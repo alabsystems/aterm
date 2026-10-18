@@ -19,152 +19,418 @@ use crate::flow::now_unix;
 /// against the verbs that actually run.
 #[must_use]
 pub fn dispatch_roster() -> &'static [&'static str] {
-    VERBS
+    &VERBS
 }
 
-/// Every verb the dispatch accepts, in the order the unknown-verb hint prints them.
-/// Data, checked against the `match` by [`tests::verb_hint_matches_dispatch`], so the
-/// hint never advertises a verb that does not dispatch.
-const VERBS: &[&str] = &[
-    "doctor",
-    "status",
-    "which",
-    "list",
-    "repair",
-    "uninstall",
-    "tree-root",
-    "verify-index",
-    "verify-pkg",
-    "install",
-    "seed",
-    "update",
-    "rollback",
-    "pin",
-    "unpin",
-    "gc",
-    "verify",
-    "link",
-    "unlink",
-    "refresh",
-    "run",
-    "relocate",
-    "lineage",
-    "noindex",
-    "machine",
-    "lease",
-    "lane",
+/// Which help tier a verb is listed under: what a reader meets first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tier {
+    Daily,
+    Occasional,
+    Plumbing,
+}
+
+/// How a verb takes its operands — checked at the dispatch edge, before the store lock,
+/// so nothing of a command runs when its argv is refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Arity {
+    /// No argument at all: one is a usage error, never swallowed (audit D-12).
+    None,
+    /// At most ONE operand; `flags` are flags it also takes in any position, which do not
+    /// count (`update [program] [--retry]`).
+    One { flags: &'static [&'static str] },
+    /// Its own parser owns the whole argv.
+    Own,
+}
+
+/// One verb: everything the dispatch edge and every help surface know of it. The ONE
+/// table: dispatch, the unknown-verb hint, `<verb> --help`, the tiers, the name-operand
+/// gate, the arity refusals, the store lock and the `[machine]` edit all read it, so no
+/// second list can advertise a verb that does not run or miss one that does.
+struct Verb {
+    name: &'static str,
+    tier: Tier,
+    /// What `atpkg <verb> --help` prints (docs/AUDIT-cli-per-verb-help-2026-08-31.md);
+    /// it names every flag the verb accepts.
+    usage: &'static str,
+    arity: Arity,
+    /// `Some` when the FIRST operand is a program name: the flag-shaped literals it
+    /// accepts in that slot (`install --default-set`, `uninstall --all`); anything else
+    /// beginning with `-` is a mistyped flag, refused before a program could be recorded
+    /// under its name. `run` is absent on purpose: `aterm <tool>` arrives as
+    /// `run <tool> -- …`, and `cmd_run` owns its own `--` handling.
+    program_flags: Option<&'static [&'static str]>,
+    /// It stages, activates or discards builds, rewrites shims or links, or edits the pin
+    /// set, so it holds the store-wide single-writer lock ([`crate::lock`]) for its whole
+    /// run. Everything else reads only — `run` above all, which may exec a long-lived tool.
+    mutates_store: bool,
+    /// A pass that applies the `[machine]` settings when their table CHANGED
+    /// ([`machine_table_changed`]): the three long passes. `update <vendor program>` never
+    /// does (the edge checks its operand).
+    applies_machine: bool,
+    /// The verb's body, handed the argv after the verb.
+    run: fn(&[String]) -> ExitCode,
+}
+
+/// The verbs, in the order the help tiers list them.
+const TABLE: &[Verb] = &[
+    Verb {
+        name: "install",
+        tier: Tier::Daily,
+        usage: "aterm pkg install <program>\n\
+                aterm pkg install --default-set    — the whole ALab toolset",
+        arity: Arity::Own,
+        program_flags: Some(&["--default-set"]),
+        mutates_store: true,
+        applies_machine: true,
+        run: cmd_install_argv,
+    },
+    Verb {
+        name: "list",
+        tier: Tier::Daily,
+        usage: "aterm pkg list [--porcelain]",
+        arity: Arity::Own,
+        program_flags: None,
+        mutates_store: false,
+        applies_machine: false,
+        run: cmd_list,
+    },
+    Verb {
+        name: "update",
+        tier: Tier::Daily,
+        usage: "aterm pkg update [program] [--retry]  (--retry: try a held-back download again \
+                now)\n\
+                aterm pkg update codex --vendor | --alab  — OpenAI's codex here, or back to \
+                ALab's",
+        arity: Arity::One {
+            flags: &["--retry", SOURCE_VENDOR_FLAG, SOURCE_ALAB_FLAG],
+        },
+        program_flags: Some(&["--retry", SOURCE_VENDOR_FLAG, SOURCE_ALAB_FLAG]),
+        mutates_store: true,
+        applies_machine: true,
+        run: cmd_update_argv,
+    },
+    Verb {
+        name: "doctor",
+        tier: Tier::Daily,
+        usage: "aterm pkg doctor [--verbose]  (alias: status) — what needs attention; \
+                --verbose: every check",
+        arity: Arity::Own,
+        program_flags: None,
+        mutates_store: false,
+        applies_machine: false,
+        // `status` is an alias, the name other package managers use. `--verbose` (or `-v`)
+        // is the one thing either takes ([`crate::doctor::present`]).
+        run: |rest| doctor_detail(rest, "doctor").map_or_else(|code| code, |d| doctor("doctor", d)),
+    },
+    Verb {
+        name: "status",
+        tier: Tier::Daily,
+        usage: "aterm pkg status [--verbose]  (alias of doctor) — what needs attention; \
+                --verbose: every check",
+        arity: Arity::Own,
+        program_flags: None,
+        mutates_store: false,
+        applies_machine: false,
+        // The same report, prefixed with the verb the user typed.
+        run: |rest| doctor_detail(rest, "status").map_or_else(|code| code, |d| doctor("status", d)),
+    },
+    Verb {
+        name: "which",
+        tier: Tier::Daily,
+        usage: "aterm pkg which <tool>",
+        arity: Arity::One { flags: &[] },
+        program_flags: Some(&[]),
+        mutates_store: false,
+        applies_machine: false,
+        run: |rest| cmd_which(rest.first()),
+    },
+    Verb {
+        name: "run",
+        tier: Tier::Daily,
+        usage: "aterm pkg run <tool> [args…]",
+        arity: Arity::Own,
+        program_flags: None,
+        mutates_store: false,
+        applies_machine: false,
+        run: cmd_run,
+    },
+    Verb {
+        name: "uninstall",
+        tier: Tier::Occasional,
+        usage: "aterm pkg uninstall <program> | aterm pkg uninstall --all",
+        arity: Arity::One { flags: &[] },
+        program_flags: Some(&["--all"]),
+        mutates_store: true,
+        applies_machine: false,
+        run: |rest| cmd_uninstall(rest.first()),
+    },
+    Verb {
+        name: "rollback",
+        tier: Tier::Occasional,
+        usage: "aterm pkg rollback <program>",
+        arity: Arity::One { flags: &[] },
+        program_flags: Some(&[]),
+        mutates_store: true,
+        applies_machine: false,
+        run: |rest| cmd_rollback(rest.first()),
+    },
+    Verb {
+        name: "pin",
+        tier: Tier::Occasional,
+        usage: "aterm pkg pin <program>",
+        arity: Arity::One { flags: &[] },
+        program_flags: Some(&[]),
+        mutates_store: true,
+        applies_machine: false,
+        run: |rest| cmd_pin(rest.first(), true),
+    },
+    Verb {
+        name: "unpin",
+        tier: Tier::Occasional,
+        usage: "aterm pkg unpin <program>",
+        arity: Arity::One { flags: &[] },
+        program_flags: Some(&[]),
+        mutates_store: true,
+        applies_machine: false,
+        run: |rest| cmd_pin(rest.first(), false),
+    },
+    Verb {
+        name: "verify",
+        tier: Tier::Occasional,
+        usage: "aterm pkg verify [program]",
+        arity: Arity::One { flags: &[] },
+        program_flags: Some(&[]),
+        mutates_store: false,
+        applies_machine: false,
+        run: |rest| cmd_verify(rest.first()),
+    },
+    Verb {
+        name: "gc",
+        tier: Tier::Occasional,
+        usage: "aterm pkg gc                — reclaim superseded builds",
+        arity: Arity::None,
+        program_flags: None,
+        mutates_store: true,
+        applies_machine: false,
+        run: |_| cmd_gc(),
+    },
+    Verb {
+        name: "repair",
+        tier: Tier::Occasional,
+        usage: "aterm pkg repair            — restore installed commands, shell integration \
+                and (macOS) the ~/.local/bin links",
+        // `repair` writes, so a swallowed `--dry-run` would rewrite everything at exit 0
+        // (audit D-12): it takes no arguments, and refuses any.
+        arity: Arity::None,
+        program_flags: None,
+        mutates_store: true,
+        applies_machine: false,
+        run: |_| run_repair(layout()),
+    },
+    Verb {
+        name: "machine",
+        tier: Tier::Occasional,
+        usage: "aterm pkg machine                 — the [machine] settings, as the doctor reads \
+                them\n\
+                aterm pkg machine apply           — apply them now: Universal Control off for \
+                this host",
+        // The [machine] settings' own door, run by the window and the session on their own
+        // schedule: a per-host preference and `<prefix>/machine.applied`, no store lock.
+        arity: Arity::Own,
+        program_flags: None,
+        mutates_store: false,
+        applies_machine: false,
+        run: cmd_machine,
+    },
+    Verb {
+        name: "self-uninstall",
+        tier: Tier::Occasional,
+        usage: "aterm pkg self-uninstall [--dry-run] [--install-dir <dir>] [--bin-dir <dir>] \
+                [--store-dir <dir>] [--man-root <dir>] [--man <dir>]  — remove what install.sh \
+                placed (the toolchain store, the app, the command links, man pages, \
+                completions, the PATH block), each only when it is aterm's",
+        // Not a store mutator at the edge: its sweep runs the bundle's own `atpkg
+        // uninstall --all`, which takes the store lock itself.
+        arity: Arity::Own,
+        program_flags: None,
+        mutates_store: false,
+        applies_machine: false,
+        run: cmd_self_uninstall,
+    },
+    Verb {
+        name: "seed",
+        tier: Tier::Plumbing,
+        usage: "aterm pkg seed",
+        arity: Arity::None,
+        program_flags: None,
+        mutates_store: true,
+        applies_machine: true,
+        run: cmd_seed,
+    },
+    Verb {
+        name: "link",
+        tier: Tier::Plumbing,
+        usage: "aterm pkg link <program> <checkout> [rel-bin…]",
+        arity: Arity::Own,
+        program_flags: Some(&[]),
+        mutates_store: true,
+        applies_machine: false,
+        run: cmd_link,
+    },
+    Verb {
+        name: "unlink",
+        tier: Tier::Plumbing,
+        usage: "aterm pkg unlink <program>",
+        arity: Arity::One { flags: &[] },
+        program_flags: Some(&[]),
+        mutates_store: true,
+        applies_machine: false,
+        run: |rest| cmd_unlink(rest.first()),
+    },
+    Verb {
+        name: "refresh",
+        tier: Tier::Plumbing,
+        usage: "aterm pkg refresh [program…]  — bare: every dev-linked program",
+        arity: Arity::Own,
+        program_flags: Some(&[]),
+        mutates_store: true,
+        applies_machine: false,
+        run: cmd_refresh,
+    },
+    Verb {
+        name: "shell-setup",
+        tier: Tier::Plumbing,
+        usage: "aterm pkg shell-setup [--path] [--completions] [--man <dir> | --own-man] \
+                [--desktop [--icons <dir>]] [--toolset-coming] [--dry-run] [--bin-dir <dir>] \
+                [--man-root <dir>]  — the managed PATH block, this binary's shell completions, \
+                the man pages (a checkout's, or this binary's own) and the Linux desktop entry \
+                (bare: --path --completions)",
+        arity: Arity::Own,
+        program_flags: None,
+        mutates_store: false,
+        applies_machine: false,
+        run: cmd_shell_setup,
+    },
+    Verb {
+        name: "tree-root",
+        tier: Tier::Plumbing,
+        usage: "aterm pkg tree-root <dir>",
+        arity: Arity::One { flags: &[] },
+        program_flags: Some(&[]),
+        mutates_store: false,
+        applies_machine: false,
+        run: |rest| cmd_tree_root(rest.first()),
+    },
+    Verb {
+        name: "verify-index",
+        tier: Tier::Plumbing,
+        usage: "aterm pkg verify-index <master-pubkey-b64> <index.toml> <index.toml.sig> \
+                <aterm-machines.toml> <aterm-machines.toml.sig>",
+        arity: Arity::Own,
+        program_flags: None,
+        mutates_store: false,
+        applies_machine: false,
+        run: cmd_verify_index,
+    },
+    Verb {
+        name: "verify-pkg",
+        tier: Tier::Plumbing,
+        usage: "aterm pkg verify-pkg <master-pubkey-b64> <pkg-*.toml> <pkg.sig> \
+                <aterm-machines.toml> <aterm-machines.toml.sig>",
+        arity: Arity::Own,
+        program_flags: None,
+        mutates_store: false,
+        applies_machine: false,
+        run: cmd_verify_pkg,
+    },
+    Verb {
+        name: "lease",
+        tier: Tier::Plumbing,
+        usage: "aterm pkg lease <toolchain-dir> [--who <words>] -- <command> [args…]  — hold \
+                the toolchain while <command> runs: no cleanup, no unattended swap, no rustup \
+                re-lay",
+        // THE HOLDER VERB ([`crate::lease::hold_for`]): no store lock — a lease is laid
+        // beside the store, never in it, and must be taken while a pass holds the lock.
+        arity: Arity::Own,
+        program_flags: None,
+        mutates_store: false,
+        applies_machine: false,
+        run: cmd_lease,
+    },
+    Verb {
+        name: "lane",
+        tier: Tier::Plumbing,
+        usage: "aterm pkg lane [--cwd <dir>] (-- <command…> | - | --json <field.path>)  — \
+                check one command line for stock Rust: exit 2 with the Trust spelling, 0 when \
+                clean or ATERM_STOCK_REASON='<why>' leads, 1 on unreadable or over-8 MiB input",
+        // Read-only and store-free ([`crate::lane`]): no lock, no layout, nothing written.
+        arity: Arity::Own,
+        program_flags: None,
+        mutates_store: false,
+        applies_machine: false,
+        run: cmd_lane,
+    },
 ];
 
-/// One usage line per verb — what `atpkg <verb> --help` prints
-/// (docs/AUDIT-cli-per-verb-help-2026-08-31.md). Every entry in [`VERBS`] must appear
-/// here, and every flag a verb accepts must be named (`tests::verb_hint_matches_dispatch`).
-const VERB_USAGE: &[(&str, &str)] = &[
-    (
-        "doctor",
-        "aterm pkg doctor [--verbose]  (alias: status) — what needs attention; --verbose: every \
-         check",
-    ),
-    (
-        "status",
-        "aterm pkg status [--verbose]  (alias of doctor) — what needs attention; --verbose: \
-         every check",
-    ),
-    ("which", "aterm pkg which <tool>"),
-    ("list", "aterm pkg list [--porcelain]"),
-    (
-        "uninstall",
-        "aterm pkg uninstall <program> | aterm pkg uninstall --all",
-    ),
-    ("tree-root", "aterm pkg tree-root <dir>"),
-    (
-        "verify-index",
-        "aterm pkg verify-index <master-pubkey-b64> <index.toml> <index.toml.sig> \
-         <aterm-machines.toml> <aterm-machines.toml.sig>",
-    ),
-    (
-        "verify-pkg",
-        "aterm pkg verify-pkg <master-pubkey-b64> <pkg-*.toml> <pkg.sig> \
-         <aterm-machines.toml> <aterm-machines.toml.sig>",
-    ),
-    (
-        "install",
-        "aterm pkg install <program>\n\
-         aterm pkg install --default-set    — the whole ALab toolset",
-    ),
-    ("seed", "aterm pkg seed"),
-    (
-        "update",
-        "aterm pkg update [program] [--retry]  (--retry: try a held-back download again now)",
-    ),
-    ("rollback", "aterm pkg rollback <program>"),
-    ("pin", "aterm pkg pin <program>"),
-    ("unpin", "aterm pkg unpin <program>"),
-    (
-        "gc",
-        "aterm pkg gc                — reclaim superseded builds",
-    ),
-    ("verify", "aterm pkg verify [program]"),
-    ("link", "aterm pkg link <program> <checkout> [rel-bin…]"),
-    ("unlink", "aterm pkg unlink <program>"),
-    (
-        "refresh",
-        "aterm pkg refresh [program…]  — bare: every dev-linked program",
-    ),
-    ("run", "aterm pkg run <tool> [args…]"),
-    (
-        "relocate",
-        "aterm pkg relocate <stage-root> [--sign <identity>] [--advisory] \
-         [--donor-root <toolchain>]… [--lineage-dormant]",
-    ),
-    (
-        "lineage",
-        "aterm pkg lineage check-compiler <bin-dir> [--lineage-dormant]  — admit a Trust \
-         compiler by CONTENT (native trustc/targo/driver, no rustup/cargo/Homebrew path, a Trust \
-         -vV, clean bytes) and LINEAGE (LINEAGE or SEED-MINT checked against its bytes); prints \
-         its record\n\
-         aterm pkg lineage scan <stage> --compiler <bin-dir> [--lineage-dormant]  — refuse a \
-         payload carrying any other compiler's evidence (a stock std path, metadata, producer or \
-         rustup path); prints the provenance record\n\
-         aterm pkg lineage seed-mint <seal> <commit>  — the seal's SEED-MINT refusals, one per \
-         line\n\
-         aterm pkg lineage stamp <stage-root> --from <bin-dir>  — write LINEAGE over a staged \
-         bundle's shipped bytes",
-    ),
-    (
-        "repair",
-        "aterm pkg repair            — restore installed commands, shell integration and \
-         (macOS) the ~/.local/bin links",
-    ),
-    (
-        "noindex",
-        "aterm pkg noindex verify <dir>  — measure whether Spotlight indexes <dir>",
-    ),
-    (
-        "machine",
-        "aterm pkg machine                 — the [machine] settings, as the doctor reads them\n\
-         aterm pkg machine apply           — apply them now: Universal Control off for this host",
-    ),
-    (
-        "lease",
-        "aterm pkg lease <toolchain-dir> [--who <words>] -- <command> [args…]  — hold the \
-         toolchain while <command> runs: no cleanup, no unattended swap, no rustup re-lay",
-    ),
-    (
-        "lane",
-        "aterm pkg lane [--cwd <dir>] (-- <command…> | - | --json <field.path>)  — check one \
-         command line for stock Rust: exit 2 with the Trust spelling, 0 when clean or \
-         ATERM_STOCK_REASON='<why>' leads, 1 on unreadable or over-8 MiB input",
-    ),
-];
+/// Every verb's name, in [`TABLE`] order: what the unknown-verb hint and the manual read.
+const VERBS: [&str; TABLE.len()] = verb_names();
+
+const fn verb_names() -> [&'static str; TABLE.len()] {
+    let mut out = [""; TABLE.len()];
+    let mut i = 0;
+    while i < TABLE.len() {
+        out[i] = TABLE[i].name;
+        i += 1;
+    }
+    out
+}
+
+/// `aterm pkg self-uninstall` ([`crate::selfsetup`]): install.sh's placement, swept.
+fn cmd_self_uninstall(rest: &[String]) -> ExitCode {
+    #[cfg(unix)]
+    return crate::selfsetup::self_uninstall_verb(rest);
+    #[cfg(not(unix))]
+    {
+        let _ = rest;
+        usage_error(
+            "self-uninstall",
+            Some("install.sh installs on macOS and Linux only"),
+        )
+    }
+}
+
+/// `aterm pkg shell-setup` ([`crate::selfsetup`]): the PATH block, completions, man pages,
+/// the desktop entry.
+fn cmd_shell_setup(rest: &[String]) -> ExitCode {
+    #[cfg(unix)]
+    return crate::selfsetup::shell_setup_verb(rest);
+    #[cfg(not(unix))]
+    {
+        let _ = rest;
+        usage_error(
+            "shell-setup",
+            Some("install.sh installs on macOS and Linux only"),
+        )
+    }
+}
+
+/// The [`TABLE`] row of `name`.
+fn verb_row(name: &str) -> Option<&'static Verb> {
+    TABLE.iter().find(|v| v.name == name)
+}
+
+/// The flag-shaped literals `verb` accepts where it takes a program name, or `None` when
+/// its first operand is no program name ([`Verb::program_flags`]).
+fn program_flags(verb: &str) -> Option<&'static [&'static str]> {
+    verb_row(verb).and_then(|v| v.program_flags)
+}
 
 /// The usage line for `verb`, if it has one. Public so the long-form manual
 /// (`aterm-cli`'s `manual.rs`) can be held to the grammar the binary parses.
 #[must_use]
 pub fn verb_usage(verb: &str) -> Option<&'static str> {
-    VERB_USAGE
-        .iter()
-        .find(|(name, _)| *name == verb)
-        .map(|(_, usage)| *usage)
+    verb_row(verb).map(|v| v.usage)
 }
 
 /// Whether a `-h`/`--help` in `rest` (the argv after `verb`) is a question for atpkg
@@ -184,7 +450,7 @@ fn help_flag_addresses_atpkg(verb: &str, rest: &[String]) -> bool {
         .any(|a| a == "-h" || a == "--help")
 }
 
-/// Answer `<verb> --help` from [`VERB_USAGE`]: the verb's own grammar, then the one
+/// Answer `<verb> --help` from the verb's [`Verb::usage`]: the verb's own grammar, then the one
 /// pointer to the long-form manual. Exit 0 — asking a question is not an error.
 fn cmd_verb_help(verb: &str) -> ExitCode {
     match verb_usage(verb) {
@@ -212,62 +478,27 @@ fn cmd_verb_help(verb: &str) -> ExitCode {
     }
 }
 
-/// The advertised roster, grouped for a reader: daily, occasional, plumbing.
-/// Presentation only — dispatch order stays [`VERBS`], and
-/// [`tests::verb_hint_matches_dispatch`] pins these tiers as an exact partition of it.
-const VERB_TIERS: &[(&str, &[&str])] = &[
-    (
-        "daily",
-        &[
-            "install", "list", "update", "doctor", "status", "which", "run",
-        ],
-    ),
-    (
-        "occasional",
-        &[
-            "uninstall",
-            "rollback",
-            "pin",
-            "unpin",
-            "verify",
-            "gc",
-            "repair",
-            "noindex",
-            "machine",
-        ],
-    ),
-    (
-        "plumbing",
-        &[
-            "seed",
-            "link",
-            "unlink",
-            "refresh",
-            "tree-root",
-            "verify-index",
-            "verify-pkg",
-            "relocate",
-            "lineage",
-            "lease",
-            "lane",
-        ],
-    ),
+/// The tier headings, in the order they print.
+const TIERS: [(&str, Tier); 3] = [
+    ("daily", Tier::Daily),
+    ("occasional", Tier::Occasional),
+    ("plumbing", Tier::Plumbing),
 ];
 
 /// The tier block, rendered once for bare `atpkg`, `--help` and the unknown-verb
 /// error. `status` renders as `doctor (or: status)`: the two are one report.
 fn verb_tier_lines() -> Vec<String> {
-    VERB_TIERS
+    TIERS
         .iter()
-        .map(|(tier, verbs)| {
-            let shown: Vec<&str> = verbs
+        .map(|(tier, which)| {
+            let shown: Vec<&str> = TABLE
                 .iter()
-                .filter(|v| **v != "status")
+                .filter(|v| v.tier == *which && v.name != "status")
                 .map(|v| {
-                    if *v == "doctor" {
+                    if v.name == "doctor" {
                         "doctor (or: status)"
                     } else {
-                        *v
+                        v.name
                     }
                 })
                 .collect();
@@ -333,6 +564,12 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
     if argv.first().and_then(|v| v.to_str()) == Some(crate::warm::HIDDEN_VERB) {
         return crate::warm::run_hidden(&argv[1..]);
     }
+    // THE HIDDEN DEVELOPER TOOLS PRIME ([`crate::devtools::run_prime`]): what the window
+    // and `aterm doctor` start, as aterm's own responsible process, once the owner
+    // switched aterm on, so macOS asks about aterm again. It never touches the store.
+    if argv.first().and_then(|v| v.to_str()) == Some(crate::devtools::PRIME_VERB) {
+        return crate::devtools::run_prime();
+    }
     let mut args: Vec<String> = argv
         .into_iter()
         .map(|a| a.to_string_lossy().into_owned())
@@ -394,8 +631,8 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
     }
     let verb = args.first().map(String::as_str);
     // The HIDDEN pending-program verb (R6): what a laid stub execs. Deliberately
-    // unlisted in help/VERBS (it is machinery, not vocabulary), handled before the
-    // dispatch match so the roster-coherence scraper sees only real verbs — and
+    // unlisted in help and the verb table (it is machinery, not vocabulary), handled
+    // before the table's dispatch — and
     // BEFORE the store lock: it only reads progress/status and appends one line to
     // the reorder-only bump file, and it must answer instantly while the installer
     // HOLDS the store lock.
@@ -405,8 +642,8 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
     // The HIDDEN self-update verb ([`crate::selfupdate`]): what an agent
     // program's `agents/` twin execs when its FIRST argument is one of the vendor's own
     // self-update verbs (`claude update|upgrade|install`, `codex update`). Same
-    // discipline as `__pending` — unlisted, dispatched before the match so the roster
-    // scraper sees only real verbs, and BEFORE the help edge and the store lock: it never
+    // discipline as `__pending` — unlisted, dispatched before the table, and BEFORE the
+    // help edge and the store lock: it never
     // mutates the store itself — the CHILD it spawns does, `update <program>` through
     // this very dispatch edge, lock and all — and it must answer while a pass HOLDS the
     // lock, when its answer is "that pass is doing this work".
@@ -423,8 +660,8 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
     }
     // The HIDDEN reroute verb (philosophy §4, `crate::reroute`): what a reroute stub
     // execs for `cargo`/`rustfmt`/… typed inside a session. Same discipline as
-    // `__pending` — unlisted, dispatched before the match so the roster scraper sees
-    // only real verbs, and BEFORE the store lock: it must answer while the installer
+    // `__pending` — unlisted, dispatched before the table, and BEFORE the store lock: it
+    // must answer while the installer
     // HOLDS the lock, and it never mutates the store.
     if verb == Some(crate::reroute::HIDDEN_VERB) {
         return cmd_reroute(&args[1..]);
@@ -440,8 +677,8 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
     // retries a timed-out wait on a short backoff. Read-only verbs never take the lock.
     // The conventional help spellings land on the help surface with exit 0, not the
     // unknown-verb error path — `atpkg` rides PATH as an argv0 alias, so `--help` is
-    // the first thing a shell (or an AI) tries. Handled BEFORE the verb match so the
-    // dispatch-coherence test's arm extraction sees only real verbs.
+    // the first thing a shell (or an AI) tries. Handled before the verb table, which
+    // holds only real verbs.
     if matches!(verb, Some("help" | "-h" | "--help")) {
         // `atpkg help <verb>` answers for THAT verb, matching `aterm help <topic>`;
         // bare `help` keeps the roster. An UNKNOWN topic is a usage error, not a
@@ -470,7 +707,7 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
     if let Some(v) = verb
         && let Some(operand) = args.get(1)
         && operand.starts_with('-')
-        && let Some((_, allowed)) = NAME_TAKING_VERBS.iter().find(|(name, _)| *name == v)
+        && let Some(allowed) = program_flags(v)
         && !allowed.contains(&operand.as_str())
     {
         // (`-h`/`--help` never reaches here.) The refusal names the verb's grammar.
@@ -481,11 +718,12 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
         }
         return refusal;
     }
-    // A ONE-NAME VERB REFUSES A SECOND NAME rather than acting on the first and dropping
-    // the rest — the same edge, the same reason (before the store lock, before anything is
+    // THE VERB'S ARITY ([`Verb::arity`]): a verb that takes no argument refuses one, and a
+    // one-name verb refuses a second name rather than acting on the first and dropping the
+    // rest — the same edge, the same reason (before the store lock, before anything is
     // done), and the answer `install` already gave in its own parser.
     if let Some(v) = verb
-        && let Some(refusal) = at_most_one_operand(&args[1..], v)
+        && let Some(refusal) = arity_refusal(&args[1..], v)
     {
         return refusal;
     }
@@ -600,77 +838,22 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
 /// The verb's own dispatch, below the edge ([`main_entry`]): everything the edge decided
 /// (the help spellings, the refusals, the lock, the held record, the roll-forward) is done.
 fn run_verb(verb: Option<&str>, args: &[String]) -> ExitCode {
-    match verb {
-        // `status` is an alias, the name other package managers use. `--verbose` (or
-        // `-v`) is the one thing either takes: the whole report rather than the verdict
-        // and what needs attention ([`crate::doctor::present`]).
-        Some("doctor") => {
-            return doctor_detail(&args[1..], "doctor")
-                .map_or_else(|code| code, |detail| doctor("doctor", detail));
-        }
-        // Same report, prefixed with the verb the user typed.
-        Some("status") => {
-            return doctor_detail(&args[1..], "status")
-                .map_or_else(|code| code, |detail| doctor("status", detail));
-        }
-        Some("which") => return cmd_which(args.get(1)),
-        Some("list") => return cmd_list(args.get(1..).unwrap_or(&[])),
-        // `repair` writes, so a swallowed `--dry-run` would rewrite everything at exit
-        // 0 (audit D-12): it takes no arguments, and refuses any.
-        Some("repair") => {
-            return zero_arity(&args[1..], "repair").unwrap_or_else(|| run_repair(layout()));
-        }
-        Some("uninstall") => return cmd_uninstall(args.get(1)),
-        Some("tree-root") => return cmd_tree_root(args.get(1)),
-        Some("verify-index") => return cmd_verify_index(args.get(1..).unwrap_or(&[])),
-        Some("verify-pkg") => return cmd_verify_pkg(args.get(1..).unwrap_or(&[])),
-        Some("install") => return cmd_install_argv(&args[1..]),
-        Some("seed") => return cmd_seed(&args[1..]),
-        Some("update") => return cmd_update_argv(&args[1..]),
-        Some("rollback") => return cmd_rollback(args.get(1)),
-        Some("pin") => return cmd_pin(args.get(1), true),
-        Some("unpin") => return cmd_pin(args.get(1), false),
-        Some("gc") => return zero_arity(&args[1..], "gc").unwrap_or_else(cmd_gc),
-        Some("verify") => return cmd_verify(args.get(1)),
-        Some("link") => return cmd_link(&args[1..]),
-        Some("unlink") => return cmd_unlink(args.get(1)),
-        Some("refresh") => return cmd_refresh(&args[1..]),
-        Some("run") => return cmd_run(&args[1..]),
-        Some("relocate") => return cmd_relocate(&args[1..]),
-        // Read-only and store-free, like `relocate`: the lineage checker reads a toolchain
-        // or a staged tree (and `stamp` writes one file INTO a staged tree the packer owns).
-        Some("lineage") => return cmd_lineage(&args[1..]),
-        // Not a store mutator at the edge: `noindex` writes nothing under `<prefix>`, so a
-        // probe never queues behind, or blocks, an install. `args[1]` is a subcommand, so
-        // its own parser owns every `-`-leading token.
-        Some("noindex") => return cmd_noindex(&args[1..]),
-        // The [machine] settings' own door, run by the window and the session on their
-        // own schedule. Writes a per-host preference and records
-        // `<prefix>/machine.applied` — no store lock.
-        Some("machine") => return cmd_machine(&args[1..]),
-        // THE HOLDER VERB ([`crate::lease::hold_for`]): no store lock — a lease is laid
-        // beside the store, never in it, and a holder must be able to lease the toolchain
-        // while a pass holds the lock.
-        Some("lease") => return cmd_lease(&args[1..]),
-        // Read-only and store-free: the Rust-lane reader over one command line
-        // ([`crate::lane`]) — no lock, no layout, nothing written.
-        Some("lane") => return cmd_lane(&args[1..]),
-        Some(other) => {
-            // The head `atpkg: unknown verb '<x>'` is byte-stable for scripts; the
-            // suggestion follows it, the full roster below.
-            match did_you_mean(other) {
-                Some(verb) => {
-                    eprintln!("atpkg: unknown verb '{other}' — did you mean `{verb}`?");
-                }
-                None => eprintln!("atpkg: unknown verb '{other}'"),
-            }
-            print_verb_tiers(&mut std::io::stderr());
-            eprintln!("atpkg: full manual: aterm help pkg");
-            return ExitCode::from(2);
-        }
-        None => cmd_bare(),
+    let Some(name) = verb else {
+        cmd_bare();
+        return ExitCode::SUCCESS;
+    };
+    if let Some(row) = verb_row(name) {
+        return (row.run)(&args[1..]);
     }
-    ExitCode::SUCCESS
+    // The head `atpkg: unknown verb '<x>'` is byte-stable for scripts; the suggestion
+    // follows it, the full roster below.
+    match did_you_mean(name) {
+        Some(near) => eprintln!("atpkg: unknown verb '{name}' — did you mean `{near}`?"),
+        None => eprintln!("atpkg: unknown verb '{name}'"),
+    }
+    print_verb_tiers(&mut std::io::stderr());
+    eprintln!("atpkg: full manual: aterm help pkg");
+    ExitCode::from(2)
 }
 
 /// A pass, as the package log records it ([`crate::packages_log`]): begun once the verb
@@ -811,10 +994,8 @@ fn pass_lane(
 }
 
 /// The exit status an [`ExitCode`] carries. `ExitCode` exposes no accessor, but it is
-/// `Eq`: the one `u8` that converts to an equal code is its status. A COMPARISON, never an
-/// exit site — it returns no code to the process, so the exit-code census
-/// (`lock::tests::contention_exit_code_is_temp_fail_and_unshared`, which reads every
-/// `ExitCode` built from a number) has nothing here to count.
+/// `Eq`: the one `u8` that converts to an equal code is its status. A comparison, never an
+/// exit site.
 fn exit_code_u8(code: ExitCode) -> u8 {
     (0..=u8::MAX)
         .find(|n| {
@@ -839,6 +1020,40 @@ fn cmd_help() -> ExitCode {
 /// The one-line answer for a program the store does not hold: the fact, then the fix.
 fn not_installed_fix(name: &str) -> String {
     format!("atpkg: {name} is not installed (fix: aterm pkg install {name})")
+}
+
+/// The answer for a command nothing here runs, read from the record of the PROGRAM that
+/// ships it ([`crate::stub::program_of`]: `targo` comes with `trust`): that program's
+/// row when it says why no install changes it — no build for this target, or a hold
+/// waiting on a person — else the install of the program, never of the command.
+///
+/// `aterm trust` and `aterm ay` on aarch64 Linux said "not installed (fix: aterm pkg
+/// install trust)", a fix that answers "unavailable … no build is published for this
+/// target" and changes nothing; `aterm pkg which targo` promised `aterm pkg install
+/// targo`, which install refuses (no program by that name).
+fn not_runnable_line(layout: &crate::store::Layout, tool: &str) -> String {
+    let program = crate::stub::program_of_in(layout, tool);
+    let program = program.as_str();
+    let stated = crate::status::read(layout)
+        .and_then(|s| s.programs.get(program).map(|row| row.state.clone()))
+        .filter(|state| {
+            state.starts_with(crate::state::UNAVAILABLE_PREFIX)
+                || state.starts_with(crate::state::HELD_FAILED_PREFIX)
+        });
+    not_runnable_words(tool, program, stated.as_deref())
+}
+
+/// [`not_runnable_line`]'s words, pure: `state` is the program's row when it says why.
+fn not_runnable_words(tool: &str, program: &str, state: Option<&str>) -> String {
+    match (state, tool == program) {
+        (Some(state), true) => format!("atpkg: {tool}: {state}"),
+        (Some(state), false) => format!("atpkg: {tool} comes with {program}: {state}"),
+        (None, true) => not_installed_fix(tool),
+        (None, false) => format!(
+            "atpkg: {tool} comes with {program}, which is not installed (fix: aterm pkg install \
+             {program})"
+        ),
+    }
 }
 
 /// A LIVE build of a program one of whose shims is gone — see [`live_without_shim`] (its
@@ -1030,7 +1245,7 @@ enum RunTarget {
     Exec {
         /// The file to exec.
         path: std::path::PathBuf,
-        /// The environment the shim would export ([`crate::ops::exec_env`]).
+        /// The environment the shim would export ([`crate::ops::Managed::env`]).
         env: crate::shim_env::ShimEnv,
         /// A line to say before exec'ing it (a lost shim), or `None` for the ordinary case.
         notice: Option<String>,
@@ -1044,7 +1259,7 @@ enum RunTarget {
     NotInstalled,
 }
 
-/// [`cmd_run`]'s resolution: the shim's exec path ([`crate::ops::exec_path`]); else a
+/// [`cmd_run`]'s resolution: the shim's managed copy ([`crate::ops::managed`]); else a
 /// pending stub; else a live build whose own-name shim is lost ([`live_without_shim`]),
 /// exec'd from the store with the environment its build declares and a notice naming the
 /// repair; else not installed.
@@ -1054,10 +1269,10 @@ enum RunTarget {
 /// ([`runs_self_update_verb`]), so exec'ing the store copy here would let `aterm claude
 /// update` reach the vendor's updater. The repair re-lays the shim, and then it runs.
 fn run_target(layout: &crate::store::Layout, tool: &str) -> RunTarget {
-    if let Some(path) = crate::ops::exec_path(layout, tool) {
+    if let Some(copy) = crate::ops::managed(layout, tool) {
         return RunTarget::Exec {
-            path,
-            env: crate::ops::exec_env(layout, tool),
+            path: copy.target,
+            env: copy.env,
             notice: None,
         };
     }
@@ -1545,7 +1760,7 @@ mod stand_down_after_wait_tests {
     #[test]
     fn queued_new_index_runs_after_older_pass_but_same_failed_target_stands_down() {
         use aterm_update_core::pkg_check::{PassOutcome, Stamps};
-        let model = aterm_spec::derive::atpkg_published_spacing_model();
+        let model = aterm_models_atpkg::atpkg_published_spacing_model();
         let mut modeled = model.init_state();
         for action in ["EndOldOk", "Publish45", "DecideQueued"] {
             assert!(model.fire(action, &mut modeled), "{action}: {modeled:?}");
@@ -1837,12 +2052,13 @@ fn cmd_landing(rest: &[String]) -> ExitCode {
 /// addition: a program operand that starts with `-` (`atpkg __selfupdate --help`) is the
 /// usage line, exit 2 — non-mutating by design, not by the accident of a refused name.
 ///
-/// In order, each ending pinned in-process by `cmd_selfupdate_refuses_forwards_and_never_takes_the_lock`
-/// and at the process edge by `tests/selfupdate_intercept.rs` — but three: a declined
-/// shape (5) is driven on the binary through `atpkg run`, which settles the same plan
-/// (`tests/run_is_the_managed_name.rs`); the disabled line (6) is a build with no root
-/// key's alone; and the child's 75 (7) needs its whole bound to elapse, so only the
-/// in-process test, at a one-second bound, reaches it:
+/// In order, each ending pinned at the process edge by `tests/selfupdate_intercept.rs`
+/// — but three, which `cmd_selfupdate_refuses_forwards_and_never_takes_the_lock` pins
+/// in-process: a declined shape (5), also driven on the binary through `atpkg run`,
+/// which settles the same plan (`tests/run_is_the_managed_name.rs`); the disabled line
+/// (6), a build with no root key's alone; and the child's 75 (7), which needs its whole
+/// bound to elapse, so its relay is pinned with a stub child, and the real binary's 75
+/// by `tests/store_lock_wait.rs`:
 /// 1. usage exit 2; not a tool name exit 2; the layout from the prefix operand (so no
 ///    `HOME` is needed — `env -i`, launchd) else [`layout`] (exit 1 with its line);
 /// 2. no roster row ⇒ `exec` the `bin/<program>` shim verbatim, nothing printed — a twin
@@ -1869,8 +2085,7 @@ fn cmd_landing(rest: &[String]) -> ExitCode {
 ///    and stdio INHERITED — the shape the window's pass uses minus its `--progress-file`
 ///    — waited for as its parent for the whole wait (Ctrl-C reaches both through the
 ///    foreground group and ends it; no handler, no epilogue for a signal death).
-///    The child's status, relayed with LITERAL arms so the exit-code registry
-///    (`lock::contention_exit_code_is_temp_fail_and_unshared`) reads them: 0 ⇒ nothing
+///    The child's status, relayed: 0 ⇒ nothing
 ///    more, the child's own stdout line was the verdict; 2 ⇒ 2; 75 ⇒ the contended line
 ///    and 75; anything else (1, a signal) ⇒ the incomplete line and 1; a spawn that
 ///    fails ⇒ `could not run`, 126.
@@ -2026,7 +2241,17 @@ fn selfupdate_plan(
         Verdict::Help => return forward(Some(selfupdate::help_line(row))),
         Verdict::PassThrough => return forward(None),
         Verdict::Declined(d) => {
-            return SelfUpdatePlan::Refuse(selfupdate::declined_line(row, &d));
+            // An ALab build is updated from ALab's channel ([`crate::alab`]): the refusal
+            // names that, never the vendor's latest.
+            let active = crate::ops::active_builds(layout).get(row.program).copied();
+            return SelfUpdatePlan::Refuse(
+                match crate::alab::agent(row.program).filter(|_| {
+                    active.is_some_and(|b| crate::alab::build_is_alab(layout, row.program, b))
+                }) {
+                    Some(agent) => selfupdate::alab_declined_line(agent, &d),
+                    None => selfupdate::declined_line(row, &d),
+                },
+            );
         }
         // The words typed are the classification's evidence, not the line's: the
         // announce line states what the person HAS, not what they typed —
@@ -2045,8 +2270,7 @@ fn selfupdate_plan(
 /// <bound>` ([`crate::selfupdate::child_argv`]) — and the child's status relayed with
 /// literal arms. `atpkg` is [`selfupdate_child_binary`] and `bound` is
 /// [`crate::selfupdate::WAIT_LOCK_SECS`] in production; both are PARAMETERS so the
-/// in-process test can drive the real child, against a store lock it holds itself,
-/// through a wrapper that confines it to a temp HOME, with a one-second bound — the 75
+/// in-process test can hand it a stub child that exits 75 — the relay of the 75
 /// ending, which no environment knob exists to shorten (and none may). The active build
 /// the epilogues name is read AFTER the child, offline
 /// ([`crate::ops::active_builds`]): it is the build that STAYS.
@@ -2060,9 +2284,21 @@ fn selfupdate_check(
     // What the person HAS, read before the child: the active build off the `bin/` shims,
     // offline; the epilogues re-read it AFTER the child, because theirs is the build
     // that stays.
-    let have = crate::ops::active_builds(layout).get(row.program).copied();
-    let have = crate::vendor_direct::have_words(layout, row.program, have);
-    eprintln!("{}", crate::selfupdate::announce_line(row, &have));
+    let active = crate::ops::active_builds(layout).get(row.program).copied();
+    // An ALab build ([`crate::alab`]) is updated from ALab's channel, by the same verb.
+    match active.filter(|b| crate::alab::build_is_alab(layout, row.program, *b)) {
+        Some(build) => eprintln!(
+            "{}",
+            crate::selfupdate::alab_announce_line(
+                row.program,
+                &crate::alab::build_words(layout, row.program, build)
+            )
+        ),
+        None => {
+            let have = crate::vendor_direct::have_words(layout, row.program, active);
+            eprintln!("{}", crate::selfupdate::announce_line(row, &have));
+        }
+    }
     let _ = std::io::stderr().flush();
     let status = aterm_uds::spawnfd::command(atpkg)
         .args(crate::selfupdate::child_argv(atpkg, row.program, bound))
@@ -2125,7 +2361,7 @@ fn selfupdate_child_binary() -> std::path::PathBuf {
 /// `atpkg __reroute <upstream> [args…]` — the hidden verb a reroute stub execs
 /// (philosophy §4, [`crate::reroute::run`]). Unlisted for the reason `__pending` is:
 /// it is machinery a stub reaches, not vocabulary a user types, so it is dispatched
-/// before the verb match and the roster scraper never sees it. Dispatched BEFORE the
+/// before the verb table and is no row of it. Dispatched BEFORE the
 /// store lock too: a `cargo build` typed while the installer HOLDS `store.lock` must
 /// still get its signpost instantly, and the verb never mutates the store — it
 /// announces, refuses (only under `[reroute] strict`), or execs a copy that is already
@@ -2178,21 +2414,16 @@ fn reassert_rustup_seam(layout: &crate::store::Layout) {
 /// [`reassert_rustup_seam`] against the rustup home `home` (`None`: no rustup home), so
 /// what the pass says for the window is provable from a test.
 fn reassert_rustup_seam_at(layout: &crate::store::Layout, home: Option<&std::path::Path>) {
-    let foreign = match home {
-        Some(home) => {
-            let said = crate::seam::reassert_reporting(layout, home);
-            for line in &said.lines {
-                println!("atpkg: {line}");
-            }
-            said.foreign
-        }
-        None => Vec::new(),
-    };
-    let items: Vec<ForeignItem> = foreign
-        .into_iter()
+    let events = home.map_or_else(Vec::new, |home| crate::seam::reassert(layout, home));
+    for event in &events {
+        println!("atpkg: {event}");
+    }
+    let items: Vec<ForeignItem> = events
+        .iter()
+        .filter_map(crate::seam::SeamEvent::foreign_entry)
         .map(|(name, path)| ForeignItem {
-            name,
-            path,
+            name: name.to_string(),
+            path: path.to_path_buf(),
             fix: crate::seam::DETACH_FIX.to_string(),
         })
         .collect();
@@ -2245,8 +2476,8 @@ fn detach_rustup_seams(layout: &crate::store::Layout) {
     let Some(home) = crate::seam::rustup_home() else {
         return;
     };
-    for line in crate::seam::detach_recorded(layout, &home) {
-        println!("atpkg: {line}");
+    for event in crate::seam::detach_recorded(layout, &home) {
+        println!("atpkg: {event}");
     }
 }
 
@@ -2333,6 +2564,21 @@ pub(crate) fn vendor_state_of(
     build: u64,
     row: Option<&crate::ProgramStatus>,
 ) -> String {
+    // An ALab build ([`crate::alab`]) is no vendor version: its row as a lane wrote it
+    // (pinned by the index, or kept), else what it is — never `updates from <vendor>`.
+    if crate::alab::build_is_alab(layout, spec.program, build) {
+        return row
+            .filter(|r| r.installed_build == Some(build) && crate::state::is_managed(&r.state))
+            .map_or_else(
+                || {
+                    crate::state::alab_kept(
+                        build,
+                        &crate::alab::build_words(layout, spec.program, build),
+                    )
+                },
+                |r| r.state.clone(),
+            );
+    }
     let lane_row = row.filter(|r| {
         r.installed_build == Some(build)
             && crate::state::is_managed(&r.state)
@@ -2466,10 +2712,12 @@ enum WaitStep {
 
 /// One look's decision, over what it read IN THIS ORDER: whether the pass was `running`
 /// (its `progress.json`), then whether the program's shim resolves (`installed`), with
-/// whether the pass recorded the program's failure (`failed`). The order is the contract
-/// the derived model `AtpkgPendingWait` states: a pass lays the shim before it ends, so a
-/// shim read after an ended pass is final — read the other way round, a pass that sets
-/// the program up and ends between the two reads was "stopped" over an installed program.
+/// whether the pass said it will not bring it (`failed`: a recorded failure, a plan that
+/// left the program out, or a done row for a program that laid no shim of the name). The
+/// order is the contract the derived model `AtpkgPendingWait` states: a pass lays the shim
+/// before it ends, and before the program's row reads done, so a shim read after an ended
+/// pass or a done row is final — read the other way round, a pass that sets the program up
+/// and ends between the two reads was "stopped" over an installed program.
 /// Pure, and Tier-1 bound to that model in the tests.
 fn pending_wait_step(running: bool, installed: bool, failed: bool) -> WaitStep {
     if installed {
@@ -2565,12 +2813,14 @@ fn unattended_wait_line(
 /// pass that ends without installing it, is said in one line and exits 1. A pass only
 /// promised so far ([`crate::progress::pass_owed`]) is waited for as one in flight; when no
 /// pass of the wait planned the program — the promise broke first, or its pass stopped
-/// before planning — it is answered as nothing installing ([`pending_not_running`]), and
-/// when the promised pass planned without it, as no longer in the default set; both exit
-/// 127, the second without waiting the pass out.
+/// before planning — it is answered as nothing installing ([`pending_not_running`]), when
+/// the promised pass planned without it, as no longer in the default set, and when its
+/// program landed without the name, as a command it does not provide
+/// ([`landed_without_line`]); all three exit 127, the last two without waiting the pass
+/// out.
 ///
 /// `tool` is what was typed; a command a program exposes (`targo`) waits on its program's
-/// progress row (`trust`, [`crate::stub::program_of`]) and runs once its own shim lands.
+/// progress row (`trust`, [`crate::stub::program_of_in`]) and runs once its own shim lands.
 fn wait_then_run(
     layout: &crate::store::Layout,
     tool: &str,
@@ -2580,7 +2830,8 @@ fn wait_then_run(
     initial: Option<&crate::progress::ProgressFile>,
     initial_running: bool,
 ) -> ExitCode {
-    let program = crate::stub::program_of(tool);
+    let program = crate::stub::program_of_in(layout, tool);
+    let program = program.as_str();
     // Register before the first progress -> shim read. A rename between that
     // read and the wait is then queued by kqueue, not lost until the fallback.
     let mut shim_wake = crate::pending_wake::PendingShimWake::new(layout);
@@ -2659,12 +2910,27 @@ fn wait_then_run(
                 crate::progress::Phase::Failed | crate::progress::Phase::Skipped
             )
         });
+        // A PROGRAM THAT LANDED WITHOUT THE NAME: its row reads done — written only once every
+        // shim its build lays stands — and the shim read after it finds none of the name typed
+        // (a command this build does not expose). Nothing brings it, so the wait ends now, not
+        // when the pass does.
+        let landed_without = row.is_some_and(|r| r.phase == crate::progress::Phase::Done);
         let installed = crate::which(layout, tool).is_some();
-        match pending_wait_step(owed || running, installed, failed.is_some() || left_out) {
+        match pending_wait_step(
+            owed || running,
+            installed,
+            failed.is_some() || left_out || landed_without,
+        ) {
             WaitStep::Run => break Ok(()),
             WaitStep::Fail if left_out => {
                 break Err(Some((
                     not_in_default_set_line(program),
+                    ExitCode::from(127),
+                )));
+            }
+            WaitStep::Fail if landed_without => {
+                break Err(Some((
+                    landed_without_line(layout, program, tool),
                     ExitCode::from(127),
                 )));
             }
@@ -2743,6 +3009,19 @@ fn wait_then_run(
     rest.push("--".to_string());
     rest.extend_from_slice(passthrough);
     cmd_run(&rest)
+}
+
+/// What a wait for `tool` says once its `program` landed with no command of that name
+/// ([`wait_then_run`]): the program is installed, the name is not one of its commands, and
+/// the commands it does provide.
+fn landed_without_line(layout: &crate::store::Layout, program: &str, tool: &str) -> String {
+    let mut provides = crate::installed_exposes(layout, program).unwrap_or_default();
+    provides.sort();
+    let mut line = format!("atpkg: {program} is installed, and it has no command named {tool}");
+    if !provides.is_empty() {
+        line.push_str(&format!(" \u{2014} it provides {}", provides.join(", ")));
+    }
+    line
 }
 
 /// How long an echoed error line may get before visible elision — generous enough
@@ -2828,10 +3107,10 @@ fn pending_state(layout: &crate::store::Layout, tool: &str, io: &mut PendingIo<'
     };
     let typed = tn.as_str();
     // A COMMAND A PROGRAM EXPOSES (`targo`) answers with its PROGRAM's state (`trust`,
-    // [`crate::stub::program_of`]): the progress row, the status row and the bump are all
+    // [`crate::stub::program_of_in`]): the progress row, the status row and the bump are all
     // the program's. Every line below names the program; this one says how they relate.
-    let program =
-        crate::store::ToolName::new(crate::stub::program_of(typed)).unwrap_or_else(|| tn.clone());
+    let program = crate::store::ToolName::new(&crate::stub::program_of_in(layout, typed))
+        .unwrap_or_else(|| tn.clone());
     let name = program.as_str();
     let what = crate::stub::describe(name).unwrap_or("part of the ALab toolset");
     if typed == name {
@@ -3172,100 +3451,38 @@ fn zero_arity(rest: &[String], verb: &str) -> Option<ExitCode> {
     Some(usage_error(verb, Some(&problem)))
 }
 
-/// The verbs whose whole grammar is at most ONE operand — each dispatch arm reads
-/// `args.get(1)` and nothing after it. Every other [`NAME_TAKING_VERBS`] entry parses its
-/// own argv: `install` (it refuses a second program itself), `update` (one operand and
-/// `--retry` in either order, [`ONE_OPERAND_FLAGGED_VERBS`]), `link` (`<program>
-/// <checkout> [rel-bin…]`) and `refresh` (`[program…]`).
-const ONE_OPERAND_VERBS: [&str; 8] = [
-    "which",
-    "uninstall",
-    "tree-root",
-    "rollback",
-    "pin",
-    "unpin",
-    "verify",
-    "unlink",
-];
+/// `update <program> --vendor`: a person's choice of the vendor's build of an ALab-built
+/// program on this machine ([`crate::alab::choose_vendor`]) — the one way back to the vendor
+/// from ALab's channel, and never taken by anything unattended.
+const SOURCE_VENDOR_FLAG: &str = "--vendor";
 
-/// One-operand verbs whose arm parses its own argv because it also takes FLAGS in any
-/// position — the flags are not operands, so the gate counts what is left:
-/// `update [program] [--retry]` ([`cmd_update_argv`], which refuses a second program
-/// itself too, for a direct caller). The gate still refuses `update ta tb` at the edge,
-/// before the store lock, exactly as it did before `--retry` existed.
-const ONE_OPERAND_FLAGGED_VERBS: &[(&str, &[&str])] = &[("update", &["--retry"])];
+/// `update <program> --alab`: forget that choice; the program follows ALab's channel again
+/// where it publishes one ([`crate::alab::clear_vendor_choice`]).
+const SOURCE_ALAB_FLAG: &str = "--alab";
 
-/// Refuse a second operand to a [`ONE_OPERAND_VERBS`] (or [`ONE_OPERAND_FLAGGED_VERBS`])
-/// verb — `Some(usage error)` when one was given, `None` to proceed (and for every other
-/// verb).
-///
-/// Each arm reads only `args.get(1)`, so the rest would be dropped silently. Runs at the
-/// dispatch edge, after the machine lanes' own flags are stripped and before the store
-/// lock, so NOTHING of the command runs: acting on the first name and refusing the rest
-/// would leave the reader to work out which half happened.
-fn at_most_one_operand(rest: &[String], verb: &str) -> Option<ExitCode> {
-    let flags: &[&str] = match ONE_OPERAND_FLAGGED_VERBS.iter().find(|(v, _)| *v == verb) {
-        Some((_, flags)) => flags,
-        None if ONE_OPERAND_VERBS.contains(&verb) => &[],
-        None => return None,
-    };
-    let operands: Vec<&String> = rest
-        .iter()
-        .filter(|a| !flags.contains(&a.as_str()))
-        .collect();
-    if operands.len() < 2 {
-        return None;
+/// The refusal [`Verb::arity`] makes of `rest` (the argv after `verb`), or `None` to
+/// proceed. [`Arity::None`]: any argument ([`zero_arity`]). [`Arity::One`]: a second
+/// operand, the verb's flags not counted — the arm reads one name, so the rest would be
+/// dropped silently. Runs at the dispatch edge, after the machine lanes' own flags are
+/// stripped and before the store lock, so NOTHING of the command runs: acting on the first
+/// name and refusing the rest would leave the reader to work out which half happened.
+fn arity_refusal(rest: &[String], verb: &str) -> Option<ExitCode> {
+    match verb_row(verb)?.arity {
+        Arity::None => zero_arity(rest, verb),
+        Arity::One { flags } => {
+            let operands = rest.iter().filter(|a| !flags.contains(&a.as_str())).count();
+            // The usage line printed under it carries the grammar.
+            (operands >= 2)
+                .then(|| usage_error(verb, Some("one name at a time \u{2014} nothing was done")))
+        }
+        Arity::Own => None,
     }
-    // The usage line printed under it carries the grammar; the names are what was typed.
-    Some(usage_error(
-        verb,
-        Some("one name at a time \u{2014} nothing was done"),
-    ))
 }
 
-/// The verbs whose FIRST positional is a program name, each paired with the flag-shaped
-/// literals it accepts in that slot: `install --default-set` and `uninstall --all` name a
-/// SET where a program name would go; everything else beginning with `-` is a mistyped
-/// flag (and `update --retry` is a flag the gate lets through).
-///
-/// `run` is deliberately absent: `aterm <tool>` synthesizes `["run", <tool>, "--", …]`,
-/// so `cmd_run` owns its own `--` handling.
-const NAME_TAKING_VERBS: &[(&str, &[&str])] = &[
-    ("install", &["--default-set"]),
-    ("uninstall", &["--all"]),
-    ("update", &["--retry"]),
-    ("rollback", &[]),
-    ("which", &[]),
-    ("tree-root", &[]),
-    ("verify", &[]),
-    ("pin", &[]),
-    ("unpin", &[]),
-    ("link", &[]),
-    ("unlink", &[]),
-    ("refresh", &[]),
-];
-
 /// Whether `verb` MUTATES the store and must hold the store-wide single-writer lock
-/// ([`crate::lock`]) for its whole run: every verb that stages, activates or discards
-/// builds, rewrites shims or links, and `pin`/`unpin`, whose read-modify-write of the pin
-/// set gates the coherence-group transaction. Everything else reads only — and `run` in
-/// particular may exec a long-lived tool that must never hold the lock.
+/// ([`Verb::mutates_store`]); an unknown word (or `help`) never does.
 fn verb_mutates_store(verb: &str) -> bool {
-    matches!(
-        verb,
-        "install"
-            | "seed"
-            | "update"
-            | "rollback"
-            | "uninstall"
-            | "gc"
-            | "link"
-            | "unlink"
-            | "refresh"
-            | "pin"
-            | "unpin"
-            | "repair"
-    )
+    verb_row(verb).is_some_and(|v| v.mutates_store)
 }
 
 /// Acquire the store-wide writer lock for a mutating verb at the dispatch edge: a
@@ -3510,8 +3727,7 @@ pub(crate) fn parent_is_gone() -> bool {
 /// `atpkg` (no verb) — the inert/enabled posture, observable from the shell, answering
 /// a first hour's four questions in order: what is this (the head), what do I have (the
 /// counts), what can I type (the tiers), and the ONE next command. Read-only and
-/// lock-free — `list_installed`/`active_builds` read the store without the writer lock,
-/// so the bare invocation's classification in `store_lock_verb_roster_is_exact` holds.
+/// lock-free — `list_installed`/`active_builds` read the store without the writer lock.
 ///
 /// The stable head `atpkg: enabled (root key pinned)` and the byte-exact disabled line
 /// are the script-facing contract; the counts ride after an em dash on the same line so
@@ -3854,36 +4070,41 @@ fn which_line_in(
             crate::vendor::system_binary_on_path(&layout.prefix, tool, path_var).as_deref(),
         ));
     }
-    // 1c. An INDEX PROGRAM of ALab's own that nothing has installed here — no shim, no
-    //     bundle, no pending stub — while a SAME-NAMED unrelated binary sits on PATH
-    //     (p11-kit's `/usr/bin/trust`). Arm 2 would name it "the system copy"; this is
-    //     arm 1b's sentence for the not-installed case, with the truth first — the
-    //     recorded reason when a row carries one, else plain not-installed with the fix.
+    // 2. A copy on PATH outside the prefix that runs. With a PENDING STUB in the managed
+    //    bin/ the question is which comes FIRST on PATH: a foreign copy ahead of the
+    //    managed bin/ runs; one behind it loses to the stub, which waits (arm 3) — the
+    //    shadow walk answers that, the system walk would skip the stub.
     let stubbed = crate::stub::pending_stub_exists(layout, tool);
     let index = cached_index(layout);
-    if !stubbed
-        && let Some(entry) = index.as_ref().and_then(|i| i.program(tool))
-        && entry.system.is_none()
-        && !crate::stub::is_agent_program(tool)
-        && let Some(path) = crate::vendor::system_binary_on_path(&layout.prefix, tool, path_var)
-    {
-        let row = row_of(tool).map(|r| r.state);
-        return Ok(index_program_shadowed_by_unrelated_line(
-            tool,
-            row.as_deref(),
-            &path,
-        ));
-    }
-    // 2. A system copy on PATH outside the prefix: it runs, and atpkg does not manage it.
-    //    With a PENDING STUB in the managed bin/ the question is which comes FIRST on
-    //    PATH: a foreign copy ahead of the managed bin/ runs; one behind it loses to the
-    //    stub, which waits — the shadow walk answers that, the system walk would skip the
-    //    stub.
     let foreign = if stubbed {
         crate::vendor::shadowing_binary_on_path(&layout.prefix, tool, path_var)
     } else {
         crate::vendor::system_binary_on_path(&layout.prefix, tool, path_var)
     };
+    // 2a. …that is an UNRELATED binary sharing the name of a program of ALab's own that
+    //     nothing installed here (p11-kit's `/usr/bin/trust` on every Ubuntu): the truth
+    //     first — the recorded reason, the pending stub's, or plain not-installed — then
+    //     the binary named for what it is, never "the system copy" of the program. ALab's
+    //     own: an index program no system copy may satisfy, or, before any index is
+    //     cached (a fresh machine, or one whose seed laid stubs and no pass has run), a
+    //     member of the compiled default set. Not an agent program, whose foreign copies
+    //     are the vendor's own installs.
+    if let Some(path) = &foreign
+        && !crate::stub::is_agent_program(tool)
+        && match index.as_ref() {
+            Some(index) => index.program(tool).is_some_and(|e| e.system.is_none()),
+            None => crate::stub::describe(tool).is_some(),
+        }
+    {
+        let row = row_of(crate::stub::program_of(tool)).map(|r| r.state);
+        return Ok(index_program_shadowed_by_unrelated_line(
+            tool,
+            row.as_deref(),
+            stubbed,
+            path,
+        ));
+    }
+    // 2b. …otherwise a system copy: it runs, and atpkg does not manage it.
     if let Some(path) = foreign {
         let retired = layout.retired_date(tool).or_else(|| {
             row_of(tool).and_then(|r| crate::state::system_retired(&r.state).map(str::to_string))
@@ -3898,8 +4119,9 @@ fn which_line_in(
     //    that says WHY it waits (unserved here) outranks the generic promise.
     if stubbed {
         // A command a program exposes (`targo`) waits on that program (`trust`): its row,
-        // and the install that lays it ([`crate::stub::program_of`]).
-        let program = crate::stub::program_of(tool);
+        // and the install that lays it ([`crate::stub::program_of_in`]).
+        let program = crate::stub::program_of_in(layout, tool);
+        let program = program.as_str();
         // …and a HELD row (`held: last attempt failed with …; <retry>`): the stub is
         // waiting on a person, not on the next pass, and the row says which act.
         let waiting = row_of(program).map(|r| r.state).filter(|st| {
@@ -3932,11 +4154,14 @@ fn which_line_in(
         return Err(no_alias_line(layout, tool, base.as_str()));
     }
     // 6. A name the cached index does not serve: `install` refuses it, so say so in
-    //    install's own words (with the roster) instead of promising an install.
-    if let Some(line) = unserved_which_line(tool, index.as_deref()) {
+    //    install's own words (with the roster) instead of promising an install. A
+    //    command is asked about by the program that ships it (`targo` by `trust`).
+    if let Some(line) =
+        unserved_which_line(&crate::stub::program_of_in(layout, tool), index.as_deref())
+    {
         return Err(line);
     }
-    Err(not_installed_fix(tool))
+    Err(not_runnable_line(layout, tool))
 }
 
 /// `which`'s answer for a name the cached `index` does not serve and no vendor program
@@ -3956,7 +4181,7 @@ fn unserved_which_line(tool: &str, index: Option<&crate::manifest::Index>) -> Op
 
 /// The `which` answer for a program dev-linked from a checkout (arm 1b' of
 /// [`which_line`]): where it is linked from, what it exposes, and — when a same-named
-/// unrelated binary sits on PATH — that binary named for what it is. Pure, unit-tested.
+/// unrelated binary sits on PATH — that binary named for what it is.
 fn dev_linked_program_line(
     tool: &str,
     checkout: Option<&std::path::Path>,
@@ -3986,23 +4211,33 @@ fn dev_linked_program_line(
     line
 }
 
-/// The `which` answer for an index program of ALab's own that is NOT installed while a
-/// same-named unrelated binary sits on PATH (arm 1c of [`which_line`]). Pure, so the
-/// wording is unit-testable without a signed index cache on disk.
+/// The `which` answer for a program of ALab's own that is NOT installed while a
+/// same-named unrelated binary on PATH runs in its place (arm 2a of [`which_line`]).
+/// Pure, so the wording is unit-testable without a signed index cache on disk.
 ///
-/// The truth leads: a recorded row that says WHY nothing runs (unserved on this target)
-/// is quoted as-is; otherwise plain not-installed with the fix.
-/// Then the foreign binary, named for what it is — never as "the system copy" of a
-/// program it has nothing to do with.
+/// The truth leads: a recorded row that says WHY nothing runs (unserved on this target,
+/// or held) is quoted as-is; else a pending stub's promise (`stubbed`: it stands in the
+/// managed bin/, behind the unrelated binary); otherwise plain not-installed with the
+/// fix. Then the foreign binary, named for what it is — never as "the system copy" of
+/// a program it has nothing to do with.
 fn index_program_shadowed_by_unrelated_line(
     tool: &str,
     row_state: Option<&str>,
+    stubbed: bool,
     path: &std::path::Path,
 ) -> String {
     let truth = match row_state {
-        Some(st) if st.starts_with(crate::state::UNAVAILABLE_PREFIX) => {
+        Some(st)
+            if st.starts_with(crate::state::UNAVAILABLE_PREFIX)
+                || st.starts_with(crate::state::HELD_FAILED_PREFIX) =>
+        {
             format!("(nothing runs) — {st}")
         }
+        _ if stubbed => format!(
+            "(nothing runs) — not installed yet: the next pass installs it (now: aterm pkg \
+             install {})",
+            crate::stub::program_of(tool)
+        ),
         _ => format!("(nothing runs) — not installed (fix: aterm pkg install {tool})"),
     };
     format!(
@@ -4157,7 +4392,7 @@ fn no_alias_line_for(
 /// IT RUNS WHAT THE MANAGED NAME RUNS. `aterm claude` is the way to the managed copy from
 /// a terminal the `agents/` twin does not lead (`crate::hooks`), so this verb does before
 /// its `exec` what the shim and the twin do before theirs: it exports the environment the
-/// build declares ([`crate::ops::exec_env`], design S7 — `DISABLE_AUTOUPDATER=1` for
+/// build declares ([`crate::ops::managed`], design S7 — `DISABLE_AUTOUPDATER=1` for
 /// Claude Code), and a vendor's own self-update verb as the FIRST argument (`claude
 /// update|upgrade|install`, `codex update` — [`crate::selfupdate`]) is answered by the
 /// package manager (the plan [`cmd_selfupdate`] carries out), never by the vendor's
@@ -4199,7 +4434,7 @@ fn cmd_run(rest: &[String]) -> ExitCode {
             return ExitCode::from(127);
         }
         RunTarget::NotInstalled => {
-            eprintln!("{}", not_installed_fix(tool));
+            eprintln!("{}", not_runnable_line(&layout, tool));
             return ExitCode::from(127);
         }
     };
@@ -4545,305 +4780,13 @@ fn cmd_lease(rest: &[String]) -> ExitCode {
     }
 }
 
-/// The first line `atpkg relocate` prints, from the WHOLE report: what it vendored, what it
-/// rewrote ("nothing to vendor" only with nothing unresolved), or "already portable" — and
-/// nothing when references were left unresolved and nothing was rewritten, whose own lines
-/// then speak (never "already portable" above them).
-fn relocate_headline(report: &crate::relocate::Report) -> Option<String> {
-    if !report.vendored.is_empty() {
-        Some(format!(
-            "atpkg relocate: vendored {} lib(s) into {}, rewrote {} object(s): {}",
-            report.vendored.len(),
-            crate::relocate::VENDOR_REL,
-            report.rewritten,
-            report.vendored.join(", ")
-        ))
-    } else if report.rewritten > 0 {
-        // "Nothing to vendor" only when nothing is left unresolved: a lib whose vendor
-        // source is missing is one that needed vendoring.
-        let rest = if report.unresolved.is_empty() {
-            "; nothing to vendor"
-        } else {
-            ""
-        };
-        Some(format!(
-            "atpkg relocate: rewrote {} object(s){rest}",
-            report.rewritten
-        ))
-    } else if report.unresolved.is_empty() {
-        Some("atpkg relocate: no machine-local references found (already portable)".to_string())
-    } else {
-        None
-    }
-}
-
-/// `atpkg relocate <stage-root> [--sign <id>] [--advisory] [--donor-root <toolchain>]…
-/// [--lineage-dormant]` — PRODUCER-side pack-time relocation (§10.1). Vendors builder-path
-/// shared-library deps into the staged sysroot — from inside the declared donor roots
-/// only, each admitted as a Trust toolchain ([`crate::lineage::check_compiler`], with
-/// `--lineage-dormant` passed through) — and rewrites/deletes builder load commands so
-/// the eventual tarball is self-contained. Run BETWEEN staging and tar so the signed
-/// `tree_root` is computed over the RELOCATED payload. Fail-closed on any unresolved
-/// builder reference unless `--advisory`; a stock toolchain's library is refused
-/// whatever the flags.
-fn cmd_relocate(rest: &[String]) -> ExitCode {
-    let mut stage: Option<&str> = None;
-    let mut sign_id: Option<&str> = None;
-    let mut advisory = false;
-    let mut donors: Vec<&str> = Vec::new();
-    let mut policy = crate::lineage::LineagePolicy::Require;
-    let mut it = rest.iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--sign" => sign_id = it.next().map(String::as_str),
-            "--advisory" => advisory = true,
-            "--lineage-dormant" => policy = crate::lineage::LineagePolicy::Dormant,
-            "--donor-root" => match it.next() {
-                Some(d) => donors.push(d),
-                None => {
-                    return usage_error(
-                        "relocate",
-                        Some("--donor-root needs a toolchain directory"),
-                    );
-                }
-            },
-            s if !s.starts_with('-') && stage.is_none() => stage = Some(s),
-            other => {
-                // Name the grammar with the refusal. The bare "unexpected
-                // argument" read as "this verb takes no flags", and the manual
-                // agreed by omission — the audit's D-5, in the verb where the
-                // wrong conclusion means signing with the wrong identity.
-                return usage_error("relocate", Some(&format!("unexpected argument {other:?}")));
-            }
-        }
-    }
-    let Some(stage) = stage else {
-        return usage_error("relocate", None);
-    };
-    let stage_path = std::path::Path::new(stage);
-    if !stage_path.is_dir() {
-        eprintln!("atpkg relocate: {stage} is not a directory");
-        return ExitCode::from(1);
-    }
-    // A donor root is a Trust toolchain, admitted by content and lineage before anything
-    // is copied out of it.
-    let mut donor_roots = Vec::new();
-    for d in donors {
-        let root = match std::fs::canonicalize(d) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("atpkg relocate: donor root {d}: {e}");
-                return ExitCode::from(1);
-            }
-        };
-        if let Err(refusals) = crate::lineage::check_compiler(&root.join("bin"), policy) {
-            for r in refusals {
-                eprintln!(
-                    "atpkg relocate: donor root {} REFUSED — {r}",
-                    root.display()
-                );
-            }
-            return ExitCode::from(1);
-        }
-        donor_roots.push(root);
-    }
-    match crate::relocate::relocate_stage(stage_path, sign_id, &donor_roots) {
-        Ok(report) => {
-            if let Some(line) = relocate_headline(&report) {
-                println!("{line}");
-            }
-            for v in &report.vendored_from {
-                println!(
-                    "atpkg relocate:   {} = donor {} (sha256 {}, byte-identical before the \
-                     re-sign)",
-                    v.name, v.donor_rel, v.sha256
-                );
-            }
-            if !advisory {
-                if let Err(e) = report.require_self_contained() {
-                    eprintln!("atpkg relocate: {e}");
-                    return ExitCode::from(1);
-                }
-            } else {
-                for u in &report.unresolved {
-                    eprintln!("atpkg relocate: advisory: {u}");
-                }
-            }
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("atpkg relocate: {e}");
-            ExitCode::from(1)
-        }
-    }
-}
-
-/// `atpkg lineage <check-compiler|scan|seed-mint|stamp> …` ([`crate::lineage`]): the ONE
-/// content-based lineage checker, on the command line (`atpkg-publish` calls the same
-/// functions as a library). Records go to stdout as `key=value` lines; refusals to
-/// stderr, one per line, exit 1 — except `seed-mint`, whose refusals ARE its output
-/// (stdout, exit 1 when any). Exit 2 is a usage error.
-fn cmd_lineage(rest: &[String]) -> ExitCode {
-    use crate::lineage::{self, LineagePolicy};
-    let refuse = |problem: &str| usage_error("lineage", Some(problem));
-    let Some(sub) = rest.first().map(String::as_str) else {
-        return usage_error("lineage", None);
-    };
-    let mut operands: Vec<&str> = Vec::new();
-    let mut compiler: Option<&str> = None;
-    let mut from: Option<&str> = None;
-    let mut policy = LineagePolicy::Require;
-    let mut it = rest[1..].iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--lineage-dormant" if matches!(sub, "check-compiler" | "scan") => {
-                policy = LineagePolicy::Dormant;
-            }
-            "--compiler" if sub == "scan" => match it.next() {
-                Some(c) => compiler = Some(c),
-                None => return refuse("--compiler needs a bin directory"),
-            },
-            "--from" if sub == "stamp" => match it.next() {
-                Some(c) => from = Some(c),
-                None => return refuse("--from needs a bin directory"),
-            },
-            s if !s.starts_with('-') => operands.push(s),
-            other => {
-                return refuse(&format!(
-                    "unexpected argument {other:?} for `lineage {sub}`"
-                ));
-            }
-        }
-    }
-    let print_record = |record: &[(&str, String)]| {
-        for (k, v) in record {
-            println!("{k}={v}");
-        }
-    };
-    let refused = |what: &str, refusals: Vec<String>| {
-        for r in refusals {
-            eprintln!("atpkg lineage: REFUSED {what} — {r}");
-        }
-        ExitCode::from(1)
-    };
-    let note_unproven = |c: &lineage::Compiler| {
-        if c.lineage == lineage::LineageProof::Unproven {
-            eprintln!(
-                "atpkg lineage: lineage NOT ENFORCED — {} carries neither {} nor {}; admitted \
-                 only because --lineage-dormant was given, and recorded as `lineage=unproven`",
-                c.content.root.display(),
-                lineage::LINEAGE_FILE,
-                lineage::SEED_MINT_FILE
-            );
-        }
-    };
-    match (sub, operands.as_slice()) {
-        ("check-compiler", [bin]) => {
-            match lineage::check_compiler(std::path::Path::new(bin), policy) {
-                Ok(c) => {
-                    note_unproven(&c);
-                    eprintln!(
-                        "atpkg lineage: compiler ADMITTED — {} (trust {}, commit {}, lineage {})",
-                        c.content.bin_dir.display(),
-                        c.content.version.trust,
-                        c.content.version.commit,
-                        c.record()
-                            .iter()
-                            .find(|(k, _)| *k == "lineage")
-                            .map_or("", |(_, v)| v.as_str())
-                    );
-                    print_record(&c.record());
-                    ExitCode::SUCCESS
-                }
-                Err(r) => refused(bin, r),
-            }
-        }
-        ("scan", [stage]) => {
-            let Some(bin) = compiler else {
-                return refuse(
-                    "scan needs --compiler <bin-dir>: the compiler whose output this is",
-                );
-            };
-            let c = match lineage::check_compiler(std::path::Path::new(bin), policy) {
-                Ok(c) => c,
-                Err(r) => return refused(bin, r),
-            };
-            note_unproven(&c);
-            let report =
-                match lineage::scan_tree(std::path::Path::new(stage), &c.content.version.commit) {
-                    Ok(r) => r,
-                    Err(e) => return refused(stage, vec![e]),
-                };
-            if !report.findings.is_empty() {
-                const SHOWN: usize = 40;
-                let n = report.findings.len();
-                let mut lines: Vec<String> = report
-                    .findings
-                    .iter()
-                    .take(SHOWN)
-                    .map(lineage::Finding::describe)
-                    .collect();
-                if n > SHOWN {
-                    lines.push(format!("… and {} more finding(s)", n - SHOWN));
-                }
-                lines.push(format!(
-                    "{n} finding(s) in {stage}: these bytes were not built by the admitted \
-                     compiler {} — rebuild them with it",
-                    c.content.version.commit
-                ));
-                return refused(stage, lines);
-            }
-            eprintln!(
-                "atpkg lineage: scan OK — {} compiled object(s) under {stage} carry no other \
-                 compiler's evidence",
-                report.objects
-            );
-            let mut record = c.record();
-            record.push(("scan_objects", report.objects.to_string()));
-            record.push(("scan_findings", "0".to_string()));
-            print_record(&record);
-            ExitCode::SUCCESS
-        }
-        ("seed-mint", [seal, commit]) => {
-            let refusals = lineage::seed_mint_refusals(std::path::Path::new(seal), commit);
-            for r in &refusals {
-                println!("{r}");
-            }
-            if refusals.is_empty() {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(1)
-            }
-        }
-        ("stamp", [stage]) => {
-            let Some(bin) = from else {
-                return refuse(
-                    "stamp needs --from <bin-dir>: the sealed compiler the stage was copied from",
-                );
-            };
-            match lineage::stamp(std::path::Path::new(stage), std::path::Path::new(bin)) {
-                Ok(text) => {
-                    eprintln!("atpkg lineage: stamped {stage}/{}", lineage::LINEAGE_FILE);
-                    print!("{text}");
-                    ExitCode::SUCCESS
-                }
-                Err(r) => refused(stage, r),
-            }
-        }
-        ("check-compiler" | "scan" | "seed-mint" | "stamp", _) => {
-            refuse(&format!("wrong operands for `lineage {sub}`"))
-        }
-        (other, _) => refuse(&format!("unknown subcommand {other:?}")),
-    }
-}
-
 /// One usage refusal: the specific complaint (`atpkg <verb>: <problem>`) when there is
 /// one, then the verb's grammar, exit 2.
 ///
-/// The grammar comes from [`VERB_USAGE`] rather than a literal at the call site — a
+/// The grammar comes from the verb's [`Verb::usage`] rather than a literal at the call site — a
 /// second copy is the thing that rots. A verb with no entry prints no usage line, never a
 /// panic on the error path.
-fn usage_error(verb: &str, problem: Option<&str>) -> ExitCode {
+pub(crate) fn usage_error(verb: &str, problem: Option<&str>) -> ExitCode {
     print_usage_error(verb, problem);
     ExitCode::from(2)
 }
@@ -4856,82 +4799,6 @@ fn print_usage_error(verb: &str, problem: Option<&str>) {
     }
     if let Some(usage) = verb_usage(verb) {
         eprintln!("usage: {usage}");
-    }
-}
-
-/// Parse `noindex`'s argv: `verify <dir>`, the one form. `Err(code)` has ALREADY printed
-/// the usage error. Pure apart from that, so the grammar is pinned by
-/// `tests::noindex_grammar_is_exact` without a 20-second probe in the loop.
-fn parse_noindex(rest: &[String]) -> Result<String, ExitCode> {
-    let refuse = |problem: &str| usage_error("noindex", Some(problem));
-    match rest {
-        [sub, dir] if sub == "verify" && !dir.starts_with('-') => Ok(dir.clone()),
-        [sub] if sub == "verify" => Err(refuse(
-            "`verify` names no directory — say which one, e.g. `aterm pkg noindex verify .`",
-        )),
-        [] => Err(refuse(
-            "say what to measure: `aterm pkg noindex verify <dir>`",
-        )),
-        [_, extra, ..] if rest[0] == "verify" => {
-            Err(refuse(&format!("unexpected argument {extra:?}")))
-        }
-        [other, ..] => Err(refuse(&format!("unexpected argument {other:?}"))),
-    }
-}
-
-/// `atpkg noindex verify <dir>` — MEASURE whether Spotlight indexes `<dir>` (§9): a probe
-/// planted in it and a control planted after it beside it ([`crate::noindex::verify`]).
-///
-/// THREE exits, because the question has three answers: 0 excluded, 1 measured-indexed,
-/// 3 could-not-measure. The verdict's own `Display` is the whole answer line — a second
-/// sentence restating it here is how two spellings of one fact start to drift.
-fn cmd_noindex(rest: &[String]) -> ExitCode {
-    let dir = match parse_noindex(rest) {
-        Ok(dir) => dir,
-        Err(code) => return code,
-    };
-    verdict_exit(&measure_and_say(
-        "atpkg noindex",
-        std::path::Path::new(&dir),
-    ))
-}
-
-/// Measure `path` and print the verdict under `speaker`, announcing the wait first and
-/// naming the real directory when the operand is a symlink.
-fn measure_and_say(speaker: &str, path: &std::path::Path) -> crate::noindex::Verdict {
-    if crate::noindex::SUPPORTED {
-        // Announce the wait BEFORE it happens. Twenty seconds of a silent cursor reads
-        // as a hang, and the first thing a reader does about a hang is ^C — which kills
-        // the measurement mid-probe and leaves them with no answer at all.
-        println!(
-            "{speaker}: probing (up to {}s — the control must index first, and the margin \
-             after it scales with how long that took)",
-            crate::noindex::Timing::DEFAULT.worst_case().as_secs()
-        );
-        // The probe measures the REAL directory (`verify` canonicalizes), so when the
-        // operand is a link, say which tree the answer is about.
-        if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
-            && let Ok(real) = std::fs::canonicalize(path)
-        {
-            println!(
-                "{speaker}: {} is a symlink — the probe measures {}",
-                path.display(),
-                real.display()
-            );
-        }
-    }
-    let verdict = crate::noindex::verify(path, &crate::noindex::Timing::DEFAULT);
-    println!("{speaker}: {}: {verdict}", path.display());
-    verdict
-}
-
-/// A measured verdict's exit: 0 excluded (or no Spotlight here), 1 indexed, 3 unmeasured.
-fn verdict_exit(verdict: &crate::noindex::Verdict) -> ExitCode {
-    use crate::noindex::Verdict;
-    match verdict {
-        Verdict::Excluded | Verdict::NotApplicable => ExitCode::SUCCESS,
-        Verdict::Indexed => ExitCode::from(1),
-        Verdict::Unknown(_) => ExitCode::from(3),
     }
 }
 
@@ -5087,8 +4954,8 @@ fn run_repair(layout: Option<crate::store::Layout>) -> ExitCode {
     // The rustup seam as every pass re-asserts it — and, this being the pass a person asked
     // for, a link to a toolchain older than the store's re-pointed at it too.
     if let Some(home) = crate::seam::rustup_home() {
-        for line in crate::seam::repair(&layout, &home) {
-            println!("repair: {line}");
+        for event in crate::seam::repair(&layout, &home) {
+            println!("repair: {event}");
         }
     }
     repair_store(&layout, &leftovers)
@@ -6960,9 +6827,20 @@ fn record_index_freshness(layout: &crate::store::Layout, now: i64, index_build: 
 fn github_fetcher(layout: &crate::store::Layout) -> crate::GithubFetcher {
     let cfg = crate::config::cached();
     let owner = crate::resolve_account(cfg.account()).owner;
+    let floor = crate::index_probe::verified_floor(layout);
+    // A store that verified nothing yet may still hold the §14 cache of a resolve that landed
+    // nothing: its highest build seeds the discovery rounds' guesses. A store with a floor
+    // walks from it in one round already, and is not asked to read its cache for this.
+    let hint = (floor == 0)
+        .then(|| {
+            crate::index_probe::cached_index_builds(layout, &crate::net::github_source_id(&owner))
+        })
+        .flatten()
+        .and_then(|builds| builds.into_iter().max());
     crate::GithubFetcher::new(owner)
         .with_overrides(crate::repo_overrides(cfg))
-        .with_index_floor(crate::index_probe::verified_floor(layout))
+        .with_index_floor(floor)
+        .with_index_hint(hint)
 }
 
 /// `ATPKG_REGISTRY` — a DEVELOPMENT SEAM (`aterm_types::dev_seam!`): swaps the whole fetch
@@ -7262,7 +7140,8 @@ fn reconcile_system_satisfied_with(
 /// offline, no network, nothing written. Settings ▸ Packages' "latest known" for an ALab program (Phase 4), read on the
 /// window's worker thread; `cfg` is passed because a window lives for days and re-reads
 /// `aterm.toml` rather than trusting this process's first read. `None` when nothing cached
-/// verifies. Vendor programs are never in it: no index pins them.
+/// verifies. Vendor programs are never in it — no index pins them — except one the source
+/// rule hands to the index lane here ([`crate::alab`]: ALab's build, pinned for this target).
 #[must_use]
 pub fn latest_known_pins(
     layout: &crate::store::Layout,
@@ -7273,7 +7152,10 @@ pub fn latest_known_pins(
         .channel_for(crate::config::CHANNEL, current_triple())?
         .pin
         .into_iter()
-        .filter(|(program, _)| !crate::vendor_direct::is_vendor(program))
+        .filter(|(program, _)| {
+            !crate::vendor_direct::is_vendor(program)
+                || crate::alab::index_owns(layout, program, current_triple(), Some(&index))
+        })
         .collect();
     Some((index.index_build, pins))
 }
@@ -8211,21 +8093,48 @@ impl MachineApply {
 /// queue let go by the close stayed taken there, holding the next apply in line behind a
 /// shell's exec rather than an apply.
 fn machine_apply_queue() -> Option<crate::lock::Flock> {
+    crate::lock::Flock::lock(machine_lock_file()?).ok()
+}
+
+/// `<prefix>/machine.lock`, opened for [`machine_apply_queue`] — the prefix made first — or
+/// `None` where it cannot be.
+fn machine_lock_file() -> Option<std::fs::File> {
     let layout = crate::store::resolve_configured()?;
     layout.ensure_dir(&layout.prefix).ok()?;
-    let file = std::fs::OpenOptions::new()
+    std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(layout.prefix.join("machine.lock"))
-        .ok()?;
-    crate::lock::Flock::lock(file).ok()
+        .ok()
+}
+
+/// A pass edge's turn at the `[machine]` queue ([`apply_machine_edit`]), never waited for.
+enum MachineTurn {
+    /// Taken: the edge applies, holding it.
+    Mine(crate::lock::Flock),
+    /// Another apply holds it now.
+    Busy,
+    /// No queue to take ([`machine_apply_queue`]'s `None`): the edge applies unqueued.
+    Unqueued,
+}
+
+/// The edge's [`MachineTurn`]: the queue taken at once, held by another apply, or not there.
+fn machine_apply_turn() -> MachineTurn {
+    let Some(file) = machine_lock_file() else {
+        return MachineTurn::Unqueued;
+    };
+    match crate::lock::Flock::try_lock(file) {
+        Ok(turn) => MachineTurn::Mine(turn),
+        Err(std::fs::TryLockError::WouldBlock) => MachineTurn::Busy,
+        Err(std::fs::TryLockError::Error(_)) => MachineTurn::Unqueued,
+    }
 }
 
 /// A pass's `[machine]` edit ([`main_entry`]), applied BESIDE the pass: on its own thread,
 /// started before the store lock is asked for and joined when this guard drops (or at
-/// [`Self::join`]). The `defaults` reads and writes — tens of milliseconds, and as long as
-/// another apply holds the queue ([`machine_apply_queue`]) — then delay neither the lock
+/// [`Self::join`]). The `defaults` reads and writes — tens of milliseconds; none while
+/// another apply holds the queue ([`apply_machine_edit`]) — then delay neither the lock
 /// attempt nor the work after it, and the edit has still landed, and said so on stdout,
 /// before the pass exits.
 struct MachineEdit(Option<std::thread::JoinHandle<()>>);
@@ -8261,10 +8170,18 @@ impl Drop for MachineEdit {
     }
 }
 
-/// The edge's apply: behind any apply already running (the window's or a session's launch
-/// apply), and then only if that one did not just apply this very table.
+/// The edge's apply, only if no apply just applied this very table — and NONE WHILE ANOTHER
+/// APPLY HOLDS THE QUEUE: that one (the window's or a session's launch apply, which a first
+/// launch starts beside its seed) applies the table and says so on its own lane, and an edit
+/// it started too early to read is carried by the next pass's edge — the edge does not wait
+/// it out. Waiting held the first launch's seed, and the update that installs behind it,
+/// until the window's `defaults` writes were done.
 fn apply_machine_edit() {
-    let _queue = machine_apply_queue();
+    let _turn = match machine_apply_turn() {
+        MachineTurn::Busy => return,
+        MachineTurn::Mine(turn) => Some(turn),
+        MachineTurn::Unqueued => None,
+    };
     if machine_table_changed() {
         let _ = apply_machine_settings();
     }
@@ -8279,7 +8196,7 @@ fn apply_machine_edit() {
 /// `update <vendor program>` never does (the edge checks its operand) — it is the lane a
 /// `claude update` runs, and must not write a host preference. The quick mutators never do.
 fn verb_applies_machine_settings(verb: &str) -> bool {
-    matches!(verb, "install" | "seed" | "update")
+    verb_row(verb).is_some_and(|v| v.applies_machine)
 }
 
 /// Whether the `[machine]` table differs from the one last applied on this machine
@@ -8571,7 +8488,7 @@ pub(crate) fn agent_twin_current(layout: &crate::store::Layout, name: &str, buil
     {
         return false;
     }
-    crate::platform::resolve_shim(&layout.agent_shim(&tool)).is_some_and(|t| t == target)
+    crate::activate::twin_target(layout, name).is_some_and(|t| t == target)
 }
 
 /// [`agent_twin_current`] AND the twin's bytes carry the self-update hand-over
@@ -8674,8 +8591,6 @@ pub(crate) fn shell_remedy_for(
     }
     let agents = layout.agents_dir().display().to_string();
     let mut s = String::new();
-    // (Arms over the bare name, not `Some("…") =>`: `verb_hint_matches_dispatch`
-    // scrapes this file for that shape as the verb dispatch table.)
     match shell.unwrap_or_default() {
         "fish" => {
             s.push_str("set -gx PATH \"");
@@ -8955,11 +8870,11 @@ pub const SEED_DONE_MARKER: &str = "seed-done: ";
 /// person who typed `claude update` while a pass holds the store sees the wait — a
 /// spinner, or on a terminal that cannot draw one the `lock-waiting:` line as a sentence
 /// ([`human_marker`]) — until the holder lets go, and, only when the whole 30 minutes
-/// run out, this line, then the intercept's own contended line on stderr — pinned
-/// in-process by
-/// `cmd_selfupdate_refuses_forwards_and_never_takes_the_lock` (the 75 lane, a 1 s
-/// bound) and at the edge by `tests/selfupdate_intercept.rs` (the wait that ends in the
-/// lock).
+/// run out, this line, then the intercept's own contended line on stderr — pinned at
+/// the edge by `tests/store_lock_wait.rs` (`a_waiting_seed_times_out_with_exit_75`) and
+/// `tests/selfupdate_intercept.rs` (the wait that ends in the lock), the intercept's
+/// relay of the 75 in-process by
+/// `cmd_selfupdate_refuses_forwards_and_never_takes_the_lock`.
 ///
 /// Without it the GUI's refusal branch would put "install failed" on a machine where the
 /// install is RUNNING in another process. Contention is a fact about this process's
@@ -9436,8 +9351,11 @@ fn do_install_with(
     let mut resolved_assets = std::collections::BTreeMap::new();
     // Typed on a terminal, the install draws its download under the meter ([`TypedPass`]).
     let typed = TypedPass::begin("install");
-    let result = match crate::vendor_direct::spec(program) {
+    let result = match crate::vendor_direct::spec(program)
+        .filter(|_| !index_owns_now(layout, fetcher, program))
+    {
         // A vendor-direct program: its own lane, which records its row ([`install_vendor_door`]).
+        // One the source rule hands to the index lane here is the index flow's below.
         Some(spec) => install_vendor_door(layout, fetcher, channel, spec, seams),
         None => crate::flow::install_collecting_assets(
             fetcher,
@@ -9593,12 +9511,6 @@ fn cmd_install_argv(rest: &[String]) -> ExitCode {
 /// `--default-set` route applies this machine's `[machine]` settings (Universal Control's
 /// two `defaults` keys) and then reaches for the network, so a test that called
 /// the verb to learn what an argv MEANS would do all of that to find out.
-///
-/// The refusals carry a built `ExitCode`, not a `u8` the caller converts: every exit
-/// code built in this file must be a literal or one of the two named relays, which is
-/// what lets `contention_exit_code_is_temp_fail_and_unshared` enumerate the codes the
-/// CLI can exit with and prove none of them is contention's 75. That scan reads this
-/// file as TEXT, so the sentence above may not spell the constructor it looks for.
 fn parse_install_argv(rest: &[String]) -> Result<Option<&String>, ExitCode> {
     if rest.len() > 1 {
         eprintln!(
@@ -9647,6 +9559,18 @@ fn cmd_install(program: Option<&String>, invoked_as: &str) -> ExitCode {
         eprintln!("atpkg: {program:?} is a command-line flag, not a program name");
         eprintln!("atpkg:   one program:      aterm pkg install <program>");
         eprintln!("atpkg:   the whole toolset: aterm pkg install --default-set");
+        return ExitCode::from(2);
+    }
+    // A COMMAND IS NOT A PROGRAM: `targo` comes with `trust`, and the index names no
+    // program `targo`, so its install could only fail with the roster. Name the install
+    // that lays it instead of installing anything the person did not name — a command only
+    // a signed manifest exposes included, while its stub stands ([`crate::stub::program_of_in`]).
+    let ships = crate::store::resolve_configured().map_or_else(
+        || crate::stub::program_of(program).to_string(),
+        |layout| crate::stub::program_of_in(&layout, program),
+    );
+    if ships != *program {
+        eprintln!("atpkg: {program} comes with {ships}: aterm pkg install {ships}");
         return ExitCode::from(2);
     }
     if !manager_enabled() {
@@ -9754,7 +9678,10 @@ fn cmd_install_with(
         }
         Err(crate::FlowError::Linked(p)) => {
             // A dev-linked program is managed from its checkout — a hard skip, not a failure.
-            println!("{}", dev_linked_line(&p));
+            println!(
+                "{}",
+                dev_linked_line(&p, unlink_returns_to_alab(layout, &p))
+            );
             ExitCode::SUCCESS
         }
         // A target the pinned build — or the vendor — does not serve is a STATE, never an
@@ -10007,16 +9934,24 @@ fn cmd_rollback_vendor(
             let tree_root =
                 crate::vendor_direct::complete_record(&layout.build_dir(program, build))
                     .map_or_else(|| legacy_root_of(layout, program, build), |r| r.tree_root);
-            let why = format!("rolled back from {}", moved.from);
+            // An ALab build's row names it as ALab's ([`crate::state::alab_kept`]).
+            let state = if crate::alab::build_is_alab(layout, program, build) {
+                crate::state::alab_kept(
+                    build,
+                    &format!("{}; rolled back from {}", moved.to, moved.from),
+                )
+            } else {
+                crate::state::vendor_kept(
+                    &crate::vendor_direct::build_label(build),
+                    &format!("rolled back from {}", moved.from),
+                )
+            };
             record_status(
                 layout,
                 program,
                 crate::ProgramStatus {
                     installed_build: Some(build),
-                    state: crate::state::vendor_kept(
-                        &crate::vendor_direct::build_label(build),
-                        &why,
-                    ),
+                    state,
                     tree_root,
                 },
                 format!("rolled back {program} {} -> {}", moved.from, moved.to),
@@ -10027,7 +9962,8 @@ fn cmd_rollback_vendor(
                     spec,
                     &moved.from,
                     &moved.to,
-                    crate::pin::is_pinned(layout, program)
+                    crate::pin::is_pinned(layout, program),
+                    alab_channel_of(layout, program, build)
                 )
             );
             ExitCode::SUCCESS
@@ -10039,20 +9975,42 @@ fn cmd_rollback_vendor(
     }
 }
 
+/// The ALab product whose channel moves `program` on from `build` after a rollback: `Some`
+/// when `build` is an ALab build ([`crate::alab::build_is_alab`]) and no person chose the
+/// vendor's build here — the next update then follows ALab's channel, never the vendor's head.
+fn alab_channel_of(
+    layout: &crate::store::Layout,
+    program: &str,
+    build: u64,
+) -> Option<&'static str> {
+    let agent = crate::alab::agent(program)?;
+    (crate::alab::build_is_alab(layout, program, build)
+        && !crate::alab::vendor_chosen(layout, program))
+    .then_some(agent.product)
+}
+
 /// [`cmd_rollback_vendor`]'s line: versions, and how the rollback holds. A `pinned`
 /// program stays (the vendor lane leaves a pinned program alone), and the line says so in
-/// [`rollback_line`]'s words.
+/// [`rollback_line`]'s words. On an ALab build (`alab`, [`alab_channel_of`]) the next update
+/// follows that product's channel, and the line names it rather than the vendor's latest.
 fn vendor_rolled_back_line(
     spec: &crate::vendor_direct::VendorSpec,
     from: &str,
     to: &str,
     pinned: bool,
+    alab: Option<&str>,
 ) -> String {
     let p = spec.program;
     if pinned {
         return format!(
             "atpkg: rolled back {p} from {from} to {to}; it is pinned, so updates leave it \
              there until `aterm pkg unpin {p}`"
+        );
+    }
+    if let Some(product) = alab {
+        return format!(
+            "atpkg: rolled back {p} from {from} to {to}; `aterm pkg pin {p}` holds it there \
+             (otherwise the next update follows {product}'s channel)"
         );
     }
     format!(
@@ -10192,10 +10150,37 @@ fn pin_peers_of(
     Some((group, others))
 }
 
+/// Whether `unlink` hands `program` back to ALab's channel on this machine: a program ALab
+/// builds here ([`crate::alab`]) that no person moved to the vendor's build, whose
+/// activation link names an ALab store build or whose last verified index pins one. Every
+/// other answer is the program's own source, as [`dev_linked_line`] says.
+fn unlink_returns_to_alab(layout: &crate::store::Layout, program: &str) -> bool {
+    if crate::alab::agent(program).is_none() || crate::alab::vendor_chosen(layout, program) {
+        return false;
+    }
+    let active = std::fs::read_link(layout.program_current(program))
+        .ok()
+        .and_then(|t| t.file_name()?.to_str()?.parse::<u64>().ok())
+        .is_some_and(|b| crate::alab::build_is_alab(layout, program, b));
+    active
+        || cached_index(layout).is_some_and(|index| {
+            crate::alab::index_pin(&index, program, current_triple()).is_some()
+        })
+}
+
 /// The dev-linked skip, pure: what `unlink` hands the program back to is the program's
-/// own source — the vendor's latest for a vendor-direct program (never the registry, which
-/// supplies no bytes for it), the registry pin for the rest (audit).
-fn dev_linked_line(program: &str) -> String {
+/// own source — ALab's build for an ALab-built agent program on a machine that follows
+/// ALab's channel (`alab`, [`unlink_returns_to_alab`]), the vendor's latest for a
+/// vendor-direct program (never the registry, which supplies no bytes for it), the
+/// registry pin for the rest (audit).
+fn dev_linked_line(program: &str, alab: bool) -> String {
+    if alab && let Some(agent) = crate::alab::agent(program) {
+        return format!(
+            "atpkg: {program} is dev-linked; run `aterm pkg unlink {program}` to return to the \
+             {} build",
+            agent.product
+        );
+    }
     match crate::vendor_direct::spec(program) {
         Some(spec) => format!(
             "atpkg: {program} is dev-linked; run `aterm pkg unlink {program}` to install {}'s \
@@ -10269,14 +10254,23 @@ fn cmd_pin(program: Option<&String>, pinned: bool) -> ExitCode {
 /// ([`forget_vendor_refusal`]) — so the two spellings agree on what "try again" means.
 fn cmd_update_argv(rest: &[String]) -> ExitCode {
     let mut retry = false;
+    let mut choice: Option<&str> = None;
     let mut operands: Vec<&String> = Vec::new();
     for arg in rest {
         if arg == "--retry" {
             retry = true;
+        } else if arg == SOURCE_VENDOR_FLAG || arg == SOURCE_ALAB_FLAG {
+            if choice.is_some_and(|c| c != arg) {
+                return usage_error(
+                    "update",
+                    Some("--vendor and --alab are two answers to one question — pass one"),
+                );
+            }
+            choice = Some(arg.as_str());
         } else if arg.starts_with('-') {
             // Unreachable through the dispatch edge: its unknown-flag check takes the
-            // FIRST position, and its one-operand gate counts a flag anywhere else as an
-            // operand ([`at_most_one_operand`]). Kept so the grammar is total for a direct
+            // FIRST position, and its arity gate counts a flag anywhere else as an
+            // operand ([`arity_refusal`]). Kept so the grammar is total for a direct
             // caller.
             let problem = format!("unknown option {arg:?} for `aterm pkg update`");
             return usage_error("update", Some(&problem));
@@ -10284,14 +10278,16 @@ fn cmd_update_argv(rest: &[String]) -> ExitCode {
             operands.push(arg);
         }
     }
-    // A SECOND NAME IS REFUSED, in the one-operand gate's own words
-    // ([`at_most_one_operand`]). The dispatch edge already refused it before the store
-    // lock ([`ONE_OPERAND_FLAGGED_VERBS`]); this keeps the grammar total for a direct
-    // caller — before anything is forgotten or run.
-    if let Some(refusal) = at_most_one_operand(rest, "update") {
+    // A SECOND NAME IS REFUSED, in the arity gate's own words ([`arity_refusal`]). The
+    // dispatch edge already refused it before the store lock; this keeps the grammar total
+    // for a direct caller — before anything is forgotten or run.
+    if let Some(refusal) = arity_refusal(rest, "update") {
         return refusal;
     }
     let program = operands.first().copied();
+    if let Some(choice) = choice {
+        return cmd_update_source(program.map(String::as_str), choice);
+    }
     // THE NAME IS ADMITTED BEFORE ANYTHING IS FORGOTTEN. `--retry` deletes `*.refused`
     // files under `store/<program>/`, and nothing between the dispatch edge (which refuses
     // only flags) and this line asks whether `<program>` is one directory name — so
@@ -10324,6 +10320,54 @@ fn cmd_update_argv(rest: &[String]) -> ExitCode {
         println!("{}", retry_line(forgotten));
     }
     cmd_update(program)
+}
+
+/// `update <program> --vendor | --alab` (B9 of the managed-codex plan): record or forget a
+/// person's choice of the vendor's build of an ALab-built program on this machine, then
+/// update that program by the source rule it now reads ([`crate::alab`]). Refused for a
+/// program ALab builds nowhere, or with no program named: the choice is per program.
+fn cmd_update_source(program: Option<&str>, choice: &str) -> ExitCode {
+    let Some(program) = program else {
+        return usage_error("update", Some("--vendor and --alab name one program"));
+    };
+    let Some(agent) = crate::alab::agent(program) else {
+        let problem = format!(
+            "{program} has no ALab build to choose between — --vendor and --alab are for {}",
+            crate::alab::ALAB_AGENTS
+                .iter()
+                .map(|a| a.program)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        return usage_error("update", Some(&problem));
+    };
+    let Some(layout) = layout() else {
+        return ExitCode::from(1);
+    };
+    let vendor = crate::vendor_direct::spec(program).map_or("the vendor", |s| s.vendor);
+    if choice == SOURCE_VENDOR_FLAG {
+        if let Err(e) = crate::alab::choose_vendor(&layout, program) {
+            eprintln!("atpkg: update {program} --vendor failed: the choice was not recorded ({e})");
+            return ExitCode::from(1);
+        }
+        println!(
+            "atpkg: {program} follows {vendor}'s builds on this machine now — `aterm pkg update \
+             {program} --alab` returns it to {}'s channel",
+            agent.product
+        );
+    } else if crate::alab::clear_vendor_choice(&layout, program) {
+        println!(
+            "atpkg: {program} follows {}'s channel on this machine again, where it publishes \
+             one",
+            agent.product
+        );
+    } else {
+        println!(
+            "atpkg: {program} already follows {}'s channel where it publishes one",
+            agent.product
+        );
+    }
+    cmd_update_one(&program.to_string())
 }
 
 /// `update --retry <program>`'s name gate: `Some(usage exit)`, said on stderr, for an
@@ -11027,6 +11071,38 @@ fn run_update_pass(
     complete_the_set: bool,
     seams: &PassSeams<'_>,
 ) -> u8 {
+    // The vendor lane's reads ahead run on threads of their own beside the pass, which waits
+    // for them all before it returns.
+    let reads = crate::vendor_direct::lane::Reads::new();
+    std::thread::scope(|scope| {
+        run_update_pass_in(
+            scope,
+            &reads,
+            layout,
+            cfg,
+            fetcher,
+            installed,
+            complete_the_set,
+            seams,
+        )
+    })
+}
+
+/// [`run_update_pass`] inside the scope its vendor reads ahead run in ([`read_vendors_ahead`]).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "run_update_pass's inputs and the scope and reads its vendor lane runs ahead in"
+)]
+fn run_update_pass_in<'scope, 'env>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    reads: &'env crate::vendor_direct::lane::Reads,
+    layout: &'env crate::store::Layout,
+    cfg: &crate::config::PackagesConfig,
+    fetcher: &'env dyn crate::flow::Fetcher,
+    installed: &std::collections::BTreeMap<String, u64>,
+    complete_the_set: bool,
+    seams: &PassSeams<'env>,
+) -> u8 {
     let mut failures = 0u32;
     // Whether EITHER lane of this pass resolved the signed index (from the channel or the
     // §14 cache): the pass-end build stamp's condition. The apply lane exits early when it
@@ -11058,6 +11134,19 @@ fn run_update_pass(
     // Whether this pass has index work at all: a pass that asked no index (a store holding
     // only a vendor program tombstoned in place) records nothing about one.
     let index_asked = !installed.is_empty() || complete_the_set;
+    // THE VENDOR LANE'S READS GO OUT WITH THE INDEX RESOLVE, not after it: its heads and the
+    // documents they name need no index — only its yanks do, and the plan that binds them
+    // takes what was read once the index is in ([`read_vendors_ahead`]).
+    let reading = read_vendors_ahead(
+        scope,
+        reads,
+        layout,
+        fetcher,
+        cfg,
+        installed,
+        complete_the_set,
+        seams,
+    );
     let mut resolved = index_asked.then(|| {
         PASS_INDEX_RESOLVE_ATTEMPTED.with(|seen| seen.set(true));
         crate::resolve_verified_index(
@@ -11135,7 +11224,11 @@ fn run_update_pass(
     // The vendor lane's downloads under a person's meter too ([`TypedPass`]).
     let consent = set_completion_consent(adopted(layout), adopted_by_seed(layout));
     let typed = TypedPass::begin("update");
-    let (mut vendor, fresh) = vendor_plan(
+    // A first run's set announces once this plan is in, so a vendor whose read is still out
+    // a moment past the index lands after the set instead ([`VENDOR_READ_GRACE`]); every
+    // other pass lands its installed vendors first and waits for them all.
+    let first_run = complete_the_set && installed.is_empty() && matches!(resolved, Some(Ok(_)));
+    let (mut vendor, mut fresh) = vendor_plan_reading(
         layout,
         fetcher,
         cfg,
@@ -11149,7 +11242,12 @@ fn run_update_pass(
             _ => None,
         },
         seams,
+        reading.then(|| ReadsAhead {
+            reads,
+            until: first_run.then(|| std::time::Instant::now() + VENDOR_READ_GRACE),
+        }),
     );
+    let late = std::mem::take(&mut fresh.late);
     // AN EMPTY STORE'S FRESH VENDORS RIDE ITS SET COMPLETION, not ahead of it. On a first
     // run every agent and the whole ALab set arrive in one pass, and landing the four agents
     // first held the toolchain's first byte back by their whole download (about 770 MiB);
@@ -11234,6 +11332,7 @@ fn run_update_pass(
         // ADDED to the vendor lane's faults, never over them: an overwrite here turned a
         // vendor refusal into a green pass whenever the index resolved.
         failures += report_channel_apply(layout, installed, &report, &vendor_failed, true);
+        warm_alab_landed(layout, installed, seams.warm_agents);
         for (group, outcome) in &report.groups {
             if matches!(outcome, crate::TxnOutcome::Deferred { .. }) {
                 held_flip.extend(group.members.iter().cloned());
@@ -11283,7 +11382,7 @@ fn run_update_pass(
         // The consent the line states is the one that holds on this machine: installing
         // aterm, with `auto_install = false` as the switch that would have stopped it —
         // unless a person adopted the set with the explicit verb ([`set_completion_consent`]).
-        let net = install_default_set_beside(
+        let net = install_default_set_with_path(
             layout,
             fetcher,
             &(seams.anchor)(layout),
@@ -11297,9 +11396,11 @@ fn run_update_pass(
             SetCompanions {
                 vendor: rider.as_mut(),
                 toolchain_flipped: &toolchain_flipped,
+                vendors_after: !late.is_empty(),
             },
         );
         failures += net.failures;
+        warm_alab_landed(layout, &before_net, seams.warm_agents);
         // What arrived under the set completion's announcement — the vendors that rode it
         // included, the ones landed alone below (with a terminal of their own) not.
         let mut arrived: Vec<String> = crate::active_builds(layout)
@@ -11307,35 +11408,23 @@ fn run_update_pass(
             .filter(|k| !before_net.contains_key(k.as_str()))
             .cloned()
             .collect();
-        // The rider's outcomes, reported on this thread (every status row is written here),
-        // or its landings alone when the set completion stopped before it could carry them.
+        // What the rider's landings came to, or its landings alone when the set completion
+        // stopped before it could carry them. The promise goes with that plan only when
+        // nothing lands after it: a vendor whose read was still out lands next, and its plan
+        // takes the promise over ([`land_late_vendors`]) — a stub waiting for it never reads
+        // it gone first.
         let mut deferred: Vec<&'static str> = Vec::new();
         if let Some(rider) = rider.take() {
             let failed_before = vendor.failures;
-            match rider.landed {
-                Some(landed) => {
-                    for outcome in &landed.outcomes {
-                        if matches!(
-                            outcome.verdict,
-                            crate::vendor_direct::lane::Verdict::Deferred { .. }
-                        ) {
-                            deferred.push(outcome.spec.program);
-                        }
-                        report_vendor(layout, outcome, &mut vendor, false, rider.fresh.now);
-                    }
-                    vendor.landed.retain(|p| !landed.warmed.contains(p));
-                }
-                None => land_fresh_alone(
-                    layout,
-                    fetcher,
-                    consent,
-                    &rider.fresh,
-                    &mut vendor,
-                    seams,
-                    true,
-                ),
-            }
-            warm_landed(layout, &mut vendor, seams);
+            deferred = settle_rider(
+                layout,
+                fetcher,
+                consent,
+                rider,
+                &mut vendor,
+                seams,
+                late.is_empty(),
+            );
             failures += vendor.failures - failed_before;
             resolved_assets.extend(vendor.resolved_assets.clone());
         }
@@ -11368,6 +11457,23 @@ fn run_update_pass(
             if let Some(line) = fresh_landing_terminal(&[], &deferred, net.announced_count) {
                 emit_marker_line(&line);
             }
+        }
+        // The vendors whose reads were still out when the set announced, once it is done.
+        if !late.is_empty() {
+            let failed_before = vendor.failures;
+            land_late_vendors(
+                layout,
+                fetcher,
+                consent,
+                reads,
+                &late,
+                pass_index.as_ref(),
+                &mut vendor,
+                seams,
+            );
+            warm_landed(layout, &mut vendor, seams);
+            failures += vendor.failures - failed_before;
+            resolved_assets.extend(vendor.resolved_assets.clone());
         }
         // A CLEAN pass retires a legacy `*seed*` offer row ([`retire_seed_row`]).
         if net.failures == 0 {
@@ -11515,7 +11621,7 @@ fn run_update_pass(
             Some(IndexServes::Unserved(served)) => {
                 let why = unserved_sentence(current_triple(), served);
                 (
-                    format!("nothing is installed and nothing was installable — {why}"),
+                    format!("{NOTHING_INSTALLABLE_LEAD}{why}"),
                     crate::state::TOOLSET_UNSERVED,
                     Some(why),
                 )
@@ -11524,11 +11630,7 @@ fn run_update_pass(
             // what left nothing — said as that, never as the architecture.
             Some(IndexServes::Narrowed(narrowing)) => {
                 let (why, state) = narrowing.verdict(current_triple());
-                (
-                    format!("nothing is installed and nothing was installable — {why}"),
-                    state,
-                    Some(why),
-                )
+                (format!("{NOTHING_INSTALLABLE_LEAD}{why}"), state, Some(why))
             }
             // `None` = the index never RESOLVED — an offline machine, a rate
             // limit, a proxy — never a machine that cannot be served (audit-2 item 6).
@@ -11749,9 +11851,11 @@ fn net_announcement(
 /// here can move a live `trust` (a sibling the index added, one whose shims are gone), and
 /// under the unattended gate that move waits for quiet like any other. `held_flip` names the
 /// members of a tuple whose flip the caller's apply lane already held: that tuple is left
-/// to the held flip, which installs its absent members with it.
+/// to the held flip, which installs its absent members with it. `companions` is what the
+/// pass hands it besides: the vendor landings that ride it, and what follows the toolchain's
+/// flip ([`SetCompanions`]).
 ///
-/// It is not a nicety. A pass answers two questions against `PATH` — "is a
+/// The injected `PATH` is not a nicety. A pass answers two questions against `PATH` — "is a
 /// foreign copy of this tool ahead of ours" (`reconcile_shadowed`) and "is this
 /// program already satisfied by a system install"
 /// (`reconcile_system_satisfied_with`) — and read from the process environment, a
@@ -11759,57 +11863,10 @@ fn net_announcement(
 #[allow(
     clippy::too_many_arguments,
     reason = "the default-set pass's whole verified context, the caller's already-resolved \
-              index, the injected `PATH` the shadow and system-satisfied probes read, and \
-              the caller's flip gate with what it holds"
+              index, the injected `PATH` the shadow and system-satisfied probes read, the \
+              caller's flip gate with what it holds, and what the pass hands it besides"
 )]
 fn install_default_set_with_path(
-    layout: &crate::store::Layout,
-    fetcher: &dyn crate::flow::Fetcher,
-    anchor: &crate::Anchor,
-    cfg: &crate::config::PackagesConfig,
-    consent: Consent,
-    now: i64,
-    index: Option<&crate::TrustedIndex>,
-    path_var: Option<&std::ffi::OsStr>,
-    flip: &crate::quiet::FlipGate<'_>,
-    held_flip: &std::collections::BTreeSet<String>,
-) -> DefaultSetOutcome {
-    install_default_set_beside(
-        layout,
-        fetcher,
-        anchor,
-        cfg,
-        consent,
-        now,
-        index,
-        path_var,
-        flip,
-        held_flip,
-        SetCompanions {
-            vendor: None,
-            toolchain_flipped: &|_| {},
-        },
-    )
-}
-
-/// What an update pass's set completion carries besides its own members
-/// ([`install_default_set_beside`]).
-struct SetCompanions<'c, 'r> {
-    /// The vendor lane's fresh landings, announced and landed beside the set's
-    /// ([`VendorRider`]).
-    vendor: Option<&'c mut VendorRider<'r>>,
-    /// Run the moment a tuple holding the Trust toolchain flips: the pass's rustup view
-    /// and exec roots, which the pass end re-lays as well.
-    toolchain_flipped: &'c dyn Fn(&crate::store::Layout),
-}
-
-/// [`install_default_set_with_path`] with its [`SetCompanions`].
-#[allow(
-    clippy::too_many_arguments,
-    reason = "[`install_default_set_with_path`]'s inputs and what an update pass hands it \
-              besides"
-)]
-fn install_default_set_beside(
     layout: &crate::store::Layout,
     fetcher: &dyn crate::flow::Fetcher,
     anchor: &crate::Anchor,
@@ -11838,6 +11895,45 @@ fn install_default_set_beside(
     out
 }
 
+/// What a pass's set completion carries besides its own members
+/// ([`install_default_set_with_path`]).
+struct SetCompanions<'c, 'r> {
+    /// The vendor lane's fresh landings, announced and landed beside the set's
+    /// ([`VendorRider`]).
+    vendor: Option<&'c mut VendorRider<'r>>,
+    /// Run the moment a tuple holding the Trust toolchain flips: the pass's rustup view
+    /// and exec roots, which the pass end re-lays as well.
+    toolchain_flipped: &'c dyn Fn(&crate::store::Layout),
+    /// Vendors land alone after this set ([`FreshVendors::late`]): its plan keeps the
+    /// promise for theirs.
+    vendors_after: bool,
+}
+
+#[cfg(test)]
+impl SetCompanions<'_, '_> {
+    /// A set completion with nothing beside it.
+    fn alone() -> Self {
+        Self {
+            vendor: None,
+            toolchain_flipped: &|_| {},
+            vendors_after: false,
+        }
+    }
+}
+
+/// The commands of a program's verified manifest (`exposes`) a pending stub may stand for
+/// before it lands ([`crate::stub::reconcile`]'s `exposed`): never a name `index` names as a
+/// program of its own — that program's own stub answers for it, and `install <name>` must
+/// install it rather than point at the program that also ships the name — and never an
+/// upstream name the reroute table answers (`z3`, `rustfmt`: [`crate::reroute::row_for`]).
+fn stub_commands_of(index: &crate::TrustedIndex, exposes: &[String]) -> Vec<String> {
+    exposes
+        .iter()
+        .filter(|name| !index.is_program(name) && crate::reroute::row_for(name).is_none())
+        .cloned()
+        .collect()
+}
+
 /// [`install_default_set_with_path`]'s body, split so pass ownership above cannot leak on any
 /// of the early returns below.
 #[allow(
@@ -11861,6 +11957,7 @@ fn install_default_set_inner(
     let SetCompanions {
         vendor: rider,
         toolchain_flipped,
+        vendors_after,
     } = companions;
     let floor = build_floor(layout);
     // THE CALLER'S INDEX WHEN IT HAS ONE (`atpkg update`'s pass resolved one for its
@@ -11899,6 +11996,13 @@ fn install_default_set_inner(
             &resolved
         }
     };
+    // The index is verified (here or by the caller): advance the anti-rollback floor to
+    // it now, as `cmd_update` does after its resolve, not only where an index-served
+    // program installs. On a target the index serves only vendor-direct agents (aarch64
+    // Linux, index build 71) no index program installs, and the floor left at 0 had the
+    // doctor call the cached index "downloaded but not accepted". Idempotent for a caller
+    // that already advanced it.
+    advance_floors(layout, index.index_build, index.roster_seq());
     // Fail-closed diagnostics for `[packages.links]` fetch overrides: a program the
     // signed index does not name is unreachable BY CONSTRUCTION (§5) — the override
     // can never fetch it, so say so plainly instead of silently never acting.
@@ -11926,6 +12030,7 @@ fn install_default_set_inner(
         // land alone next: their plan takes the promise over ([`land_fresh_alone`]), and a
         // stub waiting for one of them must not read the promise gone before it.
         if rider.as_ref().is_none_or(|r| r.fresh.pending.is_empty())
+            && !vendors_after
             && let Some(sink) = crate::progress::active()
         {
             sink.plan_promised_pass(layout, &[]);
@@ -11943,7 +12048,7 @@ fn install_default_set_inner(
         };
     };
     let ch = &ch;
-    let groups = crate::plan_groups(index, ch);
+    let groups = crate::apply::plan_groups_here(layout, index, ch, current_triple());
     let mut installed = crate::active_builds(layout);
     let mut wanted = wanted_programs(index, cfg);
     // The vendor programs are wanted from the compiled table whatever the index names:
@@ -12023,10 +12128,26 @@ fn install_default_set_inner(
             .flat_map(|(group, missing)| prescan_probe(group, missing))
             .map(String::as_str),
     );
+    // What each absent member's verified manifest exposes, read by the same probe: the
+    // pending stubs below answer for every command a program brings, not only the branded
+    // names the compiled table knows (`targo-tippy`, `clean-lsp` beside `targo`).
+    let mut exposed: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
     for (group, missing) in prescan {
         let probe = prescan_probe(group, &missing);
-        if crate::flow::group_missing_triple(fetcher, index, crate::config::CHANNEL, triple, probe)
-            .is_some()
+        if crate::flow::group_missing_triple_reading(
+            fetcher,
+            index,
+            crate::config::CHANNEL,
+            triple,
+            probe,
+            &mut |member, pkg| {
+                if missing.iter().any(|m| m == member) {
+                    exposed.insert(member.to_string(), stub_commands_of(index, &pkg.exposes));
+                }
+            },
+        )
+        .is_some()
         {
             unserved.extend(missing);
         }
@@ -12163,8 +12284,8 @@ fn install_default_set_inner(
     // installed names lose theirs, and every kept stub is rewritten so its embedded
     // atpkg path survives app relocation/self-update. `wanted` is already
     // triple-filtered above, so a stub is only ever laid for a program whose
-    // bytes CAN move on this machine.
-    crate::stub::reconcile(layout, &wanted, &installed);
+    // bytes CAN move on this machine — with one for each command its manifest exposes.
+    crate::stub::reconcile(layout, &wanted, &installed, &exposed);
     // ANNOUNCE BEFORE ACTING (the block comment at the caller had argued for it
     // while nothing announced). The set named is exactly what the loop below will
     // attempt: wanted ∧ absent, minus dev-linked groups (announcing a member the loop
@@ -12241,8 +12362,9 @@ fn install_default_set_inner(
     // ONE ANNOUNCEMENT FOR BOTH LANES: the vendors first, then the set, with their signed
     // sizes summed. A second `net-starting:` would supersede the first's card while its
     // landings were still moving bytes. Vendors a refused set leaves behind land alone after
-    // this pass, and the promise goes with their plan, not this one's ([`land_fresh_alone`]).
-    let left_behind = rider.is_some() && disk_refusal.is_some();
+    // this pass, as do the ones whose reads were still out ([`FreshVendors::late`]), and the
+    // promise goes with their plan, not this one's ([`land_fresh_alone`]).
+    let left_behind = (rider.is_some() && disk_refusal.is_some()) || vendors_after;
     let rider = rider.filter(|_| disk_refusal.is_none());
     let mut announced_names = rider.as_ref().map_or_else(Vec::new, |r| r.fresh.names());
     announced_names.extend(will_install.iter().cloned());
@@ -12387,6 +12509,14 @@ fn install_default_set_inner(
     // ([`RiderQueue::next`]).
     let gate = RiderGate::default();
     let queue = rider.as_deref().map(RiderQueue::of);
+    // THE RIDERS' ROWS AS THEY LAND, not once the pass is over: a lane thread sends each
+    // landing here, and this thread — the one that writes every row of the pass — reports it
+    // between the set's units below, and as it comes while it waits for the lanes once its
+    // own units are in. A row read once an agent's shim is live says it is installed, and a
+    // pass killed after that leaves no row saying it is still to come.
+    let mut landed = rider.as_deref().map(|_| RiderLanded::default());
+    let rider_now = rider.as_deref().map_or(0, |r| r.fresh.now);
+    let (landed_tx, landed_rx) = std::sync::mpsc::channel::<RiderLanding>();
     // EVERY UNIT THE SET LANDS, not its tuples alone: one the download-ahead lane holds no
     // archive of (an app bundle, a row of unknown or zero size, a unit the disk check could
     // not size) is fetched by this thread, which only it knows the end of, so the lane never
@@ -12402,13 +12532,17 @@ fn install_default_set_inner(
             for _ in 0..r.fresh.pending.len().min(RIDER_LANES) {
                 let lent = crate::progress::lend();
                 let gate = &gate;
+                let landed_tx = landed_tx.clone();
                 if let Ok(handle) = std::thread::Builder::new()
                     .name("atpkg-vendor-lane".into())
                     .spawn_scoped(scope, move || {
                         let _adopted = lent.adopt();
                         let faults = crate::flow::fetch_faults();
                         let lane = r.fresh.lane(layout, shared, r.trust);
-                        rider_land(&lane, r, queue, Some(gate));
+                        rider_land(&lane, r, queue, Some(gate), &mut |landing| {
+                            // This thread's receiver goes only with the pass's unwinding.
+                            let _ = landed_tx.send(landing);
+                        });
                         crate::flow::fetch_faults().wrapping_sub(faults)
                     })
                 {
@@ -12416,6 +12550,9 @@ fn install_default_set_inner(
                 }
             }
         }
+        // The lanes hold the only senders now: the wait for their landings below ends when
+        // the last lane does.
+        drop(landed_tx);
         if shared.is_some()
             && beside.is_empty()
             && let Some(sink) = crate::progress::active()
@@ -12451,6 +12588,11 @@ fn install_default_set_inner(
             Some(lane.enter())
         });
         while !remaining.is_empty() {
+            if let Some(landed) = landed.as_mut() {
+                for landing in landed_rx.try_iter() {
+                    landed.report(layout, landing, rider_now);
+                }
+            }
             if !remaining.iter().any(|(gi, _)| groups[*gi].group.is_some()) {
                 gate.open();
             }
@@ -12532,9 +12674,15 @@ fn install_default_set_inner(
         }
         drop(entered);
         drop(opens);
-        // Joined before anything below reads the store as the pass leaves it: the second
+        // Each landing still to come, reported as it lands, until the last lane ends. Then
+        // the joins, before anything below reads the store as the pass leaves it: the second
         // stub reconcile must see the vendor shims this pass laid, never re-lay a stub
         // over one.
+        if let Some(landed) = landed.as_mut() {
+            for landing in &landed_rx {
+                landed.report(layout, landing, rider_now);
+            }
+        }
         let lanes = beside.len();
         for handle in beside {
             let faults = handle
@@ -12545,14 +12693,20 @@ fn install_default_set_inner(
         if lanes == 0
             && let Some(r) = rider.as_deref()
             && let Some(queue) = &queue
+            && let Some(landed) = landed.as_mut()
         {
-            rider_land(&r.fresh.lane(layout, fetcher, r.trust), r, queue, None);
+            rider_land(
+                &r.fresh.lane(layout, fetcher, r.trust),
+                r,
+                queue,
+                None,
+                &mut |landing| landed.report(layout, landing, rider_now),
+            );
         }
     });
-    let landed = queue.map(RiderQueue::into_landed);
     let rider_failed = landed
         .as_ref()
-        .is_some_and(|landed| landed.outcomes.iter().any(|outcome| outcome.is_failure()));
+        .is_some_and(|landed| landed.pass.failures > 0);
     if let Some(r) = rider {
         r.landed = landed;
     }
@@ -12566,7 +12720,7 @@ fn install_default_set_inner(
     // shims do not expose its own name would otherwise keep a stale "installing"
     // stub until the next pass.
     let now_active = crate::active_builds(layout);
-    crate::stub::reconcile(layout, &wanted, &now_active);
+    crate::stub::reconcile(layout, &wanted, &now_active, &exposed);
     // The reroute stubs ride the same reconcile: the atpkg path they name is refreshed
     // ([`crate::stub::Embedder`]) and a row that left the table is swept (philosophy §4).
     lay_reroute_stubs(layout);
@@ -13158,9 +13312,9 @@ fn install_toolset(
         (seams.now)(),
     )
     .ok();
-    // The vendor programs before the set pass, from their vendors (design §1.5): never
-    // behind the index.
-    let vendor = vendor_pass(
+    // The vendor programs' plans, from their vendors (design §1.5), under the yanks of the
+    // index resolved above: never behind it.
+    let (mut vendor, fresh) = vendor_plan(
         layout,
         fetcher,
         cfg,
@@ -13169,10 +13323,40 @@ fn install_toolset(
             update_installed: false,
             complete_the_set: true,
         },
-        Consent::Explicit,
         resolved.as_ref(),
         seams,
     );
+    // AND THEIR LANDINGS RIDE THE SET, as an empty store's update pass lands them: the
+    // toolchain's archives take the link first, the agents land beside the rest of the set
+    // under its one announcement ([`VendorRider`]). Landed first, the four agents held the
+    // toolchain's first byte back by their whole download (about 770 MiB). With no index the
+    // set has nothing to ride, and they land alone, first, as they always did.
+    let mut rider = None;
+    if resolved.is_some() && !fresh.pending.is_empty() {
+        rider = Some(VendorRider {
+            fresh,
+            trust: seams.trust,
+            warm: seams.warm_agents,
+            landed: None,
+        });
+    } else {
+        land_fresh_alone(
+            layout,
+            fetcher,
+            Consent::Explicit,
+            &fresh,
+            &mut vendor,
+            seams,
+            false,
+        );
+        warm_landed(layout, &mut vendor, seams);
+    }
+    // The Trust toolchain is usable the moment its tuple flips, as on the update pass: the
+    // rustup view and the exec roots follow it there (the verb's end re-lays both).
+    let toolchain_flipped = |layout: &crate::store::Layout| {
+        (seams.rustup_seam)(layout);
+        let _ = reconcile_exec_roots(layout, crate::seam::Depth::Shallow);
+    };
     // Running this verb is the consent, and it never reads `auto_install`: its announcement
     // names neither the first launch's consent nor that key, only the decline that stops
     // every pass ([`Consent::Explicit`]).
@@ -13188,7 +13372,26 @@ fn install_toolset(
         // A person's verb: what it installs lands now.
         &crate::quiet::FlipGate::NOW,
         &std::collections::BTreeSet::new(),
+        SetCompanions {
+            vendor: rider.as_mut(),
+            toolchain_flipped: &toolchain_flipped,
+            vendors_after: false,
+        },
     );
+    // What the rider's landings came to, or its landings alone when the set stopped before
+    // it could carry them — their plan then the promised one. The verb's own terminal
+    // answers the one announcement ([`answer_announcement`]).
+    if let Some(rider) = rider.take() {
+        settle_rider(
+            layout,
+            fetcher,
+            Consent::Explicit,
+            rider,
+            &mut vendor,
+            seams,
+            true,
+        );
+    }
     // Adoption is decided on the index lane alone: a vendor program still to come is what
     // the set completion adoption grants will finish.
     let index_failures = failures_outcome.failures;
@@ -13326,7 +13529,7 @@ fn install_toolset(
 /// `doctor`'s own words, when it is an answer that blocks builds. The install did what
 /// was asked, so the exit code stays; the set simply stops claiming a capability it did
 /// not prove. `None` when a toolchain answers, or the probe cannot tell. `host` is
-/// [`crate::prereq::CcHost::this_machine`] in the verb; a test widens its bound.
+/// [`crate::prereq::CcHost::this_machine`] in the verb.
 fn default_set_prereq_line(
     path: Option<&std::ffi::OsStr>,
     host: &crate::prereq::CcHost,
@@ -13496,7 +13699,7 @@ fn serviceable_among(
     let triple = current_triple();
     let mut out: Vec<String> = Vec::new();
     let mut prescan: Vec<(crate::Group, Vec<String>)> = Vec::new();
-    for group in crate::plan_groups(index, ch) {
+    for group in crate::apply::plan_groups_here(layout, index, ch, triple) {
         let mut missing = absent_members(&group, wanted, &installed);
         missing.retain(|m| !removed.contains(m.as_str()));
         if missing.is_empty()
@@ -13949,6 +14152,20 @@ const fn running_translated() -> bool {
 /// yet" on a machine where it has run correctly on every single launch.
 fn report_seedless_posture(layout: &crate::store::Layout) {
     let cfg = crate::config::cached();
+    report_seedless_posture_as(layout, cfg, wait_lock().is_some(), now_unix(), || {
+        cached_index_for(layout, cfg)
+    });
+}
+
+/// [`report_seedless_posture`] under `cfg`, as of `now`, from the window's own seed
+/// (`window_pass`: a `--wait-lock` caller, [`wait_lock`]) or not.
+fn report_seedless_posture_as(
+    layout: &crate::store::Layout,
+    cfg: &crate::config::PackagesConfig,
+    window_pass: bool,
+    now: i64,
+    read_cached_index: impl FnOnce() -> Option<crate::TrustedIndex>,
+) {
     let triple = current_triple();
     // The only thing to consult is the network index. A resolve failure is not the
     // question being asked (offline is not "unsupported"), so it degrades to the
@@ -13973,9 +14190,23 @@ fn report_seedless_posture(layout: &crate::store::Layout) {
     // about a second (9-16 s from a sequential fetcher) under the store lock before the
     // install could start, on a store whose config wants no vendor program. A typed
     // `aterm pkg seed` still resolves, and still says it.
-    let served_without_index = !crate::active_builds(layout).is_empty()
-        || vendor_set_wanted_on(triple, cfg, &removed_programs(layout))
-        || wait_lock().is_some();
+    let served_here = !crate::active_builds(layout).is_empty()
+        || vendor_set_wanted_on(triple, cfg, &removed_programs(layout));
+    // …AND ON A LAUNCH NO UPDATE FOLLOWS — none is due, the last pass's success younger than
+    // the walk — it says the verdict that pass recorded, from the record: an Intel Mac or a
+    // toolset excluded to nothing gets its card at every launch, not only at those an
+    // update runs on ([`recorded_unusable_body`]).
+    if window_pass
+        && !served_here
+        && aterm_update_core::pkg_check::launch_due_in(
+            &crate::status::pass_stamps(layout, now),
+            now,
+        ) > 0
+        && let Some(body) = recorded_unusable_body(layout, cfg, read_cached_index)
+    {
+        emit_marker_line(&seed_unusable_line(&body));
+    }
+    let served_without_index = served_here || window_pass;
     let serves_us = seedless_serves_us(served_without_index, || {
         let fetcher = resolve_fetcher(layout);
         crate::resolve_verified_index(
@@ -13991,27 +14222,20 @@ fn report_seedless_posture(layout: &crate::store::Layout) {
     // The durable trace, in the same words the marker carries.
     match serves_us {
         Some(IndexServes::Unserved(served)) => {
-            emit_marker_line(&seed_unusable_line(&unserved_sentence(triple, &served)));
-            record_unbuilt(
-                layout,
-                "*toolset*",
-                crate::state::TOOLSET_UNSERVED,
-                unserved_sentence(triple, &served),
-            );
+            let why = unserved_sentence(triple, &served);
+            emit_marker_line(&seed_unusable_line(&why));
+            record_unusable_toolset(layout, crate::state::TOOLSET_UNSERVED, &why);
         }
         // NOT THE CPU: the user's own exclusion or removals emptied a set the index serves.
         Some(IndexServes::Narrowed(narrowing)) => {
             let (why, state) = narrowing.verdict(triple);
             emit_marker_line(&seed_unusable_line(&why));
-            record_unbuilt(layout, "*toolset*", state, why);
+            record_unusable_toolset(layout, state, &why);
         }
         // Said only while the store is EMPTY, and only to whoever ran the verb
         // ([`says_not_installed_yet`]).
         Some(IndexServes::Yes) | None
-            if says_not_installed_yet(
-                crate::active_builds(layout).is_empty(),
-                wait_lock().is_some(),
-            ) =>
+            if says_not_installed_yet(crate::active_builds(layout).is_empty(), window_pass) =>
         {
             println!(
                 "atpkg: the ALab toolset is not installed yet \u{2014} it downloads by itself; \
@@ -14026,6 +14250,61 @@ fn report_seedless_posture(layout: &crate::store::Layout) {
 /// update's empty-store arm, so the window's card reads the same from either.
 fn seed_unusable_line(body: &str) -> String {
     format!("atpkg: {SEED_UNUSABLE_MARKER}{body}")
+}
+
+/// What an empty store's pass outcome says before the verdict that nothing here can install
+/// ([`record_unusable_toolset`]).
+const NOTHING_INSTALLABLE_LEAD: &str = "nothing is installed and nothing was installable \u{2014} ";
+
+/// Record an empty store's `seed-unusable:` verdict — an unserved architecture, a toolset
+/// narrowed to nothing — as its `*toolset*` row (`state`) and the pass outcome, which says the
+/// verdict (`why`, the marker's body) after [`NOTHING_INSTALLABLE_LEAD`]: the seed and the
+/// update's empty-store arm write it alike, and the window's seed says it again from here on
+/// a launch no update follows ([`recorded_unusable_body`]).
+fn record_unusable_toolset(layout: &crate::store::Layout, state: &str, why: &str) {
+    record_unbuilt(
+        layout,
+        "*toolset*",
+        state,
+        format!("{NOTHING_INSTALLABLE_LEAD}{why}"),
+    );
+}
+
+/// The `seed-unusable:` body the record still carries ([`record_unusable_toolset`]): the
+/// `*toolset*` row an unserved architecture or a toolset narrowed to nothing, and the pass
+/// outcome its verdict — `None` once a later pass's outcome moved on, or for any other row.
+/// An exclusion/removal verdict also needs the local verified index to remain empty under
+/// the current exclusions and removals; this replay never fetches package manifests.
+fn recorded_unusable_body(
+    layout: &crate::store::Layout,
+    cfg: &crate::config::PackagesConfig,
+    read_cached_index: impl FnOnce() -> Option<crate::TrustedIndex>,
+) -> Option<String> {
+    let status = crate::status::read(layout)?;
+    let state = status.programs.get("*toolset*")?.state.as_str();
+    if ![
+        crate::state::TOOLSET_UNSERVED,
+        crate::state::TOOLSET_EXCLUDED,
+        crate::state::TOOLSET_REMOVED,
+    ]
+    .contains(&state)
+    {
+        return None;
+    }
+    let body = status.outcome.strip_prefix(NOTHING_INSTALLABLE_LEAD)?;
+    if state != crate::state::TOOLSET_UNSERVED {
+        // An old exclusion/removal verdict does not stand for today's policy. Read only
+        // the locally verified index; a missing/refused cache leaves this launch quiet.
+        let index = read_cached_index()?;
+        let removed = removed_programs(layout);
+        if wanted_programs(&index, cfg)
+            .iter()
+            .any(|program| !removed.contains(program))
+        {
+            return None;
+        }
+    }
+    Some(body.to_string())
 }
 
 /// The unserved-architecture `seed-unusable:` body: the need, this machine's triple, and
@@ -14123,7 +14402,7 @@ fn reconcile_links(layout: &crate::store::Layout, cfg: &crate::config::PackagesC
                             );
                             continue;
                         }
-                        match crate::link(layout, program, &want, &default_link_bins(program)) {
+                        match crate::link(layout, program, &want, &link_bins_for(program, &want)) {
                             Ok(out) => println!(
                                 "atpkg: dev-linked {program} from [packages.links] ({})",
                                 out.linked.join(", ")
@@ -14160,6 +14439,15 @@ fn reconcile_links(layout: &crate::store::Layout, cfg: &crate::config::PackagesC
             }
         }
     }
+}
+
+/// The bins a link of `checkout` with no explicit bin list names: a PACKAGE DIRECTORY of an
+/// ALab-built program (`alab/package.sh`'s output, [`crate::alab::package_link_bin`]) by its
+/// entrypoint (`bin/codex`), so `[packages.links] codex = "<pkgdir>"` links it as
+/// `aterm pkg link codex <pkgdir> bin/codex` does; anything else by [`default_link_bins`].
+fn link_bins_for(program: &str, checkout: &std::path::Path) -> Vec<std::path::PathBuf> {
+    crate::alab::package_link_bin(program, checkout)
+        .map_or_else(|| default_link_bins(program), |entry| vec![entry])
 }
 
 /// The conventional default bin for a link with no explicit bin list —
@@ -14259,6 +14547,17 @@ fn cmd_update_one(program: &String) -> ExitCode {
     if let Some(spec) = crate::vendor_direct::spec(program)
         && head_watch_pass()
     {
+        // The head watch names a vendor's head; a program the index lane owns here
+        // (an ALab build pinned for this target, [`crate::alab`]) does not follow it.
+        if crate::alab::index_owns(
+            &layout,
+            program,
+            current_triple(),
+            cached_index(&layout).as_deref(),
+        ) {
+            println!("atpkg: {program} follows the ALab channel here — nothing to update");
+            return ExitCode::SUCCESS;
+        }
         return cmd_update_vendor(&layout, spec, VendorDoor::Window);
     }
     let installed = crate::active_builds(&layout);
@@ -14266,8 +14565,13 @@ fn cmd_update_one(program: &String) -> ExitCode {
         // Update of a not-installed program = a fresh explicit install (single path).
         return cmd_install_for_update(program);
     }
-    // A vendor-direct program moves with its vendor, never behind the index resolve.
-    if let Some(spec) = crate::vendor_direct::spec(program) {
+    // A vendor-direct program moves with its vendor, never behind the index resolve —
+    // unless the source rule hands it to the index lane here ([`index_owns_now`], which asks
+    // an index only for an ALab-built program on a target ALab builds it for).
+    if let Some(spec) = crate::vendor_direct::spec(program)
+        && !(crate::alab::agent(program).is_some_and(|a| a.serves(current_triple()))
+            && index_owns_now(&layout, &*resolve_fetcher(&layout), program))
+    {
         return cmd_update_vendor(&layout, spec, VendorDoor::Person);
     }
     let cur = installed.get(program).copied();
@@ -14382,7 +14686,34 @@ fn cmd_update_one(program: &String) -> ExitCode {
     // second one. Everything `cmd_install` would re-do first — `manager_enabled`,
     // `layout()`, `cfg` — ran above with the same answers, and `reconcile_links` still
     // runs inside `cmd_install_with` exactly as before, so the output is unchanged.
-    cmd_install_with(program, &layout, cfg, &*fetcher, "update")
+    let before = crate::active_builds(&layout);
+    let code = cmd_install_with(program, &layout, cfg, &*fetcher, "update");
+    warm_alab_landed(&layout, &before, crate::warm::spawn_landed);
+    code
+}
+
+/// Whether the source rule hands ALab-built `program` to the index lane here
+/// ([`crate::alab::source`]), under the index a person's door verifies now (the fetcher
+/// memoizes the resolve, so the flow that follows asks no second time). `false` without a
+/// verified index, for a program ALab does not build, and off the targets it builds for —
+/// no index is asked then.
+fn index_owns_now(
+    layout: &crate::store::Layout,
+    fetcher: &dyn crate::flow::Fetcher,
+    program: &str,
+) -> bool {
+    crate::alab::agent(program).is_some_and(|agent| agent.serves(current_triple()))
+        && crate::resolve_verified_index(
+            fetcher,
+            layout,
+            &effective_anchor(layout),
+            build_floor(layout),
+            now_unix(),
+        )
+        .ok()
+        .is_some_and(|index| {
+            crate::alab::index_owns(layout, program, current_triple(), Some(&index))
+        })
 }
 
 /// Who asked for `atpkg update <vendor program>`.
@@ -14495,6 +14826,20 @@ struct VendorPass {
     landed: std::collections::BTreeSet<String>,
 }
 
+impl VendorPass {
+    /// Fold in what another part of the same lane did ([`RiderLanded::pass`]).
+    fn absorb(&mut self, other: Self) {
+        self.failures += other.failures;
+        self.failed.extend(other.failed);
+        self.resolved_assets.extend(other.resolved_assets);
+        self.ran.extend(other.ran);
+        self.changed |= other.changed;
+        self.unchecked.extend(other.unchecked);
+        self.reached |= other.reached;
+        self.landed.extend(other.landed);
+    }
+}
+
 /// Note `outcome`'s program as landed when the lane installed a new build of it — never a
 /// rollback onto a build that already ran here, a tombstone or anything that kept one.
 fn note_landed(pass: &mut VendorPass, outcome: &crate::vendor_direct::lane::Outcome) {
@@ -14512,6 +14857,32 @@ fn warm_landed(layout: &crate::store::Layout, pass: &mut VendorPass, seams: &Pas
     let landed = std::mem::take(&mut pass.landed);
     if !landed.is_empty() {
         (seams.warm_agents)(layout, &landed);
+    }
+}
+
+/// Warm what the INDEX lane landed of an ALab-built agent program ([`crate::alab`]) since
+/// `before` was read: a new active ALab build is warmed as the vendor lane warms its own
+/// landing ([`crate::warm`]), so codex-alab's first launch reads a fresh model catalogue
+/// exactly as a vendor codex's does.
+fn warm_alab_landed(
+    layout: &crate::store::Layout,
+    before: &std::collections::BTreeMap<String, u64>,
+    warm: fn(&crate::store::Layout, &std::collections::BTreeSet<String>),
+) {
+    let now = crate::active_builds(layout);
+    let landed: std::collections::BTreeSet<String> = crate::alab::ALAB_AGENTS
+        .iter()
+        .map(|agent| agent.program)
+        .filter(|program| {
+            now.get(*program).is_some_and(|build| {
+                before.get(*program) != Some(build)
+                    && crate::alab::build_is_alab(layout, program, *build)
+            })
+        })
+        .map(str::to_string)
+        .collect();
+    if !landed.is_empty() {
+        warm(layout, &landed);
     }
 }
 
@@ -14621,8 +14992,10 @@ fn legacy_index_for(
 /// installed arrives — announced first with `net-starting:` and the sizes its verified
 /// documents state, metered on the window's progress file, answered with
 /// `net-installed:` or `net-failed:`. Its bytes are only the vendors'. ([`vendor_plan`],
-/// then [`land_fresh_alone`]; an update pass on an empty store lands the fresh ones beside
-/// the set completion instead, [`VendorRider`].)
+/// then [`land_fresh_alone`].) The tests' door to the lane alone: the passes compose those
+/// two themselves, since a pass that installs the set on an empty store lands the fresh ones
+/// beside its set completion instead ([`VendorRider`]).
+#[cfg(test)]
 #[allow(
     clippy::too_many_arguments,
     reason = "the pass's own inputs plus the index it verified first, which only narrows"
@@ -14657,6 +15030,45 @@ fn vendor_plan(
     fresh: Option<&crate::TrustedIndex>,
     seams: &PassSeams<'_>,
 ) -> (VendorPass, FreshVendors) {
+    vendor_plan_reading(layout, fetcher, cfg, installed, lanes, fresh, seams, None)
+}
+
+/// What an update pass's vendor lane read before its index landed ([`read_vendors_ahead`]),
+/// and until when its plan waits for a read still out: for as long as it takes (`None`), or —
+/// on a first run, whose set's announcement waits for the plan — [`VENDOR_READ_GRACE`] past
+/// the index.
+#[derive(Clone, Copy)]
+struct ReadsAhead<'r> {
+    reads: &'r crate::vendor_direct::lane::Reads,
+    until: Option<std::time::Instant>,
+}
+
+/// How long a first run's vendor plan waits, once its index is in, for a vendor's read still
+/// out ([`ReadsAhead`]). The reads go out with the index resolve and are normally in before
+/// it (four hosts, a head and two or three documents each, beside three discovery rounds and
+/// the quads); one still out past this is a host that does not answer — a name that does not
+/// resolve, a connect that never finishes, each bounded at five seconds an attempt — and its
+/// program lands after the set, alone ([`FreshVendors::late`]), instead of holding the set's
+/// announcement and first byte behind it.
+const VENDOR_READ_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// [`vendor_plan`] over what `ahead` read before the index landed: each program's plan takes
+/// its read instead of asking the hosts again, and one whose read is still out at
+/// `ahead.until` is left to plan after the set ([`FreshVendors::late`]).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "vendor_plan's inputs and the reads ahead of it"
+)]
+fn vendor_plan_reading(
+    layout: &crate::store::Layout,
+    fetcher: &dyn crate::flow::Fetcher,
+    cfg: &crate::config::PackagesConfig,
+    installed: &std::collections::BTreeMap<String, u64>,
+    lanes: VendorLanes,
+    fresh: Option<&crate::TrustedIndex>,
+    seams: &PassSeams<'_>,
+    ahead: Option<ReadsAhead<'_>>,
+) -> (VendorPass, FreshVendors) {
     use crate::vendor_direct::lane::{self, Step};
     // The yanks of the index this pass verified fresh (the verification also refreshed the
     // latch), else the latch: a yank published since the last pass binds this one.
@@ -14668,6 +15080,7 @@ fn vendor_plan(
             None => legacy_index_for(layout, installed),
         },
         now: (seams.now)(),
+        late: Vec::new(),
     };
     let removed = removed_programs(layout);
     // `(program, installed, held)` for each program this lane runs. A tombstone is silent
@@ -14678,6 +15091,13 @@ fn vendor_plan(
             .iter()
             .filter_map(|spec| {
                 let program = spec.program;
+                // THE SOURCE RULE ([`crate::alab::source`]): a program the index pins from
+                // ALab's repo for this target is the index lane's this pass, never this one's.
+                if crate::alab::source(layout, program, current_triple(), fresh.map(|i| &**i))
+                    .index_lane()
+                {
+                    return None;
+                }
                 if lanes.update_installed
                     && (installed.contains_key(program)
                         || crate::flow::tombstoned_in_place(layout, [program]))
@@ -14693,22 +15113,37 @@ fn vendor_plan(
                 }
             })
             .collect();
-    let steps: Vec<Step> = match fetcher.shared() {
+    // Each program's plan over its read ahead, or `None` when that read is still out.
+    let plan = |lane: &lane::Lane<'_>, spec: &'static crate::vendor_direct::VendorSpec, held| {
+        match ahead {
+            Some(ReadsAhead { reads, until }) => reads
+                .take_read(spec.program, until)
+                .ok()
+                .map(|read| lane::plan_one_with(lane, spec, held, read)),
+            None => Some(lane::plan_one(lane, spec, held)),
+        }
+    };
+    let steps: Vec<Option<Step>> = match fetcher.shared() {
         Some(shared) => crate::net::fan_out(&runs, &|(spec, _, held)| {
-            lane::plan_one(&vendors.lane(layout, shared, seams.trust), spec, *held)
+            plan(&vendors.lane(layout, shared, seams.trust), spec, *held)
         }),
         None => {
             let lane = vendors.lane(layout, fetcher, seams.trust);
             runs.iter()
-                .map(|(spec, _, held)| lane::plan_one(&lane, spec, *held))
+                .map(|(spec, _, held)| plan(&lane, spec, *held))
                 .collect()
         }
     };
     let mut pass = VendorPass::default();
     let mut pending = Vec::new();
+    let mut late = Vec::new();
     {
         let lane = vendors.lane(layout, fetcher, seams.trust);
-        for ((_, is_installed, _), step) in runs.iter().zip(steps) {
+        for ((spec, is_installed, held), step) in runs.iter().zip(steps) {
+            let Some(step) = step else {
+                late.push((*spec, *held));
+                continue;
+            };
             match step {
                 Step::Done(outcome) => {
                     report_vendor(layout, &outcome, &mut pass, false, vendors.now);
@@ -14722,7 +15157,109 @@ fn vendor_plan(
         }
     }
     vendors.pending = pending;
+    vendors.late = late;
     (pass, vendors)
+}
+
+/// Send the vendor lane's network reads out beside the pass's index resolve: each program the
+/// lane may plan this pass ([`vendor_plan`]'s, short of the one test that needs the index —
+/// whether the index pins it from ALab's repo) read ahead on a thread of its own in `scope`
+/// ([`crate::vendor_direct::lane::read_ahead`]), into `reads`, where its plan takes it. Every
+/// other program's slot reads nothing, so its plan reads for itself. Whether any read went
+/// out: none does with a fetcher the pass may not share, and the lane then plans as it
+/// always did.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the pass's own inputs and the scope and slots its reads run in"
+)]
+fn read_vendors_ahead<'scope, 'env>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    reads: &'env crate::vendor_direct::lane::Reads,
+    layout: &'env crate::store::Layout,
+    fetcher: &'env dyn crate::flow::Fetcher,
+    cfg: &crate::config::PackagesConfig,
+    installed: &std::collections::BTreeMap<String, u64>,
+    complete_the_set: bool,
+    seams: &PassSeams<'env>,
+) -> bool {
+    let Some(shared) = fetcher.shared() else {
+        return false;
+    };
+    let removed = removed_programs(layout);
+    let (trust, now) = (seams.trust, (seams.now)());
+    for spec in crate::vendor_direct::VENDORS {
+        let program = spec.program;
+        let planned = installed.contains_key(program)
+            || crate::flow::tombstoned_in_place(layout, [program])
+            || (complete_the_set && vendor_wanted(cfg, &removed, program));
+        let spawned = planned
+            && std::thread::Builder::new()
+                .name("atpkg-vendor-ahead".into())
+                .spawn_scoped(scope, move || {
+                    reads.read(program, || {
+                        crate::vendor_direct::lane::read_ahead(
+                            layout,
+                            spec,
+                            shared,
+                            current_triple(),
+                            trust,
+                            now,
+                        )
+                    });
+                })
+                .is_ok();
+        if !spawned {
+            reads.read(program, || None);
+        }
+    }
+    true
+}
+
+/// The programs a first run's vendor plan left behind, their reads still out when its set
+/// announced ([`FreshVendors::late`]): each read waited for now, planned under the index the
+/// pass verified, and landed alone after the set — announced, metered and answered on their
+/// own, the promise going with their plan ([`land_fresh_alone`]).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the pass's inputs the late plans and their landings read"
+)]
+fn land_late_vendors(
+    layout: &crate::store::Layout,
+    fetcher: &dyn crate::flow::Fetcher,
+    consent: Consent,
+    reads: &crate::vendor_direct::lane::Reads,
+    late: &[(&'static crate::vendor_direct::VendorSpec, bool)],
+    index: Option<&crate::TrustedIndex>,
+    pass: &mut VendorPass,
+    seams: &PassSeams<'_>,
+) {
+    use crate::vendor_direct::lane::{self, Step};
+    let mut vendors = FreshVendors {
+        pending: Vec::new(),
+        policy: crate::vendor_direct::policy::Policy::current(layout, index),
+        index: index.cloned(),
+        now: (seams.now)(),
+        late: Vec::new(),
+    };
+    let steps: Vec<Step> = late
+        .iter()
+        .map(|(spec, held)| {
+            let read = reads.take_read(spec.program, None).ok().flatten();
+            lane::plan_one_with(
+                &vendors.lane(layout, fetcher, seams.trust),
+                spec,
+                *held,
+                read,
+            )
+        })
+        .collect();
+    for step in steps {
+        match step {
+            Step::Done(outcome) => report_vendor(layout, &outcome, pass, false, vendors.now),
+            Step::Land(landing) => vendors.pending.push(*landing),
+        }
+    }
+    land_fresh_alone(layout, fetcher, consent, &vendors, pass, seams, true);
 }
 
 /// The vendor lane's fresh landings once planned ([`vendor_plan`]): verified candidates
@@ -14737,6 +15274,10 @@ struct FreshVendors {
     index: Option<crate::TrustedIndex>,
     /// The pass's clock.
     now: i64,
+    /// The programs whose read ahead was still out when the plan stopped waiting
+    /// ([`ReadsAhead`]), with their local pin: planned, and landed alone, once the set
+    /// completion is done ([`land_late_vendors`]).
+    late: Vec<(&'static crate::vendor_direct::VendorSpec, bool)>,
 }
 
 impl FreshVendors {
@@ -14902,16 +15443,55 @@ fn land_fresh_alone(
     }
 }
 
-/// The vendor lane's fresh landings handed to the set completion of an update pass on an
-/// empty store ([`install_default_set_inner`]): ONE `net-starting:` names both lanes'
+/// What a [`VendorRider`] came to, folded into its pass's vendor lane: its landings, reported
+/// as each landed beside the set completion ([`RiderLanded`]), or — when that set completion
+/// stopped before it could carry them — its landings alone now ([`land_fresh_alone`], their
+/// plan the promised one when `promised`); then the warm of whatever landed and is not warm
+/// yet. The programs whose landing waited on a signature check that did not finish: the
+/// terminal of a set completion that announced them names them ([`fresh_landing_terminal`]).
+fn settle_rider(
+    layout: &crate::store::Layout,
+    fetcher: &dyn crate::flow::Fetcher,
+    consent: Consent,
+    rider: VendorRider<'_>,
+    vendor: &mut VendorPass,
+    seams: &PassSeams<'_>,
+    promised: bool,
+) -> Vec<&'static str> {
+    let deferred = match rider.landed {
+        Some(landed) => {
+            vendor.absorb(landed.pass);
+            landed.deferred
+        }
+        None => {
+            land_fresh_alone(
+                layout,
+                fetcher,
+                consent,
+                &rider.fresh,
+                vendor,
+                seams,
+                promised,
+            );
+            Vec::new()
+        }
+    };
+    warm_landed(layout, vendor, seams);
+    deferred
+}
+
+/// The vendor lane's fresh landings handed to the set completion of a pass that installs
+/// the set on an empty store — the update pass's, and `install --default-set`'s
+/// ([`install_default_set_inner`]): ONE `net-starting:` names both lanes'
 /// programs with their signed sizes, and once the set's archives are in ([`RiderGate`]), the
 /// vendors land while the pass installs them — on lane threads of their own when the fetcher
 /// may be shared — inside the one store lock, the one progress pass and the one terminal
-/// marker. Their outcomes are reported on the pass's thread once landed (`landed`), which
-/// writes every status row. A set completion that
+/// marker. Each outcome is reported on the pass's thread, which writes every status row, as
+/// it lands: between the set's units, and while the pass waits for the lanes once its own
+/// units are in (`landed`). A set completion that
 /// stops before it announces (its index stale, no channel for this machine, or a volume
 /// that cannot hold both lanes at once) leaves `landed` empty, and the caller lands them
-/// alone ([`land_fresh_alone`]).
+/// alone ([`land_fresh_alone`]; both through [`settle_rider`]).
 struct VendorRider<'r> {
     fresh: FreshVendors,
     trust: &'r crate::vendor_direct::lane::Trust,
@@ -14920,13 +15500,40 @@ struct VendorRider<'r> {
     landed: Option<RiderLanded>,
 }
 
-/// What a [`VendorRider`]'s landings came to.
+/// One of a [`VendorRider`]'s landings, handed from the lane that landed it to the pass's
+/// thread: its outcome, and whether the lane warmed its build as it landed.
+struct RiderLanding {
+    outcome: crate::vendor_direct::lane::Outcome,
+    warmed: bool,
+}
+
+/// What a [`VendorRider`]'s landings came to, reported on the pass's thread as each landed
+/// ([`RiderLanded::report`]).
 #[derive(Default)]
 struct RiderLanded {
-    /// In landing order.
-    outcomes: Vec<crate::vendor_direct::lane::Outcome>,
-    /// The programs warmed as they landed: no later exit warms them again.
-    warmed: std::collections::BTreeSet<String>,
+    /// The vendor lane's tally of them ([`report_vendor`]), less the builds their lanes
+    /// warmed as they landed: no later exit warms those again.
+    pass: VendorPass,
+    /// The programs whose landing waited on a signature check that did not finish.
+    deferred: Vec<&'static str>,
+}
+
+impl RiderLanded {
+    /// Report `landing` — its line, its count and its status row, as of `now` — on this
+    /// thread, the one that writes every row of the pass.
+    fn report(&mut self, layout: &crate::store::Layout, landing: RiderLanding, now: i64) {
+        let program = landing.outcome.spec.program;
+        if matches!(
+            landing.outcome.verdict,
+            crate::vendor_direct::lane::Verdict::Deferred { .. }
+        ) {
+            self.deferred.push(program);
+        }
+        report_vendor(layout, &landing.outcome, &mut self.pass, false, now);
+        if landing.warmed {
+            self.pass.landed.remove(program);
+        }
+    }
 }
 
 /// How often a vendor lane waiting on its gate reads the bump file ([`rider_land`]): a
@@ -14986,7 +15593,7 @@ impl Drop for RiderGateOpens<'_> {
 }
 
 /// A rider's landings not yet taken, worked by every lane that lands them ([`rider_land`]),
-/// the order their payloads take the link in, and what the ones taken came to.
+/// and the order their payloads take the link in.
 struct RiderQueue<'q> {
     left: std::sync::Mutex<Vec<&'q crate::vendor_direct::lane::Pending>>,
     /// ONE AGENT DOWNLOAD AT A TIME, in the order the programs are taken
@@ -14994,7 +15601,6 @@ struct RiderQueue<'q> {
     /// two downloads at once would land claude later than one — while the other lane's
     /// verify, unpack and activate overlap the next download.
     turns: crate::flow::DownloadTurns,
-    landed: std::sync::Mutex<RiderLanded>,
 }
 
 impl<'q> RiderQueue<'q> {
@@ -15002,7 +15608,6 @@ impl<'q> RiderQueue<'q> {
         Self {
             left: std::sync::Mutex::new(rider.fresh.pending.iter().collect()),
             turns: crate::flow::DownloadTurns::default(),
-            landed: std::sync::Mutex::default(),
         }
     }
 
@@ -15053,23 +15658,19 @@ impl<'q> RiderQueue<'q> {
             }
         }
     }
-
-    fn into_landed(self) -> RiderLanded {
-        self.landed
-            .into_inner()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
 }
 
 /// One lane of a rider's landings, on this thread ([`land_fresh`]): take the queue's next
 /// program ([`RiderQueue::next`]) until none is left, warming each agent build the moment it
-/// lands rather than when the pass is over. Every lane hands its outcomes to the queue, in the
-/// order they land.
+/// lands rather than when the pass is over. Every landing goes to `landed` the moment it is
+/// done — a lane thread sends it to the pass's thread, which writes its row — in the order
+/// they land.
 fn rider_land(
     lane: &crate::vendor_direct::lane::Lane<'_>,
     rider: &VendorRider<'_>,
     queue: &RiderQueue<'_>,
     gate: Option<&RiderGate>,
+    landed: &mut dyn FnMut(RiderLanding),
 ) {
     while let Some((pending, ticket)) = queue.next(lane.layout, gate) {
         let lane = &crate::vendor_direct::lane::Lane {
@@ -15080,17 +15681,14 @@ fn rider_land(
             let warmed = matches!(
                 outcome.verdict,
                 crate::vendor_direct::lane::Verdict::Installed { .. }
-            )
-            .then(|| std::collections::BTreeSet::from([outcome.spec.program.to_string()]));
-            if let Some(program) = &warmed {
-                (rider.warm)(lane.layout, program);
+            );
+            if warmed {
+                (rider.warm)(
+                    lane.layout,
+                    &std::collections::BTreeSet::from([outcome.spec.program.to_string()]),
+                );
             }
-            let mut landed = queue
-                .landed
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            landed.warmed.extend(warmed.into_iter().flatten());
-            landed.outcomes.push(outcome);
+            landed(RiderLanding { outcome, warmed });
         });
     }
 }
@@ -15271,17 +15869,30 @@ fn record_vendor_status(
             };
             (managed(&|v| crate::state::vendor_kept(v, &why)), false)
         }
-        Verdict::Refused { .. } | Verdict::Failed { .. } => (
+        Verdict::Refused { .. } | Verdict::Failed { .. } | Verdict::AlabRestoreFailed { .. } => (
             Some(failure_row(layout, program, format!("error: {said}"))),
             true,
         ),
-        Verdict::Tombstoned { .. } => (
+        Verdict::Tombstoned { .. } | Verdict::AlabTombstoned { .. } => (
             Some(failure_row(layout, program, format!("tombstoned: {said}"))),
             true,
         ),
         Verdict::Linked => (None, false),
         Verdict::Unavailable { state } => {
             (Some(failure_row(layout, program, state.clone())), false)
+        }
+        // An ALab build, kept or rolled back onto: its row names its store build and why,
+        // never a vendor version or a claim to be the vendor's latest.
+        Verdict::AlabKept { .. } | Verdict::AlabRolledBack { .. } => {
+            let why = outcome.kept_clause().unwrap_or_default();
+            (
+                active.map(|b| crate::ProgramStatus {
+                    installed_build: Some(b),
+                    state: crate::state::alab_kept(b, &why),
+                    tree_root: legacy_root_of(layout, program, b),
+                }),
+                matches!(outcome.verdict, Verdict::AlabRolledBack { .. }),
+            )
         }
     };
     let Some(row) = row else {
@@ -16080,8 +16691,9 @@ fn cmd_link(rest: &[String]) -> ExitCode {
         // Default to the conventional cargo release bin, WITH the platform executable
         // extension (`target/release/<program>.exe` on Windows) — else `src.is_file()`
         // never matches the real exe and the link yields nothing to link. Shared with
-        // the `[packages.links]` reconciliation.
-        default_link_bins(program)
+        // the `[packages.links]` reconciliation — which a package directory of an
+        // ALab-built program answers with its entrypoint instead ([`link_bins_for`]).
+        link_bins_for(program, checkout_path)
     };
     match crate::link(&layout, program, checkout_path, &bins) {
         Ok(out) => {
@@ -16296,7 +16908,7 @@ fn cmd_refresh(rest: &[String]) -> ExitCode {
 }
 
 /// The held-row surfaces, on EVERY platform: the main `tests` module below is Unix-only
-/// (its source scans and shell fixtures are), and the row these pin was first met on
+/// (its shell fixtures are), and the row these pin was first met on
 /// Windows — a test that could not run there would pin nothing about it.
 #[cfg(test)]
 #[path = "cli_held_row_tests.rs"]
@@ -16305,3 +16917,7 @@ mod held_row_tests;
 #[cfg(all(test, unix))]
 #[path = "cli_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+#[path = "cli_alab_tests.rs"]
+mod alab_tests;

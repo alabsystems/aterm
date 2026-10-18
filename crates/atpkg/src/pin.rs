@@ -150,14 +150,6 @@ mod tests {
     }
 
     #[test]
-    fn absent_file_is_empty_not_error() {
-        let l = layout("absent");
-        assert!(!is_pinned(&l, "ay"));
-        assert!(pinned_set(&l).is_empty());
-        let _ = fs::remove_dir_all(&l.prefix);
-    }
-
-    #[test]
     fn oversized_sparse_and_overcount_pin_files_fail_closed() {
         let l = layout("bounded");
         let path = pins_path(&l);

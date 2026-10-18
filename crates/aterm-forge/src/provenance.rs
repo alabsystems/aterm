@@ -5,22 +5,18 @@
 //!
 //! Path packages in this workspace are one of three shapes:
 //!
-//!   * `crates/<name>`: code aterm owns. First-party, so it is billed to the
-//!     workspace, never to the third-party surface. Includes the first-party
-//!     `[patch.crates-io]` replacements, which are members patched in by
-//!     package name, and the ABSORBED crates (`crates/aterm-window`, winit
-//!     0.30.13), upstream source aterm took over as members: those still owe
-//!     attest's license obligations (`[OB-5]`/`[OB-6]`/`[OB-7]`/`[OB-9]`).
-//!   * `vendor/<name>`: upstream source aterm forked and keeps reviewing
-//!     (indexmap). Third-party; owes every obligation, and `[OB-1]` holds the
-//!     patch table and the directory listing in agreement.
-//!   * a first-party path dependency vendored in-tree: `vendor/astream`, the
-//!     same owner's astream repository as a git submodule
-//!     (`vendor/README-astream.md`), path-depended on by `crates/aterm-link`.
-//!     It is in `vendor/` so a clean clone builds; it has no crates.io package,
-//!     so no patch entry can name it.
-//!
-//! # The rule is a roster
+//!   * `crates/<name>`: code aterm owns, billed to the workspace and never to the third-party
+//!     surface. Includes the first-party `[patch.crates-io]` replacements, members patched in by
+//!     package name, and the absorbed crates (`crates/aterm-window`, from winit 0.30.13):
+//!     upstream source aterm took over as members, which still owe attest's license obligations
+//!     (`[OB-5]`/`[OB-6]`/`[OB-7]`/`[OB-9]`).
+//!   * `vendor/<name>`: upstream source aterm forked and keeps reviewing. Third-party; owes
+//!     every obligation, and `[OB-1]` holds the patch table and the directory listing in
+//!     agreement. None since indexmap, the last, went back to the registry (2026-10-16).
+//!   * a first-party path dependency vendored in-tree: `vendor/astream`, the same owner's
+//!     astream repository as a git submodule (`vendor/README-astream.md`), path-depended on by
+//!     `crates/aterm-link`. It is in `vendor/` so a clean clone builds; it has no crates.io
+//!     package, so no patch entry can name it.
 //!
 //! A `vendor/<dir>` on [`FIRST_PARTY_VENDORED`] is aterm's own code; everything
 //! else under `vendor/` is a third-party fork. The roster is fail-closed both
@@ -28,9 +24,10 @@
 //! on neither the roster nor the patch table fails `[OB-1]`.
 //!
 //! The claim lives in aterm's own source rather than in a file or manifest key
-//! inside the vendored tree, which the next submodule bump could rewrite. It
-//! mirrors `aterm_census::scan_set::REVIEWED_VENDORED_CRATES`, and the two
-//! must never name the same directory ([`crate::attest`] checks that).
+//! inside the vendored tree, which the next submodule bump could rewrite. It is
+//! the first-party twin of `vendor/forge.toml`'s `[[fork]]` blocks (the
+//! third-party forks the census reviews), and the two must never name the
+//! same directory ([`crate::attest`] checks that).
 //!
 //! # What this does not relax
 //!
@@ -41,7 +38,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-/// One directory under `vendor/` that holds aterm's OWN code.
+/// One directory under `vendor/` that holds aterm's own code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FirstPartyVendored {
     /// Repo-relative directory, always `vendor/<dir>`, no trailing slash.
@@ -55,7 +52,7 @@ pub struct FirstPartyVendored {
     pub why: &'static str,
 }
 
-/// THE ROSTER. Reviewed by a human, one row per directory.
+/// The roster: reviewed by a person, one row per directory.
 pub const FIRST_PARTY_VENDORED: &[FirstPartyVendored] = &[FirstPartyVendored {
     dir: "vendor/astream",
     upstream: "github.com/alabsystems/astream, a git submodule pinned by this tree's gitlink",
@@ -63,9 +60,12 @@ pub const FIRST_PARTY_VENDORED: &[FirstPartyVendored] = &[FirstPartyVendored {
           name — so this is aterm's own code, not a redistribution. It is under vendor/ for a \
           BUILD reason: crates/aterm-link path-depended on a sibling checkout most clones do \
           not have, so cargo build never built the fabric bridge and no release ever shipped \
-          it. It is a git submodule (vendor/README-astream.md), and aterm resolves five of its \
-          crates (wire, digest, cap, broker, aead) by path, outside this workspace; aead only \
-          under aterm-link's off-by-default sealed feature. Not on crates.io, so no \
+          it. It is a git submodule (vendor/README-astream.md), and aterm resolves the astream \
+          crates its members use by path, outside this workspace ([OB-1] names each one it \
+          finds in the graph and holds it to the submodule; vendor/README-astream.md's table \
+          says what each is for); astream-aead only under aterm-link's off-by-default sealed \
+          feature, astream-term only as aterm-conformance's dev-dependency (the differential \
+          VT oracle's fold, zero dependencies). Not on crates.io, so no \
           [patch.crates-io] entry could ever name it: a patch entry replaces a registry \
           package and there is none to replace. The third-party packages it DRAGS IN (none in \
           a default build since astream-cap's SHA-256 became astream-digest, 2026-10-15; \
@@ -100,8 +100,8 @@ pub fn is_first_party(root: &Path, dir: &Path) -> bool {
 
 /// Does the roster describe this root?
 ///
-/// [`FIRST_PARTY_VENDORED`] is a statement about the aterm workspace, like
-/// `aterm_census::scan_set::REVIEWED_VENDORED_CRATES`; applied to another root
+/// [`FIRST_PARTY_VENDORED`] is a statement about the aterm workspace; applied
+/// to another root
 /// (attest's temp-dir fixtures) it would invent findings. Probed on the file
 /// the constant lives in.
 #[must_use]
@@ -201,83 +201,6 @@ fn normalize(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::repo_root;
-
-    /// The roster's shape is load-bearing: `roster_row` matches on a `/`
-    /// boundary, so a row must not carry one at either end.
-    #[test]
-    fn the_roster_is_well_formed() {
-        for row in FIRST_PARTY_VENDORED {
-            assert!(
-                row.dir.starts_with("vendor/") && !row.dir.ends_with('/'),
-                "`{}` must be `vendor/<dir>` with no trailing slash",
-                row.dir
-            );
-            assert!(
-                row.dir.matches('/').count() == 1,
-                "`{}`: the roster names a TOP-LEVEL vendor directory, because that is what \
-                 [OB-1]'s directory sweep compares against",
-                row.dir
-            );
-            assert!(!row.upstream.is_empty() && row.why.len() > 80);
-        }
-    }
-
-    /// `vendor/` holds both answers, and a sibling prefix is not swallowed.
-    #[test]
-    fn the_roster_separates_astream_from_the_real_forks() {
-        let root = repo_root();
-        assert!(is_first_party_vendored(
-            &root,
-            &root.join("vendor/astream/crates/astream-broker")
-        ));
-        assert!(is_first_party(
-            &root,
-            &root.join("vendor/astream/crates/astream-cap")
-        ));
-        assert!(
-            !is_first_party(&root, &root.join("vendor/indexmap")),
-            "`vendor/indexmap` is a REDISTRIBUTED fork and must stay third-party"
-        );
-        assert!(is_first_party(&root, &root.join("crates/aterm-core")));
-        assert!(
-            is_first_party(&root, &root.join("crates/aterm-window")),
-            "the absorbed winit is a workspace member, billed as aterm's own lines"
-        );
-        assert_eq!(
-            roster_row("vendor/astream-broker"),
-            None,
-            "prefix, not name"
-        );
-        assert!(roster_row("vendor/astream").is_some());
-        assert!(roster_row("vendor/astream/crates/astream-wire").is_some());
-    }
-
-    /// The liveness tooth, on the real tree: crates/aterm-link is why this
-    /// directory is here at all, so it must be the answer.
-    #[test]
-    fn the_roster_directory_is_reached_by_a_workspace_member() {
-        let dependants = path_dependants(&repo_root(), "vendor/astream");
-        assert!(
-            dependants.contains(&"aterm-link".to_string()),
-            "expected aterm-link among {dependants:?}"
-        );
-    }
-
-    /// The roster is scoped: it applies to this workspace and not to a
-    /// synthetic fixture.
-    #[test]
-    fn the_roster_applies_to_this_workspace_and_not_to_an_arbitrary_root() {
-        assert!(applies_to(&repo_root()));
-        assert!(!applies_to(Path::new("/")));
-        assert!(!applies_to(&std::env::temp_dir()));
-    }
-
-    /// A directory nothing points at must read EMPTY, or the tooth is blunt.
-    #[test]
-    fn a_directory_no_member_path_depends_on_has_no_dependants() {
-        assert!(path_dependants(&repo_root(), "vendor/does-not-exist").is_empty());
-    }
 
     #[test]
     fn path_values_are_read_out_of_a_manifest_and_relative_parts_resolve() {

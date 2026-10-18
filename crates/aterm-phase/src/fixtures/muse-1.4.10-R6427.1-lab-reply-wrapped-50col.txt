@@ -1,0 +1,15 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (50x40, aterm 0.105.0) running the real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab) · the pane at 50 columns: a reply of two paragraphs (the stub's reply.txt), the second wrapped over two rows, its last row `every caller now. Which do you prefer (1 or 2)?`
+
+  Muse Code 1.4.10
+
+❯ what next
+
+◆ I finished the parser and the suite is green.
+
+  Two ways on from here: keep the old API, or move
+  every caller now. Which do you prefer (1 or 2)?
+
+── Voice input (⌥ + v to start) ──────────────────
+❯
+──────────────────────────────────────────────────
+  lab-stub · high · /…/at.h09J/proj · Auto-review

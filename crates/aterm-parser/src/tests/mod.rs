@@ -13,11 +13,9 @@ mod csi;
 mod empty_params;
 mod invariants;
 mod performance;
-mod refinement;
 mod string_bulk;
 mod string_cancel;
 mod subparams;
-mod table_validity;
 mod utf8_errors;
 mod utf8_parity;
 
@@ -33,7 +31,11 @@ struct RecordingSink {
     osc_dispatches: Vec<Vec<Vec<u8>>>,
     dcs_hooks: Vec<(Vec<u16>, Vec<u8>, u8)>,
     dcs_puts: Vec<u8>,
+    /// DCS strings ended at ST (`dcs_unhook(false)`).
     dcs_unhooks: usize,
+    /// DCS strings canceled: by CAN or SUB, or broken off by an ESC that
+    /// does not begin ST (`dcs_unhook(true)`).
+    dcs_cancels: usize,
     apc_starts: usize,
     apc_data: Vec<u8>,
     /// APC strings ended by ST (`apc_end(false)`).
@@ -105,8 +107,12 @@ impl ActionSink for RecordingSink {
     fn dcs_put(&mut self, byte: u8) {
         self.dcs_puts.push(byte);
     }
-    fn dcs_unhook(&mut self, _canceled: bool) {
-        self.dcs_unhooks += 1;
+    fn dcs_unhook(&mut self, canceled: bool) {
+        if canceled {
+            self.dcs_cancels += 1;
+        } else {
+            self.dcs_unhooks += 1;
+        }
     }
     fn apc_start(&mut self) {
         self.apc_starts += 1;

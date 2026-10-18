@@ -40,7 +40,8 @@ use aterm_core::terminal::repaint_nudge::{
     Act, Dropped, Facts, GiveUp, Mode, PTY_HOLD_CAP_MS, Phase, QUIET_MAX_MS, QUIET_WAIT_MS, Reason,
     RepaintNudge,
 };
-use aterm_spec::derive::{Model, repaint_nudge_model};
+use aterm_models_render::repaint_nudge_model;
+use aterm_spec::derive::Model;
 
 const ROWS: u16 = 12;
 const COLS: u16 = 20;

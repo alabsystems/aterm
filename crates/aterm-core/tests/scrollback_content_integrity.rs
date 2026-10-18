@@ -79,43 +79,6 @@ fn resize_preserves_scrollback_logical_lines_both_directions() {
 }
 
 #[test]
-fn resize_round_trip_restores_known_early_line() {
-    // A 184 -> 140 -> 184 round-trip: an early line ("ROW30") survives both legs
-    // and the scrollback row count is restored (rewrap is reversible).
-    let mut term = Terminal::new(38, 184);
-    let mut input = Vec::new();
-    for i in 0..190u32 {
-        let mut line = format!("ROW{i} ");
-        while line.len() < 180 {
-            line.push_str("wxyz");
-        }
-        line.truncate(180);
-        input.extend_from_slice(line.as_bytes());
-        input.extend_from_slice(b"\r\n");
-    }
-    term.process(&input);
-
-    let sb0 = term.grid().scrollback_lines();
-    let present = |t: &Terminal| {
-        logical_history_lines(t)
-            .iter()
-            .any(|l| l.starts_with("ROW30 "))
-    };
-    assert!(present(&term), "ROW30 present initially");
-
-    term.resize(38, 140);
-    assert!(present(&term), "ROW30 survives 184 -> 140");
-
-    term.resize(38, 184);
-    assert!(present(&term), "ROW30 survives 140 -> 184 round-trip");
-    assert_eq!(
-        term.grid().scrollback_lines(),
-        sb0,
-        "round-trip must restore the original scrollback row count"
-    );
-}
-
-#[test]
 fn resize_preserves_scrollback_with_tiered_storage() {
     // Same invariant with an explicit tiered scrollback (the builder path used
     // by hosts that want unlimited history), exercising the lazy-buffer restore

@@ -1003,8 +1003,8 @@ impl CellExtras {
     pub fn render_data_for_cell(&self, row: u16, col: u16, cell: Cell) -> CellRenderData<'_> {
         let wants_extra = cell.has_extras();
         let wants_complex = cell.is_complex();
-        let wants_fg_rgb = !cell.uses_style_id() && cell.fg_needs_overflow();
-        let wants_bg_rgb = !cell.uses_style_id() && cell.bg_needs_overflow();
+        let wants_fg_rgb = cell.fg_needs_overflow();
+        let wants_bg_rgb = cell.bg_needs_overflow();
 
         let mut data = CellRenderData::default();
         if !(wants_extra || wants_complex || wants_fg_rgb || wants_bg_rgb) {
@@ -1457,6 +1457,11 @@ impl CellExtras {
             return;
         }
 
+        // This path keeps the run's RGB in the map, but reads consult the ring first, so
+        // drop the bytes an earlier ring writer (an RGB-only run, a truecolour erase) left
+        // here, as the per-character writer does (`Grid::write_char_at_cursor_packed`).
+        self.clear_rgb_ring_cell(row, col_start, col_end - col_start);
+
         // Build the shared (url, id) payload once, so every cell holds the same
         // `Arc`; a cell that later edits its link copies on write.
         let hyperlink = vals.hyperlink.map(|url| {
@@ -1880,85 +1885,140 @@ impl CellExtras {
 mod tests {
     use super::*;
 
-    // ComplexCharRing stride bounds checks
-
-    /// A column at or past the stride reads `None`, not the next ring row's data.
+    /// Both rings ignore a column at or past their stride: a read is `None`
+    /// and a write a no-op, never an alias into the next ring row's slots
+    /// (row 0, col 10 of a 10-wide ring is row 1, col 0's slot).
     #[test]
-    fn test_complex_ring_get_col_at_stride_returns_none() {
-        let mut ring = ComplexCharRing::new(4, 10);
-        ring.set(0, 0, '\u{1F389}');
-        ring.set(1, 0, '\u{1F680}');
-        assert_eq!(ring.get(0, 0), Some('\u{1F389}'));
-        assert_eq!(ring.get(1, 0), Some('\u{1F680}'));
+    fn ring_columns_past_the_stride_never_alias_the_next_row() {
+        let mut complex = ComplexCharRing::new(4, 10);
+        complex.set(1, 0, '\u{1F680}');
+        complex.set(0, 15, '\u{2764}');
+        assert_eq!(complex.get(1, 5), None, "a write past the stride aliased");
+        for col in [10, 100] {
+            assert_eq!(complex.get(0, col), None, "col {col}");
+        }
+        complex.set(0, 10, '\u{1F389}');
+        assert_eq!(complex.get(1, 0), Some('\u{1F680}'));
 
-        // col == stride would alias to (1, 0), the rocket.
-        assert_eq!(
-            ring.get(0, 10),
-            None,
-            "col == stride should return None, not cross-row data"
-        );
-        assert_eq!(ring.get(0, 100), None, "col >> stride should return None");
+        let mut rgb = RgbColorRing::new(4, 10);
+        rgb.set_fg(1, 0, [0, 0, 255]);
+        rgb.set_bg(1, 0, [128, 128, 0]);
+        rgb.set_fg(0, 15, [255, 0, 0]);
+        rgb.set_bg(0, 15, [0, 255, 0]);
+        assert_eq!((rgb.fg(1, 5), rgb.bg(1, 5)), (None, None));
+        for col in [10, 200] {
+            assert_eq!((rgb.fg(0, col), rgb.bg(0, col)), (None, None), "col {col}");
+        }
+        rgb.set_fg(0, 10, [1, 1, 1]);
+        assert_eq!(rgb.fg(1, 0), Some([0, 0, 255]));
     }
 
-    /// A write at or past the stride is a no-op, never another row's slot.
+    /// Scrolling a ring by at least its visible rows (e.g. `CSI 65535 S`)
+    /// recycles it whole and resets `ring_offset`, so later writes stay
+    /// readable.
     #[test]
-    fn test_complex_ring_set_col_at_stride_is_noop() {
-        let mut ring = ComplexCharRing::new(4, 10);
-        // Without the guard these alias to (1, 0) and (1, 5).
-        ring.set(0, 10, '\u{1F680}');
-        ring.set(0, 15, '\u{2764}');
+    fn ring_overscroll_recycles_and_resets_the_offset() {
+        for n in [4, 5, 65535] {
+            let mut complex = ComplexCharRing::new(4, 10);
+            complex.set(3, 1, '\u{1F389}');
+            complex.scroll_up(1);
+            complex.scroll_up(n);
+            assert_eq!(complex.ring_offset, 0, "scroll {n}");
+            assert_eq!(complex.get(2, 1), None, "scroll {n}");
+            complex.set(2, 3, '\u{1F680}');
+            assert_eq!(complex.get(2, 3), Some('\u{1F680}'), "scroll {n}");
 
-        assert_eq!(
-            ring.get(1, 0),
-            None,
-            "set at col == stride must not write to next row"
-        );
-        assert_eq!(
-            ring.get(1, 5),
-            None,
-            "set at col > stride must not write to aliased slot"
-        );
+            let mut rgb = RgbColorRing::new(4, 10);
+            rgb.set_fg(3, 0, [255, 0, 0]);
+            rgb.set_bg(3, 0, [0, 255, 0]);
+            rgb.scroll_up(1);
+            rgb.scroll_up(n);
+            assert_eq!(rgb.ring_offset, 0, "scroll {n}");
+            assert_eq!((rgb.fg(2, 0), rgb.bg(2, 0)), (None, None), "scroll {n}");
+            rgb.set_fg(2, 2, [10, 20, 30]);
+            rgb.set_bg(2, 2, [40, 50, 60]);
+            assert_eq!(rgb.fg(2, 2), Some([10, 20, 30]), "scroll {n}");
+            assert_eq!(rgb.bg(2, 2), Some([40, 50, 60]), "scroll {n}");
+        }
     }
 
-    /// `scroll_up(n >= visible_rows)` (e.g. `CSI 65535 S`) recycles the whole
-    /// ring and resets `ring_offset`; later writes read back.
+    /// EVERY CLEAR REACHES BOTH STORES (#7697): `clear_row`, `clear_range`,
+    /// `clear_rows` and `clear_rect` remove exactly their cells from the
+    /// HashMap and from the RGB ring (where RGB-only writes live), keep every
+    /// other cell, and an empty range clears nothing. Each runs on a dense and
+    /// a sparse map so `clear_range` takes both its probe and its scan.
     #[test]
-    fn test_complex_ring_overscroll_resets_offset() {
-        let mut ring = ComplexCharRing::new(24, 10);
-        ring.set(0, 0, '\u{1F389}');
-        ring.scroll_up(65535);
-        assert_eq!(ring.ring_offset, 0, "over-scroll must reset ring_offset");
-        assert_eq!(ring.get(0, 0), None, "scrolled-off char must be cleared");
-        ring.set(5, 3, '\u{1F680}');
-        assert_eq!(
-            ring.get(5, 3),
-            Some('\u{1F680}'),
-            "post-overscroll write must read back (offset not corrupted)"
-        );
-    }
-
-    /// The same for the RGB ring.
-    #[test]
-    fn test_rgb_ring_overscroll_resets_offset() {
-        let mut ring = RgbColorRing::new(24, 10);
-        ring.set_fg(0, 0, [255, 0, 0]);
-        ring.set_bg(0, 0, [0, 255, 0]);
-        ring.scroll_up(65535);
-        assert_eq!(ring.ring_offset, 0, "over-scroll must reset ring_offset");
-        assert_eq!(ring.fg(0, 0), None, "scrolled-off fg must be cleared");
-        assert_eq!(ring.bg(0, 0), None, "scrolled-off bg must be cleared");
-        ring.set_fg(7, 2, [10, 20, 30]);
-        ring.set_bg(7, 2, [40, 50, 60]);
-        assert_eq!(
-            ring.fg(7, 2),
-            Some([10, 20, 30]),
-            "post-overscroll fg write must read back"
-        );
-        assert_eq!(
-            ring.bg(7, 2),
-            Some([40, 50, 60]),
-            "post-overscroll bg write must read back"
-        );
+    fn every_clear_removes_exactly_its_cells_from_map_and_rgb_ring() {
+        type Clear = fn(&mut CellExtras);
+        #[expect(clippy::type_complexity, reason = "a test's case table")]
+        let cases: &[(&str, Clear, fn(u16, u16) -> bool)] = &[
+            ("clear_row(1)", |e| e.clear_row(1), |r, _| r == 1),
+            (
+                "clear_range(3, 1..4)",
+                |e| e.clear_range(3, 1, 4),
+                |r, c| r == 3 && (1..4).contains(&c),
+            ),
+            (
+                "clear_range(3, 4..4)",
+                |e| e.clear_range(3, 4, 4),
+                |_, _| false,
+            ),
+            (
+                "clear_rows(1..3)",
+                |e| e.clear_rows(1..3),
+                |r, _| (1..3).contains(&r),
+            ),
+            ("clear_rows(3..3)", |e| e.clear_rows(3..3), |_, _| false),
+            (
+                "clear_rect(1..3, 3..7)",
+                |e| e.clear_rect(1..3, 3..7),
+                |r, c| (1..3).contains(&r) && (3..7).contains(&c),
+            ),
+            (
+                "clear_rect(0..4, 3..3)",
+                |e| e.clear_rect(0..4, 3..3),
+                |_, _| false,
+            ),
+        ];
+        for &(name, clear, cleared) in cases {
+            for dense in [true, false] {
+                let cells: Vec<(u16, u16)> = (0..4u16)
+                    .flat_map(|r| (0..10u16).map(move |c| (r, c)))
+                    .filter(|&(r, c)| dense || (r + c) % 9 == 0)
+                    .collect();
+                let mut extras = CellExtras::new();
+                for &(r, c) in &cells {
+                    let mut extra = CellExtra::default();
+                    extra.set_fg_rgb(Some([r as u8, c as u8, 1]));
+                    extras.set(CellCoord::new(r, c), extra);
+                    extras.set_rgb_ring_range(
+                        r,
+                        c,
+                        c + 1,
+                        None,
+                        Some([r as u8, c as u8, 2]),
+                        4,
+                        10,
+                    );
+                }
+                clear(&mut extras);
+                for &(r, c) in &cells {
+                    let kept = !cleared(r, c);
+                    let map = extras.get(CellCoord::new(r, c)).and_then(CellExtra::fg_rgb);
+                    assert_eq!(
+                        map.is_some(),
+                        kept,
+                        "{name} (dense {dense}): map ({r}, {c})"
+                    );
+                    let ring = extras.bg_rgb_for(r, c);
+                    assert_eq!(
+                        ring.is_some(),
+                        kept,
+                        "{name} (dense {dense}): ring ({r}, {c})"
+                    );
+                }
+            }
+        }
     }
 
     /// `fill_runs` leaves the ring exactly as per-cell `set_fg`/`set_bg` does,
@@ -2085,18 +2145,6 @@ mod tests {
         }
     }
 
-    /// `n == visible_rows`, the over-scroll guard's boundary, also clears and resets.
-    #[test]
-    fn test_complex_ring_scroll_exactly_visible_rows() {
-        let mut ring = ComplexCharRing::new(4, 10);
-        ring.set(3, 1, '\u{1F389}');
-        ring.scroll_up(4);
-        assert_eq!(ring.ring_offset, 0);
-        assert_eq!(ring.get(3, 1), None);
-        ring.set(0, 0, '\u{1F600}');
-        assert_eq!(ring.get(0, 0), Some('\u{1F600}'));
-    }
-
     /// `ComplexCharRing::clear_range`'s one `fill('\0')` equals a per-column
     /// store, across the same kinds of ranges.
     #[test]
@@ -2144,312 +2192,6 @@ mod tests {
                 "entries mismatch for vis={vis} cols={cols} row={row} {left}..{right} scroll={scroll}"
             );
         }
-    }
-
-    // RgbColorRing stride bounds checks
-
-    /// Reading fg/bg at a column at or beyond stride must return None.
-    #[test]
-    fn test_rgb_ring_get_col_at_stride_returns_none() {
-        let mut ring = RgbColorRing::new(4, 10);
-        ring.set_fg(0, 0, [255, 0, 0]);
-        ring.set_bg(0, 0, [0, 255, 0]);
-        // Place data at row 1, col 0 to verify no cross-row bleed.
-        ring.set_fg(1, 0, [0, 0, 255]);
-        ring.set_bg(1, 0, [128, 128, 0]);
-
-        assert_eq!(ring.fg(0, 0), Some([255, 0, 0]));
-        assert_eq!(ring.bg(0, 0), Some([0, 255, 0]));
-
-        assert_eq!(
-            ring.fg(0, 10),
-            None,
-            "fg at col == stride should return None"
-        );
-        assert_eq!(
-            ring.bg(0, 10),
-            None,
-            "bg at col == stride should return None"
-        );
-        assert_eq!(
-            ring.fg(0, 200),
-            None,
-            "fg at col >> stride should return None"
-        );
-        assert_eq!(
-            ring.bg(0, 200),
-            None,
-            "bg at col >> stride should return None"
-        );
-    }
-
-    /// Writing fg/bg at a column at or beyond stride must be a no-op.
-    #[test]
-    fn test_rgb_ring_set_col_at_stride_is_noop() {
-        let mut ring = RgbColorRing::new(4, 10);
-        ring.set_fg(0, 10, [255, 0, 0]);
-        ring.set_bg(0, 10, [0, 255, 0]);
-
-        // The aliased slot (row 1, col 0) must remain empty.
-        assert_eq!(
-            ring.fg(1, 0),
-            None,
-            "set_fg at col == stride must not corrupt next row"
-        );
-        assert_eq!(
-            ring.bg(1, 0),
-            None,
-            "set_bg at col == stride must not corrupt next row"
-        );
-    }
-
-    /// After a scroll, an out-of-range column still reads `None`.
-    #[test]
-    fn test_complex_ring_scroll_then_oob_col_returns_none() {
-        let mut ring = ComplexCharRing::new(4, 10);
-        for col in 0..10 {
-            ring.set(
-                0,
-                col,
-                char::from_u32(0x1F600 + u32::from(col)).expect("valid char"),
-            );
-        }
-        // Row 0 is recycled; old row 1 becomes row 0.
-        ring.scroll_up(1);
-
-        assert_eq!(
-            ring.get(0, 10),
-            None,
-            "after scroll, col == stride must still return None"
-        );
-    }
-
-    // RgbColorRing erase clearing
-
-    /// `RgbColorRing::clear_range` zeroes fg/bg for the specified column range.
-    #[test]
-    fn test_rgb_ring_clear_range_zeroes_entries() {
-        let mut ring = RgbColorRing::new(4, 10);
-        for col in 2..7 {
-            ring.set_fg(1, col, [255, 0, col as u8]);
-            ring.set_bg(1, col, [0, 255, col as u8]);
-        }
-        assert!(ring.fg(1, 3).is_some());
-        assert!(ring.bg(1, 3).is_some());
-
-        ring.clear_range(1, 3, 6);
-
-        for col in 3..6 {
-            assert_eq!(ring.fg(1, col), None, "fg at col {col} should be cleared");
-            assert_eq!(ring.bg(1, col), None, "bg at col {col} should be cleared");
-        }
-        assert!(ring.fg(1, 2).is_some(), "col 2 should be preserved");
-        assert!(ring.fg(1, 6).is_some(), "col 6 should be preserved");
-    }
-
-    /// `RgbColorRing::clear_row` zeroes the entire row.
-    #[test]
-    fn test_rgb_ring_clear_row_zeroes_entire_row() {
-        let mut ring = RgbColorRing::new(4, 10);
-        for col in 0..10 {
-            ring.set_fg(2, col, [col as u8, 0, 0]);
-            ring.set_bg(2, col, [0, col as u8, 0]);
-        }
-        ring.set_fg(1, 0, [42, 42, 42]);
-
-        ring.clear_row(2);
-
-        for col in 0..10 {
-            assert_eq!(ring.fg(2, col), None, "fg at col {col} should be cleared");
-            assert_eq!(ring.bg(2, col), None, "bg at col {col} should be cleared");
-        }
-        assert_eq!(
-            ring.fg(1, 0),
-            Some([42, 42, 42]),
-            "row 1 should be preserved"
-        );
-    }
-
-    /// `CellExtras::clear_range` zeroes the RGB ring for the erased range.
-    #[test]
-    fn test_cell_extras_clear_range_clears_rgb_ring() {
-        let mut extras = CellExtras::new();
-        extras.set_rgb_ring_range(0, 0, 5, Some([255, 0, 0]), Some([0, 0, 255]), 4, 10);
-        assert_eq!(extras.fg_rgb_for(0, 2), Some([255, 0, 0]));
-        assert_eq!(extras.bg_rgb_for(0, 2), Some([0, 0, 255]));
-
-        extras.clear_range(0, 1, 4);
-
-        for col in 1..4 {
-            assert_eq!(
-                extras.fg_rgb_for(0, col),
-                None,
-                "fg_rgb at col {col} should be None after clear_range (#7697)"
-            );
-            assert_eq!(
-                extras.bg_rgb_for(0, col),
-                None,
-                "bg_rgb at col {col} should be None after clear_range (#7697)"
-            );
-        }
-        assert_eq!(
-            extras.fg_rgb_for(0, 0),
-            Some([255, 0, 0]),
-            "col 0 preserved"
-        );
-        assert_eq!(
-            extras.fg_rgb_for(0, 4),
-            Some([255, 0, 0]),
-            "col 4 preserved"
-        );
-    }
-
-    /// `CellExtras::clear_row` zeroes the RGB ring for the erased row.
-    #[test]
-    fn test_cell_extras_clear_row_clears_rgb_ring() {
-        let mut extras = CellExtras::new();
-        extras.set_rgb_ring_range(1, 0, 8, Some([0, 128, 0]), None, 4, 10);
-        assert_eq!(extras.fg_rgb_for(1, 3), Some([0, 128, 0]));
-
-        extras.clear_row(1);
-
-        for col in 0..8 {
-            assert_eq!(
-                extras.fg_rgb_for(1, col),
-                None,
-                "fg_rgb at (1, {col}) should be None after clear_row (#7697)"
-            );
-        }
-    }
-
-    /// `RgbColorRing::shift_region_up` moves surviving rows up via the
-    /// `copy_within` memmove in `copy_span`, preserving fg/bg exactly.
-    #[test]
-    fn test_rgb_ring_shift_region_up_preserves_via_memmove() {
-        let mut ring = RgbColorRing::new(4, 10);
-        // Distinct fg/bg per (row, col) so a wrong copy is detectable.
-        for row in 0..4 {
-            for col in 0..10 {
-                ring.set_fg(row, col, [row as u8, col as u8, 1]);
-                ring.set_bg(row, col, [row as u8, col as u8, 2]);
-            }
-        }
-        // Shift region [0, 3] up by 1: row r+1 moves to row r; row 3 cleared.
-        ring.shift_region_up(0, 3, 1);
-        for row in 0..3 {
-            for col in 0..10 {
-                assert_eq!(
-                    ring.fg(row, col),
-                    Some([(row + 1) as u8, col as u8, 1]),
-                    "fg at ({row}, {col}) should equal old row {}",
-                    row + 1
-                );
-                assert_eq!(
-                    ring.bg(row, col),
-                    Some([(row + 1) as u8, col as u8, 2]),
-                    "bg at ({row}, {col}) should equal old row {}",
-                    row + 1
-                );
-            }
-        }
-        for col in 0..10 {
-            assert_eq!(ring.fg(3, col), None, "vacated row 3 fg cleared");
-            assert_eq!(ring.bg(3, col), None, "vacated row 3 bg cleared");
-        }
-    }
-
-    /// `ComplexCharRing::shift_region_up` moves surviving rows up via the
-    /// `copy_within` memmove in `copy_row_span`, preserving chars exactly.
-    #[test]
-    fn test_complex_ring_shift_region_up_preserves_via_memmove() {
-        let mut ring = ComplexCharRing::new(4, 10);
-        for row in 0..4 {
-            for col in 0..10 {
-                let c = char::from_u32(0x1F600 + u32::from(row) * 16 + u32::from(col))
-                    .expect("valid char");
-                ring.set(row, col, c);
-            }
-        }
-        ring.shift_region_up(0, 3, 1);
-        for row in 0..3 {
-            for col in 0..10 {
-                let expected = char::from_u32(0x1F600 + u32::from(row + 1) * 16 + u32::from(col))
-                    .expect("valid char");
-                assert_eq!(
-                    ring.get(row, col),
-                    Some(expected),
-                    "char at ({row}, {col}) should equal old row {}",
-                    row + 1
-                );
-            }
-        }
-        for col in 0..10 {
-            assert_eq!(ring.get(3, col), None, "vacated row 3 cleared");
-        }
-    }
-
-    /// `CellExtras::clear_rows` zeroes the RGB ring for the erased rows.
-    #[test]
-    fn test_cell_extras_clear_rows_clears_rgb_ring() {
-        let mut extras = CellExtras::new();
-        for row in 0..4 {
-            extras.set_rgb_ring_range(row, 0, 5, Some([row as u8, 0, 0]), None, 4, 10);
-        }
-        assert_eq!(extras.fg_rgb_for(2, 0), Some([2, 0, 0]));
-
-        extras.clear_rows(1..3);
-
-        for row in 1..3 {
-            assert_eq!(
-                extras.fg_rgb_for(row, 0),
-                None,
-                "row {row} should be cleared (#7697)"
-            );
-        }
-        assert_eq!(extras.fg_rgb_for(0, 0), Some([0, 0, 0]));
-        assert_eq!(extras.fg_rgb_for(3, 0), Some([3, 0, 0]));
-    }
-
-    /// `CellExtras::clear_rect` zeroes the RGB ring for the erased rect.
-    #[test]
-    fn test_cell_extras_clear_rect_clears_rgb_ring() {
-        let mut extras = CellExtras::new();
-        for row in 0..4 {
-            extras.set_rgb_ring_range(row, 0, 10, Some([255, row as u8, 0]), None, 4, 10);
-        }
-        assert_eq!(extras.fg_rgb_for(1, 5), Some([255, 1, 0]));
-
-        extras.clear_rect(1..3, 3..7);
-
-        for row in 1..3 {
-            for col in 3..7 {
-                assert_eq!(
-                    extras.fg_rgb_for(row, col),
-                    None,
-                    "({row}, {col}) inside rect should be cleared (#7697)"
-                );
-            }
-        }
-        assert_eq!(
-            extras.fg_rgb_for(1, 2),
-            Some([255, 1, 0]),
-            "left of rect preserved"
-        );
-        assert_eq!(
-            extras.fg_rgb_for(1, 7),
-            Some([255, 1, 0]),
-            "right of rect preserved"
-        );
-        assert_eq!(
-            extras.fg_rgb_for(0, 5),
-            Some([255, 0, 0]),
-            "above rect preserved"
-        );
-        assert_eq!(
-            extras.fg_rgb_for(3, 5),
-            Some([255, 3, 0]),
-            "below rect preserved"
-        );
     }
 
     #[test]

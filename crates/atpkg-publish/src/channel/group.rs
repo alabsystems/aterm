@@ -40,6 +40,7 @@ use crate::api::{
     Packer, Signing,
 };
 use crate::artifact::lineage_switch::{self, Switch};
+use crate::artifact::upload;
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
 use crate::host::HostError;
@@ -354,7 +355,7 @@ pub fn pack_build(ctx: &Ctx, program: &str, dir: &Path, compiler_moved: bool) ->
     };
     let public = ctx.public_slug(repo);
     loop {
-        let tag = format!("atpkg-{program}-{b}");
+        let tag = upload::tag(program, b);
         let taken = staged.contains(&tag)
             || match ctx.hosts.channel.release(&public, &tag) {
                 Ok(_) => true,
@@ -568,6 +569,8 @@ pub fn preflight(ctx: &Ctx, req: &GroupRequest, parts: &Parts<'_>) -> Preflight 
     });
     match floor {
         Ok((n, q)) => {
+            // The packs this group drives sign under the generation this head elects.
+            crate::artifact::sign::elect_from_head(ctx, &q);
             if let Some(c) = q.index.channels.first() {
                 pf.public_trust_pin = c.pin.get(BUNDLE).copied();
                 pf.floor = Some(Floor {
@@ -666,21 +669,9 @@ pub fn preflight(ctx: &Ctx, req: &GroupRequest, parts: &Parts<'_>) -> Preflight 
         }
     }
 
-    // The candidate gate (D27). A dry run does not ask: asking builds the release cutter.
-    let answer = if req.mode == Mode::DryRun {
-        GateAnswer::CannotCheck(format!(
-            "not asked by a dry run (`{} {}`)",
-            super::candidate::PROGRAM,
-            super::candidate::command(Path::new(&ctx.shown(seal)), pf.public_trust_pin)
-                .iter()
-                .map(|a| a.to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-                .join(" ")
-        ))
-    } else {
-        parts.gate.admits(ctx, seal, pf.public_trust_pin)
-    };
-    match answer {
+    // The candidate gate (D27), asked in every mode: the answer is read in-process from
+    // the receipts store, so a dry run says what a publish would be told.
+    match parts.gate.admits(ctx, seal, pf.public_trust_pin) {
         GateAnswer::Admitted(receipt) => pf.notes.push(format!(
             "the candidate gate (D27): PASS for this seal — {receipt}"
         )),
@@ -1040,6 +1031,7 @@ pub fn publish_group(
             delta,
             out: out.join("index"),
             upload,
+            pack_dir: None,
         },
     )?;
     if upload {

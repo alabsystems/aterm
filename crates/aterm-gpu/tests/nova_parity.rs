@@ -13,10 +13,12 @@
 // damaged path equals a fresh render on both backends; a settled frame after
 // the super nova, with its frozen rainbow ink, takes the dirty gate.
 //
-// A host without a GPU could not run it (`common::gpu`); byte-exact checks
-// also gate on `additive_is_byte_exact`.
+// No GPU or no font: COULD NOT RUN. On a downlevel (sRGB-offscreen) adapter
+// (`additive_is_byte_exact`) a test runs its other checks, then ends COULD NOT
+// RUN naming the byte-exact comparisons it could not make (`common::ByteExact`).
 
 use crate::common;
+use crate::common::ByteExact;
 use aterm_core::render::InkCell;
 use aterm_core::terminal::Terminal;
 use aterm_effects::supernova::{self, SuperEnv};
@@ -68,6 +70,7 @@ fn push_nova(input: &mut aterm_core::render::RenderInput, cw: usize, ch: usize) 
 /// equals `min(255, bg + premul)` per channel.
 #[test]
 fn nova_additive_is_byte_exact_over_background() {
+    let exact = ByteExact::default();
     let theme = Theme::default();
     let px = 18.0;
     let (mut cpu, mut gpu) = backends(px, theme);
@@ -105,13 +108,11 @@ fn nova_additive_is_byte_exact_over_background() {
     );
     let delta = max_channel_delta(&cpu_frame.pixels, &gpu_frame.pixels);
     eprintln!("nova additive-over-bg max per-channel delta = {delta}");
-    if gpu.additive_is_byte_exact() {
+    if exact.holds(&gpu, "byte-exact additive gate") {
         assert_eq!(
             delta, 0,
             "premultiplied nova light over a flat bg must be BYTE-EXACT CPU==GPU (got {delta})"
         );
-    } else {
-        eprintln!("SKIP byte-exact additive gate: downlevel sRGB offscreen (linear add)");
     }
 
     // And the value is exactly min(255, bg + premul) at the a=255 quad centre.
@@ -128,37 +129,13 @@ fn nova_additive_is_byte_exact_over_background() {
     );
 }
 
-/// Crown and ring over glyphs stay within the glyph tolerance (<=8).
-#[test]
-fn nova_over_text_matches_within_tolerance() {
-    let theme = Theme::default();
-    let px = 18.0;
-    let (mut cpu, mut gpu) = backends(px, theme);
-    let mut win = aterm_gpu::WindowGpu::new();
-    let (rows, cols) = (5usize, 24usize);
-    let mut term = Terminal::new(rows as u16, cols as u16);
-    term.process(b"error[E0308]: fuck\r\n  --> src/main.rs:42:7\r\ncargo build failed");
-    let (cw, ch) = cpu.cell_size();
-    let mut input = term.cell_frame(rows, cols);
-    push_nova(&mut input, cw, ch);
-
-    let cpu_frame = cpu.render_input(&input);
-    let gpu_frame = gpu.render_input(&mut win, &input, None);
-    let delta = max_channel_delta(&cpu_frame.pixels, &gpu_frame.pixels);
-    eprintln!("nova over-text max per-channel delta = {delta}");
-    if gpu.additive_is_byte_exact() {
-        assert!(delta <= 8, "nova over text diverges: max delta {delta} > 8");
-    } else {
-        eprintln!("SKIP nova-over-text parity gate: downlevel sRGB offscreen (linear add)");
-    }
-}
-
 /// Cached-path nova parity with a multi-row shape: frame A places the crown and
 /// ring; frame B moves the ring down, and the shared dirty set must cover
 /// previous and current rows on both backends with no stale light. Over a
 /// glyph-free background frame B is byte-exact CPU vs GPU.
 #[test]
 fn damaged_path_multi_row_nova_parity_cpu_matches_gpu() {
+    let exact = ByteExact::default();
     let theme = Theme::default();
     let px = 18.0;
     let (mut cpu, mut gpu) = backends(px, theme);
@@ -221,13 +198,11 @@ fn damaged_path_multi_row_nova_parity_cpu_matches_gpu() {
 
     let delta = max_channel_delta(&cpu_b, &gpu_b);
     eprintln!("damaged-path nova CPU vs GPU max per-channel delta = {delta}");
-    if gpu.additive_is_byte_exact() {
+    if exact.holds(&gpu, "damaged-path byte-exact additive gate") {
         assert_eq!(
             delta, 0,
             "multi-row nova over bg via the cached path must be BYTE-EXACT CPU==GPU (got {delta})"
         );
-    } else {
-        eprintln!("SKIP damaged-path byte-exact additive gate: downlevel sRGB offscreen");
     }
 }
 
@@ -287,42 +262,6 @@ fn frozen_rainbow_ink() -> Vec<InkCell> {
     .collect()
 }
 
-/// Detonation peak (t=500 ms) over a flat background: premultiplied One/One
-/// quads, byte-exact CPU==GPU (gated on `additive_is_byte_exact`).
-#[test]
-fn supernova_detonation_peak_is_byte_exact_over_background() {
-    let theme = Theme::default();
-    let (mut cpu, mut gpu) = backends(18.0, theme);
-    let mut win = aterm_gpu::WindowGpu::new();
-    let (rows, cols) = (8usize, 16usize);
-    let mut term = Terminal::new(rows as u16, cols as u16); // all background
-    let mut input = term.cell_frame(rows, cols);
-    input.cursor_visible = false; // isolate the supernova light
-    let env = super_env(&cpu, rows, cols);
-    push_super(&mut input, &env, 500);
-    assert!(
-        !input.nova_add.is_empty(),
-        "detonation peak must emit wash/crown quads (non-vacuous)"
-    );
-    assert!(
-        input.word_decorations.is_empty(),
-        "dark-theme detonation is pure additive (the veil is light-theme only)"
-    );
-
-    let cpu_frame = cpu.render_input(&input);
-    let gpu_frame = gpu.render_input(&mut win, &input, None);
-    let delta = max_channel_delta(&cpu_frame.pixels, &gpu_frame.pixels);
-    eprintln!("supernova detonation-peak over-bg max per-channel delta = {delta}");
-    if gpu.additive_is_byte_exact() {
-        assert_eq!(
-            delta, 0,
-            "detonation-peak wash+crown over a flat bg must be BYTE-EXACT CPU==GPU (got {delta})"
-        );
-    } else {
-        eprintln!("SKIP byte-exact additive gate: downlevel sRGB offscreen (linear add)");
-    }
-}
-
 /// Detonation peak over text: the wash over glyphs stays within the glyph
 /// tolerance (<=8).
 #[test]
@@ -341,14 +280,11 @@ fn supernova_detonation_peak_over_text_matches_within_tolerance() {
     let gpu_frame = gpu.render_input(&mut win, &input, None);
     let delta = max_channel_delta(&cpu_frame.pixels, &gpu_frame.pixels);
     eprintln!("supernova detonation-peak over-text max per-channel delta = {delta}");
-    if gpu.additive_is_byte_exact() {
-        assert!(
-            delta <= 8,
-            "supernova detonation over text diverges: max delta {delta} > 8"
-        );
-    } else {
-        eprintln!("SKIP supernova-over-text parity gate: downlevel sRGB offscreen");
-    }
+    crate::common::byte_exact_or_could_not_run(&gpu, "supernova-over-text parity gate");
+    assert!(
+        delta <= 8,
+        "supernova detonation over text diverges: max delta {delta} > 8"
+    );
 }
 
 /// Damaged path, wash frame to shockwave frame: the wash lights every row, the

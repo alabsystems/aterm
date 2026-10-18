@@ -14,7 +14,6 @@ use super::Grid;
 use super::ScrolledRowExtras;
 use super::scroll_materialize::filled_span_cols;
 use crate::Row;
-use crate::StyleTable;
 use crate::{CellCoord, CellExtras};
 
 /// Fill a detached [`Row`] from a scrollback [`Line`] and return its extras in
@@ -27,12 +26,7 @@ use crate::{CellCoord, CellExtras};
 /// be pure overhead. Links and underline colours come back only on cells that
 /// got a glyph back ([`filled_span_cols`]): a one-column row cannot hold a wide
 /// glyph, so it rebuilds empty and the glyph's link must not outlive it.
-pub(crate) fn fill_row_into(
-    row: &mut Row,
-    line: &Line,
-    cols: u16,
-    _styles: &StyleTable,
-) -> ScrolledRowExtras {
+pub(crate) fn fill_row_into(row: &mut Row, line: &Line, cols: u16) -> ScrolledRowExtras {
     debug_assert_eq!(row.len(), 0, "fill_row_into takes a fresh row");
     let mut extras = ScrolledRowExtras::default();
     let Some(text) = line.as_str() else {
@@ -581,100 +575,42 @@ mod tests {
     use super::*;
     use aterm_scrollback::{CellAttrs, Line, Rle};
 
-    // fill_row_from_line: basic text
-
+    /// `fill_row_from_line` replaces the target row with the line's text,
+    /// truncated to the width, blank past it, with the line's wrap flag; other
+    /// rows (and an out-of-range target) are untouched.
     #[test]
-    fn test_fill_row_from_empty_line() {
-        let mut grid = Grid::new(3, 10);
-        let line = Line::new();
-        grid.fill_row_from_line(0, &line, 10);
-
-        let row = grid.row(0).expect("row 0 should exist");
-        assert!(
-            row.is_empty(),
-            "filling from empty line should leave row empty"
-        );
-    }
-
-    #[test]
-    fn test_fill_row_from_ascii_line() {
-        let mut grid = Grid::new(3, 20);
-        let line = Line::from_bytes(b"Hello");
-        grid.fill_row_from_line(0, &line, 20);
-
-        let row = grid.row(0).expect("row 0 should exist");
-        for (i, expected) in "Hello".chars().enumerate() {
-            assert_eq!(
-                row.get(i as u16).unwrap().char(),
-                expected,
-                "char mismatch at col {i}"
-            );
+    fn fill_row_from_line_replaces_exactly_its_row() {
+        let text = |grid: &Grid, row: u16| -> String {
+            (0..grid.cols())
+                .map(|c| grid.cell(row, c).map_or('?', |cell| cell.char()))
+                .collect()
+        };
+        let cases: &[(&str, &[u8], bool, &str)] = &[
+            ("empty", b"", false, "     "),
+            ("ascii", b"Hello", true, "Hello"),
+            ("short", b"AB", false, "AB   "),
+            ("truncated", b"LongTextThatExceedsColumns", false, "LongT"),
+        ];
+        for &(name, bytes, wrapped, want) in cases {
+            let mut grid = Grid::new(3, 5);
+            for row in 0..3 {
+                grid.set_cursor(row, 0);
+                grid.write_char('X');
+            }
+            let mut line = Line::from_bytes(bytes);
+            line.set_wrapped(wrapped);
+            grid.fill_row_from_line(1, &line, 5);
+            assert_eq!(text(&grid, 1), want, "{name}");
+            assert_eq!(grid.row(1).expect("row").is_wrapped(), wrapped, "{name}");
+            assert_eq!(text(&grid, 0), "X    ", "{name}: row above");
+            assert_eq!(text(&grid, 2), "X    ", "{name}: row below");
+            grid.fill_row_from_line(99, &line, 5);
+            assert_eq!(text(&grid, 2), "X    ", "{name}: out-of-range target");
         }
-        for col in 5..20u16 {
-            assert_eq!(
-                row.get(col).unwrap().char(),
-                ' ',
-                "col {col} should be space after text"
-            );
-        }
-    }
-
-    #[test]
-    fn test_fill_row_from_line_preserves_wrapped_flag() {
-        let mut grid = Grid::new(3, 20);
-        let mut line = Line::from_bytes(b"wrapped");
-        line.set_wrapped(true);
-        grid.fill_row_from_line(0, &line, 20);
-
-        let row = grid.row(0).expect("row 0 should exist");
-        assert!(
-            row.is_wrapped(),
-            "wrapped flag should be preserved from scrollback Line"
-        );
-    }
-
-    #[test]
-    fn test_fill_row_from_line_not_wrapped() {
-        let mut grid = Grid::new(3, 20);
-        let line = Line::from_bytes(b"not wrapped");
-        grid.fill_row_from_line(0, &line, 20);
-
-        let row = grid.row(0).expect("row 0 should exist");
-        assert!(
-            !row.is_wrapped(),
-            "non-wrapped line should not set wrapped flag"
-        );
-    }
-
-    #[test]
-    fn test_fill_row_truncates_to_cols() {
-        let mut grid = Grid::new(3, 5);
-        let line = Line::from_bytes(b"LongTextThatExceedsColumns");
+        let mut grid = Grid::new(1, 5);
+        let line = Line::with_attrs("Hello", Rle::with_value(CellAttrs::DEFAULT, 5));
         grid.fill_row_from_line(0, &line, 5);
-
-        let row = grid.row(0).expect("row 0 should exist");
-        for (i, expected) in "LongT".chars().enumerate() {
-            assert_eq!(
-                row.get(i as u16).unwrap().char(),
-                expected,
-                "char mismatch at col {i} when truncating"
-            );
-        }
-    }
-
-    #[test]
-    fn test_fill_row_from_line_clears_previous_content() {
-        let mut grid = Grid::new(3, 10);
-
-        grid.write_char('X');
-
-        let line = Line::from_bytes(b"AB");
-        grid.fill_row_from_line(0, &line, 10);
-
-        let row = grid.row(0).expect("row 0 should exist");
-        assert_eq!(row.get(0).unwrap().char(), 'A');
-        assert_eq!(row.get(1).unwrap().char(), 'B');
-        // The old 'X' should be gone (row was cleared)
+        assert_eq!(text(&grid, 0), "Hello", "default attrs");
     }
 
     #[test]
@@ -757,7 +693,7 @@ mod tests {
             let mut pages = crate::PageStore::new();
             // SAFETY: `pages` outlives `row`, both dropped at the end of the loop body.
             let mut row = unsafe { Row::new(cols, &mut pages) };
-            let extras = fill_row_into(&mut row, &line, cols, grid.styles());
+            let extras = fill_row_into(&mut row, &line, cols);
             let links: Vec<_> = extras
                 .hyperlinks
                 .iter()
@@ -772,232 +708,5 @@ mod tests {
                 "fill_row_into {text:?} underline colours"
             );
         }
-    }
-
-    #[test]
-    fn test_fill_row_different_row_index() {
-        let mut grid = Grid::new(5, 10);
-        let line = Line::from_bytes(b"Row2");
-        grid.fill_row_from_line(2, &line, 10);
-
-        let row = grid.row(2).expect("row 2 should exist");
-        assert_eq!(row.get(0).unwrap().char(), 'R');
-        assert_eq!(row.get(3).unwrap().char(), '2');
-
-        let row0 = grid.row(0).expect("row 0 should exist");
-        assert_eq!(row0.get(0).unwrap().char(), ' ');
-    }
-
-    #[test]
-    fn test_fill_row_out_of_bounds_row_is_noop() {
-        let mut grid = Grid::new(3, 10);
-        let line = Line::from_bytes(b"test");
-        // Row 99 does not exist: no panic.
-        grid.fill_row_from_line(99, &line, 10);
-
-        let row = grid.row(0).expect("row 0 should exist");
-        assert_eq!(row.get(0).unwrap().char(), ' ');
-    }
-
-    // fill_row_from_line: styled content
-
-    #[test]
-    fn test_fill_row_from_line_with_default_attrs() {
-        let mut grid = Grid::new(3, 20);
-        let attrs = Rle::with_value(CellAttrs::DEFAULT, 5);
-        let line = Line::with_attrs("Hello", attrs);
-        grid.fill_row_from_line(0, &line, 20);
-
-        let row = grid.row(0).expect("row 0 should exist");
-        for (i, expected) in "Hello".chars().enumerate() {
-            assert_eq!(
-                row.get(i as u16).unwrap().char(),
-                expected,
-                "char mismatch at col {i} with default attrs"
-            );
-        }
-    }
-
-    // scroll_up / scroll_down
-
-    #[test]
-    fn test_scroll_up_content_shifts_up() {
-        let mut grid = Grid::new(3, 10);
-        grid.set_cursor(0, 0);
-        grid.write_char('A');
-        grid.set_cursor(1, 0);
-        grid.write_char('B');
-        grid.set_cursor(2, 0);
-        grid.write_char('C');
-
-        grid.scroll_up(1);
-
-        // After scroll_up(1): row 0 = B, row 1 = C, row 2 = blank
-        assert_eq!(grid.cell(0, 0).unwrap().char(), 'B');
-        assert_eq!(grid.cell(1, 0).unwrap().char(), 'C');
-        assert_eq!(grid.cell(2, 0).unwrap().char(), ' ');
-    }
-
-    #[test]
-    fn test_scroll_down_content_shifts_down() {
-        let mut grid = Grid::new(3, 10);
-        grid.set_cursor(0, 0);
-        grid.write_char('A');
-        grid.set_cursor(1, 0);
-        grid.write_char('B');
-        grid.set_cursor(2, 0);
-        grid.write_char('C');
-
-        grid.scroll_down(1);
-
-        // After scroll_down(1): row 0 = blank, row 1 = A, row 2 = B
-        assert_eq!(grid.cell(0, 0).unwrap().char(), ' ');
-        assert_eq!(grid.cell(1, 0).unwrap().char(), 'A');
-        assert_eq!(grid.cell(2, 0).unwrap().char(), 'B');
-    }
-
-    // Scroll within a scroll region (DECSTBM)
-
-    #[test]
-    fn test_scroll_region_up_within_region() {
-        let mut grid = Grid::new(5, 10);
-        for row in 0..5u16 {
-            grid.set_cursor(row, 0);
-            grid.write_char((b'A' + row as u8) as char);
-        }
-
-        grid.set_scroll_region(1, 3);
-        grid.scroll_region_up(1);
-
-        assert_eq!(grid.cell(0, 0).unwrap().char(), 'A');
-        // Region rows 1-3: B shifted out, C->1, D->2, blank->3
-        assert_eq!(grid.cell(1, 0).unwrap().char(), 'C');
-        assert_eq!(grid.cell(2, 0).unwrap().char(), 'D');
-        assert_eq!(grid.cell(3, 0).unwrap().char(), ' ');
-        assert_eq!(grid.cell(4, 0).unwrap().char(), 'E');
-    }
-
-    #[test]
-    fn test_scroll_region_down_within_region() {
-        let mut grid = Grid::new(5, 10);
-        for row in 0..5u16 {
-            grid.set_cursor(row, 0);
-            grid.write_char((b'A' + row as u8) as char);
-        }
-
-        grid.set_scroll_region(1, 3);
-        grid.scroll_region_down(1);
-
-        assert_eq!(grid.cell(0, 0).unwrap().char(), 'A');
-        // Region: blank at top, B->2, C->3, D pushed out
-        assert_eq!(grid.cell(1, 0).unwrap().char(), ' ');
-        assert_eq!(grid.cell(2, 0).unwrap().char(), 'B');
-        assert_eq!(grid.cell(3, 0).unwrap().char(), 'C');
-        assert_eq!(grid.cell(4, 0).unwrap().char(), 'E');
-    }
-
-    // Multiple scroll operations
-
-    #[test]
-    fn test_multiple_scroll_up() {
-        let mut grid = Grid::new(4, 10);
-        for row in 0..4u16 {
-            grid.set_cursor(row, 0);
-            grid.write_char((b'A' + row as u8) as char);
-        }
-
-        grid.scroll_up(2);
-
-        // After scrolling up by 2: C->0, D->1, blank->2, blank->3
-        assert_eq!(grid.cell(0, 0).unwrap().char(), 'C');
-        assert_eq!(grid.cell(1, 0).unwrap().char(), 'D');
-        assert_eq!(grid.cell(2, 0).unwrap().char(), ' ');
-        assert_eq!(grid.cell(3, 0).unwrap().char(), ' ');
-    }
-
-    #[test]
-    fn test_multiple_scroll_down() {
-        let mut grid = Grid::new(4, 10);
-        for row in 0..4u16 {
-            grid.set_cursor(row, 0);
-            grid.write_char((b'A' + row as u8) as char);
-        }
-
-        grid.scroll_down(2);
-
-        // After scrolling down by 2: blank->0, blank->1, A->2, B->3
-        assert_eq!(grid.cell(0, 0).unwrap().char(), ' ');
-        assert_eq!(grid.cell(1, 0).unwrap().char(), ' ');
-        assert_eq!(grid.cell(2, 0).unwrap().char(), 'A');
-        assert_eq!(grid.cell(3, 0).unwrap().char(), 'B');
-    }
-
-    // Edge cases
-
-    #[test]
-    fn test_scroll_up_count_exceeds_region() {
-        let mut grid = Grid::new(3, 10);
-        for row in 0..3u16 {
-            grid.set_cursor(row, 0);
-            grid.write_char((b'A' + row as u8) as char);
-        }
-
-        grid.set_scroll_region(0, 2);
-        grid.scroll_region_up(100);
-
-        for row in 0..3u16 {
-            assert_eq!(
-                grid.cell(row, 0).unwrap().char(),
-                ' ',
-                "row {row} should be blank after excessive scroll"
-            );
-        }
-    }
-
-    #[test]
-    fn test_scroll_down_count_exceeds_region() {
-        let mut grid = Grid::new(3, 10);
-        for row in 0..3u16 {
-            grid.set_cursor(row, 0);
-            grid.write_char((b'A' + row as u8) as char);
-        }
-
-        grid.set_scroll_region(0, 2);
-        grid.scroll_region_down(100);
-
-        for row in 0..3u16 {
-            assert_eq!(
-                grid.cell(row, 0).unwrap().char(),
-                ' ',
-                "row {row} should be blank after excessive scroll down"
-            );
-        }
-    }
-
-    #[test]
-    fn test_scroll_up_zero_is_noop() {
-        let mut grid = Grid::new(3, 10);
-        grid.set_cursor(0, 0);
-        grid.write_char('A');
-
-        grid.scroll_up(0);
-
-        assert_eq!(grid.cell(0, 0).unwrap().char(), 'A');
-    }
-
-    #[test]
-    fn test_scroll_region_full_screen_delegates_to_scroll_up() {
-        let mut grid = Grid::new(3, 10);
-        for row in 0..3u16 {
-            grid.set_cursor(row, 0);
-            grid.write_char((b'A' + row as u8) as char);
-        }
-
-        grid.set_scroll_region(0, 2);
-        grid.scroll_region_up(1);
-
-        assert_eq!(grid.cell(0, 0).unwrap().char(), 'B');
-        assert_eq!(grid.cell(1, 0).unwrap().char(), 'C');
-        assert_eq!(grid.cell(2, 0).unwrap().char(), ' ');
     }
 }

@@ -44,25 +44,26 @@ fn walled(kind: WallKind, message: &str) -> TurnEndReading {
         resume: None,
         upgrading: false,
         taskless: false,
+        finished_record: None,
+        finished_at_check: false,
+        check_record: None,
+        left_record: false,
+        left_work: None,
         person: None,
         reach: Default::default(),
         login_back: false,
         auto_continue: None,
         since_limit: None,
         served_in_transcript: false,
+        notice_elsewhere: false,
         reset_clock: None,
         program: aterm_phase::Program::Claude,
-        goal: None,
-        model_field: None,
-        limits: Default::default(),
-        sandbox_fell: None,
-        thread_model: None,
-        upgrade_goal: false,
         account: None,
         autopilot: crate::supervise::Autopilot::Cruise,
         login_label: None,
         login_superseded: false,
         login_notice: None,
+        wall_remembered: false,
     }
 }
 
@@ -141,26 +142,6 @@ fn a_spend_wall_with_no_reset_says_so_once_and_the_action_is_the_strings() {
     assert_eq!(exception_for(&st, &r, &cfg(), t), None);
 }
 
-/// A Codex screen whose last turn ended on the `■` row `wall`, as the policy
-/// reads it (the Codex reader: its wall kind, its program).
-fn codex_ended_on(wall: &str) -> TurnEndReading {
-    let rows: Vec<String> = [
-        "› go on",
-        "",
-        &format!("■ {wall}"),
-        "",
-        "› Ask Codex to do anything",
-        "",
-        "  gpt · /x",
-    ]
-    .iter()
-    .map(|r| r.to_string())
-    .collect();
-    let reading = aterm_phase::read(Some("codex"), &rows, None);
-    assert_eq!(reading.program, aterm_phase::Program::Codex);
-    TurnEndReading::of(&reading, &rows, false, Some(3 * MIN), None, None)
-}
-
 /// The state after a wall in `r` answered every continuation typed after
 /// its reset (`r.reset_at`, which is `t`), one try past
 /// [`FUTILE_AFTER_TRIES`].
@@ -192,16 +173,17 @@ fn tried_past_the_reset(
     st
 }
 
-/// A CODEX SESSION'S WALLS GET CODEX'S WORDS, never Claude Code's: its spend
-/// walls (its reader's spend-cap row, and the two the 0.162.1 lab measured,
-/// `docs/measured/real-claude-lab-2026-10-15.md` M2) send the person to
-/// Codex's own notice, never to claude.ai or "usage credits"; a usage limit
-/// futile past its reset to Codex's `/status`; a lost login to `codex login`,
-/// never the page `/login` opened (nothing is typed into Codex). Any other
-/// program's words name no vendor. NEGATIVE CONTROL: the same walls in a
-/// Claude Code session keep Claude Code's words.
+/// A CODEX SESSION'S WALLS GET WORDS THAT NAME NO VENDOR, never Claude Code's
+/// (the Codex harness is retired, so no Codex step is said, and aterm reads no
+/// Codex screen: the walls are built here): its spend walls (the words the
+/// 0.162.1 lab measured, `docs/measured/real-claude-lab-2026-10-15.md` M2)
+/// send the person to the program's own notice, never to claude.ai or "usage credits"; a usage limit
+/// futile past its reset to the program's account; a lost login to its own
+/// notice, never the page `/login` opened. Muse Code's get its own:
+/// `/upgrade` past a reset, and a key wall's own remedy. NEGATIVE CONTROL:
+/// the same walls in a Claude Code session keep Claude Code's words.
 #[test]
-fn a_codex_sessions_walls_get_codexs_words() {
+fn a_codex_sessions_walls_get_words_that_name_no_vendor() {
     use aterm_phase::Program;
     let t = t0();
     let claudes = ["claude.ai", "usage credits", "/login", "Claude"];
@@ -216,12 +198,14 @@ fn a_codex_sessions_walls_get_codexs_words() {
         "You hit your spend cap set by the owner of your workspace. Ask an owner to increase your \
          spend cap to continue.",
     ] {
-        let r = codex_ended_on(notice);
-        assert_eq!(r.wall, Some(WallKind::Spend), "{notice}");
+        let r = TurnEndReading {
+            program: Program::Codex,
+            ..walled(WallKind::Spend, notice)
+        };
         let st = TurnEndState::default();
         let e = exception_for(&st, &r, &cfg(), t).expect(notice);
         assert_eq!((e.kind, e.when), (ExceptionKind::Spend, Urgency::Later));
-        assert!(e.action.contains("Codex's notice"), "{e:?}");
+        assert!(e.action.contains("the program's notice"), "{e:?}");
         assert!(names_none(&e, &claudes), "{notice}: {e:?}");
         let claude = TurnEndReading {
             program: Program::Claude,
@@ -239,7 +223,11 @@ fn a_codex_sessions_walls_get_codexs_words() {
     let mut c = cfg();
     c.model_fallback = None;
     for (program, wants) in [
-        (Program::Codex, "Run /status in this tab"),
+        (Program::Codex, "the program's account"),
+        (
+            Program::Muse,
+            "Run /upgrade in this tab for increased limits",
+        ),
         (Program::Generic, "the program's account"),
         (Program::Claude, "claude.ai/settings/usage"),
     ] {
@@ -257,16 +245,19 @@ fn a_codex_sessions_walls_get_codexs_words() {
         retry_api_errors: false,
         ..cfg()
     };
-    let lost = codex_ended_on(
-        "Your access token could not be refreshed. Please log out and sign in again.",
-    );
-    assert_eq!(lost.wall, Some(WallKind::Auth));
+    let lost = TurnEndReading {
+        program: Program::Codex,
+        ..walled(
+            WallKind::Auth,
+            "Your access token could not be refreshed. Please log out and sign in again.",
+        )
+    };
     let e = exception_for(&TurnEndState::default(), &lost, &off, t).expect("login");
     assert_eq!(
         (e.kind, e.action.as_str(), e.clears, e.escalated),
         (
             ExceptionKind::Login,
-            "Sign in to Codex again with codex login.",
+            "Sign the program in again as its notice in this tab says.",
             "the agent working",
             true
         )
@@ -278,6 +269,25 @@ fn a_codex_sessions_walls_get_codexs_words() {
     };
     let control = exception_for(&TurnEndState::default(), &claude, &off, t).expect("login");
     assert!(control.action.contains("/login"), "{control:?}");
+    // Muse Code's key wall names its own remedy: `META_API_KEY` beats
+    // `muse login`. Its signed-out wall, naming none, is `muse login`.
+    for (message, wants) in [
+        (
+            "your API key from META_API_KEY was rejected — update or unset it",
+            "As Muse Code says, update or unset META_API_KEY.",
+        ),
+        (
+            "Log in with browser · Enter to choose",
+            "Sign in to Muse Code again with muse login in a shell.",
+        ),
+    ] {
+        let muse = TurnEndReading {
+            program: Program::Muse,
+            ..walled(WallKind::Auth, message)
+        };
+        let e = exception_for(&TurnEndState::default(), &muse, &off, t).expect("login");
+        assert_eq!((e.kind, e.action.as_str()), (ExceptionKind::Login, wants));
+    }
 
     // Any other program: no vendor's words at all.
     let vendors = [
@@ -540,158 +550,100 @@ fn a_wait_is_never_an_exception() {
     }
 }
 
-/// Every text fits the digest's caps and lint (the module doc's rules).
+/// A REQUEST THE API REFUSES the same way each time is told with the remedy
+/// its notice names — by the typed kind Claude Code wrote with it where the
+/// session's transcript has one, else by its words — and every other with
+/// the tab's own: fixed aterm words, nothing of the notice quoted.
+/// NEGATIVE CONTROL: a typed kind the table does not name falls to the
+/// words, and words it does not name to the last row.
 #[test]
-fn the_exception_texts_fit_the_digests_caps_and_lint() {
-    let t = t0();
-    let mut st = TurnEndState::default();
-    let mut all: Vec<Exception> = Vec::new();
-    for (needle, _, _) in ACCOUNT_LIMITS {
-        let m = if needle.is_empty() {
-            "You're out of usage credits"
-        } else {
-            needle
-        };
-        all.push(exception_for(&st, &walled(WallKind::Spend, m), &cfg(), t).expect(m));
-    }
-    let bucket = walled(
-        WallKind::ModelBucket { consent: false },
-        "You've reached your Sonnet limit · run /usage-credits",
-    );
-    seen(&mut st, &bucket, t);
-    for c in [
-        cfg(),
-        SupervisorConfig {
-            model_fallback: None,
-            ..cfg()
-        },
+fn a_refused_request_is_told_with_the_remedy_its_notice_names() {
+    for (typed, message, wants) in [
+        (
+            Some("tool_history_mismatch"),
+            "API Error: 400 due to tool use concurrency issues.",
+            "/rewind",
+        ),
+        (
+            None,
+            "API Error: 400 due to tool use concurrency issues. Run /rewind to recover the conversation.",
+            "/rewind",
+        ),
+        (
+            Some("claude_code_version_too_old"),
+            "API Error: Claude Code 2.1.200 does not support this model; version 2.1.250 or newer is required. Run 'claude update', or update the Claude desktop app, then try again.",
+            "aterm pkg update claude",
+        ),
+        (
+            Some("model_not_found"),
+            "There's an issue with the selected model (x). It may not exist or you may not have access to it. Run /model to pick a different model.",
+            "/model",
+        ),
+        (
+            Some("safety_monitor_blocked"),
+            "API Error: Claude can't help with this. Start a new session to continue.",
+            "rephrase",
+        ),
+        (
+            None,
+            "API Error: Opus 4.1's safeguards flagged this message.",
+            "rephrase",
+        ),
+        (
+            Some("account_on_hold"),
+            "Your account is on hold and can't use Claude Code. View details or appeal: https://claude.ai/restricted",
+            "claude.ai/restricted",
+        ),
+        (
+            Some("effort_requires_thinking"),
+            "API Error: Effort 'max' isn't available with thinking turned off on this model · run /effort high to continue",
+            "/effort high",
+        ),
+        // NEGATIVE CONTROLS: a typed kind no row names, words no row names.
+        (
+            Some("no_such_kind"),
+            "API Error: 400 due to tool use concurrency issues. Run /rewind to recover the conversation.",
+            "/rewind",
+        ),
+        (
+            Some("no_such_kind"),
+            "API Error: 418 I'm a teapot",
+            "last error asks",
+        ),
+        (None, "API Error: 404 Not Found", "last error asks"),
     ] {
-        all.push(exception_for(&st, &bucket, &c, t + 2 * 60 * MIN).expect("bucket"));
-    }
-    let cleared = walled(
-        WallKind::Auth,
-        "Login expired · Please run /login — Goal cleared after an unrecoverable error (organization verification required): \"x\".",
-    );
-    all.push(exception_for(&TurnEndState::default(), &cleared, &cfg(), t).expect("cleared"));
-    let auth = walled(WallKind::Auth, "Login expired · Please run /login");
-    let off = SupervisorConfig {
-        retry_api_errors: false,
-        ..cfg()
-    };
-    all.push(exception_for(&TurnEndState::default(), &auth, &off, t).expect("login"));
-    // A renewable login's end not waited at: to renew, and, renewed, over a
-    // draft and with nothing to relaunch the tab.
-    {
-        let renewable = TurnEndReading {
-            login_label: Some("m7-a".to_string()),
-            ..auth.clone()
-        };
-        let superseded = TurnEndReading {
-            login_superseded: true,
-            ..renewable.clone()
-        };
-        let drafted = TurnEndReading {
-            composer: Composer::Typed,
-            ..superseded.clone()
-        };
-        let no_relaunch = SupervisorConfig {
-            relaunch: false,
-            ..cfg()
-        };
-        let st = TurnEndState::default();
-        for (r, c) in [
-            (&renewable, &no_relaunch),
-            (&drafted, &cfg()),
-            (&superseded, &no_relaunch),
-        ] {
-            all.push(exception_for(&st, r, c, t).expect("renewable"));
-        }
-    }
-    // A lost login after a move, the host advising nothing at all.
-    {
-        use crate::supervise::policy::turn_end::{AccountAt, Restart};
-        let mut st = TurnEndState::default();
-        let to = Restart::Account {
-            to: "work-2".to_string(),
-            at: AccountAt::Wall,
-        };
-        st.restarted(&to, true, &auth, t);
-        st.host_typed(t);
-        st.observe(&auth, t + MIN);
-        all.push(exception_for(&st, &auth, &cfg(), t + MIN).expect("no account to move to"));
-    }
-    // A usage limit that answered every continuation an hour past its reset.
-    {
-        use crate::supervise::policy::turn_end::{TurnEndAction, decide_turn_end};
-        let mut r = walled(
-            WallKind::UsageWeekly,
-            "You've hit your weekly limit · resets 4pm",
-        );
-        r.reset_at = Some(t);
-        let mut st = TurnEndState::default();
-        let mut now = t + MIN;
-        let mut tries = 0;
-        while tries < FUTILE_AFTER_TRIES + 1 {
-            r.worked = Some(if tries == 0 {
-                3 * MIN
-            } else {
-                Duration::from_secs(4)
-            });
-            st.observe(&r, now);
-            match decide_turn_end(&st, &r, &cfg(), now) {
-                a @ TurnEndAction::Type { .. } => {
-                    st.acted(&a, &r, now);
-                    tries += 1;
-                    now += Duration::from_secs(5);
-                }
-                TurnEndAction::WaitUntil { until, .. } => now = until,
-                other => panic!("{other:?}"),
-            }
-        }
-        all.push(exception_for(&st, &r, &cfg(), t + 61 * MIN).expect("futile"));
-    }
-    // A full context that three `/compact`s left full.
-    let failed = [COMPACT_FAILED_1_MEASURED; 3];
-    all.push(
-        answered(CONTEXT_WALL_MEASURED, &failed)[2]
-            .clone()
-            .expect("context"),
-    );
-    // A spend wall, a lost login and a futile limit in a Codex session, and
-    // in any other program's.
-    for program in [aterm_phase::Program::Codex, aterm_phase::Program::Generic] {
-        let st = TurnEndState::default();
-        let spend = TurnEndReading {
-            program,
-            ..walled(WallKind::Spend, "Your workspace is out of credits.")
-        };
-        all.push(exception_for(&st, &spend, &cfg(), t).expect("spend"));
-        let lost = TurnEndReading {
-            program,
-            ..auth.clone()
-        };
-        all.push(exception_for(&st, &lost, &off, t).expect("login"));
-        let mut r = TurnEndReading {
-            program,
-            reset_at: Some(t),
-            ..walled(
-                WallKind::UsageWeekly,
-                "You've hit your usage limit. Try again at 4:00 PM.",
-            )
-        };
-        let st = tried_past_the_reset(&mut r, &cfg(), t);
-        all.push(exception_for(&st, &r, &cfg(), t + 61 * MIN).expect("futile"));
-    }
-    // The canary's third rung (`wall_memory`), which no point reaches.
-    all.push(Exception::stalled());
-    all.push(Exception::dialog());
-    assert!(all.len() >= 23, "{}", all.len());
-    for e in &all {
-        assert!(e.why.chars().count() <= WHY_MAX, "{e:?}");
-        assert!(e.action.chars().count() <= ACTION_MAX, "{e:?}");
+        let e = Exception::refused(typed, message);
+        assert_eq!((e.kind, e.when), (ExceptionKind::Refused, Urgency::Later));
+        assert!(e.action.contains(wants), "{typed:?} {message}: {e:?}");
         assert!(
-            !e.action.contains(" or ") && !e.action.contains("; ") && !e.action.contains('\n'),
+            !e.action.contains("teapot") && !e.action.contains("API Error"),
             "{e:?}"
         );
     }
+}
+
+/// The long context's entitlement as 2.1.300 words it is the account limit
+/// the older words were, with its own why: told once, the action the same.
+#[test]
+fn the_long_contexts_usage_credits_are_an_account_limit() {
+    let t = t0();
+    let st = TurnEndState::default();
+    let new = walled(
+        WallKind::Spend,
+        "API Error: Usage credits required for 1M context · run /model to switch to standard context",
+    );
+    let e = exception_for(&st, &new, &cfg(), t).expect("told");
+    assert_eq!(e.kind, ExceptionKind::Spend);
+    assert!(e.why.contains("Long context"), "{e:?}");
+    let old = exception_for(
+        &st,
+        &walled(
+            WallKind::Spend,
+            "Extra usage is required for long context · run /extra-usage",
+        ),
+        &cfg(),
+        t,
+    )
+    .expect("told");
+    assert_ne!(e.why, old.why);
 }

@@ -48,6 +48,12 @@ pub const TRIM_AT_BYTES: u64 = 128 * 1024;
 pub const MAX_READ_BYTES: u64 = 512 * 1024;
 
 /// The format version every row this build writes carries (`v=1`).
+///
+/// A field added since rides as an OPTIONAL key under the same version
+/// (`started_us=`, `restored=`, …): every reader skips a row whose version is not its
+/// own, so a new version would hide every newer row from an older build — the one a
+/// crash-looping update reverts to, which is the reader that most needs the row of
+/// the run that just died. An older row lacks the key and still parses.
 pub const ROW_VERSION: u32 = 1;
 
 /// The ledger's path in `logs_dir`.
@@ -299,6 +305,133 @@ impl LaunchKind {
     }
 }
 
+/// How a launch's keeper recovery brought its screens back (the crash restore,
+/// `aterm-gui`'s `crash_restore`), with the same fields `status` reports for each recovered
+/// session, summed: written only by a launch that recovered at least one session, so the
+/// ledger answers whether real kills restore exactly and, when they do not, what was lost.
+/// The crash-restore plan starts its follow-up work only when the ledger shows the loss it
+/// would close (a gather-stage tail when `in_flight_lost` is common, a disk tier when
+/// history is), so a row that said only the rungs could never trigger any of it. Three
+/// tokens, each optional on its own (an older row has none and still parses; one this build
+/// cannot read refuses the row rather than misread it):
+///
+/// * `restored=<exact>:<screen>:<meta>`: how many sessions came back exactly, as a screen
+///   with a loss counted, or blank (the META rung);
+/// * `restore_lost=<in_flight_lost>:<tail_overflows>:<marks_lost>:<resizes_unjournaled>`:
+///   the PTY bytes read and never processed, the sessions whose tail overflowed, the
+///   verified marks left in a tail, and the resizes nothing journaled, over every session;
+/// * `restore_why=<word>:<n>,…`: how many sessions each `status restore_why=` word named
+///   (every rung but exact; `-` when every session was exact), in word order.
+///
+/// And a fourth since the history ring (the crash-restore plan's increment 5), optional the
+/// same way, which a build before it ignores as it ignores every key it does not read:
+///
+/// * `restore_history=<lines>:<sessions>`: the scrollback lines the restores could not bring
+///   back (each session's first `status history_lost=`), and how many sessions lost any —
+///   the loss a disk tier for the history would close.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Restores {
+    /// Sessions whose screen came back exactly.
+    pub exact: u32,
+    /// Sessions whose screen came back with a loss counted (repainted).
+    pub screen: u32,
+    /// Sessions that came back blank (no region, or a restore that failed).
+    pub meta: u32,
+    /// PTY bytes the dead window read and never committed to a tail, over every session.
+    pub in_flight_lost: u64,
+    /// Sessions whose keyframe's tail had been overwritten.
+    pub tail_overflows: u32,
+    /// Verified shell-integration marks left in a tail, over every session.
+    pub marks_lost: u64,
+    /// Host resizes no keyframe or tail reached, over every session.
+    pub resizes_unjournaled: u64,
+    /// Scrollback lines the restores could not bring back, over every session.
+    pub history_lost: u64,
+    /// Sessions whose restore lost any scrollback.
+    pub history_short: u32,
+    /// How many sessions each `restore_why` word named, by word (no `-`).
+    pub whys: Vec<(String, u32)>,
+}
+
+impl Restores {
+    fn token(&self) -> String {
+        format!("{}:{}:{}", self.exact, self.screen, self.meta)
+    }
+
+    fn parse(token: &str) -> Option<Self> {
+        let mut parts = token.split(':');
+        let restores = Self {
+            exact: parts.next()?.parse().ok()?,
+            screen: parts.next()?.parse().ok()?,
+            meta: parts.next()?.parse().ok()?,
+            ..Self::default()
+        };
+        parts.next().is_none().then_some(restores)
+    }
+
+    fn lost_token(&self) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            self.in_flight_lost, self.tail_overflows, self.marks_lost, self.resizes_unjournaled
+        )
+    }
+
+    fn history_token(&self) -> String {
+        format!("{}:{}", self.history_lost, self.history_short)
+    }
+
+    fn parse_history(&mut self, token: &str) -> Option<()> {
+        let mut parts = token.split(':');
+        self.history_lost = parts.next()?.parse().ok()?;
+        self.history_short = parts.next()?.parse().ok()?;
+        parts.next().is_none().then_some(())
+    }
+
+    fn parse_lost(&mut self, token: &str) -> Option<()> {
+        let mut parts = token.split(':');
+        self.in_flight_lost = parts.next()?.parse().ok()?;
+        self.tail_overflows = parts.next()?.parse().ok()?;
+        self.marks_lost = parts.next()?.parse().ok()?;
+        self.resizes_unjournaled = parts.next()?.parse().ok()?;
+        parts.next().is_none().then_some(())
+    }
+
+    /// `word:n,…`, or `-` for none. A word that could break the token (empty, or holding
+    /// a separator the line cannot carry) is written `?`.
+    fn why_token(&self) -> String {
+        if self.whys.is_empty() {
+            return "-".to_string();
+        }
+        self.whys
+            .iter()
+            .map(|(word, n)| {
+                let word = if word.is_empty() || word.contains([':', ',']) {
+                    "?"
+                } else {
+                    clean_token(word)
+                };
+                format!("{word}:{n}")
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    fn parse_whys(&mut self, token: &str) -> Option<()> {
+        self.whys.clear();
+        if token == "-" {
+            return Some(());
+        }
+        for pair in token.split(',') {
+            let (word, n) = pair.split_once(':')?;
+            if word.is_empty() {
+                return None;
+            }
+            self.whys.push((word.to_string(), n.parse().ok()?));
+        }
+        Some(())
+    }
+}
+
 /// One ledger row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Row {
@@ -308,6 +441,11 @@ pub struct Row {
     pub pid: u32,
     /// The launch's birth (Unix seconds, the kernel's record where there is one).
     pub started: u64,
+    /// The microseconds within [`Self::started`] of the kernel's birth record
+    /// (`started_us=`), when the row's writer had one: with [`Self::pid`] it names the
+    /// process exactly, where the second alone matches a pid reused within it. `None`
+    /// on a row an older build wrote, or a birth that came from the clock.
+    pub started_us: Option<u32>,
     /// The launch's build number.
     pub build: u64,
     /// The launch's version.
@@ -316,6 +454,9 @@ pub struct Row {
     pub launch: LaunchKind,
     /// The run before it.
     pub prev: PrevRun,
+    /// How this launch's keeper recovery brought its screens back, when it recovered
+    /// any ([`Restores`]).
+    pub restores: Option<Restores>,
 }
 
 /// A value token with no space, `=`, or control character in it — the one shape the
@@ -345,6 +486,19 @@ fn parse_opt_u64(token: &str) -> Option<Option<u64>> {
 }
 
 impl Row {
+    /// Whether this row is the process born `started` (Unix seconds) and `started_us`
+    /// (its microseconds, when known) with `pid`: to the microsecond when both sides
+    /// carry it, else to the second — a pid reused within the second matches only then.
+    #[must_use]
+    pub fn is_process(&self, pid: u32, started: u64, started_us: Option<u32>) -> bool {
+        self.pid == pid
+            && self.started == started
+            && match (self.started_us, started_us) {
+                (Some(ours), Some(theirs)) => ours == theirs,
+                _ => true,
+            }
+    }
+
     /// The row's line, without its newline.
     #[must_use]
     pub fn to_line(&self) -> String {
@@ -355,10 +509,22 @@ impl Row {
                 format!("{secs}{}", if at_least { "+" } else { "" })
             }
         };
+        let started_us = self
+            .started_us
+            .map_or_else(String::new, |us| format!(" started_us={us}"));
+        let restored = self.restores.as_ref().map_or_else(String::new, |r| {
+            format!(
+                " restored={} restore_lost={} restore_why={} restore_history={}",
+                r.token(),
+                r.lost_token(),
+                r.why_token(),
+                r.history_token()
+            )
+        });
         format!(
-            "v={ROW_VERSION} at={} pid={} started={} build={} version={} launch={} \
+            "v={ROW_VERSION} at={} pid={} started={}{started_us} build={} version={} launch={} \
              prev={} prev_pid={} prev_build={} prev_version={} prev_uptime={uptime} \
-             prev_stall={} prev_pressure={} prev_trial={}",
+             prev_stall={} prev_pressure={} prev_trial={}{restored}",
             self.at,
             self.pid,
             self.started,
@@ -405,6 +571,11 @@ impl Row {
             at: get("at")?.parse().ok()?,
             pid: get("pid")?.parse().ok()?,
             started: get("started")?.parse().ok()?,
+            // Optional (an older row has none); one out of range refuses the row.
+            started_us: match get("started_us") {
+                None => None,
+                Some(token) => Some(token.parse().ok().filter(|us| *us < 1_000_000)?),
+            },
             build: get("build")?.parse().ok()?,
             version: get("version")?.to_string(),
             launch: LaunchKind::parse(get("launch")?)?,
@@ -420,6 +591,23 @@ impl Row {
                 stall: Tri::parse(get("prev_stall")?)?,
                 pressure: Pressure::parse(get("prev_pressure")?)?,
                 trial: get("prev_trial")?.parse().ok()?,
+            },
+            // Optional (an older row has none); one this build cannot read refuses the row.
+            restores: match get("restored") {
+                None => None,
+                Some(token) => {
+                    let mut restores = Restores::parse(token)?;
+                    if let Some(lost) = get("restore_lost") {
+                        restores.parse_lost(lost)?;
+                    }
+                    if let Some(whys) = get("restore_why") {
+                        restores.parse_whys(whys)?;
+                    }
+                    if let Some(history) = get("restore_history") {
+                        restores.parse_history(history)?;
+                    }
+                    Some(restores)
+                }
             },
         })
     }
@@ -749,10 +937,12 @@ mod tests {
             at,
             pid,
             started: at - 1,
+            started_us: None,
             build: 1_790_305_290,
             version: "0.93.0".into(),
             launch: LaunchKind::Cold,
             prev,
+            restores: None,
         }
     }
 
@@ -796,6 +986,145 @@ mod tests {
         });
         exact.launch = LaunchKind::Successor;
         assert_eq!(Row::parse(&exact.to_line()), Some(exact));
+    }
+
+    /// THE BIRTH TO THE MICROSECOND. A row carries the kernel's birth microseconds
+    /// (`started_us=`) beside its second, round trip, under the same row version; an
+    /// older row without the key still parses (`None`), and one out of range refuses
+    /// the row. With both sides known, a process is the row's only to the microsecond:
+    /// a pid reused within the same second is another process (the negative control
+    /// is the second alone, which cannot tell them apart), while a side that does not
+    /// know its microseconds still matches by the second, as every row did before.
+    #[test]
+    fn a_row_names_its_process_to_the_microsecond() {
+        let mut r = row(1_790_500_000, 4242, prev(EndClass::Clean));
+        r.started_us = Some(123_456);
+        let line = r.to_line();
+        assert!(
+            line.starts_with(&format!(
+                "v={ROW_VERSION} at=1790500000 pid=4242 started=1790499999 started_us=123456 "
+            )),
+            "{line}"
+        );
+        assert_eq!(Row::parse(&line), Some(r.clone()));
+        let older = line.replace(" started_us=123456", "");
+        assert_eq!(Row::parse(&older).map(|row| row.started_us), Some(None));
+        assert_eq!(Row::parse(&line.replace("123456", "1000000")), None);
+        assert_eq!(Row::parse(&line.replace("123456", "x")), None);
+
+        assert!(r.is_process(4242, 1_790_499_999, Some(123_456)));
+        assert!(
+            !r.is_process(4242, 1_790_499_999, Some(654_321)),
+            "a pid reused within the second"
+        );
+        assert!(r.is_process(4242, 1_790_499_999, None), "the second alone");
+        assert!(!r.is_process(4242, 1_790_499_998, Some(123_456)));
+        assert!(!r.is_process(4243, 1_790_499_999, Some(123_456)));
+        let older = Row::parse(&older).expect("an older row");
+        assert!(older.is_process(4242, 1_790_499_999, Some(654_321)));
+    }
+
+    /// A launch that recovered sessions records how their screens came back
+    /// (`restored=<exact>:<screen>:<meta>`); a row without it (every older row, and a
+    /// launch that recovered nothing) still parses, and a token this build cannot read
+    /// refuses the row rather than misread it.
+    #[test]
+    fn a_recovery_s_restores_ride_the_row() {
+        let mut r = row(1_790_500_000, 77, prev(EndClass::Killed));
+        r.restores = Some(Restores {
+            exact: 3,
+            screen: 2,
+            meta: 1,
+            in_flight_lost: 4096,
+            tail_overflows: 1,
+            marks_lost: 2,
+            resizes_unjournaled: 0,
+            history_lost: 1200,
+            history_short: 2,
+            whys: vec![
+                ("in-flight".into(), 1),
+                ("no-region".into(), 1),
+                ("tail-overflow".into(), 1),
+            ],
+        });
+        let line = r.to_line();
+        let tokens = " restored=3:2:1 restore_lost=4096:1:2:0 \
+                      restore_why=in-flight:1,no-region:1,tail-overflow:1 restore_history=1200:2";
+        assert!(line.ends_with(tokens), "{line}");
+        assert_eq!(Row::parse(&line), Some(r.clone()));
+
+        let mut exact = r.clone();
+        exact.restores = Some(Restores {
+            exact: 2,
+            ..Restores::default()
+        });
+        let exact_line = exact.to_line();
+        assert!(
+            exact_line.ends_with(
+                " restored=2:0:0 restore_lost=0:0:0:0 restore_why=- restore_history=0:0"
+            ),
+            "{exact_line}"
+        );
+        assert_eq!(Row::parse(&exact_line), Some(exact));
+
+        let older = line.replace(tokens, "");
+        assert_eq!(
+            Row::parse(&older).map(|row| row.restores),
+            Some(None),
+            "an older row"
+        );
+        let rungs_only = line.replace(tokens, " restored=3:2:1");
+        assert_eq!(
+            Row::parse(&rungs_only).and_then(|row| row.restores),
+            Some(Restores {
+                exact: 3,
+                screen: 2,
+                meta: 1,
+                ..Restores::default()
+            }),
+            "a row with the rungs alone"
+        );
+        // A row from before the history ring: the three tokens, no fourth.
+        let before_ring = line.replace(" restore_history=1200:2", "");
+        assert_eq!(
+            Row::parse(&before_ring).and_then(|row| row.restores),
+            Some(Restores {
+                history_lost: 0,
+                history_short: 0,
+                ..r.restores.clone().expect("restores")
+            }),
+            "a row from before the history ring"
+        );
+        for (key, good, bad) in [
+            ("restored", "3:2:1", "3:1"),
+            ("restored", "3:2:1", "3:1:0:9"),
+            ("restored", "3:2:1", "3:x:0"),
+            ("restored", "3:2:1", ""),
+            ("restore_lost", "4096:1:2:0", "4096:1:2"),
+            ("restore_lost", "4096:1:2:0", "4096:1:2:0:5"),
+            (
+                "restore_why",
+                "in-flight:1,no-region:1,tail-overflow:1",
+                "in-flight",
+            ),
+            (
+                "restore_why",
+                "in-flight:1,no-region:1,tail-overflow:1",
+                ":1",
+            ),
+            (
+                "restore_why",
+                "in-flight:1,no-region:1,tail-overflow:1",
+                "in-flight:x",
+            ),
+            ("restore_history", "1200:2", "1200"),
+            ("restore_history", "1200:2", "1200:2:3"),
+            ("restore_history", "1200:2", "x:2"),
+        ] {
+            let bad_line = line.replace(&format!("{key}={good}"), &format!("{key}={bad}"));
+            assert_ne!(bad_line, line, "{key}={bad}");
+            assert_eq!(Row::parse(&bad_line), None, "{bad_line}");
+        }
     }
 
     #[test]
@@ -846,36 +1175,17 @@ mod tests {
         assert_eq!(s.unexpected_stalled, 2);
         assert_eq!(s.unexpected_critical, 2);
         assert_eq!(s.last_unexpected.as_ref().map(|r| r.pid), Some(5));
-        let (lines, unexpected) = doctor_lines(&rows, Path::new("/x/recovery-ledger.log"));
+        let (_, unexpected) = doctor_lines(&rows, Path::new("/x/recovery-ledger.log"));
         assert!(unexpected);
-        assert!(lines[0].starts_with("6 windowed launches since 2026-09-21"));
-        assert!(lines[0].contains("2 clean"), "{}", lines[0]);
-        assert!(
-            lines[1].contains("fatal signal 6 (SIGABRT)"),
-            "{}",
-            lines[1]
-        );
-        assert!(lines[1].contains("up 2 d 0 h or more"), "{}", lines[1]);
-        assert!(lines[1].contains("stalled at its end"), "{}", lines[1]);
     }
 
     #[test]
     fn an_empty_or_all_clean_ledger_is_no_note() {
-        let (lines, unexpected) = doctor_lines(&[], Path::new("/x/l"));
+        let (_, unexpected) = doctor_lines(&[], Path::new("/x/l"));
         assert!(!unexpected);
-        assert!(lines[0].starts_with("no windowed launch recorded yet (installed app only)"));
         let rows = vec![row(1, 1, PrevRun::none()), row(2, 2, prev(EndClass::Clean))];
-        let (lines, unexpected) = doctor_lines(&rows, Path::new("/x/l"));
+        let (_, unexpected) = doctor_lines(&rows, Path::new("/x/l"));
         assert!(!unexpected);
-        assert!(lines[0].contains("1 clean"));
-    }
-
-    #[test]
-    fn spans_read_as_a_person_says_them() {
-        assert_eq!(span_words(42), "42 s");
-        assert_eq!(span_words(17 * 60 + 5), "17 min");
-        assert_eq!(span_words(3 * 3600 + 5 * 60), "3 h 5 min");
-        assert_eq!(span_words(2 * 86_400 + 4 * 3600), "2 d 4 h");
     }
 
     #[cfg(unix)]

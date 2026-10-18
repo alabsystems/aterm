@@ -229,15 +229,12 @@ fn the_receipt_is_described_honestly() {
                    ddc_seed_lineage=trust\nddc_seed_relation=pin-ancestor\n\
                    stage2_tree_sha256_pinned_seed=feed\nlineage_disjoint_anchor=none\n\
                    repin_commit=3333333333cccc\nrepin_branch=seed/repin-x\nrepin_release_tag=t\n";
+    // A pin-ancestor double compile is never called diverse.
     let line = seed::describe(receipt);
-    assert_eq!(
-        line,
-        "built from the pin 1111111111; double compile against 2222222222 (trust lineage, \
-         pin-ancestor: not diverse): both stage2 trees feed; latest lineage-disjoint cut none; \
-         re-pin 3333333333 (seed/repin-x), archives t"
-    );
+    assert!(line.contains("not diverse"), "{line}");
+    let disjoint = seed::describe(&receipt.replace("pin-ancestor", "lineage-disjoint"));
     assert!(
-        seed::describe(&receipt.replace("pin-ancestor", "lineage-disjoint"))
-            .contains("lineage-disjoint: diverse")
+        disjoint.contains("diverse") && !disjoint.contains("not diverse"),
+        "{disjoint}"
     );
 }

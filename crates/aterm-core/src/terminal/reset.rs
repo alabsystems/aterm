@@ -8,7 +8,6 @@
 use crate::grid::Grid;
 
 use super::TaskbarProgress;
-#[cfg(feature = "sixel")]
 use super::grouped_state::SixelState;
 use super::grouped_state::{
     CursorSaveState, DcsState, Iterm2State, MarksState, NotificationState, ShellIntegrationState,
@@ -25,7 +24,6 @@ pub(super) struct ResetGroups<'a> {
     pub(super) xterm_keyboard: &'a mut XtermKeyboardState,
     pub(super) iterm2: &'a mut Iterm2State,
     pub(super) shell: &'a mut ShellIntegrationState,
-    #[cfg(feature = "sixel")]
     pub(super) sixel: &'a mut SixelState,
     pub(super) title: &'a mut TitleState,
     pub(super) dcs: &'a mut DcsState,
@@ -42,7 +40,6 @@ impl ResetGroups<'_> {
         self.iterm2.reset();
         self.shell.reset();
         self.title.reset();
-        #[cfg(feature = "sixel")]
         self.sixel.reset();
         self.dcs.reset();
         self.notifications.reset();
@@ -60,8 +57,8 @@ impl ResetGroups<'_> {
 /// sets these, so none may clear them: a program's reset must not lift a fail-closed
 /// authorization (`allow_*`, the shell-integration nonce requirement), re-enable an input
 /// capability the host declared absent (kitty) or claim one it never declared
-/// (win32-input), or flip host display state (CJK ambiguous width, the OS appearance). The
-/// one list for both reset paths.
+/// (win32-input), or flip host display state (CJK ambiguous width, the announced colour
+/// scheme, reconciled after the reset). The one list for both reset paths.
 fn reset_modes(prev: &TerminalModes) -> TerminalModes {
     TerminalModes {
         allow_osc52_query: prev.allow_osc52_query,
@@ -145,7 +142,6 @@ impl Terminal {
             xterm_keyboard: &mut self.xterm_keyboard,
             iterm2: &mut self.iterm2,
             shell: &mut self.shell,
-            #[cfg(feature = "sixel")]
             sixel: &mut self.sixel,
             title: &mut self.title,
             dcs: &mut self.dcs,
@@ -170,6 +166,8 @@ impl Terminal {
         self.modes.cursor_style = self.default_cursor_style;
         // Mode 12 mirrors the style's blink bit (see `set_cursor_blink`).
         self.modes.cursor_blink = self.modes.cursor_style.blinks();
+        // So is the host's alternate scroll (1007).
+        self.modes.alternate_scroll = self.host_alternate_scroll;
         // The BiDi cache may hold resolutions of pre-reset content.
         self.invalidate_bidi_all();
         // Selection anchors point at content that no longer exists.
@@ -194,5 +192,8 @@ impl Terminal {
         // `transient.reset()` bumped the reset generation, and this path never reaches
         // `process_at`: wipe the alt-screen archive here.
         self.alt_archive_after_host_reset();
+        // Colours are back on the baseline and 2031 is cleared: re-latch the
+        // announced scheme (no push can fire).
+        let _ = self.reconcile_color_scheme();
     }
 }

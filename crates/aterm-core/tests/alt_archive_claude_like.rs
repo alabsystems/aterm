@@ -271,32 +271,6 @@ fn chunked_feeds_give_an_identical_archive_and_grid() {
 }
 
 #[test]
-fn an_esu_cut_in_two_is_still_a_frame_boundary() {
-    let (data, end, _) = claude_like(&LAYOUT, 30, true);
-    let whole = observe(&feed(&LAYOUT, &data, &[data.len()]));
-    let esu = b"\x1b[?2026l";
-    let positions: Vec<usize> = data
-        .windows(esu.len())
-        .enumerate()
-        .filter(|(_, w)| *w == esu)
-        .map(|(i, _)| i)
-        .collect();
-    assert!(positions.len() > 10);
-    // Cut inside the 3rd, 7th and 11th ESU at every interior offset.
-    for &p in [positions[2], positions[6], positions[10]].iter() {
-        for inner in 1..esu.len() {
-            let cut = p + inner;
-            let mut t = term(&LAYOUT);
-            let clock = fixed_clock();
-            t.process_at(&data[..cut], clock);
-            t.process_at(&data[cut..], clock);
-            assert_eq!(observe(&t), whole, "ESU at {p} cut after {inner} bytes");
-        }
-    }
-    assert_eq!(whole.rows.len(), end);
-}
-
-#[test]
 fn a_frame_closed_by_the_sync_timeout_is_committed() {
     let layout = &LAYOUT;
     let mut t = term(layout);

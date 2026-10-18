@@ -11,7 +11,6 @@
 
 use aterm_core::render::GlowQuad;
 use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle};
-use aterm_effects::trail_pack::TrailParams;
 use aterm_effects::trail_sound::SoundKind;
 use std::time::{Duration, Instant};
 
@@ -52,7 +51,6 @@ fn cfg(style: GlowStyle) -> GlowConfig {
         ring: true,
         beam: false,
         head_dx: 0.5,
-        pack: None,
     }
 }
 
@@ -189,48 +187,6 @@ fn the_silent_visual_click_reads_this_tick_s_thermal_constants() {
         "the control is vacuous unless Fire and Lumen really differ \
          ({fire_heat} vs {lumen_heat})"
     );
-
-    // Second arm: a Trail Pack overriding heat.gain/heat.tau takes the same
-    // path.
-    let mut packed = cfg(GlowStyle::Lumen);
-    let mut params = TrailParams::defaults();
-    params.heat.gain = Some(0.9);
-    params.heat.tau = Some(4.0);
-    packed.pack = Some(params);
-
-    let packed_shed = probe(&lumen, &dark(&packed, true));
-    assert!(
-        packed_shed > lumen_heat + 1e-6,
-        "a pack's own heat gain must reach the shed click too \
-         ({packed_shed} vs {lumen_heat})"
-    );
-}
-
-/// The lit path's cue stream is unchanged: `heat_gain`/`heat_tau` are pure
-/// functions of the config.
-#[test]
-fn the_lit_path_is_byte_identical_after_the_hoist() {
-    let t0 = Instant::now();
-    let a = cfg(GlowStyle::RainbowKitty);
-    let b = cfg(GlowStyle::Fire);
-
-    let mut r = Rig::new();
-    let mut heats = Vec::new();
-    let mut now = t0;
-    for step in 0..12 {
-        let c = if step < 6 { &a } else { &b };
-        r.tick(now, c);
-        if r.glow.cue_keystroke_kind(now, SoundKind::Typed) {
-            heats.push(r.glow.take_key_cue().expect("a cue").heat);
-        }
-        now += Duration::from_millis(16);
-    }
-    assert_eq!(heats.len(), 12, "every lit tick must take its key");
-    // The cold→hot ramp is monotonic inside each style run, which is the
-    // property a stale or zeroed gain would break.
-    for w in heats[..6].windows(2) {
-        assert!(w[1] >= w[0], "the lit ramp must not cool: {heats:?}");
-    }
 }
 
 /// The key-credit ledger survives a shed frame. `cue_move_sound` spends a

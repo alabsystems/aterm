@@ -3,6 +3,10 @@
 
 # aterm-libm: spec recovery from its 3 unit tests
 
+> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 2 tests it
+> deleted are gone (one was §4's negative control for the differential's tolerance). Counts
+> elsewhere in this file were taken before.
+
 > Status 2026-10-16: this file is the crate's migration worklist (merged from 1 spec-recovery
 > chunk covering all 3 tests). Each spec below is proved
 > through Trust/Clean about the compiled Rust function, and then the tests it subsumes are deleted.
@@ -82,7 +86,6 @@ nothing but float carriers and IEEE subtraction.
 test	specs	residue
 crates/aterm-libm/tests/recorded.rs::every_function_matches_the_recorded_fork	libm-exact-ieee, libm-fdim, libm-forward-refines-std, libm-atanh-odd-and-boundaries	the transcendental differential against musl with a 2-ulp tolerance, and the 68-names control (§4)
 crates/aterm-libm/tests/recorded.rs::inverse_hyperbolic_tangent_keeps_zero_sign_and_domain_boundaries	libm-atanh-odd-and-boundaries	none
-crates/aterm-libm/tests/recorded.rs::a_swapped_function_is_caught	none	all of it (§4)
 ```
 
 ## 3. Coverage
@@ -98,7 +101,6 @@ crates/aterm-libm/tests/recorded.rs::a_swapped_function_is_caught	none	all of it
 | test | why | recommendation |
 |---|---|---|
 | recorded::every_function_matches_the_recorded_fork (transcendental half) | After the four specs take their rows, what is left is a differential of the host platform libm against musl's recorded answers, with a 2-ulp tolerance measured on aarch64-apple-darwin only. That measures the fidelity of a third-party/FFI dependency. It is not a property of the compiled Rust. The 68-names control is not a spec either: a missing forward fails to compile, as `lib.rs` states. | **move to bench**: keep it as a cross-platform conformance bench until naga retires the crate. |
-| recorded::a_swapped_function_is_caught | A negative control for the test harness's own ULPS tolerance (the `agrees`/`mismatches` helpers). It exercises no production behaviour beyond the differential; rint vs round is already distinguished by `libm-exact-ieee`. | **move to bench**, next to the differential it polices. |
 
 ## 5. Implied specs that look wrong, or disagree with the code
 

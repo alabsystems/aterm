@@ -3,6 +3,10 @@
 
 # aterm-bits: spec recovery from its 7 unit tests
 
+> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 1 test it
+> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
+> were taken before.
+
 > Status 2026-10-16: this is the crate's migration worklist. Each spec below is proved
 > through Trust/Clean about the compiled Rust function, and then the tests it subsumes are
 > deleted. No test has been deleted yet. The crate's floor today is 5 of 20 obligations
@@ -60,7 +64,7 @@ cast-slice-refines-try	refinement	cast_slice, try_cast_slice, panic_cast_failed!
 pod-cast-error-display-table	table-property	<PodCastError as Display>::fmt	∀ e: PodCastError: e.to_string() = Disp(e) (the 3-row table in §0), and fmt calls f.write_str exactly once with that literal. This is the Display half of cast-slice-refines-try; the panic_cast_failed! literals then equal "cast_slice failed: " ++ Disp(e) by construction.	(secondary only: exact_panic_message_matches_display)	EASY: enum match to &str literals; MEDIUM for the Formatter/write_str machinery and ToString	0, 1, 3, 4
 cast-slice-bytes-round-trip	round-trip	cast_slice, try_cast_slice	∀ A: Pod with sA > 0, src: &[A]: cast_slice::<A,u8>(src) does not panic and returns bytes with bytes.len() = sA·src.len() and Bytes(bytes) = Bytes(src); and try_cast_slice::<u8,A>(bytes) = Ok(back) with back = src elementwise (same address, same length, same bit patterns; compare floats by bits, so NaN payloads round-trip). For a primitive A, A::from_ne_bytes of each sA-byte chunk of bytes is the matching element. Derived from try-cast-slice-classify instantiated twice (u8 has size and align 1; addr(src) is aligned for A; byte_len is a multiple of sA).	cast_slice_u32_to_u8_native_endian, cast_slice_roundtrip_f32_u8	FREE given try-cast-slice-classify and cast-slice-refines-try; otherwise composition of two generic calls, slice equality quantified over elements, float bit equality, from_raw_parts aliasing	0, 1, 4, 5, 8, 11
 bytes-of-view	contract	bytes_of	∀ T: Pod, v: &T: bytes_of(v).len() = size_of::<T>(), bytes_of(v).as_ptr() = v as *const T as *const u8 (it aliases v; the is_null branch is unreachable), and Bytes(bytes_of(v)) is v's object representation. For every primitive integer/float T: T::from_ne_bytes(bytes_of(&x)) = x (bitwise for floats). Never panics.	bytes_of_single_value	EASY-MEDIUM: generic T over an unsafe trait, ptr::from_ref + cast + is_null, unsafe slice::from_raw_parts, slice result; from_ne_bytes/try_into for the corollary	0, 1, 3, 8, 11
-zeroed-is-all-zero-bits	contract	Zeroable::zeroed	∀ T: Zeroable: every byte of the object representation of T::zeroed() is 0. Hence T::zeroed() = 0 for each integer primitive, +0.0 (bits 0) for f32/f64, [T::zeroed(); N] for [T; N], and each field's zeroed() for a #[repr(C)] struct of Zeroable fields. For T: Pod: bytes_of(&T::zeroed()) = [0u8; size_of::<T>()].	zeroable_primitives	EASY once core::mem::zeroed has an intrinsic model: an unsafe trait default method, generics over every impl (primitives via macro, arrays with const generic N, unit), float bit patterns	0, 1, 8, 11
+zeroed-is-all-zero-bits	contract	Zeroable::zeroed	∀ T: Zeroable: every byte of the object representation of T::zeroed() is 0. Hence T::zeroed() = 0 for each integer primitive, +0.0 (bits 0) for f32/f64, [T::zeroed(); N] for [T; N], and each field's zeroed() for a #[repr(C)] struct of Zeroable fields. For T: Pod: bytes_of(&T::zeroed()) = [0u8; size_of::<T>()].	-	EASY once core::mem::zeroed has an intrinsic model: an unsafe trait default method, generics over every impl (primitives via macro, arrays with const generic N, unit), float bit patterns	0, 1, 8, 11
 ```
 
 ### Distribution by kind (6)
@@ -102,7 +106,6 @@ the cast chain. `zeroed-is-all-zero-bits`'s `bytes_of` corollary uses `bytes-of-
 
 ```tsv
 file	test	primary	also
-src/lib.rs	zeroable_primitives	zeroed-is-all-zero-bits	
 src/lib.rs	cast_slice_u32_to_u8_native_endian	cast-slice-bytes-round-trip	try-cast-slice-classify, cast-slice-refines-try
 src/lib.rs	cast_slice_roundtrip_f32_u8	cast-slice-bytes-round-trip	try-cast-slice-classify, cast-slice-refines-try
 src/lib.rs	try_cast_slice_slop_returns_err	try-cast-slice-classify	cast-slice-bytes-round-trip
@@ -128,7 +131,6 @@ Actions that come with the migration:
 
 | item | action |
 |---|---|
-| The test-only `Vec4` type and its `unsafe impl Zeroable/Pod` in `mod tests` | **delete with `zeroable_primitives`**. The spec quantifies over every `Zeroable`, including `#[repr(C)]` structs. |
 | The `panic_message` helper (`catch_unwind` + downcast) | **delete with `exact_panic_message_matches_display`**. |
 | The doc comment on `panic_cast_failed!` names `exact_panic_message_matches_display` as its guard | **rewrite in the same commit** to cite `cast-slice-refines-try` and `pod-cast-error-display-table`. |
 

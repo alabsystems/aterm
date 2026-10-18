@@ -6,12 +6,13 @@
 //!
 //! ttf-parser 0.25.1 keeps a glyph's tuples in a 32-slot stack array unless
 //! its `gvar-alloc` feature is on; without it, a glyph with more has no
-//! outline at any instance, the default included. aterm's Linux build ships
-//! the feature (winit's `wayland-csd-adwaita` -> sctk-adwaita -> ab_glyph
-//! turns it on) and its macOS, Windows and wasm builds do not. aterm-font
-//! draws such glyphs on every platform. The synthetic face below runs on every
-//! host; `reader_oracle.rs` holds SF Pro (`SFNS.ttf`) and `ADTNumeric.ttc` to
-//! what ttf-parser with `gvar-alloc` recorded, on a Mac.
+//! outline at any instance, the default included. aterm's Linux build shipped
+//! the feature while it had ttf-parser (winit's `wayland-csd-adwaita` ->
+//! sctk-adwaita -> ab_glyph turned it on, until linux-windowing LW.5) and its
+//! macOS, Windows and wasm builds did not. aterm-font draws such glyphs on
+//! every platform. The synthetic face below runs on every host;
+//! `reader_oracle.rs` holds SF Pro (`SFNS.ttf`) and `ADTNumeric.ttc` to what
+//! ttf-parser with `gvar-alloc` recorded, on a Mac.
 
 use aterm_font::{Face, GlyphId, Rect, Tag};
 

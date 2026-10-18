@@ -6,7 +6,7 @@
 // phase and a DECTCEM-hidden cursor, the GPU frame must paint the exact pixel pattern and
 // match the CPU frame within a small per-channel tolerance.
 //
-// No GPU or no system font: the tests no-op.
+// No GPU or no font: COULD NOT RUN.
 
 use aterm_core::terminal::{CursorStyle, Terminal};
 use aterm_render::{Frame, RenderInput, Renderer, Theme};

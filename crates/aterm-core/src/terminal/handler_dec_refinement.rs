@@ -9,8 +9,8 @@
 #[forbid(clippy::disallowed_methods)]
 impl TerminalHandler<'_> {
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "SetApplicationCursorKeys",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
@@ -21,8 +21,8 @@ impl TerminalHandler<'_> {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "ResetApplicationCursorKeys",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
@@ -33,8 +33,8 @@ impl TerminalHandler<'_> {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "SetOriginMode",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
@@ -52,8 +52,8 @@ impl TerminalHandler<'_> {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "ResetOriginMode",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
@@ -65,8 +65,8 @@ impl TerminalHandler<'_> {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "SetAutoWrap",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
@@ -80,8 +80,8 @@ impl TerminalHandler<'_> {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "ResetAutoWrap",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
@@ -94,8 +94,8 @@ impl TerminalHandler<'_> {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "SetCursorVisible",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
@@ -112,8 +112,8 @@ impl TerminalHandler<'_> {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "ResetCursorVisible",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
@@ -128,8 +128,8 @@ impl TerminalHandler<'_> {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "SetFocusReporting",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
@@ -140,8 +140,8 @@ impl TerminalHandler<'_> {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "ResetFocusReporting",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
@@ -154,8 +154,8 @@ impl TerminalHandler<'_> {
     // Another encoding replaces SGR 1006, so in the model's terms this ends the
     // SGR encoding (a no-op on the fact when SGR was not in force).
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "ResetSgrMouseEncoding",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
@@ -166,8 +166,8 @@ impl TerminalHandler<'_> {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             reason = "clears only its own UTF-8 encoding; the SGR 1006 fact the model tracks is unchanged"
         )
     )]
@@ -179,8 +179,8 @@ impl TerminalHandler<'_> {
 
     // Ends the model's SGR encoding (see `enable_utf8_mouse_encoding`).
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "ResetSgrMouseEncoding",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
@@ -191,8 +191,8 @@ impl TerminalHandler<'_> {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             reason = "clears only its own URXVT encoding; the SGR 1006 fact the model tracks is unchanged"
         )
     )]
@@ -204,8 +204,8 @@ impl TerminalHandler<'_> {
 
     // Ends the model's SGR encoding (see `enable_utf8_mouse_encoding`).
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "ResetSgrMouseEncoding",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
@@ -216,8 +216,8 @@ impl TerminalHandler<'_> {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             reason = "clears only its own SGR pixel encoding; the SGR 1006 fact the model tracks is unchanged"
         )
     )]
@@ -228,8 +228,8 @@ impl TerminalHandler<'_> {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "SetSynchronizedOutput",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
@@ -255,14 +255,14 @@ impl TerminalHandler<'_> {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "ResetSynchronizedOutput",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
-    fn disable_synchronized_output(&mut self) {
+    pub(super) fn disable_synchronized_output(&mut self) {
         self.modes.synchronized_output = false;
         self.transient.sync_start = None;
         self.transient.sync_open_dirty = false;
@@ -276,8 +276,8 @@ impl TerminalHandler<'_> {
     // --- ANSI modes with TLA+ actions ---
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "SetInsertMode",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
@@ -288,8 +288,8 @@ impl TerminalHandler<'_> {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "ResetInsertMode",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
@@ -300,8 +300,8 @@ impl TerminalHandler<'_> {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "SetNewLineMode",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
@@ -312,8 +312,8 @@ impl TerminalHandler<'_> {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "ResetNewLineMode",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
@@ -326,8 +326,8 @@ impl TerminalHandler<'_> {
     // --- DEC modes not modeled in TLA+ ---
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             reason = "the TerminalModes model does not model VT52 compatibility (DECANM mode 2)"
         )
     )]
@@ -341,8 +341,8 @@ impl TerminalHandler<'_> {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             reason = "the TerminalModes model does not model 132-column mode (DECCOLM mode 3)"
         )
     )]
@@ -369,8 +369,8 @@ impl TerminalHandler<'_> {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             reason = "the TerminalModes model does not model reverse video (DECSCNM mode 5)"
         )
     )]
@@ -387,16 +387,16 @@ impl TerminalHandler<'_> {
     // beside DECSCUSR: the resulting shape is the host's (`RestoreCursorStyle`) or not
     // (`SetCursorStyle`).
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "SetCursorStyle",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "RestoreCursorStyle",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
@@ -418,8 +418,8 @@ impl TerminalHandler<'_> {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             reason = "the TerminalModes model does not model reverse wraparound (DECSET 45)"
         )
     )]
@@ -428,8 +428,8 @@ impl TerminalHandler<'_> {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             reason = "the TerminalModes model does not model left/right margin mode (DECLRMM mode 69)"
         )
     )]
@@ -441,8 +441,8 @@ impl TerminalHandler<'_> {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             reason = "the TerminalModes model does not model DECSDM (Sixel Display Mode, mode 80)"
         )
     )]
@@ -451,8 +451,8 @@ impl TerminalHandler<'_> {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             reason = "the TerminalModes model does not model alternate scroll (DECSET 1007)"
         )
     )]
@@ -461,8 +461,8 @@ impl TerminalHandler<'_> {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             reason = "the TerminalModes model does not model application keypad (DECKPAM/DECKPNM)"
         )
     )]
@@ -474,8 +474,8 @@ impl TerminalHandler<'_> {
     // https://terminal-wg.pages.freedesktop.org/bidi/recommendation/escape-sequences.html
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             reason = "the TerminalModes model does not model BiDi arrow swap (DECSET 1243)"
         )
     )]
@@ -484,8 +484,8 @@ impl TerminalHandler<'_> {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             reason = "the TerminalModes model does not model BiDi box mirroring (DECSET 2500)"
         )
     )]
@@ -498,8 +498,8 @@ impl TerminalHandler<'_> {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             reason = "the TerminalModes model does not model BiDi autodetection (DECSET 2501)"
         )
     )]
@@ -513,8 +513,8 @@ impl TerminalHandler<'_> {
     // --- ANSI mode 8: BDSM (Bidirectional Support Mode) ---
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             reason = "the TerminalModes model does not model BDSM (ANSI mode 8, Bidirectional Support Mode)"
         )
     )]

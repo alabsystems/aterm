@@ -16,9 +16,8 @@
 //!     emitted + at_base == total
 //! ```
 //!
-//! with `at_base > 0` for the fixture to prove anything. Under a live wallpaper the base
-//! is backdrop texels, nothing may be elided, and the identity is `emitted == total` with
-//! `at_base == 0`.
+//! with `at_base > 0` for the fixture to prove anything. Under a live wallpaper nothing may
+//! be elided: a pixel property, pinned by `tests/bg_base_elision.rs`.
 //!
 //! `render_row_bg` elides at three sites, each reached by its own fixture:
 //!
@@ -33,10 +32,9 @@
 //! stops entering its site fail instead of passing vacuously.
 
 use aterm_core::grid::LineSize;
-use aterm_core::render::{LineSizeSpan, SceneAtlas};
-use aterm_core::selection::{SelectionSide, SelectionType};
+use aterm_core::render::LineSizeSpan;
 use aterm_core::terminal::Terminal;
-use aterm_render::{DefaultBgSpan, Renderer, Theme, WindowCpu, rgb_to_u32, row_is_uniform};
+use aterm_render::{DefaultBgSpan, Renderer, Theme, WindowCpu, row_is_uniform};
 
 const ROWS: usize = 6;
 const COLS: usize = 20;
@@ -90,68 +88,6 @@ fn a_plain_frame_never_fills_a_band_with_the_colour_it_already_carries() {
          runs — a band is filled ONCE. `emitted == total` means every repainted \
          band is being filled twice with byte-identical colour again, which no \
          pixel assertion can see."
-    );
-}
-
-#[test]
-fn under_a_live_wallpaper_no_background_run_is_elided() {
-    // The `!wallpaper` conjunct from the cost side: the base is backdrop texels, so
-    // `band_base` is `None` and every resolved run is paid for.
-    let theme_bg = Theme::default().bg;
-    let theme = Theme {
-        selection: theme_bg,
-        ..Theme::default()
-    };
-    let mut r = Renderer::from_system(18.0, theme)
-        .expect("no font: build with aterm-render's default embedded-font feature");
-    let mut term = themed_term();
-    term.process(b"selected text here");
-    {
-        let sel = term.text_selection_mut();
-        sel.start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
-        sel.update_selection(0, 7, SelectionSide::Right);
-        sel.complete_selection();
-    }
-    let (w, h) = r.frame_size(ROWS, COLS);
-    let backdrop = [0x40u8, 0x20, 0x60];
-    assert_ne!(
-        rgb_to_u32(backdrop),
-        theme_bg,
-        "fixture: the backdrop must differ from the theme bg"
-    );
-    let mut rgba = vec![0u8; w * h * 4];
-    for px in rgba.as_chunks_mut::<4>().0 {
-        px[0] = backdrop[0];
-        px[1] = backdrop[1];
-        px[2] = backdrop[2];
-        px[3] = 0xff;
-    }
-    let mut input = term.cell_frame(ROWS, COLS);
-    input.wallpaper = Some(std::sync::Arc::new(SceneAtlas {
-        width: w as u32,
-        height: h as u32,
-        rgba,
-        version: 1,
-    }));
-    assert!(
-        input.selection_contains_cell(0, 1, false, false),
-        "fixture: the selection must actually reach the band being counted"
-    );
-
-    let mut wc = WindowCpu::new();
-    let _ = r.render_input_cached(&mut wc, &input);
-    let (total, at_base) = r.last_bg_runs();
-    assert!(total > 0, "the wallpaper frame resolved no background run");
-    assert_eq!(
-        at_base, 0,
-        "under a wallpaper there is no scalar band base, so no run can be AT it"
-    );
-    assert_eq!(
-        r.last_bg_fills(),
-        total,
-        "a wallpapered frame elided a background run — the selection band whose \
-         colour coincides with the theme background would show the picture \
-         through it"
     );
 }
 

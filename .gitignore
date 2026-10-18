@@ -92,6 +92,12 @@ trustc-ice-*.txt
 # in-repo copy ever being staged; the export's secret scan backstops
 # published content the same way.
 update-v2.key
+machine.key
+master.key
+release.key
+signing.key
+root.key
+*.pkcs8
 release.conf
 *.ed25519
 *.ed25519.priv

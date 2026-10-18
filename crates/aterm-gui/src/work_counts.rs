@@ -233,9 +233,16 @@ thread_local! {
     /// (`claude_footer::PaneTextCache::rule_run`), as against a reading kept
     /// with the pane's rows.
     static FOOTER_RULE_MASKS: Cell<usize> = const { Cell::new(0) };
-    /// Chrome band tones derived from a theme (`chrome_band::band_colors_with`),
+    /// Chrome band tones derived from a theme (`chrome_band::band_colors`),
     /// as against the last derivation's kept for the same theme.
     static BAND_DERIVES: Cell<usize> = const { Cell::new(0) };
+    /// Chip blocks fitted and laid (`App::claude_lights_block`), as against
+    /// a pane's block kept from a frame whose fit key was the same.
+    static FOOTER_BLOCK_FITS: Cell<usize> = const { Cell::new(0) };
+    /// Pane rows whose text a footer rebuild compared with the last
+    /// rebuild's (`claude_footer::PaneTextCache::rows_as`), as against rows
+    /// the engine's revisions vouch unchanged.
+    static FOOTER_ROWS_COMPARED: Cell<usize> = const { Cell::new(0) };
 }
 
 pub(crate) fn harness_clock_read() {
@@ -369,6 +376,20 @@ pub(crate) fn footer_rule_masked() {
 }
 pub(crate) fn take_footer_rule_masks() -> usize {
     take(&FOOTER_RULE_MASKS)
+}
+
+pub(crate) fn footer_block_fitted() {
+    bump(&FOOTER_BLOCK_FITS);
+}
+pub(crate) fn take_footer_block_fits() -> usize {
+    take(&FOOTER_BLOCK_FITS)
+}
+
+pub(crate) fn footer_row_compared() {
+    bump(&FOOTER_ROWS_COMPARED);
+}
+pub(crate) fn take_footer_rows_compared() -> usize {
+    take(&FOOTER_ROWS_COMPARED)
 }
 
 // ---------------------------------------------------------------------------

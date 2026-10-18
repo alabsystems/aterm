@@ -1,22 +1,17 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! WHAT AN INSTANCE KEEPS OF ITS DESK across launches: the quit's layout
+//! What an instance keeps of its desk across launches: the quit's layout
 //! (`session.toml`), the crash journal and its claim at the next launch, the
 //! deferred restore pass, and the supervisor host's relaunch of the agents a
 //! restore hands it. A window keeps all of it; a headless instance keeps none.
 //!
-//! THE LAB'S SEAM (2026-10-09). The cold restore — aterm quit or crashed while
-//! an agent ran — is checkable against the REAL Claude Code only in
-//! the real-Claude lab, which runs a private headless instance. Under the
-//! [`HEADLESS_RESTORE_SEAM`] development seam ([`aterm_types::dev_seam!`]: a
-//! debug build, or an optimized one with `--features dev-seams`) a headless
-//! instance keeps its desk as a window does, with two differences a window
-//! cannot have: it has no glass, so nothing waits for a first present, and
-//! every quit keeps its agents as a system quit does (a logout's Apple Event,
-//! [`crate::system_quit`], never reaches a headless instance). A shipped
-//! binary reads no seam, so there every gate is the one before the seam
-//! existed: [`Desk::Window`] for a window, [`Desk::Headless`] for `--headless`.
+//! Under the [`HEADLESS_RESTORE_SEAM`] development seam ([`aterm_types::dev_seam!`]),
+//! which the real-Claude lab (`crates/aterm-lab`) uses to check a cold restore
+//! against a real Claude Code, a headless instance keeps its desk as a window does,
+//! except that nothing waits for a first present and every quit keeps its agents (a
+//! logout's Apple Event, [`crate::system_quit`], never reaches a headless instance).
+//! A shipped binary reads no seam.
 
 use std::sync::OnceLock;
 
@@ -40,12 +35,11 @@ pub(crate) enum Desk {
 }
 
 impl Desk {
-    /// This process's desk: `headless` is `--headless`, and the seam is read
-    /// once per process. The seam counts only under a PRIVATE state root
-    /// (`ATERM_STATE_HOME`, [`aterm_types::dirs::runs_under_private_state_root`]):
-    /// without one, the layout and journals it keeps would be the person's own
-    /// (`session.toml` and the journal dir under their data dir), which a
-    /// headless instance would consume and overwrite with its agents.
+    /// This process's desk: `headless` is `--headless`; the seam is read once per
+    /// process and counts only under a private state root
+    /// ([`aterm_types::dirs::runs_under_private_state_root`]), since otherwise a
+    /// headless instance would consume and overwrite the person's own `session.toml`
+    /// and crash journals.
     pub(crate) fn of(headless: bool) -> Self {
         static SEAM: OnceLock<bool> = OnceLock::new();
         Self::new(
@@ -91,10 +85,8 @@ impl Desk {
 mod tests {
     use super::Desk;
 
-    /// WITHOUT THE SEAM EVERY GATE IS TODAY'S: a shipped binary's `dev_seam!`
-    /// is `None`, so its desk is `new(headless, false)`, and each gate reduces
-    /// to the expression it replaced (`!headless`, `first_present_done`,
-    /// `system_quit::asked()`), for every input.
+    /// Without the seam each gate reduces to `!headless`, `first_present_done` and
+    /// `system_quit::asked()`, for every input.
     #[test]
     fn without_the_seam_every_gate_is_todays() {
         for headless in [false, true] {

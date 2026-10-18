@@ -22,7 +22,7 @@ use aterm_core::render::GlowQuad;
 use aterm_core::terminal::{ContentScrollState, Terminal};
 use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig};
 use aterm_effects::rainbow_kitty::TypedClass;
-use aterm_spec::derive::{rainbow_typed_continuity_model, same_caret_typed_echo_model};
+use aterm_models_effects::{rainbow_typed_continuity_model, same_caret_typed_echo_model};
 use std::time::{Duration, Instant};
 
 /// The take's grid and cell: `resize 32 100` in a headless instance, 7×14 px.
@@ -172,79 +172,13 @@ impl Host {
         let (c, cur) = caret_sample(&self.term);
         note_blink(&self.term, &mut self.glow, &mut self.blink, self.now);
         self.glow.note_context(self.term.is_alternate_screen());
-        self.glow.observe_print_anchor(self.term.print_anchor());
+        self.glow
+            .observe_print_anchor(aterm_effects::host::motion_print_anchor(&self.term).0);
         observe_caret_row(&self.term, &mut self.glow, &mut self.row_buf, c, self.now);
         observe_ribbon_rows(&self.term, &mut self.glow, &mut self.row_buf);
         self.glow
             .tick(cur, self.now, &self.cfg, self.g, &mut self.out);
         self.record(c.row, c.col);
-        self.dump_cells();
-    }
-
-    /// `CODEX_REPLAY_CELLS=<ms-from>:<ms-to>` prints every ribbon cell on the
-    /// composer row for the frames in that window: column, layer, cohort,
-    /// whether it is leaving, and its cohort's clock.
-    fn dump_cells(&self) {
-        let Some(row) = self.composer_row else { return };
-        let Some(win) = std::env::var("CODEX_REPLAY_CELLS").ok() else {
-            return;
-        };
-        let Some((a, b)) = win.split_once(':') else {
-            return;
-        };
-        let (a, b): (u64, u64) = (a.parse().unwrap_or(0), b.parse().unwrap_or(0));
-        let ms = self.ms();
-        if ms < a || ms > b {
-            return;
-        }
-        let rib = self.glow.v2_ribbon().expect("rainbow kitty owns the frame");
-        let cov = coverage(&self.glow, self.g, row);
-        let mut cells: Vec<_> = rib.cells().iter().filter(|c| c.row == row).collect();
-        cells.sort_by_key(|c| c.col);
-        let mut s = format!("t={ms:6} cells:");
-        for c in cells {
-            let coh = rib.cohorts().iter().find(|k| k.id == c.cohort);
-            let alive = coh
-                .map(|k| k.alive_at.saturating_duration_since(self.t0).as_millis() as i64)
-                .unwrap_or(-1);
-            let ab = coh.map(|k| k.abandoned).unwrap_or(false);
-            s.push_str(&format!(
-                " {}:{:?}/c{}{}{}@{}={}b{}{}",
-                c.col,
-                c.layer,
-                c.cohort,
-                if c.leaving() { "L" } else { "" },
-                if ab { "A" } else { "" },
-                alive,
-                cov[usize::from(c.col).min(self.g.cols - 1)],
-                c.born.saturating_duration_since(self.t0).as_millis(),
-                if c.typing { "T" } else { "" }
-            ));
-        }
-        if let Some(last) = self.glow.admission_log().last() {
-            s.push_str(&format!("\n   ring: {}", last.line(self.now)));
-        }
-        // Every cell in the pool born in the last 60 ms, whatever its row.
-        let fresh: Vec<String> = rib
-            .cells()
-            .iter()
-            .filter(|c| self.now.saturating_duration_since(c.born).as_millis() < 60)
-            .map(|c| {
-                format!(
-                    "({},{}) b{} {:?}",
-                    c.row,
-                    c.col,
-                    c.born.saturating_duration_since(self.t0).as_millis(),
-                    c.layer
-                )
-            })
-            .collect();
-        s.push_str(&format!(
-            "\n   fresh: {fresh:?} pool={} cohorts={}",
-            rib.cells().len(),
-            rib.cohorts().len()
-        ));
-        eprintln!("{s}");
     }
 
     fn run_to(&mut self, ms: u64) {
@@ -376,7 +310,6 @@ fn replay() -> Host {
 }
 
 fn replay_with(fixture: &str, end_ms: u64, mut h: Host) -> Host {
-    let dump = std::env::var_os("CODEX_REPLAY_DUMP");
     for (ms, ev) in events(fixture) {
         if ms > end_ms {
             break;
@@ -394,16 +327,6 @@ fn replay_with(fixture: &str, end_ms: u64, mut h: Host) -> Host {
         }
     }
     h.run_to(end_ms);
-    if let Some(path) = dump {
-        let mut s = String::new();
-        for c in &h.census {
-            s.push_str(&format!(
-                "t={:6} r={:2} caret={:3} lit={:2} holes={:?} {}\n",
-                c.ms, c.row, c.caret, c.lit, c.holes, c.map
-            ));
-        }
-        std::fs::write(path, s).expect("dump");
-    }
     h
 }
 
@@ -777,37 +700,31 @@ fn nine_to_128_key_wrapped_batches_reown_the_first_glyph_on_their_first_frame() 
     }
 }
 
+/// The prefix repair needs every exact key: a keyless first glyph, a changed
+/// middle glyph (in a 9-key batch and in wide 33- and 128-key batches) and an
+/// interleaved unrelated key all leave the first cell unowned.
 #[test]
 fn long_wrapped_batch_refuses_keyless_mismatch_and_interleaved_prints() {
-    let phrase = "abcdefghi";
-    let mut changed = phrase.to_owned();
-    changed.replace_range(4..5, "X");
-    for (label, painted, omit_first, interleave) in [
-        ("keyless first glyph", phrase, true, false),
-        ("different middle glyph", changed.as_str(), false, false),
-        ("interleaved unrelated key", phrase, false, true),
+    let phrase = "abcdefghijklmnopqrstuvwxyzABCDEF".repeat(4);
+    let changed = |len: usize| {
+        let mut c = phrase[..len].to_owned();
+        c.replace_range(len / 2..len / 2 + 1, "X");
+        c
+    };
+    let (p9, p33, p128) = (&phrase[..9], &phrase[..33], &phrase[..128]);
+    for (label, typed, painted, omit_first, interleave) in [
+        ("keyless first glyph", p9, p9.to_owned(), true, false),
+        ("different middle glyph", p9, changed(9), false, false),
+        ("interleaved unrelated key", p9, p9.to_owned(), false, true),
+        ("33 keys, changed middle", p33, changed(33), false, false),
+        ("128 keys, changed middle", p128, changed(128), false, false),
     ] {
         let (fixture, first, frame_ms) =
-            long_wrapped_batch(phrase, painted, omit_first, interleave);
+            long_wrapped_batch(typed, &painted, omit_first, interleave);
         let after = replay_long_wrapped_batch(&fixture, first, frame_ms, frame_ms);
         assert!(
             !long_batch_first_cell_reowned(&after, frame_ms),
             "{label}: the exceptional prefix repair accepted unrelated output"
-        );
-    }
-}
-
-#[test]
-fn wide_wrapped_batch_still_requires_every_exact_key() {
-    let phrase = "abcdefghijklmnopqrstuvwxyzABCDEF".repeat(4);
-    for len in [33, 128] {
-        let mut changed = phrase[..len].to_owned();
-        changed.replace_range(len / 2..len / 2 + 1, "X");
-        let (fixture, first, frame_ms) = long_wrapped_batch(&phrase[..len], &changed, false, false);
-        let after = replay_long_wrapped_batch(&fixture, first, frame_ms, frame_ms);
-        assert!(
-            !long_batch_first_cell_reowned(&after, frame_ms),
-            "{len} keys: a changed middle glyph claimed the missing first cell"
         );
     }
 }

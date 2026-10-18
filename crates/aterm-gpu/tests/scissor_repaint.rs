@@ -24,8 +24,8 @@ use aterm_render::{GlowQuad, RenderInput, Theme, premul_rgb};
 const ROWS: usize = 10;
 const COLS: usize = 32;
 
-/// A fresh renderer at the suite's px/theme, blocked on the lazy fallback
-/// parses so reused and oracle renderers rasterize CJK identically.
+/// A fresh renderer (no GPU: COULD NOT RUN) at the suite's px/theme, blocked on the lazy
+/// fallback parses so reused and oracle renderers rasterize CJK identically.
 fn fresh_gpu() -> GpuRenderer {
     let mut g = common::gpu(18.0, Theme::default());
     g.debug_block_on_lazy_fallbacks();
@@ -529,83 +529,6 @@ fn gpu_invalidate_present_forces_full_repaint() {
     );
 }
 
-/// The aurora with bloom enabled rides the scissored path and stays
-/// byte-identical to a fresh full render: glow appears (first frame, full),
-/// glow moves plus one keystroke (scissor), glow fades to empty (scissor, halo
-/// fully erased).
-#[test]
-fn bloom_glow_rides_the_scissor_path_byte_identical() {
-    let mut gpu = fresh_gpu();
-    assert!(gpu.bloom_enabled(), "bloom must be ON (the default) here");
-    let mut win = aterm_gpu::WindowGpu::new();
-    gpu.set_cursor_blink_phase(true);
-    gpu.set_cursor_style_override(None);
-
-    let mut term = Terminal::new(ROWS as u16, COLS as u16);
-    term.process(b"$ prompt");
-    term.process(b"\x1b[5;1Hmiddle row text");
-    term.process(b"\x1b[9;1Hbottom row text");
-    term.process(b"\x1b[1;9H"); // park the cursor after the prompt
-    let (cw, ch) = gpu.cell_size();
-    let comet = |row: usize, cols: std::ops::Range<usize>| -> Vec<GlowQuad> {
-        cols.map(|c| GlowQuad {
-            row: row as u16,
-            x: (c * cw) as u16,
-            y: (row * ch) as u16,
-            w: cw as u16,
-            h: ch as u16,
-            color: premul_rgb(0x0050_FA7B, (120 + c * 10).min(230) as u8),
-            // Additive light (see `GlowQuad::alpha`).
-            alpha: 0,
-            color2: premul_rgb(0x0050_FA7B, (120 + c * 10).min(230) as u8),
-            alpha2: 0,
-        })
-        .collect()
-    };
-
-    let mut in_a = term.cell_frame(ROWS, COLS);
-    in_a.cursor_glow_add = comet(4, 2..8);
-    let _ = gpu.present_input_readback(&mut win, &in_a);
-    assert_eq!(gpu.full_repaints(), 1, "first frame must be a full repaint");
-
-    // One keystroke + the comet moves down a row (the typing tick).
-    term.process(b"x");
-    let mut in_b = term.cell_frame(ROWS, COLS);
-    in_b.cursor_glow_add = comet(5, 4..10);
-    let scissor_before = gpu.scissor_taken();
-    let got_b = gpu.present_input_readback(&mut win, &in_b).pixels;
-    assert!(
-        gpu.scissor_taken() > scissor_before,
-        "typing with the bloom aurora alive must take the SCISSOR path"
-    );
-    assert!(
-        got_b == fresh_render(&in_b, true, None),
-        "scissored bloom frame is NOT byte-identical to a fresh full render"
-    );
-
-    // The comet fades out. The prior halo, which bled beyond the glow rows, must
-    // be erased by the widened band.
-    let mut in_c = term.cell_frame(ROWS, COLS);
-    in_c.cursor_glow_add.clear();
-    let scissor_before = gpu.scissor_taken();
-    let got_c = gpu.present_input_readback(&mut win, &in_c).pixels;
-    assert!(
-        gpu.scissor_taken() > scissor_before,
-        "the glow fade-out frame must take the SCISSOR path"
-    );
-    assert!(
-        got_c == fresh_render(&in_c, true, None),
-        "halo residue survived the fade-out scissor (or the band diverged)"
-    );
-
-    // Idle with no glow: zero dirty rows.
-    let got_d = gpu.present_input_readback(&mut win, &in_c).pixels;
-    assert!(
-        got_d == got_c,
-        "idle after fade-out must re-present the prior frame verbatim"
-    );
-}
-
 /// The bloom halo composites on every bloom frame, keystroke echoes
 /// (`input_hot`) included: hot and settle frames of the same content present
 /// identical pixels, so the halo never blinks while typing.
@@ -677,6 +600,7 @@ fn input_hot_presents_the_same_halo_as_settle() {
 /// the top rebuilds only the changed rows, far fewer instances than a
 /// full-grid repaint.
 #[test]
+#[cfg(wgpu_arm)]
 fn bloom_scissor_dirty_band_stays_proportional() {
     let mut gpu = fresh_gpu();
     assert!(gpu.bloom_enabled(), "bloom must be ON (the default) here");

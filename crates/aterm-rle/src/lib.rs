@@ -160,7 +160,7 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
     // clippy would rewrite the two lines below to `vec![...]`, but that is the
     // one spelling we must avoid: `vec!` expands alloc's unsafe boxed-array
     // construction (`Box::new_uninit`/`assume_init`) into THIS function's span,
-    // which the strict Trust gate then has to prove here. The `with_capacity` +
+    // which the Trust lane (`ship trust run`) then has to prove here. The `with_capacity` +
     // `push` form (same resulting Vec: len 1, cap 1) keeps that code inside
     // `alloc`, scoped out as a Conditional dependency. The allow is for the
     // clippy STYLE lint only — it suppresses no Trust verification obligation.

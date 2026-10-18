@@ -5,15 +5,11 @@
 //! Callback types for terminal events: the `aterm-types` aliases re-exported, the
 //! color-change callbacks, and the protocol stack and buffer limits.
 
-pub use aterm_types::ColorChangeOp;
-use aterm_types::Rgb;
-
 pub(super) use aterm_types::{
     AdvancedNotificationCallback, ClipboardCallback, NotificationCallback, WindowCallback,
 };
 
-/// Target of a dynamic color change (OSC 10-19, palette). See
-/// [`ColorChangeCallback`] for the callback signature.
+/// Target of a dynamic color change (OSC 10-19, palette).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ColorTarget {
@@ -30,14 +26,6 @@ pub enum ColorTarget {
     /// Selection foreground color (OSC 19 / OSC 21).
     SelectionForeground,
 }
-
-/// Callback type for explicit, reset, and dynamic color changes (OSC 4, 10-21,
-/// 104, 110-112, 117, and 119).
-pub(super) type ColorChangeCallback = Box<dyn FnMut(ColorTarget, Rgb, ColorChangeOp) + Send>;
-
-/// Callback type for dynamic color queries (OSC 10/11/12 with `?`): `Some`
-/// overrides the palette color in the reply, `None` keeps it.
-pub(super) type ColorQueryCallback = Box<dyn FnMut(ColorTarget) -> Option<Rgb> + Send>;
 
 /// Most bytes all active DCS operations may hold (`dcs.total_bytes`); past it
 /// new DCS data is dropped until existing operations complete. Enforced in

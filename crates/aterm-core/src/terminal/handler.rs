@@ -123,7 +123,6 @@ define_terminal_handler! {
     shell: super::ShellIntegrationState => shell,
     marks_state: super::MarksState => marks_state,
     color: super::ColorState => color,
-    #[cfg(feature = "sixel")]
     sixel: super::SixelState => sixel,
     kitty_keyboard: KittyKeyboardState => kitty_keyboard,
     xterm_keyboard: super::XtermKeyboardState => xterm_keyboard,
@@ -158,6 +157,7 @@ define_terminal_handler! {
     last_bell_time: Option<aterm_time::Instant> => last_bell_time,
     bell_total: u64 => bell_total,
     default_cursor_style: aterm_types::CursorStyle => default_cursor_style,
+    host_alternate_scroll: bool => host_alternate_scroll,
     notifications: super::NotificationState => notifications,
     clipboard: super::ClipboardState => clipboard,
     iterm2: super::Iterm2State => iterm2,
@@ -331,31 +331,7 @@ impl TerminalHandler<'_> {
         if !self.can_append_response_bytes(response.len()) {
             return;
         }
-        // Policy allow gate: a host that installs `response any = Drop`
-        // suppresses every DA/DSR/DECRQSS/XTGETTCAP reply; no engine or a
-        // fall-through decision allows. The probe (`ProbeKind::response_sink()`)
-        // and origin are constants, so the verdict is compiled once per policy
-        // (`policy_gates.rs`) and read here before the rate-limit debit.
-        if !self.policy.gates().response_sink().resolve(true) {
-            return;
-        }
-        // Rate-limit gate: with a policy installed, its `"response"` bucket
-        // decides, addressed by the slot `PolicyState` resolved at install time;
-        // `None` means no engine and defers to the legacy
-        // `ResponseRateLimiter` below. A policy without a `"response"` bucket
-        // resolves to `RateLimitSlot::UNDECLARED`, which allows.
-        let bytes = response.len() as u64;
-        let clock = aterm_policy::limits::SystemClock;
-        let permitted =
-            if let Some(permitted) = self.policy.response_rate_limit_try_consume(bytes, &clock) {
-                permitted
-            } else {
-                let legacy_clock = super::response_rate_limiter::SystemTime;
-                self.transient
-                    .response_rate_limiter
-                    .try_consume(response.len(), &legacy_clock)
-            };
-        if !permitted {
+        if !program_response_admitted(self.policy, self.transient, response.len()) {
             return;
         }
         // Fallible allocation: the total is already capped, but reserve before
@@ -481,6 +457,282 @@ pub(super) fn apply_absolute_row_update(
     }
 }
 
+/// Drop the anchors a scrollback erase (ED 3, Cmd-K) took with their lines:
+/// those wholly below `oldest`, the oldest absolute row the erased grid still
+/// holds, and start the command still being entered or run at `oldest` if
+/// the erase took its first rows.
+///
+/// The erase renumbers nothing. `Grid::erase_scrollback` keeps the visible
+/// rows and leaves `absolute_row_counter` alone, so a row on the screen keeps
+/// its absolute number, and an anchor on it still names the same line. A
+/// finished block whose rows straddle the erase keeps its numbers too: the
+/// erased part reads `BlockText::Evicted`, as rows the ring evicted do, and
+/// nothing reads another line in its place.
+///
+/// The blocks and command marks being built (`current_block`,
+/// `current_mark`) always stay. They reach the cursor, which is on the
+/// screen, and the A→B→C→D phase the erase leaves alone still needs them: a
+/// running command's D (`clear`, or a program that redraws on resume) lands
+/// on its block with its exit status. While its command has not finished,
+/// every row of it the erase took becomes `oldest`: what is left from there
+/// is still its own, and its writer goes on writing below it, so it reads
+/// that rather than `Evicted` for the rest of its run. This is what lets a
+/// program that scrolls and then clears with macOS `clear` (a full clear and
+/// an erase, in either order; [`note_full_clear`] keeps a running block's rows
+/// in the history) read what it drew after the clear. If the erase took any
+/// of its command line, that reads `Evicted` unless OSC 633;E named it
+/// (`OutputBlock::command_text_cleared`). A block whose command finished (its
+/// D came, the next prompt not yet) keeps its numbers, as an archived one
+/// does. Archived blocks and completed marks go oldest first and stop at the
+/// first one with a row left, so the ids still held stay one run (what a
+/// block read counts drops by).
+pub(super) fn forget_erased_history(
+    oldest: u64,
+    shell: &mut super::ShellIntegrationState,
+    marks_state: &mut super::MarksState,
+) {
+    // One past the last row each anchor names; gone when that is at or below
+    // `oldest`.
+    while shell
+        .output_blocks
+        .front()
+        .is_some_and(|b| block_rows_end(b) <= oldest)
+    {
+        shell.output_blocks.pop_front();
+    }
+    shell.output_blocks.make_contiguous();
+    while shell
+        .command_marks
+        .front()
+        .is_some_and(|m| mark_rows_end(m) <= oldest)
+    {
+        shell.command_marks.pop_front();
+    }
+    shell.command_marks.make_contiguous();
+    marks_state.marks.retain(|m| m.row >= oldest);
+    marks_state.marks.make_contiguous();
+    marks_state.annotations.retain(|a| a.row >= oldest);
+    marks_state.annotations.make_contiguous();
+    if let Some(block) = &mut shell.current_block
+        && block.state != super::BlockState::Complete
+    {
+        if block
+            .command_rows()
+            .is_some_and(|(start, end)| end > start && start < oldest)
+        {
+            block.command_text_cleared = true;
+        }
+        for row in block_rows_mut(block) {
+            *row = (*row).max(oldest);
+        }
+    }
+    if let Some(mark) = &mut shell.current_mark {
+        for row in mark_rows_mut(mark) {
+            *row = (*row).max(oldest);
+        }
+    }
+}
+
+/// Every row `b` names (prompt, command, output, end), for a transform that
+/// keeps their order.
+pub(super) fn block_rows_mut(b: &mut super::OutputBlock) -> impl Iterator<Item = &mut u64> {
+    std::iter::once(&mut b.prompt_start_row).chain(
+        [
+            &mut b.command_start_row,
+            &mut b.output_start_row,
+            &mut b.end_row,
+        ]
+        .into_iter()
+        .flatten(),
+    )
+}
+
+/// Every row `m` names (prompt, command, output, the D's), for a transform
+/// that keeps their order.
+fn mark_rows_mut(m: &mut super::CommandMark) -> impl Iterator<Item = &mut u64> {
+    std::iter::once(&mut m.prompt_start_row).chain(
+        [
+            &mut m.command_start_row,
+            &mut m.output_start_row,
+            &mut m.output_end_row,
+        ]
+        .into_iter()
+        .flatten(),
+    )
+}
+
+/// One past the last row `b` names: the greater of its `end_row` (already
+/// exclusive) and one past its latest start row. A scrollback erase and a
+/// carry keep a block while this is past the oldest row they hold, not by its
+/// prompt row, which a full clear can move above the previous block's.
+pub(super) fn block_rows_end(b: &super::OutputBlock) -> u64 {
+    [
+        Some(b.prompt_start_row),
+        b.command_start_row,
+        b.output_start_row,
+    ]
+    .into_iter()
+    .flatten()
+    .map(|row| row.saturating_add(1))
+    .chain(b.end_row)
+    .max()
+    .unwrap_or(0)
+}
+
+/// One past the last row `m` names (its `output_end_row` is the D's own row):
+/// what an erase and a carry keep a command mark by, as [`block_rows_end`] is
+/// for a block.
+pub(super) fn mark_rows_end(m: &super::CommandMark) -> u64 {
+    [
+        Some(m.prompt_start_row),
+        m.command_start_row,
+        m.output_start_row,
+        m.output_end_row,
+    ]
+    .into_iter()
+    .flatten()
+    .map(|row| row.saturating_add(1))
+    .max()
+    .unwrap_or(0)
+}
+
+/// What a full clear of the main screen (ED 2, or ED 0 from home: `clear`,
+/// Ctrl-L) does to the blocks and command marks. It blanks the screen, from
+/// `top` (its top absolute row) down, renumbers nothing and leaves the history
+/// above `top` as it was. `from_home`: the cursor was at the screen's home
+/// when it came.
+///
+/// What is written on the blanked rows next is no older block's. So each
+/// archived block that reads text from one (a non-empty command or output
+/// range reaching `top`) loses its text (`OutputBlock::text_cleared`): it
+/// reads `BlockText::Evicted`, never another command's lines, and keeps its
+/// rows, state, exit code and id (a block read counts the ids it no longer
+/// finds). A block with no text there keeps reading what it had: zsh's ED 0
+/// at the start of a prompt drawn on the top row (after `clear`) is a full
+/// clear, and the `clear` command's own block above it is empty, not gone.
+///
+/// The block being built (and its command mark) reached the cursor, so the
+/// clear blanked its latest rows, while its writer goes on writing on the
+/// cleared screen. Its id, state and exit code stay (the shell's D still
+/// lands on it), and no row of it is left below where its writer goes on
+/// writing, so none is below its end (the next prompt's row) and no range of
+/// it runs backwards:
+/// - A running command's block moves each row the clear blanked to `top` and
+///   keeps the ones in the history: its output reads what is still in the
+///   history, then what the command wrote after the clear, and its prompt row
+///   stays where the prompt is. If the clear blanked any of its command line,
+///   that reads `Evicted` unless OSC 633;E named it
+///   (`OutputBlock::command_text_cleared`).
+/// - A command that had finished (its D came, the next prompt not yet) has
+///   nothing more to write. Its rows move the same way, and it loses its text
+///   as an archived block does if its command, or its output up to the D's row
+///   (on the command mark that D completed), reached a blanked row.
+/// - A prompt being edited is redrawn by its line editor from the clear's home
+///   when the line editor sent the clear (Ctrl-L homes first): prompt and
+///   buffer. It starts again at `top`, with its command row (where the
+///   shell's B came) as far below the prompt's first row as it was, and
+///   nothing is marked. A clear away from home is none the line editor sent
+///   (a background job's): nothing redraws, typing goes on where it was, and
+///   the prompt keeps its rows.
+///
+/// Where the shell writes after that is its own: the redraw can leave out
+/// lines that were above its B, or come with an A of its own (fish). So the
+/// shell's next mark holds the order: its C keeps the prompt and command rows
+/// at most its own, and its A every row of a prompt it archives (no C came) at
+/// most that A's (`TerminalHandler::shell_execution_start`,
+/// `TerminalHandler::shell_prompt_start`).
+pub(super) fn note_full_clear(top: u64, from_home: bool, shell: &mut super::ShellIntegrationState) {
+    // Whether a block reads text from a blanked row: a non-empty range of it
+    // reaching `top`.
+    let reaches = |ranges: [Option<(u64, u64)>; 2]| {
+        ranges
+            .into_iter()
+            .flatten()
+            .any(|(start, end)| end > start && end > top)
+    };
+    for block in &mut shell.output_blocks {
+        if reaches([block.command_rows(), block.output_rows()]) {
+            block.text_cleared = true;
+        }
+    }
+    let marks = &shell.command_marks;
+    if let Some(block) = &mut shell.current_block {
+        match block.state {
+            super::BlockState::Executing => {
+                if reaches([block.command_rows(), None]) {
+                    block.command_text_cleared = true;
+                }
+                for row in block_rows_mut(block) {
+                    *row = (*row).min(top);
+                }
+            }
+            super::BlockState::Complete => {
+                // Its output ends at the D's row, kept on the command mark the
+                // D completed (the prompt's, the same rows); without it, the
+                // end is unknown and taken to reach the screen. Every A/B/C/D
+                // and every clear moves this block and its mark together, so
+                // that mark is the latest; checking it is defensive, for an
+                // installed checkpoint that carried the block without it.
+                let d_row = marks
+                    .back()
+                    .filter(|m| {
+                        m.prompt_start_row == block.prompt_start_row
+                            && m.output_start_row == block.output_start_row
+                    })
+                    .and_then(|m| m.output_end_row);
+                let output = block
+                    .output_start_row
+                    .map(|start| (start, d_row.unwrap_or(u64::MAX)));
+                if reaches([block.command_rows(), output]) {
+                    block.text_cleared = true;
+                }
+                for row in block_rows_mut(block) {
+                    *row = (*row).min(top);
+                }
+            }
+            // A prompt (`PromptOnly`, `EnteringCommand`).
+            _ if from_home => restart_prompt(
+                &mut block.prompt_start_row,
+                &mut block.command_start_row,
+                top,
+            ),
+            // A clear away from home is none the line editor sent (a
+            // background job's): nothing redraws the prompt, and typing goes
+            // on where it was.
+            _ => {}
+        }
+    }
+    // A command mark is current from its prompt until its D, so it is a prompt
+    // being edited until its C, and a running command's after.
+    if let Some(mark) = &mut shell.current_mark {
+        if mark.output_start_row.is_some() {
+            for row in mark_rows_mut(mark) {
+                *row = (*row).min(top);
+            }
+        } else if from_home {
+            restart_prompt(&mut mark.prompt_start_row, &mut mark.command_start_row, top);
+        }
+    }
+}
+
+/// Start a prompt being edited again at `top`, where its line editor redraws
+/// it after a full clear, with its command row as far below its first row as
+/// it was (the prompt's lines above the shell's B). A prompt taller than the
+/// screen scrolls as it is redrawn, so that row can be past the screen's
+/// last. Where the redraw leaves out lines that were above the B (a hook's
+/// between the shell's A and its prompt), that row is too far down, and the
+/// shell's C brings it back (`TerminalHandler::shell_execution_start`).
+fn restart_prompt(prompt: &mut u64, command: &mut Option<u64>, top: u64) {
+    if let Some(row) = command {
+        *row = top.saturating_add(row.saturating_sub(*prompt));
+    }
+    *prompt = top;
+}
+
+#[cfg(test)]
+#[path = "scrollback_erase_anchor_tests.rs"]
+mod scrollback_erase_anchor_tests;
+
 /// Parse the exact coordinate-bearing OSC 133 payloads aterm itself queues.
 /// Other OSC codes and OSC 133 D (which carries only an exit status) are not
 /// absolute-row anchors and deliberately return `None`.
@@ -497,6 +749,41 @@ fn shell_event_row(payload: &str, code: u32) -> Option<(char, u64, u16)> {
     };
     let (row, col) = rest.split_once(";col=")?;
     Some((command, row.parse().ok()?, col.parse().ok()?))
+}
+
+/// The gates every program-originated reply passes, debiting the rate
+/// limit when both open: the policy's `response any` verdict and the
+/// response rate limit (the policy's bucket, else the legacy limiter).
+/// Shared by [`TerminalHandler::send_response`] and the DEC 2031 push a program's own
+/// output provokes (`reconcile_color_scheme_after_output`).
+pub(super) fn program_response_admitted(
+    policy: &mut super::policy_gates::PolicyState,
+    transient: &mut TransientState,
+    len: usize,
+) -> bool {
+    // Policy allow gate: a host that installs `response any = Drop`
+    // suppresses every DA/DSR/DECRQSS/XTGETTCAP reply; no engine or a
+    // fall-through decision allows. The probe (`ProbeKind::response_sink()`)
+    // and origin are constants, so the verdict is compiled once per policy
+    // (`policy_gates.rs`) and read here before the rate-limit debit.
+    if !policy.gates().response_sink().resolve(true) {
+        return false;
+    }
+    // Rate-limit gate: with a policy installed, its `"response"` bucket
+    // decides, addressed by the slot `PolicyState` resolved at install time;
+    // `None` means no engine and defers to the legacy
+    // `ResponseRateLimiter` below. A policy without a `"response"` bucket
+    // resolves to `RateLimitSlot::UNDECLARED`, which allows.
+    let bytes = len as u64;
+    let clock = aterm_policy::limits::SystemClock;
+    if let Some(permitted) = policy.response_rate_limit_try_consume(bytes, &clock) {
+        permitted
+    } else {
+        let legacy_clock = super::response_rate_limiter::SystemTime;
+        transient
+            .response_rate_limiter
+            .try_consume(len, &legacy_clock)
+    }
 }
 
 #[cfg(test)]

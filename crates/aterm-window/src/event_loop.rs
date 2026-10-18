@@ -22,8 +22,6 @@
 // longer implements it; the Windows and Linux carves delete it with their halves.
 
 use std::marker::PhantomData;
-#[cfg(any(x11_platform, wayland_platform))]
-use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{error, fmt};
 
@@ -257,33 +255,11 @@ impl<T> rwh_06::HasDisplayHandle for EventLoop<T> {
     }
 }
 
-#[cfg(any(x11_platform, wayland_platform))]
-impl<T> AsFd for EventLoop<T> {
-    /// Get the underlying [EventLoop]'s `fd` which you can register
-    /// into other event loop, like [`calloop`] or [`mio`]. When doing so, the
-    /// loop must be polled with the [`pump_app_events`] API.
-    ///
-    /// [`calloop`]: https://crates.io/crates/calloop
-    /// [`mio`]: https://crates.io/crates/mio
-    /// [`pump_app_events`]: crate::platform::pump_events::EventLoopExtPumpEvents::pump_app_events
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        self.event_loop.as_fd()
-    }
-}
-
-#[cfg(any(x11_platform, wayland_platform))]
-impl<T> AsRawFd for EventLoop<T> {
-    /// Get the underlying [EventLoop]'s raw `fd` which you can register
-    /// into other event loop, like [`calloop`] or [`mio`]. When doing so, the
-    /// loop must be polled with the [`pump_app_events`] API.
-    ///
-    /// [`calloop`]: https://crates.io/crates/calloop
-    /// [`mio`]: https://crates.io/crates/mio
-    /// [`pump_app_events`]: crate::platform::pump_events::EventLoopExtPumpEvents::pump_app_events
-    fn as_raw_fd(&self) -> RawFd {
-        self.event_loop.as_raw_fd()
-    }
-}
+// LOCAL PATCH (aterm), 2026-10-17 (docs/AUDIT-third-party-2026-10-15.md, LW.7): upstream's
+// `AsFd` / `AsRawFd` for the X11 and Wayland loops stood here, the loop's one descriptor for
+// an embedder's own poll. The first-party loops wait in a poll(2) over several descriptors,
+// with no single epoll descriptor to hand out (calloop's was one), and no aterm crate embeds
+// the loop: aterm-gui drives it through `pump_app_events`.
 
 impl ActiveEventLoop {
     /// Create the window.

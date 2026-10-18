@@ -67,7 +67,7 @@ fn unknown_insert_orphan_key_exact_echo_matches_derived_model() {
     let c = cfg(GlowStyle::RainbowKitty, true);
     let t0 = Instant::now();
     let at = |ms: u64| t0 + Duration::from_millis(ms);
-    let model = aterm_spec::derive::unknown_insert_orphan_key_model();
+    let model = aterm_models_effects::unknown_insert_orphan_key_model();
     let mut state = model.init_state();
     for action in ["QueueOne", "LayWithSite", "Cleanup"] {
         assert!(model.fire(action, &mut state));
@@ -133,7 +133,7 @@ fn two_unknown_insert_orphan_keys_light_only_on_separate_exact_echoes() {
     let c = cfg(GlowStyle::RainbowKitty, true);
     let t0 = Instant::now();
     let at = |millis: u64| t0 + ms(millis);
-    let model = aterm_spec::derive::unknown_insert_orphan_key_model();
+    let model = aterm_models_effects::unknown_insert_orphan_key_model();
     let mut state = model.init_state();
     for action in ["QueueTwo", "LayWithSite", "Cleanup"] {
         assert!(model.fire(action, &mut state));
@@ -218,7 +218,7 @@ fn two_unknown_insert_orphans_reject_unrelated_or_stale_second_prints() {
     let c = cfg(GlowStyle::RainbowKitty, true);
     let t0 = Instant::now();
     let at = |millis: u64| t0 + ms(millis);
-    let model = aterm_spec::derive::unknown_insert_orphan_key_model();
+    let model = aterm_models_effects::unknown_insert_orphan_key_model();
     for (prior, glyph, print_seq, action) in [
         ('k', 'z', 3, "SecondAmbientOtherGlyph"),
         ('k', 'm', 2, "SecondExactOldPrint"),
@@ -289,7 +289,7 @@ fn two_unknown_insert_orphans_coalesced_exact_cells_light_without_generic_credit
     let c = cfg(GlowStyle::RainbowKitty, true);
     let t0 = Instant::now();
     let at = |millis: u64| t0 + ms(millis);
-    let model = aterm_spec::derive::unknown_insert_orphan_key_model();
+    let model = aterm_models_effects::unknown_insert_orphan_key_model();
     let mut state = model.init_state();
     for action in [
         "QueueTwo",
@@ -337,7 +337,7 @@ fn two_unknown_insert_orphans_reject_partial_wrong_stale_or_unprobed_batch() {
     let c = cfg(GlowStyle::RainbowKitty, true);
     let t0 = Instant::now();
     let at = |millis: u64| t0 + ms(millis);
-    let model = aterm_spec::derive::unknown_insert_orphan_key_model();
+    let model = aterm_models_effects::unknown_insert_orphan_key_model();
     for (second, print_seq, probed, action) in [
         ('z', 2, true, "CoalescedTwoWrongOrPartial"),
         (' ', 2, true, "CoalescedTwoWrongOrPartial"),
@@ -421,7 +421,7 @@ fn unknown_insert_orphan_space_cannot_claim_an_unchanged_blank() {
     let c = cfg(GlowStyle::RainbowKitty, true);
     let t0 = Instant::now();
     let at = |ms: u64| t0 + Duration::from_millis(ms);
-    let model = aterm_spec::derive::unknown_insert_orphan_key_model();
+    let model = aterm_models_effects::unknown_insert_orphan_key_model();
     let mut state = model.init_state();
     for action in ["QueueBlank", "LayWithSite", "Cleanup"] {
         assert!(model.fire(action, &mut state));
@@ -445,7 +445,7 @@ fn unknown_insert_orphan_key_escrow_expires_and_drops_on_space_changes() {
     let c = cfg(GlowStyle::RainbowKitty, true);
     let t0 = Instant::now();
     let at = |ms: u64| t0 + Duration::from_millis(ms);
-    let model = aterm_spec::derive::unknown_insert_orphan_key_model();
+    let model = aterm_models_effects::unknown_insert_orphan_key_model();
     for action in ["Expire", "Scroll", "Rewrite", "Reset"] {
         let (mut glow, mut out, mut row) = unknown_insert_orphan_key_setup(t0, 1, true);
         let mut state = model.init_state();

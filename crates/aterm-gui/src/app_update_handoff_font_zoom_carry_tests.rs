@@ -30,6 +30,8 @@ fn a_zoomed_font_crosses_the_handoff() {
         held: Vec::new(),
         roster_seq: None,
         fabric_attached: Vec::new(),
+        mirror_dropped: Vec::new(),
+        mirror_served: false,
     }
     .to_toml()
     .expect("serializes");
@@ -53,6 +55,8 @@ fn a_zoomed_font_crosses_the_handoff() {
         held: Vec::new(),
         roster_seq: None,
         fabric_attached: Vec::new(),
+        mirror_dropped: Vec::new(),
+        mirror_served: false,
     }
     .to_toml()
     .expect("serializes");
@@ -71,7 +75,7 @@ fn a_zoomed_font_crosses_the_handoff() {
         }
     );
     assert_eq!(
-        crate::app_window::hidpi_target_font_px(launch.explicit, 2.0),
+        crate::app_window::hidpi_target_font_px(launch.explicit, 2.0, 1000),
         None,
         "the first window's Retina auto-scale leaves a carried zoom be"
     );
@@ -180,6 +184,8 @@ fn a_zoom_out_after_a_handoff_restores_the_window_it_zoomed_in() {
         held: Vec::new(),
         roster_seq: None,
         fabric_attached: Vec::new(),
+        mirror_dropped: Vec::new(),
+        mirror_served: false,
     }
     .to_toml()
     .expect("serializes");

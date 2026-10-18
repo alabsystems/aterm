@@ -77,7 +77,8 @@ fn tiered(rows: u16, cols: u16, ring: usize) -> Terminal {
 }
 
 /// On screen: a real space in the last column before a wide glyph survives a
-/// narrow-then-widen round trip, exactly (the finding's three inputs).
+/// narrow-then-widen round trip, exactly (the finding's inputs, and its ZWJ
+/// family line, whose every space between the clusters survives).
 #[test]
 fn a_real_space_before_an_early_wrapped_glyph_survives_a_screen_round_trip() {
     for (text, narrow) in [
@@ -85,6 +86,7 @@ fn a_real_space_before_an_early_wrapped_glyph_survives_a_screen_round_trip() {
         ("done ✅ ok", 5),
         ("가나다 라마", 7),
         ("abcd 中文", 5),
+        ("👨‍👩‍👧 👨‍👩‍👧 👨‍👩‍👧 👨‍👩‍👧 👨‍👩‍👧 zwj", 9),
     ] {
         let mut term = Terminal::new(6, 20);
         term.process(text.as_bytes());
@@ -93,19 +95,6 @@ fn a_real_space_before_an_early_wrapped_glyph_survives_a_screen_round_trip() {
         term.resize(6, 20);
         assert_eq!(screen(&term), before, "{text:?} through {narrow} columns");
     }
-}
-
-/// The ZWJ family line from the finding: every space between the clusters
-/// survives a 30 -> 9 -> 30 round trip.
-#[test]
-fn spaces_between_emoji_clusters_survive_a_screen_round_trip() {
-    let text = "👨‍👩‍👧 👨‍👩‍👧 👨‍👩‍👧 👨‍👩‍👧 👨‍👩‍👧 zwj";
-    let mut term = Terminal::new(6, 30);
-    term.process(text.as_bytes());
-    let before = screen(&term);
-    term.resize(6, 9);
-    term.resize(6, 30);
-    assert_eq!(screen(&term), before);
 }
 
 /// A recorded hole is still dropped, and only it: a glyph that really
@@ -311,6 +300,44 @@ fn a_coloured_early_wrap_hole_stays_out_of_history() {
                 "{tier} history, offload={offload}: {lines:?}"
             );
         }
+    }
+}
+
+/// Read without a rewrap, the coloured hole is no text either, as its staged
+/// line already leaves it out: on screen (a copy and the row text) and in either
+/// history tier, the line reads the same as with the default background.
+#[test]
+fn a_coloured_early_wrap_hole_is_no_text_before_any_rewrap() {
+    use aterm_core::selection::{SelectionSide, SelectionType};
+    let text = "\x1b[44mabcdefghi中\x1b[0mxyz";
+    let mut term = Terminal::new(4, 10);
+    term.process(text.as_bytes());
+    assert!(
+        logical_lines(&term).iter().any(|l| l == "abcdefghi中xyz"),
+        "on screen: {:?}",
+        logical_lines(&term)
+    );
+    let sel = term.text_selection_mut();
+    sel.start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
+    sel.update_selection(1, 9, SelectionSide::Right);
+    sel.complete_selection();
+    assert_eq!(
+        term.selection_to_string().as_deref(),
+        Some("abcdefghi中xyz"),
+        "a copy on screen"
+    );
+    type Make = fn(u16) -> Terminal;
+    let makes: [(&str, Make); 2] = [
+        ("ring", |cols| Terminal::new(3, cols)),
+        ("tiered", |cols| tiered(3, cols, 1)),
+    ];
+    for (tier, make) in makes {
+        let term = in_history(make(10), text);
+        let lines = logical_lines(&term);
+        assert!(
+            lines.iter().any(|l| l == "abcdefghi中xyz"),
+            "{tier} history: {lines:?}"
+        );
     }
 }
 

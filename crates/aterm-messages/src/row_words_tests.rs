@@ -2,19 +2,19 @@
 // Copyright 2026 Andrew Yates
 
 //! Test-only: a row's slots and words: the time slot's one style per width,
-//! the distance-scaled glide, the echoes' words, the strain row's rail, the
+//! the distance-scaled glide, the echoes' words, the
 //! job's size said once, the primary load, and a count never without its
 //! unit.
 
 use crate::animate::{Look, Pace, ROW};
-use crate::center::{EchoKind, MessageCenter, Outcome};
+use crate::center::{MessageCenter, Outcome};
 use crate::glass::{Links, Presentation, RowKind, RowLayout, job_stats};
 use crate::log::MessageLog;
 use crate::model::{
     Amount, Hold, Intent, Load, Message, Meter, Restatement, Severity, Unit, WallStamp, tags,
 };
 use crate::text::char_width;
-use crate::{Duration, ELAPSED_AFTER, Instant, STALE_TAILED, STALE_UPDATE};
+use crate::{Duration, Instant, STALE_TAILED, STALE_UPDATE};
 
 fn ms(n: u64) -> Duration {
     Duration::from_millis(n)
@@ -120,7 +120,7 @@ fn style(w: &str) -> Style {
 }
 
 /// Over every row with a time slot (download latched and not, stalled, busy
-/// past ten seconds, a level, and their Fault and Vanish echoes), at four
+/// past ten seconds, and their Fault and Vanish echoes), at four
 /// widths and both looks: never a bare `m:ss` clock; a slot laid out long
 /// says `30 s left` / `for 41 s`, one laid out short `30s left` / `for 41s`;
 /// a hidden estimate leaves the slot blank; an ETA never carries a `~`.
@@ -191,24 +191,6 @@ fn the_time_slot_never_shows_a_bare_clock_and_keeps_one_style_per_width() {
                 c.post(busy("Waiting for another ALab update", ""), stamp(), now);
                 c.commit_rows(now, 3);
                 (c, now + ms(200_000))
-            }),
-        ),
-        (
-            "level, 30 s",
-            Box::new(|now| {
-                let mut c = fresh(now);
-                c.post(
-                    Message::new(tags::SYSTEM, Severity::Info, "Typing slowed by 'yes'")
-                        .key(crate::STRAIN_KEY)
-                        .hold(Hold::Live {
-                            stale_after: crate::STALE_STRAIN,
-                        })
-                        .meter(Meter::level(700, "6 of 8 cores")),
-                    stamp(),
-                    now,
-                );
-                c.commit_rows(now, 3);
-                (c, now + ms(30_000))
             }),
         ),
         (
@@ -329,7 +311,6 @@ fn the_time_slot_never_shows_a_bare_clock_and_keeps_one_style_per_width() {
     for needle in [
         "for 41 s",
         "for 3 min",
-        "for 29 s",
         " left",
         "stalled",
         "failed",
@@ -439,114 +420,6 @@ fn a_glide_moves_at_most_two_and_a_half_cells_a_frame_and_then_sleeps() {
     }
 }
 
-/// No echo of a row with finished words, in any look and at any width, paints
-/// `100%` or `done`: it draws its title, `failed`, or the frozen elapsed words.
-#[test]
-fn no_echo_says_100_percent_done() {
-    for kind in [EchoKind::Complete, EchoKind::Fault, EchoKind::Vanish] {
-        for cols in [60usize, 80, 120, 160] {
-            for look in [Look::MOVING, Look::STILL] {
-                let now = Instant::now();
-                let mut c = fresh(now);
-                let dl = c.post(download(70_000_000), stamp(), now).id;
-                let paste = busy("Pasting 4.2 MB", "").finished_as("Pasted 4.2 MB");
-                let b = c.post(paste, stamp(), now).id;
-                c.commit_rows(now, 3);
-                let at = now + ms(12_000);
-                for id in [dl, b] {
-                    match kind {
-                        EchoKind::Complete => assert!(c.resolve(id, Outcome::Ok, at)),
-                        EchoKind::Fault => assert!(c.resolve(id, Outcome::Warn, at)),
-                        EchoKind::Vanish => assert!(c.withdraw(id, at)),
-                    }
-                }
-                let p = present(&c, cols);
-                for t in [0u64, 100, 400, 900] {
-                    let m = c.motion(&p, at + ms(t), look);
-                    for (row, rm) in p.rows.iter().zip(&m.rows) {
-                        assert!(matches!(row.kind, RowKind::Echo(_)));
-                        let words = format!(
-                            "{} {} {} {}",
-                            row.title.1,
-                            row.pct.as_ref().map_or("", |p| p.1.as_str()),
-                            rm.eta.as_deref().unwrap_or(""),
-                            rm.readout.as_deref().unwrap_or("")
-                        );
-                        assert!(
-                            !words.contains("done") && !words.contains("100%"),
-                            "{kind:?}@{cols}: {words:?}"
-                        );
-                        if kind == EchoKind::Complete {
-                            assert!(row.pct.is_none() && rm.eta.is_none() && rm.readout.is_none());
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// The strain row's surface is a rail at every level and glides both ways, its
-/// layout has no load slot, and the rail's edge is the level mapped onto the
-/// whole row.
-#[test]
-fn the_strain_row_is_a_rail_across_the_whole_window() {
-    let now = Instant::now();
-    let mut c = fresh(now);
-    let row = |pm: u16| {
-        Message::new(tags::SYSTEM, Severity::Info, "Typing slowed by 'yes'")
-            .key(crate::STRAIN_KEY)
-            .hold(Hold::Live {
-                stale_after: crate::STALE_STRAIN,
-            })
-            .meter(Meter {
-                load: Some(Load::Cpu),
-                ..Meter::level(pm, "6 of 8 cores")
-            })
-            .loads([Load::Cpu])
-            .action(Intent::ShowTab { tab: 2, window: 1 })
-    };
-    let id = c.post(row(250), stamp(), now).id;
-    c.commit_rows(now, 3);
-    for cols in [60usize, 80, 120] {
-        let p = present(&c, cols);
-        let l = &p.rows[0];
-        assert!(l.load_slot.is_none() && l.load.is_none(), "@{cols}");
-        assert!(
-            l.capsules.iter().any(|cap| cap.full_label == "Show tab 2"),
-            "@{cols}: the navigation to the tab the title names"
-        );
-        for look in [Look::MOVING, Look::STILL] {
-            let s = &c.motion(&p, now + ms(500), look).rows[0].surface;
-            assert!(s.rail, "@{cols} {look:?}");
-            let e = s.edge.expect("a level inside the row has an edge");
-            assert!(
-                (i64::from(e) - i64::from(ROW) / 4).abs() <= 1,
-                "25 % of the row"
-            );
-        }
-    }
-    c.restate(
-        id,
-        Restatement {
-            meter: Some(row(900).meter),
-            ..Restatement::default()
-        },
-        now + ms(1000),
-    );
-    let p = present(&c, 80);
-    let mid = c.motion(&p, now + ms(1200), Look::MOVING).rows[0]
-        .surface
-        .clone();
-    assert!(mid.rail);
-    let e = f64::from(mid.edge.unwrap()) / f64::from(ROW);
-    assert!(e > 0.25 && e < 0.9, "gliding: {e}");
-    let before = now + ms(10_100);
-    assert!(ELAPSED_AFTER <= ms(10_000));
-    let rm = &c.motion(&p, before, Look::MOVING).rows[0];
-    assert_eq!(rm.readout.as_deref(), Some("for 10 s"));
-}
-
 /// Beside a percent the stats slot paints only the size of the whole job (a
 /// pair `A / B` its total, a count its one grammar), hidden until the first
 /// unit arrives and gone where the title already states it; no row of the
@@ -641,11 +514,11 @@ fn pass(load: Option<Load>) -> Message {
         .primary_load(Load::Network)
 }
 
-/// A download row's `network busy` shows only while other work is measurably
-/// slowed; a load outside the work's own shows at once; the slot is reserved
-/// either way, at the tail of the words, never led by a `·`.
+/// A download row's `network busy` is the title's and never shows; a load
+/// outside the work's own shows at once; the slot is reserved either way, at
+/// the tail of the words, never led by a `·`.
 #[test]
-fn a_downloads_network_words_show_only_while_other_work_is_slowed() {
+fn a_downloads_network_words_never_show_and_another_load_shows_at_once() {
     for cols in [80usize, 120, 160] {
         let now = Instant::now();
         let mut c = fresh(now);
@@ -660,12 +533,6 @@ fn a_downloads_network_words_show_only_while_other_work_is_slowed() {
             caps,
             "@{cols}: at the tail, before the capsules"
         );
-        // Slowed: the words show, in the same cells.
-        c.set_slowing(true);
-        let slowed = present(&c, cols).rows[0].clone();
-        assert_eq!(slowed.load.map(|(_, w)| w), Some("network busy"), "@{cols}");
-        assert_eq!(slowed.load_slot, l.load_slot, "@{cols}: nothing moves");
-        c.set_slowing(false);
         // Another load than the work's own shows at once (it was declared
         // with the post's load, or after LOAD_AFTER).
         c.restate(
@@ -799,91 +666,31 @@ fn a_complete_echo_without_a_past_tense_says_done() {
     assert_eq!(p.rows[0].pct.as_ref().map(|p| p.1.trim()), Some("100%"));
 }
 
-/// Where the width law shortens a count it keeps its unit word (`6/8 cores`,
-/// `3/10 programs`); where even that does not fit the stats go whole. Pinned
-/// at 60/80/120 and swept over 40–200: no painted stats is a bare fraction.
+/// Where the width law shortens a count it keeps its unit word
+/// (`3/10 programs`, `6/8 cores`), a clause before the count included; where
+/// even that does not fit the stats go whole. Swept over every width 40–200
+/// for every row that carries a count: no painted stats is a bare fraction.
 #[test]
 fn a_count_keeps_its_unit_at_every_width() {
-    let strain = |title: &str, severity: Severity, load: Load, named: bool, stats: &str| {
-        let msg = Message::new(tags::SYSTEM, severity, title)
-            .key(crate::STRAIN_KEY)
-            .hold(Hold::Live {
-                stale_after: crate::STALE_STRAIN,
-            })
-            .loads([load])
-            .meter(Meter {
-                load: named.then_some(load),
-                ..Meter::level(740, stats)
-            })
-            .no_excerpt();
-        if named {
-            msg.action(Intent::ShowTab { tab: 2, window: 1 })
-        } else {
-            msg
-        }
-    };
-    let rows: [(&str, Message, [Option<&str>; 3]); 4] = [
+    let rows: [(&str, Message); 3] = [
+        ("pass", pass(None)),
         (
-            "strain, cpu",
-            strain(
-                "Typing slowed by 'yes'",
-                Severity::Info,
-                Load::Cpu,
-                true,
-                "6 of 8 cores",
-            ),
-            // At 60 there is no room for `6/8 cores`: the stats go, never as
-            // `6/8`. At 80 they fit whole.
-            [None, Some("6 of 8 cores"), Some("6 of 8 cores")],
+            // Where the clause goes, the count keeps its unit.
+            "busy, a clause before the count",
+            busy("Verifying the payload", "throttled \u{b7} 6 of 8 cores"),
         ),
         (
-            "strain, memory",
-            strain(
-                "Typing slowed by low memory",
-                Severity::Warn,
-                Load::Memory,
-                false,
-                "23 of 24 GB used",
-            ),
-            [None, Some("23 of 24 GB used"), Some("23 of 24 GB used")],
-        ),
-        (
-            "strain, heat",
-            strain(
-                "Typing slowed by heat",
-                Severity::Info,
-                Load::Cpu,
-                false,
-                "throttled \u{b7} 6 of 8 cores",
-            ),
-            [
-                Some("6/8 cores"),
-                Some("throttled \u{b7} 6 of 8 cores"),
-                Some("throttled \u{b7} 6 of 8 cores"),
-            ],
-        ),
-        (
-            "pass",
-            pass(None),
-            [
-                Some("3/10 programs"),
-                Some("3 of 10 programs"),
-                Some("3 of 10 programs"),
-            ],
+            // The capsule leaves no room for `3/10 programs`: the stats go
+            // whole, never as `3/10`.
+            "pass, with a capsule",
+            pass(None).action(Intent::ShowTab { tab: 2, window: 1 }),
         ),
     ];
-    let mut failures = Vec::new();
-    for (name, msg, want) in rows {
+    for (name, msg) in rows {
         let now = Instant::now();
         let mut c = fresh(now);
         c.post(msg, stamp(), now);
         c.commit_rows(now, 3);
-        for (cols, want) in [60usize, 80, 120].into_iter().zip(want) {
-            let got = present(&c, cols).rows[0].stats.clone().map(|s| s.1);
-            if got.as_deref() != want {
-                failures.push(format!("{name}@{cols}: {got:?}"));
-            }
-        }
         for cols in 40..=200 {
             if let Some((_, s)) = present(&c, cols).rows[0].stats.clone() {
                 assert!(
@@ -893,5 +700,4 @@ fn a_count_keeps_its_unit_at_every_width() {
             }
         }
     }
-    assert!(failures.is_empty(), "re-pin:\n{}", failures.join("\n"));
 }

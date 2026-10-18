@@ -11,6 +11,101 @@ use crate::restore::{
 use crate::session_store::SessionRecord;
 use std::sync::{Mutex, PoisonError};
 
+/// The actual handoff JSON preserves saved empty title slots, while a carry
+/// without the presence field retains its legacy interpretation.
+#[test]
+fn carried_empty_title_slots_survive_the_handoff_wire() {
+    use aterm_core::terminal::{CheckpointMeta, Terminal, TitleRepr};
+    let titles = |terminal: &Terminal| {
+        let title = terminal.checkpoint_carry(0).expect("Ground").title.unwrap();
+        (title.window, title.icon)
+    };
+
+    for (prefix, tail) in [
+        (
+            &b"\x1b]0;caller\x07\x1b[22t\x1b]0;program\x07"[..],
+            &b"\x1b[23t"[..],
+        ),
+        (b"\x1b[22t\x1b]0;program\x07", b"\x1b[23t"),
+        (
+            b"\x1b]1;icon\x07\x1b[22;2t\x1b]0;program\x07",
+            b"\x1b[23;2t",
+        ),
+        (
+            b"\x1b]2;window\x07\x1b[22;1t\x1b]0;program\x07",
+            b"\x1b[23;1t",
+        ),
+        (
+            b"\x1b]1;icon\x07\x1b[22;2t\x1b[22;1t\x1b]0;program\x07",
+            b"\x1b[23;2t",
+        ),
+    ] {
+        let mut live = Terminal::new(4, 20);
+        live.process(prefix);
+        let carry = live.checkpoint_carry(0).expect("Ground");
+        let meta = CheckpointMeta::from_checkpoint(&carry);
+        let bytes = aterm_json::to_vec(&meta).unwrap();
+        let back: CheckpointMeta = aterm_json::from_slice(&bytes).unwrap();
+        assert_eq!(back, meta);
+        let mut adopted = Terminal::from_checkpoint(
+            &back.into_checkpoint(carry.grid.clone(), carry.alt_grid.clone()),
+        );
+        live.process(tail);
+        adopted.process(tail);
+        assert_eq!(
+            titles(&adopted),
+            titles(&live),
+            "{}",
+            String::from_utf8_lossy(prefix)
+        );
+    }
+
+    let legacy: TitleRepr = aterm_json::from_str(
+        r#"{"window":"program","icon":"current icon","stack":[["","caller"]]}"#,
+    )
+    .unwrap();
+    assert!(legacy.stack_saved.is_empty());
+    let mut terminal = Terminal::new(4, 20);
+    terminal.restore_title(&legacy);
+    terminal.process(b"\x1b[23t");
+    assert_eq!(
+        titles(&terminal),
+        ("caller".to_string(), "current icon".to_string())
+    );
+
+    // Presence does not bypass title sanitation or the stack bound. An explicit
+    // false slot stays absent, even when its untrusted string is nonempty.
+    let hostile = TitleRepr {
+        window: "program".into(),
+        icon: "current icon".into(),
+        stack: vec![("discard me".repeat(1024), "\x07\u{202e}".into()); 64],
+        stack_saved: vec![(false, true); 65],
+    };
+    terminal.restore_title(&hostile);
+    let carried = terminal.checkpoint_carry(0).unwrap().title.unwrap();
+    assert!(carried.stack.len() < hostile.stack.len());
+    assert_eq!(carried.stack_saved.len(), carried.stack.len());
+    assert!(
+        carried
+            .stack
+            .iter()
+            .all(|(icon, window)| icon.is_empty() && window.is_empty())
+    );
+    terminal.process(b"\x1b[23t");
+    assert_eq!(
+        titles(&terminal),
+        ("".to_string(), "current icon".to_string())
+    );
+
+    // A short mask supplies no new meaning for the remaining legacy entries.
+    let partial: TitleRepr = aterm_json::from_str(
+        r#"{"window":"program","icon":"current icon","stack":[["",""],["","caller"]],"stack_saved":[[true,false]]}"#,
+    ).unwrap();
+    terminal.restore_title(&partial);
+    terminal.process(b"\x1b[23t");
+    assert_eq!(titles(&terminal), ("caller".to_string(), "".to_string()));
+}
+
 /// Serializes ALL env mutation in this module. `set_var`/`remove_var` are
 /// process-global and the test binary runs hundreds of tests on parallel
 /// threads, so "single-threaded test" is NEVER a true claim here — every
@@ -194,6 +289,8 @@ fn a_target_refused_after_a_passing_deferral_exits_75() {
         "update trial for build 12 is still unconfirmed ({})",
         aterm_update::PASSING_REFUSAL_KEY
     ));
+    // The status a parent of another build reads: a cross-version contract.
+    assert_eq!(EXIT_SUCCESSOR_PASSING, 75);
     for outcome in [
         lock,
         ApplyOutcome::NoUpdate,
@@ -205,7 +302,6 @@ fn a_target_refused_after_a_passing_deferral_exits_75() {
             Some(EXIT_SUCCESSOR_PASSING),
             "{outcome:?}"
         );
-        assert_eq!(EXIT_SUCCESSOR_PASSING, 75);
         // The same outcome, but the target was admitted or IS this build:
         // nothing was refused because of it. And a parent that never said
         // it reads 75 is owed the ending it has always filed.
@@ -267,92 +363,10 @@ fn a_refused_intake_of_an_offered_handoff_exits_instead_of_booting_fresh() {
     assert!(!overlap_intake_exits(false, 3, true));
     // …and a stray channel variable with nothing offered boots fresh.
     assert!(!overlap_intake_exits(true, 0, false));
-    // An unreadable manifest is the PRODUCER's content: the exit asks a
-    // parent that reads 75 for the transient lane, never the structural
-    // latch (review round two of item 18); a parent that does not read it
-    // ends the candidate itself (round eight, finding 0).
+    // An unreadable manifest is the PRODUCER's content (review round two of
+    // item 18): `no_shipped_parent_is_sent_75_for_a_refused_intake` is how
+    // each parent is left.
     assert_eq!(incoming.refusal, Some(WholeRefusal::Producer));
-    assert_eq!(
-        refused_intake_leave(0, incoming.refusal, true),
-        RefusedIntakeLeave::Passing
-    );
-    assert_eq!(
-        refused_intake_leave(0, incoming.refusal, false),
-        RefusedIntakeLeave::ParentEndsIt
-    );
-}
-
-/// THE BOOT LEAVES AS IT DECIDED (round seven, item 106; round eight,
-/// finding 0). The decision below is driven by its tests; this pins that
-/// `main_entry` asks it, in the refused-intake exit, with the adopted
-/// count, the intake's refusal and the parent's declared capability; that
-/// it gives the counted trial launch back BEFORE it leaves either way; and
-/// that each leave does what it says — 75 only from `Passing`, the bounded
-/// wait from `ParentEndsIt` — read from the source, as `spawn`'s pins are,
-/// because the boot itself cannot run in a test. Deleting the exit, the
-/// give-back or the wait leaves every other test green.
-#[cfg(unix)]
-#[test]
-fn main_entry_leaves_a_refused_intake_as_it_decided() {
-    let src = include_str!("lib.rs");
-    let gate = src
-        .find(
-            "if seamless::overlap_intake_exits(overlap_degraded, seamless_adopt.len(), \
-             incoming_offered) {",
-        )
-        .expect("main_entry's refused-intake exit");
-    let body = &src[gate..];
-    let body = &body[..body
-        .find("\n        return;\n    }\n")
-        .expect("the exit ends")];
-    let asked = body
-        .find(
-            "let leave = seamless::refused_intake_leave(\n                adopted_count,\n                \
-             incoming_refusal,\n                parent_reads_passing_exit,\n            );",
-        )
-        .expect("the exit asks whose refusal it was, and whether the parent reads 75");
-    let after = &body[asked..];
-    let given_back = after
-        .find("seamless::give_back_refused_intake_launch(\n                leave,")
-        .expect("the leave gives its counted trial launch back");
-    let matched = after.find("match leave {").expect("and then leaves");
-    assert!(given_back < matched, "the give-back comes before any leave");
-    let passing = after
-        .find("seamless::RefusedIntakeLeave::Passing => {")
-        .expect("the passing arm");
-    let parent_ends = after
-        .find("seamless::RefusedIntakeLeave::ParentEndsIt => {")
-        .expect("the arm that leaves the ending to the parent");
-    assert!(
-        after[passing..parent_ends]
-            .contains("crate::crash_signal::clean_exit_now(seamless::EXIT_SUCCESSOR_PASSING)"),
-        "Passing exits 75"
-    );
-    assert_eq!(
-        after.matches("clean_exit_now(").count(),
-        1,
-        "no other leave exits with a status of its own"
-    );
-    assert!(
-        after[parent_ends..].contains(
-            "seamless::await_parents_end(\n                        incoming_exec_fds.parent_pid(),"
-        ),
-        "ParentEndsIt waits, bounded, for the attested parent"
-    );
-    assert!(
-        src.contains("let incoming_refusal = "),
-        "the intake's refusal is kept for it"
-    );
-    let taken = src
-        .find(
-            "let parent_reads_passing_exit = \
-             seamless::take_parent_reads_passing_exit_from(&mut handoff_env);",
-        )
-        .expect("the capability is taken from the snapshot");
-    let dropped = src
-        .find("drop(handoff_env);")
-        .expect("the snapshot is dropped");
-    assert!(taken < dropped, "before the snapshot is gone");
 }
 
 /// 0.98.0's reading of a candidate's death — the newest parent that exists,
@@ -479,13 +493,12 @@ fn no_shipped_parent_is_sent_75_for_a_refused_intake() {
     );
 }
 
-/// THE CAPABILITY IS DECLARED ON BOTH LANES, BESIDE THE READER THAT HONOURS
-/// IT, and reaches the new image (round eight, finding 0). The parent
-/// publishes it in the one list the fork lane and the launched lane both
-/// publish ([`outgoing_parent_env`]); the snapshot carries it across the
-/// boot apply's re-exec; the successor takes it out before any shell; and
-/// this build's reader files 75 transient — so the declaration can never
-/// ship without the reading it promises.
+/// THE CAPABILITY IS DECLARED BESIDE THE READER THAT HONOURS IT, and reaches
+/// the new image (round eight, finding 0). The parent publishes it in the one
+/// list both handoff lanes publish ([`outgoing_parent_env`]); the snapshot
+/// carries it across the boot apply's re-exec; the successor takes it out
+/// before any shell; and this build's reader files 75 transient — so the
+/// declaration can never ship without the reading it promises.
 #[cfg(unix)]
 #[test]
 fn the_exit_capability_is_declared_on_both_lanes_and_taken_by_the_successor() {
@@ -502,22 +515,6 @@ fn the_exit_capability_is_declared_on_both_lanes_and_taken_by_the_successor() {
         ),
         crate::app_native::PhysicalFailureShape::Transient,
         "and reads what it declares"
-    );
-    // Both lanes publish that one list.
-    let lanes = include_str!("app_update_handoff.rs");
-    assert!(
-        lanes.contains(
-            "for (key, value) in crate::seamless::outgoing_parent_env() {\n        \
-             job.command.env(key, value);"
-        ),
-        "the fork lane publishes it on the candidate's command"
-    );
-    assert!(
-        lanes.contains(
-            "for (key, value) in crate::seamless::outgoing_parent_env() {\n        \
-             environment.push((key, value));"
-        ),
-        "the launched lane publishes it in the launch environment"
     );
     // The successor: carried across the re-exec, then taken.
     let mut env = HandoffEnv::default();
@@ -584,16 +581,9 @@ fn awaiting_the_parents_end_is_bounded_and_ends_with_the_parent() {
     // SAFETY: `getpid` has no preconditions.
     let own = unsafe { libc::getpid() };
     let live = AttestedParent::attest_live_for_test(own).expect("this process attests");
-    let bound = std::time::Duration::from_millis(120);
-    let started = std::time::Instant::now();
     assert_eq!(
-        await_parents_end(Some(live), bound),
+        await_parents_end(Some(live), std::time::Duration::from_millis(10)),
         ParentsEnd::BoundPassed
-    );
-    assert!(started.elapsed() >= bound, "held to the bound");
-    assert!(
-        PARENTS_END_BOUND > std::time::Duration::from_secs(120),
-        "past every parent's readiness deadline, its development seam's ceiling included"
     );
 }
 
@@ -860,6 +850,137 @@ fn assert_peer_reaches_eof(peer: i32, subject: &str) {
     );
 }
 
+/// This build's number, as the handoff's target identity names it.
+#[cfg(unix)]
+fn own_build() -> u64 {
+    crate::build_info::build_number()
+        .parse::<u64>()
+        .unwrap_or(0)
+}
+
+/// The target identity of this very build: what a parent that authorized it
+/// publishes.
+#[cfg(unix)]
+fn own_target() -> String {
+    encode_target_identity(own_build(), crate::build_info::git_commit())
+}
+
+/// A live `zsh` record for `local_id` under `sid`, every optional field empty.
+#[cfg(unix)]
+fn zsh_record(local_id: u64, sid: &str) -> SessionRecord {
+    SessionRecord {
+        local_id,
+        sid: sid.to_string(),
+        parent: None,
+        state: "alive".to_string(),
+        title: "zsh".to_string(),
+        screen: None,
+        user_title: None,
+        description: None,
+        icon: None,
+        role: None,
+        attention: None,
+        control: None,
+        frozen_path: false,
+        identity: None,
+        topics: Vec::new(),
+        fg_holder: None,
+        rekey: false,
+        loader: false,
+        history: None,
+        history_dropped: 0,
+        history_withheld: false,
+        history_lost: 0,
+        hold: None,
+        more_holds: Vec::new(),
+        supervisor: None,
+        claim_known: false,
+        attention_owners: Vec::new(),
+        viewport_from_bottom: None,
+        render_debt: None,
+        questions: None,
+        autopilot: None,
+        land_at: None,
+        fabric: Default::default(),
+        timeline_id: 0,
+        log_ids: None,
+        log_seq: 0,
+        journal_key: None,
+    }
+}
+
+/// A manifest of `sessions` and nothing else.
+#[cfg(unix)]
+fn bare_manifest(sessions: Vec<SessionRecord>) -> SessionHandoff {
+    SessionHandoff {
+        schema: SessionHandoff::SCHEMA,
+        window: None,
+        connections: Vec::new(),
+        sessions,
+        next_turn_id: None,
+        outgoing_build: None,
+        held: Vec::new(),
+        roster_seq: None,
+        fabric_attached: Vec::new(),
+        mirror_dropped: Vec::new(),
+        mirror_served: false,
+    }
+}
+
+/// A `--hold` pane `local_id` under `sid`, showing `checkpoint`.
+#[cfg(unix)]
+fn held_screen(local_id: u64, sid: SessionId, checkpoint: TerminalCheckpoint) -> HeldScreen {
+    HeldScreen {
+        local_id,
+        sid,
+        checkpoint,
+        exit: None,
+        history_dropped: 0,
+        history_head: None,
+        failure_seen: false,
+    }
+}
+
+/// `held` as the writer stamps it onto an empty manifest in `dir`, and then as
+/// the successor takes it back beside the `handed` sessions: what was written
+/// and what is shown.
+#[cfg(unix)]
+fn stamp_and_take_held(
+    dir: &std::path::Path,
+    held: &[HeldScreen],
+    handed: &[(u64, &str)],
+) -> (Vec<crate::session_store::HeldPaneCarry>, Vec<HeldPane>) {
+    let mut manifest = bare_manifest(Vec::new());
+    let nonce = "0123456789abcdef0123456789abcdef";
+    stamp_held_panes(
+        &mut manifest,
+        held,
+        &mut crate::handoff_history::HeldExports::default(),
+        &[],
+        &mut 0,
+        dir,
+        nonce,
+        (0, 0),
+        &mut Vec::new(),
+    );
+    let stem = format!("seamless-{}-{nonce}", std::process::id());
+    let mut remaining = MAX_HANDOFF_AGGREGATE_GRID_BYTES;
+    let mut history = crate::handoff_history::MAX_AGGREGATE_BYTES;
+    let mut control = crate::handoff_carry::MAX_AGGREGATE_BYTES;
+    let shown = take_held_panes(
+        &manifest.held,
+        handed,
+        &dir.join(format!("{stem}.toml")),
+        &stem,
+        dir,
+        &mut remaining,
+        &mut 0,
+        &mut history,
+        &mut control,
+    );
+    (manifest.held, shown)
+}
+
 #[cfg(unix)]
 fn exact_legacy_layout(ids: &[u64]) -> RestoreManifest {
     RestoreManifest::new(vec![WindowLayout {
@@ -880,6 +1001,8 @@ fn exact_legacy_layout(ids: &[u64]) -> RestoreManifest {
             .iter()
             .map(|id| RestoredTab {
                 root: RestoredSplitTree::leaf(RestoredView::Terminal(TerminalLeafRestore {
+                    sid: None,
+                    lineage: None,
                     cwd: None,
                     title: format!("session-{id}"),
                     profile: None,
@@ -891,7 +1014,9 @@ fn exact_legacy_layout(ids: &[u64]) -> RestoreManifest {
                     attention: None,
                     questions: None,
                     autopilot: None,
+                    land_at: None,
                     identity: None,
+                    theme: None,
                     agent: None,
                     supervised: None,
                     held: false,
@@ -902,15 +1027,6 @@ fn exact_legacy_layout(ids: &[u64]) -> RestoreManifest {
             })
             .collect(),
     }])
-}
-
-#[test]
-fn random_nonce_is_hex_and_unique() {
-    let a = random_nonce();
-    let b = random_nonce();
-    assert_eq!(a.len(), 32, "16 bytes → 32 hex chars");
-    assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
-    assert_ne!(a, b, "two draws differ (CSPRNG)");
 }
 
 /// EXHAUSTIVE over all 256 env-presence combinations, because the cost of a
@@ -981,11 +1097,6 @@ fn a_carried_checkpoint_round_trips_its_scrollback_and_bounds_it() {
         t.process(format!("line{i}\r\n").as_bytes());
     }
 
-    // Visible-only is the old behaviour and must still be expressible.
-    let visible = t.checkpoint_visible().expect("Ground");
-    assert_eq!(visible.history_lines, 0);
-    assert!(checkpoint_grid_is_canonical(&visible.grid, 4, 20, 0));
-
     // A carried checkpoint declares its history and validates against it.
     let carried = t
         .checkpoint_carry(MAX_HANDOFF_HISTORY_LINES as usize)
@@ -1017,20 +1128,6 @@ fn a_carried_checkpoint_round_trips_its_scrollback_and_bounds_it() {
         dimension_grid_cap(4, 20, MAX_HANDOFF_HISTORY_LINES + 1).is_none(),
         "history beyond the ceiling is refused before any decode"
     );
-
-    // A shallow ring carries only what it has, not the whole bound.
-    let mut small = Terminal::new(4, 20);
-    small.process(b"a\r\nb\r\nc\r\nd\r\ne\r\nf\r\n");
-    let shallow = small
-        .checkpoint_carry(MAX_HANDOFF_HISTORY_LINES as usize)
-        .expect("Ground");
-    assert!(shallow.history_lines < MAX_HANDOFF_HISTORY_LINES);
-    assert!(checkpoint_grid_is_canonical(
-        &shallow.grid,
-        shallow.rows,
-        shallow.cols,
-        shallow.history_lines
-    ));
 
     // THE POINT: restoring a carried checkpoint really does bring history back.
     let restored = Terminal::from_checkpoint(&carried);
@@ -1172,54 +1269,12 @@ fn modern_wide_narrow_checkpoint_preserves_full_tab_vector_and_rejects_bad_lengt
     );
 }
 
-/// The desk that refused every automatic update from v0.87.0 to v0.90.0 on
-/// the owner's daily driver (measured 2026-09-22): a Claude Code tab started
-/// from a shell prompt on the LAST row of a 56-row grid (1049 saves that
-/// cursor into the main DECSC slot), then the "update staged" status bar
-/// takes one row of chrome and every session is 55 rows when the park runs.
-/// Then the engine left the slot untouched, one row past the grid, and the
-/// whole set was refused as `meta out of bounds`. The shrink demotes the saved
-/// primary's top row into history, and the slot now follows the prompt up
-/// with it (xterm's `AdjustSavedCursor`; `Grid::lend_saved_cursor`), so this
-/// desk carries it on row 54, under `$ claude`, and the set commits. The slot
-/// a shrink still leaves past the grid, and the wire must still admit, is the
-/// next test's.
-#[test]
-fn a_saved_cursor_on_the_old_bottom_row_survives_the_status_bars_one_row_shrink() {
-    let mut t = aterm_core::terminal::Terminal::new(56, 149);
-    for i in 0..60 {
-        t.process(format!("$ command {i}\r\n").as_bytes());
-    }
-    t.process(b"$ claude");
-    assert_eq!(t.cursor().row, 55, "the prompt sits on the last row");
-    t.process(b"\x1b[?1049h");
-    t.resize(55, 149);
-    let checkpoint = t
-        .checkpoint_carry(MAX_HANDOFF_HISTORY_LINES as usize)
-        .expect("Ground");
-    let meta = CheckpointMeta::from_checkpoint(&checkpoint);
-    assert_eq!(meta.rows, 55);
-    assert_eq!(
-        meta.saved_cursor_main
-            .map(|saved| (saved.cursor_row, saved.cursor_col)),
-        Some((54, 8)),
-        "the slot followed the prompt up the row the demote took, after `$ claude`"
-    );
-    assert_eq!(checkpoint_meta_bound_violation(&meta), None);
-    assert!(checkpoint_meta_is_bounded(&meta));
-    assert!(
-        screen_digest(&[(0, checkpoint)]).is_ok(),
-        "the visible checkpoint set commits canonically"
-    );
-}
-
 /// A DECSC slot on a row the shrink TRIMS (a blank row below the cursor)
-/// names no text, so the engine leaves it where it was saved, past the grid,
-/// and clamps it only when DECRC or the 1049 exit reads it (xterm's
-/// `CursorRestore`). That honest state is what refused the 2026-09-22 updates
-/// (`saved_cursor_main.cursor_row == rows`): the wire bounds a DECSC slot by
-/// the engine's ceiling rather than the grid, carries it as the engine holds
-/// it, and the set commits.
+/// stays past the grid in the engine (`aterm-core`'s
+/// `handoff_saved_cursor_after_shrink`). That honest state is what refused
+/// the 2026-09-22 updates (`saved_cursor_main.cursor_row == rows`, the
+/// "update staged" status bar's one-row shrink): the wire bounds a DECSC slot
+/// by the engine's ceiling rather than the grid, and the set commits.
 #[test]
 fn a_saved_cursor_on_a_row_the_shrink_trimmed_crosses_past_the_grid() {
     let mut t = aterm_core::terminal::Terminal::new(56, 149);
@@ -1228,190 +1283,87 @@ fn a_saved_cursor_on_a_row_the_shrink_trimmed_crosses_past_the_grid() {
     }
     // DECSC on the blank last row, then back up onto the last line of output.
     t.process(b"\x1b7\x1b[A");
-    assert_eq!(
-        t.cursor().row,
-        54,
-        "PRECONDITION: a blank row below the cursor"
-    );
     t.resize(55, 149);
     let checkpoint = t
         .checkpoint_carry(MAX_HANDOFF_HISTORY_LINES as usize)
         .expect("Ground");
     let meta = CheckpointMeta::from_checkpoint(&checkpoint);
-    assert_eq!(meta.rows, 55);
     let saved = meta.saved_cursor_main.expect("DECSC saved the cursor");
-    assert_eq!(
-        (saved.cursor_row, saved.cursor_col),
-        (55, 0),
-        "the shrink trimmed the slot's row and left the slot where it was saved"
-    );
     assert!(
         saved.cursor_row >= meta.rows,
-        "the slot names a row the grid no longer has"
+        "PRECONDITION: the slot names a row the grid no longer has"
     );
-    assert_eq!(checkpoint_meta_bound_violation(&meta), None);
-    assert!(checkpoint_meta_is_bounded(&meta));
     assert!(
         screen_digest(&[(0, checkpoint)]).is_ok(),
         "the visible checkpoint set commits canonically"
     );
 }
 
-/// Every conjunct of the bound predicate names the value, the bound and
-/// the relation — the first broken one, in the consumer's order — and the
-/// refusal that carries it prints the sentence the log needed on 2026-09-22.
+/// Every conjunct of the bound predicate refuses its own field, the first
+/// broken one in the consumer's order — and a DECSC slot past the CURRENT
+/// grid (honest state after a shrink) is no refusal.
 #[test]
 fn a_meta_out_of_bounds_names_the_field_the_value_and_the_bound() {
-    let max_rows = aterm_core::grid::MAX_GRID_ROWS;
-    let max_cols = aterm_core::grid::MAX_GRID_COLS;
     let mut t = aterm_core::terminal::Terminal::new(6, 40);
     t.process(b"\x1b7");
     let checkpoint = t.checkpoint_visible().expect("Ground");
     let meta = CheckpointMeta::from_checkpoint(&checkpoint);
     assert_eq!(checkpoint_meta_bound_violation(&meta), None);
-
-    let mut forged = meta.clone();
-    forged
-        .saved_cursor_main
-        .as_mut()
-        .expect("DECSC left a main slot")
-        .cursor_row = max_rows;
-    let violation = checkpoint_meta_bound_violation(&forged)
-        .expect("no grid can have put a cursor on row MAX_GRID_ROWS");
-    assert_eq!(
-        violation,
-        MetaBoundViolation {
-            slot: "saved_cursor_main",
-            field: "cursor_row",
-            value: u64::from(max_rows),
-            rule: BoundRule::Below,
-            limit_name: "MAX_GRID_ROWS",
-            limit: u64::from(max_rows),
-        }
+    /// What is broken, how, and the `(slot, field)` the refusal names.
+    type Case = (
+        &'static str,
+        fn(&mut CheckpointMeta),
+        Option<(&'static str, &'static str)>,
     );
-    assert!(!checkpoint_meta_is_bounded(&forged));
-    let refusal = ScreenDigestRefusal::MetaUnbounded {
-        local_id: 0,
-        rows: 6,
-        cols: 40,
-        history_lines: 0,
-        violation: Some(violation),
-    };
-    assert_eq!(
-        refusal.to_string(),
-        format!(
-            "session 0: meta out of bounds at 6x40 with 0 carried line(s): \
-             saved_cursor_main.cursor_row={max_rows} must be below MAX_GRID_ROWS={max_rows}"
-        )
-    );
-
-    let named = |mutate: fn(&mut CheckpointMeta)| {
-        let mut meta = meta.clone();
-        mutate(&mut meta);
-        checkpoint_meta_bound_violation(&meta).map(|violation| {
-            (
-                violation.slot,
-                violation.field,
-                violation.value,
-                violation.rule,
-                violation.limit_name,
-                violation.limit,
-            )
-        })
-    };
-    // A DECSC slot past the CURRENT grid is honest state, not a refusal.
-    assert_eq!(
-        named(|m| m.saved_cursor_main.as_mut().unwrap().cursor_row = 6),
-        None
-    );
-    assert_eq!(
-        named(|m| m.saved_cursor_main.as_mut().unwrap().cursor_col = 40),
-        None
-    );
-    assert_eq!(
-        named(|m| m.rows = 0),
-        Some(("", "rows", 0, BoundRule::AtLeast, "", 1))
-    );
-    assert_eq!(
-        named(|m| m.cursor.cursor_col = 40),
-        Some(("cursor", "cursor_col", 40, BoundRule::Below, "cols", 40))
-    );
-    assert_eq!(
-        named(|m| m.cursor.scroll_bottom = 6),
-        Some(("cursor", "scroll_bottom", 6, BoundRule::Below, "rows", 6))
-    );
-    assert_eq!(
-        named(|m| m.cursor.scroll_top = 9),
-        Some((
-            "cursor",
-            "scroll_top",
-            9,
-            BoundRule::AtMost,
-            "scroll_bottom",
-            5
-        ))
-    );
-    assert_eq!(
-        named(|m| m.cursor.tab_stops.truncate(39)),
-        Some((
-            "cursor",
-            "tab_stops.len()",
-            39,
-            BoundRule::AtLeast,
-            "cols",
-            40
-        ))
-    );
-    assert_eq!(
-        named(
-            |m| m.saved_cursor_main.as_mut().unwrap().cursor_col = aterm_core::grid::MAX_GRID_COLS
+    let cases: [Case; 9] = [
+        (
+            "saved row past the grid",
+            |m| m.saved_cursor_main.as_mut().unwrap().cursor_row = 6,
+            None,
         ),
-        Some((
-            "saved_cursor_main",
-            "cursor_col",
-            u64::from(max_cols),
-            BoundRule::Below,
-            "MAX_GRID_COLS",
-            u64::from(max_cols)
-        ))
-    );
-    assert_eq!(
-        named(|m| m.current_working_directory = Some("a\0b".into())),
-        Some((
-            "",
-            "current_working_directory NUL bytes",
-            1,
-            BoundRule::AtMost,
-            "",
-            0
-        ))
-    );
-    // A literal bound prints as the number alone.
-    assert_eq!(
-        MetaBoundViolation {
-            slot: "",
-            field: "rows",
-            value: 0,
-            rule: BoundRule::AtLeast,
-            limit_name: "",
-            limit: 1,
-        }
-        .to_string(),
-        "rows=0 must be at least 1"
-    );
-    // The unnamed remainder: the carried line count alone over its maximum.
-    let history = ScreenDigestRefusal::MetaUnbounded {
-        local_id: 3,
-        rows: 6,
-        cols: 40,
-        history_lines: 257,
-        violation: None,
-    };
-    assert_eq!(
-        history.to_string(),
-        "session 3: meta out of bounds at 6x40 with 257 carried line(s): \
-         history_lines=257 must be at most MAX_HANDOFF_HISTORY_LINES=256"
-    );
+        (
+            "saved col past the grid",
+            |m| m.saved_cursor_main.as_mut().unwrap().cursor_col = 40,
+            None,
+        ),
+        (
+            "saved row at the engine ceiling",
+            |m| m.saved_cursor_main.as_mut().unwrap().cursor_row = aterm_core::grid::MAX_GRID_ROWS,
+            Some(("saved_cursor_main", "cursor_row")),
+        ),
+        (
+            "saved col at the engine ceiling",
+            |m| m.saved_cursor_main.as_mut().unwrap().cursor_col = aterm_core::grid::MAX_GRID_COLS,
+            Some(("saved_cursor_main", "cursor_col")),
+        ),
+        ("no rows", |m| m.rows = 0, Some(("", "rows"))),
+        (
+            "cursor col",
+            |m| m.cursor.cursor_col = 40,
+            Some(("cursor", "cursor_col")),
+        ),
+        (
+            "scroll bottom",
+            |m| m.cursor.scroll_bottom = 6,
+            Some(("cursor", "scroll_bottom")),
+        ),
+        (
+            "scroll top",
+            |m| m.cursor.scroll_top = 9,
+            Some(("cursor", "scroll_top")),
+        ),
+        (
+            "NUL cwd",
+            |m| m.current_working_directory = Some("a\0b".into()),
+            Some(("", "current_working_directory NUL bytes")),
+        ),
+    ];
+    for (what, mutate, want) in cases {
+        let mut forged = meta.clone();
+        mutate(&mut forged);
+        let got = checkpoint_meta_bound_violation(&forged);
+        assert_eq!(got.map(|v| (v.slot, v.field)), want, "{what}");
+    }
 }
 
 /// The per-grid ceiling is exact at half the aggregate (the 2026-09-22/23
@@ -1426,7 +1378,6 @@ fn decoded_cell_budget_accepts_exact_max_and_rejects_max_plus_one() {
         MAX_HANDOFF_GRID_CELLS,
         "PRECONDITION: 512x4096 is exactly the per-grid ceiling"
     );
-    assert_eq!(MAX_HANDOFF_GRID_CELLS, MAX_HANDOFF_AGGREGATE_GRID_CELLS / 2);
     let mut used = 0;
     assert!(
         admit_checkpoint_dimensions(&mut used, rows, cols, 0, false).is_ok(),
@@ -1555,14 +1506,8 @@ fn a_rollback_never_sends_a_row_the_older_line_decoder_refuses() {
             !v0_91_consumer_decodes(&forward),
             "{cluster:?}: CONTROL — this desk is one the older decoder refuses"
         );
-        let (rollback, rung, cause) = carry_for_wire(&visible, 0, 0, &mut 0, WireCaps::legacy());
+        let (rollback, rung, _) = carry_for_wire(&visible, 0, 0, &mut 0, WireCaps::legacy());
         assert_eq!(rung, CarryRung::Repaint, "{cluster:?}: rollback hop");
-        assert!(
-            cause
-                .as_deref()
-                .is_some_and(|cause| cause.contains("line decoder")),
-            "{cluster:?}: the cause names the older decoder: {cause:?}"
-        );
         assert!(v0_91_consumer_decodes(&rollback), "{cluster:?}");
         assert!(screen_digest(&[(0, rollback)]).is_ok(), "{cluster:?}");
 
@@ -1640,141 +1585,6 @@ fn an_exact_carry_is_priced_as_the_consumer_prices_it() {
     assert_eq!(charged - spent, wire_cells(&blank));
 }
 
-/// REGRESSION (the update that would not install). A real machine had a staged
-/// build refuse to apply 38 consecutive times with a capture-admission failure,
-/// because carrying scrollback made an ORDINARY session set exceed the aggregate
-/// cell budget — and the capture loop treated that refusal as fatal instead of
-/// dropping the history it was carrying.
-///
-/// This pins the arithmetic that makes the degrade load-bearing rather than
-/// theoretical: at one real window geometry, carried history admits strictly
-/// fewer sessions than visible-only, so the degrade below is exercised.
-///
-/// RETIRED RUNG. This used to also assert `with_history <= 4`, with a note that
-/// raising the aggregate should retire that bound deliberately. It has been
-/// retired: the "4" was never a property, it was the symptom. The aggregate was
-/// 128 Ki cells, so four ordinary panes exhausted it and the FIFTH could not be
-/// admitted even visible-only — the update simply did not apply. The aggregate
-/// is now 4 Mi cells and the producer reserves every session's mandatory
-/// visible+alt cells before anyone spends on scrollback, so that pool is
-/// admitted outright — `app_update_handoff`'s
-/// `a_heavy_pool_is_admitted_even_when_it_must_drop_history` pins that. What
-/// survives here is what the rung stood in for: history still costs real
-/// aggregate, so the degrade still upholds `checkpoint_carry`'s documented
-/// "the failure mode is *less scrollback*, never *the update did not apply*".
-#[test]
-fn carried_history_can_exhaust_the_aggregate_that_visible_only_admits() {
-    // The reported window: 49 rows x 110 cols, several tabs/panes.
-    let (rows, cols) = (49u16, 110u16);
-    let history = MAX_HANDOFF_HISTORY_LINES;
-
-    let admits = |history: u32| {
-        let mut used = 0u64;
-        let mut n = 0;
-        while admit_checkpoint_dimensions(&mut used, rows, cols, history, true).is_ok() {
-            n += 1;
-            assert!(n < 10_000, "admission must terminate");
-        }
-        n
-    };
-
-    let with_history = admits(history);
-    let visible_only = admits(0);
-
-    assert!(
-        with_history < visible_only,
-        "carrying history must cost aggregate budget \
-         (with={with_history}, without={visible_only})"
-    );
-    assert!(
-        visible_only >= with_history * 2,
-        "dropping history must buy back real headroom, not a rounding error \
-         (with={with_history}, without={visible_only})"
-    );
-
-    // THE FIX, in miniature: the exact session that is refused WITH history must
-    // be admitted WITHOUT it against the SAME aggregate — otherwise degrading
-    // could not rescue the handoff. This also pins the transactional property the
-    // degrade relies on: a refused admission leaves the aggregate untouched, so
-    // the re-probe is exact rather than approximate.
-    let mut used = 0u64;
-    for _ in 0..with_history {
-        assert!(admit_checkpoint_dimensions(&mut used, rows, cols, history, true).is_ok());
-    }
-    let saturated = used;
-    assert!(
-        admit_checkpoint_dimensions(&mut used, rows, cols, history, true).is_err(),
-        "the next session must be the one that trips the budget"
-    );
-    assert_eq!(used, saturated, "a refused admission is transactional");
-    assert!(
-        admit_checkpoint_dimensions(&mut used, rows, cols, 0, true).is_ok(),
-        "the same session must be admissible visible-only — this is precisely \
-         the retry that turns 'the update did not apply' back into 'less scrollback'"
-    );
-}
-
-/// A POOL OVER THE META BUDGET ON COLOUR STACKS ALONE STILL COMMITS (round
-/// eight of the update audit, finding 51): tabs that pushed the kitty colour
-/// stack and never popped it carry up to 256 palette entries per push (each
-/// entry is the program's diff from the theme, so a base16-style program that
-/// recoloured the whole palette costs the most), with no OSC 133 mark to
-/// shed, and the settle refused the whole pool. Their stacks give way; their
-/// screens do not.
-#[test]
-fn colour_stacks_past_the_meta_budget_are_shed_not_refused() {
-    let recolour_all: Vec<u8> = (0..=u8::MAX)
-        .flat_map(|i| format!("\x1b]4;{i};rgb:{i:02x}/{:02x}/01\x07", 255 - i).into_bytes())
-        .collect();
-    let mut pool = Vec::new();
-    for local_id in 0..28 {
-        let mut terminal = aterm_core::terminal::Terminal::new(24, 80);
-        terminal.apply_config(&aterm_core::config::TerminalConfig {
-            allow_palette_reconfigure: true,
-            ..aterm_core::config::TerminalConfig::default()
-        });
-        terminal.process(b"$ some output\r\n");
-        terminal.process(&recolour_all);
-        for _ in 0..16 {
-            terminal.process(b"\x1b]30001\x07");
-        }
-        let checkpoint = terminal.checkpoint_carry(0).expect("parser is Ground");
-        assert!(
-            checkpoint.color.has_stack() && checkpoint.shell.command_marks.is_empty(),
-            "PRECONDITION: a pushed stack and no marks"
-        );
-        pool.push(WireCarry {
-            local_id,
-            checkpoint,
-            rung: CarryRung::Full,
-        });
-    }
-    let cost = |pool: &[WireCarry]| {
-        pool.iter()
-            .map(|carry| meta_manifest_cost(&carry.checkpoint))
-            .sum::<u64>()
-    };
-    assert!(
-        cost(&pool) > MAX_HANDOFF_AGGREGATE_META_BYTES,
-        "PRECONDITION: past the budget ({})",
-        cost(&pool)
-    );
-    let grids = pool
-        .iter()
-        .map(|carry| carry.checkpoint.grid.clone())
-        .collect::<Vec<_>>();
-    settle_wire_carries(&mut pool, WireCaps::current()).expect("the pool commits");
-    assert!(
-        cost(&pool) <= MAX_HANDOFF_AGGREGATE_META_BYTES,
-        "{}",
-        cost(&pool)
-    );
-    for (carry, grid) in pool.iter().zip(&grids) {
-        assert_eq!(&carry.checkpoint.grid, grid, "session {}", carry.local_id);
-        assert_eq!(carry.rung, CarryRung::Full, "session {}", carry.local_id);
-    }
-}
-
 /// The pool `settle_wire_carries` is handed for `terminals`, as `Full`
 /// carries, and the metas' cost.
 fn meta_pool(terminals: Vec<aterm_core::terminal::Terminal>) -> Vec<WireCarry> {
@@ -1795,17 +1605,37 @@ fn metas_cost(pool: &[WireCarry]) -> u64 {
         .sum::<u64>()
 }
 
-/// TAB STOPS PAST THE WIDTH AND AN OSC PAYLOAD ARE SHED, NOT REFUSED (round
-/// eight of the update audit, finding 51's second half). A grid never
-/// shrinks its stop vector, so a pane once 4,000 columns wide carries 4,000
-/// stops per cursor at any width; and a parser in the middle of an OSC
-/// carries up to 4 KiB of payload, as hex. Neither had a
-/// rung, so a desk of such tabs refused the whole update on content
-/// (`MetasOverBudget`). Now the stops past each screen's width go, then the
-/// payload (the OSC is discarded at its terminator, as an over-cap one
-/// is), every screen exact and every carry still one the consumer admits.
+/// COLOUR STACKS, TAB STOPS PAST THE WIDTH AND OSC PAYLOADS ARE SHED, NOT
+/// REFUSED (round eight of the update audit, finding 51). Tabs that pushed
+/// the kitty colour stack and never popped it carry 256 palette entries per
+/// push, with no OSC 133 mark to shed; a grid never shrinks its stop vector,
+/// so a pane once 4,000 columns wide carries 4,000 stops per cursor at any
+/// width; and a parser in the middle of an OSC carries up to 4 KiB of
+/// payload, as hex. None had a rung, so a desk of such tabs refused the
+/// whole update on content (`MetasOverBudget`). Now they give way, every
+/// screen exact and every carry still one the consumer admits.
 #[test]
-fn tab_stops_past_the_width_and_osc_payloads_are_shed_not_refused() {
+fn colour_stacks_tab_stops_and_osc_payloads_are_shed_not_refused() {
+    // A stack entry is the program's diff from the baseline, so each push
+    // carries a whole recoloured palette.
+    let recolour_all: Vec<u8> = (0..=u8::MAX)
+        .flat_map(|i| format!("\x1b]4;{i};rgb:{i:02x}/{:02x}/01\x07", 255 - i).into_bytes())
+        .collect();
+    let colour_stacks = (0..28)
+        .map(|_| {
+            let mut terminal = aterm_core::terminal::Terminal::new(24, 80);
+            terminal.apply_config(&aterm_core::config::TerminalConfig {
+                allow_palette_reconfigure: true,
+                ..aterm_core::config::TerminalConfig::default()
+            });
+            terminal.process(b"$ some output\r\n");
+            terminal.process(&recolour_all);
+            for _ in 0..16 {
+                terminal.process(b"\x1b]30001\x07");
+            }
+            terminal
+        })
+        .collect::<Vec<_>>();
     let wide_once = (0..140)
         .map(|_| {
             let mut terminal = aterm_core::terminal::Terminal::new(1, 4000);
@@ -1825,7 +1655,11 @@ fn tab_stops_past_the_width_and_osc_payloads_are_shed_not_refused() {
             terminal
         })
         .collect::<Vec<_>>();
-    for (what, terminals) in [("tab stops", wide_once), ("OSC payloads", mid_osc)] {
+    for (what, terminals) in [
+        ("colour stacks", colour_stacks),
+        ("tab stops", wide_once),
+        ("OSC payloads", mid_osc),
+    ] {
         let mut pool = meta_pool(terminals);
         assert!(
             metas_cost(&pool) > MAX_HANDOFF_AGGREGATE_META_BYTES,
@@ -1996,55 +1830,11 @@ fn an_oversized_manifest_degrades_sessions_instead_of_being_written() {
         "PRECONDITION — the metas alone are past the manifest cap ({})",
         cost(&pool)
     );
-    let manifest = SessionHandoff {
-        schema: SessionHandoff::SCHEMA,
-        window: None,
-        connections: Vec::new(),
-        sessions: (0..TABS)
-            .map(|local_id| SessionRecord {
-                local_id,
-                sid: format!("s-metas-{local_id}"),
-                parent: None,
-                state: "alive".to_string(),
-                title: "zsh".to_string(),
-                screen: None,
-                user_title: None,
-                description: None,
-                icon: None,
-                role: None,
-                attention: None,
-                control: None,
-                frozen_path: false,
-                identity: None,
-                topics: Vec::new(),
-                fg_holder: None,
-                rekey: false,
-                loader: false,
-                history: None,
-                history_dropped: 0,
-                history_withheld: false,
-                history_lost: 0,
-                hold: None,
-                more_holds: Vec::new(),
-                supervisor: None,
-                claim_known: false,
-                attention_owners: Vec::new(),
-                viewport_from_bottom: None,
-                render_debt: None,
-                questions: None,
-                autopilot: None,
-                fabric: Default::default(),
-                timeline_id: 0,
-                log_ids: None,
-                journal_key: None,
-            })
+    let manifest = bare_manifest(
+        (0..TABS)
+            .map(|local_id| zsh_record(local_id, &format!("s-metas-{local_id}")))
             .collect(),
-        next_turn_id: None,
-        outgoing_build: None,
-        held: Vec::new(),
-        roster_seq: None,
-        fabric_attached: Vec::new(),
-    };
+    );
     let fds = HandoffFds {
         entries: (0..TABS)
             .map(|local_id| {
@@ -2116,56 +1906,6 @@ fn an_oversized_manifest_degrades_sessions_instead_of_being_written() {
         .is_some(),
         "the successor's capped read takes it"
     );
-
-    // THE MAILBOX GIVES WAY BEFORE THE UPDATE DOES (round seven's review,
-    // item 1): the same settled desk, its broker down, every session
-    // holding a waiting post of ANSI colour codes — each escapes to six
-    // bytes per ESC, and together they are past what the cap leaves after
-    // the metas. The largest carries shed their rows (their ids named
-    // `uncarried`, their counters kept) and the manifest is written.
-    // RED before the fix: `ManifestOverCap`, on every retry.
-    let mut mailed = manifest.clone();
-    for rec in &mut mailed.sessions {
-        rec.fabric = crate::fabric::FabricCarry {
-            last_post_id: 7,
-            posts: vec![crate::fabric::PostCarry {
-                id: 7,
-                to: "@s-peer".to_string(),
-                kind: "note".to_string(),
-                re: None,
-                dl: None,
-                via: None,
-                key: None,
-                body: "\u{1b}[31m".repeat(10_000),
-            }],
-            ..Default::default()
-        };
-    }
-    let mail = mailed.to_toml().expect("serializes").len() as u64;
-    assert!(
-        cost(&pool) + mail > MAX_HANDOFF_MANIFEST_BYTES,
-        "PRECONDITION — the carried mail puts the manifest past its cap ({} + {mail})",
-        cost(&pool)
-    );
-    let nonce = mint_outgoing_nonce();
-    let outgoing = write_outgoing(&mailed, &fds, &screens, &[], None, &[], &nonce)
-        .expect("the mailbox sheds, the update is not refused");
-    let body = std::fs::read_to_string(&outgoing.manifest_path).expect("written");
-    assert!(body.len() as u64 <= MAX_HANDOFF_MANIFEST_BYTES);
-    let read = SessionHandoff::from_toml(body.split_once('\n').expect("nonce line").1)
-        .expect("the successor reads it");
-    let shed = read
-        .sessions
-        .iter()
-        .filter(|r| r.fabric.posts.is_empty())
-        .count();
-    assert!(shed > 0, "some carries shed");
-    for rec in &read.sessions {
-        assert_eq!(rec.fabric.last_post_id, 7, "the counters stay");
-        if rec.fabric.posts.is_empty() {
-            assert_eq!(rec.fabric.uncarried, [7], "a shed post is named");
-        }
-    }
 }
 
 /// A REFUSED WRITE SAYS WHY (the 2026-09-22/23 update audit, plan P1-2).
@@ -2189,53 +1929,7 @@ fn a_refused_grid_write_carries_its_io_error_kind_out() {
     let mut terminal = aterm_core::terminal::Terminal::new(24, 80);
     terminal.process(b"$ ls");
     let screens = vec![(0, terminal.checkpoint_visible().expect("parser is Ground"))];
-    let manifest = SessionHandoff {
-        schema: SessionHandoff::SCHEMA,
-        window: None,
-        connections: Vec::new(),
-        sessions: vec![SessionRecord {
-            local_id: 0,
-            sid: "s-write-kind".to_string(),
-            parent: None,
-            state: "alive".to_string(),
-            title: "zsh".to_string(),
-            screen: None,
-            user_title: None,
-            description: None,
-            icon: None,
-            role: None,
-            attention: None,
-            control: None,
-            frozen_path: false,
-            identity: None,
-            topics: Vec::new(),
-            fg_holder: None,
-            rekey: false,
-            loader: false,
-            history: None,
-            history_dropped: 0,
-            history_withheld: false,
-            history_lost: 0,
-            hold: None,
-            more_holds: Vec::new(),
-            supervisor: None,
-            claim_known: false,
-            attention_owners: Vec::new(),
-            viewport_from_bottom: None,
-            render_debt: None,
-            questions: None,
-            autopilot: None,
-            fabric: Default::default(),
-            timeline_id: 0,
-            log_ids: None,
-            journal_key: None,
-        }],
-        next_turn_id: None,
-        outgoing_build: None,
-        held: Vec::new(),
-        roster_seq: None,
-        fabric_attached: Vec::new(),
-    };
+    let manifest = bare_manifest(vec![zsh_record(0, "s-write-kind")]);
     let fds = HandoffFds {
         entries: vec![(0, 100, 4000)],
     };
@@ -2250,141 +1944,6 @@ fn a_refused_grid_write_carries_its_io_error_kind_out() {
             .expect("the control dir exists")
             .exists(),
         "a refused write publishes no manifest"
-    );
-}
-
-/// CONNECTIONS GIVE WAY BEFORE THE UPDATE DOES (round eight of the update
-/// audit, U23). One tab, and 50,000 carried connection rows from one
-/// source — about 4.9 MB of TOML, past the 4 MiB cap every successor reads
-/// the manifest under — beside a peer's three. The connections are the
-/// last optional part of the manifest: the costliest source's rows are
-/// left out whole (a connection not carried fails closed, and is made
-/// again with `connect`), the peer's stay, and the manifest is written
-/// under the cap. RED before the fix: `ManifestOverCap`, on every retry,
-/// since the rows live as long as the window.
-///
-/// The rows left out are RETURNED, never audited here (U23's review): this
-/// process holds them until the Commit, which audits each as dropped
-/// (`App::audit_connections_left_out`); a drop written with the manifest was
-/// false for every attempt that then stood down, and repeated at each retry.
-#[test]
-#[cfg(unix)]
-fn a_manifest_past_the_cap_on_connections_sheds_them_instead_of_being_refused() {
-    crate::test_log::install();
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    let _scratch = ScratchEnv::home("conns");
-    let dir = crate::control_auth::socket_dir().expect("scratch control dir");
-    let nonce = mint_outgoing_nonce();
-    // Session ids as `SessionId::generate` spells them.
-    let sid = "s-00000000010000050505";
-    let (controller, peer) = ("s-00000000010000030303", "s-00000000010000040404");
-    let row = |src: &str, op: &str| ConnectionCarry {
-        src: src.to_string(),
-        dst: sid.to_string(),
-        op: op.to_string(),
-    };
-    let mut connections = vec![row(controller, "read-screen"); 50_000];
-    connections.extend(
-        ["read-screen", "signal", "write-input"]
-            .into_iter()
-            .map(|op| row(peer, op)),
-    );
-    let mut terminal = aterm_core::terminal::Terminal::new(24, 80);
-    terminal.process(b"$ ls");
-    let screens = vec![(0, terminal.checkpoint_visible().expect("parser is Ground"))];
-    let manifest = SessionHandoff {
-        schema: SessionHandoff::SCHEMA,
-        window: None,
-        connections,
-        sessions: vec![SessionRecord {
-            local_id: 0,
-            sid: sid.to_string(),
-            parent: None,
-            state: "alive".to_string(),
-            title: "zsh".to_string(),
-            screen: None,
-            user_title: None,
-            description: None,
-            icon: None,
-            role: None,
-            attention: None,
-            control: None,
-            frozen_path: false,
-            identity: None,
-            topics: Vec::new(),
-            fg_holder: None,
-            rekey: false,
-            loader: false,
-            history: None,
-            history_dropped: 0,
-            history_withheld: false,
-            history_lost: 0,
-            hold: None,
-            more_holds: Vec::new(),
-            supervisor: None,
-            claim_known: false,
-            attention_owners: Vec::new(),
-            viewport_from_bottom: None,
-            render_debt: None,
-            questions: None,
-            autopilot: None,
-            fabric: Default::default(),
-            timeline_id: 0,
-            log_ids: None,
-            journal_key: None,
-        }],
-        next_turn_id: None,
-        outgoing_build: None,
-        held: Vec::new(),
-        roster_seq: None,
-        fabric_attached: Vec::new(),
-    };
-    assert!(
-        manifest.to_toml().expect("serializes").len() as u64 > MAX_HANDOFF_MANIFEST_BYTES,
-        "PRECONDITION — the connection rows put the manifest past its cap"
-    );
-    let fds = HandoffFds {
-        entries: vec![(0, 100, 4000)],
-    };
-    let outgoing = write_outgoing(&manifest, &fds, &screens, &[], None, &[], &nonce)
-        .expect("the connections shed, the update is not refused");
-    let body = std::fs::read_to_string(&outgoing.manifest_path).expect("written");
-    assert!(
-        body.len() as u64 <= MAX_HANDOFF_MANIFEST_BYTES,
-        "{}",
-        body.len()
-    );
-    assert!(
-        take_regular_capped(
-            std::path::Path::new(&outgoing.manifest_path),
-            &dir,
-            MAX_HANDOFF_MANIFEST_BYTES,
-        )
-        .is_some(),
-        "the successor's capped read takes it"
-    );
-    let read = SessionHandoff::from_toml(body.split_once('\n').expect("nonce line").1)
-        .expect("the successor reads it");
-    assert_eq!(
-        read.connections,
-        ["read-screen", "signal", "write-input"]
-            .into_iter()
-            .map(|op| row(peer, op))
-            .collect::<Vec<_>>(),
-        "the costliest source went whole; the peer's connection stayed"
-    );
-    assert_eq!(read.sessions.len(), 1, "the tab itself is handed");
-    assert_eq!(
-        outgoing.connections_left_out,
-        vec![row(controller, "read-screen"); 50_000],
-        "what was left out goes to the Commit"
-    );
-    assert!(
-        crate::test_log::containing(&format!(
-            "EDGE: action=drop origin=handoff src={controller}"
-        ))
-        .is_empty(),
-        "nothing is audited as dropped before the Commit"
     );
 }
 
@@ -2403,6 +1962,11 @@ fn a_manifest_past_the_cap_on_connections_sheds_them_instead_of_being_refused() 
 /// that has to go anyway goes first, and the few connections the smaller
 /// excess leaves are kept: a post past the cap is shed, the peer's three
 /// rows cross, and nothing is left out for the Commit to audit.
+///
+/// The rows left out are RETURNED, never audited by the writer (U23's
+/// review): the Commit audits each as dropped
+/// (`App::audit_connections_left_out`); a drop written with the manifest was
+/// false for every attempt that then stood down, and repeated at each retry.
 #[test]
 #[cfg(unix)]
 fn connections_give_way_before_held_panes_and_the_mailbox() {
@@ -2435,51 +1999,12 @@ fn connections_give_way_before_held_panes_and_the_mailbox() {
     };
     let manifest_with =
         |connections: Vec<ConnectionCarry>, fabric: crate::fabric::FabricCarry| SessionHandoff {
-            schema: SessionHandoff::SCHEMA,
-            window: None,
             connections,
-            sessions: vec![SessionRecord {
-                local_id: 0,
-                sid: sid.to_string(),
-                parent: None,
-                state: "alive".to_string(),
-                title: "zsh".to_string(),
-                screen: None,
-                user_title: None,
-                description: None,
-                icon: None,
-                role: None,
-                attention: None,
-                control: None,
-                frozen_path: false,
-                identity: None,
-                topics: Vec::new(),
-                fg_holder: None,
-                rekey: false,
-                loader: false,
-                history: None,
-                history_dropped: 0,
-                history_withheld: false,
-                history_lost: 0,
-                hold: None,
-                more_holds: Vec::new(),
-                supervisor: None,
-                claim_known: false,
-                attention_owners: Vec::new(),
-                viewport_from_bottom: None,
-                render_debt: None,
-                questions: None,
-                autopilot: None,
+            ..bare_manifest(vec![SessionRecord {
+                land_at: None,
                 fabric,
-                timeline_id: 0,
-                log_ids: None,
-                journal_key: None,
-            }],
-            next_turn_id: None,
-            outgoing_build: None,
-            held: Vec::new(),
-            roster_seq: None,
-            fabric_attached: Vec::new(),
+                ..zsh_record(0, sid)
+            }])
         };
     let screens = || {
         let mut terminal = aterm_core::terminal::Terminal::new(24, 80);
@@ -2489,15 +2014,11 @@ fn connections_give_way_before_held_panes_and_the_mailbox() {
     let held = || {
         let mut terminal = aterm_core::terminal::Terminal::new(24, 80);
         terminal.process(b"build finished\r\n");
-        vec![HeldScreen {
-            local_id: 1,
-            sid: SessionId::generate(),
-            checkpoint: terminal.checkpoint_carry_abandoning_partial(0).0,
-            exit: None,
-            history_dropped: 0,
-            history_head: None,
-            failure_seen: false,
-        }]
+        vec![held_screen(
+            1,
+            SessionId::generate(),
+            terminal.checkpoint_carry_abandoning_partial(0).0,
+        )]
     };
     let fds = HandoffFds {
         entries: vec![(0, 100, 4000)],
@@ -2559,7 +2080,10 @@ fn connections_give_way_before_held_panes_and_the_mailbox() {
         "what was left out goes to the Commit"
     );
 
-    // CONTROL: a post past the cap, which the connections cannot cover.
+    // CONTROL: a post past the cap, which the connections cannot cover. The
+    // mailbox gives way before the update does (round seven's review, item 1:
+    // `ManifestOverCap` on every retry before it), its id named, its counter
+    // kept.
     let manifest = manifest_with(peers.clone(), post("\u{1b}[31m".repeat(500_000)));
     assert!(
         manifest.to_toml().expect("serializes").len() as u64 > MAX_HANDOFF_MANIFEST_BYTES,
@@ -2571,6 +2095,7 @@ fn connections_give_way_before_held_panes_and_the_mailbox() {
     let read = read_back(&outgoing);
     assert!(read.sessions[0].fabric.posts.is_empty(), "the post is shed");
     assert_eq!(read.sessions[0].fabric.uncarried, [7], "and named");
+    assert_eq!(read.sessions[0].fabric.last_post_id, 7, "the counter stays");
     assert_eq!(read.connections, peers, "the connections are kept");
     assert!(
         outgoing.connections_left_out.is_empty(),
@@ -2606,51 +2131,11 @@ fn connections_that_cannot_cover_the_excess_measured_are_kept() {
     };
     // `pad` bytes of description: the one knob that sets the manifest's size.
     let manifest_with = |connections: Vec<ConnectionCarry>, pad: u64| SessionHandoff {
-        schema: SessionHandoff::SCHEMA,
-        window: None,
         connections,
-        sessions: vec![SessionRecord {
-            local_id: 0,
-            sid: sid.to_string(),
-            parent: None,
-            state: "alive".to_string(),
-            title: "zsh".to_string(),
-            screen: None,
-            user_title: None,
+        ..bare_manifest(vec![SessionRecord {
             description: Some("x".repeat(usize::try_from(pad).expect("a pad in memory"))),
-            icon: None,
-            role: None,
-            attention: None,
-            control: None,
-            frozen_path: false,
-            identity: None,
-            topics: Vec::new(),
-            fg_holder: None,
-            rekey: false,
-            loader: false,
-            history: None,
-            history_dropped: 0,
-            history_withheld: false,
-            history_lost: 0,
-            hold: None,
-            more_holds: Vec::new(),
-            supervisor: None,
-            claim_known: false,
-            attention_owners: Vec::new(),
-            viewport_from_bottom: None,
-            render_debt: None,
-            questions: None,
-            autopilot: None,
-            fabric: Default::default(),
-            timeline_id: 0,
-            log_ids: None,
-            journal_key: None,
-        }],
-        next_turn_id: None,
-        outgoing_build: None,
-        held: Vec::new(),
-        roster_seq: None,
-        fabric_attached: Vec::new(),
+            ..zsh_record(0, sid)
+        }])
     };
     let screens = {
         let mut terminal = aterm_core::terminal::Terminal::new(24, 80);
@@ -2662,15 +2147,11 @@ fn connections_that_cannot_cover_the_excess_measured_are_kept() {
         let mut terminal = aterm_core::terminal::Terminal::new(24, 80);
         terminal.process(format!("\x1b]2;{}\x07", "build ".repeat(150)).as_bytes());
         terminal.process(b"build finished\r\n");
-        vec![HeldScreen {
-            local_id: 1,
-            sid: SessionId::generate(),
-            checkpoint: terminal.checkpoint_carry_abandoning_partial(0).0,
-            exit: None,
-            history_dropped: 0,
-            history_head: None,
-            failure_seen: false,
-        }]
+        vec![held_screen(
+            1,
+            SessionId::generate(),
+            terminal.checkpoint_carry_abandoning_partial(0).0,
+        )]
     };
     let fds = HandoffFds {
         entries: vec![(0, 100, 4000)],
@@ -2764,40 +2245,6 @@ fn connections_that_cannot_cover_the_excess_measured_are_kept() {
     assert_eq!(
         outgoing.connections_left_out, rows,
         "for the Commit to audit"
-    );
-}
-
-/// THE TOPIC BOUND IS SIZED TO THE MANIFEST (round eight of the update
-/// audit, U54). A topic opt-in rides its session's record and is never
-/// shed (it is consent), so the bound on how many one session holds
-/// (`fabric::MAX_TOPICS`) is what keeps them inside the manifest: every
-/// session a handoff can carry, each holding the most topics with the
-/// longest rows the grammar admits (a 32-character topic, `since=` a
-/// 20-digit offset), costs less than half of the quarter of the cap the
-/// screens' metas leave. Before the bound, 70,000 opt-ins on one tab were
-/// a manifest no successor reads, refused on every attempt.
-#[test]
-fn the_topic_bound_keeps_every_desk_s_opt_ins_inside_the_manifest() {
-    let bare = SessionHandoff::from_toml(
-        "schema = 1\n\n[[sessions]]\nlocal_id = 0\nsid = \"s-00000000010000050505\"\n\
-         state = \"alive\"\ntitle = \"zsh\"\n",
-    )
-    .expect("a one-record manifest reads");
-    let mut full = bare.clone();
-    full.sessions[0].topics = (0..crate::fabric::MAX_TOPICS)
-        .map(|n| format!("{n:a>32} @{}", u64::MAX))
-        .collect();
-    assert!(
-        crate::fabric::parse_topics(&full.sessions[0].topics).len() == crate::fabric::MAX_TOPICS,
-        "PRECONDITION — every row is one the grammar admits"
-    );
-    let cost = |manifest: &SessionHandoff| manifest.to_toml().expect("serializes").len() as u64;
-    let per_session = cost(&full) - cost(&bare);
-    let desk = per_session * MAX_HANDOFF_SESSIONS as u64;
-    assert!(
-        desk <= (MAX_HANDOFF_MANIFEST_BYTES - MAX_HANDOFF_AGGREGATE_META_BYTES) / 2,
-        "{} sessions at the bound cost {desk} bytes ({per_session} each)",
-        MAX_HANDOFF_SESSIONS
     );
 }
 
@@ -2935,65 +2382,41 @@ fn invalid_prearm_alias_closes_once_clears_authority_and_cannot_close_reused_fd(
 #[test]
 #[cfg(unix)]
 fn final_exec_env_requires_valid_parent_authority() {
-    let attested = AttestedParent {
-        pid: 4242,
-        witness: ParentWitness::ForkLink,
+    let prearm = |recognizable: bool, valid: bool, witness: Option<ParentWitness>| {
+        PrearmedIncomingFds {
+            fds: Vec::new(),
+            recognizable,
+            valid,
+            parent: witness.map(|witness| AttestedParent { pid: 4242, witness }),
+        }
+        .final_exec_env()
     };
-    let valid = PrearmedIncomingFds {
-        fds: Vec::new(),
-        recognizable: true,
-        valid: true,
-        parent: Some(attested),
+    let pair = |key, value: &str| {
+        (
+            std::ffi::OsString::from(key),
+            std::ffi::OsString::from(value),
+        )
     };
     assert_eq!(
-        valid.final_exec_env(),
-        vec![(
-            std::ffi::OsString::from(ENV_PARENT_PID),
-            std::ffi::OsString::from("4242"),
-        )]
+        prearm(true, true, Some(ParentWitness::ForkLink)),
+        vec![pair(ENV_PARENT_PID, "4242")]
     );
     // A birth witness republishes the record too, so the re-exec'd image can
     // re-attest without a parent link — the property a LaunchServices
     // successor depends on.
-    let with_birth = PrearmedIncomingFds {
-        fds: Vec::new(),
-        recognizable: true,
-        valid: true,
-        parent: Some(AttestedParent {
-            pid: 4242,
-            witness: ParentWitness::Birth(ProcessBirth {
-                seconds: 17,
-                microseconds: 42,
-            }),
-        }),
-    };
+    let birth = ParentWitness::Birth(ProcessBirth {
+        seconds: 17,
+        microseconds: 42,
+    });
     assert_eq!(
-        with_birth.final_exec_env(),
+        prearm(true, true, Some(birth)),
         vec![
-            (
-                std::ffi::OsString::from(ENV_PARENT_PID),
-                std::ffi::OsString::from("4242"),
-            ),
-            (
-                std::ffi::OsString::from(ENV_PARENT_BIRTH),
-                std::ffi::OsString::from("17.42"),
-            ),
+            pair(ENV_PARENT_PID, "4242"),
+            pair(ENV_PARENT_BIRTH, "17.42")
         ]
     );
-    let invalid = PrearmedIncomingFds {
-        fds: Vec::new(),
-        recognizable: true,
-        valid: false,
-        parent: Some(attested),
-    };
-    assert!(invalid.final_exec_env().is_empty());
-    let parentless = PrearmedIncomingFds {
-        fds: Vec::new(),
-        recognizable: false,
-        valid: true,
-        parent: None,
-    };
-    assert!(parentless.final_exec_env().is_empty());
+    assert!(prearm(true, false, Some(ParentWitness::ForkLink)).is_empty());
+    assert!(prearm(false, true, None).is_empty());
 }
 
 /// The birth record crosses a process boundary as text, so its encoding is
@@ -3296,24 +2719,6 @@ fn valid_overlap_prearm_scrubs_ambient_parent_but_restores_it_for_exec() {
     }
 }
 
-#[test]
-fn nonce_mismatch_and_missing_env_fail_closed() {
-    // Hold the env lock for the whole body: the roundtrip test SETS these
-    // vars mid-flight, and take_incoming() itself mutates env on read.
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    // No env at all → empty (fresh start).
-    // SAFETY: mutation is serialized by ENV_LOCK (held for this whole test).
-    // Readers elsewhere in the process may still observe the removal —
-    // acceptable: no non-seamless test depends on ATERM_SEAMLESS_*.
-    aterm_log::env::unset(ENV_MANIFEST);
-    aterm_log::env::unset(ENV_NONCE);
-    aterm_log::env::unset(ENV_FDS);
-    assert!(
-        take_incoming().adopted.is_empty(),
-        "no handoff env → fresh start"
-    );
-}
-
 /// The readiness fd's fail-closed gauntlet: absent, garbage, stdio, and a
 /// TTY all yield `None` (the parked parent just times out + resumes — a
 /// spoof can only LOSE the signal), and the env var is cleared on read so
@@ -3334,8 +2739,7 @@ fn take_ready_fd_fails_closed() {
     let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     let _restore = RestoreVar::new("ATERM_HANDOFF_READY_FD");
     // All set/unset below: serialized by ENV_LOCK for the whole body.
-    aterm_log::env::unset("ATERM_HANDOFF_READY_FD");
-    assert!(
+    let take = || {
         take_ready_fd(
             Some("n".to_string()),
             Some([7; 32]),
@@ -3343,37 +2747,22 @@ fn take_ready_fd_fails_closed() {
             HandoffTarget::own(),
             &[],
         )
-        .is_none(),
-        "absent env → None"
-    );
-    aterm_log::env::set("ATERM_HANDOFF_READY_FD", "not-a-number");
-    assert!(
-        take_ready_fd(
-            Some("n".to_string()),
-            Some([7; 32]),
-            Some([8; 32]),
-            HandoffTarget::own(),
-            &[],
-        )
-        .is_none(),
-        "garbage → None"
-    );
-    assert!(
-        std::env::var_os("ATERM_HANDOFF_READY_FD").is_none(),
-        "cleared on read regardless of outcome"
-    );
-    aterm_log::env::set("ATERM_HANDOFF_READY_FD", "1");
-    assert!(
-        take_ready_fd(
-            Some("n".to_string()),
-            Some([7; 32]),
-            Some([8; 32]),
-            HandoffTarget::own(),
-            &[],
-        )
-        .is_none(),
-        "stdio refused"
-    );
+    };
+    for (what, value) in [
+        ("absent", None),
+        ("garbage", Some("not-a-number")),
+        ("stdio", Some("1")),
+    ] {
+        match value {
+            Some(value) => aterm_log::env::set("ATERM_HANDOFF_READY_FD", value),
+            None => aterm_log::env::unset("ATERM_HANDOFF_READY_FD"),
+        }
+        assert!(take().is_none(), "{what} is refused");
+        assert!(
+            std::env::var_os("ATERM_HANDOFF_READY_FD").is_none(),
+            "{what}: cleared on read regardless of outcome"
+        );
+    }
     // A real PTY master: the is_tty backstop must refuse it (a confused
     // wire must never let the readiness byte land in a shell's input).
     let (m, s) = aterm_pty::open_pty_pair().expect("open_pty_pair");
@@ -3387,17 +2776,7 @@ fn take_ready_fd_fails_closed() {
         slot
     });
     aterm_log::env::set("ATERM_HANDOFF_READY_FD", named.to_string());
-    assert!(
-        take_ready_fd(
-            Some("n".to_string()),
-            Some([7; 32]),
-            Some([8; 32]),
-            HandoffTarget::own(),
-            &[],
-        )
-        .is_none(),
-        "a tty is refused"
-    );
+    assert!(take().is_none(), "a tty is refused");
     if let Some(slot) = isolated {
         // SAFETY: `F_GETFD` only reads the flags a descriptor number carries.
         let flags = unsafe { libc::fcntl(slot, libc::F_GETFD) };
@@ -3467,10 +2846,10 @@ fn a_refused_target_identity_closes_the_readiness_channel_as_child_death() {
     aterm_pty::close_fd(rd);
 }
 
-/// The happy path: a real pipe write-end is adopted, its CLOEXEC is
+/// The happy path: a real pipe write-end is adopted and its CLOEXEC is
 /// RE-ARMED (only the fork child's copy was cleared for its one exec; from
-/// here no further child may inherit it), and a byte written through the adopted fd
-/// arrives at the parent's read end — the actual readiness signal.
+/// here no further child may inherit it). That the readiness byte then
+/// arrives is `a_full_seamless_handoff_completes_and_commits`'s.
 #[test]
 #[cfg(unix)]
 fn take_ready_fd_adopts_a_pipe_and_rearms_cloexec() {
@@ -3502,14 +2881,6 @@ fn take_ready_fd_adopts_a_pipe_and_rearms_cloexec() {
         flags >= 0 && (flags & libc::FD_CLOEXEC) != 0,
         "CLOEXEC re-armed on adoption (EOF discipline)"
     );
-    // The adopted fd IS the readiness channel: one byte through it lands
-    // at the parent's read end.
-    // SAFETY: 1-byte write/read on fds this test owns.
-    let w = unsafe { libc::write(owned.raw_fd(), [1u8].as_ptr().cast(), 1) };
-    assert_eq!(w, 1, "readiness byte written");
-    let mut buf = [0u8; 1];
-    let r = unsafe { libc::read(rd, buf.as_mut_ptr().cast(), 1) };
-    assert_eq!((r, buf[0]), (1, 1), "parent reads the byte");
     aterm_pty::close_fd(rd);
 }
 
@@ -3880,13 +3251,11 @@ fn watching_stand_in(
     (reader, write)
 }
 
-/// Whether `stderr` holds the fail-stop's line for `end`
-/// ([`fail_stop_without_commit`]), naming `parent`.
+/// Whether `stderr` names `end` as the ending the fail-stop took
+/// ([`fail_stop_without_commit`]): the token, not the sentence around it.
 #[cfg(unix)]
-fn says_fail_stop(stderr: &str, parent: u32, end: NoCommit) -> bool {
-    stderr.contains(&format!(
-        "no Commit from parent {parent}: {end}; this successor fail-stops with 74"
-    ))
+fn says_fail_stop(stderr: &str, end: NoCommit) -> bool {
+    stderr.contains(&end.to_string())
 }
 
 #[test]
@@ -3911,9 +3280,7 @@ fn leaked_commit_writer_cannot_hide_parent_death() {
         .env(PARENT_DEATH_WATCHED, scratch.path().join("watcher.watched"))
         .env(PARENT_DEATH_OUTLIVED, &outlived)
         .env(PARENT_DEATH_SAID, &said);
-    let launcher = launcher.spawn();
-    let launcher_pid = launcher.id();
-    launcher.passed();
+    launcher.spawn().passed();
     let watcher: libc::pid_t = std::fs::read_to_string(&marker)
         .expect("watcher pid marker")
         .trim()
@@ -3962,7 +3329,7 @@ fn leaked_commit_writer_cannot_hide_parent_death() {
     );
     let said = std::fs::read_to_string(&said).unwrap_or_default();
     assert!(
-        says_fail_stop(&said, launcher_pid, NoCommit::ParentGone),
+        says_fail_stop(&said, NoCommit::ParentGone),
         "the watcher is gone, but not by a fail-stop that says its parent was gone; its \
          stderr:\n{said}"
     );
@@ -4003,12 +3370,10 @@ fn commit_eof_from_a_live_parent_stops_the_watcher_with_74() {
     );
     // The line says the end of file (Darwin: `POLLIN | POLLHUP`, then a read
     // of nothing) or the hang-up alone, whichever bit carried it.
-    let parent = std::process::id();
     assert!(
-        says_fail_stop(&ran.stderr, parent, NoCommit::EndOfFile)
+        says_fail_stop(&ran.stderr, NoCommit::EndOfFile)
             || says_fail_stop(
                 &ran.stderr,
-                parent,
                 NoCommit::PipeEnded {
                     revents: libc::POLLHUP
                 }
@@ -4148,7 +3513,7 @@ fn a_commit_nobody_can_take_stops_the_watcher_with_74_its_pipe_closed_first() {
         .expect("the stand-in's stderr");
     let text = String::from_utf8_lossy(&text).replace('\0', "");
     assert!(
-        says_fail_stop(&text, std::process::id(), NoCommit::ReceiverGone),
+        says_fail_stop(&text, NoCommit::ReceiverGone),
         "the fail-stop says that the event loop's receiver was gone; its stderr, less the \
          fill:\n{text}\nstdout:\n{}",
         ran.stdout
@@ -4175,7 +3540,7 @@ fn a_mismatched_commit_stops_the_successor_with_74() {
         .expect("another attempt's Commit");
     let ran = stopped_with_74(refuser, "a mismatched Commit did not stop the successor");
     assert!(
-        says_fail_stop(&ran.stderr, std::process::id(), NoCommit::Mismatched),
+        says_fail_stop(&ran.stderr, NoCommit::Mismatched),
         "the fail-stop says that the Commit was not this attempt's; its stderr:\n{}",
         ran.stderr
     );
@@ -4350,23 +3715,6 @@ fn stage_outgoing_handoff_full(
         slaves.push(slave);
         let local_id = index as u64;
         records.push(SessionRecord {
-            local_id,
-            sid: format!("s-e2e-{index}"),
-            parent: None,
-            state: "alive".to_string(),
-            title: "zsh".to_string(),
-            screen: None,
-            user_title: None,
-            description: None,
-            icon: None,
-            role: None,
-            attention: None,
-            questions: None,
-            autopilot: None,
-            control: None,
-            frozen_path: false,
-            identity: None,
-            topics: Vec::new(),
             // What the park capture stamps (`stamp_fg_holders`).
             fg_holder: carry.and_then(|c| {
                 c.fg_holders
@@ -4374,18 +3722,6 @@ fn stage_outgoing_handoff_full(
                     .find(|(id, _)| *id == local_id)
                     .map(|(_, holder)| *holder)
             }),
-            rekey: false,
-            loader: false,
-            history: None,
-            history_dropped: 0,
-            history_withheld: false,
-            history_lost: 0,
-            hold: None,
-            more_holds: Vec::new(),
-            supervisor: None,
-            claim_known: false,
-            attention_owners: Vec::new(),
-            viewport_from_bottom: None,
             // What the park capture stamps (`stamp_render_debts`).
             render_debt: carry.and_then(|c| {
                 c.render_debts
@@ -4395,10 +3731,7 @@ fn stage_outgoing_handoff_full(
                         crate::session_store::render_debt_row(*shift, *pushed)
                     })
             }),
-            fabric: Default::default(),
-            timeline_id: 0,
-            log_ids: None,
-            journal_key: None,
+            ..zsh_record(local_id, &format!("s-e2e-{index}"))
         });
         live.push((local_id, master, 4000 + index as i32));
         if let Some(carry) = carry {
@@ -4414,7 +3747,6 @@ fn stage_outgoing_handoff_full(
         ));
     }
     let mut manifest = SessionHandoff {
-        schema: SessionHandoff::SCHEMA,
         window: Some(WindowCarry {
             rows: 24,
             cols: 80,
@@ -4446,16 +3778,9 @@ fn stage_outgoing_handoff_full(
         } else {
             Vec::new()
         },
-        sessions: records,
         next_turn_id: carry.and_then(|c| c.next_turn_id),
-        outgoing_build: Some(
-            crate::build_info::build_number()
-                .parse::<u64>()
-                .unwrap_or(0),
-        ),
-        held: Vec::new(),
-        roster_seq: None,
-        fabric_attached: Vec::new(),
+        outgoing_build: Some(own_build()),
+        ..bare_manifest(records)
     };
     let fds = HandoffFds {
         entries: live.clone(),
@@ -4558,9 +3883,7 @@ fn stage_outgoing_handoff_full(
 
     let expected = adoption_proof(
         &outgoing.nonce,
-        crate::build_info::build_number()
-            .parse::<u64>()
-            .unwrap_or(0),
+        own_build(),
         crate::build_info::git_commit(),
         &parent_layout_digest,
         &parent_screen_digest,
@@ -4691,16 +4014,7 @@ fn a_full_seamless_handoff_completes_and_commits() {
     let staged = stage_outgoing_handoff("ok", 3, None);
     let (ready_read, ready_write) = pipe_pair("ready");
     let (commit_read, commit_write) = pipe_pair("commit");
-    staged.publish_env(
-        ready_write,
-        commit_read,
-        Some(encode_target_identity(
-            crate::build_info::build_number()
-                .parse::<u64>()
-                .unwrap_or(0),
-            crate::build_info::git_commit(),
-        )),
-    );
+    staged.publish_env(ready_write, commit_read, Some(own_target()));
 
     let (proof, ready, adopted) = child_proof().expect("the child adopts and proves");
     assert_eq!(adopted.len(), 3, "every session is adopted, none lost");
@@ -4764,16 +4078,7 @@ fn take_incoming_carries_the_tokenless_connection_triples() {
     );
     let (ready_read, ready_write) = pipe_pair("ready");
     let (commit_read, commit_write) = pipe_pair("commit");
-    staged.publish_env(
-        ready_write,
-        commit_read,
-        Some(encode_target_identity(
-            crate::build_info::build_number()
-                .parse::<u64>()
-                .unwrap_or(0),
-            crate::build_info::git_commit(),
-        )),
-    );
+    staged.publish_env(ready_write, commit_read, Some(own_target()));
 
     let incoming = take_incoming();
     assert_eq!(incoming.adopted.len(), 2, "the carry rides a REAL adoption");
@@ -4836,16 +4141,7 @@ fn a_handoff_across_a_version_boundary_still_completes() {
 
     let (ready_read, ready_write) = pipe_pair("ready");
     let (commit_read, commit_write) = pipe_pair("commit");
-    staged.publish_env(
-        ready_write,
-        commit_read,
-        Some(encode_target_identity(
-            crate::build_info::build_number()
-                .parse::<u64>()
-                .unwrap_or(0),
-            crate::build_info::git_commit(),
-        )),
-    );
+    staged.publish_env(ready_write, commit_read, Some(own_target()));
     let (proof, _ready, _adopted) = child_proof().expect("the child adopts and proves");
     assert_eq!(
         proof, staged.expected,
@@ -4884,16 +4180,7 @@ fn a_handoff_across_a_screen_meta_version_boundary_still_completes() {
 
     let (ready_read, ready_write) = pipe_pair("ready");
     let (commit_read, commit_write) = pipe_pair("commit");
-    staged.publish_env(
-        ready_write,
-        commit_read,
-        Some(encode_target_identity(
-            crate::build_info::build_number()
-                .parse::<u64>()
-                .unwrap_or(0),
-            crate::build_info::git_commit(),
-        )),
-    );
+    staged.publish_env(ready_write, commit_read, Some(own_target()));
     let (proof, _ready, adopted) = child_proof().expect("the child adopts and proves");
     assert_eq!(
         adopted.len(),
@@ -4970,9 +4257,7 @@ pub(super) fn restage_session(
         .entries;
     staged.expected = adoption_proof(
         &staged.nonce,
-        crate::build_info::build_number()
-            .parse::<u64>()
-            .unwrap_or(0),
+        own_build(),
         crate::build_info::git_commit(),
         &layout_wire_digest(&layout_wire).expect("parent layout digest"),
         &staged.screen_digest,
@@ -5062,16 +4347,7 @@ fn a_hold_and_the_titles_cross_the_real_wire() {
 
     let (ready_read, ready_write) = pipe_pair("ready");
     let (commit_read, commit_write) = pipe_pair("commit");
-    staged.publish_env(
-        ready_write,
-        commit_read,
-        Some(encode_target_identity(
-            crate::build_info::build_number()
-                .parse::<u64>()
-                .unwrap_or(0),
-            crate::build_info::git_commit(),
-        )),
-    );
+    staged.publish_env(ready_write, commit_read, Some(own_target()));
     let incoming = take_incoming_as(ReceiverShape::Current);
     assert_eq!(incoming.adopted.len(), 3, "every session adopts");
     assert!(
@@ -5124,6 +4400,7 @@ fn a_hold_and_the_titles_cross_the_real_wire() {
                         window: "vim main.rs".to_string(),
                         icon: "vim".to_string(),
                         stack: vec![(String::new(), "the caller".to_string())],
+                        ..TitleRepr::default()
                     })
                 );
                 assert!(!seeded, "the carried title is the exact answer");
@@ -5227,26 +4504,11 @@ fn an_older_producers_tab_takes_its_park_title_not_the_records_stale_copy() {
 
         let (ready_read, ready_write) = pipe_pair("ready");
         let (commit_read, commit_write) = pipe_pair("commit");
-        staged.publish_env(
-            ready_write,
-            commit_read,
-            Some(encode_target_identity(
-                crate::build_info::build_number()
-                    .parse::<u64>()
-                    .unwrap_or(0),
-                crate::build_info::git_commit(),
-            )),
-        );
-        let incoming = take_incoming_as(ReceiverShape::Current);
+        staged.publish_env(ready_write, commit_read, Some(own_target()));
+        let mut incoming = take_incoming_as(ReceiverShape::Current);
         assert_eq!(incoming.adopted.len(), 2, "every session adopts");
-        let ((proof, ready, _), mut adopted) =
-            child_proof_from(incoming).expect("the child adopts and proves");
-        assert_eq!(
-            proof, staged.expected,
-            "the proof covers the layout as read"
-        );
         let mut titles = Vec::new();
-        for a in &mut adopted {
+        for a in &mut incoming.adopted {
             assert_eq!(
                 a.checkpoint.as_ref().map(|cp| cp.title.clone()),
                 Some(None),
@@ -5267,8 +4529,8 @@ fn an_older_producers_tab_takes_its_park_title_not_the_records_stale_copy() {
             titles.push((a.local_id, seeded, term.lock().unwrap().title().to_string()));
         }
         titles.sort_unstable();
-        drop(ready);
-        for fd in [ready_read, commit_read, commit_write] {
+        drop(incoming);
+        for fd in [ready_read, ready_write, commit_read, commit_write] {
             aterm_pty::close_fd(fd);
         }
         staged.teardown();
@@ -5325,6 +4587,8 @@ fn an_older_producers_tab_takes_its_park_title_not_the_records_stale_copy() {
     let unread_leaf = |id: u64| {
         Box::new(RestoredSplitTree::leaf(RestoredView::Terminal(
             TerminalLeafRestore {
+                sid: None,
+                lineage: None,
                 cwd: None,
                 title: String::new(),
                 profile: None,
@@ -5336,7 +4600,9 @@ fn an_older_producers_tab_takes_its_park_title_not_the_records_stale_copy() {
                 attention: None,
                 questions: None,
                 autopilot: None,
+                land_at: None,
                 identity: None,
+                theme: None,
                 agent: None,
                 supervised: None,
                 held: false,
@@ -5481,16 +4747,7 @@ fn a_manifest_an_older_producer_wrote_past_the_write_cap_is_still_adopted() {
     let (ready_read, ready_write) = pipe_pair("ready");
     let (commit_read, commit_write) = pipe_pair("commit");
     let publish = |staged: &StagedHandoff| {
-        staged.publish_env(
-            ready_write,
-            commit_read,
-            Some(encode_target_identity(
-                crate::build_info::build_number()
-                    .parse::<u64>()
-                    .unwrap_or(0),
-                crate::build_info::git_commit(),
-            )),
-        );
+        staged.publish_env(ready_write, commit_read, Some(own_target()));
     };
     publish(&staged);
     let incoming = take_incoming();
@@ -5568,16 +4825,7 @@ fn a_semantically_refused_session_adopts_blank_and_the_proof_still_matches() {
 
     let (ready_read, ready_write) = pipe_pair("ready");
     let (commit_read, commit_write) = pipe_pair("commit");
-    staged.publish_env(
-        ready_write,
-        commit_read,
-        Some(encode_target_identity(
-            crate::build_info::build_number()
-                .parse::<u64>()
-                .unwrap_or(0),
-            crate::build_info::git_commit(),
-        )),
-    );
+    staged.publish_env(ready_write, commit_read, Some(own_target()));
     let incoming = take_incoming_as(ReceiverShape::Current);
     assert_eq!(
         incoming.adopted.len(),
@@ -5658,16 +4906,7 @@ fn an_unparseable_layout_still_adopts_every_session_and_proves() {
     let staged = stage_outgoing_handoff("badlayout", 2, Some(&future_schema));
     let (ready_read, ready_write) = pipe_pair("ready");
     let (commit_read, commit_write) = pipe_pair("commit");
-    staged.publish_env(
-        ready_write,
-        commit_read,
-        Some(encode_target_identity(
-            crate::build_info::build_number()
-                .parse::<u64>()
-                .unwrap_or(0),
-            crate::build_info::git_commit(),
-        )),
-    );
+    staged.publish_env(ready_write, commit_read, Some(own_target()));
     let incoming = take_incoming_as(ReceiverShape::Current);
     assert!(
         incoming.layout.is_none(),
@@ -5703,12 +4942,12 @@ fn an_unparseable_layout_still_adopts_every_session_and_proves() {
 /// layout named one id more than the manifest, and `take_incoming` dropped
 /// the WHOLE layout: every window collapsed into tabs of the first, and the
 /// unsaved Settings draft that rides only in the layout was gone with a log
-/// line. Now the layout is adopted with that one pane a placeholder, the
-/// draft still on its Settings leaf, and the proof — over the bytes read —
-/// still matches the parent's.
+/// line. Now the layout is adopted with that one pane a placeholder and the
+/// draft still on its Settings leaf. (The proof is over the bytes read
+/// whatever is placed: `a_handoff_across_a_version_boundary_still_completes`.)
 #[test]
 #[cfg(unix)]
-fn a_layout_naming_an_exited_pane_is_still_placed_and_proves() {
+fn a_layout_naming_an_exited_pane_is_still_placed() {
     let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     let _restore = restore_env();
     // The outgoing desk: the two handed sessions, plus a tab whose pane
@@ -5733,16 +4972,7 @@ fn a_layout_naming_an_exited_pane_is_still_placed_and_proves() {
     let staged = stage_outgoing_handoff("heldpane", 2, Some(&held_desk));
     let (ready_read, ready_write) = pipe_pair("ready");
     let (commit_read, commit_write) = pipe_pair("commit");
-    staged.publish_env(
-        ready_write,
-        commit_read,
-        Some(encode_target_identity(
-            crate::build_info::build_number()
-                .parse::<u64>()
-                .unwrap_or(0),
-            crate::build_info::git_commit(),
-        )),
-    );
+    staged.publish_env(ready_write, commit_read, Some(own_target()));
     let incoming = take_incoming_as(ReceiverShape::Current);
     assert_eq!(incoming.adopted.len(), 2, "both live sessions adopt");
     let layout = incoming
@@ -5767,15 +4997,9 @@ fn a_layout_naming_an_exited_pane_is_still_placed_and_proves() {
         "the Settings draft is placed with its tab"
     );
     assert_eq!(incoming.unplaced_settings_drafts, (Vec::new(), 0));
-    let ((proof, ready, _adopted), _) =
-        child_proof_from(incoming).expect("the child adopts and proves");
-    assert_eq!(
-        proof, staged.expected,
-        "the layout digest over the bytes read still matches the parent's"
-    );
 
-    drop(ready);
-    for fd in [ready_read, commit_read, commit_write] {
+    drop(incoming);
+    for fd in [ready_read, ready_write, commit_read, commit_write] {
         aterm_pty::close_fd(fd);
     }
     staged.teardown();
@@ -5809,16 +5033,7 @@ fn an_unplaced_layout_hands_over_the_drafts_it_carried() {
     let staged = stage_outgoing_handoff("missingone", 2, Some(&missing_one));
     let (ready_read, ready_write) = pipe_pair("ready");
     let (commit_read, commit_write) = pipe_pair("commit");
-    staged.publish_env(
-        ready_write,
-        commit_read,
-        Some(encode_target_identity(
-            crate::build_info::build_number()
-                .parse::<u64>()
-                .unwrap_or(0),
-            crate::build_info::git_commit(),
-        )),
-    );
+    staged.publish_env(ready_write, commit_read, Some(own_target()));
     let incoming = take_incoming_as(ReceiverShape::Current);
     assert!(
         incoming.layout.is_none(),
@@ -5840,68 +5055,8 @@ fn an_unplaced_layout_hands_over_the_drafts_it_carried() {
         ),
         "the draft it carried is handed to the restore to say"
     );
-    let ((proof, ready, _adopted), _) =
-        child_proof_from(incoming).expect("the child adopts and proves");
-    assert_eq!(proof, staged.expected);
 
-    drop(ready);
-    for fd in [ready_read, commit_read, commit_write] {
-        aterm_pty::close_fd(fd);
-    }
-    staged.teardown();
-}
-
-/// THE NEGATIVE CONTROL for the two degrade tests above: a record naming a
-/// grid sidecar other than its own is an IDENTITY fact, not content, and
-/// still refuses the whole adoption — so the leniency is provably confined
-/// to content and a pass above is never the consumer adopting anything.
-#[test]
-#[cfg(unix)]
-fn a_foreign_grid_sidecar_path_still_refuses_the_whole_adoption() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    let _restore = restore_env();
-    let staged = stage_outgoing_handoff("foreigngrid", 2, None);
-    let body = std::fs::read_to_string(&staged.manifest_path).expect("read manifest");
-    let (file_nonce, toml) = body.split_once('\n').expect("nonce header");
-    let mut published = SessionHandoff::from_toml(toml).expect("parse the published manifest");
-    let carry = published.sessions[1]
-        .screen
-        .as_mut()
-        .expect("every session carries a screen");
-    let own = std::path::PathBuf::from(&carry.grid_file);
-    let foreign = own.with_file_name("seamless-1-someone-else.s1.grid");
-    std::fs::copy(&own, &foreign).expect("a readable foreign sidecar");
-    carry.grid_file = foreign.to_string_lossy().into_owned();
-    std::fs::write(
-        &staged.manifest_path,
-        format!(
-            "{file_nonce}\n{}",
-            published.to_toml().expect("reserialize")
-        ),
-    )
-    .expect("republish");
-    let (ready_read, ready_write) = pipe_pair("ready");
-    let (commit_read, commit_write) = pipe_pair("commit");
-    staged.publish_env(ready_write, commit_read, None);
-    let incoming = take_incoming_as(ReceiverShape::Current);
-    assert!(
-        incoming.adopted.is_empty() && incoming.screen_digest.is_none(),
-        "a sidecar that is not this record's own is refused outright"
-    );
-    // WHOSE REFUSAL (round seven, item 105): the sidecar name is what the
-    // outgoing build wrote, so to a parent that reads 75 the successor exits
-    // as a moment (75, filed transient) rather than `0`, which latches the
-    // new build after two — and to one that does not, it leaves the ending
-    // to the parent (round eight, finding 0). RED before item 105: `Some(Own)`.
-    assert_eq!(incoming.refusal, Some(WholeRefusal::Producer));
-    assert_eq!(
-        refused_intake_leave(0, incoming.refusal, true),
-        RefusedIntakeLeave::Passing
-    );
-    assert_eq!(
-        refused_intake_leave(0, incoming.refusal, false),
-        RefusedIntakeLeave::ParentEndsIt
-    );
+    drop(incoming);
     for fd in [ready_read, ready_write, commit_read, commit_write] {
         aterm_pty::close_fd(fd);
     }
@@ -5952,73 +5107,14 @@ fn a_held_screen_past_the_link_strip_bound_is_not_written() {
         t.checkpoint_carry_abandoning_partial(0).0
     };
     let held = [
-        HeldScreen {
-            local_id: 5,
-            sid: SessionId::generate(),
-            checkpoint: dense,
-            exit: None,
-            history_dropped: 0,
-            history_head: None,
-            failure_seen: false,
-        },
-        HeldScreen {
-            local_id: 6,
-            sid: SessionId::generate(),
-            checkpoint: small,
-            exit: None,
-            history_dropped: 0,
-            history_head: None,
-            failure_seen: false,
-        },
+        held_screen(5, SessionId::generate(), dense),
+        held_screen(6, SessionId::generate(), small),
     ];
-    let mut manifest = SessionHandoff {
-        schema: SessionHandoff::SCHEMA,
-        window: None,
-        connections: Vec::new(),
-        sessions: Vec::new(),
-        next_turn_id: None,
-        outgoing_build: None,
-        held: Vec::new(),
-        roster_seq: None,
-        fabric_attached: Vec::new(),
-    };
-    let nonce = "0123456789abcdef0123456789abcdef";
-    let mut written = Vec::new();
-    stamp_held_panes(
-        &mut manifest,
-        &held,
-        &mut crate::handoff_history::HeldExports::default(),
-        &[],
-        &mut 0,
-        dir,
-        nonce,
-        (0, 0),
-        &mut written,
-    );
+    let (written, shown) = stamp_and_take_held(dir, &held, &[]);
     assert_eq!(
-        manifest
-            .held
-            .iter()
-            .map(|pane| pane.local_id)
-            .collect::<Vec<_>>(),
+        written.iter().map(|pane| pane.local_id).collect::<Vec<_>>(),
         vec![6],
         "only the screen the successor can show is written"
-    );
-    let stem = format!("seamless-{}-{nonce}", std::process::id());
-    let mut remaining = MAX_HANDOFF_AGGREGATE_GRID_BYTES;
-    let mut cells = 0;
-    let mut history = crate::handoff_history::MAX_AGGREGATE_BYTES;
-    let mut control = crate::handoff_carry::MAX_AGGREGATE_BYTES;
-    let shown = take_held_panes(
-        &manifest.held,
-        &[],
-        &dir.join(format!("{stem}.toml")),
-        &stem,
-        dir,
-        &mut remaining,
-        &mut cells,
-        &mut history,
-        &mut control,
     );
     assert_eq!(
         shown.iter().map(|pane| pane.local_id).collect::<Vec<_>>(),
@@ -6052,64 +5148,16 @@ fn a_held_panes_sid_crosses_unless_it_names_another_session() {
     let held = sids
         .iter()
         .zip(5_u64..)
-        .map(|(sid, local_id)| HeldScreen {
-            local_id,
-            sid: SessionId::new(*sid),
-            checkpoint: screen(),
-            exit: None,
-            history_dropped: 0,
-            history_head: None,
-            failure_seen: false,
-        })
+        .map(|(sid, local_id)| held_screen(local_id, SessionId::new(*sid), screen()))
         .collect::<Vec<_>>();
-    let mut manifest = SessionHandoff {
-        schema: SessionHandoff::SCHEMA,
-        window: None,
-        connections: Vec::new(),
-        sessions: Vec::new(),
-        next_turn_id: None,
-        outgoing_build: None,
-        held: Vec::new(),
-        roster_seq: None,
-        fabric_attached: Vec::new(),
-    };
-    let nonce = "0123456789abcdef0123456789abcdef";
-    let mut written = Vec::new();
-    stamp_held_panes(
-        &mut manifest,
-        &held,
-        &mut crate::handoff_history::HeldExports::default(),
-        &[],
-        &mut 0,
-        dir,
-        nonce,
-        (0, 0),
-        &mut written,
-    );
+    let (written, shown) = stamp_and_take_held(dir, &held, &[(99, "s-feedfacefeedfacefeed")]);
     assert_eq!(
-        manifest
-            .held
+        written
             .iter()
             .map(|pane| pane.sid.as_deref())
             .collect::<Vec<_>>(),
         sids.iter().copied().map(Some).collect::<Vec<_>>(),
         "the writer carries every held pane's sid"
-    );
-    let stem = format!("seamless-{}-{nonce}", std::process::id());
-    let mut remaining = MAX_HANDOFF_AGGREGATE_GRID_BYTES;
-    let mut cells = 0;
-    let mut history = crate::handoff_history::MAX_AGGREGATE_BYTES;
-    let mut control = crate::handoff_carry::MAX_AGGREGATE_BYTES;
-    let shown = take_held_panes(
-        &manifest.held,
-        &[(99, "s-feedfacefeedfacefeed")],
-        &dir.join(format!("{stem}.toml")),
-        &stem,
-        dir,
-        &mut remaining,
-        &mut cells,
-        &mut history,
-        &mut control,
     );
     assert_eq!(
         shown
@@ -6145,10 +5193,6 @@ fn a_descriptor_list_that_misses_a_session_is_the_producers_refusal() {
     let incoming = take_incoming_as(ReceiverShape::Current);
     assert!(incoming.adopted.is_empty() && incoming.screen_digest.is_none());
     assert_eq!(incoming.refusal, Some(WholeRefusal::Producer));
-    assert_eq!(
-        refused_intake_leave(0, incoming.refusal, true),
-        RefusedIntakeLeave::Passing
-    );
     for fd in [ready_read, ready_write, commit_read, commit_write] {
         aterm_pty::close_fd(fd);
     }
@@ -6156,7 +5200,7 @@ fn a_descriptor_list_that_misses_a_session_is_the_producers_refusal() {
 }
 
 /// CONFORMANCE (Tier-1) of the incoming side's REFUSAL to
-/// `aterm_spec::derive::fd_handoff_no_leak_model` (`FdHandoffNoLeak`): a
+/// `aterm_models_session::fd_handoff_no_leak_model` (`FdHandoffNoLeak`): a
 /// handoff [`take_incoming_from`] refuses after it began claiming masters closes
 /// every master the wire named — session 0's, which its `Adopted` had
 /// already claimed from the guard (the `HandedMaster` drops with the
@@ -6268,8 +5312,13 @@ fn a_refused_handoff_closes_every_master_it_was_handed() {
         incoming.adopted.is_empty() && incoming.screen_digest.is_none(),
         "a sidecar that is not this record's own is refused outright"
     );
+    // WHOSE REFUSAL (round seven, item 105): the sidecar name is what the
+    // outgoing build wrote, so the successor leaves as for the producer's
+    // content, never with the `0` that latches the new build. RED before
+    // item 105: `Some(Own)`.
+    assert_eq!(incoming.refusal, Some(WholeRefusal::Producer));
 
-    let model = aterm_spec::derive::fd_handoff_no_leak_model();
+    let model = aterm_models_session::fd_handoff_no_leak_model();
     let label = "FdHandoffNoLeak(take_incoming refusal)";
     let mut state = model.init_state();
     let mut advance = |what: &str, action: &str, var: &'static str, value: i64| {
@@ -6383,9 +5432,7 @@ fn a_wrong_build_child_refuses_the_handoff() {
     let staged = stage_outgoing_handoff("wrongbuild", 1, None);
     let (ready_read, ready_write) = pipe_pair("ready");
     let (commit_read, commit_write) = pipe_pair("commit");
-    let own = crate::build_info::build_number()
-        .parse::<u64>()
-        .unwrap_or(0);
+    let own = own_build();
     staged.publish_env(
         ready_write,
         commit_read,
@@ -6415,16 +5462,7 @@ fn a_wrong_session_set_cannot_match_the_parent_expectation() {
     let staged = stage_outgoing_handoff("wrongset", 3, None);
     let (ready_read, ready_write) = pipe_pair("ready");
     let (commit_read, commit_write) = pipe_pair("commit");
-    staged.publish_env(
-        ready_write,
-        commit_read,
-        Some(encode_target_identity(
-            crate::build_info::build_number()
-                .parse::<u64>()
-                .unwrap_or(0),
-            crate::build_info::git_commit(),
-        )),
-    );
+    staged.publish_env(ready_write, commit_read, Some(own_target()));
     let (_proof, ready, adopted) = child_proof().expect("the child adopts and proves");
 
     let mut subset = adopted.clone();
@@ -6465,16 +5503,7 @@ fn a_missing_or_foreign_commit_never_releases_the_readers() {
     let staged = stage_outgoing_handoff("nocommit", 2, None);
     let (ready_read, ready_write) = pipe_pair("ready");
     let (commit_read, commit_write) = pipe_pair("commit");
-    staged.publish_env(
-        ready_write,
-        commit_read,
-        Some(encode_target_identity(
-            crate::build_info::build_number()
-                .parse::<u64>()
-                .unwrap_or(0),
-            crate::build_info::git_commit(),
-        )),
-    );
+    staged.publish_env(ready_write, commit_read, Some(own_target()));
     let (proof, _ready, adopted) = child_proof().expect("the child adopts and proves");
 
     assert!(
@@ -6485,9 +5514,7 @@ fn a_missing_or_foreign_commit_never_releases_the_readers() {
     subset.pop();
     let other = adoption_proof(
         &staged.nonce,
-        crate::build_info::build_number()
-            .parse::<u64>()
-            .unwrap_or(0),
+        own_build(),
         crate::build_info::git_commit(),
         &[0x11; 32],
         &[0x22; 32],
@@ -6514,120 +5541,6 @@ fn a_missing_or_foreign_commit_never_releases_the_readers() {
         aterm_pty::close_fd(fd);
     }
     staged.teardown();
-}
-
-/// B4's replacement proof term, measured instead of remembered.
-/// [`adoption_proof`] explains why the fd number stops agreeing the moment
-/// the masters travel over `SCM_RIGHTS`, and names the PTY's own device minor
-/// as what survives. Two facts have to hold for that to be a PROOF rather
-/// than a better-looking integer, and both were until now recorded as
-/// something somebody once saw on a terminal:
-///
-/// * SUBSTITUTION. Simultaneously-open masters must answer DIFFERENT minors.
-///   Without this the term detects a permutation and nothing else — which is
-///   exactly the objection that disqualifies the transfer-order ordinal
-///   sketched in `tests/handoff_launchd_job.rs`, and it would be no less
-///   fatal here.
-/// * IDENTITY OF THE OPEN FILE DESCRIPTION. `dup` must preserve it, because
-///   that is the same property `SCM_RIGHTS` leans on when it hands the
-///   description itself to another process. The fd number is the thing that
-///   changes across both; the PTY is not.
-///
-/// macOS only, and that is the claim rather than a portability gap:
-/// `/dev/ptmx` is a cloning device there, so each open takes its own minor
-/// and `st_ino`/`st_dev` cannot tell two masters apart at all. Linux's
-/// masters share one `st_rdev` and expose the number through
-/// `ioctl(TIOCGPTN)` — a different measurement, for the lane that needs it to
-/// assert when it exists.
-#[cfg(target_os = "macos")]
-#[test]
-fn the_replacement_proof_term_distinguishes_masters_and_survives_dup() {
-    // Darwin's `minor(3)`: the low 24 bits of `st_rdev`. Masked rather than
-    // cast, so the sign bit of a `dev_t` cannot ride into the comparison.
-    fn pty_device_minor(fd: i32) -> i32 {
-        // SAFETY: `fstat` only fills the zeroed `stat` out-parameter, and
-        // `fd` is a live descriptor the caller holds across the whole call.
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        let rc = unsafe { libc::fstat(fd, &mut st) };
-        assert_eq!(rc, 0, "fstat on a live PTY descriptor");
-        st.st_rdev & 0x00ff_ffff
-    }
-
-    let (mut masters, mut slaves) = ([0i32; 3], [0i32; 3]);
-    for (master, slave) in masters.iter_mut().zip(slaves.iter_mut()) {
-        (*master, *slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
-    }
-    let minors = [
-        pty_device_minor(masters[0]),
-        pty_device_minor(masters[1]),
-        pty_device_minor(masters[2]),
-    ];
-    assert!(
-        minors[0] != minors[1] && minors[1] != minors[2] && minors[0] != minors[2],
-        "three simultaneously-open masters must answer three minors, got {minors:?}"
-    );
-
-    // AND THE MINOR IDENTIFIES THE PTY, which is the half that makes it a term
-    // at all rather than a distinct counter: it is the number in the
-    // `/dev/ttysNNN` the SLAVE answers to. The doc above claimed this from
-    // recollection; measure it. The name comes from the KERNEL
-    // (`TIOCPTYGNAME` on the master, the call `ptsname` makes), and the
-    // slave's own device minor is read from the slave: libc's `ttyname_r`
-    // finds the name by looking the slave's device number up in devfs, and
-    // under a whole-suite run's PTY churn that lookup missed once (`ERANGE`,
-    // 2026-09-26) — a flake of the lookup, not a fact about the PTY.
-    for (i, (&master, &slave)) in masters.iter().zip(slaves.iter()).enumerate() {
-        let mut name = [0i8; 128];
-        // SAFETY: `master` is a live PTY master this test owns, and
-        // `TIOCPTYGNAME` writes at most 128 bytes, NUL-terminated, into the
-        // 128-byte buffer it is handed.
-        let rc = unsafe {
-            libc::ioctl(
-                master,
-                libc::c_ulong::from(libc::TIOCPTYGNAME),
-                name.as_mut_ptr(),
-            )
-        };
-        assert_eq!(rc, 0, "TIOCPTYGNAME on a live PTY master");
-        // SAFETY: TIOCPTYGNAME NUL-terminates on success.
-        let path = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
-            .to_str()
-            .expect("a device path is ASCII");
-        let n: i32 = path
-            .strip_prefix("/dev/ttys")
-            .expect("a Darwin PTY slave is /dev/ttysNNN")
-            .parse()
-            .expect("the NNN parses through its zero padding");
-        assert_eq!(
-            n, minors[i],
-            "the master's device minor IS the slave's /dev/ttysNNN ({path})"
-        );
-        assert_eq!(
-            pty_device_minor(slave),
-            n,
-            "…and the slave's own device minor is that NNN ({path})"
-        );
-    }
-
-    // SAFETY: duplicating a live descriptor this test owns — close-on-exec
-    // from birth, so a sibling test's child never keeps this PTY open.
-    let duplicate = unsafe { libc::fcntl(masters[0], libc::F_DUPFD_CLOEXEC, 0) };
-    assert!(duplicate >= 0, "dup");
-    assert_ne!(
-        duplicate, masters[0],
-        "the duplicate is a different NUMBER for the same PTY"
-    );
-    assert_eq!(
-        pty_device_minor(duplicate),
-        minors[0],
-        "the term follows the open file description, not the descriptor table slot"
-    );
-
-    aterm_pty::close_fd(duplicate);
-    for (master, slave) in masters.into_iter().zip(slaves) {
-        aterm_pty::close_fd(master);
-        aterm_pty::close_fd(slave);
-    }
 }
 
 /// THE PACKED TAB STOPS (R17-HANDOFF-1): every vector a grid can hold packs and

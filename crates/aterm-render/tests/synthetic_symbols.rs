@@ -1,25 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The chain's LAST-RESORT fontless symbol tier (`font_chain::Tier::Synthetic`,
-//! `procedural::covers_symbol`), bound to the real renderer.
+//! The chain's last-resort fontless symbol tier (`font_chain::Tier::Synthetic`,
+//! `procedural::covers_symbol`), bound to the real renderer. It draws a symbol
+//! no installed face covers (U+23F5 `⏵`, the Claude Code / Codex footer, on a
+//! bare Linux host) instead of `.notdef`, and a default-text symbol only the
+//! colour face covers (`⏺`) instead of that face's monochrome silhouette.
 //!
-//! THE BUG THIS PINS, measured on a Linux aarch64 host on 2026-09-24: the
-//! Claude Code / Codex footer `⏵⏵ bypass permissions on` drew two `.notdef`
-//! boxes, because NO installed face covers U+23F5 (`fc-list ':charset=23f5'`
-//! answered nothing), and Claude Code's `⏺` tool bullet drew a solid `■` — the
-//! monochrome silhouette of Noto Color Emoji's key-cap button. macOS has STIX
-//! Two Math for both, which is why it was never seen there.
-//!
-//! Machine-independent by construction EXCEPT where a test opens runtime
-//! discovery on an unsealed renderer: `Renderer::from_bytes` leaves every
-//! system-font path list empty, so the bundled DejaVu Sans Mono is the whole
-//! chain until then — but runtime discovery asks the INSTALLED fonts, and an
-//! installed face that draws the character wins over the synthesis (it is the
-//! last resort). A seal closes that tier again. So the unsealed-discovery
-//! policy is the one place a test must accept either answer, and it does so by
-//! name: macOS resolves U+23F5 to `RuntimeFallback` there (measured
-//! 2026-09-25), the bare Linux host above to `Procedural`.
+//! `Renderer::from_bytes` leaves every system-font path list empty, so DejaVu
+//! Sans Mono is the whole chain, except where a test opens runtime discovery on
+//! an unsealed renderer: an installed face that draws the character then wins
+//! over the synthesis, so that one policy accepts either answer (macOS resolves
+//! U+23F5 to `RuntimeFallback`, a host without such a face to `Procedural`).
 
 use aterm_render::procedural::{covers_symbol, symbol_coverage};
 use aterm_render::{FaceId, GlyphClass, GlyphImage, MISSING_FONT_CLASS_TEXT, Renderer, Theme};
@@ -68,9 +60,8 @@ fn the_footer_triangle_draws_ink_on_every_policy() {
         let (cw, ch) = r.cell_size();
         let baseline = r.baseline();
         let key = r.glyph_key('\u{23F5}');
-        // Only an open (unsealed) runtime tier may reach an installed face,
-        // and when one draws U+23F5 it must win: the synthesis is the LAST
-        // resort. Every other policy has no face for it and must synthesize.
+        // Only an open (unsealed) runtime tier may reach an installed face, and
+        // one that draws U+23F5 wins: the synthesis is the last resort.
         let installed_face_may_win = runtime && !sealed;
         assert!(
             key.source == FaceId::Procedural
@@ -116,7 +107,7 @@ fn no_symbol_in_the_table_is_ever_tofu() {
     let mut r = renderer(false, false);
     for c in all_symbols() {
         let key = r.glyph_key(c);
-        // `.notdef` is the Primary face addressed BY CHAR; a real primary glyph
+        // `.notdef` is the Primary face addressed by char; a real primary glyph
         // is addressed by glyph id.
         let notdef = key.source == FaceId::Primary && key.glyph_class == GlyphClass::Mono;
         assert!(
@@ -141,7 +132,7 @@ fn no_symbol_in_the_table_is_ever_tofu() {
 #[test]
 fn a_font_that_has_the_glyph_always_wins() {
     let mut r = renderer(false, false);
-    // DejaVu Sans Mono carries ▶ ● ■ ✓: the synthesis must NOT pre-empt them.
+    // DejaVu Sans Mono carries ▶ ● ■ ✓: the synthesis must not pre-empt them.
     for c in ['▶', '●', '■', '✓'] {
         let key = r.glyph_key(c);
         assert_eq!(
@@ -173,25 +164,19 @@ fn a_wide_symbol_spans_both_cells() {
 
 #[test]
 fn the_synthesis_still_reports_the_miss_to_a_poll_based_host() {
-    // E1: a web host learns which face class to inject from the miss drain. A
-    // synthesized glyph is still a font miss, so it must still be reported —
-    // otherwise the host never fetches the real face that would outrank it.
+    // A synthesized glyph is still a font miss, so a web host still learns to
+    // fetch the real face that would outrank it.
     let mut r = renderer(false, false);
     r.take_missing_font_classes();
     r.glyph_key('\u{23F5}');
     assert_eq!(r.take_missing_font_classes(), MISSING_FONT_CLASS_TEXT);
 }
 
-/// The OTHER entry to the synthesis: a default-TEXT symbol that only the
-/// colour face covers (`⏺` U+23FA with Noto Color Emoji). The chain used to
-/// take that face's monochrome silhouette — a solid key-cap square — and
-/// report NOTHING; it now draws the fontless disc and reports the TEXT class,
-/// deliberately: the text face a poll-based host injects in answer outranks
-/// the synthesis, which is the "a real face always wins" contract. This pins
-/// both halves of that behaviour change on the intercept path, which
-/// `the_synthesis_still_reports_the_miss_to_a_poll_based_host` (no colour
-/// face) does not reach. Linux's Noto Color Emoji is the face whose
-/// silhouette is the key cap, so the test is Linux's.
+/// The other entry to the synthesis: a default-text symbol only the colour face
+/// covers (`⏺` U+23FA with Noto Color Emoji) draws the fontless disc, not the
+/// face's monochrome key-cap silhouette, and reports the text class, so the
+/// text face a poll-based host injects in answer outranks the synthesis. Linux
+/// only: Linux's Noto Color Emoji is the face whose silhouette is the key cap.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_colour_silhouette_intercept_draws_the_disc_and_reports_the_text_class() {
@@ -218,18 +203,6 @@ fn the_colour_silhouette_intercept_draws_the_disc_and_reports_the_text_class() {
     for &(x, y) in &[(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)] {
         assert_eq!(bytes[y * w + x], 0, "corner ({x},{y}) inked: not a disc");
     }
-}
-
-#[test]
-fn a_genuine_miss_is_still_notdef() {
-    let mut r = renderer(true, true);
-    let key = r.glyph_key('\u{FFFF}');
-    assert_eq!(key.source, FaceId::Primary);
-    assert_eq!(
-        key.glyph_class,
-        GlyphClass::Mono,
-        "`.notdef` stays `.notdef`"
-    );
 }
 
 #[test]
@@ -285,30 +258,9 @@ fn mirrored_symbols_are_exact_mirrors() {
     }
 }
 
-#[test]
-fn the_tree_connector_meets_a_vertical_line_above_it() {
-    // `⎿` under `│`: the connector's vertical stroke sits on the SAME columns
-    // and reaches the cell's top edge, so the two join with no seam.
-    let (w, h) = (10usize, 21usize);
-    let conn = aterm_render::procedural::coverage('\u{23BF}', w, h).unwrap();
-    let bar = aterm_render::procedural::coverage('│', w, h).unwrap();
-    assert_eq!(&conn[..w], &bar[..w], "top rows must match `│`");
-    assert!(
-        conn.iter().all(|&b| b == 0 || b == 255),
-        "hard 0/255 like box drawing"
-    );
-    // It is a PRE-EMPTIVE procedural glyph, not a last-resort symbol: the
-    // last-resort table must not also claim it (the two families are disjoint).
-    assert!(!covers_symbol('\u{23BF}'));
-    assert!(symbol_coverage('\u{23BF}', w, h, 1).is_none());
-}
-
-/// The join is only real if the RENDERER draws the connector procedurally —
-/// the previous revision drew it in the last-resort tier, so on any host with
-/// a face covering U+23BF (Noto CJK on the Linux host that reported the bug)
-/// the font's short bottom-of-cell `⎿` won and left a gap under the `│` above.
-/// Checked through `glyph_key` / `glyph_image`, on every policy, and with the
-/// checked-in Iosevka Term (which maps U+23BF) injected into the chain.
+/// The renderer draws `⎿` procedurally on every policy, even with a face that
+/// covers U+23BF (the bundled Iosevka Term) in the chain: a font's `⎿` can stop
+/// short of the cell top and leave a gap under the `│` above.
 #[test]
 fn the_renderer_draws_the_tree_connector_procedurally_even_when_a_font_covers_it() {
     let check = |r: &mut Renderer, label: &str| {

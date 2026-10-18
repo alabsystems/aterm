@@ -12,8 +12,6 @@
 use crate::cell::{CellFlags, PackedColor};
 use crate::cell_colors::PackedColors;
 use crate::cursor::Cursor;
-#[cfg(test)]
-use crate::style::{ExtendedStyle, Style};
 use aterm_types::charset::CharacterSetState;
 
 /// Current style attributes for new characters.
@@ -37,9 +35,7 @@ pub struct CurrentStyle {
     cached_is_default: bool,
     // Only the caches the cell writers read are kept (`cached_colors` in
     // `write_char_core`, `has_style_extras` in the extras gate, `is_default` in
-    // the ASCII-blast gate). Nothing in production interns a `Style` (no path
-    // sets `CellFlags::USES_STYLE_ID`; cells store `PackedColors` inline), so
-    // `build_style` / `build_extended_style*` compute on demand.
+    // the ASCII-blast gate). Cells store `PackedColors` inline.
 }
 
 impl Default for CurrentStyle {
@@ -160,59 +156,6 @@ impl CurrentStyle {
             && !self.protected;
     }
 
-    /// Build just the `Style` (fg, bg, attrs) that this rendition denotes.
-    ///
-    /// Computed on demand from `fg`/`bg`/`flags`. No production caller uses it;
-    /// it is the round-trip/inspection API, so it must be correct rather than
-    /// fast.
-    #[inline]
-    #[must_use]
-    #[cfg(test)]
-    pub fn build_style(&self) -> Style {
-        self.build_extended_style().style
-    }
-
-    /// Build the `ExtendedStyle` (colors + color types + palette indices) that
-    /// this rendition denotes, via one `from_packed_colors_separate` call.
-    #[inline]
-    #[must_use]
-    #[cfg(test)]
-    pub fn build_extended_style(&self) -> ExtendedStyle {
-        ExtendedStyle::from_packed_colors_separate(self.fg, self.bg, self.flags)
-    }
-
-    /// Refresh the writer caches after only the fg color changed, and return
-    /// the resulting `ExtendedStyle`.
-    ///
-    /// The fg/bg/both variants all recompute the caches wholesale.
-    #[inline]
-    #[must_use]
-    #[cfg(test)]
-    pub fn build_extended_style_fg_changed(&mut self) -> ExtendedStyle {
-        self.update_cached_colors();
-        self.build_extended_style()
-    }
-
-    /// Refresh the writer caches after only the bg color changed, and return
-    /// the resulting `ExtendedStyle`.
-    #[inline]
-    #[must_use]
-    #[cfg(test)]
-    pub fn build_extended_style_bg_changed(&mut self) -> ExtendedStyle {
-        self.update_cached_colors();
-        self.build_extended_style()
-    }
-
-    /// Refresh the writer caches after both fg and bg changed, and return the
-    /// resulting `ExtendedStyle`.
-    #[inline]
-    #[must_use]
-    #[cfg(test)]
-    pub fn build_extended_style_both_changed(&mut self) -> ExtendedStyle {
-        self.update_cached_colors();
-        self.build_extended_style()
-    }
-
     /// Reset to default style (full reset including DECSCA protection).
     ///
     /// Used by RIS (full terminal reset).
@@ -266,8 +209,6 @@ pub struct SavedCursorState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // StyleAttrs is used only by these tests.
-    use crate::style::StyleAttrs;
 
     // =========================================================================
     // CurrentStyle::default, and one attribute or colour changed from it
@@ -282,11 +223,6 @@ mod tests {
         assert!(!style.protected, "not protected");
         assert!(style.is_default(), "cached is_default");
         assert!(!style.has_style_extras(), "no style extras");
-        assert_eq!(
-            style.build_style().attrs,
-            StyleAttrs::empty(),
-            "the default rendition denotes empty StyleAttrs"
-        );
     }
 
     #[test]
@@ -305,6 +241,13 @@ mod tests {
             ("inverse", CellFlags::INVERSE, d_fg, d_bg, false),
             ("hidden", CellFlags::HIDDEN, d_fg, d_bg, false),
             ("strikethrough", CellFlags::STRIKETHROUGH, d_fg, d_bg, false),
+            (
+                "curly underline (extended bits)",
+                CellFlags::CURLY_UNDERLINE,
+                d_fg,
+                d_bg,
+                true,
+            ),
             (
                 "overline (extended bits)",
                 CellFlags::OVERLINE,
@@ -341,35 +284,6 @@ mod tests {
         style.update_cached_colors();
         assert!(!style.flags.contains(CellFlags::BOLD));
         assert!(style.is_default(), "clearing bold should restore default");
-    }
-
-    #[test]
-    fn test_multiple_flags_combined() {
-        let mut style = CurrentStyle::default();
-        style.flags.insert(CellFlags::BOLD);
-        style.flags.insert(CellFlags::ITALIC);
-        style.flags.insert(CellFlags::UNDERLINE);
-        style.update_cached_colors();
-        assert!(style.flags.contains(CellFlags::BOLD));
-        assert!(style.flags.contains(CellFlags::ITALIC));
-        assert!(style.flags.contains(CellFlags::UNDERLINE));
-        assert!(!style.is_default());
-    }
-
-    // =========================================================================
-    // Several colours at once
-    // =========================================================================
-
-    #[test]
-    fn test_both_rgb_colors() {
-        let mut style = CurrentStyle {
-            fg: PackedColor::rgb(10, 20, 30),
-            bg: PackedColor::rgb(40, 50, 60),
-            ..CurrentStyle::default()
-        };
-        style.update_cached_colors();
-        assert!(style.has_style_extras());
-        assert!(!style.is_default());
     }
 
     // =========================================================================
@@ -437,107 +351,8 @@ mod tests {
     }
 
     // =========================================================================
-    // Underline style variants
+    // CurrentStyle::new computes the caches
     // =========================================================================
-
-    #[test]
-    fn test_curly_underline() {
-        let mut style = CurrentStyle::default();
-        style.flags.insert(CellFlags::CURLY_UNDERLINE);
-        style.update_cached_colors();
-        assert!(style.flags.contains(CellFlags::CURLY_UNDERLINE));
-        assert!(
-            style.has_style_extras(),
-            "curly underline uses extended flag bits"
-        );
-    }
-
-    // =========================================================================
-    // Style comparison / equality
-    // =========================================================================
-
-    #[test]
-    fn test_same_style_new_vs_default() {
-        let from_new = CurrentStyle::new(
-            PackedColor::DEFAULT_FG,
-            PackedColor::DEFAULT_BG,
-            CellFlags::empty(),
-            false,
-        );
-        let from_default = CurrentStyle::default();
-        assert_eq!(from_new.fg, from_default.fg);
-        assert_eq!(from_new.bg, from_default.bg);
-        assert_eq!(from_new.flags, from_default.flags);
-        assert_eq!(from_new.is_default(), from_default.is_default());
-    }
-
-    // =========================================================================
-    // build_style / build_extended_style correctness
-    // =========================================================================
-
-    // =========================================================================
-    // Partial-change build methods
-    // =========================================================================
-
-    // =========================================================================
-    // Packed color accessors (fg_packed, bg_packed, flags_bits)
-    // =========================================================================
-
-    #[test]
-    fn test_fg_packed_roundtrip() {
-        let style = CurrentStyle::new(
-            PackedColor::indexed(42),
-            PackedColor::DEFAULT_BG,
-            CellFlags::empty(),
-            false,
-        );
-        assert_eq!(style.fg_packed(), PackedColor::indexed(42).0);
-    }
-
-    #[test]
-    fn test_bg_packed_roundtrip() {
-        let style = CurrentStyle::new(
-            PackedColor::DEFAULT_FG,
-            PackedColor::rgb(10, 20, 30),
-            CellFlags::empty(),
-            false,
-        );
-        assert_eq!(style.bg_packed(), PackedColor::rgb(10, 20, 30).0);
-    }
-
-    #[test]
-    fn test_flags_bits_roundtrip() {
-        let flags = CellFlags::BOLD.union(CellFlags::ITALIC);
-        let style = CurrentStyle::new(
-            PackedColor::DEFAULT_FG,
-            PackedColor::DEFAULT_BG,
-            flags,
-            false,
-        );
-        assert_eq!(style.flags_bits(), flags.bits());
-    }
-
-    // =========================================================================
-    // SavedCursorState
-    // =========================================================================
-
-    // =========================================================================
-    // Protected attribute behavior
-    // =========================================================================
-
-    #[test]
-    fn test_protected_prevents_is_default() {
-        let style = CurrentStyle::new(
-            PackedColor::DEFAULT_FG,
-            PackedColor::DEFAULT_BG,
-            CellFlags::empty(),
-            true,
-        );
-        assert!(
-            !style.is_default(),
-            "protected=true should prevent is_default()"
-        );
-    }
 
     #[test]
     fn test_new_with_all_fields() {
@@ -554,50 +369,5 @@ mod tests {
         assert!(style.protected);
         assert!(style.has_style_extras()); // RGB fg
         assert!(!style.is_default());
-    }
-
-    // =========================================================================
-    // Extended flags trigger has_style_extras
-    // =========================================================================
-
-    #[test]
-    fn test_superscript_triggers_style_extras() {
-        let style = CurrentStyle::new(
-            PackedColor::DEFAULT_FG,
-            PackedColor::DEFAULT_BG,
-            CellFlags::SUPERSCRIPT,
-            false,
-        );
-        assert!(
-            style.has_style_extras(),
-            "superscript is in EXTENDED_FLAGS_MASK"
-        );
-    }
-
-    #[test]
-    fn test_subscript_triggers_style_extras() {
-        let style = CurrentStyle::new(
-            PackedColor::DEFAULT_FG,
-            PackedColor::DEFAULT_BG,
-            CellFlags::SUBSCRIPT,
-            false,
-        );
-        assert!(style.has_style_extras());
-    }
-
-    #[test]
-    fn test_basic_flags_no_style_extras() {
-        let style = CurrentStyle::new(
-            PackedColor::DEFAULT_FG,
-            PackedColor::DEFAULT_BG,
-            CellFlags::BOLD
-                .union(CellFlags::ITALIC)
-                .union(CellFlags::UNDERLINE),
-            false,
-        );
-        assert!(
-            !style.has_style_extras(),
-            "basic flags (bold+italic+underline) should not need style extras"
-        );
     }
 }

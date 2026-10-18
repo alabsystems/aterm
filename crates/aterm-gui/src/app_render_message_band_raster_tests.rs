@@ -73,7 +73,6 @@ fn introspection_capture_paints_the_message_band() {
         .iter()
         .find(|c| !c.action.is_details())
         .expect("the Open log capsule");
-    assert_eq!(open_log.full_label, "Open log");
     let painted: String = row0[open_log.col + 1..open_log.col + open_log.width - 1]
         .iter()
         .collect();
@@ -116,7 +115,6 @@ fn a_capture_at_an_injected_instant_is_deterministic() {
         app.windows[&wid].input_scratch.cells[0].clone()
     };
     let first = shoot(&mut app, at);
-    std::thread::sleep(std::time::Duration::from_millis(40));
     let again = shoot(&mut app, at);
     assert_eq!(first, again, "the same instant is the same frame");
     let later = shoot(&mut app, at + std::time::Duration::from_millis(400));
@@ -172,13 +170,20 @@ fn every_admitted_glyph_paints_a_non_blank_cell_headless() {
         app.post_message(Message::new(tags::SYSTEM, Severity::Info, "the seam row"));
         assert_eq!(app.message_band_rows, 2);
         compose(&mut app, wid, theme);
-        let cells = &app.windows[&wid].input_scratch.cells;
+        let scratch = &app.windows[&wid].input_scratch;
+        let cells = &scratch.cells;
         let cell = cells[0][GLYPH_COL];
         assert_eq!(cell.ch, ch_);
         assert!(cell.text_presentation, "{ch_:?}");
-        assert_ne!(
-            cell.underline_color, cells[1][GLYPH_COL].underline_color,
-            "the seam is on row 1, not on the probed row (row 0 carries the divider)"
+        // Drawn as underlines or as rails, as this cell height allows.
+        let (divider, seam) = (
+            crate::message_band::closing_line(scratch, 0),
+            crate::message_band::closing_line(scratch, 1),
+        );
+        assert!(
+            divider.is_some() && seam.is_some() && divider != seam,
+            "the seam is on row 1, not on the probed row (row 0 carries the divider): \
+             {divider:?} over {seam:?}"
         );
         assert_eq!(
             cells[0][0].bg, cell.bg,

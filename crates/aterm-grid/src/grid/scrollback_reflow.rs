@@ -219,7 +219,7 @@ impl Grid {
         // SAFETY: the row is moved into `self.storage.rows` by the caller, which
         // owns `self.storage.pages` for at least as long as the row lives.
         let mut row = unsafe { crate::Row::new(new_cols, &mut self.storage.pages) };
-        let extras = super::scroll_fill::fill_row_into(&mut row, line, new_cols, self.styles());
+        let extras = super::scroll_fill::fill_row_into(&mut row, line, new_cols);
         (row, extras)
     }
 }
@@ -638,154 +638,81 @@ mod tests {
         l
     }
 
+    /// A rewrap joins each soft-wrapped run into its logical line and splits
+    /// it at the new width (first row unwrapped, the rest continuations), never
+    /// across a hard newline or through a wide char, and keeps a blank line.
     #[test]
-    fn rewrap_preserves_disjoint_hyperlinks_across_a_split() {
-        // Two alternating-URL spans (which defeat coalescing) must each map to
-        // the right cells after a width-2 split puts them in separate lines.
-        use std::sync::Arc;
-        let spans = vec![
-            HyperlinkSpan::new(0, 2, Arc::from("u0")),
-            HyperlinkSpan::new(2, 4, Arc::from("u1")),
+    fn rewrap_resplits_each_logical_line_at_the_new_width() {
+        type Rows<'a> = &'a [(&'a str, bool)];
+        let cases: &[(&str, Rows, u16, Rows)] = &[
+            (
+                "shrink",
+                &[("ABCDEFGHIJ", false)],
+                4,
+                &[("ABCD", false), ("EFGH", true), ("IJ", true)],
+            ),
+            (
+                "grow merges a run",
+                &[("ABCD", false), ("EFGH", true), ("IJ", true)],
+                20,
+                &[("ABCDEFGHIJ", false)],
+            ),
+            (
+                "hard newlines stay",
+                &[("ABC", false), ("DEF", false)],
+                20,
+                &[("ABC", false), ("DEF", false)],
+            ),
+            ("blank survives", &[("", false)], 10, &[("", false)]),
+            (
+                "wide char wraps whole",
+                &[("世界", false)],
+                3,
+                &[("世", false), ("界", true)],
+            ),
         ];
-        let line = Line::with_hyperlinks("ABCD", Rle::new(), spans);
-        let out = reflow_scrollback_lines(&[line], 2);
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0].as_str().unwrap(), "AB");
-        assert_eq!(out[1].as_str().unwrap(), "CD");
-        assert_eq!(out[0].get_hyperlink_span(0).map(|s| &*s.url), Some("u0"));
-        assert_eq!(out[0].get_hyperlink_span(1).map(|s| &*s.url), Some("u0"));
-        assert_eq!(out[1].get_hyperlink_span(0).map(|s| &*s.url), Some("u1"));
-        assert_eq!(out[1].get_hyperlink_span(1).map(|s| &*s.url), Some("u1"));
-    }
+        for &(name, input, cols, want) in cases {
+            let lines: Vec<Line> = input.iter().map(|&(t, w)| styled(t, w)).collect();
+            let got: Vec<(String, bool)> = reflow_scrollback_lines(&lines, cols)
+                .iter()
+                .map(|l| (l.as_str().unwrap_or("").to_string(), l.is_wrapped()))
+                .collect();
+            let want: Vec<(String, bool)> = want.iter().map(|&(t, w)| (t.to_string(), w)).collect();
+            assert_eq!(got, want, "{name}");
+        }
 
-    #[test]
-    fn rewrap_preserves_underline_colors_across_a_split() {
-        // Underline colours survive a width-change reflow: two differently
-        // coloured runs split across the wrap each land on the right cells.
-        let mut line = Line::with_hyperlinks("ABCD", Rle::new(), Vec::new());
-        line.set_underline_colors(vec![
-            UnderlineColorSpan::new(0, 2, 0x01_FF_00_00), // RGB red, cols 0-1
-            UnderlineColorSpan::new(2, 4, 0x02_00_00_03), // indexed 3, cols 2-3
-        ]);
-        let out = reflow_scrollback_lines(&[line], 2);
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0].as_str().unwrap(), "AB");
-        assert_eq!(out[1].as_str().unwrap(), "CD");
-        assert_eq!(out[0].get_underline_color(0), Some(0x01_FF_00_00));
-        assert_eq!(out[0].get_underline_color(1), Some(0x01_FF_00_00));
-        assert_eq!(out[1].get_underline_color(0), Some(0x02_00_00_03));
-        assert_eq!(out[1].get_underline_color(1), Some(0x02_00_00_03));
-    }
-
-    #[test]
-    fn rewrap_underline_color_gap_cell_has_none() {
-        // A cell in the gap between two underline-colour spans carries no colour
-        // after reflow (advancing cursor + `contains()` rejection).
-        let mut line = Line::with_hyperlinks("ABC", Rle::new(), Vec::new());
-        line.set_underline_colors(vec![
-            UnderlineColorSpan::new(0, 1, 0x01_11_22_33),
-            UnderlineColorSpan::new(2, 3, 0x01_44_55_66),
-        ]);
-        let out = reflow_scrollback_lines(&[line], 20);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].get_underline_color(0), Some(0x01_11_22_33));
-        assert_eq!(
-            out[0].get_underline_color(1),
-            None,
-            "gap cell must carry no colour"
-        );
-        assert_eq!(out[0].get_underline_color(2), Some(0x01_44_55_66));
-    }
-
-    #[test]
-    fn rewrap_hyperlink_gap_cell_has_no_link() {
-        // A cell in the gap between two spans gets no link (the cursor advances
-        // to the next span, then `contains()` rejects it).
-        use std::sync::Arc;
-        let spans = vec![
-            HyperlinkSpan::new(0, 1, Arc::from("a")),
-            HyperlinkSpan::new(2, 3, Arc::from("b")),
-        ];
-        let line = Line::with_hyperlinks("ABC", Rle::new(), spans);
-        let out = reflow_scrollback_lines(&[line], 20);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].get_hyperlink_span(0).map(|s| &*s.url), Some("a"));
-        assert_eq!(
-            out[0].get_hyperlink_span(1),
-            None,
-            "gap cell must carry no link"
-        );
-        assert_eq!(out[0].get_hyperlink_span(2).map(|s| &*s.url), Some("b"));
-    }
-
-    #[test]
-    fn rewrap_shrink_splits_logical_line() {
-        // One logical line "ABCDEFGHIJ" at width 10 -> width 4 = 3 rows.
-        let lines = vec![styled("ABCDEFGHIJ", false)];
-        let out = reflow_scrollback_lines(&lines, 4);
-        let texts: Vec<_> = out
-            .iter()
-            .map(|l| l.as_str().unwrap().to_string())
-            .collect();
-        assert_eq!(texts, vec!["ABCD", "EFGH", "IJ"]);
-        assert!(!out[0].is_wrapped());
-        assert!(out[1].is_wrapped());
-        assert!(out[2].is_wrapped());
-    }
-
-    #[test]
-    fn rewrap_grow_merges_soft_wrapped_run() {
-        // "ABCD" + wrapped "EFGH" + wrapped "IJ" -> width 20 = one row.
-        let lines = vec![
-            styled("ABCD", false),
-            styled("EFGH", true),
-            styled("IJ", true),
-        ];
-        let out = reflow_scrollback_lines(&lines, 20);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].as_str().unwrap(), "ABCDEFGHIJ");
-        assert!(!out[0].is_wrapped());
-    }
-
-    #[test]
-    fn rewrap_preserves_hard_newlines() {
-        let lines = vec![styled("ABC", false), styled("DEF", false)];
-        let out = reflow_scrollback_lines(&lines, 20);
-        let texts: Vec<_> = out
-            .iter()
-            .map(|l| l.as_str().unwrap().to_string())
-            .collect();
-        assert_eq!(texts, vec!["ABC", "DEF"]);
-        assert!(!out[0].is_wrapped());
-        assert!(!out[1].is_wrapped());
-    }
-
-    #[test]
-    fn rewrap_round_trip_is_content_stable() {
         let original = vec![styled("The quick brown fox jumps", false)];
-        let narrow = reflow_scrollback_lines(&original, 7);
-        let wide = reflow_scrollback_lines(&narrow, 40);
-        assert_eq!(wide.len(), 1);
-        assert_eq!(wide[0].as_str().unwrap(), "The quick brown fox jumps");
+        let round_trip = reflow_scrollback_lines(&reflow_scrollback_lines(&original, 7), 40);
+        assert_eq!(round_trip.len(), 1);
+        assert_eq!(round_trip[0].as_str(), Some("The quick brown fox jumps"));
     }
 
+    /// Hyperlink and underline-colour spans follow their cells across a split,
+    /// and a cell in the gap between two spans carries neither.
     #[test]
-    fn rewrap_blank_logical_line_survives() {
-        let lines = vec![styled("", false)];
-        let out = reflow_scrollback_lines(&lines, 10);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].as_str().unwrap_or(""), "");
-    }
-
-    #[test]
-    fn rewrap_wide_char_not_split_across_rows() {
-        // Two wide chars need 4 columns: at width 3 the second wraps.
-        let lines = vec![styled("世界", false)];
-        let out = reflow_scrollback_lines(&lines, 3);
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0].as_str().unwrap(), "世");
-        assert_eq!(out[1].as_str().unwrap(), "界");
-        assert!(out[1].is_wrapped());
+    fn rewrap_keeps_spans_on_their_cells_across_a_split() {
+        use std::sync::Arc;
+        let mut line = Line::with_hyperlinks(
+            "ABCD",
+            Rle::new(),
+            vec![
+                HyperlinkSpan::new(0, 1, Arc::from("a")),
+                HyperlinkSpan::new(2, 3, Arc::from("b")),
+            ],
+        );
+        line.set_underline_colors(vec![
+            UnderlineColorSpan::new(0, 1, 0x01_FF_00_00),
+            UnderlineColorSpan::new(2, 3, 0x02_00_00_03),
+        ]);
+        let out = reflow_scrollback_lines(&[line], 2);
+        let texts: Vec<_> = out.iter().map(|l| l.as_str()).collect();
+        assert_eq!(texts, [Some("AB"), Some("CD")]);
+        for (row, url, color) in [(0, "a", 0x01_FF_00_00), (1, "b", 0x02_00_00_03)] {
+            assert_eq!(out[row].get_hyperlink_span(0).map(|s| &*s.url), Some(url));
+            assert_eq!(out[row].get_underline_color(0), Some(color));
+            assert_eq!(out[row].get_hyperlink_span(1), None, "row {row} gap");
+            assert_eq!(out[row].get_underline_color(1), None, "row {row} gap");
+        }
     }
 
     #[test]

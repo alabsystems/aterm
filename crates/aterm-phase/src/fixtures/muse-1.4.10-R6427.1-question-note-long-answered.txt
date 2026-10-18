@@ -1,0 +1,45 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab) · that review submitted with Enter on `⟩ Submit answers`: `Structured user input answered — Color: None of the above (note: …)` and the result (the whole 276-byte text reached the model as `note`) · the lab's random project dir is spelled /private/tmp/at.lab0 here
+  (Recommended)"},{"id":"size","selected_label":"Small (Recommended)"}]}
+
+❯ toolstart
+
+  Questions 0/1 answered (interrupted)
+  Which checks should the probe run? (unanswered)
+  interrupted with 1 unanswered
+
+◆ Interrupted · Report issues with /feedback
+
+❯ toolstart
+
+◆ Backgrounded · Wait in the background · 3.2s · ctrl+o
+
+◆ Tool call done. Result: { "chunk_id": "exec-3-1", "execution_state": "background_running", "session_id": 3, "work_id":
+  "work.v2.managed_bash.sha256.ee604ea74c24964fcafa5eedd1192c7eabb2dd521c8247e9879b11b1fb23c640", ~
+
+❯ carry on with the task
+
+◆ Finished · Wait in the background · ✓ · ctrl+o
+
+◆ tick 1 tick 2 tick 3 tick 4 tick 5 tick 6 tick 7 tick 8 tick 9 tick 10 tick 11 tick 12 tick 13 tick 14 tick 15 tick 16 tick 17 tick 18 tick 19
+  tick 20 tick 21 tick 22 tick 23 tick 24 tick 25 tick 26 tick 27 tick 28 tick 29 tick 30
+
+◆ tick 1 tick 2 tick 3 tick 4 tick 5 tick 6 tick 7 tick 8 tick 9 tick 10 tick 11 tick 12 tick 13 tick 14 tick 15 tick 16 tick 17 tick 18 tick 19
+  tick 20 tick 21 tick 22 tick 23 tick 24 tick 25 tick 26 tick 27 tick 28 tick 29 tick 30
+
+◆ Worked for 1m 01s · 6:29 PM · 16/Oct
+
+◆ Recap: ok
+
+❯ toolstart
+
+  Structured user input answered — Color: None of the above (note: Decide yourself: choose the option that best serves long term correctness and
+  total value even at the cost of short term deliverables. Say which you chose and why in one line and continue without asking again. (Answered
+  by the aterm harness by policy. The user was not asked.))
+
+◆ Tool call done. Result: {"status":"answered","answers":[{"id":"color","free_text":"None of the above","note":"Decide yourself: choose the
+  option that best serves long term correctness and total value even at the cost of sho~
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  lab-stub · high · /private/tmp/at.lab0/proj · Auto-review

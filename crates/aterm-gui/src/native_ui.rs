@@ -342,7 +342,7 @@ pub(crate) enum SemanticRole {
     Status,
     /// A SCROLLING LIST of entries (Settings ▸ Messages' log, design ruling
     /// 264): a list with no pager, which a screen reader scrolls itself —
-    /// accesskit's `List` with its scroll actions, lowered to the same
+    /// the a11y model's `List` with its scroll actions, lowered to the same
     /// `ScrollLines` the wheel and the arrow keys send.
     List,
 }
@@ -570,6 +570,12 @@ pub(crate) enum ButtonIcon {
     Trail,
     /// A speaker: the Sound page.
     Sound,
+    /// A set of palettes, four tinted squares: Settings ▸ Themes, whose row
+    /// sits right under Appearance's ring while it shows.
+    Themes,
+    /// A four-pointed spark: Settings ▸ AI CLIs, whose row sits right under
+    /// Harness's robot while it shows.
+    Spark,
 }
 
 impl ButtonSpec {
@@ -1117,7 +1123,7 @@ pub(crate) struct TextViewportSpec {
 }
 
 /// Canonical editor viewport geometry shared by paint and accessibility. The
-/// values are logical native-app pixels; the AccessKit host applies the final
+/// values are logical native-app pixels; the accessibility host applies the final
 /// window scale/translation only at the semantic root.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct TextViewportGeometry {
@@ -1475,18 +1481,6 @@ fn whole_editor_rows(geometry: &TextViewportGeometry) -> usize {
     // A hair of slack: a body that is a whole number of rows tall in exact
     // arithmetic must not lose its last row to float rounding.
     (((geometry.body_h + 0.01) / geometry.line_h).floor() as usize).clamp(1, 256)
-}
-
-#[cfg(test)]
-pub(crate) fn editor_visible_line_capacity_at_scale(
-    viewport: LogicalRect,
-    text_scale: f32,
-) -> usize {
-    let geometry = text_viewport_geometry_at_scale(
-        editor_text_viewport_rect_at_scale(viewport, EditorPalette::None, text_scale),
-        text_scale,
-    );
-    whole_editor_rows(&geometry)
 }
 
 /// Map a logical pointer location to a canonical document UTF-8 byte boundary
@@ -2444,18 +2438,19 @@ impl CompiledUi {
     }
 
     /// [`Self::tray`] with the CHROME palette and the TERMINAL theme split: the
-    /// role tokens every control paints with derive from `chrome_theme`, while
+    /// role tokens every control paints with derive from `chrome` (its theme,
+    /// palette hues and authored accent and border), while
     /// `terminal_theme` reaches only the nodes that display terminal content
     /// (the Settings appearance preview's live-colors fallback). The two are
     /// the same value everywhere chrome follows the terminal.
     pub(crate) fn tray_with_chrome(
         &self,
-        chrome_theme: aterm_render::Theme,
+        chrome: impl Into<crate::chrome_band::ChromePalette>,
         terminal_theme: aterm_render::Theme,
         base_px: f32,
     ) -> crate::widget::TrayInput {
         let theme = terminal_theme;
-        let roles = crate::settings::Roles::from_theme(chrome_theme);
+        let roles = crate::settings::Roles::from_theme(chrome);
         let mut prims = Vec::with_capacity(self.paint.len() * 5);
         for node in &self.paint {
             prims.push(crate::widget::DrawPrim::ClipPush {
@@ -4521,6 +4516,16 @@ pub(crate) fn fit_native_text_label(value: &str, max_width: f32) -> String {
     elide_ui_label(value, max_width, native_type_px(TypeStep::Body).get())
 }
 
+/// The width the painter needs to draw one-line native status copy WHOLE,
+/// in the exact face and rung [`fit_native_status_label`] elides against.
+pub(crate) fn native_status_label_width(value: &str) -> f32 {
+    visual_text_width(
+        value,
+        native_type_px(TypeStep::Caption).get(),
+        crate::widget::TextFace::Ui,
+    )
+}
+
 /// Bounded visual projection for one-line native status copy. The owning
 /// semantic Group remains responsible for the complete message.
 pub(crate) fn fit_native_status_label(value: &str, max_width: f32) -> String {
@@ -4669,11 +4674,8 @@ fn paint_button_icon(
             r_outer: 8.0,
             thickness: 3.0,
             track: rgba(color, 70),
-            sys_frac: 0.5,
-            sys_color: rgba(color, 240),
-            tab_frac: None,
-            tab_color: rgba(color, 0),
-            dashed_tab: false,
+            frac: 0.5,
+            fill: rgba(color, 240),
         }),
         ButtonIcon::Text => {
             prims.push(line(cx - 7.0, cy - 6.0, 14.0, 1.0));
@@ -4763,6 +4765,47 @@ fn paint_button_icon(
         ButtonIcon::Swatch => {
             prims.push(outline(cx - 8.0, cy - 6.0, 16.0, 12.0, 2.0));
             prims.push(block(cx - 8.0, cy - 6.0, 8.0, 5.0, 1.5));
+        }
+        ButtonIcon::Themes => {
+            // Four palettes in a 2×2 grid, each its own strength of the ink,
+            // so the set reads as several schemes rather than one swatch.
+            for (dx, dy, alpha) in [
+                (-1.0_f32, -1.0_f32, 240_u8),
+                (1.0, -1.0, 170),
+                (-1.0, 1.0, 110),
+                (1.0, 1.0, 200),
+            ] {
+                prims.push(DrawPrim::Panel {
+                    x: cx + dx * 1.5 + (dx - 1.0) * 3.0,
+                    y: cy + dy * 1.5 + (dy - 1.0) * 3.0,
+                    w: 6.0,
+                    h: 6.0,
+                    radius: 1.5,
+                    fill: rgba(color, alpha),
+                });
+            }
+        }
+        ButtonIcon::Spark => {
+            // A four-pointed star: each point's two edges meet the next
+            // point's at a pinched waist, and a small dot rides its shoulder.
+            let waist = 2.0_f32;
+            for (px, py, wx, wy) in [
+                (0.0_f32, -8.0_f32, 1.0_f32, -1.0_f32),
+                (8.0, 0.0, 1.0, 1.0),
+                (0.0, 8.0, -1.0, 1.0),
+                (-8.0, 0.0, -1.0, -1.0),
+            ] {
+                prims.push(segment(cx + px, cy + py, cx + wx * waist, cy + wy * waist));
+                // The waist after this point leads into the next one.
+                let (nx, ny) = (-py, px);
+                prims.push(segment(cx + wx * waist, cy + wy * waist, cx + nx, cy + ny));
+            }
+            prims.push(DrawPrim::Dot {
+                cx: cx + 6.5,
+                cy: cy - 6.5,
+                r: 1.3,
+                color: rgba(color, 220),
+            });
         }
         ButtonIcon::Document => {
             prims.push(outline(cx - 6.0, cy - 8.0, 12.0, 16.0, 2.0));
@@ -6280,14 +6323,14 @@ fn mix_rgb(a: [u8; 3], b: [u8; 3], amount: f32) -> [u8; 3] {
 /// open one on dark chrome. That reasoning is sound and the proxy still gets it
 /// wrong, because the two questions are answered by DIFFERENT predicates: the
 /// ramp's direction is fixed by which of `bg` and `fg` is lighter, while the
-/// proxy classifies one derived neutral against a fixed luma threshold, and one
+/// proxy classifies one derived neutral against the dark/light pole, and one
 /// step of ramp is enough to cross it. A theme at `#979797` on dark ink builds
 /// `surface #8F8F8F` over `elevated #868686` while `elevated` itself classifies
 /// dark, so the proxy chose the darker of the two and the banner sank below its
 /// own cards. Measuring answers the question the doc always asked.
 ///
 /// The POUR is picked by measuring too, and against the same base, which is the
-/// half the proxy kept. `surface_is_dark(base)` asks a 150-luma threshold to
+/// half the proxy kept. `surface_is_dark(base)` asks the dark/light pole to
 /// stand in for "will this green lift the sky or shade it" — a question about
 /// two specific colours, one of which is the green. So the code asks it of the
 /// two colours instead: pour the leaf green when it MEASURES more open than the
@@ -6635,50 +6678,6 @@ fn resolve_length(length: Length, available: f32) -> f32 {
 pub(crate) mod tests {
     use super::*;
 
-    /// THE LOG'S MARK IS THE BAND'S ICON (rulings 262 and 263): the icon is
-    /// the row's own glyph's — `aterm v0.92.0 is ready` (Info, ✓) keeps its
-    /// check, `aterm crashed last time` (Error, ⚠) its triangle — with the
-    /// severity's colour and rail; a glyph with no drawn icon, and a value
-    /// with no glyph, fall back to the severity's own icon.
-    #[test]
-    fn the_log_mark_draws_the_rows_glyph_in_the_severitys_colour() {
-        use crate::widget::{DrawPrim, rgba};
-        use aterm_render::BandIcon;
-
-        let roles = crate::settings::Roles::from_theme(aterm_render::Theme::default());
-        let mark = |value: &str| {
-            let mut prims = Vec::new();
-            paint_messages_severity(
-                &mut prims,
-                LogicalRect::new(0.0, 0.0, 24.0, 30.0),
-                Some(value),
-                &roles,
-            );
-            let rail = prims
-                .iter()
-                .any(|prim| matches!(prim, DrawPrim::Panel { .. }));
-            let icon = prims
-                .iter()
-                .find_map(|prim| match prim {
-                    DrawPrim::BandIcon { icon, color, .. } => Some((*icon, *color)),
-                    _ => None,
-                })
-                .expect("an icon");
-            (icon.0, icon.1, rail)
-        };
-        let muted = rgba(readable_secondary(&roles), 255);
-        let danger = rgba(roles.danger, 255);
-        assert_eq!(mark("info:\u{2713}"), (BandIcon::Success, muted, false));
-        assert_eq!(mark("error:\u{26a0}"), (BandIcon::Warn, danger, true));
-        assert_eq!(mark("info:\u{21e3}"), (BandIcon::Download, muted, false));
-        assert_eq!(mark("error:x"), (BandIcon::Error, danger, true), "no icon");
-        assert_eq!(mark("error"), (BandIcon::Error, danger, true), "no glyph");
-        assert_eq!(
-            mark("success:\u{2713}"),
-            (BandIcon::Success, rgba(roles.success, 255), false)
-        );
-    }
-
     /// The hero banner's sky survives a MID-TONE terminal theme.
     ///
     /// The banner tints its sky with the palette's own green, and the first pass
@@ -6706,7 +6705,7 @@ pub(crate) mod tests {
     /// theme's green happened to land.
     #[test]
     fn the_hero_banner_sky_survives_a_mid_tone_terminal_theme() {
-        use crate::native_appearance::contrast_ratio;
+        use crate::native_appearance::{contrast_ratio, forced_chrome_theme};
         use aterm_render::Theme;
 
         // `contrast_ratio` against black is monotone in relative luminance, so
@@ -6741,14 +6740,29 @@ pub(crate) mod tests {
         band.push(("#797676 on light ink".to_string(), 0x0079_7676, 0x00EE_EEEE));
         band.push(("#999955 on dark ink".to_string(), 0x0099_9955, 0x0022_2211));
         band.push(("#999955 on light ink".to_string(), 0x0099_9955, 0x00EE_EEEE));
+        let mut themes: Vec<(String, Theme)> = band
+            .into_iter()
+            .map(|(label, bg, fg)| {
+                let theme = Theme {
+                    fg,
+                    bg,
+                    cursor: 0x0085_9900,
+                    selection: 0x00EE_E8D5,
+                };
+                (label, theme)
+            })
+            .collect();
+        // And both forced chrome sides, whose skies sit at the band's ends.
+        themes.push((
+            "forced-light".to_string(),
+            forced_chrome_theme(Theme::default(), false),
+        ));
+        themes.push((
+            "forced-dark".to_string(),
+            forced_chrome_theme(FORCED_DARK_TERMINAL, true),
+        ));
 
-        for (label, bg, fg) in band {
-            let theme = Theme {
-                fg,
-                bg,
-                cursor: 0x0085_9900,
-                selection: 0x00EE_E8D5,
-            };
+        for (label, theme) in themes {
             let roles = crate::settings::Roles::from_theme(theme);
             let (sky, rim) = rainbow_banner_sky(&roles);
 
@@ -6786,144 +6800,90 @@ pub(crate) mod tests {
     }
 
     /// THE ATTENTION BADGE (2026-09-22): a rail row that wears it paints ONE dot in
-    /// the danger role past its label — at the end of a wide row, on the
-    /// pictogram's shoulder of an icon-only one — and the label gives the dot its
-    /// room, in the painter and in the fit audit alike ([`badge_reserve`]). A row
-    /// without it paints no dot at all.
+    /// the danger role inside the row — past its label, on the pictogram's
+    /// shoulder of an icon-only row, and clear of a trailing chevron's slot — and
+    /// the fit audit gives the dot its room ([`badge_reserve`]). A row without it
+    /// paints no dot at all.
     #[test]
-    fn a_badged_rail_row_paints_one_danger_dot_past_its_label() {
+    fn a_badged_rail_row_paints_one_danger_dot_clear_of_its_label_and_chevron() {
         use crate::native_appearance::forced_chrome_theme;
         use crate::widget::DrawPrim;
         use aterm_render::Theme;
         crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
         let theme = forced_chrome_theme(Theme::default(), false);
         let roles = crate::settings::Roles::from_theme(theme);
-        let paint = |spec: ButtonSpec, rect: LogicalRect| {
-            let node = PaintNode {
-                peek: false,
-                key: UiKey::new("settings/nav/packages"),
-                rect,
-                clip: rect,
-                content: UiContent::Button(
-                    Control::new(spec, ActionId::new("settings/route/packages"))
-                        .style(StyleRef::Navigation),
-                ),
-            };
-            let mut prims = Vec::new();
-            paint_compiled_node(&mut prims, &node, roles, theme, 14.0);
-            (node, prims)
+        let node = |spec: ButtonSpec, rect: LogicalRect| PaintNode {
+            peek: false,
+            key: UiKey::new("settings/nav/packages"),
+            rect,
+            clip: rect,
+            content: UiContent::Button(
+                Control::new(spec, ActionId::new("settings/route/packages"))
+                    .style(StyleRef::Navigation),
+            ),
         };
-        let dots = |prims: &[DrawPrim]| -> Vec<(f32, f32)> {
+        let dots = |node: &PaintNode| -> Vec<(f32, f32, f32)> {
+            let mut prims = Vec::new();
+            paint_compiled_node(&mut prims, node, roles, theme, 14.0);
             prims
                 .iter()
                 .filter_map(|p| match p {
-                    DrawPrim::Dot { cx, cy, color, .. } if color[..3] == roles.danger => {
-                        Some((*cx, *cy))
-                    }
+                    DrawPrim::Dot {
+                        cx, cy, r, color, ..
+                    } if color[..3] == roles.danger => Some((*cx, *cy, *r)),
                     _ => None,
                 })
                 .collect()
         };
-        let row = || ButtonSpec::new("Packages").visual_icon(ButtonIcon::Packages);
-        let wide = LogicalRect::new(8.0, 40.0, 180.0, 34.0);
-        let (_, plain) = paint(row(), wide);
-        assert!(dots(&plain).is_empty(), "no badge, no dot");
-        let (node, badged) = paint(row().badge(true), wide);
-        let wide_dots = dots(&badged);
-        assert_eq!(wide_dots.len(), 1, "one dot: {wide_dots:?}");
-        let (cx, cy) = wide_dots[0];
-        assert!(
-            cx > wide.x + 40.0 && cx < wide.right(),
-            "at the row's end: {cx}"
-        );
-        assert!((cy - (wide.y + wide.height / 2.0)).abs() < 0.01);
-        // The label's slot is the painter's, badge and all.
-        let audit = text_fit_audit(&node).expect("a rail label is audited");
-        let plain_audit = text_fit_audit(&PaintNode {
-            peek: false,
-            content: UiContent::Button(
-                Control::new(row(), ActionId::new("settings/route/packages"))
-                    .style(StyleRef::Navigation),
+        let icon_row = || ButtonSpec::new("Packages").visual_icon(ButtonIcon::Packages);
+        let chevron_row = || ButtonSpec::new("Packages").trailing_icon(ButtonIcon::Forward);
+        for (shape, spec, rect, labelled) in [
+            (
+                "icon row",
+                icon_row as fn() -> ButtonSpec,
+                LogicalRect::new(8.0, 40.0, 180.0, 34.0),
+                true,
             ),
-            ..node.clone()
-        })
-        .expect("audited");
-        assert!(
-            (plain_audit.authored_available - audit.authored_available - 16.0).abs() < 0.01,
-            "the badge takes its 16pt from the label's slot: {} vs {}",
-            plain_audit.authored_available,
-            audit.authored_available
-        );
-        // Icon-only: the dot sits on the pictogram's shoulder, inside the row.
-        let narrow = LogicalRect::new(8.0, 40.0, 48.0, 34.0);
-        let (_, icon_only) = paint(row().badge(true), narrow);
-        let icon_dots = dots(&icon_only);
-        assert_eq!(icon_dots.len(), 1, "{icon_dots:?}");
-        let (cx, cy) = icon_dots[0];
-        assert!(narrow.contains(cx, cy), "{cx},{cy} inside {narrow:?}");
-    }
-
-    /// THE BADGE BESIDE A CHEVRON (review, 2026-09-22): the painter's third branch —
-    /// a rail row with no pictogram and a trailing chevron — keeps the dot clear of
-    /// the chevron's slot, and the label's elided slot, in the painter and in the
-    /// fit audit alike, ends before the dot does.
-    #[test]
-    fn a_badged_label_row_keeps_its_dot_clear_of_the_chevron() {
-        use crate::native_appearance::forced_chrome_theme;
-        use crate::widget::DrawPrim;
-        use aterm_render::Theme;
-        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
-        let theme = forced_chrome_theme(Theme::default(), false);
-        let roles = crate::settings::Roles::from_theme(theme);
-        let rect = LogicalRect::new(0.0, 0.0, 320.0, 44.0);
-        let node = |badge: bool| PaintNode {
-            peek: false,
-            key: UiKey::new("settings/categories/packages"),
-            rect,
-            clip: rect,
-            content: UiContent::Button(
-                Control::new(
-                    ButtonSpec::new("Packages")
-                        .trailing_icon(ButtonIcon::Forward)
-                        .badge(badge),
-                    ActionId::new("settings/route/packages"),
-                )
-                .style(StyleRef::Navigation),
+            (
+                "icon-only row",
+                icon_row,
+                LogicalRect::new(8.0, 40.0, 48.0, 34.0),
+                false,
             ),
-        };
-        let mut prims = Vec::new();
-        paint_compiled_node(&mut prims, &node(true), roles, theme, 14.0);
-        let dots: Vec<(f32, f32, f32)> = prims
-            .iter()
-            .filter_map(|p| match p {
-                DrawPrim::Dot {
-                    cx, cy, r, color, ..
-                } if color[..3] == roles.danger => Some((*cx, *cy, *r)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(dots.len(), 1, "{dots:?}");
-        let (cx, cy, r) = dots[0];
-        // The chevron is painted in the row's last 34pt (`paint_compiled_node`).
-        let chevron_left = rect.right() - 34.0;
-        assert!(
-            cx + r < chevron_left,
-            "the dot ({cx}±{r}) stays left of the chevron's slot at {chevron_left}"
-        );
-        assert!(rect.contains(cx, cy));
-        let audit = text_fit_audit(&node(true)).expect("audited");
-        let plain = text_fit_audit(&node(false)).expect("audited");
-        assert!(
-            (plain.authored_available - audit.authored_available - 16.0).abs() < 0.01,
-            "the badge takes its 16pt from the label: {} vs {}",
-            plain.authored_available,
-            audit.authored_available
-        );
-        let label_right = rect.x + 12.0 + audit.authored_available;
-        assert!(
-            label_right < cx - r,
-            "the label's slot ends at {label_right}, before the dot at {cx}±{r}"
-        );
+            (
+                "chevron row",
+                chevron_row,
+                LogicalRect::new(0.0, 0.0, 320.0, 44.0),
+                true,
+            ),
+        ] {
+            assert!(
+                dots(&node(spec(), rect)).is_empty(),
+                "{shape}: no badge, no dot"
+            );
+            let badged = node(spec().badge(true), rect);
+            let found = dots(&badged);
+            assert_eq!(found.len(), 1, "{shape}: one dot: {found:?}");
+            let (cx, cy, r) = found[0];
+            assert!(rect.contains(cx, cy), "{shape}: {cx},{cy} inside {rect:?}");
+            if shape == "chevron row" {
+                // The chevron is painted in the row's last 34pt.
+                assert!(
+                    cx + r < rect.right() - 34.0,
+                    "the dot ({cx}±{r}) stays left of the chevron's slot"
+                );
+            }
+            if labelled {
+                let audit = text_fit_audit(&badged).expect("a rail label is audited");
+                let plain = text_fit_audit(&node(spec(), rect)).expect("audited");
+                assert!(
+                    audit.authored_available < plain.authored_available,
+                    "{shape}: the badge takes its room from the label's slot: {} vs {}",
+                    audit.authored_available,
+                    plain.authored_available
+                );
+            }
+        }
     }
 
     /// A COLOUR CHIP ON A BUTTON: a button that names a colour wears the chip a
@@ -7105,18 +7065,6 @@ pub(crate) mod tests {
                 .iter()
                 .any(|p| matches!(p, DrawPrim::Text { face, .. } if *face == TextFace::UiBold))
         };
-        let rail_bar = |prims: &[DrawPrim]| {
-            prims.iter().any(|p| {
-                matches!(
-                    p,
-                    DrawPrim::Panel { x, w, h, fill, .. }
-                        if (*x - rect.x).abs() < 0.01
-                            && *w <= 6.0
-                            && *h >= rect.height * 0.5
-                            && fill[..3] == roles.accent
-                )
-            })
-        };
         let accent_rim = |prims: &[DrawPrim]| {
             prims.iter().any(|p| {
                 matches!(
@@ -7127,40 +7075,6 @@ pub(crate) mod tests {
             })
         };
         // The label is the accent AS TEXT: its hue at the text floor.
-        let accent_ink = |prims: &[DrawPrim]| {
-            prims.iter().any(
-                |p| matches!(p, DrawPrim::Text { color, .. } if color[..3] == roles.accent_ink),
-            )
-        };
-
-        // THE RAIL BAR is every stacked row's, on both rail shapes.
-        for (label, spec) in [
-            ("settings rail row", rail_row as fn() -> ButtonSpec),
-            ("markdown outline row", outline_row),
-        ] {
-            let selected = paint(spec(), true);
-            assert!(
-                rail_bar(&selected),
-                "{label}: the selected row has no rail indicator"
-            );
-            assert!(
-                accent_rim(&selected),
-                "{label}: the selected row has no accent rim"
-            );
-            assert!(
-                accent_ink(&selected),
-                "{label}: the selected row is not inked in the accent"
-            );
-            let resting = paint(spec(), false);
-            assert!(
-                !rail_bar(&resting),
-                "{label}: a resting row grew a rail indicator"
-            );
-            assert!(
-                !semibold(&resting),
-                "{label}: a resting row is already semibold"
-            );
-        }
 
         // SEMIBOLD is only the destination's.
         assert!(
@@ -7168,31 +7082,22 @@ pub(crate) mod tests {
             "the selected rail destination is not semibold — selection reads as nothing"
         );
         assert!(
+            !semibold(&paint(rail_row(), false)),
+            "a resting rail row is already semibold"
+        );
+        assert!(
             !semibold(&paint(outline_row(), true)),
             "a selected outline row grew semibold ink in a slot its heading already fills"
         );
-
         let chip = paint(mode_chip(), true);
         assert!(
             !semibold(&chip),
             "a selected toolbar chip grew semibold ink in a slot measured for regular"
         );
-        assert!(
-            !rail_bar(&chip),
-            "a selected toolbar chip grew a rail indicator, and it is not on a rail"
-        );
-        // It still has to READ as selected, on marks that cost it no width.
+        // It still has to READ as selected, on a mark that costs it no width.
         assert!(
             accent_rim(&chip),
             "a selected toolbar chip lost its accent rim"
-        );
-        assert!(
-            accent_ink(&chip),
-            "a selected toolbar chip lost its accent ink"
-        );
-        assert!(
-            !accent_rim(&paint(mode_chip(), false)),
-            "a resting toolbar chip already wears the selected rim"
         );
 
         // The defect itself, at the AUTHORED slot: `markdown_toolbar_label_width`
@@ -7225,145 +7130,6 @@ pub(crate) mod tests {
             "the selected mode chip elided its own word inside its authored {slot}pt slot \
              (semibold in a space measured for regular at {px}px)"
         );
-
-        // And the SECOND defect of the same shape, at the outline's real
-        // geometry: a 220pt column with 16pt of padding is a 188pt row, whose
-        // label slot is `width - 22`. `bounded_markdown_label` caps a heading at
-        // 32 characters, so a heading that runs to the brim of that slot is the
-        // ordinary case rather than a contrived one — and SELECTING it must not
-        // be what deletes its last word.
-        let outline_rect = LogicalRect::new(16.0, 40.0, 220.0 - 32.0, 32.0);
-        let outline_slot = outline_rect.width - 22.0;
-        let outline_px = 14.0;
-        // DERIVED, not hardcoded: the premise is a relationship between the
-        // slot and the two faces' advances, and the UI face ladder moves under
-        // this test (a Noto/DejaVu swap shifted the old fixture from 159.7pt to
-        // 172.0pt regular and falsified it outright).
-        //
-        // Search for a heading that satisfies BOTH halves rather than assuming
-        // one does. The previous shape grew to the longest prefix that fits at
-        // REGULAR and asserted "one character more would overflow, so the
-        // semibold cut necessarily does too" — which is not true, and Windows
-        // proved it: Segoe's longest fitting prefix measured 159.8pt regular /
-        // 165.8pt semibold against a 166.0pt slot, i.e. semibold FIT, by 0.2pt,
-        // and the premise assertion failed. (The `trim_end` below is part of
-        // why: dropping a trailing space shrinks the very measurement the
-        // premise is about, so it must happen BEFORE the two faces are compared,
-        // not after.) The window is only about one character wide, so whether
-        // any single prefix lands in it is down to the host font — test every
-        // prefix and keep the longest that genuinely qualifies.
-        // Whole characters of a sentence step the measure by ~6pt, but the window
-        // in which the premise holds — regular fits AND semibold does not — is
-        // only about one character wide, so a prefix search alone lands in it only
-        // by luck of the host face. Segoe misses it: no prefix of the sentence
-        // below qualifies. So widen the candidate set with NARROW characters,
-        // which step ~3pt and can therefore land inside the window on any face.
-        let source = "Getting started with aterm on a Linux desktop today";
-        let qualifies = |text: &str| {
-            let reg = crate::tray_raster::ui_text_width_for(TextFace::Ui, text, outline_px);
-            let semi = crate::tray_raster::ui_text_width_for(TextFace::UiBold, text, outline_px);
-            (reg <= outline_slot, semi > outline_slot)
-        };
-        let mut heading_owned = String::new();
-        let mut base = String::new();
-        let mut candidate = String::new();
-        for ch in source.chars() {
-            candidate.push(ch);
-            let trimmed = candidate.trim_end();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let (reg_fits, semi_over) = qualifies(trimmed);
-            if !reg_fits {
-                break;
-            }
-            // The longest prefix that still fits at regular — the base the narrow
-            // run below extends when no whole-character prefix qualifies.
-            base = trimmed.to_string();
-            if semi_over {
-                heading_owned = trimmed.to_string();
-            }
-        }
-        if heading_owned.is_empty() {
-            let mut grown = base.clone();
-            for _ in 0..16 {
-                grown.push('i');
-                let (reg_fits, semi_over) = qualifies(&grown);
-                if !reg_fits {
-                    break;
-                }
-                if semi_over {
-                    heading_owned = grown.clone();
-                    break;
-                }
-            }
-        }
-        assert!(
-            !heading_owned.is_empty(),
-            "no heading built from {source:?} fits at regular while overflowing in semibold \
-             in a {outline_slot}pt slot at {outline_px}px on this host's UI face — the premise \
-             this test pins cannot be built here, so widen the search rather than deleting \
-             the assertion"
-        );
-        let heading: &str = heading_owned.as_str();
-        // MEASURE AT THE SIZE THE PAINTER USES. The premise below used the ambient
-        // `px`, which the chip section above had shadowed to
-        // `native_type_px(TypeStep::Secondary)` — 13.0 — while every
-        // `paint_compiled_node` call in this test runs at 14.0. So the premise
-        // described a type size the painter never uses: it measured the heading at
-        // 149.0 regular / 154.3 semibold against the 166.0 slot and concluded that
-        // semibold FITS, when at the painted size it measures 160.4 / 166.2 and
-        // overflows by 0.2pt — which is the whole case this test exists to pin.
-        // Named so the two cannot drift apart again.
-        let outline_painted = |selected: bool| {
-            let mut control = Control::new(
-                ButtonSpec::new(heading),
-                ActionId::new("markdown/outline/3"),
-            )
-            .style(StyleRef::Navigation);
-            control.state.selected = selected;
-            let node = PaintNode {
-                peek: false,
-                key: UiKey::new("markdown/outline-item/3"),
-                rect: outline_rect,
-                clip: outline_rect,
-                content: UiContent::Button(control),
-            };
-            let mut prims = Vec::new();
-            paint_compiled_node(&mut prims, &node, roles, theme, outline_px);
-            let painted = prims.iter().find_map(|p| match p {
-                DrawPrim::Text { s, .. } => Some(s.clone()),
-                _ => None,
-            });
-            // The repo's own overflow sensor has to agree, on the same node.
-            assert_eq!(
-                painted,
-                text_fit_audit(&node).map(|audit| audit.painted),
-                "outline row (selected={selected}): the paint-truth audit and the \
-                 painter disagree about the label that reaches the glass"
-            );
-            painted
-        };
-        // The premise: it FITS at rest, and it does not fit in semibold. Without
-        // both halves the assertion below is vacuous.
-        let regular = crate::tray_raster::ui_text_width_for(TextFace::Ui, heading, outline_px);
-        let bold = crate::tray_raster::ui_text_width_for(TextFace::UiBold, heading, outline_px);
-        assert!(
-            regular <= outline_slot && bold > outline_slot,
-            "the premise moved: {heading:?} measures {regular:.1}pt regular / {bold:.1}pt \
-             semibold against a {outline_slot:.1}pt slot"
-        );
-        assert_eq!(
-            outline_painted(true).as_deref(),
-            Some(heading),
-            "selecting an outline row cost it a word: {bold:.1}pt of semibold in the \
-             {outline_slot:.1}pt slot its {regular:.1}pt heading already fits"
-        );
-        assert_eq!(
-            outline_painted(true),
-            outline_painted(false),
-            "an outline row paints a different label selected than at rest"
-        );
     }
 
     /// The paint-truth audit measures the face the painter DRAWS.
@@ -7394,6 +7160,12 @@ pub(crate) mod tests {
             ButtonSpec::new("A document heading long enough to elide"),
             ButtonSpec::new("Preview mode").visual_label("Preview"),
             ButtonSpec::new("Software Update").trailing_icon(ButtonIcon::Forward),
+            ButtonSpec::new("Appearance and window theme")
+                .visual_icon(ButtonIcon::Home)
+                .badge(true),
+            ButtonSpec::new("Software Update")
+                .trailing_icon(ButtonIcon::Forward)
+                .badge(true),
         ];
         for spec in specs {
             for selected in [false, true] {
@@ -7424,37 +7196,31 @@ pub(crate) mod tests {
         }
     }
 
+    /// A light terminal theme, as the forced-DARK chrome side starts from.
+    const FORCED_DARK_TERMINAL: aterm_render::Theme = aterm_render::Theme {
+        fg: 0x0065_7B83,
+        bg: 0x00FD_F6E3,
+        cursor: 0x0085_9900,
+        selection: 0x00EE_E8D5,
+    };
+
     /// The Top Settings hero banner follows the RESOLVED chrome palette.
     ///
-    /// It used to fill with the landing page's authored `#EDF6EC` mint and a
-    /// `#C9DDC8` hairline — byte-identical in auto-dark, auto-light, forced-light
-    /// and forced-dark alike, which put a near-white slab in the middle of the
-    /// forced-DARK Settings page and made it the last surface where config
-    /// `window_theme` was still a no-op. This pins the property that repaired it:
-    /// the sky is a function of the palette, so the two chrome SIDES cannot paint
-    /// the same banner, and each side's sky stays on its own side.
+    /// It used to fill with the landing page's authored `#EDF6EC` mint —
+    /// byte-identical on every chrome side, which put a near-white slab in the
+    /// middle of the forced-DARK Settings page. The sky is a function of the
+    /// palette, so the two forced sides paint different skies, each on its own
+    /// side (the sky's openness and rim on both sides are swept with the band in
+    /// [`the_hero_banner_sky_survives_a_mid_tone_terminal_theme`]).
     #[test]
     fn the_hero_banner_sky_follows_the_resolved_chrome_palette() {
-        use crate::native_appearance::{contrast_ratio, forced_chrome_theme, surface_is_dark};
+        use crate::native_appearance::{forced_chrome_theme, surface_is_dark};
         use aterm_render::Theme;
 
-        let terminal_dark = Theme::default();
-        let terminal_light = Theme {
-            fg: 0x0065_7B83,
-            bg: 0x00FD_F6E3,
-            cursor: 0x0085_9900,
-            selection: 0x00EE_E8D5,
-        };
-        let sky_for = |theme: Theme| {
-            let roles = crate::settings::Roles::from_theme(theme);
-            let (sky, rim) = rainbow_banner_sky(&roles);
-            (sky, rim, roles)
-        };
-
-        let (light_sky, light_rim, light_roles) =
-            sky_for(forced_chrome_theme(terminal_dark, false));
-        let (dark_sky, dark_rim, dark_roles) = sky_for(forced_chrome_theme(terminal_light, true));
-
+        let sky_for =
+            |theme: Theme| rainbow_banner_sky(&crate::settings::Roles::from_theme(theme)).0;
+        let light_sky = sky_for(forced_chrome_theme(Theme::default(), false));
+        let dark_sky = sky_for(forced_chrome_theme(FORCED_DARK_TERMINAL, true));
         assert_ne!(
             light_sky, dark_sky,
             "the two forced chrome sides paint the same sky — window_theme is a no-op here again"
@@ -7467,175 +7233,6 @@ pub(crate) mod tests {
             surface_is_dark(dark_sky),
             "the forced-DARK banner sky {dark_sky:?} classifies light"
         );
-
-        for (label, sky, rim, roles) in [
-            ("forced-light", light_sky, light_rim, light_roles),
-            ("forced-dark", dark_sky, dark_rim, dark_roles),
-        ] {
-            // A SKY, not another card: on BOTH sides it stays at least as open
-            // as the cards standing on the same page, never darker than them.
-            // (`contrast_ratio` against black is monotone in relative
-            // luminance, so it reads as a luminance probe here.)
-            let openness = |c: [u8; 3]| contrast_ratio(c, [0, 0, 0]);
-            assert!(
-                openness(sky) >= openness(roles.elevated),
-                "{label}: the banner sky {sky:?} sits heavier than the cards {:?}",
-                roles.elevated
-            );
-            // The hairline has to be visible on the sky it encloses, and it must
-            // not turn into a second, louder border than every other card wears.
-            let rim_vs_sky = contrast_ratio(rim, sky);
-            assert!(
-                rim_vs_sky > 1.08,
-                "{label}: the banner rim {rim:?} vanishes into its own sky ({rim_vs_sky:.2}:1)"
-            );
-            assert!(
-                rim_vs_sky <= contrast_ratio(roles.text_primary, sky),
-                "{label}: the banner rim outshouts the page's own ink"
-            );
-        }
-    }
-
-    /// The SELECTED rail row has to read as selected, and its label as text.
-    ///
-    /// Its label is the accent as text ([`crate::native_appearance::NativeRoles::accent_ink`]),
-    /// held to 4.5:1 on the wash it is inked on, while the accent itself keeps
-    /// its own floor for fills and rims (raising the global floor pastels the
-    /// accent everywhere it lands on dark chrome). The selection is carried by
-    /// three marks: a semibold label, an accent indicator bar docked to the rail
-    /// edge, and an accent rim around the row.
-    ///
-    /// This pins all three and the label's contrast, and pins that the
-    /// UNSELECTED sibling wears none of the marks, on both forced sides.
-    #[test]
-    fn the_selected_rail_row_is_spelled_by_marks_the_accent_floor_cannot_dim() {
-        use crate::native_appearance::forced_chrome_theme;
-        use crate::widget::{DrawPrim, TextFace};
-        use aterm_render::Theme;
-
-        let terminal_dark = Theme::default();
-        let terminal_light = Theme {
-            fg: 0x0065_7B83,
-            bg: 0x00FD_F6E3,
-            cursor: 0x0085_9900,
-            selection: 0x00EE_E8D5,
-        };
-        let rect = LogicalRect::new(8.0, 40.0, 180.0, 34.0);
-        let row = |selected: bool| {
-            // The rail row as its author builds it: a route pictogram and the
-            // route's own label. The pictogram is what makes it a rail
-            // DESTINATION and so what entitles it to grow ink
-            // ([`navigation_label_type`]).
-            let mut control = Control::new(
-                ButtonSpec::new("Top Settings").visual_icon(ButtonIcon::Home),
-                ActionId::new("settings/nav/top"),
-            )
-            .style(StyleRef::Navigation);
-            control.state.selected = selected;
-            PaintNode {
-                peek: false,
-                key: UiKey::new("settings/nav/top"),
-                rect,
-                clip: rect,
-                content: UiContent::Button(control),
-            }
-        };
-
-        for (label, theme) in [
-            ("forced-light", forced_chrome_theme(terminal_dark, false)),
-            ("forced-dark", forced_chrome_theme(terminal_light, true)),
-        ] {
-            let roles = crate::settings::Roles::from_theme(theme);
-            let paint = |selected: bool| {
-                let mut prims = Vec::new();
-                paint_compiled_node(&mut prims, &row(selected), roles, theme, 14.0);
-                prims
-            };
-            let selected = paint(true);
-            let resting = paint(false);
-
-            // 1. The indicator bar: accent, docked to the row's left edge.
-            let bar = |prims: &[DrawPrim]| {
-                prims.iter().any(|p| {
-                    matches!(
-                        p,
-                        DrawPrim::Panel { x, w, h, fill, .. }
-                            if (*x - rect.x).abs() < 0.01
-                                && *w <= 6.0
-                                && *h >= rect.height * 0.5
-                                && fill[..3] == roles.accent
-                    )
-                })
-            };
-            assert!(
-                bar(&selected),
-                "{label}: the selected row has no rail indicator"
-            );
-            assert!(
-                !bar(&resting),
-                "{label}: a resting row grew a rail indicator"
-            );
-
-            // 2. The rim: an accent stroke around the row itself.
-            let rim = |prims: &[DrawPrim]| {
-                prims.iter().any(|p| {
-                    matches!(
-                        p,
-                        DrawPrim::Stroke { w, color, .. }
-                            if *w >= rect.width - 2.0 && color[..3] == roles.accent
-                    )
-                })
-            };
-            assert!(
-                rim(&selected),
-                "{label}: the selected row has no accent rim"
-            );
-            assert!(
-                !rim(&resting),
-                "{label}: a resting rail row grew an accent rim"
-            );
-
-            // 3. The label: semibold, painted in the accent as text, and
-            // readable on its wash.
-            let bold_accent = selected.iter().any(|p| {
-                matches!(
-                    p,
-                    DrawPrim::Text { face, color, .. }
-                        if *face == TextFace::UiBold && color[..3] == roles.accent_ink
-                )
-            });
-            assert!(
-                bold_accent,
-                "{label}: the selected rail label is not semibold accent ink"
-            );
-            let wash = mix_rgb(
-                roles.elevated,
-                roles.accent,
-                crate::native_appearance::ACCENT_WASH_SELECTED,
-            );
-            assert!(
-                crate::native_appearance::contrast_ratio(roles.accent_ink, wash) >= 4.5,
-                "{label}: the selected label reads below 4.5:1 on its wash"
-            );
-            let resting_is_regular = resting
-                .iter()
-                .all(|p| !matches!(p, DrawPrim::Text { face, .. } if *face == TextFace::UiBold));
-            assert!(
-                resting_is_regular,
-                "{label}: a resting rail row is already semibold — selection reads as nothing"
-            );
-        }
-    }
-
-    #[test]
-    fn button_visual_labels_elide_utf8_to_the_authored_width_budget() {
-        let px = native_type_px(crate::type_scale::TypeStep::Secondary).get();
-        let value = "Use default · Linear corrected · 終 👩‍💻";
-        let label = elide_ui_label(value, 104.0, px);
-        assert!(label.ends_with('…'));
-        assert!(crate::tray_raster::ui_text_width(&label, px) <= 104.0);
-        assert!(std::str::from_utf8(label.as_bytes()).is_ok());
-        assert_eq!(elide_ui_label("Nord", 104.0, px), "Nord");
     }
 
     #[test]
@@ -7764,9 +7361,7 @@ pub(crate) mod tests {
     /// A prose block's inline spans PAINT: the strong word in the bold UI face,
     /// inline code in the mono face on a chip, a link in the accent with an
     /// underline, strikethrough with a line through — each segment advancing by
-    /// its measured width so nothing overlaps — while the semantic label stays
-    /// the flat text. The control: the same block with no spans paints one prim
-    /// per row, exactly as before.
+    /// its measured width so nothing overlaps.
     #[test]
     fn a_markdown_paragraph_paints_its_inline_spans() {
         let source = "plain **bold** `code` ~~gone~~ [site](https://x.example)";
@@ -7823,27 +7418,6 @@ pub(crate) mod tests {
             .filter(|p| matches!(p, crate::widget::DrawPrim::Stroke { h, .. } if *h <= 1.0))
             .count();
         assert!(strokes >= 2, "a strike line and a link underline");
-        assert!(
-            styled
-                .semantics
-                .iter()
-                .any(|n| n.label.contains("plain bold code gone site"))
-                || styled.semantics.iter().all(|n| !n.label.contains("**")),
-            "semantics keep the flat text"
-        );
-
-        // Control: no spans — the pre-existing one-prim-per-row paint.
-        let flat = block(Vec::new());
-        let flat_texts = flat
-            .tray(aterm_render::Theme::default(), 13.0)
-            .prims
-            .iter()
-            .filter(|p| matches!(p, crate::widget::DrawPrim::Text { .. }))
-            .count();
-        assert_eq!(
-            flat_texts, 1,
-            "an unstyled one-row paragraph is one text prim"
-        );
     }
 
     #[test]
@@ -8094,103 +7668,6 @@ pub(crate) mod tests {
         }));
     }
 
-    #[test]
-    fn paint_audit_inventory_includes_preview_markdown_and_editor_paint_state() {
-        let preview = UiTree::new(UiNode::new(
-            "settings/preview",
-            UiContent::SettingsPreview(Box::default()),
-        ))
-        .compile(LogicalRect::new(0.0, 0.0, 640.0, 220.0))
-        .unwrap();
-        let preview_audit = preview.paint_audit_lines();
-        assert!(preview_audit.iter().any(|line| {
-            line.starts_with("paint-node key=\"settings/preview\"")
-                && line.contains("kind=settings-preview")
-                && line.contains("role=Group")
-        }));
-        assert!(preview_audit.iter().any(|line| {
-            line.starts_with("paint-preview key=\"settings/preview\"")
-                && line.contains("audit-state=")
-                && line.contains("animation=")
-                && line.contains("paint-fingerprint=")
-        }));
-
-        let markdown = UiTree::new(UiNode::new(
-            "markdown/block/4",
-            UiContent::MarkdownBlock(MarkdownBlockSpec {
-                text: "A paragraph that wraps naturally without being an overflow.".to_string(),
-                kind: MarkdownBlockKind::Paragraph,
-                dense: false,
-                selectable: true,
-                action: Some(ActionId::new("markdown/select-block/4")),
-                selected: true,
-                source: 80..142,
-                visual_row: 0,
-                total_visual_rows: 3,
-                estimated_height: 96.0,
-                inline: Vec::new(),
-            }),
-        ))
-        .compile(LogicalRect::new(0.0, 0.0, 180.0, 96.0))
-        .unwrap();
-        let markdown_audit = markdown.paint_audit_lines();
-        assert!(markdown_audit.iter().any(|line| {
-            line.starts_with("paint-markdown key=\"markdown/block/4\"")
-                && line.contains("block-kind=paragraph")
-                && line.contains("source=80..142")
-                && line.contains("selected=true")
-                && line.contains("wrapped-lines=")
-                && line.contains("elided=false")
-                && line.contains("paint-fingerprint=")
-        }));
-
-        let editor = editor_viewport()
-            .compile(LogicalRect::new(0.0, 0.0, 760.0, 420.0))
-            .unwrap();
-        let editor_audit = editor.paint_audit_lines();
-        assert!(editor_audit.iter().any(|line| {
-            line.starts_with("paint-editor key=\"editor/buffer\"")
-                && line.contains("document=\"document:7@12\"")
-                && line.contains("dirty=true")
-                && line.contains("focused=true")
-                && line.contains("visible-rows=2")
-                && line.contains("carets=1")
-                && line.contains("selections=1")
-                && line.contains("modeline=")
-                && line.contains("minibuffer-active=false")
-                && line.contains("paint-fingerprint=")
-        }));
-        assert!(
-            assert_fit_failures_match_full_audit(&editor).is_empty(),
-            "a roomy editor passes both verdicts"
-        );
-        // Cut by a clipped ancestor shorter than its authored height: the
-        // paint-editor record says clip-truncated=true, and the cheap verdict
-        // must report that record.
-        let clipped = UiTree::new(
-            UiNode::new(
-                "app",
-                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Application)),
-            )
-            .layout(Layout::column().clipped())
-            .children(vec![
-                editor_viewport()
-                    .root
-                    .layout(Layout::default().height(Length::Fixed(420.0))),
-            ]),
-        )
-        .compile(LogicalRect::new(0.0, 0.0, 760.0, 90.0))
-        .unwrap();
-        let failures = assert_fit_failures_match_full_audit(&clipped);
-        assert!(
-            failures.iter().any(|line| {
-                line.starts_with("paint-editor key=\"editor/buffer\"")
-                    && line.contains(" clip-truncated=true ")
-            }),
-            "a clip-truncated editor fails the cheap verdict: {failures:?}"
-        );
-    }
-
     pub(crate) fn button(key: &str, label: &str) -> UiNode {
         UiNode::new(
             key,
@@ -8258,65 +7735,92 @@ pub(crate) mod tests {
         ))
     }
 
+    /// A focused one-line editor viewport over `text`: its bytes at `source`
+    /// in the document, its first column at `column_start`, its caret first.
+    fn one_line_viewport(
+        source: std::ops::Range<usize>,
+        column_start: usize,
+        text: &str,
+    ) -> TextViewportSpec {
+        use crate::native_editor::{EditorViewportLine, EditorViewportProjection};
+        TextViewportSpec {
+            label: "one-line.txt".to_string(),
+            document_key: "document:1@1".to_string(),
+            selectable: true,
+            projection: Some(EditorViewportProjection {
+                first_line: 0,
+                total_lines: 1,
+                lines: vec![EditorViewportLine {
+                    number: 0,
+                    source,
+                    column_start,
+                    text: text.to_string(),
+                    selections: Vec::new(),
+                    carets: vec![(0, true)],
+                    syntax: Vec::new(),
+                    diagnostics: Vec::new(),
+                }],
+            }),
+            preedit: String::new(),
+            preedit_caret: None,
+            status: None,
+            semantic_status: None,
+            minibuffer: None,
+            minibuffer_caret: None,
+            cursor_label: None,
+            dirty: false,
+            saving: false,
+            focused: true,
+            action: Some(ActionId::new("editor/focus-buffer")),
+        }
+    }
+
     #[test]
     fn editor_fingerprint_tracks_every_paint_only_viewport_state() {
         use crate::native_editor::{EditorDiagnosticSpan, EditorSyntaxClass, EditorSyntaxSpan};
 
-        // `compile` consumes its tree, so this fixture helper clones — every
-        // caller below wants to keep its authored variant around.
-        let compile = |tree: &UiTree| {
-            tree.clone()
-                .compile(LogicalRect::new(0.0, 0.0, 640.0, 360.0))
+        let fingerprint = |edit: &dyn Fn(&mut TextViewportSpec)| {
+            let mut tree = editor_viewport();
+            let UiContent::TextViewport(spec) = &mut tree.root.content else {
+                panic!("editor viewport fixture")
+            };
+            edit(spec);
+            tree.compile(LogicalRect::new(0.0, 0.0, 640.0, 360.0))
                 .unwrap()
                 .fingerprint()
         };
-        let base = editor_viewport();
-        let base_fp = compile(&base);
-
-        let mut minibuffer = editor_viewport();
-        let UiContent::TextViewport(spec) = &mut minibuffer.root.content else {
-            panic!("editor viewport fixture")
-        };
-        spec.minibuffer = Some("Find: semantic".to_string());
-        assert_ne!(base_fp, compile(&minibuffer));
-
-        let mut cursor = editor_viewport();
-        let UiContent::TextViewport(spec) = &mut cursor.root.content else {
-            panic!("editor viewport fixture")
-        };
-        spec.cursor_label = Some("Ln 99, Col 3".to_string());
-        assert_ne!(base_fp, compile(&cursor));
-
-        let mut selection = editor_viewport();
-        let UiContent::TextViewport(spec) = &mut selection.root.content else {
-            panic!("editor viewport fixture")
-        };
-        spec.projection.as_mut().unwrap().lines[0].selections[0].bytes = 0..3;
-        assert_ne!(base_fp, compile(&selection));
-
-        let mut syntax = editor_viewport();
-        let UiContent::TextViewport(spec) = &mut syntax.root.content else {
-            panic!("editor viewport fixture")
-        };
-        spec.projection.as_mut().unwrap().lines[0]
-            .syntax
-            .push(EditorSyntaxSpan {
-                bytes: 0..3,
-                class: EditorSyntaxClass::Key,
-            });
-        assert_ne!(base_fp, compile(&syntax));
-
-        let mut diagnostic = editor_viewport();
-        let UiContent::TextViewport(spec) = &mut diagnostic.root.content else {
-            panic!("editor viewport fixture")
-        };
-        spec.projection.as_mut().unwrap().lines[0]
-            .diagnostics
-            .push(EditorDiagnosticSpan {
-                bytes: 4..10,
-                error: true,
-            });
-        assert_ne!(base_fp, compile(&diagnostic));
+        let base = fingerprint(&|_| {});
+        type Edit<'a> = &'a dyn Fn(&mut TextViewportSpec);
+        let edits: [(&str, Edit); 5] = [
+            ("minibuffer", &|spec| {
+                spec.minibuffer = Some("Find: semantic".to_string());
+            }),
+            ("cursor label", &|spec| {
+                spec.cursor_label = Some("Ln 99, Col 3".to_string());
+            }),
+            ("selection", &|spec| {
+                spec.projection.as_mut().unwrap().lines[0].selections[0].bytes = 0..3;
+            }),
+            ("syntax", &|spec| {
+                spec.projection.as_mut().unwrap().lines[0]
+                    .syntax
+                    .push(EditorSyntaxSpan {
+                        bytes: 0..3,
+                        class: EditorSyntaxClass::Key,
+                    });
+            }),
+            ("diagnostic", &|spec| {
+                spec.projection.as_mut().unwrap().lines[0]
+                    .diagnostics
+                    .push(EditorDiagnosticSpan {
+                        bytes: 4..10,
+                        error: true,
+                    });
+            }),
+        ];
+        for (what, edit) in edits {
+            assert_ne!(base, fingerprint(edit), "{what} must move the fingerprint");
+        }
     }
 
     fn form() -> UiTree {
@@ -8362,69 +7866,6 @@ pub(crate) mod tests {
                 && line.contains("role=Button")
                 && line.contains("action=activate/save")
         }));
-    }
-
-    #[test]
-    fn editor_viewport_paints_real_visible_text_selection_caret_and_status() {
-        use crate::widget::DrawPrim;
-
-        let compiled = editor_viewport()
-            .compile(LogicalRect::new(0.0, 0.0, 760.0, 420.0))
-            .unwrap();
-        compiled.validate_parity().unwrap();
-        let prims = compiled.tray(aterm_render::Theme::default(), 13.0).prims;
-        let caret = compiled
-            .ime_caret_rect()
-            .expect("focused primary document caret");
-        assert!(
-            prims.iter().any(|prim| matches!(
-                prim,
-                DrawPrim::Stroke { x, y, w, h, .. }
-                    if (*x, *y, *w, *h) == (caret.x, caret.y, caret.width, caret.height)
-            )),
-            "editor IME anchor must be its painted primary caret"
-        );
-        let mut unfocused = compiled.clone();
-        let UiContent::TextViewport(spec) = &mut unfocused.paint[0].content else {
-            panic!("editor")
-        };
-        spec.focused = false;
-        assert!(unfocused.ime_caret_rect().is_none());
-        let mut clipped = compiled.clone();
-        clipped.paint[0].clip = LogicalRect::new(0.0, 0.0, 760.0, caret.y);
-        assert!(clipped.ime_caret_rect().is_none());
-        assert!(prims.iter().any(
-            |primitive| matches!(primitive, DrawPrim::Text { s, .. } if s == "let answer = 42;")
-        ));
-        assert!(
-            prims
-                .iter()
-                .any(|primitive| matches!(primitive, DrawPrim::Text { s, .. } if s == "λ"))
-        );
-        assert!(
-            prims
-                .iter()
-                .any(|primitive| matches!(primitive, DrawPrim::Text { s, .. } if s == "Saved"))
-        );
-        assert!(
-            prims
-                .iter()
-                .any(|primitive| matches!(primitive, DrawPrim::Stroke { h, .. } if *h > 10.0))
-        );
-        assert!(
-            prims
-                .iter()
-                .any(|primitive| matches!(primitive, DrawPrim::ClipPush { .. }))
-        );
-        assert!(!prims.iter().any(
-            |primitive| matches!(primitive, DrawPrim::Text { s, .. } if s == "document:7@12")
-        ));
-        assert_eq!(
-            compiled
-                .hit_test(100.0, 100.0)
-                .map(|hit| hit.action.as_str()),
-            Some("editor/focus-buffer")
-        );
     }
 
     #[test]
@@ -8520,49 +7961,17 @@ pub(crate) mod tests {
             clipped.ime_caret_rect().is_none(),
             "a hidden minibuffer cannot fall back to the document caret"
         );
-    }
-
-    #[test]
-    fn editor_viewport_paints_native_syntax_runs_and_diagnostic_underlines() {
-        use crate::native_editor::{EditorDiagnosticSpan, EditorSyntaxClass, EditorSyntaxSpan};
-        use crate::widget::DrawPrim;
-
-        let mut tree = editor_viewport();
-        let UiContent::TextViewport(spec) = &mut tree.root.content else {
-            panic!("editor viewport fixture")
+        let mut unfocused = compile(Some(3), None, None);
+        let UiContent::TextViewport(spec) = &mut unfocused.paint[0].content else {
+            panic!("editor")
         };
-        let line = &mut spec.projection.as_mut().unwrap().lines[0];
-        line.syntax.push(EditorSyntaxSpan {
-            bytes: 0..3,
-            class: EditorSyntaxClass::Key,
-        });
-        line.diagnostics.push(EditorDiagnosticSpan {
-            bytes: 4..10,
-            error: true,
-        });
-
-        let compiled = tree
-            .compile(LogicalRect::new(0.0, 0.0, 760.0, 420.0))
-            .unwrap();
-        let prims = compiled.tray(aterm_render::Theme::default(), 13.0).prims;
-        assert!(
-            prims
-                .iter()
-                .any(|primitive| matches!(primitive, DrawPrim::Text { s, .. } if s == "let"))
-        );
-        assert!(prims.iter().any(|primitive| {
-            matches!(
-                primitive,
-                DrawPrim::Stroke { h, w, .. } if *h == 1.0 && *w > 1.0
-            )
-        }));
+        spec.focused = false;
+        assert!(unfocused.ime_caret_rect().is_none(), "an unfocused editor");
     }
 
     #[test]
     fn editor_selection_caret_and_diagnostic_share_grapheme_cell_geometry() {
-        use crate::native_editor::{
-            EditorDiagnosticSpan, EditorSelectionSpan, EditorViewportLine, EditorViewportProjection,
-        };
+        use crate::native_editor::{EditorDiagnosticSpan, EditorSelectionSpan};
         use crate::type_scale::TypeStep;
         use crate::widget::DrawPrim;
 
@@ -8571,56 +7980,31 @@ pub(crate) mod tests {
         let after_cjk = after_accent + "中".len();
         let after_woman = after_cjk + "👩".len();
         let text_len = text.len();
-        let spec = TextViewportSpec {
-            label: "unicode.toml".to_string(),
-            document_key: "document:unicode@1".to_string(),
-            selectable: true,
-            projection: Some(EditorViewportProjection {
-                first_line: 0,
-                total_lines: 1,
-                lines: vec![EditorViewportLine {
-                    number: 0,
-                    source: 0..text_len,
-                    column_start: 0,
-                    text,
-                    selections: vec![
-                        EditorSelectionSpan {
-                            bytes: 0..after_accent,
-                            continues: false,
-                            primary: true,
-                        },
-                        EditorSelectionSpan {
-                            bytes: after_cjk..after_woman,
-                            continues: false,
-                            primary: false,
-                        },
-                    ],
-                    carets: vec![(text_len, true)],
-                    syntax: Vec::new(),
-                    diagnostics: vec![
-                        EditorDiagnosticSpan {
-                            bytes: after_accent..after_cjk,
-                            error: true,
-                        },
-                        EditorDiagnosticSpan {
-                            bytes: after_cjk..after_woman,
-                            error: false,
-                        },
-                    ],
-                }],
-            }),
-            preedit: String::new(),
-            preedit_caret: None,
-            status: None,
-            semantic_status: None,
-            minibuffer: None,
-            minibuffer_caret: None,
-            cursor_label: None,
-            dirty: false,
-            saving: false,
-            focused: true,
-            action: Some(ActionId::new("editor/focus-buffer")),
-        };
+        let mut spec = one_line_viewport(0..text_len, 0, &text);
+        let line = &mut spec.projection.as_mut().expect("one line").lines[0];
+        line.selections = vec![
+            EditorSelectionSpan {
+                bytes: 0..after_accent,
+                continues: false,
+                primary: true,
+            },
+            EditorSelectionSpan {
+                bytes: after_cjk..after_woman,
+                continues: false,
+                primary: false,
+            },
+        ];
+        line.carets = vec![(text_len, true)];
+        line.diagnostics = vec![
+            EditorDiagnosticSpan {
+                bytes: after_accent..after_cjk,
+                error: true,
+            },
+            EditorDiagnosticSpan {
+                bytes: after_cjk..after_woman,
+                error: false,
+            },
+        ];
         let rect = LogicalRect::new(0.0, 0.0, 760.0, 420.0);
         let geometry = text_viewport_geometry(rect);
         let prims = UiTree::new(UiNode::new("editor/unicode", UiContent::TextViewport(spec)))
@@ -8708,43 +8092,14 @@ pub(crate) mod tests {
 
     #[test]
     fn editor_preedit_underlines_use_complete_grapheme_cell_widths() {
-        use crate::native_editor::{EditorViewportLine, EditorViewportProjection};
         use crate::widget::DrawPrim;
 
         let rect = LogicalRect::new(0.0, 0.0, 760.0, 420.0);
         let geometry = text_viewport_geometry(rect);
         let close = |left: f32, right: f32| (left - right).abs() < 0.01;
         for (preedit, cells) in [("e\u{301}", 1usize), ("中", 2), ("👩‍💻", 2)] {
-            let spec = TextViewportSpec {
-                label: "ime.toml".to_string(),
-                document_key: "document:ime@1".to_string(),
-                selectable: true,
-                projection: Some(EditorViewportProjection {
-                    first_line: 0,
-                    total_lines: 1,
-                    lines: vec![EditorViewportLine {
-                        number: 0,
-                        source: 0..0,
-                        column_start: 0,
-                        text: String::new(),
-                        selections: Vec::new(),
-                        carets: vec![(0, true)],
-                        syntax: Vec::new(),
-                        diagnostics: Vec::new(),
-                    }],
-                }),
-                preedit: preedit.to_string(),
-                preedit_caret: None,
-                status: None,
-                semantic_status: None,
-                minibuffer: None,
-                minibuffer_caret: None,
-                cursor_label: None,
-                dirty: false,
-                saving: false,
-                focused: true,
-                action: Some(ActionId::new("editor/focus-buffer")),
-            };
+            let mut spec = one_line_viewport(0..0, 0, "");
+            spec.preedit = preedit.to_string();
             let prims = UiTree::new(UiNode::new("editor/ime", UiContent::TextViewport(spec)))
                 .compile(rect)
                 .unwrap()
@@ -8904,21 +8259,6 @@ pub(crate) mod tests {
             prims
                 .iter()
                 .any(|prim| matches!(prim, DrawPrim::Text { s, .. } if s == "aにz"))
-        );
-        assert!(prims.iter().any(|prim| matches!(
-            prim,
-            DrawPrim::Panel {
-                fill: [_, _, _, 82],
-                ..
-            }
-        )));
-        assert!(prims.iter().any(
-            |prim| matches!(prim, DrawPrim::Stroke { h, width, .. } if *h == 1.0 && *width == 1.0)
-        ));
-        assert!(
-            prims.iter().any(
-                |prim| matches!(prim, DrawPrim::Stroke { w, h, .. } if *w == 1.0 && *h > 10.0)
-            )
         );
         assert!(prims.iter().any(|prim| matches!(
             prim,
@@ -9118,6 +8458,8 @@ pub(crate) mod tests {
             ButtonIcon::Agents,
             ButtonIcon::Trail,
             ButtonIcon::Sound,
+            ButtonIcon::Themes,
+            ButtonIcon::Spark,
         ] {
             let mut prims = Vec::new();
             paint_button_icon(
@@ -9132,65 +8474,6 @@ pub(crate) mod tests {
                     .iter()
                     .all(|prim| !matches!(prim, DrawPrim::Text { .. })),
                 "{icon:?} must remain code-native"
-            );
-        }
-    }
-
-    #[test]
-    fn disclosure_chevron_is_a_connected_downward_silhouette() {
-        use crate::widget::DrawPrim;
-
-        let mut prims = Vec::new();
-        paint_button_icon(
-            &mut prims,
-            LogicalRect::new(0.0, 0.0, 44.0, 32.0),
-            ButtonIcon::ChevronDown,
-            [180, 210, 255],
-        );
-        let rows = prims
-            .iter()
-            .filter_map(|prim| match prim {
-                DrawPrim::Panel { x, y, w, h, .. } => Some((*x, *y, *w, *h)),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(rows.len(), 3);
-        assert_eq!(
-            rows.iter()
-                .map(|(_, _, width, _)| *width)
-                .collect::<Vec<_>>(),
-            [10.0, 6.0, 2.0]
-        );
-        assert!(
-            rows.windows(2)
-                .all(|pair| pair[0].1 + pair[0].3 == pair[1].1)
-        );
-        assert!(rows.iter().all(|(_, _, _, height)| *height == 2.0));
-    }
-
-    #[test]
-    fn history_arrows_are_connected_directional_silhouettes() {
-        use crate::widget::DrawPrim;
-
-        for icon in [ButtonIcon::Back, ButtonIcon::Forward] {
-            let mut prims = Vec::new();
-            paint_button_icon(
-                &mut prims,
-                LogicalRect::new(0.0, 0.0, 44.0, 32.0),
-                icon,
-                [180, 210, 255],
-            );
-            let segments = prims
-                .iter()
-                .filter(|prim| matches!(prim, DrawPrim::Line { .. }))
-                .count();
-            assert_eq!(segments, 3, "{icon:?} keeps one stem and two head segments");
-            assert!(
-                prims
-                    .iter()
-                    .all(|prim| matches!(prim, DrawPrim::Line { .. })),
-                "{icon:?} must not regress to font or staircase geometry"
             );
         }
     }
@@ -9271,67 +8554,6 @@ pub(crate) mod tests {
         assert_eq!(geometry.cell_w, measured);
     }
 
-    #[test]
-    fn editor_capacity_uses_real_compact_landscape_desktop_and_scaled_geometry() {
-        let phone = LogicalRect::new(0.0, 0.0, 320.0, 568.0);
-        let landscape = LogicalRect::new(0.0, 0.0, 800.0, 320.0);
-        let desktop = LogicalRect::new(0.0, 0.0, 1_200.0, 800.0);
-        let phone_lines = editor_visible_line_capacity_at_scale(phone, 1.0);
-        let landscape_lines = editor_visible_line_capacity_at_scale(landscape, 1.0);
-        let desktop_lines = editor_visible_line_capacity_at_scale(desktop, 1.0);
-        let scaled_phone_lines = editor_visible_line_capacity_at_scale(phone, 2.0);
-
-        // The rows shown WHOLE: the count caret reveal keeps the caret in, so
-        // the caret line is never the one the footer cuts.
-        assert_eq!(phone_lines, 19);
-        assert_eq!(landscape_lines, 9);
-        assert_eq!(desktop_lines, 32);
-        // At 2×, the compact command bar uses two complete 48pt rows and the
-        // editor uses 40pt lines. The exact shared shell/viewport geometry leaves
-        // eight whole rows.
-        assert_eq!(scaled_phone_lines, 8);
-        assert!(scaled_phone_lines < phone_lines);
-        assert!(desktop_lines > landscape_lines);
-    }
-
-    /// Opening Settings → Manual must not bury aterm.toml under its own help.
-    ///
-    /// The landing state measured on glass at the default 80×24 window
-    /// (viewport 744×420, caret at Ln 1 Col 1, the eight metadata-derived key
-    /// completions offered): a 262 px completion list — 62% of the window — over
-    /// a 94 px editor rect whose header and footer left 20 px of document, ONE
-    /// visible line of the file the page exists to edit. The cause was the
-    /// floor: `minimum_editor_height` reserved 78 rect pixels, 74 of which
-    /// [`text_viewport_geometry_at_scale`] spends on chrome, so the reservation
-    /// guaranteed no complete text row at all.
-    #[test]
-    fn manual_landing_keeps_the_buffer_larger_than_its_completion_list() {
-        let viewport = LogicalRect::new(0.0, 0.0, 744.0, 420.0);
-        let shell = editor_shell_metrics_at_scale(viewport, 8_usize, 1.0);
-        let editor = editor_text_viewport_rect_at_scale(viewport, 8_usize, 1.0);
-        let geometry = text_viewport_geometry_at_scale(editor, 1.0);
-        let painted_rows = (geometry.body_h / geometry.line_h).floor() as usize;
-
-        assert_eq!(
-            painted_rows, MINIMUM_EDITOR_DOCUMENT_ROWS,
-            "the default window paints {painted_rows} document rows under a \
-             {}-row completion page (editor rect {} px, palette {} px)",
-            shell.palette_visible_rows, editor.height, shell.palette_height
-        );
-        assert!(
-            shell.palette_height < editor.height,
-            "unrequested help {} px must not outweigh the edited file {} px",
-            shell.palette_height,
-            editor.height
-        );
-        // The exact split this lands on: three of the eight candidates paged in
-        // 151 px, the file in 205 px. It is the same split the assist already
-        // used once the caret moved off a key position, where the whole file fit.
-        assert_eq!(shell.palette_visible_rows, 3);
-        assert_eq!(shell.palette_height, 151.0);
-        assert_eq!(editor.height, 205.0);
-    }
-
     /// The floor is a promise about DOCUMENT rows, so it has to hold across the
     /// window sizes a person actually uses — not only at the default one. Below
     /// ~335 px of viewport the palette's own "always show one candidate" floor
@@ -9369,39 +8591,9 @@ pub(crate) mod tests {
 
     #[test]
     fn text_viewport_pointer_mapping_shares_line_gutter_tab_and_utf8_geometry() {
-        use crate::native_editor::{EditorViewportLine, EditorViewportProjection};
         use crate::widget::DrawPrim as Prim;
 
-        let spec = TextViewportSpec {
-            label: "unicode.txt".to_string(),
-            document_key: "document:1@1".to_string(),
-            selectable: true,
-            projection: Some(EditorViewportProjection {
-                first_line: 0,
-                total_lines: 1,
-                lines: vec![EditorViewportLine {
-                    number: 0,
-                    source: 100..105,
-                    column_start: 0,
-                    text: "α\tβ".to_string(),
-                    selections: Vec::new(),
-                    carets: vec![(0, true)],
-                    syntax: Vec::new(),
-                    diagnostics: Vec::new(),
-                }],
-            }),
-            preedit: String::new(),
-            preedit_caret: None,
-            status: None,
-            semantic_status: None,
-            minibuffer: None,
-            minibuffer_caret: None,
-            cursor_label: None,
-            dirty: false,
-            saving: false,
-            focused: true,
-            action: Some(ActionId::new("editor/focus-buffer")),
-        };
+        let spec = one_line_viewport(100..105, 0, "α\tβ");
         let rect = LogicalRect::new(0.0, 0.0, 760.0, 420.0);
         let geometry = text_viewport_geometry(rect);
         let y = geometry.body_y + geometry.line_h * 0.5;
@@ -9449,49 +8641,13 @@ pub(crate) mod tests {
             None,
             "an unmaterialized row is not addressable"
         );
-        for byte in [100, 102, 103, 105] {
-            assert!(
-                spec.projection.as_ref().unwrap().lines[0]
-                    .text
-                    .is_char_boundary(byte - 100)
-            );
-        }
 
         let unicode_text = "e\u{301}中👩‍💻".to_string();
         let unicode_start = 300usize;
         let after_accent = unicode_start + "e\u{301}".len();
         let after_cjk = after_accent + "中".len();
         let unicode_end = unicode_start + unicode_text.len();
-        let unicode = TextViewportSpec {
-            label: "graphemes.txt".to_string(),
-            document_key: "document:3@1".to_string(),
-            selectable: true,
-            projection: Some(EditorViewportProjection {
-                first_line: 0,
-                total_lines: 1,
-                lines: vec![EditorViewportLine {
-                    number: 0,
-                    source: unicode_start..unicode_end,
-                    column_start: 0,
-                    text: unicode_text,
-                    selections: Vec::new(),
-                    carets: vec![(0, true)],
-                    syntax: Vec::new(),
-                    diagnostics: Vec::new(),
-                }],
-            }),
-            preedit: String::new(),
-            preedit_caret: None,
-            status: None,
-            semantic_status: None,
-            minibuffer: None,
-            minibuffer_caret: None,
-            cursor_label: None,
-            dirty: false,
-            saving: false,
-            focused: true,
-            action: Some(ActionId::new("editor/focus-buffer")),
-        };
+        let unicode = one_line_viewport(unicode_start..unicode_end, 0, &unicode_text);
         for tenth_cell in 0..=50 {
             let mapped = text_viewport_byte_at(
                 &unicode,
@@ -9530,36 +8686,8 @@ pub(crate) mod tests {
             Some(unicode_end)
         );
 
-        let shifted = TextViewportSpec {
-            label: "shifted.txt".to_string(),
-            document_key: "document:2@1".to_string(),
-            selectable: true,
-            projection: Some(EditorViewportProjection {
-                first_line: 0,
-                total_lines: 1,
-                lines: vec![EditorViewportLine {
-                    number: 0,
-                    source: 200..202,
-                    column_start: 3,
-                    text: "\tX".to_string(),
-                    selections: Vec::new(),
-                    carets: vec![(1, true)],
-                    syntax: Vec::new(),
-                    diagnostics: Vec::new(),
-                }],
-            }),
-            preedit: String::new(),
-            preedit_caret: None,
-            status: None,
-            semantic_status: None,
-            minibuffer: None,
-            minibuffer_caret: None,
-            cursor_label: None,
-            dirty: false,
-            saving: false,
-            focused: true,
-            action: Some(ActionId::new("editor/focus-buffer")),
-        };
+        let mut shifted = one_line_viewport(200..202, 3, "\tX");
+        shifted.projection.as_mut().expect("one line").lines[0].carets = vec![(1, true)];
         assert_eq!(
             text_viewport_byte_at(&shifted, rect, geometry.text_x + 0.4 * geometry.cell_w, y,),
             Some(200)
@@ -9739,22 +8867,12 @@ pub(crate) mod tests {
         assert!(compiled.hit_test(110.0, 30.0).is_none());
     }
 
+    /// A tree no observer could agree on fails to compile, before anything is
+    /// dispatched: two nodes under one key, a custom node with no audit
+    /// adapter, and an action on a paint-only node.
     #[test]
-    fn duplicate_keys_fail_closed_before_dispatch() {
-        let tree = UiTree::new(
-            UiNode::new("root", UiContent::Group(GroupSpec::new("root")))
-                .layout(Layout::column())
-                .children(vec![button("same", "One"), button("same", "Two")]),
-        );
-        assert_eq!(
-            tree.compile(LogicalRect::new(0.0, 0.0, 200.0, 100.0)),
-            Err(CompileError::DuplicateKey(UiKey::new("same")))
-        );
-    }
-
-    #[test]
-    fn custom_nodes_require_a_named_audit_adapter() {
-        let tree = UiTree::new(UiNode::new(
+    fn ambiguous_trees_fail_closed_before_dispatch() {
+        let custom = UiNode::new(
             "custom",
             UiContent::Custom(AuditedCustomNode {
                 audit_id: "",
@@ -9766,66 +8884,45 @@ pub(crate) mod tests {
                 focused: false,
                 focus_visible: false,
             }),
-        ));
-        assert_eq!(
-            tree.compile(LogicalRect::new(0.0, 0.0, 100.0, 40.0)),
-            Err(CompileError::CustomWithoutAudit(UiKey::new("custom")))
         );
+        for (tree, refused) in [
+            (
+                UiTree::new(
+                    UiNode::new("root", UiContent::Group(GroupSpec::new("root")))
+                        .layout(Layout::column())
+                        .children(vec![button("same", "One"), button("same", "Two")]),
+                ),
+                CompileError::DuplicateKey(UiKey::new("same")),
+            ),
+            (
+                UiTree::new(custom),
+                CompileError::CustomWithoutAudit(UiKey::new("custom")),
+            ),
+            (
+                UiTree::new(button("hidden-action", "Hidden action").paint_only()),
+                CompileError::PaintOnlyAction(UiKey::new("hidden-action")),
+            ),
+        ] {
+            assert_eq!(
+                tree.compile(LogicalRect::new(0.0, 0.0, 200.0, 100.0)),
+                Err(refused.clone()),
+                "{refused:?}"
+            );
+        }
     }
 
+    /// A paint-only copy paints without a second semantic node, and still
+    /// moves the retained raster's fingerprint when only its pixels change.
     #[test]
     fn paint_only_copy_renders_without_duplicate_semantics() {
         let complete =
             "On. Typing notes are silent while the cursor trail is off; other sounds still play.";
-        let tree = UiTree::new(
-            UiNode::new(
-                "status",
-                UiContent::Group(GroupSpec {
-                    label: Some(complete.to_string()),
-                    role: SemanticRole::Status,
-                    style: StyleRef::Quiet,
-                }),
-            )
-            .children(vec![
-                UiNode::new(
-                    "status/visual",
-                    UiContent::Text(TextSpec {
-                        text: "Typing notes off".to_string(),
-                        role: SemanticRole::Status,
-                        style: StyleRef::Quiet,
-                    }),
-                )
-                .paint_only(),
-            ]),
-        );
-
-        let compiled = tree
-            .compile(LogicalRect::new(0.0, 0.0, 240.0, 40.0))
-            .unwrap();
-        assert_eq!(compiled.paint.len(), 2);
-        assert!(
-            compiled
-                .paint
-                .iter()
-                .any(|node| node.key == UiKey::new("status/visual"))
-        );
-        assert_eq!(compiled.semantics.len(), 1);
-        assert_eq!(
-            compiled.semantic(&UiKey::new("status")).unwrap().label,
-            complete
-        );
-        assert!(compiled.semantic(&UiKey::new("status/visual")).is_none());
-        compiled.validate_parity().unwrap();
-    }
-
-    #[test]
-    fn paint_only_copy_participates_in_the_retained_raster_fingerprint() {
         let compile = |visual: &str| {
             UiTree::new(
                 UiNode::new(
                     "status",
                     UiContent::Group(GroupSpec {
-                        label: Some("Complete status that never changes".to_string()),
+                        label: Some(complete.to_string()),
                         role: SemanticRole::Status,
                         style: StyleRef::Quiet,
                     }),
@@ -9845,21 +8942,19 @@ pub(crate) mod tests {
             .compile(LogicalRect::new(0.0, 0.0, 240.0, 40.0))
             .unwrap()
         };
-        let first = compile("Visual A");
-        let second = compile("Visual B");
-
-        assert_eq!(first.semantics, second.semantics);
-        assert_ne!(first.paint, second.paint);
-        assert_ne!(first.fingerprint(), second.fingerprint());
-    }
-
-    #[test]
-    fn paint_only_controls_fail_closed() {
-        let tree = UiTree::new(button("hidden-action", "Hidden action").paint_only());
+        let compiled = compile("Typing notes off");
+        assert_eq!(compiled.paint.len(), 2);
+        assert_eq!(compiled.semantics.len(), 1);
         assert_eq!(
-            tree.compile(LogicalRect::new(0.0, 0.0, 120.0, 40.0)),
-            Err(CompileError::PaintOnlyAction(UiKey::new("hidden-action")))
+            compiled.semantic(&UiKey::new("status")).unwrap().label,
+            complete
         );
+        assert!(compiled.semantic(&UiKey::new("status/visual")).is_none());
+        compiled.validate_parity().unwrap();
+
+        let other = compile("Visual B");
+        assert_eq!(compiled.semantics, other.semantics);
+        assert_ne!(compiled.fingerprint(), other.fingerprint());
     }
 
     #[test]

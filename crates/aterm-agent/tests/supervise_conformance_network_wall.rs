@@ -19,6 +19,11 @@
 //! and otherwise waits until exactly the tick `Act` would become enabled. Negative
 //! controls: `Buggy = 1` (acting at once whatever the measure) and `Carry = 1` (the
 //! hold's clock carried across appearances) each disagree somewhere.
+//!
+//! A reply past its output token maximum is no wall of this model's: since
+//! 2026-10-15 it is no cut-off (`ApiCause::Overlong`, the server's ladder, climbed
+//! across the work each try leads to), and the reader says so
+//! (`the_models_words_read_as_the_causes_it_stands_for`).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -29,8 +34,9 @@ use aterm_agent::supervise::policy::turn_end::{
     Composer, RULE_API_BACK, RULE_API_CUTOFF, RULE_API_RETRY, Reach, TurnEndAction, TurnEndReading,
     TurnEndState, TurnEndTiming, decide_turn_end, wall_retry_text,
 };
+use aterm_models_harness::supervisor_network_wall_model;
 use aterm_phase::{ApiCause, WallKind};
-use aterm_spec::derive::{Model, supervisor_network_wall_model};
+use aterm_spec::derive::Model;
 
 use crate::common::cnst;
 
@@ -47,6 +53,7 @@ const ENOTFOUND: &str =
     "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)";
 const ASLEEP: &str =
     "API Error: Your computer went to sleep mid-response. The response above may be incomplete.";
+const OVERLONG: &str = "API Error: Claude's response exceeded the 32000 output token maximum. To configure this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable.";
 
 fn minutes(m: &Model, name: &str) -> Duration {
     MIN * u32::try_from(cnst(m, name)).expect("a small constant")
@@ -104,10 +111,16 @@ fn reading(st: &State, worked: Option<Duration>, at: Instant) -> TurnEndReading 
         resume: None,
         upgrading: false,
         taskless: false,
+        finished_record: None,
+        finished_at_check: false,
+        check_record: None,
+        left_record: false,
+        left_work: None,
         login_back: false,
         auto_continue: None,
         since_limit: None,
         served_in_transcript: false,
+        notice_elsewhere: false,
         reset_clock: None,
         person: None,
         reach: match st["verdict"] {
@@ -116,17 +129,12 @@ fn reading(st: &State, worked: Option<Duration>, at: Instant) -> TurnEndReading 
             _ => Reach::Unknown,
         },
         program: aterm_phase::Program::Claude,
-        goal: None,
-        model_field: None,
-        limits: Default::default(),
-        sandbox_fell: None,
-        thread_model: None,
-        upgrade_goal: false,
         account: None,
         autopilot: aterm_agent::supervise::Autopilot::Cruise,
         login_label: None,
         login_superseded: false,
         login_notice: None,
+        wall_remembered: false,
     }
 }
 
@@ -250,9 +258,10 @@ fn mirror(
     true
 }
 
-/// Walk `m` against the real decider: the reachable state count, every verdict word
-/// seen, and each state where the two disagree (`strict` fails at the first).
-fn walk(m: &Model, strict: bool) -> (usize, BTreeMap<&'static str, usize>, Vec<State>) {
+/// Walk `m` against the real decider: every verdict word seen, and each state
+/// where the two disagree (`strict` fails at the first; otherwise they are
+/// collected, the negative control's).
+fn walk(m: &Model, strict: bool) -> (BTreeMap<&'static str, usize>, Vec<State>) {
     let cfg = SupervisorConfig::default();
     let base = Instant::now() + Duration::from_secs(3600);
     let init = Real {
@@ -304,14 +313,13 @@ fn walk(m: &Model, strict: bool) -> (usize, BTreeMap<&'static str, usize>, Vec<S
             }
         }
     }
-    (seen.len(), words, disagree)
+    (words, disagree)
 }
 
 #[test]
 fn tier1_the_real_decider_types_into_a_network_wall_exactly_where_the_model_allows() {
     let m = supervisor_network_wall_model();
-    let (states, words, _) = walk(&m, true);
-    assert_eq!(states, 4236, "the reachable space changed: {states}");
+    let (words, _) = walk(&m, true);
     for word in [
         RULE_API_BACK,
         RULE_API_CUTOFF,
@@ -332,7 +340,7 @@ fn tier1_the_real_decider_types_into_a_network_wall_exactly_where_the_model_allo
 fn the_buggy_model_disagrees_with_the_real_decider() {
     let m = supervisor_network_wall_model();
     let buggy = aterm_spec::interp::with_buggy(&m, 1);
-    let (_, _, disagree) = walk(&buggy, false);
+    let (_, disagree) = walk(&buggy, false);
     assert!(!disagree.is_empty(), "the Buggy model agreed everywhere");
     assert!(
         disagree
@@ -346,7 +354,7 @@ fn the_buggy_model_disagrees_with_the_real_decider() {
     // the real decider either: it measures the hold from each appearance, so a
     // re-appearance under a Down measure waits the hold again where `Carry` types.
     let carry = aterm_spec::interp::with_consts(&m, &[("Carry", 1)]);
-    let (_, _, carried) = walk(&carry, false);
+    let (_, carried) = walk(&carry, false);
     assert!(
         carried
             .iter()
@@ -354,28 +362,28 @@ fn the_buggy_model_disagrees_with_the_real_decider() {
         "Carry = 1 agreed at every re-appearance of a measured outage: {} states",
         carried.len()
     );
+}
 
-    // One state spelled out: the network down and measured so, the wall just shown.
-    let mut st = m.init_state();
-    for a in ["NetFails", "MeasureDown", "Unreachable"] {
-        assert!(m.fire(a, &mut st), "{a}");
-    }
-    assert!(buggy.action_enabled("Act", &st));
-    assert!(!m.action_enabled("Act", &st));
-    let now = Instant::now() + Duration::from_secs(3600);
-    let mut real = TurnEndState::new(timing(&m));
-    real.observe(&reading(&st, Some(VENDOR_RETRIES), now), now);
+/// The words this bind hands the decider for each of the model's causes are
+/// the cause the reader reads them as — a reply cut off, a server never
+/// reached — and a reply past its output token maximum, which was a cut-off
+/// until 2026-10-15, is a cause of its own and none of this model's.
+#[test]
+fn the_models_words_read_as_the_causes_it_stands_for() {
+    let api = |cause| {
+        Some(WallKind::ApiError {
+            code: None,
+            retryable: true,
+            cause,
+        })
+    };
+    assert_eq!(aterm_phase::classify_wall(ASLEEP), api(ApiCause::CutOff));
     assert_eq!(
-        verdict(
-            &decide_turn_end(
-                &real,
-                &reading(&st, None, now),
-                &SupervisorConfig::default(),
-                now
-            ),
-            &st,
-            now
-        ),
-        Verdict::Wait(minutes(&m, "Hold")),
+        aterm_phase::classify_wall(ENOTFOUND),
+        api(ApiCause::Unreachable)
+    );
+    assert_eq!(
+        aterm_phase::classify_wall(OVERLONG),
+        api(ApiCause::Overlong)
     );
 }

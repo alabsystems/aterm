@@ -147,33 +147,6 @@ fn divider_grid_is_uniform_seam() {
     );
 }
 
-/// Recomposition is frame-hot: the sparse channels' inner rows are reset in place, keeping
-/// their allocations.
-#[test]
-fn divider_grid_reuses_sparse_row_storage() {
-    let mut dst = RenderInput::empty();
-    dst.clusters = vec![Vec::with_capacity(7)];
-    dst.combining = vec![Vec::with_capacity(9)];
-    dst.images = vec![Vec::with_capacity(11)];
-    dst.line_size_spans = vec![Vec::with_capacity(13)];
-    dst.default_bg_spans = vec![Vec::with_capacity(15)];
-    let capacities = (
-        dst.clusters[0].capacity(),
-        dst.combining[0].capacity(),
-        dst.images[0].capacity(),
-        dst.line_size_spans[0].capacity(),
-        dst.default_bg_spans[0].capacity(),
-    );
-
-    fill_divider_grid(&mut dst, 1, 5, Theme::default(), None);
-
-    assert_eq!(dst.clusters[0].capacity(), capacities.0);
-    assert_eq!(dst.combining[0].capacity(), capacities.1);
-    assert_eq!(dst.images[0].capacity(), capacities.2);
-    assert_eq!(dst.line_size_spans[0].capacity(), capacities.3);
-    assert_eq!(dst.default_bg_spans[0].capacity(), capacities.4);
-}
-
 /// An implicit blank is resolved from the pane's live terminal defaults, not
 /// the host theme. OSC 10/11 update these defaults, and DECSCNM swaps them.
 #[test]

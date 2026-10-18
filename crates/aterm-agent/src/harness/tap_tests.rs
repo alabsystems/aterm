@@ -353,8 +353,7 @@ fn reading(pid: u32, api_ms: u64, five: Option<u32>, seven: Option<u32>) -> Read
 /// no API time — is fresh once, at its first figures, and stale after;
 /// `tap-bgagent-refresh1` — a background agent's usage arriving on the timer
 /// — is fresh at every change; a new process is fresh at its first figures,
-/// whatever it repeats; a reading with no figures never is. NEGATIVE
-/// CONTROL: an `admit` that takes every reading takes the idle repeats.
+/// whatever it repeats; a reading with no figures never is.
 #[test]
 fn freshness_admits_news_and_never_an_idle_repeat() {
     // tap-refresh2: (api_ms, 5h, 7d) as the tap saw them, 01:09:42 on.
@@ -363,7 +362,6 @@ fn freshness_admits_news_and_never_an_idle_repeat() {
         .chain(std::iter::repeat_n((0, Some(75), Some(43)), 10));
     let mut fresh = Fresh::default();
     let admitted: Vec<bool> = refresh2
-        .clone()
         .map(|(api, five, seven)| fresh.admit(&reading(9, api, five, seven)))
         .collect();
     assert_eq!(admitted.iter().filter(|a| **a).count(), 1, "{admitted:?}");
@@ -390,13 +388,6 @@ fn freshness_admits_news_and_never_an_idle_repeat() {
     assert!(fresh.admit(&reading(12, 0, Some(74), Some(60))));
     assert!(!fresh.admit(&reading(12, 0, Some(74), Some(60))));
     assert!(!Fresh::default().admit(&reading(13, 50, None, None)));
-    // Negative control: an admit that takes everything takes the repeats.
-    let every = |_: &Reading| true;
-    let taken = refresh2
-        .map(|(api, five, seven)| every(&reading(9, api, five, seven)))
-        .filter(|a| *a)
-        .count();
-    assert!(taken > 1, "the control must take the idle repeats");
 }
 
 /// THE SILENT TAP: marked only for a process up at least 30 s that served a

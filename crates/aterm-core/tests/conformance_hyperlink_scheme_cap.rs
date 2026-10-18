@@ -12,7 +12,8 @@
 use std::collections::BTreeMap;
 
 use aterm_core::terminal::Terminal;
-use aterm_spec::derive::{Model, hyperlink_scheme_cap_model};
+use aterm_models_misc::hyperlink_scheme_cap_model;
+use aterm_spec::derive::Model;
 use aterm_spec::verify;
 
 type State = BTreeMap<&'static str, i64>;

@@ -10,8 +10,7 @@ mod alt_archive;
 /// Tier-1 conformance of the alt-screen selection park to `AltSelectionPark`.
 #[cfg(test)]
 mod alt_selection_park_conformance;
-/// UAX #9 BiDi visual-reordering bridge (off-by-default `bidi` feature → `aterm-bidi`).
-#[cfg(feature = "bidi")]
+/// UAX #9 BiDi visual-reordering bridge (`aterm-bidi`).
 mod bidi_reorder;
 mod bidi_stubs;
 mod blocks_api;
@@ -108,21 +107,22 @@ mod terminal_modes_conformance;
 mod transient_state;
 mod types;
 
-// The source-to-spec cross-reference gate (this crate's `terminal_modes` anchors included) runs
-// in aterm-gui's test build, the one binary that links every crate's `spec-anchors`.
+// The source-to-spec cross-reference gate lives in aterm-models' test build: it
+// links every anchored crate, including this crate's `terminal_modes` anchors,
+// which expand in every test and debug build.
 
-pub use callbacks::{ColorChangeOp, ColorTarget};
+pub use callbacks::ColorTarget;
 use callbacks::{
     MAX_DCS_GLOBAL_BUDGET, SGR_STACK_MAX_DEPTH, TITLE_STACK_MAX_DEPTH, WindowCallback,
 };
-pub use colors_api::ColorPaletteMut;
-#[cfg(feature = "sixel")]
+pub use config_api::{ColorBaseline, ColorRebase};
 use grouped_state::SixelState;
 use grouped_state::{
     ClipboardState, ColorState, CursorSaveState, DcsState, DcsType, Iterm2State, MarksState,
     NotificationState, ShellIntegrationState, TitleState,
 };
 use reset::{ResetGroups, reset_common_fields};
+pub use state_accessors::ColorSchemeSource;
 use transient_state::{TransientState, Vt52CursorState};
 
 pub use alt_archive::{
@@ -141,7 +141,7 @@ pub use blocks_api::BlockText;
 pub use buffer_api::HistoryShed;
 pub use builder::{TIERED_RING_CAP_DEFAULT, TerminalBuilder};
 #[cfg(feature = "serde")]
-pub use checkpoint::CheckpointMeta;
+pub use checkpoint::{CHECKPOINT_META_REQUIRED_KEYS, CheckpointMeta};
 pub use checkpoint::{
     GridCursorRepr, ShellIntegrationNonce, ShellIntegrationPosture, StyleRepr, TerminalCheckpoint,
 };
@@ -170,7 +170,10 @@ pub use resize_journal::{RESIZE_JOURNAL_CAP, ResizeReport};
 pub use search_budgeted::{BudgetedSearchError, BudgetedSearchStep};
 pub use search_rows::history_line_text_cells;
 pub use selection::smart_word_in_cells;
-pub use shell::{Annotation, BlockState, CommandMark, OutputBlock, ShellState, TerminalMark};
+pub use shell::{
+    Annotation, BlockState, CommandMark, OutputBlock, ShellState, StartFlags, StartKind, StartMark,
+    TerminalMark,
+};
 pub use state::{
     CONTENT_SCROLL_BAND_RING, ContentScrollDelta, ContentScrollState, RowBandMove, Terminal,
 };

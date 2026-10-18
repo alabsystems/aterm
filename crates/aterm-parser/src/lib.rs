@@ -18,14 +18,14 @@
 //! - Exhaustive tests (`src/tests/`): representative states at every bound
 //!   (each state, each bound the invariant names, every UTF-8 lead and each
 //!   Table 3-7 row's pending prefixes) x every two-byte tail x both C1 modes
-//!   x both advance paths keep the TypeInvariant
+//!   keep the TypeInvariant
 //!   (`tests::invariants::every_state_every_byte_keeps_the_type_invariant`); every
 //!   introducer terminates; parameter accumulation saturates and finalizing
 //!   clamps; every carry `restore_carry` accepts keeps the invariant through
 //!   one more byte, and a refusal installs nothing.
 //! - Deterministic fuzz (`tests/fuzz_parser.rs`): 400,000 pseudo-random
-//!   chunks, raw and shaped like escape sequences, through `advance` and
-//!   `advance_fast` with state carried across chunks; any panic fails it.
+//!   chunks, raw and shaped like escape sequences, through `advance_fast`
+//!   with state carried across chunks; any panic fails it.
 //!
 //! ## Performance
 //!
@@ -123,7 +123,7 @@ use aterm_alloc::ArrayVec;
 // NOTE: Use full path std::cell::Cell for consistency with grid module pattern.
 // Parser doesn't have a Cell type conflict, but we maintain the pattern org-wide.
 
-// Counter for main loop iterations in advance/advance_fast (O(n) verification).
+// Counter for main loop iterations in advance_fast (O(n) verification).
 #[cfg(test)]
 thread_local! {
     static PARSER_LOOP_ITERATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -221,7 +221,7 @@ pub(crate) const MAX_OSC_PARAMS: usize = 16;
 ///
 /// let mut parser = Parser::new();
 /// let mut sink = PrintSink;
-/// parser.advance(b"Hello, World!", &mut sink);
+/// parser.advance_fast(b"Hello, World!", &mut sink);
 /// ```
 #[derive(Debug, Clone)]
 #[allow(
@@ -244,6 +244,13 @@ pub struct Parser {
     pub(crate) current_param: u32,
     pub(crate) param_started: bool,
     pub(crate) dcs_active: bool,
+    /// A hooked DCS string met an ESC: the parser stands in `Escape`, and the
+    /// next byte decides how the string ends. `\` completes the ST and the
+    /// string ends complete (`dcs_unhook(false)`); any other byte breaks it off,
+    /// and a broken-off string is canceled (`dcs_unhook(true)`), as CAN and SUB
+    /// cancel one: xterm answers or applies a DCS only at ST. Until then the
+    /// string is still hooked to the sink ([`Parser::in_hooked_dcs`]).
+    pub(crate) dcs_st_pending: bool,
     /// Tracks whether we're in an APC sequence (vs SOS/PM)
     pub(crate) apc_active: bool,
     /// UTF-8 decoding buffer for multi-byte sequences
@@ -298,6 +305,7 @@ impl Parser {
             current_param: 0,
             param_started: false,
             dcs_active: false,
+            dcs_st_pending: false,
             apc_active: false,
             utf8_buffer: [0; 4],
             utf8_len: 0,
@@ -332,6 +340,7 @@ impl Parser {
         self.current_param = 0;
         self.param_started = false;
         self.dcs_active = false;
+        self.dcs_st_pending = false;
         self.apc_active = false;
         self.utf8_len = 0;
         self.utf8_expected = 0;
@@ -344,6 +353,16 @@ impl Parser {
     #[inline]
     pub fn state(&self) -> State {
         self.state
+    }
+
+    /// Whether a DCS string is hooked to the sink: inside its payload
+    /// (`DcsPassthrough`), or at the ESC that may begin its ST, where the next
+    /// byte decides whether it ends complete or broken off. What the hook
+    /// collected lives in the sink, which no [`Parser::carry`] reaches.
+    #[inline]
+    #[must_use]
+    pub fn in_hooked_dcs(&self) -> bool {
+        self.dcs_active || self.dcs_st_pending
     }
 }
 

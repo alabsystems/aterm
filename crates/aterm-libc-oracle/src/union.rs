@@ -25,6 +25,26 @@ pub fn path(root: &Path) -> PathBuf {
     root.join(PATH)
 }
 
+/// Why the list file could not be had ([`Union::read`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Unread {
+    /// There is no file: the checkout lacks a checked-in input, so the gate decides
+    /// nothing (COULD NOT RUN), the way a root without `libc-oracle/` does.
+    Absent(String),
+    /// The file is there and cannot be read or parsed: a finding about the tree.
+    Unusable(String),
+}
+
+impl Unread {
+    /// The message, whichever it is.
+    #[must_use]
+    pub fn into_detail(self) -> String {
+        match self {
+            Self::Absent(detail) | Self::Unusable(detail) => detail,
+        }
+    }
+}
+
 /// Every cell's item list.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Union {
@@ -60,15 +80,30 @@ impl Union {
         Ok(Self { lists })
     }
 
-    /// Read `<root>/libc-oracle/union.json`.
+    /// Read `<root>/libc-oracle/union.json`, saying whether it was absent or unusable.
     ///
     /// # Errors
-    /// When the file is unreadable or malformed; the message names it.
-    pub fn load(root: &Path) -> Result<Self, String> {
+    /// [`Unread::Absent`] when there is no such file; [`Unread::Unusable`] when it is
+    /// there and cannot be read or parsed. Each message names the file.
+    pub fn read(root: &Path) -> Result<Self, Unread> {
         let path = path(root);
-        let text =
-            std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        Self::parse(&text).map_err(|e| format!("{}: {e}", path.display()))
+        let text = std::fs::read_to_string(&path).map_err(|e| {
+            let said = format!("{}: {e}", path.display());
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Unread::Absent(said)
+            } else {
+                Unread::Unusable(said)
+            }
+        })?;
+        Self::parse(&text).map_err(|e| Unread::Unusable(format!("{}: {e}", path.display())))
+    }
+
+    /// [`Self::read`], either failure as its message.
+    ///
+    /// # Errors
+    /// When the file is absent, unreadable or malformed; the message names it.
+    pub fn load(root: &Path) -> Result<Self, String> {
+        Self::read(root).map_err(Unread::into_detail)
     }
 
     /// The cell's names, sorted.

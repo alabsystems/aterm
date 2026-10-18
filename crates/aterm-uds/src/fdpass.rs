@@ -137,8 +137,8 @@ pub fn recv_with_fds(stream: &CtlStream, buf: &mut [u8], max_fds: usize) -> io::
 /// A peer cannot assert this for itself. Paired with a published birth record (which shows
 /// the pid was not recycled) it attests who dialed on Linux, where `SO_PEERCRED` is fixed at
 /// `connect(2)`/`socketpair(2)`. On Darwin it is the process that last used the connection,
-/// read live (`peer`'s `the_peer_is_the_connections_last_user_read_live`), so another holder
-/// of the connection moves it by writing on it.
+/// read live (measured 2026-10-03), so another holder of the connection moves it by writing
+/// on it.
 ///
 /// # Errors
 /// * Anything `getsockopt(2)` reports, notably `ENOTCONN`.

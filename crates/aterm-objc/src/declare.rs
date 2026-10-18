@@ -31,7 +31,7 @@ use crate::runtime::{
 };
 
 /// The name of the single ivar every declared class carries.
-pub const IVAR_NAME: &CStr = c"_atermIvars";
+pub(crate) const IVAR_NAME: &CStr = c"_atermIvars";
 
 /// A witness that the caller asked, on this thread, whether it is the process
 /// main thread, and got yes.
@@ -78,7 +78,7 @@ impl MainThread {
         // query on an always-linked Foundation class, cast as `-(BOOL)(id, SEL)`.
         let is_main = unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel) -> crate::encode::Bool =
-                crate::runtime::msg();
+                crate::checked_msg();
             f(cls, crate::sel!(isMainThread))
         };
         is_main.as_bool().then(Self::mint)
@@ -129,7 +129,7 @@ impl ClassMeta {
         unsafe { ClassPtr::from_ptr(std::ptr::with_exposed_provenance_mut(self.class_addr)) }
     }
 
-    /// Byte offset of [`IVAR_NAME`] within an instance.
+    /// Byte offset of the `_atermIvars` ivar within an instance.
     #[inline]
     #[must_use]
     pub const fn ivar_offset(&self) -> isize {
@@ -180,9 +180,7 @@ impl<T> IvarSlot<T> {
     /// The flag does not guard against a substituting initializer (one that
     /// releases `self` and returns a different object): a sibling class whose
     /// ivar lands at the same offset reads `true` and hands out a `&T` over its
-    /// bytes, and a smaller survivor puts the read past its allocation
-    /// (`winit_seam.rs`'s
-    /// `a_substituting_initializer_defeats_the_initialized_flag`). A class whose
+    /// bytes, and a smaller survivor puts the read past its allocation. A class whose
     /// `Ivars` carry state must ensure its designated initializer does not
     /// substitute.
     ///
@@ -273,7 +271,7 @@ impl ClassBuilder {
         self.cls
     }
 
-    /// Add an ivar big enough for `T`, named [`IVAR_NAME`].
+    /// Add an ivar big enough for `T`, named `_atermIvars`.
     ///
     /// The encoding is `[Nc]` (N opaque bytes), deliberately not a pointer
     /// encoding, so the runtime never treats the bytes as an object to retain,

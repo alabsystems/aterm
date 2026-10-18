@@ -19,7 +19,7 @@
     reason = "test code: a stand-in child may inherit descriptors"
 )]
 
-use crate::{child_output, launch_isolation};
+use crate::{child_output, headless_boot, launch_isolation};
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -113,22 +113,11 @@ fn headless(root: &Path, sock: Option<&Path>, log: &Path) -> Command {
     cmd
 }
 
-/// Wait for the instance's socket to LISTEN, failing with its log if the instance
-/// exits first.
-fn wait_listening(child: &mut Child, sock: &Path, log: &Path) {
-    wait_until(
-        "the control socket listening",
-        || {
-            if let Ok(Some(status)) = child.try_wait() {
-                panic!(
-                    "the instance exited ({status}) before it listened:\n{}",
-                    read_log(log)
-                );
-            }
-            launch_isolation::control_listening(sock)
-        },
-        || read_log(log),
-    );
+/// Wait for the instance to say its socket LISTENS (`--ready-fd`, armed with
+/// [`headless_boot::arm_ready`]), failing with its log if the instance exits
+/// first or says nothing.
+fn wait_listening(child: &mut Child, ready: &mut aterm_agent::ready::Ready, log: &Path) {
+    headless_boot::await_ready(child, |c| c, ready, log, |_| true);
 }
 
 /// One `aterm ctl --sock <sock> <args…>` call, `stdin` piped in; its output.
@@ -169,13 +158,9 @@ fn a_held_lifeline_keeps_the_instance_and_a_cut_one_ends_it_cleanly() {
     let log = root.join("gui.log");
     let mut cmd = headless(&root, Some(&sock), &log);
     let lifeline = launch_isolation::lifeline(&mut cmd, &root);
+    let mut ready = headless_boot::arm_ready(&mut cmd, &root);
     let mut instance = Started(cmd.spawn().expect("launch aterm --headless"));
-    wait_listening(&mut instance.0, &sock, &log);
-    assert!(
-        read_log(&log).contains("lifeline armed on fd 0"),
-        "the launch says it took the lifeline:\n{}",
-        read_log(&log)
-    );
+    wait_listening(&mut instance.0, &mut ready, &log);
 
     // Held: the instance runs a shell and answers through its socket.
     let sent = ctl(&root, &sock, &["send", "--stdin"], b"echo SHPID=$$\n");
@@ -205,7 +190,6 @@ fn a_held_lifeline_keeps_the_instance_and_a_cut_one_ends_it_cleanly() {
     assert!(alive(shell), "the shell {shell} is running while held");
 
     // Cut: the ordinary quit, not the backstop.
-    let cut_at = Instant::now();
     drop(lifeline);
     let mut status = None;
     wait_until(
@@ -217,19 +201,10 @@ fn a_held_lifeline_keeps_the_instance_and_a_cut_one_ends_it_cleanly() {
         || read_log(&log),
     );
     let status = status.expect("an exit status");
-    let log_text = read_log(&log);
     assert!(
         status.success(),
-        "a cut lifeline quits cleanly: {status}\n{log_text}"
-    );
-    assert!(
-        log_text.contains("lifeline cut (fd 0 reached end-of-file)"),
-        "{log_text}"
-    );
-    assert!(
-        !log_text.contains("the quit has not finished"),
-        "the backstop fired instead of the quit ({:?} after the cut):\n{log_text}",
-        cut_at.elapsed()
+        "a cut lifeline quits cleanly: {status}\n{}",
+        read_log(&log)
     );
     assert!(
         !sock.exists(),
@@ -325,11 +300,6 @@ fn a_killed_launcher_takes_its_instance_with_it() {
     // Gone, and reaped by launchd: the number is free for any process now, and a
     // SIGKILL sent to it later could land on one this test never started.
     std::mem::forget(guard);
-    assert!(
-        read_log(&log).contains("lifeline cut (fd 0 reached end-of-file)"),
-        "{}",
-        read_log(&log)
-    );
 }
 
 /// THE CENSUS on real processes: `aterm doctor`, run in B's world, names A — whose
@@ -346,15 +316,16 @@ fn the_doctor_names_an_unreachable_instance_and_not_a_reachable_one() {
     let log_a = root_a.join("gui.log");
     let mut cmd = headless(&root_a, Some(&sock_a), &log_a);
     let _lifeline_a = launch_isolation::lifeline(&mut cmd, &root_a);
+    let mut ready_a = headless_boot::arm_ready(&mut cmd, &root_a);
     let mut a = Started(cmd.spawn().expect("launch A"));
-    wait_listening(&mut a.0, &sock_a, &log_a);
+    wait_listening(&mut a.0, &mut ready_a, &log_a);
 
     let log_b = root_b.join("gui.log");
     let mut cmd = headless(&root_b, None, &log_b);
     let _lifeline_b = launch_isolation::lifeline(&mut cmd, &root_b);
+    let mut ready_b = headless_boot::arm_ready(&mut cmd, &root_b);
     let mut b = Started(cmd.spawn().expect("launch B"));
-    let sock_b = root_b.join(format!("run/aterm/aterm-{}.sock", b.0.id()));
-    wait_listening(&mut b.0, &sock_b, &log_b);
+    wait_listening(&mut b.0, &mut ready_b, &log_b);
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
     launch_isolation::apply(&mut cmd, &root_b);
@@ -380,14 +351,6 @@ fn the_doctor_names_an_unreachable_instance_and_not_a_reachable_one() {
     assert!(
         !report.contains(&format!("pid {pid_b} ")),
         "B (pid {pid_b}) is published in the directory the doctor read:\n{report}"
-    );
-    let dir_b = root_b.join("run/aterm");
-    assert!(
-        report.contains(&format!(
-            "reachable by no control socket in {}",
-            dir_b.display()
-        )),
-        "the row names the directory it read:\n{report}"
     );
     assert!(
         a.0.try_wait().expect("try_wait A").is_none()

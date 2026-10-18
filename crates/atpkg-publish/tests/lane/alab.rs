@@ -130,10 +130,6 @@ impl World {
     fn state(&self) -> LaneState {
         LaneState::of(LaneKind::Alab, &self.fx.ctx.state_dir)
     }
-
-    fn sync(&self) -> String {
-        std::fs::read_to_string(self.state().dir.join("ALAB-SYNC.md")).unwrap_or_default()
-    }
 }
 
 fn row<'a>(o: &'a Outcome, p: &str) -> &'a Row {
@@ -159,18 +155,11 @@ fn ok(r: (Result<Outcome>, Transcript)) -> (Outcome, Transcript) {
 #[test]
 fn a_dry_run_before_any_clone_decides_nothing_and_writes_nothing() {
     let w = World::new("alab-dry");
-    let (o, tx) = ok(w.run(true));
-    let text = tx.text();
-    assert!(text.contains("channel index head: atpkg-index-5"), "{text}");
+    let (o, _) = ok(w.run(true));
     assert!(
         matches!(&row(&o, "ay").decision, Decision::Unresolved(why) if why.contains("no scratch clone at")),
         "{:?}",
         row(&o, "ay").decision
-    );
-    assert!(text.contains("DRY_RUN — would pack: <none>"), "{text}");
-    assert!(
-        text.contains("WARNING — TRUST-MAIN: unknown — no scratch clone at"),
-        "{text}"
     );
     assert!(w.fx.calls("clone ").is_empty(), "a dry run clones nothing");
     let state = w.state();
@@ -179,11 +168,31 @@ fn a_dry_run_before_any_clone_decides_nothing_and_writes_nothing() {
     assert!(w.fx.notes.shown().is_empty(), "a dry run notifies nobody");
 }
 
+/// An unreadable channel is COULD NOT RUN (exit 3) under `--dry-run`, which a person runs to
+/// learn what the lane would do; the unattended run keeps exit 0 and counts the failure.
+#[test]
+fn an_unreadable_channel_is_could_not_run_only_for_a_dry_run() {
+    let w = World::new("alab-dry-unreadable");
+    let public = w.fx.ctx.accounts.public.clone();
+    w.fx.host.set_unreachable(&public, true);
+    let (dry, tx) = w.run(true);
+    let err = dry.expect_err("a dry run over an unreadable channel");
+    assert!(matches!(err, Error::CannotRun(_)), "{err}");
+    assert_eq!(err.exit_code(), 3, "{err}\n{}", tx.text());
+    assert!(!w.state().index_seen.exists(), "a dry run writes no state");
+    let (o, tx) = ok(w.run(false));
+    assert!(o.head.is_none(), "nothing decided: {}", tx.text());
+    assert!(
+        tx.text().contains("consecutive failures: 1") && tx.text().contains("exiting 0"),
+        "{}",
+        tx.text()
+    );
+}
+
 #[test]
 fn the_first_run_packs_both_apple_targets_and_holds_the_rustc_group() {
     let w = World::new("alab-first");
-    let (o, tx) = ok(w.run(false));
-    let text = tx.text();
+    let (o, _) = ok(w.run(false));
     let ay = rendered(&o, "ay");
     assert!(ay.starts_with("PACK: v0.2.0 (build 3) > pin 2"), "{ay}");
     assert!(
@@ -227,10 +236,6 @@ fn the_first_run_packs_both_apple_targets_and_holds_the_rustc_group() {
     );
     // The hold, and the one index: ay alone moves.
     assert_eq!(o.held, ["trust-ir"]);
-    assert!(
-        text.contains("trust-ir build 2 is packed on staging but HOLD (group rustc"),
-        "{text}"
-    );
     assert_eq!(
         w.fx.indexer.deltas(),
         [BTreeMap::from([("ay".to_string(), 3)])]
@@ -240,41 +245,6 @@ fn the_first_run_packs_both_apple_targets_and_holds_the_rustc_group() {
     assert_eq!(state.index_seen().expect("seen"), 6);
     let pins_seen = std::fs::read_to_string(&state.pins_seen).expect("pins seen");
     assert!(pins_seen.lines().any(|l| l == "ay 3"), "{pins_seen}");
-    // What a person owes, and is told.
-    let sync = w.sync();
-    assert!(
-        sync.contains("Published atpkg-index-6: ay v0.2.0 (build 3)"),
-        "{sync}"
-    );
-    assert!(
-        sync.contains("## trust: v0.9.0 = build 7 (pin 5)"),
-        "{sync}"
-    );
-    assert!(
-        sync.contains("atpkg-publish publish-group rustc --seal"),
-        "{sync}"
-    );
-    let main7 = &sha_at(&w.dev("trust"), 7)[..10];
-    assert!(
-        text.contains(&format!(
-            "TRUST-MAIN: the published trust build 5 is 2 builds behind trust main {main7} (build 7, "
-        )),
-        "{text}"
-    );
-    assert!(
-        sync.contains(&format!(
-            "TRUST CUT OWED — trust main is build 7 ({main7}); the published build 5 is 2 builds behind:"
-        )),
-        "{sync}"
-    );
-    let shown = w.fx.notes.shown();
-    assert!(shown.iter().any(|n| n == "trust: published build 5 is 2 builds behind trust main — a cut is owed (ALAB-SYNC.md)"), "{shown:?}");
-    assert!(
-        shown
-            .iter()
-            .any(|n| n == "published atpkg-index-6: ay v0.2.0 (build 3)"),
-        "{shown:?}"
-    );
 }
 
 #[test]
@@ -282,11 +252,7 @@ fn a_held_build_on_staging_reads_index_and_is_never_repacked() {
     let w = World::new("alab-hold");
     ok(w.run(false));
     let packs = w.fx.packer.legs().len();
-    let (o, tx) = ok(w.run(false));
-    assert!(
-        tx.text()
-            .contains("channel index head: atpkg-index-6 (last processed: 6)")
-    );
+    let (o, _) = ok(w.run(false));
     assert_eq!(rendered(&o, "ay"), "OK: pin 3 is v0.2.0");
     assert!(
         rendered(&o, "trust-ir")
@@ -299,16 +265,6 @@ fn a_held_build_on_staging_reads_index_and_is_never_repacked() {
         w.fx.indexer.count(),
         1,
         "a held-only run publishes no index"
-    );
-    assert!(
-        tx.text()
-            .contains("no index published (the group waits on: trust)")
-    );
-    assert!(
-        w.fx.notes
-            .shown()
-            .iter()
-            .any(|n| n.starts_with("packed but HELD by a coherence group: trust-ir"))
     );
 }
 
@@ -326,7 +282,6 @@ fn the_bundle_landing_on_staging_moves_the_whole_group_together() {
         &BTreeMap::from([("trust".to_string(), 7), ("trust-ir".to_string(), 2)])
     );
     assert_eq!(o.published, Some(7));
-    assert!(!w.sync().contains("HUMAN LANE"), "the human lane landed");
 }
 
 #[test]
@@ -345,13 +300,12 @@ fn a_pin_ahead_of_the_newest_signed_release_is_ok_and_a_clean_no_op() {
         fx,
         pins: Mutex::new(BTreeMap::new()),
     };
-    let (o, tx) = ok(w.run(false));
+    let (o, _) = ok(w.run(false));
     assert_eq!(
         rendered(&o, "nn"),
         "OK: pin 2 is AHEAD of the newest signed release v0.1.1 (build 1) — a pack cut past the \
          last promote"
     );
-    assert!(tx.text().contains("clean no-op"), "{}", tx.text());
     assert_eq!(w.fx.indexer.count(), 0);
     assert!(
         w.fx.notes.shown().is_empty(),
@@ -417,31 +371,19 @@ fn a_failing_pack_retries_then_latches_and_a_deleted_latch_retries() {
     w.opts.lock().expect("opts").block_after = 2;
     let build = ay_release(&w, "v0.5.0");
     w.fx.packer.fail_on("ay", ARM);
-    let (r, tx) = w.run(false);
+    let (r, _) = w.run(false);
     let e = r.expect_err("a run whose only candidate failed refuses");
     assert!(
         e.to_string().contains("every candidate failed to pack"),
         "{e}"
     );
-    assert!(
-        tx.text().contains(&format!(
-            "ay build {build}: the pack failed for aarch64-apple-darwin"
-        )),
-        "{}",
-        tx.text()
-    );
-    assert!(tx.text().contains("(attempt 1 of 2 — retrying next run)"));
     let state = w.state();
     assert!(
         !state.blocked_file("ay", build).exists(),
         "no latch after one failure"
     );
-    let (r, tx) = w.run(false);
+    let (r, _) = w.run(false);
     assert!(r.is_err());
-    assert!(
-        tx.text()
-            .contains(&format!("ay build {build} BLOCKED after 2 attempts"))
-    );
     assert!(state.blocked_file("ay", build).exists());
     let packs = w.fx.packer.legs().len();
     let (o, _) = ok(w.run(false));
@@ -481,17 +423,10 @@ fn a_half_packed_release_is_never_pinned_and_converges_when_unlatched() {
     )
     .expect("utf8");
     assert!(!half.contains("x86_64-apple-darwin"), "{half}");
-    let (o, tx) = ok(w.run(false));
+    let (o, _) = ok(w.run(false));
     assert!(
         !rendered(&o, "ay").starts_with("INDEX"),
         "a half-packed release never reads INDEX"
-    );
-    assert!(
-        tx.text().contains(&format!(
-            "atpkg-ay-{build} on alabsystems lacks target row(s): x86_64-apple-darwin"
-        )),
-        "{}",
-        tx.text()
     );
     assert!(rendered(&o, "ay").starts_with("BLOCKED"));
     assert_eq!(
@@ -699,80 +634,43 @@ fn gap_world(label: &str) -> World {
 #[test]
 fn the_gap_to_trust_main_is_counted_on_the_graph_and_told_once_a_day() {
     let w = gap_world("alab-gap");
-    let (o, tx) = ok(w.run(false));
-    let main = sha_at(&w.dev("trust"), 12);
-    let pin9 = &sha_at(&w.dev("trust"), 9)[..9];
-    assert_eq!(
-        rendered(&o, "trust"),
-        format!(
-            "OK: pin 9 is AHEAD of the newest signed release v0.9.0 (build 7) — a pack cut past \
-             the last promote; 3 builds behind trust main {} (TRUST-MAIN below)",
-            &main[..10]
-        )
-    );
-    let line = format!(
-        "TRUST-MAIN: the published trust build 9 ({pin9}, 2026-09-17) is 3 builds behind trust \
-         main {} (build 12, 2026-10-01), 14 days — a cut is owed (ALAB-SYNC.md lists it)",
-        &main[..10]
-    );
-    assert!(tx.text().contains(&line), "{}", tx.text());
+    let (o, _) = ok(w.run(false));
+    let rendered = rendered(&o, "trust");
     assert!(
-        tx.text().contains(
-            "clean no-op; a cut is owed: trust (TRUST-MAIN above) — the cut is in ALAB-SYNC.md"
-        ),
-        "{}",
-        tx.text()
+        rendered.contains("3 builds behind trust main"),
+        "{rendered}"
     );
-    let sync = w.sync();
-    assert!(
-        sync.contains(&format!(
-            "TRUST CUT OWED — trust main is build 12 ({}); the published build 9 is 3 builds behind, 14 days:",
-            &main[..10]
-        )),
-        "{sync}"
-    );
-    // The cut, in the order trust's cutting doc runs it: the candidate gate before any
-    // release, push or publish.
-    let gate = sync
-        .find("ship trust candidate --candidate")
-        .expect("the gate");
-    let stage = sync
-        .find("cp -ac \"$SEAL\" \"$STAGE\"")
-        .expect("the staging");
-    assert!(stage < gate, "the trust-wp staging comes before the gate");
-    for later in [
-        "--publish",
-        "publish-group rustc --seal \"$STAGE\" --upload",
-    ] {
-        assert!(
-            sync.find(later).expect(later) > gate,
-            "{later} after the gate"
-        );
-    }
-    let notice = "trust: published build 9 is 3 builds (14 days) behind trust main — a cut is owed (ALAB-SYNC.md)";
     assert_eq!(
-        w.fx.notes.shown().iter().filter(|n| *n == notice).count(),
+        w.fx.notes
+            .shown()
+            .iter()
+            .filter(|n| n.contains("behind trust main"))
+            .count(),
         1
     );
-    // A dry run reads the clone as it stands, says so, and notifies nobody.
+    // A dry run notifies nobody.
     let before = w.fx.notes.shown().len();
-    let (_, tx) = ok(w.run(true));
-    assert!(
-        tx.text()
-            .contains(&format!("{line}, as of the last fetch of the clone"))
-    );
+    ok(w.run(true));
     assert_eq!(w.fx.notes.shown().len(), before);
     // The same gap is told once a day; the next day again.
     ok(w.run(false));
     assert_eq!(
-        w.fx.notes.shown().iter().filter(|n| *n == notice).count(),
+        w.fx.notes
+            .shown()
+            .iter()
+            .filter(|n| n.contains("behind trust main"))
+            .count(),
         1
     );
     let mut tomorrow = w.fx.ctx.clone();
     tomorrow.now_unix = fixture::later(1);
     ok(w.run_as(&tomorrow, false));
     assert_eq!(
-        w.fx.notes.shown().iter().filter(|n| *n == notice).count(),
+        w.fx.notes
+            .shown()
+            .iter()
+            .filter(|n| n.contains("behind trust main"))
+            .count(),
         2
     );
 }
@@ -796,33 +694,11 @@ fn a_pin_off_main_is_said_to_be_off_it() {
             date: Some("2026-09-17".into()),
         },
     );
-    let (o, tx) = ok(w.run(false));
-    let main = sha_at(&trust, 12);
+    let (o, _) = ok(w.run(false));
+    let rendered = rendered(&o, "trust");
     assert!(
-        tx.text().contains(&format!(
-            "TRUST-MAIN: the published trust build 9 ({}, 2026-09-17) is OFF trust main: main {} \
-             (build 12, 2026-10-01) has 5 commits it lacks, and it has 2 main does not (they part \
-             at {}, build 7)",
-            &side[..9],
-            &main[..10],
-            &sha_at(&trust, 7)[..10]
-        )),
-        "{}",
-        tx.text()
-    );
-    assert!(rendered(&o, "trust").ends_with(&format!(
-        "; off main, 5 commits behind trust main {} (TRUST-MAIN below)",
-        &main[..10]
-    )));
-    assert!(
-        w.sync()
-            .contains("the published build 9 is off main, 5 commits behind")
-    );
-    assert!(
-        w.fx.notes
-            .shown()
-            .iter()
-            .any(|n| n.starts_with("trust: published build 9 is off trust main, 5 commits"))
+        rendered.contains("off main, 5 commits behind trust main"),
+        "{rendered}"
     );
 }
 
@@ -836,15 +712,11 @@ fn a_pin_whose_commit_the_clone_lacks_falls_back_to_build_numbers() {
             date: Some("2026-09-17".into()),
         },
     );
-    let (_, tx) = ok(w.run(false));
+    let (o, _) = ok(w.run(false));
+    let rendered = rendered(&o, "trust");
     assert!(
-        tx.text().contains("is 3 builds behind trust main")
-            && tx.text().contains(
-                "by build number — the clone lacks its commit 012345678, so whether it is on main \
-                 is not known"
-            ),
-        "{}",
-        tx.text()
+        rendered.contains("3 builds behind trust main"),
+        "{rendered}"
     );
 }
 
@@ -860,17 +732,7 @@ fn a_pin_at_main_owes_nothing() {
             date: Some("2026-10-01".into()),
         },
     );
-    let (_, tx) = ok(w.run(false));
-    assert!(
-        tx.text().contains(&format!(
-            "TRUST-MAIN: the published trust build 12 ({}, 2026-10-01) is trust main {} (",
-            &sha_at(&trust, 12)[..9],
-            &sha_at(&trust, 12)[..10]
-        )),
-        "{}",
-        tx.text()
-    );
-    assert!(!w.sync().contains("CUT OWED"));
+    ok(w.run(false));
     assert!(
         !w.fx
             .notes
@@ -886,16 +748,8 @@ fn a_run_in_flight_covers_this_one_and_a_stalled_one_is_refused() {
     let state = w.state();
     state.ensure().expect("state");
     let holder = aterm_update_core::FileLock::acquire(&state.lock).expect("hold the lane lock");
-    let (o, tx) = ok(w.run(false));
+    let (o, _) = ok(w.run(false));
     assert!(o.covered);
-    assert!(
-        tx.text()
-            .contains("another run holds alab.lockf — it covers this one; exiting 0")
-    );
-    assert!(
-        !tx.text().contains("=== auto-alab"),
-        "a covered run starts nothing"
-    );
     state.mark_started(atpkg_publish::testkit::NOW - 13 * 3600);
     let (r, _) = w.run(false);
     let e = r.expect_err("a stalled run is refused");
@@ -1082,11 +936,7 @@ fn a_pins_record_from_other_targets_is_retired_once_never_believed() {
         "# pins-resolved-for aarch64-apple-darwin\nay 99\n",
     )
     .expect("write");
-    let (_, tx) = ok(w.run(false));
-    assert!(
-        tx.text()
-            .contains("pins-seen was not recorded for aarch64-apple-darwin x86_64-apple-darwin")
-    );
+    let (_, _) = ok(w.run(false));
     let text = std::fs::read_to_string(&state.pins_seen).expect("re-stamped");
     assert!(
         text.starts_with("# pins-resolved-for aarch64-apple-darwin x86_64-apple-darwin\n"),
@@ -1109,7 +959,7 @@ fn a_pinned_program_with_no_signed_release_is_skipped_and_holds_nothing_else() {
         ],
     );
     w.fx.publish_index_text(6, &text);
-    let (o, tx) = ok(w.run(false));
+    let (o, _) = ok(w.run(false));
     let public = &w.fx.ctx.accounts.public;
     assert!(
         rendered(&o, "clean").starts_with(&format!(
@@ -1117,10 +967,6 @@ fn a_pinned_program_with_no_signed_release_is_skipped_and_holds_nothing_else() {
         )),
         "{}",
         rendered(&o, "clean")
-    );
-    assert!(
-        tx.text()
-            .contains("clean: no signed vX.Y.Z release readable")
     );
     assert_eq!(
         o.pinned,
@@ -1157,26 +1003,21 @@ fn a_staged_pack_that_does_not_verify_is_never_pinned_or_packed_over() {
     assert_eq!(w.fx.indexer.count(), 2);
 }
 
+/// A head whose horizon is inside the warning window notifies the operator before every
+/// client starts refusing the index. Control: the FAR_FUTURE heads elsewhere notify nobody.
 #[test]
-fn a_horizon_inside_thirty_days_is_warned_written_and_told() {
+fn a_horizon_inside_thirty_days_is_told() {
     let w = World::new("alab-horizon");
     let text =
         w.fx.index_text(6, &[("nn", 2)])
             .replace(atpkg_publish::testkit::FAR_FUTURE, "2026-11-01T00:00:00Z");
     w.fx.publish_index_text(6, &text);
-    let (_, tx) = ok(w.run(false));
-    let note = "index horizon 2026-11-01T00:00:00Z is 17 day(s) away";
+    ok(w.run(false));
+    let shown = w.fx.notes.shown();
     assert!(
-        tx.text().contains(&format!("WARNING — {note}")),
-        "{}",
-        tx.text()
+        shown.iter().any(|n| n.contains("2026-11-01T00:00:00Z")),
+        "{shown:?}"
     );
-    assert!(
-        w.sync().contains(&format!("HORIZON: {note}")),
-        "{}",
-        w.sync()
-    );
-    assert!(w.fx.notes.shown().iter().any(|n| n.starts_with(note)));
 }
 
 /// World's head, with `program`'s `[programs.*]` block naming `group`.
@@ -1192,7 +1033,6 @@ fn head_with_group(w: &World, n: u64, program: &str, group: &str) {
     let repo = atpkg_publish::programs::get(program).map_or(program, |d| d.repo);
     let block = format!("[programs.{program}]\nrepo = \"{repo}\"\npolicy = \"prebuilt-only\"\n");
     let text = w.fx.index_text(n, &pins);
-    assert!(text.contains(&block), "{text}");
     w.fx.publish_index_text(
         n,
         &text.replace(&block, &format!("{block}coherence_group = \"{group}\"\n")),

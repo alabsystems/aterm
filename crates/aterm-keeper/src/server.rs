@@ -12,6 +12,12 @@
 //! duplicate of the description); `fstat` for the rdev is the one call it makes on one. It
 //! signals nothing. The only program it starts is the relaunch, `/usr/bin/open -a <its own
 //! bundle>`, inheriting nothing (`aterm_uds::pspawn`).
+//!
+//! The crash-restore companions (`companions`, keyed by the number the loop gives each) are held
+//! the same way: never mapped, read or written (guard `keeper-no-mmap`). Before the core sees
+//! one, the loop checks what the descriptor is through libproc and `fcntl` alone
+//! ([`companion_fault`]): POSIX shared memory of the claimed length, opened read-only, within
+//! the bounds. A companion closes with its master, whatever closes it.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -24,11 +30,14 @@ use std::time::{Duration, Instant};
 use aterm_uds::CtlStream;
 use aterm_uds::exitwatch::ExitWatch;
 
-use crate::core::{ConnId, Holders, KeeperCore, KeeperEnv, MarkerEvidence, Out, Rdev};
+use crate::core::{CompanionId, ConnId, Holders, KeeperCore, KeeperEnv, MarkerEvidence, Out, Rdev};
 use crate::frameio::{Incoming, read_frame, write_frame};
 use crate::identity::{CheckError, Identity};
 use crate::sys::{self, POLLERR, POLLHUP, POLLIN, PollFd};
-use crate::wire::{Birth, Frame, MarkerRef, MasterHeader, PROTO};
+use crate::wire::{
+    Birth, CAP_JOURNAL, COMPANION_JOURNAL, Frame, JournalOffer, MarkerRef, MasterHeader, PROTO,
+    RefuseCode,
+};
 
 /// How a relaunch is carried out.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,6 +83,10 @@ pub struct Server {
     core: KeeperCore,
     conns: BTreeMap<ConnId, Conn>,
     custody: BTreeMap<Rdev, OwnedFd>,
+    /// Every crash-restore companion held, by the number given at its arrival, with the master
+    /// it rides beside.
+    companions: BTreeMap<CompanionId, (Rdev, OwnedFd)>,
+    next_companion: CompanionId,
     watches: BTreeMap<u32, ExitWatch>,
     children: Vec<u32>,
     identity: Identity,
@@ -84,6 +97,12 @@ pub struct Server {
     started: Instant,
     own_pid: u32,
     refused_dials: u64,
+    /// COMPANIONs this keeper accepted since it started (`status companions_taken=`): each one
+    /// a region it now holds in place of whatever its claim held before. A window's memory
+    /// shed replaces a session's region, so the count moving is how a reader of the status
+    /// sees that the keeper holds the new region rather than the one it superseded (the
+    /// count of regions held, `journals=`, stays the same).
+    companions_taken: u64,
     /// Why the last dial was refused unchecked, as last printed: printed once per reason, and
     /// forgotten at the next admitted dial.
     unchecked_said: Option<String>,
@@ -204,6 +223,42 @@ pub fn read_marker(pid: u32, marker: &MarkerRef) -> MarkerEvidence {
     MarkerEvidence::Released
 }
 
+/// Why a descriptor a window sent as a COMPANION is not one the keeper may hold, or `None` when
+/// it may (the crash-restore plan §5, frame 14). It must be a crash-restore journal (`kind`),
+/// POSIX shared memory (`aterm_uds::holders::fd_is_pshm`: a file, a pipe or a device parked
+/// beside a master would otherwise be handed to the next window as a region to map) of exactly
+/// the length claimed, a whole number of 16 KiB pages up to 64 MiB (the restorer's own bounds,
+/// `aterm_uds::shm`), and open READ-ONLY: a received writable descriptor maps writable, so a
+/// window offered it could corrupt the dead window's words (§3.2 N8). Nothing here maps or reads
+/// the region.
+#[must_use]
+pub fn companion_fault(fd: std::os::fd::BorrowedFd<'_>, kind: u8, len: u64) -> Option<String> {
+    if kind != COMPANION_JOURNAL {
+        return Some(format!("kind {kind} is no journal region"));
+    }
+    let (page, max) = (aterm_uds::shm::PAGE as u64, aterm_uds::shm::MAX_LEN as u64);
+    if len == 0 || !len.is_multiple_of(page) || len > max {
+        return Some(format!(
+            "a {len}-byte region is not a whole number of {page}-byte pages up to {max}"
+        ));
+    }
+    match aterm_uds::holders::fd_is_pshm(fd) {
+        None => return Some("the descriptor is not POSIX shared memory".to_string()),
+        Some(size) if size != len => {
+            return Some(format!("the region is {size} bytes, not the {len} claimed"));
+        }
+        Some(_) => {}
+    }
+    match aterm_uds::shm::is_read_only(fd) {
+        Ok(true) => None,
+        Ok(false) => Some(
+            "the descriptor is open for writing: a window it is offered to could map it writable"
+                .to_string(),
+        ),
+        Err(e) => Some(format!("the descriptor's access mode is unreadable: {e}")),
+    }
+}
+
 /// A pid's kernel start time, in the wire's shape.
 #[must_use]
 pub fn born(pid: u32) -> Option<Birth> {
@@ -247,6 +302,8 @@ impl Server {
             core: KeeperCore::new(can_relaunch),
             conns: BTreeMap::new(),
             custody: BTreeMap::new(),
+            companions: BTreeMap::new(),
+            next_companion: 1,
             watches: BTreeMap::new(),
             children: Vec::new(),
             identity: config.identity,
@@ -257,6 +314,7 @@ impl Server {
             started: Instant::now(),
             own_pid: std::process::id(),
             refused_dials: 0,
+            companions_taken: 0,
             unchecked_said: None,
             frames_behind_exit: 0,
             replies_lost: 0,
@@ -546,11 +604,14 @@ impl Server {
             }
             // Accepted; nothing acts on it yet.
             Frame::RestartWhenSafe => Vec::new(),
+            Frame::Companion { rdev, kind, len } => self.companion(id, rdev, kind, len, fd),
+            Frame::CompanionRelease { rdev, kind } => self.core.companion_release(id, rdev, kind),
             // Keeper-to-window kinds from a window: a protocol error.
             Frame::Welcome { .. }
             | Frame::Offer { .. }
             | Frame::Orphans { .. }
-            | Frame::Refused { .. } => {
+            | Frame::Refused { .. }
+            | Frame::CompanionOffer { .. } => {
                 self.drop_conn(id);
                 return;
             }
@@ -593,12 +654,53 @@ impl Server {
         outs
     }
 
+    /// COMPANION: check what the descriptor is ([`companion_fault`], which neither maps nor
+    /// reads it), number it, and let the core decide; it is held only when the core keeps it.
+    fn companion(
+        &mut self,
+        id: ConnId,
+        rdev: Rdev,
+        kind: u8,
+        len: u64,
+        fd: Option<OwnedFd>,
+    ) -> Vec<Out> {
+        let refused = |code| {
+            vec![Out::Refused {
+                conn: id,
+                code,
+                rdev,
+            }]
+        };
+        let Some(fd) = fd else {
+            return refused(RefuseCode::NoDescriptor);
+        };
+        if let Some(why) = companion_fault(fd.as_fd(), kind, len) {
+            // The keeper's log names why (a window's bug, or a peer probing); the descriptor
+            // closes here.
+            eprintln!("keeper: refused a companion for rdev {rdev:#x}: {why}");
+            return refused(RefuseCode::NotAJournal);
+        }
+        let number = self.next_companion;
+        self.next_companion += 1;
+        let outs = self.core.companion(id, rdev, kind, len, number);
+        if outs.contains(&Out::KeepCompanion(number)) {
+            self.companions.insert(number, (rdev, fd));
+        }
+        outs
+    }
+
     fn apply(&mut self, outs: Vec<Out>) {
         for out in outs {
             match out {
                 Out::Keep(_) | Out::DropDuplicate(_) => {}
+                Out::KeepCompanion(_) => self.companions_taken += 1,
                 Out::Close(rdev) => {
                     self.custody.remove(&rdev);
+                    // A companion travels only beside its master: none outlives it.
+                    self.companions.retain(|_, (of, _)| *of != rdev);
+                }
+                Out::CloseCompanion(number) => {
+                    self.companions.remove(&number);
                 }
                 Out::Welcome { conn, offers } => {
                     let frame = Frame::Welcome {
@@ -608,37 +710,17 @@ impl Server {
                         // What a window that checks code reads before it
                         // registers a master here (§5.7).
                         identity: Some(self.identity.policy()),
+                        // A window sends its companions only to a keeper that says it
+                        // takes them; an older window reads no further than the policy.
+                        caps: Some(CAP_JOURNAL),
                     };
                     self.send(conn, &frame, None);
                 }
-                Out::Offer { conn, rdev } => {
-                    let Some(rec) = self.core.records().get(&rdev).cloned() else {
-                        continue;
-                    };
-                    let frame = Frame::Offer {
-                        header: rec.header,
-                        tag: rec.tag,
-                        meta: rec.meta,
-                    };
-                    // The kernel duplicates the description into the
-                    // recipient; the custody copy stays here (F9).
-                    if let Some(fd) = self
-                        .custody
-                        .get(&rdev)
-                        .map(|f| f.as_fd().try_clone_to_owned())
-                    {
-                        #[cfg(test)]
-                        let fd = if std::mem::take(&mut self.test_fail_next_dup) {
-                            Err(io::Error::from_raw_os_error(24))
-                        } else {
-                            fd
-                        };
-                        match fd {
-                            Ok(fd) => self.send(conn, &frame, Some(&fd)),
-                            Err(_) => self.end_writing(conn),
-                        }
-                    }
-                }
+                Out::Offer {
+                    conn,
+                    rdev,
+                    journal,
+                } => self.offer(conn, rdev, journal),
                 Out::Orphans { conn, n } => self.send(conn, &Frame::Orphans { n }, None),
                 Out::Refused { conn, code, rdev } => {
                     self.send(conn, &Frame::Refused { code, rdev }, None);
@@ -646,6 +728,64 @@ impl Server {
                 Out::WatchPid(pid) => self.watch_pid(pid),
                 Out::Relaunch => self.relaunch_now(),
             }
+        }
+    }
+
+    /// Send the OFFER of `rdev` to `conn` with a duplicate of the custody copy, and to a window
+    /// that journals, with the brake and a COMPANION_OFFER of the region right after it. The
+    /// kernel duplicates each description into the recipient; the keeper's copies stay here
+    /// (F9). Both duplicates are made before anything is written, so an OFFER that says a region
+    /// follows is followed by one; a duplicate that cannot be made (`EMFILE`) ends the writing to
+    /// `conn` as a failed write does, and the offer returns to Orphaned at its EOF.
+    fn offer(&mut self, conn: ConnId, rdev: Rdev, journal: Option<crate::core::OfferJournal>) {
+        let Some(rec) = self.core.records().get(&rdev).cloned() else {
+            return;
+        };
+        let Some(master) = self
+            .custody
+            .get(&rdev)
+            .map(|f| f.as_fd().try_clone_to_owned())
+        else {
+            return;
+        };
+        #[cfg(test)]
+        let master = if std::mem::take(&mut self.test_fail_next_dup) {
+            Err(io::Error::from_raw_os_error(24))
+        } else {
+            master
+        };
+        // The region: the core's companion, held here (a companion the loop does not hold is
+        // offered as none, never as a frame without its descriptor).
+        let region = journal.and_then(|j| j.companion).and_then(|c| {
+            self.companions
+                .get(&c.id)
+                .map(|(_, fd)| (c, fd.as_fd().try_clone_to_owned()))
+        });
+        let (master, region) = match (master, region) {
+            (Ok(master), None) => (master, None),
+            (Ok(master), Some((c, Ok(fd)))) => (master, Some((c, fd))),
+            (Err(_), _) | (_, Some((_, Err(_)))) => {
+                self.end_writing(conn);
+                return;
+            }
+        };
+        let frame = Frame::Offer {
+            header: rec.header,
+            tag: rec.tag,
+            meta: rec.meta,
+            journal: journal.map(|j| JournalOffer {
+                attempts: j.attempts,
+                companions: u8::from(region.is_some()),
+            }),
+        };
+        self.send(conn, &frame, Some(&master));
+        if let Some((c, fd)) = region {
+            let frame = Frame::CompanionOffer {
+                rdev,
+                kind: c.kind,
+                len: c.len,
+            };
+            self.send(conn, &frame, Some(&fd));
         }
     }
 
@@ -714,6 +854,23 @@ impl Server {
             format!("frames_behind_exit={}", self.frames_behind_exit),
             format!("replies_lost={}", self.replies_lost),
         ];
+        // The crash-restore regions held beside the masters, counted from the descriptors this
+        // loop really holds, sized by `fstat` (the plan's §5 status), never from the core's
+        // bookkeeping: a region a teardown failed to close shows here. The size is the address
+        // space the regions name (virtual: only the pages their writers touched are resident,
+        // and the keeper maps none of them).
+        let (journals, bytes) =
+            self.companions
+                .values()
+                .fold((0usize, 0u64), |(n, total), (_, fd)| {
+                    let size = aterm_uds::shm::fd_size(fd.as_fd()).unwrap_or(0);
+                    (n + 1, total.saturating_add(size))
+                });
+        lines.push(format!(
+            "journals={journals} virtual_mib={} companions_taken={}",
+            bytes.div_ceil(1 << 20),
+            self.companions_taken
+        ));
         lines.extend(self.core.status_lines());
         let mut text = lines.join("\n");
         text.truncate(text.floor_char_boundary(crate::wire::MAX_STATUS));
@@ -736,7 +893,7 @@ impl Server {
     /// processes live on. Each socket is shut down before it is dropped: a mere close leaves the
     /// connection open while another process still holds the descriptor (a concurrent test's
     /// child spawned before it was close-on-exec).
-    #[cfg(test)]
+    #[cfg(all(test, target_vendor = "apple"))]
     pub(crate) fn test_drop_connections(&mut self) {
         let ids: Vec<ConnId> = self.conns.keys().copied().collect();
         for id in ids {
@@ -750,7 +907,7 @@ impl Server {
     /// Why this keeper turned each dial away unchecked (its accept check could
     /// not run), never cleared by a later admitted dial: a test tells a
     /// `trustd` that went silent from a verdict on the dialer.
-    #[cfg(test)]
+    #[cfg(all(test, target_vendor = "apple"))]
     pub(crate) fn test_unchecked_ever(&self) -> &[String] {
         &self.test_unchecked_ever
     }
@@ -1153,5 +1310,151 @@ mod tests {
             "the control's OFFER carries a descriptor: {:?}",
             control.read
         );
+    }
+
+    /// The keeper takes in custody only a read-only POSIX shared-memory object of the kind and
+    /// length claimed, within the bounds; everything else is named, and nothing is mapped.
+    #[test]
+    fn a_companion_must_be_a_read_only_region_of_its_claimed_length() {
+        use crate::wire::COMPANION_JOURNAL as JOURNAL;
+        use aterm_uds::shm::{MAX_LEN, PAGE, Region, testing};
+        let len = 2 * PAGE;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a test playing the window makes the region the keeper is sent"
+        )]
+        // SAFETY: companion_fault only inspects descriptor metadata; this custody stays
+        // local and neither it nor an alias modifies or resizes the object.
+        let (_region, custody) = unsafe { Region::create(len) }.expect("a region");
+        let ro = custody.as_fd();
+        assert_eq!(
+            companion_fault(ro, JOURNAL, len as u64),
+            None,
+            "the real thing"
+        );
+
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a test playing the window makes the region the keeper is sent"
+        )]
+        // SAFETY: companion_fault reads only descriptor metadata and refuses writable
+        // custody; this private descriptor is never written, resized or mapped.
+        let (_twin, writable) =
+            unsafe { testing::create_with_writable_custody(len) }.expect("a twin");
+        let why = companion_fault(writable.as_fd(), JOURNAL, len as u64).expect("refused");
+        assert!(why.contains("open for writing"), "{why}");
+        let why = companion_fault(ro, JOURNAL, 3 * PAGE as u64).expect("refused");
+        assert!(why.contains("not the"), "{why}");
+        let why = companion_fault(ro, 2, len as u64).expect("refused");
+        assert!(why.contains("no journal"), "{why}");
+        for bad in [0, PAGE as u64 + 1, (MAX_LEN + PAGE) as u64] {
+            let why = companion_fault(ro, JOURNAL, bad).expect("refused");
+            assert!(why.contains("pages"), "{bad}: {why}");
+        }
+        let null = std::fs::File::open("/dev/null").expect("/dev/null");
+        let why = companion_fault(null.as_fd(), JOURNAL, len as u64).expect("refused");
+        assert!(why.contains("not POSIX shared memory"), "{why}");
+    }
+
+    /// The loop's descriptors follow the core's decisions exactly: after a COMPANION, a second
+    /// one that supersedes it (`Out::CloseCompanion`), and the RELEASE that removes the record
+    /// (`Out::Close`, which closes every companion beside the master), the regions the loop
+    /// holds are the core's, the status counts them from the descriptors (`fstat`), and the
+    /// kernel's own table of this process shows exactly that many of the region's size. A
+    /// teardown that forgot one would leave the region pinned for the keeper's life with every
+    /// status line still clean, were they counted from the core.
+    #[test]
+    fn the_loop_holds_exactly_the_regions_the_core_keeps() {
+        use aterm_uds::shm::{PAGE, Region};
+        // A size no other test in this binary makes: they run beside this one, in-process.
+        let len = 7 * PAGE;
+        let dir = std::env::temp_dir().join(format!("akk-unit-{}-regions", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut server = Server::bind(ServeConfig {
+            socket: dir.join("k.sock"),
+            identity: Identity::same_uid(),
+            relaunch: Relauncher::Unavailable,
+            version: "test".into(),
+            test_drop_custody: false,
+        })
+        .expect("bind");
+        let client = CtlStream::connect(server.socket()).expect("connect");
+        server.step(0).expect("the accept");
+        let null = std::fs::File::open("/dev/null").expect("a character device");
+        let rdev = null.metadata().expect("stat").rdev();
+        let me = std::process::id();
+        let held_here = || {
+            aterm_uds::holders::pshm_sizes_of(me)
+                .expect("our own table")
+                .into_iter()
+                .filter(|s| *s == len as u64)
+                .count()
+        };
+        let in_step = |server: &Server| {
+            let loop_holds: std::collections::BTreeSet<CompanionId> =
+                server.companions.keys().copied().collect();
+            assert_eq!(loop_holds, server.core().companions_held());
+            loop_holds.len()
+        };
+        let send = |server: &mut Server, frame: Frame, fd: Option<std::os::fd::BorrowedFd<'_>>| {
+            write_frame(&client, &frame, fd).expect("write");
+            server.step(0).expect("turn");
+        };
+        let hello = Frame::Hello {
+            proto: PROTO,
+            class: PeerClass::App,
+            caps: CAP_SENDS_BYE | CAP_JOURNAL,
+            build: "test".into(),
+            marker: None,
+        };
+        send(&mut server, hello, None);
+        let register = Frame::Register {
+            header: MasterHeader {
+                rdev,
+                shell_pid: me,
+                shell_birth: born(me).expect("our birth"),
+                local_id: 1,
+            },
+            tag: b"sid=s-unit".to_vec(),
+        };
+        send(&mut server, register, Some(null.as_fd()));
+        let companion = Frame::Companion {
+            rdev,
+            kind: COMPANION_JOURNAL,
+            len: len as u64,
+        };
+        for taken in 1..=2u64 {
+            // The window's own copies close once sent: the loop's is then the only one here.
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "a test playing the window makes the region the keeper is sent"
+            )]
+            // SAFETY: the fixture server only queries/holds/closes custody, never maps,
+            // reopens or resizes it; the inert local region is dropped after the send.
+            let (region, custody) = unsafe { Region::create(len) }.expect("a region");
+            send(&mut server, companion.clone(), Some(custody.as_fd()));
+            drop((region, custody));
+            assert_eq!(in_step(&server), 1, "the second supersedes the first");
+            assert_eq!(held_here(), 1, "the kernel agrees");
+            assert!(
+                server.status_text().contains(&format!(
+                    "journals=1 virtual_mib=1 companions_taken={taken}"
+                )),
+                "the second is counted though the count held stays 1: {}",
+                server.status_text()
+            );
+        }
+        send(&mut server, Frame::Release { rdev }, None);
+        assert!(!server.holds(rdev), "the master closed");
+        assert_eq!(in_step(&server), 0, "and every region beside it");
+        assert_eq!(held_here(), 0, "the kernel agrees");
+        assert!(
+            server.status_text().contains("journals=0 virtual_mib=0"),
+            "{}",
+            server.status_text()
+        );
+        drop(client);
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

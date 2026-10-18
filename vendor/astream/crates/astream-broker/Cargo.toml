@@ -42,6 +42,10 @@ retention = []
 
 [dependencies]
 astream-wire = { workspace = true }
+# The OS cordon: this boot's id (the unclean-open rule, logid.rs) and the ordering-only
+# flush. In-tree and zero-dependency, so the broker stays zero-third-party and keeps
+# forbid(unsafe): the two FFI calls live in astream-sys's one cordoned module.
+astream-sys = { workspace = true }
 astream-cap = { workspace = true, optional = true }
 astream-aead = { workspace = true, optional = true }
 
@@ -55,6 +59,7 @@ astream-wire = { workspace = true }
 # For the cap-enforcement test only (mints capabilities); the LIB graph stays
 # zero-third-party (astream-cap is an OPTIONAL runtime dep behind the `cap` feature).
 astream-cap = { path = "../astream-cap" }
+astream-digest = { workspace = true }
 
 # `asb` — the thin CLI over the library (serve / pub / sub / last / fetch / drain / ack /
 # commit / mint / repair) so a shell or bridge can move bytes on the bus, read retained

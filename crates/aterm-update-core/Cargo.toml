@@ -20,6 +20,8 @@ dev-seams = []
 # Reuse the single source-of-truth private-dir ownership predicate (no drift with
 # the control socket's Application Support hardening).
 aterm-types = { workspace = true }
+# How each write is finished: durable (F_FULLFSYNC) or ordered (F_BARRIERFSYNC).
+aterm-durable = { workspace = true }
 # The roster clock (`roster::now_unix`) reads the workspace's one epoch accessor.
 aterm-time = { workspace = true }
 # Route diagnostics through the global logger aterm-gui installs, so they land in
@@ -38,7 +40,8 @@ aterm-toml = { workspace = true }
 # atpkg's edge: VERIFICATION needs neither RNG nor alloc, so the client's crypto surface
 # stays minimal. ring is already a direct dependency of atpkg, aterm-update and
 # aterm-release, so this adds an edge, not a crate — and the `deny.toml` version floor
-# already covers it.
+# already covers it. Its `digest` (no feature needed) is also the macOS arm of
+# `hash::sha256_file`: the CPU's SHA-256 instructions, as atpkg's bulk hash uses.
 ring = { workspace = true }
 # Decode the base64 master + machine Ed25519 public keys (32 raw bytes each).
 # Standard padded Base64 — first-party and zero-dependency. `decode_strict` is
@@ -58,9 +61,9 @@ aterm-uds = { workspace = true }
 libc = { workspace = true }
 
 # The Linux arm of `hash::sha256_file` (docs/AUDIT-third-party-2026-10-15.md,
-# CT.2): first-party, zero-dependency SHA-256 in place of `ring::digest`, which
-# leaves ring here only for the roster's Ed25519 verify. Other hosts run their
-# system hash command and do not link it.
+# CT.2): first-party, zero-dependency SHA-256 in place of `ring::digest`. The
+# macOS arm hashes on ring (above), whose SHA-256 runs on the CPU's instructions
+# where the scalar loop would not; Windows runs its system hash command.
 [target.'cfg(target_os = "linux")'.dependencies]
 aterm-digest = { workspace = true }
 

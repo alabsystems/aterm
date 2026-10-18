@@ -20,8 +20,7 @@
 //! [`tag_menu_label`], [`tag_menu_name`], [`COPY_ALL`], [`copy_all_text`],
 //! [`EMPTY`], [`NO_MATCH`], [`SHOW_ALL`], [`MessageView::meta_words`],
 //! [`TECHNICAL`], [`button_label`], [`COPY`]). A host's own affordances keep their words
-//! there (the macOS page's `Open Log Folder` and its `Explain heavy load`
-//! switch).
+//! there (the macOS page's `Open Log Folder`).
 //!
 //! The types keep the names they have in the macOS host, so a derived
 //! `Debug` dump reads the same on either side.
@@ -58,30 +57,8 @@ use std::borrow::Cow;
 use crate::center::{Live, MessageCenter};
 use crate::digest::DigestEntry;
 use crate::log::{LogRecord, Retired, escape_into, join_us};
-use crate::model::{Glyph, Intent, MessageId, Severity, UpgradeWord};
+use crate::model::{Glyph, Intent, MessageId, Severity, UpgradeWord, tags};
 use crate::{wire, words};
-
-/// The tag chips' fixed order on Settings ▸ Messages: the families a person
-/// acts on first, then the ambient ones. Every word of the reporter
-/// vocabulary is here (`page_tests::tags_chips_cover_the_vocabulary` pins
-/// it); a tag this build does not know (a line another build wrote into the
-/// same log) follows them in first-seen order rather than vanishing.
-pub const TAG_ORDER: [&str; 14] = [
-    "crash",
-    "config",
-    "update",
-    "toolchain",
-    "packages",
-    "privacy",
-    "session",
-    "window",
-    "render",
-    "a11y",
-    "fabric",
-    "harness",
-    "system",
-    "script",
-];
 
 /// The not-saved note: what a page over an in-memory ring says, in words a
 /// person can act on.
@@ -273,7 +250,7 @@ pub struct MessagesState {
     pub now_unix_ms: u64,
     /// Every record in the ring, newest first; at most `LOG_CAP`.
     pub entries: Vec<MessageView>,
-    /// `(tag, count)` for every tag present, in [`TAG_ORDER`] then first-seen
+    /// `(tag, count)` for every tag present, in [`tags::ALL`] then first-seen
     /// order: the page's filter chips.
     pub tags: Vec<(String, usize)>,
     /// The folder the log files live in (`aterm.log`, `messages.log`,
@@ -317,7 +294,7 @@ impl MessagesState {
     /// The projection, built once from the ring: every record newest first,
     /// the live rows in their current words, the band row each is on (echoes
     /// counted), and whether each authored intent can still be pressed
-    /// ([`MessageView::of`]). Tag counts in the chips' order: [`TAG_ORDER`]
+    /// ([`MessageView::of`]). Tag counts in the chips' order: [`tags::ALL`]
     /// first, then every other tag present in first-seen (newest-first) order.
     #[must_use]
     pub fn of(center: &MessageCenter, host: &impl Host) -> Self {
@@ -370,25 +347,26 @@ impl MessagesState {
             });
         }
         entries.splice(0..0, to_look_at);
-        let mut tags: Vec<(String, usize)> = TAG_ORDER
+        let mut chips: Vec<(String, usize)> = tags::ALL
             .iter()
+            .map(|tag| tag.as_str())
             .filter_map(|tag| {
                 counts
                     .iter()
                     .find(|(seen, _)| seen == tag)
-                    .map(|(_, n)| ((*tag).to_string(), *n))
+                    .map(|(_, n)| (tag.to_string(), *n))
             })
             .collect();
-        tags.extend(
+        chips.extend(
             counts
                 .into_iter()
-                .filter(|(tag, _)| !TAG_ORDER.contains(&tag.as_str())),
+                .filter(|(tag, _)| !tags::ALL.iter().any(|own| own.as_str() == tag)),
         );
         Self {
             revision: center.projection_revision(),
             now_unix_ms,
             entries,
-            tags,
+            tags: chips,
             log_folder: host.log_folder(),
             saved: host.saved(),
             utc_offset_s: host.utc_offset_s(),
@@ -553,7 +531,7 @@ impl MessageView {
                 .enumerate()
                 // AN INTENT WHOSE MOMENT HAS PASSED IS NOT OFFERED (design
                 // ruling 265): `Stop paste` on a paste that finished, `Not
-                // now` on an answered ask, `Show tab 2` on a strain episode
+                // now` on an answered ask, `Show tab 2` on a row
                 // that folded could never be pressed again, and a dead
                 // Primary drawn in the accent read as the thing to do. An
                 // intent that can come back (`Install now`, `Open log`)
@@ -670,8 +648,9 @@ impl MessageView {
     }
 
     /// A record's state words: a record that stands for something that was on
-    /// the band (the strain episode's, whose own row stood on the glass) says
-    /// how long it was shown (`shown for 41 s`, the line its reporter wrote);
+    /// the band (an episode's, whose own row stood on the glass) says
+    /// how long it was shown (`shown for 41 s`, the line it carries; no
+    /// reporter writes one now, but a record from an older log still does);
     /// every other record was written down and never shown: `recorded`.
     #[must_use]
     pub fn record_words(&self) -> String {
@@ -679,7 +658,8 @@ impl MessageView {
             .map_or_else(|| "recorded".to_string(), str::to_string)
     }
 
-    /// The `shown for …` line a record carries, when it has one.
+    /// The `shown for …` line a record carries, when it has one (a record
+    /// from an older log: the retired strain row's episodes wrote it).
     #[must_use]
     pub fn shown_line(&self) -> Option<&str> {
         self.detail
@@ -817,7 +797,7 @@ fn script_tag_words(tag: &str) -> Cow<'_, str> {
         }
         _ => Cow::Borrowed(tag),
     };
-    if TAG_ORDER.iter().any(|own| tag_words(own) == words) {
+    if tags::ALL.iter().any(|own| tag_words(own.as_str()) == words) {
         Cow::Borrowed(tag)
     } else {
         words
@@ -852,13 +832,9 @@ fn still_actionable(intent: &Intent, live: bool, host: &impl Host) -> bool {
         // row or the waiting record too; the press re-checks under the
         // harness's lock.
         Intent::AgentUpgrade { tab, to, word } => host.upgrade_takes(tab, to, *word),
-        // An agent's one row's word: while any tab it named still takes it.
-        Intent::AgentUpgradeTabs { word, moves } => moves
-            .iter()
-            .any(|(tab, to)| host.upgrade_takes(tab, to, *word)),
         // A stop is for the paste still on its way: its row is live exactly
-        // as long as the paste is watched; a strain row's tab is the one it
-        // named while it was up.
+        // as long as the paste is watched; a row's tab is the one it named
+        // while it was up.
         // The keeper's recovered sessions are ended from the live row only.
         Intent::NotNow { .. }
         | Intent::StopPaste { .. }
@@ -898,10 +874,6 @@ pub(crate) fn cut_off_mark(glyph: Glyph, severity: Severity, state: &str) -> Gly
 fn session_gone(intent: &Intent, host: &impl Host) -> bool {
     match intent {
         Intent::AgentUpgrade { tab, .. } => !host.upgrade_stands(tab),
-        // An agent's one row's word: moot once every tab it named is gone.
-        Intent::AgentUpgradeTabs { moves, .. } => {
-            moves.iter().all(|(tab, _)| !host.upgrade_stands(tab))
-        }
         _ => false,
     }
 }
@@ -951,15 +923,6 @@ pub fn act_feedback(intent: &Intent, performed: bool, applies: bool) -> String {
             format!("Sent {}; what it did shows in this log", intent.label())
         }
         (Intent::AgentUpgrade { .. }, false) => "The upgrade no longer takes that word".to_string(),
-        (Intent::AgentUpgradeTabs { .. }, true) => {
-            format!(
-                "Sent {} for each tab; what it did shows in this log",
-                intent.label()
-            )
-        }
-        (Intent::AgentUpgradeTabs { .. }, false) => {
-            "No tab's upgrade takes that word any more".to_string()
-        }
     }
 }
 
@@ -1233,9 +1196,9 @@ impl MessagesState {
 /// - Copy All's text: the host's build information, then, for every `entry`
 ///   in list order, `\n\n` and its `copy=` ([`copy_all_text`]); the lines
 ///   carry every part but the build's.
-/// - A host's own affordances: the macOS page's `Open Log Folder` and its
-///   `Explain heavy load` switch, and the line it shows where messages exist
-///   but `shown=0` ([`NO_MATCH`], with its [`SHOW_ALL`] button).
+/// - A host's own affordances: the macOS page's `Open Log Folder`, and the
+///   line the page shows where messages exist but `shown=0` ([`NO_MATCH`],
+///   with its [`SHOW_ALL`] button).
 /// - The layout's words and choices: its groups' names (`Severity`, `Tags`,
 ///   `Message actions`), a bounded card's `… (N more lines)`, and whether the
 ///   tag filter takes the chips' form or the pop-up's.

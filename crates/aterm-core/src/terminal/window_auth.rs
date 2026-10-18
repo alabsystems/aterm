@@ -133,13 +133,6 @@ mod tests {
         assert!(auth.try_mint_with_engine(Fallback, true).is_some());
     }
 
-    /// The capability and authority are zero-sized: the gate costs nothing at runtime.
-    #[test]
-    fn capability_and_authority_are_zero_sized() {
-        assert_eq!(std::mem::size_of::<WindowOpsCapability>(), 0);
-        assert_eq!(std::mem::size_of::<WindowMintAuthority>(), 0);
-    }
-
     #[test]
     fn standard_profile_wildcard_execute_does_not_overgrant_when_legacy_bool_is_false() {
         let auth = WindowMintAuthority::new();

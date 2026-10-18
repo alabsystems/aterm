@@ -8,17 +8,6 @@ use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
 use winit::event::ElementState;
 use winit::keyboard::{KeyCode, PhysicalKey};
 
-#[cfg(unix)]
-fn press(ch: char) -> InputEvent {
-    InputEvent::Key {
-        key: Key::Character(ch),
-        mods: Modifiers::empty(),
-        base_layout: None,
-        layout_text: None,
-        event_type: KeyEventType::Press,
-    }
-}
-
 /// A real winit key event, so the tests below drive the shipping `on_key`
 /// routing (where the press-path snap lives) rather than the seam alone.
 fn character_event(ch: char, state: ElementState) -> winit::event::KeyEvent {
@@ -70,21 +59,6 @@ fn drain(pipe: i32) -> Vec<u8> {
     bytes[..read as usize].to_vec()
 }
 
-/// Through the real key route, an ordinary typed press normalizes no base key:
-/// the fence classifies the press `on_key` builds anyway (`physical_press`).
-/// Only a binding lookup, a fenced chord's paste test or the Cmd-S/R check asks
-/// for the base key.
-#[cfg(unix)]
-#[test]
-fn ordinary_typed_press_normalizes_no_base_key() {
-    let (mut app, pipe) = app_observing_pty();
-    super::BASE_KEY_NORMALIZATIONS.with(|count| count.set(0));
-    app.on_key(WindowId(0), character_event('a', ElementState::Pressed));
-    let normalizations = super::BASE_KEY_NORMALIZATIONS.with(|count| count.replace(0));
-    assert_eq!(drain(pipe), b"a", "the typed byte must still reach the PTY");
-    assert_eq!(normalizations, 0, "no normalization for a typed press");
-}
-
 /// A keypad press and its release carry one identity: the press owner stores the
 /// `Numpad5` `build_key_input` resolved, so under kitty `DISAMBIGUATE |
 /// REPORT_EVENT_TYPES` the pair is `CSI 57404 u` then `CSI 57404;1:3 u`.
@@ -120,25 +94,10 @@ fn a_keypad_press_and_its_release_report_the_same_keypad_key() {
     );
 }
 
-/// A plain Enter at the real input boundary arms `note_return` (its response
-/// move is licensed, consume-once) without wiping the banked typed stamps of
-/// keys whose echoes are still in flight: a same-row forward hop with a typed
-/// pair is a glyph's echo, licensed by its own press, never the Return's move.
+/// The window geometry the glow-licence tests tick against.
 #[cfg(unix)]
-#[test]
-fn plain_enter_licenses_its_response_and_keeps_banked_stamps() {
-    use std::time::{Duration, Instant};
-
-    use aterm_types::keyboard::NamedKey;
-
-    use crate::cursor_glow::Geom;
-
-    let (mut app, pipe) = app_observing_pty();
-    let wid = WindowId(0);
-    app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty".to_string());
-    let glow_cfg = app.glow_config();
-    let geom = Geom {
+fn glow_geom() -> crate::cursor_glow::Geom {
+    crate::cursor_glow::Geom {
         cw: 8,
         ch: 16,
         rows: 6,
@@ -148,513 +107,165 @@ fn plain_enter_licenses_its_response_and_keeps_banked_stamps() {
         win_w: 320,
         win_h: 96,
         head: 0,
-    };
-    let t0 = Instant::now();
-    let mut out = Vec::new();
-    // Phase A: bare Enter on an empty bank. The response move can only be
-    // funded by `note_return` itself, so a leftover glyph stamp cannot mask
-    // a missing arm.
-    {
-        let (mut bare, bare_pipe) = app_observing_pty();
-        bare.config.cursor_trail = Some(true);
-        bare.config.cursor_trail_style = Some("rainbow kitty".to_string());
-        let bare_cfg = bare.glow_config();
-        let b0 = Instant::now();
-        bare.windows
-            .get_mut(&wid)
-            .unwrap()
-            .fx
-            .cursor_mut()
-            .glow
-            .tick(Some((0, 0)), b0, &bare_cfg, geom, &mut out);
-        assert_eq!(
-            bare.input(
-                wid,
-                InputEvent::Key {
-                    key: Key::Named(NamedKey::Enter),
-                    mods: Modifiers::empty(),
-                    base_layout: None,
-                    layout_text: None,
-                    event_type: KeyEventType::Press,
-                },
-                Source::Human
-            ),
-            crate::input::InputOutcome::Ok
-        );
-        let _ = drain(bare_pipe);
-        let ws = bare.windows.get_mut(&wid).unwrap();
-        let b1 = Instant::now();
-        ws.fx
-            .cursor_mut()
-            .glow
-            .tick(Some((2, 0)), b1, &bare_cfg, geom, &mut out);
-        assert_eq!(
-            ws.fx.cursor_mut().glow.spawns(),
-            1,
-            "a bare Enter's response move is licensed by note_return alone"
-        );
-        // …and consumed once: the program flood after it stays dark.
-        ws.fx.cursor_mut().glow.tick(
-            Some((3, 0)),
-            b1 + Duration::from_millis(16),
-            &bare_cfg,
-            geom,
-            &mut out,
-        );
-        assert_eq!(
-            ws.fx.cursor_mut().glow.spawns(),
-            1,
-            "the return license is depth-1/consume-once — floods still decline"
-        );
     }
-    app.windows
-        .get_mut(&wid)
-        .unwrap()
-        .fx
-        .cursor_mut()
-        .glow
-        .tick(Some((0, 0)), t0, &glow_cfg, geom, &mut out);
-    // Two real glyphs bank stamps; their echoes are in flight when Enter lands.
-    for ch in ['g', 'i'] {
-        assert_eq!(
-            app.input(
-                wid,
-                InputEvent::Key {
-                    key: Key::Character(ch),
-                    mods: Modifiers::empty(),
-                    base_layout: None,
-                    layout_text: None,
-                    event_type: KeyEventType::Press,
-                },
-                Source::Human
-            ),
-            crate::input::InputOutcome::Ok,
-            "glyph key must land on the observing PTY"
-        );
-    }
-    assert_eq!(
-        app.input(
-            wid,
-            InputEvent::Key {
-                key: Key::Named(NamedKey::Enter),
-                mods: Modifiers::empty(),
-                base_layout: None,
-                layout_text: None,
-                event_type: KeyEventType::Press,
-            },
-            Source::Human
-        ),
-        crate::input::InputOutcome::Ok
-    );
-    let _ = drain(pipe);
-    let ws = app.windows.get_mut(&wid).unwrap();
-    // The first observed move is `g`'s echo (a same-row `+1` with a typed
-    // pair), licensed by its own press; the Return hint is kept for its row
-    // change and `i`'s press stays in flight.
-    let e1 = Instant::now();
-    ws.fx
-        .cursor_mut()
-        .glow
-        .tick(Some((0, 1)), e1, &glow_cfg, geom, &mut out);
-    assert_eq!(
-        ws.fx.cursor_mut().glow.spawns(),
-        1,
-        "the first glyph's echo is licensed"
-    );
-    assert_eq!(
-        ws.fx.cursor_mut().glow.in_flight_tally().credits,
-        1,
-        "`i` is still in flight after `g`'s echo — the Return forgot nothing"
-    );
-    // …the bank survived it (the second glyph's stamp is still there)…
-    let e2 = e1 + Duration::from_millis(16);
-    assert!(
-        ws.fx.cursor_mut().glow.move_licensed(e2),
-        "banked typed stamps must survive a plain Enter"
-    );
-    // …and licenses `i`'s echo, which precedes the Return's own move.
-    ws.fx
-        .cursor_mut()
-        .glow
-        .tick(Some((0, 2)), e2, &glow_cfg, geom, &mut out);
-    assert_eq!(
-        ws.fx.cursor_mut().glow.spawns(),
-        2,
-        "the in-flight glyph echo after a plain Enter is licensed"
-    );
-    assert_eq!(ws.fx.cursor_mut().glow.in_flight_tally().credits, 0);
-    // The Return's own move (the row change) is licensed by `note_return`.
-    ws.fx.cursor_mut().glow.tick(
-        Some((2, 0)),
-        e1 + Duration::from_millis(32),
-        &glow_cfg,
-        geom,
-        &mut out,
-    );
-    assert_eq!(
-        ws.fx.cursor_mut().glow.spawns(),
-        3,
-        "Enter's own response move must be licensed"
-    );
-    // Depth-1/consume-once: everything is spent — a program flood declines.
-    ws.fx.cursor_mut().glow.tick(
-        Some((3, 0)),
-        e1 + Duration::from_millis(48),
-        &glow_cfg,
-        geom,
-        &mut out,
-    );
-    assert_eq!(
-        ws.fx.cursor_mut().glow.spawns(),
-        3,
-        "the return license is consume-once — a program flood after it stays dark"
-    );
 }
 
-/// Only a plain Tab is an insert gesture. ⇧Tab is Claude Code's mode cycle
-/// and readline's reverse menu-complete (a repaint, not a completion to
-/// lay), and a modified Tab is whatever the app binds it to; neither arms
-/// the delivered-insert stamp. A bare Tab does.
+/// An observing App under Rainbow Kitty with its glow settled at the origin.
 #[cfg(unix)]
-#[test]
-fn only_a_plain_tab_arms_the_delivered_insert_stamp() {
-    use aterm_types::keyboard::NamedKey;
-
-    use super::classify_press;
-
+fn rainbow_app() -> (App, i32, crate::cursor_glow::GlowConfig) {
     let (mut app, pipe) = app_observing_pty();
-    let wid = WindowId(0);
     app.config.cursor_trail = Some(true);
     app.config.cursor_trail_style = Some("rainbow kitty".to_string());
-    let tab = |mods: Modifiers| InputEvent::Key {
-        key: Key::Named(NamedKey::Tab),
+    let cfg = app.glow_config();
+    let _ = glow_tick(&mut app, &cfg, (0, 0), std::time::Instant::now());
+    (app, pipe, cfg)
+}
+
+/// A person's press of `key` under `mods` through the seam.
+#[cfg(unix)]
+fn human_press(app: &mut App, key: Key, mods: Modifiers) {
+    let ev = InputEvent::Key {
+        key,
         mods,
         base_layout: None,
         layout_text: None,
         event_type: KeyEventType::Press,
     };
     assert_eq!(
-        app.input(wid, tab(Modifiers::SHIFT), Source::Human),
+        app.input(WindowId(0), ev, Source::Human),
         crate::input::InputOutcome::Ok
     );
-    let _ = drain(pipe);
-    assert_eq!(
-        app.windows
-            .get(&wid)
-            .unwrap()
-            .fx
-            .cursor()
-            .glow
-            .insert_tally()
-            .delivered,
-        0,
-        "a Shift+Tab arms no delivered insert"
-    );
-    assert_eq!(
-        app.input(wid, tab(Modifiers::empty()), Source::Human),
-        crate::input::InputOutcome::Ok
-    );
-    let _ = drain(pipe);
-    assert_eq!(
-        app.windows
-            .get(&wid)
-            .unwrap()
-            .fx
-            .cursor()
-            .glow
-            .insert_tally()
-            .delivered,
-        1,
-        "a plain Tab is a delivered insert of unknown width"
-    );
-    // The classifier, every modifier: the gesture class stays (a reverse
-    // menu-complete is a completion sweep to the classic trail), the insert
-    // does not.
-    for mods in [
-        Modifiers::SHIFT,
-        Modifiers::CTRL,
-        Modifiers::ALT,
-        Modifiers::SUPER,
-        Modifiers::SHIFT | Modifiers::CTRL,
-    ] {
-        let ev = tab(mods);
-        let class = classify_press(&ev);
-        assert!(
-            class.tab_key && !class.insert_tab,
-            "{mods:?}: a modified Tab keeps the gesture and arms no insert"
-        );
-    }
-    let plain_ev = tab(Modifiers::empty());
-    let plain = classify_press(&plain_ev);
-    assert!(plain.tab_key && plain.insert_tab);
 }
 
-/// A plain Tab arms the user gesture licence (its completion sweep is
-/// licensed) and keeps the banked typed stamps (the supersede shape inside
-/// `note_user_gesture`).
+/// One glow frame with the caret at `caret`; the glow's spawn count after it.
+#[cfg(unix)]
+fn glow_tick(
+    app: &mut App,
+    cfg: &crate::cursor_glow::GlowConfig,
+    caret: (u16, u16),
+    at: std::time::Instant,
+) -> u64 {
+    let glow = &mut app
+        .windows
+        .get_mut(&WindowId(0))
+        .unwrap()
+        .fx
+        .cursor_mut()
+        .glow;
+    glow.tick(Some(caret), at, cfg, glow_geom(), &mut Vec::new());
+    glow.spawns()
+}
+
+/// A press that arms its own licence class at dispatch — a plain Enter
+/// (`note_return`), a plain Tab (`note_user_gesture`; was: the 8-cell black
+/// notch), a bare ⌃V (Claude Code's clipboard-image insert, whose `[Image #1] `
+/// echo is laid as one delivered insert) and an IME / dead-key commit — keeps
+/// the banked typed stamps of glyphs whose echoes are still in flight (the
+/// pre-fix `clear_typed` emptied the bank), and its own response move is
+/// licensed; bare, on an empty bank, only its own arm can fund that move. The
+/// Control release between a ⌃V and its echo (`clear_move_license`, which wipes
+/// the bank) must not kill the insert. The class-aware take and consume-once
+/// laws are the engine's (`a_glyph_echo_does_not_spend_the_enter_pressed_behind_it`).
 #[cfg(unix)]
 #[test]
-fn tab_arms_a_user_gesture_and_keeps_banked_stamps() {
+fn a_self_licensing_press_keeps_banked_stamps_and_licenses_its_response() {
     use std::time::{Duration, Instant};
 
     use aterm_types::keyboard::NamedKey;
 
-    use crate::cursor_glow::Geom;
-
-    let (mut app, pipe) = app_observing_pty();
-    let wid = WindowId(0);
-    app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty".to_string());
-    let glow_cfg = app.glow_config();
-    let geom = Geom {
-        cw: 8,
-        ch: 16,
-        rows: 6,
-        cols: 40,
-        origin_x: 0,
-        origin_y: 0,
-        win_w: 320,
-        win_h: 96,
-        head: 0,
-    };
-    let t0 = Instant::now();
-    let mut out = Vec::new();
-    app.windows
-        .get_mut(&wid)
-        .unwrap()
-        .fx
-        .cursor_mut()
-        .glow
-        .tick(Some((0, 0)), t0, &glow_cfg, geom, &mut out);
-    for ch in ['l', 's'] {
-        assert_eq!(
-            app.input(
-                wid,
-                InputEvent::Key {
-                    key: Key::Character(ch),
-                    mods: Modifiers::empty(),
-                    base_layout: None,
-                    layout_text: None,
-                    event_type: KeyEventType::Press,
-                },
-                Source::Human
-            ),
-            crate::input::InputOutcome::Ok
-        );
+    enum Act {
+        Press(Key, Modifiers),
+        Commit(&'static str),
     }
-    assert_eq!(
-        app.input(
-            wid,
-            InputEvent::Key {
-                key: Key::Named(NamedKey::Tab),
-                mods: Modifiers::empty(),
-                base_layout: None,
-                layout_text: None,
-                event_type: KeyEventType::Press,
-            },
-            Source::Human
+    let none = Modifiers::empty();
+    let ctrl_v = || Act::Press(Key::Character('v'), Modifiers::CTRL);
+    // (label, act, response row, response cells past the caret, echo delay ms,
+    //  release fence, licence)
+    let cases = [
+        (
+            "Enter",
+            Act::Press(Key::Named(NamedKey::Enter), none),
+            2,
+            None,
+            32,
+            false,
+            None,
         ),
-        crate::input::InputOutcome::Ok
-    );
-    let _ = drain(pipe);
-    let ws = app.windows.get_mut(&wid).unwrap();
-    // The tab sweep is licensed by the gesture hint…
-    let e1 = Instant::now();
-    ws.fx
-        .cursor_mut()
-        .glow
-        .tick(Some((0, 8)), e1, &glow_cfg, geom, &mut out);
-    assert_eq!(
-        ws.fx.cursor_mut().glow.spawns(),
-        1,
-        "the Tab completion sweep must be licensed (was: the 8-cell black notch)"
-    );
-    // …and the surviving banked stamp still licenses the in-flight echo.
-    ws.fx.cursor_mut().glow.tick(
-        Some((0, 9)),
-        e1 + Duration::from_millis(16),
-        &glow_cfg,
-        geom,
-        &mut out,
-    );
-    assert_eq!(
-        ws.fx.cursor_mut().glow.spawns(),
-        2,
-        "banked typed stamps must survive a mid-burst Tab"
-    );
-
-    // Bare Tab on an empty bank: only `note_user_gesture` can fund the sweep.
-    let (mut bare, bare_pipe) = app_observing_pty();
-    bare.config.cursor_trail = Some(true);
-    bare.config.cursor_trail_style = Some("rainbow kitty".to_string());
-    let bare_cfg = bare.glow_config();
-    let b0 = Instant::now();
-    bare.windows
-        .get_mut(&wid)
-        .unwrap()
-        .fx
-        .cursor_mut()
-        .glow
-        .tick(Some((0, 0)), b0, &bare_cfg, geom, &mut out);
-    assert_eq!(
-        bare.input(
-            wid,
-            InputEvent::Key {
-                key: Key::Named(NamedKey::Tab),
-                mods: Modifiers::empty(),
-                base_layout: None,
-                layout_text: None,
-                event_type: KeyEventType::Press,
-            },
-            Source::Human
+        (
+            "Tab",
+            Act::Press(Key::Named(NamedKey::Tab), none),
+            0,
+            Some(6),
+            32,
+            false,
+            None,
         ),
-        crate::input::InputOutcome::Ok
-    );
-    let _ = drain(bare_pipe);
-    let ws = bare.windows.get_mut(&wid).unwrap();
-    let b1 = Instant::now();
-    ws.fx
-        .cursor_mut()
-        .glow
-        .tick(Some((0, 8)), b1, &bare_cfg, geom, &mut out);
-    assert_eq!(
-        ws.fx.cursor_mut().glow.spawns(),
-        1,
-        "a bare Tab's sweep is licensed by note_user_gesture alone"
-    );
-    // …and consumed once: the program move after it stays dark.
-    ws.fx.cursor_mut().glow.tick(
-        Some((3, 0)),
-        b1 + Duration::from_millis(16),
-        &bare_cfg,
-        geom,
-        &mut out,
-    );
-    assert_eq!(
-        ws.fx.cursor_mut().glow.spawns(),
-        1,
-        "the gesture license is consume-once — floods still decline"
-    );
-}
-
-/// A bare ⌃V (Claude Code's clipboard-image insert) arms the delivered-insert
-/// class beside the gesture class, bank-preserving: in-flight glyph echoes stay
-/// licensed and the `[Image #1] ` echo (an 11-cell same-row hop) is one insert
-/// sweep. The second pass runs the Control release's `clear_move_license`
-/// (which wipes the typed bank) before the echo; the insert survives it.
-#[cfg(unix)]
-#[test]
-fn a_ctrl_v_press_arms_an_insert_and_keeps_banked_stamps() {
-    use std::time::{Duration, Instant};
-
-    use crate::cursor_glow::Geom;
-
-    let geom = Geom {
-        cw: 8,
-        ch: 16,
-        rows: 6,
-        cols: 40,
-        origin_x: 0,
-        origin_y: 0,
-        win_w: 320,
-        win_h: 96,
-        head: 0,
-    };
-    let press = |app: &mut App, wid: WindowId, key: Key, mods: Modifiers| {
-        assert_eq!(
-            app.input(
-                wid,
-                InputEvent::Key {
-                    key,
-                    mods,
-                    base_layout: None,
-                    layout_text: None,
-                    event_type: KeyEventType::Press,
-                },
-                Source::Human
-            ),
-            crate::input::InputOutcome::Ok
-        );
-    };
-    for release_fence in [false, true] {
-        let (mut app, pipe) = app_observing_pty();
-        let wid = WindowId(0);
-        app.config.cursor_trail = Some(true);
-        app.config.cursor_trail_style = Some("rainbow kitty".to_string());
-        let glow_cfg = app.glow_config();
-        let t0 = Instant::now();
-        let mut out = Vec::new();
-        app.windows
-            .get_mut(&wid)
-            .unwrap()
-            .fx
-            .cursor_mut()
-            .glow
-            .tick(Some((0, 0)), t0, &glow_cfg, geom, &mut out);
-        press(&mut app, wid, Key::Character('h'), Modifiers::empty());
-        press(&mut app, wid, Key::Character('i'), Modifiers::empty());
-        press(&mut app, wid, Key::Character('v'), Modifiers::CTRL);
-        let _ = drain(pipe);
-        if release_fence {
-            app.clear_move_license(wid);
-        }
-        let ws = app.windows.get_mut(&wid).unwrap();
-        let e1 = Instant::now();
-        ws.fx
-            .cursor_mut()
-            .glow
-            .tick(Some((0, 1)), e1, &glow_cfg, geom, &mut out);
-        ws.fx.cursor_mut().glow.tick(
-            Some((0, 2)),
-            e1 + Duration::from_millis(16),
-            &glow_cfg,
-            geom,
-            &mut out,
-        );
-        if !release_fence {
-            assert_eq!(
-                ws.fx.cursor_mut().glow.spawns(),
-                2,
-                "banked typed stamps must survive a ⌃V press"
-            );
-        }
-        let before = ws.fx.cursor_mut().glow.spawns();
-        // The app's placeholder echo, 11 cells, laid as one insert.
-        ws.fx.cursor_mut().glow.tick(
-            Some((0, 13)),
-            e1 + Duration::from_millis(300),
-            &glow_cfg,
-            geom,
-            &mut out,
-        );
-        assert_eq!(
-            ws.fx.cursor_mut().glow.spawns(),
-            before + 1,
-            "the ⌃V placeholder echo is licensed (release fence: {release_fence})"
-        );
-        assert_eq!(
-            ws.fx
-                .cursor_mut()
-                .glow
-                .admission_log()
-                .last()
-                .map(|r| r.licence),
+        ("Ctrl-V", ctrl_v(), 0, Some(11), 300, false, Some("insert")),
+        (
+            "Ctrl-V, release fence",
+            ctrl_v(),
+            0,
+            Some(11),
+            300,
+            true,
             Some("insert"),
-            "…as a delivered insert (release fence: {release_fence})"
-        );
-        // Consume-once: the next keyless hop declines.
-        ws.fx.cursor_mut().glow.tick(
-            Some((0, 20)),
-            e1 + Duration::from_millis(320),
-            &glow_cfg,
-            geom,
-            &mut out,
-        );
-        assert_eq!(
-            ws.fx.cursor_mut().glow.spawns(),
-            before + 1,
-            "one ⌃V, one insert"
-        );
+        ),
+        (
+            "IME commit",
+            Act::Commit("f\u{e9}"),
+            0,
+            Some(2),
+            32,
+            false,
+            None,
+        ),
+    ];
+    for (label, act, row, cells, delay, fence, licence) in cases {
+        for banked in [false, true] {
+            if fence && !banked {
+                continue;
+            }
+            let (mut app, pipe, cfg) = rainbow_app();
+            if banked {
+                human_press(&mut app, Key::Character('g'), none);
+                human_press(&mut app, Key::Character('i'), none);
+            }
+            match &act {
+                Act::Press(key, mods) => human_press(&mut app, key.clone(), *mods),
+                Act::Commit(text) => app.on_ime_commit(WindowId(0), (*text).to_string()),
+            }
+            let _ = drain(pipe);
+            if fence {
+                app.clear_move_license(WindowId(0));
+            }
+            let e1 = Instant::now();
+            let ms = Duration::from_millis;
+            let mut spawns = 0;
+            let mut caret = 0;
+            if banked {
+                for (i, col) in [1u16, 2].into_iter().enumerate() {
+                    spawns = glow_tick(&mut app, &cfg, (0, col), e1 + ms(16 * i as u64));
+                    caret = col;
+                }
+                if !fence {
+                    assert_eq!(spawns, 2, "{label}: banked typed stamps survive");
+                }
+            }
+            let target = (row, cells.map_or(0, |cells| caret + cells));
+            assert_eq!(
+                glow_tick(&mut app, &cfg, target, e1 + ms(delay)),
+                spawns + 1,
+                "{label} (banked {banked}): its own response move is licensed"
+            );
+            if let Some(licence) = licence {
+                let glow = &app.windows[&WindowId(0)].fx.cursor().glow;
+                assert_eq!(
+                    glow.admission_log().last().map(|r| r.licence),
+                    Some(licence),
+                    "{label} (banked {banked})"
+                );
+            }
+        }
     }
 }
 
@@ -683,7 +294,7 @@ fn a_press_keeps_the_glow_s_hand_on_its_row_exactly_when_the_seam_does() {
         Key as WinitKey, KeyLocation, ModifiersState, NamedKey as WinitNamed, SmolStr,
     };
 
-    use crate::cursor_glow::{CursorGlow, Geom};
+    use crate::cursor_glow::CursorGlow;
     use crate::input::PasteFraming;
 
     enum Via {
@@ -721,17 +332,7 @@ fn a_press_keeps_the_glow_s_hand_on_its_row_exactly_when_the_seam_does() {
     let physical = |code: KeyCode, key: WinitNamed, mods: ModifiersState| {
         Via::Winit(code, WinitKey::Named(key), mods)
     };
-    let geom = Geom {
-        cw: 8,
-        ch: 16,
-        rows: 6,
-        cols: 40,
-        origin_x: 0,
-        origin_y: 0,
-        win_w: 320,
-        win_h: 96,
-        head: 0,
-    };
+    let geom = glow_geom();
     let none = ModifiersState::empty();
     let mut cases = vec![
         ("Backspace", seam(NamedKey::Backspace), true),
@@ -931,123 +532,53 @@ fn a_press_keeps_the_glow_s_hand_on_its_row_exactly_when_the_seam_does() {
 
 /// The insert arm is Rainbow Kitty's alone: a bare Tab and a bare ⌃V arm
 /// the delivered-insert licence under Rainbow Kitty and no other style,
-/// the same gate the paste's delivery edge applies. The gesture class is
-/// armed in every style (the classic trail's lockstep).
+/// the same gate the paste's delivery edge applies. Only a PLAIN Tab is an
+/// insert: ⇧Tab (Claude Code's mode cycle, readline's reverse menu-complete)
+/// and a modified Tab arm none, yet each keeps the gesture class (a completion
+/// sweep to the classic trail), which every style arms.
 #[cfg(unix)]
 #[test]
 fn a_tab_or_ctrl_v_arms_an_insert_under_rainbow_kitty_only() {
     use aterm_types::keyboard::NamedKey;
 
-    let press = |app: &mut App, wid: WindowId, key: Key, mods: Modifiers| {
-        assert_eq!(
-            app.input(
-                wid,
-                InputEvent::Key {
-                    key,
-                    mods,
-                    base_layout: None,
-                    layout_text: None,
-                    event_type: KeyEventType::Press,
-                },
-                Source::Human
-            ),
-            crate::input::InputOutcome::Ok
-        );
-    };
+    let tab = Key::Named(NamedKey::Tab);
     for (style, armed) in [("rainbow kitty", 2u64), ("lumen", 0), ("comet", 0)] {
         let (mut app, pipe) = app_observing_pty();
-        let wid = WindowId(0);
         app.config.cursor_trail = Some(true);
         app.config.cursor_trail_style = Some(style.to_string());
         app.kitty_cursor_enabled_cache = None;
-        press(&mut app, wid, Key::Named(NamedKey::Tab), Modifiers::empty());
-        press(&mut app, wid, Key::Character('v'), Modifiers::CTRL);
+        for mods in [
+            Modifiers::SHIFT,
+            Modifiers::CTRL,
+            Modifiers::ALT,
+            Modifiers::SHIFT | Modifiers::CTRL,
+        ] {
+            app.clear_move_license(WindowId(0));
+            human_press(&mut app, tab.clone(), mods);
+            assert!(
+                app.windows[&WindowId(0)]
+                    .fx
+                    .cursor()
+                    .trail
+                    .move_licensed(std::time::Instant::now()),
+                "{style} {mods:?}: the gesture class is armed in every style"
+            );
+        }
+        human_press(&mut app, tab.clone(), Modifiers::empty());
+        human_press(&mut app, Key::Character('v'), Modifiers::CTRL);
         let _ = drain(pipe);
-        let ws = app.windows.get(&wid).unwrap();
         assert_eq!(
-            ws.fx.cursor().glow.insert_tally().delivered,
-            armed,
-            "{style}: a bare Tab and a bare ⌃V arm the insert for Rainbow Kitty only"
-        );
-        assert!(
-            ws.fx
+            app.windows[&WindowId(0)]
+                .fx
                 .cursor()
-                .trail
-                .move_licensed(std::time::Instant::now()),
-            "{style}: the gesture class is armed in every style"
+                .glow
+                .insert_tally()
+                .delivered,
+            armed,
+            "{style}: a bare Tab and a bare ⌃V (never a modified Tab) arm the \
+             insert for Rainbow Kitty only"
         );
     }
-}
-
-/// An IME / dead-key commit that reaches the PTY keeps the banked stamps of
-/// keys still in flight: two keys typed, then `é` committed, and all three
-/// echoes light.
-#[cfg(unix)]
-#[test]
-fn an_ime_commit_keeps_in_flight_typed_stamps() {
-    use std::time::{Duration, Instant};
-
-    use crate::cursor_glow::Geom;
-
-    let (mut app, pipe) = app_observing_pty();
-    let wid = WindowId(0);
-    app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty".to_string());
-    let glow_cfg = app.glow_config();
-    let geom = Geom {
-        cw: 8,
-        ch: 16,
-        rows: 6,
-        cols: 40,
-        origin_x: 0,
-        origin_y: 0,
-        win_w: 320,
-        win_h: 96,
-        head: 0,
-    };
-    let t0 = Instant::now();
-    let mut out = Vec::new();
-    app.windows
-        .get_mut(&wid)
-        .unwrap()
-        .fx
-        .cursor_mut()
-        .glow
-        .tick(Some((0, 0)), t0, &glow_cfg, geom, &mut out);
-    for ch in ['c', 'a'] {
-        assert_eq!(
-            app.input(
-                wid,
-                InputEvent::Key {
-                    key: Key::Character(ch),
-                    mods: Modifiers::empty(),
-                    base_layout: None,
-                    layout_text: None,
-                    event_type: KeyEventType::Press,
-                },
-                Source::Human
-            ),
-            crate::input::InputOutcome::Ok
-        );
-    }
-    app.on_ime_commit(wid, "f\u{e9}".to_string());
-    let _ = drain(pipe);
-    let ws = app.windows.get_mut(&wid).unwrap();
-    let e1 = Instant::now();
-    for (i, col) in [1u16, 2, 4].into_iter().enumerate() {
-        ws.fx.cursor_mut().glow.tick(
-            Some((0, col)),
-            e1 + Duration::from_millis(16 * i as u64),
-            &glow_cfg,
-            geom,
-            &mut out,
-        );
-    }
-    assert_eq!(
-        ws.fx.cursor_mut().glow.spawns(),
-        3,
-        "the two in-flight glyph echoes and the commit's own echo all light"
-    );
 }
 
 use std::sync::{Arc, Mutex};
@@ -1056,99 +587,18 @@ use aterm_core::selection::SelectionType;
 use aterm_core::terminal::Terminal;
 use winit::keyboard::ModifiersState;
 
-/// A bare modifier press leaves `on_key` before the lock-state RPC and the
-/// encoder: no bytes, recorded Consumed (its release pairs and is swallowed),
-/// `input_hot` dark. Under kitty report-all it is a reported key (`ESC[57441;2u`).
-#[cfg(unix)]
-#[test]
-fn a_bare_modifier_press_skips_the_ladder_unless_kitty_reports_all_keys() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static RPC: AtomicUsize = AtomicUsize::new(0);
-    fn counting_lock_modifiers() -> aterm_types::keyboard::Modifiers {
-        RPC.fetch_add(1, Ordering::Relaxed);
-        aterm_types::keyboard::Modifiers::empty()
-    }
-    let (mut app, pipe) = app_observing_pty();
-    app.lock_modifiers = counting_lock_modifiers;
-    let wid = WindowId(0);
-    let shift = |state| modifier_event(winit::keyboard::NamedKey::Shift, KeyCode::ShiftLeft, state);
-
-    RPC.store(0, Ordering::Relaxed);
-    app.on_key(wid, shift(ElementState::Pressed));
-    assert_eq!(
-        RPC.load(Ordering::Relaxed),
-        0,
-        "legacy mode: no IOKit RPC for a bare Shift"
-    );
-    assert!(
-        drain(pipe).is_empty(),
-        "legacy mode: a bare Shift writes nothing"
-    );
-    assert!(
-        matches!(
-            app.physical_press_owners
-                .get(&PhysicalKey::Code(KeyCode::ShiftLeft)),
-            Some(crate::PhysicalPressOwner::Consumed { .. })
-        ),
-        "the press must be recorded Consumed so its release pairs and is swallowed"
-    );
-    assert!(
-        !app.windows[&wid].input_hot,
-        "a bare modifier must not arm the keystroke-priority frame admission"
-    );
-    app.on_key(wid, shift(ElementState::Released));
-    assert!(drain(pipe).is_empty(), "…and its release is swallowed");
-
-    // Negotiate report-all on the front terminal (the reader would do this
-    // under the lock; the mirror republishes at the end of `process`).
-    let term = app.front_terminal(wid).expect("terminal").term.clone();
-    term_lock(&term).process(b"\x1b[>8u");
-    app.on_key(wid, shift(ElementState::Pressed));
-    assert_eq!(
-        RPC.load(Ordering::Relaxed),
-        1,
-        "report-all: the modifier is a real key"
-    );
-    // kitty reports a modifier key with its own modifier bit set: Shift is
-    // `57441` with mods `1+1 = 2` — `ESC [ 57441 ; 2 u`.
-    assert_eq!(
-        drain(pipe),
-        b"\x1b[57441;2u".to_vec(),
-        "report-all: the bare Shift press is reported"
-    );
-    // The right Shift is its own kitty key, `RIGHT_SHIFT` 57447: winit names
-    // the modifier without a side (the side is the event's location).
-    app.on_key(
-        wid,
-        winit::event::KeyEvent::synthetic_for_test(
-            PhysicalKey::Code(KeyCode::ShiftRight),
-            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Shift),
-            None,
-            winit::keyboard::KeyLocation::Right,
-            ElementState::Pressed,
-            false,
-        ),
-    );
-    assert_eq!(
-        drain(pipe),
-        b"\x1b[57447;2u".to_vec(),
-        "report-all: the right Shift is reported as RIGHT_SHIFT"
-    );
-}
-
 /// kitty reports a modifier's release with the state it leaves: with both
 /// Shifts down and one let go, `shift` is still in force, so the release
 /// carries the bit (`CSI 57441;2:3u`); the last one's release clears it
 /// (`CSI 57447;1:3u`), as does a lone Shift's. The window decides from its
-/// physical-press record.
+/// physical-press record. Control: in legacy mode a bare Shift writes nothing
+/// and its release is swallowed with it.
 #[cfg(unix)]
 #[test]
 fn a_modifier_release_keeps_its_bit_while_the_other_side_is_held() {
     let (mut app, pipe) = app_observing_pty();
     let wid = WindowId(0);
     let term = app.front_terminal(wid).expect("terminal").term.clone();
-    // Report all keys (8) and event types (2): releases are reported.
-    term_lock(&term).process(b"\x1b[>10u");
     let shift = |code: KeyCode, state: ElementState| {
         winit::event::KeyEvent::synthetic_for_test(
             PhysicalKey::Code(code),
@@ -1163,6 +613,14 @@ fn a_modifier_release_keeps_its_bit_while_the_other_side_is_held() {
             false,
         )
     };
+    app.on_key(wid, shift(KeyCode::ShiftLeft, ElementState::Pressed));
+    app.on_key(wid, shift(KeyCode::ShiftLeft, ElementState::Released));
+    assert!(
+        drain(pipe).is_empty(),
+        "legacy: a bare Shift writes nothing"
+    );
+    // Report all keys (8) and event types (2): releases are reported.
+    term_lock(&term).process(b"\x1b[>10u");
     app.on_key(wid, shift(KeyCode::ShiftLeft, ElementState::Pressed));
     assert_eq!(drain(pipe), b"\x1b[57441;2u".to_vec(), "left down");
     app.on_key(wid, shift(KeyCode::ShiftRight, ElementState::Pressed));
@@ -1186,17 +644,15 @@ fn a_modifier_release_keeps_its_bit_while_the_other_side_is_held() {
     assert_eq!(drain(pipe), b"\x1b[57441;1:3u".to_vec(), "lone up");
 }
 
-/// Unmapped physical keys have no wire encoding in either dialect, so they
-/// skip HID. Mapped keys keep the live read even in legacy mode, because a
-/// Kitty push may arrive before the seam encodes the event.
+/// The live lock-state read reaches the wire in both dialects: Caps Lock
+/// capitalizes a letter (xterm applies Lock; kitty and Terminal.app send the
+/// OS's 'A' — it used to type 'a') and rides a kitty arrow as its `caps_lock`
+/// bit, while an unmapped physical key has no encoding in either and writes
+/// nothing.
 #[cfg(target_os = "macos")]
 #[test]
-fn unmapped_mac_keys_skip_hid_while_mapped_keys_keep_legacy_and_kitty_parity() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    static READS: AtomicUsize = AtomicUsize::new(0);
+fn caps_lock_reaches_legacy_and_kitty_while_unmapped_keys_write_nothing() {
     fn read_caps() -> Modifiers {
-        READS.fetch_add(1, Ordering::Relaxed);
         Modifiers::CAPS_LOCK
     }
     let arrow = |state| {
@@ -1222,18 +678,13 @@ fn unmapped_mac_keys_skip_hid_while_mapped_keys_keep_legacy_and_kitty_parity() {
     let (mut app, pipe) = app_observing_pty();
     app.lock_modifiers = read_caps;
     let wid = WindowId(0);
-    READS.store(0, Ordering::Relaxed);
 
     app.on_key(wid, unmapped());
     assert!(drain(pipe).is_empty());
-    assert_eq!(READS.load(Ordering::Relaxed), 0);
-    // Caps Lock (the HID read) capitalizes the letter: xterm applies Lock,
-    // kitty and Terminal.app send the OS's 'A'.
     app.on_key(wid, character_event('a', ElementState::Pressed));
     assert_eq!(drain(pipe), b"A");
     app.on_key(wid, arrow(ElementState::Pressed));
     assert_eq!(drain(pipe), b"\x1b[A");
-    assert_eq!(READS.load(Ordering::Relaxed), 2);
     app.on_key(wid, arrow(ElementState::Released));
     assert!(drain(pipe).is_empty());
 
@@ -1241,10 +692,8 @@ fn unmapped_mac_keys_skip_hid_while_mapped_keys_keep_legacy_and_kitty_parity() {
     term_lock(&term).process(b"\x1b[>1u");
     app.on_key(wid, unmapped());
     assert!(drain(pipe).is_empty());
-    assert_eq!(READS.load(Ordering::Relaxed), 2);
     app.on_key(wid, arrow(ElementState::Pressed));
     assert_eq!(drain(pipe), b"\x1b[1;65A");
-    assert_eq!(READS.load(Ordering::Relaxed), 3);
 }
 
 /// The HID read is retained for a mapped key even while the mirror says
@@ -1254,12 +703,8 @@ fn unmapped_mac_keys_skip_hid_while_mapped_keys_keep_legacy_and_kitty_parity() {
 #[cfg(target_os = "macos")]
 #[test]
 fn mapped_press_keeps_caps_when_kitty_arrives_between_hid_and_egress() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    static READS: AtomicUsize = AtomicUsize::new(0);
     static SWITCH: Mutex<Option<Arc<Mutex<Terminal>>>> = Mutex::new(None);
     fn read_caps_and_switch_mode() -> Modifiers {
-        READS.fetch_add(1, Ordering::Relaxed);
         let term = SWITCH
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -1273,7 +718,6 @@ fn mapped_press_keeps_caps_when_kitty_arrives_between_hid_and_egress() {
     let wid = WindowId(0);
     let term = app.front_terminal(wid).expect("terminal").term.clone();
     *SWITCH.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(term);
-    READS.store(0, Ordering::Relaxed);
     app.lock_modifiers = read_caps_and_switch_mode;
     app.on_key(
         wid,
@@ -1286,7 +730,6 @@ fn mapped_press_keeps_caps_when_kitty_arrives_between_hid_and_egress() {
             false,
         ),
     );
-    assert_eq!(READS.load(Ordering::Relaxed), 1);
     assert_eq!(drain(pipe), b"\x1b[1;65A");
 }
 
@@ -1382,11 +825,8 @@ fn cmd_arrows_are_the_deliberate_return_to_live() {
     // ⌘-arrow is part of the hardcoded Cmd suite: live on macOS/Windows,
     // off on Linux, where Super+arrow is a desktop chord (GNOME
     // tiling/unmaximize) and must fall through.
+    // ⌘↓ end to end: `cmd_down_returns_to_live_through_on_key_without_clearing_the_selection`.
     if super::HARDCODED_SUPER_CHORDS {
-        assert!(matches!(
-            super::scrollback_chord(ModifiersState::SUPER, &down),
-            Some(ScrollIntent::Bottom)
-        ));
         assert!(matches!(
             super::scrollback_chord(ModifiersState::SUPER, &up),
             Some(ScrollIntent::Top)
@@ -1408,226 +848,6 @@ fn cmd_arrows_are_the_deliberate_return_to_live() {
     ));
     // A bare arrow still belongs to the PTY.
     assert!(super::scrollback_chord(ModifiersState::empty(), &down).is_none());
-}
-
-/// Selection custody for modifier keys the engine has no `NamedKey` for (AltGr,
-/// `Fn`): `map_logical_key` returns `None`, so the press never reaches the
-/// seam. The window half needs its own arm (`keymap::press_is_inert` answers
-/// from the winit key), so resting on AltGr keeps an in-flight scroll's
-/// `scroll_frac_px` residual.
-#[test]
-fn unmapped_modifier_keys_are_inert_too() {
-    use winit::keyboard::NamedKey as WNamed;
-    let mut app = App::headless_for_test();
-    let wid = WindowId(0);
-    let term = scrolled_back_with_a_selection(&mut app, wid);
-    let offset_before = term_lock(&term).grid().display_offset();
-
-    for named in [WNamed::AltGraph, WNamed::Fn, WNamed::FnLock] {
-        // Bank a sub-row scroll residual, as an in-flight wheel glide would.
-        app.windows.get_mut(&wid).expect("window").scroll_frac_px = 7;
-        app.on_key(
-            wid,
-            modifier_event(named, KeyCode::AltRight, ElementState::Pressed),
-        );
-        assert_eq!(
-            app.windows[&wid].scroll_frac_px, 7,
-            "bare {named:?} must not cancel an in-flight scroll"
-        );
-        let t = term_lock(&term);
-        assert_eq!(
-            t.grid().display_offset(),
-            offset_before,
-            "bare {named:?} must not move the viewport"
-        );
-        assert!(
-            t.text_selection().has_selection(),
-            "bare {named:?} must not clear the selection"
-        );
-    }
-    // Control: a real typing press still cancels the glide and snaps.
-    app.on_key(wid, character_event('a', ElementState::Pressed));
-    assert_eq!(
-        app.windows[&wid].scroll_frac_px, 0,
-        "typing still drops the banked residual"
-    );
-    assert_eq!(term_lock(&term).grid().display_offset(), 0);
-}
-
-/// Selection custody in macOS's event order: winit queues a bare ⌘'s
-/// `KeyboardInput` before its `ModifiersChanged`, so the bare-Cmd swallow does
-/// not fire and the press reaches the seam; it still must not snap or deselect.
-#[test]
-fn bare_command_keydown_is_inert_in_either_modifier_order() {
-    for settled_first in [false, true] {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        let term = scrolled_back_with_a_selection(&mut app, wid);
-        let offset_before = term_lock(&term).grid().display_offset();
-
-        if settled_first {
-            app.windows.get_mut(&wid).expect("window").mods = ModifiersState::SUPER;
-        }
-        app.on_key(
-            wid,
-            modifier_event(
-                winit::keyboard::NamedKey::Super,
-                KeyCode::SuperLeft,
-                ElementState::Pressed,
-            ),
-        );
-        {
-            let t = term_lock(&term);
-            assert_eq!(
-                t.grid().display_offset(),
-                offset_before,
-                "bare Command must not move the viewport (settled_first={settled_first})"
-            );
-            assert!(
-                t.text_selection().has_selection(),
-                "bare Command must not clear the selection (settled_first={settled_first})"
-            );
-        }
-
-        // …and now the ModifiersChanged winit queued second finally lands.
-        app.windows.get_mut(&wid).expect("window").mods = ModifiersState::SUPER;
-        {
-            let t = term_lock(&term);
-            assert_eq!(t.grid().display_offset(), offset_before);
-            assert!(t.text_selection().has_selection());
-            // What ⌘-C will read, asserted at the selection rather than
-            // through the `c` press and the clipboard it writes.
-            let text = t.selection_to_string().expect("selection resolves to text");
-            assert!(
-                !text.is_empty(),
-                "the copy has something to copy (settled_first={settled_first})"
-            );
-        }
-    }
-}
-
-/// An inert press keeps the move licence: an Option+Left/Right word move's sound
-/// is minted when its echo is licensed by the press's `nav_hint`, and macOS
-/// delivers `flags_changed` as a `KeyboardInput` press, so a bare modifier must
-/// not clear the licence while the echo is in flight. An intent-bearing press does.
-#[test]
-fn a_bare_modifier_press_does_not_revoke_a_word_moves_licence() {
-    use std::time::Instant;
-
-    use winit::keyboard::NamedKey as WNamed;
-
-    let mut app = App::headless_for_test();
-    let wid = WindowId(0);
-
-    for (named, code, keeps) in [
-        (WNamed::Alt, KeyCode::AltLeft, true),
-        (WNamed::Shift, KeyCode::ShiftLeft, true),
-        (WNamed::Control, KeyCode::ControlLeft, true),
-        (WNamed::Super, KeyCode::SuperLeft, true),
-        (WNamed::CapsLock, KeyCode::CapsLock, true),
-        // The control: an intent-bearing press still closes the cohort.
-        (WNamed::Backspace, KeyCode::Backspace, false),
-        (WNamed::Escape, KeyCode::Escape, false),
-    ] {
-        let now = Instant::now();
-        {
-            let ws = app.windows.get_mut(&wid).expect("window");
-            // Option+Left: the press stamps the only licence a word move
-            // ever gets, and its echo has not landed yet.
-            ws.fx.cursor_mut().glow.note_motion(now);
-            ws.fx.cursor_mut().trail.note_navigation(now);
-            assert!(ws.fx.cursor_mut().glow.move_licensed(now));
-        }
-        app.on_key(wid, modifier_event(named, code, ElementState::Pressed));
-        if keeps {
-            app.on_modifiers_changed(wid, winit::keyboard::ModifiersState::ALT);
-            app.on_modifiers_changed(wid, winit::keyboard::ModifiersState::empty());
-        }
-        let ws = &app.windows[&wid];
-        assert_eq!(
-            (
-                ws.fx.cursor().glow.move_licensed(now),
-                ws.fx.cursor().trail.move_licensed(now)
-            ),
-            (keeps, keeps),
-            "{named:?}: a bare modifier expresses no intent and must not \
-             revoke the word move's licence, while a real chord must"
-        );
-    }
-}
-
-/// Every other bare modifier and lock key is inert too. Shift matters
-/// beyond ⌘-C: clearing the selection on its keydown would make
-/// shift-click-to-extend impossible on macOS.
-#[test]
-fn every_bare_modifier_and_lock_key_is_inert() {
-    use winit::keyboard::NamedKey as WNamed;
-    let mut app = App::headless_for_test();
-    let wid = WindowId(0);
-    let term = scrolled_back_with_a_selection(&mut app, wid);
-    let offset_before = term_lock(&term).grid().display_offset();
-    for (named, code) in [
-        (WNamed::Shift, KeyCode::ShiftLeft),
-        (WNamed::Control, KeyCode::ControlLeft),
-        (WNamed::Alt, KeyCode::AltLeft),
-        (WNamed::Super, KeyCode::SuperRight),
-        (WNamed::CapsLock, KeyCode::CapsLock),
-        (WNamed::NumLock, KeyCode::NumLock),
-        (WNamed::ScrollLock, KeyCode::ScrollLock),
-    ] {
-        app.on_key(wid, modifier_event(named, code, ElementState::Pressed));
-        let t = term_lock(&term);
-        assert_eq!(
-            t.grid().display_offset(),
-            offset_before,
-            "bare {named:?} must not move the viewport"
-        );
-        assert!(
-            t.text_selection().has_selection(),
-            "bare {named:?} must not clear the selection"
-        );
-    }
-    // The narrowing is surgical: an ordinary character still snaps and
-    // deselects, which is what a user means by "start typing and jump back".
-    app.on_key(wid, character_event('a', ElementState::Pressed));
-    let t = term_lock(&term);
-    assert_eq!(t.grid().display_offset(), 0, "typing still snaps");
-    assert!(
-        !t.text_selection().has_selection(),
-        "typing still deselects"
-    );
-}
-
-/// A seam-bound keystroke snaps without a caller-side `snap_to_bottom` (a third
-/// terminal lock per key): the seam's lock scope pulls the viewport to live, and
-/// the lock-free window half drops the glide's banked residual.
-#[cfg(unix)]
-#[test]
-fn a_seam_bound_press_snaps_the_viewport_and_kills_the_glide_residual() {
-    let (mut app, pipe) = app_observing_pty();
-    let wid = WindowId(0);
-    let term = app.front_terminal(wid).expect("terminal").term.clone();
-    {
-        let mut t = term_lock(&term);
-        t.process("x\r\n".repeat(64).as_bytes());
-        t.scroll_to_top();
-        assert_ne!(t.grid().display_offset(), 0, "viewport is in history");
-    }
-    app.windows.get_mut(&wid).expect("window").scroll_frac_px = 7;
-
-    app.on_key(wid, character_event('a', ElementState::Pressed));
-
-    assert_eq!(
-        term_lock(&term).grid().display_offset(),
-        0,
-        "the seam's own snap must still pull the view to the live bottom"
-    );
-    assert_eq!(
-        app.windows[&wid].scroll_frac_px, 0,
-        "the glide residual must still be dropped at the press"
-    );
-    assert_eq!(drain(pipe), b"a".to_vec(), "and the key still types");
-    unsafe { libc::close(pipe) };
 }
 
 /// Selection custody: a bare Cmd chord no shortcut claims is swallowed
@@ -1705,104 +925,6 @@ fn a_sample_answers_only_for_the_session_it_was_taken_on() {
     assert_eq!(sampled_release_relevance(0), Some(false));
 }
 
-/// Legacy shell (no Kitty flags): the press publishes "releases encode
-/// nothing", so the forwarded release skips `seam_egress` and the terminal
-/// mutex entirely. Byte-identical: the seam would write nothing and report
-/// `Delivery::Full`, as the release path does.
-#[cfg(unix)]
-#[test]
-fn legacy_release_is_byte_silent_and_skips_the_seam() {
-    let (mut app, pipe) = app_observing_pty();
-    let wid = WindowId(0);
-    let session = app.front_terminal(wid).expect("terminal").session;
-    let physical = PhysicalKey::Code(KeyCode::KeyA);
-
-    let _ = app.input(wid, press('a'), Source::Human);
-    assert_eq!(drain(pipe), b"a".to_vec(), "the press itself still types");
-    assert_eq!(
-        sampled_release_relevance(session),
-        Some(false),
-        "a legacy press must publish that its release is byte-silent"
-    );
-
-    app.note_forwarded_press_key(
-        wid,
-        physical,
-        false,
-        Key::Character('a'),
-        Modifiers::empty(),
-        None,
-        None,
-    );
-    app.release_physical_press(wid, physical);
-    assert_eq!(
-        drain(pipe),
-        Vec::<u8>::new(),
-        "a legacy release emits nothing"
-    );
-    assert!(
-        matches!(
-            super::take_physical_release_trace(),
-            Some(super::PhysicalReleaseTrace::Forwarded {
-                delivery: crate::input::Delivery::Full,
-                ..
-            })
-        ),
-        "the elided release still reports the seam's own verdict"
-    );
-    unsafe { libc::close(pipe) };
-}
-
-/// Negative control for the elision above: with Kitty `REPORT_EVENT_TYPES`
-/// (`CSI > 2 u`) the press publishes "relevant" and the release report reaches
-/// the PTY. Ctrl+A, since a bare printable key has no representable release
-/// even in this mode.
-#[cfg(unix)]
-#[test]
-fn kitty_event_type_release_still_reports() {
-    let (mut app, pipe) = app_observing_pty();
-    let wid = WindowId(0);
-    let session = app.front_terminal(wid).expect("terminal").session;
-    let term = app.front_terminal(wid).expect("terminal").term.clone();
-    term_lock(&term).process(b"\x1b[>2u");
-    let physical = PhysicalKey::Code(KeyCode::KeyA);
-
-    let _ = app.input(
-        wid,
-        InputEvent::Key {
-            key: Key::Character('a'),
-            mods: Modifiers::CTRL,
-            base_layout: None,
-            layout_text: None,
-            event_type: KeyEventType::Press,
-        },
-        Source::Human,
-    );
-    let _ = drain(pipe);
-    assert_eq!(
-        sampled_release_relevance(session),
-        Some(true),
-        "an event-type press must keep its release on the seam"
-    );
-
-    app.note_forwarded_press_key(
-        wid,
-        physical,
-        false,
-        Key::Character('a'),
-        Modifiers::CTRL,
-        None,
-        None,
-    );
-    app.release_physical_press(wid, physical);
-    assert_eq!(
-        drain(pipe),
-        b"\x1b[97;5:3u".to_vec(),
-        "REPORT_EVENT_TYPES releases must still reach the app"
-    );
-    unsafe { libc::close(pipe) };
-}
-
 /// Selection custody for the two byte-producing press payloads with no event
 /// type: a `[key_sequences]` chord's `InputEvent::KeySequence` and the
 /// `option_as_meta = false` / IME-commit fallback's `InputEvent::Text`.
@@ -1857,54 +979,97 @@ fn a_held_literal_payload_repeats_without_re_taking_the_reading_position() {
     }
 }
 
-/// Selection custody: an inert modifier press (⇧ to shift-click-extend) leaves
-/// the blink alone. The gate is on inertness only, never on auto-repeat: a
-/// repeat tick and an ordinary press still keep the cursor solid.
+/// Selection custody: a bare modifier or lock key is inert. No snap, no clear
+/// (Shift's keydown clearing the selection would make shift-click-extend
+/// impossible on macOS), no glide cancel, no blink reset, and no revoked move
+/// licence: Option+Left/Right have no key-time cue, so a word move's sound is
+/// minted when its echo's caret delta is licensed by the press's `nav_hint`,
+/// and macOS delivers `flags_changed` as a synthesized Pressed for
+/// `Named(Alt|Shift|…)`, then `ModifiersChanged` edges as Option is released,
+/// while that echo is in flight. AltGr and `Fn` have no engine key
+/// (`map_logical_key` is `None`), so they never reach the seam and rely on
+/// `on_key`'s own `keymap::press_is_inert` gate. The gate is on inertness only,
+/// never on auto-repeat: a repeat tick keeps the cursor solid, and ordinary
+/// typing still snaps, deselects, drops the glide's banked residual and
+/// restarts the blink, while an intent-bearing chord revokes the licence.
 #[test]
-fn a_bare_modifier_leaves_the_blink_alone_while_typing_and_repeats_reset_it() {
+fn a_bare_modifier_or_lock_key_is_inert() {
     use winit::keyboard::NamedKey as WNamed;
-    // Park the cursor in the blink's off phase with a live deadline, as an
-    // idle window sits between two blinks.
-    fn park_blink_off(app: &mut App, wid: WindowId, deadline: std::time::Instant) {
+    // Park the cursor mid-blink-OFF with a live blink deadline, bank a
+    // sub-row scroll residual, as an in-flight wheel glide would, and stamp
+    // the only licence a word move gets (Option+Left, echo not landed yet).
+    fn park(app: &mut App, wid: WindowId, deadline: std::time::Instant) {
         let ws = app.windows.get_mut(&wid).expect("window");
         ws.blink_phase = false;
         ws.next_blink = Some(deadline);
+        ws.scroll_frac_px = 7;
+        let now = std::time::Instant::now();
+        ws.fx.cursor_mut().glow.note_motion(now);
+        ws.fx.cursor_mut().trail.note_navigation(now);
+    }
+    fn licensed(app: &App, wid: WindowId) -> (bool, bool) {
+        let cursor = app.windows[&wid].fx.cursor();
+        let now = std::time::Instant::now();
+        (
+            cursor.glow.move_licensed(now),
+            cursor.trail.move_licensed(now),
+        )
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-
-    // The `on_key` half: winit's real bare-modifier events. `AltGraph`/`Fn`
-    // have no engine key, so they never reach the seam and rely on
-    // `on_key`'s own gate, as for the glide cancel in
-    // `unmapped_modifier_keys_are_inert_too`.
-    for (named, code) in [
-        (WNamed::Shift, KeyCode::ShiftLeft),
-        (WNamed::Super, KeyCode::SuperLeft),
-        (WNamed::Control, KeyCode::ControlLeft),
-        (WNamed::Alt, KeyCode::AltLeft),
-        (WNamed::CapsLock, KeyCode::CapsLock),
-        (WNamed::AltGraph, KeyCode::AltRight),
-        (WNamed::Fn, KeyCode::Fn),
-    ] {
-        park_blink_off(&mut app, wid, deadline);
-        app.on_key(wid, modifier_event(named, code, ElementState::Pressed));
+    let term = scrolled_back_with_a_selection(&mut app, wid);
+    let offset_before = term_lock(&term).grid().display_offset();
+    let assert_inert = |app: &App, what: &str| {
         let ws = &app.windows[&wid];
-        assert!(
-            !ws.blink_phase,
-            "bare {named:?} must not snap the cursor solid"
-        );
+        assert!(!ws.blink_phase, "{what} must not snap the cursor solid");
         assert_eq!(
             ws.next_blink,
             Some(deadline),
-            "bare {named:?} must not restart the blink period"
+            "{what} must not restart the blink period"
         );
+        assert_eq!(ws.scroll_frac_px, 7, "{what} must not cancel the glide");
+        assert_eq!(
+            licensed(app, wid),
+            (true, true),
+            "{what} must not revoke the word move's licence"
+        );
+        let t = term_lock(&term);
+        assert_eq!(
+            t.grid().display_offset(),
+            offset_before,
+            "{what} must not move the viewport"
+        );
+        assert!(
+            t.text_selection().has_selection(),
+            "{what} must not clear the selection"
+        );
+    };
+
+    for (named, code) in [
+        (WNamed::Shift, KeyCode::ShiftLeft),
+        (WNamed::Control, KeyCode::ControlLeft),
+        (WNamed::Alt, KeyCode::AltLeft),
+        (WNamed::Super, KeyCode::SuperRight),
+        (WNamed::CapsLock, KeyCode::CapsLock),
+        (WNamed::NumLock, KeyCode::NumLock),
+        (WNamed::ScrollLock, KeyCode::ScrollLock),
+        (WNamed::AltGraph, KeyCode::AltRight),
+        (WNamed::Fn, KeyCode::Fn),
+        (WNamed::FnLock, KeyCode::AltRight),
+    ] {
+        park(&mut app, wid, deadline);
+        app.on_key(wid, modifier_event(named, code, ElementState::Pressed));
+        // Option released before the echo lands (was: `on_modifiers_changed`
+        // revoked the `nav_hint`, and the word move failed `no-fresh-hint`).
+        app.on_modifiers_changed(wid, winit::keyboard::ModifiersState::ALT);
+        app.on_modifiers_changed(wid, winit::keyboard::ModifiersState::empty());
+        assert_inert(&app, &format!("bare {named:?}"));
     }
 
     // The seam half: the same press arriving as an engine event (a controller
     // verb, or a held modifier routed to its press-time session).
-    park_blink_off(&mut app, wid, deadline);
+    park(&mut app, wid, deadline);
     let _ = app.input(
         wid,
         InputEvent::Key {
@@ -1916,14 +1081,11 @@ fn a_bare_modifier_leaves_the_blink_alone_while_typing_and_repeats_reset_it() {
         },
         Source::Human,
     );
-    let ws = &app.windows[&wid];
-    assert!(!ws.blink_phase, "the seam must honour the same contract");
-    assert_eq!(ws.next_blink, Some(deadline), "…period included");
+    assert_inert(&app, "a seam-routed bare Shift");
 
-    // Control 1: an auto-repeat tick of a held ordinary key takes no
-    // custody, but the cursor stays solid for the whole hold (the blink is
-    // never gated on `PressKind::disturbs()`).
-    park_blink_off(&mut app, wid, deadline);
+    // An auto-repeat tick of a held ordinary key keeps the cursor solid for
+    // the whole hold (the blink is never gated on `PressKind::disturbs()`).
+    park(&mut app, wid, deadline);
     let _ = app.input(
         wid,
         InputEvent::Key {
@@ -1940,58 +1102,27 @@ fn a_bare_modifier_leaves_the_blink_alone_while_typing_and_repeats_reset_it() {
         "a repeat tick must keep the cursor solid mid-hold"
     );
 
-    // Control 2: ordinary typing, unchanged.
-    park_blink_off(&mut app, wid, deadline);
-    app.on_key(wid, character_event('a', ElementState::Pressed));
-    assert!(
-        app.windows[&wid].blink_phase,
-        "typing still makes the cursor solid"
-    );
-    assert_ne!(
-        app.windows[&wid].next_blink,
-        Some(deadline),
-        "…and still restarts the blink period"
-    );
-}
-
-/// Selection custody's hidden-session press gate: `input_to_hidden_session`
-/// (auto-repeat ticks aimed at a session no window fronts) takes the
-/// unconditional hidden-session lock on the UI thread, so an inert press takes
-/// it once and does nothing under it (`disturbs` short-circuits). Pinned as an
-/// operation count: a second acquisition or a self-deadlock fails here.
-#[test]
-fn an_inert_press_to_a_hidden_session_takes_the_terminal_lock_once() {
-    use crate::stub_session;
-    use aterm_types::keyboard::{Key as EngineKey, KeyEventType, Modifiers};
-
-    let mut app = App::headless_for_test();
-    let wid = WindowId(0);
-    let hidden_session = 0u64;
-    let _hidden_term = scrolled_back_with_a_selection(&mut app, wid);
-    let sid = app.next_session_id;
-    app.push_stub_tab(wid, stub_session(sid));
-
-    let bare_shift = InputEvent::Key {
-        key: EngineKey::Named(aterm_types::keyboard::NamedKey::ShiftLeft),
-        mods: Modifiers::SHIFT,
-        base_layout: None,
-        layout_text: None,
-        event_type: KeyEventType::Press,
-    };
-    let acq = crate::term_lock_acquisitions_on_this_thread;
-    let before = acq();
-    for _ in 0..200 {
-        app.input_to_hidden_session(
-            hidden_session,
-            bare_shift.clone(),
-            crate::app_input::PressPhase::Initial,
-        );
+    // Control: an intent-bearing press closes the licence cohort.
+    for (named, code) in [
+        (WNamed::Escape, KeyCode::Escape),
+        (WNamed::Backspace, KeyCode::Backspace),
+    ] {
+        park(&mut app, wid, deadline);
+        app.on_key(wid, modifier_event(named, code, ElementState::Pressed));
+        assert_eq!(licensed(&app, wid), (false, false), "{named:?} revokes it");
     }
-    assert_eq!(
-        acq() - before,
-        200,
-        "one terminal-lock acquisition per inert hidden-session delivery"
-    );
+
+    // Control: ordinary typing.
+    let _ = scrolled_back_with_a_selection(&mut app, wid);
+    park(&mut app, wid, deadline);
+    app.on_key(wid, character_event('a', ElementState::Pressed));
+    let ws = &app.windows[&wid];
+    assert!(ws.blink_phase, "typing still makes the cursor solid");
+    assert_ne!(ws.next_blink, Some(deadline), "…and restarts the blink");
+    assert_eq!(ws.scroll_frac_px, 0, "…and drops the banked residual");
+    let t = term_lock(&term);
+    assert_eq!(t.grid().display_offset(), 0, "…and snaps to live");
+    assert!(!t.text_selection().has_selection(), "…and deselects");
 }
 
 #[test]
@@ -2030,6 +1161,7 @@ fn a_repeat_into_a_hidden_session_leaves_its_viewport_and_selection_alone() {
             hidden_session,
             held(KeyEventType::Repeat),
             crate::app_input::PressPhase::Repeat,
+            None,
         );
     }
     {
@@ -2056,6 +1188,7 @@ fn a_repeat_into_a_hidden_session_leaves_its_viewport_and_selection_alone() {
             event_type: KeyEventType::Press,
         },
         crate::app_input::PressPhase::Initial,
+        None,
     );
     assert_eq!(
         term_lock(&term).grid().display_offset(),
@@ -2069,6 +1202,7 @@ fn a_repeat_into_a_hidden_session_leaves_its_viewport_and_selection_alone() {
         hidden_session,
         held(KeyEventType::Press),
         crate::app_input::PressPhase::Initial,
+        None,
     );
     let t = term_lock(&term);
     assert_eq!(
@@ -2118,64 +1252,20 @@ fn a_pinned_view_gesture_for_a_hidden_session_is_dropped() {
     assert!(t.text_selection().has_selection(), "selection left alone");
 }
 
-/// `apply_press_custody` reports only what it changed: its `display_offset() != 0`
-/// guard makes `scrolled` mean the reading position actually moved (the seam's
-/// change-gated repaint runs off it), so a live terminal's keystroke reports none.
-#[test]
-fn press_custody_reports_only_the_disturbances_it_actually_caused() {
-    use aterm_core::selection::{SelectionSide, SelectionType};
-    use aterm_core::terminal::Terminal;
-
-    let mut live = Terminal::new(24, 40);
-    live.process("line\r\n".repeat(64).as_bytes());
-    assert_eq!(live.grid().display_offset(), 0, "precondition: at the tail");
-    assert_eq!(
-        super::apply_press_custody(&mut live, super::PressKind::Typing),
-        (false, false),
-        "nothing to snap and nothing to clear: a disturbing press changed nothing"
-    );
-
-    let mut scrolled = Terminal::new(24, 40);
-    scrolled.process("line\r\n".repeat(64).as_bytes());
-    scrolled.scroll_to_top();
-    assert_ne!(scrolled.grid().display_offset(), 0);
-    {
-        let sel = scrolled.text_selection_mut();
-        sel.start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
-        sel.update_selection(0, 3, SelectionSide::Right);
-        sel.complete_selection();
-    }
-    assert_eq!(
-        super::apply_press_custody(&mut scrolled, super::PressKind::Inert),
-        (false, false),
-        "a NON-disturbing press must short-circuit before either read"
-    );
-    assert_ne!(
-        scrolled.grid().display_offset(),
-        0,
-        "…and must leave the viewport where the user put it"
-    );
-    assert!(scrolled.text_selection().has_selection());
-
-    assert_eq!(
-        super::apply_press_custody(&mut scrolled, super::PressKind::Typing),
-        (true, true),
-        "a disturbing press over a scrolled-back selection reports BOTH effects"
-    );
-    assert_eq!(scrolled.grid().display_offset(), 0);
-    assert!(!scrolled.text_selection().has_selection());
-}
-
 /// Selection custody: ⌘↓ through the shipping `App::on_key` returns to live
-/// with the selection intact.
+/// with the selection intact where the hardcoded ⌘ suite is compiled in (on
+/// Linux Super is the desktop's: `cmd_arrows_are_the_deliberate_return_to_live`
+/// and `a_swallowed_cmd_chord_no_longer_snaps_the_viewport`).
 #[test]
 fn cmd_down_returns_to_live_through_on_key_without_clearing_the_selection() {
     use winit::keyboard::NamedKey as WNamed;
 
+    if !super::HARDCODED_SUPER_CHORDS {
+        return;
+    }
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     let term = scrolled_back_with_a_selection(&mut app, wid);
-    let offset_before = term_lock(&term).grid().display_offset();
     let text_before = term_lock(&term).selection_to_string();
     assert!(
         text_before.is_some(),
@@ -2189,33 +1279,17 @@ fn cmd_down_returns_to_live_through_on_key_without_clearing_the_selection() {
     );
 
     let t = term_lock(&term);
-    if super::HARDCODED_SUPER_CHORDS {
-        assert_eq!(
-            t.grid().display_offset(),
-            0,
-            "⌘↓ returns the viewport to live"
-        );
-        assert_eq!(
-            t.selection_to_string(),
-            text_before,
-            "…and the selection it was introduced to preserve survives it, \
-             naming the same text"
-        );
-    } else {
-        // On Linux Super belongs to the desktop: the chord reaches the PTY like
-        // any key, so the viewport returns to live and the selection clears.
-        let _ = offset_before;
-        assert_eq!(
-            t.grid().display_offset(),
-            0,
-            "an unclaimed chord reaches the PTY, and input returns the viewport to live"
-        );
-        assert_eq!(
-            t.selection_to_string(),
-            None,
-            "…clearing the selection exactly as typing any key does"
-        );
-    }
+    assert_eq!(
+        t.grid().display_offset(),
+        0,
+        "⌘↓ returns the viewport to live"
+    );
+    assert_eq!(
+        t.selection_to_string(),
+        text_before,
+        "…and the selection it was introduced to preserve survives it, \
+         naming the same text"
+    );
 }
 
 /// A single-cell printable `InputEvent::Text` commit (`ctl type` or single-char

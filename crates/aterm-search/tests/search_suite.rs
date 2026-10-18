@@ -9,5 +9,4 @@
 //! `autotests = false` in `Cargo.toml`: a `tests/*.rs` file that is neither a
 //! `mod` line here nor a `[[test]]` of its own NEVER COMPILES.
 
-mod conformance_streaming;
 mod search_vs_bruteforce;

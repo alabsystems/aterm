@@ -28,16 +28,20 @@
 //! spinner, no `esc to interrupt`, no message just submitted), the memory
 //! stands for the wall the screen no longer shows; the standing `WaitUntil`
 //! then fires at the reset and its grace as it would have with the rows
-//! showing — unless the screen draws a turn served under that wall's own
-//! notice ([`served_under`]: a person's short turn, which no read saw busy,
-//! is work since the wall). A live turn (the worker worked: the
+//! showing — unless the screen draws the wall's end under that wall's own
+//! notice ([`ended_under`]: a person's short turn, which no read saw busy,
+//! is work since the wall, and so is the vendor's own continuation; under
+//! another limit's notice, a `/resume`d conversation's, neither is). A live
+//! turn (the worker worked: the
 //! owner typed, the vendor's own resume), a question or an idle screen with
 //! no wall, and another wall end it
 //! — the ledger row for the end ([`approvals::RULE_WALL_WAIT_END`]) says so to
 //! the next loop; so does any act the policy typed since
-//! ([`approvals::open_wall`]). NOT an idle screen while the policy still waits
-//! on the reset the notice named ([`TurnEndState::waits_on_named_reset`]): Esc
-//! on the vendor's countdown leaves one, and the wait it leaves standing can
+//! ([`approvals::open_wall`]), and the wall that act meets again is written
+//! again ([`Session::wall_closed_by_act`]). NOT an idle screen while the
+//! policy still waits on the reset the notice named
+//! ([`TurnEndState::waits_on_named_reset`]): Esc on the vendor's countdown
+//! leaves one, and the wait it leaves standing can
 //! last days. The wall stays open, and a loop that follows takes that reset up
 //! ([`Session::seed_wall_memory`]): with the wall's end written, a successor
 //! typed `keep going` into the standing limit (the review of 2026-10-14).
@@ -47,8 +51,8 @@
 //! policy's and the loop's, as at any wall.
 
 use super::super::policy::outlook::ExceptionKind;
-use super::super::policy::turn_end::served_under;
-use super::approvals::{self, Outcome, RULE_WALL_WAIT, RULE_WALL_WAIT_END};
+use super::super::policy::turn_end::{HostTurn, RULE_MODEL_FALLBACK, ended_under};
+use super::approvals::{self, Outcome, RULE_WALL_WAIT, RULE_WALL_WAIT_END, WALL_LEFT_NO_TASK};
 use super::turn_end_loop::resume_jitter;
 use super::*;
 
@@ -61,11 +65,6 @@ pub(super) const MEMORY_TTL: Duration = Duration::from_secs(24 * 3600);
 /// Why a wall's wait ended, as its ledger row ([`RULE_WALL_WAIT_END`]) says
 /// it: the screen left it, the worker worked, another wall replaced it.
 const WALL_LEFT: &str = "the wall left the screen or the worker worked";
-
-/// ... or the conversation holds no task — a `/clear` at the limit, or a
-/// conversation started since — so nothing is owed at its reset.
-const WALL_LEFT_NO_TASK: &str =
-    "the conversation holds no task (a /clear, or a new one): nothing is owed at the reset";
 
 /// How long a screen may read busy on the agent's own background work alone,
 /// with the agent's OWN title saying idle, before the loop says so in its
@@ -89,8 +88,23 @@ const IDLE_TITLE_GLYPH: char = '\u{2733}';
 pub(super) struct WallMemory {
     pub(super) wall: aterm_phase::Wall,
     /// The reset placement last written to the ledger: `None` before the
-    /// first write, then `Some(the placement)`.
+    /// first write, then `Some(the placement)` — and `None` again once an act
+    /// typed closed the ledger's wall ([`Session::wall_closed_by_act`]).
     saved: Option<Option<i64>>,
+    /// The wall WAS WRITTEN to the ledger, by this loop
+    /// ([`Session::persist_wall`]) or the one it took the wall up from
+    /// ([`Session::seed_wall_memory`]). Its end is written whenever it was
+    /// ([`Session::forget_wall`]), an act typed since or not: the act's row
+    /// closes the ledger's wall for [`approvals::open_wall`], not for every
+    /// reader. [`approvals::account_moves`] ends a move refused at the wall
+    /// ([`approvals::AccountMoves::unmade`]) at a typed row or the wall's
+    /// end row only. Shown before by the verifier of 49f07f50e (V21-3, a
+    /// probe): a try typed at the wall, then a move to another account asked
+    /// there and refused (`skipped … at=wall`), then the wall ended by a
+    /// person's work with no typed row; no end row was written, the ledger
+    /// kept `unmade`, and a loop that followed carried the latch onto its
+    /// first wall, where no move was asked beside an account that could serve.
+    written: bool,
 }
 
 /// Whether `p`'s screen can read as the agent's own background work alone
@@ -99,7 +113,7 @@ pub(super) struct WallMemory {
 fn reads_background_work(p: Program) -> bool {
     match p {
         Program::Claude => true,
-        Program::Codex | Program::Agy | Program::Muse | Program::Generic => false,
+        Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => false,
     }
 }
 
@@ -113,10 +127,10 @@ fn is_kept(wall: &aterm_phase::Wall) -> bool {
 impl<C: Ctl> Session<'_, C> {
     /// The remembered wall, when `rows` show nothing but the agent's own
     /// background work — Claude Code's screen, its composer frame drawn, no
-    /// live turn and no message just submitted — and no turn served under
-    /// that wall's own notice ([`served_under`]: a person's short turn under
-    /// it, which no read saw busy, is work since the wall; one under another
-    /// limit's notice is not).
+    /// live turn and no message just submitted — and the wall not ended under
+    /// its own notice ([`ended_under`]: a person's short turn under it, which
+    /// no read saw busy, is work since the wall, and so is the vendor's own
+    /// continuation; either under another limit's notice is not).
     pub(super) fn remembered_wall(
         &self,
         reader: &dyn ScreenReader,
@@ -125,7 +139,7 @@ impl<C: Ctl> Session<'_, C> {
         let memory = self.wall_memory.as_ref()?;
         (reads_background_work(reader.program())
             && aterm_phase::background_only(rows)
-            && !served_under(
+            && !ended_under(
                 aterm_phase::since_limit(rows).as_ref(),
                 memory.wall.kind,
                 limit::ResetClock::of(memory.wall.reset.as_deref()),
@@ -136,18 +150,41 @@ impl<C: Ctl> Session<'_, C> {
     /// `rows` read `Busy`: a LIVE turn on a screen with a composer (a spinner,
     /// `esc to interrupt`, a message just submitted) ends the memory. A busy
     /// read that is only background work, or a screen with no composer frame
-    /// (a dialog covering it), leaves it.
+    /// (a dialog covering it), leaves it. Where that turn TAKES THE WALL'S
+    /// RETRY a wall answered inside its take window
+    /// ([`TurnEndState::retry_met_untaken`]), the ledger says so
+    /// ([`approvals::WALL_TAKEN`]) whether or not the memory still stands:
+    /// the wall read was the screen the retry was typed at, and a loop that
+    /// follows reads no try met again. Written only where the memory ended at
+    /// the take, a take after the memory had ended inside the same window (a
+    /// person's `/model` under the notice read as an idle point, which ends
+    /// it) wrote nothing: the take window's wall row read as the try met
+    /// again, and a successor attached during the person's three-hour turn
+    /// that took the try held the try's two-hour rung, where the first loop
+    /// counted that turn's work as the try's and typed 30 minutes from the
+    /// wall it ended on (the verifier of 5b72b1613, M7-2).
     pub(super) fn end_memory_on_live_turn(
         &mut self,
         reader: &dyn ScreenReader,
         rows: &[String],
         seq: u64,
     ) {
-        if self.wall_memory.is_some()
-            && reader.composer(rows).is_some()
-            && !aterm_phase::background_only(rows)
-        {
-            self.forget_wall(seq);
+        if reader.composer(rows).is_none() || aterm_phase::background_only(rows) {
+            return;
+        }
+        // The wall's retry this turn takes ([`TurnEndState::took`]) was typed
+        // at the wall read since: no answer of its. Once: the take clears it.
+        if self.turn_end.retry_met_untaken() {
+            self.wall_memory = None;
+            self.ledger_row(
+                RULE_WALL_WAIT_END,
+                Outcome::Waiting,
+                "",
+                approvals::WALL_TAKEN,
+                seq,
+            );
+        } else {
+            self.forget_wall_because(seq, WALL_LEFT);
         }
     }
 
@@ -164,7 +201,12 @@ impl<C: Ctl> Session<'_, C> {
         seq: u64,
     ) {
         match reading.wall.clone() {
-            Some(w) if is_kept(&w) => self.remember_wall(&w),
+            // A bucket the session left, its notice redrawn by the fallback's
+            // relaunch, is no wall of the session's: none is kept, and the
+            // ledger's wall ends ([`TurnEndState::bucket_left`]).
+            Some(w) if is_kept(&w) && !self.turn_end.left_bucket(w.kind, &w.message) => {
+                self.remember_wall(&w);
+            }
             Some(_) => self.forget_wall(seq),
             None => match reading.phase {
                 aterm_phase::Phase::Busy => {
@@ -197,7 +239,21 @@ impl<C: Ctl> Session<'_, C> {
     /// at the limit, W4 of ATERM-KI-1015-1) ends the wait too, and the
     /// ledger's end row says that, not that the worker worked.
     pub(super) fn observe_point(&mut self, reading: &TurnEndReading, now: Instant, seq: u64) {
+        let unasked = self.turn_end.fallback_unasked();
+        let land = self.turn_end.land_episode().0;
         self.turn_end.observe(reading, now);
+        self.land_over(land, seq);
+        self.fallback_asked(unasked, seq);
+        if self.turn_end.limit_ended() {
+            // The policy's end of a conversation with no task says so, as the
+            // memory's does (below).
+            let why = if reading.taskless && reading.wall.is_none() {
+                WALL_LEFT_NO_TASK
+            } else {
+                approvals::LIMIT_ENDED
+            };
+            self.limit_ended_row(reading.wall.is_some(), why, seq);
+        }
         if matches!(reading.phase, Phase::Idle | Phase::Question)
             && !self.turn_end.waits_on_named_reset()
         {
@@ -209,6 +265,54 @@ impl<C: Ctl> Session<'_, C> {
                     WALL_LEFT
                 },
             );
+        }
+    }
+
+    /// A TURN THE HOST TYPED ([`TurnEndState::host_typed`]): awaited as the
+    /// policy's own acts are, its answer no work of the worker's, and, the
+    /// fallback's relaunch unasked till now, written as the turn asked on it
+    /// ([`Self::fallback_asked`]).
+    pub(super) fn host_turn(&mut self, kind: HostTurn, seq: u64) {
+        let unasked = self.turn_end.fallback_unasked();
+        self.turn_end.host_typed(self.fx.mono(), kind);
+        self.fallback_asked(unasked, seq);
+    }
+
+    /// A TURN ASKED ON THE FALLBACK that typed no row of the loop's (`unasked`
+    /// before, [`TurnEndState::fallback_unasked`] no longer): a point that
+    /// drew no notice of the bucket the relaunch left, or a turn the host
+    /// typed. The ledger says so ([`approvals::FALLBACK_ASKED`]), so a loop
+    /// that follows reads that bucket's notice as the wall it is again, as
+    /// this one does ([`approvals::OpenSwitch::asked`]). Where the loop types
+    /// the act, the act's own row says it.
+    pub(super) fn fallback_asked(&mut self, unasked: bool, seq: u64) {
+        if unasked && !self.turn_end.fallback_unasked() {
+            self.ledger_row(
+                RULE_MODEL_FALLBACK,
+                Outcome::Waiting,
+                "",
+                approvals::FALLBACK_ASKED,
+                seq,
+            );
+        }
+    }
+
+    /// A LIMIT'S TRACK ENDED at this point by no act of the loop's
+    /// ([`TurnEndState::limit_ended`]): the ledger says so and `why`
+    /// ([`approvals::LIMIT_ENDED`], [`WALL_LEFT_NO_TASK`]), and a loop that
+    /// follows takes up no try made before it ([`approvals::usage_attempt`]).
+    /// That row ends the remembered wall; a wall `shown` at the point — the
+    /// same limit met by that work, a new episode of it, or the other wall
+    /// that took its place — is written again after the end.
+    fn limit_ended_row(&mut self, shown: bool, why: &str, seq: u64) {
+        self.ledger_row(RULE_WALL_WAIT_END, Outcome::Waiting, "", why, seq);
+        match self.wall_memory.as_mut() {
+            Some(m) if shown => {
+                m.saved = None;
+                m.written = false;
+                self.persist_wall(seq);
+            }
+            _ => self.wall_memory = None,
         }
     }
 
@@ -224,8 +328,28 @@ impl<C: Ctl> Session<'_, C> {
                 *slot = Some(WallMemory {
                     wall: wall.clone(),
                     saved: None,
+                    written: false,
                 });
             }
+        }
+    }
+
+    /// AN ACT TYPED CLOSED THE LEDGER'S WALL ([`approvals::open_wall`]: no
+    /// `typed` row of any rule may follow the wall's row), so the remembered
+    /// wall is written again at its next reading ([`Self::persist_wall`]). The
+    /// act may have met the wall again: the same notice, no busy read between
+    /// (Claude Code answers a `keep going` at a standing limit at once), which
+    /// the memory holds unchanged. That wall stands for a loop that follows as
+    /// it stands for this one. Shown before by the verifier of the successor's
+    /// seed's refix (V2-1, a probe): nothing was written after the act, the
+    /// successor found no wall open, and at a screen with no notice (Esc on the
+    /// countdown, a `/resume`) the continue policy typed `keep going` into the
+    /// standing limit two minutes in. A wall the act ended (the worker's work,
+    /// another wall) is not read again; its end row is still written
+    /// ([`WallMemory::written`]), for the readers the act's row does not close.
+    pub(super) fn wall_closed_by_act(&mut self) {
+        if let Some(m) = self.wall_memory.as_mut() {
+            m.saved = None;
         }
     }
 
@@ -234,10 +358,11 @@ impl<C: Ctl> Session<'_, C> {
         self.forget_wall_because(seq, WALL_LEFT);
     }
 
-    /// [`Self::forget_wall`], the ledger's end row saying `why`.
+    /// [`Self::forget_wall`], the ledger's end row saying `why`: written for a
+    /// wall that was written ([`WallMemory::written`]).
     fn forget_wall_because(&mut self, seq: u64, why: &str) {
         if let Some(m) = self.wall_memory.take()
-            && m.saved.is_some()
+            && m.written
         {
             self.ledger_row(RULE_WALL_WAIT_END, Outcome::Waiting, "", why, seq);
         }
@@ -255,7 +380,25 @@ impl<C: Ctl> Session<'_, C> {
             return;
         }
         m.saved = Some(unix);
-        let reason = approvals::wall_wait_reason(unix, m.wall.reset.as_deref(), &m.wall.message);
+        m.written = true;
+        let reason = approvals::wall_wait_reason(
+            unix,
+            m.wall.reset.as_deref(),
+            m.wall.kind,
+            &m.wall.message,
+        );
+        // The try a loop before this one made, which this loop's seed found
+        // aged out ([`TurnEndState::take_try_over`]): over before this wall,
+        // which stands ([`approvals::RULE_TRY_OVER`]).
+        if self.turn_end.take_try_over() {
+            self.ledger_row(
+                approvals::RULE_TRY_OVER,
+                Outcome::Waiting,
+                "",
+                approvals::TRY_OVER,
+                seq,
+            );
+        }
         self.ledger_row(RULE_WALL_WAIT, Outcome::Waiting, "", &reason, seq);
     }
 
@@ -279,7 +422,10 @@ impl<C: Ctl> Session<'_, C> {
         if now > since.saturating_add(ttl) {
             return;
         }
-        let Some(kind) = aterm_phase::classify_wall(&open.message).filter(|k| k.reads_limited())
+        // The kind as the loop that wrote it read it ([`approvals::wall_kind`]:
+        // the row's own `kind=`, a bucket named by its `rateLimitType` too).
+        let Some(kind) =
+            approvals::wall_kind(open.kind, &open.message).filter(|k| k.reads_limited())
         else {
             return;
         };
@@ -288,7 +434,7 @@ impl<C: Ctl> Session<'_, C> {
         if let Some(unix) = open.reset_unix {
             // This session's share of the herd, as a reading of the wall
             // gives it ([`Self::turn_end_reading`]).
-            let jitter = self.sid.as_deref().map_or(Duration::ZERO, |sid| {
+            let jitter = self.setup.sid.as_deref().map_or(Duration::ZERO, |sid| {
                 resume_jitter(sid, unix, self.turn_end.timing.reset_jitter)
             });
             let ago = u64::try_from(self.now_unix_ms().saturating_sub(open.at_ms))
@@ -300,7 +446,10 @@ impl<C: Ctl> Session<'_, C> {
                 jitter,
                 limit::resumes_by_itself(&open.message),
                 limit::ResetClock::of(open.reset.as_deref()),
-                Instant::now().checked_sub(ago).unwrap_or_else(Instant::now),
+                self.fx
+                    .mono()
+                    .checked_sub(ago)
+                    .unwrap_or_else(|| self.fx.mono()),
             );
         }
         self.wall_memory = Some(WallMemory {
@@ -313,6 +462,7 @@ impl<C: Ctl> Session<'_, C> {
                 under_call: false,
             },
             saved: Some(open.reset_unix),
+            written: true,
         });
     }
 }
@@ -397,7 +547,13 @@ impl<C: Ctl> Session<'_, C> {
             self.stuck_asked = None;
             return;
         };
-        self.stuck_climb(screen, at, self.stuck_after, ExceptionKind::Stalled, review);
+        self.stuck_climb(
+            screen,
+            at,
+            self.setup.stuck_after,
+            ExceptionKind::Stalled,
+            review,
+        );
     }
 
     /// THE CANARY'S SECOND FLAVOUR, for a DIALOG NO READER NAMES: Claude Code
@@ -443,7 +599,7 @@ impl<C: Ctl> Session<'_, C> {
         match self.stuck_dialog.as_ref() {
             Some((was, at)) if *was == words => {
                 let at = *at;
-                let after = self.stuck_after / DIALOG_DIVISOR;
+                let after = self.setup.stuck_after / DIALOG_DIVISOR;
                 self.stuck_climb(screen, at, after, ExceptionKind::Dialog, review);
             }
             // A screen new to the clock, or another dialog on it: its own
@@ -451,7 +607,7 @@ impl<C: Ctl> Session<'_, C> {
             // before (a busy flavour's rungs) is over with it.
             _ => {
                 self.stuck_over(screen.seq, "the screen changed", review);
-                self.stuck_dialog = Some((words, Instant::now()));
+                self.stuck_dialog = Some((words, self.fx.mono()));
             }
         }
     }
@@ -507,10 +663,12 @@ impl<C: Ctl> Session<'_, C> {
         let Some((next, times)) = self.stuck_rung.next() else {
             return;
         };
-        if at.elapsed() < after * times || self.stuck_asked.is_some_and(|t| t.elapsed() < after) {
+        if self.fx.since(at) < after * times
+            || self.stuck_asked.is_some_and(|t| self.fx.since(t) < after)
+        {
             return;
         }
-        self.stuck_asked = Some(Instant::now());
+        self.stuck_asked = Some(self.fx.mono());
         let Ok(r) = self.call(&["status"]) else {
             return;
         };
@@ -525,7 +683,7 @@ impl<C: Ctl> Session<'_, C> {
             self.stuck_over(screen.seq, "the tab runs no Claude", review);
             return;
         }
-        let minutes = at.elapsed().as_secs() / 60;
+        let minutes = self.fx.since(at).as_secs() / 60;
         self.stuck_rung = next;
         match next {
             StuckRung::Quiet => {}
@@ -580,7 +738,7 @@ impl<C: Ctl> Session<'_, C> {
                 if let Some(host) = &self.stall_host {
                     host.exception(Some(&exception));
                 }
-                self.stuck_raised = Some((Instant::now(), kind));
+                self.stuck_raised = Some((self.fx.mono(), kind));
             }
         }
     }
@@ -605,7 +763,7 @@ impl<C: Ctl> Session<'_, C> {
             review.note(&format!(
                 "CLEARED seq={seq} exception={} after={}s {cause}",
                 kind.word(),
-                since.elapsed().as_secs(),
+                self.fx.since(since).as_secs(),
             ));
             // The host keeps ONE exception per tab, so the stall's end must not
             // drop a point that stood under it: the point is told again.
@@ -635,7 +793,10 @@ fn names_claude(stdout: &str) -> bool {
         .and_then(aterm_phase::program_of)
     {
         Some(Program::Claude) => true,
-        Some(Program::Codex | Program::Agy | Program::Muse | Program::Generic) | None => false,
+        Some(
+            Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic,
+        )
+        | None => false,
     }
 }
 

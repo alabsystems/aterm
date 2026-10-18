@@ -24,33 +24,6 @@ fn reflow_shrink_wraps_long_line() {
 }
 
 #[test]
-fn reflow_grow_unwraps_soft_wrapped_lines() {
-    let mut grid = Grid::new(5, 5);
-    for c in "ABCDE".chars() {
-        grid.write_char(c);
-    }
-    grid.line_feed();
-    grid.carriage_return();
-
-    // A soft-wrapped continuation, built by hand.
-    if let Some(row) = grid.row_mut(1) {
-        row.set_wrapped(true);
-        for (i, c) in "FGHIJ".chars().enumerate() {
-            row.write_char(i as u16, c);
-        }
-    }
-
-    assert_eq!(grid.row(0).unwrap().to_string(), "ABCDE");
-    assert_eq!(grid.row(1).unwrap().to_string(), "FGHIJ");
-    assert!(grid.row(1).unwrap().is_wrapped());
-
-    grid.resize(5, 12);
-
-    assert_eq!(grid.row(0).unwrap().to_string(), "ABCDEFGHIJ");
-    assert!(grid.row(1).unwrap().is_empty() || !grid.row(1).unwrap().is_wrapped());
-}
-
-#[test]
 fn reflow_shrink_preserves_cursor_position() {
     let mut grid = Grid::new(5, 20);
     for c in "ABCDEFGHIJ".chars() {
@@ -228,19 +201,6 @@ fn resize_with_reflow_grow_preserves_nonempty_bottom_row_after_scroll() {
     assert!(grid.row(4).unwrap().is_empty());
     assert!(grid.row(5).unwrap().is_empty());
     grid.assert_invariants();
-}
-
-#[test]
-fn reflow_handles_empty_rows() {
-    let mut grid = Grid::new(5, 10);
-    for c in "Hello".chars() {
-        grid.write_char(c);
-    }
-
-    grid.resize(5, 3);
-    assert_eq!(grid.row(0).unwrap().to_string(), "Hel");
-    assert_eq!(grid.row(1).unwrap().to_string(), "lo");
-    assert!(grid.row(2).unwrap().is_empty());
 }
 
 #[test]

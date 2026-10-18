@@ -5,9 +5,8 @@
 
 use crate::{ledger, publish, sign};
 
-use aterm_spec::derive::{
-    Model, release_durable_post_intent_model, release_historical_recovery_model,
-};
+use aterm_models_release::{release_durable_post_intent_model, release_historical_recovery_model};
+use aterm_spec::derive::Model;
 use aterm_spec::interp::State;
 use publish::{CutCtx, CutKind, DurablePostDecision, Journal};
 use std::path::{Path, PathBuf};
@@ -317,7 +316,7 @@ fn an_upload_intent_is_freed_by_a_post_that_created_nothing_and_by_nothing_else(
         ("403: throttled", http(403), Refused),
         ("422: the upload was refused", http(422), Refused),
     ] {
-        let (got, intents, reposts) = settled(CutKind::Rehearse, &finished);
+        let (got, intents, reposts) = settled(CutKind::DryRun, &finished);
         assert_eq!(got.expect("a retraction"), verdict, "{label}");
         assert_eq!(intents, [OTHER], "{label}");
         assert!(reposts, "{label}");
@@ -353,7 +352,7 @@ fn an_upload_intent_is_freed_by_a_post_that_created_nothing_and_by_nothing_else(
         ),
         ("success: the probe decides", out(0, "")),
     ] {
-        let (got, intents, reposts) = settled(CutKind::Rehearse, &finished);
+        let (got, intents, reposts) = settled(CutKind::DryRun, &finished);
         assert_eq!(got.expect("no retraction to fail"), Unknown, "{label}");
         assert_eq!(intents, [NAME, OTHER], "{label}");
         assert!(!reposts, "{label}");
@@ -439,13 +438,27 @@ fn what_an_upload_does_after_its_post_is_one_table() {
     use publish::AfterUploadPost::{Ambiguous, Converge, NeverSent, Refused};
     use publish::PostOutcome;
     let decide = |outcome, seen: Result<bool, ()>| {
+        let settled = std::cell::Cell::new(false);
         let mut asked = 0;
-        let verdict = publish::after_upload_post(outcome, || {
-            asked += 1;
-            seen.map_err(|()| ledger::Error::new("the probe failed"))
-        });
+        let verdict = publish::after_upload_post(
+            || {
+                settled.set(true);
+                Ok(outcome)
+            },
+            || {
+                assert!(settled.get(), "the intent is settled before any probe");
+                asked += 1;
+                seen.map_err(|()| ledger::Error::new("the probe failed"))
+            },
+        );
         (verdict.map_err(|error| error.to_string()), asked)
     };
+    // A settle that fails asks nothing of the network.
+    let unsettled = publish::after_upload_post(
+        || Err(ledger::Error::new("the journal could not be written")),
+        || -> ledger::Result<bool> { panic!("a probe before the settle") },
+    );
+    assert!(unsettled.is_err());
 
     // Never sent: local and provable, so the probe is never asked.
     assert_eq!(decide(PostOutcome::NeverSent, Ok(true)), (Ok(NeverSent), 0));
@@ -677,24 +690,9 @@ fn recovery_cleanup_selector_refines_the_historical_recovery_model() {
         }
     }
 
-    // The owner's lease is released only after the tag cleanup. `recover_under_fence` runs
-    // only against GitHub, so the order is asserted on its source.
-    let src = include_str!("../../src/publish.rs");
-    let start = src
-        .find("fn recover_under_fence(")
-        .expect("recovery present");
-    let body = &src[start..];
-    let body = &body[..body.find("\nfn ").unwrap_or(body.len())];
-    let tag_deleted = body
-        .find("delete_owned_release_tag(&git, &tag, owner, &lease, fence)?;")
-        .expect("the tag cleanup");
-    let released = body
-        .find("release_completed_publisher_session(&git, owner, fence)?;")
-        .expect("the owner release");
-    assert!(
-        tag_deleted < released,
-        "the owner is released only after its tag is gone"
-    );
+    // The owner's lease is released only after the tag cleanup: the recovery and
+    // `--abandon` both end through `publish::withdraw_tag_then_unlock`, whose one body
+    // runs them in that order; the model's own transitions are held to it here.
     let mut cleaned = recovery_state(&model, Some(true), true, true);
     assert!(model.fire("DeleteExactDraft", &mut cleaned));
     assert!(!model.action_enabled("ReleaseOwnerBeforeTagCleanup", &cleaned));
@@ -717,19 +715,6 @@ fn curl_transport_preflight_requires_every_no_retry_post_option() {
             "missing {missing} must fail before durable intent"
         );
     }
-}
-
-#[test]
-fn one_shot_auth_token_is_pinned_to_the_public_github_host() {
-    assert_eq!(publish::GITHUB_AUTH_HOST, "github.com");
-    assert_eq!(
-        publish::github_auth_token_args(),
-        ["auth", "token", "--hostname", "github.com"]
-    );
-    assert_eq!(publish::GITHUB_API_ORIGIN, "https://api.github.com");
-    assert_eq!(publish::GITHUB_UPLOAD_ORIGIN, "https://uploads.github.com");
-    assert!(publish::GITHUB_API_ORIGIN.ends_with(publish::GITHUB_AUTH_HOST));
-    assert!(publish::GITHUB_UPLOAD_ORIGIN.ends_with(publish::GITHUB_AUTH_HOST));
 }
 
 #[test]

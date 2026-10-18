@@ -195,7 +195,8 @@ fn a_download_is_held_to_the_named_size() {
 
 /// One `linux_target_preflight` row: the tag, the head, the arch, the skip
 /// reason's key fact (empty: installable), the appcast it binds, and the
-/// requests it makes (`None`: not checked).
+/// requests it makes (`None`: not checked). A tag other than the head is a
+/// `--version` pin; the head is the unpinned run's.
 struct Target {
     tag: &'static str,
     head: &'static str,
@@ -240,7 +241,8 @@ fail v0.96.0/aterm-appcast.toml
             tag: "v0.101.0",
             head: "v0.101.0",
             arch: "aarch64",
-            skip: "has no aterm-0.101.0-linux-aarch64",
+            skip: "the latest release v0.101.0 publishes no Linux aarch64 executable \
+                   (aterm-0.101.0-linux-aarch64)",
             appcast: "aterm-appcast.toml",
             requests: None,
         },
@@ -334,7 +336,11 @@ fail v0.96.0/aterm-appcast.toml
         .enumerate()
         .map(|(n, row)| {
             let log = scratch.join(&format!("requests.{n}"));
-            lib.step(format!(": >{}", q(s(&requests))));
+            lib.step(format!(
+                ": >{}; TAG_EXPLICIT={}",
+                q(s(&requests)),
+                u8::from(row.tag != row.head)
+            ));
             let call = lib.call(
                 format!(
                     "linux_target_preflight {} {} aterm-{}-linux-{}",
@@ -369,10 +375,19 @@ fail v0.96.0/aterm-appcast.toml
             assert_eq!(asked, want, "{label}");
         }
     }
-    // A missing binary names the one remedy, a pinned release, never a tarball.
-    let missing = recs[calls[1].0].var("LINUX_TARGET_SKIP");
+    // A missing binary never names a tarball. Unpinned, the head is the one
+    // release the run inspected: it says that one publishes none and offers no
+    // `--version` it cannot back; a pin names the pin as the remedy.
+    let unpinned = recs[calls[1].0].var("LINUX_TARGET_SKIP");
     assert!(
-        missing.contains("--version") && !missing.contains("tarball"),
-        "{missing}"
+        !unpinned.contains("--version") && !unpinned.contains("tarball"),
+        "{unpinned}"
+    );
+    let pinned = recs[calls[4].0].var("LINUX_TARGET_SKIP");
+    assert!(
+        pinned.contains(
+            "has no aterm-0.100.0-linux-x86_64 — pin a release that has one with --version"
+        ) && !pinned.contains("tarball"),
+        "{pinned}"
     );
 }

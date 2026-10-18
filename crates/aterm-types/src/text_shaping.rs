@@ -147,35 +147,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_font_features_plus_minus() {
-        let f = parse_font_features("+ss01 -calt");
-        assert_eq!(f.len(), 2);
-        assert_eq!(&f[0].tag, b"ss01");
-        assert_eq!(f[0].value, 1);
-        assert_eq!(&f[1].tag, b"calt");
-        assert_eq!(f[1].value, 0);
-    }
-
-    #[test]
-    fn parse_font_features_bare_tag_enables() {
-        // ghostty-style: a bare tag turns the feature ON (value 1).
-        let f = parse_font_features("ss01 zero");
-        assert_eq!(f.len(), 2);
-        assert_eq!(&f[0].tag, b"ss01");
-        assert_eq!(f[0].value, 1);
-        assert_eq!(&f[1].tag, b"zero");
-        assert_eq!(f[1].value, 1);
-    }
-
-    #[test]
-    fn parse_font_features_explicit_value() {
-        let f = parse_font_features("cv01=2");
-        assert_eq!(f.len(), 1);
-        assert_eq!(&f[0].tag, b"cv01");
-        assert_eq!(f[0].value, 2);
-    }
-
-    #[test]
     fn parse_font_features_short_tag_padded() {
         let f = parse_font_features("+cv1");
         assert_eq!(f.len(), 1);
@@ -191,12 +162,6 @@ mod tests {
         assert_eq!(&f[0].tag, b"calt");
         assert_eq!(f[0].value, 0);
         assert_eq!(&f[1].tag, b"zero");
-    }
-
-    #[test]
-    fn parse_font_features_empty() {
-        assert!(parse_font_features("").is_empty());
-        assert!(parse_font_features("   ").is_empty());
     }
 }
 

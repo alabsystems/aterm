@@ -184,6 +184,15 @@ esac
 const NO_NETWORK: &str =
     "#!/bin/sh\necho \"network: $(basename \"$0\") $*\" >>\"${SHIM_LOG:?}\"\nexit 1\n";
 
+/// `uname` for the OS whose remedies a run names (`-s` and bare), the
+/// machine's own for anything else: Trust is published for macOS only, so the
+/// remedies differ by OS, and every lab run names the OS it means rather than
+/// inheriting the host's.
+const DARWIN_UNAME: &str =
+    "#!/bin/sh\ncase \"${1:--s}\" in -s) echo Darwin ;; *) exec /usr/bin/uname \"$@\" ;; esac\n";
+const LINUX_UNAME: &str =
+    "#!/bin/sh\ncase \"${1:--s}\" in -s) echo Linux ;; *) exec /usr/bin/uname \"$@\" ;; esac\n";
+
 /// An `aterm` with no Trust store.
 const BARE_ATERM: &str = "#!/bin/sh\necho \"atpkg: ${3:-it} is not installed (fix: aterm pkg install ${3:-it})\" >&2\nexit 1\n";
 
@@ -264,6 +273,8 @@ impl Lab {
         );
         lay("nonet/curl", NO_NETWORK);
         lay("nonet/gh", NO_NETWORK);
+        lay("macos/uname", DARWIN_UNAME);
+        lay("linux/uname", LINUX_UNAME);
         for dir in ["nohome", "none"] {
             scratch.mkdir(&format!("lab/{dir}"));
         }
@@ -312,9 +323,12 @@ impl Lab {
         s(&self.t.join(rel)).into()
     }
 
-    /// `dirs` (lab names), the network guard, then the system dirs, as a PATH.
+    /// `dirs` (lab names), macOS's `uname` (a row names `linux` among its
+    /// dirs to be a Linux run), the network guard, then the system dirs, as a
+    /// PATH.
     fn path(&self, dirs: &[&str]) -> String {
         let mut parts: Vec<String> = dirs.iter().map(|d| self.p(d)).collect();
+        parts.push(self.p("macos"));
         parts.push(self.p("nonet"));
         parts.push(SYSTEM_PATH.into());
         parts.join(":")
@@ -753,6 +767,21 @@ fn a_cargo_that_cannot_honour_the_pin_is_refused_naming_its_remedy() {
                 "rustup toolchain link trust <prefix>".into(),
             ],
             lacks: Vec::new(),
+        },
+        Row {
+            label: "the pinned toolchain absent, on Linux",
+            dirs: vec!["linux", "shadow"],
+            home: "cargo-home",
+            setup: "export FAKE_TOOLCHAIN_MISSING=1",
+            cargo: Some("cargo-home/bin/cargo"),
+            names: vec![
+                format!("toolchain '{PIN}' is not installed"),
+                "build the Trust toolchain from source (https://github.com/alabsystems/trust \
+                 publishes no build for Linux)"
+                    .into(),
+                "rustup toolchain link trust <prefix>".into(),
+            ],
+            lacks: vec!["aterm pkg install trust".into(), "tarballs".into()],
         },
         Row {
             label: "a rustup override on the checkout",
@@ -1326,8 +1355,9 @@ fn a_stock_pin_never_takes_the_store_lane() {
 
 /// With no toolchain in reach at all, the refusal names ONE remedy: the
 /// product's where an `aterm` can run it, else rustup and the Trust tarballs
-/// (rustup alone cannot fetch the `trust` pin); and a rustup with no proxy
-/// beside it says where the proxy should have been.
+/// (rustup alone cannot fetch the `trust` pin) — and on Linux, where neither is
+/// published, rustup and a Trust built from source, `aterm` or not; and a
+/// rustup with no proxy beside it says where the proxy should have been.
 #[test]
 fn with_no_toolchain_in_reach_the_one_remedy_depends_on_an_aterm() {
     if has_system_cargo() {
@@ -1388,6 +1418,26 @@ fn with_no_toolchain_in_reach_the_one_remedy_depends_on_an_aterm() {
             vec!["aterm pkg install trust"],
         ),
     ];
+    let linux = [
+        gate(
+            &mut lib,
+            &lab,
+            &lab.path(&["linux", "none"]),
+            "nohome",
+            &root,
+            "",
+            false,
+        ),
+        gate(
+            &mut lib,
+            &lab,
+            &lab.path(&["linux", "none", "bare-aterm"]),
+            "nohome",
+            &root,
+            "",
+            false,
+        ),
+    ];
     let bare = gate(
         &mut lib,
         &lab,
@@ -1402,6 +1452,25 @@ fn with_no_toolchain_in_reach_the_one_remedy_depends_on_an_aterm() {
         let found = Found::from(&recs[g.find]);
         assert!(!found.ok, "{found:?}");
         assert_eq!(&remedies(&found.reason), want, "{}", found.reason);
+    }
+    for g in &linux {
+        let found = Found::from(&recs[g.find]);
+        assert!(!found.ok, "{found:?}");
+        assert_eq!(
+            remedies(&found.reason),
+            ["https://rustup.rs", "rustup toolchain link trust <prefix>"],
+            "{}",
+            found.reason
+        );
+        assert!(
+            says(
+                &found.reason,
+                &["publishes no build for Linux"],
+                &["tarballs"]
+            ),
+            "{}",
+            found.reason
+        );
     }
     let found = Found::from(&recs[bare.find]);
     assert!(!found.ok);
@@ -1599,6 +1668,20 @@ fn the_dry_run_plan_reports_the_source_build_as_the_run_would() {
             Want::skip(&[product, "rustup toolchain link trust <prefix>"], &[]),
         ),
         row(
+            "the trust pin absent, on Linux",
+            &trust,
+            &["linux", "shadow"],
+            "cargo-home",
+            vec![("FAKE_TOOLCHAIN_MISSING", "1")],
+            Want::skip(
+                &[
+                    "publishes no build for Linux",
+                    "rustup toolchain link trust <prefix>",
+                ],
+                &[product, "tarballs"],
+            ),
+        ),
+        row(
             "a stock pin absent",
             &stock,
             &["shadow"],
@@ -1737,5 +1820,45 @@ fn the_dry_run_plan_reports_the_source_build_as_the_run_would() {
         lab.take_builds(),
         "",
         "a dry run never builds or reaches the network"
+    );
+}
+
+/// A source build that fails ends the run with the installer's own line — what
+/// failed and that the command was not installed — and status 1, not with
+/// cargo's status and its error as the run's last words. (A Linux run: off
+/// macOS the CLI half never looks for an installed aterm.app to link.)
+#[test]
+fn a_failed_source_build_is_said_and_installs_nothing() {
+    let scratch = Scratch::new();
+    let lab = Lab::new(&scratch);
+    let trust = checkout(&scratch, "build-checkout", "trust");
+    let fresh: Home = scratch.home("build");
+    let path = lab.path(&["linux", "shadow"]);
+    let cargo_home = lab.p("cargo-home");
+    let stand_ins = lab.env();
+    let mut env: Vec<(&str, &str)> = vec![("PATH", &path), ("CARGO_HOME", &cargo_home)];
+    env.extend(stand_ins.iter().map(|(k, v)| (*k, v.as_str())));
+    let run = installer(
+        &trust.join("tools/install.sh"),
+        &fresh,
+        &env,
+        &["--no-toolchain", "--no-app", "--no-path"],
+    );
+    let out = run.all();
+    assert_eq!(run.code(), 1, "{out}");
+    assert!(
+        out.contains(
+            "install.sh: the source build failed (cargo exit 97, its error above) — the `aterm` \
+             command was not installed"
+        ),
+        "{out}"
+    );
+    assert!(
+        lab.take_builds().contains("build --release -p aterm"),
+        "the build ran"
+    );
+    assert!(
+        !fresh.home.join(".local/bin/aterm").exists(),
+        "nothing was linked"
     );
 }

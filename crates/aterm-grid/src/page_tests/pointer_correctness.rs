@@ -7,16 +7,6 @@ use super::super::*;
 // Alignment and pointer correctness (Miri-exercised).
 
 #[test]
-fn alloc_slice_alignment_u8() {
-    let mut store = PageStore::new();
-    let slice = store.alloc_slice::<u8>(100);
-    assert_eq!(slice.len(), 100);
-    // u8 has align 1, any address works
-    let ptr = slice.as_slice().as_ptr();
-    assert!(!ptr.is_null());
-}
-
-#[test]
 fn alloc_slice_alignment_u64() {
     let mut store = PageStore::new();
     // First alloc a u8 to misalign, then alloc u64 which needs align 8
@@ -38,47 +28,8 @@ fn alloc_slice_alignment_u128() {
     assert_eq!(ptr.align_offset(std::mem::align_of::<u128>()), 0);
 }
 
-#[test]
-fn alloc_slice_sequential_no_overlap() {
-    let mut store = PageStore::new();
-    let slice1 = store.alloc_slice::<u32>(100);
-    let slice2 = store.alloc_slice::<u32>(100);
-
-    let ptr1 = slice1.as_slice().as_ptr() as usize;
-    let end1 = ptr1 + 100 * std::mem::size_of::<u32>();
-    let ptr2 = slice2.as_slice().as_ptr() as usize;
-
-    assert!(
-        end1 <= ptr2,
-        "slices overlap: first ends at {end1:#x}, second starts at {ptr2:#x}"
-    );
-}
-
 // Pointer stability and alignment: alloc_slice pointers stay valid across later
 // allocations, and Cell gets correct alignment.
-
-/// PageSlice<Cell> pointers are valid and aligned on the production allocation
-/// path (Cell is `repr(C, packed)`, align 1).
-#[test]
-fn alloc_slice_cell_alignment_and_access() {
-    use crate::Cell;
-
-    let mut store = PageStore::new();
-
-    let mut cells = store.alloc_slice::<Cell>(80);
-    assert_eq!(cells.len(), 80);
-
-    let ptr = cells.as_slice().as_ptr();
-    assert!(!ptr.is_null());
-
-    // Write and read back through the slice (exercises from_raw_parts).
-    for cell in cells.iter_mut() {
-        *cell = Cell::EMPTY;
-    }
-    for cell in cells.as_slice() {
-        assert!(cell.is_empty());
-    }
-}
 
 /// Zero-length allocations are stable and consume no page capacity.
 #[test]

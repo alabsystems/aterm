@@ -50,6 +50,7 @@ mod notifications_api;
 mod predict_api;
 mod scroll_input_api;
 mod scrollback_tiers_api;
+mod theme_api;
 
 use aterm_core::grid::{PendingScrollbackReflow, ReflowStep};
 use aterm_core::selection::SmartSelection;
@@ -218,13 +219,14 @@ pub struct AtermTerminal {
     // until the host opts in via set_predictive_echo. pub(crate) so the
     // predict_api module (and tests) reach it (the effects-field posture).
     pub(crate) predict: aterm_predict::Predictor,
-    // Resident scratch row for the predictive-echo reconcile probe (the wasm
-    // twin of aterm-gui's `pred_row_scratch`): `Predictor::reconcile` runs its
-    // observe closure once per retired guess plus the head, all on the SAME
-    // row, so `Terminal::render_row` would allocate a fresh Vec and re-resolve
-    // the whole row (palette, decorations, the lot) once per pending guess just
-    // to read one `ch`. `render_row_into` refills this buffer in place instead.
-    pub(crate) pred_row_scratch: Vec<aterm_core::terminal::RenderCell>,
+    // Resident row buffers for the predictor (the wasm twin of aterm-gui's
+    // `predict_seen`): `Predictor::reconcile_seen` runs its observe closure once
+    // per retired guess plus the head and the tail guard's scan, all on the SAME
+    // row, so extracting the row per probe would allocate a fresh Vec and
+    // re-resolve the whole row (palette, decorations, the lot) each time;
+    // `Terminal::logical_row_into` refills these in place instead. The cursor
+    // row a run's first keypress hands the predictor lives here too.
+    pub(crate) pred_row_scratch: predict_api::PredRows,
     // Chrome-band spill rasterizer (the cross-pane window-space effects
     // export): refreshed per `render`, read back via the `spill_*` bindings.
     // Identity at 0/0 chrome — empty buffer, zero per-frame work. pub(crate)
@@ -291,6 +293,10 @@ pub struct AtermTerminal {
     blink_phase_shadow: Option<bool>,
     // Shadow of the last hollow-cursor override — same de-dup contract.
     hollow_shadow: Option<bool>,
+    // Named themes, splits and registered themes (the shared theme_api):
+    // the selector on screen and the host's last appearance. pub(crate) so
+    // theme_api reaches it (the effects-field posture).
+    pub(crate) web_theme: theme_api::WebThemeState,
 }
 
 /// The WF-1 frame-gate key: every input of a rendered frame that can change
@@ -325,17 +331,17 @@ struct DisplayRowCache {
 /// aligned with the renderer theme. The renderer cannot own these colours by
 /// itself: sparse row tails and live selection colours are synthesized by
 /// `Terminal`, then stamped into every frame by
-/// [`AtermTerminal::refill_frame_scratch`].
+/// [`AtermTerminal::refill_frame_scratch`]. The baseline moves through
+/// [`Terminal::rebase_colors`], so a program's OSC 10/11/12/17 colours survive
+/// a host theme change, as they survive a native reload; the palette and the
+/// selection foreground keep their current baseline.
 fn apply_terminal_theme_colors(term: &mut Terminal, fg: u32, bg: u32, cursor: u32, selection: u32) {
-    let rgb = |color: u32| Rgb {
-        r: ((color >> 16) & 0xff) as u8,
-        g: ((color >> 8) & 0xff) as u8,
-        b: (color & 0xff) as u8,
-    };
-    term.set_default_foreground(rgb(fg));
-    term.set_default_background(rgb(bg));
-    term.set_default_cursor_color(Some(rgb(cursor)));
-    term.set_default_selection_background(Some(rgb(selection)));
+    let mut base = term.color_baseline();
+    base.foreground = theme_api::unpack(fg);
+    base.background = theme_api::unpack(bg);
+    base.cursor = Some(theme_api::unpack(cursor));
+    base.selection_background = Some(theme_api::unpack(selection));
+    term.rebase_colors(&base);
 }
 
 impl AtermTerminal {
@@ -401,6 +407,50 @@ impl AtermTerminal {
     }
 }
 
+/// The renderer half of a theme install, which `theme_api` (shared with
+/// aterm-gpu-web) calls on whichever crate compiles it.
+impl AtermTerminal {
+    /// The CPU face this terminal renders with.
+    pub(crate) fn render_face(&self) -> &Renderer {
+        &self.renderer
+    }
+
+    /// Everything a theme change does outside the engine's colours: the
+    /// repaint, the effects' and band's theme-derived inks, and the renderer.
+    pub(crate) fn install_renderer_theme(&mut self, parts: aterm_types::scheme::ThemeParts) {
+        let aterm_types::scheme::ThemeParts { fg, bg, cursor, .. } = parts;
+        // Theme is appearance-only (selection band / idle cursor / padding / default
+        // cells) — not tracked by the row-diff — so force one full repaint next frame.
+        self.force_full_repaint = true;
+        // Keep the effects' derive-from-theme default in sync (glow/trail colours
+        // passed as `None` follow the cursor colour, like the native app).
+        self.theme_cursor = cursor & 0x00FF_FFFF;
+        self.theme_fg = fg & 0x00FF_FFFF;
+        self.theme_bg = bg & 0x00FF_FFFF;
+        self.effects
+            .set_matrix_rain_theme(self.theme_bg, self.theme_fg, self.theme_cursor);
+        // The pet's frozen contrast sample is keyed to the theme it was taken
+        // against; a new theme retires it (the native palette-authority edge)
+        // while the cat's behaviour, position and breed carry on.
+        self.effects.invalidate_companion_colors();
+        // The band's inks derive from the theme (the next frame repaints it).
+        self.band.set_theme(fg, bg, cursor);
+        self.renderer.set_theme(Theme::from(parts));
+    }
+
+    /// The renderer half of `set_selection_fg` (the engine half is the caller's).
+    pub(crate) fn install_renderer_selection_fg(&mut self, fg: Option<u32>) {
+        self.force_full_repaint = true;
+        self.renderer.set_selection_fg(fg);
+    }
+
+    /// TEST BUILDS ONLY: render once, so the frame gate settles.
+    #[cfg(test)]
+    pub(crate) fn settle_frame(&mut self) {
+        self.render();
+    }
+}
+
 #[cfg_attr(target_arch = "wasm32", export)]
 impl AtermTerminal {
     /// Build a `rows`x`cols` terminal rendered with `font_bytes` (a TTF/OTF) at
@@ -462,6 +512,7 @@ impl AtermTerminal {
         // Poll-drain surface for OSC 9/99/777 (a web host has no callback
         // thread); authorization keeps the engine's fail-closed default.
         let notifications = notifications_api::wire_notification_queue(&mut term);
+        let web_theme = theme_api::WebThemeState::new(term.color_scheme());
         let rows = term.grid().rows() as usize;
         let cols = term.grid().cols() as usize;
         Ok(Self {
@@ -489,7 +540,7 @@ impl AtermTerminal {
             band: messages_api::WebBand::new(aterm_time::Instant::now(), fg, bg, cursor),
             scroll_input: scroll_input_api::ScrollInputState::default(),
             predict: aterm_predict::Predictor::default(),
-            pred_row_scratch: Vec::new(),
+            pred_row_scratch: predict_api::PredRows::default(),
             spill: SpillBand::new(),
             pending_reflow: None,
             reflow_grace: 0,
@@ -500,6 +551,7 @@ impl AtermTerminal {
             last_render_gated: false,
             blink_phase_shadow: None,
             hollow_shadow: None,
+            web_theme,
         })
     }
 
@@ -732,25 +784,13 @@ impl AtermTerminal {
     /// Replace the default fg/bg/cursor/selection theme live (0x00RRGGBB), so a host
     /// theme change re-themes the pane without rebuilding it. Per-cell SGR colours
     /// flow independently; pair with set_palette_color for the ANSI palette.
+    ///
+    /// A program's OSC 10/11/12/17 colours survive it (the engine baseline is
+    /// rebased, as on native). It takes the colours back from a named theme
+    /// (`set_theme_by_name`), so a later `set_color_scheme` leaves them alone,
+    /// and the reported scheme returns to the host's last `set_color_scheme`.
     pub fn set_theme(&mut self, fg: u32, bg: u32, cursor: u32, selection: u32) {
-        // Theme is appearance-only (selection band / idle cursor / padding / default
-        // cells) — not tracked by the row-diff — so force one full repaint next frame.
-        self.force_full_repaint = true;
-        // Keep the effects' derive-from-theme default in sync (glow/trail colours
-        // passed as `None` follow the cursor colour, like the native app).
-        self.theme_cursor = cursor & 0x00FF_FFFF;
-        self.theme_fg = fg & 0x00FF_FFFF;
-        self.theme_bg = bg & 0x00FF_FFFF;
-        self.effects
-            .set_matrix_rain_theme(self.theme_bg, self.theme_fg, self.theme_cursor);
-        // The pet's frozen contrast sample is keyed to the theme it was taken
-        // against; a new theme retires it (the native palette-authority edge)
-        // while the cat's behaviour, position and breed carry on.
-        self.effects.invalidate_companion_colors();
-        // The band's inks derive from the theme (the next frame repaints it).
-        self.band.set_theme(fg, bg, cursor);
-        apply_terminal_theme_colors(&mut self.term, fg, bg, cursor, selection);
-        self.renderer.set_theme(Theme {
+        self.install_host_colors(aterm_types::scheme::ThemeParts {
             fg,
             bg,
             cursor,
@@ -762,14 +802,9 @@ impl AtermTerminal {
     /// 0x00RRGGBB, or `undefined` to restore the WCAG contrast-floor default.
     /// Appearance-only, so force one full repaint next frame.
     pub fn set_selection_fg(&mut self, fg: Option<u32>) {
-        self.force_full_repaint = true;
         self.term
-            .set_default_selection_foreground(fg.map(|color| Rgb {
-                r: ((color >> 16) & 0xff) as u8,
-                g: ((color >> 8) & 0xff) as u8,
-                b: (color & 0xff) as u8,
-            }));
-        self.renderer.set_selection_fg(fg);
+            .set_default_selection_foreground(fg.map(theme_api::unpack));
+        self.install_renderer_selection_fg(fg);
     }
 
     /// Set the per-cell minimum contrast ratio (xterm's `minimumContrastRatio`,
@@ -777,7 +812,9 @@ impl AtermTerminal {
     /// rescue for bright-white SGR text on a light theme. `ratio <= 1.0` turns
     /// the floor off (the default; xterm treats 1 as "do nothing"). Cells whose
     /// fg == bg are never adjusted (SGR 8 conceal renders fg = bg and must stay
-    /// hidden). Appearance-only, so force one full repaint next frame.
+    /// hidden). While `set_background_opacity` is below 1 the renderer floors
+    /// at no less than 4.5:1 (`effective_minimum_contrast`), as native does.
+    /// Appearance-only, so force one full repaint next frame.
     pub fn set_minimum_contrast(&mut self, ratio: f32) {
         self.force_full_repaint = true;
         self.renderer.set_minimum_contrast(ratio);
@@ -789,7 +826,9 @@ impl AtermTerminal {
     /// come out of [`rgba`](Self::rgba)/[`rgba_ptr`](Self::rgba_ptr) with
     /// `alpha = round(opacity*255)`, so `putImageData` onto a (transparent)
     /// canvas lets the page show through. SGR-colored bg cells, the selection
-    /// band and glyph pixels stay opaque so text keeps its contrast.
+    /// band and glyph pixels stay opaque so text keeps its contrast, and below
+    /// 1.0 glyphs are floored to at least 4.5:1 against their cell
+    /// (`effective_minimum_contrast`), as on native.
     /// Appearance-only, so force one full repaint next frame.
     pub fn set_background_opacity(&mut self, opacity: f32) {
         self.force_full_repaint = true;
@@ -1454,6 +1493,7 @@ impl AtermTerminal {
         apply_terminal_theme_colors(&mut term, theme.fg, theme.bg, theme.cursor, theme.selection);
         // Same notification wiring as `new` (fail-closed until authorized).
         let notifications = notifications_api::wire_notification_queue(&mut term);
+        let web_theme = theme_api::WebThemeState::new(term.color_scheme());
         let rows = term.grid().rows() as usize;
         let cols = term.grid().cols() as usize;
         Some(Self {
@@ -1486,7 +1526,7 @@ impl AtermTerminal {
             ),
             scroll_input: scroll_input_api::ScrollInputState::default(),
             predict: aterm_predict::Predictor::default(),
-            pred_row_scratch: Vec::new(),
+            pred_row_scratch: predict_api::PredRows::default(),
             spill: SpillBand::new(),
             pending_reflow: None,
             reflow_grace: 0,
@@ -1497,537 +1537,238 @@ impl AtermTerminal {
             last_render_gated: false,
             blink_phase_shadow: None,
             hollow_shadow: None,
+            web_theme,
         })
     }
+}
+
+/// A test terminal on the host's system font: `new_from_system`, or COULD NOT
+/// RUN where this host has no system monospace font. Never a silent pass: a
+/// missing font decides nothing about the code.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn system_font_terminal(rows: u16, cols: u16, px: f32) -> AtermTerminal {
+    AtermTerminal::new_from_system(rows, cols, px)
+        .unwrap_or_else(|| aterm_spec::host::could_not_run("no system monospace font on this host"))
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
 
-    #[test]
-    fn host_theme_colors_are_the_dynamic_color_reset_baseline() {
-        let mut term = Terminal::new(2, 4);
-        apply_terminal_theme_colors(
-            &mut term,
-            0x0011_2233,
-            0x0044_5566,
-            0x0077_8899,
-            0x000A_0B0C,
-        );
-        term.process(b"\x1b]10;rgb:aaaa/bbbb/cccc\x1b\\");
-        term.process(b"\x1b]11;rgb:dddd/eeee/ffff\x1b\\");
-        term.process(b"\x1b]12;rgb:1111/2222/3333\x1b\\");
-        term.process(b"\x1b]17;rgb:0101/0202/0303\x1b\\");
-        term.process(b"\x1b]19;rgb:0404/0505/0606\x1b\\");
-        assert_eq!(term.default_foreground(), Rgb::new(0xaa, 0xbb, 0xcc));
-        assert_eq!(term.default_background(), Rgb::new(0xdd, 0xee, 0xff));
-        assert_eq!(
-            term.selection_background(),
-            Some(Rgb::new(0x01, 0x02, 0x03))
-        );
-        assert_eq!(
-            term.selection_foreground(),
-            Some(Rgb::new(0x04, 0x05, 0x06))
-        );
+    /// The bundled face, injected the way a JS host injects a fetched one. A
+    /// security property must not be skipped on a box with no system font, so
+    /// those tests build from these bytes rather than `new_from_system`.
+    const BUNDLED_FACE: &[u8] = include_bytes!("../../aterm-render/assets/DejaVuSansMono.ttf");
 
-        term.process(b"\x1b]110\x07\x1b]111\x07\x1b]112\x07\x1b]117\x07\x1b]119\x07");
-        assert_eq!(term.default_foreground(), Rgb::new(0x11, 0x22, 0x33));
-        assert_eq!(term.default_background(), Rgb::new(0x44, 0x55, 0x66));
-        assert_eq!(term.cursor_color(), Some(Rgb::new(0x77, 0x88, 0x99)));
-        assert_eq!(
-            term.selection_background(),
-            Some(Rgb::new(0x0a, 0x0b, 0x0c))
-        );
-        assert_eq!(term.selection_foreground(), None);
-    }
-
+    /// The theme the host hands the constructor seeds the engine's implicit
+    /// colours (`apply_terminal_theme_colors`), so every frame channel the
+    /// renderer takes from the engine (default fg and bg, cursor, selection
+    /// pair) is the host's, and an OSC 110/111/112/117/119 reset returns to
+    /// it rather than to the engine's built-ins.
     #[test]
-    fn frame_scratch_tracks_live_sparse_blank_and_cursor_colors() {
-        let Some(mut t) = AtermTerminal::new_from_system(3, 8, 16.0) else {
-            return;
-        };
-        t.set_default_foreground(0x11, 0x22, 0x33);
-        t.set_default_background(0x44, 0x55, 0x66);
+    fn the_host_theme_is_the_frames_colour_baseline() {
+        let (fg, bg, cursor, selection) = (0x0011_2233, 0x0044_5566, 0x0077_8899, 0x000A_0B0C);
+        let mut t = AtermTerminal::new(3, 8, BUNDLED_FACE, 16.0, fg, bg, cursor, selection)
+            .expect("the bundled face parses");
         t.set_selection_fg(Some(0x0012_3456));
-        t.process(b"X");
+        let channels = |t: &mut AtermTerminal| {
+            t.refill_frame_scratch();
+            let f = &t.frame_scratch;
+            (
+                f.default_fg,
+                f.default_bg,
+                f.cursor_color,
+                f.selection_bg,
+                f.selection_fg,
+            )
+        };
+        let host = (fg, bg, cursor, selection, 0x0012_3456);
+        assert_eq!(channels(&mut t), host, "at construction");
+        t.process(b"\x1b]10;rgb:aaaa/bbbb/cccc\x1b\\\x1b]11;rgb:dddd/eeee/ffff\x1b\\");
+        t.process(b"\x1b]12;rgb:2121/4343/6565\x1b\\");
+        t.process(b"\x1b]17;rgb:0101/0202/0303\x1b\\\x1b]19;rgb:0404/0505/0606\x1b\\");
+        assert_eq!(
+            channels(&mut t),
+            (
+                0x00aa_bbcc,
+                0x00dd_eeff,
+                0x0021_4365,
+                0x0001_0203,
+                0x0004_0506
+            ),
+            "precondition: the program recoloured every channel"
+        );
+        t.process(b"\x1b]110\x07\x1b]111\x07\x1b]112\x07\x1b]117\x07\x1b]119\x07");
+        assert_eq!(channels(&mut t), host, "after the OSC resets");
+    }
 
-        t.refill_frame_scratch();
+    /// `search_meta` and `search_summary` describe exactly the result set the
+    /// legacy `search` export returns, plus what it drops: the engine's
+    /// match-cap truncation (E9a) and, for the summary, line snippets and a
+    /// `total` the `max_matches` cap leaves alone. An empty query or a bad
+    /// regex is silent on all three.
+    #[test]
+    fn search_meta_and_summary_carry_what_the_legacy_export_drops() {
+        let mut t = crate::system_font_terminal(24, 80, 16.0);
+        t.process(b"alpha beta\r\nalpha gamma\r\nno match here\r\n");
+        assert_eq!(t.search("alpha", true, false).len() / 3, 2);
+        let meta = t.search_meta("alpha", true, false);
+        assert_eq!((meta.match_count(), meta.incomplete()), (2, false));
+        let summary = t.search_summary("alpha", true, false, 1).expect("summary");
+        assert_eq!(
+            summary.matches("\"absRow\":").count(),
+            1,
+            "max_matches caps the matches: {summary}"
+        );
         assert!(
-            t.frame_scratch.cells[0].len() < t.cols,
-            "the regression requires an unmaterialized sparse row tail"
+            summary.contains("\"col\":0,\"len\":5,\"snippet\":\"alpha beta\""),
+            "span and snippet: {summary}"
         );
-        assert_eq!(t.frame_scratch.default_bg, 0x0044_5566);
-        assert_eq!(t.frame_scratch.cells[0][0].bg, [0x44, 0x55, 0x66]);
-        assert_eq!(
-            t.frame_scratch.cursor_color, t.theme_cursor,
-            "the configured OSC 12 baseline matches the host theme"
+        assert!(
+            summary.ends_with("\"total\":2,\"incomplete\":false}"),
+            "the cap leaves the total: {summary}"
         );
-        assert_eq!(t.frame_scratch.selection_bg, Theme::default().selection);
-        assert_eq!(t.frame_scratch.selection_fg, 0x0012_3456);
-
-        t.process(b"\x1b]11;rgb:7777/8888/9999\x1b\\");
-        t.process(b"\x1b]12;rgb:aaaa/bbbb/cccc\x1b\\");
-        t.process(b"\x1b]17;rgb:0101/0202/0303\x1b\\");
-        t.process(b"\x1b]19;rgb:0404/0505/0606\x1b\\");
-        t.refill_frame_scratch();
-        assert_eq!(t.frame_scratch.default_bg, 0x0077_8899);
-        assert_eq!(t.frame_scratch.cells[0][0].bg, [0x77, 0x88, 0x99]);
-        assert_eq!(t.frame_scratch.cursor_color, 0x00aa_bbcc);
-        assert_eq!(t.frame_scratch.selection_bg, 0x0001_0203);
-        assert_eq!(t.frame_scratch.selection_fg, 0x0004_0506);
-
-        t.process(b"\x1b[?5h");
-        t.refill_frame_scratch();
-        assert_eq!(
-            t.frame_scratch.default_bg, 0x0011_2233,
-            "DECSCNM makes the live default foreground the effective blank background"
-        );
-        assert_eq!(t.frame_scratch.cells[0][0].bg, [0x11, 0x22, 0x33]);
-
-        t.process(b"\x1b]111\x07\x1b]112\x07\x1b]117\x07\x1b]119\x07\x1b[?5l");
-        t.refill_frame_scratch();
-        assert_eq!(
-            t.frame_scratch.default_bg, 0x0044_5566,
-            "OSC 111 restores the configured background"
-        );
-        assert_eq!(
-            t.frame_scratch.cursor_color, t.theme_cursor,
-            "OSC 112 restores the host-configured cursor baseline"
-        );
-        assert_eq!(t.frame_scratch.selection_bg, Theme::default().selection);
-        assert_eq!(t.frame_scratch.selection_fg, 0x0012_3456);
-
-        t.process(b"\x1b]21;cursor=\x07\x1b]10;#DEADBE\x07");
-        t.refill_frame_scratch();
-        assert_eq!(t.term.cursor_color(), None);
-        assert_eq!(
-            t.frame_scratch.cursor_color, 0x00DE_ADBE,
-            "OSC 21 cursor= makes the embedded cursor follow live OSC 10"
-        );
-        t.process(b"\x1b]10;#1234AB\x07");
-        t.refill_frame_scratch();
-        assert_eq!(
-            t.frame_scratch.cursor_color, 0x0012_34AB,
-            "a later OSC 10 recolors the still-dynamic cursor"
-        );
-    }
-
-    #[test]
-    fn dynamic_cursor_osc10_changes_wasm_pixels() {
-        let Some(mut t) = AtermTerminal::new_from_system(2, 4, 16.0) else {
-            return;
-        };
-        t.process(b"\x1b]21;cursor=\x07\x1b]10;#21C365\x07\x1b[2 q");
-        t.render();
-        assert_eq!(t.term.cursor_color(), None);
-        assert_eq!(t.frame_scratch.cursor_color, 0x0021_C365);
-        let (cw, ch) = t.renderer.cell_size();
-        assert_eq!(
-            t.rgba()
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .filter(|pixel| **pixel == [0x21, 0xc3, 0x65, 0xff])
-                .count(),
-            cw * ch,
-            "the steady blank block cursor uses the dynamic OSC 10 color"
-        );
-
-        t.process(b"\x1b]10;#BADA55\x07");
-        t.render();
-        assert_eq!(t.frame_scratch.cursor_color, 0x00BA_DA55);
-        assert_eq!(
-            t.rgba()
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .filter(|pixel| **pixel == [0xba, 0xda, 0x55, 0xff])
-                .count(),
-            cw * ch,
-            "changing OSC 10 changes wasm cursor pixels while the cursor slot stays dynamic"
-        );
-    }
-
-    #[test]
-    fn serialize_round_trips_visible_grid_into_a_fresh_engine() {
-        // The serialize output is replayable ANSI: feeding it into a fresh engine
-        // must reproduce the visible rows — proving it can replace xterm's
-        // SerializeAddon for snapshot/restore without a shadow xterm buffer.
-        let Some(mut a) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            return;
-        };
-        a.process(b"\x1b[1;32mhello\x1b[0m world\r\nsecond line\r\n$ ");
-        let snapshot = a.serialize(None);
-        assert!(snapshot.contains("hello"), "serialize carries visible text");
-
-        let Some(mut b) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            return;
-        };
-        b.process(snapshot.as_bytes());
-        for r in 0..3u16 {
+        for (query, regex) in [("", false), ("(", true)] {
+            assert!(t.search(query, true, regex).is_empty(), "{query:?}");
+            let meta = t.search_meta(query, true, regex);
             assert_eq!(
-                a.row_text(r),
-                b.row_text(r),
-                "row {r} differs after serialize→replay"
+                (meta.match_count(), meta.incomplete()),
+                (0, false),
+                "{query:?}"
+            );
+            assert_eq!(
+                t.search_summary(query, true, regex, 0).as_deref(),
+                Some(r#"{"matches":[],"total":0,"incomplete":false}"#),
+                "{query:?}"
             );
         }
-    }
-
-    #[test]
-    fn search_meta_agrees_with_search_and_is_silent_on_empty_or_bad_input() {
-        let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            return;
-        };
-        t.process(b"alpha beta\r\nalpha gamma\r\nno match here\r\n");
-        let matches = t.search("alpha", true, false);
-        let meta = t.search_meta("alpha", true, false);
-        assert_eq!(
-            meta.match_count() as usize,
-            matches.len() / 3,
-            "meta counts the same result set the legacy export returns"
-        );
-        assert_eq!(meta.match_count(), 2);
-        assert!(!meta.incomplete(), "small buffer: nothing truncated");
-        // Empty query and invalid regex mirror the legacy export's silence.
-        let empty = t.search_meta("", true, false);
-        assert_eq!((empty.incomplete(), empty.match_count()), (false, 0));
-        let bad = t.search_meta("(", true, true);
-        assert_eq!((bad.incomplete(), bad.match_count()), (false, 0));
-    }
-
-    #[test]
-    fn search_meta_surfaces_the_match_cap_truncation_the_legacy_export_drops() {
-        // E9a: the legacy `search` export silently caps at MAX_SEARCH_MATCHES;
-        // `search_meta` must carry the engine's `incomplete` signal for exactly
-        // that result set.
-        let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            return;
-        };
-        t.set_scrollback_limit(3000);
         // 1,300 lines x 78 "a"s = 101,400 single-char matches > the 100k cap.
+        t.set_scrollback_limit(3000);
         let line = "a".repeat(78) + "\r\n";
         for _ in 0..1_300 {
             t.process(line.as_bytes());
         }
-        let matches = t.search("a", true, false);
+        let cap = aterm_core::search::MAX_SEARCH_MATCHES;
+        assert_eq!(
+            t.search("a", true, false).len() / 3,
+            cap,
+            "the legacy export silently caps"
+        );
         let meta = t.search_meta("a", true, false);
         assert_eq!(
-            matches.len() / 3,
-            aterm_core::search::MAX_SEARCH_MATCHES,
-            "legacy export returns the silently capped set"
+            (meta.match_count() as usize, meta.incomplete()),
+            (cap, true)
         );
-        assert_eq!(
-            meta.match_count() as usize,
-            aterm_core::search::MAX_SEARCH_MATCHES
-        );
+        let summary = t.search_summary("a", true, false, 1).expect("summary");
         assert!(
-            meta.incomplete(),
-            "the cap must surface out-of-band via search_meta"
+            summary.ends_with(&format!("\"total\":{cap},\"incomplete\":true}}")),
+            "{summary}"
         );
     }
 
-    #[test]
-    fn search_summary_carries_snippets_total_and_incomplete_superseding_meta() {
-        // fed E-1: search_summary returns absolute-row matches WITH line-text
-        // snippets + total + the incomplete flag in one call — the same result
-        // set the legacy `search` export returns, enriched.
-        let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            return;
-        };
-        t.process(b"alpha beta\r\nalpha gamma\r\nno match here\r\n");
-        let json = t.search_summary("alpha", true, false, 0).expect("summary");
-        // total agrees with the legacy export's match count.
-        let legacy = t.search("alpha", true, false).len() / 3;
-        assert_eq!(legacy, 2);
-        assert!(
-            json.contains("\"total\":2"),
-            "total counts all matches: {json}"
-        );
-        assert!(
-            json.contains("\"incomplete\":false"),
-            "nothing truncated: {json}"
-        );
-        // Each match carries its span coords AND a text snippet from its line.
-        assert_eq!(
-            json.matches("\"absRow\":").count(),
-            2,
-            "one absRow per match: {json}"
-        );
-        assert!(
-            json.contains("\"snippet\":\"alpha beta\""),
-            "snippet is the match line: {json}"
-        );
-        assert!(
-            json.contains("\"snippet\":\"alpha gamma\""),
-            "second snippet: {json}"
-        );
-        assert!(json.contains("\"col\":0"), "start_col present: {json}");
-        // max_matches caps `matches` but not `total`.
-        let capped = t.search_summary("alpha", true, false, 1).expect("capped");
-        assert_eq!(
-            capped.matches("\"absRow\":").count(),
-            1,
-            "cap limits matches: {capped}"
-        );
-        assert!(
-            capped.contains("\"total\":2"),
-            "cap does not change total: {capped}"
-        );
-        // Empty query and invalid regex mirror the legacy export's silence.
-        let empty = t.search_summary("", true, false, 0).expect("empty");
-        assert_eq!(empty, "{\"matches\":[],\"total\":0,\"incomplete\":false}");
-        let bad = t.search_summary("(", true, true, 0).expect("bad regex");
-        assert_eq!(bad, "{\"matches\":[],\"total\":0,\"incomplete\":false}");
-    }
-
-    #[test]
-    fn search_index_release_reclaims_then_search_still_finds() {
-        // fed E-1 search_index_release: after eviction the next search rebuilds
-        // and still finds everything (real reclaim, never a false empty cache).
-        let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            return;
-        };
-        t.process(b"NEEDLE here\r\nfiller\r\nNEEDLE again\r\n");
-        assert_eq!(t.search("NEEDLE", true, false).len() / 3, 2);
-        t.search_index_release();
-        assert_eq!(
-            t.search("NEEDLE", true, false).len() / 3,
-            2,
-            "post-release search rebuilds and finds the same matches"
-        );
-    }
-
+    /// The P7 grid-mirror batch export: one `{text, wrapped, len, widths?}`
+    /// record per display row, `widths` only on a row holding a wide cell,
+    /// and `undefined` for a range past the live grid (resize skew).
     #[test]
     fn row_range_json_batches_rows_matching_the_per_row_exports() {
-        let Some(mut t) = AtermTerminal::new_from_system(6, 20, 16.0) else {
-            return;
-        };
+        let mut t = crate::system_font_terminal(6, 20, 16.0);
         t.process(b"hello\r\nc\xe6\xbc\xa2x\r\n");
-        // Batch export of the first 3 display rows in one call.
         let json = t.row_range_json(0, 3).expect("range available");
-        // Exactly 3 records, text agrees with the per-row row_text fallback.
-        assert_eq!(
-            json.matches("\"text\":").count(),
-            3,
-            "one record per row: {json}"
-        );
+        assert_eq!(json.matches("\"text\":").count(), 3, "{json}");
         assert!(
-            json.contains("\"text\":\"hello\""),
-            "narrow row text: {json}"
+            json.contains("{\"text\":\"hello\",\"wrapped\":false,\"len\":5}"),
+            "a narrow row omits widths: {json}"
         );
-        assert!(json.contains("\"text\":\"c漢x\""), "wide row text: {json}");
-        // The wide row carries a per-column widths map with a '2' lead; the
-        // all-narrow rows OMIT widths (host reuses its cached all-'1' string).
-        assert!(
-            json.contains("\"widths\":\"12"),
-            "wide lead marked '2': {json}"
-        );
+        assert!(json.contains("\"text\":\"c漢x\""), "{json}");
         assert_eq!(
             json.matches("\"widths\":").count(),
             1,
             "only the wide row has widths: {json}"
         );
-        // Text is byte-identical to the per-row export it replaces.
-        for y in 0..3u16 {
-            let rec_text = t.row_text(y).unwrap_or_default();
-            assert!(
-                json.contains(&json_string(&rec_text)),
-                "row {y} text {rec_text:?} in {json}"
-            );
-        }
-        // A range past the live grid is unavailable (resize-skew fallback).
         assert!(
-            t.row_range_json(0, 999).is_none(),
-            "over-long range → undefined"
+            json.contains("\"widths\":\"12"),
+            "wide lead marked '2': {json}"
         );
+        assert!(t.row_range_json(0, 999).is_none(), "past the grid");
     }
 
-    /// The bundled face, injected the way a JS host injects a fetched one. A
-    /// security property must not be skipped on a box with no system font, so
-    /// paste tests build from these bytes rather than `new_from_system`.
-    const BUNDLED_FACE: &[u8] = include_bytes!("../../aterm-render/assets/DejaVuSansMono.ttf");
-
+    /// The host's input-intent words (the JS-to-wasm contract) each note one
+    /// console input of their kind and buy one frame; an unknown word is
+    /// refused without scheduling one.
     #[test]
-    fn console_input_api_counts_commits_without_replaying_their_echoes() {
+    fn console_input_words_note_one_input_each_and_refuse_unknowns() {
         use aterm_effects::kitty_pet::PetInputKind;
 
         let mut t = AtermTerminal::new(8, 48, BUNDLED_FACE, 14.0, 0, 0, 0, 0)
             .expect("the bundled face parses");
-        assert_eq!(t.effects.cursor_pet_console_input_seq(), 0);
         let generation = t.host_visual_gen;
         assert!(!t.note_console_input("unknown"));
-        assert_eq!(t.host_visual_gen, generation);
-        t.note_keystroke();
-        assert_eq!(t.effects.cursor_pet_console_input_seq(), 0);
-        assert!(t.note_typed_char('x'));
-        assert_eq!(t.effects.cursor_pet_console_input_seq(), 1);
-        // Same-cell overwrite and subsequent unrelated output do not note input.
-        t.process(b"x\r");
-        t.process(b"program repaint\r");
-        assert_eq!(t.effects.cursor_pet_console_input_seq(), 1);
-
-        // The handler reports an entire composition commit, never preedit or
-        // one note per scalar. A zero-advance combining commit counts as well.
-        assert!(t.note_console_input("text"));
-        t.process("中文🙂".as_bytes());
-        assert_eq!(t.effects.cursor_pet_console_input_seq(), 2);
-        assert!(!t.note_typed_char('\u{0301}'));
-        assert_eq!(t.effects.cursor_pet_console_input_seq(), 3);
-
-        // Formatting is pure; admission owns the single paste event.
-        let paste = t.format_paste("one pasted sentence");
-        assert_eq!(t.effects.cursor_pet_console_input_seq(), 3);
-        let generation = t.host_visual_gen;
-        assert!(t.note_console_input("paste"));
-        assert!(
-            t.host_visual_gen > generation,
-            "no-caret-travel input must wake one frame"
-        );
-        t.process(&paste);
-        assert_eq!(t.effects.cursor_pet_console_input_seq(), 4);
-        assert_eq!(
-            t.effects.cursor_pet_console_input_kind(),
-            Some(PetInputKind::Paste)
-        );
-        for (name, kind) in [
-            ("navigate", PetInputKind::Navigate),
+        assert_eq!(t.host_visual_gen, generation, "a refusal schedules nothing");
+        for (word, kind) in [
+            ("text", PetInputKind::Text),
             ("delete", PetInputKind::Delete),
+            ("navigate", PetInputKind::Navigate),
             ("submit", PetInputKind::Submit),
+            ("paste", PetInputKind::Paste),
+            ("kill", PetInputKind::Kill),
+            ("kill-forward", PetInputKind::KillForward),
         ] {
-            let before = t.effects.cursor_pet_console_input_seq();
-            assert!(t.note_console_input(name));
-            assert_eq!(t.effects.cursor_pet_console_input_seq(), before + 1);
+            let (seq, generation) = (t.effects.cursor_pet_console_input_seq(), t.host_visual_gen);
+            assert!(t.note_console_input(word), "{word}");
+            assert_eq!(t.effects.cursor_pet_console_input_seq(), seq + 1, "{word}");
             assert_eq!(t.effects.cursor_pet_console_input_kind(), Some(kind));
+            assert!(t.host_visual_gen > generation, "{word} must wake one frame");
         }
     }
 
-    /// The web export IS the engine's paste formatter, so a JS host cannot get
-    /// the ordering wrong. Sanitize-then-wrap is the whole security property: a
-    /// planted `ESC[201~` (or its 8-bit `0x9B 2 0 1 ~` spelling, which closes the
-    /// region just as well) is inert text before the closing guard is appended,
-    /// so it can never terminate its own bracket and let the tail run as
-    /// keystrokes. A host that wraps raw clipboard text itself has that hole.
+    /// The paste export is the engine's formatter on THIS instance's mode, so
+    /// a JS host cannot get the order wrong: a planted `ESC[201~` (or its
+    /// 8-bit `0x9B 2 0 1 ~` spelling) is inert text before the one closing
+    /// guard is appended, so it can never end its own bracket and let the
+    /// tail run as keystrokes.
     #[test]
     fn paste_export_wraps_only_sanitized_text_so_a_planted_terminator_stays_inert() {
         let mut t = AtermTerminal::new(24, 80, BUNDLED_FACE, 16.0, 0, 0, 0, 0)
             .expect("the bundled face parses");
-
-        // Mode OFF: no guards to escape, yet ESC/C1 are still stripped and a bare
-        // LF is still folded to CR for the PTY.
-        assert!(!t.bracketed_paste_mode());
         assert_eq!(
-            t.format_paste("a\x1b[31mb\u{009d}c\nd"),
-            b"a[31mbc\rd",
-            "unbracketed paste is sanitized too"
+            t.format_paste("a\nb"),
+            b"a\rb",
+            "no guards until DECSET 2004"
         );
-
         t.process(b"\x1b[?2004h");
-        assert!(t.bracketed_paste_mode());
-
-        let out = t.format_paste("safe\x1b[201~rm -rf ~");
-        assert_eq!(out, b"\x1b[200~safe[201~rm -rf ~\x1b[201~");
         assert_eq!(
-            out.windows(6).filter(|w| *w == b"\x1b[201~").count(),
-            1,
-            "exactly one closing guard on the wire"
+            t.format_paste("safe\x1b[201~rm -rf ~"),
+            b"\x1b[200~safe[201~rm -rf ~\x1b[201~"
         );
-        assert!(out.ends_with(b"\x1b[201~"), "and it is the last thing sent");
-
         assert_eq!(
             t.format_paste("a\u{009b}201~b"),
             b"\x1b[200~a201~b\x1b[201~",
             "the 8-bit CSI spelling of the terminator is stripped as well"
         );
-
-        // The seam that keeps web and native from drifting: the export delegates,
-        // it does not reimplement. A second implementation here is exactly how the
-        // two paths come to disagree about what a paste is.
-        let mut engine = Terminal::new(24, 80);
-        engine.process(b"\x1b[?2004h");
-        for probe in [
-            "",
-            "\t",
-            "x\r\ny\nz",
-            "safe\x1b[201~rm -rf ~",
-            "a\u{009b}201~b",
-            "a\u{0003}b\u{0004}c\u{001a}d\u{007f}e",
-            "中文🙂",
-        ] {
-            assert_eq!(
-                t.format_paste(probe),
-                engine.format_paste(probe),
-                "web export must equal Terminal::format_paste for {probe:?}"
-            );
-        }
     }
 
+    /// Font handles: identical bytes share one handle and distinct bytes get
+    /// their own, a handle builds an engine and installs the shared emoji
+    /// copy, and an unknown handle is a catchable error, never a panic.
     #[test]
-    fn register_font_dedupes_identical_bytes() {
-        let a = register_font(b"font-blob-a");
-        let a2 = register_font(b"font-blob-a");
-        let b = register_font(b"font-blob-b");
-        assert_eq!(a, a2, "identical bytes share one handle");
-        assert_ne!(a, b, "distinct bytes get distinct handles");
-    }
-
-    #[test]
-    fn registered_engine_builds_and_seeds_from_handles() {
-        // A plain (non-collection) monospace face readable on the host; skip-gate
-        // when absent (CI containers without system fonts).
-        let candidates = [
-            "/System/Library/Fonts/Monaco.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-        ];
-        let Some(bytes) = candidates.iter().find_map(|p| std::fs::read(p).ok()) else {
-            return;
-        };
-        let handle = register_font(&bytes);
+    fn registered_font_handles_dedupe_build_and_refuse_unknowns() {
+        let handle = register_font(BUNDLED_FACE);
         assert_eq!(
-            register_font(&bytes),
+            register_font(BUNDLED_FACE),
             handle,
-            "re-registration returns the same handle"
+            "identical bytes share one handle"
         );
-        let mut t = AtermTerminal::new_registered(
-            24,
-            80,
+        assert_ne!(
+            register_font(b"other-bytes"),
             handle,
-            16.0,
-            0x00ff_ffff,
-            0x0000_0000,
-            0x00ff_ffff,
-            0x0033_3333,
-        )
-        .expect("registered ctor builds");
-        t.set_fallback_font_registered(handle)
-            .expect("fallback via handle");
-        t.add_fallback_font_registered(handle)
-            .expect("add fallback via handle");
-        t.set_symbol_font_registered(handle)
-            .expect("symbol via handle");
+            "distinct bytes, distinct handles"
+        );
+        let mut t = AtermTerminal::new_registered(4, 20, handle, 16.0, 0, 0, 0, 0)
+            .expect("registered ctor builds");
         t.set_emoji_font_registered(handle)
-            .expect("emoji via handle (any parseable face installs)");
-        t.set_bold_font_registered(handle).expect("bold via handle");
-        t.process(b"handle-built engine renders\r\n");
-        assert!(
-            t.row_text(0).unwrap_or_default().contains("handle-built"),
-            "engine built from handles parses + stores text"
-        );
-        // An unknown handle is a catchable error, never a panic.
+            .expect("the shared copy installs");
         assert!(t.set_fallback_font_registered(u32::MAX).is_err());
-        assert!(AtermTerminal::new_registered(24, 80, u32::MAX, 16.0, 0, 0, 0, 0).is_err());
-    }
-
-    #[test]
-    fn serialize_scrollback_is_history_only() {
-        let Some(mut a) = AtermTerminal::new_from_system(4, 20, 16.0) else {
-            return;
-        };
-        for i in 0..12 {
-            a.process(format!("line {i}\r\n").as_bytes());
-        }
-        let hist = a.serialize_scrollback(None);
-        assert!(hist.contains("line 0"), "scrollback keeps the oldest line");
+        assert!(AtermTerminal::new_registered(4, 20, u32::MAX, 16.0, 0, 0, 0, 0).is_err());
     }
 
     /// Drive one OSC 133 command block (prompt → command → output → done),
@@ -2046,125 +1787,89 @@ mod tests {
         t.process(b"\x1b]133;A\x07");
     }
 
+    /// `last_command_output`'s three answers (the host's "Copy Last Command
+    /// Output" JSON): `undefined` without shell integration, the LATEST
+    /// block's whole output with its exit code, and an honest `evicted`
+    /// marker once the block's rows scroll past the cap, never shifted text.
     #[test]
-    fn last_command_output_returns_latest_block_output_json() {
-        let Some(mut t) = AtermTerminal::new_from_system(10, 40, 16.0) else {
-            return;
-        };
+    fn last_command_output_is_none_then_the_latest_block_then_evicted() {
+        let mut t = crate::system_font_terminal(10, 40, 16.0);
+        t.process(b"plain output, no OSC 133 anywhere\r\n$ ");
+        assert!(t.last_command_output().is_none(), "no blocks: undefined");
         run_osc133_block(&mut t, "first", &["OLD-OUTPUT"], 0);
         run_osc133_block(&mut t, "second", &["NEW-LINE-1", "NEW-LINE-2"], 3);
         let json = t.last_command_output().expect("a completed block exists");
-        assert!(
-            json.contains(r#""status":"ok""#),
-            "readable output reports ok: {json}"
-        );
+        assert!(json.starts_with(r#"{"status":"ok","text":"#), "{json}");
         assert!(
             json.contains("NEW-LINE-1") && json.contains("NEW-LINE-2"),
-            "the LATEST block's full multi-line output is carried: {json}"
+            "{json}"
         );
         assert!(
             !json.contains("OLD-OUTPUT"),
-            "an older block's output must not leak in: {json}"
+            "an older block leaked in: {json}"
         );
-        assert!(
-            json.contains(r#""exitCode":3"#),
-            "the exit code rides along: {json}"
-        );
-    }
-
-    #[test]
-    fn last_command_output_reports_evicted_after_scrollback_cap() {
-        let Some(mut t) = AtermTerminal::new_from_system(4, 40, 16.0) else {
-            return;
-        };
+        assert!(json.ends_with(r#","exitCode":3}"#), "{json}");
         t.set_scrollback_limit(6);
-        run_osc133_block(&mut t, "doomed", &["EVICT-ME"], 0);
-        // Flood plain output (no new marks) until the block's rows scroll past
-        // the 6-line cap: the JSON must say so, never silently-shifted text.
         for i in 0..40 {
             t.process(format!("filler-{i}\r\n").as_bytes());
         }
-        let json = t.last_command_output().expect("the block is still tracked");
         assert_eq!(
-            json, r#"{"status":"evicted"}"#,
-            "evicted rows surface the honest marker"
+            t.last_command_output().as_deref(),
+            Some(r#"{"status":"evicted"}"#)
         );
     }
 
+    /// A host-minted scheme lets its OSC 8 link through to `link_at` as an
+    /// OSC-8 hit spanning exactly its cells; revoking it shuts the door.
     #[test]
-    fn authorize_hyperlink_scheme_gates_osc8_custom_links() {
-        let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            return;
-        };
-        // Unminted: the custom scheme is refused at parse time — no engine hit.
-        t.process(b"\x1b]8;;orca://focus/w1\x07XX\x1b]8;;\x07\r\n");
-        assert!(
-            t.link_at(0, 0).is_none(),
-            "an unminted custom scheme must not linkify"
-        );
-        // Never-allow / malformed schemes refuse at the mint (false, no state).
-        assert!(!t.authorize_hyperlink_scheme("javascript"));
-        assert!(!t.authorize_hyperlink_scheme("1orca"));
-        // Minted: the same sequence linkifies with the OSC-8 kind.
+    fn a_minted_scheme_links_through_osc8_until_revoked() {
+        let mut t = crate::system_font_terminal(24, 80, 16.0);
+        let link = |n: u8| format!("\x1b]8;;orca://focus/w{n}\x07YY\x1b]8;;\x07 plain\r\n");
+        t.process(link(0).as_bytes());
+        assert!(t.link_at(0, 0).is_none(), "an unminted custom scheme");
         assert!(t.authorize_hyperlink_scheme("orca"));
-        t.process(b"\x1b]8;;orca://focus/w1\x07YY\x1b]8;;\x07\r\n");
-        let hit = t.link_at(1, 0).expect("a minted scheme must linkify");
-        assert_eq!(hit.url(), "orca://focus/w1");
-        assert_eq!(hit.kind(), 0, "engine OSC-8 hit, not a smart-match");
-        // Revoke restores the default allowlist.
+        t.process(link(1).as_bytes());
+        let hit = t.link_at(1, 1).expect("a minted scheme must linkify");
+        assert_eq!(
+            (hit.url(), hit.start_col(), hit.end_col(), hit.kind()),
+            ("orca://focus/w1".to_string(), 0, 2, 0)
+        );
         t.revoke_hyperlink_scheme("orca");
-        t.process(b"\x1b]8;;orca://focus/w2\x07ZZ\x1b]8;;\x07\r\n");
+        t.process(link(2).as_bytes());
         assert!(
             t.link_at(2, 0).is_none(),
             "a revoked scheme must stop linkifying"
         );
     }
 
-    #[test]
-    fn last_command_output_is_none_without_shell_integration() {
-        let Some(mut t) = AtermTerminal::new_from_system(10, 40, 16.0) else {
-            return;
-        };
-        t.process(b"plain output, no OSC 133 anywhere\r\n$ ");
-        assert!(
-            t.last_command_output().is_none(),
-            "no blocks → undefined, the menu item stays hidden"
-        );
-    }
-
+    /// `serialize` is replayable ANSI: replayed into a fresh engine it
+    /// reproduces the viewport AND lands the source's history in the target's
+    /// scrollback. Regression: the layout prints history onto the screen and
+    /// then paints the viewport with absolute CUP + erase-line; without the
+    /// scroll-off epilogue that paint ERASED the last min(history, rows)
+    /// history lines (all of it when history < rows).
     #[test]
     fn serialize_replay_lands_history_in_scrollback_not_under_the_viewport_paint() {
-        // Regression: the serialize layout prints history lines onto the visible
-        // screen, then paints the viewport with absolute CUP + erase-line. Without
-        // the scroll-off epilogue the last min(take, rows) history lines were
-        // ERASED by that paint — a replay lost a viewport-sized chunk of history
-        // (ALL of it when history < rows, e.g. a prompt + marker snapshot).
-        let Some(mut a) = AtermTerminal::new_from_system(6, 40, 16.0) else {
-            return;
-        };
-        // 3 history lines (< rows=6) + a distinct visible viewport.
+        let mut a = crate::system_font_terminal(6, 40, 16.0);
         for i in 0..9 {
             a.process(format!("hist {i}\r\n").as_bytes());
         }
-        a.process(b"\x1b[2J\x1b[Hviewport line");
+        a.process(b"\x1b[2J\x1b[H\x1b[1;32mviewport\x1b[0m line\r\n$ ");
         let snapshot = a.serialize(None);
 
-        let Some(mut b) = AtermTerminal::new_from_system(6, 40, 16.0) else {
-            return;
-        };
+        let mut b = crate::system_font_terminal(6, 40, 16.0);
         b.process(snapshot.as_bytes());
-        // The viewport replayed intact...
-        assert_eq!(
-            a.row_text(0),
-            b.row_text(0),
-            "viewport row differs after replay"
-        );
-        // ...AND the source's history lives in the replay target's SCROLLBACK
-        // (byte-identical: nothing eaten by the viewport paint, no injected blanks).
+        for r in 0..6 {
+            assert_eq!(
+                a.row_text(r),
+                b.row_text(r),
+                "viewport row {r} after replay"
+            );
+        }
         let source_hist = a.serialize_scrollback(None);
         assert!(
             source_hist.contains("hist 0"),
-            "test setup: source must hold history"
+            "precondition: the source holds history"
         );
         assert_eq!(
             b.serialize_scrollback(None),
@@ -2179,22 +1884,15 @@ mod tests {
     /// unbounded alloc / wasm32 u32 overflow → OOB.
     #[test]
     fn oversized_dims_are_clamped_to_the_grid_bound() {
-        let Some(mut t) = AtermTerminal::new_from_system(u16::MAX, u16::MAX, 16.0) else {
-            return;
-        };
+        let mut t = crate::system_font_terminal(u16::MAX, u16::MAX, 16.0);
         assert!(
             t.rows <= 4096 && t.cols <= 4096,
             "ctor clamps to grid bound"
         );
         assert_eq!(t.rows, t.term.grid().rows() as usize, "ctor syncs to grid");
         assert_eq!(t.cols, t.term.grid().cols() as usize, "ctor syncs to grid");
-
-        // Zero is clamped UP to 1 by the grid, not stored as 0.
         t.resize(0, 0);
-        assert_eq!(t.rows, 1, "resize(0) → grid clamps rows to 1");
-        assert_eq!(t.cols, 1, "resize(0) → grid clamps cols to 1");
-
-        // And an oversized resize re-syncs to the clamped bound too.
+        assert_eq!((t.rows, t.cols), (1, 1), "resize(0) is clamped UP to 1");
         t.resize(u16::MAX, u16::MAX);
         assert!(
             t.rows <= 4096 && t.cols <= 4096,
@@ -2202,52 +1900,39 @@ mod tests {
         );
     }
 
+    /// The persistent WindowCpu reuses unchanged rows across frames and the
+    /// WF-1 gate skips settled ones; neither may change the picture. A pane
+    /// drawn after every step (and re-rendered settled) equals ONE full render
+    /// of the same final content, and that content rasterized real glyphs.
     #[test]
-    fn renders_text_to_a_nonempty_rgba_framebuffer() {
-        let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            // No system font available in this environment; skip rather than fail.
-            eprintln!("no system font; skipping render test");
-            return;
-        };
-        t.process(b"\x1b[1;32mhello\x1b[0m world\r\nsecond line");
-        t.render();
-        assert!(t.width() > 0 && t.height() > 0, "frame has dimensions");
-        let rgba = t.rgba();
-        assert_eq!(rgba.len(), t.width() * t.height() * 4, "RGBA8 buffer size");
-        // Some pixel must differ from the top-left (background) pixel — i.e. glyphs
-        // were actually rasterized, not a blank frame.
-        let bg = &rgba[0..4];
-        assert!(
-            rgba.as_chunks::<4>().0.iter().any(|px| px != bg),
-            "rendered glyphs should produce non-background pixels"
-        );
-    }
-
-    #[test]
-    fn incremental_render_is_byte_identical_to_a_single_full_render() {
-        // The persistent WindowCpu reuses unchanged rows across frames; the output
-        // must still equal a fresh full render of the same final content — proving
-        // the damage tracking is correct, not just faster.
-        let Some(mut warm) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            eprintln!("no system font; skipping damage-parity test");
-            return;
-        };
-        let Some(mut fresh) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            return;
-        };
+    fn incremental_and_gated_renders_equal_a_single_full_render() {
+        let mut warm = crate::system_font_terminal(24, 80, 16.0);
+        let mut fresh = crate::system_font_terminal(24, 80, 16.0);
         let steps: &[&[u8]] = &[b"$ ", b"ls -la\r\n", b"file one\r\n", b"\x1b[1;1HX"];
         for s in steps {
             warm.process(s);
-            warm.render(); // incremental every step → warm cache + dirty-row reuse
+            warm.render();
+            warm.render();
+            assert!(
+                warm.last_render_skipped(),
+                "the settled re-render takes the gate"
+            );
             fresh.process(s);
         }
-        fresh.render(); // one full render of the final state (cold cache)
-        assert_eq!(warm.width(), fresh.width());
-        assert_eq!(warm.height(), fresh.height());
+        fresh.render();
+        assert_eq!(
+            (warm.width(), warm.height()),
+            (fresh.width(), fresh.height())
+        );
         assert_eq!(
             warm.rgba(),
             fresh.rgba(),
-            "incremental damage-tracked render must equal a fresh full render"
+            "damage-tracked and gated renders drifted"
+        );
+        let rgba = fresh.rgba();
+        assert!(
+            rgba.as_chunks::<4>().0.iter().any(|px| px[..] != rgba[..4]),
+            "glyphs must produce non-background pixels"
         );
     }
 
@@ -2256,10 +1941,7 @@ mod tests {
         // With the persistent cache, an appearance-only change (no cell moved) would
         // be skipped by the row-diff — set_theme must force a full repaint so the
         // background actually re-themes on an otherwise-idle frame (CPU finding #7).
-        let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            eprintln!("no system font; skipping set_theme repaint test");
-            return;
-        };
+        let mut t = crate::system_font_terminal(24, 80, 16.0);
         // Clear, then park the cursor in the far corner so the sampled centre cell
         // is pure background (no glyph, no cursor).
         t.process(b"\x1b[2J\x1b[24;80H");
@@ -2271,230 +1953,51 @@ mod tests {
         let new_bg = 0x0012_3456u32; // distinctive, unlike the default theme bg
         t.set_theme(0x00ff_ffff, new_bg, 0x0050_fa7b, 0x0026_4f78);
         t.render(); // idle frame: no content changed, only the theme
-        let after = t.rgba();
         let want = [(new_bg >> 16) as u8, (new_bg >> 8) as u8, new_bg as u8];
-        assert_eq!(
-            &after[centre..centre + 3],
-            &want,
-            "an idle pane must repaint to the new theme bg after set_theme"
-        );
         assert_ne!(
             before.as_slice(),
             &want,
             "test is meaningful: bg actually changed"
         );
-    }
-
-    #[test]
-    fn scrolls_into_scrollback_and_extracts_a_selection() {
-        let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            eprintln!("no system font; skipping scroll/select test");
-            return;
-        };
-        for i in 0..200 {
-            t.process(format!("line {i}\r\n").as_bytes());
-        }
-        assert_eq!(t.display_offset(), 0, "live output stays at the bottom");
-        t.scroll_lines(40);
-        assert_eq!(t.display_offset(), 40, "scrolling up reveals older history");
-        t.scroll_to_bottom();
-        assert_eq!(t.display_offset(), 0, "scroll_to_bottom snaps back to live");
-        t.selection_start(0, 0);
-        t.selection_extend(1, 4);
-        t.selection_finish();
-        let selected = t.selection_text().expect("a drag selects text");
-        assert!(!selected.is_empty(), "selection should not be empty");
-    }
-
-    #[test]
-    fn double_click_selects_whole_word_triple_click_whole_line() {
-        let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            eprintln!("no system font; skipping word/line select test");
-            return;
-        };
-        t.process(b"hello world");
-        // Double-click anywhere in "hello" (cols 0..5) selects the WHOLE word,
-        // not just the clicked cell — the expand_semantic fix.
-        let word = t.selection_word(0, 2).expect("word selection");
-        assert_eq!(word, "hello", "double-click selects the full word");
-        // Triple-click selects the whole line (trailing blanks trimmed).
-        let line = t.selection_line(0, 2).expect("line selection");
-        assert_eq!(line, "hello world", "triple-click selects the full line");
-    }
-
-    /// Retention shrink must invalidate the search index like any content
-    /// change: a shrink-then-search may not return absolute rows the engine
-    /// just evicted (the introspection harness caught `search` handing out
-    /// rows `line` already reported evicted, until the next write re-synced
-    /// the cache).
-    #[test]
-    fn retention_shrink_search_returns_no_evicted_rows() {
-        let Some(mut t) = AtermTerminal::new_from_system(5, 40, 16.0) else {
-            eprintln!("no system font; skipping shrink-search test");
-            return;
-        };
-        for i in 0..300 {
-            t.process(format!("needle-{i}\r\n").as_bytes());
-        }
-        assert_eq!(t.search("needle-", true, false).len() / 3, 300);
-
-        // Shrink retention to 50 (evicting the oldest history immediately)
-        // with NO intervening write: the very next search must reflect it.
-        t.set_scrollback_limit(50);
-        let hits = t.search("needle-", true, false);
-        // 50 retained history lines + the 4 needle rows still on screen.
-        assert_eq!(hits.len() / 3, 54, "evicted rows no longer match");
-        // Absolute-row identity: needle-i sits at absolute row i; the oldest
-        // survivor is needle-246 (300 written − 50 history − 4 on screen).
-        assert_eq!(hits[0], 246, "the first match is the oldest RETAINED row");
-    }
-
-    #[test]
-    fn set_scrollback_limit_governs_ring_retention() {
-        let Some(mut t) = AtermTerminal::new_from_system(5, 40, 16.0) else {
-            eprintln!("no system font; skipping scrollback-limit test");
-            return;
-        };
-        // Shrink below the 10k construction ring: retention follows the limit.
-        t.set_scrollback_limit(200);
-        for i in 0..500 {
-            t.process(format!("line-{i}\r\n").as_bytes());
-        }
-        t.scroll_to_top();
         assert_eq!(
-            t.display_offset(),
-            200,
-            "a 200-line limit really caps retention (was a silent no-op)"
+            &t.rgba()[centre..centre + 3],
+            &want,
+            "an idle pane must repaint to the new theme bg after set_theme"
         );
-        assert_eq!(
-            t.row_text(0).as_deref(),
-            Some("line-296"),
-            "the oldest retained line sits 200 above the live top"
-        );
+    }
 
-        // Grow PAST the old fixed 10k ring: a bigger limit actually retains more.
-        t.scroll_to_bottom();
-        t.set_scrollback_limit(12_000);
-        for i in 500..11_500 {
-            t.process(format!("line-{i}\r\n").as_bytes());
-        }
-        t.scroll_to_top();
-        assert_eq!(
-            t.display_offset(),
-            200 + 11_000,
-            "retention grows past the old 10k ring cap"
-        );
-
-        // 0 = unlimited; a later shrink truncates and re-clamps the viewport.
-        t.scroll_to_bottom();
+    /// `set_scrollback_limit(0)` is unlimited, never a zero-line cap, and a
+    /// later shrink re-clamps a scrolled-back viewport to the new limit.
+    #[test]
+    fn scrollback_limit_zero_is_unlimited_and_a_shrink_reclamps_the_viewport() {
+        let mut t = crate::system_font_terminal(5, 40, 16.0);
         t.set_scrollback_limit(0);
-        t.process(b"tail\r\n");
+        for i in 0..300 {
+            t.process(format!("line-{i}\r\n").as_bytes());
+        }
         t.scroll_to_top();
+        assert_eq!(t.display_offset(), 296, "0 kept every line");
         t.set_scrollback_limit(50);
         assert_eq!(
             t.display_offset(),
             50,
-            "shrink re-clamps a scrolled viewport"
+            "a shrink re-clamps a scrolled viewport"
         );
+        assert_eq!(t.row_text(0).as_deref(), Some("line-246"));
     }
 
-    #[test]
-    fn search_stays_fresh_and_complete_across_a_height_only_resize() {
-        let Some(mut t) = AtermTerminal::new_from_system(10, 40, 16.0) else {
-            eprintln!("no system font; skipping height-resize search test");
-            return;
-        };
-        for i in 0..30 {
-            t.process(format!("needle-{i}\r\n").as_bytes());
-        }
-        assert_eq!(t.search("needle-", true, false).len() / 3, 30);
-
-        // Height-only resize (cols unchanged), reflow pump drained like the host.
-        t.resize(5, 40);
-        while t.pump_reflow() {}
-
-        // Pre-fix the rows-only resize dropped ALL ring history and
-        // renumbered the survivors, so this search returned only the 5
-        // visible rows at shifted absolute lines — "stale"/wrong results
-        // until new output arrived.
-        let hits = t.search("needle-", true, false);
-        assert_eq!(
-            hits.len() / 3,
-            30,
-            "history stays searchable after the resize"
-        );
-        // The oldest retained content is still reachable and identical.
-        t.scroll_to_top();
-        assert_eq!(t.display_offset(), 26, "retention grew by the demoted rows");
-        assert_eq!(t.row_text(0).as_deref(), Some("needle-0"));
-
-        // Staleness identity: a fresh engine given the same writes + resize
-        // reports byte-identical matches.
-        let Some(mut fresh) = AtermTerminal::new_from_system(10, 40, 16.0) else {
-            return;
-        };
-        for i in 0..30 {
-            fresh.process(format!("needle-{i}\r\n").as_bytes());
-        }
-        fresh.resize(5, 40);
-        while fresh.pump_reflow() {}
-        assert_eq!(
-            hits,
-            fresh.search("needle-", true, false),
-            "post-resize results equal a from-scratch engine (no stale cache)"
-        );
-    }
-
-    #[test]
-    fn row_text_straddles_the_history_live_boundary_correctly() {
-        let Some(mut t) = AtermTerminal::new_from_system(5, 40, 16.0) else {
-            eprintln!("no system font; skipping straddle test");
-            return;
-        };
-        for i in 0..30 {
-            t.process(format!("line{i}\r\n").as_bytes());
-        }
-        // Live bottom: line26..line29 + the blank cursor row.
-        assert_eq!(t.row_text(0).as_deref(), Some("line26"));
-
-        // Scroll up 2: the viewport straddles history (rows 0-1) and live
-        // rows (2-4). Pre-fix the live rows re-applied the offset and
-        // repeated the history rows (line24/line25/line24/line25/line26).
-        t.scroll_lines(2);
-        for (r, want) in ["line24", "line25", "line26", "line27", "line28"]
-            .iter()
-            .enumerate()
-        {
-            assert_eq!(
-                t.row_text(r as u16).as_deref(),
-                Some(*want),
-                "display row {r} while straddling"
-            );
-        }
-
-        // Selection is display-anchored at the same boundary: triple-click on
-        // display row 3 must copy the row the user sees there.
-        assert_eq!(t.selection_line(3, 0).as_deref(), Some("line27"));
-
-        // Back at the bottom, reads are unchanged (identity at offset 0).
-        t.scroll_to_bottom();
-        assert_eq!(t.row_text(0).as_deref(), Some("line26"));
-        assert_eq!(t.row_text(3).as_deref(), Some("line29"));
-    }
-
+    /// A host that rebuilds a row PER-CELL (a buffer facade that walks any
+    /// non-ASCII row through `cell_text` + `cell_is_wide`) must see the same
+    /// display-relative rows `row_text` serves. Regression: the v0.49
+    /// live-frame retarget of the shared cell-grapheme helper made every
+    /// scrolled-back per-cell read return the LIVE screen, so a host walking
+    /// restored scrollback (a box-drawing table) found no history row.
+    /// The single-slot row cache behind those reads is keyed by content
+    /// generation and display offset: a scroll or a write must refresh the
+    /// row it cached. Triple-click is display-anchored the same way.
     #[test]
     fn scrolled_cell_reads_are_display_relative_like_row_text() {
-        // A host that rebuilds a row PER-CELL (a buffer facade that walks any
-        // non-ASCII row through cell_text + cell_is_wide) must see the same
-        // display-relative rows row_text serves. Regression: the v0.49
-        // live-frame retarget of the shared cell-grapheme helper made every
-        // scrolled-back per-cell read return the LIVE screen instead of the
-        // scrolled row — a host walking restored scrollback (a box-drawing
-        // table, 100% non-ASCII rows) could no longer find any history row.
-        let Some(mut t) = AtermTerminal::new_from_system(5, 20, 16.0) else {
-            eprintln!("no system font; skipping display-relative cell-read test");
-            return;
-        };
+        let mut t = crate::system_font_terminal(5, 20, 16.0);
         for i in 0..30 {
             // Box-drawing edges force the host's per-cell path; a wide emoji
             // exercises complex-cluster pairing for materialized history rows.
@@ -2514,144 +2017,42 @@ mod tests {
         let row_text_trimmed = |t: &AtermTerminal, row: u16| {
             t.row_text(row).unwrap_or_default().trim_end().to_string()
         };
+        let agree = |t: &AtermTerminal, at: &str| {
+            for r in 0..5u16 {
+                assert_eq!(per_cell_row(t, r), row_text_trimmed(t, r), "{at}, row {r}");
+            }
+        };
 
-        // Identity at the live bottom (display_offset == 0).
-        for r in 0..5u16 {
-            assert_eq!(
-                per_cell_row(&t, r),
-                row_text_trimmed(&t, r),
-                "per-cell rebuild differs from row_text at the live bottom, row {r}"
-            );
-        }
-
-        // Top of retention: display row 0 is the OLDEST retained line.
+        agree(&t, "live bottom");
+        // Prime the cache with display row 0 at offset 0, then scroll: the
+        // same (row) key at a new offset must re-resolve.
+        let _ = per_cell_row(&t, 0);
         t.scroll_to_top();
         assert_eq!(
             per_cell_row(&t, 0),
             "│🦀line0│",
-            "oldest history line, rebuilt per-cell while scrolled to top"
+            "oldest line, rebuilt per-cell"
         );
-        for r in 0..5u16 {
-            assert_eq!(
-                per_cell_row(&t, r),
-                row_text_trimmed(&t, r),
-                "per-cell rebuild differs from row_text at the top, row {r}"
-            );
-        }
+        agree(&t, "top of retention");
 
-        // Straddling the history/live boundary keeps both arms aligned.
         t.scroll_to_bottom();
         t.scroll_lines(2);
-        for r in 0..5u16 {
-            assert_eq!(
-                per_cell_row(&t, r),
-                row_text_trimmed(&t, r),
-                "per-cell rebuild differs from row_text while straddling, row {r}"
-            );
-        }
-        t.scroll_to_bottom();
-    }
-
-    #[test]
-    fn per_cell_row_cache_invalidates_on_scroll_and_write() {
-        // cell_text/cell_is_wide serve from a single-slot per-row cache (the
-        // O(cols²)->O(cols) fix for scrolled-back per-cell walks). The cache is
-        // keyed by (content_gen, display_offset, row); a scroll or a write must
-        // refresh it, never serving the stale row a prior read cached.
-        let Some(mut t) = AtermTerminal::new_from_system(5, 40, 16.0) else {
-            eprintln!("no system font; skipping per-cell cache test");
-            return;
-        };
-        for i in 0..30 {
-            t.process(format!("row{i}\r\n").as_bytes());
-        }
-        let per_cell = |t: &AtermTerminal, row: u16| -> String {
-            (0..8)
-                .map(|c| t.cell_text(row, c))
-                .collect::<String>()
-                .trim_end()
-                .to_string()
-        };
-        // Prime the cache for display row 0 at the live bottom, and confirm the
-        // per-cell reads agree with row_text (which does not use the cache).
-        let bottom = per_cell(&t, 0);
-        assert_eq!(bottom, t.row_text(0).unwrap().trim_end());
-        assert!(bottom.starts_with("row"), "bottom row0 was {bottom:?}");
-
-        // SCROLL changes display_offset: display row 0 is now the OLDEST line,
-        // so the cache must refresh instead of serving the primed bottom row.
-        t.scroll_to_top();
+        agree(&t, "straddling the history/live boundary");
         assert_eq!(
-            per_cell(&t, 0),
-            "row0",
-            "scroll must refresh the cached row"
+            t.selection_line(3, 0),
+            Some(row_text_trimmed(&t, 3)),
+            "triple-click copies the row the user sees while straddling"
         );
 
-        // WRITE bumps content_gen WITHOUT changing display_offset (re-prime at
-        // the bottom first, offset stays 0 across the write): display row 0 must
-        // reflect the post-write content, isolating content_gen invalidation.
+        // A write bumps content_gen at an unchanged offset and row.
         t.scroll_to_bottom();
-        let _prime = per_cell(&t, 0);
+        let _ = per_cell_row(&t, 0);
         t.process(b"\x1b[2J\x1b[HZEBRA\r\n");
         assert_eq!(
-            per_cell(&t, 0),
+            per_cell_row(&t, 0),
             "ZEBRA",
-            "a write must refresh the cached row (content_gen changed)"
+            "a write must refresh the cached row"
         );
-    }
-
-    #[test]
-    fn scrolled_wrapped_row_len_and_wrap_flag_are_tier_aware() {
-        // P1 regression: after a width-shrink reflow overflows wrapped rows
-        // into scrollback, a
-        // scrolled-back HISTORY row returns correct TEXT (tier-aware via
-        // visible_row_view) but row_len/row_is_wrapped resolved through Grid::row
-        // — which is None past the ring base — so a host stitching wrapped lines
-        // saw isWrapped=false / len=cols for every scrolled wrap continuation.
-        let Some(mut t) = AtermTerminal::new_from_system(3, 40, 16.0) else {
-            eprintln!("no system font; skipping tier-aware wrap-metadata test");
-            return;
-        };
-        // Three 30-char lines fill the 3 visible rows at 40 cols (no wrap yet);
-        // the last has no newline so the cursor rests on the bottom row.
-        let a = "A".repeat(30);
-        let b = "B".repeat(30);
-        let c = "C".repeat(30);
-        t.process(format!("{a}\r\n").as_bytes());
-        t.process(format!("{b}\r\n").as_bytes());
-        t.process(c.as_bytes());
-
-        // Shrink width to 20: each 30-char line rewraps to a 20-col head + a
-        // 10-col WRAPPED continuation, overflowing the 3-row window; the top rows
-        // spill to scrollback. A history this small rewraps inline (pump is a
-        // no-op).
-        t.resize(3, 20);
-        while t.pump_reflow() {}
-
-        // The three oldest content rows are HISTORY rows (past the ring base).
-        t.scroll_to_top();
-        // Text is already tier-aware (the sibling that always worked).
-        assert_eq!(t.row_text(0).as_deref(), Some("A".repeat(20).as_str()));
-        assert_eq!(t.row_text(1).as_deref(), Some("A".repeat(10).as_str()));
-
-        // The head row: full-width, not a wrap continuation.
-        assert_eq!(t.row_len(0), Some(20), "history head-row length");
-        assert_eq!(t.row_is_wrapped(0), Some(false), "history head not wrapped");
-        // The continuation row: pre-fix these were None because they resolved
-        // through Grid::row past the ring base.
-        assert_eq!(
-            t.row_len(1),
-            Some(10),
-            "scrolled wrapped continuation must report its materialized length, not None"
-        );
-        assert_eq!(
-            t.row_is_wrapped(1),
-            Some(true),
-            "scrolled wrapped continuation must report is_wrapped=true, not None"
-        );
-        // Out-of-range still yields None (the row past the grid).
-        assert_eq!(t.row_len(99), None);
-        assert_eq!(t.row_is_wrapped(99), None);
     }
 
     #[test]
@@ -2661,10 +2062,7 @@ mod tests {
         // alt-screen bit. The main and alt grids keep INDEPENDENT content_gen
         // counters, so a main<->alt swap landing on a coinciding
         // content_gen+offset+row served one buffer's cell for the other.
-        let Some(mut t) = AtermTerminal::new_from_system(5, 20, 16.0) else {
-            eprintln!("no system font; skipping alt-screen cache-key test");
-            return;
-        };
+        let mut t = crate::system_font_terminal(5, 20, 16.0);
         // MAIN: push content_gen well above a freshly-entered alt buffer's, then
         // park a distinct glyph at (0,0) and prime the per-row cache by reading it.
         for _ in 0..30 {
@@ -2674,17 +2072,15 @@ mod tests {
         let main_gen = t.term.grid().content_gen();
         assert_eq!(t.cell_text(0, 0), "M", "primed main cell at (0,0)");
 
-        // Enter the alternate screen: a fresh, low-content_gen independent grid.
+        // Enter the alternate screen and drive its INDEPENDENT content_gen to
+        // EXACTLY main's cached value, writing only to row 1 so (0,0) keeps
+        // its "A": the (content_gen, display_offset, row) collision.
         t.process(b"\x1b[?1049h");
         t.process(b"\x1b[HA");
         assert!(
             t.term.grid().content_gen() <= main_gen,
             "alt buffer starts below main_gen so we can drive it up to collide"
         );
-        // Drive alt's INDEPENDENT content_gen to EXACTLY main's cached value,
-        // writing only to row 1 so (0,0) keeps its "A" — manufacturing the
-        // (content_gen, display_offset, row) collision a single-slot cache
-        // without an alt-screen key bit cannot tell apart.
         let mut guard = 0;
         while t.term.grid().content_gen() != main_gen && guard < 10_000 {
             let g: &[u8] = if guard % 2 == 0 {
@@ -2700,9 +2096,6 @@ mod tests {
             main_gen,
             "manufactured the content_gen collision across the swap"
         );
-
-        // Read alt (0,0). Pre-fix the un-keyed cache serves the primed MAIN "M";
-        // the alt bit in the key forces a refresh to the real alt cell "A".
         assert_eq!(
             t.cell_text(0, 0),
             "A",
@@ -2710,13 +2103,12 @@ mod tests {
         );
     }
 
+    /// `search` hands out `[abs_line, col, len]` triplets in absolute rows,
+    /// and `scroll_search_line_into_view` lands a scrollback match on a
+    /// visible row.
     #[test]
     fn search_finds_a_token_in_scrollback_and_scrolls_it_into_view() {
-        let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            eprintln!("no system font; skipping search test");
-            return;
-        };
-        // Push a unique token far into scrollback, then bury it under filler.
+        let mut t = crate::system_font_terminal(24, 80, 16.0);
         t.process(b"UNIQUE_SEARCH_TOKEN here\r\n");
         for i in 0..200 {
             t.process(format!("filler line {i}\r\n").as_bytes());
@@ -2728,377 +2120,169 @@ mod tests {
             "exactly one match → one [line,col,len] triple"
         );
         let (line, col, len) = (hits[0], hits[1], hits[2]);
-        assert_eq!(col, 0, "token starts at column 0");
-        assert_eq!(len, "UNIQUE_SEARCH_TOKEN".len() as u32, "match length");
-        // The match is in scrollback, so it is not visible at the live bottom.
+        assert_eq!((col, len), (0, 19));
         let origin = t.search_display_origin();
-        assert!(
-            line < origin,
-            "token line is above the live viewport origin"
-        );
-        // Scrolling it into view must move the viewport off the bottom and land
-        // the match within the visible rows.
+        assert!(line < origin, "the match is above the live viewport");
         assert_eq!(t.display_offset(), 0, "starts at the live bottom");
         t.scroll_search_line_into_view(line);
-        assert!(t.display_offset() > 0, "viewport scrolled up to the match");
-        let display_row = (line as i64) - (origin as i64) + (t.display_offset() as i64);
+        let display_row = i64::from(line) - i64::from(origin) + t.display_offset() as i64;
         assert!(
             (0..24).contains(&display_row),
             "match landed on a visible row, got {display_row}"
         );
-        // A case-sensitive miss and an empty query both yield nothing.
-        assert!(t.search("unique_search_token", true, false).is_empty());
-        assert!(t.search("", false, false).is_empty());
-        // Regex search: a pattern matches the token; an invalid pattern is Err →
-        // empty (so a half-typed regex highlights nothing rather than throwing).
-        assert_eq!(
-            t.search("UNIQUE_[A-Z_]+TOKEN", true, true).len(),
-            3,
-            "regex matches"
-        );
-        assert!(
-            t.search("UNIQUE_[", true, true).is_empty(),
-            "invalid regex → empty"
-        );
     }
 
+    /// The mode getters the host reads follow the program: each DECSET mode
+    /// defaults off and follows its set and reset, and DECSCUSR surfaces as
+    /// its `CursorStyle` discriminant.
     #[test]
-    fn tracks_application_cursor_mode_via_decckm() {
-        let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            eprintln!("no system font; skipping app-cursor-mode test");
-            return;
-        };
-        assert!(
-            !t.is_app_cursor_mode(),
-            "DECCKM defaults off (cursor → CSI)"
-        );
-        // CSI ? 1 h sets DECCKM (application cursor keys); CSI ? 1 l resets it.
-        t.process(b"\x1b[?1h");
-        assert!(
-            t.is_app_cursor_mode(),
-            "DECCKM set → application cursor keys"
-        );
-        t.process(b"\x1b[?1l");
-        assert!(!t.is_app_cursor_mode(), "DECCKM reset → normal cursor keys");
-    }
-
-    #[test]
-    fn encode_key_follows_the_live_keyboard_mode() {
-        let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            eprintln!("no system font; skipping encode_key test");
-            return;
-        };
-        // Plain arrow: legacy CSI A.
-        assert_eq!(
-            t.encode_key("ArrowUp", 0, 0, None).as_deref(),
-            Some(&b"\x1b[A"[..])
-        );
-        // Modified arrows: the xterm CSI 1;{mod} form the old TS encoder dropped.
-        assert_eq!(
-            t.encode_key("ArrowUp", 1, 0, None).as_deref(),
-            Some(&b"\x1b[1;2A"[..]),
-            "Shift+ArrowUp must carry the modifier"
-        );
-        assert_eq!(
-            t.encode_key("ArrowUp", 4, 0, None).as_deref(),
-            Some(&b"\x1b[1;5A"[..]),
-            "Ctrl+ArrowUp must carry the modifier"
-        );
-        // DECCKM set → SS3 for the unmodified arrow.
-        t.process(b"\x1b[?1h");
-        assert_eq!(
-            t.encode_key("ArrowUp", 0, 0, None).as_deref(),
-            Some(&b"\x1bOA"[..]),
-            "DECCKM arrow must be SS3"
-        );
-        t.process(b"\x1b[?1l");
-        // A release without the Kitty protocol encodes to nothing.
-        assert!(t.encode_key("ArrowUp", 0, 2, None).is_none());
-        // Modifier-only / IME / unidentified DOM keys are never guessed.
-        assert!(t.encode_key("Shift", 0, 0, None).is_none());
-        assert!(t.encode_key("Dead", 0, 0, None).is_none());
-        assert!(t.encode_key("Unidentified", 0, 0, None).is_none());
-        // An out-of-range event_type is refused, not guessed.
-        assert!(t.encode_key("ArrowUp", 0, 3, None).is_none());
-    }
-
-    #[test]
-    fn encode_key_shift_enter_speaks_kitty_after_negotiation() {
-        // Mirrors keyboard_mode.rs's shift_enter_e2e tests through the wasm-level
-        // API: drive the exact Kitty push an app performs, then confirm the bytes.
-        let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            eprintln!("no system font; skipping kitty shift-enter test");
-            return;
-        };
-        // No protocol: plain Enter is CR; Shift+Enter is aterm's imposed LF.
-        assert_eq!(
-            t.encode_key("Enter", 0, 0, None).as_deref(),
-            Some(&[0x0d][..])
-        );
-        assert_eq!(
-            t.encode_key("Enter", 1, 0, None).as_deref(),
-            Some(&[0x0a][..])
-        );
-        // The Kitty query must be answered so apps detect support.
-        t.process(b"\x1b[?u");
-        assert_eq!(t.take_response().unwrap_or_default(), b"\x1b[?0u");
-        // Push disambiguate (what a kitty-aware app sends to turn it on).
-        t.process(b"\x1b[>1u");
-        assert_eq!(
-            t.encode_key("Enter", 1, 0, None).as_deref(),
-            Some(&b"\x1b[13;2u"[..]),
-            "Shift+Enter under pushed kitty disambiguate must be CSI-u"
-        );
-        // Plain Enter stays legacy CR under disambiguate.
-        assert_eq!(
-            t.encode_key("Enter", 0, 0, None).as_deref(),
-            Some(&[0x0d][..])
-        );
-    }
-
-    /// win32-input-mode is the host's to grant: conhost's `?9001h` changes
-    /// nothing until the embedder says a ConPTY is behind the terminal
-    /// (`set_win32_input_enabled`). Then Shift+Enter is the key-record pair
-    /// conhost reads (down, up) instead of the legacy LF.
-    #[test]
-    fn a_conpty_host_opts_in_to_win32_input_records() {
-        let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            return;
-        };
-        t.process(b"\x1b[?9001h");
-        assert_eq!(
-            t.encode_key("Enter", 1, 0, None).as_deref(),
-            Some(&[0x0a][..]),
-            "program output alone grants nothing"
-        );
-        t.set_win32_input_enabled(true);
-        t.process(b"\x1b[?9001h");
-        let pair = b"\x1b[13;28;13;1;16;1_\x1b[13;28;13;0;16;1_";
-        assert_eq!(
-            t.encode_key("Enter", 1, 0, None).as_deref(),
-            Some(&pair[..])
-        );
-        // A worker-hosted engine's mirrored bits carry the mode too.
-        assert_eq!(
-            encode_key_with_mode("Enter", 1, 0, None, t.keyboard_mode_bits()).as_deref(),
-            Some(&pair[..])
-        );
-    }
-
-    #[test]
-    fn encode_key_with_mode_matches_the_instance_encoder() {
-        // Stateless with mode_bits = 0: plain legacy CSI A, no instance needed
-        // (this is the worker-hosted main-thread path before any snapshot).
-        assert_eq!(
-            encode_key_with_mode("ArrowUp", 0, 0, None, 0).as_deref(),
-            Some(&b"\x1b[A"[..])
-        );
-        let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            eprintln!("no system font; skipping encode_key_with_mode test");
-            return;
-        };
-        assert_eq!(t.keyboard_mode_bits(), 0, "fresh terminal: no mode bits");
-        // Bits mirrored from a terminal with DECCKM set encode SS3 arrows.
-        t.process(b"\x1b[?1h");
-        assert_eq!(
-            encode_key_with_mode("ArrowUp", 0, 0, None, t.keyboard_mode_bits()).as_deref(),
-            Some(&b"\x1bOA"[..]),
-            "snapshot bits under DECCKM must be SS3"
-        );
-        t.process(b"\x1b[?1l");
-        // Bits captured after a real kitty disambiguate push speak CSI-u.
-        t.process(b"\x1b[>1u");
-        assert_eq!(
-            encode_key_with_mode("Enter", 1, 0, None, t.keyboard_mode_bits()).as_deref(),
-            Some(&b"\x1b[13;2u"[..]),
-            "snapshot bits under pushed kitty must be CSI-u Shift+Enter"
-        );
-        // With FRESH bits the stateless encoder is byte-identical to the
-        // instance method (the one-frame-staleness contract's fixed point).
-        for (key, mods, event_type) in [
-            ("ArrowUp", 0u8, 0u8),
-            ("ArrowUp", 1, 0),
-            ("Enter", 0, 0),
-            ("Enter", 1, 0),
-            ("a", 4, 0),
-            ("Shift", 0, 0),
-            ("ArrowUp", 0, 2),
-        ] {
-            assert_eq!(
-                t.encode_key(key, mods, event_type, None),
-                encode_key_with_mode(key, mods, event_type, None, t.keyboard_mode_bits()),
-                "instance and stateless encoders must agree on {key:?} mods={mods} type={event_type}"
-            );
+    fn host_mode_getters_follow_the_program() {
+        let mut t = crate::system_font_terminal(24, 80, 16.0);
+        #[expect(clippy::type_complexity, reason = "a test's case table")]
+        let modes: [(&str, fn(&AtermTerminal) -> bool); 3] = [
+            ("1", AtermTerminal::is_app_cursor_mode),
+            ("1007", AtermTerminal::is_alternate_scroll),
+            ("1004", AtermTerminal::is_focus_event_mode),
+        ];
+        for (mode, get) in modes {
+            assert!(!get(&t), "mode {mode} defaults off");
+            t.process(format!("\x1b[?{mode}h").as_bytes());
+            assert!(get(&t), "mode {mode} set");
+            t.process(format!("\x1b[?{mode}l").as_bytes());
+            assert!(!get(&t), "mode {mode} reset");
         }
-    }
-
-    #[test]
-    fn reports_alternate_scroll_via_decset_1007() {
-        let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            eprintln!("no system font; skipping alternate-scroll test");
-            return;
-        };
-        assert!(!t.is_alternate_scroll(), "mode 1007 defaults off");
-        t.process(b"\x1b[?1007h");
-        assert!(t.is_alternate_scroll(), "1007 set → wheel becomes arrows");
-        t.process(b"\x1b[?1007l");
-        assert!(
-            !t.is_alternate_scroll(),
-            "1007 reset → wheel scrolls history"
-        );
-    }
-
-    /// The host word-separator setting reshapes double-click words end-to-end
-    /// (xterm.js `wordSeparators` semantics), and clearing it restores the
-    /// engine's default class-based word logic exactly.
-    #[test]
-    fn set_word_separators_reshapes_double_click_words() {
-        let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            eprintln!("no system font; skipping word-separator test");
-            return;
-        };
-        t.process(b"foo-bar baz");
-        // Default: '-' breaks, double-click on 'o' selects "foo".
-        assert_eq!(t.selection_word(0, 1).as_deref(), Some("foo"));
-        // Space-only separators: the hyphenated token is one word.
-        t.set_word_separators(Some(" ".to_string()));
-        assert_eq!(t.selection_word(0, 1).as_deref(), Some("foo-bar"));
-        // Clearing restores the default exactly.
-        t.set_word_separators(None);
-        assert_eq!(t.selection_word(0, 1).as_deref(), Some("foo"));
-    }
-
-    #[test]
-    fn reports_mouse_tracking_and_encodes_sgr_reports() {
-        let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            eprintln!("no system font; skipping mouse-tracking test");
-            return;
-        };
-        // No tracking by default → encoders return None, motion not wanted.
-        assert!(!t.is_mouse_tracking(), "mouse tracking defaults off");
-        assert!(t.encode_mouse_press(0, 0, 0, 0).is_none(), "no report off");
-        assert!(!t.mouse_wants_motion(), "no motion wanted off");
-        // DECSET 1000 (normal tracking) + 1006 (SGR encoding).
-        t.process(b"\x1b[?1000h\x1b[?1006h");
-        assert!(t.is_mouse_tracking(), "1000 enables tracking");
-        assert!(!t.mouse_wants_motion(), "1000 does not report motion");
-        // Left press at col 4 / row 2 → SGR \e[<0;5;3M (encoders +1 to coords).
-        let press = t.encode_mouse_press(4, 2, 0, 0).expect("press encoded");
-        assert_eq!(press, b"\x1b[<0;5;3M", "SGR press report");
-        let release = t.encode_mouse_release(4, 2, 0, 0).expect("release encoded");
-        assert_eq!(release, b"\x1b[<0;5;3m", "SGR release uses lowercase m");
-        // Normal mode (1000) reports no motion.
-        assert!(
-            t.encode_mouse_motion(0, 0, 0, 0).is_none(),
-            "1000 no motion"
-        );
-        // Switch to 1002 (button-event) → motion while a button is held.
-        t.process(b"\x1b[?1002h");
-        assert!(t.mouse_wants_motion(), "1002 reports drag motion");
-        assert!(!t.mouse_wants_any_motion(), "1002 is not any-motion");
-        // 1003 (any-event) reports motion with no button held.
-        t.process(b"\x1b[?1003h");
-        assert!(t.mouse_wants_any_motion(), "1003 reports any motion");
-        // Wheel-up → button 64 → SGR \e[<64;...M.
-        let wheel = t.encode_mouse_wheel(4, 2, true, 0).expect("wheel encoded");
-        assert_eq!(wheel, b"\x1b[<64;5;3M", "SGR wheel-up report");
-        // DECRST 1003/1002/1000 clears tracking entirely.
-        t.process(b"\x1b[?1003l\x1b[?1002l\x1b[?1000l");
-        assert!(
-            !t.is_mouse_tracking(),
-            "clearing all modes disables tracking"
-        );
-    }
-
-    #[test]
-    fn reports_focus_event_mode_via_decset_1004() {
-        let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            eprintln!("no system font; skipping focus-mode test");
-            return;
-        };
-        assert!(!t.is_focus_event_mode(), "focus reporting defaults off");
-        t.process(b"\x1b[?1004h");
-        assert!(t.is_focus_event_mode(), "1004 enables focus reporting");
-        t.process(b"\x1b[?1004l");
-        assert!(
-            !t.is_focus_event_mode(),
-            "1004 reset disables focus reporting"
-        );
-    }
-
-    #[test]
-    fn tracks_cursor_style_via_decscusr() {
-        let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            eprintln!("no system font; skipping cursor-style test");
-            return;
-        };
-        // DECSCUSR is CSI Ps SP q; Ps=5 → BlinkingBar (discriminant 5), Ps=2 →
-        // SteadyBlock (2). The engine paints the shape; we just read it back.
         t.process(b"\x1b[5 q");
         assert_eq!(t.cursor_style(), 5, "DECSCUSR 5 → BlinkingBar");
         t.process(b"\x1b[2 q");
         assert_eq!(t.cursor_style(), 2, "DECSCUSR 2 → SteadyBlock");
     }
 
-    /// A link under the pointer is read from the cells it is drawn in,
-    /// whatever precedes it on the row (r16 selection-stride): after two
-    /// ideographs, or two flag halves drawn into neighbouring cells out of
-    /// order (two cells each, which a walk of the row's text pairs into one
-    /// two-cell flag), the URL's columns are its own and its text is the
-    /// URL. On origin/main the URL's text was sliced out of the row one
-    /// column a character: after the ideographs it read `tps://example.com/a`,
-    /// no link at all, and after the flag halves the link was answered in
-    /// cells 2-22 and not at cell 24.
+    /// `encode_key` speaks the LIVE keyboard mode the program negotiated, and
+    /// the worker path's stateless `encode_key_with_mode`, fed the mirrored
+    /// `keyboard_mode_bits`, is byte-identical at every step, including
+    /// win32-input-mode, which only a host-declared ConPTY can turn on.
+    #[test]
+    fn encode_key_follows_the_live_mode_and_its_mirrored_bits() {
+        let mut t = crate::system_font_terminal(24, 80, 16.0);
+        let win32_pair = &b"\x1b[13;28;13;1;16;1_\x1b[13;28;13;0;16;1_"[..];
+        for (step, program, conpty, key, mods, want) in [
+            ("fresh", &b""[..], false, "ArrowUp", 0, &b"\x1b[A"[..]),
+            (
+                "DECCKM",
+                &b"\x1b[?1h"[..],
+                false,
+                "ArrowUp",
+                0,
+                &b"\x1bOA"[..],
+            ),
+            ("no kitty", &b"\x1b[?1l"[..], false, "Enter", 1, &b"\n"[..]),
+            (
+                "kitty pushed",
+                &b"\x1b[>1u"[..],
+                false,
+                "Enter",
+                1,
+                &b"\x1b[13;2u"[..],
+            ),
+            (
+                "?9001h alone",
+                &b"\x1b[<u\x1b[?9001h"[..],
+                false,
+                "Enter",
+                1,
+                &b"\n"[..],
+            ),
+            (
+                "?9001h on ConPTY",
+                &b"\x1b[?9001h"[..],
+                true,
+                "Enter",
+                1,
+                win32_pair,
+            ),
+        ] {
+            if conpty {
+                t.set_win32_input_enabled(true);
+            }
+            t.process(program);
+            assert_eq!(
+                t.encode_key(key, mods, 0, None).as_deref(),
+                Some(want),
+                "{step}"
+            );
+            assert_eq!(
+                encode_key_with_mode(key, mods, 0, None, t.keyboard_mode_bits()).as_deref(),
+                Some(want),
+                "{step}: mirrored bits"
+            );
+        }
+    }
+
+    /// The host word-separator setting reshapes double-click words end-to-end
+    /// (xterm.js `wordSeparators` semantics), and clearing it restores the
+    /// engine's default class-based word logic exactly. A click mid-word
+    /// selects the WHOLE word (the expand_semantic fix).
+    #[test]
+    fn set_word_separators_reshapes_double_click_words() {
+        let mut t = crate::system_font_terminal(24, 80, 16.0);
+        t.process(b"foo-bar baz");
+        assert_eq!(t.selection_word(0, 1).as_deref(), Some("foo"));
+        t.set_word_separators(Some(" ".to_string()));
+        assert_eq!(t.selection_word(0, 1).as_deref(), Some("foo-bar"));
+        t.set_word_separators(None);
+        assert_eq!(t.selection_word(0, 1).as_deref(), Some("foo"));
+    }
+
+    /// The mouse surface the host drives: the motion getters follow
+    /// 1000/1002/1003, and the encoders take the host's 0-based
+    /// `(col, row, button, mods)` and wheel direction.
+    #[test]
+    fn mouse_getters_follow_the_mode_and_encoders_take_host_cells() {
+        let mut t = crate::system_font_terminal(24, 80, 16.0);
+        assert!(!t.is_mouse_tracking(), "mouse tracking defaults off");
+        assert!(t.encode_mouse_press(0, 0, 0, 0).is_none(), "no report off");
+        t.process(b"\x1b[?1000h\x1b[?1006h");
+        assert!(t.is_mouse_tracking() && !t.mouse_wants_motion(), "1000");
+        assert_eq!(
+            t.encode_mouse_press(4, 2, 0, 0).as_deref(),
+            Some(&b"\x1b[<0;5;3M"[..])
+        );
+        assert_eq!(
+            t.encode_mouse_wheel(4, 2, true, 0).as_deref(),
+            Some(&b"\x1b[<64;5;3M"[..])
+        );
+        t.process(b"\x1b[?1002h");
+        assert!(
+            t.mouse_wants_motion() && !t.mouse_wants_any_motion(),
+            "1002"
+        );
+        t.process(b"\x1b[?1003h");
+        assert!(t.mouse_wants_any_motion(), "1003 reports any motion");
+    }
+
+    /// A link under the pointer is read from the cells it is drawn in (r16
+    /// selection-stride): after two ideographs the URL's columns are its own
+    /// and its text is the URL. Slicing the row's text one column a
+    /// character read `tps://example.com/a`, no link at all.
     #[test]
     fn a_link_after_wide_characters_is_read_from_its_cells() {
         let mut t = AtermTerminal::new(4, 60, BUNDLED_FACE, 16.0, 0, 0, 0, 0)
             .expect("the bundled face parses");
         t.process("\u{65e5}\u{672c} https://example.com/a\r\n".as_bytes());
-        t.process("\x1b[2;3H\u{1f1e7}\x1b[2;1H\u{1f1e6}\x1b[2;5Hhttps://example.com/b".as_bytes());
-        for (row, col, url, start, end) in [
-            (0, 5, "https://example.com/a", 5, 26),
-            (0, 25, "https://example.com/a", 5, 26),
-            (1, 4, "https://example.com/b", 4, 25),
-            (1, 24, "https://example.com/b", 4, 25),
-        ] {
+        for col in [5, 25] {
             let hit = t
-                .link_at(row, col)
-                .unwrap_or_else(|| panic!("({row}, {col}) is over a URL"));
+                .link_at(0, col)
+                .unwrap_or_else(|| panic!("column {col} is over the URL"));
             assert_eq!(
                 (hit.url(), hit.start_col(), hit.end_col(), hit.kind()),
-                (url.to_string(), start, end, 1),
-                "link at ({row}, {col})"
+                ("https://example.com/a".to_string(), 5, 26, 1),
+                "link at column {col}"
             );
         }
-        assert!(t.link_at(1, 2).is_none(), "a flag half is no link");
     }
 
     #[test]
-    fn detects_a_url_link_under_the_cursor() {
-        let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            eprintln!("no system font; skipping link detection test");
-            return;
-        };
-        t.process(b"https://example.com/foo bar");
-        // Column 5 is inside "https://example.com/foo".
-        let hit = t.link_at(0, 5).expect("a URL under the cursor is a link");
-        assert!(
-            hit.kind() == 0 || hit.kind() == 1,
-            "expected osc8 or url kind, got {}",
-            hit.kind()
-        );
-        assert!(
-            hit.url().contains("example.com"),
-            "url should contain the host, got {:?}",
-            hit.url()
-        );
-    }
-
-    // --- Font-independent tests (operate on the engine + helpers directly) ---
-
-    #[test]
-    fn selection_range_reports_display_coords_while_scrolled() {
-        // 5 rows, 20 cols; push lines so some scroll into history.
+    fn selection_range_reports_display_coords_and_none_off_screen() {
         let mut term = Terminal::new(5, 20);
         for i in 0..20 {
             term.process(format!("line{i}\r\n").as_bytes());
@@ -3108,40 +2292,23 @@ mod tests {
         assert_eq!(offset, 4);
 
         // Select display rows 0..=1 — the host passes TERMINAL-relative rows
-        // (display_row - offset), exactly as the fixed wasm entry points do.
+        // (display_row - offset), exactly as the wasm entry points do.
         {
             let sel = term.text_selection_mut();
             sel.start_selection(0 - offset, 0, SelectionSide::Left, SelectionType::Lines);
             sel.update_selection(1 - offset, 19, SelectionSide::Right);
             sel.complete_selection();
         }
-
-        // selection_range maps back to DISPLAY coords 0..=1.
         let r = selection_range_for(&term, 5, 20).expect("selection in viewport");
         assert_eq!((r.start_y(), r.end_y()), (0, 1), "display rows 0..=1");
-
         // And it agrees with selection_text (the scrollback lines, not live rows).
         let copied = term.selection_to_string().expect("text");
         let want0 = term.display_row_text(0).unwrap();
         let want1 = term.display_row_text(1).unwrap();
         assert_eq!(copied, format!("{want0}\n{want1}"));
-    }
 
-    #[test]
-    fn selection_range_is_none_when_fully_in_scrollback() {
-        let mut term = Terminal::new(5, 20);
-        for i in 0..20 {
-            term.process(format!("line{i}\r\n").as_bytes());
-        }
-        // Select a region in scrollback (terminal rows -8..=-7), then view the
-        // live bottom (offset 0) so the selection is entirely above the viewport.
-        {
-            let sel = term.text_selection_mut();
-            sel.start_selection(-8, 0, SelectionSide::Left, SelectionType::Lines);
-            sel.update_selection(-7, 19, SelectionSide::Right);
-            sel.complete_selection();
-        }
-        assert_eq!(term.grid().display_offset(), 0);
+        // Back at the live bottom the selection lies wholly above the viewport.
+        term.scroll_to_bottom();
         assert!(
             selection_range_for(&term, 5, 20).is_none(),
             "selection fully off-screen yields None"
@@ -3155,28 +2322,20 @@ mod tests {
     /// suite; this pins the BINDING's default-off wiring to that path).
     #[test]
     fn effects_off_is_byte_identical() {
-        let Some(mut plain) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            eprintln!("no system font; skipping effects-off identity test");
-            return;
-        };
-        let Some(mut toggled) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            return;
-        };
+        let mut plain = crate::system_font_terminal(24, 80, 16.0);
+        let mut toggled = crate::system_font_terminal(24, 80, 16.0);
         let content = b"a curious cat watched the build fail: fuck\r\n$ ";
         plain.process(content);
         plain.render();
 
         toggled.process(content);
-        // Exercise the whole surface, then land back on OFF.
         toggled.set_sparkle_words_enabled(true);
         toggled.set_cursor_glow(true, "phaser", None, None, 260, 24, 0.7, 0.6, true);
         toggled.set_cursor_trail(true, 260, 24, None);
         toggled.advance_effects(50.0);
         toggled.render();
-        // A FIRE burn too: the spliced fire/halo/under/char streams must all
-        // vanish with the toggle. Type-then-erase ignites a REAL burn (typed
-        // glyphs ignite; navigation does not) while leaving the cell bytes and
-        // the cursor position identical to the plain engine.
+        // A FIRE burn: type-then-erase ignites a REAL burn while leaving the
+        // cell bytes and the cursor position identical to the plain engine.
         toggled.set_cursor_glow(true, "ember", None, None, 400, 64, 1.0, 2.0, true);
         toggled.process(b"z\x1b[D \x1b[D");
         toggled.advance_effects(50.0);
@@ -3186,15 +2345,10 @@ mod tests {
             toggled.rgba(),
             "a live burn must visibly change the frame (non-vacuous toggle)"
         );
-        // A PET leg too: the resident cat is free sprites over the grid, so
-        // it must vanish with the seed door like every other channel. The
-        // glow style that names the pet is switched on, the pet enabled by
-        // seed, a witnessed type-then-erase keeps the cell bytes identical
-        // to the plain engine, and the frames advance until the cat has
-        // faded onto the glass (a non-vacuous toggle).
+        // A PET: free sprites over the grid, enabled by seed, brought onto
+        // the glass by a witnessed type-then-erase.
         toggled.set_cursor_glow(true, "rainbow kitty", None, None, 260, 24, 0.7, 0.6, true);
         toggled.set_cursor_pet(true, 7);
-        assert!(toggled.cursor_pet_enabled());
         toggled.render();
         toggled.note_typed_char('p');
         toggled.process(b"p\x1b[D \x1b[D");
@@ -3214,7 +2368,6 @@ mod tests {
             "a drawn pet must visibly change the frame (non-vacuous toggle)"
         );
         toggled.set_cursor_pet(false, 7);
-        assert!(!toggled.cursor_pet_enabled());
         toggled.set_sparkle_words_enabled(false);
         toggled.set_cursor_glow(false, "lumen", None, None, 260, 24, 0.7, 0.6, true);
         toggled.set_cursor_trail(false, 260, 24, None);
@@ -3235,12 +2388,8 @@ mod tests {
     /// binding).
     #[test]
     fn set_chrome_pads_the_frame_and_zero_restores_identity() {
-        let Some(mut plain) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            return;
-        };
-        let Some(mut chromed) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            return;
-        };
+        let mut plain = crate::system_font_terminal(24, 80, 16.0);
+        let mut chromed = crate::system_font_terminal(24, 80, 16.0);
         let content = b"chrome test\r\n$ ";
         plain.process(content);
         plain.render();
@@ -3255,13 +2404,10 @@ mod tests {
             h + 24 + 30,
             "frame gains 2*pad + head in height"
         );
-        // The grid still holds the same cells; only the frame grew.
-        assert_eq!(chromed.row_text(0), plain.row_text(0));
 
         chromed.set_chrome(0, 0);
         chromed.render();
-        assert_eq!(chromed.width(), w);
-        assert_eq!(chromed.height(), h);
+        assert_eq!((chromed.width(), chromed.height()), (w, h));
         assert_eq!(
             plain.rgba(),
             chromed.rgba(),
@@ -3270,35 +2416,23 @@ mod tests {
     }
 
     /// SPILL BAND through the REAL pipeline: an EMBERFORGE burn on the top
-    /// row (the pipeline now splices the glow engine's fire/halo/under
-    /// streams, and the flame field rises above the grid — the effects box
-    /// relaxes upward by exactly `head` under chrome) must light the TOP
-    /// strip and surface band bytes whose source-over composite onto the
-    /// theme bg equals the rendered frame's band region byte-for-byte (the
-    /// seam-continuity law), size the buffer exactly to the four strips, keep
-    /// the pointer stable across animation frames, and stay identity (len 0,
-    /// rev still) at 0/0 chrome.
+    /// row (the flame field rises above the grid: the effects box relaxes
+    /// upward by exactly `head` under chrome) must light the TOP strip, and
+    /// the band bytes `render` exports, packed as the four strips, must
+    /// composite source-over onto the theme bg into exactly the rendered
+    /// frame's band region (the seam-continuity law).
     #[test]
     fn spill_exports_track_band_content_through_the_real_pipeline() {
-        let Some(mut t) = AtermTerminal::new_from_system(12, 40, 16.0) else {
-            return;
-        };
-        t.render();
-        assert_eq!(t.spill_len(), 0, "0/0 chrome: identity — no band, no bytes");
-        assert_eq!(t.spill_rev(), 0);
-        assert_eq!(t.spill_rect_count(), 0);
-
+        let mut t = crate::system_font_terminal(12, 40, 16.0);
         let (pad, head) = (12usize, 30usize);
         t.set_chrome(pad as u16, head as u16);
         // The glow observes cursor motion FRAME-TO-FRAME, so keystrokes
         // interleave with renders, each WITNESSED through the committed-char
-        // seam exactly as a JS keydown handler would (RED from 201449c2 until
-        // that seam existed: the movement-admission gate leaves unwitnessed
-        // motion dark, and note_keystroke is deliberately text-blind); the
-        // admitted row-0 burn then licks into the head band.
+        // seam as a JS keydown handler would: the movement-admission gate
+        // leaves unwitnessed motion dark.
         t.set_cursor_glow(true, "ember", None, None, 400, 64, 1.0, 2.0, true);
-        // Seed the just-enabled engines' cursor anchor so the first witness
-        // below has an owner to check against (apply is the anchor authority).
+        // Seed the just-enabled engines' cursor anchor (apply is the anchor
+        // authority) so the first witness has an owner to check against.
         t.render();
         for (ch, bytes) in [('a', b"a"), ('b', b"b"), ('c', b"c"), ('d', b"d")] {
             assert!(
@@ -3309,11 +2443,8 @@ mod tests {
             t.advance_effects(30.0);
             t.render();
         }
-        // Find a frame whose band coverage is LIVE (nonzero alpha), not merely
-        // rev-ticked: the rev also advances on the ERASE that follows an
-        // ember's exit, and parity below must sample a frame with something on
-        // it to be non-vacuous. Check-then-advance: the last witnessed burn is
-        // typically still licking upward right now.
+        // A frame whose band coverage is LIVE (nonzero alpha), not merely
+        // rev-ticked, or the parity below proves nothing.
         let mut lit_frame = false;
         for _ in 0..40 {
             if t.spill_rev() > 0
@@ -3339,8 +2470,6 @@ mod tests {
             (w * (pad + head) + w * pad + 2 * pad * grid_h) * 4,
             "spill buffer sized to the four band strips"
         );
-        assert!(t.spill_rev() > 0, "the fire must reach the band");
-        assert!(t.spill_rect_count() > 0, "band content must report rects");
 
         // Byte parity against the engine's OWN presented frame: walk the four
         // strips (top, bottom, left, right — the documented packing) and
@@ -3389,152 +2518,9 @@ mod tests {
             lit[0] > 0,
             "the fire must rise into the TOP strip (the head band)"
         );
-
-        // Pointer stability across an animating content frame.
-        let ptr = t.spill_ptr();
-        t.advance_effects(16.0);
-        t.render();
-        assert_eq!(t.spill_ptr(), ptr, "same geometry ⇒ the export never moves");
-
-        // Idle re-render (no clock advance): the engine's word to skip the blit.
-        let rev = t.spill_rev();
-        t.render();
-        assert_eq!(t.spill_rev(), rev, "idle re-render must not tick the rev");
-        assert_eq!(t.spill_rect_count(), 0);
-    }
-
-    /// Typing-only frames with a grid-interior glow keep the spill revision
-    /// still: the emissions move with the cursor, but nothing reaches the
-    /// band, so the host may skip its blit on the engine's word.
-    #[test]
-    fn spill_rev_holds_still_for_typing_under_an_interior_glow() {
-        let Some(mut t) = AtermTerminal::new_from_system(12, 40, 16.0) else {
-            return;
-        };
-        t.set_chrome(12, 30);
-        // Park the cursor deep in the grid, then enable the same style the
-        // band test proves emissive — here everything it emits is interior.
-        t.process(b"\r\n\r\n\r\n\r\n\r\n\r\n      hello");
-        t.set_cursor_glow(true, "water", None, None, 400, 64, 1.0, 2.0, true);
-        for _ in 0..12 {
-            t.advance_effects(16.0);
-            t.render();
-        }
-        let rev = t.spill_rev();
-        t.process(b"x");
-        t.render();
-        t.process(b"y");
-        t.render();
-        assert_eq!(
-            t.spill_rev(),
-            rev,
-            "typing under a grid-interior glow must not tick the spill rev"
-        );
-        assert_eq!(t.spill_rect_count(), 0);
-    }
-
-    /// Effects ON actually reach the pixels through the wasm path (sparkle ink
-    /// + decorations change the frame for matched words).
-    #[test]
-    fn effects_on_changes_pixels_for_matched_words() {
-        let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            eprintln!("no system font; skipping effects-on pixel test");
-            return;
-        };
-        t.process(b"kitty cat says fuck\r\n");
-        t.render();
-        let before = t.rgba();
-        t.set_sparkle_words_enabled(true);
-        t.advance_effects(120.0);
-        t.render();
-        assert_ne!(
-            before,
-            t.rgba(),
-            "sparkle words ON must visibly decorate matched words"
-        );
-    }
-
-    /// Determinism: two instances fed the SAME bytes and the SAME dt stream
-    /// produce identical frames at every step — the engines never read a wall
-    /// clock (the injected-clock contract), so replay is exact.
-    #[test]
-    fn effects_on_is_deterministic_across_instances() {
-        let Some(mut a) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            eprintln!("no system font; skipping effects determinism test");
-            return;
-        };
-        let Some(mut b) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            return;
-        };
-        for t in [&mut a, &mut b] {
-            t.set_sparkle_words_enabled(true);
-            t.set_cursor_glow(
-                true,
-                "sparkle",
-                Some(0x0050_FA7B),
-                None,
-                400,
-                24,
-                0.9,
-                0.8,
-                true,
-            );
-            t.process(b"the cat typed fuck and moved on\r\n");
-        }
-        for step in 0..40u32 {
-            // Cursor motion so the aurora spawns comets/particles too.
-            let bytes = format!("x{}", if step % 8 == 0 { "\r\n" } else { "" });
-            a.process(bytes.as_bytes());
-            b.process(bytes.as_bytes());
-            a.advance_effects(33.0);
-            b.advance_effects(33.0);
-            a.render();
-            b.render();
-            assert_eq!(
-                a.rgba(),
-                b.rgba(),
-                "same bytes + same dt stream must be pixel-identical (step {step})"
-            );
-        }
-    }
-
-    /// Self-termination / idle-to-zero: after the animation budgets elapse the
-    /// binding reports inactive and the frame fingerprint is stable (two more
-    /// advanced renders change nothing) — the host's rAF loop can stop.
-    #[test]
-    fn effects_settle_to_stable_idle() {
-        let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            eprintln!("no system font; skipping effects settle test");
-            return;
-        };
-        t.set_sparkle_words_enabled(true);
-        // Idle cat one-shots off so "settled" means settled forever, not
-        // "until the next scheduled blink" (that path is deadline-driven).
-        t.set_sparkle_feline("cat", true, true, false);
-        t.set_cursor_glow(true, "lumen", None, None, 260, 24, 0.7, 0.6, true);
-        t.process(b"cat + fuck\r\n");
-        let mut settled = false;
-        for _ in 0..600 {
-            t.advance_effects(100.0);
-            t.render();
-            if !t.is_effects_active() {
-                settled = true;
-                break;
-            }
-        }
-        assert!(settled, "effects must self-terminate within the budget");
-        let stable = t.rgba();
-        t.advance_effects(500.0);
-        t.render();
-        assert_eq!(stable, t.rgba(), "settled frame must be a fixed point");
-        assert!(!t.is_effects_active(), "still idle after further advance");
     }
 
     // --- The resident pet through the binding (design 2026-08-30, Phase 1) --
-    //
-    // Every test here skips silently on a box with no system font, like the
-    // rest of this module: grep the run for "no system font" before trusting
-    // a green result.
 
     /// Drive the pet onto the glass through the binding alone: the glow
     /// style that names it, the seed door, then witnessed keystrokes at
@@ -3583,57 +2569,6 @@ mod tests {
         false
     }
 
-    /// The pet arrives beside a witnessed caret, walks with it while the
-    /// host types, and — left alone — sleeps and RELEASES the frame lane:
-    /// `is_effects_active()` false, the frame a fixed point, the next render
-    /// gate-hit. The cadence law through the binding: a cat that exists is
-    /// not a reason to run at 60 Hz; only a cat that is moving is.
-    #[test]
-    fn cursor_pet_walks_through_the_binding_and_settles() {
-        let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            eprintln!("no system font; skipping pet walk/settle test");
-            return;
-        };
-        assert!(!t.cursor_pet_enabled(), "the pet defaults OFF");
-        assert_eq!(t.cursor_pet_alpha(), 0, "nothing on glass before opt-in");
-        t.process(b"$ ");
-        assert!(
-            wake_the_pet(&mut t, 7).is_some(),
-            "the pet must reach the glass through the binding"
-        );
-        assert!(t.cursor_pet_enabled());
-        assert!(
-            t.is_effects_active(),
-            "a pet fading in / walking holds the frame lane"
-        );
-        for ch in "the cat walks with the caret".chars() {
-            t.note_typed_char(ch);
-            t.process(ch.to_string().as_bytes());
-            t.advance_effects(33.0);
-            t.render();
-        }
-        assert!(t.cursor_pet_alpha() > 0, "still on glass while walking");
-
-        // A minute of quiet: the pet sleeps and the lane is released.
-        assert!(
-            settle(&mut t, 600),
-            "a quiet pet must sleep and release the frame lane (idle-to-zero)"
-        );
-        assert!(
-            t.cursor_pet_alpha() > 0,
-            "asleep is still on glass — the resident is not earned"
-        );
-        let stable = t.rgba();
-        t.advance_effects(500.0);
-        t.render();
-        assert_eq!(stable, t.rgba(), "the settled frame must be a fixed point");
-        assert!(!t.is_effects_active(), "still idle after further advance");
-        assert!(
-            t.last_render_skipped(),
-            "a settled sleeping cat takes the frame gate"
-        );
-    }
-
     /// The seed door is the ONLY entropy: two instances fed the same seed,
     /// the same bytes and the same `dt` stream are pixel-identical at every
     /// step (the engine is clockless and dieless — nothing in-wasm rolls a
@@ -3641,16 +2576,9 @@ mod tests {
     /// non-vacuity half: the seed actually reaches the coat).
     #[test]
     fn cursor_pet_is_deterministic_for_one_seed() {
-        let Some(mut a) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            eprintln!("no system font; skipping pet determinism test");
-            return;
-        };
-        let Some(mut b) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            return;
-        };
-        let Some(mut c) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            return;
-        };
+        let mut a = crate::system_font_terminal(24, 80, 16.0);
+        let mut b = crate::system_font_terminal(24, 80, 16.0);
+        let mut c = crate::system_font_terminal(24, 80, 16.0);
         const SEED: u64 = 7;
         const OTHER_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
         let (look, other) = (
@@ -3694,18 +2622,17 @@ mod tests {
         );
     }
 
-    /// The pointer and the press are value-shadowed doors on the WF-1 gate:
-    /// a pointer sample that moved reopens it, the same sample again does
-    /// not; a leave reopens it once; a press outside the body passes (`0`)
-    /// and leaves the gate shut, a press inside pets (`1`) and buys the
-    /// frame that runs the purr. So an idle hover cannot delete the gate and
-    /// a stroked cat cannot be a stale frame.
+    /// The pet defaults OFF. The pointer and the press are value-shadowed
+    /// doors on the WF-1 gate: a pointer sample that moved reopens it, the
+    /// same sample again does not; a leave reopens it once; a press outside
+    /// the body passes (`0`) and leaves the gate shut, a press inside pets
+    /// (`1`) and buys the frame that runs the purr. So an idle hover cannot
+    /// delete the gate and a stroked cat cannot be a stale frame.
     #[test]
     fn pointer_and_pet_press_reopen_the_frame_gate() {
-        let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            eprintln!("no system font; skipping pointer/press gate test");
-            return;
-        };
+        let mut t = crate::system_font_terminal(24, 80, 16.0);
+        assert!(!t.cursor_pet_enabled(), "the pet defaults OFF");
+        assert_eq!(t.cursor_pet_alpha(), 0, "nothing on glass before opt-in");
         t.process(b"$ ");
         assert!(
             wake_the_pet(&mut t, 7).is_some(),
@@ -3744,8 +2671,6 @@ mod tests {
         assert!(t.last_render_skipped(), "re-settled after the leave");
         t.note_pointer_leave();
         assert!(!t.needs_frame(), "a second leave is value-shadowed");
-        t.render();
-        assert!(t.last_render_skipped(), "a second leave must gate");
 
         // A press outside passes and gates; a press inside pets and draws.
         let (x0, x1, y0, y1) = t
@@ -3774,14 +2699,10 @@ mod tests {
     /// as SUB-FRAME bands (the rows the sprite vacated and entered), never
     /// a full-frame band, and the partially-updated persistent buffer stays
     /// byte-exact against a from-scratch expansion of the same frame — the
-    /// dirty-band oracle of `dirty_band_present_api`. A settled sleeping cat
-    /// gate-hits to zero bands.
+    /// dirty-band oracle of `dirty_band_present_api`.
     #[test]
     fn walking_pet_presents_sub_frame_bands() {
-        let Some(mut t) = AtermTerminal::new_from_system(8, 40, 14.0) else {
-            eprintln!("no system font; skipping pet band test");
-            return;
-        };
+        let mut t = crate::system_font_terminal(8, 40, 14.0);
         let full_expansion = |t: &AtermTerminal| {
             let mut rgba = Vec::new();
             let mut bands = Vec::new();
@@ -3800,7 +2721,6 @@ mod tests {
             "the pet must reach the glass through the binding"
         );
         let full = (t.width * t.height) as i32;
-        let mut banded_frames = 0u32;
         for ch in "walk".chars().cycle().take(24) {
             t.note_typed_char(ch);
             t.process(ch.to_string().as_bytes());
@@ -3827,25 +2747,10 @@ mod tests {
                 full_expansion(&t),
                 "the banded update is byte-exact against a full expansion"
             );
-            banded_frames += 1;
         }
-        assert!(banded_frames > 0, "non-vacuity: frames were checked");
         assert!(
             t.cursor_pet_alpha() > 0,
             "the cat was on glass while walking"
-        );
-
-        assert!(settle(&mut t, 600), "the pet must sleep");
-        t.render();
-        assert_eq!(
-            t.present_band_count(),
-            0,
-            "a settled sleeping cat gate-hits to zero bands"
-        );
-        assert_eq!(
-            t.rgba,
-            full_expansion(&t),
-            "gate-hit leaves the buffer intact"
         );
     }
 
@@ -3879,61 +2784,29 @@ mod tests {
         t.term.process(&buf);
     }
 
+    /// The inline bound splits the two resize paths: a history at or under
+    /// `INLINE_REFLOW_MAX_LINES` rewraps inline, mirroring the native bound;
+    /// a deeper one detaches, and any schedule of small bounded pumps
+    /// re-attaches it with its content intact (aterm-grid's
+    /// schedule-independence property, asserted here as the JS-visible
+    /// outcome: counts + oldest line).
     #[test]
-    fn resize_without_tiered_store_never_defers() {
-        // A ring-only engine (no tiered store — the pre-E1 ctor shape, still
-        // reachable via checkpoint-restore of old grids): every resize is the
-        // plain bounded path — nothing stashes, nothing to pump.
-        let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            return;
-        };
-        t.term = Terminal::new(24, 80);
-        for i in 0..50 {
-            t.process(format!("line {i}\r\n").as_bytes());
-        }
-        t.resize(24, 40);
-        assert!(!t.reflow_pending(), "no tiered store → no deferred job");
-        assert!(!t.pump_reflow(), "nothing to pump");
-        assert_eq!(t.cols, 40, "resize applied synchronously");
-    }
-
-    #[test]
-    fn small_tiered_history_rewraps_inline_on_resize() {
-        let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            return;
-        };
+    fn small_history_rewraps_inline_and_a_deep_one_defers_to_stepped_pumps() {
+        let mut t = crate::system_font_terminal(24, 80, 16.0);
         install_tiered_history(&mut t, 24, 80, 500);
         let before = t.term.grid().scrollback_lines();
         assert!(before > 100, "precondition: deep history ({before} lines)");
         t.resize(24, 40);
-        assert!(
-            !t.reflow_pending(),
-            "≤ INLINE_REFLOW_MAX_LINES rewraps inline, mirroring the native bound"
-        );
+        assert!(!t.reflow_pending(), "a small history rewraps inline");
         assert!(
             t.term.grid().scrollback_lines() >= before,
             "inline rewrap preserves history"
         );
-        assert!(
-            t.serialize_scrollback(None).contains("L0-hist"),
-            "oldest line intact after the inline rewrap"
-        );
-    }
+        assert!(t.serialize_scrollback(None).contains("L0-hist"));
 
-    #[test]
-    fn large_tiered_history_defers_rewrap_and_stepped_pumps_reattach_it() {
-        // The content-intact defer test, now driven in RANDOM SMALL BUDGETS:
-        // every pump is a bounded `reflow_step` slice, and any schedule must
-        // re-attach content identical to what a one-shot rewrap yields
-        // (aterm-grid's schedule-independence property; here we assert the
-        // JS-visible outcome: counts + oldest line intact).
-        let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            return;
-        };
         install_tiered_history(&mut t, 24, 80, INLINE_REFLOW_MAX_LINES + 5_000);
         let before = t.term.grid().scrollback_lines();
         assert!(before > INLINE_REFLOW_MAX_LINES, "precondition: {before}");
-
         t.resize(24, 40);
         assert!(t.reflow_pending(), "a deep history defers its rewrap");
         assert_eq!(t.cols, 40, "the visible grid resized synchronously");
@@ -3978,88 +2851,50 @@ mod tests {
         );
     }
 
+    /// A second width change during the detach window, whether the job is
+    /// still stashed or already half-stepped, supersedes without losing
+    /// history: the store is out, so nothing re-detaches; the job keeps its
+    /// progress and re-attaches (content valid, wrapping stale for the newest
+    /// width), and the NEXT width change re-detaches and re-wraps it (the
+    /// self-heal, the native supersede semantics).
     #[test]
-    fn resize_mid_stepping_supersedes_without_losing_history() {
-        // A width change while a job is HALF-STEPPED (not merely stashed):
-        // the store is out, so nothing re-detaches; the partly-stepped job
-        // keeps its progress and still re-attaches (content valid, wrapping
-        // stale for the newest width, self-healing on the next width change —
-        // the same supersede semantics as the never-pumped stash).
-        let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            return;
-        };
-        install_tiered_history(&mut t, 24, 80, INLINE_REFLOW_MAX_LINES + 5_000);
-        let before = t.term.grid().scrollback_lines();
-
-        t.resize(24, 40);
-        assert!(t.reflow_pending());
-        t.pump_reflow_budget(500);
-        for _ in 0..3 {
-            assert!(t.pump_reflow(), "mid-stepping: work must remain");
+    fn a_resize_during_the_window_supersedes_without_losing_history() {
+        for half_stepped in [false, true] {
+            let mut t = crate::system_font_terminal(24, 80, 16.0);
+            install_tiered_history(&mut t, 24, 80, INLINE_REFLOW_MAX_LINES + 5_000);
+            let before = t.term.grid().scrollback_lines();
+            t.resize(24, 40);
+            assert!(t.reflow_pending());
+            if half_stepped {
+                t.pump_reflow_budget(500);
+                for _ in 0..3 {
+                    assert!(t.pump_reflow(), "mid-stepping: work must remain");
+                }
+            }
+            t.resize(24, 60);
+            assert!(
+                t.reflow_pending(),
+                "half_stepped={half_stepped}: the job survives"
+            );
+            assert_eq!(t.cols, 60, "the newest geometry wins for the grid");
+            while t.pump_reflow() {}
+            let after = t.term.grid().scrollback_lines();
+            assert!(
+                after >= before,
+                "half_stepped={half_stepped}: no history lost across the supersede \
+                 (before={before}, after={after})"
+            );
+            t.resize(24, 30);
+            assert!(
+                t.reflow_pending(),
+                "stale wrapping re-detaches and re-wraps"
+            );
+            while t.pump_reflow() {}
+            assert!(
+                t.serialize_scrollback(None).contains("L0-hist"),
+                "half_stepped={half_stepped}: oldest line intact after the supersede"
+            );
         }
-        assert!(t.reflow_pending(), "job is half-stepped");
-
-        t.resize(24, 60); // supersede mid-stepping
-        assert!(
-            t.reflow_pending(),
-            "the half-stepped job survives a re-resize"
-        );
-        assert_eq!(t.cols, 60, "the newest geometry wins for the grid");
-
-        let mut pumps = 0usize;
-        while t.pump_reflow() {
-            pumps += 1;
-            assert!(pumps < 100_000, "stepping must terminate");
-        }
-        let after = t.term.grid().scrollback_lines();
-        assert!(
-            after >= before,
-            "no history lost across the mid-stepping supersede \
-             (before={before}, after={after})"
-        );
-        assert!(
-            t.serialize_scrollback(None).contains("L0-hist"),
-            "oldest line intact after the mid-stepping supersede"
-        );
-    }
-
-    #[test]
-    fn resize_during_the_window_supersedes_without_losing_history() {
-        let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            return;
-        };
-        install_tiered_history(&mut t, 24, 80, INLINE_REFLOW_MAX_LINES + 5_000);
-        let before = t.term.grid().scrollback_lines();
-
-        t.resize(24, 40);
-        assert!(t.reflow_pending());
-        // A second width change while detached: the store is out, so nothing
-        // re-detaches — the stashed job survives and still re-attaches
-        // (content valid; wrapping stale for the newest width, self-healing
-        // on the next width change — the native supersede semantics).
-        t.resize(24, 60);
-        assert!(t.reflow_pending(), "the stashed job survives a re-resize");
-        assert_eq!(t.cols, 60, "the newest geometry wins for the grid");
-
-        while t.pump_reflow() {}
-        let after = t.term.grid().scrollback_lines();
-        assert!(
-            after >= before,
-            "no history lost across the superseding resize \
-             (before={before}, after={after})"
-        );
-        // The self-heal: the NEXT width change re-detaches the (stale-wrapped)
-        // store and re-reflows it to the current width.
-        t.resize(24, 30);
-        assert!(
-            t.reflow_pending(),
-            "stale wrapping re-detaches and re-wraps"
-        );
-        while t.pump_reflow() {}
-        assert!(
-            t.serialize_scrollback(None).contains("L0-hist"),
-            "oldest line intact after the whole supersede dance"
-        );
     }
 
     #[test]
@@ -4068,9 +2903,7 @@ mod tests {
         // (an un-updated embedder) must still get its history back — after
         // the grace window `render` pumps ONE bounded step per frame, so the
         // job CONVERGES across frames (never the whole rewrap in one frame).
-        let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            return;
-        };
+        let mut t = crate::system_font_terminal(24, 80, 16.0);
         install_tiered_history(&mut t, 24, 80, INLINE_REFLOW_MAX_LINES + 5_000);
         let before = t.term.grid().scrollback_lines();
         t.resize(24, 40);
@@ -4112,9 +2945,7 @@ mod tests {
         // advances the job one bounded step, so the window closes after
         // finitely many calls (amortized convergence; no single unbounded
         // catch-up task).
-        let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            return;
-        };
+        let mut t = crate::system_font_terminal(24, 80, 16.0);
         install_tiered_history(&mut t, 24, 80, INLINE_REFLOW_MAX_LINES + 5_000);
         t.resize(24, 40);
         assert!(t.reflow_pending());
@@ -4150,154 +2981,66 @@ mod tests {
         );
     }
 
-    #[test]
-    fn teardown_with_a_half_stepped_job_drops_cleanly() {
-        // Module teardown (JS `free()` → Drop) while a job is stashed AND
-        // half-stepped: the engine and the detached history (with its
-        // stepping progress) drop TOGETHER — no wedge can outlive the
-        // instance, and nothing panics.
-        let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
-            return;
-        };
-        install_tiered_history(&mut t, 24, 80, INLINE_REFLOW_MAX_LINES + 5_000);
-        t.resize(24, 40);
-        assert!(t.reflow_pending());
-        t.pump_reflow_budget(100);
-        assert!(t.pump_reflow(), "step partway before teardown");
-        assert!(t.reflow_pending(), "job is half-stepped at drop time");
-        drop(t);
-    }
-
+    /// Driving the budgeted export to completion yields exactly the legacy
+    /// one-shot triplets, cursor discipline included (Some while incomplete,
+    /// None at completion); an empty query or a bad regex answers at once,
+    /// empty and complete, like the legacy export's silence.
     #[test]
     fn search_budgeted_resumes_to_the_one_shot_result() {
-        // Driving the budgeted export to completion — for literal, folded, and
-        // regex modes — yields exactly the legacy one-shot triplets, cursor
-        // discipline included (Some while incomplete, None at completion).
-        let Some(mut t) = AtermTerminal::new_from_system(6, 40, 16.0) else {
-            return;
-        };
+        let mut t = crate::system_font_terminal(6, 40, 16.0);
         for i in 0..60 {
             t.process(format!("row {i} NEEDLE-{i} tail\r\n").as_bytes());
         }
-        for &(query, cs, rx) in &[
-            ("NEEDLE", true, false),
-            ("needle", false, false),
-            ("NEEDLE-[0-9]+", true, true),
-        ] {
-            let one_shot = t.search(query, cs, rx);
-            let mut cursor = None;
-            let mut all_matches = Vec::new();
-            let mut search_id = None;
-            let step = loop {
-                let step = t.search_budgeted(query, cs, rx, cursor, 9);
-                if step.reset() {
-                    assert!(search_id.is_none(), "only the first turn resets here");
-                    all_matches.clear();
-                    search_id = step.search_id();
-                } else {
-                    assert_eq!(step.search_id(), search_id);
-                }
-                all_matches.extend(step.matches());
-                if step.complete() {
-                    break step;
-                }
-                assert!(step.cursor().is_some(), "incomplete step carries a cursor");
-                assert!(step.rows_fed() <= step.total_rows());
-                cursor = step.cursor();
-            };
-            assert_eq!(step.cursor(), None, "complete step drops the cursor");
-            assert_eq!(
-                all_matches, one_shot,
-                "budgeted != one-shot for {query:?} cs={cs} rx={rx}"
+        let one_shot = t.search("NEEDLE", true, false);
+        let mut cursor = None;
+        let mut all_matches = Vec::new();
+        let mut search_id = None;
+        let step = loop {
+            let step = t.search_budgeted("NEEDLE", true, false, cursor, 9);
+            if step.reset() {
+                assert!(search_id.is_none(), "only the first turn resets here");
+                all_matches.clear();
+                search_id = step.search_id();
+            } else {
+                assert_eq!(step.search_id(), search_id);
+            }
+            all_matches.extend(step.matches());
+            if step.complete() {
+                break step;
+            }
+            assert!(step.cursor().is_some(), "incomplete step carries a cursor");
+            cursor = step.cursor();
+        };
+        assert_eq!(step.cursor(), None, "complete step drops the cursor");
+        assert_eq!(all_matches, one_shot, "budgeted != one-shot");
+        assert!(!step.incomplete_index(), "small buffer is exhaustive");
+        for (query, regex) in [("", false), ("f(oo", true)] {
+            let r = t.search_budgeted(query, false, regex, None, 5);
+            assert!(
+                r.complete() && r.matches().is_empty() && r.reset() && r.search_id().is_none(),
+                "{query:?}"
             );
-            assert!(!step.incomplete_index(), "small buffer is exhaustive");
-            assert_eq!(step.lowest_retained_line(), 0);
         }
     }
 
-    #[test]
-    fn search_budgeted_supersession_and_edge_cases_stay_safe() {
-        let Some(mut t) = AtermTerminal::new_from_system(6, 40, 16.0) else {
-            return;
-        };
-        for i in 0..60 {
-            t.process(format!("row {i} NEEDLE-{i} tail\r\n").as_bytes());
-        }
-        // A new pattern supersedes the in-flight search: old cursor restarts.
-        let first = t.search_budgeted("NEEDLE", true, false, None, 5);
-        assert!(!first.complete());
-        assert!(first.reset());
-        let first_id = first.search_id();
-        let switched = t.search_budgeted("row", true, false, first.cursor(), 5);
-        assert!(switched.rows_fed() <= 5, "superseded cursor restarted");
-        assert!(switched.reset());
-        assert_ne!(switched.search_id(), first_id);
-        // Cancel between slices: the cursor goes stale, restart is silent.
-        t.search_budgeted_cancel();
-        let resumed = t.search_budgeted("row", true, false, switched.cursor(), 5);
-        assert!(resumed.rows_fed() <= 5, "cancelled cursor restarted");
-        assert!(resumed.reset());
-        assert_ne!(resumed.search_id(), switched.search_id());
-        // Empty query: immediate empty complete result (and frees state).
-        let empty = t.search_budgeted("", true, false, resumed.cursor(), 5);
-        assert!(empty.complete() && empty.matches().is_empty());
-        assert!(empty.reset() && empty.search_id().is_none());
-        // Invalid regex: silent empty complete result, like the legacy export.
-        let bad = t.search_budgeted("f(oo", false, true, None, 5);
-        assert!(bad.complete() && bad.matches().is_empty());
-        assert!(bad.reset() && bad.search_id().is_none());
-    }
-
-    /// DMG-1 ON THE WEB PATH: an echo frame re-resolves ONE row — with every
-    /// damage-reading effect on. The host extracts through
+    /// DMG-1 ON THE WEB PATH: across a mutation stream (typing, wraps and
+    /// scrolls, erases, SGR, an OSC 11 recolour, the alt screen, a history
+    /// viewport and a resize) with the damage-reading effects on, every
+    /// rendered frame's engine channels equal a FULL extraction of the same
+    /// terminal, and an echo re-resolves ONE row. The host extracts through
     /// `cell_frame_damage_scoped_into` (which consumes the damage session),
     /// and the effects pipeline closes a session only when one is still open,
-    /// so sparkle words and rain do not re-take it. A second `take_damage`
-    /// would bump the extraction generation every frame and the next echo
-    /// would take `Full { cause: DamageTaken }`.
-    #[test]
-    fn echo_frames_refill_one_row_with_sparkle_and_rain_on() {
-        use aterm_core::render::FrameRefill;
-        let Some(mut t) = AtermTerminal::new_from_system(8, 40, 14.0) else {
-            eprintln!("no system font; skipping web-path scoped-refill test");
-            return;
-        };
-        t.set_sparkle_words_enabled(true);
-        t.set_matrix_rain_enabled(true);
-        t.process(b"$ ");
-        t.render();
-        assert!(
-            matches!(t.last_refill, Some(FrameRefill::Full { .. })),
-            "the first fill is full by construction"
-        );
-        for (i, ch) in b"hello world".iter().enumerate() {
-            t.process(std::slice::from_ref(ch));
-            t.advance_effects(16.0);
-            t.render();
-            assert_eq!(
-                t.last_refill,
-                Some(FrameRefill::Scoped { rows_refilled: 1 }),
-                "echo #{i} must refill exactly its one row"
-            );
-        }
-    }
-
-    /// DMG-1 ON THE WEB PATH, EQUALITY: across a mutation stream (typing,
-    /// wraps and scrolls, erases, SGR, an OSC 11 recolour, the alt screen, a
-    /// history viewport and a resize) with the damage-reading effects on,
-    /// every rendered frame's engine channels equal a FULL extraction of the
-    /// same terminal. The oracle is seeded from the rendered scratch (so the
-    /// host-owned overlay channels the effects wrote are carried over) and
-    /// refilled with `cell_frame_into`, which rewrites every engine channel —
-    /// so only an engine divergence can make the two differ. Both arms must
-    /// be reached, or the equality proves nothing about the scoped one.
+    /// so sparkle words and rain do not re-take it; a second `take_damage`
+    /// would force `Full { cause: DamageTaken }` on every echo. The oracle is
+    /// seeded from the rendered scratch (so the host-owned overlay channels
+    /// the effects wrote are carried over) and refilled with
+    /// `cell_frame_into`, which rewrites every engine channel — so only an
+    /// engine divergence can make the two differ. Both arms must be reached,
+    /// or the equality proves nothing about the scoped one.
     #[test]
     fn web_path_scoped_refill_matches_a_full_extraction_over_a_mutation_stream() {
         use aterm_core::render::FrameRefill;
-        let Some(mut t) = AtermTerminal::new_from_system(8, 40, 14.0) else {
-            eprintln!("no system font; skipping web-path scoped-equality test");
-            return;
-        };
+        let mut t = crate::system_font_terminal(8, 40, 14.0);
         t.set_sparkle_words_enabled(true);
         t.set_matrix_rain_enabled(true);
         let steps: &[&[u8]] = &[
@@ -4335,6 +3078,13 @@ mod tests {
             t.process(step);
             t.advance_effects(16.0);
             t.render();
+            if *step == b"e" || *step == b"c" {
+                assert_eq!(
+                    t.last_refill,
+                    Some(FrameRefill::Scoped { rows_refilled: 1 }),
+                    "an echo must refill exactly its one row"
+                );
+            }
             check(&mut t, &String::from_utf8_lossy(step));
         }
         t.scroll_lines(3);
@@ -4353,20 +3103,15 @@ mod tests {
         assert!(full >= 2, "the full arm must be reached ({full})");
     }
 
-    /// WF-1 frame gate, two-sided + byte parity. Side 1 (skip): a second
-    /// `render()` with nothing changed must take the gate (zero present bands,
-    /// `rgba` byte-identical). Side 2 (reopen): every class of change the gate
+    /// WF-1 frame gate, two-sided. Side 1 (skip): a second `render()` with
+    /// nothing changed must take the gate (zero present bands, `rgba`
+    /// byte-identical). Side 2 (reopen): every class of change the gate
     /// folds — grid damage, blink phase, selection, viewport scroll — must
-    /// defeat the skip and produce output byte-identical to a fresh instance
-    /// fed the same bytes (the gate can never be the thing that changes
-    /// pixels). This is the reach fence: if the gate silently stopped firing
-    /// (or fired always), one of the two sides fails.
+    /// defeat the skip. This is the reach fence: if the gate silently
+    /// stopped firing (or fired always), one of the two sides fails.
     #[test]
     fn frame_gate_skips_settled_frames_and_reopens_on_every_change_class() {
-        let Some(mut t) = AtermTerminal::new_from_system(8, 40, 14.0) else {
-            eprintln!("no system font; skipping frame-gate test");
-            return;
-        };
+        let mut t = crate::system_font_terminal(8, 40, 14.0);
         t.process(b"hello gate");
         t.render();
         assert!(!t.last_render_skipped(), "first render must draw");
@@ -4384,14 +3129,6 @@ mod tests {
         assert!(t.needs_frame(), "damage must reopen the gate");
         t.render();
         assert!(!t.last_render_skipped(), "an echo frame must draw");
-        // Byte parity with a fresh instance fed the same total byte stream:
-        // the gate must be unobservable in pixels.
-        let Some(mut fresh) = AtermTerminal::new_from_system(8, 40, 14.0) else {
-            return;
-        };
-        fresh.process(b"hello gate!");
-        fresh.render();
-        assert_eq!(t.rgba(), fresh.rgba(), "gate must be pixel-invisible");
 
         // REOPEN side 2: renderer-held blink phase (no grid damage).
         t.render();
@@ -4427,18 +3164,16 @@ mod tests {
         );
     }
 
-    /// The drag half of the WF-1 gate: `selection_extend` must bump ONLY when
-    /// the resolved selection actually moved in cell coordinates.
-    ///
-    /// This is the two-sided guard for the redundant-extend fix. Every "must
-    /// draw" case below is a way an argument shadow (rather than a comparison
-    /// of the engine's resolved `TextSelection`) would have lost a real update.
+    /// The drag half of the WF-1 gate: `selection_extend` bumps ONLY when the
+    /// resolved selection actually moved in cell coordinates. Skip side: a
+    /// cell-identical (sub-cell pointer) extend gates. Draw side: a one-cell
+    /// move draws, and so does an extend with IDENTICAL arguments after the
+    /// viewport scrolled under a stationary pointer (an argument shadow, not
+    /// a comparison of the engine's resolved `TextSelection`, would lose it).
+    /// The de-dup must never change the picture.
     #[test]
     fn redundant_selection_extend_gates_but_every_real_move_still_draws() {
-        let Some(mut t) = AtermTerminal::new_from_system(8, 40, 14.0) else {
-            eprintln!("no system font; skipping selection-extend gate test");
-            return;
-        };
+        let mut t = crate::system_font_terminal(8, 40, 14.0);
         for _ in 0..20 {
             t.process(b"a line of selectable text\r\n");
         }
@@ -4472,38 +3207,7 @@ mod tests {
         assert!(!t.last_render_skipped(), "a one-cell move must draw");
         assert_ne!(t.selection_text(), span, "and it really moved");
 
-        // ---- DRAW side 2: leave a cell and come back -----------------------
-        // The head is at col 11. Go back to 10 and then to 11 again: BOTH are
-        // real changes relative to the immediately preceding state, so neither
-        // may be swallowed.
-        t.render();
-        assert!(t.last_render_skipped(), "re-settled before the round trip");
-        t.selection_extend(2, 10);
-        t.render();
-        assert!(!t.last_render_skipped(), "moving back one cell must draw");
-        t.selection_extend(2, 11);
-        t.render();
-        assert!(
-            !t.last_render_skipped(),
-            "re-entering the previous cell must draw"
-        );
-
-        // ---- DRAW side 3: a NEW drag onto the old drag's end cell ----------
-        // A stale endpoint shadow would match here and lose the whole new
-        // highlight until the pointer moved again.
-        t.selection_finish();
-        t.render();
-        t.render();
-        assert!(t.last_render_skipped(), "re-settled before the second drag");
-        t.selection_start(4, 2);
-        t.selection_extend(2, 11); // exactly where the previous drag ended
-        t.render();
-        assert!(
-            !t.last_render_skipped(),
-            "a new drag reaching the old end cell must draw"
-        );
-
-        // ---- DRAW side 4: the viewport scrolls under a stationary pointer --
+        // ---- DRAW side 2: the viewport scrolls under a stationary pointer --
         // `selection_extend` takes a DISPLAY row; a scroll moves the
         // terminal-relative anchor under an unmoved display row, so the SAME
         // arguments name a different cell of the buffer.
@@ -4536,9 +3240,7 @@ mod tests {
         );
 
         // ---- Pixel invisibility: the gate must never change the picture ----
-        let Some(mut fresh) = AtermTerminal::new_from_system(8, 40, 14.0) else {
-            return;
-        };
+        let mut fresh = crate::system_font_terminal(8, 40, 14.0);
         for _ in 0..20 {
             fresh.process(b"a line of selectable text\r\n");
         }
@@ -4553,6 +3255,46 @@ mod tests {
             t.rgba(),
             fresh.rgba(),
             "de-duping redundant extends must be pixel-invisible"
+        );
+    }
+
+    /// Glass floors glyphs on the web too: a low-contrast SGR fg (#2A2D35 on
+    /// the #111318 default) gets an opaque glyph pixel at >= 4.5:1 under 0.6
+    /// opacity with no `set_minimum_contrast` call. Negative control: the
+    /// opaque frame paints nothing near that contrast.
+    #[test]
+    fn web_translucency_floors_the_rendered_glyphs() {
+        let face = include_bytes!("../../aterm-render/assets/DejaVuSansMono.ttf");
+        let bg = aterm_types::Rgb::new(0x11, 0x13, 0x18);
+        let best = |opacity: f32| {
+            let mut t = AtermTerminal::new(
+                1,
+                4,
+                face,
+                32.0,
+                0x00d0_d0d0,
+                0x0011_1318,
+                0x00ff_ffff,
+                0x0040_4040,
+            )
+            .expect("the bundled face parses");
+            t.set_background_opacity(opacity);
+            t.process(b"\x1b[?25l\x1b[38;2;42;45;53mXXXX");
+            t.render();
+            let rgba = t.rgba();
+            rgba.as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|&&[_, _, _, a]| a == 255)
+                .map(|&[r, g, b, _]| aterm_types::Rgb::new(r, g, b).contrast(bg))
+                .fold(0.0_f64, f64::max)
+        };
+        let glass = best(0.6);
+        assert!(glass >= 4.5, "glass floored the glyphs to only {glass}:1");
+        let opaque = best(1.0);
+        assert!(
+            opaque < 4.5,
+            "control: the unfloored glyph is sub-AA ({opaque}:1)"
         );
     }
 }

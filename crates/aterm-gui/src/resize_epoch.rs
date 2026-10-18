@@ -636,8 +636,8 @@ impl EpochBook {
 /// raises the digest line (`App::arm_nudges`). A repaint by the program closes the
 /// epoch first and nothing is said.
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "RepaintNudge",
         action = "Report",
         project = "aterm_gui::nudge_conformance::Rig::header"

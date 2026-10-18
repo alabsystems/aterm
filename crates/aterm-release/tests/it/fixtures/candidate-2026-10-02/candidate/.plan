@@ -2,8 +2,6 @@ aterm-trust plan 1
 driver /x/trust/build/scratch-toolchains/stage2-d36c551fac/bin/targo
 driver-id targo 1.99.0-dev (d36c551fa 2026-10-01) (targo 0.10.0+gd36c551fa)
 only 
-per-commit 0
-scope-file /x/aterm-run/tools/trust-gate-scope.tsv
 logdir /x/aterm-run/target-trust-main/logs
 ratchet /x/aterm-run/tools/trust-gate-ratchet.tsv
 memory-file /x/aterm-run/tools/trust-gate-memory.tsv

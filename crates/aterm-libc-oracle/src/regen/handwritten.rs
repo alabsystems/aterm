@@ -307,7 +307,7 @@ That parity is the decision, not an oversight. It was declared because rustix
 names it: `pub(super) use host_statistics64 as host_statistics, vm_statistics64_t
 as vm_statistics_t` in `src/backend/libc/c.rs` (0.38.44 and 1.1.4, called by
 neither). Since 2026-09-24 ONE caller exists: `aterm-sysprobe` reads `swapins`
-and `swapouts` for the strain probe, and it passes upstream's own
+and `swapouts` for the memory ceiling, and it passes upstream's own
 `HOST_VM_INFO64_COUNT` -- THIS layout's size in words, 38 -- so the kernel
 writes the rev1 prefix and nothing past it. Both fields it reads are rev1
 fields. For a drop-in replacement, differing from the crate it replaces is

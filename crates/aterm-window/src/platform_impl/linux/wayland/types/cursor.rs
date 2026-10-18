@@ -4,31 +4,24 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/wayland/types/cursor.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
+//! Modified by the aterm project in 2026; see the repository NOTICE.
+//!
+//! LOCAL PATCH (aterm), 2026-10-17 (docs/AUDIT-third-party-2026-10-15.md, LW.7): the named
+//! cursors as cursor-shape-v1 shapes and as cursor theme names, which the pointer hands to
+//! first-party `aterm-wayland` (its cursor-shape tables, and libwayland-cursor), where upstream
+//! converted to cursor-icon's type for smithay-client-toolkit's themed pointer
+//! (`cursor_icon_to_shape`; the names are cursor-icon 1.2.0's, which `CursorIcon` records).
+//! The custom cursor image and its shm buffer are CUT: no aterm caller.
+
+use std::ffi::CString;
+
+use aterm_wayland::protocols::cursor_shape_v1::wp_cursor_shape_device_v1::shape;
+
 use crate::window::CursorIcon;
-
-use sctk::reexports::client::protocol::wl_shm::Format;
-use sctk::shm::slot::{Buffer, SlotPool};
-
-use crate::cursor::CursorImage;
-
-/// LOCAL PATCH (aterm), 2026-10-15 (winit-core step 5): `CursorIcon` is the crate's own type,
-/// and smithay-client-toolkit's themed pointer takes cursor-icon's, which Linux still links
-/// through it. Each of the six names the same CSS keyword in both.
-pub(crate) fn sctk_icon(icon: CursorIcon) -> cursor_icon::CursorIcon {
-    match icon {
-        CursorIcon::Default => cursor_icon::CursorIcon::Default,
-        CursorIcon::Pointer => cursor_icon::CursorIcon::Pointer,
-        CursorIcon::Text => cursor_icon::CursorIcon::Text,
-        CursorIcon::Grabbing => cursor_icon::CursorIcon::Grabbing,
-        CursorIcon::ColResize => cursor_icon::CursorIcon::ColResize,
-        CursorIcon::RowResize => cursor_icon::CursorIcon::RowResize,
-    }
-}
 
 #[derive(Debug)]
 pub enum SelectedCursor {
     Named(CursorIcon),
-    Custom(CustomCursor),
 }
 
 impl Default for SelectedCursor {
@@ -37,43 +30,72 @@ impl Default for SelectedCursor {
     }
 }
 
-#[derive(Debug)]
-pub struct CustomCursor {
-    pub buffer: Buffer,
-    pub w: i32,
-    pub h: i32,
-    pub hotspot_x: i32,
-    pub hotspot_y: i32,
+/// The icon's cursor-shape-v1 shape (sctk 0.19.2's `cursor_icon_to_shape`).
+pub(crate) fn shape(icon: CursorIcon) -> u32 {
+    match icon {
+        CursorIcon::Default => shape::DEFAULT,
+        CursorIcon::Pointer => shape::POINTER,
+        CursorIcon::Text => shape::TEXT,
+        CursorIcon::Grabbing => shape::GRABBING,
+        CursorIcon::ColResize => shape::COL_RESIZE,
+        CursorIcon::RowResize => shape::ROW_RESIZE,
+        CursorIcon::NResize => shape::N_RESIZE,
+        CursorIcon::NeResize => shape::NE_RESIZE,
+        CursorIcon::EResize => shape::E_RESIZE,
+        CursorIcon::SeResize => shape::SE_RESIZE,
+        CursorIcon::SResize => shape::S_RESIZE,
+        CursorIcon::SwResize => shape::SW_RESIZE,
+        CursorIcon::WResize => shape::W_RESIZE,
+        CursorIcon::NwResize => shape::NW_RESIZE,
+    }
 }
 
-impl CustomCursor {
-    pub(crate) fn new(pool: &mut SlotPool, image: &CursorImage) -> Self {
-        let (buffer, canvas) = pool
-            .create_buffer(
-                image.width as i32,
-                image.height as i32,
-                4 * (image.width as i32),
-                Format::Argb8888,
-            )
-            .unwrap();
+/// The names a cursor theme may hold the icon under, in the order sctk tried them: its CSS name,
+/// then its legacy Xcursor names.
+pub(crate) fn theme_names(icon: CursorIcon) -> Vec<CString> {
+    std::iter::once(icon.name())
+        .chain(icon.alt_names().iter().copied())
+        .filter_map(|name| CString::new(name).ok())
+        .collect()
+}
 
-        for (canvas_chunk, rgba) in canvas.chunks_exact_mut(4).zip(image.rgba.chunks_exact(4)) {
-            // Alpha in buffer is premultiplied.
-            let alpha = rgba[3] as f32 / 255.;
-            let r = (rgba[0] as f32 * alpha) as u32;
-            let g = (rgba[1] as f32 * alpha) as u32;
-            let b = (rgba[2] as f32 * alpha) as u32;
-            let color = ((rgba[3] as u32) << 24) + (r << 16) + (g << 8) + b;
-            let array: &mut [u8; 4] = canvas_chunk.try_into().unwrap();
-            *array = color.to_le_bytes();
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        CustomCursor {
-            buffer,
-            w: image.width as i32,
-            h: image.height as i32,
-            hotspot_x: image.hotspot_x as i32,
-            hotspot_y: image.hotspot_y as i32,
-        }
+    const ALL: [CursorIcon; 14] = [
+        CursorIcon::Default,
+        CursorIcon::Pointer,
+        CursorIcon::Text,
+        CursorIcon::Grabbing,
+        CursorIcon::ColResize,
+        CursorIcon::RowResize,
+        CursorIcon::NResize,
+        CursorIcon::NeResize,
+        CursorIcon::EResize,
+        CursorIcon::SeResize,
+        CursorIcon::SResize,
+        CursorIcon::SwResize,
+        CursorIcon::WResize,
+        CursorIcon::NwResize,
+    ];
+
+    /// Each icon has a shape of its own, and the protocol names the shape by the icon's CSS
+    /// name (`n-resize` is `N_RESIZE`).
+    #[test]
+    fn every_icon_has_its_own_shape_named_as_its_css_name() {
+        let mut shapes: Vec<u32> = ALL.iter().map(|i| shape(*i)).collect();
+        shapes.sort_unstable();
+        shapes.dedup();
+        assert_eq!(shapes.len(), ALL.len());
+        assert_eq!(shape(CursorIcon::NResize), shape::N_RESIZE);
+        assert_eq!(shape(CursorIcon::ColResize), shape::COL_RESIZE);
+    }
+
+    #[test]
+    fn a_theme_is_asked_for_the_css_name_first() {
+        let names = theme_names(CursorIcon::Text);
+        assert_eq!(names[0].as_bytes(), b"text");
+        assert_eq!(names[1].as_bytes(), b"xterm");
     }
 }

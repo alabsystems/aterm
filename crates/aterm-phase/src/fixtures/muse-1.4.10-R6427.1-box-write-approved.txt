@@ -1,0 +1,15 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab) · the file-access box of the write answered with Enter on its focused first option · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+  Muse Code 1.4.10
+
+❯ toolstart
+
+◆ Wrote .agents/probe-write.md (+1)
+  1 +written by the lab stub
+
+◆ Tool call done. Result: wrote 24 bytes to /private/tmp/at.lab0/proj/.agents/probe-write.md
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  lab-stub · high · /private/tmp/at.lab0/proj · Auto-review

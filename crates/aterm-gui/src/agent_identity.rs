@@ -33,7 +33,7 @@
 //! (`docs/AGENT-EXPERIENCE-2026-08-26.md` §7.3).
 //!
 //! `spawn identity=<name>` is the only create path ([`ensure`] with
-//! `create = true`, Owner-only, on the verb's control thread). The event loop's
+//! `create = true`, Owner-only, on the verb's control thread). The spawner's
 //! half of that spawn ([`check_for_spawn`]), the spawn seam and a cold restore pass
 //! `create = false`: a missing identity falls back to a default shell with one
 //! stderr line ([`restorable`]). A downgrade to a build without the field keeps
@@ -138,7 +138,9 @@ pub(crate) fn ensure_in(root: &Path, name: &str, create: bool) -> io::Result<Pat
     Ok(dir)
 }
 
-/// The event loop's half of a spawn under `name`: the identity must exist
+/// The spawner's half of a spawn under `name`, before its fork
+/// (`tab_spawn::IdentityPrep::Admit`, never in an event-loop turn: the
+/// identities folder can sit on a slow volume): the identity must exist
 /// (`create = false`), and its required directories must be private before a
 /// child receives them. `spawn identity=<name>` created and primed it on the
 /// control thread before the spawn was posted, and an INHERITED one (an aimed

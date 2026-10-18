@@ -530,11 +530,18 @@ macro_rules! bind {
                 }
             }
 
-            /// Push the host OS color scheme into the engine. `dark = true` selects a dark
-            /// appearance, `false` light. When the scheme CHANGES and the app enabled DEC mode
+            /// Set the host's baseline colour scheme: the appearance of the background the
+            /// host set (`set_theme`). `dark = true` selects dark, `false` light. A program's
+            /// OSC 11 background outranks it while it holds (DSR 996 answers the background
+            /// on screen). When the REPORTED scheme changes and the app enabled DEC mode
             /// 2031, the engine queues an unsolicited `CSI ? 997 ; Ps n` (1=dark, 2=light);
             /// drain it via `take_response` and forward to the PTY so subscribed apps live-
-            /// update their theme. A no-op when the scheme is unchanged.
+            /// update their theme. A no-op when the reported scheme is unchanged.
+            ///
+            /// With a selector installed by `set_theme_by_name`, this is the OS
+            /// appearance instead: it picks the selector's side, installs it and
+            /// reports the drawn theme's appearance (a plain theme reports the same
+            /// in light and dark mode, as native does).
             pub fn set_color_scheme(&mut self, dark: bool) {
                 // WF-1 gate (defensive): scheme changes can recolor engine-resolved
                 // dynamic colors; whether the engine marks damage for every arm is its
@@ -545,7 +552,10 @@ macro_rules! bind {
                 } else {
                     aterm_types::Appearance::Light
                 };
-                self.term.set_color_scheme(scheme);
+                // With a selector installed by `set_theme_by_name`, this picks its
+                // side and reports the palette on screen; else the host owns the
+                // colours and only the reported baseline moves (theme_api).
+                self.follow_appearance(scheme);
             }
 
             /// Encode a mouse-button PRESS at 0-based on-screen cell `col`/`row` for the
@@ -626,6 +636,11 @@ macro_rules! bind {
             /// when unknown). Returns `None` when the event encodes to nothing (e.g. a
             /// release without the Kitty protocol) or the key has no terminal encoding
             /// (modifier-only / IME / unidentified DOM keys — never guessed).
+            ///
+            /// `mods` are the chord's modifiers only: a press AltGr chose (Windows
+            /// reports it as `ctrlKey` + `altKey`, with `getModifierState("AltGraph")`
+            /// true) goes in without CTRL and ALT, its glyph in `key`; a Ctrl+Alt left
+            /// on it is encoded as a chord (`encode_dom_key`).
             pub fn encode_key(
                 &self,
                 key: &str,

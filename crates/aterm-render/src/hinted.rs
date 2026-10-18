@@ -53,8 +53,9 @@
 //! names: it has no separate Bold file, so BOTH the regular cut and the
 //! `wght`≈700 cut the real-bold path (W9) draws are instances, and a hinter
 //! pinned to `LocationRef::default()` would silently reset the configured
-//! weight. (The unconfigured Windows default is the bundled STATIC Cascadia
-//! Mono PL, whose real Bold / Italic files take slot 0 like any static face.)
+//! weight. (The bundled faces, the unconfigured Windows default Iosevka Term
+//! Semibold and Cascadia Mono PL among them, are STATIC: their real Bold /
+//! Italic files take slot 0 like any static face.)
 //! Linux passes an empty coord slice: the default location.
 //!
 //! Production builds gate this to `cfg(any(all(unix, not(target_os = "macos")), windows))` at the
@@ -453,24 +454,6 @@ mod tests {
         HintingInstance::new(dejavu(), 0, px, &[], HintMode::Full.options().unwrap()).unwrap()
     }
 
-    /// The blit anchors must be the FLOOR of the fitted ink box: xmin <= every
-    /// outline x < xmin + width, same for y — the "origins snap to integer
-    /// pixels" law. Verified over the printable ASCII set at the live 12px.
-    #[test]
-    fn ink_box_floor_law_ascii_12px() {
-        let hint = full_instance(12.0);
-        for ch in ' '..='~' {
-            let Some(gid) = unicode_gid(dejavu(), 0, ch) else {
-                continue;
-            };
-            let (w, h, _xmin, _ymin, adv, cov) =
-                hinted_glyph_raster(dejavu(), 0, gid, 12.0, &hint, &[]).unwrap();
-            assert_eq!(cov.len(), w * h, "coverage is width*height for {ch:?}");
-            assert!(adv > 0.0, "printable ASCII advances are positive ({ch:?})");
-            assert!(w <= 32 && h <= 32, "sane 12px ink box for {ch:?}: {w}x{h}");
-        }
-    }
-
     /// Per-row peak coverage ≥ `t` — a row whose brightest texel is near-full
     /// renders a solid (not washed) stroke crossing there.
     fn rows_with_peak(cov: &[u8], w: usize, h: usize, t: u8) -> usize {
@@ -703,12 +686,13 @@ mod tests {
     fn ppem_sweep_no_glyph_rasterizes_as_a_filled_block() {
         // Both bundled faces: the text default the bug bit, and the Nerd icon
         // face, whose outlines are shaped nothing like Latin text.
-        let mut faces: Vec<(&str, &[u8])> = vec![("DejaVuSansMono (embedded)", dejavu())];
-        #[cfg(feature = "embedded-symbols")]
-        faces.push((
-            "SymbolsNerdFontMono (embedded)",
-            crate::embedded_symbols_font(),
-        ));
+        let faces: [(&str, &[u8]); 2] = [
+            ("DejaVuSansMono (embedded)", dejavu()),
+            (
+                "SymbolsNerdFontMono (embedded)",
+                crate::embedded_symbols_font(),
+            ),
+        ];
         let chars = sweep_chars();
         let modes = [HintMode::Full, HintMode::Light];
         let mut checked = 0usize;
@@ -771,77 +755,6 @@ mod tests {
         assert!(
             checked > 5_000,
             "the ppem sweep must actually rasterize thousands of glyphs, got {checked}"
-        );
-    }
-
-    /// A VARIABLE system face — Windows 11's own Cascadia Mono (what
-    /// `font_family = "Cascadia Mono"` names) or any other `%WINDIR%\Fonts`
-    /// face with a `wght` axis. Panics rather than skipping: a test that
-    /// silently returns when its fixture is missing passes forever and proves
-    /// nothing, and the embedded DejaVu (no `fvar`) cannot stand in — every
-    /// location on it normalizes to empty, which is exactly the vacuity this
-    /// guards against.
-    #[cfg(windows)]
-    fn variable_system_face() -> (String, Vec<u8>) {
-        let dir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".to_string());
-        let mut candidates = vec![format!("{dir}\\Fonts\\CascadiaMono.ttf")];
-        if let Ok(rd) = std::fs::read_dir(format!("{dir}\\Fonts")) {
-            candidates.extend(rd.flatten().filter_map(|e| {
-                let p = e.path();
-                (p.extension().is_some_and(|x| x.eq_ignore_ascii_case("ttf")))
-                    .then(|| p.to_str().map(str::to_string))
-                    .flatten()
-            }));
-        }
-        for path in candidates {
-            let Ok(bytes) = std::fs::read(&path) else {
-                continue;
-            };
-            let usable = aterm_font::Face::parse(&bytes, 0).is_ok_and(|f| {
-                f.variation_axes()
-                    .into_iter()
-                    .any(|a| a.tag == aterm_font::Tag(WGHT) && a.max_value >= 600.0)
-            });
-            if usable {
-                return (path, bytes);
-            }
-        }
-        panic!("no variable font with a `wght` axis under {dir}\\Fonts");
-    }
-
-    /// The coord seam, on a face that can actually show it: an EMPTY slice is
-    /// the `fvar` DEFAULT location (the pre-instance behaviour this module
-    /// shipped with, which Linux still relies on byte-for-byte), and a REAL
-    /// request moves off it. Without the second half the first is vacuous —
-    /// a static face normalizes everything to the default.
-    #[cfg(windows)]
-    #[test]
-    fn coords_move_the_fitted_outline() {
-        let (path, bytes) = variable_system_face();
-        let outline_of = |coords: &[(u32, f32)]| {
-            let hint = HintingInstance::new(&bytes, 0, 16.0, coords, Target::Normal).unwrap();
-            let gid = unicode_gid(&bytes, 0, 'M').unwrap();
-            let mut pen = PathPen::default();
-            hint.draw(&bytes, 0, gid, &mut pen).unwrap();
-            (pen.min_x, pen.max_x, pen.min_y, pen.max_y, pen.cmds.len())
-        };
-        let default_wght = aterm_font::Face::parse(&bytes, 0)
-            .unwrap()
-            .variation_axes()
-            .into_iter()
-            .find(|a| a.tag == aterm_font::Tag(WGHT))
-            .unwrap()
-            .def_value;
-        assert_eq!(
-            outline_of(&[]),
-            outline_of(&[(WGHT, default_wght)]),
-            "{path}: empty coords must be the fvar default location"
-        );
-        assert_ne!(
-            outline_of(&[]),
-            outline_of(&[(WGHT, 700.0)]),
-            "{path}: a real wght request must move off the default location \
-             (the hinter would otherwise fit the wrong cut)"
         );
     }
 

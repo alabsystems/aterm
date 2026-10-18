@@ -9,7 +9,7 @@
 //! the lowest descender from the seam. These tests compose the band through the real
 //! `compose_band` and render it through the CPU renderer at the shipped sizes, and pin
 //! the cases that keep the face's underline as the seam: cells too short to lift, a
-//! strain rail, an outlined capsule, and chips that keep their own fill.
+//! glint rail, an outlined capsule, and chips that keep their own fill.
 
 use aterm_core::render::HostRowPixels;
 use aterm_core::terminal::{RenderCell, Terminal, UnderlineStyle};
@@ -24,7 +24,7 @@ const COLS: usize = 44;
 const PAD: usize = 8;
 
 /// A size whose band rails its seam on every platform's default face
-/// (Windows' Cascadia Mono PL: a 30 px cell, room `(1, 2)`).
+/// (Windows' Iosevka Term Semibold: a 30 px cell, room `(2, 1)`).
 const RAILED_PX: f32 = 24.0;
 
 fn inks() -> BandInks {
@@ -195,14 +195,16 @@ fn a_stacked_rows_divider_is_a_rail_with_the_same_clear_row() {
 }
 
 /// Under [`RAIL_SEAM_MIN_CELL_H`], or where the face's measured room cannot pay for the
-/// lift ([`seam_can_rail`]: Windows' Cascadia Mono PL at 14 px and 18 px, room
-/// `(0, 1)`), the seam stays the underline: no rail is laid and the words do not lift.
+/// lift ([`seam_can_rail`]: Windows' Iosevka Term Semibold on its own line at 14, 15 and
+/// 16 px, rooms `(0, 0)`, `(1, 0)` and `(0, 1)`), the seam stays the underline: no rail
+/// is laid and the words do not lift.
 #[test]
 fn a_cell_too_short_to_lift_keeps_the_underline_seam() {
     let mut ran = 0;
-    // On Windows also 18 px: a tall cell whose face has no room for the rail.
+    // On Windows also 15 and 16 px: cells tall enough for the proxy whose face has
+    // no room for the rail.
     let sizes: &[f32] = if cfg!(windows) {
-        &[8.0, 10.0, 12.0, 14.0, 18.0]
+        &[8.0, 10.0, 12.0, 14.0, 15.0, 16.0]
     } else {
         &[8.0, 10.0, 12.0, 14.0]
     };
@@ -272,11 +274,11 @@ fn the_seam_rail_covers_the_gutters_and_the_bleed_adds_no_second_line() {
     }
 }
 
-/// A stack with a strain rail (ruling 243), an outlined capsule (ruling 254) or chips
-/// that keep their own fill keeps the underline seam: those rows own their foot, and a
-/// rail would leave holes under a chip's `own` columns.
+/// A stack with a glint rail, an outlined capsule (ruling 254) or chips that keep their
+/// own fill keeps the underline seam: those rows own their foot, and a rail would leave
+/// holes under a chip's `own` columns.
 #[test]
-fn a_stack_with_a_strain_rail_or_owned_chips_keeps_the_underline_seam() {
+fn a_stack_with_a_glint_rail_or_owned_chips_keeps_the_underline_seam() {
     use aterm_messages::ink::RowRaster;
     let c = inks();
     let seam = pack(c.label);
@@ -286,9 +288,8 @@ fn a_stack_with_a_strain_rail_or_owned_chips_keeps_the_underline_seam() {
             own: vec![(2, 6)],
             ..RowRaster::default()
         }),
-        ("strain rail", |w| RowRaster {
+        ("glint rail", |w| RowRaster {
             rail: vec![Some([0xff, 0x88, 0x00]); w],
-            clear_rail: true,
             ..RowRaster::default()
         }),
         ("ring", |_| RowRaster {
@@ -307,10 +308,10 @@ fn a_stack_with_a_strain_rail_or_owned_chips_keeps_the_underline_seam() {
             m.rail.iter().all(|&px| px != seam),
             "{kind}: no seam rail was laid over the row's own foot"
         );
-        if kind == "strain rail" {
-            // Where the gauge is lit it is the row's lower edge: the seam gives
+        if kind == "glint rail" {
+            // Where the rail is lit it is the row's lower edge: the seam gives
             // way to it cell by cell (`give_seam_to_rails`).
-            assert!(m.rail_h > 1, "{kind}: the gauge keeps its own height");
+            assert!(m.rail_h > 1, "{kind}: the rail keeps its own height");
         } else {
             assert!(
                 dst.cells[0][20].underline == UnderlineStyle::Single,

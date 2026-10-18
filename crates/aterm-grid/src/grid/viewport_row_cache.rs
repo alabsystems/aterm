@@ -100,7 +100,7 @@ fn capacity_for(visible_rows: u16) -> usize {
 }
 
 /// The per-`Grid` memo. Interior-mutable because `Grid::visible_row_view` takes `&self`;
-/// `Grid` is already `!Sync` (its `StyleTable` is).
+/// the `RefCell` makes `Grid` `!Sync`, which no reader needs.
 #[derive(Debug, Default)]
 pub(in crate::grid) struct ViewportRowCache {
     inner: RefCell<Inner>,

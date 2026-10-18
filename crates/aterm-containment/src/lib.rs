@@ -2,17 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! 4-mode containment for AI agent isolation: the mode → capabilities policy, and the
+//! 3-mode containment for AI agent isolation: the mode → capabilities policy, and the
 //! spawn-seam actuator that enforces it. [`actuator`]'s module doc states each rule; in short:
 //!
 //! | Mode | Trust | Enforced |
 //! |------|-------|----------|
-//! | **Master** | Full | Nothing beyond the capability-gated spawn. |
 //! | **User** | Normal (default) | Nothing beyond the capability-gated spawn; the shell keeps aterm's own resource limits. |
 //! | **Safety** | Reduced | Resource limits, no OS sandbox: soft on POSIX (the shell's rc or its program can raise them), binding on Windows (the Job Object). |
 //! | **Containment** | Hostile | macOS Seatbelt: no network, no task port but a process's own, no mach service lookup but the user and group queries, writes confined to the temp roots, no access to the credential and private-data stores; plus Safety's limits as hard limits. Refuses to start where no OS sandbox exists. |
 //!
-//! The policy tests pin the mapping over all four modes and every ordered pair: a lower mode
+//! The policy tests pin the mapping over all three modes and every ordered pair: a lower mode
 //! never holds more of any capability than a higher one, and Containment holds each at its
 //! floor. The mode is set once per process ([`init_mode`]) and never changes.
 //!
@@ -42,7 +41,7 @@
 )]
 #![allow(
     clippy::inline_always,
-    reason = "containment hot paths require cross-crate inlining for zero-cost in Master/User modes (#5559)"
+    reason = "containment hot paths require cross-crate inlining for zero-cost in User mode (#5559)"
 )]
 
 pub mod actuator;
@@ -217,54 +216,5 @@ impl From<ParseModeError> for InitModeFromFlagError {
 impl From<InitError> for InitModeFromFlagError {
     fn from(value: InitError) -> Self {
         Self::Init(value)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // `OnceLock` is process-global, so init isolation is not testable within
-    // one binary; the pure policy tests carry the verification.
-
-    #[test]
-    fn test_init_error_message_includes_modes() {
-        let err = InitError::AlreadyInitialized {
-            existing: ContainmentMode::Containment,
-            attempted: ContainmentMode::Master,
-        };
-        let msg = err.to_string();
-        assert!(
-            msg.contains("Containment"),
-            "error should mention existing mode: {msg}"
-        );
-        assert!(
-            msg.contains("Master"),
-            "error should mention attempted mode: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_init_mode_from_flag_error_variants() {
-        let parse_err = InitModeFromFlagError::Parse(ParseModeError("bogus".to_string()));
-        let msg = parse_err.to_string();
-        assert!(
-            msg.contains("invalid containment mode"),
-            "parse error should say what was invalid: {msg}"
-        );
-        assert!(
-            msg.contains("bogus"),
-            "parse error should include bad value: {msg}"
-        );
-
-        let init_err = InitModeFromFlagError::Init(InitError::AlreadyInitialized {
-            existing: ContainmentMode::User,
-            attempted: ContainmentMode::Safety,
-        });
-        let msg = init_err.to_string();
-        assert!(
-            msg.contains("already set"),
-            "init error should explain double-init: {msg}"
-        );
     }
 }

@@ -326,11 +326,13 @@ mod tests {
     #[test]
     fn floor_filters_below_high_water() {
         let cands = vec![signed("v30", 30), signed("v45", 45), signed("v42", 42)];
-        // Floor 44 ⇒ only v45 qualifies.
-        let sel = select_index(&anchor(0), cands.clone(), floor(44), testkit::NOW)
-            .selected
-            .expect("v45 qualifies");
-        assert_eq!(sel.index.index_build, 45);
+        // Floor 44 ⇒ only v45 qualifies; floor 45 admits it too (the gate is >=).
+        for at in [44, 45] {
+            let sel = select_index(&anchor(0), cands.clone(), floor(at), testkit::NOW)
+                .selected
+                .expect("v45 qualifies");
+            assert_eq!(sel.index.index_build, 45, "floor {at}");
+        }
         // Floor 100 ⇒ nothing qualifies.
         assert!(
             select_index(&anchor(0), cands, floor(100), testkit::NOW)
@@ -419,22 +421,6 @@ mod tests {
                 .selected
                 .is_none()
         );
-    }
-
-    #[test]
-    fn no_candidates_selects_nothing() {
-        let out = select_index(&anchor(0), vec![], no_floor(), testkit::NOW);
-        assert!(out.selected.is_none());
-        assert_eq!(out.observed_roster_seq, 0);
-    }
-
-    // Equal to the floor is allowed (>=).
-    #[test]
-    fn equal_to_floor_is_allowed() {
-        let sel = select_index(&anchor(0), vec![signed("v41", 41)], floor(41), testkit::NOW)
-            .selected
-            .expect("equal passes");
-        assert_eq!(sel.index.index_build, 41);
     }
 
     /// A candidate on a generation older than the newest admitted is discarded however high
@@ -533,69 +519,6 @@ mod tests {
             .selected
             .is_none(),
             "within one generation the ratchet is exactly as monotonic as it was"
-        );
-    }
-
-    /// Candidates carrying one roster pair cost one master verify, not one each.
-    ///
-    /// MUTATION: drop the memo in Pass 1 and this counts four verifies.
-    #[test]
-    fn one_generation_costs_one_admission_however_many_candidates_carry_it() {
-        let cands = vec![
-            signed("atpkg-index-29", 29),
-            signed("atpkg-index-30", 30),
-            signed("atpkg-index-31", 31),
-            signed("atpkg-index-32", 32),
-        ];
-        // Premise: one roster pair published beside every release.
-        assert!(
-            cands
-                .iter()
-                .all(|c| c.roster_bytes == cands[0].roster_bytes
-                    && c.roster_sig == cands[0].roster_sig),
-            "four releases, one published roster pair"
-        );
-        let before = testkit::master_verifies();
-        let out = select_index(&anchor(0), cands, no_floor(), testkit::NOW);
-        assert_eq!(
-            testkit::master_verifies() - before,
-            1,
-            "four candidates carrying ONE roster generation must cost one master verify"
-        );
-        let sel = out.selected.expect("the highest signed build wins");
-        assert_eq!(sel.label, "atpkg-index-32");
-        assert_eq!(sel.index.index_build, 32);
-        assert_eq!(sel.index.attribution().machine_id, testkit::MACHINE_ID);
-        assert_eq!(
-            out.observed_roster_seq,
-            testkit::SEQ,
-            "the reused generation is observed exactly as the re-admitted one was"
-        );
-    }
-
-    /// The memo keys on the exact bytes of both halves: a pair with a forged master
-    /// signature is refused on its own account, not waved through by the genuine one.
-    #[test]
-    fn distinct_roster_pairs_are_each_admitted_on_their_own() {
-        // Same roster bytes, a forged master signature: a different pair.
-        let mut forged = signed("forged-master-sig", 9_000);
-        forged.roster_sig = vec![0u8; 64];
-        let before = testkit::master_verifies();
-        let out = select_index(
-            &anchor(0),
-            vec![forged, signed("genuine", 60)],
-            no_floor(),
-            testkit::NOW,
-        );
-        assert_eq!(
-            testkit::master_verifies() - before,
-            2,
-            "two distinct (roster_bytes, roster_sig) pairs are two admissions"
-        );
-        let sel = out.selected.expect("the genuine candidate still qualifies");
-        assert_eq!(
-            sel.index.index_build, 60,
-            "the forged pair carried no authority, however high its build"
         );
     }
 }

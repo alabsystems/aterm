@@ -3,11 +3,7 @@
 // Author: Andrew Yates
 
 //! Search surface for aterm-core; the logic lives in `aterm-search`.
-//!
-//! The `SearchContent` impls live beside their types (orphan rules): `Grid`'s
-//! in `aterm-grid`, the `Scrollback*` adapters in `aterm-scrollback`.
 
-pub use aterm_search::streaming;
 pub use aterm_search::{
     BloomFilter, BudgetedSearch, DEFAULT_MAX_CACHED_LINES, LineCells, MAX_SEARCH_MATCHES,
     NarrowedSearch, SearchDirection, SearchIndex, SearchMatch, SearchOptionsError, SearchResults,

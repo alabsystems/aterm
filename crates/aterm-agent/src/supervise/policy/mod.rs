@@ -15,7 +15,14 @@
 //!   aterm-phase did not read whole, is escalated.
 //! * [`claude_settings`]: where a Claude Code agent's settings live, and the
 //!   ask rules and PreToolUse hooks in them that may send a box to a person.
+//! * [`box_facts`]: what the loop learned of a box before deciding it, and the
+//!   context built from those facts alone ([`ApprovalCtx::from`]).
+//! * [`box_call`]: transcript candidates matching a box's possible tool and
+//!   file, without current-mount identity or authority to lift settings holds.
 //! * [`git_config`]: what a git read would load that can run a program.
+//! * [`probe`]: the one door the approval policy looks at the machine by
+//!   ([`PolicyProbe`]), at the level of what it concluded — so a harness tape
+//!   holds what a decision turned on, and never the worker's environment.
 //! * [`rm_breaker`]: where every `rm` operand on a line points, for the rm
 //!   circuit breaker's approval rule.
 //! * [`shell_startup`]: what the worker's shell carries in from the person's
@@ -24,36 +31,44 @@
 //!   generation fence.
 //! * [`reset`]: a limit reset's vocabulary between the loop and its host, and
 //!   the verdict on the confirmation its row opens ([`confirm_verdict`]).
+//! * [`trace`]: a decision's rule trace — the checks a policy consulted and what
+//!   came of each, which diagnostic callers can collect. The loop keeps
+//!   no steps, and these APIs have no current CLI reader.
 //! * [`turn_end`]: the turn-end decider (continue, wait out a wall, switch a
 //!   model, compact, log in, or escalate).
 //! * [`exception`], [`outlook`]: the points only a person can answer, and what
 //!   becomes of each wall.
 
 pub mod approval;
+pub mod box_call;
+pub mod box_facts;
 pub mod claude_settings;
 pub mod exception;
 pub mod git_config;
 pub mod guard;
 pub mod outlook;
+pub mod probe;
+mod probe_live;
 pub mod question;
 pub mod reset;
 pub mod rm_breaker;
 pub mod shell_startup;
+pub mod trace;
 pub mod turn_end;
 
 pub use approval::{
-    Answer, AnswerTarget, ApprovalCtx, Choice, DECLINE_PREFIX, Decision, DeclineStep, NudgeCtx,
+    Answer, AnswerTarget, ApprovalCtx, Choice, DECLINE_PREFIX, Decision, DeclineStep,
     QuestionPriority, REFUSAL_LABEL, RULE_ALLOW_ONCE, RULE_ANSWER_LONG_TERM,
-    RULE_ANSWER_SHORT_TERM, RULE_DECLINE, RULE_GOAL_RESUME, RULE_LIMIT_RESET, RULE_MODEL_CONFIRM,
-    RULE_MODEL_RESTORE_PICK, RULE_MODEL_SWITCH, RULE_NO_SPEND, RULE_PLAN, RULE_PROSE_LONG_TERM,
-    RULE_PROSE_SHORT_TERM, RULE_RATE_NUDGE_KEEP, RULE_RATE_NUDGE_SWITCH, RULE_READ_ONLY,
+    RULE_ANSWER_SHORT_TERM, RULE_DECLINE, RULE_LIMIT_RESET, RULE_MODEL_CONFIRM, RULE_MODEL_SWITCH,
+    RULE_NO_SPEND, RULE_PLAN, RULE_PROSE_LONG_TERM, RULE_PROSE_SHORT_TERM, RULE_READ_ONLY,
     RULE_READ_OUTSIDE_CWD, RULE_RM_BREAKER, RULE_RM_BREAKER_WARN, RULE_TALL_BOX, RULE_TRUST_ANY,
-    RULE_TRUST_DIALOG, SecretRule, buys, decide, decide_screen, decline, decline_step,
-    decline_text, default_secrets, footer_mode, rm_breaker_label, roots_from_config,
+    RULE_TRUST_DIALOG, SecretRule, buys, decide, decide_screen, decide_traced, decline,
+    decline_step, decline_text, default_secrets, footer_mode, rm_breaker_label, roots_from_config,
 };
 pub use claude_settings::{AskKind, OwnerAsk};
 pub use git_config::{GitView, WorkerEnv};
 pub use guard::{key_args, row_guard, server_fences_gen, server_fences_send};
+pub use probe::{LiveProbe, OnDisk, PolicyProbe, WorkerWrites};
 pub use question::{
     LONG_TERM_TEXT, MAX_QUESTION_FOCUS_STEPS, RULE_ANSWER_RECOMMENDED, SHORT_TERM_TEXT,
     answer_question, is_question_rule,

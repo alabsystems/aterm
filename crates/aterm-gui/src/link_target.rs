@@ -91,6 +91,7 @@
 use std::ops::Range;
 
 use aterm_core::terminal::RenderCell;
+#[cfg(test)]
 use aterm_render::Theme;
 
 use crate::chrome_band;
@@ -477,7 +478,7 @@ pub(crate) fn caption(url: &str, max_cells: usize) -> Caption {
 pub(crate) fn caption_row(
     url: &str,
     cols: usize,
-    theme: Theme,
+    palette: impl Into<chrome_band::ChromePalette>,
     seam: bool,
     tracking: bool,
 ) -> Option<Vec<RenderCell>> {
@@ -485,7 +486,7 @@ pub(crate) fn caption_row(
     if body < MIN_URL_CELLS {
         return None;
     }
-    let c = chrome_band::band_colors(theme);
+    let c = chrome_band::band_colors(palette);
     let mut row = blank_row(cols, c.label, c.bar_bg, seam);
     let lead = if !crate::is_safe_url(url) {
         BLOCKED
@@ -532,7 +533,100 @@ pub(crate) fn caption_row(
     // its bottom edge with the twin in `aterm_render::band` (`seal_stack`). See
     // the module header for why the ink is the band's and not the text's.
     if seam {
-        chrome_band::seal_band_top(&mut row, c.label);
+        chrome_band::seal_band_top(&mut row, c.seam);
+    }
+    Some(row)
+}
+
+/// The lead-in of a file citation's caption (`crate::path_link`): the click
+/// opens aterm's own editor, never the OS, and the band says so.
+pub(crate) const OPENS_IN_ATERM: &str = "opens in aterm:";
+
+/// The same lead-in while the program under the pointer tracks the mouse:
+/// the gesture that still reaches aterm.
+#[cfg(target_os = "macos")]
+const OPENS_IN_ATERM_TRACKED: &str = "Cmd-Option-click opens in aterm:";
+#[cfg(not(target_os = "macos"))]
+const OPENS_IN_ATERM_TRACKED: &str = "ctrl+alt+click opens in aterm:";
+
+/// A file citation's name laid out for `max_cells`: its safe form
+/// ([`safe_form`]), cut from the FRONT when too wide so the file name and its
+/// line, the answer, are the last thing to go. Returns the text and the run
+/// to emphasize (the final path component with its `:line`), in characters.
+pub(crate) fn path_caption(shown: &str, max_cells: usize) -> (String, Range<usize>) {
+    let safe = safe_form(shown);
+    let chars: Vec<char> = safe.chars().collect();
+    let text: Vec<char> = if chars.len() <= max_cells {
+        chars
+    } else if max_cells == 0 {
+        Vec::new()
+    } else {
+        let keep = max_cells - 1;
+        std::iter::once(ELLIPSIS)
+            .chain(chars[chars.len() - keep..].iter().copied())
+            .collect()
+    };
+    let name_start = text
+        .iter()
+        .rposition(|ch| *ch == '/')
+        .map_or(0, |at| at + 1)
+        .max(usize::from(text.first() == Some(&ELLIPSIS)));
+    (text.iter().collect(), name_start..text.len())
+}
+
+/// PURE row builder for a file citation (`crate::path_link`):
+/// `opens in aterm: <path>:<line>`, the file name and line emphasized, the
+/// same band as [`caption_row`] (`cols` wide, the seam when asked). `None`
+/// when the band leaves fewer than [`MIN_URL_CELLS`] for the name.
+pub(crate) fn path_caption_row(
+    shown: &str,
+    cols: usize,
+    palette: impl Into<chrome_band::ChromePalette>,
+    seam: bool,
+    tracking: bool,
+) -> Option<Vec<RenderCell>> {
+    let body = cols.saturating_sub(MARGIN * 2);
+    if body < MIN_URL_CELLS {
+        return None;
+    }
+    let c = chrome_band::band_colors(palette);
+    let mut row = blank_row(cols, c.label, c.bar_bg, seam);
+    let lead = if tracking {
+        OPENS_IN_ATERM_TRACKED
+    } else {
+        OPENS_IN_ATERM
+    };
+    let gap = 1;
+    let with_lead = body.saturating_sub(lead.len() + gap);
+    let (name_col, name_cells) = if with_lead >= LEAD_IN_URL_CELLS {
+        write_str(&mut row, cols, MARGIN, lead, c.label, c.bar_bg, false);
+        (MARGIN + lead.len() + gap, with_lead)
+    } else {
+        (MARGIN, body)
+    };
+    let (text, emphasis) = path_caption(shown, name_cells);
+    if !text.chars().any(|ch| ch != ELLIPSIS) {
+        return None;
+    }
+    write_str(&mut row, cols, name_col, &text, c.label, c.bar_bg, false);
+    if !emphasis.is_empty() {
+        let run: String = text
+            .chars()
+            .skip(emphasis.start)
+            .take(emphasis.len())
+            .collect();
+        write_str(
+            &mut row,
+            cols,
+            name_col + emphasis.start,
+            &run,
+            c.value,
+            c.bar_bg,
+            true,
+        );
+    }
+    if seam {
+        chrome_band::seal_band_top(&mut row, c.seam);
     }
     Some(row)
 }
@@ -821,52 +915,6 @@ mod tests {
         assert!(caption_row("", 200, theme, true, false).is_none());
     }
 
-    /// The seam is the band's content-facing EDGE, so it must run the whole
-    /// width. Every cell carries it — the margins, the lead-in, the gap, the
-    /// URL and the tail alike — or the rule reads as scattered debris over the
-    /// row rather than as a boundary.
-    #[test]
-    fn the_seam_runs_unbroken_and_one_toned_across_every_cell_of_the_band() {
-        let theme = Theme::default();
-        let row =
-            caption_row("https://evil.example/steal", 80, theme, true, false).expect("a wide band");
-        assert!(
-            row.iter().all(|cell| cell.overline),
-            "the seam breaks at columns {:?}",
-            row.iter()
-                .enumerate()
-                .filter(|(_, cell)| !cell.overline)
-                .map(|(col, _)| col)
-                .collect::<Vec<_>>()
-        );
-        // AND IT IS ONE TONE, stated where the seam is actually drawn from. The
-        // row deliberately carries TWO inks (the host is brighter than the rest),
-        // so a seam left to each cell's `fg` would put a brighter dash over
-        // exactly the cells above the domain — the whole reason the edge has a
-        // colour channel of its own.
-        let seams: std::collections::BTreeSet<Option<[u8; 3]>> =
-            row.iter().map(|cell| cell.overline_color).collect();
-        assert_eq!(
-            seams.len(),
-            1,
-            "the rule takes as many tones as the band has inks: {seams:?}"
-        );
-        assert!(
-            seams.iter().all(Option::is_some),
-            "an uncoloured seam falls back to its cell's ink: {seams:?}"
-        );
-        let inks: std::collections::BTreeSet<[u8; 3]> = row.iter().map(|cell| cell.fg).collect();
-        assert!(
-            inks.len() > 1,
-            "the band is meant to carry hierarchy in ink, so this proof is not vacuous: {inks:?}"
-        );
-        // A caption flipped to the top row sits under the tab strip's own rule,
-        // so it asks for no second one anywhere.
-        let row = caption_row("https://evil.example/steal", 80, theme, false, false)
-            .expect("a wide band");
-        assert!(row.iter().all(|cell| !cell.overline));
-    }
-
     /// THE DESTINATION IS THE BRIGHTEST THING ON THE ROW, on every theme the
     /// product ships. Weight is a hierarchy a glance can miss — a bold run in a
     /// dim tone still reads as part of the dim sentence around it — and the one
@@ -1004,5 +1052,59 @@ mod tests {
         let row = caption_row("file:///etc/passwd", 80, Theme::default(), true, true)
             .expect("a wide band");
         assert!(text_of(&row).contains(BLOCKED));
+    }
+
+    /// A file citation's band says where the click goes and that it stays in
+    /// aterm: `opens in aterm: src/foo.rs:42`, the file name and line the
+    /// emphasized run, and never the OS gesture's `opens`/`blocked` words.
+    #[test]
+    fn a_file_citation_caption_names_aterm_and_the_line() {
+        let row =
+            path_caption_row("src/foo.rs:42", 80, Theme::default(), true, false).expect("a band");
+        let text = text_of(&row);
+        assert!(text.contains("opens in aterm: src/foo.rs:42"), "{text:?}");
+        assert!(!text.contains(BLOCKED), "{text:?}");
+        let (shown, emphasis) = path_caption("src/foo.rs:42", 80);
+        let run: String = shown
+            .chars()
+            .skip(emphasis.start)
+            .take(emphasis.len())
+            .collect();
+        assert_eq!(run, "foo.rs:42");
+        let bold: String = row
+            .iter()
+            .filter(|cell| cell.bold)
+            .map(|cell| cell.ch)
+            .collect();
+        assert_eq!(bold, "foo.rs:42", "the file and its line are the answer");
+    }
+
+    /// Too wide for the band, the cut keeps the END: the file name and line.
+    #[test]
+    fn a_long_citation_is_cut_from_the_front() {
+        let long = format!("{}/deep/file.rs:7", "a".repeat(300));
+        let (text, emphasis) = path_caption(&long, 30);
+        assert_eq!(text.chars().count(), 30, "{text:?}");
+        assert!(
+            text.starts_with(ELLIPSIS) && text.ends_with("file.rs:7"),
+            "{text:?}"
+        );
+        let run: String = text
+            .chars()
+            .skip(emphasis.start)
+            .take(emphasis.len())
+            .collect();
+        assert_eq!(run, "file.rs:7");
+    }
+
+    /// A hostile name (a bidi override in a file name) arrives as `%XX`, as
+    /// a URL's does: the band cannot be made to reorder.
+    #[test]
+    fn a_hostile_file_name_is_spelled_out() {
+        let (text, _) = path_caption("src/a\u{202e}sr.exe:1", 200);
+        assert!(text.contains("%E2%80%AE"), "{text:?}");
+        assert!(!text.contains('\u{202e}'));
+        let row = path_caption_row("x.rs:1", 80, Theme::default(), true, true).expect("a band");
+        assert!(text_of(&row).contains(OPENS_IN_ATERM_TRACKED));
     }
 }

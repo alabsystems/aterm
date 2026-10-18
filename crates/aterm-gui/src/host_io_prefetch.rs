@@ -243,6 +243,7 @@ impl Drop for Burst {
 /// The OSC 52 query callback's answer: the pasteboard as read for the slice
 /// being fed on this thread, for as many queries as the scan found in it, or
 /// `None` (no reply) when none was read.
+#[cfg(any(not(target_os = "linux"), test))]
 pub(crate) fn take_clipboard_query() -> Option<String> {
     FETCHED.with(|cell| {
         let mut fetched = cell.try_borrow_mut().ok()?;

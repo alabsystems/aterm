@@ -3,9 +3,7 @@
 
 //! The shared types' own tests.
 
-mod cli;
 mod pins;
-mod programs;
 mod quad;
 mod triple;
 

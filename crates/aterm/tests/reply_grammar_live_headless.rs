@@ -45,7 +45,7 @@ fn token(inst: &Instance) -> String {
 
 /// One boot with the temporal recorder on (so `temporal` has a spine to read)
 /// and the token file written.
-fn boot() -> Option<Instance> {
+fn boot() -> Instance {
     headless_boot::boot_with(
         "atrg",
         |tmp, cmd| {
@@ -149,7 +149,7 @@ fn field<'a>(row: &'a str, key: &str) -> Option<&'a str> {
 
 #[test]
 fn the_audit_verbs_frame_their_replies_as_the_table_says() {
-    let Some(inst) = boot() else { return };
+    let inst = boot();
 
     // `await seq <n> timeout=0`: the cheap dirty check — a Status line.
     match wire(&inst, "await seq 0 timeout=0") {

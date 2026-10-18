@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// Sixel graphics with the `sixel` feature on (this crate enables it): the DCS
-// dispatcher (handler_dcs.rs) feeds `DCS Ps q <data> ST` to the `aterm-sixel`
-// decoder, and at ST places the RGBA raster through the OSC 1337 inline-image
-// path (handler_osc_1337.rs `place_sixel_image`). The image lives in per-cell
-// image extras (`Screen::images_row`), not glyph cells, so `screen()`/`row()`
-// stay empty for it. DA1 advertises sixel (code 4).
+// Sixel graphics: the DCS dispatcher (handler_dcs.rs) feeds `DCS Ps q <data> ST`
+// to the `aterm-sixel` decoder, and at ST places the RGBA raster through the
+// OSC 1337 inline-image path (handler_osc_1337.rs `place_sixel_image`). The
+// image lives in per-cell image extras (`Screen::images_row`), not glyph cells,
+// so `screen()`/`row()` stay empty for it. DA1 advertises sixel (code 4).
 
 use aterm_conformance::{Screen, run};
 
@@ -78,10 +77,11 @@ fn sixel_dcs_split_across_feeds_renders_identically() {
 }
 
 #[test]
-fn truncated_sixel_consumes_following_text_until_escape_breaks_out() {
+fn truncated_sixel_consumes_following_text_until_an_escape_breaks_it_off() {
     // Missing ST: the terminal stays in DCS passthrough (VT500 parser model), so
-    // following text is payload. The next ESC ends the string as `ESC \` would,
-    // so the declared image is placed and then the CSI runs.
+    // following text is payload. An ESC that does not begin ST breaks the string
+    // off, and a broken-off string is canceled as CAN cancels one (xterm applies
+    // a DCS only at ST): nothing is placed, and the CSI the ESC began runs.
     let mut s = Screen::new(24, 80);
     s.feed(b"\x1bP0;0;8q\"1;1;4;6#1~~"); // no ST
     s.feed(b"XYZ"); // still inside the DCS: must NOT print as glyphs
@@ -90,16 +90,15 @@ fn truncated_sixel_consumes_following_text_until_escape_breaks_out() {
         s.images_row(0).is_empty(),
         "no terminator yet -> not placed yet"
     );
-    s.feed(b"\x1b[6n"); // ESC breaks out (= ST), image placed, then CSI runs
-    assert_eq!(
-        s.images_row(0).len(),
-        1,
-        "ESC-breakout terminates -> image placed"
+    s.feed(b"\x1b[6n"); // ESC breaks the string off, then the CSI runs
+    assert!(
+        s.images_row(0).is_empty(),
+        "a sixel broken off by ESC [ is not placed"
     );
-    // Image occupied row 0, cursor advanced to row 1 -> CPR reports row 2 (1-based).
-    assert_eq!(s.response_string(), "\x1b[2;1R");
+    // Nothing placed, the cursor unmoved -> CPR reports row 1 (1-based).
+    assert_eq!(s.response_string(), "\x1b[1;1R");
     s.feed(b"OK");
-    assert_eq!(s.row(1), "OK");
+    assert_eq!(s.row(0), "OK");
 }
 
 #[test]
@@ -203,53 +202,35 @@ fn decsdm_is_reset_by_decstr_soft_reset() {
 
 // --- XTSMGRAPHICS (CSI ? Pi ; Pa ; Pv S) ---
 // Reply CSI ? Pi ; Ps ; Pv S, Ps 0 = success, 1 = error in Pi, 2 = error in Pa,
-// 3 = failure. Read-only: 1024 color registers and 4096 max sixel dimension,
-// aterm-sixel's constants when the feature is on (handler_xtsmgraphics.rs).
+// 3 = failure. Read-only: 1024 color registers (aterm-sixel's constant when the
+// feature is on) and a 1000x1000 sixel maximum, the largest square the DCS path
+// places whatever the encoder (handler_xtsmgraphics.rs).
 
 #[test]
-fn xtsmgraphics_color_registers_read_and_read_max() {
-    // Pi=1 Pa=1 (read) and Pa=4 (read max) both report 1024.
-    assert_eq!(run(b"\x1b[?1;1S").response_string(), "\x1b[?1;0;1024S");
-    assert_eq!(run(b"\x1b[?1;4S").response_string(), "\x1b[?1;0;1024S");
-}
-
-#[test]
-fn xtsmgraphics_sixel_geometry_read_falls_back_to_max_without_window_callback() {
-    // Pi=2 Pa=1 reads the current text-area pixel size behind the same
-    // window-ops capability as CSI 14 t; the harness grants no window ops and
-    // reports no cell box, so the fallback is the max dimension on both axes.
-    // The granted case is pinned in aterm-core's handler_xtsmgraphics tests.
-    assert_eq!(run(b"\x1b[?2;1S").response_string(), "\x1b[?2;0;4096;4096S");
-}
-
-#[test]
-fn xtsmgraphics_sixel_geometry_read_max() {
-    // Pi=2 Pa=4: maximum sixel geometry, width;height.
-    assert_eq!(run(b"\x1b[?2;4S").response_string(), "\x1b[?2;0;4096;4096S");
-}
-
-#[test]
-fn xtsmgraphics_regis_geometry_reports_failure() {
-    // Pi=3 (ReGIS) is unsupported: status 3 (failure).
-    assert_eq!(run(b"\x1b[?3;1S").response_string(), "\x1b[?3;3;0S");
-}
-
-#[test]
-fn xtsmgraphics_set_and_reset_rejected_read_only() {
-    // Pa=3 (set) and Pa=2 (reset) are rejected with status 3: the engine's
-    // graphics limits are read-only.
-    assert_eq!(run(b"\x1b[?1;3;99S").response_string(), "\x1b[?1;3;0S");
-    assert_eq!(run(b"\x1b[?2;2S").response_string(), "\x1b[?2;3;0S");
-}
-
-#[test]
-fn xtsmgraphics_invalid_item_and_action_report_errors() {
-    // Unknown Pi -> status 1 (error in Pi); unknown/omitted Pa -> status 2
-    // (error in Pa). The raw Pi is echoed back in both cases.
-    assert_eq!(run(b"\x1b[?9;1S").response_string(), "\x1b[?9;1;0S");
-    assert_eq!(run(b"\x1b[?0;1S").response_string(), "\x1b[?0;1;0S");
-    assert_eq!(run(b"\x1b[?1;9S").response_string(), "\x1b[?1;2;0S");
-    assert_eq!(run(b"\x1b[?1S").response_string(), "\x1b[?1;2;0S");
+fn xtsmgraphics_reports_read_only_limits_and_errors() {
+    for (name, query, reply) in [
+        // Pi=1 (color registers): read (Pa=1) and read max (Pa=4).
+        ("colors read", &b"\x1b[?1;1S"[..], "\x1b[?1;0;1024S"),
+        ("colors read max", b"\x1b[?1;4S", "\x1b[?1;0;1024S"),
+        // Pi=2 Pa=1 reads the text-area pixel size behind the CSI 14 t
+        // window-ops capability; the harness grants none and reports no cell
+        // box, so it falls back to the max (the granted case is pinned in
+        // aterm-core's handler_xtsmgraphics tests).
+        ("geometry read", b"\x1b[?2;1S", "\x1b[?2;0;1000;1000S"),
+        ("geometry read max", b"\x1b[?2;4S", "\x1b[?2;0;1000;1000S"),
+        // Pi=3 (ReGIS) is unsupported: status 3 (failure).
+        ("regis", b"\x1b[?3;1S", "\x1b[?3;3;0S"),
+        // Set (Pa=3) and reset (Pa=2) are refused: the limits are read-only.
+        ("colors set", b"\x1b[?1;3;99S", "\x1b[?1;3;0S"),
+        ("geometry reset", b"\x1b[?2;2S", "\x1b[?2;3;0S"),
+        // Unknown Pi -> status 1; unknown/omitted Pa -> status 2; Pi echoed.
+        ("unknown item", b"\x1b[?9;1S", "\x1b[?9;1;0S"),
+        ("item zero", b"\x1b[?0;1S", "\x1b[?0;1;0S"),
+        ("unknown action", b"\x1b[?1;9S", "\x1b[?1;2;0S"),
+        ("omitted action", b"\x1b[?1S", "\x1b[?1;2;0S"),
+    ] {
+        assert_eq!(run(query).response_string(), reply, "{name}");
+    }
 }
 
 // --- cursor after sixel, both DECSDM states ---

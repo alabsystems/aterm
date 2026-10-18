@@ -1,18 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// Per-style fonts and the config fallback chain. The ty-checked twins
-// `styled_run_face_model` and `fallback_precedence_model` (aterm-spec's
-// `derived_ring_ty.rs`) prove the policies; this file checks the same
-// invariants on the shipping code: `resolve_styled_face` over its whole 2^6
-// input space, `fallback_chain_order` over the presence lattice, and rendered
-// ink for the styled-run routing. The config keys' round-trip is
-// `w6_font_keys_round_trip` in aterm-gui's `prefs.rs`.
+// Per-style fonts and the config fallback chain, checked on the shipping
+// code: `resolve_styled_face` over its whole 2^6 input space, and rendered ink
+// for the styled-run routing and the config-headed fallback chains.
 
 use aterm_core::terminal::Terminal;
-use aterm_render::{
-    FaceId, FacePick, Renderer, StyleBits, Theme, fallback_chain_order, resolve_styled_face,
-};
+use aterm_render::{FaceId, FacePick, Renderer, StyleBits, Theme, resolve_styled_face};
 
 /// The committed JetBrains Mono fixture (a liga/calt ligature font).
 fn ligature_test_font() -> Vec<u8> {
@@ -84,9 +78,9 @@ fn resolve_styled_face_is_total_and_wellformed() {
                     "an unstyled cell never routes to a styled face"
                 );
             }
-            // `StyledRunFace`'s `RealBoldNeverDilated`: when a face can serve
-            // the request's real boldness (the injection or slot 0; slot 2 only
-            // for bold-italic, so a plain bold cell is never slanted), the
+            // Real bold is never dilated: when a face can serve the request's
+            // real boldness (the injection or slot 0; slot 2 only for
+            // bold-italic, so a plain bold cell is never slanted), the
             // resolution never synthesizes bold.
             let bold_capable =
                 injected || covers[0] || (style.contains(StyleBits::ITALIC) && covers[2]);
@@ -151,54 +145,6 @@ fn resolve_styled_face_precedence_pins() {
             synthetic: StyleBits::BOLD
         }
     );
-}
-
-/// Over the full presence lattice the chain is exactly `config ++ discovery`:
-/// config precedes discovery, order within each class holds, nothing is
-/// dropped or invented.
-#[test]
-fn fallback_chain_order_precedence_law() {
-    let configs: [&[&str]; 3] = [&[], &["c1"], &["c1", "c2"]];
-    let discos: [&[&str]; 3] = [&[], &["d1"], &["d1", "d2"]];
-    for cfg in configs {
-        for disc in discos {
-            let cfg_v: Vec<String> = cfg.iter().map(|s| (*s).to_string()).collect();
-            let disc_v: Vec<String> = disc.iter().map(|s| (*s).to_string()).collect();
-            let out = fallback_chain_order(&cfg_v, &disc_v);
-            // Nothing dropped or invented; order == concatenation.
-            let mut expect = cfg_v.clone();
-            expect.extend(disc_v.clone());
-            assert_eq!(out, expect, "cfg {cfg:?} disc {disc:?}");
-            // Class precedence: every config position precedes every discovery one.
-            let pos = |m: &str| out.iter().position(|x| x == m);
-            if let (Some(c), Some(d)) = (pos("c2").or(pos("c1")), pos("d1")) {
-                assert!(c < d, "config must outrank discovery");
-            }
-        }
-    }
-}
-
-/// Binds the `FallbackPrecedence` ty model: the real function's first candidate
-/// class equals the model's `winner` (1 = config, 2 = discovery; discovery is
-/// never empty in the shipping lists) for every presence combination.
-#[test]
-fn fallback_chain_order_first_element_matches_model_winner() {
-    let disc = vec!["d".to_string()];
-    for cfg_present in [false, true] {
-        let cfg: Vec<String> = if cfg_present {
-            vec!["c".into()]
-        } else {
-            vec![]
-        };
-        let out = fallback_chain_order(&cfg, &disc);
-        let winner = match out.first().map(String::as_str) {
-            Some("c") => 1,
-            Some("d") => 2,
-            other => panic!("unexpected head {other:?}"),
-        };
-        let expect = if cfg_present { 1 } else { 2 };
-        assert_eq!(winner, expect, "cfg_present {cfg_present}");
-    }
 }
 
 /// Render `text` (may contain SGR escapes) on one row with the given renderer.

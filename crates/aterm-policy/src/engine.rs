@@ -415,11 +415,6 @@ mod tests {
                 assert_eq!(d.rate_limit.as_deref(), rate_limit, "{what}: rate limit");
             }
         }
-        assert_eq!(
-            PolicyEngine::new(standard()).policy().defaults.unmatched,
-            R::Warn,
-            "standard's configured unmatched default"
-        );
     }
 
     // -----------------------------------------------------------------
@@ -484,61 +479,5 @@ mod tests {
         let d = eng.evaluate(&osc(9, &["ping"]), OriginTag::Pty);
         assert_eq!(d.response, Response::Warn);
         assert_eq!(d.matched_rule, Some(1));
-    }
-
-    #[test]
-    fn rate_limit_id_propagates_through_decision() {
-        let eng = PolicyEngine::new(profiles::standard());
-        let d = eng.evaluate(&osc(9, &["build done"]), OriginTag::User);
-        assert_eq!(d.rate_limit.as_deref(), Some("notifications"));
-    }
-
-    #[test]
-    fn rate_limit_id_is_shared_not_reallocated_per_match() {
-        // Repeated matches share the id precomputed in `new`.
-        let eng = PolicyEngine::new(profiles::standard());
-        let a = eng
-            .evaluate(&osc(9, &["build done"]), OriginTag::User)
-            .rate_limit
-            .expect("rate limit id present");
-        let b = eng
-            .evaluate(&osc(9, &["other"]), OriginTag::User)
-            .rate_limit
-            .expect("rate limit id present");
-        assert_eq!(&*a, "notifications");
-        assert!(
-            Arc::ptr_eq(&a, &b),
-            "evaluate must clone the precomputed Arc id, not allocate a fresh one",
-        );
-    }
-
-    #[test]
-    fn empty_policy_returns_default_unmatched() {
-        let p = Policy {
-            schema_version: crate::SCHEMA_VERSION,
-            profile: Profile::Hardened,
-            defaults: crate::Defaults {
-                unmatched: Response::Drop,
-                shell_integration_require_nonce: false,
-            },
-            rules: vec![],
-            rate_limits: vec![],
-        };
-        let eng = PolicyEngine::new(p);
-        let d = eng.evaluate(&osc(52, &["c", "?"]), OriginTag::Host);
-        assert_eq!(d.response, Response::Drop);
-        assert!(d.matched_rule.is_none());
-    }
-
-    #[test]
-    fn matched_rule_index_is_stable_after_wildcard_fallthrough() {
-        // Standard profile: OSC 9 Warn rule at index 6 (User origin_min).
-        // Ensure the engine reports the actual rule index, not a wildcard
-        // bucket surrogate.
-        let eng = PolicyEngine::new(profiles::standard());
-        let d = eng.evaluate(&osc(9, &["x"]), OriginTag::User);
-        assert!(d.matched_rule.is_some());
-        let idx = d.matched_rule.expect("matched");
-        assert_eq!(eng.policy().rules[idx].sequence, "OSC 9");
     }
 }

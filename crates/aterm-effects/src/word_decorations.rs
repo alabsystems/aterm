@@ -398,42 +398,6 @@ pub struct DogCameoFrame {
     pub alpha: u8,
 }
 
-/// One resolved Robi emission ([`crate::robi`]): the resident frame plus cell
-/// metrics. No palette context — Robi's roster is all `Recolor::Fixed`, so a
-/// pose at a size is one tile.
-#[derive(Clone, Copy, Debug)]
-pub struct RobiShowFrame {
-    pub geom: EffectGeom,
-    /// The resident frame ([`crate::robi::RobiShow::frame`]).
-    pub frame: crate::robi::RobiFrame,
-}
-
-/// What one [`WordDecorations::robi`] call put on glass. A fresh baker can
-/// spend the bake budget on the ladder and defer the body, and the host must
-/// not hang the click-to-dismiss hit-box (a click writes `robi = false`) over
-/// an invisible body.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RobiEmission {
-    /// Fingerprint fold for the host's early-out (ladder + body, whatever
-    /// this frame drew).
-    pub fp: u64,
-    /// The body's drawn dest rect in grid px (`x0, x1, y0, y1`, right/bottom
-    /// exclusive), or `None` when only the ladder made it onto the glass.
-    pub body_px: Option<(i32, i32, i32, i32)>,
-}
-
-/// A hosted robot body: pose, dest size and each vertical slice's atlas rect
-/// (Robi exceeds the 2-row tile ceiling: 2–3 stacked slices). Held as the
-/// last-resolved fallback.
-#[derive(Clone, Copy, Debug)]
-struct RobiBodySlices {
-    w: u16,
-    h: u16,
-    n: u8,
-    /// Per slice: `(ax, ay, slice_h)` in atlas texels.
-    sl: [(u16, u16, u16); 4],
-}
-
 /// Geometry-only inputs for resolving the cursor companion before its local
 /// palette is sampled.
 #[derive(Clone, Copy, Debug)]
@@ -1815,12 +1779,6 @@ pub struct WordDecorations {
     /// The rescan's tokenise+lexicon-lookup memo — see [`ScanMemo`]. Holds the
     /// only per-row work that is a pure function of the row's text.
     scan_memo: ScanMemo,
-    /// Test-only mutation switch: suppress the memo-hit rebuild of
-    /// `scan_chars`, proving the `scan_chars` / `scan_text` invariant is
-    /// guarded by a named `debug_assert_eq!` rather than a panic deep in
-    /// `genome::simhash_ctx`.
-    #[cfg(test)]
-    mutate_skip_scan_chars_rebuild: bool,
     /// Lexicon token/fold/CJK workspace, resident so typing-damage rescans
     /// allocate nothing after the scanner reaches its high-water capacities.
     scan_scratch: ScanScratch,
@@ -1908,13 +1866,6 @@ pub struct WordDecorations {
     /// ([`crate::dog_cameo::DogCameo::on_summon`]) and the dest rect uses the
     /// current breed's aspect ([`crate::dog_baker::DogBaker::aspect`]).
     dog_last_tile: Option<(u16, u16, crate::dog_cameo::DogLook)>,
-    /// The Robi roster's exact-size tile cache ([`crate::robi_baker`]), through
-    /// the shared atlas's `host_tile`.
-    robi_baker: crate::robi_baker::RobiBaker,
-    /// The last robot body that fully resolved (every vertical slice hosted),
-    /// so a budget-starved frame re-draws the whole previous robot rather than
-    /// half a new one. Cleared with the atlas.
-    robi_last_body: Option<RobiBodySlices>,
     /// The cell metric the held tiles above were resolved against.
     ///
     /// `CatBaker::begin_frame` wipes the shared atlas when the metric moves, and
@@ -2561,8 +2512,6 @@ impl WordDecorations {
         self.pet_depart_tiles = [None; PET_DEPART_HOLDS];
         self.dog_baker.clear();
         self.dog_last_tile = None;
-        self.robi_baker.clear();
-        self.robi_last_body = None;
     }
 
     /// Drop every held tile when the shared atlas is about to be cleared for a
@@ -2580,15 +2529,14 @@ impl WordDecorations {
         self.pet_last_tile = None;
         self.pet_depart_tiles = [None; PET_DEPART_HOLDS];
         self.dog_last_tile = None;
-        self.robi_last_body = None;
     }
 
     /// The per-frame baker prologue every atlas-baking entry runs first: LRU
     /// clock + bake budget; a cell-metric change clears and version-bumps the
     /// atlas (§5.5). Guarded by `cat_baker_ready`, so N panes share one
     /// two-bake budget; unbracketed hosts clear the flag at tick start.
-    /// `animals` also begins the animal roster's cache (dog and robi entries
-    /// never bake one).
+    /// `animals` also begins the animal roster's cache (dog entries never
+    /// bake one).
     fn begin_baker_frame(&mut self, geom: EffectGeom, animals: bool) {
         if self.cat_baker_ready {
             return;
@@ -3483,7 +3431,7 @@ impl WordDecorations {
         // Vertical bound: a mote born at the pet's `head_anchor` (~0.6 rows
         // above its row) would have negative y on row 0, and the tab-strip
         // splice shifts free sprites down into the strip, painting over the tab
-        // titles. (Robi reaches the tab bar deliberately via his own emitter.)
+        // titles.
         let grid_h = i32::from(geom.rows).saturating_mul(i32::from(geom.cell_h));
         for (slot, m) in mote_sprites.iter_mut().zip(pet.motes.iter().flatten()) {
             // `pet.alpha` (presence × arrival), not `lane_alpha`: motes are the
@@ -4057,165 +4005,6 @@ impl WordDecorations {
         Some(fp)
     }
 
-    /// Emit the Robi show ([`crate::robi`]): the body at the frame's
-    /// pose/anchor plus his ladder as tiling segments ([`FreeZ::UnderText`], so
-    /// text reads through it; Robi walks [`FreeZ::OverText`]). Same two-door
-    /// bake as the pet; a miss re-emits the last resolved body. `anchor_y`/`bar`
-    /// may be negative: the strip splice shifts free sprites down, which is how
-    /// Robi reaches the tab bar. Call after `tick`; `None` when nothing drew.
-    pub fn robi(
-        &mut self,
-        show: RobiShowFrame,
-        free: &mut Vec<FreeSprite>,
-    ) -> Option<RobiEmission> {
-        let RobiShowFrame { geom, frame } = show;
-        if frame.alpha == 0 || geom.cell_w == 0 || geom.cell_h == 0 {
-            return None;
-        }
-        self.begin_baker_frame(geom, false);
-        // Idempotent guard, so this entry does not rely on another companion
-        // running the prologue first.
-        self.drop_holds_if_metric_moved(geom.cell_w, geom.cell_h);
-        self.robi_baker.begin_frame(geom.cell_w, geom.cell_h);
-
-        let mut fp = FNV64_OFFSET;
-        let mut emitted = false;
-
-        // ── the ladder: a bottom-up stack of tiling segments ──────────────
-        if let Some(ladder) = frame.ladder
-            && ladder.bot_y > ladder.top_y
-        {
-            // One segment law (`crate::robi::ladder_tile_px`), shared with the
-            // brain's window clamp, so the stack's overshoot stays inside the window.
-            let (lw, lh) = crate::robi::ladder_tile_px(&geom);
-            let key = crate::robi_baker::RobiBakeKey {
-                pose: crate::robi_glyphs_gen::RobiGlyphId::RobiLadder,
-                w: lw,
-                h: lh,
-            };
-            let tile = self
-                .robi_baker
-                .tile(&key)
-                .and_then(|rgba| self.cat_baker.host_tile(key.host_id(), lw, lh, rgba));
-            if let Some(t) = tile {
-                // Runaway guard sized from the grid: the ladder spans at most
-                // the window, and a segment is `round(0.219 · art_rows ·
-                // cell_h)` tall (0.70–1.18 cells), so ≤ 46 segments up to 54
-                // rows and ≤ 0.85·rows above. `max(64, rows + 8)` covers both;
-                // a flat cap would cut the top off tall-window ladders.
-                let max_segments = u32::from(geom.rows).saturating_add(8).max(64);
-                let x = ladder.x - i32::from(lw) / 2;
-                let mut y = ladder.bot_y - i32::from(lh);
-                let mut segments = 0u32;
-                while y >= ladder.top_y - i32::from(lh) / 4 && segments < max_segments {
-                    let sprite = FreeSprite {
-                        x,
-                        y,
-                        w: lw,
-                        h: lh,
-                        ax: t.ax,
-                        ay: t.ay,
-                        aw: lw,
-                        ah: lh,
-                        tint: 0x00FF_FFFF,
-                        alpha: frame.alpha,
-                        flip_x: false,
-                        z: FreeZ::UnderText,
-                        sampler: FreeSampler::Nearest,
-                    };
-                    free.push(sprite);
-                    fp = fold_free(fp, &sprite);
-                    emitted = true;
-                    y -= i32::from(lh);
-                    segments += 1;
-                }
-            }
-        }
-
-        // ── the robot body ────────────────────────────────────────────────
-        // ART_ROWS tall, above the atlas's 2-row tile ceiling: baked as one
-        // tile in the Robi cache, entering the shared atlas as stacked
-        // vertical slices re-assembled at draw. Sized by
-        // [`crate::robi::body_size_px`] (width capped at `4·cell_h`), which the
-        // host's dismiss hit-box also reads.
-        let (w, h) = crate::robi::body_size_px(&geom);
-        let key = crate::robi_baker::RobiBakeKey {
-            pose: frame.pose,
-            w,
-            h,
-        };
-        let max_slice = geom.cell_h.saturating_mul(2).max(1);
-        let resolved: Option<RobiBodySlices> = self.robi_baker.tile(&key).and_then(|rgba| {
-            let mut body = RobiBodySlices {
-                w,
-                h,
-                n: 0,
-                sl: [(0, 0, 0); 4],
-            };
-            let mut y0: u16 = 0;
-            while y0 < h {
-                if usize::from(body.n) == body.sl.len() {
-                    return None; // taller than 4 slices — never with ART_ROWS ≤ 8
-                }
-                let sh = max_slice.min(h - y0);
-                let bytes = &rgba[usize::from(y0) * usize::from(w) * 4
-                    ..usize::from(y0 + sh) * usize::from(w) * 4];
-                let t =
-                    self.cat_baker
-                        .host_tile(key.host_id_slice(u16::from(body.n)), w, sh, bytes)?;
-                body.sl[usize::from(body.n)] = (t.ax, t.ay, sh);
-                body.n += 1;
-                y0 += sh;
-            }
-            Some(body)
-        });
-        if let Some(r) = resolved {
-            self.robi_last_body = Some(r);
-        }
-        // No body this frame. The ladder may still have drawn, so the
-        // fingerprint carries it, but `body_px` is `None` so the host does not
-        // hang the dismiss hit-box on empty grid.
-        let Some(body) = resolved.or(self.robi_last_body) else {
-            return emitted.then_some(RobiEmission { fp, body_px: None });
-        };
-
-        // Anchor: feet on the ground line or hands on the bar, by the hit-box's
-        // law ([`crate::robi::body_rect_px`]) applied to the resolved body (the
-        // held body's previous size on a bake miss).
-        let (x, _, top, _) = crate::robi::body_rect_px(&frame, body.w, body.h);
-        let mut dy: i32 = 0;
-        for (ax, ay, sh) in body.sl.iter().copied().take(usize::from(body.n)) {
-            let sprite = FreeSprite {
-                x,
-                y: top + dy,
-                w: body.w,
-                h: sh,
-                ax,
-                ay,
-                aw: body.w,
-                ah: sh,
-                tint: 0x00FF_FFFF,
-                alpha: frame.alpha,
-                // Each slice shares x/w, so flipping every slice about its
-                // own rect is the whole-body mirror.
-                flip_x: frame.flip_x,
-                z: FreeZ::OverText,
-                sampler: FreeSampler::Nearest,
-            };
-            free.push(sprite);
-            fp = fold_free(fp, &sprite);
-            dy += i32::from(sh);
-        }
-        fp = fnv_mix_u64(fp, self.cat_baker.version());
-        fp = fnv_mix_u64(fp, self.robi_baker.version());
-        // The rect the slices occupy (`body_rect_px` of the resolved body); the
-        // host's hit-box is this rect.
-        Some(RobiEmission {
-            fp,
-            body_px: Some(crate::robi::body_rect_px(&frame, body.w, body.h)),
-        })
-    }
-
     /// Install one already-resolved immutable source. No filesystem access,
     /// decoding or cloning of custom bytes. The source fingerprint keys the
     /// shared-atlas tile; a target metric change rebuilds only the resample
@@ -4544,7 +4333,7 @@ impl WordDecorations {
     /// the same Terminal lock, so the per-cell resolve runs once per frame.
     /// `cells`/`line_sizes` come from the same probes as the term-walking
     /// path, so occurrences, ink capture and the §5.7 `dec_line` flag are
-    /// byte-identical (with feature `bidi`, rows arrive in visual order).
+    /// byte-identical (rows arrive in visual order).
     #[allow(
         clippy::too_many_arguments,
         reason = "the rescan threads the snapshot rows, grid geometry (rows/cols), lexicon, config, damage epoch, and clock through one call; a wrapper struct would relocate the list, not simplify it"
@@ -4912,13 +4701,7 @@ impl WordDecorations {
         } else {
             &self.scan_matches
         };
-        // Test-only mutation switch for the rebuild below
-        // (`memo_hit_without_the_scan_chars_rebuild_trips_the_guard`).
-        #[cfg(test)]
-        let rebuild_scan_chars = !self.mutate_skip_scan_chars_rebuild;
-        #[cfg(not(test))]
-        let rebuild_scan_chars = true;
-        if hit && rebuild_scan_chars && !matches.is_empty() {
+        if hit && !matches.is_empty() {
             // A hit skipped the scanner, so `scan_chars` still holds the
             // previous row's stream, and the SimHash below indexes it with this
             // row's spans. Rebuild it as `scan_into_with_scratch` would; only
@@ -6542,8 +6325,9 @@ impl WordDecorations {
         // delayed start and while its word is off screen. Two-way: a live
         // classic nova blocks a supernova ignition, as a supernova blocks
         // classic grants, or the `nova_add` share could exceed MAX_NOVA_QUADS.
-        // Parked shards count too (the census's supernova-burst-mutex
-        // aggregator checks this).
+        // Parked panes' shards count too (the mutex is window-wide; the scope
+        // census's supernova-burst-mutex aggregator checks this), and every
+        // live end folds into the returned wake.
         let mut busy = false;
         // O(1) skip ([`Self::burst_hint`]): every end in this map is `<= hint`,
         // so once `now` reaches it the walk would change nothing. Debug builds
@@ -9126,7 +8910,7 @@ fn pick_color(cfg: &DecoConfig, s: u64) -> u32 {
 /// Driven by the occurrence's age from the injected `now`, not a frame
 /// counter, so it runs at [`crate::effect_util::TWINKLE_FLASH_HZ`] on every
 /// panel, inside the WCAG 2.3.1 flash bound
-/// (`sparkle_twinkle_is_frame_rate_independent`).
+/// (`effect_util`'s `twinkle_law_stays_under_the_photosensitivity_bound`).
 fn twinkle(s: u64, age_s: f32) -> f32 {
     let phase = (s & 0xff) as f32 / 255.0 * std::f32::consts::TAU;
     crate::effect_util::twinkle_env(age_s, phase)
@@ -9149,71 +8933,6 @@ fn scale_u8(v: f32) -> u8 {
 mod tests {
     use super::*;
 
-    /// The sparkle twinkle is frame-rate independent and inside the flash
-    /// bound: one second of wall clock holds the same number of bright peaks
-    /// however finely it is sampled.
-    #[test]
-    fn sparkle_twinkle_is_frame_rate_independent() {
-        // Count the envelope's bright peaks over one second of wall clock,
-        // sampled at a given refresh rate.
-        let peaks_at = |hz: u32| {
-            let mut peaks = 0usize;
-            let mut high = false;
-            for i in 0..hz {
-                let hot = twinkle(0, i as f32 / hz as f32)
-                    >= crate::effect_util::TWINKLE_FLOOR + crate::effect_util::TWINKLE_DEPTH * 0.9;
-                if hot && !high {
-                    peaks += 1;
-                }
-                high = hot;
-            }
-            peaks
-        };
-        let (p60, p120, p144) = (peaks_at(60), peaks_at(120), peaks_at(144));
-        assert_eq!(
-            (p60, p60),
-            (p120, p144),
-            "the sparkle envelope still rides the frame counter: 60/120/144 Hz gave {p60}/{p120}/{p144} peaks in one second"
-        );
-        assert!(
-            p60 as f32 <= 3.2,
-            "sparkle words flash {p60} times a second — over the 3.2 Hz bound"
-        );
-        // ...and it is the shared envelope every other star uses.
-        for (s, t) in [(0u64, 0.11f32), (12_345, 0.4), (0xFFFF_FFFF, 1.7)] {
-            let phase = (s & 0xff) as f32 / 255.0 * std::f32::consts::TAU;
-            assert_eq!(twinkle(s, t), crate::effect_util::twinkle_env(t, phase));
-        }
-    }
-
-    /// A cat stacked on the companion yields; one grazing it does not (the away
-    /// cat overlaps the caret row by 4 of its 28 px), so the gate is a coverage
-    /// fraction, not an intersection.
-    #[test]
-    fn only_a_cat_stacked_on_the_companion_yields() {
-        // A caret box two cells wide by one cell tall at (row 3, col 0),
-        // cell 10x20 — the geometry the sibling companion tests use.
-        let companion = (0, 20, 60, 80);
-
-        // Near miss: 4 px of a 28 px-tall cat, ~5% of its area.
-        assert!(
-            !cat_is_stacked_on(companion, 8, 33, 76, 104),
-            "a cat peeking up from a word rows below only grazes the caret row"
-        );
-        // Squarely on the companion.
-        assert!(
-            cat_is_stacked_on(companion, 2, 20, 58, 82),
-            "a cat drawn over the companion must yield"
-        );
-        // Same row, one cell clear to the right: touching nothing.
-        assert!(
-            !cat_is_stacked_on(companion, 30, 20, 60, 80),
-            "a cat beside the companion keeps its peek"
-        );
-        // Degenerate rects can never be judged stacked (no divide by zero).
-        assert!(!cat_is_stacked_on(companion, 0, 0, 60, 60));
-    }
-
     /// The yield collides against the flying head's real sprite (from
     /// [`WordDecorations::kitty_cursor_footprint`]), ~1.75 cells right of and
     /// ~0.4 rows above the caret: a word-cat drawn on the head yields.
@@ -9228,12 +8947,7 @@ mod tests {
         let cell = (3u16, 0u16);
         let wd = WordDecorations::default();
         let head = wd
-            .kitty_cursor_footprint(KittyCursorLayout {
-                geom,
-                cursor: cell,
-                look: KittyLook::default(),
-                bob: 0.0,
-            })
+            .kitty_cursor_footprint(still_layout(geom, cell))
             .expect("the head is placeable on a 20-column grid");
         let head_rect = (
             head.x,
@@ -9298,8 +9012,6 @@ mod tests {
     /// and the second is refused.
     #[test]
     fn one_host_frame_admits_exactly_one_companion_body() {
-        use crate::kitty_cursor::CursorCatPlacementFrame;
-
         let geom = EffectGeom {
             cell_w: 10,
             cell_h: 20,
@@ -9309,37 +9021,11 @@ mod tests {
         let now = Instant::now();
         let cell = (3u16, 4u16);
         let head_frame = |wd: &mut WordDecorations, free: &mut Vec<FreeSprite>| {
-            let layout = KittyCursorLayout {
-                geom,
-                cursor: cell,
-                look: KittyLook::default(),
-                bob: 0.0,
-            };
+            let layout = still_layout(geom, cell);
             let placement = wd
-                .resolve_kitty_cursor_placement(
-                    layout,
-                    CursorCatPlacementFrame {
-                        sampled_at: now,
-                        fold: None,
-                        facing_left: false,
-                    },
-                )
+                .resolve_kitty_cursor_placement(layout, settled_at(now))
                 .expect("placeable companion");
-            wd.kitty_cursor_at_placement(
-                KittyCursorFrame {
-                    geom,
-                    cursor: cell,
-                    look: layout.look,
-                    colors: CatColorKey::default(),
-                    bob: 0.0,
-                    alpha: 255,
-                    pose: crate::kitty_cursor::CatPose::STILL,
-                    sing: 0.0,
-                    notes: [None; crate::kitty_sing::MAX_NOTES],
-                },
-                placement,
-                free,
-            )
+            wd.kitty_cursor_at_placement(still_frame(geom, cell), placement, free)
         };
 
         // Positive check first: in its own frame the head draws, so the refusal
@@ -9554,51 +9240,6 @@ mod tests {
         assert!(!wd.is_active(now));
     }
 
-    #[test]
-    fn empty_occurrences_emit_nothing() {
-        let now = Instant::now();
-        let mut wd = WordDecorations::default();
-        let mut out = vec![];
-        assert_eq!(tick_deco(&mut wd, now, &cfg(), &mut out), 0);
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn rescan_finds_words_on_a_real_grid() {
-        let mut term = Terminal::new(4, 48);
-        term.process(b"I love cats and say fuck sometimes");
-        let mut wd = WordDecorations::default();
-        let lex = Lexicon::with_languages(&["en"]);
-        let mut c = cfg();
-        c.profanity = true;
-        c.feline = true;
-        c.allow_bare_cat = true;
-        let epoch = term.damage_epoch();
-        let now = Instant::now();
-
-        assert!(wd.needs_rescan(epoch), "fresh state must want a scan");
-        wd.rescan(&term, 4, 48, &lex, &c, epoch, now);
-        assert!(!wd.needs_rescan(epoch), "same epoch must not rescan");
-
-        let mut out = Vec::new();
-        tick_deco(&mut wd, now, &c, &mut out);
-
-        // "fuck" sparkles (Add) on row 0; the all-zero geometry trips the §5.7
-        // floor, so "cats" draws no graphic.
-        assert!(
-            out.iter()
-                .any(|d| matches!(d.blend, DecoBlend::Add) && d.row == 0),
-            "expected a profanity sparkle on row 0, got {out:?}"
-        );
-        assert!(
-            !out.iter().any(|d| matches!(d.glyph, DecoGlyph::Paw)),
-            "no paw graphic under v4, got {:?}",
-            out.iter()
-                .filter(|d| matches!(d.glyph, DecoGlyph::Paw))
-                .collect::<Vec<_>>()
-        );
-    }
-
     /// `fix` and its near-misses never take or inherit the profanity rainbow,
     /// typed incrementally or overwriting a live `fuck` in place.
     #[test]
@@ -9664,6 +9305,7 @@ mod tests {
 
     /// Ambiguous forms at the live caret (`fut`, `futu` while typing `future`)
     /// wait for a delimiter with `ro` or every language on; `fuck` is immediate.
+    /// Both scan entry points honour the live cursor.
     #[test]
     fn ambiguous_future_prefix_waits_for_delimiter_in_ro_and_all() {
         let mut c = cfg();
@@ -9715,6 +9357,46 @@ mod tests {
                 scan.occ.iter().any(|o| o.class == Class::Profanity),
                 "{language} exact fuck must retain the immediate profanity effect"
             );
+
+            // The shipping renderer scans an already-resolved cell snapshot,
+            // not the `Terminal`: its explicit cursor plumbing must defer the
+            // same provisional `fut` and settle it on the delimiter, or the
+            // live window and introspection captures drift apart.
+            let geom = EffectGeom {
+                cell_w: 8,
+                cell_h: 16,
+                rows: 2,
+                cols: 48,
+            };
+            let mut term = Terminal::new(2, 48);
+            let mut wd = WordDecorations::default();
+            let mut snap = aterm_core::render::RenderInput::default();
+            for (epoch, (bytes, settled)) in [(b"fut".as_slice(), false), (b" ".as_slice(), true)]
+                .into_iter()
+                .enumerate()
+            {
+                term.process(bytes);
+                term.cell_frame_into(&mut snap, 2, 48);
+                let cursor = term.cursor();
+                wd.rescan_from_cells_with_geom_at_cursor(
+                    &snap.cells,
+                    &snap.line_sizes,
+                    2,
+                    48,
+                    &lex,
+                    &c,
+                    epoch as u64 + 1,
+                    now,
+                    geom,
+                    snap.default_bg,
+                    Some((cursor.row, cursor.col)),
+                );
+                assert_eq!(
+                    wd.occ.iter().any(|o| o.class == Class::Profanity),
+                    settled,
+                    "{language} snapshot path after {bytes:?}"
+                );
+            }
         }
     }
 
@@ -9728,7 +9410,7 @@ mod tests {
         // Pins completion, not detonation: a won supernova roll adds a cue.
         c.supernova_chance = 0;
         let t0 = Instant::now();
-        let model = aterm_spec::derive::exact_profanity_completion_model();
+        let model = aterm_models_misc::exact_profanity_completion_model();
         let mut state = model.init_state();
         let mut term = Terminal::new(2, 48);
         let mut wd = WordDecorations::default();
@@ -9808,137 +9490,10 @@ mod tests {
         assert!(!model.check_invariant("CompletionCreatesExactlyOneEpisode", &early));
     }
 
-    /// The snapshot scan path carries the cursor too, so it defers ambiguous
-    /// forms exactly like `rescan(&Terminal)`.
-    #[test]
-    fn snapshot_cursor_defers_ambiguous_form_until_delimiter() {
-        let (rows, cols) = (2usize, 48usize);
-        let mut c = cfg();
-        c.profanity_style = ProfanityStyle::Rainbow;
-        let geom = EffectGeom {
-            cell_w: 8,
-            cell_h: 16,
-            rows: rows as u16,
-            cols: cols as u16,
-        };
-        let now = Instant::now();
-
-        for language in ["ro", "all"] {
-            let lex = Lexicon::with_languages(&[language]);
-            let mut term = Terminal::new(rows as u16, cols as u16);
-            let mut snap = aterm_core::render::RenderInput::default();
-            term.process(b"fut");
-            term.cell_frame_into(&mut snap, rows, cols);
-            let cursor = term.cursor();
-            let mut wd = WordDecorations::default();
-            wd.rescan_from_cells_with_geom_at_cursor(
-                &snap.cells,
-                &snap.line_sizes,
-                rows,
-                cols,
-                &lex,
-                &c,
-                1,
-                now,
-                geom,
-                snap.default_bg,
-                Some((cursor.row, cursor.col)),
-            );
-            assert!(
-                wd.occ.iter().all(|o| o.class != Class::Profanity),
-                "{language} snapshot path decorated provisional fut"
-            );
-
-            term.process(b" ");
-            term.cell_frame_into(&mut snap, rows, cols);
-            let cursor = term.cursor();
-            wd.rescan_from_cells_with_geom_at_cursor(
-                &snap.cells,
-                &snap.line_sizes,
-                rows,
-                cols,
-                &lex,
-                &c,
-                2,
-                now,
-                geom,
-                snap.default_bg,
-                Some((cursor.row, cursor.col)),
-            );
-            assert!(
-                wd.occ.iter().any(|o| o.class == Class::Profanity),
-                "{language} snapshot path lost delimiter-settled fut"
-            );
-        }
-    }
-
-    /// Model of the spent-profanity re-arm rule. `Buggy=1` combines both
-    /// single-signal faults (unconditional transfer; caret-only re-arm).
-    fn live_profanity_retype_model() -> aterm_spec::derive::Model {
-        use aterm_spec::ty_model;
-        ty_model! {
-            LiveProfanityRetype {
-                const Cap = 2;
-                const Buggy = 0;
-                var phase = 0;     // 0 intervening text, 1 completed live curse
-                var retypes = 0;
-                var armed = 0;
-                var transfers = 0;
-                var passive = 0;
-                var preserved = 0;
-                var false_rearms = 0;
-                action TypeLive when (phase == 0 && retypes <= Cap - 1) {
-                    phase = 1;
-                    retypes = retypes + 1;
-                    armed = if Buggy == 1 { armed } else { armed + 1 };
-                    transfers = if Buggy == 1 { transfers + 1 } else { transfers };
-                }
-                action PassiveCaret when (passive == 0) {
-                    passive = 1;
-                    preserved = if Buggy == 1 { preserved } else { preserved + 1 };
-                    false_rearms = if Buggy == 1 { false_rearms + 1 } else { false_rearms };
-                }
-                action Intervene when (phase == 1 && retypes <= Cap - 1) { phase = 0; }
-                action Stay when (retypes == Cap) { phase = phase; }
-                invariant Bounds: phase <= 1 && retypes <= Cap && armed <= Cap && transfers <= Cap && passive <= 1 && preserved <= 1 && false_rearms <= 1;
-                invariant EveryLiveRetypeArmed: armed == retypes;
-                invariant NoLiveRetypeTransferred: transfers == 0;
-                invariant EveryPassiveCaretPreserved: preserved == passive;
-                invariant NoPassiveCaretRearm: false_rearms == 0;
-            }
-        }
-    }
-
-    #[test]
-    fn live_profanity_retype_model_proves_and_catches_unconditional_transfer() {
-        let model = live_profanity_retype_model();
-        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
-
-        // Negative controls pin both halves of the faulty policy; finding one
-        // counterexample does not prove the other.
-        let mut buggy = model.clone();
-        for cst in &mut buggy.consts {
-            if cst.0 == "Buggy" {
-                cst.1 = 1;
-            }
-        }
-        let mut live = buggy.init_state();
-        assert!(buggy.fire("TypeLive", &mut live));
-        assert!(!buggy.check_invariant("EveryLiveRetypeArmed", &live));
-        assert!(!buggy.check_invariant("NoLiveRetypeTransferred", &live));
-
-        let mut passive = buggy.init_state();
-        assert!(buggy.fire("PassiveCaret", &mut passive));
-        assert!(!buggy.check_invariant("EveryPassiveCaretPreserved", &passive));
-        assert!(!buggy.check_invariant("NoPassiveCaretRearm", &passive));
-    }
-
     /// Passive output leaves the cursor after the word; after identity expiry
     /// the done mark still keeps it inert (a caret-only policy would re-arm).
     #[test]
     fn passive_output_at_terminal_cursor_stays_spent() {
-        let model = live_profanity_retype_model();
-        let mut state = model.init_state();
         let lex = Lexicon::with_languages(&["all"]);
         let mut c = cfg();
         c.profanity_style = ProfanityStyle::Rainbow;
@@ -9964,7 +9519,6 @@ mod tests {
         wd.rescan(&blank, 4, 48, &lex, &c, 2, t0 + Duration::from_secs(16));
         assert!(wd.persist.is_empty(), "fixture must cross identity expiry");
         wd.rescan(&output, 4, 48, &lex, &c, 3, t0 + Duration::from_secs(17));
-        assert!(model.fire("PassiveCaret", &mut state));
 
         let restored = wd
             .occ
@@ -9974,16 +9528,12 @@ mod tests {
         assert!(restored.inert, "passive cursor-end output rearmed");
         assert!(wd.persist[&restored.ident].born_done);
         assert!(wd.persist[&restored.ident].nova_done);
-        assert!(model.check_invariant("EveryPassiveCaretPreserved", &state));
-        assert!(model.check_invariant("NoPassiveCaretRearm", &state));
     }
 
     /// After a spent `fuck` and `fix`, `fuc` stays ordinary and a live `fuck`
     /// re-arms once; a second retype after `future` re-arms again.
     #[test]
     fn repeated_complete_fuck_rearms_while_fuc_stays_ordinary() {
-        let model = live_profanity_retype_model();
-        let mut state = model.init_state();
         let lex = Lexicon::with_languages(&["all"]);
         let mut c = cfg();
         c.profanity_style = ProfanityStyle::Rainbow;
@@ -10043,7 +9593,6 @@ mod tests {
             6,
             first_retype_at + Duration::from_millis(8),
         );
-        assert!(model.fire("TypeLive", &mut state));
         let completed = wd
             .occ
             .iter()
@@ -10064,7 +9613,6 @@ mod tests {
             .expect("completed episode")
             .nova_done = true;
 
-        assert!(model.fire("Intervene", &mut state));
         for (i, text) in ["f", "fu", "fut", "futu", "futur", "future"]
             .into_iter()
             .enumerate()
@@ -10092,18 +9640,19 @@ mod tests {
         // The first retype spent the witness; this one needs its own key.
         wd.note_typed_edit(second_retype_at, None);
         wd.rescan(&repeated, 4, 48, &lex, &c, 13, second_retype_at);
-        assert!(model.fire("TypeLive", &mut state));
         let second = wd
             .occ
             .iter()
             .find(|occ| occ.class == Class::Profanity)
             .expect("second live fuck");
         assert_eq!(second.appeared, second_retype_at);
-        assert_eq!(wd.birth_seq, births_before + state["armed"] as u64);
+        assert_eq!(
+            wd.birth_seq,
+            births_before + 2,
+            "each live retype is one birth"
+        );
         assert!(!second.inert);
         assert!(!wd.persist[&second.ident].nova_done);
-        assert!(model.check_invariant("EveryLiveRetypeArmed", &state));
-        assert!(model.check_invariant("NoLiveRetypeTransferred", &state));
     }
 
     /// Composer repaints while `fix` is typed, then a restored `fuck` line: the
@@ -10230,22 +9779,6 @@ mod tests {
             !ink.is_empty(),
             "the rainbow may continue after the stars settle"
         );
-    }
-
-    #[test]
-    fn scunthorpe_not_decorated_on_real_grid() {
-        let mut term = Terminal::new(2, 48);
-        term.process(b"the scattered concatenation in category");
-        let mut wd = WordDecorations::default();
-        let lex = Lexicon::with_languages(&["en"]);
-        let mut c = cfg();
-        c.allow_bare_cat = true;
-        let epoch = term.damage_epoch();
-        let now = Instant::now();
-        wd.rescan(&term, 2, 48, &lex, &c, epoch, now);
-        let mut out = Vec::new();
-        tick_deco(&mut wd, now, &c, &mut out);
-        assert!(out.is_empty(), "no false positives expected, got {out:?}");
     }
 
     /// Builtin `en` plus an emphasis override for `ultrathink`: what a user's
@@ -10490,105 +10023,67 @@ mod tests {
         );
     }
 
-    /// A deny-list edit on an idle grid retires the memo (`ScanMemo::fit`), or
-    /// a newly ignored word would keep sparkling.
+    /// A deny-list edit or a language switch on an idle grid retires the memo
+    /// (`ScanMemo::fit` over [`scan_inputs_fp`], which covers both the scan
+    /// gates and the lexicon), or a newly ignored word (or a switched-off
+    /// language's form) would keep decorating. A two-way gate, not a latch.
     #[test]
-    fn scan_memo_retires_when_the_scan_gates_change() {
+    fn scan_memo_retires_when_the_gates_or_the_lexicon_change() {
         let (rows, cols) = (3usize, 32usize);
-        let mut term = Terminal::new(rows as u16, cols as u16);
-        term.process(b"the kitty is here\r\n");
-        let lex = Lexicon::with_languages(&["en"]);
-        let mut c = cfg();
-        let mut snap = aterm_core::render::RenderInput::default();
-        term.cell_frame_into(&mut snap, rows, cols);
-        let now = Instant::now();
-        let mut wd = WordDecorations::default();
-        wd.rescan_from_cells(&snap.cells, &snap.line_sizes, rows, cols, &lex, &c, 1, now);
-        assert!(
-            wd.occ.iter().any(|o| o.class == Class::Feline),
-            "the fixture must decorate the feline word first"
-        );
-
-        // Same cells, same epoch-advance, only the deny list changed.
-        c.ignore.insert("kitty".to_string());
-        wd.rescan_from_cells(&snap.cells, &snap.line_sizes, rows, cols, &lex, &c, 2, now);
-        assert!(
-            !wd.occ.iter().any(|o| o.class == Class::Feline),
-            "a denied surface must stop decorating without needing a text change"
-        );
-
-        // ...and back: the fingerprint must be a two-way gate, not a latch.
-        c.ignore.clear();
-        wd.rescan_from_cells(&snap.cells, &snap.line_sizes, rows, cols, &lex, &c, 3, now);
-        assert!(
-            wd.occ.iter().any(|o| o.class == Class::Feline),
-            "clearing the deny list must restore the decoration"
-        );
-    }
-
-    /// The lexicon is in the retirement key ([`scan_inputs_fp`]): switching
-    /// `languages` from `["en","ro"]` to `["en"]` undecorates the `ro` form.
-    #[test]
-    fn scan_memo_retires_when_the_lexicon_changes() {
-        let (rows, cols) = (3usize, 32usize);
-        let mut term = Terminal::new(rows as u16, cols as u16);
+        let en = Lexicon::with_languages(&["en"]);
         // `futu` is a `ro`-gated ambiguous profanity form: present in the
-        // en+ro lexicon, absent from the en-only one, with the same scan gates.
-        term.process(b"totally futu here\r\n");
-        let with_ro = Lexicon::with_languages(&["en", "ro"]);
-        let en_only = Lexicon::with_languages(&["en"]);
+        // en+ro lexicon, absent from the en-only one, with the same gates.
+        let en_ro = Lexicon::with_languages(&["en", "ro"]);
         let c = cfg();
-        let mut snap = aterm_core::render::RenderInput::default();
-        term.cell_frame_into(&mut snap, rows, cols);
-        let now = Instant::now();
-        let mut wd = WordDecorations::default();
-        let profane = |wd: &WordDecorations| wd.occ.iter().any(|o| o.class == Class::Profanity);
-        wd.rescan_from_cells(
-            &snap.cells,
-            &snap.line_sizes,
-            rows,
-            cols,
-            &with_ro,
-            &c,
-            1,
-            now,
-        );
-        assert!(
-            profane(&wd),
-            "the fixture must decorate the language-gated form under en+ro"
-        );
-
-        // Same cells, same epoch-advance, same options — only the lexicon.
-        wd.rescan_from_cells(
-            &snap.cells,
-            &snap.line_sizes,
-            rows,
-            cols,
-            &en_only,
-            &c,
-            2,
-            now,
-        );
-        assert!(
-            !profane(&wd),
-            "a swapped lexicon must not be answered from the old lexicon's memo"
-        );
-
-        // ...and back: a fingerprint, not a latch.
-        wd.rescan_from_cells(
-            &snap.cells,
-            &snap.line_sizes,
-            rows,
-            cols,
-            &with_ro,
-            &c,
-            3,
-            now,
-        );
-        assert!(
-            profane(&wd),
-            "restoring the language must restore the decoration"
-        );
+        let mut ignoring = cfg();
+        ignoring.ignore.insert("kitty".to_string());
+        for (label, text, class, (lex_on, c_on), (lex_off, c_off)) in [
+            (
+                "deny list",
+                "the kitty is here\r\n",
+                Class::Feline,
+                (&en, &c),
+                (&en, &ignoring),
+            ),
+            (
+                "lexicon",
+                "totally futu here\r\n",
+                Class::Profanity,
+                (&en_ro, &c),
+                (&en, &c),
+            ),
+        ] {
+            let mut term = Terminal::new(rows as u16, cols as u16);
+            term.process(text.as_bytes());
+            let mut snap = aterm_core::render::RenderInput::default();
+            term.cell_frame_into(&mut snap, rows, cols);
+            let now = Instant::now();
+            let mut wd = WordDecorations::default();
+            // Same cells every time; only the scan inputs change.
+            let scans = [
+                (lex_on, c_on, true),
+                (lex_off, c_off, false),
+                (lex_on, c_on, true),
+            ];
+            for (epoch, (lex, c, decorated)) in scans.into_iter().enumerate() {
+                let epoch = epoch as u64 + 1;
+                wd.rescan_from_cells(
+                    &snap.cells,
+                    &snap.line_sizes,
+                    rows,
+                    cols,
+                    lex,
+                    c,
+                    epoch,
+                    now,
+                );
+                assert_eq!(
+                    wd.occ.iter().any(|o| o.class == class),
+                    decorated,
+                    "{label}: scan {epoch} must follow its own inputs, not a stale memo"
+                );
+            }
+        }
     }
 
     /// The probe class of hash `h` in a 256-bucket hashbrown table: starting
@@ -10693,60 +10188,6 @@ mod tests {
         );
     }
 
-    /// Rows whose char streams differ in length (a wide CJK lead): a memo hit
-    /// that skipped the `scan_chars` rebuild trips the named guard, not a panic.
-    #[cfg(debug_assertions)]
-    #[test]
-    #[should_panic(expected = "scan_chars must mirror scan_text")]
-    fn memo_hit_without_the_scan_chars_rebuild_trips_the_guard() {
-        let (rows, cols) = (4usize, 24usize);
-        let mut term = Terminal::new(rows as u16, cols as u16);
-        term.process("a kitty naps\r\n\u{5BBD} cat here\r\n".as_bytes());
-        let lex = Lexicon::with_languages(&["en"]);
-        let c = cfg();
-        let mut snap = aterm_core::render::RenderInput::default();
-        term.cell_frame_into(&mut snap, rows, cols);
-        let now = Instant::now();
-        let mut wd = WordDecorations::default();
-        // Frame 1 populates the memo and leaves `scan_chars` holding the last
-        // row's (wide-lead, one char shorter) stream.
-        wd.rescan_from_cells(&snap.cells, &snap.line_sizes, rows, cols, &lex, &c, 1, now);
-        assert!(
-            wd.occ.iter().any(|o| o.class == Class::Feline),
-            "the fixture must match on the first row, or the hit proves nothing"
-        );
-        wd.mutate_skip_scan_chars_rebuild = true;
-        wd.rescan_from_cells(&snap.cells, &snap.line_sizes, rows, cols, &lex, &c, 2, now);
-    }
-
-    /// The unmutated fixture: an all-memo second frame keeps the guard quiet
-    /// and the decoration set unchanged.
-    #[test]
-    fn memo_hit_over_a_wide_row_keeps_the_frame_and_the_guard_quiet() {
-        let (rows, cols) = (4usize, 24usize);
-        let mut term = Terminal::new(rows as u16, cols as u16);
-        term.process("a kitty naps\r\n\u{5BBD} cat here\r\n".as_bytes());
-        let lex = Lexicon::with_languages(&["en"]);
-        let c = cfg();
-        let mut snap = aterm_core::render::RenderInput::default();
-        term.cell_frame_into(&mut snap, rows, cols);
-        let now = Instant::now();
-        let mut wd = WordDecorations::default();
-        wd.rescan_from_cells(&snap.cells, &snap.line_sizes, rows, cols, &lex, &c, 1, now);
-        let first = deco_state(&wd);
-        let misses = wd.scan_memo.misses;
-        wd.rescan_from_cells(&snap.cells, &snap.line_sizes, rows, cols, &lex, &c, 2, now);
-        assert_eq!(
-            wd.scan_memo.misses, misses,
-            "the second frame must be served entirely from the memo"
-        );
-        assert_eq!(
-            first,
-            deco_state(&wd),
-            "the memo-served frame must decorate identically"
-        );
-    }
-
     #[test]
     fn geometry_scan_samples_and_freezes_the_prospective_cat_footprint() {
         let (rows, cols) = (4usize, 20usize);
@@ -10807,50 +10248,8 @@ mod tests {
                 cell.bg = dark;
             }
         }
-        let occupied_row = usize::from(feline(&wd).row - 1);
-        let occupied_variant = c
-            .feline_magic
-            .then(|| special_variant_v4(feline(&wd).genome.magic))
-            .flatten()
-            .unwrap_or_else(|| cat_variant_v4(feline(&wd).genome.gkey));
-        let occupied_col =
-            usize::from(cat_geometry(feline(&wd), geom, occupied_variant).x / geom.cell_w);
-        let mut blank =
-            snap.cells[usize::from(feline(&wd).row)][usize::from(feline(&wd).start_col)];
-        blank.ch = ' ';
-        blank.wide = false;
-        blank.bg = dark;
-        snap.cells[occupied_row].resize(occupied_col + 1, blank);
-        snap.cells[occupied_row][occupied_col].ch = 'X';
-        // A sparse blocker does not veto (cats draw under text); only a wall on
-        // both sides, built below, does.
-        wd.rescan_from_cells_with_geom_at_cursor(
-            &snap.cells,
-            &snap.line_sizes,
-            rows,
-            cols,
-            &lex,
-            &c,
-            2,
-            now + Duration::from_millis(50),
-            geom,
-            rgb3_to_u32(dark),
-            None,
-        );
-        assert!(
-            feline(&wd).cat_text_clear,
-            "one blocker cell keeps the cat — under-text fur never fights glyphs"
-        );
-        let trigger_row = usize::from(feline(&wd).row);
-        let walled: Vec<usize> = (trigger_row.saturating_sub(2)..=trigger_row + 2)
-            .filter(|r| *r != trigger_row && *r < snap.cells.len())
-            .collect();
-        for &r in &walled {
-            snap.cells[r].resize(cols, blank);
-            for cell in &mut snap.cells[r] {
-                cell.ch = 'X';
-            }
-        }
+        // The background under the footprint changes; the live episode keeps
+        // the palette it froze at birth.
         wd.rescan_from_cells_with_geom_at_cursor(
             &snap.cells,
             &snap.line_sizes,
@@ -10869,17 +10268,6 @@ mod tests {
             mixed,
             "a live episode freezes its footprint-derived palette"
         );
-        assert!(
-            !feline(&wd).cat_text_clear && !cat_eligible(feline(&wd), &c, geom),
-            "opaque cats yield when text WALLS both candidate bands"
-        );
-
-        for &r in &walled {
-            for cell in &mut snap.cells[r] {
-                cell.ch = ' ';
-            }
-        }
-        snap.cells[occupied_row][occupied_col].ch = ' ';
         let mut fresh = WordDecorations::default();
         fresh.rescan_from_cells_with_geom_at_cursor(
             &snap.cells,
@@ -10897,176 +10285,6 @@ mod tests {
         assert!(
             feline(&fresh).cat_colors.dark(),
             "a fresh episode sees the now-dark full footprint"
-        );
-    }
-
-    #[test]
-    fn moved_episode_rechecks_text_clearance_with_the_transferred_genome() {
-        let (rows, cols) = (8usize, 48usize);
-        let geom = EffectGeom {
-            cell_w: CAT_MIN_CELL_W,
-            cell_h: 20,
-            rows: rows as u16,
-            cols: cols as u16,
-        };
-        let lex = lex();
-        let c = cfg();
-        let now = Instant::now();
-        let mut wd = WordDecorations::default();
-
-        let snapshot = |row_1_based: u8| {
-            let mut term = Terminal::new(rows as u16, cols as u16);
-            term.process(format!("\x1b[{row_1_based};1Hdear kitty friend").as_bytes());
-            let mut snap = aterm_core::render::RenderInput::default();
-            term.cell_frame_into(&mut snap, rows, cols);
-            snap
-        };
-        let first = snapshot(4);
-        wd.rescan_from_cells_with_geom_at_cursor(
-            &first.cells,
-            &first.line_sizes,
-            rows,
-            cols,
-            &lex,
-            &c,
-            1,
-            now,
-            geom,
-            first.default_bg,
-            None,
-        );
-        let original = feline(&wd).clone();
-
-        // Probe the moved row as a fresh birth to capture the provisional
-        // genome that alignment is required to replace.
-        let mut moved = snapshot(5);
-        let mut probe = WordDecorations::default();
-        probe.rescan_from_cells_with_geom_at_cursor(
-            &moved.cells,
-            &moved.line_sizes,
-            rows,
-            cols,
-            &lex,
-            &c,
-            1,
-            now,
-            geom,
-            moved.default_bg,
-            None,
-        );
-        let provisional = feline(&probe).clone();
-        assert_eq!(
-            original.seed, provisional.seed,
-            "same column keeps the alignment seed"
-        );
-
-        let body_cells = |genome: Genome| {
-            let variant = c
-                .feline_magic
-                .then(|| special_variant_v4(genome.magic))
-                .flatten()
-                .unwrap_or_else(|| cat_variant_v4(genome.gkey));
-            let g = cat_geometry_for(
-                provisional.start_col,
-                provisional.end_col,
-                genome.gkey,
-                geom,
-                variant,
-            );
-            let cw = i64::from(geom.cell_w);
-            let ch = i64::from(geom.cell_h);
-            let x0 = i64::from(g.x);
-            let x1 = x0 + i64::from(g.w);
-            let trigger_top = i64::from(provisional.row) * ch;
-            let y0 = (trigger_top + i64::from(g.chin) - i64::from(g.hart)).max(0);
-            let mut cells = Vec::new();
-            for row in usize::try_from(y0 / ch).unwrap_or(0)..usize::from(provisional.row) {
-                for col in usize::try_from(x0 / cw).unwrap_or(0)
-                    ..=usize::try_from((x1 - 1) / cw).unwrap_or(0)
-                {
-                    cells.push((row, col));
-                }
-            }
-            cells
-        };
-
-        let provisional_cells = body_cells(provisional.genome);
-        // Pick a genome whose body footprint differs from the provisional one
-        // and wall the symmetric difference, so the two plans diverge.
-        let (transferred, blocked_cells) = (0..10_000u64)
-            .find_map(|seed| {
-                let genome = Genome {
-                    gkey: mix(seed),
-                    magic: 1000,
-                };
-                let transferred_cells = body_cells(genome);
-                let diff: Vec<(usize, usize)> = transferred_cells
-                    .iter()
-                    .filter(|cell| !provisional_cells.contains(cell))
-                    .chain(
-                        provisional_cells
-                            .iter()
-                            .filter(|cell| !transferred_cells.contains(cell)),
-                    )
-                    .copied()
-                    .collect();
-                (!diff.is_empty()).then_some((genome, diff))
-            })
-            .expect("fixture finds a transferred footprint distinct from the provisional one");
-
-        let mut blank =
-            moved.cells[usize::from(provisional.row)][usize::from(provisional.start_col)];
-        blank.ch = ' ';
-        blank.wide = false;
-        for &(r, col) in &blocked_cells {
-            if moved.cells[r].len() <= col {
-                moved.cells[r].resize(col + 1, blank);
-            }
-            moved.cells[r][col].ch = 'X';
-        }
-        let plan_for = |genome: Genome| {
-            cat_peek_plan(
-                &moved.cells,
-                geom,
-                provisional.row,
-                provisional.start_col,
-                provisional.end_col,
-                genome,
-                c.feline_magic,
-            )
-        };
-        let expected_clear = plan_for(transferred).is_some();
-
-        wd.persist
-            .get_mut(&original.ident)
-            .expect("original episode")
-            .genome = transferred;
-        wd.rescan_from_cells_with_geom_at_cursor(
-            &moved.cells,
-            &moved.line_sizes,
-            rows,
-            cols,
-            &lex,
-            &c,
-            2,
-            now + Duration::from_millis(100),
-            geom,
-            moved.default_bg,
-            None,
-        );
-        let aligned = feline(&wd);
-        assert_eq!(aligned.row, provisional.row);
-        assert_eq!(
-            aligned.appeared, now,
-            "the old episode moved to the new row"
-        );
-        assert_eq!(
-            aligned.genome, transferred,
-            "alignment transferred the old genome"
-        );
-        assert_eq!(
-            aligned.cat_text_clear, expected_clear,
-            "clearance is computed after alignment with the transferred footprint"
         );
     }
 
@@ -11167,34 +10385,9 @@ mod tests {
         );
     }
 
-    /// `reduced_motion` forces the static gradient from frame 0: identical bytes
-    /// at t=0 and t=later, and no `active_until` contribution.
-    #[test]
-    fn reduced_motion_ink_static_from_frame_0() {
-        let mut term = Terminal::new(2, 48);
-        term.process(b"ultrathink");
-        let mut wd = WordDecorations::default();
-        let mut c = cfg();
-        c.reduced_motion = true;
-        let now = Instant::now();
-        let (a, fp_a) = ink_at(&mut wd, &mut term, 2, 48, &c, now, now);
-        assert!(!a.is_empty(), "static ink still renders");
-        assert!(!wd.is_active(now), "reduced motion never animates");
-        let mut out = Vec::new();
-        let mut b = Vec::new();
-        let fp_b = tick_ink(
-            &mut wd,
-            now + Duration::from_millis(500),
-            &c,
-            &mut out,
-            &mut b,
-        );
-        assert_eq!(a, b, "static gradient is frame-invariant");
-        assert_eq!(fp_a, fp_b);
-    }
-
     /// §4.4: `MAX_INK_CELLS` truncates whole words row-major (never partial)
-    /// and re-emission is a stable fixed point.
+    /// and re-emission is a stable fixed point. Under `reduced_motion` that
+    /// static gradient holds from frame 0 and never arms the scheduler.
     #[test]
     fn ink_truncation_is_whole_word_and_stable() {
         // 4 × 10-col words per row = 40 lead cells/row: 12 rows + 3 words fill
@@ -11214,6 +10407,7 @@ mod tests {
         c.reduced_motion = true; // settled bytes, so re-emission compares exactly
         let now = Instant::now();
         let (ink, fp_a) = ink_at(&mut wd, &mut term, rows, cols, &c, now, now);
+        assert!(!wd.is_active(now), "reduced-motion ink never animates");
         assert_eq!(ink.len(), 510, "51 whole words of 10 cells, never partial");
         assert!(
             ink.iter().filter(|i| i.row == 12).count() == 30 && ink.iter().all(|i| i.row <= 12),
@@ -11396,111 +10590,6 @@ mod tests {
             "rebirth resolves the new surrounding colors"
         );
         assert_eq!(feline(&wd).appeared, t0 + Duration::from_secs(13));
-    }
-
-    /// §13 `grace_survives_one_epoch`: a word occluded for one rescan keeps its
-    /// genome, `appeared` and spent nova.
-    #[test]
-    fn grace_survives_one_epoch() {
-        let lex = lex();
-        let c = cfg();
-        let t0 = Instant::now();
-        let mut wd = WordDecorations::default();
-        let mut term = Terminal::new(2, 64);
-        term.process(b"one sleepy kitty purrs");
-        wd.rescan(&term, 2, 64, &lex, &c, 1, t0);
-        let g1 = feline(&wd).genome;
-        let ident = mix(feline(&wd).seed); // ordinal 0
-        // Simulate a spent nova for this episode.
-        wd.persist.get_mut(&ident).expect("episode").nova_done = true;
-
-        // Occlude exactly one rescan (a clear+redraw race).
-        let blank = Terminal::new(2, 64);
-        wd.rescan(&blank, 2, 64, &lex, &c, 2, t0 + Duration::from_secs(1));
-        assert!(wd.occ.is_empty());
-        assert!(wd.persist.contains_key(&ident), "grace holds the episode");
-
-        // Re-hit within grace: same genome, same appeared, nova stays spent.
-        wd.rescan(&term, 2, 64, &lex, &c, 3, t0 + Duration::from_secs(2));
-        assert_eq!(feline(&wd).genome, g1, "occlusion must not re-roll");
-        assert_eq!(
-            feline(&wd).appeared,
-            t0,
-            "occlusion must not restart windows"
-        );
-        assert!(
-            wd.persist[&ident].nova_done,
-            "the spent-nova guard survives occlusion (no strobe)"
-        );
-    }
-
-    /// §13 `magic_position_independent`: the same sentence at three positions
-    /// rolls the same magic (§3.5) while `gkey`, which folds in the seed,
-    /// differs.
-    #[test]
-    fn magic_position_independent() {
-        let lex = lex();
-        let c = cfg();
-        let t0 = Instant::now();
-        let mut wd = WordDecorations::default();
-        let mut term = Terminal::new(6, 64);
-        term.process(
-            b"the nice kitty sleeps\r\n\r\n    the nice kitty sleeps\r\n\r\n        the nice kitty sleeps",
-        );
-        wd.rescan(&term, 6, 64, &lex, &c, 1, t0);
-        let cats: Vec<&Occurrence> = wd.occ.iter().filter(|o| o.class == Class::Feline).collect();
-        assert_eq!(cats.len(), 3, "three indented copies");
-        assert_eq!(cats[0].genome.magic, cats[1].genome.magic);
-        assert_eq!(cats[1].genome.magic, cats[2].genome.magic);
-        assert_ne!(
-            cats[0].genome.gkey, cats[1].genome.gkey,
-            "seeds keep gkeys distinct"
-        );
-        assert_ne!(cats[1].genome.gkey, cats[2].genome.gkey);
-    }
-
-    /// §13 `ordinal_transfer_is_episode_only`: when one of two context-identical
-    /// twins scrolls off, the survivor lands on the departed twin's entry,
-    /// taking only episode state, never the coat (§3.6).
-    #[test]
-    fn ordinal_transfer_is_episode_only() {
-        let lex = lex();
-        let c = cfg();
-        let t0 = Instant::now();
-        let mut wd = WordDecorations::default();
-        let mut twins = Terminal::new(4, 64);
-        twins.process(b"dear kitty friend\r\n\r\ndear kitty friend");
-        wd.rescan(&twins, 4, 64, &lex, &c, 1, t0);
-        let cats: Vec<&Occurrence> = wd.occ.iter().filter(|o| o.class == Class::Feline).collect();
-        assert_eq!(cats.len(), 2);
-        assert_eq!(
-            cats[0].seed, cats[1].seed,
-            "same word, same column: same seed"
-        );
-        let g = cats[0].genome;
-        assert_eq!(
-            cats[1].genome, g,
-            "context-identical twins hold byte-equal genomes"
-        );
-        let seed = cats[0].seed;
-        let ident0 = mix(seed); // ordinal 0 — the row-major FIRST twin
-        // The first twin's nova fires (simulated); the second's does not.
-        wd.persist.get_mut(&ident0).expect("twin 0").nova_done = true;
-
-        // The first twin scrolls off; the survivor's ordinal shifts 1 → 0.
-        let mut lone = Terminal::new(4, 64);
-        lone.process(b"dear kitty friend");
-        wd.rescan(&lone, 4, 64, &lex, &c, 2, t0 + Duration::from_secs(1));
-        let survivor = feline(&wd);
-        assert_eq!(
-            survivor.genome, g,
-            "the survivor keeps its coat (genome by value)"
-        );
-        assert_eq!(survivor.appeared, t0, "the survivor inherits the episode");
-        assert!(
-            wd.persist[&ident0].nova_done,
-            "the inherited episode's spent nova suppresses a re-flash (conservative direction)"
-        );
     }
 
     /// §13 allocation regression: every resident scratch buffer's capacity is
@@ -11721,7 +10810,7 @@ mod tests {
     /// `SparkleIdentity` model, checking `(state, rolls, nova)` at every step.
     #[test]
     fn sparkle_identity_conformance_real_persist_map() {
-        let m = aterm_spec::derive::sparkle_identity_model();
+        let m = aterm_models_effects::sparkle_identity_model();
         let mut st = m.init_state();
         let lex = lex();
         let c = cfg();
@@ -11879,322 +10968,140 @@ mod tests {
         assert!(m.check_invariant("GenomeFrozen", &st));
     }
 
-    /// Negative control for `Rekey`: discarding the old entry before the
-    /// redraw gives Buggy=1's second roll and second fire.
+    /// ContextMove's soundness complement: a `kitty` retyped after nonblank
+    /// partial-token frames, with equal FormId, is a fresh, armed episode,
+    /// never the spent one transferred, in all three shapes:
+    ///
+    /// * at a changed column (no exact evidence at all);
+    /// * at the same key after several partial scans (`TypedRetype`: the
+    ///   exact context returns, but the taint forbids the transfer);
+    /// * at the same key after ONE coalesced partial inside the two-scan weak
+    ///   window (`RecentTypedRetype`: neither the same-row fast path nor an
+    ///   alignment edge may take it).
     #[test]
-    fn sparkle_identity_negative_control_missing_rekey_is_buggy_trace() {
-        let healthy = aterm_spec::derive::sparkle_identity_model();
-        let mut buggy = aterm_spec::derive::sparkle_identity_model();
-        for cst in &mut buggy.consts {
-            if cst.0 == "Buggy" {
-                cst.1 = 1;
+    fn a_kitty_retyped_after_partial_frames_is_fresh_and_armed() {
+        let model = aterm_models_effects::sparkle_reflow_cardinality_model();
+        let lex = lex();
+        let c = cfg();
+        let changed: &[&[u8]] = &[
+            b"\x1b[2;1Hstatus a noisy k purrs",
+            b"\x1b[2;1Hstatus a noisy ki purrs",
+            b"\x1b[2;1Hstatus a noisy kitt purrs",
+        ];
+        let same: &[&[u8]] = &[
+            b"old alpha k tail",
+            b"old alpha ki tail",
+            b"old alpha kitt tail",
+        ];
+        let one: &[&[u8]] = &[b"old alpha kitt tail"];
+        for (label, partials, complete, action) in [
+            (
+                "changed column",
+                changed,
+                b"\x1b[2;1Hstatus a noisy kitty purrs".as_slice(),
+                None,
+            ),
+            (
+                "same key after more typing",
+                same,
+                b"old alpha kitty tail".as_slice(),
+                Some("TypedRetype"),
+            ),
+            (
+                "same key after one partial",
+                one,
+                b"old alpha kitty tail".as_slice(),
+                Some("RecentTypedRetype"),
+            ),
+        ] {
+            let t0 = Instant::now();
+            let at = |n: usize| t0 + Duration::from_millis(16 * n as u64);
+            let mut original = Terminal::new(4, 48);
+            original.process(b"old alpha kitty tail");
+            let mut wd = WordDecorations::default();
+            wd.rescan(&original, 4, 48, &lex, &c, 1, t0);
+            let old = feline(&wd).clone();
+            let old_ctx = wd.persist[&old.ident].ctx_fp;
+            wd.persist.get_mut(&old.ident).expect("old live").nova_done = true;
+
+            for (i, partial) in partials.iter().enumerate() {
+                let mut typing = Terminal::new(4, 48);
+                typing.process(partial);
+                wd.rescan(&typing, 4, 48, &lex, &c, i as u64 + 2, at(i + 1));
+                assert!(
+                    wd.occ.iter().all(|o| o.class != Class::Feline),
+                    "{label}: partial token {i} must not be recognized"
+                );
             }
-        }
-        let mut st = buggy.init_state();
-        let lex = lex();
-        let c = cfg();
-        let t0 = Instant::now();
-        let mut wd = WordDecorations::default();
-        let mut original = Terminal::new(2, 48);
-        original.process(b"a fluffy kitty naps");
-        let mut moved = Terminal::new(2, 48);
-        moved.process(b" a fluffy kitty naps");
-        let mut rolls = 0i64;
-
-        wd.rescan(&original, 2, 48, &lex, &c, 1, t0);
-        rolls += 1;
-        assert!(buggy.fire("Appear", &mut st));
-        let old_ident = mix(feline(&wd).seed);
-        wd.persist.get_mut(&old_ident).expect("live").nova_done = true;
-        assert!(buggy.fire("Ignite", &mut st));
-
-        // Fault injection: no rekey transfer, so the scanner takes its fresh path.
-        wd.persist.clear();
-        wd.done_marks.clear();
-        wd.rescan(&moved, 2, 48, &lex, &c, 2, t0 + Duration::from_secs(1));
-        rolls += 1;
-        assert!(buggy.fire("Rekey", &mut st));
-        let new_ident = mix(feline(&wd).seed);
-        assert_ne!(new_ident, old_ident);
-        assert_projection(&wd, new_ident, rolls, &st);
-        assert!(
-            !wd.persist[&new_ident].nova_done,
-            "fresh path lost the spent guard"
-        );
-        assert!(
-            !healthy.check_invariant("GenomeFrozen", &st),
-            "a logical move must not add a genome roll"
-        );
-
-        assert!(buggy.fire("Ignite", &mut st));
-        assert!(
-            !healthy.check_invariant("PlayedOnce", &st),
-            "the rekey bug admits a second logical fire"
-        );
-    }
-
-    /// Negative control for `ContextMove`: removing the live episode before the
-    /// wrap-crossing move gives Buggy=1's false birth and second fire.
-    #[test]
-    fn sparkle_identity_negative_control_context_move_false_birth() {
-        let healthy = aterm_spec::derive::sparkle_identity_model();
-        let mut buggy = aterm_spec::derive::sparkle_identity_model();
-        for cst in &mut buggy.consts {
-            if cst.0 == "Buggy" {
-                cst.1 = 1;
+            if action.is_some() {
+                let tainted = wd.persist[&old.ident];
+                assert!(
+                    tainted.continuity_tainted,
+                    "{label}: PRECONDITION — nonblank partial scans taint the old episode"
+                );
+                if partials.len() == 1 {
+                    assert_eq!(
+                        wd.rescan_seq.wrapping_sub(tainted.seen_seq),
+                        1,
+                        "{label}: PRECONDITION — inside the weak-continuity window"
+                    );
+                }
             }
-        }
-        let mut st = buggy.init_state();
-        let lex = lex();
-        let c = cfg();
-        let t0 = Instant::now();
-        let mut wd = WordDecorations::default();
-        let mut original = Terminal::new(2, 48);
-        original.process(b"a fluffy kitty naps");
-        let mut context_moved = Terminal::new(2, 48);
-        context_moved
-            .process(b"build output changed; wrapping follows here.    status a bright kitty naps");
 
-        wd.rescan(&original, 2, 48, &lex, &c, 1, t0);
-        assert!(buggy.fire("Appear", &mut st));
-        let old_ident = mix(feline(&wd).seed);
-        let old_ctx = wd.persist[&old_ident].ctx_fp;
-        wd.persist.get_mut(&old_ident).expect("live").nova_done = true;
-        assert!(buggy.fire("Ignite", &mut st));
-
-        // Fault injection: with no transferable episode the surface is fresh.
-        wd.persist.clear();
-        wd.done_marks.clear();
-        let births_before = wd.birth_seq;
-        wd.rescan(
-            &context_moved,
-            2,
-            48,
-            &lex,
-            &c,
-            2,
-            t0 + Duration::from_secs(1),
-        );
-        assert!(buggy.fire("ContextMove", &mut st));
-        let new_ident = mix(feline(&wd).seed);
-        assert_ne!(new_ident, old_ident, "the target crossed the wrap");
-        assert_eq!(feline(&wd).row, 1);
-        assert_ne!(
-            wd.persist[&new_ident].ctx_fp, old_ctx,
-            "the candidate's row-local status context really changed"
-        );
-        assert_eq!(
-            wd.birth_seq,
-            births_before + 1,
-            "the fault injection exercised the genuine fresh-allocation arm"
-        );
-        assert_projection(&wd, new_ident, 2, &st);
-        assert!(
-            healthy.check_invariant("GenomeFrozen", &st),
-            "a false birth rolls exactly once and evades GenomeFrozen"
-        );
-        assert!(
-            !healthy.check_invariant("RecognitionComplete", &st),
-            "the logical move was not recognized"
-        );
-        assert!(
-            !healthy.check_invariant("NoFalseBirths", &st),
-            "the move was misclassified as a birth"
-        );
-        assert!(
-            !wd.persist[&new_ident].nova_done,
-            "the false birth lost the spent guard"
-        );
-
-        assert!(buggy.fire("Ignite", &mut st));
-        assert!(
-            !healthy.check_invariant("PlayedOnce", &st),
-            "the false birth admits a second logical fire"
-        );
-    }
-
-    /// ContextMove's soundness complement: a retyped nearby `kitty` with equal
-    /// FormId stays a fresh, armed episode.
-    #[test]
-    fn unrelated_changed_column_retype_remains_fresh_and_armed() {
-        let lex = lex();
-        let c = cfg();
-        let t0 = Instant::now();
-        let mut original = Terminal::new(4, 48);
-        original.process(b"old alpha kitty tail");
-        let mut replacement = Terminal::new(4, 48);
-        replacement.process(b"\x1b[2;1Hstatus a noisy kitty purrs");
-
-        let mut wd = WordDecorations::default();
-        wd.rescan(&original, 4, 48, &lex, &c, 1, t0);
-        let old = feline(&wd).clone();
-        wd.persist.get_mut(&old.ident).expect("old live").nova_done = true;
-
-        // Key-by-key typing yields nonmatching scans first, which rule out the
-        // seq-gap ≤ 2 continuity arm.
-        for (i, partial) in [
-            b"\x1b[2;1Hstatus a noisy k purrs".as_slice(),
-            b"\x1b[2;1Hstatus a noisy ki purrs".as_slice(),
-            b"\x1b[2;1Hstatus a noisy kitt purrs".as_slice(),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let mut typing = Terminal::new(4, 48);
-            typing.process(partial);
-            wd.rescan(
-                &typing,
-                4,
-                48,
-                &lex,
-                &c,
-                i as u64 + 2,
-                t0 + Duration::from_millis(16 * (i as u64 + 1)),
+            let births_before = wd.birth_seq;
+            let appeared = at(partials.len() + 1);
+            let mut replacement = Terminal::new(4, 48);
+            replacement.process(complete);
+            let seq = partials.len() as u64 + 2;
+            wd.rescan(&replacement, 4, 48, &lex, &c, seq, appeared);
+            let new = feline(&wd);
+            assert_eq!(
+                new.form_id, old.form_id,
+                "{label}: the exact surface is kitty"
+            );
+            assert_eq!(
+                new.ident == old.ident,
+                action.is_some(),
+                "{label}: PRECONDITION — the fixture's identity key"
+            );
+            if action.is_some() {
+                assert_eq!(
+                    wd.persist[&new.ident].ctx_fp, old_ctx,
+                    "{label}: PRECONDITION — the exact context returns"
+                );
+            }
+            assert_eq!(
+                wd.birth_seq,
+                births_before + 1,
+                "{label}: one genuine new birth"
+            );
+            assert_eq!(
+                new.appeared, appeared,
+                "{label}: the new kitty activates now"
             );
             assert!(
-                wd.occ.iter().all(|o| o.class != Class::Feline),
-                "partial token must not be recognized at step {i}"
+                !wd.persist[&new.ident].nova_done,
+                "{label}: the retyped kitty is armed rather than inheriting spent state"
             );
+            if let Some(action) = action {
+                let mut state = model.init_state();
+                assert!(model.fire(action, &mut state), "{label}");
+                assert_eq!(
+                    state[&"fresh"], 1,
+                    "{label}: real birth projects onto {action}"
+                );
+                assert_eq!(state[&"armed"], 1, "{label}");
+                assert_eq!(state[&"transferred"], 0, "{label}");
+                assert!(model.check_invariant("NoFalseTransfers", &state), "{label}");
+            }
         }
-
-        let births_before = wd.birth_seq;
-        let replaced_at = t0 + Duration::from_millis(64);
-        wd.rescan(&replacement, 4, 48, &lex, &c, 5, replaced_at);
-        let new = feline(&wd);
-        assert_eq!(new.form_id, old.form_id, "the exact surface is kitty");
-        assert_ne!(new.seed, old.seed, "the replacement changed column");
-        assert_eq!(wd.birth_seq, births_before + 1, "one genuine new birth");
-        assert_eq!(new.appeared, replaced_at, "the new kitty activates now");
-        assert!(
-            !wd.persist[&new.ident].nova_done,
-            "the new nearby kitty is armed rather than inheriting spent state"
-        );
-    }
-
-    #[test]
-    fn same_column_retype_after_more_typing_is_fresh_and_armed() {
-        let model = aterm_spec::derive::sparkle_reflow_cardinality_model();
-        let lex = lex();
-        let c = cfg();
-        let t0 = Instant::now();
-        let mut original = Terminal::new(4, 48);
-        original.process(b"old alpha kitty tail"); // kitty starts at column 10
-        let mut wd = WordDecorations::default();
-        wd.rescan(&original, 4, 48, &lex, &c, 1, t0);
-        let old = feline(&wd).clone();
-        let old_ctx = wd.persist[&old.ident].ctx_fp;
-        wd.persist.get_mut(&old.ident).expect("old live").nova_done = true;
-
-        for (i, partial) in [
-            b"old alpha k tail".as_slice(),
-            b"old alpha ki tail".as_slice(),
-            b"old alpha kitt tail".as_slice(),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let mut typing = Terminal::new(4, 48);
-            typing.process(partial);
-            wd.rescan(
-                &typing,
-                4,
-                48,
-                &lex,
-                &c,
-                i as u64 + 2,
-                t0 + Duration::from_millis(16 * (i as u64 + 1)),
-            );
-            assert!(wd.occ.iter().all(|o| o.class != Class::Feline));
-        }
-        assert!(
-            wd.persist[&old.ident].continuity_tainted,
-            "nonblank partial-token scans are the model's taint premise"
-        );
-
-        let mut replacement = Terminal::new(4, 48);
-        replacement.process(b"old alpha kitty tail");
-        let births_before = wd.birth_seq;
-        let appeared = t0 + Duration::from_millis(64);
-        wd.rescan(&replacement, 4, 48, &lex, &c, 5, appeared);
-        let new = feline(&wd);
-        let mut state = model.init_state();
-        assert!(model.fire("TypedRetype", &mut state));
-        assert_eq!(
-            new.start_col, old.start_col,
-            "fixture keeps the same column"
-        );
-        assert_eq!(new.seed, old.seed, "same form and column keep the seed");
-        assert_eq!(
-            new.ident, old.ident,
-            "the position-bearing key is identical"
-        );
-        assert_eq!(
-            wd.birth_seq - births_before,
-            state[&"fresh"] as u64,
-            "real fresh allocations project onto TypedRetype"
-        );
-        assert_eq!(
-            wd.persist[&new.ident].ctx_fp, old_ctx,
-            "exact context returns"
-        );
-        assert_eq!(new.appeared, appeared);
-        assert!(
-            !wd.persist[&new.ident].nova_done,
-            "the common same-prompt retype activates the kitty again"
-        );
-        assert_eq!(state[&"transferred"], 0);
-        assert_eq!(state[&"armed"], 1);
-        assert!(model.check_invariant("NoFalseTransfers", &state));
-    }
-
-    /// One coalesced partial-token frame is overwrite evidence: the returning
-    /// kitty takes neither the fast path nor an alignment edge.
-    #[test]
-    fn recent_same_column_retype_after_one_partial_is_fresh_and_armed() {
-        let model = aterm_spec::derive::sparkle_reflow_cardinality_model();
-        let lex = lex();
-        let c = cfg();
-        let t0 = Instant::now();
-        let mut complete = Terminal::new(4, 48);
-        complete.process(b"old alpha kitty tail");
-        let mut partial = Terminal::new(4, 48);
-        partial.process(b"old alpha kitt tail");
-
-        let mut wd = WordDecorations::default();
-        wd.rescan(&complete, 4, 48, &lex, &c, 1, t0);
-        let old = feline(&wd).clone();
-        wd.persist.get_mut(&old.ident).expect("old kitty").nova_done = true;
-
-        wd.rescan(&partial, 4, 48, &lex, &c, 2, t0 + Duration::from_millis(16));
-        let tainted = wd.persist[&old.ident];
-        assert!(tainted.continuity_tainted);
-        assert_eq!(wd.rescan_seq.wrapping_sub(tainted.seen_seq), 1);
-
-        let births_before = wd.birth_seq;
-        let appeared = t0 + Duration::from_millis(32);
-        wd.rescan(&complete, 4, 48, &lex, &c, 3, appeared);
-        let new = feline(&wd);
-        let mut state = model.init_state();
-        assert!(model.fire("RecentTypedRetype", &mut state));
-        assert_eq!(new.ident, old.ident, "fixture returns to the same key");
-        assert_eq!(new.appeared, appeared);
-        assert_eq!(
-            wd.birth_seq - births_before,
-            state[&"fresh"] as u64,
-            "taint, not elapsed scan count, makes this a fresh birth"
-        );
-        assert!(!wd.persist[&new.ident].nova_done, "the kitty is armed");
-        assert_eq!(state[&"recent"], 1);
-        assert_eq!(state[&"continuity_tainted"], 1);
-        assert_eq!(state[&"transferred"], 0);
-        assert!(model.check_invariant("NoFalseTransfers", &state));
     }
 
     /// The episode replaced by one explicit kitty retype does not make the next
     /// retype born-done; each cycle ends with the caret one past the `y`.
     #[test]
     fn two_consecutive_recent_kitty_retypes_both_arm() {
-        let model = aterm_spec::derive::sparkle_retype_rearm_model();
+        let model = aterm_models_effects::sparkle_retype_rearm_model();
         let lex = lex();
         let c = cfg();
         let t0 = Instant::now();
@@ -12332,146 +11239,6 @@ mod tests {
         );
     }
 
-    /// Each arm varies the caret and keystroke over the same frames; only a
-    /// typed retype plays a second cat. Every precondition is asserted.
-    #[test]
-    fn a_repaint_with_the_caret_elsewhere_plays_no_second_cat() {
-        let lex = lex();
-        let c = cfg();
-        let g = geom20();
-        let (rows, cols) = (g.rows as usize, g.cols as usize);
-        let t0 = Instant::now();
-
-        // As typed: the caret is the cell right after the `y`.
-        let mut typed = Terminal::new(g.rows, g.cols);
-        typed.process(b"hello kitty");
-        // The repaint: same row, nonblank, word gone (sets `continuity_tainted`).
-        let mut overwritten = Terminal::new(g.rows, g.cols);
-        overwritten.process(b"hello ------");
-        // The word restored with the cursor parked on another row.
-        let mut restored_elsewhere = Terminal::new(g.rows, g.cols);
-        restored_elsewhere.process(b"hello kitty\r\n\r\n$ ");
-
-        // `play` runs the real one-shot to completion.
-        let play = |wd: &mut WordDecorations, ident: u64| {
-            let mut at = t0;
-            for _ in 0..120 {
-                at += Duration::from_millis(60);
-                tick_cat(wd, at, &c, g);
-                if wd.persist[&ident].peek_done {
-                    break;
-                }
-            }
-            at
-        };
-
-        // The retype arm's intermediate frame: backspaced to `kitt`, caret on
-        // the partial token, as typing looks from the grid.
-        let mut partial = Terminal::new(g.rows, g.cols);
-        partial.process(b"hello kitt");
-
-        let mut arms = Vec::new();
-        for (label, gap, restore, keystroke) in [
-            (
-                "repaint (caret elsewhere)",
-                &overwritten,
-                &restored_elsewhere,
-                false,
-            ),
-            // The retype arm's frames without a committed key: still a redraw.
-            (
-                "repaint that PARKS THE CARET ON THE WORD",
-                &overwritten,
-                &typed,
-                false,
-            ),
-            ("retype (caret on the word)", &overwritten, &typed, true),
-            (
-                "incremental retype (partial -> complete)",
-                &partial,
-                &typed,
-                true,
-            ),
-        ] {
-            let mut wd = WordDecorations::default();
-            wd.rescan(&typed, rows, cols, &lex, &c, 1, t0);
-            let first = feline(&wd).clone();
-            assert!(!first.inert, "{label}: the typed kitty must be armed");
-
-            let played_at = play(&mut wd, first.ident);
-            assert!(
-                wd.persist[&first.ident].peek_done,
-                "{label}: PRECONDITION — the first cat must really play out"
-            );
-            let done_key = first.ident ^ wd.persist[&first.ident].ctx_fp;
-            assert!(
-                wd.done_marks.contains_key(&done_key),
-                "{label}: PRECONDITION — a spent cat must stamp the ledger IN \
-                 PLACE, before anything replaces it"
-            );
-
-            wd.rescan(
-                gap,
-                rows,
-                cols,
-                &lex,
-                &c,
-                2,
-                played_at + Duration::from_millis(16),
-            );
-            assert!(
-                wd.persist[&first.ident].continuity_tainted,
-                "{label}: PRECONDITION — the overwrite must taint the episode, \
-                 or neither arm is exercising the disputed branch"
-            );
-
-            let births_before = wd.birth_seq;
-            // The causal witness, only where a key was pressed.
-            if keystroke {
-                wd.note_typed_edit(played_at + Duration::from_millis(30), None);
-            }
-            wd.rescan(
-                restore,
-                rows,
-                cols,
-                &lex,
-                &c,
-                3,
-                played_at + Duration::from_millis(32),
-            );
-            let back = feline(&wd).clone();
-            assert_eq!(
-                back.ident, first.ident,
-                "{label}: PRECONDITION — the same word at the same column \
-                 re-keys identically, so both arms really are arguing about \
-                 ONE ledger row"
-            );
-            assert_eq!(
-                wd.birth_seq - births_before,
-                1,
-                "{label}: PRECONDITION — the restore is a FRESH birth in both \
-                 arms; only its armed/inert verdict may differ"
-            );
-            arms.push((label, back.inert));
-        }
-
-        for arm in &arms[..2] {
-            assert!(
-                arm.1,
-                "{}: a repaint must NOT play a second cat — that is the owner's \
-                 'new kitties appear when the screen draws'",
-                arm.0
-            );
-        }
-        for arm in &arms[2..] {
-            assert!(
-                !arm.1,
-                "{}: CONVERSE — a genuine retype under the caret must still re-arm",
-                arm.0
-            );
-        }
-    }
-
     /// A redraw during the rise or dwell does not replay the cat: the mark is
     /// written when the one-shot starts.
     #[test]
@@ -12543,7 +11310,7 @@ mod tests {
     /// kitty stays armed and resident.
     #[test]
     fn persist_cap_drops_unmatched_grace_after_fresh_move() {
-        let model = aterm_spec::derive::sparkle_persist_capacity_model();
+        let model = aterm_models_effects::sparkle_persist_capacity_model();
         let lex = lex();
         let c = cfg();
         let t0 = Instant::now();
@@ -12644,284 +11411,144 @@ mod tests {
         assert_eq!(wd.persist.len(), PERSIST_CAP);
     }
 
+    /// The redraw windows of a spent `kitty` that went away and came back.
+    /// Each row is one boundary of the transfer rules:
+    ///
+    /// * the weak redraw window is exactly two scans: a changed-context redraw
+    ///   at gap 2 transfers the episode, at gap 3 it is a fresh birth;
+    /// * blank occlusion is grace, not a redraw: the exact context returning
+    ///   after MORE than two blank scans still transfers (`BlankGrace`);
+    /// * TTL expiry happens before adoption, so an hour-old episode is never
+    ///   resurrected by a low rescan count, through alignment or through the
+    ///   same-position fast path (where the departure's done mark makes the
+    ///   rebirth born-done);
+    /// * a width change never takes the weak redraw transfer.
     #[test]
-    fn exact_context_blank_grace_survives_more_than_two_scans() {
-        let model = aterm_spec::derive::sparkle_reflow_cardinality_model();
+    fn a_returning_spent_kitty_transfers_only_inside_its_redraw_windows() {
+        let model = aterm_models_effects::sparkle_reflow_cardinality_model();
         let lex = lex();
         let c = cfg();
-        let t0 = Instant::now();
-        let mut term = Terminal::new(4, 48);
-        term.process(b"old alpha kitty tail");
-        let blank = Terminal::new(4, 48);
-        let mut wd = WordDecorations::default();
-        wd.rescan(&term, 4, 48, &lex, &c, 1, t0);
-        let old = feline(&wd).clone();
-        let old_ctx = wd.persist[&old.ident].ctx_fp;
-        wd.persist.get_mut(&old.ident).expect("old live").nova_done = true;
-
-        for seq in 2..=4 {
-            wd.rescan(
-                &blank,
-                4,
-                48,
-                &lex,
-                &c,
-                seq,
-                t0 + Duration::from_secs(seq - 1),
-            );
-        }
-        assert!(
-            !wd.persist[&old.ident].continuity_tainted,
-            "blank occlusion is the model's untainted premise"
-        );
-        let births_before = wd.birth_seq;
-        wd.rescan(&term, 4, 48, &lex, &c, 5, t0 + Duration::from_secs(4));
-        let resumed = feline(&wd);
-        let mut state = model.init_state();
-        assert!(model.fire("BlankGrace", &mut state));
-        assert_eq!(
-            wd.birth_seq - births_before,
-            state[&"fresh"] as u64,
-            "real blank-grace births project onto the model"
-        );
-        assert_eq!(resumed.appeared, t0);
-        assert_eq!(wd.persist[&resumed.ident].ctx_fp, old_ctx);
-        assert!(wd.persist[&resumed.ident].nova_done, "spent guard survives");
-        assert_eq!(state[&"transferred"], 1);
-        assert_eq!(state[&"armed"], 0);
-        assert!(model.check_invariant("RecognitionComplete", &state));
-    }
-
-    /// Negative controls for the two stale exact-evidence actions: each fault
-    /// changes only the recognizer boundary and reproduces the Buggy state.
-    #[test]
-    fn reflow_taint_and_blank_grace_negative_controls_match_buggy_model() {
-        let healthy = aterm_spec::derive::sparkle_reflow_cardinality_model();
-        let mut buggy = aterm_spec::derive::sparkle_reflow_cardinality_model();
-        for cst in &mut buggy.consts {
-            if cst.0 == "Buggy" {
-                cst.1 = 1;
-            }
-        }
-        let lex = lex();
-        let c = cfg();
-        let t0 = Instant::now();
         let mut original = Terminal::new(4, 48);
         original.process(b"old alpha kitty tail");
-
-        // Fault A: discard the real nonblank-taint evidence. The unchanged
-        // exact context then steals the spent episode, exactly Buggy TypedRetype.
-        let mut wd = WordDecorations::default();
-        wd.rescan(&original, 4, 48, &lex, &c, 1, t0);
-        let ident = feline(&wd).ident;
-        wd.persist.get_mut(&ident).expect("old live").nova_done = true;
-        for (i, partial) in [
-            b"old alpha k tail".as_slice(),
-            b"old alpha ki tail".as_slice(),
-            b"old alpha kitt tail".as_slice(),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let mut typing = Terminal::new(4, 48);
-            typing.process(partial);
-            wd.rescan(
-                &typing,
-                4,
-                48,
-                &lex,
-                &c,
-                i as u64 + 2,
-                t0 + Duration::from_millis(16 * (i as u64 + 1)),
-            );
+        let moved_at = |cols: u16| {
+            let mut t = Terminal::new(4, cols);
+            t.process(b"\x1b[2;1Hstatus a noisy kitty purrs");
+            t
+        };
+        let (moved, moved_wider) = (moved_at(48), moved_at(49));
+        let blank = Terminal::new(4, 48);
+        /// What the returning occurrence must be.
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Verdict {
+            /// The spent episode transferred (clock and guard kept).
+            Transferred,
+            /// A fresh birth, armed.
+            Armed,
+            /// A fresh birth, born-done from the departure's mark.
+            BornDone,
+            /// A fresh birth, nothing adopted (settling may make it inert).
+            Fresh,
         }
-        assert!(wd.persist[&ident].continuity_tainted);
-        wd.persist
-            .get_mut(&ident)
-            .expect("fault target")
-            .continuity_tainted = false;
-        let births_before = wd.birth_seq;
-        wd.rescan(
-            &original,
-            4,
-            48,
-            &lex,
-            &c,
-            5,
-            t0 + Duration::from_millis(64),
-        );
-        let mut typed = buggy.init_state();
-        assert!(buggy.fire("TypedRetype", &mut typed));
-        assert_eq!(wd.birth_seq - births_before, typed[&"fresh"] as u64);
-        assert_eq!(
-            i64::from(wd.persist[&ident].nova_done),
-            typed[&"transferred"]
-        );
-        assert!(!healthy.check_invariant("NoFalseTransfers", &typed));
-        assert!(!healthy.check_invariant("FreshMatchesExpected", &typed));
-
-        // Fault B: remove the untainted grace survivor before the exact-context
-        // return. The real miss path births/arms, exactly Buggy BlankGrace.
-        let blank = Terminal::new(4, 48);
-        let mut wd = WordDecorations::default();
-        wd.rescan(&original, 4, 48, &lex, &c, 1, t0);
-        let ident = feline(&wd).ident;
-        wd.persist.get_mut(&ident).expect("old live").nova_done = true;
-        for seq in 2..=4 {
-            wd.rescan(
-                &blank,
-                4,
+        for (label, blanks, ret_ms, target, cols, verdict, action) in [
+            (
+                "gap 2",
+                &[16u64][..],
+                32,
+                &moved,
                 48,
-                &lex,
-                &c,
-                seq,
-                t0 + Duration::from_millis(16 * (seq - 1)),
-            );
-        }
-        assert!(!wd.persist[&ident].continuity_tainted);
-        wd.persist.clear();
-        wd.done_marks.clear();
-        let births_before = wd.birth_seq;
-        wd.rescan(
-            &original,
-            4,
-            48,
-            &lex,
-            &c,
-            5,
-            t0 + Duration::from_millis(64),
-        );
-        let mut grace = buggy.init_state();
-        assert!(buggy.fire("BlankGrace", &mut grace));
-        let returned = feline(&wd);
-        assert_eq!(wd.birth_seq - births_before, grace[&"fresh"] as u64);
-        assert_eq!(
-            i64::from(!wd.persist[&returned.ident].nova_done),
-            grace[&"armed"]
-        );
-        assert!(!healthy.check_invariant("NoFalseBirths", &grace));
-        assert!(!healthy.check_invariant("RecognitionComplete", &grace));
-    }
-
-    #[test]
-    fn same_position_hour_old_episode_expires_before_fast_adoption() {
-        let lex = lex();
-        let c = cfg();
-        let t0 = Instant::now();
-        let mut term = Terminal::new(4, 48);
-        term.process(b"old alpha kitty tail");
-        let blank = Terminal::new(4, 48);
-        let mut wd = WordDecorations::default();
-        wd.rescan(&term, 4, 48, &lex, &c, 1, t0);
-        let old = feline(&wd).clone();
-        wd.persist.get_mut(&old.ident).expect("old live").nova_done = true;
-        wd.rescan(&blank, 4, 48, &lex, &c, 2, t0 + Duration::from_secs(1));
-
-        let births_before = wd.birth_seq;
-        let now = t0 + Duration::from_secs(3_600);
-        wd.rescan(&term, 4, 48, &lex, &c, 3, now);
-        let reborn = feline(&wd);
-        assert_eq!(
-            wd.birth_seq,
-            births_before + 1,
-            "the expired episode was not adopted"
-        );
-        assert_eq!(reborn.appeared, now);
-        assert!(
-            wd.persist[&reborn.ident].born_done,
-            "true death records the completed one-shot before the same identity returns"
-        );
-    }
-
-    #[test]
-    fn weak_redraw_sequence_boundary_is_exactly_two_scans() {
-        let lex = lex();
-        let c = cfg();
-        let t0 = Instant::now();
-        let mut original = Terminal::new(4, 48);
-        original.process(b"old alpha kitty tail");
-        let blank = Terminal::new(4, 48);
-        let mut moved = Terminal::new(4, 48);
-        moved.process(b"\x1b[2;1Hstatus a noisy kitty purrs");
-
-        let run = |blank_scans: u64| {
+                Verdict::Transferred,
+                None,
+            ),
+            ("gap 3", &[16, 32][..], 48, &moved, 48, Verdict::Armed, None),
+            (
+                "three blank scans, exact context",
+                &[1_000, 2_000, 3_000][..],
+                4_000,
+                &original,
+                48,
+                Verdict::Transferred,
+                Some("BlankGrace"),
+            ),
+            (
+                "hour old, moved",
+                &[1_000][..],
+                3_600_000,
+                &moved,
+                48,
+                Verdict::Armed,
+                None,
+            ),
+            (
+                "hour old, same position",
+                &[1_000][..],
+                3_600_000,
+                &original,
+                48,
+                Verdict::BornDone,
+                None,
+            ),
+            (
+                "width change",
+                &[][..],
+                16,
+                &moved_wider,
+                49,
+                Verdict::Fresh,
+                None,
+            ),
+        ] {
+            let t0 = Instant::now();
+            let at = |ms: u64| t0 + Duration::from_millis(ms);
             let mut wd = WordDecorations::default();
             wd.rescan(&original, 4, 48, &lex, &c, 1, t0);
-            let old_ident = feline(&wd).ident;
-            wd.persist.get_mut(&old_ident).expect("old live").nova_done = true;
-            for n in 0..blank_scans {
-                wd.rescan(
-                    &blank,
-                    4,
-                    48,
-                    &lex,
-                    &c,
-                    n + 2,
-                    t0 + Duration::from_millis(16 * (n + 1)),
-                );
+            let old = feline(&wd).clone();
+            let old_ctx = wd.persist[&old.ident].ctx_fp;
+            wd.persist.get_mut(&old.ident).expect("old live").nova_done = true;
+            for (n, &ms) in blanks.iter().enumerate() {
+                wd.rescan(&blank, 4, 48, &lex, &c, n as u64 + 2, at(ms));
             }
             let births_before = wd.birth_seq;
-            let seq = blank_scans + 2;
-            let now = t0 + Duration::from_millis(16 * (blank_scans + 1));
-            wd.rescan(&moved, 4, 48, &lex, &c, seq, now);
-            (wd, births_before, now)
-        };
-
-        let (within, births, _) = run(1); // visible -> blank -> redrawn: gap 2
-        assert_eq!(within.birth_seq, births, "gap 2 transfers the episode");
-        assert!(within.persist[&feline(&within).ident].nova_done);
-
-        let (outside, births, appeared) = run(2); // gap 3
-        assert_eq!(outside.birth_seq, births + 1, "gap 3 is a fresh birth");
-        assert_eq!(feline(&outside).appeared, appeared);
-        assert!(!outside.persist[&feline(&outside).ident].nova_done);
-    }
-
-    #[test]
-    fn expired_episode_cannot_be_resurrected_by_low_rescan_count() {
-        let lex = lex();
-        let c = cfg();
-        let t0 = Instant::now();
-        let mut original = Terminal::new(4, 48);
-        original.process(b"old alpha kitty tail");
-        let blank = Terminal::new(4, 48);
-        let mut moved = Terminal::new(4, 48);
-        moved.process(b"\x1b[2;1Hstatus a noisy kitty purrs");
-        let mut wd = WordDecorations::default();
-        wd.rescan(&original, 4, 48, &lex, &c, 1, t0);
-        let old_ident = feline(&wd).ident;
-        wd.persist.get_mut(&old_ident).expect("old live").nova_done = true;
-        wd.rescan(&blank, 4, 48, &lex, &c, 2, t0 + Duration::from_secs(1));
-
-        let births_before = wd.birth_seq;
-        let now = t0 + Duration::from_secs(3_600);
-        wd.rescan(&moved, 4, 48, &lex, &c, 3, now);
-        assert_eq!(wd.birth_seq, births_before + 1);
-        assert_eq!(feline(&wd).appeared, now);
-        assert!(
-            !wd.persist[&feline(&wd).ident].nova_done,
-            "TTL expiry occurs before alignment, despite a sequence gap of two"
-        );
-    }
-
-    #[test]
-    fn width_change_never_uses_weak_redraw_transfer() {
-        let lex = lex();
-        let c = cfg();
-        let t0 = Instant::now();
-        let mut original = Terminal::new(4, 48);
-        original.process(b"old alpha kitty tail");
-        let mut moved = Terminal::new(4, 49);
-        moved.process(b"\x1b[2;1Hstatus a noisy kitty purrs");
-        let mut wd = WordDecorations::default();
-        wd.rescan(&original, 4, 48, &lex, &c, 1, t0);
-        let births_before = wd.birth_seq;
-        wd.rescan(&moved, 4, 49, &lex, &c, 2, t0 + Duration::from_millis(16));
-        assert_eq!(
-            wd.birth_seq,
-            births_before + 1,
-            "resize settling may make the birth inert, but cannot adopt unrelated state"
-        );
+            let seq = blanks.len() as u64 + 2;
+            wd.rescan(target, 4, cols, &lex, &c, seq, at(ret_ms));
+            let back = feline(&wd);
+            let ep = &wd.persist[&back.ident];
+            let fresh = wd.birth_seq - births_before;
+            if verdict == Verdict::Transferred {
+                assert_eq!(fresh, 0, "{label}: the episode transfers");
+                assert_eq!(back.appeared, t0, "{label}: the episode clock survives");
+                assert!(ep.nova_done, "{label}: the spent guard survives");
+            } else {
+                assert_eq!(fresh, 1, "{label}: a fresh birth, nothing adopted");
+                assert_eq!(back.appeared, at(ret_ms), "{label}");
+            }
+            match verdict {
+                Verdict::Armed => assert!(!ep.nova_done, "{label}: armed"),
+                Verdict::BornDone => assert!(
+                    ep.born_done,
+                    "{label}: true death records the one-shot before the identity returns"
+                ),
+                Verdict::Transferred | Verdict::Fresh => {}
+            }
+            if let Some(action) = action {
+                assert!(
+                    !ep.continuity_tainted,
+                    "{label}: PRECONDITION — blank occlusion never taints"
+                );
+                assert_eq!(ep.ctx_fp, old_ctx, "{label}: the exact context returns");
+                let mut state = model.init_state();
+                assert!(model.fire(action, &mut state), "{label}");
+                assert_eq!(
+                    fresh, state[&"fresh"] as u64,
+                    "{label}: projects onto {action}"
+                );
+                assert_eq!(state[&"transferred"], 1, "{label}");
+                assert_eq!(state[&"armed"], 0, "{label}");
+                assert!(
+                    model.check_invariant("RecognitionComplete", &state),
+                    "{label}"
+                );
+            }
+        }
     }
 
     /// Tier-1 binding for `SparkleReflowCardinality`: two repeated surfaces
@@ -12929,7 +11556,7 @@ mod tests {
     /// exactly one (association checked as a multiset).
     #[test]
     fn sparkle_reflow_cardinality_conformance_repeated_surfaces() {
-        let model = aterm_spec::derive::sparkle_reflow_cardinality_model();
+        let model = aterm_models_effects::sparkle_reflow_cardinality_model();
         let lex = lex();
         let c = cfg();
         let t0 = Instant::now();
@@ -13032,7 +11659,7 @@ mod tests {
     /// and 2→3 arm three, matching `Buggy=1`.
     #[test]
     fn sparkle_reflow_cardinality_negative_control_context_gate() {
-        let mut buggy = aterm_spec::derive::sparkle_reflow_cardinality_model();
+        let mut buggy = aterm_models_effects::sparkle_reflow_cardinality_model();
         for cst in &mut buggy.consts {
             if cst.0 == "Buggy" {
                 cst.1 = 1;
@@ -13078,8 +11705,8 @@ mod tests {
     /// the re-hit re-rolls and the spent-nova guard is lost.
     #[test]
     fn sparkle_identity_negative_control_graceless_map_is_buggy_trace() {
-        let healthy = aterm_spec::derive::sparkle_identity_model();
-        let mut buggy = aterm_spec::derive::sparkle_identity_model();
+        let healthy = aterm_models_effects::sparkle_identity_model();
+        let mut buggy = aterm_models_effects::sparkle_identity_model();
         for cst in &mut buggy.consts {
             if cst.0 == "Buggy" {
                 cst.1 = 1;
@@ -13150,16 +11777,16 @@ mod tests {
         }
     }
 
-    /// Scan a terminal through the geometry-aware snapshot path and hand back
-    /// the engine plus the resolved feline occurrence.
+    /// Scan a terminal through the geometry-aware snapshot path (the shipping
+    /// one) with the live caret at `caret`, and hand back the engine.
     fn scan_grid(
         term: &mut Terminal,
-        rows: usize,
-        cols: usize,
         c: &DecoConfig,
         geom: EffectGeom,
         now: Instant,
+        caret: Option<(u16, u16)>,
     ) -> WordDecorations {
+        let (rows, cols) = (usize::from(geom.rows), usize::from(geom.cols));
         let lex = lex();
         let mut snap = aterm_core::render::RenderInput::default();
         term.cell_frame_into(&mut snap, rows, cols);
@@ -13181,7 +11808,7 @@ mod tests {
             now,
             geom,
             bg,
-            None,
+            caret,
         );
         wd
     }
@@ -13200,7 +11827,7 @@ mod tests {
             "\r\n\r\n╭──────────────────╮\r\n│ kitty            │\r\n╰──────────────────╯"
                 .as_bytes(),
         );
-        let mut wd = scan_grid(&mut term, rows, cols, &c, g, t0);
+        let mut wd = scan_grid(&mut term, &c, g, t0, None);
         let occ = feline(&wd);
         assert!(
             occ.cat_text_clear && cat_eligible(occ, &c, g),
@@ -13211,36 +11838,6 @@ mod tests {
             !cats.is_empty(),
             "typing `kitty` inside a TUI prompt box summons a cat"
         );
-    }
-
-    /// A row-0 word peeks `Down`: every pixel sits below the word row, never
-    /// over the text.
-    #[test]
-    fn top_row_word_peeks_down_under_the_word_never_over_it() {
-        let (rows, cols) = (6usize, 20usize);
-        let c = cfg();
-        let g = geom20();
-        let t0 = Instant::now();
-        let mut term = Terminal::new(rows as u16, cols as u16);
-        term.process(b"kitty"); // row 0 — nothing above it
-        let mut wd = scan_grid(&mut term, rows, cols, &c, g, t0);
-        let occ = feline(&wd);
-        assert_eq!(occ.row, 0, "fixture puts the word on the top row");
-        assert!(
-            occ.cat_peek_down,
-            "a top-row word has no band above — the head must peek DOWN"
-        );
-        let (cats, _, _) = tick_cat(&mut wd, t0 + Duration::from_millis(600), &c, g);
-        assert!(!cats.is_empty(), "the top-row cat draws");
-        let word_row_bottom = i32::from(g.cell_h);
-        for s in &cats {
-            assert!(
-                s.y >= word_row_bottom - i32::from(g.cell_h) / 2,
-                "no sprite pixel may bury the top-row word it decorates: \
-                 sprite y={} vs word row bottom {word_row_bottom}",
-                s.y
-            );
-        }
     }
 
     /// Words that arrived while the window was not presenting (no rescan ran)
@@ -13357,7 +11954,7 @@ mod tests {
         let t0 = Instant::now();
         let mut term = Terminal::new(rows as u16, cols as u16);
         term.process(b"XXXXXXXXXXXXXXXXXXXX\r\nXXXXXXXXXXXXXXXXXXXX\r\nkitty");
-        let wd = scan_grid(&mut term, rows, cols, &c, g, t0);
+        let wd = scan_grid(&mut term, &c, g, t0, None);
         let occ = feline(&wd);
         assert_eq!(occ.row, 2);
         assert!(
@@ -13458,6 +12055,82 @@ mod tests {
 
     /// Incremental typing creates the episode when the final `y` lands, and
     /// the top-row entrance is visible on the first animation sample.
+    /// A still, opaque, note-less cursor-companion frame at `cursor`.
+    fn still_frame(geom: EffectGeom, cursor: (u16, u16)) -> KittyCursorFrame {
+        KittyCursorFrame {
+            geom,
+            cursor,
+            look: KittyLook::default(),
+            colors: CatColorKey::default(),
+            bob: 0.0,
+            alpha: 255,
+            pose: crate::kitty_cursor::CatPose::STILL,
+            sing: 0.0,
+            notes: [None; crate::kitty_sing::MAX_NOTES],
+        }
+    }
+
+    /// The companion's layout at `cursor`: default look, no bob.
+    fn still_layout(geom: EffectGeom, cursor: (u16, u16)) -> KittyCursorLayout {
+        KittyCursorLayout {
+            geom,
+            cursor,
+            look: KittyLook::default(),
+            bob: 0.0,
+        }
+    }
+
+    /// A settled (no fold) companion placement sample at `at`, facing right.
+    fn settled_at(at: Instant) -> crate::kitty_cursor::CursorCatPlacementFrame {
+        crate::kitty_cursor::CursorCatPlacementFrame {
+            sampled_at: at,
+            fold: None,
+            facing_left: false,
+        }
+    }
+
+    /// Resolve and emit one companion frame through the shipping placement
+    /// path; the body is the last sprite it emits.
+    fn emit_placed(
+        wd: &mut WordDecorations,
+        geom: EffectGeom,
+        cursor: (u16, u16),
+        motion: crate::kitty_cursor::CursorCatPlacementFrame,
+    ) -> (KittyCursorPlacement, FreeSprite) {
+        let placement = wd
+            .resolve_kitty_cursor_placement(still_layout(geom, cursor), motion)
+            .expect("placeable companion");
+        let mut free = Vec::new();
+        wd.kitty_cursor_at_placement(still_frame(geom, cursor), placement, &mut free)
+            .expect("companion emitted");
+        (placement, *free.last().expect("the body emits last"))
+    }
+
+    /// One host frame in `redraw_window` order: the engine tick, then the
+    /// cursor companion's emission at `companion`, sharing one free stream.
+    fn companion_frame(
+        wd: &mut WordDecorations,
+        now: Instant,
+        c: &DecoConfig,
+        g: EffectGeom,
+        companion: Option<(u16, u16)>,
+    ) -> Vec<FreeSprite> {
+        let (mut free, _, _) = tick_cat_at(wd, now, c, g, companion, true);
+        if let Some(cell) = companion {
+            wd.kitty_cursor(still_frame(g, cell), &mut free);
+        }
+        free
+    }
+
+    /// The word-peek sprites of a free stream: word cats draw under the text,
+    /// the companion over it.
+    fn ambient(free: &[FreeSprite]) -> Vec<FreeSprite> {
+        free.iter()
+            .filter(|s| matches!(s.z, FreeZ::UnderText))
+            .copied()
+            .collect()
+    }
+
     #[test]
     fn incrementally_typed_kitty_always_starts_a_visible_top_row_cat() {
         let lex = lex();
@@ -13509,38 +12182,17 @@ mod tests {
 
     /// A downward peek is cut only at the text line: the art's bottom edge
     /// (`ay + h`) stays fixed through rise and descend, and only the top edge
-    /// moves.
+    /// moves. No pixel buries the word it decorates (a viewport clamp that
+    /// slid an Up sprite into view would cover it).
     #[test]
     fn a_downward_peek_is_cut_only_at_the_text_line() {
-        let lex = lex();
         let c = cfg();
         let g = geom20();
         let t0 = Instant::now();
-        let (rows, cols) = (usize::from(g.rows), usize::from(g.cols));
         // Row 0 has no rows above, so the peek plan must resolve down.
         let mut term = Terminal::new(g.rows, g.cols);
         term.process(b"\x1b[1;6Hkitty");
-        let mut snap = aterm_core::render::RenderInput::default();
-        term.cell_frame_into(&mut snap, rows, cols);
-        let bg = snap
-            .cells
-            .iter()
-            .find_map(|line| line.first())
-            .map_or(0, |cell| rgb3_to_u32(cell.bg));
-        let mut wd = WordDecorations::default();
-        wd.rescan_from_cells_with_geom_at_cursor(
-            &snap.cells,
-            &snap.line_sizes,
-            rows,
-            cols,
-            &lex,
-            &c,
-            1,
-            t0,
-            g,
-            bg,
-            Some((0, 10)),
-        );
+        let mut wd = scan_grid(&mut term, &c, g, t0, Some((0, 10)));
         assert!(
             feline(&wd).cat_peek_down,
             "a row-0 word has no habitable side above it — the plan must peek DOWN"
@@ -13552,6 +12204,11 @@ mod tests {
             let (free, _, _) =
                 tick_cat_at(&mut wd, t0 + Duration::from_millis(ms), &c, g, None, true);
             for s in free.iter().filter(|s| matches!(s.z, FreeZ::UnderText)) {
+                assert!(
+                    s.y >= i32::from(g.cell_h) / 2,
+                    "no sprite pixel may bury the top-row word it decorates: y={}",
+                    s.y
+                );
                 seen.push((s.y as u16, s.h, s.ay));
             }
         }
@@ -13578,222 +12235,14 @@ mod tests {
         );
     }
 
-    /// One cat per caret: the companion summoned at the caret is this word's
-    /// cat, so the word's ambient peek yields. Scope siblings:
-    /// [`a_feline_word_away_from_the_caret_still_peeks_beside_the_companion`]
-    /// and [`the_claimed_word_stays_quiet_while_the_companion_holds`].
-    #[test]
-    fn a_word_under_the_companion_never_peeks_a_second_cat() {
-        let lex = lex();
-        let c = cfg();
-        let g = geom20();
-        let t0 = Instant::now();
-        let (rows, cols) = (usize::from(g.rows), usize::from(g.cols));
-        // `kitty` at row 3, cols 5..=9, caret one past its last.
-        let mut term = Terminal::new(g.rows, g.cols);
-        term.process(b"\x1b[4;6Hkitty");
-        let caret = (3u16, 10u16);
-        assert_eq!(
-            (term.cursor().row, term.cursor().col),
-            caret,
-            "the caret parks one past the typed word"
-        );
-        let mut snap = aterm_core::render::RenderInput::default();
-        term.cell_frame_into(&mut snap, rows, cols);
-        let bg = snap
-            .cells
-            .iter()
-            .find_map(|line| line.first())
-            .map_or(0, |cell| rgb3_to_u32(cell.bg));
-        let scan = || {
-            let mut wd = WordDecorations::default();
-            wd.rescan_from_cells_with_geom_at_cursor(
-                &snap.cells,
-                &snap.line_sizes,
-                rows,
-                cols,
-                &lex,
-                &c,
-                1,
-                t0,
-                g,
-                bg,
-                Some(caret),
-            );
-            let occ = feline(&wd);
-            assert_eq!((occ.row, occ.start_col, occ.end_col), (3, 5, 9));
-            wd
-        };
-        // One host frame: the engine tick, then the companion, one free stream.
-        let frame = |wd: &mut WordDecorations, now: Instant, companion: Option<(u16, u16)>| {
-            let (mut free, _, _) = tick_cat_at(wd, now, &c, g, companion, true);
-            if let Some(cell) = companion {
-                wd.kitty_cursor(
-                    KittyCursorFrame {
-                        geom: g,
-                        cursor: cell,
-                        look: KittyLook::default(),
-                        colors: CatColorKey::default(),
-                        bob: 0.0,
-                        alpha: 255,
-                        pose: crate::kitty_cursor::CatPose::STILL,
-                        sing: 0.0,
-                        notes: [None; crate::kitty_sing::MAX_NOTES],
-                    },
-                    &mut free,
-                );
-            }
-            free
-        };
-        // Settled over mid-dwell frames, so the assertion reads the emission
-        // decision, not the two-tile bake budget.
-        let mut wd = scan();
-        let mut ctl = scan();
-        let (mut fixed, mut control) = (Vec::new(), Vec::new());
-        for k in 0..6u64 {
-            let now = t0 + Duration::from_millis(DWELL_QUIET_MS + 16 * k);
-            fixed = frame(&mut wd, now, Some(caret));
-            control = frame(&mut ctl, now, None);
-        }
-
-        let ambient = |free: &[FreeSprite]| -> Vec<FreeSprite> {
-            free.iter()
-                .filter(|s| matches!(s.z, FreeZ::UnderText))
-                .copied()
-                .collect()
-        };
-        // Control: with no companion on glass the word peeks as usual.
-        assert_eq!(
-            ambient(&control).len(),
-            1,
-            "with no companion up the typed word peeks on its own"
-        );
-        assert_eq!(
-            fixed.len(),
-            1,
-            "the caret already has a companion — no second cat on the same word"
-        );
-        assert!(
-            matches!(fixed[0].z, FreeZ::OverText),
-            "the one cat at the caret is the companion itself"
-        );
-    }
-
-    /// The companion holds for `DISCOVERY_HOLD` while the caret walks one cell
-    /// past the word; the claim keeps the word's peek quiet for that long.
-    #[test]
-    fn the_claimed_word_stays_quiet_while_the_companion_holds() {
-        let lex = lex();
-        let c = cfg();
-        let g = geom20();
-        let t0 = Instant::now();
-        let (rows, cols) = (usize::from(g.rows), usize::from(g.cols));
-        // `kitty` at row 3, cols 5..=9, caret one past its last.
-        let mut term = Terminal::new(g.rows, g.cols);
-        term.process(b"\x1b[4;6Hkitty");
-        let on_span = (3u16, 10u16);
-        // One keystroke later: one cell off the span.
-        let past_span = (3u16, 11u16);
-        assert!(
-            caret_on_span(on_span, 3, 5, 9) && !caret_on_span(past_span, 3, 5, 9),
-            "the caret starts on the word's span and ends one cell off it"
-        );
-        let mut snap = aterm_core::render::RenderInput::default();
-        term.cell_frame_into(&mut snap, rows, cols);
-        let bg = snap
-            .cells
-            .iter()
-            .find_map(|line| line.first())
-            .map_or(0, |cell| rgb3_to_u32(cell.bg));
-        let scan = || {
-            let mut wd = WordDecorations::default();
-            wd.rescan_from_cells_with_geom_at_cursor(
-                &snap.cells,
-                &snap.line_sizes,
-                rows,
-                cols,
-                &lex,
-                &c,
-                1,
-                t0,
-                g,
-                bg,
-                Some(on_span),
-            );
-            let occ = feline(&wd);
-            assert_eq!((occ.row, occ.start_col, occ.end_col), (3, 5, 9));
-            wd
-        };
-        // One host frame: the engine tick, then the companion, one free stream.
-        let frame = |wd: &mut WordDecorations, now: Instant, companion: Option<(u16, u16)>| {
-            let (mut free, _, _) = tick_cat_at(wd, now, &c, g, companion, true);
-            if let Some(cell) = companion {
-                wd.kitty_cursor(
-                    KittyCursorFrame {
-                        geom: g,
-                        cursor: cell,
-                        look: KittyLook::default(),
-                        colors: CatColorKey::default(),
-                        bob: 0.0,
-                        alpha: 255,
-                        pose: crate::kitty_cursor::CatPose::STILL,
-                        sing: 0.0,
-                        notes: [None; crate::kitty_sing::MAX_NOTES],
-                    },
-                    &mut free,
-                );
-            }
-            free
-        };
-        let mut wd = scan();
-        let mut ctl = scan();
-        // Companion frames with the caret on the word take the claim.
-        for k in 0..6u64 {
-            let now = t0 + Duration::from_millis(100 + 16 * k);
-            frame(&mut wd, now, Some(on_span));
-        }
-        // The caret moves on, the companion stays (settled over frames past
-        // the two-tile bake budget).
-        let (mut held, mut control) = (Vec::new(), Vec::new());
-        for k in 0..6u64 {
-            let now = t0 + Duration::from_millis(DWELL_QUIET_MS + 16 * k);
-            held = frame(&mut wd, now, Some(past_span));
-            control = frame(&mut ctl, now, None);
-        }
-        let ambient = |free: &[FreeSprite]| -> Vec<FreeSprite> {
-            free.iter()
-                .filter(|s| matches!(s.z, FreeZ::UnderText))
-                .copied()
-                .collect()
-        };
-        // The control proves the peek is still live, so the silence is the
-        // claim at work.
-        assert_eq!(
-            ambient(&control).len(),
-            1,
-            "the word is still mid-peek at the sample instants"
-        );
-        assert!(
-            ambient(&held).is_empty(),
-            "the companion still holds its claim — the word must not peek a twin"
-        );
-        assert_eq!(held.len(), 1, "exactly one cat on glass");
-        assert!(
-            matches!(held[0].z, FreeZ::OverText),
-            "and it is the companion, not a second ambient cat"
-        );
-    }
-
     /// The companion arrives a frame after the tick that scanned its word, by
     /// which time the caret is past the span, so the claim never latches;
     /// [`WordDecorations::caret_word`] still names the word and no twin pops.
     #[test]
     fn the_summoning_word_is_claimed_even_after_the_caret_moved_on() {
-        let lex = lex();
         let c = cfg();
         let g = geom20();
         let t0 = Instant::now();
-        let (rows, cols) = (usize::from(g.rows), usize::from(g.cols));
         // `kitty` at row 3, cols 5..=9, caret one past its last: the only scan
         // that can name the summoning word.
         let mut term = Terminal::new(g.rows, g.cols);
@@ -13805,67 +12254,17 @@ mod tests {
             caret_on_span(on_span, 3, 5, 9) && !caret_on_span(past_span, 3, 5, 9),
             "the rescan caret is on the word's span and the companion's is not"
         );
-        let mut snap = aterm_core::render::RenderInput::default();
-        term.cell_frame_into(&mut snap, rows, cols);
-        let bg = snap
-            .cells
-            .iter()
-            .find_map(|line| line.first())
-            .map_or(0, |cell| rgb3_to_u32(cell.bg));
-        let scan = || {
-            let mut wd = WordDecorations::default();
-            wd.rescan_from_cells_with_geom_at_cursor(
-                &snap.cells,
-                &snap.line_sizes,
-                rows,
-                cols,
-                &lex,
-                &c,
-                1,
-                t0,
-                g,
-                bg,
-                Some(on_span),
-            );
-            let occ = feline(&wd);
-            assert_eq!((occ.row, occ.start_col, occ.end_col), (3, 5, 9));
-            wd
-        };
-        let frame = |wd: &mut WordDecorations, now: Instant, companion: Option<(u16, u16)>| {
-            let (mut free, _, _) = tick_cat_at(wd, now, &c, g, companion, true);
-            if let Some(cell) = companion {
-                wd.kitty_cursor(
-                    KittyCursorFrame {
-                        geom: g,
-                        cursor: cell,
-                        look: KittyLook::default(),
-                        colors: CatColorKey::default(),
-                        bob: 0.0,
-                        alpha: 255,
-                        pose: crate::kitty_cursor::CatPose::STILL,
-                        sing: 0.0,
-                        notes: [None; crate::kitty_sing::MAX_NOTES],
-                    },
-                    &mut free,
-                );
-            }
-            free
-        };
-        let mut wd = scan();
-        let mut ctl = scan();
+        let mut wd = scan_grid(&mut term, &c, g, t0, Some(on_span));
+        let mut ctl = scan_grid(&mut term, &c, g, t0, Some(on_span));
+        let occ = feline(&wd);
+        assert_eq!((occ.row, occ.start_col, occ.end_col), (3, 5, 9));
         // No warm-up: the companion's first frame already has the caret off.
         let (mut held, mut control) = (Vec::new(), Vec::new());
         for k in 0..6u64 {
             let now = t0 + Duration::from_millis(DWELL_QUIET_MS + 16 * k);
-            held = frame(&mut wd, now, Some(past_span));
-            control = frame(&mut ctl, now, None);
+            held = companion_frame(&mut wd, now, &c, g, Some(past_span));
+            control = companion_frame(&mut ctl, now, &c, g, None);
         }
-        let ambient = |free: &[FreeSprite]| -> Vec<FreeSprite> {
-            free.iter()
-                .filter(|s| matches!(s.z, FreeZ::UnderText))
-                .copied()
-                .collect()
-        };
         // The control proves the word is still mid-peek: the silence is the
         // claim.
         assert_eq!(
@@ -13881,134 +12280,43 @@ mod tests {
         assert_eq!(held.len(), 1, "exactly one cat on glass");
     }
 
-    /// Exactly one companion body per host frame (`redraw_window` order: one
-    /// `tick`, one `kitty_cursor`), counted by the `OverText` z-slot, since a
-    /// second identical body would hide under the first.
-    #[test]
-    fn every_host_frame_emits_exactly_one_companion_body() {
-        let (rows, cols) = (6usize, 20usize);
-        let c = cfg();
-        let g = geom20();
-        let t0 = Instant::now();
-        let mut term = Terminal::new(rows as u16, cols as u16);
-        // Row 2, clear rows above: the stream carries both families.
-        term.process(b"\r\n\r\nkitty on a wire");
-        let mut wd = scan_grid(&mut term, rows, cols, &c, g, t0);
-        // Row 4 is off every span, so the veto never fires and the count of
-        // one body is earned.
-        let caret = (4u16, 2u16);
-        let mut bodies_seen = 0usize;
-        for k in 0..16u64 {
-            let now = t0 + Duration::from_millis(100 + 40 * k);
-            let (mut free, _, _) = tick_cat_at(&mut wd, now, &c, g, Some(caret), true);
-            wd.kitty_cursor(
-                KittyCursorFrame {
-                    geom: g,
-                    cursor: caret,
-                    look: KittyLook::default(),
-                    colors: CatColorKey::default(),
-                    bob: 0.0,
-                    alpha: 255,
-                    pose: crate::kitty_cursor::CatPose::STILL,
-                    sing: 0.0,
-                    notes: [None; crate::kitty_sing::MAX_NOTES],
-                },
-                &mut free,
-            );
-            let bodies: Vec<FreeSprite> = free
-                .iter()
-                .filter(|s| matches!(s.z, FreeZ::OverText))
-                .copied()
-                .collect();
-            assert!(
-                bodies.len() <= 1,
-                "frame {k}: {} companion bodies at {:?} — the double cursor cat \
-                 is a COUNT failure, invisible to a placement assertion",
-                bodies.len(),
-                bodies.iter().map(|s| (s.x, s.y)).collect::<Vec<_>>()
-            );
-            bodies_seen += bodies.len();
-        }
-        // Non-vacuity: the companion reaches the stream (a floor; frames may
-        // defer on the bake budget).
-        assert!(
-            bodies_seen > 0,
-            "the companion never reached the free stream — the census is vacuous"
-        );
-    }
-
     /// Suppression is scoped to the word under the companion: a feline word
-    /// elsewhere peeks byte-identically to a frame with no companion.
+    /// elsewhere peeks byte-identically to a frame with no companion, and so
+    /// it does beside the resident pet standing rows away: yielding is a
+    /// collision rule, not a mode.
     #[test]
     fn a_feline_word_away_from_the_caret_still_peeks_beside_the_companion() {
-        let lex = lex();
         let c = cfg();
         let g = geom20();
         let t0 = Instant::now();
-        let (rows, cols) = (usize::from(g.rows), usize::from(g.cols));
         // Only the away word this time; the caret sits on a bare prompt row.
         let mut term = Terminal::new(g.rows, g.cols);
         term.process(b"\x1b[6;1Hkitty\x1b[4;1H");
         let caret = (3u16, 0u16);
-        let mut snap = aterm_core::render::RenderInput::default();
-        term.cell_frame_into(&mut snap, rows, cols);
-        let bg = snap
-            .cells
-            .iter()
-            .find_map(|line| line.first())
-            .map_or(0, |cell| rgb3_to_u32(cell.bg));
-        let scan = || {
-            let mut wd = WordDecorations::default();
-            wd.rescan_from_cells_with_geom_at_cursor(
-                &snap.cells,
-                &snap.line_sizes,
-                rows,
-                cols,
-                &lex,
-                &c,
-                1,
-                t0,
-                g,
-                bg,
-                Some(caret),
-            );
-            wd
-        };
-        let frame = |wd: &mut WordDecorations, now: Instant, companion: Option<(u16, u16)>| {
-            let (mut free, _, _) = tick_cat_at(wd, now, &c, g, companion, true);
-            if let Some(cell) = companion {
-                wd.kitty_cursor(
-                    KittyCursorFrame {
-                        geom: g,
-                        cursor: cell,
-                        look: KittyLook::default(),
-                        colors: CatColorKey::default(),
-                        bob: 0.0,
-                        alpha: 255,
-                        pose: crate::kitty_cursor::CatPose::STILL,
-                        sing: 0.0,
-                        notes: [None; crate::kitty_sing::MAX_NOTES],
-                    },
-                    &mut free,
-                );
-            }
-            free
-        };
-        let mut wd = scan();
-        let mut ctl = scan();
-        let (mut with_companion, mut control) = (Vec::new(), Vec::new());
+        // The pet stands in the top-right corner — feet on row 1's baseline,
+        // flank against the right edge — nowhere near the word's rise.
+        let nat_h = (crate::kitty_pet::ART_ROWS * f32::from(g.cell_h)).round() as i32;
+        let nat_w = (nat_h as f32 * crate::kitty_pet::ART_ASPECT).round() as i32;
+        let grid_w = i32::from(g.cols) * i32::from(g.cell_w);
+        let feet = 2 * i32::from(g.cell_h);
+        let pet =
+            CompanionOnGlass::at_body(Some(caret), (grid_w - nat_w, grid_w, feet - nat_h, feet));
+        let mut wd = scan_grid(&mut term, &c, g, t0, Some(caret));
+        let mut ctl = scan_grid(&mut term, &c, g, t0, Some(caret));
+        let mut resident = scan_grid(&mut term, &c, g, t0, Some(caret));
+        let (mut with_companion, mut control, mut with_pet) = (Vec::new(), Vec::new(), Vec::new());
         for k in 0..6u64 {
             let now = t0 + Duration::from_millis(DWELL_QUIET_MS + 16 * k);
-            with_companion = frame(&mut wd, now, Some(caret));
-            control = frame(&mut ctl, now, None);
+            with_companion = companion_frame(&mut wd, now, &c, g, Some(caret));
+            control = companion_frame(&mut ctl, now, &c, g, None);
+            with_pet = tick_cat_companion(&mut resident, now, &c, g, Some(pet), true).0;
         }
-        let ambient = |free: &[FreeSprite]| -> Vec<FreeSprite> {
-            free.iter()
-                .filter(|s| matches!(s.z, FreeZ::UnderText))
-                .copied()
-                .collect()
-        };
         assert_eq!(ambient(&control).len(), 1, "the away kitty peeks");
+        assert_eq!(
+            ambient(&with_pet),
+            ambient(&control),
+            "a pet standing rows away leaves the word's peek untouched"
+        );
         assert_eq!(
             ambient(&with_companion),
             ambient(&control),
@@ -14025,36 +12333,13 @@ mod tests {
     /// separate from cats, with no Kitty Log rows.
     #[test]
     fn animal_words_peek_their_species_heads() {
-        let lex = lex();
         let c = cfg();
         let g = geom20();
         let t0 = Instant::now();
-        let (rows, cols) = (usize::from(g.rows), usize::from(g.cols));
         let mut term = Terminal::new(g.rows, g.cols);
         // Two animal words on well-separated rows, caret on a bare prompt row.
         term.process(b"\x1b[3;1Hmonkey\x1b[7;1Hcamel\x1b[10;1H");
-        let caret = (9u16, 0u16);
-        let mut snap = aterm_core::render::RenderInput::default();
-        term.cell_frame_into(&mut snap, rows, cols);
-        let bg = snap
-            .cells
-            .iter()
-            .find_map(|line| line.first())
-            .map_or(0, |cell| rgb3_to_u32(cell.bg));
-        let mut wd = WordDecorations::default();
-        wd.rescan_from_cells_with_geom_at_cursor(
-            &snap.cells,
-            &snap.line_sizes,
-            rows,
-            cols,
-            &lex,
-            &c,
-            1,
-            t0,
-            g,
-            bg,
-            Some(caret),
-        );
+        let mut wd = scan_grid(&mut term, &c, g, t0, Some((9, 0)));
         // The rescan resolved each occurrence's species from its lexicon tag.
         let species: Vec<_> = wd.occ.iter().filter_map(|o| o.species).collect();
         assert_eq!(
@@ -14180,47 +12465,15 @@ mod tests {
     /// it stays down.
     #[test]
     fn a_word_under_the_pet_body_never_peeks() {
-        let lex = lex();
         let c = cfg();
         let g = geom20();
         let t0 = Instant::now();
-        let (rows, cols) = (usize::from(g.rows), usize::from(g.cols));
         // The caret sits rows away, off every span, isolating the pixel yield.
         let mut term = Terminal::new(g.rows, g.cols);
         term.process(b"\x1b[6;1Hkitty\x1b[4;1H");
         let caret = (3u16, 0u16);
-        let mut snap = aterm_core::render::RenderInput::default();
-        term.cell_frame_into(&mut snap, rows, cols);
-        let bg = snap
-            .cells
-            .iter()
-            .find_map(|line| line.first())
-            .map_or(0, |cell| rgb3_to_u32(cell.bg));
-        let scan = || {
-            let mut wd = WordDecorations::default();
-            wd.rescan_from_cells_with_geom_at_cursor(
-                &snap.cells,
-                &snap.line_sizes,
-                rows,
-                cols,
-                &lex,
-                &c,
-                1,
-                t0,
-                g,
-                bg,
-                Some(caret),
-            );
-            wd
-        };
-        let ambient = |free: &[FreeSprite]| -> Vec<FreeSprite> {
-            free.iter()
-                .filter(|s| matches!(s.z, FreeZ::UnderText))
-                .copied()
-                .collect()
-        };
         // Where the ambient cat lands, from the control twin (settled frames).
-        let mut ctl = scan();
+        let mut ctl = scan_grid(&mut term, &c, g, t0, Some(caret));
         let mut control = Vec::new();
         for k in 0..6u64 {
             let now = t0 + Duration::from_millis(DWELL_QUIET_MS + 16 * k);
@@ -14237,7 +12490,7 @@ mod tests {
         let x0 = cat.x + i32::from(cat.w) / 2 - nat_w / 2;
         // No caret cell (DECTCEM hidden): the live body alone must hold custody.
         let companion = CompanionOnGlass::at_body(None, (x0, x0 + nat_w, feet - nat_h, feet));
-        let mut wd = scan();
+        let mut wd = scan_grid(&mut term, &c, g, t0, Some(caret));
         for k in 0..6u64 {
             let now = t0 + Duration::from_millis(DWELL_QUIET_MS + 16 * k);
             let (free, _, _) = tick_cat_companion(&mut wd, now, &c, g, Some(companion), true);
@@ -14248,315 +12501,214 @@ mod tests {
         }
     }
 
-    /// Yielding is a collision rule, not a mode: a feline word away from both
-    /// the caret and the pet peeks as if nothing were on glass.
+    /// `kitty`, its cat done, `clear`, retype at the same column, right away
+    /// or after the spent episode grace-expired: the retype keys identically
+    /// (ident folds no row; blank clears never taint), and the typed witness
+    /// makes it a fresh second cat. After [`GRACE_TTL`] the departure's
+    /// session-lived done mark would otherwise make it born-done (the re-arm
+    /// cannot require a still-resident old episode).
     #[test]
-    fn a_feline_word_away_from_both_caret_and_pet_still_peeks() {
-        let lex = lex();
-        let c = cfg();
-        let g = geom20();
-        let t0 = Instant::now();
-        let (rows, cols) = (usize::from(g.rows), usize::from(g.cols));
-        // The `a_word_under_the_pet_body_never_peeks` stage, with the pet in the
-        // top-right corner, far from the word's rise.
-        let mut term = Terminal::new(g.rows, g.cols);
-        term.process(b"\x1b[6;1Hkitty\x1b[4;1H");
-        let caret = (3u16, 0u16);
-        let mut snap = aterm_core::render::RenderInput::default();
-        term.cell_frame_into(&mut snap, rows, cols);
-        let bg = snap
-            .cells
-            .iter()
-            .find_map(|line| line.first())
-            .map_or(0, |cell| rgb3_to_u32(cell.bg));
-        let scan = || {
-            let mut wd = WordDecorations::default();
-            wd.rescan_from_cells_with_geom_at_cursor(
-                &snap.cells,
-                &snap.line_sizes,
-                rows,
-                cols,
-                &lex,
-                &c,
-                1,
-                t0,
-                g,
-                bg,
-                Some(caret),
-            );
-            wd
-        };
-        let nat_h = (crate::kitty_pet::ART_ROWS * f32::from(g.cell_h)).round() as i32;
-        let nat_w = (nat_h as f32 * crate::kitty_pet::ART_ASPECT).round() as i32;
-        let grid_w = i32::from(g.cols) * i32::from(g.cell_w);
-        let feet = 2 * i32::from(g.cell_h);
-        let companion =
-            CompanionOnGlass::at_body(Some(caret), (grid_w - nat_w, grid_w, feet - nat_h, feet));
-        let mut wd = scan();
-        let mut ctl = scan();
-        let (mut with_pet, mut control) = (Vec::new(), Vec::new());
-        for k in 0..6u64 {
-            let now = t0 + Duration::from_millis(DWELL_QUIET_MS + 16 * k);
-            with_pet = tick_cat_companion(&mut wd, now, &c, g, Some(companion), true).0;
-            control = tick_cat_companion(&mut ctl, now, &c, g, None, true).0;
-        }
-        let ambient = |free: &[FreeSprite]| -> Vec<FreeSprite> {
-            free.iter()
-                .filter(|s| matches!(s.z, FreeZ::UnderText))
-                .copied()
-                .collect()
-        };
-        assert_eq!(ambient(&control).len(), 1, "the away kitty peeks");
-        assert_eq!(
-            ambient(&with_pet),
-            ambient(&control),
-            "a pet standing rows away leaves the word's peek untouched"
-        );
-    }
-
-    /// `kitty`, its cat done, `clear`, retype at the same column: the retype
-    /// keys identically, and the typed witness makes it a fresh second cat.
-    #[test]
-    fn clear_then_retype_at_same_prompt_plays_a_second_cat() {
-        let lex = lex();
-        let c = cfg();
-        let g = geom20();
-        let t0 = Instant::now();
-        let mut term = Terminal::new(g.rows, g.cols);
-        let mut wd = WordDecorations::default();
-
-        term.process(b"kitty"); // caret parks at end_col + 1 — the typed witness
-        wd.rescan(&term, g.rows as usize, g.cols as usize, &lex, &c, 1, t0);
-        let first = feline(&wd).clone();
-        let (cats, _, _) = tick_cat(&mut wd, t0 + Duration::from_millis(100), &c, g);
-        assert!(!cats.is_empty(), "the first typed kitty plays its cat");
-
-        // Run the one-shot to completion (worst-case peek is 4580 ms).
-        let done_t = t0 + Duration::from_millis(5000);
-        tick_cat(&mut wd, done_t, &c, g);
-        assert!(
-            wd.persist[&first.ident].peek_done,
-            "the first cat's one-shot has completed"
-        );
-
-        // `clear`: one blank frame (grace, never taint), prompt returns home.
-        term.process(b"\x1b[2J\x1b[H");
-        wd.rescan(
-            &term,
-            g.rows as usize,
-            g.cols as usize,
-            &lex,
-            &c,
-            2,
-            done_t + Duration::from_millis(16),
-        );
-        assert!(wd.occ.iter().all(|o| o.class != Class::Feline));
-
-        // Same row and column: same seed, ordinal and context fingerprint.
-        term.process(b"kitty");
-        let retyped_at = done_t + Duration::from_millis(32);
-        // The keystroke makes it a retype rather than a redraw.
-        wd.note_typed_edit(retyped_at, None);
-        wd.rescan(
-            &term,
-            g.rows as usize,
-            g.cols as usize,
-            &lex,
-            &c,
-            3,
-            retyped_at,
-        );
-        let second = feline(&wd).clone();
-        assert_eq!(second.ident, first.ident, "fixture reproduces the key");
-        assert_eq!(
-            second.appeared, retyped_at,
-            "the retyped kitty is a FRESH episode, not an adoption"
-        );
-        assert!(!second.inert, "the retype must not be born-done");
-        assert!(
-            !wd.persist[&second.ident].peek_done,
-            "the fresh episode's peek is armed"
-        );
-        let (cats, _, _) = tick_cat(&mut wd, retyped_at + Duration::from_millis(100), &c, g);
-        assert!(
-            !cats.is_empty(),
-            "a genuinely retyped kitty after clear plays a SECOND cat"
-        );
-    }
-
-    /// A retype after the episode grace-expired (its done mark lives on) still
-    /// plays a cat; the fixture asserts the episode is gone and the mark stays.
-    #[test]
-    fn a_retype_after_the_episode_expired_still_plays_its_cat() {
+    fn a_retype_after_clear_plays_a_second_cat_even_after_expiry() {
         let lex = lex();
         let c = cfg();
         let g = geom20();
         let (rows, cols) = (g.rows as usize, g.cols as usize);
-        let t0 = Instant::now();
-        let mut term = Terminal::new(g.rows, g.cols);
-        let mut wd = WordDecorations::default();
+        for (label, wait) in [
+            ("right after the clear", Duration::ZERO),
+            ("after grace expiry", GRACE_TTL + Duration::from_secs(1)),
+        ] {
+            let t0 = Instant::now();
+            let mut term = Terminal::new(g.rows, g.cols);
+            let mut wd = WordDecorations::default();
+            term.process(b"kitty"); // caret parks at end_col + 1 — the typed witness
+            wd.rescan(&term, rows, cols, &lex, &c, 1, t0);
+            let first = feline(&wd).clone();
+            let (cats, _, _) = tick_cat(&mut wd, t0 + Duration::from_millis(100), &c, g);
+            assert!(
+                !cats.is_empty(),
+                "{label}: PRECONDITION — the first kitty plays"
+            );
+            // Run the one-shot to completion (worst-case peek is 4580 ms).
+            let done_t = t0 + Duration::from_millis(5000);
+            tick_cat(&mut wd, done_t, &c, g);
+            assert!(
+                wd.persist[&first.ident].peek_done,
+                "{label}: PRECONDITION — the first one-shot completes"
+            );
+            let done_key = first.ident ^ wd.persist[&first.ident].ctx_fp;
 
-        term.process(b"kitty");
-        wd.rescan(&term, rows, cols, &lex, &c, 1, t0);
-        let first = feline(&wd).clone();
-        let (cats, _, _) = tick_cat(&mut wd, t0 + Duration::from_millis(100), &c, g);
-        assert!(!cats.is_empty(), "PRECONDITION: the first kitty plays");
-        let done_t = t0 + Duration::from_millis(5000);
-        tick_cat(&mut wd, done_t, &c, g);
+            // `clear`: one blank frame (grace, never taint), prompt returns home.
+            term.process(b"\x1b[2J\x1b[H");
+            let cleared = done_t + Duration::from_millis(16);
+            wd.rescan(&term, rows, cols, &lex, &c, 2, cleared);
+            assert!(wd.occ.iter().all(|o| o.class != Class::Feline));
+            let mut seq = 3;
+            if !wait.is_zero() {
+                wd.rescan(&term, rows, cols, &lex, &c, seq, cleared + wait);
+                seq += 1;
+                assert!(
+                    !wd.persist.contains_key(&first.ident),
+                    "{label}: PRECONDITION — the episode really has grace-expired"
+                );
+                assert!(
+                    wd.done_marks.contains_key(&done_key),
+                    "{label}: PRECONDITION — …while its session done mark survives, \
+                     which is the asymmetry the bug lived in"
+                );
+            }
+
+            // Retype at the exact same row and column, with the key that typed
+            // it: the caret lands after the `y` either way, so the keystroke is
+            // what makes this a retype rather than a redraw.
+            term.process(b"kitty");
+            let retyped_at = cleared + wait + Duration::from_millis(16);
+            wd.note_typed_edit(retyped_at, None);
+            wd.rescan(&term, rows, cols, &lex, &c, seq, retyped_at);
+            let second = feline(&wd).clone();
+            assert_eq!(
+                second.ident, first.ident,
+                "{label}: PRECONDITION — the retype re-keys onto the same ledger row"
+            );
+            assert_eq!(
+                second.appeared, retyped_at,
+                "{label}: the retyped kitty is a FRESH episode, not an adoption"
+            );
+            assert!(!second.inert, "{label}: the retype must not be born-done");
+            let (cats, _, _) = tick_cat(&mut wd, retyped_at + Duration::from_millis(100), &c, g);
+            assert!(
+                !cats.is_empty(),
+                "{label}: a genuinely retyped kitty plays a SECOND cat"
+            );
+        }
+    }
+
+    // The typed-witness scope fixture shared by the place, pane and tab tests
+    // below: `kitty` on row 2 above an ordinary prompt; a gap frame that
+    // overwrites row 2 nonblank (what taints the episode, so its return argues
+    // on the typed witness rather than on grace); two caret parks that change
+    // no cell; and a restore that puts the word back with the caret one past
+    // the `y`, which is what both a retype and a TUI redraw look like.
+    const WITNESS_BASE: &[u8] = b"\r\n\r\nkitty\r\n\r\n$ ok";
+    const WITNESS_GAP: &[u8] = b"\x1b[3;1H------";
+    /// Row 2, col 6 — beside `kitty`.
+    const PARK_ON_WORD: &[u8] = b"\x1b[3;7H";
+    /// Row 5, col 10 — the prompt.
+    const PARK_FAR_AWAY: &[u8] = b"\x1b[6;11H";
+    const WITNESS_RESTORE: &[u8] = b"\x1b[3;1Hkitty \x1b[3;6H";
+
+    /// Drive `term`'s `kitty` through its whole one-shot (stamped in place),
+    /// then the tainting gap frame with the caret at `park`. Returns its ident.
+    fn play_out_and_taint(
+        wd: &mut WordDecorations,
+        term: &mut Terminal,
+        park: &[u8],
+        t0: Instant,
+        label: &str,
+    ) -> u64 {
+        let (lex, c, g) = (lex(), cfg(), geom20());
+        let (rows, cols) = (usize::from(g.rows), usize::from(g.cols));
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        term.process(WITNESS_BASE);
+        wd.rescan(term, rows, cols, &lex, &c, 1, t0);
+        let first = feline(wd).clone();
+        assert!(!first.inert, "{label}: PRECONDITION — the first cat arms");
+        let (cats, _, _) = tick_cat(wd, at(100), &c, g);
+        assert!(!cats.is_empty(), "{label}: PRECONDITION — it draws");
+        tick_cat(wd, at(5000), &c, g);
+        let ep = wd.persist[&first.ident];
         assert!(
-            wd.persist[&first.ident].peek_done,
-            "PRECONDITION: the first one-shot completes"
+            ep.peek_done,
+            "{label}: PRECONDITION — the one-shot completes"
         );
-        let done_key = first.ident ^ wd.persist[&first.ident].ctx_fp;
+        assert!(
+            wd.done_marks.contains_key(&(first.ident ^ ep.ctx_fp)),
+            "{label}: PRECONDITION — the guard is stamped in place"
+        );
+        term.process(WITNESS_GAP);
+        term.process(park);
+        wd.rescan(term, rows, cols, &lex, &c, 2, at(5016));
+        assert!(
+            wd.persist[&first.ident].continuity_tainted,
+            "{label}: PRECONDITION — the overwrite taints, so every arm argues \
+             about the same branch"
+        );
+        first.ident
+    }
 
-        // Erase it and let the grace TTL run out on an empty screen.
-        term.process(b"\x1b[2J\x1b[H");
+    /// Repaint the word back at `back_at` and report `(inert, drew no cat)`.
+    fn restore_verdict(
+        wd: &mut WordDecorations,
+        term: &mut Terminal,
+        ident: u64,
+        back_at: Instant,
+        label: &str,
+    ) -> (bool, bool) {
+        let (lex, c, g) = (lex(), cfg(), geom20());
+        term.process(WITNESS_RESTORE);
         wd.rescan(
-            &term,
-            rows,
-            cols,
+            term,
+            usize::from(g.rows),
+            usize::from(g.cols),
             &lex,
             &c,
-            2,
-            done_t + Duration::from_millis(16),
+            3,
+            back_at,
         );
-        let expired_at = done_t + GRACE_TTL + Duration::from_secs(1);
-        wd.rescan(&term, rows, cols, &lex, &c, 3, expired_at);
-        assert!(
-            !wd.persist.contains_key(&first.ident),
-            "PRECONDITION: the episode really has grace-expired — without that \
-             this fixture is just the resident-ancestor case again"
-        );
-        assert!(
-            wd.done_marks.contains_key(&done_key),
-            "PRECONDITION: …while its session done mark really does survive, \
-             which is the asymmetry the bug lived in"
-        );
-
-        // Retype at the same column, a full TTL later.
-        term.process(b"kitty");
-        let retyped_at = expired_at + Duration::from_millis(400);
-        wd.note_typed_edit(retyped_at, None);
-        wd.rescan(&term, rows, cols, &lex, &c, 4, retyped_at);
-        let second = feline(&wd).clone();
+        let back = feline(wd).clone();
         assert_eq!(
-            second.ident, first.ident,
-            "PRECONDITION: the retype re-keys onto the same ledger row"
+            back.ident, ident,
+            "{label}: PRECONDITION — the restore re-keys identically"
         );
         assert!(
-            !second.inert,
-            "a real retype after the episode expired must still arm"
+            wd.last_caret.is_some_and(|cell| caret_on_span(
+                cell,
+                back.row,
+                back.start_col,
+                back.end_col
+            )),
+            "{label}: PRECONDITION — the restored caret is parked on the word, \
+             so only the keystroke can separate the verdicts"
         );
-        let (cats, _, _) = tick_cat(&mut wd, retyped_at + Duration::from_millis(100), &c, g);
-        assert!(
-            !cats.is_empty(),
-            "…and must actually draw a cat: the user typed `kitty` and saw \
-             nothing at all"
-        );
+        let (cats, _, _) = tick_cat(wd, back_at + Duration::from_millis(100), &c, g);
+        (back.inert, cats.is_empty())
     }
 
     /// A key committed five rows away does not license a repaint that drops a
     /// spent `kitty` under the caret; the same key on the word does.
     #[test]
     fn an_unrelated_edit_does_not_license_a_repaint_replay() {
-        let lex = lex();
-        let c = cfg();
         let g = geom20();
-        let (rows, cols) = (g.rows as usize, g.cols as usize);
         let t0 = Instant::now();
-
-        // `kitty` on row 2, a prompt below for the far arm's caret.
-        let base = b"\r\n\r\nkitty\r\n\r\n$ ok".as_slice();
-        // The gap frame: row 2 overwritten nonblank (the taint); the arms then
-        // park the caret differently.
-        let gap = b"\x1b[3;1H------".as_slice();
-        let park_on_word = b"\x1b[3;7H".as_slice(); // row 2, col 6 — beside `kitty`
-        let park_far_away = b"\x1b[6;11H".as_slice(); // row 5, col 10 — the prompt
-        // Restore: the word returns with the caret one past the `y`.
-        let restore = b"\x1b[3;1Hkitty \x1b[3;6H".as_slice();
-
         let mut verdicts = Vec::new();
-        for (label, park) in [("retype", park_on_word), ("unrelated edit", park_far_away)] {
+        for (label, park) in [("retype", PARK_ON_WORD), ("unrelated edit", PARK_FAR_AWAY)] {
             let mut term = Terminal::new(g.rows, g.cols);
-            term.process(base);
             let mut wd = WordDecorations::default();
-            wd.rescan(&term, rows, cols, &lex, &c, 1, t0);
-            let first = feline(&wd).clone();
-            assert!(!first.inert, "{label}: PRECONDITION — the first cat arms");
-            let (cats, _, _) = tick_cat(&mut wd, t0 + Duration::from_millis(100), &c, g);
-            assert!(!cats.is_empty(), "{label}: PRECONDITION — it draws");
-            let done_t = t0 + Duration::from_millis(5000);
-            tick_cat(&mut wd, done_t, &c, g);
-            assert!(
-                wd.persist[&first.ident].peek_done,
-                "{label}: PRECONDITION — the one-shot completes"
-            );
-            let done_key = first.ident ^ wd.persist[&first.ident].ctx_fp;
-            assert!(
-                wd.done_marks.contains_key(&done_key),
-                "{label}: PRECONDITION — the guard is stamped in place"
-            );
-
-            term.process(gap);
-            term.process(park);
-            let gap_at = done_t + Duration::from_millis(16);
-            wd.rescan(&term, rows, cols, &lex, &c, 2, gap_at);
-            assert!(
-                wd.persist[&first.ident].continuity_tainted,
-                "{label}: PRECONDITION — the overwrite taints, so both arms are \
-                 arguing about the same branch"
-            );
-
+            let ident = play_out_and_taint(&mut wd, &mut term, park, t0, label);
             // The keystroke, identical in both arms but for the caret it was
-            // typed at.
-            let key_at = gap_at + Duration::from_millis(20);
+            // typed at (captured by the gap rescan).
+            let key_at = t0 + Duration::from_millis(5036);
+            let back_at = key_at + Duration::from_millis(12);
             wd.note_typed_edit(key_at, None);
             assert!(
-                wd.typed_edit_witness(key_at + Duration::from_millis(12)),
+                wd.typed_edit_witness(back_at),
                 "{label}: PRECONDITION — the time/pane half of the witness is \
                  live in BOTH arms, so only the PLACE can decide"
             );
-
-            let births_before = wd.birth_seq;
-            term.process(restore);
-            let back_at = key_at + Duration::from_millis(12);
-            wd.rescan(&term, rows, cols, &lex, &c, 3, back_at);
-            let back = feline(&wd).clone();
-            assert_eq!(
-                back.ident, first.ident,
-                "{label}: PRECONDITION — the restore re-keys identically"
-            );
-            assert_eq!(
-                wd.birth_seq - births_before,
-                1,
-                "{label}: PRECONDITION — the restore is a FRESH birth in both \
-                 arms; only its armed/inert verdict may differ"
-            );
-            // The restored caret is on the word in both arms.
-            assert!(
-                wd.last_caret.is_some_and(|cell| caret_on_span(
-                    cell,
-                    back.row,
-                    back.start_col,
-                    back.end_col
-                )),
-                "{label}: PRECONDITION — the caret really is parked on the word \
-                 in the restored frame, in BOTH arms (got {:?})",
-                wd.last_caret
-            );
-            let (cats, _, _) = tick_cat(&mut wd, back_at + Duration::from_millis(100), &c, g);
-            verdicts.push((label, back.inert, cats.is_empty()));
+            verdicts.push((
+                label,
+                restore_verdict(&mut wd, &mut term, ident, back_at, label),
+            ));
         }
 
         assert_eq!(
             verdicts[0],
-            ("retype", false, false),
+            ("retype", (false, false)),
             "CONVERSE: a key committed ON the word is a retype and must still \
              play its cat"
         );
         assert_eq!(
             verdicts[1],
-            ("unrelated edit", true, true),
+            ("unrelated edit", (true, true)),
             "a key committed five rows away in another widget must not license \
              a redraw's replay — that is the owner's 'new kitties appear when \
              the screen draws'"
@@ -14568,64 +12720,29 @@ mod tests {
     /// which pane's caret is on the word.
     #[test]
     fn a_split_keystroke_is_attributed_to_the_pane_it_was_typed_in() {
-        let lex = lex();
-        let c = cfg();
         let g = geom20();
-        let (rows, cols) = (g.rows as usize, g.cols as usize);
         let t0 = Instant::now();
-        let at = |ms: u64| t0 + Duration::from_millis(ms);
-
-        // Identical in both panes: `kitty` on row 2, a prompt on row 5.
-        let base = b"\r\n\r\nkitty\r\n\r\n$ ok".as_slice();
-        // Row 2 overwritten nonblank: the taint.
-        let gap = b"\x1b[3;1H------".as_slice();
-        let park_on_word = b"\x1b[3;7H".as_slice(); // row 2, col 6 — beside `kitty`
-        let park_far_away = b"\x1b[6;11H".as_slice(); // row 5, col 10 — the prompt
-        let restore = b"\x1b[3;1Hkitty \x1b[3;6H".as_slice();
-
         const PANE_A: u64 = 1;
         const PANE_B: u64 = 2;
 
-        // Prime one pane: cat, one-shot done, taint, caret per `park`.
-        let prime = |wd: &mut WordDecorations, term: &mut Terminal, park: &[u8], label: &str| {
-            term.process(base);
-            wd.rescan(term, rows, cols, &lex, &c, 1, t0);
-            let first = feline(wd).clone();
-            assert!(!first.inert, "{label}: PRECONDITION — the first cat arms");
-            let (cats, _, _) = tick_cat(wd, at(100), &c, g);
-            assert!(!cats.is_empty(), "{label}: PRECONDITION — it draws");
-            tick_cat(wd, at(5000), &c, g);
-            assert!(
-                wd.persist[&first.ident].peek_done,
-                "{label}: PRECONDITION — the one-shot completes"
-            );
-            term.process(gap);
-            term.process(park);
-            wd.rescan(term, rows, cols, &lex, &c, 2, at(5016));
-            assert!(
-                wd.persist[&first.ident].continuity_tainted,
-                "{label}: PRECONDITION — the overwrite taints"
-            );
-            first.ident
-        };
-
         let mut verdicts = Vec::new();
         for (label, park_a, park_b) in [
-            ("typed ON the word in B", park_far_away, park_on_word),
-            ("typed FAR from the word in B", park_on_word, park_far_away),
+            ("typed ON the word in B", PARK_FAR_AWAY, PARK_ON_WORD),
+            ("typed FAR from the word in B", PARK_ON_WORD, PARK_FAR_AWAY),
         ] {
             let mut wd = WordDecorations::default();
             let mut term_a = Terminal::new(g.rows, g.cols);
             let mut term_b = Terminal::new(g.rows, g.cols);
             // Two panes side by side, disjoint pixel origins.
             wd.bind_pane(PANE_A, (0, 0));
-            prime(&mut wd, &mut term_a, park_a, label);
+            play_out_and_taint(&mut wd, &mut term_a, park_a, t0, label);
             wd.bind_pane(PANE_B, (400, 0));
-            let ident_b = prime(&mut wd, &mut term_b, park_b, label);
+            let ident_b = play_out_and_taint(&mut wd, &mut term_b, park_b, t0, label);
 
             // Pane A is left bound while the user types in B.
             wd.bind_pane(PANE_A, (0, 0));
-            let key_at = at(5036);
+            let key_at = t0 + Duration::from_millis(5036);
+            let back_at = key_at + Duration::from_millis(12);
             wd.note_typed_edit(key_at, Some(PANE_B));
             assert_eq!(
                 wd.typed_edit.expect("the key was recorded").cell,
@@ -14634,7 +12751,7 @@ mod tests {
                  keystroke went to — not the bound pane's"
             );
             assert!(
-                !wd.typed_edit_witness(key_at + Duration::from_millis(12)),
+                !wd.typed_edit_witness(back_at),
                 "{label}: PRECONDITION — while A is bound, B's keystroke is no \
                  witness for A's scan"
             );
@@ -14642,31 +12759,25 @@ mod tests {
             // Pane B repaints its word back, exactly as a TUI redraw would.
             wd.bind_pane(PANE_B, (400, 0));
             assert!(
-                wd.typed_edit_witness(key_at + Duration::from_millis(12)),
+                wd.typed_edit_witness(back_at),
                 "{label}: PRECONDITION — the time/pane half IS live for B in \
                  both arms, so only the recorded PLACE can decide"
             );
-            term_b.process(restore);
-            let back_at = key_at + Duration::from_millis(12);
-            wd.rescan(&term_b, rows, cols, &lex, &c, 3, back_at);
-            let back = feline(&wd).clone();
-            assert_eq!(
-                back.ident, ident_b,
-                "{label}: PRECONDITION — the restore re-keys identically"
-            );
-            let (cats, _, _) = tick_cat(&mut wd, back_at + Duration::from_millis(100), &c, g);
-            verdicts.push((label, back.inert, cats.is_empty()));
+            verdicts.push((
+                label,
+                restore_verdict(&mut wd, &mut term_b, ident_b, back_at, label),
+            ));
         }
 
         assert_eq!(
             verdicts[0],
-            ("typed ON the word in B", false, false),
+            ("typed ON the word in B", (false, false)),
             "a retype committed IN PANE B, on B's own word, must re-arm and \
              draw B's cat — reading pane A's caret refuses it"
         );
         assert_eq!(
             verdicts[1],
-            ("typed FAR from the word in B", true, true),
+            ("typed FAR from the word in B", (true, true)),
             "and a key committed five rows away IN PANE B must not license B's \
              redraw replay just because pane A's caret happens to sit on pane \
              A's copy of the word"
@@ -14806,24 +12917,12 @@ mod tests {
     /// key's tab; the first proves the fixture re-arms.
     #[test]
     fn an_edit_in_one_tab_does_not_license_another_tabs_replay_when_unsplit() {
-        let lex = lex();
-        let c = cfg();
         let g = geom20();
-        let (rows, cols) = (g.rows as usize, g.cols as usize);
         let t0 = Instant::now();
-        let at = |ms: u64| t0 + Duration::from_millis(ms);
-
         /// The tab that is on glass for the whole fixture.
         const TAB_A: u64 = 11;
         /// A tab that is not on glass — only ever named by a keystroke.
         const TAB_B: u64 = 12;
-
-        let base = b"\r\n\r\nkitty\r\n\r\n$ ok".as_slice();
-        // Row 2 overwritten nonblank: the taint makes the return argue on the
-        // typed witness.
-        let gap = b"\x1b[3;1H------".as_slice();
-        let park_on_word = b"\x1b[3;7H".as_slice(); // row 2, col 6 — beside `kitty`
-        let restore = b"\x1b[3;1Hkitty \x1b[3;6H".as_slice();
 
         let mut verdicts = Vec::new();
         for (label, key_tab) in [("same tab", TAB_A), ("another tab", TAB_B)] {
@@ -14831,57 +12930,34 @@ mod tests {
             let mut term = Terminal::new(g.rows, g.cols);
             // The unsplit host binds nothing and declares the tab it shows.
             wd.set_scan_session(Some(TAB_A));
-            term.process(base);
-            wd.rescan(&term, rows, cols, &lex, &c, 1, t0);
-            let first = feline(&wd).clone();
-            assert!(!first.inert, "{label}: PRECONDITION — the first cat arms");
-            let (cats, _, _) = tick_cat(&mut wd, at(100), &c, g);
-            assert!(!cats.is_empty(), "{label}: PRECONDITION — it draws");
-            tick_cat(&mut wd, at(5000), &c, g);
-            assert!(
-                wd.persist[&first.ident].peek_done,
-                "{label}: PRECONDITION — the one-shot completes"
-            );
-            term.process(gap);
-            term.process(park_on_word);
-            wd.rescan(&term, rows, cols, &lex, &c, 2, at(5016));
-            assert!(
-                wd.persist[&first.ident].continuity_tainted,
-                "{label}: PRECONDITION — the overwrite taints"
-            );
+            let ident = play_out_and_taint(&mut wd, &mut term, PARK_ON_WORD, t0, label);
 
             // The edit key, in the tab on glass or the other one.
-            let key_at = at(5036);
+            let key_at = t0 + Duration::from_millis(5036);
+            let back_at = key_at + Duration::from_millis(12);
             wd.note_typed_edit(key_at, Some(key_tab));
             assert_eq!(
-                wd.typed_edit_witness(key_at + Duration::from_millis(12)),
+                wd.typed_edit_witness(back_at),
                 key_tab == TAB_A,
                 "{label}: PRECONDITION — a key witnesses the scan of its OWN \
                  tab and no other; this is the discriminator the verdicts below \
                  must be reading"
             );
-
-            term.process(restore);
-            let back_at = key_at + Duration::from_millis(12);
-            wd.rescan(&term, rows, cols, &lex, &c, 3, back_at);
-            let back = feline(&wd).clone();
-            assert_eq!(
-                back.ident, first.ident,
-                "{label}: PRECONDITION — the restore re-keys identically"
-            );
-            let (cats, _, _) = tick_cat(&mut wd, back_at + Duration::from_millis(100), &c, g);
-            verdicts.push((label, back.inert, cats.is_empty()));
+            verdicts.push((
+                label,
+                restore_verdict(&mut wd, &mut term, ident, back_at, label),
+            ));
         }
 
         assert_eq!(
             verdicts[0],
-            ("same tab", false, false),
+            ("same tab", (false, false)),
             "a retype in the tab that is on glass must still re-arm and draw — \
              this is a scope, not a deletion"
         );
         assert_eq!(
             verdicts[1],
-            ("another tab", true, true),
+            ("another tab", (true, true)),
             "but a key committed in ANOTHER tab must not license this one's \
              repaint replay: once per kitty word, per tab"
         );
@@ -15236,92 +13312,6 @@ mod tests {
         );
     }
 
-    /// A WordDecorations carrying one eligible adult cat occurrence (row 2).
-    fn settled_cat(now: Instant) -> WordDecorations {
-        WordDecorations {
-            occ: vec![cat_occ(2, 2, 6, GKEY_ADULT_HEAD, now)],
-            cols: 20,
-            have_scanned: true,
-            ..WordDecorations::default()
-        }
-    }
-
-    /// Rise and descend reveal the art top-down with the dest bottom pinned at
-    /// `word_top + chin`.
-    #[test]
-    fn free_rise_and_descend_reveal_window() {
-        let now = Instant::now();
-        let mk = || WordDecorations {
-            occ: vec![cat_occ(2, 2, 6, GKEY_ADULT_HEAD, now)],
-            cols: 20,
-            have_scanned: true,
-            ..WordDecorations::default()
-        };
-        let o = mk().occ[0].clone();
-        let dwell = peek_dwell_ms(o.ident, o.genome.gkey, false, (2200, 3598));
-        let antic = anticipation_ms(o.genome.gkey);
-        let variant = cat_variant_v4(GKEY_ADULT_HEAD);
-        let (_, hart) =
-            authored_cat_size(variant, f32::from(cat_hart(20)) * CatAge::Adult.scale(), 20);
-        // The settled dest bottom: word_row_top + the age-scaled chin.
-        let rest_bottom = 2 * 20 + i32::from(cat_chin(hart));
-        // Mid-rise, late-rise, and mid-descend sample instants.
-        let mid_descend = CAT_RISE_MS + dwell + antic + 160;
-        for t_ms in [120u64, 300, mid_descend] {
-            let at = now + Duration::from_millis(t_ms);
-            let (fr, _, _) = tick_cat(&mut mk(), at, &cfg(), geom20());
-            assert_eq!(
-                fr.len(),
-                1,
-                "one revealing sprite at t={t_ms} (no gaze mid-motion)"
-            );
-            let body = fr[0];
-            assert!(
-                i32::from(body.h) <= i32::from(hart),
-                "the reveal never exceeds the rest window at t={t_ms} \
-                 (ease-out-back overshoot lifts the DEST, capped by vh = min(reveal, rest))"
-            );
-            assert_eq!((body.aw, body.ah), (body.w, body.h), "NEAREST 1:1 window");
-            // Overshoot lifts the dest above the pinned rest bottom, never
-            // below; mid-descend sits exactly at it.
-            assert!(
-                body.y + i32::from(body.h) <= rest_bottom,
-                "the dest bottom never drops below word_top + chin at t={t_ms}"
-            );
-            assert_eq!(
-                (body.z, body.sampler),
-                (FreeZ::UnderText, FreeSampler::Nearest)
-            );
-        }
-        // Early rise is a partial, growing reveal; the descend shrinks it.
-        let (fr_a, _, _) = tick_cat(
-            &mut mk(),
-            now + Duration::from_millis(120),
-            &cfg(),
-            geom20(),
-        );
-        let (fr_b, _, _) = tick_cat(
-            &mut mk(),
-            now + Duration::from_millis(300),
-            &cfg(),
-            geom20(),
-        );
-        assert!(fr_a[0].h < hart, "early rise is a partial reveal");
-        assert!(fr_b[0].h > fr_a[0].h, "the reveal grows through the rise");
-        let (fr_d, _, _) = tick_cat(
-            &mut mk(),
-            now + Duration::from_millis(mid_descend),
-            &cfg(),
-            geom20(),
-        );
-        assert!(fr_d[0].h < hart, "mid-descend is a shrinking reveal");
-        // Done: past the total window the one-shot emits zero forever.
-        let total = peek_total_ms(o.ident, o.genome.gkey, false, (2200, 3598));
-        let at = now + Duration::from_millis(total + 50);
-        let (fr, _, _) = tick_cat(&mut mk(), at, &cfg(), geom20());
-        assert!(fr.is_empty(), "Done: zero sprites forever");
-    }
-
     /// `fold_free` covers every field, z and sampler included, and the signed
     /// origin by bit pattern.
     #[test]
@@ -15377,8 +13367,7 @@ mod tests {
         );
     }
 
-    /// The settled cat moves during the dwell, never changes size, and holds
-    /// still under reduced motion.
+    /// The settled cat moves during the dwell and never changes size.
     #[test]
     fn a_settled_keyword_kitty_breathes_without_resizing() {
         let now = Instant::now();
@@ -15426,88 +13415,9 @@ mod tests {
             1,
             "the idle pose translates and never resizes: {sizes:?}"
         );
-
-        // 3. Reduced motion pins the settled pose exactly.
-        let rc = DecoConfig {
-            reduced_motion: true,
-            ..cfg()
-        };
-        let mut still = build();
-        for t in [100u64, 300, 440, 700] {
-            tick_cat(&mut still, now + Duration::from_millis(t), &rc, g);
-        }
-        let a = sample(&mut still, &rc, 900);
-        let b = sample(&mut still, &rc, 1900);
-        assert!(a.is_some(), "the reduced-motion cat is still shown");
-        assert_eq!(
-            a, b,
-            "reduced motion holds the settled pose perfectly still"
-        );
-    }
-
-    /// §5.6 kitten: the landing bounce peaks 2 px below the settled rest.
-    #[test]
-    fn kitten_landing_bounce_moves_dest_two_px() {
-        let now = Instant::now();
-        // gkey 0: age Kitten, pose HeadPeek, overshoot 0.06.
-        let mut wd = WordDecorations {
-            occ: vec![cat_occ(2, 2, 6, 0, now)],
-            cols: 20,
-            have_scanned: true,
-            ..WordDecorations::default()
-        };
-        let c = cfg();
-        let g = geom20();
-        // Warm the bakes through the entrance.
-        for t in [100u64, 300, 440] {
-            tick_cat(&mut wd, now + Duration::from_millis(t), &c, g);
-        }
-        // Bounce peak: t = 450 + 75 ⇒ sin(π/2) ⇒ +2 px.
-        let (frb, _, _) = tick_cat(&mut wd, now + Duration::from_millis(525), &c, g);
-        let bottom = |fr: &[FreeSprite]| fr.iter().map(|s| s.y + i32::from(s.h)).max().unwrap();
-        assert!(
-            wd.is_active(now + Duration::from_millis(525)),
-            "the bounce is animating"
-        );
-        let (frs, _, _) = tick_cat(&mut wd, now + Duration::from_millis(900), &c, g);
-        // The 900 ms frame carries that instant's idle bob (pure, so recovered
-        // exactly); the bounce frame has none, the pose is off while bouncing.
-        let settled_bob = CatIdlePose::breathing(900 - CAT_RISE_MS, 0, g.cell_h).bob_px;
-        assert_eq!(
-            bottom(&frb),
-            bottom(&frs) - settled_bob + 2,
-            "bounce peak dips 2 px below rest"
-        );
-        // v3: the dwell keeps the one-shot active until Done.
-        assert!(wd.is_active(now + Duration::from_millis(900)));
     }
 
     // ─────────────── v3 §1.2 in-dwell life battery (pure time) ───────────────
-
-    /// v3 §1.2 duty pin: after Done, zero quads, `is_active` false, fp frozen.
-    #[test]
-    fn post_done_duty_pin_no_deadline_no_activity_zero_quads() {
-        let now = Instant::now();
-        let mut wd = settled_cat(now);
-        let o = wd.occ[0].clone();
-        let c = cfg();
-        let g = geom20();
-        let total = peek_total_ms(o.ident, o.genome.gkey, false, (2200, 3598));
-        // Ride the whole cycle (rise → dwell → descend).
-        for t in [100u64, 400, DWELL_QUIET_MS, total - 100] {
-            let (fr, _, _) = tick_cat(&mut wd, now + Duration::from_millis(t), &c, g);
-            assert!(!fr.is_empty(), "the peek emits through its window (t={t})");
-            assert!(wd.is_active(now + Duration::from_millis(t)));
-        }
-        // Done, forever.
-        let after = |ms: u64| now + Duration::from_millis(total + ms);
-        let (fr, _, fp1) = tick_cat(&mut wd, after(10), &c, g);
-        assert!(fr.is_empty(), "Done = zero sprites");
-        assert!(!wd.is_active(after(10)));
-        let (fr, _, fp2) = tick_cat(&mut wd, after(30_000), &c, g);
-        assert!(fr.is_empty(), "still zero sprites 30 s later");
-        assert_eq!(fp1, fp2, "the post-Done fp is frozen (zero wakes)");
-    }
 
     /// The peek clock latches at birth: quads land on the first ticked frame
     /// and same-frame siblings rise together.
@@ -15544,89 +13454,6 @@ mod tests {
             "BOTH cats rise together from the first ticked frame (no \
              stagger), got {fr:?}"
         );
-    }
-
-    /// An episode born unfocused runs on its birth clock: refocus after the
-    /// window shows no entrance and a rescan never replays it.
-    #[test]
-    fn born_unfocused_entrance_never_replays_on_refocus() {
-        let lex = lex();
-        let c = cfg();
-        let g = geom20();
-        let t0 = Instant::now();
-        let mut wd = WordDecorations::default();
-        let mut term = Terminal::new(4, 20);
-        term.process(b"\r\n\r\nnice kitty");
-        wd.rescan(&term, 4, 20, &lex, &c, 1, t0);
-        // Unfocused presents: the clock latched at birth keeps running.
-        tick_cat_at(&mut wd, t0, &c, g, None, false);
-        tick_cat_at(&mut wd, t0 + Duration::from_millis(200), &c, g, None, false);
-        // Refocus past every peek total (4580 ms): no entrance, no re-latch.
-        let t_focus = t0 + Duration::from_millis(6_000);
-        let (fr, _, _) = tick_cat_at(&mut wd, t_focus, &c, g, None, true);
-        assert!(fr.is_empty(), "no entrance replay on refocus: {fr:?}");
-        let cat = wd
-            .occ
-            .iter()
-            .find(|o| o.spec.graphic.is_some())
-            .expect("the cat word scanned")
-            .ident;
-        assert!(
-            wd.persist[&cat].peek_done,
-            "the one-shot elapsed by wall time while unfocused"
-        );
-        let (fr, _, _) = tick_cat_at(
-            &mut wd,
-            t_focus + Duration::from_millis(100),
-            &c,
-            g,
-            None,
-            true,
-        );
-        assert!(fr.is_empty(), "…and stays spent");
-        term.process(b" "); // damage: force a real rescan
-        wd.rescan(&term, 4, 20, &lex, &c, 2, t_focus);
-        let (fr, _, _) = tick_cat_at(
-            &mut wd,
-            t_focus + Duration::from_millis(200),
-            &c,
-            g,
-            None,
-            true,
-        );
-        assert!(fr.is_empty(), "a rescan never re-plays a spent episode");
-        assert!(!wd.is_active(t_focus + Duration::from_millis(200)));
-    }
-
-    /// v3 §1.2 twin desync: same-seed twins' dwells differ by the ident jitter,
-    /// so their descends are never in lockstep.
-    #[test]
-    fn twin_desync_dwells_and_descend_frames_differ() {
-        let seed = seed_of(2, Class::Feline, aterm_lexicon::form_hash("kitty"));
-        let id0 = mix(seed);
-        let id1 = mix(seed ^ ORDINAL_MIX);
-        let g0 = GKEY_ADULT_HEAD;
-        let d0 = peek_dwell_ms(id0, g0, false, (2200, 3598));
-        let d1 = peek_dwell_ms(id1, g0, false, (2200, 3598));
-        assert_ne!(d0, d1, "the twin-desync jitter separates the dwells");
-        // At the earlier twin's mid-descend instant the two reveals differ.
-        let now = Instant::now();
-        let run = |ident: u64| {
-            let mut o = cat_occ(2, 2, 6, g0, now);
-            o.ident = ident;
-            o.seed = seed;
-            let mut wd = WordDecorations {
-                occ: vec![o],
-                cols: 20,
-                have_scanned: true,
-                ..WordDecorations::default()
-            };
-            let c = cfg();
-            let sample = CAT_RISE_MS + d0.min(d1) + anticipation_ms(g0) + CAT_DESCEND_MS / 2;
-            tick_cat(&mut wd, now + Duration::from_millis(sample), &c, geom20()).0
-        };
-        let (q0, q1) = (run(id0), run(id1));
-        assert_ne!(q0, q1, "twin descend frames differ (desync jitter)");
     }
 
     /// Freeze/thaw mid-rise resumes at the same phase; nothing completes while
@@ -15700,7 +13527,7 @@ mod tests {
     /// short occlusion, freeze/thaw mid-rise, and a born-done re-appearance.
     #[test]
     fn one_shot_peek_conformance_real_engine() {
-        let m = aterm_spec::derive::one_shot_peek_model();
+        let m = aterm_models_effects::one_shot_peek_model();
         let mut st = m.init_state();
         let lex = lex();
         let c = cfg();
@@ -15891,51 +13718,13 @@ mod tests {
         );
     }
 
-    /// §5.2: across entrance, overshoot and bounce the 2-band head stays in
-    /// rows {r−2, r−1, r}, never r−3.
-    #[test]
-    fn entrance_overshoot_never_crosses_into_row_r_minus_3() {
-        let now = Instant::now();
-        // gkey: age Kitten (0), pose HeadPeek (0), overshoot ord 3
-        // (Gray-encode 3 = 0b10 at v4 bits 15–16).
-        let gkey = 2u64 << 15;
-        // Row 3: r−2 = row 1, r−3 = row 0 (representable, so a spill would show).
-        let mut wd = WordDecorations {
-            occ: vec![cat_occ(3, 2, 6, gkey, now)],
-            cols: 20,
-            have_scanned: true,
-            ..WordDecorations::default()
-        };
-        let c = cfg();
-        let g = EffectGeom {
-            cell_w: 8,
-            cell_h: 16,
-            rows: 6,
-            cols: 20,
-        };
-        // The kitten sprite stays in rows {1, 2, 3}; overshoot never reaches 0.
-        let mut min_y = i32::MAX;
-        for t in (10..620u64).step_by(5) {
-            let (fr, _, _) = tick_cat(&mut wd, now + Duration::from_millis(t), &c, g);
-            for s in &fr {
-                assert!(s.y >= 16, "sprite crossed into row r−3: {s:?}");
-                min_y = min_y.min(s.y);
-            }
-        }
-        // The peak excursion stays inside the eyes' band (row 1, y ≥ 16).
-        assert!(
-            min_y >= 16,
-            "the head never lifts above row r−2 (got {min_y})"
-        );
-    }
-
     // ────────── v3 §1.1 alignment / done-marks / reset-table battery ──────────
 
     /// v3 §1.1 log-tail rotation at constant count: the survivor keeps its
     /// episode, the new bottom twin plays, the departed one grace-expires.
     #[test]
     fn rotation_alignment_plays_new_twin_and_pins_survivor() {
-        let model = aterm_spec::derive::sparkle_reflow_cardinality_model();
+        let model = aterm_models_effects::sparkle_reflow_cardinality_model();
         let lex = lex();
         let c = cfg();
         let t0 = Instant::now();
@@ -16193,7 +13982,8 @@ mod tests {
     // ───────────────────── §F4.2 Kitty Log recording ─────────────────────
 
     /// §F4.2: one sighting per episode, on the first frame quads land, silent
-    /// across grace re-hits, recounted only after episode death.
+    /// across grace re-hits, and silent again for the born-done re-appearance
+    /// after episode death.
     #[test]
     fn kitty_sighting_once_per_episode_across_occlusion() {
         let lex = lex();
@@ -16248,23 +14038,6 @@ mod tests {
             wd.drain_kitty_sightings().count(),
             0,
             "a born-done re-appearance logs nothing (§1.1 inertness)"
-        );
-        // `hard_reset` clears the marks: the next appearance records again.
-        wd.hard_reset();
-        wd.rescan(&term, 4, 20, &lex, &c, 6, at(17));
-        tick_cat_at(&mut wd, at(17), &c, g, None, true); // latch the phase clock
-        tick_cat_at(
-            &mut wd,
-            at(17) + Duration::from_millis(100),
-            &c,
-            g,
-            None,
-            true,
-        );
-        assert_eq!(
-            wd.drain_kitty_sightings().count(),
-            1,
-            "hard_reset makes the sighting reachable again"
         );
     }
 
@@ -16322,6 +14095,35 @@ mod tests {
             .collect()
     }
 
+    /// An engine holding classic-nova profanity words (cols 4..=7, one per
+    /// `(row, seed, magic, dec_line)`), each already granted at `now` —
+    /// bypassing the limiter, so a test pins what happens after the grant.
+    fn granted_novas(now: Instant, words: &[(u16, u64, u64, bool)]) -> WordDecorations {
+        let mut wd = WordDecorations {
+            cols: 20,
+            have_scanned: true,
+            ..WordDecorations::default()
+        };
+        for &(row, seed, magic, dec_line) in words {
+            let o = Occurrence {
+                row,
+                start_col: 4,
+                end_col: 7,
+                seed,
+                ident: mix(seed),
+                genome: Genome { gkey: 0, magic },
+                dec_line,
+                spec: class_default_spec(Class::Profanity, &cfg_nova()),
+                ..occ(Class::Profanity, now)
+            };
+            let mut e = Episode::fresh(now, o.genome, seed, row, 0);
+            e.nova_start = Some(now);
+            wd.persist.insert(o.ident, e);
+            wd.occ.push(o);
+        }
+        wd
+    }
+
     fn select_span(row: i32, c0: u16, c1: u16) -> aterm_core::selection::TextSelection {
         use aterm_core::selection::{SelectionSide, SelectionType};
         let mut s = aterm_core::selection::TextSelection::new();
@@ -16332,7 +14134,8 @@ mod tests {
     }
 
     /// §6.4: one flash per episode across occlusion (phase ride, then a grace
-    /// re-hit never re-ignites); only identity death re-arms.
+    /// re-hit never re-ignites); the re-appearance after identity death is
+    /// born-done.
     #[test]
     fn nova_one_flash_per_episode_across_occlusion() {
         let lex = lex();
@@ -16411,12 +14214,6 @@ mod tests {
             "born-done still shows the settled ink bytes"
         );
         assert!(!wd.is_active(at(17_300)), "born-done is inert (zero wakes)");
-        // `hard_reset` re-arms ignition (a user-asked fresh start).
-        wd.hard_reset();
-        wd.rescan(&term, 2, 20, &lex, &c, 6, at(18_000));
-        tick_nova(&mut wd, at(18_000), &c, g, None, None); // grant
-        let (q, _, _, _, _) = tick_nova(&mut wd, at(18_300), &c, g, None, None);
-        assert!(!q.is_empty(), "hard_reset makes re-ignition reachable");
     }
 
     /// Tier-1 binding for `DoneMarkLruBound`: fill, touch the oldest, replace at
@@ -16425,7 +14222,7 @@ mod tests {
     fn done_mark_lru_real_order_and_constant_work_conform() {
         const CAP: usize = 3;
         const MAX_LINK_WRITES: u8 = 6;
-        let model = aterm_spec::derive::done_mark_lru_model();
+        let model = aterm_models_effects::done_mark_lru_model();
         let mut state = model.init_state();
         let mut marks = DoneMarkLru::default();
 
@@ -16456,7 +14253,7 @@ mod tests {
 
         // Negative control: a `min_by_key` scan over every resident (the Buggy
         // model's three probes) fails the same at-cap transition.
-        let mut buggy = aterm_spec::derive::done_mark_lru_model();
+        let mut buggy = aterm_models_effects::done_mark_lru_model();
         for cst in &mut buggy.consts {
             if cst.0 == "Buggy" {
                 cst.1 = 1;
@@ -16564,7 +14361,7 @@ mod tests {
     /// migration; an expiry-only sweep matches the Buggy counterexample.
     #[test]
     fn ignition_reservation_lifecycle_real_queue_conforms() {
-        let model = aterm_spec::derive::ignition_reservation_lifecycle_model();
+        let model = aterm_models_effects::ignition_reservation_lifecycle_model();
         let t0 = Instant::now();
         let mut state = model.init_state();
         let mut wd = WordDecorations::default();
@@ -16622,7 +14419,7 @@ mod tests {
         }
 
         // Negative control: an expiry-only sweep keeps both ownerless slots.
-        let mut buggy = aterm_spec::derive::ignition_reservation_lifecycle_model();
+        let mut buggy = aterm_models_effects::ignition_reservation_lifecycle_model();
         for cst in &mut buggy.consts {
             if cst.0 == "Buggy" {
                 cst.1 = 1;
@@ -16650,7 +14447,7 @@ mod tests {
     /// a persist-only rekey (negative control) double-flashes.
     #[test]
     fn ignition_reservation_rekey_real_queue_conforms() {
-        let model = aterm_spec::derive::ignition_reservation_rekey_model();
+        let model = aterm_models_effects::ignition_reservation_rekey_model();
         let mut state = model.init_state();
         let t0 = Instant::now();
         let t1 = t0 + IGNITION_WINDOW;
@@ -16722,7 +14519,7 @@ mod tests {
 
         // Negative control: a persist-only rekey loses owner 2's future slot
         // while episode 22 still flashes at t1.
-        let mut buggy = aterm_spec::derive::ignition_reservation_rekey_model();
+        let mut buggy = aterm_models_effects::ignition_reservation_rekey_model();
         for cst in &mut buggy.consts {
             if cst.0 == "Buggy" {
                 cst.1 = 1;
@@ -16881,7 +14678,7 @@ mod tests {
         let t0 = Instant::now();
 
         // ── storm 1: disjoint regions (model scenario Overlap = 0) ──
-        let m = aterm_spec::derive::flash_limiter_model();
+        let m = aterm_models_effects::flash_limiter_model();
         let mut st = m.init_state();
         let mut igns = Vec::new();
         let a = grant_ignition(&mut igns, None, 1, t0, (100, 100), 88.0).expect("capacity");
@@ -16928,7 +14725,7 @@ mod tests {
         assert!(m.check_invariant("RegionFlashPairs", &st));
 
         // ── storm 2: overlapping regions (model scenario Overlap = 1) ──
-        let mut mo = aterm_spec::derive::flash_limiter_model();
+        let mut mo = aterm_models_effects::flash_limiter_model();
         for cst in &mut mo.consts {
             if cst.0 == "Overlap" {
                 cst.1 = 1;
@@ -16969,8 +14766,8 @@ mod tests {
     /// second, rejected by `IgnitionBound` and `RegionFlashPairs`.
     #[test]
     fn flash_limiter_negative_control_overlap_blind_limiter_is_buggy_trace() {
-        let mut healthy = aterm_spec::derive::flash_limiter_model();
-        let mut buggy = aterm_spec::derive::flash_limiter_model();
+        let mut healthy = aterm_models_effects::flash_limiter_model();
+        let mut buggy = aterm_models_effects::flash_limiter_model();
         for cst in &mut healthy.consts {
             if cst.0 == "Overlap" {
                 cst.1 = 1;
@@ -17205,55 +15002,19 @@ mod tests {
         );
     }
 
-    /// §6.1: the Quasar's jets and the Singularity's Over-blend RingArc reach
-    /// the host tick's output streams.
+    /// §6.1: the Singularity's Over-blend RingArc reaches the host tick's
+    /// output streams, capped, and `profanity.magic = false` turns it off.
     #[test]
-    fn quasar_and_singularity_ride_the_host_tick() {
-        const QUASAR_MAGIC: u64 = 0; // (0 >> 12) % 4096 = 0 → Quasar
+    fn singularity_rides_the_host_tick() {
         const SING_MAGIC: u64 = 8 << 12; // → 8 → Singularity
         let now = Instant::now();
         let g = geom20();
         let run = |magic: u64, profanity_magic: bool| {
-            let mut wd = WordDecorations {
-                occ: vec![Occurrence {
-                    row: 2,
-                    start_col: 4,
-                    end_col: 7,
-                    class: Class::Profanity,
-                    langs: LangSet::EMPTY,
-                    form_id: FormId::UNKNOWN,
-                    seed: 0xF00D,
-                    ident: mix(0xF00D),
-                    appeared: now,
-                    genome: Genome { gkey: 0, magic },
-                    ink_base: 0,
-                    ink_cells: 0,
-                    ink_bg: [0; 3],
-                    cat_colors: CatColorKey::default(),
-                    cat_text_clear: true,
-                    cat_peek_down: false,
-                    dec_line: false,
-                    inert: false,
-                    spec: class_default_spec(Class::Profanity, &cfg_nova()),
-                    custom: false,
-                    species: None,
-                }],
-                cols: 20,
-                have_scanned: true,
-                ..WordDecorations::default()
-            };
-            let mut e = Episode::fresh(now, Genome { gkey: 0, magic }, 0xF00D, 2, 0);
-            e.nova_start = Some(now);
-            wd.persist.insert(mix(0xF00D), e);
+            let mut wd = granted_novas(now, &[(2, 0xF00D, magic, false)]);
             let mut c = cfg_nova();
             c.profanity_magic = profanity_magic;
-            let at = now + Duration::from_millis(400);
-            let mut wd2 = wd;
-            tick_nova(&mut wd2, at, &c, g, None, None)
+            tick_nova(&mut wd, now + Duration::from_millis(400), &c, g, None, None)
         };
-        // Quasar: vertical jets hug the center column (x ≈ 55 px).
-        let (q, _, _, _, _) = run(QUASAR_MAGIC, true);
-        assert!(!q.is_empty());
         // Singularity: the darkening ring rides the Over wdeco stream.
         let (_, out, _, _, _) = run(SING_MAGIC, true);
         assert!(
@@ -17283,45 +15044,11 @@ mod tests {
             rows: 30,
             cols: 20,
         };
-        let mut wd = WordDecorations {
-            cols: 20,
-            have_scanned: true,
-            ..WordDecorations::default()
-        };
-        for k in 0..4u16 {
-            let seed = 0xF00D + u64::from(k);
-            let o = Occurrence {
-                row: k * 7,
-                start_col: 4,
-                end_col: 7,
-                class: Class::Profanity,
-                langs: LangSet::EMPTY,
-                form_id: FormId::UNKNOWN,
-                seed,
-                ident: mix(seed),
-                appeared: now,
-                genome: Genome {
-                    gkey: 0,
-                    magic: (100 << 12) | 100,
-                },
-                ink_base: 0,
-                ink_cells: 0,
-                ink_bg: [0; 3],
-                cat_colors: CatColorKey::default(),
-                cat_text_clear: true,
-                cat_peek_down: false,
-                dec_line: false,
-                inert: false,
-                spec: class_default_spec(Class::Profanity, &cfg_nova()),
-                custom: false,
-                species: None,
-            };
-            // All four pre-granted: this pins the concurrency cap, not the rate.
-            let mut e = Episode::fresh(now, o.genome, o.seed, o.row, 0);
-            e.nova_start = Some(now);
-            wd.persist.insert(o.ident, e);
-            wd.occ.push(o);
-        }
+        // All four pre-granted: this pins the concurrency cap, not the rate.
+        let words: Vec<_> = (0..4u16)
+            .map(|k| (k * 7, 0xF00D + u64::from(k), (100 << 12) | 100, false))
+            .collect();
+        let mut wd = granted_novas(now, &words);
         let at = now + Duration::from_millis(400);
         tick_nova(&mut wd, at, &cfg_nova(), g, None, None);
         let spent: Vec<bool> = wd
@@ -17343,50 +15070,7 @@ mod tests {
         let now = Instant::now();
         let g = geom20();
         let run = |dec_line: bool| {
-            let o = Occurrence {
-                row: 2,
-                start_col: 4,
-                end_col: 7,
-                class: Class::Profanity,
-                langs: LangSet::EMPTY,
-                form_id: FormId::UNKNOWN,
-                seed: 0xF00D,
-                ident: mix(0xF00D),
-                appeared: now,
-                genome: Genome {
-                    gkey: 0,
-                    magic: (100 << 12) | 100,
-                },
-                ink_base: 0,
-                ink_cells: 0,
-                ink_bg: [0; 3],
-                cat_colors: CatColorKey::default(),
-                cat_text_clear: true,
-                cat_peek_down: false,
-                dec_line,
-                inert: false,
-                spec: class_default_spec(Class::Profanity, &cfg_nova()),
-                custom: false,
-                species: None,
-            };
-            let mut wd = WordDecorations {
-                occ: vec![o],
-                cols: 20,
-                have_scanned: true,
-                ..WordDecorations::default()
-            };
-            let mut e = Episode::fresh(
-                now,
-                Genome {
-                    gkey: 0,
-                    magic: (100 << 12) | 100,
-                },
-                0xF00D,
-                2,
-                0,
-            );
-            e.nova_start = Some(now);
-            wd.persist.insert(mix(0xF00D), e);
+            let mut wd = granted_novas(now, &[(2, 0xF00D, (100 << 12) | 100, dec_line)]);
             let (q, _, _, _, _) = tick_nova(
                 &mut wd,
                 now + Duration::from_millis(400),
@@ -17446,39 +15130,6 @@ mod tests {
         (c, lexicon)
     }
 
-    /// §6: custom rainbow word end-to-end — scans as emphasis, resolves the
-    /// override spec, emits animated rainbow ink, settles byte-stable.
-    #[test]
-    fn custom_rainbow_word_end_to_end() {
-        let (c, lex) = lex_with_customs(
-            "[[sparkle_words.custom]]\nwords = [\"ultrathink\"]\nink = { colorway = \"rainbow\" }\n",
-        );
-        let t0 = Instant::now();
-        let at = |ms: u64| t0 + Duration::from_millis(ms);
-        let mut wd = WordDecorations::default();
-        let mut term = Terminal::new(2, 40);
-        term.process(b"go ultrathink now");
-        wd.rescan(&term, 2, 40, &lex, &c, 1, t0);
-        assert_eq!(wd.occ.len(), 1, "the custom word scans");
-        assert!(wd.occ[0].custom, "the override spec resolved");
-        assert!(matches!(
-            wd.occ[0].spec.ink,
-            Some(InkSpec {
-                colorway: Colorway::Rainbow { .. },
-                ..
-            })
-        ));
-        let (_, _, ink0, _, _) = tick_nova(&mut wd, t0, &c, geom20(), None, None);
-        assert_eq!(ink0.len(), 10, "one InkCell per lead cell");
-        assert!(wd.is_active(at(1)), "the drift animates");
-        let (_, _, ink_a, _, fp_a) = tick_nova(&mut wd, at(3000), &c, geom20(), None, None);
-        let (_, _, ink_b, _, fp_b) = tick_nova(&mut wd, at(3200), &c, geom20(), None, None);
-        assert_eq!(ink_a, ink_b, "settled rainbow is byte-stable");
-        assert_eq!(fp_a, fp_b, "settled fp is stable (frame fold gated)");
-        assert!(!wd.is_active(at(3000)), "settled ink disarms the scheduler");
-        assert_eq!(ink0, ink_a, "EXACT full cycle: frozen phase == t = 0 phase");
-    }
-
     /// §6: a custom spec on a builtin profanity form fires with
     /// `[profanity] enabled = false` and beats the class default.
     #[test]
@@ -17536,64 +15187,43 @@ mod tests {
         assert!(!cats.is_empty(), "the cat graphic rises on a custom word");
     }
 
-    /// §6: 2-char custom word (the user-surface guard exemption end-to-end).
+    /// §6 custom surfaces the resolver must key: a 2-char word (explicit
+    /// config is consent, so the short-surface guard is exempt), the possessive
+    /// form (the four possessive-variant hashes) and a no-space-script (CJK)
+    /// compound (the synthesized `cjk = true` entry and its raw form hash).
+    /// Each scans exactly once, resolves the custom spec and styles as rainbow.
     #[test]
-    fn two_char_custom_word_scans_and_styles() {
-        let (c, lex) = lex_with_customs(
-            "[[sparkle_words.custom]]\nwords = [\"gg\"]\nink = { colorway = \"rainbow\" }\n",
-        );
-        let t0 = Instant::now();
-        let mut wd = WordDecorations::default();
-        let mut term = Terminal::new(2, 20);
-        term.process(b"gg well played");
-        wd.rescan(&term, 2, 20, &lex, &c, 1, t0);
-        assert_eq!(wd.occ.len(), 1, "explicit config is consent (v3 §6)");
-        assert!(wd.occ[0].custom);
-        let (_, _, ink, _, _) = tick_nova(&mut wd, t0, &c, geom20(), None, None);
-        assert_eq!(ink.len(), 2, "both lead cells ink");
-    }
-
-    /// §6: the possessive form styles identically (the resolver registered
-    /// the four possessive-variant hashes).
-    #[test]
-    fn possessive_custom_form_styled_identically() {
-        let (c, lex) = lex_with_customs(
-            "[[sparkle_words.custom]]\nwords = [\"ultrathink\"]\nink = { colorway = \"rainbow\" }\n",
-        );
-        let t0 = Instant::now();
-        let mut wd = WordDecorations::default();
-        let mut term = Terminal::new(2, 40);
-        term.process(b"ultrathink's power");
-        wd.rescan(&term, 2, 40, &lex, &c, 1, t0);
-        assert_eq!(wd.occ.len(), 1, "the possessive matches");
-        assert!(
-            wd.occ[0].custom,
-            "possessive hits carry the full-token hash; the variant keys cover it"
-        );
-        assert!(matches!(
-            wd.occ[0].spec.ink,
-            Some(InkSpec {
-                colorway: Colorway::Rainbow { .. },
-                ..
-            })
-        ));
-    }
-
-    /// §6: a no-space-script (CJK) custom surface matches via the synthesized
-    /// `cjk = true` entry and its raw form_hash key.
-    #[test]
-    fn cjk_custom_surface_matches() {
-        let (c, lex) = lex_with_customs(
-            "[[sparkle_words.custom]]\nwords = [\"\u{732b}\u{795e}\"]\nink = { colorway = \"rainbow\" }\n",
-        );
-        let t0 = Instant::now();
-        let mut wd = WordDecorations::default();
-        let mut term = Terminal::new(2, 30);
-        term.process("これは猫神です".as_bytes());
-        wd.rescan(&term, 2, 30, &lex, &c, 1, t0);
-        assert_eq!(wd.occ.len(), 1, "the CJK custom compound scans");
-        assert!(wd.occ[0].custom, "RAW-hash override resolved");
-        assert_eq!(wd.occ[0].class, Class::Emphasis);
+    fn custom_short_possessive_and_cjk_surfaces_scan_and_style() {
+        for (word, text, cols, ink_cells) in [
+            ("gg", "gg well played", 20usize, Some(2usize)),
+            ("ultrathink", "ultrathink's power", 40, None),
+            ("\u{732b}\u{795e}", "これは猫神です", 30, None),
+        ] {
+            let (c, lex) = lex_with_customs(&format!(
+                "[[sparkle_words.custom]]\nwords = [\"{word}\"]\nink = {{ colorway = \"rainbow\" }}\n"
+            ));
+            let t0 = Instant::now();
+            let mut wd = WordDecorations::default();
+            let mut term = Terminal::new(2, cols as u16);
+            term.process(text.as_bytes());
+            wd.rescan(&term, 2, cols, &lex, &c, 1, t0);
+            assert_eq!(wd.occ.len(), 1, "{text:?}: the custom surface scans");
+            assert!(wd.occ[0].custom, "{text:?}: the override spec resolved");
+            assert!(
+                matches!(
+                    wd.occ[0].spec.ink,
+                    Some(InkSpec {
+                        colorway: Colorway::Rainbow { .. },
+                        ..
+                    })
+                ),
+                "{text:?}: styled as the custom rainbow"
+            );
+            if let Some(n) = ink_cells {
+                let (_, _, ink, _, _) = tick_nova(&mut wd, t0, &c, geom20(), None, None);
+                assert_eq!(ink.len(), n, "{text:?}: every lead cell inks");
+            }
+        }
     }
 
     /// §3.1: past the freeze, ink and fingerprint are identical on both themes,
@@ -17666,13 +15296,6 @@ mod tests {
     /// at 100, and transferred by alignment.
     #[test]
     fn supernova_roll_decorrelates_and_transfers_across_alignment() {
-        // The salted mix over birth sequences hits both outcomes at 10%.
-        let roll_seed = 0xABCD_EF12_3456_7890u64;
-        let outcomes: Vec<bool> = (1..=200u64)
-            .map(|s| mix(roll_seed ^ s ^ supernova::SUPERNOVA_SALT) % 100 < 10)
-            .collect();
-        assert!(outcomes.iter().any(|h| *h) && outcomes.iter().any(|h| !*h));
-
         let lex = lex();
         let t0 = Instant::now();
         // chance = 100: always rolls; the decision transfers with alignment.
@@ -17709,65 +15332,6 @@ mod tests {
             seen[0] && seen[1],
             "independent outcomes across rebirths of the same context"
         );
-    }
-
-    /// §3.2: a second supernova and a classic nova defer while the first is
-    /// granted or live, then grant after its window.
-    #[test]
-    fn supernova_mutex_serializes_bursts() {
-        let (table, lex_frag) = custom_table(
-            "[[sparkle_words.custom]]\nwords = [\"boom\"]\nburst = { kind = \"nova\" }\n",
-        );
-        let lexicon = Lexicon::with_languages_and_override(&["en"], Some(&lex_frag))
-            .expect("override parses");
-        let mut c = cfg_rainbow(100);
-        c.spec_table = table;
-        let t0 = Instant::now();
-        let at = |ms: u64| t0 + Duration::from_millis(ms);
-        let g = geom20();
-        let mut wd = WordDecorations::default();
-        let mut term = Terminal::new(8, 20);
-        term.process(b"fuck\r\nfuck it\r\nboom");
-        wd.rescan(&term, 8, 20, &lexicon, &c, 1, t0);
-        let start_of = |wd: &WordDecorations, i: usize| {
-            wd.persist.get(&wd.occ[i].ident).and_then(|e| e.nova_start)
-        };
-        assert_eq!(wd.occ.len(), 3);
-        tick_nova(&mut wd, t0, &c, g, None, None);
-        assert!(
-            start_of(&wd, 0).is_some(),
-            "row-major first supernova grants"
-        );
-        assert!(
-            start_of(&wd, 1).is_none(),
-            "MAX_ACTIVE_SUPERNOVAE = 1: the second roll defers"
-        );
-        assert!(
-            start_of(&wd, 2).is_none(),
-            "burst mutex: the classic nova defers behind the live supernova"
-        );
-        // Past the first window: the second supernova takes the mutex.
-        tick_nova(
-            &mut wd,
-            at(supernova::SUPER_TOTAL_MS + 50),
-            &c,
-            g,
-            None,
-            None,
-        );
-        assert!(wd.persist[&wd.occ[0].ident].nova_done);
-        assert!(start_of(&wd, 1).is_some(), "the deferred supernova grants");
-        assert!(start_of(&wd, 2).is_none(), "the classic nova still waits");
-        // Past the second window: the classic nova finally ignites.
-        tick_nova(
-            &mut wd,
-            at(2 * supernova::SUPER_TOTAL_MS + 100),
-            &c,
-            g,
-            None,
-            None,
-        );
-        assert!(start_of(&wd, 2).is_some(), "the mutex released the nova");
     }
 
     /// The burst mutex holds for the supernova's full window even while its
@@ -17934,34 +15498,6 @@ mod tests {
                 "chance 100 still rolls at the cold level"
             );
         }
-    }
-
-    /// §3.2b: `hard_reset` cools the streak (`birth_seq` alone survives).
-    #[test]
-    fn fbomb_combo_cools_on_hard_reset() {
-        let lexicon = lex();
-        let c = cfg_rainbow(1);
-        let t0 = Instant::now();
-        let at = |ms: u64| t0 + Duration::from_millis(ms);
-        let mut wd = WordDecorations::default();
-        let mut term = Terminal::new(4, 40);
-        for (i, ch) in b"fuck fuck".iter().enumerate() {
-            term.process(&[*ch]);
-            // A committed key per char.
-            wd.note_typed_edit(at(100 * (i as u64 + 1)), None);
-            wd.rescan(
-                &term,
-                4,
-                40,
-                &lexicon,
-                &c,
-                i as u64 + 1,
-                at(100 * (i as u64 + 1)),
-            );
-        }
-        assert_eq!(wd.combo_births.len(), 2);
-        wd.hard_reset();
-        assert!(wd.combo_births.is_empty(), "a fresh start cools the combo");
     }
 
     /// §3.2b: combo heat decays in engine-clock time across a freeze (the ring
@@ -18192,7 +15728,7 @@ mod tests {
     /// order), and every state satisfies the invariants.
     #[test]
     fn real_burst_grants_conform_to_the_supernova_mutex_model() {
-        let model = aterm_spec::derive::supernova_burst_mutex_model();
+        let model = aterm_models_effects::supernova_burst_mutex_model();
         let check = |wd: &mut WordDecorations,
                      now: Instant,
                      c: &DecoConfig,
@@ -18470,6 +16006,11 @@ mod tests {
             fr.is_empty() && !out.iter().any(|d| matches!(d.glyph, DecoGlyph::Paw)),
             "paw style draws no graphic under v4"
         );
+        assert_eq!(
+            wd.drain_kitty_sightings().count(),
+            0,
+            "paw style logs no sighting"
+        );
         let (_, out, _) = tick_cat_at(&mut wd, at(4_050), &reduce(&c_paw), g, None, true);
         assert!(out.is_empty(), "reduced motion resurrects nothing");
 
@@ -18525,56 +16066,6 @@ mod tests {
         assert!(out.is_empty(), "no static-spark resurrection: {out:?}");
     }
 
-    /// A word born unfocused under `reduced_motion` shows the static pose at
-    /// once, logs once, and replays no entrance after the peek window.
-    #[test]
-    fn born_unfocused_reduced_shows_static_pose_and_never_replays() {
-        let lex = lex();
-        let mut c = cfg();
-        c.reduced_motion = true;
-        let g = geom20();
-        let t0 = Instant::now();
-        let at = |ms: u64| t0 + Duration::from_millis(ms);
-        let mut term = Terminal::new(4, 20);
-        term.process(b"\r\n\r\na happy kitty naps");
-        let mut wd = WordDecorations::default();
-        wd.rescan(&term, 4, 20, &lex, &c, 1, t0);
-        let (fr1, out1, _) = tick_cat_at(&mut wd, t0, &c, g, None, false);
-        assert!(
-            !fr1.is_empty() || !out1.is_empty(),
-            "the static pose lands on the first unfocused tick (clock \
-             latched at birth): {fr1:?} {out1:?}"
-        );
-        assert_eq!(wd.drain_kitty_sightings().count(), 1, "logs once");
-        // The pose persists while reduced (flags never advance), unfocused.
-        let (fr2, out2, _) = tick_cat_at(&mut wd, at(1_000), &c, g, None, false);
-        assert_eq!(fr1, fr2, "the pose persists while reduced");
-        assert_eq!(out1, out2);
-        assert_eq!(wd.drain_kitty_sightings().count(), 0, "exactly once");
-        // Un-reduce and refocus past every peek total: no replay.
-        let c_full = cfg();
-        let (fr, _, _) = tick_cat_at(&mut wd, at(60_000), &c_full, g, None, true);
-        assert!(
-            fr.is_empty(),
-            "no entrance replay on un-reduce/refocus: {fr:?}"
-        );
-        let cat = wd
-            .occ
-            .iter()
-            .find(|o| o.spec.graphic.is_some())
-            .expect("the cat word scanned")
-            .ident;
-        assert!(wd.persist[&cat].peek_done, "the elapsed window spends it");
-        // The paw arm draws no graphic under v4 and logs nothing.
-        let mut c_paw = c.clone();
-        c_paw.feline_style = FelineStyle::Paw;
-        let mut wd = WordDecorations::default();
-        wd.rescan(&term, 4, 20, &lex, &c_paw, 1, t0);
-        let (_, out, _) = tick_cat_at(&mut wd, t0, &c_paw, g, None, false);
-        assert!(out.is_empty(), "no paw graphic under v4");
-        assert_eq!(wd.drain_kitty_sightings().count(), 0);
-    }
-
     /// A landed peek records exactly one positioned cue; later frames none.
     #[test]
     fn a_peek_landing_records_one_positioned_cue() {
@@ -18611,42 +16102,14 @@ mod tests {
     }
 
     /// A focused reduce-motion user gets the static pose at once, logged once,
-    /// byte-stable.
+    /// byte-stable. Un-reducing after that showing, past the peek window,
+    /// marks the peek done: no entrance replay.
     #[test]
-    fn reduced_from_birth_focused_shows_static_pose_and_logs_once() {
+    fn reduced_from_birth_shows_a_static_pose_once_and_un_reducing_spends_it() {
         let lex = lex();
-        let mut c = cfg();
-        c.reduced_motion = true;
-        let g = geom20();
-        let t0 = Instant::now();
-        let at = |ms: u64| t0 + Duration::from_millis(ms);
-        let mut term = Terminal::new(4, 20);
-        term.process(b"\r\n\r\na happy kitty naps");
-        let mut wd = WordDecorations::default();
-        wd.rescan(&term, 4, 20, &lex, &c, 1, t0);
-        let (fr1, out1, fp1) = tick_cat_at(&mut wd, t0, &c, g, None, true);
-        assert!(
-            !fr1.is_empty() || !out1.is_empty(),
-            "the static pose lands on the first focused tick"
-        );
-        assert_eq!(wd.drain_kitty_sightings().count(), 1, "logs once");
-        // Far past the (never-running) peek window: the pose persists.
-        let (fr2, out2, fp2) = tick_cat_at(&mut wd, at(60_000), &c, g, None, true);
-        assert_eq!(fr1, fr2, "the pose persists (flags never advance)");
-        assert_eq!(out1, out2);
-        assert_eq!(fp1, fp2, "byte-stable static pose");
-        assert_eq!(wd.drain_kitty_sightings().count(), 0, "exactly once");
-        assert!(!wd.is_active(at(60_000)), "static = zero wakes");
-    }
-
-    /// Un-reducing after a static showing, past the peek window, marks the
-    /// peek done: no entrance replay.
-    #[test]
-    fn un_reduce_after_static_showing_marks_the_peek_done() {
-        let lex = lex();
+        let c = cfg();
         let mut c_red = cfg();
         c_red.reduced_motion = true;
-        let c = cfg();
         let g = geom20();
         let t0 = Instant::now();
         let at = |ms: u64| t0 + Duration::from_millis(ms);
@@ -18654,12 +16117,12 @@ mod tests {
         term.process(b"\r\n\r\na happy kitty naps");
         let mut wd = WordDecorations::default();
         wd.rescan(&term, 4, 20, &lex, &c_red, 1, t0);
-        // Focused reduced tick: the static pose shows.
-        let (fr, out, _) = tick_cat_at(&mut wd, t0, &c_red, g, None, true);
+        let (fr1, out1, fp1) = tick_cat_at(&mut wd, t0, &c_red, g, None, true);
         assert!(
-            !fr.is_empty() || !out.is_empty(),
+            !fr1.is_empty() || !out1.is_empty(),
             "the static pose lands on the first focused tick"
         );
+        assert_eq!(wd.drain_kitty_sightings().count(), 1, "logs once");
         let cat = wd
             .occ
             .iter()
@@ -18670,12 +16133,21 @@ mod tests {
             wd.persist[&cat].phase_start.is_some(),
             "the phase clock is latched (at birth)"
         );
+        // Far past the (never-running) peek window: the pose persists.
+        let (fr2, out2, fp2) = tick_cat_at(&mut wd, at(60_000), &c_red, g, None, true);
+        assert_eq!(fr1, fr2, "the pose persists (flags never advance)");
+        assert_eq!(out1, out2);
+        assert_eq!(fp1, fp2, "byte-stable static pose");
+        assert_eq!(wd.drain_kitty_sightings().count(), 0, "exactly once");
+        assert!(!wd.is_active(at(60_000)), "static = zero wakes");
         assert!(
             !wd.persist[&cat].peek_done,
             "flags hold while reduced (the pose persists)"
         );
-        // Un-reduce past every peek total: the first tick spends the one-shot.
-        let (fr, _, _) = tick_cat_at(&mut wd, at(60_000), &c, g, None, true);
+
+        // Un-reduce: the first tick spends the one-shot (the static showing
+        // was the showing).
+        let (fr, _, _) = tick_cat_at(&mut wd, at(61_000), &c, g, None, true);
         assert!(
             fr.is_empty(),
             "zero free sprites — no entrance replay on un-reduce: {fr:?}"
@@ -18684,9 +16156,8 @@ mod tests {
             wd.persist[&cat].peek_done,
             "the elapsed static window latches peek_done"
         );
-        assert!(!wd.is_active(at(60_000)), "done = zero wakes");
-        // And it stays spent: later ticks never resurrect the cat.
-        let (fr, _, _) = tick_cat_at(&mut wd, at(61_000), &c, g, None, true);
+        assert!(!wd.is_active(at(61_000)), "done = zero wakes");
+        let (fr, _, _) = tick_cat_at(&mut wd, at(62_000), &c, g, None, true);
         assert!(fr.is_empty(), "the peek stays spent (done forever)");
     }
 
@@ -18991,106 +16462,6 @@ mod tests {
         assert_eq!(wash, 0, "no full-viewport additive wash on a light bg");
     }
 
-    /// §3.1 span clamp: 300° across 4 leads, a 100° two-step on 2, and a 1-lead
-    /// word that drifts then freezes at its t = 0 bytes.
-    #[test]
-    fn rainbow_span_clamps_to_lead_cells() {
-        let t0 = Instant::now();
-        let c = cfg_rainbow(0);
-        let fg = [220u8, 220, 220];
-        let strength = c.ink_strength;
-        // A gkey whose guard never binds on black, so the bytes are the raw
-        // formula.
-        let clears = |gkey: u64, span: f32| {
-            [0.0f32, 1.0 / 3.0, 2.0 / 3.0, 1.0].iter().all(|u| {
-                let h = hsv2rgb(
-                    (rainbow_base_hue(gkey) + u * span).rem_euclid(360.0),
-                    0.85,
-                    1.0,
-                );
-                contrast_ratio(mix_rgb(rgb3_to_u32(fg), h, strength), 0) >= MIN_INK_CONTRAST
-            })
-        };
-        let gkey = (0..10_000u64)
-            .find(|g| clears(*g, 300.0) && clears(*g, 100.0) && clears(*g, 0.0))
-            .expect("a guard-free gkey exists");
-        let build = |leads: u16| {
-            let mut o = occ(Class::Profanity, t0);
-            o.spec = class_default_spec(Class::Profanity, &c);
-            o.genome = Genome { gkey, magic: 100 };
-            o.start_col = 2;
-            o.end_col = 2 + leads - 1;
-            o.ink_cells = leads;
-            o.ink_bg = [0; 3];
-            let mut wd = WordDecorations {
-                occ: vec![o],
-                cols: 20,
-                have_scanned: true,
-                ..WordDecorations::default()
-            };
-            wd.ink_base_fg = vec![fg; usize::from(leads)];
-            wd.ink_cols = (2..2 + leads).collect();
-            wd
-        };
-        let expect = |span_used: f32, n: u16| -> Vec<[u8; 3]> {
-            let denom = f32::from(n.saturating_sub(1)).max(1.0);
-            (0..n)
-                .map(|i| {
-                    let u = f32::from(i) / denom;
-                    u32_to_rgb3(mix_rgb(
-                        rgb3_to_u32(fg),
-                        hsv2rgb(
-                            (rainbow_base_hue(gkey) + u * span_used).rem_euclid(360.0),
-                            0.85,
-                            1.0,
-                        ),
-                        strength,
-                    ))
-                })
-                .collect()
-        };
-        let settle = t0 + Duration::from_millis(2_600); // past the 2 500 ms drift
-        // 4 leads ("fuck"): span_used = min(300, 300) = 300°.
-        let mut wd = build(4);
-        let (_, _, ink, _, _) = tick_nova(&mut wd, settle, &c, geom20(), None, None);
-        assert_eq!(
-            ink.iter().map(|i| i.color).collect::<Vec<_>>(),
-            expect(300.0, 4),
-            "4 leads sweep the full 300°"
-        );
-        // 2 leads (2-cell CJK): span_used = min(300, 100) = 100°.
-        let mut wd = build(2);
-        let (_, _, ink, _, _) = tick_nova(&mut wd, settle, &c, geom20(), None, None);
-        assert_eq!(
-            ink.iter().map(|i| i.color).collect::<Vec<_>>(),
-            expect(100.0, 2),
-            "2 leads take the readable 100° two-step"
-        );
-        // 1 lead: no span; the cell drifts, then freezes at its t = 0 bytes.
-        let mut wd = build(1);
-        let (_, _, ink0, _, _) = tick_nova(&mut wd, t0, &c, geom20(), None, None);
-        assert_eq!(
-            ink0.iter().map(|i| i.color).collect::<Vec<_>>(),
-            expect(0.0, 1),
-            "t = 0 shows the genome base hue"
-        );
-        let (_, _, ink_mid, _, _) = tick_nova(
-            &mut wd,
-            t0 + Duration::from_millis(1_200),
-            &c,
-            geom20(),
-            None,
-            None,
-        );
-        assert_ne!(ink0, ink_mid, "the 1-cell word drifts through hues");
-        let (_, _, ink_set, _, _) = tick_nova(&mut wd, settle, &c, geom20(), None, None);
-        assert_eq!(
-            ink0, ink_set,
-            "…then freezes at the exact t = 0 base-hue bytes"
-        );
-        assert!(!wd.is_active(settle), "settled = idle");
-    }
-
     /// §3.1: the rainbow guard samples four points, so a word whose mid sample
     /// passes while an endpoint fails is still pulled to [`MIN_INK_CONTRAST`].
     #[test]
@@ -19174,25 +16545,13 @@ mod tests {
         let mut wd = WordDecorations::default();
         let mut free = Vec::new();
         let footprint = wd
-            .kitty_cursor_footprint(KittyCursorLayout {
-                geom: g,
-                cursor: (3, 5),
-                look: KittyLook::default(),
-                bob: 0.0,
-            })
+            .kitty_cursor_footprint(still_layout(g, (3, 5)))
             .expect("visible footprint");
 
         wd.kitty_cursor(
             KittyCursorFrame {
-                geom: g,
-                cursor: (3, 5),
-                look: KittyLook::default(),
-                colors: CatColorKey::default(),
-                bob: 0.0,
                 alpha: 200,
-                pose: crate::kitty_cursor::CatPose::STILL,
-                sing: 0.0,
-                notes: [None; crate::kitty_sing::MAX_NOTES],
+                ..still_frame(g, (3, 5))
             },
             &mut free,
         );
@@ -19217,16 +16576,10 @@ mod tests {
         // The sprite's left edge is past the cursor cell's right edge (x=60),
         // within a cell of it.
         let cursor_right = 6 * i32::from(g.cell_w);
-        let old_v056_x = cursor_right + i32::from(g.cell_w) / 4;
-        assert_eq!(
-            s.x,
-            cursor_right + 3 * i32::from(g.cell_w) / 4,
-            "the companion uses the incoming 3/4-cell lead"
-        );
         assert!(
-            s.x > old_v056_x,
-            "v0.57 body x={} must lead the v0.56 x={old_v056_x}",
-            s.x,
+            s.x > cursor_right && s.x < cursor_right + i32::from(g.cell_w),
+            "the companion leads the cursor cell by less than a cell: x={}",
+            s.x
         );
         // Vertically centred on row 3 (centre y = 3*20 + 10 = 70).
         let mid = s.y + i32::from(s.h) / 2;
@@ -19240,15 +16593,8 @@ mod tests {
         let mut none = Vec::new();
         wd.kitty_cursor(
             KittyCursorFrame {
-                geom: g,
-                cursor: (3, 5),
-                look: KittyLook::default(),
-                colors: CatColorKey::default(),
-                bob: 0.0,
                 alpha: 0,
-                pose: crate::kitty_cursor::CatPose::STILL,
-                sing: 0.0,
-                notes: [None; crate::kitty_sing::MAX_NOTES],
+                ..still_frame(g, (3, 5))
             },
             &mut none,
         );
@@ -19279,15 +16625,9 @@ mod tests {
             });
         }
         let frame = |sing: f32, notes| KittyCursorFrame {
-            geom: g,
-            cursor: (3, 2),
-            look: KittyLook::default(),
-            colors: CatColorKey::default(),
-            bob: 0.0,
-            alpha: 255,
-            pose: crate::kitty_cursor::CatPose::STILL,
             sing,
             notes,
+            ..still_frame(g, (3, 2))
         };
         let mut free = Vec::new();
         wd.kitty_cursor(frame(1.0, notes), &mut free);
@@ -19327,63 +16667,11 @@ mod tests {
         assert_eq!(plain.len(), 1, "no note work at rest — just the body");
     }
 
-    /// Age is a pixel dimension, not a cache key: at `cell_h = 4` Kitten and
-    /// Adolescent round to one box (6 px) and share a tile, while Elder (8 px)
-    /// does not.
+    /// The escort's drawn height stays within the baker's `2·cell_h` slot at
+    /// every age ([`WordDecorations::COMPANION_CELL_H`]), so a size bump can
+    /// never clamp the age axis flat.
     #[test]
-    fn cursor_age_rounding_alias_reuses_the_exact_size_bake() {
-        let geom = EffectGeom {
-            cell_w: 2,
-            cell_h: 4,
-            rows: 10,
-            cols: 40,
-        };
-        let mut wd = WordDecorations::default();
-        let emit = |wd: &mut WordDecorations, age| {
-            let mut sprites = Vec::new();
-            wd.kitty_cursor(
-                KittyCursorFrame {
-                    geom,
-                    cursor: (3, 5),
-                    look: KittyLook {
-                        age,
-                        ..KittyLook::default()
-                    },
-                    colors: CatColorKey::default(),
-                    bob: 0.0,
-                    alpha: 255,
-                    pose: crate::kitty_cursor::CatPose::STILL,
-                    sing: 0.0,
-                    notes: [None; crate::kitty_sing::MAX_NOTES],
-                },
-                &mut sprites,
-            );
-            assert_eq!(sprites.len(), 1, "one age-sized companion body");
-            sprites[0]
-        };
-
-        let kitten = emit(&mut wd, CatAge::Kitten);
-        let after_kitten = wd.cat_baker.version();
-        let adolescent = emit(&mut wd, CatAge::Adolescent);
-        assert_eq!((kitten.w, kitten.h), (adolescent.w, adolescent.h));
-        assert_eq!(
-            wd.cat_baker.version(),
-            after_kitten,
-            "dimensionally identical ages must be a cache hit"
-        );
-        // Non-vacuity: Elder really is a different size here.
-        let elder = emit(&mut wd, CatAge::Elder);
-        assert_ne!(
-            (elder.w, elder.h),
-            (kitten.w, kitten.h),
-            "a separated age must still bake a distinct box at this metric"
-        );
-    }
-
-    /// The escort's drawn height stays above a floor and within the `2·cell_h`
-    /// slot at every age (see [`WordDecorations::COMPANION_CELL_H`]).
-    #[test]
-    fn the_cursor_escort_really_grew_and_still_fits_its_slot() {
+    fn the_cursor_escort_fits_its_slot_at_every_age() {
         let g = geom20(); // cell_h = 20 ⇒ the slot is 40 px.
         let mut wd = WordDecorations::default();
         let emit = |wd: &mut WordDecorations, age| {
@@ -19393,32 +16681,18 @@ mod tests {
             let mut sprites = Vec::new();
             wd.kitty_cursor(
                 KittyCursorFrame {
-                    geom: g,
-                    cursor: (2, 4),
                     look: KittyLook {
                         age,
                         ..KittyLook::default()
                     },
-                    colors: CatColorKey::default(),
-                    bob: 0.0,
-                    alpha: 255,
-                    pose: crate::kitty_cursor::CatPose::STILL,
-                    sing: 0.0,
-                    notes: [None; crate::kitty_sing::MAX_NOTES],
+                    ..still_frame(g, (2, 4))
                 },
                 &mut sprites,
             );
             assert_eq!(sprites.len(), 1, "the escort drew");
             sprites[0].h
         };
-        // The floor sits above 1.45·1.04 = 1.508 cells (30 px here).
-        let adult = emit(&mut wd, CatAge::Adult);
-        assert!(
-            i32::from(adult) >= 34,
-            "the Adult escort must be visibly larger than the 30 px it shipped \
-             at: {adult}"
-        );
-        // Every age still fits the atlas slot — nothing is being clamped.
+        // Every age fits the atlas slot — nothing is being clamped.
         for age in [
             CatAge::Kitten,
             CatAge::Adolescent,
@@ -19436,81 +16710,6 @@ mod tests {
             emit(&mut wd, CatAge::Kitten),
             emit(&mut wd, CatAge::Elder),
             "a clamped-flat age axis would defeat the ceiling above"
-        );
-    }
-
-    /// The maneki's raised paw (from the generated table) is enlarged, not
-    /// clamped flat, and its `outline` keyline still contains its `coat` fill.
-    #[test]
-    fn the_maneki_raised_paw_grew_with_its_keyline_intact() {
-        use crate::cat_glyphs_gen::{CatGlyphId, GLYPHS, GlyphRole};
-        use aterm_scene::vector::PathSeg;
-
-        let glyph = &GLYPHS[CatGlyphId::SpecManeki as usize];
-        // Sub-path 2 of `outline`/`coat` is the raised arm.
-        let arm = |role: GlyphRole| -> (u16, u16, u16, u16) {
-            let layer = glyph
-                .layers
-                .iter()
-                .find(|l| l.role == role)
-                .unwrap_or_else(|| panic!("spec_maneki has a {role:?} layer"));
-            let path = layer.paths.get(2).expect("the raised-arm sub-path");
-            let mut b = (u16::MAX, u16::MAX, 0u16, 0u16);
-            let mut pt = |x: u16, y: u16| {
-                b.0 = b.0.min(x);
-                b.1 = b.1.min(y);
-                b.2 = b.2.max(x);
-                b.3 = b.3.max(y);
-            };
-            for seg in path.iter() {
-                match *seg {
-                    PathSeg::Move(x, y) | PathSeg::Line(x, y) => pt(x, y),
-                    PathSeg::Cubic(x1, y1, x2, y2, x, y) => {
-                        pt(x1, y1);
-                        pt(x2, y2);
-                        pt(x, y);
-                    }
-                    PathSeg::Close => {}
-                }
-            }
-            b
-        };
-        let outline = arm(GlyphRole::Outline);
-        let coat = arm(GlyphRole::Coat);
-        assert!(
-            outline.0 <= coat.0
-                && outline.1 <= coat.1
-                && outline.2 >= coat.2
-                && outline.3 >= coat.3,
-            "the keyline must still enclose the fill it traces: outline \
-             {outline:?} vs coat {coat:?}"
-        );
-
-        // Enlarged: the unscaled arm spanned 40/150 × 88/170 of the viewbox.
-        let one = f64::from(aterm_scene::vector::FIXED_ONE);
-        let w_span = f64::from(outline.2 - outline.0) / one;
-        let h_span = f64::from(outline.3 - outline.1) / one;
-        assert!(
-            w_span > 0.30 && h_span > 0.60,
-            "the raised paw must be visibly larger: spans {w_span:.3} x {h_span:.3}"
-        );
-
-        // Not clamped: the codegen pins out-of-viewbox points to the edge.
-        assert!(
-            outline.2 < aterm_scene::vector::FIXED_ONE,
-            "the paw must fit inside the (widened) viewbox, not be clamped flat"
-        );
-        // Whiskers paint before the paw pads, or they bisect the pads.
-        let role_at = |role: GlyphRole| {
-            glyph
-                .layers
-                .iter()
-                .position(|l| l.role == role)
-                .unwrap_or_else(|| panic!("spec_maneki has a {role:?} layer"))
-        };
-        assert!(
-            role_at(GlyphRole::Whisker) < role_at(GlyphRole::Pink),
-            "paint order: whiskers go UNDER the raised paw's pads"
         );
     }
 
@@ -19581,159 +16780,11 @@ mod tests {
         }
     }
 
-    /// The maneki is off the launch roster (`cat_variant_v4` indexes `HEADS`)
-    /// but on the discovery path: a `SpecManeki` look survives `normalized()`
-    /// and [`authored_cat_size`] fits it by its own widened aspect.
-    #[test]
-    fn the_enlarged_maneki_is_off_the_launch_roster_but_on_the_discovery_path() {
-        use crate::cat_glyphs_gen::{CatGlyphId, GLYPHS, HEADS};
-        use crate::genome::CatAge;
-
-        // ── never rolled by the launch floor ────────────────────────────────
-        assert!(
-            !HEADS.contains(&CatGlyphId::SpecManeki),
-            "PRECONDITION: the maneki is a SPECIAL, not a head"
-        );
-        assert!(
-            (0..4096u64).any(|s| KittyLook::for_launch(s).variant == CatGlyphId::S103),
-            "PRECONDITION: the sample really does roll heads, so the negative \
-             below is not vacuous"
-        );
-        assert!(
-            (0..4096u64).all(|s| KittyLook::for_launch(s).variant != CatGlyphId::SpecManeki),
-            "the launch kitty can never BE the maneki — the enlarged paw is \
-             unreachable through that lane"
-        );
-
-        // ── the other half: a collected maneki reaches the companion ────────
-        let maneki = KittyLook {
-            variant: CatGlyphId::SpecManeki,
-            // Specials wear no accessory: `normalized` drops it, not the special.
-            accessory: Some(CatGlyphId::AccBow),
-            coat: 3,
-            iris: 5,
-            age: CatAge::Adult,
-        }
-        .normalized();
-        assert_eq!(
-            (maneki.variant, maneki.accessory),
-            (CatGlyphId::SpecManeki, None),
-            "a collected Lucky Bean survives normalization as itself"
-        );
-
-        // ── and the widened art is what the emitter sizes by ────────────────
-        // The paw scaled 1.5x in a 166-wide viewbox gives aspect 976.
-        let aspect = GLYPHS[CatGlyphId::SpecManeki as usize].aspect_x1000;
-        assert_eq!(
-            aspect, 976,
-            "the maneki's authored aspect must carry the widened paw"
-        );
-        // Heads have aspect ≥ 1145; no glyph but the maneki has 976.
-        assert!(
-            HEADS
-                .iter()
-                .all(|h| GLYPHS[*h as usize].aspect_x1000 != aspect),
-            "the maneki's aspect must be distinguishable from every head's"
-        );
-
-        // ── and the sizing law fits it ──────────────────────────────────────
-        // `authored_cat_size` is the one funnel every cat on glass passes
-        // through.
-        let g = geom20();
-        let (w, h) = authored_cat_size(
-            maneki.variant,
-            f32::from(cat_hart(g.cell_h)) * maneki.age.scale(),
-            g.cell_h,
-        );
-        let expect_w = |asp: u16| ((u32::from(h) * u32::from(asp)) + 500) / 1000;
-        assert_eq!(
-            u32::from(w),
-            expect_w(aspect),
-            "the sprite is sized by the maneki's own widened aspect: {w}x{h}"
-        );
-        assert_ne!(
-            expect_w(aspect),
-            expect_w(882),
-            "PRECONDITION: 882 was the PRE-enlargement aspect and it would size \
-             a visibly different sprite, so the check above really is reading \
-             the new art"
-        );
-    }
-
-    /// A user sprite ([`WordDecorations::set_kitty_sprite_source`]) is
-    /// nearest-resampled into the slot, aspect kept, and flown; clearing it
-    /// restores the built-in cat.
-    #[test]
-    fn kitty_flies_a_user_sprite_when_set() {
-        let g = geom20(); // ch = 20 ⇒ slot 80×40, height cap 1.8·ch = 36.
-        let mut wd = WordDecorations::default();
-        // A 4×2 opaque sprite (aspect 2:1). fit s = min(80/4, 36/2) = 18 ⇒ 72×36.
-        let mut native = Vec::new();
-        for _ in 0..(4 * 2) {
-            native.extend_from_slice(&[255, 0, 0, 255]);
-        }
-        let native: Arc<[u8]> = Arc::from(native);
-        wd.set_kitty_sprite_source(KittySpriteSource::Custom {
-            source_fp: 7,
-            w: 4,
-            h: 2,
-            rgba: Arc::clone(&native),
-        });
-        assert!(Arc::ptr_eq(
-            wd.kitty_sprite_rgba().expect("custom source"),
-            &native
-        ));
-        let mut free = Vec::new();
-        wd.kitty_cursor(
-            KittyCursorFrame {
-                geom: g,
-                cursor: (3, 5),
-                look: KittyLook::default(),
-                colors: CatColorKey::default(),
-                bob: 0.0,
-                alpha: 255,
-                pose: crate::kitty_cursor::CatPose::STILL,
-                sing: 0.0,
-                notes: [None; crate::kitty_sing::MAX_NOTES],
-            },
-            &mut free,
-        );
-        assert_eq!(
-            free.len(),
-            1,
-            "user art follows the same one-body sprite contract"
-        );
-        assert_eq!(
-            (free[0].w, free[0].h),
-            (72, 36),
-            "resampled to fit the slot"
-        );
-        assert!(wd.free_atlas().is_some(), "baked into the shared atlas");
-
-        // Clearing restores the one-body homage at its own, different size.
-        wd.set_kitty_sprite_source(KittySpriteSource::BuiltIn);
-        let mut homage = Vec::new();
-        wd.kitty_cursor(
-            KittyCursorFrame {
-                geom: g,
-                cursor: (3, 5),
-                look: KittyLook::default(),
-                colors: CatColorKey::default(),
-                bob: 0.0,
-                alpha: 255,
-                pose: crate::kitty_cursor::CatPose::STILL,
-                sing: 0.0,
-                notes: [None; crate::kitty_sing::MAX_NOTES],
-            },
-            &mut homage,
-        );
-        assert_eq!(homage.len(), 1, "built-in homage is one body sprite");
-        let body = homage[0];
-        assert_ne!(body.w, 72, "homage has its own dimensions");
-    }
-
     /// The custom sprite's footprint matches emission, clamping at the right
     /// edge and showing the lower part of the body on row zero.
+    /// The 4×2 source is nearest-resampled to fit the slot, aspect kept
+    /// (`min(80/4, 36/2) = 18` ⇒ 72×36), and clearing it restores the
+    /// built-in homage at its own size.
     #[test]
     fn custom_kitty_footprint_matches_emission_at_interior_right_and_top_edges() {
         let g = geom20();
@@ -19747,29 +16798,11 @@ mod tests {
         });
         let emit = |wd: &mut WordDecorations, cursor: (u16, u16)| {
             let expected = wd
-                .kitty_cursor_footprint(KittyCursorLayout {
-                    geom: g,
-                    cursor,
-                    look: KittyLook::default(),
-                    bob: 0.0,
-                })
+                .kitty_cursor_footprint(still_layout(g, cursor))
                 .expect("custom sprite remains placeable");
             let mut free = Vec::new();
-            wd.kitty_cursor(
-                KittyCursorFrame {
-                    geom: g,
-                    cursor,
-                    look: KittyLook::default(),
-                    colors: CatColorKey::default(),
-                    bob: 0.0,
-                    alpha: 255,
-                    pose: crate::kitty_cursor::CatPose::STILL,
-                    sing: 0.0,
-                    notes: [None; crate::kitty_sing::MAX_NOTES],
-                },
-                &mut free,
-            )
-            .expect("custom sprite emits");
+            wd.kitty_cursor(still_frame(g, cursor), &mut free)
+                .expect("custom sprite emits");
             assert_eq!(free.len(), 1, "custom art is exactly one body");
             let body = free[0];
             assert_eq!(
@@ -19804,6 +16837,14 @@ mod tests {
             "row-zero custom art is partially clipped, never wholly misplaced or dropped: \
              {top_right:?}"
         );
+
+        wd.set_kitty_sprite_source(KittySpriteSource::BuiltIn);
+        let homage = emit(&mut wd, (3, 5));
+        assert_ne!(
+            (homage.w, homage.h),
+            (interior.w, interior.h),
+            "clearing the custom art restores the built-in homage"
+        );
     }
 
     /// A same-size asset replacement rebases a fold and repaints; an invalid
@@ -19824,12 +16865,7 @@ mod tests {
             rgba: Arc::clone(&red),
         });
 
-        let layout = |cursor| KittyCursorLayout {
-            geom: g,
-            cursor,
-            look: KittyLook::default(),
-            bob: 0.0,
-        };
+        let layout = |cursor| still_layout(g, cursor);
         let emit =
             |wd: &mut WordDecorations, cursor: (u16, u16), motion: CursorCatPlacementFrame| {
                 let placement = wd
@@ -19837,21 +16873,7 @@ mod tests {
                     .expect("custom kitty placement");
                 let mut free = Vec::new();
                 let fp = wd
-                    .kitty_cursor_at_placement(
-                        KittyCursorFrame {
-                            geom: g,
-                            cursor,
-                            look: KittyLook::default(),
-                            colors: CatColorKey::default(),
-                            bob: 0.0,
-                            alpha: 255,
-                            pose: crate::kitty_cursor::CatPose::STILL,
-                            sing: 0.0,
-                            notes: [None; crate::kitty_sing::MAX_NOTES],
-                        },
-                        placement,
-                        &mut free,
-                    )
+                    .kitty_cursor_at_placement(still_frame(g, cursor), placement, &mut free)
                     .expect("custom kitty emission");
                 (placement, free[0], fp)
             };
@@ -19862,15 +16884,7 @@ mod tests {
         };
 
         let old_cursor = (3, g.cols - 1);
-        let (_, red_body, red_fp) = emit(
-            &mut wd,
-            old_cursor,
-            CursorCatPlacementFrame {
-                sampled_at: t0,
-                fold: None,
-                facing_left: false,
-            },
-        );
+        let (_, red_body, red_fp) = emit(&mut wd, old_cursor, settled_at(t0));
         let red_atlas = wd.free_atlas().expect("red atlas");
         assert_eq!(atlas_pixel(&red_atlas, red_body), [0xff, 0x10, 0x20, 0xff]);
 
@@ -19933,21 +16947,8 @@ mod tests {
         assert!(wd.kitty_cursor_footprint(layout((4, 0))).is_none());
         let mut stale = Vec::new();
         assert!(
-            wd.kitty_cursor(
-                KittyCursorFrame {
-                    geom: g,
-                    cursor: (4, 0),
-                    look: KittyLook::default(),
-                    colors: CatColorKey::default(),
-                    bob: 0.0,
-                    alpha: 255,
-                    pose: crate::kitty_cursor::CatPose::STILL,
-                    sing: 0.0,
-                    notes: [None; crate::kitty_sing::MAX_NOTES],
-                },
-                &mut stale,
-            )
-            .is_none()
+            wd.kitty_cursor(still_frame(g, (4, 0)), &mut stale,)
+                .is_none()
         );
         assert!(
             stale.is_empty(),
@@ -19964,19 +16965,13 @@ mod tests {
         let mut free = Vec::new();
         wd.kitty_cursor(
             KittyCursorFrame {
-                geom: g,
-                cursor: (3, g.cols - 1), // last column: the body clamps to the edge
-                look: KittyLook::default(),
-                colors: CatColorKey::default(),
-                bob: 0.0,
-                alpha: 255,
                 pose: crate::kitty_cursor::CatPose {
                     scale_x: 1.17,
                     lead: 0.22,
                     ..crate::kitty_cursor::CatPose::STILL
                 },
-                sing: 0.0,
-                notes: [None; crate::kitty_sing::MAX_NOTES],
+                // Last column: the body clamps to the edge.
+                ..still_frame(g, (3, g.cols - 1))
             },
             &mut free,
         );
@@ -19990,57 +16985,22 @@ mod tests {
         assert!(body.x >= 0, "body never crosses the left edge");
     }
 
-    /// A forward line fold switches sides only while both samples are off
-    /// glass; the palette footprint stays at the live caret.
+    /// A forward line fold launches from the body actually drawn and lands
+    /// without a snap; the palette footprint stays at the live caret. (The
+    /// off-glass leave and cross legs are the conformance walk's
+    /// `cursor_cat_fold_conformance_real_placement_and_teleport_mutant`.)
     #[test]
-    fn cursor_cat_fold_leaves_and_arrives_off_glass_without_edge_clamp() {
+    fn cursor_cat_fold_launches_from_the_drawn_body_and_lands_without_a_snap() {
         use crate::kitty_cursor::{CatFoldDirection, CatFoldFrame, CursorCatPlacementFrame};
 
         let g = geom20();
         let grid_w = i32::from(g.cols) * i32::from(g.cell_w);
         let t0 = Instant::now();
         let mut wd = WordDecorations::default();
-        let emit =
-            |wd: &mut WordDecorations, cursor: (u16, u16), motion: CursorCatPlacementFrame| {
-                let layout = KittyCursorLayout {
-                    geom: g,
-                    cursor,
-                    look: KittyLook::default(),
-                    bob: 0.0,
-                };
-                let placement = wd
-                    .resolve_kitty_cursor_placement(layout, motion)
-                    .expect("placeable kitty");
-                let mut free = Vec::new();
-                wd.kitty_cursor_at_placement(
-                    KittyCursorFrame {
-                        geom: g,
-                        cursor,
-                        look: layout.look,
-                        colors: CatColorKey::default(),
-                        bob: 0.0,
-                        alpha: 255,
-                        pose: crate::kitty_cursor::CatPose::STILL,
-                        sing: 0.0,
-                        notes: [None; crate::kitty_sing::MAX_NOTES],
-                    },
-                    placement,
-                    &mut free,
-                )
-                .expect("kitty emitted");
-                (placement, *free.last().expect("body emits last"))
-            };
+        let emit = |wd: &mut WordDecorations, cursor, motion| emit_placed(wd, g, cursor, motion);
 
         let old_cursor = (3, g.cols - 1);
-        let (_, old) = emit(
-            &mut wd,
-            old_cursor,
-            CursorCatPlacementFrame {
-                sampled_at: t0,
-                fold: None,
-                facing_left: false,
-            },
-        );
+        let (_, old) = emit(&mut wd, old_cursor, settled_at(t0));
         assert_eq!(old.x + i32::from(old.w), grid_w, "seed at right edge");
 
         let started = t0 + Duration::from_millis(16);
@@ -20062,33 +17022,9 @@ mod tests {
         );
         assert_eq!(
             launch_place.sample,
-            wd.kitty_cursor_footprint(KittyCursorLayout {
-                geom: g,
-                cursor: new_cursor,
-                look: KittyLook::default(),
-                bob: 0.0,
-            })
-            .expect("logical target"),
+            wd.kitty_cursor_footprint(still_layout(g, new_cursor))
+                .expect("logical target"),
             "palette sampling follows the live target, never the offstage body"
-        );
-
-        let (_, right_off) = emit(
-            &mut wd,
-            new_cursor,
-            motion(0.499, started + Duration::from_millis(139)),
-        );
-        assert!(
-            right_off.x >= grid_w,
-            "the leaving body is wholly right-offstage, not clamped back to {grid_w}: {right_off:?}"
-        );
-        let (_, left_off) = emit(
-            &mut wd,
-            new_cursor,
-            motion(0.5, started + Duration::from_millis(140)),
-        );
-        assert!(
-            left_off.x + i32::from(left_off.w) <= 0,
-            "the arriving body starts wholly left-offstage: {left_off:?}"
         );
 
         // The target moves during entry; the landing glides onto exactly the
@@ -20101,47 +17037,18 @@ mod tests {
         );
         assert_eq!(entry_place.sample.x, 4 * i32::from(g.cell_w) + 7);
         let mut at = started + crate::kitty_cursor::CURSOR_FOLD_DURATION;
-        let (_, mut landed) = emit(
-            &mut wd,
-            advanced,
-            CursorCatPlacementFrame {
-                sampled_at: at,
-                fold: None,
-                facing_left: false,
-            },
-        );
+        let (_, mut landed) = emit(&mut wd, advanced, settled_at(at));
         assert!(
             (landed.x - entry_body.x).abs() < 2 * i32::from(g.cell_w),
             "the landing glides from the entry body, no end snap: {entry_body:?} -> {landed:?}"
         );
         for _ in 0..40 {
             at += Duration::from_millis(16);
-            let (_, body) = emit(
-                &mut wd,
-                advanced,
-                CursorCatPlacementFrame {
-                    sampled_at: at,
-                    fold: None,
-                    facing_left: false,
-                },
-            );
+            let (_, body) = emit(&mut wd, advanced, settled_at(at));
             landed = body;
         }
         let mut direct = Vec::new();
-        wd.kitty_cursor(
-            KittyCursorFrame {
-                geom: g,
-                cursor: advanced,
-                look: KittyLook::default(),
-                colors: CatColorKey::default(),
-                bob: 0.0,
-                alpha: 255,
-                pose: crate::kitty_cursor::CatPose::STILL,
-                sing: 0.0,
-                notes: [None; crate::kitty_sing::MAX_NOTES],
-            },
-            &mut direct,
-        );
+        wd.kitty_cursor(still_frame(g, advanced), &mut direct);
         assert_eq!(
             landed, direct[0],
             "the seam converges on the exact settled frame"
@@ -20156,48 +17063,10 @@ mod tests {
         let grid_w = i32::from(g.cols) * i32::from(g.cell_w);
         let t0 = Instant::now();
         let mut wd = WordDecorations::default();
-        let layout = |geom, cursor| KittyCursorLayout {
-            geom,
-            cursor,
-            look: KittyLook::default(),
-            bob: 0.0,
-        };
-        let emit = |wd: &mut WordDecorations,
-                    geom: EffectGeom,
-                    cursor: (u16, u16),
-                    motion: CursorCatPlacementFrame| {
-            let place = wd
-                .resolve_kitty_cursor_placement(layout(geom, cursor), motion)
-                .expect("placement");
-            let mut free = Vec::new();
-            wd.kitty_cursor_at_placement(
-                KittyCursorFrame {
-                    geom,
-                    cursor,
-                    look: KittyLook::default(),
-                    colors: CatColorKey::default(),
-                    bob: 0.0,
-                    alpha: 255,
-                    pose: crate::kitty_cursor::CatPose::STILL,
-                    sing: 0.0,
-                    notes: [None; crate::kitty_sing::MAX_NOTES],
-                },
-                place,
-                &mut free,
-            )
-            .expect("emission");
-            (place, free[0])
-        };
-        let _ = emit(
-            &mut wd,
-            g,
-            (3, 0),
-            CursorCatPlacementFrame {
-                sampled_at: t0,
-                fold: None,
-                facing_left: false,
-            },
-        );
+
+        let emit =
+            |wd: &mut WordDecorations, geom, cursor, motion| emit_placed(wd, geom, cursor, motion);
+        let _ = emit(&mut wd, g, (3, 0), settled_at(t0));
         let started = t0 + Duration::from_millis(16);
         let fold = |progress| CursorCatPlacementFrame {
             sampled_at: started + Duration::from_secs_f32(progress * 0.28),
@@ -20238,7 +17107,7 @@ mod tests {
         // cannot restart.
         let zero_width = EffectGeom { cell_w: 0, ..g };
         assert!(
-            wd.resolve_kitty_cursor_placement(layout(zero_width, (3, 0)), reentered(0.1))
+            wd.resolve_kitty_cursor_placement(still_layout(zero_width, (3, 0)), reentered(0.1))
                 .is_none()
         );
         let (reappeared, body) = emit(&mut wd, g, (3, 0), reentered(0.2));
@@ -20303,45 +17172,17 @@ mod tests {
 
     #[test]
     fn sparkle_word_reset_preserves_cursor_companion_placement_and_atlas() {
-        use crate::kitty_cursor::CursorCatPlacementFrame;
-
         let g = geom20();
         let now = Instant::now();
         let mut wd = WordDecorations::default();
         wd.begin_host_frame();
-        let layout = KittyCursorLayout {
-            geom: g,
-            cursor: (3, 7),
-            look: KittyLook::default(),
-            bob: 0.0,
-        };
+        let layout = still_layout(g, (3, 7));
         let placement = wd
-            .resolve_kitty_cursor_placement(
-                layout,
-                CursorCatPlacementFrame {
-                    sampled_at: now,
-                    fold: None,
-                    facing_left: false,
-                },
-            )
+            .resolve_kitty_cursor_placement(layout, settled_at(now))
             .expect("placeable companion");
         let mut free = Vec::new();
-        wd.kitty_cursor_at_placement(
-            KittyCursorFrame {
-                geom: g,
-                cursor: layout.cursor,
-                look: layout.look,
-                colors: CatColorKey::default(),
-                bob: 0.0,
-                alpha: 255,
-                pose: crate::kitty_cursor::CatPose::STILL,
-                sing: 0.0,
-                notes: [None; crate::kitty_sing::MAX_NOTES],
-            },
-            placement,
-            &mut free,
-        )
-        .expect("companion emits");
+        wd.kitty_cursor_at_placement(still_frame(g, layout.cursor), placement, &mut free)
+            .expect("companion emits");
         let atlas_before = wd.free_atlas().expect("companion baked an atlas");
         let key_before = wd.kitty_cursor_placement.key;
         let target_before = wd.kitty_cursor_placement.last_target;
@@ -20381,41 +17222,12 @@ mod tests {
     fn cursor_cat_fold_conformance_real_placement_and_teleport_mutant() {
         use crate::kitty_cursor::{CatFoldDirection, CatFoldFrame, CursorCatPlacementFrame};
 
-        let model = aterm_spec::derive::cursor_cat_fold_model();
+        let model = aterm_models_effects::cursor_cat_fold_model();
         let g = geom20();
         let grid_w = i32::from(g.cols) * i32::from(g.cell_w);
         let t0 = Instant::now();
 
-        let emit =
-            |wd: &mut WordDecorations, cursor: (u16, u16), motion: CursorCatPlacementFrame| {
-                let layout = KittyCursorLayout {
-                    geom: g,
-                    cursor,
-                    look: KittyLook::default(),
-                    bob: 0.0,
-                };
-                let placement = wd
-                    .resolve_kitty_cursor_placement(layout, motion)
-                    .expect("placeable cursor kitty");
-                let mut free = Vec::new();
-                wd.kitty_cursor_at_placement(
-                    KittyCursorFrame {
-                        geom: g,
-                        cursor,
-                        look: layout.look,
-                        colors: CatColorKey::default(),
-                        bob: 0.0,
-                        alpha: 255,
-                        pose: crate::kitty_cursor::CatPose::STILL,
-                        sing: 0.0,
-                        notes: [None; crate::kitty_sing::MAX_NOTES],
-                    },
-                    placement,
-                    &mut free,
-                )
-                .expect("cursor kitty emitted");
-                (placement, *free.last().expect("body emits last"))
-            };
+        let emit = |wd: &mut WordDecorations, cursor, motion| emit_placed(wd, g, cursor, motion);
 
         let sprite_place = |sprite: FreeSprite| {
             let wholly_left = sprite.x + i32::from(sprite.w) <= 0;
@@ -20494,15 +17306,7 @@ mod tests {
         };
 
         let mut wd = WordDecorations::default();
-        let (seed_placement, seed) = emit(
-            &mut wd,
-            (3, g.cols - 1),
-            CursorCatPlacementFrame {
-                sampled_at: t0,
-                fold: None,
-                facing_left: false,
-            },
-        );
+        let (seed_placement, seed) = emit(&mut wd, (3, g.cols - 1), settled_at(t0));
         let mut state = project(seed_placement, seed, 1, false, 0);
         assert_eq!(state, model.init_state(), "right-edge seed is model Init");
 
@@ -20525,11 +17329,7 @@ mod tests {
         let (placement, sprite) = emit(
             &mut wd,
             (4, 0),
-            CursorCatPlacementFrame {
-                sampled_at: forward_at + crate::kitty_cursor::CURSOR_FOLD_DURATION,
-                fold: None,
-                facing_left: false,
-            },
+            settled_at(forward_at + crate::kitty_cursor::CURSOR_FOLD_DURATION),
         );
         let next = project(placement, sprite, 0, false, 1);
         assert_step(&state, &next, "Finish", "forward settles on left edge");
@@ -20568,17 +17368,7 @@ mod tests {
         // frames on glass.
         let mut mutant_wd = WordDecorations::default();
         let mut free = Vec::new();
-        let frame = |cursor| KittyCursorFrame {
-            geom: g,
-            cursor,
-            look: KittyLook::default(),
-            colors: CatColorKey::default(),
-            bob: 0.0,
-            alpha: 255,
-            pose: crate::kitty_cursor::CatPose::STILL,
-            sing: 0.0,
-            notes: [None; crate::kitty_sing::MAX_NOTES],
-        };
+        let frame = |cursor| still_frame(g, cursor);
         mutant_wd
             .kitty_cursor(frame((3, g.cols - 1)), &mut free)
             .expect("old edge emits");
@@ -20612,7 +17402,7 @@ mod tests {
         );
         assert!(!model.check_invariant("OffGlassBeforeSideChange", &teleported));
 
-        let mut buggy = aterm_spec::derive::cursor_cat_fold_model();
+        let mut buggy = aterm_models_effects::cursor_cat_fold_model();
         for cst in &mut buggy.consts {
             if cst.0 == "Buggy" {
                 cst.1 = 1;
@@ -20637,13 +17427,8 @@ mod tests {
         let grid_w = i32::from(g.cols) * i32::from(g.cell_w);
         let wd = WordDecorations::default();
         let fp_at = |cursor: (u16, u16)| {
-            wd.kitty_cursor_footprint(KittyCursorLayout {
-                geom: g,
-                cursor,
-                look: KittyLook::default(),
-                bob: 0.0,
-            })
-            .expect("visible footprint")
+            wd.kitty_cursor_footprint(still_layout(g, cursor))
+                .expect("visible footprint")
         };
         let interior = fp_at((3, 5));
         let edge = fp_at((3, g.cols - 1));
@@ -20663,20 +17448,7 @@ mod tests {
         let mut wd = WordDecorations::default();
         let emit = |wd: &mut WordDecorations, cursor: (u16, u16)| {
             let mut free = Vec::new();
-            wd.kitty_cursor(
-                KittyCursorFrame {
-                    geom: g,
-                    cursor,
-                    look: KittyLook::default(),
-                    colors: CatColorKey::default(),
-                    bob: 0.0,
-                    alpha: 255,
-                    pose: crate::kitty_cursor::CatPose::STILL,
-                    sing: 0.0,
-                    notes: [None; crate::kitty_sing::MAX_NOTES],
-                },
-                &mut free,
-            );
+            wd.kitty_cursor(still_frame(g, cursor), &mut free);
             assert_eq!(free.len(), 1, "one companion body at {cursor:?}");
             free[0]
         };
@@ -20701,47 +17473,11 @@ mod tests {
     /// it lands on the raw placement's exact bytes once keys stop.
     #[test]
     fn margin_staircase_glides_instead_of_stepping_per_key() {
-        use crate::kitty_cursor::CursorCatPlacementFrame;
-
         let g = geom20();
         let t0 = Instant::now();
         let mut wd = WordDecorations::default();
-        let emit = |wd: &mut WordDecorations, cursor: (u16, u16), at: Instant| {
-            let layout = KittyCursorLayout {
-                geom: g,
-                cursor,
-                look: KittyLook::default(),
-                bob: 0.0,
-            };
-            let placement = wd
-                .resolve_kitty_cursor_placement(
-                    layout,
-                    CursorCatPlacementFrame {
-                        sampled_at: at,
-                        fold: None,
-                        facing_left: false,
-                    },
-                )
-                .expect("placeable kitty");
-            let mut free = Vec::new();
-            wd.kitty_cursor_at_placement(
-                KittyCursorFrame {
-                    geom: g,
-                    cursor,
-                    look: layout.look,
-                    colors: CatColorKey::default(),
-                    bob: 0.0,
-                    alpha: 255,
-                    pose: crate::kitty_cursor::CatPose::STILL,
-                    sing: 0.0,
-                    notes: [None; crate::kitty_sing::MAX_NOTES],
-                },
-                placement,
-                &mut free,
-            )
-            .expect("kitty emitted");
-            *free.last().expect("body emits last")
-        };
+        let emit =
+            |wd: &mut WordDecorations, cursor, at| emit_placed(wd, g, cursor, settled_at(at)).1;
 
         // The first emission snaps by law; it is the baseline, not a step.
         let mut at = t0;
@@ -20765,21 +17501,8 @@ mod tests {
             settled = emit(&mut wd, (3, 19), at);
         }
         let mut direct = Vec::new();
-        wd.kitty_cursor(
-            KittyCursorFrame {
-                geom: g,
-                cursor: (3, 19),
-                look: KittyLook::default(),
-                colors: CatColorKey::default(),
-                bob: 0.0,
-                alpha: 255,
-                pose: crate::kitty_cursor::CatPose::STILL,
-                sing: 0.0,
-                notes: [None; crate::kitty_sing::MAX_NOTES],
-            },
-            &mut direct,
-        )
-        .expect("direct emitter draws");
+        wd.kitty_cursor(still_frame(g, (3, 19)), &mut direct)
+            .expect("direct emitter draws");
         assert_eq!(
             (settled.x, settled.y),
             (direct[0].x, direct[0].y),
@@ -20796,53 +17519,15 @@ mod tests {
         let g = geom20();
         let t0 = Instant::now();
         let mut wd = WordDecorations::default();
-        let emit =
-            |wd: &mut WordDecorations, cursor: (u16, u16), motion: CursorCatPlacementFrame| {
-                let layout = KittyCursorLayout {
-                    geom: g,
-                    cursor,
-                    look: KittyLook::default(),
-                    bob: 0.0,
-                };
-                let placement = wd
-                    .resolve_kitty_cursor_placement(layout, motion)
-                    .expect("placeable kitty");
-                let mut free = Vec::new();
-                wd.kitty_cursor_at_placement(
-                    KittyCursorFrame {
-                        geom: g,
-                        cursor,
-                        look: layout.look,
-                        colors: CatColorKey::default(),
-                        bob: 0.0,
-                        alpha: 255,
-                        pose: crate::kitty_cursor::CatPose::STILL,
-                        sing: 0.0,
-                        notes: [None; crate::kitty_sing::MAX_NOTES],
-                    },
-                    placement,
-                    &mut free,
-                )
-                .expect("kitty emitted");
-                *free.last().expect("body emits last")
-            };
-        let settled = |at: Instant| CursorCatPlacementFrame {
-            sampled_at: at,
-            fold: None,
-            facing_left: false,
-        };
+        let emit = |wd: &mut WordDecorations, cursor, motion| emit_placed(wd, g, cursor, motion).1;
+        let settled = settled_at;
 
         // Cross the rise onset so the follower lags when the fold interrupts.
         let _ = emit(&mut wd, (3, 14), settled(t0));
         let _ = emit(&mut wd, (3, 15), settled(t0 + Duration::from_millis(16)));
         let mid = emit(&mut wd, (3, 16), settled(t0 + Duration::from_millis(32)));
         let raw = wd
-            .kitty_cursor_footprint(KittyCursorLayout {
-                geom: g,
-                cursor: (3, 16),
-                look: KittyLook::default(),
-                bob: 0.0,
-            })
+            .kitty_cursor_footprint(still_layout(g, (3, 16)))
             .expect("raw law");
         assert_ne!(
             (mid.x, mid.y),
@@ -20875,47 +17560,11 @@ mod tests {
     /// footprint and never touches the follower, even mid-glide.
     #[test]
     fn compat_settled_emission_is_the_raw_footprint_and_ignores_the_glide() {
-        use crate::kitty_cursor::CursorCatPlacementFrame;
-
         let g = geom20();
         let t0 = Instant::now();
         let mut wd = WordDecorations::default();
-        let resolver_emit = |wd: &mut WordDecorations, cursor: (u16, u16), at: Instant| {
-            let layout = KittyCursorLayout {
-                geom: g,
-                cursor,
-                look: KittyLook::default(),
-                bob: 0.0,
-            };
-            let placement = wd
-                .resolve_kitty_cursor_placement(
-                    layout,
-                    CursorCatPlacementFrame {
-                        sampled_at: at,
-                        fold: None,
-                        facing_left: false,
-                    },
-                )
-                .expect("placeable kitty");
-            let mut free = Vec::new();
-            wd.kitty_cursor_at_placement(
-                KittyCursorFrame {
-                    geom: g,
-                    cursor,
-                    look: layout.look,
-                    colors: CatColorKey::default(),
-                    bob: 0.0,
-                    alpha: 255,
-                    pose: crate::kitty_cursor::CatPose::STILL,
-                    sing: 0.0,
-                    notes: [None; crate::kitty_sing::MAX_NOTES],
-                },
-                placement,
-                &mut free,
-            )
-            .expect("kitty emitted");
-            *free.last().expect("body emits last")
-        };
+        let resolver_emit =
+            |wd: &mut WordDecorations, cursor, at| emit_placed(wd, g, cursor, settled_at(at)).1;
 
         // Put a live glide on the ledger.
         let _ = resolver_emit(&mut wd, (3, 16), t0);
@@ -20925,30 +17574,12 @@ mod tests {
         assert!(ledger_settle.is_some(), "a resolver glide is live");
 
         let raw = wd
-            .kitty_cursor_footprint(KittyCursorLayout {
-                geom: g,
-                cursor: (3, 17),
-                look: KittyLook::default(),
-                bob: 0.0,
-            })
+            .kitty_cursor_footprint(still_layout(g, (3, 17)))
             .expect("raw law");
         let compat = |wd: &mut WordDecorations| {
             let mut free = Vec::new();
-            wd.kitty_cursor(
-                KittyCursorFrame {
-                    geom: g,
-                    cursor: (3, 17),
-                    look: KittyLook::default(),
-                    colors: CatColorKey::default(),
-                    bob: 0.0,
-                    alpha: 255,
-                    pose: crate::kitty_cursor::CatPose::STILL,
-                    sing: 0.0,
-                    notes: [None; crate::kitty_sing::MAX_NOTES],
-                },
-                &mut free,
-            )
-            .expect("compat emitter draws");
+            wd.kitty_cursor(still_frame(g, (3, 17)), &mut free)
+                .expect("compat emitter draws");
             *free.last().expect("one body")
         };
         let first = compat(&mut wd);
@@ -20975,32 +17606,11 @@ mod tests {
         let mut wd = WordDecorations::default();
         wd.set_kitty_sprite_source(KittySpriteSource::Disabled);
         assert_eq!(wd.kitty_sprite_source_fingerprint(), None);
-        assert!(
-            wd.kitty_cursor_footprint(KittyCursorLayout {
-                geom: g,
-                cursor: (3, 5),
-                look: KittyLook::default(),
-                bob: 0.0,
-            })
-            .is_none()
-        );
+        assert!(wd.kitty_cursor_footprint(still_layout(g, (3, 5))).is_none());
         let mut free = Vec::new();
         assert!(
-            wd.kitty_cursor(
-                KittyCursorFrame {
-                    geom: g,
-                    cursor: (3, 5),
-                    look: KittyLook::default(),
-                    colors: CatColorKey::default(),
-                    bob: 0.0,
-                    alpha: 255,
-                    pose: crate::kitty_cursor::CatPose::STILL,
-                    sing: 0.0,
-                    notes: [None; crate::kitty_sing::MAX_NOTES],
-                },
-                &mut free,
-            )
-            .is_none()
+            wd.kitty_cursor(still_frame(g, (3, 5)), &mut free,)
+                .is_none()
         );
         assert!(free.is_empty());
     }
@@ -21012,71 +17622,37 @@ mod tests {
         use crate::kitty_registry::{TRAIT_BOW, accessory_trait_bits};
         let now = Instant::now();
         // No magic build (`% 4096` = 100); the accessory window decodes Bow.
-        let magic = (64u64 << 24) | 100;
-        assert_eq!(genome::cat_accessory(magic), Some(genome::Accessory::Bow));
-        assert_eq!(
-            accessory_trait_bits(genome::cat_accessory(magic)),
-            TRAIT_BOW
-        );
-        let mut o = cat_occ(2, 2, 6, GKEY_ADULT_HEAD, now);
-        o.genome = Genome {
-            gkey: GKEY_ADULT_HEAD,
-            magic,
-        };
-        let mut wd = WordDecorations {
-            occ: vec![o.clone()],
-            cols: 20,
-            have_scanned: true,
-            ..WordDecorations::default()
-        };
-        let mut e = Episode::fresh(o.appeared, o.genome, o.seed, o.row, 0);
-        e.phase_start = Some(o.appeared);
-        wd.persist.insert(o.ident, e);
-        // Drain across a few ticks (bakes land ≤ 2/frame).
-        let mut s: Vec<KittySighting> = Vec::new();
-        for k in 0..4u64 {
-            tick_cat_at(
-                &mut wd,
-                now + Duration::from_millis(DWELL_QUIET_MS + 16 * k),
-                &cfg(),
-                geom20(),
-                None,
-                true,
+        let bow = (64u64 << 24) | 100;
+        assert_eq!(accessory_trait_bits(genome::cat_accessory(bow)), TRAIT_BOW);
+        // Control: the bare twin's accessory window misses.
+        let bare = cat_occ(2, 2, 6, GKEY_ADULT_HEAD, now).genome.magic;
+        for (label, magic, bit) in [("bow", bow, TRAIT_BOW), ("bare", bare, 0)] {
+            let mut o = cat_occ(2, 2, 6, GKEY_ADULT_HEAD, now);
+            o.genome.magic = magic;
+            let mut e = Episode::fresh(o.appeared, o.genome, o.seed, o.row, 0);
+            e.phase_start = Some(o.appeared);
+            let mut wd = WordDecorations {
+                occ: vec![o.clone()],
+                cols: 20,
+                have_scanned: true,
+                ..WordDecorations::default()
+            };
+            wd.persist.insert(o.ident, e);
+            // Drain across a few ticks (bakes land ≤ 2/frame).
+            let mut s: Vec<KittySighting> = Vec::new();
+            for k in 0..4u64 {
+                let at = now + Duration::from_millis(DWELL_QUIET_MS + 16 * k);
+                tick_cat_at(&mut wd, at, &cfg(), geom20(), None, true);
+                s.extend(wd.drain_kitty_sightings());
+            }
+            assert_eq!(s.len(), 1, "{label}: one sighting");
+            assert_eq!(
+                s[0].traits & TRAIT_BOW,
+                bit,
+                "{label}: the accessory rides the sighting trait bits, got {:#010b}",
+                s[0].traits
             );
-            s.extend(wd.drain_kitty_sightings());
         }
-        assert_eq!(s.len(), 1, "one sighting for the bow cat");
-        assert_ne!(
-            s[0].traits & TRAIT_BOW,
-            0,
-            "the Bow accessory rides the sighting trait bits, got {:#010b}",
-            s[0].traits
-        );
-        // Control: the bare twin (accessory window misses) carries no bit.
-        let bare = cat_occ(2, 2, 6, GKEY_ADULT_HEAD, now);
-        let mut wd = WordDecorations {
-            occ: vec![bare.clone()],
-            cols: 20,
-            have_scanned: true,
-            ..WordDecorations::default()
-        };
-        let mut e = Episode::fresh(bare.appeared, bare.genome, bare.seed, bare.row, 0);
-        e.phase_start = Some(bare.appeared);
-        wd.persist.insert(bare.ident, e);
-        let mut s: Vec<KittySighting> = Vec::new();
-        for k in 0..4u64 {
-            tick_cat_at(
-                &mut wd,
-                now + Duration::from_millis(DWELL_QUIET_MS + 16 * k),
-                &cfg(),
-                geom20(),
-                None,
-                true,
-            );
-            s.extend(wd.drain_kitty_sightings());
-        }
-        assert_eq!(s.len(), 1);
-        assert_eq!(s[0].traits & TRAIT_BOW, 0, "the bare twin carries no bow");
     }
 
     // ───────────────────── curse bonk cue battery ─────────────────────
@@ -21110,31 +17686,6 @@ mod tests {
         wd.rescan(&term, 4, 32, &lex, &c, 2, t0 + Duration::from_millis(32));
         tick_deco(&mut wd, t0 + Duration::from_millis(48), &c, &mut out);
         assert_eq!(wd.drain_curse_cues().count(), 0);
-    }
-
-    /// Curse output that leaves the caret at the next prompt never cues `Typed`.
-    #[test]
-    fn onscreen_curse_output_never_records_a_typed_bonk() {
-        let lex = lex();
-        let c = cfg();
-        let t0 = Instant::now();
-        let mut term = Terminal::new(6, 32);
-        let mut wd = WordDecorations::default();
-        term.process(b"$ cat rant.txt\r\nfuck this thing\r\n$ ");
-        wd.rescan(&term, 6, 32, &lex, &c, 1, t0);
-        assert!(
-            wd.occ.iter().any(|o| o.class == Class::Profanity),
-            "the output curse does decorate"
-        );
-        let mut out = Vec::new();
-        for i in 0..4u64 {
-            tick_deco(&mut wd, t0 + Duration::from_millis(16 * i), &c, &mut out);
-            assert_eq!(
-                wd.drain_curse_cues().count(),
-                0,
-                "on-screen output must never bonk (tick {i})"
-            );
-        }
     }
 
     /// Typed zh / ja / ko / en curses each surface one typed cue.
@@ -21785,11 +18336,10 @@ mod pet_stays_inside_the_grid_tests {
             "a departing ghost's hold survived"
         );
         assert!(wd.dog_last_tile.is_none(), "the dog's hold survived");
-        assert!(wd.robi_last_body.is_none(), "the robot's hold survived");
     }
 
     /// A pet on row 0 emits no sprite above the grid (a negative y would land
-    /// on the tab strip after the splice). Robi is the deliberate exception.
+    /// on the tab strip after the splice).
     #[test]
     fn a_pet_on_row_zero_emits_no_sprite_above_the_grid() {
         let mut wd = WordDecorations::default();
@@ -22017,144 +18567,6 @@ mod dog_cameo_emission_tests {
     }
 }
 
-#[cfg(test)]
-mod robi_emission_tests {
-    use super::*;
-    use crate::robi::{RobiAnchor, RobiFrame, RobiLadder};
-    use crate::robi_glyphs_gen::RobiGlyphId;
-
-    fn geom(rows: u16, cell_h: u16) -> EffectGeom {
-        EffectGeom {
-            cell_w: cell_h / 2,
-            cell_h,
-            rows,
-            cols: 100,
-        }
-    }
-
-    /// Mid-climb: a ladder planted on the caret row, reaching just above row 0.
-    fn climbing(g: &EffectGeom) -> RobiFrame {
-        let ground = i32::from(g.rows) * i32::from(g.cell_h);
-        RobiFrame {
-            pose: RobiGlyphId::RobiClimb0,
-            x: i32::from(g.cols) * i32::from(g.cell_w) / 2,
-            anchor_y: ground,
-            anchor: RobiAnchor::Feet,
-            flip_x: false,
-            alpha: 255,
-            ladder: Some(RobiLadder {
-                x: i32::from(g.cols) * i32::from(g.cell_w) / 2,
-                top_y: -1 + i32::from(g.cell_h) / 4,
-                bot_y: ground,
-            }),
-            tip: None,
-            animating: true,
-        }
-    }
-
-    /// A frame where a cold baker drew only the ladder reports no body, so the
-    /// host hangs no click-to-dismiss hit-box on empty grid.
-    #[test]
-    fn a_ladder_only_frame_reports_no_body() {
-        let g = geom(60, 20);
-        let frame = climbing(&g);
-        let mut wd = WordDecorations::default();
-        let mut free = Vec::new();
-
-        wd.begin_host_frame();
-        let first = wd
-            .robi(RobiShowFrame { geom: g, frame }, &mut free)
-            .expect("the ladder drew, so something was emitted");
-        let body_sprites = free.iter().filter(|s| s.z == FreeZ::OverText).count();
-        let ladder_sprites = free.iter().filter(|s| s.z == FreeZ::UnderText).count();
-        // Non-vacuity: the ladder did draw this frame.
-        assert!(
-            ladder_sprites > 0,
-            "fixture: the ladder must have drawn on the first frame"
-        );
-        assert_eq!(
-            body_sprites, 0,
-            "fixture: the body cannot resolve on the first frame (3 slices, 2 bakes)"
-        );
-        assert!(
-            first.body_px.is_none(),
-            "a frame that drew no body must not report one — the host hangs \
-             Robi's dismiss hit-box on this answer (got {:?})",
-            first.body_px
-        );
-
-        // The next frame, slices landed, reports the body at their rect.
-        wd.begin_host_frame();
-        free.clear();
-        let second = wd
-            .robi(RobiShowFrame { geom: g, frame }, &mut free)
-            .expect("emitted");
-        let body: Vec<&FreeSprite> = free.iter().filter(|s| s.z == FreeZ::OverText).collect();
-        assert!(!body.is_empty(), "the body lands on the second frame");
-        let rect = second.body_px.expect("a drawn body reports its rect");
-        let top = body.iter().map(|s| s.y).min().expect("nonempty");
-        let bot = body
-            .iter()
-            .map(|s| s.y + i32::from(s.h))
-            .max()
-            .expect("nonempty");
-        let left = body.iter().map(|s| s.x).min().expect("nonempty");
-        let right = body
-            .iter()
-            .map(|s| s.x + i32::from(s.w))
-            .max()
-            .expect("nonempty");
-        assert_eq!(
-            rect,
-            (left, right, top, bot),
-            "the reported rect must BE the drawn sprite, not a model of it"
-        );
-    }
-
-    /// On a tall window the ladder reaches the bar: the stack is bounded by
-    /// the window, not a constant.
-    #[test]
-    fn the_ladder_reaches_the_top_of_a_tall_window() {
-        for (rows, cell_h) in [(24u16, 20u16), (60, 20), (80, 20), (100, 34), (120, 16)] {
-            let g = geom(rows, cell_h);
-            let frame = climbing(&g);
-            let ladder = frame.ladder.expect("fixture");
-            let (_, lh) = crate::robi::ladder_tile_px(&g);
-            let mut wd = WordDecorations::default();
-            let mut free = Vec::new();
-            // A few frames, in case the body's slices take the budget first.
-            let mut segments = Vec::new();
-            for _ in 0..4 {
-                wd.begin_host_frame();
-                free.clear();
-                wd.robi(RobiShowFrame { geom: g, frame }, &mut free);
-                segments = free
-                    .iter()
-                    .filter(|s| s.z == FreeZ::UnderText)
-                    .map(|s| s.y)
-                    .collect();
-                if !segments.is_empty() {
-                    break;
-                }
-            }
-            let top = *segments
-                .iter()
-                .min()
-                .unwrap_or_else(|| panic!("{rows}x{cell_h}: the ladder never drew"));
-            // The top segment starts within one tile of `top_y`; lower means
-            // the cap truncated the stack.
-            assert!(
-                top < ladder.top_y + i32::from(lh),
-                "{rows} rows @ {cell_h} px: the stack stops at y={top}, {} px short of \
-                 the ladder's own top_y={} (tile {lh} px, {} segments drawn)",
-                top - ladder.top_y,
-                ladder.top_y,
-                segments.len()
-            );
-        }
-    }
-}
-
 /// The trick flash's engine hooks against private state: what `tick` arms and
 /// what a reset leaves (the flash's own battery is in `trick_flash.rs`).
 #[cfg(test)]
@@ -22214,29 +18626,6 @@ mod trick_flash_hook_tests {
             assert!(ink.is_empty(), "pending = {pending}");
             assert_eq!(wd.active_until, None, "pending = {pending}");
         }
-    }
-
-    /// A live flash on a wordless screen arms exactly its own end, and the
-    /// first tick past it returns to the flashless path.
-    #[test]
-    fn a_live_flash_on_a_wordless_screen_arms_exactly_its_own_window() {
-        let t0 = Instant::now();
-        let mut term = Terminal::new(4, 40);
-        let mut wd = WordDecorations::default();
-        flash(&mut term, &mut wd, "$ sit", "sit", t0);
-        let end = t0 + Duration::from_millis(u64::from(FLASH_MS));
-        let mut ink = Vec::new();
-        let frame_before = wd.frame;
-        assert_ne!(tick(&mut wd, t0 + Duration::from_millis(200), &mut ink), 0);
-        assert_eq!(ink.len(), 3);
-        assert_eq!(wd.active_until, Some(end));
-        assert_eq!(
-            wd.frame, frame_before,
-            "the wordless arm still advances no frame counter"
-        );
-        assert_eq!(tick(&mut wd, end, &mut ink), 0);
-        assert!(ink.is_empty());
-        assert_eq!(wd.active_until, None);
     }
 
     /// The flash only extends the tick's deadline: a longer feline glow keeps

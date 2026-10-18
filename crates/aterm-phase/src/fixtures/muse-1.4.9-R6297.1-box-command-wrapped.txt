@@ -1,0 +1,16 @@
+# muse 1.4.9-R6297.1 · MEASURED 2026-10-16, `aterm ctl text --json` of a private headless aterm 120x40 (aterm 0.105.0 80b670745), the atpkg-managed muse (Meta latest) launched through its shim with a scratch HOME, `--base-url` at a local scripted stand-in for Meta's Responses endpoint (`--model fake-1`, a dummy META_API_KEY: no login and no model; the stand-in returns the tool call that raises the box, the box is muse's own), harness off · the command box with a long command: its second row continues four columns in (`    do printf …`) · cursor=2,11 (hidden) · scratch path redacted at equal length
+❯ LONGCMD please
+
+◇ Calling tools (2s · esc to interrupt)
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────
+Would you like to run the following command?
+
+  $ for f in alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon;
+    do printf "%s\n" "$f" >> muse-long-marker.txt; done && wc -l muse-long-marker.txt
+
+⟩ 1. Yes, proceed (y)
+  2. No, and tell Muse Code what to do differently (esc)
+Change approval defaults in /permissions
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  fake-1 · high · /private/tmp/at.XXXXXX/mwork · Auto-review

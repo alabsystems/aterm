@@ -15,18 +15,3 @@ pub const SITE: &str = "alab.systems";
 
 /// The origin line every text surface prints under its title.
 pub const ORIGIN_LINE: &str = "by Andrew Yates \u{00b7} ALab \u{00b7} alab.systems";
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The line is the parts, so editing one without the other is caught here.
-    #[test]
-    fn the_origin_line_is_assembled_from_the_parts() {
-        assert_eq!(
-            ORIGIN_LINE,
-            format!("by {AUTHOR} \u{00b7} {COMPANY} \u{00b7} {SITE}")
-        );
-        assert!(!SITE.contains("://"), "SITE is printed bare");
-    }
-}

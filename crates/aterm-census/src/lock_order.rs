@@ -155,7 +155,7 @@ pub const LOCK_PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits 
         fn implements. The interior is listed with its audit note and keeps a
         unique per-site node (edges reported, never able to close a cycle).
       - VENDORED-IDENTITY MODE: the vendored [patch] crates that link into the
-        GUI process (REVIEWED_VENDORED_CRATES) are scanned with every identity
+        GUI process (vendor/forge.toml [[fork]]) are scanned with every identity
         in a per-crate namespace (`winit::…`), so a foreign receiver name can
         never merge with an aterm identity or another vendored crate's. The
         namespace is carried by the fn TABLE as well as by the identities, so a
@@ -222,6 +222,15 @@ struct GuardHelper {
 
 const GUARD_HELPERS: &[GuardHelper] = &[
     GuardHelper {
+        // The crash restore's heap region (`VecStore`, the tests' and benches' store,
+        // and the window's when it has no shared mapping): returns the guard of the one
+        // mutex over its bytes, which every copy and word access takes. Named
+        // `lock_bytes` because a bare `bytes(` is every buffer's accessor.
+        symbol: "lock_bytes",
+        identity: "bytes",
+        def_file: "crates/aterm-restore/src/store.rs",
+    },
+    GuardHelper {
         symbol: "term_lock",
         identity: "term",
         // The windowed terminal lives in the library so the single `aterm`
@@ -251,6 +260,13 @@ const GUARD_HELPERS: &[GuardHelper] = &[
         symbol: "keeper_state",
         identity: "KEEPER_STATE",
         def_file: "crates/aterm-gui/src/keeper_link.rs",
+    },
+    GuardHelper {
+        // The disk watch's episode state is returned to its callers. They
+        // release it before logging, journal writes or host callbacks.
+        symbol: "disk_episode",
+        identity: "DISK_EPISODE",
+        def_file: "crates/aterm-gui/src/harness_host.rs",
     },
     GuardHelper {
         symbol: "lock_fonts",
@@ -286,20 +302,6 @@ const GUARD_HELPERS: &[GuardHelper] = &[
         symbol: "narrow_sessions_lock",
         identity: "NARROW_SESSIONS",
         def_file: "crates/aterm-gui/src/control_query.rs",
-    },
-    GuardHelper {
-        // Operator claims/management hold the host authority gate across
-        // their durable queue transition; callers get the guard from here.
-        symbol: "accepting_guard",
-        identity: "fleet_fault",
-        def_file: "crates/aterm-gui/src/operator_host.rs",
-    },
-    GuardHelper {
-        // Cleanup/reconciliation uses the same host authority gate through a
-        // distinct policy helper; it is the same lock identity, not a waiver.
-        symbol: "mutation_guard",
-        identity: "fleet_fault",
-        def_file: "crates/aterm-gui/src/operator_host.rs",
     },
     GuardHelper {
         // `fabric attach`'s supervisor latch. `supervise` has no stop handle,
@@ -3001,7 +3003,8 @@ mod tests {
     /// and aterm-types) because a `GUARD_HELPERS` entry is registered in them:
     /// the registry's interior check reads the scanned corpus. Every synthetic
     /// tree composing its own manifest set must splice these in.
-    const SYNTH_HELPER_CRATES: &[(&str, &str)] = &[("aterm-log", ""), ("atpkg", "")];
+    const SYNTH_HELPER_CRATES: &[(&str, &str)] =
+        &[("aterm-log", ""), ("atpkg", ""), ("aterm-restore", "")];
 
     /// Every registered helper and vocabulary interior at its `def_file`, its
     /// acquisition spelled as the shipping one is, so the registry checks hold.
@@ -3033,9 +3036,21 @@ mod tests {
                 .to_string(),
         ));
         files.push((
+            "crates/aterm-gui/src/harness_host.rs".to_string(),
+            "fn disk_episode() -> std::sync::MutexGuard<'static, DiskEpisode> {\n    \
+             DISK_EPISODE.lock().unwrap_or_else(PoisonError::into_inner)\n}\n"
+                .to_string(),
+        ));
+        files.push((
             "crates/aterm-gui/src/keeper_link.rs".to_string(),
             "fn keeper_state() -> std::sync::MutexGuard<'static, State> {\n    \
              KEEPER_STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)\n}\n"
+                .to_string(),
+        ));
+        files.push((
+            "crates/aterm-gui/src/harness_host.rs".to_string(),
+            "fn disk_episode() -> std::sync::MutexGuard<'static, DiskEpisode> {\n    \
+             DISK_EPISODE.lock().unwrap_or_else(PoisonError::into_inner)\n}\n"
                 .to_string(),
         ));
         files.push((
@@ -3050,14 +3065,6 @@ mod tests {
              SEARCH_SNAPSHOTS.lock().unwrap()\n}\n\
              fn narrow_sessions_lock() -> MutexGuard<'static, VecDeque<NarrowSession>> {\n    \
              NARROW_SESSIONS.lock().unwrap_or_else(PoisonError::into_inner)\n}\n"
-                .to_string(),
-        ));
-        files.push((
-            "crates/aterm-gui/src/operator_host.rs".to_string(),
-            "fn accepting_guard(&self) -> MutexGuard<'_, HostActuationGate> {\n    \
-             self.shared.fleet_fault.lock().unwrap()\n}\n\
-             fn mutation_guard(&self) -> MutexGuard<'_, HostActuationGate> {\n    \
-             self.shared.fleet_fault.lock().unwrap()\n}\n"
                 .to_string(),
         ));
         files.push((
@@ -3086,6 +3093,13 @@ mod tests {
              let posting = self.posting.lock().unwrap_or_else(|e| e.into_inner());\n        \
              if self.is_open() { Err(()) } else { Ok(posting) }\n    \
              }\n}\n"
+                .to_string(),
+        ));
+        files.push((
+            "crates/aterm-restore/src/store.rs".to_string(),
+            "impl VecStore {\n    \
+             fn lock_bytes(&self) -> MutexGuard<'_, Vec<u8>> {\n        \
+             self.bytes.lock().unwrap_or_else(PoisonError::into_inner)\n    }\n}\n"
                 .to_string(),
         ));
         files.push((

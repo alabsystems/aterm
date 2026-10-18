@@ -199,6 +199,14 @@ pub trait ReleaseHost {
         Duration::ZERO
     }
 
+    /// Whether this identity reads with no credential: no token file, so `gh` has nothing
+    /// to read the API with on a keyless builder. Then the channel head is found and
+    /// fetched on the anonymous download host, as a client finds it
+    /// ([`crate::quad::head_build`]).
+    fn reads_anonymously(&self) -> bool {
+        false
+    }
+
     /// Bring the scratch clone `dir` of `slug` up to date as this identity: every branch
     /// into `refs/remotes/origin/*`, and the tags. A clone's own `origin` is never fetched
     /// by name, because git would authenticate with whatever credential is ambient.

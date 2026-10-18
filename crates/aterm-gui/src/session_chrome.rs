@@ -26,8 +26,10 @@
 //! [`tab_menu_chrome_line`] mirror (read off the live strip) is provably the
 //! same items a human sees, because there is exactly one place items are made.
 //!
-//! PURE by construction — no locks, no AppKit, no clocks (ages arrive as
-//! `age_ms` deltas; the `~`-abbreviation takes an EXPLICIT `home` like
+//! PURE by construction — no locks, no AppKit, no clocks (a timeline row
+//! carries its event's stamp and is aged against an EXPLICIT `now_ms` where a
+//! surface shows it, [`TabMenuEntry::shown_at`]; the `~`-abbreviation takes
+//! an EXPLICIT `home` like
 //! [`crate::app_tabs::home_relative_suffix`], which it reuses) — so every
 //! ordering/truncation/degradation rule is unit-proved headlessly, on every
 //! platform. The impure work (leaf-lock reads, epoch caching) lives in
@@ -183,16 +185,17 @@ pub(crate) struct ConnectionFact {
 }
 
 /// One timeline event as the chrome shows it: the kind token (printed in a
-/// person's words, [`event_words`]) plus its age at compose time. The payload
-/// is deliberately NOT shown — hover chrome is a
-/// pulse ("what happened lately"), the `timeline` verb is the detail.
+/// person's words, [`event_words`]) plus when it happened. The payload is
+/// deliberately NOT shown — hover chrome is a pulse ("what happened
+/// lately"), the `timeline` verb is the detail.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TimelineNote {
     /// The event kind token (`spawned`, `cwd-change`, `meta-change`, …).
     pub kind: &'static str,
-    /// Milliseconds since the event, on the same monotonic clock it was
-    /// recorded with ([`crate::turn_ledger::now_ms`]).
-    pub age_ms: u64,
+    /// When the event was recorded, on its own monotonic clock
+    /// ([`crate::turn_ledger::now_ms`]): the menu row carries it and is aged
+    /// where it is shown ([`TabMenuEntry::Event`]).
+    pub at_ms: u64,
 }
 
 /// One entry of the composed context menu — the platform-neutral MODEL the
@@ -204,8 +207,17 @@ pub(crate) struct TimelineNote {
 /// serialization's flat `items=[…]` contract and the NSMenu render loop.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TabMenuEntry {
-    /// A disabled, informational row (identity / timeline / connection lines).
+    /// A disabled, informational row (identity / connection lines).
     Header(String),
+    /// A disabled timeline row: its event in a person's words and when it
+    /// happened ([`crate::turn_ledger::now_ms`]'s clock). Its age is the
+    /// surface's to read, AS IT SHOWS THE ROW ([`Self::shown_at`]: `changed
+    /// directory · 2m ago`) — the native menu as it pops, the in-grid card
+    /// as it opens, the `chrome` verb's mirror as it is read — so a
+    /// composition is the same at every instant and the clock never wakes the
+    /// loop to recompose a closed menu (the Together run, 2026-10-16: a timer
+    /// wake every 30 s per tab re-deriving ages nobody was reading).
+    Event { words: String, at_ms: u64 },
     /// A native separator.
     Separator,
     /// A live command row: `action`'s tag is what the `NSMenuItem` carries, so
@@ -306,17 +318,21 @@ pub(crate) struct CachedChrome {
     /// (`upgrade_host::UpgradeView::revision`): the harness host's rows move
     /// none of the other epochs, and the menu's upgrade words are theirs.
     pub upgrade_revision: u64,
-    /// [`crate::turn_ledger::now_ms`] at compose time — bounds staleness of
-    /// the coarse relative ages.
-    pub composed_ms: u64,
+    /// When the clock may move this composition with no input epoch moving
+    /// ([`clock_expiry_ms`], from [`crate::turn_ledger::now_ms`] at compose
+    /// time): the instant the scheduler recomposes it, or `None` when nothing
+    /// it says moves with the clock — no wake.
+    pub expires_ms: Option<u64>,
     /// The composed extension handed to the native strip.
     pub ext: TabChromeExt,
 }
 
-/// How long a cached composition may serve before the coarse relative ages are
-/// re-derived even with unchanged inputs. The event loop arms the earliest
-/// cache expiry and drains due entries in bounded batches, so this bounds age
-/// drift without per-frame work.
+/// How long a cached composition the clock moves (an upgrade's words) may
+/// serve before it is re-derived with unchanged inputs. The event loop arms
+/// the earliest cache expiry ([`CachedChrome::expires_ms`],
+/// [`clock_expiry_ms`]) and drains due entries in bounded batches, so this
+/// bounds their drift without per-frame work — and a composition the clock
+/// cannot move arms nothing.
 pub(crate) const CACHE_MAX_AGE_MS: u64 = 30_000;
 
 /// Maximum real window inspections/toolbar refreshes performed by the expiry
@@ -334,18 +350,33 @@ pub(crate) struct ExpiryProgress {
     pub(crate) completed_session: Option<u64>,
 }
 
+/// THE CLOCK'S PART IN A COMPOSITION: when the one composed at `composed_ms`
+/// from `input` may read differently though no input epoch moves, or `None`
+/// when it never does. The timeline rows' ages are no part of it: a row
+/// carries its event's stamp and is aged where it is shown
+/// ([`TabMenuEntry::Event`]). What is left is the upgrade's words
+/// (`upgrade_host::UpgradeView::menu_for` reads them against the clock: a
+/// stall, a deferral running out), re-derived every [`CACHE_MAX_AGE_MS`]
+/// while a tab has one. A tab with none arms no wake: a quiet desktop's
+/// tabs, on screen or not, cost the event loop nothing (the Together run,
+/// 2026-10-16, measured one timer wake every 30 s per tab recomposing a
+/// closed menu's ages).
 #[must_use]
-fn cache_expiry_ms(cache: &CachedChrome) -> u64 {
-    cache.composed_ms.saturating_add(CACHE_MAX_AGE_MS)
+pub(crate) fn clock_expiry_ms(composed_ms: u64, input: &SessionChromeInput) -> Option<u64> {
+    input
+        .upgrade
+        .is_some()
+        .then(|| composed_ms.saturating_add(CACHE_MAX_AGE_MS))
 }
 
 /// Earliest absolute process-clock expiry represented by the cache, or `None`
-/// when no terminal chrome is retained (the event loop can return to pure Wait).
+/// when no retained composition moves with the clock (the event loop can
+/// return to pure Wait).
 #[must_use]
 pub(crate) fn next_cache_expiry_ms(
     cache: &std::collections::HashMap<u64, CachedChrome>,
 ) -> Option<u64> {
-    cache.values().map(cache_expiry_ms).min()
+    cache.values().filter_map(|c| c.expires_ms).min()
 }
 
 /// Deterministic bounded set of entries due at `now_ms`, ordered by deadline
@@ -370,10 +401,9 @@ pub(crate) fn due_cache_batch(
     // returned value are unchanged.
     let mut due: Vec<(u64, u64)> = Vec::new();
     for (session, entry) in cache {
-        let expiry = cache_expiry_ms(entry);
-        if expiry > now_ms {
+        let Some(expiry) = entry.expires_ms.filter(|at| *at <= now_ms) else {
             continue;
-        }
+        };
         let candidate = (expiry, *session);
         if due.len() < budget {
             due.push(candidate);
@@ -495,14 +525,13 @@ fn connection_lines(input: &SessionChromeInput) -> Vec<String> {
     input.connections.iter().map(connection_line).collect()
 }
 
-/// The shared identity/timeline HEADER LINES (title, durable description,
-/// status activity, cwd, the lifecycle state when it is news — `exited`, not
-/// the `alive` every live tab is — then the newest-first timeline tail) — the
-/// one list both surfaces render. Authored and observed prose are labeled so
-/// a transient status line can never masquerade as durable session metadata.
-/// Returns `(identity_lines, timeline_lines)` so the two consumers can place
-/// their own separators between the groups.
-fn header_lines(input: &SessionChromeInput) -> (Vec<String>, Vec<String>) {
+/// The shared identity HEADER LINES (title, durable description, status
+/// activity, cwd, the lifecycle state when it is news — `exited`, not the
+/// `alive` every live tab is) — the one list both surfaces render. Authored
+/// and observed prose are labeled so a transient status line can never
+/// masquerade as durable session metadata. The newest-first timeline tail is
+/// the menu's alone ([`timeline_rows`]).
+fn header_lines(input: &SessionChromeInput) -> Vec<String> {
     let mut identity = vec![title_line(input)];
     if let Some(description) = input.description.as_deref().and_then(|description| {
         crate::session_timeline::sanitize_metadata_value("description", description)
@@ -536,14 +565,47 @@ fn header_lines(input: &SessionChromeInput) -> (Vec<String>, Vec<String>) {
     }) {
         identity.push(format!("state: {state}"));
     }
-    let timeline: Vec<String> = input
+    identity
+}
+
+/// The menu's newest-first timeline tail: each shown event
+/// ([`timeline_row_shown`], at most [`TIMELINE_TAIL`]) as a row its surface
+/// ages ([`TabMenuEntry::Event`]).
+fn timeline_rows(input: &SessionChromeInput) -> Vec<TabMenuEntry> {
+    input
         .timeline
         .iter()
         .filter(|n| timeline_row_shown(n.kind))
         .take(TIMELINE_TAIL)
-        .map(|n| format!("{} · {}", event_words(n.kind), relative_age(n.age_ms)))
-        .collect();
-    (identity, timeline)
+        .map(|n| TabMenuEntry::Event {
+            words: event_words(n.kind).to_string(),
+            at_ms: n.at_ms,
+        })
+        .collect()
+}
+
+impl TabMenuEntry {
+    /// This entry as a surface shows it at `now_ms`
+    /// ([`crate::turn_ledger::now_ms`]'s clock): an [`Self::Event`] aged into
+    /// its row (`changed directory · 2m ago`, [`relative_age`]), every other
+    /// entry as it is.
+    #[must_use]
+    pub(crate) fn shown_at(&self, now_ms: u64) -> Self {
+        match self {
+            Self::Event { words, at_ms } => Self::Header(format!(
+                "{words} \u{b7} {}",
+                relative_age(now_ms.saturating_sub(*at_ms))
+            )),
+            other => other.clone(),
+        }
+    }
+}
+
+/// A composed menu as a surface shows it at `now_ms`: every timeline row
+/// aged ([`TabMenuEntry::shown_at`]).
+#[must_use]
+pub(crate) fn menu_shown_at(entries: &[TabMenuEntry], now_ms: u64) -> Vec<TabMenuEntry> {
+    entries.iter().map(|e| e.shown_at(now_ms)).collect()
 }
 
 /// Whether a timeline event earns a row in the tab's hover chrome. An agent's
@@ -562,20 +624,16 @@ pub(crate) fn timeline_row_shown(kind: &str) -> bool {
 
 /// The rows the hover chrome shows, from a NEWEST-FIRST walk of the
 /// session's `(kind, t_ms)` events: the newest [`TIMELINE_TAIL`] that earn a
-/// row ([`timeline_row_shown`]), aged against `now_ms`. The cut runs before
-/// the cap, so the rows left out never crowd out older ones that say
-/// something.
+/// row ([`timeline_row_shown`]), each with its stamp (aged where it is
+/// shown, [`TabMenuEntry::shown_at`]). The cut runs before the cap, so the
+/// rows left out never crowd out older ones that say something.
 pub(crate) fn timeline_tail(
     newest_first: impl Iterator<Item = (&'static str, u64)>,
-    now_ms: u64,
 ) -> Vec<TimelineNote> {
     newest_first
         .filter(|(kind, _)| timeline_row_shown(kind))
         .take(TIMELINE_TAIL)
-        .map(|(kind, t_ms)| TimelineNote {
-            kind,
-            age_ms: now_ms.saturating_sub(t_ms),
-        })
+        .map(|(kind, at_ms)| TimelineNote { kind, at_ms })
         .collect()
 }
 
@@ -609,7 +667,7 @@ fn event_words(kind: &str) -> &str {
 /// strip joins the tooltip's lines into one help string.
 #[must_use]
 pub(crate) fn compose_tooltip(input: &SessionChromeInput) -> Option<String> {
-    let (identity, _timeline) = header_lines(input);
+    let identity = header_lines(input);
     let connections = connection_lines(input);
     let icon = input
         .icon
@@ -658,11 +716,14 @@ fn attention_line(input: &SessionChromeInput) -> Option<String> {
 /// the direction line, the peer's `ConnectionAction` rows follow flat.
 #[must_use]
 pub(crate) fn compose_tab_menu(input: &SessionChromeInput) -> Vec<TabMenuEntry> {
-    let (identity, timeline) = header_lines(input);
-    let mut entries: Vec<TabMenuEntry> = identity.into_iter().map(TabMenuEntry::Header).collect();
+    let mut entries: Vec<TabMenuEntry> = header_lines(input)
+        .into_iter()
+        .map(TabMenuEntry::Header)
+        .collect();
+    let timeline = timeline_rows(input);
     if !timeline.is_empty() {
         entries.push(TabMenuEntry::Separator);
-        entries.extend(timeline.into_iter().map(TabMenuEntry::Header));
+        entries.extend(timeline);
     }
     // The live agent upgrade's words (gap #21), right under the identity the
     // headers above describe: the owner steers THIS tab's upgrade here.
@@ -766,10 +827,15 @@ pub(crate) fn compose_tab_menu(input: &SessionChromeInput) -> Vec<TabMenuEntry> 
 /// disabled-ness is structural: they carry no action). A connection row stays
 /// FLAT and carries its peer argument as `<label> @<sid>` — the control
 /// layer's `@<sid>` addressing spelling, so a driving AI can read the target
-/// straight off the mirror.
+/// straight off the mirror. Timeline rows are aged at `now_ms`, the instant
+/// the mirror is read, as a right-click then would show them
+/// ([`TabMenuEntry::shown_at`]).
 #[must_use]
-pub(crate) fn tab_menu_chrome_line(index: usize, entries: &[TabMenuEntry]) -> String {
-    let items: Vec<String> = entries.iter().map(menu_entry_mirror).collect();
+pub(crate) fn tab_menu_chrome_line(index: usize, entries: &[TabMenuEntry], now_ms: u64) -> String {
+    let items: Vec<String> = entries
+        .iter()
+        .map(|entry| menu_entry_mirror(&entry.shown_at(now_ms)))
+        .collect();
     format!("tab-menu tab={index} items={items:?}")
 }
 
@@ -783,6 +849,9 @@ pub(crate) fn menu_entry_mirror(entry: &TabMenuEntry) -> String {
     let disabled_suffix = |enabled: bool| if enabled { "" } else { " (disabled)" };
     match entry {
         TabMenuEntry::Header(t) => t.clone(),
+        // Aged by the surface before it is mirrored ([`menu_shown_at`]);
+        // unaged, its words alone.
+        TabMenuEntry::Event { words, .. } => words.clone(),
         TabMenuEntry::Separator => "---".to_string(),
         TabMenuEntry::Action { label, enabled, .. } => {
             format!("{label}{}", disabled_suffix(*enabled))
@@ -814,7 +883,7 @@ mod tests {
             activity_revision: 0,
             connections_revision: 0,
             upgrade_revision: 0,
-            composed_ms,
+            expires_ms: Some(composed_ms + CACHE_MAX_AGE_MS),
             ext: TabChromeExt::default(),
         }
     }
@@ -852,6 +921,71 @@ mod tests {
         );
     }
 
+    /// The instant the tests' timelines are aged against
+    /// ([`crate::turn_ledger::now_ms`]'s clock).
+    const NOW: u64 = 1_000_000_000;
+
+    /// THE CLOCK MOVES A COMPOSITION ONLY BY AN UPGRADE'S WORDS (D5, the
+    /// Together run, and the review of ba16cabbe5): a timeline row carries
+    /// its event's stamp and is aged where the menu is shown, so one
+    /// composition reads `2m ago` now and `3m ago` a minute on and arms no
+    /// wake; the upgrade's words read the clock, so a tab with one is
+    /// re-derived every period; a cache entry with no expiry is never due.
+    ///
+    /// NEGATIVE CONTROL: the same input with an upgrade arms the period.
+    #[test]
+    fn the_clock_moves_a_composition_only_by_an_upgrades_words() {
+        let mut input = full_input();
+        assert_eq!(clock_expiry_ms(NOW, &input), None, "its ages arm nothing");
+        let menu = compose_tab_menu(&input);
+        let aged = |at: u64| -> Vec<String> {
+            menu_shown_at(&menu, at)
+                .into_iter()
+                .filter_map(|e| match e {
+                    TabMenuEntry::Header(h) if h.contains(" \u{b7} ") => Some(h),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            aged(NOW),
+            [
+                "details changed \u{b7} just now",
+                "changed directory \u{b7} 2m ago",
+                "started \u{b7} 2h ago"
+            ]
+        );
+        assert_eq!(
+            aged(NOW + 60_000),
+            [
+                "details changed \u{b7} 1m ago",
+                "changed directory \u{b7} 3m ago",
+                "started \u{b7} 2h ago"
+            ],
+            "the same composition, aged a minute on"
+        );
+        // The `chrome` verb's mirror ages them as it is read.
+        let line = tab_menu_chrome_line(0, &menu, NOW + 60_000);
+        assert!(
+            line.contains("\"changed directory \u{b7} 3m ago\""),
+            "{line}"
+        );
+        // Negative control: the upgrade's words read the clock.
+        input.upgrade = Some(UpgradeMenu {
+            sid: "s-1".to_string(),
+            moving: "Claude Code 2.1.281 → 2.1.282".to_string(),
+            to: "2.1.282".to_string(),
+            words: Vec::new(),
+        });
+        assert_eq!(clock_expiry_ms(NOW, &input), Some(NOW + CACHE_MAX_AGE_MS));
+        let mut cache = std::collections::HashMap::new();
+        let mut quiet = cached_at(NOW);
+        quiet.expires_ms = None;
+        cache.insert(3, quiet);
+        assert_eq!(next_cache_expiry_ms(&cache), None);
+        assert!(due_cache_batch(&cache, u64::MAX, 4).is_empty());
+    }
+
     fn full_input() -> SessionChromeInput {
         SessionChromeInput {
             can_rename: true,
@@ -866,15 +1000,15 @@ mod tests {
             timeline: vec![
                 TimelineNote {
                     kind: "meta-change",
-                    age_ms: 3_000,
+                    at_ms: NOW - 3_000,
                 },
                 TimelineNote {
                     kind: "cwd-change",
-                    age_ms: 125_000,
+                    at_ms: NOW - 125_000,
                 },
                 TimelineNote {
                     kind: "spawned",
-                    age_ms: 7_200_000,
+                    at_ms: NOW - 7_200_000,
                 },
             ],
             connections: Vec::new(),
@@ -933,42 +1067,11 @@ mod tests {
             has_session: true,
             timeline: vec![TimelineNote {
                 kind: "spawned",
-                age_ms: 7_200_000,
+                at_ms: NOW - 7_200_000,
             }],
             ..SessionChromeInput::default()
         };
         assert_eq!(compose_tooltip(&bare), None);
-    }
-
-    /// The activity line is transient and therefore never overwrites durable
-    /// `meta set description` identity. With both present they remain distinct;
-    /// without authored metadata, activity alone supplies the descriptive line.
-    #[test]
-    fn authored_description_and_status_activity_remain_distinct() {
-        let both = full_input();
-        let tip = compose_tooltip(&both).expect("full metadata composes");
-        assert!(
-            tip.lines()
-                .any(|line| line == "description: Rebuilds the docs site")
-        );
-        assert!(
-            tip.lines()
-                .any(|line| line == "activity: Building documentation")
-        );
-
-        let activity_only = SessionChromeInput {
-            label: "tests".to_string(),
-            activity: Some("Running the focused test suite".to_string()),
-            ..SessionChromeInput::default()
-        };
-        assert_eq!(
-            compose_tooltip(&activity_only).as_deref(),
-            Some("tests\nactivity: Running the focused test suite")
-        );
-        assert_eq!(
-            compose_tab_menu(&activity_only)[1],
-            TabMenuEntry::Header("activity: Running the focused test suite".to_string())
-        );
     }
 
     #[test]
@@ -992,7 +1095,7 @@ mod tests {
                 .all(|line| { !crate::session_timeline::metadata_has_forbidden_formatting(line) })
         );
         assert!(compose_tab_menu(&input).iter().all(|entry| match entry {
-            TabMenuEntry::Header(label) =>
+            TabMenuEntry::Header(label) | TabMenuEntry::Event { words: label, .. } =>
                 !crate::session_timeline::metadata_has_forbidden_formatting(label),
             TabMenuEntry::Action { label, .. }
             | TabMenuEntry::ConnectionAction { label, .. }
@@ -1028,25 +1131,6 @@ mod tests {
             Some("zsh\nNeeds attention: wedged on CI"),
             "a reason alone earns a tooltip"
         );
-    }
-
-    /// No reason recorded, no line: the tooltip is exactly what it was, and an
-    /// empty or all-control reason counts as none.
-    #[test]
-    fn no_attention_no_line() {
-        assert!(
-            !compose_tooltip(&full_input())
-                .unwrap()
-                .contains("Needs attention")
-        );
-        for reason in [None, Some(String::new()), Some("\u{202e}\n".to_string())] {
-            let input = SessionChromeInput {
-                label: "zsh".to_string(),
-                attention: reason,
-                ..SessionChromeInput::default()
-            };
-            assert_eq!(compose_tooltip(&input), None);
-        }
     }
 
     /// The reason is capped and stripped of controls like every other line:
@@ -1094,42 +1178,6 @@ mod tests {
             ..SessionChromeInput::default()
         };
         assert_eq!(compose_tooltip(&dashed), None);
-    }
-
-    /// One extra fact (here: a cwd) is enough to earn a tooltip — and a cwd
-    /// OUTSIDE home (or a sibling like `/Users//foobar`) stays verbatim, the
-    /// component-boundary rule `home_relative_suffix` proves.
-    #[test]
-    fn single_fact_composes_and_foreign_cwd_stays_verbatim() {
-        let input = SessionChromeInput {
-            label: "zsh".to_string(),
-            cwd: Some("/Users//foobar/x".to_string()),
-            home: Some("/Users//foo".to_string()),
-            ..SessionChromeInput::default()
-        };
-        assert_eq!(
-            compose_tooltip(&input).as_deref(),
-            Some("zsh\ncwd: /Users//foobar/x")
-        );
-    }
-
-    /// The description is display-truncated at the cap with an ellipsis —
-    /// counting GRAPHEME CLUSTERS (single-char clusters here, so the cluster
-    /// count and char count agree) — while short text is untouched.
-    #[test]
-    fn description_truncates_on_a_char_boundary() {
-        let mut input = full_input();
-        input.description = Some("é".repeat(DESCRIPTION_DISPLAY_MAX + 40));
-        let tip = compose_tooltip(&input).unwrap();
-        let line = tip
-            .lines()
-            .nth(1)
-            .unwrap()
-            .strip_prefix("description: ")
-            .unwrap();
-        assert_eq!(line.chars().count(), DESCRIPTION_DISPLAY_MAX + 1, "cap+…");
-        assert!(line.ends_with('…'));
-        assert!(line.chars().take(DESCRIPTION_DISPLAY_MAX).all(|c| c == 'é'));
     }
 
     /// REGRESSION (grapheme-cluster truncation): a multi-codepoint cluster
@@ -1200,7 +1248,7 @@ mod tests {
         input.timeline = (0..9)
             .map(|i| TimelineNote {
                 kind: "state-change",
-                age_ms: i * 1000,
+                at_ms: NOW - i * 1000,
             })
             .collect();
         let tip = compose_tooltip(&input).unwrap();
@@ -1209,7 +1257,7 @@ mod tests {
             .filter(|l| l.starts_with("state changed"))
             .count();
         assert_eq!(events, 0, "the tooltip is no log: {tip:?}");
-        let menu = compose_tab_menu(&input);
+        let menu = menu_shown_at(&compose_tab_menu(&input), NOW);
         let headers = menu
             .iter()
             .filter(|e| matches!(e, TabMenuEntry::Header(h) if h.starts_with("state changed")))
@@ -1236,16 +1284,16 @@ mod tests {
             ("inbox", 90),
             ("cwd-change", 90),
         ];
-        let tail = timeline_tail(newest_first.into_iter(), 100);
+        let tail = timeline_tail(newest_first.into_iter());
         let kinds: Vec<&str> = tail.iter().map(|n| n.kind).collect();
         assert_eq!(kinds, ["inbox", "cwd-change"]);
-        assert!(tail.iter().all(|n| n.age_ms == 10));
+        assert!(tail.iter().all(|n| n.at_ms == 90), "each keeps its stamp");
         let mut input = full_input();
         input.timeline = ["agent-change", "human", "agent-change", "cwd-change"]
             .into_iter()
-            .map(|kind| TimelineNote { kind, age_ms: 0 })
+            .map(|kind| TimelineNote { kind, at_ms: NOW })
             .collect();
-        let menu = compose_tab_menu(&input);
+        let menu = menu_shown_at(&compose_tab_menu(&input), NOW);
         let rows: Vec<&str> = menu
             .iter()
             .filter_map(|e| match e {
@@ -1254,20 +1302,6 @@ mod tests {
             })
             .collect();
         assert_eq!(rows, ["changed directory \u{b7} just now"]);
-    }
-
-    /// The age buckets are coarse and monotone: sub-10s reads "just now", then
-    /// seconds, minutes, hours, days.
-    #[test]
-    fn relative_age_buckets() {
-        assert_eq!(relative_age(0), "just now");
-        assert_eq!(relative_age(9_999), "just now");
-        assert_eq!(relative_age(10_000), "10s ago");
-        assert_eq!(relative_age(59_999), "59s ago");
-        assert_eq!(relative_age(60_000), "1m ago");
-        assert_eq!(relative_age(3_599_999), "59m ago");
-        assert_eq!(relative_age(3_600_000), "1h ago");
-        assert_eq!(relative_age(86_400_000), "1d ago");
     }
 
     /// The menu model carries the pinned structure: identity headers, sep,
@@ -1285,7 +1319,7 @@ mod tests {
             ConnFlow::Push,
             false,
         )];
-        let menu = compose_tab_menu(&input);
+        let menu = menu_shown_at(&compose_tab_menu(&input), NOW);
         let tip = compose_tooltip(&input).unwrap();
         let tip_lines: Vec<&str> = tip.lines().filter(|l| !l.is_empty()).collect();
         let menu_headers: Vec<&str> = menu
@@ -1312,46 +1346,28 @@ mod tests {
             "menu headers ARE the tooltip plus the timeline tail"
         );
         assert!(tip_lines.contains(&"\u{21e5} pushes into \"build\""));
-        let actions: Vec<(&str, MenuAction, bool)> = menu
+        let actions: Vec<(MenuAction, bool)> = menu
             .iter()
             .filter_map(|e| match e {
                 TabMenuEntry::Action {
-                    label,
-                    action,
-                    enabled,
-                } => Some((label.as_str(), *action, *enabled)),
+                    action, enabled, ..
+                } => Some((*action, *enabled)),
                 _ => None,
             })
             .collect();
         assert_eq!(
             actions,
             vec![
-                (
-                    "New Controlled Session in New Window",
-                    MenuAction::NewControlledWindow,
-                    true
-                ),
-                (
-                    "New Controlled Session as Tab",
-                    MenuAction::NewControlledTab,
-                    true
-                ),
-                (
-                    "New Controller Session in New Window",
-                    MenuAction::NewControllerWindow,
-                    true
-                ),
-                (
-                    "New Controller Session as Tab",
-                    MenuAction::NewControllerTab,
-                    true
-                ),
-                ("Connect to Session…", MenuAction::ConnectToSession, true),
-                ("Show Connection Map", MenuAction::ShowConnectionMap, true),
-                ("Rename Session…", MenuAction::RenameSession, true),
-                ("Copy Session ID", MenuAction::CopySessionId, true),
-                ("Copy CWD", MenuAction::CopyCwd, true),
-                ("Close Tab", MenuAction::CloseTab, true),
+                (MenuAction::NewControlledWindow, true),
+                (MenuAction::NewControlledTab, true),
+                (MenuAction::NewControllerWindow, true),
+                (MenuAction::NewControllerTab, true),
+                (MenuAction::ConnectToSession, true),
+                (MenuAction::ShowConnectionMap, true),
+                (MenuAction::RenameSession, true),
+                (MenuAction::CopySessionId, true),
+                (MenuAction::CopyCwd, true),
+                (MenuAction::CloseTab, true),
             ]
         );
         assert_eq!(
@@ -1585,7 +1601,7 @@ mod tests {
             ConnFlow::Push,
             false,
         )];
-        let line = tab_menu_chrome_line(2, &compose_tab_menu(&input));
+        let line = tab_menu_chrome_line(2, &compose_tab_menu(&input), NOW);
         assert_eq!(
             line,
             "tab-menu tab=2 items=[\"zsh\", \"cwd: /tmp\", \"---\", \"CONNECTIONS\", \

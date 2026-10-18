@@ -234,14 +234,4 @@ impl GridCursorState {
         self.tab_defaults_suppressed = false;
         self.tab_stops = Self::default_tab_stops(cols);
     }
-
-    #[cfg(test)]
-    #[inline]
-    #[must_use]
-    pub(crate) fn is_tab_stop(&self, col: u16) -> bool {
-        self.tab_stops
-            .get(usize::from(col))
-            .copied()
-            .unwrap_or(false)
-    }
 }

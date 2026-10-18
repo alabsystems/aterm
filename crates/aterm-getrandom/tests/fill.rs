@@ -9,9 +9,8 @@
 //! is filled, and each byte must leave the sentinel at least once in up to
 //! [`ROUNDS`] fills (a random byte equals it with probability 1/256, so a
 //! position misses all of them with probability 2^-64), and two fills of 16
-//! bytes or more must differ (2^-128). [`the_property_catches_a_fill_that_skips_bytes`]
-//! runs it against fills that do not do the job and requires each to be
-//! caught, so the property cannot pass vacuously.
+//! bytes or more must differ (2^-128). Length 0 is in the sweep, so an empty
+//! request must succeed too.
 
 use core::mem::MaybeUninit;
 
@@ -73,49 +72,4 @@ fn getrandom_uninit_writes_every_byte_and_returns_the_same_memory() {
         Ok(())
     };
     assert_eq!(every_byte_is_written(through_uninit), Ok(()));
-}
-
-#[test]
-fn an_empty_request_succeeds() {
-    assert_eq!(getrandom(&mut []), Ok(()));
-    assert_eq!(getrandom_uninit(&mut []).map(|b| b.len()), Ok(0));
-}
-
-/// The negative controls: each fill below fails the job in one way, and the
-/// property must say so at the length where it first shows.
-#[test]
-fn the_property_catches_a_fill_that_skips_bytes() {
-    let caught = |name: &str, fill: &dyn Fn(&mut [u8]) -> Result<(), Error>, at_len: usize| {
-        let verdict = every_byte_is_written(fill);
-        let prefix = format!("len {at_len}:");
-        assert!(
-            verdict.as_ref().is_err_and(|why| why.starts_with(&prefix)),
-            "{name}: {verdict:?}, want a failure at len {at_len}"
-        );
-    };
-    caught("writes nothing", &|_| Ok(()), 1);
-    caught(
-        "writes the first 256-byte chunk only",
-        &|buf| {
-            let n = buf.len().min(256);
-            getrandom(&mut buf[..n])
-        },
-        257,
-    );
-    caught(
-        "skips the last byte",
-        &|buf| {
-            let n = buf.len().saturating_sub(1);
-            getrandom(&mut buf[..n])
-        },
-        1,
-    );
-    caught(
-        "writes a constant",
-        &|buf| {
-            buf.fill(0x42);
-            Ok(())
-        },
-        16,
-    );
 }

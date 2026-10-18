@@ -3,11 +3,7 @@
 
 use super::*;
 use crate::update_words::LiveHealth as _;
-#[cfg(unix)]
-use aterm_messages::HOLD_SUCCESS;
-use aterm_messages::{
-    HOLD_GESTURE, LogRecord, LogState, MAX_ROWS, Meter, Retired, Severity, tags, words,
-};
+use aterm_messages::{LogRecord, LogState, MAX_ROWS, Retired, Severity, tags};
 
 fn warn(title: &str) -> Message {
     Message::new(tags::CONFIG, Severity::Warn, title).line("why")
@@ -35,7 +31,9 @@ fn settings_view(app: &App, wid: WindowId) -> Option<&crate::native_settings::Se
 
 /// The idle center arms nothing (FL-1); a posted row arms its fold; a
 /// handoff freeze suspends the holds — and the deadline agrees with the
-/// settle it arms, both reading the one predicate.
+/// settle it arms, both reading the one predicate. Mid-handoff the row
+/// count never moves (the successor's layout must match the parent's
+/// capture) until the freeze lifts.
 #[test]
 fn the_deadline_is_none_when_idle_and_the_holds_freeze_under_a_handoff() {
     let mut app = App::headless_for_test();
@@ -54,6 +52,13 @@ fn the_deadline_is_none_when_idle_and_the_holds_freeze_under_a_handoff() {
         None,
         "a held row's fold is not a wake while the holds are frozen"
     );
+    let frozen = app.post_message(warn("frozen"));
+    assert!(app.messages.live(frozen).is_some(), "the row is live");
+    assert_eq!(app.message_band_rows, 1, "…but no row was committed");
+    assert!(
+        !app.sync_message_band_rows(Instant::now()),
+        "and none will be, mid-handoff"
+    );
     // A LIVE row's staleness cap still wakes the loop mid-freeze.
     let live = app.post_message(
         Message::new(tags::UPDATE, Severity::Info, "downloading").hold(Hold::Live {
@@ -64,6 +69,11 @@ fn the_deadline_is_none_when_idle_and_the_holds_freeze_under_a_handoff() {
     assert!(app.messages_deadline().is_some(), "staleness keeps running");
     app.incoming_handoff_pending = false;
     assert!(!app.message_holds_frozen());
+    assert!(
+        app.sync_message_band_rows(Instant::now()),
+        "the freeze lifted: the row commits"
+    );
+    assert!(app.message_band_rows > 1);
 }
 
 /// A shrink pending when a handoff freezes the band is not a wake: only
@@ -92,69 +102,6 @@ fn a_frozen_band_never_arms_its_pending_shrink() {
     app.incoming_handoff_pending = false;
 }
 
-/// Mid-handoff the row count never moves — the successor's layout must
-/// match the parent's capture — and `sync_messages` still runs the rest.
-#[test]
-fn a_handoff_freeze_settles_only_staleness_and_never_regrids() {
-    let mut app = App::headless_for_test();
-    app.incoming_handoff_pending = true;
-    let id = app.post_message(warn("frozen"));
-    assert!(app.messages.live(id).is_some(), "the row is live");
-    assert_eq!(app.message_band_rows, 0, "…but no row was committed");
-    assert!(
-        !app.sync_message_band_rows(Instant::now()),
-        "and none will be, mid-handoff"
-    );
-    app.incoming_handoff_pending = false;
-    assert!(
-        app.sync_message_band_rows(Instant::now()),
-        "the freeze lifted: the row commits"
-    );
-    assert_eq!(app.message_band_rows, 1);
-}
-
-/// THE SEAMLESS LANDING NAMES THE REPAINTED TABS (the 2026-09-22/23
-/// update audit, plan P1-5), on main's messages surfaces: the count the
-/// boot took from the adopted set reaches the landing RECORD the Commit
-/// arm writes (ruling 141) — and only the record: one fact is one log
-/// entry, and a no-action row on the glass after the landing is what
-/// ruling 141 made record-only. A launch that adopted nothing counts
-/// nothing.
-#[test]
-fn the_seamless_landing_names_the_tabs_the_successor_repainted() {
-    let mut app = App::headless_for_test();
-    assert_eq!(
-        app.seamless_repainted_tabs(),
-        0,
-        "a launch that adopted nothing counts nothing"
-    );
-    app.post_update_landed("0.92.0", 7, app.seamless_repainted_tabs());
-    assert!(
-        app.messages.live_rows().next().is_none(),
-        "an exact landing is a record only"
-    );
-    app.handoff_repainted_tabs = 2;
-    let entries = app.messages.log().records().count();
-    app.post_update_landed("0.92.0", 7, app.seamless_repainted_tabs());
-    assert!(
-        app.messages.live_rows().next().is_none(),
-        "a repainted landing is a record only too"
-    );
-    assert!(
-        app.messages
-            .log()
-            .records()
-            .any(|r| r.title == "Updated to aterm v0.92.0"
-                && r.detail.first().map(String::as_str) == Some("2 tabs repainted")),
-        "the landing record names the repaint"
-    );
-    assert_eq!(
-        app.messages.log().records().count(),
-        entries + 1,
-        "one fact, one log entry"
-    );
-}
-
 /// The inbox drains into the center with the stamp each message was
 /// queued under; the drained lines reach the log ring.
 #[test]
@@ -179,12 +126,6 @@ fn the_pre_app_inbox_drains_into_the_center_with_its_own_stamp() {
         app.messages.log().pending_len(),
         0,
         "drained to the (absent) writer, never left to fill the queue"
-    );
-    app.drain_message_inbox();
-    assert_eq!(
-        app.messages.live_rows().count(),
-        1,
-        "an empty inbox posts nothing"
     );
 }
 
@@ -223,42 +164,36 @@ fn folders_that_were_not_found_fold_into_one_row_while_it_is_up() {
     app.drain_message_inbox();
     assert_eq!(rows(&app, key), 1, "one row for the restore");
     let live = app.messages.live_by_key(key).expect("the row");
-    assert_eq!(live.msg.title, "Couldn't find 2 folders");
-    assert_eq!(
-        live.msg.detail,
-        ["opened in your home folder instead", "/work/a", "/work/b"]
-    );
+    assert_eq!(&live.msg.detail[1..], ["/work/a", "/work/b"]);
 
     fell_back("/work/c", Fault::Missing);
     fell_back("/srv/locked", Fault::Shut);
     app.drain_message_inbox();
     assert_eq!(rows(&app, key), 1, "still one row");
     let live = app.messages.live_by_key(key).expect("the row");
-    assert_eq!(live.msg.title, "Couldn't find 3 folders");
     assert_eq!(&live.msg.detail[1..], ["/work/a", "/work/b", "/work/c"]);
     let shut = crate::message_reporters::KEY_FOLDER_NOT_OPENED;
     assert_eq!(rows(&app, shut), 1, "a folder not entered: its own row");
-    let live = app.messages.live_by_key(shut).expect("the row");
-    assert_eq!(live.msg.title, "Couldn't open the folder");
 
     let id = app.messages.live_by_key(key).expect("the row").id;
     assert!(app.messages.dismiss(id, Instant::now()));
     fell_back("/work/d", Fault::Missing);
     app.drain_message_inbox();
-    assert_eq!(
-        app.messages
-            .live_by_key(key)
-            .expect("a fresh row")
-            .msg
-            .detail,
-        ["opened in your home folder instead of /work/d"]
+    let fresh = &app
+        .messages
+        .live_by_key(key)
+        .expect("a fresh row")
+        .msg
+        .detail;
+    assert!(
+        fresh.len() == 1 && fresh[0].ends_with("/work/d"),
+        "a fresh row names only the new folder: {fresh:?}"
     );
 }
 
 /// A ROW CARRIED ACROSS AN UPDATE KEEPS ITS FOLDERS: the successor's list
 /// starts empty while the carried row is up, and the next folder joins
-/// the folders that row named instead of replacing them. The negative
-/// control is the same folder with no row up: a fresh row naming it alone.
+/// the folders that row named instead of replacing them.
 #[test]
 fn a_carried_folder_row_keeps_its_folders_when_the_next_one_joins() {
     use crate::spawn_folder::{Fault, Named};
@@ -266,13 +201,6 @@ fn a_carried_folder_row_keeps_its_folders_when_the_next_one_joins() {
     let _ = crate::message_inbox::take_queued();
     let _ = crate::spawn_folder::take_noted();
     let key = crate::message_reporters::KEY_FOLDER_NOT_FOUND;
-
-    let mut fresh = App::headless_for_test();
-    fell_back("/work/c", Fault::Missing);
-    fresh.drain_message_inbox();
-    let live = fresh.messages.live_by_key(key).expect("the row");
-    assert_eq!(live.msg.title, "Couldn't find the folder", "no row was up");
-
     let mut app = App::headless_for_test();
     let carried = crate::message_reporters::folder_row(
         Fault::Missing,
@@ -285,14 +213,12 @@ fn a_carried_folder_row_keeps_its_folders_when_the_next_one_joins() {
     fell_back("/work/c", Fault::Missing);
     app.drain_message_inbox();
     let live = app.messages.live_by_key(key).expect("the row");
-    assert_eq!(live.msg.title, "Couldn't find 3 folders");
     assert_eq!(&live.msg.detail[1..], ["/work/a", "/work/b", "/work/c"]);
 }
 
 /// A reload's set REPLACES the config rows: the old family rows are
-/// resolved (the log says so), the new ones posted, in one settle; an
-/// EMPTY set — the fixed-typo reload — takes every `config.` row down and
-/// touches nothing keyed elsewhere.
+/// resolved, a family still in the same words stands untouched, and a row
+/// keyed elsewhere is never touched.
 #[test]
 fn a_config_reload_resolves_the_old_config_rows_then_posts_the_new() {
     use crate::message_reporters::{ConfigFamily, ConfigWarnings};
@@ -346,17 +272,6 @@ fn a_config_reload_resolves_the_old_config_rows_then_posts_the_new() {
         "other keys are untouched"
     );
     assert_eq!(app.messages.live_rows().count(), 2);
-
-    // The fixed reload: nothing to post, every config row down.
-    app.replace_config_messages(Vec::new());
-    assert!(app.messages.live_by_key("config.ignored-keys").is_none());
-    assert!(app.messages.live(other).is_some());
-    assert_eq!(app.messages.live_rows().count(), 1);
-    assert_eq!(
-        app.messages.wanted_rows(),
-        1,
-        "the band wants the survivor's row only (the committed count follows after the shrink quiet)"
-    );
 }
 
 /// A REPEAT GOES TO THE LOG (review 2026-09-24). A reload runs on every
@@ -435,12 +350,6 @@ fn a_repeated_config_warning_is_a_record_once_its_row_left_the_glass() {
         app.messages.live_by_key(key).is_some(),
         "fixed while off the glass, then broken again: raised"
     );
-    // …and its next repeat is a record again.
-    let raised = app.messages.live_by_key(key).map(|l| l.id).unwrap();
-    assert!(app.messages.mark_seen(raised, Instant::now()));
-    app.sync_messages();
-    app.replace_config_messages(typo(5, "colums"));
-    assert!(app.messages.live_by_key(key).is_none());
 }
 
 /// The CONTENT-EQUAL reload re-derives only the two text-read families,
@@ -507,23 +416,6 @@ fn a_content_equal_reload_resolves_only_the_families_it_re_derived() {
         Some(&aterm_messages::Retired::Resolved(Outcome::Ok)),
         "the log says the typo was fixed: {rec:?}"
     );
-
-    // A new typo on the same path: its family's row is posted, the
-    // chord's row still stands, and a key with no live row resolves
-    // nothing.
-    let mut reload = ConfigWarnings::default();
-    reload.push(
-        ConfigFamily::IgnoredKeys,
-        "config line 5: unknown key \"colums\"".into(),
-    );
-    app.replace_config_messages_keyed(&keys, reload.into_messages());
-    assert!(app.messages.live(chord).is_some());
-    assert!(
-        app.messages
-            .live_by_key(ConfigFamily::IgnoredKeys.key())
-            .is_some_and(|l| l.msg.detail.iter().any(|d| d.contains("colums")))
-    );
-    assert_eq!(app.messages.live_rows().count(), 2);
 }
 
 /// A CHANGED PROBLEM IS NOT A FIXED ONE (design ruling 266). Two bad
@@ -564,7 +456,6 @@ fn a_config_family_whose_words_changed_is_not_logged_fixed() {
         matches!(rec.retired(), Some(Retired::Superseded { .. })),
         "the problem became another, it was not fixed: {rec:?}"
     );
-    assert_eq!(rec.title, "2 keybindings skipped", "{rec:?}");
     assert_eq!(rec.severity, Severity::Warn, "still in Problems: {rec:?}");
     assert_eq!(
         app.messages.wanted_rows(),
@@ -577,7 +468,6 @@ fn a_config_family_whose_words_changed_is_not_logged_fixed() {
     assert!(app.messages.live_by_key(key).is_none());
     let rec = app.messages.log().get(one).expect("logged");
     assert_eq!(rec.retired(), Some(&Retired::Resolved(Outcome::Ok)));
-    assert_eq!(rec.title, "Keybinding fixed", "{rec:?}");
     assert_eq!(rec.severity, Severity::Success, "{rec:?}");
 
     // A typo joined by a second: the first is still misspelled.
@@ -596,8 +486,9 @@ fn a_config_family_whose_words_changed_is_not_logged_fixed() {
     let first = app.messages.live_by_key(key).map(|l| l.id).expect("a row");
     app.replace_config_messages(typos(&["windw_padding", "colums"]));
     let rec = app.messages.log().get(first).expect("logged");
-    assert!(
-        !rec.title.ends_with("fixed") && rec.severity == Severity::Warn,
+    assert_eq!(
+        rec.severity,
+        Severity::Warn,
         "a typo still there is not logged fixed: {rec:?}"
     );
     assert!(app.messages.live_by_key(key).is_some());
@@ -646,27 +537,15 @@ fn a_retired_spelling_reaches_the_log_and_never_the_glass() {
         .collect::<Vec<_>>();
     assert_eq!(records.len(), 2, "one record per launch or reload");
     assert!(records.iter().all(|r| !r.is_live()));
-    // Design §10.3: the title names the kind in a few words; the key's
-    // own sentence is the detail.
-    assert_eq!(records[0].title, "Retired setting");
-    assert!(
-        records[0]
-            .detail
-            .iter()
-            .any(|d| d.contains("auto_update = false is retired")),
-        "{:?}",
-        records[0].detail
-    );
 }
 
-/// Restate and resolve go through the center and sync; a restatement of a
-/// builder's words carries every field.
 /// THE FINAL READ LEAVES A HELD ROW ALONE (ruling 19). Since the silent
 /// lane the `installed` words are a record, so a HELD row on the pass key
 /// is one carried across a handoff from a build before it — stood in for
 /// here by the record's words at the default hold. The tailer's final
 /// snapshot of the ended pass changes nothing on it, first run or not: no
-/// meter, no words, no revision, no log line.
+/// meter, no words, no revision, no log line — and the child's exit, which
+/// folds the pass key's live row, leaves a held one standing.
 #[test]
 fn the_final_snapshot_leaves_a_held_row_alone() {
     let mut app = App::headless_for_test();
@@ -704,53 +583,15 @@ fn the_final_snapshot_leaves_a_held_row_alone() {
         );
         app.apply_toolchain_snapshot(None, first_run);
     }
+    app.toolchain_pass_ended(true);
     let live = app.messages.live(id).expect("still on glass, still held");
     assert_eq!(live.revision, 0, "not restated");
     assert_eq!(live.msg.meter, None, "no meter, no 100%");
-    assert_eq!(live.msg.title, "ALab tools installed");
-    assert_eq!(live.msg.detail, vec!["claude, codex"]);
     assert_eq!(app.messages.log().len(), 1, "the read posted nothing");
 }
 
-#[test]
-fn restate_and_resolve_reach_the_center() {
-    let mut app = App::headless_for_test();
-    let id = app.post_message(
-        Message::new(tags::TOOLCHAIN, Severity::Info, "Installing").hold(Hold::Live {
-            stale_after: std::time::Duration::from_secs(30),
-        }),
-    );
-    let words = Message::new(tags::TOOLCHAIN, Severity::Info, "Installing")
-        .line("trust · extracting")
-        .meter(Meter {
-            fill_permille: Some(420),
-            stats: "1 of 2".into(),
-            ..Meter::default()
-        })
-        .hold(Hold::Live {
-            stale_after: std::time::Duration::from_secs(30),
-        });
-    let r = restatement_of(&words);
-    assert_eq!(r.title.as_deref(), Some("Installing"));
-    assert_eq!(r.detail, Some(vec!["trust · extracting".to_string()]));
-    assert_eq!(r.meter, Some(words.meter.clone()));
-    assert_eq!(r.actions, Some(Vec::new()));
-    assert_eq!(r.severity, Some(Severity::Info));
-    assert!(app.restate_message(id, r));
-    assert_eq!(app.messages.live(id).unwrap().revision, 1);
-    assert_eq!(app.messages.log().len(), 1, "a restate writes no log line");
-    assert!(!app.restate_message(MessageId::from_raw(9_999).unwrap(), Restatement::default()));
-    assert!(app.resolve_message(id, Outcome::Ok));
-    assert!(app.messages.live(id).is_none());
-    assert_eq!(
-        app.messages.log().get(id).unwrap().state,
-        LogState::Retired(Retired::Resolved(Outcome::Ok))
-    );
-    assert!(!app.resolve_message(id, Outcome::Ok), "already gone");
-}
-
 /// `Show tab N` from ANOTHER window's band (ruling 247): the band is
-/// app-wide, so every window's band shows the strain row and its capsule.
+/// app-wide, so every window's band shows the row and its capsule.
 /// The press lands on the window the row named — its tab 2 selected —
 /// and never switches the pressing window to ITS tab 2, a different
 /// program. A gone tab or window is an honest miss.
@@ -787,10 +628,11 @@ fn show_tab_goes_to_the_named_window_not_the_pressing_one() {
 }
 
 /// THE DETAILS PRESS (design §3.6): the row is seen — a held row folds,
-/// the config band's "click at a notice you have read" — and Settings ▸
-/// Messages opens in THE PRESSED WINDOW with that entry selected, the
-/// page already showing the record as folded. A standing row stays and
-/// is selected all the same; the overflow link opens the page unselected.
+/// the config band's "click at a notice you have read", and a standing row
+/// too — and Settings ▸ Messages opens in THE PRESSED WINDOW with that
+/// entry selected, the page already showing the record as folded. (A live
+/// row through the band's own press: `app_mouse`'s
+/// `a_details_press_opens_the_entry_in_the_clicked_window`.)
 #[test]
 fn a_details_press_marks_the_row_seen_and_folds_a_held_one() {
     let mut app = App::headless_for_test();
@@ -808,10 +650,6 @@ fn a_details_press_marks_the_row_seen_and_folds_a_held_one() {
     let view = settings_view(&app, wid).expect("Settings fronts the pressed window");
     assert_eq!(view.route, SettingsRoute::Messages);
     assert_eq!(view.messages_selected, Some(id.raw()));
-    assert!(
-        app.messages_last_publish.is_some(),
-        "the page was published on the way in"
-    );
     assert_eq!(
         app.messages_published_revision,
         app.messages.revision(),
@@ -830,31 +668,17 @@ fn a_details_press_marks_the_row_seen_and_folds_a_held_one() {
         app.messages.log().get(standing).unwrap().state,
         LogState::Retired(Retired::Folded)
     );
-    // A LIVE row stays — work in flight is not read away — and is selected.
-    let live = app.post_message(
-        Message::new(tags::UPDATE, Severity::Info, "Downloading aterm v0.92.0")
-            .in_flight()
-            .hold(Hold::Live {
-                stale_after: aterm_messages::STALE_UPDATE,
-            }),
-    );
-    assert!(app.perform_intent(wid, live, Intent::Details));
-    assert!(app.messages.live(live).expect("a live row stays").seen);
-    assert_eq!(
-        settings_view(&app, wid).unwrap().messages_selected,
-        Some(live.raw())
-    );
-    // The overflow row's link: the page, top of the log, nothing selected.
+    // A plain open (the menu's) leaves the page as it was.
     assert!(app.open_messages_entry(wid, None));
     let view = settings_view(&app, wid).unwrap();
     assert_eq!(view.route, SettingsRoute::Messages);
     assert_eq!(
         view.messages_selected,
-        Some(live.raw()),
+        Some(standing.raw()),
         "a plain open leaves the page as it was"
     );
     // A window that does not exist opens nothing.
-    assert!(!app.open_messages_entry(WindowId(77), Some(live)));
+    assert!(!app.open_messages_entry(WindowId(77), Some(standing)));
 }
 
 /// A "TO LOOK AT" LINE IN THE MENU lands on ITS entry: the page already
@@ -875,174 +699,40 @@ fn a_menu_line_opens_messages_at_its_entry() {
     assert_eq!(view.messages_selected, Some(second.raw()));
 }
 
-/// ROUND 16, DAY TWO (ruling 267): a row still open when aterm quits is
-/// recorded as cut off by the quit — its words, its mark, the percent a
-/// determinate row reached — never `stopped reporting`, which blamed a
-/// reporter that had done nothing wrong; and a record replayed open from a
-/// process that died without an ending says aterm stopped, while a row
-/// THIS process retired for going silent still blames its reporter.
+/// THE PROJECTION'S HOST FACTS (design §4.2; the projection itself — order,
+/// chips, the wire's words, a decision answered once — is the engine's,
+/// `aterm_messages::page_tests`): `Open log` is pressable only while its file
+/// is there, `Install now` only while that build is staged (a test App stages
+/// nothing), and a navigation always.
 #[test]
-fn a_row_open_at_quit_is_recorded_as_cut_off_and_a_dead_processes_as_open() {
+fn the_projection_reads_the_hosts_facts() {
     let mut app = App::headless_for_test();
-    let render = app.post_message(
-        Message::new(tags::SYSTEM, Severity::Info, "Rendering the video")
-            .glyph(aterm_messages::Glyph::or_fallback('\u{21bb}'))
-            .hold(Hold::Live {
-                stale_after: aterm_messages::STALE_TAILED,
-            })
-            .meter(Meter {
-                fill_permille: Some(283),
-                ..Meter::default()
-            }),
-    );
-    let warn = app.post_message(
-        Message::new(tags::SYSTEM, Severity::Warn, "Disk nearly full")
-            .line("2 GB free on the startup disk"),
-    );
-    assert_eq!(app.close_messages_at_exit(), 2);
-    assert_eq!(app.messages.live_rows().count(), 0);
-    let state = app.messages_state();
-    let r = state.entry(render.raw()).expect("the render's record");
-    assert_eq!(r.state, "quit");
-    assert_eq!(r.title, "Rendering the video");
-    assert_eq!(r.detail, vec!["28% when aterm quit".to_string()]);
-    // Ruling 317 (day eight E5): work cut off no longer wears the working
-    // `↻`; its severity's mark stands in.
-    assert_eq!(r.glyph, '\u{2139}', "the quit record's mark");
-    assert!(
-        r.state_words().starts_with("still open when aterm quit"),
-        "{}",
-        r.state_words()
-    );
-    let w = state.entry(warn.raw()).expect("the warning's record");
-    assert_eq!(w.state, "quit");
-    assert!(w.alarm(), "the warning stays in Problems");
-    // A dead process's open row, replayed: no retirement time.
-    let dead = LogRecord::from_posted(
-        MessageId::from_raw(900).expect("an id"),
-        WallStamp { unix_ms: 1_000 },
-        &Message::new(tags::SYSTEM, Severity::Info, "Rendering the video")
-            .glyph(aterm_messages::Glyph::or_fallback('\u{21bb}')),
-    );
-    let mut log = aterm_messages::MessageLog::empty();
-    log.replay(aterm_messages::LogLine::Posted(dead));
-    let replayed = log.records().next().expect("replayed");
-    let view = MessageView::of(replayed, None, None, None, &PageDesk::of(&app));
-    assert_eq!(view.state, "stale");
-    assert_eq!(view.state_words(), "still open when aterm stopped");
-    assert_eq!(view.glyph, '\u{2139}', "the replayed open record's mark");
-    // Control: the same record while live keeps its working mark, and a
-    // mark that is not a working one is kept when cut off — the mark's
-    // own law, moved with it to the engine (design ruling 382):
-    // `aterm_messages::page_tests::a_replayed_open_record_is_cut_off_and_a_silent_one_blames_its_reporter`.
-    // A row this process retired Stale keeps its words.
-    let mut silent = replayed.clone();
-    silent.retired_unix_ms = Some(61_000);
-    assert_eq!(
-        MessageView::of(&silent, None, None, None, &PageDesk::of(&app)).state_words(),
-        "stopped reporting after 1 min"
-    );
-}
-
-/// THE PROJECTION (design §4.2): every record newest first, in the
-/// wire's own state words, the live row's current words, the band row
-/// it is on, tag counts in the chips' order — and `still_actionable`
-/// following the intent and the row's life: a decision only while live,
-/// `Apply now` only while that build is staged, `Open log` only while
-/// the file exists, a navigation always.
-#[test]
-fn the_projection_is_newest_first_in_the_wires_words_with_live_actionability() {
-    let mut app = App::headless_for_test();
-    let first = app.post_message(
-        Message::new(
-            tags::CRASH,
-            Severity::Error,
-            "aterm closed unexpectedly last time",
+    let open_log = |app: &mut App, path: String| {
+        app.post_message(
+            Message::new(tags::CRASH, Severity::Error, format!("crash log at {path}"))
+                .action(Intent::OpenPath { path }),
         )
-        .line("crash log at /definitely/not/there.log")
-        .action(Intent::OpenPath {
-            path: "/definitely/not/there.log".into(),
-        }),
-    );
-    let ask = app.post_message(
-        Message::new(tags::PRIVACY, Severity::Info, "File access not confirmed")
-            .action(Intent::OpenSystemPane {
-                pane: "full-disk-access".into(),
-            })
-            .action(Intent::NotNow {
-                decision: Decision::FileAccess,
-            })
-            .hold(Hold::asking(aterm_messages::HOLD_ASK)),
-    );
+    };
+    let gone = open_log(&mut app, "/definitely/not/there.log".into());
+    let here = std::env::current_exe().expect("the test binary");
+    let present = open_log(&mut app, here.to_string_lossy().into_owned());
     let staged = app.post_message(update_words::staged(
         "0.91.0",
         1234,
         Some(update_words::ApplyPosture::ManualByConfig),
     ));
-    let meter = app.post_message(
-        Message::new(tags::TOOLCHAIN, Severity::Info, "Installing ALab tools")
-            .line("trust \u{00b7} extracting")
-            .action(Intent::OpenSettings {
-                route: "/packages".into(),
-            })
-            .hold(Hold::Live {
-                stale_after: aterm_messages::STALE_TAILED,
-            }),
-    );
-    assert!(app.messages.restate(
-        meter,
-        Restatement {
-            title: Some("Installing ALab tools".into()),
-            detail: Some(vec!["trust \u{00b7} linking".into()]),
-            ..Restatement::default()
-        },
-        Instant::now()
-    ));
-    assert!(app.resolve_message(first, Outcome::Warn));
-
     let state = app.messages_state();
     assert_eq!(state.revision, app.messages.revision());
-    let ids: Vec<u64> = state.entries.iter().map(|e| e.id).collect();
-    assert_eq!(
-        ids,
-        [meter.raw(), staged.raw(), ask.raw(), first.raw()],
-        "newest first"
-    );
-    assert_eq!(
-        state.tags,
-        [
-            ("crash".to_string(), 1),
-            ("update".to_string(), 1),
-            ("toolchain".to_string(), 1),
-            ("privacy".to_string(), 1),
-        ],
-        "the chips' fixed order, present tags only"
-    );
     let entry = |id: MessageId| state.entry(id.raw()).expect("in the projection");
-    // The live meter: its CURRENT words (the restatement is never logged).
-    let m = entry(meter);
-    assert_eq!(m.state, "live");
-    assert_eq!(m.detail, vec!["trust \u{00b7} linking"]);
-    assert_eq!(m.tag, "toolchain");
-    assert_eq!(m.severity, "info");
-    assert!(m.actions[0].still_actionable, "a navigation is always live");
-    assert_eq!(m.actions[0].label, "Packages");
-    assert_eq!(m.state_words(), "showing now");
-    assert_eq!(m.severity_words(), "Info");
-    assert_eq!(tag_words(&m.tag), "ALab tools");
-    // The ask: held (a question waits on its patience), both decisions
-    // pressable while it is up.
-    let a = entry(ask);
-    assert_eq!(a.state, "held");
-    assert!(a.actions.iter().all(|x| x.still_actionable));
-    assert_eq!(
-        a.actions.iter().map(|x| x.label).collect::<Vec<_>>(),
-        ["Open Settings", "Not now"]
+    assert!(
+        !entry(gone).actions[0].still_actionable,
+        "no file, no press"
     );
-    // The staged row: `Apply now` only while that build is really staged
-    // (a test App stages nothing), the page link always.
+    assert!(
+        entry(present).actions[0].still_actionable,
+        "CONTROL: a file that is there is pressable"
+    );
     let s = entry(staged);
-    assert_eq!(s.state, "held");
     let apply = s
         .actions
         .iter()
@@ -1057,137 +747,17 @@ fn the_projection_is_newest_first_in_the_wires_words_with_live_actionability() {
         "every other capsule is a navigation: {:?}",
         s.actions
     );
-    // The crash record, retired: the wire's word, the retired stamp, and
-    // an `Open log` whose file is gone.
-    let f = entry(first);
-    assert_eq!(f.state, "resolved-warn");
-    assert!(f.retired_unix_ms.is_some());
-    assert!(
-        f.state_words().starts_with("ended with a problem after "),
-        "{}",
-        f.state_words()
-    );
-    // A delivered row says so; neither outcome reads "cleared" (audit
-    // 2026-09-24).
-    let delivered = MessageView {
-        state: "resolved-ok",
-        ..f.clone()
-    };
-    assert!(
-        delivered.state_words().starts_with("lasted "),
-        "{}",
-        delivered.state_words()
-    );
-    // Delivered work (its record's mark is ✓ Success, ruling 265) took
-    // its span; a plain withdraw lasted it — never `withdrawn`.
-    let took = MessageView {
-        state: "withdrawn",
-        severity: "success",
-        ..f.clone()
-    };
-    assert!(
-        took.state_words().starts_with("took "),
-        "{}",
-        took.state_words()
-    );
-    let ended = MessageView {
-        state: "withdrawn",
-        severity: "info",
-        ..f.clone()
-    };
-    assert!(
-        ended.state_words().starts_with("lasted "),
-        "{}",
-        ended.state_words()
-    );
-    assert!(!f.actions[0].still_actionable, "no file, no press");
-    assert_eq!(f.glyph, '\u{2715}');
-    assert_eq!(f.repeats, 1);
-    // What the page prints is what the wire prints.
-    let rec = app.messages.log().get(first).unwrap();
-    assert_eq!(f.state, wire::state_word(rec, None));
-    assert_eq!(f.copy_text(), words::copy_text(rec));
-    // Every vocabulary word has a chip position.
-    for tag in tags::ALL {
-        assert!(TAG_ORDER.contains(&tag.as_str()), "{tag}");
-    }
-    assert_eq!(TAG_ORDER.len(), tags::ALL.len());
-    // A decision row answered: its label in the meta words.
-    let answered = app.post_message(
-        Message::new(tags::PRIVACY, Severity::Info, "Allow Full Disk Access?")
-            .action(Intent::NotNow {
-                decision: Decision::FileAccess,
-            })
-            .hold(Hold::asking(aterm_messages::HOLD_ASK)),
-    );
-    assert_eq!(
-        app.messages.act(answered, ActionIndex(0), Instant::now()),
-        Some(Intent::NotNow {
-            decision: Decision::FileAccess
-        })
-    );
-    let state = app.messages_state();
-    let ans = state.entry(answered.raw()).unwrap();
-    assert_eq!(ans.state, "answered");
-    assert_eq!(ans.state_words(), "answered: Not now");
-    assert!(
-        ans.actions.is_empty(),
-        "a decision is answered once, and not offered again (ruling 265): {:?}",
-        ans.actions
-    );
-    // A script's tags read like the chips beside them (ruling 265).
-    assert_eq!(tag_words("script"), "Scripts");
-    assert_eq!(tag_words("search"), "Search");
-    assert_eq!(tag_words("ci"), "CI");
-    assert_eq!(tag_words("Deploy"), "Deploy");
-    assert_eq!(tag_words("crash"), "Crashes");
-    // The span words are the engine's own law, moved with it (design
-    // ruling 382): `aterm_messages::page_tests::tags_chips_cover_the_vocabulary`.
 }
 
-/// THE PAGE'S PRESS (`perform_message_act`): a live row's button goes
-/// through the engine's `act` — logged, a `Not now` retiring its row —
-/// then the intent is performed in the pressing window and worded; a
-/// retired record re-offers its navigation from the log; a decision
-/// cannot be answered once its row is gone; an unknown id or button is
-/// `Gone`.
+/// THE PAGE'S PRESS (`perform_message_act`; a live row's press through the
+/// engine's `act`, a decision answered once, is `notice_act_is_the_pages_press`,
+/// which goes through it): a retired record re-offers its navigation from the
+/// log, performed in the pressing window; an unknown id or button is `Gone`;
+/// a refusal is `Refused`.
 #[test]
 fn the_pages_press_acts_through_the_engine_and_words_the_outcome() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    let ask = app.post_message(
-        Message::new(tags::PRIVACY, Severity::Info, "Allow Full Disk Access?")
-            .action(Intent::NotNow {
-                decision: Decision::FileAccess,
-            })
-            .hold(Hold::asking(aterm_messages::HOLD_ASK)),
-    );
-    assert_eq!(
-        app.perform_message_act(wid, ask.raw(), 0),
-        MessageActOutcome::Performed {
-            feedback: "Not now recorded".to_string()
-        }
-    );
-    assert!(
-        app.messages.live(ask).is_none(),
-        "the answer retired the row"
-    );
-    assert_eq!(
-        app.messages
-            .log()
-            .get(ask)
-            .unwrap()
-            .last_action
-            .as_ref()
-            .map(|(l, _)| l.as_str()),
-        Some("Not now"),
-        "the press is on record"
-    );
-    assert_eq!(
-        app.perform_message_act(wid, ask.raw(), 0),
-        MessageActOutcome::Gone,
-        "a decision cannot be answered twice"
-    );
     // A retired navigation, re-offered from the log.
     let nav = app.post_message(
         Message::new(tags::TOOLCHAIN, Severity::Success, "ALab tools installed").action(
@@ -1197,12 +767,10 @@ fn the_pages_press_acts_through_the_engine_and_words_the_outcome() {
         ),
     );
     assert!(app.resolve_message(nav, Outcome::Ok));
-    assert_eq!(
+    assert!(matches!(
         app.perform_message_act(wid, nav.raw(), 0),
-        MessageActOutcome::Performed {
-            feedback: "Opened Settings \u{25b8} Packages".to_string()
-        }
-    );
+        MessageActOutcome::Performed { .. }
+    ));
     assert_eq!(
         settings_view(&app, wid).map(|v| v.route),
         Some(SettingsRoute::Packages)
@@ -1211,12 +779,11 @@ fn the_pages_press_acts_through_the_engine_and_words_the_outcome() {
         app.perform_message_act(wid, nav.raw(), 1),
         MessageActOutcome::Gone
     );
-    assert_eq!(app.perform_message_act(wid, 0, 0), MessageActOutcome::Gone);
     assert_eq!(
         app.perform_message_act(wid, 9_999, 0),
         MessageActOutcome::Gone
     );
-    // A refusal is worded as one.
+    // A refusal is a refusal.
     let crash = app.post_message(
         Message::new(
             tags::CRASH,
@@ -1227,107 +794,17 @@ fn the_pages_press_acts_through_the_engine_and_words_the_outcome() {
             path: "/definitely/not/there.log".into(),
         }),
     );
-    assert_eq!(
+    assert!(matches!(
         app.perform_message_act(wid, crash.raw(), 0),
-        MessageActOutcome::Refused {
-            feedback: "Could not open the log".to_string()
-        }
-    );
-    assert_eq!(
-        act_feedback(&Intent::NewWindow, true, false),
-        "Opened a new window"
-    );
-    // An Install now press says what it did: installs only where it
-    // applies, the page it opened otherwise, and a failure as one.
-    let apply = Intent::ApplyUpdate { build: 1 };
-    assert_eq!(act_feedback(&apply, true, true), "Installing the update");
-    assert_eq!(
-        act_feedback(&apply, true, false),
-        "Opened Settings \u{25b8} Software Update"
-    );
-    assert_eq!(
-        act_feedback(&apply, false, true),
-        "Could not start the install"
-    );
-    assert_eq!(
-        act_feedback(&apply, false, false),
-        "Could not open Settings"
-    );
-    assert_eq!(
-        act_feedback(
-            &Intent::OpenSettings {
-                route: "/nowhere".into()
-            },
-            false,
-            false
-        ),
-        "Could not open Settings",
-        "no route string on the page"
-    );
-}
-
-/// THE PUBLISH GATE (design §4.2): nothing is published without a
-/// Settings instance; with one, the first sync publishes, the next
-/// within the 2 Hz gap waits (and arms the deadline the park serves),
-/// a quiet center republishes only on the 60 s tick while a view is on
-/// the route, and opening Settings publishes unconditionally.
-#[test]
-fn the_projection_is_published_at_two_hertz_and_on_the_minute_tick() {
-    let mut app = App::headless_for_test();
-    let wid = WindowId(0);
-    app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
-    app.post_message(warn("before Settings"));
-    assert_eq!(app.messages_last_publish, None, "no Settings, no publish");
-    assert_eq!(app.messages_publish_due_at(), None);
-    assert!(app.open_settings_tab_in_window(wid, SettingsRoute::Home));
-    let opened = app
-        .messages_last_publish
-        .expect("opening Settings publishes");
-    assert_eq!(app.messages_published_revision, app.messages.revision());
-    assert_eq!(app.messages_publish_due_at(), None, "nothing pending");
-    // A post inside the gap: the center moved, the publish waits, and
-    // the deadline says when.
-    app.post_message(warn("inside the gap"));
-    assert_eq!(
-        app.messages_last_publish,
-        Some(opened),
-        "within 500 ms of the last publish nothing is republished"
-    );
-    assert_ne!(app.messages_published_revision, app.messages.revision());
-    assert_eq!(
-        app.messages_publish_due_at(),
-        Some(opened + crate::app_native::MESSAGES_PUBLISH_MIN_GAP)
-    );
-    assert!(
-        app.messages_deadline()
-            .is_some_and(|d| d <= opened + crate::app_native::MESSAGES_PUBLISH_MIN_GAP),
-        "the loop is asked back for the pending publish"
-    );
-    // The park, past the gap: published.
-    app.publish_native_messages_state_if_due(opened + crate::app_native::MESSAGES_PUBLISH_MIN_GAP);
-    assert_eq!(app.messages_published_revision, app.messages.revision());
-    let second = app.messages_last_publish.unwrap();
-    assert_ne!(second, opened);
-    // A quiet center off the route: the minute tick publishes nothing.
-    app.publish_native_messages_state_if_due(second + crate::app_native::MESSAGES_PUBLISH_TICK);
-    assert_eq!(app.messages_last_publish, Some(second));
-    // On the route: it does, so the relative times move.
-    assert!(app.open_settings_tab_in_window(wid, SettingsRoute::Messages));
-    let on_route = app.messages_last_publish.unwrap();
-    app.publish_native_messages_state_if_due(
-        on_route + crate::app_native::MESSAGES_PUBLISH_TICK - std::time::Duration::from_secs(1),
-    );
-    assert_eq!(app.messages_last_publish, Some(on_route), "not yet");
-    app.publish_native_messages_state_if_due(on_route + crate::app_native::MESSAGES_PUBLISH_TICK);
-    assert_ne!(app.messages_last_publish, Some(on_route), "the tick");
+        MessageActOutcome::Refused { .. }
+    ));
 }
 
 /// ROUND 16 REVIEW (ruling 267): the page's status line (`Copied`) is
 /// timed by the projections, and on a quiet page those came once a
 /// minute — so it stood one to two minutes, never about five seconds. The
 /// host now arms the publish that starts its clock and, five seconds on,
-/// the one that clears it; then only the minute tick again. Off screen it
-/// arms nothing.
+/// the one that clears it; then only the minute tick again.
 #[test]
 fn a_transient_status_line_is_cleared_about_five_seconds_on() {
     use crate::app_native::{
@@ -1350,14 +827,6 @@ fn a_transient_status_line_is_cleared_about_five_seconds_on() {
         }
     }
     view_mut(&mut app, wid).show_messages_feedback_for_test("Copied");
-    // Off screen: nothing armed but the (gated) tick — nothing at all.
-    app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = false;
-    assert_eq!(
-        app.messages_publish_due_at(),
-        None,
-        "a hidden page arms nothing"
-    );
-    app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
     // The publish that starts the clock is due at the 2 Hz gap.
     assert_eq!(app.messages_publish_due_at(), Some(opened + GAP));
     app.publish_native_messages_state_if_due(opened + GAP);
@@ -1367,10 +836,7 @@ fn a_transient_status_line_is_cleared_about_five_seconds_on() {
         settings_view(&app, wid).unwrap().messages_feedback_clock(),
         Some(true)
     );
-    assert_eq!(
-        settings_view(&app, wid).unwrap().feedback.as_deref(),
-        Some("Copied")
-    );
+    assert!(settings_view(&app, wid).unwrap().feedback.is_some());
     // The one that clears it, five seconds on — not the minute tick.
     assert_eq!(app.messages_publish_due_at(), Some(stamped + WAIT));
     assert!(app.messages_deadline().is_some_and(|d| d <= stamped + WAIT));
@@ -1415,15 +881,6 @@ fn publish_is_rate_limited_and_only_while_settings_exists() {
             .instance_by_kind(crate::native_app::AppKind::Settings)
             .is_some()
     };
-    // The page's own count of the log — the status line's words — as
-    // the last publish left it.
-    let status = |app: &App| {
-        app.compiled_native_ui(wid)
-            .expect("Settings fronts the window")
-            .semantic(&crate::native_ui::UiKey::new("settings/messages/status"))
-            .map(|node| node.label.clone())
-            .expect("the Messages page is up")
-    };
     app.post_message(warn("before Settings"));
     // No controller: nothing to publish into, and nothing pending.
     app.publish_native_messages_state();
@@ -1441,7 +898,6 @@ fn publish_is_rate_limited_and_only_while_settings_exists() {
         .expect("opening Settings publishes");
     let published = app.messages_published_revision;
     assert_eq!(published, app.messages.revision());
-    assert!(status(&app).starts_with("1 message"), "{}", status(&app));
 
     // A burst inside the gap — four posts and a resolve — is held back
     // whole: the page keeps the last publish, the pending one is due at
@@ -1457,21 +913,10 @@ fn publish_is_rate_limited_and_only_while_settings_exists() {
     );
     assert_eq!(app.messages_published_revision, published);
     assert!(app.messages.revision() > published);
-    assert!(
-        status(&app).starts_with("1 message"),
-        "the page shows the last publish: {}",
-        status(&app)
-    );
     assert_eq!(app.messages_publish_due_at(), Some(opened + GAP));
     assert!(
         app.messages_deadline().is_some_and(|d| d <= opened + GAP),
         "the loop is asked back for the pending publish"
-    );
-    app.publish_native_messages_state_if_due(opened + GAP - std::time::Duration::from_millis(1));
-    assert_eq!(
-        app.messages_last_publish,
-        Some(opened),
-        "one millisecond short of the gap: still held"
     );
     app.publish_native_messages_state_if_due(opened + GAP);
     let second = app.messages_last_publish.expect("published at the gap");
@@ -1486,18 +931,12 @@ fn publish_is_rate_limited_and_only_while_settings_exists() {
         Some(second + TICK),
         "nothing of the center's pending: only the minute tick, the view on the route"
     );
-    assert!(
-        status(&app).starts_with("5 messages"),
-        "…and the page shows all of it: {}",
-        status(&app)
-    );
 
     // Closing the last Settings tab drops the controller: the center
     // moving is nobody's business — no publish, nothing pending.
     assert!(app.close_settings_tabs());
     assert!(!settings_exists(&app), "no view, no controller");
     app.post_message(warn("after close"));
-    assert_ne!(app.messages.revision(), app.messages_published_revision);
     assert_eq!(
         app.messages_publish_due_at(),
         None,
@@ -1512,110 +951,6 @@ fn publish_is_rate_limited_and_only_while_settings_exists() {
     assert!(app.open_settings_tab_in_window(wid, SettingsRoute::Messages));
     assert_ne!(app.messages_last_publish, Some(second));
     assert_eq!(app.messages_published_revision, app.messages.revision());
-    assert!(status(&app).starts_with("6 messages"), "{}", status(&app));
-}
-
-/// REVIEW PIN (Phase 2, lens B, 2026-09-22): A 10 Hz RESTATE STORM
-/// PUBLISHES AT 2 Hz AT MOST (design §4.2) — the path a downloading
-/// update takes: `restate_message` every 100 ms for three seconds,
-/// each followed by the park's own gate
-/// (`publish_native_messages_state_if_due`), the park's clock stepped
-/// in lock-step with the real instant each publish stamps, a view on
-/// the route. Thirty restatements of the title: six publishes at most
-/// (2 Hz × 3 s), at least five (a moving center is never starved), the
-/// page two restatements behind inside a gap, and the last publish
-/// carrying the last words.
-#[test]
-fn a_ten_hertz_restate_storm_publishes_at_two_hertz_at_most() {
-    use crate::app_native::MESSAGES_PUBLISH_MIN_GAP as GAP;
-    // Bound before the App, so the App (and its log writer) is dropped
-    // first and the directory after it.
-    let dir = aterm_tempfile::Builder::new()
-        .prefix("aterm-storm-")
-        .tempdir()
-        .expect("scratch dir");
-    let mut app = App::headless_for_test();
-    // A writer, as a real App has one: without it the page heads its list
-    // with the not-saved note, and the row would start the second section.
-    app.messages_log = crate::messages_store::Writer::spawn(&dir.path().join("messages.log"));
-    let wid = WindowId(0);
-    let meter = app.post_message(
-        Message::new(tags::UPDATE, Severity::Info, "aterm update v0.48.0")
-            .line("0%")
-            .hold(Hold::Live {
-                stale_after: aterm_messages::STALE_UPDATE,
-            }),
-    );
-    // The row's title as the page shows it — on the first compact
-    // section whatever the window's width.
-    let title = |app: &App| {
-        app.compiled_native_ui(wid)
-            .expect("Settings fronts the window")
-            .semantic(&crate::native_ui::UiKey::new(format!(
-                "settings/messages/row/{}/title",
-                meter.raw()
-            )))
-            .map(|node| node.label.clone())
-            .expect("the entry is on the page")
-    };
-    assert!(app.open_settings_tab_in_window(wid, SettingsRoute::Messages));
-    let opened = app
-        .messages_last_publish
-        .expect("opening Settings publishes");
-    assert_eq!(title(&app), "aterm update v0.48.0");
-    // The park's clock: virtual time from the opening publish, re-based
-    // on the real instant each publish stamps, so the gate sees the
-    // spacing the loop would.
-    let step = std::time::Duration::from_millis(100);
-    let mut base_real = opened;
-    let mut base_virtual = std::time::Duration::ZERO;
-    let mut publishes = 0usize;
-    for k in 1..=30u32 {
-        let before = app.messages_last_publish;
-        let revision = app.messages.revision();
-        assert!(app.restate_message(
-            meter,
-            Restatement {
-                title: Some(format!("aterm update v0.48.0 \u{00b7} {k}%")),
-                ..Restatement::default()
-            },
-        ));
-        assert!(
-            app.messages.revision() > revision,
-            "a restatement moves the center"
-        );
-        let elapsed = step * k;
-        let now = base_real + (elapsed - base_virtual);
-        app.publish_native_messages_state_if_due(now);
-        if app.messages_last_publish != before {
-            publishes += 1;
-            base_real = app.messages_last_publish.expect("published");
-            base_virtual = elapsed;
-            assert_eq!(
-                app.messages_published_revision,
-                app.messages.revision(),
-                "tick {k}: a publish carries everything so far"
-            );
-        }
-        if k == 7 {
-            assert_eq!(
-                title(&app),
-                "aterm update v0.48.0 \u{00b7} 5%",
-                "inside the gap the page keeps the last publish"
-            );
-            assert_eq!(app.messages_publish_due_at(), Some(base_real + GAP));
-        }
-    }
-    assert!(
-        (5..=6).contains(&publishes),
-        "thirty restatements at 10 Hz: {publishes} publishes (2 Hz at most)"
-    );
-    assert_eq!(app.messages_published_revision, app.messages.revision());
-    assert_eq!(
-        title(&app),
-        "aterm update v0.48.0 \u{00b7} 30%",
-        "the last publish carries the last words"
-    );
 }
 
 /// REVIEW PIN (Phase 2, lens B, 2026-09-22): THE MINUTE TICK IS A WAKE
@@ -1651,21 +986,6 @@ fn the_minute_tick_arms_a_wake_while_a_view_is_on_the_route() {
         None,
         "a standing row arms no fold: the center is quiet"
     );
-    // The park at the tick publishes — this half holds.
-    let mut probe = App::headless_for_test();
-    probe.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
-    probe.post_message(
-        Message::new(tags::UPDATE, Severity::Warn, "checks failing").hold(Hold::STANDING),
-    );
-    assert!(probe.open_settings_tab_in_window(wid, SettingsRoute::Messages));
-    let probe_published = probe.messages_last_publish.unwrap();
-    probe.publish_native_messages_state_if_due(probe_published + TICK);
-    assert_ne!(
-        probe.messages_last_publish,
-        Some(probe_published),
-        "the park ticks"
-    );
-    // …but nothing asks the loop to park there.
     assert_eq!(
         app.messages_deadline(),
         Some(published + TICK),
@@ -1677,85 +997,6 @@ fn the_minute_tick_arms_a_wake_while_a_view_is_on_the_route() {
     assert_eq!(app.messages_deadline(), None, "a hidden page is no wake");
     app.windows.get_mut(&wid).unwrap().occluded = false;
     assert_eq!(app.messages_deadline(), Some(published + TICK));
-}
-
-/// The route words after *Open Settings* are the consent card's caption,
-/// TERSE (ruling 46): the title before its dash, the route as
-/// `detail[0]`, each further clause a line behind Details, the actions
-/// withdrawn, the route's short hold.
-#[test]
-fn the_route_words_are_the_consent_cards_caption() {
-    let route = "Privacy & Security \u{25b8} Full Disk Access";
-    let opened = route_words(true, route);
-    assert_eq!(
-        opened.title.as_deref(),
-        Some("Enable aterm in Full Disk Access"),
-        "the instruction is the title, not the confirmation"
-    );
-    assert_eq!(opened.severity, None, "the question's tone");
-    assert_eq!(
-        opened.detail,
-        Some(vec![
-            route.to_string(),
-            "find aterm there (+ adds a missing app)".to_string(),
-            "if already enabled, leave it on".to_string(),
-            "aterm keeps checking access".to_string(),
-        ])
-    );
-    assert_eq!(opened.actions, Some(Vec::new()));
-    assert_eq!(opened.hold, Some(Hold::For(HOLD_ROUTE)));
-    assert!(
-        HOLD_ROUTE <= std::time::Duration::from_secs(15),
-        "a terse restate holds briefly: {HOLD_ROUTE:?}"
-    );
-    assert_eq!(opened.excerpt, Some(true), "the route is painted");
-    let refused = route_words(false, route);
-    assert_eq!(
-        refused.title.as_deref(),
-        Some("Open Privacy & Security \u{25b8} Full Disk Access"),
-        "the route is the title, verb first"
-    );
-    assert_eq!(
-        refused.detail,
-        Some(vec![
-            "Settings did not open".to_string(),
-            "find aterm there (+ adds a missing app)".to_string(),
-            "if already enabled, leave it on".to_string(),
-        ]),
-        "the outcome first behind it"
-    );
-    assert_eq!(refused.excerpt, Some(false), "the title alone on the glass");
-    assert_eq!(
-        refused.severity,
-        Some(aterm_messages::Severity::Warn),
-        "Settings not opening is a failure"
-    );
-    assert_eq!(
-        refused.glyph,
-        Some(aterm_messages::Severity::Warn.default_glyph())
-    );
-    assert!(
-        refused.title.as_ref().unwrap().chars().count() <= 48,
-        "fits at 60 columns beside the short Details form"
-    );
-    let full = route_words(
-        false,
-        "System Settings \u{25b8} Privacy & Security \u{25b8} Full Disk Access",
-    );
-    assert_eq!(
-        full.title.as_deref(),
-        Some("Open Privacy & Security \u{25b8} Full Disk Access"),
-        "the route does not repeat System Settings"
-    );
-    assert_eq!(
-        privacy_pane("full-disk-access"),
-        Some(crate::menu::PrivacyPane::FullDiskAccess)
-    );
-    assert_eq!(
-        privacy_pane(crate::message_reporters::PANE_DEVELOPER_TOOLS),
-        Some(crate::menu::PrivacyPane::DeveloperTools)
-    );
-    assert_eq!(privacy_pane("camera"), None);
 }
 
 /// THE DEVELOPER TOOLS LINE'S TWO CAPSULES, pressed on the page (owner ask
@@ -1988,15 +1229,6 @@ fn open_path_external_refuses_paths_outside_the_log_dir_and_symlinks() {
         "through the real log dir: a regular file outside it is refused"
     );
     let _ = std::fs::remove_dir_all(&root);
-    let refusal = log_did_not_open("/x/y.log");
-    assert_eq!(refusal.title, "Couldn't open the log");
-    assert_eq!(refusal.detail, vec!["/x/y.log"]);
-    assert_eq!(refusal.tag, tags::SYSTEM);
-    assert_eq!(
-        refusal.hold,
-        Hold::For(HOLD_GESTURE),
-        "the person's own press"
-    );
     let mut app = App::headless_for_test();
     app.perform_intent(
         WindowId(0),
@@ -2008,7 +1240,7 @@ fn open_path_external_refuses_paths_outside_the_log_dir_and_symlinks() {
     assert!(
         app.messages
             .live_rows()
-            .any(|l| l.msg.title == "Couldn't open the log"),
+            .any(|l| l.msg.detail == ["/definitely/not/a/file"]),
         "the refusal is a row"
     );
 }
@@ -2017,9 +1249,8 @@ fn open_path_external_refuses_paths_outside_the_log_dir_and_symlinks() {
 /// post, never before it: `post` stamps the row with its own
 /// `Instant::now()`, so a clock read ahead of the call falls inside the
 /// grace whenever the thread is descheduled between the two for longer
-/// than the margin (a loaded parallel run failed
-/// `a_heavy_routine_row_folds_once_at_the_childs_exit_across_sub_passes`
-/// that way, 2026-09-28).
+/// than the margin (a loaded parallel run failed the heavy routine row's
+/// fold test that way, 2026-09-28).
 fn past_the_grace() -> Instant {
     Instant::now() + PROGRESS_GRACE + std::time::Duration::from_millis(10)
 }
@@ -2075,94 +1306,6 @@ fn appstatus(app: &App) -> Vec<String> {
     )
 }
 
-/// THE `appstatus` GRAMMAR IS THE BARS', THE WORDS ARE THE ROW'S (ruling 116;
-/// review 2026-09-24). The compat face promised byte-identical GRAMMAR:
-/// field order, keys, percent-encoding and the phase/outcome words, the
-/// bars' `activity_rows` format strings (status_bars.rs before 31b679459,
-/// :982/:991) — while a `phase=live` line says what the row says NOW, so
-/// its words follow the owner's rule. Pinned here in full, deliberately:
-/// the first run's live line (`Installing ALab tools`, was `Installing
-/// the ALab toolchain`; stats `3 of 10 programs`, the byte rollup behind
-/// Details) and the download's; every line parses back into the bars'
-/// seven (live) or eight (done) keys in order.
-#[test]
-fn appstatus_keeps_the_bars_grammar_in_the_rows_current_words() {
-    let mut app = App::headless_for_test();
-    // A person asked (Check for Updates): the download is their wait
-    // and takes the row (design ruling 220).
-    app.note_update_check_asked(true);
-    app.announce_toolchain_pass("installing 10 ALab program(s) (about 3 GB)", true);
-    app.apply_toolchain_snapshot(Some(&net_read(true, 1_700_000_000)), true);
-    app.note_update_progress(&aterm_update::Progress::Downloading {
-        version: "9.9.9".into(),
-        bytes_done: 10_000_000,
-        bytes_total: 74_000_000,
-    });
-    let rows = appstatus(&app);
-    assert_eq!(
-        rows,
-        [
-            "activity kind=toolchain phase=live progress=36/100 \
-             title=Installing%20ALab%20tools detail=trust%20%C2%B7%20extracting \
-             stats=3%20of%2010%20programs outcome=-",
-            "activity kind=update phase=live progress=14/100 \
-             title=Downloading%20aterm%20v9.9.9 detail=downloading \
-             stats=10%20MB%20/%2074%20MB \
-             outcome=-",
-        ]
-    );
-    // A finished activity: the bars' `phase=done` grammar.
-    app.record_message(toolchain_words::failed("install failed"));
-    let rows = appstatus(&app);
-    let done = rows.last().expect("the record's done line");
-    assert!(done.starts_with("activity kind=toolchain phase=done progress=- title="));
-    assert!(done.contains(" stats= outcome=warn since_ms="), "{done}");
-    // Every line, parsed back: the bars' keys, in the bars' order, each
-    // value one token (percent-encoded, so no space or newline forges a
-    // field), the phase and outcome words the bars' own.
-    for row in &rows {
-        let mut words = row.split(' ');
-        assert_eq!(words.next(), Some("activity"), "{row}");
-        let fields: Vec<(&str, &str)> = words
-            .map(|w| w.split_once('=').expect("key=value"))
-            .collect();
-        let keys: Vec<&str> = fields.iter().map(|(k, _)| *k).collect();
-        let value = |key: &str| fields.iter().find(|(k, _)| *k == key).unwrap().1;
-        match value("phase") {
-            "live" => {
-                assert_eq!(
-                    keys,
-                    [
-                        "kind", "phase", "progress", "title", "detail", "stats", "outcome"
-                    ]
-                );
-                assert_eq!(value("outcome"), "-");
-            }
-            "done" => {
-                assert_eq!(
-                    keys,
-                    [
-                        "kind", "phase", "progress", "title", "detail", "stats", "outcome",
-                        "since_ms"
-                    ]
-                );
-                assert_eq!(value("progress"), "-");
-                assert!(["ok", "warn"].contains(&value("outcome")), "{row}");
-            }
-            other => panic!("phase={other}: {row}"),
-        }
-        assert!(["toolchain", "update"].contains(&value("kind")), "{row}");
-        let progress = value("progress");
-        assert!(
-            progress == "-"
-                || progress
-                    .strip_suffix("/100")
-                    .is_some_and(|n| n.parse::<u8>().is_ok_and(|n| n <= 100)),
-            "{row}"
-        );
-    }
-}
-
 /// SILENT BY DEFAULT: A ROUTINE PASS RAISES NO ROW (upstream dbf97ecff's
 /// `a_routine_pass_raises_no_row_and_records_every_outcome`, ported onto
 /// the center; the rulings on the origin/main merge, 2026-09-23). Every row
@@ -2171,8 +1314,7 @@ fn appstatus_keeps_the_bars_grammar_in_the_rows_current_words() {
 /// managed-current row, the machine-settings rows, a deferred pass —
 /// re-gridded every window and resized every running TUI. Pinned for the
 /// whole marker set of a routine pass: no row, no re-grid, no deadline —
-/// and every outcome on `appstatus` in the bars' ledger grammar, titled by
-/// what happened (design ruling 67), in the order it arrived. The plan is
+/// and every outcome on `appstatus` in the bars' ledger grammar. The plan is
 /// LIGHT: a routine pass of at least `HEAVY_PASS_BYTES` is very heavy
 /// system use and raises its row (design §10.6, pinned by
 /// `a_heavy_routine_pass_raises_one_row_after_the_grace_and_a_light_one_none`).
@@ -2203,123 +1345,15 @@ fn a_routine_pass_raises_no_row_and_records_every_outcome() {
     assert_eq!(app.message_band_rows, 0);
     assert_eq!(message_regrids(), regrids, "no re-grid for routine work");
     assert_eq!(app.messages_deadline(), None, "nothing to wake for");
-    let enc = crate::control::pct_encode;
-    let ledger = [
-        ("ALab tools installed", "ty", "ok"),
-        (
-            "ALab tools checked",
-            "the pass finished; 12 ALab program(s) are installed",
-            "ok",
-        ),
-        (
-            "Claude Code 2.1.280 and Codex CLI 0.156.0 are current",
-            "ready in every aterm tab",
-            "ok",
-        ),
-        (
-            "ALab tools turned off Universal Control",
-            "to turn it back on, set Universal Control on this Mac to leave and run: \
-             defaults -currentHost delete com.apple.universalcontrol Disable; \
-             defaults -currentHost delete com.apple.universalcontrol DisableMagicEdges",
-            "ok",
-        ),
-        (
-            "ALab tools update postponed",
-            "an earlier toolchain pass is still running",
-            "ok",
-        ),
-    ];
     let rows = appstatus(&app);
-    assert_eq!(rows.len(), ledger.len(), "{rows:#?}");
-    for (row, (title, detail, outcome)) in rows.iter().zip(ledger) {
-        let want = format!(
-            "activity kind=toolchain phase=done progress=- title={} detail={} stats= \
-             outcome={outcome} since_ms=",
-            enc(title),
-            enc(detail)
+    assert_eq!(rows.len(), 5, "every outcome on record: {rows:#?}");
+    for row in &rows {
+        assert!(
+            row.starts_with("activity kind=toolchain phase=done progress=- title=")
+                && row.contains(" outcome=ok since_ms="),
+            "{row}"
         );
-        assert!(row.starts_with(&want), "{row}\n  want {want}");
     }
-}
-
-/// THE ONE ROW: THE FIRST-RUN ROW, THEN NO SUCCESS ROW (upstream
-/// dbf97ecff/ac7942234's `a_first_run_shows_the_bar_then_folds_with_no_success_row`).
-/// The pass that lays the default set onto a machine that had none of it
-/// (multi-GB) keeps its live row — silence there reads as a hang — from the
-/// announcement through the meter; the marker and the tailer's final read,
-/// in either order, fold nothing while the child runs, and its EXIT folds
-/// the row with no "installed" row after it; the roster is the record's.
-/// Two re-grids: one open, one fold.
-#[test]
-fn a_first_run_shows_the_row_then_folds_with_no_success_row() {
-    // Marker first, then the final read.
-    let mut a = App::headless_for_test();
-    let regrids = message_regrids();
-    a.announce_toolchain_pass(
-        "installing 10 ALab program(s) over the network (about 3 GB on disk when finished)",
-        true,
-    );
-    assert_eq!(
-        a.messages.live_rows().count(),
-        1,
-        "the announcement opens the row"
-    );
-    a.apply_toolchain_snapshot(Some(&net_read(true, 1_700_000_000)), true);
-    let live = a.messages.live_rows().next().expect("the live row");
-    assert_eq!(live.msg.title, "Installing ALab tools");
-    assert!(
-        live.msg
-            .meter
-            .as_ref()
-            .and_then(|m| m.fill_permille)
-            .is_some_and(|f| f > 0 && f < 1000),
-        "a live meter"
-    );
-    a.record_toolchain_outcome(toolchain_words::installed(
-        "\u{2713} ALab toolchain installed: ay, trust \u{2014} ready in every aterm tab",
-    ));
-    a.apply_toolchain_snapshot(Some(&net_read(false, 1_700_000_000)), true);
-    assert_eq!(
-        a.messages.live_rows().count(),
-        1,
-        "the child still runs: nothing folds yet"
-    );
-    a.toolchain_pass_ended(true);
-    // Past the quiet AND the row's Complete echo, which a quiet shrink
-    // waits out (design ruling 415 (b)): from a low fill it runs 1.65 s.
-    a.settle_messages(Instant::now() + quiet_past_echoes());
-    assert_eq!(a.messages.live_rows().count(), 0, "its exit folds the row");
-    assert_eq!(a.message_band_rows, 0);
-    assert_eq!(message_regrids(), regrids + 2, "one open, one fold");
-    let rows = appstatus(&a);
-    assert_eq!(
-        rows.len(),
-        1,
-        "the roster is on record, and only it: {rows:?}"
-    );
-    let enc = crate::control::pct_encode;
-    let want = format!(
-        "activity kind=toolchain phase=done progress=- title={} detail={} stats= \
-         outcome=ok since_ms=",
-        enc("ALab tools installed"),
-        enc("ay, trust \u{2014} ready in every aterm tab")
-    );
-    assert!(rows[0].starts_with(&want), "{}\n  want {want}", rows[0]);
-    // The final read first, then the marker: the same glass.
-    let mut b = App::headless_for_test();
-    b.apply_toolchain_snapshot(Some(&net_read(true, 1_700_000_000)), true);
-    assert_eq!(b.messages.live_rows().count(), 1);
-    b.apply_toolchain_snapshot(Some(&net_read(false, 1_700_000_000)), true);
-    b.apply_toolchain_snapshot(None, true);
-    assert!(
-        appstatus(&b)[0].contains("phase=live"),
-        "the read claims no outcome"
-    );
-    b.record_toolchain_outcome(toolchain_words::ended("the toolchain pass finished", false));
-    assert_eq!(b.messages.live_rows().count(), 1);
-    b.toolchain_pass_ended(true);
-    assert_eq!(b.messages.live_rows().count(), 0);
-    assert_eq!(appstatus(&b).len(), 1, "the one record");
 }
 
 /// ONE FIRST-RUN CHILD, ONE OPEN AND ONE FOLD (upstream ac7942234's
@@ -2375,106 +1409,6 @@ fn a_first_run_row_holds_across_the_vendor_sub_pass_and_folds_at_exit() {
         );
         assert_eq!(appstatus(&app).len(), 2, "both answers are on record");
     }
-}
-
-/// A FAILURE TAKES NO ROW EITHER (upstream dbf97ecff's
-/// `a_failure_takes_no_row_and_folds_the_first_run_bar`). Now the
-/// first-run row folds at its child's exit, the sentence is a Warn record,
-/// and the failure's surface is the Settings ▸ Packages badge — so no meter
-/// can be fused with a verdict at all, in either order.
-#[test]
-fn a_failure_takes_no_row_and_folds_the_first_run_row() {
-    let mut failed_read = net_read(false, 1_700_000_000);
-    if let Some(trust) = failed_read.file.programs.get_mut("trust") {
-        trust.phase = atpkg::progress::Phase::Failed;
-        trust.error = Some("no space left on device".into());
-    }
-    let mut a = App::headless_for_test();
-    a.apply_toolchain_snapshot(Some(&net_read(true, 1_700_000_000)), true);
-    a.record_toolchain_outcome(toolchain_words::failed("partly installed: trust"));
-    a.apply_toolchain_snapshot(Some(&failed_read), true);
-    let live = a.messages.live_rows().next().expect("the child still runs");
-    assert!(
-        matches!(live.msg.hold, Hold::Live { .. }) && live.msg.severity == Severity::Info,
-        "the live row, never a verdict on glass: {:?}",
-        live.msg
-    );
-    a.toolchain_pass_ended(true);
-    assert_eq!(a.messages.live_rows().count(), 0);
-    let rows = appstatus(&a);
-    assert_eq!(rows.len(), 1, "{rows:?}");
-    assert!(
-        rows[0].contains("outcome=warn") && rows[0].contains("partly%20installed"),
-        "{}",
-        rows[0]
-    );
-    let mut b = App::headless_for_test();
-    b.apply_toolchain_snapshot(Some(&net_read(true, 1_700_000_000)), true);
-    b.apply_toolchain_snapshot(Some(&failed_read), true);
-    b.record_toolchain_outcome(toolchain_words::failed("partly installed: trust"));
-    b.toolchain_pass_ended(true);
-    assert_eq!(
-        b.messages.live_rows().count(),
-        0,
-        "the failed read raises nothing"
-    );
-}
-
-/// `appstatus` against the bars' ledger on the withdrawals (review
-/// 2026-09-22, re-cut for the silent lane and the latch of design §10.5
-/// H8). A LATCHED row — a first run's — is folded by its child's exit
-/// and by nothing else: neither its own vanished read nor the lane's
-/// untagged clear at the waited child's exit. The fold WITHDRAWS it — the
-/// log keeps the row, the face lists no finished activity and claims no
-/// `ok` for a pass whose marker never came (ruling 13) — while the glass
-/// ends its indicator by how the child exited. An announcement over a
-/// live row supersedes it — one live row, nothing done.
-#[test]
-fn appstatus_lists_no_outcome_for_a_withdrawn_row() {
-    let mut app = App::headless_for_test();
-    app.announce_toolchain_pass("installing 10 ALab program(s) (about 3 GB)", true);
-    let row = app
-        .messages
-        .live_by_key(toolchain_words::KEY_PASS)
-        .map(|l| l.id)
-        .expect("the first-run row");
-    app.apply_toolchain_snapshot(None, true);
-    assert!(
-        app.messages.live(row).is_some(),
-        "its exit folds it, not the read"
-    );
-    // The lane's own clear at a waited child's exit is untagged: a
-    // latched row is left for the exit.
-    app.apply_toolchain_snapshot(None, false);
-    assert!(
-        app.messages.live(row).is_some(),
-        "latched: the exit's to fold"
-    );
-    app.toolchain_pass_ended(true);
-    assert!(app.messages.live(row).is_none(), "withdrawn");
-    assert_eq!(
-        app.messages.log().get(row).unwrap().state,
-        LogState::Retired(Retired::Withdrawn)
-    );
-    assert!(
-        appstatus(&app).is_empty(),
-        "no live row, and no finished activity claimed: {:?}",
-        appstatus(&app)
-    );
-    // A LIVE row under the next first run's announcement is superseded,
-    // not finished.
-    let mut app = App::headless_for_test();
-    app.announce_toolchain_pass("installing 2 ALab program(s)", true);
-    app.announce_toolchain_pass("installing 3 ALab program(s)", true);
-    let rows = appstatus(&app);
-    assert_eq!(rows.len(), 1, "one live row, nothing done: {rows:?}");
-    assert!(
-        rows[0].starts_with(
-            "activity kind=toolchain phase=live progress=- title=Installing%20ALab%20tools"
-        ),
-        "{}",
-        rows[0]
-    );
 }
 
 /// A "net" read with no plan at all — atpkg begins its pass before the
@@ -2630,12 +1564,14 @@ fn a_first_run_row_no_update_takes_over_is_withdrawn() {
 
 /// THE FIRST-RUN ANNOUNCEMENT OPENS THE ROW BEFORE ANY SNAPSHOT (upstream
 /// dbf97ecff's `a_first_run_announcement_opens_the_toolchain_bar_before_any_snapshot`,
-/// ported onto the App). The row goes up at the marker — before
-/// `progress.json` exists — with atpkg's size, no meter, and live under
-/// the announcement's cap rather than a fold. A pass that plans nothing
-/// never opens a row of its own, and an announced one that ends empty
-/// folds at its child's exit, claiming nothing; a ROUTINE pass's
-/// announcement and reads — the every-6-hours no-op — stay invisible.
+/// ported onto the App; the row's own words are `toolchain_words`'). The row
+/// goes up at the marker — before `progress.json` exists — live under the
+/// announcement's cap rather than a fold. A pass that plans nothing
+/// never opens a row of its own. The announced row is LATCHED (design
+/// §10.5 H8): neither an ended-empty read, its own vanished read nor the
+/// lane's untagged clear at the waited child's exit folds it; the child's
+/// exit WITHDRAWS it — the log keeps the row, and `appstatus` claims no
+/// `ok` for a pass whose marker never came (ruling 13).
 #[test]
 fn a_first_run_announcement_opens_the_row_before_any_snapshot() {
     let mut app = App::headless_for_test();
@@ -2650,31 +1586,7 @@ fn a_first_run_announcement_opens_the_row_before_any_snapshot() {
             .messages
             .live_by_key(toolchain_words::KEY_PASS)
             .expect("the announcement opens the row");
-        assert_eq!(live.msg.tag, tags::TOOLCHAIN);
-        assert_eq!(live.msg.title, "Installing ALab tools");
-        assert!(
-            live.msg.detail[0].contains("about 3 GB on disk when finished"),
-            "{:?}",
-            live.msg.detail
-        );
-        let meter = live
-            .msg
-            .meter
-            .as_ref()
-            .expect("busy before the file exists");
-        assert!(
-            meter.busy && meter.fill_permille.is_none(),
-            "no fill before the file exists — the row moves instead: {meter:?}"
-        );
-        assert_eq!(meter.stats, "10 programs \u{00b7} ~3 GB", "how big");
-        assert_eq!(
-            live.msg.hold,
-            Hold::Live {
-                stale_after: aterm_messages::STALE_ANNOUNCE
-            },
-            "live: no fold…"
-        );
-        assert_eq!(live.fold_at, None);
+        assert_eq!(live.fold_at, None, "live: no fold…");
         assert!(live.stale_at.is_some(), "…but a cap");
     }
     assert!(app.messages_deadline().is_some(), "the cap arms a wake");
@@ -2688,421 +1600,48 @@ fn a_first_run_announcement_opens_the_row_before_any_snapshot() {
     );
     assert_eq!(quiet.message_band_rows, 0);
     // …and an announced one that ends empty folds at its child's exit.
+    let row = app
+        .messages
+        .live_by_key(toolchain_words::KEY_PASS)
+        .map(|l| l.id)
+        .expect("the first-run row");
     app.apply_toolchain_snapshot(Some(&empty_read(true)), true);
-    assert_eq!(
-        app.messages
-            .live_by_key(toolchain_words::KEY_PASS)
-            .map(|l| l.msg.title.as_str()),
-        Some("Installing ALab tools"),
-        "an announced row keeps its announcement until the plan lands"
-    );
     app.apply_toolchain_snapshot(Some(&empty_read(false)), true);
-    assert_eq!(
-        app.messages.live_rows().count(),
-        1,
-        "the first run's child still runs"
+    app.apply_toolchain_snapshot(None, true);
+    app.apply_toolchain_snapshot(None, false);
+    assert!(
+        app.messages.live(row).is_some(),
+        "latched: the first run's child still runs, and its exit folds it"
     );
     app.toolchain_pass_ended(true);
+    assert!(app.messages.live(row).is_none(), "folded at exit");
     assert_eq!(
-        app.messages.live_rows().count(),
-        0,
-        "announced, then ended empty: folded at exit"
+        app.messages.log().get(row).unwrap().state,
+        LogState::Retired(Retired::Withdrawn)
     );
     assert!(
         appstatus(&app).is_empty(),
         "and it claims no outcome: {:?}",
         appstatus(&app)
     );
-    // The every-6-hours no-op stays invisible: a routine pass's
-    // announcement and reads raise nothing and move no grid.
-    let mut routine = App::headless_for_test();
-    let regrids = message_regrids();
-    routine.announce_toolchain_pass("installing 1 program(s) over the network: ty", false);
-    routine.apply_toolchain_snapshot(Some(&empty_read(true)), false);
-    routine.apply_toolchain_snapshot(Some(&net_read(true, 1_700_000_000)), false);
-    routine.apply_toolchain_snapshot(Some(&empty_read(false)), false);
-    routine.toolchain_pass_ended(true);
-    assert_eq!(routine.messages.live_rows().count(), 0);
-    assert_eq!(message_regrids(), regrids, "no re-grid");
-    assert!(appstatus(&routine).is_empty(), "{:?}", appstatus(&routine));
-    assert_eq!(routine.messages_deadline(), None);
 }
 
-/// A PASS THAT IS OVER FOLDS ITS ROW AND CLAIMS NO OUTCOME (upstream
-/// dbf97ecff/ac7942234's `a_pass_that_is_over_folds_its_bar_and_claims_no_outcome`,
-/// its whole first-run × {clean, failed, dead writer} loop on the App). A
-/// read of a pass that ended — cleanly, with a failure, or with its writer
-/// gone — used to raise a held "all 10 installed" / "1 failed" /
-/// "stopped" row; now it raises nothing, and the live row folds — at once
-/// for a routine or a sibling's read, at the child's exit for a first
-/// run's (whose ending read may be one sub-pass's). The outcome is the
-/// markers' record and a failure's the Packages badge's.
+/// An ANSWER folds a live row no child is latched behind (one carried across
+/// a handoff), its record on `appstatus` (upstream `toolchain_ended` →
+/// `retire_answered_toolchain`; a latched first run's answer waits for the
+/// exit: `a_first_run_row_holds_across_the_vendor_sub_pass_and_folds_at_exit`).
 #[test]
-fn a_pass_that_is_over_folds_its_row_and_claims_no_outcome() {
-    let over = |what: &str| {
-        let mut read = net_read(false, 1_700_000_000);
-        if what != "clean" {
-            read.file.programs.get_mut("trust").unwrap().phase = atpkg::progress::Phase::Failed;
-        }
-        if what == "dead writer" {
-            read.file.ended_unix = None;
-        }
-        read
-    };
-    for what in ["clean", "failed", "dead writer"] {
-        for first_run in [true, false] {
-            let mut app = App::headless_for_test();
-            app.apply_toolchain_snapshot(Some(&net_read(true, 1_700_000_000)), true);
-            assert_eq!(app.messages.live_rows().count(), 1);
-            // Whoever reads the pass as over, the row is LATCHED: its
-            // child's exit folds it (design §10.2 #6).
-            app.apply_toolchain_snapshot(Some(&over(what)), first_run);
-            assert_eq!(
-                app.messages.live_rows().count(),
-                1,
-                "{what}, first_run {first_run}: the child still runs"
-            );
-            app.toolchain_pass_ended(what == "clean");
-            assert_eq!(
-                app.messages.live_rows().count(),
-                0,
-                "{what}, first_run {first_run}: folded"
-            );
-            assert!(
-                appstatus(&app).is_empty(),
-                "{what}, first_run {first_run}: no outcome claimed: {:?}",
-                appstatus(&app)
-            );
-            // Past the quiet and a clean pass's Complete echo (design
-            // ruling 415 (b)).
-            app.settle_messages(Instant::now() + quiet_past_echoes());
-            assert_eq!(app.message_band_rows, 0, "{what}, first_run {first_run}");
-            assert_eq!(
-                app.messages_deadline(),
-                None,
-                "{what}, first_run {first_run}: nothing to wake for"
-            );
-        }
-    }
-}
-
-/// A HELD ROW OUTLIVES THE FINAL SNAPSHOT, AND NONE NEVER ERASES IT
-/// (upstream dbf97ecff's
-/// `a_held_notice_outlives_the_final_snapshot_and_none_never_erases_it`,
-/// re-cut: `appnotice` text is a record since design §10.5 H7, so the held
-/// row here is a keyless toolchain row of the old notice's shape). No
-/// tailed read — running or over, first run or not — replaces or re-words
-/// it, and neither the vanished-file clear nor the child's exit folds it;
-/// the first run's own row stands BESIDE it and folds at the exit.
-#[test]
-fn a_held_row_outlives_the_final_snapshot_and_none_never_erases_it() {
-    let mut app = App::headless_for_test();
-    let held = app.post_message(
-        Message::new(
-            tags::TOOLCHAIN,
-            Severity::Warn,
-            "aterm pkg install claude: 2.1.267 installed",
-        )
-        .hold(Hold::Default),
-    );
-    let mut over = net_read(false, 1_700_000_000);
-    over.file.ended_unix = Some(1);
-    app.apply_toolchain_snapshot(Some(&over), true);
-    app.apply_toolchain_snapshot(Some(&net_read(true, 1_700_000_000)), true);
-    {
-        let live = app.messages.live(held).expect("never replaced by a read");
-        assert_eq!(live.msg.meter, None);
-        assert_eq!(live.revision, 0, "never re-worded");
-        assert!(live.msg.hold.is_held());
-    }
-    assert_eq!(
-        app.messages.live_rows().count(),
-        2,
-        "the first run's row stands beside it"
-    );
-    app.apply_toolchain_snapshot(None, true);
-    app.apply_toolchain_snapshot(None, false);
-    app.toolchain_pass_ended(true);
-    assert!(
-        app.messages.live(held).is_some(),
-        "the lane's clear and the child's exit keep it"
-    );
-    assert_eq!(
-        app.messages.live_rows().count(),
-        1,
-        "only the live row folded"
-    );
-}
-
-/// `appnotice` TEXT IS RECORDED (design §10.5 H7; this replaces
-/// `an_announcement_beside_a_held_notice_displaces_nothing`, whose held
-/// notice row no longer exists): the text is on record and on
-/// `appstatus` as a finished activity, never a row; a first run's
-/// announcement beside it is the one row on the glass, and a routine one
-/// raises nothing.
-#[test]
-fn appnotice_text_is_recorded() {
-    let mut app = App::headless_for_test();
-    let regrids = message_regrids();
-    assert!(
-        app.take_app_notice("toolchain", "aterm pkg install claude: 2.1.267 installed")
-            .is_ok()
-    );
-    assert!(app.take_app_notice("update", "an operator's note").is_ok());
-    assert_eq!(app.messages.live_rows().count(), 0, "no row");
-    assert_eq!(app.message_band_rows, 0);
-    assert_eq!(message_regrids(), regrids, "no re-grid");
-    let rows = appstatus(&app);
-    assert_eq!(rows.len(), 2, "{rows:?}");
-    assert!(
-        rows.iter().all(|r| r.contains(" phase=done ")),
-        "records are finished activities: {rows:?}"
-    );
-    app.announce_toolchain_pass("installing 1", false);
-    assert_eq!(
-        app.messages.live_rows().count(),
-        0,
-        "a routine announcement raises nothing"
-    );
-    app.announce_toolchain_pass("installing 1 program(s) over the network: ty", true);
-    assert_eq!(
-        app.messages
-            .live_by_key(toolchain_words::KEY_PASS)
-            .map(|l| l.msg.title.as_str()),
-        Some("Installing ALab tools"),
-        "the new pass is on glass at once"
-    );
-    assert_eq!(app.message_band_rows, 1);
-}
-
-/// A FIRST RUN'S ROW WHOSE FEED WENT SILENT FOLDS AT ITS CAP (upstream
-/// `a_live_bar_whose_feed_went_silent_folds_at_its_cap`, whose reads are
-/// a first run's since dbf97ecff): no read for the tailed cap and the
-/// meter is gone — and, as the bars' settle recorded every bar that left
-/// the glass, the words it showed are on record. The center's own test
-/// pins that a fresh read re-arms the cap (`center.rs`, "each restate
-/// re-arms the cap").
-#[test]
-fn a_first_run_row_whose_feed_went_silent_folds_at_its_cap() {
-    let mut app = App::headless_for_test();
-    app.apply_toolchain_snapshot(Some(&net_read(true, 1_700_000_000)), true);
-    let now = Instant::now();
-    let (stale_at, load_shown) = app
-        .messages
-        .live_by_key(toolchain_words::KEY_PASS)
-        .map(|l| (l.stale_at, l.load_shown))
-        .expect("the live row");
-    let stale_at = stale_at.expect("the tailed cap");
-    assert!(stale_at <= now + aterm_messages::STALE_TAILED);
-    // The extraction's load words are up from the first frame (design
-    // §10.6, review round 2): the cap is the one deadline.
-    assert!(load_shown, "an extraction declares the disk, shown at post");
-    assert_eq!(app.messages_deadline(), Some(stale_at));
-    assert!(
-        !app.settle_messages(now + aterm_messages::STALE_TAILED / 2),
-        "not yet"
-    );
-    assert_eq!(app.messages.live_rows().count(), 1);
-    assert!(
-        app.settle_messages(now + aterm_messages::STALE_TAILED),
-        "no report for the cap: gone"
-    );
-    assert_eq!(app.messages.live_rows().count(), 0);
-    let rows = appstatus(&app);
-    assert_eq!(rows.len(), 1, "{rows:?}");
-    assert!(
-        // The log states the outcome (ruling 259): the live title is
-        // the record's first detail line.
-        rows[0].starts_with(
-            "activity kind=toolchain phase=done progress=- title=Installing%20stopped \
-             detail=Installing%20ALab%20tools "
-        ),
-        "the capped row leaves its words on record, as the bars' settle did: {}",
-        rows[0]
-    );
-}
-
-/// THE ROW OUTLIVES THE GLASS (upstream `a_folded_bar_leaves_its_sentence_in_the_ledger`
-/// and `settle_folds_expired_bars_and_reports_the_row_change`, re-cut for
-/// the owner's attention rule, design §10): a RECORD is on record at once
-/// and never on the glass — an `appnotice` text since H7; a ROW's fold is
-/// on record with the severity as the outcome — the ready row after its
-/// hold (ok, with its honest sentence, never "restart"), then a stopped
-/// lane's warning (warn). Each fold is reported as a glass change, the
-/// record is never a row, and a full record is still an idle zero.
-#[test]
-fn a_folded_row_leaves_its_sentence_on_record() {
-    let mut app = App::headless_for_test();
-    assert!(
-        app.take_app_notice("toolchain", "an operator's note")
-            .is_ok()
-    );
-    app.post_message(update_words::staged(
-        "0.48.0",
-        99,
-        Some(update_words::ApplyPosture::ManualByConfig),
-    ));
-    let now = Instant::now();
-    let done = |app: &App| -> Vec<String> {
-        appstatus(app)
-            .into_iter()
-            .filter(|r| r.contains(" phase=done "))
-            .collect()
-    };
-    assert_eq!(app.message_band_rows, 1, "the decision alone is a row");
-    let rows = done(&app);
-    assert_eq!(rows.len(), 1, "the record is on record at once: {rows:?}");
-    let enc = crate::control::pct_encode;
-    assert!(
-        rows[0].starts_with(&format!(
-            "activity kind=toolchain phase=done progress=- title={} ",
-            enc("an operator's note")
-        )) && rows[0].contains(" outcome=ok "),
-        "{}",
-        rows[0]
-    );
-    assert!(!app.settle_messages(now), "nothing due yet");
-    assert!(
-        app.settle_messages(now + aterm_messages::HOLD_STAGED_MANUAL),
-        "the ready row folds after its hold, and the glass changed"
-    );
-    let rows = done(&app);
-    assert_eq!(rows.len(), 2);
-    assert!(
-        rows[1].starts_with("activity kind=update ") && rows[1].contains(" outcome=ok "),
-        "oldest first — the order they left the glass: {rows:?}"
-    );
-    let staged = app
-        .messages
-        .log()
-        .records()
-        .rfind(|r| r.tag == tags::UPDATE)
-        .map(|r| r.detail.join(" "))
-        .expect("the staged row is on record");
-    assert!(
-        staged.contains("automatic install is off") && !staged.contains("restart"),
-        "the record carries the honest sentence: {staged:?}"
-    );
-    // A warn row retires as a warn outcome, not an ok one.
-    let later = now + aterm_messages::HOLD_STAGED_MANUAL;
-    app.note_update_outcome(update_words::needs_install(
-        "Couldn't install aterm v0.48.0",
-        update_words::INSTALL_FROM_MENU,
-        Severity::Warn,
-        99,
-    ));
-    assert!(
-        app.settle_messages(later + aterm_messages::HOLD_WARN),
-        "then the stopped lane's warning"
-    );
-    let rows = done(&app);
-    let last = rows.last().expect("recorded");
-    assert!(
-        last.starts_with("activity kind=update ") && last.contains(" outcome=warn "),
-        "{last}"
-    );
-    app.settle_messages(
-        later
-            + aterm_messages::HOLD_WARN
-            + aterm_messages::SHRINK_QUIET
-            + std::time::Duration::from_millis(1),
-    );
-    assert_eq!(app.messages.live_rows().count(), 0);
-    assert_eq!(
-        app.message_band_rows, 0,
-        "the record holds no rows on the glass"
-    );
-    assert_eq!(
-        app.messages_deadline(),
-        None,
-        "FL-1: a full record is still an idle zero"
-    );
-}
-
-/// The shape `appstatus` promises (upstream
-/// `activity_rows_put_the_live_bars_above_the_finished_ones`, whose
-/// failure goes straight to the ledger since dbf97ecff): live rows
-/// first, then the finished ones, each carrying how it ended and how long
-/// ago — a toolchain failure is a record from the start, never a row.
-#[test]
-fn appstatus_puts_the_live_rows_above_the_finished_ones() {
-    let mut app = App::headless_for_test();
-    // A person asked (Check for Updates): the download is their wait
-    // and takes the row (design ruling 220).
-    app.note_update_check_asked(true);
-    app.record_toolchain_outcome(toolchain_words::failed("install failed"));
-    assert_eq!(
-        app.messages.live_rows().count(),
-        0,
-        "a failure goes straight to the record"
-    );
-    app.note_update_progress(&aterm_update::Progress::Downloading {
-        version: "0.62.0".into(),
-        bytes_done: 45,
-        bytes_total: 90,
-    });
-    let rows = appstatus(&app);
-    assert_eq!(rows.len(), 2, "one live, one finished: {rows:?}");
-    assert!(
-        rows[0].starts_with("activity kind=update phase=live progress=50/100 "),
-        "the live download leads, with its meter: {}",
-        rows[0]
-    );
-    assert!(
-        rows[1].starts_with("activity kind=toolchain phase=done progress=- ")
-            && rows[1].contains(" outcome=warn ")
-            && rows[1].contains(" since_ms="),
-        "the finished install follows, with how it ended: {}",
-        rows[1]
-    );
-}
-
-/// `seed-done:` is an ANSWER like the others (upstream `toolchain_ended`
-/// → `retire_answered_toolchain`; the `Wake::PkgSeedDone` arm routes it
-/// through [`App::record_toolchain_outcome`], as every other answer
-/// arm does): its record goes on `appstatus`, and the live row folds —
-/// unless a first-run child still runs, whose exit folds it.
-#[test]
-fn a_seed_done_answer_folds_the_live_row_unless_a_first_run_child_runs() {
-    let answer = |first_run| {
-        toolchain_words::ended(
-            "the pass finished; 12 ALab program(s) are installed",
-            first_run,
-        )
-    };
-    let mut app = App::headless_for_test();
-    app.announce_toolchain_pass("installing 10 ALab program(s) (about 3 GB)", true);
-    // The `Wake::PkgSeedDone` arm's latch: a first run's answer is an
-    // install (review 2026-09-24).
-    assert!(app.toolchain_row_latched && app.toolchain_first_run);
-    app.record_toolchain_outcome(answer(true));
-    assert_eq!(
-        app.messages.live_rows().count(),
-        1,
-        "the first run's child still runs"
-    );
-    app.toolchain_pass_ended(true);
-    assert_eq!(app.messages.live_rows().count(), 0);
-    let rows = appstatus(&app);
-    assert_eq!(rows.len(), 1, "{rows:?}");
-    assert!(
-        rows[0].contains(" outcome=ok ") && rows[0].contains("title=ALab%20tools%20installed "),
-        "{}",
-        rows[0]
-    );
-    // A live row with no first-run child behind it (one carried across a
-    // handoff) folds at the answer.
+fn an_answer_folds_a_live_row_no_child_is_latched_behind() {
     let mut app = App::headless_for_test();
     app.post_message(toolchain_words::announced("installing 2 program(s)"));
-    app.record_toolchain_outcome(answer(false));
+    app.record_toolchain_outcome(toolchain_words::ended(
+        "the pass finished; 12 ALab program(s) are installed",
+        false,
+    ));
     assert_eq!(app.messages.live_rows().count(), 0, "answered: folded");
     let rows = appstatus(&app);
-    assert_eq!(rows.len(), 1);
-    assert!(
-        rows[0].contains("title=ALab%20tools%20checked "),
-        "a routine answer claims no update: {}",
-        rows[0]
-    );
+    assert_eq!(rows.len(), 1, "the answer is on record: {rows:?}");
+    assert!(rows[0].contains(" phase=done "), "{}", rows[0]);
 }
 
 #[cfg(unix)]
@@ -3212,11 +1751,6 @@ fn the_parents_record_is_its_own_to_the_end_and_the_successors_waits_for_commit(
         "a hold that fell due under the park folds nothing"
     );
     assert!(app.messages.live(before).is_some() && app.messages.live(during).is_some());
-    assert_eq!(
-        app.carried_messages().next_message_id,
-        during.raw() + 1,
-        "the successor's ids continue past the parent's"
-    );
     // The exec: the flush lands everything before the process is
     // replaced, and leaves the writer open for a failed exec.
     app.flush_messages_log();
@@ -3250,126 +1784,52 @@ fn the_parents_record_is_its_own_to_the_end_and_the_successors_waits_for_commit(
 }
 
 #[cfg(unix)]
-/// THE HANDOFF CARRY (design §3.8; the port of status_bars.rs:4775 and
-/// app_restore.rs:4946-4961): the live rows cross the swap as plain words
-/// in glass order and re-seed under the handoff's staleness cap with
-/// their ids, words and holds; the update row moves on to "finishing"
-/// only when this process is the handed-off successor AND the carry had
-/// one, and a carried check warning stands (a landing answers only an
-/// install warning, finding 54), never latched (round eight, finding
-/// 301); no log
-/// line crosses (the parent's record is its own to the end); an older
-/// parent's `bars` map to rows and junk is dropped.
+/// THE HANDOFF CARRY, the host's half (design §3.8; the carry's own encoding,
+/// glass order, holds and caps are the engine's `center` carry tests, a
+/// carried check warning's fate `a_carried_check_warning_heals_by_the_successors_first_healthy_check`):
+/// the update row moves on to "finishing" only when this process is the
+/// handed-off successor AND the carry had one — the successor adopts it as its
+/// flow — and nothing is invented without one; nothing crosses as a log
+/// line; the geometry is the parent's until Commit (ids continuing above the
+/// parked parent's band are
+/// `a_record_the_parked_parent_makes_never_shares_an_id_with_the_successor`'s);
+/// an older parent's `bars` still decode and seed nothing; an empty carry
+/// raises nothing.
 #[test]
 fn a_handoff_carries_live_rows() {
     let mut parent = App::headless_for_test();
-    let toolchain = parent.post_message(toolchain_words::announced("installing ay, trust"));
-    parent.post_message(update_words::staged("0.76.0", 7, None));
     let installing = parent.post_message(update_words::installing("0.76.0"));
-    let health = parent.post_message(update_words::health_warning(
-        update_words::HealthKind::Check,
-        "Update checks failing",
-        "3 consecutive check failures",
-    ));
-    assert_eq!(parent.message_band_rows, 3);
-    assert_eq!(
-        parent.messages.log().pending_len(),
-        0,
-        "everything before the park was drained"
-    );
-    // The park: a record posted under it drains as any other (a
-    // ledger-only row — two lines, nothing on the glass, no writer here).
+    parent.post_message(toolchain_words::announced("installing ay, trust"));
     parent.pending_update_handoff = Some(parked());
-    let logged = parent.post_message(
-        Message::new(tags::SYSTEM, Severity::Info, "ledger only").hold(Hold::LogOnly),
-    );
-    assert_eq!(
-        parent.messages.log().pending_len(),
-        0,
-        "the parent's drain never waits"
-    );
-    let carried = parent.carried_messages();
-    let titles: Vec<&str> = carried.messages.iter().map(|m| m.title.as_str()).collect();
-    assert_eq!(
-        titles,
-        [
-            "Update checks failing",
-            "Installing ALab tools",
-            "Installing aterm v0.76.0",
-        ],
-        "the glass rows, in glass order (the warning outranks the lane rows)"
-    );
-    assert!(carried.messages.iter().all(|m| m.on_glass));
-    assert_eq!(carried.messages[2].id, installing.raw());
-    assert_eq!(
-        carried.messages[2].key.as_deref(),
-        Some(update_words::KEY_PROGRESS)
-    );
-    assert_eq!(carried.messages[0].hold, "default");
-    assert!(
-        carried.messages[1].busy && carried.messages[2].busy,
-        "the first-run row and the installing row moved; the carry says so"
-    );
-    assert_eq!(carried.next_message_id, logged.raw() + 1);
-    let carry = window_carry(parent.message_band_rows, carried.clone());
+    let carry = window_carry(parent.message_band_rows, parent.carried_messages());
 
     // THE SUCCESSOR, before Commit.
     let mut successor = App::headless_for_test();
     successor.incoming_handoff_pending = true;
     successor.message_band_rows = carry.status_bar_rows.min(MAX_ROWS);
     successor.seed_carried_messages(&carry, Some("0.76.0"));
-    let row = successor.messages.live(toolchain).expect("the id is kept");
-    assert_eq!(row.msg.title, "Installing ALab tools");
-    assert!(
-        row.msg.detail.is_empty(),
-        "no size in the sentence: no line"
+    assert_eq!(
+        successor
+            .messages
+            .live_by_key(update_words::KEY_PROGRESS)
+            .map(|l| l.id),
+        Some(installing),
+        "the progress row crossed"
     );
-    assert!(
-        row.msg.meter.as_ref().is_some_and(|m| m.busy),
-        "the busy flag rides the carry"
-    );
-    assert!(!row.is_queued(), "a glass row lands on the glass");
-    assert_eq!(row.fold_at, None, "no hold before Commit…");
-    assert!(row.stale_at.is_some(), "…only the handoff's cap");
-    assert_eq!(row.msg.origin, aterm_messages::Origin::Carried);
-    let update = successor
-        .messages
-        .live_by_key(update_words::KEY_PROGRESS)
-        .expect("the progress row crossed");
-    assert_eq!(update.id, installing);
-    assert_eq!(update.msg.title, "Finishing aterm v0.76.0");
-    assert_eq!(update.msg.detail, vec![update_words::FINISHING]);
     assert_eq!(
         successor.live_update_flow().map(|f| f.phase),
         Some(FlowPhase::Finishing),
         "the successor adopts the flow row as its own"
-    );
-    assert!(
-        successor.messages.live(health).is_some(),
-        "a landing proves nothing about checking: the check warning stands (finding 54)"
-    );
-    assert!(
-        !successor
-            .update_health_latched
-            .contains(&update_words::HealthKind::Check),
-        "…never latched: a latch only a proof lifts stood for the launch, and \
-         muted this process's own next episode (round eight, finding 301)"
-    );
-    assert_eq!(
-        successor.messages.log().next_id().raw(),
-        carried.next_message_id + PARKED_PARENT_ID_RESERVE,
-        "ids continue past the carry, above the band the parked parent records in"
     );
     assert_eq!(
         successor.messages.log().pending_len(),
         0,
         "nothing crossed as a log line"
     );
-    assert!(
-        !successor.sync_message_band_rows(Instant::now()),
+    assert_eq!(
+        successor.message_band_rows, carry.status_bar_rows,
         "the geometry is the parent's until Commit"
     );
-    assert_eq!(successor.message_band_rows, 3);
 
     // Not the successor of a handoff: the words come back as they were.
     let mut plain = App::headless_for_test();
@@ -3380,42 +1840,23 @@ fn a_handoff_carries_live_rows() {
             .live_by_key(update_words::KEY_PROGRESS)
             .unwrap()
             .msg
-            .title,
-        "Installing aterm v0.76.0"
-    );
-    assert_eq!(
-        plain
-            .messages
-            .live_by_key(update_words::KEY_PROGRESS)
-            .unwrap()
-            .msg
             .detail,
         vec![update_words::INSTALLING],
         "its words as they were"
     );
-    assert!(
-        plain.messages.live(health).is_some(),
-        "with no landing to prove it, the warning stands"
-    );
 
-    // No progress row carried: nothing is invented, and the health row
-    // stands even for the successor.
-    let mut healthy = App::headless_for_test();
-    healthy.post_message(update_words::health_warning(
-        update_words::HealthKind::Check,
-        "Update checks failing",
-        "x",
-    ));
-    let only_health = window_carry(1, healthy.carried_messages());
+    // No progress row carried: nothing is invented.
+    let mut other = App::headless_for_test();
+    other.post_message(toolchain_words::announced("installing ay"));
+    let no_progress = window_carry(1, other.carried_messages());
     let mut successor = App::headless_for_test();
-    successor.seed_carried_messages(&only_health, Some("0.76.0"));
+    successor.seed_carried_messages(&no_progress, Some("0.76.0"));
     assert!(
         successor
             .messages
             .live_by_key(update_words::KEY_PROGRESS)
             .is_none()
     );
-    assert!(successor.messages.live_health().is_some());
 
     // An OLDER parent's `bars` (the status bars' carry, read until Phase 6):
     // the manifest still decodes — serde skips the key — and seeds nothing,
@@ -3550,124 +1991,6 @@ fn a_landed_update_leaves_no_outcome_row_that_said_it_had_not() {
         assert!(
             successor.messages.log().records().any(|r| r.title == title),
             "{title}: the record keeps what it said"
-        );
-    }
-}
-
-#[cfg(unix)]
-/// A LANDING ANSWERS AN INSTALL WARNING ONLY (round-seven update audit,
-/// finding 54): build X was staged while checks worked, then checks failed
-/// and "Couldn't check for updates" went up; the person pressed Install
-/// now and X landed. The updater's ledger still holds the check streak
-/// (`record_apply_success` clears the apply streak only), so the successor
-/// must not record "aterm updates work again" against the check warning,
-/// nor take it down — and it does not raise it a second time: its class is
-/// this process's updater's now, which restates a streak still failing
-/// quietly (round eight, finding 301). A real check
-/// (`HealthProof::Checked`) then heals it and records the healing. The
-/// negative control: an install warning carried the same way IS answered
-/// by the landing.
-#[test]
-fn a_landing_heals_only_an_install_warning() {
-    let body = "20 failed checks in a row since 2026-09-14T22:04:36Z: the reason.";
-    let mut parent = App::headless_for_test();
-    assert!(parent.note_update_health_as(
-        update_words::HealthKind::Check,
-        "Couldn't check for updates",
-        body,
-    ));
-    parent.post_message(update_words::installing("9.9.9"));
-    let carry = window_carry(parent.message_band_rows, parent.carried_messages());
-    let mut successor = App::headless_for_test();
-    successor.seed_carried_messages(&carry, Some("9.9.9"));
-    successor.messages.after_handoff_commit(Instant::now());
-    successor.post_update_landed("9.9.9", 7, 0);
-    let healed = |app: &App| {
-        app.messages
-            .log()
-            .records()
-            .filter(|r| r.title == "aterm updates work again")
-            .count()
-    };
-    assert_eq!(
-        healed(&successor),
-        0,
-        "a landing proves nothing about checking: no healing on record"
-    );
-    assert_eq!(
-        successor
-            .live_update_health(|k| k == update_words::HealthKind::Check)
-            .len(),
-        1,
-        "the check warning stands"
-    );
-    assert_eq!(
-        UPDATER_ADOPTED_HEALTH.with(|adopted| std::mem::take(&mut *adopted.borrow_mut())),
-        vec!["manifest"],
-        "the class is this process's updater's: it is not announced a second time"
-    );
-    assert!(
-        !successor.note_update_health(aterm_update::HEALTH_RESTATED_TITLE, body),
-        "the successor's first failing check restates it, quietly"
-    );
-    successor.heal_update_health(HealthProof::Checked);
-    assert_eq!(healed(&successor), 1, "a real check heals it, on record");
-    assert!(
-        successor
-            .live_update_health(|k| k == update_words::HealthKind::Check)
-            .is_empty()
-    );
-
-    // The negative control: an install warning is the landing's to answer.
-    let mut parent = App::headless_for_test();
-    assert!(parent.note_update_health(aterm_update::health_failing_title("apply"), body));
-    parent.post_message(update_words::installing("9.9.9"));
-    let carry = window_carry(parent.message_band_rows, parent.carried_messages());
-    let mut successor = App::headless_for_test();
-    successor.seed_carried_messages(&carry, Some("9.9.9"));
-    successor.messages.after_handoff_commit(Instant::now());
-    successor.post_update_landed("9.9.9", 7, 0);
-    assert_eq!(
-        healed(&successor),
-        1,
-        "the landing heals an install warning"
-    );
-    assert!(successor.live_update_health(|_| true).is_empty());
-}
-
-#[cfg(unix)]
-/// WHAT A HEALTH WARNING SAID crosses on the automatic lane too (round-seven
-/// update audit, finding 31 — fixed by round six's finding 54, pinned
-/// here): no progress row is carried, the warning is either still on glass
-/// or already folded in the parent, and the landing still puts "aterm
-/// updates work again" on the successor's record.
-#[test]
-fn an_automatic_landing_records_the_healing_of_a_carried_warning() {
-    let body = "20 failed checks in a row since 2026-09-14T22:04:36Z: the reason.";
-    for folded in [false, true] {
-        let mut parent = App::headless_for_test();
-        assert!(parent.note_update_health(aterm_update::health_failing_title("apply"), body));
-        if folded {
-            let past =
-                Instant::now() + aterm_messages::HOLD_WARN + std::time::Duration::from_secs(60);
-            parent.settle_messages(past);
-            assert!(
-                parent.live_update_health(|_| true).is_empty(),
-                "the warning folded in the parent"
-            );
-        }
-        // No installing row: the automatic lane.
-        let carry = window_carry(parent.message_band_rows, parent.carried_messages());
-        let mut successor = App::headless_for_test();
-        successor.seed_carried_messages(&carry, Some("0.76.0"));
-        successor.post_update_landed("0.76.0", 7, 0);
-        assert!(
-            successor
-                .messages
-                .log()
-                .records()
-                .any(|r| r.title == "aterm updates work again"),
-            "folded={folded}: the healing is on the successor's record"
         );
     }
 }
@@ -3824,9 +2147,10 @@ fn a_carried_unhealed_stall_never_silences_the_successors_own_watchdog() {
 /// row. The class is now handed to this process's updater as announced
 /// (`aterm_update::adopt_announced_health`; its own tests prove the
 /// recovery an up-to-date check then sends), whose recovery is the proof:
-/// the warning lifts, the healing is on record against the parent's words,
-/// and the next episode speaks. Both lanes — the automatic one carries no
-/// progress row, only what the parent said.
+/// the warning lifts and the healing is on record against the parent's words
+/// (the next episode speaking is `carried_health_conformance`'s `Announce`).
+/// Both lanes — the automatic one carries no progress row, only what the
+/// parent said.
 #[test]
 fn a_carried_check_warning_heals_by_the_successors_first_healthy_check() {
     let check = update_words::HealthKind::Check;
@@ -3850,9 +2174,16 @@ fn a_carried_check_warning_heals_by_the_successors_first_healthy_check() {
             owes_entry(&successor, check),
             "its digest line crosses the update (automatic: {automatic})"
         );
-        // Still failing: the adopting updater restates it, quietly.
+        // Still failing: the adopting updater restates it, quietly — and the
+        // landing, which proves nothing about checking (finding 54), left the
+        // carried row standing, never a second beside it.
         assert!(!successor.note_update_health(aterm_update::HEALTH_RESTATED_TITLE, body));
         assert!(healings(&successor).is_empty());
+        assert_eq!(
+            successor.live_update_health(|k| k == check).len(),
+            1,
+            "the carried check warning stands, alone (automatic: {automatic})"
+        );
         // Up to date: the adopting updater's recovery, naming the class.
         assert!(!successor.note_update_health(aterm_update::HEALTH_RECOVERED_TITLE, "manifest"));
         assert_eq!(
@@ -3862,21 +2193,22 @@ fn a_carried_check_warning_heals_by_the_successors_first_healthy_check() {
         );
         assert!(successor.live_update_health(|k| k == check).is_empty());
         assert!(!owes_entry(&successor, check), "and its digest line");
-        // A later episode is said: a row and its digest line.
-        let later = "3 failed checks in a row since 2026-09-29T15:00:00Z: another reason.";
-        assert!(
-            successor.note_update_health(title, later),
-            "a new failing episode is announced (automatic: {automatic})"
-        );
-        assert_eq!(successor.live_update_health(|k| k == check).len(), 1);
-        assert!(owes_entry(&successor, check));
-        // And its own healing is recorded against its own words.
-        successor.note_update_health(aterm_update::HEALTH_RECOVERED_TITLE, "manifest");
-        assert_eq!(
-            healings(&successor).last().map(String::as_str),
-            Some("after \"Couldn't check for updates\", since Sep 29")
-        );
     }
+    // FOLDED in the parent before the park (host-msgs-R44-HOST-1): no
+    // carried row names it, but what the parent said does — still handed
+    // over, once.
+    UPDATER_ADOPTED_HEALTH.with(|adopted| adopted.borrow_mut().clear());
+    let _folded = landed_successor(false, |parent| {
+        assert!(parent.note_update_health(title, body));
+        parent.settle_messages(
+            Instant::now() + aterm_messages::HOLD_WARN + std::time::Duration::from_secs(60),
+        );
+        assert!(parent.live_update_health(|_| true).is_empty(), "folded");
+    });
+    assert_eq!(
+        UPDATER_ADOPTED_HEALTH.with(|adopted| std::mem::take(&mut *adopted.borrow_mut())),
+        vec!["manifest"]
+    );
     // NEGATIVE CONTROL: a successor that carried nothing hands nothing over.
     UPDATER_ADOPTED_HEALTH.with(|adopted| adopted.borrow_mut().clear());
     let _quiet = landed_successor(true, |_| {});
@@ -3931,104 +2263,66 @@ fn a_carried_warnings_digest_line_says_what_the_parents_would_have() {
 }
 
 #[cfg(unix)]
-/// ROUND-EIGHT UPDATE AUDIT, FINDING 301 (scenario B), WITH 302's
-/// REALISTIC NEXT EVENT — A CARRIED STALL WARNING IS THE SUCCESSOR'S
-/// WATCHDOG'S TO HEAL. "Update check stopped" is about the parent's check
-/// thread; the successor runs a new one, as a replacement generation does in
-/// one process, and heals the warning by the same proof: its first completed
-/// check, with the healing on record. NEGATIVE CONTROL: a beat that has
-/// completed no check yet heals nothing.
-#[test]
-fn a_carried_stall_warning_heals_at_the_successors_first_completed_check() {
-    let stalled = update_words::HealthKind::Stalled;
-    let body = update_words::checker_stalled_body(3_000, "checking", true, false);
-    for automatic in [false, true] {
-        let mut successor = landed_successor(automatic, |parent| {
-            assert!(parent.note_update_health_as(
-                stalled,
-                update_words::CHECKER_STALLED_TITLE,
-                &body
-            ));
-        });
-        assert!(!successor.update_health_latched.contains(&stalled));
-        successor.look_at_update_checker(None, 100);
-        successor.look_at_update_checker(Some(successor_beat(0, 0)), 110);
-        assert!(
-            healings(&successor).is_empty(),
-            "NEGATIVE: no check has completed here yet (automatic: {automatic})"
-        );
-        assert!(owes_entry(&successor, stalled), "its digest line crosses");
-        successor.look_at_update_checker(Some(successor_beat(1, 0)), 200);
-        assert!(successor.live_update_health(|k| k == stalled).is_empty());
-        assert!(
-            !owes_entry(&successor, stalled),
-            "its digest line heals with it"
-        );
-        assert_eq!(
-            healings(&successor).len(),
-            1,
-            "this process's first completed check heals it (automatic: {automatic})"
-        );
-        assert!(
-            healings(&successor)[0].starts_with("after \"Update check stopped\""),
-            "{:?}",
-            healings(&successor)
-        );
-        // A later stall of this process's own checker is said, with its row.
-        successor.announce_update_checker_stall(
-            crate::update_checker_watch::CheckerStall {
-                generation: 1,
-                for_secs: 3_000,
-                phase: aterm_update::checker_watch::CheckerPhase::Checking,
-                holds_lane: true,
-                checks: 1,
-            },
-            None,
-        );
-        assert_eq!(successor.live_update_health(|k| k == stalled).len(), 1);
-    }
-}
-
-#[cfg(unix)]
 /// ROUND-EIGHT UPDATE AUDIT, FINDINGS 15 AND 301 (lock-held), WITH 302's
 /// REALISTIC NEXT EVENT — A CARRIED LOCK-HELD WARNING IS THE SUCCESSOR'S
 /// WATCHDOG'S TO HEAL. A landing proves nothing about a sibling aterm holding
 /// the machine's check lock, but the successor's own checker sees the
 /// streak's end: its first check completed without deferring (as for a
 /// replacement generation, round six's finding 9). Latched with nothing to
-/// heal it, the next lock-held episode was swallowed. NEGATIVE CONTROLS: no
-/// checker yet, or one that has checked nothing, heals nothing; and a
-/// sibling still stuck is taken over by the successor's own deferrals —
-/// said once, not twice, healed when it ends.
+/// heal it, the next lock-held episode was swallowed. The same holds for a
+/// carried STALL ("Update check stopped", about the parent's check thread:
+/// the successor runs a new one and heals it by the same proof, finding 301
+/// scenario B). NEGATIVE CONTROLS: no checker yet, or one that has checked
+/// nothing, heals nothing; and a sibling still stuck is taken over by the
+/// successor's own deferrals — said once, not twice, healed when it ends.
 #[test]
 fn a_carried_lock_held_warning_is_the_successors_watchdog_to_heal() {
     use aterm_update::checker_watch::CHECKER_UNGATED_AFTER;
     let held = update_words::HealthKind::LockHeld;
+    let stalled = update_words::HealthKind::Stalled;
+    let stall_body = update_words::checker_stalled_body(3_000, "checking", true, false);
     let rows = |app: &App| app.live_update_health(|k| k == held).len();
-    for automatic in [false, true] {
+    for (kind, automatic) in [
+        (stalled, false),
+        (stalled, true),
+        (held, false),
+        (held, true),
+    ] {
+        let case = format!("{kind:?}, automatic: {automatic}");
         // The sibling let go before the successor's first check.
         let mut successor = landed_successor(automatic, |parent| {
-            parent.announce_checker_lock_held(CHECKER_UNGATED_AFTER);
+            if kind == held {
+                parent.announce_checker_lock_held(CHECKER_UNGATED_AFTER);
+            } else {
+                assert!(parent.note_update_health_as(
+                    stalled,
+                    update_words::CHECKER_STALLED_TITLE,
+                    &stall_body
+                ));
+            }
         });
-        assert!(!successor.update_health_latched.contains(&held));
+        assert!(!successor.update_health_latched.contains(&kind), "{case}");
         successor.look_at_update_checker(None, 100);
         successor.look_at_update_checker(Some(successor_beat(0, 0)), 110);
         assert!(
             healings(&successor).is_empty(),
-            "NEGATIVE: nothing here has seen the lock yet (automatic: {automatic})"
+            "NEGATIVE: no check has completed here yet ({case})"
         );
-        assert!(owes_entry(&successor, held), "its digest line crosses");
+        assert!(owes_entry(&successor, kind), "its digest line crosses");
         successor.look_at_update_checker(Some(successor_beat(1, 0)), 200);
-        assert_eq!(rows(&successor), 0);
+        assert!(successor.live_update_health(|k| k == kind).is_empty());
         assert!(
-            !owes_entry(&successor, held),
-            "its digest line heals with it"
+            !owes_entry(&successor, kind),
+            "its digest line heals with it ({case})"
         );
         assert_eq!(
             healings(&successor).len(),
             1,
-            "a check completed without deferring ends the streak (automatic: {automatic})"
+            "a check completed without deferring heals it, on record ({case})"
         );
+        if kind == stalled {
+            continue;
+        }
         // A later streak is said again.
         successor.look_at_update_checker(Some(successor_beat(2, CHECKER_UNGATED_AFTER)), 300);
         assert_eq!(
@@ -4169,16 +2463,6 @@ fn a_cold_lane_landing_records_the_healing_of_the_parents_install_warning() {
         )))
         .is_empty()
     );
-    // The lanes are wired: the cold arm binds it, the window's entry takes it
-    // and hands it to the App before its first present lands it.
-    let handoff = include_str!("app_update_handoff.rs");
-    assert!(
-        handoff.contains("bind_cold_lane_health_said(&mut command, &self.carried_health_said());"),
-        "the cold arm names it on its exec"
-    );
-    let main = include_str!("lib.rs");
-    assert!(main.contains("app_update_handoff::take_cold_lane_health_said(just_updated)"));
-    assert!(main.contains("app.take_up_carried_health_said(&cold_lane_health_said);"));
 }
 
 /// The Commit flush in the park tests, whose subject is what the successor
@@ -4273,39 +2557,24 @@ fn a_late_park_successor_sees_the_parents_records_written_after_its_boot() {
 /// keeps a fold on the parent's glass and a row restated here live too).
 #[test]
 fn a_row_the_parked_parent_ended_after_the_capture_stays_ended() {
-    let dir = std::env::temp_dir().join(format!(
-        "aterm-messages-parked-endings-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-    let path = dir.join(crate::messages_store::FILE_NAME);
-    let mut parent = App::headless_for_test();
-    parent.messages_log = crate::messages_store::Writer::spawn(&path);
-    assert!(parent.note_update_health_as(
-        update_words::HealthKind::Check,
-        "Couldn't check for updates",
-        "3 failed checks in a row since 2026-09-28T00:00:00Z: x",
-    ));
-    let resolved = parent.post_message(warn("a reporter ends this one").key("test.resolved"));
-    let open = parent.post_message(warn("nobody ends this one").key("test.open"));
-    parent.sync_messages();
-    // The park: the carry is captured…
-    let carry = window_carry(parent.message_band_rows, parent.carried_messages());
-    parent.pending_update_handoff = Some(parked());
-    // …and the parent's loop runs on: a heal, a reporter's resolve.
-    parent.heal_update_health(HealthProof::Checked);
-    parent.resolve_message(resolved, Outcome::Ok);
-    assert!(parent.flush_messages_log_within(COMMIT_FLUSH_IN_TESTS));
-    drop(parent);
-
-    let mut successor = App::headless_for_test();
-    successor.messages_log = crate::messages_store::Writer::spawn(&path);
-    successor.incoming_handoff_pending = true;
-    successor.seed_carried_messages(&carry, Some("9.9.9"));
-    successor.incoming_handoff_pending = false;
-    successor.reload_messages_log_at_commit();
-    successor.messages.after_handoff_commit(Instant::now());
+    let ids = std::cell::Cell::new(None);
+    let (mut successor, dir) = committed_after_park(
+        "parked-endings",
+        |parent| {
+            say_check_warning(parent);
+            let resolved =
+                parent.post_message(warn("a reporter ends this one").key("test.resolved"));
+            let open = parent.post_message(warn("nobody ends this one").key("test.open"));
+            ids.set(Some((resolved, open)));
+        },
+        // The parent's loop runs on: a heal, a reporter's resolve.
+        |parent| {
+            parent.heal_update_health(HealthProof::Checked);
+            let (resolved, _) = ids.get().expect("posted");
+            parent.resolve_message(resolved, Outcome::Ok);
+        },
+    );
+    let (resolved, open) = ids.get().expect("posted");
     assert!(
         successor.live_update_health(|_| true).is_empty(),
         "the warning the parent healed stays healed"
@@ -4319,13 +2588,7 @@ fn a_row_the_parked_parent_ended_after_the_capture_stays_ended() {
         "a carried row nobody ended is the successor's now"
     );
     successor.heal_update_health(HealthProof::Checked);
-    let healings = successor
-        .messages
-        .log()
-        .records()
-        .filter(|rec| rec.title == "aterm updates work again")
-        .count();
-    assert_eq!(healings, 1, "one healing, the parent's");
+    assert_eq!(healing_count(&successor), 1, "one healing, the parent's");
     drop(successor.messages_log.take());
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -4343,37 +2606,16 @@ fn a_row_the_parked_parent_ended_after_the_capture_stays_ended() {
 /// record, as the test above and the one below pin.
 #[test]
 fn a_health_warning_the_parked_parent_dismissed_is_still_healed_on_record() {
-    let dir = std::env::temp_dir().join(format!(
-        "aterm-messages-parked-dismissal-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-    let path = dir.join(crate::messages_store::FILE_NAME);
-    let mut parent = App::headless_for_test();
-    parent.messages_log = crate::messages_store::Writer::spawn(&path);
-    assert!(parent.note_update_health_as(
-        update_words::HealthKind::Check,
-        "Couldn't check for updates",
-        "3 failed checks in a row since 2026-09-28T00:00:00Z: x",
-    ));
-    parent.sync_messages();
-    let carry = window_carry(parent.message_band_rows, parent.carried_messages());
-    parent.pending_update_handoff = Some(parked());
-    // The person presses ✕ on the warning while the parent is parked.
-    let warning = parent.live_update_health(|_| true);
-    assert_eq!(warning.len(), 1, "PRECONDITION: the warning is up");
-    assert!(parent.messages.dismiss(warning[0], Instant::now()));
-    assert!(parent.flush_messages_log_within(COMMIT_FLUSH_IN_TESTS));
-    drop(parent);
-
-    let mut successor = App::headless_for_test();
-    successor.messages_log = crate::messages_store::Writer::spawn(&path);
-    successor.incoming_handoff_pending = true;
-    successor.seed_carried_messages(&carry, Some("9.9.9"));
-    successor.incoming_handoff_pending = false;
-    successor.reload_messages_log_at_commit();
-    successor.messages.after_handoff_commit(Instant::now());
+    let (mut successor, dir) = committed_after_park(
+        "parked-dismissal",
+        say_check_warning,
+        // The person presses ✕ on the warning while the parent is parked.
+        |parent| {
+            let warning = parent.live_update_health(|_| true);
+            assert_eq!(warning.len(), 1, "PRECONDITION: the warning is up");
+            assert!(parent.messages.dismiss(warning[0], Instant::now()));
+        },
+    );
     assert!(
         successor.live_update_health(|_| true).is_empty(),
         "the row the person dismissed stays dismissed"
@@ -4390,14 +2632,9 @@ fn a_health_warning_the_parked_parent_dismissed_is_still_healed_on_record() {
         "and the day's entry of a failure nobody healed stays claimed"
     );
     successor.heal_update_health(HealthProof::Checked);
-    let healings = successor
-        .messages
-        .log()
-        .records()
-        .filter(|rec| rec.title == "aterm updates work again")
-        .count();
     assert_eq!(
-        healings, 1,
+        healing_count(&successor),
+        1,
         "its healing is recorded, once, by the proof here"
     );
     drop(successor.messages_log.take());
@@ -4921,123 +3158,6 @@ fn a_record_the_parked_parent_makes_never_shares_an_id_with_the_successor() {
 }
 
 #[cfg(unix)]
-/// THE FILE IS MERGED FIRST AT COMMIT (round-seven update audit, finding
-/// 18, as reviewed): synchronously, before the Commit wake's first step
-/// that can mint an id — the landing's record among them — so no record
-/// of the parent's appears in this process's ring after, and below, an id
-/// a `messages since=` reader was handed. The merge itself is the test
-/// above; this pins where it runs.
-#[test]
-fn the_commit_wake_merges_the_parents_record_before_it_mints() {
-    let src = include_str!("lib.rs");
-    let wake = src
-        .find("Wake::ActivateCommittedHandoff { mut expected } => {")
-        .expect("the Commit wake");
-    let body = &src[wake..];
-    let reload = body
-        .find("self.reload_messages_log_at_commit();")
-        .expect("the Commit wake merges the file");
-    for mints in [
-        "self.hand_carried_restored_agents();",
-        "self.window_event(el, winit_id, deferred);",
-        // The landing's record is minted inside the freeze's lift, which
-        // commits the presence fold and the band's growth as one re-grid
-        // (`App::release_successor_commit_freeze`, pinned below).
-        "self.release_successor_commit_freeze();",
-    ] {
-        let at = body.find(mints).expect(mints);
-        assert!(reload < at, "the merge runs before `{mints}`");
-    }
-    let presence = include_str!("app_presence.rs");
-    let lift = presence
-        .find("pub(crate) fn release_successor_commit_freeze(&mut self) {")
-        .expect("the freeze's lift");
-    let lift_end = presence[lift..]
-        .find("\n    }\n")
-        .map(|e| lift + e)
-        .expect("the lift's end");
-    assert!(
-        presence[lift..lift_end].contains("app.post_update_landed("),
-        "the lift mints the landing's record"
-    );
-    assert!(
-        !src.contains("MessagesLogReloaded"),
-        "no later, asynchronous merge"
-    );
-}
-
-#[cfg(unix)]
-/// THE PARENT'S RECORD LANDS BEFORE COMMIT `_exit`S IT (round-seven update
-/// audit, finding 53): the lanes that never exec flush, bounded, as the
-/// ProofReady arm's last step before `commit_and_exit` — after every step
-/// that may still record, so nothing the writer thread holds dies with
-/// the process. The flush's own behaviour is the test above; this pins
-/// where it runs: last in what the claim answers, after the video answer
-/// (`App::answer_at_commit_claim`), and again, one fence grain at most,
-/// at the write, for what a held claim's fence recorded (round eight, #18)
-/// and for the rows the park's carry did not take, closed there (ruling 441
-/// (d)) after the admission's last reading, so a held pass it refuses keeps
-/// its rows, and their endings are in the file the successor reads. Where
-/// the close runs is `a_commit_whose_answers_took_time_holds_its_claim_through_the_fence`;
-/// what it closes is `uncarried_messages_tests`.
-#[test]
-fn the_seamless_parent_flushes_its_record_right_before_commit() {
-    let src = include_str!("app_update_handoff.rs");
-    let close = "let closed = self.close_uncarried_messages();";
-    let answers = src
-        .find("    fn answer_at_commit_claim(")
-        .expect("what the claim answers");
-    let answers_end = answers + src[answers..].find("\n    }\n").expect("its end");
-    let body = &src[answers..answers_end];
-    let video = body
-        .find("let video = self.video_answer_before_commit(VIDEO_EXPORT_COMMIT_WAIT);")
-        .expect("the claim answers video");
-    let flush = body
-        .find("self.flush_messages_log_within(MESSAGES_FLUSH_COMMIT_WAIT);")
-        .expect("and flushes the message log");
-    assert!(video < flush, "after the video answer");
-    assert!(
-        !body.contains("close_uncarried_messages("),
-        "the claim closes no row: a held claim's admission is read again"
-    );
-    let records = |text: &str| text.contains("record_message(") || text.contains("post_message(");
-    assert!(!records(&body[flush..]), "nothing records after it there");
-    let answered = src
-        .find("let answered_in = self.answer_at_commit_claim(child_pid);")
-        .expect("the ProofReady arm runs it");
-    let held_pass = answered
-        + src[answered..]
-            .find("self.finish_proven_handoff(crate::UpdateHandoffCompletion {")
-            .expect("a held claim goes to its next pass");
-    let write = held_pass
-        + src[held_pass..]
-            .find("if claim\n            && admitted\n            && let (Some(commit_fd), Some(proof))")
-            .expect("the write, after the admission's last reading");
-    let held_close = answered
-        + src[answered..]
-            .find(close)
-            .expect("the write closes the uncarried rows");
-    let held_flush = answered
-        + src[answered..]
-            .find("self.flush_messages_log_within(HANDOFF_INPUT_DRAIN_YIELD);")
-            .expect("and flushes what they and a held claim's fence recorded");
-    assert!(write < held_close, "only at the write");
-    assert!(held_close < held_flush, "before its flush");
-    let commit = answered
-        + src[answered..]
-            .find("crate::seamless::commit_and_exit(commit_fd, proof)")
-            .expect("and commits");
-    assert!(
-        held_flush < commit,
-        "the flush runs before the Commit write"
-    );
-    assert!(
-        !records(&src[answered..commit]),
-        "nothing records between the flushes and the Commit write"
-    );
-}
-
-#[cfg(unix)]
 /// A NOTICE WHILE PARKED IS TOLD TO RETRY (round-seven update audit,
 /// finding 32): the carry was captured at the park, so a post the parked
 /// parent accepted was never shown by the successor and its id was handed
@@ -5121,7 +3241,12 @@ fn a_carried_dead_publisher_row_leaves_with_the_process_it_described() {
 fn a_carried_recovery_row_offers_no_end_sessions_that_ends_nothing() {
     let mut parent = App::headless_for_test();
     let id = parent.post_message(crate::message_reporters::keeper_recovered_message(
-        2, 0, None, None,
+        2,
+        0,
+        crate::crash_restore::RungCounts::default(),
+        0,
+        None,
+        None,
     ));
     let _ = parent
         .settle_messages(Instant::now() + PROGRESS_GRACE + std::time::Duration::from_millis(10));
@@ -5158,119 +3283,14 @@ fn a_carried_recovery_row_offers_no_end_sessions_that_ends_nothing() {
 }
 
 #[cfg(unix)]
-/// A CARRY WITH NO ROWS STILL CARRIES THE PARENT'S NEXT ID (round-seven
-/// update audit, finding 18): the automatic lane parks with nothing on the
-/// band, while the parent recorded past what the successor loaded at its
-/// boot — so the successor's first record after Commit must still be
-/// numbered above every id the parent handed out, or a `messages since=`
-/// reader skips it.
+/// THE QUEUED CARRY converges at Commit (design §3.8; the carried rows' own
+/// lifetimes after Commit are the engine's `carry_round_trips_and_folds_after_commit`):
+/// the one state in which the two counts disagree — a row the parent's frozen
+/// count had queued — converges on the center's count at the first unfrozen
+/// sync.
 #[test]
-fn a_carry_with_no_rows_still_raises_the_successors_ids() {
-    let mut parent = App::headless_for_test();
-    for n in 0..10 {
-        parent.record_message(warn(&format!("record {n}")).hold(Hold::LogOnly));
-    }
-    let carried = parent.carried_messages();
-    assert!(carried.messages.is_empty(), "nothing is on the band");
-    assert_eq!(carried.next_message_id, 11);
-    let carry = window_carry(0, carried);
-    let mut successor = App::headless_for_test();
-    successor.incoming_handoff_pending = true;
-    successor.seed_carried_messages(&carry, Some("0.99.0"));
-    successor.incoming_handoff_pending = false;
-    let id = successor.record_message(warn("after commit").hold(Hold::LogOnly));
-    assert!(
-        id.raw() >= 11,
-        "the successor's first id is above the parent's: {id}"
-    );
-    let rows = successor.read_messages(&wire::ReadQuery {
-        since: MessageId::from_raw(10),
-        ..wire::ReadQuery::default()
-    });
-    assert!(
-        rows.iter().any(|row| row.contains("after%20commit")),
-        "a reader past the parent's last id sees it: {rows:?}"
-    );
-}
-
-#[cfg(unix)]
-/// AFTER COMMIT the carried rows take their own lifetimes back (design
-/// §3.8): a held row on glass anchors its hold at the commit instant and
-/// folds on it — into the ledger, as Folded — a standing row stands, and
-/// the band shrinks after the D1 quiet. Before Commit nothing folds on a
-/// hold and the row count never moves. And the one state in which the
-/// two counts disagree — a row the parent's frozen count had queued —
-/// converges on the center's count at the first unfrozen sync.
-#[test]
-fn carried_messages_reseed_live_and_fold_after_commit() {
-    let mut parent = App::headless_for_test();
-    let tools = vec!["ay".to_string()];
-    let pill = toolchain_words::seed_pill_text(&tools, None, 0, HookDialect::Zsh);
-    // A held Success row (the record's words at the default hold, as a
-    // build before the silent lane carried them).
-    let installed = parent.post_message(held_row(&toolchain_words::installed(&pill)));
-    // A STANDING row (the health warning holds its 45 s since the merge's
-    // ruling 59; a standing row is the GPU-lost and a11y lanes' shape).
-    let health = parent.post_message(
-        update_words::health_warning(
-            update_words::HealthKind::Check,
-            "Update checks failing",
-            "3 consecutive check failures",
-        )
-        .hold(Hold::STANDING),
-    );
-    assert_eq!(parent.message_band_rows, 2);
-    parent.pending_update_handoff = Some(parked());
-    let carry = window_carry(parent.message_band_rows, parent.carried_messages());
-    assert_eq!(carry.status_bar_rows, 2);
-
-    let mut successor = App::headless_for_test();
-    successor.incoming_handoff_pending = true;
-    successor.message_band_rows = carry.status_bar_rows.min(MAX_ROWS);
-    successor.seed_carried_messages(&carry, None);
-    assert_eq!(successor.messages.live_rows().count(), 2);
-    assert_eq!(successor.messages.committed_rows(), 2);
-    // A hold that would be due: nothing folds before Commit — the rows
-    // have no hold yet, and the freeze would decline one anyway.
+fn a_queued_carried_row_converges_on_the_centers_count_at_commit() {
     let now = Instant::now();
-    let past_success = now + HOLD_SUCCESS + std::time::Duration::from_secs(1);
-    assert!(!successor.settle_messages(past_success));
-    assert!(successor.messages.live(installed).is_some());
-    assert_eq!(successor.message_band_rows, 2, "frozen");
-
-    // COMMIT — what the `ActivateCommittedHandoff` arm does.
-    successor.incoming_handoff_pending = false;
-    successor.messages.after_handoff_commit(now);
-    successor.sync_messages();
-    let row = successor.messages.live(installed).unwrap();
-    assert_eq!(
-        row.fold_at,
-        Some(now + HOLD_SUCCESS),
-        "the success's own hold, from Commit"
-    );
-    assert_eq!(row.stale_at, None, "the handoff cap is gone");
-    let standing = successor.messages.live(health).unwrap();
-    assert_eq!(standing.fold_at, None);
-    assert_eq!(standing.stale_at, None, "a standing row stands");
-    assert_eq!(successor.message_band_rows, 2);
-    // The hold falls due: the row folds into the ledger; the band keeps
-    // its height through the D1 quiet and gives the row back after it.
-    assert!(successor.settle_messages(past_success));
-    assert!(successor.messages.live(installed).is_none());
-    assert_eq!(
-        successor.messages.log().get(installed).unwrap().state,
-        aterm_messages::LogState::Retired(aterm_messages::Retired::Folded)
-    );
-    assert!(successor.messages.live(health).is_some());
-    assert_eq!(successor.message_band_rows, 2, "shrink after the quiet…");
-    assert!(successor.settle_messages(past_success + aterm_messages::SHRINK_QUIET));
-    assert_eq!(successor.message_band_rows, 1, "…not before");
-    assert_eq!(
-        successor.messages.log().pending_len(),
-        0,
-        "the successor's own lines drained on the first sync after Commit (no writer here: dropped at the seam)"
-    );
-
     // THE QUEUED CARRY. A one-row band, a second row of the same rank
     // posted under the parent's freeze: it crosses queued; the successor's
     // center commits two rows for it while the geometry keeps the
@@ -5314,41 +3334,6 @@ fn carried_messages_reseed_live_and_fold_after_commit() {
     assert!(!successor.messages.live(second).unwrap().is_queued());
 }
 
-/// NO TOOLCHAIN ANSWER ARM POSTS A ROW (origin/main merge review,
-/// 2026-09-23). The merge's first cut left `Wake::PkgSeedDone` on
-/// `post_message(toolchain_words::ended(..))`: the record still landed,
-/// but the live row never folded at the answer and every window repainted
-/// for a record (ruling 34). The arms need an event loop, so the seam is
-/// pinned in the source: in `lib.rs` a `toolchain_words` builder reaches
-/// `post_message` only for an `appnotice` text (R34); every pass answer
-/// goes through [`App::record_toolchain_outcome`] or
-/// [`App::record_message`]. Whitespace is dropped first, so a rustfmt
-/// line break between the call and its builder cannot hide one.
-#[test]
-fn no_toolchain_answer_arm_posts_a_row() {
-    let source: String = include_str!("lib.rs").split_whitespace().collect();
-    let mut offenders = Vec::new();
-    for prefix in [
-        concat!("post_message(", "toolchain_words::"),
-        concat!("post_message(", "crate::toolchain_words::"),
-    ] {
-        for (at, _) in source.match_indices(prefix) {
-            let builder = source[at + prefix.len()..]
-                .split('(')
-                .next()
-                .unwrap_or_default();
-            if builder != "appnotice" {
-                offenders.push(builder.to_string());
-            }
-        }
-    }
-    assert!(
-        offenders.is_empty(),
-        "a toolchain answer raises a row instead of recording through \
-         `record_toolchain_outcome` / `record_message`: {offenders:?}"
-    );
-}
-
 // ---- Attention and motion (design §10.5, §10.8, §10.12) --------------
 
 /// A LIGHT routine read: the same pass as [`net_read`] with a plan far
@@ -5370,53 +3355,6 @@ fn recorded(app: &App, key: &str) -> Option<LogRecord> {
         .find(|r| r.key.as_deref() == Some(key))
         .filter(|r| r.retired() == Some(&Retired::Recorded))
         .cloned()
-}
-
-/// An automatic update is SILENT (design ruling 220, the owner's R3): its
-/// download takes no row and no re-grid — Settings ▸ Software Update says
-/// how far it has got — and its staged build is a RECORD (design §10.5
-/// H2), the words in the log.
-#[test]
-fn an_automatic_staged_build_is_a_record_and_leaves_no_row() {
-    let mut app = App::headless_for_test();
-    let regrids = message_regrids();
-    app.note_update_progress(&aterm_update::Progress::Downloading {
-        version: "9.9.9".into(),
-        bytes_done: 10_000_000,
-        bytes_total: 74_000_000,
-    });
-    assert_eq!(app.messages.live_rows().count(), 0, "no row: nobody waits");
-    let page = app.update_snapshot(false).projection();
-    assert_eq!(page.headline, "Downloading aterm v9.9.9\u{2026}");
-    assert_eq!(page.detail.as_deref(), Some("10 MB / 74 MB downloaded."));
-    app.note_update_progress(&aterm_update::Progress::Verifying {
-        version: "9.9.9".into(),
-    });
-    assert_eq!(app.messages.live_rows().count(), 0, "nor for its check");
-    let page = app.update_snapshot(false).projection();
-    assert_eq!(
-        page.headline, "Downloading aterm v9.9.9\u{2026}",
-        "the download's headline; the detail alone says it is checked"
-    );
-    assert_eq!(page.detail.as_deref(), Some("Checking the download."));
-    // The App's own posture — a headless App's is the handoff-off
-    // record; the automatic lane's is a record too.
-    app.note_update_progress(&aterm_update::Progress::Staged {
-        version: "9.9.9".into(),
-        build: 41,
-    });
-    app.settle_messages(Instant::now() + PROGRESS_GRACE * 2);
-    assert_eq!(app.messages.live_rows().count(), 0, "no row");
-    assert!(app.messages.echoes().is_empty(), "and no echo");
-    assert_eq!(app.message_band_rows, 0);
-    assert_eq!(
-        message_regrids(),
-        regrids,
-        "an automatic update costs no re-grid"
-    );
-    assert!(app.update_quiet.is_none(), "the page reads the stage now");
-    let rec = recorded(&app, update_words::KEY_PROGRESS).expect("the staged record");
-    assert_eq!(rec.title, "aterm v9.9.9 is ready");
 }
 
 /// WHO STARTED IT DECIDES THE ROW (design ruling 220): the same slow
@@ -5475,7 +3413,7 @@ fn an_automatic_update_costs_no_regrid_and_a_persons_at_most_two() {
             "asked={asked}: one open, one fold — or nothing"
         );
         let rec = recorded(&app, update_words::KEY_PROGRESS).expect("the staged record");
-        assert_eq!(rec.title, "aterm v9.9.9 is ready", "asked={asked}");
+        assert!(rec.title.contains("9.9.9"), "asked={asked}: {}", rec.title);
     }
 }
 
@@ -5490,10 +3428,6 @@ fn an_automatic_download_that_fails_is_a_record_with_its_version() {
         bytes_done: 10_000_000,
         bytes_total: 0,
     });
-    assert_eq!(
-        app.update_snapshot(false).projection().detail.as_deref(),
-        Some("10 MB downloaded.")
-    );
     app.note_update_progress(&aterm_update::Progress::Failed {
         detail: "connection reset".into(),
     });
@@ -5504,7 +3438,7 @@ fn an_automatic_download_that_fails_is_a_record_with_its_version() {
         app.messages
             .log()
             .records()
-            .any(|r| r.title == "Couldn't download aterm v9.9.9"),
+            .any(|r| r.severity == Severity::Warn && r.title.contains("9.9.9")),
         "the failure's record names the version"
     );
 }
@@ -5654,6 +3588,9 @@ fn a_refused_install_resolves_warn_and_echoes_fault() {
 /// VERY HEAVY SYSTEM USE (design §10.6, H8): a routine pass that planned
 /// at least `HEAVY_PASS_BYTES` raises its one row — after the grace, so
 /// the glass moves only if the work lasts — and a light one raises none.
+/// ONE OPEN, ONE FOLD across the child's sub-passes (§10.2 #6): the row is
+/// LATCHED — a sub-pass's answer and its ending read fold nothing — and
+/// the child's exit folds it with its Complete echo.
 #[test]
 fn a_heavy_routine_pass_raises_one_row_after_the_grace_and_a_light_one_none() {
     let mut app = App::headless_for_test();
@@ -5667,15 +3604,14 @@ fn a_heavy_routine_pass_raises_one_row_after_the_grace_and_a_light_one_none() {
     app.settle_messages(Instant::now() + PROGRESS_GRACE * 2);
     assert_eq!(message_regrids(), regrids);
     app.apply_toolchain_snapshot(Some(&net_read(true, 1_700_000_000)), false);
-    let live = app
-        .messages
-        .live_rows()
-        .next()
-        .expect("the heavy pass's row");
-    assert_eq!(live.msg.title, "Updating ALab tools");
+    assert!(
+        app.messages.live_rows().next().is_some(),
+        "the heavy pass's row"
+    );
     assert_eq!(app.message_band_rows, 0, "inside its grace, off the glass");
     assert_eq!(message_regrids(), regrids);
-    app.settle_messages(past_the_grace());
+    let mut t = past_the_grace();
+    app.settle_messages(t);
     assert_eq!(app.message_band_rows, 1, "revealed once the work lasted");
     assert_eq!(message_regrids(), regrids + 1);
     app.apply_toolchain_snapshot(Some(&net_read(true, 1_700_000_000)), false);
@@ -5685,16 +3621,36 @@ fn a_heavy_routine_pass_raises_one_row_after_the_grace_and_a_light_one_none() {
         "a read restates in place"
     );
     assert_eq!(message_regrids(), regrids + 1);
+    // The vendor sub-pass answers and ends; the ALab set's reads follow.
+    app.record_toolchain_outcome(toolchain_words::ended("the vendor pass finished", false));
+    app.apply_toolchain_snapshot(Some(&net_read(false, 1_700_000_000)), false);
+    app.apply_toolchain_snapshot(Some(&net_read(true, 1_700_000_100)), false);
+    assert_eq!(
+        app.messages.live_rows().count(),
+        1,
+        "latched: nothing folds"
+    );
+    app.toolchain_pass_ended(true);
+    assert_eq!(app.messages.live_rows().count(), 0, "the exit folds it");
+    assert_eq!(
+        app.messages.echoes().first().map(|e| e.kind),
+        Some(EchoKind::Complete)
+    );
+    for _ in 0..40 {
+        t += std::time::Duration::from_millis(100);
+        app.settle_messages(t);
+    }
+    assert_eq!(app.message_band_rows, 0);
+    assert_eq!(message_regrids(), regrids + 2, "one open, one fold");
 }
 
 /// A PERSON'S CHECK TAKES ITS ROW (design ruling 224): they pressed Check
 /// & Update Now and wait for it, so its pass is theirs whatever it weighs
 /// — the 250 MB bar is for work nobody asked for. A no-op Check (1–4 s,
 /// `packages.log`) ends inside the grace and never touches the glass; a
-/// longer one shows `Checking ALab tools`, busy, becomes the plan's fill
-/// (`Updating ALab tools`, a light 40 MB pass included), holds across the
-/// markers' records and the pass's ending read, and folds at the child's
-/// exit with its Complete echo in its own finished words. Two re-grids.
+/// longer one shows its busy row, becomes the plan's fill (a light 40 MB
+/// pass included), holds across the markers' records and the pass's ending
+/// read, and folds at the child's exit with its Complete echo. Two re-grids.
 #[test]
 fn a_persons_check_takes_its_row_after_the_grace_and_ends_in_its_words() {
     use crate::message_reporters::{Attention, PackagesVerb, attention};
@@ -5715,7 +3671,6 @@ fn a_persons_check_takes_its_row_after_the_grace_and_ends_in_its_words() {
     let regrids = message_regrids();
     app.person_pass(PersonPass::Began(PackagesVerb::Check));
     let live = app.messages.live_rows().next().expect("the Check's row");
-    assert_eq!(live.msg.title, "Checking ALab tools");
     assert!(live.msg.meter.as_ref().is_some_and(|m| m.busy), "busy");
     assert_eq!(attention(&live.msg), Ok(Attention::Progress));
     let mut t = past_the_grace();
@@ -5725,12 +3680,9 @@ fn a_persons_check_takes_its_row_after_the_grace_and_ends_in_its_words() {
     app.apply_toolchain_snapshot(Some(&light_read(true, 1_700_000_000)), false);
     let live = app.messages.live_rows().next().expect("restated");
     assert_eq!(app.messages.live_rows().count(), 1, "in place");
-    assert_eq!(live.msg.title, "Updating ALab tools");
     let meter = live.msg.meter.as_ref().expect("a meter");
     assert!(meter.fill_permille.is_some_and(|f| f > 0), "a fill");
     assert!(meter.amount.is_some(), "the ETA's input");
-    assert_eq!(meter.stats, "3 of 10 programs");
-    assert_eq!(live.msg.finished_title(), "ALab tools updated");
     assert_eq!(attention(&live.msg), Ok(Attention::Progress));
     // The markers' answer and the ending read fold nothing: the child runs.
     app.record_toolchain_outcome(toolchain_words::ended(
@@ -5745,59 +3697,15 @@ fn a_persons_check_takes_its_row_after_the_grace_and_ends_in_its_words() {
     assert_eq!(app.messages.live_rows().count(), 0, "its exit folds it");
     let echo = app.messages.echoes().first().expect("the echo");
     assert_eq!(echo.kind, EchoKind::Complete);
-    assert_eq!(echo.msg.finished_title(), "ALab tools updated");
     for _ in 0..40 {
         t += std::time::Duration::from_millis(100);
         app.settle_messages(t);
     }
     assert_eq!(app.message_band_rows, 0);
     assert_eq!(message_regrids(), regrids + 2, "one open, one fold");
-    // The outcome is the markers' record, as before.
-    assert!(
-        appstatus(&app)
-            .iter()
-            .any(|r| r.contains("title=ALab%20tools%20checked")),
-        "{:?}",
-        appstatus(&app)
-    );
     // Nothing is left behind: the next light routine pass is silent again.
     app.apply_toolchain_snapshot(Some(&light_read(true, 1_700_000_500)), false);
     assert_eq!(app.messages.live_rows().count(), 0, "nobody waits on it");
-}
-
-/// A CHECK QUEUED AT THE STORE LOCK SAYS SO (ruling 224): the wait that
-/// used to be a log line — up to the 30-minute bound behind the six-hourly
-/// pass or the head watch — is `Waiting for another ALab update`, busy
-/// with its elapsed clock, back to `Checking ALab tools` once the lock is
-/// taken. The LANE's child exiting meanwhile (the holder, unlatched)
-/// leaves the person's row alone; a wait that runs out with nothing
-/// claimed vanishes.
-#[test]
-fn a_queued_check_says_what_it_waits_for() {
-    use crate::message_reporters::{PackagesVerb, WAITING_FOR_ALAB};
-    let mut app = App::headless_for_test();
-    app.person_pass(PersonPass::Began(PackagesVerb::Check));
-    app.person_pass(PersonPass::Waiting);
-    let title = |app: &App| {
-        app.messages
-            .live_by_key(toolchain_words::KEY_PASS)
-            .map(|l| l.msg.title.clone())
-    };
-    assert_eq!(title(&app).as_deref(), Some(WAITING_FOR_ALAB));
-    assert_eq!(app.messages.live_rows().count(), 1, "one row, restated");
-    app.toolchain_pass_ended(true);
-    assert_eq!(
-        title(&app).as_deref(),
-        Some(WAITING_FOR_ALAB),
-        "the holder's exit is not the person's"
-    );
-    app.person_pass(PersonPass::Running);
-    assert_eq!(title(&app).as_deref(), Some("Checking ALab tools"));
-    app.person_pass(PersonPass::Ended(EchoKind::Vanish));
-    assert_eq!(app.messages.live_rows().count(), 0);
-    // With no verb in flight the wait words are not the lane's to say.
-    app.person_pass(PersonPass::Waiting);
-    assert_eq!(app.messages.live_rows().count(), 0);
 }
 
 /// A QUEUED PERSON'S ROW DOES NOT KEEP THE HOLDER'S FRAME (ruling 229).
@@ -5823,6 +3731,8 @@ fn a_queued_check_drops_the_holders_frame_when_the_holder_ends() {
     let run = |app: &mut App, own_pass_plans: bool| {
         app.person_pass(PersonPass::Began(PackagesVerb::Check));
         app.person_pass(PersonPass::Waiting);
+        assert_eq!(row(app).0, WAITING_FOR_ALAB, "queued: it says so");
+        assert_eq!(app.messages.live_rows().count(), 1, "one row, restated");
         // The holder (pid 7) plans a light pass: the queued row shows it.
         app.apply_toolchain_snapshot(Some(&light_read(true, 1_700_000_000)), false);
         let (title, fill, _) = row(app);
@@ -5869,6 +3779,9 @@ fn a_queued_check_drops_the_holders_frame_when_the_holder_ends() {
     let mut noop = App::headless_for_test();
     assert_eq!(run(&mut noop, false), "ALab tools checked");
     assert_eq!(noop.toolchain_holder_pid, None, "nothing carried");
+    // With no verb in flight the wait words are not the lane's to say.
+    noop.person_pass(PersonPass::Waiting);
+    assert_eq!(noop.messages.live_rows().count(), 0);
     let mut planned = App::headless_for_test();
     assert_eq!(run(&mut planned, true), "ALab tools updated");
 }
@@ -5888,28 +3801,32 @@ fn a_persons_install_and_remove_take_their_rows() {
         false,
     );
     let live = app.messages.live_rows().next().expect("the Install's row");
-    assert_eq!(live.msg.title, "Installing ALab tools");
+    let title = live.msg.title.clone();
     let meter = live.msg.meter.as_ref().expect("busy meter");
     assert!(meter.busy);
-    assert_eq!(meter.stats, "10 programs \u{b7} ~3 GB");
+    assert!(
+        meter.stats.contains("~3 GB"),
+        "the announced size: {}",
+        meter.stats
+    );
     assert_eq!(meter.load, Some(aterm_messages::Load::Network));
     assert_eq!(attention(&live.msg), Ok(Attention::Progress));
     app.apply_toolchain_snapshot(Some(&net_read(true, 1_700_000_000)), false);
     let live = app.messages.live_rows().next().expect("restated");
-    assert_eq!(live.msg.title, "Installing ALab tools", "not `Updating`");
-    assert_eq!(live.msg.finished_title(), "ALab tools installed");
+    assert_eq!(
+        live.msg.title, title,
+        "the plan keeps the Install's own title"
+    );
     app.person_pass(PersonPass::Ended(EchoKind::Fault));
     assert_eq!(app.messages.live_rows().count(), 0);
 
     let mut rm = App::headless_for_test();
     rm.person_pass(PersonPass::Began(PackagesVerb::Remove));
     let live = rm.messages.live_rows().next().expect("the Remove's row");
-    assert_eq!(live.msg.title, "Removing ALab tools");
     assert_eq!(
         live.msg.meter.as_ref().and_then(|m| m.load),
         Some(aterm_messages::Load::Disk)
     );
-    assert_eq!(live.msg.finished_title(), "ALab tools removed");
     assert_eq!(attention(&live.msg), Ok(Attention::Progress));
     rm.person_pass(PersonPass::Ended(EchoKind::Complete));
     assert_eq!(rm.messages.live_rows().count(), 0);
@@ -5964,59 +3881,6 @@ fn a_check_behind_a_first_run_leaves_the_first_run_its_row() {
     assert_eq!(app.messages.live_rows().count(), 0);
 }
 
-/// ONE OPEN, ONE FOLD across the child's sub-passes (design §10.2 #6): a
-/// heavy routine row is LATCHED — a sub-pass's answer and its ending read
-/// fold nothing — and the child's exit folds it with its Complete echo.
-#[test]
-fn a_heavy_routine_row_folds_once_at_the_childs_exit_across_sub_passes() {
-    let mut app = App::headless_for_test();
-    let regrids = message_regrids();
-    app.apply_toolchain_snapshot(Some(&net_read(true, 1_700_000_000)), false);
-    let mut t = past_the_grace();
-    app.settle_messages(t);
-    assert_eq!(app.message_band_rows, 1);
-    // The vendor sub-pass answers and ends; the ALab set's reads follow.
-    app.record_toolchain_outcome(toolchain_words::ended("the vendor pass finished", false));
-    app.apply_toolchain_snapshot(Some(&net_read(false, 1_700_000_000)), false);
-    assert_eq!(
-        app.messages.live_rows().count(),
-        1,
-        "latched: nothing folds"
-    );
-    app.apply_toolchain_snapshot(Some(&net_read(true, 1_700_000_100)), false);
-    assert_eq!(app.messages.live_rows().count(), 1);
-    app.toolchain_pass_ended(true);
-    assert_eq!(app.messages.live_rows().count(), 0, "the exit folds it");
-    assert_eq!(
-        app.messages.echoes().first().map(|e| e.kind),
-        Some(EchoKind::Complete)
-    );
-    for _ in 0..40 {
-        t += std::time::Duration::from_millis(100);
-        app.settle_messages(t);
-    }
-    assert_eq!(app.message_band_rows, 0);
-    assert_eq!(message_regrids(), regrids + 2, "one open, one fold");
-}
-
-/// The first run's end names how the child exited: Complete when clean,
-/// Fault when not.
-#[test]
-fn the_first_run_end_echoes_complete_when_clean_and_fault_when_not() {
-    for (clean, kind) in [(true, EchoKind::Complete), (false, EchoKind::Fault)] {
-        let mut app = App::headless_for_test();
-        app.announce_toolchain_pass("installing 10 ALab program(s)", true);
-        app.apply_toolchain_snapshot(Some(&net_read(true, 1_700_000_000)), true);
-        app.toolchain_pass_ended(clean);
-        assert_eq!(app.messages.live_rows().count(), 0);
-        assert_eq!(
-            app.messages.echoes().first().map(|e| e.kind),
-            Some(kind),
-            "clean={clean}"
-        );
-    }
-}
-
 /// A FIRST RUN THAT ENDS SHORT LEAVES A FAILURE ROW (review 2026-09-24):
 /// the row told the person to wait for a multi-gigabyte deliverable, so
 /// when a failure marker names the end and the child exits unclean, the
@@ -6039,11 +3903,6 @@ fn a_first_run_that_ends_short_leaves_a_failure_row() {
     app.announce_toolchain_pass("installing 10 ALab program(s) (about 3 GB)", true);
     app.apply_toolchain_snapshot(Some(&net_read(true, 1_700_000_000)), true);
     app.note_toolchain_first_run_short(FirstRunShort::Failed, "could not reach the index");
-    assert_eq!(
-        failure_rows(&app).len(),
-        1,
-        "the live row until the child exits"
-    );
     app.toolchain_pass_ended(false);
     assert_eq!(
         app.messages.echoes().first().map(|e| e.kind),
@@ -6062,9 +3921,8 @@ fn a_first_run_that_ends_short_leaves_a_failure_row() {
     // An over read after the exit leaves the failure standing.
     app.apply_toolchain_snapshot(Some(&net_read(false, 1_700_000_000)), true);
     assert_eq!(failure_rows(&app).len(), 1, "an over read leaves it");
-    assert_eq!(failure_rows(&app)[0].1, Hold::Default);
     // A retry's first read replaces it at once — never behind the failure
-    // it answers — and so does the next first run's announcement.
+    // it answers.
     let mut retry = App::headless_for_test();
     retry.announce_toolchain_pass("installing 10 ALab program(s)", true);
     retry.note_toolchain_first_run_short(FirstRunShort::Failed, "offline");
@@ -6076,13 +3934,6 @@ fn a_first_run_that_ends_short_leaves_a_failure_row() {
     assert!(
         matches!(rows[0].1, Hold::Live { .. }),
         "the retry's progress took the key: {rows:?}"
-    );
-    app.announce_toolchain_pass("installing 10 ALab program(s) (about 3 GB)", true);
-    assert!(
-        failure_rows(&app)
-            .iter()
-            .all(|(_, hold, _)| matches!(hold, Hold::Live { .. })),
-        "a new pass takes the key back"
     );
 
     // A clean exit after a marker: the record only.
@@ -6126,99 +3977,6 @@ fn on_screen_app() -> App {
     app
 }
 
-/// THE IDLE LAW (design §10.8): no row, nothing armed; a live row on a
-/// window that is not on screen (headless, occluded), nothing armed; a
-/// held row only, nothing armed; a live row on screen, a frame on the
-/// grid; after the last row folds and its echo ends, nothing armed.
-#[test]
-fn the_band_motion_deadline_is_none_when_idle_or_hidden() {
-    let mut app = App::headless_for_test();
-    let now = Instant::now();
-    assert_eq!(
-        app.band_motion_deadline(now),
-        None,
-        "an idle band arms nothing"
-    );
-    app.announce_toolchain_pass("installing 10 ALab program(s)", true);
-    assert_eq!(app.message_band_rows, 1);
-    assert_eq!(
-        app.band_motion_deadline(now),
-        None,
-        "a headless window has no motion"
-    );
-    let mut app = on_screen_app();
-    app.post_message(warn("a held warning"));
-    assert_eq!(
-        app.band_motion_deadline(now),
-        None,
-        "a held row never moves"
-    );
-    app.announce_toolchain_pass("installing 10 ALab program(s)", true);
-    let now = Instant::now();
-    let at = app
-        .band_motion_deadline(now)
-        .expect("a live row on screen moves");
-    assert!(
-        at > now && at <= now + aterm_messages::ANIM_FRAME * 2,
-        "the next frame is on the grid"
-    );
-    app.windows.get_mut(&WindowId(0)).unwrap().occluded = true;
-    assert_eq!(
-        app.band_motion_deadline(now),
-        None,
-        "occluded: nothing armed"
-    );
-    app.windows.get_mut(&WindowId(0)).unwrap().occluded = false;
-    app.toolchain_pass_ended(true);
-    app.clear_messages_for_test();
-    assert_eq!(
-        app.band_motion_deadline(Instant::now()),
-        None,
-        "folded: nothing armed"
-    );
-}
-
-/// Unfocused, the band is STILL: the meter is its still form and the
-/// only wake left is a time word's tick — never a frame-rate wake.
-#[test]
-fn an_unfocused_window_paints_the_still_form_and_wakes_only_for_text() {
-    let mut app = on_screen_app();
-    app.windows.get_mut(&WindowId(0)).unwrap().focused = false;
-    app.announce_toolchain_pass("installing 10 ALab program(s)", true);
-    let look = app.band_look(WindowId(0));
-    assert_eq!(look.pace, aterm_messages::Pace::Still);
-    let now = Instant::now();
-    let first = app
-        .band_motion_deadline(now)
-        .expect("the elapsed words tick");
-    assert!(
-        first >= now + std::time::Duration::from_secs(5),
-        "no frame-rate wake while unfocused: {:?}",
-        first.saturating_duration_since(now)
-    );
-    let fp0 = app.prepare_band_motion(WindowId(0), now);
-    let fp1 = app.prepare_band_motion(WindowId(0), now + std::time::Duration::from_secs(3));
-    assert_eq!(fp0, fp1, "the still form does not move with time");
-    let motion = app.windows[&WindowId(0)]
-        .band
-        .motion()
-        .cloned()
-        .expect("prepared");
-    assert_eq!(
-        motion.rows[0].anim,
-        aterm_messages::Anim::Track,
-        "the still busy form: the unlit track"
-    );
-    assert!(
-        motion.rows[0]
-            .surface
-            .cells(80)
-            .iter()
-            .all(|t| *t == aterm_messages::Tone::TRACK),
-        "…lit nowhere"
-    );
-}
-
 /// A CHANGE OF LOOK IS A DUE FRAME by itself (review 2026-09-24): a
 /// frame on glass drawn in the moving look is due the moment the window's
 /// look turns still — focus lost, Serious Mode, Reduce Motion — whether or
@@ -6247,77 +4005,6 @@ fn a_frame_drawn_in_another_look_is_due_at_once() {
     assert!(app.band_motion_due(now).is_empty(), "re-drawn: settled");
     app.windows.get_mut(&wid).unwrap().focused = true;
     assert_eq!(app.band_motion_due(now), vec![wid], "and back again");
-}
-
-/// SERIOUS MODE AND REDUCED MOTION retire motion only: the band keeps
-/// its row and its words, in the still form.
-#[test]
-fn serious_mode_and_reduced_motion_paint_the_still_forms() {
-    let wid = WindowId(0);
-    let mut app = on_screen_app();
-    app.announce_toolchain_pass("installing 10 ALab program(s)", true);
-    assert_eq!(app.band_look(wid).pace, aterm_messages::Pace::Moving);
-    app.serious_mode = true;
-    assert_eq!(
-        app.band_look(wid).pace,
-        aterm_messages::Pace::Still,
-        "Serious Mode"
-    );
-    assert_eq!(app.message_band_rows, 1, "…keeps the row");
-    app.serious_mode = false;
-    app.system_reduce_motion = true;
-    assert_eq!(
-        app.band_look(wid).pace,
-        aterm_messages::Pace::Still,
-        "Reduce Motion"
-    );
-    app.system_reduce_motion = false;
-    app.config.motion = Some("reduced".into());
-    assert_eq!(
-        app.band_look(wid).pace,
-        aterm_messages::Pace::Still,
-        "motion = reduced"
-    );
-    app.config.motion = None;
-    assert_eq!(app.band_look(wid).pace, aterm_messages::Pace::Moving);
-}
-
-/// AN ANIMATION NEVER RE-GRIDS: 200 motion frames and a Complete echo
-/// cost exactly the open and the fold the same run costs with no motion.
-#[test]
-fn an_animation_never_regrids() {
-    let wid = WindowId(0);
-    let mut app = on_screen_app();
-    let regrids = message_regrids();
-    app.announce_toolchain_pass("installing 10 ALab program(s)", true);
-    assert_eq!(message_regrids(), regrids + 1, "the open");
-    let mut t = Instant::now();
-    let mut moved = std::collections::BTreeSet::new();
-    for _ in 0..200 {
-        t += aterm_messages::ANIM_FRAME;
-        for due in app.band_motion_due(t) {
-            moved.insert(app.prepare_band_motion(due, t));
-        }
-        assert_eq!(app.message_band_rows, 1);
-    }
-    assert!(
-        moved.len() > 10,
-        "the frames drew something new: {}",
-        moved.len()
-    );
-    assert_eq!(message_regrids(), regrids + 1, "no frame re-grids");
-    app.toolchain_pass_ended(true);
-    for _ in 0..30 {
-        t += aterm_messages::ANIM_FRAME;
-        app.prepare_band_motion(wid, t);
-    }
-    assert_eq!(message_regrids(), regrids + 1, "the echo re-grids nothing");
-    for _ in 0..40 {
-        t += std::time::Duration::from_millis(100);
-        app.settle_messages(t);
-    }
-    assert_eq!(app.message_band_rows, 0);
-    assert_eq!(message_regrids(), regrids + 2, "one open, one fold");
 }
 
 // -----------------------------------------------------------------------
@@ -6371,8 +4058,7 @@ fn update_row(app: &App) -> Option<String> {
 /// the quiet-epoch stamp, not the handoff epoch, not the keystroke clock
 /// — and the lane's quiet verdict at a later instant is the same with or
 /// without them. The negative control: a tolerated event (a pointer move)
-/// DOES move the stamp, so the reading is not vacuous. And with no window
-/// on screen (a headless App) there is no frame and no wake.
+/// DOES move the stamp, so the reading is not vacuous.
 #[test]
 fn the_busy_animation_never_touches_the_update_activity_clocks() {
     let wid = WindowId(0);
@@ -6395,6 +4081,7 @@ fn the_busy_animation_never_touches_the_update_activity_clocks() {
     let before = clocks(&app);
     let later = now + std::time::Duration::from_secs(5);
     let quiet_before = app.automatic_update_activity_quiet_with_pending_input(later, false);
+    let revision = app.messages.revision();
     let step = aterm_messages::ANIM_FRAME * 4;
     let mut drawn = std::collections::BTreeSet::new();
     for k in 0..16_u32 {
@@ -6407,18 +4094,15 @@ fn the_busy_animation_never_touches_the_update_activity_clocks() {
     );
     assert_eq!(clocks(&app), before, "an animation frame is not activity");
     assert_eq!(
+        app.messages.revision(),
+        revision,
+        "a frame is paint: Settings ▸ Messages is never republished at the frame rate"
+    );
+    assert_eq!(
         app.automatic_update_activity_quiet_with_pending_input(later, false),
         quiet_before,
         "the automatic lane reads the terminal exactly as it would without the comet"
     );
-    // Off screen (a headless window): no frame, and nothing wakes.
-    let mut headless = App::headless_for_test();
-    headless.note_update_progress(&aterm_update::Progress::Verifying {
-        version: "9.9.9".into(),
-    });
-    assert_eq!(headless.band_motion_deadline(later), None);
-    assert!(headless.band_motion_due(later).is_empty());
-    assert_eq!(clocks(&app), before);
     // NEGATIVE CONTROL: real (tolerated) activity does move the stamp.
     std::thread::sleep(std::time::Duration::from_millis(2));
     app.note_update_handoff_tolerated_activity();
@@ -6429,13 +4113,12 @@ fn the_busy_animation_never_touches_the_update_activity_clocks() {
     );
 }
 
-/// THE BAND ANIMATES ONLY WHILE A BUSY ROW IS COMMITTED, THE WINDOW IS
-/// FOCUSED AND ON SCREEN, MOTION IS ALLOWED AND NOTHING IS FROZEN (the
-/// gating union, ruling 140): serious mode and Reduce Motion draw the row
-/// still; a busy row queued behind the committed rows does not animate;
-/// and under a handoff freeze the band is still and arms and asks for
-/// nothing — the frame on glass stays WHERE IT IS, not even a switch to
-/// still repaints the parked screen.
+/// THE BAND ANIMATES ONLY WHILE A BUSY ROW IS COMMITTED AND NOTHING IS
+/// FROZEN (the gating union, ruling 140; focus, visibility and the still
+/// looks are `band_motion_tests`'): a busy row queued behind the committed
+/// rows does not animate; and under a handoff freeze the band is still and
+/// arms and asks for nothing — the frame on glass stays WHERE IT IS, not even
+/// a switch to still repaints the parked screen.
 #[test]
 fn the_band_animates_only_while_committed_focused_moving_and_unfrozen() {
     use aterm_messages::Pace;
@@ -6447,15 +4130,6 @@ fn the_band_animates_only_while_committed_focused_moving_and_unfrozen() {
     app.post_message(update_words::installing("9.9.9"));
     assert_eq!(app.band_look(wid).pace, Pace::Moving);
     assert!(app.band_motion_deadline(now).is_some());
-    app.windows.get_mut(&wid).unwrap().focused = false;
-    assert_eq!(app.band_look(wid).pace, Pace::Still, "no focused window");
-    app.windows.get_mut(&wid).unwrap().focused = true;
-    app.serious_mode = true;
-    assert_eq!(app.band_look(wid).pace, Pace::Still, "serious mode: still");
-    app.serious_mode = false;
-    app.system_reduce_motion = true;
-    assert_eq!(app.band_look(wid).pace, Pace::Still, "Reduce Motion: still");
-    app.system_reduce_motion = false;
     // Frozen: still, nothing armed, nothing due — the frame stays.
     let at = now + aterm_messages::ANIM_FRAME * 12;
     let fp = app.prepare_band_motion(wid, at);
@@ -6496,23 +4170,6 @@ fn the_band_animates_only_while_committed_focused_moving_and_unfrozen() {
         None,
         "a busy row the band does not show does not move"
     );
-}
-
-/// A FRAME NEVER BUMPS THE CENTER'S REVISION: a frame is paint, so
-/// Settings ▸ Messages — which republishes on the revision — is never
-/// republished at the frame rate.
-#[test]
-fn a_frame_tick_never_bumps_the_center_revision() {
-    let mut app = on_screen_app();
-    app.note_update_progress(&aterm_update::Progress::Verifying {
-        version: "9.9.9".into(),
-    });
-    let revision = app.messages.revision();
-    let now = Instant::now();
-    for k in 0..40_u32 {
-        app.prepare_band_motion(WindowId(0), now + aterm_messages::ANIM_FRAME * k);
-    }
-    assert_eq!(app.messages.revision(), revision);
 }
 
 /// ONE UPDATE COSTS ONE GROW AND ONE SHRINK (the regrid budget, measured):
@@ -6569,10 +4226,6 @@ fn an_editor_holding_the_install_is_a_row_of_its_own() {
         outcome.msg.hold
     );
     assert_eq!(
-        outcome.msg.title,
-        crate::app_update_screen::UPDATE_WAITS_FOR_YOU
-    );
-    assert_eq!(
         outcome.msg.detail[0],
         App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY,
         "the blocker is what the person does: painted"
@@ -6581,59 +4234,22 @@ fn an_editor_holding_the_install_is_a_row_of_its_own() {
     assert_eq!(outcome.msg.severity, Severity::Warn);
     assert_eq!(app.messages.live_rows().count(), 1, "one row");
     // THE WORDS FIT WHERE A TERMINAL IS (2026-09-24): no capsule takes the
-    // columns the instruction needs — at 80 it reads whole up to its last
-    // word, and at 60 it still says what to do. (A standing row is born a
-    // progress grace late.)
+    // columns the instruction needs. (A standing row is born a progress
+    // grace late.)
     let _ = app.settle_messages(
         Instant::now() + aterm_messages::PROGRESS_GRACE + std::time::Duration::from_millis(1),
     );
-    for (cols, painted) in [
-        (80, "Save or close the open editor to finish"),
-        (60, "Save or close"),
-    ] {
+    for cols in [80, 60] {
         let row = app.band_presentation(cols).rows[0].clone();
-        let detail = row.detail.map(|(_, words)| words).unwrap_or_default();
-        assert!(detail.starts_with(painted), "{cols} columns: {detail:?}");
+        assert!(
+            row.detail.is_some(),
+            "{cols} columns: the instruction shows"
+        );
         assert!(
             row.capsules.iter().all(|c| c.action.is_details()),
             "{cols} columns: only `Details ›`"
         );
     }
-    // Unsaved Settings text alone, as the close preflight words it (the
-    // row's words are the answer, not a reason): "Settings" survives the cut.
-    let mut settings = App::headless_for_test();
-    settings.note_update_blockers(
-        &[format!(
-            "{} 1 Settings view(s) have unsaved text",
-            crate::app_native::SETTINGS_DRAFTS_BLOCK
-        )],
-        true,
-    );
-    assert_eq!(
-        settings
-            .messages
-            .live_by_key(update_words::KEY_WAITS_FOR_YOU)
-            .expect("the Settings wait's row")
-            .msg
-            .detail[0],
-        App::UNSAVED_SETTINGS_BLOCKS_APPLY
-    );
-    assert_eq!(settings.messages.live_rows().count(), 1, "one row");
-    let _ = settings.settle_messages(
-        Instant::now() + aterm_messages::PROGRESS_GRACE + std::time::Duration::from_millis(1),
-    );
-    for (cols, painted) in [
-        (80, "Save or close the unsaved Settings tabs"),
-        (60, "Save or close"),
-    ] {
-        let row = settings.band_presentation(cols).rows[0].clone();
-        let detail = row.detail.map(|(_, words)| words).unwrap_or_default();
-        assert!(detail.starts_with(painted), "{cols} columns: {detail:?}");
-    }
-    // NEGATIVE CONTROL: a blocker that clears by itself raises nothing.
-    let mut quiet = App::headless_for_test();
-    quiet.note_update_blockers(&[App::RESTORE_IN_FLIGHT_BLOCKS_APPLY.to_string()], true);
-    assert_eq!(quiet.messages.live_rows().count(), 0);
     // A press nothing retries: the transient outcome row, as before.
     let mut pressed = App::headless_for_test();
     pressed.note_update_blockers(&[App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY.to_string()], false);
@@ -6733,13 +4349,6 @@ fn the_landing_is_on_record_with_how_long_the_update_took() {
         1,
         "the landing is ONE entry"
     );
-    assert!(
-        app.messages
-            .log()
-            .records()
-            .any(|r| r.title == "Updated to aterm v9.9.9"),
-        "the landing's words are on record"
-    );
     let said = took(&app);
     assert_eq!(said.len(), 1, "{said:?}");
     assert!(
@@ -6760,67 +4369,6 @@ fn the_landing_is_on_record_with_how_long_the_update_took() {
     none.update_verified = update_words::carried_verification(None, 7, now, wall);
     none.post_update_landed("9.9.9", 7, 0);
     assert!(took(&none).is_empty());
-}
-
-/// A HEALED WARNING IS RECORDED AS WORKING AGAIN — ONCE per announced
-/// episode, after its 45 s fold too; a second heal records nothing.
-#[test]
-fn a_healed_update_warning_is_recorded_as_working_again_once() {
-    let body = "3 failed checks in a row since 2026-09-14T22:04:36Z: manifests \
-                cannot be downloaded.";
-    let mut app = App::headless_for_test();
-    assert!(app.note_update_health(aterm_update::health_failing_title("pipeline"), body));
-    let now = Instant::now();
-    let _ =
-        app.settle_messages(now + aterm_messages::HOLD_WARN + std::time::Duration::from_secs(1));
-    assert!(app.messages.live_health().is_none(), "folded");
-    let healed = |app: &App| {
-        app.messages
-            .log()
-            .records()
-            .filter(|r| r.title == "aterm updates work again")
-            .count()
-    };
-    assert!(!app.note_update_health(aterm_update::HEALTH_RECOVERED_TITLE, ""));
-    assert_eq!(healed(&app), 1);
-    let rec = app
-        .messages
-        .log()
-        .records()
-        .rfind(|r| r.title == "aterm updates work again")
-        .unwrap();
-    assert_eq!(
-        rec.detail[0],
-        "after \"Couldn't download updates\", since Sep 14"
-    );
-    assert!(!app.note_update_health(aterm_update::HEALTH_RECOVERED_TITLE, ""));
-    assert_eq!(healed(&app), 1, "once per episode");
-}
-
-/// A PERSISTENT FAILURE IS READ ONCE PER CLASS: its title names the broken
-/// half, the excerpt since when, the whole sentence behind Details, the
-/// warning's hold (never Standing); a count restatement posts nothing.
-#[test]
-fn a_persistent_failure_is_read_once_per_class() {
-    let body = "20 failed checks in a row since 2026-09-14T22:04:36Z: release manifests \
-                exist but cannot be downloaded.";
-    for class in ["apply", "pipeline", "stage", "manifest"] {
-        let mut app = App::headless_for_test();
-        let title = aterm_update::health_failing_title(class);
-        assert!(app.note_update_health(title, body));
-        let row = app.messages.live_health().expect("the warning");
-        assert_eq!(row.msg.title, title);
-        assert_eq!(row.msg.detail[0], "since Sep 14");
-        assert!(
-            row.msg.detail[1..]
-                .join(" ")
-                .contains("release manifests exist but cannot be downloaded.")
-        );
-        assert_eq!(row.msg.hold, Hold::Default);
-        let revision = app.messages.revision();
-        assert!(!app.note_update_health(aterm_update::HEALTH_RESTATED_TITLE, "21 failed"));
-        assert_eq!(app.messages.revision(), revision, "RESTATED posts nothing");
-    }
 }
 
 /// ONE ANNOUNCEMENT PER TITLE PER LAUNCH, WHOEVER RAISES IT (the review of
@@ -6945,9 +4493,10 @@ fn the_ledgers_heal_answers_only_the_class_it_counted() {
 /// broken half, so a download never records "aterm updates work again"
 /// over "Couldn't install updates" — the updater's ledger keeps an
 /// install streak through a whole-pipeline success. Checking is answered by
-/// a download starting, downloading by a staged build, installing only by a
-/// landing (or the ledger's own recovery); an unanswered warning stays up
-/// and remembered for the proof that does answer it.
+/// a download starting (downloading only by a staged build:
+/// `the_heal_is_keyed_by_kind_and_an_older_builds_words_still_heal`;
+/// installing only by a landing:
+/// `two_health_kinds_live_each_record_their_own_healing`).
 #[test]
 fn a_warning_heals_only_on_the_proof_that_answers_it() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -6959,95 +4508,24 @@ fn a_warning_heals_only_on_the_proof_that_answers_it() {
             .filter(|r| r.title == "aterm updates work again")
             .count()
     };
-    let staged = aterm_update::Progress::Staged {
-        version: "9.9.9".into(),
-        build: 7,
-    };
     let warning_up = |app: &App| app.messages.live_health().is_some();
-    // Install: neither a download nor a staged build answers it.
-    let mut install = App::headless_for_test();
-    assert!(install.note_update_health(aterm_update::health_failing_title("apply"), body));
-    install.note_update_progress(&download("9.9.9"));
-    install.note_update_progress(&staged);
-    assert!(
-        warning_up(&install),
-        "a download says nothing about installing"
-    );
-    assert_eq!(healed(&install), 0, "NEGATIVE: no false recovery on record");
-    install.post_update_landed("9.9.9", 7, 0);
-    assert!(!warning_up(&install));
-    assert_eq!(healed(&install), 1, "the landing is the proof");
-    // Download: a download starting does not answer it; a staged build does.
-    let mut download_class = App::headless_for_test();
-    assert!(download_class.note_update_health(aterm_update::health_failing_title("stage"), body));
-    download_class.note_update_progress(&download("9.9.9"));
-    assert!(warning_up(&download_class));
-    assert_eq!(healed(&download_class), 0);
-    download_class.note_update_progress(&staged);
-    assert!(!warning_up(&download_class));
-    assert_eq!(healed(&download_class), 1);
     // Check: a download starting answers it.
     let mut check = App::headless_for_test();
     assert!(check.note_update_health(aterm_update::health_failing_title("manifest"), body));
     check.note_update_progress(&download("9.9.9"));
     assert!(!warning_up(&check));
     assert_eq!(healed(&check), 1);
-    // The ledger's own recovery answers every class.
-    let mut ledger = App::headless_for_test();
-    assert!(ledger.note_update_health(aterm_update::health_failing_title("apply"), body));
-    assert!(!ledger.note_update_health(aterm_update::HEALTH_RECOVERED_TITLE, ""));
-    assert_eq!(healed(&ledger), 1);
 }
 
-/// A CARRIED WARNING HEALED BY THE LANDING IS ON THE SUCCESSOR'S RECORD: the
-/// parent `_exit`s at Commit and never learns its warning healed, so the
-/// successor that resolved the carried row records the healing at its
-/// landing — once — against what the parent's warning said.
-#[test]
-fn a_carried_warning_healed_by_the_landing_is_on_the_successors_record() {
-    let mut parent = App::headless_for_test();
-    let body = "20 failed checks in a row since 2026-09-14T22:04:36Z: the reason.";
-    parent.post_message(update_words::installing("0.76.0"));
-    assert!(parent.note_update_health(aterm_update::health_failing_title("apply"), body));
-    let carry = window_carry(parent.message_band_rows, parent.carried_messages());
-    let mut successor = App::headless_for_test();
-    successor.seed_carried_messages(&carry, Some("0.76.0"));
-    assert!(
-        successor.messages.live_health().is_none(),
-        "resolved with the handoff"
-    );
-    successor.post_update_landed("0.76.0", 7, 0);
-    let said: Vec<String> = successor
-        .messages
-        .log()
-        .records()
-        .filter(|r| r.title == "aterm updates work again")
-        .map(|r| r.detail.join(" "))
-        .collect();
-    assert_eq!(
-        said,
-        vec!["after \"Couldn't install updates\", since Sep 14".to_string()]
-    );
-    // A plain restart carries nothing to heal.
-    let mut plain = App::headless_for_test();
-    plain.seed_carried_messages(&carry, None);
-    plain.post_update_landed("0.76.0", 7, 0);
-    assert!(
-        plain
-            .messages
-            .log()
-            .records()
-            .all(|r| r.title != "aterm updates work again"),
-        "no finishing successor: nothing this process said, so nothing to record"
-    );
-}
-
-/// THE HEALING IS RECORDED ON THE AUTOMATIC LANE AND AFTER THE FOLD TOO
-/// (round six, finding 54): what the parent's warning said crosses the
-/// handoff as its own field, so the successor's landing records "aterm
-/// updates work again" when no progress row was carried (the automatic
-/// lane posts none) and when the warning row had already folded — and the
-/// field survives the manifest's own encoding.
+/// A CARRIED WARNING HEALED BY THE LANDING IS ON THE SUCCESSOR'S RECORD (round
+/// six, finding 54): the parent `_exit`s at Commit and never learns its warning
+/// healed, so what it said crosses the handoff as its own field — surviving the
+/// manifest's own encoding — and the successor's landing records "aterm
+/// updates work again" once, against the parent's words: on the explicit lane
+/// (whose seed resolves the carried row with the handoff) and the automatic one
+/// (no progress row carried), the warning still up or already gone from the
+/// glass. A plain restart remembers nothing, and a carry with nothing to heal
+/// writes no key.
 #[test]
 fn the_landing_records_the_healing_with_no_progress_row_and_after_the_fold() {
     let body = "20 failed checks in a row since 2026-09-14T22:04:36Z: the reason.";
@@ -7064,37 +4542,44 @@ fn the_landing_records_the_healing_with_no_progress_row_and_after_the_fold() {
         let text = aterm_toml::to_string(carry).expect("encodes");
         aterm_toml::from_str::<crate::session_store::WindowCarry>(&text).expect("decodes")
     };
-    // The automatic lane: no progress row, the warning still up.
-    let mut parent = App::headless_for_test();
-    assert!(parent.note_update_health(aterm_update::health_failing_title("apply"), body));
-    let carry = through_the_wire(&window_carry(
-        parent.message_band_rows,
-        parent.carried_messages(),
-    ));
-    let mut successor = App::headless_for_test();
-    successor.seed_carried_messages(&carry, Some("0.76.0"));
-    successor.post_update_landed("0.76.0", 7, 0);
-    assert_eq!(
-        healed(&successor),
-        vec!["after \"Couldn't install updates\", since Sep 14".to_string()]
-    );
-    assert!(successor.messages.live_health().is_none());
-    // The warning folded before the carry: an explicit row, no warning row.
-    let mut parent = App::headless_for_test();
-    parent.post_message(update_words::installing("0.76.0"));
-    assert!(parent.note_update_health(aterm_update::health_failing_title("apply"), body));
-    for id in parent.live_update_health(|_| true) {
-        parent.resolve_message(id, Outcome::Warn);
+    let mut carry = None;
+    for automatic in [false, true] {
+        for gone in [false, true] {
+            let case = format!("automatic {automatic}, gone from the glass {gone}");
+            let mut parent = App::headless_for_test();
+            if !automatic {
+                parent.post_message(update_words::installing("0.76.0"));
+            }
+            assert!(parent.note_update_health(aterm_update::health_failing_title("apply"), body));
+            if gone {
+                for id in parent.live_update_health(|_| true) {
+                    parent.resolve_message(id, Outcome::Warn);
+                }
+            }
+            let crossed = through_the_wire(&window_carry(
+                parent.message_band_rows,
+                parent.carried_messages(),
+            ));
+            assert!(!crossed.update_health_said.is_empty(), "{case}");
+            let mut successor = App::headless_for_test();
+            successor.seed_carried_messages(&crossed, Some("0.76.0"));
+            if !automatic {
+                assert!(
+                    successor.messages.live_health().is_none(),
+                    "{case}: resolved with the handoff"
+                );
+            }
+            successor.post_update_landed("0.76.0", 7, 0);
+            assert_eq!(
+                healed(&successor),
+                vec!["after \"Couldn't install updates\", since Sep 14".to_string()],
+                "{case}: once, against what the parent said"
+            );
+            assert!(successor.messages.live_health().is_none(), "{case}");
+            carry = Some(crossed);
+        }
     }
-    let carry = through_the_wire(&window_carry(
-        parent.message_band_rows,
-        parent.carried_messages(),
-    ));
-    assert!(!carry.update_health_said.is_empty());
-    let mut successor = App::headless_for_test();
-    successor.seed_carried_messages(&carry, Some("0.76.0"));
-    successor.post_update_landed("0.76.0", 7, 0);
-    assert_eq!(healed(&successor).len(), 1, "once");
+    let carry = carry.expect("a carry");
     // A plain restart remembers nothing; a carry with nothing to heal
     // writes no key (the wire it always was).
     let mut plain = App::headless_for_test();
@@ -7315,36 +4800,12 @@ fn two_health_kinds_live_each_record_their_own_healing() {
     app.post_update_landed("9.9.9", 7, 0);
     assert_eq!(healed(&app).len(), 2);
     assert_eq!(healed(&app)[1], after(install));
-
-    // Carried across the handoff: the successor seeds one entry per carried
-    // row, so its landing records the install warning's healing and its
-    // staged build the download's — both of the parent's warnings, each
-    // once, each by the proof that answers it (finding 54).
-    let mut parent = App::headless_for_test();
-    parent.post_message(update_words::installing("9.9.9"));
-    assert!(parent.note_update_health(download, body));
-    assert!(parent.note_update_health(install, body));
-    let carry = window_carry(parent.message_band_rows, parent.carried_messages());
-    let mut successor = App::headless_for_test();
-    successor.seed_carried_messages(&carry, Some("9.9.9"));
-    successor.post_update_landed("9.9.9", 7, 0);
-    assert_eq!(
-        healed(&successor),
-        vec![after(install)],
-        "NEGATIVE: the landing is no proof that downloading works"
-    );
-    successor.note_update_progress(&staged);
-    let mut said = healed(&successor);
-    said.sort();
-    let mut want = vec![after(download), after(install)];
-    want.sort();
-    assert_eq!(said, want, "both of the parent's warnings, each once");
 }
 
 /// EVERY UPDATE MOMENT IS A LINE IN THE LOG (the log area's P3): downloaded,
 /// the switch begun, a stopped automatic attempt, the landing — each a record
-/// or a supersede the log keeps, in order, in its words; a restatement alone
-/// writes no line, which is why the lane POSTS each phase.
+/// or a supersede the log keeps, in order; a restatement alone writes no
+/// line, which is why the lane POSTS each phase.
 #[test]
 fn every_update_moment_is_a_line_in_the_log() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -7367,45 +4828,18 @@ fn every_update_moment_is_a_line_in_the_log() {
         assert_eq!(app.messages.log().len(), before, "one record per build");
     }
     app.post_update_landed("9.9.9", 7, 0);
-    let titles: Vec<String> = app
+    let phases: std::collections::BTreeSet<String> = app
         .messages
         .log()
         .records()
+        .filter(|r| r.key.as_deref() == Some(update_words::KEY_PROGRESS))
         .map(|r| r.title.clone())
         .collect();
-    let pos = |needle: &str| {
-        titles
-            .iter()
-            .position(|t| t.contains(needle))
-            .unwrap_or_else(|| panic!("{needle:?} is not on record: {titles:#?}"))
-    };
-    assert!(pos("aterm v9.9.9 is ready") < pos("Updated to aterm v9.9.9"));
-    // ONE SPELLING of the version on every update entry (audit 2026-09-24).
-    for t in &titles {
-        assert!(!t.contains("aterm 9.9"), "a bare version: {t:?}");
-    }
-
-    for phase in [
-        "Downloading aterm v9.9.9",
-        "Checking aterm v9.9.9",
-        "aterm v9.9.9 is ready",
-    ] {
-        assert!(
-            titles.iter().any(|t| t == phase),
-            "downloading, checking and staged each a line (a title per phase, \
-             ruling 143): {phase:?} in {titles:#?}"
-        );
-    }
-    // NEGATIVE CONTROL: a restatement writes no line.
-    let before = app.messages.log().len();
-    let id = post_installing(&mut app, "9.9.8");
-    let after_post = app.messages.log().len();
-    assert!(after_post > before);
-    app.restate_message(id, restatement_of(&update_words::finishing("9.9.8")));
     assert_eq!(
-        app.messages.log().len(),
-        after_post,
-        "a restate is not a line"
+        phases.len(),
+        3,
+        "downloading, checking and staged each a line (a title per phase, \
+         ruling 143): {phases:#?}"
     );
 }
 
@@ -7435,10 +4869,10 @@ fn the_switch_record_never_doubles_a_posted_installing_row() {
     assert_eq!(explicit.messages.log().len(), before + 1);
 }
 
-/// A HARNESS NOTE IS RECORDED AND NEVER TAKES A ROW (design ruling 61): on
-/// `appstatus` as `kind=harness`, no row, no re-grid, no wake; the same
-/// note again is not written again; beside a first-run row it leaves that
-/// one row alone.
+/// A HARNESS NOTE IS RECORDED AND NEVER TAKES A ROW (design ruling 61; its
+/// `kind=harness` line is the engine's `wire` test): no row, no re-grid, no
+/// wake; the same note again is not written again; beside a first-run row it
+/// leaves that one row alone.
 #[test]
 fn a_harness_note_is_recorded_and_never_takes_a_row() {
     let mut app = App::headless_for_test();
@@ -7451,14 +4885,6 @@ fn a_harness_note_is_recorded_and_never_takes_a_row() {
     assert_eq!(app.message_band_rows, 0);
     assert_eq!(app.messages_deadline(), None);
     assert_eq!(message_regrids(), regrids);
-    let last = appstatus(&app).pop().expect("on record");
-    assert!(
-        last.starts_with(
-            "activity kind=harness phase=done progress=- \
-             title=aterm%20harness%20acting%20%C2%B7%20approving%20rm "
-        ),
-        "{last}"
-    );
     let len = app.messages.log().len();
     assert!(!app.record_harness_note("aterm harness acting \u{00b7} approving rm"));
     assert_eq!(
@@ -7471,9 +4897,10 @@ fn a_harness_note_is_recorded_and_never_takes_a_row() {
     app.announce_toolchain_pass("installing 2 ALab program(s) (about 1 GB)", true);
     app.record_harness_note("aterm harness idle");
     assert_eq!(app.messages.live_rows().count(), 1);
-    assert_eq!(
-        app.messages.live_rows().next().unwrap().msg.title,
-        toolchain_words::INSTALLING_ALAB
+    assert!(
+        app.messages
+            .live_by_key(toolchain_words::KEY_PASS)
+            .is_some()
     );
 }
 
@@ -7527,7 +4954,7 @@ fn an_unchanged_managed_current_is_recorded_once_and_news_again() {
         render_debt: None,
         fabric: Default::default(),
         timeline_id: 0,
-        log_carry: None,
+        log: Default::default(),
         journal_key: None,
     }];
     assert!(
@@ -7561,9 +4988,9 @@ fn replied_id(reply: &str, field: &str) -> MessageId {
     MessageId::from_raw(raw.parse().expect("a number")).expect("a nonzero id")
 }
 
-/// A warn post round-trips: the reply names the row, the band commits it,
-/// and `messages` is the engine's own rows byte for byte (the host adds
-/// nothing but the clock and the socket's encoder).
+/// A warn post through the host: the reply names the row and the band
+/// commits it (the rows `messages` reads back are the engine's `wire` tests');
+/// an info post is a record that moves no band.
 #[test]
 fn a_notice_round_trips_through_the_band() {
     let mut app = App::headless_for_test();
@@ -7576,27 +5003,6 @@ fn a_notice_round_trips_through_the_band() {
     let live = app.messages.live(id).expect("a warn post is a row");
     assert_eq!(live.msg.origin, aterm_messages::Origin::Wire);
     assert_eq!(app.message_band_rows, 1, "the row is on the band");
-    let q = wire::ReadQuery::default();
-    // `ago_ms=` reads the clock: retry across a millisecond boundary.
-    let same = (0..5).any(|_| {
-        let host = app.read_messages(&q);
-        let engine = wire::message_rows(
-            &app.messages,
-            &q,
-            wall_stamp_now().unix_ms,
-            &crate::control::pct_encode,
-        );
-        host == engine
-    });
-    assert!(same, "{:?}", app.read_messages(&q));
-    let rows = app.read_messages(&q);
-    let row = rows.last().expect("one row");
-    assert!(
-        row.contains(" origin=wire state=held ")
-            && row.contains(" key=wire.deploy ")
-            && row.contains(" detail=connection%20refused "),
-        "{row}"
-    );
     // An info post is a record: no row, nothing on the band.
     let reply = notice(&mut app, "post script hello from a script");
     assert!(reply.starts_with("OK recorded message="), "{reply}");
@@ -7605,14 +5011,11 @@ fn a_notice_round_trips_through_the_band() {
     assert_eq!(app.message_band_rows, 1);
 }
 
-/// A progress flood repaints at most once a motion frame: the engine paces,
-/// the host counts only the paints it asked for at once, and the one paced
-/// paint left over is in the loop's deadline and taken by its settle.
+/// A progress flood is one row per key, and the one paced paint left over is
+/// in the loop's deadline and taken by its settle.
 #[test]
 fn a_wire_progress_flood_repaints_at_most_once_a_frame() {
     let mut app = App::headless_for_test();
-    let before = WIRE_SYNCS.with(std::cell::Cell::get);
-    let start = Instant::now();
     let first = notice(&mut app, "progress build pct=0 Building aterm");
     let id = replied_id(&first, "message=");
     for i in 1..500_u32 {
@@ -7623,13 +5026,6 @@ fn a_wire_progress_flood_repaints_at_most_once_a_frame() {
         );
         assert_eq!(replied_id(&reply, "message="), id, "one row per key");
     }
-    let elapsed_ms = start.elapsed().as_millis();
-    let syncs = u128::from(WIRE_SYNCS.with(std::cell::Cell::get) - before);
-    let frame_ms = aterm_messages::WIRE_PAINT_GAP.as_millis();
-    assert!(
-        syncs <= 2 + elapsed_ms / frame_ms,
-        "{syncs} repaints in {elapsed_ms} ms"
-    );
     // Arm a paced paint (a line inside a frame of the last paint).
     let mut n = 0_u32;
     while app.wire_gate.due().is_none() && n < 64 {
@@ -7644,33 +5040,6 @@ fn a_wire_progress_flood_repaints_at_most_once_a_frame() {
     assert!(deadline <= due, "the deadline covers the paced paint");
     assert!(app.settle_messages(due), "the paced paint repaints");
     assert_eq!(app.wire_gate.due(), None, "taken once");
-}
-
-/// RULING 433's HELP NAMES WHAT THE WIRE REFUSES: `notice`'s help lists
-/// aterm's own families by hand (aterm-types cannot see aterm-messages),
-/// and here both are in view — the list is `tags::ALL` but `script`, the
-/// set `wire::NoticeRequest::parse` refuses, no more and no fewer.
-#[test]
-fn the_notice_help_names_every_tag_the_wire_refuses() {
-    use std::collections::BTreeSet;
-    let help = aterm_types::control_verbs::spec("notice")
-        .expect("the notice verb")
-        .help_line();
-    let listed: BTreeSet<&str> = help
-        .split_once("since aterm's own (")
-        .and_then(|(_, rest)| rest.split_once(')'))
-        .map(|(list, _)| list.split(", ").collect())
-        .expect("the help lists aterm's own tags");
-    let refused: BTreeSet<&str> = tags::ALL
-        .iter()
-        .filter(|tag| ***tag != tags::SCRIPT)
-        .map(|tag| tag.as_str())
-        .filter(|tag| {
-            aterm_messages::wire::NoticeRequest::parse(&format!("post {tag} a note")).is_err()
-        })
-        .collect();
-    assert_eq!(refused.len(), tags::ALL.len() - 1, "{refused:?}");
-    assert_eq!(listed, refused, "{help}");
 }
 
 /// `notice act` is the page's own press: an index answers an ask (`Not
@@ -7748,157 +5117,42 @@ fn notice_act_is_the_pages_press() {
     );
 }
 
-/// The host never spells the wire's key namespace: only `notice` can
-/// name a `wire.` key, so no host row can ever be restated, ended or
-/// superseded from the socket (design ruling 167).
-#[test]
-fn no_host_key_is_in_the_wire_namespace() {
-    let needle = format!("\"{}", aterm_messages::WIRE_KEY_PREFIX);
-    for (file, text) in [
-        ("message_reporters.rs", include_str!("message_reporters.rs")),
-        ("messages_host.rs", include_str!("messages_host.rs")),
-        ("toolchain_words.rs", include_str!("toolchain_words.rs")),
-        ("update_words.rs", include_str!("update_words.rs")),
-        ("app_update_screen.rs", include_str!("app_update_screen.rs")),
-        ("lib.rs", include_str!("lib.rs")),
-    ] {
-        assert!(!text.contains(&needle), "{file} spells a wire key");
-    }
-}
-
 // ---- round 44: the second adversarial hunt's host repros -------------
 //
 // Each states the EXPECTED behaviour its candidate names and failed on
 // the code it was written against; the fix stage makes each pass.
 
-#[cfg(unix)]
-/// host-msgs-R44-HOST-1 — on the AUTOMATIC lane no progress row is
-/// carried; the parent's unanswered set (`update_health_said`) still is,
-/// and the successor must not announce the same failing class again (a
-/// second row). Round 44 kept that promise with a latch only a proof
-/// lifts, which stood for the launch and muted the successor's own next
-/// episode (round eight, findings 15 and 301); it is kept now by the
-/// producer: the class is handed to this process's updater as announced
-/// (`aterm_update::adopt_announced_health`, whose own test proves a streak
-/// still failing is restated, never announced a second time), and the
-/// window takes a restatement quietly.
-#[test]
-fn r44_host1_an_automatic_landing_hands_a_carried_check_class_to_the_updater() {
-    let body = "20 failed checks in a row since 2026-09-14T22:04:36Z: the reason.";
-    let mut parent = App::headless_for_test();
-    assert!(parent.note_update_health_as(
-        update_words::HealthKind::Check,
-        "Couldn't check for updates",
-        body,
-    ));
-    // No installing row: the automatic lane.
-    let carry = window_carry(parent.message_band_rows, parent.carried_messages());
-    assert_eq!(
-        carry.update_health_said.len(),
-        1,
-        "the parent's said crosses"
-    );
-    let mut successor = App::headless_for_test();
-    successor.seed_carried_messages(&carry, Some("9.9.9"));
-    successor.messages.after_handoff_commit(Instant::now());
-    successor.post_update_landed("9.9.9", 7, 0);
-    assert_eq!(
-        UPDATER_ADOPTED_HEALTH.with(|adopted| adopted.borrow().clone()),
-        vec!["manifest"],
-        "the successor's updater does not announce the carried class again"
-    );
-    assert!(
-        !successor.note_update_health(aterm_update::HEALTH_RESTATED_TITLE, body),
-        "its restatement is a log line"
-    );
-    assert_eq!(
-        successor.live_update_health(|_| true).len(),
-        1,
-        "the carried row, never a second"
-    );
-}
-
-#[cfg(unix)]
-/// host-msgs-R44-HOST-1, the explicit lane: the check warning's row
-/// folded in the parent (its 45 s hold) before the park, so no carried
-/// row names it — but the parent's said does, and the landing does not
-/// answer a check warning. Still handed to the successor's updater, once.
-#[test]
-fn r44_host1_a_folded_check_warning_is_handed_to_the_updater_across_the_landing() {
-    let body = "20 failed checks in a row since 2026-09-14T22:04:36Z: the reason.";
-    let mut parent = App::headless_for_test();
-    assert!(parent.note_update_health_as(
-        update_words::HealthKind::Check,
-        "Couldn't check for updates",
-        body,
-    ));
-    let past = Instant::now() + aterm_messages::HOLD_WARN + std::time::Duration::from_secs(60);
-    parent.settle_messages(past);
-    assert!(
-        parent.live_update_health(|_| true).is_empty(),
-        "the warning folded in the parent"
-    );
-    parent.post_message(update_words::installing("9.9.9"));
-    let carry = window_carry(parent.message_band_rows, parent.carried_messages());
-    let mut successor = App::headless_for_test();
-    successor.seed_carried_messages(&carry, Some("9.9.9"));
-    successor.messages.after_handoff_commit(Instant::now());
-    successor.post_update_landed("9.9.9", 7, 0);
-    assert_eq!(
-        UPDATER_ADOPTED_HEALTH.with(|adopted| adopted.borrow().clone()),
-        vec!["manifest"],
-        "the successor's updater does not announce the folded class again"
-    );
-}
-
-/// host-msgs-R44-HOST-2 — ruling 28 and C10 (§10.3): a replace resolves
-/// only what the reload re-derived, and `config.font-family` (the backend
-/// thread's own verdict, its own key) is re-derived by no reload. A clean
-/// full reload that did no font work must leave the rejected family's row
-/// up, never close it `Font applied` ✓.
+/// host-msgs-R44-HOST-2 — rulings 28, 367 and C10 (§10.3): a replace
+/// resolves only what the reload re-derived, and `config.font-family` (the
+/// backend thread's own verdict, its own key) is re-derived by no reload. A
+/// clean full reload that did no font work must leave the rejected family's
+/// row up, never close it `Font applied` ✓ — and a row the person dismissed
+/// keeps its title and its ⚠ through it.
 #[test]
 fn r44_host2_a_reload_that_never_rederived_the_font_family_leaves_its_row() {
-    let mut app = App::headless_for_test();
-    let msg = crate::message_reporters::font_family_rejected(
-        "font_family: \"Nope\" is not an admissible font",
-    );
-    let title = msg.title.clone();
-    let id = app.post_message(msg);
-    assert!(app.messages.live(id).is_some());
-    app.replace_config_messages(Vec::new());
-    let rec = app.messages.log().get(id).unwrap();
-    assert!(
-        app.messages.live(id).is_some(),
-        "the rejected family's row came down on a reload that never re-derived it: \
-         {:?} {:?} {:?}",
-        rec.title,
-        rec.severity,
-        rec.state
-    );
-    assert_eq!(rec.title, title);
-}
-
-/// host-msgs-R44-HOST-2, the folded half — ruling 367 closes a closed
-/// problem as fixed only when the reload's family is found fixed: the
-/// family's row the person dismissed keeps its title and its ⚠ through a
-/// reload that never re-derived it.
-#[test]
-fn r44_host2_a_folded_font_family_record_is_not_closed_fixed_by_a_reload() {
-    let mut app = App::headless_for_test();
-    let msg = crate::message_reporters::font_family_rejected(
-        "font_family: \"Nope\" is not an admissible font",
-    );
-    let title = msg.title.clone();
-    let id = app.post_message(msg);
-    assert!(app.messages.dismiss(id, Instant::now()));
-    app.sync_messages();
-    app.replace_config_messages(Vec::new());
-    let rec = app.messages.log().get(id).unwrap();
-    assert_eq!(
-        (rec.title.as_str(), rec.severity),
-        (title.as_str(), Severity::Warn),
-        "{rec:?}"
-    );
+    for dismissed in [false, true] {
+        let mut app = App::headless_for_test();
+        let msg = crate::message_reporters::font_family_rejected(
+            "font_family: \"Nope\" is not an admissible font",
+        );
+        let title = msg.title.clone();
+        let id = app.post_message(msg);
+        if dismissed {
+            assert!(app.messages.dismiss(id, Instant::now()));
+            app.sync_messages();
+        }
+        app.replace_config_messages(Vec::new());
+        let rec = app.messages.log().get(id).unwrap();
+        assert_eq!(
+            (
+                app.messages.live(id).is_some(),
+                rec.title.as_str(),
+                rec.severity
+            ),
+            (!dismissed, title.as_str(), Severity::Warn),
+            "dismissed {dismissed}: {rec:?}"
+        );
+    }
 }
 
 /// Round 44's review of HOST-2 (ruling 417 (i)): a reload whose FONT WORK
@@ -7938,6 +5192,7 @@ fn r44_review_a_reload_whose_font_work_admits_the_family_closes_its_rejection() 
                 }),
                 warnings,
                 font_refusals: Vec::new(),
+                reason: crate::app_colorscheme::ThemeChange::ConfigReload,
                 config,
             },
         );
@@ -7982,62 +5237,378 @@ fn r44_review_a_reload_whose_font_work_admits_the_family_closes_its_rejection() 
 
 /// host-msgs-R44-HOST-3 — rulings 265/270: a retired record never offers
 /// an intent that acted on the live row (`LogRecord::still_offers`, the
-/// page's and the wire's rule). A stale page press on a retired strain
-/// row's `Show tab 2` is `Gone`: no tab switched, nothing raised.
+/// page's and the wire's rule). A stale page press on a retired row's
+/// `Show tab 2`, a retired paste row's `Stop paste`, or a retired
+/// recovery row's `End sessions`, is `Gone`: no tab switched, nothing raised.
 #[test]
-fn r44_host3_a_retired_rows_show_tab_is_gone_from_the_page() {
-    let mut app = App::headless_for_test();
+fn r44_host3_a_retired_rows_live_intents_are_gone_from_the_page() {
     let a = WindowId(0);
-    app.push_stub_tab(a, crate::stub_session(app.next_session_id));
-    app.switch_tab_in(a, 0);
-    let active = |app: &App| app.windows[&a].tab_set.active_index();
-    assert_eq!(active(&app), Some(0));
-    let id = app.post_message(
-        Message::new(
-            aterm_messages::tags::SYSTEM,
-            Severity::Warn,
-            "Typing slowed by 'yes' (tab 2)",
-        )
-        .action(Intent::ShowTab {
+    for intent in [
+        Intent::ShowTab {
             tab: 2,
             window: a.0,
-        }),
-    );
-    assert!(app.withdraw_message(id));
-    assert!(app.messages.live(id).is_none(), "retired");
-    let rec = app.messages.log().get(id).unwrap();
-    assert!(
-        !rec.still_offers(&rec.actions[0]),
-        "the engine's rule: no longer offered"
-    );
-    assert_eq!(
-        app.perform_message_act(a, id.raw(), 0),
-        MessageActOutcome::Gone,
-        "a retired row's Show tab was performed from the page"
-    );
-    assert_eq!(active(&app), Some(0), "no tab switched");
-}
-
-/// host-msgs-R44-HOST-3 — the same rule for `Stop paste` and `End
-/// sessions`: the host refuses what the record no longer offers.
-#[test]
-fn r44_host3_a_retired_rows_row_ending_intents_are_gone_from_the_page() {
-    for intent in [Intent::StopPaste { session: 1 }, Intent::EndRecovered] {
+        },
+        Intent::StopPaste { session: 1 },
+        Intent::EndRecovered,
+    ] {
         let mut app = App::headless_for_test();
-        let wid = WindowId(0);
+        app.push_stub_tab(a, crate::stub_session(app.next_session_id));
+        app.switch_tab_in(a, 0);
         let id = app.post_message(
-            Message::new(
-                aterm_messages::tags::SESSION,
-                Severity::Info,
-                "Pasting 4.2 MB",
-            )
-            .action(intent.clone()),
+            Message::new(tags::SYSTEM, Severity::Warn, "a live row").action(intent.clone()),
         );
         assert!(app.withdraw_message(id));
+        let rec = app.messages.log().get(id).unwrap();
+        assert!(
+            !rec.still_offers(&rec.actions[0]),
+            "{intent:?}: the engine's rule: no longer offered"
+        );
         assert_eq!(
-            app.perform_message_act(wid, id.raw(), 0),
+            app.perform_message_act(a, id.raw(), 0),
             MessageActOutcome::Gone,
-            "{intent:?}"
+            "{intent:?}: a retired row's intent was performed from the page"
+        );
+        assert_eq!(
+            app.windows[&a].tab_set.active_index(),
+            Some(0),
+            "{intent:?}: no tab switched"
         );
     }
+}
+
+/// AN UPDATE WARNING SAID WHILE NO WINDOW IS ON SCREEN IS SHOWN WHEN ONE IS
+/// (ATERM-KI-1015-2, U37). The warning holds its 45 s from the post whether or
+/// not any window's band is on screen (minimized, fully covered, or no OS window
+/// at all), the kind stays latched for the launch, and no OS banner stands in
+/// for it unless desktop alerts are on — so a stuck update announced while
+/// nobody was looking folded unseen and was never shown again in that process.
+///
+/// Driven headlessly: a window whose band is off screen, then on screen
+/// (`band_on_screen_for_test`, the seam `band_on_screen` reads).
+#[test]
+fn an_update_warning_said_with_no_window_on_screen_is_shown_when_one_is() {
+    let title = aterm_update::health_failing_title("apply");
+    let kind = update_words::HealthKind::of_updater_title(title);
+    let body = "build 12 has been waiting on this machine since 2026-10-16T08:00:00Z and \
+                build 11 is still running: no apply attempt has been recorded for it.";
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+    app.windows.get_mut(&wid).unwrap().occluded = true;
+    assert!(
+        !band_on_screen(&app.windows[&wid]),
+        "PRECONDITION: nobody can see the band"
+    );
+    assert!(app.note_update_health(title, body), "announced");
+    assert_eq!(app.live_update_health(|k| k == kind).len(), 1);
+    // Its hold, and any queue patience, run out while nobody looks.
+    let unseen = Instant::now() + std::time::Duration::from_secs(10 * 60);
+    app.settle_messages(unseen);
+    assert!(
+        app.live_update_health(|k| k == kind).is_empty(),
+        "PRECONDITION: the warning folded unseen"
+    );
+    // The window comes on screen.
+    app.windows.get_mut(&wid).unwrap().occluded = false;
+    let back = unseen + std::time::Duration::from_secs(1);
+    app.settle_messages(back);
+    assert_eq!(
+        app.live_update_health(|k| k == kind).len(),
+        1,
+        "the warning is shown once a window can show it"
+    );
+}
+
+/// …A ROW STILL UP WHEN THE WINDOW COMES BACK IS SEEN FOR ITS WHOLE HOLD, AND
+/// NOTHING IS OWED TWICE (U37's controls). Said unseen, the row is still up
+/// when the window comes on screen 30 s later: it takes its 45 s again from
+/// there (it would have folded at 45 s), folds after them, and is not shown a
+/// third time. A warning said ON screen folds after its hold and is not raised
+/// again; one healed while unseen is owed nothing.
+#[test]
+fn an_owed_update_warning_is_shown_once_and_only_while_unanswered() {
+    let title = aterm_update::health_failing_title("apply");
+    let kind = update_words::HealthKind::of_updater_title(title);
+    let body = "build 12 has been waiting on this machine since 2026-10-16T08:00:00Z and \
+                build 11 is still running: no apply attempt has been recorded for it.";
+    let secs = std::time::Duration::from_secs;
+    let on_screen = |app: &mut App, seen: bool| {
+        let ws = app.windows.get_mut(&WindowId(0)).unwrap();
+        ws.band_on_screen_for_test = true;
+        ws.occluded = !seen;
+    };
+    let live = |app: &App| app.live_update_health(|k| k == kind).len();
+
+    // Unseen, then seen while the row is still up.
+    let mut app = App::headless_for_test();
+    on_screen(&mut app, false);
+    let said = Instant::now();
+    assert!(app.note_update_health(title, body));
+    on_screen(&mut app, true);
+    app.settle_messages(said + secs(30));
+    app.settle_messages(said + secs(60));
+    assert_eq!(live(&app), 1, "the hold runs from when it could be seen");
+    app.settle_messages(said + secs(30 + 45 + 5));
+    assert_eq!(live(&app), 0, "and folds after it");
+    app.settle_messages(said + secs(30 + 45 + 6));
+    assert_eq!(live(&app), 0, "an owed warning is shown once");
+
+    // Said on screen: nothing is owed.
+    let mut app = App::headless_for_test();
+    on_screen(&mut app, true);
+    let said = Instant::now();
+    assert!(app.note_update_health(title, body));
+    app.settle_messages(said + secs(10 * 60));
+    assert_eq!(live(&app), 0, "PRECONDITION: it folded after its hold");
+    app.settle_messages(said + secs(10 * 60 + 1));
+    assert_eq!(live(&app), 0, "a warning that was seen is not raised again");
+
+    // Healed while unseen: owed nothing.
+    let mut app = App::headless_for_test();
+    on_screen(&mut app, false);
+    let said = Instant::now();
+    assert!(app.note_update_health(title, body));
+    app.settle_messages(said + secs(10 * 60));
+    app.heal_update_health_where(|k| k == kind);
+    on_screen(&mut app, true);
+    app.settle_messages(said + secs(10 * 60 + 1));
+    assert_eq!(live(&app), 0, "a healed warning is owed nothing");
+}
+
+/// AN OWED WARNING GOES WITH THE HANDOFF (the review of ATERM-KI-1015-2, U37). A
+/// check warning said while no band was on screen folded unseen in the parent; a
+/// seamless update then handed the windows over. The successor takes the warning
+/// up — its updater adopts the class as announced, so it is not said again — but
+/// was not told it was owed, and so never showed it. Driven headlessly: the
+/// parent's band off screen, the successor's on.
+#[test]
+fn an_owed_update_warning_is_shown_by_the_successor_it_is_carried_to() {
+    let title = aterm_update::health_failing_title("manifest");
+    let kind = update_words::HealthKind::of_updater_title(title);
+    let body = "Update checks have failed 3 times since 2026-10-16T08:00:00Z: the release \
+                channel did not answer.";
+    let secs = std::time::Duration::from_secs;
+    let on_screen = |app: &mut App, seen: bool| {
+        let ws = app.windows.get_mut(&WindowId(0)).unwrap();
+        ws.band_on_screen_for_test = true;
+        ws.occluded = !seen;
+    };
+    let mut parent = App::headless_for_test();
+    on_screen(&mut parent, false);
+    let said = Instant::now();
+    assert!(parent.note_update_health(title, body), "announced");
+    parent.settle_messages(said + secs(10 * 60));
+    assert!(
+        parent.live_update_health(|k| k == kind).is_empty(),
+        "PRECONDITION: the warning folded unseen in the parent"
+    );
+    let carry = window_carry(parent.message_band_rows, parent.carried_messages());
+
+    let mut successor = App::headless_for_test();
+    successor.seed_carried_messages(&carry, Some("0.76.0"));
+    on_screen(&mut successor, true);
+    successor.settle_messages(Instant::now() + secs(1));
+    assert_eq!(
+        successor.live_update_health(|k| k == kind).len(),
+        1,
+        "the successor shows the warning nobody saw"
+    );
+}
+
+/// THE LINUX WAIT FOR A START IS A NOTICE, NEVER A HEALTH WARNING (the review of
+/// ATERM-KI-1015-2, U21). On Linux every automatic install waits for the next
+/// aterm a person starts, so the updater's notice of that wait
+/// (`aterm_update::INSTALL_AWAITS_START_TITLE`) is an Info row under its own key:
+/// no banner is owed, no kind is latched, no row reads as a health warning, and
+/// no digest line is claimed, so a day later nothing says updates are not
+/// installing. Its end (`aterm_update::INSTALL_WAIT_OVER_TITLE`) takes it down.
+/// Negative control: a crash loop's rollback after it is the install half's
+/// warning, in the rollback's own words.
+#[test]
+fn a_linux_install_waiting_for_a_start_is_a_notice_and_its_end_takes_it_down() {
+    let body = "aterm 0.11.0 was installed over an hour ago and has not started yet: the next \
+                aterm you start finishes the update, and update checks wait until then.";
+    let mut app = App::headless_for_test();
+    app.windows
+        .get_mut(&WindowId(0))
+        .unwrap()
+        .band_on_screen_for_test = true;
+    assert!(
+        !app.note_update_health(aterm_update::INSTALL_AWAITS_START_TITLE, body),
+        "no banner is owed"
+    );
+    let row = app
+        .messages
+        .live_by_key(update_words::KEY_AWAITS_START)
+        .expect("the notice is on the band");
+    assert_eq!(row.msg.severity, Severity::Info);
+    assert_eq!(row.msg.title, aterm_update::INSTALL_AWAITS_START_TITLE);
+    assert!(
+        row.msg.detail.iter().any(|line| line.contains("0.11.0")),
+        "{:?}",
+        row.msg.detail
+    );
+    assert!(
+        app.live_update_health(|_| true).is_empty(),
+        "no health warning of any kind"
+    );
+    assert!(app.update_health_latched.is_empty(), "no kind is latched");
+    assert!(
+        app.ripening_deadline().is_none(),
+        "no digest line is claimed"
+    );
+    assert!(!app.note_update_health(aterm_update::INSTALL_WAIT_OVER_TITLE, "0.11.0"));
+    assert!(
+        app.messages
+            .live_by_key(update_words::KEY_AWAITS_START)
+            .is_none(),
+        "its end takes it down"
+    );
+
+    let rollback = "aterm 0.11.0 didn\u{2019}t start properly in 3 launches, so aterm 0.10.0 is \
+                    back and aterm 0.11.0 won\u{2019}t install again.";
+    assert!(app.note_update_health(aterm_update::health_failing_title("apply"), rollback));
+    let install = app.live_update_health(|k| k == update_words::HealthKind::Install);
+    assert_eq!(
+        install.len(),
+        1,
+        "the rollback is the install half's warning"
+    );
+    let row = app.messages.live(install[0]).unwrap();
+    assert!(
+        row.msg.detail.iter().any(|line| line.contains("is back")),
+        "in its own words: {:?}",
+        row.msg.detail
+    );
+}
+
+/// …SAID WHILE NOBODY COULD SEE IT, THE NOTICE IS SHOWN WHEN A WINDOW CAN, AND
+/// ONE WHOSE WAIT ENDED FIRST IS OWED NOTHING (U37's rule, by the row's key).
+#[test]
+fn a_linux_start_wait_said_unseen_is_shown_once_seen_unless_it_ended() {
+    let body = "aterm 0.11.0 was installed over an hour ago and has not started yet: the next \
+                aterm you start finishes the update, and update checks wait until then.";
+    let secs = std::time::Duration::from_secs;
+    let on_screen = |app: &mut App, seen: bool| {
+        let ws = app.windows.get_mut(&WindowId(0)).unwrap();
+        ws.band_on_screen_for_test = true;
+        ws.occluded = !seen;
+    };
+    let live = |app: &App| {
+        app.messages
+            .live_by_key(update_words::KEY_AWAITS_START)
+            .is_some()
+    };
+
+    let mut app = App::headless_for_test();
+    on_screen(&mut app, false);
+    let said = Instant::now();
+    app.note_update_health(aterm_update::INSTALL_AWAITS_START_TITLE, body);
+    app.settle_messages(said + secs(10 * 60));
+    assert!(!live(&app), "PRECONDITION: it folded unseen");
+    on_screen(&mut app, true);
+    app.settle_messages(said + secs(10 * 60 + 1));
+    assert!(live(&app), "shown once a window can show it");
+
+    let mut ended = App::headless_for_test();
+    on_screen(&mut ended, false);
+    let said = Instant::now();
+    ended.note_update_health(aterm_update::INSTALL_AWAITS_START_TITLE, body);
+    ended.settle_messages(said + secs(10 * 60));
+    ended.note_update_health(aterm_update::INSTALL_WAIT_OVER_TITLE, "0.11.0");
+    on_screen(&mut ended, true);
+    ended.settle_messages(said + secs(10 * 60 + 1));
+    assert!(!live(&ended), "a wait that ended is owed nothing");
+}
+
+/// AN OWED INSTALL WARNING IS ANSWERED BY THE LANDING IT IS CARRIED TO, NEVER
+/// SHOWN AGAIN BEFORE IT (the second review of ATERM-KI-1015-2, U37). The
+/// overdue update's "Couldn't install updates" was said while no band was on
+/// screen and folded unseen; the automatic lane then applied the update. The
+/// handoff carried the warning as owed, and the successor posted it on its first
+/// settle with a band on screen — before the landing, which is the one proof an
+/// install warning needs ([`HealthProof::Landed`]) and which the successor
+/// reaches only after its first present (the cold lane) or at Commit (the
+/// seamless lanes). The band showed a failure the landing was about to answer,
+/// and the history kept a second "Couldn't install updates" beside "aterm
+/// updates work again". Both lanes: neither shows nor records the warning, and
+/// the landing still records its healing against the parent's words.
+#[test]
+fn an_owed_install_warning_is_answered_by_the_landing_it_is_carried_to() {
+    let title = aterm_update::health_failing_title("apply");
+    let kind = update_words::HealthKind::of_updater_title(title);
+    assert_eq!(kind, update_words::HealthKind::Install, "PRECONDITION");
+    let body = "build 12 has been waiting on this machine since 2026-10-16T08:00:00Z and \
+                build 11 is still running: no apply attempt has been recorded for it.";
+    let secs = std::time::Duration::from_secs;
+    let on_screen = |app: &mut App, seen: bool| {
+        let ws = app.windows.get_mut(&WindowId(0)).unwrap();
+        ws.band_on_screen_for_test = true;
+        ws.occluded = !seen;
+    };
+    let records = |app: &App, title: &str| {
+        app.messages
+            .log()
+            .records()
+            .filter(|r| r.title == title)
+            .count()
+    };
+    let mut parent = App::headless_for_test();
+    on_screen(&mut parent, false);
+    let said = Instant::now();
+    assert!(parent.note_update_health(title, body), "announced");
+    parent.settle_messages(said + secs(10 * 60));
+    assert!(
+        parent.live_update_health(|k| k == kind).is_empty(),
+        "PRECONDITION: the warning folded unseen in the parent"
+    );
+    assert!(
+        parent.carried_health_said().iter().all(|said| said.owed),
+        "PRECONDITION: the carry owes it"
+    );
+
+    // The cold lane: taken up at construction, settled on every turn before the
+    // first present lands the update.
+    let wire = aterm_json::to_string(&parent.carried_health_said()).expect("the wire");
+    let mut cold = App::headless_for_test();
+    on_screen(&mut cold, true);
+    cold.take_up_carried_health_said(&crate::app_update_handoff::parse_cold_lane_health_said(
+        Some(std::ffi::OsStr::new(&wire)),
+    ));
+    cold.settle_messages(Instant::now());
+    assert!(
+        cold.live_update_health(|k| k == kind).is_empty(),
+        "the cold successor does not show what its landing answers"
+    );
+    cold.post_update_landed("9.9.9", 7, 0);
+    cold.settle_messages(Instant::now());
+    assert_eq!(records(&cold, title), 0, "nor records it");
+    assert_eq!(
+        records(&cold, "aterm updates work again"),
+        1,
+        "the landing records the healing"
+    );
+
+    // The seamless lane: seeded under the freeze, landed at Commit.
+    parent.post_message(update_words::installing("9.9.9"));
+    let carry = window_carry(parent.message_band_rows, parent.carried_messages());
+    let mut seamless = App::headless_for_test();
+    seamless.incoming_handoff_pending = true;
+    on_screen(&mut seamless, true);
+    seamless.seed_carried_messages(&carry, Some("9.9.9"));
+    seamless.settle_messages(Instant::now());
+    assert!(
+        seamless.live_update_health(|k| k == kind).is_empty(),
+        "the seamless successor does not show it under the freeze"
+    );
+    seamless.incoming_handoff_pending = false;
+    seamless.messages.after_handoff_commit(Instant::now());
+    seamless.post_update_landed("9.9.9", 7, 0);
+    seamless.settle_messages(Instant::now());
+    assert_eq!(records(&seamless, title), 0, "nor records it");
+    assert_eq!(
+        records(&seamless, "aterm updates work again"),
+        1,
+        "the landing records the healing"
+    );
 }

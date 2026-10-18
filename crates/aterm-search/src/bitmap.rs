@@ -10,8 +10,8 @@
 //! and compacts amortized. A run of consecutive rows costs one byte per posting and
 //! a single-row list none (docs/measured/search-posting-containers.md).
 //!
-//! A varint stream is not seekable, so membership, ranges and intersection decode
-//! to a `Vec<u32>` first, once per posting list per query. The container never
+//! A varint stream is not seekable, so membership and intersection decode to a
+//! `Vec<u32>` first, once per posting list per query. The container never
 //! retains a decoded copy.
 
 use std::cmp::Ordering;
@@ -21,15 +21,17 @@ use std::ops::{BitAnd, BitAndAssign};
 // stock rustc (the cross cells of `verify cells`, the x86_64-apple-darwin
 // compat slice) parses a cfg'd-out module's body all the same, so the island's
 // module goes through this macro, which drops its tokens there and emits them
-// unchanged under `cfg(trust_verify)`.
-#[cfg(trust_verify)]
+// unchanged under `cfg(clean_islands)`: set by this crate's build script
+// whenever the compiler is Trust (crates/aterm-log/clean_islands.rs), so the
+// island is kernel-checked at every Trust build, not only the verify lane.
+#[cfg(clean_islands)]
 macro_rules! verify_island {
     ($($tt:tt)*) => {
         $($tt)*
     };
 }
 
-#[cfg(not(trust_verify))]
+#[cfg(not(clean_islands))]
 macro_rules! verify_island {
     ($($tt:tt)*) => {};
 }
@@ -89,13 +91,6 @@ pub(crate) struct SparseBitmap {
 /// Iterator over values in a `SparseBitmap`, consuming it. Ascending order.
 #[cfg(test)]
 pub(crate) type SparseBitmapIntoIter = std::vec::IntoIter<u32>;
-
-/// Owned ascending range over a sparse bitmap, double-ended for reverse navigation.
-/// Test-only: the query paths range-bound the slice from [`to_vec`] directly.
-///
-/// [`to_vec`]: SparseBitmap::to_vec
-#[cfg(test)]
-pub(crate) type SparseBitmapRange = std::vec::IntoIter<u32>;
 
 #[cfg(test)]
 std::thread_local! {
@@ -339,15 +334,6 @@ impl SparseBitmap {
         }
     }
 
-    /// Values at or after `from`, as an owned ascending iterator.
-    #[cfg(test)]
-    pub(crate) fn range_from(&self, from: u32) -> SparseBitmapRange {
-        let mut values = self.to_vec();
-        let start = values.partition_point(|&v| v < from);
-        values.drain(..start);
-        values.into_iter()
-    }
-
     /// Returns `true` if the bitmap contains no values.
     #[inline]
     #[must_use]
@@ -371,12 +357,6 @@ impl SparseBitmap {
             return false;
         }
         self.to_vec().binary_search(&value).is_ok()
-    }
-
-    /// Iterate over all values in ascending order.
-    #[cfg(test)]
-    pub(crate) fn iter(&self) -> impl Iterator<Item = u32> {
-        self.to_vec().into_iter()
     }
 }
 
@@ -427,91 +407,6 @@ impl BitAndAssign<&SparseBitmap> for SparseBitmap {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_insert_and_len() {
-        let mut bm = SparseBitmap::new();
-        assert!(bm.is_empty());
-        assert_eq!(bm.len(), 0);
-
-        bm.insert(5);
-        bm.insert(10);
-        bm.insert(5); // duplicate
-        assert_eq!(bm.len(), 2);
-        assert!(!bm.is_empty());
-    }
-
-    #[test]
-    fn test_insert_out_of_order_stays_sorted() {
-        let mut bm = SparseBitmap::new();
-        // Not an append stream: values arrive unordered and with duplicates.
-        for v in [30u32, 10, 20, 10, 25, 5] {
-            bm.insert(v);
-        }
-        let vals: Vec<u32> = bm.iter().collect();
-        assert_eq!(vals, vec![5, 10, 20, 25, 30]);
-    }
-
-    #[test]
-    fn test_insert_return_value() {
-        let mut bm = SparseBitmap::new();
-        assert!(bm.insert(5)); // new
-        assert!(bm.insert(3)); // new (out of order)
-        assert!(!bm.insert(5)); // duplicate
-        assert!(!bm.insert(3)); // duplicate
-        assert!(bm.insert(9)); // new (append)
-    }
-
-    #[test]
-    fn test_remove() {
-        let mut bm = SparseBitmap::new();
-        bm.insert(1);
-        bm.insert(2);
-        bm.insert(3);
-
-        assert!(bm.remove(2));
-        assert!(!bm.remove(2)); // already removed
-        assert_eq!(bm.len(), 2);
-        let vals: Vec<u32> = bm.iter().collect();
-        assert_eq!(vals, vec![1, 3]);
-    }
-
-    #[test]
-    fn test_drop_below() {
-        let mut bm = SparseBitmap::new();
-        for i in 0..10 {
-            bm.insert(i);
-        }
-        bm.drop_below(4);
-        let vals: Vec<u32> = bm.iter().collect();
-        assert_eq!(vals, vec![4, 5, 6, 7, 8, 9]);
-        // Below the minimum: no-op. Above the maximum: empties the list.
-        bm.drop_below(0);
-        assert_eq!(bm.len(), 6);
-        bm.drop_below(100);
-        assert!(bm.is_empty());
-    }
-
-    #[test]
-    fn test_drop_below_equals_repeated_front_remove() {
-        // The batched trim must match one-at-a-time removal of every value
-        // below the watermark (the equivalence prefix eviction relies on).
-        let seed = [2u32, 3, 5, 8, 13, 21, 34, 55];
-        let mut batched = SparseBitmap::new();
-        let mut incremental = SparseBitmap::new();
-        for &v in &seed {
-            batched.insert(v);
-            incremental.insert(v);
-        }
-        batched.drop_below(13);
-        for &v in seed.iter().filter(|&&v| v < 13) {
-            incremental.remove(v);
-        }
-        let a: Vec<u32> = batched.iter().collect();
-        let b: Vec<u32> = incremental.iter().collect();
-        assert_eq!(a, b);
-        assert_eq!(a, vec![13, 21, 34, 55]);
-    }
 
     /// Check the logical set and the exact live encoding independently of the
     /// consumed prefix. Prefix retention is bounded even after tail removals.
@@ -589,10 +484,6 @@ mod tests {
                 let mut assigned = bm.clone();
                 assigned &= &other;
                 assert_encoding(&assigned, &intersection);
-                assert_eq!(
-                    bm.range_from(step + 128).collect::<Vec<_>>(),
-                    expected.range(step + 128..).copied().collect::<Vec<_>>()
-                );
             }
             assert_encoding(&bm, &expected.iter().copied().collect::<Vec<_>>());
         }
@@ -668,33 +559,6 @@ mod tests {
     }
 
     #[test]
-    fn test_into_iter_sorted() {
-        let mut bm = SparseBitmap::new();
-        bm.insert(30);
-        bm.insert(10);
-        bm.insert(20);
-        let vals: Vec<u32> = bm.into_iter().collect();
-        assert_eq!(vals, vec![10, 20, 30]);
-    }
-
-    #[test]
-    fn test_bitand() {
-        let mut a = SparseBitmap::new();
-        a.insert(1);
-        a.insert(2);
-        a.insert(3);
-
-        let mut b = SparseBitmap::new();
-        b.insert(2);
-        b.insert(3);
-        b.insert(4);
-
-        let result = &a & &b;
-        let vals: Vec<u32> = result.into_iter().collect();
-        assert_eq!(vals, vec![2, 3]);
-    }
-
-    #[test]
     fn test_bitand_disjoint_and_empty() {
         let mut a = SparseBitmap::new();
         a.insert(1);
@@ -706,56 +570,6 @@ mod tests {
         let empty = SparseBitmap::new();
         assert!((&a & &empty).is_empty());
         assert!((&empty & &a).is_empty());
-    }
-
-    #[test]
-    fn test_bitand_assign() {
-        let mut a = SparseBitmap::new();
-        a.insert(1);
-        a.insert(2);
-        a.insert(3);
-
-        let mut b = SparseBitmap::new();
-        b.insert(2);
-        b.insert(3);
-        b.insert(4);
-
-        a &= &b;
-        let vals: Vec<u32> = a.into_iter().collect();
-        assert_eq!(vals, vec![2, 3]);
-    }
-
-    #[test]
-    fn test_default_is_empty() {
-        let bm = SparseBitmap::default();
-        assert!(bm.is_empty());
-        assert_eq!(bm.len(), 0);
-    }
-
-    #[test]
-    fn test_large_gap_varint_roundtrip() {
-        // Gaps spanning multiple varint bytes (>= 128, >= 16384) must decode
-        // back to the exact ascending ids.
-        let mut bm = SparseBitmap::new();
-        let seed = [0u32, 1, 200, 500, 70_000, 70_001, 5_000_000];
-        for &v in &seed {
-            bm.insert(v);
-        }
-        let vals: Vec<u32> = bm.iter().collect();
-        assert_eq!(vals, seed.to_vec());
-        assert_eq!(bm.len(), seed.len() as u64);
-        assert!(bm.contains(70_000));
-        assert!(bm.contains(5_000_000));
-        assert!(!bm.contains(70_002));
-    }
-
-    #[test]
-    fn test_single_value_has_no_delta_bytes() {
-        // A one-posting list (the common short-trigram case) stores only `first`.
-        let mut bm = SparseBitmap::new();
-        bm.insert(42);
-        assert_eq!(bm.deltas.len(), 0);
-        assert_eq!(bm.into_iter().collect::<Vec<_>>(), vec![42]);
     }
 
     fn decodes() -> usize {

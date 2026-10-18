@@ -8,11 +8,11 @@ use std::fs::File;
 use std::path::Path;
 
 /// Make one open file or directory durable: the barrier an atomic publish takes on its
-/// temporary before the rename, and on the directory after it. [`File::sync_all`] is
-/// `fcntl(F_FULLFSYNC)`, a drive-cache flush, on Apple targets and `fsync(2)` elsewhere.
+/// temporary before the rename, and on the directory after it. [`aterm_durable::durable`]
+/// is `fcntl(F_FULLFSYNC)`, a drive-cache flush, on Apple targets and `fsync(2)` elsewhere.
 #[cfg(not(all(test, target_vendor = "apple")))]
 pub(crate) fn sync_all(file: &File) -> std::io::Result<()> {
-    file.sync_all()
+    aterm_durable::durable(file)
 }
 
 /// [`sync_all`] under this crate's own tests on Apple targets (`tests/it` mounts this

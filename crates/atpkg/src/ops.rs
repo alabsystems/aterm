@@ -14,33 +14,9 @@ use std::path::{Path, PathBuf};
 use crate::Layout;
 use crate::store::ToolName;
 
-// Test-only: how many times this thread has listed `bin/` through `read_bin_dir`.
-// Thread-local because libtest runs each `#[test]` on its own thread, so the count is this
-// test's own. Plain `//`, not `///`: a doc comment on a macro invocation is
-// `unused_doc_comments`, an error under this crate's gate.
-#[cfg(test)]
-thread_local! {
-    static BIN_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// Test-only: the listing count since [`reset_bin_scans`].
-#[cfg(all(test, unix))]
-pub(crate) fn bin_scans() -> usize {
-    BIN_SCANS.with(std::cell::Cell::get)
-}
-
-/// Test-only: start counting from zero.
-#[cfg(all(test, unix))]
-pub(crate) fn reset_bin_scans() {
-    BIN_SCANS.with(|n| n.set(0));
-}
-
 /// List `bin/` — the one door every scan in this module and in [`crate::activate`] goes
-/// through, so the counter above measures all of them and a test can pin a pass's cost.
-/// Outside `cfg(test)` this is just `std::fs::read_dir(layout.bin_dir())`.
+/// through.
 pub(crate) fn read_bin_dir(layout: &Layout) -> io::Result<std::fs::ReadDir> {
-    #[cfg(test)]
-    BIN_SCANS.with(|n| n.set(n.get().saturating_add(1)));
     std::fs::read_dir(layout.bin_dir())
 }
 
@@ -69,8 +45,7 @@ pub fn which(layout: &Layout, tool: &str) -> Option<PathBuf> {
 /// them linted. The answer is the one the shim's guard gives, decided by the
 /// same `stat`s. [`which`] itself is unchanged — every reader that asks where a tool
 /// LIVES (gc, doctor, `atpkg which`) keeps reading the store.
-#[must_use]
-pub fn exec_path(layout: &Layout, tool: &str) -> Option<PathBuf> {
+fn exec_path(layout: &Layout, tool: &str) -> Option<PathBuf> {
     let shim = layout.shim(&ToolName::new(tool)?);
     let target = crate::platform::resolve_shim(&shim)?;
     Some(crate::compat::route_for_shim(&shim, &target).unwrap_or(target))
@@ -91,8 +66,7 @@ pub fn exec_path(layout: &Layout, tool: &str) -> Option<PathBuf> {
 /// first, not the shim as laid, because a shim a pre-2026-09-23 `repair` laid plain has
 /// nothing to copy. Every value passed [`crate::shim_env::ShimEnv::admit`] on the way in,
 /// so no entry here can name `PATH`, the loader's variables or a runtime's.
-#[must_use]
-pub fn exec_env(layout: &Layout, tool: &str) -> crate::shim_env::ShimEnv {
+fn exec_env(layout: &Layout, tool: &str) -> crate::shim_env::ShimEnv {
     let Some(name) = ToolName::new(tool) else {
         return crate::shim_env::ShimEnv::NONE;
     };
@@ -106,6 +80,27 @@ pub fn exec_env(layout: &Layout, tool: &str) -> crate::shim_env::ShimEnv {
     } else {
         declared
     }
+}
+
+/// A tool as its shim would run it, for a door that execs PAST the shim — `atpkg run` and
+/// the reroute's DIRECT rows: the file (`exec_path`) and what to export before the exec
+/// (`exec_env`). The one way out of this module to either half, so no door can take the
+/// path without the environment (`atpkg run` once did, audit 2026-09-23).
+#[derive(Debug, PartialEq, Eq)]
+pub struct Managed {
+    /// The file to exec.
+    pub target: PathBuf,
+    /// What the shim would export before its `exec`.
+    pub env: crate::shim_env::ShimEnv,
+}
+
+/// [`Managed`] for `tool`, or `None` when no shim of it forwards to a build.
+#[must_use]
+pub fn managed(layout: &Layout, tool: &str) -> Option<Managed> {
+    Some(Managed {
+        target: exec_path(layout, tool)?,
+        env: exec_env(layout, tool),
+    })
 }
 
 /// One listing of `bin/`, resolved once: per entry, the logical [`ToolName`] its file name
@@ -661,19 +656,6 @@ mod tests {
         assert_eq!(store_build_of(prefix, Path::new("/p/store/../ay/18")), None);
     }
 
-    #[test]
-    fn which_resolves_installed_shim() {
-        let l = layout("which");
-        let dir = install(&l, "ay", 18);
-        // The shim forwards to the concrete executable (`bin/ay` Unix, `bin\ay.exe` Windows).
-        assert_eq!(
-            which(&l, "ay"),
-            Some(dir.join("bin").join(tool("ay").exe_file()))
-        );
-        assert_eq!(which(&l, "nope"), None);
-        let _ = std::fs::remove_dir_all(&l.prefix);
-    }
-
     /// `active_builds` reports the LIVE build (what the shim points at), even when a newer
     /// build is staged + marked complete on disk but never activated — so the update decision
     /// re-flips it instead of mistaking the staged build for the running one (#19).
@@ -785,19 +767,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    #[test]
-    fn list_installed_reports_program_builds() {
-        let l = layout("list");
-        install(&l, "ay", 18);
-        install(&l, "ny", 9);
-        install(&l, "ny", 10);
-        assert_eq!(
-            list_installed(&l),
-            vec![("ay".into(), 18), ("ny".into(), 9), ("ny".into(), 10)]
-        );
-        let _ = std::fs::remove_dir_all(&l.prefix);
-    }
-
     /// The listing obeys the store's strict recogniser ([`crate::store::parse_build_name`]):
     /// `u64::from_str` would accept the leading `+` and leading zeros the producer never
     /// writes, so `+19/` and `019/` are somebody else's directories. Leniency here is not
@@ -835,9 +804,12 @@ mod tests {
     fn uninstall_removes_shim_store_and_channel_link() {
         let l = layout("uninstall");
         install(&l, "ay", 18);
+        install(&l, "ny", 9);
         assert!(which(&l, "ay").is_some());
 
         uninstall(&l, "ay").unwrap();
+        assert!(which(&l, "ny").is_some(), "another program is untouched");
+        assert!(l.build_dir("ny", 9).exists());
 
         assert!(which(&l, "ay").is_none(), "shim removed");
         assert!(!l.build_dir("ay", 18).exists(), "store tree reclaimed");
@@ -847,19 +819,6 @@ mod tests {
         );
         // The program's `current` link went with its store tree, not left dangling.
         assert!(std::fs::symlink_metadata(l.program_current("ay")).is_err());
-        let _ = std::fs::remove_dir_all(&l.prefix);
-    }
-
-    #[test]
-    fn uninstall_leaves_other_programs_intact() {
-        let l = layout("uninstall-other");
-        install(&l, "ay", 18);
-        install(&l, "ny", 9);
-        uninstall(&l, "ay").unwrap();
-        // ny is untouched.
-        assert!(which(&l, "ny").is_some());
-        assert!(l.build_dir("ny", 9).exists());
-        assert!(!l.build_dir("ay", 18).exists());
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
@@ -973,40 +932,5 @@ mod tests {
         assert_eq!(exec_env(&l, "absent"), none);
         assert_eq!(exec_env(&l, "../ay"), none);
         let _ = std::fs::remove_dir_all(&l.prefix);
-    }
-
-    /// EVERY DOOR PAST THE SHIM EXPORTS WHAT THE SHIM WOULD. The production functions that
-    /// exec [`exec_path`] — `atpkg run` (hence `aterm <tool>`) and the reroute's DIRECT
-    /// rows — each export [`exec_env`] too: `run` alone was the defect (audit 2026-09-23),
-    /// and the reroute is the same shape one file away, latent only while no program it
-    /// brands declares an environment. Source-level, because a door is an `exec` that
-    /// replaces the test process.
-    #[test]
-    fn every_door_that_execs_past_the_shim_exports_its_environment() {
-        let mut doors = 0;
-        for (file, source) in [
-            ("cli.rs", include_str!("cli.rs")),
-            ("reroute.rs", include_str!("reroute.rs")),
-        ] {
-            let production = source.split("\nmod tests {").next().unwrap_or_default();
-            let mut from = 0;
-            while let Some(at) = production[from..].find("crate::ops::exec_path(") {
-                let at = from + at;
-                let start = production[..at].rfind("\nfn ").expect("inside a fn");
-                let end = production[at..]
-                    .find("\n}\n")
-                    .map_or(production.len(), |e| at + e);
-                let body = &production[start..end];
-                let name = body[4..].split('(').next().unwrap_or_default();
-                assert!(
-                    body.contains("crate::ops::exec_env("),
-                    "{file}: {name} execs `ops::exec_path` without exporting `ops::exec_env` \
-                     — the shim it skips exports that before its exec"
-                );
-                doors += 1;
-                from = end;
-            }
-        }
-        assert_eq!(doors, 2, "run and the reroute's DIRECT rows");
     }
 }

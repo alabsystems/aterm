@@ -20,6 +20,8 @@ fn make_block(id: u64, prompt_row: u64) -> OutputBlock {
         working_directory: None,
         commandline: None,
         collapsed: false,
+        text_cleared: false,
+        command_text_cleared: false,
         prompt_time_ms: None,
         command_input_start_time_ms: None,
         command_exec_start_time_ms: None,
@@ -38,23 +40,13 @@ fn block_is_complete_requires_complete_state() {
 }
 
 #[test]
-fn block_succeeded_requires_exit_code_zero() {
+fn block_succeeds_only_on_zero_and_fails_on_any_other_exit_code() {
     let mut block = make_block(0, 0);
-    assert!(!block.succeeded());
+    assert!(!block.succeeded() && !block.failed());
     block.exit_code = Some(0);
-    assert!(block.succeeded());
+    assert!(block.succeeded() && !block.failed());
     block.exit_code = Some(1);
-    assert!(!block.succeeded());
-}
-
-#[test]
-fn block_failed_requires_nonzero_exit_code() {
-    let mut block = make_block(0, 0);
-    assert!(!block.failed());
-    block.exit_code = Some(0);
-    assert!(!block.failed());
-    block.exit_code = Some(1);
-    assert!(block.failed());
+    assert!(!block.succeeded() && block.failed());
     block.exit_code = Some(-1);
     assert!(block.failed());
 }
@@ -67,16 +59,11 @@ fn block_failed_requires_nonzero_exit_code() {
 // ========================================================================
 
 #[test]
-fn command_rows_saturate_at_u64_max() {
+fn command_and_output_rows_saturate_at_u64_max() {
     let mut block = make_block(0, 0);
     block.command_start_row = Some(u64::MAX);
     let rows = block.command_rows().expect("should have command rows");
     assert_eq!(rows, (u64::MAX, u64::MAX), "command_rows must not wrap");
-}
-
-#[test]
-fn output_rows_saturate_at_u64_max() {
-    let mut block = make_block(0, 0);
     block.output_start_row = Some(u64::MAX);
     let rows = block.output_rows().expect("should have output rows");
     assert_eq!(rows, (u64::MAX, u64::MAX), "output_rows must not wrap");

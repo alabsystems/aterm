@@ -4,29 +4,29 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/common/xkb/keymap.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-//! Modified by the aterm project in 2026; see the repository NOTICE.
+//! Modified by the aterm project in 2026; see the repository NOTICE. (libxkbcommon's entry
+//! points and keysyms are first-party aterm-xkb's, and a Wayland keymap is compiled from the
+//! text aterm-wayland's seat read from the compositor's descriptor, where upstream used
+//! xkbcommon-dl, xkeysym and memmap2: docs/AUDIT-third-party-2026-10-15.md, LW.7.)
 //!
 //! XKB keymap.
 
-use std::ffi::c_char;
+use std::ffi::CStr;
 use std::ops::Deref;
 use std::ptr::{self, NonNull};
 
 #[cfg(x11_platform)]
-use x11_dl::xlib_xcb::xcb_connection_t;
-#[cfg(wayland_platform)]
-use {memmap2::MmapOptions, std::os::unix::io::OwnedFd};
+use aterm_xkb::XcbConnection as xcb_connection_t;
 
-use xkb::XKB_MOD_INVALID;
-use xkbcommon_dl::{
-    self as xkb, xkb_keycode_t, xkb_keymap, xkb_keymap_compile_flags, xkb_keysym_t,
-    xkb_layout_index_t, xkb_mod_index_t,
+use aterm_xkb::{
+    self as xkb, mod_name, Keycode as xkb_keycode_t, Keysym as xkb_keysym_t,
+    LayoutIndex as xkb_layout_index_t, ModIndex as xkb_mod_index_t, XkbKeymap as xkb_keymap,
 };
 
 use crate::keyboard::{Key, KeyCode, KeyLocation, NamedKey, NativeKey, NativeKeyCode, PhysicalKey};
 #[cfg(x11_platform)]
-use crate::platform_impl::common::xkb::XKBXH;
-use crate::platform_impl::common::xkb::{XkbContext, XKBH};
+use crate::platform_impl::common::xkb::xkbxh;
+use crate::platform_impl::common::xkb::{xkbh, XkbContext};
 
 /// Map the raw X11-style keycode to the `KeyCode` enum.
 ///
@@ -296,7 +296,7 @@ pub fn scancode_to_physicalkey(scancode: u32) -> PhysicalKey {
 }
 
 pub fn keysym_to_key(keysym: u32) -> Key {
-    use xkbcommon_dl::keysyms;
+    use aterm_xkb::keysym as keysyms;
     Key::Named(match keysym {
         // TTY function keys
         keysyms::BackSpace => NamedKey::Backspace,
@@ -710,7 +710,7 @@ pub fn keysym_to_key(keysym: u32) -> Key {
 }
 
 pub fn keysym_location(keysym: u32) -> KeyLocation {
-    use xkbcommon_dl::keysyms;
+    use aterm_xkb::keysym as keysyms;
     match keysym {
         keysyms::Shift_L
         | keysyms::Control_L
@@ -771,16 +771,22 @@ pub struct XkbKeymap {
 }
 
 impl XkbKeymap {
+    /// The keymap a compositor sent (`wl_keyboard.keymap`, XKB v1 text, up to its
+    /// terminating NUL). `None` for an empty text, or one libxkbcommon does not compile.
     #[cfg(wayland_platform)]
-    pub fn from_fd(context: &XkbContext, fd: OwnedFd, size: usize) -> Option<Self> {
-        let map = unsafe { MmapOptions::new().len(size).map_copy_read_only(&fd).ok()? };
-
+    pub fn from_text(context: &XkbContext, text: &[u8]) -> Option<Self> {
+        if text.is_empty() {
+            return None;
+        }
+        // SAFETY: a live context, and `text.len()` readable bytes; the length is passed, so
+        // the text needs no terminating NUL.
         let keymap = unsafe {
-            let keymap = (XKBH.xkb_keymap_new_from_string)(
+            let keymap = (xkbh().keymap_new_from_buffer)(
                 (*context).as_ptr(),
-                map.as_ptr() as *const _,
-                xkb::xkb_keymap_format::XKB_KEYMAP_FORMAT_TEXT_V1,
-                xkb_keymap_compile_flags::XKB_KEYMAP_COMPILE_NO_FLAGS,
+                text.as_ptr().cast(),
+                text.len(),
+                xkb::KEYMAP_FORMAT_TEXT_V1,
+                xkb::KEYMAP_COMPILE_NO_FLAGS,
             );
             NonNull::new(keymap)?
         };
@@ -795,11 +801,11 @@ impl XkbKeymap {
         core_keyboard_id: i32,
     ) -> Option<Self> {
         let keymap = unsafe {
-            (XKBXH.xkb_x11_keymap_new_from_device)(
+            (xkbxh().keymap_new_from_device)(
                 context.as_ptr(),
                 xcb,
                 core_keyboard_id,
-                xkb_keymap_compile_flags::XKB_KEYMAP_COMPILE_NO_FLAGS,
+                xkb::KEYMAP_COMPILE_NO_FLAGS,
             )
         };
         let keymap = NonNull::new(keymap)?;
@@ -808,14 +814,14 @@ impl XkbKeymap {
 
     fn new_inner(keymap: NonNull<xkb_keymap>, _core_keyboard_id: i32) -> Self {
         let mods_indices = ModsIndices {
-            shift: mod_index_for_name(keymap, xkb::XKB_MOD_NAME_SHIFT),
-            caps: mod_index_for_name(keymap, xkb::XKB_MOD_NAME_CAPS),
-            ctrl: mod_index_for_name(keymap, xkb::XKB_MOD_NAME_CTRL),
-            alt: mod_index_for_name(keymap, xkb::XKB_MOD_NAME_ALT),
-            num: mod_index_for_name(keymap, xkb::XKB_MOD_NAME_NUM),
-            mod3: mod_index_for_name(keymap, b"Mod3\0"),
-            logo: mod_index_for_name(keymap, xkb::XKB_MOD_NAME_LOGO),
-            mod5: mod_index_for_name(keymap, b"Mod5\0"),
+            shift: mod_index_for_name(keymap, mod_name::SHIFT),
+            caps: mod_index_for_name(keymap, mod_name::CAPS),
+            ctrl: mod_index_for_name(keymap, mod_name::CTRL),
+            alt: mod_index_for_name(keymap, mod_name::ALT),
+            num: mod_index_for_name(keymap, mod_name::NUM),
+            mod3: mod_index_for_name(keymap, c"Mod3"),
+            logo: mod_index_for_name(keymap, mod_name::LOGO),
+            mod5: mod_index_for_name(keymap, c"Mod5"),
         };
 
         Self { keymap, _mods_indices: mods_indices, _core_keyboard_id }
@@ -833,7 +839,7 @@ impl XkbKeymap {
     ) -> xkb_keysym_t {
         unsafe {
             let mut keysyms = ptr::null();
-            let count = (XKBH.xkb_keymap_key_get_syms_by_level)(
+            let count = (xkbh().keymap_key_get_syms_by_level)(
                 self.keymap.as_ptr(),
                 keycode,
                 layout,
@@ -852,14 +858,14 @@ impl XkbKeymap {
 
     /// Check whether the given key repeats.
     pub fn key_repeats(&mut self, keycode: xkb_keycode_t) -> bool {
-        unsafe { (XKBH.xkb_keymap_key_repeats)(self.keymap.as_ptr(), keycode) == 1 }
+        unsafe { (xkbh().keymap_key_repeats)(self.keymap.as_ptr(), keycode) == 1 }
     }
 }
 
 impl Drop for XkbKeymap {
     fn drop(&mut self) {
         unsafe {
-            (XKBH.xkb_keymap_unref)(self.keymap.as_ptr());
+            (xkbh().keymap_unref)(self.keymap.as_ptr());
         };
     }
 }
@@ -886,11 +892,10 @@ pub struct ModsIndices {
     pub mod5: Option<xkb_mod_index_t>,
 }
 
-fn mod_index_for_name(keymap: NonNull<xkb_keymap>, name: &[u8]) -> Option<xkb_mod_index_t> {
+fn mod_index_for_name(keymap: NonNull<xkb_keymap>, name: &CStr) -> Option<xkb_mod_index_t> {
     unsafe {
-        let mod_index =
-            (XKBH.xkb_keymap_mod_get_index)(keymap.as_ptr(), name.as_ptr() as *const c_char);
-        if mod_index == XKB_MOD_INVALID {
+        let mod_index = (xkbh().keymap_mod_get_index)(keymap.as_ptr(), name.as_ptr());
+        if mod_index == xkb::INVALID {
             None
         } else {
             Some(mod_index)

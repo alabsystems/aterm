@@ -10,7 +10,6 @@
 //! native Settings draws.
 
 use aterm_core::terminal::RenderCell;
-use aterm_render::Theme;
 
 use crate::app_config::Config;
 use crate::chrome_band;
@@ -24,21 +23,14 @@ pub(crate) struct SettingsState {
     /// Settings rebuilds it from its config snapshot after every persisted change, so
     /// the displayed value tracks the file. OWNED — [`EditField`] is moved in.
     pub(crate) fields: Vec<EditField>,
-    /// The ids of the loaded Trail Packs (`cursor_trail_packs`), so the
-    /// `cursor_trail_style` picker lists a `pack:<id>` option per loaded pack
-    /// (the dynamic twin of the static [`prefs::CURSOR_TRAIL_STYLES`]). Sorted; empty
-    /// when none are configured.
-    pub(crate) trail_pack_ids: Vec<String>,
 }
 
 impl SettingsState {
-    /// Build with the already-resolved catalog ids owned by the current config
-    /// generation. This constructor is intentionally IO-free; callers must not
-    /// turn semantic Settings view construction into a manifest loader.
-    pub(crate) fn from_config_with_trail_pack_ids(cfg: &Config, trail_pack_ids: &[String]) -> Self {
+    /// Build from the current config generation. This constructor is
+    /// intentionally IO-free.
+    pub(crate) fn from_config(cfg: &Config) -> Self {
         Self {
             fields: prefs::editable_fields(cfg),
-            trail_pack_ids: trail_pack_ids.to_vec(),
         }
     }
 
@@ -54,7 +46,7 @@ impl SettingsState {
             && matches!(f.kind, EditKind::Enum { .. })
         {
             // An off-roster but live value normalizes to its canonical name too
-            // — `rainbow kitty v2` reads back as `music box`, the same way an
+            // — `glass bell` reads back as `music box`, the same way an
             // offered alias reads back as its picker row.
             let token = seed.trim();
             enum_recognized(f, token)
@@ -86,7 +78,7 @@ fn enum_alias(key: &str, token: &str) -> Option<&'static str> {
         return prefs::trail_sound_style_canonical(token);
     }
     Some(match (key, token.to_ascii_lowercase().as_str()) {
-        (prefs::EDIT_CURSOR_STYLE, "beam" | "underline") => "bar",
+        (prefs::EDIT_CURSOR_STYLE, "beam") => "bar",
         (prefs::EDIT_BIDI, "off") => "disabled",
         (prefs::EDIT_BIDI, "on") => "implicit",
         (prefs::EDIT_AMBIGUOUS_WIDTH, "single") => "narrow",
@@ -139,23 +131,10 @@ fn enum_recognized(f: &EditField, token: &str) -> Option<&'static str> {
 }
 
 /// Theme-derived colour roles shared by the overlay painters and native Settings
-/// chrome, rebuilt from the live [`Theme`] so they re-tint without a hardcoded palette.
-#[derive(Clone, Copy)]
-pub(crate) struct Roles {
-    pub(crate) surface: [u8; 3],
-    pub(crate) text_primary: [u8; 3],
-    pub(crate) text_secondary: [u8; 3],
-    pub(crate) text_tertiary: [u8; 3],
-    pub(crate) accent: [u8; 3],
-    /// [`crate::native_appearance::NativeRoles::accent_ink`].
-    pub(crate) accent_ink: [u8; 3],
-    pub(crate) on_accent: [u8; 3],
-    pub(crate) separator: [u8; 3],
-    pub(crate) control_track: [u8; 3],
-    pub(crate) elevated: [u8; 3],
-    pub(crate) danger: [u8; 3],
-    pub(crate) success: [u8; 3],
-}
+/// chrome: the native role vocabulary itself
+/// ([`crate::native_appearance::NativeRoles`]), rebuilt from the live palette so
+/// they re-tint without a hardcoded palette.
+pub(crate) type Roles = crate::native_appearance::NativeRoles;
 
 pub(crate) fn u32_rgb(c: u32) -> [u8; 3] {
     [
@@ -163,33 +142,6 @@ pub(crate) fn u32_rgb(c: u32) -> [u8; 3] {
         ((c >> 8) & 0xff) as u8,
         (c & 0xff) as u8,
     ]
-}
-
-fn lerp_rgb(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
-    let t = t.clamp(0.0, 1.0);
-    std::array::from_fn(|i| {
-        (f32::from(a[i]) + (f32::from(b[i]) - f32::from(a[i])) * t).round() as u8
-    })
-}
-
-impl Roles {
-    pub(crate) fn from_theme(theme: Theme) -> Self {
-        let roles = crate::native_appearance::default_roles(theme);
-        Self {
-            surface: roles.surface,
-            text_primary: roles.text_primary,
-            text_secondary: roles.text_secondary,
-            text_tertiary: roles.text_tertiary,
-            accent: roles.accent,
-            accent_ink: roles.accent_ink,
-            on_accent: roles.on_accent,
-            separator: roles.separator,
-            control_track: roles.control_track,
-            elevated: roles.elevated,
-            danger: roles.danger,
-            success: roles.success,
-        }
-    }
 }
 
 /// The width of `s` at size `px` in the MONO (terminal) face — REAL advances from
@@ -281,7 +233,7 @@ pub(crate) fn paint_settings_aurora(
                 w: cw + 0.75,
                 h: ch + 0.75,
                 radius: 0.0,
-                fill: rgba(lerp_rgb(surface, c, 0.30), 0xFF),
+                fill: rgba(crate::native_appearance::mix_srgb(surface, c, 0.30), 0xFF),
             });
         }
     }
@@ -438,7 +390,6 @@ mod tests {
         };
         let aliases = [
             (crate::prefs::EDIT_CURSOR_STYLE, "beam", "bar"),
-            (crate::prefs::EDIT_CURSOR_STYLE, "underline", "bar"),
             (crate::prefs::EDIT_BIDI, "off", "disabled"),
             (crate::prefs::EDIT_BIDI, "on", "implicit"),
             (crate::prefs::EDIT_AMBIGUOUS_WIDTH, "single", "narrow"),

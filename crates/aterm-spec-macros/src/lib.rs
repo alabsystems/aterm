@@ -19,11 +19,12 @@ use crate::item::FnItem;
 // ---------------------------------------------------------------------------
 // Source↔spec ANCHOR EMITTERS (TRUST_NATIVE_TLA, Phase 0).
 //
-// `#[refines]`, `#[spec_unmodeled]`, `#[spec_invariant]` were no-ops (parse the
+// `#[refines]` and `#[spec_unmodeled]` were no-ops (parse the
 // args, discard, return the item). They are now ANCHOR EMITTERS: the annotated
 // item is left 100% unchanged at runtime, but each ALSO registers a compile-time-
-// collectable record into an `aterm_spec::registry` list (the records live in
-// `aterm_spec::xref`). The set of all bindings is then collectable at test time by
+// collectable record into an `aterm_spec_anchor::registry` list (the records live in
+// `aterm_spec_anchor::xref`; the anchored crate depends on that std-only crate, never on
+// the models). The set of all bindings is then collectable at test time by
 // the `spec_xref_closure` gate, with NO source-text scanning.
 //
 // EMISSION SHAPE — these attributes sit on `&mut self` methods INSIDE `impl`
@@ -34,6 +35,12 @@ use crate::item::FnItem;
 // the submit's anonymous const now lives inside a block expression (legal) and the
 // associated const name is unique within its impl (fn idents are unique per impl).
 // Verified to collect across crates from the host crate's unit-test build.
+//
+// TARGETS — the record is emitted only where `registry::submit!` has a load-time
+// constructor section (Apple, Linux, Android, Windows: the list its compile_error
+// names). Elsewhere, wasm32 in practice, nothing could collect it, so the emitters
+// leave the record out and a dev build for that target still compiles; the
+// `refines` entry probe stays, since a thread-local works there.
 //
 // The macro span-captures the source location via `file!()`/`line!()` and the fn
 // path via the fn ident (a best-effort `rust_method` for diagnostics; the precise
@@ -92,14 +99,14 @@ fn anchor_const(kind: &str, suffix: Option<&str>, fn_ident: &Ident) -> Result<Id
 // (body: `false`, callers: none; since deleted) kept the gate green.
 //
 // So the emitter now ALSO injects, as the FIRST statement of the annotated fn's
-// body, `::aterm_spec::xref::note_entered("<machine>::<action> @ <fn>")`. The id is
+// body, `::aterm_spec_anchor::xref::note_entered("<machine>::<action> @ <fn>")`. The id is
 // the same literal the submitted `RefinementAnchor` carries in `entry_id`, emitted
 // from this one expansion, so the probe and the record cannot drift. A gate resets
 // the thread-local record, runs the machine's Tier-1 conformance, and requires every
 // anchor of that machine to have been entered.
 //
-// COST. Nothing changes for a shipping build: the anchors are applied through
-// `#[cfg_attr(any(test, feature = "spec-anchors"), aterm_spec::refines(…))]`, so when
+// COST. Nothing changes for a release build: the anchors are applied through
+// `#[cfg_attr(any(test, debug_assertions), aterm_spec_anchor::refines(…))]`, so when
 // that cfg is off the ATTRIBUTE ITSELF is stripped, this macro never runs, and no probe
 // exists to optimize away.
 //
@@ -134,7 +141,7 @@ fn entry_id_for(machine: &str, action: &str, rust_method: &str) -> String {
 /// them.
 fn inject_entry_probe(item: &FnItem, entry_id: &str) -> Option<TokenStream> {
     let probe = q!(
-        "::aterm_spec::xref::note_entered(#id);",
+        "::aterm_spec_anchor::xref::note_entered(#id);",
         id = Literal::string(entry_id)
     );
     item.with_probe(&probe)
@@ -245,10 +252,11 @@ fn expand_refines(attr: TokenStream, item: TokenStream) -> Result<TokenStream, E
     };
     Ok(q!(
         "#item_out
+        #[cfg(any(target_vendor = \"apple\", target_os = \"linux\", target_os = \"android\", windows))]
         #[allow(non_upper_case_globals)]
         const #const_name: () = {
-            ::aterm_spec::registry::submit! {
-                ::aterm_spec::xref::RefinementAnchor => ::aterm_spec::xref::RefinementAnchor {
+            ::aterm_spec_anchor::registry::submit! {
+                ::aterm_spec_anchor::xref::RefinementAnchor => ::aterm_spec_anchor::xref::RefinementAnchor {
                     machine: #machine,
                     action: #action,
                     rust_method: #rust_method,
@@ -265,41 +273,6 @@ fn expand_refines(attr: TokenStream, item: TokenStream) -> Result<TokenStream, E
         rust_method = Literal::string(&rust_method),
         project = Literal::string(&project),
         entry_id = Literal::string(&entry_id)
-    ))
-}
-
-#[proc_macro_attribute]
-pub fn spec_invariant(attr: TokenStream, item: TokenStream) -> TokenStream {
-    emit(expand_spec_invariant(attr, item))
-}
-
-fn expand_spec_invariant(attr: TokenStream, item: TokenStream) -> Result<TokenStream, Error> {
-    // `tla` is accepted and documents the claim; nothing reads it.
-    let keys = Keys::parse(attr, &["id", "machine", "tla"])?;
-    let id = keys.require("id")?;
-    let machine = keys.get("machine").unwrap_or_default();
-    let item = FnItem::new(item);
-    let fn_ident = item_fn_ident(&item);
-    let const_name = anchor_const("invariant", None, &fn_ident)?;
-    let rust_method = fn_ident.to_string();
-    Ok(q!(
-        "#item
-        #[allow(non_upper_case_globals)]
-        const #const_name: () = {
-            ::aterm_spec::registry::submit! {
-                ::aterm_spec::xref::InvariantAnchor => ::aterm_spec::xref::InvariantAnchor {
-                    machine: #machine,
-                    id: #id,
-                    rust_method: #rust_method,
-                    location: concat!(file!(), \":\", line!()),
-                }
-            }
-        };",
-        item = item.stream(),
-        const_name,
-        machine = Literal::string(&machine),
-        id = Literal::string(&id),
-        rust_method = Literal::string(&rust_method)
     ))
 }
 
@@ -323,10 +296,11 @@ fn expand_spec_unmodeled(attr: TokenStream, item: TokenStream) -> Result<TokenSt
     let rust_method = fn_ident.to_string();
     Ok(q!(
         "#item
+        #[cfg(any(target_vendor = \"apple\", target_os = \"linux\", target_os = \"android\", windows))]
         #[allow(non_upper_case_globals)]
         const #const_name: () = {
-            ::aterm_spec::registry::submit! {
-                ::aterm_spec::xref::Waiver => ::aterm_spec::xref::Waiver {
+            ::aterm_spec_anchor::registry::submit! {
+                ::aterm_spec_anchor::xref::Waiver => ::aterm_spec_anchor::xref::Waiver {
                     machine: #machine,
                     action: #action,
                     reason: #reason,
@@ -371,8 +345,7 @@ fn expand_spec_unmodeled(attr: TokenStream, item: TokenStream) -> Result<TokenSt
 // also runs under (constant overrides, never `Buggy`): the sweeps hold the model
 // in it beside the committed one. `invariant` states a design claim, which some
 // mutant must break; `bound` states the box the checkers walk (a range over one
-// variable), which none is expected to; `uncaught` marks a claim no mutant breaks
-// yet. Supported operators: + - > <= == && || and if/else (mapped to the `Expr`
+// variable), which none is expected to. Supported operators: + - > <= == && || and if/else (mapped to the `Expr`
 // builders in `aterm_spec::derive`: `==` -> `eq` = TLA+ `=`, `&&` ->
 // `and_` = TLA+ `/\`). The `==`/`&&` forms support the `Buggy`-convention guards
 // (e.g. `Buggy == 1 && active == 1`) the proves-and-catches models use. The macro

@@ -102,7 +102,7 @@ lives in `aterm-alloc`.
 half (two-state over each `&mut` op) → `sv-ops-refine-vec` → `sv-drain` → `sv-drop-order-upstream`
 (needs the written Upstream model).
 
-## 2. Test → spec map (TSV; all 10)
+## 2. Test → spec map (TSV; the 9 tests left)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 A test that samples several specs is deleted only when all of its listed specs are Certified.
@@ -113,7 +113,6 @@ tests/differential.rs	lcg_operation_fuzz_at_five_inline_sizes	sv-ops-refine-vec	
 tests/differential.rs	constructors_follow_upstreams_spill_rules	sv-constructors	
 tests/differential.rs	comparison_spans_inline_sizes	sv-traits-are-slice	
 tests/upstream_transcript.rs	the_facade_replays_the_upstream_transcript	sv-drop-order-upstream	sv-ops-refine-vec, sv-spill-rule, sv-constructors, sv-macro, sv-drain, sv-traits-are-slice
-tests/upstream_transcript.rs	the_recording_covers_spills_drops_and_panics	NON-SPEC (test of test data)	
 tests/consumer_forms.rs	rustybuzz_forms	sv-ops-refine-vec	sv-repr-inv, sv-constructors (compile-time surface check stays, §5.2)
 tests/consumer_forms.rs	parking_lot_core_forms	sv-ops-refine-vec	(compile-time surface check stays, §5.2)
 tests/consumer_forms.rs	wayland_forms	sv-macro	sv-ops-refine-vec, sv-constructors (compile-time surface check stays, §5.2)
@@ -134,12 +133,13 @@ tests/consumer_forms.rs	send_and_sync_follow_the_item	NON-SPEC (type-system fact
 
 > Status 2026-10-16: `the_recording_covers_spills_drops_and_panics` is **deleted** (it read only the fixture; the replay still pins the fixture's zero `c0`/`h0` lines). The §5.6 Upstream-model check against the fixture is still owed before any re-recording.
 
+> Status 2026-10-17: its row here and in §2 is gone.
+
 | test | why | action |
 |---|---|---|
-| upstream_transcript::the_recording_covers_spills_drops_and_panics | It checks only the recorded fixture `smallvec-1.15.1.txt`. It counts lines with `s1`, `s0`, `panic` and drops, and requires zero `c0` and `h0` lines. It never calls this crate's code, so it has no production subject. The `c0`/`h0` checks are facts about upstream, not about the facade. | **delete**, together with the replay it vouches for, once that replay is retired by `sv-ops-refine-vec`, `sv-spill-rule`, `sv-drain` and `sv-drop-order-upstream`. Before that, check the written Upstream model against the fixture once (§5.6). |
 | consumer_forms::send_and_sync_follow_the_item | `Send` and `Sync` are auto traits, derived structurally through `SmallVec { store: aterm_alloc::SmallVec<T, N> }`. The type checker already guarantees the property, and the fn body has no runtime content. | **delete**. If a regression guard is still wanted, write a compile-time static assertion (a `const _` fn in `lib.rs`). It should not be a `#[test]` or a proof obligation. |
 
-Action count: delete 2. Neither test is a regression for a removed bug.
+Action count, of the rows left: delete 1. It is not a regression for a removed bug.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 

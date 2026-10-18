@@ -12,11 +12,11 @@
 
 use std::collections::BTreeSet;
 
-use aterm_spec::derive::{Model, native_async_delivery_model, native_settings_singleton_model};
+use aterm_models_native::{native_async_delivery_model, native_settings_singleton_model};
+use aterm_spec::derive::Model;
 use aterm_spec::interp::{State, admits};
 
 use crate::conformance_support::assert_sole_transition as assert_transition;
-use crate::document_store::DocumentStore;
 use crate::native_app::{
     AppEffect, AppEvent, AppKind, AppViewState, CompletionSink, ConfigPatch, ConfigPatchOutcome,
     ExternalOpenOutcome, MarkdownApp, MarkdownViewState, NativeApp, NativeRuntime, ReplyToken,
@@ -310,7 +310,7 @@ impl AsyncHarness {
 
         // A second live view of a different app: the crossed-sink control
         // needs an identity that is live on its own and still not this reply's.
-        let mut documents = DocumentStore::for_test();
+        let mut documents = crate::test_document_store();
         let document = documents.open("mem://async-conformance".into(), "alpha".into());
         let markdown_instance = runtime
             .insert_instance(NativeApp::Markdown(MarkdownApp::new(
@@ -541,18 +541,6 @@ fn async_step(
     let after = harness.project(model);
     assert_transition(model, &before, &after, action);
     (before, after)
-}
-
-#[test]
-fn native_runtime_accepts_a_live_view_owner_once() {
-    let model = native_async_delivery_model();
-    let mut harness = AsyncHarness::new();
-    assert_eq!(harness.project(&model), model.init_state());
-    async_issue(&model, &mut harness, "IssueView", |h| h.issue_view());
-    let (_, completed) = async_step(&model, &mut harness, "CompleteView", |h| {
-        let _ = h.complete_view();
-    });
-    assert_eq!(completed["reduced"], 1);
 }
 
 #[test]

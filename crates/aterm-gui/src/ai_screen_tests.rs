@@ -61,6 +61,7 @@ fn reading() -> AiReading {
             },
         ],
         store_note: None,
+        held: None,
     }
 }
 
@@ -68,10 +69,10 @@ fn reading() -> AiReading {
 /// `/dotfiles/ai-fleet.toml`) resolve.
 fn choices(text: &str, fleet: Option<&str>) -> AiChoices {
     let (local, notes) = config::read(text);
-    let path = Path::new("/dotfiles/ai-fleet.toml");
+    let path = config::FleetSource::Path("/dotfiles/ai-fleet.toml".into());
     let settings = config::resolve(
         &local,
-        fleet.map(|_| path),
+        fleet.map(|_| &path),
         fleet.map(config::read_fleet),
         notes,
     );
@@ -120,7 +121,7 @@ fn the_projection_says_who_needs_you_and_where_each_choice_came_from() {
         row("muse").detail
     );
     // The fleet document chose the preferred CLI and Muse's use; this
-    // machine's table chose the reviewers.
+    // machine's table chose the reviewers' order.
     assert!(p.preferred_from_fleet);
     assert!(row("muse").use_from_fleet);
     assert!(!row("codex").use_from_fleet);
@@ -130,12 +131,19 @@ fn the_projection_says_who_needs_you_and_where_each_choice_came_from() {
             .map(|(_, v)| v.clone())
             .unwrap_or_else(|| panic!("no {label} in {rows:?}"))
     };
-    assert_eq!(fact(&p.review_rows, "Reviewers"), "codex, claude");
-    assert_eq!(fact(&p.review_rows, "From"), "aterm.toml");
+    assert_eq!(
+        fact(&p.review_rows, "Reviewers"),
+        "codex, claude, but the one asking (aterm.toml)"
+    );
+    assert_eq!(
+        fact(&p.review_rows, "Permissions"),
+        "the asking agent's own; yolo when you ask"
+    );
     assert_eq!(
         fact(&p.review_rows, "Each review"),
-        "1 reviewer, up to 300 s each"
+        "up to 4 reviewers, up to 600 s each, with all their tools"
     );
+    assert_eq!(fact(&p.fleet_rows, "Signer"), "none pinned");
     assert_eq!(fact(&p.fleet_rows, "Machine"), "m7");
     assert_eq!(fact(&p.fleet_rows, "Document"), "/dotfiles/ai-fleet.toml");
     assert_eq!(
@@ -179,7 +187,7 @@ fn the_projection_says_who_needs_you_and_where_each_choice_came_from() {
             && row.detail == "not looked at: Look for AI CLI problems is off")
     );
 
-    // The defaults: reviews off until the grant lists one, no fleet.
+    // The defaults: batteries included, every CLI used here reviews; no fleet.
     let bare = AiState {
         choices: choices("", None),
         ..state.clone()
@@ -187,10 +195,19 @@ fn the_projection_says_who_needs_you_and_where_each_choice_came_from() {
     let p = bare.projection(true);
     assert_eq!(
         fact(&p.review_rows, "Reviewers"),
-        "none: reviews are off until [ai] reviewers lists a CLI"
+        "every AI CLI used here but the one asking"
     );
-    assert_eq!(fact(&p.review_rows, "From"), "the default");
     assert_eq!(fact(&p.fleet_rows, "Document"), "none");
+    assert!(!p.fleet_from_url);
+    // Switched off, said so.
+    let off = AiState {
+        choices: choices("[ai]\nreviews = false\n", None),
+        ..state.clone()
+    };
+    assert_eq!(
+        fact(&off.projection(true).review_rows, "Reviewers"),
+        "none: reviews are off (aterm.toml)"
+    );
     assert!(!p.preferred_from_fleet);
 
     // Before the host publishes.
@@ -405,7 +422,7 @@ fn the_worker_looks_at_start_on_ask_and_on_a_rewritten_wake() {
     let worker = {
         let wake = wake.clone();
         std::thread::spawn(move || {
-            let look = || Ok(reading());
+            let look = |_| Ok(reading());
             let send = |generation, _| looked.send(generation).is_ok();
             look_loop(
                 &asked,

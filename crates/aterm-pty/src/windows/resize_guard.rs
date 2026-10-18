@@ -88,6 +88,13 @@
 //! two threads, so a write issued right after `ResizePseudoConsole` can be
 //! queued AHEAD of the size event, and then the record the runtime drops is
 //! the one in the NEXT write — which carries the guard too.
+//!
+//! ONLY CONHOST DELIVERS IT. The runtime reads in VT-input mode, and for such
+//! a reader Windows Terminal's OpenConsole passes text alone: the guard (and
+//! every key-up) arrives as nothing, so the drop takes the user's key again
+//! (the 2026-09-29 snapshot's record; `console_host::policy::runs_a_posix_runtime`
+//! has its numbers). The opt-in console-host choice's `auto` therefore keeps
+//! these programs on conhost.
 
 use std::io;
 use std::sync::Mutex;

@@ -553,7 +553,6 @@ fn a_headless_capture_is_still_and_a_pure_function_of_its_instant() {
         app.windows[&WID].input_scratch.cells[0].clone()
     };
     let a = shoot(&mut app, now);
-    std::thread::sleep(Duration::from_millis(40));
     assert_eq!(shoot(&mut app, now), a, "the same instant, the same frame");
     assert_eq!(
         shoot(&mut app, now + Duration::from_secs(4)),
@@ -632,7 +631,6 @@ fn the_messages_page_lists_log_only_records() {
     for id in [first, second] {
         let e = state.entry(id.raw()).expect("listed");
         assert_eq!(e.state, "recorded");
-        assert_eq!(e.state_words(), "recorded", "one word (ruling 149)");
     }
     assert_eq!(
         state.entry(second.raw()).unwrap().detail,

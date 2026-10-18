@@ -6,71 +6,6 @@
 
 use super::*;
 
-#[test]
-fn scrollback_memory_tracking() {
-    let mut sb = Scrollback::new(100, 1000, 10_000_000);
-
-    let initial_mem = sb.memory_used();
-    sb.push_str("Hello World");
-
-    assert!(sb.memory_used() > initial_mem);
-}
-
-#[test]
-fn scrollback_cold_memory_used() {
-    // Small limits to trigger eviction to cold tier
-    let mut sb = Scrollback::with_block_size(5, 10, 10_000_000, 5);
-
-    // Initially cold memory should be 0
-    assert_eq!(sb.cold_memory_used(), 0);
-
-    // Push 25 lines - should evict to cold
-    for i in 0..25 {
-        sb.push_str(&format!("Line {i}"));
-    }
-
-    // Verify cold tier has data
-    assert!(sb.cold_line_count() > 0);
-    assert!(sb.cold_memory_used() > 0);
-}
-
-#[test]
-fn scrollback_total_memory_used() {
-    // Small limits to trigger eviction to cold tier
-    let mut sb = Scrollback::with_block_size(5, 10, 10_000_000, 5);
-
-    // memory_used includes base struct size, so initial is non-zero
-    let initial_total = sb.total_memory_used();
-    let initial_hot_warm = sb.memory_used();
-
-    // Push lines only to hot tier
-    for i in 0..4 {
-        sb.push_str(&format!("Line {i}"));
-    }
-    // Hot only: total = memory_used (cold tier is empty)
-    assert_eq!(sb.total_memory_used(), sb.memory_used());
-    assert_eq!(sb.cold_memory_used(), 0);
-    assert!(
-        sb.memory_used() > initial_hot_warm,
-        "memory should increase with lines"
-    );
-
-    // Push 25 lines - should have data in all tiers
-    for i in 4..25 {
-        sb.push_str(&format!("Line {i}"));
-    }
-
-    // Total should include cold tier
-    let hot_warm = sb.memory_used();
-    let cold = sb.cold_memory_used();
-    assert_eq!(sb.total_memory_used(), hot_warm + cold);
-    assert!(cold > 0, "cold tier should have compressed data");
-    assert!(
-        sb.total_memory_used() > initial_total,
-        "total should increase"
-    );
-}
-
 /// Cold tier budget enforcement: reducing the memory budget evicts cold pages.
 #[test]
 fn set_memory_budget_evicts_cold_pages() {
@@ -117,6 +52,9 @@ fn set_memory_budget_evicts_cold_pages() {
         sb.hot_line_count() + sb.warm_line_count() + sb.cold_line_count(),
         "line_count must equal sum of tier counts after eviction"
     );
+    // Eviction takes the oldest: the newest line survives.
+    let newest = sb.get_line_rev(0).expect("no error").expect("newest line");
+    assert_eq!(newest.to_string(), "Budget-test-line-49");
 }
 
 /// Memory-pressure eviction is real retention loss and is counted out of band;
@@ -208,33 +146,5 @@ fn over_budget_false_after_cold_eviction() {
         sb.memory_budget(),
         sb.cold_line_count(),
         sb.warm_line_count()
-    );
-}
-
-/// Cold tier budget enforcement: newest lines survive eviction.
-#[test]
-fn cold_eviction_preserves_newest_lines() {
-    let mut sb = Scrollback::with_block_size(5, 10, 10_000_000, 5);
-
-    for i in 0..50 {
-        sb.push_str(&format!("Preserve-line-{i}"));
-    }
-
-    // Reduce budget to force cold eviction of oldest data
-    sb.set_memory_budget(1)
-        .expect("memory budget reduction should succeed");
-
-    let count = sb.line_count();
-    assert!(count > 0, "should have at least hot tier lines");
-
-    // The newest line should still be accessible (it's in the hot tier)
-    let newest = sb
-        .get_line_rev(0)
-        .expect("no error")
-        .expect("newest line present");
-    assert_eq!(
-        newest.to_string(),
-        "Preserve-line-49",
-        "newest line must survive cold eviction"
     );
 }

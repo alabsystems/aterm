@@ -2,11 +2,11 @@
 // Copyright 2026 Andrew Yates
 //
 // Present-path blit: the fullscreen-triangle blit (`vs_blit` + `fs_blit`, NEAREST) that copies
-// the offscreen `Rgba8Unorm` frame into the swapchain. `BlitUniform.flag == 0` copies bytes
-// exactly; non-zero (visual-bell flash) inverts RGB, the GPU counterpart of the CPU
-// `px ^ 0x00ffffff`. The swapchain is not readable headless, so the same pipeline, shader,
-// sampler and uniform run against a readable target (`blit_to_offscreen_for_test`); `present()`,
-// WSI and scanout are not exercised. No GPU or no system font: no-op.
+// the offscreen `Rgba8Unorm` frame into the swapchain. With `BlitUniform.flag != 0` (visual-bell
+// flash) it inverts RGB, the GPU counterpart of the CPU `px ^ 0x00ffffff`; the unflagged 1:1 copy
+// is pinned by `blit_bands.rs`. The swapchain is not readable headless, so the same pipeline,
+// shader, sampler and uniform run against a readable target (`blit_to_offscreen_for_test`);
+// `present()`, WSI and scanout are not exercised. No GPU or no font: COULD NOT RUN.
 
 use std::sync::Arc;
 
@@ -25,26 +25,6 @@ fn fresh_gpu() -> GpuRenderer {
     common::wgpu_oracle(18.0, Theme::default())
 }
 
-/// Render `input` to the offscreen, then run the real blit (`invert`) into a readable target.
-/// Returns `(offscreen_source, blit_output)`.
-fn source_and_blit(
-    gpu: &mut GpuRenderer,
-    win: &mut aterm_gpu::WindowGpu,
-    input: &RenderInput,
-    invert: bool,
-) -> (Frame, Frame) {
-    // `render_input` fully repaints the resident offscreen and returns its readback: the frame
-    // the present path blits.
-    let source = gpu.render_input(win, input, None);
-    let blit = gpu.blit_to_offscreen_for_test(win, invert);
-    assert_eq!(
-        (source.width, source.height),
-        (blit.width, blit.height),
-        "blit target dims must equal the offscreen source dims"
-    );
-    (source, blit)
-}
-
 /// A prompt, SGR red/green/blue text and glyphs, so the blit runs over real pixels.
 fn representative_input() -> RenderInput {
     let mut term = Terminal::new(ROWS as u16, COLS as u16);
@@ -52,41 +32,6 @@ fn representative_input() -> RenderInput {
     term.process(b"\x1b[31mRED\x1b[0m \x1b[32mGREEN\x1b[0m \x1b[34mBLUE\x1b[0m\r\n");
     term.process(b"\x1b[1mbold\x1b[0m plain 0123456789");
     term.cell_frame(ROWS, COLS)
-}
-
-/// Passthrough: every blit output pixel equals the offscreen source (NEAREST at 1:1, no
-/// colour-space drift).
-#[test]
-fn blit_passthrough_is_byte_identical() {
-    let mut gpu = fresh_gpu();
-    let mut win = aterm_gpu::WindowGpu::new();
-    let input = representative_input();
-    let (source, blit) = source_and_blit(&mut gpu, &mut win, &input, false);
-
-    if source.pixels != blit.pixels {
-        let mut first = None;
-        for (i, (&s, &b)) in source.pixels.iter().zip(blit.pixels.iter()).enumerate() {
-            if s != b {
-                first = Some((i, s, b));
-                break;
-            }
-        }
-        if let Some((i, s, b)) = first {
-            let (x, y) = (i % source.width, i / source.width);
-            panic!(
-                "BLIT PASSTHROUGH NOT BYTE-IDENTICAL (real present-path bug): \
-                 first mismatch at pixel {i} (x={x}, y={y}): offscreen {s:#08x} \
-                 != blit {b:#08x}"
-            );
-        }
-        panic!("blit passthrough differs from offscreen (length mismatch)");
-    }
-    eprintln!(
-        "blit passthrough: byte-identical over {} pixels ({}x{})",
-        source.pixels.len(),
-        source.width,
-        source.height
-    );
 }
 
 /// A ramp that visits every 8-bit value in every channel: `i` for red and odd strides (coprime

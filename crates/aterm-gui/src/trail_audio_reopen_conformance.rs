@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! TIER-1 CONFORMANCE of the derived `TrailAudioReopenLadder` machine
-//! (`aterm_spec::derive::trail_audio_reopen_ladder_model`) to the shipping
+//! (`aterm_models_misc::trail_audio_reopen_ladder_model`) to the shipping
 //! reopen ladder in `trail_audio.rs` (D5).
 //!
 //! Two halves, because the ladder has two halves in the code:
@@ -65,7 +65,8 @@ use std::time::{Duration, Instant};
 
 use aterm_effects::cursor_glow::GlowStyle;
 use aterm_effects::trail_sound::{EventMeta, SoundEvent, SoundGesture, SoundKind, SoundVoice};
-use aterm_spec::derive::{Model, trail_audio_reopen_ladder_model};
+use aterm_models_misc::trail_audio_reopen_ladder_model;
+use aterm_spec::derive::Model;
 use aterm_spec::interp::{self, State};
 
 use super::mac::{Delivery, Service};

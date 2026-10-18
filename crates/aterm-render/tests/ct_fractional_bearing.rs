@@ -12,10 +12,10 @@
 //! it back exactly. Cell origins are integer device px, so each glyph has exactly one
 //! correct phase: one raster per glyph, no new cache keys.
 //!
-//! The ty model `aterm_spec::derive::ct_frac_bearing_model` carries `Decompose`
+//! The ty model `aterm_models_render::ct_frac_bearing_model` carries `Decompose`
 //! (bearing + phase == designed position) and `PhaseInUnit` (phase in `[0, 1)`) and
 //! catches a round-and-pin placement at `Buggy=1`
-//! (`derived_ct_frac_bearing_proves_and_catches_rounded_pin`). ty's Expr language is
+//! (aterm-spec's `unregistered_bound_models_prove_and_catch`). ty's Expr language is
 //! integer-only, so the float half lives here: a dyadic lattice on which every asserted
 //! equality is exact (1/64 steps), ulp-bounded specials, and a point-for-point drive of
 //! the model's interpreter against `ct_pen_and_bearing`. The one float boundary, a `b`
@@ -26,8 +26,8 @@
 //! The policy is the CoreText path's alone; on macOS both backends take the same
 //! `glyph_image` bytes and placement.
 
+use aterm_models_render::ct_frac_bearing_model;
 use aterm_render::{ct_padded_extent, ct_pen_and_bearing};
-use aterm_spec::derive::ct_frac_bearing_model;
 
 /// The floor law, exhaustive over the 1/64-px lattice in ±64px (every value exactly
 /// representable): `min <= b < min + 1`, the pen is `-min` with no rounding, the phase is
@@ -119,7 +119,7 @@ fn pen_and_bearing_floor_law_adversarial_specials() {
 /// The bitmap never clips: over 1/64-px ink widths up to 48px, both pad levels (1 plain,
 /// 2 `font_thicken`) and every phase in [0, 1], `phase + ink + 2*pad <= extent`, with a
 /// full px of headroom over the padded ink box, and the thickened box exactly 1px per
-/// side larger (as `coretext_rasterizes_real_coverage` pins on real ink).
+/// side larger (as `coretext_placement_binds_to_the_pure_policy` pins on real ink).
 #[test]
 fn padded_extent_absorbs_every_phase_without_clipping() {
     let mut old_extent_would_clip = 0usize;

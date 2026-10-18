@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm` — THE one binary.
+//! `aterm`: the one binary.
 //!
-//! One name, everywhere: the transparent terminal session, the GPU window,
-//! and every verb live behind this single executable. Routing is the whole
-//! job of this crate — every capability is a library:
+//! The transparent terminal session, the GPU window and every verb live behind this single
+//! executable. Routing is this crate's whole job; every capability is a library:
 //!
 //! ```text
 //! aterm <verb> …            every verb in `aterm_cli::Verb`, routed above the mode
@@ -17,63 +16,75 @@
 //! aterm --window            the window, explicitly, from anywhere
 //! ```
 //!
-//! ARGV0 COMPAT: the bundle ships symlinks (`aterm-ctl`, `atpkg`, `aterm-fleet`,
-//! `aterm-drive`, `aterm-link`, `aterm-gui`, `aterm-cli`) onto this binary, and
-//! main dispatches as whichever tool it was invoked as.
+//! argv0 aliases: the bundle ships symlinks (`aterm-ctl`, `atpkg`, `aterm-fleet`,
+//! `aterm-drive`, `aterm-askpass`, `aterm-link`, `aterm-gui`, `aterm-cli`) onto this binary, a
+//! login renewal links `aterm-open-url` to it, and main dispatches as whichever tool it was
+//! invoked as.
 
-// NO `windows_subsystem = "windows"` HERE — this file is the CONSOLE image.
-//
-// The PE subsystem is a per-FILE header field, and Windows shells key on it:
-// a console-subsystem child is waited for, a GUI-subsystem one is not. With
-// the attribute here, no shell waited for any `aterm` verb: output landed over
-// the returned prompt and a script calling `aterm` got nothing.
-//
-// Windows therefore needs TWO file objects of the same code (one crate, one
-// `main`): `aterm.exe`, built from this root, CONSOLE subsystem — every CLI
-// alias hardlinks to it — and `aterm-gui.exe`, built from `src/windowed.rs`
-// (the `aterm-windowed` bin target, which `#[path]`-includes this file as a
-// module and adds only the attribute), WINDOWED subsystem, for the Start Menu,
-// the Explorer verb, the jump list and the pinned tile. The console image
-// never runs a window in-process on Windows: it hands the window to the
-// windowed sibling (`run_window` / `windowed_sibling`) and returns, so the
-// prompt comes back. The one-binary doctrine on macOS/Linux is untouched: the
-// extra bin target builds there as a std-only stub that includes none of this
-// file (see `windowed.rs`).
+// No `windows_subsystem = "windows"` here: this file is the console image. A Windows shell
+// waits for a console-subsystem child and not a GUI one, so with the attribute no shell would
+// wait for any `aterm` verb. Windows therefore builds two images of this code: `aterm.exe` from
+// this root, console subsystem (every CLI alias hardlinks to it), and `aterm-gui.exe` from
+// `src/windowed.rs` (the `aterm-windowed` bin: this file plus the attribute) for the Start
+// Menu, the Explorer verb, the jump list and the pinned tile. On Windows the console image never
+// runs a window in-process: it hands it to the windowed sibling (`run_window`,
+// `windowed_sibling`) and returns, so the prompt comes back. Elsewhere the extra bin is a
+// std-only stub (see `windowed.rs`).
 
 use std::ffi::OsString;
 use std::ops::ControlFlow;
 use std::process::ExitCode;
 
-/// `aterm link` and `aterm fabric` where the fabric bridge cannot exist.
-///
-/// The bridge is Unix-domain sockets end to end, so `aterm-link` is a
-/// `cfg(unix)` dependency. The verbs stay on the one cross-platform roster and
-/// refuse by name here rather than reading as an "unknown verb".
+// `println!` in this crate is a verb's answer on stdout, written through
+// `aterm_uds::stdout` as every library this binary runs a verb from writes its own: a
+// reader that closed the pipe (`aterm update status | head -1`) ends the answer, where
+// std's `println!` panicked with exit 101 on the EPIPE (Rust leaves SIGPIPE ignored).
+// The line is formatted by std's `format!`, never a `format_args!` written here: the
+// release build (`targo trust build -p aterm`) charges the unsafe block that lowering
+// makes for a runtime argument as a refutation unless a std macro wrote it. Text that
+// cannot be written is dropped, as `aterm_uds::stdout::println` drops it.
+macro_rules! println {
+    () => {
+        ::aterm_uds::stdout::print(::std::format_args!("\n"))
+    };
+    ($($arg:tt)*) => {{
+        let mut line = ::std::format!($($arg)*);
+        line.push('\n');
+        let _ = ::aterm_uds::stdout::write_all(line.as_bytes());
+    }};
+}
+
+/// `aterm link` and `aterm fabric` where the fabric bridge cannot exist: `aterm-link` is a
+/// `cfg(unix)` dependency, so the verbs stay on the roster and refuse by name.
 #[cfg(not(unix))]
 fn link_unavailable(verb: &str) -> ExitCode {
     eprintln!("aterm {verb}: not available on this platform (Unix only)");
     ExitCode::FAILURE
 }
 
-/// The `aterm ctl` verbs this binary answers IN-PROCESS because it links the
-/// terminal engine. `aterm-ctl` is the dependency-free client and takes them as
-/// plain functions ([`aterm_ctl::LocalVerbs`]); both routes into it (the `ctl`
-/// verb and the `aterm-ctl` argv0 alias) pass this.
+/// `aterm machines` where it cannot exist: `aterm-machines` drives macOS's own tools and is a
+/// `cfg(target_os = "macos")` dependency, so the verb stays on the roster and refuses by name.
+#[cfg(not(target_os = "macos"))]
+fn machines_unavailable() -> ExitCode {
+    eprintln!("aterm machines: not available on this platform (macOS only)");
+    ExitCode::FAILURE
+}
+
+/// The `aterm ctl` verbs this binary answers in-process because it links the terminal engine,
+/// handed to the dependency-free `aterm-ctl` as plain functions ([`aterm_ctl::LocalVerbs`]) by
+/// both routes into it (the `ctl` verb and the `aterm-ctl` argv0 alias).
 const CTL_LOCAL: aterm_ctl::LocalVerbs = aterm_ctl::LocalVerbs {
     cast_drift: Some(ctl_cast_drift),
 };
 
-/// `cast drift` computed by the CLIENT: against a server that predates the verb
-/// (from the `cast`, `text`, `cursor` and `modes` it fetched; a racy cut is
-/// answered by the replays against each other, as the server answers it), or
-/// offline over saved files. The analysis is `aterm_control::cast_drift` — the code the
-/// server runs — so the report is the server's, with `computed=client` on its
-/// header. The seam policy is `Native`: the client cannot see which PTY backs
-/// the session (a Windows ConPTY session would replay a rows-grow differently,
-/// and its fidelity gate says so rather than accusing a resize). The engine's
-/// resize undo is dropped for an aterm older than the verb (older than the
-/// undo too, so a flap with nothing between its halves shifted its screen) and
-/// matched against the screen for a saved recording (`undo=off` when dropped).
+/// `cast drift` computed by the client: against a server that predates the verb (from the
+/// `cast`, `text`, `cursor` and `modes` it fetched; a racy cut is answered by the replays
+/// against each other, as the server does), or offline over saved files. The analysis is
+/// `aterm_control::cast_drift`, the server's code, with `computed=client` on its header. The
+/// seam policy is `Native`: the client cannot see which PTY backs the session (a ConPTY
+/// session's fidelity gate says so rather than accusing a resize). The engine's resize undo is
+/// dropped for an aterm older than the verb (older than the undo too) and matched against the
+/// screen for a saved recording (`undo=off` when dropped).
 fn ctl_cast_drift(job: &aterm_ctl::CastDriftJob<'_>) -> Result<String, String> {
     use aterm_control::cast_drift::{self as drift, Cut, DriftArgs, LiveScreen, Undo};
     let mut args = DriftArgs::parse(job.args).map_err(str::to_string)?;
@@ -119,13 +130,11 @@ fn ctl_cast_drift(job: &aterm_ctl::CastDriftJob<'_>) -> Result<String, String> {
     Ok(report.render(ms, Some("client")))
 }
 
-/// THE build facts of this binary — the only place any of them is compiled in.
-/// The version is this crate's own (`version.workspace = true`); the rest come
-/// from `build.rs` (the commit and build number from git or the cutter's pins,
-/// the compiler from `$RUSTC -vV`, the profile, the verification state), and the
-/// release marker is the cutter's. Libraries read them at runtime
-/// (`aterm_types::version`): no library's compile reads any of them, so a commit
-/// recompiles this crate alone and no verified library's bytes carry one.
+/// The build facts of this binary, the only place any of them is compiled in. The version is
+/// this crate's own; the rest come from `build.rs` (commit and build number from git or the
+/// cutter's pins, the compiler from `$RUSTC -vV`, the profile, the verification state), and the
+/// release marker from the cutter. Libraries read them at runtime (`aterm_types::version`), so
+/// a commit recompiles this crate alone.
 const BUILD_STAMP: aterm_types::version::BuildStamp = aterm_types::version::BuildStamp {
     app_version: env!("CARGO_PKG_VERSION"),
     git_commit: env!("ATERM_GIT_COMMIT"),
@@ -144,24 +153,34 @@ const BUILD_STAMP: aterm_types::version::BuildStamp = aterm_types::version::Buil
     release_build: option_env!("ATERM_RELEASE_BUILD").is_some(),
 };
 
-// `pub(crate)`, not private: `src/windowed.rs` includes this file as a module
-// and calls this `main` from its own — a parent module cannot reach a child's
-// private items, and rustc accepts any visibility on a bin root's `main`.
+/// The executable's inherited-lane ownership admission. The Link library
+/// parses first and invokes this provider only for inherited `serve`; observer
+/// and unrelated verbs never take descriptors3/4. The take itself is
+/// `aterm_uds::spawnfd::adopt_startup_bridge_lanes`, whose contract this route keeps.
+#[cfg(unix)]
+fn dispatch_link(args: &[String]) -> ExitCode {
+    aterm_link::cli::dispatch_with_inherited_lanes(args, || {
+        // This early startup route takes the launcher's unclaimed lanes once,
+        // before bridge threads: neither has another owner or can be closed or
+        // replaced concurrently; the library's socket/flag checks only refuse.
+        let (verb, push) = aterm_uds::spawnfd::adopt_startup_bridge_lanes()?;
+        Ok(aterm_link::bridge::InheritedLanes { verb, push })
+    })
+}
+
+// `pub(crate)`: `src/windowed.rs` includes this file as a module and calls this `main` from its
+// own; rustc accepts any visibility on a bin root's `main`.
 pub(crate) fn main() -> ExitCode {
-    // FIRST, before any route can read a build fact (`aterm --version`, About,
-    // `ctl version`, the handoff identity, XTVERSION).
+    // First, before any route can read a build fact (`aterm --version`, About, `ctl version`,
+    // the handoff identity, XTVERSION).
     aterm_types::version::install(BUILD_STAMP);
-    // Start the broad window cold-start clock before argv0 parsing or route
-    // selection. The compatibility GUI-entry clock is anchored separately if
-    // this dispatches to a window. Dyld/process-loader time remains excluded.
+    // Start the broad window cold-start clock before argv0 parsing or routing (the GUI-entry
+    // clock is anchored separately); dyld/process-loader time stays excluded.
     aterm_gui::mark_rust_main_start();
-    // The WINDOWED image (`src/windowed.rs` shares this body) starts with no
-    // console on Windows; reattach the parent's FIRST — before ANY route prints
-    // — so help/version/verbs/diag output reaches a launching console and the
-    // TTY probe below sees real console handles. The console image finds its
-    // inherited handles present and this is a no-op there, as it is off
-    // Windows and for Explorer launches. The answer (did it attach?) matters
-    // only to the window library's own entry, which asks again itself.
+    // The windowed image starts with no console on Windows: reattach the parent's before any
+    // route prints, so help/version/verb/diag output reaches a launching console and the TTY
+    // probe sees real console handles. A no-op for the console image, off Windows and for an
+    // Explorer launch; the window library's entry asks again itself.
     #[cfg(windows)]
     let _ = aterm_gui::attach_parent_console();
     let mut argv: Vec<OsString> = std::env::args_os().collect();
@@ -171,9 +190,9 @@ pub(crate) fn main() -> ExitCode {
         argv.split_off(1)
     };
 
-    // --- argv0 compat aliases (bundle symlinks + old installs) -------------
-    // `file_name` (not a substring match) so only a REAL alias dispatches;
-    // EXE_SUFFIX is trimmed for Windows dev builds of the thin bins.
+    // --- argv0 aliases (bundle symlinks, old installs) ----------------------
+    // `file_name`, not a substring match, so only a real alias dispatches; EXE_SUFFIX is
+    // trimmed for Windows.
     let argv0 = argv
         .first()
         .map(|a| {
@@ -199,7 +218,7 @@ pub(crate) fn main() -> ExitCode {
         AliasRoute::OpenUrl => return aterm_agent::harness::open_url::main_entry(rest),
         AliasRoute::Link => {
             #[cfg(unix)]
-            return aterm_link::cli::dispatch(
+            return dispatch_link(
                 &rest
                     .iter()
                     .map(|a| a.to_string_lossy().into_owned())
@@ -208,12 +227,9 @@ pub(crate) fn main() -> ExitCode {
             #[cfg(not(unix))]
             return link_unavailable("link");
         }
-        // `get(1..)` not `rest[1..]`: the verifier cannot follow that a first
-        // token is in hand here, and refuted the index.
-        // `ThisProcess`: the alias names ARE the windowed image on Windows
-        // (`aterm-gui.exe` / a dev tree's `aterm-windowed.exe`), so a spawned
-        // window runs here — handing it to "the windowed sibling" would be a
-        // detached copy of ourselves, one hop for nothing.
+        // `get(1..)`, not `rest[1..]`: the verifier cannot follow that a first token is in
+        // hand here and refuted the index. `ThisProcess`: the alias names are the windowed
+        // image on Windows, so handing the window to the sibling would start a copy of us.
         AliasRoute::AliasWindowVerb => {
             return window_verb(
                 &first,
@@ -222,21 +238,26 @@ pub(crate) fn main() -> ExitCode {
             );
         }
         AliasRoute::AliasWindow => return gui_alias_entry(rest),
-        // `aterm`, the old `aterm-cli` symlink target, and anything else
-        // (a renamed copy) are all the front door.
+        // `aterm`, `aterm-cli` and anything else (a renamed copy) are the front door.
         AliasRoute::FrontDoor => {}
     }
 
     // --- the front door -----------------------------------------------------
 
-    // THE RETIRED HOOK SHAPE `<aterm> hook run <event> …`, which an older `aterm
-    // link hook install` wrote and a project `.claude/settings*.json` may still
-    // hold. It is no verb: it reaches aterm-link's `retired_hook` (exit 0, stdin
-    // drained), because below the fork it would be the window parser's exit 2 —
-    // a BLOCK to Claude Code. Only `hook run`: a bare `aterm hook` stays the parser's.
+    // The Full Disk Access probe's child (`aterm_containment::consent::run_open_probe_verb`):
+    // the window opens a `TCC.db` through it, so the open is attributed to the window's own
+    // image. Hidden, and answered before anything else runs.
+    if first == aterm_containment::consent::OPEN_PROBE_VERB {
+        return aterm_containment::consent::run_open_probe_verb(rest.get(1..).unwrap_or(&[]));
+    }
+
+    // The retired hook shape `<aterm> hook run <event> …`, which an older `aterm link hook
+    // install` wrote and a project `.claude/settings*.json` may still hold, reaches
+    // aterm-link's `retired_hook` (exit 0, stdin drained): below the fork it would be the
+    // window parser's exit 2, a block to Claude Code. A bare `aterm hook` stays the parser's.
     #[cfg(unix)]
     if first == "hook" && rest.get(1).is_some_and(|a| a == "run") {
-        return aterm_link::cli::dispatch(
+        return dispatch_link(
             &rest
                 .iter()
                 .map(|a| a.to_string_lossy().into_owned())
@@ -244,41 +265,34 @@ pub(crate) fn main() -> ExitCode {
         );
     }
 
-    // VERBS: the one command's own powers, routed HERE — ABOVE the mode fork, so a
-    // verb answers identically at a terminal and through a pipe.
-    //
-    // The match is EXHAUSTIVE over `aterm_cli::Verb` deliberately: a new variant
-    // breaks this build until it is routed. Below the fork a TTY selects the
-    // SESSION, whose parser rejects a verb it does not know as an unknown option.
+    // Verbs, routed above the mode fork so a verb answers the same at a terminal and through a
+    // pipe. The match is exhaustive over `aterm_cli::Verb`, so a new variant fails the build
+    // until it is routed (below the fork a TTY selects the session, whose parser rejects an
+    // unknown verb as an unknown option).
     if let Some(verb) = aterm_cli::Verb::from_operand(&first) {
         // `get(1..)` for the reason recorded on the `AliasWindowVerb` arm.
         let forwarded = rest.get(1..).unwrap_or(&[]).to_vec();
         return match verb {
             aterm_cli::Verb::Ctl => aterm_ctl::main_entry_with(forwarded, CTL_LOCAL),
-            // Session connections (SESSION_CONNECTIONS.md §6.1): the human
-            // front door for the standing pull/push wiring — presentation over
-            // the same control-socket verbs `ctl` speaks, hence it lives in
-            // aterm-ctl and routes here beside its sibling.
+            // Session connections (docs/design/SESSION_CONNECTIONS.md §6.1): the human front
+            // door for the standing pull/push wiring, presentation over the control-socket
+            // verbs `ctl` speaks, hence in aterm-ctl.
             aterm_cli::Verb::Conn => aterm_ctl::conn_main_entry(forwarded),
             aterm_cli::Verb::Pkg => atpkg::cli::main_entry(forwarded),
             aterm_cli::Verb::Fleet => aterm_agent::fleet_cli::main_entry(forwarded),
             aterm_cli::Verb::Drive => aterm_agent::drive_cli::main_entry(forwarded),
-            // The fabric bridge. `dispatch` takes `String`s because every one of
-            // its operands is a subject, a path or a principal — all of which
-            // the control protocol already defines as UTF-8 — and lossy is the
-            // right conversion for an argument that is about to be rejected by
-            // name if it is not one of those.
+            // The fabric bridge. `dispatch` takes `String`s: every operand is a subject, a path
+            // or a principal, all UTF-8 in the control protocol, and a lossy one is then
+            // rejected by name.
             #[cfg(unix)]
-            aterm_cli::Verb::Link => aterm_link::cli::dispatch(
+            aterm_cli::Verb::Link => dispatch_link(
                 &forwarded
                     .iter()
                     .map(|a| a.to_string_lossy().into_owned())
                     .collect::<Vec<String>>(),
             ),
-            // The owner's view of the fabric: it lives beside the bridge it
-            // reports on (`aterm-link`'s `fabric` module), and takes `String`s
-            // for the reason `link` does — and is gated the same way, for the
-            // same reason: it lives in the unix-only crate.
+            // The owner's view of the fabric, beside the bridge it reports on (`aterm-link`'s
+            // `fabric` module): `String`s and the unix gate for the reasons `link` has them.
             #[cfg(unix)]
             aterm_cli::Verb::Fabric => aterm_link::fabric::main(
                 &forwarded
@@ -290,67 +304,65 @@ pub(crate) fn main() -> ExitCode {
             aterm_cli::Verb::Link => link_unavailable("link"),
             #[cfg(not(unix))]
             aterm_cli::Verb::Fabric => link_unavailable("fabric"),
-            // The release tool is a separate executable — deliberately NOT carried by
-            // the app bundle — so this verb execs where its siblings call a library.
+            // The release tool is a separate executable, not in the app bundle, so this verb
+            // execs where its siblings call a library.
             aterm_cli::Verb::Ship => {
                 let args: Vec<String> = forwarded
                     .iter()
                     .map(|a| a.to_string_lossy().into_owned())
                     .collect();
-                // RETURN the status rather than `std::process::exit`: a `-> !` call
-                // leaves `main`'s teardown on an `unreachable` the verifier refutes
-                // (see `session_lane`). A code outside 0..=255 becomes the refusal
-                // code 2 rather than a truncated lie.
+                // Return the status, not `std::process::exit`: a `-> !` call leaves `main`'s
+                // teardown on an `unreachable` the verifier refutes (see `session_lane`). A
+                // code outside 0..=255 becomes 2.
                 ExitCode::from(u8::try_from(aterm_gui::run_ship(&args)).unwrap_or(2))
             }
-            // The HEADLESS update lane: `aterm ctl update status` needs a running
-            // window; this reads the shared ledger and runs the one-shot checker
-            // in-process.
+            // The headless update lane: `aterm ctl update status` needs a running window; this
+            // reads the shared ledger and runs the one-shot checker in-process.
             aterm_cli::Verb::Update => update_verb(&forwarded),
-            // The Claude Code harness's read views (docs/DESIGN-aterm-wrapper-
-            // 2026-09-17.md §0.4). The retired `aterm harness hook …`, still run
-            // by an older build's bridge with the payload on a pipe, reaches the
-            // same code and its silent exit 0.
+            // The Claude Code harness's read views (docs/DESIGN-aterm-wrapper-2026-09-17.md
+            // §0.4). The retired `aterm harness hook …`, still run by an older build's bridge,
+            // reaches the same code and its silent exit 0.
             aterm_cli::Verb::Harness => aterm_agent::harness::cli::main_entry(forwarded),
             // This machine's AI CLIs: their logins' doctor and reviews across AIs
             // (docs/DESIGN-ai-connections-2026-10-16.md).
             aterm_cli::Verb::Ai => aterm_agent::ai::cli::main_entry(forwarded),
+            // A lab of Macs from this one, over SSH (docs/DESIGN-machines-2026-10-16.md).
+            #[cfg(target_os = "macos")]
+            aterm_cli::Verb::Machines => aterm_machines::cli::main_entry(forwarded),
+            #[cfg(not(target_os = "macos"))]
+            aterm_cli::Verb::Machines => machines_unavailable(),
             // The PTY keeper (docs/DESIGN-pty-keeper-2026-09-26.md).
             aterm_cli::Verb::Keeper => {
                 aterm_keeper::cli::main_entry(forwarded, aterm_types::version::app_version())
             }
-            // `agents` is parsed by aterm-cli itself (it prints and exits), so routing
-            // it means handing the WHOLE operand list back to that parser.
+            // `agents` is parsed by aterm-cli itself (it prints and exits), so the whole
+            // operand list goes back to that parser.
             aterm_cli::Verb::Agents => {
                 let _ = aterm_cli::parse_args(rest);
                 ExitCode::SUCCESS
             }
-            // The theme family: the one listing and the authoring commands
-            // (read from the window library's catalog and classifier, handed in
-            // as Ship's tool is) and import (a pure conversion plus one file
-            // write). No window either way.
+            // The theme family: the listing and the authoring commands read the window
+            // library's catalog and classifier (handed in as `WindowThemes`); import is a pure
+            // conversion plus one file write. No window either way.
             aterm_cli::Verb::Theme => aterm_cli::theme_main_entry(forwarded, &WindowThemes),
-            // The wt-shaped WINDOWING grammar (S12).
-            // `WindowedSibling`: typed at a prompt, this is the CONSOLE image on
-            // Windows, and a window it has to spawn belongs in the windowed
-            // sibling (see the file header) so the prompt comes back at once.
+            // The wt-shaped windowing grammar. `WindowedSibling`: typed at a prompt this is the
+            // console image on Windows, so a spawned window goes to the windowed sibling and
+            // the prompt comes back.
             aterm_cli::Verb::NewTab | aterm_cli::Verb::NewWindow | aterm_cli::Verb::SplitPane => {
                 window_verb(verb.name(), &forwarded, WindowHost::WindowedSibling)
             }
         };
     }
 
-    // `aterm list-themes [<args>]` is `aterm theme list [<args>]`: one listing,
-    // so it routes to the verb before the diagnostics below (whose parser has
-    // no theme catalog) can answer it.
+    // `aterm list-themes [<args>]` is `aterm theme list [<args>]`, routed here before the
+    // diagnostics below, whose parser has no theme catalog.
     if let Some(theme_args) = aterm_cli::list_themes_alias(&first, rest.get(1..).unwrap_or(&[])) {
         return aterm_cli::theme_main_entry(theme_args, &WindowThemes);
     }
 
-    // `aterm --completions <bash|zsh|fish>` — the hidden generator flag, kept
-    // OUT of `--help` like its `aterm-ctl` sibling. Before the mode fork:
-    // install.sh pipes it into a file, and a piped invocation must never fall
-    // into the window path. First token only.
+    // `aterm --completions <bash|zsh|fish>`: the hidden generator flag, out of `--help` like
+    // its `aterm-ctl` sibling, first token only. Before the mode fork: install.sh pipes it into
+    // a file, and a piped invocation must not fall into the window path.
     if first == "--completions" || first.starts_with("--completions=") {
         let shell: Option<String> = first
             .strip_prefix("--completions=")
@@ -363,11 +375,9 @@ pub(crate) fn main() -> ExitCode {
         );
     }
 
-    // Mode-free surface BEFORE the mode fork: `help`, `-h`/`--help`,
-    // `-V`/`--version`, and the diagnostic subcommands answer identically with
-    // or without a TTY, and their identity is the ONE command's ("aterm X.Y",
-    // never "aterm-gui X.Y") — a piped `aterm --version` must not fall into
-    // the window path. parse_args prints and exits for all of these.
+    // Mode-free surface, before the mode fork: `help`, `-h`/`--help`, `-V`/`--version` and the
+    // diagnostic subcommands answer the same with or without a TTY, as the one command
+    // ("aterm X.Y", never "aterm-gui X.Y"). parse_args prints and exits for all of these.
     let mode_free = matches!(
         first.as_str(),
         "help" | "-h" | "--help" | "-V" | "--version"
@@ -386,13 +396,10 @@ pub(crate) fn main() -> ExitCode {
     // run it through `pkg run`, which execs the tool. Resolution is in-process
     // (`store_resolves`); a non-tool falls through to the usage error.
     if aterm_cli::is_tool_candidate(Some(first.as_str())) && store_resolves(&first) {
-        // KNOWN LIMIT: atpkg's CLI is String-typed, so non-UTF8 tool args are
-        // lossy-converted.
-        // `run <tool> -- <args…>`: `pkg run` strips exactly one leading `--`, so
-        // the tool's own flags are never parsed by it and a user's `--` survives.
-        // `split_first` rather than `rest[0]` / `rest[1..]`: the indexes are
-        // unreachable with an empty `rest`, but the verifier cannot follow that
-        // and refuted both bounds checks.
+        // atpkg's CLI is String-typed, so non-UTF-8 tool args are lossy-converted.
+        // `run <tool> -- <args…>`: `pkg run` strips exactly one leading `--`, so the tool's
+        // own flags are never parsed by it and a user's `--` survives. `split_first`, not
+        // `rest[0]`/`rest[1..]`: the verifier refuted both bounds checks.
         if let Some((tool, tool_args)) = rest.split_first() {
             let mut run_args: Vec<OsString> = vec![OsString::from("run"), tool.clone()];
             run_args.push(OsString::from("--"));
@@ -401,10 +408,9 @@ pub(crate) fn main() -> ExitCode {
         }
     }
 
-    // PENDING-PROGRAM arm: a default-set tool whose real shim has not landed yet
-    // resolves to a pending STUB, so `aterm trust` right after a lean install prints
-    // the install state rather than "unknown option". `atpkg __pending` exits 127, or
-    // at a terminal while a pass installs the tool, waits and runs it with these args.
+    // A default-set tool whose real shim has not landed resolves to a pending stub, so
+    // `aterm trust` right after a lean install prints the install state. `atpkg __pending`
+    // exits 127, or at a terminal while a pass installs the tool, waits and runs it.
     if aterm_cli::is_tool_candidate(Some(first.as_str())) && pending_stub_resolves(&first) {
         // `split_first()` for the reason recorded on the arm above.
         let Some((tool, tool_args)) = rest.split_first() else {
@@ -415,11 +421,13 @@ pub(crate) fn main() -> ExitCode {
         return atpkg::cli::main_entry(pending_args);
     }
 
-    // A name the compiled rosters know (`atpkg::stub::describe`) that nothing in the
-    // store answers — removed, never laid, or no layout — gets `pkg run`'s own line
-    // ("atpkg: ty is not installed (fix: aterm pkg install ty)", exit 127), never the
-    // session or window parser's "unknown command ty".
-    if aterm_cli::is_tool_candidate(Some(first.as_str())) && atpkg::stub::describe(&first).is_some()
+    // A name the compiled rosters know that nothing in the store answers (removed, never
+    // laid, or no layout) gets `pkg run`'s own line ("atpkg: ty is not installed (fix: aterm
+    // pkg install ty)", exit 127), not "unknown command ty". The rosters are the programs
+    // (`atpkg::stub::describe`) and the commands a program ships (`atpkg::stub::program_of`:
+    // `targo`, `trustc`, `tippy`, `trustfmt`, `trustdoc` come with `trust`).
+    if aterm_cli::is_tool_candidate(Some(first.as_str()))
+        && (atpkg::stub::describe(&first).is_some() || atpkg::stub::program_of(&first) != first)
     {
         let Some((tool, tool_args)) = rest.split_first() else {
             return ExitCode::from(2);
@@ -430,46 +438,32 @@ pub(crate) fn main() -> ExitCode {
         return atpkg::cli::main_entry(run_args);
     }
 
-    // Mode fork. Explicit flags first — `--session` and `--window` force a
-    // mode from anywhere (both stripped here; the mode libraries don't know
-    // them). Without one: window when headless is requested, when the release
-    // gates probe --diagnose, or when there is no TTY (a Finder/.app launch —
-    // LaunchServices attaches none; the passthrough itself is PTY-backed and
-    // does not need the parent's stdio to be one, hence the explicit
-    // `--session` for scripts/CI). Otherwise: the session.
-    // The scan/strip stops at the first `-e`/`--command`/`--`: past that
-    // boundary every token is a child command's payload (the window's `-e`
-    // contract) and passes through VERBATIM. The `aterm-cli` argv0 alias
-    // keeps its binary-era contract: the session regardless of TTY (old
-    // installs pipe it in scripts).
-    // `get(..b).unwrap_or(rest)` rather than `rest[..b]`: `payload_boundary` is
-    // always in range, but the verifier refuted both the bare index and a
-    // `.min(rest.len())` clamp. `get` has no panic path; the fallback is unreachable.
+    // Mode fork. `--session` and `--window` force a mode from anywhere (both stripped; the
+    // mode libraries don't know them). Otherwise the window when headless is requested, when
+    // the release gates probe --diagnose, or with no TTY (a Finder/.app launch: LaunchServices
+    // attaches none; the passthrough is PTY-backed itself, hence `--session` for scripts/CI);
+    // else the session. The scan stops at the first `-e`/`--command`/`--`: past it every token
+    // is the child command's, verbatim. The `aterm-cli` argv0 alias is the session regardless
+    // of TTY (old installs pipe it in scripts).
+    // `get(..b).unwrap_or(rest)`, not `rest[..b]`: the verifier refuted the index and a
+    // `.min(rest.len())` clamp; the fallback is unreachable.
     let scan = rest.get(..payload_boundary(&rest)).unwrap_or(&rest);
     let force_session =
         argv0 == "aterm-cli" || scan.iter().any(|a| a.to_string_lossy() == "--session");
     let windowish = is_windowish(scan, force_session, stdin_is_terminal());
     let mode_args = take_no_reroute(&strip_mode_flags(&rest));
     if windowish {
-        // SINGLE-INSTANCE ROUTING (S12), applied to a PLAIN window launch —
-        // Explorer / the Start menu / a pinned tile / `aterm --window` with
-        // nothing else asked of it. Under the shipped default
-        // (`windowing_behavior = "new_window"`) this is a no-op. The same call sits
-        // in `gui_alias_entry`, because on Windows the shortcut this machine
-        // actually launches names an ALIAS copy of this binary.
-        //
-        // `rest`, NOT `scan`: the mode fork's scan stops at the `-e`/`--` payload
-        // boundary, so handing it to the gate would present `aterm -e vim` as an
-        // empty (maximally eligible) argument list. See `plain_launch_request`.
+        // Single-instance routing for a plain window launch; a no-op under the shipped default
+        // (`windowing_behavior = "new_window"`). `gui_alias_entry` makes the same call. `rest`,
+        // not `scan`: see `plain_launch_request`.
         let spawn = match plain_launch_policy(&rest) {
             ControlFlow::Break(code) => return code,
             ControlFlow::Continue(spawn) => spawn,
         };
-        // What the windowed sibling is told, when it is the one to open this
-        // window (see `WindowHost`): the policy's own decision when it made one
-        // — `new-window`, so the sibling cannot route it a second time — and
-        // otherwise the launch's own argument list, `--no-reroute` included,
-        // which the sibling's gate refuses exactly as this one just did.
+        // What the windowed sibling is told, when it opens this window: the policy's decision
+        // when it made one (`new-window`, so the sibling cannot route it again), else the
+        // launch's own argv, `--no-reroute` included, which the sibling's gate refuses as
+        // this one did.
         let handoff = match &spawn {
             Some(request) => spawn_handoff_argv(request),
             None => rest.clone(),
@@ -479,13 +473,10 @@ pub(crate) fn main() -> ExitCode {
         return run_window(mode_args, window_host_for(scan), &handoff);
     }
 
-    // THE NESTED-SESSION GUARD (Windows). A session nested in a tab receives the
-    // outer tab's keys as literal win32-input-mode records, so no command runs and
-    // a stray `exit` closes the OUTER window. A BARE `aterm` typed in a tab
-    // (`ATERM_CHILD=1`) therefore becomes `aterm new-tab` for the cwd in the
-    // enclosing instance. Bare means no token at all: any flag, payload or typo is
-    // the session parser's to honour or refuse. `--session` and the `aterm-cli`
-    // alias still nest. Unix nests as documented.
+    // The nested-session guard (Windows). A session nested in a tab receives the outer tab's
+    // keys as literal win32-input-mode records, so no command runs and a stray `exit` closes
+    // the outer window. A bare `aterm` typed in a tab (`ATERM_CHILD=1`) therefore becomes
+    // `aterm new-tab` for the cwd in the enclosing instance (`nests_inside_aterm`).
     #[cfg(windows)]
     if nests_inside_aterm(
         rest.is_empty(),
@@ -499,31 +490,26 @@ pub(crate) fn main() -> ExitCode {
     // The session: flags → quiet, then the passthrough (never returns).
     let quiet = aterm_cli::parse_args(mode_args);
 
-    // THE SESSION SAYS NOTHING UNASKED ON STDERR: its log is the
-    // window's `aterm.log`, and atpkg's unasked notices (a config it cannot read, a
-    // prefix it will not use) are records in it — both set up here, before the lane's
-    // first atpkg call and its first thread.
+    // The session says nothing unasked on stderr: its log is the window's `aterm.log`, and
+    // atpkg's unasked notices are records in it, both set up before the lane's first atpkg
+    // call and its first thread.
     aterm_gui::install_session_log();
     atpkg::notice::to_host_log();
-    // ONE read of aterm.toml's `[packages]` and ONE layout for the whole lane — the
-    // agents handoff, the reroute seam, the package pass and the reroute thread's lay
-    // policy all read these, so a malformed table is reported once.
+    // One read of aterm.toml's `[packages]` and one layout for the whole lane, so a malformed
+    // table is reported once.
     let packages = atpkg::config::cached();
     let layout = atpkg::store::resolve_from(packages);
 
-    // THE MANAGED `agents/` HANDOFF: ensure `<prefix>/agents` (`Layout::ensure_agents_dir`,
-    // the window's rule too) and hand it to `session_main` as `$ATERM_AGENTS_DIR` on
-    // EVERY lane — `--no-reroute` is for the upstream Rust names, never the managed
-    // `claude`/`codex`. No directory means the variable is cleared, never an inherited
-    // stray. Never `ATPKG_AGENTS`: the shell integration keys its hook-sourcing on that
-    // being unset. Set here, single-threaded, before the lane's first thread.
+    // The managed `agents/` handoff: ensure `<prefix>/agents` (`Layout::ensure_agents_dir`, the
+    // window's rule too) and hand it to `session_main` as `$ATERM_AGENTS_DIR` on every lane;
+    // no directory clears the variable. Never `ATPKG_AGENTS`: the shell integration keys its
+    // hook-sourcing on that being unset. Set before the lane's first thread.
     hand_agents_dir(layout.as_ref());
-    // THE MANAGED `bin/`, APPENDED to the PATH `session_main` hands its shell, as the
-    // window's spawn seam appends it: the shell's own copies stay ahead, and the rc-sourced
-    // hook, which appends the same entry only where it is absent, adds no second one. A
-    // process the shell starts before that hook exists still finds a tool the moment its
-    // shim lands. Gated on consent or a hook already there ([`atpkg::session_bin_dir`]).
-    // Never `ATPKG_BIN`: that says the rc chain ran.
+    // The managed `bin/`, appended to the PATH `session_main` hands its shell, as the window's
+    // spawn seam does: the shell's own copies stay ahead, the rc-sourced hook adds no second
+    // entry, and a process started before that hook exists finds a tool once its shim lands.
+    // Gated on consent or a hook already there (`atpkg::session_bin_dir`). Never `ATPKG_BIN`:
+    // that says the rc chain ran.
     if let Some(bin) = layout.as_ref().and_then(|layout| {
         atpkg::session_bin_dir(layout, packages, aterm_types::dirs::home_dir().as_deref())
     }) {
@@ -533,29 +519,22 @@ pub(crate) fn main() -> ExitCode {
         );
     }
 
-    // THE REROUTE SEAM of the session lane (`docs/DESIGN-toolchain-reroute-2026-09-07.md`
-    // §"Reaching PATH" 1): resolve the configured store, lay the session-scoped stubs
-    // of the upstream Rust names (idempotent, eight tiny files, never over a foreign
-    // file — so the very first session is covered before `atpkg seed` ever runs), and
-    // hand the directory to `session_main` as `$ATERM_REROUTE_DIR`. The environment is
-    // the handoff because aterm-cli links atpkg for its tests only (its Cargo.toml:
-    // "the router composes these crates, aterm-cli does not call atpkg"); the session
-    // reads it at its own edge, puts it FIRST on the child PATH (move-to-front) and
-    // re-exports it for the shell integration. Same trusted-launcher discipline as
-    // `take_no_reroute`: set HERE, before the update checker below spawns the first
-    // thread. `--no-reroute` (the `__ATERM_REROUTE_PASSTHROUGH` marker) ⇒ nothing laid
-    // or handed over. On Windows `lay` lays nothing, so the handoff is skipped there too.
+    // The session lane's reroute seam (`docs/DESIGN-toolchain-reroute-2026-09-07.md`): lay the
+    // session-scoped stubs of the upstream Rust names (idempotent, never over a foreign file, so
+    // the first session is covered before `atpkg seed` runs) and hand the directory to
+    // `session_main` as `$ATERM_REROUTE_DIR`, which the session puts first on the child PATH and
+    // re-exports for the shell integration. Set before the lane's first thread. With
+    // `--no-reroute` nothing is laid or handed over; on Windows `lay` lays nothing.
     if !atpkg::reroute::engaged(
         std::env::var(atpkg::reroute::PASSTHROUGH_ENV)
             .ok()
             .as_deref(),
     ) && let Some(layout) = layout.clone()
     {
-        // A SESSION SPAWN NEVER WAITS ON A LAUNCHD JOB: a `lay` with files to lay
-        // costs 452-730 ms (measured), in front of a new tab's shell. Only the
-        // DIRECTORY is needed synchronously (it goes on PATH); the stubs are laid
-        // beside the shell. Failures are log lines, never stderr; `aterm pkg doctor`
-        // names an unlaid reroute.
+        // A session spawn never waits on the lay: one with files to lay costs 452-730 ms
+        // (measured) in front of a new tab's shell. Only the directory is needed now (it goes
+        // on PATH); the stubs are laid beside the shell. `aterm pkg doctor` names an unlaid
+        // reroute.
         let dir = layout.reroute_dir();
         if let Err(error) = layout.ensure_dir(&dir) {
             aterm_log::warn!(
@@ -576,16 +555,14 @@ pub(crate) fn main() -> ExitCode {
             });
     }
 
-    // THE SESSION UPDATE LANE: the window's background check/stage loop, so a
-    // terminal-only machine updates too. Checkers dedupe ACROSS PROCESSES (a shared
-    // flock + ledger-freshness gate): ten tabs cost one check per interval. On macOS
-    // APPLY stays with the window (it re-execs and confirms in the window's steady
-    // state). On Linux the check replaces the on-disk executable (`[update]
-    // auto_apply`), never a running process; that install is a trial the session
-    // counts and confirms once its shell speaks ([`start_linux_session_trial`]),
-    // before its checker starts. Nothing is printed here; `aterm update status`
-    // answers when asked. `[update] enabled = false` makes the call a no-op. Settings
-    // resolve on the checker thread each cycle, so a config reload applies.
+    // The session update lane: the window's background check/stage loop, so a terminal-only
+    // machine updates too. Checkers dedupe across processes (a shared flock and a
+    // ledger-freshness gate): ten tabs cost one check per interval. On macOS apply stays with
+    // the window (it re-execs and confirms in the window's steady state). On Linux the check
+    // replaces the on-disk executable (`[update] auto_apply`), never a running process, as a
+    // trial this session counts before its checker starts ([`start_linux_session_trial`]).
+    // Nothing prints; `[update] enabled = false` makes it a no-op; settings resolve on the
+    // checker thread each cycle.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     if session_lane_is_interactive() {
         let build = aterm_gui::running_build_number();
@@ -600,24 +577,18 @@ pub(crate) fn main() -> ExitCode {
         );
     }
 
-    // THE TOOLCHAIN'S OWN CHECK, from the session lane, SILENT (failures are log lines):
+    // The toolchain's own check, silent (failures are log lines), for an interactive launch
+    // only: a harness driving the session over pipes must never touch the machine's real prefix.
     //
-    //  -  THE HOST SETTINGS (`pkg machine apply`) are not the package manager's to
-    //     gate: no store lock, no index, no network. They write two `defaults
-    //     -currentHost` keys and remove unused Rust build cache folders
-    //     (`atpkg::build_cache::reclaim`); they run ONCE A DAY on the slot a
-    //     window's launch claims too
-    //     (`atpkg::machine::launch_apply_due`), never under a private state root
-    //     (ruling 409; the claim logs why it stood aside).
-    //  -  THE PACKAGE PASS, under the machine-wide rule the window's six-hour walk
-    //     uses ([`session_pass_due`]), claimed first so tabs opened together start one
-    //     pass: a DETACHED `aterm pkg update` on the window's argv. It names no spawner
-    //     (`SPAWNER_DETACHED`): its detaching `sh` exits at once, and a waiter reading
-    //     that as its window going would stand aside with 75. Gated on `[packages]
-    //     enabled`.
-    //
-    // Both only for an INTERACTIVE launch: a harness driving the session over pipes
-    // must never touch the machine's real prefix.
+    //  -  The host settings (`pkg machine apply`, macOS) take no store lock, index or network,
+    //     so the package manager does not gate them. They write two `defaults -currentHost`
+    //     keys and remove unused Rust build cache folders (`atpkg::build_cache::reclaim`), once
+    //     a day on the slot a window's launch claims too (`atpkg::machine::launch_apply_due`),
+    //     never under a private state root (the claim logs why it stood aside).
+    //  -  The package pass, under the window's machine-wide rule ([`session_pass_due`]): a
+    //     detached `aterm pkg update` on the window's argv. It names no spawner
+    //     (`SPAWNER_DETACHED`): its detaching `sh` exits at once, and a waiter reading that as
+    //     its window going would stand aside with 75. Gated on `[packages] enabled`.
     let now = aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX));
     if cfg!(target_os = "macos")
         && session_lane_is_interactive()
@@ -634,10 +605,9 @@ pub(crate) fn main() -> ExitCode {
         spawn_detached_pkg_update(layout);
     }
 
-    // THE VENDOR HEAD WATCH ([`start_session_head_watch`]), so a machine with no window
-    // open still sees a new Claude Code or Codex release promptly. The store's seat lets
-    // ONE process watch, a window first; the seat passes on when this process exits.
-    // Gated like the pass above.
+    // The vendor head watch ([`start_session_head_watch`]), so a machine with no window open
+    // still sees a new Claude Code or Codex release promptly. The store's seat lets one process
+    // watch, a window first; it passes on when this process exits. Gated like the pass above.
     if let Some(layout) = layout.as_ref()
         && packages.enabled()
         && session_lane_is_interactive()
@@ -648,35 +618,26 @@ pub(crate) fn main() -> ExitCode {
     session_lane(quiet)
 }
 
-/// A TERMINAL SESSION's part in a replaced Linux executable's trial: count
-/// this start ([`aterm_update::linux_session_started`], synchronously, before the shell
-/// spawns, so a session that dies starting is counted), and when it is a start of the
-/// pending trial, confirm it ([`aterm_update::confirm_linux_session`]) once the
-/// session proves healthy: its shell's first output reached the terminal
-/// ([`aterm_cli::on_first_shell_output`]). The window's rule, with a shell's prompt for
-/// its first frame: three starts that never get there roll the install back.
+/// A terminal session's part in a replaced Linux executable's trial: count this start
+/// ([`aterm_update::linux_session_started`], before the shell spawns, so a session that dies
+/// starting counts) and, for a start of the pending trial, confirm it
+/// ([`aterm_update::confirm_linux_session`]) once the shell's first output reached the
+/// terminal ([`aterm_cli::on_first_shell_output`]). The window's rule, with a prompt for its
+/// first frame: three starts that never get there roll the install back.
 ///
-/// Staying up is no proof (U45): a confirmed lane stops counting session starts, so a
-/// timer would keep a build whose session hangs before its shell speaks. A shell prints
-/// its prompt in milliseconds, and one stuck in its rc file still echoes a typed key;
-/// the confirmer waits for that, however long it takes ([`park_until_the_shell_spoke`]).
+/// Staying up is no proof: a confirmed lane stops counting session starts, so the confirmer
+/// waits for the first output however long it takes ([`park_until_the_shell_spoke`]). A silent
+/// start buys its burst one more window ([`defer_the_verdict_while_silent`]), so an rc file
+/// waiting on a cold NFS home does not let the next tab roll a healthy build back.
 ///
-/// A silent start still up buys its burst ONE more window
-/// ([`defer_the_verdict_while_silent`]), so an rc file waiting on a cold NFS home does
-/// not let the next tab roll a healthy build back. That confirms nothing; a build that
-/// never speaks is rolled back one window later.
+/// A session confirms the session lane only: a window start still counts toward rollback until
+/// a window confirms, so `aterm` typed to look into a crashing window cannot keep that build
+/// installed, and a window that never drew cannot keep healthy sessions from confirming.
 ///
-/// A session confirms the SESSION lane only: a window start after a session confirmed
-/// still counts toward rolling it back, from a clean count, until a window confirms.
-/// `aterm` typed into a terminal is the natural way to look into a window that crashes,
-/// and it must not be the thing that keeps that build installed; nor may one window
-/// that never drew keep healthy sessions from confirming.
-///
-/// The confirmation runs on its own thread — it takes the update lock and hashes the
-/// executable, which the passthrough loop and the shell's start must never wait on — and
-/// retries a lock that another aterm held for a moment. A session that ends before its
-/// confirmation lands leaves that one start counted and nothing else: the next start
-/// confirms. Nothing here prints; the update lane's words say where the install stands.
+/// The confirmation runs on its own thread (it takes the update lock and hashes the
+/// executable, which the passthrough loop and the shell's start must never wait on) and
+/// retries a briefly held lock. A session that ends first leaves its start counted; the next
+/// start confirms. Nothing here prints.
 #[cfg(target_os = "linux")]
 fn start_linux_session_trial(build: u64) {
     use std::sync::OnceLock;
@@ -731,26 +692,20 @@ fn start_linux_session_trial(build: u64) {
     }
 }
 
-/// Park the calling thread until `spoke` says the session's shell has printed — the
-/// [`aterm_cli::on_first_shell_output`] hook sets it and unparks this thread — with no
-/// deadline: a session that never prints proves nothing, and the wait ends with the
-/// process. A wake without output (a spurious unpark) parks again.
-#[cfg(any(target_os = "linux", test))]
+/// Park until `spoke` says the shell has printed (the [`aterm_cli::on_first_shell_output`] hook
+/// sets it and unparks this thread), with no deadline: a session that never prints proves
+/// nothing. A spurious wake parks again.
+#[cfg(target_os = "linux")]
 fn park_until_the_shell_spoke(spoke: &std::sync::atomic::AtomicBool) {
     while !spoke.load(std::sync::atomic::Ordering::Acquire) {
         std::thread::park();
     }
 }
 
-/// A SILENT START STILL UP DEFERS THE TRIAL'S VERDICT, ONCE. Wait up to
-/// [`aterm_update::LINUX_SESSION_SILENT_DEFER`] (half the window in which a start may
-/// still confirm itself) for the shell's first output; with nothing by then, ask the
-/// update lane to move the trial's stamp to now, which it does once and only if the
-/// stamp is still the one this start left ([`aterm_update::defer_linux_session_verdict`]),
-/// and tries again each second while a try does not land and the shell stays silent.
-/// NOTHING HERE CONFIRMS: the confirmer goes on to wait for the first output however
-/// long it takes ([`park_until_the_shell_spoke`]), and a build whose shell never speaks
-/// is rolled back by the first start a window after the move.
+/// A silent start still up defers the trial's verdict, once: with no shell output within
+/// [`aterm_update::LINUX_SESSION_SILENT_DEFER`], ask the update lane to move the trial's stamp
+/// ([`aterm_update::defer_linux_session_verdict`]), retried while the shell stays silent.
+/// Nothing here confirms.
 #[cfg(target_os = "linux")]
 fn defer_the_verdict_while_silent(spoke: &std::sync::atomic::AtomicBool, build: u64, commit: &str) {
     if park_until_spoke_or_silent_for(spoke, aterm_update::LINUX_SESSION_SILENT_DEFER) {
@@ -769,7 +724,7 @@ fn defer_the_verdict_while_silent(spoke: &std::sync::atomic::AtomicBool, build: 
 /// Park the calling thread until `spoke` says the shell has printed, or until `silent`
 /// has passed with nothing: `true` when it spoke. A wake without output (a spurious
 /// unpark) parks again for what is left.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 fn park_until_spoke_or_silent_for(
     spoke: &std::sync::atomic::AtomicBool,
     silent: std::time::Duration,
@@ -787,12 +742,11 @@ fn park_until_spoke_or_silent_for(
     }
 }
 
-/// The session's head watch ([`atpkg::vendor_direct::watch::run_host`]): the window's
-/// cadence, wake grace and re-offer leases, `[packages]` read live, and each moved head's
-/// pass run as this binary's `pkg update <program> --head-watch` — the window's own
-/// targeted pass — DETACHED like [`spawn_detached_pkg_update`]'s, so it outlives the
-/// session and is never reaped in the shell's place. Its lines are `aterm.log` records;
-/// a thread that could not start is one more. Nothing it does prints.
+/// The session's head watch ([`atpkg::vendor_direct::watch::run_host`]): the window's cadence,
+/// wake grace and re-offer leases, `[packages]` read live, and each moved head's pass run as
+/// this binary's `pkg update <program> --head-watch`, detached like
+/// [`spawn_detached_pkg_update`]'s so it outlives the session. Its lines are `aterm.log`
+/// records; nothing prints.
 fn start_session_head_watch(
     layout: &atpkg::store::Layout,
     packages: &atpkg::config::PackagesConfig,
@@ -821,19 +775,15 @@ fn start_session_head_watch(
 /// Who a refused `agents/` leaves without the managed agents, in the session's words.
 const SESSION_REACH: &str = "this session";
 
-/// THE `$ATERM_AGENTS_DIR` DECISION, pure over the resolved layout:
-/// `Some(dir)` — the absolute managed `<prefix>/agents/`, ensured to exist as a real
-/// directory by [`atpkg::store::Layout::ensure_agents_dir`] — is what the session is
-/// handed; `None` when there is no layout (no `$HOME`), when the directory could not
-/// be created or is a symlink/file (said on stderr ONCE,
-/// [`atpkg::store::agents_dir_refusal_line`]),
-/// or when its path is not UTF-8. The reroute switch is deliberately NOT an input: the
-/// escape hatch is for the upstream Rust names, never for the managed agent programs.
+/// The `$ATERM_AGENTS_DIR` decision: `Some(dir)`, the absolute managed `<prefix>/agents/`
+/// ensured as a real directory ([`atpkg::store::Layout::ensure_agents_dir`]); `None` with no
+/// layout (no `$HOME`), when the directory could not be created or is a symlink or file (said
+/// once on stderr, [`atpkg::store::agents_dir_refusal_line`]), or when its path is not UTF-8.
+/// The reroute switch is not an input: the escape is for the upstream Rust names only.
 fn agents_dir_handoff(layout: Option<&atpkg::store::Layout>) -> Option<String> {
     let layout = layout?;
-    // A RELATIVE prefix is never handed and never created: it would lay
-    // `<cwd>/Library/…/agents` in whatever directory the session started in. This
-    // guard holds whatever resolves the layout.
+    // A relative prefix is never handed or created: it would lay `<cwd>/Library/…/agents`
+    // wherever the session started.
     if !layout.prefix.is_absolute() {
         eprintln!(
             "aterm: managed `claude`/`codex` not first on PATH: package prefix {} is not absolute",
@@ -858,11 +808,9 @@ fn agents_dir_handoff(layout: Option<&atpkg::store::Layout>) -> Option<String> {
     }
 }
 
-/// Establish [`agents_dir_handoff`]'s answer in THIS process's environment as
-/// [`atpkg::reroute::AGENTS_DIR_ENV`] — set to the directory, or REMOVED (never left
-/// as an inherited stray) when there is none — through the workspace's one
-/// lock-scoped env helper, before the session's first thread, exactly as the
-/// reroute handoff is established.
+/// Set [`agents_dir_handoff`]'s answer in this process's environment as
+/// [`atpkg::reroute::AGENTS_DIR_ENV`], or remove an inherited value when there is none, through
+/// the one lock-scoped env helper, before the session's first thread.
 fn hand_agents_dir(layout: Option<&atpkg::store::Layout>) {
     match agents_dir_handoff(layout) {
         Some(dir) => aterm_log::env::set(atpkg::reroute::AGENTS_DIR_ENV, dir),
@@ -870,23 +818,19 @@ fn hand_agents_dir(layout: Option<&atpkg::store::Layout>) {
     }
 }
 
-/// Whether this `--session` launch is a PERSON's terminal rather than a harness's
-/// child: stdin is a terminal. Only such a launch may spawn the detached toolchain
-/// pass — a piped launch is a test or a driver, and a test must never mutate the
-/// machine's real package prefix.
+/// Whether this `--session` launch is a person's terminal (stdin is a terminal) rather than a
+/// harness's child. Only such a launch spawns the detached toolchain pass: a test must never
+/// mutate the machine's real package prefix.
 fn session_lane_is_interactive() -> bool {
     stdin_is_terminal()
 }
 
-/// Whether this launch spawns the detached pass: the MACHINE-WIDE rule the window's loop
-/// runs its six-hour walk on ([`aterm_update_core::pkg_check::full_pass_owed`]) over the
-/// stamps every lane reads ([`atpkg::status::pass_stamps`]: the outcome the last pass
-/// recorded, never `updated_at`; a pass installing now, not queued behind), then the
-/// session lane's own claim, so tabs opened in the same moment spawn one pass. The derived
-/// model `AtpkgFullPassRule` states the rule — no pass back to back, no success read as a
-/// failure, no owed pass held back; there is no rate-limit hold to read, as the pass makes
-/// no metered request (owner ruling R3) — and atpkg's `status` conformance binds this
-/// reading to it.
+/// Whether this launch spawns the detached pass: the machine-wide rule of the window's six-hour
+/// walk ([`aterm_update_core::pkg_check::full_pass_owed`]) over the stamps every lane reads
+/// ([`atpkg::status::pass_stamps`]: the last pass's recorded outcome, never `updated_at`; a
+/// pass installing now), then the session lane's own claim, so tabs opened together spawn one
+/// pass. The derived model `AtpkgFullPassRule` states the rule; atpkg's `status` conformance
+/// binds this reading to it.
 fn session_pass_due(layout: &atpkg::store::Layout, now_unix: i64) -> bool {
     use aterm_update_core::pkg_check;
     pkg_check::full_pass_owed(&atpkg::status::pass_stamps(layout, now_unix), now_unix).is_some()
@@ -897,14 +841,10 @@ fn session_pass_due(layout: &atpkg::store::Layout, now_unix: i64) -> bool {
         )
 }
 
-/// One DETACHED `aterm pkg machine apply` — the lock-free host settings, once a day
-/// ([`atpkg::machine::launch_apply_due`]).
-///
-/// Separate from [`spawn_detached_pkg_update`] because the two are gated differently on
-/// purpose: a package pass is due or it is not, and a user may switch it off entirely;
-/// the `[machine]` settings are the doctor's, they take no store lock, and their own
-/// `[machine]` table is where a user switches them off. Detached and never waited for,
-/// like the pass, so a session is never blocked by it.
+/// One detached `aterm pkg machine apply`: the lock-free host settings, once a day
+/// ([`atpkg::machine::launch_apply_due`]). Separate from [`spawn_detached_pkg_update`] because
+/// the gates differ: a package pass is due or not and can be switched off; the `[machine]`
+/// settings are the doctor's, take no store lock, and are switched off in their own table.
 fn spawn_detached_machine_apply() {
     let Ok(exe) = std::env::current_exe() else {
         return;
@@ -917,12 +857,10 @@ fn spawn_detached_machine_apply() {
     }
 }
 
-/// One DETACHED `aterm pkg update` (R4): this very binary, the `pkg` verb on the window's
-/// own argv ([`session_pass_args`]), its own process group so the session's exit (and
-/// the SIGHUP that follows it) cannot take the pass down mid-install, stdio on
-/// `/dev/null` (atpkg records its own `status.toml`, and its progress file is the one a
-/// window tails), and the child never waited for. A spawn that fails is a log line, never
-/// stderr — a session must never be blocked, or spoken over, by its package manager.
+/// One detached `aterm pkg update`: this binary's `pkg` verb on the window's argv
+/// ([`session_pass_args`]), in its own process group so the session's exit and SIGHUP cannot
+/// take it down mid-install, stdio on `/dev/null` (atpkg records `status.toml`, and a window
+/// tails its progress file), never waited for. A failed spawn is a log line, never stderr.
 fn spawn_detached_pkg_update(layout: &atpkg::store::Layout) {
     let Ok(exe) = std::env::current_exe() else {
         return;
@@ -935,11 +873,10 @@ fn spawn_detached_pkg_update(layout: &atpkg::store::Layout) {
     }
 }
 
-/// The detached pass's argv: `pkg update` and the flags every scheduled pass carries
-/// ([`aterm_update_core::pkg_check::pass_flags`]) — the window's own — and, like the
-/// window's whole pass, [`atpkg::cli::DEFER_BUSY_FLIP_FLAG`]: nobody typed this pass, so a
-/// Trust toolchain it would move is staged and flipped only when nothing is using the one
-/// it replaces ([`atpkg::quiet`]). Pure for the test.
+/// The detached pass's argv: `pkg update`, the window's scheduled-pass flags
+/// ([`aterm_update_core::pkg_check::pass_flags`]) and, as on the window's pass,
+/// [`atpkg::cli::DEFER_BUSY_FLIP_FLAG`]: nobody typed it, so a Trust toolchain it would move
+/// flips only when nothing uses the one it replaces ([`atpkg::quiet`]). Pure for the test.
 fn session_pass_args(layout: &atpkg::store::Layout) -> Vec<std::ffi::OsString> {
     let mut args: Vec<std::ffi::OsString> = vec![
         "pkg".into(),
@@ -952,31 +889,23 @@ fn session_pass_args(layout: &atpkg::store::Layout) -> Vec<std::ffi::OsString> {
     args
 }
 
-/// The SESSION route as a function that RETURNS an `ExitCode`, like every other
-/// route `main` dispatches to.
-///
-/// `aterm_cli::session_main` is `-> !`, and rustc lowers a diverging call with NO
-/// successor block, leaving the caller's scope teardown on an `unreachable`. The
-/// verifier has no body for an out-of-bundle callee, so it REFUTED that unreachable
-/// inside `main`, which has droppable locals live at the call. Here there is nothing to
-/// tear down, so no `unreachable` is emitted; the call is reported as unmodelled MIR.
-///
-/// `#[inline(never)]` pins the property the fix rests on: inlined back into
-/// `main`, `main`'s teardown returns and so does the refutation.
+/// The session route as a function that returns an `ExitCode`, like every other route.
+/// `aterm_cli::session_main` is `-> !`, and rustc lowers a diverging call with no successor
+/// block, leaving the caller's scope teardown on an `unreachable`, which the verifier (with no
+/// body for an out-of-bundle callee) refutes inside `main`, where droppable locals are live.
+/// Here there is nothing to tear down; `#[inline(never)]` keeps it so.
 #[inline(never)]
 fn session_lane(quiet: bool) -> ExitCode {
     aterm_cli::session_main(quiet)
 }
 
 // ---------------------------------------------------------------------------
-// ARGV0 ALIAS DISPATCH
+// argv0 alias dispatch
 // ---------------------------------------------------------------------------
 
-/// How an invocation arriving under an argv0 ALIAS name is served.
-///
-/// Pure, for the test. On Windows the Start-Menu shortcut and the jump list launch
-/// the `aterm-gui.exe` alias (see the file header), so the windowing verbs and the
-/// routing policy must work under it, not only under `aterm.exe`.
+/// How an invocation under an argv0 alias name is served; pure, for the test. On Windows the
+/// Start-Menu shortcut and the jump list launch the `aterm-gui.exe` alias, so the windowing
+/// verbs and the routing policy work under it too.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum AliasRoute {
     /// `aterm-ctl` — the control client.
@@ -987,34 +916,25 @@ enum AliasRoute {
     Fleet,
     /// `aterm-drive` — the agent drive CLI.
     Drive,
-    /// `aterm-open-url` — the opener a Claude Code login renewal runs as
-    /// `BROWSER` (`aterm harness accounts renew`): the URL in the account's
-    /// own browser profile. An alias because the variable names ONE
-    /// executable, run with no shell.
+    /// `aterm-open-url`, the `BROWSER` a Claude Code login renewal runs
+    /// (`aterm harness accounts renew`): it opens the URL in the account's own browser
+    /// profile. An alias because the variable names one executable, run with no shell.
     OpenUrl,
-    /// `aterm-link` — the fabric bridge. It is an alias and not merely a verb
-    /// because a bridge is spawned BY NAME out of `[fabric] command`, which is
-    /// split on whitespace and exec'd, so the string an operator writes has to
-    /// be a path to something executable.
+    /// `aterm-link`, the fabric bridge: an alias as well as a verb because `[fabric] command`
+    /// is split on whitespace and exec'd, so it must name something executable.
     Link,
-    /// `aterm-gui <new-tab|new-window|split-pane> …` — a WINDOWING VERB typed at
-    /// (or, far more often, committed into the jump list by) an alias copy. It is
-    /// routed exactly as `aterm <verb>` is; handing it to the window's own flag
-    /// parser instead is how a taskbar row becomes `unknown command 'new-window'`
-    /// against a console that does not exist.
+    /// `aterm-gui <new-tab|new-window|split-pane> …`: a windowing verb typed at, or committed
+    /// into the jump list by, an alias copy; routed as `aterm <verb>` is, never handed to the
+    /// window's flag parser.
     AliasWindowVerb,
-    /// `aterm-gui …` — the window, with the plain-launch routing policy applied
-    /// (see [`gui_alias_entry`]). `aterm-windowed` is the same arm: it is the
-    /// cargo target name of the windowed image, which a dev tree runs under
-    /// that name and `build.ps1` renames to `aterm-gui.exe` for the shipped
-    /// folder.
+    /// `aterm-gui …`: the window, with the plain-launch routing policy ([`gui_alias_entry`]).
+    /// `aterm-windowed`, the windowed image's cargo target name in a dev tree, is the same arm.
     AliasWindow,
-    /// `aterm-askpass …` — the `SUDO_ASKPASS` helper `sudo` runs with no tty
-    /// (`docs/DESIGN-sudo-askpass-2026-10-15.md`). An argv0 alias because `sudo`
-    /// execs it as `[path, prompt]` with no room for a verb, and it must run
-    /// before the session/window fork (it has no tty).
+    /// `aterm-askpass …`, the `SUDO_ASKPASS` helper (`docs/DESIGN-sudo-askpass-2026-10-15.md`):
+    /// an argv0 alias because `sudo` execs it as `[path, prompt]` with no room for a verb, and,
+    /// having no tty, it must run before the session/window fork.
     Askpass,
-    /// Not an alias: `aterm`, the old `aterm-cli` symlink target, a renamed copy.
+    /// Not an alias: `aterm`, `aterm-cli` (the front door forced to a session), a renamed copy.
     FrontDoor,
 }
 
@@ -1022,6 +942,11 @@ enum AliasRoute {
 /// first operand, which is what separates a windowing verb from a window flag.
 fn alias_route(argv0: &str, first: &str) -> AliasRoute {
     match argv0 {
+        // The window's probe may exec the same bundled argv0 alias. This is
+        // the intrinsic front-door helper even through a GUI image alias.
+        "aterm-gui" | "aterm-windowed" if first == aterm_containment::consent::OPEN_PROBE_VERB => {
+            AliasRoute::FrontDoor
+        }
         "aterm-ctl" => AliasRoute::Ctl,
         "atpkg" => AliasRoute::Pkg,
         "aterm-fleet" => AliasRoute::Fleet,
@@ -1031,38 +956,23 @@ fn alias_route(argv0: &str, first: &str) -> AliasRoute {
         "aterm-open-url" => AliasRoute::OpenUrl,
         "aterm-gui" | "aterm-windowed" => match aterm_cli::Verb::from_operand(first) {
             Some(verb) if verb.is_windowing() => AliasRoute::AliasWindowVerb,
-            // Every other verb stays out: `aterm-gui` means "the window". Only the
-            // verbs the jump list launches are lifted into it.
+            // Every other verb stays out: `aterm-gui` means "the window".
             _ => AliasRoute::AliasWindow,
         },
         _ => AliasRoute::FrontDoor,
     }
 }
 
-/// The `aterm-gui` argv0 alias: the WINDOW mode, reached through the same
-/// plain-launch policy and the same mode-flag stripping the front door applies.
+/// The `aterm-gui` argv0 alias: the window mode, through the plain-launch policy and the
+/// mode-flag stripping the front door applies. On Windows the Start-Menu shortcut launches it,
+/// so `windowing_behavior` runs here, and `--window` (what `RegisterApplicationRestart`
+/// registers) is stripped; only `--window`, since the window parser refuses `--session` (exit
+/// 2). `--no-reroute` is consumed as at the front door.
 ///
-/// On Windows this alias is what the Start-Menu shortcut launches, so the
-/// `windowing_behavior` policy runs here, and `--window` (what
-/// `RegisterApplicationRestart` registers) is stripped before the window's parser.
-///
-/// ONLY `--window` is stripped: `--session` asks for a mode this alias cannot
-/// serve, and the window parser's `unknown option`, exit 2, refuses it.
-///
-/// `--no-reroute` is consumed here as well (`take_no_reroute`): the alias IS the
-/// window, and the window must honour it exactly as the front door does.
-///
-/// The window runs IN THIS PROCESS on every platform: on Windows the alias
-/// names are the windowed image itself (`aterm-gui.exe`, or `aterm-windowed.exe`
-/// in a dev tree), which is exactly where a window belongs — see [`run_window`]
-/// for the console image's opposite answer. That is also why nothing is handed
-/// anywhere (the empty handoff below).
-///
-/// Its PRINT-AND-EXIT flags (`aterm-gui --version`, `--help`, …) answer here too:
-/// a prompt that does not wait for this GUI-subsystem process would not wait for a
-/// console image it started either. The window parser writes the answer without
-/// `print!`'s panic and, on the prompt's console, names `aterm --window …` — the
-/// spelling a prompt waits for (`aterm-gui`'s `cli::answer_and_exit`).
+/// The window runs in this process on every platform: the alias names are the windowed image
+/// itself (see [`run_window`] for the console image), hence the empty handoff. Its
+/// print-and-exit flags answer here too; on the prompt's console the window parser names
+/// `aterm --window …`, the spelling a prompt waits for (`aterm-gui`'s `cli::answer_and_exit`).
 fn gui_alias_entry(rest: Vec<OsString>) -> ExitCode {
     if let ControlFlow::Break(code) = plain_launch_policy(&rest) {
         return code;
@@ -1075,42 +985,28 @@ fn gui_alias_entry(rest: Vec<OsString>) -> ExitCode {
 }
 
 // ---------------------------------------------------------------------------
-// WHERE A WINDOW RUNS: THIS PROCESS, OR THE WINDOWED SIBLING (Windows)
+// Where a window runs: this process, or the windowed sibling (Windows)
 // ---------------------------------------------------------------------------
 
-/// Which PROCESS serves a window this front door has decided to open.
-///
-/// Off Windows the two are the same thing: the one binary runs the window
-/// in-process, as it always has. On Windows the answer depends on which of the
-/// two images (see the file header) is running and on what was asked.
+/// Which process serves a window the front door decided to open: off Windows always this one;
+/// on Windows it depends on the running image (see the file header) and on what was asked.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum WindowHost {
-    /// Run the window here. Right when this image IS the windowed one (the
-    /// `aterm-gui` / `aterm-windowed` argv0 aliases), and when the launch is
-    /// headless- or diagnose-shaped: the release gates and every harness READ
-    /// its output through the pipes they gave it, so it must stay in the
-    /// process they spawned.
+    /// Run the window here: in the windowed image (the `aterm-gui`/`aterm-windowed` aliases),
+    /// and for a headless- or diagnose-shaped launch, whose output the release gates and
+    /// harnesses read through their pipes.
     ThisProcess,
-    /// The CONSOLE image on Windows, asked for a real window: check the
-    /// window's arguments HERE, then start the windowed sibling detached and
-    /// return at once, so the shell prompt comes back (see [`run_window`]).
-    /// Falls back to [`WindowHost::ThisProcess`] — out loud — when there is no
-    /// current sibling image beside this one.
+    /// The console image on Windows, asked for a real window: check the window's arguments
+    /// here, start the windowed sibling detached and return at once, so the prompt comes back
+    /// ([`run_window`]). Falls back to [`WindowHost::ThisProcess`], out loud, with no current
+    /// sibling.
     WindowedSibling,
 }
 
-/// The host for a window-shaped FRONT-DOOR launch (`aterm --window`, the no-TTY
-/// launch), decided from the pre-payload `scan` the mode fork itself read.
-///
-/// Pure over the argument list, so the table is unit-testable. Off Windows every
-/// answer is `ThisProcess`; the enum exists so the Windows rule is readable in one place
-/// rather than scattered as `cfg`s.
-///
-/// Only `--headless` and `--diagnose` keep the WINDOW in this process. Every
-/// other flag the window's parser answers by printing — `--help`, `--version`,
-/// the listings, the registry verbs — and every usage error it refuses with is
-/// answered on the sibling route too, in this process and on this console,
-/// because that route's first step is that very parser run here
+/// The host for a window-shaped front-door launch (`aterm --window`, the no-TTY launch), from
+/// the pre-payload `scan`; pure, for its table test, and off Windows always `ThisProcess`. Only
+/// `--headless` and `--diagnose` keep the window here. A flag the window's parser answers by
+/// printing, or a usage error, is still answered here on the sibling route, by that parser
 /// (`aterm_gui::check_window_args`).
 fn window_host_for(scan: &[OsString]) -> WindowHost {
     if !cfg!(windows) {
@@ -1126,24 +1022,15 @@ fn window_host_for(scan: &[OsString]) -> WindowHost {
     }
 }
 
-/// Run the WINDOW for `args` where `host` says, and return the route's exit code.
+/// Run the window for `args` where `host` says, and return the route's exit code.
+/// `WindowedSibling` (Windows) hands the window to the sibling image and returns 0 while it
+/// comes up, the `wt`/`code` shape. `handoff` is the sibling's argv, not `args`: the sibling is
+/// the whole front door under its alias, so it gets the decision already made
+/// ([`spawn_handoff_argv`]) or the launch's own argv, never a stripped remainder to route again.
 ///
-/// `WindowedSibling` on Windows is the console image handing the window to
-/// `aterm-gui.exe` next to itself and returning 0 while the window is still
-/// coming up — the `wt`/`code` shape a shell user expects. `handoff` is the
-/// argument list the sibling is started with, which is NOT `args`: the sibling
-/// is the whole front door under its alias name, so it is told either the
-/// routing decision already made ([`spawn_handoff_argv`]) or the launch's own
-/// argument list, never a stripped remainder it would route a second time.
-///
-/// Before anything is started the window's own parser runs here
-/// (`aterm_gui::check_window_args`), because the sibling's stdio is NUL: a
-/// usage error (`aterm --window --font-px abc`) printed there would reach nobody.
-/// It prints here and exits 2, and a print-and-exit flag prints here too.
-///
-/// The fallback to an in-process window when there is no current sibling is
-/// SAID on stderr: a silent fallback would look exactly like the shipped layout
-/// working, on a folder where it is not laid out.
+/// The window's parser runs here first (`aterm_gui::check_window_args`) because the sibling's
+/// stdio is NUL: a usage error printed there would reach nobody. A fallback to an in-process
+/// window is said on stderr, or it would look like the shipped layout working.
 fn run_window(args: Vec<OsString>, host: WindowHost, handoff: &[OsString]) -> ExitCode {
     #[cfg(windows)]
     if host == WindowHost::WindowedSibling {
@@ -1163,13 +1050,10 @@ fn run_window(args: Vec<OsString>, host: WindowHost, handoff: &[OsString]) -> Ex
     ExitCode::SUCCESS
 }
 
-/// The argument list the windowed sibling is started with for a window the
-/// routing policy has already decided to SPAWN: `new-window [-d <dir>]`.
-///
-/// `new-window` because it is the one verb the policy never redirects
-/// (`aterm_cli::route_launch`), so the sibling — the whole front door under
-/// its alias name — cannot route it a second time (under `attach`, a plain
-/// launch would open a TAB). The directory is `window_args`' own, already absolute.
+/// The windowed sibling's argv for a window the policy decided to spawn:
+/// `new-window [-d <dir>]`, the one verb the policy never redirects (`aterm_cli::route_launch`),
+/// so the sibling cannot route it again (under `attach` a plain launch would open a tab). The
+/// directory is `window_args`' own, already absolute.
 fn spawn_handoff_argv(request: &aterm_cli::WindowRequest) -> Vec<OsString> {
     let mut argv = vec![OsString::from(aterm_cli::Verb::NewWindow.name())];
     argv.extend(request.window_args());
@@ -1183,9 +1067,8 @@ mod windowed_sibling {
     use std::path::Path;
     use std::time::{Duration, SystemTime};
 
-    // Tiny FFI, in the style of crates/aterm-pty/src/windows/ffi.rs: the two
-    // calls that keep the shell's pipes out of the detached window, plus the
-    // query only the test's probe reads (gated with it, or it is unused).
+    // The two calls that keep the shell's pipes out of the detached window, plus the query
+    // only the test reads.
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetStdHandle(kind: u32) -> isize;
@@ -1198,14 +1081,10 @@ mod windowed_sibling {
     /// `HANDLE_FLAG_INHERIT`.
     const HANDLE_FLAG_INHERIT: u32 = 0x1;
 
-    /// How much OLDER than this image a build tree's windowed image may be and
-    /// still count as the same build.
-    ///
-    /// A STALE sibling is the hazard: `--bin aterm` rebuilds the console image
-    /// alone, and the window would open in an earlier build's `aterm-windowed.exe`.
-    /// But the two bins of one build link in parallel and land in either order
-    /// (measured: the windowed image 6 ms OLDER), so a minute absorbs the link
-    /// spread while a stale sibling trails by a whole edit-and-rebuild cycle.
+    /// How much older than this image a build tree's windowed image may be and still count as
+    /// the same build. A stale sibling is the hazard (`--bin aterm` rebuilds the console image
+    /// alone), but one build's two bins link in parallel and land in either order (measured: the
+    /// windowed image 6 ms older); a minute absorbs that, and a stale one trails by a rebuild.
     const SAME_BUILD_SPREAD: Duration = Duration::from_secs(60);
 
     /// Whether a build tree's windowed image, last written at `sibling`, is too
@@ -1216,29 +1095,20 @@ mod windowed_sibling {
             .is_ok_and(|older_by| older_by > SAME_BUILD_SPREAD)
     }
 
-    /// Whether `image` carries the cargo TARGET name of the windowed image —
-    /// only a build tree has one (`build.ps1` and `install.ps1` lay it as
-    /// `aterm-gui.exe`), and only a build tree can hold a stale one.
+    /// Whether `image` carries the windowed image's cargo target name: only a build tree has
+    /// one (`build.ps1` and `install.ps1` lay it as `aterm-gui.exe`), and only it can be stale.
     fn is_build_tree_image(image: &Path) -> bool {
         image
             .file_name()
             .is_some_and(|name| name.eq_ignore_ascii_case("aterm-windowed.exe"))
     }
 
-    /// Stop this process's std handles from being INHERITED by the sibling.
-    ///
-    /// Without this, `$o = & aterm.exe --window` from pwsh HANGS until the window
-    /// closes (measured). `Stdio::null()` only sets the child's own three
-    /// std handles to NUL; `CreateProcess` is still called with
-    /// `bInheritHandles = TRUE` (it must be, to pass those), and that hands the
-    /// child EVERY inheritable handle in our table — and a shell's stdout /
-    /// stderr pipes are inheritable by construction, since we inherited them.
-    /// The detached window then held the write end of the shell's pipe and the
-    /// shell waited for EOF on it. Clearing `HANDLE_FLAG_INHERIT` on our copies
-    /// touches only our handle table; nothing else in this process opens an
-    /// inheritable handle before this point, and the process exits right after
-    /// the spawn. Best-effort: a handle that refuses the change is left as is,
-    /// which is exactly the measured behaviour and not worse.
+    /// Stop this process's std handles from being inherited by the sibling. Without this,
+    /// `$o = & aterm.exe --window` from pwsh hangs until the window closes: `CreateProcess` runs
+    /// with `bInheritHandles = TRUE` (to pass the NUL stdio), which hands the child every
+    /// inheritable handle, and the shell's pipes are inheritable. Clearing `HANDLE_FLAG_INHERIT`
+    /// touches only our handle table; nothing here opens an inheritable handle first, and the
+    /// process exits right after the spawn. Best-effort: a handle that refuses stays as it was.
     pub(super) fn stop_inheriting_std_handles() {
         // SAFETY: handle queries and a flag write on handles this process owns;
         // no pointers cross the boundary.
@@ -1269,33 +1139,23 @@ mod windowed_sibling {
         }
     }
 
-    /// Start the windowed sibling with `args`, detached, stdio on NUL, and
-    /// return once it is running. `Err` names the reason in a sentence the
-    /// caller prints before falling back to an in-process window.
+    /// Start the windowed sibling with `args`, detached, stdio on NUL, and return once it is
+    /// running; `Err` is a sentence the caller prints before falling back to an in-process
+    /// window.
     ///
-    /// WHICH file is `aterm_gui::windowed_front_door_beside`'s answer — the one
-    /// rule the jump list and the Explorer verb use too: `aterm-gui.exe` in an
-    /// install or `build.ps1` folder, `aterm-windowed.exe` in a build tree,
-    /// whose `aterm-gui.exe` is crate aterm-gui's thin dev bin (the window
-    /// library with none of this front door) and is never taken. A build
-    /// tree's image must also be as new as this one ([`is_stale`]).
+    /// The file is `aterm_gui::windowed_front_door_beside`'s answer (the rule the jump list and
+    /// the Explorer verb use): `aterm-gui.exe` in an install or `build.ps1` folder,
+    /// `aterm-windowed.exe` in a build tree, whose `aterm-gui.exe` is crate aterm-gui's thin dev
+    /// bin. A build tree's image must also be as new as this one ([`is_stale`]).
     ///
-    /// Stdio on NUL is what keeps the sibling OFF this console: it then finds
-    /// three real (device) handles, so its `attach_parent_console` attaches
-    /// nothing and no startup line of its can reach the prompt the shell has
-    /// already redrawn. Nothing is waited for
-    /// — the window's lifetime is its own — and nothing of the shell's is
-    /// carried into it either ([`stop_inheriting_std_handles`]), so a script
-    /// that captured our output gets its pipe's EOF the moment we exit.
+    /// Stdio on NUL keeps the sibling off this console: with three real handles its
+    /// `attach_parent_console` attaches nothing, so no startup line reaches the redrawn prompt.
+    /// Nothing is waited for, and no shell handle is carried in
+    /// ([`stop_inheriting_std_handles`]), so a capturing script gets EOF when we exit.
     ///
-    /// `Console::Detached` (`DETACHED_PROCESS`): the window gets NO console — not
-    /// ours, and not a new one — which is what a GUI image wants from a shell
-    /// launch, and what it has under any flag. NOT `CREATE_NEW_PROCESS_GROUP`,
-    /// the other flag that sounds like a detach: it starts the child with Ctrl+C
-    /// DISABLED, and every shell the window then spawns inherits that, so no tab
-    /// could interrupt a command. Built by `aterm_uds::spawnfd::command`, like
-    /// every child; `aterm_uds::spawn::set_flags`, the one creation-flags setter,
-    /// then REPLACES the quiet console choice that made with this one.
+    /// `set_gui_image_flags` gives it `Console::Detached` (`DETACHED_PROCESS`): no console at
+    /// all, as a GUI image wants. Not `CREATE_NEW_PROCESS_GROUP`, which starts the child with
+    /// Ctrl+C disabled, inherited by every shell the window spawns.
     pub(super) fn launch(args: &[OsString]) -> Result<(), String> {
         let exe =
             std::env::current_exe().map_err(|e| format!("cannot locate this executable ({e})"))?;
@@ -1336,32 +1196,21 @@ mod windowed_sibling {
     }
 }
 
-/// THE NESTED-SESSION DECISION (Windows): whether a session-shaped launch was
-/// typed inside an aterm tab and should open a tab there instead of nesting.
-///
-/// Pure, so the table is a unit test. `bare` is a launch with NO argument at
-/// all: any flag, a `-e`/`--command`/`--` child
-/// command line, or a typo is a request the session parser must serve or
-/// refuse, never one to drop for a plain tab; `force_session` is the `aterm-cli`
-/// argv0 alias (and an explicit `--session`, though that one is never bare) —
-/// "nest, I know"; `aterm_child` is the tab marker the window sets for every
-/// child; `stdin_tty` is the mode fork's own probe — a piped launch inside a
-/// tab is a harness, and a harness gets what it asked for.
-///
-/// Compiled off Windows only for its test: the guard that consults it is
-/// Windows-only, and Unix keeps nesting (a nested session there is the
-/// documented way to run one).
+/// Whether a session-shaped launch typed inside an aterm tab opens a tab there instead of
+/// nesting (Windows). `bare`: no argument at all (a flag, a `-e`/`--command`/`--` payload or a
+/// typo is the session parser's to serve or refuse); `force_session`: the `aterm-cli` argv0
+/// alias ("nest, I know"); `aterm_child`: the tab marker the window sets for every child;
+/// `stdin_tty`: the mode fork's probe (a piped launch inside a tab is a harness). Compiled off
+/// Windows only for its test: Unix keeps nesting.
 #[cfg(any(windows, test))]
 fn nests_inside_aterm(bare: bool, force_session: bool, aterm_child: bool, stdin_tty: bool) -> bool {
     bare && !force_session && aterm_child && stdin_tty
 }
 
-/// What the guarded launch does instead of nesting: `aterm new-tab -d <cwd>`,
-/// FORCED to the enclosing instance — not routed by `windowing_behavior`, whose
-/// shipped default (`new_window`) would open a second window for a launch that
-/// plainly meant "a terminal here". Unreachable instance (a tab whose window
-/// died, a socket switched off): a new window, said out loud, through the same
-/// sibling handoff every other window takes.
+/// What the guarded launch does instead of nesting: `aterm new-tab -d <cwd>`, forced to the
+/// enclosing instance rather than routed by `windowing_behavior` (whose default, `new_window`,
+/// would open a second window for a launch that meant "a terminal here"). An unreachable
+/// instance gets a new window, said out loud, through the sibling handoff.
 #[cfg(windows)]
 fn nested_new_tab() -> ExitCode {
     const ALREADY_INSIDE: &str =
@@ -1419,22 +1268,19 @@ fn nested_new_tab() -> ExitCode {
     }
 }
 
-/// The index of the `-e`/`--command`/`--` PAYLOAD BOUNDARY, or `rest.len()`.
-/// Past it every token belongs to a child command line and is neither scanned
-/// nor stripped — the window's `-e` contract.
+/// The index of the `-e`/`--command`/`--` payload boundary, or `rest.len()`. Past it every
+/// token belongs to a child command line and is neither scanned nor stripped.
 fn payload_boundary(rest: &[OsString]) -> usize {
     rest.iter()
         .position(|a| matches!(a.to_string_lossy().as_ref(), "-e" | "--command" | "--"))
         .unwrap_or(rest.len())
 }
 
-/// The two MODE flags: they select which mode runs, and the mode libraries do
-/// not know them.
+/// The two mode flags: they select which mode runs, and the mode libraries do not know them.
 const MODE_FLAGS: &[&str] = &["--window", "--session"];
 
-/// `rest` with `flags` removed — but only BEFORE the payload boundary: a `--` or
-/// `-e` payload is a child command line and passes through verbatim, a
-/// `--window` inside it included.
+/// `rest` with `flags` removed, only before the payload boundary: a `--` or `-e` payload is a
+/// child command line and passes through verbatim, a `--window` inside it included.
 fn strip_flags(rest: &[OsString], flags: &[&str]) -> Vec<OsString> {
     let boundary = payload_boundary(rest);
     rest.iter()
@@ -1450,32 +1296,25 @@ fn strip_mode_flags(rest: &[OsString]) -> Vec<OsString> {
     strip_flags(rest, MODE_FLAGS)
 }
 
-/// `--no-reroute`: restore the upstream Rust names in this session (`aterm help
-/// reroute`; `docs/DESIGN-toolchain-reroute-2026-09-07.md` §"Reaching PATH" 3), the
-/// only spelling of that escape. Consumed by
-/// [`take_no_reroute`] exactly like a mode flag: stripped before the payload boundary
-/// (neither mode library knows it) and, when present, turned into the INTERNAL marker
-/// [`atpkg::reroute::PASSTHROUGH_ENV`] in THIS process's environment — so both lanes
-/// read one answer, and every child inherits it.
+/// `--no-reroute`: restore the upstream Rust names in this session (`aterm help reroute`;
+/// `docs/DESIGN-toolchain-reroute-2026-09-07.md`), the only spelling of that escape.
+/// [`take_no_reroute`] consumes it like a mode flag and turns it into the internal marker
+/// [`atpkg::reroute::PASSTHROUGH_ENV`] in this process's environment, so both lanes read one
+/// answer and every child inherits it.
 const NO_REROUTE_FLAG: &str = "--no-reroute";
 
-/// `rest` with [`NO_REROUTE_FLAG`] stripped, and the marker ESTABLISHED to match:
-/// [`atpkg::reroute::PASSTHROUGH_ENV`]`=1` when the flag was present, and REMOVED when
-/// it was not — an inherited marker (this launch typed inside a `--no-reroute`
-/// session) is protocol from another launch, never an instruction to this one, so a
-/// launch without the flag always gets the reroute. Trusted-launcher idiom (the
-/// `--containment` precedent in aterm-cli's parser): single-threaded startup, before
-/// the update checker's thread and before any PTY byte flows, through the workspace's
-/// one lock-scoped env helper. Inside a `-e`/`--` payload the token belongs to the
-/// child command line and is neither read nor stripped. A launch carrying the flag is
-/// deliberately NOT a "plain" launch for the single-instance routing policy (which
-/// reads the unstripped `rest`): a tab forwarded to another instance would not carry
-/// the environment the flag asked for, so it opens here.
+/// `rest` with [`NO_REROUTE_FLAG`] stripped, and the marker set to match:
+/// [`atpkg::reroute::PASSTHROUGH_ENV`]`=1` when the flag was present, removed when not (an
+/// inherited marker is another launch's, never an instruction to this one). Set during
+/// single-threaded startup, before the update checker's thread and any PTY byte, through the
+/// workspace's one lock-scoped env helper. Inside a `-e`/`--` payload the token is the child's.
+/// A launch carrying the flag is not a plain launch for the routing policy (which reads the
+/// unstripped `rest`): a forwarded tab would not carry the environment.
 ///
-/// [`atpkg::reroute::ANNOUNCED_ENV`] is REMOVED on every launch (2026-10-01): it marks a
-/// child of a command the reroute already ran — `cargo run -p aterm` from a session hands
-/// it to the aterm it starts — and a new session's commands are typed, not spawned, so
-/// each is announced. Inherited, it would have silenced every signpost in that session.
+/// [`atpkg::reroute::ANNOUNCED_ENV`] is removed on every launch: it marks a child of a command
+/// the reroute already ran (`cargo run -p aterm` from a session hands it on), and a new
+/// session's commands are typed, so each is announced; inherited, it would silence every
+/// signpost.
 fn take_no_reroute(rest: &[OsString]) -> Vec<OsString> {
     aterm_log::env::unset(atpkg::reroute::ANNOUNCED_ENV);
     // Same form, same reason as the `scan` slice above.
@@ -1492,16 +1331,10 @@ fn take_no_reroute(rest: &[OsString]) -> Vec<OsString> {
     strip_flags(rest, &[NO_REROUTE_FLAG])
 }
 
-/// The request a PLAIN window launch would forward, or `None` when this launch
-/// must not be routed by policy at all.
-///
-/// `argv` is THE WHOLE ARGUMENT LIST, `-e` payload included: the mode fork's
-/// `scan` stops AT the payload boundary, so `aterm -e vim` would reach the gate as
-/// an EMPTY list and forward into a tab with the command silently dropped. The
-/// boundary is refused here too, so the rule holds however this is called.
-///
-/// Apart from resolving `-d` against the real filesystem this is pure, which is
-/// what lets the payload rule be pinned by a unit test.
+/// The request a plain window launch would forward, or `None` when it must not be routed by
+/// policy. `argv` is the whole argument list, `-e` payload included: the mode fork's `scan`
+/// stops at the payload boundary, so `aterm -e vim` would reach the gate empty and forward into
+/// a tab with the command dropped. Pure apart from resolving `-d`.
 fn plain_launch_request(
     argv: &[OsString],
     env: aterm_cli::LaunchEnv,
@@ -1520,20 +1353,13 @@ fn plain_launch_request(
     })
 }
 
-/// SINGLE-INSTANCE ROUTING (S12) for a PLAIN window launch — Explorer, the Start
-/// menu, a pinned tile, `aterm --window` with nothing else asked of it.
-/// `Break(code)` when the running instance served it; `Continue` to go on and
-/// open a window here — carrying the routed request when the policy DECIDED
-/// that (the console image on Windows hands the decision, not the launch, to
-/// the windowed sibling: [`spawn_handoff_argv`]), and `None` when the launch
-/// was not the policy's to route at all.
-///
-/// The eligibility gate is `plain_launch_is_policy_eligible` and it is
-/// deliberately narrow: `-e`, `--headless`, `--diagnose` and an
-/// update successor's inherited argv all carry instructions a forwarded tab
-/// cannot honour, so they fail closed to spawning. See that function for the
-/// case-by-case reasoning. Under the shipped default this spawns without
-/// dialing anything.
+/// Single-instance routing for a plain window launch (Explorer, the Start menu, a pinned tile,
+/// a bare `aterm --window`). `Break(code)`: the running instance served it; `Continue`: open a
+/// window here, carrying the routed request when the policy decided that (the Windows console
+/// image hands the decision to the sibling: [`spawn_handoff_argv`]), `None` when the launch was
+/// not the policy's. The gate, `plain_launch_is_policy_eligible`, is narrow: `-e`, `--headless`,
+/// `--diagnose` and an update successor's argv carry instructions a forwarded tab cannot
+/// honour, so they spawn. Under the shipped default this dials nothing.
 fn plain_launch_policy(
     argv: &[OsString],
 ) -> ControlFlow<ExitCode, Option<aterm_cli::WindowRequest>> {
@@ -1550,42 +1376,27 @@ fn plain_launch_policy(
 }
 
 // ---------------------------------------------------------------------------
-// THE WINDOWING VERBS AND THE ROUTING POLICY (S12 / design §5)
+// The windowing verbs and the routing policy
 // ---------------------------------------------------------------------------
 
-/// `aterm new-tab | new-window | split-pane [-H|-V] [-d <dir>]` — the wt-shaped
-/// front door.
+/// `aterm new-tab | new-window | split-pane [-H|-V] [-d <dir>]`, the wt-shaped front door. The
+/// grammar and the routing rule are pure and live in `aterm-cli`
+/// ([`aterm_cli::parse_window_request`], [`aterm_cli::route_launch`]); this is the impure half:
+/// resolving a directory, asking whether an instance is reachable, and performing the route.
 ///
-/// The grammar and the routing rule are both PURE and live in `aterm-cli`
-/// ([`aterm_cli::parse_window_request`] / [`aterm_cli::route_launch`]); this
-/// function is only the impure half — resolving a directory against the real
-/// filesystem, asking whether an instance is reachable, and performing whichever
-/// of the two routes came back.
+/// Under the windowed image on Windows (`aterm-gui.exe new-window` from the jump list) stderr
+/// is the parent's console, reattached by `attach_parent_console` (with the parent's redirected
+/// handles) before any route runs. This route writes only to that `stderr` and returns an
+/// `ExitCode` rather than calling `process::exit`, so `main`'s teardown runs. Exit codes:
+///   * `0`: the tab/window/pane was opened (forwarded or spawned).
+///   * `1`: the running instance answered `ERR`, or took the request and did not answer in time.
+///   * `2`: a grammar error (unknown option, missing `<dir>`, bad directory).
 ///
-/// EXIT CODES, which matter more here than they look. Under the WINDOWED image
-/// on Windows (`aterm-gui.exe new-window` from the jump list) the console this
-/// prints to is the parent's, reattached by `attach_parent_console` before ANY
-/// route runs — including this one. That reattachment deliberately restores
-/// the parent's own redirected handles (the `aterm --version > out.txt`
-/// invariant `build.ps1` depends on), and nothing here disturbs it: this route
-/// only ever writes to the already-resolved `stderr`, and it returns an
-/// `ExitCode` rather than calling `process::exit`, so `main`'s normal teardown
-/// still runs. Under the console image the shell simply waits for these codes.
-///   * `0` — the tab/window/pane was opened (forwarded or spawned).
-///   * `1` — the running instance answered `ERR`, or took the request and did
-///     not answer in time; the line is on stderr.
-///   * `2` — a grammar error (unknown option, missing `<dir>`, bad directory).
-///
-/// `host` is where a SPAWNED window runs (see [`WindowHost`]): the console image
-/// hands it to the windowed sibling — as `new-window`, the decision this
-/// function just made ([`spawn_handoff_argv`]) — and the windowed image runs it
-/// here.
+/// `host` is where a spawned window runs ([`WindowHost`]): the console image hands it to the
+/// windowed sibling as `new-window` ([`spawn_handoff_argv`]); the windowed image runs it here.
 fn window_verb(verb: &str, args: &[OsString], host: WindowHost) -> ExitCode {
-    // `-h`/`--help` on a verb answers with that verb's own synopsis rather than
-    // the "unknown option" the strict grammar would otherwise produce. Every
-    // other front-door verb forwards `--help` to the tool it dispatches to and
-    // gets help; these dispatch to no tool, so the front door owns the answer.
-    // First position only, exactly like the sibling verbs' pre-verb flags.
+    // `-h`/`--help` in first position answers with the verb's synopsis rather than the strict
+    // grammar's "unknown option": these verbs dispatch to no tool that could answer it.
     if args
         .first()
         .is_some_and(|a| matches!(a.to_string_lossy().as_ref(), "-h" | "--help"))
@@ -1609,10 +1420,8 @@ fn window_verb(verb: &str, args: &[OsString], host: WindowHost) -> ExitCode {
         ControlFlow::Break(code) => return code,
         ControlFlow::Continue(why) => why,
     };
-    // The SPAWN route. A brand-new window is a single pane, so a `split-pane` that
-    // lands here has nothing to split. Say why rather than open a window that
-    // silently is not what was asked for — `wt split-pane` under `useNew` has
-    // exactly this outcome, and quietly is the wrong way to have it.
+    // The spawn route. A new window is a single pane, so a `split-pane` here has nothing to
+    // split: say why rather than silently open a window.
     if request.intent == aterm_cli::LaunchIntent::SplitPane
         && let Some(line) = split_pane_spawn_line(why)
     {
@@ -1648,30 +1457,20 @@ fn split_pane_spawn_line(why: SpawnHere) -> Option<&'static str> {
     }
 }
 
-/// Decide the route for `request` and, when it is `Forward`, perform it.
+/// Decide the route for `request` and, when it is `Forward`, perform it. `Break(code)`: the
+/// running instance answered (exit with that code); `Continue(why)`: start a window here. The
+/// impure inputs (the policy, whether an instance answered) are gathered here for the pure
+/// [`aterm_cli::route_launch`].
 ///
-/// Returns `Break(code)` when the request was answered by the running instance
-/// (the process should exit with that code) and `Continue(why)` when the caller
-/// should go on to start a window itself. The two impure inputs — the effective policy
-/// and whether an instance answered — are gathered here and handed to the pure
-/// [`aterm_cli::route_launch`], so the decision itself stays testable.
-///
-/// The reachability probe and the forward are two separate dials, so an instance
-/// can die in between, or pass the probe's connect while taking no connection
-/// (an undrained listen queue, where a forward holding a token sends nothing).
-/// Both resolve to `Continue` (spawn), not an error: the operator asked for a
-/// terminal and a transport failure is not a reason to refuse one. A request delivered and then
-/// unanswered is not that race: the instance may still open it, so it is
-/// reported (exit 1), never spawned. An `ERR` reply is the opposite case — the
-/// instance IS there and REFUSED — and is reported as a failure, because
-/// spawning a window then would contradict the policy the operator chose AND
-/// could double-open if the refusal was partial.
+/// The probe and the forward are separate dials, so an instance can die in between, or pass
+/// the probe's connect while taking no connection; both spawn, since a transport failure is no
+/// reason to refuse a terminal. A request delivered and then unanswered may still open there,
+/// so it is reported (exit 1), never spawned. An `ERR` reply is a refusal, reported as a
+/// failure: spawning then would contradict the chosen policy and could double-open.
 fn route_and_maybe_forward(request: &aterm_cli::WindowRequest) -> ControlFlow<ExitCode, SpawnHere> {
     let behavior = effective_windowing_behavior();
-    // The probe is skipped entirely under `new_window`: it costs a connect
-    // attempt on the front door of every launch, and its answer cannot change
-    // the route. `route_launch` is still consulted with `false`, so the table in
-    // its tests remains the single description of the rule.
+    // No probe under `new_window`: it costs a connect on every launch and cannot change the
+    // route. `route_launch` is still consulted, so its table stays the one statement of the rule.
     let should_probe = behavior == aterm_cli::WindowingBehavior::Attach;
     let sock = if should_probe {
         aterm_ctl::front_door_instance()
@@ -1695,8 +1494,7 @@ fn route_and_maybe_forward(request: &aterm_cli::WindowRequest) -> ControlFlow<Ex
         }
     };
     match aterm_ctl::front_door_send(&sock, &line) {
-        // `spawn` replies `OK <sid>`. The sid is deliberately NOT printed: `wt
-        // new-tab` prints nothing, and a shell prompt is not a log.
+        // `spawn` replies `OK <sid>`; the sid is not printed (`wt new-tab` prints nothing).
         Ok(reply) if reply.starts_with("OK") => ControlFlow::Break(ExitCode::SUCCESS),
         Ok(reply) => {
             eprintln!(
@@ -1749,11 +1547,10 @@ fn forward_error_line(who: &str, delivered: bool, error: &str, noun: &str) -> St
     }
 }
 
-/// The line for a `spawn` that `who` answered with `ERR`. The two refusals a
-/// person can act on are translated (`auth`: another user's or instance's
-/// socket, bare or as the connect phase words it, `auth; the server refused
-/// the token in …`; the spawn grammar: a running aterm of another version that
-/// does not parse this request); any other reason is printed after `refused`.
+/// The line for a `spawn` that `who` answered with `ERR`. The two refusals a person can act on
+/// are translated: `auth` (another user's or instance's socket, bare or as the connect phase
+/// words it) and the spawn grammar (a running aterm of another version); any other reason is
+/// printed after `refused`.
 fn spawn_refusal_line(who: &str, refused: &str, reply: &str) -> String {
     let reason = reply.strip_prefix("ERR ").unwrap_or(reply);
     if reason == "auth" || reason.starts_with("auth;") {
@@ -1771,9 +1568,9 @@ fn spawn_refusal_line(who: &str, refused: &str, reply: &str) -> String {
     }
 }
 
-/// The effective `windowing_behavior`: the `aterm.toml` key, else the default. An
-/// unrecognized spelling warns ONCE and falls back — silently treating a typo as
-/// `attach` would move where every terminal on the machine opens.
+/// The effective `windowing_behavior`: the `aterm.toml` key, else the default. An unrecognized
+/// spelling warns once and falls back: treating a typo as `attach` would move where every
+/// terminal on the machine opens.
 fn effective_windowing_behavior() -> aterm_cli::WindowingBehavior {
     let raw = aterm_gui::windowing_behavior_setting();
     match raw.as_deref() {
@@ -1791,20 +1588,11 @@ fn effective_windowing_behavior() -> aterm_cli::WindowingBehavior {
     }
 }
 
-/// Resolve one `-d <dir>` operand to the ABSOLUTE native path a forwarded
-/// request must carry.
-///
-/// Absolute because the request may be served by a process whose working
-/// directory is elsewhere entirely — a relative `-d src` forwarded verbatim
-/// would open the running instance's `src`, not the caller's. `std::path::
-/// absolute` rather than `canonicalize`: on Windows the latter returns the
-/// `\\?\C:\…` extended-length form, which is a legal path but an ugly one to
-/// hand a shell as its cwd (and one some shells' own prompt logic mishandles),
-/// and it resolves symlinks the operator may have deliberately used.
-///
-/// The directory is checked HERE, before anything is dialed, so `aterm new-tab
-/// -d nope` fails the same way under both policies with the same wording the
-/// window library's own `-d` uses.
+/// Resolve one `-d <dir>` operand to the absolute native path a forwarded request carries: the
+/// serving process's cwd is elsewhere. `std::path::absolute`, not `canonicalize`, which on
+/// Windows returns the `\\?\C:\…` extended-length form (a poor shell cwd) and resolves
+/// symlinks the operator may have used deliberately. Checked before anything is dialed, so
+/// `aterm new-tab -d nope` fails the same way under both policies, in the window's wording.
 fn resolve_dir_absolute(raw: &str) -> Result<String, String> {
     let path = std::path::Path::new(raw);
     let absolute = std::path::absolute(path).map_err(|e| format!("cannot resolve {raw}: {e}"))?;
@@ -1814,18 +1602,10 @@ fn resolve_dir_absolute(raw: &str) -> Result<String, String> {
     Ok(absolute.to_string_lossy().into_owned())
 }
 
-/// The `-d <dir>` of a PLAIN window launch, resolved to an absolute path.
-///
-/// The scan itself is `aterm_cli::plain_launch_dir_operand`, which shares its
-/// flag set with the eligibility gate — the two must never disagree about what a
-/// directory flag looks like, and that set is deliberately only the spellings the
-/// WINDOW's own parser accepts (see `PLAIN_LAUNCH_DIR_FLAGS`). This function adds
-/// the impure half: resolving the value against the real filesystem.
-///
-/// `Err` means the operand cannot be resolved — the caller then declines to
-/// route by policy and lets the ordinary spawn path report it, so there is
-/// exactly ONE "not a directory" message and it is the window library's, which
-/// is where `-d` has always been validated.
+/// The `-d <dir>` of a plain window launch, resolved to an absolute path. The scan
+/// (`aterm_cli::plain_launch_dir_operand`) shares its flag set, the window parser's spellings,
+/// with the eligibility gate. `Err`: unresolvable, so the caller declines to route by policy
+/// and the ordinary spawn path prints the window library's one "not a directory" message.
 fn plain_launch_dir(scan: &[OsString]) -> Result<Option<String>, ()> {
     match aterm_cli::plain_launch_dir_operand(scan) {
         Some(value) => resolve_dir_absolute(&value).map(Some).map_err(|_| ()),
@@ -1833,20 +1613,18 @@ fn plain_launch_dir(scan: &[OsString]) -> Result<Option<String>, ()> {
     }
 }
 
-/// `aterm update [status|check] [-v]` — the headless update lane, served in-process
-/// from the shared ledger (`status`) and the one-shot checker (`check`): no control
-/// socket, no window. `aterm ctl update status` remains the machine surface against a
-/// RUNNING window; this verb serves terminal-only machines and scripts. On macOS apply
-/// is deliberately absent: applying re-execs a process and rides the window entry's
-/// trial/rollback confirmation. Linux replaces only the on-disk executable, so there
-/// `enable`, `apply`, `rollback` and the installers' `install` are verbs here; and
-/// `identity` prints the running binary's compiled identity on every platform.
+/// `aterm update [status|check] [-v]`: the headless update lane, served in-process from the
+/// shared ledger (`status`) and the one-shot checker (`check`), with no control socket or
+/// window; `aterm ctl update status` is the machine surface against a running window. macOS
+/// has no apply here: applying re-execs a process and rides the window's trial/rollback
+/// confirmation. Linux replaces only the on-disk executable, so `enable`, `apply`, `rollback`
+/// and the installers' `install` are verbs here. `identity` prints the binary's compiled
+/// identity on every platform.
 ///
-/// It says ONE plain line ([`update_summary`]) — `aterm 0.91.0 is up to date · checked
-/// 12 min ago` — and, when something is wrong, one more on stderr saying where the rest
-/// is (a `check` at a terminal first says it is checking, on stderr). `-v` adds the
-/// ledger's own detail ([`print_update_detail`]). `check` exits nonzero when the copy
-/// cannot update or its checks are failing; `status` when there is no ledger to read.
+/// It says one plain line ([`update_summary`]) and, when something is wrong, one on stderr
+/// saying where the rest is; `-v` adds the ledger's detail ([`print_update_detail`]). `check`
+/// exits nonzero when the copy cannot update or its checks fail; with no ledger, `check` always
+/// and `status` where that is a fault ([`no_ledger_fails`]).
 fn update_verb(rest: &[OsString]) -> ExitCode {
     // The updater logs through `aterm_log`. Its records go to aterm.log with the
     // window's and the session's, never to this terminal; what went wrong reaches the
@@ -1872,10 +1650,9 @@ fn update_verb(rest: &[OsString]) -> ExitCode {
         };
     }
     if matches!(first.as_deref(), Some("--help" | "-h" | "help")) && rest.len() == 1 {
-        // The verbs THIS binary answers: the Linux delivery's `enable | apply |
-        // rollback` exist only there (a Mac refuses them), and `install` is the
-        // installer's own step (tools/install.sh), never typed — as is `enable
-        // --proof-dir`, whose signed release files only an installer holds.
+        // `enable | apply | rollback` exist only on Linux; `install` and `enable --proof-dir`
+        // are the installer's own steps (tools/install.sh, which holds the signed release
+        // files), never typed.
         println!("{UPDATE_USAGE}");
         #[cfg(target_os = "linux")]
         println!(
@@ -1943,17 +1720,13 @@ fn update_verb(rest: &[OsString]) -> ExitCode {
     let checking = sub.as_deref() == Some("check");
     let st = match sub.as_deref().unwrap_or("status") {
         "status" => aterm_update::status(build),
-        // Windows has no updater at all yet (design §7, W8 open): there is nothing to
-        // check, and `check_now` is only the unsupported-platform stub, whose sentence
-        // names no way to update. Answer as `status` does — the line that names the
-        // lane that DOES update a Windows copy.
+        // Windows has no updater (`check_now` is the unsupported-platform stub): answer as
+        // `status` does, with the line naming the lane that updates a Windows copy.
         "check" if cfg!(windows) => None,
         "check" => {
-            // A check can download a whole release: say it is working, to a person only
-            // — and only on a copy that checks (an installed aterm.app, an enrolled Linux
-            // copy). A dev, disk-image or quarantined copy answers at once with its
-            // refusal, and a Linux install waiting for its first window skips the check;
-            // announcing a check there is a line about work that never starts.
+            // A check can download a whole release: say it is working, to a person only, and
+            // only on a copy that checks. A dev, disk-image or quarantined copy refuses at once,
+            // and a Linux install waiting for its first start skips the check.
             if std::io::IsTerminal::is_terminal(&std::io::stderr())
                 && aterm_update::status(build).is_some_and(|st| {
                     st.enabled && st.installable && !linux_install_waits_for_a_start(&st)
@@ -1971,15 +1744,18 @@ fn update_verb(rest: &[OsString]) -> ExitCode {
         }
     };
     // `None` off macOS and Linux (no updater), or on a Mac when the ledger under
-    // `~/Library/Application Support/aterm/Updates` cannot be reached: `HOME` unset, or
-    // the directory not private (`ensure_private_dir`). One cause per line, never a
-    // hedge between them.
+    // `~/Library/Application Support/aterm/Updates` cannot be reached (`HOME` unset, or the
+    // directory not private). One cause per line.
     let Some(st) = st else {
         println!(
             "{}",
             update_unreadable_line(aterm_types::version::app_version())
         );
-        return ExitCode::FAILURE;
+        return if no_ledger_fails(checking) {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        };
     };
     let now = aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX));
     let lane = aterm_update::apply_lane_report(build);
@@ -2013,6 +1789,18 @@ fn update_verb(rest: &[OsString]) -> ExitCode {
     }
 }
 
+/// Whether `aterm update` ends in FAILURE when there is no ledger to read.
+///
+/// On a Mac no ledger is a fault (`HOME` unset, or the updates directory not private), and
+/// [`update_unreadable_line`] names it. Off macOS and Linux there is no updater, so no ledger
+/// is the platform's state: `status` saying so (on Windows, with the lane that updates a copy)
+/// is the report doing its job and exits 0, as `aterm help update` documents a nonzero exit
+/// only for a `check` on a copy that cannot update. A Windows `status` exited 1 on 0.95.0
+/// (measured 2026-09-27; 0.90.0 had exited 0). Linux always has a ledger.
+fn no_ledger_fails(checking: bool) -> bool {
+    checking || cfg!(target_os = "macos")
+}
+
 /// The verbs every platform's `aterm update` answers; the Linux-only ones are
 /// listed under it by `--help` on Linux alone.
 const UPDATE_USAGE: &str = "usage: aterm update [status|check] [-v] | identity";
@@ -2036,35 +1824,36 @@ fn update_unknown_line(word: &str, is_package: impl FnOnce(&str) -> bool) -> Str
     format!("aterm update: unknown sub-command {word:?} ({UPDATE_USAGE})")
 }
 
-/// What `aterm update` knows of THIS copy's dev mark (`ship dev-app`,
+/// What `aterm update` knows of this copy's dev mark (`ship dev-app`,
 /// `aterm_update::running_is_dev_marked`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum DevCopy {
     /// Not dev-marked: the updater's own ledger speaks for it.
     No,
-    /// Dev-marked, so the updater leaves it alone. `lag` is where it stands against
-    /// the public channel when the channel was read — ONE read-only HEAD of the
-    /// evergreen appcast (`aterm_update::dev_channel`) — and `None` when it was not
-    /// (automatic checks off on `status`, or the channel unreachable, which says
-    /// nothing). `shared_writes`: what it writes of the shared user state only the
-    /// release writes unattended, and what puts it back
-    /// (`aterm_gui::dev_build_shared_writes` — a dev build whose bundle is named
-    /// `aterm.app` runs those writers), `None` for one that does not. Read whether or
-    /// not the channel was: it is this copy's own fact.
+    /// Dev-marked, so the updater leaves it alone. `lag`: its standing against the public
+    /// channel when that was read (one read-only HEAD of the evergreen appcast,
+    /// `aterm_update::dev_channel`), else `None`. `shared_writes`: what a dev bundle named
+    /// `aterm.app` writes of the state only the release writes unattended, and what puts it back
+    /// (`aterm_gui::dev_build_shared_writes`); read whether or not the channel was.
     Marked {
         lag: Option<aterm_update::dev_channel::DevLag>,
         shared_writes: Option<aterm_gui::DevSharedWrites>,
     },
-    /// Not dev-marked, and running from where the updater never replaces a copy:
-    /// the disk image, a translocated download, or a plain binary
-    /// (`aterm_update::which_copy::running_posture`) — the one cause, said.
+    /// Not dev-marked, and running from where the updater never replaces a copy: the disk
+    /// image, a translocated download, or a plain binary (`which_copy::running_posture`).
+    #[cfg_attr(
+        not(target_os = "macos"),
+        expect(
+            dead_code,
+            reason = "which_copy::running_posture, its one constructor, is macOS-only"
+        )
+    )]
     Inert(aterm_update::which_copy::InstallPosture),
 }
 
 impl DevCopy {
-    /// THIS copy, read now: the dev mark and, for a dev build, its standing — asked of
-    /// the channel on a typed `check`, and on `status` only while automatic checks are
-    /// on (the one switch that keeps aterm off the network by itself).
+    /// This copy, read now: the dev mark and, for a dev build, its standing, asked of the
+    /// channel on a typed `check` and on `status` only while automatic checks are on.
     fn of_this_copy(asked_check: bool) -> Self {
         if !aterm_update::running_is_dev_marked() {
             #[cfg(target_os = "macos")]
@@ -2087,9 +1876,8 @@ impl DevCopy {
     }
 }
 
-/// What a dev build named `aterm.app` does to the release beside it — what it writes and
-/// the release's verbs that put it back (`aterm_gui::dev_build_shared_writes`) — said on
-/// this stderr line of `aterm update`, as the window's row says it when it starts.
+/// What a dev build named `aterm.app` writes of the release's state and the release verbs that
+/// put it back (`aterm_gui::dev_build_shared_writes`), for `aterm update`'s stderr line.
 fn dev_shared_writes_line(writes: aterm_gui::DevSharedWrites) -> String {
     let aterm_gui::DevSharedWrites { what, repair } = writes;
     format!(
@@ -2099,12 +1887,10 @@ fn dev_shared_writes_line(writes: aterm_gui::DevSharedWrites) -> String {
     )
 }
 
-/// What `aterm update` says when there is no ledger to read: off macOS and Linux
-/// that is the platform; on a Mac it is `HOME` unset or the updates directory
-/// failing `ensure_private_dir` — not a private one of the user's, or the system's
-/// own error (a full disk, a read-only volume) — as `ledger_unreadable_cause` names.
-/// On Windows (no updater yet, so `check` lands here too) the line names the lane
-/// that does update a Windows copy.
+/// What `aterm update` says when there is no ledger to read: off macOS and Linux that is the
+/// platform (on Windows the line names the lane that updates a Windows copy); on a Mac it is
+/// `HOME` unset or the updates directory failing `ensure_private_dir`, as
+/// `ledger_unreadable_cause` names.
 fn update_unreadable_line(version: &str) -> String {
     #[cfg(target_os = "macos")]
     {
@@ -2147,25 +1933,22 @@ fn update_log_hint_for(log: Option<&std::path::Path>, home: Option<&std::path::P
     format!("Details are in Settings \u{25b8} Messages, and in {shown}.")
 }
 
-/// How many times the window failed to install the STAGED build: the apply lane's count
-/// for the build it last tried, and only when that build is `staged` — the escalation
-/// streak (`UpdateStatus::failing_applies`) carries a superseded build's tries onto a fresh
-/// download nothing has tried yet. `aterm pkg doctor` reads health.toml by the same rule.
+/// How many times the window failed to install the staged build: the apply lane's count for the
+/// build it last tried, only when that is `staged` (the escalation streak,
+/// `UpdateStatus::failing_applies`, carries a superseded build's tries onto a fresh download).
+/// `aterm pkg doctor` reads health.toml by the same rule.
 fn staged_tries(staged: u64, lane: Option<&aterm_update::ApplyLaneReport>) -> u32 {
     lane.filter(|lane| staged > 0 && lane.last_failure_target_build == staged)
         .map_or(0, |lane| lane.failures_for_target)
 }
 
-/// What `aterm update status|check` says: ONE plain line for stdout, and — when
-/// something is wrong — one for stderr. The version a person knows (the build number
-/// is `--version`'s and About's); what is on offer and when it installs; when the last
-/// check completed, relative. The updater's own decision sentence, the lane and the
-/// counters stay in `aterm ctl update status`, `-v` and the log.
-/// `installs_by_itself` is `[update] auto_apply`, `automatic_checks` `[update] enabled`,
-/// `dev` whether the running bundle carries the dev mark (`ship dev-app`) and, for a
-/// dev build, where it stands against the public channel ([`DevCopy`]). `lane` is the
-/// apply lane's record, which counts the installs of the staged build ([`staged_tries`]).
-/// Pure for the test.
+/// What `aterm update status|check` says: one plain line for stdout and, when something is
+/// wrong, one for stderr. The line is the version a person knows (the build number is
+/// `--version`'s and About's), what is on offer and when it installs, and when the last check
+/// completed; the decision sentence, the lane and the counters stay in
+/// `aterm ctl update status`, `-v` and the log. `installs_by_itself` is `[update] auto_apply`,
+/// `automatic_checks` `[update] enabled`, `dev` the running copy's dev mark and standing
+/// ([`DevCopy`]), `lane` the apply lane's record ([`staged_tries`]). Pure for the test.
 #[allow(
     clippy::too_many_arguments,
     reason = "each argument is one gathered fact; passing them in is what keeps the line pure"
@@ -2182,10 +1965,9 @@ fn update_summary(
     log_hint: &str,
 ) -> (String, Option<String>) {
     if !st.enabled {
-        // Only a Linux copy reaches here (macOS always has an updater; elsewhere there
-        // is no ledger at all): not enrolled, or enrollment never finished — per copy,
-        // since each executable keeps its own record. The ledger's sentence names the
-        // remedy (`aterm update enable`) or why this copy's path can't be updated.
+        // Only a Linux copy reaches here: not enrolled, or enrollment never finished (each
+        // executable keeps its own record). The ledger's sentence names the remedy (`aterm
+        // update enable`) or why this copy's path can't be updated.
         let remedy = st.outcome.trim();
         return (
             format!("This copy of aterm {version} doesn\u{2019}t update itself"),
@@ -2210,11 +1992,9 @@ fn update_summary(
             None,
         );
     }
-    // A replaced Linux executable is final once aterm starts from it — a window or a
-    // terminal session; until then a check reads no channel, so "up to date" would be a
-    // claim nothing tested.
-    // The executable ON DISK is named, not this process: a check that just installed
-    // a release still runs as the build it replaced.
+    // A replaced Linux executable is final once aterm starts from it (a window or a terminal
+    // session); until then a check reads no channel. The executable on disk is named, not this
+    // process: a check that just installed a release still runs as the build it replaced.
     if let Some(native) = st
         .linux
         .as_ref()
@@ -2236,13 +2016,10 @@ fn update_summary(
         );
     }
     if !st.installable {
-        // The checker deliberately does nothing here, which otherwise reads as idleness.
-        // A dev-marked bundle (`ship dev-app`, in /Applications or not) is left
-        // alone on purpose and has nowhere to move: say that, not "move it" — and, when
-        // the channel was read, how far behind it. A disk-image launch and a translocated
-        // download get their own remedy; a `target/` binary has none to get. Never
-        // "only aterm.app in Applications updates": any bundle outside a disk image
-        // does.
+        // The checker does nothing here, which otherwise reads as idleness. A dev-marked
+        // bundle is left alone on purpose and has nowhere to move, so it is told that (and its
+        // standing, when the channel was read), not "move it". A disk-image launch and a
+        // translocated download get their own remedy; a `target/` binary has none.
         use aterm_update::which_copy::InstallPosture;
         let line = match dev {
             DevCopy::Marked { lag, shared_writes } => {
@@ -2368,9 +2145,8 @@ fn update_summary(
     }
     let checked = aterm_update_core::pkg_check::rfc3339_to_unix(&st.updated_at);
     let mut line = if st.linux.as_ref().is_some_and(|native| native.refused_newer) {
-        // A Linux copy that rolled a newer build back runs an older one on purpose;
-        // `-v`'s decision line names the build. "Up to date" would hide it. It still
-        // checks, and installs any release newer than the refused one: say when.
+        // A Linux copy that rolled a newer build back runs an older one on purpose, which "up
+        // to date" would hide (`-v` names the build). It still checks: say when.
         let refused = format!(
             "aterm {version} \u{b7} a newer release was rolled back on this copy and won\u{2019}t \
              install again"
@@ -2394,8 +2170,8 @@ fn update_summary(
     (line, None)
 }
 
-/// A failing check CLASS (the updater's health-ledger names) in a person's words;
-/// `None` for a class that names no cause (Linux records every failure as one class).
+/// A failing check class (the updater's health-ledger names) in a person's words; `None` for a
+/// class that names no cause (Linux records every failure as one class).
 fn check_trouble_words(kind: &str) -> Option<&'static str> {
     match kind {
         "network" => Some("the update server can\u{2019}t be reached"),
@@ -2518,14 +2294,10 @@ fn print_update_detail(
     }
 }
 
-/// Whether the managed store resolves `tool` — the IN-PROCESS `atpkg::which`
-/// against the same `store::resolve_configured()` layout `pkg which` uses — one
-/// `readlink(2)`, no subprocess, on the front door of every `aterm <operand>`.
-/// Best-effort: an unset HOME (no layout) or an unresolvable shim both mean "not a tool".
-///
-/// A live build whose own-name shim is LOST resolves too
-/// (`atpkg::cli::live_without_shim`), so `pkg run` execs it and names the repair; for a
-/// word that is no tool that costs one more `stat`.
+/// Whether the managed store resolves `tool`: in-process `atpkg::which` against `pkg which`'s
+/// layout, one `readlink(2)` and no subprocess, on every `aterm <operand>`. A live build whose
+/// own-name shim is lost resolves too (`atpkg::cli::live_without_shim`), so `pkg run` execs it
+/// and names the repair. Best-effort: no layout or no shim means "not a tool".
 fn store_resolves(tool: &str) -> bool {
     atpkg::store::resolve_configured().is_some_and(|layout| {
         atpkg::which(&layout, tool).is_some()
@@ -2533,16 +2305,14 @@ fn store_resolves(tool: &str) -> bool {
     })
 }
 
-/// Whether the managed store holds a PENDING stub for `tool` — the front door's
-/// second arm, checked only after [`store_resolves`] says no (a real shim always
-/// outranks a stub). Same configured layout, same best-effort posture; the check is
-/// one bounded read of `bin/<tool>` gated on the stub's marker line.
+/// Whether the managed store holds a pending stub for `tool`, checked only after
+/// [`store_resolves`] says no (a real shim outranks a stub): one bounded read of `bin/<tool>`.
 fn pending_stub_resolves(tool: &str) -> bool {
     atpkg::store::resolve_configured()
         .is_some_and(|layout| atpkg::stub::pending_stub_exists(&layout, tool))
 }
 
-/// The mode fork's rule, pure: the WINDOW when a flag asks for it (`--window`,
+/// The mode fork's rule, pure: the window when a flag asks for it (`--window`,
 /// `--headless`, `--diagnose`) or when stdin is no terminal (a Finder/.app launch),
 /// unless the session is forced. `scan` is argv before the payload boundary.
 fn is_windowish(scan: &[OsString], force_session: bool, stdin_tty: bool) -> bool {
@@ -2560,12 +2330,9 @@ fn stdin_is_terminal() -> bool {
     std::io::stdin().is_terminal()
 }
 
-/// The first-position verbs `--completions` offers — built FROM the tables the
-/// routing above actually consults (`help` is `aterm_cli::parse_args`'s leading
-/// operand, [`aterm_cli::Verb::ALL`] is the roster the exhaustive verb match
-/// dispatches, and [`aterm_cli::DIAG_COMMANDS`] is the mode-free diagnostic
-/// set), never a hand-maintained copy — so the completion cannot advertise a
-/// verb this build does not route, or miss one it does.
+/// The first-position verbs `--completions` offers, built from the tables the routing consults
+/// (`help`, [`aterm_cli::Verb::ALL`], [`aterm_cli::DIAG_COMMANDS`]), so completion cannot drift
+/// from dispatch.
 fn front_door_verbs() -> Vec<&'static str> {
     let mut verbs = vec!["help"];
     for verb in aterm_cli::Verb::ALL {
@@ -2577,8 +2344,8 @@ fn front_door_verbs() -> Vec<&'static str> {
     verbs
 }
 
-/// What `aterm theme` reads from the window library: its one theme report,
-/// its catalog lookup and its dark/light classifier (the catalog lives there).
+/// What `aterm theme` reads from the window library, which holds the theme catalog: the
+/// listing, the catalog lookup and the dark/light classifier.
 struct WindowThemes;
 
 impl aterm_cli::ThemeHost for WindowThemes {
@@ -2597,22 +2364,23 @@ impl aterm_cli::ThemeHost for WindowThemes {
     fn measure(&self, background: aterm_types::Rgb) -> aterm_types::Appearance {
         aterm_gui::theme_measured_appearance(background)
     }
+
+    fn font_available(&self, family: &str) -> Option<bool> {
+        Some(aterm_gui::theme_font_available(family))
+    }
 }
 
-/// The user-typed front-door flags `--completions` offers, with the zsh/fish
-/// descriptions. The set is the flags the routing above and `aterm-cli`'s
-/// parser recognize BEFORE the mode fork; `--completions` itself stays out,
-/// like the sibling `aterm-ctl` flag it mirrors (hidden generator flags do not
-/// complete themselves). Per-flag operand completion (the `--containment`
-/// mode) is deliberately out of scope — completing the name is the bulk of
-/// the value, the ctl scripts' own stated line.
+/// The user-typed front-door flags `--completions` offers, with the zsh/fish descriptions: the
+/// flags the routing above and `aterm-cli`'s parser recognize before the mode fork.
+/// `--completions` itself stays out, like the `aterm-ctl` flag it mirrors; operand completion
+/// (the `--containment` mode) is out of scope.
 const COMPLETION_FLAGS: &[(&str, &str)] = &[
     ("--window", "open the GPU window explicitly"),
     ("--session", "force the transparent shell session"),
     ("--headless", "engine + control socket, no window"),
     (
         "--containment",
-        "containment mode (master|user|safety|containment)",
+        "containment mode (user|safety|containment)",
     ),
     ("--sandbox", "shorthand for --containment containment"),
     ("--no-sandbox", "shorthand for --containment user"),
@@ -2625,43 +2393,16 @@ const COMPLETION_FLAGS: &[(&str, &str)] = &[
     ("--version", "print the version and exit"),
 ];
 
-/// Compiler-provenance probe (`rustc -vV` parser + r/t flavor classifier). The
-/// production copy is `include!`d by `build.rs` (which stamps the env values
-/// [`BUILD_STAMP`] reads); this test-only mount runs the same code against real
-/// `-vV` fixtures.
+/// Compiler-provenance probe: `build.rs` `include!`s it to stamp [`BUILD_STAMP`]'s values; this
+/// test-only mount runs the same code against real `-vV` fixtures.
 #[cfg(test)]
 mod compiler_probe;
 
 #[cfg(test)]
 mod tests {
-    /// The compiler facts `build.rs` stamped are in the classifier's domain: only
-    /// 'r'/'t' can be stamped, verification is on or off, and the `-vV` first line
-    /// leads with `rustc` (the ecosystem contract) or a future `trustc` banner and
-    /// carries a release token.
-    #[test]
-    fn the_build_stamp_is_well_formed() {
-        let stamp = super::BUILD_STAMP;
-        assert!(
-            stamp.compiler_flavor == "r" || stamp.compiler_flavor == "t",
-            "stamped flavor must be r|t: {}",
-            stamp.compiler_flavor
-        );
-        assert!(stamp.trust_verify == "on" || stamp.trust_verify == "off");
-        let line = stamp.compiler_version_line;
-        assert!(
-            line.starts_with("rustc ") || line.starts_with("trustc "),
-            "unexpected -vV first line: {line}"
-        );
-        assert!(
-            line.split_whitespace().nth(1).is_some(),
-            "a release token follows the compiler name: {line}"
-        );
-    }
 
-    /// Round-seven update audit #11: a window started as `aterm --window` from a
-    /// shell keeps that shell's terminal on stdin, and its update successor is routed
-    /// by this same fork. Forwarded only the stripped argv, the successor had no
-    /// `--window` and became a terminal SESSION; the window lanes now pin one.
+    /// A window started as `aterm --window` from a shell keeps that shell's terminal on stdin,
+    /// and this fork routes its update successor, so the successor's argv keeps `--window`.
     #[test]
     fn an_update_successor_of_a_shell_started_window_is_still_a_window() {
         let osv = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
@@ -2676,17 +2417,15 @@ mod tests {
                 "{argv:?} -> {successor:?} must route to the window with a TTY on stdin"
             );
         }
-        // The stripped list alone is what the lanes used to hand over.
+        // The stripped argv alone would make a session.
         assert!(!is_windowish(
             &aterm_update::reexec_forwarded_args(osv(&["--window"]).into_iter()),
             false,
             true
         ));
-        // Round eight, #6: a verb-started window's successor. A RUNNING window's
-        // (the GUI's cold and seamless lanes) is a plain window — no bare word ever
-        // reaches the window parser, whose exit 2 it was; the boot swap's re-exec of
-        // the launch is the verb itself, which the verb dispatch routes above the
-        // mode fork.
+        // A running window's successor (the GUI's cold and seamless lanes) is a plain window,
+        // so no bare verb reaches the window parser; the boot swap re-execs the verb itself,
+        // which the verb dispatch routes above the mode fork.
         for argv in [
             osv(&["new-window"]),
             osv(&["new-window", "-d", "/tmp"]),
@@ -2712,7 +2451,7 @@ mod tests {
                 "{argv:?} -> {boot:?}: the boot swap's re-exec is routed as the verb"
             );
         }
-        // The rest of the rule is unchanged.
+        // The rest of the rule.
         assert!(is_windowish(&osv(&[]), false, false), "no TTY: the window");
         assert!(!is_windowish(&osv(&[]), false, true), "a TTY: the session");
         assert!(
@@ -2723,11 +2462,29 @@ mod tests {
 
     use super::*;
 
-    /// A synthetic asciicast of the incident, as `cast` prints one: an alt-screen
-    /// frame with the cursor above a non-blank footer, an 8 -> 7 -> 8 flap with a
-    /// mode set between the halves, then a diff the app sent without repainting.
-    /// The mode set is what keeps it a desync: a flap with NO output between is
-    /// undone by the engine (the grid's resize undo), so it replays clean.
+    /// Windows has no updater, so `aterm update status` and `check` land on this line: the
+    /// state, then the one lane that updates a Windows copy (the words `aterm help update`
+    /// prints), never an app bundle.
+    #[cfg(windows)]
+    #[test]
+    fn windows_update_line_names_the_lane_that_updates_it() {
+        let line = update_unreadable_line("0.94.0");
+        assert_eq!(
+            line,
+            format!(
+                "aterm 0.94.0 doesn\u{2019}t update itself on Windows yet \u{2014} to update \
+                 it, in your aterm checkout run {}",
+                aterm_cli::WINDOWS_UPDATE_LANE
+            )
+        );
+        assert!(!line.contains("aterm.app"), "{line}");
+        assert!(!line.contains("macOS"), "{line}");
+    }
+
+    /// A synthetic asciicast, as `cast` prints one: an alt-screen frame with the cursor above a
+    /// non-blank footer, an 8 -> 7 -> 8 flap with a mode set between the halves, then a diff sent
+    /// without a repaint. The mode set keeps it a desync: the engine undoes a flap with no output
+    /// between.
     fn flapped_cast() -> String {
         let mut frame = String::from("\\u001b[?1049h\\u001b[2J");
         for r in 0..8 {
@@ -2744,9 +2501,8 @@ mod tests {
         )
     }
 
-    /// `aterm ctl cast drift` computed by the client — what the one binary does
-    /// for a server that predates the verb, and offline: the SAME analysis the
-    /// server runs, parsed from the asciicast text, with `computed=client`.
+    /// `aterm ctl cast drift` computed by the client (an older server, or offline): the server's
+    /// analysis, with `computed=client`.
     #[test]
     fn ctl_cast_drift_computes_the_report_client_side() {
         let cast = flapped_cast();
@@ -2818,14 +2574,10 @@ mod tests {
         assert!(broken.contains("line 1"), "{broken}");
     }
 
-    /// THE PEER THE FALLBACK SERVES: an aterm older than
-    /// `cast drift` is older than the resize undo too, so its quiet flap (the
-    /// halves 0.7 ms apart, nothing between) shifted its screen one row up and
-    /// appended a blank row. This engine's own replay undoes that flap and
-    /// cannot reproduce the screen; the client's replay of such a peer drops
-    /// the undo and names the flap (`undo=off`). A saved recording held
-    /// against the same screen picks that replay because only it reproduces
-    /// the screen; held against this engine's own screen it keeps the undo.
+    /// An aterm older than `cast drift` is older than the resize undo too, so its quiet flap
+    /// shifted its screen up a row. The client's replay of such a peer drops the undo and names
+    /// the flap (`undo=off`); a saved recording picks the replay that reproduces the screen it is
+    /// held against.
     #[test]
     fn a_quiet_flap_on_an_aterm_before_the_undo_is_named_client_side() {
         let mut frame = String::from("\\u001b[?1049h\\u001b[2J");
@@ -2913,497 +2665,36 @@ mod tests {
         }
     }
 
-    /// A `split-pane` that opens a new window says the reason that is TRUE for the route
-    /// it took: under `new_window` nothing was probed, so it names the setting, never "no
-    /// running aterm"; under `attach` with no answer it says there is none; after a failed
-    /// forward it adds nothing, since the forward already said "opening a new window".
+    /// With no ledger, `check` fails everywhere (it could not do its job), and `status` only
+    /// where no ledger is a fault, on a Mac; elsewhere the report is the answer and exits 0.
     #[test]
-    fn split_pane_says_why_it_opens_a_window_once() {
-        let policy = split_pane_spawn_line(SpawnHere::Policy).expect("says the setting");
+    fn a_missing_ledger_fails_check_everywhere_and_status_only_on_a_mac() {
         assert!(
-            policy.contains("windowing_behavior is new_window"),
-            "{policy}"
+            no_ledger_fails(true),
+            "check cannot do its job without a ledger"
         );
-        assert!(policy.contains("\"attach\""), "{policy}");
-        assert!(!policy.contains("no running aterm"), "{policy}");
-        assert_eq!(
-            split_pane_spawn_line(SpawnHere::NoInstance),
-            Some("aterm: no running aterm to split; opening a new window")
-        );
-        assert_eq!(split_pane_spawn_line(SpawnHere::Unreachable), None);
+        assert_eq!(no_ledger_fails(false), cfg!(target_os = "macos"));
     }
 
-    /// A refused forward names the next step for the two refusals a person can
-    /// act on, and drops the wire's `ERR ` for any other.
+    /// `aterm update status|check` claims "up to date" only over a completed
+    /// check: never before the first one, never while a Linux install waits for
+    /// its first start, never after a newer build was rolled back. And an EARLIER
+    /// build's failed installs are not this download's.
     #[test]
-    fn a_refused_forward_says_what_to_do() {
-        let auth = spawn_refusal_line("the running aterm", "refused", "ERR auth");
-        assert!(auth.contains("authentication"), "{auth}");
-        assert!(auth.contains("`aterm new-window`"), "{auth}");
-        assert_eq!(
-            spawn_refusal_line(
-                "the running aterm",
-                "refused",
-                "ERR auth; the server refused the token in /d/aterm-1.token; re-run"
-            ),
-            auth,
-            "the connect phase's wording of the same refusal"
-        );
-        let old = spawn_refusal_line(
-            "this aterm window",
-            "refused a new tab",
-            "ERR usage: spawn [window=<id>] [raise=<t|f>]",
-        );
-        assert!(old.starts_with("aterm: this aterm window is a different aterm version"));
-        assert!(!old.contains("usage:"), "{old}");
-        assert_eq!(
-            spawn_refusal_line(
-                "this aterm window",
-                "refused a new tab",
-                "ERR main thread stalled 12s; retry"
-            ),
-            "aterm: this aterm window refused a new tab: main thread stalled 12s; retry"
-        );
-    }
-
-    /// A forward the running aterm took and did not answer opens nothing here;
-    /// one whose dial failed opens a window and says so, without OS text.
-    #[test]
-    fn an_unanswered_forward_never_opens_a_second_window() {
-        assert_eq!(
-            forward_error_line(
-                "the running aterm",
-                true,
-                "did not answer within 10s",
-                "pane"
-            ),
-            "aterm: the running aterm did not answer within 10s; the pane may still open there"
-        );
-        assert_eq!(
-            forward_error_line(
-                "the running aterm",
-                false,
-                "Connection refused (os error 61)",
-                "tab"
-            ),
-            "aterm: the running aterm is not answering; opening a new window"
-        );
-    }
-
-    /// `aterm update <word>` it does not take: a package word names `aterm pkg update`,
-    /// a Linux-only verb says so on a Mac, and anything else gets the usage line once.
-    #[test]
-    fn update_unknown_line_names_the_next_step() {
-        assert_eq!(
-            update_unknown_line("claude", |w| w == "claude"),
-            "aterm update: claude is a package \u{2014} run aterm pkg update claude"
-        );
-        assert_eq!(
-            update_unknown_line("bogus", |_| false),
-            format!("aterm update: unknown sub-command \"bogus\" ({UPDATE_USAGE})")
-        );
-        #[cfg(target_os = "macos")]
-        assert_eq!(
-            update_unknown_line("apply", |_| panic!("no store lookup for a Linux verb")),
-            "aterm update: apply is Linux-only \u{2014} on a Mac a downloaded update installs \
-             from Settings \u{25b8} Software Update"
-        );
-        #[cfg(not(target_os = "linux"))]
-        assert_eq!(
-            update_unknown_line("rollback", |_| false),
-            "aterm update: rollback is Linux-only"
-        );
-    }
-
-    /// Windows has no updater, so `aterm update status` AND `check` land on this line.
-    /// It says the state, then the one
-    /// lane that updates a Windows copy — the same words `aterm help update` prints —
-    /// and never an app bundle Windows does not have.
-    #[cfg(windows)]
-    #[test]
-    fn windows_update_line_names_the_lane_that_updates_it() {
-        let line = update_unreadable_line("0.94.0");
-        assert_eq!(
-            line,
-            format!(
-                "aterm 0.94.0 doesn\u{2019}t update itself on Windows yet \u{2014} to update \
-                 it, in your aterm checkout run {}",
-                aterm_cli::WINDOWS_UPDATE_LANE
-            )
-        );
-        assert!(!line.contains("aterm.app"), "{line}");
-        assert!(!line.contains("macOS"), "{line}");
-    }
-
-    const TEST_LOG_HINT: &str =
-        "Details are in Settings \u{25b8} Messages, and in ~/Library/Logs/aterm/aterm.log.";
-
-    /// The log hint names the file this process writes, `~`-shortened under the home
-    /// directory, and only Messages when no log directory resolves.
-    #[test]
-    fn update_log_hint_names_the_resolved_log() {
-        use std::path::Path;
-        let home = Path::new("/home/u");
-        assert_eq!(
-            update_log_hint_for(
-                Some(Path::new("/xdg/state/aterm/logs/aterm.log")),
-                Some(home)
-            ),
-            "Details are in Settings \u{25b8} Messages, and in /xdg/state/aterm/logs/aterm.log."
-        );
-        assert_eq!(
-            update_log_hint_for(
-                Some(Path::new("/home/u/.local/state/aterm/logs/aterm.log")),
-                Some(home)
-            ),
-            "Details are in Settings \u{25b8} Messages, and in ~/.local/state/aterm/logs/aterm.log."
-        );
-        assert_eq!(
-            update_log_hint_for(None, Some(home)),
-            "Details are in Settings \u{25b8} Messages."
-        );
-    }
-
-    /// `aterm update status|check` SAYS ONE PLAIN LINE: the version a person knows and
-    /// what is true, relative — never the updater's decision sentence or a build number.
-    /// Trouble adds one stderr line saying where the rest is.
-    #[test]
-    fn the_update_verb_says_one_plain_line() {
+    fn the_update_line_claims_up_to_date_only_over_a_completed_check() {
         let checked =
             aterm_update_core::pkg_check::rfc3339_to_unix("2026-09-23T12:00:00Z").unwrap();
         let now = checked + 12 * 60;
-        let say = |st: &aterm_update::UpdateStatus, auto_apply: bool, automatic: bool| {
-            update_summary(
-                "0.91.0",
-                100,
-                st,
-                None,
-                now,
-                auto_apply,
-                automatic,
-                &DevCopy::No,
-                TEST_LOG_HINT,
-            )
+        let say = |st: &aterm_update::UpdateStatus,
+                   lane: Option<&aterm_update::ApplyLaneReport>| {
+            update_summary("0.91.0", 100, st, lane, now, true, true, &DevCopy::No, "").0
         };
-        let healthy = update_status();
-        assert_eq!(
-            say(&healthy, true, true),
-            (
-                "aterm 0.91.0 is up to date \u{b7} checked 12 min ago".to_string(),
-                None
-            )
-        );
-        let (line, _) = say(&healthy, true, false);
-        assert!(
-            line.ends_with("automatic checks are off (Settings \u{25b8} Software Update)"),
-            "{line}"
-        );
-
-        let mut staged = update_status();
-        staged.staged_build = Some(101);
-        staged.staged_version = Some("0.92.0".into());
-        assert_eq!(
-            say(&staged, true, true).0,
-            "aterm 0.92.0 is downloaded and installs within a minute while an aterm window \
-             is open"
-        );
-        assert!(
-            say(&staged, false, true)
-                .0
-                .contains("Settings \u{25b8} Software Update")
-        );
-        // The installs of THIS build failed: the apply lane's count for it, as
-        // `aterm pkg doctor` reads it.
-        let tried = |target: u64, failures: u32| aterm_update::ApplyLaneReport {
-            last_failure_target_build: target,
-            failures_for_target: failures,
-            ..Default::default()
-        };
-        let say_tried = |st: &aterm_update::UpdateStatus, lane: &aterm_update::ApplyLaneReport| {
-            update_summary(
-                "0.91.0",
-                100,
-                st,
-                Some(lane),
-                now,
-                true,
-                true,
-                &DevCopy::No,
-                TEST_LOG_HINT,
-            )
-        };
-        let (line, trouble) = say_tried(&staged, &tried(101, 2));
-        assert_eq!(
-            line,
-            "aterm 0.92.0 is downloaded but didn\u{2019}t install (2 tries)"
-        );
-        assert!(trouble.is_some_and(|t| t.contains("Settings \u{25b8} Messages")));
-        assert!(say_tried(&staged, &tried(101, 1)).0.ends_with("(1 try)"));
-        // An EARLIER build's failed installs are not this download's, whatever the
-        // escalation streak says: it is still promised.
-        staged.failing_applies = 3;
-        for lane in [tried(99, 3), tried(0, 0)] {
-            assert_eq!(
-                say_tried(&staged, &lane).0,
-                "aterm 0.92.0 is downloaded and installs within a minute while an aterm \
-                 window is open"
-            );
-        }
-        assert!(
-            say(&staged, true, true)
-                .0
-                .contains("installs within a minute")
-        );
-
-        let mut failing = update_status();
-        failing.failing_checks = 1;
-        failing.failing_checks_kind = "network".into();
-        failing.outcome = "update check deferred: curl exit 6 (attempt 1)".into();
-        let (line, trouble) = say(&failing, true, true);
-        assert_eq!(
-            line,
-            "aterm 0.91.0 \u{b7} the last check didn\u{2019}t finish: the update server \
-             can\u{2019}t be reached; aterm will try again"
-        );
-        assert!(trouble.is_some_and(|t| t.contains("aterm.log")));
-
-        // A persistent streak: in words, and the one a person must act on says so.
-        failing.failing_persistent = true;
-        failing.failing_checks = 3;
-        let (line, trouble) = say(&failing, true, true);
-        assert_eq!(
-            line,
-            "aterm 0.91.0 \u{b7} update checks keep failing: the update server can\u{2019}t \
-             be reached; aterm keeps trying"
-        );
-        assert!(trouble.is_some_and(|t| t.contains("Settings \u{25b8} Messages")));
-        let mut stale = failing.clone();
-        stale.failing_checks_kind = "manifest".into();
-        stale.outcome = "FAILING (3 consecutive checks since 2026-09-23T10:00:00Z): this \
-                         build's trust anchor cannot verify the channel's releases \u{2014} \
-                         reinstall aterm from the current release"
-            .into();
-        let (line, trouble) = say(&stale, true, true);
-        assert_eq!(line, "aterm 0.91.0 is too old to check for updates");
-        assert!(trouble.is_some_and(|t| t.starts_with("Reinstall aterm")));
-        failing.failing_persistent = false;
-        failing.failing_checks = 1;
-
-        for (line, _) in [say(&healthy, true, true), say(&failing, true, true)] {
-            for jargon in ["lane", "rung", "token", "build 100", "curl"] {
-                assert!(!line.contains(jargon), "{jargon}: {line}");
-            }
-        }
-        // Never checked: not "up to date", which no check has established.
+        let up_to_date = |line: &str| line.contains("is up to date");
+        assert!(up_to_date(&say(&update_status(), None)));
         let mut never = update_status();
         never.updated_at = String::new();
-        assert_eq!(
-            say(&never, true, true).0,
-            "aterm 0.91.0 hasn\u{2019}t checked for updates yet"
-        );
-        assert_eq!(
-            say(&never, true, false).0,
-            "aterm 0.91.0 hasn\u{2019}t checked for updates yet \u{b7} automatic checks are \
-             off (Settings \u{25b8} Software Update)"
-        );
+        assert!(!up_to_date(&say(&never, None)), "never checked");
 
-        // A copy the updater does not replace: a dev-marked bundle is left alone on
-        // purpose and is told so (it may well sit in /Applications — "move it" would be
-        // wrong); a disk-image or translocated launch gets its own remedy, a `target/`
-        // binary none — and none of them hears "only aterm.app in Applications
-        // updates", which is false of a bundle on the Desktop.
-        use aterm_update::which_copy::InstallPosture;
-        let mut inert = update_status();
-        inert.installable = false;
-        assert_eq!(
-            say(&inert, true, true).0,
-            "This copy of aterm 0.91.0 can\u{2019}t update itself"
-        );
-        let posture = |p: InstallPosture| {
-            update_summary(
-                "0.91.0",
-                100,
-                &inert,
-                None,
-                now,
-                true,
-                true,
-                &DevCopy::Inert(p),
-                TEST_LOG_HINT,
-            )
-        };
-        for (p, line) in [
-            (
-                InstallPosture::MountedImage,
-                "aterm 0.91.0 is running from a mounted volume \u{2014} drag aterm to \
-                 Applications and open it from there",
-            ),
-            (
-                InstallPosture::Translocated,
-                "aterm 0.91.0 is running from a temporary read-only copy \u{2014} move aterm \
-                 into Applications and open it again",
-            ),
-            (
-                InstallPosture::NotABundle,
-                "aterm 0.91.0 is a plain binary, not an app bundle \u{2014} it never updates \
-                 itself",
-            ),
-        ] {
-            assert_eq!(posture(p), (line.to_string(), None), "{p:?}");
-        }
-        let unread = DevCopy::Marked {
-            lag: None,
-            shared_writes: None,
-        };
-        let (dev, trouble) = update_summary(
-            "0.91.0",
-            100,
-            &inert,
-            None,
-            now,
-            true,
-            true,
-            &unread,
-            TEST_LOG_HINT,
-        );
-        assert_eq!(
-            dev,
-            "This copy of aterm 0.91.0 is a dev build \u{2014} the updater leaves it alone"
-        );
-        assert!(trouble.is_none());
-        assert!(!dev.contains("Applications"));
-        // …and, where the channel was read (gap #30), how far behind the newest release
-        // it is — or that it is at it, or newer: the words are the dev channel's own.
-        let at = |lag: aterm_update::dev_channel::DevLag,
-                  shared_writes: Option<aterm_gui::DevSharedWrites>| {
-            update_summary(
-                "0.91.0",
-                100,
-                &inert,
-                None,
-                now,
-                true,
-                true,
-                &DevCopy::Marked {
-                    lag: Some(lag),
-                    shared_writes,
-                },
-                TEST_LOG_HINT,
-            )
-        };
-        use aterm_update::dev_channel::DevLag;
-        let behind = DevLag::Behind {
-            latest: "v0.93.0".into(),
-            releases: Some(2),
-        };
-        assert_eq!(
-            at(behind.clone(), None),
-            (
-                "This copy of aterm 0.91.0 is a dev build, 2 releases behind aterm v0.93.0 \
-                 \u{2014} the updater leaves it alone"
-                    .to_string(),
-                None
-            )
-        );
-        assert_eq!(
-            at(
-                DevLag::Current {
-                    latest: "v0.91.0".into()
-                },
-                None
-            )
-            .0,
-            "This copy of aterm 0.91.0 is a dev build, at aterm v0.91.0, the newest release \
-             \u{2014} the updater leaves it alone"
-        );
-        assert_eq!(
-            at(
-                DevLag::Ahead {
-                    latest: "v0.90.0".into()
-                },
-                None
-            )
-            .0,
-            "This copy of aterm 0.91.0 is a dev build, newer than aterm v0.90.0, the newest \
-             release \u{2014} the updater leaves it alone"
-        );
-        // A dev build named aterm.app runs the release's unattended writers: stderr says
-        // what it writes and what puts it back — for the primer `aterm agents install`,
-        // since `aterm pkg repair` never touches it.
-        let primer = aterm_gui::DevSharedWrites {
-            what: "the agent primer",
-            repair: "`aterm agents install`",
-        };
-        let (line, trouble) = at(behind, Some(primer));
-        assert!(line.contains("2 releases behind"), "{line}");
-        let trouble = trouble.expect("what it writes is said");
-        assert!(
-            trouble.starts_with("This dev build writes the agent primer, which only the release"),
-            "{trouble}"
-        );
-        assert!(
-            trouble.ends_with("then run `aterm agents install` from the release."),
-            "{trouble}"
-        );
-        // …and says it where the channel was NOT read (checks off, offline) too: the
-        // writes are this copy's own fact.
-        let (line, trouble) = update_summary(
-            "0.91.0",
-            100,
-            &inert,
-            None,
-            now,
-            true,
-            false,
-            &DevCopy::Marked {
-                lag: None,
-                shared_writes: Some(primer),
-            },
-            TEST_LOG_HINT,
-        );
-        assert_eq!(
-            line,
-            "This copy of aterm 0.91.0 is a dev build \u{2014} the updater leaves it alone"
-        );
-        assert!(
-            trouble.is_some_and(|t| t.starts_with("This dev build writes the agent primer")),
-            "the writes are said with no standing"
-        );
-        // A copy that is not dev-marked is never told a standing, whatever it is.
-        assert_eq!(
-            update_summary(
-                "0.91.0",
-                100,
-                &inert,
-                None,
-                now,
-                true,
-                true,
-                &DevCopy::No,
-                TEST_LOG_HINT
-            )
-            .0,
-            say(&inert, true, true).0
-        );
-
-        // LINUX: a copy that is not
-        // enrolled says so plainly and hands on the ledger's remedy, and a staged
-        // Linux build names the verb that installs it — never "only on macOS".
-        let mut unenrolled = update_status();
-        unenrolled.enabled = false;
-        unenrolled.outcome = "Run `aterm update enable` to turn on updates for this copy".into();
-        let (line, trouble) = say(&unenrolled, true, true);
-        assert_eq!(
-            line,
-            "This copy of aterm 0.91.0 doesn\u{2019}t update itself"
-        );
-        assert!(trouble.is_some_and(|t| t.contains("aterm update enable")));
-        // A replaced executable waits for its first start — a window or a terminal
-        // session — and its checks with it: never "up to date" over a check that read
-        // no channel, and never a request for a window a copy used only from the
-        // terminal will not open. The line names the build ON DISK: the check that just
-        // installed 0.92.0 runs as 0.91.0, and "aterm 0.91.0 is installed" would read
-        // as nothing new installed.
         let mut waiting = update_status();
         waiting.linux = Some(aterm_update::LinuxUpdateStatus {
             installed_build: 101,
@@ -3415,367 +2706,37 @@ mod tests {
             trial_starts: 0,
             trial_healthy: false,
             refused_newer: false,
+            refused_unstarted: false,
+            kept_unproven: false,
         });
-        assert_eq!(
-            say(&waiting, true, true),
-            (
-                "aterm 0.92.0 is installed \u{2014} the next aterm you start finishes it; \
-                 update checks wait until then"
-                    .to_string(),
-                None
-            )
-        );
-        // -v: nothing about the budget right after the install, then how much is used —
-        // never more than the budget, though a burst of starts counts past it.
-        assert_eq!(trial_launches_words(0), "");
-        assert_eq!(
-            trial_launches_words(1),
-            " (1 of 3 launches used before it rolls back)"
-        );
-        assert_eq!(
-            trial_launches_words(5),
-            " (3 of 3 launches used before it rolls back)"
-        );
+        assert!(!up_to_date(&say(&waiting, None)), "an unfinished install");
         waiting.linux.as_mut().expect("linux").trial_healthy = true;
-        assert!(say(&waiting, true, true).0.contains("is up to date"));
-        // A copy that rolled a newer build back runs an older one on purpose: never
-        // "up to date" over a ledger whose `-v` line says the newer one was refused.
-        let mut refused = waiting.clone();
-        let native = refused.linux.as_mut().expect("linux");
+        assert!(up_to_date(&say(&waiting, None)), "a confirmed install");
+        let native = waiting.linux.as_mut().expect("linux");
         native.trial_phase = None;
         native.refused_newer = true;
-        // It still checks (a release newer than the refused one installs): say when.
-        assert_eq!(
-            say(&refused, true, true),
-            (
-                "aterm 0.91.0 \u{b7} a newer release was rolled back on this copy and \
-                 won\u{2019}t install again \u{b7} checked 12 min ago"
-                    .to_string(),
-                None
-            )
+        assert!(
+            !up_to_date(&say(&waiting, None)),
+            "a rolled-back newer build"
         );
-        assert!(say(&refused, true, false).0.ends_with(
-            "won\u{2019}t install again \u{b7} checked 12 min ago \u{b7} automatic checks \
-                 are off (Settings \u{25b8} Software Update)"
-        ));
-        // No completed check on record: the rolled-back fact alone, no time.
-        refused.updated_at = String::new();
-        assert_eq!(
-            say(&refused, true, true).0,
-            "aterm 0.91.0 \u{b7} a newer release was rolled back on this copy and \
-             won\u{2019}t install again"
-        );
-        // A Linux failure carries one class that names no cause: no tautology after it.
-        let mut linux_failing = update_status();
-        linux_failing.failing_checks = 1;
-        linux_failing.failing_checks_kind = "linux-update".into();
-        assert_eq!(
-            say(&linux_failing, true, true).0,
-            "aterm 0.91.0 \u{b7} the last check didn\u{2019}t finish; aterm will try again"
-        );
-        linux_failing.failing_persistent = true;
-        assert_eq!(
-            say(&linux_failing, true, true).0,
-            "aterm 0.91.0 \u{b7} update checks keep failing; aterm keeps trying"
-        );
-        let mut native = update_status();
-        native.linux = Some(aterm_update::LinuxUpdateStatus {
-            installed_build: 100,
-            installed_version: "0.91.0".into(),
-            staged_build: Some(101),
-            staged_version: Some("0.92.0".into()),
-            staged_commit: None,
-            trial_phase: None,
-            trial_starts: 0,
-            trial_healthy: false,
-            refused_newer: false,
-        });
-        assert_eq!(
-            say(&native, true, true),
-            (
-                "aterm 0.92.0 is downloaded \u{2014} `aterm update apply` installs it".to_string(),
-                None
-            )
-        );
-    }
 
-    /// THE HOST SETTINGS RUN FROM AN INTERACTIVE SESSION LAUNCH — once a day, on their own
-    /// stamp — not only when a package pass happens to be due.
-    ///
-    /// The `[machine]` settings are not the package manager's to gate: they take no
-    /// store lock, need no index and no network, and a Mac with `[packages] enabled =
-    /// false`, or a pass that ran an hour ago, would never get them. The gate is the
-    /// daily claim ([`atpkg::machine::launch_apply_due`]). A scrape, because the
-    /// alternative is spawning a real detached child in a unit test.
-    #[test]
-    fn the_session_lane_applies_the_machine_settings_outside_every_package_gate() {
-        let src = include_str!("main.rs");
-        let call = src
-            .find("spawn_detached_machine_apply();")
-            .expect("the session lane applies the [machine] settings");
-        let gate = src
-            .find("if let Some(layout) = layout.as_ref()\n        && packages.enabled()")
-            .expect("the package-pass gate");
-        assert!(
-            call < gate,
-            "the host settings must not sit inside the package manager's gate"
-        );
-        let daily = src[..call]
-            .rfind("&& atpkg::machine::launch_apply_due(layout, now)")
-            .expect("the one-shot is gated on its daily claim");
-        assert!(
-            !src[daily..call].contains("packages.enabled()"),
-            "the daily claim is the only gate between it and the call"
-        );
-        // NOT UNDER A PRIVATE STATE ROOT (ruling 409): the claim's answer goes through
-        // `runs`, which logs the skip's one line; the skip precedes the claim inside atpkg
-        // (`launch_apply_decision`, pinned there), which reads the seam itself.
-        assert!(
-            src[daily..call].contains(".runs(|why| aterm_log::info!(\"{why}\"))"),
-            "the claim's answer logs a private root's skip: {}",
-            &src[daily..call]
-        );
-        // ONE claim in the whole router, and it is that one (ruling 410): a second lane
-        // claiming the day's slot would have to be pinned here too.
-        let production = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
-        assert_eq!(
-            production.matches("launch_apply_due(").count(),
-            1,
-            "one claim, through the gated answer"
-        );
-        // And the argv is the lock-free verb, not a pass.
-        let spawner = src
-            .find("fn spawn_detached_machine_apply()")
-            .expect("the spawner");
-        let body = &src[spawner..spawner + 600];
-        assert!(
-            body.contains(r#"["pkg", "machine", "apply"]"#),
-            "the lane runs `aterm pkg machine apply`: {body}"
-        );
-    }
-
-    /// THE SESSION LANE STARTS THE VENDOR HEAD WATCH (gap #28) behind the pass's own two
-    /// gates — `[packages] enabled` and an interactive launch, so a harness driving a
-    /// session over pipes never reaches a vendor — and runs its passes as this binary's
-    /// `pkg` verb. The watch itself (the seat, the window's precedence, the detached pass)
-    /// is atpkg's and tested there; this pins only that the session starts it. A scrape,
-    /// in this module's idiom: the alternative is a real session reaching the network.
-    #[test]
-    fn the_session_lane_starts_the_head_watch_behind_the_pass_gates() {
-        let src = include_str!("main.rs");
-        let call = src
-            .find("start_session_head_watch(layout, packages);")
-            .expect("the session lane starts the head watch");
-        let gate = src[..call]
-            .rfind("if let Some(layout) = layout.as_ref()")
-            .expect("its gate");
-        let guard = &src[gate..call];
-        assert!(guard.contains("&& packages.enabled()"), "{guard}");
-        assert!(
-            guard.contains("&& session_lane_is_interactive()"),
-            "{guard}"
-        );
-        assert!(
-            src[call..].contains("session_lane(quiet)"),
-            "started before the session takes the process"
-        );
-        let body = &src[src
-            .find("fn start_session_head_watch(")
-            .expect("the starter")..];
-        let body = &body[..body.find("\n}\n").expect("its end")];
-        assert!(
-            body.contains(r#"vec![std::ffi::OsString::from("pkg")]"#),
-            "{body}"
-        );
-        assert!(
-            body.contains("atpkg::vendor_direct::watch::run_host("),
-            "{body}"
-        );
-    }
-
-    /// THE LINUX SESSION LANE COUNTS AND CONFIRMS ITS OWN START: a copy used only from
-    /// the terminal installs updates from this lane's checker, and an unconfirmed
-    /// install would stop its updates for good. The counting and confirming live in `aterm-update`
-    /// (its Linux tests drive `session_started_in` and `confirm_session_in`); this pins
-    /// the wiring nothing else would notice leaving: the start is counted BEFORE the
-    /// checker starts, inside the interactive gate, and it is confirmed through the
-    /// SESSION lane's confirmation — the window's would let a terminal vouch for a
-    /// window that crashes. A scrape, in this module's idiom: the lane is Linux-only and
-    /// this box runs macOS.
-    ///
-    /// FAILS WITHOUT THE WIRING: delete `start_linux_session_trial(build);` or confirm
-    /// through `confirm_boot_health_exact` and one of the asserts below names it.
-    #[test]
-    fn the_linux_session_lane_counts_and_confirms_before_its_checker_starts() {
-        let src = include_str!("main.rs");
-        let gate = src
-            .find("if session_lane_is_interactive() {\n        let build")
-            .expect("the session lane's interactive update gate");
-        let count = src[gate..]
-            .find("start_linux_session_trial(build);")
-            .map(|at| gate + at)
-            .expect("the session lane counts its start");
-        let checker = src[gate..]
-            .find("aterm_update::spawn_background_check_with_settings(")
-            .map(|at| gate + at)
-            .expect("the session lane's checker");
-        assert!(
-            count < checker,
-            "the start is counted before the checker can install anything"
-        );
-        let body = &src[src
-            .find("fn start_linux_session_trial(")
-            .expect("the session trial")..];
-        let body = &body[..body.find("\n}\n").expect("its end")];
-        assert!(
-            body.contains("aterm_update::linux_session_started(build, &commit)"),
-            "{body}"
-        );
-        assert!(
-            body.contains("aterm_update::confirm_linux_session(build, &commit)"),
-            "the session confirms the SESSION lane: {body}"
-        );
-        assert!(
-            !body.contains("confirm_boot_health_exact"),
-            "a window's confirmation would let a session vouch for a window: {body}"
-        );
-        assert!(
-            body.contains("aterm_cli::on_first_shell_output("),
-            "it confirms at the shell's first output: {body}"
-        );
-    }
-
-    /// A SILENT SESSION PROVES NOTHING (U45): a confirmed lane stops counting session
-    /// starts, so a timer would keep a build whose session hangs before its shell
-    /// speaks. Its one proof is the shell's first output
-    /// ([`super::park_until_the_shell_spoke`]), with no timer: a shell prints its prompt
-    /// in milliseconds, and even a shell stuck in its rc file echoes a typed key. A
-    /// scrape, in this module's idiom (the lane is Linux-only).
-    ///
-    /// The one timer is the silent start's DEFERRAL
-    /// ([`super::defer_the_verdict_while_silent`]), and it confirms nothing: it runs
-    /// before the untimed wait, and its body names no confirmation.
-    ///
-    /// FAILS WITH A TIMER: give the confirmer's wait a deadline again, or let the
-    /// deferral confirm, and an assert below names it.
-    #[test]
-    fn a_session_confirms_only_once_its_shell_spoke() {
-        let src = include_str!("main.rs");
-        let body = &src[src
-            .find("fn start_linux_session_trial(")
-            .expect("the session trial")..];
-        let body = &body[..body.find("\n}\n").expect("its end")];
-        let deferral = body
-            .find("defer_the_verdict_while_silent(&SPOKE, build, &commit);")
-            .expect("a silent start defers the verdict");
-        let wait = body
-            .find("park_until_the_shell_spoke(&SPOKE);")
-            .expect("the confirmer waits for the shell's first output");
-        let confirm = body
-            .find("aterm_update::confirm_linux_session(build, &commit)")
-            .expect("its confirmation");
-        assert!(
-            deferral < wait,
-            "the deferral runs before the untimed wait: {body}"
-        );
-        assert!(wait < confirm, "it confirms after the shell spoke: {body}");
-        let deferral_body = &src[src
-            .find("fn defer_the_verdict_while_silent(")
-            .expect("the deferral")..];
-        let deferral_body = &deferral_body[..deferral_body.find("\n}\n").expect("its end")];
-        assert!(
-            deferral_body
-                .contains("aterm_update::defer_linux_session_verdict(build, commit, |pause|")
-                && deferral_body.contains("!park_until_spoke_or_silent_for(spoke, pause)")
-                && !deferral_body.contains("confirm"),
-            "the deferral moves the stamp and confirms nothing: {deferral_body}"
-        );
-        for timer in [
-            "park_timeout",
-            "HEALTHY_AFTER",
-            "deadline",
-            "Instant::now()",
-        ] {
-            assert!(
-                !body.contains(timer),
-                "a silent session must not confirm on a timer ({timer}): {body}"
-            );
-        }
-    }
-
-    /// The wait itself: a wake that is not the shell's first output — a spurious one,
-    /// or what the old timer was — does not end it; the output does.
-    #[test]
-    fn the_confirmers_wait_ends_at_the_first_output_and_nothing_else() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::time::{Duration, Instant};
-
-        let spoke = Arc::new(AtomicBool::new(false));
-        let waiter = {
-            let spoke = Arc::clone(&spoke);
-            std::thread::spawn(move || super::park_until_the_shell_spoke(&spoke))
+        let mut staged = update_status();
+        staged.staged_build = Some(101);
+        staged.staged_version = Some("0.92.0".into());
+        staged.failing_applies = 3;
+        let tried = |target: u64, failures: u32| aterm_update::ApplyLaneReport {
+            last_failure_target_build: target,
+            failures_for_target: failures,
+            ..Default::default()
         };
-        let quiet = Instant::now() + Duration::from_millis(300);
-        while Instant::now() < quiet {
-            waiter.thread().unpark();
-            std::thread::sleep(Duration::from_millis(10));
+        let failed = |line: &str| line.contains("didn\u{2019}t install");
+        assert!(
+            failed(&say(&staged, Some(&tried(101, 2)))),
+            "this build's failures"
+        );
+        for lane in [tried(99, 3), tried(0, 0)] {
+            assert!(!failed(&say(&staged, Some(&lane))), "{lane:?}");
         }
-        assert!(
-            !waiter.is_finished(),
-            "a wake without output proves nothing"
-        );
-        spoke.store(true, Ordering::Release);
-        waiter.thread().unpark();
-        let hang = Instant::now() + Duration::from_secs(60);
-        while !waiter.is_finished() {
-            assert!(Instant::now() < hang, "the first output ends the wait");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        waiter.join().expect("the waiter");
-    }
-
-    /// The deferral's wait: the shell's first output ends it at once (`true`), and
-    /// silence ends it once its span has passed (`false`) — never a spurious wake.
-    #[test]
-    fn the_deferrals_wait_ends_at_the_first_output_or_its_span() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::time::{Duration, Instant};
-
-        let silent = Arc::new(AtomicBool::new(false));
-        let span = Duration::from_millis(200);
-        let started = Instant::now();
-        let waiter = {
-            let silent = Arc::clone(&silent);
-            std::thread::spawn(move || super::park_until_spoke_or_silent_for(&silent, span))
-        };
-        while !waiter.is_finished() && started.elapsed() < span / 2 {
-            waiter.thread().unpark();
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            !waiter.join().expect("the waiter"),
-            "silence ends it, unspoken"
-        );
-        assert!(
-            started.elapsed() >= span,
-            "a wake without output does not end it early"
-        );
-
-        let spoke = Arc::new(AtomicBool::new(false));
-        let waiter = {
-            let spoke = Arc::clone(&spoke);
-            std::thread::spawn(move || {
-                super::park_until_spoke_or_silent_for(&spoke, Duration::from_secs(60))
-            })
-        };
-        spoke.store(true, Ordering::Release);
-        waiter.thread().unpark();
-        assert!(
-            waiter.join().expect("the waiter"),
-            "the first output ends it"
-        );
     }
 
     /// A scratch store for the lane's due rules.
@@ -3790,12 +2751,10 @@ mod tests {
         atpkg::store::Layout { prefix }
     }
 
-    /// THE SESSION LANE'S DUE RULE: the machine-wide rule — never checked or six
-    /// hours since the last success, and no pass ended anywhere in the last five minutes —
-    /// then the lane's own claim, so the second of two tabs opened together spawns nothing.
-    /// A fresh success, or a sibling's pass that failed a minute ago, is no pass; a vendor
-    /// door's later write (`updated_at` alone) is no pass either. (A record that shows only
-    /// FAILED passes is the next test's.)
+    /// The session lane's due rule: the machine-wide rule (never checked or six hours since the
+    /// last success, and no pass ended in the last five minutes), then the lane's own claim, so
+    /// the second of two tabs opened together spawns nothing. A vendor door's later write
+    /// (`updated_at` alone) is no pass.
     #[test]
     fn the_session_pass_is_due_on_the_machine_rule_and_claimed_once() {
         let layout = scratch_layout("pass");
@@ -3854,9 +2813,8 @@ mod tests {
             session_pass_due(&layout, attempt + walk),
             "the negative control: six hours after it, it is owed again"
         );
-        // The same `updated_at` from a vendor head-watch write, the last pass the success
-        // itself — no failed pass, and no pass a minute ago: the walk is owed at once.
-        // "Written after the last success" is not a failed pass.
+        // The same `updated_at` from a vendor head-watch write, the success as the last pass:
+        // a write after the last success is not a failed pass, so the walk is owed at once.
         std::fs::write(
             layout.status(),
             "schema = 1\nupdated_at = \"2026-09-22T13:30:00Z\"\n\
@@ -3868,12 +2826,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// A PASS THAT KEEPS FAILING IS NOT RESPAWNED BY EVERY TAB: a record whose passes
-    /// never reach the index — a proxy that refuses the download host stamps a failure
-    /// each time — owes nothing for the interval after
-    /// its last failure; the spacing alone would have let a tab opened five minutes on spawn
-    /// another detached pass. And a pass INSTALLING now is not queued behind: no unobserved
-    /// waiter per tab.
+    /// A record whose passes keep failing (a proxy that refuses the download host) owes nothing
+    /// for the interval after its last failure, not just the spacing; a pass installing now is
+    /// not queued behind.
     #[test]
     fn a_failing_or_running_pass_is_not_respawned_by_every_tab() {
         let layout = scratch_layout("failing");
@@ -3921,48 +2876,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&fresh.prefix);
     }
 
-    /// The detached pass runs on the window's argv — the lock wait and the progress file
-    /// under the prefix — so a contended pass queues, and a window follows its progress;
-    /// and nobody typed it, so a busy toolchain's flip waits for quiet (`--defer-busy-flip`).
-    #[test]
-    fn the_detached_pass_runs_on_the_windows_argv() {
-        let layout = atpkg::store::Layout {
-            prefix: std::path::PathBuf::from("/p"),
-        };
-        let words: Vec<String> = session_pass_args(&layout)
-            .into_iter()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        // The progress file is `layout.progress_file()`, a native join: `/p/…` on
-        // Unix and `/p\…` on Windows, so the expected spelling is per host.
-        let progress = if cfg!(windows) {
-            r"/p\progress.json"
-        } else {
-            "/p/progress.json"
-        };
-        assert_eq!(
-            words,
-            [
-                "pkg",
-                "update",
-                "--defer-busy-flip",
-                "--wait-lock",
-                "1800",
-                "--progress-file",
-                progress
-            ]
-        );
-    }
-
-    /// THE DETACHED PASS IS NOT THIS PROCESS'S CHILD. The session lane
-    /// runs `aterm_cli::session_main` in this same process, and its unix driver
-    /// reaps the shell with `waitpid(-1)`: a finished `aterm pkg update` left as
-    /// our zombie could be reaped in the shell's place, and `aterm` then exited
-    /// with the pkg pass's status instead of the shell's. So the pass must be
-    /// re-parented away from us — and still sit in its own process group, so the
-    /// session's SIGHUP cannot take it down mid-install. And it is told it was detached
-    /// on purpose, so its lock wait does not read the `sh` exiting as its
-    /// window going.
+    /// The detached pass is re-parented away from this process (which goes on to run
+    /// `aterm_cli::session_main`) and sits in its own process group, so the session's SIGHUP
+    /// cannot take it down mid-install. It is told it was detached on purpose, so its lock wait
+    /// does not read the `sh` exiting as its window going.
     #[test]
     #[cfg(unix)]
     fn a_detached_pass_is_neither_our_child_nor_in_our_process_group() {
@@ -4026,50 +2943,12 @@ mod tests {
         );
     }
 
-    /// The reroute markers (`__ATERM_REROUTE_PASSTHROUGH`, which `take_no_reroute` sets
-    /// and clears, and `ATERM_AGENTS_DIR`) are process-global and several tests here
-    /// read or set them; they take this lock so a parallel test never sees the other's
-    /// value.
+    /// Serializes the tests that read or set the process-global reroute markers
+    /// (`__ATERM_REROUTE_PASSTHROUGH`, `ATERM_AGENTS_DIR`).
     static NO_REROUTE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// `-d` must reach the running instance as an ABSOLUTE native path: the
-    /// process that serves the request has its own working directory, so a
-    /// relative operand forwarded verbatim would open somewhere else entirely.
-    ///
-    /// The relative leg deliberately uses `.` against the process's real cwd
-    /// (which `cargo test` sets to the crate dir) rather than mutating the
-    /// environment — `set_current_dir` is process-global and this suite runs
-    /// threaded.
-    #[test]
-    fn a_directory_operand_resolves_to_an_absolute_native_path() {
-        let cwd = std::env::current_dir().expect("a working directory");
-        let here = resolve_dir_absolute(".").expect("`.` is a directory");
-        assert_eq!(std::path::Path::new(&here), cwd.as_path());
-        assert!(std::path::Path::new(&here).is_absolute());
-
-        let absolute = resolve_dir_absolute(&cwd.to_string_lossy()).expect("an absolute directory");
-        assert_eq!(std::path::Path::new(&absolute), cwd.as_path());
-
-        // NOT the extended-length `\\?\C:\…` form: that is what `canonicalize`
-        // would hand back, and it is a poor thing to give a shell as its cwd.
-        assert!(!absolute.starts_with(r"\\?\"), "{absolute}");
-    }
-
-    /// A `-d` that is not a directory fails BEFORE any socket is dialed, with
-    /// the same wording the window library's own `-d` uses — one message, one
-    /// meaning, whichever route the launch was going to take.
-    #[test]
-    fn a_directory_operand_that_is_not_a_directory_is_refused() {
-        let not_a_dir = std::path::Path::new(file!()).to_string_lossy().into_owned();
-        let err = resolve_dir_absolute(&not_a_dir).expect_err("a source file is not a directory");
-        assert!(err.starts_with("not a directory:"), "{err}");
-        let missing = resolve_dir_absolute("definitely-not-here-9f3a").expect_err("missing");
-        assert!(missing.starts_with("not a directory:"), "{missing}");
-    }
-
-    /// The plain-launch scan finds `-d` in the spellings the WINDOW parses, and
-    /// reports an unusable one as `Err` so the caller declines to route by
-    /// policy and lets the ordinary window path print the error.
+    /// The plain-launch scan finds `-d` in the window's spellings, and an unusable one is `Err`
+    /// so the ordinary window path prints the error.
     #[test]
     fn a_plain_launch_carries_its_directory_or_declines_to_route() {
         let osv = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
@@ -4092,16 +2971,10 @@ mod tests {
         );
     }
 
-    /// A CHILD COMMAND LINE IS NEVER ROUTED BY POLICY. `spawn` cannot carry one,
-    /// so a forwarded `aterm -e vim` opens an empty tab, exits 0, and drops the
-    /// command without a word.
-    ///
-    /// The trap, executable: the mode fork's own `scan` stops AT the payload
-    /// boundary, so `-e vim` truncates to an EMPTY argument list — the barest,
-    /// most obviously-eligible launch there is. Feeding the gate that slice makes
-    /// its documented `-e` exclusion unreachable, which is why
-    /// `plain_launch_request` takes the WHOLE argv and refuses the boundary
-    /// itself.
+    /// A child command line is never routed by policy: `spawn` cannot carry one, so a forwarded
+    /// `aterm -e vim` would open an empty tab. The mode fork's `scan` stops at the payload
+    /// boundary, so `-e vim` truncates to an empty argv; `plain_launch_request` therefore takes
+    /// the whole argv and refuses the boundary itself.
     #[test]
     fn a_child_command_payload_is_never_routed_by_policy() {
         let _env_lock = NO_REROUTE_ENV_LOCK
@@ -4123,7 +2996,7 @@ mod tests {
                 "{argv:?} carries a payload a forwarded tab cannot run"
             );
         }
-        // The truncated slice IS eligible — that is the whole hazard.
+        // The truncated slice is eligible: the hazard.
         let dash_e = osv(&["-e", "vim"]);
         assert_eq!(payload_boundary(&dash_e), 0);
         assert!(
@@ -4136,12 +3009,9 @@ mod tests {
         assert!(plain_launch_request(&osv(&["--window"]), env).is_some());
     }
 
-    /// THE ALIAS TABLE. The one that matters is the `aterm-gui` row: on the
-    /// shipped Windows install every sibling name is an identical copy of this
-    /// binary, the Start-Menu shortcut targets `aterm-gui.exe`, and the taskbar
-    /// jump list is committed by whichever copy is running — so
-    /// `aterm-gui.exe new-window` is a command line the SHELL issues, from a
-    /// launcher with no console to print an error to. It must route as a verb.
+    /// The `aterm-gui` row matters: the Start-Menu shortcut targets `aterm-gui.exe` and the
+    /// jump list is committed by the running copy, so `aterm-gui.exe new-window` comes from the
+    /// shell, with no console to print an error to. It must route as a verb.
     #[test]
     fn the_gui_alias_routes_the_windowing_verbs_and_nothing_else() {
         for verb in aterm_cli::Verb::ALL {
@@ -4176,8 +3046,7 @@ mod tests {
             alias_route("aterm-askpass", "Password:"),
             AliasRoute::Askpass
         );
-        // A bridge is spawned by name out of `[fabric] command`; before this
-        // arm existed that name opened a window instead of serving.
+        // A bridge is spawned by that name out of `[fabric] command`.
         assert_eq!(alias_route("aterm-link", ""), AliasRoute::Link);
         assert_eq!(alias_route("aterm-link", "serve"), AliasRoute::Link);
         // A renewal's `BROWSER`: the opener, whatever URL it is handed.
@@ -4196,10 +3065,8 @@ mod tests {
         }
     }
 
-    /// `aterm-windowed` — the cargo target name of the WINDOWED image, which a
-    /// dev tree runs under that name before `build.ps1` renames it to
-    /// `aterm-gui.exe` — routes exactly as `aterm-gui` does, verb for verb: the
-    /// jump list committed by a dev-tree window names that image.
+    /// `aterm-windowed`, the windowed image's cargo target name in a dev tree, routes as
+    /// `aterm-gui` does: a dev-tree window's jump list names that image.
     #[test]
     fn the_windowed_target_name_is_the_gui_alias() {
         for verb in aterm_cli::Verb::ALL {
@@ -4221,71 +3088,6 @@ mod tests {
                 "aterm-windowed {operand:?}"
             );
         }
-    }
-
-    /// THE TWO IMAGES ARE ONE BODY (Windows). The PE subsystem is a
-    /// per-file header field, so the console image (this file) must carry NO
-    /// `windows_subsystem` attribute, and the windowed image (`windowed.rs`)
-    /// must carry it and include THIS file — not a copy of it — as its body.
-    /// And every window the front door opens must go through the one call that
-    /// knows which image is running (`run_window`): a second direct
-    /// `aterm_gui::main_entry` call is a window that would run in the console
-    /// process and hold the shell's prompt. A scrape, in the idiom of the
-    /// session-lane tests above.
-    #[test]
-    fn the_windowed_image_is_this_file_plus_the_subsystem_attribute() {
-        let console = include_str!("main.rs");
-        let windowed = include_str!("windowed.rs");
-        let code_lines = |src: &str| -> Vec<String> {
-            src.lines()
-                .map(str::trim_start)
-                .filter(|l| !l.starts_with("//"))
-                .map(str::to_owned)
-                .collect()
-        };
-        assert!(
-            !code_lines(console)
-                .iter()
-                .any(|l| l.starts_with("#![") && l.contains("windows_subsystem")),
-            "the console image must not carry a subsystem attribute"
-        );
-        assert!(
-            code_lines(windowed).iter().any(|l| {
-                l.starts_with("#![cfg_attr(") && l.contains("windows_subsystem = \"windows\"")
-            }),
-            "the windowed image carries the GUI subsystem"
-        );
-        assert!(
-            code_lines(windowed)
-                .iter()
-                .any(|l| l == "#[path = \"main.rs\"]"),
-            "the windowed image shares this file's body"
-        );
-        // ... on Windows only: off Windows the include would make every release
-        // build link the whole front door twice.
-        let windowed_code = code_lines(windowed);
-        let include = windowed_code
-            .iter()
-            .position(|l| l == "#[path = \"main.rs\"]")
-            .expect("the include line, asserted above");
-        assert_eq!(
-            windowed_code
-                .get(include.wrapping_sub(1))
-                .map(String::as_str),
-            Some("#[cfg(all(windows, not(test)))]"),
-            "the front door is included into the windowed image on Windows alone"
-        );
-        // The needle is assembled so THIS line does not count itself (the
-        // first run of the test found 2: the call, and this literal).
-        let entry_call = concat!("aterm_gui::", "main_entry(");
-        assert_eq!(
-            code_lines(console)
-                .iter()
-                .filter(|l| l.contains(entry_call))
-                .count(),
-            1,
-            "every window route goes through `run_window`"
-        );
     }
 
     /// THE HOST TABLE for a window-shaped front-door launch. On Windows the
@@ -4332,12 +3134,9 @@ mod tests {
         }
     }
 
-    /// A window the routing policy decided to SPAWN is handed to the windowed
-    /// sibling as `new-window [-d <dir>]` — the verb the policy never
-    /// redirects — so the sibling, the whole front door under the `aterm-gui`
-    /// alias, cannot route it a second time (a bare `[-d <dir>]` would pass the
-    /// plain-launch gate and open a TAB under `attach`). Every intent, with and
-    /// without a directory.
+    /// A spawned window is handed to the sibling as `new-window [-d <dir>]`, the verb the policy
+    /// never redirects, so the sibling cannot route it again (a bare `[-d <dir>]` would open a
+    /// tab under `attach`).
     #[test]
     fn a_spawn_is_handed_to_the_sibling_as_new_window_never_as_a_plain_launch() {
         for intent in [
@@ -4384,11 +3183,8 @@ mod tests {
         }
     }
 
-    /// THE NESTED-SESSION TABLE: a BARE
-    /// launch typed inside a tab opens a tab; the `aterm-cli` alias, a launch
-    /// carrying anything at all (`--sandbox`, `--containment`, a `-e` payload,
-    /// a typo), a launch outside aterm, and a piped launch each keep the session
-    /// they asked for.
+    /// A bare launch typed inside a tab opens a tab; the `aterm-cli` alias, a launch carrying
+    /// anything, a launch outside aterm and a piped launch keep the session they asked for.
     #[test]
     fn a_bare_launch_inside_a_tab_opens_a_tab_and_anything_else_nests() {
         assert!(nests_inside_aterm(true, false, true, true));
@@ -4410,16 +3206,10 @@ mod tests {
         );
     }
 
-    /// WHICH windowed image the console image hands a window to, against a
-    /// real folder: the shipped name in an install folder, only as a FILE; the
-    /// cargo target name first; and in a build tree (cargo's `.fingerprint`
-    /// beside the exe) never the `aterm-gui.exe` there, which is crate
-    /// aterm-gui's thin dev bin — the window library with none of this front
-    /// door. The rule itself is `aterm_gui`'s, shared with the jump list and
-    /// the Explorer verb. The detach flag it is started with
-    /// (`Console::Detached`: `DETACHED_PROCESS`, never `CREATE_NEW_PROCESS_GROUP`,
-    /// which would start the window — and every shell under it — with Ctrl+C off)
-    /// is pinned by `aterm_uds::spawn`'s table test, where the value lives.
+    /// Which windowed image the console image hands a window to, against a real folder: the
+    /// shipped name in an install folder, only as a file; in a build tree (cargo's `.fingerprint`
+    /// beside the exe) the target name, never the `aterm-gui.exe` there (crate aterm-gui's thin
+    /// dev bin). The detach flag is pinned by `aterm_uds::spawn`'s table test.
     #[cfg(windows)]
     #[test]
     fn the_windowed_sibling_is_the_shipped_image_or_a_build_trees_own() {
@@ -4443,11 +3233,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A BUILD TREE'S windowed image stands for this build only when it is as
-    /// new as this image, give or take the two bins' link spread (measured
-    /// 6 ms, in either order): `cargo run -p aterm` relinks the console image
-    /// alone, and a window handed to the stale sibling runs old code while a
-    /// developer validates new.
+    /// A build tree's windowed image stands for this build only when it is as new as this one,
+    /// give or take the two bins' link spread (measured 6 ms, either order): `cargo run -p aterm`
+    /// relinks the console image alone.
     #[cfg(windows)]
     #[test]
     fn a_build_trees_windowed_image_older_than_this_one_is_not_used() {
@@ -4480,12 +3268,9 @@ mod tests {
         );
     }
 
-    /// THE SHELL'S PIPES STAY OUT OF THE DETACHED WINDOW. Under `cargo test` the
-    /// harness hands this process inheritable pipes as its std handles — the
-    /// same shape a capturing shell hands `aterm.exe` — and after the call none
-    /// of them may be inheritable any more, or a `$o = & aterm --window` would
-    /// hang until the window closed (measured; see the function). Harmless to
-    /// the harness: the flag governs children, and this test spawns none.
+    /// After the call no std handle is inheritable, or a capturing shell's
+    /// `$o = & aterm --window` would hang until the window closed. Harmless to the harness: the
+    /// flag governs children, and this test spawns none.
     #[cfg(windows)]
     #[test]
     fn the_std_handles_are_not_inheritable_once_the_sibling_is_about_to_start() {
@@ -4496,19 +3281,11 @@ mod tests {
         );
     }
 
-    /// THE OS-DRIVEN RELAUNCH. `RegisterApplicationRestart` fires after a
-    /// Restart-Manager reboot AND — `dwFlags = 0`, deliberately — after a crash
-    /// or a hang, and the command line it registers comes straight back through
-    /// this router. It must be a request the routing POLICY never redirects: with
-    /// `windowing_behavior = "attach"` and any sibling instance alive, a
-    /// forwardable relaunch opens a TAB IN THE SIBLING, so the crashed window
-    /// never returns and the WM_QUERYENDSESSION-persisted session manifest is
-    /// never restored — the whole reason the relaunch exists. `--window`, the
-    /// flag it used to register, is an ordinary policy-eligible plain launch.
-    ///
-    /// It must ALSO survive the argv0 alias, because the relaunched image is
-    /// whatever `current_exe()` was, which on the shipped Windows install is
-    /// normally `aterm-gui.exe`.
+    /// `RegisterApplicationRestart` fires after a Restart-Manager reboot and (`dwFlags = 0`)
+    /// after a crash or hang, and its command line comes back through this router. The policy
+    /// must never forward it: under `windowing_behavior = "attach"` it would open a tab in a
+    /// sibling instance and the persisted session manifest would never be restored. It must also
+    /// route under the alias: the relaunched image is `current_exe()`, normally `aterm-gui.exe`.
     #[cfg(windows)]
     #[test]
     fn the_os_restart_command_line_is_the_one_verb_policy_never_forwards() {
@@ -4541,10 +3318,8 @@ mod tests {
         );
     }
 
-    /// The mode flags are stripped for the alias exactly as they are for the
-    /// front door — `RegisterApplicationRestart` and every "give me the window"
-    /// script spell it `--window`, and the window's own parser rejects it as an
-    /// unknown option. Past an `-e`/`--` payload boundary nothing is touched.
+    /// The mode flags are stripped for the alias as for the front door (the window's parser
+    /// rejects `--window`), never past an `-e`/`--` payload boundary.
     #[test]
     fn the_mode_flags_are_stripped_before_the_window_but_never_inside_a_payload() {
         let osv = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
@@ -4561,23 +3336,18 @@ mod tests {
         );
         assert_eq!(payload_boundary(&osv(&["-d", "/tmp"])), 2);
         assert_eq!(payload_boundary(&osv(&["--window", "--", "x"])), 1);
-        // The `aterm-gui` alias strips ONLY `--window`: `--session` names a mode
-        // this alias cannot serve, and refusing it out loud (the window parser's
-        // `unknown option`) beats swallowing it.
+        // The `aterm-gui` alias strips only `--window`: the window parser refuses `--session`
+        // out loud rather than swallowing it.
         assert_eq!(
             strip_flags(&osv(&["--window", "--session"]), &["--window"]),
             osv(&["--session"])
         );
     }
 
-    /// `--no-reroute` is consumed like a mode flag — stripped for both lanes (neither
-    /// mode library knows it), never inside a payload — and ESTABLISHES the internal
-    /// `__ATERM_REROUTE_PASSTHROUGH=1` marker in the process environment: the one reading
-    /// both lanes and every child share. A launch WITHOUT the flag clears an inherited
-    /// marker: the flag is the one spelling of the escape, so no environment left over
-    /// from another launch can make this one skip the reroute — nor silence it: the
-    /// marker a reroute-run command hands its children (`cargo run -p aterm`) is cleared
-    /// on every launch. The flag also completes.
+    /// `--no-reroute` is stripped like a mode flag (never inside a payload) and establishes the
+    /// `__ATERM_REROUTE_PASSTHROUGH=1` marker both lanes and every child read. A launch without
+    /// the flag clears an inherited marker, so leftover environment can neither skip the reroute
+    /// nor silence it.
     #[test]
     fn no_reroute_is_stripped_before_dispatch_and_sets_the_marker() {
         let _env_lock = NO_REROUTE_ENV_LOCK
@@ -4586,23 +3356,16 @@ mod tests {
         let osv = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
         let env = atpkg::reroute::PASSTHROUGH_ENV;
         let engaged = || atpkg::reroute::engaged(std::env::var(env).ok().as_deref());
-        // This test OWNS the variable for its duration (the lock above serializes
-        // it with the routing tests that read it) and clears it on the way out
-        // (and first, in case the developer is running the suite under
-        // `aterm --no-reroute`).
+        // This test owns the variable (the lock serializes it with the routing tests that read
+        // it) and clears it first and last.
         aterm_log::env::unset(env);
-        // An INHERITED marker is not an instruction: a launch without the flag clears it.
+        // An inherited marker is not an instruction: a launch without the flag clears it.
         aterm_log::env::set(env, "1");
         assert_eq!(take_no_reroute(&osv(&["--window"])), osv(&["--window"]));
         assert!(
             !engaged(),
             "no flag, no escape — whatever the environment carried"
         );
-        // The retired variable is inert: nothing reads it.
-        aterm_log::env::set("ATERM_NO_REROUTE", "1");
-        assert_eq!(take_no_reroute(&osv(&[])), osv(&[]));
-        assert!(!engaged(), "ATERM_NO_REROUTE is not the escape any more");
-        aterm_log::env::unset("ATERM_NO_REROUTE");
         // A payload token is the child's: neither stripped nor read.
         assert_eq!(
             take_no_reroute(&osv(&["-e", "sh", "--no-reroute"])),
@@ -4637,61 +3400,6 @@ mod tests {
             );
         }
         aterm_log::env::unset(env);
-        assert!(
-            COMPLETION_FLAGS
-                .iter()
-                .any(|(flag, _)| *flag == NO_REROUTE_FLAG),
-            "the flag completes"
-        );
-    }
-
-    /// The generated scripts complete `aterm` (the ONE command on PATH after
-    /// install), cover the whole routed verb table and the front-door flags,
-    /// and delegate `aterm ctl <TAB>` to the ctl verb set. CONTRACT with
-    /// install.sh: the zsh script's FIRST line is `#compdef aterm`.
-    #[test]
-    fn front_door_completions_cover_the_routed_surface() {
-        let verbs = front_door_verbs();
-        for (shell, wiring) in [
-            ("bash", "complete -F _aterm aterm\n"),
-            ("zsh", "#compdef aterm\n"),
-            ("fish", "complete -c aterm -f\n"),
-        ] {
-            let script = aterm_ctl::front_door_completion_script(shell, &verbs, COMPLETION_FLAGS)
-                .expect("known shell yields a script");
-            assert!(script.contains(wiring), "{shell} wires `aterm`");
-            for verb in &verbs {
-                assert!(script.contains(verb), "{shell} completes `{verb}`");
-            }
-            for (flag, _) in COMPLETION_FLAGS {
-                // fish names long flags dash-less (`-l window`).
-                let probe = if shell == "fish" {
-                    flag.trim_start_matches('-')
-                } else {
-                    flag
-                };
-                assert!(script.contains(probe), "{shell} completes `{flag}`");
-            }
-            // Representative ctl verbs prove the delegation arm is present.
-            for ctl_verb in ["text", "turn", "subscribe"] {
-                assert!(
-                    script.contains(ctl_verb),
-                    "{shell} completes `aterm ctl {ctl_verb}`"
-                );
-            }
-        }
-        let zsh = aterm_ctl::front_door_completion_script("zsh", &verbs, COMPLETION_FLAGS)
-            .expect("zsh yields a script");
-        assert_eq!(
-            zsh.lines().next(),
-            Some("#compdef aterm"),
-            "install.sh keys on the first line"
-        );
-        // Unknown shells yield no script (the entry maps that to a clear error).
-        assert!(
-            aterm_ctl::front_door_completion_script("powershell", &verbs, COMPLETION_FLAGS)
-                .is_none()
-        );
     }
 
     /// A fresh scratch directory for one test, named by pid and nanos.
@@ -4705,14 +3413,10 @@ mod tests {
         dir
     }
 
-    /// THE `$ATERM_AGENTS_DIR` HANDOFF: a resolved layout
-    /// yields the absolute managed `agents/`, CREATED by the call (private in a `$HOME`
-    /// prefix) — the window's mkdir/mode rule (`spawn::managed_agents_dir`), so the
-    /// TTY session on a fresh machine has the directory before atpkg lays a twin; a
-    /// second call is a no-op with the same answer; NO layout (an unset `$HOME`) hands
-    /// nothing; and an ENGAGED reroute escape changes nothing — the switch is not an
-    /// input, which is the whole point of the handoff (`--no-reroute` restores the
-    /// upstream Rust names, never the managed `claude`/`codex`).
+    /// A resolved layout yields the absolute managed `agents/`, created by the call (private in a
+    /// `$HOME` prefix, the window's rule); a second call is a no-op; no layout hands nothing; and
+    /// an engaged reroute escape changes nothing (`--no-reroute` restores the upstream Rust names,
+    /// never the managed `claude`/`codex`).
     #[test]
     fn the_agents_dir_is_handed_on_every_lane_regardless_of_the_reroute_switch() {
         let _env_lock = NO_REROUTE_ENV_LOCK
@@ -4761,8 +3465,8 @@ mod tests {
             Some(v) => aterm_log::env::set(env, v),
             None => aterm_log::env::unset(env),
         }
-        // And what `hand_agents_dir` establishes is exactly that value — or NOTHING:
-        // an inherited stray is removed, never left for the session to trust.
+        // And `hand_agents_dir` establishes exactly that value, or nothing: an inherited
+        // stray is removed, never left for the session to trust.
         let var = atpkg::reroute::AGENTS_DIR_ENV;
         assert_eq!(var, "ATERM_AGENTS_DIR", "the contract's spelling");
         hand_agents_dir(Some(&layout));
@@ -4776,11 +3480,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
-    /// A prefix that REFUSES the `mkdir` (read-only, owned by us) hands nothing —
-    /// said on stderr, never a nonexistent entry first on the session's PATH — and
-    /// creates nothing; a symlink at `agents/` is refused the same way and left alone.
-    /// `hand_agents_dir` then REMOVES an inherited value rather than passing it on.
-    /// Root ignores mode bits, so the read-only leg is skipped there.
+    /// A prefix that refuses the `mkdir`, or a symlink at `agents/`, hands nothing (said on
+    /// stderr), creates nothing, and `hand_agents_dir` removes an inherited value. Root ignores
+    /// mode bits, so the read-only leg is skipped there.
     #[cfg(unix)]
     #[test]
     fn a_refused_agents_dir_hands_nothing_and_clears_an_inherited_stray() {
@@ -4807,41 +3509,13 @@ mod tests {
                 .is_symlink(),
             "left alone"
         );
-        // The line names the path ONCE, never `ensure_private_dir`'s `update directory`
-        // noun, and does not send the user to a `repair` that refuses the same link.
-        let refusal_line = |dir: &std::path::Path, error: &str, system: bool| {
-            atpkg::store::agents_dir_refusal_line(dir, error, system, SESSION_REACH)
-        };
-        let refusal = linked.ensure_agents_dir().expect_err("refused");
-        let line = refusal_line(&linked.agents_dir(), &refusal, false);
-        assert_eq!(
-            line.matches(&linked.agents_dir().display().to_string())
-                .count(),
-            1,
-            "{line}"
-        );
-        assert!(!line.contains("update directory"), "{line}");
-        assert!(line.contains("is a symlink —"), "{line}");
-        assert!(line.contains("in this session: "), "{line}");
-        assert!(
-            line.ends_with("— remove that symlink, then run `aterm pkg repair`"),
-            "{line}"
-        );
-        // A system prefix changes nothing here: the entry must go first either way.
-        assert_eq!(refusal_line(&linked.agents_dir(), &refusal, true), line);
-        // A regular file at agents/: the same by-hand remedy.
+        // A regular file at agents/: refused the same way.
         let filed = atpkg::store::Layout {
             prefix: scratch.join("filed"),
         };
         std::fs::create_dir_all(&filed.prefix).unwrap();
         std::fs::write(filed.agents_dir(), b"not a dir").unwrap();
-        let refusal = filed.ensure_agents_dir().expect_err("refused");
-        let line = refusal_line(&filed.agents_dir(), &refusal, false);
-        assert!(line.contains("exists and is not a directory"), "{line}");
-        assert!(
-            line.ends_with("— remove that file, then run `aterm pkg repair`"),
-            "{line}"
-        );
+        assert_eq!(agents_dir_handoff(Some(&filed)), None);
         aterm_log::env::set(var, real.to_str().unwrap());
         hand_agents_dir(Some(&linked));
         assert_eq!(
@@ -4851,9 +3525,10 @@ mod tests {
         );
         // SAFETY: getuid() takes no arguments and cannot fail.
         if unsafe { libc::getuid() } == 0 {
-            eprintln!("running as root; a read-only prefix refuses nothing — skipping that leg");
             let _ = std::fs::remove_dir_all(&scratch);
-            return;
+            aterm_spec::host::could_not_run(
+                "running as root, where a read-only prefix refuses nothing: the refusal leg cannot run",
+            );
         }
         let layout = atpkg::store::Layout {
             prefix: scratch.join("pkg"),
@@ -4862,23 +3537,6 @@ mod tests {
         std::fs::set_permissions(&layout.prefix, std::fs::Permissions::from_mode(0o500)).unwrap();
         assert_eq!(agents_dir_handoff(Some(&layout)), None);
         assert!(!layout.agents_dir().exists(), "nothing created");
-        // A refused mkdir: the path once, and `repair` IS the remedy (root where needed).
-        let refusal = layout.ensure_agents_dir().expect_err("refused");
-        let line = refusal_line(&layout.agents_dir(), &refusal, false);
-        assert_eq!(
-            line.matches(&layout.agents_dir().display().to_string())
-                .count(),
-            1,
-            "{line}"
-        );
-        assert!(line.ends_with("— run `aterm pkg repair`"), "{line}");
-        assert!(!line.contains("remove that"), "{line}");
-        // On a root-owned prefix the line says so instead of hedging.
-        assert!(
-            refusal_line(&layout.agents_dir(), &refusal, true)
-                .ends_with("— run `aterm pkg repair` as root"),
-            "{line}"
-        );
         aterm_log::env::set(var, real.to_str().unwrap());
         hand_agents_dir(Some(&layout));
         assert_eq!(std::env::var_os(var), None);
@@ -4900,33 +3558,38 @@ mod tests {
         aterm_log::env::unset(var);
         let _ = std::fs::remove_dir_all(&scratch);
     }
+}
 
-    /// The handoff is established in the session lane OUTSIDE the reroute gate — before
-    /// it, and before the lane's first background thread — so an engaged
-    /// `--no-reroute` cannot skip it and no thread races the `setenv`. A scrape, in
-    /// the idiom of `the_session_lane_applies_the_machine_settings_outside_every_package_gate`.
+#[cfg(test)]
+mod open_probe_alias_boundary_tests {
+    use super::{AliasRoute, alias_route};
+
     #[test]
-    fn the_agents_dir_handoff_sits_outside_the_reroute_gate() {
-        let src = include_str!("main.rs");
-        let handoff = src
-            .find("hand_agents_dir(layout.as_ref());")
-            .expect("the session lane hands the agents dir");
-        let quiet = src
-            .find("let quiet = aterm_cli::parse_args(mode_args);")
-            .expect("the session lane's start");
-        let gate = src
-            .find("if !atpkg::reroute::engaged(")
-            .expect("the session lane's reroute gate");
-        assert!(
-            quiet < handoff && handoff < gate,
-            "the handoff sits in the session lane BEFORE the reroute gate, never inside it"
+    fn a_window_alias_serves_its_open_probe_child_at_the_front_door() {
+        let verb = aterm_containment::consent::OPEN_PROBE_VERB;
+        assert_eq!(alias_route("aterm-gui", ""), AliasRoute::AliasWindow);
+        assert_eq!(
+            alias_route("aterm-windowed", "new-window"),
+            AliasRoute::AliasWindowVerb
         );
-        let lay = src
-            .find(".name(\"aterm-reroute-lay\".into())")
-            .expect("the gate's background lay");
+        assert_eq!(alias_route("aterm-ctl", "status"), AliasRoute::Ctl);
+        // Askpass's first operand is a prompt, so ordinary alias semantics stay intact.
+        assert_eq!(alias_route("aterm-askpass", verb), AliasRoute::Askpass);
+        let observed: Vec<_> = [
+            "aterm",
+            "aterm-cli",
+            "aterm-gui",
+            "aterm-windowed",
+            "renamed-copy",
+        ]
+        .into_iter()
+        .map(|name| (name, alias_route(name, verb)))
+        .collect();
         assert!(
-            handoff < lay,
-            "established single-threaded, before the lane's first thread"
+            observed
+                .iter()
+                .all(|(_, route)| *route == AliasRoute::FrontDoor),
+            "a window alias must route its probe child before window mode: {observed:?}"
         );
     }
 }

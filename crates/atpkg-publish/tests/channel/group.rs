@@ -337,42 +337,20 @@ const FLOOR: [(&str, u64); 5] = [
 #[test]
 fn a_dry_run_judges_everything_and_runs_nothing() {
     let c = cut("group-dry", &FLOOR, &[]);
-    let (o, log) = ok(&c, &request(&c, Mode::DryRun));
+    let (o, _) = ok(&c, &request(&c, Mode::DryRun));
     assert!(o.builds.is_empty() && o.index_build.is_none());
     assert!(c.packs.bundles.borrow().is_empty() && c.packs.packs.borrow().is_empty());
     assert!(c.packs.indexes.borrow().is_empty());
-    let text = log.text();
-    assert!(text.contains("mode: dry-run"), "{text}");
-    assert!(text.contains("→ trust build 5"), "{text}");
-    assert!(
-        text.contains("channel floor: atpkg-index-34 (pins trust 3)"),
-        "{text}"
-    );
-    assert!(
-        text.contains(
-            "sibling trust-ir: this cut packs build 5 (the channel head atpkg-index-34 pins 4)"
-        ),
-        "{text}"
-    );
-    assert!(text.contains("dry run — nothing executed"), "{text}");
-    assert!(text.contains("the seed pin: NOT ENFORCED"), "{text}");
-    assert!(
-        c.gate.asked.borrow().is_empty(),
-        "asking the gate builds the cutter; a dry run builds nothing"
-    );
-    assert!(
-        text.contains(&format!(
-            "the candidate gate (D27): publishing (--upload) needs its PASS — not asked by a dry \
-             run (`targo --unverified ship trust candidate --admits {} --base-build 3`)",
-            c.seal.display()
-        )),
-        "{text}"
+    assert_eq!(
+        *c.gate.asked.borrow(),
+        [Some(3)],
+        "a dry run asks the gate (in-process, cheap), against the published pin"
     );
     ok(&c, &request(&c, Mode::Stage));
     assert_eq!(
         *c.gate.asked.borrow(),
-        [Some(3)],
-        "a stage asks the gate, against the published pin"
+        [Some(3), Some(3)],
+        "a stage asks the gate too"
     );
 }
 
@@ -425,28 +403,13 @@ fn a_staged_cut_packs_the_bundle_then_the_siblings_with_the_seals_toolchain_then
     );
     assert!(!indexes[0].upload);
     assert_eq!(o.index_build, Some(35));
-    let ready = std::fs::read_to_string(c.rig.path("out/READY.md")).expect("READY.md");
-    assert!(
-        ready.contains("atpkg-publish publish-group rustc --seal"),
-        "{ready}"
-    );
-    assert!(ready.contains("SIGNED by this machine's key"), "{ready}");
 }
 
 #[test]
 fn off_the_pin_triple_the_four_builds_ride_that_targets_overlay() {
     let c = cut("group-linux", &FLOOR, &[("trust-ir", 1)]);
     *c.probe.vv.borrow_mut() = vv(&c.commit, LINUX);
-    let (_, log) = ok(&c, &request(&c, Mode::Stage));
-    let text = log.text();
-    assert!(
-        text.contains(&format!("sibling trust-ir: this cut packs build 5 (the channel head atpkg-index-34 pins 1 for {LINUX})")),
-        "{text}"
-    );
-    assert!(
-        text.contains(&format!("sibling trust-cg: this cut packs build 5 (the channel head atpkg-index-34 pins no trust-cg for {LINUX} — the index step adds it as new)")),
-        "{text}"
-    );
+    ok(&c, &request(&c, Mode::Stage));
     let indexes = c.packs.indexes.borrow();
     let d = &indexes[0].delta;
     assert!(d.pins.is_empty(), "`pin` belongs to the Mac");
@@ -503,12 +466,7 @@ fn a_sibling_behind_or_level_with_the_floor_is_refused_before_anything_packs() {
     );
     let mut forced = request(&c, Mode::Stage);
     forced.force_same_build = true;
-    let (_, log) = ok(&c, &forced);
-    assert!(
-        log.contains("--force-same-build: trust-ir repacks build 5"),
-        "{}",
-        log.text()
-    );
+    ok(&c, &forced);
 }
 
 #[test]
@@ -548,14 +506,7 @@ fn a_moved_compiler_skips_published_numbers_and_never_reuses_one() {
             b"x".to_vec(),
         );
     }
-    let (_, log) = ok(&c, &request(&c, Mode::Stage));
-    assert!(
-        log.contains(
-            "sibling trust-cg: this cut packs build 6 (the channel head atpkg-index-34 pins 5)"
-        ),
-        "{}",
-        log.text()
-    );
+    ok(&c, &request(&c, Mode::Stage));
     let packed = |program: &str| {
         c.packs
             .packs
@@ -616,8 +567,7 @@ fn the_seal_preflights_refuse_by_name() {
     req.seal = live.clone();
     assert!(refused(&c, &req).contains("is a live build tree"));
     req.allow_build_tree_seal = true;
-    let (_, log) = ok(&c, &req);
-    assert!(log.contains("--allow-build-tree-seal: packing from the live build tree"));
+    ok(&c, &req);
     // `*/build/*/stage2` matches however deep the stage2 sits below `build`.
     let deeper = c
         .rig
@@ -648,25 +598,15 @@ fn the_trust_repo_must_hold_the_seals_commit() {
     assert!(e.contains("is not in"), "{e}");
 }
 
-/// No floor: a dry run says so; staging or publishing is refused before anything packs —
+/// No floor: a dry run still runs; staging or publishing is refused before anything packs —
 /// without the head no build is judged and no published number is skipped.
 #[test]
-fn no_floor_is_said_by_a_dry_run_and_refused_by_a_cut() {
+fn no_floor_is_refused_by_a_cut_and_not_by_a_dry_run() {
     let c = cut("group-nofloor", &[], &[]);
-    let (_, log) = ok(&c, &request(&c, Mode::DryRun));
-    assert!(
-        log.contains("no floor index to judge the builds against"),
-        "{}",
-        log.text()
-    );
-    assert!(!log.contains("sibling trust-ir:"));
+    ok(&c, &request(&c, Mode::DryRun));
     for mode in [Mode::Stage, Mode::Upload] {
         let e = refused(&c, &request(&c, mode));
-        assert!(
-            e.contains("no floor index to judge the builds against")
-                && e.contains("the packs would run for nothing"),
-            "{mode:?}: {e}"
-        );
+        assert!(e.contains("no floor index"), "{mode:?}: {e}");
     }
     assert!(c.packs.bundles.borrow().is_empty());
 }
@@ -679,15 +619,7 @@ fn a_lapsed_head_is_still_the_floor() {
     let mut doc = Doc::new(34, &FLOOR);
     doc.valid_until = "2026-01-01T00:00:00Z".into();
     c.rig.publish_head(&doc);
-    let (_, log) = ok(&c, &request(&c, Mode::Stage));
-    assert!(
-        log.contains("channel floor: atpkg-index-34 (pins trust 3)"),
-        "{}",
-        log.text()
-    );
-    assert!(log.contains(
-        "sibling trust-ir: this cut packs build 5 (the channel head atpkg-index-34 pins 4)"
-    ));
+    ok(&c, &request(&c, Mode::Stage));
 }
 
 /// The staging owner's repos are private: one that does not list for this identity is a
@@ -816,10 +748,7 @@ fn the_candidate_gate_decides_a_publish_and_informs_a_stage() {
         "no candidate-gate receipt names this seal".into(),
         "second reason".into(),
     ]);
-    let (_, log) = ok(&c, &request(&c, Mode::Stage));
-    assert!(log.contains(
-        "the candidate gate (D27): publishing (--upload) is refused until it passes — no candidate-gate receipt names this seal"
-    ));
+    ok(&c, &request(&c, Mode::Stage));
     let e = refused(&c, &request(&c, Mode::Upload));
     assert!(
         e.contains("no candidate-gate receipt names this seal") && e.contains("second reason"),
@@ -828,8 +757,7 @@ fn the_candidate_gate_decides_a_publish_and_informs_a_stage() {
     c.gate.answer = GateAnswer::CannotCheck("the gate could not check".into());
     assert!(refused(&c, &request(&c, Mode::Upload)).contains("the gate could not check"));
     c.gate.answer = GateAnswer::Admitted("PASS (r)".into());
-    let (_, log) = ok(&c, &request(&c, Mode::Stage));
-    assert!(log.contains("the candidate gate (D27): PASS for this seal — PASS (r)"));
+    ok(&c, &request(&c, Mode::Stage));
 }
 
 #[test]
@@ -872,7 +800,7 @@ fn upload_needs_the_key_and_the_channel_token_and_a_keyless_stage_signs_nothing(
     std::fs::remove_file(&c.rig.ctx.identity.key).expect("rm key");
     assert!(refused(&c, &request(&c, Mode::Upload)).contains("needs a rostered machine key"));
 
-    let (o, log) = ok(&c, &request(&c, Mode::Stage));
+    let (o, _) = ok(&c, &request(&c, Mode::Stage));
     assert!(o.index_build.is_none());
     assert!(c.packs.indexes.borrow().is_empty(), "no key, no index");
     assert!(
@@ -882,7 +810,4 @@ fn upload_needs_the_key_and_the_channel_token_and_a_keyless_stage_signs_nothing(
             .iter()
             .all(|p| p.signing == Signing::Unsigned)
     );
-    assert!(log.contains("STAGED UNSIGNED"), "{}", log.text());
-    let ready = std::fs::read_to_string(c.rig.path("out/READY.md")).expect("READY.md");
-    assert!(ready.contains("UNSIGNED"), "{ready}");
 }

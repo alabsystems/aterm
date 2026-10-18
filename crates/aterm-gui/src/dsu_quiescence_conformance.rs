@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 bind for `DsuQuiescence` (`aterm_spec::derive::dsu_quiescence_model`,
+//! Tier-1 bind for `DsuQuiescence` (`aterm_models_session::dsu_quiescence_model`,
 //! Rung 0 of `docs/RFC-proof-carrying-dsu.md`): an update may be applied only
 //! at a quiescence point — never while a request is in flight.
 //!
@@ -46,7 +46,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use aterm_core::terminal::Terminal;
-use aterm_spec::derive::dsu_quiescence_model;
+use aterm_models_session::dsu_quiescence_model;
 use aterm_spec::{interp, verify};
 
 use super::{attach_reader_inner, park_reader};

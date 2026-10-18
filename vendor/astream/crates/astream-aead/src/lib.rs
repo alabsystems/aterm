@@ -33,22 +33,37 @@
 //! `forbid(unsafe_code)` applies to this crate's own code.
 #![forbid(unsafe_code)]
 
+// A contracted fn is written once, through `contract_fn!`: under a Trust compiler
+// (`cfg(clean_islands)`, build.rs) it carries its `ensures` clause, which no stock rustc can
+// parse, and every other compiler gets the plain fn.
+#[macro_use]
+#[path = "../../astream-wire/contract_fn.rs"]
+mod contract_fn;
+
+// Plain-Rust twins of the functions this crate's Clean islands compile, for a compiler
+// that cannot lex the islands.
+#[cfg(any(test, not(clean_islands)))]
+mod twins;
+
 mod stream;
 pub use stream::{
-    SealedStream, TryCloneable, HELLO_LEN, HELLO_MAGIC, MAX_PLAINTEXT, MAX_RECORD,
-    SESSION_NONCE_LEN,
+    aead_can_open_in_order, aead_seq_monotone, SealedStream, TryCloneable, HELLO_LEN, HELLO_MAGIC,
+    MAX_PLAINTEXT, MAX_RECORD, SESSION_NONCE_LEN,
 };
 
 #[cfg(feature = "handshake")]
 mod handshake;
 #[cfg(feature = "handshake")]
-pub use handshake::{client_handshake, server_handshake};
+pub use handshake::{
+    client_handshake, handshake_clamp_info_len, handshake_version_valid, server_handshake,
+};
 
 #[cfg(feature = "identity")]
 mod identity;
 #[cfg(feature = "identity")]
 pub use identity::{
-    client_identity_handshake, server_identity_handshake, IdentityKeypair, ID_PUB_LEN,
+    client_identity_handshake, identity_auth_msg_len_valid, identity_clamp_ctx_len,
+    server_identity_handshake, IdentityKeypair, ID_PUB_LEN,
 };
 
 use chacha20poly1305::aead::AeadInPlace;
@@ -78,6 +93,26 @@ impl core::fmt::Display for AeadError {
 
 impl std::error::Error for AeadError {}
 
+// The Clean island, out of line: only a Trust compiler lexes it, so it mounts under
+// `cfg(clean_islands)` (build.rs) and a stock compiler never opens the file.
+#[cfg(clean_islands)]
+mod aead_island;
+#[cfg(not(clean_islands))]
+pub use crate::twins::aead_clamp_sealed_len;
+#[cfg(clean_islands)]
+pub use aead_island::aead_clamp_sealed_len;
+
+contract_fn! {
+    /// Verified check that a sealed AEAD box has at least `overhead` bytes (`overhead <= sealed_len`),
+    /// linked via `clean-kernel-defeq` to `aead_sealed_has_overhead_isl`.
+    #[must_use]
+    pub fn aead_sealed_has_overhead(sealed_len: usize, overhead: usize) -> bool
+    clauses [ensures result == (overhead <= sealed_len)]
+    {
+        overhead <= sealed_len
+    }
+}
+
 /// Seal `plaintext` under `key`, binding `aad`, with a fresh random 24-byte
 /// nonce. Returns `nonce ‖ ciphertext ‖ tag` (length `plaintext.len() +
 /// OVERHEAD`). The nonce is drawn from the OS CSPRNG; XChaCha's 192-bit nonce
@@ -102,7 +137,7 @@ pub fn seal_with_nonce(
     aad: &[u8],
     plaintext: &[u8],
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(plaintext.len() + OVERHEAD);
+    let mut out = Vec::with_capacity(OVERHEAD);
     out.extend_from_slice(nonce);
     out.extend_from_slice(plaintext);
     seal_in_place(key, aad, &mut out, 0);
@@ -116,7 +151,12 @@ pub fn seal_with_nonce(
 /// `nonce ‖ ciphertext ‖ tag`. No copy of the plaintext is made.
 pub(crate) fn seal_in_place(key: &[u8; KEY_LEN], aad: &[u8], buf: &mut Vec<u8>, at: usize) {
     let cipher = XChaCha20Poly1305::new(key.into());
-    let (nonce, msg) = buf[at..].split_at_mut(NONCE_LEN);
+    let Some(tail) = buf.get_mut(at..) else {
+        return;
+    };
+    let Some((nonce, msg)) = tail.split_at_mut_checked(NONCE_LEN) else {
+        return;
+    };
     let tag = cipher
         .encrypt_in_place_detached(XNonce::from_slice(nonce), aad, msg)
         // encrypt only fails if the message exceeds the cipher's length ceiling
@@ -133,11 +173,18 @@ pub(crate) fn seal_in_place(key: &[u8; KEY_LEN], aad: &[u8], buf: &mut Vec<u8>, 
 /// [`AeadError`] if `sealed` is shorter than [`OVERHEAD`] or the tag does not
 /// verify.
 pub fn open(key: &[u8; KEY_LEN], aad: &[u8], sealed: &[u8]) -> Result<Vec<u8>, AeadError> {
-    if sealed.len() < OVERHEAD {
+    if !aead_sealed_has_overhead(sealed.len(), OVERHEAD) {
         return Err(AeadError);
     }
-    let (nonce, rest) = sealed.split_at(NONCE_LEN);
-    let (ct, tag) = rest.split_at(rest.len() - TAG_LEN);
+    let Some((nonce, rest)) = sealed.split_at_checked(NONCE_LEN) else {
+        return Err(AeadError);
+    };
+    let Some(ct_len) = rest.len().checked_sub(TAG_LEN) else {
+        return Err(AeadError);
+    };
+    let Some((ct, tag)) = rest.split_at_checked(ct_len) else {
+        return Err(AeadError);
+    };
     // Only the ciphertext is copied, and decrypted in place once its tag has
     // verified.
     let mut plain = ct.to_vec();
@@ -163,12 +210,19 @@ pub(crate) fn open_in_place<'a>(
     aad: &[u8],
     buf: &'a mut [u8],
 ) -> Result<&'a [u8], AeadError> {
-    if buf.len() < OVERHEAD {
+    if !aead_sealed_has_overhead(buf.len(), OVERHEAD) {
         return Err(AeadError);
     }
+    let Some((nonce, rest)) = buf.split_at_mut_checked(NONCE_LEN) else {
+        return Err(AeadError);
+    };
+    let Some(ct_len) = rest.len().checked_sub(TAG_LEN) else {
+        return Err(AeadError);
+    };
+    let Some((ct, tag)) = rest.split_at_mut_checked(ct_len) else {
+        return Err(AeadError);
+    };
     let cipher = XChaCha20Poly1305::new(key.into());
-    let (nonce, rest) = buf.split_at_mut(NONCE_LEN);
-    let (ct, tag) = rest.split_at_mut(rest.len() - TAG_LEN);
     cipher
         .decrypt_in_place_detached(XNonce::from_slice(nonce), aad, ct, Tag::from_slice(tag))
         .map_err(|_| AeadError)?;

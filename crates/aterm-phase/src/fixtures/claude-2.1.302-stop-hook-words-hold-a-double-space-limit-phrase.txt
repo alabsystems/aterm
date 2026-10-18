@@ -1,0 +1,18 @@
+# claude-code 2.1.302 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a Stop hook (command ./sx) printing {"continue": false} with a stopReason and a systemMessage that each read 'note  Usage limit reached · resets 3pm' (two spaces after 'note'), the reply EMPTY: Claude Code keeps the double space on both rows (Stop says: … under the person's turn, the stopReason under the hook summary)
+ ▐▛███▛█   Claude Code v2.1.302
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ say nothing
+  ⎿  Stop says: note  Usage limit reached · resets 3pm
+
+⏺ Ran 1 stop hook (ctrl+o to expand)
+  ⎿  note  Usage limit reached · resets 3pm
+
+✻ Cogitated for 0s · done 10:39 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                                                       ◐ medium · /effort

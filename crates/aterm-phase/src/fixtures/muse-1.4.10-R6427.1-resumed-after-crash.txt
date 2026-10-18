@@ -1,0 +1,51 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-17, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab) · a SIGKILLed Muse Code resumed (`muse resume <uuid>`), settled: the replayed session, Muse's abnormal-end warning above its idle composer — the screen the harness's relaunch types its continuation into · the session id is spelled 00000000-0000-0000-0000-000000000000 and the lab's random project dir /private/tmp/at.lab0 here
+  resumed session 00000000-0000-0000-0000-000000000000
+
+❯ remember the word PELICAN-7731
+
+◆ Hi! I am the local lab stub, not a model. (reply 1)
+
+◆ Interrupted · Report issues with /feedback
+
+❯ [aterm harness] Relaunched: Muse Code exited without anyone asking, and this session was restarted on Muse Code 1.4.10-R6427.1 and resumed.
+  Anything this session ran in the background before (a watch, a monitor, a loop, a shell) may not have come back: start again only what is no
+  longer running and you still rely on. Continue where you left off. If you were waiting on the user, nobody is here to answer: decide for
+  yourself, prefer reversible steps, and keep going.
+
+◆ Hi! I am the local lab stub, not a model. (reply 2)
+
+❯ [aterm harness] Relaunched: Muse Code exited without anyone asking, and this session was restarted on Muse Code 1.4.10-R6427.1 and resumed.
+  Anything this session ran in the background before (a watch, a monitor, a loop, a shell) may not have come back: start again only what is no
+  longer running and you still rely on. Continue where you left off. If you were waiting on the user, nobody is here to answer: decide for
+  yourself, prefer reversible steps, and keep going.
+
+◆ Hi! I am the local lab stub, not a model. (reply 3)
+
+❯ [aterm harness] Relaunched: Muse Code exited without anyone asking, and this session was restarted on Muse Code 1.4.10-R6427.1 and resumed.
+  Anything this session ran in the background before (a watch, a monitor, a loop, a shell) may not have come back: start again only what is no
+  longer running and you still rely on. Continue where you left off. If you were waiting on the user, nobody is here to answer: decide for
+  yourself, prefer reversible steps, and keep going.
+
+◆ Hi! I am the local lab stub, not a model. (reply 4)
+
+❯ [aterm harness] Relaunched: aterm ended while this session ran (a crash, a kill or a restart), and reopened its tab on Muse Code
+  1.4.10-R6427.1 and resumed. Anything this session ran in the background before (a watch, a monitor, a loop, a shell) may not have come back:
+  start again only what is no longer running and you still rely on. Continue where you left off. If you were waiting on the user, nobody is here
+  to answer: decide for yourself, prefer reversible steps, and keep going.
+
+◆ Hi! I am the local lab stub, not a model. (reply 5)
+
+❯ [aterm harness] Relaunched: Muse Code exited without anyone asking, and this session was restarted on Muse Code 1.4.10-R6427.1 and resumed.
+  Anything this session ran in the background before (a watch, a monitor, a loop, a shell) may not have come back: start again only what is no
+  longer running and you still rely on. Continue where you left off. If you were waiting on the user, nobody is here to answer: decide for
+  yourself, prefer reversible steps, and keep going.
+
+◆ Hi! I am the local lab stub, not a model. (reply 6)
+
+  warning: the previous run of this session ended abnormally around 2026-10-17 07:40 UTC-07:00 (no clean shutdown was recorded). It was resumed
+  cleanly.
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  lab-stub · high · /private/tmp/at.lab0/proj/sub · Auto-review

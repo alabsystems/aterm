@@ -148,7 +148,7 @@ pub struct BundleRequest {
     pub triple: Option<Triple>,
     /// The hello-world gate.
     pub hello: HelloGate,
-    /// Trust toolchain roots `atpkg relocate` may vendor a library from.
+    /// Trust toolchain roots pack-time relocation may vendor a library from.
     pub donor_roots: Vec<PathBuf>,
     /// Foreign `lib/rustlib/<triple>` sysroots to keep (a local cross-capable bundle).
     pub keep_targets: Vec<String>,
@@ -252,8 +252,11 @@ pub struct IndexRequest {
     /// Where the signed quad is written.
     pub out: PathBuf,
     /// Publish: make every pinned pack public, then the quad. `false` is a dry run that
-    /// still signs and self-verifies, and touches no host.
+    /// still signs and self-verifies, and touches no host but to read an ALab pack it pins.
     pub upload: bool,
+    /// Where an ALab pack this index pins is read from for a dry run (its manifest pair and
+    /// archive), instead of the hosts: a local proof. Refused with `upload`.
+    pub pack_dir: Option<PathBuf>,
 }
 
 /// A published (or staged) index.

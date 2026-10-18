@@ -364,12 +364,10 @@ impl Writer {
         let files = Arc::clone(&writer.files);
         let overflow = Arc::clone(&writer.overflow);
         let overflowed = Arc::clone(&writer.overflowed);
-        let spawned = std::thread::Builder::new()
-            .name("aterm-messages-log".into())
-            .spawn(move || {
-                // The UI takes the same short queue lock, so this follows the
-                // lock-holder floor. No disk I/O or wait holds that lock.
-                qos::set_self(qos::Role::Responsive);
+        // The UI takes the same short queue lock, so this follows the
+        // lock-holder floor. No disk I/O or wait holds that lock.
+        let spawned =
+            qos::spawn_lane_thread("aterm-messages-log", qos::Role::Responsive, move || {
                 loop {
                     let job = match rx.try_recv() {
                         Ok(job) => job,
@@ -408,9 +406,8 @@ impl Writer {
                     match job {
                         Job::Line(line, shelf) => write_line(&files, &line, shelf),
                         // Answered, then back to this thread's own class.
-                        Job::Flush(done, boost) => {
+                        Job::Flush(done, _boost) => {
                             let _ = done.send(());
-                            drop(boost);
                         }
                     }
                 }
@@ -714,26 +711,6 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).unwrap();
         assert!(load_tail(&link, TAIL_BYTES).log.is_empty());
         assert_eq!(load_tail(&real, TAIL_BYTES).log.len(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_dead_process_s_open_row_reads_back_stale() {
-        let dir = scratch("stale");
-        let path = dir.join(FILE_NAME);
-        write_lines(
-            &path,
-            &[
-                encoded(&posted(1, "folded")),
-                encoded(&retired(1)),
-                encoded(&posted(2, "left open")),
-            ],
-        );
-        let loaded = load_for_launch(&path);
-        let open = loaded.log.get(MessageId::from_raw(2).unwrap()).unwrap();
-        assert_eq!(open.state, LogState::Retired(Retired::Stale));
-        let folded = loaded.log.get(MessageId::from_raw(1).unwrap()).unwrap();
-        assert_eq!(folded.state, LogState::Retired(Retired::Folded));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

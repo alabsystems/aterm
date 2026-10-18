@@ -1,45 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A `--headless` launch must never become an app at all — not one that can
-//! take the keyboard, and not one LaunchServices or the WindowServer knows.
+//! A `--headless` launch never becomes an app: not one that can take the keyboard, and not one
+//! LaunchServices or the WindowServer knows. Every conformance probe and headless test launches
+//! the binary, dozens of times per run; on the AppKit loop winit makes an unbundled binary a
+//! regular app and activates it, stealing keyboard focus. Headless runs the display-free loop
+//! (`crates/aterm-window/src/platform_impl/macos/headless.rs`), which never creates the
+//! application object, so LaunchServices holds no record for the pid: `policy=none`. An
+//! `NSApplication` (the AppKit loop, even under a `Prohibited` posture) would check the process
+//! in with LaunchServices and open a WindowServer connection, whose synchronous TCC preflight
+//! runs on WindowServer's main thread (AGENTS.md); `window_server_census_live_headless.rs` reads
+//! that half from tccd's log. Only a test outside the process can see either.
 //!
-//! WHY. Every conformance probe and every headless test in this directory
-//! launches the binary, dozens of times per test run. On the AppKit event loop
-//! an UNBUNDLED binary is made a REGULAR app by winit's
-//! `applicationDidFinishLaunching:` (`setActivationPolicy:`) and activated
-//! (`activateIgnoringOtherApps:YES`), yanking keyboard focus from whatever the
-//! developer is typing into; and even a `Prohibited` `NSApplication` checks the
-//! process in with LaunchServices and opens its WindowServer connection — which
-//! makes WindowServer run a synchronous TCC preflight of the binary on its main
-//! thread (AGENTS.md). So headless builds winit's display-free loop
-//! (`crates/aterm-window/src/platform_impl/macos/headless.rs`), which never
-//! creates the application object, and LaunchServices holds NO record for the
-//! pid: `policy=none`, which this pins. A regression back to the AppKit loop
-//! reads `Prohibited` and fails here.
-//! (`window_server_census_live_headless.rs` reads the WindowServer
-//! half from tccd's log.) This is the only kind of test that can see it, because
-//! the effect lives in LaunchServices and the WindowServer, not inside the
-//! process.
+//! Non-vacuity: the control socket binds before the loop starts, so a probe fired as soon as it
+//! appears could read the pre-launch state. This first drives `aterm ctl spawn`, a
+//! `Wake::SpawnSession` round trip only `user_event` answers, and probes only after that reply,
+//! three times over a second. Between the two it drives `aterm ctl chrome`, which reads the
+//! menu bar: through AppKit, `+[NSApplication sharedApplication]` there would create the
+//! application object the loop never built.
 //!
-//! NON-VACUITY. LaunchServices check-in happened inside `-[NSApplication init]`
-//! and the posture inside `applicationDidFinishLaunching:`, and the control
-//! socket binds BEFORE the loop starts. A probe fired the moment the socket
-//! appears could read the pre-launch state and pass against the broken build.
-//! So this first drives `aterm ctl spawn` — a `Wake::SpawnSession` round trip
-//! that only `user_event` can answer, which no loop delivers before it is
-//! running — and probes only after that reply, three times over a second, so a
-//! registration or activation that lands a beat late is still caught. Between
-//! the two it drives `aterm ctl chrome`, the one verb that read AppKit's menu
-//! bar: `+[NSApplication sharedApplication]` there would create the application
-//! object (and its LaunchServices record) the loop never built.
-//!
-//! ISOLATION and BOOT discipline are the shared fixtures' (`support/headless_boot.rs`): the
-//! shared `support/launch_isolation.rs` fixture (a private HOME and every XDG
-//! root, no inherited `ATERM_*`/`ATPKG_*`, the auto-update / priming / packages
-//! fences, `SHELL=/bin/sh`), and every client call pinned with `--sock`. That
-//! harness keys its scratch dir on the test-binary pid, so this file's boots
-//! carry their own `athl` prefix, distinct from every other file in the suite.
+//! Isolation and boot are `support/headless_boot.rs`'s and `support/launch_isolation.rs`'s,
+//! every client call pinned with `--sock`; this file's boots carry their own `athl` prefix.
 
 #![cfg(target_os = "macos")]
 #![allow(
@@ -57,25 +38,24 @@ use crate::{headless_boot, launch_isolation};
 use headless_boot::{Instance, log_tail};
 
 /// Boot one real headless instance under the scratch world, 40x120
-/// ([`headless_boot::boot`]: `None` is an environment refusal — no scratch base,
-/// no log, no spawn, or a bind the OS refuses; an instance that exits or never
-/// listens FAILS the test, a startup regression rather than a skip).
-fn boot() -> Option<Instance> {
+/// ([`headless_boot::boot`]: an environment refusal — no scratch base, no log, no
+/// spawn, or a bind the OS refuses — is COULD NOT RUN; an instance that exits
+/// or never listens FAILS the test, a startup regression rather than a skip).
+fn boot() -> Instance {
     headless_boot::boot("athl", &["--lines", "40", "--columns", "120"])
 }
 
 const CLIENT_EXIT_DEADLINE: Duration = Duration::from_secs(90);
-/// A `swift -e` fallback can spend 5-15 s building its module cache cold; GENEROUS.
+/// A `swift -e` fallback can spend 5-15 s building its module cache cold.
 const PROBE_DEADLINE: Duration = Duration::from_secs(60);
 /// `activateIgnoringOtherApps:` lands through the WindowServer asynchronously:
 /// three samples half a second apart keep a late-landing theft observable.
 const PROBE_SAMPLES: usize = 3;
 const PROBE_GAP: Duration = Duration::from_millis(500);
 
-/// The hermetic environment shared by the server and every client call: the
-/// fixture strips every inherited `ATERM_*` (so the `--headless` FLAG — the
-/// spelling every probe script uses — is what arms the mode) and points HOME
-/// and every XDG root into the scratch world.
+/// The hermetic environment shared by the server and every client call
+/// ([`launch_isolation::apply`]): no inherited `ATERM_*`, so the `--headless` flag is what
+/// arms the mode, and HOME and every XDG root in the scratch world.
 fn hermetic_env(cmd: &mut Command, tmp: &Path) {
     launch_isolation::apply(cmd, tmp);
 }
@@ -120,12 +100,10 @@ fn bounded_wait(mut child: Child, what: &str, deadline: Duration) -> Result<Outp
     })
 }
 
-/// Run one `aterm <args…>` client call against the instance, hermetically,
-/// asserting success and returning stdout as UTF-8. The first call of this file is
-/// the anchor that needs the event loop running, and on a machine under a build
-/// storm the loop can take longer than the client's 10 s accept deadline to start
-/// taking connections ([`headless_boot::until_accepted`]; seen 2026-10-09, 3 times in
-/// sixteen gate-like rounds). Any other failure ends the test at once.
+/// Run one `aterm <args…>` client call against the instance, hermetically, asserting success
+/// and returning stdout. The first call is the anchor that needs the event loop running, which
+/// under load can start taking connections later than the client's 10 s accept deadline
+/// ([`headless_boot::until_accepted`]); any other failure ends the test.
 fn client_ok(inst: &Instance, args: &[&str]) -> String {
     let out = headless_boot::until_accepted(|| {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
@@ -147,15 +125,13 @@ fn client_ok(inst: &Instance, args: &[&str]) -> String {
     String::from_utf8(out.stdout).expect("client stdout is UTF-8")
 }
 
-/// The probe reads four facts through AppKit and prints ONE line:
-/// `policy=<0|1|2|none> frontmost=<pid|-1> frontpolicy=<0|1|2|none> active=<0|1>`.
-/// Two spellings of the same program: JXA's ObjC bridge needs no compile step
-/// (~0.3 s wall, measured on macOS 13.7), and the `/usr/bin/swift -e` twin — the
-/// `aterm-verify` `smoke.rs` pattern — is the fallback (seconds per run, more on
-/// a cold module cache). `policy=none` means LaunchServices holds no app record
-/// for the pid. `frontpolicy` is the same lookup for the FRONTMOST app's pid, the
-/// positive control: a lookup that answered `none` for every pid would read every
-/// headless instance as clean, so it must find the app that is in front.
+/// The probe reads four facts through AppKit and prints one line:
+/// `policy=<0|1|2|none> frontmost=<pid|-1> frontpolicy=<0|1|2|none> active=<0|1>`. Two
+/// spellings of one program: JXA's ObjC bridge needs no compile step (~0.3 s), and the
+/// `/usr/bin/swift -e` twin is the fallback (seconds, more on a cold module cache).
+/// `policy=none`: LaunchServices holds no app record for the pid. `frontpolicy` is the same
+/// lookup for the frontmost app's pid, the positive control: a lookup that answered `none` for
+/// every pid would read every instance as clean.
 enum ProbeTool {
     Jxa,
     Swift,
@@ -278,7 +254,7 @@ fn probe(tool: &ProbeTool, pid: u32) -> Result<Posture, String> {
     })
 }
 
-/// The one honest reason this test cannot run at all, as a SKIP reason: no
+/// The one honest reason this test cannot run at all, COULD NOT RUN: no
 /// probe tool. (`verify --no-windows` is the windowed checks' opt-out; this
 /// test opens no window, so it has none.) A missing WindowServer session
 /// (an SSH login, a CI box) is deliberately NOT a skip — `ioreg -c IOHIDSystem`
@@ -298,14 +274,12 @@ fn cannot_present() -> Option<String> {
     None
 }
 
-/// The regression, live: a headless instance, its loop running (proved by the
-/// `spawn` round trip), is no app LaunchServices knows, is not active, and is
-/// not what the human is looking at.
+/// A headless instance, its loop running (proved by the `spawn` round trip), is no app
+/// LaunchServices knows, is not active, and is not what the human is looking at.
 #[test]
 fn a_headless_launch_is_not_an_activatable_app_and_never_takes_the_front() {
     if let Some(why) = cannot_present() {
-        eprintln!("SKIP: {why}");
-        return;
+        aterm_spec::host::could_not_run(why);
     }
     let tool = probe_tool().expect("cannot_present checked the tool");
     // Diagnostics only: the human may legitimately switch apps mid-test, so
@@ -321,28 +295,22 @@ fn a_headless_launch_is_not_an_activatable_app_and_never_takes_the_front() {
         );
     }
 
-    let Some(inst) = boot() else { return };
+    let inst = boot();
     let sock = inst.sock.clone();
     let pid = inst.child.id();
 
-    // THE ANCHOR. `spawn` is `call_main(proxy, Wake::SpawnSession { .. })`,
-    // answered only from `user_event`; no loop delivers a user event before it
-    // is running — and the AppKit loop, if headless ever built it again, not
-    // before `did_finish_launching` had checked the process in, set the policy
-    // and sent (or not sent) the activation. A probe before this reply proves
-    // nothing.
+    // The anchor: `spawn` is `call_main(proxy, Wake::SpawnSession { .. })`, answered only from
+    // `user_event`, which no loop delivers before it is running (nor the AppKit loop before
+    // `did_finish_launching` checked the process in). A probe before this reply proves nothing.
     let spawned = client_ok(&inst, &["ctl", "--sock", &sock, "spawn"]);
     assert!(
         spawned.starts_with("OK s-"),
         "spawn replies `OK <sid>`: {spawned:?}"
     );
     // `chrome` reads the menu bar. Through AppKit that read begins with
-    // `+[NSApplication sharedApplication]`, which would CREATE the application
-    // object — and check the process in with LaunchServices, which the probes
-    // below then see — in a process whose display-free loop never built one
-    // (2026-09-26: the loop fix alone left this door open). Headless answers
-    // from `App::app_menu_bar`'s inert arm instead. Its text is checked after
-    // the probes, which are this test's verdict.
+    // `+[NSApplication sharedApplication]`, which would create the application object, and its
+    // LaunchServices record, in a process whose display-free loop never built one; headless
+    // answers from `App::app_menu_bar`'s inert arm. Its text is checked after the probes.
     let chrome = client_ok(&inst, &["ctl", "--sock", &sock, "chrome"]);
 
     let mut last = None;

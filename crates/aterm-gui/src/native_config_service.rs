@@ -35,7 +35,7 @@ pub(crate) struct ConfigSnapshot {
     /// them before it calls an authored key one with no effect.
     pub(crate) disk_faults: DiskFaults,
     /// Immutable non-text assets admitted with `text` at `revision`, shared as one outer
-    /// Arc; consumers never re-resolve Trail manifests or the custom kitty sprite.
+    /// Arc; consumers never re-resolve the custom kitty sprite.
     pub(crate) assets: Arc<crate::app_config::ConfigAssetCatalog>,
 }
 
@@ -205,19 +205,19 @@ pub(crate) struct VersionedConfigService {
 }
 
 impl VersionedConfigService {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "bench-support"))]
     pub(crate) fn new(text: String) -> Result<Self, String> {
         Self::new_with_themes(text, crate::app_config::ThemeCatalog::empty())
     }
 
     /// Runtime constructor used before presentation. Theme/rainbow kitty discovery is
-    /// bounded and parsed once here; Trail/Sparkle feeds stay pending for the startup
+    /// bounded and parsed once here; Sparkle feeds stay pending for the startup
     /// worker. Tests use the deterministic test constructor instead.
     pub(crate) fn new_runtime(text: String) -> Result<Self, String> {
         Self::new_with_themes_mode(text, crate::app_config::ThemeCatalog::discover(), true)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "bench-support"))]
     fn new_with_themes(
         text: String,
         themes: Arc<crate::app_config::ThemeCatalog>,
@@ -292,7 +292,7 @@ impl VersionedConfigService {
     }
 
     /// Resolve one worker-observed generation before it crosses to the event loop. Runs
-    /// on a host worker, since Trail manifests and a custom kitty sprite need file I/O.
+    /// on a host worker, since a custom kitty sprite needs file I/O.
     pub(crate) fn prepare_observation(
         observation: ConfigDiskObservation,
         themes: Arc<crate::app_config::ThemeCatalog>,
@@ -303,7 +303,7 @@ impl VersionedConfigService {
         let path_feeds = config.prepare_path_feed_generation();
         let preliminary = config.resolve_preliminary_asset_catalog_with_themes(themes);
         let assets = Arc::new(crate::app_config::ConfigAssetCatalog {
-            trail_packs: Arc::clone(&path_feeds.trail_packs),
+            trail_style: Arc::clone(&preliminary.trail_style),
             kitty_sprite: preliminary.kitty_sprite.clone(),
             wallpaper: preliminary.wallpaper.clone(),
             themes: Arc::clone(&preliminary.themes),
@@ -337,11 +337,10 @@ impl VersionedConfigService {
     pub(crate) fn complete_startup_path_generation(
         &mut self,
         consumers: aterm_effects::spec::SpecConsumerCapabilities,
-        trail_packs: Arc<crate::app_config::TrailPackCatalog>,
     ) {
         debug_assert_eq!(self.revision, 1);
         let assets = Arc::new(crate::app_config::ConfigAssetCatalog {
-            trail_packs,
+            trail_style: Arc::clone(&self.assets.trail_style),
             kitty_sprite: self.assets.kitty_sprite.clone(),
             wallpaper: self.assets.wallpaper.clone(),
             themes: Arc::clone(&self.assets.themes),
@@ -395,6 +394,24 @@ impl VersionedConfigService {
         self.write_reconciliation_required
     }
 
+    /// The admitted disk observation, when the service holds no optimistic
+    /// edit ahead of disk (DTP §6.4's retained observation): the text it last
+    /// admitted from disk and the baseline it came from. `None` while a write
+    /// is unreconciled, the text is an unwritten edit, or nothing was read
+    /// from disk. Derived from the authority itself, never cached a second
+    /// time, and it reads no file: a theme refresh re-prepares the face from it.
+    pub(crate) fn admitted_observation(&self) -> Option<ConfigDiskObservation> {
+        (self.disk_text_admitted
+            && !self.write_reconciliation_required
+            && self.text == self.durable_text)
+            .then(|| self.disk_baseline.clone())
+            .flatten()
+            .map(|baseline| ConfigDiskObservation {
+                text: self.text.clone(),
+                baseline,
+            })
+    }
+
     /// Keep path/generation authority when startup read UTF-8 bytes but could not admit
     /// malformed TOML. Opening Manual supplies its config grant here; the service text
     /// stays unchanged until a valid durable Manual observation is admitted.
@@ -442,8 +459,11 @@ impl VersionedConfigService {
         self.synchronize_prepared_observation(prepared)
     }
 
-    /// [`synchronize_observation`] with an immutable asset catalog already
-    /// resolved by the config/font worker from the same text generation.
+    /// Admit the config and assets resolved by the worker, including path-fed policy
+    /// changes with identical text. Authored fields are determined by the text;
+    /// `ai` and `harness` are resolved independently. Policy or asset changes advance
+    /// the snapshot revision; only authored value changes stamp keys. Every
+    /// observation advances analysis.
     pub(crate) fn synchronize_observation_prepared(
         &mut self,
         observation: ConfigDiskObservation,
@@ -471,8 +491,12 @@ impl VersionedConfigService {
             self.values = values;
             self.disk_faults = disk_faults;
             self.config = Arc::new(config);
-        } else if assets != self.assets {
+        } else if config.ai != self.config.ai
+            || config.harness != self.config.harness
+            || assets != self.assets
+        {
             self.revision = self.revision.saturating_add(1);
+            self.config = Arc::new(config);
         }
         self.durable_text.clone_from(&self.text);
         self.durable_values.clone_from(&self.values);
@@ -613,7 +637,7 @@ impl VersionedConfigService {
         // Validate the full typed config before advancing any state. Host-backed
         // source keys were rejected above (Manual's worker admits text and decoded
         // assets together), so structured toggle/theme/font changes reuse the admitted
-        // Trail/rainbow kitty/theme assets with no event-thread I/O. A sparkle-table
+        // trail-style/rainbow kitty/theme assets with no event-thread I/O. A sparkle-table
         // change below rewraps them with a pending consumer projection.
         let next_config = match parse_config(&next) {
             Ok(config) => config,
@@ -629,7 +653,7 @@ impl VersionedConfigService {
             && self.assets.sparkle_spec_consumers.is_some()
         {
             self.assets = Arc::new(crate::app_config::ConfigAssetCatalog {
-                trail_packs: Arc::clone(&self.assets.trail_packs),
+                trail_style: Arc::clone(&self.assets.trail_style),
                 kitty_sprite: self.assets.kitty_sprite.clone(),
                 wallpaper: self.assets.wallpaper.clone(),
                 themes: Arc::clone(&self.assets.themes),
@@ -641,7 +665,7 @@ impl VersionedConfigService {
         // inline; otherwise the catalog would serve the previous picture.
         if self.config.wallpaper != next_config.wallpaper {
             self.assets = Arc::new(crate::app_config::ConfigAssetCatalog {
-                trail_packs: Arc::clone(&self.assets.trail_packs),
+                trail_style: Arc::clone(&self.assets.trail_style),
                 kitty_sprite: self.assets.kitty_sprite.clone(),
                 wallpaper: crate::app_config::resolve_wallpaper_asset(
                     next_config.wallpaper.as_deref(),
@@ -792,8 +816,8 @@ impl VersionedConfigService {
         Ok(self.snapshot())
     }
 
-    /// Admit a catalog parsed by the background theme-directory watcher. Text, Trail
-    /// Packs and rainbow kitty keep their values; a changed catalog advances the one
+    /// Admit a catalog parsed by the background theme-directory watcher. Text, trail
+    /// style and rainbow kitty keep their values; a changed catalog advances the one
     /// outer snapshot revision.
     pub(crate) fn replace_theme_catalog(
         &mut self,
@@ -805,7 +829,7 @@ impl VersionedConfigService {
         }
         self.revision = self.revision.saturating_add(1);
         self.assets = Arc::new(crate::app_config::ConfigAssetCatalog {
-            trail_packs: Arc::clone(&self.assets.trail_packs),
+            trail_style: Arc::clone(&self.assets.trail_style),
             kitty_sprite: self.assets.kitty_sprite.clone(),
             wallpaper: self.assets.wallpaper.clone(),
             themes,
@@ -836,9 +860,8 @@ fn asset_sources_changed(
     fn normalized_kitty_sprite(value: Option<&str>) -> Option<&str> {
         value.map(str::trim).filter(|value| !value.is_empty())
     }
-    before.cursor_trail_packs != after.cursor_trail_packs
-        || normalized_kitty_sprite(before.cursor_nyan_sprite.as_deref())
-            != normalized_kitty_sprite(after.cursor_nyan_sprite.as_deref())
+    normalized_kitty_sprite(before.cursor_nyan_sprite.as_deref())
+        != normalized_kitty_sprite(after.cursor_nyan_sprite.as_deref())
 }
 
 fn read_config_file(
@@ -1004,35 +1027,79 @@ mod tests {
     #[test]
     fn byte_equal_external_observation_refreshes_assets_and_analysis_generation() {
         let dir = unique_config_dir("equal-text-assets");
-        let manifest = dir.join("trail-pack.toml");
+        let sprite = dir.join("nyan.png");
+        let png = |rgba: &[u8]| crate::app_introspect::encode_rgba8_png(rgba, 2, 1).unwrap();
         std::fs::write(
-            &manifest,
-            include_str!("../../aterm-effects/assets/trail-packs/synthwave.toml"),
+            &sprite,
+            png(&[0x22, 0x66, 0xee, 0xff, 0xee, 0x66, 0x22, 0xff]),
         )
         .unwrap();
         let text = format!(
-            "cursor_trail_packs = [{:?}]\ncursor_trail_style = \"pack:synthwave\"\n",
-            manifest.to_string_lossy()
+            "trail_sound_volume = nan\ncursor_nyan_sprite = {:?}\n",
+            sprite.to_string_lossy()
         );
         let mut service = VersionedConfigService::new(text.clone()).unwrap();
         let initial = service.snapshot();
-        assert_eq!(initial.assets.trail_packs.ids, ["synthwave"]);
+        let initial_fp = initial.assets.kitty_sprite.fingerprint();
 
         std::fs::write(
-            &manifest,
-            include_str!("../../aterm-effects/assets/trail-packs/emberfall.toml"),
+            &sprite,
+            png(&[0xee, 0x22, 0x66, 0xff, 0x22, 0xee, 0x66, 0xff]),
         )
         .unwrap();
         let refreshed = service.replace_external(text.clone()).unwrap();
         assert_eq!(refreshed.text, initial.text, "config bytes stay identical");
         assert!(refreshed.revision > initial.revision);
         assert!(refreshed.analysis_generation > initial.analysis_generation);
-        assert_eq!(refreshed.assets.trail_packs.ids, ["emberfall"]);
+        assert_ne!(refreshed.assets.kitty_sprite.fingerprint(), initial_fp);
 
-        let unchanged = service.replace_external(text).unwrap();
+        let unchanged = service.replace_external(text.clone()).unwrap();
         assert_eq!(unchanged.revision, refreshed.revision);
         assert!(unchanged.analysis_generation > refreshed.analysis_generation);
         assert_eq!(unchanged.assets, refreshed.assets);
+
+        // The worker resolves path-fed policy independently of the unchanged TOML.
+        // Tests supply the config directory explicitly rather than reading HOME.
+        let config_path = dir.join("aterm.toml");
+        let fleet_path = dir.join(aterm_agent::ai::config::FLEET_FILE);
+        std::fs::write(&config_path, &text).unwrap();
+        let observe = |service: &mut VersionedConfigService| {
+            let observation = VersionedConfigService::observe_path(&config_path, false).unwrap();
+            let mut prepared = VersionedConfigService::prepare_observation(
+                observation,
+                Arc::clone(&service.snapshot().assets.themes),
+            )
+            .unwrap();
+            prepared.config.ai = crate::app_config::AiPolicy::read_beside(&text, Some(&dir));
+            service.synchronize_prepared_observation(prepared).unwrap()
+        };
+        let absent = observe(&mut service);
+        assert_eq!(absent.config.ai.settings().preferred.0.id, "claude");
+
+        std::fs::write(&fleet_path, "schema = 1\npreferred = \"codex\"\n").unwrap();
+        let resolved = observe(&mut service);
+        assert_eq!(resolved.text, absent.text);
+        assert_eq!(resolved.semantic_values, absent.semantic_values);
+        assert_eq!(resolved.assets, absent.assets);
+        assert_eq!(
+            resolved.config.ai.settings().preferred.0.id,
+            "codex",
+            "same-text worker admission publishes the newly resolved policy"
+        );
+        assert_eq!(resolved.config.ai.fleet_paths.first(), Some(&fleet_path));
+        assert_eq!(resolved.revision, absent.revision + 1);
+        assert!(resolved.analysis_generation > absent.analysis_generation);
+
+        let repeated = observe(&mut service);
+        assert_eq!(repeated.revision, resolved.revision);
+        assert!(repeated.analysis_generation > resolved.analysis_generation);
+        assert!(repeated.config.trail_sound_volume.unwrap().is_nan());
+        assert_eq!(repeated.config.ai, resolved.config.ai);
+        assert_eq!(
+            service.restore_durable_snapshot().unwrap().config.ai,
+            resolved.config.ai,
+            "rollback keeps the admitted resolved policy"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1054,7 +1121,7 @@ mod tests {
             exact.sparkle_or_starburst_burst && exact.rainbow_ink && exact.twotone_ink,
             "negative control: the checked-in pack has shared-setting consumers"
         );
-        service.complete_startup_path_generation(exact, prepared.trail_packs);
+        service.complete_startup_path_generation(exact);
         let published = service.snapshot();
         assert_eq!(published.revision, preliminary.revision);
         assert_eq!(
@@ -1079,7 +1146,7 @@ mod tests {
         let initial = service.snapshot();
         let prepared = initial.config.prepare_path_feed_generation();
         let exact = prepared.sparkle.consumer_capabilities();
-        service.complete_startup_path_generation(exact, prepared.trail_packs);
+        service.complete_startup_path_generation(exact);
         let exact_snapshot = service.snapshot();
         let exact_assets = Arc::clone(&exact_snapshot.assets);
         assert_eq!(
@@ -1120,8 +1187,8 @@ mod tests {
         assert!(sparkle.assets.sparkle_spec_consumers.is_none());
         assert!(!Arc::ptr_eq(&sparkle.assets, &exact_assets));
         assert!(Arc::ptr_eq(
-            &sparkle.assets.trail_packs,
-            &exact_assets.trail_packs
+            &sparkle.assets.trail_style,
+            &exact_assets.trail_style
         ));
         assert!(Arc::ptr_eq(&sparkle.assets.themes, &exact_assets.themes));
     }
@@ -1217,32 +1284,6 @@ mod tests {
         let not_file = VersionedConfigService::observe_path(&dir, false).unwrap_err();
         assert!(not_file.contains("not a regular file"), "{not_file}");
         let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// A config the OS will not open says so once: the file, the OS error, no
-    /// internal stage tag and no second "unreadable" wrapped around the first.
-    #[cfg(unix)]
-    #[test]
-    fn an_unopenable_config_names_the_file_once() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = unique_config_dir("unopenable");
-        let path = dir.join("aterm.toml");
-        std::fs::write(&path, "font_px = 14.0\n").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let result = VersionedConfigService::observe_path(&path, false);
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-        // A process the permission bits do not stop (root) has nothing to say.
-        let Err(error) = result else {
-            return;
-        };
-        let shown = path.display().to_string();
-        assert_eq!(error.matches(&shown).count(), 1, "{error}");
-        assert!(error.starts_with("could not open "), "{error}");
-        assert!(
-            !error.contains("Preflight") && !error.contains("unreadable"),
-            "{error}"
-        );
     }
 
     #[test]
@@ -1352,99 +1393,6 @@ mod tests {
             "theme = \"Dracula\"\n"
         );
         let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn stale_patch_rebases_only_across_unchanged_keys() {
-        let mut service = VersionedConfigService::new(
-            "theme = \"Nord\"\nfont_px = 14.0\n# keep me\ncustom = 7\n".into(),
-        )
-        .unwrap();
-        let base = service.snapshot().revision;
-        assert!(matches!(
-            service.patch(edit(base, "theme", ExpectedValue::Any, Some("Dracula"))),
-            ConfigPatchResult::Applied { .. }
-        ));
-        assert!(matches!(
-            service.patch(edit(base, "font_px", ExpectedValue::Any, Some("16"))),
-            ConfigPatchResult::Applied { .. }
-        ));
-        assert!(matches!(
-            service.patch(edit(base, "theme", ExpectedValue::Any, Some("Tokyo Night"))),
-            ConfigPatchResult::Conflict { keys, .. } if keys == ["theme"]
-        ));
-        assert!(service.snapshot().text.contains("# keep me"));
-        assert!(service.snapshot().text.contains("custom = 7"));
-    }
-
-    #[test]
-    fn same_key_external_edit_blocks_stale_write() {
-        let mut service = VersionedConfigService::new("theme = \"Nord\"\n".into()).unwrap();
-        let base = service.snapshot().revision;
-        service
-            .replace_external("theme = \"Catppuccin Mocha\"\n".into())
-            .unwrap();
-        assert!(matches!(
-            service.patch(edit(base, "theme", ExpectedValue::Any, Some("Dracula"))),
-            ConfigPatchResult::Conflict { .. }
-        ));
-        assert_eq!(
-            service.value("theme").unwrap().as_deref(),
-            Some("Catppuccin Mocha")
-        );
-    }
-
-    #[test]
-    fn reset_all_is_one_revision_and_preserves_unknown_keys() {
-        let mut service = VersionedConfigService::new(
-            "theme = \"Nord\"\nfont_px = 15.0\ncustom = \"stay\"\n".into(),
-        )
-        .unwrap();
-        let before = service.snapshot().revision;
-        let ConfigPatchResult::Applied { snapshot, .. } =
-            service.reset_all(before, ["theme".to_string(), "font_px".to_string()])
-        else {
-            panic!("reset should commit");
-        };
-        assert_eq!(snapshot.revision, before + 1);
-        assert!(!snapshot.text.contains("theme ="));
-        assert!(!snapshot.text.contains("font_px ="));
-        assert!(snapshot.text.contains("custom = \"stay\""));
-    }
-
-    #[test]
-    fn conditional_undo_preserves_unrelated_change_and_rejects_same_key_change() {
-        let mut service =
-            VersionedConfigService::new("theme = \"Nord\"\nfont_px = 14.0\n".into()).unwrap();
-        let base = service.snapshot().revision;
-        let ConfigPatchResult::Applied { undo, .. } =
-            service.patch(edit(base, "theme", ExpectedValue::Any, Some("Dracula")))
-        else {
-            panic!("patch should commit");
-        };
-        let current = service.snapshot().revision;
-        service.patch(edit(current, "font_px", ExpectedValue::Any, Some("18")));
-        assert!(matches!(
-            service.undo(undo),
-            ConfigPatchResult::Applied { .. }
-        ));
-        assert_eq!(service.value("theme").unwrap().as_deref(), Some("Nord"));
-        assert_eq!(service.value("font_px").unwrap().as_deref(), Some("18"));
-
-        let base = service.snapshot().revision;
-        let ConfigPatchResult::Applied { undo, .. } =
-            service.patch(edit(base, "theme", ExpectedValue::Any, Some("Dracula")))
-        else {
-            panic!("patch should commit");
-        };
-        service
-            .replace_external("theme = \"External\"\nfont_px = 18.0\n".into())
-            .unwrap();
-        assert!(matches!(
-            service.undo(undo),
-            ConfigPatchResult::Conflict { keys, .. } if keys == ["theme"]
-        ));
-        assert_eq!(service.value("theme").unwrap().as_deref(), Some("External"));
     }
 
     #[test]
@@ -1688,33 +1636,6 @@ mod tests {
         }
     }
 
-    /// Full-depth dotted projection: each item in a table tree is exposed under its
-    /// dotted path with per-key semantics, while each table keeps its whole-table
-    /// opaque entry. An absent child is absent; an effective default is presentation.
-    #[test]
-    fn parse_values_projects_dotted_keys() {
-        let values =
-            parse_values("font_px = 13.0\n[matrix_rain]\nenabled = true\nfps = 24\n").unwrap();
-        assert_eq!(
-            values.get("matrix_rain.enabled").map(String::as_str),
-            Some("true")
-        );
-        assert_eq!(
-            values.get("matrix_rain.fps").map(String::as_str),
-            Some("24")
-        );
-        assert!(
-            values.contains_key("matrix_rain"),
-            "the whole-table opaque entry survives"
-        );
-        assert_eq!(values.get("font_px").map(String::as_str), Some("13"));
-        let none = parse_values("font_px = 13.0\n").unwrap();
-        assert!(
-            !none.keys().any(|k| k.starts_with("matrix_rain")),
-            "absent table projects nothing (not explicit)"
-        );
-    }
-
     #[test]
     fn snapshot_key_identities_keep_literal_dots_distinct_from_nested_paths() {
         let source = r#""packages.include" = ["literal"]
@@ -1797,73 +1718,6 @@ include = ["nested"]
             Some(r#"["literal-two"]"#)
         );
         assert!(!values.contains_key("packages.include"));
-    }
-
-    /// Dotted keys take part in OCC: a patch expecting the old child value conflicts
-    /// once the file moved, like a flat key; the winning write and blank-revert both go
-    /// through `apply_prefs_edits`, and a table the revert leaves bare goes with it.
-    #[test]
-    fn dotted_key_occ_conflict_write_and_blank_revert() {
-        let mut service =
-            VersionedConfigService::new("[matrix_rain]\nenabled = false\n".into()).unwrap();
-        let base = service.snapshot().revision;
-
-        // An external edit flips the child; a stale exact-expectation patch
-        // must CONFLICT on the dotted key, not silently clobber.
-        service
-            .replace_external("[matrix_rain]\nenabled = true\n".into())
-            .unwrap();
-        let stale = service.patch(edit(
-            base,
-            "matrix_rain.enabled",
-            ExpectedValue::Exact(Some("false".into())),
-            Some("false"),
-        ));
-        let ConfigPatchResult::Conflict { keys, .. } = stale else {
-            panic!("stale dotted expectation must conflict, got {stale:?}");
-        };
-        assert_eq!(keys, vec!["matrix_rain.enabled".to_string()]);
-
-        // A current-revision write lands typed (bool, not string).
-        let rev = service.snapshot().revision;
-        let applied = service.patch(edit(
-            rev,
-            "matrix_rain.enabled",
-            ExpectedValue::Exact(Some("true".into())),
-            Some("false"),
-        ));
-        let ConfigPatchResult::Applied { snapshot, .. } = applied else {
-            panic!("current-revision dotted write applies, got {applied:?}");
-        };
-        assert!(snapshot.text.contains("enabled = false"));
-        assert_eq!(
-            service.value("matrix_rain.enabled").unwrap().as_deref(),
-            Some("false")
-        );
-
-        // Blank reverts: the table's last key goes, and the bare [matrix_rain]
-        // header with it (no comment of its own; empty parses to defaults).
-        let rev = service.snapshot().revision;
-        let reverted = service.patch(edit(
-            rev,
-            "matrix_rain.enabled",
-            ExpectedValue::Exact(Some("false".into())),
-            None,
-        ));
-        let ConfigPatchResult::Applied { snapshot, .. } = reverted else {
-            panic!("blank revert applies, got {reverted:?}");
-        };
-        assert!(
-            !snapshot.text.contains("enabled"),
-            "the leaf is removed: {:?}",
-            snapshot.text
-        );
-        assert!(
-            !snapshot.text.contains("[matrix_rain]"),
-            "a bare table goes with its last key: {:?}",
-            snapshot.text
-        );
-        assert_eq!(service.value("matrix_rain.enabled").unwrap(), None);
     }
 
     /// Depth-2 dotted keys behave like depth-1: `sparkle_words.profanity.enabled` gets

@@ -5,190 +5,152 @@
 claude/assistant/usage	ok	{"isSidechain":false,"message":{"id":"msg_1","model":"claude-opus-5-5","usage":{"cache_creation_input_tokens":2048,"cache_read_input_tokens":40960,"input_tokens":3,"iterations":[{"type":"message"}],"output_tokens":120,"server_tool_use":{"web_search_requests":0},"service_tier":"standard"}},"timestamp":"2026-10-15T20:36:32.123Z","type":"assistant"}
 claude/assistant/metadata	ok	{"cwd":"/home/dev/src","effort":"high","isSidechain":false,"message":{"model":"claude-opus-5-5"},"timestamp":"2026-10-15T20:36:32.123Z","type":"assistant","version":"2.1.301"}
 claude/assistant/command	ok	{"cwd":"/home/dev/src","effort":"high","isSidechain":false,"message":{"content":null,"model":"claude-opus-5-5"},"timestamp":"2026-10-15T20:36:32.123Z","type":"assistant","version":"2.1.301"}
-claude/assistant/conversation	ok	{"isSidechain":false,"message":{"content":[{"text":"Done.","type":"text"},{"type":"tool_use"}],"model":"claude-opus-5-5"},"parentUuid":"p-1","timestamp":"2026-10-15T20:36:32.123Z","type":"assistant","uuid":"u-2"}
-claude/assistant/codex	ok	{"timestamp":"2026-10-15T20:36:32.123Z","type":"assistant"}
+claude/assistant/conversation	ok	{"isSidechain":false,"message":{"content":[{"text":"Done.","type":"text"},{"type":"tool_use"}],"model":"claude-opus-5-5"},"parentUuid":"p-1","timestamp":"2026-10-15T20:36:32.123Z","type":"assistant","uuid":"u-2","version":"2.1.301"}
 claude/user-prompt/usage	ok	{"isSidechain":false,"message":{},"timestamp":"2026-10-15T20:36:30Z","type":"user"}
 claude/user-prompt/metadata	ok	{"cwd":"/home/dev/src","isSidechain":false,"message":{},"timestamp":"2026-10-15T20:36:30Z","type":"user","version":"2.1.301"}
 claude/user-prompt/command	ok	{"cwd":"/home/dev/src","isSidechain":false,"message":{"content":"/model opus"},"timestamp":"2026-10-15T20:36:30Z","type":"user","version":"2.1.301"}
-claude/user-prompt/conversation	ok	{"isMeta":false,"isSidechain":false,"message":{"content":"/model opus"},"parentUuid":null,"timestamp":"2026-10-15T20:36:30Z","type":"user","uuid":"u-1"}
-claude/user-prompt/codex	ok	{"timestamp":"2026-10-15T20:36:30Z","type":"user"}
+claude/user-prompt/conversation	ok	{"isMeta":false,"isSidechain":false,"message":{"content":"/model opus"},"parentUuid":null,"promptId":"x","timestamp":"2026-10-15T20:36:30Z","type":"user","uuid":"u-1","version":"2.1.301"}
 claude/user-tool-result/usage	ok	{"message":{},"timestamp":"2026-10-15T20:36:40Z","type":"user"}
 claude/user-tool-result/metadata	ok	{"message":{},"timestamp":"2026-10-15T20:36:40Z","type":"user"}
 claude/user-tool-result/command	ok	{"message":{"content":null},"timestamp":"2026-10-15T20:36:40Z","type":"user"}
 claude/user-tool-result/conversation	ok	{"message":{"content":[{"type":"tool_result"},{"text":"follow-up","type":"text"}]},"parentUuid":"u-2","timestamp":"2026-10-15T20:36:40Z","type":"user","uuid":"u-3"}
-claude/user-tool-result/codex	ok	{"timestamp":"2026-10-15T20:36:40Z","type":"user"}
 claude/turn-duration/usage	ok	{"durationMs":5123,"isSidechain":false,"subtype":"turn_duration","timestamp":"2026-10-15T20:36:41Z","type":"system"}
 claude/turn-duration/metadata	ok	{"isSidechain":false,"timestamp":"2026-10-15T20:36:41Z","type":"system"}
 claude/turn-duration/command	ok	{"isSidechain":false,"timestamp":"2026-10-15T20:36:41Z","type":"system"}
 claude/turn-duration/conversation	ok	{"isMeta":true,"isSidechain":false,"parentUuid":"u-3","subtype":"turn_duration","timestamp":"2026-10-15T20:36:41Z","type":"system","uuid":"u-4"}
-claude/turn-duration/codex	ok	{"timestamp":"2026-10-15T20:36:41Z","type":"system"}
 claude/limit/usage	ok	{"isApiErrorMessage":true,"subtype":"api_error","timestamp":"2026-10-15T20:37:00Z","type":"system"}
 claude/limit/metadata	ok	{"timestamp":"2026-10-15T20:37:00Z","type":"system"}
 claude/limit/command	ok	{"timestamp":"2026-10-15T20:37:00Z","type":"system"}
 claude/limit/conversation	ok	{"content":"You've hit your limit","error":"rate_limit","isApiErrorMessage":true,"quotaLimits":{"isUsingOverage":false,"overageStatus":"rejected","rateLimitType":"five_hour","resetsAt":1790870400,"status":"rejected"},"subtype":"api_error","timestamp":"2026-10-15T20:37:00Z","type":"system","uuid":"u-5"}
-claude/limit/codex	ok	{"timestamp":"2026-10-15T20:37:00Z","type":"system"}
 claude/compact-boundary/usage	ok	{"subtype":"compact_boundary","timestamp":"2026-10-15T20:40:00Z","type":"system"}
 claude/compact-boundary/metadata	ok	{"timestamp":"2026-10-15T20:40:00Z","type":"system"}
 claude/compact-boundary/command	ok	{"timestamp":"2026-10-15T20:40:00Z","type":"system"}
 claude/compact-boundary/conversation	ok	{"content":"Conversation compacted","isCompactSummary":true,"isMeta":false,"parentUuid":null,"subtype":"compact_boundary","timestamp":"2026-10-15T20:40:00Z","type":"system","uuid":"u-6"}
-claude/compact-boundary/codex	ok	{"timestamp":"2026-10-15T20:40:00Z","type":"system"}
 claude/bookkeeping/usage	ok	{"type":"cost-state"}
 claude/bookkeeping/metadata	ok	{"type":"cost-state"}
 claude/bookkeeping/command	ok	{"type":"cost-state"}
 claude/bookkeeping/conversation	ok	{"type":"cost-state"}
-claude/bookkeeping/codex	ok	{"type":"cost-state"}
 codex/session-meta/usage	ok	{"timestamp":"2026-10-15T20:00:00.000Z","type":"session_meta"}
 codex/session-meta/metadata	ok	{"timestamp":"2026-10-15T20:00:00.000Z","type":"session_meta"}
 codex/session-meta/command	ok	{"timestamp":"2026-10-15T20:00:00.000Z","type":"session_meta"}
 codex/session-meta/conversation	ok	{"timestamp":"2026-10-15T20:00:00.000Z","type":"session_meta"}
-codex/session-meta/codex	ok	{"payload":{"cwd":"/home/dev/src"},"timestamp":"2026-10-15T20:00:00.000Z","type":"session_meta"}
 codex/turn-context/usage	ok	{"timestamp":"2026-10-15T20:00:01.000Z","type":"turn_context"}
 codex/turn-context/metadata	ok	{"timestamp":"2026-10-15T20:00:01.000Z","type":"turn_context"}
 codex/turn-context/command	ok	{"timestamp":"2026-10-15T20:00:01.000Z","type":"turn_context"}
 codex/turn-context/conversation	ok	{"timestamp":"2026-10-15T20:00:01.000Z","type":"turn_context"}
-codex/turn-context/codex	ok	{"payload":{"approval_policy":"on-request","cwd":"/home/dev/src","model":"gpt-5-codex","sandbox_policy":{"type":"workspace-write"}},"timestamp":"2026-10-15T20:00:01.000Z","type":"turn_context"}
 codex/response-item/usage	ok	{"timestamp":"2026-10-15T20:00:02.000Z","type":"response_item"}
 codex/response-item/metadata	ok	{"timestamp":"2026-10-15T20:00:02.000Z","type":"response_item"}
 codex/response-item/command	ok	{"timestamp":"2026-10-15T20:00:02.000Z","type":"response_item"}
 codex/response-item/conversation	ok	{"timestamp":"2026-10-15T20:00:02.000Z","type":"response_item"}
-codex/response-item/codex	ok	{"payload":{"role":"user","type":"message"},"timestamp":"2026-10-15T20:00:02.000Z","type":"response_item"}
 drift/usage-strings/usage	ok	{"message":{"model":null,"usage":{"cache_read_input_tokens":null,"input_tokens":"3","output_tokens":null}},"type":"assistant"}
 drift/usage-strings/metadata	ok	{"message":{"model":null},"type":"assistant"}
 drift/usage-strings/command	ok	{"message":{"model":null},"type":"assistant"}
 drift/usage-strings/conversation	ok	{"message":{"model":null},"type":"assistant"}
-drift/usage-strings/codex	ok	{"type":"assistant"}
 drift/message-array/usage	ok	{"message":null,"timestamp":7,"type":"assistant"}
 drift/message-array/metadata	ok	{"message":null,"timestamp":7,"type":"assistant"}
 drift/message-array/command	ok	{"message":null,"timestamp":7,"type":"assistant"}
 drift/message-array/conversation	ok	{"message":null,"timestamp":7,"type":"assistant"}
-drift/message-array/codex	ok	{"timestamp":7,"type":"assistant"}
 drift/content-scalars/usage	ok	{"message":{},"type":"user"}
 drift/content-scalars/metadata	ok	{"message":{},"type":"user"}
 drift/content-scalars/command	ok	{"message":{"content":null},"type":"user"}
 drift/content-scalars/conversation	ok	{"message":{"content":[null,12,"scalar",null,{"text":"kept","type":"text"},{"text":null}]},"type":"user"}
-drift/content-scalars/codex	ok	{"type":"user"}
 drift/quota-shapes/usage	ok	{"type":"system"}
 drift/quota-shapes/metadata	ok	{"type":"system"}
 drift/quota-shapes/command	ok	{"type":"system"}
 drift/quota-shapes/conversation	ok	{"quotaLimits":{"rateLimitType":null,"resetsAt":"soon","status":null},"type":"system"}
-drift/quota-shapes/codex	ok	{"type":"system"}
 duplicate/last-wins/usage	ok	{"message":{"model":"b"},"type":"system"}
 duplicate/last-wins/metadata	ok	{"message":{"model":"b"},"type":"system"}
 duplicate/last-wins/command	ok	{"message":{"model":"b"},"type":"system"}
 duplicate/last-wins/conversation	ok	{"message":{"model":"b"},"type":"system"}
-duplicate/last-wins/codex	ok	{"type":"system"}
 duplicate/escaped-spelling/usage	ok	{"message":{"model":"b"},"type":"user"}
 duplicate/escaped-spelling/metadata	ok	{"message":{"model":"b"},"type":"user"}
 duplicate/escaped-spelling/command	ok	{"message":{"model":"b"},"type":"user"}
 duplicate/escaped-spelling/conversation	ok	{"message":{"model":"b"},"type":"user"}
-duplicate/escaped-spelling/codex	ok	{"type":"user"}
 number/u64-max/usage	ok	{"message":{"usage":{"input_tokens":18446744073709551615}},"type":"assistant"}
 number/u64-max/metadata	ok	{"message":{},"type":"assistant"}
 number/u64-max/command	ok	{"message":{},"type":"assistant"}
 number/u64-max/conversation	ok	{"message":{},"type":"assistant"}
-number/u64-max/codex	ok	{"type":"assistant"}
 number/u64-overflow/usage	ok	{"message":{"usage":{"input_tokens":1.8446744073709552e+19}},"type":"assistant"}
 number/u64-overflow/metadata	ok	{"message":{},"type":"assistant"}
 number/u64-overflow/command	ok	{"message":{},"type":"assistant"}
 number/u64-overflow/conversation	ok	{"message":{},"type":"assistant"}
-number/u64-overflow/codex	ok	{"type":"assistant"}
 number/i64-min/usage	ok	{"message":{"usage":{"input_tokens":-9223372036854775808}},"type":"assistant"}
 number/i64-min/metadata	ok	{"message":{},"type":"assistant"}
 number/i64-min/command	ok	{"message":{},"type":"assistant"}
 number/i64-min/conversation	ok	{"message":{},"type":"assistant"}
-number/i64-min/codex	ok	{"type":"assistant"}
 number/negative-zero/usage	ok	{"durationMs":-0.0,"message":{"usage":{"input_tokens":-0.0}},"type":"assistant"}
 number/negative-zero/metadata	ok	{"message":{},"type":"assistant"}
 number/negative-zero/command	ok	{"message":{},"type":"assistant"}
 number/negative-zero/conversation	ok	{"message":{},"type":"assistant"}
-number/negative-zero/codex	ok	{"type":"assistant"}
 number/exponent/usage	ok	{"durationMs":1000.0,"type":"system"}
 number/exponent/metadata	ok	{"type":"system"}
 number/exponent/command	ok	{"type":"system"}
 number/exponent/conversation	ok	{"type":"system"}
-number/exponent/codex	ok	{"type":"system"}
 number/infinite/usage	err	number out of range at line 1 column 37
 number/infinite/metadata	err	number out of range at line 1 column 37
 number/infinite/command	err	number out of range at line 1 column 37
 number/infinite/conversation	err	number out of range at line 1 column 37
-number/infinite/codex	err	number out of range at line 1 column 37
 number/nan-literal/usage	err	expected a JSON value at line 1 column 31
 number/nan-literal/metadata	err	expected a JSON value at line 1 column 31
 number/nan-literal/command	err	expected a JSON value at line 1 column 31
 number/nan-literal/conversation	err	expected a JSON value at line 1 column 31
-number/nan-literal/codex	err	expected a JSON value at line 1 column 31
 number/infinity-literal/usage	err	expected a JSON value at line 1 column 31
 number/infinity-literal/metadata	err	expected a JSON value at line 1 column 31
 number/infinity-literal/command	err	expected a JSON value at line 1 column 31
 number/infinity-literal/conversation	err	expected a JSON value at line 1 column 31
-number/infinity-literal/codex	err	expected a JSON value at line 1 column 31
 number/leading-zero/usage	err	number has a leading zero at line 1 column 32
 number/leading-zero/metadata	err	number has a leading zero at line 1 column 32
 number/leading-zero/command	err	number has a leading zero at line 1 column 32
 number/leading-zero/conversation	err	number has a leading zero at line 1 column 32
-number/leading-zero/codex	err	number has a leading zero at line 1 column 32
 shape/array/usage	ok	null
 shape/array/metadata	ok	null
 shape/array/command	ok	null
 shape/array/conversation	ok	null
-shape/array/codex	ok	null
 shape/string/usage	ok	"assistant"
 shape/string/metadata	ok	"assistant"
 shape/string/command	ok	"assistant"
 shape/string/conversation	ok	"assistant"
-shape/string/codex	ok	"assistant"
 shape/null/usage	ok	null
 shape/null/metadata	ok	null
 shape/null/command	ok	null
 shape/null/conversation	ok	null
-shape/null/codex	ok	null
 shape/empty-object/usage	ok	{}
 shape/empty-object/metadata	ok	{}
 shape/empty-object/command	ok	{}
 shape/empty-object/conversation	ok	{}
-shape/empty-object/codex	ok	{}
 shape/empty/usage	err	unexpected end of JSON input at line 1 column 1
 shape/empty/metadata	err	unexpected end of JSON input at line 1 column 1
 shape/empty/command	err	unexpected end of JSON input at line 1 column 1
 shape/empty/conversation	err	unexpected end of JSON input at line 1 column 1
-shape/empty/codex	err	unexpected end of JSON input at line 1 column 1
 shape/trailing/usage	err	trailing characters after JSON value at line 1 column 17
 shape/trailing/metadata	err	trailing characters after JSON value at line 1 column 17
 shape/trailing/command	err	trailing characters after JSON value at line 1 column 17
 shape/trailing/conversation	err	trailing characters after JSON value at line 1 column 17
-shape/trailing/codex	err	trailing characters after JSON value at line 1 column 17
 shape/trailing-comma/usage	err	trailing comma in object at line 1 column 16
 shape/trailing-comma/metadata	err	trailing comma in object at line 1 column 16
 shape/trailing-comma/command	err	trailing comma in object at line 1 column 16
 shape/trailing-comma/conversation	err	trailing comma in object at line 1 column 16
-shape/trailing-comma/codex	err	trailing comma in object at line 1 column 16
 shape/unterminated/usage	err	unexpected end of JSON input at line 1 column 39
 shape/unterminated/metadata	err	unexpected end of JSON input at line 1 column 39
 shape/unterminated/command	err	unexpected end of JSON input at line 1 column 39
 shape/unterminated/conversation	err	unexpected end of JSON input at line 1 column 39
-shape/unterminated/codex	err	unexpected end of JSON input at line 1 column 39
 shape/lone-surrogate/usage	err	unpaired high surrogate in \\u escape at line 1 column 44
 shape/lone-surrogate/metadata	err	unpaired high surrogate in \\u escape at line 1 column 44
 shape/lone-surrogate/command	err	unpaired high surrogate in \\u escape at line 1 column 44
 shape/lone-surrogate/conversation	err	unpaired high surrogate in \\u escape at line 1 column 44
-shape/lone-surrogate/codex	err	unpaired high surrogate in \\u escape at line 1 column 44
 shape/bad-escape-discarded/usage	err	invalid escape sequence at line 1 column 29
 shape/bad-escape-discarded/metadata	err	invalid escape sequence at line 1 column 29
 shape/bad-escape-discarded/command	err	invalid escape sequence at line 1 column 29
 shape/bad-escape-discarded/conversation	err	invalid escape sequence at line 1 column 29
-shape/bad-escape-discarded/codex	err	invalid escape sequence at line 1 column 29
 shape/control-char/usage	err	control character in string at line 1 column 12
 shape/control-char/metadata	err	control character in string at line 1 column 12
 shape/control-char/command	err	control character in string at line 1 column 12
 shape/control-char/conversation	err	control character in string at line 1 column 12
-shape/control-char/codex	err	control character in string at line 1 column 12
 shape/whitespace/usage	ok	{"type":"user"}
 shape/whitespace/metadata	ok	{"type":"user"}
 shape/whitespace/command	ok	{"type":"user"}
 shape/whitespace/conversation	ok	{"type":"user"}
-shape/whitespace/codex	ok	{"type":"user"}
 shape/deep-discarded/usage	err	recursion limit exceeded at line 1 column 138
 shape/deep-discarded/metadata	err	recursion limit exceeded at line 1 column 138
 shape/deep-discarded/command	err	recursion limit exceeded at line 1 column 138
 shape/deep-discarded/conversation	err	recursion limit exceeded at line 1 column 138
-shape/deep-discarded/codex	err	recursion limit exceeded at line 1 column 138

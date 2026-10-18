@@ -161,7 +161,7 @@ pub(super) struct ResizeOrigin {
     native: bool,
 }
 
-/// The selection and vi cursor line a grid resize undo will put back
+/// The active selection a grid resize undo will put back
 /// (`Terminal::follow_resize_undo_selection`). Session-only.
 #[derive(Clone, Debug)]
 pub(super) struct ResizeUndoSelection {
@@ -172,12 +172,6 @@ pub(super) struct ResizeUndoSelection {
     pre: Option<crate::selection::TextSelection>,
     /// The selection as the newest of those resizes left it.
     after: crate::selection::TextSelection,
-    /// The vi cursor's line before that undo's first shrink, on the same
-    /// terms as `pre` (and `None` while copy mode is off).
-    vi_pre: Option<i32>,
-    /// The vi cursor's line as the newest of those resizes left it (`None`
-    /// while copy mode is off).
-    vi_after: Option<i32>,
 }
 
 /// The newest [`RESIZE_JOURNAL_CAP`] resize reports, the ordinal and the lifetime token. A
@@ -267,51 +261,36 @@ impl Terminal {
     /// Keep the selection whole across a flap the grid undoes: record it as it stood before
     /// the undo's first shrink, keep the record while the same undo stays open and nothing
     /// moved the selection, and put it back when the grid hands the rows back (`undone`).
-    /// `before` is the selection as this resize found it. The vi cursor's line
-    /// (`vi_before`, `None` while copy mode is off) gets the same treatment: the relabel
-    /// clamps a cursor on a demoted row to the top, so the grow would land it below its text.
+    /// `before` is the selection as this resize found it.
     pub(super) fn follow_resize_undo_selection(
         &mut self,
         before: crate::selection::TextSelection,
-        vi_before: Option<i32>,
         undone: bool,
     ) {
         let kept = self.resize_undo_selection.take();
         if undone {
-            if let Some(k) = kept {
-                if let Some(pre) = k.pre
-                    && k.after == before
-                {
-                    self.text_selection = pre;
-                }
-                if let Some(line) = k.vi_pre
-                    && k.vi_after == vi_before
-                {
-                    let now = self.vi.cursor_point().line;
-                    self.vi_shift(line.saturating_sub(now));
-                }
+            if let Some(k) = kept
+                && let Some(pre) = k.pre
+                && k.after == before
+            {
+                self.text_selection = pre;
             }
             return;
         }
         let Some(serial) = self.grid.resize_undo_serial() else {
             return;
         };
-        let (pre, vi_pre) = match kept {
+        let pre = match kept {
             // The same undo: keep the first shrink's selection unless something moved the
             // selection since the last resize (then it has no pre-image).
-            Some(k) if k.serial == serial => (
-                k.pre.filter(|_| k.after == before),
-                k.vi_pre.filter(|_| k.vi_after == vi_before),
-            ),
+            Some(k) if k.serial == serial => k.pre.filter(|_| k.after == before),
             // A fresh undo: this resize is its first shrink.
-            _ => (Some(before), vi_before),
+            _ => Some(before),
         };
         self.resize_undo_selection = Some(ResizeUndoSelection {
             serial,
             pre,
             after: self.text_selection.clone(),
-            vi_pre,
-            vi_after: self.vi_is_active().then(|| self.vi.cursor_point().line),
         });
     }
 

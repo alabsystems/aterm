@@ -3,6 +3,10 @@
 
 # aterm-time: spec recovery from its 14 unit tests
 
+> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 2 tests it
+> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
+> were taken before.
+
 > Status 2026-10-16: this is the crate's migration worklist. Each spec in §1 is to be proved
 > through Trust/Clean about the compiled Rust function, and then the tests it subsumes are
 > deleted. The 4 tests in §4 sample no aterm spec and can be deleted now.
@@ -49,9 +53,9 @@ Columns: `id`, `kind`, `functions`, `statement`, `subsumes (primary tests; secon
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking gaps
 time-conv-total-floor	no-panic + contract	shim::duration_from_millis_f64	∀ ms: f64 (NaN, ±∞, ±0, subnormals and f64::MAX included): conv(ms) does not panic, and (¬ms.is_finite() ∨ ms ≤ 0.0) ⇒ conv(ms) = D::ZERO.	shim::millisecond_conversion_is_total	EASY once floats exist: two f64 predicates (is_finite, `<=` with NaN and −0.0), an early return, a Duration struct return; no loops. The no-panic half also needs time-conv-exact's bound that the cast operands are in range.	1, 3, 6, F, cfg
-time-conv-exact	contract	shim::duration_from_millis_f64	∀ finite ms > 0.0: let w = trunc(ms) and f = ms − w (exact in IEEE, 0 ≤ f < 1). Then ‖conv(ms)‖ = M·10^6 + ⌊fl(f·10^6)⌋, where M = u64::MAX if w ≥ 2^64 else ⌊w⌋. Also ⌊fl(f·10^6)⌋ < 10^6, so the final saturating_add never saturates. Lemmas: (a) ms = k integral with k < 2^64 ⇒ conv(ms) = D::from_millis(k); (b) ms ≥ 2^64 ⇒ conv(ms) = D::from_millis(u64::MAX) (then f = 0); (c) ms = k + f with k integral and f·10^6 exactly representable ⇒ ‖conv(ms)‖ = k·10^6 + f·10^6.	shim::millisecond_conversion_keeps_the_fraction, shim::absurd_readings_saturate	MEDIUM: f64 trunc/sub/mul with rounding, f64→u64 and f64→u32 saturating casts, the `u64::MAX as f64` comparison (it rounds to 2^64), and core calls Duration::from_millis/from_nanos/saturating_add. The `< 10^6` bound is a real rounding fact: for f = 1 − 2^-53, fl(f·10^6) is the float just below 10^6, not 10^6.	1, 3, 4, 6, 12, F
+time-conv-exact	contract	shim::duration_from_millis_f64	∀ finite ms > 0.0: let w = trunc(ms) and f = ms − w (exact in IEEE, 0 ≤ f < 1). Then ‖conv(ms)‖ = M·10^6 + ⌊fl(f·10^6)⌋, where M = u64::MAX if w ≥ 2^64 else ⌊w⌋. Also ⌊fl(f·10^6)⌋ < 10^6, so the final saturating_add never saturates. Lemmas: (a) ms = k integral with k < 2^64 ⇒ conv(ms) = D::from_millis(k); (b) ms ≥ 2^64 ⇒ conv(ms) = D::from_millis(u64::MAX) (then f = 0); (c) ms = k + f with k integral and f·10^6 exactly representable ⇒ ‖conv(ms)‖ = k·10^6 + f·10^6.	shim::millisecond_conversion_keeps_the_fraction	MEDIUM: f64 trunc/sub/mul with rounding, f64→u64 and f64→u32 saturating casts, the `u64::MAX as f64` comparison (it rounds to 2^64), and core calls Duration::from_millis/from_nanos/saturating_add. The `< 10^6` bound is a real rounding fact: for f = 1 − 2^-53, fl(f·10^6) is the float just below 10^6, not 10^6.	1, 3, 4, 6, 12, F
 time-conv-monotone-resolution	contract (quantified)	shim::duration_from_millis_f64	(monotone) ∀ finite ms1 ≤ ms2: conv(ms1) ≤ conv(ms2). (accuracy) ∀ finite 0 < ms < 2^64: |‖conv(ms)‖ − ms·10^6| < 1 ns, where ms is read as its exact real value. So the error does not grow with the integer part. (resolution) ∀ finite 0 < a < b < 2^64: ‖conv(b)‖ − ‖conv(a)‖ > (b − a)·10^6 − 2, with b − a the exact real difference. At a = 3.6e6 and b = fl(a + 0.1), this gives > 99_997 ns.	shim::resolution_survives_an_aged_time_origin	MEDIUM: two binders and real-valued reasoning over time-conv-exact's formula. Monotone across trunc boundaries uses ⌊fl(f·10^6)⌋ < 10^6. It is FALSE at +∞, so `finite` is part of the spec (see §5.1).	1, 3, 5, 6, F
-time-from-js-millis	refinement	shim::Instant::from_js_millis, shim::SystemTime::from_js_millis	∀ ms: f64: Instant::from_js_millis(ms) = Ishim(conv(ms)) and SystemTime::from_js_millis(ms) = Sshim(conv(ms)). So equal readings give equal values, and every concrete reading in the shim tests reduces to time-conv-exact.	shim::a_stalled_clock_produces_zero_spans	TRIVIAL: tuple-struct construction around one call to an admitted fn.	1, 3, 4, cfg
+time-from-js-millis	refinement	shim::Instant::from_js_millis, shim::SystemTime::from_js_millis	∀ ms: f64: Instant::from_js_millis(ms) = Ishim(conv(ms)) and SystemTime::from_js_millis(ms) = Sshim(conv(ms)). So equal readings give equal values, and every concrete reading in the shim tests reduces to time-conv-exact.	-	TRIVIAL: tuple-struct construction around one call to an admitted fn.	1, 3, 4, cfg
 time-instant-difference	contract	shim::Instant::{duration_since,checked_duration_since,saturating_duration_since}, <shim::Instant as Sub<Instant>>::sub, derived PartialEq/Eq/PartialOrd/Ord	∀ a, b: Instant: a.checked_duration_since(b) = (a.0 ≥ b.0 ? Some(a.0 − b.0) : None). a.saturating_duration_since(b) = a.duration_since(b) = a − b = (a.0 ≥ b.0 ? a.0 − b.0 : D::ZERO). None of them panics. a < b ⇔ a.0 < b.0 and a = b ⇔ a.0 = b.0 (the derived order is the field order). Corollary: a = b ⇒ b.duration_since(a) = D::ZERO.	shim::instant_differences_saturate_backwards	EASY: &self methods, an Option return, core Duration::checked_sub/saturating_sub, an operator-trait impl, derives on a newtype.	1, 2, 3, 4, 6, 12, cfg
 time-instant-shift	contract	shim::Instant::{checked_add,checked_sub}, <shim::Instant as Add<Duration>>::add, <… as Sub<Duration>>::sub, <… as AddAssign<Duration>>::add_assign, <… as SubAssign<Duration>>::sub_assign	∀ a: Instant, d: D: a.checked_add(d) = (‖a.0‖ + ‖d‖ ≤ ‖D::MAX‖ ? Some(Ishim(a.0 + d)) : None). a.checked_sub(d) = (d ≤ a.0 ? Some(Ishim(a.0 − d)) : None). a + d panics ⇔ a.checked_add(d) = None, and otherwise a + d = a.checked_add(d).unwrap(); likewise a − d with checked_sub. `a += d` leaves a' = a + d and `a -= d` leaves a' = a − d, with the same panic condition. Round trip: a.checked_add(d) = Some(b) ⇒ b − d = a ∧ b − a = d ∧ (d > 0 ⇒ b > a).	shim::instant_arithmetic_round_trips_and_checks	EASY-MEDIUM: &mut self two-state a', Option::map, `expect` (panic as a precondition), operator traits, core Duration::checked_add/checked_sub. Same proof as time-systime-shift.	1, 2, 3, 4, 6, 12, cfg
 time-systime-duration-since	contract	shim::SystemTime::duration_since, shim::SystemTimeError::duration, <shim::SystemTimeError as Display>::fmt, shim::UNIX_EPOCH, shim::SystemTime::UNIX_EPOCH	∀ s, t: SystemTime: s.duration_since(t) = (s.0 ≥ t.0 ? Ok(s.0 − t.0) : Err(e) with e.duration() = t.0 − s.0 > 0), and it never panics. UNIX_EPOCH.0 = D::ZERO and SystemTime::UNIX_EPOCH = UNIX_EPOCH, so s.duration_since(UNIX_EPOCH) = Ok(s.0). ∀ e: SystemTimeError: e.to_string() = "second time provided was later than self" (std's message, the parity contract that callers may log). Corollary: s = t ⇒ t.duration_since(s) = Ok(D::ZERO).	shim::system_time_reports_backwards_steps	EASY-MEDIUM: a Result return built with an ok_or_else closure, &self, consts, and a Display impl through write! into a Formatter (the String content needs gap 1).	1, 2, 3, 4, 6, 12, 13, cfg
@@ -74,49 +78,40 @@ time-epoch-accessors	contract (effectful)	since_epoch, unix_secs, unix_millis	Ef
 `time-conv-total-floor` → `time-conv-exact` → `time-conv-monotone-resolution` and
 `time-from-js-millis` (they compose on conv's ensures, gap 4) → `time-epoch-accessors` (effects, gap 8).
 
-## 2. Test → spec map (TSV; all 14)
+## 2. Test → spec map (TSV)
 
-`primary` is the spec that retires the test. `also` lists the other specs the same test samples.
+`primary` is the spec that retires the test. `also` lists the other specs the same test samples. The
+tests of §4 are deleted and have no row.
 
 ```tsv
 file	test	primary	also
-src/shim.rs	millisecond_conversion_is_total	time-conv-total-floor	
+src/shim.rs	millisecond_conversion_is_total	time-conv-total-floor	time-conv-exact
 src/shim.rs	millisecond_conversion_keeps_the_fraction	time-conv-exact	
 src/shim.rs	resolution_survives_an_aged_time_origin	time-conv-monotone-resolution	time-conv-exact
-src/shim.rs	absurd_readings_saturate	time-conv-exact	
 src/shim.rs	instant_differences_saturate_backwards	time-instant-difference	time-from-js-millis
 src/shim.rs	instant_arithmetic_round_trips_and_checks	time-instant-shift	time-instant-difference, time-from-js-millis
 src/shim.rs	system_time_reports_backwards_steps	time-systime-duration-since	time-from-js-millis, time-conv-exact
 src/shim.rs	system_time_arithmetic_round_trips	time-systime-shift	time-from-js-millis
-src/shim.rs	a_stalled_clock_produces_zero_spans	time-from-js-millis	time-instant-difference, time-systime-duration-since
 src/lib.rs	the_epoch_accessors_read_the_wall_clock	time-epoch-accessors	
-src/lib.rs	instant_is_monotonic_across_a_sleep	NON-SPEC (timing, tests std)	
-src/lib.rs	duration_since_saturates_rather_than_panicking	NON-SPEC (tests std; duplicate of time-instant-difference)	
-src/lib.rs	instant_duration_arithmetic_round_trips	NON-SPEC (tests std; duplicate of time-instant-shift)	
-src/lib.rs	system_time_is_anchored_at_the_unix_epoch	NON-SPEC (environment check)	
 ```
 
 ## 3. Coverage
 
 - 14 tests read. 10 map to one of the 9 specs, and 4 are not spec samples (§4).
-- One spec retires two tests: `time-conv-exact` (`millisecond_conversion_keeps_the_fraction` and
-  `absurd_readings_saturate`). Every other spec retires one primary test. `time-from-js-millis` and
-  `time-conv-exact` are also lemmas that the arithmetic tests use to build their inputs.
+- Every spec but `time-from-js-millis` retires one primary test. `millisecond_conversion_is_total`
+  also checks that a reading beyond `u64::MAX` milliseconds saturates, a clause of `time-conv-exact`.
+  `time-from-js-millis` and `time-conv-exact` are also lemmas that the arithmetic tests use to build
+  their inputs.
 - When the tests that exercise them are gone, the shim specs remain the only statement of the
   wasm clock's contract. That is the point: on native Trust the shim runs nowhere except tests.
 
 ## 4. Tests that are not spec samples
 
 > Status 2026-10-16: all 4 tests below are deleted from `src/lib.rs`.
-
-| test | why | recommendation |
-|---|---|---|
-| lib::instant_is_monotonic_across_a_sleep | A timing test (a 5 ms sleep measured as ≥ 4 ms) of `std::time::Instant`, which is a plain re-export on native. It samples the OS clock, not aterm code. The shim's monotonicity rests on the host's `performance.now()`, which is a host assumption and cannot be proved in Rust. AGENTS.md: delete timing-dependent tests. | **delete** |
-| lib::duration_since_saturates_rather_than_panicking | Exercises std's `Instant` behind a sleep. The aterm-owned form of this property is `time-instant-difference` on the shim. It tests std and depends on timing. | **delete** |
-| lib::instant_duration_arithmetic_round_trips | Exercises std's `Instant` arithmetic, not aterm code. It duplicates `time-instant-shift`. | **delete** |
-| lib::system_time_is_anchored_at_the_unix_epoch | An environment check that the host wall clock reads between 2020 and 2200, through std's `SystemTime`. It samples the machine, not a property of any aterm function. | **delete** |
-
-Actions: 4 delete, 0 become-spec, 0 keep.
+>
+> Status 2026-10-17: their table and their rows in §2 are gone. They exercised std's `Instant` and
+> `SystemTime` (plain re-exports on native), one of them by timing a sleep, and one checked that the
+> host wall clock reads between 2020 and 2200; none sampled a property of aterm code.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 

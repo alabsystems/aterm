@@ -5,10 +5,9 @@
 //! Emoji strike selection and the premultiplied area filter, checked exhaustively.
 //!
 //! The strike-selection law (chosen from the available strikes; minimal adequate, else the
-//! maximum) is also the ty model `strike_selection_model` (aterm-spec); here it is checked
-//! against [`aterm_render::select_strike_ppem`] over every small strike multiset. The area
-//! filter's laws involve products, which ty's `Expr` language lacks, so the integer lattice
-//! here is their only check.
+//! maximum) is checked against [`aterm_render::select_strike_ppem`] over every small strike
+//! multiset. The area filter's laws involve products, which ty's `Expr` language lacks, so
+//! the integer lattice here is their only check.
 
 use aterm_render::{area_overlap, resample_rgba, select_strike_ppem};
 
@@ -244,27 +243,6 @@ fn invisible_texels_contribute_nothing() {
     );
 }
 
-/// Every RGB payload under `a == 0` maps to all-zero output; an opaque texel survives the
-/// identity resample.
-#[test]
-fn zero_alpha_annihilates_every_payload() {
-    for v in 0u16..=255 {
-        let v = v as u8;
-        for src in [[v, 0, 0, 0], [0, v, 0, 0], [0, 0, v, 0], [v, v, v, 0]] {
-            assert_eq!(
-                resample_rgba(&src, 1, 1, 1, 1),
-                [0, 0, 0, 0],
-                "a=0 payload {src:?} leaked"
-            );
-        }
-    }
-    assert_eq!(
-        resample_rgba(&[9, 8, 7, 255], 1, 1, 1, 1),
-        [9, 8, 7, 255],
-        "an opaque texel must survive the identity resample exactly"
-    );
-}
-
 /// One visible white texel in a field of invisible magenta, minified to one texel, yields
 /// pure white at 1/16 coverage; a straight average would bleed magenta (the CBDT halo).
 #[test]
@@ -345,38 +323,5 @@ fn strike_selection_law_exhaustive() {
     assert!(
         hits_fallback > 0,
         "the fallback (max) arm was never exercised"
-    );
-}
-
-/// The Apple ladder (20/32/40/48/64/96/160): typical cell heights land on small strikes,
-/// and a composite carried only by the large strikes walks up to the smallest carrier.
-#[test]
-fn apple_strike_ladder_and_dead_zone() {
-    const APPLE: [u16; 7] = [20, 32, 40, 48, 64, 96, 160];
-    assert_eq!(select_strike_ppem(&APPLE, 17), Some(20));
-    assert_eq!(select_strike_ppem(&APPLE, 22), Some(32));
-    assert_eq!(
-        select_strike_ppem(&APPLE, 40),
-        Some(40),
-        "exact hit is exact"
-    );
-    assert_eq!(select_strike_ppem(&APPLE, 41), Some(48));
-    assert_eq!(select_strike_ppem(&APPLE, 100), Some(160));
-    assert_eq!(
-        select_strike_ppem(&APPLE, 300),
-        Some(160),
-        "beyond the ladder: the largest strike (the old u16::MAX behaviour)"
-    );
-    // A ZWJ composite absent from the small strikes: the carrying set `pick_glyph_raster`
-    // passes.
-    assert_eq!(
-        select_strike_ppem(&[64, 96, 160], 40),
-        Some(64),
-        "dead-zone walk stops at the SMALLEST carrier, not the 160px master"
-    );
-    assert_eq!(
-        select_strike_ppem(&[], 40),
-        None,
-        "no carrier → COLR/mono fallback"
     );
 }

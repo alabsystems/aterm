@@ -1,0 +1,18 @@
+# claude-code 2.1.300 · HAND-BUILT 2026-10-15 from claude-2.1.287-held-message.txt's geometry, re-wrapped at 50 columns: the title fits, the Deny label does not (`Deny — drop it and tell the sender it was` over `declined` at its column 3, in the Select's 46 cells) · read on main as three options, and the held message was escalated (`a held message whose delivery is not its one other option`)
+⏺ Working on it.
+  ⎿  (tool output)
+
+──────────────────────────────────────────────────
+ Held message from another session
+
+ Another Claude session sent a message: from @s-1
+
+ This session is not prompting for permissions.
+
+ Message body (this is what will be delivered):
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Please rebase onto main before you push.
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ ❯ Deny — drop it and tell the sender it was
+   declined
+   Deliver this message to Claude

@@ -4,7 +4,9 @@
 //! A bounded walk's children. The walk can be stuck in Rust or filesystem IO,
 //! but its output calls have one cancellable owner. Closing admission and
 //! acquiring a child permit share a lock, so no child can start after close
-//! has returned. A permit is released only after kill/reap, including unwind.
+//! has returned. Success follows a reap. On cancellation or unwind, the owner
+//! attempts kill/reap before releasing its permit; errors or interruption can
+//! leave the child unreaped. The permit counts active calls, not proven exits.
 
 use aterm_uds::spawnfd::{Child, Command, Stdio};
 use std::io;
@@ -67,8 +69,8 @@ impl Scope {
             .stderr(std::fs::File::create(&stderr)?);
         let permit = self.enter()?;
         let status = OwnedChild::run(command, self);
-        // The owned child is gone now. A stuck read of the captured files does
-        // not keep close waiting for an OS child that no longer exists.
+        // Success means the child was reaped; an error can leave cleanup
+        // unproven. File reads do not retain the active-call permit.
         drop(permit);
         Ok(Output {
             status: status?,
@@ -97,6 +99,7 @@ fn cancelled() -> io::Error {
 struct OwnedChild {
     child: Option<Child>,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
+    /// The group's place on the interrupt list, while the child is owned.
     live: super::group::Live,
 }
 
@@ -131,7 +134,7 @@ impl OwnedChild {
             let child = command.spawn()?;
             let mut owned = Self {
                 #[cfg(unix)]
-                live: super::group::Live::enter(child.id(), false),
+                live: super::group::Live::enter(child.id()),
                 child: Some(child),
             };
             #[cfg(unix)]
@@ -139,7 +142,8 @@ impl OwnedChild {
             let mut nap = Duration::from_millis(1);
             loop {
                 if scope.closed() {
-                    // Drop sends SIGKILL and reaps before the permit can leave.
+                    // Drop attempts SIGKILL/reap before the permit can leave;
+                    // an error or interruption can leave the child unreaped.
                     return Err(cancelled());
                 }
                 if let Some(status) = owned.poll()? {
@@ -154,11 +158,12 @@ impl OwnedChild {
     fn poll(&mut self) -> io::Result<Option<ExitStatus>> {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
-            if !self.live.exited(false)? {
+            if !self
+                .live
+                .exited_output(self.child.as_ref().expect("owned child"))?
+            {
                 return Ok(None);
             }
-            // Keep the leader unreaped while disposing any descendants. Output
-            // calls own finite commands, never a detached daemon's lifetime.
             let _ = self.live.kill();
             let status = self
                 .live
@@ -184,12 +189,15 @@ impl Drop for OwnedChild {
         };
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
-            // Every signal precedes the only reap, while the group id is held.
-            let _ = self.live.kill();
-            let _ = self.live.reap_output(&mut child);
-            if super::group::stopping() {
-                // The interrupt handler may remember this group. Keep its
-                // leader unreaped, exactly as the stage executor does.
+            // Signal while this exact leader is held unreaped, then attempt
+            // the one reap. On error/stop, forgetting the wrapper prevents its
+            // Drop from reaping behind the interrupt handler; it does not
+            // establish that cleanup completed.
+            if self.live.holds(child.id()) && self.live.kill().is_err() {
+                let _ = child.kill();
+            }
+            let reaped = self.live.reap_output(&mut child);
+            if reaped.is_err() || super::group::stopping() {
                 std::mem::forget(child);
             }
         }

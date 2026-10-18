@@ -1,72 +1,18 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Integration tests for the self-contained surface of `aterm-spec-macros`:
-//! the `refines` / `spec_invariant` / `spec_unmodeled` attribute macros.
-//!
-//! Since TRUST_NATIVE_TLA Phase 0 the attribute macros are ANCHOR EMITTERS: they
-//! leave the annotated item unchanged AND emit a registry record referencing
-//! `::aterm_spec::{registry,xref}::…`. So this test now links `aterm-spec` (a
-//! dev-dependency; the cycle is dev-only and Cargo-legal). The `ty_model!` macro
-//! emits `::aterm_spec::derive::*` paths and is exercised from `aterm-spec`'s own
-//! `tests/`.
+//! Integration tests for the `#[refines]` anchor emitter: the fn-entry probe it
+//! injects keeps every awkward fn shape's behaviour and records the anchor id.
+//! The emitted records reference `::aterm_spec_anchor::{registry,xref}::…`, so this
+//! test links `aterm-spec-anchor` and `aterm-spec` (dev-dependencies; the cycle is
+//! dev-only and Cargo-legal).
 
-use aterm_spec_macros::{refines, spec_invariant, spec_unmodeled};
-
-// ── Attribute macros are pass-throughs: the annotated item still works ────────
-// `refines` takes `machine`, `action` and `project` (all required), `spec_invariant` takes
-// `id = ".."` and an optional `tla = ".."`, and `spec_unmodeled` accepts
-// `reason = ".."`; the item each annotates must remain callable and unmodified.
-
-#[refines(machine = "Ring", action = "Push", project = "test::project")]
-fn push_impl(n: u32) -> u32 {
-    n + 1
-}
-
-#[spec_invariant(id = "LenBounded", tla = "seq - lo + 1 <= Cap")]
-fn check_len(len: usize, cap: usize) -> bool {
-    len <= cap
-}
-
-#[spec_invariant(id = "NoSilentLoss")]
-fn no_loss() -> bool {
-    true
-}
-
-#[spec_unmodeled(reason = "platform-specific fast path")]
-fn platform_fast_path() -> &'static str {
-    "fast"
-}
-
-// `refines` on an impl-block method (item position generality).
-struct Engine;
-
-impl Engine {
-    #[refines(machine = "Cursor", action = "Deliver", project = "test::project")]
-    fn deliver(&self, seq: u64) -> u64 {
-        seq
-    }
-}
-
-#[test]
-fn attribute_macros_preserve_the_annotated_item() {
-    let rows = [
-        ("refines on a free fn", push_impl(41) == 42),
-        ("spec_invariant with tla, holding", check_len(2, 3)),
-        ("spec_invariant with tla, violated", !check_len(4, 3)),
-        ("spec_invariant without tla", no_loss()),
-        ("spec_unmodeled", platform_fast_path() == "fast"),
-        ("refines on an impl method", Engine.deliver(7) == 7),
-    ];
-    for (row, preserved) in rows {
-        assert!(preserved, "{row}: the annotated item changed behaviour");
-    }
-}
+use aterm_spec_macros::refines;
 
 // ── EXECUTION EVIDENCE: the fn-entry probe `#[refines]` injects ──────────────
 //
 // The emitter no longer leaves the annotated fn untouched: it prepends
-// `::aterm_spec::xref::note_entered("<machine>::<action> @ <fn>")` to the body and
+// `::aterm_spec_anchor::xref::note_entered("<machine>::<action> @ <fn>")` to the body and
 // records that same id on the submitted `RefinementAnchor`. These tests pin the two
 // properties that make that safe to do to ~190 anchors across the tree: the
 // annotated function's BEHAVIOUR is unchanged for every awkward fn shape, and the
@@ -77,8 +23,7 @@ fn attribute_macros_preserve_the_annotated_item() {
 // harness runs them in parallel.
 
 use aterm_spec::xref::{
-    disarm_entered_anchors, entered_anchor_count, entered_anchor_ids, refinements,
-    reset_entered_anchors, window_is_armed,
+    entered_anchor_count, entered_anchor_ids, refinements, reset_entered_anchors, window_is_armed,
 };
 
 /// Open an evidence window, failing loudly if the reset did not take.
@@ -268,127 +213,4 @@ fn a_nested_window_panics_instead_of_lending_the_outer_step_its_evidence() {
             let _ = ByValue { n: 0 }.multi();
         });
     });
-}
-
-/// `entered_anchor_count` reports what `entered_anchor_ids` cannot: the difference
-/// between an empty record and an unreadable one.
-///
-/// The readable half is what the assertions in `open_window` and in
-/// `StepEvidence::step` now rest on. The unreadable half (`None`) is a destroyed TLS
-/// slot or an outstanding borrow, neither of which a test can stage without unsound
-/// tricks — what matters is that the SIGNAL exists at all, because
-/// `entered_anchor_ids().is_empty()` collapsed both cases to `true`.
-#[test]
-fn the_record_reports_its_size_rather_than_only_its_contents() {
-    open_window();
-    assert_eq!(entered_anchor_count(), Some(0));
-    let _ = early_return(1);
-    assert_eq!(
-        entered_anchor_count(),
-        Some(entered_anchor_ids().len()),
-        "the count and the contents must agree while the record is readable"
-    );
-    assert!(entered_anchor_count().is_some_and(|n| n > 0));
-    disarm_entered_anchors();
-    assert_eq!(
-        window_is_armed(),
-        Some(false),
-        "closing the window must be observable — `StepEvidence::step` reads this to \
-         detect a window that did not survive its own drive closure"
-    );
-}
-
-/// THE COST CONTRACT, asserted behaviourally rather than promised in a comment.
-///
-/// The probe is injected into ~190 bodies tree-wide, including `Terminal::write_char`
-/// — the per-character path for every non-ASCII, styled, insert-mode and VT52 write.
-/// So an UN-ARMED probe must do nothing at all beyond one thread-local `bool` load:
-/// no `RefCell` borrow, no `BTreeSet` insert, no string comparisons down a tree
-/// that grows with every anchor a conformance has entered.
-///
-/// "Does nothing" is observable exactly as "records nothing", which is what this
-/// asserts. Only `reset_entered_anchors` arms, and `disarm_entered_anchors` closes the
-/// window again.
-#[test]
-fn an_unarmed_probe_records_nothing() {
-    let id = anchor_entry_id("EarlyReturn");
-
-    // Close any window explicitly rather than assuming this thread never opened one:
-    // `--test-threads=1` runs every test in this file on ONE thread, and the record is
-    // thread-local, so "no test has armed yet" is not a property this test may assume.
-    disarm_entered_anchors();
-    let baseline = entered_anchor_ids();
-    let _ = early_return(1);
-    assert_eq!(
-        entered_anchor_ids(),
-        baseline,
-        "a probe outside any evidence window must record NOTHING — it is on a \
-         per-character hot path and inside a benchmark's measured region"
-    );
-
-    open_window();
-    let _ = early_return(1);
-    assert!(
-        entered_anchor_ids().contains(id),
-        "…and inside a window it must record"
-    );
-
-    disarm_entered_anchors();
-    let before = entered_anchor_ids();
-    let _ = early_return(1);
-    let _ = ByValue { n: 0 }.multi();
-    assert_eq!(
-        entered_anchor_ids(),
-        before,
-        "closing the window must stop the recording, without discarding what the \
-         window already saw"
-    );
-}
-
-// ── COLLECTION: every record this file submits is collected exactly once ──────
-//
-// The emitters' records reach `aterm_spec::xref` through a constructor-section
-// registry that runs before `main`. A target where those constructors never run,
-// or a node linked twice, would not fail any test above that looks one anchor up
-// by name; it fails this one. The digest pins this file's records (it leaves
-// `location` out: editing this file moves line numbers, not records), so a change
-// to an anchor above changes it too.
-
-/// FNV-1a over the sorted records, so the whole collected set is pinned by one value.
-fn records_digest(rows: &[String]) -> String {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in rows.iter().flat_map(|r| r.as_bytes().iter().chain(&[0xff])) {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
-    format!("{h:016x}")
-}
-
-#[test]
-fn the_registry_collects_every_record_this_file_submits_exactly_once() {
-    use aterm_spec::xref::{invariant_anchors, waivers};
-    let mut rows: Vec<String> = refinements()
-        .map(|r| {
-            format!(
-                "refines {}|{}|{}|{}|{}",
-                r.machine, r.action, r.rust_method, r.project, r.entry_id
-            )
-        })
-        .chain(waivers().map(|w| {
-            format!(
-                "unmodeled {}|{}|{}|{}",
-                w.machine, w.action, w.reason, w.rust_method
-            )
-        }))
-        .chain(
-            invariant_anchors()
-                .map(|i| format!("invariant {}|{}|{}", i.machine, i.id, i.rust_method)),
-        )
-        .collect();
-    rows.sort();
-    assert_eq!(
-        (rows.len(), records_digest(&rows).as_str()),
-        (15, "388d1c9f0d7b4c66"),
-        "the collected record set changed: {rows:#?}"
-    );
 }

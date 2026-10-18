@@ -19,7 +19,8 @@
 //! faulted in only where touched. Copying them would be ~240 MB of
 //! non-evictable heap per process.
 //!
-//! Observables, in this process: `AdmittedFontSources::discovered_residency`
+//! Observables, in this test's own process (`common/alone.rs`: the suite
+//! binary re-run on this one test): `AdmittedFontSources::discovered_residency`
 //! reports every byte mapped and none copied; the seal grows max RSS by under
 //! 64 MiB (a quarter of the copy, with room for debug-build page faults); and a
 //! colour emoji and a CJK ideograph still draw real ink from the mapped faces.
@@ -72,6 +73,14 @@ fn ink(r: &mut Renderer, ch: char) -> (FaceId, usize) {
 
 #[test]
 fn the_seal_maps_every_discovered_face_and_does_not_grow_rss_by_their_size() {
+    // The peak resident set is the process's: only a process this test owns
+    // measures the seal and nothing else.
+    if !crate::alone::in_own_process(
+        module_path!(),
+        "the_seal_maps_every_discovered_face_and_does_not_grow_rss_by_their_size",
+    ) {
+        return;
+    }
     let mut r = Renderer::from_system(18.0, Theme::default())
         .expect("no font: build with aterm-render's default embedded-font feature");
     // A host fact, from the files: a discovered face is a candidate file this
@@ -86,15 +95,12 @@ fn the_seal_maps_every_discovered_face_and_does_not_grow_rss_by_their_size() {
         );
     }
     let rss_before = max_rss_bytes();
-    let started = std::time::Instant::now();
     let sources = r.seal_admitted_font_sources();
-    let seal_wall = started.elapsed();
     let rss_after = max_rss_bytes();
     let (mapped, copied) = sources.discovered_residency();
     let grew = rss_after.saturating_sub(rss_before);
     eprintln!(
-        "seal: discovered faces mapped={} MiB copied={} MiB; max RSS {} MiB -> {} MiB (+{} MiB); \
-         seal wall {seal_wall:?}",
+        "seal: discovered faces mapped={} MiB copied={} MiB; max RSS {} MiB -> {} MiB (+{} MiB)",
         mapped / MIB,
         copied / MIB,
         rss_before / MIB,

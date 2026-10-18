@@ -15,7 +15,7 @@
 //! gesture stamped and revoked at the enqueue and
 //! `note_insert_delivered_from(Cells(3))` at the delivery edge (`input_paste`,
 //! `apply_delivery`). The repaint arrives in one of six shapes ([`Shape`]):
-//! `inkish.py`'s split whole-line redraw, the same bytes in one read, the same
+//! the Ink-shaped split whole-line redraw, the same bytes in one read, the same
 //! bytes with the hide alone in the first read, Claude Code's own diff frame
 //! (`?2026h ?25l … ?25h ?2026l`) whole or torn after its hide, and a shell's
 //! print at a visible caret.
@@ -54,7 +54,7 @@ const COLS: usize = 140;
 /// 12 cps, the owner's pace.
 const KEY_MS: u64 = 83;
 const FRAME_MS: u64 = 16;
-/// `inkish.py`'s pause between a redraw's two reads.
+/// The Ink-shaped composer's pause between a redraw's two reads.
 const INK_SPLIT_MS: u64 = 30;
 /// A hole standing longer than this many frames is the defect.
 const HOLE_FRAMES_MAX: usize = 3;
@@ -71,8 +71,8 @@ const SUFFIX: &str = "MAIN!!!!";
 /// How the composer's repaint reaches the glass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Shape {
-    /// `inkish.py`: hide, home, clear, the whole line | present | 30 ms |
-    /// the caret placed and shown | present.
+    /// The Ink-shaped redraw: hide, home, clear, the whole line | present |
+    /// 30 ms | the caret placed and shown | present.
     InkSplit,
     /// The same bytes in one read, one present.
     InkWhole,
@@ -186,7 +186,8 @@ impl Host {
         self.glow.note_context(self.term.is_alternate_screen());
         observe_caret_row(&self.term, &mut self.glow, &mut self.row_buf, c, self.now);
         observe_ribbon_rows(&self.term, &mut self.glow, &mut self.row_buf);
-        self.glow.observe_print_anchor(self.term.print_anchor());
+        self.glow
+            .observe_print_anchor(aterm_effects::host::motion_print_anchor(&self.term).0);
         let g = geom(ROWS, COLS, CW, CH);
         self.glow.tick(cur, self.now, &self.cfg, g, &mut self.out);
         self.record();
@@ -510,23 +511,23 @@ fn torn_timings() -> Vec<(Shape, u64, u64)> {
 // and the first failing take in the law's order raises its own panic (0.8 to
 // 4.0 s a law alone on one thread).
 
+/// A tab completion or a paste whose frame is torn before its glyphs. Before
+/// the fix the Tab was declined `hidden-relocation`, `O` and ` ` of `INTO `
+/// dark for 73 frames in every take; the paste was refused silently (the
+/// enqueue revoked its gesture), the same 73-frame hole.
 #[test]
-fn a_tab_completion_whose_frame_is_torn_before_its_glyphs_is_laid_as_the_insert() {
-    // Before the fix: declined `hidden-relocation`, `O` and ` ` of `INTO `
-    // dark for 73 frames in every take.
-    crate::common::par_map(&torn_timings(), |&(shape, gap, echo)| {
-        let h = take(shape, Lic::Tab, gap, echo);
-        assert_laid_whole(&h, &format!("{shape:?} Tab gap={gap} echo={echo}"));
-    });
-}
-
-#[test]
-fn a_paste_whose_frame_is_torn_before_its_glyphs_is_laid_as_the_insert() {
-    // Before the fix: refused silently (the enqueue revoked the paste's
-    // gesture), the same 73-frame hole.
-    crate::common::par_map(&torn_timings(), |&(shape, gap, echo)| {
-        let h = take(shape, Lic::Paste(3), gap, echo);
-        assert_laid_whole(&h, &format!("{shape:?} Paste(3) gap={gap} echo={echo}"));
+fn a_licensed_insert_whose_frame_is_torn_before_its_glyphs_is_laid_as_the_insert() {
+    let takes: Vec<(Lic, Shape, u64, u64)> = [Lic::Tab, Lic::Paste(3)]
+        .into_iter()
+        .flat_map(|lic| {
+            torn_timings()
+                .into_iter()
+                .map(move |(shape, gap, echo)| (lic, shape, gap, echo))
+        })
+        .collect();
+    crate::common::par_map(&takes, |&(lic, shape, gap, echo)| {
+        let h = take(shape, lic, gap, echo);
+        assert_laid_whole(&h, &format!("{shape:?} {lic:?} gap={gap} echo={echo}"));
     });
 }
 

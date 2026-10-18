@@ -84,7 +84,6 @@ fn posted_lines(c: &MessageCenter) -> usize {
 /// again clears the clock and writes no line.
 #[test]
 fn a_family_pass_ends_an_entry_only_after_ten_minutes_unnamed() {
-    assert_eq!(RESOLVE_AFTER, ms(600_000));
     let now = t0();
     let mut c = fresh(now);
     let s = c.sync_digest(UPGRADE, vec![own_work("s-1", 16)], stamp(), now);
@@ -237,13 +236,6 @@ fn every_family_has_one_mode_and_no_prefix_shadows_another() {
     assert_eq!(level, vec![Family::Upgrade, Family::Resume, Family::Ai]);
     assert_eq!(Family::Ai.stem(), "ai");
     assert_eq!(Family::Ai.tag(), tags::HARNESS);
-    // The accounts' facts are the machine's, raised by the host's own look: a
-    // prefix beside the supervisor's, never under it, whose adopted-line sweep
-    // would end them.
-    assert_eq!(Family::Accounts.stem(), "harness.accounts");
-    assert_eq!(Family::Accounts.mode(), Mode::Event);
-    assert_eq!(Family::Accounts.tag(), tags::HARNESS);
-    assert!(all.contains(&Family::Accounts));
 }
 
 /// A pass for one family never sees another family's entries, so a reporter

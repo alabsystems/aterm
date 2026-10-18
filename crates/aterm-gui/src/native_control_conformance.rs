@@ -14,7 +14,8 @@
 
 #![cfg(test)]
 
-use aterm_spec::derive::{Model, native_control_routing_model};
+use aterm_models_native::native_control_routing_model;
+use aterm_spec::derive::Model;
 use aterm_spec::interp::{State, admits};
 
 use crate::conformance_support::assert_sole_transition as assert_transition;

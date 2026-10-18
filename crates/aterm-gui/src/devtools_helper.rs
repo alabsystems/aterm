@@ -1,40 +1,62 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE DEVELOPER TOOLS HAND-OVER: the one lane that brings the owner to System Settings ▸
-//! Privacy & Security ▸ Developer Tools, and aterm's own panel beside it (owner ask
-//! 2026-10-15: "I need some kind of banner explaining why I need this for aterm, and I
-//! need for aterm to be autopopulated when this menu appears. make this even lower
-//! friction").
+//! THE SYSTEM SETTINGS HAND-OVERS: the one lane that brings the owner to System Settings ▸
+//! Privacy & Security ▸ Developer Tools or ▸ Full Disk Access ([`Page`]), and aterm's own
+//! panel beside it (owner ask 2026-10-15: "I need some kind of banner explaining why I need
+//! this for aterm, and I need for aterm to be autopopulated when this menu appears. make
+//! this even lower friction"; owner ask 2026-10-16: "on starting aterm, I didn't see aterm
+//! automatically enable file system access everywhere on a new machine … It needs to
+//! enable all these by default", on macOS 26 Tahoe and 27).
 //!
-//! No app can put itself on that list (`atpkg::devtools`; debugger design §9.1, O19):
-//! only the owner adds it, and macOS asks for their password. The most aterm can do is be
-//! there when the page opens, saying why, with its own icon ready to drag into the list.
-//! Every place that brings the owner there — the window's own once-per-version hand-over
-//! (`devtools_watch`), the digest line's press, the Settings ▸ Security card and the
-//! control verb — goes through ONE function, `App::hand_devtools_to_owner`, so none of
-//! them can drift. This module holds the parts that decide, each testable without a
-//! window, a process or System Settings:
+//! No app can put itself on either list (`atpkg::devtools`; debugger design §9.1, O19;
+//! TCC design §0): only the owner adds it, and macOS asks for their password. The most
+//! aterm can do is be there when the page opens, saying why, with its own icon ready to
+//! drag into the list. Every place that brings the owner to Developer Tools — the window's
+//! own once-per-version hand-over (`devtools_watch`), the digest line's press, the
+//! Settings ▸ Security card and the control verb — goes through ONE function,
+//! `App::hand_devtools_to_owner`, so none of them can drift. Full Disk Access has its
+//! own: `App::hand_fda_to_owner` for the window's once-per-version launch hand-over (the
+//! launch check read the grant off on a Mac where aterm never verified it,
+//! `crate::consent_launch`), and `App::fda_page_opened_by_owner` for the owner's own
+//! *Open Settings* (the Security page's button, the digest entry's press), which opens
+//! the page itself and has the panel join it. No control verb reaches the Full Disk
+//! Access page. When both pages wait, Full Disk Access goes first: the Developer Tools
+//! list cannot be read without it, and there is one Settings window. This module holds
+//! the parts that decide, each testable without a window, a process or System Settings:
 //!
-//! * [`admit`] — who may bring the page up, and when ([`Origin`] × the reading × the
-//!   owner's decline × the build): an owner's press always opens it; the window's own
-//!   hand-over and a control verb never on a state aterm did not read, never while the
-//!   owner's Not now holds, never on a build whose grant would not survive the next one,
-//!   never twice in ten minutes, and only at a quiet moment ([`quiet`]).
+//! * [`admit`] — who may bring the Developer Tools page up, and when ([`Origin`] × the
+//!   reading × the owner's decline × the build): an owner's press always opens it; the
+//!   window's own hand-over and a control verb never on a state aterm did not read, never
+//!   while the owner's Not now holds, never on a build whose grant would not survive the
+//!   next one, never twice in ten minutes, and only at a quiet moment ([`quiet`]).
+//! * [`admit_fda`] — the same for the Full Disk Access page: an owner's press always
+//!   opens it; the window's own hand-over only on a probe that read `denied`, never while
+//!   the owner's Not now holds (this panel's `fda-declined`, or the access card's
+//!   permanent one), never on a build whose grant would not survive the next one, once
+//!   per version (`fda-pane-opened`), never within ten minutes of either page, and only
+//!   at a quiet moment.
 //! * [`Panel`] — the panel's states (why and how, with aterm's icon to drag; the variant
 //!   for a list aterm cannot read; a drop that did not take, or did not land; done) and
-//!   what each of the owner's presses asks of the window. One panel at a time.
+//!   what each of the owner's presses asks of the window. On the Full Disk Access page
+//!   *I've switched it on* counts as the access card's *Open Settings* and *Not now*
+//!   writes `fda-declined`; a probe that reads the grant turns the panel to its done
+//!   words. One panel at a time.
 //! * [`layout`] and [`place`] — the panel's frames from its words, and where it goes
 //!   beside System Settings' window: never over the right pane, which holds the list,
 //!   its switches and its + button.
-//! * [`Lane`] — the `App`-owned bundle: the hand-over waiting for its quiet moment, the
-//!   `spctl` worker for an empty list, the shown panel and its one-shot list reads. The
-//!   park reads it (`App::tick_devtools_hand_over`, `DeadlineOwner::DevToolsHandOver`);
-//!   workers publish into a shared slot, and their wake (`Wake::DevToolsHandOver`) is a
-//!   nudge only, so a wake an uncommitted incoming handoff drops loses nothing.
-//! * [`Reach`] and [`DevToolsHelperArm`] — everything the lane does to the Mac and its
-//!   markers, and the panel itself, injected: a headless instance and every unit test get
-//!   the inert arms, which open, run, read, write and show nothing.
+//! * [`Lane`] — the `App`-owned bundle: each page's hand-over waiting for its quiet
+//!   moment, the `spctl` worker for an empty list, the shown panel and its one-shot list
+//!   reads, and how settled this process is ([`Lane::settled`]: [`COLD_START_SETTLE`]
+//!   for a process the owner started, `consent_card::LAUNCH_SETTLE` for one an update or
+//!   a hand-off brought in). The park reads it (`App::tick_devtools_hand_over`,
+//!   `DeadlineOwner::DevToolsHandOver`); workers publish into a shared slot, and their
+//!   wake (`Wake::DevToolsHandOver`) is a nudge only, so a wake an uncommitted incoming
+//!   handoff drops loses nothing.
+//! * [`Reach`], [`FdaReach`] and [`DevToolsHelperArm`] — everything the lane does to the
+//!   Mac and its markers (`atpkg::devtools::PageMarkers`, one set per page), and the
+//!   panel itself, injected: a headless instance and every unit test get the inert arms,
+//!   which open, run, read, write and show nothing.
 //! * `live` (macOS) — the panel on AppKit, the windowed arm: a non-activating panel
 //!   shown only while System Settings is in front, placed beside its window, with
 //!   aterm's icon as a Copy-only drag source. `devtools_helper_drive` (the
@@ -51,7 +73,7 @@ use std::time::{Duration, Instant};
 
 use aterm_containment::DevToolGrant;
 use aterm_containment::consent::{
-    DevToolList, DevToolListLabel, DevToolListing, DevToolProbe, ProbeGate, devtool_grant,
+    DevToolList, DevToolListLabel, DevToolListing, DevToolProbe, FdaState, ProbeGate, devtool_grant,
 };
 use aterm_types::MutexExt as _;
 
@@ -77,26 +99,28 @@ pub(crate) const RECHECK_EVERY: Duration = Duration::from_secs(5);
 /// own (once per version) waits as long as it takes.
 pub(crate) const ASKED_LAPSE: Duration = Duration::from_secs(30 * 60);
 
+/// How long a process the owner started (not a successor an update brought in) waits
+/// before its first quiet moment: on a new Mac the owner sees System Settings seconds
+/// after aterm opens, once they pause ([`QUIET_FOR`]), rather than a minute and a half
+/// later. A successor waits `consent_card::LAUNCH_SETTLE` ([`Lane::note_cold_start`]).
+pub(crate) const COLD_START_SETTLE: Duration = Duration::from_secs(5);
+
 /// Whether now is a moment to put System Settings in front of the owner unasked: an
 /// aterm window is focused (they are looking at aterm, not at another app's work), the
 /// owner is present ([`PRESENT_WITHIN`]) but not typing or pointing ([`QUIET_FOR`]),
-/// this process has settled (`consent_card::LAUNCH_SETTLE`: a successor an update just
-/// brought in is not "quiet" the second it starts), and no update hand-off is pending or
-/// in flight. The input clock is the machine-wide HID idle time, which carries across an
-/// update hand-off where the window's own keystroke stamp starts empty. Pure.
+/// this process has settled ([`Lane::settled`]: a successor an update just brought in is
+/// not "quiet" the second it starts), and no update hand-off is pending or in flight. The
+/// input clock is the machine-wide HID idle time, which carries across an update hand-off
+/// where the window's own keystroke stamp starts empty. Pure.
 #[must_use]
 pub(crate) fn quiet(
     focused: bool,
     input_within_quiet: bool,
     input_within_presence: bool,
-    age: Duration,
+    settled: bool,
     handoff_busy: bool,
 ) -> bool {
-    focused
-        && !input_within_quiet
-        && input_within_presence
-        && age >= crate::consent_card::LAUNCH_SETTLE
-        && !handoff_busy
+    focused && !input_within_quiet && input_within_presence && settled && !handoff_busy
 }
 
 // ---------------------------------------------------------------------------
@@ -106,7 +130,8 @@ pub(crate) fn quiet(
 /// Where a hand-over came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Origin {
-    /// The window's own, once per aterm version (`devtools_watch`): at a quiet moment.
+    /// The window's own, once per aterm version (`devtools_watch` for Developer Tools,
+    /// the launch check, `App::note_launch_fda`, for Full Disk Access): at a quiet moment.
     Automatic,
     /// The Settings ▸ Security card's button: the owner's press.
     Settings,
@@ -160,6 +185,37 @@ impl Origin {
     }
 }
 
+/// Which System Settings page a hand-over brings up, aterm's panel beside it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Page {
+    /// Privacy & Security ▸ Developer Tools (owner ask 2026-10-15).
+    #[default]
+    DeveloperTools,
+    /// Privacy & Security ▸ Full Disk Access (owner ask 2026-10-16: aterm on a new Mac
+    /// starts out asking for file access everywhere): the window's own hand-over at the
+    /// first quiet moment of a launch that reads it off ([`admit_fda`]), and the panel
+    /// beside the page the Security card's and the digest's *Open Settings* open.
+    FullDiskAccess,
+}
+
+impl Page {
+    /// The page's System Settings anchor.
+    pub(crate) const fn pane(self) -> crate::menu::PrivacyPane {
+        match self {
+            Self::DeveloperTools => crate::menu::PrivacyPane::DeveloperTools,
+            Self::FullDiskAccess => crate::menu::PrivacyPane::FullDiskAccess,
+        }
+    }
+
+    /// The page in aterm.log's words.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::DeveloperTools => "devtools",
+            Self::FullDiskAccess => "full disk access",
+        }
+    }
+}
+
 /// When [`admit`] is asked: as the request arrives, or at the quiet moment a waiting
 /// one was held for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -180,7 +236,8 @@ pub(crate) struct Facts {
     /// The owner's Not now still holds (`atpkg::devtools::declined_until`).
     pub(crate) declined: bool,
     /// A grant keyed to this build's designated requirement survives the next build
-    /// (`DrClass::grant_stable`): a Developer ID build, not an ad hoc or dev one.
+    /// (`DrClass::grant_stable`): a Developer ID or "aterm dev"-signed build, not an ad hoc
+    /// or unsigned one.
     pub(crate) grant_stable: bool,
     /// aterm opened the page within the origin's [`Origin::reopen_after_s`] — for
     /// `now`, or the window answered a `now` within that minute
@@ -204,6 +261,9 @@ pub(crate) enum Refusal {
     /// aterm's row reads on while macOS still checks its new programs: the page holds
     /// nothing to add or switch on (`atpkg::devtools::Step::ListedOn`).
     Listed,
+    /// aterm already brought the page up for this version, unasked
+    /// ([`FdaFacts::shown_this_version`]).
+    Shown,
 }
 
 impl Refusal {
@@ -216,6 +276,7 @@ impl Refusal {
             Self::Unstable => "unstable",
             Self::Recent => "recent",
             Self::Listed => "listed",
+            Self::Shown => "shown",
         }
     }
 }
@@ -285,6 +346,66 @@ pub(crate) fn admit(origin: Origin, moment: Moment, facts: &Facts) -> Admit {
         (false, Moment::Asked) => Admit::Queue,
         (false, Moment::Quiet) => Admit::Hand {
             list_terminal: empty,
+        },
+    }
+}
+
+/// What [`admit_fda`] judges on, read at the moment it is asked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FdaFacts {
+    /// The window's own Full Disk Access probe, as last completed.
+    pub(crate) fda: FdaState,
+    /// The owner's Not now on this panel still holds (`fda-declined`), or they answered
+    /// the access card's question Not now (`consent_card::Marker::NotNow`, for good).
+    pub(crate) declined: bool,
+    /// A grant keyed to this build's designated requirement survives the next build.
+    pub(crate) grant_stable: bool,
+    /// aterm brought up this page, or the Developer Tools one, within
+    /// [`atpkg::devtools::REOPEN_AFTER_S`]: never two pages back to back.
+    pub(crate) recent: bool,
+    /// aterm already brought this page up, unasked, for the running version
+    /// (`fda-pane-opened`): once per version, as the Developer Tools page.
+    pub(crate) shown_this_version: bool,
+}
+
+/// WHO MAY BRING THE FULL DISK ACCESS PAGE UP, AND WHEN. An owner's press opens it
+/// whatever aterm read (with the panel unless the probe reads granted). The window's own
+/// hand-over acts only on a probe that read `denied` (`unknown` does nothing: the grant
+/// may be held), never while the owner's Not now holds, never on a build whose grant would
+/// not survive the next build, never twice for one version, never within ten minutes of
+/// either page, and only at a quiet moment. No control verb reaches it. Pure.
+#[must_use]
+pub(crate) fn admit_fda(origin: Origin, moment: Moment, facts: &FdaFacts) -> Admit {
+    if origin.owner_press() {
+        return if facts.fda == FdaState::Granted {
+            Admit::PaneOnly
+        } else {
+            Admit::Hand {
+                list_terminal: false,
+            }
+        };
+    }
+    match facts.fda {
+        FdaState::Granted => return Admit::Refuse(Refusal::Granted),
+        FdaState::Unknown => return Admit::Refuse(Refusal::Unknown),
+        FdaState::Denied => {}
+    }
+    if facts.declined {
+        return Admit::Refuse(Refusal::Declined);
+    }
+    if !facts.grant_stable {
+        return Admit::Refuse(Refusal::Unstable);
+    }
+    if facts.shown_this_version {
+        return Admit::Refuse(Refusal::Shown);
+    }
+    if facts.recent {
+        return Admit::Refuse(Refusal::Recent);
+    }
+    match moment {
+        Moment::Asked => Admit::Queue,
+        Moment::Quiet => Admit::Hand {
+            list_terminal: false,
         },
     }
 }
@@ -470,6 +591,45 @@ fn show_list_failed_words(why: &str) -> String {
     )
 }
 
+/// The Full Disk Access panel's heading.
+pub(crate) const FDA_PANEL_TITLE: &str = "Turn on Full Disk Access for aterm";
+
+/// Why: what the switch grants, the access card's `consent_card::FDA_GRANTS` as a sentence.
+/// Nothing about which prompts it silences or when a running process sees it (design
+/// §3.4's copy rules).
+pub(crate) const FDA_PANEL_WHY: &str = "Full Disk Access lets programs you run in aterm, agents \
+                                        included, read protected data such as Mail and \
+                                        Messages.";
+
+/// The tile's hint while it can be dragged.
+pub(crate) const FDA_PANEL_STEP: &str = "Drag aterm into the Full Disk Access list";
+
+/// How, with aterm's icon to drag.
+pub(crate) const FDA_PANEL_HOW: &str = "Drag aterm into the list (or press + below it and choose \
+                                        aterm), enter your password if macOS asks, and switch \
+                                        aterm on.";
+
+/// How, with no icon to drag (the running copy is not one aterm offers): + leads.
+pub(crate) const FDA_PANEL_HOW_PLUS: &str = "Press + below the list, choose aterm, enter your \
+                                             password if macOS asks, and switch aterm on.";
+
+/// How, once the tile is spent: the switch, then the + route for a drop that landed
+/// elsewhere. aterm cannot read this list, so it never says where the drop went.
+pub(crate) const FDA_PANEL_DROPPED: &str = "Switch aterm on in the list. If aterm is not there, \
+                                            press + below the list and choose aterm.";
+
+/// The drag ended with nothing taken.
+pub(crate) const FDA_DROP_FAILED_WORDS: &str =
+    "Didn't take? Press + below the Full Disk Access list and choose aterm.";
+
+/// The trade, as the Security page states it.
+pub(crate) const FDA_PANEL_TRADE: &str = "Full Disk Access on a terminal is broad: everything you \
+                                          run in aterm can then read everything this account \
+                                          can read.";
+
+/// The done words: aterm's own probe reads the grant.
+pub(crate) const FDA_PANEL_DONE: &str = "aterm has Full Disk Access.";
+
 /// tccd's measured cost, when its log was read whole and it checked any: the Settings
 /// row's words.
 #[must_use]
@@ -591,17 +751,20 @@ pub(crate) struct Tile {
     pub(crate) bundle: PathBuf,
     /// Whether it can still be dragged: one accepted drop per panel.
     pub(crate) live: bool,
+    /// The drag as one step, for the page's list ([`atpkg::devtools::HELPER_STEP`],
+    /// [`FDA_PANEL_STEP`]).
+    pub(crate) step: &'static str,
 }
 
 /// The hint beside a spent tile: something took its one drop.
 pub(crate) const TILE_SPENT_HINT: &str = "Dropped.";
 
 impl Tile {
-    /// The hint beside the icon: the drag while it can be dragged
-    /// ([`atpkg::devtools::HELPER_STEP`]), then what happened.
+    /// The hint beside the icon: the drag while it can be dragged ([`Self::step`]),
+    /// then what happened.
     pub(crate) const fn hint(&self) -> &'static str {
         if self.live {
-            atpkg::devtools::HELPER_STEP
+            self.step
         } else {
             TILE_SPENT_HINT
         }
@@ -797,6 +960,8 @@ impl Effect {
 /// What a show starts from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Show {
+    /// The page the panel stands beside.
+    pub(crate) page: Page,
     /// Who asked.
     pub(crate) origin: Origin,
     /// The reading the show judged by.
@@ -815,6 +980,7 @@ pub(crate) struct Show {
 /// reading and each turn of the lane asks. Pure: the lane owns the arm that draws it.
 #[derive(Clone, Debug)]
 pub(crate) struct Panel {
+    page: Page,
     origin: Origin,
     shown_at: Instant,
     phase: Phase,
@@ -871,6 +1037,7 @@ impl Panel {
     /// A panel shown at `now`.
     pub(crate) fn new(show: Show, now: Instant) -> Self {
         Self {
+            page: show.page,
             origin: show.origin,
             shown_at: now,
             phase: Phase::Explain,
@@ -902,9 +1069,15 @@ impl Panel {
         self.origin
     }
 
-    /// Whether the lane may read the list (otherwise the UNREAD variant).
-    pub(crate) const fn readable(&self) -> bool {
-        self.unread.is_none()
+    /// The page it stands beside.
+    pub(crate) const fn page(&self) -> Page {
+        self.page
+    }
+
+    /// Whether the lane may read the list (otherwise the UNREAD variant). The Full Disk
+    /// Access list is never read: only aterm's own probe says whether it holds the grant.
+    pub(crate) fn readable(&self) -> bool {
+        self.page == Page::DeveloperTools && self.unread.is_none()
     }
 
     /// The words, top to bottom.
@@ -914,6 +1087,9 @@ impl Panel {
             HELPER_HOW, HELPER_HOW_PLUS, HELPER_LISTED_ON, HELPER_SWITCH_ON, HELPER_TITLE, done,
             only_aterm, trade, why,
         };
+        if self.page == Page::FullDiskAccess {
+            return self.fda_content();
+        }
         let mut blocks = vec![Block::text(HELPER_TITLE, Tone::Title)];
         if self.phase == Phase::Done {
             blocks.push(Block::text(done(self.skips), Tone::Done));
@@ -930,6 +1106,7 @@ impl Panel {
             blocks.push(Block::Tile(Tile {
                 bundle: bundle.clone(),
                 live: self.dropped_at.is_none(),
+                step: atpkg::devtools::HELPER_STEP,
             }));
         }
         match self.phase {
@@ -972,6 +1149,51 @@ impl Panel {
         }));
         blocks.push(Block::Link(STATUS_LINK));
         Content { blocks }
+    }
+
+    /// The Full Disk Access panel's words: what the switch grants and costs, aterm's icon
+    /// to drag into the list, the + route, and the owner's two answers. aterm cannot read
+    /// that list, so nothing confirms a drop: aterm's own probe reading the grant, or the
+    /// owner's "I've switched it on", ends the panel.
+    fn fda_content(&self) -> Content {
+        let mut blocks = vec![Block::text(FDA_PANEL_TITLE, Tone::Title)];
+        if self.phase == Phase::Done {
+            blocks.push(Block::text(FDA_PANEL_DONE, Tone::Done));
+            blocks.push(Block::Link(STATUS_LINK));
+            return Content { blocks };
+        }
+        blocks.push(Block::text(FDA_PANEL_WHY, Tone::Body));
+        if let Some(bundle) = &self.bundle {
+            blocks.push(Block::Tile(Tile {
+                bundle: bundle.clone(),
+                live: self.dropped_at.is_none(),
+                step: FDA_PANEL_STEP,
+            }));
+        }
+        match self.phase {
+            Phase::DropFailed => blocks.push(Block::text(FDA_DROP_FAILED_WORDS, Tone::Notice)),
+            Phase::DroppedOutside => blocks.push(Block::text(DROP_OUTSIDE_WORDS, Tone::Notice)),
+            Phase::Explain | Phase::DroppedUnconfirmed | Phase::Done => {}
+        }
+        blocks.push(Block::text(
+            if self.dropped_at.is_some() {
+                FDA_PANEL_DROPPED
+            } else if self.bundle.is_none() {
+                FDA_PANEL_HOW_PLUS
+            } else {
+                FDA_PANEL_HOW
+            },
+            Tone::Body,
+        ));
+        blocks.push(Block::text(FDA_PANEL_TRADE, Tone::Secondary));
+        blocks.push(Block::Buttons(vec![Button::SwitchedOn, Button::NotNow]));
+        blocks.push(Block::Link(STATUS_LINK));
+        Content { blocks }
+    }
+
+    /// Whether the owner dropped aterm's icon somewhere this panel's life.
+    pub(crate) const fn dropped(&self) -> bool {
+        self.dropped_at.is_some()
     }
 
     /// One of the owner's presses, or the end of their drag.
@@ -1167,8 +1389,9 @@ impl Panel {
 
     /// A turn of the lane at `now`: the done words' time and the ten-minute
     /// bound. (A drop is judged by the read that follows it, [`Self::on_read`]:
-    /// while System Settings is not in front nothing is read, and nothing is
-    /// judged — the owner may be typing their password into macOS's prompt.)
+    /// nothing is read while System Settings is not in front or shows its own
+    /// password window over its list ([`settings_busy`]), and nothing is judged
+    /// without a read — the owner may be typing their password.)
     pub(crate) fn turn(&mut self, now: Instant) -> Effect {
         if self.done_at.is_some_and(|at| now >= at + DONE_FOR) {
             return Effect {
@@ -1194,7 +1417,8 @@ impl Panel {
     /// Whether the lane should read the list now: only a readable list, one read at a
     /// time, at most one per [`PANEL_TICK`] (sooner after a drop), never once done.
     pub(crate) fn wants_read(&self, now: Instant) -> bool {
-        self.unread.is_none()
+        self.page == Page::DeveloperTools
+            && self.unread.is_none()
             && !self.read_out
             && self.phase != Phase::Done
             && self
@@ -1615,6 +1839,140 @@ pub(crate) fn drift(placed: Rect, placed_on: &[Rect], frame: Rect, screens: &[Re
     }
 }
 
+/// The smallest window counted as System Settings' main window, wide by
+/// [`SETTINGS_MIN_H`] high: its sheets, popovers and password window are smaller
+/// (the password window is 260 × 349 pt on 27.0).
+pub(crate) const SETTINGS_MIN_W: f64 = 320.0;
+/// See [`SETTINGS_MIN_W`].
+pub(crate) const SETTINGS_MIN_H: f64 = 240.0;
+
+/// One of System Settings' on-screen windows as the placement reads it: its layer,
+/// opacity and frame in Cocoa screen space — never its name, title or number, and
+/// kept no longer than the turn that read it (O27).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SettingsWindow {
+    /// Its window layer: 0 for a normal window; the panel floats at 3.
+    pub(crate) layer: isize,
+    /// Its opacity.
+    pub(crate) alpha: f64,
+    /// Its frame.
+    pub(crate) bounds: Rect,
+}
+
+/// Which of `windows` is System Settings' main window, the one the panel stands
+/// beside: the largest on layer 0 with any opacity and at least [`SETTINGS_MIN_W`] ×
+/// [`SETTINGS_MIN_H`], the first of equals. Pure.
+// No `expect(dead_code)` off macOS: only its callers carry one, because rustc
+// before 1.97 counts the callee of an `expect(dead_code)` item as live and would
+// leave a second expectation here unfulfilled.
+#[must_use]
+pub(crate) fn settings_main(windows: &[SettingsWindow]) -> Option<usize> {
+    let area = |r: Rect| r.w * r.h;
+    let mut best: Option<usize> = None;
+    for (i, window) in windows.iter().enumerate() {
+        if window.layer != 0
+            || window.alpha <= 0.0
+            || window.bounds.w < SETTINGS_MIN_W
+            || window.bounds.h < SETTINGS_MIN_H
+        {
+            continue;
+        }
+        if best.is_none_or(|b| area(window.bounds) > area(windows[b].bounds)) {
+            best = Some(i);
+        }
+    }
+    best
+}
+
+/// System Settings' windows other than its main one that a panel floating at
+/// `level` would sit over: at or below that level (one above is in front of the
+/// panel anyway, as the + button's file chooser is, at 8), with any opacity, and not
+/// one that holds the main window's whole frame (a companion on it; a larger window
+/// would be the main window itself). On 27.0 the one such window is macOS's
+/// password window for a change to the Developer Tools list: System Settings' own,
+/// on layer 0, centred on its window, so System Settings stays the active app and
+/// the activation observer never orders the panel out for it. None without a main
+/// window.
+// No `expect(dead_code)` off macOS, as on `settings_main`.
+fn secondary(windows: &[SettingsWindow], level: isize) -> impl Iterator<Item = &SettingsWindow> {
+    let main = settings_main(windows);
+    windows
+        .iter()
+        .enumerate()
+        .filter(move |&(i, window)| {
+            main.is_some_and(|m| {
+                i != m
+                    && window.layer <= level
+                    && window.alpha > 0.0
+                    && !window.bounds.holds(windows[m].bounds)
+            })
+        })
+        .map(|(_, window)| window)
+}
+
+/// Whether one of System Settings' secondary windows — its password window — lies
+/// under the panel at `panel`, floating at `level`: the panel orders out until it
+/// goes ([`cover_turn`]). Pure.
+#[must_use]
+#[cfg_attr(
+    not(any(test, target_os = "macos")),
+    expect(dead_code, reason = "the AppKit panel is macOS-only")
+)]
+pub(crate) fn under_panel(windows: &[SettingsWindow], panel: Rect, level: isize) -> bool {
+    secondary(windows, level).any(|window| window.bounds.overlap(panel) > 0.0)
+}
+
+/// Whether System Settings shows one of its secondary windows over its main window,
+/// wherever the panel stands: the owner may be typing their password, so the panel's
+/// list read waits and a drop is judged after it, never while it is typed (a drop
+/// judged at [`DROP_CONFIRM_WITHIN`] mid-password read as not landed). Pure.
+#[must_use]
+#[cfg_attr(
+    not(any(test, target_os = "macos")),
+    expect(dead_code, reason = "the AppKit panel is macOS-only")
+)]
+pub(crate) fn settings_busy(windows: &[SettingsWindow], level: isize) -> bool {
+    let Some(main) = settings_main(windows).map(|i| windows[i].bounds) else {
+        return false;
+    };
+    secondary(windows, level).any(|window| window.bounds.overlap(main) > 0.0)
+}
+
+/// What the lane's turn does about System Settings' secondary windows
+/// ([`under_panel`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Cover {
+    /// Nothing to do.
+    Nothing,
+    /// Order the panel out: one lies under it.
+    Out,
+    /// Bring back the panel this ordered out: the window went, and System Settings
+    /// is still the active app.
+    Back,
+}
+
+/// [`Cover`] for one turn, from whether the panel is in front, whether a secondary
+/// window ordered it out (`yielded`), whether System Settings is the active app, and
+/// whether one lies under it now. A panel out for any other reason is not this
+/// turn's to bring back. Pure.
+#[must_use]
+#[cfg_attr(
+    not(any(test, target_os = "macos")),
+    expect(dead_code, reason = "the AppKit panel is macOS-only")
+)]
+pub(crate) const fn cover_turn(
+    visible: bool,
+    yielded: bool,
+    settings_front: bool,
+    under: bool,
+) -> Cover {
+    match (visible, yielded) {
+        (true, _) if under => Cover::Out,
+        (false, true) if settings_front && !under => Cover::Back,
+        _ => Cover::Nothing,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // WHAT TO DRAG
 // ---------------------------------------------------------------------------
@@ -1692,6 +2050,10 @@ pub(crate) struct Reach {
     pub(crate) grant_stable: fn() -> bool,
     /// The bundle to drag ([`drag_bundle`]).
     pub(crate) drag_bundle: fn(Option<&str>) -> Option<PathBuf>,
+    /// Make macOS ask about aterm again once the owner switched it on
+    /// (`atpkg::devtools::refresh_verdict`: aterm's own executable, its own
+    /// responsible process, starts one new program), on a worker.
+    pub(crate) refresh_verdict: fn() -> Result<(), String>,
     live: bool,
 }
 
@@ -1709,6 +2071,7 @@ impl Reach {
             note_declined: atpkg::devtools::note_declined,
             grant_stable: live_grant_stable,
             drag_bundle,
+            refresh_verdict: atpkg::devtools::refresh_verdict,
             live: true,
         }
     }
@@ -1726,6 +2089,7 @@ impl Reach {
             note_declined: inert_note,
             grant_stable: inert_no,
             drag_bundle: inert_drag_bundle,
+            refresh_verdict: inert_list_terminal,
             live: false,
         }
     }
@@ -1779,6 +2143,89 @@ fn inert_no() -> bool {
     false
 }
 
+/// What the Full Disk Access hand-over does to the Mac and to its markers
+/// (`atpkg::devtools::FULL_DISK_ACCESS`), injected beside [`Reach`]: the window's instance
+/// gets [`Self::live`]; a headless instance and every unit test [`Self::inert`]. The
+/// build's grant stability and the bundle to drag are [`Reach`]'s.
+#[derive(Clone, Copy)]
+pub(crate) struct FdaReach {
+    /// Open System Settings at Privacy & Security ▸ Full Disk Access. `true` when it opened.
+    pub(crate) open_pane: fn() -> bool,
+    /// When aterm last opened the page unasked: `(version, unix seconds)`.
+    pub(crate) last_opened: fn() -> Option<(String, u64)>,
+    /// How many seconds ago aterm opened the page, when under the window.
+    pub(crate) opened_within: fn(u64) -> Option<u64>,
+    /// Note the page opened for this version.
+    pub(crate) note_opened: fn(&str),
+    /// The owner's Not now on the panel, while it holds (when said, until when).
+    pub(crate) declined: fn() -> Option<(u64, u64)>,
+    /// Note the owner's Not now for this version.
+    pub(crate) note_declined: fn(&str),
+    live: bool,
+}
+
+impl FdaReach {
+    /// The windowed instance's arms.
+    pub(crate) const fn live() -> Self {
+        Self {
+            open_pane: live_open_fda_pane,
+            last_opened: live_fda_last_opened,
+            opened_within: live_fda_opened_within,
+            note_opened: live_fda_note_opened,
+            declined: live_fda_declined,
+            note_declined: live_fda_note_declined,
+            live: true,
+        }
+    }
+
+    /// The headless / unit-test arms: nothing opens, is read or written.
+    pub(crate) const fn inert() -> Self {
+        Self {
+            open_pane: inert_open_pane,
+            last_opened: inert_last_opened,
+            opened_within: inert_opened_within,
+            note_opened: inert_note,
+            declined: inert_not_declined,
+            note_declined: inert_note,
+            live: false,
+        }
+    }
+}
+
+impl std::fmt::Debug for FdaReach {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FdaReach")
+            .field("live", &self.live)
+            .finish()
+    }
+}
+
+fn live_open_fda_pane() -> bool {
+    crate::menu::open_privacy_settings(Page::FullDiskAccess.pane()).opened()
+}
+
+fn live_fda_last_opened() -> Option<(String, u64)> {
+    atpkg::devtools::FULL_DISK_ACCESS.last_opened()
+}
+
+fn live_fda_opened_within(window_s: u64) -> Option<u64> {
+    atpkg::devtools::FULL_DISK_ACCESS.opened_within(window_s)
+}
+
+fn live_fda_note_opened(version: &str) {
+    atpkg::devtools::FULL_DISK_ACCESS.note_opened(version);
+}
+
+fn live_fda_declined() -> Option<(u64, u64)> {
+    atpkg::devtools::FULL_DISK_ACCESS
+        .declined_until()
+        .map(|declined| (declined.at, declined.until))
+}
+
+fn live_fda_note_declined(version: &str) {
+    atpkg::devtools::FULL_DISK_ACCESS.note_declined(version);
+}
+
 fn inert_drag_bundle(_subject: Option<&str>) -> Option<PathBuf> {
     None
 }
@@ -1800,6 +2247,9 @@ pub(crate) struct DevToolsHelperArm {
     pub(crate) settings_running: fn() -> bool,
     /// Whether System Settings is the frontmost app (the lane reads the list only then).
     pub(crate) settings_frontmost: fn() -> bool,
+    /// Whether System Settings showed its own password window over its list at the
+    /// last placement ([`settings_busy`]): the lane's list read waits while it does.
+    pub(crate) settings_busy: fn() -> bool,
     live: bool,
 }
 
@@ -1816,6 +2266,7 @@ impl DevToolsHelperArm {
                 close: live::close,
                 settings_running: live::settings_running,
                 settings_frontmost: live::settings_frontmost,
+                settings_busy: live::settings_busy_now,
                 live: true,
             }
         }
@@ -1837,6 +2288,7 @@ impl DevToolsHelperArm {
             close: inert_unit,
             settings_running: inert_no,
             settings_frontmost: inert_no,
+            settings_busy: inert_no,
             live: false,
         }
     }
@@ -1978,9 +2430,32 @@ struct Queued {
 /// what the `spctl` run it already made answered, if one did.
 pub(crate) type TakenHandOver = (Origin, Option<Result<(), String>>);
 
+/// How a Full Disk Access panel ended: why it closed, and whether the owner dropped
+/// aterm's icon first. The window's launch warm-up reads it: a panel the owner acted on
+/// (switched on, dropped, done) is not followed by folder dialogs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FdaEnded {
+    /// Why it closed.
+    pub(crate) why: Closed,
+    /// The owner's drag of the tile was taken somewhere.
+    pub(crate) dropped: bool,
+}
+
+impl FdaEnded {
+    /// Whether the owner acted on the page: anything but leaving the panel alone (Not now,
+    /// or ten minutes with nothing dropped). Said it is on, read on, aterm's icon dropped,
+    /// System Settings quit or another page brought up all count: the running process may
+    /// not see a grant made now (design §7 S1), so nothing reads that as "still off".
+    pub(crate) const fn owner_acted(self) -> bool {
+        self.dropped || !matches!(self.why, Closed::NotNow | Closed::Lapsed)
+    }
+}
+
 /// What a panel turn asks of the window.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Asks {
+    /// The page of the panel this turn was for.
+    pub(crate) page: Page,
     /// A reading saw aterm on: end the digest line, refresh Settings.
     pub(crate) granted: bool,
     /// The owner says it is on: drop the cached reading, read on their return.
@@ -1998,10 +2473,20 @@ pub(crate) struct Asks {
 pub(crate) struct Lane {
     windowed: bool,
     born: Instant,
+    /// How long after [`Self::born`] a quiet moment may come ([`Self::settled`]):
+    /// `consent_card::LAUNCH_SETTLE`, or [`COLD_START_SETTLE`] for a process the owner
+    /// started ([`Self::note_cold_start`]).
+    settle: Duration,
     reach: Reach,
+    fda: FdaReach,
     arm: DevToolsHelperArm,
     reading: Option<Reading>,
     queued: Option<Queued>,
+    /// The Full Disk Access hand-over waiting for its quiet moment. It goes before a
+    /// waiting Developer Tools one: that list cannot be read without Full Disk Access.
+    fda_queued: Option<Queued>,
+    /// How the last Full Disk Access panel ended, until the window takes it.
+    fda_ended: Option<FdaEnded>,
     listing: Option<Listing>,
     /// The owner's presses waiting on the `spctl` run that is out.
     waiting: Waiting,
@@ -2024,6 +2509,10 @@ pub(crate) struct Lane {
     /// window holds `now` to its minute itself: a program that asks and never
     /// opens cannot raise the panel again and again.
     now_answered: Option<Instant>,
+    /// A [`Self::refresh_verdict`] worker is out: one at a time.
+    refreshing: Arc<std::sync::atomic::AtomicBool>,
+    /// How many [`Self::refresh_verdict`] workers this lane started.
+    refreshes: u32,
 }
 
 impl Lane {
@@ -2031,20 +2520,34 @@ impl Lane {
     pub(crate) fn new(headless: bool) -> Self {
         let windowed = !headless && cfg!(target_os = "macos");
         if windowed {
-            Self::with_arms(true, Reach::live(), DevToolsHelperArm::live())
+            Self::with_arms(
+                true,
+                Reach::live(),
+                FdaReach::live(),
+                DevToolsHelperArm::live(),
+            )
         } else {
-            Self::with_arms(false, Reach::inert(), DevToolsHelperArm::inert())
+            Self::with_arms(
+                false,
+                Reach::inert(),
+                FdaReach::inert(),
+                DevToolsHelperArm::inert(),
+            )
         }
     }
 
-    fn with_arms(windowed: bool, reach: Reach, arm: DevToolsHelperArm) -> Self {
+    fn with_arms(windowed: bool, reach: Reach, fda: FdaReach, arm: DevToolsHelperArm) -> Self {
         Self {
             windowed,
             born: Instant::now(),
+            settle: crate::consent_card::LAUNCH_SETTLE,
             reach,
+            fda,
             arm,
             reading: None,
             queued: None,
+            fda_queued: None,
+            fda_ended: None,
             listing: None,
             waiting: Waiting::default(),
             panel: None,
@@ -2054,13 +2557,25 @@ impl Lane {
             opened: None,
             declined: None,
             now_answered: None,
+            refreshing: Arc::default(),
+            refreshes: 0,
         }
     }
 
     /// A windowed lane with injected arms: the tests' stand-in for a window.
     #[cfg(test)]
     pub(crate) fn windowed_for_test(reach: Reach, arm: DevToolsHelperArm) -> Self {
-        Self::with_arms(true, reach, arm)
+        Self::with_arms(true, reach, FdaReach::inert(), arm)
+    }
+
+    /// A windowed lane with injected arms for both pages.
+    #[cfg(test)]
+    pub(crate) fn windowed_with_fda_for_test(
+        reach: Reach,
+        fda: FdaReach,
+        arm: DevToolsHelperArm,
+    ) -> Self {
+        Self::with_arms(true, reach, fda, arm)
     }
 
     /// Whether this lane may act at all (a window on macOS).
@@ -2073,9 +2588,25 @@ impl Lane {
         self.reach
     }
 
+    /// The Full Disk Access hand-over's reach.
+    pub(crate) const fn fda_reach(&self) -> FdaReach {
+        self.fda
+    }
+
     /// How long ago this instance's lane was made (the App's construction).
     pub(crate) fn age(&self, now: Instant) -> Duration {
         now.saturating_duration_since(self.born)
+    }
+
+    /// This process was started by the owner, not brought in by an update: its first
+    /// quiet moment may come [`COLD_START_SETTLE`] after it was made.
+    pub(crate) fn note_cold_start(&mut self) {
+        self.settle = COLD_START_SETTLE;
+    }
+
+    /// Whether this process has settled enough for a quiet moment ([`quiet`]).
+    pub(crate) fn settled(&self, now: Instant) -> bool {
+        self.age(now) >= self.settle
     }
 
     /// The panel, when one is up.
@@ -2137,7 +2668,11 @@ impl Lane {
             self.queued = None;
         }
         let drag_bundle = self.reach.drag_bundle;
-        if let Some(panel) = self.panel.as_mut() {
+        if let Some(panel) = self
+            .panel
+            .as_mut()
+            .filter(|panel| panel.page == Page::DeveloperTools)
+        {
             let mut effect = panel.note_reading(&reading, now);
             if panel.wants_subject()
                 && let Some(subject) = reading.subject
@@ -2232,16 +2767,129 @@ impl Lane {
         self.queued = None;
     }
 
+    /// Whether a Full Disk Access hand-over or panel goes first: a Developer Tools one
+    /// waits behind it (that list cannot be read without Full Disk Access, and one System
+    /// Settings window shows one page).
+    pub(crate) fn fda_first(&self) -> bool {
+        self.fda_queued.is_some()
+            || self
+                .panel
+                .as_ref()
+                .is_some_and(|panel| panel.page == Page::FullDiskAccess)
+    }
+
     /// Whether the waiting hand-over's next look at the moment is due.
     pub(crate) fn hand_over_due(&self, now: Instant) -> bool {
-        self.queued.as_ref().is_some_and(|q| now >= q.next_check)
+        !self.fda_first() && self.queued.as_ref().is_some_and(|q| now >= q.next_check)
+    }
+
+    /// Hold the Full Disk Access hand-over for its quiet moment. One at a time: a second
+    /// ask while one waits changes nothing.
+    pub(crate) fn queue_fda(&mut self, origin: Origin, now: Instant) {
+        if self.fda_queued.is_some() {
+            return;
+        }
+        self.fda_queued = Some(Queued {
+            origin,
+            at: now,
+            next_check: now,
+            listed: None,
+        });
+    }
+
+    /// The origin of the Full Disk Access hand-over waiting for its quiet moment.
+    #[cfg(test)]
+    pub(crate) fn fda_queued(&self) -> Option<Origin> {
+        self.fda_queued.as_ref().map(|q| q.origin)
+    }
+
+    /// The owner's press on the panel that is up, as the live arm posts it.
+    #[cfg(test)]
+    pub(crate) fn press_for_test(&self, event: PanelEvent) {
+        self.shared
+            .lock_or_recover()
+            .events
+            .push((self.generation, event));
+    }
+
+    /// Whether a Full Disk Access hand-over waits for its quiet moment.
+    pub(crate) const fn fda_waiting(&self) -> bool {
+        self.fda_queued.is_some()
+    }
+
+    /// The owner reached the Full Disk Access page another way, or the grant reads held:
+    /// nothing waits any longer.
+    pub(crate) fn drop_queued_fda(&mut self) {
+        self.fda_queued = None;
+    }
+
+    /// Whether the waiting Full Disk Access hand-over's next look at the moment is due.
+    pub(crate) fn fda_hand_over_due(&self, now: Instant) -> bool {
+        self.fda_queued
+            .as_ref()
+            .is_some_and(|q| now >= q.next_check)
+    }
+
+    /// The probe the waiting Full Disk Access hand-over judges by is being read again:
+    /// look at `at`, not now (a look on a pending read would refuse it as unknown).
+    pub(crate) fn defer_fda(&mut self, at: Instant) {
+        if let Some(queued) = self.fda_queued.as_mut() {
+            queued.next_check = at;
+        }
+    }
+
+    /// Whether a Developer Tools hand-over waits for its quiet moment, or its `spctl`
+    /// run is out.
+    pub(crate) const fn devtools_waiting(&self) -> bool {
+        self.queued.is_some() || self.listing.is_some()
+    }
+
+    /// The waiting Full Disk Access hand-over, when `quiet` and no panel is up (an owner's
+    /// Developer Tools panel is not taken away from them); otherwise it looks again
+    /// [`RECHECK_EVERY`] later.
+    pub(crate) fn take_queued_fda(&mut self, now: Instant, quiet: bool) -> Option<Origin> {
+        let panel_up = self.panel.is_some();
+        let queued = self.fda_queued.as_mut()?;
+        if quiet && !panel_up {
+            return self.fda_queued.take().map(|q| q.origin);
+        }
+        queued.next_check = now + RECHECK_EVERY;
+        None
+    }
+
+    /// The window's own Full Disk Access probe completed with `fda`: a grant ends a
+    /// waiting hand-over and turns a Full Disk Access panel to its done words.
+    pub(crate) fn note_fda(&mut self, fda: FdaState, now: Instant) {
+        if fda != FdaState::Granted {
+            return;
+        }
+        self.fda_queued = None;
+        if let Some(panel) = self
+            .panel
+            .as_mut()
+            .filter(|panel| panel.page == Page::FullDiskAccess)
+        {
+            let effect = panel.granted(now);
+            self.redraw(effect);
+        }
+    }
+
+    /// How the last Full Disk Access panel ended, once: the window's launch warm-up
+    /// takes it.
+    pub(crate) fn take_fda_ended(&mut self) -> Option<FdaEnded> {
+        self.fda_ended.take()
     }
 
     /// The waiting hand-over, when `quiet` (the caller judged [`quiet`] at `now`),
     /// with what its earlier `spctl` run answered; otherwise it looks again
     /// [`RECHECK_EVERY`] later, or lapses.
     pub(crate) fn take_queued(&mut self, now: Instant, quiet: bool) -> Option<TakenHandOver> {
+        let fda_first = self.fda_first();
         let queued = self.queued.as_mut()?;
+        if fda_first {
+            queued.next_check = now + RECHECK_EVERY;
+            return None;
+        }
         if queued
             .origin
             .lapses_after()
@@ -2278,17 +2926,18 @@ impl Lane {
         }
         let list_terminal = self.reach.list_terminal;
         let shared = Arc::clone(&self.shared);
-        let spawned = std::thread::Builder::new()
-            .name("aterm-devtools-terminal".to_owned())
-            .spawn(move || {
+        let spawned = crate::qos::spawn_lane_thread(
+            "aterm-devtools-terminal".to_owned(),
+            crate::qos::Role::Responsive,
+            move || {
                 // Responsive: the worker publishes under the slot mutex the UI
                 // thread's park reads, and nearly all of its life is a wait on
                 // one short child.
-                crate::qos::set_self(crate::qos::Role::Responsive);
                 let listed = list_terminal();
                 shared.lock_or_recover().listed = Some(listed);
                 wake();
-            });
+            },
+        );
         match spawned {
             Ok(_) => {
                 self.listing = Some(listing);
@@ -2301,6 +2950,52 @@ impl Lane {
                 false
             }
         }
+    }
+
+    /// MAKE macOS ASK ABOUT ATERM AGAIN once the owner switched it on
+    /// ([`Reach::refresh_verdict`], `atpkg::devtools::refresh_verdict`): syspolicyd
+    /// keeps its verdict for this process, checked before the switch went on, until an
+    /// aterm process it has not checked starts a new program (measured, design §7
+    /// D14). On a worker at background priority, one at a time; it publishes nothing —
+    /// its effect is macOS's, and the owner's next reading sees tccd's fresh answer.
+    /// `false` on a headless instance, while one is out, or when the worker could not
+    /// start.
+    pub(crate) fn refresh_verdict(&mut self) -> bool {
+        use std::sync::atomic::Ordering;
+        if !self.windowed || self.refreshing.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        let refresh = self.reach.refresh_verdict;
+        let refreshing = Arc::clone(&self.refreshing);
+        // Background: it takes no lock a UI thread waits on (`qos.rs`'s floor
+        // rule), and all of its life is a wait on two short children.
+        let spawned = crate::qos::spawn_lane_thread(
+            "aterm-devtools-refresh",
+            crate::qos::Role::Background,
+            move || {
+                match refresh() {
+                    Ok(()) => aterm_log::info!(
+                        "devtools: a fresh aterm process ran a new program, so macOS asked \
+                         about aterm again"
+                    ),
+                    Err(e) => aterm_log::warn!("devtools: asking macOS about aterm again: {e}"),
+                }
+                refreshing.store(false, Ordering::Release);
+            },
+        );
+        if let Err(e) = spawned {
+            self.refreshing.store(false, Ordering::Release);
+            aterm_log::warn!("devtools: the refresh worker could not start: {e}");
+            return false;
+        }
+        self.refreshes += 1;
+        true
+    }
+
+    /// How many verdict refreshes this lane started ([`Self::refresh_verdict`]).
+    #[cfg(test)]
+    pub(crate) const fn refreshes_started(&self) -> u32 {
+        self.refreshes
     }
 
     /// A digest press waits on the run it started or rode.
@@ -2340,7 +3035,11 @@ impl Lane {
 
     /// The panel's Show it ended.
     pub(crate) fn on_listed(&mut self, listed: &Result<(), String>) {
-        if let Some(panel) = self.panel.as_mut() {
+        if let Some(panel) = self
+            .panel
+            .as_mut()
+            .filter(|panel| panel.page == Page::DeveloperTools)
+        {
             let effect = panel.on_listed(listed);
             self.redraw(effect);
         }
@@ -2366,9 +3065,14 @@ impl Lane {
             return false;
         }
         aterm_log::info!(
-            "devtools: the helper panel is up ({}{})",
+            "{}: the helper panel is up ({}{})",
+            panel.page.as_str(),
             panel.origin().as_str(),
-            if panel.readable() { "" } else { ", unread" }
+            if panel.page == Page::DeveloperTools && !panel.readable() {
+                ", unread"
+            } else {
+                ""
+            }
         );
         self.panel = Some(panel);
         self.next_tick = Some(now);
@@ -2384,13 +3088,27 @@ impl Lane {
         };
         (self.arm.close)();
         self.next_tick = None;
-        if why.declines() {
-            (self.reach.note_declined)(aterm_types::version::app_version());
-            // The Settings card reads the decline again, once.
-            self.declined = None;
+        match panel.page {
+            Page::DeveloperTools => {
+                if why.declines() {
+                    (self.reach.note_declined)(aterm_types::version::app_version());
+                    // The Settings card reads the decline again, once.
+                    self.declined = None;
+                }
+            }
+            Page::FullDiskAccess => {
+                if why.declines() {
+                    (self.fda.note_declined)(aterm_types::version::app_version());
+                }
+                self.fda_ended = Some(FdaEnded {
+                    why,
+                    dropped: panel.dropped(),
+                });
+            }
         }
         aterm_log::info!(
-            "devtools: the helper panel closed ({why:?}, {:?})",
+            "{}: the helper panel closed ({why:?}, {:?})",
+            panel.page.as_str(),
             panel.phase()
         );
     }
@@ -2417,9 +3135,9 @@ impl Lane {
         read: Option<ProbeGate>,
         wake: &Wake,
     ) -> Asks {
-        if self.panel.is_none() {
+        let Some(page) = self.panel.as_ref().map(Panel::page) else {
             return Asks::default();
-        }
+        };
         let generation = self.generation;
         let (events, list) = {
             let mut shared = self.shared.lock_or_recover();
@@ -2471,6 +3189,7 @@ impl Lane {
             self.start_read(now, gate, wake);
         }
         let asks = Asks {
+            page,
             granted: effect.granted,
             recheck: effect.recheck,
             list_terminal: effect.list_terminal,
@@ -2492,8 +3211,9 @@ impl Lane {
         if !panel.wants_read(now) {
             return;
         }
-        if !(self.arm.settings_frontmost)() {
-            // Not in front (macOS's password prompt may be): a drop's read waits
+        if !(self.arm.settings_frontmost)() || (self.arm.settings_busy)() {
+            // Not in front, or showing its own password window over its list (the
+            // owner may be typing: a drop is judged after it): a drop's read waits
             // for the cadence like any other, rather than asking every loop turn.
             panel.last_read.get_or_insert(now);
             return;
@@ -2502,12 +3222,12 @@ impl Lane {
         let shared = Arc::clone(&self.shared);
         let generation = self.generation;
         let wake = Arc::clone(wake);
-        let spawned = std::thread::Builder::new()
-            .name("aterm-devtools-list".to_owned())
-            .spawn(move || {
+        let spawned = crate::qos::spawn_lane_thread(
+            "aterm-devtools-list".to_owned(),
+            crate::qos::Role::Responsive,
+            move || {
                 // Responsive, as the `spctl` worker: it publishes under the slot
                 // mutex the park reads.
-                crate::qos::set_self(crate::qos::Role::Responsive);
                 let list = read_list(gate, subject);
                 {
                     let mut shared = shared.lock_or_recover();
@@ -2516,7 +3236,8 @@ impl Lane {
                     }
                 }
                 wake();
-            });
+            },
+        );
         match spawned {
             Ok(_) => panel.read_out = true,
             Err(e) => aterm_log::warn!("devtools: the list read could not start: {e}"),
@@ -2548,10 +3269,14 @@ impl Lane {
         if self.listing.is_some() {
             fold(now + PANEL_TICK);
         }
-        if let Some(queued) = &self.queued
-            && focused()
-        {
-            fold(queued.next_check);
+        // A Developer Tools hand-over behind a Full Disk Access one is not looked at
+        // ([`Self::hand_over_due`]), so its past look must arm nothing.
+        let devtools = self.queued.as_ref().filter(|_| !self.fda_first());
+        let waiting = [devtools, self.fda_queued.as_ref()];
+        if waiting.iter().any(Option::is_some) && focused() {
+            for queued in waiting.into_iter().flatten() {
+                fold(queued.next_check);
+            }
         }
         soonest
     }
@@ -2575,7 +3300,10 @@ impl Lane {
 /// * **Visible only while System Settings is the frontmost app.** An NSWorkspace
 ///   activation observer orders it out whenever another app comes forward and
 ///   back in when System Settings returns — so it never floats over another app's
-///   work, and it is out of the way while macOS's own password prompt is in front.
+///   work. macOS's password window for a change to the list is System Settings'
+///   own (27.0), so System Settings stays frontmost and the observer never sees it:
+///   the lane's placement turn orders the panel out while that window lies under
+///   it ([`cover_turn`]) and back when it goes.
 ///   On a show it waits up to [`REVEAL_WAIT`] for System Settings' window before
 ///   placing itself, rather than appearing at a screen corner and jumping.
 /// * **Placed beside System Settings' window ([`place`]), never over its right
@@ -2600,10 +3328,11 @@ impl Lane {
 ///   icon back, never dropping it on whatever window is beneath (an aterm
 ///   terminal would type its path; aterm's own fallback over the sidebar strip
 ///   hangs the tile outside System Settings' window). Its
-///   end says whether the destination took it. One accepted drop per panel. An
-///   open hand shows over the tile while it can be dragged (a tracking area
-///   active always: cursor rects work only in the key window, which this panel
-///   never is). aterm never drops anything itself.
+///   end says whether the destination took it. One accepted drop per panel. The
+///   tile lights up under the pointer while it can be dragged (a tracking area
+///   active always), in place of an open-hand cursor: macOS ignores a cursor
+///   that an inactive app sets, and aterm is never the active app while the
+///   panel is up. aterm never drops anything itself.
 /// * **Its presses are posted, not acted on**: Not now, the close box, "I've
 ///   switched it on", Show it and the status link go to the lane through
 ///   [`PanelEvents`]; the lane decides.
@@ -2623,9 +3352,10 @@ pub(crate) mod live {
     use aterm_objc::{Bool, CGPoint, CGRect, CGSize, Id, Obj, Retained, Sel, class, sel};
 
     use super::{
-        Block, Button, Content, Drift, ICON, Measure, PANEL_W, PanelEvent, PanelEvents, Part,
-        PlaceTurn, Rect, TILE_CAPTION, Tone, cg_to_cocoa, drift, drop_landed, layout, may_reveal,
-        place, place_turn,
+        Block, Button, Content, Cover, Drift, ICON, Measure, PANEL_W, PanelEvent, PanelEvents,
+        Part, PlaceTurn, Rect, SettingsWindow, TILE_CAPTION, Tone, cg_to_cocoa, cover_turn, drift,
+        drop_landed, layout, may_reveal, place, place_turn, settings_busy, settings_main,
+        under_panel,
     };
     use crate::appkit::{self, MainThread, consts};
 
@@ -2655,12 +3385,12 @@ pub(crate) mod live {
     /// The tile's opacity once its one drop is spent.
     const SPENT_ALPHA: f64 = 0.4;
 
-    /// The smallest window counted as System Settings' own (its sheets and
-    /// popovers are smaller).
-    const SETTINGS_MIN: CGSize = CGSize {
-        width: 320.0,
-        height: 240.0,
-    };
+    /// The corner radius of the hover ring behind the tile's icon.
+    const HOVER_RADIUS: f64 = 12.0;
+
+    /// How strongly the hover wash tints the accent colour (the tab chips'
+    /// drop-target wash).
+    const HOVER_WASH_ALPHA: f64 = 0.18;
 
     /// The width a push button adds to its title's cell.
     const BUTTON_PAD: f64 = 8.0;
@@ -2742,6 +3472,12 @@ pub(crate) mod live {
         dragging: bool,
         /// Words that came while the drag ran, drawn when it ends.
         pending: Option<Content>,
+        /// Ordered out because one of System Settings' own windows (its password
+        /// window) lay under it ([`under_panel`]): back when that window goes.
+        yielded: bool,
+        /// System Settings showed its password window over its list at the last
+        /// placement ([`settings_busy`]).
+        busy: bool,
     }
 
     /// `f` on the panel up, if there is one and nothing is using it already.
@@ -2925,6 +3661,8 @@ pub(crate) mod live {
         down: Cell<Option<CGPoint>>,
         /// This press's drag has begun.
         began: Cell<bool>,
+        /// The pointer is over the tile (`mouseEntered:` while live).
+        hover: Cell<bool>,
         events: PanelEvents,
     }
 
@@ -2937,14 +3675,56 @@ pub(crate) mod live {
             type Ivars = TileIvars;
             protocols: [NSObject, NSDraggingSource];
 
-            /// The icon, filling the tile.
+            /// The icon, filling the tile, over an accent wash and ring while the
+            /// pointer is on a tile that can still be dragged.
             @sel(drawRect:)
             fn drawRect(&self, _dirty: CGRect) {
-                // SAFETY: inside AppKit's draw cycle; the icon is the live NSImage
-                // the ivars own; `-drawInRect:` is `-(void)(NSRect)`.
+                let ivars = self.ivars();
+                // SAFETY: inside AppKit's draw cycle on the main thread; the icon is
+                // the live NSImage the ivars own; `-drawInRect:` is
+                // `-(void)(NSRect)`; the colour and path factories are +0 and
+                // non-raising, and `-set`, `-fill`, `-stroke` `-(void)`,
+                // `-setLineWidth:` `-(void)(CGFloat)`.
                 unsafe {
                     let bounds = appkit::send_rect(self.as_id(), sel!(bounds));
-                    appkit::send_v_rect(self.ivars().icon.id(), sel!(drawInRect:), bounds);
+                    if ivars.hover.get() && ivars.live.get() {
+                        let accent = appkit::send_id(
+                            class(c"NSColor").as_id(),
+                            sel!(controlAccentColor),
+                        );
+                        if !accent.is_null() {
+                            let ring = CGRect {
+                                origin: CGPoint {
+                                    x: bounds.origin.x + 1.0,
+                                    y: bounds.origin.y + 1.0,
+                                },
+                                size: CGSize {
+                                    width: bounds.size.width - 2.0,
+                                    height: bounds.size.height - 2.0,
+                                },
+                            };
+                            let path = appkit::send_id_rect_f64_f64(
+                                class(c"NSBezierPath").as_id(),
+                                sel!(bezierPathWithRoundedRect:xRadius:yRadius:),
+                                ring,
+                                HOVER_RADIUS,
+                                HOVER_RADIUS,
+                            );
+                            let wash = appkit::send_id_f64(
+                                accent,
+                                sel!(colorWithAlphaComponent:),
+                                HOVER_WASH_ALPHA,
+                            );
+                            if !path.is_null() && !wash.is_null() {
+                                appkit::send_v(wash, sel!(set));
+                                appkit::send_v(path, sel!(fill));
+                                appkit::send_v(accent, sel!(set));
+                                appkit::send_v_f64(path, sel!(setLineWidth:), 2.0);
+                                appkit::send_v(path, sel!(stroke));
+                            }
+                        }
+                    }
+                    appkit::send_v_rect(ivars.icon.id(), sel!(drawInRect:), bounds);
                 }
             }
 
@@ -3007,22 +3787,20 @@ pub(crate) mod live {
                 self.ivars().began.set(false);
             }
 
-            /// The pointer came over the tile: an open hand while it can still be
-            /// dragged. From the tracking area `build` installs, active always:
-            /// cursor rects work only in the key window, which this panel, beside
-            /// the active System Settings, never is. Best effort: the cursor is
-            /// the active app's to set again.
+            /// The pointer came over the tile: it lights up while it can still be
+            /// dragged. From the tracking area `build` installs, active always. Not
+            /// the cursor: the panel is up only while System Settings is the active
+            /// app, and macOS ignores a cursor an inactive app sets (measured on
+            /// 27.0 in a VM: the arrow stayed over the tile).
             @sel(mouseEntered:)
             fn mouseEntered(&self, _event: Id) {
-                if self.ivars().live.get() {
-                    set_cursor(true);
-                }
+                self.set_hover(self.ivars().live.get());
             }
 
-            /// The pointer left the tile: the arrow again.
+            /// The pointer left the tile.
             @sel(mouseExited:)
             fn mouseExited(&self, _event: Id) {
-                set_cursor(false);
+                self.set_hover(false);
             }
 
             /// Copy, and nothing else, in every context: a Move or a Generic
@@ -3066,13 +3844,11 @@ pub(crate) mod live {
                 let ivars = self.ivars();
                 ivars.down.set(None);
                 ivars.began.set(false);
+                // Tracking areas see no exit while a drag runs: lit again only when
+                // the pointer next comes over it.
+                self.set_hover(false);
                 if taken {
-                    ivars.live.set(false);
-                    // SAFETY: main thread; `-setAlphaValue:` is `-(void)(CGFloat)` on
-                    // the live tile.
-                    unsafe {
-                        appkit::send_v_f64(self.as_id(), sel!(setAlphaValue:), SPENT_ALPHA);
-                    }
+                    self.set_live(false);
                 }
                 aterm_log::info!(
                     "devtools: the owner's drag of aterm ended (operation {operation}: {})",
@@ -3155,6 +3931,8 @@ pub(crate) mod live {
                 beside: false,
                 dragging: false,
                 pending: None,
+                yielded: false,
+                busy: false,
             };
             let refused = LIVE.with(|slot| match slot.try_borrow_mut() {
                 Ok(mut slot) => {
@@ -3192,33 +3970,68 @@ pub(crate) mod live {
         });
     }
 
-    /// The lane's turn: beside System Settings again (it may have moved),
-    /// unless a drag runs or the owner moved the panel ([`place_turn`]). System
-    /// Settings still the active app with the window the panel stood beside off
-    /// the screen (minimized: no activation fires) orders the panel out rather
-    /// than sending it to a screen corner over other apps' work, and the turn
-    /// that finds the window back brings it back beside it. A panel out because
-    /// another app is in front is left to the activation observer.
+    /// The lane's turn: out of the way of System Settings' own password window
+    /// ([`cover_turn`]), moved or not — it keeps System Settings the active app,
+    /// so the activation observer never sees it — and back when it goes; then
+    /// beside System Settings again (it may have moved), unless a drag runs or the
+    /// owner moved the panel ([`place_turn`]). System Settings still the active
+    /// app with the window the panel stood beside off the screen (minimized: no
+    /// activation fires) orders the panel out rather than sending it to a screen
+    /// corner over other apps' work, and the turn that finds the window back
+    /// brings it back beside it. A panel out because another app is in front is
+    /// left to the activation observer.
     pub(crate) fn place_beside_settings() {
         if MainThread::new().is_none() {
             return;
         }
         aterm_objc::autoreleasepool(|_| {
             let _ = with_live(|live| {
-                if live.dragging || live.moved {
+                if live.dragging {
                     return;
                 }
-                if !live.visible && !(live.settings_front && live.beside) {
+                if !live.visible && !live.yielded && !(live.settings_front && live.beside) {
+                    return;
+                }
+                // SAFETY: main thread; the window and screen reads are read-only.
+                let screens = unsafe { screens() };
+                // SAFETY: as above.
+                let windows = unsafe { settings_windows(&screens) };
+                // SAFETY: main thread; reads the live panel's frame and level.
+                let (frame, level) = unsafe { frame_and_level(live) };
+                live.busy = settings_busy(&windows, level);
+                let window = settings_main(&windows).map(|i| windows[i].bounds);
+                let under = under_panel(&windows, frame, level);
+                match cover_turn(live.visible, live.yielded, live.settings_front, under) {
+                    Cover::Out => {
+                        hide(live);
+                        live.yielded = true;
+                        aterm_log::info!(
+                            "devtools: System Settings' password window is under the helper \
+                             panel; it steps aside"
+                        );
+                        return;
+                    }
+                    Cover::Back => {
+                        live.reveal_since = None;
+                        // SAFETY: main thread; the target is the live one `Live`
+                        // holds. `place_now` leaves a panel the owner moved alone.
+                        unsafe {
+                            cancel_reveal_soon(live.target.as_id());
+                            place_now(live, &screens, window);
+                        }
+                        order_in(live);
+                        return;
+                    }
+                    Cover::Nothing if live.yielded => return,
+                    Cover::Nothing => {}
+                }
+                if live.moved {
                     return;
                 }
                 note_owner_move(live);
                 if live.moved {
                     return;
                 }
-                // SAFETY: main thread; the window and screen reads are read-only.
-                let screens = unsafe { screens() };
-                // SAFETY: as above.
-                let window = unsafe { settings_window(&screens) };
                 match place_turn(live.visible, live.settings_front, live.beside, window) {
                     PlaceTurn::Nothing => {}
                     PlaceTurn::Hide => hide(live),
@@ -3291,6 +4104,17 @@ pub(crate) mod live {
         .unwrap_or(false)
     }
 
+    /// Whether System Settings showed its own password window over its list at the
+    /// last placement: the word the turn kept on the panel, no window read here.
+    pub(crate) fn settings_busy_now() -> bool {
+        LIVE.with(|slot| {
+            slot.try_borrow()
+                .ok()
+                .and_then(|slot| slot.as_ref().map(|live| live.busy))
+        })
+        .unwrap_or(false)
+    }
+
     // ---- visibility and placement ----
 
     /// Bring the panel in, beside System Settings' window — waiting up to
@@ -3305,7 +4129,8 @@ pub(crate) mod live {
         // SAFETY: main thread; read-only window and screen queries.
         let screens = unsafe { screens() };
         // SAFETY: as above.
-        let settings = unsafe { settings_window(&screens) };
+        let windows = unsafe { settings_windows(&screens) };
+        let settings = settings_main(&windows).map(|i| windows[i].bounds);
         if settings.is_none() && live.beside {
             // The window it stood beside is off the screen (minimized) while System
             // Settings came forward: no corner — the lane's turn brings the panel
@@ -3322,7 +4147,33 @@ pub(crate) mod live {
         live.reveal_since = None;
         // SAFETY: as above.
         unsafe { place_now(live, &screens, settings) };
+        // SAFETY: main thread; reads the live panel's frame and level.
+        let (frame, level) = unsafe { frame_and_level(live) };
+        live.busy = settings_busy(&windows, level);
+        if under_panel(&windows, frame, level) {
+            // System Settings came forward with its password window still under
+            // where the panel stands: it stays out until the lane's turn finds
+            // that window gone.
+            live.yielded = true;
+            return;
+        }
         order_in(live);
+    }
+
+    /// The panel's frame in Cocoa screen space and its window level.
+    ///
+    /// # Safety
+    /// Main thread.
+    unsafe fn frame_and_level(live: &Live) -> (Rect, isize) {
+        let panel = live.panel.id();
+        // SAFETY: main thread; `-frame` is `-(NSRect)` and `-level` `-(NSInteger)`
+        // on the live panel.
+        unsafe {
+            (
+                from_cg(appkit::send_rect(panel, sel!(frame))),
+                appkit::send_isize(panel, sel!(level)),
+            )
+        }
     }
 
     /// Put the panel in front, and remember the frame it took there: an
@@ -3332,6 +4183,9 @@ pub(crate) mod live {
         note_owner_move(live);
         let panel = live.panel.id();
         live.visible = crate::menu::order_front_regardless(panel, WHAT);
+        if live.visible {
+            live.yielded = false;
+        }
         if live.visible && live.placed.is_some() && !live.moved {
             // SAFETY: main thread (`Live` lives on it); read-only screen queries.
             unsafe { note_placed(live, &screens()) };
@@ -3389,8 +4243,9 @@ pub(crate) mod live {
         }
     }
 
-    /// Order the panel out (another app is in front), and drop a reveal still
-    /// waiting for System Settings' window.
+    /// Order the panel out (another app is in front, or System Settings' password
+    /// window is under it), and drop a reveal still waiting for System Settings'
+    /// window.
     fn hide(live: &mut Live) {
         live.reveal_since = None;
         // SAFETY: main thread; the target is the live one `Live` holds.
@@ -3401,6 +4256,12 @@ pub(crate) mod live {
         note_owner_move(live);
         // SAFETY: main thread; `-orderOut:` is `-(void)(id)`, nil the sender.
         unsafe { appkit::send_v_id(live.panel.id(), sel!(orderOut:), Id::NIL) };
+        // AppKit sends a tracking area no exit when its window leaves the screen
+        // under a still pointer: the tile would come back lit with the pointer
+        // elsewhere.
+        if let Some(tile) = &live.tile {
+            tile.set_hover(false);
+        }
         live.visible = false;
     }
 
@@ -3510,18 +4371,34 @@ pub(crate) mod live {
         }
     }
 
-    /// System Settings' window in Cocoa screen space: the largest on-screen
-    /// layer-0 window of its process with any opacity. Reads each entry's owner
-    /// pid, layer, alpha and bounds, nothing else; keeps and logs none of it.
+    /// System Settings' main window in Cocoa screen space ([`settings_main`]).
     ///
     /// # Safety
     /// Main thread.
     unsafe fn settings_window(screens: &Screens) -> Option<Rect> {
+        // SAFETY: the caller's main thread; read-only queries.
+        let windows = unsafe { settings_windows(screens) };
+        settings_main(&windows).map(|i| windows[i].bounds)
+    }
+
+    /// System Settings' on-screen windows in Cocoa screen space
+    /// ([`SettingsWindow`]): each entry's owner pid, layer, alpha and bounds,
+    /// nothing else — a missing layer counts as 0 and a missing alpha as opaque;
+    /// keeps and logs none of it.
+    ///
+    /// # Safety
+    /// Main thread.
+    unsafe fn settings_windows(screens: &Screens) -> Vec<SettingsWindow> {
         // SAFETY: read-only, as `settings_pid` says.
-        let pid = unsafe { settings_pid() }?;
+        let Some(pid) = (unsafe { settings_pid() }) else {
+            return Vec::new();
+        };
         let [pid_key, layer_key, alpha_key, bounds_key] = WINDOW_KEYS.map(appkit::nsstring);
-        let (pid_key, layer_key, alpha_key, bounds_key) =
-            (pid_key?, layer_key?, alpha_key?, bounds_key?);
+        let (Some(pid_key), Some(layer_key), Some(alpha_key), Some(bounds_key)) =
+            (pid_key, layer_key, alpha_key, bounds_key)
+        else {
+            return Vec::new();
+        };
         // SAFETY: `CGWindowListCopyWindowInfo` returns a +1 CFArray (the Copy
         // rule), adopted here and released once; toll-free bridging makes it an
         // NSArray of NSDictionaries, read with `-count`, `-objectAtIndex:` and
@@ -3529,11 +4406,13 @@ pub(crate) mod live {
         // `-doubleValue`, and the bounds dictionary turned back into a CGRect by
         // its own CoreGraphics reader into a local.
         unsafe {
-            let list = Obj::from_owned(CGWindowListCopyWindowInfo(
+            let Some(list) = Obj::from_owned(CGWindowListCopyWindowInfo(
                 consts::CG_WINDOW_LIST_ON_SCREEN_NON_DESKTOP,
                 consts::CG_NULL_WINDOW_ID,
-            ))?;
-            let mut best: Option<CGRect> = None;
+            )) else {
+                return Vec::new();
+            };
+            let mut windows = Vec::new();
             for i in 0..appkit::send_usize(list.id(), sel!(count)) {
                 let window = appkit::send_id_usize(list.id(), sel!(objectAtIndex:), i);
                 if window.is_null() {
@@ -3547,29 +4426,24 @@ pub(crate) mod live {
                 if owner != Some(isize::try_from(pid).unwrap_or(-1)) {
                     continue;
                 }
-                if value(&layer_key).map_or(0, |v| appkit::send_isize(v, sel!(integerValue))) != 0 {
-                    continue;
-                }
-                if value(&alpha_key).map_or(1.0, |v| appkit::send_f64(v, sel!(doubleValue))) <= 0.0
-                {
-                    continue;
-                }
+                let layer =
+                    value(&layer_key).map_or(0, |v| appkit::send_isize(v, sel!(integerValue)));
+                let alpha =
+                    value(&alpha_key).map_or(1.0, |v| appkit::send_f64(v, sel!(doubleValue)));
                 let Some(bounds) = value(&bounds_key) else {
                     continue;
                 };
                 let mut frame = CGRect::default();
-                if !CGRectMakeWithDictionaryRepresentation(bounds, &raw mut frame)
-                    || frame.size.width < SETTINGS_MIN.width
-                    || frame.size.height < SETTINGS_MIN.height
-                {
+                if !CGRectMakeWithDictionaryRepresentation(bounds, &raw mut frame) {
                     continue;
                 }
-                let area = |r: CGRect| r.size.width * r.size.height;
-                if best.is_none_or(|b| area(frame) > area(b)) {
-                    best = Some(frame);
-                }
+                windows.push(SettingsWindow {
+                    layer,
+                    alpha,
+                    bounds: cg_to_cocoa(from_cg(frame), screens.primary_h),
+                });
             }
-            best.map(|frame| cg_to_cocoa(from_cg(frame), screens.primary_h))
+            windows
         }
     }
 
@@ -3740,23 +4614,6 @@ pub(crate) mod live {
     }
 
     // ---- the drag ----
-
-    /// The open hand (`true`) or the arrow, set now.
-    fn set_cursor(open_hand: bool) {
-        // SAFETY: main thread (AppKit's mouse-tracking dispatch); `+openHandCursor`
-        // and `+arrowCursor` are `+(NSCursor *)`, +0, and `-set` is `-(void)`.
-        unsafe {
-            let cursors = class(c"NSCursor").as_id();
-            let cursor = if open_hand {
-                appkit::send_id(cursors, sel!(openHandCursor))
-            } else {
-                appkit::send_id(cursors, sel!(arrowCursor))
-            };
-            if !cursor.is_null() {
-                appkit::send_v(cursor, sel!(set));
-            }
-        }
-    }
 
     /// Whether `tile` is the tile on the panel up: a drag belongs to the panel whose
     /// tile is its source, and to no other.
@@ -4410,6 +5267,7 @@ pub(crate) mod live {
                         live: Cell::new(true),
                         down: Cell::new(None),
                         began: Cell::new(false),
+                        hover: Cell::new(false),
                         events,
                     },
                 );
@@ -4424,7 +5282,7 @@ pub(crate) mod live {
                 appkit::send_v_bool(this.as_id(), sel!(setAccessibilityElement:), true);
                 appkit::send_v_id(this.as_id(), sel!(setAccessibilityRole:), role.id());
                 appkit::send_v_id(this.as_id(), sel!(setAccessibilityLabel:), name.id());
-                // The hover that sets the open hand (`mouseEntered:`): entered and
+                // The hover that lights the tile (`mouseEntered:`): entered and
                 // exited, active always, following the visible rect. The view keeps
                 // its tracking areas; `-initWithRect:options:owner:userInfo:`
                 // consumes `+alloc`'s +1, and the owner is held weakly.
@@ -4442,9 +5300,26 @@ pub(crate) mod live {
             }
         }
 
+        /// Whether the pointer lights the tile, redrawn when that changes.
+        fn set_hover(&self, hover: bool) {
+            if self.ivars().hover.replace(hover) != hover {
+                // SAFETY: main thread (AppKit's mouse-tracking dispatch or the
+                // lane); `-setNeedsDisplay:` is `-(void)(BOOL)`.
+                unsafe { appkit::send_v_bool(self.as_id(), sel!(setNeedsDisplay:), true) };
+            }
+        }
+
+        /// Whether the pointer lights the tile now: for the driver's check.
+        pub(crate) fn hovered(&self) -> bool {
+            self.ivars().hover.get()
+        }
+
         /// Whether the tile can still be dragged (dimmed once spent).
         fn set_live(&self, live: bool) {
             self.ivars().live.set(live);
+            if !live {
+                self.set_hover(false);
+            }
             // SAFETY: main thread; `-setAlphaValue:` is `-(void)(CGFloat)`.
             unsafe {
                 appkit::send_v_f64(
@@ -4514,44 +5389,51 @@ pub(crate) mod test_arms {
         DevToolList, DevToolListLabel, DevToolListing, DevToolProbe, DevToolProbeLabel, ProbeGate,
     };
 
-    use super::{DevToolsHelperArm, Lane, Reach, Reading};
+    use super::{DevToolsHelperArm, FdaReach, Lane, Reach, Reading};
 
     /// The bundle id the stand-ins read for.
     pub(crate) const SUBJECT: &str = "com.aterm.test";
-
-    /// The phrases no Developer Tools surface says, on top of the owner's restart
-    /// phrases (`native_settings`' `BANNED_PANEL_PHRASES`): what being listed skips is
-    /// "should" until D14, and nothing claims a check or a prompt gone for good.
-    const RULED_OUT_PHRASES: [&str; 2] = ["never prompt", "can stay off"];
-
-    /// Stems no Developer Tools surface starts a word with ("covers", "eliminates"):
-    /// matched at a word's start only, so "discover" and "recover" pass.
-    const RULED_OUT_STEMS: [&str; 2] = ["cover", "eliminat"];
-
-    /// THE ONE FENCE for every Developer Tools sweep in this crate — the panel's
-    /// states and its own words, the Settings card, its bar: the first ruled-out
-    /// phrase or stem `text` holds, or `None`. atpkg's own test sweeps atpkg's words
-    /// with the same set (a test of one crate cannot read another's).
-    pub(crate) fn ruled_out(text: &str) -> Option<&'static str> {
-        let lower = text.to_lowercase();
-        if let Some(phrase) = crate::native_settings::tests::BANNED_PANEL_PHRASES
-            .iter()
-            .chain(RULED_OUT_PHRASES.iter())
-            .find(|phrase| lower.contains(*phrase))
-        {
-            return Some(phrase);
-        }
-        RULED_OUT_STEMS.iter().copied().find(|stem| {
-            lower
-                .split(|c: char| !c.is_alphabetic())
-                .any(|word| word.starts_with(stem))
-        })
-    }
 
     thread_local! {
         static OPENS: Cell<u32> = const { Cell::new(0) };
         static OPENED_NOTES: Cell<u32> = const { Cell::new(0) };
         static DECLINE_NOTES: Cell<u32> = const { Cell::new(0) };
+        static FDA_OPENS: Cell<u32> = const { Cell::new(0) };
+        static FDA_OPENED_NOTES: Cell<u32> = const { Cell::new(0) };
+        static FDA_DECLINE_NOTES: Cell<u32> = const { Cell::new(0) };
+    }
+
+    /// How often this thread's stand-ins opened, noted opened and noted declined the
+    /// Full Disk Access page.
+    pub(crate) fn fda_counts() -> (u32, u32, u32) {
+        (
+            FDA_OPENS.with(Cell::get),
+            FDA_OPENED_NOTES.with(Cell::get),
+            FDA_DECLINE_NOTES.with(Cell::get),
+        )
+    }
+
+    /// [`fda_opening`], whose page another process opened 30 seconds ago.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn fda_opened_just_now() -> FdaReach {
+        FdaReach {
+            opened_within: |_| Some(30),
+            ..fda_opening()
+        }
+    }
+
+    /// A Full Disk Access reach whose page opens and whose markers are counted, never
+    /// written.
+    pub(crate) fn fda_opening() -> FdaReach {
+        FdaReach {
+            open_pane: || {
+                bump(&FDA_OPENS);
+                true
+            },
+            note_opened: |_| bump(&FDA_OPENED_NOTES),
+            note_declined: |_| bump(&FDA_DECLINE_NOTES),
+            ..FdaReach::inert()
+        }
     }
 
     fn bump(counter: &'static std::thread::LocalKey<Cell<u32>>) {
@@ -4638,6 +5520,7 @@ pub(crate) mod test_arms {
             note_opened: |_| bump(&OPENED_NOTES),
             note_declined: |_| bump(&DECLINE_NOTES),
             grant_stable: || true,
+            refresh_verdict: || Ok(()),
             ..Reach::inert()
         }
     }
@@ -4738,26 +5621,278 @@ mod tests {
     /// The quiet moment both ways: every input alone keeps it from coming.
     #[test]
     fn the_quiet_moment_needs_every_input_and_each_alone_holds_it() {
-        let settled = crate::consent_card::LAUNCH_SETTLE;
-        assert!(quiet(true, false, true, settled, false), "the quiet moment");
+        assert!(quiet(true, false, true, true, false), "the quiet moment");
+        assert!(!quiet(false, false, true, true, false), "aterm not focused");
+        assert!(!quiet(true, true, true, true, false), "typing");
         assert!(
-            !quiet(false, false, true, settled, false),
-            "aterm not focused"
-        );
-        assert!(!quiet(true, true, true, settled, false), "typing");
-        assert!(
-            !quiet(true, false, false, settled, false),
+            !quiet(true, false, false, true, false),
             "nobody there for five minutes"
         );
         assert!(
-            !quiet(true, false, true, settled - Duration::from_secs(1), false),
-            "a launch (an update's successor) not yet settled"
+            !quiet(true, false, true, false, false),
+            "a launch not yet settled"
         );
         assert!(
-            !quiet(true, false, true, settled, true),
+            !quiet(true, false, true, true, true),
             "a hand-off under way"
         );
         assert!(QUIET_FOR < PRESENT_WITHIN);
+    }
+
+    fn fda_facts() -> FdaFacts {
+        FdaFacts {
+            fda: FdaState::Denied,
+            declined: false,
+            grant_stable: true,
+            recent: false,
+            shown_this_version: false,
+        }
+    }
+
+    /// The Full Disk Access page: an owner's press opens it whatever aterm read; the
+    /// window's own acts only on a probe that read `denied`, never while the owner's Not
+    /// now holds, on an unstable build, twice for one version or within ten minutes of a
+    /// page, and waits for a quiet moment.
+    #[test]
+    fn the_full_disk_access_hand_over_is_a_table_of_named_refusals() {
+        let hand = Admit::Hand {
+            list_terminal: false,
+        };
+        for origin in [Origin::Settings, Origin::Digest] {
+            assert_eq!(admit_fda(origin, Moment::Asked, &fda_facts()), hand);
+            let refused_everything = FdaFacts {
+                fda: FdaState::Unknown,
+                declined: true,
+                grant_stable: false,
+                recent: true,
+                shown_this_version: true,
+            };
+            assert_eq!(admit_fda(origin, Moment::Asked, &refused_everything), hand);
+            let granted = FdaFacts {
+                fda: FdaState::Granted,
+                ..fda_facts()
+            };
+            assert_eq!(admit_fda(origin, Moment::Asked, &granted), Admit::PaneOnly);
+        }
+        let auto = Origin::Automatic;
+        assert_eq!(admit_fda(auto, Moment::Asked, &fda_facts()), Admit::Queue);
+        assert_eq!(admit_fda(auto, Moment::Quiet, &fda_facts()), hand);
+        let cases = [
+            (
+                FdaFacts {
+                    fda: FdaState::Granted,
+                    ..fda_facts()
+                },
+                Refusal::Granted,
+            ),
+            (
+                FdaFacts {
+                    fda: FdaState::Unknown,
+                    ..fda_facts()
+                },
+                Refusal::Unknown,
+            ),
+            (
+                FdaFacts {
+                    declined: true,
+                    ..fda_facts()
+                },
+                Refusal::Declined,
+            ),
+            (
+                FdaFacts {
+                    grant_stable: false,
+                    ..fda_facts()
+                },
+                Refusal::Unstable,
+            ),
+            (
+                FdaFacts {
+                    shown_this_version: true,
+                    ..fda_facts()
+                },
+                Refusal::Shown,
+            ),
+            (
+                FdaFacts {
+                    recent: true,
+                    ..fda_facts()
+                },
+                Refusal::Recent,
+            ),
+        ];
+        for (facts, why) in cases {
+            for moment in [Moment::Asked, Moment::Quiet] {
+                assert_eq!(
+                    admit_fda(auto, moment, &facts),
+                    Admit::Refuse(why),
+                    "{facts:?} {moment:?}"
+                );
+            }
+        }
+    }
+
+    fn fda_show(bundle: Option<PathBuf>) -> Show {
+        Show {
+            page: Page::FullDiskAccess,
+            origin: Origin::Automatic,
+            reading: Reading::UNREAD,
+            listed: None,
+            bundle,
+            skips: false,
+        }
+    }
+
+    /// The Full Disk Access panel's words in each state: why (the card's own grant
+    /// sentence), the icon to drag into that list, the + route, the trade and the
+    /// owner's two answers; never a Developer Tools word, never a list read.
+    #[test]
+    fn the_full_disk_access_panels_words_in_each_state() {
+        let now = Instant::now();
+        let bundle = PathBuf::from("/Applications/aterm.app");
+        assert_eq!(
+            FDA_PANEL_WHY,
+            format!("{}.", crate::consent_card::FDA_GRANTS),
+            "the panel's why is the card's one spelling"
+        );
+        let mut panel = Panel::new(fda_show(Some(bundle.clone())), now);
+        assert_eq!(panel.page(), Page::FullDiskAccess);
+        assert!(!panel.readable() && !panel.wants_read(now + PANEL_TICK));
+        let mut seen = Vec::new();
+        let explain = panel.content();
+        assert!(has(&explain, FDA_PANEL_TITLE) && has(&explain, FDA_PANEL_WHY));
+        assert!(has(&explain, FDA_PANEL_HOW) && has(&explain, FDA_PANEL_TRADE));
+        assert_eq!(
+            explain.tile(),
+            Some(&Tile {
+                bundle: bundle.clone(),
+                live: true,
+                step: FDA_PANEL_STEP,
+            })
+        );
+        assert_eq!(explain.tile().map(Tile::hint), Some(FDA_PANEL_STEP));
+        assert_eq!(explain.buttons(), [Button::SwitchedOn, Button::NotNow]);
+        seen.push(explain);
+        let plus = Panel::new(fda_show(None), now).content();
+        assert!(plus.tile().is_none() && has(&plus, FDA_PANEL_HOW_PLUS));
+        seen.push(plus);
+        let _ = panel.on(PanelEvent::DragEnded { accepted: false }, now);
+        let failed = panel.content();
+        assert!(has(&failed, FDA_DROP_FAILED_WORDS));
+        seen.push(failed);
+        let _ = panel.on(PanelEvent::DragEnded { accepted: true }, now);
+        let dropped = panel.content();
+        assert!(panel.dropped() && has(&dropped, FDA_PANEL_DROPPED));
+        assert_eq!(dropped.tile().map(Tile::hint), Some(TILE_SPENT_HINT));
+        seen.push(dropped);
+        let effect = panel.granted(now);
+        assert!(effect.granted && effect.redraw);
+        let done = panel.content();
+        assert!(has(&done, FDA_PANEL_DONE) && done.buttons().is_empty());
+        seen.push(done);
+        for content in &seen {
+            for (text, _) in content.texts() {
+                assert!(!text.contains("Developer Tools"), "{text}");
+            }
+            assert!(!content.buttons().contains(&Button::ShowList));
+        }
+    }
+
+    /// One System Settings window shows one page: a waiting Full Disk Access hand-over
+    /// goes first, and a Developer Tools one waits behind it and its panel without
+    /// arming a timer that has passed; the Full Disk Access panel's Not now notes that
+    /// page's decline only, and its end is the launch warm-up's to read.
+    #[test]
+    fn a_full_disk_access_hand_over_goes_first_and_declines_only_its_own_page() {
+        let now = Instant::now();
+        let mut lane = Lane::windowed_with_fda_for_test(
+            test_arms::opening(),
+            test_arms::fda_opening(),
+            test_arms::showing(),
+        );
+        lane.queue(Origin::Automatic, now);
+        lane.queue_fda(Origin::Automatic, now + Duration::from_secs(1));
+        assert_eq!(lane.fda_queued(), Some(Origin::Automatic));
+        let later = now + Duration::from_secs(30);
+        assert!(
+            !lane.hand_over_due(later),
+            "Developer Tools waits behind it"
+        );
+        assert!(lane.fda_hand_over_due(later));
+        assert_eq!(
+            lane.next_deadline(later, || true),
+            Some(now + Duration::from_secs(1)),
+            "only the Full Disk Access look is armed"
+        );
+        assert_eq!(lane.take_queued(later, true), None);
+        assert_eq!(lane.take_queued_fda(later, false), None, "not quiet");
+        assert_eq!(lane.take_queued_fda(later, true), Some(Origin::Automatic));
+        let wake: Wake = Arc::new(|| {});
+        assert!(lane.show(fda_show(None), later, Arc::clone(&wake)));
+        assert!(!lane.hand_over_due(later + RECHECK_EVERY * 10));
+        let (_, _, declines_before) = test_arms::fda_counts();
+        let devtools_declines = test_arms::decline_notes();
+        lane.press_for_test(PanelEvent::NotNow);
+        let asks = lane.tick_panel(later, None, &wake);
+        assert_eq!(asks.page, Page::FullDiskAccess);
+        assert!(lane.panel().is_none());
+        assert_eq!(test_arms::fda_counts().2, declines_before + 1);
+        assert_eq!(test_arms::decline_notes(), devtools_declines);
+        assert_eq!(
+            lane.take_fda_ended(),
+            Some(FdaEnded {
+                why: Closed::NotNow,
+                dropped: false
+            })
+        );
+        assert_eq!(lane.take_fda_ended(), None);
+        assert!(
+            lane.hand_over_due(later + RECHECK_EVERY),
+            "Developer Tools' turn at its next look"
+        );
+    }
+
+    /// A probe that reads the grant ends a waiting Full Disk Access hand-over and turns
+    /// its panel to the done words; any other reading changes nothing, and a Developer
+    /// Tools reading never touches a Full Disk Access panel.
+    #[test]
+    fn a_grant_ends_the_full_disk_access_wait_and_panel() {
+        let now = Instant::now();
+        let mut lane = Lane::windowed_with_fda_for_test(
+            test_arms::opening(),
+            test_arms::fda_opening(),
+            test_arms::showing(),
+        );
+        lane.queue_fda(Origin::Automatic, now);
+        lane.note_fda(FdaState::Denied, now);
+        lane.note_fda(FdaState::Unknown, now);
+        assert!(lane.fda_waiting());
+        lane.note_fda(FdaState::Granted, now);
+        assert!(!lane.fda_waiting());
+        assert!(lane.show(fda_show(None), now, Arc::new(|| {})));
+        lane.note_reading(
+            test_arms::reading(DevToolGrant::Granted, test_arms::on()),
+            now,
+        );
+        assert_eq!(lane.panel().map(Panel::phase), Some(Phase::Explain));
+        lane.note_fda(FdaState::Granted, now);
+        assert_eq!(lane.panel().map(Panel::phase), Some(Phase::Done));
+    }
+
+    /// A successor an update brought in settles after `consent_card::LAUNCH_SETTLE`;
+    /// a process the owner started, after [`COLD_START_SETTLE`].
+    #[test]
+    fn a_cold_start_settles_in_seconds_and_a_successor_waits_out_the_launch_settle() {
+        let lane = Lane::windowed_for_test(Reach::inert(), DevToolsHelperArm::inert());
+        let born = lane.born;
+        assert!(!lane.settled(born + COLD_START_SETTLE));
+        assert!(lane.settled(born + crate::consent_card::LAUNCH_SETTLE));
+        let mut cold = Lane::windowed_for_test(Reach::inert(), DevToolsHelperArm::inert());
+        cold.note_cold_start();
+        let born = cold.born;
+        assert!(!cold.settled(born));
+        assert!(cold.settled(born + COLD_START_SETTLE));
+        assert!(COLD_START_SETTLE < QUIET_FOR);
     }
 
     /// THE ORIGIN × GRANT × DECLINE TABLE. An owner's press opens the page whatever was
@@ -4936,6 +6071,7 @@ mod tests {
 
     fn show(list: DevToolList, bundle: Option<PathBuf>) -> Show {
         Show {
+            page: Page::DeveloperTools,
             origin: Origin::Digest,
             reading: test_arms::reading(DevToolGrant::NotGranted, list),
             listed: None,
@@ -4971,7 +6107,8 @@ mod tests {
             explain.tile(),
             Some(&Tile {
                 bundle: bundle.clone(),
-                live: true
+                live: true,
+                step: atpkg::devtools::HELPER_STEP,
             })
         );
         assert_eq!(
@@ -5059,7 +6196,7 @@ mod tests {
         // An accepted drop: the tile is spent; a whole read 15 s on that still
         // lacks aterm says it may have landed elsewhere — a read sooner does not,
         // and neither does time alone (no read while System Settings is not in
-        // front: the owner may be at macOS's password prompt).
+        // front or shows its own password window over its list).
         let _ = panel.on(PanelEvent::DragEnded { accepted: true }, t0);
         assert_eq!(panel.phase(), Phase::Explain);
         assert!(panel.content().tile().is_some_and(|t| !t.live), "one drop");
@@ -5114,100 +6251,6 @@ mod tests {
             [(HELPER_TITLE, Tone::Title), (done(false), Tone::Done)]
         );
         assert!(done_words.buttons().is_empty());
-    }
-
-    /// EVERY WORD THE PANEL CAN SAY passes the one fence (`test_arms::ruled_out`: the
-    /// owner's restart phrases and the design's own bans): every state and variant's
-    /// content — each list it can be shown on, with and without a tile, after no
-    /// `spctl` run, an Ok one and a failed one, D14 either way, then a drop that did
-    /// not take, one taken, one taken outside System Settings, each read on, and done —
-    /// and the panel's own words directly: its button labels, the unread line for every
-    /// reason, the drop and failure notices, the + route after a drop, the checked
-    /// counts and the status link. NEGATIVE CONTROL: the fence catches a restart word,
-    /// a phrase and a stem at a word's start, and lets "discover" through.
-    #[test]
-    fn every_word_the_panel_can_say_passes_the_fence() {
-        use test_arms::ruled_out;
-        let t0 = Instant::now();
-        let off = test_arms::list(DevToolListing::Off, DevToolListLabel::Read, Some(2));
-        let labels = [
-            DevToolListLabel::Pending,
-            DevToolListLabel::Read,
-            DevToolListLabel::NoFullDiskAccess,
-            DevToolListLabel::OpenFailed,
-            DevToolListLabel::ToolFailed,
-            DevToolListLabel::FormatUnrecognized,
-            DevToolListLabel::TimedOut,
-            DevToolListLabel::SpawnFailed,
-            DevToolListLabel::OutputUnreadable,
-            DevToolListLabel::RefusedDisabled,
-            DevToolListLabel::RefusedObserverOff,
-            DevToolListLabel::RefusedOutOfBundle,
-            DevToolListLabel::RefusedNoExe,
-            DevToolListLabel::RefusedNoSubject,
-            DevToolListLabel::UnsupportedPlatform,
-        ];
-        let mut lists = vec![absent(2), absent(0), off, on()];
-        lists.extend(labels.iter().map(|label| DevToolList::refused(*label)));
-        let mut said: Vec<String> = Vec::new();
-        let mut take = |content: Content| {
-            said.extend(content.texts().map(|(text, _)| text.to_string()));
-        };
-        for skips in [false, true] {
-            for list in &lists {
-                for bundle in [Some(PathBuf::from("/Applications/aterm.app")), None] {
-                    for listed in [None, Some(Ok(())), Some(Err("spctl exited 1".to_string()))] {
-                        let mut shown = show(*list, bundle.clone());
-                        shown.skips = skips;
-                        shown.listed = listed;
-                        let panel = Panel::new(shown, t0);
-                        take(panel.content());
-                        for event in [
-                            PanelEvent::DragEnded { accepted: false },
-                            PanelEvent::DragEnded { accepted: true },
-                            PanelEvent::DroppedOutside,
-                        ] {
-                            let mut moved = panel.clone();
-                            let _ = moved.on(event, t0);
-                            take(moved.content());
-                            let _ = moved.on_read(absent(2), t0 + DROP_CONFIRM_WITHIN);
-                            take(moved.content());
-                        }
-                        let mut done = panel.clone();
-                        let _ = done.granted(t0);
-                        take(done.content());
-                    }
-                }
-            }
-        }
-        said.extend(Button::ALL.iter().map(|button| button.label().to_string()));
-        said.extend(labels.iter().map(|label| unread_words(*label).into_owned()));
-        said.extend(
-            [
-                DROP_FAILED_WORDS,
-                DROP_UNCONFIRMED_WORDS,
-                DROP_OUTSIDE_WORDS,
-                TILE_SPENT_HINT,
-                TILE_CAPTION,
-                STATUS_LINK,
-            ]
-            .map(str::to_string),
-        );
-        said.push(dropped_how());
-        said.push(show_list_failed_words("spctl exited 1"));
-        said.extend([Some(1), Some(3)].into_iter().filter_map(checked_words));
-        for text in &said {
-            assert_eq!(ruled_out(text), None, "{text:?}");
-        }
-        // NEGATIVE CONTROL: the fence itself.
-        assert_eq!(ruled_out("Quit and Reopen aterm"), Some("reopen"));
-        assert_eq!(ruled_out("Switch it off whenever you like."), None);
-        assert_eq!(ruled_out("The switch can stay off."), Some("can stay off"));
-        assert_eq!(ruled_out("This covers every tool."), Some("cover"));
-        assert_eq!(
-            ruled_out("aterm can't discover which copy; it recovers."),
-            None
-        );
     }
 
     /// A HAND-OVER WHOSE `spctl` RUN FAILED (a list read whole and empty, so macOS may
@@ -5432,6 +6475,7 @@ mod tests {
         let bundle = Some(PathBuf::from("/Applications/aterm.app"));
         let mut panel = Panel::new(
             Show {
+                page: Page::DeveloperTools,
                 origin: Origin::Digest,
                 reading,
                 listed: None,
@@ -5456,6 +6500,7 @@ mod tests {
         // toggled row to it too.
         let mut held = Panel::new(
             Show {
+                page: Page::DeveloperTools,
                 origin: Origin::Digest,
                 reading,
                 listed: None,
@@ -5483,6 +6528,7 @@ mod tests {
         // NEGATIVE CONTROL: opened on aterm absent; the owner adds it.
         let mut adding = Panel::new(
             Show {
+                page: Page::DeveloperTools,
                 origin: Origin::Digest,
                 reading: joined(absent(2)),
                 listed: None,
@@ -5516,6 +6562,7 @@ mod tests {
         lane.queue(Origin::Automatic, t0);
         assert!(lane.show(
             Show {
+                page: Page::DeveloperTools,
                 origin: Origin::Digest,
                 reading,
                 listed: None,
@@ -5577,6 +6624,7 @@ mod tests {
             let t0 = Instant::now();
             assert!(lane.show(
                 Show {
+                    page: Page::DeveloperTools,
                     origin: Origin::Settings,
                     reading: Reading::UNREAD,
                     listed: None,
@@ -5861,6 +6909,189 @@ mod tests {
             place_turn(false, false, true, Some(window)),
             PlaceTurn::Nothing
         );
+    }
+
+    /// SYSTEM SETTINGS' OWN PASSWORD WINDOW (measured on 27.0: its process, layer 0,
+    /// 260 × 349 pt, centred on its window, System Settings still the active app)
+    /// under the panel orders the panel out until it goes, moved or not; beside the
+    /// window, or with only the main window up, nothing happens. The + button's file
+    /// chooser floats above the panel (layer 8), and a companion on the main window's
+    /// own frame is no dialog. Wherever the panel stands, the list read waits while the
+    /// password window is up.
+    #[test]
+    fn system_settings_password_window_under_the_panel_orders_it_out_until_it_goes() {
+        let main = Rect {
+            x: 200.0,
+            y: 300.0,
+            w: 740.0,
+            h: 625.0,
+        };
+        let dialog = Rect {
+            x: main.x + 240.0,
+            y: main.y + 138.0,
+            w: 260.0,
+            h: 349.0,
+        };
+        let window = |layer, alpha, bounds| SettingsWindow {
+            layer,
+            alpha,
+            bounds,
+        };
+        let both = [window(0, 1.0, main), window(0, 1.0, dialog)];
+        let level = 3;
+        assert_eq!(settings_main(&both), Some(0));
+        assert_eq!(
+            settings_main(&[both[1], both[0]]),
+            Some(1),
+            "the 740 × 625 window, wherever it is listed"
+        );
+        assert_eq!(
+            settings_main(&both[1..]),
+            None,
+            "the password window alone is no main window"
+        );
+        let over = Rect {
+            x: main.x + 300.0,
+            y: main.y + 50.0,
+            w: PANEL_W,
+            h: 540.0,
+        };
+        assert!(under_panel(&both, over, level), "moved over the window");
+        let screen = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 1728.0,
+            h: 1117.0,
+        };
+        let beside = place(PANEL_W, 540.0, Some(main), &[screen]);
+        assert!(!under_panel(&both, beside, level), "where `place` puts it");
+        // NEGATIVE CONTROLS.
+        assert!(
+            !under_panel(&both[..1], over, level),
+            "the main window alone is no dialog: a panel moved over the list stays"
+        );
+        assert!(
+            !under_panel(&[both[0], window(0, 0.0, dialog)], over, level),
+            "transparent"
+        );
+        assert!(
+            !under_panel(&[both[0], window(8, 1.0, dialog)], over, level),
+            "the + button's file chooser floats above the panel"
+        );
+        assert!(
+            under_panel(&[both[0], window(3, 1.0, dialog)], over, level),
+            "at the panel's own level: out"
+        );
+        assert!(
+            !under_panel(&[both[0], window(0, 1.0, main)], over, level),
+            "a companion on the main window's own frame is no dialog"
+        );
+        assert!(settings_busy(&both, level), "wherever the panel stands");
+        assert!(!settings_busy(&both[..1], level));
+        assert!(
+            !settings_busy(&both[1..], level),
+            "no main window to be busy over"
+        );
+        assert!(!settings_busy(&[both[0], window(8, 1.0, dialog)], level));
+        assert_eq!(cover_turn(true, false, true, true), Cover::Out);
+        assert_eq!(cover_turn(true, false, true, false), Cover::Nothing);
+        assert_eq!(
+            cover_turn(false, true, true, true),
+            Cover::Nothing,
+            "still under: it stays out"
+        );
+        assert_eq!(
+            cover_turn(false, true, true, false),
+            Cover::Back,
+            "gone: back"
+        );
+        assert_eq!(
+            cover_turn(false, true, false, false),
+            Cover::Nothing,
+            "another app in front: the activation observer's"
+        );
+        assert_eq!(
+            cover_turn(false, false, true, false),
+            Cover::Nothing,
+            "out for another reason: not this turn's to bring back"
+        );
+    }
+
+    /// While System Settings shows its password window over its list the panel reads
+    /// nothing, so a drop is judged after the password, never [`DROP_CONFIRM_WITHIN`]
+    /// into typing it. NEGATIVE CONTROL: the same lane reads once the window goes.
+    #[test]
+    fn the_list_read_waits_while_system_settings_shows_its_password_window() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        static BUSY: AtomicBool = AtomicBool::new(true);
+        static READS: AtomicU32 = AtomicU32::new(0);
+        let reach = Reach {
+            read_list: |_, _| {
+                READS.fetch_add(1, Ordering::SeqCst);
+                test_arms::absent(2)
+            },
+            ..test_reach()
+        };
+        let arm = DevToolsHelperArm {
+            settings_busy: || BUSY.load(Ordering::SeqCst),
+            ..test_arm()
+        };
+        let mut lane = Lane::windowed_for_test(reach, arm);
+        let wake = nudge();
+        let t0 = Instant::now();
+        assert!(lane.show(show(test_arms::absent(2), None), t0, Arc::clone(&wake)));
+        let gate = Some(ProbeGate::on());
+        let _ = lane.tick_panel(t0, gate, &wake);
+        events_of(&lane).post(PanelEvent::DragEnded { accepted: true });
+        let mut at = t0;
+        for _ in 0..12 {
+            at += PANEL_TICK;
+            let _ = lane.tick_panel(at, gate, &wake);
+        }
+        assert_eq!(
+            READS.load(Ordering::SeqCst),
+            0,
+            "a drop and twelve ticks while the password window is up: no read"
+        );
+        BUSY.store(false, Ordering::SeqCst);
+        let _ = lane.tick_panel(at + PANEL_TICK, gate, &wake);
+        until(|| READS.load(Ordering::SeqCst) == 1);
+    }
+
+    /// THE VERDICT REFRESH (`atpkg::devtools::refresh_verdict`) runs on a worker, one at
+    /// a time, and again for a later switch-on. NEGATIVE CONTROL: a headless instance
+    /// starts nothing.
+    #[test]
+    fn the_verdict_refresh_runs_on_a_window_one_at_a_time_and_never_headless() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        static RUNS: AtomicU32 = AtomicU32::new(0);
+        static HELD: AtomicBool = AtomicBool::new(true);
+        let mut headless = Lane::new(true);
+        assert!(!headless.refresh_verdict(), "headless: nothing runs");
+        assert_eq!(headless.refreshes_started(), 0);
+        let reach = Reach {
+            refresh_verdict: || {
+                RUNS.fetch_add(1, Ordering::SeqCst);
+                // Out until the test lets it go (the one-minute hang detector).
+                until(|| !HELD.load(Ordering::SeqCst));
+                Ok(())
+            },
+            ..test_reach()
+        };
+        let mut lane = Lane::windowed_for_test(reach, test_arm());
+        // Back while the stand-in is held: the work left the calling thread.
+        assert!(lane.refresh_verdict());
+        until(|| RUNS.load(Ordering::SeqCst) == 1);
+        assert!(
+            !lane.refresh_verdict(),
+            "one at a time: a second waits for the first"
+        );
+        assert_eq!(lane.refreshes_started(), 1);
+        HELD.store(false, Ordering::SeqCst);
+        until(|| !lane.refreshing.load(Ordering::SeqCst));
+        assert!(lane.refresh_verdict(), "the next switch-on runs again");
+        until(|| RUNS.load(Ordering::SeqCst) == 2);
+        assert_eq!(lane.refreshes_started(), 2);
     }
 
     /// A DROP SOMETHING TOOK OUTSIDE SYSTEM SETTINGS' WINDOW (a Finder window, the

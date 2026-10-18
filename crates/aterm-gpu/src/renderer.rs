@@ -52,13 +52,15 @@ use aterm_render::{
 use crate::GpuContext;
 // Every pipeline's entry points, target role, blend, write mask, vertex layout and
 // topology come from the pipeline table, which the Metal backend also reads.
-use crate::pipeline_table::{self, Pipeline, ShaderLibrary};
+#[cfg(any(wgpu_arm, target_os = "macos"))]
+use crate::pipeline_table::ShaderLibrary;
 #[cfg(wgpu_arm)]
-use crate::pipeline_table::{PipelineSpec, TargetFormats};
+use crate::pipeline_table::TargetFormats;
+use crate::pipeline_table::{self, Pipeline};
 
 /// The WGSL source for one [`ShaderLibrary`]; twin of
 /// `crate::metal::shaders::source`. A row's `library` must name the module that
-/// exports its entry points, or [`build_table_pipeline`] fails.
+/// exports its entry points, or [`pipeline_table::build_wgpu`] fails.
 #[cfg(wgpu_arm)]
 const fn wgsl_source(library: ShaderLibrary) -> &'static str {
     match library {
@@ -285,10 +287,33 @@ const _: () = {
     assert!(std::mem::size_of::<GlyphInstance>() as u64 == pipeline_table::GLYPH_LAYOUT.stride);
 };
 
-/// One neutral glyph fixture instance for the corrected-coverage differential:
-/// `(rect, uv, colour, bg)` in [`GlyphInstance`] field order.
-#[cfg(all(target_os = "macos", test))]
-pub(crate) type GlyphFixtureInstance = ([f32; 4], [f32; 4], [u8; 4], [u8; 4]);
+/// What a CPU raster edit answers [`GpuRenderer::raster_changed`]: whether the
+/// wrapped CPU face dropped its rasters, so the GPU atlas must go too.
+trait RasterEdit {
+    fn dropped_rasters(&self) -> bool;
+}
+
+/// A setter that reports a real change: `true` when it re-rasterized.
+impl RasterEdit for bool {
+    fn dropped_rasters(&self) -> bool {
+        *self
+    }
+}
+
+/// A setter that always re-rasterizes.
+impl RasterEdit for () {
+    fn dropped_rasters(&self) -> bool {
+        true
+    }
+}
+
+/// A face install: it re-rasterized when it took (`Ok`); a refused face
+/// leaves the old one, and its rasters, in place.
+impl RasterEdit for Result<(), String> {
+    fn dropped_rasters(&self) -> bool {
+        self.is_ok()
+    }
+}
 
 /// Rain bright-head halo instance: a premultiplied One/One quad plus the
 /// elliptical falloff basis `(cx, cy, rx, ry)` in window pixels. `fs_rain_glow`
@@ -807,7 +832,7 @@ fn vs_glyph(@builtin(vertex_index) vi: u32,
 // `blend_text(.., corrected=true)`:
 //   blend_l = s2l(l2s(fg_l)*cov + l2s(bg_l)*(1-cov))
 //   cov'    = clamp((blend_l - bg_l) / (fg_l - bg_l), 0, 1)
-// gated EXACTLY like the CPU `correction_applies`: interior coverage only
+// gated EXACTLY like the CPU `blend_text`: interior coverage only
 // (endpoints stay byte-exact) and a non-degenerate luminance gap only (the
 // 0.001 literal == aterm_render::TEXT_BLEND_EPS). `in.bg` is the HOME cell's
 // bg; the CPU uses the true dst pixel, which is identical on cell interiors
@@ -2024,9 +2049,9 @@ pub(crate) enum DrawPipe {
 }
 
 impl DrawPipe {
-    /// The table row this pipe draws through: the Metal arm's key into its PSO
-    /// set and `BindSpec` column.
-    #[cfg(target_os = "macos")]
+    /// The table row this pipe draws through: the Metal and GL arms' key into
+    /// their pipeline sets and `BindSpec` column.
+    #[cfg(any(target_os = "macos", gl_arm))]
     pub(crate) const fn row(self) -> Pipeline {
         match self {
             Self::Bg => Pipeline::Bg,
@@ -2063,8 +2088,9 @@ pub(crate) enum DrawAtlas {
     Wallpaper,
 }
 
-/// How many [`DrawAtlas`] slots exist (the Metal rig's atlas array length).
-#[cfg(target_os = "macos")]
+/// How many [`DrawAtlas`] slots exist (the Metal and GL rigs' atlas array
+/// length).
+#[cfg(any(target_os = "macos", gl_arm))]
 pub(crate) const DRAW_ATLAS_COUNT: usize = DrawAtlas::Wallpaper as usize + 1;
 
 /// Every per-frame instance stream, in draw order.
@@ -2394,6 +2420,10 @@ pub(crate) enum FrameRes<'a> {
     /// the full-frame differential harness.
     #[cfg(target_os = "macos")]
     Metal(&'a MetalFrameRig),
+    /// The GL arm's resolution set (Linux). Constructed by the GL
+    /// differential until the flip wires the arm in.
+    #[cfg(gl_arm)]
+    Gl(&'a GlFrameRig<'a>),
 }
 
 impl FrameRes<'_> {
@@ -2409,6 +2439,11 @@ impl FrameRes<'_> {
             } else {
                 &rig.offscreen
             }),
+            #[cfg(gl_arm)]
+            Self::Gl(rig) => crate::device_layer::FrameView::Gl {
+                tex: rig.offscreen,
+                srgb,
+            },
         }
     }
 
@@ -2418,6 +2453,11 @@ impl FrameRes<'_> {
             Self::Wgpu(r) => crate::device_layer::FrameUniforms::Wgpu(r.uniform_bg),
             #[cfg(target_os = "macos")]
             Self::Metal(rig) => rig.uniforms(),
+            #[cfg(gl_arm)]
+            Self::Gl(rig) => crate::device_layer::FrameUniforms::Gl {
+                buf: rig.uniform,
+                binding: rig.uniform_binding,
+            },
         }
     }
 
@@ -2446,14 +2486,16 @@ impl FrameRes<'_> {
             }),
             #[cfg(target_os = "macos")]
             Self::Metal(rig) => rig.pipeline(pipe),
+            #[cfg(gl_arm)]
+            Self::Gl(rig) => rig.pipeline(pipe),
         }
     }
 
     /// Resolve an atlas bind. `pipe` names the row whose `BindSpec` supplies
     /// the Metal slots; the wgpu arm always binds group 1.
     fn atlas(&self, atlas: DrawAtlas, pipe: DrawPipe) -> crate::device_layer::FrameAtlas<'_> {
-        // `pipe` is consumed only by the macOS arm.
-        #[cfg(not(target_os = "macos"))]
+        // `pipe` is consumed only by the explicit-slot arms (Metal, GL).
+        #[cfg(not(any(target_os = "macos", gl_arm)))]
         let _ = pipe;
         match self {
             #[cfg(wgpu_arm)]
@@ -2477,6 +2519,8 @@ impl FrameRes<'_> {
             }
             #[cfg(target_os = "macos")]
             Self::Metal(rig) => rig.atlas(atlas, pipe),
+            #[cfg(gl_arm)]
+            Self::Gl(rig) => rig.atlas(atlas, pipe),
         }
     }
 
@@ -2493,7 +2537,68 @@ impl FrameRes<'_> {
             ),
             #[cfg(target_os = "macos")]
             Self::Metal(rig) => rig.stream(id),
+            #[cfg(gl_arm)]
+            Self::Gl(rig) => rig.stream(id),
         }
+    }
+}
+
+/// The GL arm's resolution set, the twin of [`MetalFrameRig`], borrowed from
+/// wherever the resources live (the armed arm's residency, or a differential's
+/// locals): programs by table row, the 16-byte uniform block at its binding
+/// point, the instance streams, the atlas textures with their samplers, and
+/// the offscreen (`SRGB8_ALPHA8`, drawn through its sRGB or raw view per pass;
+/// see `gl/mod.rs`).
+#[cfg(gl_arm)]
+pub(crate) struct GlFrameRig<'a> {
+    pub(crate) offscreen: &'a crate::gl::resources::GlTexture,
+    /// Programs by [`Pipeline`] row discriminant; `None` == the plan never
+    /// draws that row (resolving it is a rig-construction bug, panics by name).
+    pub(crate) pipelines:
+        [Option<&'a crate::gl::pipelines::GlPipeline>; pipeline_table::PIPELINE_COUNT],
+    /// The `cell.glsl` `Uniforms` block (`aterm_b0`).
+    pub(crate) uniform: &'a crate::gl::resources::GlBuffer,
+    /// `BindSpec::vertex_uniform` of the drawn rows (one per frame).
+    pub(crate) uniform_binding: u32,
+    /// Instance streams by [`StreamId`] discriminant.
+    pub(crate) streams: [Option<&'a crate::gl::resources::GlBuffer>; STREAM_COUNT],
+    /// Atlas texture + sampler by [`DrawAtlas`] discriminant.
+    pub(crate) atlases: [Option<(
+        &'a crate::gl::resources::GlTexture,
+        &'a crate::gl::resources::GlSampler,
+    )>; DRAW_ATLAS_COUNT],
+}
+
+#[cfg(gl_arm)]
+impl GlFrameRig<'_> {
+    fn pipeline(&self, pipe: DrawPipe) -> crate::device_layer::FramePipeline<'_> {
+        let row = pipe.row();
+        crate::device_layer::FramePipeline::Gl(
+            self.pipelines[row as usize].unwrap_or_else(|| {
+                panic!("gl frame rig: no program for row {row:?} (pipe {pipe:?})")
+            }),
+        )
+    }
+
+    /// The row's `BindSpec` names the texture unit (GL pairs the sampler).
+    fn atlas(&self, atlas: DrawAtlas, pipe: DrawPipe) -> crate::device_layer::FrameAtlas<'_> {
+        let unit = *pipe
+            .row()
+            .spec()
+            .binds
+            .fragment_textures
+            .first()
+            .unwrap_or_else(|| panic!("row {:?} samples no fragment texture", pipe.row()));
+        let (tex, sampler) = self.atlases[atlas as usize]
+            .unwrap_or_else(|| panic!("gl frame rig: no atlas for {atlas:?} (pipe {pipe:?})"));
+        crate::device_layer::FrameAtlas::Gl { tex, sampler, unit }
+    }
+
+    fn stream(&self, id: StreamId) -> crate::device_layer::FrameStream<'_> {
+        crate::device_layer::FrameStream::Gl(
+            self.streams[id as usize]
+                .unwrap_or_else(|| panic!("gl frame rig: no stream buffer for {id:?}")),
+        )
     }
 }
 
@@ -2579,6 +2684,17 @@ impl MetalFrameRig {
                 .obj(),
         )
     }
+}
+
+/// The note of the build's first-party arm: Metal's on macOS, GL's on Linux.
+#[cfg(not(wgpu_arm))]
+fn first_party_note(what: &str) {
+    #[cfg(target_os = "macos")]
+    metal_arm_note(what);
+    #[cfg(gl_arm)]
+    gl_arm::gl_arm_note(what);
+    #[cfg(not(any(target_os = "macos", gl_arm)))]
+    crate::stderr_line!("aterm-gpu: {what}");
 }
 
 /// A named armed-arm degrade note, printed once per message per process, so a
@@ -2821,7 +2937,7 @@ impl MetalArmLive {
         &mut self.frame_slots[self.cur_slot]
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, wgpu_arm))]
     #[inline]
     fn has_inflight_frame(&self) -> bool {
         self.frame_slots.iter().any(|s| s.inflight.is_some())
@@ -3664,12 +3780,150 @@ struct NeutralSurfaceConfig {
     format: crate::device_layer::TexelFormat,
 }
 
+/// The Metal attach's swapchain format: the proven gate narrowed by the EDR
+/// potential of the screen `target` sits on
+/// ([`crate::format_plan::hdr_swapchain_wants_f16_on_screen`]). An SDR-only
+/// screen gets 8-bit, since f16 there would draw neither the HDR aurora nor the
+/// SDR crown at higher cost; the frontend re-picks through
+/// [`GpuRenderer::upgrade_surface_for_screen`]. One function, so the pick
+/// cannot skip the screen and the screen is read off the attach's own handle.
+#[cfg(all(not(wgpu_arm), target_os = "macos"))]
+fn metal_attach_format<W: WindowTarget>(
+    hdr_glow: bool,
+    target: &W,
+) -> crate::device_layer::TexelFormat {
+    let potential = crate::metal::present::screen_edr_potential_of(target);
+    if crate::format_plan::hdr_swapchain_wants_f16_on_screen(hdr_glow, true, potential) {
+        crate::device_layer::TexelFormat::Rgba16Float
+    } else {
+        crate::device_layer::TexelFormat::Bgra8Unorm
+    }
+}
+
+/// A window's live wgpu surface, as an attached [`GpuSurface`] holds it. It
+/// offers no bare `Surface::configure`: DX12 rebuilds the swapchain on every
+/// configure and reverts it to the gamma-2.2 default, so a bare reconfigure of
+/// an f16 surface would drop the scRGB tag and wash the present out. Its two
+/// configures are the re-tagging one every live reconfigure takes
+/// ([`GpuRenderer::configure_surface_retagging_scrgb`]) and the deliberately
+/// untagged SDR escape, which only the `FallbackToSdr` plan orders; both are
+/// scoped ([`configure_scoped`]), so a rejected one is an `Err`, never a
+/// panic. The first attach configures its fresh local `wgpu::Surface` before
+/// wrapping it.
+#[cfg(wgpu_arm)]
+mod live_surface {
+    use super::{GpuRenderer, configure_scoped};
+    use crate::format_plan::HdrReconfigurePlan;
+
+    pub(super) struct LiveSurface(wgpu::Surface<'static>);
+
+    impl LiveSurface {
+        /// Wrap a surface its attach has configured.
+        pub(super) const fn attached(surface: wgpu::Surface<'static>) -> Self {
+            Self(surface)
+        }
+
+        /// Reconfigure, then re-tag scRGB when the surface was HDR; whether
+        /// the tag held (always `false` for an SDR surface, which skips the
+        /// platform call).
+        ///
+        /// # Errors
+        /// wgpu rejected the configure (its message); nothing was tagged.
+        pub(super) fn configure_retagging(
+            &self,
+            device: &wgpu::Device,
+            config: &wgpu::SurfaceConfiguration,
+            was_hdr: bool,
+        ) -> Result<bool, String> {
+            configure_scoped(device, &self.0, config)?;
+            Ok(was_hdr && GpuRenderer::tag_swapchain_scrgb(&self.0))
+        }
+
+        /// The SDR escape: reconfigure to the retained 8-bit format and leave
+        /// it untagged, so DWM reads it as ordinary sRGB. Only the
+        /// `FallbackToSdr` plan orders it.
+        ///
+        /// # Errors
+        /// wgpu rejected the configure (its message).
+        pub(super) fn configure_sdr_escape(
+            &self,
+            device: &wgpu::Device,
+            config: &wgpu::SurfaceConfiguration,
+            plan: HdrReconfigurePlan,
+        ) -> Result<(), String> {
+            assert_eq!(
+                plan,
+                HdrReconfigurePlan::FallbackToSdr,
+                "the untagged reconfigure is the SDR escape and nothing else"
+            );
+            configure_scoped(device, &self.0, config)
+        }
+
+        /// Re-tag the current swapchain scRGB without reconfiguring it.
+        pub(super) fn retag(&self) -> bool {
+            GpuRenderer::tag_swapchain_scrgb(&self.0)
+        }
+
+        /// Whether the surface's output advertises the HDR10 desktop colour
+        /// space (a probe; changes nothing).
+        pub(super) fn output_hdr_enabled(&self) -> bool {
+            GpuRenderer::surface_output_hdr_enabled(&self.0)
+        }
+
+        pub(super) fn get_current_texture(&self) -> wgpu::CurrentSurfaceTexture {
+            self.0.get_current_texture()
+        }
+    }
+}
+
+/// `surface.configure(device, config)` inside error scopes (validation,
+/// internal, out-of-memory), so a configure wgpu rejects comes back as `Err`
+/// with its message on one line, instead of reaching wgpu's default
+/// uncaptured-error handler, which panics. Every configure of a window surface
+/// goes through here: the first attach's
+/// ([`GpuRenderer::configure_first_attach`]) and each live one
+/// ([`live_surface::LiveSurface`]).
+///
+/// The Linux lane met that panic when weston died under aterm-gui
+/// (2026-10-16, `docs/measured/linux-lw2-2026-10-16.md`): the configure's
+/// surface queries opened with a roundtrip on the dead connection, Mesa
+/// answered `VK_ERROR_SURFACE_LOST_KHR`, and wgpu reported "Surface does not
+/// support the adapter's queue family" to the handler.
+#[cfg(wgpu_arm)]
+fn configure_scoped(
+    device: &wgpu::Device,
+    surface: &wgpu::Surface<'_>,
+    config: &wgpu::SurfaceConfiguration,
+) -> Result<(), String> {
+    // An error goes to the innermost matching scope, so one scope per class,
+    // popped in reverse push order on this thread.
+    let oom = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    surface.configure(device, config);
+    // The pop futures are already resolved; all three pops always run so the
+    // stack is left empty.
+    let validation = crate::block_on::block_on(validation.pop());
+    let internal = crate::block_on::block_on(internal.pop());
+    let oom = crate::block_on::block_on(oom.pop());
+    match validation.or(internal).or(oom) {
+        None => Ok(()),
+        // wgpu's Display is a multi-line cause tree; flatten it so the
+        // frontend's one-line diagnostic stays one line.
+        Some(err) => Err(err
+            .to_string()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")),
+    }
+}
+
 pub struct GpuSurface {
     acquire_id: u64,
     #[cfg(not(wgpu_arm))]
     neutral: NeutralSurfaceConfig,
     #[cfg(wgpu_arm)]
-    surface: wgpu::Surface<'static>,
+    surface: live_surface::LiveSurface,
     #[cfg(wgpu_arm)]
     config: wgpu::SurfaceConfiguration,
     /// A supported non-sRGB 8-bit format kept when an HDR surface is created,
@@ -3679,6 +3933,10 @@ pub struct GpuSurface {
     sdr_format: wgpu::TextureFormat,
     /// Raw f16 capability at attach, independent of the HDR-glow opt-in, so a
     /// later HDR-on plus opt-in can restore f16.
+    #[cfg_attr(
+        target_arch = "wasm32",
+        expect(dead_code, reason = "read by the window HDR paths; a canvas has none")
+    )]
     supports_f16: bool,
     /// Last HDR/scRGB probe instant. Windows can toggle HDR without a resize or
     /// a lost acquire, so presents probe on a bounded cadence.
@@ -3704,6 +3962,11 @@ pub struct GpuSurface {
     /// thread-pinned raw pointers, keeping `GpuSurface` on the attaching thread.
     #[cfg(target_os = "macos")]
     metal: Option<crate::metal::present::MetalWindowSurface>,
+    /// The GL arm's swapchain: an EGL window surface (the shipped Linux build;
+    /// raw EGL and window-system pointers, keeping `GpuSurface` on the
+    /// attaching thread, as the Metal swapchain does), or a WebGL2 canvas.
+    #[cfg(all(gl_arm, not(wgpu_arm)))]
+    gl: Option<crate::gl::WindowSurface>,
 }
 
 fn next_surface_acquire_id() -> u64 {
@@ -3758,6 +4021,12 @@ impl GpuSurface {
         #[cfg(target_os = "macos")]
         if self.metal.is_some() {
             return None;
+        }
+        // A synchronized EGL swap (interval 1) queues behind the frame on
+        // glass; an unsynchronized one never waits.
+        #[cfg(all(gl_arm, not(wgpu_arm)))]
+        if let Some(gl) = self.gl.as_ref() {
+            return gl.synced().then_some(1);
         }
         #[cfg(wgpu_arm)]
         {
@@ -4180,9 +4449,9 @@ fn deco_sprite_index(g: aterm_render::DecoGlyph) -> usize {
 struct DecoAtlas {
     #[cfg(wgpu_arm)]
     bind: wgpu::BindGroup,
-    /// The baked R8 coverage bytes (`atlas_w * ch`), kept so the Metal arm can
-    /// re-mint the atlas without re-baking.
-    #[cfg(target_os = "macos")]
+    /// The baked R8 coverage bytes (`atlas_w * ch`), kept so the Metal and GL
+    /// arms can re-mint the atlas without re-baking.
+    #[cfg(any(target_os = "macos", gl_arm))]
     data: Vec<u8>,
     cw: usize,
     ch: usize,
@@ -4199,6 +4468,10 @@ struct DecoAtlas {
 struct SpriteTex {
     #[cfg(target_os = "macos")]
     metal_atlas: std::sync::OnceLock<ArmAtlas>,
+    /// The GL arm's upload of these texels, made when a frame samples them
+    /// (re-made when the arm's device changes).
+    #[cfg(gl_arm)]
+    gl_atlas: std::sync::Mutex<Option<Arc<crate::gl::resources::GlTexture>>>,
     #[cfg(wgpu_arm)]
     bind: wgpu::BindGroup,
     w: u32,
@@ -4484,6 +4757,30 @@ pub struct WindowGpu {
     // Send+Sync.
     #[cfg(target_os = "macos")]
     pub(crate) metal_offscreen: Option<MetalOffscreen>,
+    // The GL arm's offscreen for an armed frame (`last_frame_arm_gl`), and
+    // its resident band-shift scratch (see `gl_arm.rs`).
+    #[cfg(gl_arm)]
+    gl_offscreen: Option<gl_arm::GlOffscreen>,
+    #[cfg(gl_arm)]
+    gl_shift_scratch: Option<crate::gl::resources::GlTexture>,
+    #[cfg(gl_arm)]
+    gl_tray_card: Option<gl_arm::GlTrayCard>,
+    // The GL arm's present residency (`gl_present.rs`), the twins of
+    // `metal_present_off`, `metal_bloom_half`, `metal_shimmer_scratch`,
+    // `metal_apron_tex` (with the apron generation it holds) and
+    // `metal_virtual_off`; each re-minted on resize or a new device.
+    #[cfg(gl_arm)]
+    gl_present_off: Option<crate::gl::resources::GlTexture>,
+    #[cfg(gl_arm)]
+    gl_bloom_half: Option<crate::gl::resources::GlTexture>,
+    #[cfg(gl_arm)]
+    gl_shimmer_scratch: Option<crate::gl::resources::GlTexture>,
+    #[cfg(gl_arm)]
+    gl_apron_tex: Option<crate::gl::resources::GlTexture>,
+    #[cfg(gl_arm)]
+    gl_apron_gen: u64,
+    #[cfg(gl_arm)]
+    gl_virtual_off: Option<crate::gl::resources::GlTexture>,
     // The armed arm's present copy (twin of `present_offscreen`): effects and
     // tray composite over it, the blit samples it.
     #[cfg(target_os = "macos")]
@@ -4703,32 +5000,32 @@ impl WindowGpu {
     /// Performs every `HdrReconfigureRetag` transition except `UpgradeSucceeds`,
     /// which [`Self::apply_hdr_surface_upgrade`] handles.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "HdrReconfigureRetag",
             action = "RetagSucceeds",
             project = "aterm_gpu::WindowGpu::project_hdr_reconfigure_state"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "HdrReconfigureRetag",
             action = "RetagFails",
             project = "aterm_gpu::WindowGpu::project_hdr_reconfigure_state"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "HdrReconfigureRetag",
             action = "EnterSdrFallback",
             project = "aterm_gpu::WindowGpu::project_hdr_reconfigure_state"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "HdrReconfigureRetag",
             action = "UpgradeFails",
             project = "aterm_gpu::WindowGpu::project_hdr_reconfigure_state"
@@ -4748,11 +5045,18 @@ impl WindowGpu {
     /// the frontend's next monitor query. This, not the planner, sets
     /// `capture_linear` on `UpgradeSucceeds`.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "HdrReconfigureRetag",
             action = "UpgradeSucceeds",
             project = "aterm_gpu::WindowGpu::project_hdr_reconfigure_state"
+        )
+    )]
+    #[cfg_attr(
+        all(gl_arm, not(wgpu_arm), not(test)),
+        expect(
+            dead_code,
+            reason = "GL surfaces never move to f16; the model's test drives it"
         )
     )]
     fn apply_hdr_surface_upgrade(&mut self) {
@@ -4766,7 +5070,7 @@ impl WindowGpu {
     /// `retagged` are drive coordinates, `is_f16` the planner's format;
     /// `capture_linear` is read back off `self`, so an apply path that skips its
     /// metadata half violates `CaptureMatchesSurfaceEncoding`.
-    #[cfg(test)]
+    #[cfg(all(test, wgpu_arm))]
     #[must_use]
     pub(crate) fn project_hdr_reconfigure_state(
         &self,
@@ -4818,7 +5122,7 @@ impl WindowGpu {
 
     /// Test probe: `(epoch, has_metal_texels)` of the resident image plane, or
     /// `None` when no plane is resident.
-    #[cfg(all(target_os = "macos", test))]
+    #[cfg(all(target_os = "macos", test, wgpu_arm))]
     pub(crate) fn image_plane_probe_for_test(&self) -> Option<(u64, bool)> {
         self.image_plane
             .as_ref()
@@ -4904,6 +5208,14 @@ pub(crate) struct ImagePlane {
     /// salt, so texels re-upload only on rebuild on both arms.
     #[cfg(target_os = "macos")]
     epoch: u64,
+    /// The GL arm's twins of `metal_texels`/`epoch`, kept only while the GL
+    /// arm is armed, and its resident upload of them.
+    #[cfg(gl_arm)]
+    gl_texels: Option<Vec<u8>>,
+    #[cfg(gl_arm)]
+    gl_epoch: u64,
+    #[cfg(gl_arm)]
+    gl_atlas: Option<gl_arm::GlArmAtlas>,
 }
 
 /// GPU terminal renderer. Holds its own device (via [`GpuContext`]) and a CPU
@@ -5095,13 +5407,33 @@ pub struct GpuRenderer {
     metal_inject_loss_after: Option<u64>,
     // Image-plane rebuild counter, stamped into each plane as its `epoch`.
     // Renderer-level so two windows' planes never share a stamp.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", gl_arm))]
     image_plane_epoch: u64,
     // Packed-atlas rebuild counter, bumped per `rebuild_atlases` and folded into
     // the armed Mono/Color atlas keys, so a rebuild with the same dims and glyph
     // count (e.g. a font-feature flip) still re-uploads.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", gl_arm))]
     atlas_epoch: u64,
+    // The GL arm (Linux, `gl_arm.rs`, `gl_present.rs`): whether it drives
+    // this renderer (true at construct), its lazily minted residency, why a
+    // mint failed, the window system the first window attached on (the arm's
+    // display from then on), and whether the last frame drew on it.
+    #[cfg(gl_arm)]
+    gl_armed: bool,
+    #[cfg(gl_arm)]
+    gl_arm: Option<gl_arm::GlArmLive>,
+    #[cfg(gl_arm)]
+    gl_mint_error: Option<String>,
+    #[cfg(all(gl_arm, not(target_arch = "wasm32")))]
+    gl_window_system: Option<crate::gl::device::WindowSystem>,
+    #[cfg(gl_arm)]
+    last_frame_arm_gl: bool,
+    // The GL arm's injected-loss drill: `ATERM_GL_INJECT_LOSS=<n>` (parsed at
+    // construct). After the n-th successful GL present, the device's next
+    // `eglMakeCurrent` answers `EGL_CONTEXT_LOST`, so the latch, `device_lost`
+    // and the frontend's CPU fallback run end to end. `None` normally.
+    #[cfg(gl_arm)]
+    gl_inject_loss_after: Option<u64>,
     // Persistent per-frame instance streams + glyph-key set. Cleared (capacity
     // retained) at the top of each `encode_frame` instead of re-allocated. See
     // `Instances`.
@@ -5202,6 +5534,9 @@ pub(crate) struct PresentPrev {
     /// `Load` is safe only on the same arm's offscreen.
     #[cfg(target_os = "macos")]
     on_metal: bool,
+    /// The GL arm's twin of `on_metal`.
+    #[cfg(gl_arm)]
+    on_gl: bool,
 }
 
 /// What portion of the offscreen `encode_frame` must repaint:
@@ -5348,6 +5683,7 @@ type OffscreenTexHandle = wgpu::Texture;
 #[cfg(not(wgpu_arm))]
 type OffscreenTexHandle = std::convert::Infallible;
 
+#[cfg(any(wgpu_arm, target_os = "macos"))]
 const VIRTUAL_PRESENT_TEXEL: crate::device_layer::TexelFormat =
     crate::device_layer::TexelFormat::Bgra8Unorm;
 #[cfg(wgpu_arm)]
@@ -5889,7 +6225,7 @@ fn build_bloom_resources(
     // `Blend::SCREEN` spends only the destination's remaining headroom, so the
     // halo, composited after everything else, brightens without saturating.
     let spec = Pipeline::Bloom.spec();
-    let pipeline = build_table_pipeline(device, &shader, &layout, targets, spec);
+    let pipeline = crate::pipeline_table::build_wgpu(spec, device, &shader, &layout, targets);
     let uniform = handle
         .create_uniform_buffer(
             "aterm-gpu bloom uniform",
@@ -5982,7 +6318,7 @@ fn build_shimmer_resources(
     });
     // The row is replace (`blend: None`) with an RGB-only mask.
     let spec = Pipeline::Shimmer.spec();
-    let pipeline = build_table_pipeline(device, &shader, &layout, targets, spec);
+    let pipeline = crate::pipeline_table::build_wgpu(spec, device, &shader, &layout, targets);
     let uniform_buf = handle
         .create_uniform_buffer(
             "aterm-gpu shimmer uniform",
@@ -6050,45 +6386,6 @@ fn build_cell_layouts(
     }
 }
 
-/// Build one `wgpu` render pipeline entirely from its pipeline-table row.
-///
-/// Entry points, blend, write mask, vertex format and topology all come from
-/// `spec`, which the Metal backend also consumes. The caller supplies the
-/// per-backend plumbing: the compiled module and the layout. `targets` only
-/// resolves the row's [`TargetRole`] to a format.
-///
-/// [`TargetRole`]: crate::pipeline_table::TargetRole
-#[cfg(wgpu_arm)]
-fn build_table_pipeline(
-    device: &wgpu::Device,
-    shader: &wgpu::ShaderModule,
-    layout: &wgpu::PipelineLayout,
-    targets: TargetFormats,
-    spec: &PipelineSpec,
-) -> wgpu::RenderPipeline {
-    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some(spec.label),
-        layout: Some(layout),
-        vertex: wgpu::VertexState {
-            module: shader,
-            entry_point: Some(spec.vs),
-            compilation_options: Default::default(),
-            buffers: spec.wgpu_vertex_buffers(),
-        },
-        primitive: spec.wgpu_primitive(),
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        fragment: Some(wgpu::FragmentState {
-            module: shader,
-            entry_point: Some(spec.fs),
-            compilation_options: Default::default(),
-            targets: &[Some(spec.wgpu_color_target(targets))],
-        }),
-        multiview_mask: None,
-        cache: None,
-    })
-}
-
 /// The THREE cell pipelines [`build_cell_pipelines`] returns, in declaration
 /// order: bg, glyph, color_glyph.
 #[cfg(wgpu_arm)]
@@ -6118,26 +6415,27 @@ fn build_cell_pipelines(
 
     // Per-pipeline compile timing for crate::startup_probe.
     let mut pipeline_mark = aterm_time::Instant::now();
-    let bg_pipeline = build_table_pipeline(device, shader, bg_layout, targets, Pipeline::Bg.spec());
+    let bg_pipeline =
+        crate::pipeline_table::build_wgpu(Pipeline::Bg.spec(), device, shader, bg_layout, targets);
     pipeline_mark = crate::startup_probe::split_cell_pipeline(0, pipeline_mark);
 
-    let glyph_pipeline = build_table_pipeline(
+    let glyph_pipeline = crate::pipeline_table::build_wgpu(
+        Pipeline::Glyph.spec(),
         device,
         shader,
         glyph_layout,
         targets,
-        Pipeline::Glyph.spec(),
     );
     pipeline_mark = crate::startup_probe::split_cell_pipeline(1, pipeline_mark);
 
     // Colour emoji: like the mono glyph pipeline, but `fs_glyph_color` samples
     // an RGBA8 atlas straight. Reuses `atlas_bgl`.
-    let color_glyph_pipeline = build_table_pipeline(
+    let color_glyph_pipeline = crate::pipeline_table::build_wgpu(
+        Pipeline::ColorGlyph.spec(),
         device,
         shader,
         glyph_layout,
         targets,
-        Pipeline::ColorGlyph.spec(),
     );
     // Last split: the returned mark has no successor to close against.
     let _ = crate::startup_probe::split_cell_pipeline(2, pipeline_mark);
@@ -6352,7 +6650,7 @@ fn frame_effect_pipelines(
 }
 
 /// Build one effect pipeline: pick its table row and which of the two layouts
-/// it binds. Everything else comes from the row via [`build_table_pipeline`];
+/// it binds. Everything else comes from the row via [`pipeline_table::build_wgpu`];
 /// `crate::metal::pipelines` builds from the same rows.
 #[cfg(wgpu_arm)]
 fn build_effect_pipeline(
@@ -6391,7 +6689,7 @@ fn build_effect_pipeline(
         // Shared RGBA8 sprite pipeline for rain, cats, and free sprites.
         EffectPipeline::SpriteOver => (Pipeline::SpriteOver, &layouts.glyph),
     };
-    build_table_pipeline(device, shader, layout, targets, row.spec())
+    crate::pipeline_table::build_wgpu(row.spec(), device, shader, layout, targets)
 }
 
 /// Build the format-independent present blit resources: shader, bind-group
@@ -6775,10 +7073,25 @@ impl GpuRenderer {
             last_frame_arm_metal: false,
             #[cfg(target_os = "macos")]
             metal_pending_band_shift: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", gl_arm))]
             image_plane_epoch: 0,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", gl_arm))]
             atlas_epoch: 0,
+            #[cfg(gl_arm)]
+            gl_armed: true,
+            #[cfg(gl_arm)]
+            gl_arm: None,
+            #[cfg(gl_arm)]
+            gl_mint_error: None,
+            #[cfg(all(gl_arm, not(target_arch = "wasm32")))]
+            gl_window_system: None,
+            #[cfg(gl_arm)]
+            last_frame_arm_gl: false,
+            // A development seam (`dev_seam!`), never read by a shipped binary.
+            #[cfg(gl_arm)]
+            gl_inject_loss_after: aterm_types::dev_seam!("ATERM_GL_INJECT_LOSS")
+                .and_then(|v| v.to_str()?.parse::<u64>().ok())
+                .filter(|n| *n > 0),
             // A development seam (`dev_seam!`), never read by a shipped binary;
             // non-mac builds never parse it.
             #[cfg(target_os = "macos")]
@@ -6855,9 +7168,7 @@ impl GpuRenderer {
     pub fn set_runtime_font_discovery(&mut self, enabled: bool) {
         // Widening the chain drops the CPU's rasterized glyphs (a `.notdef` from
         // the narrower chain must not survive), so the atlas copy goes too.
-        if self.cpu.set_runtime_font_discovery(enabled) {
-            self.invalidate_atlas();
-        }
+        self.raster_changed(|cpu| cpu.set_runtime_font_discovery(enabled));
     }
 
     /// Test/debug forward of
@@ -6866,15 +7177,6 @@ impl GpuRenderer {
     #[doc(hidden)]
     pub fn debug_block_on_lazy_fallbacks(&mut self) {
         self.cpu.debug_block_on_lazy_fallbacks();
-    }
-
-    /// Test/debug: [`Renderer::debug_fallback_candidate_paths`] for the GPU's
-    /// CPU-side renderer. A parity pair has two lazy chains, so a test must ask
-    /// both; `&self` so asking cannot settle the answer.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn debug_fallback_candidate_paths(&self) -> &[String] {
-        self.cpu.debug_fallback_candidate_paths()
     }
 
     /// Swap in an already-built CPU face and theme in place: device, pipelines
@@ -6910,8 +7212,7 @@ impl GpuRenderer {
     /// wrapped CPU face and drop the atlas, since the shaper selects different
     /// glyph ids. Mirrors [`Renderer::set_text_shaping`].
     pub fn set_text_shaping(&mut self, shaping: aterm_render::TextShapingConfig) {
-        self.cpu.set_text_shaping(shaping);
-        self.invalidate_atlas();
+        self.raster_changed(|cpu| cpu.set_text_shaping(shaping));
     }
 
     /// Configured primary-face `font_features` tags the active font cannot apply
@@ -6938,38 +7239,37 @@ impl GpuRenderer {
     /// the face reports a change (coverage bytes differ). Mirrors
     /// [`Renderer::set_font_thicken`].
     pub fn set_font_thicken(&mut self, on: bool) {
-        if self.cpu.font_thicken() != on {
-            self.cpu.set_font_thicken(on);
-            self.invalidate_atlas();
-        }
+        self.raster_changed(|cpu| {
+            let changed = cpu.font_thicken() != on;
+            if changed {
+                cpu.set_font_thicken(on);
+            }
+            changed
+        });
     }
 
     /// Install the variable-font config (`font_variation` / `font_weight` plus
     /// `font_weight_dark_nudge`) on the wrapped CPU face and drop the atlas when
     /// the resolved coords change. Mirrors [`Renderer::set_font_variations`].
     pub fn set_font_variations(&mut self, requests: &[(u32, f32)], dark_nudge: f32) {
-        if self.cpu.set_font_variations(requests, dark_nudge) {
-            self.invalidate_atlas();
-        }
+        self.raster_changed(|cpu| cpu.set_font_variations(requests, dark_nudge));
     }
 
     /// Set `stem_gamma` on the wrapped CPU face and drop the atlas on a change
     /// (stem darkening is baked into coverage).
     pub fn set_stem_gamma(&mut self, gamma: f32) {
-        let before = self.cpu.stem_gamma();
-        self.cpu.set_stem_gamma(gamma);
-        if (self.cpu.stem_gamma() - before).abs() > f32::EPSILON {
-            self.invalidate_atlas();
-        }
+        self.raster_changed(|cpu| {
+            let before = cpu.stem_gamma();
+            cpu.set_stem_gamma(gamma);
+            (cpu.stem_gamma() - before).abs() > f32::EPSILON
+        });
     }
 
     /// Set the Linux/Windows grid-fitting mode (`font_hinting`) and drop the
     /// atlas on a change. Inert on targets without hinting, like the wrapped
     /// setter.
     pub fn set_font_hinting(&mut self, mode: &str) {
-        if self.cpu.set_font_hinting(mode) {
-            self.invalidate_atlas();
-        }
+        self.raster_changed(|cpu| cpu.set_font_hinting(mode));
     }
 
     /// Record the Linux subpixel-RGB mode (`font_subpixel`) on the wrapped CPU
@@ -6988,11 +7288,11 @@ impl GpuRenderer {
     /// primary.
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
-        let coords_before: Option<Vec<(u32, f32)>> = self.cpu.variation_coords().map(<[_]>::to_vec);
-        self.cpu.set_theme(theme);
-        if self.cpu.variation_coords() != coords_before.as_deref() {
-            self.invalidate_atlas();
-        }
+        self.raster_changed(|cpu| {
+            let coords_before: Option<Vec<(u32, f32)>> = cpu.variation_coords().map(<[_]>::to_vec);
+            cpu.set_theme(theme);
+            cpu.variation_coords() != coords_before.as_deref()
+        });
     }
 
     /// Explicit selected-text foreground (theme `selectionForeground`), or `None`
@@ -7011,9 +7311,9 @@ impl GpuRenderer {
     /// Default-background opacity (0..=1; `1.0` = opaque, the default). Routed
     /// through the CPU face; `encode_frame` emits it as clear/quad alpha on
     /// default-bg cells via [`aterm_render::vibrancy::bg_quad_alpha`]. Below
-    /// `1.0` the offscreen's straight alpha carries it (ink opaque,
-    /// [`aterm_render::vibrancy::ink_quad_alpha`]), `present_input` switches the
-    /// swapchain to `PostMultiplied` where offered, and the blit emits the alpha.
+    /// `1.0` the offscreen's straight alpha carries it (ink stays opaque),
+    /// `present_input` switches the swapchain to `PostMultiplied` where
+    /// offered, and the blit emits the alpha.
     /// The host must invalidate the present for it to redraw.
     pub fn set_background_opacity(&mut self, opacity: f32) {
         self.cpu.set_background_opacity(opacity);
@@ -7054,8 +7354,7 @@ impl GpuRenderer {
     /// Re-rasterize at a new pixel size (DPI change): update the CPU face's
     /// metrics and caches and drop the atlas. The host then resizes the grid.
     pub fn set_px(&mut self, px: f32) {
-        self.cpu.set_px(px);
-        self.invalidate_atlas();
+        self.raster_changed(|cpu| cpu.set_px(px));
     }
 
     /// Per-window size switch: re-target rasterization to `px` without
@@ -7090,96 +7389,73 @@ impl GpuRenderer {
     /// Set a broad-coverage fallback face from font bytes and invalidate the
     /// atlas. For hosts without system-font discovery (the browser).
     pub fn set_fallback_font_bytes(&mut self, bytes: &[u8]) -> Result<(), String> {
-        self.cpu.set_fallback_bytes(bytes)?;
-        self.invalidate_atlas();
-        Ok(())
+        self.raster_changed(|cpu| cpu.set_fallback_bytes(bytes))
     }
 
     /// Append a broad-coverage fallback face (like [`set_fallback_font_bytes`],
     /// but adds rather than resets), so several scripts can find coverage.
     /// Invalidates the atlas.
     pub fn add_fallback_font_bytes(&mut self, bytes: &[u8]) -> Result<(), String> {
-        self.cpu.add_fallback_bytes(bytes)?;
-        self.invalidate_atlas();
-        Ok(())
+        self.raster_changed(|cpu| cpu.add_fallback_bytes(bytes))
     }
 
     /// Set a colour-emoji (sbix) face from font bytes and invalidate the atlas.
     pub fn set_emoji_font_bytes(&mut self, bytes: Vec<u8>) -> Result<(), String> {
-        self.cpu.set_color_font_bytes(bytes)?;
-        self.invalidate_atlas();
-        Ok(())
+        self.raster_changed(|cpu| cpu.set_color_font_bytes(bytes))
     }
 
     /// Set a real bold face (`FaceId::BoldPrimary`) so SGR bold is not synthetic.
     /// Invalidates the atlas.
     pub fn set_bold_font_bytes(&mut self, bytes: &[u8]) -> Result<(), String> {
-        self.cpu.set_bold_font(bytes)?;
-        self.invalidate_atlas();
-        Ok(())
+        self.raster_changed(|cpu| cpu.set_bold_font(bytes))
     }
 
     /// Set a symbol fallback face (config `symbol_font`) from font bytes and
     /// invalidate the atlas; byte-injection sibling of [`set_config_symbol_font`].
     pub fn set_symbol_font_bytes(&mut self, bytes: &[u8]) -> Result<(), String> {
-        self.cpu.set_symbol_fallback_bytes(bytes)?;
-        self.invalidate_atlas();
-        Ok(())
+        self.raster_changed(|cpu| cpu.set_symbol_fallback_bytes(bytes))
     }
 
     /// Set a real styled face (`slot` 0 = bold, 1 = italic, 2 = bold-italic) and
     /// invalidate the atlas.
     pub fn set_styled_font_bytes(&mut self, slot: usize, bytes: &[u8]) -> Result<(), String> {
-        self.cpu.set_styled_font_bytes(slot, bytes)?;
-        self.invalidate_atlas();
-        Ok(())
+        self.raster_changed(|cpu| cpu.set_styled_font_bytes(slot, bytes))
     }
 
     /// Enable/disable synthetic bold/italic (`font_synthetic_style`). The atlas
     /// is invalidated only on a real change.
     pub fn set_synthetic_styles(&mut self, on: bool) {
-        if self.cpu.set_synthetic_styles(on) {
-            self.invalidate_atlas();
-        }
+        self.raster_changed(|cpu| cpu.set_synthetic_styles(on));
     }
 
     /// Install the config fallback chain (`fallback_fonts`), ordered config
     /// before built-ins. The atlas is invalidated only on a real change.
     pub fn set_config_fallback_fonts(&mut self, paths: &[String]) {
-        if self.cpu.set_config_fallback_fonts(paths) {
-            self.invalidate_atlas();
-        }
+        self.raster_changed(|cpu| cpu.set_config_fallback_fonts(paths));
     }
 
     /// Install the config symbol-fallback font (`symbol_font`). The atlas is
     /// invalidated only on a real change.
     pub fn set_config_symbol_font(&mut self, path: Option<&str>) {
-        if self.cpu.set_config_symbol_font(path) {
-            self.invalidate_atlas();
-        }
+        self.raster_changed(|cpu| cpu.set_config_symbol_font(path));
     }
 
     /// Install the config colour-emoji font (`emoji_font`). The atlas is
     /// invalidated only on a real change.
     pub fn set_config_emoji_font(&mut self, path: Option<&str>) {
-        if self.cpu.set_config_emoji_font(path) {
-            self.invalidate_atlas();
-        }
+        self.raster_changed(|cpu| cpu.set_config_emoji_font(path));
     }
 
     /// Swap the primary face and invalidate the atlas. The host resizes the grid
     /// if the cell metrics changed.
     pub fn set_primary_font_bytes(&mut self, bytes: &[u8]) -> Result<(), String> {
-        self.cpu.set_primary_font(bytes)?;
-        self.invalidate_atlas();
-        Ok(())
+        self.raster_changed(|cpu| cpu.set_primary_font(bytes))
     }
 
     /// Scale the cell box height without changing glyph px. Invalidates the
     /// atlas (box-drawing glyphs are cell-exact); the host resizes the grid.
     pub fn set_line_height(&mut self, scale: f32) {
-        self.cpu.set_line_height(scale);
-        self.invalidate_atlas();
+        self.raster_changed(|cpu| cpu.set_line_height(scale));
     }
 
     /// Shift the baseline by a signed px delta (`adjust_baseline`). The host
@@ -7188,11 +7464,11 @@ impl GpuRenderer {
         // Drop the atlas too: `baseline_adjust` is not part of `GlyphKey` and the
         // CPU face drops its rasters on this change. Compared after clamping, so
         // re-applying an unchanged config keeps a warm atlas.
-        let before = self.cpu.adjust_baseline();
-        self.cpu.set_adjust_baseline(px);
-        if self.cpu.adjust_baseline() != before {
-            self.invalidate_atlas();
-        }
+        self.raster_changed(|cpu| {
+            let before = cpu.adjust_baseline();
+            cpu.set_adjust_baseline(px);
+            cpu.adjust_baseline() != before
+        });
     }
 
     /// Underline position/thickness adjustments (`adjust_underline_*`). Solid
@@ -7295,6 +7571,22 @@ impl GpuRenderer {
     #[must_use]
     pub fn fork_semantic_surface(&self, px: f32, theme: Theme) -> Option<aterm_render::Renderer> {
         self.cpu.fork_semantic_surface(px, theme)
+    }
+
+    /// THE ONE DOOR for a forwarding setter whose CPU twin re-rasterizes: run
+    /// `edit` on the wrapped CPU face, then drop the GPU atlas whenever the
+    /// edit says the CPU dropped its rasters ([`RasterEdit`]). The GPU uploads
+    /// the CPU's glyph pixels, so a setter that re-rasterized the CPU face and
+    /// kept the atlas would serve the old upload: the edit would reach the face
+    /// and never the glass. Two forwards deliberately keep the atlas, and say
+    /// why where they are: [`Self::activate_px`] (the atlas is keyed by size)
+    /// and [`Self::set_font_subpixel`] (its CPU cache never reaches the atlas).
+    fn raster_changed<R: RasterEdit>(&mut self, edit: impl FnOnce(&mut Renderer) -> R) -> R {
+        let out = edit(&mut self.cpu);
+        if out.dropped_rasters() {
+            self.invalidate_atlas();
+        }
+        out
     }
 
     /// Drop the resident atlases and key set so the next present rebuilds them
@@ -7512,12 +7804,33 @@ impl GpuRenderer {
     /// downgrade to the CPU backend.
     #[inline]
     pub fn device_lost(&self) -> bool {
+        // The GL arm's latch: EGL reported `EGL_CONTEXT_LOST` (in a browser,
+        // the WebGL2 context was lost).
+        #[cfg(gl_arm)]
+        if self
+            .gl_arm
+            .as_ref()
+            .is_some_and(|live| live.dev.shared().lost())
+        {
+            return true;
+        }
         self.ctx.device_lost()
     }
 
     /// The loss's cause — see [`GpuContext::device_loss_reason`].
     #[must_use]
     pub fn device_loss_reason(&self) -> Option<String> {
+        #[cfg(gl_arm)]
+        if self
+            .gl_arm
+            .as_ref()
+            .is_some_and(|live| live.dev.shared().lost())
+        {
+            #[cfg(target_arch = "wasm32")]
+            return Some("webglcontextlost (the WebGL2 context was lost)".to_owned());
+            #[cfg(not(target_arch = "wasm32"))]
+            return Some("EGL_CONTEXT_LOST (the GL context was lost)".to_owned());
+        }
         self.ctx.device_loss_reason()
     }
 
@@ -7578,9 +7891,9 @@ impl GpuRenderer {
 
     /// Integration-suite spelling of [`Self::disarm_metal_for_test`], for the
     /// wgpu-oracle differential suites under `tests/`, which link the lib
-    /// externally.
+    /// externally. Only a build carrying the oracle arm has it.
     #[doc(hidden)]
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", wgpu_arm))]
     pub fn disarm_metal_for_oracle(&mut self) {
         self.metal_armed = false;
     }
@@ -7588,21 +7901,11 @@ impl GpuRenderer {
     /// Test probe: `(submit_a_inflight, awaited_total)`, whether the pipelined
     /// Submit A is held un-waited and how many prior frames the staging wait
     /// consumed.
-    #[cfg(all(target_os = "macos", test))]
+    #[cfg(all(target_os = "macos", test, wgpu_arm))]
     pub(crate) fn metal_pipeline_probe_for_test(&mut self) -> (bool, u64) {
         self.metal_arm.as_mut().map_or((false, 0), |c| {
             let l = c.live_mut();
             (l.has_inflight_frame(), l.awaited_frames)
-        })
-    }
-
-    /// Test probe: `(frame_slot_wait_ns, pending_ring_wait_ns)` accumulated and
-    /// not yet drained. Reads without taking.
-    #[cfg(all(target_os = "macos", test))]
-    pub(crate) fn metal_park_probe_for_test(&mut self) -> (u64, u64) {
-        self.metal_arm.as_mut().map_or((0, 0), |c| {
-            let l = c.live_mut();
-            (l.frame_slot_wait_ns, l.pending_ring_wait_ns)
         })
     }
 
@@ -7648,9 +7951,22 @@ impl GpuRenderer {
         }
         #[cfg(not(wgpu_arm))]
         {
-            // The Metal arm's device answer: the production context holds no
-            // device until the arm mints one on the render thread.
-            d.clamp(1, crate::device_layer::METAL_MAX_TEXTURE_DIM)
+            d.clamp(1, self.first_party_max_texture_dim())
+        }
+    }
+
+    /// The first-party arm's 2-D texture dimension ceiling on the wgpu-free
+    /// build, known before the arm mints its device on the render thread:
+    /// Metal's constant, or what the context's GL probe read.
+    #[cfg(not(wgpu_arm))]
+    fn first_party_max_texture_dim(&self) -> u32 {
+        #[cfg(target_os = "macos")]
+        {
+            crate::device_layer::METAL_MAX_TEXTURE_DIM
+        }
+        #[cfg(gl_arm)]
+        {
+            self.ctx.gl_max_texture_dim
         }
     }
 
@@ -7664,14 +7980,14 @@ impl GpuRenderer {
 
     /// Glyph-atlas textures created so far (full packs only; reuse and appends
     /// create none).
-    #[cfg(test)]
+    #[cfg(all(test, wgpu_arm))]
     fn atlas_tex_creations(&self) -> u64 {
         self.atlas_tex_creations
     }
 
     /// The `(width, height)` of the resident mono + colour atlas textures (for
     /// the persistence test: identity check that the SAME textures are reused).
-    #[cfg(test)]
+    #[cfg(all(test, wgpu_arm))]
     fn atlas_tex_dims(&self) -> Option<((u32, u32), (u32, u32))> {
         let m = self.mono_res.as_ref()?;
         let c = self.color_res.as_ref()?;
@@ -7752,7 +8068,7 @@ impl GpuRenderer {
         let max_tex_dim = handle.max_texture_dim();
         // The wgpu-free build uses the Metal arm's `max_texture_dim`.
         #[cfg(not(wgpu_arm))]
-        let max_tex_dim = crate::device_layer::METAL_MAX_TEXTURE_DIM;
+        let max_tex_dim = self.first_party_max_texture_dim();
         let tex_h = (atlas.height + ATLAS_GROW_HEADROOM).min(max_tex_dim);
         #[cfg(wgpu_arm)]
         let tex = handle.create_texture_2d(
@@ -7890,7 +8206,7 @@ impl GpuRenderer {
             ch,
             curl_band,
             atlas_w,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", gl_arm))]
             data,
         });
     }
@@ -7985,10 +8301,10 @@ impl GpuRenderer {
         #[cfg(wgpu_arm)]
         let cap_h = self.ctx.device_layer().max_texture_dim();
         #[cfg(not(wgpu_arm))]
-        let cap_h = crate::device_layer::METAL_MAX_TEXTURE_DIM;
+        let cap_h = self.first_party_max_texture_dim();
         // Every full repack moves the armed atlas keys, even when
         // `(w, tex_h, map.len())` are identical (a font-feature change).
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", gl_arm))]
         {
             self.atlas_epoch += 1;
         }
@@ -8110,7 +8426,7 @@ impl GpuRenderer {
         #[cfg(wgpu_arm)]
         let max_tex_dim = self.ctx.device.limits().max_texture_dimension_2d;
         #[cfg(not(wgpu_arm))]
-        let max_tex_dim = crate::device_layer::METAL_MAX_TEXTURE_DIM;
+        let max_tex_dim = self.first_party_max_texture_dim();
         let mut total_h: u32 = 0;
         let mut max_w: u32 = 0;
         for (image, fp_w, fp_h, _) in &order {
@@ -8236,6 +8552,14 @@ impl GpuRenderer {
         } else {
             (None, 0)
         };
+        // The GL arm's twin: texels and stamp kept only while armed.
+        #[cfg(gl_arm)]
+        let (gl_texels, gl_epoch) = if self.gl_armed {
+            self.image_plane_epoch += 1;
+            (Some(data), self.image_plane_epoch)
+        } else {
+            (None, 0)
+        };
         win.image_plane = Some(ImagePlane {
             #[cfg(target_os = "macos")]
             metal_atlas: None,
@@ -8251,6 +8575,12 @@ impl GpuRenderer {
             metal_texels,
             #[cfg(target_os = "macos")]
             epoch,
+            #[cfg(gl_arm)]
+            gl_texels,
+            #[cfg(gl_arm)]
+            gl_epoch,
+            #[cfg(gl_arm)]
+            gl_atlas: None,
         });
         // Exit 4 of 4 (fall-through). `order`'s `Arc` clones are dropped here; the
         // plane pins the images it actually placed via `_pinned_images`.
@@ -8408,6 +8738,20 @@ impl GpuRenderer {
             win.video = Some(tap);
             return Ok(());
         }
+        // The GL arm records its window's stand-in (the posted bytes).
+        #[cfg(all(gl_arm, not(wgpu_arm)))]
+        if self.gl_armed && surf.gl.is_some() {
+            let tap = crate::video_tap::VideoTap::new_gl(
+                surf.neutral.width,
+                surf.neutral.height,
+                crate::device_layer::TexelFormat::Rgba8Unorm,
+                win.capture_color_space,
+                win.sdr_white_scale(),
+                opts,
+            )?;
+            win.video = Some(tap);
+            return Ok(());
+        }
         #[cfg(not(wgpu_arm))]
         {
             Err("video: the wgpu tap ring is not in this build".to_string())
@@ -8449,7 +8793,26 @@ impl GpuRenderer {
         // `metal_virtual_off` inside the virtual Submit B. A headless recording
         // may start before the first frame, so mint the arm on demand (this runs
         // on the render thread).
-        #[cfg(not(wgpu_arm))]
+        // The GL arm records the resident virtual target's bytes.
+        #[cfg(gl_arm)]
+        if self.gl_armed && self.gl_arm_ready() {
+            let tap = crate::video_tap::VideoTap::new_gl(
+                w,
+                h,
+                crate::device_layer::TexelFormat::Rgba8Unorm,
+                crate::video_tap::CaptureColorSpace::Srgb,
+                1.0,
+                opts,
+            )?;
+            win.virtual_presented_input_epoch = 0;
+            win.video = Some(tap);
+            return Ok(());
+        }
+        #[cfg(all(not(wgpu_arm), gl_arm))]
+        {
+            Err(format!("video: {}", self.gl_start_error()))
+        }
+        #[cfg(all(not(wgpu_arm), target_os = "macos"))]
         {
             if !self.metal_arm_ready() {
                 return Err(format!("video: {}", self.metal_start_error()));
@@ -8496,8 +8859,18 @@ impl GpuRenderer {
             if tap.ring_is_metal() {
                 tap.metal_after_present(t_us);
             }
+            #[cfg(gl_arm)]
+            let on_gl = tap.ring_is_gl();
+            #[cfg(all(not(gl_arm), wgpu_arm))]
+            let on_gl = false;
+            #[cfg(gl_arm)]
+            if on_gl {
+                tap.gl_after_present(t_us);
+            }
             #[cfg(wgpu_arm)]
-            tap.after_present(&self.ctx.device, t_us);
+            if !on_gl {
+                tap.after_present(&self.ctx.device, t_us);
+            }
         }
     }
 
@@ -8508,6 +8881,10 @@ impl GpuRenderer {
             #[cfg(target_os = "macos")]
             if t.ring_is_metal() {
                 return t.metal_finish();
+            }
+            #[cfg(gl_arm)]
+            if t.ring_is_gl() {
+                return t.gl_finish();
             }
             #[cfg(wgpu_arm)]
             {
@@ -8563,6 +8940,18 @@ impl GpuRenderer {
             )?);
             return Ok(());
         }
+        // The GL arm's one-shot over its window's stand-in.
+        #[cfg(all(gl_arm, not(wgpu_arm)))]
+        if self.gl_armed && surface.gl.is_some() {
+            win.presented_snapshot = Some(crate::video_tap::PresentedFrameTap::new_gl(
+                surface.neutral.width,
+                surface.neutral.height,
+                crate::device_layer::TexelFormat::Rgba8Unorm,
+                win.capture_color_space,
+                win.sdr_white_scale(),
+            )?);
+            return Ok(());
+        }
         #[cfg(not(wgpu_arm))]
         {
             Err("snapshot: the wgpu tap ring is not in this build".to_string())
@@ -8598,6 +8987,10 @@ impl GpuRenderer {
         if tap.tap_is_metal() {
             return tap.metal_after_present(t_us);
         }
+        #[cfg(gl_arm)]
+        if tap.tap_is_gl() {
+            return tap.gl_after_present(t_us);
+        }
         #[cfg(wgpu_arm)]
         {
             tap.after_present(&self.ctx.device, t_us)
@@ -8617,6 +9010,10 @@ impl GpuRenderer {
         #[cfg(target_os = "macos")]
         if tap.tap_is_metal() {
             return tap.metal_finish();
+        }
+        #[cfg(gl_arm)]
+        if tap.tap_is_gl() {
+            return tap.gl_finish();
         }
         #[cfg(wgpu_arm)]
         {
@@ -8661,10 +9058,16 @@ impl GpuRenderer {
                 "presented snapshot: virtual destination advanced before capture".to_string(),
             );
         }
+        // The GL arm reads its resident virtual target back (GL waits for
+        // the draws that made it).
+        #[cfg(gl_arm)]
+        if self.gl_armed {
+            return self.gl_virtual_snapshot(win, t_us);
+        }
         // Wgpu-free arm: a one-shot Metal tap copies the resident
         // `metal_virtual_off` on the arm's queue (waited; cold introspection),
         // through the same decode plumbing.
-        #[cfg(not(wgpu_arm))]
+        #[cfg(all(not(wgpu_arm), target_os = "macos"))]
         {
             let target = win.metal_virtual_off.as_ref().ok_or_else(|| {
                 "presented snapshot: current virtual destination is unavailable".to_string()
@@ -8698,6 +9101,10 @@ impl GpuRenderer {
             tap.metal_after_present(t_us)?;
             tap.metal_finish()?;
             tap.take()
+        }
+        #[cfg(all(not(wgpu_arm), gl_arm))]
+        {
+            Err(format!("presented snapshot: {}", self.gl_start_error()))
         }
         #[cfg(wgpu_arm)]
         {
@@ -8742,6 +9149,21 @@ impl GpuRenderer {
         tray: Option<TrayQuad<'_>>,
     ) -> Frame {
         let (texture, width, height) = self.render_input_target(win, input, tray);
+        #[cfg(gl_arm)]
+        if self.last_frame_arm_gl {
+            return self
+                .gl_read_back_offscreen(win, width, height)
+                .unwrap_or_else(|e| {
+                    crate::stderr_line!(
+                        "aterm-gpu: gl readback failed ({e}); returning blank frame"
+                    );
+                    Frame {
+                        width: width as usize,
+                        height: height as usize,
+                        pixels: vec![0; (width as usize) * (height as usize)],
+                    }
+                });
+        }
         // Armed arm: read back `win.metal_offscreen`
         // (`device_layer::metal_try_read_back`); a failure yields a blank frame,
         // like `GpuContext::read_back`.
@@ -8793,6 +9215,10 @@ impl GpuRenderer {
         tray: Option<TrayQuad<'_>>,
     ) -> Result<Frame, String> {
         let (texture, width, height) = self.render_input_target(win, input, tray);
+        #[cfg(gl_arm)]
+        if self.last_frame_arm_gl {
+            return self.gl_read_back_offscreen(win, width, height);
+        }
         // The armed arm's fallible readback (see `render_input`).
         #[cfg(target_os = "macos")]
         if self.last_frame_arm_metal {
@@ -8840,6 +9266,38 @@ impl GpuRenderer {
             pass += 1;
         }
         let (w, h) = dims;
+        // An armed GL frame: the same order as the other arms (bloom, shimmer,
+        // the glide, the tray card), each degrading by name, then the frame
+        // is read off `win.gl_offscreen`.
+        #[cfg(gl_arm)]
+        if self.last_frame_arm_gl {
+            if self.enable_bloom
+                && !input.cursor_glow_add.is_empty()
+                && let Err(e) = self.gl_composite_bloom_in_place(win, input)
+            {
+                gl_arm::gl_arm_note(&format!(
+                    "armed readback: in-place bloom failed ({e}); frame has no halo"
+                ));
+            }
+            if self.shimmer_live(input)
+                && let Err(e) = self.gl_shimmer_in_place(win, input)
+            {
+                gl_arm::gl_arm_note(&format!(
+                    "armed readback: in-place shimmer failed ({e}); frame has no refraction"
+                ));
+            }
+            if input.scroll_frac_px != 0 {
+                self.gl_shift_offscreen_band(win, input);
+            }
+            if let Some(t) = tray
+                && let Err(e) = self.gl_tray_into_offscreen(win, t)
+            {
+                gl_arm::gl_arm_note(&format!(
+                    "armed readback: tray bake failed ({e}); frame has no settings card"
+                ));
+            }
+            return (None, w, h);
+        }
         // Composite the bloom halo into the offscreen here, before the tray and
         // sub-row scroll, so readback is base + aurora + halo. Safe in place:
         // `present_prev` is invalidated, so this offscreen is never a scissor base.
@@ -8891,6 +9349,9 @@ impl GpuRenderer {
         // Bake the tray into the translated offscreen before readback, the same
         // order as on-glass presents.
         if let Some(t) = tray {
+            // The GL arm baked its card in its own branch above.
+            #[cfg(not(any(wgpu_arm, target_os = "macos")))]
+            let _ = t;
             // Armed arm: the resident Metal card composites straight-alpha
             // source-over onto the Metal offscreen, above halo and haze.
             #[cfg(target_os = "macos")]
@@ -9639,7 +10100,7 @@ impl GpuRenderer {
 
     /// Test hook: the real `metal_attach_surface` under a caller-owned parent
     /// layer.
-    #[cfg(all(target_os = "macos", test))]
+    #[cfg(all(target_os = "macos", test, wgpu_arm))]
     pub(crate) fn metal_attach_for_test(
         &mut self,
         parent: Option<&crate::metal::ffi::Obj>,
@@ -10876,7 +11337,7 @@ impl GpuRenderer {
     /// Test hook: the wgpu `present_to_view` with a translucent
     /// (PostMultiplied-shaped) destination, as when `background_opacity < 1.0`.
     /// Returns tight RGBA.
-    #[cfg(all(target_os = "macos", test))]
+    #[cfg(all(target_os = "macos", test, wgpu_arm))]
     pub(crate) fn wgpu_present_bytes_for_test(
         &mut self,
         win: &mut WindowGpu,
@@ -10952,6 +11413,10 @@ impl GpuRenderer {
         if frac == 0 {
             return;
         }
+        // The GL arm's frames shift in `render_input_target`'s GL branch
+        // (`gl_shift_offscreen_band`), which returns before this.
+        #[cfg(not(any(wgpu_arm, target_os = "macos")))]
+        let _ = win;
         // Armed frames live on the Metal offscreen: run the same `BandShift`
         // plan there.
         #[cfg(target_os = "macos")]
@@ -11002,6 +11467,26 @@ impl GpuRenderer {
     /// framebuffer, not the sub-row glide's chrome partition (`scroll_blit_plan`
     /// refuses frames that are not a rigid translation).
     fn shift_offscreen_rows(&mut self, win: &mut WindowGpu, delta_rows: i32, rows: usize) {
+        // The GL arm's resident frame (`present_prev.on_gl` admitted the
+        // rescue): shift it now; GL runs the copies before the encode's Load.
+        #[cfg(gl_arm)]
+        let on_gl = self.last_frame_arm_gl;
+        #[cfg(all(not(gl_arm), wgpu_arm))]
+        let on_gl = false;
+        #[cfg(gl_arm)]
+        if on_gl && let Some(h) = win.gl_offscreen.as_ref().map(|o| o.h as usize) {
+            let cell_h = self.cell_size().1;
+            let grid_top = self.cpu.grid_top();
+            let y0 = grid_top.min(h);
+            let y1 = grid_top.saturating_add(rows.saturating_mul(cell_h)).min(h);
+            self.gl_shift_offscreen_band_px(
+                win,
+                y0,
+                y1,
+                i64::from(delta_rows) * cell_h as i64,
+                None,
+            );
+        }
         // The rescue shifts the resident frame, which on the armed arm lives on
         // the Metal offscreen (`last_frame_arm_metal`).
         #[cfg(target_os = "macos")]
@@ -11028,7 +11513,7 @@ impl GpuRenderer {
             }
         }
         #[cfg(wgpu_arm)]
-        {
+        if !on_gl {
             let Some(h) = win.offscreen.as_ref().map(|o| o.h as usize) else {
                 return;
             };
@@ -11117,6 +11602,10 @@ impl GpuRenderer {
             crate::device_layer::SubmittedFrame::Metal(_) => {
                 unreachable!("the production scroll shift constructs the Wgpu arm only")
             }
+            #[cfg(gl_arm)]
+            crate::device_layer::SubmittedFrame::Gl(_) => {
+                unreachable!("the production scroll shift constructs the Wgpu arm only")
+            }
         }
     }
 
@@ -11126,6 +11615,7 @@ impl GpuRenderer {
     ///
     /// The swapchain format is non-sRGB (preferring `Bgra8Unorm`), so the raw
     /// offscreen bytes land on screen identical to what introspection reads.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn create_window_surface<W: WindowTarget>(
         &mut self,
         target: W,
@@ -11148,75 +11638,35 @@ impl GpuRenderer {
         // `upgrade_surface_for_screen`. Pacing is `displaySyncEnabled = NO`. An
         // attach failure is an error; the frontend falls back to the CPU
         // renderer.
-        #[cfg(not(wgpu_arm))]
+        #[cfg(all(not(wgpu_arm), target_os = "macos"))]
         {
             // Off the same handle as the parent layer, and before `target`
-            // moves: the EDR potential of the screen the window sits on.
-            let screen_edr_potential = crate::metal::present::screen_edr_potential_of(&target);
+            // moves.
+            let format = metal_attach_format(self.hdr_glow, &target);
             let _ = (target, &metal_parent); // `target`'s layer was resolved above.
             let width = self.clamp_fb_dim(width.max(1));
             let height = self.clamp_fb_dim(height.max(1));
-            let format = if crate::format_plan::hdr_swapchain_wants_f16_on_screen(
-                self.hdr_glow,
-                true,
-                screen_edr_potential,
-            ) {
-                crate::device_layer::TexelFormat::Rgba16Float
-            } else {
-                crate::device_layer::TexelFormat::Bgra8Unorm
-            };
             let parent = metal_parent
                 .as_ref()
                 .ok_or("no AppKit view layer to attach the Metal swapchain under")?;
-            if !self.metal_arm_ready() {
-                return Err(self.metal_start_error());
-            }
-            let want = crate::metal::swapchain::SwapchainConfig {
-                format: format.metal(),
-                width: width as usize,
-                height: height as usize,
-                // Taps arm COPY_SRC per present via the reconcile, exactly as
-                // the wgpu arm toggled usage — attached framebuffer-only.
-                framebuffer_only: true,
-                display_sync: false,
-                maximum_drawables: 3,
-                opaque: self.cpu.background_opacity() >= 1.0,
-            };
-            let live = self
-                .metal_arm
-                .as_mut()
-                .expect("metal_arm_ready above")
-                .live_mut();
-            let latch = Arc::clone(live.session.latch());
-            let ms = crate::metal::present::MetalWindowSurface::attached(
-                live.mint.device(),
-                parent,
-                want,
-                latch,
-            )?;
-            Ok(GpuSurface {
-                acquire_id: next_surface_acquire_id(),
-                neutral: NeutralSurfaceConfig {
-                    width,
-                    height,
-                    format,
-                },
-                supports_f16: true,
-                #[cfg(wgpu_arm)]
-                last_hdr_probe: None,
-                // CAMetalLayer composites non-opaque content (the armed
-                // translucent differential is byte-proven PostMultiplied).
-                post_mult: true,
-                #[cfg(wgpu_arm)]
-                pre_mult: false,
-                // The drawable copies once `framebufferOnly` clears — the
-                // reconcile arms it while a tap records.
-                copyable: true,
-                metal: Some(ms),
-            })
+            self.attach_metal_window_surface(parent, format, width, height)
+        }
+        // The shipped Linux build: the GL arm's EGL window surface.
+        #[cfg(all(not(wgpu_arm), gl_arm))]
+        {
+            self.gl_create_window_surface(target, width, height)
         }
         #[cfg(wgpu_arm)]
         {
+            // A build carrying both arms (Linux's `--features wgpu-oracle` lane)
+            // attaches windows on wgpu, so the window's frames must draw there too.
+            #[cfg(gl_arm)]
+            if self.gl_armed {
+                gl_arm::gl_arm_note(
+                    "a window attached on wgpu (the oracle build); GL disarmed for this renderer",
+                );
+                self.gl_armed = false;
+            }
             let surf = self.create_window_surface_wgpu(target, width, height)?;
             // Attach the first-party swapchain beside the wgpu one. A failure
             // disarms the renderer with a named note, so the window presents wgpu.
@@ -11241,15 +11691,29 @@ impl GpuRenderer {
         width: u32,
         height: u32,
     ) -> Result<GpuSurface, String> {
-        // macOS names no handle crate (`WindowTarget`), so the oracle hands wgpu
-        // the content view as an AppKit raw-window-handle.
+        // macOS and Linux name no handle crate (`WindowTarget`), so the oracle
+        // hands wgpu the content view as an AppKit raw-window-handle, or the X11
+        // or Wayland handles as theirs.
         #[cfg(target_os = "macos")]
         let target = AppKitSurfaceTarget(target);
+        #[cfg(target_os = "linux")]
+        let target = NativeSurfaceTarget(target);
         let surface = self
             .ctx
             .instance
             .create_surface(target)
             .map_err(|e| format!("create_surface failed: {e}"))?;
+        // The device was chosen before any window existed (`compatible_surface:
+        // None`), so the first surface is where an adapter that cannot present to
+        // this display shows up — e.g. NVIDIA's Vulkan ICD on a Wayland compositor
+        // it cannot share buffers with, which offers no formats at all. Say so by
+        // name; the caller falls back to the CPU renderer.
+        if !self.ctx.adapter.is_surface_supported(&surface) {
+            return Err(format!(
+                "{} ({}) cannot present to this window",
+                self.ctx.adapter_name, self.ctx.backend
+            ));
+        }
         // With `hdr_glow` on, prefer the `Rgba16Float` HDR swapchain when offered
         // (`format_plan::hdr_swapchain_wants_f16`). Queries caps per attach and
         // leaves `cached_surface_format` (the SDR pick cache) alone.
@@ -11276,8 +11740,7 @@ impl GpuRenderer {
                     // reference-white SDR).
                     alpha_mode: self.surface_alpha_mode(post_mult, pre_mult),
                     view_formats: vec![],
-                    // Same latency as the SDR paths (`default_frame_latency`,
-                    // honoring `ATERM_GPU_FRAME_LATENCY`).
+                    // Same latency as the SDR paths (`default_frame_latency`).
                     desired_maximum_frame_latency: self.desired_frame_latency(),
                 };
                 self.configure_first_attach(&surface, &config)?;
@@ -11293,7 +11756,7 @@ impl GpuRenderer {
                     }
                     return Ok(GpuSurface {
                         acquire_id: next_surface_acquire_id(),
-                        surface,
+                        surface: live_surface::LiveSurface::attached(surface),
                         config,
                         sdr_format,
                         supports_f16: true,
@@ -11369,7 +11832,7 @@ impl GpuRenderer {
         }
         Ok(GpuSurface {
             acquire_id: next_surface_acquire_id(),
-            surface,
+            surface: live_surface::LiveSurface::attached(surface),
             config,
             sdr_format: format,
             supports_f16: caps.formats.contains(&wgpu::TextureFormat::Rgba16Float),
@@ -11385,59 +11848,37 @@ impl GpuRenderer {
     }
 
     /// The first `configure` of a freshly created window surface (both attach
-    /// arms of [`Self::create_window_surface`] use it).
+    /// arms of [`Self::create_window_surface`] use it), scoped
+    /// ([`configure_scoped`]) so a rejected configure returns as `Err` instead
+    /// of panicking in wgpu's default error handler.
     ///
     /// On a DirectComposition visual instance this configure builds the
-    /// composition stack, and a failure there would reach wgpu's default error
-    /// handler, which panics. So on a visual instance the configure runs inside
-    /// error scopes (validation, internal, out-of-memory) and a captured error
-    /// returns as `Err`; the frontend then rebuilds on the opaque HWND swapchain
-    /// ([`Self::rebuild_on_fresh_context`]).
-    ///
-    /// Other instances call `configure` directly (`clamp_fb_dim` guards size
-    /// errors upstream).
+    /// composition stack, and the frontend answers its failure by rebuilding on
+    /// the opaque HWND swapchain ([`Self::rebuild_on_fresh_context`]); on any
+    /// other instance by the CPU renderer, as for any failed attach
+    /// (`clamp_fb_dim` guards size errors upstream).
     #[cfg(wgpu_arm)]
     fn configure_first_attach(
         &self,
         surface: &wgpu::Surface<'static>,
         config: &wgpu::SurfaceConfiguration,
     ) -> Result<(), String> {
-        #[cfg(not(target_arch = "wasm32"))]
-        if self.ctx.visual_swapchain {
-            let device = &self.ctx.device;
-            // An error goes to the innermost matching scope, so one scope per
-            // class, popped in reverse push order on this thread.
-            let oom = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-            let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
-            let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
-            surface.configure(device, config);
-            // The pop futures are already resolved; all three pops always run so
-            // the stack is left empty.
-            let validation = crate::block_on::block_on(validation.pop());
-            let internal = crate::block_on::block_on(internal.pop());
-            let oom = crate::block_on::block_on(oom.pop());
-            return match validation.or(internal).or(oom) {
-                None => Ok(()),
-                Some(err) => Err(format!(
-                    "DirectComposition visual swapchain configure failed: {}",
-                    // wgpu's Display is a multi-line cause tree; flatten it so
-                    // the frontend's one-line diagnostic stays one line.
-                    err.to_string()
-                        .split_whitespace()
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                )),
-            };
-        }
-        surface.configure(&self.ctx.device, config);
-        Ok(())
+        configure_scoped(&self.ctx.device, surface, config).map_err(|err| {
+            if self.ctx.visual_swapchain {
+                format!("DirectComposition visual swapchain configure failed: {err}")
+            } else {
+                format!("window surface configure failed: {err}")
+            }
+        })
     }
 
-    /// Configure the canvas surface [`crate::GpuContext::for_canvas`] created,
-    /// at the given size, with the same non-sRGB format selection as
-    /// [`create_window_surface`](Self::create_window_surface). WebGL needs the
-    /// canvas surface before the adapter, hence the two steps. No format cache
-    /// or eager blit pipeline; `present_input` ensures it lazily.
+    /// Configure the canvas surface [`crate::GpuContext::for_canvas`] made, at
+    /// `width` x `height` (clamped like every framebuffer): the canvas is
+    /// sized now, and presents compose into its stand-in and post it
+    /// (`gl::canvas`). The canvas's context is the GL arm's device. An
+    /// 8-bit opaque target with no HDR negotiation, as wgpu's WebGL2 surface
+    /// was. A surface from another context is refused before configuring its
+    /// canvas.
     #[cfg(target_arch = "wasm32")]
     pub fn configure_canvas_surface(
         &self,
@@ -11445,43 +11886,25 @@ impl GpuRenderer {
         width: u32,
         height: u32,
     ) -> Result<GpuSurface, String> {
-        let surface = surface.0;
-        let caps = surface.get_capabilities(&self.ctx.adapter);
-        let format = Self::pick_surface_format(&caps)?;
-        let post_mult = Self::caps_support_post_multiplied(&caps);
-        let pre_mult = Self::caps_support_pre_multiplied(&caps);
-        let (usage, copyable) = Self::surface_usage(&caps);
-        let config = wgpu::SurfaceConfiguration {
-            usage,
-            format,
-            // Clamp to the device limit (same helper as `resize_surface`); the web path
-            // (aterm-gpu-web) feeds `frame_size` straight in here, so this covers it too.
-            width: self.clamp_fb_dim(width),
-            height: self.clamp_fb_dim(height),
-            // Tear-free + smooth (Mailbox else Fifo); see `pick_present_mode`.
-            present_mode: Self::pick_present_mode(&caps),
-            // Opaque at the default; PostMultiplied only when offered.
-            alpha_mode: self.surface_alpha_mode(post_mult, pre_mult),
-            view_formats: vec![],
-            desired_maximum_frame_latency: self.desired_frame_latency(),
-        };
-        surface.configure(&self.ctx.device, &config);
+        if !Arc::ptr_eq(self.ctx.gl_canvas.shared(), surface.0.shared()) {
+            return Err("canvas surface belongs to a different GPU context".to_owned());
+        }
+        let width = self.clamp_fb_dim(width.max(1));
+        let height = self.clamp_fb_dim(height.max(1));
+        let canvas = crate::gl::canvas::GlCanvasSurface::new(&surface.0, width, height)?;
         Ok(GpuSurface {
             acquire_id: next_surface_acquire_id(),
-            surface,
-            config,
-            sdr_format: format,
-            // The web surface path deliberately has no platform HDR colour-space
-            // negotiation; do not manufacture a native live-upgrade probe here.
+            neutral: NeutralSurfaceConfig {
+                width,
+                height,
+                format: crate::device_layer::TexelFormat::Rgba8Unorm,
+            },
             supports_f16: false,
-            #[cfg(wgpu_arm)]
-            last_hdr_probe: None,
-            post_mult,
-            #[cfg(wgpu_arm)]
-            pre_mult,
-            copyable,
-            #[cfg(target_os = "macos")]
-            metal: None,
+            // wgpu's WebGL2 surface offered no non-opaque composite mode.
+            post_mult: false,
+            // The stand-in reads back, so the taps always have a source.
+            copyable: true,
+            gl: Some(canvas),
         })
     }
 
@@ -11503,6 +11926,7 @@ impl GpuRenderer {
     /// or a presented snapshot (which is independent of `video`). Copying from a
     /// swapchain without `COPY_SRC` is a validation panic in the present path.
     #[must_use]
+    #[cfg(any(wgpu_arm, target_os = "macos"))]
     fn tap_wants_copy_src(recording: bool, snapshot: bool) -> bool {
         recording || snapshot
     }
@@ -11574,23 +11998,26 @@ impl GpuRenderer {
 
     /// Swapchain frame-latency budget (`desired_maximum_frame_latency`) for a
     /// surface on this renderer's adapter. See [`Self::default_frame_latency`]
-    /// for the policy; this only resolves the backend and, in a development
-    /// build, the `ATERM_GPU_FRAME_LATENCY` seam.
+    /// for the policy; this only resolves the backend. wgpu further clamps to
+    /// what the swapchain supports.
     #[cfg(wgpu_arm)]
     fn desired_frame_latency(&self) -> u32 {
-        Self::frame_latency_for(
+        Self::default_frame_latency(
             cfg!(target_os = "macos"),
             self.ctx.adapter.get_info().backend == wgpu::Backend::Vulkan,
-            aterm_types::dev_seam!("ATERM_GPU_FRAME_LATENCY")
-                .and_then(|v| v.into_string().ok())
-                .as_deref(),
         )
     }
 
-    /// The default frame latency before any `ATERM_GPU_FRAME_LATENCY` override:
-    /// 2 (three swapchain images) on Metal and Vulkan, 1 elsewhere (DX12, GL).
+    /// The frame latency: 2 (three swapchain images) on Metal and Vulkan, 1
+    /// elsewhere (DX12, GL).
     ///
-    /// * Metal: see [`Self::frame_latency_for`].
+    /// * Metal: macOS has no Mailbox, the drawable pool holds latency + 1
+    ///   drawables and `nextDrawable` is unbounded. At latency 1 a repaint
+    ///   storm exhausts the pool and parks the event loop (~84ms of queued
+    ///   keystrokes measured); a third drawable keeps the acquire immediate and
+    ///   adds no latency while the pool is not exhausted. The present itself is
+    ///   `Immediate` (`pick_present_mode`); compositor-to-glass time is measured
+    ///   by `aterm_gpu::present_glass` (`present_glass_*`).
     /// * Vulkan: with two images, a second present inside one refresh has nothing
     ///   to acquire until vblank, parking the main thread in
     ///   `get_current_texture` with keystrokes queued. aterm's frames are bursty,
@@ -11598,43 +12025,9 @@ impl GpuRenderer {
     ///   glass (the clustered frame waits for the same vblank either way); on a
     ///   Mailbox surface three images cost nothing. The content pace floor and
     ///   the effect lane's panel-rate cap keep the queue from deepening.
-    #[cfg(any(wgpu_arm, test))]
+    #[cfg(wgpu_arm)]
     pub(crate) fn default_frame_latency(is_metal: bool, is_vulkan: bool) -> u32 {
         if is_metal || is_vulkan { 2 } else { 1 }
-    }
-
-    /// Pure core of `desired_frame_latency`: the default from
-    /// [`Self::default_frame_latency`], or the clamped (1..=3)
-    /// `ATERM_GPU_FRAME_LATENCY` development seam, which announces itself when it
-    /// differs from the default. wgpu further clamps to what the swapchain
-    /// supports.
-    #[cfg(any(wgpu_arm, test))]
-    pub(crate) fn frame_latency_for(is_metal: bool, is_vulkan: bool, env: Option<&str>) -> u32 {
-        // Default 2 on Metal: macOS has no Mailbox, the drawable pool holds
-        // latency + 1 drawables and `nextDrawable` is unbounded. At latency 1 a
-        // repaint storm exhausts the pool and parks the event loop; a third
-        // drawable keeps the acquire immediate and adds no latency while the pool
-        // is not exhausted. The present itself is `Immediate`
-        // (`pick_present_mode`); compositor-to-glass time is measured by
-        // `aterm_gpu::present_glass` (`present_glass_*`). Other backends: see
-        // `default_frame_latency`.
-        let default = Self::default_frame_latency(is_metal, is_vulkan);
-        let Some(raw) = env.and_then(|v| v.trim().parse::<u32>().ok()) else {
-            return default;
-        };
-        let forced = raw.clamp(1, 3);
-        // Announced, because non-default values change keystroke latency: on
-        // macOS latency 1 leaves two drawables, which a repaint storm exhausts.
-        if forced != default {
-            crate::stderr_line!(
-                "aterm-gpu: $ATERM_GPU_FRAME_LATENCY={forced} overrides the \
-                 measured default of {default}. Lower values shrink the drawable \
-                 pool and can park the event loop on nextDrawable() under a repaint \
-                 storm (~84ms of queued keystrokes measured at 1 on Metal). Unset it \
-                 to restore the shipped default."
-            );
-        }
-        forced
     }
 
     /// Pick a non-sRGB swapchain format: `Bgra8Unorm` if offered, else
@@ -11647,6 +12040,9 @@ impl GpuRenderer {
         caps: &wgpu::SurfaceCapabilities,
     ) -> Result<wgpu::TextureFormat, String> {
         use wgpu::TextureFormat::{Bgra8Unorm, Rgba8Unorm};
+        if caps.formats.is_empty() {
+            return Err("surface offers no formats: the adapter cannot present to it".to_string());
+        }
         if caps.formats.contains(&Bgra8Unorm) {
             return Ok(Bgra8Unorm);
         }
@@ -11887,13 +12283,19 @@ impl GpuRenderer {
         {
             let _ = win;
             // The retained desire moves; the armed present's reconcile rebuilds
-            // the swapchain before its acquire.
+            // the swapchain before its acquire (the GL present resizes its
+            // surface to it).
             if surf.neutral.width == w && surf.neutral.height == h {
                 return;
             }
             surf.discard_pending_acquire();
             surf.neutral.width = w;
             surf.neutral.height = h;
+            // A canvas is sized at once, as wgpu's surface configure sized it.
+            #[cfg(target_arch = "wasm32")]
+            if let Some(gs) = surf.gl.as_mut() {
+                gs.resize(w, h);
+            }
         }
         #[cfg(wgpu_arm)]
         {
@@ -11915,7 +12317,7 @@ impl GpuRenderer {
     /// Used by the armed present every frame and by
     /// [`Self::upgrade_surface_for_screen`], so an upgrade performs exactly the
     /// reconcile the next present would.
-    #[cfg(not(wgpu_arm))]
+    #[cfg(all(not(wgpu_arm), target_os = "macos"))]
     fn metal_present_want(
         &self,
         win: &WindowGpu,
@@ -11937,6 +12339,61 @@ impl GpuRenderer {
                 opaque: !translucent,
             },
         )
+    }
+
+    /// The wgpu-free attach's swapchain: the first-party `CAMetalLayer` under
+    /// `parent` at `format` and the clamped size, as [`Self::create_window_surface`]
+    /// attaches it once it has resolved the parent and picked the format.
+    #[cfg(all(not(wgpu_arm), target_os = "macos"))]
+    fn attach_metal_window_surface(
+        &mut self,
+        parent: &crate::metal::ffi::Obj,
+        format: crate::device_layer::TexelFormat,
+        width: u32,
+        height: u32,
+    ) -> Result<GpuSurface, String> {
+        if !self.metal_arm_ready() {
+            return Err(self.metal_start_error());
+        }
+        let want = crate::metal::swapchain::SwapchainConfig {
+            format: format.metal(),
+            width: width as usize,
+            height: height as usize,
+            // Taps arm COPY_SRC per present via the reconcile, exactly as
+            // the wgpu arm toggled usage — attached framebuffer-only.
+            framebuffer_only: true,
+            display_sync: false,
+            maximum_drawables: 3,
+            opaque: self.cpu.background_opacity() >= 1.0,
+        };
+        let live = self
+            .metal_arm
+            .as_mut()
+            .expect("metal_arm_ready above")
+            .live_mut();
+        let latch = Arc::clone(live.session.latch());
+        let ms = crate::metal::present::MetalWindowSurface::attached(
+            live.mint.device(),
+            parent,
+            want,
+            latch,
+        )?;
+        Ok(GpuSurface {
+            acquire_id: next_surface_acquire_id(),
+            neutral: NeutralSurfaceConfig {
+                width,
+                height,
+                format,
+            },
+            supports_f16: true,
+            // CAMetalLayer composites non-opaque content (the armed
+            // translucent differential is byte-proven PostMultiplied).
+            post_mult: true,
+            // The drawable copies once `framebufferOnly` clears — the
+            // reconcile arms it while a tap records.
+            copyable: true,
+            metal: Some(ms),
+        })
     }
 
     /// Re-pick the swapchain format for the screen the window now sits on (macOS
@@ -11963,69 +12420,26 @@ impl GpuRenderer {
     /// Returns whether the layer moved. `false` without an AppKit read for an
     /// already-f16 surface or when the gate refuses; also `false` on an SDR
     /// screen, a refused flip, off macOS, and on the wgpu-oracle arm.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn upgrade_surface_for_screen<W: WindowTarget>(
         &mut self,
         win: &mut WindowGpu,
         surf: &mut GpuSurface,
         target: &W,
     ) -> bool {
-        #[cfg(not(wgpu_arm))]
+        // GL surfaces have no f16 format to move to (`supports_f16` is false
+        // at every GL attach).
+        #[cfg(all(not(wgpu_arm), gl_arm))]
         {
-            // Cheap gates before the AppKit read: f16 surfaces and gate-refused
-            // windows return here.
-            if surf.is_hdr()
-                || !crate::format_plan::hdr_swapchain_wants_f16(self.hdr_glow, surf.supports_f16)
-            {
-                return false;
-            }
-            let screen_edr_potential = crate::metal::present::screen_edr_potential_of(target);
-            if !crate::format_plan::hdr_screen_upgrade_wants_f16(
-                self.hdr_glow,
-                surf.supports_f16,
-                surf.is_hdr(),
-                screen_edr_potential,
-            ) {
-                return false;
-            }
-            // The retained desire moves FIRST so `want` derives off it exactly
-            // as the next present would; the layer follows in the same call.
-            let previous = surf.neutral.format;
-            surf.neutral.format = crate::device_layer::TexelFormat::Rgba16Float;
-            let (_, _, want) = self.metal_present_want(win, surf);
-            let flipped = match (self.metal_arm.as_mut(), surf.metal.as_mut()) {
-                (Some(cell), Some(ms)) => {
-                    // The present's own preamble: settled presents feed the
-                    // loss latch before the reconfigure consults it.
-                    let live = cell.live_mut();
-                    live.drain_pending();
-                    let device = live.mint.device().clone_ref();
-                    // `Ok` is not a flip by itself: during an in-flight
-                    // acquisition `reconcile` only records the desire. The format
-                    // the layer now holds says whether it moved.
-                    ms.reconcile(&device, &want).and_then(|_| {
-                        if ms.config().format == want.format {
-                            Ok(())
-                        } else {
-                            Err("a drawable acquisition is in flight, so the layer was not \
-                                 reconfigured in this call"
-                                .to_owned())
-                        }
-                    })
-                }
-                (None, _) => Err("the arm is not live".to_owned()),
-                (_, None) => Err("this window has no armed swapchain".to_owned()),
-            };
-            if let Err(e) = flipped {
-                // Nothing moved: restore the held format, keep 8-bit metadata,
-                // report no upgrade.
-                surf.neutral.format = previous;
-                metal_arm_note(&format!(
-                    "screen re-pick: f16 flip refused ({e}); keeping 8-bit swapchain"
-                ));
-                return false;
-            }
-            win.apply_hdr_surface_upgrade();
-            true
+            let _ = (win, target);
+            debug_assert!(!surf.supports_f16, "a GL surface offers no f16 format");
+            surf.supports_f16 && surf.is_hdr()
+        }
+        #[cfg(all(not(wgpu_arm), target_os = "macos"))]
+        {
+            self.upgrade_surface_on_screen(win, surf, || {
+                crate::metal::present::screen_edr_potential_of(target)
+            })
         }
         #[cfg(wgpu_arm)]
         {
@@ -12034,14 +12448,81 @@ impl GpuRenderer {
         }
     }
 
+    /// [`Self::upgrade_surface_for_screen`] over the screen's EDR potential as
+    /// `read_potential` reads it, the attach's reader in production.
+    #[cfg(all(not(wgpu_arm), target_os = "macos"))]
+    fn upgrade_surface_on_screen(
+        &mut self,
+        win: &mut WindowGpu,
+        surf: &mut GpuSurface,
+        read_potential: impl FnOnce() -> Option<f32>,
+    ) -> bool {
+        // The decision reads the screen only past the cheap gates: f16 surfaces
+        // and gate-refused windows never pay the AppKit read.
+        if !crate::format_plan::hdr_screen_upgrade_decision(
+            self.hdr_glow,
+            surf.supports_f16,
+            surf.is_hdr(),
+            read_potential,
+        ) {
+            return false;
+        }
+        // The retained desire moves FIRST so `want` derives off it exactly
+        // as the next present would; the layer follows in the same call.
+        let previous = surf.neutral.format;
+        surf.neutral.format = crate::device_layer::TexelFormat::Rgba16Float;
+        let (_, _, want) = self.metal_present_want(win, surf);
+        let flipped = match (self.metal_arm.as_mut(), surf.metal.as_mut()) {
+            (Some(cell), Some(ms)) => {
+                // The present's own preamble: settled presents feed the
+                // loss latch before the reconfigure consults it.
+                let live = cell.live_mut();
+                live.drain_pending();
+                let device = live.mint.device().clone_ref();
+                // `Ok` is not a flip by itself: during an in-flight
+                // acquisition `reconcile` only records the desire. The format
+                // the layer now holds says whether it moved.
+                ms.reconcile(&device, &want).and_then(|_| {
+                    if ms.config().format == want.format {
+                        Ok(())
+                    } else {
+                        Err("a drawable acquisition is in flight, so the layer was not \
+                             reconfigured in this call"
+                            .to_owned())
+                    }
+                })
+            }
+            (None, _) => Err("the arm is not live".to_owned()),
+            (_, None) => Err("this window has no armed swapchain".to_owned()),
+        };
+        if let Err(e) = flipped {
+            // Nothing moved: restore the held format, keep 8-bit metadata,
+            // report no upgrade.
+            surf.neutral.format = previous;
+            metal_arm_note(&format!(
+                "screen re-pick: f16 flip refused ({e}); keeping 8-bit swapchain"
+            ));
+            return false;
+        }
+        win.apply_hdr_surface_upgrade();
+        true
+    }
+
     /// Configure an existing surface, keeping the invariant that f16 means a
     /// compositor-confirmed scRGB swapchain.
     ///
     /// DX12 rebuilds its swapchain on every `Surface::configure`, reverting to
-    /// the gamma-2.2 colour space, so every configure call site routes through
-    /// here (`tests/hdr_gate.rs` scans for this name). An f16 swapchain that
+    /// the gamma-2.2 colour space, so every live reconfigure routes through
+    /// here: [`live_surface::LiveSurface`] has no other configure but the SDR
+    /// escape this transaction's plan orders. An f16 swapchain that
     /// cannot be re-tagged is reconfigured to the retained SDR format before
     /// another present. No-op on SDR swapchains and off DX12.
+    ///
+    /// A configure wgpu rejects (the surface's window system gone, a lost
+    /// swapchain) latches the context's loss with its message
+    /// ([`crate::GpuContext::latch_surface_loss`]): the frontend's loss poll
+    /// then downgrades to the CPU renderer instead of presenting to a surface
+    /// wgpu refused.
     #[cfg(wgpu_arm)]
     fn configure_surface_retagging_scrgb(
         &mut self,
@@ -12050,9 +12531,19 @@ impl GpuRenderer {
         reason: &'static str,
     ) {
         let was_hdr = surf.is_hdr();
-        surf.surface.configure(&self.ctx.device, &surf.config);
         // Re-tag scRGB after the rebuild; SDR swapchains skip the platform call.
-        let scrgb_retagged = was_hdr && Self::tag_swapchain_scrgb(&surf.surface);
+        let scrgb_retagged =
+            match surf
+                .surface
+                .configure_retagging(&self.ctx.device, &surf.config, was_hdr)
+            {
+                Ok(tagged) => tagged,
+                Err(err) => {
+                    self.ctx
+                        .latch_surface_loss(format!("the {reason} configure was rejected: {err}"));
+                    return;
+                }
+            };
         self.finish_surface_color_space_recovery(
             win,
             surf,
@@ -12085,7 +12576,15 @@ impl GpuRenderer {
             );
             self.ensure_blit_pipeline(surf.sdr_format);
             surf.config.format = surf.sdr_format;
-            surf.surface.configure(&self.ctx.device, &surf.config);
+            if let Err(err) =
+                surf.surface
+                    .configure_sdr_escape(&self.ctx.device, &surf.config, plan)
+            {
+                self.ctx.latch_surface_loss(format!(
+                    "the SDR fallback configure after {reason} was rejected: {err}"
+                ));
+                return;
+            }
             // Deliberately NO `tag_swapchain_scrgb` follow-up: this configure IS
             // the SDR escape, and an 8-bit swapchain must keep the DXGI
             // gamma-2.2 default so DWM reads it as ordinary sRGB.
@@ -12120,7 +12619,7 @@ impl GpuRenderer {
             return;
         }
         if surf.is_hdr() {
-            let scrgb_retagged = Self::tag_swapchain_scrgb(&surf.surface);
+            let scrgb_retagged = surf.surface.retag();
             self.finish_surface_color_space_recovery(
                 win,
                 surf,
@@ -12135,7 +12634,7 @@ impl GpuRenderer {
         // SDR-to-HDR through this seam is Windows-only; macOS uses
         // `upgrade_surface_for_screen`, and Linux/web have no compositor HDR
         // protocol.
-        let output_hdr_enabled = Self::surface_output_hdr_enabled(&surf.surface);
+        let output_hdr_enabled = surf.surface.output_hdr_enabled();
         if !crate::format_plan::hdr_live_upgrade_wants_f16(
             self.hdr_glow,
             surf.supports_f16,
@@ -12324,11 +12823,25 @@ impl GpuRenderer {
                 effects_transport_shift_y,
             );
         }
+        // The GL arm's window present (the shipped Linux build).
+        #[cfg(all(gl_arm, not(wgpu_arm)))]
+        if self.gl_armed {
+            return self.gl_present_input_with_crop(
+                win,
+                surf,
+                input,
+                invert,
+                overlay,
+                tray,
+                source_crop,
+                effects_transport_shift_y,
+            );
+        }
         // Wgpu-free build: a disarmed renderer has no present path; refuse and
         // let the frontend's device-loss poll downgrade to CPU.
         #[cfg(not(wgpu_arm))]
         {
-            metal_arm_note("present refused: renderer disarmed, no wgpu arm in this build");
+            first_party_note("present refused: renderer disarmed, no wgpu arm in this build");
             Err(SurfacePresentFailure::Validation)
         }
         #[cfg(wgpu_arm)]
@@ -12359,6 +12872,12 @@ impl GpuRenderer {
                 self.configure_surface_retagging_scrgb(win, surf, "composite-alpha/usage change");
             }
             self.reconcile_live_hdr_state_if_due(win, surf);
+            // A configure above (or an earlier resize's) was rejected and
+            // latched the loss: acquiring from that surface would reach wgpu's
+            // error handler again. Refuse; the frontend's loss poll downgrades.
+            if self.ctx.device_lost() {
+                return Err(SurfacePresentFailure::Validation);
+            }
 
             // Acquire before any compose work, so a dropped acquire leaves the
             // offscreen and scissor state untouched. Outdated/Lost: reconfigure
@@ -13155,11 +13674,34 @@ impl GpuRenderer {
                 }
             };
         }
+        // The GL arm's headless present: GL Submit into the resident virtual
+        // target.
+        #[cfg(gl_arm)]
+        if self.gl_armed && self.gl_arm_ready() {
+            return match self.gl_present_virtual_with_crop(
+                win,
+                input,
+                invert,
+                overlay,
+                tray,
+                source_crop,
+                effects_transport_shift_y,
+                destination,
+            ) {
+                Ok(()) => true,
+                Err(e) => {
+                    gl_arm::gl_arm_note(&format!(
+                        "armed virtual present refused ({e}); dropping this present"
+                    ));
+                    false
+                }
+            };
+        }
         // Wgpu-free build: a disarmed renderer has no virtual present body, so
         // refuse (a counted drop).
         #[cfg(not(wgpu_arm))]
         {
-            metal_arm_note(
+            first_party_note(
                 "virtual present: the renderer is disarmed and this build carries \
                  no wgpu arm — dropping this present",
             );
@@ -13395,7 +13937,7 @@ impl GpuRenderer {
             )],
             immediate_size: 0,
         });
-        build_table_pipeline(device, &shader, &layout, targets, row.spec())
+        crate::pipeline_table::build_wgpu(row.spec(), device, &shader, &layout, targets)
     }
 
     /// Compute the scissored dirty-row scope for this frame against the previous
@@ -13407,16 +13949,16 @@ impl GpuRenderer {
     /// exists, the offscreen holds it at the right dims, and `compute_dirty_rows`
     /// allows reuse with a non-empty dirty set.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "AsymmetricPadLayout",
             action = "PrimeLayoutCache",
             project = "aterm_gpu::GpuRenderer::project_asymmetric_pad_layout"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "AsymmetricPadLayout",
             action = "RenderWithLayoutCache",
             project = "aterm_gpu::GpuRenderer::project_asymmetric_pad_layout"
@@ -13460,7 +14002,27 @@ impl GpuRenderer {
                 false
             }
         };
-        #[cfg(not(target_os = "macos"))]
+        // The GL arm's twin (Linux): an armed Load needs a prior frame the GL
+        // arm drew on its current device.
+        #[cfg(gl_arm)]
+        let offscreen_holds_prev = if self.gl_armed {
+            win.present_prev.as_ref().is_some_and(|p| p.on_gl)
+                && self.gl_arm.as_ref().is_some_and(|live| {
+                    matches!(&win.gl_offscreen,
+                        Some(o) if o.w == w && o.h == h && o.tex.on(&live.dev))
+                })
+        } else {
+            #[cfg(wgpu_arm)]
+            {
+                win.present_prev.as_ref().is_none_or(|p| !p.on_gl)
+                    && matches!(&win.offscreen, Some(o) if o.w == w && o.h == h)
+            }
+            #[cfg(not(wgpu_arm))]
+            {
+                false
+            }
+        };
+        #[cfg(not(any(target_os = "macos", gl_arm)))]
         let offscreen_holds_prev = matches!(&win.offscreen, Some(o) if o.w == w && o.h == h);
 
         // Take the dirty scratch and this window's prior-frame state out (swapping
@@ -13531,7 +14093,7 @@ impl GpuRenderer {
             self.scroll_rescues += 1;
             self.shift_offscreen_rows(win, delta, input.rows);
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", gl_arm))]
         let was_dirty = matches!(scope, RepaintScope::Dirty(_));
         let dims = self.encode_frame(win, input, &scope);
         // Done with the borrowed scope; restore the scratch (capacity retained).
@@ -13543,6 +14105,19 @@ impl GpuRenderer {
             metal_arm_note(
                 "armed present: mid-frame degrade under a Dirty scope — re-encoded \
                  FULL for coherence",
+            );
+            self.full_repaints += 1;
+            self.encode_frame(win, input, &RepaintScope::Full)
+        } else {
+            dims
+        };
+        // The GL twin: a Dirty encode that left the GL arm mid-frame painted
+        // over a stale base, so re-encode Full.
+        #[cfg(gl_arm)]
+        let dims = if self.gl_armed && !self.last_frame_arm_gl && was_dirty {
+            gl_arm::gl_arm_note(
+                "armed present: mid-frame degrade under a Dirty scope; re-encoded FULL for \
+                 coherence",
             );
             self.full_repaints += 1;
             self.encode_frame(win, input, &RepaintScope::Full)
@@ -13568,6 +14143,8 @@ impl GpuRenderer {
             // Record which arm's offscreen now holds this frame.
             #[cfg(target_os = "macos")]
             on_metal: self.last_frame_arm_metal,
+            #[cfg(gl_arm)]
+            on_gl: self.last_frame_arm_gl,
         });
         dims
     }
@@ -14411,6 +14988,22 @@ impl GpuRenderer {
                 }
             });
         }
+        // The GL arm (see `gl_present_readback`).
+        #[cfg(gl_arm)]
+        if self.last_frame_arm_gl {
+            return self
+                .gl_present_readback(win, input, (w, h))
+                .unwrap_or_else(|e| {
+                    crate::stderr_line!(
+                        "aterm-gpu: armed GL present readback failed ({e}); returning blank frame"
+                    );
+                    Frame {
+                        width: w as usize,
+                        height: h as usize,
+                        pixels: vec![0; (w as usize) * (h as usize)],
+                    }
+                });
+        }
         #[cfg(not(wgpu_arm))]
         {
             // Disarmed with no wgpu arm: blank frame (the helper's best-effort
@@ -14626,7 +15219,7 @@ impl GpuRenderer {
     /// The exact `BlitUniform` bytes the last present-path blit wrote, so the
     /// Metal blit differential (`crate::metal::blit`) consumes the same 112
     /// bytes rather than reconstructing them.
-    #[cfg(all(target_os = "macos", test))]
+    #[cfg(all(target_os = "macos", test, wgpu_arm))]
     pub(crate) fn last_blit_uniform_bytes(&self) -> Option<Vec<u8>> {
         self.blit_uniform_written
             .as_ref()
@@ -14850,7 +15443,7 @@ impl GpuRenderer {
     /// [`Self::blit_effect_target_for_test`] read back as tightly packed bytes in
     /// the destination format's own layout (`Bgra8Unorm` stays BGRA,
     /// `Rgba16Float` stays half floats), matching `metal::blit`'s raw readback.
-    #[cfg(all(target_os = "macos", test))]
+    #[cfg(all(target_os = "macos", test, wgpu_arm))]
     pub(crate) fn blit_effect_bytes_for_test(
         &mut self,
         win: &mut WindowGpu,
@@ -14867,7 +15460,7 @@ impl GpuRenderer {
     /// Copy mip 0 of `tex` (`w` x `h`, `texel` bytes per texel) into a mapped
     /// buffer and strip the 256-byte row padding; the shared raw readback for
     /// the wgpu arm of the Metal differentials.
-    #[cfg(all(target_os = "macos", test))]
+    #[cfg(all(target_os = "macos", test, wgpu_arm))]
     fn texture_bytes_tight_for_test(
         &self,
         tex: &wgpu::Texture,
@@ -14925,536 +15518,6 @@ impl GpuRenderer {
         drop(data);
         buffer.unmap();
         out
-    }
-
-    /// Test helper for the glyph differential: draw a fixed glyph stream through
-    /// the real glyph machinery (`self.glyph_pipeline`, the shared uniform at
-    /// group 0, a fresh R8 atlas via `atlas_bgl` and the nearest sampler at group
-    /// 1, the `GlyphInstance` layout) into a readable `OffscreenSrgb` texture,
-    /// read back as tightly packed bytes.
-    ///
-    /// `atlas` is `(coverage bytes, width, height)`, uploaded like the atlas path
-    /// does. `text_blend` drives the corrected-coverage remap through the same
-    /// uniform memo as the frame encode. Instances are neutral
-    /// [`GlyphFixtureInstance`] tuples so the Metal arm packs its own bytes.
-    #[cfg(all(target_os = "macos", test))]
-    pub(crate) fn glyph_row_bytes_for_test(
-        &mut self,
-        atlas: (&[u8], u32, u32),
-        instances: &[GlyphFixtureInstance],
-        text_blend: bool,
-        w: u32,
-        h: u32,
-    ) -> Vec<u8> {
-        assert!(
-            !instances.is_empty() && w > 0 && h > 0,
-            "an empty glyph differential compares two clears and arms nothing"
-        );
-        let (atlas_bytes, aw, ah) = atlas;
-        assert_eq!(
-            atlas_bytes.len(),
-            (aw * ah) as usize,
-            "the test atlas is aw x ah R8 coverage bytes"
-        );
-        let spec = Pipeline::Glyph.spec();
-        let format = self.ctx.pipeline_targets().resolve(spec.target);
-
-        // The test atlas: R8 coverage with `create_atlas_texture`'s shape, bound
-        // through `atlas_bgl` and the nearest sampler.
-        let atlas_tex = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("aterm-gpu test glyph atlas"),
-            size: wgpu::Extent3d {
-                width: aw,
-                height: ah,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        self.ctx.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &atlas_tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            atlas_bytes,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(aw),
-                rows_per_image: Some(ah),
-            },
-            wgpu::Extent3d {
-                width: aw,
-                height: ah,
-                depth_or_array_layers: 1,
-            },
-        );
-        let atlas_view = atlas_tex.create_view(&wgpu::TextureViewDescriptor::default());
-        let atlas_bind = self
-            .ctx
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("aterm-gpu test glyph atlas bg"),
-                layout: &self.atlas_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&atlas_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                    },
-                ],
-            });
-
-        let dst = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("aterm-gpu test glyph dst (offscreen stand-in)"),
-            size: wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
-
-        // The real shared uniform buffer and memo, keyed on the text-blend mode
-        // as the frame encode keys it.
-        let tb = u32::from(text_blend);
-        if self.uniform_written != Some((w, h, tb)) {
-            self.ctx.queue.write_buffer(
-                &self.uniform_buf,
-                0,
-                aterm_bits::bytes_of(&Uniforms {
-                    screen: [w as f32, h as f32],
-                    text_blend: tb as f32,
-                    _pad: 0.0,
-                }),
-            );
-            self.uniform_written = Some((w, h, tb));
-        }
-
-        let insts: Vec<GlyphInstance> = instances
-            .iter()
-            .map(|&(rect, uv, color, bg)| GlyphInstance {
-                rect,
-                uv,
-                color,
-                bg,
-            })
-            .collect();
-        let bytes: &[u8] = aterm_bits::cast_slice(&insts);
-        let buf = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("aterm-gpu test glyph instances"),
-            size: bytes.len() as u64,
-            usage: wgpu::BufferUsages::VERTEX,
-            mapped_at_creation: true,
-        });
-        buf.slice(..).get_mapped_range_mut().copy_from_slice(bytes);
-        buf.unmap();
-
-        let mut enc = self
-            .ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("aterm-gpu test glyph draw"),
-            });
-        {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("aterm-gpu test glyph pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &dst_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        // Opaque black, the Metal arm's ClearColor twin.
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.glyph_pipeline);
-            pass.set_bind_group(0, &self.uniform_bg, &[]);
-            pass.set_bind_group(1, &atlas_bind, &[]);
-            pass.set_vertex_buffer(0, buf.slice(..));
-            pass.draw(0..6, 0..insts.len() as u32);
-        }
-        self.ctx.queue.submit([enc.finish()]);
-        self.texture_bytes_tight_for_test(&dst, w, h, 4)
-    }
-
-    /// Test helper for the colour-glyph differential: like the glyph helper but
-    /// through `self.color_glyph_pipeline` with a fresh RGBA atlas.
-    ///
-    /// `atlas` is `(rgba bytes, width, height)`. `fs_glyph_color` samples
-    /// straight RGBA, so the atlas carries the colour and the instance `color` is
-    /// inert. Instances are neutral fixture tuples.
-    #[cfg(all(target_os = "macos", test))]
-    pub(crate) fn color_glyph_row_bytes_for_test(
-        &mut self,
-        atlas: (&[u8], u32, u32),
-        instances: &[GlyphFixtureInstance],
-        w: u32,
-        h: u32,
-    ) -> Vec<u8> {
-        assert!(
-            !instances.is_empty() && w > 0 && h > 0,
-            "an empty colour-glyph differential compares two clears and arms nothing"
-        );
-        let (atlas_bytes, aw, ah) = atlas;
-        assert_eq!(
-            atlas_bytes.len(),
-            (aw * ah * 4) as usize,
-            "the test atlas is aw x ah RGBA texels"
-        );
-        let spec = Pipeline::ColorGlyph.spec();
-        let format = self.ctx.pipeline_targets().resolve(spec.target);
-
-        // The RGBA test atlas, shaped like the colour arm of
-        // `create_atlas_texture`.
-        let atlas_tex = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("aterm-gpu test colour atlas"),
-            size: wgpu::Extent3d {
-                width: aw,
-                height: ah,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        self.ctx.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &atlas_tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            atlas_bytes,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(aw * 4),
-                rows_per_image: Some(ah),
-            },
-            wgpu::Extent3d {
-                width: aw,
-                height: ah,
-                depth_or_array_layers: 1,
-            },
-        );
-        let atlas_view = atlas_tex.create_view(&wgpu::TextureViewDescriptor::default());
-        let atlas_bind = self
-            .ctx
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("aterm-gpu test colour atlas bg"),
-                layout: &self.atlas_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&atlas_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                    },
-                ],
-            });
-
-        let dst = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("aterm-gpu test colour-glyph dst (offscreen stand-in)"),
-            size: wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
-
-        if self.uniform_written != Some((w, h, 0)) {
-            self.ctx.queue.write_buffer(
-                &self.uniform_buf,
-                0,
-                aterm_bits::bytes_of(&Uniforms {
-                    screen: [w as f32, h as f32],
-                    text_blend: 0.0,
-                    _pad: 0.0,
-                }),
-            );
-            self.uniform_written = Some((w, h, 0));
-        }
-
-        let insts: Vec<GlyphInstance> = instances
-            .iter()
-            .map(|&(rect, uv, color, bg)| GlyphInstance {
-                rect,
-                uv,
-                color,
-                bg,
-            })
-            .collect();
-        let bytes: &[u8] = aterm_bits::cast_slice(&insts);
-        let buf = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("aterm-gpu test colour-glyph instances"),
-            size: bytes.len() as u64,
-            usage: wgpu::BufferUsages::VERTEX,
-            mapped_at_creation: true,
-        });
-        buf.slice(..).get_mapped_range_mut().copy_from_slice(bytes);
-        buf.unmap();
-
-        let mut enc = self
-            .ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("aterm-gpu test colour-glyph draw"),
-            });
-        {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("aterm-gpu test colour-glyph pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &dst_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        // Opaque black, the Metal arm's ClearColor twin.
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.color_glyph_pipeline);
-            pass.set_bind_group(0, &self.uniform_bg, &[]);
-            pass.set_bind_group(1, &atlas_bind, &[]);
-            pass.set_vertex_buffer(0, buf.slice(..));
-            pass.draw(0..6, 0..insts.len() as u32);
-        }
-        self.ctx.queue.submit([enc.finish()]);
-        self.texture_bytes_tight_for_test(&dst, w, h, 4)
-    }
-
-    /// Test helper for the deco differential: draw a deco_over stream then a
-    /// deco_add stream into one offscreen-shaped texture, over through its sRGB
-    /// view (linear-light alpha blend) and add through its Unorm view (One/One,
-    /// RGB-only mask), via the demand-built pipelines, real uniforms and a fresh
-    /// R8 atlas. Read back as tightly packed Unorm storage bytes.
-    #[cfg(all(target_os = "macos", test))]
-    pub(crate) fn deco_rows_bytes_for_test(
-        &mut self,
-        atlas: (&[u8], u32, u32),
-        over: &[GlyphFixtureInstance],
-        add: &[GlyphFixtureInstance],
-        w: u32,
-        h: u32,
-    ) -> Vec<u8> {
-        assert!(
-            !over.is_empty() && !add.is_empty() && w > 0 && h > 0,
-            "an empty deco differential leaves an axis unarmed"
-        );
-        let (atlas_bytes, aw, ah) = atlas;
-        assert_eq!(
-            atlas_bytes.len(),
-            (aw * ah) as usize,
-            "the test atlas is aw x ah R8 coverage bytes"
-        );
-        // The REAL lazy build path (a frame with sparkle words does this).
-        self.effects
-            .ensure(&self.ctx.device, EffectPipeline::DecoOver);
-        self.effects
-            .ensure(&self.ctx.device, EffectPipeline::DecoAdd);
-
-        // The R8 atlas, as `glyph_row_bytes_for_test` builds it.
-        let atlas_tex = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("aterm-gpu test deco atlas"),
-            size: wgpu::Extent3d {
-                width: aw,
-                height: ah,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        self.ctx.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &atlas_tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            atlas_bytes,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(aw),
-                rows_per_image: Some(ah),
-            },
-            wgpu::Extent3d {
-                width: aw,
-                height: ah,
-                depth_or_array_layers: 1,
-            },
-        );
-        let atlas_view = atlas_tex.create_view(&wgpu::TextureViewDescriptor::default());
-        let atlas_bind = self
-            .ctx
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("aterm-gpu test deco atlas bg"),
-                layout: &self.atlas_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&atlas_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                    },
-                ],
-            });
-
-        // One texture, two typed views (`offscreen_texture`), plus `COPY_SRC` for
-        // the readback.
-        let dst = self.ctx.offscreen_texture(w, h);
-        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
-        let dst_view_srgb = dst.create_view(&wgpu::TextureViewDescriptor {
-            format: Some(self.ctx.offscreen_srgb_view_format()),
-            ..Default::default()
-        });
-
-        if self.uniform_written != Some((w, h, 0)) {
-            self.ctx.queue.write_buffer(
-                &self.uniform_buf,
-                0,
-                aterm_bits::bytes_of(&Uniforms {
-                    screen: [w as f32, h as f32],
-                    text_blend: 0.0,
-                    _pad: 0.0,
-                }),
-            );
-            self.uniform_written = Some((w, h, 0));
-        }
-
-        let mk_buf = |label: &'static str, fixtures: &[GlyphFixtureInstance]| {
-            let insts: Vec<GlyphInstance> = fixtures
-                .iter()
-                .map(|&(rect, uv, color, bg)| GlyphInstance {
-                    rect,
-                    uv,
-                    color,
-                    bg,
-                })
-                .collect();
-            let bytes: &[u8] = aterm_bits::cast_slice(&insts);
-            let buf = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size: bytes.len() as u64,
-                usage: wgpu::BufferUsages::VERTEX,
-                mapped_at_creation: true,
-            });
-            buf.slice(..).get_mapped_range_mut().copy_from_slice(bytes);
-            buf.unmap();
-            buf
-        };
-        let over_buf = mk_buf("aterm-gpu test deco-over instances", over);
-        let add_buf = mk_buf("aterm-gpu test deco-add instances", add);
-
-        let mut enc = self
-            .ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("aterm-gpu test deco draw"),
-            });
-        {
-            // Pass 1 — row 9 on the sRGB VIEW: linear-light source-over.
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("aterm-gpu test deco-over pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &dst_view_srgb,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        // Fractional clear alpha (0.25, matching the Metal arm)
-                        // so a wrong alpha write mask is visible; at 1.0 the
-                        // alpha plane saturates and hides it.
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.0,
-                            g: 0.0,
-                            b: 0.0,
-                            a: 0.25,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(self.effects.get(EffectPipeline::DecoOver));
-            pass.set_bind_group(0, &self.uniform_bg, &[]);
-            pass.set_bind_group(1, &atlas_bind, &[]);
-            pass.set_vertex_buffer(0, over_buf.slice(..));
-            pass.draw(0..6, 0..over.len() as u32);
-        }
-        {
-            // Pass 2 — row 10 on the UNORM view of the SAME storage: raw
-            // One/One add over the bytes pass 1 just stored.
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("aterm-gpu test deco-add pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &dst_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(self.effects.get(EffectPipeline::DecoAdd));
-            pass.set_bind_group(0, &self.uniform_bg, &[]);
-            pass.set_bind_group(1, &atlas_bind, &[]);
-            pass.set_vertex_buffer(0, add_buf.slice(..));
-            pass.draw(0..6, 0..add.len() as u32);
-        }
-        self.ctx.queue.submit([enc.finish()]);
-        self.texture_bytes_tight_for_test(&dst, w, h, 4)
     }
 
     /// Test helper for the HDR clamp laws: run the real present-path encode, then
@@ -15701,12 +15764,12 @@ impl GpuRenderer {
         if self.blit_pipelines.contains_key(&format) {
             return;
         }
-        let pipeline = build_table_pipeline(
+        let pipeline = crate::pipeline_table::build_wgpu(
+            Pipeline::Blit.spec(),
             &self.ctx.device,
             &self.blit_shader,
             &self.blit_layout,
             self.ctx.pipeline_targets().with_present(format),
-            Pipeline::Blit.spec(),
         );
         self.blit_pipelines.insert(format, pipeline);
     }
@@ -15719,12 +15782,12 @@ impl GpuRenderer {
         if self.tray_pipelines.contains_key(&format) {
             return;
         }
-        let pipeline = build_table_pipeline(
+        let pipeline = crate::pipeline_table::build_wgpu(
+            Pipeline::Tray.spec(),
             &self.ctx.device,
             &self.tray_shader,
             &self.tray_layout,
             self.ctx.pipeline_targets().with_present(format),
-            Pipeline::Tray.spec(),
         );
         self.tray_pipelines.insert(format, pipeline);
     }
@@ -15966,16 +16029,16 @@ impl GpuRenderer {
     /// [`render_input`](Self::render_input), caches the frame with this input's
     /// state, and returns a borrow of it.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "AsymmetricPadLayout",
             action = "PrimeLayoutCache",
             project = "aterm_gpu::GpuRenderer::project_asymmetric_pad_layout"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "AsymmetricPadLayout",
             action = "RenderWithLayoutCache",
             project = "aterm_gpu::GpuRenderer::project_asymmetric_pad_layout"
@@ -16142,6 +16205,8 @@ impl GpuRenderer {
         let texture = Arc::new(SpriteTex {
             #[cfg(target_os = "macos")]
             metal_atlas: std::sync::OnceLock::new(),
+            #[cfg(gl_arm)]
+            gl_atlas: std::sync::Mutex::new(None),
             #[cfg(wgpu_arm)]
             bind,
             w: src.width,
@@ -16221,16 +16286,16 @@ impl GpuRenderer {
     /// gated by [`should_slice`]. `tests/conformance_gpuencode.rs` drives that
     /// decision; the `project_bg_encode` projection is named, not executed.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "gpu_encode",
             action = "Append",
             project = "aterm_gpu::renderer::project_bg_encode"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "gpu_encode",
             action = "Encode",
             project = "aterm_gpu::renderer::project_bg_encode"
@@ -16247,6 +16312,10 @@ impl GpuRenderer {
         // drops it (a degrade re-encodes Full).
         #[cfg(target_os = "macos")]
         let pending_band_shift = self.metal_pending_band_shift.take();
+        #[cfg(gl_arm)]
+        {
+            self.last_frame_arm_gl = false;
+        }
         // Bound the shared shaping/glyph caches: the GPU path never goes through
         // `Renderer::render_input_cached`, the CPU's only eviction point.
         self.cpu.evict_caches_if_large();
@@ -16600,6 +16669,10 @@ impl GpuRenderer {
             }
             armed
         };
+        // The GL arm draws this frame when armed; minted here, before the
+        // atlas borrows.
+        #[cfg(gl_arm)]
+        let gl_armed = self.gl_arm_ready();
         // The inline-image texture (`&mut self`, so before the atlas borrows).
         // Drops any prior plane on image-free frames.
         self.build_image_plane(win, input);
@@ -16711,8 +16784,9 @@ impl GpuRenderer {
         // carries one selection per pane with its own colours and focus.
         // Captured before the loop, where `self.cpu` is borrowed.
         let selection_palette = self.cpu.selection_palette(input);
-        // Per-cell minimum-contrast floor from the CPU face (`<= 1.0` is off).
-        let min_contrast = self.cpu.minimum_contrast();
+        // Per-cell minimum-contrast floor from the CPU face: the effective floor
+        // (configured, raised under glass; `<= 1.0` is off).
+        let min_contrast = self.cpu.effective_minimum_contrast();
         // A cell's selection read for the glyph and combining loops: whether a
         // selection paints it, its colours, and the fill under its ink (the
         // selection band, else the cell bg), the corrected-coverage luminance
@@ -18389,6 +18463,53 @@ impl GpuRenderer {
             input,
             cursor_opaque,
         );
+        // The GL tail (Linux, `gl_arm.rs`): the same instance bytes, plan and
+        // rig law on the GL arm. A failure takes one named note and falls
+        // through: to the wgpu tail where one is compiled (the oracle build),
+        // else to the lost frame below.
+        #[cfg(gl_arm)]
+        if gl_armed {
+            let live = self.gl_arm.as_mut().expect("gl_arm_ready minted it");
+            let tail = gl_arm::encode_tail(
+                live,
+                win,
+                &mut self.frame_plan,
+                gl_arm::GlTailIn {
+                    inst: &self.inst,
+                    mono: mono_res,
+                    color: color_res,
+                    atlas_epoch: self.atlas_epoch,
+                    deco: self.deco_atlas.as_ref(),
+                    scope,
+                    dirty_band,
+                    grid_top,
+                    ch,
+                    rows,
+                    dims: (w, h),
+                    clear: theme_color_alpha(frame_bg, f64::from(bg_opacity)),
+                    text_blend,
+                    cursor_opaque,
+                },
+            );
+            match tail {
+                Ok(out) => {
+                    self.last_frame_passes = out.passes as u32;
+                    self.last_frame_load = out.load0;
+                    self.last_frame_scissor = out.scissor;
+                    self.record_frame_instance_totals();
+                    self.last_frame_arm_gl = true;
+                    return (w, h);
+                }
+                Err(e) => gl_arm::gl_arm_note(&format!(
+                    "armed frame failed ({e}); {}",
+                    if cfg!(wgpu_arm) {
+                        "this frame draws on wgpu"
+                    } else {
+                        "this frame is lost"
+                    }
+                )),
+            }
+        }
         // The armed Metal tail. Everything above (instance building, atlas
         // packing, plan inputs) is shared; here the arms fork. The armed arm
         // stages the same instance bytes on its shared `MTLBuffer`s, builds the
@@ -18843,9 +18964,14 @@ impl GpuRenderer {
         // `encode_present_frame` re-encodes a Dirty scope Full, and
         // `present_prev.on_metal` cannot claim an offscreen this frame never
         // reached. The frontend's device-loss poll owns the downgrade to CPU.
+        // (On the GL arm `last_frame_arm_gl` was reset at the top of the
+        // encode and is set only by a GL tail that drew.)
         #[cfg(not(wgpu_arm))]
         {
-            self.last_frame_arm_metal = false;
+            #[cfg(target_os = "macos")]
+            {
+                self.last_frame_arm_metal = false;
+            }
             (w, h)
         }
         #[cfg(wgpu_arm)]
@@ -18984,7 +19110,8 @@ impl GpuRenderer {
             // on pass 0, one dirty-band scissor per pass, bind group 0 once,
             // rebinds only on change), feeding `coalesce_frame_passes` and
             // driving the backend through `device_layer::FrameEncoder`.
-            // `effects_free_frame_is_a_single_pass` pins the quiet frame.
+            // `frame_passes_coalesce_maximally_without_reordering` pins the
+            // pass count, the quiet single-pass frame included.
 
             // Build the plan (reusing the retained Vec's capacity), resolve the
             // wgpu arm's objects and run the shared ladder.
@@ -19040,6 +19167,10 @@ impl GpuRenderer {
                 crate::device_layer::SubmittedFrame::Wgpu => {}
                 #[cfg(target_os = "macos")]
                 crate::device_layer::SubmittedFrame::Metal(_) => {
+                    unreachable!("the production encode constructs the Wgpu arm only")
+                }
+                #[cfg(gl_arm)]
+                crate::device_layer::SubmittedFrame::Gl(_) => {
                     unreachable!("the production encode constructs the Wgpu arm only")
                 }
             }
@@ -19304,18 +19435,19 @@ fn theme_color_alpha(c: u32, a: f64) -> crate::device_layer::ClearColor4 {
 /// One present differential's result: the wgpu arm's presented RGBA, the
 /// Metal arm's, the destination extent, and which optional passes
 /// `[bloom, shimmer, tray]` encoded (the non-vacuity report).
-#[cfg(all(target_os = "macos", test))]
+#[cfg(all(target_os = "macos", test, wgpu_arm))]
 pub(crate) type PresentDifferential = (Vec<u8>, Vec<u8>, (u32, u32), [bool; 3]);
 
 /// The Metal present replay's yield: the drawable's bytes as tight RGBA plus
 /// the `[bloom, shimmer, tray]` armed report.
-#[cfg(all(target_os = "macos", test))]
+#[cfg(all(target_os = "macos", test, wgpu_arm))]
 pub(crate) type PresentReplay = (Vec<u8>, [bool; 3]);
 
 #[cfg(all(target_os = "macos", test))]
 impl GpuRenderer {
     /// The streams (with their pipes) the most recent frame's plan drew, so
     /// differential fixtures can prove they drive the rows they claim.
+    #[cfg(wgpu_arm)]
     pub(crate) fn last_frame_plan_streams_for_test(&self) -> Vec<(StreamId, DrawPipe)> {
         self.frame_plan
             .iter()
@@ -19325,11 +19457,13 @@ impl GpuRenderer {
 
     /// The recorded pass-0 load op — so a fixture can PROVE it exercised the
     /// scissored `Load` path rather than assuming the dirty diff engaged.
+    #[cfg(wgpu_arm)]
     pub(crate) fn last_frame_load_for_test(&self) -> crate::device_layer::FrameLoad {
         self.last_frame_load
     }
 
     /// The recorded per-pass scissor — `None` == a full-frame encode.
+    #[cfg(wgpu_arm)]
     pub(crate) fn last_frame_scissor_for_test(&self) -> Option<(u32, u32, u32, u32)> {
         self.last_frame_scissor
     }
@@ -19342,6 +19476,7 @@ impl GpuRenderer {
     /// bind plumbing, view aliasing, load/clear, scissors, copies, sampling and
     /// shader twins are independent per arm. Bloom and shimmer must be off:
     /// they are present-time layers outside the encode plan.
+    #[cfg(wgpu_arm)]
     pub(crate) fn frame_differential_for_test(
         &mut self,
         win: &mut WindowGpu,
@@ -19363,6 +19498,7 @@ impl GpuRenderer {
     /// `FrameLoad::Load` plan (the pre-encode offscreen readback), uploaded
     /// into the fresh Metal offscreen first. A `Load` replay without a seed is
     /// refused by assert; a `Clear` replay needs none.
+    #[cfg(wgpu_arm)]
     pub(crate) fn metal_replay_recorded_plan_for_test(
         &mut self,
         win: &WindowGpu,
@@ -19582,12 +19718,24 @@ impl GpuRenderer {
                         &src.rgba[..(src.width * src.height * 4) as usize],
                     )
                 }
-                DrawAtlas::Deco | DrawAtlas::Image => {
-                    return Err(format!(
-                        "W4 differential fixture reached {a:?} — deco rows are the W3 \
-                         differential's and image planes are W5+; keep fixtures inside \
-                         the sweep"
-                    ));
+                DrawAtlas::Deco => {
+                    let d = self
+                        .deco_atlas
+                        .as_ref()
+                        .expect("plan samples the deco atlas");
+                    (
+                        TexelFormat::R8Unorm,
+                        d.atlas_w as u32,
+                        d.ch as u32,
+                        &d.data[..],
+                    )
+                }
+                DrawAtlas::Image => {
+                    return Err(
+                        "W4 differential fixture reached the image plane (W5+); keep \
+                         fixtures inside the sweep"
+                            .to_string(),
+                    );
                 }
             };
             let bpp = format.bytes_per_texel();
@@ -19759,6 +19907,7 @@ impl GpuRenderer {
     /// Asserted preconditions: shimmer phase pinned
     /// (`set_shimmer_phase_for_test`) and SDR crown boost 0
     /// (`set_sdr_glow_boost(0.0)`), since the SDR envelope is wall-clock driven.
+    #[cfg(wgpu_arm)]
     pub(crate) fn present_differential_for_test(
         &mut self,
         win: &mut WindowGpu,
@@ -19844,6 +19993,7 @@ impl GpuRenderer {
         reason = "the whole present replay reads as one §2 Submit B transcript; \
                   splitting it would scatter the pass order the map pins"
     )]
+    #[cfg(wgpu_arm)]
     pub(crate) fn metal_present_replay_for_test(
         &mut self,
         input: &RenderInput,
@@ -20287,6 +20437,7 @@ impl GpuRenderer {
 
     /// A texture of `format` seeded with `bytes` (tight stride), usable as a
     /// `LoadOp::Load` render target and readback source.
+    #[cfg(wgpu_arm)]
     fn seeded_target_for_test(
         &self,
         format: wgpu::TextureFormat,
@@ -20336,6 +20487,7 @@ impl GpuRenderer {
     }
 
     /// A vertex buffer holding `bytes` (test stream).
+    #[cfg(wgpu_arm)]
     fn stream_buffer_for_test(&self, bytes: &[u8]) -> wgpu::Buffer {
         let buf = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("aterm-gpu test stream"),
@@ -20358,6 +20510,7 @@ impl GpuRenderer {
         clippy::too_many_arguments,
         reason = "the crown fixture states screen geometry, boost and headroom explicitly"
     )]
+    #[cfg(wgpu_arm)]
     pub(crate) fn crown_row_bytes_for_test(
         &mut self,
         hdr: bool,
@@ -20469,155 +20622,12 @@ mod tests {
 
     // The group -> view map under test is the production `super::GROUP_SRGB`
     // (the array `encode_frame` hands the coalescer), never a copy.
+    #[cfg(wgpu_arm)]
     use super::{
-        DrawAtlas, DrawItem, DrawPipe, FramePlanCtx, STREAM_COUNT, StreamId, build_frame_plan,
+        EFFECT_PIPELINE_COUNT, EFFECT_PIPELINE_NAMES, EffectPipeline, Instances,
+        frame_effect_pipelines,
     };
-    use super::{
-        EFFECT_PIPELINE_COUNT, EFFECT_PIPELINE_NAMES, EFFECT_PIPELINES, EffectPipeline,
-        FRAME_GROUPS, G_BASE_BG, G_BASE_FG, G_CURSOR, G_FREE_OVER, G_GLOW, G_GLOW_UNDER,
-        G_WDECO_ADD, G_WDECO_OVER, GROUP_SRGB, Instances, WindowGpu, frame_effect_pipelines,
-    };
-
-    /// A [`FramePlanCtx`] with every optional resource present — the
-    /// everything-on frame the order-law tests start from.
-    const fn ctx_all() -> FramePlanCtx {
-        FramePlanCtx {
-            has_image_plane: true,
-            has_deco: true,
-            has_rain: true,
-            has_cat: true,
-            has_free: true,
-            has_wallpaper: true,
-            cursor_opaque: true,
-        }
-    }
-
-    /// Draw-order law: with every stream non-empty and every guard satisfied,
-    /// `build_frame_plan` emits all 31 streams once each, in the pinned order,
-    /// with each draw's pipeline and atlas. A reorder is a composition change
-    /// on both backends (add and over do not commute).
-    #[test]
-    fn the_frame_plan_states_the_draw_order_law() {
-        let counts: [Option<u32>; STREAM_COUNT] = [Some(1); STREAM_COUNT];
-        let mut plan = Vec::new();
-        build_frame_plan(&mut plan, &counts, ctx_all());
-        use DrawAtlas as A;
-        use DrawPipe as P;
-        use StreamId as S;
-        #[rustfmt::skip]
-        let want: [(usize, S, P, Option<A>); 31] = [
-            (G_BASE_BG, S::Wallpaper, P::Wallpaper, Some(A::Wallpaper)),
-            (G_BASE_BG, S::Bg, P::Bg, None),
-            (G_BASE_BG, S::ImageBelowBg, P::Color, Some(A::Image)),
-            (G_BASE_BG, S::ImageBgCover, P::Bg, None),
-            (G_BASE_BG, S::RainUnder, P::RainUnder, Some(A::Rain)),
-            (G_BASE_BG, S::CatOver, P::CatOver, Some(A::Cat)),
-            (G_BASE_BG, S::FreeUnder, P::FreeUnder, Some(A::Free)),
-            (G_BASE_BG, S::Trail, P::Bg, None),
-            (G_GLOW_UNDER, S::GlowUnder, P::GlowAdd, None),
-            (G_GLOW_UNDER, S::FireAdd, P::FireAdd, None),
-            (G_GLOW_UNDER, S::FireOver, P::FireOver, None),
-            (G_BASE_FG, S::ImageUnder, P::Color, Some(A::Image)),
-            (G_BASE_FG, S::GlyphHalo, P::DecoOver, Some(A::Mono)),
-            (G_BASE_FG, S::Glyph, P::Glyph, Some(A::Mono)),
-            (G_BASE_FG, S::Color, P::Color, Some(A::Color)),
-            (G_BASE_FG, S::Image, P::Color, Some(A::Image)),
-            (G_BASE_FG, S::Deco, P::Bg, None),
-            (G_BASE_FG, S::Curl, P::DecoOver, Some(A::Deco)),
-            (G_GLOW, S::GlowAdd, P::GlowAdd, None),
-            (G_GLOW, S::GlowHalo, P::RainGlow, None),
-            (G_GLOW, S::GlowHaloOver, P::RainGlowOver, None),
-            (G_GLOW, S::NovaAdd, P::GlowAdd, None),
-            (G_GLOW, S::RainAdd, P::RainGlow, None),
-            (G_GLOW, S::RainAddOver, P::RainGlowOver, None),
-            (G_WDECO_OVER, S::WdecoOver, P::DecoOver, Some(A::Deco)),
-            (G_WDECO_ADD, S::WdecoAdd, P::DecoAdd, Some(A::Deco)),
-            (G_FREE_OVER, S::FreeOver, P::FreeOver, Some(A::Free)),
-            (G_CURSOR, S::CursorBlock, P::Bg, None),
-            (G_CURSOR, S::CursorGlyph, P::Glyph, Some(A::Mono)),
-            (G_CURSOR, S::CursorColor, P::Color, Some(A::Color)),
-            (G_CURSOR, S::Cursor, P::Bg, None),
-        ];
-        assert_eq!(plan.len(), want.len(), "31 streams, one draw each");
-        for (item, (group, stream, pipe, atlas)) in plan.iter().zip(want) {
-            assert_eq!(
-                (
-                    item.group as usize,
-                    item.stream,
-                    item.pipe,
-                    item.atlas,
-                    item.count
-                ),
-                (group, stream, pipe, atlas, 1),
-                "draw-order law broken at {stream:?}"
-            );
-        }
-        // The translucent-cursor arm: only the two FILL draws switch pipe.
-        let mut translucent = ctx_all();
-        translucent.cursor_opaque = false;
-        build_frame_plan(&mut plan, &counts, translucent);
-        let fills: Vec<DrawPipe> = plan
-            .iter()
-            .filter(|it| matches!(it.stream, S::CursorBlock | S::Cursor))
-            .map(|it| it.pipe)
-            .collect();
-        assert_eq!(fills, [P::CursorBlend, P::CursorBlend]);
-        assert!(
-            plan.iter()
-                .filter(|it| matches!(it.stream, S::CursorGlyph | S::CursorColor))
-                .all(|it| matches!(it.pipe, P::Glyph | P::Color)),
-            "the cut-out draws never switch with cursor opacity"
-        );
-    }
-
-    /// Plan gates: a non-empty stream whose group gate fails vanishes (free
-    /// sprites with no atlas), image streams without a plane vanish, and atlas
-    /// tags are independent of draws (`rain_under` with no rain bind).
-    #[test]
-    fn the_frame_plan_gates_match_the_pre_plan_enabled_terms() {
-        let mut counts: [Option<u32>; STREAM_COUNT] = [None; STREAM_COUNT];
-        counts[StreamId::Bg as usize] = Some(3);
-        counts[StreamId::FreeOver as usize] = Some(2);
-        counts[StreamId::ImageUnder as usize] = Some(2);
-        counts[StreamId::Image as usize] = Some(2);
-        counts[StreamId::ImageBelowBg as usize] = Some(2);
-        counts[StreamId::RainUnder as usize] = Some(4);
-        counts[StreamId::Curl as usize] = Some(1);
-        counts[StreamId::WdecoOver as usize] = Some(1);
-        counts[StreamId::WdecoAdd as usize] = Some(1);
-        let mut plan = Vec::new();
-        build_frame_plan(
-            &mut plan,
-            &counts,
-            FramePlanCtx {
-                has_image_plane: false,
-                has_deco: false,
-                has_rain: false,
-                has_cat: false,
-                has_free: false,
-                has_wallpaper: false,
-                cursor_opaque: true,
-            },
-        );
-        let ids: Vec<StreamId> = plan.iter().map(|it| it.stream).collect();
-        assert_eq!(
-            ids,
-            [StreamId::Bg, StreamId::RainUnder],
-            "every guarded stream must vanish exactly as the old enabled terms said"
-        );
-        let rain = plan
-            .iter()
-            .find(|it| it.stream == StreamId::RainUnder)
-            .expect("just asserted");
-        assert_eq!(
-            rain.atlas, None,
-            "an atlas-less sprite stream still draws (the old `bind.map(..)` arm) \
-             but tags no atlas bind"
-        );
-        // Sanity on the plan artifact itself.
-        let item: DrawItem = plan[0];
-        assert_eq!((item.group as usize, item.count), (G_BASE_BG, 3));
-    }
+    use super::{FRAME_GROUPS, GROUP_SRGB, WindowGpu};
 
     /// The staged band move's pure arithmetic: the copy plan for an up-glide, a
     /// down-bounce and every no-op arm, matching the CPU
@@ -20662,541 +20672,13 @@ mod tests {
         );
     }
 
-    /// The scroll shift's Metal twin: the same `BandShift` plan run through the
-    /// copy verbs on a Metal texture via a scratch lands exactly the
-    /// CPU-simulated shift, and a direct overlapping self-copy (undefined on
-    /// Metal, silently accepted by validation) is refused by name.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn the_metal_band_shift_matches_the_cpu_simulation_and_refuses_overlap() {
-        use super::band_shift_ops;
-        use crate::device_layer::{
-            DeviceHandle, FrameCopyTexture, FrameEncoder, SubmittedFrame, TexUsage, TexelFormat,
-            metal_try_read_back,
-        };
-        use crate::metal::ffi::Device as MtlDevice;
-        use crate::metal::loss::LossLatch;
-        use crate::metal::resources::MetalResourceDevice;
-        use std::sync::Arc;
-
-        // Pool first: the process's first device build autoreleases the
-        // device object.
-        let _test_pool = crate::metal::ffi::AutoreleasePool::new();
-        let Some(mdev) = MtlDevice::preferred() else {
-            aterm_spec::host::could_not_run("no Metal device");
-        };
-        let latch = Arc::new(LossLatch::new());
-        let session =
-            crate::metal::encoder::EncodeSession::new(&mdev, Arc::clone(&latch)).expect("session");
-        let mint = MetalResourceDevice::new(&mdev, Arc::clone(&latch));
-        let handle = DeviceHandle::Metal(&mint);
-
-        const W: u32 = 16;
-        const H: u32 = 12;
-        let usage = TexUsage {
-            sampled: true,
-            render: false,
-            copy_src: true,
-            copy_dst: true,
-        };
-        let pattern: Vec<u8> = (0..(W * H * 4) as usize)
-            .map(|i| ((i * 11 + 3) % 256) as u8)
-            .collect();
-
-        for delta in [3i64, -3] {
-            let off = handle.create_texture_2d(
-                "w4 metal band-shift offscreen",
-                TexelFormat::Rgba8Unorm,
-                W,
-                H,
-                usage,
-                None,
-            );
-            handle.upload_texture_full(&off, &pattern, W * 4, W, H);
-            let scratch = handle.create_texture_2d(
-                "aterm-gpu m1b scroll shift scratch",
-                TexelFormat::Rgba8Unorm,
-                W,
-                H,
-                TexUsage {
-                    sampled: false,
-                    render: false,
-                    copy_src: true,
-                    copy_dst: true,
-                },
-                None,
-            );
-            let (y0, y1) = (2usize, 10usize);
-            let shift = band_shift_ops(y0, y1, delta).expect("the fixture band moves");
-
-            // The DIRECT overlapping self-copy refuses by name — the scratch
-            // is load-bearing, not a style choice.
-            let mut enc = FrameEncoder::metal(&session).expect("metal cb");
-            let err = enc
-                .copy_texture_rect(
-                    FrameCopyTexture::Metal(off.metal()),
-                    (0, shift.src_y),
-                    FrameCopyTexture::Metal(off.metal()),
-                    (0, shift.dst_y),
-                    W,
-                    shift.moved,
-                )
-                .expect_err("an overlapping same-texture band copy must refuse");
-            assert!(
-                err.contains("overlapping"),
-                "the refusal names the hazard: {err}"
-            );
-            drop(enc.submit());
-
-            // The staged plan — the SAME two copies the production wgpu arm
-            // issues — lands the CPU-simulated bytes.
-            let mut enc = FrameEncoder::metal(&session).expect("metal cb");
-            enc.copy_texture_rect(
-                FrameCopyTexture::Metal(off.metal()),
-                (0, shift.src_y),
-                FrameCopyTexture::Metal(scratch.metal()),
-                (0, 0),
-                W,
-                shift.moved,
-            )
-            .expect("stage into the scratch");
-            enc.copy_texture_rect(
-                FrameCopyTexture::Metal(scratch.metal()),
-                (0, 0),
-                FrameCopyTexture::Metal(off.metal()),
-                (0, shift.dst_y),
-                W,
-                shift.moved,
-            )
-            .expect("lay back shifted");
-            match enc.submit() {
-                SubmittedFrame::Metal(submitted) => assert_eq!(
-                    submitted.wait_outcome(),
-                    crate::metal::loss::CbOutcome::Completed,
-                    "the staged shift completes"
-                ),
-                #[cfg(wgpu_arm)]
-                SubmittedFrame::Wgpu => unreachable!("a metal encoder commits a metal frame"),
-            }
-            let frame = metal_try_read_back(&session, &mint, off.metal(), W, H)
-                .expect("metal readback succeeds");
-
-            // CPU simulation of the same move over the same pattern.
-            let row = (W * 4) as usize;
-            let mut expected = pattern.clone();
-            let (src_y, dst_y, moved) = (
-                shift.src_y as usize,
-                shift.dst_y as usize,
-                shift.moved as usize,
-            );
-            let staged: Vec<u8> = expected[src_y * row..(src_y + moved) * row].to_vec();
-            expected[dst_y * row..(dst_y + moved) * row].copy_from_slice(&staged);
-            let expected_pixels: Vec<u32> = expected
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|c| {
-                    ((255 - u32::from(c[3])) << 24)
-                        | (u32::from(c[0]) << 16)
-                        | (u32::from(c[1]) << 8)
-                        | u32::from(c[2])
-                })
-                .collect();
-            assert_eq!(
-                frame.pixels, expected_pixels,
-                "delta {delta}: the Metal staged shift must land the CPU bytes"
-            );
-        }
-        assert!(
-            !latch.is_lost(),
-            "a refused copy is a wiring error, not a loss"
-        );
-    }
-
-    /// Encode-seam crossing guards: a handle from one backend reaching the
-    /// other backend's frame encoder (pass target, uniform set, pipeline, copy
-    /// texture) panics naming "device layer". Unreachable in production, which
-    /// builds matched arms of one backend.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn the_frame_seam_refuses_cross_backend_handles_by_name() {
-        use crate::device_layer::{
-            FrameCopyTexture, FrameEncoder, FrameLoad, FramePipeline, FrameUniforms, FrameView,
-        };
-        use crate::metal::ffi::Device as MtlDevice;
-        use crate::metal::loss::LossLatch;
-        use crate::metal::resources::MetalResourceDevice;
-        use std::sync::Arc;
-
-        let _test_pool = crate::metal::ffi::AutoreleasePool::new();
-        let gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
-        let Some(mdev) = MtlDevice::preferred() else {
-            aterm_spec::host::could_not_run("no Metal device");
-        };
-        let latch = Arc::new(LossLatch::new());
-        let session =
-            crate::metal::encoder::EncodeSession::new(&mdev, Arc::clone(&latch)).expect("session");
-        let mint = MetalResourceDevice::new(&mdev, Arc::clone(&latch));
-        let sealed = mint
-            .texture_2d(
-                crate::metal::ffi::PixelFormat::Rgba8Unorm,
-                4,
-                4,
-                crate::metal::ffi::TEXTURE_USAGE_RENDER_TARGET,
-            )
-            .expect("metal texture");
-        let mbuf = mint.buffer(16).expect("metal buffer");
-        let wtex = gpu.ctx.offscreen_texture(4, 4);
-        let wview = wtex.create_view(&wgpu::TextureViewDescriptor::default());
-
-        fn named<F: FnOnce()>(what: &str, f: F) {
-            let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
-                .expect_err("a cross-backend handle must refuse");
-            let msg = err
-                .downcast_ref::<String>()
-                .cloned()
-                .or_else(|| err.downcast_ref::<&str>().map(|m| (*m).to_owned()))
-                .unwrap_or_default();
-            assert!(
-                msg.contains("device layer"),
-                "{what}: the refusal must name the device layer, got: {msg}"
-            );
-        }
-
-        // 1. Wgpu encoder, Metal pass target.
-        {
-            let mut enc = FrameEncoder::wgpu(&gpu.ctx.device, &gpu.ctx.queue, "w4 arming probe");
-            named("wgpu encoder + metal view", || {
-                let _ = enc.begin_pass(
-                    "w4 arming pass",
-                    FrameView::Metal(&sealed),
-                    FrameLoad::Load,
-                    None,
-                    FrameUniforms::Wgpu(&gpu.uniform_bg),
-                );
-            });
-        }
-        // 2. Metal encoder, wgpu pass target.
-        {
-            let mut enc = FrameEncoder::metal(&session).expect("metal cb");
-            named("metal encoder + wgpu view", || {
-                let _ = enc.begin_pass(
-                    "w4 arming pass",
-                    FrameView::Wgpu(&wview),
-                    FrameLoad::Load,
-                    None,
-                    FrameUniforms::Metal {
-                        buf: &mbuf,
-                        vertex_slot: 0,
-                        fragment_slot: None,
-                    },
-                );
-            });
-        }
-        // 3. A live wgpu pass fed a Metal pipeline handle.
-        {
-            let mut enc = FrameEncoder::wgpu(&gpu.ctx.device, &gpu.ctx.queue, "w4 arming probe");
-            named("wgpu pass + metal pipeline", || {
-                let wtex2 = gpu.ctx.offscreen_texture(4, 4);
-                let wview2 = wtex2.create_view(&wgpu::TextureViewDescriptor::default());
-                let mut pass = enc
-                    .begin_pass(
-                        "w4 arming pass",
-                        FrameView::Wgpu(&wview2),
-                        FrameLoad::Clear(crate::device_layer::ClearColor4::BLACK),
-                        None,
-                        FrameUniforms::Wgpu(&gpu.uniform_bg),
-                    )
-                    .expect("matched arms open");
-                let mbuf2 = mint.buffer(16).expect("metal buffer");
-                pass.set_pipeline(FramePipeline::Metal(&mbuf2));
-            });
-        }
-        // 4. The copy verb, mixed.
-        {
-            let mut enc = FrameEncoder::wgpu(&gpu.ctx.device, &gpu.ctx.queue, "w4 arming probe");
-            let sealed2 = mint
-                .texture_2d(crate::metal::ffi::PixelFormat::Rgba8Unorm, 4, 4, 0)
-                .expect("metal texture");
-            named("wgpu copy + metal texture", || {
-                let _ = enc.copy_texture_rect(
-                    FrameCopyTexture::Metal(&sealed2),
-                    (0, 0),
-                    FrameCopyTexture::Metal(&sealed2),
-                    (0, 0),
-                    2,
-                    2,
-                );
-            });
-        }
-    }
-
-    /// The wgpu side of the binding-map cross-check, as far as
-    /// [`crate::pipeline_table::BindSpec`]'s doc says it is expressible.
-    ///
-    /// wgpu validates the `BindGroupLayout`s against the WGSL's module-scope
-    /// `@group(g) @binding(b)` declarations, so scanning the WGSL checks the
-    /// same facts without a device. The mapping to the table's Metal slots:
-    ///
-    /// * a `var<uniform>` keeps its binding number as the `[[buffer]]` index;
-    /// * textures and samplers take per-type sequential slots in
-    ///   `(group, binding)` order (the blit sampler at `@binding(1)` is
-    ///   `[[sampler(0)]]`);
-    /// * per-stage visibility is not visible at module scope, so the check is
-    ///   the per-library union of the rows' BindSpec halves; the per-entry
-    ///   split is checked by the MSL twin scan in `crate::shader_twins`.
-    ///
-    /// Fails both ways: an untabled WGSL slot, or a tabled slot with no WGSL
-    /// declaration.
-    #[test]
-    fn the_wgsl_binding_map_agrees_with_the_tables_bind_column() {
-        use crate::pipeline_table::{ALL_PIPELINES, ShaderLibrary};
-        use std::collections::BTreeSet;
-
-        let mut any = (0usize, 0usize, 0usize);
-        for lib in ShaderLibrary::ALL {
-            let src = super::wgsl_source(lib);
-            // Parse `@group(G) @binding(B) var...` declarations.
-            let mut buffers: BTreeSet<u32> = BTreeSet::new();
-            let mut textures: Vec<(u32, u32)> = Vec::new(); // (group, binding)
-            let mut samplers: Vec<(u32, u32)> = Vec::new();
-            for line in src.lines() {
-                let Some(rest) = line.trim_start().strip_prefix("@group(") else {
-                    continue;
-                };
-                let (g, rest) = rest.split_once(')').expect("well-formed @group");
-                let rest = rest
-                    .trim_start()
-                    .strip_prefix("@binding(")
-                    .expect("@group is followed by @binding in these modules");
-                let (b, rest) = rest.split_once(')').expect("well-formed @binding");
-                let (g, b) = (
-                    g.parse::<u32>().expect("group number"),
-                    b.parse::<u32>().expect("binding number"),
-                );
-                if rest.contains("var<uniform>") {
-                    buffers.insert(b);
-                } else if rest.contains("texture_2d") {
-                    textures.push((g, b));
-                } else if rest.contains(": sampler") {
-                    samplers.push((g, b));
-                } else {
-                    panic!(
-                        "{}: unclassifiable WGSL declaration `{line}` — the \
-                         cross-check needs a new kind",
-                        lib.name()
-                    );
-                }
-            }
-            // Per-type sequential slots in (group, binding) order.
-            textures.sort_unstable();
-            samplers.sort_unstable();
-            let tex_slots: BTreeSet<u32> = (0..textures.len() as u32).collect();
-            let samp_slots: BTreeSet<u32> = (0..samplers.len() as u32).collect();
-
-            // The per-library union of the rows' BindSpec halves.
-            let mut want_buffers: BTreeSet<u32> = BTreeSet::new();
-            let mut want_textures: BTreeSet<u32> = BTreeSet::new();
-            let mut want_samplers: BTreeSet<u32> = BTreeSet::new();
-            for p in ALL_PIPELINES {
-                let spec = p.spec();
-                if spec.library != lib {
-                    continue;
-                }
-                want_buffers.extend(spec.binds.vertex_uniform);
-                want_buffers.extend(spec.binds.fragment_buffers.iter().copied());
-                want_textures.extend(spec.binds.fragment_textures.iter().copied());
-                want_samplers.extend(spec.binds.fragment_samplers.iter().copied());
-            }
-
-            assert_eq!(
-                buffers,
-                want_buffers,
-                "{}: WGSL uniform bindings (kept as Metal buffer indices) \
-                 disagree with the table's BindSpec union",
-                lib.name()
-            );
-            assert_eq!(
-                tex_slots,
-                want_textures,
-                "{}: WGSL texture declarations (per-type sequential) disagree \
-                 with the table's fragment texture slots",
-                lib.name()
-            );
-            assert_eq!(
-                samp_slots,
-                want_samplers,
-                "{}: WGSL sampler declarations (per-type sequential) disagree \
-                 with the table's fragment sampler slots",
-                lib.name()
-            );
-            any.0 += buffers.len();
-            any.1 += textures.len();
-            any.2 += samplers.len();
-        }
-        // Positive control: the scan read real declarations (an empty parse
-        // agrees with anything).
-        assert!(
-            any.0 > 0 && any.1 > 0 && any.2 > 0,
-            "the WGSL scan found {any:?} (buffers/textures/samplers) — it went blind"
-        );
-    }
-
     // ---------------------------------------------------------------------
     // The demand set (`frame_effect_pipelines`) of the lazy effect-pipeline
     // build. A slot missing from the set panics in `EffectPipelines::get` on
-    // the frame that binds it; a slot wrongly in it compiles a shader the
-    // launch meant to avoid. Both directions are asserted per slot.
+    // the frame that binds it.
     // ---------------------------------------------------------------------
 
-    /// A stream in `Instances` that binds an effect pipeline, named for the
-    /// assertion messages, with a closure that puts ONE instance in it.
-    struct StreamCase {
-        stream: &'static str,
-        want: EffectPipeline,
-        fill: fn(&mut Instances),
-    }
-
-    /// Every `(stream, pipeline)` edge `encode_frame` draws, one row per call
-    /// site that binds an effect pipeline. Enumerated from the call sites, not
-    /// the enum: a draw site without a row here still passes the demand test
-    /// but panics in the live frame.
-    fn stream_cases() -> Vec<StreamCase> {
-        fn bg(v: &mut Vec<super::BgInstance>) {
-            v.push(aterm_bits::Zeroable::zeroed());
-        }
-        fn gw(v: &mut Vec<super::GlowInstance>) {
-            v.push(aterm_bits::Zeroable::zeroed());
-        }
-        fn gl(v: &mut Vec<super::GlyphInstance>) {
-            v.push(aterm_bits::Zeroable::zeroed());
-        }
-        fn rg(v: &mut Vec<super::RainGlowInstance>) {
-            v.push(aterm_bits::Zeroable::zeroed());
-        }
-        fn fi(v: &mut Vec<super::FireInstance>) {
-            v.push(aterm_bits::Zeroable::zeroed());
-        }
-        vec![
-            StreamCase {
-                stream: "cursor_block",
-                want: EffectPipeline::CursorBlend,
-                fill: |i| bg(&mut i.cursor_block),
-            },
-            StreamCase {
-                stream: "cursor",
-                want: EffectPipeline::CursorBlend,
-                fill: |i| bg(&mut i.cursor),
-            },
-            StreamCase {
-                stream: "glow_under",
-                want: EffectPipeline::GlowAdd,
-                fill: |i| gw(&mut i.glow_under),
-            },
-            StreamCase {
-                stream: "glow_add",
-                want: EffectPipeline::GlowAdd,
-                fill: |i| gw(&mut i.glow_add),
-            },
-            StreamCase {
-                stream: "nova_add",
-                want: EffectPipeline::GlowAdd,
-                fill: |i| gw(&mut i.nova_add),
-            },
-            StreamCase {
-                stream: "glow_halo",
-                want: EffectPipeline::RainGlow,
-                fill: |i| rg(&mut i.glow_halo),
-            },
-            StreamCase {
-                stream: "rain_add",
-                want: EffectPipeline::RainGlow,
-                fill: |i| rg(&mut i.rain_add),
-            },
-            StreamCase {
-                stream: "glow_halo_over",
-                want: EffectPipeline::RainGlowOver,
-                fill: |i| rg(&mut i.glow_halo_over),
-            },
-            StreamCase {
-                stream: "rain_add_over",
-                want: EffectPipeline::RainGlowOver,
-                fill: |i| rg(&mut i.rain_add_over),
-            },
-            StreamCase {
-                stream: "fire_add",
-                want: EffectPipeline::FireAdd,
-                fill: |i| fi(&mut i.fire_add),
-            },
-            StreamCase {
-                stream: "fire_over",
-                want: EffectPipeline::FireOver,
-                fill: |i| fi(&mut i.fire_over),
-            },
-            StreamCase {
-                stream: "glyph_halo",
-                want: EffectPipeline::DecoOver,
-                fill: |i| gl(&mut i.glyph_halo),
-            },
-            StreamCase {
-                stream: "curl",
-                want: EffectPipeline::DecoOver,
-                fill: |i| gl(&mut i.curl),
-            },
-            StreamCase {
-                stream: "wdeco_over",
-                want: EffectPipeline::DecoOver,
-                fill: |i| gl(&mut i.wdeco_over),
-            },
-            StreamCase {
-                stream: "wdeco_add",
-                want: EffectPipeline::DecoAdd,
-                fill: |i| gl(&mut i.wdeco_add),
-            },
-            StreamCase {
-                stream: "wallpaper",
-                want: EffectPipeline::SpriteOver,
-                fill: |i| gl(&mut i.wallpaper),
-            },
-            StreamCase {
-                stream: "rain_under",
-                want: EffectPipeline::SpriteOver,
-                fill: |i| gl(&mut i.rain_under),
-            },
-            StreamCase {
-                stream: "cat_over",
-                want: EffectPipeline::SpriteOver,
-                fill: |i| gl(&mut i.cat_over),
-            },
-            StreamCase {
-                stream: "free_under",
-                want: EffectPipeline::SpriteOver,
-                fill: |i| gl(&mut i.free_under),
-            },
-            StreamCase {
-                stream: "free_over",
-                want: EffectPipeline::SpriteOver,
-                fill: |i| gl(&mut i.free_over),
-            },
-        ]
-    }
-
-    /// A frame with no effect layer (every frame under the Windows defaults
-    /// `cursor_trail = false`, `hdr_glow = false`) demands no effect pipeline,
-    /// so launch compiles none.
-    #[test]
-    fn an_effect_free_frame_demands_no_pipeline() {
-        let inst = Instances::default();
-        let input = aterm_render::RenderInput::default();
-        let want = frame_effect_pipelines(&inst, &input, true);
-        assert_eq!(
-            want,
-            [false; EFFECT_PIPELINE_COUNT],
-            "a plain frame must compile no effect pipeline; demanded {:?}",
-            resident_names(want)
-        );
-    }
-
+    #[cfg(wgpu_arm)]
     fn resident_names(want: [bool; EFFECT_PIPELINE_COUNT]) -> Vec<&'static str> {
         EFFECT_PIPELINE_NAMES
             .iter()
@@ -21206,53 +20688,12 @@ mod tests {
             .collect()
     }
 
-    /// Every live stream demands its own pipeline and no other: missing it
-    /// panics in `EffectPipelines::get`, extras drag other effects onto the
-    /// launch path.
-    #[test]
-    fn each_stream_demands_exactly_its_own_pipeline() {
-        let input = aterm_render::RenderInput::default();
-        for case in stream_cases() {
-            let mut inst = Instances::default();
-            (case.fill)(&mut inst);
-            // A live cursor stream reaches the blend pipeline only when the
-            // cursor is translucent; opaque routes through `bg_pipeline`.
-            let cursor_opaque = case.want != EffectPipeline::CursorBlend;
-            let want = frame_effect_pipelines(&inst, &input, cursor_opaque);
-            let mut expected = [false; EFFECT_PIPELINE_COUNT];
-            expected[case.want as usize] = true;
-            assert_eq!(
-                want,
-                expected,
-                "stream `{}` must demand exactly `{}`; demanded {:?}",
-                case.stream,
-                EFFECT_PIPELINE_NAMES[case.want as usize],
-                resident_names(want),
-            );
-        }
-    }
-
-    /// The default opaque cursor never pulls in the blend pipeline; its two
-    /// streams draw every frame, so keying on the stream alone would compile
-    /// it at every launch.
-    #[test]
-    fn an_opaque_cursor_never_demands_the_blend_pipeline() {
-        let mut inst = Instances::default();
-        inst.cursor_block.push(aterm_bits::Zeroable::zeroed());
-        inst.cursor.push(aterm_bits::Zeroable::zeroed());
-        let input = aterm_render::RenderInput::default();
-        assert_eq!(
-            frame_effect_pipelines(&inst, &input, true),
-            [false; EFFECT_PIPELINE_COUNT],
-            "an opaque cursor draws through bg_pipeline and must compile nothing"
-        );
-    }
-
     /// A translucent cursor that draws no cursor quads this frame still demands
     /// the blend pipeline (a pre-warm keyed on the cursor mode, so it exists by
     /// the first frame that draws a cursor quad). Covers blink-off frames, a
     /// `DECTCEM`-hidden cursor and one scrolled out of view.
     #[test]
+    #[cfg(wgpu_arm)]
     fn a_translucent_cursor_demands_the_blend_pipeline_even_with_no_cursor_quads() {
         let inst = Instances::default(); // blink-off: both cursor streams empty
         let input = aterm_render::RenderInput::default();
@@ -21279,6 +20720,7 @@ mod tests {
     /// `inst.glow_add` empty while bloom still draws, so the slot is keyed on
     /// the input too.
     #[test]
+    #[cfg(wgpu_arm)]
     fn a_row_gated_glow_still_demands_glow_add_for_the_bloom_pass() {
         let inst = Instances::default(); // row gate emptied every stream
         let mut input = aterm_render::RenderInput::default();
@@ -21298,22 +20740,6 @@ mod tests {
         let mut expected = [false; EFFECT_PIPELINE_COUNT];
         expected[EffectPipeline::GlowAdd as usize] = true;
         assert_eq!(want, expected);
-    }
-
-    /// The three slot tables are one table seen three ways: a slot without a
-    /// name, or out of order, would mislabel every residency report.
-    #[test]
-    fn the_effect_pipeline_tables_agree() {
-        assert_eq!(
-            EFFECT_PIPELINE_COUNT,
-            EffectPipeline::SpriteOver as usize + 1
-        );
-        for (slot, which) in EFFECT_PIPELINES.iter().enumerate() {
-            assert_eq!(
-                *which as usize, slot,
-                "EFFECT_PIPELINES is out of slot order"
-            );
-        }
     }
 
     #[test]
@@ -21343,48 +20769,6 @@ mod tests {
         assert_eq!(
             b.sdr_glow_level, b_first,
             "resetting window A cannot disturb window B"
-        );
-    }
-
-    /// Pins each stream group's composite view to its physical reason: the
-    /// three One/One additive streams need the plain Unorm view to match the
-    /// CPU `add_sat` byte for byte; everything else blends source-over on the
-    /// sRGB view so the hardware blends in linear light. A wrongly tagged
-    /// stream would merge into a neighbour's pass with a legal pass count, so
-    /// the pass-count tests cannot catch it.
-    #[test]
-    fn production_group_view_map_matches_each_stream_blend_mode() {
-        // The additive (One/One) groups — and ONLY these — take the Unorm view.
-        let additive = [G_GLOW_UNDER, G_GLOW, G_WDECO_ADD];
-        for (g, &is_srgb) in GROUP_SRGB.iter().enumerate() {
-            assert_eq!(
-                is_srgb,
-                !additive.contains(&g),
-                "group {g}: an additive group on the sRGB view would add in linear \
-                 light (not the CPU `add_sat`), and a source-over group on the \
-                 Unorm view would blend in sRGB light (not the CPU `blend`)"
-            );
-        }
-        // Group 0 anchors pass 0, which carries `load_op` — a `Clear` in the
-        // frame's own colour space. It is source-over base fill, so sRGB.
-        assert_eq!(G_BASE_BG, 0);
-        assert!(GROUP_SRGB[G_BASE_BG]);
-        // Draw order is the index order, and the constants must tile 0..N exactly
-        // — a duplicate or a hole would silently drop a group from the encode.
-        let mut idx = [
-            G_BASE_BG,
-            G_GLOW_UNDER,
-            G_BASE_FG,
-            G_GLOW,
-            G_WDECO_OVER,
-            G_WDECO_ADD,
-            G_FREE_OVER,
-            G_CURSOR,
-        ];
-        idx.sort_unstable();
-        assert!(
-            idx.iter().enumerate().all(|(i, &g)| i == g) && idx.len() == FRAME_GROUPS,
-            "the G_* constants must be a permutation of 0..FRAME_GROUPS in draw order"
         );
     }
 
@@ -21446,27 +20830,6 @@ mod tests {
         }
     }
 
-    /// A frame with NO additive stream must still collapse to the ONE sRGB pass
-    /// the historical fused path used — every parity test and every effects-off
-    /// keystroke lives here, so a regression to multiple passes would tax the
-    /// quietest possible frame.
-    #[test]
-    fn effects_free_frame_is_a_single_pass() {
-        let mut enabled = [false; FRAME_GROUPS];
-        enabled[G_BASE_BG] = true;
-        enabled[G_BASE_FG] = true;
-        enabled[G_FREE_OVER] = true;
-        enabled[G_CURSOR] = true;
-        let (pass_of, pass_srgb, passes) = super::coalesce_frame_passes(&enabled, &GROUP_SRGB);
-        assert_eq!(passes, 1);
-        assert!(pass_srgb[0]);
-        assert!(
-            [G_BASE_BG, G_BASE_FG, G_FREE_OVER, G_CURSOR]
-                .iter()
-                .all(|&g| pass_of[g] == 0)
-        );
-    }
-
     /// Present-copy tracker safety: `None` ("unknown extent") is absorbing, so
     /// a writer that cannot describe its extent costs a full copy, never a
     /// stale blit. The empty rect is the unit (an idle frame never widens the
@@ -21493,72 +20856,36 @@ mod tests {
         );
     }
 
-    /// The compose rect both arms copy: `None` on either tracker is the whole
-    /// frame, two empty trackers copy nothing, otherwise the union.
+    /// `COPY_SRC` on the swapchain: either capture tap (the still
+    /// `presented_snapshot` or the recording `video`) arms it, because copying
+    /// out of a `RENDER_ATTACHMENT`-only swapchain is a wgpu validation panic
+    /// inside present; an idle window never does, because on Metal any extra
+    /// usage clears `CAMetalLayer.framebufferOnly` and loses lossless
+    /// compression on every frame; and a surface without the cap is never asked.
     #[test]
-    fn present_copy_rect_is_the_stale_union_or_the_frame() {
-        let dims = (100, 80);
-        assert_eq!(super::present_copy_rect(None, None, dims), [0, 0, 100, 80]);
-        assert_eq!(
-            super::present_copy_rect(Some([0, 0, 0, 0]), None, dims),
-            [0, 0, 100, 80]
-        );
-        assert_eq!(
-            super::present_copy_rect(None, Some([1, 2, 3, 4]), dims),
-            [0, 0, 100, 80]
-        );
-        assert_eq!(
-            super::present_copy_rect(Some([0, 0, 0, 0]), Some([0, 0, 0, 0]), dims),
-            [0, 0, 0, 0]
-        );
-        assert_eq!(
-            super::present_copy_rect(Some([0, 40, 100, 60]), Some([0, 20, 100, 70]), dims),
-            [0, 20, 100, 70]
-        );
-    }
-
-    /// The swapchain is RENDER_ATTACHMENT-only: on Metal any extra usage clears
-    /// `CAMetalLayer.framebufferOnly`, losing lossless compression on every
-    /// frame. `COPY_SRC` is armed only while a video tap records, and only
-    /// where the surface offers it.
-    #[test]
-    fn swapchain_arms_copy_src_only_while_recording() {
-        use wgpu::TextureUsages as U;
-        assert_eq!(
-            super::GpuRenderer::swapchain_usage_for(true, false),
-            U::RENDER_ATTACHMENT,
-            "an idle window must not forfeit drawable compression"
-        );
-        assert_eq!(
-            super::GpuRenderer::swapchain_usage_for(true, true),
-            U::RENDER_ATTACHMENT | U::COPY_SRC,
-            "a live recording needs the presented texture to be copyable"
-        );
-        assert_eq!(
-            super::GpuRenderer::swapchain_usage_for(false, true),
-            U::RENDER_ATTACHMENT,
-            "a surface with no COPY_SRC cap must never be asked for it"
-        );
-    }
-
-    /// Either capture tap (the still `presented_snapshot` or the recording
-    /// `video`) arms `COPY_SRC`; with neither it is cleared. Copying out of a
-    /// `RENDER_ATTACHMENT`-only swapchain is a wgpu validation panic inside
-    /// present, and the bit costs Metal's lossless compression, so it is not
-    /// always on.
-    #[test]
-    fn either_tap_arms_copy_src_and_an_idle_window_arms_neither() {
+    #[cfg(any(wgpu_arm, target_os = "macos"))]
+    fn copy_src_is_armed_only_by_a_live_tap_on_a_capable_surface() {
         let wants = super::GpuRenderer::tap_wants_copy_src;
         assert!(!wants(false, false), "idle: no readback, no cost");
         assert!(wants(true, false), "a live recording needs the readback");
-        assert!(
-            wants(false, true),
-            "a ONE-SHOT still needs it just as much — the regression"
-        );
+        assert!(wants(false, true), "a ONE-SHOT still needs it just as much");
         assert!(
             wants(true, true),
             "a still taken mid-recording needs it too"
         );
+        // The swapchain usage is the wgpu arm's.
+        #[cfg(wgpu_arm)]
+        {
+            use wgpu::TextureUsages as U;
+            let usage = super::GpuRenderer::swapchain_usage_for;
+            assert_eq!(usage(true, false), U::RENDER_ATTACHMENT);
+            assert_eq!(usage(true, true), U::RENDER_ATTACHMENT | U::COPY_SRC);
+            assert_eq!(
+                usage(false, true),
+                U::RENDER_ATTACHMENT,
+                "a surface with no COPY_SRC cap must never be asked for it"
+            );
+        }
     }
 
     use super::*;
@@ -21680,6 +21007,11 @@ mod tests {
         }
     }
 
+    /// The GPU atlas holds the CPU renderer's exact glyph bytes: for Latin and
+    /// CJK-fallback glyphs plus regular/bold/italic warning-symbol fallback
+    /// masks, every atlas texel equals the CPU cache byte. The styled variants
+    /// pin that proportional fitting happens before this shared image, so the
+    /// atlas gets the CPU's final fit. Pure CPU (`build_atlas` needs no device).
     #[test]
     fn crown_scissor_clips_both_scroll_directions_to_independent_destination_bounds() {
         let mut uniform = present_blit_uniform(false, None, None, 40, 60, 40, 60, 0);
@@ -21824,141 +21156,90 @@ mod tests {
         );
     }
 
-    /// `pack_image_plane`'s `dw == tw` single-memcpy path matches a naive
-    /// row-by-row pack byte for byte.
-    #[test]
-    fn pack_image_plane_fast_path_matches_per_row() {
-        // Reference: always copy row by row (the pre-optimization path).
-        fn per_row(items: &[(u32, u32, u32, &[u8])], tw: u32, th: u32) -> Vec<u8> {
-            let mut data = vec![0u8; (tw * th * 4) as usize];
-            for &(y0, dw, dh, rgba) in items {
-                for y in 0..dh {
-                    let src = (y * dw * 4) as usize;
-                    let dst = ((y0 + y) * tw) as usize * 4;
-                    data[dst..dst + (dw * 4) as usize]
-                        .copy_from_slice(&rgba[src..src + (dw * 4) as usize]);
-                }
-            }
-            data
-        }
-        // Deterministic raster: distinct bytes per pixel so a mis-copy is visible.
-        let raster = |w: u32, h: u32, seed: u8| -> Vec<u8> {
-            (0..(w * h * 4))
-                .map(|i| (i as u8).wrapping_add(seed))
-                .collect()
-        };
-        let a = raster(7, 5, 1);
-        // Case 1: single full-width image (dw == tw -> fast path).
-        let items = [(0u32, 7u32, 5u32, a.as_slice())];
-        assert_eq!(
-            GpuRenderer::pack_image_plane(&items, 7, 5),
-            per_row(&items, 7, 5)
-        );
-        // Case 2: two stacked same-width images (both hit the fast path).
-        let b = raster(7, 3, 9);
-        let items = [(0u32, 7, 5, a.as_slice()), (5u32, 7, 3, b.as_slice())];
-        assert_eq!(
-            GpuRenderer::pack_image_plane(&items, 7, 8),
-            per_row(&items, 7, 8)
-        );
-        // Case 3: a narrow image under a wider plane (dw < tw -> else path).
-        let narrow = raster(3, 4, 4);
-        let wide = raster(7, 2, 7);
-        let items = [
-            (0u32, 7, 2, wide.as_slice()),
-            (2u32, 3, 4, narrow.as_slice()),
-        ];
-        assert_eq!(
-            GpuRenderer::pack_image_plane(&items, 7, 6),
-            per_row(&items, 7, 6)
-        );
-    }
-
     /// The GPU atlas holds the CPU renderer's exact glyph bytes: for every glyph
-    /// of the parity demo grid (colours, CJK fallback, inverse, cursor) plus
-    /// regular/bold/italic warning-symbol fallback masks, every atlas texel
-    /// equals the CPU cache byte. The styled variants pin that proportional
-    /// fitting happens before this shared image, so the atlas gets the CPU's
-    /// final fit. Pure CPU (`build_atlas` needs no device).
+    /// of the parity demo grid (Latin and the CJK fallback), every atlas texel
+    /// equals the CPU cache byte. Pure CPU (`build_atlas` needs no device).
     #[test]
     fn atlas_texel_bytes_match_cpu_glyph_bytes_exactly() {
         let Some(mut cpu) = Renderer::from_system(18.0, Theme::default()) else {
             aterm_spec::host::could_not_run("no system monospace font");
         };
 
-        let (rows, cols) = (6usize, 12usize);
-        let mut term = Terminal::new(rows as u16, cols as u16);
-        term.process(
-            b"\x1b[31mRR\x1b[0m\r\n\
-\x1b[44m  \x1b[0m\r\n\
-\xe6\x97\xa5\xe6\x9c\xac\r\n\
-\x1b[7mXX\x1b[0m\r\n\
-ab\r\n",
-        );
+        // The parity demo grid's glyphs, Latin and the CJK fallback, keyed over
+        // a settled fallback chain (the CJK pair is a fallback face's).
+        cpu.debug_block_on_lazy_fallbacks();
+        let keys: Vec<GlyphKey> = "RXab\u{65E5}\u{672C}"
+            .chars()
+            .map(|c| cpu.glyph_key(c))
+            .collect();
+        assert_atlas_holds_the_cpu_bytes(&mut cpu, keys, 5);
+    }
 
-        // The same key set encode_frame builds for this frame.
-        let input = term.cell_frame(rows, cols);
-        // Same shape encode_frame builds: dedup, then sort (the packing order
-        // `build_atlas` consumes).
-        let mut keys: Vec<GlyphKey> = Vec::new();
-        for cells in &input.cells {
-            for cell in cells.iter().take(cols) {
-                if GpuRenderer::drawable(cell) {
-                    keys.push(cpu.glyph_key(cell.ch));
-                }
-            }
-        }
-        // U+26A0 is a proportional symbol: settle the lazy slots, then add each
-        // synthetic style this host serves from a mono fallback face.
+    /// [`atlas_texel_bytes_match_cpu_glyph_bytes_exactly`] for the synthetic
+    /// styles of a proportional symbol served from a mono fallback face: the
+    /// regular, bold, italic and bold-italic U+26A0 masks are fitted to one
+    /// cell before the shared image, so the atlas gets the CPU's final fit,
+    /// texel for texel. A host that serves U+26A0 from no mono fallback face
+    /// could not run it.
+    #[test]
+    fn fitted_fallback_styles_reach_the_atlas_as_the_cpu_fit_them() {
+        let Some(mut cpu) = Renderer::from_system(18.0, Theme::default()) else {
+            aterm_spec::host::could_not_run("no system monospace font");
+        };
+        // Settle the lazy slots before asking which face serves the symbol.
         cpu.debug_block_on_lazy_fallbacks();
         let warning = cpu.glyph_key('\u{26A0}');
-        let mut fitted_warning_keys = Vec::new();
-        if matches!(
+        if !matches!(
             warning.source,
             FaceId::Fallback
                 | FaceId::SymbolFallback
                 | FaceId::RuntimeFallback
                 | FaceId::DisplayMix
-        ) && warning.glyph_class == GlyphClass::Mono
+        ) || warning.glyph_class != GlyphClass::Mono
         {
-            let (cell_w, cell_h) = cpu.cell_size();
-            for style in [
-                StyleBits::REGULAR,
-                StyleBits::BOLD,
-                StyleBits::ITALIC,
-                StyleBits(StyleBits::BOLD.0 | StyleBits::ITALIC.0),
-            ] {
-                let key = cpu.glyph_key_styled('\u{26A0}', style);
-                assert_eq!(key.cell_span, 1);
-                let img = cpu.glyph_image(key);
-                assert!(
-                    img.xmin() >= 0 && img.xmin() + img.width() as i32 <= cell_w as i32,
-                    "{style:?} warning escaped its one-cell CPU mask before atlas packing"
-                );
-                assert!(img.height() <= cell_h);
-                assert_eq!(img.advance(), cell_w as f32);
-                fitted_warning_keys.push(key);
-            }
-            keys.extend(fitted_warning_keys.iter().copied());
-        } else {
-            crate::stderr_line!(
-                "SKIP warning atlas extension: no mono fallback warning ({warning:?})"
-            );
+            aterm_spec::host::could_not_run(format!(
+                "this host serves U+26A0 from no mono fallback face ({warning:?})"
+            ));
         }
+        let (cell_w, cell_h) = cpu.cell_size();
+        let mut keys = Vec::new();
+        for style in [
+            StyleBits::REGULAR,
+            StyleBits::BOLD,
+            StyleBits::ITALIC,
+            StyleBits(StyleBits::BOLD.0 | StyleBits::ITALIC.0),
+        ] {
+            let key = cpu.glyph_key_styled('\u{26A0}', style);
+            assert_eq!(key.cell_span, 1);
+            let img = cpu.glyph_image(key);
+            assert!(
+                img.xmin() >= 0 && img.xmin() + img.width() as i32 <= cell_w as i32,
+                "{style:?} warning escaped its one-cell CPU mask before atlas packing"
+            );
+            assert!(img.height() <= cell_h);
+            assert_eq!(img.advance(), cell_w as f32);
+            keys.push(key);
+        }
+        assert_atlas_holds_the_cpu_bytes(&mut cpu, keys, 1);
+    }
+
+    /// Packs `keys` (deduplicated and sorted, the order `build_atlas` consumes)
+    /// and asserts every key has a slot whose texels are the CPU cache's bytes.
+    /// `at_least` distinct keys keep the check from passing vacuously.
+    fn assert_atlas_holds_the_cpu_bytes(
+        cpu: &mut Renderer,
+        mut keys: Vec<GlyphKey>,
+        at_least: usize,
+    ) {
         keys.sort_unstable();
         keys.dedup();
         assert!(
-            keys.len() >= 5,
-            "demo frame should contribute several glyphs"
+            keys.len() >= at_least,
+            "the fixture contributes at least {at_least} distinct glyphs, got {}",
+            keys.len()
         );
 
-        let atlas = build_atlas(&mut cpu, &keys, u32::MAX);
-        for key in &fitted_warning_keys {
-            assert!(
-                atlas.map.contains_key(key),
-                "every fitted warning style reaches the shared GPU atlas"
-            );
-        }
+        let atlas = build_atlas(cpu, &keys, u32::MAX);
         for &key in &keys {
             let slot = atlas
                 .map
@@ -22004,349 +21285,12 @@ ab\r\n",
         }
     }
 
-    /// Atlas-grow parity across backends, the GPU-side mirror of
-    /// [`atlas_texel_bytes_match_cpu_glyph_bytes_exactly`]: the real grow
-    /// sequence (full pack, in-place row-ranged append, genuine overflow, full
-    /// rebuild) from `build_atlas`/`grow_atlas` is uploaded through the device
-    /// layer on both the wgpu and Metal arms, and the resident texels are
-    /// compared at every step against the CPU atlas and against each other.
-    ///
-    /// Uploads follow `create_atlas_texture`/`upload_atlas_rows` through the
-    /// same `DeviceHandle` verbs, so a stride bug, a dropped y-offset or a
-    /// rebuild that misses the taller backing shows as a byte diff on a named
-    /// step.
+    /// A primary font can own an emoji-default scalar (DejaVu's ⚡): bare and
+    /// VS15 name the same face and glyph id, so the one-cell qualifier alone
+    /// must separate their atlas identities, or the two rasters share one
+    /// entry. Pure CPU.
     #[test]
-    #[cfg(target_os = "macos")]
-    fn atlas_grow_sequence_bytes_match_across_backends() {
-        use crate::device_layer::{DeviceHandle, TexUsage, TexelFormat};
-        use crate::metal::ffi::Device as MtlDevice;
-        use crate::metal::loss::LossLatch;
-        use crate::metal::resources::MetalResourceDevice;
-        use std::sync::Arc;
-
-        // One autorelease pool for the whole test, catching drop-time and wgpu
-        // bring-up autoreleases.
-        let _test_pool = crate::metal::ffi::AutoreleasePool::new();
-        let Some(mut cpu) = Renderer::from_system(18.0, Theme::default()) else {
-            aterm_spec::host::could_not_run("no system monospace font");
-        };
-        let gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
-        let Some(mdev) = MtlDevice::preferred() else {
-            aterm_spec::host::could_not_run("no Metal device");
-        };
-        let latch = Arc::new(LossLatch::new());
-        let session =
-            crate::metal::encoder::EncodeSession::new(&mdev, Arc::clone(&latch)).expect("session");
-        let mint = MetalResourceDevice::new(&mdev, Arc::clone(&latch));
-
-        // ---- the CPU-side sequence, run ONCE by the real machinery --------
-        let mut keys1: Vec<GlyphKey> = "abR".chars().map(|c| cpu.glyph_key(c)).collect();
-        keys1.sort_unstable();
-        keys1.dedup();
-        let mut atlas = build_atlas(&mut cpu, &keys1, u32::MAX);
-        assert!(atlas.height > 0, "the seed pack must occupy rows");
-        let w = atlas.width;
-        let h1 = atlas.height;
-        let data1 = atlas.data[..(w * h1) as usize].to_vec();
-        // Resident texture height: seed + headroom as `create_atlas_texture`
-        // sizes it (a fixed 64 keeps the fixture deterministic).
-        let tex_h = h1 + 64;
-
-        // In-place append: new keys, dry-run probed then committed, exactly
-        // `ensure_atlases`'s path.
-        let mut keys2: Vec<GlyphKey> = "XYZQ".chars().map(|c| cpu.glyph_key(c)).collect();
-        keys2.sort_unstable();
-        keys2.dedup();
-        keys2.retain(|k| !keys1.contains(k));
-        let band = grow_atlas(&mut cpu, &mut atlas, &keys2, tex_h)
-            .expect("four new glyphs fit under seed + 64 rows of headroom");
-        assert!(
-            band.1 > band.0,
-            "the append must dirty a real row band, or the row-ranged axis is unarmed"
-        );
-        let h2 = atlas.height;
-        assert!(
-            h2 <= tex_h,
-            "the committed grow stays under the texture cap"
-        );
-        let band_bytes = atlas.data[(band.0 * w) as usize..(band.1 * w) as usize].to_vec();
-        let data2 = atlas.data[..(w * h2) as usize].to_vec();
-
-        // Genuine overflow: a cap below the occupied height takes no append, so
-        // `grow_atlas` refuses and leaves the atlas unmodified.
-        let mut keys3: Vec<GlyphKey> = "0123456789".chars().map(|c| cpu.glyph_key(c)).collect();
-        keys3.sort_unstable();
-        keys3.dedup();
-        keys3.retain(|k| !keys1.contains(k) && !keys2.contains(k));
-        assert!(
-            grow_atlas(&mut cpu, &mut atlas, &keys3, h2.saturating_sub(1)).is_none(),
-            "a cap below the occupied height is a genuine overflow"
-        );
-        assert_eq!(
-            atlas.data[..(w * h2) as usize],
-            data2[..],
-            "a refused grow must leave the atlas unmodified"
-        );
-        let mut all_keys: Vec<GlyphKey> =
-            keys1.iter().chain(&keys2).chain(&keys3).copied().collect();
-        all_keys.sort_unstable();
-        all_keys.dedup();
-        let atlas3 = build_atlas(&mut cpu, &all_keys, u32::MAX);
-        let h3 = atlas3.height;
-        let data3 = atlas3.data[..(w * h3) as usize].to_vec();
-        assert!(
-            h3 >= h2,
-            "the rebuild packs a superset, so it cannot occupy fewer rows"
-        );
-
-        // ---- the same choreography on each arm, byte-compared -------------
-        // Test-only usage adds copy_src so both arms can read texels back.
-        let usage = TexUsage {
-            copy_src: true,
-            ..TexUsage::UPLOADED_SAMPLED
-        };
-        let read_metal = |tex: &crate::metal::resources::SealedTexture, h: u32| -> Vec<u8> {
-            let rb = mdev
-                .new_buffer((w * h) as usize)
-                .expect("metal readback buffer");
-            let mut cb = session.begin().expect("cb");
-            cb.copy_texture_to_buffer(tex, w as usize, h as usize, &rb, w as usize)
-                .expect("metal readback copy");
-            assert_eq!(
-                cb.commit().wait_outcome(),
-                crate::metal::loss::CbOutcome::Completed,
-                "the readback completes"
-            );
-            // SAFETY: shared storage, sized w*h, terminal above.
-            unsafe { crate::metal::ffi::buffer_bytes(&rb, (w * h) as usize) }
-        };
-
-        let wgpu_handle = gpu.ctx.device_layer();
-        let metal_handle = DeviceHandle::Metal(&mint);
-
-        // Step 1 — create + occupied-rows full upload (create_atlas_texture's
-        // shape) on both arms.
-        let wt = wgpu_handle.create_texture_2d(
-            "aterm-gpu grow-parity wgpu atlas",
-            TexelFormat::R8Unorm,
-            w,
-            tex_h,
-            usage,
-            None,
-        );
-        wgpu_handle.upload_texture_full(&wt, &data1, w, w, h1);
-        let mt = metal_handle.create_texture_2d(
-            "aterm-gpu grow-parity metal atlas",
-            TexelFormat::R8Unorm,
-            w,
-            tex_h,
-            usage,
-            None,
-        );
-        metal_handle.upload_texture_full(&mt, &data1, w, w, h1);
-        let wgpu_bytes = gpu.texture_bytes_tight_for_test(wt.wgpu(), w, h1, 1);
-        let metal_bytes = read_metal(mt.metal(), h1);
-        assert_eq!(
-            wgpu_bytes, data1,
-            "step 1 (full pack): the wgpu texture must hold the CPU atlas bytes"
-        );
-        assert_eq!(
-            metal_bytes, data1,
-            "step 1 (full pack): the METAL texture must hold the CPU atlas bytes"
-        );
-
-        // Step 2: in-place append, one row-ranged write of the dirty band on
-        // both arms; the whole occupied region must then match.
-        wgpu_handle.upload_texture_rows(&wt, band.0, band.1 - band.0, &band_bytes, w, w);
-        metal_handle.upload_texture_rows(&mt, band.0, band.1 - band.0, &band_bytes, w, w);
-        let wgpu_bytes = gpu.texture_bytes_tight_for_test(wt.wgpu(), w, h2, 1);
-        let metal_bytes = read_metal(mt.metal(), h2);
-        assert_eq!(
-            wgpu_bytes, data2,
-            "step 2 (row-ranged append): the wgpu texture diverged from the CPU atlas"
-        );
-        assert_eq!(
-            metal_bytes, data2,
-            "step 2 (row-ranged append): the METAL texture diverged from the CPU \
-             atlas — a y-offset or stride fault in the replaceRegion: band lands here"
-        );
-
-        // Step 2b: the y-offset. The grow above packed into existing shelves
-        // (`band.0 == 0`), so it cannot catch an arm that ignores `y0`. Write
-        // a synthetic band at rows [q, q+3) on both arms and require the whole
-        // occupied region to equal the CPU mirror.
-        let q = (h2 / 2).max(1);
-        let rows_b = 3.min(h2 - q);
-        assert!(q > 0 && rows_b > 0, "the y-offset arm needs a real band");
-        let band_b: Vec<u8> = (0..(w * rows_b) as usize)
-            .map(|i| u8::try_from((i * 37 + 11) % 256).expect("< 256"))
-            .collect();
-        let mut mirror = data2.clone();
-        mirror[(q * w) as usize..((q + rows_b) * w) as usize].copy_from_slice(&band_b);
-        assert_ne!(
-            mirror, data2,
-            "the synthetic band must actually change the mirror, or the arm is vacuous"
-        );
-        wgpu_handle.upload_texture_rows(&wt, q, rows_b, &band_b, w, w);
-        metal_handle.upload_texture_rows(&mt, q, rows_b, &band_b, w, w);
-        let wgpu_bytes = gpu.texture_bytes_tight_for_test(wt.wgpu(), w, h2, 1);
-        let metal_bytes = read_metal(mt.metal(), h2);
-        assert_eq!(
-            wgpu_bytes, mirror,
-            "step 2b (y-offset band): the wgpu band landed wrong"
-        );
-        assert_eq!(
-            metal_bytes, mirror,
-            "step 2b (y-offset band): the METAL band landed wrong — MtlOrigin.y \
-             or the stride is mishandled at y0 > 0"
-        );
-
-        // Step 3 — overflow rebuild: fresh taller textures, full upload of
-        // the repacked atlas (rebuild_atlases' shape) on both arms.
-        let wt3 = wgpu_handle.create_texture_2d(
-            "aterm-gpu grow-parity wgpu atlas rebuild",
-            TexelFormat::R8Unorm,
-            w,
-            h3 + 64,
-            usage,
-            None,
-        );
-        wgpu_handle.upload_texture_full(&wt3, &data3, w, w, h3);
-        let mt3 = metal_handle.create_texture_2d(
-            "aterm-gpu grow-parity metal atlas rebuild",
-            TexelFormat::R8Unorm,
-            w,
-            h3 + 64,
-            usage,
-            None,
-        );
-        metal_handle.upload_texture_full(&mt3, &data3, w, w, h3);
-        let wgpu_bytes = gpu.texture_bytes_tight_for_test(wt3.wgpu(), w, h3, 1);
-        let metal_bytes = read_metal(mt3.metal(), h3);
-        assert_eq!(
-            wgpu_bytes, data3,
-            "step 3 (overflow rebuild): the wgpu texture diverged from the repack"
-        );
-        assert_eq!(
-            metal_bytes, data3,
-            "step 3 (overflow rebuild): the METAL texture diverged from the repack"
-        );
-        crate::stderr_line!(
-            "atlas grow parity: {} keys -> {h1} rows, +{} keys appended rows \
-             {}..{} in place, y-offset band at {q}..{}, overflow rebuilt at \
-             {h3} rows — wgpu and Metal byte-identical to the CPU atlas at \
-             every step",
-            keys1.len(),
-            keys2.len(),
-            band.0,
-            band.1,
-            q + rows_b,
-        );
-
-        // Reverse crossing guard: a wgpu resource reaching a Metal-only seam
-        // refuses by name (the forward case is in device_layer::tests).
-        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = wt.metal();
-        }))
-        .expect_err("a wgpu texture in a Metal seam must refuse");
-        let msg = err
-            .downcast_ref::<String>()
-            .cloned()
-            .or_else(|| err.downcast_ref::<&str>().map(|m| (*m).to_owned()))
-            .unwrap_or_default();
-        assert!(
-            msg.contains("device layer"),
-            "the refusal must name the device layer, got: {msg}"
-        );
-    }
-
-    /// Explicit VS15 reaches the GPU as the CPU's one-cell mono image while the
-    /// bare form of the same scalar stays a two-cell colour image: both cache
-    /// identities coexist and land in the right atlas. Pure CPU. Not on
-    /// Windows: its Segoe UI Symbol maps a monochrome 😀, which outranks the
-    /// colour face by design.
-    #[cfg(not(windows))]
-    #[test]
-    fn vs15_text_and_default_emoji_pack_distinct_one_and_two_cell_atlas_entries() {
-        // A host fact, from the files: every Mac ships a colour face, a Linux
-        // host when Noto Color Emoji is installed.
-        let noto = "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf";
-        if !cfg!(target_os = "macos") && !std::path::Path::new(noto).is_file() {
-            aterm_spec::host::could_not_run(format!("{noto} is not installed here"));
-        }
-        let Some(mut cpu) = Renderer::from_system(18.0, Theme::default()) else {
-            aterm_spec::host::could_not_run("no system monospace font");
-        };
-        let grin = '\u{1F600}';
-        cpu.debug_block_on_lazy_fallbacks();
-        let default_key = cpu.glyph_key(grin);
-        assert!(
-            default_key.source == FaceId::ColorEmoji && default_key.glyph_class == GlyphClass::Rgba,
-            "😀 takes the colour path: {default_key:?}"
-        );
-
-        let mut term = Terminal::new(1, 4);
-        term.process("😀\u{FE0E}\x1b[2GX".as_bytes());
-        let input = term.cell_frame(1, 4);
-        let cell = input.cells[0][0];
-        assert!(cell.text_presentation);
-        assert_eq!(aterm_render::materialized_cell_span(&input.cells[0], 0), 1);
-        let text_key = cpu.resolve_cell_key_for_span(None, &cell, 1);
-        assert_ne!(text_key, default_key);
-        assert_ne!(text_key.source, FaceId::ColorEmoji);
-        assert!(matches!(
-            text_key.glyph_class,
-            GlyphClass::Mono | GlyphClass::MonoGid
-        ));
-
-        let (cw, ch) = cpu.cell_size();
-        let text_img = cpu.glyph_image(text_key).clone();
-        let GlyphImage::Mono {
-            width,
-            height,
-            bytes,
-            ..
-        } = &text_img
-        else {
-            panic!("VS15 atlas input must be mono")
-        };
-        assert!(text_img.xmin() >= 0 && text_img.xmin() + *width as i32 <= cw as i32);
-        assert!(*height <= ch);
-        let mono = build_atlas(&mut cpu, &[text_key], u32::MAX);
-        let slot = mono
-            .map
-            .get(&text_key)
-            .expect("VS15 key reaches mono atlas");
-        assert_eq!((slot.gw as usize, slot.gh as usize), (*width, *height));
-        for j in 0..slot.gh {
-            for i in 0..slot.gw {
-                assert_eq!(
-                    mono.data[((slot.ay + j) * mono.width + slot.ax + i) as usize],
-                    bytes[(j * slot.gw + i) as usize],
-                    "VS15 mono atlas texel differs from CPU cache at ({i},{j})"
-                );
-            }
-        }
-
-        let default_img = cpu.glyph_image(default_key).clone();
-        assert_eq!(default_img.advance(), (2 * cw) as f32);
-        assert!(
-            default_img.xmin() >= 0
-                && default_img.xmin() + default_img.width() as i32 <= (2 * cw) as i32
-        );
-        let color = build_color_atlas(&mut cpu, &[default_key], u32::MAX);
-        let color_slot = color
-            .map
-            .get(&default_key)
-            .expect("default emoji key reaches colour atlas");
-        assert_eq!(
-            (color_slot.gw as usize, color_slot.gh as usize),
-            (default_img.width(), default_img.height())
-        );
-
-        // A primary font can own an emoji-default scalar (DejaVu's ⚡): bare and
-        // VS15 name the same face/gid, so the one-cell qualifier alone must
-        // separate the atlas identities.
+    fn vs15_and_bare_primary_glyphs_pack_distinct_atlas_entries() {
         let primary_bytes = include_bytes!("../../aterm-render/assets/DejaVuSansMono.ttf");
         let mut primary = Renderer::from_bytes(primary_bytes, 18.0, Theme::default())
             .expect("fixture primary renderer");
@@ -22444,29 +21388,6 @@ ab\r\n",
         let before = mono.data.clone();
         mono.blit(&overwide, &slot);
         assert_eq!(mono.data, before, "zero-slot blit writes nothing");
-        // A subsequent NORMAL glyph still packs at the origin — proof the over-wide
-        // attempt left the packer state intact.
-        let normal = GlyphImage::Mono {
-            width: 5,
-            height: 8,
-            xmin: 0,
-            ymin: 0,
-            advance: 6.0,
-            bytes: vec![0xFF; 5 * 8],
-        };
-        let nkey = GlyphKey::mono_char(
-            aterm_render::FaceId::Primary,
-            'x',
-            aterm_render::StyleBits::REGULAR,
-            px_q,
-        );
-        assert_eq!(
-            mono.place(nkey, &normal),
-            Some((0, 8)),
-            "a normal glyph still packs at the origin"
-        );
-        let nslot = *mono.map.get(&nkey).expect("normal glyph slot");
-        assert_eq!((nslot.ax, nslot.ay, nslot.gw, nslot.gh), (0, 0, 5, 8));
 
         // --- Color atlas: over-wide glyph is skipped entirely (no slot recorded). ---
         let mut color = Atlas {
@@ -22525,44 +21446,8 @@ ab\r\n",
         );
     }
 
-    /// The constructor's font thread does not prewarm; the post-seal warm the
-    /// host calls is what the first atlas build finds resident (regular and
-    /// bold ASCII), and later look-ups hit.
     #[test]
-    fn the_font_thread_leaves_the_cache_cold_and_the_post_seal_prewarm_survives() {
-        let theme = Theme::default();
-        // The real constructor is the subject (its font thread); a host with
-        // no GPU could not run it, decided before it runs.
-        if let Err(error) = GpuContext::new() {
-            aterm_spec::host::could_not_run(format!("no GPU: {error}"));
-        }
-        let mut gpu = GpuRenderer::new(16.0, theme).expect("the GPU renderer builds");
-        assert_eq!(
-            gpu.cpu.glyph_cache_len(),
-            0,
-            "the font thread must not rasterize into a cache the seal is about to clear"
-        );
-        gpu.seal_admitted_font_sources();
-        gpu.prewarm_ascii();
-        let warmed = gpu.cpu.glyph_cache_len();
-        assert!(
-            warmed >= 2 * 95,
-            "regular + bold printable ASCII must be resident after the post-seal warm; got {warmed}"
-        );
-        for ch in ['$', '>', 'a', 'Z'] {
-            let regular = gpu.cpu.glyph_key(ch);
-            let bold = gpu.cpu.glyph_key_styled(ch, aterm_render::StyleBits::BOLD);
-            let _ = gpu.cpu.glyph_image(regular);
-            let _ = gpu.cpu.glyph_image(bold);
-        }
-        assert_eq!(
-            gpu.cpu.glyph_cache_len(),
-            warmed,
-            "the prompt's regular and bold keys must be cache hits after the warm"
-        );
-    }
-
-    #[test]
+    #[cfg(wgpu_arm)]
     fn admitted_rebuild_preserves_device_and_exact_sources() {
         const FONT: &[u8] = include_bytes!("../../aterm-render/assets/DejaVuSansMono.ttf");
         let theme = Theme::default();
@@ -22617,62 +21502,11 @@ ab\r\n",
         );
     }
 
-    /// The glyph atlas persists across frames: two `render_input` calls with an
-    /// unchanged glyph set create no new atlas texture (counter unchanged,
-    /// resident dims identical). Skips without GPU/font.
-    #[test]
-    fn atlas_persists_across_unchanged_frames() {
-        let theme = Theme::default();
-        let px = 18.0;
-        let mut gpu = crate::renderer::gpu_renderer_for_test(None, px, theme);
-
-        // A small static grid (cursor hidden so a blink phase can't change the
-        // glyph set), then the EXACT same input rendered again.
-        let (rows, cols) = (3usize, 8usize);
-        let mut term = Terminal::new(rows as u16, cols as u16);
-        term.process(b"\x1b[?25lhello\r\nworld\r\nabcd");
-        let input = term.cell_frame(rows, cols);
-        let mut win = WindowGpu::new();
-
-        // Frame 1: cold cache -> the atlases are built (both textures created).
-        let _ = gpu.render_input(&mut win, &input, None);
-        let after_first = gpu.atlas_tex_creations();
-        let dims_first = gpu
-            .atlas_tex_dims()
-            .expect("atlases resident after first frame");
-        assert!(
-            after_first >= 1,
-            "first frame should have created at least one atlas texture"
-        );
-
-        // Frame 2: identical glyph set -> reuse, NO new texture creation.
-        let _ = gpu.render_input(&mut win, &input, None);
-        let after_second = gpu.atlas_tex_creations();
-        let dims_second = gpu.atlas_tex_dims().expect("atlases still resident");
-
-        assert_eq!(
-            after_first, after_second,
-            "an unchanged-glyph frame must NOT create a new atlas texture \
-             (creations {after_first} -> {after_second}) — the atlas is not persisting"
-        );
-        assert_eq!(
-            dims_first, dims_second,
-            "resident atlas texture dims changed across an unchanged frame — textures were recreated"
-        );
-
-        // And a THIRD identical frame is still a no-op (steady state holds).
-        let _ = gpu.render_input(&mut win, &input, None);
-        assert_eq!(
-            after_second,
-            gpu.atlas_tex_creations(),
-            "repeated unchanged frames must keep reusing the resident atlas"
-        );
-    }
-
     /// A new glyph appends into the resident atlas via a sub-region upload (same
-    /// dims, no new texture); only genuine overflow recreates. Skips without
-    /// GPU/font.
+    /// dims, no new texture); only genuine overflow recreates. No GPU or
+    /// no font: COULD NOT RUN.
     #[test]
+    #[cfg(wgpu_arm)]
     fn new_glyph_grows_atlas_in_place_without_recreating_texture() {
         let theme = Theme::default();
         let px = 18.0;
@@ -22711,7 +21545,7 @@ ab\r\n",
     /// interleaved through the scissored present-readback path on one shared
     /// `GpuRenderer` each read back identical to a fresh full render of their
     /// own input. Shared state would diff B against A's last frame and leak A's
-    /// pixels into B. Skips without GPU/font.
+    /// pixels into B. No GPU or no font: COULD NOT RUN.
     #[test]
     fn present_prev_is_per_window_no_cross_window_leak() {
         let theme = Theme::default();
@@ -22793,7 +21627,7 @@ ab\r\n",
     /// they will preserve/return pixels at the prior Y origin indefinitely.
     #[test]
     fn asymmetric_top_pad_change_invalidates_gpu_present_and_readback_caches() {
-        let model = aterm_spec::derive::asymmetric_pad_layout_model();
+        let model = aterm_models_render::asymmetric_pad_layout_model();
         let picked = model
             .successors("PickLayout", &model.init_state())
             .into_iter()
@@ -22919,11 +21753,15 @@ ab\r\n",
         assert_ne!(gated_first, gated_moved);
     }
 
-    /// With bloom enabled (the default), a glow frame takes the scissored path
-    /// with dirty rows widened to the halo penumbra, and every frame of a
-    /// spawn → animate → fade-out → post-fade sequence equals a fresh full
-    /// render (no ghosting or accumulation), including at the max bloom radius.
-    /// Skips without GPU/font.
+    /// With bloom enabled (the default), every frame of one window's glow
+    /// sequence takes the scissored present, its dirty rows widened to the halo
+    /// penumbra, and equals a fresh full render (no ghosting or accumulation):
+    /// spawn, animate, a mid-sequence radius change to the clamp max (the halo
+    /// composites at present time over a copy of the bloom-free offscreen, so
+    /// no old-radius fringe reaches the scissor base), fade-out, and a halo at
+    /// the grid's top edge spilling into the pad strip (a row-0 band opens the
+    /// strip and the strip-reset quads rebuild it from bg). No GPU or no font:
+    /// COULD NOT RUN.
     #[test]
     fn bloom_glow_frames_scissor_and_match_full_render() {
         let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
@@ -22938,205 +21776,71 @@ ab\r\n",
         let (cw, ch) = gpu.cell_size();
         let (rows, cols) = (10usize, 12usize);
 
-        let frame = |bytes: &[u8]| {
+        let frame = |bytes: &[u8], glow: Vec<GlowQuad>| {
             let mut term = Terminal::new(rows as u16, cols as u16);
             term.process(b"\x1b[?25l");
             term.process(bytes);
-            term.cell_frame(rows, cols)
+            let mut input = term.cell_frame(rows, cols);
+            input.cursor_glow_add = glow;
+            input
         };
-        // A single-row window-absolute glow quad (coords carry the grid origin),
-        // clear of the edges so the penumbra stays inside the grid.
-        let quad = |row: usize, dx: usize| GlowQuad {
+        // A window-absolute single-row glow quad (coords carry the grid origin).
+        let quad = |row: usize, x: usize, y: usize, h: usize| GlowQuad {
             row: row as u16,
-            x: (pad + 2 * cw + dx) as u16,
-            y: (pad + row * ch + 2) as u16,
+            x: (pad + x) as u16,
+            y: (pad + row * ch + y) as u16,
             w: cw as u16,
-            h: (ch - 4) as u16,
-            color: 0x0030_50A0, // premultiplied light,
-            // ADDITIVE light (see `GlowQuad::alpha`).
+            h: h as u16,
+            color: 0x0030_50A0, // premultiplied ADDITIVE light (alpha 0)
             alpha: 0,
             color2: 0x0030_50A0,
             alpha2: 0,
         };
-
-        let run = |gpu: &mut GpuRenderer, label: &str| {
-            // spawn → animate (text stable, glow-only change) → fade-out (glow
-            // empties) → post-fade (text change, no glow).
-            let mut spawn = frame(b"AAAA\r\nbbbb");
-            spawn.cursor_glow_add = vec![quad(4, 0)];
-            let mut animate = frame(b"AAAA\r\nbbbb");
-            animate.cursor_glow_add = vec![quad(4, 3), quad(5, 1)];
-            let seq = [
-                frame(b"AAAA"),
-                spawn,
-                animate,
-                frame(b"AAAA\r\nbbbb"),
-                frame(b"AAAA\r\ncccc"),
-            ];
-            let mut win = WindowGpu::new();
-            let before = gpu.scissor_taken();
-            for (i, input) in seq.iter().enumerate() {
-                let got = gpu.present_input_readback(&mut win, input);
-                // Fresh window ⇒ render_input is a clean FULL repaint reference
-                // (bloom composited unscissored over a cleared offscreen).
-                let mut ref_win = WindowGpu::new();
-                let want = gpu.render_input(&mut ref_win, input, None);
-                assert_eq!(
-                    (got.width, got.height),
-                    (want.width, want.height),
-                    "[{label}] frame {i}: dims must match the full-render reference"
-                );
-                assert_eq!(
-                    got.pixels, want.pixels,
-                    "[{label}] frame {i}: scissored bloom present must be \
-                     byte-identical to a fresh full render (halo ghost/accumulation?)"
-                );
+        let inner = |row: usize, dx: usize| quad(row, 2 * cw + dx, 2, ch - 4);
+        // (radius set before this present, input)
+        let seq = [
+            (None, frame(b"AAAA", Vec::new())),
+            (None, frame(b"AAAA\r\nbbbb", vec![inner(4, 0)])),
+            (
+                Some(8.0),
+                frame(b"AAAA\r\nbbbb", vec![inner(4, 3), inner(5, 1)]),
+            ),
+            (None, frame(b"AAAA\r\nbbbb", Vec::new())),
+            (None, frame(b"AAAA\r\ncccc", vec![quad(0, cw, 1, ch - 2)])),
+            (None, frame(b"AAAA\r\ncccc", Vec::new())),
+        ];
+        let mut win = WindowGpu::new();
+        let mut scissored = 0;
+        for (i, (radius, input)) in seq.iter().enumerate() {
+            if let Some(radius) = radius {
+                gpu.set_bloom_params(BLOOM_STRENGTH, *radius);
             }
-            assert!(
-                gpu.scissor_taken() > before,
-                "[{label}] glow frames must take the scissored path, not force Full \
-                 (scissor_taken={}, full_repaints={})",
-                gpu.scissor_taken(),
-                gpu.full_repaints(),
-            );
-        };
-
-        run(&mut gpu, "default radius");
-        // The config clamp max spreads the widest halo the margin must cover.
-        gpu.set_bloom_params(BLOOM_STRENGTH, 8.0);
-        run(&mut gpu, "radius 8.0");
-    }
-
-    /// A bloom-radius change between two glow presents of one window stays on
-    /// the scissor path and equals a fresh full render: the halo composites at
-    /// present time over a copy of the bloom-free offscreen, so no old-radius
-    /// fringe or accumulation can reach the scissor base. Skips without
-    /// GPU/font.
-    #[test]
-    fn bloom_radius_change_mid_sequence_scissors_byte_identical() {
-        let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
-        assert!(gpu.bloom_enabled(), "precondition: bloom defaults ON");
-        // Pin the heat shimmer's wall-clock phase so the scissored present and
-        // the fresh reference compose the same refraction.
-        gpu.set_shimmer_phase_for_test(Some(0.33));
-        gpu.set_pad(14);
-        let pad = gpu.pad();
-        let (cw, ch) = gpu.cell_size();
-        let (rows, cols) = (10usize, 12usize);
-        let frame = |bytes: &[u8]| {
-            let mut term = Terminal::new(rows as u16, cols as u16);
-            term.process(b"\x1b[?25l");
-            term.process(bytes);
-            term.cell_frame(rows, cols)
-        };
-        // Window-absolute quads, as above.
-        let quad = |row: usize, dx: usize| GlowQuad {
-            row: row as u16,
-            x: (pad + 2 * cw + dx) as u16,
-            y: (pad + row * ch + 2) as u16,
-            w: cw as u16,
-            h: (ch - 4) as u16,
-            color: 0x0030_50A0,
-            // ADDITIVE light (see `GlowQuad::alpha`).
-            alpha: 0,
-            color2: 0x0030_50A0,
-            alpha2: 0,
-        };
-        let mut glow_a = frame(b"AAAA\r\nbbbb");
-        glow_a.cursor_glow_add = vec![quad(4, 0)];
-        // Same TEXT, same glow rows — only the radius changes between the two
-        // presents, so `compute_dirty_rows` alone would see a scissorable frame.
-        let mut glow_b = frame(b"AAAA\r\nbbbb");
-        glow_b.cursor_glow_add = vec![quad(4, 3), quad(5, 1)];
-
-        let mut win = WindowGpu::new();
-        // Prime the persistent window with the first glow frame at the default
-        // radius, then flip the radius before the second present.
-        let _ = gpu.present_input_readback(&mut win, &glow_a);
-        gpu.set_bloom_params(BLOOM_STRENGTH, 8.0);
-        let scissor_before = gpu.scissor_taken();
-
-        let got = gpu.present_input_readback(&mut win, &glow_b);
-        let mut ref_win = WindowGpu::new();
-        let want = gpu.render_input(&mut ref_win, &glow_b, None);
-        assert_eq!(
-            (got.width, got.height),
-            (want.width, want.height),
-            "radius-change transition frame: dims must match the full-render reference"
-        );
-        assert_eq!(
-            got.pixels, want.pixels,
-            "a mid-sequence radius change must be byte-identical to a fresh full \
-             render (present-time halo recomputed at the new radius over a clean base)"
-        );
-        assert!(
-            gpu.scissor_taken() > scissor_before,
-            "with present-time bloom (#2) the radius-change frame must stay on the \
-             SCISSOR path — no forced full repaint from an old-radius fringe"
-        );
-    }
-
-    /// A glow halo spilling past the grid's top edge (cursor on row 0) keeps the
-    /// scissored repaint: a row-0 band extends the scissor over the top strip
-    /// and the strip-reset quads rebuild it from bg, so Full and scissored
-    /// frames match a fresh full render. Skips without GPU/font.
-    #[test]
-    fn bloom_glow_at_grid_edge_scissors_and_matches() {
-        let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
-        assert!(gpu.bloom_enabled(), "precondition: bloom defaults ON");
-        // Pin the heat shimmer's wall-clock phase so the scissored present and
-        // the fresh reference compose the same refraction.
-        gpu.set_shimmer_phase_for_test(Some(0.33));
-        gpu.set_pad(14);
-        let pad = gpu.pad();
-        let (cw, ch) = gpu.cell_size();
-        let (rows, cols) = (6usize, 10usize);
-        let frame = |bytes: &[u8]| {
-            let mut term = Terminal::new(rows as u16, cols as u16);
-            term.process(b"\x1b[?25l");
-            term.process(bytes);
-            term.cell_frame(rows, cols)
-        };
-        let mut with_edge_glow = frame(b"AAAA\r\nbbbb");
-        // Window-absolute quad at the grid's top edge: the penumbra spills
-        // into the pad strip above.
-        with_edge_glow.cursor_glow_add = vec![GlowQuad {
-            row: 0,
-            x: (pad + cw) as u16,
-            y: (pad + 1) as u16,
-            w: cw as u16,
-            h: (ch - 2) as u16,
-            color: 0x0030_50A0,
-            // ADDITIVE light (see `GlowQuad::alpha`).
-            alpha: 0,
-            color2: 0x0030_50A0,
-            alpha2: 0,
-        }];
-        let seq = [frame(b"AAAA"), with_edge_glow, frame(b"AAAA\r\nbbbb")];
-        let mut win = WindowGpu::new();
-        let scissored_before = gpu.scissor_taken();
-        for (i, input) in seq.iter().enumerate() {
+            let before = gpu.scissor_taken();
             let got = gpu.present_input_readback(&mut win, input);
+            scissored += gpu.scissor_taken() - before;
+            // Fresh window => render_input is a clean FULL repaint reference
+            // (bloom composited unscissored over a cleared offscreen).
             let mut ref_win = WindowGpu::new();
             let want = gpu.render_input(&mut ref_win, input, None);
             assert_eq!(
-                got.pixels, want.pixels,
-                "frame {i}: edge-glow present must be byte-identical to a full render"
+                (got.width, got.height, got.pixels == want.pixels),
+                (want.width, want.height, true),
+                "frame {i}: the scissored bloom present must be byte-identical to \
+                 a fresh full render (halo ghost, accumulation or old-radius fringe?)"
             );
         }
-        // Both glow frames (edge spawn, fade-out) stay on the scissored path:
-        // the row-0 band opens the top strip and the strip-reset quads rebuild
-        // it, so no Full fallback is needed.
         assert_eq!(
-            gpu.scissor_taken(),
-            scissored_before + 2,
-            "edge-spilling halo frames must keep the scissored repaint"
+            scissored as usize,
+            seq.len() - 1,
+            "every frame after the first must keep the scissored path, not force Full \
+             (full_repaints={})",
+            gpu.full_repaints(),
         );
     }
 
     /// Settings-card upload skip: bytes identical to the resident texture skip
     /// the whole-card `write_texture`; changed bytes or a size change (texture
-    /// recreated, contents undefined) always upload. Skips without GPU/font.
+    /// recreated, contents undefined) always upload. No GPU or no font: COULD NOT RUN.
     #[test]
     fn tray_upload_skips_unchanged_card_bytes() {
         let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
@@ -23246,10 +21950,13 @@ ab\r\n",
     /// against. Drives `present_to_view` through the swapchain stand-in, which
     /// (unlike the readback helpers) does not reset `present_prev`.
     #[test]
+    #[cfg(wgpu_arm)]
     fn fractional_scroll_frames_keep_the_scissor_path() {
         let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
         #[cfg(target_os = "macos")]
         gpu.disarm_metal_for_test();
+        #[cfg(gl_arm)]
+        gpu.disarm_gl_for_oracle();
         let (rows, cols) = (6usize, 12usize);
         let mut term = Terminal::new(rows as u16, cols as u16);
         term.process(b"\x1b[?25lrow zero\r\nrow one\r\nrow two\r\nrow three");
@@ -23351,62 +22058,13 @@ ab\r\n",
         );
     }
 
-    /// Armed-arm twin: after an armed present with a nonzero frac the Metal
-    /// offscreen holds the untranslated frame (the translate happens on
-    /// `metal_present_off` in Submit B), while the presented bytes move the
-    /// band and leave chrome rows pinned.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn armed_fractional_scroll_keeps_the_offscreen_untranslated() {
-        if crate::metal::ffi::Device::preferred().is_none() {
-            aterm_spec::host::could_not_run("no Metal device");
-        }
-        let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
-        gpu.arm_metal_for_test();
-        let (rows, cols) = (6usize, 12usize);
-        let mut term = Terminal::new(rows as u16, cols as u16);
-        term.process(b"\x1b[?25lrow zero\r\nrow one\r\nrow two\r\nrow three");
-        let mut input = term.cell_frame(rows, cols);
-        input.grid_top_row = 1;
-        input.grid_bot_row = rows - 1;
-        let mut win = WindowGpu::new();
-        let untranslated = gpu.render_input(&mut win, &input, None);
-        assert!(
-            gpu.metal_render_armed(),
-            "the first frame must mint the arm"
-        );
-        let (w, h) = (untranslated.width as u32, untranslated.height as u32);
-        let dest = (w + 9, h + 7);
-
-        input.scroll_frac_px = 0;
-        let flat = gpu
-            .metal_present_bytes_for_test(&mut win, &input, dest, false)
-            .expect("armed present");
-        input.scroll_frac_px = 3;
-        let glided = gpu
-            .metal_present_bytes_for_test(&mut win, &input, dest, false)
-            .expect("armed present");
-        // (1) The offscreen is still the untranslated frame.
-        let resident = gpu
-            .metal_read_back_offscreen(&win, w, h)
-            .expect("armed offscreen readback");
-        assert_eq!(
-            resident.pixels, untranslated.pixels,
-            "the armed scissor base must stay untranslated through a glide"
-        );
-        // (2) The glass moved: the presented bytes differ from the frac-0 present
-        //     (non-vacuity — the translate really landed on the copy).
-        assert_ne!(
-            glided, flat,
-            "a frac 3 present must move terminal pixels on glass"
-        );
-    }
-
     /// A scissored armed present-copy frame (one dirty row in the grid band plus
     /// a sub-row band shift) composes only the rect that can differ between the
-    /// resident copy and the clean offscreen. The glass equals a full-copy oracle
-    /// byte for byte, and the whole-row scroll rescue (an offscreen write outside
-    /// any scissor) degrades the tracker to everything.
+    /// resident copy and the clean offscreen. The glide moves the glass, the
+    /// glass equals a full-copy oracle byte for byte (so the offscreen the
+    /// scissored encode builds on stayed untranslated), and the whole-row scroll
+    /// rescue (an offscreen write outside any scissor) degrades the tracker to
+    /// everything.
     #[cfg(target_os = "macos")]
     #[test]
     fn armed_present_composes_the_stale_rect_and_matches_a_full_copy() {
@@ -23448,6 +22106,22 @@ ab\r\n",
             win.metal_last_compose_rect,
             Some([0, 0, fw, fh]),
             "the first sync into a fresh copy is the full frame"
+        );
+        // The translate lands on the glass: a frac-0 present differs.
+        let mut flat = input.clone();
+        flat.scroll_frac_px = 0;
+        let flat = gpu
+            .metal_present_bytes_with_scope_for_test(
+                &mut WindowGpu::new(),
+                &flat,
+                dest,
+                false,
+                true,
+            )
+            .expect("armed present");
+        assert_ne!(
+            primed, flat,
+            "a frac 3 present must move terminal pixels on glass"
         );
 
         // One cell changes INSIDE the band (row 2), same frac: a scissored armed
@@ -23519,6 +22193,7 @@ ab\r\n",
     /// non-finite) is always `Opaque`; translucent uses `PostMultiplied` only
     /// where the surface offers it, otherwise stays solid.
     #[test]
+    #[cfg(wgpu_arm)]
     fn present_alpha_mode_is_opacity_and_caps_aware() {
         use super::GpuRenderer;
         use wgpu::CompositeAlphaMode::{Opaque, PostMultiplied};
@@ -23532,23 +22207,6 @@ ab\r\n",
         // Translucent but the surface has NO non-opaque composite → honestly solid.
         assert_eq!(GpuRenderer::present_alpha_mode(0.85, false), Opaque);
         assert_eq!(GpuRenderer::present_alpha_mode(0.0, false), Opaque);
-    }
-
-    /// `with_translucency` sets the blit's translucent flag and the
-    /// remainder-band alpha; the solid default leaves the flag clear so the
-    /// present forces destination alpha to 1.0.
-    #[test]
-    fn blit_translucency_sets_flag_and_band_alpha() {
-        use super::BlitUniform;
-        let solid = BlitUniform::bell(false);
-        assert_eq!(solid.translucent, 0.0, "solid default keeps the flag clear");
-        let t = BlitUniform::bell(false).with_translucency(0.5);
-        assert_eq!(t.translucent, 1.0, "translucent flag set");
-        assert_eq!(t.band[3], 0.5, "band alpha threaded");
-        // std140 layout: 112 bytes, matching the WGSL `Blit` struct (the
-        // `sdr_white_scale` block after `translucent`, and `chrome_y0` plus
-        // three pads after `premult`).
-        assert_eq!(std::mem::size_of::<BlitUniform>(), 112);
     }
 
     /// SDR→HDR metadata changes only after f16+scRGB succeeds and starts each
@@ -23573,6 +22231,7 @@ ab\r\n",
     /// A confirmed-HDR window in the model's `stage = 0` state: extended-linear
     /// capture metadata and live scRGB reference-white/headroom values. Not the
     /// inert defaults, which would make the fallback assertions vacuous.
+    #[cfg(wgpu_arm)]
     fn confirmed_hdr_window() -> WindowGpu {
         let mut win = WindowGpu::new();
         win.set_capture_color_space(crate::video_tap::CaptureColorSpace::ExtendedLinearSrgb);
@@ -23583,6 +22242,7 @@ ab\r\n",
 
     /// Lift a concrete projection onto `before`'s variables to get the state the
     /// model must agree is the successor.
+    #[cfg(wgpu_arm)]
     fn project_reconfigure(
         before: &std::collections::BTreeMap<&'static str, i64>,
         projection: crate::format_plan::HdrReconfigureProjection,
@@ -23598,6 +22258,7 @@ ab\r\n",
     /// Checks one action: the model enables it, the concrete `before -> after`
     /// step is its only successor, the tiered validator admits it under that
     /// action's name, and every invariant holds after.
+    #[cfg(wgpu_arm)]
     fn assert_reconfigure_transition(
         model: &aterm_spec::derive::Model,
         before: &std::collections::BTreeMap<&'static str, i64>,
@@ -23632,6 +22293,93 @@ ab\r\n",
         }
     }
 
+    /// The macOS monitor-change upgrade, driven on a real Metal swapchain under
+    /// a stand-in parent layer (the screen's EDR potential injected where the
+    /// attach's AppKit reader would answer). It holds the order the upgrade
+    /// promises: an SDR or unresolved screen moves nothing; a refused flip
+    /// restores the retained format and promotes no capture metadata; an EDR
+    /// screen moves the LIVE layer to f16 before the metadata says linear (a
+    /// `want` derived before the retained format moved would leave the layer
+    /// 8-bit and still report success); and an f16 surface never reads the
+    /// screen again.
+    #[cfg(all(target_os = "macos", not(wgpu_arm)))]
+    #[test]
+    fn the_screen_upgrade_moves_the_layer_before_it_promotes_the_metadata() {
+        use crate::device_layer::TexelFormat;
+        use crate::video_tap::CaptureColorSpace;
+
+        let _pool = crate::metal::ffi::AutoreleasePool::new();
+        let parent = crate::metal::test_support::plain_calayer();
+        let mut gpu =
+            crate::renderer::gpu_renderer_for_test(None, 18.0, aterm_render::Theme::default());
+        gpu.set_hdr_glow(true);
+        let mut win = WindowGpu::new();
+        let mut surf = gpu
+            .attach_metal_window_surface(&parent, TexelFormat::Bgra8Unorm, 64, 48)
+            .expect("an 8-bit attach under a stand-in parent layer");
+        let linear =
+            |win: &WindowGpu| win.capture_color_space == CaptureColorSpace::ExtendedLinearSrgb;
+        let layer = |surf: &super::GpuSurface| {
+            surf.metal
+                .as_ref()
+                .expect("the attach armed a swapchain")
+                .config()
+                .format
+        };
+        let held_8bit = |surf: &super::GpuSurface, why: &str| {
+            assert_eq!(
+                surf.neutral.format,
+                TexelFormat::Bgra8Unorm,
+                "{why}: retained"
+            );
+            assert_eq!(
+                layer(surf),
+                TexelFormat::Bgra8Unorm.metal(),
+                "{why}: live layer"
+            );
+        };
+
+        for potential in [Some(1.0), None] {
+            assert!(
+                !gpu.upgrade_surface_on_screen(&mut win, &mut surf, || potential),
+                "{potential:?} is no evidence of an EDR screen"
+            );
+            held_8bit(&surf, "no EDR screen");
+            assert!(!linear(&win), "no EDR screen promotes no metadata");
+        }
+
+        // A refused flip: the arm is not live, so the layer cannot move.
+        let arm = gpu.metal_arm.take();
+        assert!(!gpu.upgrade_surface_on_screen(&mut win, &mut surf, || Some(2.0)));
+        held_8bit(&surf, "a refused flip");
+        assert!(!linear(&win), "a refused flip promotes no metadata");
+        gpu.metal_arm = arm;
+
+        assert!(
+            gpu.upgrade_surface_on_screen(&mut win, &mut surf, || Some(2.0)),
+            "an EDR screen upgrades an opted-in 8-bit window"
+        );
+        assert_eq!(surf.neutral.format, TexelFormat::Rgba16Float);
+        assert_eq!(
+            layer(&surf),
+            TexelFormat::Rgba16Float.metal(),
+            "the live layer itself moved, not only the retained desire"
+        );
+        assert!(linear(&win), "the metadata follows the flipped layer");
+
+        let mut read = false;
+        assert!(!gpu.upgrade_surface_on_screen(&mut win, &mut surf, || {
+            read = true;
+            Some(1.0)
+        }));
+        assert!(!read, "an f16 surface never reads the screen");
+        assert_eq!(
+            layer(&surf),
+            TexelFormat::Rgba16Float.metal(),
+            "one direction only"
+        );
+    }
+
     /// Tier-1 refinement binding for `HdrReconfigureRetag`: drives the real
     /// `apply_hdr_reconfigure_plan` / `apply_hdr_surface_upgrade` on a
     /// `WindowGpu` and reads `capture_linear` back, so an apply that forgets its
@@ -23639,53 +22387,18 @@ ab\r\n",
     ///
     /// Only `capture_linear` is measured; `is_f16` is the planner's resolved
     /// format and `stage`/`retagged` are drive coordinates. The surface-side
-    /// halves need a real DX12 swapchain and are held by `hdr_gate.rs`'s source
-    /// gate (see `aterm_spec::derive::hdr_reconfigure_retag_model`). In-crate so
-    /// the two applies can stay private.
+    /// halves need a real DX12 swapchain; `LiveSurface` holds them by
+    /// construction, since its only live configure is the re-tagging one (see
+    /// `aterm_models_render::hdr_reconfigure_retag_model`). In-crate so the two
+    /// applies can stay private.
     #[test]
+    #[cfg(wgpu_arm)]
     fn hdr_reconfigure_apply_conforms_to_retag_model() {
         use crate::format_plan::{HdrReconfigurePlan, hdr_reconfigure_plan};
         use crate::video_tap::CaptureColorSpace;
 
-        let model = aterm_spec::derive::hdr_reconfigure_retag_model();
+        let model = aterm_models_render::hdr_reconfigure_retag_model();
         let initial = model.init_state();
-
-        // Every action is anchored on both halves (planner and apply); the
-        // anchors are gated on cfgs that include `cfg(test)`.
-        {
-            use std::collections::{BTreeMap, BTreeSet};
-
-            let anchors: Vec<_> = aterm_spec::xref::refinements()
-                .filter(|anchor| anchor.machine == "HdrReconfigureRetag")
-                .collect();
-            let mut fns_of_action: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-            for anchor in &anchors {
-                fns_of_action
-                    .entry(anchor.action)
-                    .or_default()
-                    .insert(anchor.rust_method);
-                assert_eq!(
-                    anchor.project, "aterm_gpu::WindowGpu::project_hdr_reconfigure_state",
-                    "{} must name the live projection, not a hand-written table",
-                    anchor.action
-                );
-            }
-            let expected: BTreeMap<&str, BTreeSet<&str>> = [
-                ("RetagSucceeds", "apply_hdr_reconfigure_plan"),
-                ("RetagFails", "apply_hdr_reconfigure_plan"),
-                ("EnterSdrFallback", "apply_hdr_reconfigure_plan"),
-                ("UpgradeFails", "apply_hdr_reconfigure_plan"),
-                ("UpgradeSucceeds", "apply_hdr_surface_upgrade"),
-            ]
-            .into_iter()
-            .map(|(action, apply)| (action, BTreeSet::from(["hdr_reconfigure_plan", apply])))
-            .collect();
-            assert_eq!(
-                fns_of_action, expected,
-                "every HdrReconfigureRetag action must bind the shipping planner AND the \
-                 concrete apply that performs its metadata half"
-            );
-        }
 
         // stage 0 -> 2: an f16 surface rebuilt by any live reconfigure. The plan
         // decides; the apply reconciles; the projection reads the apply's work.
@@ -23862,6 +22575,7 @@ ab\r\n",
     /// re-check scRGB support: immediately on an unvalidated/dormant surface,
     /// at most once per interval on an animated window.
     #[test]
+    #[cfg(wgpu_arm)]
     fn hdr_state_probe_is_immediate_then_throttled() {
         let now = aterm_time::Instant::now();
         assert!(hdr_color_space_probe_due(None, now));
@@ -23917,48 +22631,44 @@ impl<T> WindowTarget for T where T: aterm_objc::HasNsView + Send + Sync + 'stati
 
 /// A window a GPU backend can attach a swapchain to.
 ///
+/// On Linux that is the window's X11 or Wayland handles
+/// ([`aterm_types::native_window::HasNativeWindow`]): the GL arm makes its EGL
+/// window surface on them, and the wgpu-oracle arm hands wgpu the same handles
+/// (`NativeSurfaceTarget`). Naming no handle crate keeps raw-window-handle out
+/// of the shipped Linux graph (docs/AUDIT-third-party-2026-10-15.md,
+/// winit-core step 6, the Linux half).
+#[cfg(target_os = "linux")]
+pub trait WindowTarget:
+    aterm_types::native_window::HasNativeWindow + Send + Sync + 'static
+{
+}
+
+#[cfg(target_os = "linux")]
+impl<T> WindowTarget for T where
+    T: aterm_types::native_window::HasNativeWindow + Send + Sync + 'static
+{
+}
+
+/// A window a GPU backend can attach a swapchain to.
+///
 /// Keeps `wgpu` types out of the public API: the bound is the same set
 /// `wgpu::SurfaceTarget` accepts (`HasWindowHandle + HasDisplayHandle +
-/// WasmNotSendSync`).
-///
-/// wgpu's `WasmNotSendSync` is `Send + Sync` on every cell aterm builds: native
-/// targets, and wasm32 because `Cargo.toml` enables
-/// `fragile-send-sync-non-atomic-wasm`. Only a threaded (`atomics`) wasm build
-/// relaxes it; see the other arm.
-#[cfg(not(any(
-    target_os = "macos",
-    all(target_arch = "wasm32", target_feature = "atomics")
-)))]
+/// WasmNotSendSync`, which is `Send + Sync` on every native cell). wasm32
+/// attaches no window: its one surface is a canvas
+/// ([`GpuRenderer::configure_canvas_surface`]).
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_arch = "wasm32")))]
 pub trait WindowTarget:
     raw_window_handle::HasWindowHandle + raw_window_handle::HasDisplayHandle + Send + Sync + 'static
 {
 }
 
-#[cfg(not(any(
-    target_os = "macos",
-    all(target_arch = "wasm32", target_feature = "atomics")
-)))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_arch = "wasm32")))]
 impl<T> WindowTarget for T where
     T: raw_window_handle::HasWindowHandle
         + raw_window_handle::HasDisplayHandle
         + Send
         + Sync
         + 'static
-{
-}
-
-/// The threaded-wasm arm of [`WindowTarget`]: with `target_feature =
-/// "atomics"` wgpu's `WasmNotSend`/`WasmNotSync` are empty traits, so this arm
-/// drops `Send + Sync` to accept what `Instance::create_surface` accepts.
-#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
-pub trait WindowTarget:
-    raw_window_handle::HasWindowHandle + raw_window_handle::HasDisplayHandle + 'static
-{
-}
-
-#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
-impl<T> WindowTarget for T where
-    T: raw_window_handle::HasWindowHandle + raw_window_handle::HasDisplayHandle + 'static
 {
 }
 
@@ -24032,62 +22742,131 @@ mod appkit_surface_target_tests {
     }
 }
 
-/// Every entry point a WGSL source defines, in source order.
-///
-/// Pairs each stage attribute with the next `fn` line (comments may sit in
-/// between, see `fs_sprite_over`); all sources here are written that way.
-#[cfg(test)]
-fn wgsl_entry_points(src: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut armed = false;
-    for line in src.lines() {
-        let t = line.trim_end();
-        if t == "@vertex" || t == "@fragment" {
-            armed = true;
-            continue;
-        }
-        if armed && let Some(rest) = t.strip_prefix("fn ") {
-            if let Some((name, _)) = rest.split_once('(') {
-                out.push(name);
+/// The wgpu-oracle arm's surface target on Linux: a [`WindowTarget`]'s X11 or
+/// Wayland handles in raw-window-handle's words, through wgpu's own re-export.
+/// Only the oracle build has wgpu, so the shipped graph never gets the handle
+/// crate. wgpu keeps this value, and with it the window, alive as long as the
+/// surface.
+#[cfg(all(target_os = "linux", wgpu_arm))]
+struct NativeSurfaceTarget<W>(W);
+
+#[cfg(all(target_os = "linux", wgpu_arm))]
+impl<W: aterm_types::native_window::HasNativeWindow> wgpu::rwh::HasWindowHandle
+    for NativeSurfaceTarget<W>
+{
+    fn window_handle(&self) -> Result<wgpu::rwh::WindowHandle<'_>, wgpu::rwh::HandleError> {
+        use aterm_types::native_window::NativeWindow;
+        let raw = match self.0.native_window() {
+            Some(NativeWindow::Xlib { window, visual, .. }) => {
+                let mut h = wgpu::rwh::XlibWindowHandle::new(window.into());
+                h.visual_id = visual.into();
+                wgpu::rwh::RawWindowHandle::Xlib(h)
             }
-            armed = false;
+            Some(NativeWindow::Wayland { surface, .. }) => {
+                wgpu::rwh::RawWindowHandle::Wayland(wgpu::rwh::WaylandWindowHandle::new(surface))
+            }
+            None => return Err(wgpu::rwh::HandleError::Unavailable),
+        };
+        // SAFETY: `HasNativeWindow` keeps the handles live as long as `self.0`
+        // is, which outlives this borrow of `self`.
+        Ok(unsafe { wgpu::rwh::WindowHandle::borrow_raw(raw) })
+    }
+}
+
+#[cfg(all(target_os = "linux", wgpu_arm))]
+impl<W: aterm_types::native_window::HasNativeWindow> wgpu::rwh::HasDisplayHandle
+    for NativeSurfaceTarget<W>
+{
+    fn display_handle(&self) -> Result<wgpu::rwh::DisplayHandle<'_>, wgpu::rwh::HandleError> {
+        use aterm_types::native_window::NativeWindow;
+        let raw = match self.0.native_window() {
+            Some(NativeWindow::Xlib {
+                display, screen, ..
+            }) => wgpu::rwh::RawDisplayHandle::Xlib(wgpu::rwh::XlibDisplayHandle::new(
+                Some(display),
+                screen,
+            )),
+            Some(NativeWindow::Wayland { display, .. }) => {
+                wgpu::rwh::RawDisplayHandle::Wayland(wgpu::rwh::WaylandDisplayHandle::new(display))
+            }
+            None => return Err(wgpu::rwh::HandleError::Unavailable),
+        };
+        // SAFETY: as for the window handle: the connection stays open as long
+        // as `self.0` lives.
+        Ok(unsafe { wgpu::rwh::DisplayHandle::borrow_raw(raw) })
+    }
+}
+
+#[cfg(all(test, target_os = "linux", wgpu_arm))]
+mod native_surface_target_tests {
+    use aterm_types::native_window::{HasNativeWindow, NativeWindow};
+    use wgpu::rwh::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
+
+    use super::NativeSurfaceTarget;
+
+    /// A window stand-in answering fixed handles. Never dereferenced: the
+    /// handles only carry the pointers.
+    struct Handles(Option<NativeWindow>);
+
+    // SAFETY: the tests below never dereference the answer, and `None` is
+    // always a permitted one.
+    unsafe impl HasNativeWindow for Handles {
+        fn native_window(&self) -> Option<NativeWindow> {
+            self.0
         }
     }
-    out
+
+    /// The oracle hands wgpu exactly the handles the GL arm makes its EGL
+    /// surface on, on X11 and on Wayland, and a target with none is
+    /// `Unavailable` rather than a null handle.
+    #[test]
+    fn the_oracle_target_carries_the_native_handles_or_nothing() {
+        let mut words = [0_u64; 2];
+        let display = std::ptr::NonNull::from(&mut words[0]).cast();
+        let surface = std::ptr::NonNull::from(&mut words[1]).cast();
+
+        let x11 = NativeSurfaceTarget(Handles(Some(NativeWindow::Xlib {
+            display,
+            screen: 1,
+            window: 0x0040_0007,
+            visual: 0x21,
+        })));
+        let RawWindowHandle::Xlib(w) = x11.window_handle().expect("an X11 window").as_raw() else {
+            panic!("an Xlib window handle");
+        };
+        assert_eq!((w.window, w.visual_id), (0x0040_0007, 0x21));
+        let RawDisplayHandle::Xlib(d) = x11.display_handle().expect("an X11 display").as_raw()
+        else {
+            panic!("an Xlib display handle");
+        };
+        assert_eq!((d.display, d.screen), (Some(display), 1));
+
+        let wl = NativeSurfaceTarget(Handles(Some(NativeWindow::Wayland { display, surface })));
+        let RawWindowHandle::Wayland(w) = wl.window_handle().expect("a Wayland window").as_raw()
+        else {
+            panic!("a Wayland window handle");
+        };
+        assert_eq!(w.surface, surface);
+        let RawDisplayHandle::Wayland(d) = wl.display_handle().expect("a Wayland display").as_raw()
+        else {
+            panic!("a Wayland display handle");
+        };
+        assert_eq!(d.display, display);
+
+        let none = NativeSurfaceTarget(Handles(None));
+        assert!(matches!(
+            none.window_handle(),
+            Err(wgpu::rwh::HandleError::Unavailable)
+        ));
+        assert!(matches!(
+            none.display_handle(),
+            Err(wgpu::rwh::HandleError::Unavailable)
+        ));
+    }
 }
 
 #[cfg(test)]
-mod pipeline_table_wgsl_tests {
-    use super::{ShaderLibrary, wgsl_entry_points, wgsl_source};
-    use crate::pipeline_table::entry_points;
-
-    /// Entry-point roster guard, wgpu half (twin of
-    /// `crate::shader_twins::tests::every_twin_defines_exactly_the_entry_points_the_table_asks_for`):
-    /// each library's WGSL defines exactly the entry points the pipeline table
-    /// asks for, no more, no fewer, no renames.
-    #[test]
-    fn the_wgsl_defines_exactly_the_entry_points_the_table_asks_for() {
-        for lib in ShaderLibrary::ALL {
-            let mut want = entry_points(lib);
-            let mut have = wgsl_entry_points(wgsl_source(lib));
-            assert!(
-                !have.is_empty(),
-                "{}: the WGSL scan found no entry points at all — the shader's \
-                 declaration style changed and this guard went blind",
-                lib.name()
-            );
-            // `vs_fs` is one function per library and listed once per library,
-            // so a repeat is a genuine duplicate definition.
-            want.sort_unstable();
-            have.sort_unstable();
-            assert_eq!(
-                have,
-                want,
-                "{} WGSL defines {have:?} but the pipeline table asks for {want:?}",
-                lib.name()
-            );
-        }
-    }
+mod device_lost_tests {
 
     /// A Metal [`crate::metal::loss::LossLatch`] wired into `GpuContext`
     /// surfaces through the same `device_lost()` poll `recover_from_gpu_loss`
@@ -24244,7 +23023,7 @@ mod atlas_upload_sync_tests {
         );
         assert_eq!(resident.write_gen, 1);
         let after = atlas_state(reader_count(&live), 3, 1);
-        let model = aterm_spec::derive::metal_atlas_residency_model();
+        let model = aterm_models_render::metal_atlas_residency_model();
         assert_eq!(
             aterm_spec::interp::admits(&model, &before, &after),
             Some("SyncAndPresent")
@@ -24318,7 +23097,7 @@ mod acquire_wait_failure_tests {
 
 #[cfg(all(target_os = "macos", test))]
 mod gpu_park_accounting_tests {
-    use super::{WindowGpu, encode_work_ns_excluding_park};
+    use super::WindowGpu;
 
     /// The armed present parks at two sites (pending-ring drain, then frame
     /// slot) and may be refused between them; the park total accumulates
@@ -24350,68 +23129,56 @@ mod gpu_park_accounting_tests {
         window.add_gpu_park(250_000);
         assert_eq!(window.take_gpu_park_sample_ns(), Some(250_000));
     }
-
-    /// A GPU park is not a slow frame: the staging wait inside the armed
-    /// present's work timer is reported as park time, not as `frame_render`
-    /// work against the slow-frame budget.
-    #[test]
-    fn a_contention_park_is_subtracted_from_the_presents_encode_cost() {
-        // 14 ms in the work timer, 10 ms of it parked on the previous frame's
-        // Submit A: 4 ms of real encode work.
-        assert_eq!(
-            encode_work_ns_excluding_park(14_000_000, 10_000_000),
-            4_000_000
-        );
-
-        // A 38 ms park around a 2 ms encode: charged raw it would exceed the
-        // slow-frame budget; attributed, the frame costs 2 ms.
-        // (`SLOW_FRAME_THRESHOLD_NS` restates the frontend's constant.)
-        const SLOW_FRAME_THRESHOLD_NS: u64 = 33_333_333;
-        let raw_span_ns = 40_000_000;
-        let park_ns = 38_000_000;
-        assert!(
-            raw_span_ns > SLOW_FRAME_THRESHOLD_NS,
-            "the raw span must be one the frontend would call a slow frame"
-        );
-        let attributed = encode_work_ns_excluding_park(raw_span_ns, park_ns);
-        assert_eq!(attributed, 2_000_000);
-        assert!(
-            attributed < SLOW_FRAME_THRESHOLD_NS,
-            "a GPU park must not count against the compose path's budget"
-        );
-
-        // Saturating: the timer and the park are read from the same clock but
-        // not atomically, so a park may round up to the whole span.
-        assert_eq!(encode_work_ns_excluding_park(1_000, 5_000), 0);
-    }
 }
 
-#[cfg(test)]
-mod frame_latency_tests {
+/// Why a surface yields no swapchain format names the right cause: a surface with
+/// no formats is one the adapter cannot present to, not one short of non-sRGB ones.
+#[cfg(all(test, wgpu_arm))]
+mod surface_format_tests {
     use super::GpuRenderer;
+    use wgpu::TextureFormat::{Bgra8Unorm, Bgra8UnormSrgb, Rgb10a2Unorm, Rgba8UnormSrgb};
 
-    /// Vulkan gets three images (latency 2) in every present mode: at latency 1
-    /// a second present within one refresh parks the main thread until vblank.
-    /// Metal keeps 2; DX12/GL keep 1.
-    #[test]
-    fn vulkan_and_metal_get_the_three_image_pool() {
-        assert_eq!(GpuRenderer::default_frame_latency(false, true), 2);
-        assert_eq!(GpuRenderer::default_frame_latency(true, false), 2);
-        assert_eq!(GpuRenderer::default_frame_latency(false, false), 1);
-        assert_eq!(GpuRenderer::frame_latency_for(false, true, None), 2);
-        assert_eq!(GpuRenderer::frame_latency_for(false, false, None), 1);
+    fn caps(formats: &[wgpu::TextureFormat]) -> wgpu::SurfaceCapabilities {
+        wgpu::SurfaceCapabilities {
+            formats: formats.to_vec(),
+            ..Default::default()
+        }
     }
 
-    /// The override still wins, clamped to 1..=3, and garbage is ignored.
     #[test]
-    fn the_env_override_is_clamped_and_garbage_falls_back() {
-        assert_eq!(GpuRenderer::frame_latency_for(false, true, Some("1")), 1);
-        assert_eq!(GpuRenderer::frame_latency_for(false, false, Some("9")), 3);
-        assert_eq!(GpuRenderer::frame_latency_for(false, false, Some("0")), 1);
-        assert_eq!(GpuRenderer::frame_latency_for(false, true, Some("x")), 2);
+    fn no_formats_is_an_adapter_that_cannot_present() {
+        let none = GpuRenderer::pick_surface_format(&caps(&[])).expect_err("refused");
+        assert!(none.contains("cannot present"), "{none}");
+        let srgb_only = GpuRenderer::pick_surface_format(&caps(&[Bgra8UnormSrgb, Rgba8UnormSrgb]))
+            .expect_err("refused");
+        assert_ne!(
+            none, srgb_only,
+            "an sRGB-only surface is a different refusal"
+        );
+        assert_eq!(
+            GpuRenderer::pick_surface_format(&caps(&[Bgra8UnormSrgb, Rgb10a2Unorm, Bgra8Unorm])),
+            Ok(Bgra8Unorm)
+        );
     }
 }
 
-#[cfg(test)]
+// The window atlas's ownership and sharing replays run on the wgpu and Metal
+// arms; a GL-only build (Linux without the oracle) has neither.
+#[cfg(all(test, any(wgpu_arm, target_os = "macos")))]
 #[path = "window_atlas_tests.rs"]
 mod window_atlas_tests;
+
+// The GL arm's renderer side: its residency and encode tail, and its
+// presents.
+#[cfg(gl_arm)]
+#[path = "gl_arm.rs"]
+mod gl_arm;
+#[cfg(gl_arm)]
+#[path = "gl_present.rs"]
+mod gl_present;
+
+// The GL arm's replay of a recorded frame plan, and its byte differentials
+// against wgpu on the same driver: the `--features wgpu-oracle` lane.
+#[cfg(all(gl_arm, wgpu_arm, test))]
+#[path = "gl_replay_tests.rs"]
+mod gl_replay_tests;

@@ -36,8 +36,9 @@ use aterm_agent::supervise::policy::turn_end::{
     Composer, ModelSwitch, RULE_LIMIT_RESUME, Restart, TurnEndAction, TurnEndReading, TurnEndState,
     TurnEndTiming, decide_turn_end,
 };
+use aterm_models_harness::supervisor_model_switch_model;
 use aterm_phase::WallKind;
-use aterm_spec::derive::{Model, supervisor_model_switch_model};
+use aterm_spec::derive::Model;
 
 use crate::common::cnst;
 
@@ -79,25 +80,26 @@ fn base_reading() -> TurnEndReading {
         resume: None,
         upgrading: false,
         taskless: false,
+        finished_record: None,
+        finished_at_check: false,
+        check_record: None,
+        left_record: false,
+        left_work: None,
         login_back: false,
         auto_continue: None,
         since_limit: None,
         served_in_transcript: false,
+        notice_elsewhere: false,
         reset_clock: None,
         person: None,
         reach: Default::default(),
         program: aterm_phase::Program::Claude,
-        goal: None,
-        model_field: None,
-        limits: Default::default(),
-        sandbox_fell: None,
-        thread_model: None,
-        upgrade_goal: false,
         account: None,
         autopilot: aterm_agent::supervise::Autopilot::Cruise,
         login_label: None,
         login_superseded: false,
         login_notice: None,
+        wall_remembered: false,
     }
 }
 
@@ -311,7 +313,6 @@ fn walk(m: &Model, strict: bool) -> (usize, Vec<State>) {
 fn tier1_the_real_decider_switches_and_returns_exactly_where_the_model_allows() {
     let m = supervisor_model_switch_model();
     let (states, _) = walk(&m, true);
-    eprintln!("model switch Tier-1: {states} states walked");
     assert!(states > 50, "{states}");
 }
 

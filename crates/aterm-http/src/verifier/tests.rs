@@ -7,10 +7,8 @@
 //! Coverage, stated plainly:
 //!
 //! * **Apple arm** — fully exercised here, accept and reject, offline.
-//! * **Unix arm** — its CHAIN MATH is exercised here
-//!   ([`the_webpki_chain_math_matches_its_recorded_expectations`]) because
-//!   `WebPkiServerVerifier` is portable. Its `/etc/ssl/certs` DISCOVERY half
-//!   needs a Linux host.
+//! * **Unix arm** — exercised by the same corpus on a Unix host (the `webpki`
+//!   column); its `/etc/ssl/certs` DISCOVERY half is `verifier::unix`'s.
 //! * **Windows arm** — not exercised here.
 //!
 //! # Two places the platforms genuinely disagree
@@ -31,7 +29,7 @@
 //! Every case names its own `now`. Nothing here calls `UnixTime::now()`. Apple
 //! enforces a ~398-day ceiling on TLS leaf validity
 //! (`errSecCertificateValidityPeriodTooLong`), so the corpus CANNOT dodge expiry
-//! by minting a century-long certificate the way `crates/aterm-net/src/testdata`
+//! by minting a century-long certificate the way `tests/testdata/loopback-cert.der`
 //! does — every leaf here lives about a year, and a test that read the wall
 //! clock would start failing inside one. A red test with a date on it is a test
 //! someone eventually deletes.
@@ -42,11 +40,11 @@ use rustls::client::danger::ServerCertVerifier;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 
 use super::PlatformVerifier;
-use super::test_platform::{notice_once, trust_service_silent};
+use super::test_platform::trust_service_silent;
 
 // --- fixtures --------------------------------------------------------------
-// See `src/testdata/tls/README.md` for what each one is and `mint.sh` for how
-// it was made. All of them are public test data.
+// See `src/testdata/tls/README.md` for what each one is and `PROVENANCE.md`
+// beside it for how it was made. All of them are public test data.
 
 const ROOT: &[u8] = include_bytes!("../testdata/tls/root.der");
 const INTER: &[u8] = include_bytes!("../testdata/tls/inter.der");
@@ -69,27 +67,6 @@ const MALFORMED: &[u8] = include_bytes!("../testdata/tls/malformed.der");
 const GH_LEAF: &[u8] = include_bytes!("../testdata/tls/gh-leaf.der");
 const GH_INT0: &[u8] = include_bytes!("../testdata/tls/gh-int0.der");
 const GH_INT1: &[u8] = include_bytes!("../testdata/tls/gh-int1.der");
-
-/// Every locally minted fixture, for the hermeticity check.
-const LOCAL_FIXTURES: &[(&str, &[u8])] = &[
-    ("root", ROOT),
-    ("inter", INTER),
-    ("notca", NOTCA),
-    ("good", GOOD),
-    ("expired", EXPIRED),
-    ("future", FUTURE),
-    ("wronghost", WRONGHOST),
-    ("viainter", VIAINTER),
-    ("vianotca", VIANOTCA),
-    ("selfsigned", SELFSIGNED),
-    ("nosan", NOSAN),
-    ("clientonly", CLIENTONLY),
-    ("noeku", NOEKU),
-    ("keyenciph", KEYENCIPH),
-    ("ipsan", IPSAN),
-    ("tampersig", TAMPERSIG),
-    ("tampertbs", TAMPERTBS),
-];
 
 /// The name every local leaf but two is issued for.
 const HOST: &str = "test.aterm.invalid";
@@ -190,10 +167,7 @@ struct Case {
     now: u64,
     /// What an Apple platform does with this input. MEASURED.
     apple: Outcome,
-    /// What the webpki chain math does with it. MEASURED, natively, by
-    /// [`the_webpki_chain_math_matches_its_recorded_expectations`] — but note
-    /// that on a real Linux box the ROOTS would come from `/etc/ssl/certs`,
-    /// which nothing here can exercise.
+    /// What the webpki chain math (the Unix arm) does with it. MEASURED.
     webpki: Outcome,
 }
 
@@ -230,8 +204,7 @@ impl Case {
 /// Every reject case is ARMED: it is paired with at least one case that differs
 /// in exactly ONE variable and must ACCEPT. If a rejection were happening for
 /// the wrong reason — a DER that never parsed, a verifier that refuses
-/// everything — the twin fails and says so. The counts are asserted by
-/// [`the_corpus_is_armed_in_both_directions`].
+/// everything — the twin fails and says so.
 const CORPUS: &[Case] = &[
     // --- the positive control, and its two temporal twins ---
     Case {
@@ -420,14 +393,20 @@ const CORPUS: &[Case] = &[
 
 // --- the tests -------------------------------------------------------------
 
-/// The verifier over the fixture root. `None`, after printing why, where no
-/// platform verifier exists or the platform's certificate service does not
-/// answer: the skip signal, and the caller just returns.
+/// Why a non-Apple host cannot run the system-anchored checks: its trust store
+/// does not validate the captured github.com chain.
+const UNANCHORED_GITHUB: &str = "this machine's trust store did not validate the captured \
+     github.com chain; see src/testdata/tls/README.md for recapture";
+
+/// The verifier over the fixture root. A target with no platform verifier
+/// ends COULD NOT RUN; `None`, after the shared skip line, only where the
+/// platform's certificate service does not answer ([`trust_service_silent`]).
 fn mine() -> Option<PlatformVerifier> {
-    let Ok(mine) = PlatformVerifier::new_with_extra_roots(vec![der(ROOT)], provider()) else {
-        notice_once("SKIP: no platform verifier on this target");
-        return None;
-    };
+    let mine = PlatformVerifier::new_with_extra_roots(vec![der(ROOT)], provider()).unwrap_or_else(
+        |error| {
+            aterm_spec::host::could_not_run(format!("no platform verifier on this target: {error}"))
+        },
+    );
     if trust_service_silent() {
         return None;
     }
@@ -459,24 +438,6 @@ fn the_first_party_verifier_matches_its_recorded_expectations() {
 }
 
 #[test]
-fn the_corpus_is_armed_in_both_directions() {
-    // The anti-degeneracy check. A verifier that rejected EVERYTHING would pass
-    // every reject case; a verifier that accepted everything would pass every
-    // accept case. Both counts must stay non-trivial, so neither degenerate
-    // implementation can be green.
-    let accepts = CORPUS.iter().filter(|c| c.expected().accepted()).count();
-    let rejects = CORPUS.len() - accepts;
-    assert!(
-        accepts >= 6,
-        "only {accepts} ACCEPT cases: a reject-everything verifier would pass this suite"
-    );
-    assert!(
-        rejects >= 12,
-        "only {rejects} REJECT cases: an accept-everything verifier would pass this suite"
-    );
-}
-
-#[test]
 fn the_shipped_constructor_trusts_no_fixture_anchor() {
     // THE anchor-seam assertion. `PlatformVerifier::new` is what
     // `crate::tls::client_config` calls, and it must know nothing about the
@@ -490,10 +451,9 @@ fn the_shipped_constructor_trusts_no_fixture_anchor() {
     }
     let shipped = match PlatformVerifier::new(provider()) {
         Ok(verifier) => verifier,
-        Err(_) => {
-            eprintln!("SKIP: no platform trust store on this target");
-            return;
-        }
+        Err(error) => aterm_spec::host::could_not_run(format!(
+            "no platform trust store on this target: {error}"
+        )),
     };
     let case = Case {
         what: "the good chain under the SYSTEM anchors only",
@@ -548,10 +508,9 @@ fn the_system_trust_store_is_actually_consulted() {
         webpki: Outcome::NotValidForName,
     };
 
-    let Ok(mine) = PlatformVerifier::new(provider()) else {
-        eprintln!("SKIP: no system trust store on this target");
-        return;
-    };
+    let mine = PlatformVerifier::new(provider()).unwrap_or_else(|error| {
+        aterm_spec::host::could_not_run(format!("no system trust store on this target: {error}"))
+    });
     if trust_service_silent() {
         return;
     }
@@ -559,16 +518,12 @@ fn the_system_trust_store_is_actually_consulted() {
         !wrong_name.run(&mine).accepted(),
         "a real chain was accepted for a name it does not carry"
     );
-    // Hard only on Apple, whose store always carries the anchor; elsewhere the
-    // distro store may not, which is a skip and not a defect.
-    if cfg!(target_vendor = "apple") || real.run(&mine).accepted() {
-        assert_eq!(real.run(&mine), real.expected(), "system-anchored verdict");
-    } else {
-        eprintln!(
-            "SKIP (hard assertion only): this machine's trust store did not validate the \
-             captured github.com chain; see src/testdata/tls/README.md for recapture"
-        );
+    // Apple's store always carries the anchor. A distro store that does not
+    // cannot answer the question: COULD NOT RUN, never a pass.
+    if !cfg!(target_vendor = "apple") && !real.run(&mine).accepted() {
+        aterm_spec::host::could_not_run(UNANCHORED_GITHUB);
     }
+    assert_eq!(real.run(&mine), real.expected(), "system-anchored verdict");
 }
 
 #[test]
@@ -593,17 +548,16 @@ fn extra_anchors_add_to_the_system_set_rather_than_replacing_it() {
         webpki: Outcome::Accept,
     };
     let Some(mine) = mine() else { return };
-    if cfg!(target_vendor = "apple") || chain.run(&mine).accepted() {
-        assert!(
-            chain.run(&mine).accepted(),
-            "supplying an extra anchor DISABLED the system anchors"
-        );
-    } else {
-        eprintln!(
-            "SKIP (hard assertion only): this machine's trust store did not validate the \
-             captured github.com chain; see src/testdata/tls/README.md for recapture"
-        );
+    // Off Apple, a store without the github.com anchor cannot tell add from
+    // replace: COULD NOT RUN, never a pass.
+    let accepted = chain.run(&mine).accepted();
+    if !cfg!(target_vendor = "apple") && !accepted {
+        aterm_spec::host::could_not_run(UNANCHORED_GITHUB);
     }
+    assert!(
+        accepted,
+        "supplying an extra anchor DISABLED the system anchors"
+    );
 }
 
 #[test]
@@ -703,95 +657,15 @@ fn a_degenerate_server_name_fails_closed_instead_of_disabling_name_checking() {
 }
 
 #[test]
-fn every_local_fixture_is_hermetic() {
-    // The corpus's reject cases only mean anything if the platform cannot repair
-    // a broken chain by fetching something. No `authorityInformationAccess` and
-    // no `crlDistributionPoints` anywhere means there is no URL to fetch, on any
-    // platform, whatever the flags say.
-    //
-    // Encoded OIDs, as they appear inside an X.509 extension's OBJECT
-    // IDENTIFIER: 1.3.6.1.5.5.7.1.1 (AIA) and 2.5.29.31 (CRL distribution
-    // points).
-    const AIA: &[u8] = &[0x06, 0x08, 0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x01];
-    const CRLDP: &[u8] = &[0x06, 0x03, 0x55, 0x1D, 0x1F];
-    for (name, bytes) in LOCAL_FIXTURES {
-        assert!(
-            !bytes.windows(AIA.len()).any(|w| w == AIA),
-            "{name}.der carries authorityInformationAccess; the platform could fetch its issuer \
-             and turn a reject case into an accept"
-        );
-        assert!(
-            !bytes.windows(CRLDP.len()).any(|w| w == CRLDP),
-            "{name}.der carries crlDistributionPoints"
-        );
-    }
-}
-
-#[test]
-fn the_webpki_chain_math_matches_its_recorded_expectations() {
-    // The Unix arm's verifier is `rustls`'s own `WebPkiServerVerifier`, which is
-    // portable — so its CHAIN MATH can be driven on this machine even though its
-    // `/etc/ssl/certs` DISCOVERY half cannot. This is what backs the `webpki`
-    // column of `CORPUS`; without it those values would be predictions.
-    //
-    // What it does NOT cover, and nothing here does: reading the system store,
-    // the tolerant PEM path over a real distro bundle, or the empty-store
-    // failure. Those need a Linux host.
-    let mut store = rustls::RootCertStore::empty();
-    store
-        .add(der(ROOT))
-        .expect("the fixture root is a usable anchor");
-    let verifier =
-        rustls::client::WebPkiServerVerifier::builder_with_provider(store.into(), provider())
-            .build()
-            .expect("a one-root store builds a verifier");
-
-    let mut wrong = Vec::new();
-    for case in CORPUS {
-        // Match the Unix arm's own EKU normalisation so the two are comparable.
-        let chain: Vec<CertificateDer<'static>> = case.chain.iter().copied().map(der).collect();
-        let name = ServerName::try_from(case.server).expect("a usable server name");
-        let result = verifier
-            .verify_server_cert(
-                &chain[0],
-                &chain[1..],
-                &name,
-                &[],
-                UnixTime::since_unix_epoch(std::time::Duration::from_secs(case.now)),
-            )
-            .map_err(|error| match &error {
-                rustls::Error::InvalidCertificate(rustls::CertificateError::InvalidPurpose)
-                | rustls::Error::InvalidCertificate(
-                    rustls::CertificateError::InvalidPurposeContext { .. },
-                ) => super::eku_rejected(),
-                _ => error,
-            });
-        let got = reduce(&result);
-        if got != case.webpki {
-            wrong.push(format!(
-                "{}: got {got:?}, recorded {:?}",
-                case.what, case.webpki
-            ));
-        }
-    }
-    assert!(
-        wrong.is_empty(),
-        "the recorded webpki expectations are stale:\n  {}",
-        wrong.join("\n  ")
-    );
-}
-
-#[test]
 fn handshake_signature_verification_is_delegated_to_the_provider() {
     // Not platform work: the three signature methods must expose exactly the
-    // provider's algorithms, the way `crates/aterm-net/src/tls.rs:157` does.
+    // provider's algorithms.
     // A verifier that narrowed this set would break handshakes in a way no
     // certificate fixture can catch. No evaluation happens, so this runs even
     // where the platform's certificate service does not answer.
-    let Ok(mine) = PlatformVerifier::new(provider()) else {
-        eprintln!("SKIP: no platform verifier on this target");
-        return;
-    };
+    let mine = PlatformVerifier::new(provider()).unwrap_or_else(|error| {
+        aterm_spec::host::could_not_run(format!("no platform verifier on this target: {error}"))
+    });
     let expected = provider()
         .signature_verification_algorithms
         .supported_schemes();

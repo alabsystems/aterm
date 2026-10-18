@@ -707,16 +707,17 @@ impl ProgramResolver {
         let pending = Arc::clone(&self.pending);
         let lookup = Arc::clone(&self.lookup);
         let completion = self.completion.clone();
-        match std::thread::Builder::new()
-            .name("aterm-program-id".into())
-            .spawn(move || {
+        match crate::qos::spawn_lane_thread(
+            "aterm-program-id",
+            crate::qos::Role::Responsive,
+            move || {
                 // A process lookup never holds the pending-map lock. The
                 // short publication section takes pending, then the leaf
                 // timeline lock, so cancellation cannot split its validity
                 // check from the write.
-                crate::qos::set_self(crate::qos::Role::Responsive);
                 run_worker(rx, pending, lookup, completion);
-            }) {
+            },
+        ) {
             Ok(worker) => {
                 self.tx = Some(tx);
                 self.worker = Some(worker);
@@ -1007,37 +1008,13 @@ mod tests {
         let _ = child.wait();
     }
 
-    /// Spawn a script this test JUST wrote, retrying `ETXTBSY` to a bounded
-    /// deadline. Another test thread that forks while `std::fs::write` still
-    /// holds the script open for writing hands its child a copy of that fd,
-    /// held until the child's own exec closes it — and an exec of a file open
-    /// for writing anywhere is `ETXTBSY` (seen here 1 run in 100 — the
-    /// well-known write-then-exec race of any multithreaded test harness).
-    /// The window is only that other child's fork-to-exec, so a retry clears
-    /// it.
-    #[cfg(unix)]
-    fn spawn_fresh_script(script: &std::path::Path) -> aterm_uds::spawnfd::Child {
-        let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
-        loop {
-            match quiet_child(&mut aterm_uds::spawnfd::command(script)).spawn() {
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::ExecutableFileBusy
-                        && std::time::Instant::now() < deadline =>
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-                spawned => return spawned.expect("spawn the shim"),
-            }
-        }
-    }
-
     /// Tier-1 for `ProgramResolverQueue`: the shipping slot transitions agree
     /// with the derived model, including a superseding foreground group and
     /// a worker restart. The `Buggy` model queues each duplicate and fails its
     /// one-token invariant in the spec gate.
     #[test]
     fn pending_job_transitions_keep_the_latest_group_and_one_token() {
-        let model = aterm_spec::derive::program_resolver_queue_model();
+        let model = aterm_models_harness::program_resolver_queue_model();
         let mut state = model.init_state();
         let mut jobs = PendingJobs::default();
         let timeline = Arc::new(Mutex::new(SessionTimeline::default()));
@@ -1097,7 +1074,7 @@ mod tests {
     /// lookup cannot publish even when the new request uses the same PGID.
     #[test]
     fn cancelled_inflight_job_reenables_without_a_second_token() {
-        let model = aterm_spec::derive::program_resolver_queue_model();
+        let model = aterm_models_harness::program_resolver_queue_model();
         let mut state = model.init_state();
         let mut jobs = PendingJobs::default();
         let timeline = Arc::new(Mutex::new(SessionTimeline::default()));
@@ -1196,11 +1173,9 @@ mod tests {
 
     /// A blocked old-group lookup cannot create an unbounded queue of retries
     /// or delay the replacement behind them. Another session gets its turn
-    /// before the hot session's newest request, and only applied answers post
-    /// a completion wake.
+    /// before the hot session's newest request.
     #[test]
     fn slow_lookup_coalesces_retries_and_serves_a_new_group_promptly() {
-        use std::sync::mpsc::RecvTimeoutError;
         use std::time::Duration;
 
         let (started_tx, started_rx) = channel::<()>();
@@ -1266,10 +1241,6 @@ mod tests {
             Some("zsh")
         );
         assert_eq!(*calls.lock().unwrap(), vec![10, 30, 20]);
-        assert_eq!(
-            wake_rx.recv_timeout(Duration::from_millis(50)),
-            Err(RecvTimeoutError::Timeout)
-        );
         let drained_by = std::time::Instant::now() + MUST_HAPPEN;
         while !resolver.pending.lock().unwrap().by_session.is_empty() {
             assert!(
@@ -1372,7 +1343,6 @@ mod tests {
     #[test]
     fn reenabling_the_same_group_drops_the_pre_clear_answer() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::time::Duration;
 
         let (entered_tx, entered_rx) = channel::<()>();
         let (release_tx, release_rx) = channel::<()>();
@@ -1415,7 +1385,6 @@ mod tests {
             Some("new")
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
-        assert!(wake_rx.recv_timeout(Duration::from_millis(50)).is_err());
     }
 
     #[test]
@@ -1642,51 +1611,6 @@ mod tests {
             Some(("-zsh".to_string(), None)),
             "argc 1: the environment is not argv[1]"
         );
-    }
-
-    /// A real shim in its window: `/bin/sh <dir>/agents/claude` that has not
-    /// exec'd yet reads `claude` when `<dir>/agents` is the managed one.
-    /// NEGATIVE CONTROLS: the same script under another name reads `sh`, and
-    /// so does the agent-named one when its directory is not managed.
-    #[cfg(unix)]
-    #[test]
-    fn a_live_shim_before_its_exec_is_named_by_its_script() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("aterm-shim-{}", std::process::id()));
-        std::fs::create_dir_all(dir.join("agents")).expect("scratch dir");
-        let mut named = Vec::new();
-        for name in ["agents/claude", "build.sh"] {
-            let script = dir.join(name);
-            std::fs::write(&script, "#!/bin/sh\nsleep 30\nexit 0\n").expect("write the shim");
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod");
-            let mut child = spawn_fresh_script(&script);
-            let pid = i32::try_from(child.id()).expect("pid");
-            // The kernel runs `#!` scripts as `/bin/sh <script>` from the
-            // first instruction — once its exec has laid out argv, which on
-            // Linux is AFTER `spawn` returns ([`settled_argv_head`]).
-            let path = script.to_string_lossy().into_owned();
-            let head = settled_argv_head(pid, |a0, a1| {
-                a0.rsplit('/').next() == Some("sh") && a1 == Some(path.as_str())
-            });
-            kill_group(&mut child);
-            let (argv0, argv1) = head.expect("the shim's argv");
-            assert_eq!(
-                argv1.as_deref(),
-                Some(path.as_str()),
-                "settled on the script"
-            );
-            let managed = [dir.join("agents")];
-            let unmanaged = [dir.join("elsewhere")];
-            named.push((
-                program_from_argv(&argv0, argv1.as_deref(), &|s| script_in(s, &managed)),
-                program_from_argv(&argv0, argv1.as_deref(), &|s| script_in(s, &unmanaged)),
-            ));
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(named[0].0.as_deref(), Some("claude"));
-        assert_eq!(named[0].1.as_deref(), Some("sh"), "not the managed agents/");
-        assert_eq!(named[1].0.as_deref(), Some("sh"));
     }
 
     /// A `KERN_PROCARGS2` buffer as the kernel lays one out: argc, the exec

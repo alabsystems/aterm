@@ -11,7 +11,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "aterm — the worker-phase reader: busy | prompt | limited | idle | question, the context indicator and the approval box, read from one screen of a Claude Code, Codex, agy or Muse Code session; shared by `aterm drive phase` and the server's agent verdict"
+description = "aterm — the worker-phase reader: busy | prompt | limited | idle | question, the context indicator and the approval box, read from one screen of a Claude Code, Codex, agy, Muse Code or Gemini CLI session; shared by `aterm drive phase` and the server's agent verdict"
 
 [lints]
 workspace = true
@@ -22,6 +22,9 @@ workspace = true
 # relays as `phase=`); `aterm-link`, the fabric, links no screen reader. See
 # src/lib.rs.
 [dependencies]
+
+[dev-dependencies]
+aterm-tempfile = { workspace = true }
 
 [[test]]
 name = "phase_suite"

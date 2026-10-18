@@ -424,7 +424,7 @@ struct Scratch {
 
 /// A retained-row budget that live archives share: one total divided by the
 /// number of archives currently drawing on it, each held to `total / live`
-/// (never below [`AltArchiveBudget::min_share`]).
+/// (never below its `min_share` floor).
 ///
 /// Shares are equal, not first-come-first-served, so each session's limit is a
 /// pure function of the live count and eviction stays oldest-first and
@@ -435,8 +435,7 @@ struct Scratch {
 /// idle session keeps what it holds until it draws again. The total therefore
 /// converges rather than holding at every instant: if sessions fill in turn and
 /// go idle, session `k` holds `total / k` and the sum is `total * H_n`; one frame
-/// per session brings it back inside `total` (pinned by
-/// `alt_archive_tests::a_session_that_fills_up_alone_and_goes_idle_is_the_pool_s_worst_case`).
+/// per session brings it back inside `total`.
 /// Only archives holding rows count as live, so tabs not running a fullscreen
 /// app do not shrink the share of the one that is.
 #[derive(Debug)]
@@ -478,13 +477,6 @@ impl AltArchiveBudget {
         self.total
     }
 
-    /// The floor under one archive's share.
-    #[must_use]
-    #[cfg(test)]
-    pub fn min_share(&self) -> usize {
-        self.min_share
-    }
-
     /// Archives currently drawing on this pool: joined, enabled and holding rows.
     /// An empty archive costs nothing and is not counted, so idle tabs do not
     /// shrink the share of the one running a fullscreen app.
@@ -494,7 +486,7 @@ impl AltArchiveBudget {
     }
 
     /// What one archive may retain right now: `total / live`, floored at
-    /// [`Self::min_share`]. With nothing live yet (the archive asking is about
+    /// `min_share`. With nothing live yet (the archive asking is about
     /// to be the first), the whole total.
     #[must_use]
     pub fn share(&self) -> usize {

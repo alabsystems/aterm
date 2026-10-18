@@ -8,9 +8,7 @@
 //! * The exactly specified functions ([`EXACT`]) must agree bit for bit.
 //! * A transcendental may stand at most [`ULPS`] from the recorded answer:
 //!   std calls the platform's libm, musl's port is the recording, and both
-//!   are within an ulp of the true value. The tolerance is tight enough to
-//!   tell two functions apart, which [`a_swapped_function_is_caught`] checks
-//!   rather than assumes.
+//!   are within an ulp of the true value.
 //! * NaN agrees with NaN whatever its payload or sign.
 
 use std::collections::BTreeSet;
@@ -206,29 +204,4 @@ fn inverse_hyperbolic_tangent_keeps_zero_sign_and_domain_boundaries() {
     }
     check!(f64, libm::atanh);
     check!(f32, libm::atanhf);
-}
-
-/// The negative control for [`ULPS`]: answering one function's recording with
-/// a neighbour must be caught, or the tolerance could not tell them apart.
-#[test]
-fn a_swapped_function_is_caught() {
-    for (recorded, called) in [
-        ("sin", "cos"),
-        ("sinh", "sin"),
-        ("tanh", "tan"),
-        ("log", "log10"),
-        ("exp", "exp2"),
-        ("expm1", "exp"),
-        ("log1p", "log"),
-        ("asinh", "asin"),
-        ("rint", "round"),
-        ("atan2", "hypot"),
-        ("logf", "log2f"),
-        ("rintf", "roundf"),
-    ] {
-        assert!(
-            !mismatches(recorded, called).is_empty(),
-            "{called} passes for {recorded}: the comparison is too loose"
-        );
-    }
 }

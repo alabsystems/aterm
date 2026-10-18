@@ -5,7 +5,8 @@
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
 //! Modified by the aterm project in 2026; see the repository NOTICE. (`SmolStr` from
-//! `crate::keyboard`.)
+//! `crate::keyboard`. libxkbcommon's compose entry points are first-party aterm-xkb's, where
+//! upstream used xkbcommon-dl's: docs/AUDIT-third-party-2026-10-15.md, LW.7.)
 //!
 //! XKB compose handling.
 
@@ -15,12 +16,15 @@ use std::ops::Deref;
 use std::os::unix::ffi::OsStringExt;
 use std::ptr::NonNull;
 
-use super::{XkbContext, XKBCH};
+use super::{xkbch, XkbContext};
 use crate::keyboard::SmolStr;
-use xkbcommon_dl::{
-    xkb_compose_compile_flags, xkb_compose_feed_result, xkb_compose_state, xkb_compose_state_flags,
-    xkb_compose_status, xkb_compose_table, xkb_keysym_t,
+use aterm_xkb::{
+    compose_feed, Keysym as xkb_keysym_t, XkbComposeState as xkb_compose_state,
+    XkbComposeTable as xkb_compose_table, COMPOSE_NO_FLAGS,
 };
+
+/// `enum xkb_compose_status`, as libxkbcommon returns it.
+type ComposeStatusCode = u32;
 
 #[derive(Debug)]
 pub struct XkbComposeTable {
@@ -30,20 +34,16 @@ pub struct XkbComposeTable {
 impl XkbComposeTable {
     pub fn new(context: &XkbContext) -> Option<Self> {
         let locale = env::var_os("LC_ALL")
-            .and_then(|v| if v.is_empty() { None } else { Some(v) })
+            .filter(|v| !v.is_empty())
             .or_else(|| env::var_os("LC_CTYPE"))
-            .and_then(|v| if v.is_empty() { None } else { Some(v) })
+            .filter(|v| !v.is_empty())
             .or_else(|| env::var_os("LANG"))
-            .and_then(|v| if v.is_empty() { None } else { Some(v) })
+            .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "C".into());
         let locale = CString::new(locale.into_vec()).unwrap();
 
         let table = unsafe {
-            (XKBCH.xkb_compose_table_new_from_locale)(
-                context.as_ptr(),
-                locale.as_ptr(),
-                xkb_compose_compile_flags::XKB_COMPOSE_COMPILE_NO_FLAGS,
-            )
+            (xkbch().table_new_from_locale)(context.as_ptr(), locale.as_ptr(), COMPOSE_NO_FLAGS)
         };
 
         let table = NonNull::new(table)?;
@@ -52,12 +52,7 @@ impl XkbComposeTable {
 
     /// Create new state with the given compose table.
     pub fn new_state(&self) -> Option<XkbComposeState> {
-        let state = unsafe {
-            (XKBCH.xkb_compose_state_new)(
-                self.table.as_ptr(),
-                xkb_compose_state_flags::XKB_COMPOSE_STATE_NO_FLAGS,
-            )
-        };
+        let state = unsafe { (xkbch().state_new)(self.table.as_ptr(), COMPOSE_NO_FLAGS) };
 
         let state = NonNull::new(state)?;
         Some(XkbComposeState { state })
@@ -75,7 +70,7 @@ impl Deref for XkbComposeTable {
 impl Drop for XkbComposeTable {
     fn drop(&mut self) {
         unsafe {
-            (XKBCH.xkb_compose_table_unref)(self.table.as_ptr());
+            (xkbch().table_unref)(self.table.as_ptr());
         }
     }
 }
@@ -88,45 +83,44 @@ pub struct XkbComposeState {
 impl XkbComposeState {
     pub fn get_string(&mut self, scratch_buffer: &mut Vec<u8>) -> Option<SmolStr> {
         super::make_string_with(scratch_buffer, |ptr, len| unsafe {
-            (XKBCH.xkb_compose_state_get_utf8)(self.state.as_ptr(), ptr, len)
+            (xkbch().state_get_utf8)(self.state.as_ptr(), ptr, len)
         })
     }
 
     #[inline]
     pub fn feed(&mut self, keysym: xkb_keysym_t) -> ComposeStatus {
-        let feed_result = unsafe { (XKBCH.xkb_compose_state_feed)(self.state.as_ptr(), keysym) };
+        let feed_result = unsafe { (xkbch().state_feed)(self.state.as_ptr(), keysym) };
         match feed_result {
-            xkb_compose_feed_result::XKB_COMPOSE_FEED_IGNORED => ComposeStatus::Ignored,
-            xkb_compose_feed_result::XKB_COMPOSE_FEED_ACCEPTED => {
-                ComposeStatus::Accepted(self.status())
-            },
+            compose_feed::ACCEPTED => ComposeStatus::Accepted(self.status()),
+            // IGNORED, and any result a later libxkbcommon adds.
+            _ => ComposeStatus::Ignored,
         }
     }
 
     #[inline]
     pub fn reset(&mut self) {
         unsafe {
-            (XKBCH.xkb_compose_state_reset)(self.state.as_ptr());
+            (xkbch().state_reset)(self.state.as_ptr());
         }
     }
 
     #[inline]
-    pub fn status(&mut self) -> xkb_compose_status {
-        unsafe { (XKBCH.xkb_compose_state_get_status)(self.state.as_ptr()) }
+    pub fn status(&mut self) -> ComposeStatusCode {
+        unsafe { (xkbch().state_get_status)(self.state.as_ptr()) }
     }
 }
 
 impl Drop for XkbComposeState {
     fn drop(&mut self) {
         unsafe {
-            (XKBCH.xkb_compose_state_unref)(self.state.as_ptr());
+            (xkbch().state_unref)(self.state.as_ptr());
         };
     }
 }
 
 #[derive(Copy, Clone, Debug)]
 pub enum ComposeStatus {
-    Accepted(xkb_compose_status),
+    Accepted(ComposeStatusCode),
     Ignored,
     None,
 }

@@ -67,6 +67,7 @@ impl HandoffName {
     /// `envs`, a launch request's pairs, the re-exec image's restored pairs.
     /// The name leaves this file only bound to a value, never as a bare string
     /// a read of this process's own environment could take.
+    #[cfg(unix)]
     #[must_use]
     pub(crate) fn pair(self, value: impl AsRef<OsStr>) -> (OsString, OsString) {
         (OsString::from(self.0), value.as_ref().to_os_string())
@@ -176,8 +177,8 @@ impl HandoffEnv {
     /// single-threaded. Every later handoff read is of `self`.
     #[must_use]
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "native_update_successor_warm_before_claim",
             action = "Capture",
             project = "aterm_gui::seamless::handoff_env_conformance::project"
@@ -248,7 +249,7 @@ impl HandoffEnv {
     /// snapshot is this process's own memory: no other thread can observe it,
     /// so unlike the `set_var` it replaces this is sound at any point. The
     /// launched lane (`handoff_rendezvous`) is macOS's.
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(any(target_os = "macos", all(test, unix)))]
     pub(crate) fn set(&mut self, key: HandoffName, value: impl Into<OsString>) {
         let value = value.into();
         let _ = self.take(key);
@@ -275,7 +276,7 @@ impl HandoffEnv {
     }
 
     /// The names still held, for the conformance projection.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn held(&self) -> Vec<HandoffName> {
         self.slots.iter().map(|(name, _)| *name).collect()
     }
@@ -287,8 +288,9 @@ impl HandoffEnv {
 /// retired function read) into a snapshot WITHOUT clearing them, runs `body`
 /// over it, then clears from the process exactly the names `body` consumed —
 /// the old function's effect on the process environment, name for name. Test
-/// builds only: a shipped reader has the one snapshot `main_entry` captured.
-#[cfg(test)]
+/// builds only: a shipped reader has the one snapshot `main_entry` captured. The
+/// suites that drive it are Unix's.
+#[cfg(all(test, unix))]
 pub(crate) fn through_process_env<T>(
     keys: &[HandoffName],
     body: impl FnOnce(&mut HandoffEnv) -> T,
@@ -319,13 +321,13 @@ pub(crate) fn through_process_env<T>(
 /// `seamless::handoff_env_conformance`.
 #[cfg(test)]
 mod waivers {
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_successor_warm_before_claim",
         action = "RelativeSocket",
         reason = "The environment: the launch's own `--control-sock` flag. `warm_order`'s Tier-1 \
                   drives the real decision over every shape, relative included."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_successor_warm_before_claim",
         action = "WarmDone",
         reason = "The return of `warm_prologue`'s main-thread section (lib.rs): it builds a GPU \
@@ -333,103 +335,103 @@ mod waivers {
                   realizes it as a stand-in that returns without joining its thread, and asserts \
                   that thread is still running at the real dial."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_successor_warm_before_claim",
         action = "StaleHint",
         reason = "The environment: the outgoing process's window changed between its launch-time \
                   hint and its capture. `warm_miss_px`'s Tier-1 drives the real hint parser over \
                   stale and hostile hints."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_successor_warm_before_claim",
         action = "ConfigEdit",
         reason = "The environment: the outgoing process applies an edit to aterm.toml, or to a \
                   theme file or feed it names, during the dial's hold. `warm_config_moved`'s \
                   Tier-1 writes the edit into a real file between the real reads."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_successor_warm_before_claim",
         action = "PrepareSocketDir",
         reason = "ControlSocketIdentity::prepare_incoming_directory's chdir, driven by \
                   control_socket_identity's own suites; P2's part is keeping threads away from it, \
                   bound through `warm_order`."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_successor_warm_before_claim",
         action = "SpawnLate",
         reason = "`warm_prologue` on the late order, after the intake (lib.rs `main_entry`): a GPU \
                   device, as WarmDone; the order decision itself is bound through `warm_order`."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_successor_warm_before_claim",
         action = "WarmPresent",
         reason = "P4's Warm-origin present into a hidden window; no code until then."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_successor_warm_before_claim",
         action = "RealPresent",
         reason = "A window's first present of the carried screens (app_render's post-present \
                   hook); a window cannot be driven from a unit test (AGENTS.md)."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_successor_warm_before_claim",
         action = "Reveal",
         reason = "The hidden window's reveal after a real present (app_render); a window, as \
                   RealPresent."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_successor_warm_before_claim",
         action = "Prove",
         reason = "Bound by NativeUpdateSeamlessHandoffOwnership's Tier-1 (ProofMatched); P1 changes \
                   nothing after the intake."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_successor_warm_before_claim",
         action = "Commit",
         reason = "Bound by NativeUpdateSeamlessHandoffOwnership's Tier-1 (Committed)."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_successor_warm_before_claim",
         action = "PublishToEnv",
         reason = "The Buggy=1 mutant: the retired ClaimedHandoff::publish; no shipping code \
                   implements it, and the conformance's negative control replays and catches it."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_successor_warm_before_claim",
         action = "BindWhileWarming",
         reason = "The Buggy=1 mutant: an owned resource taken before the claim; no shipping code."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_successor_warm_before_claim",
         action = "RevealPlaceholder",
         reason = "The Buggy=1 mutant: a warm window shown before the claim; no shipping code."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_successor_warm_before_claim",
         action = "WarmProves",
         reason = "The Buggy=1 mutant: a warm present standing for the carried screens; no \
                   shipping code."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_successor_warm_before_claim",
         action = "FoldHint",
         reason = "The Buggy=1 mutant: the launch hint folded into the digests; no shipping code, \
                   and the conformance replays it and sees it prove something else."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_successor_warm_before_claim",
         action = "WarmBeforeDialOnRelativeSocket",
         reason = "The Buggy=1 mutant: the prologue before the dial on the relative-socket shape; \
                   no shipping code (`warm_order` refuses it), replayed and caught by the \
                   conformance."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_successor_warm_before_claim",
         action = "PresentAtHintedSize",
         reason = "The Buggy=1 mutant: a carried present at a stale hint's size; no shipping code \
                   (`finalize_backend` re-selects first)."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_successor_warm_before_claim",
         action = "PresentUnderStaleConfig",
         reason = "The Buggy=1 mutant: a carried present under the config the early warm read \
@@ -437,7 +439,7 @@ mod waivers {
                   code (`main_entry` warms the config again first), replayed and caught by the \
                   conformance."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_successor_warm_before_claim",
         action = "JoinWorkerBeforeDial",
         reason = "The Buggy=1 liveness mutant: a prologue that joins its backend worker before \
@@ -451,17 +453,17 @@ mod waivers {
 
     /// The claim is the launched lane's, macOS's alone.
     #[cfg(not(target_os = "macos"))]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_successor_warm_before_claim",
         action = "Dial",
         reason = "The rendezvous dial is macOS's alone; the fork lane inherits its descriptors."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_successor_warm_before_claim",
         action = "ClaimFail",
         reason = "The rendezvous claim is macOS's alone."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_successor_warm_before_claim",
         action = "ClaimOk",
         reason = "The rendezvous claim is macOS's alone."
@@ -474,7 +476,7 @@ mod waivers {
 
     /// The overlap channels are unix's alone.
     #[cfg(not(unix))]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_successor_warm_before_claim",
         action = "Adopt",
         reason = "The overlap channels are a unix mechanism; off unix nothing is adopted."

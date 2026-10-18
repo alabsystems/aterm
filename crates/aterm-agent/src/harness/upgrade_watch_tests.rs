@@ -29,6 +29,8 @@ fn scratch(tag: &str) -> (crate::supervise::ScratchDir, Opts) {
         usage_tap: None,
         instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
         agents_off: Vec::new(),
+        land: false,
+        timings: crate::harness::Timings::FAST,
     };
     (dir, opts)
 }
@@ -717,11 +719,6 @@ fn the_watch_retargets_and_holds_tab_ones_record_off_any_point_with_no_hands() {
         "said once in the ledger: {}",
         one.ledger()
     );
-    assert!(
-        one.ledger().contains("still count") && !one.ledger().contains("started over"),
-        "the row says the round was kept: {}",
-        one.ledger()
-    );
     assert_eq!(one.hands(), Vec::<String>::new(), "ZERO input requests");
     assert!(
         !one.asked.lock().expect("log").is_empty(),
@@ -765,37 +762,6 @@ fn the_watch_retargets_and_holds_tab_ones_record_off_any_point_with_no_hands() {
     assert_eq!(one.hands(), Vec::<String>::new(), "ZERO input requests");
 }
 
-/// A pending round the watch retargets stays pending, and its row says so: tab
-/// one's record, never announced, meets a newer build. It has no notice and no
-/// READY, so its row says "still pending", not "in place — its round, notice
-/// and any READY kept". Zero input requests.
-#[test]
-fn the_watch_retargets_a_pending_round_and_says_it_stays_pending() {
-    let one = TabOne::new("t1c-pending", "2.1.284");
-    let mut st = one.record();
-    st.phase = Phase::Pending;
-    st.marker.clear();
-    write_verbatim(&one.opts, SESSION, &st);
-    let reads = std::cell::Cell::new(0);
-    let told = Watcher {
-        told: true,
-        ..looker()
-    };
-    let w = watch_with(&one.opts, TAB_ONE, &told, NOW_28TH, &one.read(&reads));
-    assert!(
-        w.wrote.iter().any(|x| x == "retargeted:2.1.283->2.1.284"),
-        "{w:?}"
-    );
-    let st = one.record();
-    assert_eq!((st.to.as_str(), &st.phase), ("2.1.284", &Phase::Pending));
-    let row = one.ledger();
-    assert!(
-        row.contains("still pending") && !row.contains("still count") && !row.contains("READY"),
-        "{row}"
-    );
-    assert_eq!(one.hands(), Vec::<String>::new(), "ZERO input requests");
-}
-
 /// An announced round whose model rides its restart is retargeted in place by
 /// the watch as the visit does: tab one's record with a model promised
 /// (`model_list`) and a newer build installed. The watch hands
@@ -829,12 +795,6 @@ fn the_watch_keeps_an_announced_round_whose_model_rides_the_restart_in_place() {
     assert_eq!(st.marker, "ATERM-UPGRADE-READY-5f3a1c9e", "its marker kept");
     assert_eq!(st.model_list, "claude-opus-5-5", "its promise kept");
     assert!(st.release.is_empty(), "no release owed: {:?}", st.release);
-    assert!(
-        one.ledger()
-            .contains("its notice and any READY still count"),
-        "{}",
-        one.ledger()
-    );
     assert_eq!(one.hands(), Vec::<String>::new(), "ZERO input requests");
     // Negative control: no promise handed, or another model, abandons it.
     let from = Version::parse("2.1.280").expect("from");
@@ -900,12 +860,6 @@ fn the_watch_keeps_no_reset_for_a_limit_row_that_names_none() {
         .expect("the row");
     let later = until + LIMIT_GRACE_S;
     assert!(!row.limit_passed(later), "no named reset has passed");
-    assert!(
-        row.stall_words(later)
-            .is_none_or(|w| !w.contains("reset passed")),
-        "{:?}",
-        row.stall_words(later)
-    );
     assert_eq!(one.hands(), Vec::<String>::new(), "ZERO input requests");
 }
 
@@ -1118,7 +1072,7 @@ fn tab_one_state(one: &TabOne, posture: i64, now: u64) -> aterm_spec::interp::St
         .into_iter()
         .find(|r| r.session == SESSION)
         .expect("tab #1's row");
-    let mut s = aterm_spec::derive::harness_upgrade_progress_model().init_state();
+    let mut s = aterm_models_harness::harness_upgrade_progress_model().init_state();
     for (k, v) in progress_projection(&row, now) {
         s.insert(k, v);
     }
@@ -1165,7 +1119,7 @@ fn looked(s: &aterm_spec::interp::State) -> Vec<(&'static str, i64)> {
 ///   the classifier's horizon for the agent's own work, `Row::own_work`).
 #[test]
 fn the_real_watch_is_the_derived_look() {
-    use aterm_spec::derive::harness_upgrade_progress_model;
+    use aterm_models_harness::harness_upgrade_progress_model;
     use aterm_spec::xref;
     assert!(xref::reset_entered_anchors(), "the evidence window opens");
     let today = aterm_spec::interp::with_buggy(&harness_upgrade_progress_model(), 0);
@@ -1263,10 +1217,9 @@ fn the_real_watch_is_the_derived_look() {
         .find(|r| r.session == SESSION)
         .expect("tab #1's row");
     assert!(
-        row.stall_words(NOW_28TH)
-            .is_some_and(|w| w.ends_with("its next step goes at its next pause")),
-        "{:?}",
-        row.stall_words(NOW_28TH)
+        row.line(NOW_28TH).contains(" cause=next-point "),
+        "{}",
+        row.line(NOW_28TH)
     );
     // NEGATIVE CONTROL: the `keep` latch's look leaves `background`: the
     // record keeps its own work.

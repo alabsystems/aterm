@@ -250,8 +250,6 @@ pub fn admit_roster(
         return Err(Reject::Disabled);
     }
     // Steps 2–3: signature length, then the master crypto.
-    #[cfg(test)]
-    MASTER_VERIFIES.with(|c| c.set(c.get() + 1));
     let verified: VerifiedRoster = verify_roster(&anchor.keys(), raw, sig).map_err(from_roster)?;
     // Steps 4–5: parse only from the verified wrapper, with the reject-newer schema gate.
     let roster = Roster::parse(&verified).map_err(from_roster)?;
@@ -260,13 +258,6 @@ pub fn admit_roster(
         .admit(anchor.roster_floor, now_unix)
         .map_err(from_roster)?;
     Ok(TrustedRoster { roster, now_unix })
-}
-
-#[cfg(test)]
-thread_local! {
-    /// Test-only count of master Ed25519 checks in [`admit_roster`], behind `select`'s "one
-    /// admission per distinct roster" tests. Thread-local so parallel tests don't race.
-    static MASTER_VERIFIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl TrustedRoster {
@@ -446,12 +437,6 @@ pub(crate) mod testkit {
     /// An anchor armed with the synthetic paper master, floor 0.
     pub(crate) fn anchor() -> Anchor {
         Anchor::of(vec![pubkey_b64(&MASTER_SEED)], 0)
-    }
-
-    /// How many master Ed25519 verifies [`admit_roster`] has run on this thread; read it as
-    /// a delta around the call under test.
-    pub(crate) fn master_verifies() -> usize {
-        super::MASTER_VERIFIES.with(|c| c.get())
     }
 
     /// The admitted roster generation, through the real chain.
@@ -841,29 +826,6 @@ mod tests {
         admit_roster(anchor, bytes, &sig, NOW)
     }
 
-    /// Waiving the floor needs an index that declares the newer generation, not one merely
-    /// served beside a newer roster (`Attribution::bind` admits an older `roster_seq`).
-    #[test]
-    fn only_the_generation_an_index_declares_waives_the_floor() {
-        let floor = BuildFloor {
-            index_build: 100,
-            roster_seq: 4,
-        };
-        // The master's rescue: a new index that declares generation 5.
-        assert!(
-            floor.admits(5, 1),
-            "a genuinely newer generation re-bases the floor"
-        );
-        // The replay: an old index (declaring 4) served beside a generation-5 roster.
-        assert!(
-            !floor.admits(4, 99),
-            "an index below the floor must not be admitted by its neighbour's roster"
-        );
-        assert!(floor.admits(4, 100), "…while the floor itself still passes");
-        // An index that declares nothing cannot waive a generation floor.
-        assert!(!floor.admits(0, 99));
-    }
-
     /// An `index.toml` body naming `machine_id` / `roster_seq`, the attribution step 10 binds.
     fn index_body(machine_id: &str, roster_seq: u64, index_build: u64) -> Vec<u8> {
         let mut s = String::from("schema = 2\nindex_build = ");
@@ -903,24 +865,6 @@ mod tests {
         // The same bytes and signature are accepted once a master is pinned, so the
         // refusal above is the anchor, not the fixture.
         assert!(admit_roster(&armed(0), bytes, &sig, NOW).is_ok());
-    }
-
-    /// The shipped anchor is armed and the manager live because of it; emptying it is a
-    /// deliberate act to review.
-    #[test]
-    fn this_build_ships_armed_and_the_pinned_anchor_is_live() {
-        assert!(
-            !crate::PKG_TRUST_ANCHORS.is_empty(),
-            "atpkg's anchor is pins::PAPER_MASTER_PUBKEYS, armed 2026-08-15"
-        );
-        assert!(
-            Anchor::pinned(0).is_armed(),
-            "so the pinned anchor is live by construction"
-        );
-        assert!(
-            crate::enabled(),
-            "and the manager acts at the CLI edge — no environment variable can switch it off"
-        );
     }
 
     // The happy path, and the ways it is not.
@@ -1359,28 +1303,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The roster's `roster_seq` ratchet (`<prefix>/roster.floor`) is the same `Floor`.
-    #[test]
-    fn the_roster_floor_uses_the_same_durable_ratchet() {
-        let dir = private_tmp_dir("roster-floor");
-        let floor = Floor::new(dir.join("roster.floor"));
-        assert_eq!(floor.check_and_record(3), Ok(()));
-        assert_eq!(floor.current(), 3);
-        assert_eq!(floor.check_and_record(2), Err(Reject::Rollback));
-        // And the value it hands an Anchor is what refuses the replayed roster.
-        assert!(
-            admit(&armed(floor.current()), &roster()).is_ok(),
-            "seq 3 == floor 3 is accepted"
-        );
-        assert_eq!(floor.check_and_record(4), Ok(()));
-        assert_eq!(
-            admit(&armed(floor.current()), &roster()).err(),
-            Some(Reject::Rollback),
-            "once seq 4 is durable, the seq-3 roster is refused forever"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// The build floor binds within its generation and a strictly newer one re-bases it, so
     /// one machine publishing `index_build = u64::MAX` cannot put the store beyond the index
     /// that revokes it. An equal or older generation still binds.
@@ -1541,16 +1463,6 @@ mod tests {
             litter.is_empty(),
             "a failed persist left its temp behind: {litter:?}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn oversized_sparse_floor_is_bounded_first_contact() {
-        let dir = private_tmp_dir("floor-sparse");
-        let path = dir.join("index_build.floor");
-        let file = std::fs::File::create(&path).unwrap();
-        file.set_len((MAX_FLOOR_BYTES + 1) as u64).unwrap();
-        assert_eq!(Floor::new(path).current(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

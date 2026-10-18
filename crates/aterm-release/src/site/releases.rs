@@ -330,6 +330,10 @@ pub struct LinuxDownload {
 pub struct Facts {
     pub slug: String,
     pub mac: MacDownload,
+    /// The tag of the newest stable release with a current appcast: the policy
+    /// every Linux download is proved under, and the release an unpinned
+    /// `install.sh` takes (the cutter points `releases/latest` at it).
+    pub head: String,
     /// The chosen release's x86_64 run record, when it carries one.
     pub intel_proof: Option<String>,
     /// Per [`LINUX_ARCHES`] entry, its download (or none).
@@ -606,6 +610,7 @@ pub fn elect(
     Ok(Facts {
         slug: slug.into(),
         mac,
+        head: authority.tag.clone(),
         intel_proof,
         linux,
     })
@@ -819,6 +824,8 @@ mod tests {
         let releases = vec![app("0.64.0", Some(1)), old];
         let mut notes = Vec::new();
         let facts = elect(&releases, SLUG, &mut NoProver, &mut notes).unwrap();
+        // the policy head an unpinned installer takes: the newest current appcast
+        assert_eq!(facts.head, "v0.64.0");
         let x86 = facts.linux("x86_64").unwrap();
         assert_eq!(
             (x86.tag.as_str(), x86.label.as_str(), &x86.kind),

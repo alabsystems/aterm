@@ -1016,8 +1016,8 @@ impl<'a> UnscaledScaler<'a> {
                     *phantom += delta.map(Fixed::to_i32).map(F26Dot6::from_bits);
                 }
                 have_deltas = true;
+                self.component_delta_count += count;
             }
-            self.component_delta_count += count;
         }
         for point in self.phantom.iter_mut() {
             *point = point.map(|x| F26Dot6::from_i32(x.to_bits()));

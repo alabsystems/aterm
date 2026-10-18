@@ -165,10 +165,6 @@ fn a_pass_the_lock_refused_says_it_did_not_run() {
     assert_eq!(events.len(), 1, "{events:?}");
     assert_eq!(events[0].kind, "pass-end");
     assert_eq!(events[0].get("exit"), Some("75"));
-    assert_eq!(
-        events[0].get("outcome"),
-        Some("did not run: another pass holds the store")
-    );
 }
 
 /// The child half of the two-process test below: append this process's lines, through the

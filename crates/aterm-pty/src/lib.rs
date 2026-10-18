@@ -38,10 +38,96 @@ pub struct SpawnedShell {
     pub pid: i32,
 }
 
+/// The variables another terminal emulator sets for ITS children: when aterm is
+/// started from a gnome-terminal, kitty, Konsole, … tab, these name that terminal's
+/// window, pane or control socket, so in aterm's shell they point at the wrong
+/// terminal (`$WINDOWID` tools act on the outer window, `kitty @` drives the outer
+/// kitty, Ubuntu's `vte-2.91.sh` runs a VTE prompt hook at every prompt). aterm's own
+/// identity is `TERM_PROGRAM` and its kin, which a window's spawn sets in `env_add`;
+/// these are the other side of that, stripped by [`build_child_env`] only on a spawn
+/// that sets it. A spawn that does not (the passthrough session of an `aterm` typed at
+/// a prompt, which models no screen) runs inside the outer terminal, which really is
+/// the shell's terminal there, so they pass through.
+///
+/// Only names the terminal itself sets per window or session: a user's configuration
+/// variable (`KITTY_CONFIG_DIRECTORY`, `WEZTERM_CONFIG_FILE`) and a multiplexer's
+/// (`TMUX`, `STY`, which aterm's integration reads) pass through.
+const FOREIGN_TERMINAL_VARS: &[&str] = &[
+    // X11 terminals (xterm, urxvt, kitty, alacritty): the terminal's X window id.
+    "WINDOWID",
+    // VTE (gnome-terminal, Tilix, Terminator, xfce4-terminal, Ptyxis).
+    "VTE_VERSION",
+    "GNOME_TERMINAL_SCREEN",
+    "GNOME_TERMINAL_SERVICE",
+    "TILIX_ID",
+    "TERMINATOR_UUID",
+    "TERMINATOR_DBUS_NAME",
+    "TERMINATOR_DBUS_PATH",
+    // kitty.
+    "KITTY_WINDOW_ID",
+    "KITTY_PID",
+    "KITTY_LISTEN_ON",
+    "KITTY_PUBLIC_KEY",
+    // Alacritty.
+    "ALACRITTY_WINDOW_ID",
+    "ALACRITTY_SOCKET",
+    "ALACRITTY_LOG",
+    // WezTerm.
+    "WEZTERM_PANE",
+    "WEZTERM_UNIX_SOCKET",
+    "WEZTERM_EXECUTABLE",
+    "WEZTERM_EXECUTABLE_DIR",
+    // Ghostty: its shell integration keys off these.
+    "GHOSTTY_RESOURCES_DIR",
+    "GHOSTTY_BIN_DIR",
+    "GHOSTTY_SHELL_FEATURES",
+    // iTerm2 and Terminal.app.
+    "ITERM_SESSION_ID",
+    "ITERM_PROFILE",
+    "LC_TERMINAL",
+    "LC_TERMINAL_VERSION",
+    "TERM_SESSION_ID",
+    // Windows Terminal.
+    "WT_SESSION",
+    "WT_PROFILE_ID",
+    // The outer terminal's foreground/background colours (rxvt, Konsole, iTerm2),
+    // which vim and others read as aterm's.
+    "COLORFGBG",
+];
+
+/// Prefixes of [`FOREIGN_TERMINAL_VARS`]: every `KONSOLE_*` name is Konsole's
+/// per-session D-Bus address or profile.
+const FOREIGN_TERMINAL_PREFIXES: &[&str] = &["KONSOLE_"];
+
+/// Whether `key` is another terminal's identity variable ([`FOREIGN_TERMINAL_VARS`],
+/// [`FOREIGN_TERMINAL_PREFIXES`]). Like [`aterm_types::domain::is_ai_env_key`], a
+/// non-Unicode key is read by its lossy spelling and the match ignores ASCII case on
+/// Windows only.
+#[must_use]
+fn is_foreign_terminal_key(key: &std::ffi::OsStr) -> bool {
+    let key = key.to_string_lossy();
+    #[cfg(windows)]
+    let key = key.to_ascii_uppercase();
+    for name in FOREIGN_TERMINAL_VARS {
+        if *name == key {
+            return true;
+        }
+    }
+    for prefix in FOREIGN_TERMINAL_PREFIXES {
+        if key.starts_with(prefix) {
+            return true;
+        }
+    }
+    false
+}
+
 /// The child shell's environment: `inherited` minus every deny-listed key
 /// ([`aterm_types::domain::is_ai_env_key`]: AI-tool vars and the recursion-provisioning
-/// identity vars; case-insensitive on Windows only), then `env_add` on top, overriding
-/// or appending. Built in the parent before the fork, so the child allocates nothing.
+/// identity vars; case-insensitive on Windows only), then `env_add` on top, overriding or
+/// appending. When `env_add` claims the terminal (it sets `TERM_PROGRAM`, as a window's
+/// spawn does), every other terminal's identity variable ([`is_foreign_terminal_key`])
+/// is dropped as well; without that claim the shell runs in the outer terminal and
+/// keeps them. Built in the parent before the fork, so the child allocates nothing.
 // Skip: `inherited` is a caller-chosen iterator, so `next` is open-trait dispatch the
 // verifier cannot follow; the deny-list logic is unit-tested.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -51,9 +137,18 @@ fn build_child_env(
 ) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
     // Plain loops, not adapters: closure bodies are absent callees for the Trust
     // panic-freedom verifier. They keep encounter order and replace the first match.
+    let mut claims_terminal = false;
+    for (k, _) in env_add {
+        if k == "TERM_PROGRAM" {
+            claims_terminal = true;
+            break;
+        }
+    }
     let mut env_pairs: Vec<(std::ffi::OsString, std::ffi::OsString)> = Vec::new();
     for (k, v) in inherited {
-        if !aterm_types::domain::is_ai_env_key(&k) {
+        if !aterm_types::domain::is_ai_env_key(&k)
+            && !(claims_terminal && is_foreign_terminal_key(&k))
+        {
             env_pairs.push((k, v));
         }
     }
@@ -233,10 +328,23 @@ pub enum ChildExit {
     Signal(u8),
 }
 
+// The console host a Windows pseudoconsole runs in (aterm.toml `conpty`): the
+// types on every platform, the no-op parity of the window's calls off Windows.
+mod console_host;
+pub use console_host::{ConsoleHostChoice, ConsoleHostKind, ConsoleHostReport};
+#[cfg(unix)]
+pub use console_host::{conpty_host, set_console_host, take_console_host_fallback};
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
 pub use unix::*;
+#[cfg(unix)]
+mod unix_shell;
+#[cfg(unix)]
+pub use unix_shell::{
+    ShellOrigin, fallback_shell, login_shell, select_shell_with_origin, shell_cannot_start,
+    shell_env_for_child,
+};
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
@@ -296,6 +404,91 @@ mod tests {
             terms[0],
             &os("xterm-256color"),
             "env_add must override inherited TERM"
+        );
+    }
+
+    /// aterm launched from another terminal's tab: that terminal's window, pane and
+    /// socket names do not reach aterm's shell, aterm's own identity does, and a
+    /// multiplexer's or a user's configuration variable is left alone.
+    #[test]
+    fn build_child_env_drops_another_terminals_identity() {
+        use std::ffi::OsString;
+        let os = |s: &str| OsString::from(s);
+        let inherited = vec![
+            (os("PATH"), os("/usr/bin")),
+            (os("WINDOWID"), os("4242")),
+            (os("VTE_VERSION"), os("7600")),
+            (
+                os("GNOME_TERMINAL_SCREEN"),
+                os("/org/gnome/Terminal/screen/x"),
+            ),
+            (os("GNOME_TERMINAL_SERVICE"), os(":1.99")),
+            (os("KITTY_WINDOW_ID"), os("3")),
+            (os("KONSOLE_DBUS_SERVICE"), os(":1.7")),
+            (os("TERM_PROGRAM"), os("WezTerm")),
+            (os("TMUX"), os("/tmp/tmux-1000/default,9,0")),
+            (os("KITTY_CONFIG_DIRECTORY"), os("/home/u/kitty")),
+        ];
+        let env_add = vec![("TERM_PROGRAM".to_string(), "aterm".to_string())];
+        let out = build_child_env(inherited.into_iter(), &env_add);
+        let pairs: Vec<(String, String)> = out
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
+        let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+        assert_eq!(
+            pairs,
+            vec![
+                pair("PATH", "/usr/bin"),
+                pair("TERM_PROGRAM", "aterm"),
+                pair("TMUX", "/tmp/tmux-1000/default,9,0"),
+                pair("KITTY_CONFIG_DIRECTORY", "/home/u/kitty"),
+            ]
+        );
+    }
+
+    /// The passthrough session of an `aterm` typed at a prompt: its `env_add` holds the
+    /// session PATH and no `TERM_PROGRAM`, so the outer terminal stays the shell's
+    /// terminal and its identity variables reach the shell unchanged.
+    #[test]
+    fn build_child_env_keeps_the_outer_terminals_identity_without_a_claim() {
+        use std::ffi::OsString;
+        let os = |s: &str| OsString::from(s);
+        let inherited = vec![
+            (os("WINDOWID"), os("4242")),
+            (os("VTE_VERSION"), os("7600")),
+            (os("KITTY_WINDOW_ID"), os("3")),
+            (os("KONSOLE_DBUS_SERVICE"), os(":1.7")),
+            (os("TERM_PROGRAM"), os("kitty")),
+            (os("PATH"), os("/usr/bin")),
+        ];
+        let env_add = vec![("PATH".to_string(), "/opt/aterm/bin:/usr/bin".to_string())];
+        let out = build_child_env(inherited.into_iter(), &env_add);
+        let pairs: Vec<(String, String)> = out
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
+        let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+        assert_eq!(
+            pairs,
+            vec![
+                pair("WINDOWID", "4242"),
+                pair("VTE_VERSION", "7600"),
+                pair("KITTY_WINDOW_ID", "3"),
+                pair("KONSOLE_DBUS_SERVICE", ":1.7"),
+                pair("TERM_PROGRAM", "kitty"),
+                pair("PATH", "/opt/aterm/bin:/usr/bin"),
+            ]
         );
     }
 
@@ -382,7 +575,11 @@ mod tests {
         }
     }
 
-    // Windows env names are case-insensitive, so any casing of a denied key is denied.
+    // Windows env names are case-insensitive, so any casing of a denied key is denied:
+    // the prefixes (`ANTHROPIC_`, `CLAUDE`, `CURSOR_`) and an exact name, the retired
+    // update token (a secret, so a leak costs the most). The exact name was
+    // `ATERM_CONTAINMENT_MODE` until that knob left `ENV_DENY_VARS`; denied in no case
+    // since, it stood for nothing about case.
     #[cfg(windows)]
     #[test]
     fn build_child_env_denies_mixed_case_keys_on_windows() {
@@ -392,7 +589,7 @@ mod tests {
             (os("Path"), os("C:\\Windows")),
             (os("anthropic_api_key"), os("secret")),
             (os("Claude_Code"), os("1")),
-            (os("Aterm_Containment_Mode"), os("containment")),
+            (os("Aterm_Update_Token"), os("secret")),
             (os("cursor_trace_id"), os("xyz")),
         ];
         let out = build_child_env(inherited.into_iter(), &[]);

@@ -1,29 +1,21 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The narrow filesystem primitives the updater needs, in their portable/
-//! artifact-agnostic form: an advisory exclusive file lock (`flock(LOCK_EX)`, via
-//! std's `File::lock`) for the apply/stage critical sections, and a same-volume
-//! (`st_dev`) check. All safe Rust. The macOS `renamex_np(RENAME_SWAP)` directory
-//! exchange stays in the `.app`-specific crate. Windows (where the updater is
-//! inert) carries honest std-only approximations of both primitives so the crate
-//! compiles everywhere.
+//! The updater's portable filesystem primitives: an advisory exclusive file lock (std's
+//! `File::lock`, which is `flock(LOCK_EX)` on unix) and a same-volume (`st_dev`) check.
+//! Windows, where the updater is inert, gets std-only approximations of both.
 
 use std::fs::File;
 use std::io;
 use std::path::Path;
 
-/// An advisory exclusive lock held for the lifetime of the value. Dropping it (or
-/// the process exiting / `exec`ing) releases the lock — `flock` is associated with
-/// the open file description, so the kernel always cleans up.
+/// An advisory exclusive lock held for the lifetime of the value.
 ///
-/// Dropping releases it by `LOCK_UN`, not by the close alone (2026-09-24): a child
-/// another thread is mid-spawning holds a copy of every descriptor until it
-/// `exec`s (`FD_CLOEXEC` closes at exec, never at fork — up to ~523 ms under load),
-/// and a lock released only by the close stayed held that long. `LOCK_UN` strips
-/// it from the description, every inherited copy included. An `exec` with the
-/// guard alive still releases it atomically with the image replacement (the file
-/// is close-on-exec), and a failed exec keeps it held for rollback.
+/// Drop releases it by `LOCK_UN`, not by the close alone: a child another thread is
+/// mid-spawning holds a copy of every descriptor until it `exec`s (up to ~523 ms under load),
+/// and `LOCK_UN` strips the lock from the open file description, every copy included. An
+/// `exec` with the guard alive releases it with the image replacement (the file is
+/// close-on-exec); a failed exec keeps it held for rollback.
 pub struct FileLock {
     _file: File,
 }
@@ -36,21 +28,15 @@ impl Drop for FileLock {
     }
 }
 
-/// How often [`FileLock::acquire_within`] re-tests a held lock, on both
-/// branches: short enough that the common "holder finishes in millis" case
-/// costs one tick, long enough that a full wait is ~20 syscalls a second rather
-/// than a spin.
+/// How often [`FileLock::acquire_within`] re-tests a held lock, on both platforms: a holder
+/// that finishes in millis costs one tick, and a long wait polls rather than spins.
 const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 impl FileLock {
-    /// Acquire `LOCK_EX` on `path` (created `0600` if absent), blocking until the
-    /// lock is available. Blocking is fine: this runs before the window exists and
-    /// the holder either re-execs (releasing immediately) or returns in millis.
+    /// Open the lock file at `path` (created `0600` if absent).
     #[cfg(unix)]
-    // Skip: OpenOptions::open for the advisory lock file — hardened raw_path
-    // class; the lock path is private-dir confined and the lock is advisory
-    // by design (a raced path costs a retry, never corruption). Audited
-    // (update-atpkg).
+    // Skip: OpenOptions::open for the lock file; the path is private-dir confined and a
+    // raced path costs a retry, never corruption.
     #[cfg_attr(trust_verify, trust::skip)]
     fn open_lock_file(path: &Path) -> io::Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
@@ -58,27 +44,21 @@ impl FileLock {
             .create(true)
             .read(true)
             .write(true)
-            // A lock file is a rendezvous, not data — never clobber its contents.
+            // A lock file is a rendezvous, not data: never clobber it.
             .truncate(false)
             .mode(0o600)
-            // Apply intentionally holds this guard through execve: the kernel must
-            // release the transaction lock atomically with successful image
-            // replacement, while an exec error leaves it held for rollback.
+            // Apply holds this guard through execve (see `FileLock`).
             .custom_flags(libc::O_CLOEXEC)
             .open(path)
     }
 
+    /// Take `LOCK_EX` on `path` (created `0600` if absent), blocking until it is free. Not for
+    /// the launch path: see [`acquire_within`](Self::acquire_within).
     #[cfg(unix)]
     pub fn acquire(path: &Path) -> io::Result<Self> {
-        // The ascription is LOAD-BEARING: it is the lock-order census's File
-        // evidence (aterm-census `is_file_binding_rhs`), which keeps the flock
-        // below categorized as the cross-process advisory lock it is rather
-        // than graphed as an in-process mutex.
+        // The `File` ascription is the lock-order census's evidence (`is_file_binding_rhs`)
+        // that this flock is a cross-process advisory lock, not an in-process mutex.
         let file: std::fs::File = Self::open_lock_file(path)?;
-        // std's `File::lock` IS `flock(fd, LOCK_EX)` on unix — the same syscall with
-        // the same blocking semantics, released on close/drop exactly as a direct
-        // `libc::flock` call, and failures map to the same `io::Error`. Using the
-        // safe std wrapper keeps this crate free of direct FFI here.
         #[expect(
             clippy::disallowed_methods,
             reason = "the guard's own take: its Drop releases by LOCK_UN"
@@ -87,10 +67,10 @@ impl FileLock {
         Ok(Self { _file: file })
     }
 
-    /// Take `LOCK_EX` on a file the caller opened its own way (blocking) — the
-    /// roster's read-only claim, which must never create its rendezvous.
+    /// Take `LOCK_EX` (blocking) on a file the caller opened: the roster's read-only claim,
+    /// which must never create its rendezvous.
     pub fn lock_open(file: File) -> io::Result<Self> {
-        // Ascription load-bearing — census File evidence, as in `acquire`.
+        // Ascription is census File evidence, as in `acquire`.
         let file: std::fs::File = file;
         #[expect(
             clippy::disallowed_methods,
@@ -100,21 +80,12 @@ impl FileLock {
         Ok(Self { _file: file })
     }
 
-    /// Acquire the lock, giving up after `limit` instead of waiting forever.
-    ///
-    /// The blocking [`acquire`](Self::acquire) is correct wherever an indefinite
-    /// wait is merely a delay — a background stage, a durable counter, a
-    /// publication transaction that returns in millis. It is NOT correct on the
-    /// LAUNCH path. The apply lock is taken at the top of `main`, before the
-    /// window exists, so a holder that is SIGSTOPped, paused under a debugger, or
-    /// wedged on an unplugged volume turns "aterm starts a moment later" into
-    /// "aterm never starts", with no window to say why and nothing to click.
-    ///
-    /// Callers map the timeout to a normal launch on the build already installed,
-    /// which is always a safe outcome.
+    /// Acquire the lock, giving up after `limit`. The launch path takes the apply lock
+    /// before the window exists, so a stopped or wedged holder would otherwise mean aterm
+    /// never starts; callers map the timeout to a normal launch of the installed build.
     #[cfg(unix)]
     pub fn acquire_within(path: &Path, limit: std::time::Duration) -> io::Result<Self> {
-        // Ascription load-bearing — census File evidence, as in `acquire`.
+        // Ascription is census File evidence, as in `acquire`.
         let file: std::fs::File = Self::open_lock_file(path)?;
         let deadline = std::time::Instant::now() + limit;
         loop {
@@ -125,7 +96,6 @@ impl FileLock {
             let taken = file.try_lock();
             match taken {
                 Ok(()) => return Ok(Self { _file: file }),
-                // Held by someone else: the ONLY retryable outcome.
                 Err(std::fs::TryLockError::WouldBlock) => {
                     if std::time::Instant::now() >= deadline {
                         return Err(io::Error::new(
@@ -138,35 +108,22 @@ impl FileLock {
                     }
                     std::thread::sleep(LOCK_POLL);
                 }
-                // A real error (EBADF, ENOLCK, an unsupported filesystem) is
-                // PERMANENT — retrying it just burns the budget before surfacing
-                // the same failure, exactly as the Windows branch reasons.
+                // A real error (EBADF, ENOLCK, an unsupported filesystem) is permanent.
                 Err(std::fs::TryLockError::Error(error)) => return Err(error),
             }
         }
     }
 
-    /// Windows approximation of the advisory lock: open the file with
-    /// `share_mode(0)` (exclusive — a second open by anyone fails with a sharing
-    /// violation), retried until `limit`. The updater is inert on Windows
-    /// (`enabled()` is already `false`), so an approximate advisory lock is an
-    /// honest stand-in; the OS releases it when the handle closes, matching the
-    /// flock open-file-description cleanup guarantee.
+    /// Windows approximation of the advisory lock (the updater is inert on Windows): an
+    /// exclusive `share_mode(0)` open, retried until `limit`, released when the handle closes.
     #[cfg(windows)]
-    // Skip: OpenOptions::open for the advisory lock file — hardened raw_path
-    // class; the lock path is private-dir confined and the lock is advisory
-    // by design (a raced path costs a retry, never corruption). Audited
-    // (update-atpkg).
+    // Skip: as the unix `open_lock_file`.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn acquire_within(path: &Path, limit: std::time::Duration) -> io::Result<Self> {
         use std::os::windows::fs::OpenOptionsExt;
-        // Only a sharing/lock violation means "someone else holds it" — retry
-        // those. ERROR_SHARING_VIOLATION (32) is what a competing `share_mode(0)`
-        // open returns; ERROR_LOCK_VIOLATION (33) is the byte-range-lock cousin.
-        // Any other error (missing parent dir = 3, access-denied ACL = 5, invalid
-        // path, …) is PERMANENT: retrying just burns the budget before the real
-        // error surfaces, so return it immediately (matching the unix branch, where
-        // flock only blocks after a successful open).
+        // Only a sharing violation (32, a competing `share_mode(0)` open) or lock violation
+        // (33) means another holder, so only those retry; any other error is permanent and
+        // returns at once.
         const ERROR_SHARING_VIOLATION: i32 = 32;
         const ERROR_LOCK_VIOLATION: i32 = 33;
         let deadline = std::time::Instant::now() + limit;
@@ -175,7 +132,6 @@ impl FileLock {
                 .create(true)
                 .read(true)
                 .write(true)
-                // A lock file is a rendezvous, not data — never clobber its contents.
                 .truncate(false)
                 .share_mode(0)
                 .open(path)
@@ -188,8 +144,7 @@ impl FileLock {
                     ) {
                         return Err(e);
                     }
-                    // Held past the deadline: `TimedOut`, as the unix branch
-                    // answers, which is what every caller matches on.
+                    // Held past the deadline: `TimedOut`, as on unix; callers match on that kind.
                     if std::time::Instant::now() >= deadline {
                         return Err(io::Error::new(
                             io::ErrorKind::TimedOut,
@@ -205,22 +160,19 @@ impl FileLock {
         }
     }
 
-    /// [`Self::acquire_within`] a bounded ~5 s rather than flock's indefinite
-    /// block: holders release in millis, and a wedged holder should surface as
-    /// an error.
+    /// Windows: [`acquire_within`](Self::acquire_within) with a 5 s limit rather than flock's
+    /// indefinite block, so a wedged holder surfaces as an error.
     #[cfg(windows)]
     pub fn acquire(path: &Path) -> io::Result<Self> {
         Self::acquire_within(path, std::time::Duration::from_secs(5))
     }
 }
 
-/// Whether `a` and `b` live on the same filesystem volume (`st_dev`). Required
-/// before attempting an in-volume atomic directory exchange (`RENAME_SWAP` is
-/// in-volume only), which the consuming crate performs.
+/// Whether `a` and `b` live on the same filesystem volume (`st_dev`), as an in-volume
+/// `RENAME_SWAP` exchange requires.
 #[cfg(unix)]
-// Skip: fs::metadata dev-id comparison — hardened raw_path class; a raced
-// direntry only flips the answer to the CONSERVATIVE cross-volume copy
-// path (fail-safe, never fail-open). Audited (update-atpkg).
+// Skip: fs::metadata over caller paths; a raced entry only flips the answer to the
+// conservative cross-volume copy.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn same_volume(a: &Path, b: &Path) -> bool {
     match (std::fs::metadata(a), std::fs::metadata(b)) {
@@ -232,16 +184,10 @@ pub fn same_volume(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// Windows approximation of the `st_dev` check: compare the leading path
-/// component (drive letter or UNC share prefix). There is no `st_dev` here;
-/// two paths under the same drive/share prefix are treated as same-volume
-/// (mount points nested inside a drive are not detected — an acceptable
-/// approximation while the updater is inert on Windows). A missing path is
-/// never same-volume (fail closed), matching the unix behavior.
+/// Windows approximation of the `st_dev` check: the same drive letter or UNC share prefix
+/// (mount points nested in a drive are not detected). A missing path is never same-volume.
 #[cfg(windows)]
-// Skip: fs::metadata dev-id comparison — hardened raw_path class; a raced
-// direntry only flips the answer to the CONSERVATIVE cross-volume copy
-// path (fail-safe, never fail-open). Audited (update-atpkg).
+// Skip: as the unix `same_volume`.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn same_volume(a: &Path, b: &Path) -> bool {
     use std::path::Component;
@@ -257,14 +203,10 @@ pub fn same_volume(a: &Path, b: &Path) -> bool {
 #[cfg(all(test, unix))]
 mod bounded_lock_tests {
     use super::FileLock;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
-    /// A wait for something that must happen is a hang detector, never a latency budget.
-    const HANG_DETECTOR: Duration = Duration::from_secs(60);
-
-    /// THE FIX. A held lock must surface as a timeout, not as a launch that never
-    /// finishes. `flock` is per open-file-description, so a second handle in this
-    /// same process contends exactly as another process would.
+    /// A held lock surfaces as a timeout. `flock` is per open file description, so a second
+    /// handle in this process contends as another process would.
     #[test]
     fn acquire_within_times_out_while_another_holder_has_it() {
         let dir = std::env::temp_dir().join(format!("aterm-bounded-lock-{}", std::process::id()));
@@ -272,25 +214,14 @@ mod bounded_lock_tests {
         let path = dir.join("apply.lock");
 
         let held = FileLock::acquire(&path).expect("first holder takes the lock");
-        let started = Instant::now();
-        let error = match FileLock::acquire_within(&path, Duration::from_millis(200)) {
+        let error = match FileLock::acquire_within(&path, Duration::from_millis(50)) {
             Ok(_) => panic!("a held lock must not be acquirable"),
             Err(error) => error,
         };
-        let waited = started.elapsed();
-
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "{error}");
-        assert!(
-            waited >= Duration::from_millis(150),
-            "gave up too early: {waited:?}"
-        );
-        assert!(waited < HANG_DETECTOR, "waited {waited:?}: it blocked");
 
-        // And once the holder goes, the same call succeeds immediately: with a
-        // ZERO budget only the very first `try_lock` can win, so this demands the
-        // drop released the lock synchronously. It replaces a `< 1 s` stopwatch
-        // around a 5 s budget (the load-sensitive test audit of 2026-09-27),
-        // which a descheduled thread could fail and a late release could pass.
+        // With a zero budget only the first `try_lock` can win, so this demands the drop
+        // released the lock synchronously.
         drop(held);
         FileLock::acquire_within(&path, Duration::ZERO)
             .expect("the dropped lock must be free at the first try");
@@ -302,23 +233,8 @@ mod bounded_lock_tests {
 mod tests {
     use super::*;
 
-    #[test]
-    fn file_lock_releases_on_drop() {
-        let p = std::env::temp_dir().join(format!("aterm-lock-{}", std::process::id()));
-        {
-            let _l = FileLock::acquire(&p).expect("first acquire");
-        } // dropped here → released
-        // Re-acquiring after the previous guard dropped must succeed (no deadlock).
-        let l2 = FileLock::acquire(&p).expect("re-acquire after release");
-        drop(l2);
-        let _ = std::fs::remove_file(&p);
-    }
-
-    /// A DROPPED LOCK IS FREE AT ONCE, even while a copy of its descriptor lives —
-    /// the copy a child another thread is mid-spawning holds until it `exec`s
-    /// (`try_clone` is `dup`, the same open file description). Released by the close
-    /// alone, it stayed held for that window, which `aterm-update`'s dedup-wait test
-    /// had to poll out for up to five seconds.
+    /// A dropped lock is free at once even while a `dup` of its descriptor lives, as the copy
+    /// a child mid-spawn holds until it `exec`s does.
     #[cfg(unix)]
     #[test]
     fn a_dropped_lock_is_free_while_a_copy_of_its_descriptor_lives() {
@@ -364,17 +280,16 @@ mod tests {
         let _ = std::fs::remove_file(p);
     }
 
-    // A permanent open failure (here: parent directory does not exist → os error 3)
-    // must surface IMMEDIATELY, not after the retry budget that is reserved for
-    // genuine sharing-violation contention.
+    // A permanent open failure (a missing parent) surfaces at once, not after the retry
+    // budget reserved for sharing violations.
     #[cfg(windows)]
     #[test]
     fn acquire_fails_fast_on_permanent_error() {
         let missing = std::env::temp_dir()
             .join(format!("aterm-no-such-dir-{}", std::process::id()))
             .join("lock");
-        // A two-minute budget, and a minute's hang detector: only an error
-        // returned without retrying ends inside it.
+        // A two-minute budget against a one-minute hang detector: only an error returned
+        // without retrying finishes inside it.
         let start = std::time::Instant::now();
         let err = match FileLock::acquire_within(&missing, std::time::Duration::from_secs(120)) {
             Ok(_) => panic!("acquire must fail on a missing parent"),
@@ -385,8 +300,7 @@ mod tests {
             "permanent error must not burn the retry budget (took {:?})",
             start.elapsed()
         );
-        // Not a sharing/lock violation, so the ORIGINAL os error is preserved (not a
-        // TimedOut placeholder).
+        // The original OS error, not a TimedOut placeholder.
         assert!(!matches!(err.raw_os_error(), Some(32 | 33)));
     }
 

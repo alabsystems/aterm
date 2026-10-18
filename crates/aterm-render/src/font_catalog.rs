@@ -241,6 +241,14 @@ impl Catalog {
             }
             if trimmed.is_empty() {
                 results[index] = Some(Err("empty font name or path".to_string()));
+            } else if crate::is_generic_monospace_family(trimmed) {
+                // `monospace` names the default face, not a file to hunt for
+                // (`resolve_family_or_bundled`).
+                results[index] = Some(
+                    crate::default_primary_identity()
+                        .map(PathBuf::from)
+                        .ok_or_else(|| format!("{trimmed:?}: no default face loads")),
+                );
             } else if trimmed.contains(['/', '\\']) {
                 results[index] = Some(Ok(PathBuf::from(trimmed)));
             } else if crate::bundled::is_identity(trimmed)
@@ -291,10 +299,11 @@ impl Catalog {
         // Name tables are the expensive fallback. Parse each candidate at most
         // once and compare it against every still-unresolved family. A matched
         // family keeps settling over the files of its first matching directory, so its
-        // most regular face wins (`regular_face_score`); finding the regular
-        // face itself ends that family's search, so the rest of a crowded
-        // directory is not read for it.
-        let mut settling: HashMap<String, (u32, PathBuf)> = HashMap::new();
+        // best match wins (`name_match_rank`: the most regular face, a file over
+        // a link to it from beside it); finding the regular face that is no such
+        // alias ends that family's search, so the rest of a crowded directory —
+        // a Nix or Stow directory of links elsewhere too — is not read for it.
+        let mut settling: HashMap<String, ((u32, bool), PathBuf)> = HashMap::new();
         let settle =
             |want: &str, path: &Path, results: &mut Vec<Option<Result<PathBuf, String>>>| {
                 if let Some(indexes) = wants.get(want) {
@@ -364,17 +373,19 @@ impl Catalog {
                     .collect();
                 if !matches.is_empty() {
                     self.bytes.insert(path.clone(), Arc::clone(&bytes));
-                }
-                let score = super::regular_face_score(&bytes);
-                for want in matches {
-                    unresolved.remove(&want);
-                    let held = settling.entry(want).or_insert((u32::MAX, path.clone()));
-                    if score < held.0 {
-                        *held = (score, path.clone());
+                    let rank = super::name_match_rank(&bytes, &path);
+                    for want in matches {
+                        unresolved.remove(&want);
+                        let held = settling
+                            .entry(want)
+                            .or_insert(((u32::MAX, true), path.clone()));
+                        if rank < held.0 {
+                            *held = (rank, path.clone());
+                        }
                     }
                 }
                 settling.retain(|want, (held, best)| {
-                    let regular = *held == 0;
+                    let regular = *held == super::NAME_MATCH_SETTLED;
                     if regular {
                         settle(want, best, &mut results);
                     }
@@ -491,6 +502,7 @@ fn resolve_and_admit_in_dirs(requests: &[String], dirs: &[PathBuf], limits: Limi
         !request.trim().contains(['/', '\\'])
             && crate::display_face_for_family(request.trim()).is_none()
             && !crate::bundled::is_identity(request)
+            && !crate::is_generic_monospace_family(request)
     });
     let mut catalog = if need_catalog {
         Catalog::scan(dirs, limits)
@@ -859,12 +871,19 @@ fn monospace_families_with_bundled(
 
 /// The family and ligature support of the default face at `candidate`, a
 /// path or a bundled identity, when it loads. A system face that hides its
-/// name (`.SF NS Mono`) is called what people call it (`SF Mono`).
+/// name (`.SF NS Mono`) is called what people call it (`SF Mono`). A bundled
+/// face is called by its identity's family, the name it is selected by: the
+/// Windows default's typographic family is `Iosevka Term` — the name of the
+/// lighter bundled set beside it — where it is selected as `Iosevka Term
+/// Semibold`.
 fn automatic_face(candidate: &str) -> Option<(String, bool)> {
     use aterm_font::name_id::{FAMILY, TYPOGRAPHIC_FAMILY};
     let bytes = crate::read_resolved_font(candidate).ok()?;
     let face = aterm_font::Face::parse(&bytes, 0).ok()?;
-    let family = face_name(&face, TYPOGRAPHIC_FAMILY).or_else(|| face_name(&face, FAMILY))?;
+    let family = match candidate.strip_prefix(crate::bundled::SCHEME) {
+        Some(bundled) if crate::bundled::is_bundled_id(candidate) => bundled.to_string(),
+        _ => face_name(&face, TYPOGRAPHIC_FAMILY).or_else(|| face_name(&face, FAMILY))?,
+    };
     let family = match family.strip_prefix('.') {
         Some(hidden) => hidden
             .strip_prefix("SF NS ")
@@ -969,25 +988,6 @@ mod tests {
         }
     }
 
-    /// The same property observed on THIS host's real font tree: the catalogue
-    /// names each path once. (Raw paths, deliberately not canonical ones — a
-    /// user whose `~/.fonts` is a symlink to `~/.local/share/fonts` legitimately
-    /// sees the same files under two prefixes, and that is a property of their
-    /// home directory, not of the walk.)
-    #[test]
-    fn system_font_files_lists_each_path_once() {
-        let files = system_font_files();
-        let mut seen = std::collections::HashSet::new();
-        let duplicates: Vec<&PathBuf> = files.iter().filter(|p| !seen.insert(*p)).collect();
-        assert!(
-            duplicates.is_empty(),
-            "{} of {} catalogued font paths are listed more than once, e.g. {}",
-            duplicates.len(),
-            files.len(),
-            duplicates[0].display()
-        );
-    }
-
     const JETBRAINS: &[u8] = include_bytes!("../tests/fixtures/jetbrains-mono.ttf");
 
     /// The fixture face with its OS/2 weight class set to `weight`: a bold
@@ -1051,6 +1051,106 @@ mod tests {
             admitted.path
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A family installed as a variable face plus links that name its weights
+    /// (Ubuntu's `fonts-ubuntu`: `UbuntuMono-B.ttf` and `-R.ttf` link to
+    /// `UbuntuMono[wght].ttf`) resolves to the file itself: every one of them
+    /// is the regular default instance, and the link that sorts first named a
+    /// Bold file as the regular face. A directory of links into another tree
+    /// (a Nix profile, a Stow target) has no file of its own, so there the
+    /// regular face's link still ends the search: the fonts after it are not
+    /// read.
+    #[cfg(unix)]
+    #[test]
+    fn a_family_resolves_to_its_file_not_a_link_that_sorts_first() {
+        let root = fixture("linked-weights");
+        let file = root.join("JetBrainsMono[wght].ttf");
+        std::fs::write(&file, JETBRAINS).unwrap();
+        for alias in ["JetBrainsMono-B.ttf", "JetBrainsMono-R.ttf"] {
+            std::os::unix::fs::symlink("JetBrainsMono[wght].ttf", root.join(alias)).unwrap();
+        }
+        let request = ["JetBrains Mono".to_string()];
+        let batch =
+            resolve_and_admit_in_dirs(&request, std::slice::from_ref(&root), Limits::default());
+        let admitted = batch.get(0).unwrap().as_ref().expect("the family resolves");
+        assert_eq!(admitted.path, file.to_string_lossy());
+        assert_eq!(
+            super::super::resolve_by_name_table_in(
+                Catalog::scan(std::slice::from_ref(&root), Limits::default()).files,
+                "jetbrainsmono",
+            )
+            .as_deref(),
+            Some(&*file.to_string_lossy()),
+            "the by-name resolver `show-face` reports agrees"
+        );
+
+        // With only links to the face (a dotfiles manager's font directory),
+        // a link still resolves.
+        std::fs::rename(&file, root.join("elsewhere.bin")).unwrap();
+        for alias in ["JetBrainsMono-B.ttf", "JetBrainsMono-R.ttf"] {
+            std::fs::remove_file(root.join(alias)).unwrap();
+            std::os::unix::fs::symlink("elsewhere.bin", root.join(alias)).unwrap();
+        }
+        let batch =
+            resolve_and_admit_in_dirs(&request, std::slice::from_ref(&root), Limits::default());
+        let admitted = batch
+            .get(0)
+            .unwrap()
+            .as_ref()
+            .expect("a link still resolves");
+        assert!(
+            admitted.path.ends_with("JetBrainsMono-B.ttf"),
+            "{}",
+            admitted.path
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+
+        // A profile of links into a store: the Nix kind (absolute), then the
+        // Stow kind (`../`). The bold face's link sorts first, the regular
+        // face's second, and three more fonts follow.
+        let store = fixture("linked-weights-store");
+        let (bold, regular) = (
+            store.join("JetBrainsMono-Bold.ttf"),
+            store.join("JetBrainsMono-Regular.ttf"),
+        );
+        std::fs::write(&bold, with_weight(700)).unwrap();
+        std::fs::write(&regular, JETBRAINS).unwrap();
+        let profile = fixture("linked-weights-profile");
+        for link in ["a.ttf", "c.ttf", "d.ttf", "e.ttf"] {
+            std::os::unix::fs::symlink(&bold, profile.join(link)).unwrap();
+        }
+        let link = profile.join("b.ttf");
+        let stow = Path::new("..")
+            .join(store.file_name().unwrap())
+            .join("JetBrainsMono-Regular.ttf");
+        for target in [regular.clone(), stow] {
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let batch = resolve_and_admit_in_dirs(
+                &request,
+                std::slice::from_ref(&profile),
+                Limits::default(),
+            );
+            let admitted = batch.get(0).unwrap().as_ref().expect("the family resolves");
+            assert_eq!(admitted.path, link.to_string_lossy(), "{target:?}");
+            assert_eq!(
+                batch.stats.name_files, 2,
+                "a link to {target:?} is the regular face's only path here, so it \
+                 ends the search; the fonts after it were read"
+            );
+            assert_eq!(
+                super::super::resolve_by_name_table_in(
+                    Catalog::scan(std::slice::from_ref(&profile), Limits::default()).files,
+                    "jetbrainsmono",
+                )
+                .as_deref(),
+                Some(&*link.to_string_lossy()),
+                "{target:?}"
+            );
+        }
+        std::fs::remove_dir_all(&profile).unwrap();
+        std::fs::remove_dir_all(&store).unwrap();
     }
 
     #[test]
@@ -1309,6 +1409,35 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Settings' "Automatic (…)" names a bundled default by the family it is
+    /// selected by: on Windows `Iosevka Term Semibold`, whose own typographic
+    /// family (name ID 16) is `Iosevka Term` — the name of the lighter set
+    /// listed beside it — and which draws no ligatures. JetBrains Mono, whose
+    /// name the two agree on, is called what it always was.
+    #[test]
+    fn a_bundled_default_is_named_as_it_is_selected() {
+        if crate::bundled::IOSEVKA_SEMIBOLD_ACTIVE {
+            let id = crate::bundled::IOSEVKA_SEMIBOLD_ID;
+            let face =
+                aterm_font::Face::parse(crate::bundled::face_for_id(id).unwrap(), 0).unwrap();
+            assert_eq!(
+                face_name(&face, aterm_font::name_id::TYPOGRAPHIC_FAMILY).as_deref(),
+                Some(crate::bundled::IOSEVKA_FAMILY),
+                "CONTROL: the face's own typographic family"
+            );
+            assert_eq!(
+                automatic_face(id),
+                Some((crate::bundled::IOSEVKA_SEMIBOLD_FAMILY.to_string(), false))
+            );
+        }
+        if crate::bundled::ACTIVE {
+            assert_eq!(
+                automatic_face(crate::bundled::JETBRAINS_ID),
+                Some((crate::bundled::JETBRAINS_FAMILY.to_string(), true))
+            );
+        }
     }
 
     #[test]

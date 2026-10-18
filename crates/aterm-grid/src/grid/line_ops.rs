@@ -49,13 +49,13 @@ impl Grid {
         let bounded = self.shift_is_bounded(right_bound, !margins.is_full(self.storage.cols));
         if cursor_col < right_bound {
             let count = count.min(right_bound - cursor_col);
-            if bounded {
-                if let Some(row) = self.row_mut(cursor_row) {
-                    row.insert_chars_bounded_fill(cursor_col, count, right_bound, fill);
+            let blanked = self.row_mut(cursor_row).map(|row| {
+                if bounded {
+                    row.insert_chars_bounded_fill(cursor_col, count, right_bound, fill)
+                } else {
+                    row.insert_chars_fill(cursor_col, count, fill)
                 }
-            } else if let Some(row) = self.row_mut(cursor_row) {
-                row.insert_chars_fill(cursor_col, count, fill);
-            }
+            });
             self.storage
                 .extras
                 .shift_cols_right(cursor_row, cursor_col, count, right_bound);
@@ -67,8 +67,10 @@ impl Grid {
                 cursor_row,
                 cursor_col.saturating_sub(1)..right_bound.saturating_add(1),
             );
-            // Fill BCE RGB in vacated cells at cursor position after shift.
+            // Fill BCE RGB in vacated cells at cursor position after shift, and
+            // in the wide halves the insert blanked.
             self.fill_bce_rgb_range(cursor_row, cursor_col, cursor_col + count);
+            self.fill_bce_rgb_cols(cursor_row, blanked.unwrap_or_default());
             // ICH shifts the row's tail right under any highlight, replacing
             // content like EL, so record one row of selection damage (the
             // cursor's). Not `damage_selection_scroll_region`: that also
@@ -93,13 +95,13 @@ impl Grid {
         let bounded = self.shift_is_bounded(right_bound, !margins.is_full(self.storage.cols));
         if cursor_col < right_bound {
             let count = count.min(right_bound - cursor_col);
-            if bounded {
-                if let Some(row) = self.row_mut(cursor_row) {
-                    row.delete_chars_bounded_fill(cursor_col, count, right_bound, fill);
+            let blanked = self.row_mut(cursor_row).map(|row| {
+                if bounded {
+                    row.delete_chars_bounded_fill(cursor_col, count, right_bound, fill)
+                } else {
+                    row.delete_chars_fill(cursor_col, count, fill)
                 }
-            } else if let Some(row) = self.row_mut(cursor_row) {
-                row.delete_chars_fill(cursor_col, count, fill);
-            }
+            });
             self.storage
                 .extras
                 .shift_cols_left(cursor_row, cursor_col, count, right_bound);
@@ -110,8 +112,10 @@ impl Grid {
                 cursor_row,
                 cursor_col.saturating_sub(1)..right_bound.saturating_add(1),
             );
-            // Fill BCE RGB in vacated cells at end of line after shift.
+            // Fill BCE RGB in vacated cells at end of line after shift, and in the
+            // wide halves the delete blanked.
             self.fill_bce_rgb_range(cursor_row, right_bound - count, right_bound);
+            self.fill_bce_rgb_cols(cursor_row, blanked.unwrap_or_default());
             // DCH shifts the row's tail left under a live highlight; see
             // `insert_chars` for the one-row damage.
             self.damage_selection_visible_rows(cursor_row, cursor_row);
@@ -147,13 +151,13 @@ impl Grid {
         let bounded = self.shift_is_bounded(right_bound, in_margins);
         if cursor_col < right_bound {
             let count = count.min(right_bound - cursor_col);
-            if let Some(row) = self.row_mut(cursor_row) {
+            let blanked = self.row_mut(cursor_row).map(|row| {
                 if bounded {
-                    row.insert_chars_bounded_fill(cursor_col, count, right_bound, fill);
+                    row.insert_chars_bounded_fill(cursor_col, count, right_bound, fill)
                 } else {
-                    row.insert_chars_fill(cursor_col, count, fill);
+                    row.insert_chars_fill(cursor_col, count, fill)
                 }
-            }
+            });
             self.storage
                 .extras
                 .shift_cols_right(cursor_row, cursor_col, count, right_bound);
@@ -163,6 +167,7 @@ impl Grid {
                 cursor_col.saturating_sub(1)..right_bound.saturating_add(1),
             );
             self.fill_bce_rgb_range(cursor_row, cursor_col, cursor_col + count);
+            self.fill_bce_rgb_cols(cursor_row, blanked.unwrap_or_default());
             // The margined ICH replaces content like the unmargined one; see
             // `insert_chars`.
             self.damage_selection_visible_rows(cursor_row, cursor_row);
@@ -197,13 +202,13 @@ impl Grid {
         let bounded = self.shift_is_bounded(right_bound, in_margins);
         if cursor_col < right_bound {
             let count = count.min(right_bound - cursor_col);
-            if let Some(row) = self.row_mut(cursor_row) {
+            let blanked = self.row_mut(cursor_row).map(|row| {
                 if bounded {
-                    row.delete_chars_bounded_fill(cursor_col, count, right_bound, fill);
+                    row.delete_chars_bounded_fill(cursor_col, count, right_bound, fill)
                 } else {
-                    row.delete_chars_fill(cursor_col, count, fill);
+                    row.delete_chars_fill(cursor_col, count, fill)
                 }
-            }
+            });
             self.storage
                 .extras
                 .shift_cols_left(cursor_row, cursor_col, count, right_bound);
@@ -213,6 +218,7 @@ impl Grid {
                 cursor_col.saturating_sub(1)..right_bound.saturating_add(1),
             );
             self.fill_bce_rgb_range(cursor_row, right_bound - count, right_bound);
+            self.fill_bce_rgb_cols(cursor_row, blanked.unwrap_or_default());
             // The margined DCH replaces content like the unmargined one; see
             // `insert_chars`.
             self.damage_selection_visible_rows(cursor_row, cursor_row);
@@ -236,9 +242,9 @@ impl Grid {
         if cursor_col < right_bound {
             let count = count.min(right_bound - cursor_col);
             let fill = self.storage.cursor_template;
-            if let Some(row) = self.row_mut(cursor_row) {
-                row.erase_chars_with(cursor_col, count, fill);
-            }
+            let blanked = self
+                .row_mut(cursor_row)
+                .map(|row| row.erase_chars_with(cursor_col, count, fill));
             self.storage
                 .extras
                 .clear_range(cursor_row, cursor_col, cursor_col + count);
@@ -248,6 +254,7 @@ impl Grid {
                 cursor_col.saturating_sub(1)..(cursor_col + count).saturating_add(1),
             );
             self.fill_bce_rgb_range(cursor_row, cursor_col, cursor_col + count);
+            self.fill_bce_rgb_cols(cursor_row, blanked.unwrap_or_default());
             // ECH blanks cells in place like EL, so it gets the same one-row
             // selection damage; see `insert_chars`.
             self.damage_selection_visible_rows(cursor_row, cursor_row);
@@ -741,8 +748,9 @@ impl Grid {
         let fill = self.storage.cursor_template;
 
         for row_idx in region.top..=region.bottom {
+            let mut blanked = crate::row::BlankedHalves::default();
             if let Some(row) = self.row_mut(row_idx) {
-                row.insert_chars_bounded_fill(cursor_col, count, right_bound, fill);
+                blanked = row.insert_chars_bounded_fill(cursor_col, count, right_bound, fill);
                 // `insert_chars_bounded_fill` already fixed genuine boundary
                 // orphans, so skip the ambiguous spacer-clear (it could blank a
                 // protected space outside the region).
@@ -757,6 +765,7 @@ impl Grid {
                 .extras
                 .shift_cols_right(row_idx, cursor_col, count, right_bound);
             self.fill_bce_rgb_range(row_idx, cursor_col, cursor_col + count);
+            self.fill_bce_rgb_cols(row_idx, blanked);
             // The halves of pairs the shift or the edge fixup blanked.
             self.drop_unclaimed_extras(
                 row_idx,
@@ -801,8 +810,9 @@ impl Grid {
         let fill = self.storage.cursor_template;
 
         for row_idx in region.top..=region.bottom {
+            let mut blanked = crate::row::BlankedHalves::default();
             if let Some(row) = self.row_mut(row_idx) {
-                row.delete_chars_bounded_fill(cursor_col, count, right_bound, fill);
+                blanked = row.delete_chars_bounded_fill(cursor_col, count, right_bound, fill);
                 // As in `insert_columns`.
                 row.fixup_wide_boundary(
                     usize::from(margins.left),
@@ -815,6 +825,7 @@ impl Grid {
                 .extras
                 .shift_cols_left(row_idx, cursor_col, count, right_bound);
             self.fill_bce_rgb_range(row_idx, right_bound - count, right_bound);
+            self.fill_bce_rgb_cols(row_idx, blanked);
             // The halves of pairs the shift or the edge fixup blanked.
             self.drop_unclaimed_extras(
                 row_idx,
@@ -849,8 +860,9 @@ impl Grid {
         }
         let fill = self.storage.cursor_template;
         for row_idx in region.top..=region.bottom {
+            let mut blanked = crate::row::BlankedHalves::default();
             if let Some(row) = self.row_mut(row_idx) {
-                row.delete_chars_bounded_fill(left, count, right_bound, fill);
+                blanked = row.delete_chars_bounded_fill(left, count, right_bound, fill);
                 // Genuine orphans were already fixed by the bounded shift, so skip
                 // the ambiguous spacer-clear (it could blank a protected space).
                 row.fixup_wide_boundary(
@@ -864,6 +876,7 @@ impl Grid {
                 .extras
                 .shift_cols_left(row_idx, left, count, right_bound);
             self.fill_bce_rgb_range(row_idx, right_bound - count, right_bound);
+            self.fill_bce_rgb_cols(row_idx, blanked);
             // The halves of pairs the shift or the edge fixup blanked.
             self.drop_unclaimed_extras(
                 row_idx,
@@ -896,8 +909,9 @@ impl Grid {
         }
         let fill = self.storage.cursor_template;
         for row_idx in region.top..=region.bottom {
+            let mut blanked = crate::row::BlankedHalves::default();
             if let Some(row) = self.row_mut(row_idx) {
-                row.insert_chars_bounded_fill(left, count, right_bound, fill);
+                blanked = row.insert_chars_bounded_fill(left, count, right_bound, fill);
                 // Genuine orphans were already fixed by the bounded shift, so skip
                 // the ambiguous spacer-clear (it could blank a protected space).
                 row.fixup_wide_boundary(
@@ -911,6 +925,7 @@ impl Grid {
                 .extras
                 .shift_cols_right(row_idx, left, count, right_bound);
             self.fill_bce_rgb_range(row_idx, left, left + count);
+            self.fill_bce_rgb_cols(row_idx, blanked);
             // The halves of pairs the shift or the edge fixup blanked.
             self.drop_unclaimed_extras(
                 row_idx,
@@ -946,8 +961,9 @@ impl Grid {
         let fill = self.storage.cursor_template;
 
         for row_idx in region.top..=region.bottom {
+            let mut blanked = crate::row::BlankedHalves::default();
             if let Some(row) = self.row_mut(row_idx) {
-                row.insert_chars_bounded_fill(left, 1, right_bound, fill);
+                blanked = row.insert_chars_bounded_fill(left, 1, right_bound, fill);
                 // Genuine orphans were already fixed by the bounded shift, so skip
                 // the ambiguous spacer-clear (it could blank a protected space).
                 row.fixup_wide_boundary(
@@ -961,6 +977,7 @@ impl Grid {
                 .extras
                 .shift_cols_right(row_idx, left, 1, right_bound);
             self.fill_bce_rgb_range(row_idx, left, left + 1);
+            self.fill_bce_rgb_cols(row_idx, blanked);
             // The halves of pairs the shift or the edge fixup blanked.
             self.drop_unclaimed_extras(
                 row_idx,
@@ -995,8 +1012,9 @@ impl Grid {
         let fill = self.storage.cursor_template;
 
         for row_idx in region.top..=region.bottom {
+            let mut blanked = crate::row::BlankedHalves::default();
             if let Some(row) = self.row_mut(row_idx) {
-                row.delete_chars_bounded_fill(left, 1, right_bound, fill);
+                blanked = row.delete_chars_bounded_fill(left, 1, right_bound, fill);
                 // Genuine orphans were already fixed by the bounded shift, so skip
                 // the ambiguous spacer-clear (it could blank a protected space).
                 row.fixup_wide_boundary(
@@ -1010,6 +1028,7 @@ impl Grid {
                 .extras
                 .shift_cols_left(row_idx, left, 1, right_bound);
             self.fill_bce_rgb_range(row_idx, right_bound - 1, right_bound);
+            self.fill_bce_rgb_cols(row_idx, blanked);
             // The halves of pairs the shift or the edge fixup blanked.
             self.drop_unclaimed_extras(
                 row_idx,
@@ -1027,8 +1046,6 @@ impl Grid {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cell::CellFlags;
-    use crate::cell_colors::PackedColor;
     use crate::grid::test_support::wrapped_pair;
 
     /// Helper: read the character at (row, col), returning space for empty cells.
@@ -1051,263 +1068,163 @@ mod tests {
             .to_string()
     }
 
-    // ICH — insert_chars: insert N blank chars at cursor, shifting right
-
-    #[test]
-    fn test_ich_basic_insert_one() {
-        let mut grid = Grid::new(4, 10);
-        write_text(&mut grid, "ABCDE");
-        grid.move_cursor_to(0, 2); // cursor at 'C'
-        grid.insert_chars(1);
-        // Expected: "AB CDE".
-        assert_eq!(char_at(&grid, 0, 0), 'A');
-        assert_eq!(char_at(&grid, 0, 1), 'B');
-        assert_eq!(char_at(&grid, 0, 2), ' '); // inserted blank
-        assert_eq!(char_at(&grid, 0, 3), 'C');
-        assert_eq!(char_at(&grid, 0, 4), 'D');
-        assert_eq!(char_at(&grid, 0, 5), 'E');
+    #[derive(Clone, Copy, Debug)]
+    enum CharOp {
+        Ich,
+        Dch,
+        Ech,
     }
 
+    /// ICH shifts the rest of the cursor row right (dropping what passes the
+    /// edge), DCH shifts it left (blank-filling the end), ECH blanks in place;
+    /// each clamps its count to the row, leaves the other rows alone and
+    /// consumes the pending wrap.
     #[test]
-    fn test_ich_insert_multiple() {
-        let mut grid = Grid::new(4, 10);
-        write_text(&mut grid, "ABCDE");
-        grid.move_cursor_to(0, 1); // cursor at 'B'
-        grid.insert_chars(3);
-        // Expected: "A   BCDE".
-        assert_eq!(char_at(&grid, 0, 0), 'A');
-        assert_eq!(char_at(&grid, 0, 1), ' ');
-        assert_eq!(char_at(&grid, 0, 2), ' ');
-        assert_eq!(char_at(&grid, 0, 3), ' ');
-        assert_eq!(char_at(&grid, 0, 4), 'B');
-        assert_eq!(char_at(&grid, 0, 5), 'C');
-        assert_eq!(char_at(&grid, 0, 6), 'D');
+    fn char_ops_edit_only_the_cursor_row() {
+        use CharOp::*;
+        let cases: &[(CharOp, u16, &str, u16, u16, &str)] = &[
+            (Ich, 10, "ABCDE", 2, 1, "AB CDE    "),
+            (Ich, 10, "ABCDE", 1, 3, "A   BCDE  "),
+            (Ich, 8, "HELLO", 0, 2, "  HELLO "),
+            (Ich, 6, "ABCDEF", 4, 100, "ABCD  "),
+            (Ich, 5, "ABCDE", 4, 1, "ABCD "),
+            (Ich, 10, "", 0, 3, "          "),
+            (Dch, 10, "ABCDE", 2, 1, "ABDE      "),
+            (Dch, 10, "ABCDEFGH", 1, 3, "AEFGH     "),
+            (Dch, 8, "ABCDEFGH", 0, 3, "DEFGH   "),
+            (Dch, 6, "ABCDEF", 4, 100, "ABCD  "),
+            (Dch, 5, "ABCDE", 4, 1, "ABCD "),
+            (Dch, 10, "", 0, 3, "          "),
+            (Ech, 10, "ABCDEFGH", 2, 3, "AB   FGH  "),
+            (Ech, 10, "ABCDE", 2, 1, "AB DE     "),
+            (Ech, 6, "ABCDEF", 3, 100, "ABC   "),
+            (Ech, 8, "ABCDEFGH", 0, 4, "    EFGH"),
+            (Ech, 10, "", 0, 5, "          "),
+        ];
+        for &(op, cols, text, col, count, want) in cases {
+            let mut grid = Grid::new(3, cols);
+            write_text(&mut grid, text);
+            grid.move_cursor_to(1, 0);
+            write_text(&mut grid, "ROW1");
+            grid.move_cursor_to(0, col);
+            grid.storage.mark_pending_wrap();
+            match op {
+                Ich => grid.insert_chars(count),
+                Dch => grid.delete_chars(count),
+                Ech => grid.erase_chars(count),
+            }
+            let got: String = (0..cols).map(|c| char_at(&grid, 0, c)).collect();
+            let at = format!("{op:?} {count} at col {col} of {text:?}");
+            assert_eq!(got, want, "{at}");
+            assert_eq!(row_trimmed(&grid, 1), "ROW1", "{at}: another row changed");
+            assert!(!grid.storage.pending_wrap, "{at}: the wrap survived");
+        }
     }
 
+    /// IL inserts blank rows at the cursor row and DL deletes rows there,
+    /// shifting only the rest of the scroll region (rows past it are pushed
+    /// out or blank-filled), clamping the count to the region, and homing the
+    /// cursor column; a zero count or a cursor outside the region is a no-op.
     #[test]
-    fn test_ich_at_beginning_of_line() {
-        let mut grid = Grid::new(4, 8);
-        write_text(&mut grid, "HELLO");
-        grid.move_cursor_to(0, 0);
-        grid.insert_chars(2);
-        assert_eq!(char_at(&grid, 0, 0), ' ');
-        assert_eq!(char_at(&grid, 0, 1), ' ');
-        assert_eq!(char_at(&grid, 0, 2), 'H');
-        assert_eq!(char_at(&grid, 0, 3), 'E');
-        assert_eq!(char_at(&grid, 0, 4), 'L');
-        assert_eq!(char_at(&grid, 0, 5), 'L');
-        assert_eq!(char_at(&grid, 0, 6), 'O');
-    }
-
-    #[test]
-    fn test_ich_count_exceeds_remaining() {
-        // When count exceeds remaining space, it's clamped.
-        let mut grid = Grid::new(4, 6);
-        write_text(&mut grid, "ABCDEF");
-        grid.move_cursor_to(0, 4); // cursor at 'E'
-        grid.insert_chars(100); // way more than remaining 2 cols
-        assert_eq!(char_at(&grid, 0, 0), 'A');
-        assert_eq!(char_at(&grid, 0, 1), 'B');
-        assert_eq!(char_at(&grid, 0, 2), 'C');
-        assert_eq!(char_at(&grid, 0, 3), 'D');
-        assert_eq!(char_at(&grid, 0, 4), ' '); // blanked
-        assert_eq!(char_at(&grid, 0, 5), ' '); // blanked
-    }
-
-    #[test]
-    fn test_ich_at_last_column() {
-        let mut grid = Grid::new(4, 5);
-        write_text(&mut grid, "ABCDE");
-        grid.move_cursor_to(0, 4); // last column
-        grid.insert_chars(1);
-        assert_eq!(char_at(&grid, 0, 0), 'A');
-        assert_eq!(char_at(&grid, 0, 1), 'B');
-        assert_eq!(char_at(&grid, 0, 2), 'C');
-        assert_eq!(char_at(&grid, 0, 3), 'D');
-        assert_eq!(char_at(&grid, 0, 4), ' '); // 'E' pushed off, blank inserted
-    }
-
-    #[test]
-    fn test_ich_does_not_affect_other_rows() {
-        let mut grid = Grid::new(4, 10);
-        write_text(&mut grid, "ROW0ROW0");
-        grid.move_cursor_to(1, 0);
-        write_text(&mut grid, "ROW1ROW1");
-        grid.move_cursor_to(0, 2);
-        grid.insert_chars(2);
-        // Row 1 should be unchanged
-        assert!(row_trimmed(&grid, 1).starts_with("ROW1ROW1"));
-    }
-
-    // DCH — delete_chars: delete N chars at cursor, shifting left
-
-    #[test]
-    fn test_dch_basic_delete_one() {
-        let mut grid = Grid::new(4, 10);
-        write_text(&mut grid, "ABCDE");
-        grid.move_cursor_to(0, 2); // cursor at 'C'
-        grid.delete_chars(1);
-        // Expected: "ABDE " (C removed, D and E shift left)
-        assert_eq!(char_at(&grid, 0, 0), 'A');
-        assert_eq!(char_at(&grid, 0, 1), 'B');
-        assert_eq!(char_at(&grid, 0, 2), 'D');
-        assert_eq!(char_at(&grid, 0, 3), 'E');
-        assert_eq!(char_at(&grid, 0, 4), ' '); // blank fill at end
-    }
-
-    #[test]
-    fn test_dch_delete_multiple() {
-        let mut grid = Grid::new(4, 10);
-        write_text(&mut grid, "ABCDEFGH");
-        grid.move_cursor_to(0, 1); // cursor at 'B'
-        grid.delete_chars(3);
-        // Expected: "AEFGH   " (B, C, D removed)
-        assert_eq!(char_at(&grid, 0, 0), 'A');
-        assert_eq!(char_at(&grid, 0, 1), 'E');
-        assert_eq!(char_at(&grid, 0, 2), 'F');
-        assert_eq!(char_at(&grid, 0, 3), 'G');
-        assert_eq!(char_at(&grid, 0, 4), 'H');
-    }
-
-    #[test]
-    fn test_dch_at_beginning_of_line() {
-        let mut grid = Grid::new(4, 8);
-        write_text(&mut grid, "ABCDEFGH");
-        grid.move_cursor_to(0, 0);
-        grid.delete_chars(3);
-        // Expected: "DEFGH   "
-        assert_eq!(char_at(&grid, 0, 0), 'D');
-        assert_eq!(char_at(&grid, 0, 1), 'E');
-        assert_eq!(char_at(&grid, 0, 2), 'F');
-        assert_eq!(char_at(&grid, 0, 3), 'G');
-        assert_eq!(char_at(&grid, 0, 4), 'H');
-        assert_eq!(char_at(&grid, 0, 5), ' ');
-    }
-
-    #[test]
-    fn test_dch_count_exceeds_remaining() {
-        let mut grid = Grid::new(4, 6);
-        write_text(&mut grid, "ABCDEF");
-        grid.move_cursor_to(0, 4); // cursor at 'E'
-        grid.delete_chars(100);
-        // Clamped: delete 2 chars from col 4 to end
-        assert_eq!(char_at(&grid, 0, 0), 'A');
-        assert_eq!(char_at(&grid, 0, 1), 'B');
-        assert_eq!(char_at(&grid, 0, 2), 'C');
-        assert_eq!(char_at(&grid, 0, 3), 'D');
-        assert_eq!(char_at(&grid, 0, 4), ' ');
-        assert_eq!(char_at(&grid, 0, 5), ' ');
-    }
-
-    #[test]
-    fn test_dch_at_last_column() {
-        let mut grid = Grid::new(4, 5);
-        write_text(&mut grid, "ABCDE");
-        grid.move_cursor_to(0, 4); // last column
-        grid.delete_chars(1);
-        assert_eq!(char_at(&grid, 0, 0), 'A');
-        assert_eq!(char_at(&grid, 0, 1), 'B');
-        assert_eq!(char_at(&grid, 0, 2), 'C');
-        assert_eq!(char_at(&grid, 0, 3), 'D');
-        assert_eq!(char_at(&grid, 0, 4), ' '); // 'E' deleted, replaced with blank
-    }
-
-    #[test]
-    fn test_dch_does_not_affect_other_rows() {
-        let mut grid = Grid::new(4, 10);
-        write_text(&mut grid, "ROW0DATA");
-        grid.move_cursor_to(1, 0);
-        write_text(&mut grid, "ROW1DATA");
-        grid.move_cursor_to(0, 2);
-        grid.delete_chars(2);
-        // Row 1 unchanged
-        assert!(row_trimmed(&grid, 1).starts_with("ROW1DATA"));
-    }
-
-    // ECH — erase_chars: blank N chars at cursor without shifting
-
-    #[test]
-    fn test_ech_basic_erase() {
-        let mut grid = Grid::new(4, 10);
-        write_text(&mut grid, "ABCDEFGH");
-        grid.move_cursor_to(0, 2);
-        grid.erase_chars(3);
-        // Expected: "AB   FGH" (C, D, E erased in place)
-        assert_eq!(char_at(&grid, 0, 0), 'A');
-        assert_eq!(char_at(&grid, 0, 1), 'B');
-        assert_eq!(char_at(&grid, 0, 2), ' ');
-        assert_eq!(char_at(&grid, 0, 3), ' ');
-        assert_eq!(char_at(&grid, 0, 4), ' ');
-        assert_eq!(char_at(&grid, 0, 5), 'F');
-        assert_eq!(char_at(&grid, 0, 6), 'G');
-        assert_eq!(char_at(&grid, 0, 7), 'H');
-    }
-
-    #[test]
-    fn test_ech_erase_one() {
-        let mut grid = Grid::new(4, 10);
-        write_text(&mut grid, "ABCDE");
-        grid.move_cursor_to(0, 2);
-        grid.erase_chars(1);
-        assert_eq!(char_at(&grid, 0, 0), 'A');
-        assert_eq!(char_at(&grid, 0, 1), 'B');
-        assert_eq!(char_at(&grid, 0, 2), ' ');
-        assert_eq!(char_at(&grid, 0, 3), 'D');
-        assert_eq!(char_at(&grid, 0, 4), 'E');
-    }
-
-    #[test]
-    fn test_ech_count_exceeds_remaining() {
-        let mut grid = Grid::new(4, 6);
-        write_text(&mut grid, "ABCDEF");
-        grid.move_cursor_to(0, 3);
-        grid.erase_chars(100); // clamped to 3
-        assert_eq!(char_at(&grid, 0, 0), 'A');
-        assert_eq!(char_at(&grid, 0, 1), 'B');
-        assert_eq!(char_at(&grid, 0, 2), 'C');
-        assert_eq!(char_at(&grid, 0, 3), ' ');
-        assert_eq!(char_at(&grid, 0, 4), ' ');
-        assert_eq!(char_at(&grid, 0, 5), ' ');
-    }
-
-    #[test]
-    fn test_ech_at_beginning() {
-        let mut grid = Grid::new(4, 8);
-        write_text(&mut grid, "ABCDEFGH");
-        grid.move_cursor_to(0, 0);
-        grid.erase_chars(4);
-        assert_eq!(char_at(&grid, 0, 0), ' ');
-        assert_eq!(char_at(&grid, 0, 1), ' ');
-        assert_eq!(char_at(&grid, 0, 2), ' ');
-        assert_eq!(char_at(&grid, 0, 3), ' ');
-        assert_eq!(char_at(&grid, 0, 4), 'E');
-        assert_eq!(char_at(&grid, 0, 5), 'F');
-    }
-
-    #[test]
-    fn test_ech_does_not_shift_content() {
-        // Key difference from DCH: content after erased region stays in place
-        let mut grid = Grid::new(4, 10);
-        write_text(&mut grid, "ABCDE");
-        grid.move_cursor_to(0, 1);
-        grid.erase_chars(2);
-        // "A  DE" — B and C erased, D and E stay at their columns
-        assert_eq!(char_at(&grid, 0, 0), 'A');
-        assert_eq!(char_at(&grid, 0, 1), ' ');
-        assert_eq!(char_at(&grid, 0, 2), ' ');
-        assert_eq!(char_at(&grid, 0, 3), 'D');
-        assert_eq!(char_at(&grid, 0, 4), 'E');
-    }
-
-    #[test]
-    fn test_ech_does_not_affect_other_rows() {
-        let mut grid = Grid::new(4, 10);
-        write_text(&mut grid, "ROW0DATA");
-        grid.move_cursor_to(1, 0);
-        write_text(&mut grid, "ROW1DATA");
-        grid.move_cursor_to(0, 0);
-        grid.erase_chars(4);
-        assert!(row_trimmed(&grid, 1).starts_with("ROW1DATA"));
+    fn line_ops_shift_rows_within_the_region() {
+        type Case<'a> = (
+            bool,
+            u16,
+            Option<(u16, u16)>,
+            (u16, u16),
+            u16,
+            &'a [&'a str],
+        );
+        let cases: &[Case] = &[
+            (true, 5, None, (2, 0), 1, &["L0", "L1", "", "L2", "L3"]),
+            (true, 6, None, (1, 0), 2, &["L0", "", "", "L1", "L2", "L3"]),
+            (true, 4, None, (0, 0), 1, &["", "L0", "L1", "L2"]),
+            (true, 4, None, (1, 5), 100, &["L0", "", "", ""]),
+            (true, 5, None, (3, 0), 2, &["L0", "L1", "L2", "", ""]),
+            (true, 1, None, (0, 0), 1, &[""]),
+            (true, 4, None, (0, 3), 0, &["L0", "L1", "L2", "L3"]),
+            (
+                true,
+                6,
+                Some((1, 4)),
+                (2, 0),
+                1,
+                &["L0", "L1", "", "L2", "L3", "L5"],
+            ),
+            (
+                true,
+                6,
+                Some((1, 3)),
+                (1, 0),
+                1,
+                &["L0", "", "L1", "L2", "L4", "L5"],
+            ),
+            (
+                true,
+                6,
+                Some((2, 4)),
+                (0, 3),
+                1,
+                &["L0", "L1", "L2", "L3", "L4", "L5"],
+            ),
+            (false, 5, None, (2, 0), 1, &["L0", "L1", "L3", "L4", ""]),
+            (false, 6, None, (1, 0), 3, &["L0", "L4", "L5", "", "", ""]),
+            (false, 4, None, (0, 0), 1, &["L1", "L2", "L3", ""]),
+            (false, 4, None, (1, 5), 100, &["L0", "", "", ""]),
+            (false, 5, None, (3, 0), 1, &["L0", "L1", "L2", "L4", ""]),
+            (false, 1, None, (0, 0), 1, &[""]),
+            (false, 4, None, (0, 3), 0, &["L0", "L1", "L2", "L3"]),
+            (
+                false,
+                6,
+                Some((1, 4)),
+                (2, 0),
+                1,
+                &["L0", "L1", "L3", "L4", "", "L5"],
+            ),
+            (
+                false,
+                6,
+                Some((1, 3)),
+                (3, 0),
+                1,
+                &["L0", "L1", "L2", "", "L4", "L5"],
+            ),
+            (
+                false,
+                6,
+                Some((2, 4)),
+                (5, 3),
+                1,
+                &["L0", "L1", "L2", "L3", "L4", "L5"],
+            ),
+        ];
+        for &(insert, rows, region, (row, col), count, want) in cases {
+            let mut grid = Grid::new(rows, 10);
+            for r in 0..rows {
+                grid.move_cursor_to(r, 0);
+                write_text(&mut grid, &format!("L{r}"));
+            }
+            if let Some((top, bottom)) = region {
+                grid.set_scroll_region(top, bottom);
+            }
+            grid.move_cursor_to(row, col);
+            if insert {
+                grid.insert_lines(usize::from(count));
+            } else {
+                grid.delete_lines(usize::from(count));
+            }
+            let at = format!(
+                "{} {count} at {:?} in {rows} rows, region {region:?}",
+                if insert { "IL" } else { "DL" },
+                (row, col)
+            );
+            let got: Vec<String> = (0..rows).map(|r| row_trimmed(&grid, r)).collect();
+            assert_eq!(got, want, "{at}");
+            let unchanged = want.iter().enumerate().all(|(r, w)| *w == format!("L{r}"));
+            let want_col = if unchanged { col } else { 0 };
+            assert_eq!(grid.cursor_col(), want_col, "{at}: cursor column");
+        }
     }
 
     #[test]
@@ -1373,515 +1290,7 @@ mod tests {
         assert!(grid.row(1).unwrap().is_wrapped());
     }
 
-    // IL — insert_lines: insert N blank lines at cursor row
-
-    #[test]
-    fn test_il_basic_insert_one() {
-        let mut grid = Grid::new(5, 10);
-        for r in 0..5u16 {
-            grid.move_cursor_to(r, 0);
-            write_text(&mut grid, &format!("LINE{r}"));
-        }
-        grid.move_cursor_to(2, 0);
-        grid.insert_lines(1);
-        // Row 2 should be blank, LINE2 shifted to row 3, LINE4 lost
-        assert!(row_trimmed(&grid, 0).starts_with("LINE0"));
-        assert!(row_trimmed(&grid, 1).starts_with("LINE1"));
-        assert_eq!(row_trimmed(&grid, 2), ""); // inserted blank
-        assert!(row_trimmed(&grid, 3).starts_with("LINE2"));
-        assert!(row_trimmed(&grid, 4).starts_with("LINE3"));
-    }
-
-    #[test]
-    fn test_il_insert_multiple() {
-        let mut grid = Grid::new(6, 10);
-        for r in 0..6u16 {
-            grid.move_cursor_to(r, 0);
-            write_text(&mut grid, &format!("L{r}"));
-        }
-        grid.move_cursor_to(1, 0);
-        grid.insert_lines(2);
-        // L0 stays, rows 1-2 blank, L1 at row 3, L2 at row 4, L3 at row 5
-        assert!(row_trimmed(&grid, 0).starts_with("L0"));
-        assert_eq!(row_trimmed(&grid, 1), "");
-        assert_eq!(row_trimmed(&grid, 2), "");
-        assert!(row_trimmed(&grid, 3).starts_with("L1"));
-        assert!(row_trimmed(&grid, 4).starts_with("L2"));
-        assert!(row_trimmed(&grid, 5).starts_with("L3"));
-    }
-
-    #[test]
-    fn test_il_at_top() {
-        let mut grid = Grid::new(4, 10);
-        for r in 0..4u16 {
-            grid.move_cursor_to(r, 0);
-            write_text(&mut grid, &format!("R{r}"));
-        }
-        grid.move_cursor_to(0, 0);
-        grid.insert_lines(1);
-        assert_eq!(row_trimmed(&grid, 0), "");
-        assert!(row_trimmed(&grid, 1).starts_with("R0"));
-        assert!(row_trimmed(&grid, 2).starts_with("R1"));
-        assert!(row_trimmed(&grid, 3).starts_with("R2"));
-        // R3 pushed off bottom
-    }
-
-    #[test]
-    fn test_il_count_exceeds_region() {
-        let mut grid = Grid::new(4, 10);
-        for r in 0..4u16 {
-            grid.move_cursor_to(r, 0);
-            write_text(&mut grid, &format!("R{r}"));
-        }
-        grid.move_cursor_to(1, 0);
-        grid.insert_lines(100); // way more than 3 remaining rows
-        // All rows from cursor down should be blank
-        assert!(row_trimmed(&grid, 0).starts_with("R0"));
-        assert_eq!(row_trimmed(&grid, 1), "");
-        assert_eq!(row_trimmed(&grid, 2), "");
-        assert_eq!(row_trimmed(&grid, 3), "");
-    }
-
-    #[test]
-    fn test_il_cursor_moves_to_col0() {
-        let mut grid = Grid::new(4, 10);
-        grid.move_cursor_to(1, 5);
-        grid.insert_lines(1);
-        assert_eq!(
-            grid.storage.cursor.col, 0,
-            "IL should move cursor to column 0"
-        );
-    }
-
-    #[test]
-    fn test_il_zero_count_is_noop() {
-        let mut grid = Grid::new(4, 10);
-        write_text(&mut grid, "HELLO");
-        grid.move_cursor_to(0, 3);
-        let col_before = grid.storage.cursor.col;
-        grid.insert_lines(0);
-        assert_eq!(
-            grid.storage.cursor.col, col_before,
-            "IL 0 should be a no-op"
-        );
-        assert!(row_trimmed(&grid, 0).starts_with("HELLO"));
-    }
-
-    // DL — delete_lines: delete N lines at cursor row
-
-    #[test]
-    fn test_dl_basic_delete_one() {
-        let mut grid = Grid::new(5, 10);
-        for r in 0..5u16 {
-            grid.move_cursor_to(r, 0);
-            write_text(&mut grid, &format!("LINE{r}"));
-        }
-        grid.move_cursor_to(2, 0);
-        grid.delete_lines(1);
-        // LINE2 deleted, LINE3 and LINE4 shift up, blank at bottom
-        assert!(row_trimmed(&grid, 0).starts_with("LINE0"));
-        assert!(row_trimmed(&grid, 1).starts_with("LINE1"));
-        assert!(row_trimmed(&grid, 2).starts_with("LINE3"));
-        assert!(row_trimmed(&grid, 3).starts_with("LINE4"));
-        assert_eq!(row_trimmed(&grid, 4), ""); // blank at bottom
-    }
-
-    #[test]
-    fn test_dl_delete_multiple() {
-        let mut grid = Grid::new(6, 10);
-        for r in 0..6u16 {
-            grid.move_cursor_to(r, 0);
-            write_text(&mut grid, &format!("L{r}"));
-        }
-        grid.move_cursor_to(1, 0);
-        grid.delete_lines(3);
-        // L1, L2, L3 deleted; L4 moves to row 1, L5 to row 2, rows 3-5 blank
-        assert!(row_trimmed(&grid, 0).starts_with("L0"));
-        assert!(row_trimmed(&grid, 1).starts_with("L4"));
-        assert!(row_trimmed(&grid, 2).starts_with("L5"));
-        assert_eq!(row_trimmed(&grid, 3), "");
-        assert_eq!(row_trimmed(&grid, 4), "");
-        assert_eq!(row_trimmed(&grid, 5), "");
-    }
-
-    #[test]
-    fn test_dl_at_top() {
-        let mut grid = Grid::new(4, 10);
-        for r in 0..4u16 {
-            grid.move_cursor_to(r, 0);
-            write_text(&mut grid, &format!("R{r}"));
-        }
-        grid.move_cursor_to(0, 0);
-        grid.delete_lines(1);
-        assert!(row_trimmed(&grid, 0).starts_with("R1"));
-        assert!(row_trimmed(&grid, 1).starts_with("R2"));
-        assert!(row_trimmed(&grid, 2).starts_with("R3"));
-        assert_eq!(row_trimmed(&grid, 3), "");
-    }
-
-    #[test]
-    fn test_dl_count_exceeds_region() {
-        let mut grid = Grid::new(4, 10);
-        for r in 0..4u16 {
-            grid.move_cursor_to(r, 0);
-            write_text(&mut grid, &format!("R{r}"));
-        }
-        grid.move_cursor_to(1, 0);
-        grid.delete_lines(100);
-        // All rows from cursor down blanked
-        assert!(row_trimmed(&grid, 0).starts_with("R0"));
-        assert_eq!(row_trimmed(&grid, 1), "");
-        assert_eq!(row_trimmed(&grid, 2), "");
-        assert_eq!(row_trimmed(&grid, 3), "");
-    }
-
-    #[test]
-    fn test_dl_cursor_moves_to_col0() {
-        let mut grid = Grid::new(4, 10);
-        grid.move_cursor_to(1, 5);
-        grid.delete_lines(1);
-        assert_eq!(
-            grid.storage.cursor.col, 0,
-            "DL should move cursor to column 0"
-        );
-    }
-
-    #[test]
-    fn test_dl_zero_count_is_noop() {
-        let mut grid = Grid::new(4, 10);
-        write_text(&mut grid, "HELLO");
-        grid.move_cursor_to(0, 3);
-        let col_before = grid.storage.cursor.col;
-        grid.delete_lines(0);
-        assert_eq!(
-            grid.storage.cursor.col, col_before,
-            "DL 0 should be a no-op"
-        );
-        assert!(row_trimmed(&grid, 0).starts_with("HELLO"));
-    }
-
-    // Scroll region interaction: IL/DL within DECSTBM margins
-
-    #[test]
-    fn test_il_within_scroll_region() {
-        let mut grid = Grid::new(6, 10);
-        for r in 0..6u16 {
-            grid.move_cursor_to(r, 0);
-            write_text(&mut grid, &format!("L{r}"));
-        }
-        // Set scroll region to rows 1-4 (0-indexed)
-        grid.set_scroll_region(1, 4);
-        grid.move_cursor_to(2, 0);
-        grid.insert_lines(1);
-        // L0 unchanged (outside region top), L5 unchanged (outside region bottom)
-        // Within region [1,4]: L2 inserted blank at row 2, L2->3, L3->4, L4 lost
-        assert!(row_trimmed(&grid, 0).starts_with("L0"));
-        assert!(row_trimmed(&grid, 1).starts_with("L1"));
-        assert_eq!(row_trimmed(&grid, 2), ""); // inserted blank
-        assert!(row_trimmed(&grid, 3).starts_with("L2"));
-        assert!(row_trimmed(&grid, 4).starts_with("L3"));
-        assert!(row_trimmed(&grid, 5).starts_with("L5")); // outside region, preserved
-    }
-
-    #[test]
-    fn test_dl_within_scroll_region() {
-        let mut grid = Grid::new(6, 10);
-        for r in 0..6u16 {
-            grid.move_cursor_to(r, 0);
-            write_text(&mut grid, &format!("L{r}"));
-        }
-        grid.set_scroll_region(1, 4);
-        grid.move_cursor_to(2, 0);
-        grid.delete_lines(1);
-        // Within [1,4]: L2 deleted, L3->2, L4->3, blank at 4
-        assert!(row_trimmed(&grid, 0).starts_with("L0"));
-        assert!(row_trimmed(&grid, 1).starts_with("L1"));
-        assert!(row_trimmed(&grid, 2).starts_with("L3"));
-        assert!(row_trimmed(&grid, 3).starts_with("L4"));
-        assert_eq!(row_trimmed(&grid, 4), ""); // blank at bottom of region
-        assert!(row_trimmed(&grid, 5).starts_with("L5")); // outside, preserved
-    }
-
-    #[test]
-    fn test_il_outside_scroll_region_is_noop() {
-        let mut grid = Grid::new(6, 10);
-        for r in 0..6u16 {
-            grid.move_cursor_to(r, 0);
-            write_text(&mut grid, &format!("L{r}"));
-        }
-        grid.set_scroll_region(2, 4);
-        grid.move_cursor_to(0, 3); // row 0 is above scroll region
-        grid.insert_lines(1);
-        // Nothing should change; cursor col should be preserved
-        for r in 0..6u16 {
-            assert!(
-                row_trimmed(&grid, r).starts_with(&format!("L{r}")),
-                "row {r} should be unchanged"
-            );
-        }
-    }
-
-    #[test]
-    fn test_dl_outside_scroll_region_is_noop() {
-        let mut grid = Grid::new(6, 10);
-        for r in 0..6u16 {
-            grid.move_cursor_to(r, 0);
-            write_text(&mut grid, &format!("L{r}"));
-        }
-        grid.set_scroll_region(2, 4);
-        grid.move_cursor_to(5, 3); // row 5 is below scroll region
-        grid.delete_lines(1);
-        for r in 0..6u16 {
-            assert!(
-                row_trimmed(&grid, r).starts_with(&format!("L{r}")),
-                "row {r} should be unchanged"
-            );
-        }
-    }
-
-    #[test]
-    fn test_il_at_top_of_scroll_region() {
-        let mut grid = Grid::new(6, 10);
-        for r in 0..6u16 {
-            grid.move_cursor_to(r, 0);
-            write_text(&mut grid, &format!("L{r}"));
-        }
-        grid.set_scroll_region(1, 3);
-        grid.move_cursor_to(1, 0);
-        grid.insert_lines(1);
-        assert!(row_trimmed(&grid, 0).starts_with("L0"));
-        assert_eq!(row_trimmed(&grid, 1), ""); // inserted blank
-        assert!(row_trimmed(&grid, 2).starts_with("L1"));
-        assert!(row_trimmed(&grid, 3).starts_with("L2")); // L3 pushed off region bottom
-        assert!(row_trimmed(&grid, 4).starts_with("L4")); // outside, preserved
-    }
-
-    #[test]
-    fn test_dl_at_bottom_of_scroll_region() {
-        let mut grid = Grid::new(6, 10);
-        for r in 0..6u16 {
-            grid.move_cursor_to(r, 0);
-            write_text(&mut grid, &format!("L{r}"));
-        }
-        grid.set_scroll_region(1, 3);
-        grid.move_cursor_to(3, 0); // bottom of region
-        grid.delete_lines(1);
-        // L3 deleted from bottom row of region; it's blanked immediately
-        assert!(row_trimmed(&grid, 0).starts_with("L0"));
-        assert!(row_trimmed(&grid, 1).starts_with("L1"));
-        assert!(row_trimmed(&grid, 2).starts_with("L2"));
-        assert_eq!(row_trimmed(&grid, 3), ""); // was L3, now blank
-        assert!(row_trimmed(&grid, 4).starts_with("L4"));
-    }
-
-    // Wide character handling
-
-    #[test]
-    fn test_ich_with_wide_char() {
-        let mut grid = Grid::new(4, 10);
-        write_text(&mut grid, "A");
-        grid.write_wide_char_styled(
-            '\u{4E2D}', // CJK "middle" (wide, occupies 2 cells)
-            PackedColor::DEFAULT_FG,
-            PackedColor::DEFAULT_BG,
-            CellFlags::empty(),
-        );
-        write_text(&mut grid, "B");
-        // Row: A[4E2D][cont]B
-        grid.move_cursor_to(0, 0);
-        grid.insert_chars(1);
-        // Shifted right by 1: " A[4E2D][cont]B".
-        assert_eq!(char_at(&grid, 0, 0), ' '); // inserted blank
-        assert_eq!(char_at(&grid, 0, 1), 'A');
-    }
-
-    #[test]
-    fn test_dch_with_wide_char() {
-        let mut grid = Grid::new(4, 10);
-        write_text(&mut grid, "AB");
-        grid.write_wide_char_styled(
-            '\u{4E2D}',
-            PackedColor::DEFAULT_FG,
-            PackedColor::DEFAULT_BG,
-            CellFlags::empty(),
-        );
-        write_text(&mut grid, "C");
-        // Row: A B [4E2D] [cont] C
-        grid.move_cursor_to(0, 0);
-        grid.delete_chars(1);
-        // A deleted, everything shifts left
-        assert_eq!(char_at(&grid, 0, 0), 'B');
-    }
-
-    #[test]
-    fn test_ech_on_wide_char() {
-        let mut grid = Grid::new(4, 10);
-        grid.write_wide_char_styled(
-            '\u{4E2D}',
-            PackedColor::DEFAULT_FG,
-            PackedColor::DEFAULT_BG,
-            CellFlags::empty(),
-        );
-        write_text(&mut grid, "XY");
-        // Row: [4E2D][cont]XY
-        grid.move_cursor_to(0, 0);
-        grid.erase_chars(1);
-        // Erase the first cell of the wide char
-        assert_eq!(char_at(&grid, 0, 2), 'X');
-        assert_eq!(char_at(&grid, 0, 3), 'Y');
-    }
-
-    // Edge cases
-
-    #[test]
-    fn test_ich_on_empty_row() {
-        let mut grid = Grid::new(4, 10);
-        grid.move_cursor_to(0, 0);
-        grid.insert_chars(3);
-        // Row was empty, inserting blanks into an empty row is fine
-        assert_eq!(char_at(&grid, 0, 0), ' ');
-        assert_eq!(char_at(&grid, 0, 1), ' ');
-    }
-
-    #[test]
-    fn test_dch_on_empty_row() {
-        let mut grid = Grid::new(4, 10);
-        grid.move_cursor_to(0, 0);
-        grid.delete_chars(3);
-        assert_eq!(char_at(&grid, 0, 0), ' ');
-    }
-
-    #[test]
-    fn test_ech_on_empty_row() {
-        let mut grid = Grid::new(4, 10);
-        grid.move_cursor_to(0, 0);
-        grid.erase_chars(5);
-        assert_eq!(char_at(&grid, 0, 0), ' ');
-    }
-
-    #[test]
-    fn test_il_single_row_grid() {
-        let mut grid = Grid::new(1, 10);
-        write_text(&mut grid, "HELLO");
-        grid.move_cursor_to(0, 0);
-        grid.insert_lines(1);
-        // On a 1-row grid, the single row is blanked
-        assert_eq!(row_trimmed(&grid, 0), "");
-    }
-
-    #[test]
-    fn test_dl_single_row_grid() {
-        let mut grid = Grid::new(1, 10);
-        write_text(&mut grid, "HELLO");
-        grid.move_cursor_to(0, 0);
-        grid.delete_lines(1);
-        assert_eq!(row_trimmed(&grid, 0), "");
-    }
-
-    #[test]
-    fn test_ich_clears_pending_wrap() {
-        let mut grid = Grid::new(4, 5);
-        write_text(&mut grid, "ABCDE"); // stops at col 4 without arming the wrap
-        grid.move_cursor_to(0, 0);
-        write_text(&mut grid, "ABCDE");
-        // write_char never arms the wrap, so arm it directly.
-        grid.move_cursor_to(0, 4);
-        grid.storage.mark_pending_wrap();
-        assert!(grid.storage.pending_wrap);
-        grid.insert_chars(1);
-        assert!(!grid.storage.pending_wrap, "ICH should clear pending_wrap");
-    }
-
-    #[test]
-    fn test_dch_clears_pending_wrap() {
-        let mut grid = Grid::new(4, 5);
-        grid.move_cursor_to(0, 4);
-        grid.storage.mark_pending_wrap();
-        assert!(grid.storage.pending_wrap);
-        grid.delete_chars(1);
-        assert!(!grid.storage.pending_wrap, "DCH should clear pending_wrap");
-    }
-
-    #[test]
-    fn test_ech_clears_pending_wrap() {
-        let mut grid = Grid::new(4, 5);
-        grid.move_cursor_to(0, 4);
-        grid.storage.mark_pending_wrap();
-        assert!(grid.storage.pending_wrap);
-        grid.erase_chars(1);
-        assert!(!grid.storage.pending_wrap, "ECH should clear pending_wrap");
-    }
-
-    #[test]
-    fn test_il_preserves_rows_above_cursor() {
-        // Verify that rows above the cursor are completely untouched
-        let mut grid = Grid::new(5, 10);
-        for r in 0..5u16 {
-            grid.move_cursor_to(r, 0);
-            write_text(&mut grid, &format!("ROW{r}"));
-        }
-        grid.move_cursor_to(3, 0);
-        grid.insert_lines(2);
-        // Rows 0-2 should be totally unchanged
-        assert!(row_trimmed(&grid, 0).starts_with("ROW0"));
-        assert!(row_trimmed(&grid, 1).starts_with("ROW1"));
-        assert!(row_trimmed(&grid, 2).starts_with("ROW2"));
-        assert_eq!(row_trimmed(&grid, 3), "");
-        assert_eq!(row_trimmed(&grid, 4), "");
-    }
-
-    #[test]
-    fn test_dl_preserves_rows_above_cursor() {
-        let mut grid = Grid::new(5, 10);
-        for r in 0..5u16 {
-            grid.move_cursor_to(r, 0);
-            write_text(&mut grid, &format!("ROW{r}"));
-        }
-        grid.move_cursor_to(3, 0);
-        grid.delete_lines(1);
-        assert!(row_trimmed(&grid, 0).starts_with("ROW0"));
-        assert!(row_trimmed(&grid, 1).starts_with("ROW1"));
-        assert!(row_trimmed(&grid, 2).starts_with("ROW2"));
-        assert!(row_trimmed(&grid, 3).starts_with("ROW4"));
-        assert_eq!(row_trimmed(&grid, 4), "");
-    }
-
-    // ICH/DCH inverse relationship
-
-    #[test]
-    fn test_ich_then_dch_roundtrip() {
-        let mut grid = Grid::new(4, 10);
-        write_text(&mut grid, "ABCDE");
-        grid.move_cursor_to(0, 2);
-        grid.insert_chars(2); // "AB  CDE.."
-        grid.move_cursor_to(0, 2);
-        grid.delete_chars(2); // Should restore "ABCDE"
-        assert_eq!(char_at(&grid, 0, 0), 'A');
-        assert_eq!(char_at(&grid, 0, 1), 'B');
-        assert_eq!(char_at(&grid, 0, 2), 'C');
-        assert_eq!(char_at(&grid, 0, 3), 'D');
-        assert_eq!(char_at(&grid, 0, 4), 'E');
-    }
-
-    #[test]
-    fn test_il_then_dl_roundtrip() {
-        let mut grid = Grid::new(5, 10);
-        for r in 0..5u16 {
-            grid.move_cursor_to(r, 0);
-            write_text(&mut grid, &format!("L{r}"));
-        }
-        grid.move_cursor_to(1, 0);
-        grid.insert_lines(1);
-        grid.move_cursor_to(1, 0);
-        grid.delete_lines(1);
-        // L4 was pushed off by IL and is gone, but L0-L3 should be restored
-        assert!(row_trimmed(&grid, 0).starts_with("L0"));
-        assert!(row_trimmed(&grid, 1).starts_with("L1"));
-        assert!(row_trimmed(&grid, 2).starts_with("L2"));
-        assert!(row_trimmed(&grid, 3).starts_with("L3"));
-        assert_eq!(row_trimmed(&grid, 4), ""); // L4 was lost by IL
-    }
-
+    // =========================================================================
     // DECLRMM IL/DL horizontal containment
 
     /// IL with DECLRMM active is a no-op when the cursor column is outside the

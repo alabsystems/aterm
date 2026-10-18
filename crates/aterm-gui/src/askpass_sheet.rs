@@ -241,7 +241,7 @@ impl App {
             }
             let mode = Id::from_ptr(aterm_objc::cf::kCFRunLoopDefaultMode.cast_mut().cast());
             let next: unsafe extern "C-unwind" fn(Id, Sel, usize, Id, Id, aterm_objc::Bool) -> Id =
-                aterm_objc::msg();
+                aterm_objc::checked_msg();
             // Unlike discardEvents(..., nil), nextEvent's nil-empty result and
             // expired deadline are documented. Refuse an overloaded queue
             // instead of attaching a field before all earlier keys are gone.
@@ -284,7 +284,7 @@ impl App {
                 return Err("could not guard the password field's input");
             };
             let begin_sheet: unsafe extern "C-unwind" fn(Id, Sel, Id, aterm_objc::BlockPtr) =
-                aterm_objc::msg();
+                aterm_objc::checked_msg();
             begin_sheet(
                 alert.id(),
                 sel!(beginSheetModalForWindow:completionHandler:),
@@ -381,11 +381,11 @@ fn read_secure_field(field: &Obj) -> Option<aterm_uds::sudo::Secret> {
         if value.is_null() {
             return None;
         }
-        let length: unsafe extern "C-unwind" fn(Id, Sel) -> usize = aterm_objc::msg();
+        let length: unsafe extern "C-unwind" fn(Id, Sel) -> usize = aterm_objc::checked_msg();
         let len = length(value, sel!(length));
         let mut units = aterm_uds::sudo::SecretUtf16::new(len)?;
         let get: unsafe extern "C-unwind" fn(Id, Sel, *mut u16, aterm_objc::NSRange) =
-            aterm_objc::msg();
+            aterm_objc::checked_msg();
         get(
             value,
             sel!(getCharacters:range:),

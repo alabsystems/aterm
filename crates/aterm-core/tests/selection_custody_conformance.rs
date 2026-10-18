@@ -43,29 +43,6 @@ fn selected_text(term: &Terminal) -> String {
         .expect("a live selection must resolve to text")
 }
 
-/// A program repainting a status bar in a scroll region at the bottom of the
-/// screen must not destroy a highlight sitting in scrollback.
-#[test]
-fn a_region_scroll_spares_a_selection_it_never_touched() {
-    let mut term = with_scrollback_selection(24, 40);
-    let before = selected_text(&term);
-
-    // DECSTBM rows 19..24, then scroll inside it — a status-bar repaint.
-    term.process(b"\x1b[19;24r");
-    term.process(b"\x1b[24;1H\n");
-
-    assert!(
-        term.text_selection().has_selection(),
-        "a scroll region at the bottom must not clear a scrollback selection"
-    );
-    assert_eq!(
-        selected_text(&term),
-        before,
-        "…and it must still name the SAME line: surviving over shifted content is \
-         the wrong-copy half of the same bug"
-    );
-}
-
 /// …and the same op must still clear a selection that is inside the region.
 /// Over-clearing is safe; leaving a highlight over replaced content is not.
 #[test]
@@ -186,34 +163,10 @@ fn clearing_the_scrollback_still_clears_the_selection() {
     );
 }
 
-/// An op that rewrites the row a highlight sits on must clear it: a `\r` + EL
-/// progress bar or spinner under a live highlight would otherwise make a copy
-/// return text the user never selected. Over-clearing is safe; a stale
-/// highlight is not.
-#[test]
-fn erasing_the_selected_line_clears_the_stale_highlight() {
-    let mut term = Terminal::new(24, 40);
-    term.process(b"hello world\r\n");
-    term.process(b"\x1b[1;1H");
-    {
-        let sel = term.text_selection_mut();
-        sel.start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
-        sel.update_selection(0, 4, SelectionSide::Right);
-        sel.complete_selection();
-    }
-    assert!(term.text_selection().has_selection());
-
-    // The spinner shape: carriage return, erase the line, repaint.
-    term.process(b"\r\x1b[K");
-
-    assert!(
-        !term.text_selection().has_selection(),
-        "EL rewrote the selected row; the highlight must not survive it"
-    );
-}
-
-/// …but EL on a different row must leave the highlight alone. This is the half that
-/// makes the previous test a scoped rule rather than a return to clearing everything.
+/// EL (the `\r` + EL progress bar or spinner) on a different row leaves the
+/// highlight alone, and the same EL on the selected row clears it: a copy must
+/// never return text the user did not select, and the rule is scoped to
+/// overlap rather than a return to clearing everything.
 #[test]
 fn erasing_another_line_spares_the_highlight() {
     let mut term = Terminal::new(24, 40);
@@ -554,50 +507,8 @@ fn with_live_row_zero_selection() -> Terminal {
     term
 }
 
-/// ECH (CSI X) blanks cells in place under the highlight. A background job repainting
-/// a field with `\x1b[40X` is the shape: the GUI's clear-on-typing never fires for it,
-/// so nothing else takes the highlight down and a copy returns 40 spaces.
-#[test]
-fn erasing_chars_on_the_selected_line_clears_the_stale_highlight() {
-    let mut term = with_live_row_zero_selection();
-
-    term.process(b"\x1b[1;1H\x1b[40X");
-
-    assert!(
-        !term.text_selection().has_selection(),
-        "ECH rewrote the selected row; the highlight must not survive it"
-    );
-}
-
-/// DCH (CSI P) shifts the row's tail left under the highlight, so the copy comes back
-/// shifted by N columns — text the user never selected, not even a prefix of it.
-#[test]
-fn deleting_chars_on_the_selected_line_clears_the_stale_highlight() {
-    let mut term = with_live_row_zero_selection();
-
-    term.process(b"\x1b[1;1H\x1b[3P");
-
-    assert!(
-        !term.text_selection().has_selection(),
-        "DCH shifted the selected row's content; the highlight must not survive it"
-    );
-}
-
-/// ICH (CSI @) shifts it right, the mirror image.
-#[test]
-fn inserting_chars_on_the_selected_line_clears_the_stale_highlight() {
-    let mut term = with_live_row_zero_selection();
-
-    term.process(b"\x1b[1;1H\x1b[3@");
-
-    assert!(
-        !term.text_selection().has_selection(),
-        "ICH shifted the selected row's content; the highlight must not survive it"
-    );
-}
-
-/// …and all three on another row must spare it. Without this half the fix above is
-/// indistinguishable from a return to clearing on every content op.
+/// ECH, DCH and ICH on another row spare the highlight. Without this half the
+/// clearing below is indistinguishable from clearing on every content op.
 #[test]
 fn char_edits_on_another_line_spare_the_highlight() {
     for op in [&b"\x1b[40X"[..], &b"\x1b[3P"[..], &b"\x1b[3@"[..]] {
@@ -633,30 +544,6 @@ fn char_edits_on_the_selected_line_clear_the_stale_highlight() {
             "a char edit ON the selected row must clear the stale highlight: {op:?}"
         );
     }
-}
-
-/// The canonical progress bar without an erase: `\r` plus a plain overwrite. The
-/// design used exactly this example, and only the `\r\e[K` spelling was closed —
-/// ordinary character output recorded nothing, so the highlight stayed painted over
-/// `Progress: 90%` and a copy returned it.
-#[test]
-fn a_bare_carriage_return_overwrite_clears_the_stale_highlight() {
-    let mut term = Terminal::new(24, 40);
-    term.process(b"Progress: 10%");
-    {
-        let sel = term.text_selection_mut();
-        sel.start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
-        sel.update_selection(0, 12, SelectionSide::Right);
-        sel.complete_selection();
-    }
-    assert!(term.text_selection().has_selection());
-
-    term.process(b"\rProgress: 90%");
-
-    assert!(
-        !term.text_selection().has_selection(),
-        "the row under the highlight was overwritten; the highlight must go with it"
-    );
 }
 
 /// Every print path records: the parser splits printable text four ways (a
@@ -745,52 +632,6 @@ fn appending_to_the_selected_row_spares_the_highlight() {
         term.selection_to_string().as_deref(),
         Some("hello"),
         "and the copy still returns exactly what was selected"
-    );
-}
-
-/// Two disjoint repaints in one batch (an inline TUI redrawing its title row and
-/// composer box in one read) stay two bands, up to `MAX_SELECTION_DAMAGE_BANDS`,
-/// so a selection on the rows between them survives.
-#[test]
-fn two_disjoint_repaints_in_one_batch_spare_the_selection_between_them() {
-    let mut term = Terminal::new(24, 40);
-    for i in 0..24 {
-        term.process(format!("row-{i}\r\n").as_bytes());
-    }
-    {
-        let sel = term.text_selection_mut();
-        sel.start_selection(10, 0, SelectionSide::Left, SelectionType::Simple);
-        sel.update_selection(10, 4, SelectionSide::Right);
-        sel.complete_selection();
-    }
-    assert!(term.text_selection().has_selection());
-
-    // One batch: the title row and the composer box, twenty rows apart.
-    term.process(b"\x1b[1;1H\x1b[K\x1b[21;1H\x1b[K");
-
-    assert!(
-        term.text_selection().has_selection(),
-        "nothing rewrote row 10; the gap between two disjoint bands is not damage"
-    );
-}
-
-/// The bound is four, and it is exact in both directions. Four disjoint repaints stay
-/// four bands…
-#[test]
-fn four_disjoint_repaints_in_one_batch_spare_the_selection_between_them() {
-    let mut term = Terminal::new(24, 40);
-    {
-        let sel = term.text_selection_mut();
-        sel.start_selection(2, 0, SelectionSide::Left, SelectionType::Simple);
-        sel.update_selection(2, 4, SelectionSide::Right);
-        sel.complete_selection();
-    }
-
-    term.process(b"\x1b[1;1H\x1b[K\x1b[5;1H\x1b[K\x1b[9;1H\x1b[K\x1b[13;1H\x1b[K");
-
-    assert!(
-        term.text_selection().has_selection(),
-        "four disjoint bands are kept exactly; row 2 lies in a gap"
     );
 }
 

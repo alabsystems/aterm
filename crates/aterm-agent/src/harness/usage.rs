@@ -26,8 +26,7 @@
 //! reading for the session's own process ([`AccountView::windows`],
 //! [`super::tap`]), its caller's to read; without one they stay unknown
 //! (`"windows":{}`, `?%` in the HUD), and `harness limits` prints a painted
-//! panel's ([`usage_panel_windows`]), or a Codex `/status` card's
-//! ([`codex_status_windows`]). The fold also feeds the window
+//! panel's ([`usage_panel_windows`]). The fold also feeds the window
 //! footer's `Σ` tokens and limit wall ([`LimitNoticeRow`]) through
 //! [`super::session_usage`].
 
@@ -934,23 +933,19 @@ impl UsageView {
 // The `/usage` panel, read off aterm's own grid
 // ---------------------------------------------------------------------------
 
-/// One rate-limit window Claude Code painted on its `/usage` panel, or Codex
-/// on its `/status` card ([`codex_status_windows`]), before its reset text is
-/// placed on a clock; the producer of [`super::source::Source::Grid`]. The
-/// panel and the card are the only surfaces that paint a quota figure.
+/// One rate-limit window Claude Code painted on its `/usage` panel, before
+/// its reset text is placed on a clock; the producer of
+/// [`super::source::Source::Grid`]. The panel is the only surface read that
+/// paints a quota figure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PanelWindow {
-    /// The window key this row names (the vendor's own: `five_hour`, …; on
-    /// Codex's card, the same keys for the windows its labels name by length,
-    /// `5h` and `Weekly`, another length's label folded: [`codex_window_key`]).
+    /// The window key this row names (the vendor's own: `five_hour`, …).
     pub name: String,
     /// The whole-number percent printed (`7% used` → 7). The vendor floors its
-    /// own figure, so this is the painted integer, never re-derived. Codex's
-    /// card paints what is LEFT (`99% left`), and this is its complement
-    /// (`1`): the painted integer, turned round.
+    /// own figure, so this is the painted integer, never re-derived.
     pub used_pct: u32,
-    /// The text after `Resets `, exactly as painted and not placed on a clock
-    /// (on Codex's card, inside `(resets …)`). `None` when the row carried no
+    /// The text after `Resets `, exactly as painted and not placed on a clock.
+    /// `None` when the row carried no
     /// reset.
     pub reset_text: Option<String>,
 }
@@ -1017,8 +1012,7 @@ fn reset_after(s: &str) -> Option<String> {
 }
 
 /// Lowercase, non-alphanumeric runs folded to `_`, bounded: the key half of
-/// an UNMEASURED `Current week (<display name>)` title, and of a Codex card's
-/// label no window key names ([`codex_window_key`]).
+/// an UNMEASURED `Current week (<display name>)` title.
 fn panel_key_slug(display: &str) -> Option<String> {
     let mut out = String::new();
     for c in display.chars() {
@@ -1140,271 +1134,6 @@ pub fn usage_panel_windows(rows: &[String]) -> Vec<PanelWindow> {
         return Vec::new();
     }
     out
-}
-
-// ---------------------------------------------------------------------------
-// Codex's `/status` card, read off aterm's own grid
-// ---------------------------------------------------------------------------
-
-/// What the first row inside a Codex card says (`>_ OpenAI Codex (v0.156.1)`):
-/// the `/status` card's, and the session card's it opens on, which carries no
-/// limit row.
-const CODEX_CARD_HEADER: &str = ">_ OpenAI Codex";
-
-/// What a card row holds between its side rules (`│ … │`); `None` for a row
-/// that is not one.
-fn card_row(row: &str) -> Option<&str> {
-    row.trim()
-        .strip_prefix('\u{2502}')?
-        .strip_suffix('\u{2502}')
-}
-
-/// The words inside `(resets …)` on a card row, or `None`.
-fn card_reset(s: &str) -> Option<String> {
-    let at = s.find("(resets ")? + "(resets ".len();
-    let rest = s.get(at..)?;
-    let text = rest.get(..rest.find(')')?)?.trim();
-    (!text.is_empty()).then(|| text.to_owned())
-}
-
-/// The windows the card names by their length (codex-rs labels a window
-/// `5h`, `weekly`, …), keyed as Claude Code's panel keys the same windows
-/// ([`PANEL_TITLES`]): Codex's own limit's are aterm's `five_hour` and
-/// `seven_day` (`docs/DESIGN-account-stats-2026-10-15.md` §7.2). Any other
-/// length is its label folded ([`panel_key_slug`]: `monthly`).
-const CODEX_CARD_WINDOWS: [(&str, &str); 2] = [("5h", "five_hour"), ("weekly", "seven_day")];
-
-/// A `<label> limit:` row of the card, its side rules gone: the label and
-/// what follows the colon.
-fn codex_limit_label(inner: &str) -> Option<(&str, &str)> {
-    let (label, value) = inner.trim().split_once(':')?;
-    Some((label.trim().strip_suffix(" limit")?, value))
-}
-
-/// What a limit row says after its label: the meter, `N% left`, and
-/// `(resets …)` where it fits on the row; read as what is used, the
-/// complement of what is left, and the reset's words.
-fn codex_limit_figure(value: &str) -> Option<(u32, Option<String>)> {
-    let at = value.find("% left")?;
-    let head = &value[..at];
-    let digits = head.len() - head.trim_end_matches(|c: char| c.is_ascii_digit()).len();
-    if digits == 0 {
-        return None;
-    }
-    let left: u32 = head[head.len() - digits..].parse().ok()?;
-    Some((100u32.checked_sub(left)?, card_reset(&value[at..])))
-}
-
-/// The key of the window a limit row labels ([`CODEX_CARD_WINDOWS`]).
-/// Another model's limit (`limit_name`, the accounts design's F11) labels
-/// its windows by length too, so its key carries its name, folded, in front
-/// (`<name>_five_hour`): under a `<name> limit:` row that heads it
-/// (`family`), or in a label of its own (`<name> 5h`, a limit with one
-/// window). `None` for a label that folds to nothing.
-fn codex_window_key(label: &str, family: Option<&str>) -> Option<String> {
-    let known = |label: &str| {
-        CODEX_CARD_WINDOWS
-            .iter()
-            .find(|(length, _)| label.eq_ignore_ascii_case(length))
-            .map(|(_, key)| (*key).to_owned())
-    };
-    let named = |name: &str, window: String| match panel_key_slug(name) {
-        Some(name) => format!("{name}_{window}"),
-        None => window,
-    };
-    if known(label).is_none()
-        && let Some((name, window)) = label
-            .rsplit_once(' ')
-            .and_then(|(name, length)| Some((name, known(length)?)))
-    {
-        return Some(named(name, window));
-    }
-    let window = known(label).or_else(|| panel_key_slug(label))?;
-    Some(match family {
-        Some(name) => named(name, window),
-        None => window,
-    })
-}
-
-/// The windows one card's rows name, read row by row ([`Self::feed`]): each
-/// `<label> limit:` row with a figure is a window, a `<name> limit:` row with
-/// none heads another model's limit, and a `(resets …)` row right under a
-/// window is that window's reset where its own row had none.
-#[derive(Default)]
-struct CardWindows {
-    windows: Vec<PanelWindow>,
-    /// The last row read was a window (its reset may be painted on the next).
-    after_window: bool,
-    /// The other model's limit a row above headed (its `<name> limit:`).
-    family: Option<String>,
-}
-
-impl CardWindows {
-    /// One card row, `inner` its text (a boxed row's between its side rules).
-    fn feed(&mut self, inner: &str) {
-        let after_window = std::mem::replace(&mut self.after_window, false);
-        if let Some((label, value)) = codex_limit_label(inner) {
-            if value.trim().is_empty() {
-                self.family = Some(label.to_owned());
-            } else if let Some((used_pct, reset_text)) = codex_limit_figure(value)
-                && let Some(name) = codex_window_key(label, self.family.as_deref())
-            {
-                self.windows.push(PanelWindow {
-                    name,
-                    used_pct,
-                    reset_text,
-                });
-                self.after_window = true;
-            }
-        } else if after_window
-            && inner.trim().starts_with("(resets ")
-            && let Some(window) = self.windows.last_mut()
-            && window.reset_text.is_none()
-        {
-            window.reset_text = card_reset(inner);
-        }
-    }
-}
-
-/// The rate-limit windows Codex painted on its `/status` card, read off the
-/// rows of aterm's own parsed grid. Two layouts are read, measured:
-///
-/// * codex 0.156.1 (2026-09-24) draws the card in a box:
-///
-/// ```text
-/// ╭────────────────────────────────────────────────────────────────────────╮
-/// │  >_ OpenAI Codex (v0.156.1)                                            │
-/// │  …                                                                     │
-/// │  Context window:  99% left (14.8K used / 258K)                         │
-/// │  Weekly limit:    [████████████████████] 99% left (resets 13:24 on 1 Oct) │
-/// ╰────────────────────────────────────────────────────────────────────────╯
-/// ```
-///
-///   Only a box whose first row is Codex's header ([`CODEX_CARD_HEADER`])
-///   and whose bottom rule is on the grid is read.
-/// * codex 0.163.0 (2026-10-16, the lab) draws it with no box, under the
-///   `/status` it answers, every row at column 2, its resets on a 12-hour
-///   clock where the TUI's is one:
-///
-/// ```text
-/// /status
-///
-///   >_ OpenAI Codex (v0.163.0)
-///   …
-///   Context window:      99% left (15.7K used / 258K)
-///   5h limit:            [██████████████░░░░░░] 70% left (resets 12:15 PM)
-///   Weekly limit:        [██████████████████░░] 90% left (resets 11:15 AM on 21 Oct)
-///   Credits:             13 credits
-///
-/// › Ask Codex to do anything
-/// ```
-///
-///   Only a header at column 2 whose nearest row above, past blanks, is the
-///   `/status` it answers, and whose rows (blank, or at column 2 or deeper)
-///   end on the grid at a row that is none of them (the composer), is read
-///   ([`unboxed_card`]); a provider with no limits (`Limits: data not
-///   available yet`) paints none.
-///
-/// Each `<label> limit:` row is a window (`5h limit` is `five_hour`, `Weekly
-/// limit` `seven_day`: [`codex_window_key`]): what it says is left, turned
-/// into what is used. A `<name> limit:` row with no figure heads another
-/// model's limit, whose windows below it carry its name. A reset that does
-/// not fit beside the figure is painted alone on the row under it (`(resets
-/// …)`). The context window is no limit and is not read, so a row quoted in
-/// a conversation is not; of two cards, either layout, the lower (the newer)
-/// is read. Credits are not read here: the card's figure is a balance, not
-/// Claude Code's notice that credits carry the session. The text is evidence
-/// of what was drawn, never an instruction.
-#[must_use]
-pub fn codex_status_windows(rows: &[String]) -> Vec<PanelWindow> {
-    /// The box open on the grid: whether its first row is Codex's header, how
-    /// many rows it has shown, and its windows.
-    struct Card {
-        codex: bool,
-        rows: usize,
-        read: CardWindows,
-    }
-    // The newest card read, by the row it ends on. A completed newer card
-    // supersedes history even when its quota is absent or unreadable.
-    let mut read: Option<(usize, Vec<PanelWindow>)> = None;
-    let mut keep = |end: usize, windows: Vec<PanelWindow>| {
-        if read.as_ref().is_none_or(|(at, _)| end > *at) {
-            read = Some((end, windows));
-        }
-    };
-    let mut open: Option<Card> = None;
-    for (i, row) in rows.iter().enumerate() {
-        if let Some(windows) = unboxed_card(rows, i) {
-            keep(i, windows);
-        }
-        let t = row.trim();
-        if t.starts_with('\u{256d}') {
-            open = Some(Card {
-                codex: false,
-                rows: 0,
-                read: CardWindows::default(),
-            });
-            continue;
-        }
-        if t.starts_with('\u{2570}') {
-            if let Some(card) = open.take()
-                && card.codex
-            {
-                keep(i, card.read.windows);
-            }
-            continue;
-        }
-        let Some(card) = open.as_mut() else {
-            continue;
-        };
-        let Some(inner) = card_row(row) else {
-            // Anything else between the rules is no card.
-            open = None;
-            continue;
-        };
-        card.rows += 1;
-        if card.rows == 1 {
-            card.codex = inner.trim().starts_with(CODEX_CARD_HEADER);
-            continue;
-        }
-        card.read.feed(inner);
-    }
-    read.map(|(_, windows)| windows).unwrap_or_default()
-}
-
-/// The command a `/status` card answers, as Codex 0.163.0 echoes it in the
-/// history above the card it draws.
-const STATUS_COMMAND: &str = "/status";
-
-/// The windows of the box-less card (codex 0.163.0, [`codex_status_windows`])
-/// whose LAST row is `rows[end - 1]`, read when `rows[end]` is the row that
-/// ends it: a row the card does not draw (neither blank nor at column 2 or
-/// deeper: the composer), under rows that run back to its header at column 2
-/// (`  >_ OpenAI Codex (v…)`), the nearest row above which, past blanks, is
-/// the `/status` it answers. `None` for any other `end`.
-fn unboxed_card(rows: &[String], end: usize) -> Option<Vec<PanelWindow>> {
-    let card_row = |r: &str| r.trim().is_empty() || r.starts_with("  ");
-    if card_row(rows.get(end)?) {
-        return None;
-    }
-    let first = rows[..end]
-        .iter()
-        .rposition(|r| !card_row(r))
-        .map_or(0, |at| at + 1);
-    let header = (first..end).find(|&i| {
-        rows[i]
-            .strip_prefix("  ")
-            .is_some_and(|r| r.starts_with(CODEX_CARD_HEADER))
-    })?;
-    let above = rows[..header].iter().rev().find(|r| !r.trim().is_empty())?;
-    if above.trim() != STATUS_COMMAND {
-        return None;
-    }
-    let mut read = CardWindows::default();
-    for row in &rows[header + 1..end] {
-        read.feed(row);
-    }
-    Some(read.windows)
 }
 
 // ---------------------------------------------------------------------------
@@ -2409,22 +2138,6 @@ mod tests {
         assert_eq!(t.per_model()["model-000"].messages, 2);
     }
 
-    #[test]
-    fn spend_from_transcript_carries_tokens() {
-        let mut t = TranscriptUsage::new();
-        fold_all(
-            &mut t,
-            &[
-                &assistant_row("msg_a", "claude-fable-5-1", 1_000_000, 0),
-                &assistant_row("msg_b", "claude-opus-5", 10, 0),
-            ],
-        );
-        let spend = spend_from_transcript(&t);
-        assert_eq!(spend["claude-fable-5-1"].input, 1_000_000);
-        assert_eq!(spend["claude-fable-5-1"].cache_read, 1000);
-        assert_eq!(spend["claude-opus-5"].input, 10);
-    }
-
     /// THE ONE-HOUR WRITES ARE KEPT APART: 800 of the row's 1000 cache writes
     /// are one-hour ones (`cache_creation.ephemeral_1h_input_tokens`, the key
     /// MEASURED by name on Claude Code 2.1.30x transcripts), which list higher
@@ -2538,10 +2251,7 @@ mod tests {
         assert_eq!(t.last_model(), Some("claude-fable-5-1"));
         let mut a = AccountView::new("account", true);
         a.add_transcript(&t);
-        assert_eq!(
-            hud_line(&view_with(a)),
-            "fable ?%/5h · ?%/7d · acct account · resets ? · none"
-        );
+        assert_eq!(a.model.as_deref(), Some("claude-fable-5-1"));
         // Alone, it names nothing.
         let mut only = TranscriptUsage::new();
         fold_all(&mut only, &[synthetic]);
@@ -2563,32 +2273,12 @@ mod tests {
         assert_eq!(v.shown().map(|a| a.label.as_str()), Some("alt-1"));
     }
 
-    // -- hud_line -----------------------------------------------------------
-
-    /// The HUD names the model family and the account, and says the
-    /// windows are unknown here (`?%`, `resets ?`, source `none`) rather
-    /// than inventing a number.
+    /// A USAGE TAP'S READING fills the windows: the JSON's `windows` (schema
+    /// 1's own key, empty before) carries each by the vendor's name, with the
+    /// reading's age. NEGATIVE CONTROL: a window the reading has not is
+    /// absent, and no reading leaves `windows` empty.
     #[test]
-    fn hud_line_names_the_model_and_says_the_windows_are_unknown() {
-        assert_eq!(hud_line(&UsageView::new(0)), "no account");
-        assert_eq!(
-            hud_line(&view_with(live_account())),
-            "fable ?%/5h · ?%/7d · acct work · resets ? · none"
-        );
-        assert_eq!(
-            hud_line(&view_with(AccountView::new("work", true))),
-            "model? ?%/5h · ?%/7d · acct work · resets ? · none"
-        );
-    }
-
-    /// A USAGE TAP'S READING fills the windows: the HUD shows both figures,
-    /// the five-hour reset as a span from the view's instant and the
-    /// reading's age, and the JSON's `windows` (schema 1's own key, empty
-    /// before) carries each by the vendor's name. NEGATIVE CONTROL: a window
-    /// the reading has not is still `?%`, and no reading leaves `windows`
-    /// empty and the HUD's `none`.
-    #[test]
-    fn a_tap_reading_fills_the_windows_of_the_hud_and_the_json() {
+    fn a_tap_reading_fills_the_windows_of_the_json() {
         let reading = crate::harness::tap::Reading {
             at: 1_000,
             sid: "s-1".to_string(),
@@ -2611,12 +2301,6 @@ mod tests {
         a.add_reading(&reading, 1_012);
         let mut view = UsageView::new(1_012);
         view.accounts.push(a);
-        let line = hud_line(&view);
-        assert!(
-            line.starts_with("fable 42%/5h · ?%/7d · acct work · resets in "),
-            "{line}"
-        );
-        assert!(line.ends_with(" · tap 12s"), "{line}");
         let json: Value = aterm_json::from_str(&usage_json(&view)).expect("json");
         let five = &json["accounts"][0]["windows"]["five_hour"];
         assert_eq!(five["used_pct"], Value::from(42u64));
@@ -2627,6 +2311,8 @@ mod tests {
             aterm_json::from_str(&usage_json(&view_with(live_account()))).expect("json");
         assert_eq!(bare["accounts"][0]["windows"], Value::Object(Map::new()));
     }
+
+    // -- hud_line -----------------------------------------------------------
 
     #[test]
     fn hud_line_is_capped_at_1024_bytes_on_a_char_boundary() {
@@ -2664,9 +2350,7 @@ mod tests {
         assert!(!line.contains('\n') && !line.contains('\x1b') && !line.contains('\t'));
         assert!(line.starts_with("fa ble ?%/5h"));
 
-        // Negative control for the shared predicate: `U+2028` is Zl, so
-        // `char::is_control()` is false for it.
-        assert!(!'\u{2028}'.is_control());
+        // `U+2028` is no `char::is_control()` (it is Zl), and is flattened too.
         let split = AccountView::new("wo\u{2028}rk", true);
         let line = hud_line(&view_with(split));
         assert!(!line.contains('\u{2028}'), "{line:?}");
@@ -2736,15 +2420,6 @@ mod tests {
         assert!(j["sheet"]["last_sync"].is_null());
         assert!(j["sheet"]["last_error"].is_null());
         assert!(!doc.contains('\n'), "one line");
-    }
-
-    #[test]
-    fn usage_json_of_an_empty_view_is_still_schema_1() {
-        let doc = usage_json(&UsageView::new(0));
-        assert_eq!(
-            doc,
-            r#"{"accounts":[],"as_of":"1970-01-01T00:00:00Z","schema":1,"sheet":{"enabled":false,"last_error":null,"last_sync":null}}"#
-        );
     }
 
     #[test]
@@ -2839,296 +2514,6 @@ mod tests {
         );
         // Negative control 5: empty input.
         assert!(usage_panel_windows(&[]).is_empty());
-    }
-
-    // -- Codex's `/status` card --------------------------------------------
-
-    /// A card as codex-rs lays it out: its header row first, `body` between,
-    /// its rules at `width` columns.
-    fn codex_card(body: &[&str]) -> Vec<String> {
-        let width = 90;
-        let row = |text: &str| {
-            let pad = width - text.chars().count();
-            format!("\u{2502}{text}{}\u{2502}", " ".repeat(pad))
-        };
-        let rule = "\u{2500}".repeat(width);
-        std::iter::once(format!("\u{256d}{rule}\u{256e}"))
-            .chain(std::iter::once(row("  >_ OpenAI Codex (v0.156.1)")))
-            .chain(body.iter().map(|text| row(text)))
-            .chain(std::iter::once(format!("\u{2570}{rule}\u{256f}")))
-            .collect()
-    }
-
-    /// MEASURED (codex 0.156.1, 2026-09-24): the `/status` card's one limit
-    /// row, `Weekly limit: […] 99% left (resets 13:24 on 1 Oct)`, is a window,
-    /// `seven_day` (the key Claude Code's weekly window has), 1% used, its
-    /// reset as painted; the `Context window: 99% left` row above it is no
-    /// limit and is not read.
-    #[test]
-    fn the_codex_status_card_paints_its_weekly_window() {
-        use aterm_phase::codex::fixtures::STATUS;
-        let got = codex_status_windows(&fx::screen(STATUS));
-        assert_eq!(
-            got,
-            vec![PanelWindow {
-                name: String::from("seven_day"),
-                used_pct: 1,
-                reset_text: Some(String::from("13:24 on 1 Oct")),
-            }]
-        );
-        // NEGATIVE CONTROL: Claude Code's reader finds no panel on it.
-        assert!(usage_panel_windows(&fx::screen(STATUS)).is_empty());
-    }
-
-    /// MEASURED (codex 0.163.0, 2026-10-16, the lab, a composed ChatGPT
-    /// login at 5h 30% and weekly 10% used): the card is drawn with no box
-    /// under the `/status` it answers, and read the same: `five_hour` 30%
-    /// used, reset `12:15 PM`, and `seven_day` 10%, reset `11:15 AM on 21 Oct`
-    /// (a 12-hour clock); the `Context window` and `Credits` rows are no
-    /// limit. With the 5h window spent (the same login later) the newer card
-    /// reads it 100% used, under an older card scrolled past its header. The
-    /// lab provider's card says `Limits: data not available yet`: no window.
-    #[test]
-    fn the_codex_0_163_status_card_is_read_without_its_box() {
-        let window = |name: &str, used_pct, reset: &str| PanelWindow {
-            name: name.to_owned(),
-            used_pct,
-            reset_text: Some(reset.to_owned()),
-        };
-        let credits = fx::screen(include_str!(
-            "../../../aterm-phase/src/fixtures/codex-0.163.0-status-card-chatgpt-credits.txt"
-        ));
-        assert_eq!(
-            codex_status_windows(&credits),
-            vec![
-                window("five_hour", 30, "12:15 PM"),
-                window("seven_day", 10, "11:15 AM on 21 Oct"),
-            ]
-        );
-        let spent = fx::screen(include_str!(
-            "../../../aterm-phase/src/fixtures/codex-0.163.0-status-card-chatgpt-credits-in-use.txt"
-        ));
-        assert_eq!(
-            codex_status_windows(&spent),
-            vec![
-                window("five_hour", 100, "12:15 PM"),
-                window("seven_day", 10, "11:15 AM on 21 Oct"),
-            ]
-        );
-        let lab = fx::screen(include_str!(
-            "../../../aterm-phase/src/fixtures/codex-0.163.0-status-card-lab-provider.txt"
-        ));
-        assert!(codex_status_windows(&lab).is_empty(), "no limits painted");
-        // Each reset is the card's clock.
-        for (w, at) in [("12:15 PM", (12, 15)), ("11:15 AM on 21 Oct", (11, 15))] {
-            assert!(
-                matches!(
-                    crate::supervise::limit::parse_card_reset(w),
-                    Some(crate::supervise::limit::ResetSpec::At { hour, minute, .. })
-                        if (hour, minute) == at
-                ),
-                "{w}"
-            );
-        }
-    }
-
-    /// The box-less card's reader ([`unboxed_card`]) refuses what is not the
-    /// card. NEGATIVE CONTROLS, each the measured card with one thing
-    /// changed: no `/status` above its header (a card quoted in a message);
-    /// no row under it that ends it (the card runs off the grid); its header
-    /// not at column 2; the session card Codex opens on (no limit row).
-    #[test]
-    fn the_codex_0_163_card_reader_refuses_what_is_not_the_card() {
-        let credits = fx::screen(include_str!(
-            "../../../aterm-phase/src/fixtures/codex-0.163.0-status-card-chatgpt-credits.txt"
-        ));
-        assert_eq!(codex_status_windows(&credits).len(), 2, "the control");
-        let status = credits
-            .iter()
-            .position(|r| r == "/status")
-            .expect("the command");
-        let mut quoted = credits.clone();
-        quoted[status] = "• Here is my card:".to_string();
-        assert!(codex_status_windows(&quoted).is_empty(), "no /status above");
-        let composer = credits
-            .iter()
-            .rposition(|r| r.starts_with('›'))
-            .expect("the composer");
-        assert!(
-            codex_status_windows(&credits[..composer]).is_empty(),
-            "nothing ends it"
-        );
-        let shifted: Vec<String> = credits
-            .iter()
-            .map(|r| {
-                if r.contains(">_ OpenAI Codex") {
-                    format!("  {r}")
-                } else {
-                    r.clone()
-                }
-            })
-            .collect();
-        assert!(
-            codex_status_windows(&shifted).is_empty(),
-            "the header off column 2"
-        );
-        let idle = fx::screen(include_str!(
-            "../../../aterm-phase/src/fixtures/codex-0.163.0-idle.txt"
-        ));
-        assert!(codex_status_windows(&idle).is_empty(), "the session card");
-    }
-
-    /// Every `<label> limit:` row of the card is a window, keyed by the
-    /// window its label names (`5h` is `five_hour`, `Weekly` `seven_day`,
-    /// another length its label folded); a reset that does not fit beside the
-    /// figure is read off the row under it, alone; a row with no reset has
-    /// none; a full window is 100% used. Of two cards, the lower (the newer)
-    /// is read.
-    #[test]
-    fn every_limit_row_of_the_codex_card_is_a_window() {
-        let card = codex_card(&[
-            "  Context window:   99% left (14.8K used / 258K)",
-            "  5h limit:         [████████████████░░░░] 80% left",
-            "                    (resets 18:05)",
-            "  Weekly limit:     [░░░░░░░░░░░░░░░░░░░░] 0% left (resets 13:24 on 1 Oct)",
-            "  Monthly limit:    [████████████████████] 100% left",
-        ]);
-        let window = |name: &str, used_pct, reset: Option<&str>| PanelWindow {
-            name: name.to_owned(),
-            used_pct,
-            reset_text: reset.map(str::to_owned),
-        };
-        assert_eq!(
-            codex_status_windows(&card),
-            vec![
-                window("five_hour", 20, Some("18:05")),
-                window("seven_day", 100, Some("13:24 on 1 Oct")),
-                window("monthly", 0, None),
-            ]
-        );
-        let older = codex_card(&["  Weekly limit:     [██████████] 50% left (resets 09:00)"]);
-        let both: Vec<String> = older.into_iter().chain(card.clone()).collect();
-        assert_eq!(codex_status_windows(&both).len(), 3, "the newer card");
-    }
-
-    /// The newest completed Codex card owns the reading even when it is the
-    /// session card, which paints no quota. An older `/status` card left in
-    /// the transcript must not supply this card's windows.
-    #[test]
-    fn a_newer_codex_card_without_limits_retires_older_windows() {
-        let older = codex_card(&["  Weekly limit:     [██████████] 50% left"]);
-        assert_eq!(codex_status_windows(&older)[0].used_pct, 50);
-        let newer = codex_card(&["  Model:            GPT-5.6-Luna"]);
-        assert!(codex_status_windows(&newer).is_empty());
-        let both: Vec<String> = older.into_iter().chain(newer).collect();
-        assert!(
-            codex_status_windows(&both).is_empty(),
-            "the newest card paints no quota; the older card is history"
-        );
-    }
-
-    /// An unreadable figure on the newest completed card is unknown, not
-    /// permission to reuse an older card's readable figure. Positive control:
-    /// a newer valid figure replaces the old one as before.
-    #[test]
-    fn an_unreadable_newer_codex_limit_retires_older_windows() {
-        let older = codex_card(&["  Weekly limit:     [██████████] 50% left"]);
-        let valid = codex_card(&["  Weekly limit:     [███████████████] 75% left"]);
-        let valid_pair: Vec<String> = older.iter().cloned().chain(valid).collect();
-        assert_eq!(
-            codex_status_windows(&valid_pair)
-                .into_iter()
-                .map(|window| window.used_pct)
-                .collect::<Vec<_>>(),
-            vec![25],
-            "the newer valid card owns the reading"
-        );
-        let invalid = codex_card(&["  Weekly limit:     [████] 101% left"]);
-        assert!(codex_status_windows(&invalid).is_empty());
-        let both: Vec<String> = older.into_iter().chain(invalid).collect();
-        assert!(
-            codex_status_windows(&both).is_empty(),
-            "the unreadable current quota must not become the older quota"
-        );
-    }
-
-    /// ANOTHER MODEL'S LIMIT on the card (`limit_name`, the accounts design's
-    /// F11; UNMEASURED, laid out as codex-rs's status card lays it: a
-    /// `<name> limit:` row with no figure over its windows, or `<name> <length>
-    /// limit` for a limit with one window) labels its windows by length as
-    /// Codex's own do, and is keyed with its name in front: its `5h` is never
-    /// read as Codex's `five_hour`. NEGATIVE CONTROL: Codex's own windows
-    /// above it keep the bare keys.
-    #[test]
-    fn another_models_limit_on_the_codex_card_keeps_its_own_keys() {
-        let card = codex_card(&[
-            "  5h limit:                    [████████████████░░░░] 80% left (resets 18:05)",
-            "  Weekly limit:                [████████████████████] 99% left",
-            "  GPT-5.3-Codex-Spark limit:",
-            "  5h limit:                    [░░░░░░░░░░░░░░░░░░░░] 0% left (resets 19:00)",
-            "  Weekly limit:                [██████████████████░░] 90% left",
-            "  GPT-5.6-Mini weekly limit:   [███████████████░░░░░] 75% left",
-        ]);
-        let keys: Vec<(String, u32)> = codex_status_windows(&card)
-            .into_iter()
-            .map(|w| (w.name, w.used_pct))
-            .collect();
-        let want = |rows: &[(&str, u32)]| -> Vec<(String, u32)> {
-            rows.iter().map(|(k, u)| ((*k).to_owned(), *u)).collect()
-        };
-        assert_eq!(
-            keys,
-            want(&[
-                ("five_hour", 20),
-                ("seven_day", 1),
-                ("gpt_5_3_codex_spark_five_hour", 100),
-                ("gpt_5_3_codex_spark_seven_day", 10),
-                ("gpt_5_6_mini_seven_day", 25),
-            ])
-        );
-    }
-
-    /// The card's reader refuses what is not the card. NEGATIVE CONTROLS: the
-    /// session card Codex opens on (its header, no limit row); a limit row
-    /// quoted outside a card; a box that is not Codex's; a card whose bottom
-    /// rule is not on the grid; a `(resets …)` row that follows no window;
-    /// and a figure past 100% left.
-    #[test]
-    fn the_codex_card_reader_refuses_what_is_not_the_card() {
-        use aterm_phase::codex::fixtures::IDLE;
-        assert!(
-            codex_status_windows(&fx::screen(IDLE)).is_empty(),
-            "the session card"
-        );
-        assert!(
-            codex_status_windows(&rows(
-                "• Weekly limit:     [████] 99% left (resets 13:24 on 1 Oct)\n"
-            ))
-            .is_empty(),
-            "a quoted row"
-        );
-        let mut other = codex_card(&["  Weekly limit:     [████] 99% left (resets 13:24)"]);
-        other[1] = other[1].replace(">_ OpenAI Codex", ">_ Another Tool ");
-        assert!(codex_status_windows(&other).is_empty(), "not Codex's box");
-        let mut cut = codex_card(&["  Weekly limit:     [████] 99% left (resets 13:24)"]);
-        cut.pop();
-        assert!(codex_status_windows(&cut).is_empty(), "no bottom rule");
-        let stray = codex_card(&[
-            "  Model:            GPT-5.6-Luna",
-            "                    (resets 13:24)",
-            "  Weekly limit:     [████] 99% left",
-        ]);
-        assert_eq!(
-            codex_status_windows(&stray)
-                .into_iter()
-                .map(|w| w.reset_text)
-                .collect::<Vec<_>>(),
-            vec![None],
-            "a reset under no window is no window's"
-        );
-        let past = codex_card(&["  Weekly limit:     [████] 101% left"]);
-        assert!(codex_status_windows(&past).is_empty(), "past 100% left");
-        assert!(codex_status_windows(&[]).is_empty());
     }
 
     // -- the accounts probe's read: the Settings panel, the settled rule ------
@@ -3673,7 +3058,6 @@ mod tests {
     /// seven days ahead, the session's four hours ahead.
     #[test]
     fn a_reset_beyond_its_windows_bound_is_dropped_and_its_figure_kept() {
-        use crate::harness::accounts::{RESET_BELIEVED_S, SESSION_WINDOW_S, STAMP_SKEW_S};
         let sample = |session: Option<&str>, week: Option<&str>| {
             panel_sample(
                 &[
@@ -3687,11 +3071,6 @@ mod tests {
             .expect("a sample")
         };
         let ahead = |at: Option<i64>| at.map(|at| at - READ_AT);
-        // The two bounds, by value: five hours and five minutes; eight days.
-        assert_eq!(
-            (SESSION_WINDOW_S + STAMP_SKEW_S, RESET_BELIEVED_S),
-            (5 * 3600 + 300, 8 * 24 * 3600)
-        );
         // Read at 9:20 PM in the panel's zone, Oct 1.
         let zone = "(America/Los_Angeles)";
         // The session: 1:20am is four hours ahead; a dated reset tomorrow

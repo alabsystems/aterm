@@ -111,39 +111,21 @@ fn mode_1049_round_trip_still_restores_cursor() {
 
 /// xterm CASE_DECSTBM (charproc.c) guards both set_tb_margins and
 /// CursorSet(0,0) behind `if (bot > top)`: a region that is empty or
-/// inverted after defaulting (e.g. CSI 10;10r) must change nothing — not
-/// the margins, not the cursor.
+/// inverted after defaulting changes nothing — not the margins, not the
+/// cursor. A top at/past the screen bottom is invalid once the bottom
+/// defaults to the last row (CSI 28r or CSI 114r on 24 rows).
 #[test]
-fn invalid_decstbm_equal_margins_is_fully_ignored() {
-    let s = run(b"x\x1b[10;10r");
-    assert_eq!(
-        s.cursor(),
-        (0, 1),
-        "cursor must not home on invalid DECSTBM"
-    );
-    assert_eq!(s.row(0), "x");
-}
-
-/// Inverted margins (bottom < top) likewise change nothing.
-#[test]
-fn invalid_decstbm_inverted_margins_is_fully_ignored() {
-    let s = run(b"x\x1b[20;5r");
-    assert_eq!(
-        s.cursor(),
-        (0, 1),
-        "cursor must not home on inverted DECSTBM"
-    );
-}
-
-/// A top at/past the screen bottom is invalid after the bottom defaults to
-/// the last row (xterm: bot defaults to MaxRows, then `bot > top` fails for
-/// CSI 28r or CSI 114r on 24 rows).
-#[test]
-fn invalid_decstbm_top_past_screen_is_fully_ignored() {
-    let s = run(b"x\x1b[28r");
-    assert_eq!(s.cursor(), (0, 1), "CSI 28r on 24 rows must be ignored");
-    let s2 = run(b"x\x1b[114r");
-    assert_eq!(s2.cursor(), (0, 1), "CSI 114r on 24 rows must be ignored");
+fn invalid_decstbm_is_fully_ignored() {
+    for (name, input) in [
+        ("equal margins", &b"x\x1b[10;10r"[..]),
+        ("inverted margins", b"x\x1b[20;5r"),
+        ("top past the screen", b"x\x1b[28r"),
+        ("top far past the screen", b"x\x1b[114r"),
+    ] {
+        let s = run(input);
+        assert_eq!(s.cursor(), (0, 1), "{name}: cursor must not home");
+        assert_eq!(s.row(0), "x", "{name}");
+    }
 }
 
 /// An invalid DECSTBM must also leave a previously set region in force —
@@ -327,7 +309,7 @@ fn mode_1049_save_overwrites_decsc_slot() {
 /// LF after a full bottom row scrolls exactly once and clears the pending
 /// wrap; the next printable overwrites the last column. Only the explicit
 /// SU/SD CSI ops preserve the flag (xtermScroll `save_wrap`). Mirrors the
-/// aterm-grid test `line_feed_always_clears_pending_wrap`.
+/// aterm-grid test `each_operation_keeps_or_consumes_the_parked_wrap`.
 #[test]
 fn scrolling_lf_clears_pending_wrap() {
     // Fill the bottom row to arm pending-wrap, LF scrolls once + clears the flag,
@@ -357,6 +339,18 @@ fn moving_lf_clears_pending_wrap() {
     let s = run(&input);
     assert_eq!(s.cursor(), (1, 79), "'!' printed at (1,79), no wrap");
     assert_eq!(s.row(2), "", "nothing wrapped to row 2");
+}
+
+/// The same under DECSLRM margins: xterm's `xtermIndex` runs `CursorDown`
+/// (by 0) before `xtermScroll` whether or not left/right margins are set, so
+/// an LF that scrolls the margin rectangle clears the wrap too. aterm's
+/// margined LF kept it: `Z` wrapped and scrolled the rectangle a second time.
+#[test]
+fn margined_scrolling_lf_clears_pending_wrap() {
+    let s = run(b"\x1b[?69h\x1b[2;5s\x1b[24;5Ha\nZ");
+    assert_eq!(s.row(22), "    a", "the rectangle scrolled up exactly once");
+    assert_eq!(s.row(23), "    Z", "Z overwrites the right margin, no wrap");
+    assert_eq!(s.cursor(), (23, 4));
 }
 
 /// SU (CSI S) also goes through xtermScroll and preserves the flag.

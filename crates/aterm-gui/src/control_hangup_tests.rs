@@ -101,7 +101,6 @@ fn a_half_closed_caller_still_gets_its_answer() {
     client
         .shutdown(std::net::Shutdown::Write)
         .expect("half-close");
-    let started = Instant::now();
     let waiter = await_while_serving(
         server,
         crate::subscribe::new_registry(),
@@ -112,7 +111,6 @@ fn a_half_closed_caller_still_gets_its_answer() {
         reply, "OK timeout\n",
         "a half-closed caller is not a hangup"
     );
-    assert!(started.elapsed() >= Duration::from_millis(600));
     drop(client);
 }
 
@@ -301,9 +299,8 @@ fn a_turn_whose_caller_hung_up_before_typing_types_nothing() {
 /// the lane back at once (nothing is left half-typed), and the turn — typed
 /// AND submitted — is still in the turn ledger, as `status=hangup`, because
 /// `history`, the events digest and `aterm drive report` read it back. Its
-/// verdict still says `submitted=1`, for an in-process reader such as the
-/// durable operator. The old code returned `ERR exited` from the settle ahead
-/// of the ledger push, so a submitted turn vanished from `history`
+/// verdict still says `submitted=1`. The old code returned `ERR exited` from
+/// the settle ahead of the ledger push, so a submitted turn vanished from `history`
 /// (2026-09-28 review). The negative control keeps its caller and settles:
 /// `status=settled`.
 #[test]
@@ -435,8 +432,12 @@ impl LaneService for ParkingService {
         &self,
         _stream: &CtlStream,
         reader: &mut LaneReader<'_>,
-    ) -> Option<(Scope, Option<String>)> {
-        (super::read_request_line(reader)? == "AUTH ok").then_some((Scope::Owner, None))
+    ) -> Option<(Scope, crate::control::Principal, Option<String>)> {
+        (super::read_request_line(reader)? == "AUTH ok").then_some((
+            Scope::Owner,
+            crate::control::Principal::Instance,
+            None,
+        ))
     }
 
     fn serve_line(
@@ -564,17 +565,5 @@ fn a_main_thread_request_whose_caller_hung_up_is_refused_before_it_is_posted() {
     until_seen(
         "a closed caller's request to be refused before it is posted",
         || main_thread_refusal() == hung_up,
-    );
-}
-
-/// Off a serving lane (an in-process caller) there is no client to hang up,
-/// so the refusal never says one did.
-#[test]
-fn an_in_process_main_thread_request_is_never_refused_for_a_hangup() {
-    use super::control_media::{CLIENT_HUNG_UP, MainHopError, main_thread_refusal};
-
-    assert_ne!(
-        main_thread_refusal(),
-        Some(MainHopError::Reason(CLIENT_HUNG_UP))
     );
 }

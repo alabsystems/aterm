@@ -498,6 +498,28 @@ impl App {
             HostNote::DiskSettingsOff { notes } => {
                 self.except(&message_reporters::disk_settings_entry(&notes));
             }
+            HostNote::DiskFreed { bytes, went } => {
+                self.except(&message_reporters::disk_freed_entry(bytes, &went));
+            }
+            HostNote::DiskFull {
+                free,
+                volume,
+                freed,
+                hogs,
+                why,
+            } => {
+                self.post_message(message_reporters::disk_full(
+                    free, &volume, freed, &hogs, &why,
+                ));
+            }
+            HostNote::DiskFullOver => {
+                self.messages.resolve_key_prefix(
+                    message_reporters::DISK_FULL_KEY,
+                    aterm_messages::Outcome::Ok,
+                    Instant::now(),
+                );
+                aterm_log::info!("harness disk watch: the disk is out of its emergency");
+            }
             HostNote::DiskSettingsRead => {
                 self.host_noted.remove(DISK_CLEANUP_OFF_NOTED);
                 self.except_clear(message_reporters::DISK_SETTINGS_KEY);
@@ -723,13 +745,22 @@ impl App {
     }
 
     /// A tab's relaunch says something about itself ([`RelaunchSay`]): a record
-    /// for a relaunch that keeps failing (and, for a cause only a person clears,
-    /// a line of the digest once it has gone on for an hour) and for the owner's
-    /// own limit; for an agent that cannot be brought back, a record and, where
-    /// no command can be named for the tab's mark, one line of the digest. Its
-    /// end (an agent runs in the tab again) ends every line. Never a mark here.
+    /// for a relaunch that keeps failing — and, where no command is named for
+    /// the tab's mark, one line of the digest at once (LC-5 of
+    /// ATERM-KI-1015-1), save for the harness's own restart, whose record's
+    /// own row speaks (`harness_host::failing_names_command`); else, for a
+    /// cause only a person clears, a line once it has gone on for an hour —
+    /// and for the owner's own limit; for an agent that cannot be brought
+    /// back, a record and, where no command can be named for the tab's mark,
+    /// one line of the digest. Its end (an agent runs in the tab again) ends
+    /// every line but two: a `lost` one, which its conversation held again
+    /// ends ([`RelaunchSay::Back`]), a newer word of the tab, or the tab
+    /// closing; and the line of what a restart did not bring back
+    /// ([`RelaunchSay::NotRestored`], a key of its own), which nothing the
+    /// agent or its conversation does ends — what it lost stays lost — only
+    /// the tab closing. Never a mark here: the host sets it.
     fn note_relaunch(&mut self, sid: &str, said: RelaunchSay) {
-        let [blocked, gone] = message_reporters::relaunch_keys(sid);
+        let [blocked, gone, lost] = message_reporters::relaunch_keys(sid);
         let spot = self.upgrade_spot(sid);
         match said {
             RelaunchSay::Ended => {
@@ -737,9 +768,16 @@ impl App {
                 self.except_clear(&blocked);
                 self.except_clear(&gone);
             }
+            // What the agent's restart did not bring back stays lost though
+            // it runs again: its own key, which no `Ended`, `Back` or newer
+            // word of the tab clears.
+            RelaunchSay::NotRestored => {
+                self.except(&message_reporters::relaunch_not_restored_entry(sid, &spot));
+            }
             RelaunchSay::Failing {
                 blocked_by,
                 restarted,
+                command,
             } => {
                 let text = if restarted {
                     "aterm ended the agent and has not brought it back yet; it is \
@@ -748,7 +786,15 @@ impl App {
                     "the agent exited and its relaunch keeps failing; it is still tried"
                 };
                 self.record_message(message_reporters::relaunch_record(sid, &spot.place, text));
-                if let Some(cause) = blocked_by {
+                // AT ATTENTION (LC-5 of ATERM-KI-1015-1): with a command the
+                // tab's mark says it; with none, the digest's line now — save
+                // the harness's own restart's, which its row speaks for.
+                if command.is_none() && !restarted {
+                    self.host_noted.insert(relaunch_told_key(sid));
+                    self.except(&message_reporters::relaunch_failing_entry(
+                        sid, &spot, blocked_by, restarted,
+                    ));
+                } else if let Some(cause) = blocked_by {
                     self.host_noted.insert(relaunch_told_key(sid));
                     self.except_after(
                         &message_reporters::relaunch_blocked_entry(sid, &spot, cause, restarted),
@@ -768,6 +814,8 @@ impl App {
                 reason,
                 restarted,
                 command,
+                marked,
+                lost: known,
             } => {
                 self.except_clear(&blocked);
                 self.record_message(message_reporters::relaunch_record(
@@ -775,15 +823,45 @@ impl App {
                     &spot.place,
                     &format!("aterm cannot bring the agent back: {reason}"),
                 ));
-                // With a command the tab carries the ask itself; without one the
-                // owner's line is the digest's.
-                if command.is_none() {
+                // With the tab's mark the tab carries the ask itself, and it
+                // is the tab's one word: an earlier word's line goes. Without
+                // one the owner's line is the digest's — keyed by its
+                // conversation where one is known, which that conversation
+                // held again ends (`Back`, LC-4), or its tab closing.
+                if marked {
+                    self.except_clear(&lost);
+                } else {
                     self.host_noted.insert(relaunch_told_key(sid));
-                    self.except(&message_reporters::relaunch_gone_entry(
-                        sid, &spot, &reason, restarted,
-                    ));
+                    if known {
+                        self.except(&message_reporters::relaunch_lost_entry(
+                            sid,
+                            &spot,
+                            &reason,
+                            restarted,
+                            command.as_deref(),
+                        ));
+                    } else {
+                        self.except(&message_reporters::relaunch_gone_entry(
+                            sid, &spot, &reason, restarted,
+                        ));
+                    }
                 }
             }
+            RelaunchSay::SteppedDown {
+                reason,
+                restarted,
+                command,
+            } => {
+                self.host_noted.insert(relaunch_told_key(sid));
+                self.except(&message_reporters::relaunch_lost_entry(
+                    sid,
+                    &spot,
+                    &reason,
+                    restarted,
+                    command.as_deref(),
+                ));
+            }
+            RelaunchSay::Back => self.except_clear(&lost),
         }
     }
 
@@ -934,10 +1012,12 @@ impl App {
         }
     }
 
-    /// A session refused a program's palette set under
-    /// `allow_palette_reconfigure = false` (the engine tells only a session's
-    /// first): one digest line for every tab, never an on-screen alert. Posting
-    /// it again is a duplicate, and a line the owner dismissed stays filed.
+    /// A session refused a program's palette set, which happens only under the
+    /// owner's explicit `allow_palette_reconfigure = false` (palette sets are
+    /// allowed by default; the engine tells only a session's first): one digest
+    /// line for every tab, never an on-screen alert. Posting it again is a
+    /// duplicate, a line the owner dismissed stays filed, and a config that
+    /// allows palette sets again ends it.
     pub(crate) fn note_palette_refused(&mut self) {
         self.except(&message_reporters::palette_refused_entry());
     }
@@ -1022,10 +1102,13 @@ impl App {
         }
     }
 
-    /// A tab's relaunch lines (`not-back`, `gone`) and the claim that would
-    /// raise them are about the agent in a tab: with the tab closed the fact
-    /// cannot be true and nobody can act on it, so they end (the worker of a
-    /// closed tab has no later word to end them).
+    /// A tab's relaunch lines (`not-back`, `gone`, `lost`, `not-restored`) and
+    /// the claim that would raise them are about the agent in a tab: with the
+    /// tab closed the fact cannot be true and nobody can act on it — a `lost`
+    /// line tells a command to run in that tab, a `not-restored` one asks a
+    /// look at it, and both show it — so they end (the worker of a closed tab
+    /// has no later word to end them, and its host forgets the tab's word
+    /// with it).
     pub(crate) fn end_relaunch_lines_of_closed_tabs(&mut self) {
         // Every loop turn comes here (`ripen_exceptions`), and the live tabs'
         // keys cost a string per tab: they are computed only while there is a
@@ -1056,7 +1139,15 @@ impl App {
         let live = self.shown_session_sids();
         let live_keys: std::collections::HashSet<String> = live
             .iter()
-            .flat_map(|sid| message_reporters::relaunch_keys(sid))
+            .flat_map(|sid| {
+                let [blocked, gone, lost] = message_reporters::relaunch_keys(sid);
+                [
+                    blocked,
+                    gone,
+                    lost,
+                    message_reporters::relaunch_not_restored_key(sid),
+                ]
+            })
             .collect();
         keys.sort();
         keys.dedup();
@@ -1078,7 +1169,12 @@ impl App {
     /// again would have been noted within that time, and a survey that is still
     /// open is told again by the successor's first look. A line this process does
     /// hold ([`Self::supervisor_failing`], [`Self::host_noted`]) is left to its
-    /// own end.
+    /// own end. A `lost` line an earlier process left ends so too, though its
+    /// conversation may still be lost: the handoff carries no word of it to
+    /// this process's host, so nothing here would ever end it (a residual,
+    /// stated: the word lapses at a seamless update). A `not-restored` line
+    /// is no process's word but a fact (what a restart did not bring back):
+    /// it stands, to its tab's close or the owner's look.
     pub(crate) fn sweep_adopted_supervisor_lines(&mut self) {
         // The keys THIS process holds, computed from the ids it holds them
         // under: an id is never read back out of a key (a key shortens a
@@ -1111,8 +1207,8 @@ impl App {
             else {
                 continue;
             };
-            let process_held =
-                matches!(cause, "failing" | "not-back" | "gone") || cause.starts_with("survey-");
+            let process_held = matches!(cause, "failing" | "not-back" | "gone" | "lost")
+                || cause.starts_with("survey-");
             if process_held && !held.contains(&key) {
                 aterm_log::info!(
                     "exceptions: {key} was an earlier run's; nothing has told of it since"
@@ -1124,7 +1220,7 @@ impl App {
 
     /// The session id (`s-3e79`) of the pool session `local`, if it is
     /// registered.
-    fn session_sid(&self, local: u64) -> Option<String> {
+    pub(crate) fn session_sid(&self, local: u64) -> Option<String> {
         let store = self.store.read().unwrap_or_else(|p| p.into_inner());
         store
             .by_local(local)
@@ -1309,13 +1405,14 @@ fn renew_label(exception: &aterm_agent::supervise::policy::exception::Exception)
         .map(str::to_string)
 }
 
-/// Whether `key` is a `harness.supervisor.<subject>.not-back|gone` key: a
-/// tab's relaunch line. Its subject may be a shortened form of the session id,
-/// so it names no tab; compare it with `message_reporters::relaunch_keys`.
+/// Whether `key` is a `harness.supervisor.<subject>.not-back|gone|lost|
+/// not-restored` key: a tab's relaunch line. Its subject may be a shortened
+/// form of the session id, so it names no tab; compare it with
+/// `message_reporters::relaunch_keys` and `relaunch_not_restored_key`.
 fn is_relaunch_key(key: &str) -> bool {
     key.strip_prefix(&Family::Supervisor.prefix())
         .and_then(|rest| rest.rsplit_once('.'))
-        .is_some_and(|(_, cause)| matches!(cause, "not-back" | "gone"))
+        .is_some_and(|(_, cause)| matches!(cause, "not-back" | "gone" | "lost" | "not-restored"))
 }
 
 #[cfg(test)]
@@ -1674,8 +1771,8 @@ mod tests {
 
     /// THE PAGE'S OWN DISMISS BUTTONS (owner rule, 2026-09-28): every open entry
     /// offers `Dismiss` (files that one) and, with two or more open, the first
-    /// offers `Dismiss all`; each press is flushed to the log and worded for the
-    /// page; a settled entry offers neither; a stale press is `Gone`.
+    /// offers `Dismiss all`; each press is flushed to the log; a settled entry
+    /// offers neither; a stale press is `Gone`.
     #[test]
     fn the_page_dismisses_one_entry_or_all_of_them() {
         use crate::native_app::MessageActOutcome;
@@ -1693,9 +1790,9 @@ mod tests {
         assert_eq!(open.len(), 2);
         for e in &open {
             assert!(
-                e.actions.iter().any(|a| a.index == DISMISS_ACTION
-                    && a.label == "Dismiss"
-                    && a.still_actionable),
+                e.actions
+                    .iter()
+                    .any(|a| a.index == DISMISS_ACTION && a.still_actionable),
                 "every open entry offers Dismiss: {:?}",
                 e.actions
             );
@@ -1707,11 +1804,11 @@ mod tests {
         assert_eq!(all_on.len(), 1, "only the first offers Dismiss all");
         assert!(std::ptr::eq(*all_on[0], open[0]));
 
-        // One entry: filed, the other stays, the page is worded.
+        // One entry: filed, the other stays.
         let (first, second) = (open[0].id, open[1].id);
         let outcome = app.perform_message_act(crate::WindowId(0), first, DISMISS_ACTION);
         assert!(
-            matches!(&outcome, MessageActOutcome::Performed { feedback } if feedback == "Filed in the log"),
+            matches!(&outcome, MessageActOutcome::Performed { .. }),
             "{outcome:?}"
         );
         assert_eq!(app.messages.digest().len(), 1);
@@ -1739,7 +1836,7 @@ mod tests {
         // The last one goes with Dismiss all when it is asked from any open entry.
         let outcome = app.perform_message_act(crate::WindowId(0), second, DISMISS_ALL_ACTION);
         assert!(
-            matches!(&outcome, MessageActOutcome::Performed { feedback } if feedback == "Filed 1 in the log"),
+            matches!(&outcome, MessageActOutcome::Performed { .. }),
             "{outcome:?}"
         );
         assert!(app.messages.digest().is_empty());
@@ -1787,23 +1884,5 @@ mod tests {
             ),
         );
         assert_eq!(app.demotions_logged, 3, "an over-long hold is cut and said");
-    }
-
-    /// The menu bar and Settings read one digest: the glance's lines are the
-    /// digest's entries in the digest's order.
-    #[test]
-    fn the_menu_bar_reads_the_digest() {
-        let mut app = App::headless_for_test();
-        app.except(&full_disk_access());
-        app.except_replace(Family::Upgrade, &[tab_one()]);
-        let lines: Vec<String> = app
-            .messages
-            .digest()
-            .entries
-            .into_iter()
-            .map(|e| e.title)
-            .collect();
-        assert_eq!(lines.len(), 2);
-        assert!(lines.contains(&"macOS keeps asking for access".to_string()));
     }
 }

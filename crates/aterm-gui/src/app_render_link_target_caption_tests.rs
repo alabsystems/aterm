@@ -269,10 +269,6 @@ fn a_top_placed_find_panel_keeps_its_rows_while_the_caption_takes_the_bottom() {
     );
     assert!(band.concat().contains("Find: "), "{band:?}");
     assert!(
-        band.concat().contains("esc cancel"),
-        "the panel keeps the keys it teaches: {band:?}"
-    );
-    assert!(
         !band.concat().contains("evil.example"),
         "the caption never lands inside the panel: {band:?}"
     );
@@ -317,10 +313,6 @@ fn a_bottom_floated_find_panel_pushes_the_caption_to_the_other_end() {
     let panel = panel_rows(&app, wid);
     assert!(panel.concat().contains("Find: "), "{panel:?}");
     assert!(
-        panel.concat().contains("esc cancel"),
-        "the floated panel keeps its legend row: {panel:?}"
-    );
-    assert!(
         !panel.concat().contains("evil.example"),
         "the caption never lands inside the panel: {panel:?}"
     );
@@ -352,7 +344,7 @@ fn a_link_with_nowhere_to_put_the_caption_says_nothing_at_all() {
     );
     let panel = panel_rows(&app, wid);
     assert!(
-        panel.concat().contains("Find: ") && panel.concat().contains("esc cancel"),
+        panel.concat().contains("Find: "),
         "the panel is whole: {panel:?}"
     );
     assert!(

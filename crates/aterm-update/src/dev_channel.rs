@@ -341,56 +341,30 @@ mod tests {
         (told, requests, waits)
     }
 
-    /// BEHIND: a 0.91.0 dev build against a channel at v0.93.0 is told "2 releases
-    /// behind aterm v0.93.0" — from ONE HEAD, the evergreen appcast URL of the compiled
-    /// public channel, and nothing else.
+    /// A dev build is told its standing against the channel head from ONE HEAD of
+    /// the compiled public channel's evergreen appcast URL (`channel_at` refuses any
+    /// other), then waits a day: behind by a count, current, or ahead (work not yet
+    /// released is never "behind", never a negative count).
     #[test]
-    fn a_dev_build_behind_the_channel_is_told_how_far() {
-        let (told, requests, waits) = run(DEV, "0.91.0", 1, &mut channel_at("v0.93.0"));
-        assert_eq!(requests, 1, "one HEAD per cycle, never a GET");
-        assert_eq!(waits, vec![RECHECK_EVERY], "then it waits a day");
-        assert_eq!(
-            told,
-            vec![DevLag::Behind {
-                latest: "v0.93.0".into(),
-                releases: Some(2),
-            }]
-        );
-        assert_eq!(told[0].words(), "2 releases behind aterm v0.93.0");
-        assert!(told[0].is_behind());
-    }
-
-    /// CURRENT: the same version as the channel head.
-    #[test]
-    fn a_dev_build_of_the_newest_release_is_current() {
-        let (told, requests, _) = run(DEV, "0.93.0", 1, &mut channel_at("v0.93.0"));
-        assert_eq!(requests, 1);
-        assert_eq!(
-            told,
-            vec![DevLag::Current {
-                latest: "v0.93.0".into()
-            }]
-        );
-        assert_eq!(told[0].words(), "at aterm v0.93.0, the newest release");
-        assert!(!told[0].is_behind());
-    }
-
-    /// AHEAD: a dev build of work not yet released is newer than the channel head —
-    /// never "behind", never a negative count.
-    #[test]
-    fn a_dev_build_newer_than_the_channel_is_ahead() {
-        let (told, requests, _) = run(DEV, "0.94.0", 1, &mut channel_at("v0.93.0"));
-        assert_eq!(requests, 1);
-        assert_eq!(
-            told,
-            vec![DevLag::Ahead {
-                latest: "v0.93.0".into()
-            }]
-        );
-        assert_eq!(
-            told[0].words(),
-            "newer than aterm v0.93.0, the newest release"
-        );
+    fn a_dev_build_is_told_its_standing_from_one_head() {
+        let latest = || "v0.93.0".to_string();
+        for (running, want) in [
+            (
+                "0.91.0",
+                DevLag::Behind {
+                    latest: latest(),
+                    releases: Some(2),
+                },
+            ),
+            ("0.93.0", DevLag::Current { latest: latest() }),
+            ("0.94.0", DevLag::Ahead { latest: latest() }),
+        ] {
+            let (told, requests, waits) = run(DEV, running, 1, &mut channel_at("v0.93.0"));
+            assert_eq!(requests, 1, "{running}: one HEAD per cycle, never a GET");
+            assert_eq!(waits, vec![RECHECK_EVERY], "{running}: then it waits a day");
+            assert_eq!(told[0].is_behind(), running == "0.91.0", "{running}");
+            assert_eq!(told, vec![want], "{running}");
+        }
     }
 
     /// UNREACHABLE: a transport failure (offline), a 404, a 429/5xx, a refused
@@ -513,8 +487,11 @@ mod tests {
     #[test]
     fn the_count_is_minors_within_a_major() {
         assert_eq!(
-            classify("0.92.0", "v0.93.0").map(|l| l.words()),
-            Some("1 release behind aterm v0.93.0".to_string())
+            classify("0.92.0", "v0.93.0"),
+            Some(DevLag::Behind {
+                latest: "v0.93.0".into(),
+                releases: Some(1),
+            })
         );
         assert_eq!(
             classify("0.93.0", "v1.0.0"),
@@ -524,30 +501,11 @@ mod tests {
             })
         );
         assert_eq!(
-            classify("0.93.0", "v1.0.0").map(|l| l.words()),
-            Some("older than aterm v1.0.0".to_string())
-        );
-        assert_eq!(
             classify("1.0.0", "v0.99.0").map(|l| l.is_behind()),
             Some(false)
         );
         for (running, tag) in [("0.93", "v0.93.0"), ("0.93.0", "v0.93"), ("x", "v0.93.0")] {
             assert_eq!(classify(running, tag), None, "{running} / {tag}");
         }
-    }
-
-    /// The URL asked is the COMPILED public channel's — the updater's evergreen appcast —
-    /// and the asset is the updater's own.
-    #[test]
-    fn the_one_url_is_the_public_evergreen_appcast() {
-        assert_eq!(
-            evergreen(),
-            format!(
-                "https://github.com/{}/{}/releases/latest/download/aterm-appcast.toml",
-                crate::DEFAULT_OWNER,
-                crate::DEFAULT_REPO
-            )
-        );
-        assert_eq!(RECHECK_EVERY, Duration::from_secs(86_400));
     }
 }

@@ -22,7 +22,7 @@
 //! [`WAKE_TIMER_REPEAT_SECS`], a year: any survivable lateness costs one step.
 //! After firing, the timer is spent (next date a year out) until re-armed; the
 //! callout records that, so [`WakePlan`] never trusts a stale "already armed
-//! for now" (model: `aterm_spec::derive::run_loop_waker_model`).
+//! for now" (model: `aterm_models_core::run_loop_waker_model`).
 //!
 //! This is the only place that creates a run-loop timer: the `runloop-timer`
 //! guard of `aterm-census --guards` fences `CFRunLoopTimerCreate` and the
@@ -41,9 +41,9 @@ use crate::declare::MainThread;
 
 /// The repeat interval handed to CoreFoundation, in seconds: one Julian year.
 ///
-/// Not a cadence: it bounds CoreFoundation's catch-up walk
-/// ([`cf_catch_up_steps`]), so shorter lateness costs one step however long the
-/// process was stopped. CoreFoundation clamps intervals above ~16 years, so
+/// Not a cadence: it bounds CoreFoundation's catch-up walk (the loop in the
+/// module docs), so shorter lateness costs one step however long the process
+/// was stopped. CoreFoundation clamps intervals above ~16 years, so
 /// this is honoured as written.
 pub const WAKE_TIMER_REPEAT_SECS: f64 = 31_557_600.0;
 
@@ -147,54 +147,6 @@ impl WakePlan {
             WakeTarget::At(at) => WakeArm::At(at),
         }
     }
-}
-
-/// How many times CoreFoundation's catch-up walk runs for a repeating timer that
-/// fires `lag_ticks` after its due date, at `interval_ticks` per repeat (the
-/// loop in the module docs). `None` for a zero interval, which CoreFoundation
-/// refuses by halting the process.
-#[must_use]
-pub const fn cf_catch_up_steps(lag_ticks: u64, interval_ticks: u64) -> Option<u64> {
-    if interval_ticks == 0 {
-        return None;
-    }
-    Some(lag_ticks / interval_ticks + 1)
-}
-
-/// `secs` in ticks of a clock running at `ticks_per_sec`, truncated as
-/// CoreFoundation's `__CFTimeIntervalToTSR` truncates (0.1 µs is 2 ticks, not
-/// 2.4, at Apple silicon's 24 MHz).
-#[must_use]
-pub fn interval_ticks(secs: f64, ticks_per_sec: f64) -> u64 {
-    let ticks = secs * ticks_per_sec;
-    if ticks.is_nan() || ticks <= 0.0 {
-        0
-    } else if ticks >= u64::MAX as f64 {
-        u64::MAX
-    } else {
-        ticks as u64
-    }
-}
-
-/// `mach_absolute_time`'s rate on this machine, in ticks per second.
-#[must_use]
-pub fn mach_ticks_per_sec() -> f64 {
-    #[repr(C)]
-    struct TimebaseInfo {
-        numer: u32,
-        denom: u32,
-    }
-    unsafe extern "C" {
-        fn mach_timebase_info(info: *mut TimebaseInfo) -> i32;
-    }
-    let mut info = TimebaseInfo { numer: 0, denom: 0 };
-    // SAFETY: `info` is a live, correctly laid out out-parameter.
-    let ok = unsafe { mach_timebase_info(&raw mut info) };
-    if ok != 0 || info.numer == 0 || info.denom == 0 {
-        // Nanosecond ticks: the rate every Intel Mac reports.
-        return 1e9;
-    }
-    1e9 * f64::from(info.denom) / f64::from(info.numer)
 }
 
 // The timer's half of CoreFoundation stays here (the `runloop-timer` guard);
@@ -410,24 +362,6 @@ impl Drop for WakeTimer {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The interval bounds CoreFoundation's catch-up walk: at 0.1 µs a 26.6 h
-    /// stop costs ~10¹² steps.
-    #[test]
-    fn a_week_of_lateness_costs_the_waker_one_catch_up_step() {
-        let rate = mach_ticks_per_sec();
-        let week = interval_ticks(7.0 * 86_400.0, rate);
-        let ours = interval_ticks(WAKE_TIMER_REPEAT_SECS, rate);
-        assert!(ours > 0, "a zero-tick interval makes CoreFoundation halt");
-        assert_eq!(cf_catch_up_steps(week, ours), Some(1));
-        // A 0.1 µs interval, priced the same way.
-        let historical = interval_ticks(0.000_000_1, rate);
-        let incident = interval_ticks(95_674.0, rate);
-        assert!(
-            cf_catch_up_steps(incident, historical).unwrap() > 1_000_000_000,
-            "the 0.1 µs waker walked ~10¹² steps for the 2026-09-26 gap"
-        );
-    }
 
     #[test]
     fn a_spent_timer_is_re_armed_for_an_unchanged_request() {

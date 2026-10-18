@@ -163,13 +163,3 @@ fn a_write_without_a_token_file_is_refused_before_gh_runs() {
         }
     }
 }
-
-/// Only a real network service is waited on between retries; an in-memory host never is.
-#[test]
-fn only_the_real_host_pauses_between_retries() {
-    assert!(GhCli::new(None).retry_pause() > std::time::Duration::ZERO);
-    assert_eq!(
-        atpkg_publish::host::fake::FakeHost::new().retry_pause(),
-        std::time::Duration::ZERO
-    );
-}

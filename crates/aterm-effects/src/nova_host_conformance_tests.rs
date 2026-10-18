@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 bind for `NovaPhase` (`aterm_spec::derive::nova_phase_model`) on the
+//! Tier-1 bind for `NovaPhase` (`aterm_models_effects::nova_phase_model`) on the
 //! host: the real `WordDecorations` engine over a real terminal holding a
 //! profanity word in the classic nova style, ticked at 1 ms through three arms
 //! and everything between them.
@@ -32,7 +32,8 @@
 
 use std::collections::BTreeMap;
 
-use aterm_spec::derive::{Model, nova_phase_model};
+use aterm_models_effects::nova_phase_model;
+use aterm_spec::derive::Model;
 use aterm_spec::{interp, verify};
 
 use super::*;

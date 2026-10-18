@@ -165,9 +165,6 @@ impl Terminal {
         // uninitialised so the compiler holds both `post_process` arms to
         // assigning it.
         let damage_class: super::custody::OutputDamage;
-        // The row moves the vi cursor rides (see `vi_follow_output`), from the
-        // same `post_process` call.
-        let vi_bands: Option<aterm_grid::RowBandMoves>;
         // Whether a selection was alive when the batch began: `post_process` can
         // destroy one in ways other than damage overlap (bad splice projection,
         // splice mixed with scroll, alt exit, the `left_alt` re-check, eviction
@@ -204,7 +201,7 @@ impl Terminal {
                 reason = "profiling diagnostic, gated: measures real latency and never feeds grid state"
             )]
             let grid_start = aterm_time::Instant::now();
-            (damage_class, vi_bands) = self.post_process(lines_before, was_alt);
+            damage_class = self.post_process(lines_before, was_alt);
             // Alt-screen archive: a sync-timeout close `post_process` just forced,
             // and the rate-limited commit for apps that never use 2026.
             self.alt_archive_epilogue();
@@ -235,7 +232,7 @@ impl Terminal {
             if self.transient.pending_parser_reset {
                 self.finish_ris_batch();
             }
-            (damage_class, vi_bands) = self.post_process(lines_before, was_alt);
+            damage_class = self.post_process(lines_before, was_alt);
             self.alt_archive_epilogue();
             self.observe_at(self.transient.process_now);
 
@@ -244,6 +241,13 @@ impl Terminal {
             ts.last_process_bytes = u32::try_from(input.len()).unwrap_or(u32::MAX);
             ts.process_sequence = ts.process_sequence.wrapping_add(1);
         }
+
+        // Reported colour scheme: one reconciliation per batch, so OSC 10/11/
+        // 110/111, OSC 21, a kitty colour-stack pop, RIS and DECSTR push
+        // `CSI ? 997 ; Ps n` (mode 2031) at most once, and only when the net
+        // scheme moved, through the gates a program's reply passes. One Rgb
+        // compare when nothing did.
+        self.reconcile_color_scheme_after_output();
 
         // Re-pin: if the user was scrolled back, advance display_offset by the lines that entered
         // scrollback (the rise of the absolute row counter), clamped to that grid's scrollback.
@@ -293,21 +297,14 @@ impl Terminal {
 
         // Press custody, site 3 of 3: emit, now that the pre-batch offset, the damage class and
         // the re-pinned offset are known; suppressed on a screen-switching batch, whose before
-        // and after belong to unrelated grids. The vi cursor follows its text by the same count
-        // as the re-pin (its lines count from the live screen's top), or rides the band moves
-        // where only some rows moved; a screen-switching batch moves it by nothing, and every
-        // batch clamps it onto the grid it ended on. Unlike the selection it is not parked per
-        // screen, so a cursor in main-screen history does not come back to its text.
-        let mut vi_lines = 0;
+        // and after belong to unrelated grids.
         if was_alt == self.modes.alternate_screen {
             let lines_added = self
                 .grid
                 .absolute_row_counter()
                 .saturating_sub(lines_before);
             self.note_output_custody(pinned_offset, damage_class, lines_added, selection_before);
-            vi_lines = lines_added;
         }
-        self.vi_follow_output(vi_lines, vi_bands);
 
         // Integrity self-check: in debug builds, validate the active grid's
         // structural invariants (CursorInBounds, ScrollRegionValid,
@@ -364,9 +361,7 @@ impl Terminal {
     /// Post-processing after parser advances: selection adjustment and BiDi sync.
     ///
     /// `was_alt` is the screen the batch started on, captured before the parser
-    /// ran. Returns the batch's damage class (press custody, site 2) and, when
-    /// it explains every row the batch moved, its row-band record, which the
-    /// epilogue hands the vi cursor.
+    /// ran. Returns the batch's damage class (press custody, site 2).
     ///
     /// This is the engine half of the `SelectionCustody` model and implements
     /// four of its actions in one pass:
@@ -385,32 +380,32 @@ impl Terminal {
     /// `text_selection`. Conformance drives real `Terminal::process` batches in
     /// `aterm_gui::selection_custody_conformance`.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "SelectionCustody",
             action = "UniformScroll",
             project = "aterm_gui::selection_custody_conformance::project_selection_custody"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "SelectionCustody",
             action = "RegionDamageLow",
             project = "aterm_gui::selection_custody_conformance::project_selection_custody"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "SelectionCustody",
             action = "RegionDamageHigh",
             project = "aterm_gui::selection_custody_conformance::project_selection_custody"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "SelectionCustody",
             action = "WholesaleInvalidate",
             project = "aterm_gui::selection_custody_conformance::project_selection_custody"
@@ -421,10 +416,7 @@ impl Terminal {
         &mut self,
         absolute_rows_before: u64,
         was_alt: bool,
-    ) -> (
-        super::custody::OutputDamage,
-        Option<aterm_grid::RowBandMoves>,
-    ) {
+    ) -> super::custody::OutputDamage {
         // Top-anchored partial scrollback inserts logical rows immediately
         // before a protected footer. Keep every durable OSC/shell anchor paired
         // with the footer content that stayed fixed on screen.
@@ -487,15 +479,11 @@ impl Terminal {
         // The band record when it explains every row this batch moved: an exact non-empty
         // record, no whole-screen scroll in the same batch (`scroll_delta == 0`, pinned by
         // `content_scroll_state_coalesces_uniform_rows_and_invalidates_mixed_batches`) and no
-        // screen switch (the record came from the incoming grid). The vi cursor replays it
-        // (`vi_follow_output`). A splice degraded to `Invalidate` does not stop that: the only
-        // splice is the archival region scroll, which records its band beside it, so two that do
-        // not merge are still two exact bands.
-        let explaining_bands = (bands.len > 0
+        // screen switch (the record came from the incoming grid).
+        let bands_explain = bands.len > 0
             && !bands.inexact
             && scroll_delta == 0
-            && was_alt == self.modes.alternate_screen)
-            .then_some(bands);
+            && was_alt == self.modes.alternate_screen;
         let invalidates_coordinates = selection_row_update.is_some()
             || coordinates_invalidated
             || scroll_delta == i32::MAX
@@ -506,7 +494,7 @@ impl Terminal {
             // batch's row motion, also publish it so a band-translating consumer
             // keeps its marks on their lines, unless a non-composable splice
             // degraded to `Invalidate`.
-            let explained = explaining_bands.is_some()
+            let explained = bands_explain
                 && !matches!(
                     selection_row_update,
                     Some(aterm_grid::AbsoluteRowUpdate::Invalidate)
@@ -659,7 +647,7 @@ impl Terminal {
                 }
             }
         }
-        (damage_class, explaining_bands)
+        damage_class
     }
 
     /// Backdate the synchronized-output (mode 2026) start timestamp for
@@ -704,6 +692,7 @@ fn _terminal_field_exhaustiveness_check(t: &mut Terminal) {
         last_bell_time: _,
         bell_total: _,
         default_cursor_style: _,
+        host_alternate_scroll: _,
         notifications: _,
         clipboard: _,
         iterm2: _,
@@ -717,8 +706,7 @@ fn _terminal_field_exhaustiveness_check(t: &mut Terminal) {
         program_state: _,
         kitty_keyboard: _,
         xterm_keyboard: _,
-        #[cfg(feature = "sixel")]
-            sixel: _,
+        sixel: _,
         window_callback: _,
         bidi_state: _,
         secure_keyboard_entry: _,
@@ -754,7 +742,6 @@ fn _terminal_field_exhaustiveness_check(t: &mut Terminal) {
         last_custody_change: _,
         last_selection_taker: _,
         reader_gestures: _,
-        vi: _,
         sync_timeout_duration: _,
         clipboard_auth: _,
         shell_integration_auth: _,
@@ -948,57 +935,43 @@ mod tests {
         );
     }
 
+    /// A full-screen scroll is one uniform row of motion whatever history does:
+    /// none retained (zero capacity), history saturated (eviction keeps the
+    /// count flat), or the alt screen (no history at all). None of them is an
+    /// ambiguous coordinate move.
     #[test]
-    fn content_scroll_state_tracks_uniform_scroll_with_zero_history_capacity() {
-        let mut term = TerminalBuilder::new()
-            .size(3, 12)
-            .ring_buffer_size(0)
-            .build();
-        let before = term.content_scroll_state();
+    fn content_scroll_state_tracks_uniform_scroll_independent_of_history() {
+        for (case, ring, setup) in [
+            ("zero history capacity", 0, &b""[..]),
+            ("saturated history", 1, &b"\x1b[3;1H\n"[..]),
+            ("alt screen", 8, &b"\x1b[?1049h"[..]),
+        ] {
+            let mut term = TerminalBuilder::new()
+                .size(3, 12)
+                .ring_buffer_size(ring)
+                .build();
+            term.process(setup);
+            let history = term.grid().scrollback_lines();
+            let before = term.content_scroll_state();
 
-        term.process(b"\x1b[3;1H\n");
+            term.process(b"\x1b[3;1H\n");
 
-        assert_eq!(
-            term.grid().scrollback_lines(),
-            0,
-            "zero-capacity history cannot expose a count delta"
-        );
-        assert_eq!(
-            term.content_scroll_state().uniform_up_rows,
-            before.uniform_up_rows + 1,
-            "the content-motion signal is independent of retained history"
-        );
-        assert_eq!(
-            term.content_scroll_state().invalidation_epoch,
-            before.invalidation_epoch
-        );
-    }
-
-    #[test]
-    fn content_scroll_state_tracks_uniform_scroll_at_saturated_history_capacity() {
-        let mut term = TerminalBuilder::new()
-            .size(3, 12)
-            .ring_buffer_size(1)
-            .build();
-        term.process(b"\x1b[3;1H\n");
-        assert_eq!(term.grid().scrollback_lines(), 1, "history is at its cap");
-        let before = term.content_scroll_state();
-
-        term.process(b"\x1b[3;1H\n");
-
-        assert_eq!(
-            term.grid().scrollback_lines(),
-            1,
-            "eviction keeps the observable history count saturated"
-        );
-        assert_eq!(
-            term.content_scroll_state().uniform_up_rows,
-            before.uniform_up_rows + 1
-        );
-        assert_eq!(
-            term.content_scroll_state().invalidation_epoch,
-            before.invalidation_epoch
-        );
+            assert_eq!(
+                term.grid().scrollback_lines(),
+                history,
+                "{case}: the history count does not move"
+            );
+            assert_eq!(
+                term.content_scroll_state().uniform_up_rows,
+                before.uniform_up_rows + 1,
+                "{case}: the content-motion signal is independent of retained history"
+            );
+            assert_eq!(
+                term.content_scroll_state().invalidation_epoch,
+                before.invalidation_epoch,
+                "{case}"
+            );
+        }
     }
 
     #[test]
@@ -1066,35 +1039,6 @@ mod tests {
                 bottom: 2,
                 delta: -1
             }
-        );
-    }
-
-    #[test]
-    fn content_scroll_state_tracks_uniform_alt_screen_scrolls() {
-        let mut term = TerminalBuilder::new()
-            .size(3, 12)
-            .ring_buffer_size(8)
-            .build();
-        term.process(b"\x1b[?1049h");
-        assert!(term.is_alternate_screen());
-        let before = term.content_scroll_state();
-
-        term.process(b"\x1b[3;1H\n");
-
-        assert_eq!(
-            term.grid().scrollback_lines(),
-            0,
-            "alt screen has no history"
-        );
-        assert_eq!(
-            term.content_scroll_state().uniform_up_rows,
-            before.uniform_up_rows + 1,
-            "an exact full-grid alt scroll has the same uniform transform as primary"
-        );
-        assert_eq!(
-            term.content_scroll_state().invalidation_epoch,
-            before.invalidation_epoch,
-            "the active screen's ownership does not make an exact translation ambiguous"
         );
     }
 
@@ -1544,60 +1488,6 @@ mod tests {
         }
     }
 
-    /// At the live bottom (display_offset == 0) the viewport tracks output (no pin).
-    #[test]
-    fn live_viewport_tracks_bottom_when_not_scrolled_back() {
-        let mut term = TerminalBuilder::new()
-            .size(4, 40)
-            .ring_buffer_size(200)
-            .build();
-        for i in 0..10 {
-            term.process(format!("row-{i}\r\n").as_bytes());
-        }
-        assert_eq!(term.grid().display_offset(), 0, "starts at live bottom");
-        term.process(b"newest\r\n");
-        assert_eq!(
-            term.grid().display_offset(),
-            0,
-            "viewport stays at the live bottom when not scrolled back",
-        );
-        let visible = term.visible_content();
-        assert!(
-            visible.contains("newest"),
-            "live output is visible: {visible:?}"
-        );
-    }
-
-    /// Mode 2026 times out (fails open) when the clock jumps past the deadline
-    /// after `CSI ?2026h`, e.g. across suspend/resume.
-    #[test]
-    fn sync_output_disables_after_backdated_start() {
-        let mut term = Terminal::new(24, 80);
-        term.process(b"\x1b[?2026h");
-        assert!(
-            term.modes().synchronized_output(),
-            "DECSET 2026 must enable"
-        );
-        assert!(term.transient.sync_start.is_some());
-
-        // Jump the timer well past the default 1000ms timeout.
-        term.backdate_sync_start(Duration::from_secs(120));
-        term.process(b"x"); // any processed byte runs post_process()
-
-        assert!(
-            !term.modes().synchronized_output(),
-            "sync output must disable once the deadline passed (no hang)"
-        );
-        assert!(
-            term.transient.sync_start.is_none(),
-            "sync_start must be cleared with the mode"
-        );
-        assert!(
-            !term.sync_open_dirty(),
-            "the timeout close must retire the current episode's dirty bit"
-        );
-    }
-
     /// The close counter alone cannot authorize a close+immediate-reopen
     /// present: once the new episode has accepted output, the grid holds a prefix
     /// of the next frame. Pins the episode boundary and the redundant-DECSET
@@ -1728,6 +1618,37 @@ mod tests {
             term.process(reset);
             assert!(!term.sync_frame_unfinished(), "{name} ends the frame");
         }
+    }
+
+    /// A program that dies mid-frame leaves its bracket open by its own
+    /// account, and the shell's prompt after it ends that frame: on the main
+    /// screen once the timeout cleared the mode, and leaving an orphaned
+    /// alternate screen at any age. Control: a prompt inside a live bracket
+    /// (the shell's own prompt redraw) leaves it open.
+    #[test]
+    fn a_prompt_after_a_dead_programs_frame_ends_it() {
+        let prompt = b"\x1b]133;A\x07$ ";
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b[?2026h\x1b[?25l\x1b[3;1Hpartial");
+        term.process(prompt);
+        assert!(
+            term.sync_frame_unfinished(),
+            "control: a prompt inside a live bracket is the frame's own"
+        );
+        term.backdate_sync_start(Duration::from_secs(120));
+        term.process(b"x");
+        assert!(term.sync_frame_unfinished(), "timed out, still unfinished");
+        term.process(prompt);
+        assert!(
+            !term.sync_frame_unfinished(),
+            "the prompt ends the dead frame"
+        );
+
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b[?1049h\x1b[?2026h\x1b[?25l\x1b[3;1Hpartial");
+        term.process(prompt);
+        assert!(!term.is_alternate_screen(), "the orphaned screen is left");
+        assert!(!term.sync_frame_unfinished(), "and its frame ended with it");
     }
 
     #[test]

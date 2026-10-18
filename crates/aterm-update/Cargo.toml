@@ -10,11 +10,6 @@ repository.workspace = true
 description = "aterm — signature-pinned in-app updater: stages verified releases and hands the live session to the new build in place."
 
 [features]
-default = []
-# Compile the shipping source↔spec anchors for cross-crate inventory collection.
-# Tests always compile the same anchors through `cfg(test)`; the default updater
-# build keeps the specification machinery out of the shipped dependency graph.
-spec-anchors = ["dep:aterm-spec"]
 # Development seams in an optimized build — forwarded to the crate that reads them
 # (`aterm-update-core`: ATERM_UPDATE_ROOT, the `[update]` repoint). The release cutter
 # never enables this; aterm-release's buildplan pins that.
@@ -29,6 +24,8 @@ serde = { workspace = true, features = ["derive"] }
 aterm-json = { workspace = true }
 # renamex_np(RENAME_SWAP) for the atomic bundle swap.
 libc = { workspace = true }
+# How each write is finished: durable (F_FULLFSYNC) or ordered (F_BARRIERFSYNC).
+aterm-durable = { workspace = true }
 # The shared RFC3339 civil-calendar math (`aterm_types::rfc3339`).
 aterm-types = { workspace = true }
 # The workspace's one epoch-clock read (`aterm_time::unix_secs`).
@@ -51,9 +48,9 @@ aterm-digest = { workspace = true }
 # never a hand-rolled `/dev/urandom` read (that pattern caused kernel panics).
 # aterm-uds has no dependencies, so no cycle.
 aterm-uds = { workspace = true }
-# Optional source↔spec anchor support. The real Tier-1 conformance test gets the
-# same crate through `[dev-dependencies]` below.
-aterm-spec = { workspace = true, optional = true }
+# The anchor attributes' registry (std-only): `#[cfg_attr(any(test, debug_assertions),
+# aterm_spec_anchor::refines(…))]` expands in every test and debug build; release strips it.
+aterm-spec-anchor = { workspace = true }
 
 [dev-dependencies]
 # install.sh's tests build atpkg's shim from its own block (`build_cache::shim_block`),
@@ -65,6 +62,9 @@ ring = { workspace = true, features = ["default"] }
 # Tier-1 binds the real updater reducers to their single-source derived models;
 # production builds retain no spec dependency.
 aterm-spec = { workspace = true }
+# The models its tests drive (a model edit rebuilds only their tests).
+aterm-models-misc = { workspace = true }
+aterm-models-update = { workspace = true }
 # Test scratch directories removed on drop, and the shared-inode stand-ins the
 # install.sh tests lay as stub tools (`stand_in`, a debug build's).
 aterm-tempfile = { workspace = true }

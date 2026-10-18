@@ -7,14 +7,14 @@
 //! package roster every other layer derives from. Every fact is compiled (harness-plugins
 //! owner rule R1): where the vendor keeps its home, which files show a login exists (their
 //! existence and write time only, never their content), the sign-in flow, the one-shot
-//! read-only mode a review runs, and the wording a failed one-shot run uses for a lost login
+//! one-shot mode a review runs (and its flags for each permission level), and the wording a failed one-shot run uses for a lost login
 //! or a reached limit.
 //!
 //! [`connections`] walks `VENDORS` and keeps the programs that have a row, so a package with
 //! no row is not a connection in this build and nothing polices the pairing.
 //!
 //! A row whose commands have not run on a real install is `measured: false`: it never reads
-//! FAIL in the doctor, and it is never a reviewer.
+//! FAIL in the doctor. It reviews like any other.
 
 /// One AI CLI aterm can keep a connection to.
 #[derive(Debug)]
@@ -33,7 +33,7 @@ pub struct Connector {
     pub credential_env: &'static [&'static str],
     /// The sign-in flow.
     pub login: Login,
-    /// The one-shot read-only mode a review runs.
+    /// The one-shot mode a review runs.
     pub review: Review,
     /// How the CLI starts a line that reports its own failure (lowercase), where it marks
     /// one: only such lines are read for a lost login or a limit, so its talk of the change
@@ -113,26 +113,48 @@ pub enum AnswerVia {
     File(&'static str),
 }
 
-/// What a reviewer starts in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Scope {
-    /// The repository, its file tools confined there by the CLI itself.
-    Repo,
-    /// An empty private run directory; it is shown only the change.
-    DiffOnly,
+/// The flags that give a reviewer each permission level (`permission::Level`).
+#[derive(Debug)]
+pub struct Levels {
+    /// No approvals and no sandbox.
+    pub yolo: &'static [&'static str],
+    /// Edits without asking.
+    pub edits: &'static [&'static str],
+    /// What would ask is refused.
+    pub ask: &'static [&'static str],
+    /// Read and plan only.
+    pub plan: &'static [&'static str],
 }
 
-/// The one-shot read-only mode a review runs.
+impl Levels {
+    /// The flags for `level`.
+    #[must_use]
+    pub fn of(&self, level: super::permission::Level) -> &'static [&'static str] {
+        use super::permission::Level;
+        match level {
+            Level::Yolo => self.yolo,
+            Level::Edits => self.edits,
+            Level::Ask => self.ask,
+            Level::Plan => self.plan,
+        }
+    }
+}
+
+/// The one-shot mode a review runs: the CLI with every capability it has, in the repository,
+/// at the asking agent's permission level.
 #[derive(Debug)]
 pub struct Review {
     /// Arguments after the program, before the answer's and the request's.
     pub args: &'static [&'static str],
+    /// The flags for each permission level.
+    pub levels: Levels,
+    /// Whether the level's flags go before `args` (Muse Code's are global flags, before its
+    /// `exec`); otherwise after.
+    pub levels_first: bool,
     /// How the request goes in.
     pub prompt: PromptVia,
     /// Where the answer comes out.
     pub answer: AnswerVia,
-    /// What it starts in.
-    pub scope: Scope,
 }
 
 /// Claude Code (Anthropic).
@@ -155,24 +177,21 @@ pub const CLAUDE: Connector = Connector {
     ],
     login: Login::Accounts,
     review: Review {
-        args: &[
-            "-p",
-            "--restricted",
-            "--safe-mode",
-            "--tools",
-            "Read,Grep,Glob",
-            "--permission-prompts",
-            "none",
-            "--no-session-persistence",
-            "--strict-mcp-config",
-            "--settings",
-            "{\"disableAllHooks\":true}",
-            "--output-format",
-            "text",
-        ],
+        args: &["-p", "--output-format", "text"],
+        levels: Levels {
+            yolo: &["--dangerously-skip-permissions"],
+            edits: &[
+                "--permission-mode",
+                "acceptEdits",
+                "--permission-prompts",
+                "none",
+            ],
+            ask: &["--permission-prompts", "none"],
+            plan: &["--permission-mode", "plan", "--permission-prompts", "none"],
+        },
+        levels_first: false,
         prompt: PromptVia::Stdin { dash: false },
         answer: AnswerVia::Stdout,
-        scope: Scope::Repo,
     },
     error_lead: None,
     // `-p`'s non-interactive wording (2.1.301 bundle), and the TUI's.
@@ -231,52 +250,17 @@ pub const CODEX: Connector = Connector {
             ],
         }),
     },
-    // TOOL-LESS: its read-only sandbox reads any file this user can, and a
-    // `permissions.<profile>.deny_read` given with `-c` was NOT enforced (MEASURED on 0.163.0,
-    // 2026-10-16: a denied file was read). With every tool switched off it can run, read and
-    // fetch nothing: it reviews only the change aterm hands it ("this session has no shell
-    // execution tool available", measured the same day).
     review: Review {
-        args: &[
-            "exec",
-            "--sandbox",
-            "read-only",
-            "--ephemeral",
-            "--skip-git-repo-check",
-            "--ignore-user-config",
-            "--ignore-rules",
-            "--color",
-            "never",
-            "-c",
-            "features.shell_tool=false",
-            "-c",
-            "features.unified_exec=false",
-            "-c",
-            "features.view_image=false",
-            "-c",
-            "features.image_generation=false",
-            "-c",
-            "features.browser_use=false",
-            "-c",
-            "features.browser_use_external=false",
-            "-c",
-            "features.in_app_browser=false",
-            "-c",
-            "features.computer_use=false",
-            "-c",
-            "features.apps=false",
-            "-c",
-            "features.plugins=false",
-            "-c",
-            "features.remote_plugin=false",
-            "-c",
-            "features.skill_mcp_dependency_install=false",
-            "-c",
-            "features.tool_suggest=false",
-        ],
+        args: &["exec", "--skip-git-repo-check", "--color", "never"],
+        levels: Levels {
+            yolo: &["--dangerously-bypass-approvals-and-sandbox"],
+            edits: &["--sandbox", "workspace-write"],
+            ask: &["--sandbox", "workspace-write"],
+            plan: &["--sandbox", "read-only"],
+        },
+        levels_first: false,
         prompt: PromptVia::Stdin { dash: true },
         answer: AnswerVia::File("-o"),
-        scope: Scope::DiffOnly,
     },
     error_lead: Some("error"),
     auth_words: &[
@@ -316,17 +300,16 @@ pub const AGY: Connector = Connector {
         after: None,
     },
     review: Review {
-        args: &[
-            "--sandbox",
-            "--mode",
-            "plan",
-            "--disable-slash-commands",
-            "--output-format",
-            "text",
-        ],
+        args: &["--output-format", "text"],
+        levels: Levels {
+            yolo: &["--dangerously-skip-permissions"],
+            edits: &["--mode", "accept-edits"],
+            ask: &[],
+            plan: &["--mode", "plan"],
+        },
+        levels_first: false,
         prompt: PromptVia::Pointer("--print"),
         answer: AnswerVia::Stdout,
-        scope: Scope::DiffOnly,
     },
     error_lead: None,
     // `You are currently not signed in.` is agy 1.4.0's signed-out wall (aterm-phase `agy`).
@@ -342,9 +325,9 @@ pub const AGY: Connector = Connector {
 
 /// Muse Code (Meta); served on macOS only. Its help was read on 1.4.10-R6427.1 (2026-10-16):
 /// `muse login` approves a code in the browser (so it works over SSH too), its login is
-/// `~/.config/muse/.auth.json`, and `META_API_KEY` takes priority over it. A headless run is
-/// tool-less with the shell and writes disabled, its web tools off and no `--workspace`.
-/// Its one-shot behaviour is unmeasured until someone signs in.
+/// `~/.config/muse/.auth.json`, and `META_API_KEY` takes priority over it. Its safety flags
+/// (`--yolo`, `--disable-approval`, `--disable-write`, `--disable-shell`) are global, before
+/// `exec`. Its one-shot behaviour is unmeasured until someone signs in.
 pub const MUSE: Connector = Connector {
     id: "muse",
     product: "Muse Code",
@@ -362,16 +345,16 @@ pub const MUSE: Connector = Connector {
         after: None,
     },
     review: Review {
-        args: &[
-            "--disable-shell",
-            "--disable-write",
-            "--no-session-log",
-            "exec",
-            "--disable-web-tools",
-        ],
+        args: &["exec"],
+        levels: Levels {
+            yolo: &["--yolo"],
+            edits: &["--disable-approval"],
+            ask: &[],
+            plan: &["--disable-write", "--disable-shell"],
+        },
+        levels_first: true,
         prompt: PromptVia::File("--prompt-file"),
         answer: AnswerVia::Stdout,
-        scope: Scope::DiffOnly,
     },
     error_lead: None,
     // `Log in with browser` heads Muse Code's signed-out menu (aterm-phase `muse`).

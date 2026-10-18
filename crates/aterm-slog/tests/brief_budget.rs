@@ -245,10 +245,11 @@ fn brief_names_every_need_and_claim() {
     );
 }
 
-/// The open turn's line survives the ring evicting its open record: the
-/// fold still holds it, and the brief reads it from there.
+/// The open turn's line comes from the fold, not the window: level-aware
+/// eviction never takes an open node's open record (it is pinned), and a
+/// window that lacks it (a reader's cursor past it) still briefs the turn.
 #[test]
-fn brief_keeps_the_open_turn_its_ring_evicted() {
+fn brief_keeps_the_open_turn_its_window_lacks() {
     let mut log = Log::with_limits(0, Limits::new(64, 1 << 20).expect("small"));
     let run = agent_session(&mut log, 0);
     let mut tr = TurnTracker::new(run);
@@ -264,11 +265,13 @@ fn brief_keeps_the_open_turn_its_ring_evicted() {
         log.mark(Mark::new(Kind::Bell, Src::Engine, Conf::Exact), at(40 + i))
             .expect("bell");
     }
+    assert!(log.lost() > 0, "the bells evicted");
     assert!(
-        !log.window().any(|r| r.k == Kind::Turn),
-        "the ring evicted the turn's open"
+        log.window().any(|r| r.k == Kind::Turn),
+        "the open turn's open record is pinned"
     );
-    let b = log.brief("s-1", 100_000, WALL0 + 60_000);
+    let without: Vec<&aterm_slog::Rec> = log.window().filter(|r| r.k != Kind::Turn).collect();
+    let b = aterm_slog::brief("s-1", without, None, log.state(), 100_000, WALL0 + 60_000);
     let turn = b
         .text
         .lines()

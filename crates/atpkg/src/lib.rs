@@ -93,6 +93,7 @@ pub mod activation_notice;
 /// Whether this machine consents to the unattended adoption of the ALab toolset: the one
 /// predicate the first-launch seed and the window both ask ([`adoption_consented`]).
 pub mod adoption;
+pub mod alab;
 pub mod apply;
 pub mod build_cache;
 pub mod cache;
@@ -140,24 +141,23 @@ pub mod lay;
 /// Toolchain leases: a run holds the store build it resolved for as long as it runs, so gc
 /// never reclaims it and the unattended trust flip waits for it.
 pub mod lease;
-/// Which compiler built a toolchain or a payload, decided by content: compiler admission
-/// (`atpkg lineage check-compiler`), the payload scan (`atpkg lineage scan`), the
-/// SEED-MINT receipt check and the LINEAGE record a signed bundle carries.
+/// Which compiler built a toolchain, decided by content: compiler admission
+/// ([`lineage::check_compiler_with`]) with the scan of one object it runs over the
+/// compiler's own bytes, and the SEED-MINT and LINEAGE receipts it checks. The producer
+/// (`atpkg-publish`) walks a staged payload with the same scan and writes the LINEAGE.
 pub mod lineage;
 pub mod linkmode;
 pub mod lock;
 pub mod machine;
-/// The Mach-O files of a staged tree, found by magic, for the Developer ID stage gate.
-mod macho;
+/// The Mach-O files of a staged tree, found by magic, for the Developer ID stage gate; the
+/// header test is public, so the producer's payload scan reads a head the same way.
+pub mod macho;
 pub mod manifest;
 mod metadata_io;
 /// The one-line progress meter under a person's typed verb, and the printing every line
 /// takes around it.
 mod meter;
 pub mod net;
-/// MEASURING whether Spotlight indexes a directory: a probe and a later control, never a
-/// claim read off a name (§9).
-pub mod noindex;
 /// Where atpkg's unasked notices go: stderr in its own CLI, the host's log in the terminal
 /// session and the window, which call it beside a live shell.
 pub mod notice;
@@ -181,12 +181,15 @@ pub mod protected;
 /// Flip when quiet: an unattended update stages a new Trust toolchain at once and flips it
 /// only when no run leases or runs from the one it replaces — four hours at the most.
 pub mod quiet;
-pub mod relocate;
 pub mod reroute;
 /// The rustup toolchain seam owner (Lockstep S1): `<rustup_home>/toolchains/trust` ->
 /// `<prefix>/store/trust/current`, laid, adopted, re-asserted and recorded by atpkg.
 pub mod seam;
 pub mod select;
+/// What `tools/install.sh` lays on an account beyond the binary, and its undo, as verbs of
+/// the installed binary: `aterm pkg shell-setup` and `aterm pkg self-uninstall`.
+#[cfg(unix)]
+pub mod selfsetup;
 /// The self-update intercept (2026-09-19): `claude update|upgrade|install` and `codex
 /// update` typed on the MANAGED name are answered by the standard `aterm pkg update` —
 /// the roster, the classification and every line, pure; the verb is `cli::cmd_selfupdate`.
@@ -214,7 +217,7 @@ mod test_programs;
 #[cfg(test)]
 pub(crate) mod testdir;
 /// THE toolchain resolution order (`aterm help rust`, `verify`, the release
-/// cutter). Std-only: `aterm-verify` compiles this same file.
+/// cutter), re-exported from `aterm-toolchain`, where its tests run.
 pub mod toolchain;
 pub mod tree;
 pub mod upstream_identity;
@@ -238,7 +241,6 @@ pub use config::{LinkTarget, PackagesConfig, classify_link, repo_overrides};
 pub use discovery::resolve_account;
 pub use extract::{
     EntryKind, ExtractError, ExtractReject, TooLargeReason, extract_tar_zst, vet_entry,
-    vet_hardlink,
 };
 pub use flow::{
     AppliedMember, ChannelApplyReport, DepOutcome, DepResult, Fetcher, FlowError, InstallReport,
@@ -265,7 +267,7 @@ pub use sig::{
 };
 pub use status::{ProgramStatus, Status};
 pub use store::{Layout, default_prefix, shim_allowed, vet_prefix};
-pub use tree::{sha256_file, tree_root};
+pub use tree::{sha256_bytes, sha256_file, tree_root};
 
 /// The base64 Ed25519 public key(s) of the **paper master** this binary trusts — atpkg's
 /// one and only trust root, shared verbatim with the app update channel.

@@ -135,7 +135,7 @@ fn the_seal_and_its_private_closure_are_never_written() {
     let snapshot = || -> BTreeMap<PathBuf, Vec<u8>> {
         let mut out = BTreeMap::new();
         for d in [f.source.clone(), f.private.clone()] {
-            for rel in atpkg::relocate::walk_files(&d).expect("walk") {
+            for rel in atpkg_publish::artifact::relocate::walk_files(&d).expect("walk") {
                 out.insert(d.join(&rel), std::fs::read(d.join(rel)).expect("read"));
             }
         }

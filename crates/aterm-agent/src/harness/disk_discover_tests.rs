@@ -6,7 +6,7 @@
 //!
 //! Every tree lives in its own scratch directory ([`Tmp`]): a `home/` that
 //! stands in for `$HOME` (its checkouts, a Claude Code registry and
-//! transcripts under `home/.claude`), a Claude Code temp root, a cells cache.
+//! transcripts under `home/.claude`) and a Claude Code temp root.
 //! No test reads or writes anything of the owner's: the registry is a
 //! fixture whose one live record names THIS test process, and a dead one
 //! names a pid no process has. `now` is moved FORWARD past the files a test
@@ -81,10 +81,23 @@ fn register(home: &Path, pid: u32, session: &str) {
     .expect("registry record");
 }
 
+/// Claude Code's temp root at `claude_tmp`, made as Claude Code makes it: `0700`,
+/// whatever the test's umask (Ubuntu's 002 would leave it group-writable, a root
+/// discovery refuses to search). An existing root keeps its mode.
+fn claude_root(claude_tmp: &Path) {
+    use std::os::unix::fs::DirBuilderExt as _;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(claude_tmp)
+        .expect("Claude Code's temp root");
+}
+
 /// A Claude Code session's scratch build: `<tmp>/<project>/<session>/scratchpad/<sub>/target`,
 /// with a task output beside it and its transcript under `home`. Answers the
 /// build directory (canonical).
 fn scratch_build(claude_tmp: &Path, home: &Path, session: &str, sub: &str) -> PathBuf {
+    claude_root(claude_tmp);
     let sdir = claude_tmp.join("-proj").join(session);
     let target = lay_target(&sdir.join("scratchpad").join(sub).join("target"));
     std::fs::write(mkdirs(&sdir.join("tasks")).join("t1.output"), b"done\n").expect("task");
@@ -103,7 +116,6 @@ fn roots_at(tmp: &Tmp) -> Roots {
         claude_unread: None,
         agent_target_dirs: Vec::new(),
         claude_tmp: Some(tmp.path().join("claude-tmp")),
-        cells: Some(tmp.path().join("cells")),
         device: None,
         mounts: Vec::new(),
     }
@@ -118,10 +130,9 @@ fn kinds(d: &Discovered) -> Vec<(PathBuf, &'static str)> {
                 Origin::Named => "named",
                 Origin::Checkout { .. } => "checkout",
                 Origin::AgentTargetDir => "agent",
-                Origin::BuildCache => "build-cache",
+                Origin::BuildCache { .. } => "build-cache",
                 Origin::Bootstrap { .. } => "bootstrap",
                 Origin::ClaudeScratch { .. } => "scratch",
-                Origin::Cell { .. } => "cell",
                 Origin::Linked { .. } => "linked",
             };
             (f.path.clone(), k)
@@ -136,11 +147,12 @@ fn kinds(d: &Discovered) -> Vec<(PathBuf, &'static str)> {
 /// once, canonical) and a workspace one level down (`crates/target`); a
 /// build directory BESIDE a worktree (`wt-parent/m1-target`) and in a git
 /// worktree that lives outside `$HOME` (read from `.git/worktrees`); a
-/// Claude Code session's scratch build three levels down; a cells cache.
-/// NEGATIVE CONTROLS: a build directory three levels down a checkout, one in
-/// a hidden directory, one under `~/Library`, one in `$HOME`'s own hidden
-/// children (`~/.cargo` carries a `CACHEDIR.TAG` too), and one deeper than
-/// the scratch walk goes — none is found.
+/// Claude Code session's scratch build three levels down. NEGATIVE
+/// CONTROLS: a build directory three levels down a checkout, one in a hidden
+/// directory, one under `~/Library`, one in `$HOME`'s own hidden children
+/// (`~/.cargo` carries a `CACHEDIR.TAG` too, as does `~/.cache/aterm/cells`,
+/// a layout nothing writes), and one deeper than the scratch walk goes —
+/// none is found.
 #[test]
 fn every_root_kind_is_found_and_each_build_directory_once() {
     let tmp = Tmp::new("discover-roots");
@@ -182,25 +194,8 @@ fn every_root_kind_is_found_and_each_build_directory_once() {
             .join(DEAD)
             .join("scratchpad/1/2/3/4/target"),
     ); // deeper than the scratch walk
-    // A cells cache. Its marker holds the checkout's path byte for byte, as
-    // the cache was written: a live checkout whose folder name ends in a
-    // space is read as that folder (a trimmed read named the missing `live`
-    // beside it, seen gone, and the cache went whole). A marker ending in a
-    // line break (none was written so) names no checkout.
-    let live = mkdirs(&t.join("live "));
-    std::fs::write(live.join("Cargo.toml"), b"[workspace]\n").expect("manifest");
-    let cell = lay_target(&t.join("cells/wt-0123/linux"));
-    std::fs::write(
-        t.join("cells/wt-0123/.checkout"),
-        canon(&live).as_os_str().as_encoded_bytes(),
-    )
-    .expect("marker");
-    let lined = lay_target(&t.join("cells/wt-0456/linux"));
-    std::fs::write(
-        t.join("cells/wt-0456/.checkout"),
-        format!("{}\n", canon(&live).display()),
-    )
-    .expect("marker");
+    // `~/.cache/aterm/cells`: a layout nothing writes, never searched.
+    lay_target(&home.join(".cache/aterm/cells/wt-0123/linux"));
 
     let roots = Roots {
         cwds: vec![sub.clone()],
@@ -220,20 +215,13 @@ fn every_root_kind_is_found_and_each_build_directory_once() {
         (canon(&crates_target), "checkout"),
         (canon(&wt1_target), "checkout"),
         (canon(&m1), "checkout"),
-        (canon(&cell), "cell"),
-        (canon(&lined), "cell"),
     ];
     want.sort();
     assert_eq!(got, want);
-    // The scratch build carries its session, and each cell its checkout.
+    // The scratch build carries its session.
     for f in &d.found {
-        match &f.origin {
-            Origin::ClaudeScratch { session, .. } => assert_eq!(session, DEAD),
-            Origin::Cell { checkout, .. } if f.path == canon(&cell) => {
-                assert_eq!(checkout.as_deref(), Some(canon(&live).as_path()));
-            }
-            Origin::Cell { checkout, .. } => assert_eq!(*checkout, None),
-            _ => {}
+        if let Origin::ClaudeScratch { session, .. } = &f.origin {
+            assert_eq!(session, DEAD);
         }
     }
 }
@@ -376,7 +364,11 @@ fn the_rust_build_cache_gives_each_workspace_build_directory() {
         "{found:?}"
     );
     assert_eq!(found.len(), 2, "{found:?}");
-    assert!(!Origin::BuildCache.ownable());
+    assert!(
+        d.found
+            .iter()
+            .all(|f| !matches!(f.origin, Origin::BuildCache { .. }) || f.origin.ownable())
+    );
 }
 
 /// THE SESSION'S OWNER: GONE ONLY WHEN NOTHING NAMES IT AND NOTHING OF IT
@@ -406,11 +398,7 @@ fn the_rust_build_cache_gives_each_workspace_build_directory() {
 /// started with — a renamed Claude Code's registry names its session there;
 /// aterm's own identities' in `~/Library` too, never another place of
 /// `~/Library` nor one that climbs out by `..` — and none is a reason to
-/// refuse. A cells cache is gone only when its checkout is SEEN to be — its
-/// folder there without a `Cargo.toml`, or the folder that held it there
-/// without it — never when the checkout cannot be read, is away with the
-/// folder above it, sits at a volume's root, or (macOS) lies in a
-/// privacy-guarded folder, and the guarded places are never looked at.
+/// refuse.
 #[test]
 fn a_session_is_gone_only_when_nothing_names_it_and_nothing_of_it_was_written() {
     let tmp = Tmp::new("discover-owners");
@@ -732,10 +720,20 @@ fn a_session_is_gone_only_when_nothing_names_it_and_nothing_of_it_was_written() 
         ],
         Some(&home),
     );
-    assert_eq!(
-        reach.map(|r| r.dirs),
-        Ok(vec![identity, PathBuf::from("/proj/rel/.claude")])
-    );
+    // Two folders up from aterm's state is `~/Library` on macOS, never looked
+    // into; elsewhere (`~/.local/state/aterm`) it is a plain folder of `$HOME`
+    // (`~/.local`), read as any other.
+    let climbed = state
+        .parent()
+        .and_then(Path::parent)
+        .expect("two folders above aterm's state")
+        .join("Mail/.claude");
+    let mut read = vec![identity];
+    if !cfg!(target_os = "macos") {
+        read.push(climbed);
+    }
+    read.push(PathBuf::from("/proj/rel/.claude"));
+    assert_eq!(reach.map(|r| r.dirs), Ok(read));
     // And the directory ANY process was started with: a Claude Code the
     // kernel does not name one (a copy renamed `cc-work`, started with
     // `CLAUDE_CONFIG_DIR=alt/.claude`) keeps its registry there, which names
@@ -814,80 +812,6 @@ fn a_session_is_gone_only_when_nothing_names_it_and_nothing_of_it_was_written() 
         "{:?}",
         verdict(&mut fresh, DEAD)
     );
-    // Cells.
-    let checkout = mkdirs(&tmp.path().join("checkout"));
-    let mut cells = Owners::new(Some(home.clone()), Vec::new(), Vec::new(), None, now, DAY);
-    let key = tmp.path().to_path_buf();
-    let cell = |c: &Path| Origin::Cell {
-        checkout: Some(c.to_path_buf()),
-        key: key.clone(),
-    };
-    assert!(matches!(cells.of(&cell(&checkout)), Owned::Gone { .. }));
-    // Removed, the folder that held it there: gone.
-    assert!(matches!(
-        cells.of(&cell(&tmp.path().join("removed"))),
-        Owned::Gone { .. }
-    ));
-    // NOT SEEN, so not gone: a checkout whose folder and the one that held
-    // it are both missing (a volume not mounted now); one at a volume's root
-    // (the folder above it, where volumes mount, is there); one that is there
-    // but cannot be read; and (macOS) one in a privacy-guarded folder, there
-    // without a Cargo.toml, which is never looked into.
-    let volumes = if cfg!(target_os = "macos") {
-        "/Volumes"
-    } else {
-        "/media"
-    };
-    let volume = PathBuf::from(format!(
-        "{volumes}/aterm-not-mounted-{}",
-        std::process::id()
-    ));
-    let mut guarded = vec![volume.join("repo"), volume];
-    if cfg!(target_os = "macos") {
-        guarded.push(mkdirs(&home.join("Documents/repo")));
-    }
-    // The guarded places are not even looked at.
-    for c in &guarded {
-        let not_looked = super::checkout::gone_by(c, Some(&home), &mut |p| {
-            panic!("{} looked at {}", c.display(), p.display())
-        });
-        assert!(not_looked.is_err(), "{}", c.display());
-    }
-    // The walled checkout: its folder is there, its Cargo.toml unreadable.
-    let walled = mkdirs(&tmp.path().join("walled"));
-    std::fs::write(walled.join("Cargo.toml"), b"[workspace]\n").expect("manifest");
-    let mode = |m: u32| {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&walled, std::fs::Permissions::from_mode(m)).expect("chmod");
-    };
-    mode(0o000);
-    let refused = std::fs::symlink_metadata(walled.join("Cargo.toml"));
-    let mut unseen = vec![tmp.path().join("away/repo"), walled.clone()];
-    unseen.extend(guarded);
-    let verdicts: Vec<(PathBuf, Owned)> = unseen
-        .iter()
-        .map(|c| (c.clone(), cells.of(&cell(c))))
-        .collect();
-    mode(0o755);
-    assert!(
-        refused.is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied),
-        "the walled folder must refuse this reader"
-    );
-    let gone: Vec<&PathBuf> = verdicts
-        .iter()
-        .filter(|(_, v)| !matches!(v, Owned::Live(_)))
-        .map(|(c, _)| c)
-        .collect();
-    assert!(gone.is_empty(), "called gone: {gone:#?}");
-    std::fs::write(checkout.join("Cargo.toml"), b"[workspace]\n").expect("manifest");
-    assert!(matches!(cells.of(&cell(&checkout)), Owned::Live(_)));
-    assert!(matches!(
-        cells.of(&Origin::Cell {
-            checkout: None,
-            key: key.clone()
-        }),
-        Owned::Live(_)
-    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -1195,10 +1119,7 @@ fn above_the_floor_or_switched_off_an_ended_sessions_build_is_any_other() {
     let now = now_after_write(4);
     let gone = scratch_build(&claude, &home, DEAD, "a");
     mkdirs(&home.join(".claude/sessions"));
-    for (free, config, says) in [
-        (100 * GIB, cfg(true), "goes whole below the 10 GiB floor"),
-        (GIB, cfg(false), "dead_build_dirs` is off"),
-    ] {
+    for (free, config) in [(100 * GIB, cfg(true)), (GIB, cfg(false))] {
         let (_, rep) = survey_at(&tmp, &roots_at(&tmp), now, free, config);
         let kinds: Vec<&str> = rep
             .rows
@@ -1207,9 +1128,7 @@ fn above_the_floor_or_switched_off_an_ended_sessions_build_is_any_other() {
             .map(|r| r.witness.kind())
             .collect();
         assert_eq!(kinds, ["stale-build-dir"], "{:#?}", rep.rows);
-        let hog = rep.hogs.iter().find(|h| h.path == gone).expect("a hog");
-        assert!(hog.why.contains(says), "{}", hog.why);
-        assert!(hog.why.contains("ended Claude Code session"), "{}", hog.why);
+        assert!(rep.hogs.iter().any(|h| h.path == gone), "{:#?}", rep.hogs);
     }
     const WHY: &str = "process 4242 (/opt/x/bin/agent) could not be read, and may be a Claude Code";
     let unread = Roots {
@@ -1275,20 +1194,27 @@ fn the_largest_hogs_are_what_no_row_frees_biggest_first() {
         td("/h/d/target", checkout, 1),
     ];
     let rep = report(&s, Config::default());
-    let lines: Vec<String> = rep
+    let hogs: Vec<(&Path, u64)> = rep
         .hogs
         .iter()
-        .map(|h| h.line(rep.home.as_deref()))
+        .map(|h| (h.path.as_path(), h.bytes))
         .collect();
     assert_eq!(
-        lines,
+        hogs,
         [
-            "$HOME/trust/build 94.0 GiB (x.py bootstrap; run scripts/slim_build.py)",
-            "$HOME/trust/crates/target.noindex 49.0 GiB (cargo build output: deps/ and build/ are `targo clean`'s)",
-            "~/c/target 5.0 GiB (cargo build output: deps/ and build/ are `targo clean`'s)",
-            "~/b/target 4.0 GiB (cargo build output: deps/ and build/ are `targo clean`'s)",
-            "~/a/target 2.0 GiB (cargo build output: deps/ and build/ are `targo clean`'s)",
+            ("/h/trust/build", 94),
+            ("/h/trust/crates/target.noindex", 49),
+            ("/h/c/target", 5),
+            ("/h/b/target", 4),
+            ("/h/a/target", 2),
         ]
+        .map(|(path, gib)| (Path::new(path), gib * GIB))
+    );
+    assert!(
+        rep.hogs[0]
+            .line(rep.home.as_deref())
+            .starts_with("$HOME/trust/build "),
+        "a line reads `~/…`"
     );
     assert!(rep.to_json().contains("\"hogs\":["), "{}", rep.to_json());
     // One something else removed during the pass is no hog, and the next
@@ -1428,6 +1354,7 @@ fn the_hogs_a_tick_hands_the_window_name_what_the_pass_left() {
 /// in it) and its transcript, both days old by `now`; no build directory.
 /// Answers the session's temp directory (canonical).
 fn session_folder(claude_tmp: &Path, home: &Path, session: &str) -> PathBuf {
+    claude_root(claude_tmp);
     let sdir = claude_tmp.join("-proj").join(session);
     mkdirs(&sdir.join("scratchpad"));
     std::fs::write(mkdirs(&sdir.join("tasks")).join("t1.output"), b"done\n").expect("task");
@@ -1557,14 +1484,14 @@ fn a_build_directory_a_checkout_also_names_is_the_checkouts() {
     assert_eq!(scratch.clone().merge(checkout.clone()), checkout);
     assert_eq!(checkout.clone().merge(scratch.clone()), checkout);
     assert_eq!(scratch.clone().merge(scratch.clone()), scratch);
-    let other = Origin::Cell {
-        checkout: None,
-        key: PathBuf::from("/cells/k"),
+    let other = Origin::ClaudeScratch {
+        session: LIVE.to_owned(),
+        session_dir: PathBuf::from("/claude-tmp/-proj/other"),
     };
     assert_eq!(
         scratch.merge(other),
         Origin::Linked {
-            from: PathBuf::from("/cells/k")
+            from: PathBuf::from("/claude-tmp/-proj/other")
         }
     );
 }
@@ -1703,8 +1630,8 @@ fn a_process_that_cannot_be_read_keeps_a_gone_owners_build_directory() {
 
 /// THE SEARCH STAYS ON THE MEASURED VOLUME AND OUT OF MOUNT POINTS (review
 /// P5). With the fixtures' own device every build directory is found; with
-/// a device none of them is on, none is — a root, `$HOME`'s children, the
-/// temp root and the cells alike. A directory the mount table names is
+/// a device none of them is on, none is — a root, `$HOME`'s children and the
+/// temp root alike. A directory the mount table names is
 /// never entered (nor `stat`ed): its build directory is not found, its
 /// sibling's is; and a `target` link into a mount is never followed. And
 /// the mount table's escapes decode.
@@ -1716,7 +1643,6 @@ fn the_search_stays_on_the_measured_volume_and_out_of_mount_points() {
     let a = canon(&lay_target(&home.join("a/target")));
     let b = canon(&lay_target(&home.join("b/target")));
     let scratch = scratch_build(&claude, &home, DEAD, "x");
-    let cell = canon(&lay_target(&tmp.path().join("cells/k/linux")));
     // A checkout whose `target` links onto another mount.
     let mounted_target = canon(&lay_target(&tmp.path().join("nas/proj/target")));
     symlink(&mounted_target, mkdirs(&home.join("c")).join("target")).expect("link to a mount");
@@ -1730,7 +1656,7 @@ fn the_search_stays_on_the_measured_volume_and_out_of_mount_points() {
         p.sort();
         p
     };
-    let mut all = vec![a.clone(), b.clone(), scratch, cell, mounted_target.clone()];
+    let mut all = vec![a.clone(), b.clone(), scratch, mounted_target.clone()];
     all.sort();
     let on = Roots {
         cwds: vec![home.join("a")],
@@ -1896,4 +1822,150 @@ fn the_journal_names_whose_build_directory_went_whole() {
     assert!(line.contains("\"owner\":"), "{line}");
     assert!(line.contains(DEAD), "{line}");
     assert!(line.contains(&session_dir.display().to_string()), "{line}");
+}
+
+/// One workspace's build directory in the fixture's Rust build cache
+/// (`<cache><workspace>/.cargo-build`), its profile last used at `at`.
+/// Answers the build directory (canonical).
+fn cache_build(home: &Path, workspace: &Path, at: i64) -> PathBuf {
+    let cache = atpkg::build_cache::cache_root(home);
+    let dir = lay_target(&atpkg::build_cache::build_dir(&cache, workspace));
+    last_used(&dir.join("debug"), at);
+    canon(&dir)
+}
+
+/// The whole rows of `rep` by path.
+fn whole_paths(rep: &Report) -> Vec<PathBuf> {
+    rep.rows
+        .iter()
+        .filter(|r| matches!(r.witness, Witness::OwnerGone { .. }))
+        .map(|r| r.path.clone())
+        .collect()
+}
+
+/// BELOW THE FLOOR, A REMOVED WORKSPACE'S RUST BUILD CACHE GOES WHOLE AFTER
+/// TEN MINUTES UNWRITTEN — the leftover of a deleted worktree that filled
+/// the disk twice on 2026-10-16. Its owner is the workspace, gone when SEEN
+/// gone (its folder's parent there without it). NEGATIVE CONTROLS, each
+/// kept byte for byte: the workspace present (a `Cargo.toml`); one written
+/// into a minute ago; one gone with the folder above it (away, not
+/// removed); one whose cargo lock a build holds; and the same survey above
+/// the floor. A `.cargo-build` that is a link out of the cache is never
+/// found at all, and its target survives.
+#[test]
+fn below_the_floor_a_removed_workspaces_build_cache_goes_whole() {
+    let tmp = Tmp::new("discover-build-cache-gone");
+    let home = mkdirs(&tmp.path().join("home"));
+    let now = now_after_write(0);
+    let quarter_hour = now - 15 * 60;
+    let gone = cache_build(&home, &home.join("aterm-wt/removed"), quarter_hour);
+    mkdirs(&home.join("aterm-wt"));
+    let live_ws = mkdirs(&home.join("aterm-wt/live"));
+    std::fs::write(live_ws.join("Cargo.toml"), "[workspace]\n").expect("manifest");
+    let live = cache_build(&home, &live_ws, quarter_hour);
+    let recent = cache_build(&home, &home.join("aterm-wt/just-built"), now - 60);
+    let away = cache_build(&home, &home.join("away/ws"), quarter_hour);
+    let locked = cache_build(&home, &home.join("aterm-wt/building"), quarter_hour);
+    let outside = lay_target(&tmp.path().join("outside/.cargo-build"));
+    let linked = atpkg::build_cache::build_dir(
+        &atpkg::build_cache::cache_root(&home),
+        &home.join("aterm-wt/linked"),
+    );
+    mkdirs(linked.parent().expect("mirror"));
+    symlink(&outside, &linked).expect("link");
+
+    // Above the floor: nothing goes whole.
+    let (_, rep) = survey_at(&tmp, &roots_at(&tmp), now, 500 * GIB, cfg(true));
+    assert!(whole_paths(&rep).is_empty(), "{:#?}", rep.rows);
+
+    let build = Build::holds(&locked.join("debug/.cargo-lock"));
+    let (_, rep) = survey_at(&tmp, &roots_at(&tmp), now, GIB, cfg(true));
+    drop(build);
+    assert_eq!(whole_paths(&rep), vec![gone.clone()], "{:#?}", rep.notes);
+    let row = whole_row(&rep).expect("a whole row");
+    let Witness::OwnerGone { owner, quiet_s, .. } = &row.witness else {
+        unreachable!("a whole row");
+    };
+    assert_eq!(*quiet_s, crate::harness::disk::PRESSURE_MIN_IDLE_S);
+    assert!(
+        row.witness.describe().contains("workspace that is gone"),
+        "{}",
+        row.witness.describe()
+    );
+    assert!(matches!(owner, Owner::BuildCache { .. }));
+    assert!(
+        rep.notes
+            .iter()
+            .any(|n| n.contains(&recent.display().to_string()) && n.contains("quiet window")),
+        "{:#?}",
+        rep.notes
+    );
+
+    let mut journal = Vec::new();
+    let done = apply_auto(&rep, None, &mut real(now), &mut || Some(GIB), &mut |step| {
+        if let Step::Removed(r, _) = step {
+            journal.push(r.path.clone());
+        }
+        true
+    })
+    .expect("below the floor");
+    assert!(journal.contains(&gone), "{journal:?}");
+    assert!(!gone.exists(), "the removed workspace's cache went whole");
+    assert!(done.freed_bytes >= 8192, "{}", done.freed_bytes);
+    for kept in [&live, &recent, &away, &locked] {
+        assert!(
+            kept.join("debug/deps/liblay.rlib").is_file(),
+            "{} keeps its deps",
+            kept.display()
+        );
+    }
+    assert!(outside.join("debug/deps/liblay.rlib").is_file());
+    assert!(
+        std::fs::symlink_metadata(&linked)
+            .expect("link")
+            .file_type()
+            .is_symlink()
+    );
+}
+
+/// AT THE REMOVAL a removed workspace's build cache is judged again: a
+/// worktree recreated since the survey (its `Cargo.toml` back) keeps it,
+/// and so does a process working inside it. NEGATIVE CONTROL: with the
+/// worktree removed again and the process gone, the same row goes.
+#[test]
+fn a_recreated_worktree_or_a_process_inside_keeps_a_build_cache() {
+    let tmp = Tmp::new("discover-build-cache-recheck");
+    let home = mkdirs(&tmp.path().join("home"));
+    let now = now_after_write(0);
+    let ws = home.join("wt");
+    let dir = cache_build(&home, &ws, now - 15 * 60);
+    let (_, rep) = survey_at(&tmp, &roots_at(&tmp), now, GIB, cfg(true));
+    let row = whole_row(&rep).expect("a whole row");
+
+    mkdirs(&ws);
+    std::fs::write(ws.join("Cargo.toml"), "[workspace]\n").expect("manifest");
+    let err = real(now)(&row).expect_err("the worktree is back");
+    assert!(err.to_string().contains("is there"), "{err}");
+    assert!(dir.join("debug/deps/liblay.rlib").is_file());
+    std::fs::remove_dir_all(&ws).expect("removed again");
+
+    let mut inside = aterm_uds::spawnfd::command("/bin/sleep")
+        .arg("120")
+        .current_dir(dir.join("debug"))
+        .spawn()
+        .expect("a process inside");
+    let Witness::OwnerGone { owner, .. } = &row.witness else {
+        unreachable!("a whole row");
+    };
+    let seen = until_err(|| unused(owner, &row.path, &among(vec![inside.id()])));
+    let err = real_among(now, vec![inside.id()])(&row).expect_err("a process works inside");
+    let _ = inside.kill();
+    let _ = inside.wait();
+    assert!(seen.is_err_and(|why| why.contains("working directory")));
+    assert!(err.to_string().contains("uses"), "{err}");
+    assert!(dir.join("debug/deps/liblay.rlib").is_file());
+
+    let removed = real_among(now, vec![inside.id()])(&row).expect("nothing keeps it now");
+    assert_eq!(removed.units, std::slice::from_ref(&dir));
+    assert!(!dir.exists());
 }

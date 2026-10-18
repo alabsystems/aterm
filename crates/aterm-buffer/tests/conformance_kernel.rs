@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 //
 //! Tier-1 conformance: binds the real event-log spine to the derived `Kernel`
-//! model (`aterm_spec::derive::kernel_model()`): every `Emit` bumps `count` by
+//! model (`aterm_models_session::kernel_model()`): every `Emit` bumps `count` by
 //! one and assigns the next contiguous `seq`, so `SeqIsCount` holds. `Buggy = 1`
 //! opens a gap (an append that advances `seq` by two).
 //!
@@ -20,7 +20,8 @@
 
 use crate::support::{read_cap, write_cap};
 use aterm_buffer::{Edit, EventLog, LineId, MAX_LOG_EVENTS, Op, Seq, Surface, Ticks, TxnOutcome};
-use aterm_spec::derive::{Model, kernel_model};
+use aterm_models_session::kernel_model;
+use aterm_spec::derive::Model;
 use aterm_spec::{interp, verify};
 use std::collections::BTreeMap;
 

@@ -30,7 +30,8 @@
 //! registry crate's: `tests/oracle/` const-asserts every size, alignment,
 //! value and signature against windows-sys 0.52.0 on x86_64- and
 //! aarch64-pc-windows-msvc and compares the imported symbol and DLL, with a
-//! planted mismatch of each kind that must fail. `tests/recorded.rs` holds the
+//! planted mismatch of each kind that must fail (`targo --unverified run -p
+//! aterm-win32-oracle -- oracle-052`). `tests/recorded.rs` holds the
 //! recorded answers on any host.
 //!
 //! # Divergences

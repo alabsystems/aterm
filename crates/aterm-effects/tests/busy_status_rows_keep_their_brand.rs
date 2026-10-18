@@ -43,7 +43,6 @@ use aterm_effects::cursor_glow::{CURSOR_WITNESS_ROWS, CursorGlow, Geom, GlowConf
 use aterm_effects::rainbow_kitty::TypedClass;
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const ROWS: usize = 30;
@@ -506,8 +505,8 @@ impl Host {
         self.glow
             .observe_row_with_trust(c.row, c.col, &self.row_buf, self.now, ProbeTrust::Full);
         observe_neighbor_rows(&self.term, &mut self.glow, &mut self.nbrs, c.row, ROWS);
-        self.glow
-            .observe_print_anchor_glyph(self.term.print_anchor(), self.term.print_anchor_glyph());
+        let (anchor, glyph) = aterm_effects::host::motion_print_anchor(&self.term);
+        self.glow.observe_print_anchor_glyph(anchor, glyph);
         self.glow.observe_caret_drawn(drawn);
         self.glow
             .tick(cur, self.now, &self.cfg, self.g, &mut self.out);
@@ -693,40 +692,24 @@ fn replay(take: Take, frame_us: u64, phase_us: u64, lat: u64, shape: Shape) -> S
     bad
 }
 
-/// Whether this process replays the whole grid ([`grid`]); only
-/// [`every_law_over_the_whole_frame_and_latency_grid`] sets it.
-static FULL_GRID: AtomicBool = AtomicBool::new(false);
-
 /// The replays of one sweep, `(frame_us, phase_us, key-to-echo latency ms)`.
 ///
 /// The whole grid is 120 Hz at three latencies and 60 Hz at one, five phases each: 20 replays.
-/// The default run samples six over both rates, every phase and all three latencies. Replays are
+/// This samples six over both rates, every phase and all three latencies. Replays are
 /// deterministic, and without each law's fix at least 15 of 20 are red, so any six contain a red
-/// one. The whole grid is the `#[ignore]`d test below.
+/// one.
 fn grid() -> Vec<(u64, u64, u64)> {
-    let sampled: [(u64, u64, u64); 6] = [
-        (8_333, 0, 12),
+    [
+        (8_333u64, 0u64, 12u64),
         (8_333, 3, 16),
         (8_333, 1, 20),
         (8_333, 4, 12),
         (16_667, 0, 20),
         (16_667, 2, 20),
-    ];
-    let mut all = Vec::new();
-    for (frame_us, lats) in [(8_333u64, &[12u64, 16, 20][..]), (16_667, &[20][..])] {
-        for phase in 0..5u64 {
-            for &lat in lats {
-                all.push((frame_us, phase, lat));
-            }
-        }
-    }
-    if FULL_GRID.load(Ordering::Relaxed) {
-        return all.into_iter().map(|(f, p, l)| (f, p * f / 5, l)).collect();
-    }
-    sampled
-        .into_iter()
-        .map(|(f, p, l)| (f, p * f / 5, l))
-        .collect()
+    ]
+    .into_iter()
+    .map(|(f, p, l)| (f, p * f / 5, l))
+    .collect()
 }
 
 /// Every replay of `take` in `shape` ([`grid`]). Each replay has its own `Terminal`, engine and
@@ -751,54 +734,6 @@ fn sweep(take: Take, shape: Shape) {
         take.keys,
         broken.len(),
         broken.join("\n")
-    );
-}
-
-/// Every law above over the whole 20-replay grid the default run samples; run it when the
-/// lane's custody, row memory or hand-row logic changes:
-/// `targo --unverified test -p aterm-effects --test effects_suite -- --ignored busy_status_rows_keep_their_brand::`.
-#[test]
-#[ignore = "the exhaustive 20-replay grid of every law (the default run samples 6); run it when the glow lane's custody changes"]
-fn every_law_over_the_whole_frame_and_latency_grid() {
-    FULL_GRID.store(true, Ordering::Relaxed);
-    // Every law runs, red or not: a red law does not hide the rest, which is
-    // what tells a defect's footprint from a single law's.
-    let laws: [(&str, fn()); 6] = [
-        (
-            "a_status_row_digit_inside_a_hesitated_keys_echo_window_leaves_no_hole",
-            a_status_row_digit_inside_a_hesitated_keys_echo_window_leaves_no_hole,
-        ),
-        (
-            "a_scroll_that_wipes_the_brands_leaves_no_hole",
-            a_scroll_that_wipes_the_brands_leaves_no_hole,
-        ),
-        (
-            "a_transcript_streaming_onto_new_rows_leaves_no_hole",
-            a_transcript_streaming_onto_new_rows_leaves_no_hole,
-        ),
-        (
-            "a_footer_below_the_composer_leaves_no_hole_after_a_scroll",
-            a_footer_below_the_composer_leaves_no_hole_after_a_scroll,
-        ),
-        (
-            "a_line_editing_key_before_the_hesitated_key_leaves_no_hole",
-            a_line_editing_key_before_the_hesitated_key_leaves_no_hole,
-        ),
-        (
-            "a_status_tick_ending_on_the_hesitated_key_s_own_glyph_takes_nothing",
-            a_status_tick_ending_on_the_hesitated_key_s_own_glyph_takes_nothing,
-        ),
-    ];
-    let red: Vec<&str> = laws
-        .into_iter()
-        .filter(|(_, law)| std::panic::catch_unwind(law).is_err())
-        .map(|(name, _)| name)
-        .collect();
-    assert!(
-        red.is_empty(),
-        "{} of {} laws are red over the whole grid (each one's replays are in the output above): {red:#?}",
-        red.len(),
-        laws.len()
     );
 }
 

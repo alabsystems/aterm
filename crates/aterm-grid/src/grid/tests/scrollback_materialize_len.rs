@@ -6,83 +6,31 @@
 
 use super::super::*;
 
+/// The occupied length counts columns, not chars, and ignores default-styled
+/// trailing spaces.
 #[test]
-fn materialized_row_len_ascii_content() {
+fn materialized_row_len_counts_occupied_columns() {
     use crate::grid::scroll_materialize::materialize_from_line;
 
-    let attrs: Rle<CellAttrs> = std::iter::repeat_n(CellAttrs::DEFAULT, 5).collect();
-    let line = Line::with_attrs("Hello", attrs);
-    let row = materialize_from_line(&line, 10);
-
-    assert_eq!(row.len(), 5, "len should be 5 for 'Hello' in 10 cols");
-    assert!(!row.is_empty());
-}
-
-#[test]
-fn materialized_row_len_empty_row() {
-    use crate::grid::scroll_materialize::materialize_from_line;
-
-    let line = Line::new();
-    let row = materialize_from_line(&line, 10);
-
-    assert_eq!(row.len(), 0, "empty row should have len 0");
-    assert!(row.is_empty());
-}
-
-#[test]
-fn materialized_row_len_wide_cjk() {
-    use crate::grid::scroll_materialize::materialize_from_line;
-
-    let text = "日本";
-    let attr_count = text.chars().count();
-    let attrs: Rle<CellAttrs> = std::iter::repeat_n(CellAttrs::DEFAULT, attr_count).collect();
-    let line = Line::with_attrs(text, attrs);
-    let row = materialize_from_line(&line, 10);
-
-    assert_eq!(row.len(), 4, "two wide CJK chars should give len 4");
-}
-
-#[test]
-fn materialized_row_len_complex_emoji() {
-    use crate::grid::scroll_materialize::materialize_from_line;
-
-    let text = "\u{1F389}";
-    let attr_count = text.chars().count();
-    let attrs: Rle<CellAttrs> = std::iter::repeat_n(CellAttrs::DEFAULT, attr_count).collect();
-    let line = Line::with_attrs(text, attrs);
-    let row = materialize_from_line(&line, 10);
-
-    assert_eq!(row.len(), 2, "wide emoji should give len 2");
-}
-
-#[test]
-fn materialized_row_len_combining_mark() {
-    use crate::grid::scroll_materialize::materialize_from_line;
-
-    let text = "e\u{0301}";
-    let attr_count = text.chars().count();
-    let attrs: Rle<CellAttrs> = std::iter::repeat_n(CellAttrs::DEFAULT, attr_count).collect();
-    let line = Line::with_attrs(text, attrs);
-    let row = materialize_from_line(&line, 10);
-
-    assert_eq!(row.len(), 1, "base + combining mark should give len 1");
-}
-
-#[test]
-fn materialized_row_len_trailing_spaces_after_content() {
-    use crate::grid::scroll_materialize::materialize_from_line;
-
-    let text = "AB   ";
-    let attr_count = text.chars().count();
-    let attrs: Rle<CellAttrs> = std::iter::repeat_n(CellAttrs::DEFAULT, attr_count).collect();
-    let line = Line::with_attrs(text, attrs);
-    let row = materialize_from_line(&line, 10);
-
-    assert_eq!(
-        row.len(),
-        2,
-        "trailing default spaces should not contribute to len"
-    );
+    for (text, want) in [
+        ("", 0),
+        ("Hello", 5),
+        ("日本", 4),
+        ("\u{1F389}", 2),
+        ("e\u{0301}", 1),
+        ("AB   ", 2),
+    ] {
+        let line = if text.is_empty() {
+            Line::new()
+        } else {
+            let attrs: Rle<CellAttrs> =
+                std::iter::repeat_n(CellAttrs::DEFAULT, text.chars().count()).collect();
+            Line::with_attrs(text, attrs)
+        };
+        let row = materialize_from_line(&line, 10);
+        assert_eq!(row.len(), want, "{text:?}");
+        assert_eq!(row.is_empty(), want == 0, "{text:?}");
+    }
 }
 
 #[test]
@@ -100,32 +48,6 @@ fn materialized_row_len_styled_trailing_spaces() {
     assert_eq!(
         row.len(),
         2,
-        "MaterializedRow::len() now counts coloured trailing spaces, matching Row::len()"
-    );
-}
-
-#[test]
-fn materialized_row_len_matches_row_len_for_content() {
-    use crate::grid::scroll_materialize::materialize_from_line;
-
-    let mut grid = Grid::new(3, 10);
-    let red_fg = PackedColor::indexed(1);
-    let default_bg = PackedColor::DEFAULT_BG;
-
-    for (col, c) in "Hello".chars().enumerate() {
-        let cell = Cell::with_style(c, red_fg, default_bg, CellFlags::BOLD);
-        grid.row_mut(0).unwrap().set(col as u16, cell);
-    }
-
-    let row = grid.row(0).unwrap();
-    let row_len = row.len();
-
-    let line = Grid::row_to_line_static(row);
-    let mat = materialize_from_line(&line, 10);
-    let mat_len = mat.len();
-
-    assert_eq!(
-        row_len, mat_len,
-        "Row::len() ({row_len}) and MaterializedRow::len() ({mat_len}) should match for normal content"
+        "a coloured trailing space counts, as in Row::len()"
     );
 }

@@ -187,23 +187,25 @@ fn kitty_reports_the_layouts_character_beside_the_unshifted_key_code() {
 #[test]
 fn xterm_modify_other_keys_reads_the_layouts_shifted_keysym() {
     // modifyOtherKeys level 2 escapes a Shift chord whose shifted keysym is in
-    // '@'..DEL. German Shift+2 is '"', ordinary text; US Shift+2 is '@'.
+    // '@'..DEL, and reports that keysym. German Shift+2 is '"', ordinary text; US
+    // Shift+2 is '@'; UK Shift+' is '@' too.
     let level2 = KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL2;
     assert_eq!(press('2', SHIFT, level2, '2', '"'), b"\"");
     assert_eq!(
         encode_key(&Key::Character('2'), SHIFT, level2),
-        b"\x1b[27;2;50~"
+        b"\x1b[27;2;64~"
     );
+    assert_eq!(press('\'', SHIFT, level2, '\'', '@'), b"\x1b[27;2;64~");
 }
 
 #[test]
-fn the_layouts_character_never_replaces_a_chord() {
-    // Ctrl, Alt and Super chords encode from the base key on every layout:
-    // the window never carries layout text for them, and the encoder refuses
-    // it if a caller does.
+fn a_chord_writes_its_control_or_escape_form() {
+    // A chord writes its control or ESC form where one exists: Ctrl takes the
+    // key's own control byte first (the layout's character is a fallback), and
+    // Alt prefixes ESC.
     let none = KeyboardMode::empty();
     assert_eq!(press('2', SHIFT | CTRL, none, '2', '"'), [0x00]);
-    assert_eq!(press('a', ALT, none, 'a', 'å'), b"\x1ba");
+    assert_eq!(press('a', ALT, none, 'a', 'a'), b"\x1ba");
     assert_eq!(press('a', CTRL, none, 'a', 'A'), [0x01]);
     assert_eq!(press('a', CTRL, kitty(1), 'a', 'A'), b"\x1b[97;5u");
     // A control code is never text, and a named key never takes any.
@@ -266,10 +268,96 @@ fn ctrl_on_a_non_latin_layout_sends_the_us_letters_control_byte() {
     // Kitty reports the layout's key, with the US key in the base-layout field.
     assert_eq!(ctrl('с', CTRL, kitty(1), Some('c')), b"\x1b[1089;5u");
     assert_eq!(ctrl('с', CTRL, kitty(5), Some('c')), b"\x1b[1089::99;5u");
-    // Only a letter on a US letter key: AZERTY 'é' sits on the 2 key, and
-    // Ctrl+é is not Ctrl+2 (NUL). No US key known (a controller): unchanged.
-    assert_eq!(ctrl('é', CTRL, none, Some('2')), "é".as_bytes());
+    // No US key known (a controller): unchanged.
     assert_eq!(ctrl('с', CTRL, none, None), "с".as_bytes());
     // A Latin layout's own letters keep their bytes (AZERTY Ctrl+a on the Q key).
     assert_eq!(ctrl('a', CTRL, none, Some('q')), [0x01]);
+}
+
+/// ATERM-KI-1015-9: a chord on a non-US layout. `layout_text` is the layout's character at the
+/// press's Shift level, Ctrl and Alt aside (what the window reads off the key: xkb's keysym,
+/// AppKit's `-charactersIgnoringModifiers`). Alt sends ESC and then that character, as xterm
+/// sends ESC and its `XLookupString` text and kitty ESC and the layout's shifted key; Ctrl sends
+/// the character's control byte, else the control byte of the key at that position on US
+/// QWERTY (kitty's `alternate_key` and ghostty's physical key fallback for a non-ASCII key).
+#[test]
+fn a_chord_on_a_non_us_layout_takes_the_layouts_character() {
+    let none = KeyboardMode::empty();
+    // Alt + the layout's Shift level: German Alt+Shift+2 is ESC '"', not ESC '@'.
+    assert_eq!(press('2', ALT | SHIFT, none, '2', '"'), b"\x1b\"");
+    assert_eq!(press('7', ALT | SHIFT, none, '7', '/'), b"\x1b/");
+    // AZERTY Alt+Shift+& (the 1 key) is ESC '1'; Russian Alt+Shift+ф is ESC 'Ф'.
+    assert_eq!(press('&', ALT | SHIFT, none, '1', '1'), b"\x1b1");
+    assert_eq!(press('ф', ALT | SHIFT, none, 'a', 'Ф'), "\x1bФ".as_bytes());
+    // Without the layout's character (a controller's `key 2 mods=alt,shift`) the US table
+    // still names the glyph.
+    assert_eq!(
+        encode_key(&Key::Character('2'), ALT | SHIFT, none),
+        b"\x1b@"
+    );
+
+    // Ctrl on a non-Latin symbol key: the key's US position names the control byte.
+    let ctrl = |c: char, mods, mode, base| {
+        encode_key_with_layout(&Key::Character(c), mods, mode, KeyEventType::Press, base)
+    };
+    // Russian Ctrl+Х (the [ key) is ESC, German Ctrl+ü (the [ key) too, and Russian Ctrl+Ъ
+    // (the ] key) GS; with Alt, ESC-prefixed.
+    assert_eq!(ctrl('х', CTRL, none, Some('[')), [0x1b]);
+    assert_eq!(ctrl('ü', CTRL, none, Some('[')), [0x1b]);
+    assert_eq!(ctrl('ъ', CTRL, none, Some(']')), [0x1d]);
+    assert_eq!(ctrl('х', CTRL | ALT, none, Some('[')), [0x1b, 0x1b]);
+    assert_eq!(press('х', CTRL | SHIFT, none, '[', 'Х'), [0x1b]);
+    // AZERTY Ctrl+é (the 2 key) is Ctrl+2, NUL, as kitty and ghostty send it.
+    assert_eq!(ctrl('é', CTRL, none, Some('2')), [0x00]);
+    // The layout's own character comes first where it has a control byte: German Ctrl+Shift+ß
+    // types '?' at that level, DEL, where the US key there ('-' / '_') would say US.
+    assert_eq!(press('ß', CTRL | SHIFT, none, '-', '?'), [0x7f]);
+    // German Ctrl+Shift+2: '"' has none, the key's own '2' is NUL.
+    assert_eq!(press('2', CTRL | SHIFT, none, '2', '"'), [0x00]);
+    // A non-ASCII key whose US key has no control byte either keeps its character (German
+    // Ctrl+ö, the ; key), and an ASCII key is never moved (German Ctrl+#, the \ key).
+    assert_eq!(ctrl('ö', CTRL, none, Some(';')), "ö".as_bytes());
+    // With neither form the chord writes what the layout types at its level: German
+    // Ctrl+Shift+ö is 'Ö', and Alt+Shift+2 under ALT_NO_ESC (no ESC prefix) is '"'.
+    assert_eq!(press('ö', CTRL | SHIFT, none, ';', 'Ö'), "Ö".as_bytes());
+    assert_eq!(
+        press('2', ALT | SHIFT, KeyboardMode::ALT_NO_ESC, '2', '"'),
+        b"\""
+    );
+    assert_eq!(ctrl('#', CTRL, none, Some('\\')), b"#");
+    // modifyOtherKeys level 2 reports the key the byte names, as for Russian Ctrl+С.
+    assert_eq!(
+        ctrl(
+            'х',
+            CTRL,
+            KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL2,
+            Some('[')
+        ),
+        b"\x1b[27;5;91~"
+    );
+    // …and with Shift, though the layout reads 'Х' there: the twin's key is Ctrl+Shift+[
+    // ('{'), the byte it sends ESC.
+    assert_eq!(
+        press(
+            'х',
+            CTRL | SHIFT,
+            KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL2,
+            '[',
+            'Х'
+        ),
+        b"\x1b[27;6;123~"
+    );
+
+    // Kitty keeps the layout's key code; its shifted key is the layout's, chord or not ("the
+    // shifted version, in the currently active keyboard layout").
+    assert_eq!(
+        press('2', ALT | SHIFT, kitty(5), '2', '"'),
+        b"\x1b[50:34;4u"
+    );
+    assert_eq!(
+        press('2', CTRL | SHIFT, kitty(5), '2', '"'),
+        b"\x1b[50:34;6u"
+    );
+    assert_eq!(ctrl('х', CTRL, kitty(1), Some('[')), b"\x1b[1093;5u");
+    assert_eq!(ctrl('х', CTRL, kitty(5), Some('[')), b"\x1b[1093::91;5u");
 }

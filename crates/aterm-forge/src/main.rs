@@ -33,9 +33,7 @@ fn main() -> ExitCode {
             print!("{}", cli::USAGE);
             return ExitCode::from(exit::PASS);
         }
-        cli::Cmd::Survey { cells, top, json } => {
-            aterm_forge::survey::run(&root, &cells, top, json.as_deref())
-        }
+        cli::Cmd::Survey { cells, top } => aterm_forge::survey::run(&root, &cells, top),
         cli::Cmd::Blame { pkg, cells } => aterm_forge::blame::run(&root, &pkg, &cells),
         cli::Cmd::Budget {
             update,

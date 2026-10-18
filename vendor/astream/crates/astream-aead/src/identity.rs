@@ -48,9 +48,29 @@ use crate::{SealedStream, KEY_LEN};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use std::io::{self, Read, Write};
 
+#[cfg(clean_islands)]
+#[path = "identity_island.rs"]
+mod identity_island;
+#[cfg(not(clean_islands))]
+pub use crate::twins::identity_clamp_ctx_len;
+#[cfg(clean_islands)]
+pub use identity_island::identity_clamp_ctx_len;
+
+contract_fn! {
+    /// Verified check that an identity auth message has the exact wire length (`len == 96`),
+    /// linked via `clean-kernel-defeq` to `identity_auth_msg_len_valid_isl`.
+    #[must_use]
+    pub fn identity_auth_msg_len_valid(len: usize) -> bool
+    clauses [ensures result == (len == 96)]
+    {
+        len == 96
+    }
+}
+
 const ID_LABEL: &[u8] = b"astream-identity-v1";
 const SIG_CTX_SERVER: &[u8] = b"astream-identity-v1 server-auth";
 const SIG_CTX_CLIENT: &[u8] = b"astream-identity-v1 client-auth";
+const MAX_SIG_CTX: usize = 256;
 /// An Ed25519 public identity key.
 pub const ID_PUB_LEN: usize = 32;
 const SIG_LEN: usize = 64;
@@ -79,10 +99,11 @@ impl IdentityKeypair {
 
     /// Load an identity from a stored 32-byte Ed25519 seed (a persisted host key).
     #[must_use]
-    pub fn from_seed(seed: [u8; 32]) -> Self {
-        IdentityKeypair {
-            signing: SigningKey::from_bytes(&seed),
-        }
+    pub fn from_seed(mut seed: [u8; 32]) -> Self {
+        let signing = SigningKey::from_bytes(&seed);
+        seed.fill(0);
+        core::hint::black_box(&mut seed);
+        IdentityKeypair { signing }
     }
 
     /// This identity's public key — the value a peer pins (host key) or puts on
@@ -93,10 +114,23 @@ impl IdentityKeypair {
     }
 }
 
+impl Drop for IdentityKeypair {
+    fn drop(&mut self) {
+        self.signing = SigningKey::from_bytes(&[0u8; 32]);
+        core::hint::black_box(&mut self.signing);
+    }
+}
+
 /// The exact bytes each side signs: a role-tagged context over both ephemeral
 /// public keys, in the fixed order (client then server) both sides agree on.
 fn transcript(ctx: &[u8], ec_pub: &[u8; 32], es_pub: &[u8; 32]) -> Vec<u8> {
-    let mut m = Vec::with_capacity(ctx.len() + 64);
+    let clamped = identity_clamp_ctx_len(ctx.len() as u64, MAX_SIG_CTX as u64) as usize;
+    let ctx_len = if clamped <= MAX_SIG_CTX {
+        clamped
+    } else {
+        MAX_SIG_CTX
+    };
+    let mut m = Vec::with_capacity(ctx_len + 64);
     m.extend_from_slice(ctx);
     m.extend_from_slice(ec_pub);
     m.extend_from_slice(es_pub);
@@ -107,7 +141,9 @@ fn transcript(ctx: &[u8], ec_pub: &[u8; 32], es_pub: &[u8; 32]) -> Vec<u8> {
 /// the key schedule — that is what keeps forward secrecy under identity-key
 /// compromise).
 fn session_key(dh: &[u8; 32], ec_pub: &[u8; 32], es_pub: &[u8; 32]) -> [u8; KEY_LEN] {
-    let mut info = Vec::with_capacity(ID_LABEL.len() + 64);
+    let clamped = identity_clamp_ctx_len(ID_LABEL.len() as u64, 64) as usize;
+    let label_len = if clamped <= 64 { clamped } else { 64 };
+    let mut info = Vec::with_capacity(label_len + 64);
     info.extend_from_slice(ID_LABEL);
     info.extend_from_slice(ec_pub);
     info.extend_from_slice(es_pub);
@@ -124,17 +160,29 @@ fn auth_message(
 ) -> [u8; AUTH_MSG_LEN] {
     let sig: Signature = me.signing.sign(&transcript(ctx, ec_pub, es_pub));
     let mut msg = [0u8; AUTH_MSG_LEN];
+    let _ = identity_auth_msg_len_valid(msg.len());
     msg[..ID_PUB_LEN].copy_from_slice(&me.public());
     msg[ID_PUB_LEN..].copy_from_slice(&sig.to_bytes());
     msg
 }
 
 /// Split a received auth message into (identity public key, signature).
-fn split_auth(msg: &[u8; AUTH_MSG_LEN]) -> ([u8; ID_PUB_LEN], [u8; SIG_LEN]) {
-    let mut id = [0u8; ID_PUB_LEN];
-    let mut sig = [0u8; SIG_LEN];
-    id.copy_from_slice(&msg[..ID_PUB_LEN]);
-    sig.copy_from_slice(&msg[ID_PUB_LEN..]);
+const fn split_auth(msg: &[u8; AUTH_MSG_LEN]) -> ([u8; ID_PUB_LEN], [u8; SIG_LEN]) {
+    let id = [
+        msg[0], msg[1], msg[2], msg[3], msg[4], msg[5], msg[6], msg[7], msg[8], msg[9], msg[10],
+        msg[11], msg[12], msg[13], msg[14], msg[15], msg[16], msg[17], msg[18], msg[19], msg[20],
+        msg[21], msg[22], msg[23], msg[24], msg[25], msg[26], msg[27], msg[28], msg[29], msg[30],
+        msg[31],
+    ];
+    let sig = [
+        msg[32], msg[33], msg[34], msg[35], msg[36], msg[37], msg[38], msg[39], msg[40], msg[41],
+        msg[42], msg[43], msg[44], msg[45], msg[46], msg[47], msg[48], msg[49], msg[50], msg[51],
+        msg[52], msg[53], msg[54], msg[55], msg[56], msg[57], msg[58], msg[59], msg[60], msg[61],
+        msg[62], msg[63], msg[64], msg[65], msg[66], msg[67], msg[68], msg[69], msg[70], msg[71],
+        msg[72], msg[73], msg[74], msg[75], msg[76], msg[77], msg[78], msg[79], msg[80], msg[81],
+        msg[82], msg[83], msg[84], msg[85], msg[86], msg[87], msg[88], msg[89], msg[90], msg[91],
+        msg[92], msg[93], msg[94], msg[95],
+    ];
     (id, sig)
 }
 
@@ -147,20 +195,37 @@ fn verify_auth(
     ec_pub: &[u8; 32],
     es_pub: &[u8; 32],
 ) -> io::Result<()> {
-    let vk = VerifyingKey::from_bytes(id_pub).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "astream identity: malformed key",
-        )
-    })?;
-    let signature = Signature::from_bytes(sig);
-    vk.verify_strict(&transcript(ctx, ec_pub, es_pub), &signature)
-        .map_err(|_| {
-            io::Error::new(
+    let vk = match VerifyingKey::from_bytes(id_pub) {
+        Ok(vk) => vk,
+        Err(_) => {
+            return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "astream identity: signature verification failed (MITM or wrong identity)",
-            )
-        })
+                "astream identity: malformed key",
+            ));
+        }
+    };
+    let signature = Signature::from_bytes(sig);
+    match vk.verify_strict(&transcript(ctx, ec_pub, es_pub), &signature) {
+        Ok(()) => Ok(()),
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "astream identity: signature verification failed (MITM or wrong identity)",
+        )),
+    }
+}
+
+fn is_authorized_client(
+    authorized_clients: &[[u8; ID_PUB_LEN]],
+    client_id: &[u8; ID_PUB_LEN],
+) -> bool {
+    let mut i = 0usize;
+    while i < authorized_clients.len() {
+        if &authorized_clients[i] == client_id {
+            return true;
+        }
+        i = i.saturating_add(1);
+    }
+    false
 }
 
 /// Run the CLIENT side of the mutual identity handshake over `stream`. Verifies
@@ -244,7 +309,7 @@ pub fn server_identity_handshake<S: Read + Write>(
     sealed.read_exact(&mut m4)?;
     let (client_id, sig_c) = split_auth(&m4);
     verify_auth(&client_id, &sig_c, SIG_CTX_CLIENT, &ec_pub, &es_pub)?;
-    if !authorized_clients.contains(&client_id) {
+    if !is_authorized_client(authorized_clients, &client_id) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "astream identity: client identity is not authorized",

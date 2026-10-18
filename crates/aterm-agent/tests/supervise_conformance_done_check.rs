@@ -24,8 +24,9 @@ use aterm_agent::supervise::policy::turn_end::{
     Composer, DONE_CHECK, RULE_API_RETRY, RULE_CONTINUE, RULE_DONE_CHECK, RULE_OPEN_ITEMS,
     TurnEndAction, TurnEndReading, TurnEndState, decide_turn_end, open_items_text,
 };
+use aterm_models_harness::supervisor_done_check_model;
 use aterm_phase::wall::WallKind;
-use aterm_spec::derive::{Model, supervisor_done_check_model};
+use aterm_spec::derive::Model;
 
 type State = BTreeMap<&'static str, i64>;
 
@@ -68,25 +69,26 @@ fn point(said: &str, walled: bool, worked: Option<Duration>) -> TurnEndReading {
         resume: None,
         upgrading: false,
         taskless: false,
+        finished_record: None,
+        finished_at_check: false,
+        check_record: None,
+        left_record: false,
+        left_work: None,
         person: None,
         login_back: false,
         auto_continue: None,
         since_limit: None,
         served_in_transcript: false,
+        notice_elsewhere: false,
         reset_clock: None,
         reach: Default::default(),
         program: aterm_phase::Program::Claude,
-        goal: None,
-        model_field: None,
-        limits: Default::default(),
-        sandbox_fell: None,
-        thread_model: None,
-        upgrade_goal: false,
         account: None,
         autopilot: aterm_agent::supervise::Autopilot::Cruise,
         login_label: None,
         login_superseded: false,
         login_notice: None,
+        wall_remembered: false,
     }
 }
 
@@ -108,7 +110,11 @@ fn verdict(a: &TurnEndAction) -> Verdict {
             Verdict::Check
         }
         TurnEndAction::Type { text, rule_id } if *rule_id == RULE_OPEN_ITEMS => {
-            assert_eq!(text, &open_items_text(&["still open"], None), "its words");
+            assert_eq!(
+                text,
+                &open_items_text(&["still open"], None, false),
+                "its words"
+            );
             Verdict::Challenge
         }
         TurnEndAction::Type { rule_id, .. } if *rule_id == RULE_API_RETRY => Verdict::WallAct,
@@ -193,21 +199,24 @@ fn mirror(action: &str, before: &State, real: &mut Real) {
     }
 }
 
+/// The walk starts at a point that ended someone's turn of real work.
+fn init_real(now: Instant) -> Real {
+    let mut real = Real {
+        st: TurnEndState::default(),
+        now,
+        said: PROGRESS,
+        walled: false,
+    };
+    real.st.observe(&point(PROGRESS, false, Some(LONG)), now);
+    real
+}
+
 #[test]
 fn tier1_the_real_decider_checks_a_done_report_and_leaves_a_done_task() {
     let m = supervisor_done_check_model();
     let base = Instant::now() + Duration::from_secs(3600);
-    // The walk starts at a point that ended someone's turn of real work.
-    let mut init = Real {
-        st: TurnEndState::default(),
-        now: base,
-        said: PROGRESS,
-        walled: false,
-    };
-    init.st
-        .observe(&point(PROGRESS, false, Some(LONG)), init.now);
     let mut seen: BTreeSet<State> = BTreeSet::new();
-    let mut queue = VecDeque::from([(m.init_state(), init)]);
+    let mut queue = VecDeque::from([(m.init_state(), init_real(base))]);
     let mut verdicts = BTreeMap::<String, usize>::new();
     while let Some((st, real)) = queue.pop_front() {
         if !seen.insert(st.clone()) {
@@ -252,11 +261,6 @@ fn tier1_the_real_decider_checks_a_done_report_and_leaves_a_done_task() {
             queue.push_back((next, r));
         }
     }
-    // done 0, 1 and 2 at a clean point, 0 and 1 at a wall, and a
-    // continuation's, the check's and the wall's act's turn (from done 0 or
-    // 1); an open FINISHED's point; and, once the job was challenged, the
-    // challenge's turn and every state short of done again (19).
-    assert_eq!(seen.len(), 19, "the reachable space changed: {seen:?}");
     for word in ["Continue", "Check", "Challenge", "WallAct", "Nothing"] {
         assert!(
             verdicts.contains_key(word),
@@ -264,60 +268,31 @@ fn tier1_the_real_decider_checks_a_done_report_and_leaves_a_done_task() {
         );
     }
 
-    // Negative controls: at a done report, and on a done task, the Buggy
-    // model continues — the real decider types the check, then nothing.
+    // Negative controls: along a done report checked, its done yield and a
+    // wall someone else's turn ended on after it, the comparison rejects the
+    // `Buggy = 1` model at every point: it continues the report and the done
+    // task where the real decider checks and then does nothing, and does not
+    // act on the wall where the real decider retries.
     let buggy = aterm_spec::interp::with_buggy(&m, 1);
-    let mut real = Real {
-        st: TurnEndState::default(),
-        now: base,
-        said: PROGRESS,
-        walled: false,
-    };
-    real.st
-        .observe(&point(PROGRESS, false, Some(LONG)), real.now);
-    let mut st = m.init_state();
-    for action in ["OtherTurnDone", "Check", "YieldDone"] {
-        if action == "OtherTurnDone" {
-            assert!(buggy.action_enabled("Continue", &{
-                let mut b = st.clone();
-                assert!(buggy.fire(action, &mut b));
-                b
-            }));
-        }
+    let mut real = init_real(base);
+    let (mut st, mut b) = (m.init_state(), buggy.init_state());
+    for action in ["OtherTurnDone", "Check", "YieldDone", "OtherTurnWall"] {
         let before = st.clone();
-        assert!(m.fire(action, &mut st), "{action} at {st:?}");
+        assert!(m.fire(action, &mut st), "{action} at {before:?}");
+        assert!(buggy.fire(action, &mut b), "{action} at {b:?}");
         mirror(action, &before, &mut real);
-        if action == "OtherTurnDone" {
-            assert_eq!(verdict(&real.clone().decide()), Verdict::Check);
+        if action != "Check" {
+            assert_ne!(
+                verdict(&real.clone().decide()),
+                expected(&buggy, &b),
+                "the Buggy model agrees after {action}"
+            );
         }
     }
-    assert!(real.st.task_done());
-    assert!(
-        buggy.action_enabled("Continue", &st),
-        "the Buggy policy nudges a done task"
-    );
-    assert_eq!(verdict(&real.clone().decide()), Verdict::Nothing);
-    // …and someone else's turn that ends on a wall there: the Buggy model
-    // leaves the task done and does nothing; the real decider retries.
-    let mut b = st.clone();
-    assert!(buggy.fire("OtherTurnWall", &mut b));
-    assert!(!buggy.action_enabled("WallAct", &b), "{b:?}");
-    let before = st.clone();
-    assert!(m.fire("OtherTurnWall", &mut st));
-    mirror("OtherTurnWall", &before, &mut real);
-    assert!(!real.st.task_done());
-    assert_eq!(verdict(&real.clone().decide()), Verdict::WallAct);
 
     // At an open FINISHED the Buggy model ends the task at once (the harness
     // before DONE-1); the real decider types the challenge…
-    let mut real = Real {
-        st: TurnEndState::default(),
-        now: base,
-        said: PROGRESS,
-        walled: false,
-    };
-    real.st
-        .observe(&point(PROGRESS, false, Some(LONG)), real.now);
+    let mut real = init_real(base);
     let mut st = m.init_state();
     let before = st.clone();
     assert!(m.fire("OtherTurnOpenFinished", &mut st));

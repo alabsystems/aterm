@@ -354,20 +354,68 @@ mod tests {
         );
     }
 
+    /// The doctor and the updater must never disagree about the same install:
+    /// whatever `resolve_from` refuses to act on is exactly what `posture_from`
+    /// reports as unable to update, and only the two fixable states advise a move.
+    /// Translocation outranks the volume marker (a translocated path is
+    /// randomized), and an install on an external disk is refused too, which keeps
+    /// an ejected volume out of the boot trial's ownership rule.
     #[test]
-    fn resolves_canonical_app_layout() {
+    fn posture_agrees_with_what_the_updater_will_act_on() {
         let b = resolve_from(Path::new("/Applications/aterm.app/Contents/MacOS/aterm")).unwrap();
         assert_eq!(b.app_root, Path::new("/Applications/aterm.app"));
         assert_eq!(
             b.exe,
             Path::new("/Applications/aterm.app/Contents/MacOS/aterm")
         );
-    }
-
-    #[test]
-    fn rejects_dev_and_target_paths() {
-        assert!(resolve_from(Path::new("/Users//x/aterm/target/release/aterm-gui")).is_none());
-        assert!(resolve_from(Path::new("/tmp/aterm")).is_none());
+        for (p, want) in [
+            (
+                "/Applications/aterm.app/Contents/MacOS/aterm",
+                InstallPosture::Installed,
+            ),
+            (
+                "/Users//ana/Applications/aterm.app/Contents/MacOS/aterm",
+                InstallPosture::Installed,
+            ),
+            (
+                "/Volumes/aterm 0.67.0/aterm.app/Contents/MacOS/aterm",
+                InstallPosture::MountedImage,
+            ),
+            (
+                "/Volumes/Ext/Applications/aterm.app/Contents/MacOS/aterm",
+                InstallPosture::MountedImage,
+            ),
+            (
+                "/private/var/folders/zz/AppTranslocation/ABC/d/aterm.app/Contents/MacOS/aterm",
+                InstallPosture::Translocated,
+            ),
+            (
+                "/Volumes/x/private/var/AppTranslocation/ABC/d/aterm.app/Contents/MacOS/aterm",
+                InstallPosture::Translocated,
+            ),
+            (
+                "/Users//ana/aterm/target/release/aterm",
+                InstallPosture::NotABundle,
+            ),
+            ("/usr/local/bin/aterm", InstallPosture::NotABundle),
+            ("/tmp/aterm", InstallPosture::NotABundle),
+        ] {
+            let path = Path::new(p);
+            assert_eq!(posture_from(path), want, "{p}");
+            assert_eq!(
+                resolve_from(path).is_some(),
+                want == InstallPosture::Installed,
+                "the updater and the doctor disagree about {p}"
+            );
+            assert_eq!(
+                want.remedy().is_some(),
+                matches!(
+                    want,
+                    InstallPosture::MountedImage | InstallPosture::Translocated
+                ),
+                "{p}"
+            );
+        }
     }
 
     #[test]
@@ -393,6 +441,11 @@ mod tests {
             "<key>ATermDevBuild</key><string></string>"
         )));
         assert!(!plist_marks_dev_build("\u{0}bplist00 binary garbage"));
+        // A later key's string must not bind to this one (the hazard
+        // `xml_plist_string` guards for release identity).
+        assert!(!plist_marks_dev_build(
+            "<plist><dict><key>ATermDevBuild</key><key>Other</key><string>true</string></dict></plist>"
+        ));
     }
 
     #[test]
@@ -427,109 +480,5 @@ mod tests {
     fn the_shipped_info_plist_declares_the_chunked_grant() {
         let template = include_str!("../../../apps/aterm-mac/Info.plist");
         assert!(plist_declares_grant_chunks(template));
-    }
-
-    #[test]
-    fn dev_mark_cannot_be_lent_by_an_intervening_key() {
-        // Same hazard `xml_plist_string` guards for release identity: a later key's
-        // string must not bind to this one.
-        assert!(!plist_marks_dev_build(
-            "<plist><dict><key>ATermDevBuild</key><key>Other</key><string>true</string></dict></plist>"
-        ));
-    }
-
-    #[test]
-    fn posture_names_the_reason_not_just_the_refusal() {
-        let installed = Path::new("/Applications/aterm.app/Contents/MacOS/aterm");
-        let dmg = Path::new("/Volumes/aterm 0.67.0/aterm.app/Contents/MacOS/aterm");
-        let transloc = Path::new(
-            "/private/var/folders/zz/AppTranslocation/ABC/d/aterm.app/Contents/MacOS/aterm",
-        );
-        let bare = Path::new("/Users//ana/aterm/target/release/aterm");
-
-        assert_eq!(posture_from(installed), InstallPosture::Installed);
-        assert_eq!(posture_from(dmg), InstallPosture::MountedImage);
-        assert_eq!(posture_from(transloc), InstallPosture::Translocated);
-        assert_eq!(posture_from(bare), InstallPosture::NotABundle);
-    }
-
-    /// The doctor and the updater must never disagree about the same install:
-    /// whatever `resolve_from` refuses to act on is exactly what `posture_from`
-    /// reports as unable to update. (A dev-MARKED bundle is the one deliberate
-    /// exception and is not path-classifiable, so it is not covered here — see
-    /// `posture_from`'s note.)
-    #[test]
-    fn posture_agrees_with_what_the_updater_will_act_on() {
-        for p in [
-            "/Applications/aterm.app/Contents/MacOS/aterm",
-            "/Users//ana/Applications/aterm.app/Contents/MacOS/aterm",
-            "/Volumes/aterm 0.67.0/aterm.app/Contents/MacOS/aterm",
-            "/private/var/folders/zz/AppTranslocation/ABC/d/aterm.app/Contents/MacOS/aterm",
-            "/Users//ana/aterm/target/release/aterm",
-            "/usr/local/bin/aterm",
-        ] {
-            let path = Path::new(p);
-            assert_eq!(
-                resolve_from(path).is_some(),
-                posture_from(path) == InstallPosture::Installed,
-                "the updater and the doctor disagree about {p}"
-            );
-        }
-    }
-
-    /// Only the two fixable states advise a move, and both name the two
-    /// consequences that are otherwise invisible.
-    #[test]
-    fn only_fixable_states_advise_a_move() {
-        assert!(InstallPosture::Installed.remedy().is_none());
-        assert!(InstallPosture::NotABundle.remedy().is_none());
-        for p in [InstallPosture::MountedImage, InstallPosture::Translocated] {
-            let remedy = p.remedy().expect("a fixable state must say what to do");
-            assert!(remedy.contains("Applications"), "{remedy}");
-            assert!(remedy.contains("update itself"), "{remedy}");
-            assert!(remedy.contains("PATH"), "{remedy}");
-            assert!(
-                !p.summary().ends_with('.'),
-                "summary is a clause: {}",
-                p.summary()
-            );
-        }
-    }
-
-    /// Translocation wins over the volume marker: a translocated path is
-    /// randomized, so "drag it from the disk image" would name a copy the user
-    /// cannot find.
-    #[test]
-    fn translocation_outranks_the_volume_marker() {
-        assert_eq!(
-            posture_from(Path::new(
-                "/Volumes/x/private/var/AppTranslocation/ABC/d/aterm.app/Contents/MacOS/aterm"
-            )),
-            InstallPosture::Translocated
-        );
-    }
-
-    #[test]
-    fn rejects_translocated_and_mounted() {
-        assert!(
-            resolve_from(Path::new(
-                "/private/var/folders/zz/AppTranslocation/ABC/d/aterm.app/Contents/MacOS/aterm"
-            ))
-            .is_none()
-        );
-        assert!(
-            resolve_from(Path::new(
-                "/Volumes/aterm 0.2.0/aterm.app/Contents/MacOS/aterm"
-            ))
-            .is_none()
-        );
-        // An install on an external disk is refused too, which keeps an ejected
-        // volume out of the boot trial's ownership rule.
-        assert!(
-            resolve_from(Path::new(
-                "/Volumes/Ext/Applications/aterm.app/Contents/MacOS/aterm"
-            ))
-            .is_none()
-        );
     }
 }

@@ -196,6 +196,27 @@ pub struct Health {
     /// running.
     #[serde(default)]
     pub last_apply_refusal_build: u64,
+    /// Why [`Self::trial_proof_failure_build`]'s boot trial is still unconfirmed
+    /// although a launch of it reached its health checkpoint: who did, and the
+    /// recovery proof's own error. Empty when there is none.
+    ///
+    /// The checkpoint's confirmation answers only "retry", and its caller retries
+    /// on a backoff for as long as the process runs; without this the trial looks
+    /// exactly like one no window has reached, and `update status` asks the person
+    /// to open a window that is already open. Written once per distinct reason by
+    /// [`Self::record_trial_proof_failure`], cleared by the confirmation that
+    /// succeeds ([`Self::record_apply_success`]), and read only while that build's
+    /// trial is still armed, so a trial that ended any other way (a revert, a
+    /// disarm) leaves nothing that answers for it.
+    #[serde(default)]
+    pub trial_proof_failure: String,
+    /// RFC3339 UTC at which [`Self::trial_proof_failure`] was first recorded in
+    /// these words (empty when there is none).
+    #[serde(default)]
+    pub trial_proof_failure_at: String,
+    /// The build whose trial [`Self::trial_proof_failure`] is about (0 when none).
+    #[serde(default)]
+    pub trial_proof_failure_build: u64,
     /// The newer build this machine has been WAITING ON — staged in `Updates/`,
     /// or already installed under a running image that is older — and
     /// [`Self::pending_since`], when it was first seen waiting. `0` when
@@ -287,9 +308,21 @@ impl Health {
     /// Non-UTF-8 IS a corrupt ledger, deliberately folded to the healthy default.
     #[must_use]
     pub fn read(path: &Path) -> Self {
-        crate::read_ledger_text(path)
+        let mut h: Self = crate::read_ledger_text(path)
             .and_then(|t| aterm_toml::from_str(&t).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // Kept, so this build's next write carries it (see `diagnosis_at`).
+        h.last_diagnosis_at = h.diagnosis_at().to_string();
+        h
+    }
+
+    /// The newest failure of the standing diagnosis class ([`Self::last_diagnosis_at`]).
+    /// A build without that field drops it when it rewrites the ledger. Its
+    /// any-class stamp cannot replace it: a later network failure can be followed by
+    /// a relabel to the standing diagnosis without changing that stamp. Missing
+    /// evidence stays unknown until a new diagnosis failure records its own stamp.
+    fn diagnosis_at(&self) -> &str {
+        &self.last_diagnosis_at
     }
 
     /// Total consecutive failed checks across classes (the `failing=` status field).
@@ -368,8 +401,8 @@ impl Health {
     ///
     /// A class a CHECK books (`pipeline`, `manifest`, `stage`) must also have failed
     /// for [`PERSISTENT_SPAN`]: from its streak's start ([`Self::class_since`]) to its
-    /// newest failure ([`Self::last_diagnosis_at`]; a ledger an older build wrote has
-    /// only the any-class [`Self::last_failure_at`]). Measured between two failures,
+    /// newest failure ([`Self::last_diagnosis_at`]; on a ledger an older build rewrote,
+    /// what `diagnosis_at` can still vouch for). Measured between two failures,
     /// never against the clock, so a laptop asleep on a short streak wakes to the same
     /// verdict it slept on. `apply` is counted in attempts the apply lane paces on its
     /// own clock, and its count alone escalates.
@@ -392,17 +425,12 @@ impl Health {
     }
 
     /// Whether `class`'s streak has lasted [`PERSISTENT_SPAN`] (see
-    /// [`Self::persistent_class`]). An unreadable stamp has not.
+    /// [`Self::persistent_class`]). An unreadable or missing stamp has not.
     fn spans_persistently(&self, class: &str) -> bool {
         if class == "apply" {
             return true;
         }
-        let newest = if self.last_diagnosis_at.is_empty() {
-            &self.last_failure_at
-        } else {
-            &self.last_diagnosis_at
-        };
-        crate::install::rfc3339_delta_secs(self.class_since(class), newest)
+        crate::install::rfc3339_delta_secs(self.class_since(class), self.diagnosis_at())
             .is_some_and(|span| span >= PERSISTENT_SPAN.as_secs())
     }
 
@@ -728,6 +756,27 @@ impl Health {
         !self.last_apply_refusal.is_empty() && self.last_apply_refusal_build == current_build
     }
 
+    /// Record that a launch of `build` reached its health checkpoint and the trial's
+    /// recovery proof refused it, in `words` (see [`Self::trial_proof_failure`]),
+    /// and answer whether that is NEWS: the same words for the same build already
+    /// standing are not rewritten, so a confirmation retried on its backoff writes
+    /// — and its caller says — each distinct reason once, not once per try. Every
+    /// streak and every other slot is untouched: the trial is armed and still able
+    /// to revert, so nothing has failed to apply.
+    pub fn record_trial_proof_failure(path: &Path, build: u64, words: &str) -> bool {
+        let _lock = Self::lock(path);
+        let mut h = Self::read(path);
+        let words = capped_error(words);
+        if h.trial_proof_failure_build == build && h.trial_proof_failure == words {
+            return false;
+        }
+        h.trial_proof_failure = words;
+        h.trial_proof_failure_at = crate::install::now_rfc3339();
+        h.trial_proof_failure_build = build;
+        h.write(path);
+        true
+    }
+
     fn clear_apply_refusal(&mut self) {
         self.last_apply_refusal = String::new();
         self.last_apply_refusal_at = String::new();
@@ -762,10 +811,15 @@ impl Health {
         if h.apply_failures == 0
             && h.apply_failures_for_target == 0
             && h.last_apply_refusal.is_empty()
+            && h.trial_proof_failure.is_empty()
         {
             return h;
         }
         h.clear_apply_refusal();
+        // The trial whose proof had failed is the one that just confirmed.
+        h.trial_proof_failure = String::new();
+        h.trial_proof_failure_at = String::new();
+        h.trial_proof_failure_build = 0;
         // The artifact-scoped count answers to the same success: whatever build just
         // became the running build, no standing attempt survives it.
         h.apply_failures_for_target = 0;
@@ -1131,27 +1185,6 @@ mod tests {
         assert_eq!(h.kind, "pipeline", "named, not blanked");
     }
 
-    /// One lock scope: the apply-lane increment and the apply-owned reason must land
-    /// together. They used to be two locked writes with a window between them, and
-    /// `expire_stale_apply_streak` landing in that window durably dropped the
-    /// increment.
-    #[test]
-    fn an_apply_failure_records_its_streak_and_its_reason_together() {
-        let p = tmp("apply-failure-atomic");
-        let h = Health::record_apply_failure(&p, 77, 900 + 77, "AdoptionMismatch");
-        assert_eq!(h.apply_failures, 1);
-        assert_eq!(h.kind, "apply");
-        assert_eq!(h.last_apply_error, "AdoptionMismatch");
-        assert_eq!(h.last_apply_failure_build, 77);
-        assert!(!h.apply_since.is_empty(), "the class clock started");
-        // The returned record must equal what a reader sees on disk — i.e. the whole
-        // mutation was one write, not a partial one another writer could interleave.
-        let reread = Health::read(&p);
-        assert_eq!(reread.apply_failures, h.apply_failures);
-        assert_eq!(reread.last_apply_error, h.last_apply_error);
-        assert_eq!(reread.last_apply_failure_build, h.last_apply_failure_build);
-    }
-
     /// THE SPLICE THIS LEDGER USED TO REPORT. `failing_since` is any-class: it
     /// stamps when the ledger stopped being clean and does not move again until it
     /// is clean. A machine that had been failing to APPLY for days, and only later
@@ -1388,12 +1421,16 @@ mod tests {
             !h.last_apply_failure_at.is_empty(),
             "the lane owns its clock"
         );
-        // Same build still running: the streak is fresh evidence — stands.
-        Health::expire_stale_apply_streak(&p, 77);
-        assert!(
-            Health::read(&p).is_persistent(),
-            "same build ⇒ still standing"
-        );
+        // Same build still running: the streak is fresh evidence — stands. So does
+        // a straggler session still on an OLDER build (launched before the
+        // self-update): it proves nothing about the machine having moved, and
+        // erasing the streak from it would reset the freeze budget's per-artifact
+        // count.
+        for straggler_or_same in [77, 76] {
+            let h = Health::expire_stale_apply_streak(&p, straggler_or_same);
+            assert!(h.is_persistent(), "build {straggler_or_same}");
+            assert_eq!(h.apply_failures_for_target, PERSISTENT_AFTER);
+        }
         // A different build is running: the machine moved, the claim is stale.
         Health::expire_stale_apply_streak(&p, 78);
         let h = Health::read(&p);
@@ -1417,86 +1454,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
-    /// A stranded apply lane must escalate as loudly as a stranded download lane:
-    /// the user-visible symptom (machine does not move to the new version) is the
-    /// same, so it drives the same persistent-failure notification.
+    /// Every class that strands the machine escalates and names its own count:
+    /// `manifest` cannot heal on the client (an unsigned release stays unsigned until
+    /// it is republished), `stage` is an artifact that refuses to become a bundle.
+    /// `network` is the one class that must NOT alarm: it is transient and already
+    /// answered by slowing the cadence. Regression: the notice once took its count
+    /// from `pipeline_failures`, which is 0 for a manifest streak ("0 consecutive
+    /// checks").
     #[test]
-    fn a_persistent_apply_streak_is_surfaced_like_a_persistent_pipeline_streak() {
-        let p = tmp("apply-persistent");
-        for _ in 0..PERSISTENT_AFTER {
-            Health::record_apply_failure(&p, 77, 900 + 77, "ChildDied");
-        }
-        let h = Health::read(&p);
-        assert_eq!(h.apply_failures, PERSISTENT_AFTER);
-        assert!(
-            h.is_persistent(),
-            "a staged build that never applies must escalate, not sit in a file"
-        );
-        // And a healthy check does not silence it.
-        Health::record_success(&p);
-        assert!(Health::read(&p).is_persistent());
-    }
-
-    /// A MANIFEST STREAK ESCALATES. The class cannot heal on the client — an unsigned
-    /// release stays unsigned until the publisher republishes — so a streak of it
-    /// means this Mac cannot update.
-    #[test]
-    fn a_manifest_streak_escalates_and_names_its_own_class() {
-        let p = tmp("manifest-persistent");
-        for _ in 0..PERSISTENT_AFTER {
-            Health::record_failure(
-                &p,
-                "manifest",
-                "authoritative update v0.61 is unsigned under the pinned channel",
+    fn each_stranding_class_escalates_under_its_own_name_and_network_never_does() {
+        for (class, escalates) in [
+            ("manifest", true),
+            ("stage", true),
+            ("pipeline", true),
+            ("network", false),
+        ] {
+            let p = tmp(&format!("{class}-persistent"));
+            for _ in 0..PERSISTENT_AFTER * 4 {
+                Health::record_failure(&p, class, "reason");
+            }
+            // A check class escalates only once its streak spans PERSISTENT_SPAN.
+            backdate_streaks(&p, PERSISTENT_SPAN * 4);
+            let h = Health::read(&p);
+            assert_eq!(h.is_persistent(), escalates, "{class}");
+            assert_eq!(
+                h.persistent_class(),
+                escalates.then_some((class, PERSISTENT_AFTER * 4)),
+                "{class}"
             );
         }
-        backdate_streaks(&p, PERSISTENT_SPAN);
-        let h = Health::read(&p);
-        assert_eq!(h.manifest_failures, PERSISTENT_AFTER);
-        assert!(
-            h.is_persistent(),
-            "an untrustworthy authoritative release strands the machine exactly as \
-             surely as one that cannot be downloaded"
-        );
-        // The notification takes its count and its sentence from HERE, so the class
-        // must be named and the count must be its own — never `pipeline_failures`,
-        // which is 0 in this state and produced "0 consecutive checks".
-        assert_eq!(h.persistent_class(), Some(("manifest", PERSISTENT_AFTER)));
-        assert_eq!(
-            h.pipeline_failures, 0,
-            "the incident's pipeline lane was fine"
-        );
-    }
-
-    /// `stage` strands too: the artifact arrives and then refuses to become a bundle.
-    #[test]
-    fn a_stage_streak_escalates_and_names_its_own_class() {
-        let p = tmp("stage-persistent");
-        for _ in 0..PERSISTENT_AFTER {
-            Health::record_failure(&p, "stage", "sha256 mismatch");
-        }
-        backdate_streaks(&p, PERSISTENT_SPAN);
-        let h = Health::read(&p);
-        assert!(h.is_persistent());
-        assert_eq!(h.persistent_class(), Some(("stage", PERSISTENT_AFTER)));
-    }
-
-    /// `network` is the one class that must NOT alarm: it is genuinely transient and
-    /// is already answered by slowing the cadence.
-    #[test]
-    fn a_network_streak_never_escalates() {
-        let p = tmp("network-not-persistent");
-        for _ in 0..(PERSISTENT_AFTER * 4) {
-            Health::record_failure(&p, "network", "dns");
-        }
-        backdate_streaks(&p, PERSISTENT_SPAN * 4);
-        let h = Health::read(&p);
-        assert!(h.network_failures >= PERSISTENT_AFTER);
-        assert!(
-            !h.is_persistent(),
-            "a flaky network must not tell the user their updater is broken"
-        );
-        assert_eq!(h.persistent_class(), None);
     }
 
     /// THREE FAILED CHECKS ARE PERSISTENT ONLY ONCE THEY SPAN HALF AN HOUR. At the
@@ -1506,8 +1492,8 @@ mod tests {
     /// three spanning 30 minutes escalate. The span ends at the class's own newest
     /// failure: a DNS blip hours later (weather, which never resets a standing
     /// diagnosis) moves only the any-class stamp and stretches nothing. A ledger an
-    /// older build wrote, with no `last_diagnosis_at`, is measured to its
-    /// `last_failure_at`. `apply` counts attempts the apply lane paces itself, and
+    /// older build wrote, with no `last_diagnosis_at`, has no proven span until a
+    /// fresh diagnosis failure records one. `apply` counts attempts the apply lane paces itself, and
     /// three quick ones still escalate.
     #[test]
     fn a_check_class_streak_is_persistent_only_once_it_spans_half_an_hour() {
@@ -1548,10 +1534,10 @@ mod tests {
                 None,
                 "{class}: weather stretches nothing"
             );
-            // An older build's ledger: the any-class stamp is all there is.
+            // An older build's any-class stamp cannot establish a diagnosis span.
             let mut older = long.clone();
             older.last_diagnosis_at.clear();
-            assert_eq!(older.persistent_class(), Some((class, PERSISTENT_AFTER)));
+            assert_eq!(older.persistent_class(), None);
             older.last_failure_at = "2026-10-15T10:06:00Z".to_string();
             assert_eq!(older.persistent_class(), None);
         }
@@ -1577,6 +1563,63 @@ mod tests {
         assert!(
             h.last_diagnosis_at.is_empty() && !h.is_persistent(),
             "{h:?}"
+        );
+    }
+
+    /// A standing class label does not identify the last failure's timestamp.
+    /// An older writer can clear a network streak and relabel the surviving stage
+    /// streak without changing its later any-class stamp. Parse that carried record
+    /// and ask the actual persistence decision; a dedicated diagnosis stamp is the
+    /// evidence that distinguishes a long streak from a quick one.
+    #[test]
+    fn a_relabelled_legacy_diagnosis_has_no_proven_end_stamp() {
+        let captured = format!(
+            r#"kind = "stage"
+failing_since = "2026-10-15T10:00:00Z"
+last_failure_at = "2026-10-15T18:00:00Z"
+last_error = "standing stage verdict"
+last_diagnosis_error = "standing stage verdict"
+stage_failures = {PERSISTENT_AFTER}
+stage_since = "2026-10-15T10:00:00Z"
+"#
+        );
+        let legacy: Health = aterm_toml::from_str(&captured).unwrap();
+        let mut known_long = legacy.clone();
+        known_long.last_diagnosis_at = "2026-10-15T10:30:00Z".into();
+        assert_eq!(
+            known_long.persistent_class(),
+            Some(("stage", PERSISTENT_AFTER)),
+            "a dedicated half-hour span still escalates"
+        );
+        let mut known_quick = known_long.clone();
+        known_quick.last_diagnosis_at = "2026-10-15T10:06:00Z".into();
+        assert_eq!(
+            known_quick.persistent_class(),
+            None,
+            "weather extends nothing"
+        );
+        let apply: Health = aterm_toml::from_str(&format!(
+            r#"kind = "apply"
+apply_failures = {PERSISTENT_AFTER}
+"#
+        ))
+        .unwrap();
+        assert_eq!(apply.persistent_class(), Some(("apply", PERSISTENT_AFTER)));
+        let mut weather_label = legacy.clone();
+        weather_label.kind = "network".into();
+        let weather = weather_label.persistent_class();
+        // The production relabel keeps last_failure_at while restoring the label.
+        Health::relabel_by_standing(&mut weather_label);
+        assert_eq!(weather_label.kind, "stage");
+        assert_eq!(weather_label.last_failure_at, legacy.last_failure_at);
+        assert_eq!(
+            [
+                legacy.persistent_class(),
+                weather,
+                weather_label.persistent_class()
+            ],
+            [None, None, None],
+            "a legacy class label is not a diagnosis end stamp"
         );
     }
 
@@ -1688,19 +1731,14 @@ mod tests {
                 .starts_with("hdiutil attach failed after 4 attempts")
         );
         assert!(crate::is_passing_refusal(&h.last_error), "{}", h.last_error);
-        let (_, body) = crate::persistent_failure_notice("stage", h.stage_failures, &h, 1);
-        assert!(
-            body.contains("could not finish") && !body.contains("will not verify"),
-            "{body}"
-        );
         // A network blip on top of the standing stage streak overwrites `last_error`;
         // the notice describes the STAGE streak by the stage class's own reason.
         let h = Health::record_failure(&p, "network", "could not resolve the host");
         assert!(h.stage_failures >= crate::PERSISTENT_AFTER, "{h:?}");
-        let (_, body) = crate::persistent_failure_notice("stage", h.stage_failures, &h, 1);
         assert!(
-            body.contains("could not finish") && body.contains("hdiutil"),
-            "{body}"
+            crate::is_passing_refusal(&h.last_diagnosis_error),
+            "{}",
+            h.last_diagnosis_error
         );
         // The apply lane's slots keep it the same way.
         let h = Health::record_apply_failure(&p, 1, 2, &error);

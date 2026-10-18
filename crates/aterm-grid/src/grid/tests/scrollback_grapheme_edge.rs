@@ -72,51 +72,26 @@ fn advance_grapheme_unit_folds_a_flag_half_onto_its_base_past_a_mark() {
     }
 }
 
-/// Consecutive combining marks join the base.
+/// One call consumes exactly one cluster: a single ASCII char, a base with
+/// consecutive combining marks, a base with VS16, a whole ZWJ family emoji.
 #[test]
-fn advance_grapheme_unit_consecutive_combining_marks() {
+fn advance_grapheme_unit_consumes_one_cluster() {
     use crate::grid::scroll_materialize::advance_grapheme_unit;
 
-    let text = "e\u{0301}\u{0302}";
-
-    let mut byte_idx = 0;
-    let chars_consumed = advance_grapheme_unit(text, &mut byte_idx);
-    assert_eq!(
-        chars_consumed, 3,
-        "consecutive combining marks should all join base char"
-    );
-    assert_eq!(byte_idx, text.len());
-}
-
-/// An emoji plus VS16 is one unit.
-#[test]
-fn advance_grapheme_unit_variation_selector() {
-    use crate::grid::scroll_materialize::advance_grapheme_unit;
-
-    let text = "\u{2764}\u{FE0F}";
-
-    let mut byte_idx = 0;
-    let chars_consumed = advance_grapheme_unit(text, &mut byte_idx);
-    assert_eq!(
-        chars_consumed, 2,
-        "variation selector should join base char"
-    );
-    assert_eq!(byte_idx, text.len());
-}
-
-/// A single ASCII char is one unit of one byte.
-#[test]
-fn advance_grapheme_unit_single_ascii() {
-    use crate::grid::scroll_materialize::advance_grapheme_unit;
-
-    let text = "ABC";
-    let mut byte_idx = 0;
-    let chars_consumed = advance_grapheme_unit(text, &mut byte_idx);
-    assert_eq!(
-        chars_consumed, 1,
-        "single ASCII should consume exactly 1 char"
-    );
-    assert_eq!(byte_idx, 1, "should advance exactly 1 byte for ASCII");
+    for (text, chars, bytes) in [
+        ("ABC", 1, 1),
+        ("e\u{0301}\u{0302}", 3, 5),
+        ("\u{2764}\u{FE0F}", 2, 6),
+        ("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}", 5, 18),
+    ] {
+        let mut byte_idx = 0;
+        assert_eq!(
+            advance_grapheme_unit(text, &mut byte_idx),
+            chars,
+            "{text:?}"
+        );
+        assert_eq!(byte_idx, bytes, "{text:?}");
+    }
 }
 
 /// Effective width replays the live writer's VS16 widening: `❤` + VS16 comes
@@ -194,22 +169,6 @@ fn advance_grapheme_unit_wide_skin_tone_fold_gates_on_effective_width() {
     let (chars, wide) = (u.chars, u.wide);
     assert_eq!(chars, 3, "☝ + VS16 + modifier is one unit");
     assert!(wide, "the folded unit keeps the VS16-widened 2-cell width");
-}
-
-/// A ZWJ family emoji is one unit.
-#[test]
-fn advance_grapheme_unit_zwj_emoji_sequence() {
-    use crate::grid::scroll_materialize::advance_grapheme_unit;
-
-    let text = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
-
-    let mut byte_idx = 0;
-    let chars_consumed = advance_grapheme_unit(text, &mut byte_idx);
-    assert_eq!(
-        chars_consumed, 5,
-        "ZWJ family emoji should consume all 5 codepoints"
-    );
-    assert_eq!(byte_idx, text.len());
 }
 
 /// An endless ZWJ chain (from a crafted checkpoint or scrollback `Line`) is not

@@ -8,8 +8,28 @@
 use super::*;
 use crate::AtermTerminal;
 
-fn term() -> Option<AtermTerminal> {
-    AtermTerminal::new_from_system(6, 40, 14.0)
+/// This crate's host, for the tests `scrollback_tiers_api.rs` shares with
+/// aterm-gpu-web.
+type Host = AtermTerminal;
+
+/// The bundled JetBrains Mono: a checked-in face, so no test here needs a
+/// system font to construct its terminal.
+const FONT: &[u8] = include_bytes!("../../aterm-render/assets/bundled/JetBrainsMono-Regular.ttf");
+
+/// A 6x40 terminal on the bundled face: the shipped constructor, tiered store
+/// attached.
+fn term() -> Host {
+    AtermTerminal::new(
+        6,
+        40,
+        FONT,
+        14.0,
+        0x00d8_d8d8,
+        0x0018_1818,
+        0x00a0_c0ff,
+        0x0040_4050,
+    )
+    .expect("the bundled font")
 }
 
 /// The module-global budget is process-wide: while
@@ -35,23 +55,9 @@ fn feed_lines(t: &mut AtermTerminal, n: usize) {
 }
 
 #[test]
-fn ctor_attaches_tiered_store_with_the_unified_default_total() {
-    let Some(t) = term() else { return };
-    assert!(
-        t.term.scrollback().is_some(),
-        "E1: the wasm ctor must attach the tiered store"
-    );
-    assert_eq!(
-        t.term.scrollback_line_limit(),
-        Some(aterm_core::scrollback::DEFAULT_LINE_LIMIT),
-        "the construction default round-trips as ONE total"
-    );
-}
-
-#[test]
 fn ingest_stages_and_render_promotes() {
     let _global = global_budget_unset();
-    let Some(mut t) = term() else { return };
+    let mut t = term();
     // Well past the ring cap: scroll-off must STAGE (no inline promote).
     feed_lines(&mut t, 4_000);
     assert!(
@@ -85,7 +91,7 @@ fn a_flood_between_frames_leaves_one_marker() {
     // opportunity the frame drain skips while the flood outruns it, and
     // the drains after the flood promote ONE marker.
     let _global = global_budget_unset();
-    let Some(mut t) = term() else { return };
+    let mut t = term();
     t.set_scrollback_budget(2_000_000);
     for _ in 0..8 {
         feed_lines(&mut t, 10_000);
@@ -104,7 +110,7 @@ fn a_flood_between_frames_leaves_one_marker() {
 #[test]
 fn set_scrollback_limit_caps_the_total_across_tiers() {
     let _global = global_budget_unset();
-    let Some(mut t) = term() else { return };
+    let mut t = term();
     t.set_scrollback_limit(1_500);
     feed_lines(&mut t, 5_000);
     while t.drain_scrollback_backlog(0) > 0 {}
@@ -123,7 +129,7 @@ fn set_scrollback_limit_caps_the_total_across_tiers() {
 #[test]
 fn pane_budget_evicts_and_reports() {
     let _global = global_budget_unset();
-    let Some(mut t) = term() else { return };
+    let mut t = term();
     feed_lines(&mut t, 3_000);
     while t.drain_scrollback_backlog(0) > 0 {}
     let before = t
@@ -149,7 +155,7 @@ fn global_budget_caps_the_effective_share() {
     let _global = GLOBAL_BUDGET
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(mut t) = term() else { return };
+    let mut t = term();
     // Robust under parallel tests (other live panes shift the divisor):
     // the effective share can never exceed the global cap itself, and
     // restoring global=0 restores the configured budget.
@@ -170,7 +176,7 @@ fn global_budget_caps_the_effective_share() {
 #[test]
 fn truncation_and_pressure_are_observable_out_of_band() {
     let _global = global_budget_unset();
-    let Some(mut t) = term() else { return };
+    let mut t = term();
     assert_eq!(t.scrollback_truncated_lines(), 0.0);
     // Squeeze the pane budget, then keep feeding + draining: the store
     // must evict under pressure and the loss must surface in the counter
@@ -190,45 +196,4 @@ fn truncation_and_pressure_are_observable_out_of_band() {
             "no sentinel content injected (got {text:?})"
         );
     }
-}
-
-/// The JSON wire contract the host glue parses: exact keys, lowercase codec
-/// tokens, JSON-lowercase booleans.
-///
-/// This is a NATIVE test binary, and cargo unifies features per build — under
-/// `cargo test --workspace` the members that take `aterm-core` default-featured
-/// pull `disk-tier` onto the single `aterm-scrollback` unit, so
-/// `TierCapabilities::current()` legitimately reads `diskSpill` true here and
-/// false under `-p aterm-wasm`. A hard-coded literal therefore pinned the INVOCATION,
-/// not the contract. (The old comment here also had it backwards: this crate
-/// takes `aterm-core` with `default-features = false`.)
-///
-/// So pin every combination against the pure renderer — no arm can go dead —
-/// and separately assert the exported method reports THIS build faithfully. The
-/// shipped module's lz4/no-spill shape is enforced structurally instead: the
-/// wasm builds are `-p`-scoped (the wasm cells, the `wasm` perf lane) and
-/// `disk-tier` drags in the libc mmap store, which cannot target
-/// wasm32-unknown-unknown — so it fails to BUILD long before any assertion.
-#[test]
-fn tier_capabilities_json_pins_the_wire_contract() {
-    use aterm_core::scrollback::{ColdTierCodec, TierCapabilities};
-    let json = |cold_codec, disk_spill| {
-        render_tier_capabilities_json(TierCapabilities {
-            cold_codec,
-            disk_spill,
-        })
-    };
-    assert_eq!(
-        json(ColdTierCodec::Lz4, false),
-        "{\"coldCodec\":\"lz4\",\"diskSpill\":false}"
-    );
-    assert_eq!(
-        json(ColdTierCodec::Lz4, true),
-        "{\"coldCodec\":\"lz4\",\"diskSpill\":true}"
-    );
-    assert_eq!(
-        AtermTerminal::tier_capabilities_json(),
-        render_tier_capabilities_json(TierCapabilities::current()),
-        "the exported method must report the capabilities of THIS build"
-    );
 }

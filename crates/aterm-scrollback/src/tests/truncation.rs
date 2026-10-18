@@ -6,170 +6,84 @@
 
 use super::*;
 
-#[test]
-fn scrollback_truncate() {
-    let mut sb = Scrollback::new(100, 1000, 10_000_000);
-    for i in 0..50 {
-        sb.push_str(&format!("Line {i}"));
+/// A hot=5 / warm=10 / block=5 scrollback holding `L-00..L-29`, so the newest
+/// lines are in hot, the middle in warm and the oldest in cold.
+fn three_tier() -> Scrollback {
+    let mut sb = Scrollback::with_block_size(5, 10, 10_000_000, 5);
+    for i in 0..30 {
+        sb.push_str(&format!("L-{i:02}"));
     }
-
-    sb.truncate(10).expect("truncate should succeed");
-    assert_eq!(sb.line_count(), 10);
-
-    // Should keep the last 10 lines
-    assert_eq!(
-        sb.get_line(0)
-            .expect("no error")
-            .expect("line present")
-            .to_string(),
-        "Line 40"
-    );
-    assert_eq!(
-        sb.get_line(9)
-            .expect("no error")
-            .expect("line present")
-            .to_string(),
-        "Line 49"
-    );
+    assert!(sb.cold_line_count() > 0 && sb.warm_line_count() > 0);
+    sb
 }
 
-/// Truncate across tiers keeps cold/warm data when `n` exceeds the hot tier.
+/// `truncate` keeps exactly the newest `keep` lines on every path — hot only,
+/// into warm, into cold (#1693: it once cleared cold/warm whenever `keep`
+/// exceeded the hot tier) and zero — and never leaves hot over its limit.
 #[test]
-fn scrollback_truncate_cross_tier() {
-    // Small limits to force tier transitions
-    let mut sb = Scrollback::with_block_size(5, 10, 10_000_000, 5);
-
-    // Push 25 lines - spreads across cold (5), warm (10), hot (10)
-    for i in 0..25 {
-        sb.push_str(&format!("Line {i}"));
+fn truncate_keeps_the_newest_lines_on_every_path() {
+    let (hot, warm) = {
+        let sb = three_tier();
+        (sb.hot_line_count(), sb.warm_line_count())
+    };
+    for keep in [
+        hot.saturating_sub(1),
+        hot + 2,
+        hot + warm,
+        hot + warm + 5,
+        0,
+    ] {
+        let mut sb = three_tier();
+        sb.truncate(keep).expect("truncate should succeed");
+        assert_eq!(sb.line_count(), keep, "keep {keep}");
+        assert!(sb.hot_line_count() <= sb.hot_limit(), "keep {keep}");
+        for i in 0..keep {
+            let line = sb.get_line(i).expect("no error").expect("line present");
+            assert_eq!(line.to_string(), format!("L-{:02}", 30 - keep + i));
+        }
     }
-
-    // Verify lines are in multiple tiers
-    assert!(sb.cold_line_count() > 0, "expected cold tier data");
-    assert!(sb.warm_line_count() > 0, "expected warm tier data");
-    let hot_count = sb.hot_line_count();
-    assert!(hot_count > 0 && hot_count < 25, "expected partial hot tier");
-
-    // Truncate to keep more lines than hot tier has
-    // Bug: old code would clear cold/warm and only keep hot lines
-    let keep = 15;
-    assert!(keep > hot_count, "test requires n > hot_line_count");
-
-    sb.truncate(keep).expect("truncate should succeed");
-    assert_eq!(sb.line_count(), keep, "line count mismatch after truncate");
-
-    // Verify we kept the last 15 lines (10-24)
-    assert_eq!(
-        sb.get_line(0)
-            .expect("no error")
-            .expect("line present")
-            .to_string(),
-        "Line 10"
-    );
-    assert_eq!(
-        sb.get_line(14)
-            .expect("no error")
-            .expect("line present")
-            .to_string(),
-        "Line 24"
-    );
-}
-
-/// Test truncate with n=0 clears all tiers.
-#[test]
-fn scrollback_truncate_zero() {
-    let mut sb = Scrollback::with_block_size(5, 10, 10_000_000, 5);
-    for i in 0..25 {
-        sb.push_str(&format!("Line {i}"));
-    }
-
+    let mut sb = three_tier();
     sb.truncate(0).expect("truncate should succeed");
-    assert_eq!(sb.line_count(), 0);
-    assert_eq!(sb.hot_line_count(), 0);
-    assert_eq!(sb.warm_line_count(), 0);
-    assert_eq!(sb.cold_line_count(), 0);
+    assert_eq!(
+        (
+            sb.hot_line_count(),
+            sb.warm_line_count(),
+            sb.cold_line_count()
+        ),
+        (0, 0, 0)
+    );
 }
 
-/// The `remove_newest` slow path keeps the tier structure: surviving lines are
-/// not all dumped into hot past `hot_limit`.
+/// `remove_newest` keeps exactly the oldest lines on every path — the hot
+/// fast path, a partial warm block, past warm into cold, and everything. The
+/// slow path once dumped every survivor into hot past `hot_limit`; it
+/// re-promotes instead.
 #[test]
-fn remove_newest_slow_path_restores_tier_structure() {
-    let mut sb = Scrollback::with_block_size(5, 10, 10_000_000, 5);
-
-    // Push 30 lines — spreads across cold, warm, hot.
-    for i in 0..30 {
-        sb.push_str(&format!("Line {i:02}"));
+fn remove_newest_keeps_the_oldest_lines_on_every_path() {
+    let (hot, warm) = {
+        let sb = three_tier();
+        (sb.hot_line_count(), sb.warm_line_count())
+    };
+    for remove in [2, hot + 1, hot + 2, hot + warm + 3, 30] {
+        let mut sb = three_tier();
+        sb.remove_newest(remove)
+            .expect("remove_newest should succeed");
+        let expected = 30 - remove;
+        assert_eq!(sb.line_count(), expected, "remove {remove}");
+        assert!(sb.hot_line_count() <= sb.hot_limit(), "remove {remove}");
+        for i in 0..expected {
+            let line = sb.get_line(i).expect("no error").expect("line present");
+            assert_eq!(line.to_string(), format!("L-{i:02}"), "remove {remove}");
+        }
     }
-    assert_eq!(sb.line_count(), 30);
-    let hot_before = sb.hot_line_count();
-    assert!(
-        hot_before <= sb.hot_limit(),
-        "hot tier should respect limit before operation"
+    let mut sb = three_tier();
+    sb.remove_newest(30).expect("remove everything");
+    assert_eq!(
+        (
+            sb.hot_line_count(),
+            sb.warm_line_count(),
+            sb.cold_line_count()
+        ),
+        (0, 0, 0)
     );
-
-    // Remove more than hot tier contains → triggers slow path.
-    let remove = hot_before + 1;
-    sb.remove_newest(remove)
-        .expect("remove_newest should succeed");
-
-    let expected = 30 - remove;
-    assert_eq!(sb.line_count(), expected, "total line count after remove");
-
-    assert!(
-        sb.hot_line_count() < sb.hot_limit(),
-        "hot tier ({}) must stay under hot_limit ({}) after slow-path rebuild",
-        sb.hot_line_count(),
-        sb.hot_limit()
-    );
-
-    // Verify all remaining lines are accessible and have correct content.
-    for i in 0..expected {
-        let line = sb
-            .get_line(i)
-            .expect("no decompression error")
-            .unwrap_or_else(|| panic!("line {i} should exist"));
-        assert_eq!(line.to_string(), format!("Line {i:02}"));
-    }
-}
-
-/// Tier-aware truncate preserves tier structure: only removes lines from the
-/// oldest tier(s) without rebuilding the entire scrollback. Hot tier lines
-/// remain untouched when removals happen in cold/warm.
-#[test]
-fn truncate_slow_path_restores_tier_structure() {
-    let mut sb = Scrollback::with_block_size(5, 10, 10_000_000, 5);
-
-    for i in 0..30 {
-        sb.push_str(&format!("Line {i:02}"));
-    }
-    assert_eq!(sb.line_count(), 30);
-
-    // Keep more lines than hot tier has → triggers cross-tier truncate.
-    let keep = 20;
-    assert!(
-        keep > sb.hot_line_count(),
-        "test requires keep > hot_line_count to trigger cross-tier path"
-    );
-
-    sb.truncate(keep).expect("truncate should succeed");
-    assert_eq!(sb.line_count(), keep, "total line count after truncate");
-
-    // Hot tier stays at or below the promotion threshold (tier-aware truncate
-    // only removes from cold/warm when those tiers contain the oldest lines).
-    assert!(
-        sb.hot_line_count() <= sb.hot_limit(),
-        "hot tier ({}) must stay at or below hot_limit ({}) after truncate",
-        sb.hot_line_count(),
-        sb.hot_limit()
-    );
-
-    // Verify the kept lines are the newest 20 (lines 10-29).
-    for i in 0..keep {
-        let line = sb
-            .get_line(i)
-            .expect("no decompression error")
-            .unwrap_or_else(|| panic!("line {i} should exist"));
-        let expected_idx = 30 - keep + i;
-        assert_eq!(line.to_string(), format!("Line {expected_idx:02}"));
-    }
 }

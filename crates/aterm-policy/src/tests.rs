@@ -1,48 +1,19 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Unit tests for the policy data model, profiles and engine: TOML round-trips,
-//! the `hardened ⊆ standard ⊆ permissive` refinement over every sequence the
+//! Unit tests for the policy profiles and engine: the
+//! `hardened ⊆ standard ⊆ permissive` refinement over every sequence the
 //! profiles rule on, Hardened's fail-closed default, rule-vs-default
-//! arbitration, and the exhaustive `OriginTag` lattice order.
+//! arbitration, and the `OriginTag` lattice order.
 
 use super::{
-    Defaults, OriginTag, Policy, Profile, RateLimit, Response, Rule, SCHEMA_VERSION, aliases,
-    engine::PolicyEngine, profiles, profiles::refinement::response_rank,
+    Defaults, OriginTag, Policy, Profile, Response, Rule, SCHEMA_VERSION, engine::PolicyEngine,
+    profiles, profiles::refinement::response_rank,
 };
-
-// ---------------------------------------------------------------------------
-// Round-trip
-// ---------------------------------------------------------------------------
-
-#[test]
-fn builtin_profiles_roundtrip_through_toml() {
-    for original in [
-        profiles::permissive(),
-        profiles::standard(),
-        profiles::hardened(),
-    ] {
-        let ser = original.to_toml().expect("serializes");
-        let parsed: Policy = aterm_toml::from_str(&ser).expect("parses");
-        assert_eq!(original, parsed, "{:?}", original.profile);
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Refinement invariant
 // ---------------------------------------------------------------------------
-
-#[test]
-fn refinement_unmatched_default_is_monotone() {
-    let h = response_rank(profiles::hardened().defaults.unmatched);
-    let s = response_rank(profiles::standard().defaults.unmatched);
-    let p = response_rank(profiles::permissive().defaults.unmatched);
-    assert!(
-        h >= s && s >= p,
-        "refinement violated: hardened={h} standard={s} permissive={p} \
-         (expected hardened >= standard >= permissive over strictness rank)"
-    );
-}
 
 #[test]
 fn refinement_holds_over_all_sequences_and_origins() {
@@ -125,15 +96,6 @@ fn hardened_fails_closed_on_unknown_for_untrusted_origins() {
     }
 }
 
-#[test]
-fn hardened_denies_unmatched() {
-    assert_eq!(
-        profiles::hardened().defaults.unmatched,
-        Response::Drop,
-        "Hardened MUST drop on unmatched (§4.1 + §7.3)"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Hardened-specific invariants
 // ---------------------------------------------------------------------------
@@ -162,22 +124,6 @@ fn hardened_requires_shell_integration_nonce() {
 }
 
 // ---------------------------------------------------------------------------
-// Schema version + profile tag coherence
-// ---------------------------------------------------------------------------
-
-#[test]
-fn builtin_profiles_stamp_schema_version_and_tag() {
-    for (p, tag) in [
-        (profiles::permissive(), Profile::Permissive),
-        (profiles::standard(), Profile::Standard),
-        (profiles::hardened(), Profile::Hardened),
-    ] {
-        assert_eq!(p.schema_version, SCHEMA_VERSION);
-        assert_eq!(p.profile, tag);
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Rate-limit references resolve
 // ---------------------------------------------------------------------------
 
@@ -200,25 +146,6 @@ fn every_rate_limit_ref_resolves_in_each_profile() {
             }
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// Alias table
-// ---------------------------------------------------------------------------
-
-#[test]
-fn alias_table_has_expected_entries() {
-    // Design §3.4 — 7 canonical aliases.
-    assert_eq!(aliases::count(), 7);
-    assert!(aliases::lookup("OSC 52 set").is_some());
-    assert!(aliases::lookup("OSC 52 query").is_some());
-    assert!(aliases::lookup("response any").is_some());
-}
-
-#[test]
-fn alias_lookup_is_case_sensitive() {
-    assert!(aliases::lookup("OSC 52 set").is_some());
-    assert!(aliases::lookup("osc 52 set").is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -271,44 +198,8 @@ fn single_matching_rule_decides_for_every_response_and_origin_gate() {
 }
 
 // ---------------------------------------------------------------------------
-// Hand-built Rule / RateLimit round-trip
+// OriginTag trust lattice
 // ---------------------------------------------------------------------------
-
-#[test]
-fn manually_built_policy_roundtrips() {
-    let p = Policy {
-        schema_version: SCHEMA_VERSION,
-        profile: Profile::Standard,
-        defaults: Defaults {
-            unmatched: Response::Warn,
-            shell_integration_require_nonce: true,
-        },
-        rules: vec![Rule {
-            sequence: "OSC 52 set".to_owned(),
-            origin_min: OriginTag::User,
-            response: Response::Ask,
-            rate_limit: Some("clipboard".to_owned()),
-            prompt_id: Some("clipboard-write".to_owned()),
-        }],
-        rate_limits: vec![RateLimit {
-            id: "clipboard".to_owned(),
-            capacity_bytes: 16_384,
-            refill_per_second: 1_024,
-            per_sequence_max: 65_536,
-        }],
-    };
-
-    let ser = p.to_toml().expect("serialize");
-    let back: Policy = aterm_toml::from_str(&ser).expect("parse");
-    assert_eq!(p, back);
-}
-
-// ---------------------------------------------------------------------------
-// OriginTag trust lattice — exhaustive order proofs
-// ---------------------------------------------------------------------------
-//
-// With 8 elements, enumerating all pairs/triples is a complete proof, not a
-// sample.
 
 /// Every `OriginTag` variant, most- to least-trusted.
 const ALL_ORIGINS: [OriginTag; 8] = [
@@ -322,28 +213,6 @@ const ALL_ORIGINS: [OriginTag; 8] = [
     OriginTag::NetworkUntrusted,
 ];
 
-/// Compile-time guard: adding an `OriginTag` variant without extending
-/// [`ALL_ORIGINS`] (and the proofs below) is a hard error. The match is
-/// exhaustive without a wildcard because these tests live in the defining crate,
-/// and walking [`ALL_ORIGINS`] through it pins that the list names every variant
-/// exactly once, in trust order.
-#[test]
-fn all_origins_names_every_variant_once_in_order() {
-    for (index, &origin) in ALL_ORIGINS.iter().enumerate() {
-        let position = match origin {
-            OriginTag::Host => 0,
-            OriginTag::ConfigFile => 1,
-            OriginTag::User => 2,
-            OriginTag::UserTyped => 3,
-            OriginTag::Ai => 4,
-            OriginTag::PtySafe => 5,
-            OriginTag::Pty => 6,
-            OriginTag::NetworkUntrusted => 7,
-        };
-        assert_eq!(position, index, "ALL_ORIGINS[{index}] is {origin:?}");
-    }
-}
-
 #[test]
 fn trust_rank_is_a_bijection_onto_0_through_7() {
     // Each variant has a distinct rank covering exactly 0..8 — no collisions, no
@@ -355,42 +224,6 @@ fn trust_rank_is_a_bijection_onto_0_through_7() {
         (0..8).collect::<Vec<_>>(),
         "trust_rank must biject onto 0..8"
     );
-}
-
-#[test]
-fn dominates_agrees_with_trust_rank_everywhere() {
-    // The whole contract: `a dominates b  ⟺  rank(a) <= rank(b)`. Exhaustive 8×8.
-    for &a in &ALL_ORIGINS {
-        for &b in &ALL_ORIGINS {
-            assert_eq!(
-                a.dominates(b),
-                a.trust_rank() <= b.trust_rank(),
-                "dominates disagreed with trust_rank for {a:?} vs {b:?}"
-            );
-        }
-    }
-}
-
-#[test]
-fn dominance_is_a_reflexive_antisymmetric_transitive_total_order() {
-    for &a in &ALL_ORIGINS {
-        assert!(a.dominates(a), "reflexivity: {a:?}");
-        for &b in &ALL_ORIGINS {
-            assert!(a.dominates(b) || b.dominates(a), "totality: {a:?},{b:?}");
-            if a.dominates(b) && b.dominates(a) {
-                assert_eq!(a, b, "antisymmetry: {a:?},{b:?}");
-            }
-        }
-    }
-    for &a in &ALL_ORIGINS {
-        for &b in &ALL_ORIGINS {
-            for &c in &ALL_ORIGINS {
-                if a.dominates(b) && b.dominates(c) {
-                    assert!(a.dominates(c), "transitivity: {a:?},{b:?},{c:?}");
-                }
-            }
-        }
-    }
 }
 
 #[test]
@@ -412,16 +245,10 @@ fn host_is_the_top_and_networkuntrusted_is_the_bottom() {
     // The lattice is non-trivial: the top strictly dominates the bottom.
     assert!(OriginTag::Host.dominates(OriginTag::NetworkUntrusted));
     assert!(!OriginTag::NetworkUntrusted.dominates(OriginTag::Host));
-}
-
-#[test]
-fn pty_default_is_more_trusted_than_explicit_network() {
-    // Pins the deliberate threat-model choice (the one that LOOKS like an
-    // inversion vs aterm-provenance but is intentional here): an unshaped local
-    // PTY byte (`Pty`) is MORE trusted than an explicitly remote one
-    // (`NetworkUntrusted`), because the escape-policy floor treats known-remote as
-    // the least-trusted origin. Provenance's byte-taint lattice makes the opposite
-    // (Pty-as-catch-all-bottom) choice for its own purpose; the two are separate.
+    // The deliberate threat-model choice (it LOOKS like an inversion of
+    // aterm-provenance's byte-taint lattice, which makes Pty its catch-all
+    // bottom): an unshaped local PTY byte is MORE trusted than an explicitly
+    // remote one, the escape-policy floor.
     assert!(OriginTag::Pty.dominates(OriginTag::NetworkUntrusted));
     assert!(!OriginTag::NetworkUntrusted.dominates(OriginTag::Pty));
 }

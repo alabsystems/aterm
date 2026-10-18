@@ -42,6 +42,18 @@ aterm-tempfile = { workspace = true }
 # for the length of one call, and every mutation in the workspace routes through
 # that helper rather than a raw `set_var`/`remove_var`.
 aterm-log = { workspace = true }
+# `aterm_spec::host::could_not_run`: a live test whose shell or pty this host
+# lacks ends COULD NOT RUN, never a silent pass.
+aterm-spec = { workspace = true }
+
+# The Windows key-press test (src/tests_pwsh_keys.rs) types at a live PowerShell
+# prompt through the ConPTY a tab gets: aterm-pty's spawn, with the caps the test
+# mints as its own launcher (`launcher-mint` on this dev edge only, as aterm-pty's
+# and aterm-sandbox's own tests have it).
+[target.'cfg(windows)'.dev-dependencies]
+aterm-pty = { workspace = true }
+aterm-cap = { workspace = true, features = ["launcher-mint"] }
+aterm-sandbox = { workspace = true }
 
 [lints]
 workspace = true

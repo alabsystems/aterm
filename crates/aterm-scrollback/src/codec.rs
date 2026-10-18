@@ -23,7 +23,7 @@ pub(crate) const DEFAULT_WARM_LIMIT: usize = 10000;
 pub const DEFAULT_MEMORY_BUDGET: usize = 100 * 1024 * 1024;
 
 /// Default line limit (lines): bounds a runaway writer short of exhausting the
-/// memory budget (or, disk-backed, the disk). Unbounded history is opt-in via
+/// memory budget. Unbounded history is opt-in via
 /// `Scrollback::set_line_limit(None)` or a `TerminalConfig` whose
 /// `scrollback_limit` is `None`.
 pub const DEFAULT_LINE_LIMIT: usize = 100_000;
@@ -32,13 +32,13 @@ pub const DEFAULT_LINE_LIMIT: usize = 100_000;
 ///
 /// One limit for writer and reader: every page decoder admits this much (the
 /// LZ4 cap in `lz4.rs` is this constant) and `WarmTier::push_block` pages by
-/// it, so the store never writes a block it cannot read back. Cold and disk
-/// pages are one per warm block, so the bound carries to them.
+/// it, so the store never writes a block it cannot read back. Cold pages are
+/// one per warm block, so the bound carries to them.
 pub(crate) const MAX_DECOMPRESSED_SCROLLBACK_PAGE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Binary search on a sorted cumulative array, counting iterations in `steps`.
 ///
-/// `steps` is a plain `&mut usize`, not a callback, so the strict Trust gate
+/// `steps` is a plain `&mut usize`, not a callback, so the Trust lane (`ship trust run`)
 /// sees a closed body (an opaque callback is an absent callee it must assume
 /// may panic).
 pub(crate) fn binary_search_counted(
@@ -76,8 +76,7 @@ pub(crate) fn binary_search_counted(
     Err(left)
 }
 
-/// Compress a serialized scrollback block for the cold tier (in memory and on
-/// disk).
+/// Compress a serialized scrollback block for the cold tier.
 ///
 /// The cold codec is the size-prepended LZ4 path that already backs the warm
 /// tier, so a cold page decodes with [`decode_cold_bounded`] in any build.
@@ -106,7 +105,7 @@ pub(crate) fn decompress_lz4_bounded(compressed: &[u8]) -> Result<Vec<u8>, Scrol
         u32::from_le_bytes([compressed[0], compressed[1], compressed[2], compressed[3]]) as usize;
     if claimed_size > MAX_DECOMPRESSED_SCROLLBACK_PAGE_BYTES {
         // Built by hand, not with `format!`: `fmt::Arguments` embeds unsafe the
-        // strict Trust gate cannot lower.
+        // Trust lane (`ship trust run`) cannot lower.
         let mut msg = String::from("LZ4 prepended size ");
         msg.push_str(&crate::error::dec_string(claimed_size));
         msg.push_str(" exceeds ");

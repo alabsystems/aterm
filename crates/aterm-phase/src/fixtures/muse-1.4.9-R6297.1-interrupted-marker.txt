@@ -1,0 +1,11 @@
+# muse 1.4.9-R6297.1 · MEASURED 2026-10-16, `aterm ctl text --json` of a private headless aterm 120x40 (aterm 0.105.0 80b670745), the atpkg-managed muse (Meta latest) launched through its shim with a scratch HOME, `--base-url` at a local scripted stand-in for Meta's Responses endpoint (`--model fake-1`, a dummy META_API_KEY: no login and no model; the stand-in returns the tool call that raises the box, the box is muse's own), harness off · Esc while a reply streamed (the scripted reply takes 20 s): the reply's start `◆ Thinking about it slowly, one`, then the marker `◆ Interrupted · Report issues with /feedback` (bold f38ba8 diamond, f38ba8 text), the idle composer (an Esc before any reply retracts the turn instead, see the interrupted-draft-restored capture) · cursor=7,2 (visible) · scratch path redacted at equal length
+❯ SLOW reply
+
+◆ Thinking about it slowly, one
+
+◆ Interrupted · Report issues with /feedback
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  fake-1 · high · /private/tmp/at.XXXXXX/mwork · Auto-review

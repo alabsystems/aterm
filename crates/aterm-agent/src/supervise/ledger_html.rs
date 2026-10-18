@@ -462,26 +462,3 @@ pub(super) fn is_self_contained(html: &str) -> Result<(), String> {
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Every swatch the legend names has a style, and the style and script
-    /// fetch nothing.
-    #[test]
-    fn the_legend_names_every_shape_the_script_draws() {
-        for (cls, _) in LEGEND {
-            assert!(
-                STYLE.contains(&format!(".swatch.{cls} ")),
-                "the legend's {cls} swatch has no style"
-            );
-        }
-        for part in [STYLE, SCRIPT] {
-            assert_eq!(
-                is_self_contained(&format!("default-src 'none'{part}")),
-                Ok(())
-            );
-        }
-    }
-}

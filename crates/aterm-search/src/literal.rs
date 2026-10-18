@@ -88,23 +88,19 @@ mod tests {
     }
 
     #[test]
-    fn finds_single_byte_in_both_cases() {
-        assert_eq!(offsets("aA-x", "a"), vec![0, 1]);
-        assert_eq!(offsets("aA-x", "A"), vec![0, 1]);
-        assert_eq!(offsets("aA-x", "-"), vec![2]);
-    }
-
-    #[test]
-    fn finds_two_byte_and_overlapping_matches() {
-        assert_eq!(offsets("aAaAa", "AA"), vec![0, 1, 2, 3]);
-        assert_eq!(offsets("BANANA", "ana"), vec![1, 3]);
-    }
-
-    #[test]
-    fn handles_empty_long_and_missing_needles() {
-        assert!(offsets("abc", "").is_empty());
-        assert!(offsets("abc", "abcd").is_empty());
-        assert!(offsets("abc", "z").is_empty());
-        assert_eq!(offsets("abc", "ABC"), vec![0]);
+    fn finds_every_ascii_case_insensitive_occurrence() {
+        for (haystack, needle, want) in [
+            ("aA-x", "a", vec![0, 1]),
+            ("aA-x", "A", vec![0, 1]),
+            ("aA-x", "-", vec![2]),
+            ("aAaAa", "AA", vec![0, 1, 2, 3]),
+            ("BANANA", "ana", vec![1, 3]),
+            ("abc", "ABC", vec![0]),
+            ("abc", "", vec![]),
+            ("abc", "abcd", vec![]),
+            ("abc", "z", vec![]),
+        ] {
+            assert_eq!(offsets(haystack, needle), want, "{haystack:?} / {needle:?}");
+        }
     }
 }

@@ -42,7 +42,7 @@
 //! `cmd_turn`'s lease acquire, `run_feed_bin_routed`'s edge check and lease mirror),
 //! except `ERR busy sink`, decided at a write that moved nothing; a partial write
 //! answers `ERR write failed` (`control_input::guarded_input_reply`). Nothing else
-//! is carved out, not even `ERR usage`: `cmd_turn_guarded` answers its usage string
+//! is carved out, not even `ERR usage`: `cmd_turn` answers its usage string
 //! when a submit press fails after the text was typed. A reply string is not
 //! evidence about the PTY.
 
@@ -473,7 +473,7 @@ where
         Err(reply) => return reply,
     };
     let realm = Realm::of(scope);
-    let claim = match ctx.fabric.idem().claim(realm, key, &dup_reply(verb)) {
+    let claim = match ctx.idem.claim(realm, key, &dup_reply(verb)) {
         Claimed::Fresh(claim) => claim,
         Claimed::Answer(reply) => return reply,
     };
@@ -536,71 +536,6 @@ mod tests {
         assert_eq!(empty_payload_refusal(None, false), None);
     }
 
-    /// `turn`'s help names every keyed verb ([`KEYED_VERBS`]), says the others take
-    /// no key, and never says "every input verb" shares it: an unkeyed verb delivers
-    /// a leading `id=` as literal text (`control_tests.rs`'s
-    /// `unkeyed_verbs_deliver_a_leading_id_as_content`).
-    #[test]
-    fn the_turn_help_names_exactly_the_keyed_verbs() {
-        let detail = aterm_types::control_verbs::spec("turn")
-            .expect("`turn` is a catalog verb")
-            .detail;
-        for verb in KEYED_VERBS {
-            assert!(
-                detail.contains(&format!("`{verb}`")),
-                "`turn`'s key sentence must name `{verb}` — the roster is \
-                 KEYED_VERBS, stated, not gestured at"
-            );
-        }
-        assert!(
-            !detail.contains("every input verb"),
-            "\"every input verb shares\" was the false claim; it must not return"
-        );
-        assert!(
-            detail.contains("take NO key"),
-            "the entry must say the unkeyed verbs take no key, so a reader \
-             cannot infer coverage the code refuses"
-        );
-    }
-
-    /// `send`'s help files each keyed verb in the reply roster its framing
-    /// (`framing_of`) puts it in, and in no other.
-    #[test]
-    fn the_send_help_files_every_keyed_verb_on_the_side_its_framing_puts_it() {
-        use aterm_types::control_verbs::{Framing, framing_of, spec};
-        let detail = spec("send").expect("`send` is a catalog verb").detail;
-        // Read the two parenthesised rosters, not everything around the split
-        // point: `feed-bin` is also named earlier in the detail.
-        let roster = |after: &str| -> String {
-            let tail = detail
-                .split_once(after)
-                .unwrap_or_else(|| panic!("`send`'s help states {after:?}"))
-                .1;
-            tail.split_once(')')
-                .expect("the roster is parenthesised")
-                .0
-                .to_string()
-        };
-        let status = roster("`Status`-framed verb (");
-        let lines = roster("`Lines`/`Bytes` one (");
-        for verb in KEYED_VERBS {
-            let quoted = format!("`{verb}`");
-            let (side, other, name) = match framing_of(verb, verb) {
-                Framing::Status => (&status, &lines, "Status"),
-                _ => (&lines, &status, "Lines/Bytes"),
-            };
-            assert!(
-                side.contains(&quoted),
-                "`{verb}` is {name}-framed, so `send`'s help must list it in the \
-                 {name} roster; that roster reads ({side})"
-            );
-            assert!(
-                !other.contains(&quoted),
-                "`{verb}` is {name}-framed but `send`'s help also lists it in the \
-                 OTHER roster ({other}) — a reader cannot tell which reply to expect"
-            );
-        }
-    }
     use super::*;
 
     fn nonce() -> LaunchNonce {

@@ -45,6 +45,7 @@ const MAX_HANDOFF_FDS_WIRE_BYTES: usize = 32 * 1024;
 /// reads with (v0.100.0 and older, a rollback's target included), so FROZEN —
 /// a manifest past it is one an older successor refuses whole. This build's
 /// own read is [`MAX_INCOMING_MANIFEST_BYTES`].
+#[cfg(unix)]
 const MAX_HANDOFF_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 /// The largest manifest this build READS: eight times what it writes (L3, the
 /// consumer is only ever more lenient). v0.98.0 and every producer before it
@@ -333,7 +334,7 @@ impl AdoptionProof {
 /// exclude a substituted or partial adoption — but the exclusion is supplied by
 /// the transport plus our own code, and merely WITNESSED by the digest, which
 /// checks an integer that any process may put on any descriptor with `dup2`.
-/// Move the masters to `SCM_RIGHTS` (B4, `tests/handoff_launchd_job.rs`) and the
+/// Move the masters to `SCM_RIGHTS` (B4) and the
 /// kernel picks the receiver's numbers: the term stops agreeing, and the only
 /// way to keep it would be `dup2` surgery onto parent-chosen numbers at process
 /// entry, where one mistake destroys a live descriptor.
@@ -351,19 +352,17 @@ impl AdoptionProof {
 /// caller already holds, and to ANSWER a given minor it has to hold that very
 /// PTY — minting a character device with a chosen `st_rdev` needs `mknod(2)`,
 /// i.e. root. The "descriptor's ordinal in the parent-declared transfer order"
-/// sketched in `tests/handoff_launchd_job.rs` is transport-portable but as
+/// is transport-portable but as
 /// content-free as the number: it names a slot, so it detects a permutation and
 /// never a substitution. It is fine as ADDRESSING — which received descriptor
 /// is which `local_id` — and useless as proof.
 ///
-/// The two halves of that paragraph a running kernel can settle are settled by
-/// a test rather than by a note about what somebody once observed:
-/// `the_replacement_proof_term_distinguishes_masters_and_survives_dup` opens
-/// three real masters at once, asserts three DISTINCT minors, and asserts `dup`
-/// preserves each — the substitution half and the same-open-file-description
-/// half. The `SCM_RIGHTS` half stays an observation until there is fd-passing
-/// code to assert it against; it follows from the same open file description,
-/// but this file does not get to claim what it cannot run.
+/// The code that relies on that paragraph asserts it:
+/// `handoff_rendezvous::pty_device_term`'s
+/// `the_device_term_distinguishes_masters` (three real masters, three DISTINCT
+/// terms) and `a_grant_whose_connection_closes_at_once_is_still_claimed` (the
+/// `SCM_RIGHTS` half: over a real transfer, the same PTY at a different number
+/// keeps its term).
 ///
 /// It is not landed here because it IS the frozen-wire change above. The plan
 /// used to be a version ADVERTISEMENT through [`outgoing_parent_env`] — parent
@@ -1093,7 +1092,7 @@ fn screen_wire_digest(entries: &mut [ScreenWireEntry<'_>]) -> Option<[u8; 32]> {
 /// but a guessed nonce only ever COSTS the adoption — everything downstream fails closed —
 /// it can never fabricate a session or adopt a stranger's fd, so fail-open is the right
 /// posture here.
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 fn random_nonce() -> String {
     aterm_uds::rand::hex_token::<16>().unwrap_or_else(|_| "0".repeat(32))
 }
@@ -1598,36 +1597,11 @@ fn checkpoint_meta_is_bounded(meta: &CheckpointMeta) -> bool {
     checkpoint_meta_bound_violation(meta).is_none()
 }
 
-/// The `CheckpointMeta` keys a modern screen carry must name before this build
-/// deserializes it.
-///
-/// FROZEN — THIS LIST MAY ONLY SHRINK (the 2026-09-22/23 update audit, plan
-/// P0-2f/L3). The producer of a handoff is always the OLDER build, so a key
-/// added here is a key every producer already in the field fails to send: each
-/// of its sessions would arrive "unparseable". That used to refuse the whole
-/// update; since P0-2 it degrades each such session to a blank, repainted
-/// screen — every tab of every desk, on every hop from the older build. A new
-/// meta field rides `#[serde(default)]` instead, and
-/// `the_required_meta_keys_are_frozen` pins this list verbatim.
-const CHECKPOINT_META_REQUIRED_KEYS: &[&str] = &[
-    "rows",
-    "cols",
-    "cursor",
-    "alt_cursor",
-    "saved_cursor_main",
-    "saved_cursor_alt",
-    "modes",
-    "style_fg_bits",
-    "style_bg_bits",
-    "style_flag_bits",
-    "style_protected",
-    "charset",
-    "kitty_keyboard",
-    "xterm_keyboard",
-    "taskbar_progress",
-    "secure_keyboard_entry",
-    "current_working_directory",
-];
+// The `CheckpointMeta` keys a modern screen carry must name before this build
+// deserializes it: aterm-core's FROZEN list (it may only shrink; its doc says why),
+// shared with the crash-restore journal's keyframe reader so the two doors refuse the
+// same metas. `the_required_meta_keys_are_frozen` pins it verbatim.
+use aterm_core::terminal::CHECKPOINT_META_REQUIRED_KEYS;
 
 fn parse_checkpoint_meta(carry: &ScreenCarry) -> Option<CheckpointMeta> {
     if carry.schema != ScreenCarry::SCHEMA {
@@ -1827,6 +1801,7 @@ impl WireCaps {
     /// there (`Terminal::partial_sequence_state`), not only the hooked DCS no
     /// carry holds (`Terminal::partial_sequence_uncarried`): the queued tail of
     /// a split CSI would otherwise print as text in that successor.
+    #[cfg(unix)]
     #[must_use]
     pub(crate) const fn carries_parser(self) -> bool {
         self.carries_parser
@@ -1840,6 +1815,7 @@ impl WireCaps {
     /// (`Terminal::output_state_in_flight`): that successor would write the
     /// rest of the link's text unlinked and print the address bytes. To a
     /// successor that carries it, neither is a hazard.
+    #[cfg(unix)]
     #[must_use]
     pub(crate) const fn carries_output_state(self) -> bool {
         self.carries_output_state
@@ -1968,6 +1944,38 @@ pub(crate) fn admit_checkpoint_dimensions(
     has_alt: bool,
 ) -> Result<u64, AdmitRefusal> {
     WireCaps::current().admit(used_cells, rows, cols, history, has_alt)
+}
+
+/// [`admit_checkpoint_dimensions`] for a crash restore's checkpoint (`crash_restore`). Its
+/// history is not the handoff wire's (at most `MAX_HANDOFF_HISTORY_LINES`): it is the
+/// keyframe's bridge (at most `aterm_restore::policy::BRIDGE_CAP` lines) plus the lines the
+/// tail's replay pushed (bounded by the tail ring, 256 KiB), already decoded in the
+/// restorer's memory. So the visible grid and its alternate screen are priced exactly as a
+/// handoff's, and every history line on top of them against the same aggregate: a
+/// recovery whose screens would together pass it takes the META rung for the rest. The
+/// aggregate changes only on success.
+#[cfg(unix)]
+pub(crate) fn admit_restored_dimensions(
+    used_cells: &mut u64,
+    rows: u16,
+    cols: u16,
+    history: u32,
+    has_alt: bool,
+) -> Result<(), AdmitRefusal> {
+    let mut charged = *used_cells;
+    WireCaps::current().admit(&mut charged, rows, cols, 0, has_alt)?;
+    let history_cells = u64::from(history) * u64::from(cols);
+    let aggregate = AdmitRefusal::Aggregate {
+        cost: history_cells,
+        used: charged,
+        cap: MAX_HANDOFF_AGGREGATE_GRID_CELLS,
+    };
+    let next = charged.checked_add(history_cells).ok_or(aggregate)?;
+    if next > MAX_HANDOFF_AGGREGATE_GRID_CELLS {
+        return Err(aggregate);
+    }
+    *used_cells = next;
+    Ok(())
 }
 
 /// What one session's MANDATORY carry costs the aggregate: its visible grid plus
@@ -3676,6 +3684,7 @@ pub(crate) const MAX_HELD_AGGREGATE_GRID_BYTES: u64 = 16 * 1024 * 1024;
 /// its layout leaf names, its session id (round eight, finding 21), its
 /// visible screen, and how its command ended (round six of the update audit,
 /// finding 49) when the outgoing process had collected that.
+#[cfg(unix)]
 #[derive(Clone, Debug)]
 pub(crate) struct HeldScreen {
     pub local_id: u64,
@@ -3696,6 +3705,7 @@ pub(crate) struct HeldScreen {
     pub failure_seen: bool,
 }
 
+#[cfg(unix)]
 impl HeldScreen {
     /// The grid bytes this screen puts on disk — what
     /// [`MAX_HELD_AGGREGATE_GRID_BYTES`] prices.
@@ -4730,6 +4740,7 @@ pub(crate) struct IncomingHandoff {
     /// one ([`refused_whole`]); `None` for an admitted handoff and for a boot
     /// that was offered none. Decides how the refusing successor leaves
     /// ([`refused_intake_leave`]).
+    #[cfg_attr(not(unix), expect(dead_code, reason = "read only by the unix boot"))]
     pub refusal: Option<WholeRefusal>,
     /// The outgoing store's exit-ledger sequence
     /// ([`crate::session_store::SessionHandoff::roster_seq`]), which this
@@ -4741,7 +4752,15 @@ pub(crate) struct IncomingHandoff {
     /// ([`crate::session_store::SessionHandoff::fabric_attached`]), empty when
     /// none — armed by this process's supervisor when it has no command
     /// configured (round seven of the update audit, finding 7).
+    #[cfg_attr(not(unix), expect(dead_code, reason = "read only by the unix boot"))]
     pub fabric_attached: Vec<String>,
+    /// The outgoing process's bus-mirror tombstones
+    /// ([`crate::session_store::SessionHandoff::mirror_dropped`]), the rows as
+    /// written; adopted into this process's store before its first session.
+    pub mirror_dropped: Vec<String>,
+    /// Whether the outgoing process's node mirrored
+    /// ([`crate::session_store::SessionHandoff::mirror_served`]).
+    pub mirror_served: bool,
 }
 
 /// WHOSE CONTENT A WHOLE-HANDOFF REFUSAL WAS ABOUT (round six of the update
@@ -4863,8 +4882,8 @@ pub(crate) fn discard_outgoing(nonce: &str) {
 /// retires it too (`NothingSpeculativeOutlivesTheAttempt`).
 #[cfg(any(unix, test))]
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "native_update_speculative_sidecar",
         action = "Retire",
         project = "aterm_gui::handoff_diet::conformance::project"
@@ -5012,10 +5031,6 @@ pub(crate) const EXIT_CAPS_PASSING: &str = "passing75";
 /// its own; and two processes that reuse a pid cannot share it, which is
 /// exactly the property a bare pid lacks. Compared for EQUALITY only — it is an
 /// identity token, never a clock reading.
-///
-/// The same idea guarded the since-retired managed-Ollama daemon ("a bare PID
-/// is not an identity: it can be reused after exit"); this is the update lane's
-/// copy, kept local because the handoff needs the probe on its own hot path.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ProcessBirth {
@@ -5226,10 +5241,10 @@ fn attest_handoff_parent_from(
             ParentWitness::Birth(live)
         }
         (None, None) if creator == pid => {
-            // On macOS libproc answers for a live same-uid process (the retired
-            // managed-Ollama attestation depended on it), so no record is an anomaly, said
-            // below as the one signal that this machine's handoffs run on the
-            // weaker witness — or the parent is already EXITING: its birth read
+            // On macOS libproc answers for a live same-uid process, so no record
+            // is an anomaly, said below as the one signal that this machine's
+            // handoffs run on the weaker witness — or the parent is already
+            // EXITING: its birth read
             // fails about a millisecond before this link moves (the order measured
             // at `read_process_birth`), so the line names both causes. Off macOS
             // the link IS the documented witness.
@@ -5580,8 +5595,7 @@ pub(crate) fn prearm_incoming_fds() -> PrearmedIncomingFds {
 /// incoming handoff names, attest the outgoing parent, and scrub the authority
 /// environment.
 ///
-/// B3 — PROCESS-GROUP CONTAINMENT, RESIDUAL GAP (see
-/// `tests/handoff_launchd_job.rs`). On the fork lane the parent puts the
+/// B3 — PROCESS-GROUP CONTAINMENT, RESIDUAL GAP. On the fork lane the parent puts the
 /// candidate in its own process group with `setpgid(0, 0)` in
 /// `run_handoff_worker`'s `pre_exec`, which is what makes that file's
 /// `kill(-pid, SIGKILL)` sweep the candidate's `ditto`/`codesign`/`spctl`
@@ -5797,10 +5811,6 @@ impl PrearmedIncomingFds {
         &[]
     }
 
-    pub(crate) fn final_exec_env(&self) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
-        Vec::new()
-    }
-
     /// The re-exec's pairs (the unix twin's doc): no handoff exists off unix, but
     /// a snapshot's stray names ride the exec as they rode `environ`.
     pub(crate) fn final_exec_env_with(
@@ -5920,7 +5930,7 @@ pub(crate) fn target_identity_names_this_build(env: &HandoffEnv) -> bool {
 
 /// [`take_target_identity_from`] over the process environment: the env-shaped
 /// entry point the handoff suites drive (`handoff_env::through_process_env`).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[must_use]
 pub(crate) fn take_target_identity() -> Option<HandoffTarget> {
     crate::handoff_env::through_process_env(&[ENV_TARGET], take_target_identity_from)
@@ -6083,7 +6093,7 @@ pub(crate) fn incoming_offered_in(env: &HandoffEnv) -> bool {
 }
 
 /// [`incoming_offered_in`] over the process environment (the suites' shape).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[must_use]
 pub(crate) fn incoming_offered() -> bool {
     crate::handoff_env::through_process_env(&[ENV_FDS], |env| incoming_offered_in(env))
@@ -6638,8 +6648,7 @@ pub(crate) fn commit_and_exit(
             // `app_update_handoff::out_of_band_lane_refusal`; see "WHY THIS
             // `spawn` IS STILL HERE" in `run_handoff_worker`) is the successor a
             // fork child of ours, which survives as a pid-1 orphan holding this
-            // dead job's bootstrap context. Guarded by
-            // `tests/handoff_launchd_job.rs`.
+            // dead job's bootstrap context.
             //
             // This is the protocol's point of no return. `_exit` skips every
             // App/Session destructor that could SIGHUP the handed-off PTYs; the
@@ -6750,8 +6759,8 @@ pub(crate) fn take_ready_fd_from(
 /// make an intake an overlap adoption.
 #[cfg(unix)]
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "native_update_successor_warm_before_claim",
         action = "Adopt",
         project = "aterm_gui::seamless::handoff_env_conformance::project"
@@ -6900,11 +6909,13 @@ struct PackedTabStops {
 }
 
 /// The member of a keeper META's cursor that carries its [`PackedTabStops`].
+#[cfg(unix)]
 const PACKED_TAB_STOPS_KEY: &str = "tab_stops_packed";
 
 /// The stops a fresh grid `cols` wide holds, one every eighth column
 /// ([`aterm_core::grid::is_default_tab_stop`]): what a carried cursor's stops
 /// become wherever this module replaces them.
+#[cfg(any(unix, test))]
 pub(crate) fn default_tab_stops(cols: usize) -> Vec<bool> {
     (0..cols)
         .map(aterm_core::grid::is_default_tab_stop)
@@ -6943,6 +6954,7 @@ impl PackedTabStops {
     /// or over-wide vector, a bitmap longer than its length or with a digit
     /// that is not hex, or a stop past the length. The caller then keeps the
     /// META's own `tab_stops`, which the Repaint rung judges as it judges any.
+    #[cfg(any(unix, test))]
     fn unpack(&self) -> Option<Vec<bool>> {
         let len = usize::from(self.len);
         if len == 0 || len > usize::from(aterm_core::grid::MAX_GRID_COLS) {
@@ -7159,6 +7171,7 @@ fn keeper_meta_json(mut meta: CheckpointMeta) -> Option<Vec<u8>> {
 /// a readable meta does). A nonce is never taken from it, nor a partial
 /// sequence or in-flight output state, whatever window sent it: the META is a
 /// sample from some time before the crash, never the moment of it.
+#[cfg(unix)]
 pub(crate) fn recovered_checkpoint(
     meta: &[u8],
     used_cells: &mut u64,
@@ -7300,7 +7313,7 @@ pub(crate) fn recovered_fabric(meta: &[u8]) -> RecoveredFabric {
 
 /// [`take_incoming_from`] over the process environment: the env-shaped entry
 /// point the handoff suites drive (`handoff_env::through_process_env`).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn take_incoming() -> IncomingHandoff {
     take_incoming_as(ReceiverShape::Current)
 }
@@ -7337,8 +7350,8 @@ pub(crate) fn take_incoming() -> IncomingHandoff {
 /// parent already in the field. It used to refuse everything for either, with
 /// no log line, and every shell stayed on the old build.
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "native_update_successor_warm_before_claim",
         action = "TakeOwned",
         project = "aterm_gui::seamless::handoff_env_conformance::project"
@@ -7388,7 +7401,7 @@ fn refused_whole(whose: WholeRefusal, why: &str) -> IncomingHandoff {
 
 /// The names [`take_incoming_from_as`] reads: the four it consumes and the two
 /// channel names whose presence it checks.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 const INTAKE_KEYS: &[HandoffName] = &[
     ENV_MANIFEST,
     ENV_NONCE,
@@ -7398,7 +7411,7 @@ const INTAKE_KEYS: &[HandoffName] = &[
     ENV_COMMIT_FD,
 ];
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn take_incoming_as(shape: ReceiverShape) -> IncomingHandoff {
     crate::handoff_env::through_process_env(INTAKE_KEYS, |env| take_incoming_from_as(env, shape))
 }
@@ -7913,12 +7926,21 @@ fn take_incoming_from_as(env: &mut HandoffEnv, shape: ReceiverShape) -> Incoming
                     // mailbox re-validated row by row at the seed.
                     fabric: rec.fabric.clone(),
                     timeline_id: rec.timeline_id,
-                    // THE SESSION LOG'S EPOCH AND NODE-ID COUNTERS (slice 1):
-                    // a row that does not read carries none, never the manifest.
-                    log_carry: rec
-                        .log_ids
-                        .as_deref()
-                        .and_then(crate::session_log::LogCarry::parse),
+                    // THE SESSION LOG'S EPOCH, NODE-ID COUNTERS AND SEQ
+                    // COUNT: a row that does not read carries none, never the
+                    // manifest.
+                    log: crate::session_log::LogAdopt {
+                        ids: rec
+                            .log_ids
+                            .as_deref()
+                            .and_then(crate::session_log::LogCarry::parse),
+                        seq: rec.log_seq,
+                        // The carried log rides the control sidecar, taken off
+                        // it in `spawn_session` before the gap is marked.
+                        lines: None,
+                        keeper_ep: None,
+                        mirror: None,
+                    },
                     // THE PAIR THE CRASH JOURNAL KEYS THE SHELL BY, when the
                     // outgoing process held an image not its own (round
                     // seven's leftover I2b); one that does not read is none.
@@ -8131,6 +8153,8 @@ fn take_incoming_from_as(env: &mut HandoffEnv, shape: ReceiverShape) -> Incoming
         refusal: None,
         roster_seq: manifest.roster_seq,
         fabric_attached: manifest.fabric_attached,
+        mirror_dropped: manifest.mirror_dropped,
+        mirror_served: manifest.mirror_served,
     }
 }
 

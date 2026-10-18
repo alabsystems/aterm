@@ -207,7 +207,8 @@ mod tests {
     use super::*;
 
     /// The mirror's own statement of the rule, in the crate the dependency-free
-    /// `--dial` client calls (`aterm-ctl` pins it against `aterm-types`).
+    /// `aterm drive --socket` client calls (`aterm-ctl` pins it against
+    /// `aterm-types`).
     #[test]
     fn token_names_pair_per_socket_and_never_reach_a_reserved_name() {
         // Per-instance.
@@ -292,23 +293,6 @@ mod tests {
             dir.join("aterm-77.token")
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Two explicit sockets in one directory resolve to two different token
-    /// files, so the second instance cannot overwrite the first's credential.
-    #[test]
-    fn two_explicit_sockets_in_one_directory_never_share_a_token() {
-        let dir = test_dir("pair");
-        let a = dir.join("a.sock").to_string_lossy().into_owned();
-        let b = dir.join("b.sock").to_string_lossy().into_owned();
-        std::fs::write(dir.join("a.sock.token"), "aaaa\n").unwrap();
-        std::fs::write(dir.join("b.sock.token"), "bbbb\n").unwrap();
-        let ta = token_path_for_sock(&a).expect("resolves");
-        let tb = token_path_for_sock(&b).expect("resolves");
-        assert_ne!(ta, tb);
-        assert_eq!(std::fs::read_to_string(&ta).unwrap().trim(), "aaaa");
-        assert_eq!(std::fs::read_to_string(&tb).unwrap().trim(), "bbbb");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

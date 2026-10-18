@@ -972,7 +972,7 @@ fn the_classic_wake_and_an_empty_grid_obey_the_one_key_seam_law() {
 /// Rapid synthetic new lines keep their cue morphology. Enter after a typed command (one row
 /// down, column snapped left) is a Jump, which bypasses the synth's min-gap thinning, so a rapid
 /// run stacks flourishes; a held Enter at an empty prompt (one row down, same column) is a Typed
-/// pluck. The synth half is `trail_sound::tests::brrrring_of_rapid_line_feeds_is_pinned`.
+/// pluck.
 #[test]
 fn rapid_synthetic_line_feeds_cue_jump_and_typed_gestures() {
     use crate::trail_sound::SoundKind;

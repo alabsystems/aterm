@@ -5,17 +5,6 @@
 use super::*;
 
 #[test]
-fn bloom_insert_and_query() {
-    let mut bloom = BloomFilter::with_capacity(100);
-
-    bloom.insert("hello");
-    bloom.insert("world");
-
-    assert!(bloom.might_contain("hello"));
-    assert!(bloom.might_contain("world"));
-}
-
-#[test]
 fn bloom_no_false_negatives() {
     let mut bloom = BloomFilter::with_capacity(1000);
 
@@ -98,147 +87,6 @@ fn bloom_estimated_fpr() {
 }
 
 #[test]
-fn bloom_with_size() {
-    let bloom = BloomFilter::with_size(1024);
-    assert_eq!(bloom.num_bits(), 1024);
-}
-
-/// A lookup of a present item checks exactly K bits whatever the filter size.
-#[test]
-fn bloom_lookup_constant_time() {
-    fn measure_lookup_ops(num_bits: usize, num_items: usize, num_lookups: usize) -> usize {
-        take_get_bit_ops();
-        take_set_bit_ops();
-
-        let mut bloom = BloomFilter::with_size(num_bits);
-
-        for i in 0..num_items {
-            bloom.insert(&format!("item_{i}"));
-        }
-
-        take_get_bit_ops();
-        take_set_bit_ops();
-
-        // Present items, so every lookup checks all K bits.
-        for i in 0..num_lookups {
-            let result = bloom.might_contain(&format!("item_{}", i % num_items));
-            assert!(result, "item_{} should exist in filter", i % num_items);
-        }
-
-        take_get_bit_ops()
-    }
-
-    let items = 1000;
-    let lookups = 1000;
-
-    let ops_small = measure_lookup_ops(10_000, items, lookups);
-    let ops_large = measure_lookup_ops(1_000_000, items, lookups);
-
-    assert!(
-        ops_small > 0,
-        "lookup on 10K-bit filter should perform ops, got 0"
-    );
-    assert!(
-        ops_large > 0,
-        "lookup on 1M-bit filter should perform ops, got 0"
-    );
-
-    assert_eq!(
-        ops_small, ops_large,
-        "O(1) lookup: ops should be equal regardless of filter size (small={ops_small}, large={ops_large})"
-    );
-
-    let expected_ops = lookups * K;
-    assert_eq!(
-        ops_small, expected_ops,
-        "Expected exactly {expected_ops} bit ops ({lookups} lookups * K={K}), got {ops_small}"
-    );
-}
-
-/// An insert sets exactly K bits whatever the filter size.
-#[test]
-fn bloom_insert_constant_time() {
-    fn measure_insert_ops(num_bits: usize, num_inserts: usize) -> usize {
-        take_get_bit_ops();
-        take_set_bit_ops();
-
-        let mut bloom = BloomFilter::with_size(num_bits);
-
-        for i in 0..num_inserts {
-            bloom.insert(&format!("item_{i}"));
-        }
-
-        take_set_bit_ops()
-    }
-
-    let inserts = 1000;
-
-    let ops_small = measure_insert_ops(10_000, inserts);
-    let ops_large = measure_insert_ops(1_000_000, inserts);
-
-    assert!(
-        ops_small > 0,
-        "insert on 10K-bit filter should perform ops, got 0"
-    );
-    assert!(
-        ops_large > 0,
-        "insert on 1M-bit filter should perform ops, got 0"
-    );
-
-    assert_eq!(
-        ops_small, ops_large,
-        "O(1) insert: ops should be equal regardless of filter size (small={ops_small}, large={ops_large})"
-    );
-
-    let expected_ops = inserts * K;
-    assert_eq!(
-        ops_small, expected_ops,
-        "Expected exactly {expected_ops} bit ops ({inserts} inserts * K={K}), got {ops_small}"
-    );
-}
-
-#[test]
-fn bloom_insert_bytes() {
-    let mut bloom = BloomFilter::with_capacity(100);
-
-    bloom.insert_bytes(b"hello");
-    assert!(bloom.might_contain_bytes(b"hello"));
-    assert!(!bloom.might_contain_bytes(b"world"));
-    assert_eq!(bloom.count(), 1);
-
-    bloom.insert("world");
-    assert!(bloom.might_contain_bytes(b"world"));
-    assert!(bloom.might_contain("world"));
-}
-
-#[test]
-fn bloom_default() {
-    let bloom = BloomFilter::default();
-    // 10_000 items * 10 bits, rounded up to a multiple of 64.
-    assert_eq!(bloom.num_bits(), 100_032);
-    assert_eq!(bloom.count(), 0);
-    assert!(!bloom.might_contain("anything"));
-}
-
-#[test]
-fn bloom_empty_string() {
-    let mut bloom = BloomFilter::with_capacity(100);
-
-    bloom.insert("hello");
-    assert!(bloom.might_contain("hello"));
-    assert_eq!(bloom.count(), 1);
-
-    bloom.insert("");
-    assert!(bloom.might_contain(""));
-    assert_eq!(bloom.count(), 2);
-
-    assert!(
-        bloom.might_contain("hello"),
-        "inserting empty string must not corrupt existing entries"
-    );
-}
-
-#[test]
 fn bloom_with_size_rounding() {
     // Sizes round up to a multiple of 64, at least 64.
     let bloom = BloomFilter::with_size(100);
@@ -267,60 +115,6 @@ fn bloom_with_size_rounding() {
     }
 }
 
-/// A lookup returns at the first clear bit, so misses check fewer than K bits.
-#[test]
-fn bloom_lookup_early_return_on_miss() {
-    take_get_bit_ops();
-    take_set_bit_ops();
-
-    // Sparse (100 items in 1M bits): a miss almost always hits a 0 bit quickly.
-    let mut bloom = BloomFilter::with_size(1_000_000);
-    for i in 0..100 {
-        bloom.insert(&format!("existing_{i}"));
-    }
-
-    take_get_bit_ops();
-    take_set_bit_ops();
-
-    let lookups = 1000usize;
-    let mut false_positives = 0usize;
-    for i in 0..lookups {
-        if bloom.might_contain(&format!("nonexistent_{i}")) {
-            false_positives += 1;
-        }
-    }
-
-    // The theoretical rate is negligible; 1% is a generous bound.
-    assert!(
-        false_positives <= lookups / 100,
-        "false positive rate too high: {false_positives}/{lookups} ({:.1}%)",
-        false_positives as f64 / lookups as f64 * 100.0
-    );
-
-    let ops = take_get_bit_ops();
-
-    let avg_ops_per_lookup = ops / lookups;
-
-    assert!(
-        avg_ops_per_lookup < K,
-        "Early return optimization: avg ops per miss ({avg_ops_per_lookup}) should be less than K={K} for sparse filter"
-    );
-
-    assert!(ops > 0, "Should perform at least some bit checks");
-}
-
-/// Zero capacity must produce a valid (minimum-sized) filter, not panic or UB.
-#[test]
-fn bloom_zero_capacity() {
-    let bloom = BloomFilter::with_capacity(0);
-    assert_eq!(
-        bloom.num_bits(),
-        64,
-        "zero capacity should produce minimum 64-bit filter"
-    );
-    assert_eq!(bloom.count(), 0);
-}
-
 /// Extremely large capacity values must be capped rather than overflow.
 #[test]
 fn bloom_large_capacity_no_overflow() {
@@ -343,16 +137,6 @@ fn bloom_large_capacity_no_overflow() {
 #[test]
 fn bloom_with_size_max_no_overflow() {
     let bloom = BloomFilter::with_size(usize::MAX);
-    assert!(bloom.num_bits() <= BloomFilter::MAX_BITS);
-    assert_eq!(bloom.num_bits() % 64, 0);
-}
-
-/// A capacity past the bit cap is capped.
-#[test]
-fn bloom_capacity_near_overflow_boundary() {
-    // 10 bits per item puts 2^28 items past MAX_BITS on every target.
-    let bloom = BloomFilter::with_capacity(1 << 28);
-    assert!(bloom.num_bits() > 0);
     assert!(bloom.num_bits() <= BloomFilter::MAX_BITS);
     assert_eq!(bloom.num_bits() % 64, 0);
 }

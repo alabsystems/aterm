@@ -6,10 +6,8 @@
 //! WHY. cargo runs test binaries one at a time, even under `--no-fail-fast`, so
 //! a workspace's few hundred binaries, most of them under a second each, would
 //! be a serial walk on the run's critical path. This module runs several at
-//! once. They start longest first by the last run's times ([`start_order`]),
-//! up to `--test-jobs` at once ([`DEFAULT_JOBS`]) and more than [`FLOOR_JOBS`]
-//! only while the machine's load is under its cores ([`Limits::by_load`]), each
-//! with the whole pinned `RUST_TEST_THREADS`, as cargo's own run hands it.
+//! once, `--test-jobs` at a time ([`DEFAULT_JOBS`]), each with the whole
+//! pinned `RUST_TEST_THREADS`, as cargo's own run hands it.
 //!
 //! THE PROCESS IS CARGO'S, NOT A GUESS AT IT. A test binary is not just a path:
 //! cargo starts it in its package's root with an environment of its own —
@@ -44,8 +42,7 @@
 //! that log ([`crate::libtest::failed_tests`],
 //! [`crate::libtest::environment_refusals`]) reads it unchanged. The header is
 //! written at the head of each binary's own log before it starts
-//! ([`exec::Cmd::preamble`]), so a wall-clock kill names the binary and the
-//! test still running in it, per binary ([`crate::libtest::note`]).
+//! ([`exec::Cmd::preamble`]).
 //!
 //! NEVER LESS THAN CARGO. Anything that does not add up — the recording pass
 //! failed, cargo announced a binary the recorder did not see (or the reverse),
@@ -55,12 +52,10 @@
 //! cargo config names outranks this one) WAS that serial run, and is judged as
 //! one. No retry anywhere: a red binary is decided once, as cargo decided it.
 
-use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
 
 use crate::exec::{self, Cmd, Run};
 use crate::ladder::Report;
@@ -69,35 +64,10 @@ use crate::ladder::Report;
 /// --record-test-binary <dir> <test binary> <its args…>` ([`record_main`]).
 pub const RECORD_FLAG: &str = "--record-test-binary";
 
-/// The most test binaries that run at once unless `--test-jobs` says
-/// otherwise — a CAP, not a level: past [`FLOOR_JOBS`] the pool starts one more
-/// only while the machine's one-minute load is under its cores
-/// ([`Limits::by_load`]).
-///
-/// Eight: two at a time already took the run to about 60 % of cargo's serial
-/// walk, and with the long poles started first the whole tree's test run still
-/// held the run's critical path at two (`docs/measured/test-pool-2026-09-30.md`
-/// has the measurements).
+/// How many test binaries run at once unless `--test-jobs` says otherwise.
+/// Two at a time already took the run to about 60 % of cargo's serial walk
+/// (`docs/measured/test-pool-2026-09-30.md`).
 pub const DEFAULT_JOBS: u32 = 8;
-
-/// How many test binaries the pool always lets run at once when it has them,
-/// whatever the load, so a busy machine still runs two at a time.
-/// `--test-jobs 1` still means one at a time: the floor is never above the cap.
-pub const FLOOR_JOBS: usize = 2;
-
-/// THE MEMORY CAP: the most test binaries `ram` bytes hold at once beside the
-/// workspace builds `plan` can run during the test run
-/// ([`crate::plan::builds_held`] less [`crate::plan::builds_beside_tests`]),
-/// never under [`FLOOR_JOBS`]; an unread host gets the floor. Past it, a small
-/// host swaps and the tests that wait on sockets fail on its clock.
-#[must_use]
-pub fn memory_jobs(ram: Option<u64>, plan: &[crate::plan::StageSpec]) -> usize {
-    ram.map_or(FLOOR_JOBS, |ram| {
-        let beside = u64::try_from(crate::plan::builds_beside_tests(plan)).unwrap_or(u64::MAX);
-        let holds = crate::plan::builds_held(ram).saturating_sub(beside);
-        usize::try_from(holds).unwrap_or(usize::MAX).max(FLOOR_JOBS)
-    })
-}
 
 // NO BINARY RUNS ALONE. Every live suite scratches under its own pid-keyed
 // world (private sockets, state and HOME), so two binaries booting headless
@@ -480,9 +450,13 @@ pub fn plan(records: Vec<Record>, log: &str, exes: &[TestExe]) -> Result<Vec<Bin
                     exe.display()
                 ));
             }
+            // BY FILE NAME, the unit's hash in it: with a build directory (the
+            // build cache plain targo shares) the compile reports each test
+            // executable where it was built, under the build dir, and cargo runs
+            // the copy it puts under the target dir.
             let flag = exes
                 .iter()
-                .find(|e| e.exe == exe)
+                .find(|e| e.exe.file_name().is_some() && e.exe.file_name() == exe.file_name())
                 .map(|e| e.flag.clone())
                 .ok_or_else(|| format!("the compile did not report {}", exe.display()))?;
             let package = record
@@ -505,86 +479,16 @@ pub fn plan(records: Vec<Record>, log: &str, exes: &[TestExe]) -> Result<Vec<Bin
 // Running them.
 // ---------------------------------------------------------------------------
 
-/// Each shared binary's last wall time, in the run's state dir
-/// ([`crate::Ctx::state_dir`]), so the next run starts the longest first.
-pub const COSTS_FILE: &str = "test-costs.tsv";
-
-/// The order the shared binaries START in (their logs still print in
-/// declared order): the ones `costs` does not name first, then the rest
-/// longest first. In cargo's order the longest binaries can start last and
-/// run on alone at the end; longest first, they overlap the short ones
-/// instead. Stable, so no history is declared order.
-#[must_use]
-pub fn start_order(shared: &[usize], bins: &[Binary], costs: &BTreeMap<String, f64>) -> Vec<usize> {
-    let cost = |i: usize| costs.get(bins[i].spec.as_str());
-    let mut order = shared.to_vec();
-    order.sort_by(|&a, &b| match (cost(a), cost(b)) {
-        (None, None) => std::cmp::Ordering::Equal,
-        (None, Some(_)) => std::cmp::Ordering::Less,
-        (Some(_), None) => std::cmp::Ordering::Greater,
-        (Some(x), Some(y)) => y.total_cmp(x),
-    });
-    order
-}
-
-/// The recorded wall seconds by spec (`-p <package> <flag>`) in `path`; a
-/// missing or unreadable file is no history.
-#[must_use]
-pub fn read_costs(path: &Path) -> BTreeMap<String, f64> {
-    std::fs::read_to_string(path)
-        .map(|text| {
-            text.lines()
-                .filter_map(|l| {
-                    let (spec, secs) = l.rsplit_once('\t')?;
-                    Some((spec.to_string(), secs.parse().ok()?))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Merge this run's `measured` times into the history at `path` (a binary
-/// this run did not time keeps its row), written whole and renamed into
-/// place. A history that cannot be written only costs the next run its order.
-pub fn write_costs(path: &Path, measured: &[(String, f64)]) {
-    let mut costs = read_costs(path);
-    for (spec, secs) in measured {
-        costs.insert(spec.clone(), *secs);
-    }
-    let text: String = costs
-        .iter()
-        .map(|(spec, secs)| format!("{spec}\t{secs:.1}\n"))
-        .collect();
-    let tmp = path.with_extension("tsv.tmp");
-    if std::fs::write(&tmp, text).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
-    }
-}
-
-/// Run every binary through [`pool_within`] under `limits`, in [`start_order`] over
-/// `costs`, `load` reading the machine's busy cores. EVERY binary runs
-/// with the whole `threads`, as cargo's own run hands each one.
-/// `run_one(binary, its threads)` runs one; the answers come back in declared
-/// order whatever order they ran in, beside the most shared binaries that ran
-/// at once.
-pub fn run_all<F, L>(
-    bins: &[Binary],
-    limits: Limits,
-    threads: u32,
-    costs: &BTreeMap<String, f64>,
-    load: L,
-    run_one: F,
-) -> (Vec<Run>, usize)
+/// Run every binary through [`pool`], `jobs` at a time. EVERY binary runs with
+/// the whole `threads`, as cargo's own run hands each one. `run_one(binary, its
+/// threads)` runs one; the answers come back in declared order whatever order
+/// they ran in.
+pub fn run_all<F>(bins: &[Binary], jobs: usize, threads: u32, run_one: F) -> Vec<Run>
 where
     F: Fn(&Binary, u32) -> Run + Sync,
-    L: Fn() -> Option<f64> + Sync,
 {
     let all: Vec<usize> = (0..bins.len()).collect();
-    let order = start_order(&all, bins, costs);
-    let (ran, peak) = pool_within(bins.len(), &order, limits, load, |i| {
-        run_one(&bins[i], threads)
-    });
-    let runs = ran
+    pool(bins.len(), &all, jobs, |i| run_one(&bins[i], threads))
         .into_iter()
         .map(|pooled| {
             pooled.unwrap_or_else(|| Run {
@@ -594,215 +498,37 @@ where
                 spawn_error: None,
             })
         })
-        .collect();
-    (runs, peak)
+        .collect()
 }
 
-/// How long one reading of the load serves every slot that asks, and how long
-/// a slot the load holds back waits before it asks again.
-pub const LOAD_SAMPLE: Duration = Duration::from_secs(1);
-
-/// How many items a pool runs at once ([`pool_within`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Limits {
-    /// Never more than this many at once (at least one).
-    pub jobs: usize,
-    /// Always up to this many while items are left, whatever the load (never
-    /// above `jobs`).
-    pub floor: usize,
-    /// Past `floor`, one more starts only while the machine reads under this
-    /// many busy cores ([`crate::Ctx::test_load`]).
-    pub cores: u32,
-    /// Past `floor`, how long after one start the next waits, and reads the
-    /// machine afresh ([`ADMIT_SETTLE`]).
-    pub settle: Duration,
-}
-
-/// How long a binary started past the floor gets to show its CPU before the
-/// pool reads the machine for the next one. One reading serving every slot
-/// that asked within [`LOAD_SAMPLE`] would let a second that read idle start
-/// every free slot at once and overload the machine. A binary takes about a
-/// second to load and fan out its threads.
-pub const ADMIT_SETTLE: Duration = Duration::from_secs(2);
-
-impl Limits {
-    /// Exactly `jobs` at a time (at least one), the load never read.
-    #[cfg(test)]
-    #[must_use]
-    pub fn fixed(jobs: usize) -> Self {
-        let jobs = jobs.max(1);
-        Self {
-            jobs,
-            floor: jobs,
-            cores: 0,
-            settle: Duration::ZERO,
-        }
-    }
-
-    /// THE TEST RUN'S: up to `jobs` at once (at least one), always
-    /// [`FLOOR_JOBS`] of them (within `jobs`), and more only while the machine
-    /// reads under its `cores` busy (the cores busy over the last second,
-    /// [`crate::exec::busy_cores`]; the one-minute load where that cannot be
-    /// read). The reading is the whole
-    /// machine's, the pool's own binaries included — what a test that waits on
-    /// something feels — so the pool fills an idle machine and stops adding to a
-    /// busy one; it never stops a binary it started.
-    #[must_use]
-    pub fn by_load(jobs: usize, cores: u32) -> Self {
-        let jobs = jobs.max(1);
-        Self {
-            jobs,
-            floor: FLOOR_JOBS.min(jobs),
-            cores,
-            settle: ADMIT_SETTLE,
-        }
-    }
-
-    /// These limits with `settle` between starts past the floor.
-    #[must_use]
-    pub fn paced(self, settle: Duration) -> Self {
-        Self { settle, ..self }
-    }
-
-    /// THE ADMISSION LAW, pure so it is a test: with `running` items running,
-    /// may one more start? Under the floor, yes, and the load is not read;
-    /// at the cap, no; between, only while `load()` reads under the cores. A
-    /// load that cannot be read is not an idle machine: past the floor it is
-    /// a no.
-    #[must_use]
-    pub fn may_start(&self, running: usize, load: impl FnOnce() -> Option<f64>) -> bool {
-        running < self.jobs
-            && (running < self.floor || load().is_some_and(|l| l < f64::from(self.cores)))
-    }
-}
-
-/// Run `run(i)` for every index in `order` under `limits`: each item starts, in `order`, when
-/// [`Limits::may_start`] says one more may — `load` is read at most once per
-/// [`LOAD_SAMPLE`], and only when its answer decides that — and never stops
-/// once started. The answers come back by index, of `n`, with `None` for an
-/// index `order` does not hold, beside the most items that ran at once.
-/// Nothing is retried; a `run` that panics is this call's panic once the
-/// others are done, as a scoped thread's is.
-pub fn pool_within<T, F, L>(
-    n: usize,
-    order: &[usize],
-    limits: Limits,
-    load: L,
-    run: F,
-) -> (Vec<Option<T>>, usize)
+/// Run `run(i)` for every index in `order`, `jobs` at a time (at least one),
+/// each started in `order` as a slot frees; the answers come back by index, of
+/// `n`, with `None` for an index `order` does not hold. Nothing is retried; a
+/// `run` that panics is this call's panic once the others are done, as a
+/// scoped thread's is.
+pub fn pool<T, F>(n: usize, order: &[usize], jobs: usize, run: F) -> Vec<Option<T>>
 where
     T: Send,
     F: Fn(usize) -> T + Sync,
-    L: Fn() -> Option<f64> + Sync,
 {
-    /// What the slots share, under one lock so that deciding to start and
-    /// taking the next item are one step: the next item, how many run, the
-    /// most that ever did, and the last reading of the load with its time.
-    struct State {
-        next: usize,
-        running: usize,
-        peak: usize,
-        sampled: Option<(Instant, Option<f64>)>,
-        started_past_floor: Option<Instant>,
-    }
-    /// One running item's claim on `running`, given back when it ends — by a
-    /// panic too, so a slot that died never holds the floor.
-    struct Claim<'a>(&'a Mutex<State>);
-    impl Drop for Claim<'_> {
-        fn drop(&mut self) {
-            self.0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .running -= 1;
-        }
-    }
-    /// What a slot does next.
-    enum Step<'a> {
-        Run(Claim<'a>, usize),
-        Wait(Duration),
-        Done,
-    }
     let answers: Vec<Mutex<Option<T>>> = (0..n).map(|_| Mutex::new(None)).collect();
-    let state = Mutex::new(State {
-        next: 0,
-        running: 0,
-        peak: 0,
-        sampled: None,
-        started_past_floor: None,
-    });
+    let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
-        for _ in 0..limits.jobs.clamp(1, order.len().max(1)) {
+        for _ in 0..jobs.clamp(1, order.len().max(1)) {
             scope.spawn(|| {
-                loop {
-                    let step = {
-                        let mut st = state
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        let running = st.running;
-                        match order.get(st.next).copied() {
-                            None => Step::Done,
-                            Some(i) => {
-                                let past_floor = running >= limits.floor;
-                                let settling = past_floor
-                                    && st
-                                        .started_past_floor
-                                        .is_some_and(|at| at.elapsed() < limits.settle);
-                                let may = !settling
-                                    && limits.may_start(running, || match st.sampled {
-                                        Some((at, v)) if at.elapsed() < LOAD_SAMPLE => v,
-                                        _ => {
-                                            let v = load();
-                                            st.sampled = Some((Instant::now(), v));
-                                            v
-                                        }
-                                    });
-                                if may {
-                                    if past_floor {
-                                        // The next start past the floor waits out
-                                        // the settle; a settle past LOAD_SAMPLE
-                                        // also outlives this reading, so that start
-                                        // reads the machine afresh.
-                                        st.started_past_floor = Some(Instant::now());
-                                    }
-                                    st.next += 1;
-                                    st.running += 1;
-                                    st.peak = st.peak.max(st.running);
-                                    Step::Run(Claim(&state), i)
-                                } else if settling {
-                                    Step::Wait(
-                                        st.started_past_floor
-                                            .map_or(LOAD_SAMPLE, |at| {
-                                                limits.settle.saturating_sub(at.elapsed())
-                                            })
-                                            .min(LOAD_SAMPLE),
-                                    )
-                                } else {
-                                    Step::Wait(LOAD_SAMPLE)
-                                }
-                            }
-                        }
-                    };
-                    match step {
-                        Step::Done => break,
-                        Step::Wait(nap) => std::thread::sleep(nap),
-                        Step::Run(_claim, i) => {
-                            let out = run(i);
-                            *answers[i].lock().expect("answer") = Some(out);
-                        }
-                    }
+                while let Some(&i) = order.get(next.fetch_add(1, Ordering::SeqCst)) {
+                    let out = run(i);
+                    *answers[i]
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(out);
                 }
             });
         }
     });
-    let peak = state
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .peak;
-    let answers = answers
+    answers
         .into_iter()
         .map(|s| s.into_inner().ok().flatten())
-        .collect();
-    (answers, peak)
+        .collect()
 }
 
 /// The command that runs `b` as cargo would have, with `threads` test threads
@@ -875,32 +601,14 @@ pub fn combined(bins: &[Binary], runs: &[Run]) -> Run {
     }
 }
 
-/// The ladder's one line about how the binaries ran: every one with `threads`
-/// test threads; `timed` of the shared ones had a time in the history
-/// ([`COSTS_FILE`]), and at most `peak` of them ran at once under `limits`.
+/// The ladder's one line about how the binaries ran.
 #[must_use]
-pub fn summary(bins: &[Binary], limits: Limits, threads: u32, timed: usize, peak: usize) -> String {
+pub fn summary(bins: &[Binary], jobs: usize, threads: u32) -> String {
     let n = bins.len();
-    let mut s = format!("  test binaries: {n} — RUST_TEST_THREADS={threads} each, ");
-    let timed = timed.min(n);
-    // [`longest_first`] is stable: with no times it keeps cargo's order.
-    s.push_str(&match n - timed {
-        _ if timed == 0 => "in cargo's order (no times recorded yet), ".to_string(),
-        0 => "longest first by the last run's times, ".to_string(),
-        untimed => {
-            format!("the {untimed} never timed first, then longest first by the last run's times, ")
-        }
-    });
-    if limits.jobs > limits.floor {
-        s.push_str(&format!(
-            "up to {} at once, past {} only while fewer than {} cores read busy: \
-             {peak} at the most",
-            limits.jobs, limits.floor, limits.cores
-        ));
-    } else {
-        s.push_str(&format!("{} at a time", limits.jobs.min(n.max(1))));
-    }
-    s
+    format!(
+        "  test binaries: {n} — RUST_TEST_THREADS={threads} each, {} at a time",
+        jobs.min(n.max(1))
+    )
 }
 
 /// A binary the test run's ceiling left no time to start: a FAIL in cargo's
@@ -936,21 +644,16 @@ fn first_error(log: &str) -> String {
     line.trim().chars().take(200).collect()
 }
 
-/// Decide the test run's row exactly as the serial child's was decided, then
-/// print the slowest tests its `--report-time` verdicts timed
-/// ([`crate::libtest::slowest`]; nothing when none were timed).
+/// Decide the test run's row exactly as the serial child's was decided.
 ///
 /// A binary whose tests of a macOS service (`trustd`, the disk-image
 /// service) returned early because it did not answer passed without checking
 /// them: the row stays what ran decided, and ONE named skip per service says
-/// what did not ([`crate::libtest::host_skips`]).
+/// what did not ([`crate::libtest::host_skips`]), so `release` refuses.
 fn decide(r: &mut Report, run: &Run, label: &str, env: &[(OsString, OsString)]) {
     r.decide_test_child(run, label, env);
     for skip in crate::libtest::host_skips(&run.output) {
         r.skip(skip);
-    }
-    if let Some(table) = crate::libtest::slowest(&run.output, crate::stages::SLOWEST_TESTS_LISTED) {
-        r.raw(table);
     }
 }
 
@@ -1052,14 +755,7 @@ pub fn run_tests(
             return;
         }
     };
-    // Three quarters of the cores: the binaries running burst past their
-    // average, so a pool that admits until every core reads busy has none left
-    // for the burst.
-    let limits = Limits::by_load(
-        ctx.test_jobs()
-            .min(memory_jobs(ctx.host_memory, &crate::plan::plan(ctx))),
-        (ctx.cores() * 3 / 4).max(1),
-    );
+    let jobs = ctx.test_jobs();
     let threads = ctx.test_threads();
     // ONE CEILING FOR THE WHOLE RUN, as the serial child had: a binary is
     // started with what is left of it, and one whose turn comes after it is
@@ -1067,53 +763,17 @@ pub fn run_tests(
     // bound at all — two hangs, two ceilings.
     let ceiling = ctx.exec_env().child_ceiling;
     let started = std::time::Instant::now();
-    let costs_path = Some(ctx.state_dir().join(COSTS_FILE));
-    let costs = costs_path.as_deref().map(read_costs).unwrap_or_default();
-    let timed = bins.iter().filter(|b| costs.contains_key(&b.spec)).count();
-    let measured: Mutex<Vec<(String, f64)>> = Mutex::new(Vec::new());
-    let cpu: Mutex<Vec<Busy>> = Mutex::new(Vec::new());
-    let (runs, peak) = run_all(
-        &bins,
-        limits,
-        threads,
-        &costs,
-        || ctx.test_load(),
-        |b, t| {
-            let mut env = ctx.exec_env();
-            if let Some(limit) = ceiling {
-                let left = limit.saturating_sub(started.elapsed());
-                if left.is_zero() {
-                    return not_started(b, limit);
-                }
-                env.child_ceiling = Some(left);
+    let runs = run_all(&bins, jobs, threads, |b, t| {
+        let mut env = ctx.exec_env();
+        if let Some(limit) = ceiling {
+            let left = limit.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                return not_started(b, limit);
             }
-            let began = std::time::Instant::now();
-            let (run, spent) = exec::run_measured(&binary_cmd(b, t), env);
-            let wall = began.elapsed().as_secs_f64();
-            measured
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push((b.spec.clone(), wall));
-            if let Some(spent) = spent {
-                cpu.lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push(Busy {
-                        spec: b.spec.clone(),
-                        wall,
-                        cpu: spent.as_secs_f64(),
-                    });
-            }
-            run
-        },
-    );
-    if let Some(path) = &costs_path {
-        write_costs(
-            path,
-            &measured
-                .into_inner()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
-    }
+            env.child_ceiling = Some(left);
+        }
+        exec::run(&binary_cmd(b, t), env)
+    });
     // cargo's own lines from the pass (its warnings, `Finished`), without the
     // headers the binaries' logs carry.
     let preface: String = pass
@@ -1123,63 +783,10 @@ pub fn run_tests(
         .map(|l| format!("{l}\n"))
         .collect();
     r.raw(preface);
-    r.raw(summary(&bins, limits, threads, timed, peak));
+    r.raw(summary(&bins, jobs, threads));
     let all = combined(&bins, &runs);
     r.raw(all.output.as_str());
     decide(r, &all, label, &env);
-    if let Some(table) = busiest(
-        cpu.into_inner()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-        bins.len(),
-        BUSIEST_LISTED,
-    ) {
-        r.raw(table);
-    }
-}
-
-/// One test binary's cost in the test run: its wall seconds and the CPU
-/// seconds it and the processes it reaped spent ([`exec::run_measured`]).
-#[derive(Clone, Debug, PartialEq)]
-pub struct Busy {
-    pub spec: String,
-    pub wall: f64,
-    pub cpu: f64,
-}
-
-/// How many binaries [`busiest`] lists.
-pub const BUSIEST_LISTED: usize = 12;
-
-/// The binaries that spent the most CPU, most first, beside their wall time,
-/// under the run's total: on a saturated machine the test run's length follows
-/// the CPU every binary spends, which a binary's own wall time does not show.
-/// `planned` is how many binaries the run had: one with no
-/// CPU figure (a FAIL above names why) is left out, and the header says how
-/// many the table and its total leave out. `None` when no binary was measured
-/// (off Unix).
-#[must_use]
-pub fn busiest(mut runs: Vec<Busy>, planned: usize, n: usize) -> Option<String> {
-    if runs.is_empty() {
-        return None;
-    }
-    let total: f64 = runs.iter().map(|b| b.cpu).sum();
-    runs.sort_by(|a, b| b.cpu.total_cmp(&a.cpu).then_with(|| a.spec.cmp(&b.spec)));
-    let measured = runs.len();
-    let gap = if planned > measured {
-        format!("; {} not measured", planned - measured)
-    } else {
-        String::new()
-    };
-    let mut out = format!(
-        "  busiest test binaries by CPU ({} of {measured}; {total:.0} CPU-s in all{gap}):\n",
-        n.min(measured)
-    );
-    for b in runs.iter().take(n) {
-        out.push_str(&format!(
-            "    {:8.1} CPU-s {:7.1}s wall  {}\n",
-            b.cpu, b.wall, b.spec
-        ));
-    }
-    Some(out)
 }
 
 static RECORDING: AtomicUsize = AtomicUsize::new(0);
@@ -1217,75 +824,24 @@ mod tests {
             )
         };
         let t = judge(log(true));
-        assert_eq!(
-            t.skips,
-            [
-                "tests: trustd did not answer — 1 test binary skipped its code-signing and TLS \
-                 checks (aterm_uds unittests src/lib.rs); rebooting the Mac clears a wedged trustd"
-            ]
-        );
+        assert_eq!(t.skips.len(), 1, "{t:?}");
         assert!(!t.failed());
-        let t = judge(log(true).replace(
-            crate::libtest::skipped::SKIPPED,
-            crate::libtest::skipped::DISK_IMAGE_SKIPPED,
-        ));
-        assert_eq!(
-            t.skips,
-            [
-                "tests: hdiutil did not answer — 1 test binary skipped its disk-image checks \
-                 (aterm_uds unittests src/lib.rs); rebooting the Mac clears a wedged disk-image \
-                 service"
-            ]
+        // Each service is its own row, both on one binary that printed both.
+        let both = log(true).replace(
+            "running 1 test",
+            &format!(
+                "{}\nrunning 1 test",
+                crate::libtest::skipped::DISK_IMAGE_SKIPPED
+            ),
         );
+        assert_eq!(judge(both).skips.len(), 2);
         assert!(judge(log(false)).skips.is_empty());
-    }
-
-    /// The busiest table lists the binaries that spent the most CPU, most first
-    /// (ties by name), at most `n`, under the run's total; nothing measured is
-    /// no table.
-    #[test]
-    fn the_busiest_table_ranks_by_cpu_and_names_the_total() {
-        let b = |spec: &str, wall: f64, cpu: f64| Busy {
-            spec: spec.to_string(),
-            wall,
-            cpu,
-        };
-        assert_eq!(busiest(Vec::new(), 3, 3), None);
-        let runs = vec![
-            b("-p a --lib", 100.0, 20.0),
-            b("-p b --lib", 10.0, 90.0),
-            b("-p c --lib", 5.0, 20.0),
-        ];
-        let table = busiest(runs.clone(), 3, 2).expect("a table");
-        let lines: Vec<&str> = table.lines().collect();
-        assert!(lines[0].contains("(2 of 3; 130 CPU-s in all):"), "{table}");
-        assert!(
-            lines[1].ends_with("-p b --lib") && lines[1].contains("90.0 CPU-s"),
-            "{table}"
-        );
-        assert!(lines[2].ends_with("-p a --lib"), "ties by name: {table}");
-        assert_eq!(lines.len(), 3, "{table}");
-        // A binary with no CPU figure is left out: the header names how many
-        // the table and its total leave out.
-        let short = busiest(runs, 5, 2).expect("a table");
-        assert!(
-            short
-                .lines()
-                .next()
-                .unwrap()
-                .contains("130 CPU-s in all; 2 not measured)"),
-            "{short}"
-        );
     }
 
     fn rec(exe: &str, pkg: &str) -> Record {
         Record {
             cwd: PathBuf::from(format!("/r/crates/{pkg}")),
-            argv: vec![
-                exe.into(),
-                "-Zunstable-options".into(),
-                "--report-time".into(),
-            ],
+            argv: vec![exe.into(), "--skip".into(), "slow::".into()],
             env: vec![
                 ("CARGO_PKG_NAME".into(), pkg.into()),
                 ("RUST_TEST_THREADS".into(), "14".into()),
@@ -1376,30 +932,11 @@ mod tests {
                  \"/tmp/q\\\"d\"]"
             )
         );
-        let serial = Cmd::new("targo").args([
-            "--unverified",
-            "test",
-            "--workspace",
-            "--no-fail-fast",
-            "--tests",
-            "--",
-            "-Zunstable-options",
-            "--report-time",
-        ]);
+        let serial = Cmd::new("targo").args(["test", "--tests", "--", "--skip", "x"]);
         assert_eq!(
             recording_cmd(&serial, "CFG").argv(),
             [
-                "targo",
-                "--unverified",
-                "test",
-                "--workspace",
-                "--no-fail-fast",
-                "--tests",
-                "--config",
-                "CFG",
-                "--",
-                "-Zunstable-options",
-                "--report-time"
+                "targo", "test", "--tests", "--config", "CFG", "--", "--skip", "x"
             ],
             "cargo's flag before the separator, libtest's arguments untouched after it"
         );
@@ -1471,6 +1008,17 @@ mod tests {
             bins.iter().map(|b| b.spec.as_str()).collect::<Vec<_>>(),
             ["-p aterm-link --lib", "-p aterm-link --test bridge_e2e"]
         );
+        // Under a build directory the compile reports where it built each
+        // executable and cargo runs the target dir's copy: the same file name.
+        let in_build_dir: Vec<TestExe> = exes
+            .iter()
+            .map(|e| TestExe {
+                exe: Path::new("/cache/r/.cargo-build/debug/deps")
+                    .join(e.exe.file_name().expect("a file name")),
+                flag: e.flag.clone(),
+            })
+            .collect();
+        assert_eq!(plan(recs(), log, &in_build_dir).expect("a plan"), bins);
         assert_eq!(
             bins[1].header,
             "     Running tests/bridge_e2e.rs (target/debug/deps/bridge_e2e-2)"
@@ -1504,42 +1052,11 @@ mod tests {
         );
     }
 
-    /// THE START ORDER: binaries the history does not name start first, then
-    /// the named ones longest first; with no history it is declared order. The
-    /// history round-trips through its file, a new run's times merged over it.
+    /// THE POOL: never more than `jobs` at once, every binary once and with the
+    /// whole thread count, as cargo's own run gives it, and the answers in
+    /// declared order whatever order they finished in.
     #[test]
-    fn shared_binaries_start_longest_first_by_the_recorded_times() {
-        let bins: Vec<Binary> = (0..4)
-            .map(|i| Binary {
-                header: format!("     Running tests/t{i}.rs (target/debug/deps/t{i}-1)"),
-                spec: format!("-p x --test t{i}"),
-                record: rec(&format!("/r/t{i}"), "x"),
-            })
-            .collect();
-        let all = [0, 1, 2, 3];
-        assert_eq!(start_order(&all, &bins, &BTreeMap::new()), all);
-
-        let dir = crate::mktemp_dir("atv-costs").expect("mktemp");
-        let path = dir.join(COSTS_FILE);
-        write_costs(
-            &path,
-            &[
-                ("-p x --test t0".into(), 3.0),
-                ("-p x --test t2".into(), 90.0),
-            ],
-        );
-        write_costs(&path, &[("-p x --test t3".into(), 40.0)]);
-        let costs = read_costs(&path);
-        assert_eq!(costs.len(), 3, "{costs:?}");
-        assert_eq!(start_order(&all, &bins, &costs), [1, 2, 3, 0]);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// THE SCHEDULE: never more than `jobs` at once, started longest first; EVERY
-    /// binary with the whole thread count, as cargo's own run gives it; and the
-    /// answers in declared order whatever order they finished in.
-    #[test]
-    fn binaries_share_the_pool_longest_first_and_answer_in_declared_order() {
+    fn binaries_share_the_pool_and_answer_in_declared_order() {
         let bins: Vec<Binary> = (0..9)
             .map(|i| Binary {
                 header: format!("     Running tests/t{i}.rs (target/debug/deps/t{i}-1)"),
@@ -1549,12 +1066,11 @@ mod tests {
             .collect();
         let running = AtomicUsize::new(0);
         let peak = AtomicUsize::new(0);
-        let order = Mutex::new(Vec::new());
-        let run_one = |b: &Binary, threads: u32| {
+        let runs = run_all(&bins, 3, 12, |b, threads| {
             let now = running.fetch_add(1, Ordering::SeqCst) + 1;
             peak.fetch_max(now, Ordering::SeqCst);
             assert_eq!(threads, 12, "every binary gets the whole count");
-            order.lock().unwrap().push(b.spec.clone());
+            // The first binary finishes last.
             std::thread::sleep(std::time::Duration::from_millis(if b.spec.ends_with('0') {
                 60
             } else {
@@ -1567,42 +1083,8 @@ mod tests {
                 code: Some(0),
                 spawn_error: None,
             }
-        };
-        // t8 took longest last time; t5 no run has timed.
-        let costs: BTreeMap<String, f64> = (0..9)
-            .filter(|&i| i != 5)
-            .map(|i| (format!("-p x --test t{i}"), if i == 8 { 90.0 } else { 1.0 }))
-            .collect();
-        // One at a time the start order is the call order.
-        let (_, one) = run_all(
-            &bins,
-            Limits::by_load(1, 64),
-            12,
-            &costs,
-            || Some(0.0),
-            run_one,
-        );
-        assert_eq!(one, 1);
-        assert_eq!(
-            std::mem::take(&mut *order.lock().unwrap()),
-            [5, 8, 0, 1, 2, 3, 4, 6, 7].map(|i| format!("-p x --test t{i}")),
-            "the untimed first, then longest first, then declared order"
-        );
-        assert_eq!(peak.swap(0, Ordering::SeqCst), 1);
-        // Three at a time on an idle machine.
-        let (runs, pooled) = run_all(
-            &bins,
-            Limits::by_load(3, 64),
-            12,
-            &BTreeMap::new(),
-            || Some(0.0),
-            run_one,
-        );
-        assert!(pooled <= 3 && peak.load(Ordering::SeqCst) <= 3);
-        assert!(
-            peak.load(Ordering::SeqCst) >= 2,
-            "the shared slots were shared"
-        );
+        });
+        assert!(peak.load(Ordering::SeqCst) <= 3, "never past the jobs");
         let said: Vec<String> = runs
             .iter()
             .map(|r| r.output.lines().nth(1).unwrap().to_string())
@@ -1614,162 +1096,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             "declared order"
         );
-    }
-
-    /// THE ADMISSION LAW: under the floor, yes without reading the load; at the
-    /// cap, no; between, only while the load is under the cores — a load AT
-    /// the cores is not under them, and one that cannot be read is not an idle
-    /// machine. `--test-jobs 1` is one at a time, and a fixed pool never asks.
-    #[test]
-    fn the_pool_keeps_the_floor_whatever_the_load_and_fills_only_an_idle_machine() {
-        let never = || -> Option<f64> { panic!("the load was read") };
-        let l = Limits::by_load(8, 18);
-        assert_eq!((l.jobs, l.floor, l.cores), (8, FLOOR_JOBS, 18));
-        assert!(l.may_start(0, never) && l.may_start(1, never));
-        assert!(l.may_start(2, || Some(17.9)) && l.may_start(7, || Some(0.0)));
-        assert!(!l.may_start(2, || Some(18.0)), "at the cores is not under");
-        assert!(!l.may_start(2, || Some(90.0)));
-        assert!(!l.may_start(2, || None), "an unreadable load is not idle");
-        assert!(!l.may_start(8, || Some(0.0)), "never past the cap");
-        let one = Limits::by_load(1, 18);
-        assert_eq!(
-            (one.jobs, one.floor),
-            (1, 1),
-            "the floor is never above the cap"
-        );
-        assert!(one.may_start(0, never) && !one.may_start(1, || Some(0.0)));
-        assert_eq!(Limits::by_load(0, 18).jobs, 1, "never zero");
-        let fixed = Limits::fixed(4);
-        assert!((0..4).all(|r| fixed.may_start(r, never)));
-        assert!(!fixed.may_start(4, never));
-    }
-
-    /// The most items at once `pool_within` reaches over `n` items, the load
-    /// reading `load` (each reading counted in `reads`). Each item waits, a
-    /// minute at the most (a hang detector), until `want` have run at once, so a loaded
-    /// machine's late thread start cannot hide a pool's concurrency; a pool
-    /// that never reaches `want` only makes this slower, never green.
-    fn pool_peak(
-        n: usize,
-        limits: Limits,
-        load: Option<f64>,
-        want: usize,
-        reads: &AtomicUsize,
-    ) -> usize {
-        let running = AtomicUsize::new(0);
-        let seen = AtomicUsize::new(0);
-        let order: Vec<usize> = (0..n).collect();
-        let began = Instant::now();
-        let (answers, peak) = pool_within(
-            n,
-            &order,
-            limits,
-            || {
-                reads.fetch_add(1, Ordering::SeqCst);
-                load
-            },
-            |i| {
-                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
-                seen.fetch_max(now, Ordering::SeqCst);
-                let waited = Instant::now();
-                while seen.load(Ordering::SeqCst) < want
-                    && waited.elapsed() < Duration::from_secs(60)
-                {
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-                std::thread::sleep(Duration::from_millis(10));
-                running.fetch_sub(1, Ordering::SeqCst);
-                i
-            },
-        );
-        assert_eq!(
-            answers,
-            (0..n).map(Some).collect::<Vec<_>>(),
-            "every item ran once"
-        );
-        assert!(
-            seen.load(Ordering::SeqCst) <= peak,
-            "the peak it reports is what ran"
-        );
-        let samples = began.elapsed().as_millis() / LOAD_SAMPLE.as_millis();
-        let samples = usize::try_from(samples).unwrap_or(usize::MAX);
-        assert!(
-            reads.load(Ordering::SeqCst) <= 1 + samples,
-            "at most one reading per LOAD_SAMPLE"
-        );
-        peak
-    }
-
-    /// THE POOL OVER THREADS: an idle machine fills to the cap; a busy one or
-    /// one whose load cannot be read keeps the floor, and every item still
-    /// runs; the floor and a fixed pool never read the load.
-    #[test]
-    fn a_busy_machine_keeps_the_floor_and_an_idle_one_fills_to_the_cap() {
-        let peak = |n, limits, load, want| {
-            let reads = AtomicUsize::new(0);
-            let peak = pool_peak(n, limits, load, want, &reads);
-            (peak, reads.into_inner())
-        };
-        let quick = |jobs| Limits::by_load(jobs, 18).paced(Duration::ZERO);
-        assert_eq!(peak(12, quick(6), Some(1.0), 6).0, 6);
-        assert_eq!(peak(5, quick(6), Some(40.0), 2).0, FLOOR_JOBS);
-        assert_eq!(peak(5, quick(6), None, 2).0, FLOOR_JOBS);
-        assert_eq!(peak(5, quick(2), Some(0.0), 2), (2, 0));
-        assert_eq!(peak(9, Limits::fixed(3), Some(0.0), 3), (3, 0));
-    }
-
-    /// THE SETTLE: past the floor the pool starts one binary, then lets it show
-    /// its CPU before the next, however idle the one reading looked; the floor
-    /// itself starts at once.
-    #[test]
-    fn starts_past_the_floor_wait_out_the_settle() {
-        let settle = Duration::from_millis(60);
-        let began = Instant::now();
-        let starts = Mutex::new(Vec::new());
-        let (answers, peak) = pool_within(
-            5,
-            &[0, 1, 2, 3, 4],
-            Limits::by_load(5, 64).paced(settle),
-            || Some(0.0),
-            |i| {
-                starts.lock().unwrap().push(began.elapsed());
-                // Hold the slot until every item has started.
-                while starts.lock().unwrap().len() < 5 {
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-                i
-            },
-        );
-        assert_eq!(answers, (0..5).map(Some).collect::<Vec<_>>());
-        assert_eq!(peak, 5);
-        let mut starts = starts.into_inner().unwrap();
-        starts.sort();
-        for w in starts[FLOOR_JOBS..].windows(2) {
-            assert!(w[1] - w[0] >= settle, "spaced by the settle: {starts:?}");
-        }
-    }
-
-    /// A RUN THAT PANICS is the pool's panic once the others are done — and
-    /// its slot gives the floor back, so a busy machine's pool still runs
-    /// every other item instead of waiting on a slot that died.
-    #[test]
-    fn a_panicking_run_is_a_panic_and_never_holds_the_floor() {
-        let done = AtomicUsize::new(0);
-        let order: Vec<usize> = (0..6).collect();
-        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            pool_within(
-                6,
-                &order,
-                Limits::by_load(4, 18),
-                || Some(99.0),
-                |i| {
-                    assert!(i > 1, "run {i} broke");
-                    done.fetch_add(1, Ordering::SeqCst);
-                },
-            )
-        }));
-        assert!(caught.is_err(), "the panic is the pool's");
-        assert_eq!(done.load(Ordering::SeqCst), 4, "the other four ran");
     }
 
     /// A BINARY THE RUN'S CEILING LEFT NO TIME TO START is a FAIL in cargo's
@@ -1867,7 +1193,7 @@ mod tests {
         let all = combined(&bins, &[pass(&bins[0]), crashed, pass(&bins[2])]);
         assert!(all.output.contains(
             "error: test failed, to rerun pass `-p x --test b`\n\nCaused by:\n  process didn't \
-             exit successfully: `/r/target/debug/deps/b-1 -Zunstable-options --report-time` (killed by a signal)\n"
+             exit successfully: `/r/target/debug/deps/b-1 --skip slow::` (killed by a signal)\n"
         ));
         assert_eq!(
             crate::libtest::failed_tests(&all.output),
@@ -1897,14 +1223,7 @@ mod tests {
             record: rec("/r/target/debug/deps/a-1", "x"),
         };
         let cmd = binary_cmd(&b, 7);
-        assert_eq!(
-            cmd.argv(),
-            [
-                "/r/target/debug/deps/a-1",
-                "-Zunstable-options",
-                "--report-time"
-            ]
-        );
+        assert_eq!(cmd.argv(), ["/r/target/debug/deps/a-1", "--skip", "slow::"]);
         assert_eq!(cmd.cwd.as_deref(), Some(Path::new("/r/crates/x")));
         assert!(cmd.exact_env);
         assert_eq!(
@@ -1924,26 +1243,6 @@ mod tests {
         assert_eq!(
             cmd.preamble.as_deref(),
             Some("     Running tests/a.rs (target/debug/deps/a-1)\n")
-        );
-        let all = [b.clone(), b.clone(), b];
-        let s = summary(&all, Limits::by_load(8, 18), 14, 2, 3);
-        assert!(
-            s.contains(
-                "3 — RUST_TEST_THREADS=14 each, the 1 never timed first, then longest first by \
-                 the last run's times, up to 8 at once, past 2 only while fewer than 18 cores \
-                 read busy: 3 at the most"
-            ),
-            "{s}"
-        );
-        let s = summary(&all, Limits::by_load(1, 18), 14, 0, 1);
-        assert!(
-            s.ends_with("each, in cargo's order (no times recorded yet), 1 at a time"),
-            "{s}"
-        );
-        let s = summary(&all, Limits::by_load(1, 18), 14, 3, 1);
-        assert!(
-            s.ends_with("each, longest first by the last run's times, 1 at a time"),
-            "{s}"
         );
     }
 }

@@ -335,8 +335,8 @@ impl ActionSink for TerminalHandler<'_> {
     }
 
     /// Finish a DCS string, minting the response capability DECRQSS/XTGETTCAP answers need.
-    /// `canceled` (CAN/SUB) discards the string: a half-decoded sixel is dropped and a query is
-    /// not answered.
+    /// `canceled` (CAN/SUB, or an ESC that does not begin ST) discards the string: a
+    /// half-decoded sixel is dropped and a query is not answered.
     fn dcs_unhook(&mut self, canceled: bool) {
         self.note_sync_open_action();
         let cap = super::super::response_capability::ResponseCapability::mint_for_dispatch();
@@ -354,7 +354,6 @@ impl ActionSink for TerminalHandler<'_> {
         self.dcs.sequence_bytes = 0;
         // Drop an abandoned Sixel decoder before clearing dcs_type, without the full-size
         // copy `unhook` makes.
-        #[cfg(feature = "sixel")]
         if matches!(self.dcs.dcs_type, super::super::DcsType::Sixel) {
             self.sixel.decoder.abort();
         }
@@ -377,7 +376,8 @@ impl ActionSink for TerminalHandler<'_> {
     }
 
     fn apc_put_bulk(&mut self, data: &Provenance<[u8], Pty>) {
-        // Bulk `apc_put`: byte-identical to it (`apc_put_bulk_crosses_caps_parity`). Only
+        // Bulk `apc_put`: byte-identical to it
+        // (`bulk_string_accumulators_cross_caps_like_per_byte`). Only
         // `MAX_DCS_GLOBAL_BUDGET - total_bytes` of the run are counted; bytes past that are
         // neither counted nor pushed. Counted byte k is pushed iff `data.len() + k < 4 MiB`.
         let data = data.as_ref();
@@ -401,6 +401,9 @@ impl ActionSink for TerminalHandler<'_> {
     fn apc_end(&mut self, canceled: bool) {
         self.note_sync_open_action();
         let kitty = self.dcs.data.first() == Some(&b'G');
+        if kitty {
+            self.transient.kitty_commands = self.transient.kitty_commands.wrapping_add(1);
+        }
         if canceled && kitty {
             // A canceled kitty command was a chunk of any transfer in flight, which can no
             // longer complete intact: drop it, or the next complete command would be taken as
@@ -3096,58 +3099,6 @@ impl TerminalHandler<'_> {
 }
 
 #[cfg(test)]
-mod bulk_ascii_fast_tests {
-    use super::has_run_of_4;
-    use crate::terminal::Terminal;
-
-    #[test]
-    fn has_run_of_4_detects_exact_boundary() {
-        assert!(!has_run_of_4(b""));
-        assert!(!has_run_of_4(b"abc"));
-        assert!(!has_run_of_4(b"aaab")); // only 3 identical
-        assert!(!has_run_of_4(b"the quick brown fox jumps over 0123456789"));
-        assert!(has_run_of_4(b"aaaa")); // exactly 4
-        assert!(has_run_of_4(b"xy    zw")); // 4 spaces mid-string
-        assert!(has_run_of_4(b"prefix______suffix")); // run at an offset
-        assert!(has_run_of_4(b"tailaaaa")); // run at the end
-    }
-
-    /// The bulk writer must render byte-identically to the per-byte oracle.
-    fn assert_bulk_matches_per_byte(line: &[u8]) {
-        let mut bulk = Terminal::new(24, 80);
-        bulk.process(line);
-        let mut per_byte = Terminal::new(24, 80);
-        for &b in line {
-            per_byte.process(&[b]);
-        }
-        assert_eq!(
-            bulk.visible_content(),
-            per_byte.visible_content(),
-            "bulk vs per-byte render mismatch"
-        );
-    }
-
-    #[test]
-    fn long_run_free_prose_renders_identically() {
-        // >64 bytes, no 4+ identical run: the direct blast path.
-        assert_bulk_matches_per_byte(
-            b"the quick brown fox jumps over the lazy dog 0123456789 and some more text\r\n",
-        );
-    }
-
-    #[test]
-    fn long_data_with_runs_still_renders_identically() {
-        // >64 bytes with 4+ runs: the run-detection scan path.
-        assert_bulk_matches_per_byte(
-            b"indent:        code====line with runs and normal prose padding to exceed 64B\r\n",
-        );
-        assert_bulk_matches_per_byte(
-            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n",
-        );
-    }
-}
-
-#[cfg(test)]
 mod kitty_display_tests {
     use crate::terminal::Terminal;
 
@@ -3170,185 +3121,6 @@ mod kitty_display_tests {
     /// A 1x1-cell RGBA image: cell_px 10x20 + s=10,v=20 -> ceil(10/10)=1 col, 1 row.
     fn one_cell_rgba() -> Vec<u8> {
         vec![0u8; 10 * 20 * 4]
-    }
-
-    #[test]
-    fn transmit_and_display_places_inline_image() {
-        let mut term = Terminal::new(24, 80);
-        term.set_cell_pixel_size(10, 20);
-        term.process(&apc_g("a=T,f=32,s=10,v=20", &one_cell_rgba()));
-        let frame = term.cell_frame(24, 80);
-        assert!(
-            !frame.images[0].is_empty(),
-            "a=T must place an inline image via the shared image pipeline"
-        );
-    }
-
-    #[test]
-    fn store_then_put_displays_only_after_put() {
-        let mut term = Terminal::new(24, 80);
-        term.set_cell_pixel_size(10, 20);
-        // a=t stores under id=5 without displaying.
-        term.process(&apc_g("a=t,f=32,s=10,v=20,i=5", &one_cell_rgba()));
-        assert!(
-            term.cell_frame(24, 80).images[0].is_empty(),
-            "a=t alone does not display"
-        );
-        // a=p puts the stored image at the cursor.
-        term.process(&apc_g("a=p,i=5", b""));
-        assert!(
-            !term.cell_frame(24, 80).images[0].is_empty(),
-            "a=p displays the stored image"
-        );
-    }
-
-    /// Bare `a=d` clears visible placements but keeps the store (only an
-    /// uppercase selector frees data), so `a=p` still displays; `d=A` empties
-    /// the store and makes `a=p` a no-op.
-    #[test]
-    fn bare_delete_keeps_store_but_uppercase_all_frees_it() {
-        let mut term = Terminal::new(24, 80);
-        term.set_cell_pixel_size(10, 20);
-        term.process(&apc_g("a=t,f=32,s=10,v=20,i=5", &one_cell_rgba()));
-        term.process(&apc_g("a=d", b""));
-        term.process(&apc_g("a=p,i=5", b"")); // store kept -> still placeable
-        assert!(
-            !term.cell_frame(24, 80).images[0].is_empty(),
-            "bare a=d keeps the store; a=p still displays"
-        );
-        term.process(&apc_g("a=d,d=A", b""));
-        term.process(&apc_g("a=p,i=5", b"")); // store freed -> nothing to place
-        assert!(
-            term.cell_frame(24, 80).images[0].is_empty(),
-            "d=A freed the store; a=p cannot display"
-        );
-    }
-
-    #[test]
-    fn delete_by_id_removes_only_that_image() {
-        let mut term = Terminal::new(24, 80);
-        term.set_cell_pixel_size(10, 20);
-        term.process(&apc_g("a=t,f=32,s=10,v=20,i=5", &one_cell_rgba()));
-        term.process(&apc_g("a=t,f=32,s=10,v=20,i=6", &one_cell_rgba()));
-        // d=I,i=5 (uppercase: placements + data) deletes only image 5; image 6
-        // still displays. Lowercase d=i keeps the data (covered by
-        // tests/kitty_graphics_delete.rs).
-        term.process(&apc_g("a=d,d=I,i=5", b""));
-        assert!(
-            term.cell_frame(24, 80).images[0].is_empty(),
-            "deleted id 5 cannot be put"
-        );
-        term.process(&apc_g("a=p,i=5", b""));
-        assert!(term.cell_frame(24, 80).images[0].is_empty(), "id 5 is gone");
-        term.process(&apc_g("a=p,i=6", b""));
-        assert!(
-            !term.cell_frame(24, 80).images[0].is_empty(),
-            "id 6 survived the targeted delete"
-        );
-    }
-
-    #[test]
-    fn chunked_transmit_display_assembles_and_places() {
-        let mut term = Terminal::new(24, 80);
-        term.set_cell_pixel_size(10, 20);
-        let full = one_cell_rgba(); // 800 bytes = 10*20*4
-        // First chunk carries the control + m=1; continuations carry m=1 / m=0
-        // (their payloads are appended using the first chunk's metadata).
-        term.process(&apc_g("a=T,f=32,s=10,v=20,m=1", &full[0..400]));
-        assert!(
-            term.cell_frame(24, 80).images[0].is_empty(),
-            "must not place a partial (mid-chunk) image"
-        );
-        term.process(&apc_g("m=1", &full[400..600]));
-        term.process(&apc_g("m=0", &full[600..800]));
-        assert!(
-            !term.cell_frame(24, 80).images[0].is_empty(),
-            "assembled image places on the final (m=0) chunk"
-        );
-    }
-
-    #[test]
-    fn unicode_placeholder_places_stored_image_via_fg_id_and_diacritics() {
-        let mut term = Terminal::new(24, 80);
-        term.set_cell_pixel_size(10, 20);
-        // Store a 1-cell RGBA image under id 5 without displaying it (a=t).
-        term.process(&apc_g("a=t,f=32,s=10,v=20,i=5", &one_cell_rgba()));
-        assert!(
-            term.cell_frame(24, 80).images[0].is_empty(),
-            "a=t stores but does not display"
-        );
-        // Now draw it virtually: fg = indexed 5 (image-id low), then the placeholder
-        // U+10EEEE + row diacritic (U+0305 -> 0) + col diacritic (U+0305 -> 0).
-        let mut seq = b"\x1b[38;5;5m".to_vec();
-        let mut buf = [0u8; 4];
-        for c in ['\u{10EEEE}', '\u{0305}', '\u{0305}'] {
-            seq.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-        }
-        term.process(&seq);
-
-        let frame = term.cell_frame(24, 80);
-        assert!(
-            !frame.images[0].is_empty(),
-            "a Unicode placeholder cell must place the stored image (id from fg)"
-        );
-        let (col, iref) = &frame.images[0][0];
-        assert_eq!(*col, 0, "placeholder was written at column 0");
-        assert_eq!(
-            (iref.cell_row, iref.cell_col),
-            (0, 0),
-            "row/col diacritics 0x0305 both decode to tile (0, 0)"
-        );
-    }
-
-    #[test]
-    fn animation_frame_transmit_and_select_switches_displayed_frame() {
-        let mut term = Terminal::new(24, 80);
-        term.set_cell_pixel_size(10, 20);
-        // Base transmit (frame 1): a 1-cell RGBA image of all-zero bytes, id 7.
-        term.process(&apc_g("a=t,f=32,s=10,v=20,i=7", &one_cell_rgba()));
-        // a=f: append a 2nd frame with distinct pixels (all 0xAB).
-        let frame2 = vec![0xABu8; 10 * 20 * 4];
-        term.process(&apc_g("a=f,f=32,s=10,v=20,i=7", &frame2));
-
-        // Display via a placeholder (it reads the current frame from the store).
-        let mut seq = b"\x1b[38;5;7m".to_vec();
-        let mut buf = [0u8; 4];
-        for c in ['\u{10EEEE}', '\u{0305}', '\u{0305}'] {
-            seq.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-        }
-        term.process(&seq);
-
-        // Frame 1 is current: the placeholder shows the all-zero base frame.
-        let f = term.cell_frame(24, 80);
-        assert_eq!(
-            f.images[0][0].1.image.bytes[0], 0x00,
-            "frame 1 = base (zeros)"
-        );
-
-        // a=a c=2: select frame 2; the same placeholder now shows the 0xAB frame.
-        term.process(&apc_g("a=a,i=7,c=2", b""));
-        let f = term.cell_frame(24, 80);
-        assert_eq!(
-            f.images[0][0].1.image.bytes[0], 0xAB,
-            "a=a c=2 must switch the displayed frame to frame 2"
-        );
-
-        // a=a c=1: back to frame 1.
-        term.process(&apc_g("a=a,i=7,c=1", b""));
-        assert_eq!(
-            term.cell_frame(24, 80).images[0][0].1.image.bytes[0],
-            0x00,
-            "a=a c=1 returns to frame 1"
-        );
-
-        // `r=` (with `z=`) names the frame whose gap changes; it selects
-        // nothing.
-        term.process(&apc_g("a=a,i=7,r=2,z=80", b""));
-        assert_eq!(
-            term.cell_frame(24, 80).images[0][0].1.image.bytes[0],
-            0x00,
-            "a=a r=2 z=80 changes a gap and leaves frame 1 shown"
-        );
     }
 
     /// The first pixel byte of what the placeholder at (0, 0) draws — the
@@ -3678,23 +3450,6 @@ mod kitty_display_tests {
     }
 
     #[test]
-    fn unicode_placeholder_unknown_id_places_nothing() {
-        let mut term = Terminal::new(24, 80);
-        term.set_cell_pixel_size(10, 20);
-        // No image stored under id 9 -> the placeholder resolves to nothing (no panic).
-        let mut seq = b"\x1b[38;5;9m".to_vec();
-        let mut buf = [0u8; 4];
-        for c in ['\u{10EEEE}', '\u{0305}', '\u{0305}'] {
-            seq.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-        }
-        term.process(&seq);
-        assert!(
-            term.cell_frame(24, 80).images[0].is_empty(),
-            "a placeholder referencing an unknown image id places nothing (fail closed)"
-        );
-    }
-
-    #[test]
     fn non_direct_mediums_skip_cleanly_never_garbage() {
         // t=f / t=t / t=s carry a path, not pixels: with no resolver nothing is read or
         // decoded, and nothing is placed.
@@ -3710,76 +3465,53 @@ mod kitty_display_tests {
         }
     }
 
+    /// A host that installs a resolver serves `t=f` files and `t=s` shared
+    /// memory behind the same seam, under its own policy: a name it refuses
+    /// places nothing (fail closed).
     #[test]
-    fn file_medium_places_image_via_host_resolver() {
+    fn non_direct_mediums_place_only_what_the_host_resolver_serves() {
         use crate::terminal::kitty_graphics::KittyMedium;
-        let mut term = Terminal::new(24, 80);
-        term.set_cell_pixel_size(10, 20);
-        // Host opts in by installing a resolver: it serves a 1-cell RGBA image for the
-        // path "img.rgba" via `t=f`, rejects everything else (its security policy).
-        term.set_kitty_file_resolver(|medium, name| {
-            (medium == KittyMedium::File && name == "img.rgba").then(|| vec![0u8; 10 * 20 * 4])
-        });
-        // a=T with t=f and the path as payload → the resolver supplies the bytes.
-        term.process(&apc_g("a=T,f=32,s=10,v=20,t=f", b"img.rgba"));
-        assert!(
-            !term.cell_frame(24, 80).images[0].is_empty(),
-            "t=f via the host resolver must place the image"
-        );
-        // A path the resolver rejects (its policy) → fail closed, nothing placed.
-        let mut term2 = Terminal::new(24, 80);
-        term2.set_cell_pixel_size(10, 20);
-        term2.set_kitty_file_resolver(|_, _| None);
-        term2.process(&apc_g("a=T,f=32,s=10,v=20,t=f", b"/etc/passwd"));
-        assert!(
-            term2.cell_frame(24, 80).images[0].is_empty(),
-            "a resolver that rejects the path places nothing (fail closed)"
-        );
-    }
-
-    #[test]
-    fn shared_memory_medium_routes_through_resolver() {
-        use crate::terminal::kitty_graphics::KittyMedium;
-        let mut term = Terminal::new(24, 80);
-        term.set_cell_pixel_size(10, 20);
-        // t=s (shared memory) routes through the same resolver.
-        term.set_kitty_file_resolver(|medium, name| {
-            (medium == KittyMedium::SharedMemory && name == "/aterm-shm")
+        for (medium, name, served) in [
+            ("f", "img.rgba", true),
+            ("s", "/aterm-shm", true),
+            ("f", "/etc/passwd", false),
+            ("s", "img.rgba", false),
+        ] {
+            let mut term = Terminal::new(24, 80);
+            term.set_cell_pixel_size(10, 20);
+            term.set_kitty_file_resolver(|medium, name| {
+                matches!(
+                    (medium, name),
+                    (KittyMedium::File, "img.rgba") | (KittyMedium::SharedMemory, "/aterm-shm")
+                )
                 .then(|| vec![0u8; 10 * 20 * 4])
-        });
-        term.process(&apc_g("a=T,f=32,s=10,v=20,t=s", b"/aterm-shm"));
-        assert!(
-            !term.cell_frame(24, 80).images[0].is_empty(),
-            "t=s via the host resolver must place the image"
-        );
+            });
+            term.process(&apc_g(
+                &format!("a=T,f=32,s=10,v=20,t={medium}"),
+                name.as_bytes(),
+            ));
+            assert_eq!(
+                !term.cell_frame(24, 80).images[0].is_empty(),
+                served,
+                "t={medium} {name}"
+            );
+        }
     }
 
+    /// A payload that is not what its keys say is dropped, never placed and
+    /// never a panic: a corrupt `o=z` stream, a raw buffer shorter than
+    /// `s`x`v`.
     #[test]
-    fn compressed_o_z_payload_is_inflated_and_placed() {
-        let mut term = Terminal::new(24, 80);
-        term.set_cell_pixel_size(10, 20);
-        // zlib(800 zero bytes) — a one-cell 10x20 RGBA image, transmitted with o=z.
-        let compressed: &[u8] = &[
-            0x78, 0xda, 0x63, 0x60, 0x18, 0x05, 0xa3, 0x60, 0x14, 0xe0, 0x02, 0x00, 0x03, 0x20,
-            0x00, 0x01,
-        ];
-        term.process(&apc_g("a=T,f=32,s=10,v=20,o=z", compressed));
-        assert!(
-            !term.cell_frame(24, 80).images[0].is_empty(),
-            "o=z compressed payload must be inflated and placed via the shared pipeline"
-        );
-    }
-
-    #[test]
-    fn malformed_o_z_payload_is_rejected_not_panic() {
-        let mut term = Terminal::new(24, 80);
-        term.set_cell_pixel_size(10, 20);
-        // o=z but the payload is not a valid zlib stream — must drop, never panic.
-        term.process(&apc_g("a=T,f=32,s=10,v=20,o=z", &[1, 2, 3, 4, 5, 6]));
-        assert!(
-            term.cell_frame(24, 80).images[0].is_empty(),
-            "a corrupt o=z stream must be rejected (fail closed)"
-        );
+    fn malformed_payloads_place_nothing() {
+        for (control, payload) in [
+            ("a=T,f=32,s=10,v=20,o=z", &[1u8, 2, 3, 4, 5, 6][..]),
+            ("a=T,f=32,s=10,v=20", &[1, 2, 3, 4]),
+        ] {
+            let mut term = Terminal::new(24, 80);
+            term.set_cell_pixel_size(10, 20);
+            term.process(&apc_g(control, payload));
+            assert!(term.cell_frame(24, 80).images[0].is_empty(), "{control}");
+        }
     }
 
     #[test]
@@ -3809,23 +3541,6 @@ mod kitty_display_tests {
         );
     }
 
-    #[test]
-    fn query_reports_ok() {
-        let mut term = Terminal::new(24, 80);
-        // a=q support probe with id=3 -> _Gi=3;OK (q=0 default).
-        term.process(&apc_g("a=q,i=3", b""));
-        assert_eq!(
-            term.take_response().unwrap_or_default(),
-            b"\x1b_Gi=3;OK\x1b\\"
-        );
-        // q=2 suppresses the response.
-        term.process(&apc_g("a=q,i=4,q=2", b""));
-        assert!(
-            term.take_response().is_none(),
-            "q=2 suppresses the query OK"
-        );
-    }
-
     /// The probe answers per medium: `t=f` errors until the opt-in resolver is installed
     /// (so the prober falls back to direct); direct is always OK.
     #[test]
@@ -3838,12 +3553,14 @@ mod kitty_display_tests {
             reply.starts_with("\x1b_Gi=3;ENOTSUPPORTED"),
             "no resolver -> t=f errors: {reply:?}"
         );
-        term.process(&apc_g("a=q,i=3,t=d", b""));
+        term.process(&apc_g("a=q,i=3", b""));
         assert_eq!(
             term.take_response().unwrap_or_default(),
             b"\x1b_Gi=3;OK\x1b\\",
-            "direct is always real"
+            "direct (the default medium) is always real"
         );
+        term.process(&apc_g("a=q,i=4,q=2", b""));
+        assert!(term.take_response().is_none(), "q=2 suppresses the OK");
         term.set_kitty_file_resolver(|_, _| None);
         term.process(&apc_g("a=q,i=3,t=f", b""));
         assert_eq!(
@@ -3891,136 +3608,57 @@ mod kitty_display_tests {
         }
     }
 
+    /// The bulk accumulators (`apc_put_bulk`, the parser's APC fast path, and
+    /// `dcs_put_bulk` for every non-sixel DCS type) must accumulate the same
+    /// `dcs.data` and budget counters as per-byte `apc_put` / `dcs_put`, even
+    /// when one run straddles both the per-sequence (or per-type) data cap and
+    /// the global DCS budget. `Unknown` pushes nothing without a registered
+    /// callback but must still count bytes.
     #[test]
-    fn malformed_raw_buffer_is_rejected() {
-        let mut term = Terminal::new(24, 80);
-        term.set_cell_pixel_size(10, 20);
-        // s/v claim 10x20 RGBA (800 bytes) but only 4 bytes of payload -> rejected.
-        term.process(&apc_g("a=T,f=32,s=10,v=20", &[1, 2, 3, 4]));
-        assert!(
-            term.cell_frame(24, 80).images[0].is_empty(),
-            "a mismatched raw RGBA length must not place an image"
-        );
-    }
-
-    /// `apc_put_bulk` (the parser's APC fast path) accumulates the same `dcs.data` and budget
-    /// counters as per-byte `apc_put`, across the per-sequence cap and the global DCS budget.
-    #[test]
-    fn apc_put_bulk_crosses_caps_parity() {
-        use crate::parser::ActionSink;
-        use crate::terminal::MAX_DCS_GLOBAL_BUDGET;
-        use aterm_provenance::pty_wrap_ref;
-
-        const PER_SEQ_CAP: usize = 4 * 1024 * 1024;
-
-        // Seed dcs.data 100 bytes below the per-sequence cap and total_bytes 200
-        // below the global budget, so a 300-byte run crosses both: pushes stop
-        // after 100 bytes and counting after 200.
-        let seed_len = PER_SEQ_CAP - 100;
-        let seed_total = MAX_DCS_GLOBAL_BUDGET - 200;
-        let run: Vec<u8> = (0..300u32).map(|i| (i % 251) as u8).collect();
-
-        // `false` => per-byte reference (apc_put); `true` => bulk path
-        // (apc_put_bulk), fed in three uneven chunks so a boundary crossing is
-        // exercised across calls too.
-        fn drive(
-            bulk: bool,
-            run: &[u8],
-            seed_len: usize,
-            seed_total: usize,
-        ) -> (Vec<u8>, usize, usize) {
-            let mut term = Terminal::new(24, 80);
-            let (_parser, mut h) = term.split_for_process();
-            h.dcs.data = vec![0xAB; seed_len];
-            h.dcs.total_bytes = seed_total;
-            h.dcs.sequence_bytes = seed_total;
-            if bulk {
-                for chunk in [&run[..150], &run[150..151], &run[151..]] {
-                    h.apc_put_bulk(pty_wrap_ref(chunk));
-                }
-            } else {
-                for &b in run {
-                    h.apc_put(b);
-                }
-            }
-            (h.dcs.data.clone(), h.dcs.total_bytes, h.dcs.sequence_bytes)
-        }
-
-        let (data_byte, total_byte, seq_byte) = drive(false, &run, seed_len, seed_total);
-        let (data_bulk, total_bulk, seq_bulk) = drive(true, &run, seed_len, seed_total);
-
-        assert_eq!(
-            data_byte, data_bulk,
-            "bulk and per-byte APC paths must accumulate byte-identical data across both caps"
-        );
-        assert_eq!(
-            (total_byte, seq_byte),
-            (total_bulk, seq_bulk),
-            "bulk and per-byte APC paths must charge the global budget identically"
-        );
-        // Sanity: both boundaries were actually crossed.
-        assert_eq!(data_bulk.len(), PER_SEQ_CAP, "per-sequence cap reached");
-        assert_eq!(total_bulk, MAX_DCS_GLOBAL_BUDGET, "global budget reached");
-    }
-
-    /// `dcs_put_bulk` matches per-byte `dcs_put` across the per-type cap and the global budget
-    /// for every non-sixel type (`Unknown` keeps nothing but still counts).
-    #[test]
-    fn dcs_put_bulk_crosses_caps_parity() {
+    fn bulk_string_accumulators_cross_caps_like_per_byte() {
         use crate::parser::ActionSink;
         use crate::terminal::{DcsType, MAX_DCS_GLOBAL_BUDGET};
         use aterm_provenance::pty_wrap_ref;
 
-        // (dcs_type, per-type data cap; 0 = nothing kept).
-        let cases: &[(DcsType, usize)] = &[
-            (DcsType::Decrqss, 256),
-            (DcsType::Xtgettcap, 1024),
-            (DcsType::Unknown, 0),
+        // (None = APC, else that DCS type; its data cap, 0 = nothing pushed).
+        let cases: &[(Option<DcsType>, usize)] = &[
+            (None, 4 * 1024 * 1024),
+            (Some(DcsType::Decrqss), 256),
+            (Some(DcsType::Xtgettcap), 1024),
+            (Some(DcsType::Unknown), 0),
         ];
-
-        // `false` => per-byte reference (dcs_put); `true` => bulk path
-        // (dcs_put_bulk), fed in three uneven chunks so a boundary crossing is
-        // exercised across calls too.
-        fn drive(
-            bulk: bool,
-            dcs_type: DcsType,
-            seed_len: usize,
-            seed_total: usize,
-            run: &[u8],
-        ) -> (Vec<u8>, usize, usize) {
+        // Seed the data 100 bytes below its cap and the budget 200 below full,
+        // so a 300-byte run crosses both; the bulk path takes it in three
+        // uneven chunks so a crossing falls between calls too.
+        let run: Vec<u8> = (0..300u32).map(|i| (i % 251) as u8).collect();
+        let drive = |bulk: bool, kind: Option<DcsType>, cap: usize| {
             let mut term = Terminal::new(24, 80);
             let (_parser, mut h) = term.split_for_process();
-            h.dcs.dcs_type = dcs_type;
-            h.dcs.data = vec![0xAB; seed_len];
-            h.dcs.total_bytes = seed_total;
-            h.dcs.sequence_bytes = seed_total;
-            if bulk {
-                for chunk in [&run[..150], &run[150..151], &run[151..]] {
-                    h.dcs_put_bulk(pty_wrap_ref(chunk));
-                }
-            } else {
-                for &b in run {
-                    h.dcs_put(b);
+            if let Some(dcs_type) = kind {
+                h.dcs.dcs_type = dcs_type;
+            }
+            h.dcs.data = vec![0xAB; cap.saturating_sub(100)];
+            h.dcs.total_bytes = MAX_DCS_GLOBAL_BUDGET - 200;
+            h.dcs.sequence_bytes = MAX_DCS_GLOBAL_BUDGET - 200;
+            for chunk in [&run[..150], &run[150..151], &run[151..]] {
+                match (bulk, kind) {
+                    (true, None) => h.apc_put_bulk(pty_wrap_ref(chunk)),
+                    (true, Some(_)) => h.dcs_put_bulk(pty_wrap_ref(chunk)),
+                    (false, None) => chunk.iter().for_each(|&b| h.apc_put(b)),
+                    (false, Some(_)) => chunk.iter().for_each(|&b| h.dcs_put(b)),
                 }
             }
             (h.dcs.data.clone(), h.dcs.total_bytes, h.dcs.sequence_bytes)
-        }
-
-        for &(dcs_type, cap) in cases {
-            // Seed the data 100 bytes below its per-type cap (when it has one)
-            // and the budget 200 below full: a 300-byte run crosses both.
-            let seed_len = cap.saturating_sub(100);
-            let seed_total = MAX_DCS_GLOBAL_BUDGET - 200;
-            let run: Vec<u8> = (0..300u32).map(|i| (i % 251) as u8).collect();
-            let per_byte = drive(false, dcs_type, seed_len, seed_total, &run);
-            let bulk = drive(true, dcs_type, seed_len, seed_total, &run);
+        };
+        for &(kind, cap) in cases {
+            let per_byte = drive(false, kind, cap);
+            assert_eq!(per_byte, drive(true, kind, cap), "{kind:?}");
             assert_eq!(
-                per_byte, bulk,
-                "bulk and per-byte DCS paths must match for {dcs_type:?}"
+                per_byte.1, MAX_DCS_GLOBAL_BUDGET,
+                "{kind:?}: budget reached"
             );
-            assert_eq!(per_byte.1, MAX_DCS_GLOBAL_BUDGET, "global budget reached");
             if cap > 0 {
-                assert_eq!(per_byte.0.len(), cap, "per-type data cap reached");
+                assert_eq!(per_byte.0.len(), cap, "{kind:?}: data cap reached");
             }
         }
     }
@@ -4028,7 +3666,6 @@ mod kitty_display_tests {
     /// Bulk/per-byte parity for the Sixel DCS path: for an in-budget stream
     /// the run-sampled pixel-allocation charge must land on identical budget
     /// counters and an identical decoder allocation.
-    #[cfg(feature = "sixel")]
     #[test]
     fn dcs_put_bulk_sixel_parity() {
         use crate::parser::ActionSink;
@@ -4073,55 +3710,6 @@ mod kitty_display_tests {
         vec![0u8; w * h * 4]
     }
 
-    /// The running `kitty_total_bytes` budget tracks every stored slot precisely:
-    /// a base transmit charges two slots (kitty_images[id] + kitty_frames[id][0]),
-    /// a frame charges one, and delete/clear decrement back to zero without drift.
-    #[test]
-    fn kitty_total_bytes_accounting_is_precise() {
-        let mut term = Terminal::new(24, 80);
-        term.set_cell_pixel_size(10, 20);
-        let img = raw_rgba(4, 4); // 64 bytes
-        let n = img.len();
-
-        // Base transmit (a=t, no display): stored in images[1] and frames[1][0].
-        term.process(&apc_g("a=t,f=32,s=4,v=4,i=1", &img));
-        assert_eq!(
-            term.transient.kitty_total_bytes,
-            2 * n,
-            "base transmit = 2 slots"
-        );
-
-        // a=f appends one animation frame to id 1: +1 slot.
-        term.process(&apc_g("a=f,f=32,s=4,v=4,i=1", &img));
-        assert_eq!(
-            term.transient.kitty_total_bytes,
-            3 * n,
-            "frame adds one slot"
-        );
-
-        // A second image in another id.
-        term.process(&apc_g("a=t,f=32,s=4,v=4,i=2", &img));
-        assert_eq!(term.transient.kitty_total_bytes, 5 * n);
-
-        // Data-freeing deletes are the uppercase selectors. Delete just id 1's
-        // data (its image + its 2 frames = 3 slots freed).
-        term.process(&apc_g("a=d,d=I,i=1", b""));
-        assert_eq!(
-            term.transient.kitty_total_bytes,
-            2 * n,
-            "delete id 1 frees 3 slots"
-        );
-
-        // Uppercase delete-all clears the counter to zero.
-        term.process(&apc_g("a=d,d=A", b""));
-        assert_eq!(
-            term.transient.kitty_total_bytes, 0,
-            "delete-all resets the budget"
-        );
-        assert!(term.transient.kitty_images.is_empty());
-        assert!(term.transient.kitty_frames.is_empty());
-    }
-
     /// RIS (`ESC c`) clears the Kitty store and its byte budget together, so a later in-budget
     /// image is admitted and a stale id no longer displays.
     #[test]
@@ -4152,36 +3740,12 @@ mod kitty_display_tests {
             "RIS clears animation frames"
         );
 
-        // The freed budget admits a fresh image post-reset (no stale rejection).
-        term.process(&apc_g("a=t,f=32,s=4,v=4,i=3", &img));
-        assert!(
-            term.transient.kitty_total_bytes > 0,
-            "post-RIS image stores cleanly"
-        );
-    }
-
-    /// RIS drops the in-flight chunked-transmit accumulator (`kitty_pending`)
-    /// as well as the store, so a partial `m=1` transfer is not merged into
-    /// the first post-reset Kitty command.
-    #[test]
-    fn ris_clears_in_flight_kitty_chunk_accumulator() {
-        let mut term = Terminal::new(24, 80);
-        term.set_cell_pixel_size(10, 20);
-        let img = raw_rgba(4, 4);
-
-        // A first chunk with m=1 seeds kitty_pending and waits for more chunks.
+        // ...and the in-flight chunked transfer, so a partial `m=1` load is
+        // not merged into the first post-reset command.
         term.process(&apc_g("a=T,f=32,s=4,v=4,m=1", &img));
-        assert!(
-            term.transient.kitty_pending.is_some(),
-            "precondition: an m=1 chunk leaves an in-flight transfer pending"
-        );
-
-        // RIS — full reset must abandon the partial transfer.
+        assert!(term.transient.kitty_pending.is_some(), "precondition");
         term.process(b"\x1bc");
-        assert!(
-            term.transient.kitty_pending.is_none(),
-            "RIS must clear the in-flight chunked-transmit accumulator"
-        );
+        assert!(term.transient.kitty_pending.is_none());
     }
 
     /// The Kitty store enforces a global byte budget: once adding an image
@@ -4231,39 +3795,34 @@ mod kitty_display_tests {
         assert_eq!(term.transient.kitty_images.len(), stored);
     }
 
-    /// With neither `c=` nor `r=` the image is pixel-exact in its rounded-up footprint (as
-    /// kitty draws it); an explicit cell box is fitted.
+    /// A transmit's footprint and scaling come from its keys, as kitty
+    /// computes them: with neither `c=` nor `r=` (or both `0`, unspecified)
+    /// the raster's pixel size rounded up to whole cells, drawn pixel-exact; a
+    /// named cell box is fitted; one of `c=`/`r=` alone takes the other from
+    /// the aspect. `(raster px, keys, (cols, rows), scaling)` at a 10x20 cell.
     #[test]
-    fn un_sized_transmit_is_pixel_exact_but_an_explicit_cell_box_is_fitted() {
-        // 15x25 px at a 10x20 cell: a 2x2-cell footprint that is not the raster,
-        // so the two policies differ on every pixel of it.
-        let raster = vec![0u8; 15 * 25 * 4];
-        let mut term = Terminal::new(24, 80);
-        term.set_cell_pixel_size(10, 20);
-        term.process(&apc_g("a=T,f=32,s=15,v=25", &raster));
-        let frame = term.cell_frame(24, 80);
-        let placed = frame.images[0].first().expect("a=T places an image");
-        assert_eq!((placed.1.image.cols, placed.1.image.rows), (2, 2));
-        assert_eq!(
-            placed.1.image.scaling,
-            aterm_grid::ImageScaling::PixelExact,
-            "a transmission with neither c= nor r= is drawn at its natural size, \
-             1:1 from the top-left of the footprint"
-        );
-
-        // The same raster with an explicit cell box: the client named cells, so
-        // the renderer fits the raster to them.
-        let mut term = Terminal::new(24, 80);
-        term.set_cell_pixel_size(10, 20);
-        term.process(&apc_g("a=T,f=32,s=15,v=25,c=4,r=3", &raster));
-        let frame = term.cell_frame(24, 80);
-        let placed = frame.images[0].first().expect("a=T places an image");
-        assert_eq!((placed.1.image.cols, placed.1.image.rows), (4, 3));
-        assert_eq!(
-            placed.1.image.scaling,
-            aterm_grid::ImageScaling::Fit,
-            "c=/r= asked for the image over that many cells: fit it to them"
-        );
+    fn a_transmits_footprint_and_scaling_follow_its_keys() {
+        use aterm_grid::ImageScaling::{Fit, PixelExact};
+        for ((w, h), keys, footprint, scaling) in [
+            ((15, 25), "", (2, 2), PixelExact),
+            ((15, 25), ",c=4,r=3", (4, 3), Fit),
+            ((20, 40), ",c=4", (4, 4), Fit),
+            ((20, 40), ",r=1", (1, 1), Fit),
+            ((20, 40), ",c=0,r=0", (2, 2), PixelExact),
+        ] {
+            let mut term = Terminal::new(24, 80);
+            term.set_cell_pixel_size(10, 20);
+            term.process(&apc_g(
+                &format!("a=T,f=32,s={w},v={h}{keys}"),
+                &raw_rgba(w, h),
+            ));
+            let placed = image_at(&term, 0, 0).expect("a=T places an image");
+            assert_eq!(
+                ((placed.image.cols, placed.image.rows), placed.image.scaling),
+                (footprint, scaling),
+                "{w}x{h}{keys}"
+            );
+        }
     }
 
     /// The one image placed at `(row, col)` of the visible grid, if any.
@@ -4830,6 +4389,11 @@ mod kitty_display_tests {
             "the placeholder's row repaints"
         );
         assert_eq!(term.cell_frame(24, 80).images[5][0].1.image.bytes[0], 2);
+
+        // `r=` (with `z=`) names the frame whose gap changes; it selects
+        // nothing.
+        term.process(&apc_g("a=a,i=7,r=1,z=80", b""));
+        assert_eq!(term.cell_frame(24, 80).images[5][0].1.image.bytes[0], 2);
     }
 
     /// A `U=1` put has its own id and cell box, named by a placeholder's underline colour;
@@ -4994,7 +4558,7 @@ mod kitty_display_tests {
 
     /// A placement relative to a virtual placement shows `H=`/`V=` cells from the top-left of
     /// its parent's placeholders, follows them (chains too), is kept but drawn nowhere with no
-    /// placeholder on screen, and is deleted with its parent. Kitty's refusals hold.
+    /// placeholder on screen, and is deleted with its parent.
     #[test]
     fn placements_relative_to_a_virtual_placement_follow_its_placeholders() {
         let mut term = Terminal::new(24, 80);
@@ -5041,9 +4605,7 @@ mod kitty_display_tests {
         term.process(&placeholder(1, 7, 0, 0));
         assert_eq!(tags_at(&term, 1, 2), [(2, 5)], "back with its parent");
 
-        // Kitty's refusals.
-        term.process(&apc_g("a=p,i=3,P=9", b""));
-        assert!(reply(&mut term).contains(";ENOPARENT"));
+        // A cycle through floating parents is refused, moving nothing.
         term.process(&apc_g("a=p,i=2,p=5,P=3,Q=6", b""));
         assert!(reply(&mut term).contains(";ECYCLE"));
         assert_eq!(tags_at(&term, 1, 2), [(2, 5)], "refusals moved nothing");
@@ -5244,31 +4806,6 @@ mod kitty_display_tests {
         assert!(reply(&mut term).contains(";ENOENT"), "no frame 9");
         term.process(&apc_g("a=c,i=7,r=2,c=2,w=2", b""));
         assert!(reply(&mut term).contains(";EINVAL"), "overlapping itself");
-    }
-
-    /// Only one of `c=`/`r=`: the other follows from the image's aspect, as
-    /// kitty computes it; `c=0`/`r=0` are unspecified.
-    #[test]
-    fn one_cell_dimension_keeps_the_aspect() {
-        let mut term = Terminal::new(24, 80);
-        term.set_cell_pixel_size(10, 20);
-        // 20x40 px: natural 2x2 cells; 4 columns = 40 px wide → 80 px tall.
-        term.process(&apc_g("a=T,f=32,s=20,v=40,c=4", &raw_rgba(20, 40)));
-        let placed = image_at(&term, 0, 0).expect("placed");
-        assert_eq!((placed.image.cols, placed.image.rows), (4, 4));
-        term.process(b"\x1b[10;1H");
-        term.process(&apc_g("a=T,f=32,s=20,v=40,r=1", &raw_rgba(20, 40)));
-        let placed = image_at(&term, 9, 0).expect("placed");
-        assert_eq!(
-            (placed.image.cols, placed.image.rows),
-            (1, 1),
-            "20 px tall → 10 px wide"
-        );
-        term.process(b"\x1b[15;1H");
-        term.process(&apc_g("a=T,f=32,s=20,v=40,c=0,r=0", &raw_rgba(20, 40)));
-        let placed = image_at(&term, 14, 0).expect("placed");
-        assert_eq!((placed.image.cols, placed.image.rows), (2, 2));
-        assert_eq!(placed.image.scaling, aterm_grid::ImageScaling::PixelExact);
     }
 
     /// A put's in-cell offset (`X=`/`Y=`) added to a client's huge length (`c=`/`r=`, or a PNG

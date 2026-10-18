@@ -9,8 +9,6 @@
 pub(crate) use super::builtin_patterns::BuiltinRules;
 use aterm_regex::Regex;
 use aterm_types::text_shaping::AmbiguousWidth;
-#[cfg(test)]
-use std::cmp::Ordering;
 
 /// Priority levels for selection rules.
 ///
@@ -48,8 +46,6 @@ pub enum SelectionRuleKind {
     Uuid,
     /// Semantic version (semver)
     SemVer,
-    /// Custom user-defined pattern.
-    Custom,
 }
 
 /// A selection rule that matches semantic text units.
@@ -63,8 +59,6 @@ pub(crate) struct SelectionRule {
     pattern: Regex,
     /// Priority for rule ordering
     priority: RulePriority,
-    /// Whether this rule is enabled
-    enabled: bool,
 }
 
 impl std::fmt::Debug for SelectionRule {
@@ -74,7 +68,6 @@ impl std::fmt::Debug for SelectionRule {
             .field("kind", &self.kind)
             .field("pattern", &self.pattern.as_str())
             .field("priority", &self.priority)
-            .field("enabled", &self.enabled)
             .finish()
     }
 }
@@ -92,7 +85,6 @@ impl SelectionRule {
             kind,
             pattern: Regex::new(pattern).expect("Invalid regex pattern"),
             priority: RulePriority::Normal,
-            enabled: true,
         }
     }
 
@@ -101,18 +93,6 @@ impl SelectionRule {
     pub(crate) fn with_priority(mut self, priority: RulePriority) -> Self {
         self.priority = priority;
         self
-    }
-
-    /// Enable or disable this rule.
-    #[cfg(test)]
-    pub(crate) fn set_enabled(&mut self, enabled: bool) {
-        self.enabled = enabled;
-    }
-
-    /// Check if this rule is enabled.
-    #[must_use]
-    pub(crate) fn is_enabled(&self) -> bool {
-        self.enabled
     }
 
     /// Find all matches in the given text.
@@ -213,12 +193,6 @@ impl SelectionMatch {
     pub(crate) fn kind(&self) -> SelectionRuleKind {
         self.kind
     }
-
-    /// Get the byte length of the match.
-    #[must_use]
-    pub(super) fn len(&self) -> usize {
-        self.end.saturating_sub(self.start)
-    }
 }
 
 /// Smart selection engine that applies rules to find semantic text units.
@@ -267,25 +241,6 @@ impl SmartSelection {
         self.rules.sort_by_key(|r| std::cmp::Reverse(r.priority));
     }
 
-    /// Get a mutable reference to a rule by name.
-    #[cfg(test)]
-    pub(crate) fn get_rule_mut(&mut self, name: &str) -> Option<&mut SelectionRule> {
-        self.rules.iter_mut().find(|r| r.name == name)
-    }
-
-    /// Enable or disable a rule by name.
-    ///
-    /// Returns `true` if the rule was found.
-    #[cfg(test)]
-    pub fn set_rule_enabled(&mut self, name: &str, enabled: bool) -> bool {
-        if let Some(rule) = self.get_rule_mut(name) {
-            rule.set_enabled(enabled);
-            true
-        } else {
-            false
-        }
-    }
-
     /// Find the best match at the given byte position in the text.
     ///
     /// Returns the highest-priority match that contains the position.
@@ -302,7 +257,7 @@ impl SmartSelection {
         ))
     }
 
-    /// The highest-priority enabled rule whose match contains `byte_pos`, and
+    /// The highest-priority rule whose match contains `byte_pos`, and
     /// that match — the one lookup both [`Self::word_boundaries_at`] and the
     /// tests' `find_at` view go through.
     fn rule_match_at<'t>(
@@ -315,55 +270,7 @@ impl SmartSelection {
         }
         self.rules
             .iter()
-            .filter(|rule| rule.is_enabled())
             .find_map(|rule| Some((rule, rule.find_at_position(text, byte_pos)?)))
-    }
-
-    /// Find the best match at the given column position in the text.
-    ///
-    /// This converts the column (character count) to a byte position.
-    /// Useful for terminal selection where positions are in columns.
-    #[cfg(test)]
-    #[must_use]
-    pub fn find_at_column(&self, text: &str, column: usize) -> Option<SelectionMatch> {
-        let byte_pos = column_to_byte_pos(text, column);
-        self.find_at(text, byte_pos)
-    }
-
-    /// Find all matches in the text.
-    ///
-    /// Returns matches from all enabled rules, sorted by start position.
-    /// Overlapping matches from different rules are all included.
-    #[cfg(test)]
-    #[must_use]
-    pub fn find_all(&self, text: &str) -> Vec<SelectionMatch> {
-        let mut matches = Vec::new();
-
-        for rule in &self.rules {
-            if !rule.is_enabled() {
-                continue;
-            }
-
-            for m in rule.find_all(text) {
-                matches.push(SelectionMatch::new(
-                    m.as_str(),
-                    m.start(),
-                    m.end(),
-                    &rule.name,
-                    rule.kind,
-                ));
-            }
-        }
-
-        // Sort by start position, then by priority (via rule order which maintains priority)
-        matches.sort_by(|a, b| {
-            match a.start.cmp(&b.start) {
-                Ordering::Equal => a.len().cmp(&b.len()).reverse(), // longer matches first
-                other => other,
-            }
-        });
-
-        matches
     }
 
     /// Override the characters that BREAK a word for the basic (non-rule)
@@ -378,14 +285,6 @@ impl SmartSelection {
     /// shape the fallback word.
     pub fn set_word_separators(&mut self, separators: Option<&str>) {
         self.word_separators = separators.map(str::to_owned);
-    }
-
-    /// The configured word-separator set, or `None` for the default
-    /// class-based word logic.
-    #[cfg(test)]
-    #[must_use]
-    pub fn word_separators(&self) -> Option<&str> {
-        self.word_separators.as_deref()
     }
 
     /// Get the word boundaries for smart selection at a position.
@@ -564,10 +463,6 @@ fn byte_span_to_columns_with(
     }
     (start.unwrap_or(end), end)
 }
-
-#[cfg(test)]
-#[path = "rules_test_accessors.rs"]
-mod test_accessors;
 
 #[cfg(test)]
 #[path = "rules_tests.rs"]

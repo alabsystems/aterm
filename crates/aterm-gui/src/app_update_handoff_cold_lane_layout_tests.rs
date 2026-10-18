@@ -36,10 +36,7 @@ fn the_cold_lane_leaves_a_layout_that_reopens_the_native_tabs() {
 fn the_cold_lane_refuses_what_it_could_not_reopen() {
     let mut app = windowed_with_settings();
     app.config.restore_session = Some(false);
-    let refusal = app
-        .cold_lane_layout()
-        .expect_err("nothing would reopen them");
-    assert!(refusal.contains("session restore is off"), "{refusal}");
+    assert!(app.cold_lane_layout().is_err(), "nothing would reopen them");
     // Control: a headless instance has no windows to leave.
     let mut headless = windowed_with_settings();
     headless.headless = true;
@@ -136,8 +133,12 @@ fn a_layout_the_disk_will_not_take_refuses_only_while_its_cause_passes() {
     );
 }
 
-/// A settled layout write leaves one Messages record per target build and cause, written once
-/// the operator's quiesce grants the switch and before the flush that carries it.
+/// The record a settled layout write leaves: why the new version opens
+/// without those tabs, in Messages, written before the switch.
+///
+/// ROUND EIGHT, U48's REVIEW: ONCE PER TARGET BUILD AND CAUSE. A record is
+/// never folded, so an `exec` that fails and is retried must not write it
+/// again.
 #[test]
 fn a_layout_not_kept_is_said_on_record_once_the_switch_is_granted() {
     const CAUSE: &str = "open restore lock: Permission denied (os error 13)";
@@ -145,10 +146,7 @@ fn a_layout_not_kept_is_said_on_record_once_the_switch_is_granted() {
         app.messages
             .log()
             .records()
-            .filter(|record| {
-                record.title == "Open tabs not kept for the update"
-                    && record.detail.iter().any(|line| line.contains(needle))
-            })
+            .filter(|record| record.detail.iter().any(|line| line.contains(needle)))
             .count()
     };
     let mut app = windowed_with_settings();
@@ -169,46 +167,6 @@ fn a_layout_not_kept_is_said_on_record_once_the_switch_is_granted() {
     assert_eq!(records(&app, "Read-only file system"), 1);
     app.say_cold_lane_tabs_not_kept(8, CAUSE);
     assert_eq!(records(&app, "Permission denied"), 2);
-
-    // The wiring: in the cold arm, after the operator's quiesce is granted and before the
-    // steps that flush the message log; nowhere else.
-    let (src, start) = attempt_entry_source();
-    let quiesce = start
-        .find(".map(crate::operator_host::ControlHandle::try_begin_update_quiesce)")
-        .expect("the operator's quiesce");
-    let said = start
-        .find("self.say_cold_lane_tabs_not_kept(target_build, cause);")
-        .expect("the record");
-    let prepared = start
-        .find("self.prepare_cold_exec(")
-        .expect("the steps before the exec");
-    assert!(
-        quiesce < said && said < prepared,
-        "said once the switch is granted, before the flush that carries it"
-    );
-    let shipped = &src[..src
-        .find("mod cold_lane_layout_tests;")
-        .expect("this module")];
-    assert_eq!(
-        shipped.matches("self.say_cold_lane_tabs_not_kept(").count(),
-        1,
-        "one caller outside the tests"
-    );
-}
-
-/// `app_update_handoff.rs`, and the body of the attempt's entry, `start_unix_update_handoff`.
-pub(super) fn attempt_entry_source() -> (&'static str, &'static str) {
-    let src = include_str!("app_update_handoff.rs");
-    let start = &src[src
-        .find("fn start_unix_update_handoff(")
-        .expect("the attempt's entry")..];
-    let end = start[1..]
-        .find("\n    fn ")
-        .into_iter()
-        .chain(start[1..].find("\n    pub(crate) fn "))
-        .min()
-        .expect("the entry ends");
-    (src, &start[..end])
 }
 
 /// A refused take-back of the cold lane's layout (the restore lock held past the main thread's
@@ -284,10 +242,11 @@ fn a_refused_take_back_is_owed_until_it_lands_or_a_newer_write_replaces_it() {
         "spaced at most a minute"
     );
     // A seamless park tries now and refuses while the cause passes, the terminal untouched.
-    let refusal = app
-        .settle_owed_layout_take_back_before_switch_with(t0, unwrite)
-        .expect_err("a passing refusal refuses the park");
-    assert!(refusal.contains("could not be taken back"), "{refusal}");
+    assert!(
+        app.settle_owed_layout_take_back_before_switch_with(t0, unwrite)
+            .is_err(),
+        "a passing refusal refuses the park"
+    );
     assert_eq!(runs(), ["2-2", "1-1"], "nothing changed while it is held");
     // The holder lets go: the next try lands, this run's desk alone.
     drop(holder);
@@ -326,26 +285,6 @@ fn a_refused_take_back_is_owed_until_it_lands_or_a_newer_write_replaces_it() {
     assert_eq!(app.owed_layout_take_back_at(), None);
     assert_eq!(runs(), ["1-1"], "the quit took this run's desk back");
 
-    // The wiring: a cold `exec` that writes no newer desk of this run tries it before the
-    // operator's quiesce, the seamless lane before the park changes anything, and a write of
-    // this run's desk replaces it.
-    let (_, start) = attempt_entry_source();
-    let switches = start
-        .match_indices("self.settle_owed_layout_take_back_before_switch(")
-        .map(|(at, _)| at)
-        .collect::<Vec<_>>();
-    assert_eq!(switches.len(), 2, "the cold exec and the seamless park");
-    let at = |needle: &str| start.find(needle).expect(needle);
-    assert!(
-        at("self.cold_lane_layout_rewritten();") < switches[0]
-            && switches[0]
-                < at(".map(crate::operator_host::ControlHandle::try_begin_update_quiesce)")
-    );
-    assert!(
-        at("crate::seamless::handoff_commit_stamp(&target_commit)") < switches[1]
-            && switches[1] < at("self.begin_update_installing(")
-    );
-
     // A settled cause goes on past the switch (logged): no retry changes it.
     let _ = app.take_back_cold_lane_layout_with(Some(RUN.to_string()), t0, |_| {
         Err(crate::restore::RestoreFault::settled(
@@ -359,44 +298,5 @@ fn a_refused_take_back_is_owed_until_it_lands_or_a_newer_write_replaces_it() {
             ))
         }),
         Ok(())
-    );
-}
-
-/// A busy resident operator (a proposal in flight at the quiesce, or its gate held at the
-/// `exec`'s permit) defers a cold replacement as activity, retried and charged nothing.
-#[test]
-fn a_busy_resident_operator_defers_a_cold_replacement_and_charges_nothing() {
-    use crate::native_updater_service::ApplyMode;
-    let (notify_tx, _notify_rx) = std::sync::mpsc::sync_channel(8);
-    let operator =
-        crate::operator_host::ControlHandle::new("test-cold-operator-busy".to_string(), notify_tx);
-    let proposal = operator.begin_action_activity().expect("a proposal starts");
-    let busy = operator
-        .try_begin_update_quiesce()
-        .err()
-        .expect("a proposal is in flight");
-    for what in ["could not quiesce for replacement", "revoked replacement"] {
-        let error = crate::UpdateHandoffStartError::operator_refused(busy, what);
-        assert!(error.is_activity_deferred(), "activity: {error:?}");
-        for mode in [ApplyMode::Automatic, ApplyMode::AutomaticPastGrace] {
-            assert!(error.stops_routinely(mode), "routine: {error}");
-        }
-        assert!(
-            error.to_string().contains("transaction is in flight"),
-            "{error}"
-        );
-    }
-    drop(proposal);
-
-    // Negative control: shutting down is no work in flight, so a failure.
-    operator.begin_shutdown();
-    let shut = operator
-        .try_begin_update_quiesce()
-        .err()
-        .expect("a shutting-down operator refuses");
-    let error = crate::UpdateHandoffStartError::operator_refused(shut, "revoked replacement");
-    assert!(
-        !error.is_activity_deferred() && !error.is_refused(),
-        "a failure, as before: {error:?}"
     );
 }

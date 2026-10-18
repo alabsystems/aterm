@@ -150,9 +150,9 @@ struct BlockDescriptor {
 /// ```
 ///
 /// `@?` is a block and `^?` a function pointer; only the first is bound. No
-/// declared method takes a block today (`tests/winit_seam.rs` checks), but
-/// the alternative, `*mut c_void`, would register `"^v"` and tell every
-/// reflective path the argument is an opaque pointer.
+/// declared method takes a block today, but the alternative, `*mut c_void`,
+/// would register `"^v"` and tell every reflective path the argument is an
+/// opaque pointer.
 ///
 /// Borrowed, not an owner: [`RcBlock`] (or whatever the framework copied) owns
 /// the reference, and this is valid while that lives.
@@ -178,7 +178,7 @@ impl BlockPtr {
 }
 
 // SAFETY: `@encode` of any block type is `"@?"` (clang, two signatures, and
-// Foundation's `v24@0:8@?16` read back in `tests/winit_seam.rs`). `BlockPtr` is
+// Foundation's `v24@0:8@?16` read back in `tests/declared_abi.rs`). `BlockPtr` is
 // `#[repr(transparent)]` over exactly the pointer a block is passed as.
 unsafe impl crate::encode::Encode for BlockPtr {
     const ENCODING: &'static str = "@?";

@@ -31,7 +31,7 @@ pub struct CellAttrs {
     /// Packed background color (same format as fg).
     pub bg: u32,
     /// Cell flags (bold, italic, underline, etc.) plus the main-cell WIDE bit.
-    /// Excludes WIDE_CONTINUATION/PROTECTED, USES_STYLE_ID, and COMPLEX.
+    /// Excludes WIDE_CONTINUATION/PROTECTED, the reserved bit 14, and COMPLEX.
     pub flags: u16,
 }
 
@@ -64,7 +64,7 @@ impl CellAttrs {
     /// Mask for visual flags and write-time width geometry preserved in scrollback.
     /// Includes bits 0-9 (bold through WIDE) plus bits 11-13 (superscript,
     /// subscript, curly_underline). Excludes WIDE_CONTINUATION/PROTECTED (bit
-    /// 10), USES_STYLE_ID (bit 14), and COMPLEX (bit 15), which cannot be
+    /// 10), the reserved bit 14, and COMPLEX (bit 15), which cannot be
     /// interpreted independently from their live-grid context.
     const VISUAL_FLAGS_MASK: u16 = 0x3BFF; // bits 0-9, 11-13
 
@@ -105,7 +105,7 @@ pub(crate) use line_codec::{MAX_DECODE_PAGE_LINES, count_page_lines, serialize_p
 pub use line_codec::{
     deserialize_lines, deserialize_lines_strict, deserialize_lines_strict_dropping_over_cap_links,
     deserialize_lines_tail_strict, deserialize_page_lines, max_linked_record_bytes,
-    serialize_lines,
+    serialize_lines, serialize_lines_bounded,
 };
 
 #[path = "line_content.rs"]
@@ -336,7 +336,7 @@ impl Line {
     /// Get the hyperlink URL at a column, if any.
     #[must_use]
     pub fn get_hyperlink(&self, col: u16) -> Option<&Arc<str>> {
-        // Explicit loop over the plain slice: the strict gate proves slice
+        // Explicit loop over the plain slice: the Trust lane (`ship trust run`) proves slice
         // iteration, while the MIR-inlined `SmallVec::iter` internals fail its
         // hardened-unsafe check.
         for span in self.hyperlinks()? {
@@ -351,7 +351,7 @@ impl Line {
     #[must_use]
     #[allow(
         clippy::manual_find,
-        reason = "explicit slice loop is the lowerable form for the strict Trust gate; the `.iter().find(..)` rewrite MIR-inlines SmallVec::iter internals its hardened-unsafe check fails on"
+        reason = "explicit slice loop is the lowerable form for the Trust lane (`ship trust run`); the `.iter().find(..)` rewrite MIR-inlines SmallVec::iter internals its hardened-unsafe check fails on"
     )]
     pub fn get_hyperlink_span(&self, col: u16) -> Option<&HyperlinkSpan> {
         // Explicit slice loop (see `get_hyperlink`).
@@ -490,7 +490,7 @@ impl Line {
     #[must_use]
     #[allow(
         clippy::manual_find,
-        reason = "explicit slice loop is the lowerable form for the strict Trust gate; the `.iter().find(..)` rewrite MIR-inlines SmallVec::iter internals its hardened-unsafe check fails on"
+        reason = "explicit slice loop is the lowerable form for the Trust lane (`ship trust run`); the `.iter().find(..)` rewrite MIR-inlines SmallVec::iter internals its hardened-unsafe check fails on"
     )]
     #[cfg(test)]
     pub fn get_image(&self, col: u16) -> Option<&ImageSpan> {
@@ -739,8 +739,8 @@ impl std::fmt::Display for Line {
     // Display only — the byte-exact content stays in `as_bytes`.
     #[cfg_attr(trust_verify, trust::skip)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // `write_str`, not `write!`: no `format_args!` expansion for the strict
-        // gate to fail closed on.
+        // `write_str`, not `write!`: no `format_args!` expansion for the `verify
+        // trust` lane to fail closed on.
         f.write_str(&String::from_utf8_lossy(self.as_bytes()))
     }
 }

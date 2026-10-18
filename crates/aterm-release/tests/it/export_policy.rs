@@ -65,7 +65,8 @@ fn specs(manifest: &str) -> Vec<String> {
 /// run), never publish/, not a test whose fixture is withheld, not the real-Claude lab
 /// (`crates/aterm-lab`) — and none of the art
 /// whose rights were never established, each excluded path tracked (so no exclusion is
-/// vacuous), while the roster the product is generated from ships.
+/// vacuous), while the roster the product is generated from and the man page the
+/// crates embed ship.
 #[test]
 fn the_export_selects_no_gitlink_and_none_of_the_withheld_files() {
     let manifest = std::fs::read_to_string(repo().join("publish/manifest.txt")).unwrap();
@@ -94,6 +95,12 @@ fn the_export_selects_no_gitlink_and_none_of_the_withheld_files() {
     ] {
         assert!(!exported.contains(withheld), "{withheld} is exported");
     }
+    // Outside crates/ and assets/, yet aterm-gui embeds it (`include_bytes!`), so a
+    // public clone without it does not compile.
+    assert!(
+        exported.contains("man/aterm.1"),
+        "man/aterm.1 is not exported"
+    );
 
     let art = "crates/aterm-effects/art";
     let tracked: BTreeSet<String> = git(&["ls-files", "--", art])
@@ -105,7 +112,6 @@ fn the_export_selects_no_gitlink_and_none_of_the_withheld_files() {
         "pet/README.md",
         "animal/README.md",
         "dogs/README.md",
-        "convert_glyphs.py",
     ]
     .iter()
     .map(|p| format!("{art}/{p}"))
@@ -127,7 +133,7 @@ fn the_export_selects_no_gitlink_and_none_of_the_withheld_files() {
     ] {
         expected.insert(format!("{art}/glyphs/acc_{a}.toml"));
     }
-    assert_eq!(expected.len(), 40);
+    assert_eq!(expected.len(), 39);
     let untracked: Vec<&String> = expected.iter().filter(|p| !tracked.contains(*p)).collect();
     assert!(
         untracked.is_empty(),

@@ -32,8 +32,8 @@
 //! production [`zone_offset_at`], which asks `date` under `TZ=<zone>`: a reset
 //! that falls across a daylight-saving change is placed where the zone's clock
 //! shows it, not an hour off by today's offset. [`reset_at`] and
-//! [`place_reset`] keep the offset of ONE instant (`zone_offset(zone)`, in
-//! production [`zone_offset_s`]: today's), right unless such a change falls
+//! [`place_reset`] keep the offset of ONE instant (`zone_offset(zone)`: today's,
+//! [`zone_offset_at`] at the caller's now), right unless such a change falls
 //! between now and the reset. Either way only for a zone `/usr/share/zoneinfo`
 //! has, since an unknown `TZ` reads as UTC in silence (measured:
 //! `TZ=Nonsense/Zone date +%z` prints `+0000`). A zone the machine does not
@@ -148,77 +148,6 @@ pub fn parse_reset(text: &str) -> Option<ResetSpec> {
         minute,
         zone,
     })
-}
-
-/// The reset a limit row of Codex's `/status` card names, the words inside
-/// its `(resets …)` (`harness::usage::codex_status_windows`): codex-rs paints
-/// its clock as `%H:%M` (0.156.1: `13:24`) or, on a 12-hour clock, `%-I:%M
-/// %p` (0.163.0, measured in the lab: `12:15 PM`; its binary carries both
-/// formats), followed by ` on %-d %b` when the reset falls on another day
-/// than the reading it was drawn from (`13:24 on 1 Oct`, `11:15 AM on 21
-/// Oct`), in the TUI's own zone, which it never names. [`parse_reset`] reads
-/// a date only in front of the clock, so it refuses the dated form. `None`
-/// for any other shape.
-pub fn parse_card_reset(text: &str) -> Option<ResetSpec> {
-    let text = text.trim();
-    let (clock, day) = match text.split_once(" on ") {
-        Some((clock, day)) => (clock, Some(day)),
-        None => (text, None),
-    };
-    let (hour, minute) = card_clock(clock)?;
-    let date = match day {
-        None => None,
-        Some(day) => {
-            let words: Vec<&str> = day.split_whitespace().collect();
-            let [d, month] = words.as_slice() else {
-                return None;
-            };
-            let d: u32 = d.parse().ok()?;
-            if !(1..=31).contains(&d) {
-                return None;
-            }
-            Some((month_of(month)?, d))
-        }
-    };
-    Some(ResetSpec::At {
-        date,
-        hour,
-        minute,
-        zone: None,
-    })
-}
-
-/// A card's clock ([`parse_card_reset`]) as `(hour, minute)` on the 24-hour
-/// clock: `%H:%M` (two digits each), or `%-I:%M AM|PM` (an hour of 1 to 12,
-/// one digit or two; 12 AM is midnight, 12 PM noon). `None` otherwise.
-fn card_clock(clock: &str) -> Option<(u32, u32)> {
-    let (time, pm) = match clock.rsplit_once(' ') {
-        Some((time, "AM")) => (time, Some(false)),
-        Some((time, "PM")) => (time, Some(true)),
-        Some(_) => return None,
-        None => (clock, None),
-    };
-    let (h, m) = time.split_once(':')?;
-    let digits = |s: &str, most: usize| {
-        (1..=most).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit())
-    };
-    if m.len() != 2 || !digits(m, 2) {
-        return None;
-    }
-    let minute: u32 = m.parse().ok()?;
-    if minute > 59 {
-        return None;
-    }
-    let hour: u32 = match pm {
-        None if h.len() == 2 && digits(h, 2) => h.parse().ok().filter(|h| *h <= 23)?,
-        None => return None,
-        Some(pm) if digits(h, 2) => {
-            let h12: u32 = h.parse().ok().filter(|h| (1..=12).contains(h))?;
-            h12 % 12 + if pm { 12 } else { 0 }
-        }
-        Some(_) => return None,
-    };
-    Some((hour, minute))
 }
 
 /// A LIMIT NOTICE'S RESET AS ITS CLOCK SAYS IT — the date it names, the hour
@@ -640,17 +569,12 @@ pub fn tz_offset_s() -> i64 {
     parse_zone(&text).unwrap_or(0)
 }
 
-/// A named zone's offset from UTC today, in seconds: `date +%z` under
-/// `TZ=<zone>`, asked only for a zone `/usr/share/zoneinfo` has (an unknown
-/// `TZ` reads as UTC in silence). `None` for one it has not, or a name with
-/// characters no zone has.
-pub fn zone_offset_s(zone: &str) -> Option<i64> {
-    zone_offset_at(zone, unix_now())
-}
-
 /// A named zone's offset from UTC AT the instant `unix` ([`offset_at`], for a
 /// zone `/usr/share/zoneinfo` has): the reader [`reset_at_with`] and
-/// [`place_reset_with`] take.
+/// [`place_reset_with`] take. `None` for a zone it has not, or a name with
+/// characters no zone has. The caller hands the instant in — the supervising
+/// loop from its clock door (`supervise::fx`) — so there is no "today's
+/// offset" reader beside it: one would read the system clock behind the door.
 pub fn zone_offset_at(zone: &str, unix: i64) -> Option<i64> {
     offset_at(Some(zone), unix)
 }
@@ -658,7 +582,7 @@ pub fn zone_offset_at(zone: &str, unix: i64) -> Option<i64> {
 /// A zone's offset from UTC at the instant `unix`, in seconds (the offset
 /// daylight saving gave that instant): `date -r <unix> +%z` (BSD) /
 /// `date -d @<unix> +%z` (GNU). `zone` names the zone (`TZ=<zone>`, only one
-/// [`zone_offset_s`] would ask about); `None` is the local clock. The
+/// `/usr/share/zoneinfo` has); `None` is the local clock. The
 /// workspace's one reader of an offset at an instant (aterm-gui's
 /// `presence::local_offset_at` is this with no zone). A subprocess per call,
 /// so hot callers cache. `None` where `date` cannot say, or off Unix.
@@ -669,12 +593,11 @@ pub fn offset_at(zone: Option<&str>, unix: i64) -> Option<i64> {
     date_offset(zone.map_or(DateZone::Inherited, DateZone::Named), unix)
 }
 
-/// The machine's own zone's offset from UTC at `unix`: `/etc/localtime`'s,
-/// whatever `TZ` this process has (the zone a process with no `TZ` reads its
-/// clock in, e.g. a Codex's usage wall, `harness::codex::wall_zone`).
-/// [`offset_at`] with `TZ` removed. `None` where `date` cannot say, or off Unix.
-pub fn machine_offset_at(unix: i64) -> Option<i64> {
-    date_offset(DateZone::Machine, unix)
+/// The local clock's offset from UTC at `unix` ([`offset_at`] with no zone):
+/// the supervising loop's reader of a day the vendor draws with no zone,
+/// which the loop asks through its door (`supervise::fx`).
+pub fn local_offset_at(unix: i64) -> Option<i64> {
+    offset_at(None, unix)
 }
 
 /// Whose zone `date` reads ([`date_offset`]).
@@ -683,12 +606,10 @@ enum DateZone<'a> {
     Inherited,
     /// `TZ=<zone>`.
     Named(&'a str),
-    /// The machine's, `TZ` removed.
-    Machine,
 }
 
 /// `date +%z` at the instant `unix` in `zone`: the one subprocess behind
-/// [`offset_at`] and [`machine_offset_at`].
+/// [`offset_at`].
 fn date_offset(zone: DateZone<'_>, unix: i64) -> Option<i64> {
     if !cfg!(unix) {
         return None;
@@ -698,9 +619,6 @@ fn date_offset(zone: DateZone<'_>, unix: i64) -> Option<i64> {
         DateZone::Inherited => {}
         DateZone::Named(zone) => {
             date.env("TZ", zone);
-        }
-        DateZone::Machine => {
-            date.env_remove("TZ");
         }
     }
     if cfg!(any(
@@ -783,22 +701,6 @@ pub fn one_line(text: &str) -> String {
 mod tests {
     use super::*;
 
-    /// `date +%z`'s answer, and the shapes near it: the sign is the first
-    /// byte, exactly four digits follow (a `:` between them is tolerated),
-    /// and anything else is refused rather than read.
-    #[test]
-    fn a_zone_is_a_sign_and_four_digits() {
-        assert_eq!(parse_zone("+0130"), Some(5_400));
-        assert_eq!(parse_zone("-0700"), Some(-25_200));
-        assert_eq!(parse_zone("+07:00"), Some(25_200));
-        assert_eq!(parse_zone("+0000"), Some(0));
-        assert_eq!(parse_zone("0700"), None, "no sign");
-        assert_eq!(parse_zone("+070"), None, "three digits");
-        assert_eq!(parse_zone("x+0700"), None, "sign not first");
-        assert_eq!(parse_zone("+1\u{e9}1"), None, "not four digits");
-        assert_eq!(parse_zone(""), None);
-    }
-
     /// The test's zone table: what `date` answers on a machine that knows
     /// these two zones, in mid-September (daylight time).
     fn zones(zone: &str) -> Option<i64> {
@@ -844,67 +746,6 @@ mod tests {
         let dec30 = 1_798_632_000;
         let spec = parse_reset("Jan 2, 2027 at 9am (UTC)").expect("parses");
         assert_eq!(reset_at(&spec, dec30, 0, zones), 1_798_880_400);
-    }
-
-    /// Codex's `/status` card names a reset as `%H:%M` (0.156.1) or `%-I:%M
-    /// %p` (0.163.0, measured: `12:15 PM`, `11:15 AM on 21 Oct`), and ` on
-    /// %-d %b` when it falls on another day: read as the clock with the date,
-    /// no zone. NEGATIVE CONTROLS: the supervisor's own grammar refuses the
-    /// dated form, and the card's grammar refuses the notices' shapes and
-    /// anything off its own (a one-digit 24-hour hour, an hour past 12 with
-    /// AM/PM, hour 0 on the 12-hour clock, a lower-case `pm`, a date in front,
-    /// a stray word).
-    #[test]
-    fn the_codex_cards_reset_parses_as_its_clock_and_day() {
-        let at = |date, hour, minute| {
-            Some(ResetSpec::At {
-                date,
-                hour,
-                minute,
-                zone: None,
-            })
-        };
-        assert_eq!(
-            parse_card_reset("13:24 on 1 Oct"),
-            at(Some((10, 1)), 13, 24)
-        );
-        assert_eq!(
-            parse_card_reset("00:05 on 31 Dec"),
-            at(Some((12, 31)), 0, 5)
-        );
-        assert_eq!(parse_card_reset(" 13:24 "), at(None, 13, 24));
-        // 0.163.0's 12-hour clock, as measured in the lab.
-        assert_eq!(parse_card_reset("12:15 PM"), at(None, 12, 15));
-        assert_eq!(
-            parse_card_reset("11:15 AM on 21 Oct"),
-            at(Some((10, 21)), 11, 15)
-        );
-        assert_eq!(parse_card_reset("1:24 PM"), at(None, 13, 24));
-        assert_eq!(parse_card_reset("12:05 AM"), at(None, 0, 5));
-        assert_eq!(parse_card_reset("09:05 AM"), at(None, 9, 5));
-        assert_eq!(
-            parse_reset("13:24 on 1 Oct"),
-            None,
-            "not the notices' grammar"
-        );
-        for text in [
-            "13:24 PM",
-            "0:05 AM",
-            "1:24 pm",
-            "1:24  PM",
-            "1:5 PM",
-            "1:24",
-            "Oct 1 at 13:24",
-            "13:24 on Oct 1",
-            "13:24 on 1 Oct 2026",
-            "13:24 on 32 Oct",
-            "24:00",
-            "13:60",
-            "in 3h",
-            "",
-        ] {
-            assert_eq!(parse_card_reset(text), None, "{text:?}");
-        }
     }
 
     /// Both spellings the real notices carry, with the zone read.
@@ -1155,71 +996,6 @@ mod tests {
         assert_eq!(parse_clock("23:00"), Some((23, 0)));
     }
 
-    /// The earlier placer, kept as the oracle: every caller of `reset_at` (the
-    /// supervisor's clock, `harness limits`, the band) places as it does, every
-    /// five minutes over three days (edges included), for every spelling:
-    /// dated, bare, zoned, span.
-    #[test]
-    fn reset_at_places_as_it_always_did() {
-        fn before(spec: &ResetSpec, now: i64, local: i64) -> i64 {
-            match spec {
-                ResetSpec::In(span) => now + i64::try_from(span.as_secs()).unwrap(),
-                ResetSpec::At {
-                    date,
-                    hour,
-                    minute,
-                    zone,
-                } => {
-                    let offset = zone.as_deref().and_then(zones).unwrap_or(local);
-                    let (y, m, d) = civil((now + offset).div_euclid(86_400));
-                    let clock = i64::from(*hour) * 3600 + i64::from(*minute) * 60;
-                    match date {
-                        Some((month, day)) => [y - 1, y, y + 1]
-                            .into_iter()
-                            .map(|year| {
-                                days_from_civil(year, *month, *day) * 86_400 + clock - offset
-                            })
-                            .min_by_key(|at| (at - now).abs())
-                            .unwrap(),
-                        None => {
-                            let today = days_from_civil(y, m, d) * 86_400 + clock - offset;
-                            if today > now || now - today <= SAME_DAY {
-                                today
-                            } else {
-                                today + 86_400
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        let texts = [
-            "3am",
-            "3pm (America/Los_Angeles)",
-            "11:30pm (America/New_York)",
-            "12am (UTC)",
-            "Sep 19 at 11am (America/Los_Angeles)",
-            "Jan 2 at 9am (UTC)",
-            "Dec 31 at 11pm",
-            "in 3h",
-        ];
-        for text in texts {
-            let spec = parse_reset(text).expect(text);
-            // Every five minutes — the rule's edges fall on the hour — and
-            // a few seconds past each.
-            for step in 0..(3 * 24 * 12 * 2) {
-                let now = NOW + 5 * 60 + (step / 2) * 300 + (step % 2) * 17;
-                for local in [PDT, 0, 5 * 3600 + 1800] {
-                    assert_eq!(
-                        reset_at(&spec, now, local, zones),
-                        before(&spec, now, local),
-                        "{text} at {now} local {local}"
-                    );
-                }
-            }
-        }
-    }
-
     /// America/Los_Angeles around its 2026 switches: PST until 2026-03-08
     /// 10:00Z, PDT until 2026-11-01 09:00Z, PST after.
     fn la_at(t: i64) -> Option<i64> {
@@ -1277,7 +1053,7 @@ mod tests {
     #[test]
     fn a_zones_offset_is_read_at_the_instant() {
         if !Path::new("/usr/share/zoneinfo/America/Los_Angeles").is_file() {
-            return;
+            aterm_spec::host::could_not_run("this machine has no zoneinfo for America/Los_Angeles");
         }
         assert_eq!(
             offset_at(Some("America/Los_Angeles"), 1_772_951_400),
@@ -1334,15 +1110,19 @@ mod tests {
             ("+07", None),
             ("+070000", None),
             ("x+0700", None),
+            ("+1\u{e9}1", None),
         ] {
             assert_eq!(parse_zone(text), want, "{text:?}");
         }
         // Whatever this machine's zone is, it reads as a whole number of
         // minutes within a day.
         assert!(tz_offset_s().abs() < 86_400);
-        // A zone no machine has, and a path that is not a zone name.
-        assert_eq!(zone_offset_s("Mars/Olympus"), None);
-        assert_eq!(zone_offset_s("../etc/passwd"), None);
+        // A zone no machine has, and a path that is not a zone name, at any
+        // instant.
+        for unix in [0, 1_790_000_000] {
+            assert_eq!(zone_offset_at("Mars/Olympus", unix), None);
+            assert_eq!(zone_offset_at("../etc/passwd", unix), None);
+        }
     }
     /// EXHAUSTIVELY: with the
     /// print known, a wall's bare clock time is the first occurrence of that

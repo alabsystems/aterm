@@ -20,7 +20,8 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Instant;
 
-use aterm_spec::derive::{Model, native_update_carried_health_model};
+use aterm_models_update::native_update_carried_health_model;
+use aterm_spec::derive::Model;
 use aterm_spec::interp::{self, State};
 use aterm_spec::xref::StepEvidence;
 

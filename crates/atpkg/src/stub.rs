@@ -174,20 +174,61 @@ pub fn program_of(name: &str) -> &str {
     }
 }
 
-/// The stubs for `program`'s commands ([`commands_of`]) in `bin/`, rendered, each only
-/// where [`pending_stub_executable`] would lay one; `keep` gains every command name whose
-/// slot is the program's to answer for — laid now, or already standing.
-fn command_stub_executables(
+/// [`program_of`] in `layout`: also a command a signed manifest exposes (`targo-tippy`,
+/// `clean-lsp`), named by the pending stub that stands for it ([`stub_comes_with`]) — the
+/// table knows only the branded names.
+#[must_use]
+pub fn program_of_in(layout: &Layout, name: &str) -> String {
+    let table = program_of(name);
+    if table != name {
+        return table.to_string();
+    }
+    ToolName::new(name)
+        .and_then(|tool| stub_comes_with(&layout.shim(&tool)))
+        .unwrap_or_else(|| name.to_string())
+}
+
+/// The program the pending stub at `path` names on its [`COMES_WITH`] line, if it is a
+/// pending stub that names one (and the name is one a stub could carry).
+fn stub_comes_with(path: &Path) -> Option<String> {
+    let text = crate::metadata_io::read_bounded_regular_utf8(path, 64 * 1024).ok()?;
+    if !text.lines().any(|l| is_marker_line(l, STUB_MARKER)) {
+        return None;
+    }
+    text.lines()
+        .map(str::trim)
+        .find_map(|l| {
+            l.strip_prefix("# ")
+                .or_else(|| l.strip_prefix("rem "))?
+                .strip_prefix(COMES_WITH)
+        })
+        .and_then(|program| ToolName::new(program.trim()))
+        .map(|program| program.as_str().to_string())
+}
+
+/// The stubs for `program`'s commands in `bin/` — the branded ones ([`commands_of`]) and the
+/// ones its signed manifest exposes (`exposed`, the index-resolve reconcile's) — rendered,
+/// each naming `program` ([`COMES_WITH`]) and each only where [`pending_stub_executable`]
+/// would lay one; `keep` gains every command name whose slot is the program's to answer
+/// for — laid now, or already standing.
+fn command_stub_executables<'a>(
     layout: &Layout,
     program: &str,
-    keep: &mut BTreeSet<&str>,
+    exposed: &'a [String],
+    keep: &mut BTreeSet<&'a str>,
     files: &mut Vec<crate::lay::Executable>,
 ) {
-    for command in commands_of(program) {
+    let mut commands: Vec<&'a str> = commands_of(program).collect();
+    for name in exposed {
+        if name != program && !commands.contains(&name.as_str()) {
+            commands.push(name);
+        }
+    }
+    for command in commands {
         let Some(tool) = ToolName::new(command) else {
             continue;
         };
-        match pending_stub_executable(layout, &tool) {
+        match pending_command_stub_executable(layout, &tool, program) {
             Ok(Some(file)) => {
                 files.push(file);
                 keep.insert(command);
@@ -203,6 +244,11 @@ fn command_stub_executables(
 /// The marker line that identifies a pending stub — the recognition gate for every
 /// rewrite/removal below. Version-suffixed so a future stub format can coexist.
 const STUB_MARKER: &str = "# atpkg pending-program stub v1";
+
+/// What a command's stub says of the program that brings it, on a comment line of its own
+/// (`# comes with: trust`, or behind a batch `rem`): `__pending` reads it to wait for that
+/// program ([`program_of_in`]). An atpkg that predates the line reads past it.
+const COMES_WITH: &str = "comes with: ";
 
 /// The static last-resort message (fallback 3) — the one line the stub can always
 /// say without an atpkg to ask.
@@ -285,13 +331,15 @@ fn stub_named_atpkg(body: &str) -> Option<PathBuf> {
 /// `platform::parse_sh_shim_target` recognizes real shims by a line starting `exec '`: a
 /// stub must resolve as no store target, or `active_builds`/`which`/the front door would
 /// take it for an installed tool.
+/// `comes_with` is the program a command's stub waits for ([`COMES_WITH`]), `None` for a
+/// program's own stub.
 #[must_use]
-fn stub_content(tool: &ToolName, atpkg: Option<&Path>) -> String {
+fn stub_content(tool: &ToolName, comes_with: Option<&str>, atpkg: Option<&Path>) -> String {
     let atpkg = named(atpkg);
     if cfg!(windows) {
-        stub_content_cmd(tool, atpkg)
+        stub_content_cmd(tool, comes_with, atpkg)
     } else {
-        stub_content_sh(tool, atpkg)
+        stub_content_sh(tool, comes_with, atpkg)
     }
 }
 
@@ -306,11 +354,14 @@ pub(crate) fn named(atpkg: Option<&Path>) -> &Path {
 /// The POSIX `/bin/sh` stub body (macOS/Linux — the shim there is a plain
 /// executable file).
 #[must_use]
-fn stub_content_sh(tool: &ToolName, atpkg: &Path) -> String {
+fn stub_content_sh(tool: &ToolName, comes_with: Option<&str>, atpkg: &Path) -> String {
     let name = sh_single_quote(tool.as_str());
     let mut s = String::from("#!/bin/sh\n");
     s.push_str(STUB_MARKER);
     s.push('\n');
+    if let Some(program) = comes_with {
+        s.push_str(&format!("# {COMES_WITH}{program}\n"));
+    }
     s.push_str("# Replaced by the real shim when the program installs.\nATPKG=");
     s.push_str(&sh_single_quote(&atpkg.to_string_lossy()));
     // The caller's arguments ride along: an agent program's stub execs the user's own copy
@@ -355,13 +406,16 @@ const _: () = assert!(CMD_STUB_FIRST_LINE.len() >= crate::platform::CMD_FRAME_HE
 /// [`CMD_STUB_FIRST_LINE`] is the first line after `:main`. An empty `atpkg` ([`named`])
 /// leaves the `if exist` block out. Unverified on a Windows host.
 #[must_use]
-fn stub_content_cmd(tool: &ToolName, atpkg: &Path) -> String {
+fn stub_content_cmd(tool: &ToolName, comes_with: Option<&str>, atpkg: &Path) -> String {
     let name = tool.as_str();
     let atpkg = atpkg.to_string_lossy();
     let mut s = String::from(CMD_STUB_FIRST_LINE);
     s.push_str("rem ");
     s.push_str(STUB_MARKER);
     s.push_str("\r\n");
+    if let Some(program) = comes_with {
+        s.push_str(&format!("rem {COMES_WITH}{program}\r\n"));
+    }
     s.push_str("rem Replaced by the real shim when the program installs.\r\n");
     // The caller's arguments ride along (`%*`, the batch `"$@"` — the real shim forwards
     // the same way): an agent program's stub execs the user's own copy meanwhile, and a
@@ -648,6 +702,35 @@ pub(crate) fn pending_stub_executable(
     layout: &Layout,
     tool: &ToolName,
 ) -> io::Result<Option<crate::lay::Executable>> {
+    pending_bin_stub_executable(layout, tool, None)
+}
+
+/// [`pending_stub_executable`] for a command `program` brings ([`command_stub_executables`]):
+/// its body names `program` ([`COMES_WITH`]). None for a program name a body cannot carry
+/// inertly: one that would break its comment line (a line break, any control character),
+/// or one a batch body cannot embed.
+fn pending_command_stub_executable(
+    layout: &Layout,
+    tool: &ToolName,
+    program: &str,
+) -> io::Result<Option<crate::lay::Executable>> {
+    let Some(program) = ToolName::new(program) else {
+        return Ok(None);
+    };
+    if program.as_str().chars().any(char::is_control)
+        || (cfg!(windows) && !cmd_stub_name_safe(program.as_str()))
+    {
+        return Ok(None);
+    }
+    pending_bin_stub_executable(layout, tool, Some(program.as_str()))
+}
+
+/// The `bin/` stub for `tool`, naming the program it comes with when it is a command.
+fn pending_bin_stub_executable(
+    layout: &Layout,
+    tool: &ToolName,
+    comes_with: Option<&str>,
+) -> io::Result<Option<crate::lay::Executable>> {
     if cfg!(windows) && !cmd_stub_name_safe(tool.as_str()) {
         // See `cmd_stub_name_safe`: no inert embedding exists, so no stub.
         return Ok(None);
@@ -657,7 +740,7 @@ pub(crate) fn pending_stub_executable(
         // installed, and the plain name's stub already answers until then.
         return Ok(None);
     }
-    pending_stub_executable_at(layout, tool, layout.shim(tool))
+    pending_stub_at(layout, tool, comes_with, layout.shim(tool))
 }
 
 /// [`pending_stub_executable`] for a stub at an explicit path: the `bin/` slot, or an agent
@@ -670,6 +753,16 @@ pub(crate) fn pending_stub_executable_at(
     tool: &ToolName,
     shim: PathBuf,
 ) -> io::Result<Option<crate::lay::Executable>> {
+    pending_stub_at(layout, tool, None, shim)
+}
+
+/// [`pending_stub_executable_at`], naming the program a command's stub comes with.
+fn pending_stub_at(
+    layout: &Layout,
+    tool: &ToolName,
+    comes_with: Option<&str>,
+    shim: PathBuf,
+) -> io::Result<Option<crate::lay::Executable>> {
     let standing = match std::fs::symlink_metadata(&shim) {
         Err(_) => None, // absent: ours to claim
         Ok(_) if is_pending_stub(&shim) => Some(
@@ -679,7 +772,7 @@ pub(crate) fn pending_stub_executable_at(
     };
     let atpkg =
         Embedder::this_process().embed(standing.as_deref().and_then(stub_named_atpkg).as_deref());
-    let body = stub_content(tool, atpkg.as_deref());
+    let body = stub_content(tool, comes_with, atpkg.as_deref());
     // Ours already and byte-identical: nothing to lay (the reroute stubs' rule). Seeds and
     // install passes reconcile repeatedly; a body that differs (another atpkg named, an
     // older client's retired line) is rewritten.
@@ -698,8 +791,9 @@ fn stub_is_current(shim: &Path, body: &str) -> bool {
     std::fs::read(shim).is_ok_and(|have| have == body.as_bytes())
 }
 
-/// Remove `program`'s stub and its commands' ([`commands_of`]), each only while it is
-/// still a pending stub: `atpkg uninstall <p>`, an index de-listing.
+/// Remove `program`'s stub and its commands' — the branded ones ([`commands_of`]) and every
+/// stub that names it ([`COMES_WITH`]) — each only while it is still a pending stub: `atpkg
+/// uninstall <p>`, an index de-listing.
 pub fn remove_stub(layout: &Layout, program: &str) {
     let commands: Vec<&str> = commands_of(program).collect();
     for name in std::iter::once(program).chain(commands) {
@@ -708,6 +802,15 @@ pub fn remove_stub(layout: &Layout, program: &str) {
             if is_pending_stub(&shim) {
                 let _ = std::fs::remove_file(&shim);
             }
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(layout.bin_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if stub_comes_with(&path).as_deref() == Some(program) {
+            let _ = std::fs::remove_file(&path);
         }
     }
 }
@@ -752,7 +855,7 @@ pub fn lay_adoption_stubs(layout: &Layout, cfg: &crate::config::PackagesConfig) 
                 files.push(file);
             }
             // The commands it exposes answer too (`targo` for `trust`, [`commands_of`]).
-            command_stub_executables(layout, name, &mut commands, &mut files);
+            command_stub_executables(layout, name, &[], &mut commands, &mut files);
             // The agent programs' stubs go first on PATH too ([`pending_stub_executable_at`]).
             if is_agent_program(name)
                 && let Ok(Some(twin)) =
@@ -769,10 +872,20 @@ pub fn lay_adoption_stubs(layout: &Layout, cfg: &crate::config::PackagesConfig) 
 }
 
 /// The index-resolve reconcile: `wanted` is the signed set the pass keeps complete
-/// (installable and not removed), `installed` the active builds. Adds or refreshes a stub
-/// for every wanted absent program and the commands it exposes ([`commands_of`]), then
-/// sweeps every other pending stub: one whose program is no longer wanted or is installed.
-pub fn reconcile(layout: &Layout, wanted: &BTreeSet<String>, installed: &BTreeMap<String, u64>) {
+/// (installable and not removed), `installed` the active builds, `exposed` what each
+/// program's signed manifest exposes (the ones the pass verified). Adds or refreshes a stub
+/// for every wanted absent program and the commands it brings — the branded ones
+/// ([`commands_of`]) and every other name its manifest exposes, each naming the program
+/// ([`COMES_WITH`]) — then sweeps every other pending stub: one whose program is no longer
+/// wanted or is installed, or a command the manifest read this pass no longer exposes. A
+/// command's stub whose program this pass read no manifest of (its fetch failed) stays: it
+/// is what the last verified manifest said.
+pub fn reconcile(
+    layout: &Layout,
+    wanted: &BTreeSet<String>,
+    installed: &BTreeMap<String, u64>,
+    exposed: &BTreeMap<String, Vec<String>>,
+) {
     let mut keep: BTreeSet<&str> = BTreeSet::new();
     let mut files = Vec::new();
     for name in wanted {
@@ -800,7 +913,13 @@ pub fn reconcile(layout: &Layout, wanted: &BTreeSet<String>, installed: &BTreeMa
         {
             files.push(twin);
         }
-        command_stub_executables(layout, name, &mut keep, &mut files);
+        command_stub_executables(
+            layout,
+            name,
+            exposed.get(name).map_or(&[], Vec::as_slice),
+            &mut keep,
+            &mut files,
+        );
     }
     // Every stub this reconcile adds or refreshes. A lay that fails leaves the names it
     // would have laid in `keep`, so the sweep below removes nothing over it — and the
@@ -824,7 +943,12 @@ pub fn reconcile(layout: &Layout, wanted: &BTreeSet<String>, installed: &BTreeMa
                 continue;
             };
             let logical = ToolName::from_shim_file(name);
-            let stays = logical.as_ref().is_some_and(|t| keep.contains(t.as_str()));
+            let stays = logical.as_ref().is_some_and(|t| keep.contains(t.as_str()))
+                || stub_comes_with(&path).is_some_and(|program| {
+                    wanted.contains(&program)
+                        && !installed.contains_key(&program)
+                        && !exposed.contains_key(&program)
+                });
             if !stays {
                 let _ = std::fs::remove_file(&path);
             }
@@ -880,10 +1004,96 @@ mod tests {
         // activation, is what stands there next).
         let mut installed = BTreeMap::new();
         installed.insert(String::from("claude"), 1u64);
-        reconcile(&l, &BTreeSet::new(), &installed);
+        reconcile(&l, &BTreeSet::new(), &installed, &BTreeMap::new());
         assert!(
             !twin.exists(),
             "an installed program's stub is swept from agents/"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// A command only a program's signed manifest exposes stands with it like a branded one:
+    /// the reconcile lays it naming its program — which `program_of_in` answers and the table
+    /// alone (`program_of`) cannot — keeps it while the program is wanted and absent, also
+    /// through a pass that read no manifest of it, sweeps it once the manifest read no longer
+    /// exposes it or the program is installed, and `remove_stub` takes it with the program.
+    #[test]
+    fn a_command_only_the_manifest_exposes_is_stubbed_naming_its_program() {
+        let l = layout("exposed");
+        let wanted: BTreeSet<String> = BTreeSet::from(["clean".to_string()]);
+        let exposed = |names: &[&str]| {
+            BTreeMap::from([(
+                "clean".to_string(),
+                names.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            )])
+        };
+        let lsp = l.shim(&tool("clean-lsp"));
+        reconcile(
+            &l,
+            &wanted,
+            &BTreeMap::new(),
+            &exposed(&["clean", "clean-lsp"]),
+        );
+        assert!(is_pending_stub(&lsp), "laid with its program");
+        assert!(is_pending_stub(&l.shim(&tool("clean"))));
+        assert_eq!(
+            program_of("clean-lsp"),
+            "clean-lsp",
+            "the table does not know it"
+        );
+        assert_eq!(program_of_in(&l, "clean-lsp"), "clean");
+        assert_eq!(
+            program_of_in(&l, "targo"),
+            "trust",
+            "the table still answers first"
+        );
+        reconcile(&l, &wanted, &BTreeMap::new(), &BTreeMap::new());
+        assert!(
+            is_pending_stub(&lsp),
+            "a pass that read no manifest of clean keeps what the last one said"
+        );
+        reconcile(&l, &wanted, &BTreeMap::new(), &exposed(&["clean"]));
+        assert!(
+            !lsp.exists(),
+            "a manifest that no longer exposes it sweeps it"
+        );
+        reconcile(
+            &l,
+            &wanted,
+            &BTreeMap::new(),
+            &exposed(&["clean", "clean-lsp"]),
+        );
+        let mut installed = BTreeMap::new();
+        installed.insert("clean".to_string(), 1u64);
+        reconcile(&l, &wanted, &installed, &BTreeMap::new());
+        assert!(
+            !lsp.exists(),
+            "an installed program's command stub is swept"
+        );
+        reconcile(
+            &l,
+            &wanted,
+            &BTreeMap::new(),
+            &exposed(&["clean", "clean-lsp"]),
+        );
+        remove_stub(&l, "clean");
+        assert!(!lsp.exists(), "remove_stub takes it with its program");
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// A command's stub names its program on a comment line of the script, so a program name
+    /// that would end that line early lays no stub for its commands: the rest of the name
+    /// would be a line of the stub's shell script.
+    #[test]
+    fn a_program_name_that_would_break_the_comes_with_line_lays_no_command_stub() {
+        let l = layout("comes-with-line");
+        let program = "ay\nid";
+        let wanted: BTreeSet<String> = BTreeSet::from([program.to_string()]);
+        let exposed = BTreeMap::from([(program.to_string(), vec!["ay-qbf".to_string()])]);
+        reconcile(&l, &wanted, &BTreeMap::new(), &exposed);
+        assert!(
+            !l.shim(&tool("ay-qbf")).exists(),
+            "no stub carries the program's second line as a command"
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
@@ -918,25 +1128,25 @@ mod tests {
             );
         }
         let trust: BTreeSet<String> = ["trust".to_string()].into_iter().collect();
-        reconcile(&l, &trust, &BTreeMap::new());
+        reconcile(&l, &trust, &BTreeMap::new(), &BTreeMap::new());
         assert!(commands.iter().all(|c| pending_stub_exists(&l, c)), "kept");
-        reconcile(&l, &BTreeSet::new(), &BTreeMap::new());
+        reconcile(&l, &BTreeSet::new(), &BTreeMap::new(), &BTreeMap::new());
         assert!(
             commands.iter().all(|c| !l.shim(&tool(c)).exists()),
             "swept once trust leaves `wanted`"
         );
-        reconcile(&l, &trust, &BTreeMap::new());
+        reconcile(&l, &trust, &BTreeMap::new(), &BTreeMap::new());
         assert!(
             commands.iter().all(|c| pending_stub_exists(&l, c)),
             "laid again"
         );
         let installed: BTreeMap<String, u64> = [("trust".to_string(), 1u64)].into_iter().collect();
-        reconcile(&l, &trust, &installed);
+        reconcile(&l, &trust, &installed, &BTreeMap::new());
         assert!(
             commands.iter().all(|c| !l.shim(&tool(c)).exists()),
             "swept once trust is installed (its real shims stand there next)"
         );
-        reconcile(&l, &trust, &BTreeMap::new());
+        reconcile(&l, &trust, &BTreeMap::new(), &BTreeMap::new());
         remove_stub(&l, "trust");
         assert!(
             commands.iter().all(|c| !l.shim(&tool(c)).exists()),
@@ -953,13 +1163,13 @@ mod tests {
         let mine = l.shim(&tool("targo"));
         std::fs::write(&mine, "#!/bin/sh\necho mine\n").unwrap();
         let trust: BTreeSet<String> = ["trust".to_string()].into_iter().collect();
-        reconcile(&l, &trust, &BTreeMap::new());
+        reconcile(&l, &trust, &BTreeMap::new(), &BTreeMap::new());
         assert_eq!(
             std::fs::read_to_string(&mine).unwrap(),
             "#!/bin/sh\necho mine\n"
         );
         assert!(pending_stub_exists(&l, "trustc"), "its siblings are laid");
-        reconcile(&l, &BTreeSet::new(), &BTreeMap::new());
+        reconcile(&l, &BTreeSet::new(), &BTreeMap::new(), &BTreeMap::new());
         assert_eq!(
             std::fs::read_to_string(&mine).unwrap(),
             "#!/bin/sh\necho mine\n",
@@ -993,24 +1203,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn roster_names_all_pass_shim_allowed() {
-        for (name, desc) in DEFAULT_SET_STUB_NAMES {
-            assert!(
-                crate::store::shim_allowed(name),
-                "{name} would be refused as a shim"
-            );
-            assert!(!desc.is_empty(), "{name} needs its authored line");
-        }
-    }
-
     /// An alias is never a stub: the reconcile lays plain names only, and the writer is a
     /// no-op for an `alab-` name even when asked directly.
     #[test]
     fn an_alias_is_never_a_stub() {
         let l = layout("alias-stub");
         let wanted: BTreeSet<String> = ["trust".to_string()].into_iter().collect();
-        reconcile(&l, &wanted, &BTreeMap::new());
+        reconcile(&l, &wanted, &BTreeMap::new(), &BTreeMap::new());
         assert!(
             pending_stub_exists(&l, "trust"),
             "the plain name is stubbed"
@@ -1028,30 +1227,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// The stub body: marker present, the three-step fallback chain in order, the tool name
-    /// and embedded path quote-safe, and it parses as no shim target, so
-    /// `which`/`active_builds`/`prune_stale_shims` never take a stub for an installed tool.
+    /// The stub body: marker present, the tool name and embedded path quote-safe, and it
+    /// parses as no shim target, so `which`/`active_builds`/`prune_stale_shims` never take a
+    /// stub for an installed tool. (The fallback chain runs for real in
+    /// `fallback_chain_runs_in_a_real_shell`.)
     #[test]
     fn stub_content_shape_and_shim_invisibility() {
         // The sh body directly — `stub_content` dispatches by compile target,
         // and this shape must stay pinned from every build host.
         let body = stub_content_sh(
             &tool("trust"),
+            None,
             Path::new("/Apps/aterm.app/Contents/MacOS/atpkg"),
         );
-        assert!(body.starts_with("#!/bin/sh\n"));
         assert!(body.contains(STUB_MARKER));
-        let atpkg_pos = body.find("[ -x \"$ATPKG\" ]").unwrap();
-        let command_v = body.find("exec \"$__d/atpkg\" __pending").unwrap();
-        // The message embeds sh-quoted (its apostrophe becomes '\''), so probe a
-        // quote-free distinctive slice of it.
-        let static_msg = body.find("package manager is not reachable").unwrap();
-        assert!(
-            atpkg_pos < command_v && command_v < static_msg,
-            "fallbacks in order"
-        );
-        assert!(body.contains("__pending 'trust'"));
-        assert!(body.trim_end().ends_with("exit 127"));
         assert_eq!(
             crate::platform::parse_sh_shim_target(&body),
             None,
@@ -1059,7 +1248,7 @@ mod tests {
         );
         // Quote-safety: a name with an embedded quote cannot break out.
         let nasty = ToolName::new("a'b").expect("shim_allowed admits quotes");
-        let body = stub_content_sh(&nasty, Path::new("/x'y/atpkg"));
+        let body = stub_content_sh(&nasty, None, Path::new("/x'y/atpkg"));
         assert!(body.contains("__pending 'a'\\''b'"));
         assert!(body.contains("ATPKG='/x'\\''y/atpkg'"));
     }
@@ -1070,43 +1259,20 @@ mod tests {
     fn cmd_stub_shape_marker_and_safety() {
         let body = stub_content_cmd(
             &tool("trust"),
+            None,
             Path::new(r"C:\Program Files\aterm\atpkg.exe"),
         );
-        // The frame first, then the batch body's `@echo off`.
-        let frame = crate::platform::cmd_frame();
-        assert!(body.starts_with(&frame), "framed: {body}");
+        // The frame first.
         assert!(
-            body[frame.len()..].starts_with("@echo off\r\n"),
-            "batch, not sh: {body}"
+            body.starts_with(&crate::platform::cmd_frame()),
+            "framed: {body}"
         );
-        assert_eq!(body.matches("@goto :main").count(), 1);
-        assert_eq!(body.matches("\r\n:main\r\n").count(), 1);
-        assert!(!body.contains("#!/bin/sh"), "no POSIX in a .cmd file");
         // cmd.exe reads the file in the console's OEM code page: no UTF-8 in it.
         assert!(body.is_ascii(), "a .cmd stub is ASCII: {body}");
-        let exist = body.find("if exist").unwrap();
-        let where_probe = body.find("where atpkg").unwrap();
-        let static_msg = body.find("package manager is not reachable").unwrap();
-        assert!(
-            exist < where_probe && where_probe < static_msg,
-            "fallbacks in order"
-        );
         assert_eq!(
             body.matches("__pending \"trust\" %*\r\n").count(),
             2,
             "both arms that reach atpkg carry the caller's arguments: {body}"
-        );
-        assert!(
-            body.matches("exit /b 127").count() >= 3,
-            "every arm exits 127"
-        );
-        // Recognition round-trips through the `rem` spelling.
-        assert!(
-            body.lines().any(|l| l
-                .trim()
-                .strip_prefix("rem ")
-                .is_some_and(|r| r.trim() == STUB_MARKER)),
-            "the marker rides a rem line"
         );
 
         // The batch-hostility gate: sh can neutralize these, batch cannot —
@@ -1132,7 +1298,7 @@ mod tests {
         let fake = l.prefix.join("fake-atpkg.cmd");
         std::fs::write(&fake, format!("@echo %*> \"{}\"\r\n", record.display())).unwrap();
         let stub = l.prefix.join("claude.cmd");
-        std::fs::write(&stub, stub_content_cmd(&tool("claude"), &fake)).unwrap();
+        std::fs::write(&stub, stub_content_cmd(&tool("claude"), None, &fake)).unwrap();
         let mut command = aterm_uds::spawnfd::command("cmd");
         command
             .args(["/d", "/c"])
@@ -1175,12 +1341,13 @@ mod tests {
                 "a Program Files atpkg",
                 stub_content_cmd(
                     &tool("trust"),
+                    None,
                     Path::new(r"C:\Program Files (x86)\aterm\app\atpkg.exe"),
                 ),
             ),
             (
                 "the longest atpkg path",
-                stub_content_cmd(&tool("vendorx"), &long_atpkg),
+                stub_content_cmd(&tool("vendorx"), None, &long_atpkg),
             ),
         ];
         for (what, new) in &cases {
@@ -1246,6 +1413,7 @@ mod tests {
         let old = &cases[0].1[frame.len()..];
         let moved = stub_content_cmd(
             &tool("trust"),
+            None,
             Path::new(&format!(
                 r"C:\Program Files (x86)\aterm\app\{}\atpkg.exe",
                 "m".repeat(29)
@@ -1272,7 +1440,7 @@ mod tests {
         let path = dir.join("trust.cmd");
         std::fs::write(
             &path,
-            stub_content_cmd(&tool("trust"), Path::new(r"C:\x\atpkg.exe")),
+            stub_content_cmd(&tool("trust"), None, Path::new(r"C:\x\atpkg.exe")),
         )
         .unwrap();
         assert!(is_pending_stub(&path), "batch stub recognized");
@@ -1399,7 +1567,7 @@ mod tests {
         use std::os::unix::fs::MetadataExt as _;
         let l = layout("identical-skip");
         let t = tool("trust");
-        let body = stub_content(&t, Embedder::this_process().embed(None).as_deref());
+        let body = stub_content(&t, None, Embedder::this_process().embed(None).as_deref());
         let fresh = pending_stub_executable(&l, &t).unwrap();
         assert!(fresh.is_some(), "an absent name is ours to claim");
         write_pending_stub(&l, &t).unwrap();
@@ -1415,7 +1583,7 @@ mod tests {
         // session's writes carry, the identical stub keeps its inode.
         let ino = std::fs::metadata(&shim).unwrap().ino();
         let wanted: BTreeSet<String> = ["trust".to_string()].into_iter().collect();
-        reconcile(&l, &wanted, &BTreeMap::new());
+        reconcile(&l, &wanted, &BTreeMap::new(), &BTreeMap::new());
         lay_adoption_stubs(&l, &crate::config::PackagesConfig::default());
         assert!(pending_stub_exists(&l, "trust"), "the reconcile keeps it");
         assert!(
@@ -1444,7 +1612,7 @@ mod tests {
             !stub_is_current(&shim, &body),
             "a changed body is never current"
         );
-        reconcile(&l, &wanted, &BTreeMap::new());
+        reconcile(&l, &wanted, &BTreeMap::new(), &BTreeMap::new());
         assert_eq!(
             std::fs::read(&shim).unwrap(),
             body.as_bytes(),
@@ -1469,7 +1637,7 @@ mod tests {
         .into_iter()
         .collect();
         let installed: BTreeMap<String, u64> = BTreeMap::new();
-        reconcile(&l, &wanted, &installed);
+        reconcile(&l, &wanted, &installed, &BTreeMap::new());
         assert!(
             pending_stub_exists(&l, "brandnew"),
             "newly listed name gains a stub"
@@ -1485,7 +1653,7 @@ mod tests {
         );
         // Installed ⇒ stub retired even if the real shims expose other names.
         let installed: BTreeMap<String, u64> = [("trust".to_string(), 210)].into_iter().collect();
-        reconcile(&l, &wanted, &installed);
+        reconcile(&l, &wanted, &installed, &BTreeMap::new());
         assert!(!pending_stub_exists(&l, "trust"));
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
@@ -1512,7 +1680,7 @@ mod tests {
                 .unwrap()
         };
         // 1: embedded path exists and is executable.
-        let out = run(&stub_content(&t, Some(&fake)), "/nonexistent");
+        let out = run(&stub_content(&t, None, Some(&fake)), "/nonexistent");
         assert_eq!(out.status.code(), Some(127));
         assert_eq!(
             String::from_utf8_lossy(&out.stdout),
@@ -1532,7 +1700,7 @@ mod tests {
         )
         .unwrap();
         let out = run(
-            &stub_content(&t, Some(Path::new("/gone/after/relocation/atpkg"))),
+            &stub_content(&t, None, Some(Path::new("/gone/after/relocation/atpkg"))),
             path_dir.to_str().unwrap(),
         );
         assert_eq!(out.status.code(), Some(127));
@@ -1541,14 +1709,14 @@ mod tests {
             "path: __pending trust\n"
         );
         // 2, naming no atpkg at all (nothing live when it was laid): the same PATH answer.
-        let out = run(&stub_content(&t, None), path_dir.to_str().unwrap());
+        let out = run(&stub_content(&t, None, None), path_dir.to_str().unwrap());
         assert_eq!(
             String::from_utf8_lossy(&out.stdout),
             "path: __pending trust\n"
         );
         // 3: nothing reachable — the static honest message, exit 127.
         let out = run(
-            &stub_content(&t, Some(Path::new("/gone/atpkg"))),
+            &stub_content(&t, None, Some(Path::new("/gone/atpkg"))),
             "/nonexistent",
         );
         assert_eq!(out.status.code(), Some(127));
@@ -1556,7 +1724,7 @@ mod tests {
         // ... and never an atpkg a relative or empty PATH entry names: run from the
         // directory holding one, `.` and a stray `:` both mean it, and the stub answers 3.
         let script = l.prefix.join("stub-under-test");
-        std::fs::write(&script, stub_content(&t, None)).unwrap();
+        std::fs::write(&script, stub_content(&t, None, None)).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         for path_env in ["/nonexistent:.", "/nonexistent:"] {
             let out = std::process::Command::new(&script)
@@ -1571,31 +1739,6 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&l.prefix);
-    }
-
-    /// Every agent program is a shim-admissible name no default-set member also claims (one
-    /// in both would be laid twice and described as the other), and its pending stub prints
-    /// its vendor row's line: descriptive of the vendor, never an ALab mark, naming the host
-    /// the bytes come from.
-    #[test]
-    fn an_agent_program_is_a_shim_name_described_by_its_vendor() {
-        for row in crate::vendor_direct::VENDORS {
-            let (name, desc) = (row.program, row.description);
-            assert!(is_agent_program(name));
-            assert!(crate::store::shim_allowed(name), "{name}");
-            assert!(
-                DEFAULT_SET_STUB_NAMES.iter().all(|(n, _)| *n != name),
-                "{name} is in two rosters"
-            );
-            assert_eq!(describe(name), Some(desc));
-            assert!(desc.contains("downloaded from"), "{name}: {desc}");
-            assert!(
-                desc.starts_with(&format!("{} ", row.vendor)),
-                "{name}: {desc}"
-            );
-        }
-        assert!(!is_agent_program("trust"));
-        assert!(!is_agent_program("nonesuch"));
     }
 
     // ── which atpkg a laid file names ───────────────────────────────────────────────
@@ -1770,7 +1913,7 @@ mod tests {
             "/Users//o'brien/Application Support/aterm/bin/atpkg",
             "/it's/''/x",
         ] {
-            let body = stub_content_sh(&t, Path::new(path));
+            let body = stub_content_sh(&t, None, Path::new(path));
             assert_eq!(
                 sh_named_atpkg(&body, "ATPKG"),
                 Some(PathBuf::from(path)),
@@ -1794,16 +1937,16 @@ mod tests {
                 assert_eq!(sh_named_atpkg(&reroute, "ATPKG"), Some(PathBuf::from(path)));
             }
         }
-        let cmd = stub_content_cmd(&t, Path::new(r"C:\Program Files\aterm\atpkg.exe"));
+        let cmd = stub_content_cmd(&t, None, Path::new(r"C:\Program Files\aterm\atpkg.exe"));
         assert_eq!(
             stub_named_atpkg(&cmd),
             Some(PathBuf::from(r"C:\Program Files\aterm\atpkg.exe"))
         );
         // Naming none.
-        let none = stub_content_sh(&t, named(None));
+        let none = stub_content_sh(&t, None, named(None));
         assert!(none.contains("\nATPKG=''\n"), "{none}");
         assert_eq!(stub_named_atpkg(&none), None);
-        let cmd_none = stub_content_cmd(&t, named(None));
+        let cmd_none = stub_content_cmd(&t, None, named(None));
         assert!(!cmd_none.contains("if exist"), "{cmd_none}");
         assert!(cmd_none.contains("where atpkg"), "{cmd_none}");
         assert_eq!(stub_named_atpkg(&cmd_none), None);
@@ -1862,12 +2005,15 @@ mod tests {
             std::os::unix::fs::symlink(exe.file_name().unwrap(), exe.with_file_name("atpkg"))
                 .unwrap();
         }
-        let out = std::process::Command::new(exe)
-            .args(["--exact", "--nocapture", LAY_AS_COPY_PROBE])
-            .env(LAY_AS_COPY_ENV, &l.prefix)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .expect("run the copy");
+        // Just copied: past the `ETXTBSY` a sibling test's fork can hold it in.
+        let out = aterm_spec::wait::past_text_busy(|| {
+            std::process::Command::new(exe)
+                .args(["--exact", "--nocapture", LAY_AS_COPY_PROBE])
+                .env(LAY_AS_COPY_ENV, &l.prefix)
+                .stdin(std::process::Stdio::null())
+                .output()
+        })
+        .expect("run the copy");
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
             out.status.success() && stdout.contains("1 passed"),

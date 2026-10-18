@@ -7,13 +7,22 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "First-party SHA-256 and HMAC-SHA256 for aterm (replaces sha2 and hmac)"
+description = "aterm's SHA-256 (astream-digest's, re-exported) and its HMAC-SHA256 and constant-time compare (replaces sha2 and hmac)"
 
 [dependencies]
-# None, on purpose: `sha2` + `hmac` pulled in 8 packages (49,474 lines) for
-# four methods; `cargo forge survey --cell mac-arm` measured 161 -> 153
+# ONE SHA-256. astream-digest is the hash under astream-cap's capability tags and
+# producer ids, astream-aead's handshake and astream-evidence's output pins: zero
+# dependencies, forbid(unsafe), its streaming buffer's L0 obligations discharged as
+# a Clean island. It began as this crate's own sha256.rs (the same author, ported
+# with its tests), and aterm kept a second copy of the same 320 lines, which nothing
+# held to the first. Re-exporting it makes `aterm_digest::Sha256` the very type
+# aterm-link's grants are already hashed with, so a fix or a proof lands once.
+#
+# Still no third-party code: `sha2` + `hmac` pulled in 8 packages (49,474 lines)
+# for four methods; `cargo forge survey --cell mac-arm` measured 161 -> 153
 # third-party packages. `subtle` stays in the graph through rustls; `ct_eq`
 # replaces only our use of it.
+astream-digest = { path = "../../vendor/astream/crates/astream-digest" }
 
 [lints]
 workspace = true

@@ -23,59 +23,47 @@ fn emoji_row(t: &Terminal, max_rows: u16) -> Option<String> {
     })
 }
 
+/// An on-screen non-BMP cell survives every resize path: a rows-only grow and
+/// shrink, a font re-fit (the wild bug: a small rows delta right after the
+/// emoji rendered on a non-top row) and a column reflow.
 #[test]
-fn rows_only_grow_preserves_non_bmp_cell() {
-    let mut t = Terminal::new(24, 80);
-    t.process(EMOJI_LINE);
-    assert_eq!(t.row_text(0).as_deref().map(str::trim_end), Some("Q😀Z"));
-
-    // Rows grow, columns unchanged.
-    t.resize(48, 80);
-    assert_eq!(
-        emoji_row(&t, 48).as_deref(),
-        Some("Q😀Z"),
-        "non-BMP emoji must survive a rows-only grow, not become U+FFFD"
+fn every_resize_path_preserves_non_bmp_cells() {
+    type Case = (
+        &'static str,
+        (u16, u16),
+        &'static [u8],
+        (u16, u16),
+        &'static str,
     );
-}
-
-#[test]
-fn rows_only_shrink_preserves_non_bmp_cell() {
-    let mut t = Terminal::new(24, 80);
-    t.process(b"\r\n");
-    t.process(EMOJI_LINE); // emoji on row 1 (not the top row)
-    t.resize(12, 80); // rows shrink, cols unchanged
-    assert_eq!(
-        emoji_row(&t, 12).as_deref(),
-        Some("Q😀Z"),
-        "non-BMP emoji must survive a rows-only shrink"
-    );
-}
-
-#[test]
-fn font_refit_style_resize_preserves_non_bmp_cell() {
-    // The exact shape of the wild bug: a small rows delta with the emoji already
-    // on a non-top row (a font-metrics re-fit right after the emoji rendered).
-    let mut t = Terminal::new(55, 128);
-    t.process(b"\x1b]133;C\x07"); // OSC 133;C command mark, like the shell
-    t.process(b"\r\n");
-    t.process(b"Q\xf0\x9f\x98\x80A\xf0\x9f\x98\x80Z"); // two emoji: Q😀A😀Z
-    assert_eq!(emoji_row(&t, 55).as_deref(), Some("Q😀A😀Z"));
-
-    t.resize(61, 128); // font-refit re-fit: rows 55 -> 61, cols unchanged
-    assert_eq!(
-        emoji_row(&t, 61).as_deref(),
-        Some("Q😀A😀Z"),
-        "both on-screen emoji must survive the font-refit rows-only resize"
-    );
-}
-
-#[test]
-fn column_reflow_still_preserves_non_bmp_cell() {
-    // Column reflow also keeps the non-BMP cell.
-    let mut t = Terminal::new(24, 80);
-    t.process(EMOJI_LINE);
-    t.resize(50, 200); // cols change -> column reflow path
-    assert_eq!(emoji_row(&t, 50).as_deref(), Some("Q😀Z"));
+    let cases: [Case; 4] = [
+        ("rows-only grow", (24, 80), EMOJI_LINE, (48, 80), "Q😀Z"),
+        (
+            "rows-only shrink",
+            (24, 80),
+            b"\r\nQ\xf0\x9f\x98\x80Z",
+            (12, 80),
+            "Q😀Z",
+        ),
+        (
+            "font re-fit",
+            (55, 128),
+            b"\x1b]133;C\x07\r\nQ\xf0\x9f\x98\x80A\xf0\x9f\x98\x80Z",
+            (61, 128),
+            "Q😀A😀Z",
+        ),
+        ("column reflow", (24, 80), EMOJI_LINE, (50, 200), "Q😀Z"),
+    ];
+    for (name, (rows, cols), input, (to_rows, to_cols), want) in cases {
+        let mut t = Terminal::new(rows, cols);
+        t.process(input);
+        assert_eq!(emoji_row(&t, rows).as_deref(), Some(want), "{name}: before");
+        t.resize(to_rows, to_cols);
+        assert_eq!(
+            emoji_row(&t, to_rows).as_deref(),
+            Some(want),
+            "{name}: the non-BMP cells must survive, not become U+FFFD"
+        );
+    }
 }
 
 /// The parser stores the non-BMP base in a dense ring while skin-tone/ZWJ

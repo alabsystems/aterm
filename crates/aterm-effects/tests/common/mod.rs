@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Shared support for this crate's integration tests and benches. `effects_suite` mounts it
-//! once (its files reach it as `crate::common`); a binary of its own, such as
-//! `rainbow_kitty_v2_frame_cost`, declares `mod common;`, and a bench mounts it (or such a
-//! binary) by path. An item some binary leaves unused carries `#[allow(dead_code)]`.
+//! Shared support for this crate's integration tests and benches. `effects_suite`, the
+//! crate's one test binary, mounts it once (its files reach it as `crate::common`); a bench
+//! mounts it (or a suite file) by path. An item some binary leaves unused carries
+//! `#[allow(dead_code)]`.
 //!
 //! It holds the budget-scale knob of the release perf gates (`benches/cursor_bench.rs` and
 //! `benches/rainbow_kitty_v2_frame_cost.rs`); the ribbon host's pieces: the rainbow-kitty
 //! config, a grid's geometry, and the frame hold's samples as `app_render.rs` takes them from a
 //! real `Terminal` after the last `process`, one free function each so a host keeps its own
-//! order; the plan-coverage census of a row; the `ptyrec.py` recording parse; and the replay
-//! pool ([`par_map`]).
+//! order; the plan-coverage census of a row; the `lab ptyrec` recording parse the real-byte
+//! replays read; and the replay pool ([`par_map`]).
 
 use aterm_core::grid::Cursor;
 use aterm_core::terminal::{ContentScrollDelta, ContentScrollState, Terminal};
@@ -80,7 +80,6 @@ pub fn rainbow_cfg() -> GlowConfig {
         ring: true,
         beam: false,
         head_dx: 0.5,
-        pack: None,
     }
 }
 
@@ -294,7 +293,7 @@ pub fn is_arrow(b: &[u8]) -> bool {
     b.starts_with(b"\x1b[") && matches!(b.last(), Some(b'A' | b'B' | b'C' | b'D'))
 }
 
-/// One recorded event of a `ptyrec.py` take.
+/// One recorded event of a `targo --unverified lab ptyrec` take.
 #[allow(dead_code)]
 pub enum Rec {
     /// Bytes the program wrote to the terminal.
@@ -312,7 +311,7 @@ pub fn unhex(s: &str) -> Vec<u8> {
 
 /// `(ms from the first line, event)` of a take whose lines read `<stamp>
 /// <O|I> <hex>`; `per_ms` stamps make a millisecond (`1_000_000` for
-/// `ptyrec.py`'s nanoseconds, `1_000` for microseconds).
+/// `lab ptyrec`'s nanoseconds, `1_000` for microseconds).
 #[allow(dead_code)]
 pub fn recording(src: &str, per_ms: u64) -> Vec<(u64, Rec)> {
     let mut t0 = None;

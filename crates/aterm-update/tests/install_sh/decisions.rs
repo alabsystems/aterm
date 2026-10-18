@@ -4,7 +4,7 @@
 //! The installer's pure decisions: the manifest's identity fields, the
 //! official channel's signing-team pin, the app half's idempotence and its
 //! signature gate, the container election, which repository a checkout
-//! installs from, and the Linux desktop entry.
+//! installs from, and the Linux candidate's identity line.
 
 use crate::support::{Lib, Scratch, q, root, s};
 
@@ -179,78 +179,80 @@ fn digests_compare_case_blind_and_never_empty() {
     }
 }
 
-/// The desktop entry's Exec= is written unquoted, so only a plain absolute
-/// path may ride it.
+/// The authenticated Linux candidate is the release it was elected as when
+/// the FIRST line of its `--version` says so: `aterm --version` prints the
+/// origin line, the build, which copy runs and the trust roots under the
+/// identity, and the lane compared that whole report, refusing every release.
+/// A version on a later line is not the identity; a candidate that cannot run
+/// is a different refusal from one that names another release.
 #[test]
-fn only_a_plain_absolute_path_rides_an_unquoted_exec_line() {
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the Linux release lane's probe runs under coreutils timeout"
+)]
+fn the_linux_candidate_is_judged_by_its_identity_line() {
     let scratch = Scratch::new();
-    let rows = [
-        ("/home/user/.local/bin/aterm", 0),
-        ("/opt/aterm-0.44.0/bin_x86+64/.aterm", 0),
-        (".local/bin/aterm", 1),
-        ("/home/user name/bin/aterm", 1),
-        ("/home/u\"/bin/aterm", 1),
-        ("/home/u%U/bin/aterm", 1),
-        ("/home/u;rm/bin/aterm", 1),
-        ("", 1),
+    // aterm-cli's version_text: identity, origin, build, which copy, trust roots.
+    let report = |identity: &str| {
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' '{identity}' '{}' 'build: 1792175575' \
+             'running: /home/u/.local/lib/aterm/bin/aterm' 'trusts: master=155e'\n",
+            aterm_types::identity::ORIGIN_LINE
+        )
+    };
+    let rows: Vec<(String, &str, i32, &str)> = vec![
+        (report("aterm 0.105.0"), "v0.105.0", 0, "aterm 0.105.0"),
+        (
+            report("aterm 0.105.0+g1234abcd"),
+            "v0.105.0",
+            0,
+            "aterm 0.105.0+g1234abcd",
+        ),
+        (
+            "#!/bin/sh\necho 'aterm 0.105.0'\n".into(),
+            "v0.105.0",
+            0,
+            "aterm 0.105.0",
+        ),
+        (report("aterm 0.104.0"), "v0.105.0", 1, "aterm 0.104.0"),
+        (report("aterm 0.105.0"), "v0.10.0", 1, "aterm 0.105.0"),
+        (
+            report("aterm-gui 0.105.0"),
+            "v0.105.0",
+            1,
+            "aterm-gui 0.105.0",
+        ),
+        (
+            "#!/bin/sh\necho 'aterm 0.104.0'\necho 'aterm 0.105.0'\n".into(),
+            "v0.105.0",
+            1,
+            "aterm 0.104.0",
+        ),
+        (
+            "#!/bin/sh\necho 'aterm 0.105.0'\nexit 1\n".into(),
+            "v0.105.0",
+            2,
+            "",
+        ),
     ];
     let mut lib = Lib::new();
     let calls: Vec<usize> = rows
         .iter()
-        .map(|(path, _)| lib.call(format!("desktop_exec_path_ok {}", q(path)), &[]))
+        .enumerate()
+        .map(|(n, (body, tag, _, _))| {
+            let exe = scratch.exe(&format!("candidate/{n}/aterm-linux"), body);
+            lib.call(
+                format!("linux_candidate_answers_tag {} {tag}", q(s(&exe))),
+                &["LINUX_CANDIDATE_SAID"],
+            )
+        })
         .collect();
     let recs = lib.run(&scratch);
-    for ((path, rc), i) in rows.iter().zip(calls) {
-        assert_eq!(recs[i].rc, *rc, "{path:?}");
-    }
-}
-
-/// A clone run installs the desktop entry and the aterm icon at every hicolor
-/// size the checkout ships (`uname` shadowed: the lane is Linux-only).
-#[test]
-fn a_clone_run_installs_the_desktop_entry_and_every_icon_size() {
-    let scratch = Scratch::new();
-    let bin = scratch.exe("desktop/bin/aterm", "#!/bin/sh\n");
-    let share = scratch.mkdir("desktop/share");
-    let mut lib = Lib::new();
-    let call = lib.call(
-        format!(
-            "( uname() {{ echo Linux; }}; BIN_DIR={} XDG_DATA_HOME={} ROOT={}; install_linux_desktop_entry )",
-            q(s(bin.parent().expect("bin dir"))),
-            q(s(&share)),
-            q(s(&root()))
-        ),
-        &["ATERM_DESKTOP_MARKER"],
-    );
-    let recs = lib.run(&scratch);
-    assert_eq!(recs[call].rc, 0, "{}", recs[call].err);
-    let entry = crate::support::read(&share.join("applications/aterm.desktop"));
-    // The marker is an on-disk contract across versions: uninstall finds the
-    // entries older installers wrote by this exact line.
-    assert_eq!(
-        recs[call].var("ATERM_DESKTOP_MARKER"),
-        "# Managed by aterm install.sh — its uninstall removes only an entry carrying this line."
-    );
-    assert!(
-        entry.starts_with(recs[call].var("ATERM_DESKTOP_MARKER")),
-        "the entry carries the ownership marker the uninstall sweep reads: {entry}"
-    );
-    assert!(
-        entry.contains(&format!("Exec={} --window", s(&bin))),
-        "{entry}"
-    );
-    let shipped: Vec<String> = std::fs::read_dir(root().join("assets/linux/icons/hicolor"))
-        .expect("the checkout's icons")
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
-    assert_eq!(shipped.len(), 5, "{shipped:?}");
-    for size in shipped {
-        let icon = share.join(format!("icons/hicolor/{size}/apps/aterm.png"));
-        assert!(
-            icon.metadata().is_ok_and(|m| m.len() > 0),
-            "{} missing",
-            icon.display()
+    for ((body, tag, rc, said), i) in rows.iter().zip(calls) {
+        assert_eq!(
+            (recs[i].rc, recs[i].var("LINUX_CANDIDATE_SAID")),
+            (*rc, *said),
+            "{tag}: {body}"
         );
     }
 }

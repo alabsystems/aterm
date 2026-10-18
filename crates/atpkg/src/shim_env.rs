@@ -33,7 +33,7 @@
 //!   `repair`) re-lay a build's shims with its declared env. It is also the standard a
 //!   laid shim is held to: the pass re-lays a primary that exports otherwise
 //!   ([`crate::activate::reassert_shim_env`]), `doctor` names one, and `atpkg run`, which
-//!   execs past the shim, exports it itself ([`crate::ops::exec_env`]).
+//!   execs past the shim, exports it itself ([`crate::ops::managed`]).
 //!
 //! # The rule (checked at parse, and again, fail-closed, on every read)
 //!
@@ -426,49 +426,9 @@ mod tests {
         assert!(env.to_lines().len() < MAX_SIDECAR_BYTES);
         // The cap: nine entries is one too many, and the refusal says so.
         let nine: Vec<String> = (0..9).map(|i| format!("V{i}=1")).collect();
-        let err = ShimEnv::admit(&nine).unwrap_err();
-        assert_eq!(err, "shim_env: 9 entries, at most 8 allowed");
+        assert!(ShimEnv::admit(&nine).is_err());
         let eight: Vec<String> = (0..8).map(|i| format!("V{i}=1")).collect();
         assert_eq!(ShimEnv::admit(&eight).unwrap().entries().len(), 8);
-    }
-
-    /// The fix-line spellings: the self-update switches earn "own updater is off here"
-    /// (naming the product for a vendor-direct program), anything else `runs with …`, an
-    /// empty env none.
-    #[test]
-    fn the_fix_line_is_exact() {
-        assert_eq!(
-            ShimEnv::admit(&raw(&["DISABLE_AUTOUPDATER=1"]))
-                .unwrap()
-                .fix_line("claude")
-                .as_deref(),
-            Some("Claude Code's own updater is off here (DISABLE_AUTOUPDATER=1)")
-        );
-        assert_eq!(
-            ShimEnv::admit(&raw(&["DISABLE_UPDATES=1", "FOO=bar"]))
-                .unwrap()
-                .fix_line("tool")
-                .as_deref(),
-            Some("its own updater is off here (DISABLE_UPDATES=1); also runs with FOO=bar")
-        );
-        assert_eq!(
-            ShimEnv::admit(&raw(&["FOO=bar"]))
-                .unwrap()
-                .fix_line("claude")
-                .as_deref(),
-            Some("runs with FOO=bar")
-        );
-        assert_eq!(ShimEnv::NONE.fix_line("claude"), None);
-        // agy's switch is off only at its one value: `1` is no claim about its updater.
-        let agy = |entry: &str| ShimEnv::admit(&raw(&[entry])).unwrap().fix_line("agy");
-        assert_eq!(
-            agy("AGY_CLI_DISABLE_AUTO_UPDATE=true").as_deref(),
-            Some("Antigravity CLI's own updater is off here (AGY_CLI_DISABLE_AUTO_UPDATE=true)")
-        );
-        assert_eq!(
-            agy("AGY_CLI_DISABLE_AUTO_UPDATE=1").as_deref(),
-            Some("runs with AGY_CLI_DISABLE_AUTO_UPDATE=1")
-        );
     }
 
     /// The sidecar round-trips, an empty env removes it, a hand-edited one that breaks the

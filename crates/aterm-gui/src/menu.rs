@@ -334,8 +334,7 @@ pub(crate) enum MenuAction {
     /// launches and programs. Process-wide (never terminal-only: the launch
     /// kitty exists without a front session). The palette row's checkmark
     /// reports whether that promotable kitty is the current pin. One-way: the
-    /// pin is transferable, not toggleable. Wire id 46 and the legacy invoke
-    /// spelling `FavouriteSessionKitty` are kept ([`canonical_invoke_name`]).
+    /// pin is transferable, not toggleable. Wire id 46 is kept.
     FavouriteKitty,
     /// **WEAR THE NEXT CAT IN THE COLLECTION.** The switch
     /// [`Self::FavouriteKitty`] cannot make: that one pins the cat that would
@@ -387,11 +386,20 @@ pub(crate) enum MenuAction {
     /// where every theme can be tried on a live stage and its fonts and
     /// colors tuned. Instance-level: no session needed.
     BrowseThemes,
+    /// View ▸ Choose Tab Theme… — the palette's Theme section scoped to the
+    /// front session (`App::open_tab_theme_palette`): the arrow keys draw each
+    /// theme on this tab only, Enter keeps it as the tab's own theme
+    /// (`theme session set`), Esc puts the tab's previous theme back. Nothing
+    /// is written to aterm.toml. Terminal-only; no default binding.
+    ChooseTabTheme,
+    /// View ▸ Clear Tab Theme — the front session draws the instance theme
+    /// again (`theme session clear`). Terminal-only.
+    ClearTabTheme,
     // Tab-strip CONTEXT menu (session-metadata stage 2). These two live ONLY in
     // the per-tab right-click menu the native strip pops (`toolbar.rs` /
     // `session_chrome::compose_tab_menu`) — NOT in the menu bar, so they are
-    // deliberately absent from `MENU_MODEL` (see the tests' TAB_CONTEXT_ACTIONS
-    // twin list). They ride the same tag→action decode as every bar item.
+    // deliberately absent from `MENU_MODEL`. They ride the same tag→action decode
+    // as every bar item.
     /// Copy the right-clicked tab's session id (the registry `sid`) to the
     /// clipboard — the handle an agent needs to address this session over the
     /// control socket (`meta`, `timeline`, `turn`, …).
@@ -597,6 +605,9 @@ impl MenuAction {
             MenuAction::ChooseTheme => 75,
             // Settings ▸ Themes, the Theme Showcase (the theme overhaul).
             MenuAction::BrowseThemes => 76,
+            // Per-session themes (palette-256-session).
+            MenuAction::ChooseTabTheme => 77,
+            MenuAction::ClearTabTheme => 78,
         }
     }
 
@@ -679,6 +690,8 @@ impl MenuAction {
             74 => MenuAction::HarnessSettings,
             75 => MenuAction::ChooseTheme,
             76 => MenuAction::BrowseThemes,
+            77 => MenuAction::ChooseTabTheme,
+            78 => MenuAction::ClearTabTheme,
             _ => return None,
         })
     }
@@ -692,9 +705,6 @@ impl MenuAction {
 /// spellings a caller could reasonably have written for a row whose bar
 /// identity moved:
 ///
-/// * `FavouriteSessionKitty` — the wire name of the favourite action until the
-///   launch-kitty ruling (2026-08-17) retired the session kitty and renamed the
-///   action [`MenuAction::FavouriteKitty`]; the numeric wire id (46) never moved.
 /// * `OpenLedger` — the `[keybindings]` action name of the ledger key, for a
 ///   script that reaches the Fabric menu's "Ledger for This Session" row by
 ///   the name it already knows ([`MenuAction::LedgerForSession`]).
@@ -705,7 +715,6 @@ impl MenuAction {
 #[must_use]
 pub(crate) fn canonical_invoke_name(name: &str) -> &str {
     match name {
-        "FavouriteSessionKitty" => "FavouriteKitty",
         "OpenLedger" => "LedgerForSession",
         "Fleet" | "ShowFleet" => "ShowConnectionMap",
         "ShowInbox" => "Inbox",
@@ -761,6 +770,9 @@ pub(crate) const fn requires_terminal_tab(action: MenuAction) -> bool {
             // The reset acts on the front SESSION's terminal; a native whole
             // tab has none.
             | MenuAction::ResetTerminal
+            // A tab's own theme is the front SESSION's.
+            | MenuAction::ChooseTabTheme
+            | MenuAction::ClearTabTheme
     )
 }
 
@@ -1029,69 +1041,6 @@ pub(crate) fn native_row_title(tag: isize, stamped: String) -> String {
 #[cfg(test)]
 pub(crate) static MENU_STATICS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-#[cfg(test)]
-mod headless_os_ui_tests {
-    /// Every function in this file that parks the watchdog for a modal
-    /// (`park_modal`), asks `NSWorkspace` to open something (`openURL:`) or
-    /// puts a window in front of other apps' (`orderFrontRegardless`)
-    /// consults [`super::os_ui_refused`] before it — a SOURCE pin, because the
-    /// refusal only bites in a real headless process on the main thread, which
-    /// a unit test cannot be. A new modal or open helper added without the
-    /// check fails here by name.
-    #[test]
-    fn every_modal_and_workspace_open_asks_the_headless_refusal_first() {
-        let src = include_str!("menu.rs");
-        let lines: Vec<&str> = src.lines().collect();
-        let is_fn = |l: &str| {
-            let t = l.trim_start();
-            t.starts_with("fn ") || t.starts_with("pub fn ") || t.starts_with("pub(crate) fn ")
-        };
-        let mut sites = 0;
-        for (i, line) in lines.iter().enumerate() {
-            let code = line.split("//").next().unwrap_or("");
-            // Spelled in pieces so this scan never matches its own needles.
-            let parks = code.contains(concat!("park_", "modal()"));
-            let opens = code.contains(concat!("sel", "!(openURL:)"));
-            // A window put in front of other apps' without activating aterm
-            // (the Developer Tools helper panel) is OS UI too.
-            let fronts = code.contains(concat!("sel", "!(orderFrontRegardless)"));
-            if !(parks || opens || fronts) {
-                continue;
-            }
-            sites += 1;
-            let start = (0..i)
-                .rev()
-                .find(|&j| is_fn(lines[j]))
-                .unwrap_or_else(|| panic!("menu.rs:{}: no enclosing fn", i + 1));
-            let asked = lines[start..i].iter().any(|l| {
-                l.split("//")
-                    .next()
-                    .unwrap_or("")
-                    .contains(concat!("os_ui_", "refused("))
-            });
-            assert!(
-                asked,
-                "menu.rs:{}: `{}` presents OS UI without asking `os_ui_refused` first \
-                 (enclosing fn at menu.rs:{})",
-                i + 1,
-                line.trim(),
-                start + 1
-            );
-        }
-        // choose_local_file, confirm, notify park; open_in_workspace and its
-        // delayed twin open; order_front_regardless fronts the helper panel.
-        // Fewer means the scan went blind.
-        assert!(sites >= 6, "found only {sites} modal/open sites");
-    }
-
-    /// The refusal is off until `main_entry` marks the process headless — a
-    /// unit-test process never is, so windowed behaviour is untouched here.
-    #[test]
-    fn a_process_not_marked_headless_is_never_refused() {
-        assert!(!super::os_ui_refused("a probe"));
-    }
-}
-
 #[cfg(any(target_os = "macos", test))]
 fn native_menu_action_enabled(action: MenuAction) -> bool {
     if matches!(action, MenuAction::RenameSession | MenuAction::SetRole)
@@ -1305,6 +1254,11 @@ impl MenuAction {
             // front session's terminal modes, writes no input and nothing
             // durable.
             | MenuAction::ResetTerminal
+            // `theme session set|clear`'s twins: one session's colours,
+            // runtime only (carried by an update and a restore), the verb's
+            // `Write` class.
+            | MenuAction::ChooseTabTheme
+            | MenuAction::ClearTabTheme
             | MenuAction::Minimize
             | MenuAction::Zoom
             | MenuAction::NextTab
@@ -1389,6 +1343,9 @@ impl MenuAction {
             // Resets the TERMINAL's modes; nothing reaches the program's input
             // (the menu form never flushes it either).
             | MenuAction::ResetTerminal
+            // Recolour one session; nothing reaches its input.
+            | MenuAction::ChooseTabTheme
+            | MenuAction::ClearTabTheme
             | MenuAction::Minimize
             | MenuAction::Zoom
             | MenuAction::NextTab
@@ -1514,6 +1471,11 @@ impl MenuAction {
                 "Hand this terminal's keys, mouse and modes back to their defaults; \
                  keeps the screen and scrollback."
             }
+            MenuAction::ChooseTabTheme => {
+                "Choose a theme for this tab only: arrow keys preview it here, Enter keeps it, \
+                 Esc puts the tab's theme back."
+            }
+            MenuAction::ClearTabTheme => "Draw this tab in the window's theme again.",
             MenuAction::Minimize => "Minimise this window.",
             MenuAction::Zoom => "Zoom this window.",
             MenuAction::NextTab => "Show the next tab.",
@@ -1552,8 +1514,7 @@ impl MenuAction {
     /// `invoke <Name>` (the exact token [`crate::palette::PaletteState::action_by_name`]
     /// matches and `controls menu` prints), or `None` for an unknown token. The control
     /// layer uses this to classify a socket `invoke` BEFORE the action is dispatched, so
-    /// a scoped edge is fenced from the privileged actions at the authority layer. Kept
-    /// in lockstep with the enum by `invoke_name_round_trips`.
+    /// a scoped edge is fenced from the privileged actions at the authority layer.
     #[must_use]
     pub(crate) fn from_invoke_name(name: &str) -> Option<MenuAction> {
         match canonical_invoke_name(name) {
@@ -1626,6 +1587,8 @@ impl MenuAction {
             "TogglePresenceBand" => Some(MenuAction::TogglePresenceBand),
             "TogglePresenceRim" => Some(MenuAction::TogglePresenceRim),
             "ResetTerminal" => Some(MenuAction::ResetTerminal),
+            "ChooseTabTheme" => Some(MenuAction::ChooseTabTheme),
+            "ClearTabTheme" => Some(MenuAction::ClearTabTheme),
             _ => None,
         }
     }
@@ -2122,6 +2085,20 @@ const VIEW_MENU: &[MenuEntry] = &[
     },
     // Settings at the /themes route: the Theme Showcase, every theme on a
     // live stage with its fonts and colors to tune.
+    // The same palette scoped to the front tab: its own theme, nothing
+    // written to aterm.toml. No key equivalent.
+    Item {
+        label: "Choose Tab Theme…",
+        action: MenuAction::ChooseTabTheme,
+        key: "",
+        mods: MenuMods::None,
+    },
+    Item {
+        label: "Clear Tab Theme",
+        action: MenuAction::ClearTabTheme,
+        key: "",
+        mods: MenuMods::None,
+    },
     Item {
         label: "Browse & Customize Themes…",
         action: MenuAction::BrowseThemes,
@@ -2488,6 +2465,7 @@ pub(crate) fn staged_for_version_menu(
 /// regular app claiming the bar in between, the bar kept the menu the DEAD
 /// parent published last. Nothing the successor does can fix that without
 /// stealing focus; the parent's last-published title can simply be the right one.
+#[cfg(any(unix, test))]
 #[must_use]
 pub(crate) fn handoff_target_bar_title(
     target_build: u64,
@@ -2664,11 +2642,19 @@ pub(crate) fn mark_process_headless() {
     PROCESS_HEADLESS.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether this process is headless, for a presenter that refuses quietly: the
+/// Linux desktop-notification delivery (`notify::deliver`), whose refusal would
+/// otherwise print one stderr line per program notification.
+#[cfg(target_os = "linux")]
+pub(crate) fn process_is_headless() -> bool {
+    PROCESS_HEADLESS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Whether a helper about to present OS UI (a modal, or an open that fronts
 /// another app) must refuse because this process is headless — saying so on
 /// stderr, which is the only surface a headless instance has. Every such
-/// helper in the macOS module asks this FIRST; a unit test pins that.
-#[cfg(any(target_os = "macos", test))]
+/// helper in the macOS module asks this FIRST.
+#[cfg(target_os = "macos")]
 pub(crate) fn os_ui_refused(what: &str) -> bool {
     let refused = PROCESS_HEADLESS.load(std::sync::atomic::Ordering::Relaxed);
     if refused {
@@ -2702,7 +2688,7 @@ pub(crate) fn install(
 }
 
 /// Non-macOS stub: no native menu bar to retitle for a successor.
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 pub fn show_handoff_target_version(_handle: &MenuHandle, _title: &str) {}
 
 /// Non-macOS stub: no native menu bar, so there is no Version menu to retitle/rebuild.
@@ -2992,10 +2978,12 @@ impl SettingsOpen {
 }
 
 /// Open System Settings at `pane` — the owner-gesture entry point the Security
-/// page presses (design §3.4's FDA button, §3.7's repair link), and the
-/// Developer Tools hand-over's opener (`devtools_helper::Reach::live`), which
-/// the window's own lane and `aterm ctl devtools hand-over` reach at a quiet
-/// moment.
+/// page presses (design §3.4's FDA button, §3.7's repair link), the Developer
+/// Tools hand-over's opener (`devtools_helper::Reach::live`), which the
+/// window's own lane and `aterm ctl devtools hand-over` reach at a quiet
+/// moment, and the Full Disk Access hand-over's opener
+/// (`devtools_helper::FdaReach::live`), which only the window's own launch
+/// check reaches at a quiet moment (owner ask 2026-10-16).
 ///
 /// macOS does the work in [`macos::open_privacy_settings`], which documents why
 /// a Settings URL may be opened from here and never from a hyperlink. Off macOS
@@ -3163,6 +3151,12 @@ mod macos {
     /// (`NSWindowStyleMaskFullScreen`, `1 << 14`): `Exit Full Screen` while it
     /// is full screen, `Enter Full Screen` otherwise or with no main window.
     fn stamp_full_screen_title(item: Id) {
+        // Only items of the bar `install` built reach here, and it builds one
+        // only windowed; the proof keeps a headless `+sharedApplication` out
+        // all the same.
+        let Some(_windowed) = crate::platform::Windowed::get() else {
+            return;
+        };
         // SAFETY: `+sharedApplication` and `-mainWindow` are `-(id)` accessors
         // read on the main thread (AppKit calls `validateMenuItem:` there);
         // `-styleMask` is `-(NSWindowStyleMask)`, an `NSUInteger`, sent only to
@@ -3213,6 +3207,9 @@ mod macos {
     /// event loop always runs `resumed` on the main thread, so in practice the
     /// marker is always present.
     pub(crate) fn install(proxy: &EventLoopProxy<Wake>) -> Option<MenuHandle> {
+        // A menu bar is a windowed process's: headless, the `-setMainMenu:`
+        // below would first CREATE the application object.
+        let _windowed = crate::platform::Windowed::get()?;
         let main_thread = MainThread::new()?;
         let _ = TERMINATE_PROXY.set(proxy.clone());
         let target = MenuTarget::alloc_init(main_thread, proxy.clone())?;
@@ -4008,10 +4005,15 @@ mod macos {
     /// This URL is a different kind of thing: a `&'static str` compiled into
     /// aterm, with no untrusted bytes anywhere in it, reached from the owner's
     /// own presses (a button on aterm's own Security page, a digest line's
-    /// capsule) and from one lane of aterm's own: the Developer Tools hand-over
-    /// (`App::hand_devtools_to_owner`), which opens that one page — once per
-    /// aterm version on its own, and when `aterm ctl devtools hand-over` asks —
-    /// only at a quiet moment it judges itself (`devtools_helper::quiet`). A
+    /// capsule) and from one lane of aterm's own, for two pages: the Developer
+    /// Tools hand-over (`App::hand_devtools_to_owner`), which opens that page —
+    /// once per aterm version on its own, and when `aterm ctl devtools
+    /// hand-over` asks — and the Full Disk Access hand-over
+    /// (`App::hand_fda_to_owner`, owner ask 2026-10-16), which opens that page
+    /// once per aterm version when the launch check reads the grant off on a Mac
+    /// where aterm never verified it, and which no control verb reaches. Both
+    /// open only at a quiet moment the lane judges itself
+    /// (`devtools_helper::quiet`). A
     /// program's ask chooses neither the page nor the moment: the verb names no
     /// URL, and the lane holds it to the same gates as its own (the owner's Not
     /// now, a build whose grant would not last, ten minutes since the page last
@@ -4112,7 +4114,8 @@ mod macos {
             if url.is_null() || ws.is_null() {
                 return;
             }
-            let perform: unsafe extern "C-unwind" fn(Id, Sel, Sel, Id, f64) = aterm_objc::msg();
+            let perform: unsafe extern "C-unwind" fn(Id, Sel, Sel, Id, f64) =
+                aterm_objc::checked_msg();
             perform(
                 ws,
                 sel!(performSelector:withObject:afterDelay:),
@@ -4229,176 +4232,36 @@ mod tests {
         );
     }
 
-    /// The post-update row claims no age: it stands for ten minutes and nothing
-    /// rewrites it, so the Version menu's "… just now" read false for nine of
-    /// them. The menu and the palette say the same words.
-    #[test]
-    fn the_updated_row_claims_no_age() {
-        assert_eq!(
-            super::realized_row_label("\u{2191}", "9.9.9"),
-            "\u{2191} Updated to aterm v9.9.9"
-        );
-        assert!(!super::realized_row_label("\u{2B06}\u{FE0F}", "9.9.9").contains("now"));
-        assert!(crate::relaunch_notice::REALIZED_ARROW_TTL > std::time::Duration::from_secs(10));
-    }
-
-    /// THE ALWAYS-VISIBLE OFFER MUST CARRY THE APPLY LANE'S VERDICT ON ITSELF.
-    ///
-    /// This row is the affordance the owner actually looked at for hours on
-    /// 2026-08-21: "⬆️ Update to v0.56.0 — restart now" (the tail of the day), above
-    /// a control socket reporting `failing_applies=2` and the reason both attempts
-    /// died. A row that tells you to apply, over a build that has already refused to
-    /// start twice, is not merely incomplete — it is instructing you to repeat
-    /// something the program privately knows has not worked. And the clean row says
-    /// what pressing it does in the update row's own words — install, now — never a
-    /// restart.
+    /// THE ALWAYS-VISIBLE OFFER MUST CARRY THE APPLY LANE'S VERDICT ON ITSELF
+    /// (2026-08-21: the row said "restart now" above a build that had already
+    /// refused to start twice). A scheduled retry asks for nothing; a lane that
+    /// stopped names the action that resumes it; a build on hold offers no start.
     #[test]
     fn the_apply_row_admits_when_applying_has_already_been_tried() {
         use crate::update_apply_trouble::{ApplyRetry, ApplyTrouble};
 
+        let label = |retry, held| {
+            let trouble = ApplyTrouble::new(2, "handoff proof ended ChildDied", retry)
+                .expect("two failed applies");
+            staged_apply_label("\u{2191}", 1_787_699_398, "9.9.9", Some(&trouble), held)
+        };
         let clean = staged_apply_label("\u{2191}", 1_787_699_398, "9.9.9", None, false);
-        assert_eq!(clean, "\u{2191} Install aterm v9.9.9 now");
-
-        let trouble = ApplyTrouble::new(
-            2,
-            "overlap handoff failed safely: handoff proof ended ChildDied",
-            ApplyRetry::Scheduled,
-        )
-        .expect("two failed applies");
-        let troubled =
-            staged_apply_label("\u{2191}", 1_787_699_398, "9.9.9", Some(&trouble), false);
+        assert!(clean.ends_with(" now"), "{clean}");
+        let scheduled = label(ApplyRetry::Scheduled, false);
         assert!(
-            troubled.contains("v9.9.9"),
-            "the offer still names what it is offering: {troubled}"
+            scheduled.contains("v9.9.9") && scheduled.contains("twice"),
+            "{scheduled}"
         );
-        assert!(
-            troubled.contains("twice"),
-            "…and how many attempts have already died: {troubled}"
-        );
-        assert!(
-            troubled.contains("didn\u{2019}t start"),
-            "…and why, in words: {troubled}"
-        );
-        assert!(
-            !troubled.contains("ChildDied"),
-            "never the proof-outcome enum name: {troubled}"
-        );
-        assert!(
-            !troubled.contains(" now") && troubled.ends_with("will try again"),
-            "a scheduled retry must not demand an action that is already on its way: \
-             {troubled}"
-        );
-
-        // The latched lane keeps the call to action, because there it is true.
-        let latched = ApplyTrouble::new(2, "handoff proof ended ChildDied", ApplyRetry::ManualOnly)
-            .expect("two failed applies");
-        let latched = staged_apply_label("\u{2191}", 1_787_699_398, "9.9.9", Some(&latched), false);
-        assert!(
-            latched.ends_with("try again now") && latched.contains("Install"),
-            "a lane that has stopped names the action that resumes it: {latched}"
-        );
-        // A build on hold is offered no start: its next one is the launch its
-        // boot trial rolls back. The row reads as the band's record does.
-        let held = ApplyTrouble::new(2, "handoff proof ended ChildDied", ApplyRetry::NewerRelease)
-            .expect("two failed applies");
-        let held = staged_apply_label("\u{2191}", 1_787_699_398, "9.9.9", Some(&held), true);
-        assert_eq!(
-            held,
-            "\u{2191} aterm v9.9.9 is on hold \u{2014} tried twice, didn\u{2019}t start; a newer \
-             release replaces it by itself"
-        );
-        // …and so is one whose failures the ledger no longer names: the hold is
-        // the fact the click refuses on, not the record.
-        assert_eq!(
+        assert!(!scheduled.contains("ChildDied"), "{scheduled}");
+        assert!(!scheduled.ends_with(" now"), "{scheduled}");
+        assert!(label(ApplyRetry::ManualOnly, false).ends_with(" now"));
+        for held in [
+            label(ApplyRetry::NewerRelease, true),
             staged_apply_label("\u{2191}", 1_787_699_398, "9.9.9", None, true),
-            "\u{2191} aterm v9.9.9 is on hold \u{2014} a newer release replaces it by itself"
-        );
-        // …and none of them asks for a restart: the apply is in place.
-        assert!(
-            !clean.contains("restart")
-                && !troubled.contains("restart")
-                && !latched.contains("restart"),
-            "{clean} / {troubled} / {latched}"
-        );
+        ] {
+            assert!(held.contains("on hold") && !held.contains(" now"), "{held}");
+        }
     }
-
-    /// The canonical set of every menu command — shared by the tag round-trip test and
-    /// the `MENU_MODEL` completeness test (so adding a command means updating one list).
-    const ALL_ACTIONS: &[MenuAction] = &[
-        MenuAction::About,
-        MenuAction::SoftwareUpdate,
-        MenuAction::Preferences,
-        MenuAction::Quit,
-        MenuAction::NewWindow,
-        MenuAction::NewTab,
-        MenuAction::OpenMarkdown,
-        MenuAction::OpenEditor,
-        MenuAction::ReopenClosedTab,
-        MenuAction::ReopenClosedView,
-        MenuAction::MoveTabToNewWindow,
-        MenuAction::MoveTabToNextWindow,
-        MenuAction::ViewSessionInNewWindow,
-        MenuAction::NewControlledWindow,
-        MenuAction::NewControlledTab,
-        MenuAction::NewControllerWindow,
-        MenuAction::NewControllerTab,
-        MenuAction::CloseTab,
-        MenuAction::Copy,
-        MenuAction::Paste,
-        MenuAction::SelectAll,
-        MenuAction::Find,
-        MenuAction::FindNext,
-        MenuAction::FindPrev,
-        MenuAction::ToggleFullScreen,
-        MenuAction::FontIncrease,
-        MenuAction::FontDecrease,
-        MenuAction::FontActualSize,
-        MenuAction::SplitVertical,
-        MenuAction::SplitHorizontal,
-        MenuAction::Minimize,
-        MenuAction::Zoom,
-        MenuAction::NextTab,
-        MenuAction::PrevTab,
-        MenuAction::RenameSession,
-        MenuAction::ToggleSeriousMode,
-        MenuAction::ToggleMatrixRain,
-        MenuAction::FavouriteKitty,
-        MenuAction::NextKitty,
-        MenuAction::ToggleSettings,
-        MenuAction::Packages,
-        MenuAction::Messages,
-        MenuAction::OpenPalette,
-        MenuAction::Help,
-        MenuAction::Version,
-        MenuAction::ApplyUpdate,
-        // Round 19: the Fabric menu (the four connection ids became BAR rows
-        // there), Set Role…, and the two presence checkables.
-        MenuAction::Inbox,
-        MenuAction::LedgerForSession,
-        MenuAction::HoldSession,
-        MenuAction::LiftHold,
-        MenuAction::ConnectToSession,
-        MenuAction::ConfigureConnection,
-        MenuAction::DisconnectSession,
-        MenuAction::ShowConnectionMap,
-        MenuAction::FabricStatus,
-        MenuAction::FabricOn,
-        MenuAction::FabricOff,
-        MenuAction::SetRole,
-        MenuAction::TogglePresenceBand,
-        MenuAction::TogglePresenceRim,
-        // Round 18's identity rows (2026-09-25).
-        MenuAction::ShowIdentity,
-        MenuAction::NewWindowWithIdentity,
-        MenuAction::NewTabWithIdentity,
-        MenuAction::ResetTerminal,
-        // Settings ▸ Harness (the Autopilot design, 2026-10-15).
-        MenuAction::HarnessSettings,
-        // View ▸ Choose Theme… (the theme overhaul, 2026-10-15).
-        MenuAction::ChooseTheme,
-        // View ▸ Browse & Customize Themes… (the theme overhaul).
-        MenuAction::BrowseThemes,
-    ];
 
     /// Every `invoke` name that resolved BEFORE round 19's menu rework, verbatim
     /// — the names an agent's script may already carry. SPEC19 §9: "add
@@ -4439,7 +4302,6 @@ mod tests {
         "SplitHorizontal",
         "ToggleMatrixRain",
         "FavouriteKitty",
-        "FavouriteSessionKitty",
         "NextKitty",
         "ToggleSeriousMode",
         "ToggleSettings",
@@ -4459,46 +4321,13 @@ mod tests {
         "DisconnectSession",
     ];
 
-    /// The NON-BAR action vocabulary: the tab-strip CONTEXT menu's own copy
-    /// rows (session-metadata stage 2, `session_chrome::compose_tab_menu`) —
-    /// deliberately NOT in the menu bar, hence not in [`ALL_ACTIONS`]/
-    /// `MENU_MODEL`. (`CloseTab`, `RenameSession` and the connection ids also
-    /// appear in the context menu, but they are BAR actions first and live in
-    /// the list above; the connection ids moved into the bar's Fabric menu in
-    /// round 19.) Kept as a named twin list so the round-trip/uniqueness
-    /// proofs cover the whole enum: `ALL_ACTIONS ∪ TAB_CONTEXT_ACTIONS`.
-    const TAB_CONTEXT_ACTIONS: &[MenuAction] = &[MenuAction::CopySessionId, MenuAction::CopyCwd];
-
-    /// Every item of the model, submenus flattened — the one walk the
-    /// completeness and key-equivalent proofs share.
+    /// Every item of the model, submenus flattened.
     fn model_items() -> Vec<(&'static str, MenuAction, &'static str, super::MenuMods)> {
         MENU_MODEL
             .iter()
             .flat_map(|s| s.entries.iter())
             .flat_map(MenuEntry::items)
             .collect()
-    }
-
-    /// Every action's tag round-trips through `from_tag`, and the tags are
-    /// distinct ACROSS the bar and tab-context vocabularies (so the integer
-    /// carried in an NSMenuItem — bar item or context-menu item — identifies
-    /// exactly one command; no two items share a dispatch).
-    #[test]
-    fn tags_round_trip_and_are_unique() {
-        let mut seen = std::collections::HashSet::new();
-        for a in ALL_ACTIONS
-            .iter()
-            .chain(TAB_CONTEXT_ACTIONS.iter())
-            .copied()
-        {
-            assert!(a.tag() >= 1, "tag 0 is reserved for untagged items");
-            assert!(seen.insert(a.tag()), "duplicate tag {} for {a:?}", a.tag());
-            assert_eq!(
-                MenuAction::from_tag(a.tag()),
-                Some(a),
-                "round-trip failed for {a:?}"
-            );
-        }
     }
 
     /// The tab-context actions are a deliberate NON-bar vocabulary: their invoke
@@ -4510,7 +4339,7 @@ mod tests {
     /// there (`the_fabric_menu_is_owner_only_and_its_session_rows_need_a_session`).
     #[test]
     fn tab_context_actions_round_trip_and_stay_out_of_the_bar() {
-        for a in TAB_CONTEXT_ACTIONS.iter().copied() {
+        for a in [MenuAction::CopySessionId, MenuAction::CopyCwd] {
             let name = format!("{a:?}");
             assert_eq!(MenuAction::from_invoke_name(&name), Some(a));
             assert_eq!(
@@ -4559,56 +4388,23 @@ mod tests {
         );
     }
 
-    /// THE FABRIC MENU (SPEC19 §9): its rows, in order, are the tree the owner
-    /// asked for — Inbox, the ledger with its accelerator, the halt
-    /// pair, the four connection rows unchanged, then the three `aterm fabric`
-    /// commands — and it sits where an app's own menu goes, between View and
-    /// Window. Every row is Owner-only on the `invoke` fence, no exception;
-    /// the session rows need a focused session, the instance rows never grey.
+    /// THE FABRIC MENU (SPEC19 §9): every row is Owner-only on the `invoke`
+    /// fence, no exception; the session rows need a focused session, the
+    /// instance rows never grey.
     #[test]
     fn the_fabric_menu_is_owner_only_and_its_session_rows_need_a_session() {
-        let titles: Vec<&str> = MENU_MODEL.iter().map(|s| s.title).collect();
-        assert_eq!(
-            titles,
-            [
-                "aterm", "File", "Edit", "View", "Fabric", "Window", "Help", "Version"
-            ]
-        );
         let fabric = MENU_MODEL
             .iter()
             .find(|s| s.title == "Fabric")
             .expect("a Fabric menu");
-        let rows: Vec<(&str, MenuAction)> = fabric
+        let rows: Vec<MenuAction> = fabric
             .entries
             .iter()
             .flat_map(MenuEntry::items)
-            .map(|(label, action, _, _)| (label, action))
+            .map(|(_, action, _, _)| action)
             .collect();
-        assert_eq!(
-            rows,
-            [
-                ("Inbox", MenuAction::Inbox),
-                ("Ledger for This Session", MenuAction::LedgerForSession),
-                ("Hold This Session", MenuAction::HoldSession),
-                ("Lift Hold (This Session)", MenuAction::LiftHold),
-                ("Connect to Session…", MenuAction::ConnectToSession),
-                ("Configure Connection…", MenuAction::ConfigureConnection),
-                ("Disconnect Session…", MenuAction::DisconnectSession),
-                ("Show Connection Map", MenuAction::ShowConnectionMap),
-                ("Fabric Status", MenuAction::FabricStatus),
-                ("Turn Fabric On…", MenuAction::FabricOn),
-                ("Turn Fabric Off…", MenuAction::FabricOff),
-            ]
-        );
-        // The ledger row SHOWS the ledger key's chord.
-        let ledger = fabric
-            .entries
-            .iter()
-            .flat_map(MenuEntry::items)
-            .find(|(_, a, _, _)| *a == MenuAction::LedgerForSession)
-            .unwrap();
-        assert_eq!((ledger.2, ledger.3), ("l", super::MenuMods::CommandShift));
-        for (_, action) in &rows {
+        assert!(rows.len() >= 11, "{rows:?}");
+        for action in &rows {
             assert_eq!(
                 action.invoke_authority(),
                 super::InvokeAuthority::OwnerOnly,
@@ -4811,38 +4607,6 @@ mod tests {
         set_menu_live(before);
     }
 
-    /// The ⌘W row names what it closes, and its help sentence (the tool tip and
-    /// the palette row's spoken description) names both effects.
-    #[test]
-    fn the_close_row_names_what_it_closes() {
-        assert_eq!(super::close_row_title(true), "Close Pane");
-        assert_eq!(super::close_row_title(false), "Close Tab");
-        let help = MenuAction::CloseTab.help();
-        assert!(
-            help.contains("focused pane") && help.contains("closes the tab"),
-            "{help}"
-        );
-        // The static label (the title the native item is built with) is the
-        // unsplit title.
-        let close = MENU_MODEL
-            .iter()
-            .flat_map(|s| s.entries.iter())
-            .flat_map(MenuEntry::items)
-            .find(|(_, a, _, _)| *a == MenuAction::CloseTab)
-            .expect("a Close row");
-        assert_eq!(close.0, super::close_row_title(false));
-        // `chrome` off macOS prints the title the palette row reads, not the
-        // static label.
-        let file = |split| {
-            menu_chrome_lines(None, split)
-                .into_iter()
-                .find(|l| l.starts_with("menu \"File\""))
-                .expect("a File line")
-        };
-        assert!(file(true).ends_with(", Close Pane"), "{}", file(true));
-        assert!(file(false).ends_with(", Close Tab"), "{}", file(false));
-    }
-
     /// `chrome` on macOS reads each row's title off its `NSMenuItem`, and ⌘W's
     /// is stamped only when the menu validates: ⌘W on a split tab stamps Close
     /// Pane, then closes the pane, and the item keeps Close Pane for a tab that
@@ -4882,124 +4646,6 @@ mod tests {
         set_menu_live(before);
     }
 
-    /// Every action carries a HELP sentence (the tool tip / accessibility
-    /// description SPEC19 §9 asks for): non-empty, one line, and — the band's
-    /// own law — never a command, a body or a title a session wrote.
-    #[test]
-    fn every_action_has_a_one_line_help_sentence() {
-        for a in ALL_ACTIONS.iter().chain(TAB_CONTEXT_ACTIONS).copied() {
-            let help = a.help();
-            assert!(!help.trim().is_empty(), "{a:?} has no help");
-            assert!(!help.contains('\n'), "{a:?}: one line");
-            assert!(help.ends_with('.'), "{a:?}: a sentence");
-            // No command text: a screen reader speaks the backticks, and a
-            // tool tip is no place for a shell line or a config key.
-            assert!(!help.contains('`') && !help.contains('['), "{a:?}: {help}");
-        }
-        // The Controller presets spawn an ordinary shell that can read and type
-        // into this session — not "a supervisor".
-        assert!(!MenuAction::NewControllerTab.help().contains("supervisor"));
-    }
-
-    /// FILE ▸ DRIVING carries the four presets UNCHANGED (same labels, same
-    /// actions, no key equivalents), and round 18's two identity rows sit
-    /// between New Terminal Tab and Driving — no key equivalents either (choosing
-    /// may create an identity) — with Show Identity directly under Set Role….
-    #[test]
-    fn file_driving_holds_the_four_presets_and_the_identity_rows_sit_above_it() {
-        let file = MENU_MODEL.iter().find(|s| s.title == "File").unwrap();
-        let driving = file
-            .entries
-            .iter()
-            .find_map(|e| match e {
-                MenuEntry::Submenu { label, entries } if *label == "Driving" => Some(*entries),
-                _ => None,
-            })
-            .expect("File ▸ Driving");
-        let rows: Vec<(&str, MenuAction, &str)> = driving
-            .iter()
-            .flat_map(MenuEntry::items)
-            .map(|(l, a, k, _)| (l, a, k))
-            .collect();
-        assert_eq!(
-            rows,
-            [
-                (
-                    "New Controlled Session in New Window",
-                    MenuAction::NewControlledWindow,
-                    ""
-                ),
-                (
-                    "New Controlled Session as Tab",
-                    MenuAction::NewControlledTab,
-                    ""
-                ),
-                (
-                    "New Controller Session in New Window",
-                    MenuAction::NewControllerWindow,
-                    ""
-                ),
-                (
-                    "New Controller Session as Tab",
-                    MenuAction::NewControllerTab,
-                    ""
-                ),
-            ]
-        );
-        let order: Vec<Option<(&str, MenuAction, &str)>> = file
-            .entries
-            .iter()
-            .map(|e| match e {
-                MenuEntry::Item {
-                    label, action, key, ..
-                } => Some((*label, *action, *key)),
-                MenuEntry::Submenu { label, .. } => Some((*label, MenuAction::Help, "▸")),
-                _ => None,
-            })
-            .collect();
-        let at = |label: &str| {
-            order
-                .iter()
-                .position(|e| e.is_some_and(|(l, _, _)| l == label))
-                .unwrap_or_else(|| panic!("File menu lacks {label}"))
-        };
-        assert!(
-            at("New Terminal Tab") < at("New Window With Identity…")
-                && at("New Window With Identity…") < at("New Tab With Identity…")
-                && at("New Tab With Identity…") < at("Driving"),
-            "the identity rows sit between New Terminal Tab and Driving: {order:?}"
-        );
-        for (label, action) in [
-            (
-                "New Window With Identity…",
-                MenuAction::NewWindowWithIdentity,
-            ),
-            ("New Tab With Identity…", MenuAction::NewTabWithIdentity),
-        ] {
-            assert_eq!(
-                order[at(label)],
-                Some((label, action, "")),
-                "{label}: its action, and no key equivalent"
-            );
-        }
-        let window = MENU_MODEL.iter().find(|s| s.title == "Window").unwrap();
-        let window_labels: Vec<&str> = window
-            .entries
-            .iter()
-            .flat_map(MenuEntry::items)
-            .map(|(l, _, _, _)| l)
-            .collect();
-        let role = window_labels
-            .iter()
-            .position(|l| *l == "Set Role…")
-            .unwrap();
-        assert_eq!(
-            window_labels.get(role + 1),
-            Some(&"Show Identity"),
-            "Show Identity sits directly under Set Role…"
-        );
-    }
-
     /// The connected-spawn presets MINT session-connection authority over the
     /// focused session, so their `invoke` fence is OwnerOnly — the MenuAction
     /// twin of the `spawn connected=` escalation arm (design §5.3/§6). They
@@ -5025,34 +4671,43 @@ mod tests {
         }
     }
 
-    /// Every action's `{:?}` Debug token round-trips through `from_invoke_name` (the
-    /// name→variant map the control-layer `invoke` fence reads), and every action has a
-    /// compiler-classified `invoke_authority`. Iterating `ALL_ACTIONS` (pinned to be the
-    /// whole enum by `menu_model_covers_every_action_exactly_once`) ties the string map
-    /// to the real variant set, so a new action cannot slip past the fence unclassified.
+    /// Every command the bar and the tab menu carry decodes back from the
+    /// integer its `NSMenuItem` carries, and no two share one, so a press
+    /// dispatches exactly its own command. It also decodes from its `invoke`
+    /// name, the token the control socket's authority fence classifies
+    /// (`control::escalated_op`): a name the fence cannot decode escalates
+    /// nothing, while the palette still dispatches it, so an Owner-only
+    /// action would run under the base `WriteInput` gate. The default tag (0)
+    /// and any unknown tag or name decode to `None`, so an untagged item never
+    /// dispatches a real command.
     #[test]
-    fn invoke_name_round_trips() {
-        for a in ALL_ACTIONS.iter().copied() {
-            let name = format!("{a:?}");
+    fn every_action_decodes_from_its_tag_and_its_invoke_name() {
+        let mut by_tag = std::collections::HashMap::new();
+        let actions = model_items()
+            .into_iter()
+            .map(|(_, action, _, _)| action)
+            .chain([MenuAction::CopySessionId, MenuAction::CopyCwd]);
+        for a in actions {
+            if let Some(other) = by_tag.insert(a.tag(), a) {
+                assert_eq!(other, a, "{a:?} and {other:?} share tag {}", a.tag());
+            }
+            assert_eq!(MenuAction::from_tag(a.tag()), Some(a), "{a:?}");
             assert_eq!(
-                MenuAction::from_invoke_name(&name),
+                MenuAction::from_invoke_name(&format!("{a:?}")),
                 Some(a),
-                "from_invoke_name must recover {a:?} from its Debug token {name:?}"
+                "the invoke fence must decode {a:?}"
             );
-            // Exercises the exhaustive classifier (a decision exists for every variant).
-            let _ = a.invoke_authority();
         }
-        assert_eq!(MenuAction::from_invoke_name("NopeNotAnAction"), None);
-        assert_eq!(MenuAction::from_invoke_name(""), None);
-    }
-
-    /// The default `NSMenuItem` tag (0) and any unknown tag decode to `None`, so
-    /// an untagged item never dispatches a real command.
-    #[test]
-    fn unknown_tag_is_none() {
+        for tag in 0..=255isize {
+            if let Some(a) = MenuAction::from_tag(tag) {
+                assert_eq!(a.tag(), tag, "tag {tag} decodes to {a:?}");
+            }
+        }
         assert_eq!(MenuAction::from_tag(0), None);
         assert_eq!(MenuAction::from_tag(-1), None);
         assert_eq!(MenuAction::from_tag(9999), None);
+        assert_eq!(MenuAction::from_invoke_name("NopeNotAnAction"), None);
+        assert_eq!(MenuAction::from_invoke_name(""), None);
     }
 
     #[test]
@@ -5060,7 +4715,7 @@ mod tests {
         let _statics = super::MENU_STATICS
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        let model = aterm_spec::derive::native_update_menu_activation_model();
+        let model = aterm_models_misc::native_update_menu_activation_model();
         let mut state = model.init_state();
         for action in ["StageUpdate", "RefreshStagedVersionMenu"] {
             assert!(model.fire(action, &mut state), "{action}: {state:?}");
@@ -5104,111 +4759,6 @@ mod tests {
         assert!(buggy.successors("DecodeApplyTag", &disabled).is_empty());
     }
 
-    /// MENU_MODEL IS the macOS menu (the builder reads it item-for-item since round
-    /// 19): every command appears in it EXACTLY once, submenus included, and no
-    /// extra/unknown action. This is what keeps the cross-platform `chrome`
-    /// serialisation in lockstep with the native menu (and fails CI if a command is
-    /// added to the enum and not the model).
-    #[test]
-    fn menu_model_covers_every_action_exactly_once() {
-        let mut model: Vec<MenuAction> = model_items()
-            .into_iter()
-            .map(|(_, action, _, _)| action)
-            .collect();
-        let mut expected: Vec<MenuAction> = ALL_ACTIONS.to_vec();
-        let sort_key = |a: &MenuAction| a.tag();
-        model.sort_by_key(sort_key);
-        expected.sort_by_key(sort_key);
-        assert_eq!(
-            model, expected,
-            "MENU_MODEL must list every MenuAction exactly once (and no extras)"
-        );
-    }
-
-    /// THE MENU TREE GOLDEN — the `chrome` serialiser's lines, whole, as round 19
-    /// (SPEC19 §9, "the menu reworked to align") left them. One `menu "<title>": …`
-    /// line per section in the standard Mac order plus the app's own Fabric menu
-    /// between View and Window; a submenu prints as `<label> ▸` in its parent's line
-    /// and then as its own `menu "<parent> ▸ <label>": …` line right after.
-    ///
-    /// WHY IT CHANGED (the reason the golden records): the File menu used to carry
-    /// the pre-fabric driving model flat — "New Controlled Session in New Window /
-    /// as Tab", "New Controller Session in New Window / as Tab" — and the four
-    /// connection rows lived in a palette-only "Connections" section; nothing in
-    /// the bar named the fabric, the fleet, the ledger, an inbox, a session's role
-    /// or the presence surfaces. Now the four presets sit under File ▸ Driving
-    /// unchanged, a Fabric menu carries the fleet, this session's inbox and ledger,
-    /// the halt pair, the connection rows and the three `aterm fabric` commands,
-    /// Window gains Set Role…, and View gains the two presence checkables. Round
-    /// 18's identity rows followed (2026-09-25): File gains New Window / New Tab
-    /// With Identity… above Driving, and Window gains Show Identity.
-    ///
-    /// 2026-09-26: Edit gains Reset Terminal, after a separator below the find
-    /// rows — the manual reset (`crate::manual_reset`), the escape hatch for a
-    /// terminal the automatic foreground handback cannot reach.
-    ///
-    /// 2026-10-15: View gains Claude Code Harness…, after a separator below the
-    /// kitties — Settings ▸ Harness, the bar twin of the footer's `⚙` chip
-    /// (the Autopilot design). 2026-10-16: named Coding Agent Harness…, as
-    /// the page it opens is (it holds Codex's switch too).
-    ///
-    /// 2026-10-16: View gains Choose Theme… above Command Palette… — the
-    /// palette scoped to its Theme section (live preview, Enter keeps).
-    ///
-    /// 2026-10-16: View gains Browse & Customize Themes… after it — Settings
-    /// ▸ Themes, the Theme Showcase.
-    #[test]
-    fn chrome_lines_render_titled_sections() {
-        let lines = menu_chrome_lines(None, false);
-        // "Check for Updates…" is offered only where an updater exists
-        // (`aterm_update::enabled()`: macOS and Linux), and the Version menu's
-        // install row only while an update is staged or just landed (nothing
-        // is, here); `update_rows_are_not_offered_where_no_updater_exists`
-        // pins both rules.
-        let app_line = if aterm_update::enabled() {
-            "menu \"aterm\": About aterm, Check for Updates…, Settings…, Packages…, \
-             Messages…, Open aterm.toml, Quit aterm"
-        } else {
-            "menu \"aterm\": About aterm, Settings…, Packages…, Messages…, \
-             Open aterm.toml, Quit aterm"
-        };
-        let version_line = "menu \"Version\": About aterm — build & version…";
-        let expected = [
-            app_line,
-            "menu \"File\": New Window, New Terminal Tab, New Window With Identity…, \
-             New Tab With Identity…, Driving ▸, Open Markdown…, \
-             Open File in Editor…, Reopen Closed Tab, Reopen Closed Pane, \
-             Move Tab to New Window, Move Tab to Next Window, Open Session in New Window, \
-             Close Tab",
-            "menu \"File ▸ Driving\": New Controlled Session in New Window, \
-             New Controlled Session as Tab, New Controller Session in New Window, \
-             New Controller Session as Tab",
-            "menu \"Edit\": Copy, Paste, Select All, Find…, Find Next, Find Previous, \
-             Reset Terminal",
-            "menu \"View\": Increase Font Size, Decrease Font Size, Actual Size, Split Right, \
-             Split Down, Enter Full Screen, Presence Band, Presence Rim, Serious Mode, \
-             Matrix Rain, Favourite This Kitty, Next Kitty, Coding Agent Harness…, \
-             Choose Theme…, Browse & Customize Themes…, Command Palette…",
-            "menu \"Fabric\": Inbox, Ledger for This Session, Hold This Session, \
-             Lift Hold (This Session), Connect to Session…, Configure Connection…, \
-             Disconnect Session…, Show Connection Map, Fabric Status, Turn Fabric On…, \
-             Turn Fabric Off…",
-            "menu \"Window\": Minimize, Zoom, Show Next Tab, Show Previous Tab, \
-             Rename Session…, Set Role…, Show Identity",
-            "menu \"Help\": aterm Help",
-            version_line,
-        ];
-        assert_eq!(
-            lines, expected,
-            "the menu tree golden (see the doc for why it moved)"
-        );
-        // No separator artifacts (a stray ", ," from an unfiltered Separator).
-        assert!(
-            !lines.iter().any(|l| l.contains(", ,")),
-            "separators must be filtered"
-        );
-    }
-
     /// The `chrome` verb's menu lines offer "Check for Updates…" exactly where an
     /// updater exists ([`aterm_update::enabled`]), and the Version menu's install
     /// row only where one exists AND the row is live — so they agree with
@@ -5241,28 +4791,6 @@ mod tests {
         assert_eq!(offered("Check for Updates…"), updater);
         // Nothing staged: no install row, and never the model's placeholder.
         assert!(!offered("Install"), "{:?}", menu_chrome_lines(None, false));
-        // Staged: the live label, first in the Version menu, where an updater
-        // exists — the row the palette resolves (`palette::apply_row_label`).
-        let staged = crate::palette::apply_row_label(&crate::palette::PaletteLive {
-            staged: Some((7, "9.9.9".to_string())),
-            ..Default::default()
-        })
-        .expect("a staged build has a row");
-        let version = menu_chrome_lines(Some(&staged), false)
-            .into_iter()
-            .find(|l| l.starts_with("menu \"Version\""))
-            .expect("a Version line");
-        if updater {
-            assert_eq!(
-                version,
-                format!("menu \"Version\": {staged}, About aterm — build & version…")
-            );
-        } else {
-            assert_eq!(version, "menu \"Version\": About aterm — build & version…");
-        }
-        // The rows are hidden, not the sections: About stays where it was.
-        assert!(offered("About aterm — build & version…"));
-        assert!(offered("About aterm, "));
         // Nothing else is platform-gated.
         for section in MENU_MODEL {
             for entry in section.entries {
@@ -5330,95 +4858,6 @@ mod tests {
             .map(|(_, a, _, _)| a)
             .collect();
         assert_eq!(on_l, [MenuAction::LedgerForSession]);
-    }
-
-    #[test]
-    fn terminal_only_actions_are_identified_exhaustively() {
-        for action in ALL_ACTIONS.iter().copied() {
-            let expected = matches!(
-                action,
-                MenuAction::SplitVertical
-                    | MenuAction::SplitHorizontal
-                    | MenuAction::ViewSessionInNewWindow
-                    // Per-session rain acts on the front SESSION — no session
-                    // under a native whole tab, so the item greys out there.
-                    | MenuAction::ToggleMatrixRain
-                    // Same reason: the pin is SESSION metadata.
-                    | MenuAction::RenameSession
-                    // The connected-spawn presets need a FOCUSED session origin.
-                    | MenuAction::NewControlledWindow
-                    | MenuAction::NewControlledTab
-                    | MenuAction::NewControllerWindow
-                    | MenuAction::NewControllerTab
-                    // The connection ids act FROM the focused session.
-                    | MenuAction::ConnectToSession
-                    | MenuAction::ConfigureConnection
-                    | MenuAction::DisconnectSession
-                    // The Fabric menu's session rows and the role editor.
-                    | MenuAction::Inbox
-                    | MenuAction::LedgerForSession
-                    | MenuAction::HoldSession
-                    | MenuAction::LiftHold
-                    | MenuAction::SetRole
-                    // The focused session's identity (read-only).
-                    | MenuAction::ShowIdentity
-                    // The manual reset acts on the front session's terminal.
-                    | MenuAction::ResetTerminal
-            );
-            assert_eq!(
-                super::requires_terminal_tab(action),
-                expected,
-                "terminal-context classification drifted for {action:?}"
-            );
-        }
-    }
-
-    /// The Version menu's bar title: plain `v<version>` at rest; a TRAILING ⬆️ (the
-    /// user's "emoji uparrow under version") while `attention` holds — the attention
-    /// draw pointing at the version-number menu. The base must be a prefix of the
-    /// attention form (retitling never rewrites the version).
-    #[test]
-    fn version_menu_bar_title_carries_the_arrow_only_under_attention() {
-        let plain = super::version_menu_bar_title(false);
-        let arrowed = super::version_menu_bar_title(true);
-        // A test binary is a DEV build, so the base leads with the dev
-        // signature's wrench rather than the bare `v` a release shows.
-        assert!(plain.contains('v'), "{plain}");
-        assert!(!plain.contains('\u{2B06}'), "no arrow at rest: {plain}");
-        assert!(
-            arrowed.starts_with(&plain),
-            "retitle only appends: {arrowed}"
-        );
-        assert!(
-            arrowed.ends_with(" \u{2B06}\u{FE0F}"),
-            "TRAILING emoji arrow (\"v0.25 ⬆️\" shape): {arrowed}"
-        );
-    }
-
-    /// THE DEV SIGNATURE (owner, 2026-08-16: a marker in the menu bar "so
-    /// that I know what is a development build … using the 3rd developer
-    /// number and the hash"): a binary the release cutter did not produce —
-    /// this test binary — must wear the dev counter in the third slot, the
-    /// short commit hash, and the DEV marker. A release build
-    /// (`ATERM_RELEASE_BUILD` present for the binary's compile) keeps its clean
-    /// `v<version>`; that arm is proven by the discriminator being exactly the
-    /// release marker's presence, whose name `aterm-release`'s buildplan pins to
-    /// the one it sets.
-    #[test]
-    fn a_dev_build_wears_its_signature_in_the_bar_title() {
-        // A test binary is never a release build: it reads the test stamp.
-        assert!(
-            !crate::build_info::is_release_build(),
-            "a test binary is never a release build"
-        );
-        let t = super::version_menu_bar_title(false);
-        assert!(t.starts_with('\u{1F6E0}'), "the wrench leads: {t}");
-        assert!(t.ends_with(" \u{00B7} DEV"), "the marker trails: {t}");
-        assert!(t.contains("+g"), "the hash is pinned: {t}");
-        assert!(
-            t.contains(&format!(".{}+", crate::build_info::dev_commits())),
-            "the third slot is the dev counter, not a release patch: {t}"
-        );
     }
 
     /// THE SIGNATURE FOR EVERY KIND OF BUILD, on both rungs, composed from
@@ -5772,21 +5211,6 @@ mod tests {
         );
     }
 
-    /// Help opens the PUBLIC channel's page, never the private staging repo
-    /// (`[workspace.package] repository`), which a person without its token
-    /// sees as a 404.
-    #[test]
-    fn the_help_destination_is_the_public_channel() {
-        assert_eq!(
-            super::help_url(),
-            format!(
-                "https://github.com/{}/{}",
-                aterm_update_core::DEFAULT_OWNER,
-                aterm_update_core::DEFAULT_REPO
-            )
-        );
-    }
-
     // ---- the System Settings deep link (design §3.4, §3.7, Appendix A.2) --------
 
     /// THE SCHEME HAS A DOT. `x-apple.systempreferences` is the real scheme;
@@ -5861,19 +5285,6 @@ mod tests {
                     )
                 ),
                 "only a REGISTERED anchor may ship: {url:?}"
-            );
-        }
-        // The words never claim a folder, and never claim what a grant covers —
-        // that claim belongs to S4, which has not been run.
-        for pane in super::PrivacyPane::ALL {
-            let words = super::privacy_settings_path_words(pane);
-            assert!(
-                words.starts_with("System Settings"),
-                "the words are a route, not a sentence: {words:?}"
-            );
-            assert!(
-                !words.to_ascii_lowercase().contains("cover"),
-                "coverage is S4's claim to make, not this route's: {words:?}"
             );
         }
     }

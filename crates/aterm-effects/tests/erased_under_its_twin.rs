@@ -178,85 +178,58 @@ fn under_git_status() -> Host {
     h
 }
 
-/// Readline's redraw erases a line typed under its twin, its first two keys
-/// echoed in one frame: `$ git status` on row 4, `git status` typed on row 5
-/// (`gi` in one frame), then readline's kill redraw (`\r$ \x1b[K`, no key hint)
-/// blanks it. The arming rows show row 4 when `gi` echoes, and every record has
-/// stood beside row 4 for `TWIN_MIN` by the erase.
+/// A line killed by Ctrl-U 16 or 32 ms after its last echo, before `TWIN_MIN`,
+/// under an identical line: only the copy seen on the arming frame makes its
+/// records twins (`Seen::observe`'s `at_arm` arm).
+///
+/// * a fast final bigram: `git stat` typed a key a frame under `$ git status`,
+///   then `us` echoed in one frame;
+/// * a whole command echoed in one frame: `cd ..` under `$ cd ..`. No band
+///   lives on row 5 when its keys are armed, so only the arming rows
+///   (`rk::Engine::ribbon_rows_for`) show row 4;
+/// * a paste: `git status` pasted under `$ git status` in one echo. A
+///   delivered insert awaiting its echo names its row like a waiting key
+///   (`CursorGlow::ribbon_rows`).
 #[test]
-fn a_redraw_erasing_a_line_typed_under_its_twin_follows_nothing_when_two_keys_echo_together() {
-    let mut h = under_git_status();
-    h.burst("gi");
-    h.type_str("t status");
-    h.idle(64);
-    assert_eq!(
-        h.live(5),
-        (2..12).collect::<Vec<u16>>(),
-        "the band is under `git status`"
-    );
-    assert!(!h.lit(4), "row 4 is dark before the erase");
-    h.program(b"\r$ \x1b[K");
-    h.assert_never_followed_onto(4, "readline's redraw");
-}
-
-/// A fast final bigram, then Ctrl-U before `TWIN_MIN`: `git stat` typed a key a
-/// frame under `$ git status`, then `us` echoed in one frame, and Ctrl-U 16 or
-/// 32 ms later. `u` and `s` are twins only through the copy seen on their arming
-/// frame (`Seen::observe`'s `at_arm` arm).
-#[test]
-fn a_ctrl_u_right_after_a_final_burst_under_its_twin_follows_nothing() {
-    for gap in [16, 32] {
-        let mut h = under_git_status();
-        h.type_str("git stat");
-        h.burst("us");
-        assert_eq!(
-            h.live(5),
-            (2..12).collect::<Vec<u16>>(),
-            "the band is under `git status`"
-        );
-        h.kill_after(gap, b"\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x1b[K");
-        h.assert_never_followed_onto(4, &format!("Ctrl-U {gap} ms after `us`"));
-    }
-}
-
-/// A whole command echoed in one frame, then Ctrl-U before `TWIN_MIN`: `cd ..`
-/// under `$ cd ..`, all five keys echoed together, killed 16 or 32 ms later. No
-/// band lives on row 5 when they are armed, so only the arming rows
-/// (`rk::Engine::ribbon_rows_for`) show row 4, and the `at_arm` arm makes them
-/// twins.
-#[test]
-fn a_ctrl_u_right_after_a_whole_command_echoed_at_once_under_its_twin_follows_nothing() {
-    for gap in [16, 32] {
-        let mut h = Host::at_row(4);
-        h.program(b"$ cd ..\r\n$ ");
-        h.burst("cd ..");
-        assert_eq!(
-            h.live(5),
-            (2..7).collect::<Vec<u16>>(),
-            "the band is under `cd ..`"
-        );
-        h.kill_after(gap, b"\x08\x08\x08\x08\x08\x1b[K");
-        h.assert_never_followed_onto(4, &format!("Ctrl-U {gap} ms after `cd ..`"));
-    }
-}
-
-/// A paste, then Ctrl-U before `TWIN_MIN`: `git status` pasted under
-/// `$ git status` (one echo) and killed 16 or 32 ms later. Every record is armed
-/// on the paste's frame, and a delivered insert awaiting its echo names its row
-/// like a waiting key (`CursorGlow::ribbon_rows`), so the copy on row 4 makes
-/// them twins.
-#[test]
-fn a_ctrl_u_right_after_a_paste_under_its_twin_follows_nothing() {
-    for gap in [16, 32] {
-        let mut h = under_git_status();
-        h.paste("git status");
-        assert_eq!(
-            h.live(5),
-            (2..12).collect::<Vec<u16>>(),
-            "the band is under the pasted `git status`"
-        );
-        h.kill_after(gap, b"\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x1b[K");
-        h.assert_never_followed_onto(4, &format!("Ctrl-U {gap} ms after the paste"));
+fn a_ctrl_u_right_after_the_last_echo_under_its_twin_follows_nothing() {
+    type Gesture = fn(&mut Host);
+    let cases: [(&str, &[u8], Gesture, u16); 3] = [
+        (
+            "a final burst",
+            b"$ git status\r\n$ ",
+            |h| {
+                h.type_str("git stat");
+                h.burst("us");
+            },
+            12,
+        ),
+        (
+            "a whole command at once",
+            b"$ cd ..\r\n$ ",
+            |h| h.burst("cd .."),
+            7,
+        ),
+        (
+            "a paste",
+            b"$ git status\r\n$ ",
+            |h| h.paste("git status"),
+            12,
+        ),
+    ];
+    for (what, twin, gesture, end) in cases {
+        for gap in [16, 32] {
+            let mut h = Host::at_row(4);
+            h.program(twin);
+            gesture(&mut h);
+            assert_eq!(
+                h.live(5),
+                (2..end).collect::<Vec<u16>>(),
+                "{what}: the band is under its twin"
+            );
+            let kill = format!("{}\x1b[K", "\x08".repeat(usize::from(end - 2)));
+            h.kill_after(gap, kill.as_bytes());
+            h.assert_never_followed_onto(4, &format!("Ctrl-U {gap} ms after {what}"));
+        }
     }
 }
 

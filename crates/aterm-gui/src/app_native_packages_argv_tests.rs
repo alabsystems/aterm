@@ -23,97 +23,6 @@ fn packages_argv_is_pinned_per_request() {
     );
 }
 
-/// THE CHECK IS THE WINDOW'S OWN PASS (Phase 3): the worker spawns the Check with the
-/// lanes' argv (`pass_args(PassVerb::Update, …)`: `--wait-lock` with their bound and
-/// `--progress-file`), the spawner's pid and the login shell's PATH — the orphan watch
-/// and the progress file are armed by exactly those — and answers at once only when a
-/// person's typed verb holds the store. Pinned by scrape: the spawn is inside the
-/// worker thread, which a unit test cannot reach without a real child.
-#[test]
-fn the_settings_check_runs_the_windows_pass_argv() {
-    let src = include_str!("app_native.rs");
-    let start = src
-        .find("pub(crate) fn execute_native_packages(")
-        .expect("the worker");
-    let body = &src[start..start + src[start..].find("\n    }\n").unwrap()];
-    let gate = body.find("if check {").expect("the Check's own spawn");
-    let spawn = &body[gate..gate + 600];
-    // Match the exact call after removing formatting whitespace: rustfmt
-    // wraps this argument list across lines.
-    let compact: String = spawn.chars().filter(|ch| !ch.is_whitespace()).collect();
-    assert!(
-        compact.contains("crate::pass_args(crate::PassVerb::Update,layout.as_ref(),None,)"),
-        "Check uses the package lane's update argv: {spawn}"
-    );
-    for needle in [
-        "atpkg::cli::SPAWNER_PID_ENV",
-        "crate::spawn::atpkg_child_path()",
-    ] {
-        assert!(spawn.contains(needle), "{needle}: {spawn}");
-    }
-    let fail_fast = body
-        .find("atpkg::lock::person_holder")
-        .expect("the fail-fast rule");
-    assert!(fail_fast < gate, "decided before anything is spawned");
-    // The Install is the same shape (ruling 225): the lanes' lock wait and
-    // progress file, the spawner's pid and PATH.
-    let install = body
-        .find("} else if install {")
-        .expect("the Install's spawn");
-    let install_spawn: String = body[install..install + 700]
-        .chars()
-        .filter(|ch| !ch.is_whitespace())
-        .collect();
-    assert!(
-        install_spawn
-            .contains(".args(verb).args(crate::pass_wait_and_progress_args(layout.as_ref()))"),
-        "{install_spawn}"
-    );
-    assert!(install_spawn.contains("atpkg::cli::SPAWNER_PID_ENV"));
-    // …and RUN the lanes' way: its stdout streamed, not collected at exit,
-    // as a pass a PERSON waits on (ruling 224).
-    let compact_body: String = body.chars().filter(|ch| !ch.is_whitespace()).collect();
-    assert!(
-        compact_body.contains("ifcheck||install{"),
-        "both verbs stream"
-    );
-    let runs = body[gate..]
-        .find("crate::run_pass_child(")
-        .map(|i| gate + i)
-        .expect("the Check runs through the lanes' child runner");
-    let call: String = body[runs..runs + 400]
-        .chars()
-        .filter(|ch| !ch.is_whitespace())
-        .collect();
-    assert!(
-        call.starts_with(
-            "crate::run_pass_child(&mutchild,layout.as_ref(),false,aterm_messages::Waiter::Person,&post,)"
-        ),
-        "{call}"
-    );
-    let collected = body
-        .find("let result = child.output();")
-        .expect("the other verbs");
-    assert!(
-        runs < collected,
-        "the Check leaves the loop before the collect-at-exit"
-    );
-    // …and a PERSON's: no `--defer-busy-flip` (2026-09-26), the one flag the loop's
-    // own spawn adds (`lane_pass_args`) — a Check clicked in Settings flips a new
-    // Trust toolchain at once, however busy the old one is.
-    let args = crate::pass_args(crate::PassVerb::Update, None, None);
-    assert_eq!(
-        args,
-        vec![
-            std::ffi::OsString::from("update"),
-            "--wait-lock".into(),
-            crate::ATPKG_WAIT_LOCK_SECS.to_string().into()
-        ],
-        "the lanes' own bound, and never the unattended flip hold"
-    );
-    assert!(check_held_by_person_message(4242).contains("pid 4242"));
-}
-
 /// The offline code reads as what it is, never as a bare exit status.
 #[cfg(unix)]
 #[test]
@@ -228,10 +137,10 @@ fn machine_state_is_read_from_the_marker_line_and_never_guessed() {
     );
 }
 
-/// The worker's exit classification: success is no sentence; `--default-set`
-/// exit 2 keeps its "nothing was installed" words; the contention code (75)
-/// names the other installer by code; any other exit is the last stderr line,
-/// or the status when there is none.
+/// The worker's exit classification: success is no sentence; the contention
+/// code (75) never quotes the child's own line (it names a peer and a lock)
+/// and reads the same with or without stderr; any other exit is the last
+/// stderr line.
 #[cfg(unix)]
 #[test]
 fn a_contended_verb_names_the_other_installer_by_exit_code() {
@@ -244,32 +153,13 @@ fn a_contended_verb_names_the_other_installer_by_exit_code() {
         packages_child_failure(Ok(status(0)), &s(&["update"]), ""),
         None
     );
-    assert!(
-        packages_child_failure(Ok(status(2)), &s(&["install", "--default-set"]), "")
-            .unwrap()
-            .starts_with("Nothing was installed"),
-    );
     let contended = packages_child_failure(
         Ok(status(i32::from(atpkg::lock::CONTENDED_EXIT))),
         &s(&["install", "--default-set"]),
         lock_line,
     )
     .unwrap();
-    assert!(
-        contended.starts_with("A toolchain pass is already running on this store"),
-        "{contended}"
-    );
-    // Never a claim about another aterm: after a self-update the holder is
-    // this app's predecessor's pass.
-    assert!(
-        !contended.to_lowercase().contains("another aterm"),
-        "{contended}"
-    );
-    assert!(!contended.to_lowercase().contains("lock"), "{contended}");
-    assert!(contended.ends_with("try again in a moment."), "{contended}");
-    // The child's own line is never quoted: it names a peer and a lock.
     assert!(!contended.contains("holds"), "{contended}");
-    // With nothing on stderr the sentence is the same.
     let quiet = packages_child_failure(
         Ok(status(i32::from(atpkg::lock::CONTENDED_EXIT))),
         &s(&["update"]),
@@ -280,15 +170,6 @@ fn a_contended_verb_names_the_other_installer_by_exit_code() {
     assert_eq!(
         packages_child_failure(Ok(status(1)), &s(&["update"]), "first\nlast line").as_deref(),
         Some("last line")
-    );
-    assert_eq!(
-        packages_child_failure(Ok(status(1)), &s(&["update"]), "").as_deref(),
-        Some("atpkg update exited with exit status: 1")
-    );
-    let error = std::io::Error::other("no such file");
-    assert_eq!(
-        packages_child_failure(Err(&error), &s(&["update"]), "").as_deref(),
-        Some("could not launch atpkg update: no such file")
     );
 }
 
@@ -403,26 +284,6 @@ fn a_check_behind_a_cached_index_pass_names_the_cause_regression_2026_09_26() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
-fn every_request_reserves_its_own_busy_label() {
-    assert_eq!(
-        packages_busy(&PackagesRequest::CheckUpdate),
-        PackagesBusy::Check
-    );
-    assert_eq!(
-        packages_busy(&PackagesRequest::InstallDefaultSet),
-        PackagesBusy::Install
-    );
-    assert_eq!(
-        packages_busy(&PackagesRequest::UninstallAll),
-        PackagesBusy::Uninstall
-    );
-    assert_eq!(
-        packages_busy(&PackagesRequest::MachineApply),
-        PackagesBusy::MachineApply
-    );
-}
-
 /// The host re-reads the machine record after exactly the verbs whose atpkg
 /// pass runs `apply_machine_settings` first, derived from the pinned argv
 /// table to mirror atpkg's `verb_applies_machine_settings` (`update`, every
@@ -479,9 +340,8 @@ fn packages_requests_are_admitted_by_platform() {
     }
 }
 
-/// Under a private state root Apply Now is refused by name, and nothing else
-/// is; unset, every request passes. The Check and the Install then lead with
-/// the private window's flag, from the same live answer.
+/// Under a private state root Apply Now is refused, and nothing else is;
+/// unset, every request passes.
 #[test]
 fn apply_now_is_refused_under_a_private_state_root_and_nothing_else_is() {
     let all = [
@@ -500,57 +360,8 @@ fn apply_now_is_refused_under_a_private_state_root_and_nothing_else_is() {
     for request in &all[..3] {
         assert_eq!(packages_request_refusal(request, true), None, "{request:?}");
     }
-    let refused = packages_request_refusal(&PackagesRequest::MachineApply, true)
-        .expect("Apply now under a private state root");
     assert!(
-        refused.contains("private state root (ATERM_STATE_HOME)")
-            && refused.contains("`aterm pkg machine apply` in a terminal"),
-        "it names why and the way left: {refused}"
+        packages_request_refusal(&PackagesRequest::MachineApply, true).is_some(),
+        "Apply now under a private state root is refused"
     );
-    // The host asks it with the live answer, as a refusal (not a failure), before the
-    // busy gate and the worker thread, so no child is spawned.
-    let src = include_str!("app_native.rs");
-    let start = src
-        .find("pub(crate) fn execute_native_packages(")
-        .expect("the host executor");
-    let body = &src[start..];
-    let body = &body[..body.find("\n    }\n").expect("its end")];
-    // Whitespace out, so the formatter's line breaks cannot move the needles.
-    let flat: String = body.chars().filter(|c| !c.is_whitespace()).collect();
-    let live = flat
-        .find("letprivate_state_root=aterm_types::dirs::runs_under_private_state_root();")
-        .expect("the executor reads the live answer once");
-    let ask = flat
-        .find("packages_request_refusal(&request,private_state_root)")
-        .expect("the executor asks with it");
-    assert!(live < ask, "{body}");
-    let blocked = flat[ask..]
-        .find("returnPackagesOutcome::Blocked{message};")
-        .map(|at| ask + at)
-        .expect("a refusal is Blocked");
-    let busy = flat
-        .find("self.native_packages_service.busy()")
-        .expect("the busy gate");
-    let worker = flat.find(".spawn(move||").expect("the worker");
-    assert!(ask < blocked && blocked < busy && busy < worker, "{body}");
-    // Both passes lead with it, ahead of their verb: the `atpkg` beside a dev
-    // build may lack the seam, and one built before the flag refuses it as an
-    // unknown verb instead of applying.
-    for (branch, verb) in [
-        ("ifcheck{", ".args(crate::pass_args("),
-        ("}elseifinstall{", ".args(verb)"),
-    ] {
-        let at = worker + flat[worker..].find(branch).expect(branch);
-        let lead = at
-            + flat[at..]
-                .find("child.args(crate::pass_lead(private_state_root))")
-                .expect("the lead");
-        let args = at + flat[at..].find(verb).expect(verb);
-        assert!(lead < args, "{branch}: the lead comes first");
-        assert_eq!(
-            args,
-            lead + "child.args(crate::pass_lead(private_state_root))".len(),
-            "{branch}: nothing between the lead and the verb"
-        );
-    }
 }

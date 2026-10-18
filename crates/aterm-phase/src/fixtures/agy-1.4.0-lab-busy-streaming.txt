@@ -1,0 +1,20 @@
+# agy 1.4.0 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Antigravity CLI, launched by path with a scratch `HOME` whose settings name the Gemini API provider, its Google hosts black-holed, a fake `GEMINI_API_KEY` and `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:<port>` (a local stub of the Gemini API, crates/aterm-lab) · busy: the same turn after its thoughts, its text streaming one `tick N` a second; the screen 3 s into the text
+
+      ▄▀▀▄        Antigravity CLI 1.4.0
+     ▀▀▀▀▀▀       Gemini API key
+    ▀▀▀▀▀▀▀▀      Gemini 3.1 Pro (Low)
+   ▄▀▀    ▀▀▄     /private/tmp/at.lpPV/proj
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+> think slowly
+
+▸ Thought for 16s
+  tick 15
+  tick 16 tick 17 tick 18 tick 19
+⣽  Working...
+└ Tip: Press ctrl+o to expand or collapse tool details.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+esc to cancel                                                                                                               Gemini 3.1 Pro · low

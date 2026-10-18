@@ -1,8 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! State accessors for `Terminal`: vi mode, keyboard, cursor, modes, title and the
-//! security authorizations.
+//! State accessors for `Terminal`: keyboard, cursor, modes, title and the security
+//! authorizations.
 
 use super::{
     CurrentStyle, Cursor, CursorStyle, KittyKeyboardFlags, MAX_TITLE_BYTES, Terminal,
@@ -12,145 +12,21 @@ use crate::grid::ResizePolicy;
 use aterm_types::PipelineTimestamps;
 use std::sync::Arc;
 
+/// Where the reported colour scheme (DSR 996 / mode 2031) comes from
+/// ([`Terminal::color_scheme_source`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorSchemeSource {
+    /// The live default background is the host-configured one: the host's
+    /// baseline appearance (`Terminal::set_color_scheme` /
+    /// `TerminalConfig::color_scheme`).
+    Configured,
+    /// A program moved the default background (OSC 11/21, a colour-stack pop,
+    /// a handoff replay): that background's polarity.
+    Program,
+}
+
 /// Production accessors used by external crates and FFI.
 impl Terminal {
-    /// Get a reference to the vi mode state.
-    #[must_use]
-    #[inline]
-    pub fn vi_mode(&self) -> &crate::vi_mode::ViMode {
-        &self.vi
-    }
-
-    /// Get a mutable reference to the vi mode state.
-    #[inline]
-    pub fn vi_mode_mut(&mut self) -> &mut crate::vi_mode::ViMode {
-        &mut self.vi
-    }
-
-    /// Whether vi (keyboard copy-mode) is active. The GUI gates its vi key handling
-    /// and the vi-cursor render override on this.
-    #[must_use]
-    #[inline]
-    pub fn vi_is_active(&self) -> bool {
-        self.vi.is_active()
-    }
-
-    /// The vi cursor position (grid `line`, `col`). While vi mode is active the
-    /// GUI paints the cursor here (mapped to a screen row via the display
-    /// offset) instead of at the terminal cursor.
-    #[must_use]
-    #[inline]
-    pub fn vi_cursor_point(&self) -> crate::vi_mode::ViPoint {
-        self.vi.cursor_point()
-    }
-
-    /// Toggle vi mode on/off; toggling on places the vi cursor at the terminal cursor.
-    pub fn vi_toggle(&mut self) {
-        let cursor = self.grid.cursor();
-        let point = crate::vi_mode::ViPoint::new(i32::from(cursor.row), cursor.col);
-        self.vi.toggle(point);
-    }
-
-    /// Execute a vi mode motion; word, bracket, paragraph and search motions read the grid.
-    pub fn vi_motion(
-        &mut self,
-        motion: crate::vi_mode::ViMotion,
-        boundary: crate::vi_mode::ViBoundary,
-    ) {
-        self.vi.motion_with_grid(&self.grid, motion, boundary);
-    }
-
-    /// Keep the vi cursor on its text after a batch moved rows, then clamp it onto the grid.
-    ///
-    /// A vi line counts from the live screen's top; `lines` is the rise of the grid's
-    /// absolute row counter. History grows only by whole-screen scrolls and by a top region
-    /// scrolling into it, both counted by the rise, so a line in history moves up by the
-    /// whole rise.
-    ///
-    /// `bands` is the batch's row-band record when it explains every row the batch moved.
-    /// A cursor on the screen then replays, in order, only the moves its row was in:
-    ///
-    /// * a top region of a screen with history (`top == 0`, the counter rising): its rows
-    ///   and all of history go up, its top rows into history, and the fixed rows below it
-    ///   stay (Codex's composer, apt's progress bar);
-    /// * any other band (interior region, IL/DL, reverse index, a top region with no
-    ///   history): its rows move, a cursor whose row left the band rests on the edge it
-    ///   left through, and every line outside it stays.
-    ///
-    /// A row that entered history is among the batch's `lines` newest history lines, so
-    /// the replay stops there; the band record composes a DL at row 0 with the archival.
-    ///
-    /// The clamp runs on every batch, so a cleared history (ED 3) leaves no cursor below
-    /// the oldest line. A cursor whose text left history rests on the oldest line kept, even
-    /// above a live viewport: it follows its text on purpose.
-    pub(super) fn vi_follow_output(&mut self, lines: u64, bands: Option<aterm_grid::RowBandMoves>) {
-        if !self.vi_is_active() {
-            return;
-        }
-        let rise = i32::try_from(lines).unwrap_or(i32::MAX);
-        let before = self.vi.cursor_point().line;
-        let after = match bands {
-            Some(bands) if before >= 0 => bands
-                .as_slice()
-                .iter()
-                .fold(before, |line, band| {
-                    let (top, bottom) = (i32::from(band.top), i32::from(band.bottom));
-                    let moved = line.saturating_add(i32::from(band.delta));
-                    if top == 0 && band.delta < 0 && rise > 0 {
-                        // Archival: history and the region go up, the region's top
-                        // rows into history; the rows below it stay.
-                        if line <= bottom { moved } else { line }
-                    } else if (top..=bottom).contains(&line) {
-                        // A row moved out of the band is gone: rest on its edge.
-                        moved.clamp(top, bottom)
-                    } else {
-                        line
-                    }
-                })
-                .max(rise.saturating_neg()),
-            _ => before.saturating_sub(rise),
-        };
-        self.vi_shift(after.saturating_sub(before));
-    }
-
-    /// Move the vi cursor `delta` lines and clamp it onto the grid: line into
-    /// `-history..=rows - 1`, column into the width. While an offloaded reflow holds the
-    /// history, nothing is in memory to clamp against, so the line keeps its floor until
-    /// [`Self::finish_resize_offload`] or [`Self::abort_resize_offload`] clamps it
-    /// (clamping now would put a cursor in history on live line 0).
-    pub(super) fn vi_shift(&mut self, delta: i32) {
-        if !self.vi_is_active() {
-            return;
-        }
-        let topmost = if self.grid.reflow_offload_in_flight() {
-            i32::MIN
-        } else {
-            aterm_types::BufferAccess::total_lines(&self.grid).saturating_neg()
-        };
-        let bottommost = i32::from(self.grid.rows()).saturating_sub(1);
-        let last_col = self.grid.cols().saturating_sub(1);
-        self.vi.scroll(topmost, bottommost, last_col, delta);
-    }
-
-    /// Execute a vi mode inline character search (f/F/t/T).
-    pub fn vi_inline_search_execute(
-        &mut self,
-        needle: char,
-        kind: crate::vi_mode::InlineSearchKind,
-    ) -> bool {
-        self.vi.inline_search_execute(&self.grid, needle, kind)
-    }
-
-    /// Repeat the last vi mode inline search (`;`).
-    pub fn vi_inline_search_repeat(&mut self) -> bool {
-        self.vi.inline_search_repeat(&self.grid)
-    }
-
-    /// Repeat the last vi mode inline search in reverse (`,`).
-    pub fn vi_inline_search_repeat_reverse(&mut self) -> bool {
-        self.vi.inline_search_repeat_reverse(&self.grid)
-    }
-
     /// Get the current Kitty keyboard enhancement flags.
     #[must_use]
     pub fn kitty_keyboard_flags(&self) -> KittyKeyboardFlags {
@@ -188,6 +64,29 @@ impl Terminal {
         self.modes.win32_input_enabled = console_host;
         self.modes.kitty_keyboard_enabled = !console_host;
         self.refresh_mode_mirror();
+    }
+
+    /// Host policy: the console host between this terminal and its app forwards the app's
+    /// alternate-screen switches verbatim and never repaints the buffer it switches to
+    /// (Windows Terminal's OpenConsole). A shell prompt on the alternate screen (a
+    /// full-screen app died without its `?1049l`) then does not leave the screen locally; it
+    /// raises ONE request per stuck screen for the host to leave its own dead buffer
+    /// ([`take_alt_screen_resync_request`](Self::take_alt_screen_resync_request)), whose
+    /// forwarded `?1049l` leaves both. Kept across RIS; off by default, which is the local
+    /// leave every other host gets.
+    pub fn set_host_resyncs_alt_screen(&mut self, on: bool) {
+        self.transient.host_resyncs_alt_screen = on;
+        if !on {
+            self.transient.alt_screen_resync_requested = false;
+        }
+    }
+
+    /// Take the pending alternate-screen resync request (see
+    /// [`set_host_resyncs_alt_screen`](Self::set_host_resyncs_alt_screen)): `true` once per
+    /// stuck screen, when the embedder should make its console host leave the alternate
+    /// buffer. Always `false` while the policy is off.
+    pub fn take_alt_screen_resync_request(&mut self) -> bool {
+        std::mem::take(&mut self.transient.alt_screen_resync_requested)
     }
 
     /// Whether the Kitty keyboard protocol capability is enabled
@@ -267,31 +166,98 @@ impl Terminal {
         self.secure_keyboard_entry = enabled;
     }
 
-    /// Report the host OS color scheme (light/dark) to the engine, at startup and
-    /// on every appearance change. Apps read it via DSR `CSI ? 996 n`; when it
-    /// changes and DEC mode 2031 is set, the engine queues `CSI ? 997 ; Ps n`
+    /// Set the host's baseline colour scheme: the appearance of the
+    /// host-configured default background (a theme's declared appearance).
+    /// Programs read the REPORTED scheme via DSR `CSI ? 996 n`, which is this
+    /// baseline while the background is the configured one and the live
+    /// background's polarity while a program holds its own (OSC 11; see
+    /// [`color_scheme`](Self::color_scheme)). When the reported scheme changes
+    /// and DEC mode 2031 is set, the engine queues `CSI ? 997 ; Ps n`
     /// (1 = dark, 2 = light) for the host to drain via
-    /// [`take_response`](Self::take_response). A no-op if unchanged.
-    pub fn set_color_scheme(&mut self, scheme: aterm_types::Appearance) {
-        if self.modes.color_scheme == scheme {
+    /// [`take_response`](Self::take_response).
+    ///
+    /// Hosts with a [`TerminalConfig`](crate::config::TerminalConfig) pass the
+    /// baseline as its `color_scheme` instead, so one `apply_config` lands the
+    /// colours and the scheme together.
+    pub fn set_color_scheme(&mut self, baseline: aterm_types::Appearance) {
+        self.color.configured_color_scheme = baseline;
+        let _ = self.reconcile_color_scheme();
+    }
+
+    /// The colour scheme DSR 996 answers now: the background on screen. The
+    /// host's baseline ([`set_color_scheme`](Self::set_color_scheme)) while the
+    /// live default background is the configured one, else that background's
+    /// polarity under [`aterm_messages::ink::bg_is_light`].
+    #[must_use]
+    pub fn color_scheme(&self) -> aterm_types::Appearance {
+        self.color.reported_scheme().0
+    }
+
+    /// Where [`color_scheme`](Self::color_scheme) comes from.
+    #[must_use]
+    pub fn color_scheme_source(&self) -> ColorSchemeSource {
+        self.color.reported_scheme().1
+    }
+
+    /// [`Self::reconcile_color_scheme`] at the end of a process batch, where
+    /// the change came from the program's own output (OSC 10/11/110/111,
+    /// OSC 21, a colour-stack pop, RIS, DECSTR). Such a push is a reply the
+    /// program provoked, so it passes the gates every program reply passes
+    /// ([`program_response_admitted`](super::handler::program_response_admitted): the policy's `response any`
+    /// verdict and the response rate limit). Refused, the latch stays where it
+    /// was, so the next reconcile (host-driven or a later batch) can still
+    /// announce the change. Host entry points keep the ungated reconcile.
+    pub(super) fn reconcile_color_scheme_after_output(&mut self) {
+        const PUSH_LEN: usize = b"\x1b[?997;1n".len();
+        if self.modes.color_scheme == self.color.reported_scheme().0 {
             return;
         }
-        self.modes.color_scheme = scheme;
-        if self.modes.report_color_scheme {
-            // Unsolicited push, not a query reply: no capability gate or rate limit.
+        if self.modes.report_color_scheme
+            && !super::handler::program_response_admitted(
+                &mut self.policy,
+                &mut self.transient,
+                PUSH_LEN,
+            )
+        {
+            return;
+        }
+        let _ = self.reconcile_color_scheme();
+    }
+
+    /// Bring the announced latch (`TerminalModes::color_scheme`) to the derived
+    /// scheme, queueing the `CSI ? 997 ; Ps n` push when it moved and DEC 2031
+    /// is set. This ungated form is for host entry points (apply_config,
+    /// rebase, set_color_scheme, a checkpoint restore, a host reset); the end
+    /// of a process batch goes through
+    /// [`Self::reconcile_color_scheme_after_output`], which first applies the
+    /// program-reply gates. Like any advisory report the push is dropped when
+    /// the response buffer is at its cap. Called at host entry
+    /// points and the end of each process batch, never per sequence, so
+    /// several background writes in one batch push at most once, and only for
+    /// a net change. Returns whether the latch moved.
+    pub(super) fn reconcile_color_scheme(&mut self) -> bool {
+        const PUSH_MAX_LEN: usize = 16;
+        let now = self.color.reported_scheme().0;
+        if self.modes.color_scheme == now {
+            return false;
+        }
+        self.modes.color_scheme = now;
+        if self.modes.report_color_scheme
+            && self
+                .transient
+                .response_buffer
+                .len()
+                .saturating_add(PUSH_MAX_LEN)
+                <= super::MAX_RESPONSE_BUFFER_SIZE
+        {
             use std::fmt::Write as _;
-            let mut response = super::stack_response::StackResponse::<16>::new();
-            let _ = write!(response, "\x1b[?997;{}n", scheme.dsr_code());
+            let mut response = super::stack_response::StackResponse::<PUSH_MAX_LEN>::new();
+            let _ = write!(response, "\x1b[?997;{}n", now.dsr_code());
             self.transient
                 .response_buffer
                 .extend_from_slice(response.as_bytes());
         }
-    }
-
-    /// The host OS color scheme last reported via [`set_color_scheme`](Self::set_color_scheme).
-    #[must_use]
-    pub fn color_scheme(&self) -> aterm_types::Appearance {
-        self.modes.color_scheme
+        true
     }
 
     /// Whether an OSC 52 query the program sends now reaches the host's clipboard
@@ -414,6 +380,50 @@ impl Terminal {
         self.shell_integration_auth.dropped_count()
     }
 
+    /// Number of OSC 133 / OSC 633 sequences whose capability nonce verified since
+    /// construction (saturating; a pure counter, only moved while
+    /// `modes.require_shell_integration_nonce` is `true`).
+    ///
+    /// The crash-restore journal reads it around each slice: a restore replays the raw
+    /// output past its keyframe into an engine that does not hold the live nonce (a
+    /// restored shell re-keys), where a verified mark would be dropped, so the journal
+    /// keyframes a slice that moved this count and counts the marks a rate limit left in
+    /// its tail.
+    #[must_use]
+    pub fn shell_marks_verified(&self) -> u64 {
+        self.shell_integration_auth.verified_count()
+    }
+
+    /// Number of kitty-graphics APC strings (`ESC _ G … ST`) that ended since construction,
+    /// complete or cut short by CAN/SUB, whatever each did: a pure counter, never reset.
+    ///
+    /// The crash-restore journal's recovery reads it around its replay: what a kitty
+    /// command does depends on state no checkpoint carries and no scratch engine has (the
+    /// image store, a chunked transmission under way, the image numbers, and the host's
+    /// file and shared-memory medium resolver), so a command the tail holds may place an
+    /// image and move the cursor live and do neither in the replay. A replay that ran one
+    /// is not called exact.
+    #[must_use]
+    pub fn kitty_graphics_commands(&self) -> u64 {
+        self.transient.kitty_commands
+    }
+
+    /// Number of Kitty unscrolls (`CSI n + T`) run on the main screen since
+    /// construction, whatever each pulled: a pure counter, never reset. One on the
+    /// alternate screen is not counted: that grid keeps no history, so it scrolls in
+    /// blank rows wherever it runs.
+    ///
+    /// The crash-restore journal's recovery reads it around its replay: an unscroll
+    /// pulls the newest history lines onto the screen, and the scratch engine holds
+    /// only the keyframe's bridge (none at all once the history ring has caught up),
+    /// in its store where the live engine read its ring first, so the replay may
+    /// scroll in blank rows, or other lines, where the live one pulled history. A
+    /// replay that ran one is not called exact.
+    #[must_use]
+    pub fn kitty_unscrolls(&self) -> u64 {
+        self.transient.kitty_unscrolls
+    }
+
     /// Enable or disable OSC 133 / OSC 633 capability-nonce enforcement (default off):
     /// when on, every sequence must carry a matching `id=<64-hex>` (see
     /// [`Self::authorize_shell_integration`]). Preserved across RIS and
@@ -453,32 +463,32 @@ impl Terminal {
     /// live; `true` when stored (idempotent, lowercased). The other OSC 8 guards still
     /// apply. Extra schemes survive soft and hard resets and are not checkpointed.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "hyperlink_scheme_cap",
             action = "Authorize",
             project = "conformance_hyperlink_scheme_cap::project"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "hyperlink_scheme_cap",
             action = "AuthorizeOther",
             project = "conformance_hyperlink_scheme_cap::project"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "hyperlink_scheme_cap",
             action = "RefuseAtCap",
             project = "conformance_hyperlink_scheme_cap::project"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "hyperlink_scheme_cap",
             action = "RefuseNeverAllow",
             project = "conformance_hyperlink_scheme_cap::project"
@@ -491,8 +501,8 @@ impl Terminal {
     /// Remove a host-minted extra scheme (case-insensitive): OSC 8 URIs with it
     /// are refused again. Absent schemes are a no-op.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "hyperlink_scheme_cap",
             action = "Revoke",
             project = "conformance_hyperlink_scheme_cap::project"
@@ -529,20 +539,37 @@ impl Terminal {
         self.policy.install(engine);
     }
 
-    /// Clear the installed policy engine, returning to the
-    /// `TerminalModes::allow_*`-only behavior a checkpoint restore starts from
-    /// (checkpoints do not carry the engine).
-    #[cfg(test)]
-    pub fn clear_policy_engine(&mut self) {
-        // `clear` recompiles the gate table to the no-engine posture.
-        self.policy.clear();
+    /// Enable or disable OSC 4 / OSC 21 indexed palette reconfigure (engine
+    /// default off; the aterm app turns it on unless configured false): while
+    /// disabled, PTY-origin attempts to change the 256-entry palette
+    /// are ignored. Equivalent to setting
+    /// `modes_mut().allow_palette_reconfigure`; preserved across
+    /// `Terminal::reset()` and RIS so a program cannot re-enable it with a reset.
+    ///
+    /// Opening a closed gate re-arms the refusal report
+    /// ([`Self::palette_set_refused`] reads false again), so a refusal after
+    /// the gate closes again calls the host's `palette_refused_callback` anew.
+    pub fn set_allow_palette_reconfigure(&mut self, allowed: bool) {
+        if allowed && !self.modes.allow_palette_reconfigure {
+            self.color.palette_set_refused = false;
+        }
+        self.modes.allow_palette_reconfigure = allowed;
     }
 
-    /// Enable or disable OSC 4 / OSC 21 indexed palette reconfigure (default off): while
-    /// off, PTY-origin palette changes are ignored. Preserved across `Terminal::reset()` and
-    /// RIS so a program cannot re-enable it with a reset.
-    pub fn set_allow_palette_reconfigure(&mut self, allowed: bool) {
-        self.modes.allow_palette_reconfigure = allowed;
+    /// Whether programs may set the 256 indexed colours (OSC 4 / numeric
+    /// OSC 21) in this session (see [`Self::set_allow_palette_reconfigure`]).
+    #[must_use]
+    pub fn allow_palette_reconfigure(&self) -> bool {
+        self.modes.allow_palette_reconfigure
+    }
+
+    /// What programs set over the configured colours (OSC 4/10/11/12/17/19/
+    /// 21): the diff `apply_config` replays over a new theme and a handoff
+    /// carries. Empty once OSC 104/110-119, RIS or a manual handback put the
+    /// theme's colours back. The colour stack (OSC 30001) is not included.
+    #[must_use]
+    pub fn program_color_overrides(&self) -> super::ColorOverridesRepr {
+        self.color.capture_overrides()
     }
 
     /// Get cursor position.
@@ -683,30 +710,42 @@ impl Terminal {
     }
 
     /// Set the host's alternate-scroll default (DEC 1007): the live mode now,
-    /// and the value [`Self::foreground_handback`] restores 1007 to. Programs
-    /// may still change the live mode with `CSI ? 1007 h/l`.
+    /// and the value RIS, DECSTR and [`Self::foreground_handback`] restore 1007
+    /// to. Programs may still change the live mode with `CSI ? 1007 h/l`.
     pub fn set_host_alternate_scroll(&mut self, on: bool) {
         self.modes.alternate_scroll = on;
-        self.configured_modes.alternate_scroll = on;
+        self.host_alternate_scroll = on;
         // 1007 rides the lock-free mode word (the wheel's route reads it).
         self.refresh_mode_mirror();
     }
 }
 
 /// Append a DEC mode-2048 in-band size report, `CSI 48 ; rows ; cols ; pixH ; pixW t`
-/// (as xterm/ghostty), to a response buffer. Pixels are computed in `u32`; a `0` cell size
-/// reports `0` pixels. Shared by the DECSET-2048 enable path and `Terminal::resize`.
+/// (as xterm/ghostty), to a response buffer, unless it would pass
+/// `MAX_RESPONSE_BUFFER_SIZE`: every caller writes the buffer directly, past
+/// `send_response`'s rate limit, so a toggle flood or a resize storm against a host
+/// that does not drain must not grow it.
+///
+/// `host_cell_px` is the cell box a host measured (`Terminal::host_cell_pixel_size`):
+/// pixels are `0` until one has, as the PTY's winsize says, never the 8x16
+/// placeholder passed off as a measurement. Pixels are computed in `u32`. Shared by
+/// the DECSET-2048 enable path, `Terminal::resize` and `Terminal::set_cell_pixel_size`.
 pub(super) fn push_in_band_size_report(
     buf: &mut Vec<u8>,
     rows: u16,
     cols: u16,
-    cell_w: u16,
-    cell_h: u16,
+    host_cell_px: Option<(u16, u16)>,
 ) {
     use std::fmt::Write as _;
+    // The report's capacity.
+    const MAX_LEN: usize = 48;
+    if buf.len().saturating_add(MAX_LEN) > super::MAX_RESPONSE_BUFFER_SIZE {
+        return;
+    }
+    let (cell_w, cell_h) = host_cell_px.unwrap_or((0, 0));
     let pix_h = u32::from(rows) * u32::from(cell_h);
     let pix_w = u32::from(cols) * u32::from(cell_w);
-    let mut r = super::stack_response::StackResponse::<48>::new();
+    let mut r = super::stack_response::StackResponse::<MAX_LEN>::new();
     let _ = write!(r, "\x1b[48;{rows};{cols};{pix_h};{pix_w}t");
     buf.extend_from_slice(r.as_bytes());
 }

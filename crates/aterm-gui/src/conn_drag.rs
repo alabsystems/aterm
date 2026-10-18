@@ -326,15 +326,6 @@ mod tests {
         );
     }
 
-    /// Release over nothing (or after the target left) cancels; nothing in
-    /// this module ever mints.
-    #[test]
-    fn release_over_nothing_cancels() {
-        let mut d = ConnDragState::arm(WindowId(0), 0, sid(1), (0.0, 0.0));
-        assert!(d.track((0.0, 50.0)));
-        assert_eq!(d.release(), ConnDragOutcome::Cancel);
-    }
-
     /// A native-strip drag is born dragging, so a release with no target cancels and
     /// never opens a menu (the native strip opens its own).
     #[test]

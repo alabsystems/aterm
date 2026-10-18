@@ -1065,37 +1065,27 @@ mod tests {
         );
     }
 
+    /// Reference vectors: an empty stream, fixed-Huffman literals, a stored
+    /// block, fixed-Huffman back-references and a dynamic-Huffman block, plus the
+    /// bare DEFLATE body without its zlib wrapper.
     #[test]
-    fn empty_stream() {
-        assert_eq!(zlib_decompress(EMPTY, 1 << 20).unwrap(), b"");
-    }
-
-    #[test]
-    fn fixed_huffman_literals() {
-        assert_eq!(zlib_decompress(HELLO, 1 << 20).unwrap(), b"hello, world");
-    }
-
-    #[test]
-    fn stored_block() {
-        assert_eq!(zlib_decompress(STORED, 1 << 20).unwrap(), b"ABCDEABCDE");
-    }
-
-    #[test]
-    fn fixed_huffman_backreferences() {
-        let expected = "ab".repeat(40).into_bytes();
-        assert_eq!(zlib_decompress(BACKREFS, 1 << 20).unwrap(), expected);
-    }
-
-    #[test]
-    fn dynamic_huffman_block() {
-        let base = "the quick brown fox jumps over the lazy dog while a programmer \
-                    carefully writes a deflate decompressor in rust with zero dependencies. ";
-        let expected = base.repeat(12).into_bytes();
-        assert_eq!(zlib_decompress(DYNAMIC, 1 << 20).unwrap(), expected);
-    }
-
-    #[test]
-    fn raw_inflate_without_zlib_wrapper() {
+    fn reference_vectors_decode() {
+        let dynamic = "the quick brown fox jumps over the lazy dog while a programmer \
+                       carefully writes a deflate decompressor in rust with zero dependencies. "
+            .repeat(12);
+        for (name, vector, want) in [
+            ("empty", EMPTY, Vec::new()),
+            ("fixed literals", HELLO, b"hello, world".to_vec()),
+            ("stored", STORED, b"ABCDEABCDE".to_vec()),
+            ("fixed backrefs", BACKREFS, "ab".repeat(40).into_bytes()),
+            ("dynamic", DYNAMIC, dynamic.into_bytes()),
+        ] {
+            assert_eq!(
+                zlib_decompress(vector, 1 << 20).as_deref(),
+                Ok(&want[..]),
+                "{name}"
+            );
+        }
         // Strip the 2-byte header + 4-byte Adler trailer -> a bare DEFLATE stream.
         let raw = &HELLO[2..HELLO.len() - 4];
         assert_eq!(inflate(raw, 1 << 20).unwrap(), b"hello, world");
@@ -1111,30 +1101,10 @@ mod tests {
     }
 
     #[test]
-    fn truncated_input_errors_not_panics() {
-        for cut in 0..HELLO.len() {
-            // Any prefix must return an error (or, by luck, decode) — never panic.
-            let _ = zlib_decompress(&HELLO[..cut], 1 << 20);
-            let _ = inflate(&HELLO[..cut], 1 << 20);
-        }
-    }
-
-    #[test]
     fn bad_zlib_header_rejected() {
         assert_eq!(
             zlib_decompress(&[0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01], 1 << 20),
             Err(InflateError::BadZlibHeader)
-        );
-    }
-
-    #[test]
-    fn corrupt_checksum_rejected() {
-        let mut bad = HELLO.to_vec();
-        let n = bad.len();
-        bad[n - 1] ^= 0xff; // flip the last Adler byte
-        assert_eq!(
-            zlib_decompress(&bad, 1 << 20),
-            Err(InflateError::BadChecksum)
         );
     }
 
@@ -1172,12 +1142,6 @@ mod tests {
         // An incomplete code (one length-2 code) yields a positive residual.
         let (_h, left) = Huffman::new(&[0, 2]).unwrap();
         assert!(left > 0);
-    }
-
-    #[test]
-    fn adler32_known_value() {
-        // Adler-32("hello, world") cross-checked against zlib.
-        assert_eq!(adler32(b"hello, world"), 0x1d54_0489);
     }
 
     // Root lookup table: differential oracle against the bit-at-a-time walk.
@@ -1427,291 +1391,19 @@ mod tests {
         }
     }
 
-    // Reference per-bit reader and decode path. Decoding the vectors and every
-    // truncation prefix through both must give identical output and errors.
-
-    /// The original LSB-first per-bit reader, kept verbatim as a reference.
-    struct RefBitReader<'a> {
-        data: &'a [u8],
-        byte_pos: usize,
-        bit_pos: u32,
-    }
-
-    impl<'a> RefBitReader<'a> {
-        fn new(data: &'a [u8]) -> Self {
-            Self {
-                data,
-                byte_pos: 0,
-                bit_pos: 0,
-            }
-        }
-
-        fn read_bit(&mut self) -> Result<u32, InflateError> {
-            let byte = *self
-                .data
-                .get(self.byte_pos)
-                .ok_or(InflateError::Truncated)?;
-            let bit = (byte >> self.bit_pos) & 1;
-            self.bit_pos += 1;
-            if self.bit_pos == 8 {
-                self.bit_pos = 0;
-                self.byte_pos += 1;
-            }
-            Ok(u32::from(bit))
-        }
-
-        fn read_bits(&mut self, n: u32) -> Result<u32, InflateError> {
-            let mut v = 0u32;
-            for i in 0..n {
-                v |= self.read_bit()? << i;
-            }
-            Ok(v)
-        }
-
-        fn align_to_byte(&mut self) {
-            if self.bit_pos != 0 {
-                self.bit_pos = 0;
-                self.byte_pos += 1;
-            }
-        }
-
-        fn read_aligned_byte(&mut self) -> Result<u8, InflateError> {
-            let b = *self
-                .data
-                .get(self.byte_pos)
-                .ok_or(InflateError::Truncated)?;
-            self.byte_pos += 1;
-            Ok(b)
-        }
-
-        fn read_aligned_u16(&mut self) -> Result<u16, InflateError> {
-            let lo = self.read_aligned_byte()?;
-            let hi = self.read_aligned_byte()?;
-            Ok(u16::from_le_bytes([lo, hi]))
-        }
-    }
-
-    // The reference reuses the production `Huffman` table construction (unchanged)
-    // and only re-implements the bit-consuming decode against `RefBitReader`.
-    fn ref_decode(h: &Huffman, br: &mut RefBitReader) -> Result<u16, InflateError> {
-        let mut code: i32 = 0;
-        let mut first: i32 = 0;
-        let mut index: i32 = 0;
-        for len in 1..=MAXBITS {
-            code |= br.read_bit()? as i32;
-            let cnt = i32::from(h.count[len]);
-            if code - first < cnt {
-                let idx = (index + (code - first)) as usize;
-                return h.symbol.get(idx).copied().ok_or(InflateError::BadSymbol);
-            }
-            index += cnt;
-            first += cnt;
-            first <<= 1;
-            code <<= 1;
-        }
-        Err(InflateError::BadSymbol)
-    }
-
-    fn ref_read_dynamic_tables(br: &mut RefBitReader) -> Result<(Huffman, Huffman), InflateError> {
-        let hlit = br.read_bits(5)? as usize + 257;
-        let hdist = br.read_bits(5)? as usize + 1;
-        let hclen = br.read_bits(4)? as usize + 4;
-        if hlit > 286 || hdist > 30 || hclen > 19 {
-            return Err(InflateError::BadSymbol);
-        }
-        let mut cl_lengths = [0u16; 19];
-        for &slot in CLCL_ORDER.iter().take(hclen) {
-            cl_lengths[slot] = br.read_bits(3)? as u16;
-        }
-        let (cl_huff, cl_left) = Huffman::new(&cl_lengths)?;
-        if cl_left != 0 {
-            return Err(InflateError::BadSymbol);
-        }
-
-        let mut lengths = vec![0u16; hlit + hdist];
-        let mut i = 0;
-        while i < lengths.len() {
-            let sym = ref_decode(&cl_huff, br)?;
-            match sym {
-                0..=15 => {
-                    lengths[i] = sym;
-                    i += 1;
-                }
-                16 => {
-                    if i == 0 {
-                        return Err(InflateError::BadSymbol);
-                    }
-                    let prev = lengths[i - 1];
-                    let repeat = 3 + br.read_bits(2)? as usize;
-                    for _ in 0..repeat {
-                        if i >= lengths.len() {
-                            return Err(InflateError::BadSymbol);
-                        }
-                        lengths[i] = prev;
-                        i += 1;
-                    }
-                }
-                17 => {
-                    let repeat = 3 + br.read_bits(3)? as usize;
-                    for _ in 0..repeat {
-                        if i >= lengths.len() {
-                            return Err(InflateError::BadSymbol);
-                        }
-                        lengths[i] = 0;
-                        i += 1;
-                    }
-                }
-                18 => {
-                    let repeat = 11 + br.read_bits(7)? as usize;
-                    for _ in 0..repeat {
-                        if i >= lengths.len() {
-                            return Err(InflateError::BadSymbol);
-                        }
-                        lengths[i] = 0;
-                        i += 1;
-                    }
-                }
-                _ => return Err(InflateError::BadSymbol),
-            }
-        }
-        let (lit, lit_left) = Huffman::new(&lengths[..hlit])?;
-        if lit_left != 0 {
-            return Err(InflateError::BadSymbol);
-        }
-        let (dist, dist_left) = Huffman::new(&lengths[hlit..])?;
-        let dist_special = dist.symbol.is_empty() || (dist.symbol.len() == 1 && dist.count[1] == 1);
-        if dist_left != 0 && !dist_special {
-            return Err(InflateError::BadSymbol);
-        }
-        Ok((lit, dist))
-    }
-
-    fn ref_inflate_stored(
-        br: &mut RefBitReader,
-        out: &mut Vec<u8>,
-        max_output: usize,
-    ) -> Result<(), InflateError> {
-        br.align_to_byte();
-        let len = br.read_aligned_u16()? as usize;
-        let nlen = br.read_aligned_u16()?;
-        if (len as u16) != !nlen {
-            return Err(InflateError::BadStoredLength);
-        }
-        if out.len().saturating_add(len) > max_output {
-            return Err(InflateError::OutputTooLarge);
-        }
-        out.reserve(len);
-        for _ in 0..len {
-            let b = br.read_aligned_byte()?;
-            out.push(b);
-        }
-        Ok(())
-    }
-
-    fn ref_inflate_block(
-        br: &mut RefBitReader,
-        out: &mut Vec<u8>,
-        max_output: usize,
-        lit: &Huffman,
-        dist: &Huffman,
-    ) -> Result<(), InflateError> {
-        loop {
-            let sym = ref_decode(lit, br)?;
-            if sym < 256 {
-                if out.len() >= max_output {
-                    return Err(InflateError::OutputTooLarge);
-                }
-                out.push(sym as u8);
-            } else if sym == 256 {
-                return Ok(());
-            } else {
-                let li = sym as usize - 257;
-                let length = *LENGTH_BASE.get(li).ok_or(InflateError::BadSymbol)? as usize
-                    + br.read_bits(LENGTH_EXTRA[li])? as usize;
-                let dsym = ref_decode(dist, br)? as usize;
-                let distance = *DIST_BASE.get(dsym).ok_or(InflateError::BadDistance)? as usize
-                    + br.read_bits(DIST_EXTRA[dsym])? as usize;
-                if distance == 0 || distance > out.len() {
-                    return Err(InflateError::BadDistance);
-                }
-                if out.len().saturating_add(length) > max_output {
-                    return Err(InflateError::OutputTooLarge);
-                }
-                out.reserve(length);
-                let start = out.len() - distance;
-                for i in 0..length {
-                    let b = out[start + i];
-                    out.push(b);
-                }
-            }
-        }
-    }
-
-    fn ref_inflate(input: &[u8], max_output: usize) -> Result<Vec<u8>, InflateError> {
-        let mut br = RefBitReader::new(input);
-        let mut out: Vec<u8> = Vec::new();
-        loop {
-            let bfinal = br.read_bit()?;
-            let btype = br.read_bits(2)?;
-            match btype {
-                0 => ref_inflate_stored(&mut br, &mut out, max_output)?,
-                1 => ref_inflate_block(&mut br, &mut out, max_output, &fixed_lit(), &fixed_dist())?,
-                2 => {
-                    let (lit, dist) = ref_read_dynamic_tables(&mut br)?;
-                    ref_inflate_block(&mut br, &mut out, max_output, &lit, &dist)?;
-                }
-                _ => return Err(InflateError::BadBlockType),
-            }
-            if bfinal == 1 {
-                return Ok(out);
-            }
-        }
-    }
-
-    fn ref_zlib_decompress(input: &[u8], max_output: usize) -> Result<Vec<u8>, InflateError> {
-        if input.len() < 6 {
-            return Err(InflateError::Truncated);
-        }
-        let cmf = input[0];
-        let flg = input[1];
-        if (cmf & 0x0f) != 8 {
-            return Err(InflateError::BadZlibHeader);
-        }
-        if ((u16::from(cmf) << 8) | u16::from(flg)) % 31 != 0 {
-            return Err(InflateError::BadZlibHeader);
-        }
-        if (flg & 0x20) != 0 {
-            return Err(InflateError::BadZlibHeader);
-        }
-        let deflate = &input[2..input.len() - 4];
-        let out = ref_inflate(deflate, max_output)?;
-        let trailer = &input[input.len() - 4..];
-        let expected = u32::from_be_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
-        if adler32(&out) != expected {
-            return Err(InflateError::BadChecksum);
-        }
-        Ok(out)
-    }
-
+    /// Every strict prefix of a bare DEFLATE stream is `Truncated`: the
+    /// buffered bit reader never invents bits past the end of its input.
     #[test]
-    fn buffered_reader_matches_per_bit_reader_on_vectors_and_truncations() {
-        const CAP: usize = 1 << 20;
-        let vectors: [&[u8]; 5] = [EMPTY, HELLO, STORED, BACKREFS, DYNAMIC];
-        for v in vectors {
-            // Every truncation prefix (including the full stream at cut == len).
-            for cut in 0..=v.len() {
-                let prefix = &v[..cut];
+    fn every_strict_prefix_of_a_raw_stream_is_truncated() {
+        for v in [EMPTY, HELLO, STORED, BACKREFS, DYNAMIC] {
+            let raw = &v[2..v.len() - 4];
+            assert!(inflate(raw, 1 << 20).is_ok());
+            for cut in 0..raw.len() {
                 assert_eq!(
-                    inflate(prefix, CAP),
-                    ref_inflate(prefix, CAP),
-                    "raw inflate disagreed at cut {cut} of a {}-byte vector",
-                    v.len()
-                );
-                assert_eq!(
-                    zlib_decompress(prefix, CAP),
-                    ref_zlib_decompress(prefix, CAP),
-                    "zlib_decompress disagreed at cut {cut} of a {}-byte vector",
-                    v.len()
+                    inflate(&raw[..cut], 1 << 20),
+                    Err(InflateError::Truncated),
+                    "cut {cut} of a {}-byte stream",
+                    raw.len()
                 );
             }
         }

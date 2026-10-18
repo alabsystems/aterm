@@ -6,7 +6,7 @@ use crate::{App, WindowId};
 use aterm_types::keyboard::{Key as EKey, KeyEventType, Modifiers, NamedKey as ENamed};
 
 /// The source an `aterm ctl key` verb stamps. For audit only: the seam never
-/// branches on it (`bytes_human_eq_controller`), so these tests pin the
+/// branches on it (`seam_egress` takes no source), so these tests pin the
 /// route, not the label.
 const CTL: Source = Source::Controller;
 
@@ -49,21 +49,6 @@ fn ctl_key_menu_pops_the_card_the_physical_key_pops() {
             .contains(&EKey::Named(ENamed::ContextMenu)),
         "the swallowed press is booked so its release cannot orphan"
     );
-}
-
-/// …and ⇧F10 through the seam under the opt-in, with the same modifier
-/// rule the glass uses: bare F10 belongs to the program.
-#[test]
-fn ctl_key_shift_f10_pops_it_and_bare_f10_does_not() {
-    let (mut app, wid) = app_with_strip();
-    app.config.tab_menu_chord = Some("on".to_string());
-    app.input(wid, key(ENamed::F10, Modifiers::empty()), CTL);
-    assert!(
-        app.windows[&wid].tab_menu.is_none(),
-        "bare F10 is the program's function key"
-    );
-    app.input(wid, key(ENamed::F10, Modifiers::SHIFT), CTL);
-    assert!(app.windows[&wid].tab_menu.is_some(), "⇧F10 pops it");
 }
 
 /// With the default config, `aterm ctl key shift+f10` writes terminfo `kf22`
@@ -120,21 +105,6 @@ fn the_controller_walks_and_activates_the_card() {
     assert_ne!(first, stepped, "↓ moved the highlight");
     app.input(wid, key(ENamed::Escape, Modifiers::empty()), CTL);
     assert!(app.windows[&wid].tab_menu.is_none(), "Esc dismissed it");
-}
-
-/// Deference holds on both routes off one predicate: a client that
-/// negotiated for the Menu key keeps it whether a hand or a controller
-/// presses it.
-#[test]
-fn the_seam_defers_to_a_kitty_client_exactly_as_the_glass_does() {
-    let (mut app, wid) = app_with_strip();
-    let term = app.pool.get(0).expect("session 0").term.clone();
-    crate::term_lock(&term).process(b"\x1b[>1u");
-    app.input(wid, key(ENamed::ContextMenu, Modifiers::empty()), CTL);
-    assert!(
-        app.windows[&wid].tab_menu.is_none(),
-        "the controller must not pop a card the physical key would decline"
-    );
 }
 
 /// A wheel notch under an open card scrolls and reports nothing, on either

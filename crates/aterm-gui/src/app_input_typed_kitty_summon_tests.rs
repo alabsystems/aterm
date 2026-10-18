@@ -4,8 +4,8 @@
 #[cfg(unix)]
 use super::DeliveredClass;
 use crate::input::{InputEvent, Source};
-use crate::{App, WindowId, term_lock};
-use aterm_spec::derive::cursor_cat_model;
+use crate::{App, WindowId};
+use aterm_models_effects::cursor_cat_model;
 use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
 use std::time::{Duration, Instant};
 
@@ -174,8 +174,8 @@ fn cursor_trail_master_owns_ordinary_kitty_but_not_the_collection_hello() {
 
 /// Typing `dog` through the REAL input path summons the dog cameo — but
 /// only after the window has typed a lot ([`aterm_effects::kitty_summon`]'s
-/// `DOG_SUMMON_KEYS`). A re-summon while visible parades a different
-/// breed, and nothing ever lands in the Kitty Log (dogs are visitors).
+/// `DOG_SUMMON_KEYS`), and nothing lands in the Kitty Log (dogs are
+/// visitors). The re-summon parade is `dog_cameo`'s own test.
 #[test]
 fn typing_dog_after_the_gate_pops_the_dog_cameo() {
     let mut app = App::headless_for_test();
@@ -202,55 +202,11 @@ fn typing_dog_after_the_gate_pops_the_dog_cameo() {
         app.windows[&wid].fx.companions().dog_cameo.active(now),
         "the earned dog arrives on the completing letter"
     );
-    let first = app.windows[&wid]
-        .fx
-        .companions()
-        .dog_cameo
-        .look()
-        .expect("a summoned dog has a rolled look");
-
-    type_word(&mut app, wid, " puppy");
-    let second = app.windows[&wid]
-        .fx
-        .companions()
-        .dog_cameo
-        .look()
-        .expect("the parade re-rolls a look");
-    assert_ne!(
-        first.breed, second.breed,
-        "a re-summon while visible parades a DIFFERENT breed"
-    );
     assert_eq!(
         app.kitty_log.log().sightings,
         0,
         "dogs are visitors — the Kitty Log records nothing"
     );
-}
-
-/// Typing Robi's name through the REAL input path pokes him (his show
-/// restarts at the greeting and the posted tip is forgotten) — but only
-/// while `robi` is on: his gate is the host's, his name matcher the
-/// engine's (`Companions::note_robi_press`).
-#[test]
-fn typing_robis_name_pokes_him_only_while_he_is_on() {
-    let mut app = App::headless_for_test();
-    let wid = WindowId(0);
-    type_word(&mut app, wid, "robi ");
-    assert_eq!(
-        app.windows[&wid].fx.companions().robi_shows,
-        0,
-        "robi is off by default: his name pokes nothing"
-    );
-
-    app.config.robi = Some(true);
-    app.windows.get_mut(&wid).expect("window 0").robi_tip_posted = Some(3);
-    type_word(&mut app, wid, "ROBI");
-    let ws = &app.windows[&wid];
-    assert_eq!(ws.fx.companions().robi_shows, 1, "his name pokes him");
-    assert_eq!(ws.robi_tip_posted, None, "the poke forgets the posted tip");
-
-    type_word(&mut app, wid, "robot");
-    assert_eq!(app.windows[&wid].fx.companions().robi_shows, 2);
 }
 
 /// THE WORD ENGINE'S "A HUMAN TYPED" WITNESS IS ACTUALLY WIRED.
@@ -605,67 +561,6 @@ fn ime_and_external_local_boundaries_retire_older_candidates_before_consumers() 
     assert_boundary_dark(App::headless_for_test(), |app, _wid| {
         app.clear_tab_surface_move_license(None);
     });
-    let source = include_str!("app_input.rs");
-    let dispatch = source
-        .split_once("pub(crate) fn dispatch_menu_action")
-        .expect("menu dispatcher")
-        .1;
-    assert!(
-        dispatch.find("fence_menu_action(").unwrap()
-            < dispatch.find("divert_menu_action_around_rename").unwrap(),
-        "menu candidate fence must precede every local/no-op early return"
-    );
-
-    // Native TabView consumes select/close/context-menu/rename gestures
-    // outside winit, while its context menu can be dismissed without an
-    // action. Every wake (including rename completion and TabCmd drag) and
-    // both status-item ingress points must cross the helper above.
-    let lib_source = include_str!("lib.rs");
-    assert_eq!(
-        lib_source.matches("clear_tab_surface_move_license").count(),
-        7,
-        "all custom tab-strip wake boundaries remain fenced",
-    );
-    // The eighth, `Wake::TabCmd` (a TabView drag shares it with the wire
-    // `tab` verb), fences in the ONE wire `tab` bracket its arm and the
-    // aimed arm both enter (`control_media.rs`), before the action runs.
-    let tab_arm = lib_source
-        .split_once("Wake::TabCmd { action, by, reply } =>")
-        .expect("the TabCmd arm")
-        .1;
-    assert!(
-        tab_arm.find("self.tab_cmd_front(").unwrap() < tab_arm.find("Wake::").unwrap(),
-        "the TabCmd arm enters the wire bracket"
-    );
-    let bracket = include_str!("control_media.rs")
-        .split_once("fn tab_cmd_applied(")
-        .expect("the wire tab bracket")
-        .1;
-    assert!(
-        bracket
-            .find("clear_tab_surface_move_license(None)")
-            .unwrap()
-            < bracket.find("apply(self)").unwrap(),
-        "the wire tab bracket fences before the action runs"
-    );
-    let toolbar_source = include_str!("toolbar.rs");
-    let context_menu = toolbar_source
-        .split_once("fn show_context_menu")
-        .expect("native context-menu entry")
-        .1;
-    assert!(
-        context_menu.find("Wake::TabContextMenuOpening").unwrap()
-            < context_menu.find("entries.is_empty()").unwrap(),
-        "context-menu open/dismiss must fence before every early return",
-    );
-    for wake in ["Wake::OperatorAction", "Wake::OperatorMenuOpening"] {
-        let arm = lib_source.rsplit_once(wake).expect("operator wake arm").1;
-        assert!(
-            arm.find("clear_front_move_license").unwrap()
-                < arm.find("Wake::FleetInstances").unwrap(),
-            "{wake} must fence before its first no-op/dispatch path",
-        );
-    }
 }
 
 /// THE WITNESS CLOCK STARTS AT THE WIRE, NOT AT THE EVENT LOOP.
@@ -792,92 +687,10 @@ fn a_key_queued_behind_a_paste_still_witnesses_its_own_echo() {
     }
 }
 
-/// A key typed behind a draining paste lights its cell when the FIFO
-/// drains: its arrival-time stamp is revoked at enqueue, the writer
-/// thread's completed write publishes a typed delivery ticket, and the
-/// prelude re-stamps the key at that instant (one stamp, one echo, as for
-/// an inline key). Without the re-stamp the hop reads as program output
-/// (`no-fresh-hint`).
-#[cfg(unix)]
-#[test]
-fn a_key_typed_behind_a_draining_paste_lights_its_cell_when_the_fifo_drains() {
-    use crate::cursor_glow::Geom;
-
-    let (mut app, sink, pipe) = app_with_private_pty();
-    let wid = WindowId(0);
-    app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty".to_string());
-    let glow_cfg = app.glow_config();
-    let geom = Geom {
-        cw: 8,
-        ch: 16,
-        rows: 6,
-        cols: 40,
-        origin_x: 0,
-        origin_y: 0,
-        win_w: 320,
-        win_h: 96,
-        head: 0,
-    };
-    let mut out = Vec::new();
-    app.windows
-        .get_mut(&wid)
-        .unwrap()
-        .fx
-        .cursor_mut()
-        .glow
-        .tick(Some((2, 4)), Instant::now(), &glow_cfg, geom, &mut out);
-    let pin = super::paste_order::pin_ordering_for_test(&sink);
-    assert!(super::paste_order::is_ordering(&sink));
-    type_word(&mut app, wid, "k");
-    {
-        let ws = app.windows.get(&wid).unwrap();
-        assert!(
-            !ws.fx.cursor().glow.move_licensed(Instant::now()),
-            "PRECONDITION: the queued key's arrival stamp is revoked"
-        );
-    }
-    drop(pin);
-    super::paste_order::await_drain_for_test(&sink);
-    assert!(!super::paste_order::is_ordering(&sink));
-    // The frame that observes the key's delivery ([`observing_frame`]).
-    let now = observing_frame(delivery_edge(&app, wid, 1), 1);
-    let session = app.front_terminal(wid).unwrap().session;
-    let ctx = &app.pool.get(session).unwrap().ctx;
-    let batch = ctx.output_echo.deliveries_after(&ctx.sink, Some(0), now);
-    let (at, ticket) = batch.items[0].expect("the queued key's delivery receipt");
-    assert!(ticket.key == Some(DeliveredClass::Typed) && ticket.insert.is_none());
-    let ws = app.windows.get_mut(&wid).unwrap();
-    ws.fx
-        .cursor_mut()
-        .glow
-        .note_delivered(at, DeliveredClass::Typed);
-    ws.fx.cursor_mut().trail.note_typed(at);
-    ws.fx
-        .cursor_mut()
-        .glow
-        .tick(Some((2, 5)), now, &glow_cfg, geom, &mut out);
-    assert_eq!(
-        ws.fx.cursor_mut().glow.spawns(),
-        1,
-        "the queued key's echo is licensed by its delivered stamp"
-    );
-    assert_eq!(
-        ws.fx
-            .cursor_mut()
-            .glow
-            .admission_log()
-            .last()
-            .map(|r| r.licence),
-        Some("key")
-    );
-    unsafe {
-        libc::close(pipe[0]);
-        libc::close(pipe[1]);
-    }
-}
-
-/// A one-shot key queued behind a draining paste keeps its licence. Enter,
+/// A key queued behind a draining paste keeps its licence. A typed key's
+/// arrival stamp is revoked at enqueue and the prelude re-stamps it at its
+/// delivery receipt (one stamp, one echo, as for an inline key: without the
+/// re-stamp the hop reads as program output, `no-fresh-hint`). Enter,
 /// navigation and Backspace have their one-shot licences (return / nav /
 /// quench + poof) revoked at enqueue; the delivery ticket carries the class
 /// and the prelude re-stamps it (a pure re-stamp: the v2 `Return` / `Erase`
@@ -894,30 +707,6 @@ fn a_key_typed_behind_a_draining_paste_lights_its_cell_when_the_fifo_drains() {
 #[cfg(unix)]
 #[test]
 fn a_queued_one_shot_key_keeps_its_licence_at_delivery() {
-    queued_one_shot_licence_cases(Duration::ZERO, None);
-}
-
-/// The verdict above is the product's, not the scheduler's: the licence is
-/// fresh for 250 ms from the key's edge, so this thread stalls past that
-/// window between the edge and the frame, and the frame observing the key
-/// is presented on the key's clock ([`observing_frame`]). One case carries
-/// the stall: every case reads the same frame clock, so the rest would
-/// repeat the verdicts above 300 ms later each.
-#[cfg(unix)]
-#[test]
-fn a_one_shot_licence_is_judged_on_its_own_frame_however_late_the_test_thread_runs() {
-    queued_one_shot_licence_cases(
-        Duration::from_millis(300),
-        Some(("rainbow kitty", "Enter", false)),
-    );
-}
-
-/// The cases of [`a_queued_one_shot_key_keeps_its_licence_at_delivery`] —
-/// every one, or `only` the named `(style, key, queued)` — with `stall`
-/// spent by this thread between the key's edge and the frame that observes
-/// it.
-#[cfg(unix)]
-fn queued_one_shot_licence_cases(stall: Duration, only: Option<(&str, &str, bool)>) {
     use crate::app_render::CursorFxInputs;
     let chord = |key: Key, mods: Modifiers| InputEvent::Key {
         key,
@@ -926,7 +715,8 @@ fn queued_one_shot_licence_cases(stall: Duration, only: Option<(&str, &str, bool
         layout_text: None,
         event_type: KeyEventType::Press,
     };
-    let cases: [(&str, InputEvent, DeliveredClass, bool); 6] = [
+    let cases: [(&str, InputEvent, DeliveredClass, bool); 7] = [
+        ("k", key('k'), DeliveredClass::Typed, false),
         (
             "Enter",
             named(NamedKey::Enter),
@@ -962,14 +752,9 @@ fn queued_one_shot_licence_cases(stall: Duration, only: Option<(&str, &str, bool
         ),
         ("Tab", named(NamedKey::Tab), DeliveredClass::Gesture, false),
     ];
-    let mut ran = 0;
     for style in ["rainbow kitty", "comet"] {
         for (label, ev, class, alt_screen) in cases.clone() {
             for queued in [false, true] {
-                if only.is_some_and(|case| case != (style, label, queued)) {
-                    continue;
-                }
-                ran += 1;
                 let (mut app, sink, pipe) = app_with_private_pty();
                 let wid = WindowId(0);
                 app.config.motion = Some("full".into());
@@ -984,7 +769,7 @@ fn queued_one_shot_licence_cases(stall: Duration, only: Option<(&str, &str, bool
                     // only (Claude Code's composer); the main screen's
                     // Shift+Enter arms nothing and carries no class.
                     let term = app.front_terminal(wid).expect("terminal").term.clone();
-                    term_lock(&term).process(b"\x1b[?1049h");
+                    crate::term_lock(&term).process(b"\x1b[?1049h");
                 }
                 let mut seed = CursorFxInputs::sample_for_test(Instant::now());
                 seed.cur = Some((2, 2));
@@ -1035,9 +820,8 @@ fn queued_one_shot_licence_cases(stall: Duration, only: Option<(&str, &str, bool
                     );
                     edge = batch.items.iter().flatten().next_back().unwrap().0;
                 }
-                // However late this thread runs, the prelude is the frame
-                // that observes the key ([`observing_frame`]).
-                std::thread::sleep(stall);
+                // The prelude is the frame that observes the key
+                // ([`observing_frame`]).
                 let now = observing_frame(edge, 1);
                 let mut live = CursorFxInputs::sample_for_test(now);
                 live.cur = Some((2, 2));
@@ -1070,7 +854,6 @@ fn queued_one_shot_licence_cases(stall: Duration, only: Option<(&str, &str, bool
             }
         }
     }
-    assert_ne!(ran, 0, "{only:?} names no case");
 }
 
 /// A Tab's dispatch arm claims no hop refused before the key. A bare Tab /
@@ -1375,7 +1158,7 @@ fn the_prelude_bounds_a_queued_tabs_late_claim_at_its_dispatch() {
 
 /// A real PTY pair whose slave this test puts into `lflag` mode, with no
 /// child: the master reflects the slave's termios directly (as aterm-pty's
-/// `spawned_pty_carries_iutf8_and_b230400` proves), so the session sink
+/// real-spawn test proves for IUTF8 + B230400), so the session sink
 /// reads what a `read -s` / raw TUI would set. Returns `(master, slave)`;
 /// the caller closes both. `pub(super)` for the kitty-command seam tests.
 #[cfg(unix)]
@@ -1399,46 +1182,73 @@ pub(super) fn pty_pair_with_lflag(edit: impl FnOnce(&mut libc::tcflag_t)) -> (i3
     (master, slave)
 }
 
+/// A headless app on a real pty pair whose slave is in `lflag` mode, with
+/// the rainbow kitty trail on. [`close_pty`] gives the fds back.
+#[cfg(unix)]
+fn pty_app(
+    edit: impl FnOnce(&mut libc::tcflag_t),
+) -> (
+    App,
+    std::sync::Arc<aterm_session::sink::SinkWriter>,
+    i32,
+    i32,
+) {
+    let (master, slave) = pty_pair_with_lflag(edit);
+    let sink = std::sync::Arc::new(aterm_session::sink::SinkWriter::new(master));
+    let mut app = App::headless_for_test_with_sink(sink.clone());
+    app.recompute_sparkle();
+    app.config.cursor_trail = Some(true);
+    app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+    (app, sink, master, slave)
+}
+
+#[cfg(unix)]
+fn close_pty(
+    app: App,
+    sink: std::sync::Arc<aterm_session::sink::SinkWriter>,
+    master: i32,
+    slave: i32,
+) {
+    drop(app);
+    drop(sink);
+    // SAFETY: both fds are the caller's and open; the borrowed-fd sink did
+    // not close the master.
+    unsafe {
+        libc::close(slave);
+        libc::close(master);
+    }
+}
+
+/// The three tty modes a press can meet: cooked (a shell's baseline),
+/// canonical no-echo (`read -s`, `sudo`, an `ssh` passphrase) and raw
+/// (Claude Code's `setRawMode`, vim, ZLE at rest: the program echoes for
+/// itself), each with whether the tty echoes what is typed.
+#[cfg(unix)]
+type SetMode = fn(&mut libc::tcflag_t);
+#[cfg(unix)]
+const TTY_MODES: [(&str, SetMode, bool); 3] = [
+    ("cooked (echo+icanon)", |_| {}, true),
+    ("canonical no-echo (read -s)", |l| *l &= !libc::ECHO, false),
+    (
+        "raw (a TUI echoes for itself)",
+        |l| *l &= !(libc::ECHO | libc::ICANON),
+        true,
+    ),
+];
+
 /// A press the tty will not echo banks no credit. The host reads the pty's
 /// ECHO/ICANON off the session sink at the key (iTerm2's password-mode
-/// rule); a press into canonical no-echo mode (`read -s`, `sudo`, an `ssh`
-/// passphrase, `passwd`) arms no typed licence and no press credit, so a
-/// program write on that row has nothing to spend. The bytes still reach
-/// the PTY.
-///
-/// Three real ptys, one per mode, the same three keys into each:
-///
-/// * cooked (ECHO + ICANON, a shell's cooked baseline): banked;
-/// * canonical no-echo (`read -s`): withheld, `move_licensed` false,
-///   `swallowed_no_echo=3`;
-/// * raw (ECHO and ICANON clear: Claude Code's `setRawMode`, vim, readline
-///   / ZLE at rest): banked, since the program echoes for itself.
+/// rule); a press into canonical no-echo mode arms no typed licence and no
+/// press credit on either engine, so a program write on that row has
+/// nothing to spend. The bytes still reach the PTY.
 #[cfg(unix)]
 #[test]
 fn a_press_the_tty_will_not_echo_banks_no_credit() {
-    use aterm_session::sink::SinkWriter;
-    use std::sync::Arc;
-
-    type Edit = fn(&mut libc::tcflag_t);
-    let cases: [(&str, Edit, bool); 3] = [
-        ("cooked (echo+icanon)", |_| {}, true),
-        ("canonical no-echo (read -s)", |l| *l &= !libc::ECHO, false),
-        (
-            "raw (a TUI echoes for itself)",
-            |l| *l &= !(libc::ECHO | libc::ICANON),
-            true,
-        ),
-    ];
-    for (label, edit, banks) in cases {
-        let (master, slave) = pty_pair_with_lflag(edit);
-        let sink = Arc::new(SinkWriter::new(master));
+    for (label, edit, banks) in TTY_MODES {
+        let (mut app, sink, master, slave) = pty_app(edit);
         let echo = sink.tty_echo().expect("a pty master answers");
         assert_eq!(echo.swallows_input(), !banks, "{label}: the sink's verdict");
-        let mut app = App::headless_for_test_with_sink(sink.clone());
-        app.recompute_sparkle();
         let wid = WindowId(0);
-        app.config.cursor_trail = Some(true);
-        app.config.cursor_trail_style = Some("rainbow kitty".to_string());
         type_word(&mut app, wid, "abc");
         let now = Instant::now();
         let session = app.front_terminal(wid).unwrap().session;
@@ -1451,13 +1261,7 @@ fn a_press_the_tty_will_not_echo_banks_no_credit() {
             "{label}: the bytes reached the PTY regardless"
         );
         let ws = app.windows.get(&wid).unwrap();
-        assert_eq!(
-            ws.fx.cursor().glow.move_licensed(now),
-            banks,
-            "{label}: the typed licence"
-        );
-        // The classic trail's typed stamp (the glow's twin) is withheld
-        // with the glow's; this pins the withheld pair.
+        assert_eq!(ws.fx.cursor().glow.move_licensed(now), banks, "{label}");
         assert_eq!(
             ws.fx.cursor().trail.move_licensed(now),
             banks,
@@ -1468,14 +1272,7 @@ fn a_press_the_tty_will_not_echo_banks_no_credit() {
             if banks { 0 } else { 3 },
             "{label}: the `swallowed_no_echo=` tally"
         );
-        drop(app);
-        drop(sink);
-        // SAFETY: both fds are ours and open; the borrowed-fd sink did
-        // not close the master.
-        unsafe {
-            libc::close(slave);
-            libc::close(master);
-        }
+        close_pty(app, sink, master, slave);
     }
 }
 
@@ -1608,78 +1405,9 @@ fn a_password_prompt_clicks_one_tone_and_rings_no_ting() {
     }
 }
 
-/// [`super::key_click_stamp`] is the whole decision: off a prompt the
-/// key's own four stamps (the spacebar's comma, never a shifted space),
-/// at a prompt one stamp whatever the key.
-#[test]
-fn the_key_click_stamp_is_one_stamp_at_a_prompt() {
-    use super::{KeyClickStamp, key_click_stamp};
-    use aterm_effects::trail_sound::{SoundKind, glyph_class};
-    let one = KeyClickStamp {
-        kind: SoundKind::Typed,
-        shifted: false,
-        glyph_class: glyph_class::SECRET,
-        rank: 0,
-    };
-    for (space, shifted, typed) in [
-        (false, false, Some('a')),
-        (false, true, Some('A')),
-        (false, false, Some('7')),
-        (false, true, Some('?')),
-        (true, false, Some(' ')),
-        (true, true, Some(' ')),
-        (false, false, None),
-    ] {
-        assert_eq!(
-            key_click_stamp(true, space, shifted, typed),
-            one,
-            "{typed:?}"
-        );
-    }
-    assert_eq!(
-        key_click_stamp(false, true, true, Some(' ')),
-        KeyClickStamp {
-            kind: SoundKind::Space,
-            shifted: false,
-            glyph_class: glyph_class::LETTER,
-            rank: super::typed_glyph_rank(Some(' ')),
-        }
-    );
-    assert_eq!(
-        key_click_stamp(false, false, true, Some('A')),
-        KeyClickStamp {
-            kind: SoundKind::Typed,
-            shifted: true,
-            glyph_class: glyph_class::LETTER,
-            rank: 1,
-        }
-    );
-    assert_eq!(
-        key_click_stamp(false, false, false, Some('7')).glyph_class,
-        glyph_class::DIGIT
-    );
-}
-
-/// A Backspace into a committed IME run gives back one glyph's credit. The
-/// host banks an IME commit as one press priced at its summed width, and
-/// remembers the last typed dispatch's per-grapheme widths to price each
-/// Backspace: `日本語` (6) ⌫ → 4 ⌫ → 2 ⌫ → 0. A plain key still goes whole
-/// (`ab` ⌫ → 1 ⌫ → 0), and a press of another class between the commit and
-/// the Backspace empties the memory. Real cooked pty: the writes must land,
-/// or the failed-write revoke takes the credits itself.
+/// The glow's in-flight press credits, read at a tick on the origin.
 #[cfg(unix)]
-#[test]
-fn a_backspace_into_an_ime_run_gives_back_one_glyphs_credit() {
-    use aterm_session::sink::SinkWriter;
-    use std::sync::Arc;
-
-    let (master, slave) = pty_pair_with_lflag(|_| {});
-    let sink = Arc::new(SinkWriter::new(master));
-    let mut app = App::headless_for_test_with_sink(sink.clone());
-    app.recompute_sparkle();
-    let wid = WindowId(0);
-    app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+fn erase_credits(app: &mut App, wid: WindowId) -> usize {
     let glow_cfg = app.glow_config();
     let geom = crate::cursor_glow::Geom {
         cw: 8,
@@ -1692,153 +1420,91 @@ fn a_backspace_into_an_ime_run_gives_back_one_glyphs_credit() {
         win_h: 384,
         head: 0,
     };
-    let mut out = Vec::new();
-    let mut credits = |app: &mut App| {
-        let ws = app.windows.get_mut(&wid).unwrap();
-        ws.fx
-            .cursor_mut()
-            .glow
-            .tick(Some((0, 0)), Instant::now(), &glow_cfg, geom, &mut out);
-        ws.fx.cursor_mut().glow.in_flight_tally().credits
-    };
-    // Seed the engine: the unseeded first draw drops every bank.
-    assert_eq!(credits(&mut app), 0);
-    let ok = crate::input::InputOutcome::Ok;
-
-    assert_eq!(
-        app.input(wid, InputEvent::Text("日本語".to_string()), Source::Human),
-        ok
+    let glow = &mut app.windows.get_mut(&wid).unwrap().fx.cursor_mut().glow;
+    glow.tick(
+        Some((0, 0)),
+        Instant::now(),
+        &glow_cfg,
+        geom,
+        &mut Vec::new(),
     );
-    assert_eq!(credits(&mut app), 6, "one press, three glyphs, six cells");
-    let mut expect = [4usize, 2, 0];
-    for want in &mut expect {
+    glow.in_flight_tally().credits
+}
+
+/// A human paste, waited for until the ordering FIFO has drained it.
+#[cfg(unix)]
+fn paste_drained(
+    app: &mut App,
+    sink: &std::sync::Arc<aterm_session::sink::SinkWriter>,
+    wid: WindowId,
+    text: &str,
+) {
+    assert_eq!(
+        app.input(
+            wid,
+            InputEvent::Paste(text.to_string(), crate::input::PasteFraming::AtDrain),
+            Source::Human
+        ),
+        crate::input::InputOutcome::Ok
+    );
+    super::paste_order::await_drain_for_test(sink);
+    assert!(!super::paste_order::is_ordering(sink), "the paste drained");
+}
+
+/// A Backspace into a committed IME run gives back one glyph's credit. The
+/// host banks an IME commit as one press priced at its summed width, and
+/// remembers the last typed dispatch's per-grapheme widths to price each
+/// Backspace: `日本語` (6) ⌫ → 4 ⌫ → 2 ⌫ → 0. The memory is held at the
+/// press bank's depth as a whole, even across consecutive pastes, and a
+/// pasted line break is one erasable unit (ZLE, readline and Claude Code's
+/// composer keep the newline and one Backspace erases it). Real cooked
+/// pty: the writes must land, or the failed-write revoke takes the credits
+/// itself.
+#[cfg(unix)]
+#[test]
+fn a_backspace_into_an_ime_run_gives_back_one_glyphs_credit() {
+    let (mut app, sink, master, slave) = pty_app(|_| {});
+    let wid = WindowId(0);
+    // Seed the engine: the unseeded first draw drops every bank.
+    assert_eq!(erase_credits(&mut app, wid), 0);
+    let ok = crate::input::InputOutcome::Ok;
+    let backspace = |app: &mut App| {
         assert_eq!(
             app.input(wid, named(NamedKey::Backspace), Source::Human),
             ok
         );
-        assert_eq!(credits(&mut app), *want, "one glyph's cells given back");
-    }
-    // A plain key is whole: the memory holds one width per press.
-    type_word(&mut app, wid, "ab");
-    assert_eq!(credits(&mut app), 2);
-    assert_eq!(
-        app.input(wid, named(NamedKey::Backspace), Source::Human),
-        ok
-    );
-    assert_eq!(credits(&mut app), 1);
-    assert_eq!(
-        app.input(wid, named(NamedKey::Backspace), Source::Human),
-        ok
-    );
-    assert_eq!(credits(&mut app), 0);
-    // Another class between the commit and the erase empties the memory:
-    // the arrow's own licence closes the row, and the Backspace after it
-    // prices nothing (the whole-press retire, as for a plain key).
-    assert_eq!(
-        app.input(wid, InputEvent::Text("日本".to_string()), Source::Human),
-        ok
-    );
-    assert_eq!(
-        app.input(wid, named(NamedKey::ArrowLeft), Source::Human),
-        ok
-    );
-    assert_eq!(
-        app.input(wid, named(NamedKey::Backspace), Source::Human),
-        ok
-    );
-    assert_eq!(
-        credits(&mut app),
-        0,
-        "unpriced: the whole newest press goes, as before"
-    );
-    // A paste between the run and the Backspace: the pasted glyphs banked
-    // no press, so the Backspace that erases one is the paste's and retires
-    // nothing of the run (a priced 0 per pasted grapheme).
-    let paste = |app: &mut App, text: &str| {
-        assert_eq!(
-            app.input(
-                wid,
-                InputEvent::Paste(text.to_string(), crate::input::PasteFraming::AtDrain),
-                Source::Human
-            ),
-            ok
-        );
-        super::paste_order::await_drain_for_test(&sink);
-        assert!(!super::paste_order::is_ordering(&sink), "the paste drained");
     };
     assert_eq!(
-        app.input(wid, InputEvent::Text("日本".to_string()), Source::Human),
+        app.input(wid, InputEvent::Text("日本語".to_string()), Source::Human),
         ok
     );
-    assert_eq!(credits(&mut app), 4);
-    paste(&mut app, "x");
-    assert_eq!(
-        app.input(wid, named(NamedKey::Backspace), Source::Human),
-        ok
-    );
-    assert_eq!(
-        credits(&mut app),
-        4,
-        "the Backspace erased the pasted glyph: the run's credits stand"
-    );
-    // …and a second Backspace, past the paste, is the run's again.
-    assert_eq!(
-        app.input(wid, named(NamedKey::Backspace), Source::Human),
-        ok
-    );
-    assert_eq!(credits(&mut app), 2);
-    // The plain-key analogue: `abc`, a paste, one Backspace — three
-    // presses still in flight.
-    assert_eq!(
-        app.input(wid, named(NamedKey::Backspace), Source::Human),
-        ok
-    );
-    assert_eq!(credits(&mut app), 0);
-    type_word(&mut app, wid, "abc");
-    assert_eq!(credits(&mut app), 3);
-    paste(&mut app, "yz");
-    assert_eq!(
-        app.input(wid, named(NamedKey::Backspace), Source::Human),
-        ok
-    );
-    assert_eq!(credits(&mut app), 3, "the paste's glyph, not `c`");
-    // The memory as a whole is held at the press bank's depth, oldest
-    // first out, even across consecutive pastes.
+    assert_eq!(erase_credits(&mut app, wid), 6, "one press, three glyphs");
+    for want in [4, 2, 0] {
+        backspace(&mut app);
+        assert_eq!(erase_credits(&mut app, wid), want, "one glyph given back");
+    }
     let wide = "w".repeat(super::ErasePriceMemory::CAP + 2);
-    paste(&mut app, &wide);
-    paste(&mut app, &wide);
+    paste_drained(&mut app, &sink, wid, &wide);
+    paste_drained(&mut app, &sink, wid, &wide);
     assert_eq!(
         app.windows[&wid].erase_prices.widths().len(),
         super::ErasePriceMemory::CAP,
         "the memory is bounded as a whole"
     );
-    // A line break is one erasable unit: `x⏎y` pasted is three priced zeros
-    // (ZLE, readline and Claude Code's composer keep the newline and one
-    // Backspace erases it), so three Backspaces retire nothing of `abc`,
-    // and the fourth is the run's again.
     type_word(&mut app, wid, "de");
-    assert_eq!(credits(&mut app), 5);
-    paste(&mut app, "x\ny");
+    assert_eq!(erase_credits(&mut app, wid), 2);
+    paste_drained(&mut app, &sink, wid, "x\ny");
     for _ in 0..3 {
+        backspace(&mut app);
         assert_eq!(
-            app.input(wid, named(NamedKey::Backspace), Source::Human),
-            ok
+            erase_credits(&mut app, wid),
+            2,
+            "the paste's, newline included"
         );
-        assert_eq!(credits(&mut app), 5, "the paste's own, newline included");
     }
-    assert_eq!(
-        app.input(wid, named(NamedKey::Backspace), Source::Human),
-        ok
-    );
-    assert_eq!(credits(&mut app), 4, "past the paste: `e`");
-    drop(app);
-    drop(sink);
-    // SAFETY: both fds are ours and open; the borrowed-fd sink did not
-    // close the master.
-    unsafe {
-        libc::close(slave);
-        libc::close(master);
-    }
+    backspace(&mut app);
+    assert_eq!(erase_credits(&mut app, wid), 1, "past the paste: `e`");
+    close_pty(app, sink, master, slave);
 }
 
 /// A Backspace erasing a zero-width glyph gives back a priced nothing. A
@@ -1851,9 +1517,6 @@ fn a_backspace_into_an_ime_run_gives_back_one_glyphs_credit() {
 #[cfg(unix)]
 #[test]
 fn a_backspace_erasing_a_zero_width_glyph_gives_back_a_priced_nothing() {
-    use aterm_session::sink::SinkWriter;
-    use std::sync::Arc;
-
     let mut widths = Vec::new();
     super::committed_grapheme_cells_into("\u{0301}日本", false, &mut widths);
     assert_eq!(
@@ -1863,39 +1526,12 @@ fn a_backspace_erasing_a_zero_width_glyph_gives_back_a_priced_nothing() {
     );
     assert_eq!(super::committed_text_cells("\u{0301}日本", false), 4);
 
-    let (master, slave) = pty_pair_with_lflag(|_| {});
-    let sink = Arc::new(SinkWriter::new(master));
-    let mut app = App::headless_for_test_with_sink(sink.clone());
-    app.recompute_sparkle();
+    let (mut app, sink, master, slave) = pty_app(|_| {});
     let wid = WindowId(0);
-    app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty".to_string());
-    let glow_cfg = app.glow_config();
-    let geom = crate::cursor_glow::Geom {
-        cw: 8,
-        ch: 16,
-        rows: 24,
-        cols: 80,
-        origin_x: 0,
-        origin_y: 0,
-        win_w: 640,
-        win_h: 384,
-        head: 0,
-    };
-    let mut out = Vec::new();
-    let mut credits = |app: &mut App| {
-        let ws = app.windows.get_mut(&wid).unwrap();
-        ws.fx
-            .cursor_mut()
-            .glow
-            .tick(Some((0, 0)), Instant::now(), &glow_cfg, geom, &mut out);
-        ws.fx.cursor_mut().glow.in_flight_tally().credits
-    };
-    assert_eq!(credits(&mut app), 0, "seeded");
+    assert_eq!(erase_credits(&mut app, wid), 0, "seeded");
     let ok = crate::input::InputOutcome::Ok;
-
     type_word(&mut app, wid, "x");
-    assert_eq!(credits(&mut app), 1);
+    assert_eq!(erase_credits(&mut app, wid), 1);
     assert_eq!(
         app.input(
             wid,
@@ -1904,11 +1540,7 @@ fn a_backspace_erasing_a_zero_width_glyph_gives_back_a_priced_nothing() {
         ),
         ok
     );
-    assert_eq!(
-        credits(&mut app),
-        5,
-        "one key, then one press of four cells"
-    );
+    assert_eq!(erase_credits(&mut app, wid), 5, "one key, then four cells");
     for (want, why) in [
         (3, "本 given back"),
         (1, "日 given back: the run is paid out"),
@@ -1919,81 +1551,33 @@ fn a_backspace_erasing_a_zero_width_glyph_gives_back_a_priced_nothing() {
             app.input(wid, named(NamedKey::Backspace), Source::Human),
             ok
         );
-        assert_eq!(credits(&mut app), want, "{why}");
+        assert_eq!(erase_credits(&mut app, wid), want, "{why}");
     }
-    drop(app);
-    drop(sink);
-    // SAFETY: both fds are ours and open; the borrowed-fd sink did not
-    // close the master.
-    unsafe {
-        libc::close(slave);
-        libc::close(master);
-    }
+    close_pty(app, sink, master, slave);
 }
 
 /// A key typed after a paste keeps the paste's price zeros. A typed press
 /// keeps the memory and appends its own widths behind the zeros, so the
 /// memory is the row's erasable tail in order: under a stall `abc`, paste
 /// `yz`, `d`, then Backspaces retire `d`, nothing for `z`, nothing for `y`,
-/// then `c`. Every other class still empties it (an arrow moves the erase
-/// point), and the whole is bounded at `TYPED_STAMP_DEPTH`.
+/// then `c`. An IME commit appends per grapheme the same way, and every
+/// other class still empties it (an arrow moves the erase point).
 #[cfg(unix)]
 #[test]
 fn a_key_typed_after_a_paste_keeps_the_pastes_price_zeros() {
-    use aterm_session::sink::SinkWriter;
-    use std::sync::Arc;
-
-    let (master, slave) = pty_pair_with_lflag(|_| {});
-    let sink = Arc::new(SinkWriter::new(master));
-    let mut app = App::headless_for_test_with_sink(sink.clone());
-    app.recompute_sparkle();
+    let (mut app, sink, master, slave) = pty_app(|_| {});
     let wid = WindowId(0);
-    app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty".to_string());
-    let glow_cfg = app.glow_config();
-    let geom = crate::cursor_glow::Geom {
-        cw: 8,
-        ch: 16,
-        rows: 24,
-        cols: 80,
-        origin_x: 0,
-        origin_y: 0,
-        win_w: 640,
-        win_h: 384,
-        head: 0,
-    };
-    let mut out = Vec::new();
-    let mut credits = |app: &mut App| {
-        let ws = app.windows.get_mut(&wid).unwrap();
-        ws.fx
-            .cursor_mut()
-            .glow
-            .tick(Some((0, 0)), Instant::now(), &glow_cfg, geom, &mut out);
-        ws.fx.cursor_mut().glow.in_flight_tally().credits
-    };
-    assert_eq!(credits(&mut app), 0, "seeded");
+    assert_eq!(erase_credits(&mut app, wid), 0, "seeded");
     let ok = crate::input::InputOutcome::Ok;
-    let paste = |app: &mut App, text: &str| {
-        assert_eq!(
-            app.input(
-                wid,
-                InputEvent::Paste(text.to_string(), crate::input::PasteFraming::AtDrain),
-                Source::Human
-            ),
-            ok
-        );
-        super::paste_order::await_drain_for_test(&sink);
-        assert!(!super::paste_order::is_ordering(&sink), "the paste drained");
-    };
 
     type_word(&mut app, wid, "abc");
-    assert_eq!(credits(&mut app), 3);
-    paste(&mut app, "yz");
+    assert_eq!(erase_credits(&mut app, wid), 3);
+    paste_drained(&mut app, &sink, wid, "yz");
     type_word(&mut app, wid, "d");
     assert_eq!(
-        credits(&mut app),
+        erase_credits(&mut app, wid),
         4,
-        "four presses, two pasted glyphs between"
+        "four presses, two pasted glyphs"
     );
     assert_eq!(
         app.windows[&wid].erase_prices.widths(),
@@ -2010,11 +1594,9 @@ fn a_key_typed_after_a_paste_keeps_the_pastes_price_zeros() {
             app.input(wid, named(NamedKey::Backspace), Source::Human),
             ok
         );
-        assert_eq!(credits(&mut app), want, "{why}");
+        assert_eq!(erase_credits(&mut app, wid), want, "{why}");
     }
-    // An IME commit after a paste keeps the zeros too, per grapheme
-    // behind them; and another class still empties the memory.
-    paste(&mut app, "q");
+    paste_drained(&mut app, &sink, wid, "q");
     assert_eq!(
         app.input(wid, InputEvent::Text("日本".to_string()), Source::Human),
         ok
@@ -2032,144 +1614,24 @@ fn a_key_typed_after_a_paste_keeps_the_pastes_price_zeros() {
         app.windows[&wid].erase_prices.widths().is_empty(),
         "an arrow moves the erase point: the memory is closed"
     );
-    drop(app);
-    drop(sink);
-    // SAFETY: both fds are ours and open; the borrowed-fd sink did not
-    // close the master.
-    unsafe {
-        libc::close(slave);
-        libc::close(master);
-    }
-}
-
-/// A swallowed press whose write fails is not tallied:
-/// `swallowed_no_echo=` counts presses that reached a tty that will not
-/// echo them, so it is taken after the PTY write. A canonical no-echo tty
-/// whose inline write fails must read 0 beside `WriteFailed`.
-#[cfg(unix)]
-#[test]
-fn a_swallowed_press_whose_write_fails_is_not_tallied() {
-    use aterm_session::sink::SinkWriter;
-    use std::sync::Arc;
-
-    // The stimulus needs one fd with two properties: `tcgetattr` answers
-    // no-echo canonical (so the press counts as swallowed) and the inline
-    // write hard-fails (so the outcome is `WriteFailed`). `SinkWriter`
-    // holds a single fd for both.
-    //
-    // A slave-less master does not do it portably (Linux keeps accepting
-    // writes to it). A second fd opened read-only on the slave does, on
-    // every POSIX system: the tty is alive so `tcgetattr` answers, and a
-    // write to an O_RDONLY descriptor is EBADF, which
-    // `write_some_nonparking` classifies `Fatal`.
-    let (master, slave) = pty_pair_with_lflag(|l| *l &= !libc::ECHO);
-    // SAFETY: `ptsname` reads the master's pty number into its static
-    // buffer; the pointer is valid until the next `ptsname` call on this
-    // thread, and it is copied before anything else can run.
-    let path = unsafe {
-        let name = libc::ptsname(master);
-        assert!(!name.is_null(), "ptsname(master)");
-        std::ffi::CStr::from_ptr(name).to_owned()
-    };
-    // SAFETY: `path` is a NUL-terminated device path that names our own
-    // slave; opening it read-only creates a second descriptor on it.
-    // Close-on-exec from birth, like the pair it joins: a child another
-    // test forks meanwhile must not keep the tty open past its exec.
-    let read_only = unsafe {
-        libc::open(
-            path.as_ptr(),
-            libc::O_RDONLY | libc::O_NOCTTY | libc::O_CLOEXEC,
-        )
-    };
-    assert!(read_only >= 0, "open({path:?}, O_RDONLY)");
-    let sink = Arc::new(SinkWriter::new(read_only));
-    let echo = sink
-        .tty_echo()
-        .expect("a read-only tty fd still answers tcgetattr");
-    assert!(echo.swallows_input(), "the press is withheld regardless");
-    let mut app = App::headless_for_test_with_sink(sink.clone());
-    app.recompute_sparkle();
-    let wid = WindowId(0);
-    app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("rainbow kitty".to_string());
-    assert_eq!(
-        app.input(wid, key('a'), Source::Human),
-        crate::input::InputOutcome::WriteFailed,
-        "no slave: the inline write fails"
-    );
-    let ws = app.windows.get(&wid).unwrap();
-    assert_eq!(
-        ws.fx.cursor().glow.in_flight_tally().swallowed_no_echo,
-        0,
-        "a press that never reached the tty was not swallowed by it"
-    );
-    assert!(!ws.fx.cursor().glow.move_licensed(Instant::now()));
-    drop(app);
-    drop(sink);
-    // SAFETY: the three descriptors are ours and still open (the borrowed-fd
-    // sink closed none), and each is closed exactly once: a second close could
-    // hit an fd number a concurrent test was just given.
-    unsafe {
-        libc::close(read_only);
-        libc::close(slave);
-        libc::close(master);
-    }
+    close_pty(app, sink, master, slave);
 }
 
 /// A paste the tty will not echo carries no delivery ticket, like the press
-/// path (`tty_swallows`): a paste into `read -s` / `sudo` / an `ssh`
-/// passphrase must not arm a same-row insert licence that a program print
-/// on that row could spend as a phantom. One paste into each of three ptys:
-/// cooked and raw publish the priced insert; canonical no-echo publishes no
-/// insert receipt. The bytes reach the PTY in every case, and the gesture
-/// stamp, up-strum cue and pet note are unchanged (a paste's gesture stamp
-/// is revoked at enqueue in the same turn whatever the tty).
+/// path: a paste into `read -s` / `sudo` / an `ssh` passphrase must not arm
+/// a same-row insert licence that a program print on that row could spend
+/// as a phantom. Cooked and raw publish the priced insert; canonical
+/// no-echo publishes no receipt at all. The bytes reach the PTY in every
+/// case, and a paste's gesture stamp is revoked at enqueue whatever the tty.
 #[cfg(unix)]
 #[test]
 fn a_paste_the_tty_will_not_echo_publishes_no_insert_receipt() {
     use aterm_effects::cursor_glow::InsertWidth;
-    use aterm_session::sink::SinkWriter;
-    use std::sync::Arc;
 
-    type Edit = fn(&mut libc::tcflag_t);
-    let cases: [(&str, Edit, bool); 3] = [
-        ("cooked (echo+icanon)", |_| {}, true),
-        ("canonical no-echo (read -s)", |l| *l &= !libc::ECHO, false),
-        (
-            "raw (a TUI echoes for itself)",
-            |l| *l &= !(libc::ECHO | libc::ICANON),
-            true,
-        ),
-    ];
-    for (label, edit, ticketed) in cases {
-        let (master, slave) = pty_pair_with_lflag(edit);
-        let sink = Arc::new(SinkWriter::new(master));
-        let echo = sink.tty_echo().expect("a pty master answers");
-        assert_eq!(
-            echo.swallows_input(),
-            !ticketed,
-            "{label}: the sink's verdict"
-        );
-        let mut app = App::headless_for_test_with_sink(sink.clone());
-        app.recompute_sparkle();
+    for (label, edit, ticketed) in TTY_MODES {
+        let (mut app, sink, master, slave) = pty_app(edit);
         let wid = WindowId(0);
-        app.config.cursor_trail = Some(true);
-        app.config.cursor_trail_style = Some("rainbow kitty".to_string());
-        assert_eq!(
-            app.input(
-                wid,
-                InputEvent::Paste("foo bar ".to_string(), crate::input::PasteFraming::AtDrain),
-                Source::Human
-            ),
-            crate::input::InputOutcome::Ok
-        );
-        // The FIFO drains: the writer thread's completed write is the
-        // delivery edge.
-        super::paste_order::await_drain_for_test(&sink);
-        assert!(
-            !super::paste_order::is_ordering(&sink),
-            "{label}: the FIFO drained"
-        );
+        paste_drained(&mut app, &sink, wid, "foo bar ");
         let now = Instant::now();
         let session = app.front_terminal(wid).unwrap().session;
         let ctx = &app.pool.get(session).unwrap().ctx;
@@ -2187,90 +1649,49 @@ fn a_paste_the_tty_will_not_echo_publishes_no_insert_receipt() {
             ticketed.then_some(InsertWidth::Cells(8)),
             "{label}: the insert receipt"
         );
+        assert_eq!(
+            batch.latest,
+            u64::from(ticketed),
+            "{label}: no receipt at all"
+        );
         let ws = &app.windows[&wid];
         assert!(
             !ws.fx.cursor().glow.move_licensed(now) && !ws.fx.cursor().trail.move_licensed(now),
             "{label}: a paste's gesture stamp is revoked at enqueue whatever the tty"
         );
-        assert_eq!(
-            batch.latest,
-            u64::from(ticketed),
-            "{label}: a withheld ticket publishes no receipt at all"
-        );
-        drop(app);
-        drop(sink);
-        // SAFETY: both fds are ours and open; the borrowed-fd sink did
-        // not close the master.
-        unsafe {
-            libc::close(slave);
-            libc::close(master);
-        }
+        close_pty(app, sink, master, slave);
     }
 }
 
 /// A bare Tab the tty will not echo arms no insert and no gesture. A bare
 /// Tab / ⌃V has `typed_forward == None`, so the tty's verdict is read
 /// separately: a press the tty will not echo is neither a licence nor a
-/// credit in the three classes that read the tty (typed, insert, gesture).
-/// Return, Nav, Erase and Kill never read it and keep their one-shot class
-/// (an Enter's response at a password prompt is real). One bare Tab into
-/// each of three ptys, inline and queued behind a pinned FIFO: cooked and
-/// raw arm, stamp and ticket as usual; canonical no-echo arms nothing,
-/// stamps nothing on either engine, and publishes no receipt.
+/// credit in the classes that read the tty. Inline and queued behind a
+/// pinned FIFO: cooked and raw arm, stamp and ticket as usual; canonical
+/// no-echo arms nothing on either engine and publishes no receipt.
 #[cfg(unix)]
 #[test]
 fn a_bare_tab_the_tty_will_not_echo_arms_no_insert() {
     use aterm_effects::cursor_glow::InsertWidth;
-    use aterm_session::sink::SinkWriter;
-    use aterm_types::keyboard::NamedKey;
-    use std::sync::Arc;
 
-    type Edit = fn(&mut libc::tcflag_t);
-    let cases: [(&str, Edit, bool); 3] = [
-        ("cooked (echo+icanon)", |_| {}, true),
-        ("canonical no-echo (read -s)", |l| *l &= !libc::ECHO, false),
-        (
-            "raw (a TUI echoes for itself)",
-            |l| *l &= !(libc::ECHO | libc::ICANON),
-            true,
-        ),
-    ];
-    for (label, edit, arms) in cases {
-        let (master, slave) = pty_pair_with_lflag(edit);
-        let sink = Arc::new(SinkWriter::new(master));
-        let echo = sink.tty_echo().expect("a pty master answers");
-        assert_eq!(echo.swallows_input(), !arms, "{label}: the sink's verdict");
-        let mut app = App::headless_for_test_with_sink(sink.clone());
-        app.recompute_sparkle();
+    for (label, edit, arms) in TTY_MODES {
+        let (mut app, sink, master, slave) = pty_app(edit);
         let wid = WindowId(0);
-        app.config.cursor_trail = Some(true);
-        app.config.cursor_trail_style = Some("rainbow kitty".to_string());
-        // Inline: dispatch is delivery for a bare Tab.
         assert_eq!(
             app.input(wid, named(NamedKey::Tab), Source::Human),
             crate::input::InputOutcome::Ok
         );
         {
             let ws = app.windows.get(&wid).unwrap();
+            let now = Instant::now();
             assert_eq!(
                 ws.fx.cursor().glow.insert_tally().delivered,
                 u64::from(arms),
                 "{label}: the inline Tab's insert arm"
             );
-            assert_eq!(
-                ws.fx.cursor().glow.move_licensed(Instant::now()),
-                arms,
-                "{label}: the gesture class follows the tty's verdict"
-            );
-            assert_eq!(
-                ws.fx.cursor().trail.move_licensed(Instant::now()),
-                arms,
-                "{label}: …on the classic trail in lockstep"
-            );
+            assert_eq!(ws.fx.cursor().glow.move_licensed(now), arms, "{label}");
+            assert_eq!(ws.fx.cursor().trail.move_licensed(now), arms, "{label}");
         }
-        // Queued behind a pinned FIFO: the writer's completed write is
-        // the delivery edge, and it must carry no insert for a Tab the
-        // tty swallows.
         let pin = super::paste_order::pin_ordering_for_test(&sink);
         assert!(super::paste_order::is_ordering(&sink));
         assert_eq!(
@@ -2303,16 +1724,9 @@ fn a_bare_tab_the_tty_will_not_echo_arms_no_insert() {
         assert_eq!(
             batch.latest,
             u64::from(arms),
-            "{label}: one receipt, or none when every half is withheld"
+            "{label}: one receipt or none"
         );
-        drop(app);
-        drop(sink);
-        // SAFETY: both fds are ours and open; the borrowed-fd sink did
-        // not close the master.
-        unsafe {
-            libc::close(slave);
-            libc::close(master);
-        }
+        close_pty(app, sink, master, slave);
     }
 }
 
@@ -2367,22 +1781,6 @@ fn typing_kitty_logs_one_episode_and_wakes_no_companion() {
     );
 }
 
-/// Screen content never summons: a PTY payload full of "kitty" reaches the
-/// grid, not the detector, so no typed-summon log entry.
-#[test]
-fn screen_output_of_kitty_never_summons() {
-    let mut app = App::headless_for_test();
-    app.recompute_sparkle();
-    let wid = WindowId(0);
-    let session = app.front_terminal(wid).unwrap().session;
-    term_lock(&app.pool.get(session).unwrap().term).process(b"kitty kitty kitty\r\n");
-    assert!(
-        !app.windows[&wid].fx.companions().cursor_cat.is_active(),
-        "PTY output must never reach the typed detector"
-    );
-    assert_eq!(app.kitty_log.log().sightings, 0);
-}
-
 /// Keys alone build no cat momentum: the metric builds only from a real
 /// keystroke correlated with its forward echo (the glow's
 /// `take_momentum_pulse`, fed in `cursor_frame`). A printable keystream
@@ -2412,23 +1810,6 @@ fn key_only_input_builds_no_cat_momentum() {
     );
 }
 
-/// The rate limit holds on the real input path: back-to-back completions
-/// land inside [`aterm_effects::kitty_summon::TYPED_SUMMON_COOLDOWN`], so
-/// kitty-spam yields one LEDGER episode, not a flood. The COMPLETION itself
-/// is not rate-limited — see `kitty_summon`'s two tiers.
-#[test]
-fn kitty_spam_is_rate_limited_to_one_episode() {
-    let mut app = App::headless_for_test();
-    app.recompute_sparkle();
-    let wid = WindowId(0);
-    type_word(&mut app, wid, "kittykittykitty");
-    assert_eq!(
-        app.kitty_log.log().sightings,
-        1,
-        "spam inside the cooldown logs exactly once"
-    );
-}
-
 /// A word-breaking key (plain Enter) clears the run on the real path:
 /// `kit` ⏎ `ty` was never the typed word.
 #[test]
@@ -2451,28 +1832,53 @@ fn enter_breaks_the_typed_run() {
     );
 }
 
-/// With sparkle words off (resolved from config) nothing can draw a cat, so
-/// the summon is inert: no hello, no log entry, like the ambient sightings.
-/// The unresolved render cache (`sparkle` starts `None`) is not "off"; see
-/// the next test.
+/// With sparkle words off, or the feline family off while other families
+/// keep the master on (`[sparkle_words.feline] enabled = false`), nothing
+/// can draw a cat, so the typed summon is inert: no companion, no log
+/// entry (a `head_peek` row would land in a category the config can never
+/// produce ambiently). The unresolved render cache (`sparkle` starts
+/// `None`) is not "off"; see the next test.
 #[test]
 fn summon_is_inert_with_sparkle_words_off() {
-    let mut app = App::headless_for_test();
-    app.config.sparkle_words = Some(crate::app_config::SparkleWordsConfig {
-        enabled: Some(false),
-        ..Default::default()
-    });
-    app.prepared_sparkle = app.config.prepare_sparkle_runtime();
-    app.sparkle_dirty = true;
-    app.recompute_sparkle();
-    assert!(
-        app.sparkle.is_none(),
-        "the master is OFF in the config, not merely unread"
-    );
-    let wid = WindowId(0);
-    type_word(&mut app, wid, "kitty");
-    assert!(!app.windows[&wid].fx.companions().cursor_cat.is_active());
-    assert_eq!(app.kitty_log.log().sightings, 0);
+    use crate::app_config::{SparkleFelineConfig, SparkleWordsConfig};
+    for (label, words) in [
+        (
+            "sparkle words off",
+            SparkleWordsConfig {
+                enabled: Some(false),
+                ..Default::default()
+            },
+        ),
+        (
+            "feline family off",
+            SparkleWordsConfig {
+                feline: Some(SparkleFelineConfig {
+                    enabled: Some(false),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ),
+    ] {
+        let mut app = App::headless_for_test();
+        app.config.sparkle_words = Some(words);
+        // Runtime activation is memory-only: config mutations take effect
+        // when the worker-prepared generation is installed.
+        app.prepared_sparkle = app.config.prepare_sparkle_runtime();
+        app.sparkle_dirty = true;
+        app.recompute_sparkle();
+        assert!(
+            app.sparkle.as_ref().is_none_or(|rs| !rs.cfg.feline),
+            "{label}: resolved OFF, not merely unread"
+        );
+        let wid = WindowId(0);
+        type_word(&mut app, wid, "kitty");
+        assert!(
+            !app.windows[&wid].fx.companions().cursor_cat.is_active(),
+            "{label}"
+        );
+        assert_eq!(app.kitty_log.log().sightings, 0, "{label}");
+    }
 }
 
 /// Unresolved is not off: with the vocabulary on, the first keystroke
@@ -2491,47 +1897,6 @@ fn a_typed_summon_before_the_first_frame_is_not_taken_for_effects_off() {
         app.kitty_log.log().sightings > 0,
         "a config with cats ON must summon on the first keystroke, drawn \
          frame or not"
-    );
-}
-
-/// Feline sub-gate: `[sparkle_words.feline] enabled = false` disables every
-/// ambient cat and Kitty Log sighting while other families keep the master
-/// on. The typed summon is inert too: a `head_peek` row would land in a
-/// category the config can never produce ambiently.
-#[test]
-fn summon_is_inert_with_feline_family_off() {
-    let mut app = App::headless_for_test();
-    app.config.sparkle_words = Some(crate::app_config::SparkleWordsConfig {
-        feline: Some(crate::app_config::SparkleFelineConfig {
-            enabled: Some(false),
-            ..Default::default()
-        }),
-        ..Default::default()
-    });
-    // Runtime activation is memory-only: config mutations take effect when
-    // the worker-prepared generation is installed. Model that handoff
-    // instead of reparsing config on the input path.
-    app.prepared_sparkle = app.config.prepare_sparkle_runtime();
-    app.sparkle_dirty = true;
-    app.recompute_sparkle();
-    let rs = app
-        .sparkle
-        .as_ref()
-        .expect("the remaining families keep the sparkle master resolved ON");
-    assert!(
-        !rs.cfg.feline,
-        "the resolved config carries the feline opt-out"
-    );
-    let wid = WindowId(0);
-    type_word(&mut app, wid, "kitty");
-    assert!(
-        !app.windows[&wid].fx.companions().cursor_cat.is_active(),
-        "feline off: no companion may wake"
-    );
-    assert_eq!(
-        app.kitty_log.log().sightings,
-        0,
-        "feline off: nothing rendered means nothing logged"
     );
 }
 

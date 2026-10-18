@@ -42,7 +42,6 @@ use std::sync::OnceLock;
 
 use aterm_agent::supervise::{Autopilot, SupervisorConfig};
 
-use crate::session_timeline::MetaField;
 use crate::{App, WindowId};
 
 /// What the window's harness is, for every session's Autopilot at once: the
@@ -68,6 +67,12 @@ pub(crate) enum HarnessPosture {
     /// The host runs, with some agent tables disabled. The mask is the live
     /// switches' encoding, derived from `SupervisorConfig::on_for`.
     Restricted(Autopilot, u8),
+    /// The host runs, and this session's agent's OWN switch is off
+    /// (`[harness.codex] enabled = false`, the master on): what
+    /// [`Self::for_agent`] joins [`Self::Restricted`] to for a KNOWN agent
+    /// the policy does not admit (§10.2.3, item 5). A session's posture
+    /// alone — the window's is never this.
+    AgentOff(aterm_phase::Program),
 }
 
 impl HarnessPosture {
@@ -90,24 +95,46 @@ impl HarnessPosture {
     pub(crate) const fn default_mode(self) -> Option<Autopilot> {
         match self {
             Self::On(default) | Self::Restricted(default, _) => Some(default),
-            Self::Unhosted | Self::MasterOff => None,
+            Self::Unhosted | Self::MasterOff | Self::AgentOff(_) => None,
         }
     }
 
-    /// Join the published program with the same policy gate the worker uses.
-    /// An unresolved restricted projection cannot promise a carrying mode.
+    /// Join the published program with the same policy gate the worker uses:
+    /// an admitted agent runs under the table's default, a known one whose
+    /// own switch is off reads [`Self::AgentOff`] (its chip and its row name
+    /// the switch, §10.2.1). An agent not yet read keeps
+    /// [`Self::MasterOff`]: an unresolved restricted projection cannot
+    /// promise a carrying mode, and no chip is drawn before the program is
+    /// read.
     pub(crate) fn for_agent(self, agent: Option<aterm_phase::Program>) -> Self {
-        match self {
-            Self::Restricted(default, admitted) => {
-                if agent.is_some_and(|agent| admitted & crate::harness_host::agent_bit(agent) != 0)
-                {
-                    Self::On(default)
-                } else {
-                    Self::MasterOff
-                }
+        match (self, agent) {
+            (Self::Restricted(default, admitted), Some(agent))
+                if admitted & crate::harness_host::agent_bit(agent) != 0 =>
+            {
+                Self::On(default)
             }
-            posture => posture,
+            (Self::Restricted(..), Some(agent)) => Self::AgentOff(agent),
+            (Self::Restricted(..), None) => Self::MasterOff,
+            (posture, _) => posture,
         }
+    }
+}
+
+/// What an agent's own switch off says (§10.2.1): its Settings row's label
+/// (`prefs::agent_switch_label`: `Supervise <product> sessions`, and Codex's
+/// `Watch codex-alab sessions` since aterm supervises no Codex) and `is off`
+/// — `Supervise Claude Code sessions is off` — so the chip, its row and the
+/// menu name the switch a click opens Settings ▸ Harness to.
+#[must_use]
+pub(crate) const fn agent_switch_off(agent: aterm_phase::Program) -> &'static str {
+    use aterm_phase::Program;
+    match agent {
+        Program::Claude => "Supervise Claude Code sessions is off",
+        Program::Codex => "Watch codex-alab sessions is off",
+        Program::Agy => "Supervise Antigravity CLI sessions is off",
+        Program::Muse => "Supervise Muse Code sessions is off",
+        Program::Gemini => "Supervise Gemini CLI sessions is off",
+        Program::Generic => "Supervise the program sessions is off",
     }
 }
 
@@ -134,6 +161,12 @@ pub(crate) enum AutopilotView {
     /// ([`Self::wire`]), no word a cycle writes ([`Self::next`]), and
     /// Settings ▸ Harness naming why.
     Unhosted,
+    /// The master switch on and this agent's own switch off
+    /// ([`HarnessPosture::AgentOff`], §10.2.3 item 5): read as the master
+    /// switch's off everywhere — `off` on the wire, no word a cycle writes,
+    /// a click opening Settings ▸ Harness — but NAMED as the agent's switch
+    /// (`Supervise Claude Code sessions is off`, [`agent_switch_off`]).
+    AgentOff(aterm_phase::Program),
 }
 
 /// How a chip is tinted (§2.3): Cruise the accent, Land amber, the rest dim.
@@ -175,12 +208,13 @@ impl AutopilotView {
     /// Every view, the three modes in the chip's cycle order first (the
     /// tests' sweep of the table).
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 6] = [
         Self::Cruise,
         Self::Land,
         Self::Off,
         Self::MasterOff,
         Self::Unhosted,
+        Self::AgentOff(aterm_phase::Program::Claude),
     ];
 
     /// The view of a session whose own word is `word` under `posture`:
@@ -191,6 +225,7 @@ impl AutopilotView {
         match posture {
             HarnessPosture::Unhosted => Self::Unhosted,
             HarnessPosture::MasterOff | HarnessPosture::Restricted(_, _) => Self::MasterOff,
+            HarnessPosture::AgentOff(agent) => Self::AgentOff(agent),
             HarnessPosture::On(default) => Self::from_mode(word.unwrap_or(default)),
         }
     }
@@ -206,14 +241,30 @@ impl AutopilotView {
     }
 
     /// The mode the harness runs the session under: `None` where it runs
-    /// none ([`Self::MasterOff`], [`Self::Unhosted`]).
+    /// none ([`Self::MasterOff`], [`Self::Unhosted`], [`Self::AgentOff`]).
     #[must_use]
     pub(crate) const fn mode(self) -> Option<Autopilot> {
         match self {
             Self::Cruise => Some(Autopilot::Cruise),
             Self::Land => Some(Autopilot::Land),
             Self::Off => Some(Autopilot::Off),
-            Self::MasterOff | Self::Unhosted => None,
+            Self::MasterOff | Self::Unhosted | Self::AgentOff(_) => None,
+        }
+    }
+
+    /// The view as a small number (`0..=10`), distinct for every view — an
+    /// agent's own switch off by its agent — for the repaint keys that pack
+    /// it (`claude_lights::WindowLights::autopilot_term`, bits 8–15; the
+    /// harness card's).
+    #[must_use]
+    pub(crate) const fn code(self) -> u64 {
+        match self {
+            Self::Cruise => 0,
+            Self::Land => 1,
+            Self::Off => 2,
+            Self::MasterOff => 3,
+            Self::Unhosted => 4,
+            Self::AgentOff(agent) => 5 + agent as u64,
         }
     }
 
@@ -243,7 +294,7 @@ impl AutopilotView {
             Self::Cruise => "\u{221e}",
             Self::Land => "\u{2913}",
             Self::Off => "\u{25cb}",
-            Self::MasterOff | Self::Unhosted => "\u{2298}",
+            Self::MasterOff | Self::Unhosted | Self::AgentOff(_) => "\u{2298}",
         }
     }
 
@@ -255,7 +306,7 @@ impl AutopilotView {
         match self {
             Self::Cruise => None,
             Self::Land => Some("land"),
-            Self::Off | Self::MasterOff | Self::Unhosted => Some("off"),
+            Self::Off | Self::MasterOff | Self::Unhosted | Self::AgentOff(_) => Some("off"),
         }
     }
 
@@ -278,15 +329,16 @@ impl AutopilotView {
         match self {
             Self::Cruise => ChipTone::Accent,
             Self::Land => ChipTone::Amber,
-            Self::Off | Self::MasterOff | Self::Unhosted => ChipTone::Dim,
+            Self::Off | Self::MasterOff | Self::Unhosted | Self::AgentOff(_) => ChipTone::Dim,
         }
     }
 
     /// The chip's title at rest (§2.3): what the mode does, then what a click
     /// does. The window composes it from the face table
     /// (`claude_lights::autopilot_title`), which gives exactly this for the
-    /// default glass with no trail and no menu; kept here as v1's words, the
-    /// face table's tests hold it to them.
+    /// default glass with no trail, then v2's ` · right-click: more` (the
+    /// chip's menu, §9.3.2); kept here as v1's words, the face table's tests
+    /// hold it to them.
     #[cfg(test)]
     #[must_use]
     pub(crate) const fn title(self) -> &'static str {
@@ -299,6 +351,22 @@ impl AutopilotView {
                 "no harness: this aterm has no control socket \u{b7} ",
                 open_harness_click!()
             ),
+            Self::AgentOff(agent) => {
+                use aterm_phase::Program;
+                macro_rules! agent_off {
+                    ($switch:literal) => {
+                        concat!($switch, " is off \u{b7} ", open_harness_click!())
+                    };
+                }
+                match agent {
+                    Program::Claude => agent_off!("Supervise Claude Code sessions"),
+                    Program::Codex => agent_off!("Watch codex-alab sessions"),
+                    Program::Agy => agent_off!("Supervise Antigravity CLI sessions"),
+                    Program::Muse => agent_off!("Supervise Muse Code sessions"),
+                    Program::Gemini => agent_off!("Supervise Gemini CLI sessions"),
+                    Program::Generic => agent_off!("Supervise the program sessions"),
+                }
+            }
         }
     }
 
@@ -310,7 +378,7 @@ impl AutopilotView {
         match self {
             Self::Cruise => "cruise",
             Self::Land => "land",
-            Self::Off | Self::MasterOff | Self::Unhosted => "off",
+            Self::Off | Self::MasterOff | Self::Unhosted | Self::AgentOff(_) => "off",
         }
     }
 }
@@ -464,17 +532,13 @@ impl App {
         self.session_autopilot_for(local_id, self.session_agent(local_id), clock)
     }
 
-    /// The supervisable agent session `local_id` publishes, if any (its
-    /// timeline's program, [`crate::harness_host::agent_of`]).
+    /// The agent session `local_id` publishes that the host supervises or
+    /// watches, if any ([`crate::harness_host::admitted`]: its timeline's
+    /// program, never a vendor `codex`).
     pub(crate) fn session_agent(&self, local_id: u64) -> Option<aterm_phase::Program> {
-        self.pool.get(local_id).and_then(|session| {
-            let timeline = session
-                .ctx
-                .timeline
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            crate::harness_host::agent_of(timeline.agent())
-        })
+        self.pool
+            .get(local_id)
+            .and_then(|session| crate::harness_host::admitted(&session.ctx))
     }
 
     /// Session `local_id`'s OWN posture: the window's, joined with its
@@ -522,18 +586,76 @@ impl App {
     /// ([`crate::claude_footer::post_changed`]) and leaves a `harness` RECORD
     /// in the message log (never a row: nothing is asked of the person).
     /// Whether the word moved.
+    ///
+    /// A HAND WRITE: it drops any timer the session's Cruise held, the same
+    /// word included (§9.3.6, item 1) —
+    /// [`Self::set_session_autopilot_timed`] with no instant.
     pub(crate) fn set_session_autopilot(&mut self, local_id: u64, word: Option<Autopilot>) -> bool {
-        let text = word.map_or("", Autopilot::word);
-        let changed = match self.write_session_meta_field(local_id, MetaField::Autopilot, text) {
-            Ok(changed) => changed,
-            // Unreachable: every mode's word is in the closed set.
-            Err(error) => {
-                aterm_log::warn!("autopilot not written for session {local_id}: {error:?}");
-                false
-            }
-        };
-        if !changed {
+        self.set_session_autopilot_timed(local_id, word, None)
+    }
+
+    /// THE WINDOW'S ONE WRITER OF THE AUTOPILOT PAIR (§9.3.6, item 1):
+    /// session `local_id`'s own word and, beside `cruise` only, the instant
+    /// its timed Cruise lands (`land_at`, unix ms; `None`: no timer) —
+    /// `session_timeline::apply_autopilot`, the store write `meta set
+    /// autopilot … [until=]` makes. Whether either half moved; a move is
+    /// fanned out as [`Self::set_session_autopilot`] says, and the session's
+    /// timer is indexed again from what is stored.
+    pub(crate) fn set_session_autopilot_timed(
+        &mut self,
+        local_id: u64,
+        word: Option<Autopilot>,
+        land_at: Option<i64>,
+    ) -> bool {
+        let Some(ctx) = self.pool.get(local_id).map(|s| s.ctx.clone()) else {
             return false;
+        };
+        let write = crate::session_timeline::apply_autopilot(
+            &ctx,
+            word.map(|w| w.word().to_string()),
+            land_at,
+        );
+        self.autopilot_pair_written(local_id, write.moved, word.is_some())
+    }
+
+    /// THE FAN-OUT of a window write of session `local_id`'s Autopilot pair
+    /// (the window's writer, [`Self::set_session_autopilot_timed`]; the
+    /// timer's cancel, `App::cancel_autopilot_timer`): the timer indexed
+    /// again from what is stored, and an open Autopilot menu for the session
+    /// built again (`App::refresh_autopilot_menu`) — both even where the
+    /// write moved nothing (a wire write of the same pair whose wake is
+    /// still in flight). Where it `moved`, what [`Self::set_session_autopilot`]
+    /// says follows; `has_word`: a word is stored (not unset), for the
+    /// record. Returns `moved`.
+    pub(crate) fn autopilot_pair_written(
+        &mut self,
+        local_id: u64,
+        moved: bool,
+        has_word: bool,
+    ) -> bool {
+        // The timer the write may drop, read BEFORE the index is built again
+        // from what is stored (§10.2.3, item 8): the record names it.
+        let dropped = self.autopilot_timers.glass(local_id);
+        self.index_autopilot_timer(local_id, None);
+        self.refresh_autopilot_menu(local_id);
+        // The person's word about typing: the crash journal carries it at
+        // once (`App::journal_owner_words`; a pair it already carries owes
+        // nothing).
+        self.journal_owner_words(local_id);
+        if !moved {
+            return false;
+        }
+        // What a `meta set` from the window refreshes
+        // (`App::write_session_meta_field`): the tab chrome, the presence
+        // band and the operator item, and the session's `events` watchers.
+        self.refresh_meta_dependent_chrome(local_id);
+        self.refresh_presence_session(local_id, false);
+        self.refresh_operator_status_item();
+        if self.subscribers.any() {
+            self.subscribers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .notify(local_id);
         }
         crate::claude_footer::post_changed(local_id);
         // The session's A/B arm moves with its mode (Settings ▸ Harness), and
@@ -546,13 +668,18 @@ impl App {
             .map(|s| s.ctx.self_id.as_str().to_string());
         if let Some(sid) = sid {
             let (_, view, _) = self.session_autopilot(local_id);
-            let place = self.upgrade_place(&sid);
-            self.record_message(crate::message_reporters::autopilot_set(
-                &sid,
-                &place,
-                view,
-                word.is_some(),
-            ));
+            // The records' titles name no place; their lines lead with it,
+            // the pane named where the tab holds two agents (§10.3.3, item 9).
+            let place = self.session_place(&sid);
+            let message = match self.autopilot_timers.glass(local_id) {
+                // A timed Cruise says when it lands (§9.3.2).
+                Some(until) => crate::message_reporters::autopilot_timer_set(&sid, &place, until),
+                // A hand change says the timer it dropped is cancelled.
+                None => {
+                    crate::message_reporters::autopilot_set(&sid, &place, view, has_word, dropped)
+                }
+            };
+            self.record_message(message);
         }
         true
     }
@@ -574,10 +701,32 @@ impl App {
     }
 
     /// Open Settings ▸ Harness in window `wid` (the `⚙` chip, the chip under
-    /// the master switch off, View ▸ Coding Agent Harness…): the one Settings
-    /// tab, raised there at the Harness route. Whether a tab shows it.
-    pub(crate) fn open_harness_settings(&mut self, wid: WindowId) -> bool {
-        self.open_settings_tab_in_window(wid, crate::native_settings::SettingsRoute::Harness)
+    /// the master switch off, the Autopilot menu's `Harness settings…`, View ▸
+    /// Coding Agent Harness…): the one Settings tab, raised there at the
+    /// Harness route, and landed at `focus` (§10.3.3, item 8) — a session's
+    /// row, drawn selected until the next press or scroll, or SUPERVISION;
+    /// [`HarnessFocus::Top`] leaves the page where the route's arrival puts
+    /// it. The landing is the page's own action
+    /// ([`crate::harness_screen::HARNESS_LAND`]), so it holds before the
+    /// page has been measured and after. Whether a tab shows it.
+    ///
+    /// [`HarnessFocus::Top`]: crate::harness_screen::HarnessFocus::Top
+    pub(crate) fn open_harness_settings(
+        &mut self,
+        wid: WindowId,
+        focus: crate::harness_screen::HarnessFocus,
+    ) -> bool {
+        if !self.open_settings_tab_in_window(wid, crate::native_settings::SettingsRoute::Harness) {
+            return false;
+        }
+        if focus == crate::harness_screen::HarnessFocus::Top {
+            return true;
+        }
+        self.dispatch_settings_action_in_window(
+            wid,
+            crate::harness_screen::HARNESS_LAND,
+            Some(crate::native_app::SemanticInput::Text(focus.wire())),
+        )
     }
 }
 
@@ -684,6 +833,12 @@ mod tests {
                 None,
             ),
             (AutopilotView::Unhosted, "\u{2298} off", ChipTone::Dim, None),
+            (
+                AutopilotView::AgentOff(aterm_phase::Program::Claude),
+                "\u{2298} off",
+                ChipTone::Dim,
+                None,
+            ),
         ];
         for (view, label, tone, next) in rows {
             assert_eq!(view.label(), label, "{view:?}");
@@ -712,7 +867,112 @@ mod tests {
         assert_eq!(SETTINGS_GLYPH, "\u{2699}");
         assert!(AutopilotView::Cruise.carries() && AutopilotView::Land.carries());
         assert!(!AutopilotView::Off.carries() && !AutopilotView::MasterOff.carries());
-        assert_eq!(AutopilotView::ALL.len(), 5);
+        assert_eq!(AutopilotView::ALL.len(), 6);
+    }
+
+    /// AN AGENT'S OWN SWITCH OFF IS NAMED (§10.2.1, §10.2.5): for each
+    /// supervisable agent, its switch off under the master switch on joins to
+    /// `AgentOff` — `⊘ off`, dim, titled with the switch's own Settings label
+    /// and a click to Settings, `off` on the wire, no word a cycle writes, no
+    /// default — and counts as Off in the A/B where no claim is live, while
+    /// every other agent of the same policy runs the table's default. An
+    /// agent not yet read reads `MasterOff`, and the master switch off wins
+    /// over the agent's. NEGATIVE CONTROL: with the agent's switch on, its
+    /// sessions run the default.
+    #[test]
+    fn an_agents_own_switch_off_reads_agent_off_and_the_master_wins() {
+        use crate::harness_screen::AbArm;
+        use aterm_phase::Program;
+        for agent in Program::ALL.into_iter().filter(|p| p.supervisable()) {
+            let mut cfg = SupervisorConfig::default();
+            cfg.set(&format!("{}.enabled", agent.name()), "false")
+                .unwrap();
+            let posture = HarnessPosture::of(true, &cfg, false);
+            let joined = posture.for_agent(Some(agent));
+            assert_eq!(joined, HarnessPosture::AgentOff(agent), "{agent:?}");
+            assert_eq!(joined.default_mode(), None, "{agent:?}");
+            for word in [None, Some(Autopilot::Cruise), Some(Autopilot::Land)] {
+                let view = AutopilotView::of(joined, word);
+                assert_eq!(view, AutopilotView::AgentOff(agent), "{agent:?} {word:?}");
+                assert_eq!(view.mode(), None);
+                assert_eq!(view.next(), None, "a click opens Settings");
+                assert!(!view.carries());
+                assert_eq!(view.wire(), "off");
+                assert_eq!(view.label(), "\u{2298} off");
+                assert_eq!(view.tone(), ChipTone::Dim);
+                assert_eq!(
+                    wire_field(posture, word, Some(agent)),
+                    "off",
+                    "{agent:?} {word:?}"
+                );
+            }
+            let switch = format!("Supervise {} sessions is off", agent.product());
+            assert_eq!(agent_switch_off(agent), switch);
+            assert_eq!(
+                switch,
+                format!(
+                    "{} is off",
+                    crate::prefs::agent_switch_label(agent.product())
+                ),
+                "{agent:?}: the switch's Settings label"
+            );
+            assert_eq!(
+                AutopilotView::AgentOff(agent).title(),
+                format!("{switch} \u{b7} click: open Settings \u{25b8} Harness")
+            );
+            assert_eq!(
+                AbArm::of(AutopilotView::AgentOff(agent), false, false),
+                AbArm::Off,
+                "{agent:?}: plain, the baseline"
+            );
+            assert_eq!(
+                AbArm::of(AutopilotView::AgentOff(agent), false, true),
+                AbArm::Unsupervised,
+                "{agent:?}: a claim still live"
+            );
+            // NEGATIVE CONTROL: every other agent runs the default.
+            for other in Program::ALL
+                .into_iter()
+                .filter(|p| p.supervisable() && *p != agent)
+            {
+                assert_eq!(
+                    posture.for_agent(Some(other)),
+                    HarnessPosture::On(Autopilot::Cruise),
+                    "{agent:?} off, {other:?} on"
+                );
+            }
+            // Not yet read: no carrying mode promised, no switch named.
+            assert_eq!(posture.for_agent(None), HarnessPosture::MasterOff);
+            // The master switch off wins over the agent's own.
+            cfg.set("enabled", "false").unwrap();
+            assert_eq!(
+                HarnessPosture::of(true, &cfg, false).for_agent(Some(agent)),
+                HarnessPosture::MasterOff,
+                "{agent:?}: the master wins"
+            );
+        }
+        // Every switch with a Settings row is named by that row's label —
+        // Codex's too, a codex-alab tab's watch (aterm supervises no Codex).
+        for agent in Program::ALL.into_iter().filter(|p| p.harness_table()) {
+            assert_eq!(
+                agent_switch_off(agent),
+                format!(
+                    "{} is off",
+                    crate::prefs::agent_switch_label(agent.product())
+                ),
+                "{agent:?}"
+            );
+        }
+        assert_eq!(
+            agent_switch_off(Program::Codex),
+            "Watch codex-alab sessions is off"
+        );
+        // Every view packs to its own code.
+        let mut codes: Vec<u64> = AutopilotView::ALL.iter().map(|v| v.code()).collect();
+        codes.extend(Program::ALL.map(|p| AutopilotView::AgentOff(p).code()));
+        let unique: std::collections::BTreeSet<u64> = codes.iter().copied().collect();
+        assert_eq!(unique.len(), 5 + Program::ALL.len(), "{codes:?}");
+        assert!(codes.iter().all(|c| *c < 256), "bits 8-15 hold it");
     }
 
     /// A host that supervises nothing (`Acts` inert, no sessions): what the
@@ -894,7 +1154,9 @@ mod tests {
         let (app, host) = agent_policy_app();
         publish_program(&app, "claude");
         assert!(!host.0.admits(aterm_phase::Program::Claude));
-        assert!(host.0.admits(aterm_phase::Program::Codex));
+        // The other agent: agy (a vendor `codex` is admitted to no worker
+        // since the Codex screen lane's retirement, 2026-10-16).
+        assert!(host.0.admits(aterm_phase::Program::Agy));
         let ctx = &app.pool.get(0).unwrap().ctx;
         // A still-visible claim is a fact, not permission for the card to carry.
         crate::session_timeline::claim_supervisor(
@@ -912,7 +1174,7 @@ mod tests {
         assert!(!view.carries(), "a stale claim does not admit a card");
         assert_eq!(app.harness_state().sessions[0].view.wire(), "off");
 
-        publish_program(&app, "codex");
+        publish_program(&app, "agy");
         assert_eq!(app.session_autopilot(0).1, AutopilotView::Cruise);
         assert_eq!(app.harness_state().sessions[0].view, AutopilotView::Cruise);
     }
@@ -934,7 +1196,9 @@ mod tests {
                 .to_string()
         };
         assert_eq!(read("claude"), "off");
-        assert_eq!(read("codex"), "cruise");
+        assert_eq!(read("agy"), "cruise");
+        // A vendor `codex` is shown, not supervised: no mode of the harness's.
+        assert_eq!(read("codex"), "-", "a vendor codex claims no mode");
         assert_eq!(read("sh"), "-", "non-agent rows do not claim a mode");
     }
 
@@ -967,7 +1231,7 @@ mod tests {
             app.native_settings_route_view_target(SettingsRoute::Harness)
                 .is_none()
         );
-        assert!(app.open_harness_settings(WindowId(0)));
+        assert!(app.open_harness_settings(WindowId(0), crate::harness_screen::HarnessFocus::Top));
         assert!(
             app.native_settings_route_view_target(SettingsRoute::Harness)
                 .is_some()

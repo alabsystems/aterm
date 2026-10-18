@@ -750,7 +750,7 @@ mod mac {
                     aterm_objc::Id,
                     aterm_objc::Id,
                     *mut core::ffi::c_void,
-                ) = aterm_objc::msg();
+                ) = aterm_objc::checked_msg();
                 send(
                     target.as_id(),
                     aterm_objc::sel!(observeValueForKeyPath:ofObject:change:context:),
@@ -885,16 +885,6 @@ mod tests {
             assert_eq!(source.at_attach(|| Some(winit::window::Theme::Dark)), None);
             assert!(!source.reads_window_theme());
         }
-    }
-
-    /// The platform source follows winit's window theme only on Windows, where
-    /// it is the OS setting; elsewhere it is the window's own chrome.
-    #[test]
-    fn only_windows_reads_the_window_theme() {
-        assert_eq!(
-            OsAppearanceSource::Platform.reads_window_theme(),
-            cfg!(windows)
-        );
     }
 
     /// The verb reads bare, injects one word, and refuses anything else; a

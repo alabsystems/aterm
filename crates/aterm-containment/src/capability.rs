@@ -25,13 +25,13 @@ pub enum NetworkCapability {
     /// No network access. Containment mode — enforced by the macOS Seatbelt
     /// `(deny network*)`.
     None = 0,
-    /// Unrestricted network. Master, User and Safety mode.
+    /// Unrestricted network. User and Safety mode.
     Full = 1,
 }
 
 /// Filesystem capability levels.
 ///
-/// Discriminants: TmpOnly=0, ProjectRW=1, HomeRW=2, Full=3.
+/// Discriminants: TmpOnly=0, ProjectRW=1, HomeRW=2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 #[non_exhaustive]
@@ -45,8 +45,6 @@ pub enum FsCapability {
     ProjectReadWrite = 1,
     /// Read/write to home directory. User mode.
     HomeReadWrite = 2,
-    /// Full filesystem access. Master mode.
-    Full = 3,
 }
 
 /// Process capability levels.
@@ -60,6 +58,6 @@ pub enum ProcessCapability {
     NoFork = 0,
     /// Restricted process creation. Safety mode.
     Restricted = 1,
-    /// Unrestricted process creation. Master/User mode.
+    /// Unrestricted process creation. User mode.
     Full = 2,
 }

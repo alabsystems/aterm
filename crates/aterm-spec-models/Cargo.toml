@@ -7,10 +7,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "TLA+ models of aterm's kernel/security/concurrency invariants (ROADMAP WS-I), model-checked by `ty` from `spec-check`."
+description = "The proof bundles beside aterm's models (the ay certificates), re-checked by `spec-check`."
 
-# No code deps: `spec-check specs` (aterm-spec) model-checks the specs in
-# `specs/` with `ty`. The .tla/.cfg files ARE the crate.
+# No code deps: `spec-check ay` (aterm-models) re-checks the bundles under
+# `proofs/ay`. The bundles ARE the crate; tests/ay_bundles.rs holds the two
+# generated bundles to their generator.
 
 [lints]
 workspace = true

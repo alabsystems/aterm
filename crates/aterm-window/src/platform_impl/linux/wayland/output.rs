@@ -4,10 +4,15 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/wayland/output.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-use sctk::reexports::client::protocol::wl_output::WlOutput;
-use sctk::reexports::client::Proxy;
+//! Modified by the aterm project in 2026; see the repository NOTICE. (A monitor is a
+//! first-party `aterm_wayland::output::Output`, read as of its last `done`, where upstream read
+//! smithay-client-toolkit's `OutputData`: docs/AUDIT-third-party-2026-10-15.md, LW.7. Its
+//! position is `wl_output.geometry`'s; sctk 0.19.2 bound xdg-output where the compositor offers
+//! it, as Mutter and weston do, and gave its logical position. aterm-gui reads a monitor's
+//! position to place a restored window and to cascade a new one, and on Wayland both only feed
+//! `set_outer_position`, which a Wayland client cannot do.)
 
-use sctk::output::OutputData;
+use aterm_wayland::output::{Output, OutputInfo};
 
 use crate::dpi::{LogicalPosition, PhysicalPosition, PhysicalSize};
 use crate::platform_impl::platform::VideoModeHandle as PlatformVideoModeHandle;
@@ -17,7 +22,7 @@ use super::event_loop::ActiveEventLoop;
 impl ActiveEventLoop {
     #[inline]
     pub fn available_monitors(&self) -> impl Iterator<Item = MonitorHandle> {
-        self.state.borrow().output_state.outputs().map(MonitorHandle::new)
+        self.state.borrow().outputs.outputs().into_iter().map(MonitorHandle::new)
     }
 
     #[inline]
@@ -29,36 +34,38 @@ impl ActiveEventLoop {
 
 #[derive(Clone, Debug)]
 pub struct MonitorHandle {
-    pub(crate) proxy: WlOutput,
+    pub(crate) output: Output,
 }
 
 impl MonitorHandle {
     #[inline]
-    pub(crate) fn new(proxy: WlOutput) -> Self {
-        Self { proxy }
+    pub(crate) fn new(output: Output) -> Self {
+        Self { output }
+    }
+
+    /// The output as of its last `done` (its defaults before the first).
+    fn info(&self) -> OutputInfo {
+        self.output.info().unwrap_or_else(|| OutputInfo {
+            global: self.output.global(),
+            scale: 1,
+            ..OutputInfo::default()
+        })
     }
 
     #[inline]
     pub fn name(&self) -> Option<String> {
-        let output_data = self.proxy.data::<OutputData>().unwrap();
-        output_data.with_output_info(|info| info.name.clone())
+        self.info().name
     }
 
     #[inline]
     pub fn native_identifier(&self) -> u32 {
-        let output_data = self.proxy.data::<OutputData>().unwrap();
-        output_data.with_output_info(|info| info.id)
+        self.output.global()
     }
 
     #[inline]
     pub fn size(&self) -> PhysicalSize<u32> {
-        let output_data = self.proxy.data::<OutputData>().unwrap();
-        let dimensions = output_data.with_output_info(|info| {
-            info.modes.iter().find_map(|mode| mode.current.then_some(mode.dimensions))
-        });
-
-        match dimensions {
-            Some((width, height)) => (width as u32, height as u32),
+        match self.info().current_mode() {
+            Some(mode) => (mode.width as u32, mode.height as u32),
             _ => (0, 0),
         }
         .into()
@@ -66,46 +73,30 @@ impl MonitorHandle {
 
     #[inline]
     pub fn position(&self) -> PhysicalPosition<i32> {
-        let output_data = self.proxy.data::<OutputData>().unwrap();
-        output_data.with_output_info(|info| {
-            info.logical_position.map_or_else(
-                || {
-                    LogicalPosition::<i32>::from(info.location)
-                        .to_physical(info.scale_factor as f64)
-                },
-                |logical_position| {
-                    LogicalPosition::<i32>::from(logical_position)
-                        .to_physical(info.scale_factor as f64)
-                },
-            )
-        })
+        let info = self.info();
+        LogicalPosition::<i32>::from((info.x, info.y)).to_physical(info.scale as f64)
     }
 
     #[inline]
     pub fn refresh_rate_millihertz(&self) -> Option<u32> {
-        let output_data = self.proxy.data::<OutputData>().unwrap();
-        output_data.with_output_info(|info| {
-            info.modes.iter().find_map(|mode| mode.current.then_some(mode.refresh_rate as u32))
-        })
+        self.info().current_mode().map(|mode| mode.refresh as u32)
     }
 
     #[inline]
     pub fn scale_factor(&self) -> i32 {
-        let output_data = self.proxy.data::<OutputData>().unwrap();
-        output_data.scale_factor()
+        self.info().scale
     }
 
     #[inline]
     pub fn video_modes(&self) -> impl Iterator<Item = PlatformVideoModeHandle> {
-        let output_data = self.proxy.data::<OutputData>().unwrap();
-        let modes = output_data.with_output_info(|info| info.modes.clone());
+        let modes = self.info().modes;
 
         let monitor = self.clone();
 
         modes.into_iter().map(move |mode| {
             PlatformVideoModeHandle::Wayland(VideoModeHandle {
-                size: (mode.dimensions.0 as u32, mode.dimensions.1 as u32).into(),
-                refresh_rate_millihertz: mode.refresh_rate as u32,
+                size: (mode.width as u32, mode.height as u32).into(),
+                refresh_rate_millihertz: mode.refresh as u32,
                 bit_depth: 32,
                 monitor: monitor.clone(),
             })

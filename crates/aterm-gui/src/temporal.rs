@@ -184,6 +184,62 @@ impl SpinePre {
     }
 }
 
+/// One resize a [`SpineMark`] hands its sink, in the engine's order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SpineResize {
+    /// The geometry after it, `(rows, cols)`.
+    pub(crate) to: (u16, u16),
+    /// The geometry before it, from the engine's resize journal; `None` for the live
+    /// geometry recorded once (a mark never seeded, or another engine lifetime's).
+    pub(crate) from: Option<(u16, u16)>,
+    /// The engine lifetime and resize ordinal it carries.
+    pub(crate) lifetime: u64,
+    pub(crate) ordinal: u64,
+}
+
+/// WHERE A READER'S SPINE GOES (crash restore, increment 4): the temporal
+/// recorder's channel ([`TemporalMsg`]) or the crash-restore journal's tail
+/// (`crate::crash_restore`). Both need the same discipline — every resize the
+/// engine applied, in engine order and before the input that followed it, net-zero
+/// flaps included, read from the engine's own resize journal — so the watermark
+/// ([`SpineMark`]) is one piece of code and only where it writes differs. A sink
+/// answers `false` when it could not take a record; the mark then stops there and
+/// the next hold retries from where it stopped, so input is never recorded at a
+/// geometry the sink does not hold yet.
+pub(crate) trait SpineSink {
+    /// One resize the engine applied.
+    fn resize(&mut self, resize: SpineResize) -> bool;
+    /// `n` resizes the engine's journal overran before a hold read them.
+    fn resizes_lost(&mut self, n: u64) -> bool;
+    /// The bytes the hold processed, after every resize before them.
+    fn bytes(&mut self, bytes: &[u8]) -> bool;
+}
+
+/// The temporal recorder's channel as a [`SpineSink`]: bounded `try_send`s that
+/// never block the reader.
+struct TemporalSink<'a>(&'a std::sync::mpsc::SyncSender<TemporalMsg>);
+
+impl SpineSink for TemporalSink<'_> {
+    fn resize(&mut self, resize: SpineResize) -> bool {
+        self.0
+            .try_send(TemporalMsg::Resize {
+                rows: resize.to.0,
+                cols: resize.to.1,
+            })
+            .is_ok()
+    }
+
+    fn resizes_lost(&mut self, n: u64) -> bool {
+        self.0.try_send(TemporalMsg::ResizesLost(n)).is_ok()
+    }
+
+    fn bytes(&mut self, bytes: &[u8]) -> bool {
+        self.0
+            .try_send(TemporalMsg::RawIn(Arc::from(bytes)))
+            .is_ok()
+    }
+}
+
 impl SpineMark {
     /// A reader's mark, starting where the session's previous reader left the
     /// spine (or where its keyframe seeded it). Built at attach, after the
@@ -193,6 +249,15 @@ impl SpineMark {
             at: shared.load(),
             shared,
         }
+    }
+
+    /// Put the watermark at `pre`: a keyframe read in the same hold holds every
+    /// resize up to it, so none of those may be recorded after it (the journal's
+    /// keyframes, `crate::crash_restore`, which a replay would otherwise resize a
+    /// second time).
+    #[cfg(unix)]
+    pub(crate) fn seed(&mut self, pre: SpinePre) {
+        self.advance((pre.lifetime, pre.ordinal));
     }
 
     /// Move the watermark to `at`, and publish it when it moved.
@@ -228,20 +293,35 @@ impl SpineMark {
         term: &Terminal,
         bytes: &[u8],
     ) {
-        if !self.catch_up(tx, pre, term) {
-            return;
-        }
-        if tx.try_send(TemporalMsg::RawIn(Arc::from(bytes))).is_ok() {
-            // Past anything the bytes themselves applied (they replay it).
-            self.advance((term.resize_lifetime(), term.resize_ordinal()));
-        }
+        self.record_to(&mut TemporalSink(tx), pre, term, bytes);
     }
 
-    /// Bring the spine up to `pre`'s resize ordinal. `false`: a resize could
-    /// not be queued, so the caller must not queue input after it.
-    fn catch_up(
+    /// [`Self::record`] into any [`SpineSink`]: every resize up to `pre`, then
+    /// `bytes`. `false` when the sink refused a record (the watermark stays where
+    /// the sink stopped, and the bytes were not recorded).
+    pub(crate) fn record_to(
         &mut self,
-        tx: &std::sync::mpsc::SyncSender<TemporalMsg>,
+        sink: &mut impl SpineSink,
+        pre: SpinePre,
+        term: &Terminal,
+        bytes: &[u8],
+    ) -> bool {
+        if !self.catch_up(sink, pre, term) {
+            return false;
+        }
+        if !sink.bytes(bytes) {
+            return false;
+        }
+        // Past anything the bytes themselves applied (they replay it).
+        self.advance((term.resize_lifetime(), term.resize_ordinal()));
+        true
+    }
+
+    /// Bring the sink up to `pre`'s resize ordinal. `false`: a resize could not
+    /// be recorded, so the caller must not record input after it.
+    pub(crate) fn catch_up(
+        &mut self,
+        sink: &mut impl SpineSink,
         pre: SpinePre,
         term: &Terminal,
     ) -> bool {
@@ -253,11 +333,13 @@ impl SpineMark {
                 ordinal
             }
             _ => {
-                let resize = TemporalMsg::Resize {
-                    rows: pre.rows,
-                    cols: pre.cols,
+                let resize = SpineResize {
+                    to: (pre.rows, pre.cols),
+                    from: None,
+                    lifetime: pre.lifetime,
+                    ordinal: pre.ordinal,
                 };
-                if tx.try_send(resize).is_err() {
+                if !sink.resize(resize) {
                     return false;
                 }
                 self.advance((pre.lifetime, pre.ordinal));
@@ -266,7 +348,7 @@ impl SpineMark {
         };
         let (reports, lost) = term.resize_journal_since(since);
         if lost > 0 {
-            if tx.try_send(TemporalMsg::ResizesLost(lost)).is_err() {
+            if !sink.resizes_lost(lost) {
                 return false;
             }
             // Counted once: the watermark moves past what the journal lost.
@@ -276,11 +358,13 @@ impl SpineMark {
             self.advance((pre.lifetime, first_kept));
         }
         for report in reports.iter().filter(|r| r.ordinal <= pre.ordinal) {
-            let resize = TemporalMsg::Resize {
-                rows: report.to.0,
-                cols: report.to.1,
+            let resize = SpineResize {
+                to: report.to,
+                from: Some(report.from),
+                lifetime: pre.lifetime,
+                ordinal: report.ordinal,
             };
-            if tx.try_send(resize).is_err() {
+            if !sink.resize(resize) {
                 return false;
             }
             self.advance((pre.lifetime, report.ordinal));

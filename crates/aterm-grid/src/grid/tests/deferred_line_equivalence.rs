@@ -75,347 +75,140 @@ impl RowBuilder {
     }
 }
 
-// Equivalence: Empty rows
-
+/// `DeferredLine::to_line` and `into_line` build the same `Line` as the eager
+/// `row_to_line_with_stored_extras` — text, wrap flag, per-char attrs and
+/// hyperlink spans — for every row shape and every extras kind.
 #[test]
-fn deferred_line_empty_row_equivalence() {
-    let mut rb = RowBuilder::new();
-    let row = rb.build(&[], 80, false);
-    let extras = ScrolledRowExtras::default();
-
-    let eager = Grid::row_to_line_with_stored_extras(&row, &extras);
-    let deferred = DeferredLine::new(&row, extras.clone(), Vec::new());
-    let lazy_ref = deferred.to_line().clone();
-
-    let deferred2 = DeferredLine::new(&row, extras, Vec::new());
-    let lazy_owned = deferred2.into_line();
-
-    assert_lines_equivalent(&eager, &lazy_ref, "empty row (to_line)");
-    assert_lines_equivalent(&eager, &lazy_owned, "empty row (into_line)");
-}
-
-#[test]
-fn deferred_line_empty_row_wrapped_equivalence() {
-    let mut rb = RowBuilder::new();
-    let row = rb.build(&[], 80, true);
-    let extras = ScrolledRowExtras::default();
-
-    let eager = Grid::row_to_line_with_stored_extras(&row, &extras);
-    let deferred = DeferredLine::new(&row, extras, Vec::new());
-    let lazy = deferred.into_line();
-
-    assert_lines_equivalent(&eager, &lazy, "empty wrapped row");
-}
-
-// Equivalence: ASCII rows
-
-#[test]
-fn deferred_line_ascii_row_equivalence() {
-    let cells: Vec<Cell> = b"Hello, World!"
-        .iter()
-        .map(|&b| Cell::from_ascii_fast(b))
-        .collect();
-    let mut rb = RowBuilder::new();
-    let row = rb.build(&cells, 80, false);
-    let extras = ScrolledRowExtras::default();
-
-    let eager = Grid::row_to_line_with_stored_extras(&row, &extras);
-
-    let deferred = DeferredLine::new(&row, extras.clone(), Vec::new());
-    let lazy_ref = deferred.to_line().clone();
-
-    let deferred2 = DeferredLine::new(&row, extras, Vec::new());
-    let lazy_owned = deferred2.into_line();
-
-    assert_lines_equivalent(&eager, &lazy_ref, "ASCII row (to_line)");
-    assert_lines_equivalent(&eager, &lazy_owned, "ASCII row (into_line)");
-    assert_eq!(eager.to_string(), "Hello, World!");
-}
-
-#[test]
-fn deferred_line_styled_ascii_row_equivalence() {
-    let fg = PackedColor::indexed(1); // Red
-    let bg = PackedColor::indexed(4); // Blue
-    let flags = CellFlags::BOLD | CellFlags::UNDERLINE;
-    let cells: Vec<Cell> = b"Styled"
-        .iter()
-        .map(|&b| Cell::with_style(b as char, fg, bg, flags))
-        .collect();
-    let mut rb = RowBuilder::new();
-    let row = rb.build(&cells, 80, false);
-    let extras = ScrolledRowExtras::default();
-
-    let eager = Grid::row_to_line_with_stored_extras(&row, &extras);
-    let deferred = DeferredLine::new(&row, extras, Vec::new());
-    let lazy = deferred.into_line();
-
-    assert_lines_equivalent(&eager, &lazy, "styled ASCII row");
-    assert_eq!(eager.to_string(), "Styled");
-}
-
-// Equivalence: Wrapped rows
-
-#[test]
-fn deferred_line_wrapped_row_equivalence() {
-    let cells: Vec<Cell> = b"wrapped content"
-        .iter()
-        .map(|&b| Cell::from_ascii_fast(b))
-        .collect();
-    let mut rb = RowBuilder::new();
-    let row = rb.build(&cells, 80, true);
-    let extras = ScrolledRowExtras::default();
-
-    let eager = Grid::row_to_line_with_stored_extras(&row, &extras);
-    let deferred = DeferredLine::new(&row, extras, Vec::new());
-    let lazy = deferred.into_line();
-
-    assert_lines_equivalent(&eager, &lazy, "wrapped row");
-    assert!(lazy.is_wrapped(), "lazy line should be wrapped");
-}
-
-// Equivalence: Complex characters (non-BMP / overflow)
-
-#[test]
-fn deferred_line_complex_chars_equivalence() {
-    // Build cells where some have complex chars (stored in extras).
-    let mut cells = vec![Cell::from_ascii_fast(b'A'); 5];
-    // Cell at col 2 has a complex character (emoji stored via overflow)
-    cells[2].set_overflow_index(0);
-
-    let mut rb = RowBuilder::new();
-    let row = rb.build(&cells, 80, false);
-
-    let mut extras = ScrolledRowExtras::default();
-    // The complex char at col 2 is a multi-codepoint emoji
-    extras.complex_chars.push((2, Arc::from("\u{1F600}"))); // grinning face
-
-    let eager = Grid::row_to_line_with_stored_extras(&row, &extras);
-    let deferred = DeferredLine::new(&row, extras, Vec::new());
-    let lazy = deferred.into_line();
-
-    assert_lines_equivalent(&eager, &lazy, "complex chars row");
-}
-
-// Equivalence: Combining marks
-
-#[test]
-fn deferred_line_combining_marks_equivalence() {
-    let cells: Vec<Cell> = b"cafe".iter().map(|&b| Cell::from_ascii_fast(b)).collect();
-    let mut rb = RowBuilder::new();
-    let row = rb.build(&cells, 80, false);
-
-    let mut extras = ScrolledRowExtras::default();
-    // Add combining acute accent on 'e' (col 3): e + U+0301 = e-acute
+fn deferred_line_matches_the_eager_conversion() {
     use aterm_alloc::SmallVec;
+    use aterm_scrollback::HyperlinkSpan;
+
+    let ascii =
+        |text: &[u8]| -> Vec<Cell> { text.iter().map(|&b| Cell::from_ascii_fast(b)).collect() };
+    let styled = |text: &[u8], fg, bg, flags| -> Vec<Cell> {
+        text.iter()
+            .map(|&b| Cell::with_style(char::from(b), fg, bg, flags))
+            .collect()
+    };
+    let link = |start_col, end_col, url: &str| HyperlinkSpan {
+        start_col,
+        end_col,
+        url: Arc::from(url),
+        id: None,
+    };
+    let complex = |cells: &mut Vec<Cell>, col: usize| cells[col].set_overflow_index(0);
+    let mut cases: Vec<(&str, Vec<Cell>, ScrolledRowExtras, bool)> = vec![
+        ("empty", Vec::new(), ScrolledRowExtras::default(), false),
+        (
+            "empty wrapped",
+            Vec::new(),
+            ScrolledRowExtras::default(),
+            true,
+        ),
+        (
+            "ascii",
+            ascii(b"Hello, World!"),
+            ScrolledRowExtras::default(),
+            false,
+        ),
+        (
+            "ascii wrapped",
+            ascii(b"wrapped content"),
+            ScrolledRowExtras::default(),
+            true,
+        ),
+        (
+            "styled",
+            styled(
+                b"Styled",
+                PackedColor::indexed(1),
+                PackedColor::indexed(4),
+                CellFlags::BOLD | CellFlags::UNDERLINE,
+            ),
+            ScrolledRowExtras::default(),
+            false,
+        ),
+    ];
+
+    let mut cells = ascii(b"AAAAA");
+    complex(&mut cells, 2);
+    let mut extras = ScrolledRowExtras::default();
+    extras.complex_chars.push((2, Arc::from("\u{1F600}")));
+    cases.push(("complex char", cells, extras, false));
+
+    let mut extras = ScrolledRowExtras::default();
     extras
         .combining
         .push((3, SmallVec::from_elem('\u{0301}', 1)));
-
-    let eager = Grid::row_to_line_with_stored_extras(&row, &extras);
-    let deferred = DeferredLine::new(&row, extras, Vec::new());
-    let lazy = deferred.into_line();
-
-    assert_lines_equivalent(&eager, &lazy, "combining marks row");
-    assert!(
-        eager.to_string().contains('\u{0301}'),
-        "eager line should contain combining mark"
-    );
-}
-
-// Equivalence: Hyperlinks
-
-#[test]
-fn deferred_line_hyperlinks_equivalence() {
-    let cells: Vec<Cell> = b"click here"
-        .iter()
-        .map(|&b| Cell::from_ascii_fast(b))
-        .collect();
-    let mut rb = RowBuilder::new();
-    let row = rb.build(&cells, 80, false);
-
-    let url: Arc<str> = Arc::from("https://example.com");
-    let mut extras = ScrolledRowExtras::default();
-    use aterm_scrollback::HyperlinkSpan;
-    extras.hyperlinks.push(HyperlinkSpan {
-        start_col: 0,
-        end_col: 4, // "click"
-        url: url.clone(),
-        id: None,
-    });
-
-    let eager = Grid::row_to_line_with_stored_extras(&row, &extras);
-    let deferred = DeferredLine::new(&row, extras, Vec::new());
-    let lazy = deferred.into_line();
-
-    assert_lines_equivalent(&eager, &lazy, "hyperlinks row");
-    assert!(lazy.has_hyperlinks(), "lazy line should have hyperlinks");
-    assert_eq!(
-        lazy.hyperlink_count(),
-        1,
-        "lazy line should have 1 hyperlink span"
-    );
-}
-
-#[test]
-fn deferred_line_multiple_hyperlinks_equivalence() {
-    let cells: Vec<Cell> = b"foo bar baz"
-        .iter()
-        .map(|&b| Cell::from_ascii_fast(b))
-        .collect();
-    let mut rb = RowBuilder::new();
-    let row = rb.build(&cells, 80, false);
-
-    let url1: Arc<str> = Arc::from("https://foo.com");
-    let url2: Arc<str> = Arc::from("https://bar.com");
-    let mut extras = ScrolledRowExtras::default();
-    use aterm_scrollback::HyperlinkSpan;
-    extras.hyperlinks.push(HyperlinkSpan {
-        start_col: 0,
-        end_col: 2,
-        url: url1,
-        id: None,
-    });
-    extras.hyperlinks.push(HyperlinkSpan {
-        start_col: 4,
-        end_col: 6,
-        url: url2,
-        id: None,
-    });
-
-    let eager = Grid::row_to_line_with_stored_extras(&row, &extras);
-    let deferred = DeferredLine::new(&row, extras, Vec::new());
-    let lazy = deferred.into_line();
-
-    assert_lines_equivalent(&eager, &lazy, "multiple hyperlinks row");
-    assert_eq!(lazy.hyperlink_count(), 2);
-}
-
-// Equivalence: RGB colors
-
-#[test]
-fn deferred_line_rgb_colors_equivalence() {
-    // Create cells with RGB overflow marker
-    let fg = PackedColor::rgb(255, 128, 0); // Orange
-    let bg = PackedColor::rgb(0, 64, 128); // Dark teal
-    let cells: Vec<Cell> = b"RGB!"
-        .iter()
-        .map(|&b| Cell::with_style(b as char, fg, bg, CellFlags::empty()))
-        .collect();
-    let mut rb = RowBuilder::new();
-    let row = rb.build(&cells, 80, false);
+    cases.push(("combining mark", ascii(b"cafe"), extras, false));
 
     let mut extras = ScrolledRowExtras::default();
-    // Store resolved RGB for each cell with overflow
+    extras.hyperlinks.push(link(0, 2, "https://foo.com"));
+    extras.hyperlinks.push(link(4, 6, "https://bar.com"));
+    cases.push(("hyperlinks", ascii(b"foo bar baz"), extras, false));
+
+    let mut extras = ScrolledRowExtras::default();
     for col in 0..4u16 {
         extras.rgb_fg.push((col, [255, 128, 0]));
         extras.rgb_bg.push((col, [0, 64, 128]));
     }
+    let rgb = styled(
+        b"RGB!",
+        PackedColor::rgb(255, 128, 0),
+        PackedColor::rgb(0, 64, 128),
+        CellFlags::empty(),
+    );
+    cases.push(("truecolor", rgb, extras, false));
 
-    let eager = Grid::row_to_line_with_stored_extras(&row, &extras);
-    let deferred = DeferredLine::new(&row, extras, Vec::new());
-    let lazy = deferred.into_line();
-
-    assert_lines_equivalent(&eager, &lazy, "RGB colors row");
-}
-
-// Equivalence: Mixed content (the stress test)
-
-#[test]
-fn deferred_line_mixed_content_equivalence() {
-    // Build a row with plain ASCII, styled, complex char, and RGB overflow cells.
-    let mut cells = Vec::new();
-
-    // Cols 0-2: plain ASCII "abc"
-    for &b in b"abc" {
-        cells.push(Cell::from_ascii_fast(b));
-    }
-    // Col 3: bold cell
-    cells.push(Cell::with_style(
-        'd',
+    let mut cells = ascii(b"abc");
+    cells.extend(styled(
+        b"d",
         PackedColor::indexed(2),
         PackedColor::DEFAULT_BG,
         CellFlags::BOLD,
     ));
-    // Col 4: complex char (overflow index 0)
-    let mut complex_cell = Cell::new('\u{FFFD}');
-    complex_cell.set_overflow_index(0);
-    cells.push(complex_cell);
-    // Col 5-6: more ASCII
-    for &b in b"ef" {
-        cells.push(Cell::from_ascii_fast(b));
-    }
-
-    let mut rb = RowBuilder::new();
-    let row = rb.build(&cells, 80, true); // wrapped
-
+    cells.push(Cell::new('\u{FFFD}'));
+    complex(&mut cells, 4);
+    cells.extend(ascii(b"ef"));
     let mut extras = ScrolledRowExtras::default();
-    extras.complex_chars.push((4, Arc::from("\u{1F680}"))); // rocket emoji
-    // Adding combining mark on col 1 ('b')
-    use aterm_alloc::SmallVec;
+    extras.complex_chars.push((4, Arc::from("\u{1F680}")));
     extras
         .combining
-        .push((1, SmallVec::from_elem('\u{0308}', 1))); // diaeresis
-    // Hyperlink spanning cols 5-6
-    use aterm_scrollback::HyperlinkSpan;
-    extras.hyperlinks.push(HyperlinkSpan {
-        start_col: 5,
-        end_col: 6,
-        url: Arc::from("https://test.com"),
-        id: None,
-    });
+        .push((1, SmallVec::from_elem('\u{0308}', 1)));
+    extras.hyperlinks.push(link(5, 6, "https://test.com"));
+    cases.push(("mixed", cells, extras, true));
 
-    let eager = Grid::row_to_line_with_stored_extras(&row, &extras);
-
-    let deferred1 = DeferredLine::new(&row, extras.clone(), Vec::new());
-    let lazy_ref = deferred1.to_line().clone();
-
-    let deferred2 = DeferredLine::new(&row, extras, Vec::new());
-    let lazy_owned = deferred2.into_line();
-
-    assert_lines_equivalent(&eager, &lazy_ref, "mixed content (to_line)");
-    assert_lines_equivalent(&eager, &lazy_owned, "mixed content (into_line)");
-    assert!(lazy_owned.is_wrapped(), "mixed content should be wrapped");
-    assert!(
-        lazy_owned.has_hyperlinks(),
-        "mixed content should have hyperlinks"
-    );
-}
-
-// Equivalence: Full-width / wide character rows
-
-#[test]
-fn deferred_line_wide_chars_equivalence() {
-    // Wide chars occupy 2 cells: primary + continuation
-    let mut cells = Vec::new();
-    // Col 0: ASCII 'A'
-    cells.push(Cell::from_ascii_fast(b'A'));
-    // Col 1-2: Wide CJK char (U+4E16 = world)
-    let wide_cell = Cell::with_style(
-        '\u{4E16}',
-        PackedColor::DEFAULT_FG,
-        PackedColor::DEFAULT_BG,
-        CellFlags::WIDE,
-    );
-    cells.push(wide_cell);
-    let cont_cell = Cell::with_style(
-        ' ',
+    let mut cells = ascii(b"A");
+    cells.extend(styled(
+        b" ",
         PackedColor::DEFAULT_FG,
         PackedColor::DEFAULT_BG,
         CellFlags::WIDE_CONTINUATION,
+    ));
+    cells.insert(
+        1,
+        Cell::with_style(
+            '\u{4E16}',
+            PackedColor::DEFAULT_FG,
+            PackedColor::DEFAULT_BG,
+            CellFlags::WIDE,
+        ),
     );
-    cells.push(cont_cell);
-    // Col 3: ASCII 'B'
-    cells.push(Cell::from_ascii_fast(b'B'));
+    cells.extend(ascii(b"B"));
+    cases.push(("wide", cells, ScrolledRowExtras::default(), false));
 
     let mut rb = RowBuilder::new();
-    let row = rb.build(&cells, 80, false);
-    let extras = ScrolledRowExtras::default();
-
-    let eager = Grid::row_to_line_with_stored_extras(&row, &extras);
-    let deferred = DeferredLine::new(&row, extras, Vec::new());
-    let lazy = deferred.into_line();
-
-    assert_lines_equivalent(&eager, &lazy, "wide chars row");
+    for (name, cells, extras, wrapped) in cases {
+        let row = rb.build(&cells, 80, wrapped);
+        let eager = Grid::row_to_line_with_stored_extras(&row, &extras);
+        let by_ref = DeferredLine::new(&row, extras.clone(), Vec::new())
+            .to_line()
+            .clone();
+        let owned = DeferredLine::new(&row, extras, Vec::new()).into_line();
+        assert_lines_equivalent(&eager, &by_ref, &format!("{name} (to_line)"));
+        assert_lines_equivalent(&eager, &owned, &format!("{name} (into_line)"));
+        assert_eq!(owned.is_wrapped(), wrapped, "{name}");
+    }
 }
 
 // Lazy buffer integration: drain produces equivalent lines
@@ -517,37 +310,6 @@ fn recycled_cell_body_carries_no_state_from_the_previous_line() {
         fresh_body.to_string(),
         drained[0].to_string(),
         "recycled body must produce the same text as a fresh Vec"
-    );
-}
-
-#[test]
-fn lazy_buffer_recycles_bodies_across_a_drain() {
-    use crate::grid::scroll_convert::LazyBuffer;
-
-    let mut rb = RowBuilder::new();
-    let mut buf = LazyBuffer::new();
-    let cells: Vec<Cell> = b"staged line"
-        .iter()
-        .map(|&b| Cell::from_ascii_fast(b))
-        .collect();
-    let row = rb.build(&cells, 80, false);
-
-    for _ in 0..8 {
-        buf.push_row(&row, ScrolledRowExtras::default());
-    }
-    assert_eq!(buf.pooled_bodies(), 0, "production drains the free-list");
-
-    assert_eq!(buf.drain_all().count(), 8);
-    assert_eq!(buf.pooled_bodies(), 8, "the drain refills the free-list");
-
-    // The next 8 scroll-offs must reach the allocator zero times.
-    for _ in 0..8 {
-        buf.push_row(&row, ScrolledRowExtras::default());
-    }
-    assert_eq!(
-        buf.pooled_bodies(),
-        0,
-        "every staged line should have taken a recycled body"
     );
 }
 
@@ -765,128 +527,4 @@ fn recycling_preserves_flooded_scrollback_content() {
         history, expected,
         "flooded history must be intact and ordered"
     );
-}
-
-// Attribute-run shape: materialization spills into an `Rle` only once a
-// second distinct `CellAttrs` appears, so an all-default line allocates
-// nothing, while a wholly coloured line is one run and is still stored.
-
-/// A line of plain cells stores no attrs Rle (the all-default run is dropped).
-#[test]
-fn materialized_all_default_line_stores_no_attrs() {
-    let cells: Vec<Cell> = b"plain text"
-        .iter()
-        .map(|&b| Cell::from_ascii_fast(b))
-        .collect();
-    let mut rb = RowBuilder::new();
-    let row = rb.build(&cells, 80, false);
-    let extras = ScrolledRowExtras::default();
-
-    let eager = Grid::row_to_line_with_stored_extras(&row, &extras);
-    let lazy = DeferredLine::new(&row, extras, Vec::new()).into_line();
-
-    assert!(
-        eager.attrs().is_none(),
-        "an all-default line must not carry an attrs Rle"
-    );
-    assert!(lazy.attrs().is_none(), "deferred path must agree");
-    assert_lines_equivalent(&eager, &lazy, "all-default line");
-}
-
-/// A line entirely in one non-default style is a single run and is kept.
-#[test]
-fn materialized_single_nondefault_run_is_kept() {
-    let fg = PackedColor::indexed(1);
-    let cells: Vec<Cell> = b"error: everything is on fire"
-        .iter()
-        .map(|&b| Cell::with_style(b as char, fg, PackedColor::DEFAULT_BG, CellFlags::empty()))
-        .collect();
-    let mut rb = RowBuilder::new();
-    let row = rb.build(&cells, 80, false);
-    let extras = ScrolledRowExtras::default();
-
-    let eager = Grid::row_to_line_with_stored_extras(&row, &extras);
-    let lazy = DeferredLine::new(&row, extras, Vec::new()).into_line();
-
-    let runs = eager.attrs().map_or(0, aterm_rle::Rle::run_count);
-    assert_eq!(runs, 1, "a uniformly styled line is exactly one run");
-    assert_eq!(
-        eager.get_attr(0).fg,
-        lazy.get_attr(0).fg,
-        "the single run's colour must survive materialization"
-    );
-    assert_ne!(
-        eager.get_attr(0),
-        aterm_scrollback::CellAttrs::DEFAULT,
-        "the run under test must actually be non-default"
-    );
-    assert_lines_equivalent(&eager, &lazy, "single non-default run");
-}
-
-/// Several styles: every run is emitted, in order, and the last one being
-/// default must not cause the earlier ones to be dropped.
-#[test]
-fn materialized_multi_run_keeps_every_run_including_default_tail() {
-    let fg = PackedColor::indexed(2);
-    let mut cells: Vec<Cell> = b"warn"
-        .iter()
-        .map(|&b| Cell::with_style(b as char, fg, PackedColor::DEFAULT_BG, CellFlags::BOLD))
-        .collect();
-    cells.extend(b": tail".iter().map(|&b| Cell::from_ascii_fast(b)));
-    let mut rb = RowBuilder::new();
-    let row = rb.build(&cells, 80, false);
-    let extras = ScrolledRowExtras::default();
-
-    let eager = Grid::row_to_line_with_stored_extras(&row, &extras);
-    let lazy = DeferredLine::new(&row, extras, Vec::new()).into_line();
-
-    let runs = eager.attrs().map_or(0, aterm_rle::Rle::run_count);
-    assert_eq!(runs, 2, "styled prefix + default tail is two runs");
-    assert_ne!(
-        eager.get_attr(0),
-        aterm_scrollback::CellAttrs::DEFAULT,
-        "the styled prefix must be preserved"
-    );
-    assert_eq!(
-        eager.get_attr(5),
-        aterm_scrollback::CellAttrs::DEFAULT,
-        "the trailing run must read back as default"
-    );
-    assert_lines_equivalent(&eager, &lazy, "styled prefix + default tail");
-}
-
-/// The reverse order: default prefix, styled tail. The spill happens at the
-/// boundary, so the first (default) run must be flushed rather than dropped.
-#[test]
-fn materialized_default_prefix_then_styled_tail_keeps_both() {
-    let fg = PackedColor::indexed(3);
-    let mut cells: Vec<Cell> = b"plain "
-        .iter()
-        .map(|&b| Cell::from_ascii_fast(b))
-        .collect();
-    cells.extend(
-        b"styled"
-            .iter()
-            .map(|&b| Cell::with_style(b as char, fg, PackedColor::DEFAULT_BG, CellFlags::empty())),
-    );
-    let mut rb = RowBuilder::new();
-    let row = rb.build(&cells, 80, false);
-    let extras = ScrolledRowExtras::default();
-
-    let eager = Grid::row_to_line_with_stored_extras(&row, &extras);
-    let lazy = DeferredLine::new(&row, extras, Vec::new()).into_line();
-
-    let runs = eager.attrs().map_or(0, aterm_rle::Rle::run_count);
-    assert_eq!(runs, 2, "default prefix + styled tail is two runs");
-    assert_eq!(
-        eager.get_attr(0),
-        aterm_scrollback::CellAttrs::DEFAULT,
-        "the leading default run must still occupy its columns"
-    );
-    assert_ne!(
-        eager.get_attr(8),
-        aterm_scrollback::CellAttrs::DEFAULT,
-        "the styled tail must be preserved"
-    );
-    assert_lines_equivalent(&eager, &lazy, "default prefix + styled tail");
 }

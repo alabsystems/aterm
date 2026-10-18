@@ -45,9 +45,8 @@ impl Scrollback {
     }
 }
 
-/// The cold-tier surface the streaming walk needs, shared by the in-memory
-/// [`ColdTier`](crate::ColdTier) and the disk-backed `DiskColdTier` so one
-/// [`read_segment_tiers`] serves both scrollback types.
+/// The cold-tier surface the streaming walk needs from
+/// [`ColdTier`](crate::ColdTier), which [`read_segment_tiers`] reads through.
 pub(crate) trait ColdSegments {
     fn line_count(&self) -> usize;
     fn take_lines_from(&self, idx: usize) -> Result<Vec<Line>, ScrollbackError>;
@@ -63,19 +62,6 @@ impl ColdSegments for crate::ColdTier {
     }
     fn segment_len_at(&self, idx: usize) -> usize {
         crate::ColdTier::segment_len_at(self, idx)
-    }
-}
-
-#[cfg(feature = "disk-tier")]
-impl ColdSegments for crate::DiskColdTier {
-    fn line_count(&self) -> usize {
-        crate::DiskColdTier::line_count(self)
-    }
-    fn take_lines_from(&self, idx: usize) -> Result<Vec<Line>, ScrollbackError> {
-        crate::DiskColdTier::take_lines_from(self, idx)
-    }
-    fn segment_len_at(&self, idx: usize) -> usize {
-        crate::DiskColdTier::segment_len_at(self, idx)
     }
 }
 
@@ -146,8 +132,6 @@ impl ScrollbackStorage {
         let end = self.line_count();
         let hot_start = match self {
             ScrollbackStorage::Memory(sb) => sb.hot_start(),
-            #[cfg(feature = "disk-tier")]
-            ScrollbackStorage::Disk(sb) => sb.hot_start(),
         };
         DenseScrollbackIter {
             storage: self,

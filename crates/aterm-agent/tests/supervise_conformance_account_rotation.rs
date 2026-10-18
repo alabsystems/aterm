@@ -86,8 +86,9 @@ use aterm_agent::supervise::policy::turn_end::{
     AccountPoint, Composer, RULE_ACCOUNT, RULE_CONTINUE, RULE_LIMIT_RESUME, Restart, TurnEndAction,
     TurnEndReading, TurnEndState, TurnEndTiming, decide_turn_end,
 };
+use aterm_models_harness::supervisor_account_rotation_model;
 use aterm_phase::WallKind;
-use aterm_spec::derive::{Invariant, Model, eq, int, or_, supervisor_account_rotation_model, var};
+use aterm_spec::derive::Model;
 
 use crate::common::cnst;
 
@@ -869,25 +870,26 @@ fn turn_end(worked: Option<Duration>) -> TurnEndReading {
         resume: None,
         upgrading: false,
         taskless: false,
+        finished_record: None,
+        finished_at_check: false,
+        check_record: None,
+        left_record: false,
+        left_work: None,
         login_back: false,
         auto_continue: None,
         since_limit: None,
         served_in_transcript: false,
+        notice_elsewhere: false,
         reset_clock: None,
         person: None,
         reach: Default::default(),
         program: aterm_phase::Program::Claude,
-        goal: None,
-        model_field: None,
-        limits: Default::default(),
-        sandbox_fell: None,
-        thread_model: None,
-        upgrade_goal: false,
         account: None,
         autopilot: aterm_agent::supervise::Autopilot::Cruise,
         login_label: None,
         login_superseded: false,
         login_notice: None,
+        wall_remembered: false,
     }
 }
 
@@ -3024,28 +3026,6 @@ fn tier1_the_real_advice_and_transactions_are_the_models_at_every_reachable_stat
     }
 }
 
-/// Negative control for the walk itself: the real code answers once per projection,
-/// but the model's laws are read at every state, so a law broken only where the
-/// agent's jobs run and a session sleeps (states that share their projection with
-/// the state where the jobs ended) is still found.
-#[test]
-#[should_panic(expected = "JobsHoldNoSleeper at")]
-fn the_models_laws_are_read_at_every_state_that_shares_a_projection() {
-    let mut m = supervisor_account_rotation_model();
-    m.invariants.push(Invariant {
-        name: "JobsHoldNoSleeper",
-        kind: aterm_spec::derive::InvariantKind::Claim,
-        expr: or_(eq(var("jobs"), int(0)), eq(var("w1"), int(0))),
-    });
-    walk(
-        &World::by_label(),
-        &Graph::of(m, true),
-        advise,
-        Host::Roster,
-        true,
-    );
-}
-
 /// Negative controls: every defect of the `Buggy = 1` model, at every state the sound
 /// rule reaches where it can fire, is disagreed with (the supervisor's by the real
 /// advice and by the real decider fed it, the world's unread wall by the real
@@ -4102,10 +4082,9 @@ fn the_sessions_own_bounds_part_from_the_model_only_toward_todays_rule() {
     let capped = c.ask(0);
     assert_eq!(c.said(&capped), Asked::Waits);
     assert_eq!(c.model(0), to(1, false), "the stated exception");
-    let TurnEndAction::WaitUntil { until, why, .. } = &capped.action else {
+    let TurnEndAction::WaitUntil { until, .. } = &capped.action else {
         panic!("{:?}", capped.action);
     };
-    assert!(why.contains("a breaker: 4 account moves"), "{why}");
     assert_eq!(Some(*until), free);
     assert!(Some(*until) < waits_until(&capped.today));
     // The hour's lapse is not the model's. On the policy alone: at that

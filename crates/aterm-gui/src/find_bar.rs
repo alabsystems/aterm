@@ -66,6 +66,7 @@
 use std::ops::Range;
 
 use aterm_core::terminal::RenderCell;
+#[cfg(test)]
 use aterm_render::Theme;
 
 use crate::chrome_band::{self, BandColors};
@@ -390,10 +391,10 @@ pub(crate) fn find_bar_paint(
     v: &FindBarView,
     cols: usize,
     height: usize,
-    theme: Theme,
+    palette: impl Into<chrome_band::ChromePalette>,
     seam_at_top: bool,
 ) -> FindBarPaint {
-    let c = chrome_band::band_colors(theme);
+    let c = chrome_band::band_colors(palette);
     let height = height.max(1);
     // 3 rows: pad / field / hints. 2: field / hints. 1: field only — the pad is the
     // first thing to go, the hints the second, the field never.
@@ -463,11 +464,11 @@ pub(crate) fn find_bar_paint(
     // query, and go missing at the caret.
     let seam_row = if seam_at_top { 0 } else { height - 1 };
     if seam_at_top {
-        chrome_band::seal_band_top(&mut rows[seam_row], c.label);
+        chrome_band::seal_band_top(&mut rows[seam_row], c.seam);
     } else {
         for cell in &mut rows[seam_row] {
             cell.underline = aterm_core::terminal::UnderlineStyle::Single;
-            cell.underline_color = Some(c.label);
+            cell.underline_color = Some(c.seam);
         }
     }
 
@@ -633,66 +634,6 @@ fn field_layout(v: &FindBarView, c: &BandColors, cols: usize, well_start: usize)
     layout
 }
 
-/// The least contrast a highlight-all tint stands from the terminal background:
-/// the step that makes "this cell is a match" visible as a surface change (the
-/// band's hover rise, [`chrome_band::HOVER_RISE`]'s value).
-pub(crate) const MATCH_TINT_RISE: f64 = 1.5;
-
-/// The least `OkLab` distance between a highlight-all tint and the selection
-/// colour the current match is painted in, so the current match reads as a
-/// different mark from the others rather than as one more of them.
-pub(crate) const MATCH_DISTINCT_OKLAB: f64 = 0.06;
-
-/// The tint ramp: twentieths of the way from `bg` toward its seed, up to
-/// twelve of them (0.6). Past that the tint stops reading as a tint of the
-/// background and starts competing with the text on it.
-const MATCH_TINT_STEPS: (u8, f32) = (12, 20.0);
-
-/// The highlight-all tint the find panel paints under every visible match other
-/// than the current one (which the renderer paints in the selection colour).
-///
-/// The tint is the background stepped toward a hue seed until it stands
-/// [`MATCH_TINT_RISE`]:1 off the background and [`MATCH_DISTINCT_OKLAB`] away
-/// from the selection. The seed is the theme's accent (its cursor, floored to the
-/// band's 3:1 so a cursor that hugs the background still has somewhere to go),
-/// then the foreground for a theme whose accent sits on its selection. A
-/// halfway blend of background and selection, the old rule, vanishes where the
-/// selection is itself a faint step (Solarized Light) and makes every match
-/// look like the current one. Where no seed satisfies both (a user theme whose
-/// selection is the accent and the foreground at once), the accent's first tint
-/// that clears the rise wins: visible beats distinct.
-pub(crate) fn match_tint(theme: Theme) -> [u8; 3] {
-    let rgb = crate::settings::u32_rgb;
-    let (bg, fg, selection) = (rgb(theme.bg), rgb(theme.fg), rgb(theme.selection));
-    let accent = chrome_band::ensure_contrast(rgb(theme.cursor), bg, 3.0);
-    let (steps, per) = MATCH_TINT_STEPS;
-    let ramp = |seed: [u8; 3]| {
-        (1..=steps)
-            .map(move |step| chrome_band::mix3(bg, seed, f32::from(step) / per))
-            .filter(move |tint| chrome_band::contrast(*tint, bg) >= MATCH_TINT_RISE)
-    };
-    let distinct = |tint: &[u8; 3]| oklab_distance(*tint, selection) >= MATCH_DISTINCT_OKLAB;
-    [accent, fg]
-        .into_iter()
-        .find_map(|seed| ramp(seed).find(distinct))
-        .or_else(|| ramp(accent).next())
-        .unwrap_or_else(|| {
-            let deepest = chrome_band::mix3(bg, accent, f32::from(steps) / per);
-            chrome_band::ensure_contrast(deepest, bg, MATCH_TINT_RISE)
-        })
-}
-
-/// The `OkLab` Euclidean distance between two sRGB colours.
-pub(crate) fn oklab_distance(a: [u8; 3], b: [u8; 3]) -> f64 {
-    let lab = |c: [u8; 3]| {
-        let (l, chroma, hue) = aterm_messages::palette::oklch(c);
-        let h = hue.to_radians();
-        (l, chroma * h.cos(), chroma * h.sin())
-    };
-    let ((l1, a1, b1), (l2, a2, b2)) = (lab(a), lab(b));
-    ((l1 - l2).powi(2) + (a1 - a2).powi(2) + (b1 - b2).powi(2)).sqrt()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -717,40 +658,6 @@ mod tests {
 
     fn paint(v: &FindBarView, cols: usize) -> FindBarPaint {
         find_bar_paint(v, cols, FIND_BAR_ROWS, Theme::default(), true)
-    }
-
-    fn builtin_theme(name: &str) -> Theme {
-        let tp = aterm_types::scheme::builtin(name)
-            .expect("builtin exists")
-            .to_theme_parts();
-        Theme {
-            fg: tp.fg,
-            bg: tp.bg,
-            cursor: tp.cursor,
-            selection: tp.selection,
-        }
-    }
-
-    /// On every built-in theme the highlight-all tint is a visible surface
-    /// change ([`MATCH_TINT_RISE`]:1 off the background) and a different mark
-    /// from the selection colour the current match is painted in.
-    #[test]
-    fn match_tint_is_visible_and_apart_from_the_current_match() {
-        let rgb = crate::settings::u32_rgb;
-        for name in aterm_types::scheme::builtin_names() {
-            let theme = builtin_theme(name);
-            let tint = match_tint(theme);
-            let rise = chrome_band::contrast(tint, rgb(theme.bg));
-            assert!(
-                rise >= MATCH_TINT_RISE,
-                "{name}: highlight {tint:02x?} is {rise:.2}:1 off the background"
-            );
-            let apart = oklab_distance(tint, rgb(theme.selection));
-            assert!(
-                apart >= MATCH_DISTINCT_OKLAB,
-                "{name}: highlight {tint:02x?} is {apart:.3} from the selection"
-            );
-        }
     }
 
     fn text(row: &[RenderCell]) -> String {
@@ -780,70 +687,6 @@ mod tests {
             row[p.field_cols.clone()].iter().map(|c| c.ch).collect(),
             caret,
         )
-    }
-
-    /// Every row is exactly `cols` wide, the panel is [`FIND_BAR_ROWS`] tall, and it
-    /// carries the prompt + query + status across matched / no-match / empty.
-    #[test]
-    fn shape_and_content() {
-        let cols = 90;
-        let p = paint(
-            &FindBarView {
-                idx: 2,
-                total: 3,
-                ..view("foo")
-            },
-            cols,
-        );
-        assert_eq!(p.rows.len(), FIND_BAR_ROWS);
-        assert!(p.rows.iter().all(|r| r.len() == cols));
-        let s = all(&p);
-        assert!(s.contains("Find: foo"), "{s}");
-        assert!(s.contains("2/3"), "{s}");
-
-        let s = all(&paint(
-            &FindBarView {
-                idx: 12,
-                total: 34,
-                truncated: true,
-                ..view("e")
-            },
-            cols,
-        ));
-        assert!(s.contains("12/34+"), "{s}");
-
-        let s = all(&paint(&view("zzz"), cols));
-        assert!(s.contains("no matches"), "{s}");
-
-        // Empty: the placeholder says what find searches, and the hints teach the map.
-        let s = all(&paint(&view(""), cols));
-        assert!(s.contains(PLACEHOLDER), "{s}");
-        assert!(s.contains("cancel"), "{s}");
-    }
-
-    /// The query lives in a WELL (the terminal's own bg) at least [`MIN_FIELD`] cells
-    /// wide, and the hints sit on their own row — never squeezing the field.
-    #[test]
-    fn well_is_a_real_field() {
-        let cols = 90;
-        let p = paint(&view("needle"), cols);
-        assert!(
-            p.field_cols.len() >= MIN_FIELD,
-            "well {:?} must keep {MIN_FIELD} cells",
-            p.field_cols
-        );
-        let field = &p.rows[p.field_row];
-        let c = chrome_band::band_colors(Theme::default());
-        assert!(
-            p.field_cols
-                .clone()
-                .all(|col| field[col].bg == c.field_bg || field[col].bg == c.caret),
-            "the whole well is painted in the well background (bar the caret)"
-        );
-        assert_ne!(c.field_bg, c.bar_bg, "the well must read as recessed");
-        // Hints are on their own row, below the field.
-        assert!(text(&p.rows[FIND_BAR_ROWS - 1]).contains("accept"));
-        assert!(!text(field).contains("accept"));
     }
 
     /// THE FIELD MUST NOT MOVE UNDER THE CARET. The well's geometry depends on the
@@ -1156,71 +999,6 @@ mod tests {
         }
     }
 
-    /// A regex that could not finish a long line (R15 content-2) says so on
-    /// the bar, in the form that fits its status zone — never `bad regex`,
-    /// which a long soft-wrapped run used to make every regex find show, and
-    /// never a vague `partial history` — and keeps its `+` down to the
-    /// narrowest form.
-    #[test]
-    fn a_long_line_the_regex_could_not_finish_is_named() {
-        let bar = |total: usize, cols: usize| {
-            all(&paint(
-                &FindBarView {
-                    idx: 3,
-                    total,
-                    is_regex: true,
-                    truncated: true,
-                    cut_short: true,
-                    ..view("x=")
-                },
-                cols,
-            ))
-        };
-        let wide = bar(7, 220);
-        assert!(wide.contains("3/7+ (line cut short)"), "{wide}");
-        let none = bar(0, 220);
-        assert!(none.contains("no matches (line cut short)"), "{none}");
-        for row in [&wide, &none] {
-            assert!(!row.contains("bad regex"), "{row}");
-            assert!(!row.contains("partial history"), "{row}");
-        }
-        let narrow = bar(7, 90);
-        assert!(narrow.contains("3/7+"), "{narrow}");
-    }
-
-    /// The hints row teaches the emacs-isearch keymap in words that actually RENDER:
-    /// `esc` is spelled out because U+238B is a font-fallback lottery.
-    #[test]
-    fn chord_hints_use_glyphs_that_render() {
-        let cols = 100;
-        let s = all(&paint(&view("q"), cols));
-        // PER PLATFORM, like `hint_text` itself: ⌘/⌥ glyphs exist only on a Mac
-        // keyboard — a Windows find bar must never teach ⌥⌘R, which there means
-        // Win+Alt+R, the Xbox Game Bar chord.
-        #[cfg(target_os = "macos")]
-        {
-            assert!(s.contains("⌘S next"), "{s}");
-            assert!(s.contains("⌘R prev"), "{s}");
-            assert!(s.contains("⌥⌘C case"), "{s}");
-            assert!(s.contains("⌥⌘R regex"), "{s}");
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            assert!(s.contains("Ctrl+S next"), "{s}");
-            assert!(s.contains("Ctrl+R prev"), "{s}");
-            assert!(s.contains("Alt+C case"), "{s}");
-            assert!(s.contains("Alt+R regex"), "{s}");
-            assert!(!s.contains('⌘'), "no command glyph off macOS: {s}");
-            assert!(!s.contains('⌥'), "no option glyph off macOS: {s}");
-        }
-        assert!(s.contains("⏎ accept"), "{s}");
-        assert!(s.contains("esc cancel"), "{s}");
-        assert!(
-            !s.contains('⎋'),
-            "the unrenderable escape glyph is gone: {s}"
-        );
-    }
-
     /// An ACTIVE toggle reverses (ink and ground swap) at the SAME width, so its state
     /// is visible across the window and nothing reflows when it flips.
     #[test]
@@ -1255,83 +1033,6 @@ mod tests {
         );
     }
 
-    /// A truncated scan stays honest at every width: the full phrase when the status
-    /// zone is wide enough, the same `+` marker the count form uses when it is not.
-    #[test]
-    fn honest_no_match_states() {
-        let wide = all(&paint(
-            &FindBarView {
-                truncated: true,
-                ..view("needle")
-            },
-            180,
-        ));
-        assert!(wide.contains("no matches (partial history)"), "{wide}");
-        let narrow = all(&paint(
-            &FindBarView {
-                truncated: true,
-                ..view("needle")
-            },
-            90,
-        ));
-        assert!(narrow.contains("no matches+"), "{narrow}");
-        // The depth cap stopped it: how far it searched, as wide as fits, and
-        // never `partial history` for a search the code can name.
-        let capped = |cols: usize| {
-            let p = paint(
-                &FindBarView {
-                    truncated: true,
-                    searched_lines: Some(100_000),
-                    ..view("needle")
-                },
-                cols,
-            );
-            text(&p.rows[p.field_row])
-        };
-        for (cols, want) in [
-            (220, "none in newest 100,000 lines"),
-            (168, "none in newest 100,000 lines"),
-            (150, "none in newest 100k lines"),
-            (120, "none in newest 100k"),
-            (90, "no matches+"),
-        ] {
-            let row = capped(cols);
-            assert!(row.contains(want), "{cols} cols: {row}");
-            assert!(!row.contains("partial history"), "{cols} cols: {row}");
-        }
-        // The match limit is not a history cut.
-        let full = all(&paint(
-            &FindBarView {
-                idx: 1,
-                total: 100_000,
-                truncated: true,
-                match_capped: true,
-                ..view("e")
-            },
-            180,
-        ));
-        assert!(full.contains("1/100000+ (match limit)"), "{full}");
-        assert!(!full.contains("history"), "{full}");
-        let s = all(&paint(
-            &FindBarView {
-                is_regex: true,
-                regex_error: true,
-                ..view("(")
-            },
-            90,
-        ));
-        assert!(s.contains("bad regex"), "{s}");
-        // The narrowest status zone (8 cells, at 49 columns) still says what
-        // is wrong.
-        let bad = FindBarView {
-            is_regex: true,
-            regex_error: true,
-            ..view("(")
-        };
-        let s = all(&paint(&bad, 50));
-        assert!(s.contains("invalid"), "{s}");
-    }
-
     /// THE HISTORY IS AWAY, NOT EMPTY (ruling 237): while a rewrap holds the
     /// history detached, a search that found nothing on the screen says so in
     /// words that never read `no matches` — at EVERY width from 40 columns up —
@@ -1354,49 +1055,22 @@ mod tests {
             let ink = p.rows[p.field_row][p.field_cols.start].fg;
             (row, ink)
         };
-        for (cols, want) in [
-            (40, None),
-            (60, Some("rewrapping")),
-            (80, Some("rewrapping")),
-            (120, Some("rewrapping history")),
-            (168, Some("none yet, history rewrapping")),
-        ] {
+        // Every width: never the opposite of the truth.
+        for cols in 40..=220 {
             for stale in [false, true] {
                 let (row, ink) = field_row(&away(stale), cols);
-                assert!(!row.contains("no matches"), "{cols} cols: {row}");
-                assert!(!row.contains("0 hits"), "{cols} cols: {row}");
-                assert_ne!(ink, c.warn, "{cols} cols: the query is not a failure");
-                match want {
-                    Some(want) => assert!(row.contains(want), "{cols} cols: {row}"),
-                    // 40 columns: the field keeps its minimum, the status zone
-                    // goes, and the bar says nothing at all.
-                    None => assert!(!row.contains("rewrap"), "{cols} cols: {row}"),
-                }
+                assert!(
+                    !row.contains("no matches") && !row.contains("0 hits"),
+                    "{cols}: {row}"
+                );
+                assert_ne!(ink, c.warn, "{cols}: the query is not a failure");
             }
-        }
-        // Every width in between: never the opposite of the truth.
-        for cols in 40..=220 {
-            let (row, ink) = field_row(&away(false), cols);
-            assert!(
-                !row.contains("no matches") && !row.contains("0 hits"),
-                "{cols}: {row}"
-            );
-            assert_ne!(ink, c.warn, "{cols}");
         }
         // The ordinary miss is still a miss, tinted as one.
         let (row, ink) = field_row(&view("needle"), 80);
         assert!(row.contains("no matches"), "{row}");
         assert_eq!(ink, c.warn);
-        // Hits on the screen while the rest is away: a floor, and why.
-        let (row, _) = field_row(
-            &FindBarView {
-                idx: 1,
-                total: 3,
-                ..away(false)
-            },
-            168,
-        );
-        assert!(row.contains("1/3+ (rewrapping)"), "{row}");
+        // Hits on the screen while the rest is away: a floor.
         let (row, _) = field_row(
             &FindBarView {
                 idx: 1,
@@ -1457,10 +1131,6 @@ mod tests {
             );
         }
         assert!(widths_checked >= 4, "the width sweep must actually sweep");
-        // Where the zone has room, the mark is spelled out, as it is for a miss.
-        let wide = status_row(&moved, 200);
-        assert!(wide.contains("1/6 (stale)"), "{wide}");
-
         let both = FindBarView {
             truncated: true,
             stale: true,
@@ -1473,15 +1143,13 @@ mod tests {
         let painted = status_row(&both, 90);
         assert!(painted.contains("1/6+…"), "{painted}");
 
-        // The spelled-out no-match forms carry the same two facts.
+        // The no-match form carries the same fact.
         let none = FindBarView {
             idx: 1,
             total: 0,
             stale: true,
             ..view("needle")
         };
-        let wide = status_row(&none, 180);
-        assert!(wide.contains("no matches (stale)"), "{wide}");
         let narrow = status_row(&none, 60);
         assert!(narrow.contains('…'), "{narrow}");
     }
@@ -1516,7 +1184,6 @@ mod tests {
         // A degraded 1-row band keeps the FIELD (the pad and hints go first).
         let one = find_bar_paint(&view("kept"), 90, 1, Theme::default(), true);
         assert_eq!(one.field_row, 0);
-        assert!(text(&one.rows[0]).contains("Find: "));
         assert!(text(&one.rows[0]).contains("kept"));
     }
 

@@ -31,7 +31,8 @@ use crate::paint::{
     self, ChipFace, ChipForm, Face, Fill, Geometry, Hover, Icon, Ink, RowPaint, RowSurface,
 };
 pub use crate::palette::luminance;
-use crate::palette::{MeterHue, enc, keeps_pastel, lin, oklch, outline_borrows_blue, pastel_edge};
+use crate::palette::{enc, keeps_pastel, lin, oklch, outline_borrows_blue, pastel_edge};
+use crate::tokens::{AuthoredChrome, ChromeSeeds, ChromeTokens};
 
 // ---- The palette ------------------------------------------------------------
 
@@ -82,6 +83,11 @@ pub struct BandInks {
     /// border. `None` on every theme-derived scheme (`field_bg` is `theme.bg`
     /// against a 0.10/0.16 blend, which already makes the well an inset).
     pub well_rule: Option<[u8; 3]>,
+    /// The band's content-facing edge (the hairline over a find panel or a
+    /// banner): [`Self::label`] unless the theme authors a `border_color`,
+    /// which is floored on the band ([`crate::tokens::ChromeTokens::seam_on`]).
+    /// `COLOR_WINDOWTEXT` under an OS-forced palette, like `label`.
+    pub seam: [u8; 3],
     /// The fill of a determinate meter drawn in the band (the message band's
     /// full-row meter): the theme's cursor accent, contrast-floored against
     /// [`Self::bar_bg`] so a pale cursor on a pale band still reads as a
@@ -203,11 +209,14 @@ pub struct ThemeInks {
 
 /// The theme's ANSI hues the band borrows: blue and cyan (slots 4 and 6)
 /// for a meter when the cursor is near-grey, red and yellow (slots 1 and 3)
-/// as the seeds of its error and warn inks.
+/// as the seeds of its error and warn inks, and red and green (slot 2) as the
+/// chrome's danger and success hues ([`crate::tokens::ChromeTokens`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AnsiHues {
     /// ANSI slot 1.
     pub red: [u8; 3],
+    /// ANSI slot 2.
+    pub green: [u8; 3],
     /// ANSI slot 3.
     pub yellow: [u8; 3],
     /// ANSI slot 4.
@@ -372,49 +381,63 @@ impl BandInks {
     /// and the meter's hue: where the theme's cursor is near-grey and the host
     /// knows the terminal palette's blue and cyan (`ansi`), the meter's fill
     /// is the blue, or the cyan where only the cyan carries the band's words,
-    /// chosen by [`MeterHue`]. A hue the 3:1 floor would darken into brown
+    /// chosen by [`crate::palette::MeterHue`]. A hue the 3:1 floor would darken into brown
     /// keeps its own pastel and a darker edge instead
     /// ([`crate::palette::keeps_pastel`]). `base` says where the band's ground
     /// comes from ([`BarBase`]).
+    ///
+    /// [`Self::from_tokens`] with nothing authored.
+    #[must_use]
+    pub fn derive(theme: ThemeInks, ansi: Option<AnsiHues>, base: BarBase) -> Self {
+        Self::from_tokens(
+            theme,
+            &ChromeTokens::derive(&ChromeSeeds {
+                bg: theme.bg,
+                fg: theme.fg,
+                cursor: theme.cursor,
+                ansi,
+                authored: AuthoredChrome::NONE,
+                base,
+            }),
+        )
+    }
+
+    /// The band tones over the theme's chrome tokens: the band's ground is
+    /// [`ChromeTokens::bar_bg`], its accent and meter wear
+    /// [`ChromeTokens::accent`] floored to 3:1 on it, and its seam is the
+    /// authored border when there is one. `theme` must be the colours `t` was
+    /// derived from.
     #[must_use]
     #[allow(
         clippy::items_after_statements,
         reason = "the host's arithmetic verbatim, bit parity, ruling 324"
     )]
-    pub fn derive(theme: ThemeInks, ansi: Option<AnsiHues>, base: BarBase) -> Self {
+    pub fn from_tokens(theme: ThemeInks, t: &ChromeTokens) -> Self {
         let mut c = {
-            let light = bg_is_light(theme.bg);
-            let bar_bg = match base {
-                BarBase::Fixed { light: l, dark: d } => {
-                    if light {
-                        l
-                    } else {
-                        d
-                    }
-                }
-                BarBase::Blend => mix3(theme.bg, theme.fg, if light { 0.10 } else { 0.16 }),
-            };
-            let (warn, error) = status_inks(ansi, bar_bg, light);
+            let light = t.light;
+            let bar_bg = t.bar_bg;
+            let (warn, error) = status_inks(t.ansi, bar_bg, light);
             const AA: f64 = 4.5;
             let field_bg = theme.bg;
             let value = ensure_contrast(theme.fg, bar_bg, AA);
             // A meter fill is a surface, not text: the 3:1 non-text floor, so
-            // the cursor accent survives on a band it resembles without being
+            // the accent survives on a band it resembles without being
             // dragged to black or white needlessly.
-            let accent = ensure_contrast(theme.cursor, bar_bg, 3.0);
+            let accent = t.accent_on(bar_bg, crate::tokens::ACCENT_FLOOR);
             let chip_ground = mix3(bar_bg, theme.fg, if light { 0.12 } else { 0.18 });
             let meter_track = mix3(bar_bg, accent, TRACK_TINT);
+            // `label` is the secondary tone, not an optional one: it carries
+            // the find panel's hint row, its placeholder and every inactive
+            // toggle. Held to the same AA floor as `value`; `value` (bold,
+            // full contrast) keeps the hierarchy on its own.
+            let label = ensure_contrast(
+                mix3(theme.fg, theme.bg, if light { 0.40 } else { 0.48 }),
+                bar_bg,
+                AA,
+            );
             Self {
                 bar_bg,
-                // `label` is the secondary tone, not an optional one: it carries
-                // the find panel's hint row, its placeholder and every inactive
-                // toggle. Held to the same AA floor as `value`; `value` (bold,
-                // full contrast) keeps the hierarchy on its own.
-                label: ensure_contrast(
-                    mix3(theme.fg, theme.bg, if light { 0.40 } else { 0.48 }),
-                    bar_bg,
-                    AA,
-                ),
+                label,
                 value,
                 warn,
                 error,
@@ -425,6 +448,11 @@ impl BandInks {
                 // already draws the edge. The guard still matters: a user theme
                 // may land on a `bg` that blends to itself.
                 well_rule: (field_bg == bar_bg).then(|| ensure_contrast(theme.fg, field_bg, AA)),
+                seam: if t.border.is_some() {
+                    t.seam_on(bar_bg)
+                } else {
+                    label
+                },
                 accent,
                 meter: accent,
                 meter_edge: None,
@@ -439,7 +467,7 @@ impl BandInks {
                 // Toward the ink is away from the band on every theme (the band
                 // is a step off `bg`, the ink its opposite), so the lit accent
                 // can only gain contrast for the `bar_bg` ink on it; the floor
-                // covers a theme whose cursor sits between the two.
+                // covers a theme whose accent sits between the two.
                 capsule_primary_hover: ensure_contrast(
                     mix3(accent, theme.fg, PRIMARY_HOVER_LIFT),
                     bar_bg,
@@ -450,14 +478,11 @@ impl BandInks {
                 on_accent: bar_bg,
             }
         };
-        let cursor = theme.cursor;
-        let mut hue = cursor;
-        if let Some(a) = ansi {
-            let pick = MeterHue::pick(cursor, a.blue, a.cyan, &[c.field_bg, c.bar_bg, c.value]);
-            hue = pick.of(cursor, a.blue, a.cyan);
-            c.meter = ensure_contrast(hue, c.bar_bg, 3.0);
-            c.meter_track = mix3(c.bar_bg, c.meter, TRACK_TINT);
-            c.ring = c.meter;
+        // The meter wears the accent: the cursor when it has a colour, else
+        // the blue or cyan [`crate::palette::MeterHue`] borrows (ruling 250), or the authored
+        // accent. `c.meter` is already that hue floored to 3:1.
+        let hue = t.accent;
+        if let Some(a) = t.ansi {
             // The outline's hue: a warm meter floored to AA for its label
             // reads brown; the outline borrows the theme's blue.
             let label = |hue: [u8; 3]| keep_side(hue, c.bar_bg, 4.5);
@@ -503,6 +528,7 @@ impl BandInks {
             // See [`BandInks::well_rule`]: every stock HC scheme has WINDOW ==
             // BTNFACE, so the fill alone leaves the query field no boundary.
             well_rule: (hc.window == hc.btn_face).then_some(in_well),
+            seam: on_band,
             accent: hc.highlight,
             meter: hc.highlight,
             meter_edge: None,
@@ -541,17 +567,19 @@ pub const TRACK_TINT: f32 = 0.10;
 /// The least contrast a hovered chip's fill stands from a resting chip's.
 pub const HOVER_RISE: f64 = 1.5;
 
-/// Is this background a light one? A cheap perceptual-luma threshold (no
-/// sRGB-linear round-trip for a binary decision), in `f32` and unfused on
-/// purpose: twelve colours sit at a luma of exactly 150 (`#01d1ed` …
-/// `#ef7f23`), and this arithmetic calls them light where the exact integer
-/// test would not. Every bundled dark scheme sits well below the threshold
-/// and every light scheme well above it. The one dark/light classifier for
-/// all chrome.
+/// Is this background a light one? Light when black text has more contrast
+/// on it than white: the WCAG pole, where WCAG 2 relative luminance crosses
+/// √0.0525 − 0.05 ≈ 0.1791 (greys `#767676` and lighter are light, `#757575`
+/// and darker are dark). The ink this implies — black on light, white on
+/// dark — clears √21 ≈ 4.58:1 on every colour, which a luma threshold did
+/// not (luma > 150 put white on `#939393` at 3.07:1 and on `#01ff00` at
+/// 1.37:1). Measured in [`contrast`]'s unfused arithmetic. No 8-bit colour
+/// ties (the closest, `#cf0dcc`, differs by 2.4e-7); a tie would be dark, the
+/// side [`ensure_contrast`] picks on one. The one dark/light classifier for
+/// all chrome, the renderer's polarity, and theme admission.
 #[must_use]
 pub fn bg_is_light(bg: [u8; 3]) -> bool {
-    let luma = 0.299 * f32::from(bg[0]) + 0.587 * f32::from(bg[1]) + 0.114 * f32::from(bg[2]);
-    luma > 150.0
+    contrast(BLACK, bg) > contrast(WHITE, bg)
 }
 
 /// Linear blend of two RGB triples: `a` toward `b` by `t` ∈ \[0,1\], the one
@@ -617,13 +645,15 @@ fn rgb_luminance(c: [u8; 3]) -> f64 {
 /// exotic user theme.
 ///
 /// The anchor is chosen by the contrast it can REACH, not by the surface's
-/// luma: the ink first moves away from `bg` on its own side (lighter ink
+/// polarity: the ink first moves away from `bg` on its own side (lighter ink
 /// toward white, darker toward black), which keeps a floored ink beside the
 /// unfloored ones it sits with; where that pole cannot clear `target`
-/// against `bg`, it crosses to the other pole. The luma split
-/// ([`bg_is_light`]) is not the contrast crossover: on a mid-grey bar
-/// (`#939393`) white tops out at 3.07:1 while black reaches 6.8:1, so a
-/// luma-chosen anchor left AA unreachable. One of black and white always
+/// against `bg`, it crosses to the other pole. The surface's polarity
+/// ([`bg_is_light`]) is the pole crossover, but the anchor is still chosen
+/// by what the ink's own side can reach, so a floored ink stays beside its
+/// unfloored siblings. (A floor anchored on the former luma split failed:
+/// on a mid-grey bar, `#939393`, it walked toward white, which tops out at
+/// 3.07:1, while black reaches 6.8:1.) One of black and white always
 /// clears √21 ≈ 4.58:1, so a target at or under AA is always met. When
 /// neither pole can clear `target`, the best ratio either walk reached is
 /// returned.
@@ -1028,21 +1058,15 @@ fn from_oklch(l: f64, c: f64, h: f64) -> [u8; 3] {
 // ---- One row resolved ---------------------------------------------------------
 
 /// One row's pixel raster in window pixels, before the host maps it onto its
-/// frame: the ground one colour per window pixel column (empty for none: a
-/// rail row, the flat look), the rail band's colours (`None` keeps the
-/// ground; empty for no rail), whether the words lift clear of a level's
-/// rail, the columns whose chips keep their own fill, and the ink split.
+/// frame: the ground one colour per window pixel column (empty for none: the
+/// flat look), the rail band's colours (`None` keeps the ground; empty for no
+/// rail), the columns whose chips keep their own fill, and the ink split.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct RowRaster {
     /// One colour per window pixel column, `[0, win_w)`.
     pub ground: Vec<[u8; 3]>,
     /// The rail band's colour per window pixel column (`None`: the ground).
     pub rail: Vec<Option<[u8; 3]>>,
-    /// A level's rail (the strain row): the row's words keep clear of it (the
-    /// renderer lifts them into the room the face leaves above its tallest
-    /// letter and fits the rail, with one clear row, under their lowest ink).
-    /// A bar's glint rail never moves its words.
-    pub clear_rail: bool,
     /// Cell columns `[start, end)` that keep their own fill.
     pub own: Vec<(u16, u16)>,
     /// `(col, window x, ink, ground)`: the cell the fill's edge falls in,
@@ -1134,8 +1158,7 @@ pub(crate) struct RowInks<'a> {
 /// A row's ink rule.
 #[derive(Clone, Copy)]
 pub(crate) enum InkPlan {
-    /// The band's own inks, untouched: an unmetered row, a rail row (the
-    /// strain gauge's words sit on the band).
+    /// The band's own inks, untouched: an unmetered row.
     Band,
     /// A busy row: every role's ink floored once toward `anchor` against the
     /// hottest tone the comet can reach (`hot`) and its `track` (the side hold
@@ -1244,10 +1267,6 @@ fn chip_face_inks(c: &BandInks, chip: ChipFace) -> ([u8; 3], [u8; 3]) {
 )]
 pub(crate) fn resolve(rp: &RowPaint<'_>, c: &BandInks) -> Resolved {
     let hc = rp.forced;
-    // A measured level is a rail: its words sit on the band's own ground, the
-    // rail in the row's lowest pixels in the warn hue; never the cursor
-    // accent, never a fill a word rides.
-    let rail = rp.kind == RowSurface::Rail;
     // The meter is the row: the fill's ink is the cursor accent, `warn` on a
     // Warn/Error row; under High Contrast the system's HIGHLIGHT whatever the
     // severity (the forced `warn` is WINDOWTEXT, an ink, not a surface) and
@@ -1256,10 +1275,10 @@ pub(crate) fn resolve(rp: &RowPaint<'_>, c: &BandInks) -> Resolved {
         Fill::Meter => c.meter,
         Fill::Warn => c.warn,
     };
-    let (inks, side) = inks_for(c, fill, rp.busy, rail, hc);
+    let (inks, side) = inks_for(c, fill, rp.busy, hc);
     // The glint in the lowest pixels, where the fill's words leave it no room
     // at full height.
-    let glint_rail = !rp.busy && !rail && !hc && glint_needs_rail(c, fill, &inks);
+    let glint_rail = !rp.busy && !hc && glint_needs_rail(c, fill, &inks);
     let rail_glint_ink = glint_rail.then(|| glint_step(fill, fill_ink(c, fill), true));
     let lin = LinInks::of(&inks);
     // Each cell's record: the mean tone over its pixels, and its side.
@@ -1290,7 +1309,7 @@ pub(crate) fn resolve(rp: &RowPaint<'_>, c: &BandInks) -> Resolved {
             .collect()
     });
     // The row's inks, chosen once.
-    let plan = if matches!(rp.kind, RowSurface::Plain | RowSurface::Rail) {
+    let plan = if matches!(rp.kind, RowSurface::Plain) {
         InkPlan::Band
     } else if let Some(anchor) = side {
         // Floored against the hottest tone the comet can reach (its head, held
@@ -1359,10 +1378,10 @@ pub(crate) fn resolve(rp: &RowPaint<'_>, c: &BandInks) -> Resolved {
     // The pixel raster: the ground pixel by pixel in linear light, its edge
     // antialiased over one pixel (each pixel is the mean of the profile over
     // it); the glint in the lowest pixels where the words leave it no room at
-    // full height; a level's rail. Which window pixels lie on the fill's side
-    // (the fade's anchors):
+    // full height. Which window pixels lie on the fill's side (the fade's
+    // anchors):
     let mut fill_side: Vec<bool> = Vec::new();
-    let mut raster = (rp.raster_ground || rail).then(|| {
+    let mut raster = rp.raster_ground.then(|| {
         let mut r = RowRaster::default();
         let mut memo: Option<(FineTone, [u8; 3])> = None;
         let mut rgb_of = |t: FineTone| match memo {
@@ -1381,11 +1400,6 @@ pub(crate) fn resolve(rp: &RowPaint<'_>, c: &BandInks) -> Resolved {
         for (xw, (t, on_fill)) in (0u64..).zip(rp.pixels()) {
             // The fill's coverage — handed to warn by a Fault's wash.
             fill_side.push(on_fill);
-            if rail {
-                let cov = f64::from(t.fill) / (255.0 * 256.0);
-                rail_px_row.push((t.fill > 0).then(|| lin_mix(c.bar_bg, inks.fill, cov)));
-                continue;
-            }
             let base = FineTone {
                 lift: if glint_rail { 0 } else { t.lift },
                 ..t
@@ -1400,10 +1414,9 @@ pub(crate) fn resolve(rp: &RowPaint<'_>, c: &BandInks) -> Resolved {
                 rail_px_row.push((t.lift > 0).then(|| lin_mix(rgb, g, lift)));
             }
         }
-        if rail || glint_rail {
+        if glint_rail {
             r.rail = rail_px_row;
         }
-        r.clear_rail = rail;
         r.own.clone_from(&rp.owned);
         r.rings = rp
             .rings
@@ -1498,36 +1511,14 @@ pub(crate) fn resolve(rp: &RowPaint<'_>, c: &BandInks) -> Resolved {
 }
 
 /// The inks a row's surface resolves against, from what the painter says of
-/// the row (its fill's ink, whether it is busy, whether it is a rail, and
-/// the forced palette) and, on a busy row, the anchor its words floor toward.
-/// A busy row's surface keeps its words' side (the comet, its track and its
-/// echoes); a determinate row's Fault wash keeps the fill's words' side, its
-/// hue kept (High Contrast keeps its raw warn); a rail (a measured level)
-/// wears warn over the band itself, never the cursor accent.
+/// the row (its fill's ink, whether it is busy, and the forced palette) and,
+/// on a busy row, the anchor its words floor toward. A busy row's surface
+/// keeps its words' side (the comet, its track and its echoes); a
+/// determinate row's Fault wash keeps the fill's words' side, its hue kept
+/// (High Contrast keeps its raw warn).
 #[must_use]
-#[allow(
-    clippy::fn_params_excessive_bools,
-    reason = "the host's arithmetic verbatim, bit parity, ruling 324"
-)]
-pub fn inks_for(
-    c: &BandInks,
-    fill: [u8; 3],
-    busy: bool,
-    rail: bool,
-    hc: bool,
-) -> (MeterInks, Option<[u8; 3]>) {
-    if rail {
-        let warn = ensure_contrast(rail_warn(c.warn, hc), c.bar_bg, 3.0);
-        (
-            MeterInks {
-                track: c.bar_bg,
-                fill: warn,
-                glint: warn,
-                warn,
-            },
-            None,
-        )
-    } else if busy && !hc {
+pub fn inks_for(c: &BandInks, fill: [u8; 3], busy: bool, hc: bool) -> (MeterInks, Option<[u8; 3]>) {
+    if busy && !hc {
         let (inks, anchor) = MeterInks::comet(c, fill);
         (inks, Some(anchor))
     } else {
@@ -1540,25 +1531,6 @@ pub fn inks_for(
         (MeterInks { warn, ..inks }, None)
     }
 }
-
-/// The level rail's warn: the warn hue at a surface's chroma. A theme's warn
-/// is an ink, and on a dark band often a pale one (`#f1fa8c`, `OkLCh` chroma
-/// 0.13) that under the words' descenders would read as an underline, not a
-/// level. The rail keeps the warn's lightness and hue and lifts its chroma to
-/// [`RAIL_CHROMA`] as far as sRGB allows (`#f2fd4a` there; the light bands'
-/// amber is already at the gamut's edge and stays). High Contrast keeps its
-/// system ink.
-pub(crate) fn rail_warn(warn: [u8; 3], hc: bool) -> [u8; 3] {
-    if hc {
-        return warn;
-    }
-    let (l, ch, h) = oklch(warn);
-    from_oklch(l, ch.max(RAIL_CHROMA), h)
-}
-
-/// The level rail's `OkLCh` chroma floor: a vivid warn, never the pale ink
-/// tone the words' glyph wears.
-const RAIL_CHROMA: f64 = 0.19;
 
 /// The one ink every word wears over a determinate row's fill: the row's
 /// crisp ink ([`fill_ink`]), floored once against every tone the fill's side
@@ -1807,9 +1779,16 @@ pub(crate) fn chip_inks(
 mod tests {
     use super::*;
 
+    /// The former dark/light rule, verbatim: Rec. 601 luma above 150 in
+    /// unfused `f32`. Kept only as the negative control the pole is
+    /// measured against.
+    fn luma_is_light(c: [u8; 3]) -> bool {
+        0.299 * f32::from(c[0]) + 0.587 * f32::from(c[1]) + 0.114 * f32::from(c[2]) > 150.0
+    }
+
     /// The pre-fix floor: the anchor chosen by the surface's luma alone.
     fn luma_anchored_floor(c: [u8; 3], bg: [u8; 3], target: f64) -> [u8; 3] {
-        let anchor = if bg_is_light(bg) {
+        let anchor = if luma_is_light(bg) {
             [0, 0, 0]
         } else {
             [255, 255, 255]
@@ -1872,6 +1851,7 @@ mod tests {
         };
         let solarized = AnsiHues {
             red: [0xdc, 0x32, 0x2f],
+            green: [0x85, 0x99, 0x00],
             yellow: [0xb5, 0x89, 0x00],
             blue: [0x26, 0x8b, 0xd2],
             cyan: [0x2a, 0xa1, 0x98],
@@ -1922,6 +1902,7 @@ mod tests {
             };
             let ansi = AnsiHues {
                 red: bytes(scheme.ansi[1]),
+                green: bytes(scheme.ansi[2]),
                 yellow: bytes(scheme.ansi[3]),
                 blue: bytes(scheme.ansi[4]),
                 cyan: bytes(scheme.ansi[6]),
@@ -1982,92 +1963,73 @@ mod tests {
         assert!(got[0] < label[0], "the label stays darker than its bar");
     }
 
-    /// THE CONTRAST IS aterm-types' ARITHMETIC (ruling 324): the pin pair
-    /// `(#000000, #f8f8f2)` gives `…a6` in `aterm_types::Rgb::contrast`'s
-    /// unfused arithmetic (read from it, not guessed), where a fused
-    /// luminance gives `…a7`; the palette imports this one (ruling 438).
-    #[test]
-    fn contrast_is_the_types_arithmetic() {
-        let (a, b) = ([0, 0, 0], [0xf8, 0xf8, 0xf2]);
-        assert_eq!(contrast(a, b).to_bits(), 0x4033_b34e_4a38_aca6);
-        assert_eq!(contrast(a, b).to_bits(), contrast(b, a).to_bits());
-    }
-
-    /// The f32 boundary is kept: the twelve colours whose luma is exactly 150
-    /// in exact arithmetic are light in the f32 one, and the integer test's
-    /// neighbours on each side stay where they are.
-    #[test]
-    fn bg_is_light_keeps_the_f32_boundary() {
-        let at_150: [[u8; 3]; 12] = [
-            [0x01, 0xd1, 0xed],
-            [0x04, 0xe6, 0x79],
-            [0x07, 0xfb, 0x05],
-            [0x0b, 0xf1, 0x2e],
-            [0x17, 0xd3, 0xa9],
-            [0x34, 0xe0, 0x1a],
-            [0x5d, 0xcf, 0x06],
-            [0x83, 0xa9, 0x66],
-            [0x9d, 0xa1, 0x4b],
-            [0xc3, 0x7b, 0xab],
-            [0xdd, 0x73, 0x90],
-            [0xef, 0x7f, 0x23],
-        ];
-        for c in at_150 {
-            let exact = 299 * u32::from(c[0]) + 587 * u32::from(c[1]) + 114 * u32::from(c[2]);
-            assert_eq!(exact, 150_000, "{c:02x?}");
-            assert!(bg_is_light(c), "{c:02x?}: the f32 luma calls it light");
-        }
-        assert!(!bg_is_light([0x96, 0x96, 0x96]));
-        assert!(bg_is_light([0x97, 0x97, 0x97]));
-        assert!(!bg_is_light([0x11, 0x13, 0x18]));
-        assert!(bg_is_light([0xff, 0xff, 0xff]));
-    }
-
-    /// Each ink slot is its one [`BandInks`] ink, on a dark and a light
-    /// derived palette and a forced one.
-    #[test]
-    fn every_ink_slot_is_its_palette_ink() {
-        let dark = BandInks::derive(
-            ThemeInks {
-                bg: [0x11, 0x13, 0x18],
-                fg: [0xd0, 0xd0, 0xd0],
-                cursor: [0x50, 0xfa, 0x7b],
-            },
-            None,
-            BarBase::Blend,
-        );
-        let light = BandInks::derive(
-            ThemeInks {
-                bg: [0xff, 0xff, 0xff],
-                fg: [0x1f, 0x23, 0x28],
-                cursor: [0x04, 0x44, 0xd8],
-            },
-            Some(AnsiHues {
-                red: [0xcf, 0x22, 0x2e],
-                yellow: [0x4d, 0x2d, 0x00],
-                blue: [0x09, 0x69, 0xda],
-                cyan: [0x1b, 0x7c, 0x83],
-            }),
-            BarBase::Blend,
-        );
-        let forced = BandInks::forced(ForcedPalette {
-            window: [0x2d, 0x32, 0x36],
-            window_text: [0xff, 0xff, 0xff],
-            highlight: [0x1a, 0xeb, 0xff],
-            highlight_text: [0, 0, 0],
-            btn_face: [0x2d, 0x32, 0x36],
-        });
-        for c in [dark, light, forced] {
-            for (ink, want) in [
-                (Ink::Label, c.label),
-                (Ink::Value, c.value),
-                (Ink::Warn, c.warn),
-                (Ink::Error, c.error),
-                (Ink::Accent, c.accent),
-            ] {
-                assert_eq!(c.slot(ink), want, "{ink:?}");
+    /// Every colour a pole-ink law is checked on: every grey, an RGB
+    /// lattice (every 15th level per channel, ends included), the colour
+    /// the luma rule failed worst (`#01ff00`) and the nearest tie
+    /// (`#cf0dcc`).
+    fn pole_sweep() -> Vec<[u8; 3]> {
+        let levels: Vec<u8> = (0..=255u8).step_by(15).collect();
+        let mut out: Vec<[u8; 3]> = (0..=255u8).map(|g| [g, g, g]).collect();
+        for &r in &levels {
+            for &g in &levels {
+                for &b in &levels {
+                    out.push([r, g, b]);
+                }
             }
         }
+        out.extend([[0x01, 0xff, 0x00], [0xcf, 0x0d, 0xcc]]);
+        out
+    }
+
+    /// Does `is_light`'s pole ink (black on light, white on dark) clear
+    /// √21 and read at least as well as the other pole on `c`?
+    fn pole_ink_reads_best(is_light: fn([u8; 3]) -> bool, c: [u8; 3]) -> bool {
+        let (ink, other) = if is_light(c) {
+            (BLACK, WHITE)
+        } else {
+            (WHITE, BLACK)
+        };
+        contrast(ink, c) >= 4.58 && contrast(ink, c) >= contrast(other, c)
+    }
+
+    /// THE POLE INK READS BEST: on every swept surface the ink
+    /// [`bg_is_light`] implies clears √21 ≈ 4.58:1 and out-contrasts the
+    /// other pole. Negative control: the former luma rule breaks the same
+    /// law on the sweep — white on `#939393` at under 3.1:1 and on
+    /// `#01ff00` at under 1.4:1.
+    #[test]
+    fn bg_is_light_picks_the_pole_ink_that_reads_best() {
+        let sweep = pole_sweep();
+        for &c in &sweep {
+            assert!(pole_ink_reads_best(bg_is_light, c), "{c:02x?}");
+        }
+        assert!(!luma_is_light([0x93; 3]));
+        assert!(contrast(WHITE, [0x93; 3]) < 3.1);
+        assert!(!luma_is_light([0x01, 0xff, 0x00]));
+        assert!(contrast(WHITE, [0x01, 0xff, 0x00]) < 1.4);
+        let luma_failures = sweep
+            .iter()
+            .filter(|&&c| !pole_ink_reads_best(luma_is_light, c))
+            .count();
+        assert!(luma_failures > 0, "the sweep must catch the luma rule");
+    }
+
+    /// THE GREYS TURN LIGHT ONCE, AT THE POLE: along the grey ramp the
+    /// classifier changes value exactly once, dark to light, between
+    /// `#757575` and `#767676` — the first grey where black (4.62:1) beats
+    /// white (4.54:1). The former luma rule called `#767676` dark.
+    #[test]
+    fn the_greys_turn_light_once_at_the_pole() {
+        let ramp: Vec<bool> = (0..=255u8).map(|g| bg_is_light([g; 3])).collect();
+        let flips = ramp.windows(2).filter(|w| w[0] != w[1]).count();
+        assert_eq!(flips, 1);
+        assert!(!ramp[0] && ramp[255], "dark to light, never back");
+        assert!(!bg_is_light([0x75; 3]));
+        assert!(bg_is_light([0x76; 3]));
+        assert!(contrast(BLACK, [0x76; 3]) > contrast(WHITE, [0x76; 3]));
+        assert!(!bg_is_light([0x11, 0x13, 0x18]));
+        assert!(bg_is_light([0xff; 3]));
+        assert!(!luma_is_light([0x76; 3]), "the former rule called it dark");
     }
 
     /// The forced mapping (Windows High Contrast, CSS forced-colors): the band

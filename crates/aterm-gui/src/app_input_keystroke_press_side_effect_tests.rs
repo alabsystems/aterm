@@ -167,8 +167,16 @@ fn zero_width_commits_and_stationary_kills_arm_no_cursor_move() {
     assert!(!committed_text_moves_cursor("\u{0301}\u{fe0f}\u{200d}"));
     assert_eq!(classify_press(&combining).typed_forward, None);
     assert!(committed_text_moves_cursor("中🙂"));
-    for (text, cells) in [("⚠️", 2), ("🇺🇸", 2), ("👨‍👩‍👧‍👦", 2), ("中", 2), ("中🙂", 4)]
-    {
+    for (text, cells) in [
+        ("⚠️", 2),
+        ("🇺🇸", 2),
+        ("👨‍👩‍👧‍👦", 2),
+        ("中", 2),
+        ("中🙂", 4),
+        // Spacing vowel signs take a cell of their own; a ZWJ folds into its base.
+        ("\u{915}\u{93f}\u{924}\u{93e}\u{92c}", 5),
+        ("\u{2764}\u{200d}\u{1f525}", 1),
+    ] {
         assert_eq!(
             committed_text_cells(text, false),
             cells,
@@ -429,6 +437,167 @@ fn failed_inline_key_write_revokes_every_new_movement_licence() {
         assert!(glow_out.is_empty() && trail_out.is_empty());
     }
     // A key that never reached the PTY clears the movement licence
-    // (`SwallowedKeyClearsLicense`, proved in aterm-spec's
-    // `derived_cursor_hint_license_proves_and_catches_cold_light`).
+    // (`SwallowedKeyClearsLicense`, proved by aterm-spec's registry sweep).
+}
+
+/// A key QUEUED to the session's ordered writer (every key on Windows, where that
+/// writer is the ConPTY writer; on unix a key behind a draining paste) whose write
+/// then FAILS. Its enqueue kept the press credit, since a queued key's bytes will
+/// reach the wire; these never will, so the writer publishes a FAILED receipt and
+/// the render prelude takes the credit back (`revoke_failed_delivery`), as a failed
+/// inline write's dispatch does at once
+/// ([`failed_inline_key_write_revokes_every_new_movement_licence`]).
+///
+/// Driven on the ConPTY route on this host (`force_conpty_route_for_test`), against
+/// the headless stub's invalid sink. CONTROL: with the prelude never run, the typed
+/// glyph's credit, which the enqueue kept, funds the program's own later `+1` as the
+/// key's echo, which is what every such key did before this edge existed. Enter and
+/// Tab bank no credit a one-cell move could spend; for them the test pins that the
+/// failed receipt is read and nothing funds the move.
+#[test]
+fn failed_queued_key_write_revokes_its_press_credit() {
+    use std::time::Duration;
+
+    use crate::app_render::CursorFxInputs;
+    use crate::cursor_glow::Geom;
+    use crate::cursor_trail::TrailConfig;
+
+    let events = [
+        InputEvent::Key {
+            key: Key::Character('a'),
+            mods: Modifiers::empty(),
+            base_layout: None,
+            layout_text: None,
+            event_type: KeyEventType::Press,
+        },
+        InputEvent::Key {
+            key: Key::Named(NamedKey::Enter),
+            mods: Modifiers::empty(),
+            base_layout: None,
+            layout_text: None,
+            event_type: KeyEventType::Press,
+        },
+        InputEvent::Key {
+            key: Key::Named(NamedKey::Tab),
+            mods: Modifiers::empty(),
+            base_layout: None,
+            layout_text: None,
+            event_type: KeyEventType::Press,
+        },
+    ];
+    let geom = Geom {
+        cw: 8,
+        ch: 16,
+        rows: 6,
+        cols: 40,
+        origin_x: 0,
+        origin_y: 0,
+        win_w: 320,
+        win_h: 96,
+        head: 0,
+    };
+    let trail_cfg = TrailConfig {
+        enabled: true,
+        duration: Duration::from_millis(300),
+        max_len: 24,
+        color: 0x0050_FA7B,
+        intensity: 0.0,
+        warmth: 0.0,
+    };
+
+    for (event, banks_credit) in events.into_iter().zip([true, false, false]) {
+        for prelude in [true, false] {
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            app.config.cursor_trail = Some(true);
+            app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+            let glow_cfg = app.glow_config();
+            let session = app.front_terminal(wid).unwrap().session;
+            // The seed frame: the caret at (0,0), and the window's delivery
+            // baseline, without which the prelude applies nothing.
+            app.cursor_frame(wid, CursorFxInputs::sample_for_test(Instant::now()))
+                .expect("seed");
+            let _route = super::paste_order::force_conpty_route_for_test();
+            assert_eq!(
+                app.input(wid, event.clone(), Source::Human),
+                crate::input::InputOutcome::Ok,
+                "FIFO admission: handed to the session's ordered writer ({event:?})"
+            );
+            // The key's dispatch is no later than this; every instant below is
+            // placed after it, however long the writer thread takes.
+            let dispatched = Instant::now();
+            let sink = app.pool.get(session).unwrap().ctx.sink.clone();
+            super::paste_order::await_drain_for_test(&sink);
+            assert!(
+                !super::paste_order::is_ordering(&sink),
+                "the writer finished the job"
+            );
+            {
+                let ctx = &app.pool.get(session).unwrap().ctx;
+                let batch = ctx
+                    .output_echo
+                    .deliveries_after(&ctx.sink, Some(0), dispatched);
+                assert!(
+                    batch.items.iter().all(Option::is_none),
+                    "a queued write that failed publishes no delivery ({event:?})"
+                );
+                assert_eq!(
+                    batch
+                        .failed
+                        .iter()
+                        .flatten()
+                        .map(|t| t.window)
+                        .collect::<Vec<_>>(),
+                    [Some(wid)],
+                    "…but one failed receipt, for the window that dispatched it ({event:?})"
+                );
+            }
+            if prelude {
+                let mut frame =
+                    CursorFxInputs::sample_for_test(dispatched + Duration::from_millis(2));
+                frame.cur = Some((0, 0));
+                app.cursor_frame(wid, frame).expect("the prelude");
+                let latest = {
+                    let ctx = &app.pool.get(session).unwrap().ctx;
+                    ctx.output_echo
+                        .deliveries_after(&ctx.sink, None, dispatched)
+                        .latest
+                };
+                assert_eq!(
+                    app.windows[&wid].delivery_seen,
+                    Some((session, latest)),
+                    "the prelude read the failed receipt"
+                );
+            }
+            let ws = app.windows.get_mut(&wid).unwrap();
+            let moved = dispatched + Duration::from_millis(4);
+            let mut glow_out = Vec::new();
+            let mut trail_out = Vec::new();
+            let glow =
+                ws.fx
+                    .cursor_mut()
+                    .glow
+                    .tick(Some((0, 1)), moved, &glow_cfg, geom, &mut glow_out);
+            if prelude {
+                assert_eq!(
+                    glow, 0,
+                    "a failed queued write cannot fund a later glow move ({event:?})"
+                );
+                assert_eq!(
+                    ws.fx
+                        .cursor_mut()
+                        .trail
+                        .tick(Some((0, 1)), moved, &trail_cfg, &mut trail_out),
+                    0,
+                    "nor a later classic comet move ({event:?})"
+                );
+                assert!(glow_out.is_empty() && trail_out.is_empty());
+            } else if banks_credit {
+                assert_ne!(
+                    glow, 0,
+                    "CONTROL: unrevoked, the credit the enqueue kept funds the move ({event:?})"
+                );
+            }
+        }
+    }
 }

@@ -1,0 +1,51 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (60x50, aterm 0.105.0) running the real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab) · the two-question call in a 60-column tab: `None of the above`'s description wrapped in its column, `1 of 2`, and the key row wrapped onto two rows · the lab's random project dir is spelled /private/tmp/at.lab0 here
+◆ Tool call done. Result: Removed scheduled job 109c3489.
+
+❯ toolstart
+
+◆ Fetched http://127.0.0.1:50581/lab-probe-approved — 404
+
+◆ Tool call done. Result: tool failed: web_fetch failed:
+  HTTP 404 Not Found
+
+❯ toolstart
+
+◆ Fetched http://127.0.0.1:50581/lab-probe-guard — denied
+
+◆ Tool call done. Result: tool failed: web_fetch failed:
+  network access denied
+
+❯ toolstart
+
+◆ Fetched http://127.0.0.1:50581/lab-probe-guard2 — denied
+
+◆ Tool call done. Result: tool failed: web_fetch failed:
+  network access denied
+
+❯ toolstart
+
+◆ Fetched http://127.0.0.1:50581/lab-probe-a-rather-long-pat
+h-for-the-narrow-tab — denied
+
+◆ Tool call done. Result: tool failed: web_fetch failed:
+  network access denied
+
+❯ toolstart
+
+◆ Request user input Color, Size — running (13s)
+
+  Which color should the probe use?
+
+  ⟩ 1. Red (Recommended)  Warm and loud.
+    2. Blue               Cool and calm.
+    3. None of the above  Optionally, add details in notes
+                          (tab).
+
+  1 of 2
+  Enter to select · ↑/↓ to move · ←/→ to switch question ·
+  Tab for an optional note · Esc to interrupt
+
+── Voice input (⌥ + v to start) ────────────────────────────
+❯
+────────────────────────────────────────────────────────────
+  lab-stub · high · /private/tmp/at.lab0/proj · Auto-review

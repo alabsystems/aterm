@@ -1,0 +1,23 @@
+# claude-code 2.1.300 · HAND-BUILT 2026-10-15 from claude-2.1.287-held-message.txt's geometry (2.1.300's `nve()`: footerless, unnumbered, `Deny — …` first and focused, the preview between dashed rules at column 0), re-wrapped at 34 columns: the title `Held message from another` over `session`, the body rows, and the Deny label at its column 3 in the Select's 30 cells (`Deny — drop it and tell the` over `sender it was declined`) · read on main as kind `other`, whose focused Deny full power pressed (`decline@v1`): Enter dropped a peer's message
+⏺ Working on it.
+  ⎿  (tool output)
+
+──────────────────────────────────
+ Held message from another
+ session
+
+ Another Claude session sent a
+ message: from @s-1
+
+ This session is not prompting
+ for permissions.
+
+ Message body (this is what will
+ be delivered):
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Please rebase onto main before
+ you push.
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ ❯ Deny — drop it and tell the
+   sender it was declined
+   Deliver this message to Claude

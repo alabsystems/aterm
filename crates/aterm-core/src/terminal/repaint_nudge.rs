@@ -461,8 +461,8 @@ impl RepaintNudge {
     /// mode `off`, an attempt in flight, or this epoch already tried or logged (new debt is a
     /// new epoch).
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "RepaintNudge",
             action = "Arm",
             project = "conformance_repaint_nudge::World::project"
@@ -495,8 +495,8 @@ impl RepaintNudge {
     /// release (the model's `ReleaseByDeadline`). The world may not be readable now, so the
     /// counters are read at the next step. `false` when no hold was in flight.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "RepaintNudge",
             action = "ReleaseByDeadline",
             project = "conformance_repaint_nudge::World::project"
@@ -513,168 +513,168 @@ impl RepaintNudge {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "RepaintNudge",
             action = "Debt",
             reason = "The world's: rows come to be owed when a resize the program does not repaint for is booked. The machine reads it as `Facts::owed` (the engine's render debt), never causes it."
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "RepaintNudge",
             action = "AltLeft",
             reason = "The world's: the program leaves the alternate screen or repaints from scratch. The machine reads it as `Facts::alt_screen` / `Facts::owed` and stands down."
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "RepaintNudge",
             action = "Quiet",
             reason = "The world's: the output goes quiet. The machine reads it as `Facts::output_quiet_ms` (`QUIET_WAIT_MS`), a clock it is handed."
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "RepaintNudge",
             action = "Busy",
             reason = "The world's: output arrives or a DEC 2026 frame opens. The machine reads it as `Facts::output_quiet_ms` / `Facts::frame_open`."
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "RepaintNudge",
             action = "App1",
             reason = "The program's: it answers the short size with a full clear. The machine reads it as `Facts::full_clears` / `Facts::screen_replaced` advancing past the counts at the hold (`answered`)."
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "RepaintNudge",
             action = "App2",
             reason = "The program's: it answers the true size. The machine reads the same counters after the release."
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "RepaintNudge",
             action = "Flap",
             reason = "The window's: a flap's layout passes (or a cell-box sync) set the PTY while it is held and leave the engine where the hold found it. The machine reads it as `Facts::pty` no longer the short size it set."
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "RepaintNudge",
             action = "Resize",
             reason = "The window's: a real resize moves the engine, and its layout pass the PTY. The machine reads it as `Facts::engine` against the size the hold was taken at."
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "RepaintNudge",
             action = "Return",
             reason = "The window's: a real resize that superseded an attempt did not last, and the engine is back where the hold found it. The machine is at rest by then; the epoch judge (`aterm_gui::resize_epoch`) reads it as the epoch back at `desync-risk` at its start geometry."
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "RepaintNudge",
             action = "ReturnUnwatched",
             reason = "A mutant of the `Buggy = 1` bundle: the shipped bug of 2026-10-03, nothing watched a superseded attempt's epoch, so a resize that came back left the tab displaced with its one try spent and nothing said. The epoch judge owes that end now, and the window's Tier-1 (`aterm_gui::nudge_conformance`) holds it to a give-up."
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "RepaintNudge",
             action = "DropOnFlap",
             reason = "A mutant of the `Buggy = 1` bundle: the shipped bug of 2026-10-02, any write by someone else read as a real resize and the attempt dropped at once. `forget` waits for the answer instead, and the conformance's busy stand-in holds it to a give-up."
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "RepaintNudge",
             action = "Halt",
             reason = "The fabric's: a standing hold (`hold=1`) begins. The machine reads it as `Facts::halted`."
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "RepaintNudge",
             action = "Lift",
             reason = "The fabric's: the standing hold ends. The machine reads it as `Facts::halted` and re-evaluates."
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "RepaintNudge",
             action = "Tick",
             reason = "Time passing: the machine is clockless, and reads the host's `now_ms` at every `step` (the answer timeouts, the quiet wait and the deferral caps are comparisons against it)."
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "RepaintNudge",
             action = "DriverVanishes",
             reason = "The host's record of the attempt is lost while the PTY is short (a panic in the tick, a teardown race). Nothing in this machine can do it; the host's `PtyGuard` drop and the app-level held map (`aterm_gui::app_nudge`) are what the model's ReleaseByDeadline binds."
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "RepaintNudge",
             action = "Age",
             reason = "Time passing while the PTY is short: the host compares `now_ms` with the hold's start against `PTY_HOLD_CAP_MS` (`aterm_gui::app_nudge::NudgeHost::tick`)."
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "RepaintNudge",
             action = "LoseTheHold",
             reason = "A mutant of the `Buggy = 1` bundle: an exit path that forgets to lift the hold. No shipping code takes it; the Tier-1 (`conformance_repaint_nudge`) and the host tests hold that every exit releases."
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "RepaintNudge",
             action = "HealOnFirstAnswer",
             reason = "A mutant of the `Buggy = 1` bundle: healed on the first answer. No shipping code takes it; `Act::Healed` needs both answers."
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "RepaintNudge",
             action = "HoldTheEngine",
             reason = "A mutant of the `Buggy = 1` bundle: the hold resizes the ENGINE. The machine has no act that asks for it; the Tier-1 asserts the engine is untouched."
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "RepaintNudge",
             action = "NoCap",
             reason = "A mutant of the `Buggy = 1` bundle: no hard deadline on a hold. The host enforces `PTY_HOLD_CAP_MS`."
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "RepaintNudge",
             action = "RetryForever",
             reason = "A mutant of the `Buggy = 1` bundle: retried without a budget. The machine tries once per epoch and three times an hour."
@@ -722,8 +722,8 @@ impl RepaintNudge {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "RepaintNudge",
             action = "Hold",
             project = "conformance_repaint_nudge::World::project"
@@ -828,8 +828,8 @@ impl RepaintNudge {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "RepaintNudge",
             action = "Release",
             project = "conformance_repaint_nudge::World::project"
@@ -847,8 +847,8 @@ impl RepaintNudge {
     /// on as after a release. A real resize and a flap cannot be told apart yet (a step may
     /// see a flap's middle), so [`Self::step_restoring`] judges it when the wait ends.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "RepaintNudge",
             action = "Forget",
             project = "conformance_repaint_nudge::World::project"
@@ -902,24 +902,24 @@ impl RepaintNudge {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "RepaintNudge",
             action = "Finish",
             project = "conformance_repaint_nudge::World::project"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "RepaintNudge",
             action = "GiveUp",
             project = "conformance_repaint_nudge::World::project"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "RepaintNudge",
             action = "Supersede",
             project = "conformance_repaint_nudge::World::project"
@@ -1027,149 +1027,41 @@ mod tests {
         }
     }
 
+    /// Each deferring gate (a driver lease, a standing selection, an open DEC
+    /// 2026 frame, another tab's hold) keeps the machine armed while it stands
+    /// and lets the hold go once it clears; the first three are abandoned with
+    /// their own give-up rather than waited on for ever.
     #[test]
-    fn nudge_heals_a_program_that_answers_at_once() {
-        let mut r = Rig::new(Mode::On);
-        r.hold();
-        r.answer();
-        assert_eq!(r.at(5), Act::Release);
-        assert_eq!(r.m.phase(), Phase::Restoring);
-        r.release();
-        r.answer();
-        assert_eq!(
-            r.at(20),
-            Act::Healed {
-                first_ms: 5,
-                second_ms: 20
+    fn a_standing_gate_defers_the_hold_and_a_capped_one_is_abandoned() {
+        type Set = fn(&mut Facts, bool);
+        let gates: [(&str, Set, Option<Gate>); 4] = [
+            ("lease", |f, on| f.driver_may_type = on, Some(Gate::Lease)),
+            ("selection", |f, on| f.selection = on, Some(Gate::Selection)),
+            ("frame", |f, on| f.frame_open = on, Some(Gate::Busy)),
+            ("other hold", |f, on| f.other_hold = on, None),
+        ];
+        for (name, set, gate) in gates {
+            let mut r = Rig::new(Mode::On);
+            set(&mut r.f, true);
+            for _ in 0..20 {
+                assert!(matches!(r.at(100), Act::WaitUntil(_)), "{name}");
             }
-        );
-        assert_eq!(r.m.phase(), Phase::Rest);
-        assert_eq!(r.m.nudged(), 1);
-    }
-
-    #[test]
-    fn nudge_gives_up_and_lifts_the_hold_when_nothing_answers() {
-        let mut r = Rig::new(Mode::On);
-        r.hold();
-        assert_eq!(
-            r.at(ANSWER_TIMEOUT_MS - 1),
-            Act::WaitUntil(r.m.hold_started_ms() + ANSWER_TIMEOUT_MS)
-        );
-        assert_eq!(r.at(1), Act::Release);
-        r.release();
-        assert_eq!(r.m.phase(), Phase::Restoring);
-        assert_eq!(r.at(ANSWER_TIMEOUT_MS), Act::GaveUp(GiveUp::NoAnswer));
-        assert_eq!(r.m.phase(), Phase::Rest);
-    }
-
-    #[test]
-    fn nudge_waits_for_a_late_answer_and_then_restores() {
-        let mut r = Rig::new(Mode::On);
-        r.hold();
-        r.at(200);
-        r.answer();
-        assert_eq!(r.at(1), Act::Release);
-        r.release();
-        r.at(300);
-        r.answer();
-        assert!(matches!(r.at(1), Act::Healed { first_ms: 201, .. }));
-    }
-
-    #[test]
-    fn an_ordinary_frame_before_a_late_answer_is_not_an_answer() {
-        let mut r = Rig::new(Mode::On);
-        r.hold();
-        // The program draws ordinary frames (no full clear): output, not an answer.
-        r.f.output_quiet_ms = 0;
-        assert!(matches!(r.at(300), Act::WaitUntil(_)));
-        assert_eq!(r.m.phase(), Phase::Short);
-        r.f.output_quiet_ms = u64::MAX;
-        r.answer();
-        assert_eq!(r.at(1), Act::Release);
-    }
-
-    #[test]
-    fn a_program_that_repaints_without_ed2_is_tried_once_and_abandoned() {
-        let mut r = Rig::new(Mode::On);
-        r.hold();
-        r.f.output_quiet_ms = 0;
-        r.at(ANSWER_TIMEOUT_MS);
-        assert_eq!(r.m.phase(), Phase::Restoring);
-        r.release();
-        assert_eq!(r.at(ANSWER_TIMEOUT_MS), Act::GaveUp(GiveUp::NoAnswer));
-        // The same epoch never arms again; new debt is a new epoch.
-        assert!(!r.m.arm(Mode::On, Reason::Debt, 1, r.now));
-        assert_eq!(r.m.nudged(), 1);
-    }
-
-    #[test]
-    fn a_non_answering_app_ends_with_the_pty_at_the_engine_dims() {
-        let mut r = Rig::new(Mode::On);
-        r.hold();
-        assert_eq!(r.at(ANSWER_TIMEOUT_MS), Act::Release);
-        // What the host does on Release: the engine's size.
-        r.release();
-        assert_eq!(r.f.pty, r.f.engine);
-        r.at(ANSWER_TIMEOUT_MS);
-        assert_eq!(r.m.phase(), Phase::Rest);
-        assert_eq!(r.f.pty, r.f.engine);
-    }
-
-    #[test]
-    fn a_nudge_that_gets_no_answer_never_asks_for_the_engine() {
-        // Over a silent program the acts are Hold, Release, give-up: nothing else.
-        let mut r = Rig::new(Mode::On);
-        let mut acts = Vec::new();
-        for _ in 0..40 {
-            let a = r.at(200);
-            if matches!(a, Act::Hold | Act::Release | Act::GaveUp(_)) {
-                acts.push(a);
+            assert_eq!(r.m.phase(), Phase::Armed, "{name}");
+            set(&mut r.f, false);
+            assert_eq!(r.at(1), Act::Hold, "{name}");
+            let Some(gate) = gate else { continue };
+            let mut r = Rig::new(Mode::On);
+            set(&mut r.f, true);
+            let mut last = Act::Nothing;
+            for _ in 0..600 {
+                last = r.at(250);
+                if matches!(last, Act::GaveUp(_)) {
+                    break;
+                }
             }
-            match a {
-                Act::Hold => r.f.pty = SHORT,
-                Act::Release => r.f.pty = SIZE,
-                _ => {}
-            }
+            assert_eq!(last, Act::GaveUp(GiveUp::Deferred(gate)), "{name}");
+            assert_eq!(r.m.phase(), Phase::Rest, "{name}");
         }
-        assert_eq!(
-            acts,
-            [Act::Hold, Act::Release, Act::GaveUp(GiveUp::NoAnswer)]
-        );
-    }
-
-    #[test]
-    fn nudge_never_holds_while_a_driver_may_type_into_the_session() {
-        let mut r = Rig::new(Mode::On);
-        r.f.driver_may_type = true;
-        for _ in 0..20 {
-            assert!(matches!(r.at(100), Act::WaitUntil(_)));
-        }
-        assert_eq!(r.m.phase(), Phase::Armed);
-        r.f.driver_may_type = false;
-        assert!(matches!(r.at(10), Act::Hold));
-    }
-
-    #[test]
-    fn a_lease_on_another_tab_does_not_defer_the_nudge() {
-        // The fact is per target session: another tab's lease is not in it.
-        let mut r = Rig::new(Mode::On);
-        r.f.driver_may_type = false;
-        assert_eq!(r.step(), Act::Hold);
-    }
-
-    #[test]
-    fn a_lease_held_for_120s_defers_once_then_abandons() {
-        let mut r = Rig::new(Mode::On);
-        r.f.driver_may_type = true;
-        let mut last = Act::Nothing;
-        for _ in 0..600 {
-            last = r.at(250);
-            if matches!(last, Act::GaveUp(_)) {
-                break;
-            }
-        }
-        assert_eq!(last, Act::GaveUp(GiveUp::Deferred(Gate::Lease)));
-        assert_eq!(r.m.phase(), Phase::Rest);
     }
 
     #[test]
@@ -1179,16 +1071,6 @@ mod tests {
         assert_eq!(r.step(), Act::WaitUntil(r.now + PERSON_GATE_MS - 100));
         r.f.person_quiet_ms = PERSON_GATE_MS;
         assert_eq!(r.step(), Act::Hold);
-    }
-
-    #[test]
-    fn a_click_a_wheel_notch_and_a_drag_each_count_as_a_person() {
-        // The host builds the one number from the stamp `is_person_gesture` feeds.
-        for quiet in [0, 1, 700, PERSON_GATE_MS - 1] {
-            let mut r = Rig::new(Mode::On);
-            r.f.person_quiet_ms = quiet;
-            assert!(matches!(r.step(), Act::WaitUntil(_)), "{quiet}");
-        }
     }
 
     #[test]
@@ -1250,29 +1132,6 @@ mod tests {
     }
 
     #[test]
-    fn nudge_waits_out_an_open_2026_frame() {
-        let mut r = Rig::new(Mode::On);
-        r.f.frame_open = true;
-        for _ in 0..20 {
-            assert!(matches!(r.at(100), Act::WaitUntil(_)));
-        }
-        assert_eq!(r.m.phase(), Phase::Armed);
-        r.f.frame_open = false;
-        assert_eq!(r.at(1), Act::Hold);
-        // A frame that never closes is abandoned, not waited on for ever.
-        let mut r = Rig::new(Mode::On);
-        r.f.frame_open = true;
-        let mut last = Act::Nothing;
-        for _ in 0..200 {
-            last = r.at(100);
-            if matches!(last, Act::GaveUp(_)) {
-                break;
-            }
-        }
-        assert_eq!(last, Act::GaveUp(GiveUp::Deferred(Gate::Busy)));
-    }
-
-    #[test]
     fn the_release_waits_for_40ms_of_quiet() {
         let mut r = Rig::new(Mode::On);
         r.hold();
@@ -1289,43 +1148,6 @@ mod tests {
         assert!(matches!(r.step(), Act::WaitUntil(_)));
         r.f.frame_open = false;
         assert_eq!(r.step(), Act::Release);
-    }
-
-    #[test]
-    fn a_halted_session_is_never_nudged_and_the_epoch_waits_for_the_lift() {
-        let mut r = Rig::new(Mode::On);
-        r.f.halted = true;
-        assert_eq!(r.at(10_000), Act::Nothing);
-        assert_eq!(r.m.phase(), Phase::Armed);
-        r.f.halted = false;
-        assert_eq!(r.at(1), Act::Hold);
-        // A halt that arrives during the hold lifts it; the answer is then
-        // waited for as after any release.
-        r.f.pty = SHORT;
-        r.f.halted = true;
-        assert_eq!(r.at(1), Act::Release);
-        assert_eq!(r.m.phase(), Phase::Restoring);
-    }
-
-    #[test]
-    fn a_standing_selection_defers_the_nudge_then_abandons_it() {
-        let mut r = Rig::new(Mode::On);
-        r.f.selection = true;
-        assert!(matches!(r.at(1), Act::WaitUntil(_)));
-        let mut last = Act::Nothing;
-        for _ in 0..200 {
-            last = r.at(250);
-            if matches!(last, Act::GaveUp(_)) {
-                break;
-            }
-        }
-        assert_eq!(last, Act::GaveUp(GiveUp::Deferred(Gate::Selection)));
-        // Cleared inside the cap: goes.
-        let mut r = Rig::new(Mode::On);
-        r.f.selection = true;
-        r.at(10_000);
-        r.f.selection = false;
-        assert_eq!(r.at(1), Act::Hold);
     }
 
     #[test]
@@ -1362,16 +1184,6 @@ mod tests {
     }
 
     #[test]
-    fn at_most_one_hold_app_wide() {
-        let mut r = Rig::new(Mode::On);
-        r.f.other_hold = true;
-        assert!(matches!(r.at(10), Act::WaitUntil(_)));
-        assert_eq!(r.m.phase(), Phase::Armed);
-        r.f.other_hold = false;
-        assert_eq!(r.at(1), Act::Hold);
-    }
-
-    #[test]
     fn a_program_that_repainted_by_itself_is_not_nudged() {
         let mut r = Rig::new(Mode::On);
         r.f.owed = false;
@@ -1383,22 +1195,6 @@ mod tests {
         f.owed = false;
         assert!(m.arm(Mode::On, Reason::Adoption, u64::MAX, 0));
         assert_eq!(m.step(&f, 0), Act::Hold);
-    }
-
-    #[test]
-    fn a_real_resize_meanwhile_supersedes_the_hold() {
-        let mut r = Rig::new(Mode::On);
-        r.hold();
-        // A real resize moved the engine and its layout pass reset the PTY: forgotten,
-        // nothing written.
-        r.f.engine = (62, 200);
-        r.f.pty = (62, 200);
-        assert_eq!(r.at(5), Act::Forget);
-        assert_eq!(r.m.phase(), Phase::Restoring);
-        // The program was given a size it reads as changed and has not
-        // answered: superseded, not a give-up.
-        assert_eq!(r.at(ANSWER_TIMEOUT_MS), Act::Dropped(Dropped::Superseded));
-        assert_eq!(r.m.phase(), Phase::Rest);
     }
 
     #[test]

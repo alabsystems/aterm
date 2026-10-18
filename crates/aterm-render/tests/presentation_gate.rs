@@ -10,11 +10,8 @@
 //! `Emoji_Presentation=No`, so it draws as text even though Apple Color Emoji
 //! covers it.
 //!
-//! The `PresentationGate` model (`aterm_spec::derive::presentation_gate_model`)
-//! carries `NoColorForText`, and aterm-spec's
-//! `derived_presentation_gate_proves_and_catches_text_colored_as_emoji` runs
-//! `ty` over it. `select_face` has a finite boolean domain, so this file checks
-//! the invariant on all 2^6 inputs, with a non-vacuous control.
+//! `select_face` has a finite boolean domain, so this file checks the
+//! `NoColorForText` invariant on all 2^6 inputs, with a non-vacuous control.
 
 use aterm_render::{FaceId, select_face};
 

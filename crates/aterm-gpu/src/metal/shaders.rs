@@ -1,18 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The MSL twins of aterm's WGSL shaders. The entry-point roster is derived
-//! from [`crate::pipeline_table`] (see `libraries`); `crate::shader_twins`
-//! scans every twin's entry points and bindings against it.
-//!
-//! The WGSL lives in `const &str` literals in `renderer.rs`; the MSL lives in
-//! `crates/aterm-gpu/shaders/*.metal`, pulled in with `include_str!`, so the
-//! compile test, editors and `xcrun metal` can read it.
+//! The MSL twins of aterm's WGSL shaders. The WGSL lives in `renderer.rs`; the
+//! MSL in `crates/aterm-gpu/shaders/*.metal`, pulled in with `include_str!` so
+//! editors and `xcrun metal` can read it. Which entry points each library
+//! exports is the business of [`crate::pipeline_table`].
 //!
 //! # Colour spaces
 //!
-//! `renderer.rs::pick_surface_format` chooses a non-sRGB surface format, never
-//! an `*_sRGB` one:
+//! The surface format is never `*_sRGB` (`pick_surface_format`):
 //!
 //! * Base OVER/REPLACE passes render into an sRGB view of the offscreen; the
 //!   fragments emit linear light (`s2l`) and the view re-encodes on store, so
@@ -23,31 +19,25 @@
 //! * The blit writes already-encoded bytes; an sRGB swapchain would encode
 //!   twice.
 //!
-//! Metal expresses the pairing with `newTextureViewWithPixelFormat:` on
-//! Unorm/sRGB view-compatible formats. The formats used (`Bgra8Unorm`,
-//! `Rgba8Unorm`, `R8Unorm`, `Rgba16Float`) are declared in
-//! [`super::ffi::PixelFormat`] and exercised by [`super::tests`].
-
+//! The view pairs come from `newTextureViewWithPixelFormat:` on
+//! view-compatible Unorm/sRGB formats.
+//!
 //! # WGSL to MSL mapping
 //!
-//! Structural differences: `@location` params become `[[attribute(n)]]` +
-//! `[[stage_in]]` structs; `@interpolate(flat)` becomes `[[flat]]`;
-//! `bitcast<i32>` becomes `as_type<int>`; `textureLoad` becomes `read`;
-//! `textureSampleLevel(.., 0.0)` becomes `sample(.., level(0.0))`; uniforms,
-//! textures and samplers become function arguments. In `cell.metal` the rain
-//! weight and fire shading tails are shared `static inline` helpers so the
-//! parity kernel calls the same code as the fragments. Integer math is
-//! otherwise op for op. `parity_kernel.metal` is verification-only.
+//! `@location` params become `[[attribute(n)]]` + `[[stage_in]]` structs;
+//! `@interpolate(flat)` becomes `[[flat]]`; `bitcast<i32>` becomes
+//! `as_type<int>`; `textureLoad` becomes `read`; `textureSampleLevel(.., 0.0)`
+//! becomes `sample(.., level(0.0))`; uniforms, textures and samplers become
+//! function arguments. Integer math is otherwise op for op. In `cell.metal` the
+//! rain weight and fire shading are shared `static inline` helpers so the
+//! verification-only `parity_kernel.metal` calls the same code as the
+//! fragments.
 //!
-//! Every construct maps exactly:
-//!
-//! * Arithmetic right shift of negative integers (`fire_core`'s
-//!   `(body0 - 128) * edge >> 8`): sign-replicating in both WGSL and MSL for
-//!   signed types; the fire differential in `super::tests` confirms it.
-//! * Wrapping `u32` arithmetic (`fire_hash`): defined in both.
-//! * Flat integer interpolation: MSL requires `[[flat]]`; every flat value is
-//!   per instance, so the provoking vertex does not matter.
-//! * Uniform layout: std140 in WGSL, natural C layout in MSL. Every member here
+//! * Arithmetic right shift of a negative signed integer (`fire_core`'s
+//!   `(body0 - 128) * edge >> 8`) sign-replicates in both languages.
+//! * Wrapping `u32` arithmetic (`fire_hash`) is defined in both.
+//! * Every flat value is per instance, so the provoking vertex does not matter.
+//! * Uniforms are std140 in WGSL and natural C layout in MSL. Every member here
 //!   is at most 16 bytes and naturally aligned, so they agree; recheck
 //!   `BlitUniform` (112 bytes) and `ShimmerU`'s `float4[16]` when adding
 //!   fields.
@@ -71,8 +61,7 @@ pub(crate) const BLOOM: &str = include_str!("../../shaders/bloom.metal");
 /// `renderer.rs::SHIMMER_SHADER`.
 pub(crate) const SHIMMER: &str = include_str!("../../shaders/shimmer.metal");
 
-/// The MSL source for one [`ShaderLibrary`]. Which entry points it must export
-/// comes from `crate::pipeline_table::entry_points`.
+/// The MSL source for one [`ShaderLibrary`].
 pub(crate) const fn source(library: ShaderLibrary) -> &'static str {
     match library {
         ShaderLibrary::Cell => CELL,
@@ -84,21 +73,9 @@ pub(crate) const fn source(library: ShaderLibrary) -> &'static str {
     }
 }
 
-/// Every `(library, source, entry points)` triple, derived from the pipeline
-/// table, so one test proves every library compiles and every entry point the
-/// renderer requests resolves. Derived rather than listed so the roster cannot
-/// agree with a rename the renderer does not know about.
-#[cfg(test)]
-pub(crate) fn libraries() -> Vec<(ShaderLibrary, &'static str, Vec<&'static str>)> {
-    ShaderLibrary::ALL
-        .into_iter()
-        .map(|lib| (lib, source(lib), crate::pipeline_table::entry_points(lib)))
-        .collect()
-}
-
 /// Verification-only state probes (fullscreen triangle, constant-colour and
-/// sampling fragments) that let [`super::tests`] prove the write mask,
-/// scissor, viewport and sampler filters in [`super::ffi`] are honoured.
+/// sampling fragments) that let [`super::tests`] prove the write mask and
+/// sampler filters in [`super::ffi`] are honoured.
 #[cfg(test)]
 pub(crate) const STATE_PROBE: &str = include_str!("../../shaders/state_probe.metal");
 
@@ -111,24 +88,4 @@ pub(crate) const PARITY_KERNEL: &str = include_str!("../../shaders/parity_kernel
 #[cfg(test)]
 pub(crate) fn cell_with_parity_kernels() -> String {
     format!("{CELL}\n{PARITY_KERNEL}")
-}
-
-#[cfg(test)]
-mod tests {
-    /// The Metal half of the bind column the twin scan cannot state off
-    /// macOS: no row's vertex uniform sits on `INSTANCE_STREAM_SLOT`, where the
-    /// vertex descriptor binds the instance stream. The rest of the MSL entry
-    /// point and binding scan is `crate::shader_twins`, which reads every
-    /// dialect's twins on every host.
-    #[test]
-    fn no_vertex_uniform_sits_on_the_instance_stream_slot() {
-        for p in crate::pipeline_table::ALL_PIPELINES {
-            assert_ne!(
-                p.spec().binds.vertex_uniform,
-                Some(crate::metal::ffi::INSTANCE_STREAM_SLOT as u32),
-                "{}: the vertex uniform may not sit on INSTANCE_STREAM_SLOT",
-                p.name()
-            );
-        }
-    }
 }

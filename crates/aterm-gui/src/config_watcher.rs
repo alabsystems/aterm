@@ -21,7 +21,7 @@
 //! generation.
 //!
 //! The path feeds — files `aterm.toml` names whose content is applied state (the Sparkle Words
-//! lexicon, Toy Packs, Trail Packs; [`crate::app_config::Config::path_feed_paths`]) — are
+//! lexicon and Toy Packs; [`crate::app_config::Config::path_feed_paths`]) — are
 //! stamped beside it, metadata only, on the same poll. A change to one re-posts the current
 //! config observation, and the UI's reload admission re-reads the feeds and compares content
 //! fingerprints (`refresh_path_feeds`): editing only the lexicon hot-reloads it, a `touch` stays
@@ -631,8 +631,8 @@ fn observed_harness(
 /// posted (`last`), recording it only once `send` queued the wake
 /// (`Wake::HarnessPolicyObserved`). `false` when the event loop is gone.
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "HarnessPolicyOneWriter",
         action = "Poll",
         project = "aterm_gui::config_watcher::tests::project_harness_writer"
@@ -930,6 +930,14 @@ impl ThemePollSchedule {
 /// The first content read happens only in `try_discover_in` after this stamp has
 /// selected a real candidate edge.
 fn theme_directory_stamp(path: &std::path::Path) -> Result<ThemeDirectoryStamp, WatchFailureKind> {
+    theme_directory_stamp_capped(path, crate::app_config::MAX_USER_THEME_DIRECTORY_ENTRIES)
+}
+
+/// [`theme_directory_stamp`] reading at most `cap` entries (`truncated` past it).
+fn theme_directory_stamp_capped(
+    path: &std::path::Path,
+    cap: usize,
+) -> Result<ThemeDirectoryStamp, WatchFailureKind> {
     let directory_metadata = match std::fs::metadata(path) {
         Ok(metadata) => Some(metadata),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -953,12 +961,9 @@ fn theme_directory_stamp(path: &std::path::Path) -> Result<ThemeDirectoryStamp, 
     let mut inspected_entries = 0usize;
     let mut truncated = false;
     if let Some(entries) = entries {
-        for (index, result) in entries
-            .take(crate::app_config::MAX_USER_THEME_DIRECTORY_ENTRIES + 1)
-            .enumerate()
-        {
+        for (index, result) in entries.take(cap.saturating_add(1)).enumerate() {
             inspected_entries = inspected_entries.saturating_add(1);
-            if index == crate::app_config::MAX_USER_THEME_DIRECTORY_ENTRIES {
+            if index == cap {
                 truncated = true;
                 break;
             }
@@ -1110,7 +1115,7 @@ pub(crate) mod tests {
         coherent_theme_sample_with, config_failure_kind, config_file_observation,
         config_file_stamp, config_path_stamp, feed_paths_of, initial_config_observation_changed,
         observed_harness, path_feed_stamp, prepare_config_edge_with, prepare_theme_edge_with,
-        theme_directory_stamp,
+        theme_directory_stamp, theme_directory_stamp_capped,
     };
 
     /// Editing only the lexicon hot-reloads it: the feeds the config names are stamped beside it,
@@ -1125,20 +1130,20 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let config = dir.join("aterm.toml");
         let lexicon = dir.join("lexicon.toml");
-        let pack = dir.join("pack.toml");
+        let toy = dir.join("toy.toml");
         std::fs::write(&lexicon, b"[[entry]]\nword = \"purr\"\n").unwrap();
         std::fs::write(
             &config,
             format!(
-                "cursor_trail_packs = [{:?}]\n\n[sparkle_words]\nlexicon = {:?}\n",
-                pack.display().to_string(),
+                "[sparkle_words]\nlexicon = {:?}\ntoy_packs = [{:?}]\n",
                 lexicon.display().to_string(),
+                toy.display().to_string(),
             ),
         )
         .unwrap();
         let observation = config_file_observation(&config).unwrap();
         let feeds = feed_paths_of(&observation.text).expect("the config parses");
-        assert_eq!(feeds, vec![lexicon.clone(), pack.clone()]);
+        assert_eq!(feeds, vec![lexicon.clone(), toy.clone()]);
         let config_stamp = config_path_stamp(&config).unwrap();
         let before = path_feed_stamp(&feeds);
         assert_eq!(path_feed_stamp(&feeds), before, "control: idle is no edge");
@@ -1167,7 +1172,7 @@ pub(crate) mod tests {
 
         // A feed that appears is an edge too (it was absent above).
         let absent = path_feed_stamp(&feeds);
-        std::fs::write(&pack, b"").unwrap();
+        std::fs::write(&toy, b"").unwrap();
         assert_ne!(path_feed_stamp(&feeds), absent);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1194,7 +1199,7 @@ pub(crate) mod tests {
         );
         let many: Vec<String> = (0..12).map(|i| format!("\"/p{i}.toml\"")).collect();
         let packs = crate::app_config::Config::parse(&format!(
-            "cursor_trail_packs = [{}]\n",
+            "[sparkle_words]\ntoy_packs = [{}]\n",
             many.join(", ")
         ))
         .unwrap();
@@ -1364,20 +1369,20 @@ pub(crate) mod tests {
     /// Tier-1 drives, each waived by name. Bound: `Poll` (`post_harness`),
     /// `Deliver` (`App::adopt_harness_policy`), `AdmitOn`/`AdmitOff`
     /// (`App::apply_prepared_config_generation`).
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "HarnessPolicyOneWriter",
         action = "WriteOn",
         reason = "The environment: a person saves aterm.toml with approvals on. The Tier-1 \
                   writes the real file and the real watcher read (observed_harness) sees it."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "HarnessPolicyOneWriter",
         action = "WriteOff",
         reason = "The environment: a person saves the kill switch, refused for a stray \
                   non-UTF-8 byte. The Tier-1 writes the real file and the real watcher read \
                   (observed_harness) sees it."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "HarnessPolicyOneWriter",
         action = "Commit",
         reason = "A seamless successor's Commit (Wake::ActivateCommittedHandoff), bound by the \
@@ -1385,28 +1390,28 @@ pub(crate) mod tests {
                   raises the process-wide REPOST_AFTER_COMMIT that a live watcher thread in \
                   the same test binary could consume, so the Tier-1 stands in for it."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "HarnessPolicyOneWriter",
         action = "Forget",
         reason = "An inline block of the watcher thread's loop (REPOST_AFTER_COMMIT's swap, \
                   then last_harness = None), which the Tier-1 transcribes: the loop polls \
                   forever and posts through a real event-loop proxy."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "HarnessPolicyOneWriter",
         action = "SecondWriterOff",
         reason = "The Buggy=1 mutant: an admission adopting its own kill switch, the design \
                   this replaced; no shipping code, and the Tier-1's negative control sees the \
                   step refused."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "HarnessPolicyOneWriter",
         action = "SecondWriterOn",
         reason = "The Buggy=1 mutant: an admission adopting its own approvals, the design this \
                   replaced; no shipping code, and the Tier-1's negative control sees the step \
                   refused."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "HarnessPolicyOneWriter",
         action = "CommitWithoutForget",
         reason = "The Buggy=1 mutant: a Commit that raises no REPOST_AFTER_COMMIT; no shipping \
@@ -1564,6 +1569,7 @@ pub(crate) mod tests {
                         fonts: None,
                         warnings: Vec::new(),
                         font_refusals: Vec::new(),
+                        reason: crate::app_colorscheme::ThemeChange::ConfigReload,
                     },
                 );
             });
@@ -1619,7 +1625,7 @@ pub(crate) mod tests {
             forget_pending: false,
             disk: 0,
             edits: 0,
-            model: aterm_spec::derive::harness_policy_one_writer_model(),
+            model: aterm_models_harness::harness_policy_one_writer_model(),
         };
         assert_eq!(drive.state(), drive.model.init_state(), "the model's start");
 
@@ -1962,43 +1968,28 @@ pub(crate) mod tests {
 
     #[test]
     fn theme_stamp_bounds_total_entries_and_detects_return_under_cap() {
-        /// `each` over `paths`, on four threads.
-        fn on_four_threads(paths: &[std::path::PathBuf], each: impl Fn(&std::path::Path) + Sync) {
-            std::thread::scope(|scope| {
-                for chunk in paths.chunks(paths.len().div_ceil(4).max(1)) {
-                    let each = &each;
-                    scope.spawn(move || chunk.iter().for_each(|path| each(path)));
-                }
-            });
-        }
-
+        // The cap is the production one's law at a size the test can lay down
+        // (`theme_directory_stamp` passes `MAX_USER_THEME_DIRECTORY_ENTRIES`).
+        const CAP: usize = 8;
         let dir = std::env::temp_dir().join(format!(
             "aterm-theme-watch-entry-cap-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        // Laid and removed by four threads: beside `F_FULLFSYNC` writers (as `verify test` runs
-        // it) every create and unlink waits for the volume's next commit, and four threads halve
-        // the wait (about 28 s to 14 s; eight gain little). The stamp reads names and file
-        // types, the same whichever thread made each.
-        let noise = (0..=crate::app_config::MAX_USER_THEME_DIRECTORY_ENTRIES)
+        let noise = (0..=CAP)
             .map(|index| dir.join(format!("noise-{index:04}")))
             .collect::<Vec<_>>();
-        on_four_threads(&noise, |path| std::fs::write(path, []).unwrap());
-        let over = theme_directory_stamp(&dir).unwrap();
+        for path in &noise {
+            std::fs::write(path, []).unwrap();
+        }
+        let over = theme_directory_stamp_capped(&dir, CAP).unwrap();
         assert!(over.truncated);
-        assert_eq!(
-            over.inspected_entries,
-            crate::app_config::MAX_USER_THEME_DIRECTORY_ENTRIES + 1
-        );
+        assert_eq!(over.inspected_entries, CAP + 1);
         std::fs::remove_file(&noise[0]).unwrap();
-        let under = theme_directory_stamp(&dir).unwrap();
+        let under = theme_directory_stamp_capped(&dir, CAP).unwrap();
         assert_ne!(over, under, "returning under the entry cap is observable");
         assert!(!under.truncated);
-        on_four_threads(&noise[1..], |path| {
-            let _ = std::fs::remove_file(path);
-        });
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2165,7 +2156,7 @@ pub(crate) mod tests {
 
     #[test]
     fn watcher_failure_latch_conforms_to_the_derived_protocol() {
-        let model = aterm_spec::derive::watcher_failure_recovery_model();
+        let model = aterm_models_native::watcher_failure_recovery_model();
         let mut modeled = model.init_state();
         let mut latch = FailureLatch::default();
         let mut failure_wakes = 0_i64;
@@ -2239,7 +2230,7 @@ pub(crate) mod tests {
         assert_ne!(first, second);
 
         let mut state = WatchStatusState::default();
-        let model = aterm_spec::derive::watcher_failure_recovery_model();
+        let model = aterm_models_native::watcher_failure_recovery_model();
         let mut modeled = model.successors("ObserveFailure", &model.init_state())[0].clone();
         assert!(state.reduce(WatchStatusEvent::Failed(WatchFailure {
             target: WatchTarget::Config,

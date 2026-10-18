@@ -3,54 +3,24 @@
 
 use std::collections::BTreeSet;
 
-use aterm_spec::tla_check::TlaSpec;
 use aterm_spec::xref::{self, SpecModule};
 
-// The toolchain-free closure: every anchor linked into this binary resolves,
-// every actively-bound machine is fully covered, and the Tier-1 conformances
-// the anchors claim are run. `ty --strict-vacuity` and `trust-ir spec-link`
-// over the registry are `spec-check vacuity` and `spec-check trust-ir`
-// (aterm-spec), which need the checkers.
+// The toolchain-free closure over the machines this crate binds: every anchor it writes
+// resolves, every machine it binds is fully covered (its test-only seams and waivers are
+// linked only here), and the Tier-1 conformances the anchors claim are run. Every other
+// anchored crate's machines are aterm-models' `spec_xref_closure`. `ty --strict-vacuity`
+// over the registry is `spec-check vacuity` (aterm-models), which needs the checker.
 
-/// The registered `SpecModule` set: every embedded `Model` plus every active external
-/// `.tla` in aterm-spec-models' `specs/`.
+/// Where this crate's own anchors are written (`file!()` of each).
+const GUI_SOURCE: &str = "crates/aterm-gui/";
+
+/// The registered `SpecModule` set: every model linked into this binary.
 fn registered_modules() -> Vec<SpecModule> {
-    let mut modules: Vec<SpecModule> = xref::model_registry()
+    xref::model_registry()
         .into_iter()
         .map(SpecModule::Embedded)
-        .collect();
-    let specs = xref::hand_written_specs().unwrap_or_else(|why| panic!("{why}"));
-    for path in specs {
-        let spec = TlaSpec::parse_file(&path)
-            .unwrap_or_else(|e| panic!("failed to parse external spec {path:?}: {e}"));
-        modules.push(SpecModule::External(spec));
-    }
-    modules
+        .collect()
 }
-
-/// The six ISOLATION machines Phase 2 activates, with the action count the
-/// closure gate must find bound-or-waived (the `Next` disjuncts of each spec).
-/// `fork_exec` is anchored-but-not-Tier-1 (its child branch can't be driven
-/// in-process); the rest carry Tier-1 conformance in their own crates' tests.
-#[cfg(unix)]
-const ISOLATION: &[(&str, usize)] = &[
-    ("sandbox", 1),      // Apply
-    ("path_confine", 1), // Confine
-    ("fork_exec", 6),    // Fork, Setrlimit, Chdir, CloseMaster, UnsafeEnvOp, Exec
-    ("write_all", 2),    // Progress, Interrupted
-    ("alt_screen", 4),   // WriteMain, Enter, Scribble, Leave
-    ("gpu_encode", 2),   // Append, Encode
-];
-/// Windows twin of [`ISOLATION`]: `fork_exec` and `write_all` model POSIX code that does
-/// not compile here, so those machines stay report-only; the four whose subjects ship
-/// on Windows stay fully gated.
-#[cfg(windows)]
-const ISOLATION: &[(&str, usize)] = &[
-    ("sandbox", 1),      // Apply
-    ("path_confine", 1), // Confine
-    ("alt_screen", 4),   // WriteMain, Enter, Scribble, Leave
-    ("gpu_encode", 2),   // Append, Encode
-];
 
 /// The eleven `SelectionCustody` actions, shared by the coverage and execution-evidence
 /// assertions so both check the same set.
@@ -87,6 +57,30 @@ const PRESS_CUSTODY_ACTIONS: &[&str] = &[
     "OutputTookTheSelectionUnattributedInPlace",
     "OutputInvalidatesTheCoordinateSpace",
 ];
+
+/// The registered machines (as the closure names them) that some anchor or waiver linked
+/// here from `source` binds.
+fn machines_bound_from(report: &xref::ClosureReport, source: &str) -> BTreeSet<String> {
+    let anchored: BTreeSet<&str> = xref::refinements()
+        .filter(|r| r.location.starts_with(source))
+        .map(|r| r.machine)
+        .chain(
+            xref::waivers()
+                .filter(|w| w.location.starts_with(source) && !w.machine.is_empty())
+                .map(|w| w.machine),
+        )
+        .collect();
+    report
+        .coverage
+        .iter()
+        .filter(|c| {
+            anchored
+                .iter()
+                .any(|a| xref::machine_matches(a, &c.machine))
+        })
+        .map(|c| c.machine.clone())
+        .collect()
+}
 
 /// Assert one machine's per-step execution evidence and return the derived summary of
 /// what it does and does not discriminate.
@@ -258,15 +252,6 @@ fn run_conformance_body<T: Send>(
 
 #[test]
 fn spec_xref_closure() {
-    // LINK the keeper's anchors: aterm-keeper is a test-only dependency here
-    // (the window does not use it before P3), and `aterm_spec::registry` sees only
-    // object code the binary links. Naming the anchored handlers links them.
-    std::hint::black_box((
-        aterm_keeper::KeeperCore::new as fn(bool) -> aterm_keeper::KeeperCore,
-        aterm_keeper::RelaunchBrake::new as fn() -> aterm_keeper::RelaunchBrake,
-        aterm_keeper::core::classify_death
-            as fn(aterm_keeper::core::DeathEvidence) -> aterm_keeper::core::Verdict,
-    ));
     // ---- Proof #1: the registry ACTUALLY collected the anchors, cross-crate. ----
     let refs: Vec<_> = xref::refinements().collect();
     let waivers: Vec<_> = xref::waivers().collect();
@@ -283,7 +268,7 @@ fn spec_xref_closure() {
         )
         .collect();
     crate::logging::stderr_line!(
-        "spec_xref_closure (relocated to aterm-gui): collected {} refinement anchor(s) + \
+        "spec_xref_gate: collected {} refinement anchor(s) + \
          {} waiver(s) across {} machine(s):",
         refs.len(),
         waivers.len(),
@@ -295,40 +280,25 @@ fn spec_xref_closure() {
         crate::logging::stderr_line!("    {m:<16} refinements={r:<3} waivers={w}");
     }
 
-    // Phase 0 not regressed: the terminal_modes anchors (from aterm-core, now
-    // visible via its `spec-anchors` feature) must still be collected here.
-    let tm = refs
-        .iter()
-        .filter(|r| r.machine == "terminal_modes")
-        .count();
-    assert!(
-        tm >= 26,
-        "expected >= 26 `terminal_modes` refinement anchors collected cross-crate from \
-         aterm-core (Phase 0 must not regress), found {tm}"
-    );
-
-    // Every ISOLATION machine's anchors collected here (cross-crate).
-    for (machine, _) in ISOLATION {
-        let r = refs.iter().filter(|x| x.machine == *machine).count();
-        let w = waivers.iter().filter(|x| x.machine == *machine).count();
-        assert!(
-            r + w > 0,
-            "ISOLATION machine `{machine}` collected ZERO anchors — the cross-crate \
-             registry collection (spec-anchors feature) did not link. The gate would be \
-             vacuously green for it."
-        );
-    }
-
-    // ---- Build the registered SpecModule set (embedded + external ISOLATION) ----
+    // ---- Build the registered SpecModule set ----
     let modules = registered_modules();
-    crate::logging::stderr_line!(
-        "spec_xref_closure: {} registered SpecModule(s) ({} embedded + external ISOLATION)",
-        modules.len(),
-        xref::model_registry().len()
-    );
+    crate::logging::stderr_line!("spec_xref_closure: {} registered model(s)", modules.len());
 
-    // ---- Run the obligations (1, 3, 4) ----
-    let report = xref::check_closure(&modules);
+    // ---- Run the obligations (1, 3, 4), scoped to what this crate binds ----
+    // Every other anchored crate's machines are closed by aterm-models'
+    // `spec_xref_closure`, which links them all from outside; a machine this crate binds is
+    // closed here, where its test-only seams and waivers are linked too.
+    let mut report = xref::check_closure(&modules);
+    let ours = machines_bound_from(&report, GUI_SOURCE);
+    report.violations.retain(|v| {
+        if v.obligation == 3 {
+            ours.iter()
+                .any(|m| v.message.starts_with(&format!("machine `{m}` ")))
+        } else {
+            v.message.contains(GUI_SOURCE)
+        }
+    });
+    report.coverage.retain(|c| ours.contains(&c.machine));
 
     crate::logging::stderr_line!("spec_xref_closure: per-machine coverage ledger:");
     for c in &report.coverage {
@@ -364,59 +334,6 @@ fn spec_xref_closure() {
             .join("\n")
     );
 
-    // StreamingSearch's shipping methods are fully bound in ty: keep the
-    // machine itself non-vacuous.
-    let streaming = report
-        .coverage
-        .iter()
-        .find(|c| aterm_spec::xref::machine_matches("streaming_search", &c.machine))
-        .expect("StreamingSearch must be present in the coverage ledger");
-    assert!(streaming.active, "StreamingSearch must be ACTIVE");
-    assert_eq!(
-        streaming.total_actions, 9,
-        "StreamingSearch action inventory drifted"
-    );
-    assert_eq!(
-        streaming.bound.len(),
-        9,
-        "all StreamingSearch actions must carry refinement anchors"
-    );
-    assert_eq!(
-        streaming.ratio(),
-        1.0,
-        "StreamingSearch must remain fully bound"
-    );
-    assert!(
-        streaming.uncovered.is_empty(),
-        "StreamingSearch must have no uncovered action"
-    );
-
-    // ---- Proof #3: every ISOLATION machine is active and fully covered (==1.0) ----
-    for (machine, want_actions) in ISOLATION {
-        let c = report
-            .coverage
-            .iter()
-            .find(|c| aterm_spec::xref::machine_matches(machine, &c.machine))
-            .unwrap_or_else(|| panic!("ISOLATION machine `{machine}` not in the coverage ledger"));
-        assert!(
-            c.active,
-            "ISOLATION machine `{machine}` must be ACTIVE (>= 1 refinement)"
-        );
-        assert_eq!(
-            c.ratio(),
-            1.0,
-            "ISOLATION machine `{machine}` must be fully bound-or-waived (ratio == 1.0); \
-             uncovered = {:?}",
-            c.uncovered
-        );
-        assert_eq!(
-            c.total_actions, *want_actions,
-            "ISOLATION machine `{machine}` expected {want_actions} actions (its Next \
-             disjuncts), found {}",
-            c.total_actions
-        );
-    }
-
     // Each Tier-1 body runs under its own catch (`run_conformance_body`) and the
     // failures are asserted together once the last body has run.
     let mut failed_bodies: Vec<String> = Vec::new();
@@ -440,13 +357,6 @@ fn spec_xref_closure() {
             "window_routing must be fully bound (CreateWindow + CloseWindow + \
              ConnectedCreateWindow + RaiseSession all anchored); uncovered = {:?}",
             wr.uncovered
-        );
-        assert_eq!(
-            wr.total_actions, 4,
-            "window_routing has 4 actions (CreateWindow, CloseWindow, \
-             ConnectedCreateWindow, RaiseSession — the session-connections acts, \
-             design §9), found {}",
-            wr.total_actions
         );
     }
     // Run it (the gate now proves window_routing Tier-1, not merely claims it).
@@ -481,11 +391,6 @@ fn spec_xref_closure() {
             "pane_tree must be fully bound (Split + Close both anchored); uncovered = {:?}",
             pt.uncovered
         );
-        assert_eq!(
-            pt.total_actions, 2,
-            "pane_tree has 2 actions (Split, Close), found {}",
-            pt.total_actions
-        );
     }
     if run_conformance_body(
         "pane_tree",
@@ -517,11 +422,6 @@ fn spec_xref_closure() {
             1.0,
             "session_pool must be fully bound (Acquire + Release both anchored); uncovered = {:?}",
             sp.uncovered
-        );
-        assert_eq!(
-            sp.total_actions, 2,
-            "session_pool has 2 actions (Acquire, Release), found {}",
-            sp.total_actions
         );
     }
     if run_conformance_body(
@@ -557,11 +457,6 @@ fn spec_xref_closure() {
             "tab_strip must be fully bound (NewTab + SelectTab + Close all anchored); uncovered = {:?}",
             ts.uncovered
         );
-        assert_eq!(
-            ts.total_actions, 3,
-            "tab_strip has 3 actions (NewTab, SelectTab, Close), found {}",
-            ts.total_actions
-        );
     }
     if run_conformance_body(
         "tab_strip",
@@ -595,10 +490,6 @@ fn spec_xref_closure() {
             1.0,
             "AsymmetricPadLayout must be fully bound-or-waived; uncovered = {:?}",
             layout.uncovered
-        );
-        assert_eq!(
-            layout.total_actions, 5,
-            "AsymmetricPadLayout action surface changed; update anchors/conformance"
         );
         for action in [
             "ApplyInitialTop",
@@ -647,10 +538,6 @@ fn spec_xref_closure() {
             1.0,
             "input_release_pairing must be fully bound-or-waived; uncovered = {:?}",
             pairing.uncovered
-        );
-        assert_eq!(
-            pairing.total_actions, 21,
-            "input_release_pairing action surface changed; update anchors/conformance"
         );
         for action in [
             "ConsumePhysicalPress",
@@ -705,7 +592,8 @@ fn spec_xref_closure() {
              selection seams), not report-only"
         );
         assert_eq!(
-            custody.total_actions, 11,
+            custody.total_actions,
+            SELECTION_CUSTODY_ACTIONS.len(),
             "SelectionCustody action inventory drifted; update the anchors AND the \
              Tier-1 conformance, found {}",
             custody.total_actions
@@ -760,7 +648,8 @@ fn spec_xref_closure() {
              recorders), not report-only"
         );
         assert_eq!(
-            press.total_actions, 16,
+            press.total_actions,
+            PRESS_CUSTODY_ACTIONS.len(),
             "PressCustody action inventory drifted; update the anchors AND the Tier-1 \
              conformance, found {}",
             press.total_actions
@@ -840,8 +729,7 @@ fn spec_xref_closure() {
          move between them is invisible — the entry-pattern check cannot separate \
          what the identifier already merged. Beyond that the `project=` and \
          `rust_method` paths remain unresolved strings no layer maps to a symbol \
-         (obligation 2 proper — Phase 3 `trust-ir`), and the trust-ir manifest this \
-         gate emits is unchanged by any of it. The conformance remains the half that \
+         (obligation 2 proper — Phase 3 `trust-ir`). The conformance remains the half that \
          carries real weight: it drives shipping code and is falsified by a \
          regression in it."
     );
@@ -869,63 +757,12 @@ fn spec_xref_closure() {
          regression in it. Its per-step verdict is a REFINEMENT check (the action's \
          guard and its exact update image) PLUS an evaluation of every model \
          invariant over the observed pre- and post-states; whole-reachable-space \
-         invariant checking is Tier-0's, in `aterm-spec/tests/derived_ring_ty.rs`."
+         invariant checking is Tier-0's, in `aterm-models/tests/derived_ring_ty.rs`."
     );
 
-    // How far execution evidence reaches: per-step windows must be added inside each
-    // conformance module, so others get string coverage only. The audited count and
-    // names are derived from the ledgers (`StepEvidence::machine()`); the string-only
-    // list below is hand-maintained and its count taken from the array.
-    {
-        /// Tier-1 conformances run here without per-step windows. Hand-maintained;
-        /// forgetting one under-reports.
-        const STRING_ONLY_CONFORMANCES: &[&str] = &[
-            "window_routing",
-            "pane_tree",
-            "session_pool",
-            "tab_strip",
-            "AsymmetricPadLayout",
-            "input_release_pairing",
-        ];
-        let audited_ledgers: [&aterm_spec::xref::StepEvidence; 2] = [&sel_ev, &press_ev];
-        let mut machines: BTreeSet<&'static str> = BTreeSet::new();
-        let mut all_anchors = 0usize;
-        for r in xref::refinements() {
-            machines.insert(r.machine);
-            all_anchors += 1;
-        }
-        let audited_names: Vec<&'static str> =
-            audited_ledgers.iter().map(|e| e.machine()).collect();
-        let audited_machines = audited_names.len();
-        let audited: usize = audited_ledgers.iter().map(|e| e.audit().anchors).sum();
-        let widest: usize = audited_ledgers
-            .iter()
-            .map(|e| e.audit().wide_windows().2.len())
-            .max()
-            .unwrap_or(0);
-        crate::logging::stderr_line!(
-            "spec_xref_closure: EXECUTION-EVIDENCE REACH — {audited_machines} of {} \
-             anchor-bearing machines linked into this binary are audited for per-step \
-             function entry ({audited_names:?}; {audited} of {all_anchors} anchors). \
-             The other {} carry the STRING closure only: for them a green ratio still \
-             says an action name is claimed by some anchor and says nothing about the \
-             function it sits on. {} of them run a Tier-1 conformance in this very \
-             test ({STRING_ONLY_CONFORMANCES:?} — a HAND-MAINTAINED list, unlike the \
-             counts around it) and are the cheapest to convert; the rest have no \
-             in-process conformance here at all. And for the {audited_machines} that \
-             ARE audited, the evidence is function ENTRY inside a window as wide as \
-             the seam its step calls — up to {widest} anchored functions in one \
-             window here — never a proof that the anchored function is the one that \
-             performs the action.",
-            machines.len(),
-            machines.len().saturating_sub(audited_machines),
-            STRING_ONLY_CONFORMANCES.len(),
-        );
-    }
-
     crate::logging::stderr_line!(
-        "spec_xref_closure: LOCAL GREEN — obligations 1/3/4 hold for terminal_modes + {} \
-         ISOLATION machines; Tier-1 conformances discharged by the in-process interpreter.",
-        ISOLATION.len()
+        "spec_xref_gate: LOCAL GREEN — obligations 1/3/4 hold for the {} machine(s) this crate \
+         binds; Tier-1 conformances discharged by the in-process interpreter.",
+        ours.len()
     );
 }

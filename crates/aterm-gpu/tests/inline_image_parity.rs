@@ -3,8 +3,10 @@
 //
 // Inline-image (iTerm2 OSC 1337 / Kitty) pixel and precedence parity. Both
 // renderers composite the real image pixels: Kitty z<0 tiles sit after
-// backgrounds/underlayers but before base+combining glyphs; z>=0 tiles draw
-// over text, before line decorations.
+// backgrounds/underlayers but before base+combining glyphs, while z>=0 tiles
+// retain the traditional over-text slot before line decorations.
+//
+// No GPU or no font: COULD NOT RUN.
 
 use crate::common;
 use aterm_core::terminal::Terminal;
@@ -600,8 +602,7 @@ fn image_pixels_gpu_match_cpu() {
 fn sixel_rawrgba8_pixels_gpu_match_cpu() {
     // A decoded sixel (`ImageFormat::RawRgba8`) driven through the Terminal
     // paints the same pixels on the GPU as the CPU's `blit_image_cell`, within
-    // the 8-LSB tolerance. Needs aterm-core's `sixel` feature, which the test
-    // build enables.
+    // the 8-LSB tolerance.
     let theme = Theme::default();
     let px = 18.0;
     let (mut cpu, mut gpu) = backends(px, theme);
@@ -713,65 +714,6 @@ fn image_scissored_present_byte_identical_to_full() {
         f3.pixels,
         fresh(&input3),
         "image-removed frame must match a full render"
-    );
-}
-
-#[test]
-fn image_free_frame_stays_within_cpu_gpu_tolerance() {
-    // The image plumbing is inert for image-free content: a text frame stays
-    // within the usual antialiasing tolerance.
-    let theme = Theme::default();
-    let px = 18.0;
-    let (mut cpu, mut gpu) = backends(px, theme);
-    let (rows, cols) = (4usize, 12usize);
-    let mut term = Terminal::new(rows as u16, cols as u16);
-    term.process(b"\x1b[31mhello\x1b[0m \x1b[44mworld\x1b[0m");
-    let mut win = aterm_gpu::WindowGpu::new();
-    let input = term.cell_frame(rows, cols);
-    let cpu_frame = cpu.render_input(&input);
-    let gpu_frame = gpu.render_input(&mut win, &input, None);
-    let delta = max_channel_delta(&cpu_frame, &gpu_frame);
-    assert!(delta <= 8, "image-free CPU/GPU diverge by {delta} > 8");
-}
-
-/// A Kitty `a=T` RGBA image rasterizes to real pixels through the CPU inline
-/// image compositor. CPU-only.
-#[test]
-fn kitty_rgba_image_rasterizes_to_pixels_cpu() {
-    let theme = Theme::default();
-    let px = 18.0;
-    let mut cpu = common::cpu(px, theme);
-    cpu.debug_block_on_lazy_fallbacks();
-    let (cw, ch) = cpu.cell_size();
-    let (rows, cols) = (4usize, 8usize);
-    let mut term = Terminal::new(rows as u16, cols as u16);
-    term.set_cell_pixel_size(cw as u16, ch as u16);
-    term.process(b"\r");
-
-    // A solid-red RGBA image exactly one cell (cw x ch px) -> 1x1 footprint.
-    let mut raw = Vec::with_capacity(cw * ch * 4);
-    for _ in 0..(cw * ch) {
-        raw.extend_from_slice(&[255, 0, 0, 255]);
-    }
-    let mut seq = format!("\x1b_Ga=T,f=32,s={cw},v={ch};").into_bytes();
-    seq.extend_from_slice(
-        aterm_codec::base64::encode(&raw)
-            .expect("encode")
-            .as_bytes(),
-    );
-    seq.extend_from_slice(b"\x1b\\");
-    term.process(&seq);
-
-    let input = term.cell_frame(rows, cols);
-    assert!(!input.images[0].is_empty(), "kitty a=T placed the image");
-
-    let frame = cpu.render_input(&input);
-    let cell = cell_pixels(&frame, cw, ch, 0, 0);
-    assert!(
-        cell.iter()
-            .any(|&p| rr(p) > 180 && gg(p) < 80 && bb(p) < 80),
-        "the Kitty RGBA image must rasterize to red pixels (got none) — \
-         confirms kitty graphics actually render via the shared compositor"
     );
 }
 

@@ -16,7 +16,6 @@
 //! shell survived, the window is there — until the survivor asks for something
 //! that needs the app's own XPC domain: `hdiutil` answers `ENXIO`, so the
 //! process that just applied an update can never apply the next one.
-//! `tests/handoff_launchd_job.rs` states that property and is the guard.
 //!
 //! A LaunchServices launch is the fix: it hands the new instance to launchd,
 //! which mints it a job — and therefore a bootstrap domain — of its own. Probed
@@ -118,7 +117,7 @@
 //!
 //! That trade no longer exists in either direction. Every call here goes
 //! through `aterm_objc` — `class(c"NSWorkspace")`, the
-//! `NSWorkspaceOpenConfiguration` class, `aterm_objc::msg()` for each
+//! `NSWorkspaceOpenConfiguration` class, `aterm_objc::checked_msg()` for each
 //! prototype and `RcBlock` for the completion handler — and `aterm-gui`'s
 //! four `objc2` family rows were retired in the same wave. A binding is now
 //! reachable because it was written, not because a feature flag was set, so
@@ -478,6 +477,11 @@ pub(crate) fn activate_running(pid: i32) -> bool {
     if pid <= 1 {
         return false;
     }
+    // Only a windowed process yields activation: headless, the
+    // `+sharedApplication` below would CREATE the application object.
+    if crate::platform::Windowed::get().is_none() {
+        return false;
+    }
     /// `NSApplicationActivateIgnoringOtherApps` (AppKit, `NSApplicationActivationOptions`).
     const ACTIVATE_IGNORING_OTHER_APPS: usize = 1 << 1;
     autoreleasepool(|_| {
@@ -490,7 +494,7 @@ pub(crate) fn activate_running(pid: i32) -> bool {
         // instance and a bitmask by value.
         unsafe {
             let running_with_pid: unsafe extern "C-unwind" fn(Id, Sel, i32) -> Id =
-                aterm_objc::msg();
+                aterm_objc::checked_msg();
             let successor = running_with_pid(
                 class(c"NSRunningApplication").as_id(),
                 sel!(runningApplicationWithProcessIdentifier:),
@@ -499,10 +503,11 @@ pub(crate) fn activate_running(pid: i32) -> bool {
             if successor.is_null() {
                 return false;
             }
-            let shared: unsafe extern "C-unwind" fn(Id, Sel) -> Id = aterm_objc::msg();
+            let shared: unsafe extern "C-unwind" fn(Id, Sel) -> Id = aterm_objc::checked_msg();
             let nsapp = shared(class(c"NSApplication").as_id(), sel!(sharedApplication));
             if !nsapp.is_null() {
-                let responds: unsafe extern "C-unwind" fn(Id, Sel, Sel) -> Bool = aterm_objc::msg();
+                let responds: unsafe extern "C-unwind" fn(Id, Sel, Sel) -> Bool =
+                    aterm_objc::checked_msg();
                 if responds(
                     nsapp,
                     sel!(respondsToSelector:),
@@ -510,11 +515,13 @@ pub(crate) fn activate_running(pid: i32) -> bool {
                 )
                 .as_bool()
                 {
-                    let yield_to: unsafe extern "C-unwind" fn(Id, Sel, Id) = aterm_objc::msg();
+                    let yield_to: unsafe extern "C-unwind" fn(Id, Sel, Id) =
+                        aterm_objc::checked_msg();
                     yield_to(nsapp, sel!(yieldActivationToApplication:), successor);
                 }
             }
-            let activate: unsafe extern "C-unwind" fn(Id, Sel, usize) -> Bool = aterm_objc::msg();
+            let activate: unsafe extern "C-unwind" fn(Id, Sel, usize) -> Bool =
+                aterm_objc::checked_msg();
             activate(
                 successor,
                 sel!(activateWithOptions:),
@@ -765,8 +772,9 @@ fn begin_launch_validated(
             } else if app.is_null() {
                 Err(LaunchError::NoApplication)
             } else {
-                let pid_of: unsafe extern "C-unwind" fn(Id, Sel) -> i32 = aterm_objc::msg();
-                let terminated_of: unsafe extern "C-unwind" fn(Id, Sel) -> Bool = aterm_objc::msg();
+                let pid_of: unsafe extern "C-unwind" fn(Id, Sel) -> i32 = aterm_objc::checked_msg();
+                let terminated_of: unsafe extern "C-unwind" fn(Id, Sel) -> Bool =
+                    aterm_objc::checked_msg();
                 admit_launch_answer(
                     pid_of(app, sel!(processIdentifier)),
                     terminated_of(app, sel!(isTerminated)).as_bool(),
@@ -836,7 +844,7 @@ fn begin_launch_validated(
     // AUTORELEASED into the pool this whole body runs in.
     autoreleasepool(|_| unsafe {
         let array_with: unsafe extern "C-unwind" fn(Id, Sel, *const Id, usize) -> Id =
-            aterm_objc::msg();
+            aterm_objc::checked_msg();
         let arguments = array_with(
             class(c"NSArray").as_id(),
             sel!(arrayWithObjects:count:),
@@ -844,7 +852,7 @@ fn begin_launch_validated(
             arg_ids.len(),
         );
         let dict_with: unsafe extern "C-unwind" fn(Id, Sel, *const Id, *const Id, usize) -> Id =
-            aterm_objc::msg();
+            aterm_objc::checked_msg();
         let environment = dict_with(
             class(c"NSDictionary").as_id(),
             sel!(dictionaryWithObjects:forKeys:count:),
@@ -852,7 +860,8 @@ fn begin_launch_validated(
             key_ids.as_ptr(),
             key_ids.len(),
         );
-        let file_url: unsafe extern "C-unwind" fn(Id, Sel, Id, Bool) -> Id = aterm_objc::msg();
+        let file_url: unsafe extern "C-unwind" fn(Id, Sel, Id, Bool) -> Id =
+            aterm_objc::checked_msg();
         let url = file_url(
             class(c"NSURL").as_id(),
             sel!(fileURLWithPath:isDirectory:),
@@ -902,7 +911,8 @@ fn begin_launch_validated(
         // `@`. It does not matter for a SEND — nothing reads an encoding here —
         // but writing it as an object would be the shape that, in a DECLARED
         // method, registers the wrong letter.
-        let open: unsafe extern "C-unwind" fn(Id, Sel, Id, Id, *mut c_void) = aterm_objc::msg();
+        let open: unsafe extern "C-unwind" fn(Id, Sel, Id, Id, *mut c_void) =
+            aterm_objc::checked_msg();
         open(
             workspace,
             sel!(openApplicationAtURL:configuration:completionHandler:),
@@ -956,24 +966,24 @@ fn admit_launched_pid(pid: i32, own_pid: i32) -> Result<LaunchedSuccessor, Launc
 /// which knows exactly, rather than this flag.
 #[cfg(target_os = "macos")]
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "native_update_launched_dial_wait",
         action = "AnswerExited",
         project = "aterm_gui::app_update_handoff::launched_dial_wait_conformance::project"
     )
 )]
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "native_update_launched_dial_wait",
         action = "AnswerNamed",
         project = "aterm_gui::app_update_handoff::launched_dial_wait_conformance::project"
     )
 )]
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "native_update_launched_dial_wait",
         action = "AnswerOther",
         project = "aterm_gui::app_update_handoff::launched_dial_wait_conformance::project"
@@ -1005,8 +1015,8 @@ fn admit_launch_answer(
 #[must_use]
 #[cfg(target_os = "macos")]
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "native_update_launched_dial_wait",
         action = "EndOnExit",
         project = "aterm_gui::app_update_handoff::launched_dial_wait_conformance::project"
@@ -1185,8 +1195,7 @@ mod tests {
 
     /// A real directory named `<something>.app`, which is all the pure
     /// validation can ask of a bundle. NOTHING in this file's tests launches an
-    /// application: the AppKit call is exercised by the ignored end-to-end guard
-    /// in `tests/handoff_launchd_job.rs`, which owns a real bundle.
+    /// application.
     ///
     /// The bundle lives as long as the returned guard: keep it bound for the
     /// test's whole body.
@@ -1207,41 +1216,32 @@ mod tests {
             .collect()
     }
 
+    /// A bundle path is refused before anything is launched: relative
+    /// (LaunchServices resolves nothing against our working directory), not a
+    /// `.app` (checked before the filesystem, so the message names the wrong
+    /// kind of target rather than a missing file), or absent.
     #[test]
-    fn a_relative_bundle_path_is_refused() {
-        let refusal = validate_request(&PathBuf::from("Successor.app"), &[], &[]);
-        assert_eq!(
-            refusal,
-            Err(LaunchError::BundlePathNotAbsolute(
-                "Successor.app".to_string()
-            )),
-            "LaunchServices resolves nothing against our working directory"
-        );
-    }
-
-    #[test]
-    fn a_target_that_is_not_a_dot_app_is_refused_before_the_filesystem_is_consulted() {
-        // Deliberately a path that does not exist either: the extension check
-        // must fire first, so the message names the real problem (the wrong kind
-        // of target) instead of blaming a missing file.
-        let refusal = validate_request(&PathBuf::from("/nowhere/successor.tar.gz"), &[], &[]);
-        assert_eq!(
-            refusal,
-            Err(LaunchError::BundlePathNotAnAppBundle(
-                "/nowhere/successor.tar.gz".to_string()
-            )),
-        );
-    }
-
-    #[test]
-    fn a_bundle_that_is_not_on_disk_is_refused() {
-        let missing = PathBuf::from("/nowhere/aterm-does-not-exist.app");
-        assert_eq!(
-            validate_request(&missing, &[], &[]),
-            Err(LaunchError::BundleMissing(
-                "/nowhere/aterm-does-not-exist.app".to_string()
-            )),
-        );
+    fn a_malformed_bundle_path_is_refused() {
+        for (path, want) in [
+            (
+                "Successor.app",
+                LaunchError::BundlePathNotAbsolute("Successor.app".to_string()),
+            ),
+            (
+                "/nowhere/successor.tar.gz",
+                LaunchError::BundlePathNotAnAppBundle("/nowhere/successor.tar.gz".to_string()),
+            ),
+            (
+                "/nowhere/aterm-does-not-exist.app",
+                LaunchError::BundleMissing("/nowhere/aterm-does-not-exist.app".to_string()),
+            ),
+        ] {
+            assert_eq!(
+                validate_request(&PathBuf::from(path), &[], &[]),
+                Err(want),
+                "{path}"
+            );
+        }
     }
 
     /// The measured merge fact, pinned as a property of the request we build:
@@ -1277,9 +1277,14 @@ mod tests {
         );
     }
 
+    /// An environment no shell could carry is refused. A NUL in a VALUE is
+    /// the quiet one: every C-string consumer past `execve` would truncate
+    /// there. A repeated key is refused rather than collapsed: an
+    /// `NSDictionary` keeps one of the two, so the successor's view of a
+    /// handoff would depend on the caller's vector order.
     #[test]
-    fn an_environment_key_that_no_shell_could_carry_is_refused() {
-        let (_root, bundle) = scratch_bundle("bad-keys");
+    fn a_malformed_environment_is_refused() {
+        let (_root, bundle) = scratch_bundle("bad-env");
         for (pairs, expected) in [
             (
                 env(&[("", "value")]),
@@ -1302,47 +1307,28 @@ mod tests {
                     fault: TextFault::InteriorNul,
                 },
             ),
-        ] {
-            assert_eq!(validate_request(&bundle, &[], &pairs), Err(expected));
-        }
-    }
-
-    /// A NUL in a VALUE is the quiet one: `NSString` would carry it, and every
-    /// C-string consumer past `execve` would truncate there — the successor
-    /// would read a handoff key that authenticates against nothing rather than
-    /// falling back.
-    #[test]
-    fn a_nul_inside_an_environment_value_is_refused() {
-        let (_root, bundle) = scratch_bundle("nul-value");
-        assert_eq!(
-            validate_request(&bundle, &[], &env(&[("ATERM_SEAMLESS_NONCE", "ab\0cd")])),
-            Err(LaunchError::EnvValue {
-                key: "ATERM_SEAMLESS_NONCE".to_string(),
-                fault: TextFault::InteriorNul,
-            }),
-        );
-    }
-
-    /// REGRESSION SHAPE: an `NSDictionary` silently keeps one of two entries
-    /// with the same key, so a doubled key would make the successor's view of a
-    /// handoff depend on the order the caller happened to build its vector in.
-    #[test]
-    fn a_repeated_environment_key_is_refused_rather_than_silently_collapsed() {
-        let (_root, bundle) = scratch_bundle("duplicate-key");
-        assert_eq!(
-            validate_request(
-                &bundle,
-                &[],
-                &env(&[
+            (
+                env(&[("ATERM_SEAMLESS_NONCE", "ab\0cd")]),
+                LaunchError::EnvValue {
+                    key: "ATERM_SEAMLESS_NONCE".to_string(),
+                    fault: TextFault::InteriorNul,
+                },
+            ),
+            (
+                env(&[
                     ("ATERM_SEAMLESS_NONCE", "first"),
                     ("ATERM_OTHER", "x"),
                     ("ATERM_SEAMLESS_NONCE", "second"),
-                ])
+                ]),
+                LaunchError::EnvKeyDuplicated("ATERM_SEAMLESS_NONCE".to_string()),
             ),
-            Err(LaunchError::EnvKeyDuplicated(
-                "ATERM_SEAMLESS_NONCE".to_string()
-            )),
-        );
+        ] {
+            assert_eq!(
+                validate_request(&bundle, &[], &pairs),
+                Err(expected),
+                "{pairs:?}"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -1510,19 +1496,6 @@ mod tests {
                 CONDVAR_PARKS.with(Cell::get) > parks
             });
             assert!(live, "an unanswered budget never parked: the count is dead");
-        }
-
-        #[test]
-        fn a_launch_that_is_never_answered_times_out_at_its_budget() {
-            let watch = LaunchWatch::pending();
-            let budget = Duration::from_millis(60);
-            let started = Instant::now();
-            let answer = watch.wait(budget);
-            assert_eq!(answer, Err(LaunchError::Timeout(budget)));
-            assert!(
-                started.elapsed() >= budget,
-                "the wait must honour the whole budget before declaring a timeout"
-            );
         }
 
         #[test]

@@ -49,10 +49,10 @@ pub(crate) fn start(mode: &OsStr, headless: bool, proxy: EventLoopProxy<Wake>) -
         );
         return true;
     };
-    let spawned = std::thread::Builder::new()
-        .name("first-run-row-probe".into())
-        .spawn(move || {
-            crate::qos::set_self(crate::qos::Role::Background);
+    let spawned = crate::qos::spawn_lane_thread(
+        "first-run-row-probe",
+        crate::qos::Role::Background,
+        move || {
             let step = dir.join("step");
             if !wait_step(&step, 1) {
                 return;
@@ -79,7 +79,8 @@ pub(crate) fn start(mode: &OsStr, headless: bool, proxy: EventLoopProxy<Wake>) -
                 let _ = wait_step(&step, 3);
             }
             let _ = proxy.send_event(Wake::PkgFirstRunAhead { open: false });
-        });
+        },
+    );
     if let Err(error) = spawned {
         aterm_log::warn!("first-run row probe could not start: {error}");
     }

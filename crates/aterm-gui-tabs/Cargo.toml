@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-gui-tabs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aterm-gui's tab model below the window: the stable view, tab and app-instance ids, the views a tab holds, the pane tree and the front-content choice. No App, window or event loop; aterm-gui re-exports each module under its old name."
+
+[dependencies]
+# The layout and ids ride the restore manifest and the seamless carry
+# (`#[derive(Serialize, Deserialize)]`, so the row asks for the derive).
+serde = { workspace = true, features = ["derive"] }
+# The front content's terminal and its sink.
+aterm-core = { workspace = true }
+aterm-session = { workspace = true }
+
+[dev-dependencies]
+# The pane tree's Tier-1 bind to its derived model.
+aterm-spec = { workspace = true }
+aterm-models-gui = { workspace = true }
+
+[lints]
+workspace = true

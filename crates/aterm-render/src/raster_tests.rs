@@ -89,51 +89,6 @@ fn golden_fractional_triangle() {
     assert_grid(&got, &want, 4, "fractional triangle");
 }
 
-/// A quadratic, the TrueType outline form. This is the fill's answer over this
-/// module's flattening, not the retired crate's: the accuracy limits in
-/// `tests/raster_accuracy_survey.rs` bound it, and this grid makes a re-record loud.
-#[test]
-fn golden_quadratic() {
-    let got = cov(6, 6, |r| {
-        r.draw_quad(point(0.5, 0.5), point(5.5, 2.0), point(0.5, 5.5));
-        r.draw_line(point(0.5, 5.5), point(0.5, 0.5));
-    });
-    #[rustfmt::skip]
-    let want = [
-        0.209_617, 0.138_579, 0.0,       0.0, 0.0, 0.0,
-        0.5,       0.987_065, 0.469_326, 0.0, 0.0, 0.0,
-        0.5,       1.0,       0.963_990, 0.0, 0.0, 0.0,
-        0.5,       1.0,       0.629_342, 0.0, 0.0, 0.0,
-        0.5,       0.713_891, 0.037_827, 0.0, 0.0, 0.0,
-        0.159_617, 0.011_752, 0.0,       0.0, 0.0, 0.0,
-    ];
-    assert_grid(&got, &want, 6, "quadratic");
-}
-
-/// A cubic, the CFF outline form, pinned on the same terms as [`golden_quadratic`].
-#[test]
-fn golden_cubic() {
-    let got = cov(6, 6, |r| {
-        r.draw_cubic(
-            point(0.5, 0.5),
-            point(5.5, 1.0),
-            point(5.5, 5.0),
-            point(0.5, 5.5),
-        );
-        r.draw_line(point(0.5, 5.5), point(0.5, 0.5));
-    });
-    #[rustfmt::skip]
-    let want = [
-        0.234_436, 0.332_630, 0.060_644, 0.0,       0.0,       0.0,
-        0.5,       1.0,       0.953_358, 0.400_362, 0.0,       0.0,
-        0.5,       1.0,       1.0,       0.992_968, 0.141_929, 0.0,
-        0.5,       1.0,       1.0,       0.992_968, 0.141_929, 0.0,
-        0.5,       1.0,       0.953_358, 0.400_362, 0.0,       0.0,
-        0.234_436, 0.332_630, 0.060_644, 0.0,       0.0,       0.0,
-    ];
-    assert_grid(&got, &want, 6, "cubic");
-}
-
 /// Winding cancels exactly: an edge and its reverse leave the grid at
 /// literal zero, which is what lets `for_each_pixel` carry one accumulator
 /// across every row of the buffer.

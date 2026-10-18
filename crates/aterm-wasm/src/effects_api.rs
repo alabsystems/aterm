@@ -424,14 +424,6 @@ macro_rules! bind {
                 self.effects.set_sparkle_custom_specs(toml);
             }
 
-            /// Arm or clear (`undefined`) a trail pack from its TOML source
-            /// (`trail_pack::compile_trail_pack_toml`). On a compile error the prior pack stays
-            /// and the joined diagnostics are returned; success returns `undefined`.
-            pub fn set_cursor_trail_pack(&mut self, toml: Option<String>) -> Option<String> {
-                self.note_host_visual_change();
-                self.effects.set_cursor_trail_pack(toml)
-            }
-
             /// Comma-separated languages whose ambiguous homograph entries un-gate (native
             /// `languages`, default `"en"`; `"all"` un-gates everything). Rebuilds the lexicon.
             pub fn set_sparkle_languages(&mut self, languages_csv: &str) {

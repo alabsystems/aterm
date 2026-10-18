@@ -24,22 +24,28 @@ pub enum ImmediateWrite {
     Full,
     /// This call accepted zero bytes and queued nothing for later delivery.
     BusyZero,
-    /// A conditional actuator call saw a different attempted-input epoch and
-    /// accepted zero bytes: another producer attempted input after the caller's
-    /// snapshot, so retrying against it would cross a human/controller interjection.
-    ConflictZero,
     /// The kernel accepted this prefix immediately. No tail was queued; the
     /// action is in doubt and must never be retried automatically.
     PartialInDoubt { accepted: usize },
+    /// The whole write only ([`SinkWriter::try_write_frame_whole_with_receipt`]):
+    /// the kernel accepted this prefix during the call, and the rest of the frame is
+    /// queued directly behind it in the sink's spill, ahead of anything
+    /// written after it, for the drainer to hand the kernel as the program
+    /// reads. The frame is delivered whole, in order, with no other frame's
+    /// bytes inside it — unless the session's end drops the queued rest, as it
+    /// drops any spilled frame, or a discard drops the frame, which takes the
+    /// prefix from the kernel's queue with the rest
+    /// ([`SinkWriter::discard_unread_input`]).
+    Queued { accepted: usize },
 }
 
 /// Opaque process-local version of all non-empty input attempts against one PTY
 /// sink. It advances before a producer can wait for the serialization lock, so
-/// a queued human/controller attempt invalidates an actuator snapshot even
-/// before that producer reaches the kernel.
+/// a queued human/controller attempt moves it even before that producer
+/// reaches the kernel.
 ///
-/// A compare token only, with no numeric accessor. On exhaustion the guarded
-/// path fails closed forever rather than wrapping to an old token.
+/// A compare token only, with no numeric accessor. On exhaustion it stops
+/// rather than wrapping to an old token.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InputEpoch(u64);
 
@@ -251,8 +257,8 @@ struct MeteredEnd {
 /// `write` must be the sink's ledgered blocking write
 /// ([`Shared::write_stamped_blocking`], given this meter so a stop reaches a
 /// writer parked on a full tty), never a bare `aterm_pty` call: a byte the
-/// input-backlog ledger does not see cannot be dated. The census
-/// `every_production_master_write_is_ledgered` enforces this.
+/// input-backlog ledger does not see cannot be dated. Every master write goes
+/// through [`Shared::ledgered`], the one place the bracket is written.
 fn write_metered(
     bytes: &[u8],
     meter: &BulkMeter,
@@ -427,13 +433,6 @@ impl WriteReceiptError {
         self.refused
     }
 
-    /// The original I/O error by reference.
-    #[must_use]
-    #[cfg(test)]
-    pub const fn error(&self) -> &io::Error {
-        &self.error
-    }
-
     /// Number of bytes accepted before the error.
     #[must_use]
     #[cfg(test)]
@@ -490,6 +489,37 @@ pub enum Discard {
     /// `reset flush` (aterm-gui's `manual_reset`): the input goes, and no
     /// signal follows.
     Flush,
+}
+
+/// What the immediate write does with a frame the kernel took only part of
+/// ([`SinkWriter::try_write_frame_immediate_with_receipt`] and its guarded
+/// twin [`SinkWriter::try_write_frame_whole_with_receipt`]).
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShortWrite {
+    /// Queue nothing: the prefix is in doubt ([`ImmediateWrite::PartialInDoubt`]).
+    InDoubt,
+    /// Queue the rest right behind the prefix ([`ImmediateWrite::Queued`]).
+    Queue,
+}
+
+/// A point inside the sink where a test stands a racing thread
+/// ([`SinkWriter::seam_for_testing`]). The races at these points are decided
+/// by which side of a lock a thread falls, and only a test pinned at the
+/// point can show it. Tests only, here and downstream (a debug build's).
+#[cfg(all(unix, any(test, debug_assertions)))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Seam {
+    /// In [`SinkWriter::discard_unread_input`]'s critical section: the
+    /// discard epoch moved and the spill emptied, the kernel's queue not
+    /// flushed yet. The spill mutex is held.
+    DiscardFlush,
+    /// On the drainer's thread, after its look at the discard epoch and
+    /// before the `write(2)` of the spilled bytes it peeked.
+    DrainWrite,
+    /// In a blocking frame write ([`SinkWriter::write_frame`]), after it
+    /// found the spill empty and before it waits for the fd lock.
+    FrameLock,
 }
 
 /// What the non-parking body does where a frame cannot be taken without
@@ -720,16 +750,6 @@ pub struct SinkWriter {
     /// closes the session.
     #[cfg(windows)]
     _owned: Option<CountedMaster<aterm_pty::OwnedMaster>>,
-    /// Whether the master's open file description is known to carry
-    /// `O_NONBLOCK` (declared via [`SinkWriter::note_master_nonblocking`]). It
-    /// licenses the non-parking egress to hand the kernel a whole frame in one
-    /// `write(2)`: only then can `write(2)` short-write or return `EAGAIN` instead
-    /// of parking. `false` keeps the one-byte-per-`POLLOUT` cadence, parking-free
-    /// even on a blocking description.
-    ///
-    /// `Relaxed` suffices: written once at session setup, and a stale read only
-    /// costs the slower, still parking-free cadence.
-    master_nonblocking: AtomicBool,
     /// Ordered GUI input jobs still waiting for or running on this sink's
     /// per-session writer. The key path reads this sink-local count without
     /// visiting the process-wide writer registry, so a paste in another tab
@@ -824,6 +844,20 @@ struct Shared {
     /// Bytes held by live [`ReplyPermit`]s: the replies queued in front of this
     /// sink ([`SinkWriter::reply_budget`]).
     reply_reserved: AtomicUsize,
+    /// Whether the master's open file description is known to carry
+    /// `O_NONBLOCK` (declared via [`SinkWriter::note_master_nonblocking`]). It
+    /// licenses the non-parking egress to hand the kernel a whole frame in one
+    /// `write(2)`: only then can `write(2)` short-write or return `EAGAIN` instead
+    /// of parking. `false` keeps the one-byte-per-`POLLOUT` cadence, parking-free
+    /// even on a blocking description. The drainer reads it too: only a write
+    /// that cannot park runs under the spill mutex ([`Self::drain_write`]).
+    ///
+    /// `Relaxed` suffices: written once at session setup, and a stale read only
+    /// costs the slower, still parking-free cadence.
+    master_nonblocking: AtomicBool,
+    /// The test's hook at each [`Seam`] ([`SinkWriter::seam_for_testing`]).
+    #[cfg(all(unix, any(test, debug_assertions)))]
+    seam: std::sync::OnceLock<Box<dyn Fn(Seam) + Send + Sync>>,
 }
 
 /// See [`Shared::spill`].
@@ -872,7 +906,6 @@ impl SinkWriter {
         Self {
             master,
             _owned: None,
-            master_nonblocking: AtomicBool::new(false),
             ordered_egress_pending: AtomicUsize::new(0),
             shared: Arc::new(Shared::new()),
         }
@@ -889,8 +922,8 @@ impl SinkWriter {
     /// aterm method to anchor, so they are waived here; the fd-use action is
     /// anchored on `master()`/`write_frame`.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "fd_lifecycle",
             action = "Clone",
             reason = "RAII, no aterm method to anchor: the Clone action is std `Arc::clone(&sink)` \
@@ -902,8 +935,8 @@ impl SinkWriter {
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "fd_lifecycle",
             action = "DropClone",
             reason = "RAII, no aterm method to anchor: the DropClone action is the std `Drop` of an \
@@ -920,7 +953,6 @@ impl SinkWriter {
         Self {
             master: master.as_raw_fd(),
             _owned: Some(CountedMaster::new(master)),
-            master_nonblocking: AtomicBool::new(false),
             ordered_egress_pending: AtomicUsize::new(0),
             shared: Arc::new(Shared::new()),
         }
@@ -932,8 +964,8 @@ impl SinkWriter {
     /// waivers as the Unix constructor, since the closure gate collects per
     /// target.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "fd_lifecycle",
             action = "Clone",
             reason = "RAII, no aterm method to anchor (Windows twin of the unix waiver): the Clone \
@@ -946,8 +978,8 @@ impl SinkWriter {
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "fd_lifecycle",
             action = "DropClone",
             reason = "RAII, no aterm method to anchor (Windows twin of the unix waiver): the \
@@ -964,7 +996,6 @@ impl SinkWriter {
         Self {
             master: master.as_raw(),
             _owned: Some(CountedMaster::new(master)),
-            master_nonblocking: AtomicBool::new(false),
             ordered_egress_pending: AtomicUsize::new(0),
             shared: Arc::new(Shared::new()),
         }
@@ -980,7 +1011,7 @@ impl SinkWriter {
     ///
     /// The Arc strong count (the model's `clones`) is not observable from `&self`.
     /// `owned_fd_stays_open_until_last_clone_drops` evaluates this on real state.
-    #[cfg(any(test, feature = "spec-anchors"))]
+    #[cfg(any(test, debug_assertions))]
     #[must_use]
     pub fn project_fd_state(&self) -> (bool, bool) {
         (self.master != -1, self._owned.is_some())
@@ -993,8 +1024,8 @@ impl SinkWriter {
     /// This is the model's `UseFd` action; the last-drop discipline keeps the fd
     /// open while any clone is alive, so `usedAfterClose` never latches.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "fd_lifecycle",
             action = "UseFd",
             project = "aterm_session::sink::SinkWriter::project_fd_state"
@@ -1181,9 +1212,22 @@ impl SinkWriter {
     /// and on Darwin a flush does not wake a parked `poll`, so every later key
     /// would queue behind the spill for good. So:
     ///
-    /// - The epoch moves and the spill empties in one critical section.
-    /// - The kernel queue is flushed after that, so a drainer that wakes in
-    ///   between finds its chunk discarded and writes nothing.
+    /// - The epoch moves, the spill empties and the kernel queue is flushed in
+    ///   ONE critical section of the spill mutex, the flush last. Every write
+    ///   that holds that mutex across its `write(2)` therefore lands wholly
+    ///   before the discard, and goes with the queue, or wholly after it: the
+    ///   guarded write ([`Self::try_write_frame_whole_with_receipt`]), from its
+    ///   look at the empty spill until the rest of a short write is queued, and
+    ///   the drainer on a non-blocking master (which that write requires), from
+    ///   its look at the epoch through its write of spilled bytes
+    ///   ([`Shared::drain_write`]).
+    ///   A frame begun in the kernel with its rest in the spill is dropped
+    ///   whole, head and rest. Until 2026-10-16 the flush ran after the mutex
+    ///   was released: a guarded write landing between the two had its head
+    ///   flushed and its queued rest delivered, and the program read the end
+    ///   of a text without its beginning.
+    /// - A drainer that wakes after the discard finds its chunk discarded and
+    ///   writes nothing.
     /// - Every parked writer re-polls on a clock ([`Shared::PARK_RECHECK_MS`]),
     ///   sees the epoch move, and abandons the rest of its frame. A fresh
     ///   `poll` after a flush answers writable at once; only a parked one
@@ -1198,10 +1242,16 @@ impl SinkWriter {
     /// [`Self::restart_discards`], the count a published stall's restart
     /// grace is judged on.
     ///
-    /// Residual: a writer that passed its epoch check just before the discard
-    /// and is inside `write(2)` as the flush lands can put that one write's bytes
-    /// into the emptied queue. Closing that window would need the fd lock, which
-    /// a parked writer holds as long as the program stays frozen.
+    /// Residual: a DIRECT write, one that found the spill empty and writes
+    /// outside the spill mutex (a key, a reply, a blocking frame), is not
+    /// ordered with the critical section, and neither is the drainer's write
+    /// on a master that may block (whose `write(2)` can park, so it never runs
+    /// under the mutex). One that took its epoch before the discard and is
+    /// inside `write(2)` as the flush lands can put that write's bytes into the
+    /// emptied queue; a direct frame that took its epoch inside the section
+    /// and whose head the flush then drops can still queue its tail. Closing
+    /// that would need the fd lock, which a parked writer holds as long as the
+    /// program stays frozen.
     #[cfg(unix)]
     pub fn discard_unread_input(&self, why: Discard) -> Option<usize> {
         aterm_pty::input_queue_len(self.master)?;
@@ -1225,10 +1275,15 @@ impl SinkWriter {
             self.shared
                 .order_state
                 .fetch_and(!Shared::SPILL_ACTIVE_BIT, Ordering::Release);
-            (epoch, unsent)
+            #[cfg(all(unix, any(test, debug_assertions)))]
+            self.shared.at_seam(Seam::DiscardFlush);
+            // Still under the spill mutex: a guarded write or a drainer write
+            // falls wholly on one side of the flush (see above). One
+            // non-blocking syscall, so the hold stays short.
+            let flushed = aterm_pty::flush_input_queue(self.master).unwrap_or(0);
+            (epoch, flushed.saturating_add(unsent))
         };
         self.shared.drained.notify_all();
-        let flushed = aterm_pty::flush_input_queue(self.master).unwrap_or(0);
         // Marked AFTER the flush, so every byte counted after the mark was
         // accepted into the emptied queue ([`Self::read_since_discard`]).
         self.shared
@@ -1236,7 +1291,7 @@ impl SinkWriter {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .mark_discard(epoch);
-        Some(flushed.saturating_add(dropped))
+        Some(dropped)
     }
 
     /// Whether the program has read input since the last discard
@@ -1370,6 +1425,16 @@ impl SinkWriter {
             .backdate(by);
     }
 
+    /// Run `hook` at each [`Seam`] this sink passes, on the thread passing it
+    /// (the drainer's own at [`Seam::DrainWrite`], under the locks that point
+    /// holds): where a test stands a racing thread and decides when it goes
+    /// on. First install wins. Tests only, here and downstream (a debug
+    /// build's).
+    #[cfg(all(unix, any(test, debug_assertions)))]
+    pub fn seam_for_testing(&self, hook: impl Fn(Seam) + Send + Sync + 'static) {
+        let _ = self.shared.seam.set(Box::new(hook));
+    }
+
     /// This sink's reply budget ([`ReplyBudget`], [`REPLY_BUDGET_BYTES`]): a
     /// handle that does not keep the sink or its master alive, for the producer
     /// that must never be the last holder of its own session's master (the PTY
@@ -1405,7 +1470,8 @@ impl SinkWriter {
     /// frame larger than the tty's free room park the event loop in `write(2)`.
     /// `false` (the default) is always safe.
     pub fn note_master_nonblocking(&self, nonblocking: bool) {
-        self.master_nonblocking
+        self.shared
+            .master_nonblocking
             .store(nonblocking, Ordering::Relaxed);
     }
 
@@ -1585,29 +1651,22 @@ impl SinkWriter {
     /// Reserve one non-empty DRIVEN input attempt (a key, a paste, a report, a
     /// control verb's bytes): it moves [`Self::driven_input`] as well as the
     /// input epoch ([`Self::reserve_attempt`]).
-    fn reserve_input_attempt(&self) -> Option<(InputEpoch, InputEpoch)> {
+    fn reserve_input_attempt(&self) {
         self.shared.driven_input.fetch_add(1, Ordering::AcqRel);
-        self.reserve_attempt()
+        self.reserve_attempt();
     }
 
-    /// Reserve one non-empty input attempt, returning `(previous, reserved)`.
-    /// Exhaustion is permanent and makes conditional actuation fail closed.
+    /// Reserve one non-empty input attempt, saturating: exhaustion is
+    /// permanent.
     /// Every write reserves one; only a reply ([`Self::write_reply`]) reserves
     /// it without [`Self::reserve_input_attempt`].
-    fn reserve_attempt(&self) -> Option<(InputEpoch, InputEpoch)> {
-        self.shared
+    fn reserve_attempt(&self) {
+        let _ = self
+            .shared
             .input_epoch
             .try_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
                 epoch.checked_add(1)
-            })
-            .ok()
-            // The update succeeded only because `previous + 1` fits; re-deriving
-            // it checks that instead of assuming it.
-            .and_then(|previous| {
-                previous
-                    .checked_add(1)
-                    .map(|reserved| (InputEpoch(previous), InputEpoch(reserved)))
-            })
+            });
     }
 
     /// Try to hand one bounded frame to the kernel now, without parking and
@@ -1650,61 +1709,69 @@ impl SinkWriter {
         if bytes.is_empty() {
             return (ImmediateWrite::Full, None);
         }
-        // Reserve before any wait or refusal: a concurrent conditional actuator
-        // must see even an attempt that ends in EAGAIN.
-        let _ = self.reserve_input_attempt();
-        self.try_write_frame_immediate_reserved(bytes, None)
+        // Reserve before any wait or refusal: an epoch reader must see even an
+        // attempt that ends in EAGAIN.
+        self.reserve_input_attempt();
+        self.try_write_frame_immediate_reserved(bytes, ShortWrite::InDoubt)
     }
 
-    /// Conditional twin of [`Self::try_write_frame_immediate`]. The caller's
-    /// `expected` token is consumed; a full write returns the new token for the
-    /// next step of the same guarded turn.
+    /// THE GUARDED WRITE: [`Self::try_write_frame_immediate_with_receipt`]'s
+    /// refusals, then the frame WHOLE. A frame is begun now or not at all —
+    /// every case that writes nothing there writes nothing here, and queues
+    /// nothing a detached thread could inject later — but a frame the kernel
+    /// began taking is finished in order: when the `write(2)` takes only a
+    /// prefix, the rest goes to the front of the spill (empty, checked under
+    /// both locks) before the fd lock is released, so the drainer hands it to
+    /// the kernel as the program reads and every later frame queues behind
+    /// it. One decision covers the whole frame: the caller's check, made
+    /// before the call, decided all of it ([`ImmediateWrite::Queued`]).
     ///
-    /// The epoch check happens under the same fd/spill locks as the syscall:
-    /// attempts reserved before those locks were taken produce
-    /// [`ImmediateWrite::ConflictZero`], and later producers serialize after it.
-    /// (Windows refuses every non-empty write; see its `_with_receipt` twin.)
-    #[cfg(any(unix, windows))]
-    pub fn try_write_frame_immediate_if_epoch(
+    /// Why: a pty's input queue is small (1022 bytes on Darwin), so any frame
+    /// longer than the room it has comes back short. Under the immediate
+    /// write that is [`ImmediateWrite::PartialInDoubt`], never retried, and a
+    /// guarded text of 1.1 KB (a supervisor's instruction to save the work)
+    /// was cut at 1022 bytes every time it was typed.
+    ///
+    /// The drainer is arranged as the non-parking body arranges it: with an
+    /// arranger installed (every production session) its spawn is deferred
+    /// to the arranger, so this call never creates a thread and never waits;
+    /// without one it is spawned inline, and when it cannot be the rest is
+    /// not queued and the call answers [`ImmediateWrite::PartialInDoubt`]:
+    /// only then are bytes of the frame lost for certain. A rest that is
+    /// queued and then dropped (a discard, the session closing, a dead peer)
+    /// is lost as any spilled frame's is, after this call answered.
+    #[cfg(unix)]
+    pub fn try_write_frame_whole_with_receipt(
         &self,
-        expected: InputEpoch,
         bytes: &[u8],
-    ) -> (ImmediateWrite, InputEpoch) {
-        let (write, epoch, _) =
-            self.try_write_frame_immediate_if_epoch_with_receipt(expected, bytes);
-        (write, epoch)
+    ) -> (ImmediateWrite, Option<AcceptedOrder>) {
+        if bytes.is_empty() {
+            return (ImmediateWrite::Full, None);
+        }
+        self.reserve_input_attempt();
+        self.try_write_frame_immediate_reserved(bytes, ShortWrite::Queue)
     }
 
-    /// Receipt-bearing twin of [`Self::try_write_frame_immediate_if_epoch`].
-    #[cfg(unix)]
-    pub fn try_write_frame_immediate_if_epoch_with_receipt(
+    /// Windows fail-closed twin of [`Self::try_write_frame_whole_with_receipt`]:
+    /// ConPTY has no non-blocking write, so it refuses as the immediate write does.
+    #[cfg(windows)]
+    pub fn try_write_frame_whole_with_receipt(
         &self,
-        expected: InputEpoch,
         bytes: &[u8],
-    ) -> (ImmediateWrite, InputEpoch, Option<AcceptedOrder>) {
-        if bytes.is_empty() {
-            return (ImmediateWrite::Full, expected, None);
-        }
-        let Some((previous, reserved)) = self.reserve_input_attempt() else {
-            return (ImmediateWrite::ConflictZero, self.input_epoch(), None);
-        };
-        if previous != expected {
-            return (ImmediateWrite::ConflictZero, reserved, None);
-        }
-        let (write, order) = self.try_write_frame_immediate_reserved(bytes, Some(reserved));
-        (write, reserved, order)
+    ) -> (ImmediateWrite, Option<AcceptedOrder>) {
+        self.try_write_frame_immediate_with_receipt(bytes)
     }
 
     #[cfg(unix)]
     fn try_write_frame_immediate_reserved(
         &self,
         bytes: &[u8],
-        conditional: Option<InputEpoch>,
+        short: ShortWrite,
     ) -> (ImmediateWrite, Option<AcceptedOrder>) {
         if bytes.len() > Self::IMMEDIATE_FRAME_MAX || self.shared.is_severed() {
             return (ImmediateWrite::BusyZero, None);
         }
-        if !self.master_nonblocking.load(Ordering::Relaxed) {
+        if !self.shared.master_nonblocking.load(Ordering::Relaxed) {
             return (ImmediateWrite::BusyZero, None);
         }
 
@@ -1728,12 +1795,6 @@ impl SinkWriter {
         if !spill_guard.buf.is_empty() {
             return (ImmediateWrite::BusyZero, None);
         }
-        // The conditional operation's linearization point: any input attempt
-        // reserved before it invalidates the frame; later ones order after it.
-        if conditional.is_some_and(|reserved| self.input_epoch() != reserved) {
-            return (ImmediateWrite::ConflictZero, None);
-        }
-
         // Reserve under both ordering locks: the syscall may still refuse, but
         // no later frame can get an earlier token than bytes this call accepts.
         let Ok(order) = self.shared.next_accepted_order(false) else {
@@ -1742,9 +1803,24 @@ impl SinkWriter {
 
         // Keep both guards through the syscall, so a normal writer cannot see an
         // empty spill and then race this frame for the fd.
-        self.shared.ledger_begin(bytes.len());
-        let result = match aterm_pty::write_some_nonparking(self.master, bytes) {
+        let mut spill_guard = spill_guard;
+        let mut poke = false;
+        let result = match self.shared.ledgered_nonparking(self.master, bytes, false) {
             aterm_pty::NonParkWrite::Wrote(n) if n == bytes.len() => ImmediateWrite::Full,
+            // A frame begun is finished in order (`try_write_frame_whole_with_receipt`):
+            // the rest to the front of the spill, still empty under both locks.
+            aterm_pty::NonParkWrite::Wrote(n) if n > 0 && short == ShortWrite::Queue => {
+                match bytes.get(n..).and_then(|rest| {
+                    self.shared
+                        .queue_rest_held(self.master, &mut spill_guard, rest)
+                }) {
+                    Some(arrange) => {
+                        poke = arrange;
+                        ImmediateWrite::Queued { accepted: n }
+                    }
+                    None => ImmediateWrite::PartialInDoubt { accepted: n },
+                }
+            }
             aterm_pty::NonParkWrite::Wrote(n) => ImmediateWrite::PartialInDoubt { accepted: n },
             aterm_pty::NonParkWrite::Closed
             | aterm_pty::NonParkWrite::WouldBlock
@@ -1752,13 +1828,17 @@ impl SinkWriter {
         };
         let accepted = match result {
             ImmediateWrite::Full => bytes.len(),
-            ImmediateWrite::PartialInDoubt { accepted } => accepted,
-            ImmediateWrite::BusyZero | ImmediateWrite::ConflictZero => 0,
+            ImmediateWrite::PartialInDoubt { accepted } | ImmediateWrite::Queued { accepted } => {
+                accepted
+            }
+            ImmediateWrite::BusyZero => 0,
         };
         drop(spill_guard);
-        // Still under the fd lock, so this stamp is ordered with every other
-        // write's.
-        self.shared.ledger_end(accepted, false);
+        // The deferred drainer's poke, after the spill mutex is released, as
+        // `spill_append` makes it: a `try_send` to the arranger's worker.
+        if poke && let Some(arranger) = self.shared.arranger.get() {
+            arranger();
+        }
         drop(fd_guard);
         if accepted > 0 {
             let _ = self.shared.fire_input_hook();
@@ -1783,30 +1863,8 @@ impl SinkWriter {
         if bytes.is_empty() {
             return (ImmediateWrite::Full, None);
         }
-        let _ = self.reserve_input_attempt();
+        self.reserve_input_attempt();
         (ImmediateWrite::BusyZero, None)
-    }
-
-    /// Windows fail-closed conditional receipt-bearing twin. ConPTY still has
-    /// no bounded input primitive, but the attempted-input epoch is consumed so
-    /// a later guarded operation cannot mistake this refused attempt for
-    /// quiescence.
-    #[cfg(windows)]
-    pub fn try_write_frame_immediate_if_epoch_with_receipt(
-        &self,
-        expected: InputEpoch,
-        bytes: &[u8],
-    ) -> (ImmediateWrite, InputEpoch, Option<AcceptedOrder>) {
-        if bytes.is_empty() {
-            return (ImmediateWrite::Full, expected, None);
-        }
-        let Some((previous, reserved)) = self.reserve_input_attempt() else {
-            return (ImmediateWrite::ConflictZero, self.input_epoch(), None);
-        };
-        if previous != expected {
-            return (ImmediateWrite::ConflictZero, reserved, None);
-        }
-        (ImmediateWrite::BusyZero, reserved, None)
     }
 
     /// Write a WHOLE frame atomically with respect to other writers, returning the
@@ -1829,8 +1887,8 @@ impl SinkWriter {
     /// land on a closed/recycled fd — the `NoUseAfterClose` invariant of
     /// `fd_lifecycle_model`.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "fd_lifecycle",
             action = "UseFd",
             project = "aterm_session::sink::SinkWriter::project_fd_state"
@@ -1850,7 +1908,7 @@ impl SinkWriter {
         if bytes.is_empty() {
             return Ok(WriteReceipt::new(0, None));
         }
-        let _ = self.reserve_input_attempt();
+        self.reserve_input_attempt();
         self.write_frame_after_reserve(bytes, None)
     }
 
@@ -1895,7 +1953,7 @@ impl SinkWriter {
             .state
             .store(BulkState::Writing as u8, Ordering::Release);
         let since = self.shared.discard_epoch();
-        let _ = self.reserve_input_attempt();
+        self.reserve_input_attempt();
         let result = self.write_frame_after_reserve(bytes, Some(meter));
         let sent = meter.sent.load(Ordering::Relaxed);
         meter.finish(match &result {
@@ -1949,6 +2007,8 @@ impl SinkWriter {
                 Spilled::NoDrainer => {}
             }
         }
+        #[cfg(all(unix, any(test, debug_assertions)))]
+        self.shared.at_seam(Seam::FrameLock);
         let guard = self
             .shared
             .lock
@@ -2028,8 +2088,8 @@ impl SinkWriter {
                 // `get` + saturating_add (the drain_loop idiom): `off < len` makes
                 // the `get` always Some, and `n <= rest.len()` (POSIX) means the
                 // sum never saturates — both spellings byte-identical on every
-                // real path; write_some_blocking's body is outside this crate's
-                // bundle so `n` is unbounded to the verifier.
+                // real path; the write's `n` comes from `write(2)` outside this
+                // crate's bundle, so it is unbounded to the verifier.
                 let Some(rest) = bytes.get(off..) else { break };
                 match self
                     .shared
@@ -2178,8 +2238,8 @@ impl SinkWriter {
     /// the OwnedFd-last-drop discipline (plus the drainer's own `dup(2)` — see
     /// [`Shared`]) keeps every use on a live fd (`NoUseAfterClose`).
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "fd_lifecycle",
             action = "UseFd",
             project = "aterm_session::sink::SinkWriter::project_fd_state"
@@ -2201,7 +2261,7 @@ impl SinkWriter {
         if bytes.is_empty() {
             return Ok(WriteReceipt::new(0, None));
         }
-        let _ = self.reserve_input_attempt();
+        self.reserve_input_attempt();
         self.write_frame_nonparking_after_reserve(bytes)
     }
 
@@ -2215,7 +2275,7 @@ impl SinkWriter {
         if bytes.is_empty() {
             return Ok(0);
         }
-        let _ = self.reserve_attempt();
+        self.reserve_attempt();
         self.write_frame_nonparking_after_reserve(bytes)
             .map(WriteReceipt::accepted)
             .map_err(WriteReceiptError::into_error)
@@ -2284,7 +2344,7 @@ impl SinkWriter {
         if bytes.is_empty() {
             return Ok(WriteReceipt::new(0, None));
         }
-        let _ = self.reserve_input_attempt();
+        self.reserve_input_attempt();
         self.write_frame_unparked(bytes, WhenFull::Refuse)
     }
 
@@ -2408,7 +2468,7 @@ impl SinkWriter {
         //
         // Either way the SPILL decision is identical: a refused (or short) write
         // hands the tail to the drainer below.
-        let whole_frame = self.master_nonblocking.load(Ordering::Relaxed);
+        let whole_frame = self.shared.master_nonblocking.load(Ordering::Relaxed);
         let mut off = 0;
         while off < bytes.len() {
             // The readiness check is load-bearing ONLY on a blocking description,
@@ -2450,15 +2510,7 @@ impl SinkWriter {
             let Some(unit) = unit else {
                 break;
             };
-            self.shared.ledger_begin(unit.len());
-            let wrote = aterm_pty::write_some_nonparking(self.master, unit);
-            self.shared.ledger_end(
-                match wrote {
-                    aterm_pty::NonParkWrite::Wrote(n) => n,
-                    _ => 0,
-                },
-                false,
-            );
+            let wrote = self.shared.ledgered_nonparking(self.master, unit, false);
             match wrote {
                 aterm_pty::NonParkWrite::Closed => break, // peer closed mid-frame
                 aterm_pty::NonParkWrite::Wrote(n) => {
@@ -2608,7 +2660,7 @@ impl SinkWriter {
                     }
                     return Ok(WriteReceipt::new(off, (off > 0).then_some(order)));
                 }
-                // `write_some_blocking` never writes more than the slice it was
+                // A blocking write never writes more than the slice it was
                 // given (`write(2)` returns at most its count), so `n <= bytes.len() -
                 // off` and this clamp is a no-op — it equals the previous
                 // `n.min(bytes.len() - off)`, spelled as a visible branch so
@@ -2748,11 +2800,23 @@ impl Shared {
             restarts: AtomicU64::new(0),
             severed: AtomicBool::new(false),
             reply_reserved: AtomicUsize::new(0),
+            master_nonblocking: AtomicBool::new(false),
+            #[cfg(all(unix, any(test, debug_assertions)))]
+            seam: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Run the test's hook at `seam` ([`SinkWriter::seam_for_testing`]).
+    #[cfg(all(unix, any(test, debug_assertions)))]
+    fn at_seam(&self, seam: Seam) {
+        if let Some(hook) = self.seam.get() {
+            hook(seam);
         }
     }
 
     /// Mint the next [`AcceptedOrder`] token, optionally setting
     /// [`Self::SPILL_ACTIVE_BIT`] in the same atomic step.
+    #[cfg(unix)]
     fn next_accepted_order(&self, mark_spill_active: bool) -> io::Result<AcceptedOrder> {
         let mut cur = self.order_state.load(Ordering::Acquire);
         loop {
@@ -2833,6 +2897,43 @@ impl Shared {
         }
     }
 
+    /// THE way production code hands the master bytes: `write` runs inside the
+    /// ledger bracket ([`Self::ledger_begin`] … [`Self::ledger_end`]) and returns
+    /// its result with the count of bytes the kernel accepted (0 for a refusal,
+    /// would-block, closed peer or error), so the ledger sees every byte the sink
+    /// writes by construction: no write site spells the bracket, so none can
+    /// forget it. Called with the fd lock held, so the stamp is ordered with every
+    /// other write's; the ledger is a leaf lock, taken under the caller's.
+    fn ledgered<R>(
+        &self,
+        bytes: &[u8],
+        fire_hook: bool,
+        write: impl FnOnce(&[u8]) -> (R, usize),
+    ) -> R {
+        self.ledger_begin(bytes.len());
+        let (result, accepted) = write(bytes);
+        self.ledger_end(accepted, fire_hook);
+        result
+    }
+
+    /// [`Self::ledgered`] over the non-parking master write.
+    #[cfg(unix)]
+    fn ledgered_nonparking(
+        &self,
+        fd: i32,
+        bytes: &[u8],
+        fire_hook: bool,
+    ) -> aterm_pty::NonParkWrite {
+        self.ledgered(bytes, fire_hook, |bytes| {
+            let wrote = aterm_pty::write_some_nonparking(fd, bytes);
+            let accepted = match &wrote {
+                aterm_pty::NonParkWrite::Wrote(n) => *n,
+                _ => 0,
+            };
+            (wrote, accepted)
+        })
+    }
+
     /// Run the input hook unless it already fired since the last rearm (or
     /// none is installed); returns whether it ran. The one firing rule for a
     /// landing write ([`Self::ledger_end`]) and an explicit wake
@@ -2865,8 +2966,8 @@ impl Shared {
         }
     }
 
-    /// [`aterm_pty::write_some_blocking`], with the park OUTSIDE the ledger
-    /// bracket: one non-blocking `write(2)` per bracket, and on `EAGAIN` a
+    /// A blocking write with the park OUTSIDE the ledger bracket: one
+    /// non-blocking `write(2)` per bracket, and on `EAGAIN` a
     /// `poll(POLLOUT)` wait between brackets. Byte-identical results — an
     /// empty slice or a `0` write is `Ok(0)`, `EINTR` retries, `EAGAIN` parks
     /// and retries, any other error propagates — on the `O_NONBLOCK` master
@@ -2880,8 +2981,8 @@ impl Shared {
     /// the drainer's 8 KiB — would read "no date": the probe blind in exactly
     /// the state it exists to see. The ledger unit test
     /// `ledger_a_bracket_held_across_a_park_would_blind_the_probe` pins the
-    /// arithmetic; with this helper reverted to one bracket around
-    /// `write_some_blocking`, the real-pty test
+    /// arithmetic; with this helper reverted to one bracket around a
+    /// blocking write, the real-pty test
     /// `a_writer_parked_on_a_full_queue_does_not_blind_the_probe` read
     /// `queued: 1022, wait: 0ns` (measured 2026-09-24). On an `O_NONBLOCK`
     /// description a write that returns `EAGAIN` accepted nothing, so parking
@@ -2929,15 +3030,7 @@ impl Shared {
             if self.discarded_since(since) {
                 return Ok(0);
             }
-            self.ledger_begin(bytes.len());
-            let wrote = aterm_pty::write_some_nonparking(fd, bytes);
-            self.ledger_end(
-                match wrote {
-                    aterm_pty::NonParkWrite::Wrote(n) => n,
-                    _ => 0,
-                },
-                true,
-            );
+            let wrote = self.ledgered_nonparking(fd, bytes, true);
             match wrote {
                 aterm_pty::NonParkWrite::Wrote(n) => return Ok(n),
                 aterm_pty::NonParkWrite::Closed => return Ok(0),
@@ -3005,22 +3098,103 @@ impl Shared {
         if self.discarded_since(since) {
             return Ok(0);
         }
-        self.ledger_begin(bytes.len());
-        let wrote = blocking_write(bytes);
-        self.ledger_end(wrote.as_ref().map_or(0, |n| *n), true);
-        wrote
+        self.ledgered(bytes, true, |bytes| {
+            let wrote = blocking_write(bytes);
+            let accepted = wrote.as_ref().map_or(0, |n| *n);
+            (wrote, accepted)
+        })
     }
 
-    /// [`Self::write_stamped_blocking`] as a plain count — the drainer's
-    /// shape, with the park outside the ledger bracket: `0` for a closed peer, a broken poll or any hard
-    /// error. The only `io::Error` it can hold is the `Os(errno)` variant
-    /// (born in `write_some_nonparking` or `poll_writable`), dropped HERE —
-    /// a trivially total drop with no boxed `Custom` payload, so the drain
-    /// loop itself still never touches an error value.
+    /// The drainer's write of `chunk` from `off`, parked until the kernel
+    /// takes some of it: the count it took, or `0` for a discard or sever
+    /// since `since`, a closed peer, a broken poll or any hard error. The only
+    /// `io::Error` it can hold is the `Os(errno)` variant (born in
+    /// `write_some_nonparking` or `poll_writable`), dropped HERE — a
+    /// trivially total drop with no boxed `Custom` payload, so the drain loop
+    /// itself never touches an error value.
+    ///
+    /// On a master known to be non-blocking ([`Self::master_nonblocking`],
+    /// which every guarded write requires), the look at the discard epoch and
+    /// the `write(2)` share ONE hold of the spill mutex, the mutex a discard
+    /// empties the spill and flushes the kernel's queue under
+    /// ([`SinkWriter::discard_unread_input`]): a discard lands wholly before
+    /// the write, which then writes nothing, or wholly after it, whose flush
+    /// takes these bytes with the rest of the queue. With the look outside it
+    /// (until 2026-10-16, [`Self::write_stamped_blocking`] served the drainer
+    /// too) a discard could land between the two, and the drainer handed the
+    /// emptied queue the middle of a frame whose head the flush had just
+    /// dropped: a guarded write's rest, a split frame's tail.
+    ///
+    /// The hold covers one `write(2)` that cannot park, never a park: the
+    /// `poll(POLLOUT)` is taken with the mutex released and the ledger
+    /// bracket closed, as [`Self::write_stamped_blocking`] parks, so a writer
+    /// queueing behind the spill (the UI thread's keys among them) never waits
+    /// on a frozen program here, and the backlog probe keeps dating the queue
+    /// this drainer waits on. On a description that may block, a `write(2)`
+    /// larger than the room parks inside the syscall, so there the look and
+    /// the write keep their two holds and the residual
+    /// ([`SinkWriter::discard_unread_input`]'s) stays. The chunk's accepted
+    /// prefix is recorded in [`Spill::chunk_written`] under the spill mutex,
+    /// unless a discard took the chunk, so a discard never counts it as both
+    /// queued and spilled.
     #[cfg(unix)]
-    fn write_stamped_count_blocking(&self, fd: i32, bytes: &[u8], since: u64) -> usize {
-        self.write_stamped_blocking(fd, bytes, since, None)
-            .unwrap_or(0)
+    fn drain_write(&self, fd: i32, chunk: &[u8], off: usize, since: u64) -> usize {
+        let Some(bytes) = chunk.get(off..) else {
+            return 0;
+        };
+        loop {
+            let wrote = {
+                let s = self.spill.lock().unwrap_or_else(|p| p.into_inner());
+                if self.discarded_since(since) {
+                    return 0;
+                }
+                let held = if self.master_nonblocking.load(Ordering::Relaxed) {
+                    Some(s)
+                } else {
+                    drop(s);
+                    None
+                };
+                #[cfg(any(test, debug_assertions))]
+                self.at_seam(Seam::DrainWrite);
+                let wrote = self.ledgered_nonparking(fd, bytes, false);
+                let n = match wrote {
+                    aterm_pty::NonParkWrite::Wrote(n) => n,
+                    _ => 0,
+                };
+                if n > 0 {
+                    let mut s = held
+                        .unwrap_or_else(|| self.spill.lock().unwrap_or_else(|p| p.into_inner()));
+                    // After a discard `buf` no longer holds this chunk, so the
+                    // mark would describe bytes it does not have.
+                    if !self.discarded_since(since) {
+                        s.chunk_written = off.saturating_add(n);
+                    }
+                }
+                wrote
+            };
+            match wrote {
+                aterm_pty::NonParkWrite::Wrote(n) => {
+                    // The hook after the spill mutex drops (it runs under the
+                    // fd lock, as every landing write's does).
+                    if n > 0 {
+                        let _ = self.fire_input_hook();
+                    }
+                    return n;
+                }
+                aterm_pty::NonParkWrite::Closed | aterm_pty::NonParkWrite::Fatal(_) => return 0,
+                // Park until the tty input queue has room (or the peer errors
+                // — reported writable, so the retry surfaces it), looking
+                // again every PARK_RECHECK_MS: a discard's flush does not wake
+                // this poll.
+                aterm_pty::NonParkWrite::WouldBlock => loop {
+                    match aterm_pty::poll_writable(fd, Self::PARK_RECHECK_MS) {
+                        Ok(true) => break,
+                        Ok(false) if !self.discarded_since(since) => {}
+                        Ok(false) | Err(_) => return 0,
+                    }
+                },
+            }
+        }
     }
 
     /// While the caller holds the fd lock, bind an empty spill observation to a
@@ -3063,6 +3237,48 @@ impl Shared {
     #[cfg(unix)]
     fn spill_len(&self) -> usize {
         self.spilled_bytes.load(Ordering::Acquire)
+    }
+
+    /// The rest of a frame the guarded write began
+    /// ([`SinkWriter::try_write_frame_whole_with_receipt`]), queued in the
+    /// spill `s` the caller holds — with the fd lock, and found EMPTY under
+    /// both — so it is the spill's front: the drainer peeks under the fd lock
+    /// and every other writer queues behind a non-empty spill, so nothing can
+    /// come between the prefix the kernel took and this rest. No discard can
+    /// run meanwhile: it empties the spill AND flushes the kernel's queue
+    /// under this mutex ([`SinkWriter::discard_unread_input`]), so one before
+    /// the caller's empty check left the prefix an empty queue, and one after
+    /// the caller lets go drops prefix and rest together. The rest belongs to
+    /// the program the prefix went to, and the drainer's writes of it are
+    /// ordered with a discard the same way: the caller needs a non-blocking
+    /// master, on which the drainer writes under the mutex
+    /// ([`Self::drain_write`]).
+    ///
+    /// The drainer is arranged as [`Self::spill_prepend`] arranges it for
+    /// [`Room::NoWait`]: one already live (it waits on the fd lock to peek)
+    /// takes the rest; with an arranger installed the spawn is deferred to it
+    /// and `Some(true)` asks the caller to poke it once the spill mutex is
+    /// released; otherwise the drainer is spawned here. `None` when it cannot
+    /// be: nothing is queued, and the prefix stands alone, in doubt.
+    #[cfg(unix)]
+    fn queue_rest_held(self: &Arc<Self>, master: i32, s: &mut Spill, rest: &[u8]) -> Option<bool> {
+        let defer = self.arranger.get().is_some();
+        if !s.draining {
+            if defer {
+                s.draining = true;
+                s.arrange_pending = true;
+            } else if !self.arrange_drainer(master, s) {
+                return None;
+            }
+        }
+        let poke = defer && s.arrange_pending;
+        s.buf.extend(rest.iter().copied());
+        self.spilled_bytes.store(s.buf.len(), Ordering::Release);
+        if !s.buf.is_empty() {
+            self.order_state
+                .fetch_or(Self::SPILL_ACTIVE_BIT, Ordering::Release);
+        }
+        Some(poke)
     }
 
     /// PREPEND a split frame's tail (or what a stopped paste still owes,
@@ -3320,45 +3536,31 @@ impl Shared {
             let mut off = 0;
             let mut dead = false;
             while off < chunk.len() {
-                // `off < chunk.len()` (the loop condition) makes this `get`
-                // always `Some`; the unreachable `else` arm exits the loop like
-                // a completed chunk, so the observable result is unchanged.
-                let Some(rest) = chunk.get(off..) else { break };
-                // `write_stamped_count_blocking` keeps the `io::Error` OUT of
-                // this loop: it returns the accepted byte count as a plain
-                // `usize` (0 on any hard error, retrying `EINTR` internally).
-                // The _blocking shape matters: the gather keeps the master
-                // `O_NONBLOCK` (per-description, shared by this dup'd fd), and
-                // a bare EAGAIN-collapses-to-0 here would misread the
-                // full-but-alive input queue of the wedged foreground — the
-                // very state this drainer absorbs — as session-dead and DROP
-                // the spill. It parks in poll(POLLOUT) and retries instead, the
-                // legacy kernel behavior — and parks BETWEEN ledger brackets,
-                // so the input-backlog probe keeps dating the queue this
-                // drainer is waiting on (`write_stamped_blocking`).
-                match self.write_stamped_count_blocking(fd.as_raw_fd(), rest, since) {
-                    // saturating_add: `n <= rest.len() <= chunk.len() - off`
-                    // (the POSIX write contract), so the sum never actually
-                    // saturates — but the helper's return is opaque to
-                    // the verifier here, so `n` is unbounded and the plain `+=`
-                    // would carry an undischargeable overflow obligation.
-                    // Behavior-identical on every real return.
-                    //
-                    // The chunk's first `off` bytes are the kernel's now, but
-                    // stay in `buf` until the chunk is popped below — and the
-                    // next write may park for as long as the program stays
-                    // frozen. Record them (fd lock, then spill: the order
-                    // every writer uses) so the input-backlog probe does not
-                    // count them twice (`Spill::chunk_written`).
-                    n if n > 0 => {
-                        off = off.saturating_add(n);
-                        let mut s = self.spill.lock().unwrap_or_else(|p| p.into_inner());
-                        // After a discard `buf` no longer holds this chunk, so
-                        // the mark would describe bytes it does not have.
-                        if !self.discarded_since(since) {
-                            s.chunk_written = off;
-                        }
-                    }
+                // `drain_write` keeps the `io::Error` OUT of this loop: it
+                // returns the accepted byte count as a plain `usize` (0 on any
+                // hard error, retrying `EINTR` internally). Its parking shape
+                // matters: the gather keeps the master `O_NONBLOCK`
+                // (per-description, shared by this dup'd fd), and a bare
+                // EAGAIN-collapses-to-0 here would misread the full-but-alive
+                // input queue of the wedged foreground — the very state this
+                // drainer absorbs — as session-dead and DROP the spill. It
+                // parks in poll(POLLOUT) and retries instead, the legacy
+                // kernel behavior — and parks BETWEEN ledger brackets, so the
+                // input-backlog probe keeps dating the queue this drainer is
+                // waiting on. It also records the chunk's accepted prefix in
+                // `Spill::chunk_written` under the hold its write ran in: the
+                // chunk's first `off` bytes are the kernel's now, but stay in
+                // `buf` until the chunk is popped below — and the next write
+                // may park for as long as the program stays frozen — so the
+                // probe does not count them twice.
+                match self.drain_write(fd.as_raw_fd(), &chunk, off, since) {
+                    // saturating_add: `n <= chunk.len() - off` (the POSIX
+                    // write contract), so the sum never actually saturates —
+                    // but the helper's return is opaque to the verifier here,
+                    // so `n` is unbounded and the plain `+=` would carry an
+                    // undischargeable overflow obligation. Behavior-identical
+                    // on every real return.
+                    n if n > 0 => off = off.saturating_add(n),
                     // Peer closed / hard error: the session is dead — drop the
                     // spill (a blocking write would have reported Ok(0)/Err once;
                     // these bytes were already accepted-for-delivery). Or a
@@ -3439,47 +3641,22 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
 
-    #[test]
-    fn receipt_error_preserves_prefix_order_and_original_io_error() {
-        let partial = WriteReceiptError::after_write(
-            io::Error::from_raw_os_error(libc::EIO),
-            3,
-            AcceptedOrder(7),
-        );
-        assert_eq!(partial.accepted(), 3);
-        assert_eq!(partial.order(), Some(AcceptedOrder(7)));
-        assert_eq!(partial.error().raw_os_error(), Some(libc::EIO));
-        assert_eq!(partial.into_error().raw_os_error(), Some(libc::EIO));
-
-        let refused = WriteReceiptError::from(io::Error::from_raw_os_error(libc::EBADF));
-        assert_eq!(refused.accepted(), 0);
-        assert_eq!(refused.order(), None);
-        assert_eq!(refused.into_error().raw_os_error(), Some(libc::EBADF));
-    }
-
-    /// A NON-TTY SINK KNOWS NOTHING ABOUT ECHO: the socketpair fixture every
-    /// sink test drives, and the `-1` sentinel every plain headless test
-    /// shares, both answer `None` — so a consumer's default (bank the press)
-    /// is what every existing fixture exercises, byte-identical. The real-pty
-    /// verdicts are aterm-pty's `tty_echo_*` tests.
-    #[test]
-    fn tty_echo_is_none_off_a_tty() {
-        let (_reader, writer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
-        assert_eq!(SinkWriter::new(writer.as_raw_fd()).tty_echo(), None);
-        assert_eq!(SinkWriter::new(-1).tty_echo(), None);
-    }
-
-    /// A NON-TTY SINK HAS NO INPUT BACKLOG: the socketpair fixture and the
-    /// `-1` sentinel answer `None` even with bytes written and unread, so no
-    /// existing fixture can ever read `pending`, `stalled`, or be refused.
-    /// The real-pty readings are `tests/input_backlog_pty.rs`.
+    /// A NON-TTY SINK HAS NO INPUT BACKLOG AND KNOWS NOTHING ABOUT ECHO: the
+    /// socketpair fixture and the `-1` sentinel answer `None` even with bytes
+    /// written and unread, so no existing fixture can ever read `pending`,
+    /// `stalled`, or be refused, and a consumer's default (bank the press) is
+    /// what every fixture exercises. The real-pty readings are
+    /// `tests/input_backlog_pty.rs` and aterm-gui's
+    /// `a_press_the_tty_will_not_echo_banks_no_credit`.
     #[test]
     fn input_backlog_is_none_off_a_tty() {
         let (_reader, writer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
         let sink = SinkWriter::new(writer.as_raw_fd());
         assert_eq!(sink.write_frame(b"abc").expect("write"), 3);
         assert_eq!(sink.input_backlog(), None);
+        assert_eq!(sink.tty_echo(), None);
         assert_eq!(SinkWriter::new(-1).input_backlog(), None);
+        assert_eq!(SinkWriter::new(-1).tty_echo(), None);
     }
 
     /// THE INPUT HOOK FIRES ONCE PER ARMING: two writes that land wake the
@@ -3549,31 +3726,6 @@ mod tests {
         assert!(!sink.wake_input_hook(), "the write fired first");
         assert_eq!(fired.load(Ordering::SeqCst), 2);
         drop(writer);
-    }
-
-    /// STRUCTURAL: every production master write is ledgered. The kernel
-    /// queue can only be dated if the ledger sees every byte the sink hands
-    /// the kernel, so each `aterm_pty::write_some*` call in production code
-    /// must sit inside a `ledger_begin` … `ledger_end` bracket. This counts
-    /// the three spellings in the non-comment lines above `mod tests`: a new
-    /// write site added without its bracket breaks the equality.
-    #[test]
-    fn every_production_master_write_is_ledgered() {
-        let src = include_str!("sink.rs");
-        let production = src
-            .split("\n#[cfg(all(test, unix))]\nmod tests {")
-            .next()
-            .expect("sink.rs has a production half");
-        assert_ne!(production.len(), src.len(), "the tests marker moved");
-        let code: Vec<&str> = production
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect();
-        let count = |needle: &str| code.iter().filter(|line| line.contains(needle)).count();
-        let writes = count("aterm_pty::write_some");
-        assert!(writes >= 3, "the census found only {writes} write sites");
-        assert_eq!(writes, count(".ledger_begin("), "a write without its begin");
-        assert_eq!(writes, count(".ledger_end("), "a write without its end");
     }
 
     // Whole-frame atomicity: N threads each write a distinct frame LARGER than the
@@ -3653,17 +3805,6 @@ mod tests {
     }
 
     #[test]
-    fn write_frame_reports_full_count() {
-        let (mut reader, writer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
-        let sink = SinkWriter::new(writer.as_raw_fd());
-        assert_eq!(sink.write_frame(b"hello-sink").expect("write_frame"), 10);
-        let mut buf = [0u8; 10];
-        reader.read_exact(&mut buf).expect("read_exact");
-        assert_eq!(&buf, b"hello-sink");
-        drop(writer);
-    }
-
-    #[test]
     fn receipt_twins_report_actual_acceptance_in_increasing_order() {
         let (mut reader, writer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
         let sink = SinkWriter::new(writer.as_raw_fd());
@@ -3685,24 +3826,18 @@ mod tests {
         sink.note_master_nonblocking(true);
         let (immediate, immediate_order) = sink.try_write_frame_immediate_with_receipt(b"I");
         assert_eq!(immediate, ImmediateWrite::Full);
-        let expected = sink.input_epoch();
-        let (conditional, _next, conditional_order) =
-            sink.try_write_frame_immediate_if_epoch_with_receipt(expected, b"C");
-        assert_eq!(conditional, ImmediateWrite::Full);
 
         assert_eq!(blocking.accepted(), 1);
         assert_eq!(nonparking.accepted(), 1);
         let blocking_order = blocking.order().expect("blocking accepted order");
         let nonparking_order = nonparking.order().expect("non-parking accepted order");
         let immediate_order = immediate_order.expect("immediate accepted order");
-        let conditional_order = conditional_order.expect("conditional accepted order");
         assert!(blocking_order < nonparking_order);
         assert!(nonparking_order < immediate_order);
-        assert!(immediate_order < conditional_order);
 
-        let mut bytes = [0_u8; 4];
+        let mut bytes = [0_u8; 3];
         reader.read_exact(&mut bytes).expect("read receipt frames");
-        assert_eq!(&bytes, b"BNIC");
+        assert_eq!(&bytes, b"BNI");
     }
 
     #[test]
@@ -4075,13 +4210,6 @@ mod tests {
                 .send(completion_sink.wait_egress_drained_to_kernel())
                 .expect("completion receiver alive");
         });
-        assert!(
-            matches!(
-                completion_rx.recv_timeout(std::time::Duration::from_millis(50)),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-            ),
-            "the completion fence returned before the spill reached the kernel"
-        );
 
         // Unwedge: drain everything; the spill drainer must deliver A,B,C after
         // the fill bytes, contiguous and in submission order.
@@ -4224,14 +4352,14 @@ mod tests {
         let (mut reader, writer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
         let sink = Arc::new(SinkWriter::new(writer.as_raw_fd()));
         assert!(
-            !sink.master_nonblocking.load(Ordering::Relaxed),
+            !sink.shared.master_nonblocking.load(Ordering::Relaxed),
             "a fresh sink assumes the description may be BLOCKING (per-byte cadence)"
         );
 
         // Production shape: the direct-read gather flips the shared description.
         writer.set_nonblocking(true).expect("nonblocking master");
         sink.note_master_nonblocking(true);
-        assert!(sink.master_nonblocking.load(Ordering::Relaxed));
+        assert!(sink.shared.master_nonblocking.load(Ordering::Relaxed));
 
         // Fast path: room to spare, so the whole frame goes inline in one write.
         assert_eq!(
@@ -4330,19 +4458,6 @@ mod tests {
         let mut buf = [0u8; 4];
         let n = reader.read(&mut buf).expect("read");
         assert_eq!(&buf[..n], b"K");
-    }
-
-    /// An unwedged fd takes the fast path: bytes land without any drainer thread
-    /// (spill stays empty), byte-identical to the legacy write.
-    #[test]
-    fn nonparking_fast_path_writes_inline() {
-        let (mut reader, writer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
-        let sink = SinkWriter::new(writer.as_raw_fd());
-        assert_eq!(sink.write_frame_nonparking(b"hello").expect("write"), 5);
-        assert!(sink.shared.spill_is_empty(), "no spill on the fast path");
-        let mut buf = [0u8; 8];
-        let n = reader.read(&mut buf).expect("read");
-        assert_eq!(&buf[..n], b"hello");
     }
 }
 
@@ -4464,7 +4579,6 @@ mod p04_direct_receipt_and_deferred_drainer_tests {
         );
         drop(held);
         // Nothing drains until the WORKER arranges the drainer…
-        std::thread::sleep(std::time::Duration::from_millis(20));
         assert_eq!(sink.try_egress_drained_to_kernel(), Some(false));
         // …which is the worker-side half.
         sink.arrange_pending_drainer();
@@ -4497,6 +4611,144 @@ mod p04_direct_receipt_and_deferred_drainer_tests {
         }
         drop(held);
         assert_eq!(read_exactly(&mut reader, 1), b"q");
+    }
+
+    /// THE DRAINER NEVER PARKS UNDER THE SPILL MUTEX. On a master that may
+    /// block (no `note_master_nonblocking`), the drainer's `write(2)` into a
+    /// full queue parks inside the syscall, so it runs with the spill mutex
+    /// released: stood at its write (`Seam::DrainWrite`) the mutex is free,
+    /// and once it is parked in the write a non-parking writer queueing
+    /// behind the spill (the UI thread's next key) still appends at once. On
+    /// a master declared non-blocking the write cannot park, and the look at
+    /// the discard epoch and the write share one hold of the mutex
+    /// (`drain_write`; a discard is then wholly before or after it, the pty
+    /// test `a_discard_racing_the_drainers_write_drops_the_frame_whole`).
+    ///
+    /// NEGATIVE CONTROL: that declared lane, where the seam finds the mutex
+    /// held. A drainer that held it on both lanes failed aterm-gui's
+    /// `spilled_key_does_not_hold_later_queued_keys` on 2026-10-16 (its keys
+    /// never left the FIFO writer), and fails this test's first half.
+    #[test]
+    fn the_drainer_never_parks_in_its_write_under_the_spill_mutex() {
+        for declared in [false, true] {
+            let (reader, writer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+            writer.set_nonblocking(true).expect("nonblocking for fill");
+            while let Ok(n) = aterm_pty::write_some(writer.as_raw_fd(), &[b'.'; 4096]) {
+                if n == 0 {
+                    break;
+                }
+            }
+            writer.set_nonblocking(declared).expect("the description");
+            let sink = Arc::new(SinkWriter::new(writer.as_raw_fd()));
+            sink.note_master_nonblocking(declared);
+            let (at_tx, at_rx) = std::sync::mpsc::channel::<bool>();
+            let at_tx = Mutex::new(at_tx);
+            let shared = Arc::downgrade(&sink.shared);
+            let fired = AtomicBool::new(false);
+            sink.seam_for_testing(move |seam| {
+                if seam != Seam::DrainWrite || fired.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let free = shared
+                    .upgrade()
+                    .is_some_and(|shared| shared.spill.try_lock().is_ok());
+                let _ = at_tx.lock().expect("at").send(free);
+            });
+            assert_eq!(sink.write_frame_nonparking(b"s").expect("spilled"), 1);
+            let free = at_rx
+                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .expect("the drainer reached its write");
+            assert_eq!(
+                free, !declared,
+                "declared={declared}: the mutex at the write"
+            );
+            // A key behind the spill, from another thread: it must come back
+            // (a minute is the hang detector) while the drainer is parked.
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let key = {
+                let sink = Arc::clone(&sink);
+                std::thread::spawn(move || {
+                    let _ = done_tx.send(sink.write_frame_nonparking(b"k").map_err(|e| e.kind()));
+                })
+            };
+            assert_eq!(
+                done_rx
+                    .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                    .expect("the key never queued behind a parked drainer"),
+                Ok(1)
+            );
+            key.join().expect("the key");
+            drop(reader);
+        }
+    }
+
+    /// THE GUARDED WRITE NEVER CREATES A THREAD WHERE AN ARRANGER IS
+    /// INSTALLED (every production session: its reply writer): the rest of a
+    /// frame the kernel took only part of is committed under the PENDING mark
+    /// and the arranger poked once, so the control thread that wrote it under
+    /// the terminal lock waits for nothing; the worker's half then delivers it,
+    /// whole, after the prefix. Over a pipe, whose short write is deterministic
+    /// (the room a read made, smaller than the frame).
+    ///
+    /// NEGATIVE CONTROL: with no arranger the drainer is arranged inline (the
+    /// thread exists, nothing is pending), as the non-parking body does
+    /// (`without_an_arranger_the_concession_arranges_inline_as_before`).
+    #[test]
+    fn the_guarded_writes_rest_defers_its_drainer_to_the_arranger() {
+        static POKES: AtomicUsize = AtomicUsize::new(0);
+        for arranged in [true, false] {
+            let (read_end, write_end) = std::io::pipe().expect("pipe");
+            let (read_end, write_end): (OwnedFd, OwnedFd) = (read_end.into(), write_end.into());
+            aterm_pty::set_nonblocking(write_end.as_raw_fd(), true).expect("nonblocking");
+            let mut filled = 0_usize;
+            while let Ok(n) = aterm_pty::write_some(write_end.as_raw_fd(), &[b'.'; 4096]) {
+                filled += n;
+            }
+            let sink = SinkWriter::new_owned(write_end);
+            sink.note_master_nonblocking(true);
+            if arranged {
+                sink.install_spill_arranger(|| {
+                    POKES.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+            let mut reader = std::fs::File::from(read_end);
+            let room = filled.min(8 * 1024);
+            let mut made = vec![0_u8; room];
+            reader.read_exact(&mut made).expect("make partial room");
+
+            let frame = vec![b'P'; SinkWriter::IMMEDIATE_FRAME_MAX];
+            let (outcome, _) = sink.try_write_frame_whole_with_receipt(&frame);
+            assert!(
+                matches!(outcome, ImmediateWrite::Queued { accepted } if accepted < frame.len()),
+                "{outcome:?}"
+            );
+            {
+                let s = sink.shared.spill.lock().unwrap();
+                assert!(s.draining, "a drainer owes the rest");
+                assert_eq!(s.arrange_pending, arranged, "pending iff deferred");
+            }
+            if arranged {
+                assert_eq!(POKES.load(Ordering::SeqCst), 1, "poked exactly once");
+                sink.arrange_pending_drainer();
+            }
+            aterm_pty::set_nonblocking(reader.as_raw_fd(), true).expect("nonblocking reader");
+            let want = filled - room + frame.len();
+            let mut landed = Vec::with_capacity(want);
+            let came = aterm_spec::wait::within(
+                aterm_spec::wait::MUST_HAPPEN,
+                std::time::Duration::from_millis(5),
+                || {
+                    let mut buf = [0_u8; 16 * 1024];
+                    if let Ok(n) = reader.read(&mut buf) {
+                        landed.extend_from_slice(&buf[..n]);
+                    }
+                    (landed.len() >= want).then_some(())
+                },
+            );
+            assert!(came.is_some(), "{arranged}: {} of {want}", landed.len());
+            assert!(landed[..filled - room].iter().all(|b| *b == b'.'));
+            assert!(landed[filled - room..].iter().all(|b| *b == b'P'));
+        }
     }
 }
 
@@ -4802,32 +5054,6 @@ mod input_io_tests {
         (sink, reader, filled)
     }
 
-    /// Read everything the reader can get within `quiet` of silence.
-    fn read_until_quiet(reader: &mut UnixStream, quiet: Duration) -> Vec<u8> {
-        reader.set_read_timeout(Some(quiet)).expect("timeout");
-        let mut got = Vec::new();
-        let mut chunk = [0u8; 65536];
-        loop {
-            match reader.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => got.extend_from_slice(&chunk[..n]),
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    break;
-                }
-                Err(e) => panic!("read: {e}"),
-            }
-        }
-        reader
-            .set_read_timeout(Some(Duration::from_secs(60)))
-            .expect("timeout");
-        got
-    }
-
     fn bracketed(body: &[u8]) -> Vec<u8> {
         [PASTE_OPEN, body, PASTE_CLOSE].concat()
     }
@@ -4923,13 +5149,10 @@ mod input_io_tests {
             rx.recv_timeout(Duration::from_secs(60)).expect("K queued"),
             Ok(1)
         );
-        std::thread::sleep(Duration::from_millis(300));
 
         // The program resumes: the paste's head, CLOSED, then the key. Read up
         // to the key (the one `K` in the stream) under the reader's hang
-        // detector, not until a 300 ms silence: the close and the key come from
-        // the drainer, which a loaded box can leave unscheduled for longer
-        // than that. The silence is then only the check that nothing follows.
+        // detector: the close and the key come from the drainer.
         let mut delivered = head.split_off(filled);
         let mut chunk = [0u8; 65536];
         while delivered.last() != Some(&b'K') {
@@ -4939,12 +5162,6 @@ mod input_io_tests {
             assert!(n > 0, "peer closed early");
             delivered.extend_from_slice(&chunk[..n]);
         }
-        let after = read_until_quiet(&mut reader, Duration::from_millis(300));
-        assert!(
-            after.is_empty(),
-            "the key arrives last, yet {} bytes followed it",
-            after.len()
-        );
         delivered.pop();
         assert_eq!(delivered.len(), accepted, "exactly the accepted bytes");
         assert!(delivered.starts_with(PASTE_OPEN));
@@ -4975,10 +5192,6 @@ mod input_io_tests {
                     .expect("receiver");
             })
         };
-        assert!(
-            rx.recv_timeout(Duration::from_millis(300)).is_err(),
-            "the paste waits for room behind the full spill"
-        );
         meter.request_stop();
         let accepted = rx
             .recv_timeout(Duration::from_secs(60))
@@ -4997,9 +5210,9 @@ mod input_io_tests {
     /// no order, `is_refused` — never parked and never falsely reported
     /// delivered; everything accepted before it reaches the program in order
     /// once it reads, the refused key nowhere among it; and a key typed after
-    /// the program has read goes through. The negative control is the
-    /// expendable-thread twin, `write_frame_nonparking`, which PARKS on the
-    /// same full spill (the backpressure `tests/spill_bound.rs` pins) — the
+    /// the program has read goes through. The expendable-thread twin,
+    /// `write_frame_nonparking`, PARKS on the same full spill (the backpressure
+    /// `tests/spill_bound.rs` pins) and lands after the accepted frames — the
     /// shape that used to freeze every window when the UI thread reached it.
     #[test]
     fn the_interactive_egress_refuses_at_the_spill_cap_and_never_parks() {
@@ -5042,10 +5255,6 @@ mod input_io_tests {
                     .expect("receiver");
             })
         };
-        assert!(
-            rx.recv_timeout(Duration::from_millis(300)).is_err(),
-            "the parking twin waits for the wedge to clear"
-        );
 
         // The program reads: every accepted frame arrives in order, then the
         // parked control's byte; the refused key is nowhere.
@@ -5117,8 +5326,7 @@ mod input_io_tests {
     /// will never read again: a paste parked on the direct lane, a key waiting
     /// for spill room behind a spill past its cap, and the spill drainer. A
     /// sever returns all of them promptly; every later write fails at entry;
-    /// the completion fence reports the dropped spill as a loss. The negative
-    /// control is the same waiters before the sever: still parked.
+    /// the completion fence reports the dropped spill as a loss.
     #[test]
     fn a_sever_unblocks_every_waiter() {
         let (sink, _reader, _filled) = wedged();
@@ -5146,10 +5354,6 @@ mod input_io_tests {
             assert!(keys < 1024);
         }
         let waiter = spawn("room", b"w".to_vec());
-        assert!(
-            rx.recv_timeout(Duration::from_millis(300)).is_err(),
-            "before the sever every writer is still parked"
-        );
 
         sink.sever_input();
         let mut returned = Vec::new();

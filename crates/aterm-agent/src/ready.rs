@@ -1,0 +1,278 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! THE LAUNCHER'S HALF OF `aterm --headless --ready-fd <n>`: wait for a headless
+//! instance this process starts to say its control socket listens, instead of
+//! polling the socket.
+//!
+//! The instance writes ONE byte down the descriptor once its control listener is
+//! bound, then closes it; it closes it with nothing written when it has no socket
+//! to offer, and the kernel closes it when the instance dies. So a launcher that
+//! holds the read end and no write end reads one of three things: the byte
+//! (ready), end-of-file (the instance will not be ready — it exited, or runs
+//! socketless), or nothing until its own hang detector.
+//!
+//! A FIFO, not `pipe(2)`, for `aterm_uds::lifeline`'s reason: Darwin has no
+//! `pipe2`, so a `pipe(2)` end is inheritable until its `F_SETFD`, and a
+//! concurrent spawn could carry the write end into a stranger that then holds
+//! the signal open. `open(2)` makes each end close-on-exec from birth; the name
+//! is unlinked before [`Ready::open`] returns. The write end reaches the child
+//! at its own number, through a `pre_exec` hook that clears close-on-exec on
+//! exactly that number in the child ([`Ready::hand`]) — the one spelling that
+//! works under every std, SP-1's included.
+//!
+//! THE WAIT IS A BLOCKING READ on a thread of its own, its answer taken with a
+//! bound ([`Ready::wait`]): `poll(2)` cannot stand in, because on macOS it
+//! reports neither `POLLIN` nor `POLLHUP` for a FIFO whose last writer closed
+//! (`aterm_uds::lifeline::NONBLOCKING_READ_GAP` says the same), while a read
+//! returns end-of-file at once.
+
+use std::fs::File;
+use std::io::{self, Read as _};
+use std::os::fd::{AsRawFd as _, RawFd};
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::time::Duration;
+
+/// The instance's flag.
+pub const FLAG: &str = "--ready-fd";
+
+/// What [`Ready::wait`] read.
+#[derive(Debug)]
+pub enum Signal {
+    /// The byte: the instance's control socket listens.
+    Ready,
+    /// End-of-file with nothing written: the instance exited, or it has no
+    /// socket to offer. Its exit status and log say which.
+    Closed,
+    /// Neither within the wait's bound: a hang.
+    TimedOut,
+    /// The read end could not be read (`poll`/`read` failed).
+    Failed(io::Error),
+}
+
+/// One instance's ready signal: the read end this process keeps (handed to the
+/// reading thread at the first [`Ready::wait`]), and the write end until the
+/// instance is spawned holding its own copy.
+#[derive(Debug)]
+pub struct Ready {
+    read: Option<File>,
+    write: Option<File>,
+    number: RawFd,
+    /// The reading thread's one answer: the bytes its read returned (1 or 0).
+    answer: Option<mpsc::Receiver<io::Result<usize>>>,
+    /// The signal was read ([`Signal::Ready`] or [`Signal::Closed`]).
+    done: bool,
+}
+
+impl Ready {
+    /// A fresh signal in `dir` — a directory only this process writes (its
+    /// scratch root): a FIFO made there, both ends opened close-on-exec, the
+    /// name removed.
+    ///
+    /// # Errors
+    /// `mkfifo(3)` or either `open(2)` failed; nothing is left behind.
+    pub fn open(dir: &Path) -> io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        static SERIAL: AtomicU64 = AtomicU64::new(0);
+        let path = dir.join(format!(
+            ".aterm-ready-{}-{}",
+            std::process::id(),
+            SERIAL.fetch_add(1, Ordering::Relaxed)
+        ));
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a NUL in the FIFO path"))?;
+        // SAFETY: `c_path` is a NUL-terminated string that outlives the call,
+        // which only reads it.
+        if unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // The read end first and non-blocking (no writer yet); then the write
+        // end, which a reader lets open at once. std passes O_CLOEXEC on both.
+        let opened = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+            .and_then(|read| {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .map(|write| (read, write))
+            });
+        let unlinked = std::fs::remove_file(&path);
+        let (read, write) = opened?;
+        unlinked?;
+        // A writer holds it open now: the read end blocks from here, so the
+        // reading thread's read waits for the byte or the end-of-file.
+        // SAFETY: `F_GETFL`/`F_SETFL` read and write one descriptor's status
+        // flags; `read` is open and owned here.
+        let blocking = unsafe {
+            let flags = libc::fcntl(read.as_raw_fd(), libc::F_GETFL);
+            flags >= 0
+                && libc::fcntl(read.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK) >= 0
+        };
+        if !blocking {
+            return Err(io::Error::last_os_error());
+        }
+        let number = write.as_raw_fd();
+        Ok(Self {
+            read: Some(read),
+            write: Some(write),
+            number,
+            answer: None,
+            done: false,
+        })
+    }
+
+    /// The flag and the number the instance is to be told.
+    #[must_use]
+    pub fn args(&self) -> [String; 2] {
+        [FLAG.to_string(), self.number.to_string()]
+    }
+
+    /// The write end's number, which the child finds it at.
+    #[must_use]
+    pub fn number(&self) -> RawFd {
+        self.number
+    }
+
+    /// Hand the write end to `cmd`'s child at its own number and add [`FLAG`]
+    /// to its arguments — before any `-e` payload, which takes every argument
+    /// after it. A `pre_exec` hook, so the spawn forks: install a strip that
+    /// hands nothing else (`aterm_uds::spawnfd::InheritNothing`) BEFORE this,
+    /// or its work undoes this hook's.
+    pub fn hand(&self, cmd: &mut aterm_uds::spawnfd::StdCommand) {
+        use std::os::unix::process::CommandExt as _;
+        let fd = self.number;
+        cmd.args(self.args());
+        // SAFETY: the hook runs in the forked child before its exec and makes
+        // only async-signal-safe calls (`fcntl`) on one integer copied into it;
+        // `last_os_error` reads `errno` and allocates nothing.
+        unsafe {
+            cmd.pre_exec(move || {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    /// Let go of this process's write end: the child holds its own now, and
+    /// one held here would keep its end-of-file from ever reaching
+    /// [`Self::wait`]. Call it once the child is spawned; [`Self::wait`] does.
+    pub fn spawned(&mut self) {
+        self.write = None;
+    }
+
+    /// Block until the instance signals or closes its end, for at most `limit`
+    /// (a hang detector, never a latency budget). Drops this process's write
+    /// end first ([`Self::spawned`]). The read itself runs on a thread of its
+    /// own (module doc), started at the first call; a call that timed out may
+    /// be made again. Once it has answered `Ready` or `Closed` it answers
+    /// `Closed` from then on.
+    pub fn wait(&mut self, limit: Duration) -> Signal {
+        self.spawned();
+        if self.done {
+            return Signal::Closed;
+        }
+        if self.answer.is_none() {
+            let Some(mut read) = self.read.take() else {
+                return Signal::Closed;
+            };
+            let (tx, rx) = mpsc::sync_channel(1);
+            let started = std::thread::Builder::new()
+                .name("aterm-ready-wait".into())
+                .spawn(move || {
+                    let mut byte = [0u8; 1];
+                    let got = loop {
+                        match read.read(&mut byte) {
+                            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                            other => break other,
+                        }
+                    };
+                    let _ = tx.send(got);
+                });
+            if let Err(e) = started {
+                return Signal::Failed(e);
+            }
+            self.answer = Some(rx);
+        }
+        let Some(answer) = &self.answer else {
+            return Signal::Closed;
+        };
+        match answer.recv_timeout(limit) {
+            Ok(Ok(n)) => {
+                self.done = true;
+                if n == 0 {
+                    Signal::Closed
+                } else {
+                    Signal::Ready
+                }
+            }
+            Ok(Err(e)) => {
+                self.done = true;
+                Signal::Failed(e)
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => Signal::TimedOut,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.done = true;
+                Signal::Failed(io::Error::other("the ready signal's reader ended"))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Ready, Signal};
+    use std::io::Write as _;
+    use std::time::Duration;
+
+    /// The byte reads as ready; a write end closed with nothing written reads
+    /// as closed; a write end still held somewhere reads as a hang — never as
+    /// ready. Within the process: the child's copy is a duplicate of the write
+    /// end, as `fork` makes it.
+    #[test]
+    fn the_byte_is_ready_a_bare_close_is_closed_and_a_held_end_is_a_hang() {
+        let dir = crate::supervise::test_scratch_path("ready", "signal");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the test's dir");
+
+        let mut ready = Ready::open(&dir).expect("a ready signal");
+        let mut child = ready
+            .write
+            .as_ref()
+            .expect("held")
+            .try_clone()
+            .expect("dup");
+        child.write_all(b"R").expect("the byte");
+        drop(child);
+        assert!(matches!(ready.wait(Duration::from_secs(60)), Signal::Ready));
+
+        let mut closed = Ready::open(&dir).expect("a ready signal");
+        let child = closed
+            .write
+            .as_ref()
+            .expect("held")
+            .try_clone()
+            .expect("dup");
+        drop(child);
+        assert!(matches!(
+            closed.wait(Duration::from_secs(60)),
+            Signal::Closed
+        ));
+
+        // NEGATIVE CONTROL: a copy of the write end still open, nothing written.
+        let mut held = Ready::open(&dir).expect("a ready signal");
+        let _child = held.write.as_ref().expect("held").try_clone().expect("dup");
+        assert!(matches!(
+            held.wait(Duration::from_millis(50)),
+            Signal::TimedOut
+        ));
+        assert_eq!(held.args()[0], super::FLAG);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

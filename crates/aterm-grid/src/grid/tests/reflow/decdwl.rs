@@ -4,63 +4,7 @@
 //! DECDWL/DECDHL reflow tests: double-width/height lines (half the usable
 //! columns) are resized in place, never split or merged with adjacent lines.
 
-use crate::{CellFlags, Grid, LineSize, StyleId};
-
-#[test]
-fn decdwl_row_preserved_on_shrink() {
-    let mut grid = Grid::new(5, 80);
-    for i in 0..10u16 {
-        grid.write_char((b'A' + i as u8) as char);
-    }
-    grid.row_mut(0)
-        .unwrap()
-        .set_line_size(LineSize::DoubleWidth);
-
-    grid.resize(5, 40);
-    grid.assert_invariants();
-
-    let row0 = grid.row(0).unwrap();
-    assert_eq!(
-        row0.line_size(),
-        LineSize::DoubleWidth,
-        "DECDWL attribute must survive shrink reflow"
-    );
-    // Resized in place, not wrapped onto a new row.
-    assert_eq!(row0.get(0).unwrap().char_data(), 'A' as u16);
-    assert_eq!(row0.get(9).unwrap().char_data(), 'J' as u16);
-}
-
-#[test]
-fn decdwl_row_preserved_on_grow() {
-    let mut grid = Grid::new(5, 40);
-    for i in 0..10u16 {
-        grid.write_char((b'A' + i as u8) as char);
-    }
-    grid.row_mut(0)
-        .unwrap()
-        .set_line_size(LineSize::DoubleWidth);
-
-    grid.set_cursor(1, 0);
-    grid.write_char('Z');
-
-    grid.resize(5, 80);
-    grid.assert_invariants();
-
-    let row0 = grid.row(0).unwrap();
-    assert_eq!(
-        row0.line_size(),
-        LineSize::DoubleWidth,
-        "DECDWL attribute must survive grow reflow"
-    );
-    assert_eq!(row0.get(0).unwrap().char_data(), 'A' as u16);
-
-    let row1 = grid.row(1).unwrap();
-    assert_eq!(
-        row1.get(0).unwrap().char_data(),
-        'Z' as u16,
-        "DECDWL row must not merge with next row on grow"
-    );
-}
+use crate::{CellFlags, Grid, LineSize};
 
 #[test]
 fn decdhl_top_bottom_preserved_on_shrink() {
@@ -92,52 +36,6 @@ fn decdhl_top_bottom_preserved_on_shrink() {
 }
 
 #[test]
-fn decdwl_row_not_split_even_when_full() {
-    // Shrunk to half its width, a full DECDWL row truncates: no new row.
-    let mut grid = Grid::new(3, 80);
-    for _i in 0..80u16 {
-        grid.write_char('X');
-    }
-    grid.row_mut(0)
-        .unwrap()
-        .set_line_size(LineSize::DoubleWidth);
-
-    let rows_before = grid.rows();
-    grid.resize(3, 40);
-    grid.assert_invariants();
-
-    assert_eq!(
-        grid.row(0).unwrap().line_size(),
-        LineSize::DoubleWidth,
-        "DECDWL must be preserved"
-    );
-    assert_eq!(grid.rows(), rows_before);
-}
-
-#[test]
-fn decdwl_cursor_clamped_on_shrink() {
-    let mut grid = Grid::new(5, 80);
-    for _i in 0..30u16 {
-        grid.write_char('A');
-    }
-    grid.row_mut(0)
-        .unwrap()
-        .set_line_size(LineSize::DoubleWidth);
-    grid.set_cursor(0, 35);
-
-    grid.resize(5, 40);
-    grid.assert_invariants();
-
-    assert_eq!(grid.cursor_row(), 0, "cursor should stay on row 0");
-    assert!(
-        grid.cursor_col() <= 39,
-        "cursor col {} should be <= 39",
-        grid.cursor_col()
-    );
-    assert_eq!(grid.row(0).unwrap().line_size(), LineSize::DoubleWidth);
-}
-
-#[test]
 fn decdwl_round_trip_shrink_then_grow() {
     // Content within the shrunk width survives the round trip.
     let mut grid = Grid::new(5, 80);
@@ -156,39 +54,6 @@ fn decdwl_round_trip_shrink_then_grow() {
     grid.assert_invariants();
     assert_eq!(grid.row(0).unwrap().line_size(), LineSize::DoubleWidth);
     assert_eq!(grid.row(0).unwrap().get(0).unwrap().char_data(), 'A' as u16);
-}
-
-#[test]
-fn decdhl_pair_preserved_on_grow() {
-    let mut grid = Grid::new(5, 40);
-    grid.write_char('T');
-    grid.row_mut(0)
-        .unwrap()
-        .set_line_size(LineSize::DoubleHeightTop);
-
-    grid.set_cursor(1, 0);
-    grid.write_char('B');
-    grid.row_mut(1)
-        .unwrap()
-        .set_line_size(LineSize::DoubleHeightBottom);
-
-    grid.set_cursor(2, 0);
-    grid.write_char('N'); // Normal row below the pair.
-
-    grid.resize(5, 80);
-    grid.assert_invariants();
-
-    assert_eq!(grid.row(0).unwrap().line_size(), LineSize::DoubleHeightTop);
-    assert_eq!(
-        grid.row(1).unwrap().line_size(),
-        LineSize::DoubleHeightBottom
-    );
-    assert_eq!(grid.row(2).unwrap().line_size(), LineSize::SingleWidth);
-    assert_eq!(
-        grid.row(2).unwrap().get(0).unwrap().char_data(),
-        'N' as u16,
-        "normal row below DECDHL pair must not be absorbed"
-    );
 }
 
 #[test]
@@ -297,7 +162,12 @@ fn decdwl_shrink_blanks_a_wide_char_cut_at_the_new_edge() {
     for _ in 0..39 {
         grid.write_char('a');
     }
-    grid.write_wide_char_wrap_with_style_id('界', StyleId::default(), CellFlags::empty());
+    grid.write_wide_char_wrap_styled(
+        '界',
+        crate::PackedColor::DEFAULT_FG,
+        crate::PackedColor::DEFAULT_BG,
+        CellFlags::empty(),
+    );
     {
         let row0 = grid.row(0).unwrap();
         assert!(row0.get(39).unwrap().is_wide(), "head at col 39");

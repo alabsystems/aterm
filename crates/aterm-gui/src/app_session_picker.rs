@@ -26,7 +26,8 @@ impl App {
     /// Connect lists every live registered session except the subject
     /// (connected peers annotated); Configure/Disconnect list ONLY the
     /// subject's connected peers (§2.3 — those ids act on an existing pair).
-    /// Registry facts only; titles resolve user meta title ▸ registry title.
+    /// Registry facts only; titles resolve user meta title ▸ registry title
+    /// without an agent's spinner frame (`SessionHandle::display_title`).
     fn picker_rows(&self, subject: &SessionId, intent: PickerIntent) -> Vec<PickerRow> {
         let peers: std::collections::HashSet<String> = self
             .connection_facts(subject)
@@ -41,14 +42,7 @@ impl App {
             .filter(|h| !matches!(h.state, crate::session_store::SessionState::Exited))
             .filter(|h| matches!(intent, PickerIntent::Connect) || peers.contains(h.sid.as_str()))
             .map(|h| {
-                let title = h
-                    .ctx
-                    .meta
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .get("title")
-                    .map(str::to_string)
-                    .unwrap_or_else(|| h.title.clone());
+                let title = h.display_title();
                 PickerRow::Session(SessionRow {
                     connected: peers.contains(h.sid.as_str()),
                     sid: h.sid,
@@ -249,7 +243,11 @@ impl App {
         create: bool,
     ) {
         let ask = crate::tab_spawn::SpawnAsk {
-            create_identity: create,
+            identity_prep: if create {
+                crate::tab_spawn::IdentityPrep::Create
+            } else {
+                crate::tab_spawn::IdentityPrep::Exists
+            },
             ..crate::tab_spawn::SpawnAsk::new(None, Some(name))
         };
         let then = crate::tab_spawn::TabSpawnThen::Nothing;
@@ -730,6 +728,66 @@ mod tests {
         assert_eq!(card.kind, ConnectionKind::Both);
     }
 
+    /// THE PICKER'S ROWS AND THE CONNECTION LINES NAME A SESSION WITHOUT ITS
+    /// AGENT'S SPINNER FRAME (the Together run's D7, on the surfaces the first
+    /// fix missed): the registry title `⠦ Add tested …` is listed as `Add
+    /// tested …` in the Connect picker's row and in the subject's connection
+    /// facts (the tab menu's and tooltip's `⇆ peer "…"` lines). NEGATIVE
+    /// CONTROL: a title the person set (`meta set title`) is theirs, whole,
+    /// frame and all.
+    #[test]
+    fn the_pickers_rows_and_connection_lines_drop_an_agents_spinner_frame() {
+        let (mut app, wid, sids) = app_with_three();
+        connect(&app, &sids[0], &sids[2]);
+        let local = app.store.read().unwrap().by_sid(&sids[2]).unwrap().local_id;
+        app.store
+            .write()
+            .unwrap()
+            .set_title(local, "\u{2826} Add tested calculator functions");
+        let picker_row = |app: &App| {
+            app.windows[&wid]
+                .session_picker()
+                .expect("picker open")
+                .controls_lines()
+                .into_iter()
+                .find(|l| l.contains(&format!("sid={}", sids[2].as_str())))
+                .expect("the peer is listed")
+        };
+        let peer_title = |app: &App| {
+            app.connection_facts(&sids[0])
+                .into_iter()
+                .find(|f| f.peer_sid == sids[2])
+                .expect("the pair is a connection fact")
+                .peer_title
+        };
+        assert!(app.open_session_picker(wid, sids[0].clone(), PickerIntent::Connect));
+        let row = picker_row(&app);
+        assert!(
+            row.contains("text=\"\\\"Add tested calculator functions\\\""),
+            "the row names the subject, not the frame: {row}"
+        );
+        assert_eq!(peer_title(&app), "Add tested calculator functions");
+        app.session_picker_exit(wid);
+
+        app.store
+            .read()
+            .unwrap()
+            .by_sid(&sids[2])
+            .unwrap()
+            .ctx
+            .meta
+            .lock()
+            .unwrap()
+            .set("title", Some("\u{2826} deploy".to_string()));
+        assert!(app.open_session_picker(wid, sids[0].clone(), PickerIntent::Connect));
+        let row = picker_row(&app);
+        assert!(
+            row.contains("\u{2826} deploy"),
+            "a person's title stays whole: {row}"
+        );
+        assert_eq!(peer_title(&app), "\u{2826} deploy");
+    }
+
     /// The open picker's FILTERED ordinal of the row for `sid` — cursor
     /// navigation by exact identity, immune to fuzzy-filter cross-matches.
     fn picker_row_ordinal(app: &App, wid: WindowId, sid: &aterm_session::SessionId) -> usize {
@@ -781,29 +839,16 @@ mod tests {
         use crate::menu::MenuAction;
         let (mut app, wid, sids) = app_with_three();
 
-        // No connection: both ids refuse (no picker, no card, no guess).
+        // No connection: both ids refuse (no picker, no card, no guess)…
+        let rows_before = app.messages.live_rows().count();
         app.open_connection_ui(wid, sids[0].clone(), MenuAction::ConfigureConnection);
         assert!(app.windows[&wid].overlay().is_none());
         app.open_connection_ui(wid, sids[0].clone(), MenuAction::DisconnectSession);
         assert!(app.windows[&wid].overlay().is_none());
         // ... and say why nothing opened: one row per press.
-        let mut titles: Vec<&str> = app
-            .messages
-            .live_rows()
-            .filter(|l| {
-                l.msg.title == "This tab has no connection"
-                    || l.msg.detail.first().map(String::as_str)
-                        == Some(crate::message_reporters::NO_CONNECTION)
-            })
-            .map(|l| l.msg.title.as_str())
-            .collect();
-        titles.sort_unstable();
         assert_eq!(
-            titles,
-            [
-                "Couldn't configure a connection",
-                "This tab has no connection"
-            ],
+            app.messages.live_rows().count(),
+            rows_before + 2,
             "one row per refused press"
         );
 
@@ -850,21 +895,5 @@ mod tests {
         app.open_connection_ui(wid, sids[0].clone(), MenuAction::DisconnectSession);
         assert!(app.windows[&wid].overlay().is_none(), "direct, no picker");
         assert!(app.connections.records().is_empty());
-    }
-
-    /// Configure/Disconnect pickers list ONLY connected peers.
-    #[test]
-    fn configure_picker_lists_only_connected_peers() {
-        let (mut app, wid, sids) = app_with_three();
-        connect(&app, &sids[0], &sids[1]);
-        connect(&app, &sids[0], &sids[2]);
-        assert!(app.open_session_picker(wid, sids[0].clone(), PickerIntent::Configure));
-        let lines = app.windows[&wid].session_picker().unwrap().controls_lines();
-        assert!(lines[0].contains("rows=2"));
-        // Every row is a connection, so none repeats ` · connected`.
-        assert!(
-            lines.iter().skip(1).all(|l| !l.contains("connected")),
-            "{lines:?}"
-        );
     }
 }

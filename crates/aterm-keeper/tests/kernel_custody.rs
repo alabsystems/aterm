@@ -42,6 +42,17 @@
 //! * A DEAD PEER HOLDS NOTHING: a window quits while another has died but is
 //!   not yet judged (unreaped, its connection still open); the holder scan
 //!   reads the dead one as holding nothing, and the quit hangs its shell up.
+//! * THE CRASH-RESTORE REGION (the crash-restore plan §7.3): a window that
+//!   journals registers its master and the read-only descriptor of a real
+//!   shared-memory region it writes through the real journal writer, then dies
+//!   by its own SIGKILL (`kill_self_now`); the next window that journals is
+//!   offered the master and the region, maps it read-only, recovers, and its
+//!   screen is exactly the oracle's. NEGATIVE CONTROLS: a window that
+//!   registered no region is offered none (the META rung); a restorer that
+//!   claims and dies before its COMPANION makes the next offer say
+//!   `attempts=1`, which restores the keyframe alone; a window whose HELLO does
+//!   not state CAP_JOURNAL gets no COMPANION_OFFER and its strict offer loop
+//!   succeeds; a writable custody descriptor is refused as no journal.
 //!
 //! Every wait is on a causal event — a status line, a kernel exit status, a
 //! line from a child — with a minute's hang detector, never a sleep. Every
@@ -307,7 +318,9 @@ fn marked_window_role(named: bool) -> ! {
             dir: logs.as_os_str().as_bytes().to_vec(),
         }
     });
-    let offers = client.hello_app_marked("test", named_ref).expect("hello");
+    let offers = client
+        .hello_app_marked("test", named_ref, false)
+        .expect("hello");
     assert!(offers.is_empty());
     let dup = master.try_clone().expect("dup for the keeper");
     client
@@ -368,6 +381,103 @@ fn next_window_role(bye: bool, adopt: bool) -> ! {
     }
     // Stream order: the BYE is read before the EOF our exit makes.
     std::process::exit(0)
+}
+
+/// A window of a build from before the crash-restore journal: its HELLO states no
+/// `CAP_JOURNAL`, and it reads what the keeper wrote frame by frame, as such a build's strict loop
+/// would, not through `hello_app` (which skips what a window that did not ask for a journal must
+/// never be sent, so a keeper that sent it would pass unseen). It reports how many OFFERs carried
+/// the journal's trailing fields, and how many frames came between its offers and the keeper's
+/// answer to its next request (a META for a master it does not claim, which is refused): a stray
+/// COMPANION_OFFER, written right behind its OFFER, would be one. Then, told to, it claims every
+/// master and reports it (so the test can see its claim close the region, §3.2 N5), and told
+/// again, says BYE and exits 0.
+fn old_window_role() -> ! {
+    use aterm_keeper::wire::{CAP_SENDS_BYE, PROTO, PeerClass};
+    let socket = PathBuf::from(std::env::var(SOCK).expect("socket"));
+    let client = KeeperClient::connect(&socket, &Identity::same_uid(), HANG).expect("connect");
+    let hello = Frame::Hello {
+        proto: PROTO,
+        class: PeerClass::App,
+        caps: CAP_SENDS_BYE,
+        build: "pre-journal".into(),
+        marker: None,
+    };
+    client.send(&hello, None).expect("hello");
+    let next = || client.recv().expect("a frame").expect("not EOF");
+    let n = match next().frame {
+        Frame::Welcome { offers, .. } => offers,
+        other => panic!("expected WELCOME, got {other:?}"),
+    };
+    let mut offers = Vec::new();
+    let mut trailers = 0;
+    for _ in 0..n {
+        match next() {
+            aterm_keeper::frameio::Incoming {
+                frame:
+                    Frame::Offer {
+                        header,
+                        tag,
+                        journal,
+                        ..
+                    },
+                fd: Some(master),
+            } => {
+                trailers += usize::from(journal.is_some());
+                offers.push((master, header, tag));
+            }
+            other => panic!("expected an OFFER with its master, got {:?}", other.frame),
+        }
+    }
+    client
+        .send(
+            &Frame::Meta {
+                rdev: 0,
+                meta: Vec::new(),
+            },
+            None,
+        )
+        .expect("the probe");
+    let mut strays = Vec::new();
+    loop {
+        match next().frame {
+            Frame::Refused { rdev: 0, .. } => break,
+            other => strays.push(format!("{other:?}")),
+        }
+    }
+    let rdevs: Vec<String> = offers.iter().map(|(_, h, _)| h.rdev.to_string()).collect();
+    // One report (each replaces the last): the frames themselves ride along only when there are
+    // strays, so the test's comparison shows them.
+    let mut line = format!(
+        "offers={} trailers={trailers} strays={} rdevs={}",
+        offers.len(),
+        strays.len(),
+        rdevs.join(",")
+    );
+    if !strays.is_empty() {
+        line.push_str(&format!(" stray=[{}]", strays.join(" | ")));
+    }
+    report(&line);
+    await_said("claim");
+    for (master, header, tag) in &offers {
+        client
+            .register(master, *header, tag.clone())
+            .expect("claim");
+    }
+    report("claimed");
+    await_said("quit");
+    client.send(&Frame::Bye, None).expect("bye");
+    std::process::exit(0)
+}
+
+/// Wait until the test says exactly `what` (a role told several things in turn; a hang detector
+/// bounds it).
+fn await_said(what: &str) {
+    let go = PathBuf::from(std::env::var(TALK).expect("talk")).with_extension("go");
+    within(HANG, Duration::from_millis(5), || {
+        (std::fs::read_to_string(&go).ok()? == what).then_some(())
+    })
+    .unwrap_or_else(|| panic!("never told {what:?}"));
 }
 
 /// A recovering window that could not place what it was offered: HELLO, drop
@@ -526,6 +636,11 @@ fn dispatch_role() {
         Some("unplaced-window") => unplaced_window_role(),
         Some("outgoing-window") => outgoing_window_role(),
         Some("quiet-successor") => quiet_successor_role(),
+        Some("journal-window") => journal_window_role(Journaled::Region),
+        Some("journal-window-bare") => journal_window_role(Journaled::Nothing),
+        Some("journal-window-writable") => journal_window_role(Journaled::Writable),
+        Some("journal-next-window") => journal_next_window_role(),
+        Some("old-window") => old_window_role(),
         _ => {}
     }
 }
@@ -692,6 +807,18 @@ impl Scratch {
         hit.unwrap_or_else(|| panic!("never {what}:\n{last}"))
     }
 }
+
+/// The crash-restore regions the keeper process really holds: the sizes of its POSIX shared
+/// memory descriptors, read from the kernel's table of the keeper (named by its status's `pid=`),
+/// never from what its status says it holds. The loop closes a descriptor before it answers the
+/// next status, so a status that shows the change already has the table to match.
+fn keeper_regions(s: &Scratch) -> Vec<u64> {
+    let pid = u32::try_from(field(&s.status(), "pid")).expect("a pid");
+    aterm_uds::holders::pshm_sizes_of(pid).expect("the keeper's descriptor table")
+}
+
+/// A journal region's size, as [`keeper_regions`] lists it.
+const REGION: u64 = aterm_restore::REGION_LEN as u64;
 
 fn field(line: &str, key: &str) -> u64 {
     line.split_whitespace()
@@ -1331,4 +1458,471 @@ fn a_status_client_reads_the_keeper() {
     ] {
         assert!(st.contains(want), "{want:?} in\n{st}");
     }
+}
+
+// ------------------------------------------------- the crash-restore region
+
+/// The journaled session's screen: small, so the oracle's text is readable in a failure.
+const JOURNAL_ROWS: u16 = 12;
+const JOURNAL_COLS: u16 = 48;
+/// The engine config fingerprint both the writer and the restorer run under.
+const JOURNAL_CONFIG: u64 = 0x0a7e_c0de;
+/// The slice of [`journal_output`] at which the window takes its second keyframe: what comes
+/// after it lives only in the region's tail, so an exact restore must replay it, and a restore
+/// of the keyframe alone shows the screen as of here.
+const KEYFRAMED: usize = 20;
+
+/// What the dead window's session printed, slice by slice: colour, wide UTF-8, and more lines
+/// than the screen holds.
+fn journal_output() -> Vec<Vec<u8>> {
+    let mut out: Vec<Vec<u8>> = (0..40)
+        .map(|i| format!("\x1b[3{}mline {i:03} of the dead window\x1b[0m\r\n", i % 8).into_bytes())
+        .collect();
+    out.push("$ \u{2713} last words \u{4e16}\u{754c}".as_bytes().to_vec());
+    out
+}
+
+/// The oracle: the screen text an engine shows after `slices`.
+fn journal_screen(slices: &[Vec<u8>]) -> String {
+    let mut term = aterm_core::terminal::Terminal::new(JOURNAL_ROWS, JOURNAL_COLS);
+    for slice in slices {
+        term.process(slice);
+    }
+    term.visible_content()
+}
+
+/// What a journaling window registers beside its master.
+#[derive(Clone, Copy)]
+enum Journaled {
+    /// A region it writes the session into.
+    Region,
+    /// Nothing: its claim stays unsettled.
+    Nothing,
+    /// A region whose custody descriptor is open for writing, which the keeper refuses (§3.2
+    /// N8), and then a proper one.
+    Writable,
+}
+
+/// Write a keyframe of `term` through `writer`.
+fn journal_keyframe(
+    writer: &mut aterm_restore::JournalWriter<aterm_uds::shm::Region>,
+    term: &aterm_core::terminal::Terminal,
+) {
+    let checkpoint = term.checkpoint_journal(16).expect("a keyframe at ground");
+    writer
+        .write_keyframe(&aterm_restore::KeyframeInput {
+            checkpoint: &checkpoint,
+            fence: term.history_fence(),
+            resize_lifetime: term.resize_lifetime(),
+            resize_ordinal: term.resize_ordinal(),
+            bridge_lines: 16,
+            config_fp: JOURNAL_CONFIG,
+            integration_on: term.shell_integration_posture()
+                == aterm_core::terminal::ShellIntegrationPosture::On,
+        })
+        .expect("the keyframe");
+}
+
+/// A window that JOURNALS: its HELLO states CAP_JOURNAL, it registers a PTY's master with a
+/// leader, then (per `journaled`) the region it journaled the session into. Told "die", it dies
+/// by its own SIGKILL, mid-life, as a crash does; told anything else, it says BYE and exits 0.
+fn journal_window_role(journaled: Journaled) -> ! {
+    use aterm_keeper::wire::RefuseCode;
+    let socket = PathBuf::from(std::env::var(SOCK).expect("socket"));
+    let (master, leader) = pty_with_leader();
+    let rdev = rdev_of(&master);
+    let birth = born(leader.id());
+    let client = KeeperClient::connect(&socket, &Identity::same_uid(), HANG).expect("connect");
+    let offers = client.hello_app_marked("test", None, true).expect("hello");
+    assert!(offers.is_empty(), "a fresh window is offered nothing");
+    assert!(client.keeper_journals(), "the keeper says it takes regions");
+    let dup = master.try_clone().expect("dup for the keeper");
+    client
+        .register(
+            &dup,
+            MasterHeader {
+                rdev,
+                shell_pid: leader.id(),
+                shell_birth: birth,
+                local_id: 1,
+            },
+            b"sid=s-test".to_vec(),
+        )
+        .expect("register");
+    drop(dup);
+    let len = aterm_restore::REGION_LEN;
+    let mut line = format!("leader={} rdev={rdev}", leader.id());
+    // Kept alive until the death: the window's own mapping and descriptors die with it.
+    let mut kept = Vec::new();
+    let mut writer = None;
+    match journaled {
+        Journaled::Region => {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "a test playing the window makes the region the keeper is sent"
+            )]
+            // SAFETY: only this fixture's JournalWriter changes the object; the keeper
+            // only holds/queries custody. Restorers map it only after the parent reaps this
+            // writer process; no participant reopens custody for writes or resizing.
+            let (region, custody) =
+                unsafe { aterm_uds::shm::Region::create(len) }.expect("a region");
+            let mut journal = aterm_restore::JournalWriter::create(
+                region,
+                aterm_restore::Geometry::v1(),
+                &aterm_restore::WriterIdentity {
+                    pid: std::process::id(),
+                    birth_us: 0,
+                    local_id: 1,
+                    build: 0,
+                    sid: "s-test",
+                },
+            )
+            .expect("the journal");
+            let mut term = aterm_core::terminal::Terminal::new(JOURNAL_ROWS, JOURNAL_COLS);
+            journal_keyframe(&mut journal, &term);
+            let mut gathered = 0u64;
+            for (i, slice) in journal_output().iter().enumerate() {
+                if i == KEYFRAMED {
+                    journal_keyframe(&mut journal, &term);
+                }
+                gathered += slice.len() as u64;
+                journal.set_gathered(gathered).expect("gathered");
+                term.process(slice);
+                journal.append_slice(slice).expect("appended");
+            }
+            client
+                .companion(rdev, &custody, len as u64)
+                .expect("the companion");
+            kept.push(custody);
+            writer = Some(journal);
+        }
+        Journaled::Nothing => {}
+        Journaled::Writable => {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "a test playing the window makes the region the keeper is sent"
+            )]
+            // SAFETY: this fixture keeper checks metadata and refuses the writable
+            // descriptor before any mapping; no writer uses it or its aliases. The local
+            // mapping remains inert until both local owners are dropped below.
+            let (region, writable) =
+                unsafe { aterm_uds::shm::testing::create_with_writable_custody(len) }
+                    .expect("a twin");
+            client
+                .companion(rdev, &writable, len as u64)
+                .expect("the writable companion");
+            let answer = client.recv().expect("the keeper answers").map(|i| i.frame);
+            match answer {
+                Some(Frame::Refused { code, rdev: of }) if of == rdev => {
+                    line.push_str(&format!(" refused={code:?}"));
+                    assert_eq!(code, RefuseCode::NotAJournal);
+                }
+                other => panic!("expected the refusal, got {other:?}"),
+            }
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "a test playing the window makes the region the keeper is sent"
+            )]
+            // SAFETY: the fixture keeper only holds/queries this custody; the local
+            // mapping is inert and dropped below. No participant writes or resizes aliases.
+            let (proper, custody) =
+                unsafe { aterm_uds::shm::Region::create(len) }.expect("a region");
+            client
+                .companion(rdev, &custody, len as u64)
+                .expect("the companion");
+            drop((region, writable, proper));
+            kept.push(custody);
+        }
+    }
+    report(&line);
+    std::mem::forget(leader);
+    match await_go().as_str() {
+        "die" => aterm_uds::process::kill_self_now(),
+        _ => client.send(&Frame::Bye, None).expect("bye"),
+    }
+    drop((writer, kept, master));
+    std::process::exit(0)
+}
+
+/// The next window that JOURNALS: HELLO stating CAP_JOURNAL, then for each offer report whether
+/// a region came, the brake, and what the region restores (`restore=exact|screen|meta`), the
+/// restored screen written to `<talk>.screen`. Told "die-claimed", it claims every master and
+/// dies by its own SIGKILL before any COMPANION (a restorer the region killed); told anything
+/// else, it claims every master, says it has no region of its own (COMPANION_RELEASE), says BYE
+/// and exits 0.
+fn journal_next_window_role() -> ! {
+    use std::os::fd::AsFd as _;
+    let socket = PathBuf::from(std::env::var(SOCK).expect("socket"));
+    let talk = PathBuf::from(std::env::var(TALK).expect("talk"));
+    let client = KeeperClient::connect(&socket, &Identity::same_uid(), HANG).expect("connect");
+    let offers = client.hello_app_marked("test", None, true).expect("hello");
+    let mut line = format!("offers={}", offers.len());
+    for o in &offers {
+        assert_eq!(rdev_of(&o.master), o.header.rdev, "the offered master");
+        line.push_str(&format!(
+            " companions={} attempts={}",
+            u8::from(o.companion.is_some()),
+            o.attempts
+        ));
+        let Some(c) = &o.companion else {
+            line.push_str(" restore=meta");
+            continue;
+        };
+        let len = usize::try_from(c.len).expect("a region length");
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a test playing the restoring window maps the region the keeper offered"
+        )]
+        // SAFETY: every fixture starts this role only after journal_window_dies has reaped
+        // the publishing process. Only read-only custody survives, held here throughout
+        // recovery; no surviving writer or resizing descriptor can alter the private object.
+        let region = unsafe { aterm_uds::shm::Region::map_readonly(c.region.as_fd(), len) }
+            .expect("mapped read-only");
+        let policy = aterm_restore::RecoverPolicy {
+            tail: o.attempts == 0,
+            config_fp: JOURNAL_CONFIG,
+            scratch_nonce: [0xA5; 32],
+        };
+        match aterm_restore::recover(&region, policy, aterm_core::terminal::Terminal::new) {
+            aterm_restore::Recovery::Restored(r) => {
+                let screen = aterm_core::terminal::Terminal::from_checkpoint(&r.checkpoint)
+                    .visible_content();
+                std::fs::write(talk.with_extension("screen"), screen).expect("the screen");
+                line.push_str(if r.exact {
+                    " restore=exact"
+                } else {
+                    " restore=screen"
+                });
+            }
+            aterm_restore::Recovery::Meta(why) => line.push_str(&format!(" restore=meta({why:?})")),
+        }
+    }
+    report(&line);
+    let then = await_go();
+    for o in &offers {
+        client
+            .register(&o.master, o.header, o.tag.clone())
+            .expect("claim");
+    }
+    if then == "die-claimed" {
+        aterm_uds::process::kill_self_now();
+    }
+    for o in &offers {
+        client
+            .companion_release(o.header.rdev)
+            .expect("no region of its own");
+    }
+    client.send(&Frame::Bye, None).expect("bye");
+    std::process::exit(0)
+}
+
+/// Whether a role's end was its own SIGKILL.
+fn killed(status: std::process::ExitStatus) -> bool {
+    use std::os::unix::process::ExitStatusExt as _;
+    status.signal() == Some(9)
+}
+
+/// The journaling window `w` is told to die, dies by SIGKILL, and its master is orphaned.
+fn journal_window_dies(s: &mut Scratch, w: usize) {
+    s.say(w, "die");
+    let ended = s.kids[w].wait().expect("its status");
+    assert!(killed(ended), "the window died by SIGKILL: {ended}");
+    s.await_status("orphaned", |t| {
+        t.contains("orphaned=1") || t.contains("state=launching")
+    });
+}
+
+/// A journaling window starts and registers, its custody shown in the status as `journals`:
+/// the role's index, its leader and its rdev.
+fn journal_window(s: &mut Scratch, test: &str, role: &str, journals: &str) -> (usize, u32, u64) {
+    let w = s.spawn(test, role, &[]);
+    let reg = s.line(w, "leader=");
+    let (leader, rdev) = (field(&reg, "leader") as u32, field(&reg, "rdev"));
+    s.pids.push(leader);
+    s.await_status("registered", |t| {
+        t.contains("claimed=1") && t.contains(journals)
+    });
+    (w, leader, rdev)
+}
+
+const T_JOURNAL: &str = "a_killed_window_s_region_restores_its_exact_screen";
+
+/// THE LANE: the region a SIGKILLed window journaled into is offered with its master, and the
+/// next window restores exactly the screen the dead one showed, its tail replayed; the region
+/// closes with the master when that window quits. What the keeper holds is read from the keeper
+/// process's descriptor table at each step, not from its status.
+#[test]
+fn a_killed_window_s_region_restores_its_exact_screen() {
+    dispatch_role();
+    let mut s = Scratch::new("journal");
+    s.keeper(T_JOURNAL, false);
+    let (w, leader, _) = journal_window(
+        &mut s,
+        T_JOURNAL,
+        "journal-window",
+        "journals=1 virtual_mib=8",
+    );
+    assert_eq!(keeper_regions(&s), [REGION], "the keeper holds the region");
+    let leader_watch = ExitWatch::watch(leader).expect("watch the leader");
+    journal_window_dies(&mut s, w);
+    assert_eq!(
+        keeper_regions(&s),
+        [REGION],
+        "the dead window's region outlives it"
+    );
+    let next = s.spawn(T_JOURNAL, "journal-next-window", &[]);
+    assert_eq!(
+        s.line(next, "offers="),
+        "offers=1 companions=1 attempts=0 restore=exact"
+    );
+    let screen = std::fs::read_to_string(s.dir.join(format!("kid-{next}.screen")))
+        .expect("the restored screen");
+    assert_eq!(
+        screen,
+        journal_screen(&journal_output()),
+        "the dead window's screen"
+    );
+    assert_eq!(leader_watch.exit_status(), None, "the leader lives");
+    s.say(next, "quit");
+    let ended = s.kids[next].wait().expect("its status");
+    assert!(ended.success(), "it quit: {ended}");
+    assert_eq!(await_exit(&leader_watch), 1, "the quit hung the shell up");
+    let st = s.await_status("closed", |t| t.contains("masters=0"));
+    assert!(
+        st.contains("journals=0 virtual_mib=0"),
+        "the region closed:\n{st}"
+    );
+    assert_eq!(keeper_regions(&s), [], "and its descriptor with it");
+}
+
+const T_JOURNAL_BARE: &str = "a_window_that_registered_no_region_is_offered_none";
+
+/// NEGATIVE CONTROL: a window that journals but registered no region dies; the next window is
+/// offered the master with no region, the META rung (and the unsettled claim's death counts an
+/// attempt, as the model's `ReaderDies` does).
+#[test]
+fn a_window_that_registered_no_region_is_offered_none() {
+    dispatch_role();
+    let mut s = Scratch::new("journal-bare");
+    s.keeper(T_JOURNAL_BARE, false);
+    let (w, _, _) = journal_window(&mut s, T_JOURNAL_BARE, "journal-window-bare", "journals=0");
+    assert_eq!(keeper_regions(&s), [], "nothing was sent");
+    journal_window_dies(&mut s, w);
+    let next = s.spawn(T_JOURNAL_BARE, "journal-next-window", &[]);
+    assert_eq!(
+        s.line(next, "offers="),
+        "offers=1 companions=0 attempts=1 restore=meta"
+    );
+    s.say(next, "quit");
+    let _ = s.kids[next].wait();
+    s.await_status("closed", |t| t.contains("masters=0"));
+}
+
+const T_JOURNAL_POISON: &str = "a_restorer_that_dies_before_its_companion_costs_an_attempt";
+
+/// NEGATIVE CONTROL: the first restorer claims the master and dies before its COMPANION (as a
+/// window whose replay killed it would); the keeper's next offer says `attempts=1`, and the
+/// region then restores its keyframe alone: the screen as of the keyframe, never called exact.
+#[test]
+fn a_restorer_that_dies_before_its_companion_costs_an_attempt() {
+    dispatch_role();
+    let mut s = Scratch::new("journal-poison");
+    s.keeper(T_JOURNAL_POISON, false);
+    let (w, _, _) = journal_window(&mut s, T_JOURNAL_POISON, "journal-window", "journals=1");
+    journal_window_dies(&mut s, w);
+    let first = s.spawn(T_JOURNAL_POISON, "journal-next-window", &[]);
+    assert_eq!(
+        s.line(first, "offers="),
+        "offers=1 companions=1 attempts=0 restore=exact"
+    );
+    s.say(first, "die-claimed");
+    let ended = s.kids[first].wait().expect("its status");
+    assert!(killed(ended), "the restorer died by SIGKILL: {ended}");
+    s.await_status("orphaned again", |t| t.contains("orphaned=1"));
+    assert_eq!(
+        keeper_regions(&s),
+        [REGION],
+        "the region is kept for one more try"
+    );
+    let second = s.spawn(T_JOURNAL_POISON, "journal-next-window", &[]);
+    assert_eq!(
+        s.line(second, "offers="),
+        "offers=1 companions=1 attempts=1 restore=screen"
+    );
+    let screen = std::fs::read_to_string(s.dir.join(format!("kid-{second}.screen")))
+        .expect("the restored screen");
+    assert_eq!(
+        screen,
+        journal_screen(&journal_output()[..KEYFRAMED]),
+        "the keyframe alone"
+    );
+    s.say(second, "quit");
+    let _ = s.kids[second].wait();
+    s.await_status("closed", |t| t.contains("masters=0"));
+    assert_eq!(keeper_regions(&s), [], "closed with the master");
+}
+
+const T_JOURNAL_OLD: &str = "a_window_that_does_not_journal_is_offered_the_master_alone";
+
+/// NEGATIVE CONTROL (§3.2 J2, N5): a window of a build from before the journal (its HELLO states
+/// no CAP_JOURNAL) reads, frame by frame, an OFFER of the master with no trailing fields and
+/// nothing between its offers and the keeper's next answer: no COMPANION_OFFER (`old-window`
+/// does not use `hello_app`, which would skip both unseen). The keeper meanwhile keeps the region
+/// for a window that journals; the old window's claim closes it, which the keeper process's own
+/// descriptor table shows while the master is still claimed, and its quit closes the master.
+#[test]
+fn a_window_that_does_not_journal_is_offered_the_master_alone() {
+    dispatch_role();
+    let mut s = Scratch::new("journal-old");
+    s.keeper(T_JOURNAL_OLD, false);
+    let (w, _, rdev) = journal_window(&mut s, T_JOURNAL_OLD, "journal-window", "journals=1");
+    journal_window_dies(&mut s, w);
+    let old = s.spawn(T_JOURNAL_OLD, "old-window", &[]);
+    assert_eq!(
+        s.line(old, "offers="),
+        format!("offers=1 trailers=0 strays=0 rdevs={rdev}")
+    );
+    assert_eq!(
+        keeper_regions(&s),
+        [REGION],
+        "the region is kept for a window that journals"
+    );
+    s.say(old, "claim");
+    let st = s.await_status("the old window's claim", |t| t.contains("claimed=1"));
+    assert!(st.contains("journals=0"), "{st}");
+    assert_eq!(keeper_regions(&s), [], "its claim closed the region (N5)");
+    s.say(old, "quit");
+    let ended = s.kids[old].wait().expect("its status");
+    assert!(ended.success(), "its quit succeeded: {ended}");
+    s.await_status("closed", |t| t.contains("masters=0"));
+}
+
+const T_JOURNAL_WRITABLE: &str = "a_writable_custody_descriptor_is_refused";
+
+/// NEGATIVE CONTROL (§3.2 N8): a custody descriptor open for writing is refused as no journal
+/// (any window offered it could map the dead window's words writable); the read-only one the
+/// same window sends next is held, and only it, as the keeper's descriptor table shows.
+#[test]
+fn a_writable_custody_descriptor_is_refused() {
+    dispatch_role();
+    let mut s = Scratch::new("journal-writable");
+    s.keeper(T_JOURNAL_WRITABLE, false);
+    let w = s.spawn(T_JOURNAL_WRITABLE, "journal-window-writable", &[]);
+    let reg = s.line(w, "leader=");
+    s.pids.push(field(&reg, "leader") as u32);
+    assert!(reg.ends_with("refused=NotAJournal"), "{reg}");
+    s.await_status("only the read-only region held", |t| {
+        t.contains("claimed=1") && t.contains("journals=1 virtual_mib=8")
+    });
+    assert_eq!(
+        keeper_regions(&s),
+        [REGION],
+        "the writable one was not kept"
+    );
+    s.say(w, "quit");
+    let _ = s.kids[w].wait();
+    s.await_status("closed", |t| {
+        t.contains("masters=0") && t.contains("journals=0")
+    });
+    assert_eq!(keeper_regions(&s), [], "closed with the master");
 }

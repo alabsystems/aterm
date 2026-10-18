@@ -375,7 +375,9 @@ fn update(
     if std::fs::read(&path).is_ok_and(|have| have == text) {
         return Ok(());
     }
-    durable::write_durable(&path, &text)
+    // Ordered: a lost stamp costs one GET; `high_water` binds only above the installed
+    // version, and `decide` refuses heads older than the installed build.
+    durable::write_ordered(&path, &text)
 }
 
 /// A header value we will send back verbatim: 1–256 bytes of printable ASCII.
@@ -441,6 +443,9 @@ mod tests {
     fn each_writer_changes_only_its_own_fields() {
         let l = layout("fields");
         assert_eq!(ProgramStamp::read(&l, "claude"), None);
+        // aterm-durable's counting seam: the stamp is only ordered, its temporary and
+        // its directory entry (a lost stamp costs one GET).
+        let recording = aterm_durable::seam::Recording::start();
         ProgramStamp::record_check(
             &l,
             "claude",
@@ -449,6 +454,23 @@ mod tests {
             Some("\"5f2c\""),
         )
         .unwrap();
+        let flushes = recording.take();
+        #[cfg(unix)]
+        assert_eq!(
+            flushes,
+            [aterm_durable::Flush::Ordered, aterm_durable::Flush::Ordered],
+            "the stamp, file and entry"
+        );
+        #[cfg(not(unix))]
+        assert!(
+            matches!(
+                flushes.as_slice(),
+                [aterm_durable::Flush::Ordered]
+                    | [aterm_durable::Flush::Ordered, aterm_durable::Flush::Ordered]
+            ),
+            "the ordered file is required; the directory flush is best-effort: {flushes:?}"
+        );
+        drop(recording);
         ProgramStamp::record_outcome(&l, "claude", "installed 2.1.281", Some(v("2.1.281")))
             .unwrap();
         let expected = ProgramStamp {

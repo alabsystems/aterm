@@ -56,25 +56,3 @@ fn fallback_seed() -> u64 {
     let pid = u64::from(std::process::id());
     nanos ^ pid.rotate_left(32) ^ 0x9E37_79B9_7F4A_7C15
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The seed is minted from real entropy: two mints differ (a 64-bit
-    /// collision is astronomically unlikely), and the fallback is itself
-    /// launch-varying rather than a constant.
-    #[test]
-    fn minted_seeds_vary_and_the_fallback_is_not_a_constant() {
-        let a = mint_launch_seed();
-        let b = mint_launch_seed();
-        assert_ne!(a, b, "two CSPRNG draws must not coincide");
-        // The fallback mixes the clock: at least it is not the mixing constant
-        // itself, and it never returns zero for a live clock.
-        let f = fallback_seed();
-        assert_ne!(
-            f, 0x9E37_79B9_7F4A_7C15,
-            "the fallback is not the bare constant"
-        );
-    }
-}

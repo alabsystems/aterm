@@ -284,19 +284,6 @@ mod a2 {
         h.verdict(m, last)
     }
 
-    fn vim_dup_below_then_s() -> Outcome {
-        let mut h = Host::at_row(3);
-        h.program(b"\x1b[1;1Hfn f() {\x1b[2;1H    let a = 1;\x1b[3;1H    \x1b[4;1H}\x1b[5;1H~\x1b[6;1H~\x1b[3;5H");
-        h.type_groups("let total = 0;", &[1], 0, "");
-        h.idle(64);
-        h.program(b"\x1b[3;18H");
-        h.program(b"\x1b[4;1H\x1b[L    let total = 0;\x1b[4;5H");
-        h.idle(32);
-        h.program(b"\x1b[3;5H\x1b[K");
-        // This case counts `followed` from the start (f0 = 0).
-        h.verdict((0, 0), 3)
-    }
-
     fn scroll_and_erase(groups: &[usize]) -> Outcome {
         let cmd = "git status";
         let last = (ROWS - 1) as u16;
@@ -371,18 +358,6 @@ mod a2 {
         h.term.process(format!("\r\x1b[2C\x1b[Ks{list}").as_bytes());
         h.frame();
         h.verdict(m, 19)
-    }
-
-    fn pre1_vim_yyp_then_s() -> Outcome {
-        let mut h = Host::at_row(3);
-        h.program(b"\x1b[1;1Hfn f() {\x1b[2;1H    let a = 1;\x1b[3;1H    \x1b[4;1H}\x1b[5;1H~\x1b[6;1H~\x1b[3;5H");
-        h.type_groups("let total = 0;", &[1], 0, "");
-        h.idle(64);
-        let m = h.counts();
-        h.program(b"\x1b[4;1H\x1b[L    let total = 0;\x1b[4;5H");
-        h.idle(32);
-        h.program(b"\x1b[3;5H\x1b[K");
-        h.verdict(m, 3)
     }
 
     fn ce1d_first_item_shares_only_the_directory() -> Outcome {
@@ -518,12 +493,6 @@ mod a2 {
                 move || bottom_edge_then_scroll(variant),
             );
         }
-        case(
-            v,
-            "a2.f4b.vim_dup_below_esc_then_s",
-            FF,
-            vim_dup_below_then_s,
-        );
         for groups in [vec![1usize], vec![2]] {
             let g = groups.clone();
             case(
@@ -558,7 +527,6 @@ mod a2 {
             FF,
             ce2_fzf_info_line_ssh_batch,
         );
-        case(v, "a2.pre1.vim_yyp_then_s", FF, pre1_vim_yyp_then_s);
         case(
             v,
             "a2.ce1d.fzf_first_item_shares_directory",
@@ -1121,10 +1089,10 @@ mod a3 {
 }
 
 // ===========================================================================
-// l3c: copies beside the line on a 24×80 grid: fzf's late list, a completion
-// popup, a twin drawn after the first keys, vim's `yyp`, a streamed quote, a
-// scroll's copy on the new last row, and the limits a copy short of `TWIN_MIN`
-// sets. Host: the scroll seam, the alt re-baseline, the frame hold (caret row
+// l3c: copies beside the line on a 24×80 grid: a completion popup, a twin
+// drawn after the first keys, a scroll's copy on the new last row, and the
+// limits a copy short of `TWIN_MIN` sets. (fzf's late list, vim's `yyp` and a
+// streamed quote at both pacings are `a3`'s.) Host: the scroll seam, the alt re-baseline, the frame hold (caret row
 // not re-read). Frames on the flat 16 ms train (`flat`) or at the GUI's pacing
 // once typing stops (`paced`). (The split pane's scrolled-in copy is
 // `tests/copy_beside_the_line.rs`'s.)
@@ -1242,62 +1210,6 @@ mod l3c {
         }
     }
 
-    fn fzf_list_lands_late(
-        paced: bool,
-        k0: usize,
-        reverse: bool,
-        redraw_after: Option<&str>,
-    ) -> Outcome {
-        let mut law = Law::default();
-        let q = "src/li";
-        let (query_row, item_row) = if reverse { (10u16, 11u16) } else { (21, 20) };
-        let mut h = Host::at_row(query_row, paced);
-        h.program(format!("\x1b[{};1H> ", query_row + 1).as_bytes());
-        let list = if reverse {
-            "\x1b7\x1b[12;1H> src/lib.rs\x1b[K\x1b[13;1H  src/main.rs\x1b[K\x1b[14;1H  tests/a.rs\x1b[K\x1b8"
-        } else {
-            "\x1b7\x1b[19;1H  tests/a.rs\x1b[K\x1b[20;1H  src/main.rs\x1b[K\x1b[21;1H> src/lib.rs\x1b[K\x1b8"
-        };
-        h.type_str(&q[..k0]);
-        h.program(list.as_bytes());
-        h.type_with(&q[k0..], list);
-        h.idle(64);
-        law.eq(
-            h.live(query_row),
-            (2..8).collect::<Vec<u16>>(),
-            "fixture: the band is under the query",
-        );
-        let m = h.counts();
-        let after = redraw_after.unwrap_or(list);
-        h.kill(format!("\r\x1b[2C\x1b[K{after}").as_bytes());
-        h.verdict(&mut law, m, item_row, "the query went nowhere");
-        law.done()
-    }
-
-    fn fzf_best_match_two_up_remote(paced: bool) -> Outcome {
-        let mut law = Law::default();
-        let q = "src/li";
-        let mut h = Host::at_row(21, paced);
-        h.program(b"\x1b[22;1H> ");
-        let list = "\x1b7\x1b[18;1H  tests/a.rs\x1b[K\x1b[19;1H  src/main.rs\x1b[K\x1b[20;1H> src/lib.rs\x1b[K\x1b[21;1H  3/3\x1b[K\x1b8";
-        h.type_str(&q[..2]);
-        h.program(list.as_bytes());
-        h.type_with(&q[2..], list);
-        h.idle(64);
-        law.eq(h.live(21), (2..8).collect::<Vec<u16>>(), "fixture");
-        let m = h.counts();
-        h.now += Duration::from_millis(90);
-        let t_kill = h.now;
-        h.glow.note_kill(t_kill, true);
-        h.glow
-            .note_typed_cells(t_kill + Duration::from_millis(60), 1);
-        h.now = t_kill + Duration::from_millis(120);
-        h.term.process(format!("\r\x1b[2C\x1b[Ks{list}").as_bytes());
-        h.frame();
-        h.verdict(&mut law, m, 19, "Ctrl-U and `s` in one batch");
-        law.done()
-    }
-
     fn completion_popup_ctrl_w(paced: bool) -> Outcome {
         let mut law = Law::default();
         let word = "println";
@@ -1328,50 +1240,6 @@ mod l3c {
         let m = h.counts();
         h.program(b"\r$ \x1b[K");
         h.verdict(&mut law, m, 4, "the redraw's erase");
-        law.done()
-    }
-
-    fn vim_yyp_then_s(paced: bool) -> Outcome {
-        let mut law = Law::default();
-        let mut h = Host::at_row(3, paced);
-        h.program(
-            b"\x1b[1;1Hfn f() {\x1b[2;1H    let a = 1;\x1b[3;1H    \x1b[4;1H}\x1b[5;1H~\x1b[6;1H~\x1b[3;5H",
-        );
-        h.type_str("let total = 0;");
-        h.idle(64);
-        law.eq(h.live(2), (4..18).collect::<Vec<u16>>(), "fixture");
-        let m = h.counts();
-        h.program(b"\x1b[3;18H");
-        h.program(b"\x1b[4;1H\x1b[L    let total = 0;\x1b[4;5H");
-        h.idle(32);
-        h.program(b"\x1b[3;5H\x1b[K");
-        h.verdict(&mut law, m, 3, "`S` on the original");
-        law.done()
-    }
-
-    fn streamed_quote(paced: bool, gap: u16) -> Outcome {
-        let mut law = Law::default();
-        let text = "please fix the tests";
-        let mut h = Host::at_row(20, paced);
-        let top = 20 - gap;
-        h.program(b"\x1b[21;1H> ");
-        let stream = |i: usize| {
-            format!(
-                "\x1b7\x1b[{};1H\x1b[2K  thinking {}\x1b8",
-                top + 1,
-                ".".repeat(i % 7)
-            )
-        };
-        for (i, ch) in text.chars().enumerate() {
-            h.type_with(&ch.to_string(), &stream(i));
-        }
-        h.program(stream(text.len()).as_bytes());
-        law.eq(h.live(20), (2..22).collect::<Vec<u16>>(), "fixture");
-        h.program(format!("\x1b7\x1b[{};1H\x1b[2K  {text}\x1b8", top + 1).as_bytes());
-        h.idle(90);
-        let m = h.counts();
-        h.kill(b"\r\x1b[2C\x1b[K");
-        h.verdict(&mut law, m, top, "the quote, then Ctrl-U");
         law.done()
     }
 
@@ -1448,32 +1316,6 @@ mod l3c {
     pub fn cases(v: &mut Vec<Case>) {
         for paced in [false, true] {
             let p = if paced { "paced" } else { "flat" };
-            for (k0, reverse) in [(2usize, false), (2, true), (3, false), (3, true)] {
-                case(
-                    v,
-                    format!(
-                        "L3.copy.fzf_list_lands_after_first_keys/k{k0}/rev{}/{p}",
-                        u8::from(reverse)
-                    ),
-                    FF,
-                    move || fzf_list_lands_late(paced, k0, reverse, None),
-                );
-            }
-            case(
-                v,
-                format!("L3.copy.fzf_list_resorted_as_query_cleared/{p}"),
-                FF,
-                move || {
-                    let full = "\x1b7\x1b[19;1H  tests/a.rs\x1b[K\x1b[20;1H  src/lib.rs\x1b[K\x1b[21;1H> src/main.rs\x1b[K\x1b8";
-                    fzf_list_lands_late(paced, 2, false, Some(full))
-                },
-            );
-            case(
-                v,
-                format!("L3.copy.fzf_best_match_two_up_remote_link/{p}"),
-                FF,
-                move || fzf_best_match_two_up_remote(paced),
-            );
             case(
                 v,
                 format!("L3.copy.completion_popup_then_ctrl_w/{p}"),
@@ -1486,17 +1328,6 @@ mod l3c {
                 FF,
                 move || copy_after_first_two_keys(paced),
             );
-            case(v, format!("L3.copy.vim_yyp_then_s/{p}"), FF, move || {
-                vim_yyp_then_s(paced)
-            });
-            for gap in [1u16, 2] {
-                case(
-                    v,
-                    format!("L3.copy.streamed_row_quotes_composer/gap{gap}/{p}"),
-                    FF,
-                    move || streamed_quote(paced, gap),
-                );
-            }
             case(
                 v,
                 format!("L3.copy.copy_on_new_last_row_by_scroll/{p}"),
@@ -1777,9 +1608,9 @@ fn a_full_row_budget_still_sees_the_twin() {
 }
 
 /// Scrolls, band moves and alt screens: a bottom-row line, then a scroll writing
-/// a job notice and a copy on the new last row (`v0`); vim's duplicate-below
-/// (`yyp`, `:t.`) then `S` on the original; a scroll and erase on one frame; an
-/// alt-screen round trip. A band move leaves the row it opens beside a line not
+/// a job notice and a copy on the new last row (`v0`); a scroll and erase on one
+/// frame; an alt-screen round trip. (vim's duplicate-below is
+/// [`vim_s_yyp_then_s_at_every_pause_and_pacing`].) A band move leaves the row it opens beside a line not
 /// clear until a frame shows it (`Witness::translate_band`). Limit: `v1`, the
 /// line relocated onto a new last row in the batch that erases it, is glyph for
 /// glyph a move (`L3.copy.limit_one_frame_copy_is_a_move/scroll_batch/*`).
@@ -1787,11 +1618,7 @@ fn a_full_row_budget_still_sees_the_twin() {
 fn scrolls_band_moves_and_alt_screens_do_not_make_a_copy_an_arrival() {
     holds_but(
         all_cases(),
-        |id| {
-            ["a2.f4", "a2.f5.", "a2.pre1."]
-                .iter()
-                .any(|p| id.starts_with(p))
-        },
+        |id| ["a2.f4", "a2.f5."].iter().any(|p| id.starts_with(p)),
         |id| id == "a2.f4.bottom_edge_then_scroll/v1",
     );
 }
@@ -1933,13 +1760,10 @@ fn vim_s_yyp_then_s_at_every_pause_and_pacing() {
 
 /// A copy beside the line is not where the line went, on the flat 16 ms train
 /// and under the GUI's pacing once typing stops (16 ms only while a fade needs
-/// it, otherwise at the next deadline, 110–130 ms apart): fzf's list landing
-/// after the query's first keys (above or below the prompt), re-sorted as the
-/// query is cleared, its best match two rows up over a remote link; a
-/// completion popup opened after two keys, then Ctrl-W; a copy of the line
-/// drawn after its first two keys; vim's `yyp`, then `S`; a streamed row
-/// quoting the composer one or two rows up; a copy a scroll wrote on the new
-/// last row, dated from the last walk before the scroll
+/// it, otherwise at the next deadline, 110–130 ms apart): a completion popup
+/// opened after two keys, then Ctrl-W; a copy of the line drawn after its
+/// first two keys; a copy a scroll wrote on the new last row, dated from the
+/// last walk before the scroll
 /// (`Witness::translate`). A copy short of `TWIN_MIN` is a move on both
 /// (`limit_one_frame_copy_is_a_move`: a quote seen one frame before the erase
 /// is a torn repaint's new row; a copy written with the erase onto a row seen

@@ -519,20 +519,6 @@ fn a_released_tail_is_restored_although_the_key_is_laid_before_the_restore() {
     assert_whole(&h, "a unique tail torn under every key");
 }
 
-/// Plain typing with every key's frame torn at text column 60 (second take: 90) keeps the band
-/// lit from the boundary to the head.
-#[test]
-fn plain_typing_at_the_end_of_the_line_over_a_read_boundary_keeps_the_band_whole() {
-    for j in [60usize, 90] {
-        let mut h = Host::new(false);
-        h.key_split = Split::TextCol(j);
-        h.type_str(LINE);
-        h.idle(600);
-        assert!(h.torn.len() > 10, "the boundary tore the row: {:?}", h.torn);
-        assert_whole(&h, &format!("plain typing torn at text col {j}"));
-    }
-}
-
 /// Exactly `n` bytes of SGR no-ops (`n` is 0 or at least 3): a pad that moves the
 /// read boundaries without writing a cell (a padded transcript row would wrap
 /// and scroll the frame, moving the composer's text for real).

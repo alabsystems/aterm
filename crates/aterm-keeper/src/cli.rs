@@ -125,12 +125,11 @@ pub fn label_is_ours(label: &str, own: &str) -> bool {
 pub fn main_entry(args: Vec<OsString>, version: &str) -> ExitCode {
     let first = args.first().map(|a| a.to_string_lossy().into_owned());
     if matches!(first.as_deref(), None | Some("-h" | "--help" | "help")) {
-        print!("{USAGE}");
-        return if first.is_none() {
-            ExitCode::from(2)
-        } else {
-            ExitCode::SUCCESS
-        };
+        return aterm_uds::stdout::answer_exit(
+            "aterm keeper",
+            USAGE,
+            if first.is_none() { 2 } else { 0 },
+        );
     }
     // A runtime test, not a `cfg`, so the Unix verbs stay compiled (and
     // linted) on Linux, where launchd and code identity do not exist.

@@ -91,6 +91,14 @@ pub fn describe(quad: &VerifiedQuad, now_unix: i64) -> Vec<String> {
             None => out.push(format!(
                 "drift: [programs.{name}] is in the index but not a row of programs::PROGRAMS"
             )),
+            Some(def) if programs::alab_package(name).is_some() && block.repo != def.repo => {
+                out.push(format!(
+                    "[programs.{name}] names repo {:?}, not ALab's {:?}: carried as it stands, \
+                     and every client keeps {name} on its vendor lane, until `index --pin \
+                     {name}=<b>` names a verified {} pack",
+                    block.repo, def.repo, def.repo
+                ));
+            }
             Some(def) => {
                 let mut drift = Vec::new();
                 if block.repo != def.repo {

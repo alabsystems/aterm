@@ -15,7 +15,7 @@ use atpkg::sig::{Anchor, TrustedIndex};
 
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
-use crate::host::{HostError, Slug};
+use crate::host::{HostError, Probe, Slug};
 
 /// The four files of one quad, in the order a release carries them.
 pub const QUAD_FILES: [&str; 4] = [
@@ -178,6 +178,75 @@ pub fn head_number(releases: &[crate::host::Release]) -> Option<u64> {
         .max()
 }
 
+/// The channel head's number, `Ok(None)` when `slug` serves no published index. Listed
+/// through the host when this identity reads with a token; with none (a keyless builder,
+/// [`crate::host::ReleaseHost::reads_anonymously`]) walked on the anonymous download host
+/// with the client's own walk (`atpkg::net::newest_index`), as every client finds it.
+///
+/// # Errors
+///
+/// Why the channel could not be read: a listing that failed ([`HostError::NotFound`] for no
+/// such repo), or a HEAD that said neither.
+pub fn head_build(ctx: &Ctx, slug: &Slug) -> std::result::Result<Option<u64>, HostError> {
+    let host = &ctx.hosts.channel;
+    if !host.reads_anonymously() {
+        return host.releases(slug).map(|releases| head_number(&releases));
+    }
+    let mut said: Option<String> = None;
+    let walked = atpkg::net::newest_index(0, &mut |n| match host.probe_public(
+        slug,
+        &index_tag(n),
+        QUAD_FILES[0],
+    ) {
+        Probe::Present => Ok(true),
+        Probe::Absent => Ok(false),
+        Probe::Unknown(why) => {
+            said = Some(why.clone());
+            Err(why)
+        }
+    });
+    match (walked, said) {
+        (Ok((n, _)), _) => Ok(Some(n)),
+        (Err(_), Some(why)) => Err(HostError::Unreachable(format!(
+            "the download host did not say whether an index is published: {why}"
+        ))),
+        (Err(_), None) => Ok(None),
+    }
+}
+
+/// Download `names` (of [`QUAD_FILES`]) of index release `tag` into `dir`: through the
+/// host's API with a token, else from the anonymous download host under the client's caps
+/// ([`head_build`]).
+///
+/// # Errors
+///
+/// [`HostError::NotFound`] for an absent asset; otherwise why the download failed.
+pub fn download_quad_files(
+    ctx: &Ctx,
+    slug: &Slug,
+    tag: &str,
+    names: &[&str],
+    dir: &Path,
+) -> std::result::Result<(), HostError> {
+    let host = &ctx.hosts.channel;
+    if !host.reads_anonymously() {
+        return host.download(slug, tag, names, dir);
+    }
+    for name in names {
+        let cap = match *name {
+            "index.toml" => atpkg::net::MANIFEST_CAP,
+            n if n.ends_with(".sig") => atpkg::net::SIG_CAP,
+            _ => atpkg::net::ROSTER_CAP,
+        };
+        match host.fetch_public(slug, tag, name, &dir.join(name), cap) {
+            Probe::Present => {}
+            Probe::Absent => return Err(HostError::NotFound),
+            Probe::Unknown(why) => return Err(HostError::Unreachable(why)),
+        }
+    }
+    Ok(())
+}
+
 /// Download the channel's head quad into `dest` and verify it, freshness enforced.
 ///
 /// # Errors
@@ -202,21 +271,20 @@ pub fn fetch_head_with(
     freshness: Freshness,
 ) -> Result<(u64, VerifiedQuad)> {
     let host = &ctx.hosts.channel;
-    let releases = host
-        .releases(slug)
-        .map_err(|e| Error::cannot_run(format!("could not list the releases of {slug}: {e}")))?;
-    let n = head_number(&releases).ok_or_else(|| {
-        Error::refused(format!(
-            "{slug} serves no published atpkg-index-<n> release"
-        ))
-    })?;
+    let n = head_build(ctx, slug)
+        .map_err(|e| Error::cannot_run(format!("could not list the releases of {slug}: {e}")))?
+        .ok_or_else(|| {
+            Error::refused(format!(
+                "{slug} serves no published atpkg-index-<n> release"
+            ))
+        })?;
     let tag = index_tag(n);
     let mut last = HostError::NotFound;
     for attempt in 0..3 {
         if attempt > 0 {
             std::thread::sleep(host.retry_pause());
         }
-        match host.download(slug, &tag, &QUAD_FILES, dest) {
+        match download_quad_files(ctx, slug, &tag, &QUAD_FILES, dest) {
             Ok(()) => return Ok((n, verify_dir_with(ctx, dest, freshness)?)),
             Err(e @ HostError::Unreachable(_)) => last = e,
             Err(e) => {

@@ -4,6 +4,10 @@
 
 # aterm-window: recovered contracts and migration worklist
 
+> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 10 tests it
+> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
+> were taken before.
+
 > Status 2026-10-16: this is the crate's migration worklist. Each of the 17 specs below is to be
 > proved (through Trust/Clean, or by rustc for the auto-trait spec), and then the tests it
 > subsumes are deleted. Section4 records retired non-spec checks and one remaining migration control.
@@ -11,19 +15,24 @@
 > 2026-10-16 (LAG-2): the macOS proxy queue (`src/platform_impl/macos/wake_queue.rs`) added one
 > spec, `macos-proxy-queue`, and its 3 tests (last rows of §1 and §2). The counts below are the
 > recovery's own and leave them out.
+>
+> 2026-10-17 (LAG-5): the same spec now covers coalesced wakes (only the send that arms the wake
+> signals; the drain clears the flag before every take), with 2 more tests (§2's last rows).
 
-The package and lib are named `winit`. The inventory below is historical: the original36
-entries plus3 audit regressions, including the retired entries in §4. It is not a current
-crate-wide test census (src/error.rs 1, src/event.rs 4, src/keyboard/smol_str.rs 1,
+The package and lib are named `winit`. The inventory below is historical: the original 36
+entries plus 3 audit regressions. Of those 39, the 9 auto-trait checks in `tests/send_objects.rs`
+and `tests/sync_object.rs` and 3 of the 4 non-spec tests in §4 are since deleted, which leaves 27
+(src/event.rs 2, src/keyboard/smol_str.rs 1,
 src/platform_impl/linux/common/percent.rs 1, src/platform_impl/linux/headless.rs 5,
 src/platform_impl/linux/wayland/clipboard.rs 10, src/platform_impl/linux/wayland/seat/data_device.rs 3,
 src/platform_impl/linux/x11/dnd.rs 1, src/platform_impl/linux/x11/xsettings.rs 2,
-src/platform_impl/windows/drop_handler.rs 2, tests/send_objects.rs 5, tests/sync_object.rs 4 = 39)
-and the code each one reaches. The initial inventory was read-only. The URI/Xsettings corrections
-were subsequently exercised as pure host-Trust parser tests; Windows drop tests were type-checked
+src/platform_impl/windows/drop_handler.rs 2 = 27). It is not a current crate-wide test census.
+It lists those entries and the code each one reaches. The initial inventory was read-only. The
+URI/Xsettings corrections were subsequently exercised as pure host-Trust parser tests; Windows drop tests were type-checked
 for both Windows architectures, not executed on Windows. These checks are not proof claims.
 
-The historical map has **17 specs** covering **35 entries** and **4 non-spec entries** (§4).
+The historical map has **16 specs** covering **26 entries** and **1 non-spec entry** (§4).
+`public-handles-send-sync` has no test left to retire.
 
 ## 0. Notation used in the statements
 
@@ -60,9 +69,9 @@ Columns: `id`, `kind`, `functions`, `statement`, `subsumes (primary tests; secon
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
-public-handles-send-sync	other (auto traits)	event_loop::EventLoopProxy, window::{Window,WindowAttributes,WindowId,CustomCursorSource,CustomCursor}, event::DeviceId, monitor::MonitorHandle	∀ T: 'static + Send: EventLoopProxy<T> is Send + Sync. Window, WindowAttributes, CustomCursorSource and CustomCursor are Send + Sync. WindowId, DeviceId and MonitorHandle are Send. This holds on every backend the crate compiles. Discharge: a library-level `const _: () = { fn send<T: Send>() {} fn sync<T: Sync>() {} … };` item, so rustc proves it on every build of the lib, not only under test.	tests/send_objects.rs::{event_loop_proxy_send, window_send, window_builder_send, ids_send, custom_cursor_send}; tests/sync_object.rs::{event_loop_proxy_send, window_sync, window_builder_sync, custom_cursor_sync}	TRIVIAL: auto traits, generic T, no runtime code; rustc proves it, not Clean	none
+public-handles-send-sync	other (auto traits)	event_loop::EventLoopProxy, window::{Window,WindowAttributes,WindowId,CustomCursorSource,CustomCursor}, event::DeviceId, monitor::MonitorHandle	∀ T: 'static + Send: EventLoopProxy<T> is Send + Sync. Window, WindowAttributes, CustomCursorSource and CustomCursor are Send + Sync. WindowId, DeviceId and MonitorHandle are Send. This holds on every backend the crate compiles. Discharge: a library-level `const _: () = { fn send<T: Send>() {} fn sync<T: Sync>() {} … };` item, so rustc proves it on every build of the lib, not only under test.	none (its 9 integration tests are deleted)	TRIVIAL: auto traits, generic T, no runtime code; rustc proves it, not Clean	none
 copy-outcome-placed	table-property	wayland::clipboard::CopyOutcome::placed	∀ o: CopyOutcome: placed(o) ⇔ o is not Refused(_). So it is true for Claimed and Kept, and false for Refused(NoSerial), Refused(NoDevice) and Refused(Unfocused). Decidable over the 5 values.	wayland/clipboard.rs::a_selection_the_compositor_binds_no_device_for_is_refused_and_placed_says_so	TRIVIAL: matches! on a nested Copy enum	0, 1, 3
-headless-wait-deadline	contract (arithmetic)	headless::EventLoop::{poll_events_with_timeout,wait_on_wake_pipe}, to be factored into pure deadline/poll_millis/cause fns	Factor out three pure fns. (a) deadline(pending, cf, timeout, start) = Some(0) if pending, else min_opt(by_cf, timeout), where by_cf is None for Wait, Some(0) for Poll and Some(r.saturating_duration_since(start)) for WaitUntil(r). (b) poll_millis(None) = -1, poll_millis(Some(0)) = 0, otherwise min(c_int::MAX, max(1, ceil(d.as_nanos()/1e6))); so poll_millis(Some(d))·1ms ≥ d unless it saturates. (c) cause(cf, now) = ResumeTimeReached ⇔ cf = WaitUntil(r) ∧ now ≥ r; Poll gives Poll; otherwise WaitCancelled. With poll(2) honouring its timeout (a platform assumption): a WaitUntil(r) turn with no proxy wake reports ResumeTimeReached and does not start before r.	headless.rs::a_due_wait_until_reports_resume_time_reached	EASY once factored: Duration/Instant arithmetic, u128 div_ceil, c_int::try_from, Option combinators. Only the poll(2) step needs gap 8.	0, 1, 3, 8
+headless-wait-deadline	contract (arithmetic)	headless::EventLoop::poll_events_with_timeout, common::poll::{wait, timeout_millis}, to be factored into pure deadline/poll_millis/cause fns (poll_millis is common::poll::timeout_millis since LW.7)	Factor out three pure fns. (a) deadline(pending, cf, timeout, start) = Some(0) if pending, else min_opt(by_cf, timeout), where by_cf is None for Wait, Some(0) for Poll and Some(r.saturating_duration_since(start)) for WaitUntil(r). (b) poll_millis(None) = -1, poll_millis(Some(0)) = 0, otherwise min(c_int::MAX, max(1, ceil(d.as_nanos()/1e6))); so poll_millis(Some(d))·1ms ≥ d unless it saturates. (c) cause(cf, now) = ResumeTimeReached ⇔ cf = WaitUntil(r) ∧ now ≥ r; Poll gives Poll; otherwise WaitCancelled. With poll(2) honouring its timeout (a platform assumption): a WaitUntil(r) turn with no proxy wake reports ResumeTimeReached and does not start before r.	headless.rs::a_due_wait_until_reports_resume_time_reached	EASY once factored: Duration/Instant arithmetic, u128 div_ceil, c_int::try_from, Option combinators. Only the poll(2) step needs gap 8.	0, 1, 3, 8
 percent-decode-utf8	contract	linux::common::percent::{percent_decode_utf8,hex_val}	∀ data: &[u8]: percent_decode_utf8(data) = String::from_utf8(dec(data)) with the Utf8Error mapped. So the result is Ok(s) ⇔ dec(data) is valid UTF-8, and then s.as_bytes() = dec(data). hex_val(b) = Some(v) ⇔ b ∈ [0-9a-fA-F] with v its digit value (< 16); a table property decidable over 256 values. A '%' with fewer than two following bytes, or a non-hex digit, is copied verbatim. Corollary: ∀ s: &str, percent_decode_utf8(pct_encode(s)) = Ok(s) for an encoder that escapes any chosen subset of bytes.	common/percent.rs::percent_decode_basic_and_incomplete	EASY (hex_val: range match, evaluate 256 cases) / MEDIUM (decoder: while loop over a slice index with 3-byte lookahead, Vec<u8> push, u8 shifts and OR, String::from_utf8 needs a UTF-8 model)	0, 1, 3, 5, 7
 event-map-nonuser	contract	event::Event::map_nonuser_event	∀ T, U, e: Event<T>: map_nonuser_event::<U>(e) = Err(e) ⇔ e is UserEvent(_). Otherwise it is Ok(e'), where e' has the same variant and the same payload (window_id/event, device_id/event, cause) as e, re-typed at U.	event.rs::test_map_nonuser_event	EASY in shape, heavy in data: 10-arm enum match, generic T and U, large nested enum payloads	0, 1, 3, 11
 force-normalized	contract	event::Force::normalized	∀ f, m, a: f64: normalized(Normalized(f)) = f; normalized(Calibrated{force:f, max_possible_force:m, altitude_angle:None}) = f/m; normalized(Calibrated{f, m, Some(a)}) = (f / sin a) / m, in IEEE-754 f64 semantics. Corollary used by the test: when f/m is exact, the None and Some(PI/2) results agree, because sin(PI/2) rounds to 1.0. The statement is close to the body; its value is pinning the documented normalisation.	event.rs::test_force_normalize	EASY except f64::sin: f64 division, enum match with an Option field; sin is libm (needs an FFI or float model)	0, 1, 3, 8
@@ -73,11 +82,11 @@ clip-release-before-claim-lands	refinement	wayland::clipboard::SelectionPort::co
 xsettings-decode	round-trip	linux::x11::xsettings::{read_settings, Parser::{new,advance,pad,i8,i16,i32}, Setting::parse, SettingType::try_from}	(a) ∀ endian ∈ {'l','B'}, serial, well-formed setting lists L with count ≥ 0 (names and strings of any length, ints, colors): read_settings(enc_xsettings(endian, serial, L)) = Ok(it), and it yields exactly L in order, each as Ok. (b) Short header: read_settings(d) = Err(NoMoreBytes{expected:1, found:0}) ⇔ d is empty; for 1 ≤ |d| < 8 it is Err(NoMoreBytes{expected:7, found:|d|-1}); for 8 ≤ |d| < 12 it is Err(NoMoreBytes{expected:4, found:|d|-8}). (c) Parser::advance(n) either returns the next n bytes and shrinks the cursor by n, or returns Err(NoMoreBytes{n, remaining}) and leaves the cursor unchanged. pad(size, 4) advances (4 - size%4)%4 bytes. (d) A negative list count is Err(NegativeCount(count)); a malformed setting yields one final Err, then the iterator ends even when its declared count is huge. No input panics.	x11/xsettings.rs::{empty, parse_xsettings}	MEDIUM-HARD: &mut Parser cursor over &[u8] with lifetimes, split_at, try_into [u8;N], from_be/le_bytes, iter::from_fn with an FnMut closure, checked i32 → usize count, length casts i32/i16 → usize, NonZeroUsize::unwrap	0, 1, 2, 3, 5, 7, 13
 parse-uri-list	contract	linux::common::percent::uri_list_entries, wayland::seat::data_device::parse_uri_list, x11::dnd::file_uri_path	Frame raw LF/CRLF-separated entries, trim ASCII list whitespace, and skip empty/comment entries before decoding. Only a raw file:// scheme with an empty authority (path starts /) is local; decode percent escapes only within that path. Encoded CRLF, #, trailing whitespace and embedded file:// stay path content. Wayland skips unsupported/invalid-UTF8 entries and returns canonicalize(path) or path; X11 errors on an unsupported/invalid entry or failed canonicalization. Nonempty hosts, including localhost, remain unsupported. Output order follows input entries.	wayland/seat/data_device.rs::{parse_uri_list_extracts_file_paths, parse_uri_list_skips_comments_hostnames_and_other_schemes, parse_uri_list_empty_is_empty}; x11/dnd.rs::uri_list_decodes_paths_after_framing_and_preserves_literal_uri_text	MEDIUM: raw-byte split/trim, strip_prefix, iterator filter, Vec<PathBuf>, composition with percent-decode-utf8, fs::canonicalize	0, 1, 4, 5, 7, 8, 13
 copy-verdict	contract	wayland::clipboard::copy_verdict	∀ receiver rx: copy_verdict(rx) ⇔ rx yields some outcome o within COPY_TIMEOUT ∧ placed(o). A dropped sender with nothing queued, or an elapsed timeout, gives false. A queued outcome is consumed in FIFO order.	wayland/clipboard.rs::a_copy_off_the_loop_thread_answers_the_loop_s_verdict_and_never_guesses	EASY logic over an effect: mpsc::Receiver::recv_timeout (channel and time), Result match	0, 8, 13
-wayland-clipboard-handle	contract	wayland::clipboard::WaylandClipboard::{new,copy,paste_owned,paste,send}, Shared::slot	For a handle h with loop thread L, any sel and text: (1) receiver gone ⇒ h.copy(sel, text) = false and afterwards slot(sel) = None. (2) On thread L with a successful send, h.copy returns true without waiting and slot(sel) = Some(text). (3) h.paste_owned(sel) = slot(sel) filtered to non-empty; a copy to sel leaves the other selection's slot unchanged. (4) On thread L, h.paste(sel) = h.paste_owned(sel) and sends no request. (5) slot = None (a disown) ⇒ paste_owned = None. A poisoned Mutex gives false/None and never panics.	wayland/clipboard.rs::{a_copy_with_no_loop_left_to_answer_it_is_false_and_leaves_no_own_slot_behind, the_own_slot_answers_synchronously_and_a_foreign_slot_answers_none}	MEDIUM-HARD: Arc<Mutex<Shared>> with an &mut Option<String> projection, calloop channel Sender, mpsc, thread::current().id(), Option<String> filter	0, 1, 2, 8, 13
+wayland-clipboard-handle	contract	wayland::clipboard::WaylandClipboard::{new,copy,paste_owned,paste,send}, Shared::slot	For a handle h with loop thread L, any sel and text: (1) receiver gone ⇒ h.copy(sel, text) = false and afterwards slot(sel) = None. (2) On thread L with a successful send, h.copy returns true without waiting and slot(sel) = Some(text). (3) h.paste_owned(sel) = slot(sel) filtered to non-empty; a copy to sel leaves the other selection's slot unchanged. (4) On thread L, h.paste(sel) = h.paste_owned(sel) and sends no request. (5) slot = None (a disown) ⇒ paste_owned = None. A poisoned Mutex gives false/None and never panics.	wayland/clipboard.rs::{a_copy_with_no_loop_left_to_answer_it_is_false_and_leaves_no_own_slot_behind, the_own_slot_answers_synchronously_and_a_foreign_slot_answers_none}	MEDIUM-HARD: Arc<Mutex<Shared>> with an &mut Option<String> projection, an mpsc Sender and the clipboard's own eventfd waker (calloop's channel Sender until LW.7), thread::current().id(), Option<String> filter	0, 1, 2, 8, 13
 headless-trace-grammar	invariant	linux::headless::EventLoop::{run_on_demand,pump_events,single_iteration,poll_events_with_timeout}, ActiveEventLoop::{exit,exiting,exit_code}	∀ callback, schedule of proxy sends: HeadlessTrace(run_on_demand) is a prefix of InitTurn Turn* LoopExiting, and it ends in LoopExiting whenever the run returns. Every Turn after the init turn has cause ≠ Init. Resumed occurs exactly once, second in the trace. If exit is set during turn k, no NewEvents follows turn k (so an exit on InitTurn yields exactly one NewEvents). run_on_demand returns Ok ⇔ the exit code is 0, else Err(ExitFailure(code)). pump_events resets loop_running on exit, so a later pump_events starts again with InitTurn.	headless.rs::{the_first_turn_is_init_then_resumed_and_the_last_is_loop_exiting, an_exit_on_the_init_turn_runs_no_further_turn}	HARD: &mut self loop, generic FnMut callback receiving &RootELW, Cell<ControlFlow>/Cell<Option<i32>>, Mutex<VecDeque<T>>; best stated as a ty_model! turn machine with a conformance binding	0, 2, 3, 7, 10, 11, 13
-headless-proxy-delivery	contract (liveness)	linux::headless::{EventLoopProxy::send_event, poke, WakePipe::{new,drain}, EventLoop::{create_proxy,single_iteration,wait_on_wake_pipe}}	∀ proxy p of loop l, event e: p.send_event(e) = Ok before l exits ⇒ e is delivered as exactly one UserEvent(e) in a turn that starts no earlier than the send, in FIFO order with p's other sends. A send to a loop blocked in ControlFlow::Wait ends that wait, because the pipe becomes readable. send_event never blocks (O_NONBLOCK write; EAGAIN ignored). It returns Err(EventLoopClosed(e)) only when the queue mutex is poisoned.	headless.rs::{an_event_posted_before_the_loop_runs_is_still_delivered, an_event_posted_after_init_is_delivered_from_another_thread_under_wait}	HARD: unsafe libc pipe2/read/write/poll, OwnedFd, Arc<Mutex<VecDeque<T>>>, cross-thread liveness	0, 2, 7, 8, 13
+headless-proxy-delivery	contract (liveness)	linux::headless::{EventLoopProxy::send_event, EventLoop::{create_proxy,single_iteration,poll_events_with_timeout}}, linux::common::poll::{Waker::{new,wake,drain}, wait, timeout_millis}	∀ proxy p of loop l, event e: p.send_event(e) = Ok before l exits ⇒ e is delivered as exactly one UserEvent(e) in a turn that starts no earlier than the send, in FIFO order with p's other sends. A send to a loop blocked in ControlFlow::Wait ends that wait, because the eventfd becomes readable. send_event never blocks (O_NONBLOCK eventfd write; EAGAIN, a counter already at its ceiling, is a wake already pending). It returns Err(EventLoopClosed(e)) only when the queue mutex is poisoned.	headless.rs::{an_event_posted_before_the_loop_runs_is_still_delivered, an_event_posted_after_init_is_delivered_from_another_thread_under_wait}	HARD: unsafe libc eventfd/read/write/poll, Arc<OwnedFd>, Arc<Mutex<VecDeque<T>>>, cross-thread liveness	0, 2, 7, 8, 13
 windows-drop-ownership	contract	windows::drop_handler::{FileDropHandler::QueryInterface, StorageMedium::drop, FileDropHandler::iterate_filenames}	QueryInterface supports IUnknown and IDropTarget with one pointer identity and AddRef per success; null arguments return E_POINTER and unknown IID returns E_NOINTERFACE with a null output. Each successful GetData medium is released exactly once through ReleaseStgMedium, honoring pUnkForRelease on hover, drop and wrong-type early return.	windows/drop_handler.rs::{queries_preserve_interface_identity_and_own_each_successful_reference, storage_medium_releases_its_declared_owner_once}	HARD: raw COM pointers, repr(C) identity, ownership/refcounts, extern callbacks and OLE release	0, 2, 8
-macos-proxy-queue	contract (liveness)	macos::wake_queue::{channel, Sender::send, Receiver::{try_next, has_pending, take_into}}, macos::event_loop::EventLoopProxy::send_event	∀ senders, events: try_next hands out every sent event exactly once, in send order; an event sent during a drain comes after the events already taken. A send after the Receiver is dropped returns Err(event). The receiver never waits on a sender: while a sender holds the queue's lock, try_next and has_pending return without that sender's event, and send_event signals the loop's wake source after its push, so the loop comes round again and takes it. (std::mpsc's try_recv waits on a sender part-way through a write by spinning and then calling sched_yield. On macOS that depresses the main thread's priority for one 10 ms quantum.)	macos/wake_queue.rs::{events_arrive_oldest_first_across_senders_and_drains, a_send_after_the_receiver_is_gone_hands_its_event_back, a_drain_returns_at_once_while_a_sender_holds_the_lock}	MEDIUM: Arc<Mutex<VecDeque<T>>> with try_lock, RefCell, cross-thread liveness tied to CFRunLoopSourceSignal	0, 2, 8, 13
+macos-proxy-queue	contract (liveness)	macos::wake_queue::{channel, Sender::send, Receiver::{try_next, has_pending, refill}, UnfairMutex::{lock, try_lock}}, macos::event_loop::EventLoopProxy::send_event	∀ senders, events: try_next hands out every sent event exactly once, in send order; an event sent during a drain comes after the events already taken. A send after the Receiver is dropped returns Err(event). The receiver never waits on a sender: while a sender holds the queue's lock, try_next and has_pending return without that sender's event, and send_event signals the loop's wake source after its push, so the loop comes round again and takes it. Wakes are coalesced: send_event signals only when its send armed the wake flag (clear → set, after its push), and the receiver clears the flag before every take, whatever the take finds, so a sender that held the lock through a drain still signals; the AppKit loop wakes itself once more when the flag is set at the end of its BeforeWaiting turn. (std::mpsc's try_recv waits on a sender part-way through a write by spinning and then calling sched_yield. On macOS that depresses the main thread's priority for one 10 ms quantum.)	macos/wake_queue.rs::{events_arrive_oldest_first_across_senders_and_drains, a_send_after_the_receiver_is_gone_hands_its_event_back, a_drain_returns_at_once_while_a_sender_holds_the_lock, only_the_send_that_arms_the_wake_owes_a_signal, a_drain_that_finds_the_lock_held_still_clears_the_flag}	MEDIUM: Arc<UnfairMutex<VecDeque<T>>> (os_unfair_lock over FFI, a !Send guard) with try_lock, RefCell, cross-thread liveness tied to CFRunLoopSourceSignal	0, 2, 8, 13
 ```
 
 Test paths in `subsumes` are shortened: `wayland/…`, `common/…`, `x11/…` and `headless.rs` sit under
@@ -120,17 +129,14 @@ negative control) → `copy-verdict` and `wayland-clipboard-handle`. `percent-de
 `headless-proxy-delivery`. `public-handles-send-sync`, `smolstr-text-round-trip`, `event-map-nonuser`,
 `force-normalized`, `pick-text-mime` and `xsettings-decode` stand alone.
 
-## 2. Historical test → spec map (TSV; 39 entries)
+## 2. Historical test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 
 ```tsv
 file	test	primary	also
-src/error.rs	ensure_fmt_does_not_panic	NON-SPEC (asserts nothing)	
 src/event.rs	test_map_nonuser_event	event-map-nonuser	
 src/event.rs	test_force_normalize	force-normalized	
-src/event.rs	test_event_clone	NON-SPEC (derive tautology)	
-src/event.rs	ensure_attrs_do_not_panic	NON-SPEC (asserts nothing)	
 src/keyboard/smol_str.rs	text_round_trips_on_both_sides_of_the_inline_limit	smolstr-text-round-trip	
 src/platform_impl/linux/common/percent.rs	percent_decode_basic_and_incomplete	percent-decode-utf8	parse-uri-list
 src/platform_impl/linux/headless.rs	the_first_turn_is_init_then_resumed_and_the_last_is_loop_exiting	headless-trace-grammar	
@@ -151,48 +157,38 @@ src/platform_impl/linux/wayland/clipboard.rs	a_paste_prefers_utf8_then_the_legac
 src/platform_impl/linux/wayland/seat/data_device.rs	parse_uri_list_extracts_file_paths	parse-uri-list	percent-decode-utf8
 src/platform_impl/linux/wayland/seat/data_device.rs	parse_uri_list_skips_comments_hostnames_and_other_schemes	parse-uri-list	
 src/platform_impl/linux/wayland/seat/data_device.rs	parse_uri_list_empty_is_empty	parse-uri-list	
-src/platform_impl/linux/x11/dnd.rs	uri_list_decodes_paths_after_framing_and_preserves_literal_uri_text	parse-uri-list
+src/platform_impl/linux/x11/dnd.rs	uri_list_decodes_paths_after_framing_and_preserves_literal_uri_text	parse-uri-list	
 src/platform_impl/linux/x11/xsettings.rs	empty	xsettings-decode	
 src/platform_impl/linux/x11/xsettings.rs	parse_xsettings	xsettings-decode	
-src/platform_impl/windows/drop_handler.rs	queries_preserve_interface_identity_and_own_each_successful_reference	windows-drop-ownership
-src/platform_impl/windows/drop_handler.rs	storage_medium_releases_its_declared_owner_once	windows-drop-ownership
-tests/send_objects.rs	event_loop_proxy_send	public-handles-send-sync	
-tests/send_objects.rs	window_send	public-handles-send-sync	
-tests/send_objects.rs	window_builder_send	public-handles-send-sync	
-tests/send_objects.rs	ids_send	public-handles-send-sync	
-tests/send_objects.rs	custom_cursor_send	public-handles-send-sync	
-tests/sync_object.rs	event_loop_proxy_send	public-handles-send-sync	
-tests/sync_object.rs	window_sync	public-handles-send-sync	
-tests/sync_object.rs	window_builder_sync	public-handles-send-sync	
-tests/sync_object.rs	custom_cursor_sync	public-handles-send-sync	
+src/platform_impl/windows/drop_handler.rs	queries_preserve_interface_identity_and_own_each_successful_reference	windows-drop-ownership	
+src/platform_impl/windows/drop_handler.rs	storage_medium_releases_its_declared_owner_once	windows-drop-ownership	
 src/platform_impl/macos/wake_queue.rs	events_arrive_oldest_first_across_senders_and_drains	macos-proxy-queue	
 src/platform_impl/macos/wake_queue.rs	a_send_after_the_receiver_is_gone_hands_its_event_back	macos-proxy-queue	
 src/platform_impl/macos/wake_queue.rs	a_drain_returns_at_once_while_a_sender_holds_the_lock	macos-proxy-queue	
+src/platform_impl/macos/wake_queue.rs	only_the_send_that_arms_the_wake_owes_a_signal	macos-proxy-queue	
+src/platform_impl/macos/wake_queue.rs	a_drain_that_finds_the_lock_held_still_clears_the_flag	macos-proxy-queue	
 ```
 
 ## 3. Coverage
 
-- 36 original tests read. 32 map to one of the 16 specs. 4 are not spec samples (§4).
-- The biggest collapse is `public-handles-send-sync` (9 tests across two integration files, retired by
-  one library `const _` item). Next: `selection-port-copy`, `parse-uri-list` (3 each).
+- 36 original tests read. 32 mapped to one of the 16 specs. 4 were not spec samples (§4). 12 of the
+  36 are since deleted: the 9 auto-trait checks and 3 of the 4 non-spec tests.
+- The biggest collapse was `public-handles-send-sync` (9 tests across two integration files, now
+  deleted; one library `const _` item, not yet added, would prove the property). Next: `selection-port-copy`, `parse-uri-list` (3 each).
 - 18 of the 36 tests sit in effectful files (headless event loop, Wayland clipboard, data device). Their
   pure cores (`copy-outcome-placed`, `selection-port-copy`, `pick-text-mime`, `headless-wait-deadline`,
   `percent-decode-utf8`) can be proved before Trust's platform lane (gap 8) lands.
 
 ## 4. Tests that are not spec samples
 
-> Status 2026-10-16: the 3 rows marked **delete** (error.rs::ensure_fmt_does_not_panic,
-> event.rs::test_event_clone, event.rs::ensure_attrs_do_not_panic) are deleted.
+> Status 2026-10-16: the 3 derive/prose checks in `src/error.rs` and `src/event.rs` that this
+> table marked for deletion are deleted, and their rows are gone from it and from §2.
 
 | test | why | action |
 |---|---|---|
-| src/error.rs::ensure_fmt_does_not_panic | Formats NotSupportedError and ExternalError with Debug and Display and asserts nothing. The impls are a derive plus literal `f.pad`/`write!`, so it cannot panic and samples no property. | **removed** |
-| src/event.rs::test_event_clone | Derived Clone and PartialEq. `clone() == self` is guaranteed by the derive for the non-NaN payloads used (all 0.0): a type-system tautology. | **removed** |
-| src/event.rs::ensure_attrs_do_not_panic | Exercises only derived Debug, Clone, Hash and Ord (HashSet/BTreeSet insert, sort) and asserts nothing. | **removed** |
 | wayland/clipboard.rs::claiming_before_releasing_loses_every_other_copy_and_leaves_the_text_before_it | Drives only the `#[cfg(test)]` `FakeSeat::claim` with the old `[Claim]`-only order, not production code. | **delete as a test; keep its content as the negative control** of `clip-release-before-claim-lands` (PLAN done-criterion 3) |
 
-Status: the three derive/prose checks are removed; the separate compositor negative control
-remains a migration candidate for folding into its conformance test.
+Status: the compositor negative control remains a migration candidate for folding into its conformance test.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
@@ -223,8 +219,8 @@ remains a migration candidate for folding into its conformance test.
 ## 6. Proof order (easiest high-value first)
 
 1. **`public-handles-send-sync`**. No Trust gap at all: add the `const _` auto-trait assertion item to
-   the library and delete the 9 tests in `tests/send_objects.rs` and `tests/sync_object.rs` in the same
-   commit. This is a quarter of the crate's tests.
+   the library. The 9 tests in `tests/send_objects.rs` and `tests/sync_object.rs` it was to retire are
+   already deleted.
 2. **`copy-outcome-placed`**. Blocked only by gap 0 plus enum carriers (gaps 1, 3); decidable by
    evaluation over 5 values. It is the lemma `copy-verdict` and `selection-port-copy` cite.
 3. **`headless-wait-deadline`** (pure factor). Linear `Duration`/`Option` arithmetic plus a

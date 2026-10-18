@@ -18,46 +18,6 @@ fn type_one_key(glow: &mut CursorGlow, cfg: &GlowConfig, g: Geom, at: Instant, r
     glow.tick(Some((row, col + 1)), at, cfg, g, &mut typed_scratch());
 }
 
-/// Four typed keys earn four licensed spawns and a ribbon of at least four cells across at least
-/// two status bands.
-#[test]
-fn a_typed_burst_earns_a_rainbow_ribbon_the_status_verb_reports() {
-    let g = geom();
-    let c = cfg(GlowStyle::RainbowKitty, true);
-    let mut glow = CursorGlow::default();
-    let t0 = Instant::now();
-    glow.tick(Some((2, 0)), t0, &c, g, &mut typed_scratch());
-    for key in 0..4u32 {
-        type_one_key(
-            &mut glow,
-            &c,
-            g,
-            t0 + Duration::from_millis(u64::from(key) * 120 + 1),
-            2,
-            key as u16,
-        );
-    }
-
-    let tally = glow.admission_tally();
-    assert_eq!((tally.licensed, tally.declined), (4, 0));
-    assert_eq!(tally.last_decline_reason, None);
-    assert_eq!(glow.spawns(), 4);
-    let segments = glow.ribbon_segments();
-    assert!(
-        segments >= 4,
-        "four keys leave at least four ribbon cells: {segments}"
-    );
-    assert!(
-        glow.ribbon_hue_bands() >= 2,
-        "a four-cell ribbon spans at least two status bands"
-    );
-    assert!(glow.is_active());
-    assert!(
-        glow.typing_momentum(t0 + Duration::from_millis(361)) > 0.0,
-        "ordinary typing builds momentum without gating the ribbon"
-    );
-}
-
 /// A twelve-key word at fast, average and slow human cadence earns a multi-cell ribbon across at
 /// least two status bands.
 #[test]

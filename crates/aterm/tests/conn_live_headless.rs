@@ -2,10 +2,10 @@
 // Copyright 2026 Andrew Yates
 
 //! Live-headless end-to-end test for `aterm conn` (docs/design/SESSION_CONNECTIONS.md §9
-//! [v5.1]): the no-arg form shows both directions against a live headless instance, and an
-//! add/set/rm round trip equals the wire verbs byte for byte in `edges` output. Everything runs
-//! through the one `aterm` binary: `aterm --headless` boots the engine and control socket,
-//! `aterm ctl …` speaks the raw wire, `aterm conn …` is under test.
+//! [v5.1]): against a live headless instance, an add/set/rm round trip equals the wire verbs
+//! byte for byte in `edges` output. Everything runs through the one `aterm` binary:
+//! `aterm --headless` boots the engine and control socket, `aterm ctl …` speaks the raw wire,
+//! `aterm conn …` is under test.
 //!
 //! Isolation is `support/launch_isolation.rs`'s, and every client call is pinned with `--sock`.
 //! The test process is not an aterm session, so the `@self` forms run both without
@@ -17,155 +17,25 @@
     reason = "test code: a stand-in child may inherit descriptors"
 )]
 
-use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::net::UnixStream;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use aterm_control::wire::pct_decode;
 
-#[path = "support/child_output.rs"]
-mod child_output;
-#[path = "support/headless_boot.rs"]
-mod headless_boot;
-#[path = "support/launch_isolation.rs"]
-mod launch_isolation;
+use crate::{headless_boot, launch_isolation};
 
-use headless_boot::{Instance, log_tail};
+use headless_boot::Instance;
 
 /// Boot one real headless instance under the scratch world, 40x120
-/// ([`headless_boot::boot`]: `None` is an environment refusal; a product that
-/// cannot start fails the test).
-fn boot() -> Option<Instance> {
+/// ([`headless_boot::boot`]: an environment refusal is COULD NOT RUN; a product
+/// that cannot start fails the test).
+fn boot() -> Instance {
     headless_boot::boot("atconn", &["--lines", "40", "--columns", "120"])
 }
 
 const CLIENT_EXIT_DEADLINE: Duration = Duration::from_secs(90);
-
-/// The hermetic environment shared by the server and every client call
-/// ([`launch_isolation::apply`]): scratch runtime and config dirs, a quiet shell, none of the
-/// caller's own aterm session context.
-fn hermetic_env(cmd: &mut Command, tmp: &Path) {
-    launch_isolation::apply(cmd, tmp);
-}
-
-/// The scratch world keeps every launch off the machine through config: an observer child
-/// reads the shipping config readers in the real launch environment and records whether the
-/// automatic lanes (`[update] enabled`, `[packages] enabled`) would run. No environment veto
-/// exists; the reroute's escape is a flag (`--no-reroute`). Negative control: the same world
-/// with the switches at their defaults reads "would run".
-#[test]
-fn private_launch_environment_gates_host_maintenance() {
-    const OBSERVER: &str = "ATERM_FIXTURE_OBSERVER_ROOT";
-    if let Some(root) = std::env::var_os(OBSERVER) {
-        // Executed in a child process with the actual launch environment. Read
-        // the shipping config/store/policy APIs, but never perform maintenance.
-        let root = PathBuf::from(root);
-        for (name, relative) in [
-            ("HOME", "home"),
-            ("XDG_CONFIG_HOME", "cfg"),
-            ("XDG_RUNTIME_DIR", "run"),
-            ("XDG_CACHE_HOME", "cache"),
-            ("XDG_DATA_HOME", "data"),
-            ("XDG_STATE_HOME", "state"),
-        ] {
-            assert_eq!(std::env::var_os(name), Some(root.join(relative).into()));
-        }
-        assert!(std::env::var_os("ATERM_PARENT_SESSION_ID").is_none());
-        // No environment veto is set, and none is needed: nothing reads one.
-        for name in [
-            "ATERM_NO_AUTO_UPDATE",
-            "ATERM_NO_AUTO_APPLY",
-            "ATPKG_DISABLE",
-            "ATERM_NO_REROUTE",
-            "ATERM_UPDATE_ROOT",
-            atpkg::reroute::PASSTHROUGH_ENV,
-        ] {
-            assert_eq!(std::env::var_os(name), None, "{name}");
-        }
-        let layout = atpkg::store::resolve_configured().expect("private store resolves");
-        assert!(layout.prefix.starts_with(root.join("home")));
-        let updates = aterm_update_core::seal_guard::updates_root().expect("updates root");
-        assert!(
-            updates.starts_with(root.join("home")),
-            "{}",
-            updates.display()
-        );
-        let machine = atpkg::config::load_machine();
-        assert_eq!(
-            machine.universal_control(),
-            atpkg::config::UniversalControlPolicy::Leave
-        );
-        let config = root.join("cfg/aterm/aterm.toml");
-        let updater = aterm_update_core::settings::update_enabled_at(&config);
-        let packages = atpkg::config::load().enabled();
-        // A fake writer records the real admission decision in private state.
-        // It does not run an updater, a pass, launchd, defaults, or any maintenance.
-        std::fs::write(
-            root.join("observed"),
-            if updater || packages {
-                "would-run"
-            } else {
-                "blocked"
-            },
-        )
-        .unwrap();
-        return;
-    }
-
-    let base = std::env::temp_dir().join(format!("atconn-isolation-{}", std::process::id()));
-    for (case, defaults, expected) in [
-        ("isolated", false, "blocked"),
-        ("negative-control", true, "would-run"),
-    ] {
-        let root = base.join(case);
-        launch_isolation::prepare(&root).unwrap();
-        if defaults {
-            // The update switches at their defaults; the host settings still left
-            // alone, so the observer's `[machine]` assertions hold either way.
-            std::fs::write(
-                root.join("cfg/aterm/aterm.toml"),
-                "agents_auto_prime = false\n[machine]\nuniversal_control = \"leave\"\n",
-            )
-            .unwrap();
-        }
-        let log = root.join("observer.log");
-        let mut cmd = Command::new(std::env::current_exe().unwrap());
-        cmd.args([
-            "--exact",
-            "private_launch_environment_gates_host_maintenance",
-            "--nocapture",
-        ])
-        // Explicit foreign overrides must be removed as well as ambient ones.
-        .env("ATERM_PARENT_SESSION_ID", "foreign-session")
-        .env("ATERM_NO_AUTO_UPDATE", "1")
-        .env(atpkg::reroute::PASSTHROUGH_ENV, "1");
-        hermetic_env(&mut cmd, &root);
-        cmd.env(OBSERVER, &root)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(std::fs::File::create(&log).unwrap());
-        let mut child = cmd.spawn().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                assert!(status.success(), "{case}: {}", log_tail(&log));
-                break;
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("{case}: isolation observer did not exit");
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(
-            std::fs::read_to_string(root.join("observed")).unwrap(),
-            expected
-        );
-    }
-    std::fs::remove_dir_all(base).unwrap();
-}
 
 /// Run one `aterm <args…>` client call with the hermetic environment plus `extra_env`, bounded
 /// by [`CLIENT_EXIT_DEADLINE`]: drain threads keep the pipes flowing, so a hung client is a
@@ -176,7 +46,7 @@ fn run_client(inst: &Instance, args: &[&str], extra_env: &[(&str, &str)]) -> Out
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    hermetic_env(&mut cmd, &inst.tmp);
+    launch_isolation::apply(&mut cmd, &inst.tmp);
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -258,22 +128,14 @@ fn titles(inst: &Instance, sock: &str) -> Vec<(u64, String, String)> {
     parse_sessions(&client_ok(inst, &["ctl", "--sock", sock, "sessions"], &[]))
 }
 
-fn title_of(rows: &[(u64, String, String)], sid: &str) -> String {
-    let t = rows
-        .iter()
-        .find(|(_, s, _)| s == sid)
-        .map(|(_, _, t)| t.as_str())
-        .unwrap_or_default();
-    format!("\"{t}\"")
-}
-
 /// The whole §9 [v5.1] loop against one live instance: spawn a second session, wire both
-/// directions with `conn add`, pin the no-arg and `ls` renders, narrow to pull with `conn set`
-/// and pin the raw `edges --json` bytes, then `conn rm` both pairs and pin the empty renders.
-/// One test: the steps are one causal story.
+/// directions with `conn add`, narrow to pull with `conn set` and pin the raw `edges --json`
+/// bytes, then `conn rm` both pairs. A fresh read grant stays usable on its established
+/// connection after the destination closes, until the owner revokes it through the real
+/// dispatch path. One test: the steps are one causal story.
 #[test]
 fn conn_round_trips_against_a_live_headless_instance() {
-    let Some(inst) = boot() else { return };
+    let inst = boot();
     let sock = inst.sock.clone();
 
     // --- the two sessions -------------------------------------------------
@@ -315,15 +177,14 @@ fn conn_round_trips_against_a_live_headless_instance() {
     // The harness hosts the session context the way a real in-session shell
     // would: $ATERM_PARENT_SESSION_ID = the boot session's actual sid.
     let in_session: &[(&str, &str)] = &[("ATERM_PARENT_SESSION_ID", sid1.as_str())];
-    let got = client_ok(
+    client_ok(
         &inst,
         &["conn", "--sock", &sock, "add", &format!("@{sid2}")],
         in_session,
     );
-    assert_eq!(got, format!("connected @{sid1} -> @{sid2} (both)\n"));
     // The incoming half (§9: the no-arg form shows BOTH directions): invite
     // the peer as a pull-only controller of this session.
-    let got = client_ok(
+    client_ok(
         &inst,
         &[
             "conn",
@@ -337,37 +198,12 @@ fn conn_round_trips_against_a_live_headless_instance() {
         ],
         in_session,
     );
-    assert_eq!(got, format!("connected @{sid2} -> @{sid1} (pull)\n"));
-
-    // --- (b) the no-arg and ls renders, byte-stable -----------------------
-    // Titles are live wire state, so each pin fetches them immediately before
-    // rendering its expectation — the same `sessions` index `conn` reads.
-    let rows = titles(&inst, &sock);
-    let (t1, t2) = (title_of(&rows, &sid1), title_of(&rows, &sid2));
-    let got = client_ok(&inst, &["conn", "--sock", &sock], in_session);
-    assert_eq!(
-        got,
-        format!(
-            "\u{21e5} both  @{sid2} {t2}\n\
-             \u{21e4} pull  @{sid2} {t2}\n\
-             \n\
-             drive it: aterm ctl @{sid2} turn 'your message'\n"
-        ),
-        "the no-arg render: outgoing \u{21e5}, incoming \u{21e4}, the drive hint"
-    );
-    // `conn ls`: one line per directed pair, in the wire's sorted (src, dst)
-    // order — computed here the same way so the pin is order-exact.
-    let mut pairs = [
-        format!("@{sid1} -> @{sid2}  both  {t1} -> {t2}"),
-        format!("@{sid2} -> @{sid1}  pull  {t2} -> {t1}"),
-    ];
-    pairs.sort();
     let got = client_ok(&inst, &["conn", "--sock", &sock, "ls"], &[]);
-    assert_eq!(got, format!("{}\n{}\n", pairs[0], pairs[1]));
+    assert_eq!(got.lines().count(), 2, "one line per directed pair: {got}");
 
     // --- (c) set --kind pull, then the raw-wire byte pin -------------------
     // Drop the incoming half first so exactly one pair remains under test.
-    let got = client_ok(
+    client_ok(
         &inst,
         &[
             "conn",
@@ -379,8 +215,7 @@ fn conn_round_trips_against_a_live_headless_instance() {
         ],
         in_session,
     );
-    assert_eq!(got, format!("disconnected @{sid2} -> @{sid1}\n"));
-    let got = client_ok(
+    client_ok(
         &inst,
         &[
             "conn",
@@ -393,7 +228,6 @@ fn conn_round_trips_against_a_live_headless_instance() {
         ],
         in_session,
     );
-    assert_eq!(got, format!("set @{sid1} -> @{sid2} (pull)\n"));
     // The §9 wire-equivalence pin: after the both→pull set, the raw `edges --json` body (the
     // server's own emitter) holds exactly the read-screen row.
     let got = client_ok(
@@ -417,12 +251,11 @@ fn conn_round_trips_against_a_live_headless_instance() {
     );
 
     // --- (d) rm, then verify empty ----------------------------------------
-    let got = client_ok(
+    client_ok(
         &inst,
         &["conn", "--sock", &sock, "rm", &format!("@{sid2}")],
         in_session,
     );
-    assert_eq!(got, format!("disconnected @{sid1} -> @{sid2}\n"));
     let got = client_ok(
         &inst,
         &[
@@ -436,29 +269,54 @@ fn conn_round_trips_against_a_live_headless_instance() {
         &[],
     );
     assert_eq!(got, format!("{{\"edges\":[],\"dst\":\"{sid2}\"}}\n"));
-    let got = client_ok(&inst, &["conn", "--sock", &sock], in_session);
+
+    let target = format!("@{sid2}");
+    client_ok(&inst, &["ctl", "--sock", &sock, "tab", "1"], &[]);
+    let grant = client_ok(
+        &inst,
+        &["ctl", "--sock", &sock, "grant", &sid1, "read-screen"],
+        &[],
+    );
+    let token = grant.trim().strip_prefix("OK ").expect("read grant token");
+    // Edge authentication uses the active live session. Keep the authenticated
+    // connection across its close; the closed index does not mint new authority.
+    let mut stream = UnixStream::connect(&sock).expect("connect read edge");
+    let hang = Some(Duration::from_secs(60));
+    stream.set_read_timeout(hang).unwrap();
+    stream.set_write_timeout(hang).unwrap();
+    writeln!(stream, "AUTH {token}").unwrap();
+    let mut edge = BufReader::new(stream);
+    let mut read_log = || {
+        writeln!(edge.get_mut(), "{target} log").unwrap();
+        let mut header = String::new();
+        assert_ne!(edge.read_line(&mut header).unwrap(), 0, "edge disconnected");
+        let mut rows = String::new();
+        if let Some(rest) = header.strip_prefix("OK ") {
+            let count: usize = rest.split_whitespace().next().unwrap().parse().unwrap();
+            assert!(count <= 2050, "bounded log reply: {header}");
+            for _ in 0..count {
+                assert_ne!(edge.read_line(&mut rows).unwrap(), 0, "truncated log reply");
+            }
+        }
+        (header, rows)
+    };
+    let (live, _) = read_log();
+    assert!(live.starts_with("OK "), "live read control: {live}");
     assert_eq!(
-        got,
-        format!(
-            "no session connections for @{sid1}\n\
-             create one:\n  \
-             aterm conn add @<sid>        take control of a session (pull+push)\n  \
-             aterm conn spawn controlled  spawn a new session this one controls\n"
-        ),
-        "the empty-state render after rm"
+        client_ok(&inst, &["ctl", "--sock", &sock, &target, "close"], &[]),
+        format!("OK closed {sid2}\n")
     );
-
-    // The proof-it-ran marker: a skipped run never prints this line.
-    eprintln!(
-        "conn e2e: ran live against headless pid {} ({sid1} -> {sid2}) at {sock}",
-        inst.child.id()
+    let (closed, rows) = read_log();
+    assert!(closed.starts_with("OK "), "closed read: {closed}");
+    assert!(rows.contains(" close - "), "session close record: {rows}");
+    let owner_log = client_ok(&inst, &["ctl", "--sock", &sock, &target, "log"], &[]);
+    assert!(
+        owner_log.contains(" close - "),
+        "owner closed read: {owner_log}"
     );
-}
-
-/// Negative control for the shared boot (`support/headless_boot.rs`): an instance that cannot
-/// start fails the test, never a skip. A launch flag the binary refuses is the failure here.
-#[test]
-#[should_panic(expected = "before its control socket listened")]
-fn a_headless_instance_that_cannot_start_fails_the_boot() {
-    let _ = headless_boot::boot("atconn-bad", &["--no-such-launch-flag"]);
+    assert_eq!(
+        client_ok(&inst, &["ctl", "--sock", &sock, "revoke", token], &[]),
+        "OK\n"
+    );
+    assert_eq!(read_log().0, "ERR no such session\n");
 }

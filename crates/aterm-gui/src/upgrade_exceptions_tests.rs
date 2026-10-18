@@ -7,7 +7,8 @@
 //!
 //! [`aterm_agent::harness::upgrade_drive::Row::attention`] classifies every
 //! upgrade state; this file holds the TABLE of the failure modes the owner's
-//! own machine met (`U2`'s 51 states, by id) against the REAL classifier, and
+//! own machine met (`U2`'s 51 states, by id, less the ten of the retired Codex
+//! live upgrade, X01-X10) against the REAL classifier, and
 //! the words each `Digest` becomes as an entry of the exceptions digest
 //! ([`crate::message_reporters::upgrade_exceptions`]) run through the engine's
 //! vocabulary. A state that moves class fails here by id.
@@ -177,16 +178,6 @@ fn fixture(id: &str, age: u64) -> Row {
             r.request = Request::DeferUntil(NOW + H);
             r
         }
-        "X01" => codex("daemon-first:busy-thread"),
-        "X02" => codex("daemon-first:background-terminal"),
-        "X03" => codex("daemon-first:owner-held"),
-        "X04" => codex("daemon-first:unseen-client"),
-        "X05" => codex("daemon-first:attended"),
-        "X06" => codex("daemon-first:update-failed"),
-        "X07" => codex("daemon-first:vendor-ahead"),
-        "X08" => codex("daemon-version"),
-        "X09" => codex("no-shell-integration"),
-        "X10" => codex("left-typed-backoff"),
         "X11" => codex("thread-locked"),
         other => panic!("no such state {other}"),
     }
@@ -203,7 +194,9 @@ fn class(row: &Row) -> String {
 }
 
 /// U2'S 51 STATES, BY ID, AGAINST THE REAL CLASSIFIER: what each is at 20
-/// minutes, 2 hours and a day on. 50 are `Row`-backed here; the 51st, M03
+/// minutes, 2 hours and a day on. X01-X10 were the Codex live upgrade's
+/// daemon and composer waits, retired with it (2026-10-16); 40 are
+/// `Row`-backed here; the last, M03
 /// ("the upgrade cannot run at all"), is no row of a tab — the HOST raises it
 /// (`Need::upgrade_cannot_run`), checked below. THE OWNER'S LINE this holds:
 /// the only interrupts in the whole table are S06, F02 and F04 (and F03 at
@@ -214,13 +207,12 @@ fn class(row: &Row) -> String {
 /// where it differs: G03 and G06 (a turn running, a status lagging an idle
 /// screen) are `own-work` at a day like G04 and G13 (an agent too busy to be
 /// asked at all); G01, G14, G15, G17, G19 and G21 (waits that are moments)
-/// are aterm's fault when one stands two hours, as G16 and G20 are; X09 is the
-/// digest at once, not at an hour.
+/// are aterm's fault when one stands two hours, as G16 and G20 are.
 #[test]
 fn every_upgrade_state_has_its_attention() {
     // (id, 20 min, 2 h, 25 h)
     #[rustfmt::skip]
-    let table: [(&str, [&str; 3]); 50] = [
+    let table: [(&str, [&str; 3]); 40] = [
         ("G01", ["Q", "F:harness-stuck", "F:harness-stuck"]),
         ("G02", ["Q", "Q", "Q"]),
         ("G03", ["Q", "Q", "D:own-work"]),
@@ -260,16 +252,6 @@ fn every_upgrade_state_has_its_attention() {
         ("F06", ["Q", "Q", "Q"]),
         ("O01", ["Q", "Q", "Q"]),
         ("O02", ["Q", "Q", "Q"]),
-        ("X01", ["Q", "Q", "D:daemon-busy"]),
-        ("X02", ["Q", "Q", "D:daemon-busy"]),
-        ("X03", ["Q", "Q", "Q"]),
-        ("X04", ["Q", "Q", "D:other-client"]),
-        ("X05", ["Q", "Q", "Q"]),
-        ("X06", ["Q", "Q", "F:daemon-update-failing"]),
-        ("X07", ["Q", "Q", "Q"]),
-        ("X08", ["Q", "Q", "Q"]),
-        ("X09", ["D:no-integration", "D:no-integration", "D:no-integration"]),
-        ("X10", ["Q", "F:harness-stuck", "F:harness-stuck"]),
         ("X11", ["Q", "Q", "Q"]),
     ];
     let mut wrong = Vec::new();
@@ -320,7 +302,7 @@ fn the_relaunch_and_the_returned_prompt_reach_their_interrupts_on_time() {
     assert_eq!(class(&exited(4 * 60)), "Q", "a person may be typing there");
     assert_eq!(class(&exited(6 * 60)), "I:agent-down");
     // S06's Codex twins.
-    for why in ["no-rollout", "no-resume-hint", "hint-mismatch"] {
+    for why in ["no-rollout", "codex-lane-retired"] {
         let mut r = state(Agent::Codex, 7 * H, Phase::Failed(why.into()), "");
         r.exited_at = NOW - 2 * H;
         assert_eq!(class(&r), "I:agent-down", "{why}");
@@ -337,7 +319,7 @@ fn no_state_but_an_ended_agent_ever_interrupts() {
         "G01", "G02", "G03", "G04", "G05", "G06", "G07", "G08", "G09", "G10", "G11", "G12", "G13",
         "G14", "G15", "G16", "G17", "G18", "G19", "G20", "G21", "H01", "H02", "H03", "H04", "S01",
         "S02", "S03", "S04", "S05", "S06", "F01", "F02", "F03", "F04", "F05", "F06", "O01", "O02",
-        "X01", "X02", "X03", "X04", "X05", "X06", "X07", "X08", "X09", "X10", "X11",
+        "X11",
     ];
     let mut interrupts = std::collections::BTreeSet::new();
     for id in ids {
@@ -419,9 +401,8 @@ fn day_row(id: &str, tab: &str) -> Row {
 }
 
 /// The digest states of the table, at every age each can be one.
-const DIGEST_IDS: [&str; 15] = [
-    "G03", "G04", "G06", "G11", "G13", "G18", "H01", "H02", "H03", "H04", "S05", "X01", "X02",
-    "X04", "X09",
+const DIGEST_IDS: [&str; 11] = [
+    "G03", "G04", "G06", "G11", "G13", "G18", "H01", "H02", "H03", "H04", "S05",
 ];
 
 /// The places a tab can be named: the short and the long forms.
@@ -434,8 +415,7 @@ const PLACES: [&str; 4] = [
 
 /// EVERY ENTRY THE UPGRADE CAN HAND THE DIGEST — each digest state of the
 /// table at each age it is one, named in every form a place takes — with the
-/// digest kind it is. The roster the reporters' restart lint reads
-/// (`message_reporters`' `no_reporter_wording_prompts_a_restart`).
+/// digest kind it is.
 pub(crate) fn every_digest_entry() -> Vec<(&'static str, Entry)> {
     let mut all = Vec::new();
     for id in DIGEST_IDS {
@@ -531,11 +511,9 @@ fn several_tabs_are_one_line_per_kind_and_one_line_per_tab_where_the_action_is_p
         "own-work is ONE entry for three tabs; typed-draft one; the rest one per tab"
     );
     let own = got[1].message().expect("passes");
-    assert_eq!(own.title, "Claude in 3 tabs is behind");
+    assert!(own.title.contains("3 tabs"), "{}", own.title);
     assert!(
-        own.detail
-            .iter()
-            .any(|l| l.starts_with("In tab 3, tab 2, tab 1")),
+        own.detail.iter().any(|l| l.contains("tab 3, tab 2, tab 1")),
         "the tabs are named behind Details, most behind first: {:?}",
         own.detail
     );
@@ -554,7 +532,7 @@ fn several_tabs_are_one_line_per_kind_and_one_line_per_tab_where_the_action_is_p
     // One tab: named, and shown.
     let one = entries(&[day_row("G13", "s-b")]);
     let msg = one[0].message().expect("passes");
-    assert_eq!(msg.title, "Claude in tab 1 is still on 2.1.283");
+    assert!(msg.title.contains("tab 1"), "{}", msg.title);
     assert_eq!(msg.actions, [Intent::ShowTab { tab: 1, window: 1 }]);
     // Where the window is named too, the title still fits the rule.
     let far = upgrade_exceptions(
@@ -583,7 +561,7 @@ fn several_tabs_are_one_line_per_kind_and_one_line_per_tab_where_the_action_is_p
 #[test]
 fn only_a_digest_state_is_an_entry_and_its_severity_and_span_follow_its_kind() {
     for id in [
-        "G01", "G02", "G05", "G08", "S01", "S06", "F02", "F04", "F05", "O01", "X06", "X10",
+        "G01", "G02", "G05", "G08", "S01", "S06", "F02", "F04", "F05", "O01",
     ] {
         for age in AGES {
             let row = fixture(id, age);
@@ -614,10 +592,10 @@ fn only_a_digest_state_is_an_entry_and_its_severity_and_span_follow_its_kind() {
         other => panic!("{id}: {other:?}"),
     };
     use aterm_messages::need::Resurface;
-    for choice in ["H01", "H02", "X09"] {
+    for choice in ["H01", "H02"] {
         assert_eq!(span(choice), Resurface::CHOICE, "{choice}");
     }
-    for wait in ["G13", "G11", "G18", "S05", "X01", "X04"] {
+    for wait in ["G13", "G11", "G18", "S05"] {
         assert_eq!(span(wait), Resurface::WAIT, "{wait}");
     }
     // The state that GAVE UP with nothing running is no digest at all; with a

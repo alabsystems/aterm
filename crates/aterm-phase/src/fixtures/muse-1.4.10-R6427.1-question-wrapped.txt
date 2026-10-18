@@ -1,0 +1,46 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (60x50, aterm 0.105.0) running the real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab) · the stub's call `muse.request_user_input {questions: [{id: "shade", header: "Shade", question: "Which shade should the probe use for the long label test?", options: [{label: "Crimson red, the warm and loud one (Recommended)", description: "A long description that will certainly need to wrap onto the next row at sixty columns."}, {label: "Blue", description: "Cool and calm."}]}]}` in a 60-column tab: the question, before any key — each description under its label, indented seven, and the key row wrapped onto two rows · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+  Muse Code 1.4.10
+
+❯ toolstart
+
+◆ Wrote .agents/a-protected-note-with-a-rather-long-file-nam
+e-for-wrapping.md (+1)
+  1 +written by the lab stub
+
+◆ Tool call done. Result: wrote 24 bytes to
+  /private/tmp/at.lab0/proj/.agents/a-protected-note-with-a-
+  rather-long-file-name-for-wrapping.md
+
+❯ toolstart
+
+◆ Edited .agents/a-protected-note-with-a-rather-lo… — denied
+├ approval aborted
+│ The user rejected this action. Don't retry it unless they
+│ ask.
+└ (ctrl+o to expand)
+
+◆ Tool call done. Result: tool denied: approval aborted The
+  user rejected this action. Don't retry it unless they ask.
+
+❯ toolstart
+
+◆ Request user input Shade — running (44s)
+
+  Which shade should the probe use for the long label test?
+
+  ⟩ 1. Crimson red, the warm and loud one (Recommended)
+       A long description that will certainly need to wrap
+       onto the next row at sixty columns.
+    2. Blue
+       Cool and calm.
+    3. None of the above
+       Optionally, add details in notes (tab).
+
+  Enter to select · ↑/↓ to move · Tab for an optional note ·
+  Esc to interrupt
+
+── Voice input (⌥ + v to start) ────────────────────────────
+❯
+────────────────────────────────────────────────────────────
+  lab-stub · high · /private/tmp/at.lab0/proj · Auto-review

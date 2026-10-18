@@ -4,6 +4,9 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/ime/callbacks.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
+// Modified by the aterm project in 2026; see the repository NOTICE. (aterm-x11's XIM
+// declarations, where upstream used x11-dl's.)
+
 use std::collections::HashMap;
 use std::os::raw::c_char;
 use std::ptr;
@@ -76,7 +79,7 @@ pub(crate) unsafe fn set_destroy_callback(
         xim_set_callback(
             xconn,
             im,
-            ffi::XNDestroyCallback_0.as_ptr() as *const _,
+            ffi::xn::DESTROY_CALLBACK.as_ptr() as *const _,
             &inner.destroy_callback as *const _ as *mut _,
         )
     }

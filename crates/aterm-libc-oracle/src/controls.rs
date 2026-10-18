@@ -25,9 +25,6 @@ use std::fmt;
 use std::io;
 use std::path::Path;
 
-use aterm_json::Value;
-use serde::Serialize;
-
 use crate::cargo::{Build, DocTarget, Outcome, Workspace};
 use crate::cells::{self, Cell, Os};
 use crate::rustdoc::Doc;
@@ -36,10 +33,10 @@ use crate::siblings::{self, SiblingFinding};
 use crate::symbols::{self, SymbolDiff};
 use crate::trust::Trust;
 use crate::verdict::CouldNotRun;
+use aterm_json::Value;
 
 /// One planted defect class.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ControlId {
     /// An architecture-only edit to one family's hand-written bodies.
     SiblingBody { os: Os },
@@ -97,8 +94,7 @@ impl ControlId {
 }
 
 /// How a control failed.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(tag = "failure", rename_all = "snake_case")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ControlFailure {
     /// The unmutated subject already shows the defect, so planting it proves
     /// nothing.
@@ -890,15 +886,6 @@ mod tests {
             apply("f.rs", "x", &[Edit::Append("\ny")]).as_deref(),
             Ok("x\ny")
         );
-    }
-
-    #[test]
-    fn the_primitive_mutation_withdraws_c_int_from_one_cell_only() {
-        let block = without_c_int_on(FOREIGN_CFG);
-        assert!(!block.contains("c_float, c_int, c_long"));
-        assert!(block.ends_with(&format!(
-            "#[cfg(not({FOREIGN_CFG}))]\npub use core::ffi::c_int;"
-        )));
     }
 
     #[test]

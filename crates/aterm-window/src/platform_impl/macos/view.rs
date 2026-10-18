@@ -30,10 +30,10 @@ use std::ptr;
 // a bare `NSInteger` and `NSAttributedStringKey` a bare `NSString *`.
 use aterm_objc::send::{
     alloc, send_bool, send_bool_cls, send_bool_id, send_f64, send_id, send_id_id,
-    send_id_idptr_usize, send_id_usize, send_isize, send_isize_rect_id_ptr_bool, send_point,
-    send_point_point_id, send_rect, send_rect_rect, send_rect_rect_id, send_u16, send_usize,
-    send_usize_usize, send_v, send_v_bool, send_v_id, send_v_id_sel_id_id, send_v_isize,
-    send_v_rect_id,
+    send_id_idptr_usize, send_id_usize, send_id_usize_point_usize_f64_isize_id_id_id_bool_u16,
+    send_isize, send_isize_rect_id_ptr_bool, send_point, send_point_point_id, send_rect,
+    send_rect_rect, send_rect_rect_id, send_u16, send_usize, send_usize_usize, send_v, send_v_bool,
+    send_v_id, send_v_id_sel_id_id, send_v_isize, send_v_rect_id,
 };
 use aterm_objc::{
     autoreleasepool, class, sel, Bool, CGPoint, CGRect, CGSize, Id, NSRange, Obj, Sel, WeakObj,
@@ -43,8 +43,8 @@ use super::app_state::ApplicationDelegate;
 use super::aterm_objc_seam::{self as seam, consts};
 use super::cursor::default_cursor;
 use super::event::{
-    code_to_key, code_to_location, create_key_event, event_mods, scancode_to_physicalkey,
-    KeyEventExtra,
+    code_to_key, code_to_location, create_key_event, event_mods, option_is_alt,
+    scancode_to_physicalkey, KeyEventExtra,
 };
 use super::window::WinitWindow;
 use super::DEVICE_ID;
@@ -53,6 +53,7 @@ use crate::event::{
     ElementState, Ime, KeyEvent, Modifiers, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent,
 };
 use crate::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, NamedKey};
+use crate::platform::macos::OptionAsAlt;
 
 // LOCAL PATCH (aterm), 2026-10-16 (winit-core step 5): the cursor is always visible
 // (`set_cursor_visible` is gone, and with it the `visible` flag and the transparent-GIF
@@ -163,6 +164,10 @@ pub struct ViewState {
     /// True if the current key event should be forwarded
     /// to the application, even during IME
     forward_key_to_app: Cell<bool>,
+
+    /// LOCAL PATCH (aterm), 2026-10-16: upstream's option-as-alt, restored
+    /// (`WindowExtMacOS::set_option_as_alt`; read by `replace_event`).
+    option_as_alt: Cell<OptionAsAlt>,
 
     // LOCAL PATCH (aterm): `Retained<NSMutableAttributedString>` -> `Obj`, and
     // no longer `Default`-constructed: an empty attributed string is a message
@@ -642,7 +647,7 @@ aterm_objc::declare_class! {
             // Get the characters from the event.
             let old_ime_state = self.ivars().ime_state.get();
             self.ivars().forward_key_to_app.set(false);
-            let event = copy_event(event);
+            let event = replace_event(event, self.ivars().option_as_alt.get());
 
             // The `interpretKeyEvents` function might call
             // `setMarkedText`, `insertText`, and `doCommandBySelector`.
@@ -704,7 +709,7 @@ aterm_objc::declare_class! {
         @sel(keyUp:)
         fn key_up(&self, event: Id) {
             trace_scope!("keyUp:");
-            let event = copy_event(event);
+            let event = replace_event(event, self.ivars().option_as_alt.get());
             self.update_modifiers(event.id(), false);
 
             // We want to send keyboard input when we are currently in the ground state.
@@ -1003,6 +1008,7 @@ impl WinitView {
             input_source: Default::default(),
             ime_allowed: Default::default(),
             forward_key_to_app: Default::default(),
+            option_as_alt: Default::default(),
             // LOCAL PATCH (aterm): explicit — `Obj` has no `Default`.
             marked_text: RefCell::new(new_marked_text()),
             // LOCAL PATCH (aterm): `WeakId::new(window.ns_window())` needed the
@@ -1201,6 +1207,14 @@ impl WinitView {
     pub(super) fn set_cursor_icon(&self, icon: Obj) {
         let mut cursor_state = self.ivars().cursor_state.borrow_mut();
         cursor_state.cursor = icon;
+    }
+
+    pub(super) fn set_option_as_alt(&self, option_as_alt: OptionAsAlt) {
+        self.ivars().option_as_alt.set(option_as_alt);
+    }
+
+    pub(super) fn option_as_alt(&self) -> OptionAsAlt {
+        self.ivars().option_as_alt.get()
     }
 
     pub(super) fn set_ime_allowed(&self, ime_allowed: bool) {
@@ -1525,13 +1539,71 @@ fn mouse_button(event: Id) -> MouseButton {
     }
 }
 
-/// A +1 copy of the key event the `keyDown:`/`keyUp:` rows work on.
+/// The +1 key event the `keyDown:`/`keyUp:` rows work on: rebuilt without its Option
+/// characters when `option_as_alt` makes the held Option an Alt ([`option_is_alt`]), a copy
+/// otherwise.
 ///
-/// LOCAL PATCH (aterm), 2026-10-15 (winit-core step 5): upstream's `replace_event` rebuilt the
-/// event without its Option characters when `OptionAsAlt` asked for it, and copied it otherwise.
-/// `OptionAsAlt` is cut (nothing in aterm set it, so it was always `None`), and this is the copy
-/// that branch made. The rebuild is the likely fix for an open input bug (Option dead keys compose
-/// in aterm's Meta mode): docs/AUDIT-input-encoding-2026-10-09.md, lead L1.
+/// The rebuilt event's characters are the original's `-charactersIgnoringModifiers` (what the
+/// key types without Option, Shift kept); its type, location, modifier flags, timestamp, window,
+/// repeat flag and key code are the original's. `-interpretKeyEvents:` then has no Option glyph
+/// to insert, and `create_key_event` reads the layout's character as the key event's text
+/// (German Option+Shift+2 is `"`), while the flags still report Alt. Whether AppKit's input
+/// method also leaves a dead key (Option+e on the U.S. layout) uncomposed is the windowed IME
+/// drive's to measure (`crates/aterm-gui/examples/objc_ime_drive.rs`, stage 8).
+///
+/// LOCAL PATCH (aterm), 2026-10-16 (ATERM-KI-1015-9): upstream's `replace_event`, which winit-core
+/// step 5 (2026-10-15) had cut with `OptionAsAlt`, restored. Upstream rebuilt any event; this one
+/// rebuilds only a key-down or key-up (the getters below raise on anything else, and a raise
+/// inside a trampoline aborts) with a non-empty `-charactersIgnoringModifiers`.
+fn replace_event(event: Id, option_as_alt: OptionAsAlt) -> Obj {
+    // SAFETY: `event` is the live `NSEvent` AppKit delivered; `-type` and `-modifierFlags` are
+    // `Q16@0:8` and answer for every event type.
+    let (kind, flags) =
+        unsafe { (send_usize(event, sel!(type)), send_usize(event, sel!(modifierFlags))) };
+    if !(10..=11).contains(&kind) || !option_is_alt(option_as_alt, flags) {
+        return copy_event(event);
+    }
+    autoreleasepool(|_| {
+        // SAFETY: a key event (checked above) answers `-charactersIgnoringModifiers`
+        // (`@16@0:8`, +0 autoreleased into this pool).
+        let chars = unsafe { send_id(event, sel!(charactersIgnoringModifiers)) };
+        // SAFETY: `chars` is nil or the live `NSString` just read.
+        if chars.is_null() || unsafe { seam::nsstring_to_rust(chars) }.is_empty() {
+            return copy_event(event);
+        }
+        // SAFETY: the receiver is the `NSEvent` class and the arguments are
+        // `+keyEventWithType:location:modifierFlags:timestamp:windowNumber:context:characters:
+        // charactersIgnoringModifiers:isARepeat:keyCode:`'s prototype, the one
+        // `send_id_usize_point_usize_f64_isize_id_id_id_bool_u16` names; every argument is read
+        // off the live key event with its getter's own encoding (`-locationInWindow`
+        // `{CGPoint=dd}16@0:8`, `-timestamp` `d16@0:8`, `-windowNumber` `q16@0:8`,
+        // `-isARepeat` `B16@0:8`, `-keyCode` `S16@0:8`); a nil `context:` is documented. The
+        // result is +0 autoreleased into this pool.
+        let rebuilt = unsafe {
+            send_id_usize_point_usize_f64_isize_id_id_id_bool_u16(
+                class(c"NSEvent").as_id(),
+                sel!(
+                    keyEventWithType:location:modifierFlags:timestamp:windowNumber:context:characters:charactersIgnoringModifiers:isARepeat:keyCode:
+                ),
+                kind,
+                send_point(event, sel!(locationInWindow)),
+                flags,
+                send_f64(event, sel!(timestamp)),
+                send_isize(event, sel!(windowNumber)),
+                Id::NIL,
+                chars,
+                chars,
+                send_bool(event, sel!(isARepeat)),
+                send_u16(event, sel!(keyCode)),
+            )
+        };
+        // SAFETY: `rebuilt` is nil or the live autoreleased event; `Obj::retain` takes its own
+        // +1 before the pool drains, and answers `None` for nil.
+        unsafe { Obj::retain(rebuilt) }.unwrap_or_else(|| copy_event(event))
+    })
+}
+
+/// A +1 copy of a key event (`replace_event` with nothing to rebuild).
 fn copy_event(event: Id) -> Obj {
     // SAFETY: `-copy` is `@16@0:8` and is in the `copy` family, so the
     // result is +1 and is ADOPTED rather than retained.

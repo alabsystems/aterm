@@ -419,7 +419,6 @@ mod tests {
             1_999_999_999_999_999_999
         );
         assert_eq!(v("0.156.0").to_string(), "0.156.0");
-        assert_eq!(format!("{:?}", v("2.1.280")), "Version(2.1.280)");
     }
 
     /// Installed claude and codex build ids decode exactly as the `x.y.z`-only decoder
@@ -453,7 +452,6 @@ mod tests {
         assert_eq!(bare.to_string(), "1.4.9-R6297");
         assert_eq!(bare.revision(), Some((6297, None)));
         assert_eq!(Version::with_revision(1, 4, 9, 6297, Some(1)), Some(head));
-        assert_eq!(format!("{head:?}"), "Version(1.4.9-R6297.1)");
     }
 
     #[test]

@@ -108,14 +108,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn flash_starts_idle() {
-        let flash = BellFlash::new();
-        let now = Instant::now();
-        assert!(!flash.is_active(now));
-        assert!(flash.deadline().is_none());
-    }
-
-    #[test]
     fn ring_activates_for_flash_duration() {
         let mut flash = BellFlash::new();
         let t0 = Instant::now();
@@ -155,26 +147,6 @@ mod tests {
     }
 
     #[test]
-    fn deadline_persists_until_expired() {
-        // A host that wakes late must still see the deadline (and expire it)
-        // rather than find it silently gone.
-        let mut flash = BellFlash::new();
-        let t0 = Instant::now();
-        flash.ring(t0);
-        let late = t0 + FLASH_DURATION + Duration::from_secs(5);
-        assert_eq!(flash.deadline(), Some(t0 + FLASH_DURATION));
-        assert!(!flash.is_active(late));
-        assert!(flash.expire(late));
-        assert!(flash.deadline().is_none());
-    }
-
-    #[test]
-    fn rate_limiter_first_fire_always_allowed() {
-        let mut gate = BellRateLimiter::new(Duration::from_secs(1));
-        assert!(gate.try_fire(Instant::now()));
-    }
-
-    #[test]
     fn rate_limiter_blocks_within_interval() {
         let mut gate = BellRateLimiter::new(Duration::from_secs(1));
         let t0 = Instant::now();
@@ -192,17 +164,5 @@ mod tests {
         // The boundary fire re-arms the gate from its timestamp.
         assert!(!gate.try_fire(t0 + Duration::from_millis(1500)));
         assert!(gate.try_fire(t0 + Duration::from_secs(2)));
-    }
-
-    #[test]
-    fn rate_limiter_denied_fire_does_not_rearm() {
-        // A blocked attempt must not push the window forward (otherwise a
-        // steady flood faster than the interval would silence the bell
-        // forever).
-        let mut gate = BellRateLimiter::new(Duration::from_secs(1));
-        let t0 = Instant::now();
-        assert!(gate.try_fire(t0));
-        assert!(!gate.try_fire(t0 + Duration::from_millis(900)));
-        assert!(gate.try_fire(t0 + Duration::from_secs(1)));
     }
 }

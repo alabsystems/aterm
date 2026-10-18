@@ -4,14 +4,14 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/util/window_property.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
+// Modified by the aterm project in 2026; see the repository NOTICE. (GetProperty and
+// ChangeProperty are aterm-x11's encoders, and a property's items `PropertyItem`s, where
+// upstream used x11rb's requests and bytemuck's `Pod`.)
+
 use std::error::Error;
 use std::fmt;
-use std::sync::Arc;
 
-use bytemuck::{NoUninit, Pod};
-
-use x11rb::connection::Connection;
-use x11rb::errors::ReplyError;
+use aterm_x11::proto::xproto::{GetPropertyReply, PropMode};
 
 use super::*;
 
@@ -19,9 +19,48 @@ pub const CARDINAL_SIZE: usize = mem::size_of::<u32>();
 
 pub type Cardinal = u32;
 
+/// An item of a property's value: 8-bit (`u8`) or 32-bit (`u32`, an atom, window or
+/// cardinal), in this client's byte order on the wire, as libxcb sends and receives it.
+/// Upstream bounded these by bytemuck's `Pod`; these are the two the backend reads and
+/// writes.
+pub trait PropertyItem: Copy {
+    /// The property format, in bits.
+    const FORMAT: u8;
+
+    /// Append the reply's whole items to `out`; a trailing partial item is dropped.
+    fn extend_from(bytes: &[u8], out: &mut Vec<Self>);
+
+    /// The items as the bytes ChangeProperty sends.
+    fn to_bytes(items: &[Self]) -> Vec<u8>;
+}
+
+impl PropertyItem for u8 {
+    const FORMAT: u8 = 8;
+
+    fn extend_from(bytes: &[u8], out: &mut Vec<Self>) {
+        out.extend_from_slice(bytes);
+    }
+
+    fn to_bytes(items: &[Self]) -> Vec<u8> {
+        items.to_vec()
+    }
+}
+
+impl PropertyItem for u32 {
+    const FORMAT: u8 = 32;
+
+    fn extend_from(bytes: &[u8], out: &mut Vec<Self>) {
+        out.extend(bytes.chunks_exact(4).map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]])));
+    }
+
+    fn to_bytes(items: &[Self]) -> Vec<u8> {
+        items.iter().flat_map(|v| v.to_ne_bytes()).collect()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum GetPropertyError {
-    X11rbError(Arc<ReplyError>),
+    X11Error(aterm_x11::Error),
     TypeMismatch(xproto::Atom),
     FormatMismatch(c_int),
 }
@@ -36,16 +75,16 @@ impl GetPropertyError {
     }
 }
 
-impl<T: Into<ReplyError>> From<T> for GetPropertyError {
-    fn from(e: T) -> Self {
-        Self::X11rbError(Arc::new(e.into()))
+impl From<aterm_x11::Error> for GetPropertyError {
+    fn from(e: aterm_x11::Error) -> Self {
+        Self::X11Error(e)
     }
 }
 
 impl fmt::Display for GetPropertyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            GetPropertyError::X11rbError(err) => err.fmt(f),
+            GetPropertyError::X11Error(err) => err.fmt(f),
             GetPropertyError::TypeMismatch(err) => write!(f, "type mismatch: {err}"),
             GetPropertyError::FormatMismatch(err) => write!(f, "format mismatch: {err}"),
         }
@@ -59,144 +98,66 @@ impl Error for GetPropertyError {}
 const PROPERTY_BUFFER_SIZE: u32 = 1024; // 4k of RAM ought to be enough for anyone!
 
 impl XConnection {
-    pub fn get_property<T: Pod>(
+    pub fn get_property<T: PropertyItem>(
         &self,
         window: xproto::Window,
         property: xproto::Atom,
         property_type: xproto::Atom,
     ) -> Result<Vec<T>, GetPropertyError> {
-        let mut iter = PropIterator::new(self.xcb_connection(), window, property, property_type);
         let mut data = vec![];
-
+        let mut offset = 0;
         loop {
-            if !iter.next_window(&mut data)? {
+            // Send the request and wait for the reply.
+            let reply: GetPropertyReply = self
+                .xcb_connection()
+                .send(xproto::get_property(
+                    false,
+                    window,
+                    property,
+                    property_type,
+                    offset,
+                    PROPERTY_BUFFER_SIZE,
+                ))?
+                .reply()?;
+
+            // Make sure that the reply is of the correct type.
+            if reply.type_ != property_type {
+                return Err(GetPropertyError::TypeMismatch(reply.type_));
+            }
+
+            // Make sure that the reply is of the correct format.
+            if reply.format != T::FORMAT {
+                return Err(GetPropertyError::FormatMismatch(reply.format.into()));
+            }
+
+            // Append the data to the output.
+            T::extend_from(&reply.value, &mut data);
+
+            // Check `bytes_after` to see if there are more windows to fetch.
+            if reply.bytes_after == 0 {
                 break;
             }
+            offset += PROPERTY_BUFFER_SIZE;
         }
 
         Ok(data)
     }
 
-    pub fn change_property<'a, T: NoUninit>(
+    pub fn change_property<'a, T: PropertyItem>(
         &'a self,
         window: xproto::Window,
         property: xproto::Atom,
         property_type: xproto::Atom,
-        mode: xproto::PropMode,
+        mode: PropMode,
         new_value: &[T],
     ) -> Result<VoidCookie<'a>, X11Error> {
-        assert!([1usize, 2, 4].contains(&mem::size_of::<T>()));
-        self.xcb_connection()
-            .change_property(
-                mode,
-                window,
-                property,
-                property_type,
-                (mem::size_of::<T>() * 8) as u8,
-                new_value.len().try_into().expect("too many items for property"),
-                bytemuck::cast_slice::<T, u8>(new_value),
-            )
-            .map_err(Into::into)
-    }
-}
-
-/// An iterator over the "windows" of the property that we are fetching.
-struct PropIterator<'a, C: ?Sized, T> {
-    /// Handle to the connection.
-    conn: &'a C,
-
-    /// The window that we're fetching the property from.
-    window: xproto::Window,
-
-    /// The property that we're fetching.
-    property: xproto::Atom,
-
-    /// The type of the property that we're fetching.
-    property_type: xproto::Atom,
-
-    /// The offset of the next window, in 32-bit chunks.
-    offset: u32,
-
-    /// The format of the type.
-    format: u8,
-
-    /// Keep a reference to `T`.
-    _phantom: std::marker::PhantomData<T>,
-}
-
-impl<'a, C: Connection + ?Sized, T: Pod> PropIterator<'a, C, T> {
-    /// Create a new property iterator.
-    fn new(
-        conn: &'a C,
-        window: xproto::Window,
-        property: xproto::Atom,
-        property_type: xproto::Atom,
-    ) -> Self {
-        let format = match mem::size_of::<T>() {
-            1 => 8,
-            2 => 16,
-            4 => 32,
-            _ => unreachable!(),
-        };
-
-        Self {
-            conn,
+        self.send_void(xproto::change_property(
+            mode,
             window,
             property,
             property_type,
-            offset: 0,
-            format,
-            _phantom: Default::default(),
-        }
-    }
-
-    /// Get the next window and append it to `data`.
-    ///
-    /// Returns whether there are more windows to fetch.
-    fn next_window(&mut self, data: &mut Vec<T>) -> Result<bool, GetPropertyError> {
-        // Send the request and wait for the reply.
-        let reply = self
-            .conn
-            .get_property(
-                false,
-                self.window,
-                self.property,
-                self.property_type,
-                self.offset,
-                PROPERTY_BUFFER_SIZE,
-            )?
-            .reply()?;
-
-        // Make sure that the reply is of the correct type.
-        if reply.type_ != self.property_type {
-            return Err(GetPropertyError::TypeMismatch(reply.type_));
-        }
-
-        // Make sure that the reply is of the correct format.
-        if reply.format != self.format {
-            return Err(GetPropertyError::FormatMismatch(reply.format.into()));
-        }
-
-        // Append the data to the output.
-        if mem::size_of::<T>() == 1 && mem::align_of::<T>() == 1 {
-            // We can just do a bytewise append.
-            data.extend_from_slice(bytemuck::cast_slice(&reply.value));
-        } else {
-            // Rust's borrowing and types system makes this a bit tricky.
-            //
-            // We need to make sure that the data is properly aligned. Unfortunately the best
-            // safe way to do this is to copy the data to another buffer and then append.
-            //
-            // TODO(notgull): It may be worth it to use `unsafe` to copy directly from
-            // `reply.value` to `data`; check if this is faster. Use benchmarks!
-            let old_len = data.len();
-            let added_len = reply.value.len() / mem::size_of::<T>();
-            data.resize(old_len + added_len, T::zeroed());
-            bytemuck::cast_slice_mut::<T, u8>(&mut data[old_len..]).copy_from_slice(&reply.value);
-        }
-
-        // Check `bytes_after` to see if there are more windows to fetch.
-        self.offset += PROPERTY_BUFFER_SIZE;
-        Ok(reply.bytes_after != 0)
+            T::FORMAT,
+            &T::to_bytes(new_value),
+        ))
     }
 }

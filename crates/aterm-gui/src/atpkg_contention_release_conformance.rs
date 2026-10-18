@@ -7,7 +7,8 @@ use crate::{
     BumpWatch, CONTENTION_WEDGE_PARK, LiveSwitch, LoopGate, PARK_SLICE, ParkEnd, ParkProbes,
     PassWhy, park_slice, sleep_interval_watching_bump, store_release_park_end,
 };
-use aterm_spec::derive::{Model, atpkg_contention_release_park_model};
+use aterm_models_atpkg::atpkg_contention_release_park_model;
+use aterm_spec::derive::Model;
 use aterm_spec::interp::State;
 use aterm_spec::verify::validate_transition_tiered;
 use std::time::{Duration, SystemTime};

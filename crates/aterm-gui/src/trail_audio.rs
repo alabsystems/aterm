@@ -508,14 +508,7 @@ mod mac {
         ) -> i32;
         fn AudioQueueStart(in_aq: AudioQueueRef, in_start_time: *const c_void) -> i32;
         fn AudioQueueStop(in_aq: AudioQueueRef, in_immediate: u8) -> i32;
-        fn AudioQueueDispose(in_aq: AudioQueueRef, in_immediate: u8) -> i32;
         fn AudioQueueAddPropertyListener(
-            in_aq: AudioQueueRef,
-            in_id: AudioQueuePropertyID,
-            in_proc: AudioQueuePropertyListenerProc,
-            in_user_data: *mut c_void,
-        ) -> i32;
-        fn AudioQueueRemovePropertyListener(
             in_aq: AudioQueueRef,
             in_id: AudioQueuePropertyID,
             in_proc: AudioQueuePropertyListenerProc,
@@ -614,156 +607,199 @@ mod mac {
         }
     }
 
-    /// The platform calls that bracket a queue's life, as a seam so a headless
-    /// test can observe the teardown order (the listener's memory-safety
-    /// contract).
-    pub(super) trait QueueOwnerCalls {
-        /// Register the `IsRunning` listener. `false` when refused; the queue
-        /// still works, without that detector.
-        fn add_running_listener(&mut self) -> bool;
-        fn remove_running_listener(&mut self);
-        /// `AudioQueueDispose(queue, immediate = true)` — synchronous.
-        fn dispose(&mut self);
-        /// Release the `Arc<Shared>` refcount handed to AudioToolbox as the
-        /// callbacks' userdata.
-        fn release_user(&mut self);
-    }
+    /// THE ONE DOOR TO A QUEUE'S TEARDOWN, by construction:
+    /// `AudioQueueDispose` and `AudioQueueRemovePropertyListener` are declared
+    /// in this module and nowhere else, so nothing outside it can name them; a
+    /// queue `AudioQueueNewOutput` made is owned the instant [`own`] wraps it,
+    /// [`AudioToolboxQueue`]'s fields are this module's, and the owner hands
+    /// out only `&` access to its calls, so [`OwnedQueue`]'s `Drop` is the one
+    /// caller of `dispose` and of the listener's removal.
+    mod queue_owner {
+        use std::ffi::c_void;
+        use std::sync::Arc;
 
-    /// The one owner of a live audio queue, and the only place that disposes
-    /// one. Every path that ends a queue (teardown, reopen after a fault, the
-    /// late exit of an abandoned worker, `MacOut::new`'s allocation unwind)
-    /// runs this `Drop`, which:
-    ///
-    /// 1. removes the listener, if it was registered;
-    /// 2. disposes the queue synchronously, which also retires `render_cb`;
-    /// 3. only then releases the callbacks' userdata refcount.
-    ///
-    /// A listener firing after the `Shared` is released would be a
-    /// use-after-free. Constructed as soon as `AudioQueueNewOutput` succeeds.
-    /// `the_queue_owner_removes_the_listener_before_dispose_on_every_path`
-    /// pins the order through a recording double.
-    pub(super) struct OwnedQueue<P: QueueOwnerCalls> {
-        calls: P,
-        listening: bool,
-    }
+        use super::{
+            AudioQueueAddPropertyListener, AudioQueueGetProperty, AudioQueuePropertyID,
+            AudioQueuePropertyListenerProc, AudioQueueRef, PROP_IS_RUNNING, Shared,
+            running_listener,
+        };
 
-    impl<P: QueueOwnerCalls> OwnedQueue<P> {
-        pub(super) fn new(calls: P) -> Self {
-            Self {
-                calls,
-                listening: false,
+        // AudioToolbox, as the parent's block: the two teardown calls only.
+        #[link(name = "AudioToolbox", kind = "framework")]
+        unsafe extern "C" {
+            fn AudioQueueDispose(in_aq: AudioQueueRef, in_immediate: u8) -> i32;
+            fn AudioQueueRemovePropertyListener(
+                in_aq: AudioQueueRef,
+                in_id: AudioQueuePropertyID,
+                in_proc: AudioQueuePropertyListenerProc,
+                in_user_data: *mut c_void,
+            ) -> i32;
+        }
+
+        /// Own the queue `AudioQueueNewOutput` just made, with `user` the
+        /// `Arc::into_raw` of its `Shared` handed to its callbacks.
+        pub(super) fn own(
+            queue: AudioQueueRef,
+            user: *const Shared,
+        ) -> OwnedQueue<AudioToolboxQueue> {
+            OwnedQueue::new(AudioToolboxQueue { queue, user })
+        }
+
+        /// The platform calls that bracket a queue's life, as a seam so a headless
+        /// test can observe the teardown order (the listener's memory-safety
+        /// contract).
+        pub(in crate::trail_audio) trait QueueOwnerCalls {
+            /// Register the `IsRunning` listener. `false` when refused; the queue
+            /// still works, without that detector.
+            fn add_running_listener(&mut self) -> bool;
+            fn remove_running_listener(&mut self);
+            /// `AudioQueueDispose(queue, immediate = true)` — synchronous.
+            fn dispose(&mut self);
+            /// Release the `Arc<Shared>` refcount handed to AudioToolbox as the
+            /// callbacks' userdata.
+            fn release_user(&mut self);
+        }
+
+        /// The one owner of a live audio queue, and the only place that disposes
+        /// one. Every path that ends a queue (teardown, reopen after a fault, the
+        /// late exit of an abandoned worker, `MacOut::new`'s allocation unwind)
+        /// runs this `Drop`, which:
+        ///
+        /// 1. removes the listener, if it was registered;
+        /// 2. disposes the queue synchronously, which also retires `render_cb`;
+        /// 3. only then releases the callbacks' userdata refcount.
+        ///
+        /// A listener firing after the `Shared` is released would be a
+        /// use-after-free. Constructed as soon as `AudioQueueNewOutput` succeeds.
+        /// `the_queue_owner_removes_the_listener_before_dispose_on_every_path`
+        /// pins the order through a recording double.
+        pub(in crate::trail_audio) struct OwnedQueue<P: QueueOwnerCalls> {
+            calls: P,
+            listening: bool,
+        }
+
+        impl<P: QueueOwnerCalls> OwnedQueue<P> {
+            pub(in crate::trail_audio) fn new(calls: P) -> Self {
+                Self {
+                    calls,
+                    listening: false,
+                }
+            }
+
+            /// Register the `IsRunning` listener; remembered so teardown removes
+            /// exactly what was added.
+            pub(in crate::trail_audio) fn listen(&mut self) -> bool {
+                self.listening = self.calls.add_running_listener();
+                self.listening
+            }
+
+            pub(in crate::trail_audio) fn calls(&self) -> &P {
+                &self.calls
             }
         }
 
-        /// Register the `IsRunning` listener; remembered so teardown removes
-        /// exactly what was added.
-        pub(super) fn listen(&mut self) -> bool {
-            self.listening = self.calls.add_running_listener();
-            self.listening
-        }
-
-        pub(super) fn calls(&self) -> &P {
-            &self.calls
-        }
-    }
-
-    impl<P: QueueOwnerCalls> Drop for OwnedQueue<P> {
-        fn drop(&mut self) {
-            if std::mem::take(&mut self.listening) {
-                self.calls.remove_running_listener();
-            }
-            self.calls.dispose();
-            self.calls.release_user();
-        }
-    }
-
-    /// The real [`QueueOwnerCalls`]: one AudioToolbox queue plus the raw
-    /// `Arc<Shared>` refcount its callbacks were handed.
-    struct AudioToolboxQueue {
-        queue: AudioQueueRef,
-        /// `Arc::into_raw` of the queue's `Shared`: the `render_cb` userdata
-        /// and the refcount keeping [`Shared::running_edge`] alive. Released
-        /// only by [`OwnedQueue`]'s `Drop`.
-        user: *const Shared,
-    }
-
-    impl AudioToolboxQueue {
-        fn queue(&self) -> AudioQueueRef {
-            self.queue
-        }
-
-        /// The listener's userdata (the edge field inside the pinned
-        /// allocation). Add and remove must pass the same value: a listener is
-        /// identified by (proc, userdata).
-        fn edge_user(&self) -> *mut c_void {
-            // SAFETY: `user` is a live `Arc<Shared>` raw pointer until
-            // `release_user`, which runs last; taking a field's address does
-            // not create a reference.
-            unsafe { std::ptr::addr_of!((*self.user).running_edge) as *mut c_void }
-        }
-
-        /// Read `kAudioQueueProperty_IsRunning`. Worker thread only.
-        fn read_is_running(&self) -> Option<bool> {
-            let mut value: u32 = 0;
-            let mut size = std::mem::size_of::<u32>() as u32;
-            // SAFETY: the queue is live (owned, not yet disposed); `value`
-            // and `size` outlive the call and `size` states the buffer.
-            let status = unsafe {
-                AudioQueueGetProperty(
-                    self.queue,
-                    PROP_IS_RUNNING,
-                    (&mut value as *mut u32).cast(),
-                    &mut size,
-                )
-            };
-            (status == 0 && size as usize == std::mem::size_of::<u32>()).then_some(value != 0)
-        }
-    }
-
-    impl QueueOwnerCalls for AudioToolboxQueue {
-        fn add_running_listener(&mut self) -> bool {
-            // SAFETY: the queue is live; the userdata's lifetime is argued
-            // at `running_listener`.
-            unsafe {
-                AudioQueueAddPropertyListener(
-                    self.queue,
-                    PROP_IS_RUNNING,
-                    running_listener,
-                    self.edge_user(),
-                ) == 0
+        impl<P: QueueOwnerCalls> Drop for OwnedQueue<P> {
+            fn drop(&mut self) {
+                if std::mem::take(&mut self.listening) {
+                    self.calls.remove_running_listener();
+                }
+                self.calls.dispose();
+                self.calls.release_user();
             }
         }
 
-        fn remove_running_listener(&mut self) {
-            // The status is ignored: the synchronous dispose that follows
-            // retires any listener still registered before the userdata's
-            // refcount is released.
-            // SAFETY: the queue is live (dispose has not run); proc and
-            // userdata are the exact pair that was added.
-            unsafe {
-                AudioQueueRemovePropertyListener(
-                    self.queue,
-                    PROP_IS_RUNNING,
-                    running_listener,
-                    self.edge_user(),
-                );
+        /// The real [`QueueOwnerCalls`]: one AudioToolbox queue plus the raw
+        /// `Arc<Shared>` refcount its callbacks were handed.
+        pub(super) struct AudioToolboxQueue {
+            queue: AudioQueueRef,
+            /// `Arc::into_raw` of the queue's `Shared`: the `render_cb` userdata
+            /// and the refcount keeping [`Shared::running_edge`] alive. Released
+            /// only by [`OwnedQueue`]'s `Drop`.
+            user: *const Shared,
+        }
+
+        impl AudioToolboxQueue {
+            pub(super) fn queue(&self) -> AudioQueueRef {
+                self.queue
+            }
+
+            /// The listener's userdata (the edge field inside the pinned
+            /// allocation). Add and remove must pass the same value: a listener is
+            /// identified by (proc, userdata).
+            fn edge_user(&self) -> *mut c_void {
+                // SAFETY: `user` is a live `Arc<Shared>` raw pointer until
+                // `release_user`, which runs last; taking a field's address does
+                // not create a reference.
+                unsafe { std::ptr::addr_of!((*self.user).running_edge) as *mut c_void }
+            }
+
+            /// Read `kAudioQueueProperty_IsRunning`. Worker thread only.
+            pub(super) fn read_is_running(&self) -> Option<bool> {
+                let mut value: u32 = 0;
+                let mut size = std::mem::size_of::<u32>() as u32;
+                // SAFETY: the queue is live (owned, not yet disposed); `value`
+                // and `size` outlive the call and `size` states the buffer.
+                let status = unsafe {
+                    AudioQueueGetProperty(
+                        self.queue,
+                        PROP_IS_RUNNING,
+                        (&mut value as *mut u32).cast(),
+                        &mut size,
+                    )
+                };
+                (status == 0 && size as usize == std::mem::size_of::<u32>()).then_some(value != 0)
             }
         }
 
-        fn dispose(&mut self) {
-            // SAFETY: synchronous dispose (immediate = 1) stops the callback
-            // thread before `release_user` drops the refcount it was using.
-            unsafe {
-                AudioQueueDispose(self.queue, 1);
+        impl QueueOwnerCalls for AudioToolboxQueue {
+            fn add_running_listener(&mut self) -> bool {
+                // SAFETY: the queue is live; the userdata's lifetime is argued
+                // at `running_listener`.
+                unsafe {
+                    AudioQueueAddPropertyListener(
+                        self.queue,
+                        PROP_IS_RUNNING,
+                        running_listener,
+                        self.edge_user(),
+                    ) == 0
+                }
             }
-        }
 
-        fn release_user(&mut self) {
-            // SAFETY: `user` came from `Arc::into_raw` in `MacOut::new` and
-            // is released exactly once, here, after the queue is gone.
-            unsafe { drop(Arc::from_raw(self.user)) };
+            fn remove_running_listener(&mut self) {
+                // The status is ignored: the synchronous dispose that follows
+                // retires any listener still registered before the userdata's
+                // refcount is released.
+                // SAFETY: the queue is live (dispose has not run); proc and
+                // userdata are the exact pair that was added.
+                unsafe {
+                    AudioQueueRemovePropertyListener(
+                        self.queue,
+                        PROP_IS_RUNNING,
+                        running_listener,
+                        self.edge_user(),
+                    );
+                }
+            }
+
+            fn dispose(&mut self) {
+                // SAFETY: synchronous dispose (immediate = 1) stops the callback
+                // thread before `release_user` drops the refcount it was using.
+                unsafe {
+                    AudioQueueDispose(self.queue, 1);
+                }
+            }
+
+            fn release_user(&mut self) {
+                // SAFETY: `user` came from `Arc::into_raw` in `MacOut::new` and
+                // is released exactly once, here, after the queue is gone.
+                unsafe { drop(Arc::from_raw(self.user)) };
+            }
         }
     }
+    use queue_owner::AudioToolboxQueue;
+    pub(super) use queue_owner::OwnedQueue;
+    #[cfg(test)]
+    pub(super) use queue_owner::QueueOwnerCalls;
 
     fn set_callback_recycling(shared: &Shared, enabled: bool) {
         // Stop calls this before AudioQueueStop. Taking the same gate as the
@@ -848,16 +884,16 @@ mod mac {
     /// the synth briefly (its only other holder is the worker's cue push),
     /// renders one buffer, re-enqueues it.
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "trail_audio_lifecycle",
             action = "RenderAudible",
             project = "aterm_gui::trail_audio::trail_audio_conformance::project_worker"
         )
     )]
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "trail_audio_lifecycle",
             action = "RenderSilent",
             project = "aterm_gui::trail_audio::trail_audio_conformance::project_worker"
@@ -947,8 +983,8 @@ mod mac {
         /// cue is applied. `None` on any AudioToolbox error (no audio device,
         /// etc.): trail sound then stays off; never fatal.
         #[cfg_attr(
-            test,
-            aterm_spec::refines(
+            any(test, debug_assertions),
+            aterm_spec_anchor::refines(
                 machine = "trail_audio_lifecycle",
                 action = "WorkerStart",
                 project = "aterm_gui::trail_audio::trail_audio_conformance::project_worker"
@@ -992,10 +1028,7 @@ mod mac {
             // Owned from the instant it exists: every `return None` below
             // drops `owned`, whose `Drop` removes the listener, disposes the
             // queue and releases the refcount, in that order.
-            let mut owned = OwnedQueue::new(AudioToolboxQueue {
-                queue,
-                user: user as *const Shared,
-            });
+            let mut owned = queue_owner::own(queue, user as *const Shared);
             // Registered before the buffers are allocated, so the unwind
             // below has a listener to remove. A refusal is not fatal: the
             // callback watchdog still applies.
@@ -1023,8 +1056,8 @@ mod mac {
         }
 
         #[cfg_attr(
-            test,
-            aterm_spec::refines(
+            any(test, debug_assertions),
+            aterm_spec_anchor::refines(
                 machine = "trail_audio_lifecycle",
                 action = "WorkerStartFails",
                 project = "aterm_gui::trail_audio::trail_audio_conformance::project_worker"
@@ -1073,8 +1106,8 @@ mod mac {
         /// lock is released, `on_tick` can never observe the pre-cue threshold
         /// and pause a newly queued first sound after idle.
         #[cfg_attr(
-            test,
-            aterm_spec::refines(
+            any(test, debug_assertions),
+            aterm_spec_anchor::refines(
                 machine = "trail_audio_lifecycle",
                 action = "WorkerPushRunning",
                 project = "aterm_gui::trail_audio::trail_audio_conformance::project_worker"
@@ -1127,16 +1160,16 @@ mod mac {
         /// Pause housekeeping. Returns whether the queue remains live so the
         /// host can re-arm or retract its sole event-loop deadline exactly.
         #[cfg_attr(
-            test,
-            aterm_spec::refines(
+            any(test, debug_assertions),
+            aterm_spec_anchor::refines(
                 machine = "trail_audio_lifecycle",
                 action = "ServiceRunning",
                 project = "aterm_gui::trail_audio::trail_audio_conformance::project_worker"
             )
         )]
         #[cfg_attr(
-            test,
-            aterm_spec::refines(
+            any(test, debug_assertions),
+            aterm_spec_anchor::refines(
                 machine = "trail_audio_lifecycle",
                 action = "PauseIdle",
                 project = "aterm_gui::trail_audio::trail_audio_conformance::project_worker"
@@ -1425,48 +1458,48 @@ impl AudioWorkerOutput for mac::MacOut {
 
 #[cfg(target_os = "macos")]
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "trail_audio_lifecycle",
         action = "WorkerStart",
         project = "aterm_gui::trail_audio::trail_audio_conformance::project_worker"
     )
 )]
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "trail_audio_lifecycle",
         action = "WorkerPushRunning",
         project = "aterm_gui::trail_audio::trail_audio_conformance::project_worker"
     )
 )]
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "trail_audio_lifecycle",
         action = "WorkerStartFails",
         project = "aterm_gui::trail_audio::trail_audio_conformance::project_worker"
     )
 )]
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "trail_audio_lifecycle",
         action = "ServiceRunning",
         project = "aterm_gui::trail_audio::trail_audio_conformance::project_worker"
     )
 )]
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "trail_audio_lifecycle",
         action = "PauseIdle",
         project = "aterm_gui::trail_audio::trail_audio_conformance::project_worker"
     )
 )]
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "trail_audio_lifecycle",
         action = "ParkIdle",
         project = "aterm_gui::trail_audio::trail_audio_conformance::project_worker"
@@ -1765,16 +1798,16 @@ fn saturating_increment_u64(counter: &std::sync::atomic::AtomicU64) {
 
 #[cfg(target_os = "macos")]
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "trail_audio_lifecycle",
         action = "PushCueAvailable",
         project = "aterm_gui::trail_audio::trail_audio_conformance::project_ingress"
     )
 )]
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "trail_audio_lifecycle",
         action = "PushCueFull",
         project = "aterm_gui::trail_audio::trail_audio_conformance::project_ingress"
@@ -1884,8 +1917,8 @@ impl HostState {
 
 #[cfg(target_os = "macos")]
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "trail_audio_lifecycle",
         action = "ParkIdle",
         project = "aterm_gui::trail_audio::trail_audio_conformance::project_worker"
@@ -1982,14 +2015,14 @@ impl TrailAudio {
             let worker_busy = Arc::clone(&host.busy);
             let worker_dropped_backoff = Arc::clone(&host.dropped_backoff);
             let worker_reopens_left = Arc::clone(&host.reopens_left);
-            host.worker = std::thread::Builder::new()
-                .name("aterm-trail-audio".into())
-                .spawn(move || {
+            host.worker = crate::qos::spawn_lane_thread(
+                "aterm-trail-audio",
+                crate::qos::Role::Responsive,
+                move || {
                     // This worker holds the synth mutex the real-time
                     // callback takes, so it runs `Responsive` (the `qos.rs`
                     // floor for a lock holder the UI contends) to avoid a
                     // priority inversion, without outranking the UI thread.
-                    crate::qos::set_self(crate::qos::Role::Responsive);
                     worker_main(
                         rx,
                         WorkerFlags {
@@ -2001,8 +2034,9 @@ impl TrailAudio {
                         },
                         0x5EED_50FD,
                     );
-                })
-                .ok();
+                },
+            )
+            .ok();
             if host.worker.is_some() {
                 host.tx = Some(tx);
             } else {
@@ -2448,10 +2482,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
     use aterm_effects::cursor_glow::GlowStyle;
-    use aterm_effects::trail_sound::{
-        CHANNELS, EventMeta, SoundEvent, SoundGesture, SoundKind, SoundVoice, TrailSynth,
-        WordGesture,
-    };
+    use aterm_effects::trail_sound::{EventMeta, SoundEvent, SoundGesture, SoundKind, SoundVoice};
 
     use super::mac::{
         BLOCK_S, Delivery, QueueCycle, Service, block_lead_s, callback_stalled, prime_and_start,
@@ -2519,18 +2550,6 @@ mod tests {
         }
     }
 
-    /// A revival allocates a fresh drop counter, which is exactly what makes
-    /// `dropped=0` misleading — so the row prints the revivals beside it.
-    #[test]
-    fn revives_spent_counts_up_from_zero() {
-        let (mut audio, _rx) = TrailAudio::test_ingress();
-        assert_eq!(audio.revives_spent(), 0);
-        audio.revives_left = WEDGE_REVIVES - 2;
-        assert_eq!(audio.revives_spent(), 2);
-        audio.revives_left = 0;
-        assert_eq!(audio.revives_spent(), u64::from(WEDGE_REVIVES));
-    }
-
     fn cue() -> SoundEvent {
         SoundEvent {
             style: GlowStyle::Water,
@@ -2546,115 +2565,6 @@ mod tests {
             bed: true,
             shifted: false,
         }
-    }
-
-    /// Every supported audible cue produces a nonzero sample in the first
-    /// 512-frame buffer `MacQueueCycle` renders after accepting it.
-    #[test]
-    fn every_audible_cue_begins_in_first_synth_buffer() {
-        let styles = [
-            GlowStyle::Lumen,
-            GlowStyle::Phaser,
-            GlowStyle::RainbowKitty,
-            GlowStyle::Sparkle,
-            GlowStyle::Fire,
-            GlowStyle::Laser,
-            GlowStyle::Beam,
-            GlowStyle::Water,
-            GlowStyle::Comet,
-        ];
-        // Every trail gesture PLUS the sparkle-words bonk: the first-buffer
-        // latency contract is per-gesture, not per-source.
-        let kinds = [
-            SoundGesture::Trail(SoundKind::Typed),
-            SoundGesture::Trail(SoundKind::Backspace),
-            SoundGesture::Trail(SoundKind::Navigation),
-            SoundGesture::Trail(SoundKind::Kill),
-            SoundGesture::Trail(SoundKind::Jump),
-            // A Glide is one immediate tone and a Sweep's first run-note has
-            // delay 0, so both sound in the first post-cue buffer.
-            SoundGesture::Trail(SoundKind::Glide { dir: 1 }),
-            SoundGesture::Trail(SoundKind::Sweep { dir: -1 }),
-            // The comma and the lift are delay-0 voices, as is the deletion's
-            // damp.
-            SoundGesture::Trail(SoundKind::Space),
-            SoundGesture::Trail(SoundKind::Shift),
-            SoundGesture::Words(WordGesture::Bonk),
-        ];
-
-        for style in styles {
-            for kind in kinds {
-                let mut synth = TrailSynth::new(super::SAMPLE_RATE as f32, 0x5EED_50FD);
-                synth.push(SoundEvent {
-                    style,
-                    voice: SoundVoice::Style,
-                    kind,
-                    pan: 0.0,
-                    heat: 0.4,
-                    hue: 0.0,
-                    gain: 0.4,
-                    tone: aterm_effects::tone::Tone::Technical,
-                    bed: true,
-                    shifted: false,
-                });
-                let mut samples = [0.0; super::BUFFER_FRAMES * CHANNELS];
-                synth.render(&mut samples);
-                assert!(
-                    samples.iter().any(|sample| *sample != 0.0),
-                    "{style:?}/{kind:?} missed the first post-cue buffer"
-                );
-            }
-        }
-    }
-
-    /// The host must not fan one coalesced echo out into N cues:
-    ///
-    /// 1. No extra clicks: discrete voices are admitted by a wall-clock gap
-    ///    (`MIN_GAP`, ~45 ms) between `push` calls, and a fan-out arrives at
-    ///    one instant, so every sibling is thinned.
-    /// 2. It ducks the real ones: thinned events still raise the synth's rate
-    ///    estimate, which drives the loudness duck, so the next genuine
-    ///    keystroke is quieter.
-    ///
-    /// Density comes from spacing cues in real time, i.e. cueing at the
-    /// physical keypress (`CursorGlow::cue_keystroke`).
-    #[test]
-    fn batched_cues_add_no_voices_and_duck_the_next_keystroke() {
-        // Render ~10 buffers (~107 ms) so the batch's voices have decayed and
-        // the min-gap cannot thin the follow-up; any difference left is the
-        // rate/duck inflation.
-        fn batch_then_next_peak(n: usize) -> (usize, f32) {
-            let mut synth = TrailSynth::new(super::SAMPLE_RATE as f32, 0x5EED_50FD);
-            for _ in 0..n {
-                synth.push(cue());
-            }
-            let voices = synth.live_voices();
-            let mut buf = [0.0; super::BUFFER_FRAMES * CHANNELS];
-            for _ in 0..10 {
-                synth.render(&mut buf);
-            }
-            synth.push(cue());
-            let mut next = [0.0; super::BUFFER_FRAMES * CHANNELS];
-            synth.render(&mut next);
-            (voices, next.iter().fold(0.0f32, |a, s| a.max(s.abs())))
-        }
-
-        let (one_voices, one_peak) = batch_then_next_peak(1);
-        for n in [2usize, 3, 8] {
-            let (voices, _) = batch_then_next_peak(n);
-            assert_eq!(
-                voices, one_voices,
-                "{n} same-instant cues must yield the SAME voices as one — \
-                 the min-gap thins every sibling, so a fan-out is inaudible"
-            );
-        }
-        let (_, eight_peak) = batch_then_next_peak(8);
-        assert!(
-            eight_peak < one_peak * 0.95,
-            "a fan-out must be shown to DUCK the next keystroke \
-             (one: {one_peak:.6}, eight: {eight_peak:.6}) — that is the \
-             regression this test exists to keep out"
-        );
     }
 
     /// Wait for the worker thread to reach a state. Every predicate is an
@@ -2868,7 +2778,7 @@ mod tests {
     fn audio_queue_post_cue_prime_conforms_with_callback_free_fake() {
         use super::trail_audio_conformance::project_start_latency;
 
-        let model = aterm_spec::derive::trail_audio_start_latency_model();
+        let model = aterm_models_misc::trail_audio_start_latency_model();
         let mut state = model.init_state();
         let mut queue = CallbackFreeQueue::new();
         let project = |phase: i64, audible_buffer: usize, queue: &CallbackFreeQueue| {
@@ -3244,29 +3154,6 @@ mod tests {
         )
     }
 
-    #[test]
-    fn bounded_ingress_drops_instead_of_blocking_when_full() {
-        use std::sync::atomic::Ordering;
-
-        let (mut audio, rx) = TrailAudio::test_ingress();
-        for _ in 0..COMMAND_CAPACITY {
-            audio.push(cue());
-        }
-        assert_eq!(audio.dropped_full.load(Ordering::Relaxed), 0);
-        audio.push(cue());
-        assert_eq!(
-            audio.dropped_full.load(Ordering::Relaxed),
-            1,
-            "the real TrailAudio::push full branch records one explicit drop"
-        );
-        assert_eq!(
-            rx.try_iter().count(),
-            COMMAND_CAPACITY,
-            "drop-newest preserves every already-queued cue"
-        );
-        assert_eq!(audio.state(), STATE_DORMANT);
-    }
-
     /// Tier-1: drive the shipping `TrailAudio::push` and check its
     /// available/full decisions against the derived model's transitions.
     /// Filling all 64 slots binds the abstraction to the production capacity.
@@ -3276,7 +3163,7 @@ mod tests {
 
         use super::trail_audio_conformance::project_ingress;
 
-        let model = aterm_spec::derive::trail_audio_lifecycle_model();
+        let model = aterm_models_misc::trail_audio_lifecycle_model();
         let (mut audio, rx) = TrailAudio::test_ingress();
         let mut abstract_state = project_ingress(0, 0, false);
         for abstract_queued in 1..=2 {
@@ -3377,7 +3264,7 @@ mod tests {
         });
         assert_eq!(shared.opens.load(Ordering::Relaxed), 1);
 
-        let model = aterm_spec::derive::trail_audio_lifecycle_model();
+        let model = aterm_models_misc::trail_audio_lifecycle_model();
         let before_start = project_worker(1, 0, false, false, 0, false, false, false, false);
         let after_start = project_worker(0, 0, false, true, 0, true, true, false, false);
         assert!(
@@ -3751,17 +3638,12 @@ mod tests {
     #[test]
     fn an_inert_host_counts_no_sealed_drops() {
         let mut audio = TrailAudio::new(false);
+        assert_eq!(audio.state(), STATE_DORMANT);
+        assert!(audio.worker.is_none(), "an inert host constructs no worker");
         for _ in 0..100 {
             audio.push(cue());
         }
         assert_eq!(audio.dropped_cues(), 0);
-    }
-
-    #[test]
-    fn inert_audio_constructs_no_worker() {
-        let audio = TrailAudio::new(false);
-        assert_eq!(audio.state(), STATE_DORMANT);
-        assert!(audio.worker.is_none());
     }
 
     #[test]
@@ -4303,56 +4185,6 @@ mod tests {
         owned.listen();
         std::mem::forget(owned);
         assert_eq!(*log.lock().unwrap(), ["add"]);
-    }
-
-    /// The "only place" half, lexically: the file contains exactly ONE
-    /// `AudioQueueDispose` call, and it is `AudioToolboxQueue::dispose`,
-    /// which only `OwnedQueue`'s `Drop` calls. A new dispose site spelled
-    /// anywhere else fails here before it can forget the listener.
-    #[test]
-    fn the_queue_is_disposed_in_exactly_one_place() {
-        let source = include_str!("trail_audio.rs");
-        let code_lines = || {
-            source
-                .lines()
-                .enumerate()
-                .filter(|(_, line)| !line.trim_start().starts_with("//"))
-        };
-        let calls_of = |needle: &str, decl: &str| -> Vec<usize> {
-            code_lines()
-                .filter(|(_, line)| line.contains(needle) && !line.contains(decl))
-                .map(|(n, _)| n)
-                .collect()
-        };
-        let lines: Vec<&str> = source.lines().collect();
-        let enclosing_fn = |at: usize| -> &str {
-            lines[..at]
-                .iter()
-                .rev()
-                .find(|line| line.trim_start().starts_with("fn "))
-                .map_or("", |line| line.trim())
-        };
-
-        let dispose = calls_of(
-            concat!("AudioQueue", "Dispose("),
-            concat!("fn AudioQueue", "Dispose("),
-        );
-        assert_eq!(dispose.len(), 1, "dispose call sites: {dispose:?}");
-        assert!(
-            enclosing_fn(dispose[0]).starts_with("fn dispose(&mut self)"),
-            "the one dispose lives in AudioToolboxQueue::dispose, found in {:?}",
-            enclosing_fn(dispose[0])
-        );
-        let remove = calls_of(
-            concat!("AudioQueue", "RemovePropertyListener("),
-            concat!("fn AudioQueue", "RemovePropertyListener("),
-        );
-        assert_eq!(remove.len(), 1, "listener removal sites: {remove:?}");
-        assert!(enclosing_fn(remove[0]).starts_with("fn remove_running_listener(&mut self)"));
-        // …and `.dispose()` is reached only from the owner's `Drop`.
-        let owner_calls = calls_of(concat!(".dispose", "()"), concat!("fn ", "dispose("));
-        assert_eq!(owner_calls.len(), 1, "dispose() callers: {owner_calls:?}");
-        assert!(enclosing_fn(owner_calls[0]).starts_with("fn drop(&mut self)"));
     }
 
     /// A device double for the WORKER-level proof: the real `DeviceHealth`

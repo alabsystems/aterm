@@ -91,10 +91,6 @@ mod tests {
     fn check_vector() {
         // The standard CRC-32/ISO-HDLC check value for "123456789".
         assert_eq!(Crc32::of(b"123456789"), 0xCBF4_3926);
-    }
-
-    #[test]
-    fn empty_is_zero() {
         assert_eq!(Crc32::of(b""), 0);
     }
 

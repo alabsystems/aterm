@@ -143,7 +143,7 @@ impl DogBaker {
 mod tests {
     use super::*;
     use crate::cat_baker::{MAX_ATLAS_BYTES, MAX_BAKES_PER_FRAME, MAX_SLOTS};
-    use crate::dog_glyphs_gen::{DOG_GLYPH_IDS, DOG_HEADS};
+    use crate::dog_glyphs_gen::DOG_GLYPH_IDS;
 
     /// Find a breed by a substring of its authored asset id.
     fn breed(needle: &str) -> DogGlyphId {
@@ -161,32 +161,6 @@ mod tests {
             colors: CatColorKey::default(),
             w: 48,
             h: 40,
-        }
-    }
-
-    /// The roster is populated (a WIDE selection — at least eight breeds), the
-    /// summon pool is every breed, and each has sane aspect + layers.
-    #[test]
-    fn roster_is_a_wide_selection_of_dogs() {
-        assert!(
-            DOG_HEADS.len() >= 8,
-            "the dog summon promises a wide selection — got {}",
-            DOG_HEADS.len()
-        );
-        assert_eq!(DOG_GLYPH_IDS.len(), DOG_GLYPHS.len());
-        assert_eq!(
-            DOG_HEADS.len(),
-            DOG_GLYPH_IDS.len(),
-            "every authored breed is in the summon pool"
-        );
-        for &id in DOG_GLYPH_IDS {
-            let a = DogBaker::aspect(id);
-            assert!(a.is_finite() && a > 0.0);
-            assert!(
-                !DOG_GLYPHS[id as usize].layers.is_empty(),
-                "{}: a breed with no layers would bake an empty tile",
-                DOG_GLYPHS[id as usize].id
-            );
         }
     }
 

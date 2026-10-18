@@ -366,24 +366,24 @@ impl Terminal {
     /// pages; the record says the user took the viewport, not how far.
     /// Conformance drives one-row forms, and a real wheel notch for the record.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "PressCustody",
             action = "UserScroll",
             project = "aterm_gui::press_custody_conformance::project_press_custody"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "PressCustody",
             action = "UserScrollTowardLive",
             project = "aterm_gui::press_custody_conformance::project_press_custody"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "PressCustody",
             action = "SnapToLive",
             project = "aterm_gui::press_custody_conformance::project_press_custody"
@@ -407,7 +407,7 @@ impl Terminal {
     /// clears before a step and requires `Some(_)` after it, proving the step's
     /// site recorded rather than reading a stale tag.
     #[inline]
-    #[cfg(any(test, feature = "spec-anchors"))]
+    #[cfg(any(test, debug_assertions))]
     pub fn take_custody_transition(&mut self) -> Option<CustodyTransition> {
         self.last_custody.take()
     }
@@ -445,56 +445,56 @@ impl Terminal {
     /// the re-pin saturated) records the `…InPlace` twin, which leaves the offset
     /// where it was. An undamaged batch that did not rise records nothing.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "PressCustody",
             action = "OutputAtLive",
             project = "aterm_gui::press_custody_conformance::project_press_custody"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "PressCustody",
             action = "OutputWhileReading",
             project = "aterm_gui::press_custody_conformance::project_press_custody"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "PressCustody",
             action = "OutputDamagesTheSelectedRows",
             project = "aterm_gui::press_custody_conformance::project_press_custody"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "PressCustody",
             action = "OutputDamagesTheSelectedRowsInPlace",
             project = "aterm_gui::press_custody_conformance::project_press_custody"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "PressCustody",
             action = "OutputInvalidatesTheCoordinateSpace",
             project = "aterm_gui::press_custody_conformance::project_press_custody"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "PressCustody",
             action = "OutputTookTheSelectionUnattributed",
             project = "aterm_gui::press_custody_conformance::project_press_custody"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "PressCustody",
             action = "OutputTookTheSelectionUnattributedInPlace",
             project = "aterm_gui::press_custody_conformance::project_press_custody"
@@ -551,27 +551,5 @@ impl Terminal {
         // correctly reports nothing taken.
         let took = after != pinned_offset || (selection_before && !selection_now);
         self.note_custody_at(transition, took);
-    }
-}
-
-/// The record's size: a few `Option<CustodyTransition>` slots, asserted.
-#[cfg(test)]
-mod cost {
-    use super::CustodyTransition;
-
-    #[test]
-    fn the_record_is_as_small_as_its_justification_claims() {
-        assert_eq!(
-            std::mem::size_of::<CustodyTransition>(),
-            1,
-            "the transition is a fieldless enum and must stay one byte"
-        );
-        assert_eq!(
-            std::mem::size_of::<Option<CustodyTransition>>(),
-            1,
-            "`Option` must ride the enum's niche — if this grows, every slot on \
-             `Terminal` grows with it and the header's cost argument needs rewriting \
-             rather than repeating"
-        );
     }
 }

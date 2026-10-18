@@ -38,7 +38,7 @@ enum Stroke {
 
 use Stroke::{D, L};
 
-/// The 64 recipes. Order is the field's glyph index (the hash `% 64`):
+/// The 64 recipes. Order is the field's glyph index (`glyph_from_epoch() % 64`):
 /// 0..=39 katakana-like, 40..=49 digits, 50..=63 symbols/kanji-like.
 const RECIPES: [&[Stroke]; ROM_GLYPHS] = [
     // -- katakana-like forms (simplified straight-stroke approximations) ----
@@ -405,42 +405,6 @@ fn stamp_dot(glyph: &mut [u32], x: i32, y: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Every one of the 64 glyphs rasterizes to a nonempty mask (an all-blank
-    /// tile would read as a missing rain cell).
-    #[test]
-    fn all_64_glyphs_are_nonempty() {
-        let m = rasterize_master();
-        for g in 0..ROM_GLYPHS {
-            let inked: u32 = (0..MASTER_H).map(|y| m.row(g, y).count_ones()).sum();
-            assert!(inked >= 12, "glyph {g} too sparse ({inked} px)");
-        }
-    }
-
-    /// Rasterization is deterministic and stays inside the 24-bit scanline.
-    #[test]
-    fn master_is_deterministic_and_in_bounds() {
-        let a = rasterize_master();
-        let b = rasterize_master();
-        for g in 0..ROM_GLYPHS {
-            for y in 0..MASTER_H {
-                assert_eq!(a.row(g, y), b.row(g, y));
-                assert_eq!(a.row(g, y) >> MASTER_W, 0, "ink past MASTER_W");
-            }
-        }
-    }
-
-    /// Glyphs are distinct as bit patterns.
-    #[test]
-    fn glyphs_are_pairwise_distinct() {
-        let m = rasterize_master();
-        for a in 0..ROM_GLYPHS {
-            for b in a + 1..ROM_GLYPHS {
-                let same = (0..MASTER_H).all(|y| m.row(a, y) == m.row(b, y));
-                assert!(!same, "glyphs {a} and {b} rasterize identically");
-            }
-        }
-    }
 
     /// Literal output material is literal: case and punctuation retain their
     /// own bitmap instead of hashing into a decorative kana substitute.

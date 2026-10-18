@@ -6,26 +6,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm's system samplers for the strain row: one reading of the machine (CPU busy ticks, memory pressure, swap, heat, Low Power Mode) and one bounded process sweep, as the aterm-messages strain engine's plain data. Every platform cfg of the strain feature lives here; it holds no timer."
+description = "aterm's in-process readers of another process (working directory, executable, process-group footprint) and of the machine's memory (physical, available and in use, pressure level, swap rate). Every platform cfg of those readers lives here; it holds no timer and no thread."
 
-[dependencies]
-# The strain engine's input types (`Reading`, `ProcRow`, `MemoryLevel`,
-# `Thermal`) and its `Instant`. The policy lives there; this crate only reads.
-aterm-messages = { workspace = true }
-
-# The macOS arm: Mach host statistics, `sysctlbyname`, libproc (declared in the
-# first-party `libc`, each with its oracle row) and `NSProcessInfo` through the
-# first-party Objective-C layer. No other platform links anything: the Linux
-# sampler reads `/proc` and `/sys` through std alone (bounded 4 KiB reads; the
-# clock tick and page size from `/proc/self/auxv`), under a root the tests
-# point at a fixture tree.
+# The macOS arm: libproc, `sysctlbyname` and Mach host statistics (declared in
+# the first-party `libc`, each with its oracle row). No other platform links
+# anything: the Linux arm reads `/proc` through std alone (bounded 4 KiB reads;
+# the page size from `/proc/self/auxv`).
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = { workspace = true }
-aterm-objc = { workspace = true }
-
-[dev-dependencies]
-# The Linux fixture tree's private copy, removed on drop.
-aterm-tempfile = { workspace = true }
 
 [lints]
 workspace = true

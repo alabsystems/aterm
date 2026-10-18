@@ -313,41 +313,6 @@ fn ctrl_k_shrink_poofs_once() {
     assert!(!glow.is_active());
 }
 
-/// A confirmed plain Backspace poofs: the timestamp schedules and classifies the
-/// gesture, and the exact one-cell row proof names the vanished cell.
-/// Independent of the cursor cat (`poof_scan` never consults it). On rainbow
-/// kitty over a dark theme the poof is the momentum-independent glitter burst,
-/// round sparks with one hero '+'.
-#[test]
-fn exact_plain_backspace_poofs_cat_independent() {
-    let g = geom(); // cols 40, cw 8
-    let c = cfg(GlowStyle::RainbowKitty, true);
-    let t0 = Instant::now();
-    let mut out = Vec::new();
-    let mut glow = CursorGlow::default();
-    let row = |s: &str| -> Vec<char> {
-        let mut v: Vec<char> = s.chars().collect();
-        v.resize(40, ' ');
-        v
-    };
-    // "hello", caret at col 5; then a PLAIN Backspace shrinks it to "hell".
-    glow.observe_row(2, 5, &row("hello"), t0);
-    glow.tick(Some((2, 5)), t0, &c, g, &mut out);
-    arm_exact_backspace(&mut glow, t0 + Duration::from_millis(30), (2, 5), (2, 4));
-    let t1 = t0 + Duration::from_millis(46);
-    glow.observe_row(2, 4, &row("hell"), t1);
-    glow.tick(Some((2, 4)), t1, &c, g, &mut out);
-    assert!(
-        glow.last_poof.is_some(),
-        "an exact plain Backspace proof licensed the erase poof"
-    );
-    assert!(
-        !glow.vapor.is_empty() && glow.vapor.iter().all(|v| v.kind == VaporKind::Poof),
-        "the plain delete puffs its neutral cloud at the vanished cell (v2's erase \
-         stardust is the sky's own law)"
-    );
-}
-
 /// On the default style (rainbow kitty, dark theme,
 /// `prefs::DEFAULT_CURSOR_TRAIL_STYLE`) every delete shape a shell user uses
 /// puffs smoke: `vapor` is non-empty alongside the particles, for the four
@@ -411,8 +376,12 @@ fn the_shipping_default_puffs_a_cloud_on_every_delete_shape() {
     glow.observe_row(2, 4, &row("hell"), t1);
     glow.tick(Some((2, 4)), t1, &c, g, &mut out);
     assert!(
-        !glow.vapor.is_empty(),
-        "plain backspace: the default style must puff a cloud too"
+        glow.last_poof.is_some(),
+        "plain backspace: the exact one-cell row proof licensed the poof"
+    );
+    assert!(
+        !glow.vapor.is_empty() && glow.vapor.iter().all(|v| v.kind == VaporKind::Poof),
+        "plain backspace: the default style must puff its neutral cloud too"
     );
 }
 

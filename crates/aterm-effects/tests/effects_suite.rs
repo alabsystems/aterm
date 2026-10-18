@@ -13,16 +13,17 @@
 //!
 //! Sharing a process was checked, not assumed: no file below sets or removes an
 //! environment variable, installs a hook, re-executes itself or keeps a
-//! process global (the one `thread_local!`, in `walk_census`, is per thread).
-//! The four files that install a `#[global_allocator]` and assert exact
-//! allocation counts are their own `[[test]]`s in `Cargo.toml`.
+//! process global (the `thread_local!`s, in `walk_census` and `alloc_count`,
+//! are per thread). The exact-allocation pins share it too: `alloc_count` is
+//! the suite's one `#[global_allocator]`, and it counts only the thread whose
+//! window is armed, so no test bleeds into another's count.
 //!
-//! `autotests = false`: a `tests/*.rs` file that is neither a `mod` line here
-//! nor a `[[test]]` of its own NEVER COMPILES. Run one file's tests with
-//! `targo --unverified test -p aterm-effects --test effects_suite -- <file>::`;
-//! its ignored reports and perf gates with `-- <file>:: --ignored`, never a bare
-//! `--ignored`, which would start every wall-clock gate in the suite at once.
+//! The trick conformances are unit modules mounted by `src/lib.rs`, alongside
+//! their implementations' model anchors. With `autotests = false`, every other
+//! test file must be a mod here or a [[test]]. Run one suite file's tests with
+//! `targo --unverified test -p aterm-effects --test effects_suite -- <file>::`.
 
+mod alloc_count;
 mod common;
 #[macro_use]
 mod trail_host;
@@ -38,8 +39,6 @@ mod codex_particle_replay;
 mod composer_box_growth_wrap;
 mod composer_growth_follows;
 mod composer_multiline_wrap;
-mod conformance_trick_flash;
-mod conformance_trick_listener;
 mod console_contact_observation;
 mod console_cursor_home;
 mod console_handoff_conformance;
@@ -84,6 +83,7 @@ mod pet_holds_through_a_torn_frame;
 mod pet_position_authority;
 mod pet_resident_standoff;
 mod phrase_pause_gaps;
+mod rainbow_kitty_v2_frame_cost;
 mod relaid_composer_echo;
 mod review_real_bytes;
 mod revived_line_keeps_its_stops;
@@ -98,8 +98,11 @@ mod the_owners_composer_gaps;
 mod torn_edit_gaps;
 mod torn_read_gaps;
 mod torn_repaint_hidden_caret;
+mod trick_flash_alloc;
+mod typed_tricks_alloc;
 mod wake_and_landing_walk_origins;
 mod walk_continuity_census;
+mod word_reflow_identity;
 mod wrap_code_reflow;
 mod wrapped_composer_band;
 mod zsh_isearch_band;

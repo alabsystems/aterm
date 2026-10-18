@@ -39,7 +39,11 @@
 //!   past its bound, which gets one guarded Escape (the vendor reads it as a
 //!   cancel that prints nothing). A box the row opened is the step's however
 //!   it is reworded, met on any read of the step but one after a box the
-//!   approval policy already judged: never another rule's to answer.
+//!   approval policy already judged: never another rule's to answer. A box
+//!   with nothing of the confirmation and an answer kept for good is never
+//!   the step's, and one with its head off the screen and no Esc read is a
+//!   frame half drawn: its Esc may be kept too (Claude Code's MCP server
+//!   dialogs).
 //! * **C. The confirmation** ([`Session::reset_confirmation`]): keyed only
 //!   once it has stood the box settle in this loop's sight (the vendor
 //!   refuses a key sooner and re-arms its refusal), with nobody's hand on
@@ -67,12 +71,11 @@
 //!   [`IdleHost::inform`] for a dialog whose Escape does not take, or that
 //!   a step whose end is told leaves on a screen it cannot read.
 
-use super::super::policy::approval::RULE_LIMIT_RESET;
+use super::super::policy::approval::{RULE_LIMIT_RESET, kept_for_good};
 use super::super::policy::reset::{Verdict as ResetVerdict, confirm_verdict};
 use super::super::policy::row_guard;
 use super::*;
 use crate::harness::accounts::RESET_CLAIM_S;
-use crate::supervise::journal::unix_ms;
 use aterm_phase::{ConfirmRead, ResetPending};
 
 /// How many times in a row the host may answer that it cannot say yet
@@ -201,7 +204,8 @@ enum Shows {
     Other,
     /// A composer frame, or the worker at work: the dialog is gone.
     Gone,
-    /// None of them: a frame half drawn.
+    /// None of them, or a box whose head and Esc are both unread: a frame
+    /// half drawn.
     Unread,
 }
 
@@ -268,7 +272,7 @@ impl<C: Ctl> Session<'_, C> {
     /// A step owed from now, with `go` what its confirmation is held to
     /// (`None`: never entered) and the claim asked for at `since`.
     fn reset_step_owed(&mut self, go: Option<ResetGo>, since: Instant, entered: bool) {
-        let now = Instant::now();
+        let now = self.fx.mono();
         self.reset = ResetStep::Owed(Box::new(ResetOwed {
             go,
             since,
@@ -297,7 +301,7 @@ impl<C: Ctl> Session<'_, C> {
     pub(super) fn reset_row_taken(&mut self) {
         let (go, since) = match self.reset_taken.take() {
             Some((go, since)) => (Some(go), since),
-            None => (None, Instant::now()),
+            None => (None, self.fx.mono()),
         };
         self.reset_step_owed(go, since, false);
     }
@@ -310,7 +314,7 @@ impl<C: Ctl> Session<'_, C> {
     /// is decided again after the reconnect, the claim still in hand.
     pub(super) fn reset_row_lost(&mut self, subject: &str, seq: u64) {
         self.reset_taken = None;
-        self.reset_step_owed(None, Instant::now(), false);
+        self.reset_step_owed(None, self.fx.mono(), false);
         self.ledger_row(
             RULE_LIMIT_RESET,
             approvals::Outcome::Approved,
@@ -331,8 +335,8 @@ impl<C: Ctl> Session<'_, C> {
     /// but a box that still stands under it is Escaped, never left to a
     /// rule of the approval policy that could say yes to it.
     pub(super) fn reset_take_up(&mut self, open: &approvals::ResetOpen, review: &mut dyn Review) {
-        let age_ms = unix_ms().saturating_sub(open.taken_ms);
-        self.reset_step_owed(None, Instant::now(), open.entered);
+        let age_ms = self.fx.stamp_ms().saturating_sub(open.taken_ms);
+        self.reset_step_owed(None, self.fx.mono(), open.entered);
         if u128::try_from(age_ms).unwrap_or(u128::MAX) <= RESET_STALE.as_millis() {
             return;
         }
@@ -422,7 +426,7 @@ impl<C: Ctl> Session<'_, C> {
             outcome,
             ResetOutcome::Spent { .. } | ResetOutcome::Lifted { .. }
         ) {
-            self.turn_end.reset_told(&outcome, Instant::now());
+            self.turn_end.reset_told(&outcome, self.fx.mono());
         }
     }
 
@@ -476,8 +480,8 @@ impl<C: Ctl> Session<'_, C> {
         let about = named_year(when).map_or(now, |year| {
             limit::days_from_civil(year, *month, *day) * 86_400 + 43_200
         });
-        let at = limit::reset_at_with(&spec, about, local, &self.zone_offset);
-        Some(match (zone, (self.local_offset_at)(at)) {
+        let at = limit::reset_at_with(&spec, about, local, &self.zone_lookup());
+        Some(match (zone, self.local_offset_then(at)) {
             (None, Some(there)) => at + local - there,
             _ => at,
         })
@@ -509,7 +513,7 @@ impl<C: Ctl> Session<'_, C> {
         if self.claim.watching_behind().is_some() {
             return Ok(Some("watching"));
         }
-        if self.ledger_path.is_none() {
+        if self.setup.ledger_path.is_none() {
             return Ok(Some("no-ledger"));
         }
         if self.reset != ResetStep::Idle {
@@ -521,11 +525,7 @@ impl<C: Ctl> Session<'_, C> {
         }
         // Every fence the confirmation's keys carry is one this host has.
         let screen = &turn.screen;
-        if screen.generation.is_none()
-            || screen.human_seq.is_none()
-            || !self.gen_fence_known()?
-            || self.caps.key_if == Some(false)
-        {
+        if screen.generation.is_none() || screen.human_seq.is_none() || !self.gen_fence_known()? {
             return Ok(Some("no-fence"));
         }
         Ok(None)
@@ -575,7 +575,7 @@ impl<C: Ctl> Session<'_, C> {
             self.park_on_hold("the session is held: no reset is claimed", seq, review)?;
             return Ok(ResetAsked::Again);
         }
-        let asked = Instant::now();
+        let asked = self.fx.mono();
         match host.reset_take(&ask) {
             ResetWord::Take(go) => {
                 self.reset_again = 0;
@@ -589,11 +589,11 @@ impl<C: Ctl> Session<'_, C> {
                     review.note(&format!(
                         "WAITING seq={seq} rule={RULE_LIMIT_RESET} the host cannot say yet: asked \
                          again in {} ms",
-                        self.reset_waits.again.as_millis()
+                        self.setup.reset_waits.again.as_millis()
                     ));
                 }
                 self.reset_again += 1;
-                self.wait(&["seq", &seq.to_string()], self.reset_waits.again)?;
+                self.wait(&["seq", &seq.to_string()], self.setup.reset_waits.again)?;
                 Ok(ResetAsked::Again)
             }
             ResetWord::Again => {
@@ -622,7 +622,18 @@ impl<C: Ctl> Session<'_, C> {
     /// approval policy is to say yes to it: it reads as a confirmation with
     /// no title, and is Escaped. A box the policy was handed stays the
     /// policy's while the reads go on showing a box, so one box never
-    /// changes hands.
+    /// changes hands. NEVER a box that offers an answer kept for good, read by
+    /// its role or its label as the press gate reads it ([`kept_for_good`]: a
+    /// frame whose roles the reader withheld, two cursors mid-move, still
+    /// offers one), nor a box whose head is off the screen and that reads no
+    /// Esc, a frame still being drawn: it reads as one ([`Shows::Unread`]),
+    /// never keyed. Claude Code's MCP server dialogs save their Esc as a
+    /// refusal for good (2.1.301). Read as one, its kind is
+    /// `McpServer`, never [`PromptKind::Other`]; retitled or cut, the
+    /// one-server dialog's three answers and the several-server dialog's
+    /// `Enable selected` are kept by their labels, and the several-server
+    /// dialog drawn only down to its server rows, its head cut, reads no Esc.
+    /// Such a box is the policy's — a person's.
     ///
     /// With no box read at all, a row that is the confirmation's title on a
     /// screen with no composer is the confirmation in a layout the box
@@ -643,7 +654,17 @@ impl<C: Ctl> Session<'_, C> {
                     let judged = before == Some(ResetShown::Other);
                     let unnumbered =
                         !prompt.options.is_empty() && prompt.options.iter().all(|o| o.n.is_none());
-                    if !judged && unnumbered && prompt.kind == PromptKind::Other {
+                    // A box with an answer kept for good is no confirmation
+                    // the vendor reworded (an MCP server dialog retitled or
+                    // cut, whose Esc too is kept); one whose head and Esc are
+                    // both unread is a frame half drawn, read again.
+                    let kept = prompt.options.iter().any(kept_for_good);
+                    let unfinished = prompt.head_off_screen && prompt.cancel.is_none();
+                    let reworded =
+                        !judged && unnumbered && !kept && prompt.kind == PromptKind::Other;
+                    if reworded && unfinished {
+                        Shows::Unread
+                    } else if reworded {
                         Shows::Confirm(ConfirmRead::Inexact("title"), Some(Box::new(prompt)))
                     } else {
                         Shows::Other
@@ -670,7 +691,7 @@ impl<C: Ctl> Session<'_, C> {
     /// One wait of the step's, to `until` at most: a step of the loop's and
     /// the budget bound it.
     fn reset_wait(&self, until: Option<Instant>, deadline: Instant) -> Duration {
-        let now = Instant::now();
+        let now = self.fx.mono();
         until
             .map_or(WAIT_STEP, |t| t.saturating_duration_since(now))
             .min(WAIT_STEP)
@@ -755,13 +776,13 @@ impl<C: Ctl> Session<'_, C> {
         opts: &SuperviseOpts,
         review: &mut dyn Review,
     ) -> Result<bool, Fail> {
-        let waits = self.reset_waits;
+        let waits = self.setup.reset_waits;
         let mut screen = match first {
             Some(screen) => screen,
             None => self.screen()?,
         };
         loop {
-            if self.stopped() || Instant::now() >= deadline {
+            if self.stopped() || self.fx.mono() >= deadline {
                 return Ok(true);
             }
             let Some((keyed, before, entered)) = self
@@ -785,7 +806,7 @@ impl<C: Ctl> Session<'_, C> {
             // unbroken run that showed it, and no longer than the last key.
             let since = match (before, shown) {
                 (Some((was, at)), Some(is)) if was == is => at.max(keyed),
-                _ => Instant::now(),
+                _ => self.fx.mono(),
             };
             if let Some(owed) = self.reset_owed_mut() {
                 owed.shown = shown.map(|is| match before {
@@ -800,8 +821,8 @@ impl<C: Ctl> Session<'_, C> {
             }
             let flow = match shows {
                 Shows::Pending(ResetPending::Checking, row) => {
-                    if since.elapsed() < waits.check {
-                        Flow::Again(waits.check.saturating_sub(since.elapsed()))
+                    if self.fx.since(since) < waits.check {
+                        Flow::Again(waits.check.saturating_sub(self.fx.since(since)))
                     } else {
                         let guard = row_guard(&screen.rows[row]);
                         if self.reset_not_ready(seq, &guard, deadline, opts, review)? {
@@ -818,25 +839,25 @@ impl<C: Ctl> Session<'_, C> {
                     if let Some(owed) = self.reset_owed_mut() {
                         owed.entered = true;
                     }
-                    if since.elapsed() >= waits.claim {
+                    if self.fx.since(since) >= waits.claim {
                         self.reset_end(seq, true, opts, review)?;
                         return Ok(true);
                     }
-                    Flow::Again(waits.claim.saturating_sub(since.elapsed()))
+                    Flow::Again(waits.claim.saturating_sub(self.fx.since(since)))
                 }
                 Shows::Wall => {
-                    if since.elapsed() >= waits.open {
+                    if self.fx.since(since) >= waits.open {
                         if let Some(owed) = self.reset_owed_mut() {
                             owed.kept.get_or_insert(KeepWhy::NotOpened);
                         }
                         self.reset_end(seq, false, opts, review)?;
                         return Ok(true);
                     }
-                    Flow::Again(waits.open.saturating_sub(since.elapsed()))
+                    Flow::Again(waits.open.saturating_sub(self.fx.since(since)))
                 }
                 Shows::Unread => {
                     let bound = if entered { waits.claim } else { waits.open };
-                    if since.elapsed() >= bound {
+                    if self.fx.since(since) >= bound {
                         // Whatever stands there is no screen of the step's
                         // that this build reads: said once, never keyed —
                         // and not said of a step that ends untold.
@@ -848,7 +869,7 @@ impl<C: Ctl> Session<'_, C> {
                         self.reset_end(seq, entered, opts, review)?;
                         return Ok(true);
                     }
-                    Flow::Again(bound.saturating_sub(since.elapsed()))
+                    Flow::Again(bound.saturating_sub(self.fx.since(since)))
                 }
                 Shows::Confirm(read, prompt) => self.reset_confirmation(
                     &screen,
@@ -868,7 +889,7 @@ impl<C: Ctl> Session<'_, C> {
                         && reader.background_wait(&screen.rows).is_none();
                     self.reset_end(seq, false, opts, review)?;
                     if live && self.reset == ResetStep::Idle {
-                        self.turn_end.took();
+                        self.took(seq);
                     }
                     return Ok(true);
                 }
@@ -877,7 +898,7 @@ impl<C: Ctl> Session<'_, C> {
                 Flow::Leave => return Ok(true),
                 Flow::Read(next) => next,
                 Flow::Again(pause) => {
-                    let left = deadline.saturating_duration_since(Instant::now());
+                    let left = deadline.saturating_duration_since(self.fx.mono());
                     let step = pause.min(waits.step).min(left);
                     // A redraw arrives in several writes: a screen that
                     // moved is read once it has held still a moment.
@@ -909,7 +930,7 @@ impl<C: Ctl> Session<'_, C> {
         else {
             return Ok(true);
         };
-        let now = Instant::now();
+        let now = self.fx.mono();
         let mut until = (tries > 0 && now < at).then_some(at);
         if until.is_none() {
             until = hold.filter(|until| *until > now);
@@ -941,7 +962,7 @@ impl<C: Ctl> Session<'_, C> {
     /// where only its title reads), of a step that is owed. In order, each a
     /// reason to write nothing yet:
     ///
-    /// 1. it has stood [`Session::box_settle`] since this loop first read it
+    /// 1. it has stood the setup's box settle since this loop first read it
     ///    — else the rest is waited and it is read again; a step taken up
     ///    (no go) has stood one person's grace from there;
     /// 2. an Enter already written is given [`ResetWaits::enter`];
@@ -974,7 +995,7 @@ impl<C: Ctl> Session<'_, C> {
         opts: &SuperviseOpts,
         review: &mut dyn Review,
     ) -> Result<Flow, Fail> {
-        let waits = self.reset_waits;
+        let waits = self.setup.reset_waits;
         let (seq, rows) = (screen.seq, &screen.rows);
         let title = aterm_phase::anchor("reset.confirm.title");
         let bound_to = rows.iter().position(|row| row.trim() == title).or_else(|| {
@@ -989,22 +1010,26 @@ impl<C: Ctl> Session<'_, C> {
             .and_then(|row| rows.get(row))
             .map_or_else(String::new, |r| row_guard(r));
         let grace = Duration::from_secs(u64::from(opts.policy.human_grace_s));
+        // The door's clocks, cloned: the step owed is borrowed from `self`.
+        let fx = self.fx.clone();
         let Some(owed) = self.reset_owed_mut() else {
             return Ok(Flow::Leave);
         };
-        let seen = *owed.seen.get_or_insert_with(Instant::now);
+        let seen = *owed.seen.get_or_insert_with(|| fx.mono());
         let (own, entered, kept, keyed) = (owed.go.is_some(), owed.entered, owed.kept, owed.keyed);
-        let young = self.box_settle.saturating_sub(seen.elapsed());
+        let young = self.setup.box_settle.saturating_sub(self.fx.since(seen));
         if !young.is_zero() {
             return Ok(Flow::Again(young));
         }
-        if !own && seen.elapsed() < grace {
+        if !own && self.fx.since(seen) < grace {
             let step = self.reset_wait(seen.checked_add(grace), deadline);
             self.wait_row_gone(&guard, seq, step)?;
             return Ok(Flow::Leave);
         }
-        if entered && kept.is_none() && keyed.elapsed() < waits.enter {
-            return Ok(Flow::Again(waits.enter.saturating_sub(keyed.elapsed())));
+        if entered && kept.is_none() && self.fx.since(keyed) < waits.enter {
+            return Ok(Flow::Again(
+                waits.enter.saturating_sub(self.fx.since(keyed)),
+            ));
         }
         if self.reset_not_ready(seq, &guard, deadline, opts, review)? {
             return Ok(Flow::Leave);
@@ -1113,13 +1138,14 @@ impl<C: Ctl> Session<'_, C> {
     /// read) and the journal's `confirmed` line. A loop that follows reads
     /// the row as an Enter written, and the host is told so.
     fn reset_yes_written(&mut self, head: &str, seq: u64, review: &mut dyn Review) {
+        let fx = self.fx.clone();
         let Some(owed) = self.reset_owed_mut() else {
             return;
         };
         owed.entered = true;
         owed.enters = owed.enters.saturating_add(1);
         owed.skips = 0;
-        owed.keyed = Instant::now();
+        owed.keyed = fx.mono();
         if std::mem::replace(&mut owed.yes_said, true) {
             return;
         }
@@ -1170,7 +1196,7 @@ impl<C: Ctl> Session<'_, C> {
         if owed.enters >= RESET_ENTERS {
             return Judged::Keep(KeepWhy::EnterNotTaken);
         }
-        let in_time = owed.since.elapsed() <= self.reset_waits.enter_by;
+        let in_time = self.fx.since(owed.since) <= self.setup.reset_waits.enter_by;
         if let ResetVerdict::Keep(why) = confirm_verdict(read, &go, placed, self.now_unix()) {
             return Judged::Keep(why);
         }
@@ -1216,8 +1242,7 @@ impl<C: Ctl> Session<'_, C> {
     /// * The dialog gone: the reads go on from that read.
     /// * Still up — the Escape did not take, no row matched under a dialog
     ///   that stands, or nothing could be pressed (a read with no person
-    ///   count, a host with no `key if=`: never an unfenced Escape): a failed
-    ///   try. The next is a pause of the survey's ladder away
+    ///   count: never an unfenced Escape): a failed try. The next is a pause of the survey's ladder away
     ///   ([`SURVEY_RETRY`]: 5 s first, far outside the vendor's 250 ms
     ///   re-arm, the last pause for ever), `WAITING` journaled, and at the
     ///   [`RESET_STUCK_AT`]-th the host is told once ([`IdleHost::inform`])
@@ -1240,15 +1265,16 @@ impl<C: Ctl> Session<'_, C> {
         if !guard.is_empty() && screen.human_seq.is_some() {
             match self.guarded_key(seq, guard, "esc", screen.human_seq)? {
                 Dismiss::Pressed { .. } => {
+                    let fx = self.fx.clone();
                     let first = self.reset_owed_mut().and_then(|owed| {
-                        owed.keyed = Instant::now();
+                        owed.keyed = fx.mono();
                         owed.kept.is_none().then(|| *owed.kept.insert(why))
                     });
                     if let Some(kept) = first {
                         let declined = approvals::Outcome::Declined;
                         self.ledger_row(RULE_LIMIT_RESET, declined, what, &kept.to_string(), seq);
                     }
-                    self.wait_row_gone(guard, seq, self.reset_waits.close)?;
+                    self.wait_row_gone(guard, seq, self.setup.reset_waits.close)?;
                 }
                 Dismiss::Yielded => return Ok(Flow::Leave),
                 Dismiss::Refused { halted, why } => {
@@ -1257,7 +1283,7 @@ impl<C: Ctl> Session<'_, C> {
                 }
                 // Judged by the read below: the dialog left first, or it
                 // stands and nothing was pressed.
-                Dismiss::Skipped | Dismiss::Unguarded => {}
+                Dismiss::Skipped => {}
             }
         }
         let after = self.screen()?;
@@ -1267,12 +1293,13 @@ impl<C: Ctl> Session<'_, C> {
         let tries = self
             .reset_owed()
             .map_or(1, |owed| owed.tries.saturating_add(1));
-        let pause = crate::supervise::ladder::Ladder(&self.survey_retry)
+        let pause = crate::supervise::ladder::Ladder(&self.setup.survey_retry)
             .step(usize::try_from(tries - 1).unwrap_or(usize::MAX));
         let mut stuck = false;
+        let fx = self.fx.clone();
         if let Some(owed) = self.reset_owed_mut() {
             owed.tries = tries;
-            owed.at = Instant::now() + pause;
+            owed.at = fx.mono() + pause;
             stuck = tries >= RESET_STUCK_AT && !owed.told;
             owed.told |= stuck;
         }
@@ -1344,8 +1371,8 @@ impl<C: Ctl> Session<'_, C> {
             ));
             return Ok(());
         }
-        let waits = self.reset_waits;
-        let line_by = Instant::now() + waits.line;
+        let waits = self.setup.reset_waits;
+        let line_by = self.fx.mono() + waits.line;
         let mut last = last;
         let outcome = loop {
             let end = ResetEnd {
@@ -1366,7 +1393,7 @@ impl<C: Ctl> Session<'_, C> {
             if self.stopped() {
                 return Ok(());
             }
-            let left = line_by.saturating_duration_since(Instant::now());
+            let left = line_by.saturating_duration_since(self.fx.mono());
             if left.is_zero() {
                 last = true;
                 continue;
@@ -1378,7 +1405,7 @@ impl<C: Ctl> Session<'_, C> {
         let waiting = approvals::Outcome::Waiting;
         let ended = format!("ended: {}", outcome.word());
         self.ledger_row(RULE_LIMIT_RESET, waiting, RESET_SUBJECT, &ended, seq);
-        self.turn_end.reset_told(&outcome, Instant::now());
+        self.turn_end.reset_told(&outcome, self.fx.mono());
         self.reset = ResetStep::Idle;
         self.reset_taken = None;
         let line = format!(
@@ -1418,7 +1445,7 @@ impl<C: Ctl> Session<'_, C> {
         }
         self.reset_end(screen.seq, false, opts, review)?;
         if live && self.reset == ResetStep::Idle {
-            self.turn_end.took();
+            self.took(screen.seq);
         }
         Ok(())
     }

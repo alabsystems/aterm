@@ -1,0 +1,733 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! THE HOST'S DOOR ON A TAPE: what crosses when the loop asks the window's
+//! host ([`crate::supervise::IdleHost`]) — the two hosts the trait's macro
+//! implements it for (`supervise::run::host_door`), and the tape form of
+//! every argument and answer.
+//!
+//! * [`TapedHost`]: a recording run's host. Each call is forwarded to the
+//!   window's host and crosses the run's door (`Fx`) on the way: a query as
+//!   a round trip at `host.<name>` — the arguments out, the answer back, the
+//!   LIVE answer returned to the loop (never one decoded from the tape, so a
+//!   codec cannot change what the loop saw) — and a notification as an
+//!   output at `host.<name>`, said before the host is told (a host that
+//!   panics there leaves the door it died at on the tape: `Fx::host_tell`).
+//!   A call that is an ACT on the session (marked `act` in the trait's
+//!   method list, [`super::doors::is_host_act`]: the host's step at an idle
+//!   point, a restart, a reset taken, a probe claimed) closes the tape's
+//!   frame after it, as a control act does.
+//! * [`ReplayHost`]: a replay's host. It holds no host at all: every query is
+//!   answered by the tape's record at its door, every notification compared
+//!   with the recorded one, and a call the recorded loop did not make is the
+//!   replay's divergence where it is made.
+//!
+//! **Arguments** ([`TapeArg`]) are compared by their `Debug` text, `name=`
+//! before each, a line each ([`request`]): no codec to keep beside each type,
+//! and a type opts in by name ([`tape_arg_debug!`]), so an argument of a new
+//! type does not build until someone has looked at what its `Debug` says. No
+//! argument holds an `Instant` (whose `Debug` is this process's raw clock and
+//! would make every replay diverge): in this crate's tests a request that
+//! holds one is a failed assertion.
+//!
+//! **Answers** ([`HostReply`]) are written as JSON through small mirrors of
+//! their types — the probes' idiom (`policy::probe`) — so the tape's text form
+//! reads as what the host said, and a word on the tape is a word written here
+//! (`notice`, `not-due`), never a Rust variant's name that a rename would
+//! silently change. Three answers hold an `Instant` — [`Reach`]'s `since`, an
+//! [`AccountAdvice::Wait`]'s `until`, `wants_at` — and those are written as
+//! signed nanoseconds from the tape's origin and read back onto the replay's
+//! own origin ([`offset_ns`], [`instant_at`]), so the replayed loop sees the
+//! same span between the host's instant and every clock read it makes. A
+//! byte this build did not write is a `CodecError`, never a guess.
+//!
+//! The replay plan's §4.6 had the return types derive the workspace's serde;
+//! the mirrors were chosen instead for the reason above (the probes made the
+//! same choice), and they keep serde off the policy's own types.
+
+use std::fmt;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+
+use super::codec::CodecError;
+use super::core::TapeValue;
+use super::frame::Hint;
+use crate::harness::accounts::Sample;
+use crate::harness::acts::{Act, TaskFace};
+use crate::harness::upgrade::StandingLimit;
+use crate::supervise::fx::Fx;
+use crate::supervise::memory::{AgentMemory, Pressure};
+use crate::supervise::policy::exception::Exception;
+use crate::supervise::policy::reset::{
+    ResetAsk, ResetEnd, ResetGo, ResetNo, ResetOutcome, ResetWord,
+};
+use crate::supervise::policy::turn_end::{
+    AccountAdvice, AccountBad, AccountPoint, HostTurn, Reach, Restart,
+};
+use crate::supervise::run::{
+    Guard, HostStep, IdlePoint, ProbeMiss, ProbeNo, StuckSurvey, UsageSeen, WaitPlan,
+};
+
+// -- the two hosts ------------------------------------------------------------
+
+/// A RECORDING run's host ([module docs](self)): `inner`, the window's own
+/// (or a test's), asked through the run's door. `H` is the trait object it
+/// wraps — `dyn IdleHost` for the loop, a test's planted trait for the
+/// macro's own check.
+pub(crate) struct TapedHost<H: ?Sized> {
+    inner: Arc<H>,
+    fx: Fx,
+}
+
+impl<H: ?Sized> TapedHost<H> {
+    /// `inner`, its calls taped through `fx` (a recording door).
+    pub(crate) fn new(inner: Arc<H>, fx: Fx) -> Self {
+        Self { inner, fx }
+    }
+
+    /// The host every call is forwarded to.
+    pub(crate) fn inner(&self) -> &H {
+        &self.inner
+    }
+
+    /// A QUERY at `door`: `live` asks the host, and its answer — the live one
+    /// — comes back, taped with `request`. An `act` (a method the trait's
+    /// list marks so) closes the frame after it.
+    pub(crate) fn ask<A: HostReply>(
+        &self,
+        door: &'static str,
+        request: Vec<u8>,
+        live: impl FnOnce() -> A,
+        act: bool,
+    ) -> A {
+        let answer = self.fx.host_exchange(door, move || request, live);
+        if act {
+            self.fx.flush(Hint::Act);
+        }
+        answer
+    }
+
+    /// A NOTIFICATION at `door`, said with `request`, then told to the host
+    /// by `live` (`Fx::host_tell`: a host that panics there leaves the door
+    /// it died at on the tape). An `act` closes the frame after it.
+    pub(crate) fn tell(
+        &self,
+        door: &'static str,
+        request: Vec<u8>,
+        live: impl FnOnce(),
+        act: bool,
+    ) {
+        self.fx.host_tell(door, request, live);
+        if act {
+            self.fx.flush(Hint::Act);
+        }
+    }
+}
+
+impl<H: ?Sized + fmt::Debug> fmt::Debug for TapedHost<H> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TapedHost")
+            .field("inner", &&*self.inner)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A REPLAY's host ([module docs](self)): no host behind it, every answer
+/// the tape's.
+#[derive(Debug)]
+pub(crate) struct ReplayHost {
+    fx: Fx,
+}
+
+impl ReplayHost {
+    /// The host of a replay whose door is `fx`.
+    ///
+    /// # Panics
+    ///
+    /// `fx` does not replay: a host with nothing behind it over a door that
+    /// would call its live world has nothing to call.
+    pub(crate) fn new(fx: Fx) -> Self {
+        assert!(
+            fx.replaying(),
+            "a replay's host over a door that does not replay"
+        );
+        Self { fx }
+    }
+
+    /// A QUERY at `door` asking `request`: the recorded answer.
+    pub(crate) fn ask<A: HostReply>(&self, door: &'static str, request: Vec<u8>) -> A {
+        self.fx.host_exchange(
+            door,
+            move || request,
+            || unreachable!("a replaying door never makes its live call"),
+        )
+    }
+
+    /// A NOTIFICATION at `door`: compared with the recorded one.
+    pub(crate) fn tell(&self, door: &'static str, request: Vec<u8>) {
+        self.fx.emit(door, move || request);
+    }
+}
+
+// -- arguments ----------------------------------------------------------------
+
+/// An argument a host's call is taped with: its `Debug` text, compared as it
+/// is ([module docs](self)).
+pub(crate) trait TapeArg: fmt::Debug {}
+
+impl<T: TapeArg + ?Sized> TapeArg for &T {}
+impl<T: TapeArg> TapeArg for Option<T> {}
+impl<T: TapeArg, E: TapeArg> TapeArg for Result<T, E> {}
+impl<A: TapeArg, B: TapeArg> TapeArg for (A, B) {}
+
+/// Each type an argument of the host's may be, opted in by name: its `Debug`
+/// is the text a tape compares, and holds no `Instant`.
+macro_rules! tape_arg_debug {
+    ($($t:ty),* $(,)?) => {
+        $(impl TapeArg for $t {})*
+    };
+}
+
+tape_arg_debug!(
+    str,
+    bool,
+    u32,
+    u64,
+    i64,
+    IdlePoint,
+    Restart,
+    WaitPlan,
+    Act,
+    TaskFace,
+    Guard,
+    StuckSurvey,
+    Exception,
+    UsageSeen,
+    AccountPoint,
+    AccountBad,
+    Sample,
+    ProbeMiss,
+    ResetAsk,
+    ResetEnd,
+);
+
+/// A call's request as a tape holds it: `name=<Debug>` for each argument, a
+/// line each, in the signature's order; nothing for a call with none.
+pub(crate) fn request(args: &[(&str, &dyn TapeArg)]) -> Vec<u8> {
+    let text = args
+        .iter()
+        .map(|(name, arg)| format!("{name}={arg:?}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    // This crate's tests hold every argument to it: a raw `Instant` in a
+    // request would make every replay of the run diverge there.
+    #[cfg(test)]
+    assert!(
+        !super::core::holds_instant(&text),
+        "a host's argument holds a raw Instant: {text}"
+    );
+    text.into_bytes()
+}
+
+// -- answers ------------------------------------------------------------------
+
+/// An answer of the host's, as a tape holds it: what [`TapedHost`] writes and
+/// [`ReplayHost`] reads back, with the tape's origin to place an `Instant` by
+/// ([module docs](self)).
+pub(crate) trait HostReply: Sized {
+    /// The answer's bytes on the tape, its instants from `origin`.
+    fn put(&self, origin: Instant) -> Vec<u8>;
+
+    /// The answer [`Self::put`] wrote, its instants placed from `origin`.
+    ///
+    /// # Errors
+    ///
+    /// Bytes [`Self::put`] did not write.
+    fn take(bytes: &[u8], origin: Instant) -> Result<Self, CodecError>;
+}
+
+/// Every value a round trip already tapes holds no `Instant`.
+impl<T: TapeValue> HostReply for T {
+    fn put(&self, _: Instant) -> Vec<u8> {
+        self.to_tape()
+    }
+
+    fn take(bytes: &[u8], _: Instant) -> Result<Self, CodecError> {
+        T::from_tape(bytes)
+    }
+}
+
+const NOT_WRITTEN: &str = "a host's answer this build did not write";
+
+fn bad(why: &'static str) -> CodecError {
+    CodecError { at: 0, why }
+}
+
+/// `value` as JSON bytes. The mirrors hold strings, numbers, booleans and
+/// options of them, which always serialize.
+fn json<T: Serialize>(value: &T) -> Vec<u8> {
+    aterm_json::to_vec(value).unwrap_or_default()
+}
+
+/// JSON bytes read back as `T`.
+fn of_json<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, CodecError> {
+    aterm_json::from_slice(bytes).map_err(|_| bad(NOT_WRITTEN))
+}
+
+/// `at` as signed nanoseconds from `origin` (saturated past ±292 years).
+pub(crate) fn offset_ns(origin: Instant, at: Instant) -> i64 {
+    match at.checked_duration_since(origin) {
+        Some(after) => i64::try_from(after.as_nanos()).unwrap_or(i64::MAX),
+        None => i64::try_from(origin.duration_since(at).as_nanos()).map_or(i64::MIN, |n| -n),
+    }
+}
+
+/// The instant `ns` nanoseconds from `origin` ([`offset_ns`] read back).
+///
+/// # Errors
+///
+/// An offset this process's clock cannot hold.
+pub(crate) fn instant_at(origin: Instant, ns: i64) -> Result<Instant, CodecError> {
+    let span = Duration::from_nanos(ns.unsigned_abs());
+    if ns < 0 {
+        origin.checked_sub(span)
+    } else {
+        origin.checked_add(span)
+    }
+    .ok_or(bad("an instant this clock cannot hold"))
+}
+
+/// `wants_at`: the instant the host next wants a point, or none.
+impl HostReply for Option<Instant> {
+    fn put(&self, origin: Instant) -> Vec<u8> {
+        json(&self.map(|at| offset_ns(origin, at)))
+    }
+
+    fn take(bytes: &[u8], origin: Instant) -> Result<Self, CodecError> {
+        of_json::<Option<i64>>(bytes)?
+            .map(|ns| instant_at(origin, ns))
+            .transpose()
+    }
+}
+
+/// [`Reach`] as a tape holds it.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ReachWire {
+    Unknown,
+    Down { since: i64 },
+    Up { since: i64 },
+}
+
+impl HostReply for Reach {
+    fn put(&self, origin: Instant) -> Vec<u8> {
+        json(&match *self {
+            Reach::Unknown => ReachWire::Unknown,
+            Reach::Down { since } => ReachWire::Down {
+                since: offset_ns(origin, since),
+            },
+            Reach::Up { since } => ReachWire::Up {
+                since: offset_ns(origin, since),
+            },
+        })
+    }
+
+    fn take(bytes: &[u8], origin: Instant) -> Result<Self, CodecError> {
+        Ok(match of_json(bytes)? {
+            ReachWire::Unknown => Reach::Unknown,
+            ReachWire::Down { since } => Reach::Down {
+                since: instant_at(origin, since)?,
+            },
+            ReachWire::Up { since } => Reach::Up {
+                since: instant_at(origin, since)?,
+            },
+        })
+    }
+}
+
+/// [`AccountAdvice`] as a tape holds it.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum AdviceWire {
+    Probe { otherwise: Option<Box<AdviceWire>> },
+    Move { to: String },
+    Wait { until: i64 },
+    Resume { cleared_at: i64 },
+}
+
+impl AdviceWire {
+    fn of(advice: &AccountAdvice, origin: Instant) -> Self {
+        match advice {
+            AccountAdvice::Probe { otherwise } => AdviceWire::Probe {
+                otherwise: otherwise
+                    .as_deref()
+                    .map(|o| Box::new(AdviceWire::of(o, origin))),
+            },
+            AccountAdvice::Move { to } => AdviceWire::Move { to: to.clone() },
+            AccountAdvice::Wait { until } => AdviceWire::Wait {
+                until: offset_ns(origin, *until),
+            },
+            AccountAdvice::Resume { cleared_at } => AdviceWire::Resume {
+                cleared_at: *cleared_at,
+            },
+        }
+    }
+
+    fn advice(self, origin: Instant) -> Result<AccountAdvice, CodecError> {
+        Ok(match self {
+            AdviceWire::Probe { otherwise } => AccountAdvice::Probe {
+                otherwise: otherwise
+                    .map(|o| o.advice(origin).map(Box::new))
+                    .transpose()?,
+            },
+            AdviceWire::Move { to } => AccountAdvice::Move { to },
+            AdviceWire::Wait { until } => AccountAdvice::Wait {
+                until: instant_at(origin, until)?,
+            },
+            AdviceWire::Resume { cleared_at } => AccountAdvice::Resume { cleared_at },
+        })
+    }
+}
+
+impl HostReply for Option<AccountAdvice> {
+    fn put(&self, origin: Instant) -> Vec<u8> {
+        json(&self.as_ref().map(|a| AdviceWire::of(a, origin)))
+    }
+
+    fn take(bytes: &[u8], origin: Instant) -> Result<Self, CodecError> {
+        of_json::<Option<AdviceWire>>(bytes)?
+            .map(|w| w.advice(origin))
+            .transpose()
+    }
+}
+
+/// The answers that are plain JSON values: a word, a flag, a count.
+macro_rules! tape_json {
+    ($($t:ty),* $(,)?) => {
+        $(
+            impl TapeValue for $t {
+                fn to_tape(&self) -> Vec<u8> {
+                    json(self)
+                }
+
+                fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+                    of_json(bytes)
+                }
+            }
+        )*
+    };
+}
+
+tape_json!(Option<String>, Option<bool>, Option<u32>, Option<u64>, u64);
+
+/// [`HostTurn`]'s word on a tape.
+fn turn_word(turn: HostTurn) -> &'static str {
+    match turn {
+        HostTurn::Notice => "notice",
+        HostTurn::CarryOn => "carry-on",
+        HostTurn::Check => "check",
+    }
+}
+
+fn turn_of(word: &str) -> Result<HostTurn, CodecError> {
+    [HostTurn::Notice, HostTurn::CarryOn, HostTurn::Check]
+        .into_iter()
+        .find(|t| turn_word(*t) == word)
+        .ok_or(bad("a host turn this build does not know"))
+}
+
+/// [`HostStep`] as a tape holds it.
+#[derive(Serialize, Deserialize)]
+struct StepWire {
+    line: String,
+    moved: bool,
+    typed: Option<String>,
+    repeat: bool,
+}
+
+impl TapeValue for Option<HostStep> {
+    fn to_tape(&self) -> Vec<u8> {
+        json(&self.as_ref().map(|s| {
+            let HostStep {
+                line,
+                moved,
+                typed,
+                repeat,
+            } = s;
+            StepWire {
+                line: line.clone(),
+                moved: *moved,
+                typed: typed.map(|t| turn_word(t).to_string()),
+                repeat: *repeat,
+            }
+        }))
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        of_json::<Option<StepWire>>(bytes)?
+            .map(|w| {
+                Ok(HostStep {
+                    line: w.line,
+                    moved: w.moved,
+                    typed: w.typed.as_deref().map(turn_of).transpose()?,
+                    repeat: w.repeat,
+                })
+            })
+            .transpose()
+    }
+}
+
+/// [`StandingLimit`] as a tape holds it.
+#[derive(Serialize, Deserialize)]
+struct LimitWire {
+    text: String,
+    until: Option<u64>,
+    window: Option<String>,
+    at: Option<u64>,
+    row: Option<String>,
+}
+
+impl TapeValue for Option<StandingLimit> {
+    fn to_tape(&self) -> Vec<u8> {
+        json(&self.as_ref().map(|l| {
+            let StandingLimit {
+                text,
+                until,
+                window,
+                at,
+                row,
+            } = l;
+            LimitWire {
+                text: text.clone(),
+                until: *until,
+                window: window.clone(),
+                at: *at,
+                row: row.clone(),
+            }
+        }))
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        Ok(of_json::<Option<LimitWire>>(bytes)?.map(|w| StandingLimit {
+            text: w.text,
+            until: w.until,
+            window: w.window,
+            at: w.at,
+            row: w.row,
+        }))
+    }
+}
+
+/// [`Pressure`]'s word on a tape.
+fn pressure_word(p: Pressure) -> &'static str {
+    match p {
+        Pressure::Normal => "normal",
+        Pressure::Warn => "warn",
+        Pressure::Critical => "critical",
+    }
+}
+
+fn pressure_of(word: &str) -> Result<Pressure, CodecError> {
+    [Pressure::Normal, Pressure::Warn, Pressure::Critical]
+        .into_iter()
+        .find(|p| pressure_word(*p) == word)
+        .ok_or(bad("a memory pressure this build does not know"))
+}
+
+/// [`AgentMemory`] as a tape holds it.
+#[derive(Serialize, Deserialize)]
+struct MemoryWire {
+    footprint_mib: u64,
+    physical_mib: Option<u64>,
+    available_mib: Option<u64>,
+    used_mib: Option<u64>,
+    pressure: Option<String>,
+    swap_kib_s: Option<u32>,
+    largest_other_mib: Option<u64>,
+}
+
+impl TapeValue for Option<AgentMemory> {
+    fn to_tape(&self) -> Vec<u8> {
+        json(&self.as_ref().map(|m| {
+            let AgentMemory {
+                footprint_mib,
+                physical_mib,
+                available_mib,
+                used_mib,
+                pressure,
+                swap_kib_s,
+                largest_other_mib,
+            } = *m;
+            MemoryWire {
+                footprint_mib,
+                physical_mib,
+                available_mib,
+                used_mib,
+                pressure: pressure.map(|p| pressure_word(p).to_string()),
+                swap_kib_s,
+                largest_other_mib,
+            }
+        }))
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        of_json::<Option<MemoryWire>>(bytes)?
+            .map(|w| {
+                Ok(AgentMemory {
+                    footprint_mib: w.footprint_mib,
+                    physical_mib: w.physical_mib,
+                    available_mib: w.available_mib,
+                    used_mib: w.used_mib,
+                    pressure: w.pressure.as_deref().map(pressure_of).transpose()?,
+                    swap_kib_s: w.swap_kib_s,
+                    largest_other_mib: w.largest_other_mib,
+                })
+            })
+            .transpose()
+    }
+}
+
+/// `account_probe`'s answer: `null` for a claim, else the refusal's word.
+impl TapeValue for Result<(), ProbeNo> {
+    fn to_tape(&self) -> Vec<u8> {
+        json(&self.err().map(ProbeNo::word))
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        match of_json::<Option<String>>(bytes)? {
+            None => Ok(Ok(())),
+            Some(word) => ProbeNo::of_word(&word)
+                .map(Err)
+                .ok_or(bad("a probe's refusal this build does not give")),
+        }
+    }
+}
+
+/// [`ResetWord`] as a tape holds it.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ResetWordWire {
+    Take {
+        until: i64,
+        long: bool,
+        limits: Vec<String>,
+        left: u32,
+        day: String,
+    },
+    Again,
+    No(String),
+}
+
+impl TapeValue for ResetWord {
+    fn to_tape(&self) -> Vec<u8> {
+        json(&match self {
+            ResetWord::Take(go) => {
+                let ResetGo {
+                    until,
+                    long,
+                    limits,
+                    left,
+                    day,
+                } = go;
+                ResetWordWire::Take {
+                    until: *until,
+                    long: *long,
+                    limits: limits.clone(),
+                    left: *left,
+                    day: day.clone(),
+                }
+            }
+            ResetWord::Again => ResetWordWire::Again,
+            ResetWord::No(no) => ResetWordWire::No(no.word().to_string()),
+        })
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        Ok(match of_json(bytes)? {
+            ResetWordWire::Take {
+                until,
+                long,
+                limits,
+                left,
+                day,
+            } => ResetWord::Take(ResetGo {
+                until,
+                long,
+                limits,
+                left,
+                day,
+            }),
+            ResetWordWire::Again => ResetWord::Again,
+            ResetWordWire::No(word) => ResetWord::No(
+                ResetNo::of_word(&word).ok_or(bad("a reset's refusal this build does not give"))?,
+            ),
+        })
+    }
+}
+
+/// [`ResetOutcome`] as a tape holds it.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum OutcomeWire {
+    Pending,
+    Spent {
+        asks: bool,
+        left: Option<u32>,
+        cleared_at: i64,
+    },
+    Lifted {
+        asks: bool,
+        cleared_at: i64,
+    },
+    Kept,
+    Failed {
+        login: bool,
+    },
+    Unread,
+}
+
+impl TapeValue for ResetOutcome {
+    fn to_tape(&self) -> Vec<u8> {
+        json(&match *self {
+            ResetOutcome::Pending => OutcomeWire::Pending,
+            ResetOutcome::Spent {
+                asks,
+                left,
+                cleared_at,
+            } => OutcomeWire::Spent {
+                asks,
+                left,
+                cleared_at,
+            },
+            ResetOutcome::Lifted { asks, cleared_at } => OutcomeWire::Lifted { asks, cleared_at },
+            ResetOutcome::Kept => OutcomeWire::Kept,
+            ResetOutcome::Failed { login } => OutcomeWire::Failed { login },
+            ResetOutcome::Unread => OutcomeWire::Unread,
+        })
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        Ok(match of_json(bytes)? {
+            OutcomeWire::Pending => ResetOutcome::Pending,
+            OutcomeWire::Spent {
+                asks,
+                left,
+                cleared_at,
+            } => ResetOutcome::Spent {
+                asks,
+                left,
+                cleared_at,
+            },
+            OutcomeWire::Lifted { asks, cleared_at } => ResetOutcome::Lifted { asks, cleared_at },
+            OutcomeWire::Kept => ResetOutcome::Kept,
+            OutcomeWire::Failed { login } => ResetOutcome::Failed { login },
+            OutcomeWire::Unread => ResetOutcome::Unread,
+        })
+    }
+}
+
+#[cfg(test)]
+#[path = "host_tests.rs"]
+mod tests;

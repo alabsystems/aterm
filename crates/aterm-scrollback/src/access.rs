@@ -2,14 +2,12 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! [`ScrollbackAccess`]: the methods [`Scrollback`] and [`DiskBackedScrollback`]
-//! share; [`ScrollbackStorage`] dispatches to it by matching on the concrete
+//! [`ScrollbackAccess`]: the methods [`Scrollback`] exposes to
+//! [`ScrollbackStorage`], which dispatches to it by matching on the concrete
 //! backend (see `storage.rs` for why it is not `dyn`).
 
 use std::borrow::Cow;
 
-#[cfg(feature = "disk-tier")]
-use super::DiskBackedScrollback;
 use super::{Line, Scrollback, ScrollbackError, WatermarkLevel};
 
 /// Sealed-trait supertrait: callers may name `ScrollbackAccess`, never implement
@@ -22,8 +20,8 @@ mod sealed {
 
 /// Shared interface for scrollback storage backends.
 ///
-/// Methods where the disk backend can fail return `io::Result` or
-/// `Result<_, ScrollbackError>`; the memory backend wraps infallible calls.
+/// Some methods return `io::Result` or `Result<_, ScrollbackError>`; the
+/// memory backend wraps its infallible calls in `Ok(())`.
 /// Sealed: implementable only inside this crate.
 pub trait ScrollbackAccess: sealed::Sealed {
     // --- Read ---
@@ -88,53 +86,6 @@ pub trait ScrollbackAccess: sealed::Sealed {
 
     /// Set the memory budget (bytes).
     fn set_memory_budget(&mut self, budget: usize) -> Result<(), ScrollbackError>;
-
-    // --- Checkpoint ---
-
-    /// Create an in-memory snapshot of hot + warm tiers (skip cold).
-    fn checkpoint_snapshot_fast(&self) -> Scrollback;
-}
-
-/// Shared `checkpoint_snapshot_fast()`: copies warm + hot lines and skips the
-/// cold tier, for bounded checkpoint latency.
-// Skip: the walk drives the sealed-trait accessors plus Vec/Line clones
-// (idiomatic-alloc class).
-#[cfg_attr(trust_verify, trust::skip)]
-pub(crate) fn checkpoint_snapshot_fast_from(source: &impl ScrollbackAccess) -> Scrollback {
-    let mut snapshot = Scrollback::new(
-        source.hot_limit(),
-        source.warm_limit(),
-        source.memory_budget(),
-    );
-    snapshot.set_line_limit(source.line_limit());
-
-    let cold_count = source.cold_line_count();
-    let total = source.line_count();
-    let mut saved: usize = 0;
-    let mut skipped: usize = 0;
-
-    for idx in cold_count..total {
-        match source.get_line(idx) {
-            Ok(Some(cow_line)) => {
-                snapshot.push_line(cow_line.into_owned());
-                saved += 1;
-            }
-            Ok(None) => break,
-            Err(e) => {
-                aterm_log::warn!("checkpoint_snapshot_fast: skipping line {idx}: {e}");
-                skipped += 1;
-            }
-        }
-    }
-
-    if skipped > 0 {
-        aterm_log::warn!(
-            "checkpoint_snapshot_fast: {saved} lines saved, {skipped} skipped, \
-             {cold_count} cold lines excluded"
-        );
-    }
-
-    snapshot
 }
 
 impl sealed::Sealed for Scrollback {}
@@ -213,91 +164,5 @@ impl ScrollbackAccess for Scrollback {
 
     fn set_memory_budget(&mut self, budget: usize) -> Result<(), ScrollbackError> {
         self.set_memory_budget(budget)
-    }
-
-    fn checkpoint_snapshot_fast(&self) -> Scrollback {
-        self.checkpoint_snapshot_fast()
-    }
-}
-
-#[cfg(feature = "disk-tier")]
-impl sealed::Sealed for DiskBackedScrollback {}
-
-#[cfg(feature = "disk-tier")]
-impl ScrollbackAccess for DiskBackedScrollback {
-    fn line_count(&self) -> usize {
-        self.line_count()
-    }
-
-    fn get_line(&self, idx: usize) -> Result<Option<Cow<'_, Line>>, ScrollbackError> {
-        self.get_line(idx)
-    }
-
-    fn get_line_rev(&self, rev_idx: usize) -> Result<Option<Cow<'_, Line>>, ScrollbackError> {
-        self.get_line_rev(rev_idx)
-    }
-
-    fn hot_limit(&self) -> usize {
-        self.hot_limit()
-    }
-
-    fn warm_limit(&self) -> usize {
-        self.warm_limit()
-    }
-
-    fn line_limit(&self) -> Option<usize> {
-        self.line_limit()
-    }
-
-    fn memory_budget(&self) -> usize {
-        self.memory_budget()
-    }
-
-    fn budgeted_memory_used(&self) -> usize {
-        self.budgeted_memory_used()
-    }
-
-    fn total_memory_used(&self) -> usize {
-        self.total_memory_used()
-    }
-
-    fn cold_line_count(&self) -> usize {
-        self.cold_line_count()
-    }
-
-    fn cold_memory_used(&self) -> usize {
-        self.cold_memory_used()
-    }
-
-    fn watermark_level(&self) -> WatermarkLevel {
-        self.watermark_level()
-    }
-
-    fn image_rows_dropped_by_compression(&self) -> u64 {
-        self.image_rows_dropped_by_compression()
-    }
-
-    fn push_line(&mut self, line: Line) -> std::io::Result<()> {
-        self.push_line(line)
-    }
-
-    fn clear(&mut self) -> std::io::Result<()> {
-        self.clear()
-    }
-
-    fn remove_newest(&mut self, n: usize) -> Result<(), ScrollbackError> {
-        self.remove_newest(n)
-    }
-
-    fn set_line_limit(&mut self, limit: Option<usize>) {
-        self.set_line_limit(limit);
-    }
-
-    fn set_memory_budget(&mut self, budget: usize) -> Result<(), ScrollbackError> {
-        self.set_memory_budget(budget)
-    }
-
-    fn checkpoint_snapshot_fast(&self) -> Scrollback {
-        self.checkpoint_snapshot_fast()
     }
 }

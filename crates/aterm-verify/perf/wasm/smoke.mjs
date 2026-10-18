@@ -3,9 +3,9 @@
 //
 // The wasm host-boundary smoke (`verify wasm-smoke`): drive the DEBUG
 // builds of the two web modules under node through the exports only a debug
-// build carries (each crate's src/host.rs: aterm-wasm's through aterm-wasm-abi's
-// `aterm_host` imports, aterm-gpu-web's through wasm-bindgen), and check what
-// crosses the host boundary in each direction.
+// build carries (each crate's src/host.rs, both through aterm-wasm-abi's
+// `aterm_host` imports), and check what crosses the host boundary in each
+// direction.
 //
 //   clocks  aterm_time's two browser clocks, which the module links in with
 //           aterm_time::wasm_clock_host!: Instant never goes backwards over a

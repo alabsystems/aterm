@@ -23,4 +23,3 @@ mod conformance_snapshot;
 mod conformance_subscribe;
 mod conformance_temporal;
 mod conformance_transact;
-mod public_edit_compat;

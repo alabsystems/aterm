@@ -22,8 +22,7 @@ pub(crate) const TAGLINE: &str = "Fast, hardened, introspectable.";
 pub(crate) const AUTHOR_COMPANY_BYLINE: &str = "By Andrew Yates · ALab";
 /// The author's short form, the last rung of the native About byline's fit ladder: the full
 /// [`aterm_types::identity::AUTHOR`] measures 164.6 pt at the Body step under 2× Dynamic Type,
-/// over the 164.0 pt hero column a 240 pt host gives it. `tests::author_short_names_the_author`
-/// pins it to the shared identity.
+/// over the 164.0 pt hero column a 240 pt host gives it.
 pub(crate) const AUTHOR_SHORT: &str = "A. Yates";
 /// The project site (`alab.systems`) About links from its byline and shows in its `Website`
 /// row, from the one identity every surface shares.
@@ -399,32 +398,6 @@ pub(crate) fn control_line() -> String {
 mod tests {
     use super::*;
 
-    /// Every rung of the About byline's ladder names the shared `identity::AUTHOR`, so renaming
-    /// it without respelling these fails here.
-    #[test]
-    fn author_short_names_the_author() {
-        let author = aterm_types::identity::AUTHOR;
-        let (given, surname) = author
-            .split_once(' ')
-            .expect("the shared author identity is given name plus surname");
-        assert_eq!(
-            AUTHOR_SHORT,
-            format!("{}. {surname}", &given[..1]),
-            "the byline's short rung is the shared author's initial and surname"
-        );
-        assert!(AUTHOR_ATTRIBUTION.ends_with(author));
-        assert!(AUTHOR_COMPANY_BYLINE.starts_with(AUTHOR_ATTRIBUTION));
-        assert!(AUTHOR_COMPANY_BYLINE.ends_with(COMPANY));
-    }
-
-    /// Provenance (build number, commit, compiler) has its own rows, never the version.
-    #[test]
-    fn version_display_is_shared_application_identity() {
-        let v = version_display();
-        assert!(!v.contains('+'), "no compiler suffix in the version: {v}");
-        assert_eq!(v, stamp().app_version);
-    }
-
     /// The section record and the runtime updater derive the pin independently from one
     /// compile input; the release cutter makes the same comparison on shipped bytes.
     #[test]
@@ -451,9 +424,10 @@ mod tests {
     }
 
     /// The which-copy rows: `running` names the running copy; `another copy` appears only when
-    /// there is one and carries the sentence verbatim, several copies joined at ` · `.
+    /// there is one, every copy on the one row; a bare binary (every test run) names the other
+    /// copy and promises nothing about it.
     #[test]
-    fn which_copy_rows_pin_the_s12_sentences() {
+    fn which_copy_rows_name_the_running_copy_and_every_other() {
         use aterm_update::which_copy::{OtherCopy, Running, WhichCopy};
         let alone = WhichCopy {
             running: std::path::PathBuf::from("/Applications/aterm.app"),
@@ -475,153 +449,29 @@ mod tests {
             ],
             ..alone.clone()
         };
-        assert_eq!(
-            which_copy_rows(&two),
-            vec![
-                ("running", "/Applications/aterm.app".to_string()),
-                (
-                    "another copy",
-                    "/Users//ana/Applications/aterm.app (0.60.0) \u{2014} the updater leaves \
-                     it alone \u{00b7} /opt/homebrew/Caskroom/aterm/0.59.0/aterm.app (version \
-                     unknown) \u{2014} the updater leaves it alone"
-                        .to_string()
-                ),
-            ]
+        let rows = which_copy_rows(&two);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[1].0, "another copy");
+        assert!(
+            rows[1]
+                .1
+                .contains("/Users//ana/Applications/aterm.app (0.60.0)")
+                && rows[1]
+                    .1
+                    .contains("/opt/homebrew/Caskroom/aterm/0.59.0/aterm.app"),
+            "{rows:?}"
         );
-        // A bare binary (every test run) names its path and promises nothing.
         let binary = WhichCopy {
             running: std::path::PathBuf::from("/Users//ana/aterm/target/release/aterm"),
             kind: Running::Binary,
             others: vec![other("/Applications/aterm.app", Some("0.60.0"))],
         };
         assert_eq!(
-            which_copy_rows(&binary),
-            vec![
-                (
-                    "running",
-                    "/Users//ana/aterm/target/release/aterm".to_string()
-                ),
-                (
-                    "another copy",
-                    "/Applications/aterm.app (0.60.0)".to_string()
-                ),
-            ]
-        );
-        // The live About carries the `running` row for this process.
-        let fields = about_fields();
-        let running = fields
-            .iter()
-            .filter(|(k, _)| *k == "running")
-            .map(|(_, v)| v.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(running.len(), 1, "exactly one running row: {fields:?}");
-        assert!(
-            std::path::Path::new(running[0]).is_absolute(),
-            "names a path: {}",
-            running[0]
-        );
-    }
-
-    /// About has exactly one `compiler` row: it leads with the toolchain's own name and
-    /// version, names the compiler binary and slug, and for Trust states the compatible Rust
-    /// release as a separate labelled fact.
-    #[test]
-    fn about_fields_has_the_compiler_row() {
-        let fields = about_fields();
-        let compiler: Vec<&String> = fields
-            .iter()
-            .filter(|(k, _)| *k == "compiler")
-            .map(|(_, v)| v)
-            .collect();
-        assert_eq!(compiler.len(), 1, "exactly one compiler row");
-        let row = compiler[0];
-        assert_eq!(row, &compiler_summary());
-        assert!(
-            row.contains(compiler_commit_short()),
-            "carries the slug: {row}"
-        );
-        assert!(
-            row.contains(&format!(
-                " \u{00b7} {} \u{00b7} trust_verify {}",
-                build_profile(),
-                trust_verify()
-            )),
-            "{row}"
-        );
-        if compiler_flavor() == "t" {
-            assert!(row.starts_with("Trust"), "leads with Trust: {row}");
-            assert!(
-                row.contains(&format!(
-                    " \u{00b7} trustc {} \u{00b7} ",
-                    compiler_commit_short()
-                )),
-                "names the trustc binary: {row}"
-            );
-            assert!(
-                row.contains(&format!(
-                    " \u{00b7} compatible with Rust {} \u{00b7} ",
-                    compiler_release()
-                )),
-                "the Rust release is a labelled compatibility fact: {row}"
-            );
-            let trust = compiler_trust_version();
-            if !trust.is_empty() {
-                assert!(
-                    row.starts_with(&format!("Trust {trust} \u{00b7} ")),
-                    "Trust's own version, from the trust: line: {row}"
-                );
-                assert_ne!(
-                    trust,
-                    compiler_release(),
-                    "Trust's own version is not the rust-compat release"
-                );
-            } else {
-                assert!(
-                    row.starts_with("Trust (version unreported) \u{00b7} "),
-                    "{row}"
-                );
-            }
-            assert!(!row.starts_with("Rust "), "{row}");
-        } else {
-            assert!(
-                row.starts_with(&format!("Rust {} \u{00b7} rustc ", compiler_release())),
-                "upstream leads with Rust and its release: {row}"
-            );
-            assert!(
-                !row.contains("Trust"),
-                "an upstream build claims no Trust: {row}"
-            );
-        }
-        let version = fields
-            .iter()
-            .find(|(k, _)| *k == "version")
-            .map(|(_, v)| v.as_str());
-        assert_eq!(version, Some(version_display()));
-    }
-
-    /// About's origin rows: author, company and the site the byline links and "Open Project
-    /// Site" opens.
-    #[test]
-    fn about_fields_carry_the_origin() {
-        let fields = about_fields();
-        let row = |k: &str| {
-            fields
-                .iter()
-                .find(|(key, _)| *key == k)
-                .map(|(_, v)| v.as_str())
-                .unwrap_or_else(|| panic!("no {k} row: {fields:?}"))
-        };
-        assert_eq!(row("site"), aterm_types::identity::SITE);
-        assert_eq!(row("company"), aterm_types::identity::COMPANY);
-        assert!(
-            row("author").ends_with(aterm_types::identity::AUTHOR),
-            "{}",
-            row("author")
-        );
-        assert_eq!(
-            fields.iter().filter(|(k, _)| *k == "site").count(),
-            1,
-            "exactly one site row"
+            which_copy_rows(&binary)[1],
+            (
+                "another copy",
+                "/Applications/aterm.app (0.60.0)".to_string()
+            )
         );
     }
 

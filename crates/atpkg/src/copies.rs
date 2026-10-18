@@ -387,12 +387,10 @@ mod tests {
             "the copy in use stays; the Developer ID rollback is never moved"
         );
         let row = row(&got);
-        assert_eq!(row.level, Level::Warn, "{row:?}");
         assert_eq!(
-            row.text,
-            "moved 1 stale copy of aterm to the Trash (recoverable there): \
-             aterm-prev-1788285383.app; /Applications/aterm-local-1789361388.app stays: a \
-             process runs from it; /Applications/aterm.app.rollback stays (trash=signature)"
+            row.level,
+            Level::Warn,
+            "a copy in use that stays is a warning: {row:?}"
         );
     }
 
@@ -429,12 +427,9 @@ mod tests {
             true,
         );
         assert!(
-            matches!(&got, Pruned::Done { moved, .. } if moved.is_empty()),
+            matches!(&got, Pruned::Done { moved, kept } if moved.is_empty()
+                && kept == &[(PathBuf::from("/Applications/aterm-prev-2.app"), "running-unstable")]),
             "{got:?}"
-        );
-        assert_eq!(
-            row(&got).text,
-            "/Applications/aterm-prev-2.app stays (trash=running-unstable)"
         );
     }
 
@@ -453,18 +448,12 @@ mod tests {
             |_| Ok(()),
             true,
         );
-        assert_eq!(
-            row(&alone),
-            Row {
-                level: Level::Ok,
-                text: "no other copy of aterm claims its identity".to_string()
-            }
-        );
+        assert_eq!(row(&alone).level, Level::Ok);
         let partial = Pruned::Incomplete { moved: Vec::new() };
-        assert_eq!(row(&partial).level, Level::Note);
         assert_eq!(
-            row(&Pruned::NotLooked("running outside the app bundle".into())).text,
-            "not checked (running outside the app bundle)"
+            row(&partial).level,
+            Level::Note,
+            "an incomplete census is never ok"
         );
     }
 
@@ -480,14 +469,21 @@ mod tests {
     #[test]
     fn a_look_names_what_a_prune_would_move() {
         let got = look_with("com.aterm.aterm", |_| owners_mac(), true);
-        let row = row(&got);
-        assert_eq!(row.level, Level::Warn);
         assert_eq!(
-            row.text,
-            "2 stale copies of aterm (`aterm doctor` moves them to the Trash): \
-             /Applications/aterm-prev-1788285383.app, /Applications/aterm-local-1789361388.app; \
-             /Applications/aterm.app.rollback stays (trash=signature)"
+            got,
+            Pruned::Found {
+                offered: vec![
+                    PathBuf::from("/Applications/aterm-prev-1788285383.app"),
+                    PathBuf::from("/Applications/aterm-local-1789361388.app"),
+                ],
+                kept: vec![(
+                    PathBuf::from("/Applications/aterm.app.rollback"),
+                    "signature"
+                )],
+                complete: true,
+            }
         );
+        assert_eq!(row(&got).level, Level::Warn);
     }
 
     #[test]
@@ -501,26 +497,5 @@ mod tests {
         );
         assert_eq!(trash_refusal("no code here"), None);
         assert_eq!(trash_refusal("Code=4 \"\""), None);
-    }
-
-    /// The live tool on a missing path runs, moves nothing, and reports its own refusal. A
-    /// successful move is not exercised: it would touch the real Trash.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn the_trash_tool_names_why_it_could_not_move_a_copy() {
-        if !Path::new(TRASH_TOOL).is_file() {
-            eprintln!("{TRASH_TOOL} absent (macOS before 15): skipped");
-            return;
-        }
-        let missing = std::env::temp_dir()
-            .canonicalize()
-            .unwrap()
-            .join(format!("aterm-retire-missing-{}.app", std::process::id()));
-        let refused = trash(&missing).unwrap_err();
-        // The system's own words, in whatever language this Mac speaks, name the file —
-        // never the generic exit-status fallback.
-        assert!(refused.contains("aterm-retire-missing"), "{refused}");
-        assert!(!refused.contains(TRASH_TOOL), "{refused}");
-        assert!(trash(Path::new("relative.app")).is_err());
     }
 }

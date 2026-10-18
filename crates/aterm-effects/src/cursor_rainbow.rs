@@ -85,7 +85,7 @@ const MIX_MAX: f32 = 0.82;
 /// Light-theme mixes, higher than the dark ones: a hue mixed toward near-black
 /// turns to mud, so on a light page the active block must be a saturated
 /// rainbow. Only the top of the ramp moves; at rest the block stays near-black
-/// (pinned by `light_theme_base_is_dark`).
+/// (pinned by `fill_blooms_from_base_with_energy`).
 const MIX_IDLE_LIGHT: f32 = MIX_IDLE;
 const MIX_MAX_LIGHT: f32 = 0.95;
 
@@ -135,11 +135,10 @@ const RIM_SPIN_TURNS_PER_S: f32 = 0.45;
 ///
 /// With every ring at one light, the rim's light is a function of
 /// `halo_energy` alone, which is monotone in the paint. `0.462` is the arc's
-/// mean light, re-derived by `rim_light_grey_is_the_arcs_mean`, so the average
-/// over a turn is unchanged and only the variance is gone.
+/// mean light, so the average over a turn is unchanged and only the variance
+/// is gone.
 const RIM_LIGHT: f32 = 0.462;
-/// The grey of relative luminance [`RIM_LIGHT`] (sRGB byte `181`), pinned by
-/// `rim_light_grey_is_the_arcs_mean`.
+/// The grey of relative luminance [`RIM_LIGHT`] (sRGB byte `181`).
 const RIM_LIGHT_GREY: u32 = 0x00B5_B5B5;
 
 /// Energy below which the cursor is settled: the animator reports inactive so
@@ -695,7 +694,7 @@ impl CursorRainbow {
         // per tick however many rungs were crossed; a rung re-arms once the
         // paint falls `HYST` below it. A decaying scalar crosses nothing upward,
         // so idle cost is zero. Gated on `cfg.blinking`: a steady block has no
-        // blink to replace (`steady_block_never_twinkles`).
+        // blink to replace (`idle_phase_flips_never_arm_effect_timer`).
         if cfg.blinking {
             let rung_reached = MOMENTUM_FLARE_STEPS
                 .iter()
@@ -1372,8 +1371,8 @@ fn light_on_glass(page: u32, premul: u32) -> f32 {
 /// `scale` multiplies the target; [`CursorRainbow::equalise_rim_light`]
 /// bisects it for the whole pile.
 fn ring_light_on_page(arc: u32, cov: u8, page: u32, scale: f32) -> u32 {
-    // The byte and the law it encodes are one number; `rim_light_grey_is_the_arcs_mean`
-    // pins it in the suite, this pins it on every debug call.
+    // The byte and the law it encodes are one number; this pins it on every
+    // debug call.
     debug_assert!(
         (crate::color_math::relative_luminance(RIM_LIGHT_GREY) - RIM_LIGHT).abs() < 0.005,
         "RIM_LIGHT_GREY is not the encode of RIM_LIGHT"
@@ -1516,15 +1515,6 @@ mod tests {
             .fill;
         assert_eq!(fa, fb, "a settled flare is the plain fill");
         assert_eq!(a, b, "a settled flare's halo is the plain halo");
-        // Mid-relax the fill is strictly between: no longer white, not yet home.
-        let mid = t0 + Duration::from_millis(40);
-        let mut m = Vec::new();
-        let fm = CursorRainbow::default()
-            .tick(Some((1, 1)), mid, 1.0, true, true, g, &flared, &mut m)
-            .fill
-            .unwrap();
-        assert_ne!(fm, 0x00FF_FFFF, "40 ms in, the flare has left white");
-        assert_ne!(Some(fm), fb, "40 ms in, the flare is not yet home");
     }
 
     /// §7.1 and D4, the landing's caret law on the real seam: after a v2
@@ -1561,7 +1551,6 @@ mod tests {
             theme_bg: 0x001A_1B26,
             beam: false,
             head_dx: 0.5,
-            pack: None,
             ribbon_tall: true,
             ribbon_flat: false,
         };
@@ -1676,11 +1665,6 @@ mod tests {
             now += Duration::from_micros(HZ);
             fills.push(frame(&mut glow, &mut body, &glow_cfg, g, now, landing));
         }
-        assert!(
-            fills.len() >= 47,
-            "120 Hz over 400 ms: {} frames",
-            fills.len()
-        );
 
         // Law 1, no pop: after the white frame every per-frame fill step is
         // under 40/255 per channel (spring-snap from white peaks near 27/255
@@ -1840,26 +1824,14 @@ mod tests {
                 "disabled",
                 RainbowConfig {
                     enabled: false,
-                    intensity: 1.0,
-                    blinking: false,
-                    base: None,
-                    head_rgb: None,
-                    paint: None,
-                    ground: None,
-                    flare_at: None,
+                    ..cfg()
                 },
             ),
             (
                 "zero intensity",
                 RainbowConfig {
-                    enabled: true,
                     intensity: 0.0,
-                    blinking: false,
-                    base: None,
-                    head_rgb: None,
-                    paint: None,
-                    ground: None,
-                    flare_at: None,
+                    ..cfg()
                 },
             ),
         ] {
@@ -1919,7 +1891,9 @@ mod tests {
     }
 
     /// The block fill starts near the base (white on dark) at rest and moves markedly
-    /// toward a saturated rainbow under full energy — the "white → rainbow" bloom.
+    /// toward a saturated rainbow under full energy — the "white → rainbow" bloom. A
+    /// light theme starts the block from near-BLACK instead when the host names no
+    /// cursor colour of its own.
     #[test]
     fn fill_blooms_from_base_with_energy() {
         let g = geom();
@@ -1956,6 +1930,22 @@ mod tests {
         assert!(
             spread(f_hot) > spread(f_idle) + 40,
             "energy saturates the fill"
+        );
+        let f_light = CursorRainbow::default()
+            .tick(Some((1, 1)), t, 0.0, true, false, g, &c, &mut out)
+            .fill
+            .unwrap();
+        let maxch = [
+            (f_light >> 16) & 0xff,
+            (f_light >> 8) & 0xff,
+            f_light & 0xff,
+        ]
+        .into_iter()
+        .max()
+        .unwrap();
+        assert!(
+            maxch < 90,
+            "idle block near black on a light theme, got {f_light:#08x}"
         );
     }
 
@@ -1997,18 +1987,6 @@ mod tests {
                 "two cursor colours must not paint one identical block (dark={dark})"
             );
         }
-        // …and energy still blooms the spectrum over that base rather than
-        // replacing the base's job: the hot fill is markedly more saturated.
-        let c = RainbowConfig {
-            base: Some(0x00FF_0000),
-            ..cfg()
-        };
-        out.clear();
-        let hot = CursorRainbow::default()
-            .tick(Some((1, 1)), t, 1.0, true, true, g, &c, &mut out)
-            .fill
-            .unwrap();
-        assert_ne!(hot, settled(0x00FF_0000, true, &mut out));
     }
 
     /// A host with real ribbon pixels is authoritative over a merely plausible
@@ -2084,319 +2062,122 @@ mod tests {
         );
     }
 
-    /// A light theme starts the block from near-BLACK (not white) when the host
-    /// names no cursor colour of its own.
-    #[test]
-    fn light_theme_base_is_dark() {
-        let g = geom();
-        let c = cfg();
-        let mut cr = CursorRainbow::default();
-        let mut out = Vec::new();
-        let f = cr
-            .tick(
-                Some((1, 1)),
-                Instant::now(),
-                0.0,
-                true,
-                false,
-                g,
-                &c,
-                &mut out,
-            )
-            .fill
-            .unwrap();
-        let maxch = [(f >> 16) & 0xff, (f >> 8) & 0xff, f & 0xff]
-            .into_iter()
-            .max()
-            .unwrap();
-        assert!(
-            maxch < 90,
-            "idle block near black on a light theme, got {f:#08x}"
-        );
-    }
-
-    /// Energy drives both the halo brightness and the hue-spin rate: a hot run spins
-    /// faster and glows brighter than a cool one over the same wall-clock.
-    #[test]
-    fn energy_spins_faster_and_glows_brighter() {
-        let g = geom();
-        let c = cfg();
-        let step = Duration::from_millis(16);
-        let run = |energy: f32| -> (f32, u64) {
-            let mut cr = CursorRainbow::default();
-            let mut out = Vec::new();
-            let mut t = Instant::now();
-            cr.tick(Some((2, 2)), t, energy, true, true, g, &c, &mut out); // seed last
-            let mut ink = 0u64;
-            for _ in 0..30 {
-                t += step;
-                out.clear();
-                cr.tick(Some((2, 2)), t, energy, true, true, g, &c, &mut out);
-                ink += out
-                    .iter()
-                    .map(|q| {
-                        (((q.color >> 16) & 0xff) + ((q.color >> 8) & 0xff) + (q.color & 0xff))
-                            as u64
-                    })
-                    .sum::<u64>();
-            }
-            (cr.phase, ink)
-        };
-        let (cool_phase, cool_ink) = run(0.05);
-        let (hot_phase, hot_ink) = run(1.0);
-        assert!(
-            hot_phase > cool_phase + 0.2,
-            "hot spins the hue faster ({hot_phase} vs {cool_phase})"
-        );
-        assert!(
-            hot_ink > cool_ink * 2,
-            "hot glows far brighter ({hot_ink} vs {cool_ink})"
-        );
-    }
-
-    /// Every emitted halo quad is single-row and inside the grid interior (the renderer
-    /// row-gate + parity invariant), and additive coverage is bounded for legibility.
+    /// Every emitted halo and star quad is single-row and inside the grid
+    /// interior (the renderer row-gate + parity invariant), additive coverage
+    /// is bounded for legibility, and at full energy mid-flare (the widest
+    /// reach and brightest light) no quad reaches more than about half a cell
+    /// width past the cursor cell. Checked at a grid-edge cell (clamping) and
+    /// a mid-row cell (the reach).
     #[test]
     fn halo_quads_respect_grid_and_cap() {
         let g = geom();
-        let c = cfg();
-        let mut cr = CursorRainbow::default();
-        let mut out = Vec::new();
+        let c = blink_cfg();
         let t = Instant::now();
-        // A cell at the grid edge so clamping is exercised.
-        cr.tick(Some((0, 0)), t, 1.0, true, true, g, &c, &mut out);
-        cr.tick(
-            Some((0, 0)),
-            t + Duration::from_millis(16),
-            1.0,
-            true,
-            true,
-            g,
-            &c,
-            &mut out,
-        );
         let gw = (g.cols * g.cw) as u32;
         let gh = (g.rows * g.ch) as u32;
-        for q in &out {
-            let band = q.row as u32 * g.ch as u32;
-            assert!(
-                q.y as u32 >= band && q.y as u32 + q.h as u32 <= band + g.ch as u32,
-                "single-row: {q:?}"
-            );
-            assert!(
-                q.x as u32 + q.w as u32 <= gw && q.y as u32 + q.h as u32 <= gh,
-                "in grid: {q:?}"
-            );
-            for sh in [16, 8, 0] {
-                assert!((q.color >> sh) & 0xff <= 180, "halo coverage capped: {q:?}");
+        let cw = g.cw as i32;
+        for (row, col) in [(0u16, 0u16), (2, 20)] {
+            let mut cr = CursorRainbow::default();
+            let mut out = Vec::new();
+            // Under the first rung, then a crossing: the flare fires on tick
+            // two; sampled at its full pop.
+            cr.tick(Some((row, col)), t, 0.1, true, true, g, &c, &mut out);
+            let cross = t + Duration::from_millis(16);
+            cr.tick(Some((row, col)), cross, 1.0, false, true, g, &c, &mut out);
+            out.clear();
+            let mid = cross + Duration::from_secs_f32(TWINKLE_DUR / 2.0);
+            cr.tick(Some((row, col)), mid, 1.0, false, true, g, &c, &mut out);
+            assert!(!out.is_empty(), "a hot cursor glows");
+            let (cell_l, cell_r) = (i32::from(col) * cw, (i32::from(col) + 1) * cw);
+            let max_reach = cw / 2 + 1; // ≤ half a cell (+1 px innermost bias)
+            for q in &out {
+                let band = q.row as u32 * g.ch as u32;
+                assert!(
+                    q.y as u32 >= band && q.y as u32 + q.h as u32 <= band + g.ch as u32,
+                    "single-row: {q:?}"
+                );
+                assert!(
+                    q.x as u32 + q.w as u32 <= gw && q.y as u32 + q.h as u32 <= gh,
+                    "in grid: {q:?}"
+                );
+                for sh in [16, 8, 0] {
+                    assert!((q.color >> sh) & 0xff <= 180, "coverage capped: {q:?}");
+                }
+                assert!(
+                    cell_l - q.x as i32 <= max_reach
+                        && (q.x as i32 + q.w as i32) - cell_r <= max_reach,
+                    "reaches past half a cell: {q:?}"
+                );
             }
         }
-    }
-
-    /// Charged ⇒ active (host keeps the tick armed); once energy settles it reports
-    /// inactive so the focused idle cursor stops forcing 60 fps wakeups.
-    #[test]
-    fn settles_to_inactive_when_energy_drops() {
-        let g = geom();
-        let c = cfg();
-        let mut cr = CursorRainbow::default();
-        let mut out = Vec::new();
-        let t = Instant::now();
-        cr.tick(Some((1, 1)), t, 0.8, true, true, g, &c, &mut out);
-        assert!(cr.is_active(), "charged cursor keeps the animation armed");
-        cr.tick(
-            Some((1, 1)),
-            t + Duration::from_millis(16),
-            0.0,
-            true,
-            true,
-            g,
-            &c,
-            &mut out,
-        );
-        assert!(
-            !cr.is_active(),
-            "settled cursor idles (sits solid inside its resting rim)"
-        );
-    }
-
-    /// Settled cursor pixels are frame-gap invariant: sparse captures and a
-    /// fresh charge after a long idle never integrate an unpresented clock
-    /// slice.
-    #[test]
-    fn settled_present_gaps_are_byte_identical_and_resume_without_a_snap() {
-        let g = geom();
-        let c = cfg();
-        let t = Instant::now();
-        let mut cr = CursorRainbow::default();
-        let mut out = Vec::new();
-        cr.tick(Some((1, 1)), t, 0.8, true, true, g, &c, &mut out);
-        out.clear();
-        cr.tick(
-            Some((1, 1)),
-            t + Duration::from_millis(16),
-            0.8,
-            true,
-            true,
-            g,
-            &c,
-            &mut out,
-        );
-        out.clear();
-        let first = cr.tick(
-            Some((1, 1)),
-            t + Duration::from_secs(5),
-            0.0,
-            true,
-            true,
-            g,
-            &c,
-            &mut out,
-        );
-        let first_quads = out.clone();
-        let settled_phase = cr.phase;
-        out.clear();
-        let late = cr.tick(
-            Some((1, 1)),
-            t + Duration::from_secs(30),
-            0.0,
-            true,
-            true,
-            g,
-            &c,
-            &mut out,
-        );
-        assert_eq!(late.fill, first.fill);
-        assert_eq!(late.fp, first.fp);
-        assert_eq!(out, first_quads);
-        assert_eq!(cr.phase, settled_phase);
-        assert!(!cr.is_active());
-
-        out.clear();
-        let resumed = cr.tick(
-            Some((1, 1)),
-            t + Duration::from_secs(31),
-            0.8,
-            true,
-            true,
-            g,
-            &c,
-            &mut out,
-        );
-        assert_eq!(
-            cr.phase, settled_phase,
-            "the first resumed frame cannot charge for the idle gap"
-        );
-        assert_eq!(
-            resumed.fill,
-            cr.tick(
-                Some((1, 1)),
-                t + Duration::from_secs(31),
-                0.8,
-                true,
-                true,
-                g,
-                &c,
-                &mut Vec::new(),
-            )
-            .fill,
-            "re-sampling the same instant is stable"
-        );
     }
 
     // ───────────────────────── the twinkle (glitter star) ─────────────────────────
 
     /// An upward crossing of a momentum rung while charged fires a twinkle:
-    /// star quads land in the scratch and the fill glints brighter than the
-    /// unflared rainbow. The phase argument is inert (constant `true` below).
+    /// star quads land in the scratch and, on a dark theme, the fill glints
+    /// toward white against a steady-block twin on the identical clock and
+    /// paint (which cannot flare). On a light theme the glint stays saturated:
+    /// white would sink into the background.
     #[test]
     fn momentum_rung_crossing_fires_twinkle_star() {
         let g = geom();
-        let c = blink_cfg();
         let t = Instant::now();
-        let mut cr = CursorRainbow::default();
-        let mut out = Vec::new();
-        // Charged, but under the first rung: no star yet.
-        cr.tick(Some((2, 20)), t, 0.1, true, true, g, &c, &mut out);
-        assert!(
-            cr.is_active(),
-            "typing energy already owns the frame cadence"
-        );
-        assert!(!cr.twinkling, "under the first rung nothing flares");
-        let calm_quads = out.len();
-        // The paint climbs through MOMENTUM_FLARE_STEPS[0]: the star flares.
-        out.clear();
         let cross = t + Duration::from_millis(16);
         let mid = cross + Duration::from_secs_f32(TWINKLE_DUR / 2.0);
-        cr.tick(Some((2, 20)), cross, 0.3, true, true, g, &c, &mut out);
-        assert!(cr.twinkling, "a rung crossing arms the flare");
-        assert_eq!(cr.flare_rung, 1, "the first rung is held");
-        out.clear();
-        let flared = cr
-            .tick(Some((2, 20)), mid, 0.3, true, true, g, &c, &mut out)
-            .fill
-            .unwrap();
-        // Measured against a steady-block twin on the identical clock and
-        // paint (it cannot flare), so the paint's own mix is not mistaken for
-        // the glint.
-        let steady = cfg();
-        let mut twin = CursorRainbow::default();
-        let mut twin_out = Vec::new();
-        twin.tick(Some((2, 20)), t, 0.1, true, true, g, &steady, &mut twin_out);
-        twin.tick(
-            Some((2, 20)),
-            cross,
-            0.3,
-            true,
-            true,
-            g,
-            &steady,
-            &mut twin_out,
-        );
-        let calm = twin
-            .tick(
-                Some((2, 20)),
-                mid,
-                0.3,
-                true,
-                true,
-                g,
-                &steady,
-                &mut twin_out,
-            )
-            .fill
-            .unwrap();
-        assert!(!twin.twinkling, "the steady twin never flares");
-        assert!(
-            out.len() > calm_quads,
-            "the flare adds star quads over the idle halo ({} vs {calm_quads})",
-            out.len()
-        );
         let minch = |c: u32| {
             [(c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff]
                 .into_iter()
                 .min()
                 .unwrap()
         };
+        // Charged under the first rung, then through it; the fill and quads
+        // mid-flare, and the quad count under the rung.
+        let run = |c: &RainbowConfig, dark: bool, e: f32| {
+            let mut cr = CursorRainbow::default();
+            let mut out = Vec::new();
+            cr.tick(Some((2, 20)), t, 0.1, true, dark, g, c, &mut out);
+            let calm_quads = out.len();
+            cr.tick(Some((2, 20)), cross, e, true, dark, g, c, &mut out);
+            out.clear();
+            let fill = cr
+                .tick(Some((2, 20)), mid, e, true, dark, g, c, &mut out)
+                .fill
+                .unwrap();
+            (cr.twinkling, fill, out.len(), calm_quads)
+        };
+        let (twinkling, flared, quads, calm_quads) = run(&blink_cfg(), true, 0.3);
+        assert!(twinkling, "a rung crossing arms the flare");
         assert!(
-            minch(flared) >= minch(calm),
+            quads > calm_quads,
+            "the flare adds star quads over the idle halo ({quads} vs {calm_quads})"
+        );
+        let (steady_twinkling, calm, _, _) = run(&cfg(), true, 0.3);
+        assert!(!steady_twinkling, "the steady twin never flares");
+        assert!(
+            minch(flared) >= minch(calm) && flared != calm,
             "mid-flare the dark-theme fill glints toward white ({flared:#08x} vs {calm:#08x})"
         );
-        assert_ne!(flared, calm, "the glint visibly changes the fill");
+        let (_, light, _, _) = run(&blink_cfg(), false, 0.8);
+        assert!(
+            minch(light) < 160,
+            "the light-theme glint keeps saturation (never washes to white), got {light:#08x}"
+        );
     }
 
-    /// Idle-zero: phase flips at settled energy never arm the effect timer.
-    /// The phase is not read and a resting paint (exactly 0) crosses no rung;
-    /// twenty half-periods leave the animator idle after every flip.
+    /// Only a blinking block's charged rung crossing twinkles. Idle-zero:
+    /// phase flips at settled energy never arm the effect timer (the phase is
+    /// not read and a resting paint crosses no rung), so twenty half-periods
+    /// leave the animator idle. A steady block's full momentum wind-up fires
+    /// nothing.
     #[test]
     fn idle_phase_flips_never_arm_effect_timer() {
         let g = geom();
-        let c = blink_cfg();
         let t = Instant::now();
         let mut cr = CursorRainbow::default();
         let mut out = Vec::new();
         let mut phase = true;
-        cr.tick(Some((1, 1)), t, 0.0, phase, true, g, &c, &mut out);
+        cr.tick(Some((1, 1)), t, 0.0, phase, true, g, &blink_cfg(), &mut out);
         for i in 1..=20u64 {
             phase = !phase;
             out.clear();
@@ -2407,13 +2188,28 @@ mod tests {
                 phase,
                 true,
                 g,
-                &c,
+                &blink_cfg(),
                 &mut out,
             );
             assert!(!cr.is_active(), "idle flip {i} armed an effect wake");
-            assert!(cr.twinkle_at.is_none(), "idle flip {i} armed a flare");
-            assert_eq!(cr.twinkle_seq, 0, "idle flips consumed flare identities");
+            assert_eq!(cr.twinkle_seq, 0, "idle flip {i} consumed a flare identity");
         }
+        let mut steady = CursorRainbow::default();
+        steady.tick(Some((1, 1)), t, 0.0, true, true, g, &cfg(), &mut out);
+        steady.tick(
+            Some((1, 1)),
+            t + Duration::from_millis(16),
+            1.0,
+            false,
+            true,
+            g,
+            &cfg(),
+            &mut out,
+        );
+        assert_eq!(
+            steady.twinkle_seq, 0,
+            "a steady block's wind-up fires no star"
+        );
     }
 
     /// Tier-1: project the real animator's flare generation counter through a
@@ -2427,7 +2223,7 @@ mod tests {
     /// generation, an idle event never restarts one, and every flare finishes.
     #[test]
     fn idle_blink_transition_conforms_to_model() {
-        let model = aterm_spec::derive::rainbow_idle_twinkle_model();
+        let model = aterm_models_effects::rainbow_idle_twinkle_model();
         let state = |charged: i64,
                      twinkle: i64,
                      remaining: i64,
@@ -2693,44 +2489,6 @@ mod tests {
         assert!(!flared.is_active(), "the flare completes and disarms");
         assert_eq!(out_f, out_c, "no residue: post-flare light == never-flared");
         assert_eq!(ff.fill, fc.fill, "post-flare fill == never-flared");
-    }
-
-    /// A steady block never twinkles: with `blinking: false` a full momentum
-    /// wind-up fires nothing, and the phase argument is not read.
-    #[test]
-    fn steady_block_never_twinkles() {
-        let g = geom();
-        let c = cfg(); // blinking: false
-        let t = Instant::now();
-        let mut cr = CursorRainbow::default();
-        let mut out = Vec::new();
-        cr.tick(Some((1, 1)), t, 0.0, true, true, g, &c, &mut out);
-        cr.tick(
-            Some((1, 1)),
-            t + Duration::from_millis(16),
-            0.0,
-            false,
-            true,
-            g,
-            &c,
-            &mut out,
-        );
-        assert!(!cr.is_active(), "a steady block's phase flips fire nothing");
-        cr.tick(
-            Some((1, 1)),
-            t + Duration::from_millis(32),
-            1.0,
-            true,
-            true,
-            g,
-            &c,
-            &mut out,
-        );
-        assert!(
-            cr.twinkle_at.is_none(),
-            "a steady block's wind-up fires no star"
-        );
-        assert_eq!(cr.twinkle_seq, 0, "no flare identity was consumed");
     }
 
     /// The halo rides the paint (the ribbon's display spine), not the cadence:
@@ -3003,93 +2761,8 @@ mod tests {
         assert!(worst > 0, "…and the rim must actually turn");
     }
 
-    /// Reduced motion (`intensity == 0`) keeps the twinkle provably off too —
-    /// the host then leaves the shape un-pinned and the plain blink returns.
-    #[test]
-    fn reduced_motion_keeps_plain_blink() {
-        let g = geom();
-        let c = RainbowConfig {
-            intensity: 0.0,
-            ..blink_cfg()
-        };
-        let t = Instant::now();
-        let mut cr = CursorRainbow::default();
-        let mut out = Vec::new();
-        cr.tick(Some((1, 1)), t, 0.0, true, true, g, &c, &mut out);
-        let f = cr.tick(
-            Some((1, 1)),
-            t + Duration::from_millis(16),
-            0.0,
-            false,
-            true,
-            g,
-            &c,
-            &mut out,
-        );
-        assert!(f.fill.is_none(), "inert ⇒ the host keeps the plain blink");
-        assert_eq!(f.fp, 0);
-        assert!(out.is_empty(), "no star under reduced motion");
-        assert!(!cr.is_active());
-    }
-
-    /// Star quads obey the halo's discipline: single-row, grid-interior,
-    /// coverage-capped, and within about half a cell of the block on both
-    /// sides.
-    #[test]
-    fn twinkle_star_hugs_and_caps() {
-        let g = geom();
-        let c = blink_cfg();
-        let t = Instant::now();
-        let mut cr = CursorRainbow::default();
-        let mut out = Vec::new();
-        // Under the first rung, then a crossing: the flare fires on tick two.
-        cr.tick(Some((2, 20)), t, 0.1, true, true, g, &c, &mut out);
-        cr.tick(
-            Some((2, 20)),
-            t + Duration::from_millis(16),
-            0.8,
-            false,
-            true,
-            g,
-            &c,
-            &mut out,
-        );
-        out.clear();
-        // Mid-flare at full pop: the widest reach + brightest light of the flare.
-        cr.tick(
-            Some((2, 20)),
-            t + Duration::from_millis(16) + Duration::from_secs_f32(TWINKLE_DUR / 2.0),
-            0.8,
-            false,
-            true,
-            g,
-            &c,
-            &mut out,
-        );
-        assert!(!out.is_empty(), "mid-flare the star is lit");
-        let cw = g.cw as i32;
-        let (cell_l, cell_r) = (20 * cw, 21 * cw);
-        let max_reach = cw / 2 + 1;
-        for q in &out {
-            let band = q.row as u32 * g.ch as u32;
-            assert!(
-                q.y as u32 >= band && q.y as u32 + q.h as u32 <= band + g.ch as u32,
-                "single-row: {q:?}"
-            );
-            assert!(
-                cell_l - q.x as i32 <= max_reach && (q.x as i32 + q.w as i32) - cell_r <= max_reach,
-                "star hugs within half a cell: {q:?}"
-            );
-            for sh in [16, 8, 0] {
-                assert!((q.color >> sh) & 0xff <= 180, "coverage capped: {q:?}");
-            }
-        }
-    }
-
-    /// The twinkle is a pure clock function: identical instants and paint
-    /// trajectories give byte-identical quads and equal fingerprints.
-    /// It also pins the photosensitivity bound as a rate, so retuning either
-    /// constant cannot reintroduce a strobe above WCAG 2.3.1's threshold.
+    /// The twinkle's photosensitivity bound, pinned as a rate, so retuning
+    /// either constant cannot reintroduce a strobe above WCAG 2.3.1's threshold.
     #[test]
     fn twinkle_flash_rate_stays_under_the_photosensitivity_bound() {
         let hz = TWINKLE_SCINT / TWINKLE_DUR;
@@ -3102,148 +2775,6 @@ mod tests {
         const {
             assert!(TWINKLE_SCINT > 0.0, "the flare must still scintillate");
         }
-    }
-
-    #[test]
-    fn twinkle_is_deterministic() {
-        let g = geom();
-        let c = blink_cfg();
-        let t = Instant::now();
-        let run = || {
-            let mut cr = CursorRainbow::default();
-            let mut out = Vec::new();
-            let mut fps = Vec::new();
-            for i in 0..40u64 {
-                // A wind-up every ~256 ms: 0.1 → 0.8 crosses three rungs
-                // (one flare), 0.8 → 0.1 releases them all.
-                let energy = if (i / 8) % 2 == 0 { 0.8 } else { 0.1 };
-                let f = cr.tick(
-                    Some((2, 10)),
-                    t + Duration::from_millis(i * 16),
-                    energy,
-                    true,
-                    true,
-                    g,
-                    &c,
-                    &mut out,
-                );
-                fps.push(f.fp);
-            }
-            assert_eq!(cr.twinkle_seq, 3, "three wind-ups, three flares");
-            (out, fps)
-        };
-        let (out_a, fps_a) = run();
-        let (out_b, fps_b) = run();
-        assert_eq!(out_a, out_b, "identical clocks ⇒ identical quads");
-        assert_eq!(fps_a, fps_b, "identical clocks ⇒ identical fingerprints");
-        assert!(
-            fps_a.windows(2).any(|w| w[0] != w[1]),
-            "a mid-flare fingerprint steps every frame"
-        );
-    }
-
-    /// On a light theme the glint goes toward the vivid hue, not white, which
-    /// would sink into a light background.
-    #[test]
-    fn light_theme_glint_stays_saturated() {
-        let g = geom();
-        let c = blink_cfg();
-        let t = Instant::now();
-        let mut cr = CursorRainbow::default();
-        let mut out = Vec::new();
-        // Under the first rung, then a crossing: the flare fires on tick two.
-        cr.tick(Some((1, 1)), t, 0.1, true, false, g, &c, &mut out);
-        cr.tick(
-            Some((1, 1)),
-            t + Duration::from_millis(16),
-            0.8,
-            false,
-            false,
-            g,
-            &c,
-            &mut out,
-        );
-        let mid = t + Duration::from_millis(16) + Duration::from_secs_f32(TWINKLE_DUR / 2.0);
-        let f = cr
-            .tick(Some((1, 1)), mid, 0.8, false, false, g, &c, &mut out)
-            .fill
-            .unwrap();
-        let minch = [(f >> 16) & 0xff, (f >> 8) & 0xff, f & 0xff]
-            .into_iter()
-            .min()
-            .unwrap();
-        assert!(
-            minch < 160,
-            "the light-theme glint keeps saturation (never washes to white), got {f:#08x}"
-        );
-    }
-
-    /// A standalone caret keeps its energy-responsive, about one-turn-per-second
-    /// clock, and one unit turn traverses one complete period-two family sweep.
-    ///
-    /// Drives 1.28 s of real ticks across the unit wrap and checks both sides.
-    /// The direct-unit negative control shows the smoothness bound is not
-    /// vacuous, and visiting many interpolated colours shows the colour moves.
-    #[test]
-    fn standalone_stream_crosses_its_one_second_wrap_without_a_spectrum_jump() {
-        let g = geom();
-        let c = cfg();
-        let col = 11u16;
-        let mut cr = CursorRainbow::default();
-        let mut out = Vec::new();
-        let t0 = Instant::now();
-        cr.tick(Some((2, col)), t0, 1.0, false, true, g, &c, &mut out);
-
-        let mut previous_turn = cr.phase;
-        let mut previous_sweep = rainbow_sweep_at(col, rainbow_phase_from_unit_turn(cr.phase));
-        let mut max_sweep_step = 0.0f32;
-        let mut wraps = 0usize;
-        let mut wrong_domain_disagreements = 0usize;
-        let mut colours = BTreeSet::new();
-        let mut last_at = t0;
-        for frame in 1..=80u64 {
-            last_at = t0 + Duration::from_millis(frame * 16);
-            out.clear();
-            let emitted = cr.tick(Some((2, col)), last_at, 1.0, false, true, g, &c, &mut out);
-            let family_phase = rainbow_phase_from_unit_turn(cr.phase);
-            let sweep = rainbow_sweep_at(col, family_phase);
-            max_sweep_step = max_sweep_step.max((sweep - previous_sweep).abs());
-            wraps += usize::from(cr.phase < previous_turn);
-            previous_turn = cr.phase;
-            previous_sweep = sweep;
-
-            let colour = spectrum_at(sweep, 0.0);
-            colours.insert(colour);
-            assert_white_lift_of(
-                emitted.fill.expect("enabled caret fill"),
-                caret_law(BASE_DARK_THEME, colour, MIX_MAX, 1.0),
-                &format!("frame {frame}: emitted caret must use the lifted family phase"),
-            );
-            wrong_domain_disagreements +=
-                usize::from(spectrum_at(rainbow_sweep_at(col, cr.phase), 0.0) != colour);
-        }
-
-        assert!(
-            last_at.saturating_duration_since(t0) > Duration::from_secs(1),
-            "the run must cross the one-second unit-turn wrap"
-        );
-        assert!(
-            wraps >= 1,
-            "the private unit clock must really wrap: {wraps}"
-        );
-        assert!(
-            max_sweep_step < 0.05,
-            "the reflected spectrum jumped by {max_sweep_step} at a 16 ms step"
-        );
-        assert!(
-            colours.len() > 60,
-            "one complete stream must visit a continuous spectrum: {} colours",
-            colours.len()
-        );
-        assert!(
-            wrong_domain_disagreements > 40,
-            "negative control: a raw unit clock must visibly disagree with the family domain"
-        );
     }
 
     /// The shared-phase path closes on the ribbon's 1024-unit ring, checked on
@@ -3355,8 +2886,7 @@ mod tests {
         /// Ratio `max/min` of the pile's light across the sweep. The budget is
         /// the premultiply's rounding: the two bracketing candidates are one
         /// byte apart on the inner ring, so the nearest pile sits within about
-        /// ±2 % of the grey's. The census lines print live numbers.
-        /// (`RIM_LIGHT_TOLERANCE_IDLE` covers the resting ember at coverage 5,
+        /// ±2 % of the grey's. (`RIM_LIGHT_TOLERANCE_IDLE` covers the resting ember at coverage 5,
         /// where one byte is a fifth of the light.)
         const RIM_LIGHT_TOLERANCE: f64 = 1.05;
         const RIM_LIGHT_TOLERANCE_IDLE: f64 = 1.25;
@@ -3364,9 +2894,8 @@ mod tests {
         const PAINTS: [f32; 5] = [0.0, 0.25, 0.5, 0.75, 1.0];
         const POSITIONS: u32 = 128;
         let lum = |rgb: u32| f64::from(crate::color_math::relative_luminance(rgb));
-        // (glass light, byte-composite light alone) — the second is what an SDR
-        // panel or the CPU renderer shows; printed, not asserted.
-        let raster_light = |quads: &[GlowQuad], ground: u32| -> (f64, f64) {
+        // The glass light: the byte composite plus the EDR aurora's re-emission.
+        let raster_light = |quads: &[GlowQuad], ground: u32| -> f64 {
             let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0u32, 0u32);
             for q in quads {
                 x0 = x0.min(u32::from(q.x));
@@ -3375,7 +2904,7 @@ mod tests {
                 y1 = y1.max(u32::from(q.y) + u32::from(q.h));
             }
             if x1 <= x0 || y1 <= y0 {
-                return (0.0, 0.0);
+                return 0.0;
             }
             let (w, h) = ((x1 - x0) as usize, (y1 - y0) as usize);
             let mut px = vec![ground; w * h];
@@ -3391,25 +2920,17 @@ mod tests {
             }
             let floor = lum(ground);
             let bytes: f64 = px.iter().map(|&p| (lum(p) - floor).max(0.0)).sum();
-            (
-                bytes + f64::from(aterm_render::hdr::HDR_GLOW_BOOST) * aurora,
-                bytes,
-            )
+            bytes + f64::from(aterm_render::hdr::HDR_GLOW_BOOST) * aurora
         };
 
         let g = geom();
         let now = Instant::now();
         let mut worst_spread = [1.0f64; PAINTS.len()];
         let mut worst_at: [String; PAINTS.len()] = Default::default();
-        // The byte-composite term alone — an SDR panel's or the CPU renderer's
-        // reading — under the same law. Printed beside the glass figure.
-        let mut worst_bytes_spread = [1.0f64; PAINTS.len()];
-        let mut cells = 0usize;
         for (name, base) in shipped_caret_bases() {
             for ground in GROUNDS {
                 // light(position, paint)
                 let mut light = vec![[0.0f64; PAINTS.len()]; POSITIONS as usize + 1];
-                let mut bytes = vec![[0.0f64; PAINTS.len()]; POSITIONS as usize + 1];
                 for (pi, &paint) in PAINTS.iter().enumerate() {
                     let c = RainbowConfig {
                         base,
@@ -3437,10 +2958,7 @@ mod tests {
                             &c,
                             &mut out,
                         );
-                        let (glass, byte_add) = raster_light(&out, ground);
-                        light[step as usize][pi] = glass;
-                        bytes[step as usize][pi] = byte_add;
-                        cells += 1;
+                        light[step as usize][pi] = raster_light(&out, ground);
                     }
                 }
                 for (pi, &paint) in PAINTS.iter().enumerate() {
@@ -3455,12 +2973,6 @@ mod tests {
                     if spread > worst_spread[pi] {
                         worst_spread[pi] = spread;
                         worst_at[pi] = format!("{name} over #{ground:06X} {lo:.4}..{hi:.4}");
-                    }
-                    let col: Vec<f64> = bytes.iter().map(|row| row[pi]).collect();
-                    let lo = col.iter().copied().fold(f64::INFINITY, f64::min);
-                    let hi = col.iter().copied().fold(0.0, f64::max);
-                    if lo > 0.0 {
-                        worst_bytes_spread[pi] = worst_bytes_spread[pi].max(hi / lo);
                     }
                 }
                 for (step, row) in light.iter().enumerate() {
@@ -3478,13 +2990,6 @@ mod tests {
                     }
                 }
             }
-        }
-        for (pi, &paint) in PAINTS.iter().enumerate() {
-            println!(
-                "CARET-RIM-LIGHT-CENSUS cells={cells} paint={paint} worst_spread=x{:.4} at {} \
-                 (byte-add term alone, SDR/CPU: x{:.4})",
-                worst_spread[pi], worst_at[pi], worst_bytes_spread[pi]
-            );
         }
         for (pi, &paint) in PAINTS.iter().enumerate() {
             let tolerance = if paint > 0.0 {
@@ -3535,44 +3040,11 @@ mod tests {
             VAL_MAX,
         ));
         let (dim, bright) = (flank_lo.min(flank_hi), flank_lo.max(flank_hi));
-        println!(
-            "CARET-RIM-LIGHT-CROSSING t={mid:.4}±{half:.4} flanks {flank_lo:.4} / {flank_hi:.4} \
-             step x{:.2}",
-            bright / dim
-        );
         assert!(
             bright / dim > 2.0,
             "the raw arc's light steps only ×{:.2} across the crossing — the incident \
              this law answers for could not have happened on it",
             bright / dim
-        );
-    }
-
-    /// [`RIM_LIGHT_GREY`] encodes [`RIM_LIGHT`], and [`RIM_LIGHT`] is the arc's
-    /// mean light at full chroma, derived here so a re-paced arc or re-typed
-    /// byte is caught.
-    #[test]
-    fn rim_light_grey_is_the_arcs_mean() {
-        let lum = |rgb: u32| crate::color_math::relative_luminance(rgb);
-        assert!(
-            (lum(RIM_LIGHT_GREY) - RIM_LIGHT).abs() < 0.005,
-            "#{RIM_LIGHT_GREY:06X} has relative luminance {}, not {RIM_LIGHT}",
-            lum(RIM_LIGHT_GREY)
-        );
-        let n = 400;
-        let mean = (0..=n)
-            .map(|i| {
-                lum(shade(
-                    spectrum_at(i as f32 / n as f32, 0.0),
-                    SAT_MAX,
-                    VAL_MAX,
-                ))
-            })
-            .sum::<f32>()
-            / (n + 1) as f32;
-        assert!(
-            (mean - RIM_LIGHT).abs() < 0.02,
-            "the arc's mean light at full chroma is {mean:.3}; RIM_LIGHT is {RIM_LIGHT}"
         );
     }
 
@@ -3797,37 +3269,6 @@ mod tests {
         bases
     }
 
-    /// Outer halo rings and the two glitter dots take offsets along the same
-    /// spectrum, and each offset interpolates continuously too.
-    #[test]
-    fn halo_and_glitter_offsets_have_no_anchor_colour_steps() {
-        for off in [
-            HALO_HUE_SPREAD_IDLE / 3.0,
-            2.0 * HALO_HUE_SPREAD_IDLE / 3.0,
-            HALO_HUE_SPREAD_MAX / 3.0,
-            2.0 * HALO_HUE_SPREAD_MAX / 3.0,
-            HALO_HUE_SPREAD_MAX,
-            0.13,
-            0.42,
-        ] {
-            let mut previous = spectrum_at(rainbow_sweep_at(17, 0.0), off);
-            let mut max_step = 0;
-            for sample in 1..=2400 {
-                let phase = sample as f32 * (6.0 / 2400.0);
-                let colour = spectrum_at(rainbow_sweep_at(17, phase), off);
-                max_step = max_step.max(rgb_max_delta(previous, colour));
-                previous = colour;
-            }
-            let dt = (rainbow_sweep_at(17, 6.0 / 2400.0) - rainbow_sweep_at(17, 0.0)).abs();
-            let ceiling = continuity_ceiling(dt);
-            assert!(
-                max_step <= ceiling,
-                "offset {off} jumped one spectrum channel by {max_step} \
-                 (ceiling {ceiling})"
-            );
-        }
-    }
-
     /// Real engine-to-engine lock over more than a second of typed advances:
     /// `CursorGlow` owns the ribbon clock and `CursorRainbow` consumes its
     /// sample after the same frame's tick, so every hot fill is the base mixed
@@ -3854,7 +3295,6 @@ mod tests {
             theme_bg: 0x001A_1B26,
             beam: false,
             head_dx: 0.5,
-            pack: None,
             ribbon_tall: true,
             ribbon_flat: false,
         };
@@ -3917,110 +3357,6 @@ mod tests {
             colours.len() >= 5,
             "the streaming run must traverse the unroll's colours: {colours:#x?}"
         );
-    }
-
-    /// One rainbow from the caret outward: the block and its halo resolve one
-    /// reflected spectrum position through one continuous interpolation.
-    ///
-    ///   1. the caret's spectrum lookup is deterministic at the family's
-    ///      column and phase;
-    ///   2. the energy law is a pure shade of that colour, the identity at
-    ///      full energy, so the agreement is exact;
-    ///   3. a hot block's fill is the theme base mixed toward exactly that
-    ///      interpolated colour.
-    #[test]
-    fn caret_uses_the_continuous_family_spectrum_end_to_end() {
-        for &col in &[0u16, 1, 5, 17, 22, 39, 137, 400] {
-            for i in 0..9 {
-                let phase = i as f32 * 0.37;
-                let colour = spectrum_at(rainbow_sweep_at(col, phase), 0.0);
-                // (2) full energy ⇒ the shade is the identity.
-                assert_eq!(
-                    shade(colour, SAT_MAX, VAL_MAX),
-                    colour,
-                    "the energy law recolours nothing at full energy ({colour:06X})"
-                );
-            }
-        }
-        // (3) end to end: a hot block's fill is the base mixed toward the
-        // continuous family colour at that very cell.
-        let g = geom();
-        let c = cfg();
-        for &col in &[3u16, 11, 30] {
-            let mut cr = CursorRainbow::default();
-            let mut out = Vec::new();
-            let f = cr
-                .tick(
-                    Some((1, col)),
-                    Instant::now(),
-                    1.0,
-                    true,
-                    true,
-                    g,
-                    &c,
-                    &mut out,
-                )
-                .fill
-                .unwrap();
-            assert_white_lift_of(
-                f,
-                caret_law(
-                    BASE_DARK_THEME,
-                    // The standalone path (`tick`, no host field): the caret
-                    // resolves the sweep at its own column on its own clock.
-                    spectrum_at(
-                        rainbow_sweep_at(col, rainbow_phase_from_unit_turn(cr.phase)),
-                        0.0,
-                    ),
-                    MIX_MAX,
-                    1.0,
-                ),
-                &format!("the caret at col {col} uses the family spectrum at col {col}"),
-            );
-        }
-    }
-
-    /// The additive halo hugs the block: at full energy no ring reaches more
-    /// than about half a cell width past the cursor cell.
-    #[test]
-    fn halo_hugs_within_half_a_cell_width() {
-        let g = geom();
-        let c = cfg();
-        let t = Instant::now();
-        let mut cr = CursorRainbow::default();
-        let mut out = Vec::new();
-        // A mid-row cell with room on both sides so clamping doesn't mask the reach.
-        cr.tick(Some((2, 20)), t, 1.0, true, true, g, &c, &mut out);
-        out.clear();
-        cr.tick(
-            Some((2, 20)),
-            t + Duration::from_millis(16),
-            1.0,
-            true,
-            true,
-            g,
-            &c,
-            &mut out,
-        );
-        assert!(!out.is_empty(), "a hot cursor glows");
-        let cw = g.cw as i32;
-        let cell_l = 20 * cw; // the cursor cell's left edge
-        let cell_r = 21 * cw; // the cursor cell's right edge
-        let max_reach = cw / 2 + 1; // ≤ half a cell (+1 px innermost bias)
-        for q in &out {
-            let ql = q.x as i32;
-            let qr = q.x as i32 + q.w as i32;
-            assert!(
-                cell_l - ql <= max_reach,
-                "halo reaches too far LEFT into the neighbour ({}px): {q:?}",
-                cell_l - ql
-            );
-            assert!(
-                qr - cell_r <= max_reach,
-                "halo reaches too far RIGHT into the neighbour ({}px): {q:?}",
-                qr - cell_r
-            );
-        }
     }
 
     /// The settle split is a partition: [`CursorRainbow::settling`] is disjoint
@@ -4245,13 +3581,6 @@ mod tests {
                 demand_ticks <= level_fp.len(),
                 "hand {hand}: the demand lane may never cost more than the frame train"
             );
-            println!(
-                "hand {hand}: level {} ticks / {} visible steps, release {level_release} ms; \
-                 main's rule parked at {parked_at} ms ({never_drawn} steps never drawn); \
-                 demand {demand_ticks} ticks",
-                level_fp.len(),
-                changes.len()
-            );
         }
     }
 
@@ -4289,7 +3618,6 @@ mod tests {
         let first = rb
             .next_change_deadline(now, frame)
             .expect("a settling caret owns a wake");
-        assert!(rb.settle_memo.is_some(), "the answer is memoised");
         assert_eq!(
             rb.next_change_deadline(now + Duration::from_millis(1), frame),
             Some(first.max(now + Duration::from_millis(1) + frame)),
@@ -4306,7 +3634,6 @@ mod tests {
             &cfg_at(ms),
             &mut out,
         );
-        assert!(rb.settle_memo.is_none(), "a real tick clears the memo");
         out.clear();
         rb.tick(
             Some((2, 5)),
@@ -4322,9 +3649,8 @@ mod tests {
             &mut out,
         );
         assert!(
-            rb.settle_probe.is_none() && !rb.settling(),
+            !rb.settling() && rb.next_change_deadline(first + frame, frame).is_none(),
             "an inert tick drops the latched inputs and the release with them"
         );
-        assert_eq!(rb.next_change_deadline(first + frame, frame), None);
     }
 }

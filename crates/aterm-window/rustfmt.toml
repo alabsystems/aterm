@@ -14,8 +14,7 @@
 #
 # THIS CRATE IS NOT AT THE WORKSPACE EDITION either, and `rustfmt` learns a
 # file's edition from the nearest `rustfmt.toml`, never from `Cargo.toml`
-# (crates/aterm-link/rustfmt.toml says why that matters; `verify fmt` holds the
-# two to agreement).
+# (crates/aterm-link/rustfmt.toml says why that matters).
 edition = "2021"
 use_small_heuristics = "Max"
 use_field_init_shorthand = true

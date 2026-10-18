@@ -109,10 +109,10 @@ fd-relative-no-reresolution	other (noninterference)	openat, mkdirat, unlinkat, r
 `dir-read-from-fresh-description`, `dir-listing-complete`, `dir-removed-reads-empty` →
 `fd-relative-no-reresolution` (needs `syscall-passthrough`).
 
-## 2. Test → spec map (TSV; all 15)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
-All tests are in `tests/dirfd.rs`.
+All tests are in `tests/dirfd.rs`. The test of §4 is deleted and has no row.
 
 ```tsv
 file	test	primary	also
@@ -123,7 +123,6 @@ tests/dirfd.rs	creates_and_removals_agree_including_every_error	syscall-passthro
 tests/dirfd.rs	renames_links_and_modes_agree	syscall-passthrough	flags-bit-algebra (Chmod covers user bits only, §5.2)
 tests/dirfd.rs	flagged_renames_agree	renameat-with-dispatch	flags-bit-algebra
 tests/dirfd.rs	directory_listings_agree	dir-listing-complete	
-tests/dirfd.rs	large_directory_listings_agree	(none: §4, delete)	dir-listing-complete
 tests/dirfd.rs	two_interleaved_streams_over_one_descriptor_each_see_every_entry	dir-read-from-fresh-description	dir-listing-complete
 tests/dirfd.rs	a_removed_directory_reads_as_empty	dir-removed-reads-empty	(platform-dependent, §5.1)
 tests/dirfd.rs	reading_a_directory_leaves_the_callers_descriptor_usable	dir-read-from-fresh-description	syscall-passthrough
@@ -149,10 +148,10 @@ tests/dirfd.rs	names_across_the_stack_buffer_boundary_agree	arg-cstr-faithful	sy
 ## 4. Tests that are not spec samples
 
 > Status 2026-10-16: deleted `large_directory_listings_agree` from `tests/dirfd.rs`.
-
-| test | why | recommendation |
-|---|---|---|
-| large_directory_listings_agree | A duplicate. `two_interleaved_streams_over_one_descriptor_each_see_every_entry` lists a larger directory (2000 entries against 500), asserts N+2 entries, and compares the sorted listing, `.` and `..` included, with the std reference. That comparison already implies the `.`/`..` asserts. The property is `dir-listing-complete`. | **delete** |
+>
+> Status 2026-10-17: its row here and in §2 is gone. It duplicated
+> `two_interleaved_streams_over_one_descriptor_each_see_every_entry`, which lists a larger
+> directory and compares the whole sorted listing with the std reference (`dir-listing-complete`).
 
 ## 5. Implied specs that look wrong, or disagree with the code
 

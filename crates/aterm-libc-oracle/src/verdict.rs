@@ -8,9 +8,6 @@
 
 use std::fmt;
 
-use serde::Serialize;
-
-use crate::cargo::{Diagnostic, FailedTest};
 use crate::controls::{ControlFailure, ControlId};
 use crate::shape::ShapeDiff;
 use crate::siblings::SiblingFinding;
@@ -22,7 +19,7 @@ pub const EXIT_USAGE: u8 = 2;
 pub const EXIT_COULD_NOT_RUN: u8 = 3;
 
 /// The run could not go on: a prerequisite is missing. Says what, and the fix.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CouldNotRun {
     pub what: String,
     pub fix: Option<String>,
@@ -58,8 +55,7 @@ impl fmt::Display for CouldNotRun {
 }
 
 /// A defect in the tree: the shim, its generated oracle, or their inputs.
-#[derive(Clone, Debug, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Clone, Debug)]
 pub enum Finding {
     /// A checked-in input the oracle reads is unusable (a stale `Cargo.lock`,
     /// an unreadable `union.json`).
@@ -70,13 +66,10 @@ pub enum Finding {
     Sibling(SiblingFinding),
     /// The native cell's conformance build or runtime tests failed.
     Conformance {
-        errors: Vec<Diagnostic>,
-        failed_tests: Vec<FailedTest>,
         detail: String,
     },
     /// The shim did not document, so its emitted shape and symbols are unknown.
     ShimDoc {
-        errors: Vec<Diagnostic>,
         detail: String,
     },
     Shape(ShapeDiff),
@@ -93,10 +86,10 @@ impl fmt::Display for Finding {
         match self {
             Self::Input { what, detail } => write!(f, "{what}\n{}", indent(detail)),
             Self::Sibling(finding) => write!(f, "sibling body: {finding}"),
-            Self::Conformance { detail, .. } => {
+            Self::Conformance { detail } => {
                 write!(f, "conformance failed:\n{}", indent(detail))
             }
-            Self::ShimDoc { detail, .. } => {
+            Self::ShimDoc { detail } => {
                 write!(f, "the shim did not document:\n{}", indent(detail))
             }
             Self::Shape(diff) => write!(f, "source shape: {diff}"),
@@ -116,8 +109,7 @@ fn indent(text: &str) -> String {
 }
 
 /// One stage of a run.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     /// `Cargo.lock` current, locked dependencies present offline.
     Inputs,
@@ -157,8 +149,7 @@ impl Phase {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     Ok,
     Fail,
@@ -168,7 +159,7 @@ pub enum Status {
 }
 
 /// One phase's line.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug)]
 pub struct PhaseReport {
     pub phase: Phase,
     pub status: Status,
@@ -194,7 +185,7 @@ impl fmt::Display for PhaseReport {
 }
 
 /// The whole run.
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default)]
 pub struct Report {
     /// This box's triple, once the toolchain answered.
     pub host: Option<String>,
@@ -217,32 +208,6 @@ impl Report {
             EXIT_PASS
         }
     }
-
-    /// The one-word verdict.
-    #[must_use]
-    pub fn verdict(&self) -> &'static str {
-        match self.exit_code() {
-            EXIT_PASS => "pass",
-            EXIT_FINDING => "finding",
-            _ => "could_not_run",
-        }
-    }
-
-    /// The report as one JSON object (`verdict` added).
-    #[must_use]
-    pub fn to_json(&self) -> String {
-        #[derive(Serialize)]
-        struct Out<'r> {
-            verdict: &'static str,
-            #[serde(flatten)]
-            report: &'r Report,
-        }
-        aterm_json::to_string(&Out {
-            verdict: self.verdict(),
-            report: self,
-        })
-        .unwrap_or_else(|e| format!(r#"{{"verdict":"could_not_run","error":"{e}"}}"#))
-    }
 }
 
 #[cfg(test)]
@@ -250,46 +215,23 @@ mod tests {
     use super::*;
     use crate::symbols::SymbolDiff;
 
+    /// The exit code `targo --unverified verify libc` reads: a finding outranks
+    /// a stop, and a stop alone could not run.
     #[test]
     fn findings_outrank_a_stop_and_a_stop_alone_could_not_run() {
         let mut report = Report::default();
-        assert_eq!((report.exit_code(), report.verdict()), (EXIT_PASS, "pass"));
+        assert_eq!(report.exit_code(), EXIT_PASS);
         report.could_not_run = Some(CouldNotRun::bare("no trustc"));
-        assert_eq!(
-            (report.exit_code(), report.verdict()),
-            (EXIT_COULD_NOT_RUN, "could_not_run")
-        );
+        assert_eq!(report.exit_code(), EXIT_COULD_NOT_RUN);
         report
             .findings
             .push(Finding::Symbol(SymbolDiff::AbsentFromReference {
                 name: "made_up".into(),
             }));
         assert_eq!(
-            (report.exit_code(), report.verdict()),
-            (EXIT_FINDING, "finding"),
+            report.exit_code(),
+            EXIT_FINDING,
             "a defect found before the machine failed is still a defect"
         );
-        assert!(report.could_not_run.is_some(), "the stop is still reported");
-    }
-
-    #[test]
-    fn the_json_carries_typed_findings() {
-        let report = Report {
-            host: Some("aarch64-apple-darwin".into()),
-            cell: Some("mac"),
-            findings: vec![Finding::Symbol(SymbolDiff::Mismatch {
-                name: "getpid".into(),
-                shim: "getpid$X".into(),
-                reference: "getpid".into(),
-            })],
-            ..Report::default()
-        };
-        let json: aterm_json::Value = aterm_json::from_str(&report.to_json()).expect("json");
-        assert_eq!(json["verdict"].as_str(), Some("finding"));
-        assert_eq!(json["cell"].as_str(), Some("mac"));
-        let finding = &json["findings"][0];
-        assert_eq!(finding["kind"].as_str(), Some("symbol"));
-        assert_eq!(finding["symbol"].as_str(), Some("mismatch"));
-        assert_eq!(finding["shim"].as_str(), Some("getpid$X"));
     }
 }

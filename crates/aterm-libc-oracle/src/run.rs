@@ -199,8 +199,6 @@ impl Run<'_> {
                 test.failed.len()
             );
             let finding = Finding::Conformance {
-                errors: test.errors.clone(),
-                failed_tests: test.failed.clone(),
                 detail: test.detail(),
             };
             self.phase(Phase::Conformance, since, detail, vec![finding]);
@@ -246,15 +244,17 @@ impl Run<'_> {
                 Err(could_not_run) => stop = Some(could_not_run),
             }
         }
-        let union = Union::load(root)
-            .and_then(|union| union.names(cell))
-            .unwrap_or_else(|detail| {
-                findings.push(Finding::Input {
-                    what: union::PATH.into(),
-                    detail,
-                });
+        let union = match union_names(root, cell) {
+            Ok(names) => names,
+            Err(UnionStop::Finding(finding)) => {
+                findings.push(finding);
                 Vec::new()
-            });
+            }
+            Err(UnionStop::CouldNotRun(could_not_run)) => {
+                stop.get_or_insert(could_not_run);
+                Vec::new()
+            }
+        };
         if !findings.is_empty() {
             let detail = match findings.len() {
                 1 => "an input is unusable".into(),
@@ -343,7 +343,6 @@ impl Run<'_> {
         let (outcome, path) = ws.rustdoc(DocTarget::Shim).map_err(started)?;
         if !outcome.success {
             let finding = Finding::ShimDoc {
-                errors: outcome.errors.clone(),
                 detail: outcome.detail(),
             };
             self.phase(Phase::Shape, since, format!("{outcome}"), vec![finding]);
@@ -422,6 +421,35 @@ impl Run<'_> {
     }
 }
 
+/// Why the cell's names could not be had from `union.json` ([`union_names`]).
+#[derive(Debug)]
+enum UnionStop {
+    /// The file is missing: the checkout lacks an input, so nothing is decided.
+    CouldNotRun(CouldNotRun),
+    /// The file is unreadable or malformed, or names no list for the cell.
+    Finding(Finding),
+}
+
+/// The cell's names from the checkout's `union.json`. A missing file decides nothing
+/// (COULD NOT RUN, exit 3): no build can say anything about a cell whose list is
+/// absent. A file that is there and unusable stays a finding (FAIL, exit 1).
+fn union_names(root: &Path, cell: &Cell) -> Result<Vec<String>, UnionStop> {
+    let finding = |detail| {
+        UnionStop::Finding(Finding::Input {
+            what: union::PATH.into(),
+            detail,
+        })
+    };
+    match Union::read(root) {
+        Ok(union) => union.names(cell).map_err(finding),
+        Err(union::Unread::Absent(detail)) => Err(UnionStop::CouldNotRun(CouldNotRun::new(
+            format!("the checkout holds no {} ({detail})", union::PATH),
+            format!("restore it: git checkout -- {}", union::PATH),
+        ))),
+        Err(union::Unread::Unusable(detail)) => Err(finding(detail)),
+    }
+}
+
 fn read_doc(path: &Path) -> Result<Doc, CouldNotRun> {
     let text = std::fs::read_to_string(path).map_err(|e| {
         CouldNotRun::new(
@@ -439,24 +467,35 @@ fn read_doc(path: &Path) -> Result<Doc, CouldNotRun> {
 mod tests {
     use super::*;
 
-    struct Quiet;
-    impl Observer for Quiet {
-        fn deciding(&mut self, _: &str, _: &Cell) {}
-        fn phase(&mut self, _: &PhaseReport) {}
-    }
-
+    /// A missing `union.json` decides nothing (COULD NOT RUN, exit 3); one that is
+    /// there and malformed is a finding (FAIL, exit 1).
     #[test]
-    fn a_root_without_the_oracle_could_not_run() {
+    fn a_missing_union_could_not_run_and_a_malformed_one_is_a_finding() {
         let dir = aterm_tempfile::tempdir().expect("tempdir");
-        let report = run(
-            &Options {
-                root: dir.path().to_path_buf(),
-                target_dir: dir.path().join("target"),
-            },
-            &mut Quiet,
+        std::fs::create_dir_all(dir.path().join("libc-oracle")).expect("mkdir");
+        let cell = &cells::CELLS[0];
+        match union_names(dir.path(), cell) {
+            Err(UnionStop::CouldNotRun(c)) => {
+                assert!(c.what.contains(union::PATH), "{c}");
+                assert!(c.fix.is_some_and(|f| f.contains("git checkout")));
+            }
+            other => panic!("a missing union.json must not run: {other:?}"),
+        }
+        std::fs::write(union::path(dir.path()), "{").expect("write");
+        assert!(
+            matches!(
+                union_names(dir.path(), cell),
+                Err(UnionStop::Finding(Finding::Input { .. }))
+            ),
+            "a malformed union.json is a finding"
         );
-        let could_not_run = report.could_not_run.expect("could not run");
-        assert!(could_not_run.what.contains("holds no libc-oracle/"));
-        assert!(report.phases.is_empty() && report.findings.is_empty());
+        std::fs::write(union::path(dir.path()), "{}").expect("write");
+        assert!(
+            matches!(
+                union_names(dir.path(), cell),
+                Err(UnionStop::Finding(Finding::Input { .. }))
+            ),
+            "a union.json without the cell's list is a finding"
+        );
     }
 }

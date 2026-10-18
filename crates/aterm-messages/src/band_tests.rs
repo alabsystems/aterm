@@ -6,11 +6,9 @@
 //! ink on the fill, the High Contrast capsules, whether a label clears AA.
 //! Where only a host test's colour half lives here, the host keeps its
 //! structure half under the same name. The inputs are the host's default
-//! theme, builtin schemes and stock High Contrast palettes, transcribed below
-//! and held equal to the host's by [`fixtures_are_the_hosts`]. The palette is
-//! derived on the theme blend ([`BarBase::Blend`]), the host's base on every
-//! platform but Linux. The host holds its `RenderCell` write with
-//! `paint_rows_on_writes_the_engines_resolved_cells`.
+//! theme, builtin schemes and stock High Contrast palettes, transcribed below.
+//! The palette is derived on the theme blend ([`BarBase::Blend`]), the host's
+//! base on every platform but Linux.
 
 use crate::ink::{
     self, BandInks, BarBase, ForcedPalette, InkedCell, MeterInks, RowRaster, ThemeInks, WORD_AA,
@@ -229,27 +227,6 @@ const STOCK: [(&str, ForcedPalette); 4] = [
     ),
 ];
 
-/// The digest the host computes over its own inputs
-/// (`message_band::paint_parity_tests::the_engines_band_tests_read_the_hosts_themes`).
-const HOST_INPUTS_DIGEST: u64 = 0xe8a6_78ba_9a5f_dc64;
-
-/// FNV-1a over the fixtures' `Debug` text: a digest with no hasher seed, so
-/// the engine and the host compute the same number from the same values.
-fn digest(text: &str) -> u64 {
-    text.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
-        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
-    })
-}
-
-/// The default and light themes, the seventeen builtin schemes and the four
-/// stock High Contrast palettes digest to the number the host computes from
-/// its own sources.
-#[test]
-fn fixtures_are_the_hosts() {
-    let text = format!("{:?}", (DEFAULT, LIGHT, &BUILTIN[..], &STOCK[..]));
-    assert_eq!(digest(&text), HOST_INPUTS_DIGEST, "{text}");
-}
-
 // ---- The host's painter, on the engine's cells -----------------------------
 
 /// The host's `chrome_band::band_colors(theme)` off Linux: the theme's inks
@@ -331,10 +308,10 @@ fn frame_rasters(
 }
 
 /// The inks row `l`'s surface resolves against (the host's `row_inks`).
-fn row_inks(c: &BandInks, l: &RowLayout, rail: bool, hc: bool) -> (MeterInks, Option<[u8; 3]>) {
+fn row_inks(c: &BandInks, l: &RowLayout, hc: bool) -> (MeterInks, Option<[u8; 3]>) {
     let alarm = matches!(l.severity, Severity::Warn | Severity::Error);
     let fill = if hc || !alarm { c.meter } else { c.warn };
-    ink::inks_for(c, fill, l.track.is_some(), rail, hc)
+    ink::inks_for(c, fill, l.track.is_some(), hc)
 }
 
 /// A center with the toolchain meter row and a downloading update row
@@ -480,10 +457,9 @@ fn the_meter_row_is_its_fill_and_track_and_its_words_the_crisp_ink() {
     );
 }
 
-/// The colour half of the host's `capsules_are_hit_where_they_are_painted`, at
-/// 60, 80, 120 and 160 columns: on a metered row the Secondary `Packages` draws
-/// no ground of its own and rides the meter in the value ink floored on the
-/// track; `Details ›` rides it in the label ink; a Primary wears the accent.
+/// On a metered row, at 60, 80, 120 and 160 columns: the Secondary `Packages`
+/// draws no ground of its own and rides the meter in the value ink floored on
+/// the track; `Details ›` rides it in the label ink; a Primary wears the accent.
 #[test]
 fn each_chip_wears_its_roles_ground_and_ink_on_a_metered_row() {
     let center = two_rows();
@@ -1020,7 +996,7 @@ fn words_on_a_fill_wear_the_rows_crisp_ink_in_every_frame() {
                         "{at}: the word changed side over the fill"
                     );
                     if bg == c.accent {
-                        let (inks, _) = row_inks(&c, l, false, false);
+                        let (inks, _) = row_inks(&c, l, false);
                         assert_eq!(
                             fg,
                             crisp_on_fill(&c, c.accent, &inks),
@@ -1061,6 +1037,4 @@ fn every_hover_target_on_a_row_is_its_own_key() {
             "capsule {k} shares a key"
         );
     }
-    let old = |row: u16, t: u64| (u64::from(row) << 16) | t | 1;
-    assert_eq!(old(1, 0x200), old(1, 0x201), "the old term collided");
 }

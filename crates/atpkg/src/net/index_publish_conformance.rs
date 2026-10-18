@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! Conformance of the index channel's reader to the derived model `AtpkgIndexPublishWalk`
-//! (crates/aterm-spec/src/derive/models_atpkg_index_publish.rs), which proves the published
+//! (crates/aterm-models-atpkg/src/models_atpkg_index_publish.rs), which proves the published
 //! index tags are one run and the walk from every verified floor lands the newest.
 //!
 //! Every channel and floor the model reaches is served to the real tag walk
@@ -12,7 +12,8 @@
 //! `crates/atpkg-publish/tests/channel/conformance_index_publish.rs`.
 
 use super::GithubFetcher;
-use aterm_spec::derive::{Model, atpkg_index_publish_walk_model};
+use aterm_models_atpkg::atpkg_index_publish_walk_model;
+use aterm_spec::derive::Model;
 use aterm_spec::interp::{self, State};
 use aterm_update_core::{HeadAnswer, HttpError};
 use std::collections::{BTreeSet, VecDeque};

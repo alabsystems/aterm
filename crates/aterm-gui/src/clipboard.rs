@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! The platform clipboard layer: the general clipboard (`pbcopy`/`pbpaste`) and the X11
-//! PRIMARY selection (`primary_set`/`primary_get`), over macOS `NSPasteboard`, the x11rb and
+//! PRIMARY selection (`primary_set`/`primary_get`), over macOS `NSPasteboard`, the X11 and
 //! Wayland backends and the Win32 clipboard. Reached through `crate::control`'s re-exports.
 //!
 //! Nothing else in the crate touches a platform clipboard: every copy, paste, OSC 52 operation
@@ -196,7 +196,7 @@ fn system_pbcopy(text: &str) -> bool {
             }
             let _ = appkit::send_isize(pb, sel!(clearContents));
             let set: unsafe extern "C-unwind" fn(Id, Sel, Id, Id) -> aterm_objc::Bool =
-                aterm_objc::msg();
+                aterm_objc::checked_msg();
             set(
                 pb,
                 sel!(setString:forType:),
@@ -494,33 +494,26 @@ mod tests {
         }
     }
 
-    /// Unset, the seam leaves every clipboard read and write on the platform.
+    /// Unset, the seam leaves every clipboard read and write on the platform;
+    /// set, its file stands in whatever the path — an empty value included,
+    /// which names no file, so a copy fails and a read finds nothing and the
+    /// platform clipboard is untouched. PRIMARY rides a sibling file.
     #[test]
-    fn an_unset_seam_routes_to_the_system_clipboard() {
+    fn the_seam_routes_to_the_system_clipboard_or_its_file() {
         assert_eq!(route_for(None), ClipboardRoute::System);
-    }
-
-    /// Set, the seam's file stands in for the clipboard, whatever the path.
-    #[test]
-    fn a_set_seam_routes_to_its_file() {
-        for path in ["/scratch/clip.txt", "relative/clip", "clip"] {
+        for path in ["/scratch/clip.txt", "relative/clip", "clip", ""] {
             assert_eq!(
                 route_for(Some(OsString::from(path))),
                 ClipboardRoute::File(PathBuf::from(path)),
+                "{path:?}"
             );
         }
-    }
-
-    /// An empty value still routes to the file: it names no file, so a copy
-    /// fails and a read finds nothing, and the platform clipboard is untouched.
-    #[test]
-    fn an_empty_seam_fails_its_copies_instead_of_reaching_the_system() {
-        assert_eq!(
-            route_for(Some(OsString::new())),
-            ClipboardRoute::File(PathBuf::new())
-        );
         assert!(!file_copy(Path::new(""), "x"), "no file to write");
         assert_eq!(file_paste(Path::new("")), None);
+        assert_eq!(
+            primary_file(Path::new("/scratch/clipboard.txt")),
+            PathBuf::from("/scratch/clipboard.txt.primary"),
+        );
     }
 
     /// The stand-in file behaves as a clipboard: a missing file is empty, a copy
@@ -555,14 +548,5 @@ line two"
         assert!(file_copy(&clip, ""), "an OSC 52 clear is a copy of nothing");
         assert_eq!(file_paste(&clip), None, "and reads back as empty");
         assert!(!file_copy(&dir.path().join("absent/clip.txt"), "x"));
-    }
-
-    /// PRIMARY rides its own file beside the CLIPBOARD's.
-    #[test]
-    fn primary_rides_a_sibling_file() {
-        assert_eq!(
-            primary_file(Path::new("/scratch/clipboard.txt")),
-            PathBuf::from("/scratch/clipboard.txt.primary"),
-        );
     }
 }

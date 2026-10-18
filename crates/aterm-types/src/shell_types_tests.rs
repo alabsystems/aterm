@@ -29,18 +29,12 @@ fn make_mark(prompt: u64, col: u16) -> CommandMark {
 }
 
 #[test]
-fn command_mark_is_complete_requires_exit_code() {
+fn command_mark_completes_on_an_exit_code_and_succeeds_only_on_zero() {
     let mut mark = make_mark(0, 0);
     assert!(!mark.is_complete());
-    mark.exit_code = Some(0);
-    assert!(mark.is_complete());
-}
-
-#[test]
-fn command_mark_succeeded_only_on_zero() {
-    let mut mark = make_mark(0, 0);
     assert!(!mark.succeeded());
     mark.exit_code = Some(0);
+    assert!(mark.is_complete());
     assert!(mark.succeeded());
     mark.exit_code = Some(1);
     assert!(!mark.succeeded());

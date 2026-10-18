@@ -5,7 +5,7 @@
 //! Test-only combined write+advance methods; production uses the split
 //! primitives in `write_split.rs`.
 
-use super::{CellFlags, Grid, PackedColor, StyleId};
+use super::{CellFlags, Grid, PackedColor};
 
 impl Grid {
     /// Write a styled character at the cursor and advance it (production:
@@ -34,17 +34,6 @@ impl Grid {
         debug_assert!(
             self.storage.cursor.col <= self.storage.max_col_for_row(self.storage.cursor.row)
         );
-    }
-
-    /// Write a character using a style ID. Delegates to `write_char_styled`.
-    pub(crate) fn write_char_with_style_id(
-        &mut self,
-        c: char,
-        style_id: StyleId,
-        extra_flags: CellFlags,
-    ) {
-        let (fg, bg, flags) = self.resolve_style_to_colors(style_id, extra_flags);
-        self.write_char_styled(c, fg, bg, flags);
     }
 
     /// Write a styled character with autowrap.

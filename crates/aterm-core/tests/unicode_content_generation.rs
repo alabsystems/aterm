@@ -35,15 +35,12 @@ fn assert_write_advances(initial: &str, replacement: &str, setup: &str, fragment
 }
 
 #[test]
-fn isolated_unicode_writes_and_replacements_advance_content_generation() {
-    for (initial, replacement) in [("你", "好"), ("⠁", "⠂"), ("😀", "😁"), ("é", "ñ")] {
-        assert_write_advances(initial, replacement, "", false);
-    }
-}
-
-#[test]
 fn unicode_bulk_and_fragmented_writes_advance_content_generation() {
     for (initial, replacement) in [
+        ("你", "好"),
+        ("⠁", "⠂"),
+        ("😀", "😁"),
+        ("é", "ñ"),
         ("你好", "世界"),
         ("😀😁", "😂😃"),
         ("你😀", "好😁"),

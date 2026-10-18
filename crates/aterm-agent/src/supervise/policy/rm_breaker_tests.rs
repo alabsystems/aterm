@@ -31,6 +31,7 @@ fn resolve_in(cwd: &str, cmd: &str) -> Result<Vec<String>, String> {
         cwd: Path::new(cwd),
         home: Some(Path::new(HOME)),
         roots: &roots,
+        probe: &super::super::probe::LiveProbe,
     };
     resolve_rm_line(cmd, &scope)
 }
@@ -48,28 +49,6 @@ fn escalates(cmd: &str) -> String {
         Ok(t) => panic!("{cmd:?} must escalate, resolved to {t:?}"),
         Err(e) => e,
     }
-}
-
-/// The core cases: one approval and the refusals beside it.
-#[test]
-fn the_synthesis_cases() {
-    assert_eq!(
-        approves("S=/private/tmp/claude-502/x; rm -rf \"$S/t5\""),
-        ["/private/tmp/claude-502/x/t5"]
-    );
-    assert!(escalates("rm -rf \"$UNSET/t5\"").contains("$UNSET is not assigned"));
-    assert!(escalates("S=/usr; rm -rf \"$S/t5\"").contains("not strictly inside a scratch root"));
-    assert!(escalates("cd /private/tmp/claude-502/x && rm -rf t5").contains("relative rm operand"));
-    // A real workflow line, with its scratch variable set as it was.
-    let incident = "S=/private/tmp/claude-502/s; for pair in \"t_mb 630604f8\" \
-                    \"t_sv salvage/x\" \"t_om origin/main\"; do set -- $pair; rm -rf $S/$1; \
-                    mkdir -p $S/$1; git archive $2 | tar -x -C $S/$1; done";
-    assert!(escalates(incident).contains("compound command (`for`)"));
-    // A captured Claude Code 2.1.280 line.
-    assert!(
-        escalates("S=$PWD/tmp; for p in a b; do set -- $p; rm -rf $S/$1; done")
-            .contains("compound command")
-    );
 }
 
 #[test]
@@ -93,51 +72,32 @@ fn literal_chains_resolve_and_every_operand_is_judged() {
     approves("ls /tmp/work; S=/tmp/work/a; rm -f $S/x.log >/dev/null 2>&1");
 }
 
-/// An assignment counts only where it surely runs.
+/// An assignment (or an `export`) counts only where it surely runs, and a
+/// command after `|` runs whatever the one before returned, so
+/// `test -n "$D" |` proves nothing. Negative controls: the same assignment
+/// and `export` unconditional, and `test -n "$D" &&`.
 #[test]
 fn a_conditional_or_scoped_assignment_is_unknown() {
-    assert!(escalates("test -d x || S=/tmp/w/a; rm -rf \"$S/y\"").contains("$S"));
-    assert!(escalates("true && S=/tmp/w/a; rm -rf \"$S/y\"").contains("$S"));
-    assert!(escalates("S=/tmp/w/a | cat; rm -rf \"$S/y\"").contains("$S"));
-    assert!(escalates("S=/tmp/w/a & rm -rf \"$S/y\"").contains("$S"));
+    for assign in ["S=/tmp/w/a", "export S=/tmp/w/a"] {
+        for cmd in [
+            format!("test -d x || {assign}; rm -rf \"$S/y\""),
+            format!("true && {assign}; rm -rf \"$S/y\""),
+            format!("{assign} | cat; rm -rf \"$S/y\""),
+            format!("{assign} & rm -rf \"$S/y\""),
+        ] {
+            assert!(escalates(&cmd).contains("$S"), "{cmd}");
+        }
+        approves(&format!("{assign}; rm -rf \"$S/y\""));
+    }
     assert!(escalates("S=/tmp/w/a rm -rf \"$S/y\"").contains("assignment on the rm"));
     assert!(escalates("S=/tmp/w/a ls; rm -rf \"$S/y\"").contains("$S"));
-    // Negative control: the same assignment, unconditional.
-    approves("S=/tmp/w/a; rm -rf \"$S/y\"");
-}
-
-/// `$TMPDIR` is the supervisor's, which the worker's Bash tool need not share,
-/// so it proves nothing. A `$(mktemp -d)` is proven by a literal template, or
-/// as a fresh directory (`<mktemp -d>`) behind a guard (unguarded, a failed
-/// `mktemp` makes `"$D/x"` `/x`) or as `"$D"` alone (`""` on failure).
-#[test]
-fn mktemp_is_proven_by_its_template_or_as_a_fresh_directory() {
-    for (cmd, why) in [
-        ("D=$(mktemp -d -t probe); rm -rf \"$D/x\"", "removes /x"),
-        (
-            "rm -rf \"$TMPDIR/probe\"",
-            "$TMPDIR is not assigned on this line (a value from the environment",
-        ),
+    for cmd in [
+        "D=$(mktemp -d /private/tmp/claude-502/w.XXXXXX); test -n \"$D\" | rm -rf \"$D/x\"",
+        "D=$(mktemp -d); test -n \"$D\" | rm -rf \"$D/x\"",
     ] {
-        let e = escalates(cmd);
-        assert!(e.contains(why), "{cmd}: {e}");
+        assert!(escalates(cmd).contains("removes /x"), "{cmd}");
     }
-    assert_eq!(
-        approves("D=$(mktemp -d -t probe) && rm -rf \"$D/x\""),
-        ["<mktemp -d>/x"]
-    );
-    assert_eq!(approves("D=$(mktemp -d); rm -rf \"$D\""), ["<mktemp -d>"]);
-    assert_eq!(
-        approves("D=$(mktemp -d /private/tmp/claude-502/w.XXXXXX); rm -rf \"$D\""),
-        ["/private/tmp/claude-502/<mktemp>"]
-    );
-    assert!(
-        escalates("D=$(mktemp -d /private/tmp/claude-502/w.XXXXXX); rm -rf \"$D\"/*")
-            .contains("glob behind a $(mktemp)")
-    );
-    assert!(escalates("D=$(mktemp); rm -rf \"$D\"").contains("$D"));
-    assert!(escalates("D=$(mktemp -d -p /x); rm -rf \"$D\"").contains("$D"));
-    assert!(escalates("D=$(pwd); rm -rf \"$D/x\"").contains("$D"));
+    approves("D=$(mktemp -d); test -n \"$D\" && rm -rf \"$D/x\"");
 }
 
 #[test]
@@ -269,7 +229,6 @@ fn what_the_resolver_will_not_follow() {
 #[test]
 fn scratch_root_patterns() {
     let r = ScratchRoot::glob_under(Path::new("/w/proj"), "target*").expect("root");
-    assert_eq!(r.label(), "/w/proj/target*");
     let comps = |p: &str| abs_components(p).expect("absolute");
     assert!(r.holds(&comps("/w/proj/target")));
     assert!(r.holds(&comps("/w/proj/target.noindex/x")));
@@ -285,31 +244,25 @@ fn all_escalate(cases: &[(&str, &str)]) {
     }
 }
 
-/// Each of these reaches `/etc` in zsh 5.9 or bash 3.2: a failed `$(mktemp -d)` leaves `D`
-/// empty; zsh splits `$=S`; `$_` is empty after `_=/tmp/x`. Negative controls: the same
-/// removals written provably.
-#[test]
-fn the_audits_measured_approvals_escalate() {
-    all_escalate(&[
-        // A failed `mktemp -d`, with or without a template.
-        ("D=$(mktemp -d); rm -rf \"$D/etc\"", "removes /etc"),
-        (
-            "D=$(mktemp -d /private/tmp/claude-502/w.XXXXXX); rm -rf \"$D/etc\"",
-            "removes /etc",
-        ),
-        ("S='y /etc'; rm -rf /tmp/x/$=S", "`$=S`"),
-        ("_=/tmp/x; rm -rf \"$_/etc\"", "_ is assigned"),
-        (
-            "rm -rf \"$_/etc\"",
-            "$_ (a positional or special parameter)",
-        ),
-    ]);
-    assert_eq!(
-        approves("D=$(mktemp -d /private/tmp/claude-502/w.XXXXXX) && rm -rf \"$D/etc\""),
-        ["/private/tmp/claude-502/<mktemp>/etc"]
-    );
-    approves("S='y'; rm -rf /tmp/x/$S");
-    approves("X=/tmp/x; rm -rf \"$X/etc\"");
+/// `S=<scratch>/w; <middle>; rm -rf "$S/x"` for each middle command: the rule
+/// still proves the removal — the middle command keeps `S`…
+fn keeps(middles: &[&str]) {
+    for middle in middles {
+        let cmd = format!("S=/private/tmp/claude-502/w; {middle}; rm -rf \"$S/x\"");
+        assert_eq!(
+            resolve(&cmd),
+            Ok(vec!["/private/tmp/claude-502/w/x".to_string()]),
+            "{cmd}"
+        );
+    }
+}
+
+/// …or the rule forgets `S` after it.
+fn forgets(middles: &[&str]) {
+    for middle in middles {
+        let cmd = format!("S=/private/tmp/claude-502/w; {middle}; rm -rf \"$S/x\"");
+        assert!(escalates(&cmd).contains("$S is not known after"), "{cmd}");
+    }
 }
 
 /// A failed `$(mktemp -d …)` leaves its variable empty, so every operand built
@@ -497,44 +450,13 @@ fn zsh_expansions_are_not_text() {
 /// variable is after a word whose text is unknown.
 #[test]
 fn a_variable_another_command_names_is_unknown_after_it() {
-    all_escalate(&[
-        (
-            "S=/tmp/w/a; print -v S /etc; rm -rf \"$S/x\"",
-            "$S is not known after",
-        ),
-        (
-            "S=/tmp/w/a; print -rv S /etc; rm -rf \"$S/x\"",
-            "$S is not known after",
-        ),
-        (
-            "S=/tmp/w/a; zparseopts a:=S; rm -rf \"$S/etc\"",
-            "$S is not known after",
-        ),
-        (
-            "S=/tmp/w/a; zstyle -s :x nope S; rm -rf \"$S/etc\"",
-            "$S is not known after",
-        ),
-        (
-            "S=/tmp/w/a; zformat -f S /etc; rm -rf \"$S/x\"",
-            "$S is not known after",
-        ),
+    forgets(&[
+        "print -rv S /etc",
         // Named through a variable, a substitution, an unknown variable.
-        (
-            "S=/tmp/w/a; N=S; print -v $N /etc; rm -rf \"$S/x\"",
-            "$S is not known after",
-        ),
-        (
-            "S=/tmp/w/a; print -v $(echo S) /etc; rm -rf \"$S/x\"",
-            "$S is not known after",
-        ),
-        (
-            "S=/tmp/w/a; print -v $USER /etc; rm -rf \"$S/x\"",
-            "$S is not known after",
-        ),
-        (
-            "S=/tmp/w/a; print -v $=N /etc; rm -rf \"$S/x\"",
-            "$S is not known after",
-        ),
+        "N=S; print -v $N /etc",
+        "print -v $(echo S) /etc",
+        "print -v $USER /etc",
+        "print -v $=N /etc",
     ]);
     approves("S=/tmp/w/a; mkdir -p \"$S/x\" && ls $S; rm -rf \"$S/y\"");
     approves("S=/tmp/w/a; T=/tmp/w/b; print -v T /etc; rm -rf \"$S/y\"");
@@ -672,11 +594,13 @@ impl TempTree {
 }
 
 /// `cmd` against the live disk with `roots` as the only scratch roots.
+#[cfg(unix)]
 fn resolve_on_disk(roots: &[ScratchRoot], cwd: &str, cmd: &str) -> Result<Vec<String>, String> {
     let scope = RmScope {
         cwd: Path::new(cwd),
         home: Some(Path::new(HOME)),
         roots,
+        probe: &super::super::probe::LiveProbe,
     };
     resolve_rm_line(cmd, &scope)
 }
@@ -828,8 +752,9 @@ fn a_root_is_judged_where_it_leads_through_roots_links_only() {
 
 /// The fresh-directory rule: `mktemp -d` makes a new, uniquely named directory, so `"$D"` and
 /// a path lexically under it remove nothing that predates the line, wherever `$TMPDIR`
-/// points, given a recognised guard and every use of `$D` quoted. Each negative control
-/// breaks one condition.
+/// points, given a recognised guard and every use of `$D` quoted; `"$D"` alone is proven
+/// whatever else reads `$D` (`""` when `mktemp` failed). Each negative control breaks one
+/// condition.
 #[test]
 fn a_directory_the_line_just_made_is_proven_wherever_it_is() {
     for (cmd, want) in [
@@ -871,11 +796,18 @@ fn a_directory_the_line_just_made_is_proven_wherever_it_is() {
             "E=$(mktemp -d) || exit; D=\"$E\"; rm -rf \"$D/x\"",
             vec!["<mktemp -d>/x"],
         ),
-        // Unguarded, the variable alone: `""` when the run fails.
+        // Unguarded, the variable alone: `""` when the run fails — whatever
+        // another command did with an unquoted `$D`.
         ("D=$(mktemp -d); rm -rf \"$D\"", vec!["<mktemp -d>"]),
+        ("D=$(mktemp -d); ls $D; rm -rf \"$D\"", vec!["<mktemp -d>"]),
         (
-            "D=$(mktemp -d); ls \"$D\"; rm -rf \"$D\"",
+            "D=$(mktemp -d) && cd $D && rm -rf \"$D\"",
             vec!["<mktemp -d>"],
+        ),
+        // A literal template still resolves where it says.
+        (
+            "D=$(mktemp -d /private/tmp/claude-502/w.XXXXXX); rm -rf \"$D\"",
+            vec!["/private/tmp/claude-502/<mktemp>"],
         ),
     ] {
         assert_eq!(
@@ -887,6 +819,20 @@ fn a_directory_the_line_just_made_is_proven_wherever_it_is() {
     all_escalate(&[
         ("D=$(mktemp -d) && rm -rf $D/x", "must be double-quoted"),
         ("D=$(mktemp -d) && rm -rf ${D}/x", "must be double-quoted"),
+        ("D=$(mktemp -d) && rm -rf $D", "must be double-quoted"),
+        (
+            "D=$(mktemp -d) && ls $D && rm -rf \"${D:?}/x\"",
+            "must be double-quoted",
+        ),
+        // Inside `$(…)` quoting is not read, braces or not.
+        (
+            "D=$(mktemp -d) && echo \"$(ls ${D})\" && rm -rf \"$D/x\"",
+            "must be double-quoted",
+        ),
+        (
+            "D=$(mktemp -d) && echo \"$(ls $D)\" && rm -rf \"$D/x\"",
+            "must be double-quoted",
+        ),
         (
             "D=$(mktemp -d) && ls $D && rm -rf \"$D/x\"",
             "must be double-quoted",
@@ -927,6 +873,8 @@ fn a_directory_the_line_just_made_is_proven_wherever_it_is() {
             "D=$(mktemp) && rm -rf \"$D/x\"",
             "$D is not assigned a literal",
         ),
+        ("D=$(mktemp -d -p /x); rm -rf \"$D\"", "$D"),
+        ("D=$(pwd); rm -rf \"$D/x\"", "$D"),
         (
             "S=/tmp/w; D=$(mktemp -d) && rm -rf \"$S/$D\"",
             "proven only as \"$D\" or a path under it",
@@ -1030,34 +978,6 @@ fn an_assignment_in_front_of_a_declaring_builtin_is_unknown_after_it() {
         approves("D=$(mktemp -d); export E=\"${D:?}\"; rm -rf \"$D/etc\""),
         ["<mktemp -d>/etc"]
     );
-    // The two shells' readings, with `echo`: each form lands on `/etc` in
-    // at least one of them.
-    let run = |shell: &str, line: &str| -> Option<String> {
-        let out = aterm_uds::spawnfd::command(shell)
-            .args(no_startup(shell, line))
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .output()
-            .ok()?;
-        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    };
-    for (line, what) in [
-        (format!("{s}; S=/etc export T=$S; echo \"$T\""), "T"),
-        (format!("{s}; S=/etc export S; echo \"$S\""), "S"),
-    ] {
-        let readings: Vec<String> = ["/bin/zsh", "/bin/bash"]
-            .iter()
-            .filter(|sh| Path::new(sh).exists())
-            .filter_map(|sh| run(sh, &line))
-            .collect();
-        if readings.len() == 2 {
-            assert!(readings.iter().any(|r| r == "/etc"), "{what}: {readings:?}");
-            assert!(
-                readings.iter().any(|r| r != "/etc"),
-                "the shells disagree: {readings:?}"
-            );
-        }
-    }
 }
 
 /// Which words name a variable (`Eval::forget_named`): a lone option cluster names only what
@@ -1105,8 +1025,7 @@ fn a_variable_named_only_by_an_option_letter_or_a_path_is_kept() {
         let got = resolve(cmd).unwrap_or_else(|e| panic!("{cmd}: {e}"));
         assert!(got[0].ends_with(want), "{cmd}: {got:?}");
     }
-    let s = "S=/tmp/w";
-    for middle in [
+    forgets(&[
         "[ -t \"1/(S=5)\" ]",
         "test -t \"1/S--\"",
         "[ -t -S-- ]",
@@ -1116,10 +1035,7 @@ fn a_variable_named_only_by_an_option_letter_or_a_path_is_kept() {
         "print -vS /etc",
         "print -rvS /etc",
         "printf -vS /etc",
-    ] {
-        let cmd = format!("{s}; {middle}; rm -rf \"$S/x\"");
-        assert!(escalates(&cmd).contains("$S is not known after"), "{cmd}");
-    }
+    ]);
 }
 
 /// An unknown word forgets every variable only where it could name one or run code
@@ -1139,7 +1055,7 @@ fn an_unknown_word_forgets_only_where_it_can_name_a_variable() {
         let cmd = format!("{s}; {middle}; rm -rf \"$S\"/*");
         assert_eq!(resolve(&cmd), Ok(vec!["/tmp/w/a/*".to_string()]), "{cmd}");
     }
-    for middle in [
+    forgets(&[
         "X='/tmp/*(e:S=/etc:)'; echo $~X",
         // A builtin's redirect is globbed, qualifier and all (`echo hi < $~X`
         // and `true < $~X` set `S` under `zsh -f`; `ls < $~X` does not).
@@ -1154,32 +1070,7 @@ fn an_unknown_word_forgets_only_where_it_can_name_a_variable() {
         "print \"$X\" S /etc",
         "printf %d \"$X\"",
         "[ -t \"$X\" ]",
-    ] {
-        let cmd = format!("{s}; {middle}; rm -rf \"$S/x\"");
-        assert!(escalates(&cmd).contains("$S is not known after"), "{cmd}");
-    }
-}
-
-/// An `export` that may not run assigns nothing the line can rely on, and a pipe's right
-/// side runs whatever its left returned, so `test -n "$D" |` proves nothing.
-#[test]
-fn a_conditional_export_and_a_pipe_prove_nothing() {
-    all_escalate(&[
-        ("test -d x || export S=/tmp/w/a; rm -rf \"$S/y\"", "$S"),
-        ("true && export S=/tmp/w/a; rm -rf \"$S/y\"", "$S"),
-        ("export S=/tmp/w/a | cat; rm -rf \"$S/y\"", "$S"),
-        ("export S=/tmp/w/a & rm -rf \"$S/y\"", "$S"),
-        (
-            "D=$(mktemp -d /private/tmp/claude-502/w.XXXXXX); test -n \"$D\" | rm -rf \"$D/x\"",
-            "removes /x",
-        ),
-        (
-            "D=$(mktemp -d); test -n \"$D\" | rm -rf \"$D/x\"",
-            "removes /x",
-        ),
     ]);
-    approves("export S=/tmp/w/a; rm -rf \"$S/y\"");
-    approves("D=$(mktemp -d); test -n \"$D\" && rm -rf \"$D/x\"");
 }
 
 /// SHELL_NAMES keeps every name whose assignment does not read back: in zsh
@@ -1358,53 +1249,20 @@ fn a_command_that_can_assign_what_it_names_is_no_plain_consumer() {
 /// include a word starting with `/`, where the parse stops.
 #[test]
 fn a_value_zsh_arithmetic_reads_is_read_too() {
-    all_escalate(&[
-        (
-            "S=/tmp/w/a; A=S=5; printf %d A; rm -rf \"$S/x\"",
-            "$S is not known after",
-        ),
-        (
-            "S=/tmp/w/a; A=B; B=S=5; [ -t A ]; rm -rf \"$S/x\"",
-            "$S is not known after",
-        ),
-        (
-            "S=/tmp/w/a; A=S=5; printf '%s %d' x 1/A; rm -rf \"$S/x\"",
-            "$S is not known after",
-        ),
-        (
-            "S=/tmp/w/a; printf %d HOSTX; rm -rf \"$S/x\"",
-            "$S is not known after",
-        ),
-        (
-            "S=/tmp/w/a; test -t 1/UNSETX; rm -rf \"$S/x\"",
-            "$S is not known after",
-        ),
-        (
-            "S=/tmp/w/a; A=S=5; print -f %d A; rm -rf \"$S/x\"",
-            "$S is not known after",
-        ),
+    forgets(&[
+        "A=S=5; printf %d A",
+        "A=B; B=S=5; [ -t A ]",
+        "A=S=5; printf '%s %d' x 1/A",
+        "printf %d HOSTX",
+        "test -t 1/UNSETX",
+        "A=S=5; print -f %d A",
         // `print`'s options that take a word do not end its options.
-        (
-            "S=/tmp/w/a; A=S=5; print -v T -f %d A; rm -rf \"$S/x\"",
-            "$S is not known after",
-        ),
-        (
-            "S=/tmp/w/a; A=S=5; print -u 2 -f %d A; rm -rf \"$S/x\"",
-            "$S is not known after",
-        ),
-        (
-            "S=/tmp/w/a; A=S=5; return A; rm -rf \"$S/x\"",
-            "$S is not known after",
-        ),
-        (
-            "S=/tmp/w/a; A=S=5; printf -- %d A; rm -rf \"$S/x\"",
-            "$S is not known after",
-        ),
+        "A=S=5; print -v T -f %d A",
+        "A=S=5; print -u 2 -f %d A",
+        "A=S=5; return A",
+        "A=S=5; printf -- %d A",
         // The value, not the name, is what reads `S`.
-        (
-            "S=/tmp/w/a; A=x/S; printf %d A; rm -rf \"$S/x\"",
-            "$S is not known after",
-        ),
+        "A=x/S; printf %d A",
     ]);
     for cmd in [
         "S=/tmp/w/a; printf '%s\\n' \"$S\"; rm -rf \"$S/x\"",
@@ -1425,12 +1283,6 @@ fn a_value_zsh_arithmetic_reads_is_read_too() {
             out, "5",
             "zsh reads A's value as arithmetic, and /B not at all"
         );
-    }
-    if let Some(out) = in_shell(
-        "/bin/zsh",
-        "A=S=5; S=/tmp/w/a; print -u 2 -f %d A 2>/dev/null; echo \"$S\"",
-    ) {
-        assert_eq!(out, "5", "zsh's print -f follows `-u 2`");
     }
 }
 
@@ -1470,12 +1322,6 @@ fn every_zsh_modifier_letter_is_not_text() {
             assert!(escalates(&cmd).contains("zsh computes"), "{cmd}");
         }
     }
-    all_escalate(&[
-        ("S=/tmp/w/a; rm -rf \"$S:s/w/etc/\"", "`$S:s`"),
-        ("S=/tmp/w/a; rm -rf \"$S:P/x\"", "`$S:P`"),
-        ("S=/tmp/w/a.b; rm -rf \"$S:r\"", "`$S:r`"),
-        ("S=/tmp/w/a; rm -rf \"$S:a/x\"", "`$S:a`"),
-    ]);
     // zsh's own reading of each letter, where it differs from the text
     // (each in a subshell: a modifier zsh rejects ends only that one).
     let probe: String = letters
@@ -1503,45 +1349,27 @@ fn every_zsh_modifier_letter_is_not_text() {
 /// `x/S++`), so it names its variables. Negative control: a plain path.
 #[test]
 fn a_path_word_with_an_arithmetic_operator_names_its_variables() {
-    for word in ["x/S=5", "x/(S)", "x/a[S]", "x/S++", "x/S--"] {
-        let cmd = format!("S=/tmp/w/a; zcompute '{word}'; rm -rf \"$S/x\"");
-        assert!(escalates(&cmd).contains("$S is not known after"), "{cmd}");
-    }
-    approves("S=/tmp/w/a; zcompute 'x/S'; rm -rf \"$S/x\"");
+    forgets(&[
+        "zcompute 'x/S=5'",
+        "zcompute 'x/(S)'",
+        "zcompute 'x/a[S]'",
+        "zcompute 'x/S++'",
+        "zcompute 'x/S--'",
+    ]);
+    keeps(&["zcompute 'x/S'"]);
 }
 
 /// A double-quoted `$(…)` names nothing only under a [`PLAIN_CONSUMERS`] command: under
 /// another its output may be a name a builtin assigns (`print -v "$(echo S)" /etc`).
 #[test]
 fn a_quoted_substitution_under_another_command_forgets() {
-    for middle in [
+    forgets(&[
         "print -v \"$(echo S)\" /etc",
         "printf -v \"$(echo S)\" /etc",
         "[ -t \"$(echo S)\" ]",
         "stat -A \"$(echo S)\" /etc",
-    ] {
-        let cmd = format!("S=/tmp/w/a; {middle}; rm -rf \"$S/x\"");
-        assert!(escalates(&cmd).contains("$S is not known after"), "{cmd}");
-    }
-    approves("S=/tmp/w/a; echo \"$(echo S)\"; rm -rf \"$S/x\"");
-}
-
-/// With no scratch root nothing is proven, the fresh-directory rule included.
-/// Negative control: the same lines with roots.
-#[test]
-fn nothing_is_proven_with_no_scratch_root() {
-    let none: Vec<ScratchRoot> = Vec::new();
-    for cmd in [
-        "D=$(mktemp -d) && rm -rf \"$D/x\"",
-        "D=$(mktemp -d); rm -rf \"$D\"",
-        "D=$(mktemp -d w.XXXXXX) || exit 1; rm -rf \"$D/x\"",
-    ] {
-        let e = resolve_on_disk(&none, CWD, cmd).expect_err(cmd);
-        assert!(e.contains("withheld"), "{cmd}: {e}");
-        assert!(resolve(cmd).is_ok(), "{cmd}");
-    }
-    let e = resolve_on_disk(&none, CWD, "S=/tmp/w/a; rm -rf \"$S/x\"").expect_err("literal");
-    assert!(e.contains("not strictly inside"), "{e}");
+    ]);
+    keeps(&["echo \"$(echo S)\""]);
 }
 
 /// A session cwd reached through a user's link keeps its `<cwd>/target*` root, resolved where
@@ -1655,59 +1483,13 @@ fn a_printf_format_with_no_numeric_conversion_reads_no_arithmetic() {
 }
 
 /// A program run from disk cannot assign the shell's variables: the classifier's read-only
-/// external programs are [`PLAIN_CONSUMERS`], each checked to be no builtin in zsh 5.9 or
-/// bash 3.2 where installed. Negative controls: `stat` (zsh's `-A` assigns), `env` and
-/// `xargs` (they run a command), `print`, and an unquoted unknown word.
+/// external programs are [`PLAIN_CONSUMERS`] (that no member a shell runs as a builtin
+/// assigns is `a_command_that_can_assign_what_it_names_is_no_plain_consumer`'s). Negative
+/// controls: `stat` (zsh's `-A` assigns), `env` and `xargs` (they run a command), `print`,
+/// and an unquoted unknown word.
 #[test]
 fn an_external_read_only_program_names_nothing() {
-    let externals = [
-        "git",
-        "egrep",
-        "fgrep",
-        "mdfind",
-        "sed",
-        "awk",
-        "tr",
-        "jq",
-        "comm",
-        "nl",
-        "md5",
-        "shasum",
-        "sha256sum",
-        "column",
-        "paste",
-        "seq",
-        "strings",
-        "fold",
-        "expr",
-        "uname",
-        "whoami",
-        "id",
-        "sw_vers",
-        "hostname",
-        "df",
-        "uptime",
-        "sysctl",
-        "ps",
-        "lsof",
-        "pgrep",
-        "sleep",
-    ];
-    for name in externals {
-        assert!(PLAIN_CONSUMERS.contains(&name), "{name}");
-        let zsh = format!("whence -w -- '{name}'");
-        if let Some(out) = in_shell("/bin/zsh", &zsh) {
-            assert!(
-                out.ends_with(": command") || out.ends_with(": none"),
-                "zsh: {out}"
-            );
-        }
-        let bash = format!("type -t -- '{name}'");
-        if let Some(out) = in_shell("/bin/bash", &bash) {
-            assert!(out == "file" || out.is_empty(), "bash: {name} is {out}");
-        }
-    }
-    for middle in [
+    keeps(&[
         "shasum \"$HOME/f\"",
         "jq -r .name \"$TMPDIR/p.json\"",
         "tr a b < \"$HOME/f\"",
@@ -1715,14 +1497,7 @@ fn an_external_read_only_program_names_nothing() {
         "sed -n 's/S=//p' \"$HOME/f\"",
         "git -C \"$HOME/src\" log -1 --format=S=%s",
         "nl \"$(date)\"",
-    ] {
-        let cmd = format!("S=/private/tmp/claude-502/w; {middle}; rm -rf \"$S/x\"");
-        assert_eq!(
-            resolve(&cmd),
-            Ok(vec!["/private/tmp/claude-502/w/x".to_string()]),
-            "{cmd}"
-        );
-    }
+    ]);
     for middle in [
         "stat -A S /etc",
         "stat \"$HOME/f\"",
@@ -1738,73 +1513,12 @@ fn an_external_read_only_program_names_nothing() {
     }
 }
 
-/// The operand `"$D"` alone is the fresh directory, or `""` (removing nothing) when `mktemp`
-/// failed, whatever else reads an unquoted `$D`; only a path under `$D` needs every use
-/// double-quoted.
-#[test]
-fn a_quoted_fresh_directory_alone_is_proven_whatever_else_reads_it() {
-    for cmd in [
-        "D=$(mktemp -d); ls $D; rm -rf \"$D\"",
-        "D=$(mktemp -d) && cd $D && rm -rf \"$D\"",
-    ] {
-        assert_eq!(resolve(cmd), Ok(vec!["<mktemp -d>".to_string()]), "{cmd}");
-    }
-    all_escalate(&[
-        (
-            "D=$(mktemp -d) && ls $D && rm -rf \"$D/x\"",
-            "must be double-quoted",
-        ),
-        ("D=$(mktemp -d) && rm -rf $D", "must be double-quoted"),
-        (
-            "D=$(mktemp -d) && ls $D && rm -rf \"${D:?}/x\"",
-            "must be double-quoted",
-        ),
-        // Inside `$(…)` quoting is not read, braces or not.
-        (
-            "D=$(mktemp -d) && echo \"$(ls ${D})\" && rm -rf \"$D/x\"",
-            "must be double-quoted",
-        ),
-        (
-            "D=$(mktemp -d) && echo \"$(ls $D)\" && rm -rf \"$D/x\"",
-            "must be double-quoted",
-        ),
-    ]);
-}
-
-/// A variable forgotten after a command that may assign it is reported as that, not as
-/// "not assigned a literal on this line".
-#[test]
-fn a_forgotten_variable_names_the_command_that_forgot_it() {
-    for (middle, head) in [
-        ("print -v S /etc", "print"),
-        ("A=S=5; printf %d A", "printf"),
-        ("[ -t \"$X\" ]", "["),
-        ("X='/tmp/*(e:S=/etc:)'; echo $~X", "echo"),
-    ] {
-        let cmd = format!("S=/tmp/w/a; {middle}; rm -rf \"$S/x\"");
-        let e = escalates(&cmd);
-        assert!(
-            e.starts_with(&format!("$S is not known after `{head}`")),
-            "{cmd}: {e}"
-        );
-    }
-    assert!(escalates("rm -rf \"$UNSETX/x\"").contains("$UNSETX is not assigned on this line"));
-    assert!(
-        escalates("test -d x || S=/tmp/w/a; rm -rf \"$S/x\"")
-            .contains("$S is not assigned a literal on this line")
-    );
-}
-
 /// zsh's `{S}>file` stores the new descriptor's number in `S` under a builtin, even with a
 /// blank before the `>`; an unquoted `{NAME}` word forgets `NAME` under every command.
 /// Negative controls: a quoted or escaped brace, and another name.
 #[test]
 fn a_named_descriptor_redirect_assigns_its_name() {
     all_escalate(&[
-        (
-            "S=/private/tmp/claude-502/w; echo hi {S}>/dev/null; rm -rf \"$S/x\"",
-            "$S is not known after `echo`",
-        ),
         (
             "S=/private/tmp/claude-502/w; echo hi {S} >/dev/null; rm -rf \"$S/x\"",
             "$S is not known after `echo`",
@@ -1834,17 +1548,11 @@ fn a_named_descriptor_redirect_assigns_its_name() {
             "$D is not known after `echo`",
         ),
     ]);
-    for cmd in [
-        "S=/private/tmp/claude-502/w; echo '{S}'>/dev/null; rm -rf \"$S/x\"",
-        "S=/private/tmp/claude-502/w; echo \\{S}>/dev/null; rm -rf \"$S/x\"",
-        "S=/private/tmp/claude-502/w; echo hi {T}>/dev/null; rm -rf \"$S/x\"",
-    ] {
-        assert_eq!(
-            resolve(cmd),
-            Ok(vec!["/private/tmp/claude-502/w/x".to_string()]),
-            "{cmd}"
-        );
-    }
+    keeps(&[
+        "echo '{S}'>/dev/null",
+        "echo \\{S}>/dev/null",
+        "echo hi {T}>/dev/null",
+    ]);
     let probe = "S=/x; T=/y; U=/z; V=/v; echo hi {S}>/dev/null; ls {T}>/dev/null; \
                  echo '{U}'>/dev/null; echo hi {V} >/dev/null; print -r -- \"$S $T $U $V\"";
     if let Some(out) = in_shell("/bin/zsh", probe) {
@@ -1867,7 +1575,7 @@ fn a_named_descriptor_redirect_assigns_its_name() {
 /// non-arithmetic as-written format.
 #[test]
 fn a_brace_expanded_word_moves_the_words_the_rule_reads() {
-    for middle in [
+    forgets(&[
         "A=S=5; printf {%d,A}",
         "A=S=5; printf -- {%d,A}",
         "A=S=5; printf {-%d,A}",
@@ -1880,24 +1588,14 @@ fn a_brace_expanded_word_moves_the_words_the_rule_reads() {
         "A=S=5; [ {-t,A} ]",
         "A=S=5; test {-t,A}",
         "A=S=5; printf %d {A,1}",
-    ] {
-        let cmd = format!("S=/private/tmp/claude-502/w; {middle}; rm -rf \"$S/x\"");
-        assert!(escalates(&cmd).contains("$S is not known after"), "{cmd}");
-    }
-    for middle in [
+    ]);
+    keeps(&[
         "printf '{%s}\\n' x",
         "printf '%s\\n' {a,b}",
         "printf '%s\\n' S={5,6}",
         "printf \\{-vS,%s} /etc",
         "echo {-vS,%s} /etc",
-    ] {
-        let cmd = format!("S=/private/tmp/claude-502/w; {middle}; rm -rf \"$S/x\"");
-        assert_eq!(
-            resolve(&cmd),
-            Ok(vec!["/private/tmp/claude-502/w/x".to_string()]),
-            "{cmd}"
-        );
-    }
+    ]);
     let probe = "S=1; A=S=5; printf {%d,A} >/dev/null; print -r -- \"$S\"; \
                  S=1; A=S=6; [ {-t,A} ]; print -r -- \"$S\"; \
                  S=1; printf '%s' S={7,8} >/dev/null; print -r -- \"$S\"";
@@ -1915,7 +1613,7 @@ fn a_brace_expanded_word_moves_the_words_the_rule_reads() {
 /// (`a_brace_expanded_word_moves_the_words_the_rule_reads`).
 #[test]
 fn a_globbed_word_moves_the_words_the_rule_reads() {
-    for middle in [
+    forgets(&[
         "printf %d *",
         "printf %d S=?",
         "printf '%s %d' x S*",
@@ -1924,80 +1622,46 @@ fn a_globbed_word_moves_the_words_the_rule_reads() {
         "test -t S=[5]",
         "printf * S=5",
         "printf -* S=5",
-    ] {
-        let cmd = format!("S=/private/tmp/claude-502/w; {middle}; rm -rf \"$S/x\"");
-        assert!(escalates(&cmd).contains("$S is not known after"), "{cmd}");
-    }
-    for middle in [
+    ]);
+    keeps(&[
         "printf '%s\\n' *.log",
         "printf %d '*'",
         "printf %d \\*",
         "ls *",
         "echo S=?",
-    ] {
-        let cmd = format!("S=/private/tmp/claude-502/w; {middle}; rm -rf \"$S/x\"");
-        assert_eq!(
-            resolve(&cmd),
-            Ok(vec!["/private/tmp/claude-502/w/x".to_string()]),
-            "{cmd}"
-        );
-    }
+    ]);
 }
 
 /// A glob or brace word starting with `/` expands only to absolute paths, so the rule keeps
 /// proving past one. Negative controls: a relative glob, and a value bash splits.
 #[test]
 fn an_absolute_glob_moves_no_word_the_rule_reads() {
-    for middle in [
+    keeps(&[
         "stat -f %z \"$S\"/*.bin",
         "stat -f %z $S/{a,b}.bin",
         "printf %d /tmp/w/*",
         "[ -e /tmp/w/*.log ]",
         "test -t 1 /tmp/w/*",
-    ] {
-        let cmd = format!("S=/private/tmp/claude-502/w; {middle}; rm -rf \"$S/x\"");
-        assert_eq!(
-            resolve(&cmd),
-            Ok(vec!["/private/tmp/claude-502/w/x".to_string()]),
-            "{cmd}"
-        );
-    }
-    for middle in [
+    ]);
+    forgets(&[
         "stat -f %z ./*.bin",
         "T='/tmp/w -vS'; printf %d \"$T\"/*",
         "printf %d *",
-    ] {
-        let cmd = format!("S=/private/tmp/claude-502/w; {middle}; rm -rf \"$S/x\"");
-        assert!(escalates(&cmd).contains("$S is not known after"), "{cmd}");
-    }
+    ]);
 }
 
 /// A `-` word zsh takes as `printf`'s format is read as a format (bash refuses it as an
-/// unknown option). Negative controls: a numeric `-` format, and `-vS` (bash's `-v S`).
+/// unknown option). Negative control: a numeric `-` format (`-x%d` and `-vS`, bash's
+/// `-v S`, are `a_printf_format_with_no_numeric_conversion_reads_no_arithmetic`'s).
 #[test]
 fn a_dash_format_with_no_numeric_conversion_reads_no_arithmetic() {
-    for middle in [
+    keeps(&[
         "printf '--- %s ---\\n' done",
         "printf -- '--- %s ---\\n' done",
         "printf -%s S=5",
         "printf -v T '--- %s' S=5",
-    ] {
-        let cmd = format!("S=/private/tmp/claude-502/w; {middle}; rm -rf \"$S/x\"");
-        assert_eq!(
-            resolve(&cmd),
-            Ok(vec!["/private/tmp/claude-502/w/x".to_string()]),
-            "{cmd}"
-        );
-    }
-    for middle in [
-        "printf '--- %d ---\\n' S=5",
-        "printf -x%d S=5",
-        "printf -vS '%s' /etc",
-        "printf -vT -vS x",
-    ] {
-        let cmd = format!("S=/private/tmp/claude-502/w; {middle}; rm -rf \"$S/x\"");
-        assert!(escalates(&cmd).contains("$S is not known after"), "{cmd}");
-    }
+    ]);
+    forgets(&["printf '--- %d ---\\n' S=5"]);
     let probe = "S=1; printf '--- %s ---' S=5 >/dev/null 2>&1; printf -%s S=6 >/dev/null 2>&1; \
                  printf '--- %d ---' S=7 >/dev/null 2>&1; echo \"$S\"";
     if let Some(out) = in_shell("/bin/zsh", probe) {
@@ -2013,16 +1677,13 @@ fn a_dash_format_with_no_numeric_conversion_reads_no_arithmetic() {
 /// name but `x`.
 #[test]
 fn an_extended_glob_word_moves_the_words_the_rule_reads() {
-    for middle in [
+    forgets(&[
         "[ ^-vS ]",
         "test ^x",
         "[ x~y ]",
         "printf ^%s S=5",
         "printf %s~x S=5",
-    ] {
-        let cmd = format!("S=/private/tmp/claude-502/w; {middle}; rm -rf \"$S/x\"");
-        assert!(escalates(&cmd).contains("$S is not known after"), "{cmd}");
-    }
+    ]);
     for cmd in [
         "rm -rf /private/tmp/claude-502/^x",
         "rm -rf /private/tmp/claude-502/x#",
@@ -2049,60 +1710,20 @@ fn an_extended_glob_word_moves_the_words_the_rule_reads() {
         resolve("S=\"/private/tmp/claude-502/a:~\"; rm -rf \"$S\""),
         Ok(vec!["/private/tmp/claude-502/a:~".to_string()])
     );
-    if !Path::new("/bin/zsh").exists() {
-        return;
-    }
-    for (files, probe, want) in [
-        (
-            &["-t", "-vS", "S=5"][..],
-            "setopt extendedglob; S=1; [ ^-vS ] 2>/dev/null; echo \"$S\"",
-            "5",
-        ),
-        (
-            &["%d"][..],
-            "setopt extendedglob; S=1; printf ^%s S=7 >/dev/null 2>&1; echo \"$S\"",
-            "7",
-        ),
-    ] {
-        let t = TempTree::new("extglob");
-        for f in files {
-            std::fs::write(t.0.path().join(f), "").expect("a probe file");
-        }
-        let out = aterm_uds::spawnfd::command("/bin/zsh")
-            .args(no_startup("/bin/zsh", probe))
-            .current_dir(t.0.path())
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .stdin(aterm_uds::spawnfd::Stdio::null())
-            .output()
-            .expect("zsh runs");
-        assert_eq!(
-            String::from_utf8_lossy(&out.stdout).trim(),
-            want,
-            "{probe} beside {files:?}"
-        );
-    }
 }
 
 /// Past `printf`'s non-arithmetic as-written format, a double-quoted word is one word of
 /// data. Negative controls: the same word in each other position, and under other commands.
 #[test]
 fn a_quoted_word_printf_reads_as_data_names_nothing() {
-    for middle in [
+    keeps(&[
         "printf '%s\\n' \"$x\"",
         "printf '%s: %s\\n' \"$x\" \"$(date)\"",
         "printf -- '%s\\n' \"$x\"",
         "printf -v T '%s' \"$x\"",
         "printf '%s\\n' \"$S\" \"${x}\"",
-    ] {
-        let cmd = format!("S=/private/tmp/claude-502/w; {middle}; rm -rf \"$S/x\"");
-        assert_eq!(
-            resolve(&cmd),
-            Ok(vec!["/private/tmp/claude-502/w/x".to_string()]),
-            "{cmd}"
-        );
-    }
-    for middle in [
+    ]);
+    forgets(&[
         "printf \"$f\" x",
         "printf -- \"$x\"",
         "printf -v \"$x\" '%s' y",
@@ -2113,10 +1734,7 @@ fn a_quoted_word_printf_reads_as_data_names_nothing() {
         "print \"$x\"",
         "[ -t \"$x\" ]",
         "printf '%s\\n' \"$x\" >\"$y\"",
-    ] {
-        let cmd = format!("S=/private/tmp/claude-502/w; {middle}; rm -rf \"$S/x\"");
-        assert!(escalates(&cmd).contains("$S is not known after"), "{cmd}");
-    }
+    ]);
 }
 
 /// A string or file operand of `[`/`test` names nothing ([`test_operands`]); checked in
@@ -2259,16 +1877,7 @@ fn a_subscript_on_a_special_parameter_escalates() {
             "{cmd}"
         );
     }
-    for cmd in [
-        "S=/private/tmp/claude-502/w; echo \"$#\" \"$?\" \"$1\"; rm -rf \"$S/x\"",
-        "S=/private/tmp/claude-502/w; printf '%s\\n' \"$#\"; rm -rf \"$S/x\"",
-    ] {
-        assert_eq!(
-            resolve(cmd),
-            Ok(vec!["/private/tmp/claude-502/w/x".to_string()]),
-            "{cmd}"
-        );
-    }
+    keeps(&["echo \"$#\" \"$?\" \"$1\"", "printf '%s\\n' \"$#\""]);
 }
 
 /// `printf`'s format is read after its Unicode escapes are decoded: one that

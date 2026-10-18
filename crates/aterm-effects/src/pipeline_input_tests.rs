@@ -253,7 +253,7 @@ fn web_delete_dispatch_reaches_erase_without_a_typed_replay() {
 
 #[test]
 fn web_accepted_printables_conform_to_the_existing_input_credit_model() {
-    let model = aterm_spec::derive::cursor_hint_license_model();
+    let model = aterm_models_effects::cursor_hint_license_model();
     let mut state = model.init_state();
     let mut host = Host::new(Instant::now());
     for ch in ['a', '!'] {

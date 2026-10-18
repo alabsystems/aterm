@@ -228,6 +228,7 @@ impl WebBand {
         };
         let ansi = AnsiHues {
             red: hue(1),
+            green: hue(2),
             yellow: hue(3),
             blue: hue(4),
             cyan: hue(6),
@@ -948,7 +949,7 @@ impl WebTerminal {
             Hit::Details(id) | Hit::Body(id) if self.band.details => (id, ActionIndex::DETAILS),
             Hit::Overflow if self.band.details => return "OK messages".to_string(),
             Hit::Details(_) | Hit::Body(_) | Hit::Overflow | Hit::Nothing => {
-                return "OK none".to_string()
+                return "OK none".to_string();
             }
         };
         match self.band_act_at(id, index, now) {
@@ -1280,11 +1281,236 @@ macro_rules! bind {
 web_terminal_impl!(bind);
 
 /// Each crate's own tests of this surface (`src/messages_api_tests.rs` of the crate
-/// compiling this file): the CPU and GPU hosts draw differently.
+/// compiling this file): the CPU and GPU hosts draw differently. The tests both hosts
+/// share are written once below it.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/src/messages_api_tests.rs"
     ));
+
+    // THE TESTS BOTH HOSTS SHARE. Each crate's file above names its `Host` and
+    // gives the three things that differ between the CPU twin and the GPU
+    // face: `clocked` (its constructor, on the band's clock), `draw` (a frame)
+    // and `same_picture` (what a frame is compared by: the twin's pixels, the
+    // GPU face's frame scratch). Everything below is written once.
+
+    fn stamp() -> WallStamp {
+        WallStamp {
+            unix_ms: 1_790_000_000_000,
+        }
+    }
+
+    fn ms(n: u64) -> aterm_messages::Duration {
+        aterm_messages::Duration::from_millis(n)
+    }
+
+    /// Frame pixel `(x, y)` at the middle of band cell `(row, col)`.
+    fn band_px(t: &Host, row: usize, col: usize) -> (f64, f64) {
+        let m = t.band_metrics();
+        (
+            (m.pad + col * m.cell_w + m.cell_w / 2) as f64,
+            (m.grid_top + row * m.cell_h + m.cell_h / 2) as f64,
+        )
+    }
+
+    /// The `rev=` and `total=` fields of the page's head line.
+    fn page_head(page: &str) -> (String, String) {
+        let head = page.lines().nth(1).expect("the page's head line");
+        let field = |name: &str| {
+            head.split('\t')
+                .find_map(|f| f.strip_prefix(name))
+                .expect("a head field")
+                .to_string()
+        };
+        (field("rev="), field("total="))
+    }
+
+    /// The pet's drawn body in FRAME px `(x0, x1, y0, y1)`, read off the frame
+    /// the renderer drew: the free sprite whose atlas tile is the body's
+    /// natural size (`ART_ROWS` cells tall at `ART_ASPECT` — motes and
+    /// word-cats bake at other sizes), placed where the rasterizer stamps it,
+    /// `pad` in and `grid_top` down (any band rows are already in its `y`).
+    fn drawn_pet_body(frame: &RenderInput, m: BandMetrics) -> Option<(f32, f32, f32, f32)> {
+        use aterm_effects::kitty_pet::{ART_ASPECT, ART_ROWS};
+        let nat_h = (ART_ROWS * m.cell_h as f32).round();
+        let nat = ((nat_h * ART_ASPECT).round() as u16, nat_h as u16);
+        let s = frame.free_sprites.iter().find(|s| (s.aw, s.ah) == nat)?;
+        let x0 = m.pad as f32 + s.x as f32;
+        let y0 = m.grid_top as f32 + s.y as f32;
+        Some((x0, x0 + f32::from(s.w), y0, y0 + f32::from(s.h)))
+    }
+
+    /// Drive the pet onto the glass through the binding alone — the glow
+    /// style that names it, the seed door, then witnessed keystrokes at 33 ms
+    /// — until `cursor_pet_alpha` goes positive.
+    fn wake_the_pet(t: &mut Host) -> bool {
+        t.set_cursor_glow(true, "rainbow kitty", None, None, 260, 24, 0.7, 0.6, true);
+        t.set_cursor_pet(true, 7);
+        draw(t);
+        for frame in 0..240u32 {
+            if frame % 6 == 0 {
+                let ch = char::from(b'a' + u8::try_from(frame / 6 % 26).unwrap_or(0));
+                t.note_typed_char(ch);
+                t.process(&[ch as u8]);
+            }
+            t.advance_effects(33.0);
+            draw(t);
+            if t.cursor_pet_alpha() > 0 {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// THE PET UNDER A BAND IS PRESSED WHERE IT IS DRAWN. The band's rows
+    /// land above the grid after the effects ran, and the compose moves the
+    /// pet's sprite down with the grid; the page presses in canvas pixels,
+    /// band included (ruling 347). So with a row committed, a press at the
+    /// drawn body's centre or its feet pets the cat, and a press on the text
+    /// half a row above the drawn body passes to the terminal — where a hit
+    /// rect left a band row too high swallowed that press and let a press on
+    /// the cat's feet start a selection. Without the band the same holds (the
+    /// control).
+    #[test]
+    fn the_pet_is_pressed_where_the_band_draws_it() {
+        let (mut t, t0) = clocked(12, 60);
+        t.set_chrome(6, 0);
+        // The caret three rows down, so a text row lies above the cat.
+        t.process(b"\r\n\r\n\r\n$ ");
+        assert!(wake_the_pet(&mut t), "the pet must reach the glass");
+        let m = t.band_metrics();
+        let half_row = m.cell_h as f32 / 2.0;
+        for band_rows in [0, 1] {
+            if band_rows == 1 {
+                let reply = t.notice_at("post ci sev=warn Disk nearly full", t0, stamp());
+                assert!(reply.starts_with("OK message="), "{reply}");
+                draw(&mut t);
+            }
+            assert_eq!(t.band_rows(), band_rows);
+            assert!(t.cursor_pet_alpha() > 0, "the pet is on the glass");
+            let (x0, x1, y0, y1) =
+                drawn_pet_body(&t.frame_scratch, m).expect("the pet's body is drawn");
+            assert!(
+                y0 - half_row >= t.grid_top_px() as f32,
+                "fixture: the row above the cat is the terminal's, not the band's"
+            );
+            let cx = (x0 + x1) / 2.0;
+            assert_eq!(
+                t.pet_press_px(cx, y0 - half_row),
+                0,
+                "band rows {band_rows}: a press on the text above the drawn cat is the terminal's"
+            );
+            assert_eq!(
+                t.pet_press_px(cx, (y0 + y1) / 2.0),
+                1,
+                "band rows {band_rows}: a press on the drawn cat's centre pets it"
+            );
+            assert_eq!(
+                t.pet_press_px(cx, y1 - half_row / 2.0),
+                1,
+                "band rows {band_rows}: a press on the drawn cat's feet pets it"
+            );
+        }
+    }
+
+    /// A STILL POINTER'S LIT CHIP FOLLOWS THE LAYOUT (ruling 441 (f)), under
+    /// ruling 341's "a pointer lights only where a press acts": an echo is
+    /// `Hit::Nothing` and a press there is `OK none`, so the chip the pointer
+    /// lit never stays lit on the echo a row leaves (the web twin of rulings
+    /// 417 (k) and 418 (a)). A progress row the pointer rests on ends `done …
+    /// ok` (a Complete echo): the band draws as a twin's that took the same
+    /// lines with no pointer at all. (A Details press on a plain warning
+    /// leaves no echo — only an animated row records one — so the press itself
+    /// does not reach this.)
+    #[test]
+    fn a_still_pointers_chip_never_lights_the_echo() {
+        let (mut t, t0) = clocked(12, 60);
+        let (mut twin, _) = clocked(12, 60);
+        twin.band.reset_at(t0);
+        for x in [&mut t, &mut twin] {
+            x.set_chrome(6, 0);
+            let _ = x.notice_at("progress p pct=40 Downloading assets", t0, stamp());
+            x.set_details_view_at(true, t0);
+            let _ = x.messages_tick_at(t0 + ms(2100));
+        }
+        assert_eq!(t.band_rows(), 1, "premise: revealed");
+        let (x, y) = band_px(&t, 0, 20);
+        assert!(t.band_hover_at(x, y, t0 + ms(2101)), "the body lights");
+        for b in [&mut t, &mut twin] {
+            let _ = b.messages_tick_at(t0 + ms(2101));
+            draw(b);
+        }
+        assert!(!same_picture(&t, &twin), "control: the lit chip shows");
+        for b in [&mut t, &mut twin] {
+            let reply = b.notice_at("done p ok Downloaded assets", t0 + ms(2102), stamp());
+            assert!(reply.starts_with("OK"), "{reply}");
+        }
+        let at = t0 + ms(2200);
+        for b in [&mut t, &mut twin] {
+            let _ = b.messages_tick_at(at);
+            draw(b);
+        }
+        let echo = t
+            .band
+            .view
+            .layout()
+            .and_then(|p| p.rows.first().map(|r| r.kind))
+            .expect("a laid-out row");
+        assert!(
+            matches!(echo, aterm_messages::RowKind::Echo(_)),
+            "premise: the echo is on the band: {echo:?}"
+        );
+        let differ = !same_picture(&t, &twin);
+        let flips = t.band_hover_at(x, y, at);
+        draw(&mut t);
+        let resolved = same_picture(&t, &twin);
+        assert!(
+            !differ,
+            "the echo draws a lit chip the still pointer left (a fresh hover at the same \
+             pixel changes the lit state: {flips}; after it the frames agree: {resolved})"
+        );
+    }
+
+    /// A RESTORE MOVES THE PAGE'S `rev=` (ruling 441 (e)). Ruling 388 (5):
+    /// the site reads the page again after a notice or a tick, "the head's
+    /// `rev=` says whether the log moved", and `MessageCenter::revision` bumps
+    /// on every observable change. A restore that moves the log from no
+    /// records to two moves `rev=` too. Control: a post after the restore
+    /// moves it.
+    #[test]
+    fn the_restore_moves_the_pages_rev() {
+        let (mut prev, p0) = clocked(20, 80);
+        for line in [
+            "post ci Build finished",
+            "post ci sev=warn hold=100 Disk nearly full",
+        ] {
+            let reply = prev.notice_at(line, p0, stamp());
+            assert!(reply.starts_with("OK"), "{line}: {reply}");
+        }
+        let _ = prev.messages_tick_at(p0 + ms(10));
+        let kept: Vec<String> = prev
+            .messages_log_since_at(0.0)
+            .lines()
+            .skip(1)
+            .map(str::to_string)
+            .collect();
+        let (mut t, t0) = clocked(20, 80);
+        let wall = stamp().unix_ms + 90_000;
+        let (rev0, total0) = page_head(&t.messages_page_at("", false, 0, wall));
+        assert_eq!(total0, "0", "premise: nothing yet");
+        let reply = t.messages_restore_at(&kept.join("\n"), t0 + ms(1));
+        assert!(reply.starts_with("OK records=2 "), "{reply}");
+        let _ = t.messages_tick_at(t0 + ms(2));
+        let (rev1, total1) = page_head(&t.messages_page_at("", false, 0, wall));
+        assert_eq!(total1, "2", "premise: the log moved");
+        assert_ne!(
+            rev1, rev0,
+            "the restore moved the log from 0 to 2 records and `rev=` did not move"
+        );
+        let _ = t.notice_at("post ci sev=warn Fresh warning", t0 + ms(3), stamp());
+        let (rev2, _) = page_head(&t.messages_page_at("", false, 0, wall));
+        assert_ne!(rev2, rev1, "control: a post moves it");
+    }
 }

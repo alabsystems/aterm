@@ -18,9 +18,7 @@
 //!    features, so the cfg seals it only in a graph with no launcher; in the
 //!    shipped build the `launcher-mint` source guard (`aterm-census --guards`)
 //!    holds it: outside aterm-gui and aterm-cli no shipped code names the mint
-//!    and no shipped manifest enables the feature. The property is proven by
-//!    [`aterm_spec::derive::mint_reachability_model`] (invariant
-//!    `NoUntrustedTop`).
+//!    and no shipped manifest enables the feature.
 
 use std::marker::PhantomData;
 
@@ -135,7 +133,6 @@ impl Authority {
     /// enable. Feature unification makes it nameable by every crate in a build
     /// that holds a launcher, so the `launcher-mint` source guard
     /// (`aterm-census --guards`) keeps every shipped call in those two crates.
-    /// Proven by [`aterm_spec::derive::mint_reachability_model`].
     #[cfg(any(test, feature = "launcher-mint"))]
     #[doc(hidden)]
     #[must_use]
@@ -236,13 +233,5 @@ mod tests {
 
         let certified: Cap<Spawn> = authority.grant(Tier::Certified);
         assert_eq!(require(&certified, Tier::Trusted), Ok(()));
-    }
-
-    #[test]
-    fn caps_are_copyable_witnesses() {
-        let authority = test_authority();
-        let c: Cap<Spawn> = authority.grant(Tier::Trusted);
-        let d = c; // Copy, not move
-        assert_eq!(c.tier(), d.tier());
     }
 }

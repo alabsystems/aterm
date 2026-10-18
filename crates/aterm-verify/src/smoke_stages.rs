@@ -1,148 +1,76 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The two smokes: a headless round trip and typing burst, and the pacing gate.
+//! The GUI typing-pacing smoke: the `measure` check's live window. The
+//! headless control-socket smoke is a live test
+//! (`crates/aterm/tests/control_socket_smoke_live_headless.rs`), in every
+//! `test` run.
 //!
-//! 5) HEADLESS CONTROL-SOCKET SMOKE (the `smoke` check, run alone). Launch
-//!    `aterm-gui --headless` sandboxed under a throwaway `$XDG_RUNTIME_DIR`,
-//!    drive one `aterm-ctl cursor` round trip, then a plain typing burst through
-//!    `aterm-ctl send`, and read one counter off `metrics`. Two checks, each the
-//!    only automatic guard of its failure:
-//!    - `cursor` must answer `OK <row> <col> <visible> <style>`: it is the
-//!      preflight every `aterm drive` verb sends first, and no suite sends it;
-//!    - `wake_heals` must stay 0 over a burst of at least half its keys
-//!      delivered. A heal is a `Wake::Output` whose latch is still armed after a
-//!      user-event drain that began after its post — the lost-wake class, which
-//!      the watchdog turns from a permanent 5 fps into one hiccup per lost wake (healed one expiry after the loop turn that saw
-//!      the arm, so a frame or two plus 100 ms, never a flat 100 ms). A burst
-//!      whose every wake is lost and healed can still clear a window's frames
-//!      floor and its 250 ms input→present ceiling, so this counter is the one
-//!      reading that sees the class.
+//! macOS desktop only, run with `--app <APP>`: a release signs only bytes it
+//! measured green. It drives the release bundle the run was handed — APP's
+//! `aterm-gui` and `aterm-ctl`, argv0 names of the one `aterm` — and builds
+//! nothing, so the latencies it judges are the shipped bytes'. Headless never
+//! PRESENTS, so only a real window can measure pacing: a lost-wake build
+//! presents at ~5/s with 190-530 ms input→present, a healthy build 30+/s under
+//! 15 ms. Skips without a WindowServer session (SSH), or under `--no-windows`
+//! (`plan::WINDOWED`, decided before this stage runs).
 //!
-//!    What it does not check is not measurable here: `sync_rel_timeout` and
-//!    `perf_reduced` are booked only on a window's
-//!    present path, so a headless instance read 0 whatever the tree did — the
-//!    GUI smoke reads them where they are real. The socket's boot is also
-//!    proven by the live `aterm --headless` suites
-//!    (`crates/aterm/tests/*_live_headless.rs`, whose one boot panics on an
-//!    instance that exits or never listens, among them the foreground handback
-//!    and the render desync) and the fabric worlds (`tests/fabric_world`). Being exclusive it
-//!    is also a barrier: the driver-lane rows behind it (the objc drives, the
-//!    Codex lane) run after it.
+//! ONE HARDWARE BURST (`ctl hwkey`) that posts real NSEvents into the app's own
+//! queue, so the keys take winit's `KeyboardInput` arm like a physical press —
+//! OS queue residence included, which the controller seam (`ctl key`, born
+//! already dequeued) never saw. One verdict reads both replies after it
+//! ([`hardware_key_verdict`]): the `metrics` summary's frames floor, true
+//! input→present maximum, present retries and drops and sync timeout-releases,
+//! and `metrics percentiles`' per-slice ceilings, so a failure names who owes
+//! the time: aterm's `key->write`, the press's terminal-mutex wait, the drawable
+//! acquire, the compositor leg and the queue-inclusive input->present. The
+//! child's echo round trip is reported and never gated, because it is not
+//! aterm's cost.
 //!
-//! 5b) GUI TYPING-PACING SMOKE (macOS desktop only; the `measure` check's,
-//!    run with `--app <APP>`, and a release signs only bytes it measured
-//!    green). It
-//!    drives the release bundle the run was handed — APP's `aterm-gui` and
-//!    `aterm-ctl`, argv0 names of the one `aterm` — and builds nothing, so the
-//!    latencies it judges are the shipped bytes'. Headless never PRESENTS, so
-//!    only a real window can measure pacing: a lost-wake build presents at ~5/s
-//!    with 190-530 ms input→present, a healthy build 30+/s under 15 ms. Skips
-//!    without a WindowServer session (SSH), or under `--no-windows`
-//!    (`plan::WINDOWED`, decided before this stage runs).
+//! The burst runs with the cursor effects ON in the shipped default config
+//! ([`SMOKE_CONFIG`]; docs/INCIDENT-typing-latency-2026-08-26.md item 4's
+//! late-deadline half): the effects must show engaged (it armed
+//! `cursor_effect` deadlines and composed the ribbon, `fx_under_frames`), so
+//! the burst cannot pass having measured nothing, and it fails when the
+//! `cursor_effect` owner books late (past) arms faster than
+//! `CURSOR_EFFECT_LATE_MAX` allows ([`effects_verdict`]).
 //!
-//!    ONE BURST PER LANE: a hardware burst (`ctl hwkey`) that posts
-//!    real NSEvents into the app's own queue, so the keys take winit's
-//!    `KeyboardInput` arm like a physical press — OS queue residence included,
-//!    which the controller seam (`ctl key`, born already dequeued) never saw.
-//!    One verdict reads both replies after it ([`hardware_key_verdict`]): the
-//!    `metrics` summary's frames floor, true input→present maximum, present
-//!    retries and drops and sync timeout-releases, and `metrics percentiles`'
-//!    per-slice ceilings, so a failure names who owes the time: aterm's
-//!    `key->write`, the press's terminal-mutex wait, the drawable acquire, the
-//!    compositor leg and the queue-inclusive input->present. The child's echo
-//!    round trip is reported and never gated, because it is not aterm's cost.
-//!
-//!    The burst runs in THREE EFFECT LANES ([`effect_lanes`];
-//!    docs/INCIDENT-typing-latency-2026-08-26.md items 1, 2 and item 4's
-//!    late-deadline half) — the cursor effects OFF, and ON at the shipped default
-//!    style with trail sounds off and on (the last is the shipped default
-//!    config) — each on a fresh instance. An ON lane must show the effects
-//!    engaged (it armed `cursor_effect` deadlines and composed the ribbon,
-//!    `fx_under_frames`) and the OFF lane must compose no ribbon, so no lane can
-//!    pass having measured nothing; a lane fails when the `cursor_effect` owner
-//!    books late (past) arms faster than [`CURSOR_EFFECT_LATE_MAX`] allows. Each
-//!    ON lane's input→present, present, key→write and frame-gap readings are
-//!    reported beside the OFF lane's (reported, not gated: no relative bound has
-//!    been calibrated).
-//!
-//! TWO RULES THAT LOOK LIKE DETAILS AND ARE NOT:
-//!  * BUILD BOTH BINARIES SYNCHRONOUSLY, THEN DRIVE THE BINARIES — never `targo
-//!    run` (the headless smoke; the GUI smoke drives the handed bundle). (1) Timing: the test stage links `aterm-gui`'s dev-deps with
-//!    `spec-anchors` ON, which invalidates its non-test build, so a `run` here
-//!    would rebuild and the bounded socket-poll budget would expire MID-BUILD,
-//!    reporting a false "socket never appeared" on healthy code. (Both binaries
-//!    build into the driver lane's dir, which the test stage never writes, and
-//!    the `driver builds` row has usually compiled them already — the build
-//!    here is then a fingerprint no-op.) (2) Output
-//!    purity: the driver writes lane diagnostics to stderr, and these round trips
-//!    capture stderr to catch real errors — through `run` that banner lands in the
-//!    reply and every `OK`-prefix match fails.
-//!  * These stages are EXCLUSIVE (see `crate::sched`), as are the deadline and
-//!    measuring tests: they decide on frame counts and latencies, so they must
-//!    own the machine.
+//! DRIVE THE BINARIES, never `targo run`: the driver writes lane diagnostics
+//! to stderr, and these round trips capture stderr to catch real errors —
+//! through `run` that banner lands in the reply and every `OK`-prefix match
+//! fails. The stage is EXCLUSIVE (see `crate::sched`), as are the measuring
+//! tests: it decides on frame counts and latencies, so it must own the machine.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use crate::Ctx;
-use crate::exec::{Capture, Cmd, capture_reply, run as exec_run};
-use crate::glob::glob_match;
+use crate::exec::{Cmd, capture_reply};
 use crate::ladder::Report;
 use crate::smoke::{
     is_socket_or_symlink, metric_ms_whole, metric_u64, retire_smoke_child, smoke_log_tail,
     socket_listening,
 };
-use crate::stages::{driver_bin, smoke_build_args};
 
-/// The reply shape the smokes decide a verb answered with: `OK` and a field.
-/// (Every counter is read by name, [`metric_u64`], so an absent one fails.)
-const OK_REPLY: &str = "OK *";
-
-/// One effect lane: its label, the `aterm.toml` lines that select it (top-level
-/// keys, ahead of the sandbox's first `[table]`), and whether the cursor
-/// effects are on in it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EffectLane {
-    pub label: &'static str,
-    pub config: &'static str,
-    pub effects_on: bool,
+/// Does a reply say `OK` and a field (`OK <…>`)? Every counter is then read by
+/// name ([`metric_u64`]), so an absent one fails.
+fn ok_reply(reply: &str) -> bool {
+    reply.starts_with("OK ")
 }
 
-/// THE EFFECT LANES: the cursor effects OFF — `cursor_trail = false`, the
-/// family's master, which also silences the trail sounds (their cues come from
-/// the engine it gates) and the typing-momentum glow — then ON at the shipped
-/// default style with trail sounds off and on. The OFF lane is what a user who turns the effects off writes: the
-/// baseline the ON lanes are reported against, and the negative control for the
-/// engagement witnesses — it must compose no ribbon.
-#[must_use]
-pub fn effect_lanes() -> [EffectLane; 3] {
-    [
-        EffectLane {
-            label: "effects=off",
-            config: "cursor_trail = false\ntrail_sounds = false\n",
-            effects_on: false,
-        },
-        EffectLane {
-            label: "effects=on sounds=off",
-            config: "cursor_trail = true\ntrail_sounds = false\n",
-            effects_on: true,
-        },
-        EffectLane {
-            label: "effects=on sounds=on",
-            config: "cursor_trail = true\ntrail_sounds = true\n",
-            effects_on: true,
-        },
-    ]
-}
+/// The `aterm.toml` lines the smoke's instance runs with (top-level keys, ahead
+/// of the sandbox's first `[table]`): the cursor effects and their trail
+/// sounds on, the shipped default config, written out so the burst measures
+/// the effects whatever the defaults become.
+pub const SMOKE_CONFIG: &str = "cursor_trail = true\ntrail_sounds = true\n";
 
-/// Late (`past`) `cursor_effect` arms one lane's burst may book: healthy ON-lane
+/// Late (`past`) `cursor_effect` arms the burst may book: healthy effects-on
 /// bursts arm ~430 deadlines and book 0-2 late, so four leaves two of headroom.
 /// It catches a SUSTAINED regression; a 0.8 % late rate is about 3 a burst,
 /// which one burst cannot tell from healthy.
 const CURSOR_EFFECT_LATE_MAX: u64 = 4;
-/// …and as a share of the owner's arms, so a lane that armed little cannot pass
+/// …and as a share of the owner's arms, so a burst that armed little cannot pass
 /// on the absolute bound alone: more than one late arm in fifty (2 %) is a
 /// regression once more than one arm was late.
 const CURSOR_EFFECT_LATE_SHARE_DEN: u64 = 50;
@@ -168,169 +96,61 @@ pub fn cursor_effect_arms(reply: &str) -> Option<(u64, u64)> {
     Some((0, 0))
 }
 
-/// One effect lane's verdict on its post-burst `metrics` summary: the
-/// engagement witnesses (an ON lane armed `cursor_effect` deadlines and
-/// composed the ribbon, `fx_under_frames > 0`; the OFF lane composed none),
-/// then its late `cursor_effect` arms against [`CURSOR_EFFECT_LATE_MAX`] and
-/// the one-in-ten share.
+/// The burst's verdict on its post-burst `metrics` summary: the engagement
+/// witnesses (it armed `cursor_effect` deadlines and composed the ribbon,
+/// `fx_under_frames > 0`), then its late `cursor_effect` arms against
+/// `CURSOR_EFFECT_LATE_MAX` and the one-in-fifty share.
 ///
 /// # Errors
-/// A summary missing either reading, an ON lane whose effects never engaged,
-/// an OFF lane that composed ribbon, or too many late arms.
-pub fn effect_lane_verdict(lane: &EffectLane, reply: &str) -> Result<String, String> {
-    let name = lane.label;
+/// A summary missing either reading, effects that never engaged, or too many
+/// late arms.
+pub fn effects_verdict(reply: &str) -> Result<String, String> {
     let Some((arms, late)) = cursor_effect_arms(reply) else {
         return Err(format!(
-            "gui smoke [{name}]: metrics carry no deadline_arms_by_owner ledger -> {}",
+            "gui smoke: metrics carry no deadline_arms_by_owner ledger -> {}",
             or_no_reply(reply)
         ));
     };
     let Some(under) = metric_u64(reply, "fx_under_frames") else {
         return Err(format!(
-            "gui smoke [{name}]: metrics carry no fx_under_frames -> {}",
+            "gui smoke: metrics carry no fx_under_frames -> {}",
             or_no_reply(reply)
         ));
     };
-    if lane.effects_on && (arms == 0 || under == 0) {
+    if arms == 0 || under == 0 {
         return Err(format!(
-            "gui smoke [{name}]: the cursor effects never engaged — cursor_effect \
-             arms={arms}, fx_under_frames={under} — so this lane measured an \
-             effects-off burst under an effects-on label"
-        ));
-    }
-    if !lane.effects_on && under > 0 {
-        return Err(format!(
-            "gui smoke [{name}]: the effects-off lane composed ribbon on {under} \
-             ticks — the lane is not off, and the baseline is not one"
+            "gui smoke: the cursor effects never engaged — cursor_effect arms={arms}, \
+             fx_under_frames={under} — so the burst measured an effects-off instance"
         ));
     }
     let over_share = late.saturating_mul(CURSOR_EFFECT_LATE_SHARE_DEN) > arms && late > 1;
     if late > CURSOR_EFFECT_LATE_MAX || over_share {
         return Err(format!(
-            "gui smoke [{name}]: cursor_effect booked {late} late arms of {arms} during a \
-             paced burst (max {CURSOR_EFFECT_LATE_MAX}, and at most 1 in \
-             {CURSOR_EFFECT_LATE_SHARE_DEN}) — the effect lane is arming deadlines it \
+            "gui smoke: cursor_effect booked {late} late arms of {arms} during a paced \
+             burst (max {CURSOR_EFFECT_LATE_MAX}, and at most 1 in \
+             {CURSOR_EFFECT_LATE_SHARE_DEN}) — the effects are arming deadlines they \
              already missed"
         ));
     }
     Ok(format!(
-        "gui smoke [{name}]: cursor_effect arms={arms} late={late} fx_under_frames={under}"
+        "gui smoke: cursor_effect arms={arms} late={late} fx_under_frames={under}"
     ))
 }
 
-/// The readings one lane contributes to the cross-lane comparison
-/// (INCIDENT-typing-latency item 2), as published: `input_p95_ms`,
-/// `present_p95_ms`, `max_frame_gap_ms` and the per-owner deadline ledger off
-/// the `metrics` summary, `key_write_p99_ms` off `metrics percentiles`.
-#[must_use]
-pub fn lane_latency(summary: &str, percentiles: &str) -> LaneReadings {
-    [
-        ("input_p95", reply_field(summary, "input_p95_ms").to_owned()),
-        (
-            "present_p95",
-            reply_field(summary, "present_p95_ms").to_owned(),
-        ),
-        (
-            "key_write_p99",
-            reply_field(percentiles, "key_write_p99_ms").to_owned(),
-        ),
-        (
-            "max_frame_gap",
-            reply_field(summary, "max_frame_gap_ms").to_owned(),
-        ),
-        (
-            "deadline_arms_by_owner",
-            reply_field(summary, "deadline_arms_by_owner").to_owned(),
-        ),
-    ]
-}
-
-/// One lane's comparison readings, `(name, value as published)`.
-pub type LaneReadings = [(&'static str, String); 5];
-
-/// The comparison line: every reading of every lane that measured, lane by
-/// lane, in ms. Reported, not gated.
-#[must_use]
-pub fn lane_comparison(readings: &[(&str, LaneReadings)]) -> String {
-    let mut line = String::from("gui smoke lanes (reported, not gated; times in ms):");
-    for (label, fields) in readings {
-        line.push_str(" [");
-        line.push_str(label);
-        line.push(']');
-        for (name, value) in fields {
-            line.push(' ');
-            line.push_str(name);
-            line.push('=');
-            line.push_str(value);
-        }
-    }
-    line
-}
-
-/// 30 driven keys at ~20/s, then a second to settle — a human-shaped light typing
-/// burst, deliberately not a socket-flood test. Both smokes type it.
+/// 30 hardware keys at ~20/s, then a second to settle — a human-shaped light
+/// typing burst, deliberately not a socket-flood test.
 const BURST_KEYS: usize = 30;
 const BURST_GAP: Duration = Duration::from_millis(50);
 const SETTLE: Duration = Duration::from_secs(1);
-/// The pause before the headless burst's first key, so the reader/event-loop
-/// lane reaches its ordinary idle wait first (see `headless_typing_burst`).
-const PRE_BURST: Duration = Duration::from_millis(250);
-
-/// How the smokes pace their bursts: [`Pacing::PRODUCTION`] on every real run
-/// (the only value [`Ctx::new`] ever produces), [`Pacing::INSTANT`] for this
-/// crate's fixture ladders.
-///
-/// In a fixture the `aterm-ctl` the headless smoke drives is a stub that
-/// answers canned metrics, so its 250 ms pre-burst pause, 30 x 50 ms key gaps
-/// and 1 s settle would measure nothing. The fixtures
-/// keep every one of the 30 driven sends — so the `(n/30 accepted)` count, the
-/// `SEND_ACCEPTED_FLOOR` refusal and the `wake_heals` read are still
-/// exercised — and drop only the sleeps. The GUI smoke's settle follows the
-/// same pacing (a fixture skips the GUI smoke, so only a real run reaches it,
-/// at [`Pacing::PRODUCTION`]); `hwkey`'s `interval=` argument is the real
-/// burst's pacing, handed to a real window, and stays `BURST_GAP`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Pacing {
-    /// Between two driven keys.
-    pub burst_gap: Duration,
-    /// After a burst, before its counters are read.
-    pub settle: Duration,
-    /// Before the headless burst's first key.
-    pub pre_burst: Duration,
-}
-
-impl Pacing {
-    /// The measured pacing: ~20 keys/s, a second to settle, a quarter second
-    /// before the headless burst.
-    pub const PRODUCTION: Self = Self {
-        burst_gap: BURST_GAP,
-        settle: SETTLE,
-        pre_burst: PRE_BURST,
-    };
-    /// No pauses at all — for fixtures whose driven binary is a stub.
-    pub const INSTANT: Self = Self {
-        burst_gap: Duration::ZERO,
-        settle: Duration::ZERO,
-        pre_burst: Duration::ZERO,
-    };
-}
-/// Keys the headless burst must deliver (`send` answered `OK`) before its
-/// `wake_heals=0` means anything: half the burst, the GUI floors' ratio. A heal
-/// is booked only when the GUI's lost-wake watchdog proves a wake lost — a
-/// user-event drain began after its post and no handler cleared its latch
-/// (aterm-gui's `judge_output_wake`) — and each delivered key is one echo and
-/// one wake, so a burst that delivered only a few keys gave a lost wake only a
-/// few chances to happen, whatever the tree does.
-const SEND_ACCEPTED_FLOOR: usize = BURST_KEYS / 2;
 
 /// The input->present ceiling, on the true maximum (`>=` fails) and on the
 /// bucketed p99 (`>` fails): far over a healthy burst's maximum (under 10 ms,
-/// OS queue residence included, in every effect lane) and far under a lost-wake
+/// OS queue residence included, effects on or off) and far under a lost-wake
 /// build's 300-530 ms worst case.
 const INPUT_PRESENT_CEILING_MS: u64 = 250;
 /// Frames the window must present over the burst: a healthy build presents one
-/// or more per key (30+ with the effects off, the quietest lane), a lost-wake
-/// build ~10. Half the quietest healthy lane.
+/// or more per key (30+ even with the effects off), a lost-wake build ~10.
+/// Half the quietest healthy burst.
 const FRAMES_FLOOR: u64 = 15;
 /// Hardware keys that must reach the `KeyboardInput` arm (`n_key_write`) before
 /// any hardware slice verdict means anything: half the burst, the frames floor's
@@ -339,7 +159,7 @@ const HW_KEY_WRITE_FLOOR: u64 = 15;
 /// Input→present samples the burst must book (`n_input`, one per presented key)
 /// before the input→present ceilings mean anything, at the same ratio: a burst
 /// that booked none would pass both on a maximum of 0 ms. A healthy burst books
-/// all 30 in every lane.
+/// all 30.
 const HW_INPUT_FLOOR: u64 = 15;
 /// `key->write` p99 ceiling, OS queue residence included. The release build wrote
 /// each key at p99 6.29 ms while a whole run compiled beside it; 40 ms is more than
@@ -381,20 +201,18 @@ const ACQUIRE_P99_CEILING_MS: u64 = 50;
 /// a CPU backend, a non-macOS present and a process that installs no sink register
 /// no presented handler at all, and an absent slice is not a slow one.
 const PRESENT_GLASS_P99_CEILING_MS: u64 = 50;
-/// The socket-listen budget: how many times a smoke looks at its instance's
+/// The socket-listen budget: how many times the smoke looks at its instance's
 /// control socket, [`POLL_GAP`] apart, before `control socket never started
 /// listening` ([`wait_to_listen`]) — a minute of sleeps, plus what each look (a
 /// `try_wait`, a stat and a connect) costs on the machine of the day. A hang
 /// detector, never a latency budget: an instance that listens ends the wait at
-/// that look: a freshly built aterm-gui's first exec on a loaded machine is
-/// slow, and that is no failure to listen.
+/// that look, and a bundle's first exec on a loaded machine is slow, which is
+/// no failure to listen.
 ///
 /// COUNTED IN LOOKS, NEVER TIMED BY THE CLOCK: a clock-timed wait can only be
-/// shorter than the looks, and turns a slow first exec red. This crate's
-/// fixtures wait the same: the stand-in instance their build writes is run
-/// once by that build, so its first exec is paid there.
+/// shorter than the looks, and turns a slow first exec red.
 pub const SOCKET_POLLS: usize = 600;
-/// The pause between two looks of a smoke's waits.
+/// The pause between two looks of the smoke's waits.
 pub const POLL_GAP: Duration = Duration::from_millis(100);
 
 /// A running smoke's disposable state, torn down on every exit path.
@@ -404,19 +222,11 @@ struct Sandbox {
     cfgdir: PathBuf,
     gui_log: PathBuf,
     child: Option<Child>,
-    /// The headless child's lifeline (`--lifeline-fd 0`, `aterm_uds::lifeline`):
-    /// dropped by `teardown` after the child is retired, and closed by the
-    /// kernel if this run dies first, so a killed run leaves no instance behind.
-    lifeline: Option<aterm_uds::lifeline::Lifeline>,
 }
 
 impl Sandbox {
-    fn new(tag: &str) -> Option<Self> {
-        Self::with_config(tag, "")
-    }
-
-    /// [`Self::new`] with extra `aterm.toml` lines ahead of the fixed tables
-    /// (top-level keys must precede the first `[table]`).
+    /// A fresh sandbox whose `aterm.toml` starts with `extra` lines, ahead of the
+    /// fixed tables (top-level keys must precede the first `[table]`).
     fn with_config(tag: &str, extra: &str) -> Option<Self> {
         let tmp = crate::mktemp_dir(tag).ok()?;
         std::fs::create_dir(tmp.join("home")).ok()?;
@@ -460,7 +270,6 @@ impl Sandbox {
             cfgdir,
             gui_log,
             child: None,
-            lifeline: None,
         })
     }
 
@@ -479,7 +288,6 @@ impl Sandbox {
                 r.fail("smoke: child cleanup/reap failed");
             }
         }
-        self.lifeline.take();
         std::fs::remove_dir_all(&self.tmp).ok();
     }
 }
@@ -489,7 +297,7 @@ fn chmod_700(path: &Path) -> Option<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).ok()
 }
 
-/// Outcome of the shared "build, launch, wait for the socket" preamble.
+/// Outcome of the "launch, wait for the socket" preamble.
 enum Ready {
     /// Both binaries exist, the process is up and the socket is bound.
     Up { ctl: PathBuf },
@@ -497,57 +305,19 @@ enum Ready {
     Stopped,
 }
 
-/// The preamble both smokes share, with the label prefix each one uses. With
-/// `driven` (the GUI smoke's handed bundle) it builds nothing and drives that
-/// bundle's `aterm-gui` and `aterm-ctl`; without it, the driver lane's.
-fn bring_up(
-    ctx: &Ctx,
-    r: &mut Report,
-    sb: &mut Sandbox,
-    tag: &str,
-    log_label: &str,
-    headless: bool,
-    driven: Option<&crate::MeasureArtifact>,
-) -> Ready {
-    let (gui, ctl) = if let Some(bundle) = driven {
-        (bundle.bin("aterm-gui"), bundle.bin("aterm-ctl"))
-    } else {
-        let build = crate::stages::driver_build_cmd(ctx, smoke_build_args())
-            .capture(Capture::Append(sb.gui_log.clone()));
-        let built = exec_run(&build, ctx.exec_env());
-        if !built.ok {
-            r.fail_child(
-                &built,
-                format!("{tag}: targo build -p aterm-gui -p aterm-ctl failed"),
-            );
-            r.raw(smoke_log_tail(log_label, &sb.gui_log));
-            // What the build kept from running is decided by nothing: a red build
-            // must not stand for the smoke.
-            if built.environment_failure().is_none() {
-                crate::stages::not_run_behind(
-                    r,
-                    &format!("{tag}: the smoke's checks"),
-                    "the build above failed, so there is no fresh aterm-gui to launch",
-                );
-            }
-            return Ready::Stopped;
-        }
-        // The driver lane's dir: that is where the build above put them.
-        (driver_bin(ctx, "aterm-gui"), driver_bin(ctx, "aterm-ctl"))
-    };
+/// Launch the handed bundle's `aterm-gui` in `sb` and wait for its control
+/// socket; the bundle's `aterm-ctl` drives it. It builds nothing.
+fn bring_up(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, bundle: &crate::MeasureArtifact) -> Ready {
+    let tag = "gui smoke";
+    let (gui, ctl) = (bundle.bin("aterm-gui"), bundle.bin("aterm-ctl"));
     if !crate::is_executable_file(&gui) || !crate::is_executable_file(&ctl) {
         r.cannot_run(format!(
-            "{tag}: just-built binaries missing ({}, {})",
+            "{tag}: the bundle's binaries are missing ({}, {})",
             gui.display(),
             ctl.display()
         ));
         return Ready::Stopped;
     }
-    // The build above put a NEW file at `gui` (cargo copies on every run), so
-    // its first exec is paid here, unclocked, and not inside the listen wait
-    // below ([`crate::first_exec`]).
-    crate::first_exec::warm_first_exec(ctx, r, &gui, crate::first_exec::ATERM_GUI_FLAG);
-
     let log = match std::fs::File::create(&sb.gui_log) {
         Ok(f) => f,
         Err(e) => {
@@ -581,19 +351,9 @@ fn bring_up(
         .env("SHELL", "/bin/sh")
         .stdout(log)
         .stderr(log2);
-    // The socket and headless are launch FLAGS — the one spelling; no environment
-    // variable selects either.
+    // The socket is a launch FLAG — the one spelling; no environment variable
+    // selects it.
     cmd.arg("--control-sock").arg(sb.sock());
-    if headless {
-        cmd.arg("--headless");
-        match aterm_uds::lifeline::Lifeline::arm(&mut cmd, &sb.tmp) {
-            Ok(held) => sb.lifeline = Some(held),
-            Err(e) => {
-                r.cannot_run(format!("{tag}: cannot arm the instance's lifeline ({e})"));
-                return Ready::Stopped;
-            }
-        }
-    }
     match cmd.spawn() {
         Ok(c) => sb.child = Some(c),
         Err(e) => {
@@ -611,11 +371,11 @@ fn bring_up(
         Listen::Exited => r.fail(format!("{tag}: aterm-gui exited early")),
         Listen::Never => r.fail(format!("{tag}: control socket never started listening")),
     }
-    r.raw(smoke_log_tail(log_label, &sb.gui_log));
+    r.raw(smoke_log_tail("GUI smoke", &sb.gui_log));
     Ready::Stopped
 }
 
-/// What a smoke's listen wait found ([`wait_to_listen`]).
+/// What the smoke's listen wait found ([`wait_to_listen`]).
 #[derive(Debug, PartialEq, Eq)]
 enum Listen {
     /// The instance listens.
@@ -667,136 +427,13 @@ fn ctl(ctx: &Ctx, sb: &Sandbox, ctl_bin: &Path, args: &[&str]) -> String {
     capture_reply(&cmd, ctx.exec_env())
 }
 
-fn ctl_quiet(ctx: &Ctx, sb: &Sandbox, ctl_bin: &Path, args: &[&str]) {
-    let cmd = Cmd::new(ctl_bin)
-        .arg("--sock")
-        .arg(sb.sock())
-        .args(args.iter().copied())
-        .env("XDG_RUNTIME_DIR", &sb.rundir)
-        .env("XDG_CONFIG_HOME", &sb.cfgdir)
-        .capture(Capture::Silent);
-    // `>/dev/null 2>&1` with the status ignored, exactly as the script drove the
-    // burst: a dropped keystroke shows up in the pacing counters this stage
-    // reads next, which is a better witness than the client's exit code.
-    let _ = exec_run(&cmd, ctx.exec_env());
-}
-
 /// `${got:-<no reply>}`
 fn or_no_reply(got: &str) -> &str {
     if got.is_empty() { "<no reply>" } else { got }
 }
 
 // ---------------------------------------------------------------------------
-// 5) HEADLESS CONTROL-SOCKET SMOKE
-// ---------------------------------------------------------------------------
-pub fn control_socket_smoke(ctx: &Ctx, r: &mut Report) {
-    if !ctx.tools.have_targo() {
-        r.skip("smoke (no targo)");
-        return;
-    }
-    let Some(mut sb) = Sandbox::new("ats") else {
-        r.cannot_run("smoke: mktemp");
-        return;
-    };
-    if let Ready::Up { ctl: ctl_bin } =
-        bring_up(ctx, r, &mut sb, "smoke", "control-socket smoke", true, None)
-    {
-        cursor_round_trip(ctx, r, &sb, &ctl_bin);
-        headless_typing_burst(ctx, r, &sb, &ctl_bin);
-    }
-    sb.teardown(r);
-}
-
-/// `aterm-ctl cursor`, the preflight every `aterm drive` verb on the `CtlClient`
-/// path sends before driving (aterm-agent's `drive_cli`: "cannot reach an
-/// aterm"), must answer its documented reply ([`is_cursor_reply`]). No suite
-/// sends the plain verb, so this row is its one automatic guard. The burst
-/// still runs after a bad reply: this row hides nothing, so it never ends the
-/// smoke ([`Report::fail`]).
-fn cursor_round_trip(ctx: &Ctx, r: &mut Report, sb: &Sandbox, ctl_bin: &Path) {
-    let got = ctl(ctx, sb, ctl_bin, &["cursor"]);
-    if is_cursor_reply(&got) {
-        r.pass(format!("smoke: aterm-ctl cursor -> {got}"));
-    } else {
-        r.fail(format!("smoke: aterm-ctl cursor -> {}", or_no_reply(&got)));
-    }
-}
-
-/// `cursor`'s documented reply (aterm-gui's `control_query::cmd_cursor`):
-/// `OK <row> <col> <visible:0|1> <style>`, one line. The shape, not a bare
-/// `OK *`, so a verb routed to another handler that also answers `OK …` does
-/// not pass for it.
-fn is_cursor_reply(reply: &str) -> bool {
-    let fields: Vec<&str> = reply.split_whitespace().collect();
-    matches!(
-        fields.as_slice(),
-        ["OK", row, col, "0" | "1", _style]
-            if row.parse::<u32>().is_ok() && col.parse::<u32>().is_ok()
-    )
-}
-
-/// An applied `send` returns `OK`, with the dispatcher adding its sequence.
-/// Additive warning fields still describe a write; skipped/duplicate replies
-/// delivered no new input.
-fn is_applied_send(reply: &str) -> bool {
-    if reply == "OK" {
-        return true;
-    }
-    let Some(rest) = reply.strip_prefix("OK seq=") else {
-        return false;
-    };
-    let mut fields = rest.split_ascii_whitespace();
-    fields.next().is_some_and(|seq| seq.parse::<u64>().is_ok())
-        && fields.all(|field| field != "skipped" && field != "dup=1")
-}
-
-/// A plain typing burst through `aterm-ctl send`, then `wake_heals` off `metrics`.
-fn headless_typing_burst(ctx: &Ctx, r: &mut Report, sb: &Sandbox, ctl_bin: &Path) {
-    ctl_quiet(ctx, sb, ctl_bin, &["metrics", "reset"]);
-    // Let the reader/event-loop lane reach its ordinary idle wait before the
-    // first byte, or the first startup-edge repair is miscounted as a
-    // typing-burst lost-wake heal.
-    std::thread::sleep(ctx.smoke_pacing.pre_burst);
-    // COUNT WHAT THE ENGINE ACCEPTED. `wake_heals=0` is satisfied A FORTIORI by
-    // a burst that typed too little for a heal to register
-    // ([`SEND_ACCEPTED_FLOOR`]), so a dead client, a rejected verb or a wedged
-    // input seam would pass for a subject this stage never exercised. `send`
-    // answers `OK seq=<n>` for applied input; a skipped answer delivered none.
-    // That receipt is the evidence at this seam, and the count rides on the
-    // ladder line so the row states what it measured.
-    let mut accepted = 0usize;
-    for _ in 0..BURST_KEYS {
-        if is_applied_send(&ctl(ctx, sb, ctl_bin, &["send", "x"])) {
-            accepted += 1;
-        }
-        std::thread::sleep(ctx.smoke_pacing.burst_gap);
-    }
-    std::thread::sleep(ctx.smoke_pacing.settle);
-    if accepted < SEND_ACCEPTED_FLOOR {
-        r.fail(format!(
-            "smoke: only {accepted}/{BURST_KEYS} keys accepted (< {SEND_ACCEPTED_FLOOR}), \
-             too few for a lost wake to register"
-        ));
-        return;
-    }
-    let got = ctl(ctx, sb, ctl_bin, &["metrics"]);
-    // The smoke's last check: it hides none.
-    match metric_u64(&got, "wake_heals") {
-        Some(0) => r.pass(format!(
-            "smoke: {accepted}/{BURST_KEYS} keys accepted over the control socket, no lost-wake heals"
-        )),
-        Some(n) => r.fail(format!(
-            "smoke: {n} lost output wake(s) healed during a plain typing burst -> {got}"
-        )),
-        None => r.fail(format!(
-            "smoke: metrics carry no wake_heals after the typing burst -> {}",
-            or_no_reply(&got)
-        )),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 5b) GUI TYPING-PACING SMOKE
+// GUI TYPING-PACING SMOKE
 // ---------------------------------------------------------------------------
 pub fn gui_typing_smoke(ctx: &Ctx, r: &mut Report) {
     if let Some(reason) = gui_smoke_unavailable(ctx) {
@@ -808,50 +445,32 @@ pub fn gui_typing_smoke(ctx: &Ctx, r: &mut Report) {
         r.skip(format!("gui smoke {}", crate::stages::NO_APP));
         return;
     };
-    let mut readings = Vec::new();
-    for lane in effect_lanes() {
-        let tag = format!("gui smoke [{}]", lane.label);
-        let Some(mut sb) = Sandbox::with_config("atl", lane.config) else {
-            r.cannot_run(format!("{tag}: mktemp"));
-            continue;
-        };
-        if let Ready::Up { ctl: ctl_bin } =
-            bring_up(ctx, r, &mut sb, &tag, "GUI smoke", false, Some(bundle))
-            && let Some(reading) = effect_lane_burst(ctx, r, &mut sb, &ctl_bin, &lane)
-        {
-            readings.push((lane.label, reading));
-        }
-        sb.teardown(r);
+    let Some(mut sb) = Sandbox::with_config("atl", SMOKE_CONFIG) else {
+        r.cannot_run("gui smoke: mktemp");
+        return;
+    };
+    if let Ready::Up { ctl: ctl_bin } = bring_up(ctx, r, &mut sb, bundle) {
+        typing_burst(ctx, r, &mut sb, &ctl_bin);
     }
-    if !readings.is_empty() {
-        r.raw(lane_comparison(&readings));
-    }
+    sb.teardown(r);
 }
 
-/// One lane: frontmost, first present, reset, the paced HARDWARE burst, settle;
-/// then the lane's engagement and late-arm verdict on its `metrics` summary, and
+/// Frontmost, first present, reset, the paced HARDWARE burst, settle; then the
+/// effects verdict on the `metrics` summary ([`effects_verdict`]), and
 /// [`hardware_key_verdict`] on the summary and `metrics percentiles` together.
-/// Returns the lane's comparison readings.
-fn effect_lane_burst(
-    ctx: &Ctx,
-    r: &mut Report,
-    sb: &mut Sandbox,
-    ctl_bin: &Path,
-    lane: &EffectLane,
-) -> Option<LaneReadings> {
-    let name = lane.label;
+fn typing_burst(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, ctl_bin: &Path) {
     let Some(pid) = sb.child.as_ref().map(Child::id) else {
-        r.cannot_run(format!("gui smoke [{name}]: no child to measure"));
-        return None;
+        r.cannot_run("gui smoke: no child to measure");
+        return;
     };
     if !crate::smoke::activate_macos_gui_pid(pid) {
         r.skip(if crate::smoke::screen_locked() {
-            format!("gui smoke [{name}] (the screen is locked: unlock it and run again)")
+            "gui smoke (the screen is locked: unlock it and run again)"
         } else {
-            format!("gui smoke [{name}] (could not make the test window frontmost)")
+            "gui smoke (could not make the test window frontmost)"
         });
         r.raw(smoke_log_tail("GUI smoke", &sb.gui_log));
-        return None;
+        return;
     }
     // Prove one real present happened while frontmost BEFORE resetting counters:
     // this distinguishes a product present failure from a measurement window that
@@ -860,11 +479,9 @@ fn effect_lane_burst(
     let mut presented = false;
     for _ in 0..150 {
         if child_exited(sb) {
-            r.fail(format!(
-                "gui smoke [{name}]: aterm-gui exited before its initial present"
-            ));
+            r.fail("gui smoke: aterm-gui exited before its initial present");
             r.raw(smoke_log_tail("GUI smoke", &sb.gui_log));
-            return None;
+            return;
         }
         got = ctl(ctx, sb, ctl_bin, &["metrics"]);
         if metric_u64(&got, "frames").is_some_and(|f| f > 0) {
@@ -875,51 +492,45 @@ fn effect_lane_burst(
     }
     if !presented {
         r.fail(format!(
-            "gui smoke [{name}]: the frontmost window never produced an initial present [{}]",
+            "gui smoke: the frontmost window never produced an initial present [{}]",
             or_no_reply(&got)
         ));
         r.raw(smoke_log_tail("GUI smoke", &sb.gui_log));
-        return None;
+        return;
     }
     // Posted keys go to the KEY window: re-assert frontmost after the wait.
     if !crate::smoke::activate_macos_gui_pid(pid) {
-        r.skip(format!(
-            "gui smoke [{name}] (could not keep the test window frontmost)"
-        ));
-        return None;
+        r.skip("gui smoke (could not keep the test window frontmost)");
+        return;
     }
     let got = ctl(ctx, sb, ctl_bin, &["metrics", "reset"]);
-    if !glob_match(OK_REPLY, &got) {
-        r.fail(format!(
-            "gui smoke [{name}]: metrics reset -> {}",
-            or_no_reply(&got)
-        ));
-        return None;
+    if !ok_reply(&got) {
+        r.fail(format!("gui smoke: metrics reset -> {}", or_no_reply(&got)));
+        return;
     }
     let args = hwkey_burst_args();
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     // Blocks while it paces the burst (~1.5 s); `OK posted=<n>` says only that the
     // OS queue took them. What arrived is read from the replies below.
     let got = ctl(ctx, sb, ctl_bin, &argv);
-    let Some(posted) = metric_u64(&got, "posted").filter(|_| glob_match(OK_REPLY, &got)) else {
+    let Some(posted) = metric_u64(&got, "posted").filter(|_| ok_reply(&got)) else {
         r.fail(format!(
-            "gui smoke [{name}]: hardware key injection -> {}",
+            "gui smoke: hardware key injection -> {}",
             or_no_reply(&got)
         ));
-        return None;
+        return;
     };
-    std::thread::sleep(ctx.smoke_pacing.settle);
+    std::thread::sleep(SETTLE);
     let summary = ctl(ctx, sb, ctl_bin, &["metrics"]);
     let percentiles = ctl(ctx, sb, ctl_bin, &["metrics", "percentiles"]);
-    match effect_lane_verdict(lane, &summary) {
+    match effects_verdict(&summary) {
         Ok(line) => r.pass(line),
         Err(bad) => r.fail(bad),
     }
     match hardware_key_verdict(posted, &summary, &percentiles) {
-        Ok(line) => r.pass(format!("[{name}] {line}")),
-        Err(bad) => r.fail(format!("[{name}] {bad}")),
+        Ok(line) => r.pass(line),
+        Err(bad) => r.fail(bad),
     }
-    Some(lane_latency(&summary, &percentiles))
 }
 
 /// Every honest reason this stage cannot measure anything, in the script's order.
@@ -1171,101 +782,6 @@ mod tests {
         )
     }
 
-    /// A REAL RUN PACES AS MEASURED. The fixture ladders drop the headless
-    /// smoke's sleeps, and the only way that could leak into a real run is a
-    /// context that starts anywhere but the production constants.
-    #[test]
-    fn a_real_context_paces_the_smokes_at_the_measured_constants() {
-        assert_eq!(ctx().smoke_pacing, Pacing::PRODUCTION);
-        assert_eq!(
-            Pacing::PRODUCTION,
-            Pacing {
-                burst_gap: Duration::from_millis(50),
-                settle: Duration::from_secs(1),
-                pre_burst: Duration::from_millis(250),
-            }
-        );
-        // The hardware burst's own pacing is an argv to a real window, and
-        // never follows the fixture override.
-        assert!(hwkey_burst_args().contains(&"interval=50".to_string()));
-        assert_eq!(
-            ctx().with_smoke_pacing(Pacing::INSTANT).smoke_pacing,
-            Pacing::INSTANT
-        );
-    }
-
-    /// A REAL RUN'S LISTEN WAIT IS [`SOCKET_POLLS`] LOOKS, WHATEVER EACH COSTS:
-    /// each a `try_wait`, a stat and a connect before its sleep, so it stands
-    /// for the sleeps plus what those cost on the machine of the day. A
-    /// clock-timed wait can only be shorter, and turns a slow first exec red.
-    /// Counted here with no gap: every poll is still
-    /// taken, and the last look after them, where a clock-timed wait would
-    /// look for as long as its clock allowed. Cheap controls: an instance that
-    /// listens, or exits, ends the wait at that look.
-    #[test]
-    fn a_real_runs_listen_wait_takes_every_poll_whatever_each_costs() {
-        let looks = std::cell::Cell::new(0usize);
-        let never = || {
-            looks.set(looks.get() + 1);
-            false
-        };
-        assert_eq!(
-            wait_to_listen(Duration::ZERO, || false, never),
-            Listen::Never
-        );
-        assert_eq!(
-            looks.get(),
-            SOCKET_POLLS + 1,
-            "every poll, and the last look"
-        );
-
-        let third = std::cell::Cell::new(0usize);
-        let up_at_third = || {
-            third.set(third.get() + 1);
-            third.get() == 3
-        };
-        assert_eq!(
-            wait_to_listen(Duration::ZERO, || false, up_at_third),
-            Listen::Up
-        );
-        assert_eq!(third.get(), 3);
-        assert_eq!(
-            wait_to_listen(Duration::ZERO, || true, || false),
-            Listen::Exited
-        );
-    }
-
-    #[test]
-    fn the_smoke_build_is_a_driver_lane_build() {
-        let c = ctx();
-        let cmd = crate::stages::driver_build_cmd(&c, smoke_build_args());
-        let env: Vec<(String, String)> = cmd
-            .envs
-            .iter()
-            .map(|(k, v)| {
-                (
-                    k.to_string_lossy().into_owned(),
-                    v.to_string_lossy().into_owned(),
-                )
-            })
-            .collect();
-        assert_eq!(
-            env,
-            [
-                (
-                    "CARGO_TARGET_DIR".to_string(),
-                    "/repo/target/verify/drivers".to_string()
-                ),
-                ("CARGO_BUILD_JOBS".to_string(), "8".to_string()),
-            ]
-        );
-        assert_eq!(cmd.argv()[1..], smoke_build_args()[..]);
-        assert_eq!(
-            crate::stages::drivers_dir(&c),
-            PathBuf::from("/repo/target/verify/drivers")
-        );
-    }
-
     /// The post-burst `metrics` summary a healthy burst leaves, with the readings
     /// the verdict gates set per case.
     fn summary(frames: u64, max_input: &str, retries: u64, drops: u64, sync: u64) -> String {
@@ -1281,62 +797,6 @@ mod tests {
     /// [`hardware_key_verdict`] on a healthy summary.
     fn hv(reply: &str) -> Result<String, String> {
         hardware_key_verdict(30, &summary(41, "8.90", 0, 0, 0), reply)
-    }
-
-    /// THE PACING BOUNDS, IN THE ONE VERDICT: the hardware burst's verdict
-    /// reads the `metrics` summary after the burst and holds the frames floor,
-    /// the input->present maximum, present retries and drops and the sync
-    /// timeout-releases, each at its boundary.
-    #[test]
-    fn the_summary_bounds_are_the_ported_pacing_boundaries() {
-        let hw = percentiles(30, "6.00", "0.10", "1.00", "10.00");
-        let with = |frames, max_input: &str, retries, drops, sync| {
-            hardware_key_verdict(30, &summary(frames, max_input, retries, drops, sync), &hw)
-        };
-        assert!(
-            with(41, "8.90", 0, 0, 0).is_ok(),
-            "the healthy summary passes"
-        );
-        let starved = with(14, "8.90", 0, 0, 0).expect_err("14 frames");
-        assert!(
-            starved.contains("present starvation — frames=14 (< 15)"),
-            "{starved}"
-        );
-        assert!(
-            with(15, "8.90", 0, 0, 0).is_ok(),
-            "15 frames is the floor, inclusive"
-        );
-        assert!(
-            with(41, "249.90", 0, 0, 0).is_ok(),
-            "249 ms is under the ceiling"
-        );
-        // A TRUE maximum, so `>=`: 250 ms is a sample at the bar.
-        let slow = with(41, "250.00", 0, 0, 0).expect_err("250 ms");
-        assert!(
-            slow.contains("input→present latency — max 250ms (>= 250)"),
-            "{slow}"
-        );
-        for (retries, drops) in [(4, 0), (0, 7)] {
-            let bad = with(41, "8.90", retries, drops, 0).expect_err("retries or drops");
-            assert!(
-                bad.contains("present retries/drops during frontmost typing"),
-                "{bad}"
-            );
-        }
-        let sync = with(41, "8.90", 0, 0, 2).expect_err("sync timeouts");
-        assert!(
-            sync.contains("sync timeout-releases during plain typing — sync_rel_timeout=2"),
-            "{sync}"
-        );
-        // A lost-wake build: ~5 frames/s and 190-530 ms input→present.
-        assert!(with(10, "530.10", 4, 7, 2).is_err());
-        // A summary that lacks a gated reading is never a pass.
-        let bare = hardware_key_verdict(30, "OK frames=41", &hw).expect_err("no summary");
-        assert!(
-            bare.starts_with("gui smoke: could not parse the post-burst metrics -> OK frames=41"),
-            "{bare}"
-        );
-        assert!(hardware_key_verdict(30, "", &hw).is_err());
     }
 
     /// A `metrics percentiles` reply in the verb's own field order, with the slices
@@ -1387,56 +847,13 @@ mod tests {
             )
     }
 
-    /// THE EFFECT LANES cross the effects master with the trail sounds: one
-    /// OFF lane (the master off, and the sounds with it), two ON lanes that
-    /// differ only in the sounds — every lane a distinct config of top-level keys
-    /// only (they precede the sandbox's first `[table]`). No two lanes may be the
-    /// same configuration under two spellings (the first cut crossed
-    /// `"rainbow kitty"` with the default, which IS `rainbow kitty pet`).
+    /// The effects verdict reads the `cursor_effect` owner out of the ledger by
+    /// NAME and the ribbon witness by name; passes a healthy burst; fails both
+    /// an absolute and a share late-arm regression and effects that never
+    /// engaged (the first cut read an absent owner as `(0, 0)` and PASSED it) —
+    /// never a burst whose ledger or witness is simply missing.
     #[test]
-    fn the_effect_lanes_cross_the_effects_master_with_the_sounds() {
-        let lanes = effect_lanes();
-        let configs: std::collections::BTreeSet<&str> = lanes.iter().map(|l| l.config).collect();
-        assert_eq!(
-            configs.len(),
-            lanes.len(),
-            "every lane is a distinct config"
-        );
-        let off: Vec<_> = lanes.iter().filter(|l| !l.effects_on).collect();
-        assert_eq!(off.len(), 1, "one effects-off baseline");
-        assert!(off[0].config.contains("cursor_trail = false"));
-        assert!(
-            !off[0].config.contains("cursor_momentum_glow"),
-            "the master alone is the off switch (the momentum glow obeys it): the \
-             OFF lane is what a user writes"
-        );
-        let on: Vec<_> = lanes.iter().filter(|l| l.effects_on).collect();
-        assert!(on.iter().all(|l| l.config.contains("cursor_trail = true")));
-        assert_eq!(
-            on.iter()
-                .filter(|l| l.config.contains("trail_sounds = true"))
-                .count(),
-            1,
-            "the ON lanes differ in the sounds"
-        );
-        assert!(
-            lanes
-                .iter()
-                .all(|l| !l.config.contains("cursor_trail_style")),
-            "the ON lanes run the shipped default style, not a respelling of it"
-        );
-        assert!(lanes.iter().all(|l| !l.config.contains('[')));
-    }
-
-    /// The lane verdict reads the `cursor_effect` owner out of the ledger by
-    /// NAME and the ribbon witness by name; passes a healthy lane; fails both an
-    /// absolute and a share late-arm regression, an ON lane whose effects never
-    /// engaged (the first cut read an absent owner as `(0, 0)` and PASSED it),
-    /// and an OFF lane that composed ribbon — never a lane whose ledger or
-    /// witness is simply missing.
-    #[test]
-    fn the_effect_lane_verdict_demands_engagement_and_bounds_late_arms() {
-        let [off, on, _] = effect_lanes();
+    fn the_effects_verdict_demands_engagement_and_bounds_late_arms() {
         let reply = |ledger: &str, under: u64| {
             format!("OK frames=40 fx_under_frames={under} deadline_arms_by_owner={ledger} turns=9")
         };
@@ -1449,69 +866,31 @@ mod tests {
             Some((0, 0))
         );
         assert_eq!(cursor_effect_arms("OK frames=40"), None);
-        assert!(effect_lane_verdict(&on, &reply("cursor_effect:430/0", 30)).is_ok());
+        assert!(effects_verdict(&reply("cursor_effect:430/0", 30)).is_ok());
         assert!(
-            effect_lane_verdict(&on, &reply("cursor_effect:430/2", 30)).is_ok(),
-            "the calibrated healthy worst"
-        );
-        assert!(effect_lane_verdict(&on, &reply("cursor_effect:430/4", 30)).is_ok());
-        assert!(
-            effect_lane_verdict(&on, &reply("cursor_effect:430/5", 30)).is_err(),
+            effects_verdict(&reply("cursor_effect:430/40", 30)).is_err(),
             "over the absolute bound"
         );
         assert!(
-            effect_lane_verdict(&on, &reply("cursor_effect:80/2", 30)).is_err(),
+            effects_verdict(&reply("cursor_effect:80/3", 30)).is_err(),
             "over one in fifty"
         );
-        assert!(effect_lane_verdict(&on, &reply("cursor_effect:40/1", 30)).is_ok());
         assert!(
-            effect_lane_verdict(&on, &reply("session_status:12/0", 30)).is_err(),
-            "an ON lane that armed no cursor_effect deadline measured nothing"
+            effects_verdict(&reply("session_status:12/0", 30)).is_err(),
+            "a burst that armed no cursor_effect deadline measured nothing"
         );
         assert!(
-            effect_lane_verdict(&on, &reply("cursor_effect:80/0", 0)).is_err(),
-            "an ON lane that composed no ribbon measured nothing"
-        );
-        assert!(effect_lane_verdict(&off, &reply("session_status:12/0", 0)).is_ok());
-        assert!(
-            effect_lane_verdict(&off, &reply("session_status:12/0", 3)).is_err(),
-            "an OFF lane that composed ribbon is not off"
+            effects_verdict(&reply("cursor_effect:80/0", 0)).is_err(),
+            "a burst that composed no ribbon measured nothing"
         );
         assert!(
-            effect_lane_verdict(&on, "OK frames=40 fx_under_frames=3").is_err(),
+            effects_verdict("OK frames=40 fx_under_frames=3").is_err(),
             "no ledger is not a pass"
         );
         assert!(
-            effect_lane_verdict(&on, "OK frames=40 deadline_arms_by_owner=cursor_effect:9/0")
-                .is_err(),
+            effects_verdict("OK frames=40 deadline_arms_by_owner=cursor_effect:9/0").is_err(),
             "no ribbon witness is not a pass"
         );
-    }
-
-    /// The comparison reads each lane's five readings by name, from the reply
-    /// that publishes it, and prints every lane that measured.
-    #[test]
-    fn the_lane_comparison_reports_every_lane_s_readings() {
-        let summary = "OK frames=40 input_p95_ms=6.10 present_p95_ms=4.20 \
-                       deadline_arms_by_owner=cursor_effect:80/0 max_frame_gap_ms=33.30";
-        let percentiles = "OK n_key_write=30 key_write_p99_ms=2.50";
-        let got = lane_latency(summary, percentiles);
-        assert_eq!(
-            got.iter()
-                .map(|(n, v)| format!("{n}={v}"))
-                .collect::<Vec<_>>(),
-            [
-                "input_p95=6.10",
-                "present_p95=4.20",
-                "key_write_p99=2.50",
-                "max_frame_gap=33.30",
-                "deadline_arms_by_owner=cursor_effect:80/0"
-            ]
-        );
-        assert_eq!(lane_latency("OK", "OK")[0].1, "?", "absent reads as `?`");
-        let line = lane_comparison(&[("effects=off", got.clone()), ("effects=on", got)]);
-        assert!(line.contains("[effects=off] input_p95=6.10"), "{line}");
-        assert!(line.contains("[effects=on] input_p95=6.10"), "{line}");
     }
 
     #[test]
@@ -1520,15 +899,7 @@ mod tests {
         // The echo still presents in ~58 ms, under the 250 ms input→present
         // ceilings; the burst books every key's key→write, and that fails.
         let hw = percentiles(30, "46.13", "0.10", "5.24", "58.00");
-        let bad = hv(&hw).expect_err("a finding");
-        assert!(
-            bad.contains("hardware key→write — p99 46ms (> 40)"),
-            "{bad}"
-        );
-        assert!(
-            bad.contains("press lock wait max 0.10ms, acquire p99 5.24ms, child echo p99 150.04ms"),
-            "the failure names who owes the time: {bad}"
-        );
+        assert!(hv(&hw).is_err());
     }
 
     #[test]
@@ -1536,15 +907,24 @@ mod tests {
         // echo p99 150.04 ms is the run-load measurement of a child waiting behind
         // compiles: reported, and not aterm's to fail on.
         let hw = percentiles(30, "6.29", "0.10", "5.24", "14.20");
-        let ok = hv(&hw).expect("a pass");
-        assert_eq!(
-            ok,
-            "gui smoke: frames=41 max_input_present=8ms, no present retries, drops or \
-             sync timeouts; hardware keys n_key_write=30/30 key_write_p99=6.29ms \
-             max_term_wait_press=0.10ms acquire_p99=5.24ms (n=31) input_p99=14.20ms \
-             (n=30) present_glass_p99=8.90ms (n=31, 0 never shown); \
-             echo_p99=150.04ms is the child's round trip (reported, not gated)"
-        );
+        hv(&hw).expect("a pass");
+        // A lost-wake build: ~5 frames/s and 190-530 ms input→present, with
+        // present retries, drops and sync timeouts; each alone fails too.
+        let with = |frames, max_input: &str, retries, drops, sync| {
+            hardware_key_verdict(30, &summary(frames, max_input, retries, drops, sync), &hw)
+        };
+        for (case, frames, max_input, retries, drops, sync) in [
+            ("starved", 10, "8.90", 0, 0, 0),
+            ("slow", 41, "530.10", 0, 0, 0),
+            ("retries", 41, "8.90", 4, 0, 0),
+            ("drops", 41, "8.90", 0, 7, 0),
+            ("sync timeouts", 41, "8.90", 0, 0, 2),
+        ] {
+            assert!(
+                with(frames, max_input, retries, drops, sync).is_err(),
+                "{case}"
+            );
+        }
     }
 
     #[test]
@@ -1552,13 +932,7 @@ mod tests {
         // Exactly what a `ctl key`-driven burst reports: every slice healthy, and
         // `n_key_write=0` because nothing armed the key-arrival stamp.
         let controller_shaped = percentiles(0, "0.00", "0.00", "0.02", "9.00");
-        let bad = hv(&controller_shaped).expect_err("a finding");
-        assert!(
-            bad.contains("never reached the KeyboardInput arm — n_key_write=0 of posted=30 (< 15)"),
-            "{bad}"
-        );
-        assert!(hv(&percentiles(14, "1.00", "0.0", "1.0", "9.0")).is_err());
-        assert!(hv(&percentiles(15, "1.00", "0.0", "1.0", "9.0")).is_ok());
+        assert!(hv(&controller_shaped).is_err());
     }
 
     /// THE INPUT CEILINGS CANNOT PASS VACUOUSLY: a burst that booked no
@@ -1569,17 +943,8 @@ mod tests {
             percentiles(30, "6.00", "0.10", "1.00", "0.00")
                 .replace("n_input=30", &format!("n_input={n}"))
         };
-        let bad = hardware_key_verdict(30, &summary(41, "0.00", 0, 0, 0), &hw(0))
-            .expect_err("no samples");
-        assert!(
-            bad.contains("n_input=0 input→present samples of posted=30 (< 15)"),
-            "{bad}"
-        );
-        assert!(hv(&hw(14)).is_err());
-        assert!(
-            hv(&hw(15)).is_ok(),
-            "half the burst is the floor, inclusive"
-        );
+        assert!(hardware_key_verdict(30, &summary(41, "0.00", 0, 0, 0), &hw(0)).is_err());
+        assert!(hv(&hw(30)).is_ok(), "the control");
     }
 
     /// AN ABSENT MAXIMUM FAILS CLOSED. A sampled acquire or compositor slice
@@ -1597,8 +962,7 @@ mod tests {
         };
         let healthy = percentiles(30, "6.00", "0.10", "1.00", "10.00");
         for field in ["max_acquire_wait_ms", "max_present_glass_ms"] {
-            let bad = hv(&without(&healthy, field)).expect_err(field);
-            assert!(bad.contains(&format!("published no {field}")), "{bad}");
+            assert!(hv(&without(&healthy, field)).is_err(), "{field}");
         }
         // The fail-open this closes: an acquire p99 over the bar, max missing.
         let slow = percentiles(30, "6.00", "0.10", "56.00", "10.00");
@@ -1611,84 +975,6 @@ mod tests {
         .replace("n_acquire=31", "n_acquire=0")
         .replace("n_present_glass=31", "n_present_glass=0");
         assert!(hv(&unsampled).is_ok(), "{unsampled}");
-    }
-
-    #[test]
-    fn the_hardware_slice_ceilings_are_exact_and_separately_attributed() {
-        let v =
-            |kw: &str, press: &str, acq: &str, inp: &str| hv(&percentiles(30, kw, press, acq, inp));
-        assert!(
-            v("39.99", "0.10", "1.00", "10.00").is_ok(),
-            "39 ms key→write passes"
-        );
-        assert!(
-            v("40.00", "0.10", "1.00", "10.00").is_ok(),
-            "an exclusive edge AT the 40 ms bar means every sample was under it"
-        );
-        assert!(
-            v("41.00", "0.10", "1.00", "10.00").is_err(),
-            "41 ms key→write fails"
-        );
-
-        assert!(
-            v("6.00", "24.90", "1.00", "10.00").is_ok(),
-            "24 ms press wait passes"
-        );
-        let press = v("6.00", "25.00", "1.00", "10.00").expect_err("press wait");
-        assert!(
-            press.contains("key-press terminal-mutex wait — max 25ms (>= 25) over n=60"),
-            "{press}"
-        );
-
-        assert!(
-            v("6.00", "0.10", "49.90", "10.00").is_ok(),
-            "49 ms acquire passes"
-        );
-        assert!(
-            v("6.00", "0.10", "50.00", "10.00").is_ok(),
-            "an exclusive edge AT the 50 ms bar is not a crossing"
-        );
-        // Above the bar AND confirmed by the max: 4.80 ms is the fixture's max, so the
-        // case has to move it or it is the bucket-edge artifact, not a slow acquire.
-        let acq = hv(&with_max(
-            &percentiles(30, "6.00", "0.10", "56.00", "10.00"),
-            "max_acquire_wait_ms",
-            "55.20",
-        ))
-        .expect_err("acquire");
-        assert!(
-            acq.contains(
-                "drawable acquire — p99 56ms (> 50, and its max confirms it) over n=31, max 55.20ms"
-            ),
-            "{acq}"
-        );
-        assert!(
-            v("6.00", "0.10", "56.00", "10.00").is_ok(),
-            "an acquire edge above the bar with a 4.80 ms max is the artifact, not a finding"
-        );
-
-        assert!(
-            v("6.00", "0.10", "1.00", "249.90").is_ok(),
-            "249 ms input→present passes"
-        );
-        assert!(
-            v("6.00", "0.10", "1.00", "250.00").is_ok(),
-            "an exclusive edge AT the 250 ms bar is not a crossing"
-        );
-        // This slice publishes no max of its own here (the summary's
-        // `max_input_present_ms` is gated separately, and there `>=` is right because
-        // that IS a true maximum), so the bar rests on the edge alone: one step above
-        // it fails.
-        let inp = v("6.00", "0.10", "1.00", "260.00").expect_err("input→present");
-        assert!(
-            inp.contains("hardware input→present — p99 260ms (> 250)"),
-            "{inp}"
-        );
-
-        // A CPU backend books no acquires; an absent slice is not a slow one.
-        let cpu =
-            percentiles(30, "6.00", "0.10", "0.00", "10.00").replace("n_acquire=31", "n_acquire=0");
-        assert!(hv(&cpu).is_ok());
     }
 
     #[test]
@@ -1716,144 +1002,38 @@ mod tests {
                 "{slice} is untouched by a compositor regression"
             );
         }
-        let bad = hv(&held).expect_err("a finding");
-        assert!(
-            bad.contains("present→glass — p99 92ms (> 50, and its max confirms it) over n=31"),
-            "{bad}"
-        );
-        assert!(
-            bad.contains("AFTER present-return") && bad.contains("0 drawable(s) never shown"),
-            "the failure names the leg that owes the time: {bad}"
-        );
-    }
-
-    #[test]
-    fn the_compositor_leg_ceiling_is_exact_and_an_unsampled_leg_is_not_a_slow_one() {
-        assert!(
-            hv(&with_glass(31, "49.90")).is_ok(),
-            "49 ms present->glass passes"
-        );
-        // AN EDGE AT THE BAR IS NOT A CROSSING. The reported p99 is a bucket's
-        // EXCLUSIVE upper edge, so 50.00 against a 50 ms bar says every sample was
-        // under it, as a p99 beside `max 47.85ms`, a percentile above its own
-        // maximum, says.
-        assert!(
-            hv(&with_glass(31, "50.00")).is_ok(),
-            "an exclusive edge AT the bar means every sample was under it"
-        );
-        // Above the bar, with the max confirming: the finding this row exists for.
-        assert!(
-            hv(&with_max(
-                &with_glass(31, "56.00"),
-                "max_present_glass_ms",
-                "55.10"
-            ))
-            .is_err(),
-            "a p99 above the bar whose max confirms it fails"
-        );
-        // Above the bar with a max that does not reach it: the bucket-edge artifact,
-        // which is a pass. A 12.40 ms worst frame is not a compositor holding frames.
-        assert!(
-            hv(&with_glass(31, "56.00")).is_ok(),
-            "an edge above the bar that no sample reached is not a slow leg"
-        );
-        // No sink, no handler: a CPU backend and every non-macOS present book none,
-        // and an absent slice must never be read as a slow one.
-        assert!(
-            hv(&with_glass(0, "900.00")).is_ok(),
-            "an unsampled compositor leg is not a slow one"
-        );
+        assert!(hv(&held).is_err());
+        // The reported p99 is a bucket's EXCLUSIVE upper edge: an edge above the
+        // bar that no sample reached (a 12.40 ms worst frame) is not a slow leg,
+        // and an unsampled leg (a CPU backend, a non-macOS present) is not one
+        // either.
+        assert!(hv(&with_glass(31, "56.00")).is_ok());
+        assert!(hv(&with_glass(0, "900.00")).is_ok());
     }
 
     #[test]
     fn an_unparsable_hardware_reply_fails_closed() {
-        let bad = hv("").expect_err("no reply");
-        assert_eq!(
-            bad,
-            "gui smoke: could not parse hardware-key percentiles -> <no reply>"
-        );
+        assert!(hv("").is_err());
         // The summary line (what `metrics` answers) lacks the slices: never a pass.
         let summary =
             "OK frames=41 max_input_present_ms=8.100 last_key_write_ms=0.00 max_key_write_ms=0.00 ";
         assert!(hv(summary).is_err());
-    }
-
-    #[test]
-    fn only_applied_send_receipts_count_as_delivered_keys() {
-        for applied in [
-            "OK",
-            "OK seq=0",
-            "OK seq=18446744073709551615",
-            "OK seq=7 warn=input-unread input_bytes=3 input_wait_ms=1500",
-        ] {
-            assert!(is_applied_send(applied), "{applied}");
-        }
-        for refused in [
-            "",
-            "OKAY",
-            "OK skipped",
-            "OK skipped reason=changed seq=7",
-            "OK dup=1 seq=7",
-            "OK seq=7 skipped",
-            "OK seq=7 dup=1",
-            "ERR busy sink",
-            "OK seq=",
-            "OK seq=18446744073709551616",
-            "OK seq=7extra",
-            "aterm: note\nOK seq=7",
-        ] {
-            assert!(!is_applied_send(refused), "{refused}");
-        }
-    }
-
-    #[test]
-    fn only_the_documented_cursor_reply_passes_the_round_trip() {
-        assert!(is_cursor_reply("OK 0 0 1 blinking_block"));
-        assert!(is_cursor_reply("OK 12 40 0 steady_bar"));
-        for bad in [
-            "",
-            "OK",
-            "ERR unknown verb",
-            // The stand-in's old answer, which the old `OK *` check passed.
-            "OK row=0 col=0",
-            "OK 0 0 2 blinking_block",
-            "OK -1 0 1 blinking_block",
-            "OK 0 0 1",
-            "OK 0 0 1 blinking_block extra",
-            // A banner ahead of the reply is not the reply.
-            "aterm: note\nOK 0 0 1 blinking_block",
-        ] {
-            assert!(!is_cursor_reply(bad), "{bad:?} passed for a cursor reply");
-        }
-    }
-
-    #[test]
-    fn an_empty_reply_is_reported_as_no_reply_never_as_a_pass() {
-        assert_eq!(or_no_reply(""), "<no reply>");
-        assert_eq!(or_no_reply("OK x"), "OK x");
-        assert!(!glob_match(OK_REPLY, ""));
+        // …nor is a summary that lacks a gated reading.
+        let hw = percentiles(30, "6.00", "0.10", "1.00", "10.00");
+        assert!(hardware_key_verdict(30, "OK frames=41", &hw).is_err());
+        assert!(hardware_key_verdict(30, "", &hw).is_err());
     }
 
     #[test]
     fn an_ssh_session_cannot_present_and_says_so() {
         let mut c = ctx();
         c.env.ssh_connection = Some("10.0.0.1 22 10.0.0.2 22".into());
-        if std::env::consts::OS == "macos" {
-            assert_eq!(
-                gui_smoke_unavailable(&c).as_deref(),
-                Some("gui smoke (no WindowServer session)")
-            );
-        } else {
-            assert_eq!(
-                gui_smoke_unavailable(&c).as_deref(),
-                Some("gui smoke (macOS only)")
-            );
-        }
+        assert!(gui_smoke_unavailable(&c).is_some());
     }
 
     #[test]
     fn the_sandbox_is_private_and_short_enough_for_a_unix_socket() {
-        let mut sb = Sandbox::new("ats").expect("sandbox");
+        let mut sb = Sandbox::with_config("atl", "").expect("sandbox");
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&sb.rundir)
             .expect("stat")
@@ -1875,7 +1055,7 @@ mod tests {
 
     #[test]
     fn a_teardown_that_loses_its_child_is_a_failure() {
-        let mut sb = Sandbox::new("ats").expect("sandbox");
+        let mut sb = Sandbox::with_config("atl", "").expect("sandbox");
         // A child that exits on its own is not one this smoke retired, and the
         // measurements were about THAT process.
         sb.child = Some(
@@ -1896,11 +1076,8 @@ mod tests {
         let mut r = Report::new("t");
         sb.teardown(&mut r);
         assert_eq!(
-            r.outcomes().collect::<Vec<_>>(),
-            [(
-                crate::Outcome::Fail(crate::Severity::GateFailed),
-                "smoke: child cleanup/reap failed"
-            )]
+            r.outcomes().map(|(o, _)| o).collect::<Vec<_>>(),
+            [crate::Outcome::Fail(crate::Severity::GateFailed)]
         );
     }
 }

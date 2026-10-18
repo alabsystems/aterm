@@ -14,12 +14,12 @@
 //!
 //! Usage at a fail-closed seam:
 //! ```ignore
-//! if aterm_core::fault::triggered("scrollback.disk_spill") || real_op().is_err() {
+//! if aterm_core::fault::triggered("scrollback.cold_push") || real_op().is_err() {
 //!     // graceful degradation (drop / skip / fail closed) — never panic
 //! }
 //! ```
-//! In a test: `fault::arm("scrollback.disk_spill"); … assert graceful …;
-//! fault::disarm("scrollback.disk_spill");`
+//! In a test: `fault::arm("scrollback.cold_push"); … assert graceful …;
+//! fault::disarm("scrollback.cold_push");`
 
 #[cfg(any(test, debug_assertions))]
 mod imp {

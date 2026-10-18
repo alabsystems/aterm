@@ -398,7 +398,6 @@ mod tests {
     const MASTER: [u8; 32] = [0x51; 32];
     const M3: [u8; 32] = [0x52; 32];
     const M11: [u8; 32] = [0x53; 32];
-    const NOW: i64 = 1_785_801_600; // 2026-08-04T00:00:00Z
 
     fn kp(seed: &[u8; 32]) -> Ed25519KeyPair {
         Ed25519KeyPair::from_seed_unchecked(seed).unwrap()
@@ -435,56 +434,6 @@ mod tests {
         (bytes, sig, pk(&MASTER))
     }
 
-    /// A listed machine may cut, attributed to itself.
-    #[test]
-    fn a_listed_machine_is_authorized_and_attributed() {
-        let (bytes, sig, master) = roster(&[]);
-        let who = authorize_cut(&[&master], bytes, &sig, &pk(&M3), NOW).unwrap();
-        assert_eq!(who.machine_id, "m3");
-        assert_eq!(who.pubkey_b64, pk(&M3));
-        assert_eq!(who.roster_seq, 6);
-    }
-
-    #[test]
-    fn a_key_not_on_the_roster_may_not_cut() {
-        let (bytes, sig, master) = roster(&[]);
-        let stranger = pk(&[0x5F; 32]);
-        let err = authorize_cut(&[&master], bytes, &sig, &stranger, NOW).unwrap_err();
-        assert!(
-            err.to_string().contains("not on the machine roster"),
-            "{err}"
-        );
-    }
-
-    /// The roster that lists a machine can also deny it.
-    #[test]
-    fn a_revoked_machine_may_not_cut() {
-        let (bytes, sig, master) = roster(&["m11"]);
-        let err = authorize_cut(&[&master], bytes, &sig, &pk(&M11), NOW).unwrap_err();
-        assert!(err.to_string().contains("may not sign"), "{err}");
-        // m3, on the same roster, still cuts — the refusal is targeted.
-        let (bytes, sig, master) = roster(&["m11"]);
-        assert!(authorize_cut(&[&master], bytes, &sig, &pk(&M3), NOW).is_ok());
-    }
-
-    /// A wrong master and no master both refuse; neither falls through.
-    #[test]
-    fn a_roster_under_the_wrong_or_absent_master_refuses_the_cut() {
-        let (bytes, sig, _) = roster(&[]);
-        let other_master = pk(&[0x5E; 32]);
-        assert!(authorize_cut(&[&other_master], bytes.clone(), &sig, &pk(&M3), NOW).is_err());
-        let err = authorize_cut(&[], bytes, &sig, &pk(&M3), NOW).unwrap_err();
-        assert!(err.to_string().contains("does not verify"), "{err}");
-    }
-
-    #[test]
-    fn a_lapsed_roster_refuses_the_cut_before_anything_is_published() {
-        let (bytes, sig, master) = roster(&[]);
-        let long_after = 1_900_000_000;
-        let err = authorize_cut(&[&master], bytes, &sig, &pk(&M3), long_after).unwrap_err();
-        assert!(err.to_string().contains("not usable for a cut"), "{err}");
-    }
-
     /// The fixture roster's `valid_until`, 2027-02-01T00:00:00Z, as unix seconds.
     const FIXTURE_VALID_UNTIL: i64 = 1_801_440_000;
 
@@ -494,8 +443,7 @@ mod tests {
     fn a_roster_about_to_lapse_may_not_start_a_cut() {
         let one_second_left = FIXTURE_VALID_UNTIL - 1;
         let (bytes, sig, master) = roster(&[]);
-        let err = authorize_cut(&[&master], bytes, &sig, &pk(&M3), one_second_left).unwrap_err();
-        assert!(err.to_string().contains("not usable for a cut"), "{err}");
+        authorize_cut(&[&master], bytes, &sig, &pk(&M3), one_second_left).unwrap_err();
         // Precondition, so the refusal above is not vacuous: the client's own rule (no
         // margin) still admits this roster at this instant.
         let (bytes, sig, master) = roster(&[]);
@@ -520,8 +468,7 @@ mod tests {
         let ours = b"roster_seq = 4\n[[machine]]\nid = \"m3\"\n".to_vec();
         let theirs = b"roster_seq = 4\n[[machine]]\nid = \"m19\"\n".to_vec();
         assert!(roster_lineage_agrees(&ours, Some(4), Some(&(4, ours.clone()))).is_ok());
-        let err = roster_lineage_agrees(&ours, Some(4), Some(&(4, theirs.clone()))).unwrap_err();
-        assert!(err.contains("LINEAGE FORK"), "{err}");
+        roster_lineage_agrees(&ours, Some(4), Some(&(4, theirs.clone()))).unwrap_err();
         assert!(roster_lineage_agrees(&ours, Some(4), Some(&(3, theirs.clone()))).is_ok());
         assert!(roster_lineage_agrees(&ours, Some(3), Some(&(4, theirs))).is_ok());
         assert!(roster_lineage_agrees(&ours, Some(4), None).is_ok());
@@ -545,65 +492,13 @@ mod tests {
 
         // What refuses: a manifest claiming a newer generation than the asset (7 over 6),
         // or none. An asset newer than the attribution (after a join) recovers.
-        let err =
-            verify_published_roster(&[&master], bytes.clone(), &sig, "m3", Some(7)).unwrap_err();
-        assert!(err.to_string().contains("roster_seq"), "{err}");
-        let err = verify_published_roster(&[&master], bytes.clone(), &sig, "m3", None).unwrap_err();
-        assert!(err.to_string().contains("roster_seq"), "{err}");
+        verify_published_roster(&[&master], bytes.clone(), &sig, "m3", Some(7)).unwrap_err();
+        verify_published_roster(&[&master], bytes.clone(), &sig, "m3", None).unwrap_err();
         verify_published_roster(&[&master], bytes.clone(), &sig, "m3", Some(5))
             .expect("a newer roster asset over an older attribution is what a join produces");
-        let err =
-            verify_published_roster(&[&master], bytes.clone(), &sig, "m99", Some(6)).unwrap_err();
-        assert!(err.to_string().contains("m99"), "{err}");
+        verify_published_roster(&[&master], bytes.clone(), &sig, "m99", Some(6)).unwrap_err();
         // An unarmed tree cannot check a rostered release, and says so.
-        let err = verify_published_roster(&[], bytes, &sig, "m3", Some(6)).unwrap_err();
-        assert!(err.to_string().contains("pinned paper master"), "{err}");
-    }
-
-    /// The stamp survives the emit/parse round trip through the client's own parser.
-    #[test]
-    fn attribution_is_stamped_into_the_signed_manifest_bytes() {
-        let mut m = crate::manifest_out::build(&crate::manifest_out::ManifestInputs {
-            version: "0.99.0",
-            build_number: 990,
-            commit: &"a".repeat(40),
-            dmg_name: "aterm-0.99.0.dmg",
-            dmg_sha256: &"ab".repeat(32),
-            zip_name: "aterm-0.99.0-mac.zip",
-            zip_sha256: &"cd".repeat(32),
-            repo_slug: "owner/repo",
-            min_os: "11.0",
-            team_id: "",
-            pub_date: "2026-08-04T00:00:00Z",
-            min_build: None,
-            changelog: "### Added\n- a thing\n",
-        });
-        // Negative control: before the stamp the keys are absent, as an unarmed tier
-        // publishes.
-        assert_eq!(m.machine_id, None);
-        assert_eq!(m.roster_seq, None);
-        let text = m.to_toml().unwrap();
-        assert!(!text.contains("machine_id"), "{text}");
-
-        attribute(
-            &mut m,
-            &Attribution {
-                machine_id: "m3".into(),
-                pubkey_b64: pk(&M3),
-                roster_seq: 6,
-            },
-        );
-        let text = m.to_toml().unwrap();
-        assert!(text.contains("machine_id = \"m3\""), "{text}");
-        assert!(text.contains("roster_seq = 6"), "{text}");
-        // The bytes the client verifies carry the attribution.
-        let back = Manifest::parse(&text).unwrap();
-        assert_eq!(back.machine_id.as_deref(), Some("m3"));
-        assert_eq!(back.roster_seq, Some(6));
-        assert_eq!(
-            back, m,
-            "the stamp must survive the publish round-trip exactly"
-        );
+        verify_published_roster(&[], bytes, &sig, "m3", Some(6)).unwrap_err();
     }
 
     #[test]

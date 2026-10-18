@@ -1,0 +1,20 @@
+# agy 1.4.0 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Antigravity CLI, launched by path with a scratch `HOME` whose settings name the Gemini API provider, its Google hosts black-holed, a fake `GEMINI_API_KEY` and `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:<port>` (a local stub of the Gemini API, crates/aterm-lab) · a custom stub mode: 404 NOT_FOUND, the turn's model not found for v1beta; 1 request(s) answered so before the error drew
+
+      ▄▀▀▄        Antigravity CLI 1.4.0
+     ▀▀▀▀▀▀       Gemini API key
+    ▀▀▀▀▀▀▀▀      Gemini 3.1 Pro (Low)
+   ▄▀▀    ▀▀▄     /private/tmp/at.IUGs/proj
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+> carry on with the task
+
+⚠ agent executor error: generating and executing: Error 404, Message: models/gemini-3.1-pro-preview is not found for API version v1beta, or is
+not supported for generateContent. Call ListModels to see the list of available models and their supported methods., Status: NOT_FOUND,
+Details: []
+Error ID: 89ce5224-8ef3-40e4-a3b9-984e25cb39d4-1
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts                                                                                                             Gemini 3.1 Pro · low

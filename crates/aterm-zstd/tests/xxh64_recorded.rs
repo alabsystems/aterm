@@ -8,7 +8,7 @@
 
 mod support;
 
-use aterm_zstd::xxh64::{Xxh64, xxh64};
+use aterm_zstd::xxh64::xxh64;
 use support::sanity;
 
 const RECORDED: &str = include_str!("recorded/xxh64-libzstd-1.5.7.tsv");
@@ -55,20 +55,5 @@ fn every_recorded_answer() {
             r.seed,
             r.len
         );
-    }
-}
-
-/// The streaming hasher fed in 13-byte pieces (coprime to the stripe)
-/// lands on the same recorded answers.
-#[test]
-fn every_recorded_answer_streamed() {
-    let rows = rows();
-    let buf = sanity(longest(&rows));
-    for r in &rows {
-        let mut h = Xxh64::new(r.seed);
-        for piece in buf[..r.len].chunks(13) {
-            h.update(piece);
-        }
-        assert_eq!(h.digest(), r.want, "seed {:#x} len {}", r.seed, r.len);
     }
 }

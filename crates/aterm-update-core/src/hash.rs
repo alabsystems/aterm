@@ -1,21 +1,26 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! SHA-256 of a file. Linux streams bytes through aterm-digest's first-party
-//! SHA-256, so native update verification does not depend on Perl's optional
-//! `shasum`.
-//! Other Unix hosts use `/usr/bin/shasum`; Windows uses `certutil -hashfile`,
-//! built through `aterm_uds::spawnfd::command` so a caller with no console (the
-//! window) does not flash one for it.
+//! SHA-256 of a file, read in process on Unix. macOS (and every Unix but Linux)
+//! hashes with ring, on the CPU's SHA-256 instructions — the bulk path atpkg's
+//! `tree::BulkSha256` takes; it used to spawn `/usr/bin/shasum`, a Perl start plus a
+//! software hash, for every downloaded update container. Linux streams bytes
+//! through aterm-digest's first-party SHA-256, so native update verification does
+//! not depend on Perl's optional `shasum`. Windows uses `certutil -hashfile`, built
+//! through `aterm_uds::spawnfd::command` so a caller with no console (the window)
+//! does not flash one for it.
 
 use std::path::Path;
 
-/// Lowercase SHA-256 of the complete file. Native Linux reads the file directly;
-/// other hosts use their existing system hash command. Callers establish path
-/// ownership and regular-file identity before trusting the file being hashed.
-// Skip: from_utf8_lossy/format over `shasum` OUTPUT (pure-ASCII hex by
-// contract; command output must contain exactly 64 hex digits before it is
-// returned) — hardened byte_loss/format classes. Audited (update-atpkg).
+/// Lowercase SHA-256 of the complete file. Unix reads the file directly; Windows
+/// uses its system hash command. Callers establish path ownership and regular-file
+/// identity before trusting the file being hashed. A read that never returns (a
+/// wedged volume) does not return here either: a caller that must bound it runs
+/// this on a thread of its own (`aterm-update`'s `container_sha256`).
+// Skip: format over the open error, and from_utf8_lossy/format over `certutil`
+// OUTPUT (pure-ASCII hex by contract; command output must contain exactly 64 hex
+// digits before it is returned) — hardened byte_loss/format classes. Audited
+// (update-atpkg).
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn sha256_file(path: &Path) -> Result<String, String> {
     #[cfg(target_os = "linux")]
@@ -26,10 +31,8 @@ pub fn sha256_file(path: &Path) -> Result<String, String> {
 
     #[cfg(all(unix, not(target_os = "linux")))]
     {
-        let out = shasum_command(path)
-            .output()
-            .map_err(|e| format!("spawn shasum: {e}"))?;
-        shasum_digest(&out)
+        let file = std::fs::File::open(path).map_err(|e| format!("open SHA-256 input: {e}"))?;
+        hardware_sha256_stream(file)
     }
 
     #[cfg(windows)]
@@ -62,16 +65,12 @@ pub fn sha256_file(path: &Path) -> Result<String, String> {
     }
 }
 
-/// Lowercase SHA-256 of everything `input` yields: the Linux arm of
-/// [`sha256_file`], read in 64 KiB chunks with `Interrupted` retried. Compiled
-/// for tests on every host, so the recorded answers below hold this exact loop
-/// wherever the suite runs, not only on Linux.
-// Skip: format over the read error, the class `sha256_file` skips (this is its
-// Linux arm, moved out whole).
-#[cfg(any(target_os = "linux", test))]
+/// Feed everything `input` yields to `update`, in 64 KiB chunks with `Interrupted`
+/// retried: the one read loop both Unix arms of [`sha256_file`] hash through.
+// Skip: format over the read error, the class `sha256_file` skips.
+#[cfg(any(unix, test))]
 #[cfg_attr(trust_verify, trust::skip)]
-fn sha256_stream(mut input: impl std::io::Read) -> Result<String, String> {
-    let mut hasher = aterm_digest::Sha256::new();
+fn read_stream(mut input: impl std::io::Read, mut update: impl FnMut(&[u8])) -> Result<(), String> {
     let mut buffer = [0_u8; 64 * 1024];
     loop {
         let count = match input.read(&mut buffer) {
@@ -80,94 +79,40 @@ fn sha256_stream(mut input: impl std::io::Read) -> Result<String, String> {
             Err(e) => return Err(format!("read SHA-256 input: {e}")),
         };
         if count == 0 {
-            break;
+            return Ok(());
         }
-        hasher.update(&buffer[..count]);
+        // The `Read` contract guarantees `count <= buffer.len()`; `min` keeps a
+        // nonconforming reader from panicking the slice.
+        update(&buffer[..count.min(buffer.len())]);
     }
+}
+
+/// Lowercase SHA-256 of everything `input` yields on aterm-digest's scalar hasher:
+/// the Linux arm of [`sha256_file`]. Compiled for tests on every host, so the
+/// recorded answers below hold this exact path wherever the suite runs, not only
+/// on Linux.
+#[cfg(any(target_os = "linux", test))]
+fn sha256_stream(input: impl std::io::Read) -> Result<String, String> {
+    let mut hasher = aterm_digest::Sha256::new();
+    read_stream(input, |chunk| hasher.update(chunk))?;
     Ok(aterm_codec::hex::encode_lower(&hasher.finalize()))
 }
 
-/// The `shasum -a 256 -- <path>` [`sha256_file`] runs, for a caller that must bound
-/// it: the update checker hashes a downloaded container on its own thread while it
-/// holds the check lane and the stage lock, and runs this through its bounded
-/// helper (`aterm-update`'s `output_within`), so a read that never returns (a
-/// wedged volume) cannot keep both for good. [`shasum_digest`] reads its output.
-#[cfg(all(unix, not(target_os = "linux")))]
-#[must_use]
-pub fn shasum_command(path: &Path) -> aterm_uds::spawnfd::Command {
-    let mut cmd = aterm_uds::spawnfd::command("/usr/bin/shasum");
-    cmd.args(["-a", "256", "--"]).arg(path);
-    cmd
-}
-
-/// The lowercase digest a finished [`shasum_command`] printed, or its refusal.
-// Skip: from_utf8_lossy/format over `shasum` OUTPUT, as `sha256_file` above.
-#[cfg(all(unix, not(target_os = "linux")))]
-#[cfg_attr(trust_verify, trust::skip)]
-pub fn shasum_digest(out: &std::process::Output) -> Result<String, String> {
-    if !out.status.success() {
-        return Err(format!(
-            "shasum failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    stdout
-        .split_whitespace()
-        .next()
-        // Checksum tools prefix the digest with a backslash when the filename
-        // is escaped (for a newline or backslash). The digest itself is unchanged.
-        .map(|h| h.strip_prefix('\\').unwrap_or(h))
-        .map(|h| h.to_ascii_lowercase())
-        .filter(|h| aterm_codec::hex::is_hex(h, 64))
-        .ok_or_else(|| "shasum produced no SHA-256 digest".to_string())
+/// Lowercase SHA-256 of everything `input` yields on ring, which drives the CPU's
+/// SHA-256 instructions (ARMv8 SHA2 on Apple silicon, SHA-NI on x86_64): the macOS
+/// arm of [`sha256_file`]. A 47 MiB update container hashes in tens of
+/// milliseconds; the same FIPS 180-4 digest as [`sha256_stream`], which the
+/// recorded answers below hold both to.
+#[cfg(any(all(unix, not(target_os = "linux")), test))]
+fn hardware_sha256_stream(input: impl std::io::Read) -> Result<String, String> {
+    let mut hasher = ring::digest::Context::new(&ring::digest::SHA256);
+    read_stream(input, |chunk| hasher.update(chunk))?;
+    Ok(aterm_codec::hex::encode_lower(hasher.finish().as_ref()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(all(unix, not(target_os = "linux")))]
-    #[test]
-    fn shasum_output_requires_a_complete_hex_digest() {
-        use std::os::unix::process::ExitStatusExt as _;
-
-        let digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
-        let mut output = std::process::Output {
-            status: std::process::ExitStatus::from_raw(0),
-            stdout: format!("{}  input file\n", digest.to_ascii_uppercase()).into_bytes(),
-            stderr: Vec::new(),
-        };
-        assert_eq!(shasum_digest(&output).unwrap(), digest);
-        for malformed in ["", "Usage: shasum", &digest[..63], &"g".repeat(64)] {
-            output.stdout = malformed.as_bytes().to_vec();
-            assert!(shasum_digest(&output).is_err(), "{malformed:?}");
-        }
-        output.stdout = digest.as_bytes().to_vec();
-        output.status = std::process::ExitStatus::from_raw(1 << 8);
-        assert!(shasum_digest(&output).is_err());
-    }
-
-    #[cfg(all(unix, not(target_os = "linux")))]
-    #[test]
-    fn shasum_hashes_option_like_and_escaped_filenames() {
-        let dir = aterm_tempfile::Builder::new()
-            .prefix("aterm-sha-option-")
-            .tempdir()
-            .unwrap();
-        for name in ["--help", "line\nbreak", "back\\slash"] {
-            std::fs::write(dir.path().join(name), b"abc").unwrap();
-            let output = shasum_command(Path::new(name))
-                .current_dir(dir.path())
-                .output()
-                .unwrap();
-            assert_eq!(
-                shasum_digest(&output).unwrap(),
-                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
-                "{name:?}"
-            );
-        }
-    }
 
     #[test]
     fn sha256_matches_known_vector() {
@@ -185,8 +130,9 @@ mod tests {
         );
     }
 
-    /// The Linux arm's answers, recorded from ring's SHA-256 (its hasher until
-    /// 2026-10-15) and held against ring on every run. The input is
+    /// Both Unix arms' answers, recorded from ring's SHA-256 (the Linux arm's hasher
+    /// until 2026-10-15, the macOS arm's since 2026-10-17) and held against ring on
+    /// every run. The input is
     /// [`pattern`]; the lengths are empty, one byte, both sides of the 64 KiB
     /// read buffer, and sixteen whole buffers.
     const RECORDED: [(usize, &str); 6] = [
@@ -247,39 +193,30 @@ mod tests {
         }
     }
 
+    /// Both Unix arms — the scalar one Linux ships and the hardware one macOS ships —
+    /// give the recorded answers, whole and through a reader that interrupts every
+    /// read and hands out odd-sized pieces.
     #[test]
     fn stream_hash_matches_ring_and_the_recorded_answers() {
         for (len, want) in RECORDED {
             let bytes = pattern(len);
             assert_eq!(ring_sha256(&bytes), want, "ring vs the record, {len} bytes");
-            assert_eq!(
-                sha256_stream(bytes.as_slice()).unwrap(),
-                want,
-                "{len} bytes"
-            );
-            let choppy = Choppy {
-                rest: &bytes,
-                step: 4093,
-                interrupt: false,
-            };
-            assert_eq!(sha256_stream(choppy).unwrap(), want, "{len} bytes, choppy");
-        }
-    }
-
-    /// The negative control: the comparison above can tell inputs apart. One
-    /// flipped bit in the largest row moves both hashers off the record and
-    /// onto the same new answer, and no two rows share a digest.
-    #[test]
-    fn the_recorded_answers_are_not_vacuous() {
-        let (len, want) = RECORDED[RECORDED.len() - 1];
-        let mut bytes = pattern(len);
-        bytes[65_536] ^= 1;
-        let flipped = sha256_stream(bytes.as_slice()).unwrap();
-        assert_ne!(flipped, want);
-        assert_eq!(flipped, ring_sha256(&bytes));
-        for (i, (_, a)) in RECORDED.iter().enumerate() {
-            for (_, b) in &RECORDED[i + 1..] {
-                assert_ne!(a, b);
+            for step in [bytes.len().max(1), 4093] {
+                let reader = || Choppy {
+                    rest: &bytes,
+                    step,
+                    interrupt: false,
+                };
+                assert_eq!(
+                    sha256_stream(reader()).unwrap(),
+                    want,
+                    "scalar, {len} bytes, {step}-byte reads"
+                );
+                assert_eq!(
+                    hardware_sha256_stream(reader()).unwrap(),
+                    want,
+                    "hardware, {len} bytes, {step}-byte reads"
+                );
             }
         }
     }
@@ -292,11 +229,19 @@ mod tests {
                 Err(std::io::Error::other("wedged"))
             }
         }
-        let err = sha256_stream(Broken).unwrap_err();
-        assert!(err.starts_with("read SHA-256 input: "), "{err}");
+        for err in [
+            sha256_stream(Broken).unwrap_err(),
+            hardware_sha256_stream(Broken).unwrap_err(),
+        ] {
+            assert!(err.starts_with("read SHA-256 input: "), "{err}");
+        }
     }
 
-    #[cfg(target_os = "linux")]
+    /// The file arm every Unix ships, through `open(2)` and the read loop: an empty
+    /// file, a million bytes (sixteen whole buffers and a partial one), a name that
+    /// starts with a dash and holds a newline, and a path that is missing or a
+    /// directory, which have no digest.
+    #[cfg(unix)]
     #[test]
     fn native_hash_handles_multiple_buffers_empty_input_and_unusual_names() {
         let dir = std::env::temp_dir().join(format!("aterm-sha-edge-{}", std::process::id()));

@@ -4,7 +4,7 @@
 //! Tier-1: the real herald and App config edge cancel desktop-only work.
 
 use super::{Escalation, EscalationKind, Herald, NOTIFY_BURST, NOTIFY_BURST_WINDOW};
-use aterm_spec::derive::desktop_alert_debt_model;
+use aterm_models_gui::desktop_alert_debt_model;
 use aterm_spec::interp::State;
 use std::collections::BTreeSet;
 use std::time::Instant;

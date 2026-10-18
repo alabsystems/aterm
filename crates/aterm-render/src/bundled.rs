@@ -20,13 +20,86 @@
 //!  → procedural Synthetic → .notdef
 //! ```
 //!
-//! # Windows: Cascadia Mono PL
+//! # Windows: Iosevka Term Semibold
 //!
-//! On Windows the primary is **Cascadia Mono PL** 2407.24, the official STATIC
-//! release (SIL OFL 1.1; Regular / Bold / Italic / BoldItalic), compiled in on
-//! Windows only (`cfg(windows)` on its `include_bytes!`) so a Linux binary
-//! does not carry its ~2.4 MB. Chosen 2026-09-30 when the owner asked for "a
-//! nicer, better looking font for Windows aterm": a render farm drew 22 faces
+//! On Windows the primary is **Iosevka Term Semibold**: Iosevka Term 34.9.0's
+//! SemiBold, with its ExtraBold as the bold face and their two italics (SIL
+//! OFL 1.1), subsets compiled in on Windows only ([`IOSEVKA_SEMIBOLD_ACTIVE`])
+//! so a Linux or macOS binary does not carry their ~2.3 MB. The GUI draws it
+//! at 17 px with a 1.1 line height on Windows (its `FONT_PX` and the config's
+//! line-height default), a 9x23 cell on baseline row 17.
+//!
+//! Chosen 2026-10-16 when the owner asked to "find a better font for Windows
+//! for aterm and switch to that font. See if we can use that open source font
+//! that we recently included" (Iosevka Term, below), by two judged render
+//! farms drawn through aterm at the owner's 96 DPI:
+//!
+//! * Round 1 judged the bundled Iosevka Term (Regular) at 16 to 18 px against
+//!   Cascadia Mono PL at 16 px, and it lost on three counts: its Regular
+//!   weight is too light there (ink per cell 18.9 at 17 px against Cascadia's
+//!   26.85), on a 1.0 line its accented capitals' marks touched the
+//!   descenders of the row above (42 of their pixels at 17 px), and its
+//!   `calt` ligatures (`=>` drawn as `⇒`, `!=` as `≠`) were a deal-breaker.
+//! * Round 2 answered each: heavier cuts of the same design, a taller line,
+//!   no ligatures. SemiBold at 17 px on a 1.1 line (the render named J2-lh11:
+//!   cell 9x23, ink per cell 24.12, 49.1% of ink pixels solid and 23% faint,
+//!   NO accent pixel touching a descender) scored a mean of 7.5 with no
+//!   deal-breaker from any judge, and 8.5 against Cascadia's 6.5 through the
+//!   long-time-macOS-user lens, the owner's own profile.
+//!
+//! What ships answers the ligature verdict in the bytes: the subsets drop
+//! `calt` (`publish/DECISIONS.md` has the command), so `=> != === -> <= >=`
+//! stay one glyph a column whatever `ligatures` says, while `ccmp`, `locl`,
+//! the fraction features and mark positioning stay. Iosevka's own design is
+//! otherwise untouched: the same 5,015 code points as the Regular set below.
+//!
+//! What it gives up, on purpose. Its 23 px row is two pixels taller than
+//! Cascadia Mono PL's 21 at 16 px, so a window of the same height holds about
+//! 9% fewer rows (the same columns: both cells are 9 px wide). The face
+//! carries most of what the chain used to supply: Claude Code's `⏺ ✻ ⏵`,
+//! `✗ ⚠ ⇒ ★`, the media and math arrows are Iosevka's own one-cell forms
+//! now, narrower than the Noto and DejaVu glyphs Cascadia left them to.
+//!
+//! What it does NOT draw: the 38 characters it maps that the grid gives TWO
+//! columns — the emoji-by-default `✅ ❌ ⭐ ⚡ ⏳ ⌚ ⬛ ⬜ …`, `〈 〉`, the trigrams
+//! and the digrams — whose glyphs are one column wide, so drawn from the face a `✅`
+//! stood at the left of its slot at half its width (a reviewer's live render,
+//! 2026-10-16). It leaves them to the chain ([`yields_wide_characters`]),
+//! which draws them fitted and centred across both columns from the faces
+//! they came from under Cascadia: Segoe UI Symbol's monochrome glyphs for
+//! the emoji, as before (none of them is drawn in colour, VS16 or not).
+//!
+//! Its private-use glyphs are its own, not yielded ([`yields_private_use`]):
+//! of the Powerline points it maps (U+E0A0..E0A3, U+E0AE, U+E0AF and
+//! U+E0B0..E0BF) the separators U+E0B0..E0BF are drawn by the procedural tier
+//! first, and the branch, line-number, lock and column-number glyphs
+//! U+E0A0..E0A3 stand inside the 9x23 cell (ink rows 3..19 and columns 0..9,
+//! half-open; measured 2026-10-16), where Cascadia's painted three rows into
+//! the row above. Every other Nerd Font icon still comes from the embedded
+//! Symbols Nerd Font. Its fourteen TWO-CELL glyphs — the long arrows `⟵`..`⟿`,
+//! `⟝ ⟞` and `⬳`, a full em wide where the grid gives each one column — are
+//! fitted into that column ([`fits_two_cell_glyphs`]), so a `⟹` cannot bury
+//! the `│` of a table beside it. `font_family = "Cascadia Mono PL"`,
+//! `font_px = 16` and `line_height = 1.0` give back the 9x21 Cascadia cell
+//! exactly.
+//!
+//! ```text
+//! Iosevka Term Semibold (SemiBold / ExtraBold / their italics)  primary
+//!  → DejaVu Sans Mono (embedded)                               broad tier, first
+//!  → system per-script / CJK faces → Arial                     broad tier
+//!  → Noto Sans Symbols 2 → Noto Sans Math (embedded)           symbol tier, first
+//!  → Segoe UI Symbol                                           symbol tier
+//!  → Segoe UI Emoji → Symbols Nerd Font (embedded, runtime tier)
+//!  → procedural Synthetic → .notdef
+//! ```
+//!
+//! # Cascadia Mono PL, by name on Windows
+//!
+//! **Cascadia Mono PL** 2407.24, the official STATIC release (SIL OFL 1.1;
+//! Regular / Bold / Italic / BoldItalic), is compiled in on Windows only
+//! ([`CASCADIA_ACTIVE`]) and selectable by name. It was the Windows default
+//! from 2026-09-30 to 2026-10-16, chosen when the owner asked for "a nicer,
+//! better looking font for Windows aterm": a render farm drew 22 faces
 //! through aterm on a 96 DPI display and three of four judges picked Cascadia
 //! Mono — measured crisper under aterm's grayscale raster, 50.7% of ink pixels
 //! at >= 80% coverage against 40.5% for JetBrains Mono — and two of them this
@@ -46,48 +119,39 @@
 //! * the same face on every Windows, Windows 10 included, which ships no
 //!   Cascadia at all.
 //!
-//! Two things the default gives up, both on purpose. It draws NO programming
-//! ligatures: the Mono cut is Cascadia Code without them (`=> != >= -> ===`
-//! stay as typed, measured on renders 2026-09-30), where the JetBrains Mono
-//! default before it drew them; `font_family = "JetBrains Mono"` brings them
-//! back, and the Cascadia CODE PL cut of the same release is the face to
-//! bundle if the default should ever ligate. And its cell is 9x21 at the
-//! default 16 px, not JetBrains Mono's 10x21, so a window of the same width
-//! holds more columns.
+//! Two things it gave up as the default, both on purpose. It draws NO
+//! programming ligatures: the Mono cut is Cascadia Code without them
+//! (`=> != >= -> ===` stay as typed, measured on renders 2026-09-30);
+//! `font_family = "JetBrains Mono"` brings them back. And its cell is 9x21 at
+//! 16 px, not JetBrains Mono's 10x21, so a window of the same width holds more
+//! columns.
 //!
-//! JetBrains Mono stays compiled in on Windows, selectable by name, but it is
-//! NOT a chain face there: the broad tier is DejaVu Sans Mono alone, as on
-//! Linux ([`broad_fallback_ids`] says why):
+//! Its private-use glyphs YIELD to the Symbols Nerd Font
+//! ([`yields_private_use`]), whatever slot it is in.
 //!
-//! ```text
-//! Cascadia Mono PL (real Bold / Italic / BoldItalic faces)    primary
-//!                       (its private-use glyphs yield to the Symbols Nerd Font)
-//!  → DejaVu Sans Mono (embedded)                               broad tier, first
-//!  → system per-script / CJK faces → Arial                     broad tier
-//!  → Noto Sans Symbols 2 → Noto Sans Math (embedded)           symbol tier, first
-//!  → Segoe UI Symbol                                           symbol tier
-//!  → Segoe UI Emoji → Symbols Nerd Font (embedded, runtime tier)
-//!  → procedural Synthetic → .notdef
-//! ```
+//! JetBrains Mono stays compiled in on Windows too, selectable by name, but
+//! neither it nor Cascadia Mono PL is a chain face there: the broad tier is
+//! DejaVu Sans Mono alone, as on Linux ([`broad_fallback_ids`] says why).
 //!
 //! Its cell is built on the vendor's line with ONE correction: the descent
 //! reaches the family's deepest Latin letter, and a pixel past it for the
 //! hinter ([`letter_descent_floor`]), so a Romanian `ș` or a Latvian `ķ` keeps
-//! its comma and, at the default 16 px, a row of `j` keeps a clear pixel row
-//! above the caron of an `Š` on the next row.
+//! its comma and, at 16 px, a row of `j` keeps a clear pixel row above the
+//! caron of an `Š` on the next row.
 //!
 //! # Iosevka Term, by name, everywhere
 //!
 //! **Iosevka Term** 34.9.0 (SIL OFL 1.1; Regular / Bold / Italic /
 //! BoldItalic; owner request 2026-10-14, "add https://typeof.net/Iosevka/ to
-//! aterm and try it") is compiled in on EVERY platform the stack feature is
+//! aterm and try it") is compiled in on EVERY platform the `embedded-font` feature is
 //! on, macOS included ([`IOSEVKA_ACTIVE`]), and is nobody's default and no
 //! chain face: `font_family = "Iosevka Term"` selects it, and an installed
-//! Iosevka Term wins that name as JetBrains Mono's does. The Term cut is the
-//! one for terminals: strictly monospaced, its arrows and geometric shapes one
-//! cell wide. Its cell is narrow — a 0.5 em advance on a 1.25 em line, 8x20
-//! at 16 px where JetBrains Mono is 10x21 — so a window of the same width
-//! holds a quarter more columns.
+//! Iosevka Term wins that name as JetBrains Mono's does. (The Windows default
+//! is the same design in its SemiBold and ExtraBold cuts, a different family,
+//! above.) The Term cut is the one for terminals: strictly monospaced, its
+//! arrows and geometric shapes one cell wide. Its cell is narrow — a 0.5 em
+//! advance on a 1.25 em line, 8x20 at 16 px where JetBrains Mono is 10x21 —
+//! so a window of the same width holds a quarter more columns.
 //!
 //! What ships is a SUBSET of the official unhinted release (aterm hints with
 //! the autohinter, or CoreText on macOS, so the font's own bytecode would be
@@ -95,10 +159,11 @@
 //! punctuation, arrows, math, Misc Technical, box drawing, blocks, Braille,
 //! legacy computing, Powerline — and HarfBuzz's default layout features
 //! (ligatures, marks, fractions), not Iosevka's stylistic sets and character
-//! variants: about 0.6 MB a face where the whole is 8.4 to 8.9 MB.
-//! `publish/DECISIONS.md` holds the source digests, the command and the
-//! measured sizes. Iosevka declares no Reserved Font Name, so the subset keeps
-//! its name.
+//! variants: about 0.6 MB a face where the whole is 8.4 to 8.9 MB. The
+//! Windows Semibold set is cut over the same code points, less `calt`.
+//! `publish/DECISIONS.md` holds the source digests, the commands and the
+//! measured sizes. Iosevka declares no Reserved Font Name, so the subsets keep
+//! their names.
 //!
 //! Every face here is `include_bytes!`'d, so the stack needs no I/O and works
 //! identically on a stripped container and a full desktop.
@@ -112,16 +177,20 @@
 //! carry. The unconfigured default IS the identity, so it costs no directory
 //! scan and is the same face on every machine. Each identity spells the face's
 //! own `name`-table family (name ID 1) plus its style, as a user would type it:
-//! `bundled:Cascadia Mono PL Bold Italic`, `bundled:JetBrains Mono Bold`.
+//! `bundled:Cascadia Mono PL Bold Italic`, `bundled:JetBrains Mono Bold`. The
+//! Iosevka Term Semibold family spells its regular face's family for all four
+//! slots (`bundled:Iosevka Term Semibold Bold` is the ExtraBold face, whose
+//! own name ID 1 is `Iosevka Term Extrabold`).
 //!
 //! A user who TYPES the family name — `font_family = "JetBrains Mono"` — gets an
 //! INSTALLED JetBrains Mono when one resolves (exactly what the name meant
 //! before the stack existed, so the variable `JetBrainsMono[wght].ttf` keeps its
 //! `font_weight` / `wght` axis) and the bundled face only when none does
 //! ([`crate::resolve_family_or_bundled`]). The same holds for `Cascadia Mono
-//! PL`. `Cascadia Mono` (no PL) is a different family name, and it keeps naming
-//! the system's variable face. Every consumer of a resolved identity reads its
-//! bytes through [`crate::read_resolved_font`], never as a file.
+//! PL`, `Iosevka Term` and `Iosevka Term Semibold`. `Cascadia Mono` (no PL) is
+//! a different family name, and it keeps naming the system's variable face.
+//! Every consumer of a resolved identity reads its bytes through
+//! [`crate::read_resolved_font`], never as a file.
 //!
 //! # Why not macOS
 //!
@@ -134,15 +203,12 @@
 
 /// Whether the bundled stack — the defaults and the chain faces — is compiled
 /// into this build. Iosevka Term has its own switch ([`IOSEVKA_ACTIVE`]).
-pub const ACTIVE: bool = cfg!(all(
-    feature = "bundled-font-stack",
-    not(target_os = "macos")
-));
+pub const ACTIVE: bool = cfg!(all(feature = "embedded-font", not(target_os = "macos")));
 
 /// Whether this build compiles in the Cascadia Mono PL faces: the stack is
 /// active AND the target is Windows. Everywhere else the `CASCADIA_*`
 /// identities below resolve to nothing.
-pub const CASCADIA_ACTIVE: bool = cfg!(all(feature = "bundled-font-stack", windows));
+pub const CASCADIA_ACTIVE: bool = cfg!(all(feature = "embedded-font", windows));
 
 /// The virtual identity scheme for bundled faces.
 pub const SCHEME: &str = "bundled:";
@@ -175,7 +241,7 @@ pub const CASCADIA_BOLD_ITALIC_ID: &str = "bundled:Cascadia Mono PL Bold Italic"
 /// default and never a chain face, only a family a user names
 /// (`font_family = "Iosevka Term"`), so it means the same face on every
 /// machine ([`IOSEVKA_FAMILY`]).
-pub const IOSEVKA_ACTIVE: bool = cfg!(feature = "bundled-font-stack");
+pub const IOSEVKA_ACTIVE: bool = cfg!(feature = "embedded-font");
 
 /// Iosevka Term's family name, as a user types it (name ID 1 of all four
 /// faces). Compiled in on every platform ([`IOSEVKA_ACTIVE`]).
@@ -189,34 +255,57 @@ pub const IOSEVKA_ITALIC_ID: &str = "bundled:Iosevka Term Italic";
 /// The bundled Iosevka Term's BOLD-ITALIC face identity.
 pub const IOSEVKA_BOLD_ITALIC_ID: &str = "bundled:Iosevka Term Bold Italic";
 
-/// The bundled PRIMARY's family name, as a user types it: Cascadia Mono PL on
-/// Windows, JetBrains Mono on every other non-macOS target.
+/// Whether this build compiles in the Iosevka Term SEMIBOLD faces, the Windows
+/// default: the stack is active AND the target is Windows, as for Cascadia
+/// Mono PL. Everywhere else the `IOSEVKA_SEMIBOLD_*` identities below resolve
+/// to nothing, and the opt-in Iosevka Term above is the only Iosevka there.
+pub const IOSEVKA_SEMIBOLD_ACTIVE: bool = cfg!(all(feature = "embedded-font", windows));
+
+/// Iosevka Term Semibold's family name, as a user types it: name ID 1 of its
+/// SemiBold and SemiBold Italic faces. Its bold slot is Iosevka Term's
+/// ExtraBold, whose own name ID 1 is "Iosevka Term Extrabold" (that spelling
+/// resolves too, [`face_for_family`]). Compiled in on Windows only
+/// ([`IOSEVKA_SEMIBOLD_ACTIVE`]).
+pub const IOSEVKA_SEMIBOLD_FAMILY: &str = "Iosevka Term Semibold";
+/// The bundled Iosevka Term Semibold's virtual identity (regular slot: the
+/// SemiBold face).
+pub const IOSEVKA_SEMIBOLD_ID: &str = "bundled:Iosevka Term Semibold";
+/// The bundled Iosevka Term Semibold's BOLD slot: the ExtraBold face.
+pub const IOSEVKA_SEMIBOLD_BOLD_ID: &str = "bundled:Iosevka Term Semibold Bold";
+/// The bundled Iosevka Term Semibold's ITALIC slot: the SemiBold Italic face.
+pub const IOSEVKA_SEMIBOLD_ITALIC_ID: &str = "bundled:Iosevka Term Semibold Italic";
+/// The bundled Iosevka Term Semibold's BOLD-ITALIC slot: the ExtraBold Italic
+/// face.
+pub const IOSEVKA_SEMIBOLD_BOLD_ITALIC_ID: &str = "bundled:Iosevka Term Semibold Bold Italic";
+
+/// The bundled PRIMARY's family name, as a user types it: Iosevka Term
+/// Semibold on Windows, JetBrains Mono on every other non-macOS target.
 #[cfg(windows)]
-pub const PRIMARY_FAMILY: &str = CASCADIA_FAMILY;
+pub const PRIMARY_FAMILY: &str = IOSEVKA_SEMIBOLD_FAMILY;
 /// The bundled PRIMARY's family name, as a user types it.
 #[cfg(not(windows))]
 pub const PRIMARY_FAMILY: &str = JETBRAINS_FAMILY;
 /// The bundled primary's virtual identity (regular face).
 #[cfg(windows)]
-pub const PRIMARY_ID: &str = CASCADIA_ID;
+pub const PRIMARY_ID: &str = IOSEVKA_SEMIBOLD_ID;
 /// The bundled primary's virtual identity (regular face).
 #[cfg(not(windows))]
 pub const PRIMARY_ID: &str = JETBRAINS_ID;
 /// The bundled primary's BOLD face identity.
 #[cfg(windows)]
-pub const PRIMARY_BOLD_ID: &str = CASCADIA_BOLD_ID;
+pub const PRIMARY_BOLD_ID: &str = IOSEVKA_SEMIBOLD_BOLD_ID;
 /// The bundled primary's BOLD face identity.
 #[cfg(not(windows))]
 pub const PRIMARY_BOLD_ID: &str = JETBRAINS_BOLD_ID;
 /// The bundled primary's ITALIC face identity.
 #[cfg(windows)]
-pub const PRIMARY_ITALIC_ID: &str = CASCADIA_ITALIC_ID;
+pub const PRIMARY_ITALIC_ID: &str = IOSEVKA_SEMIBOLD_ITALIC_ID;
 /// The bundled primary's ITALIC face identity.
 #[cfg(not(windows))]
 pub const PRIMARY_ITALIC_ID: &str = JETBRAINS_ITALIC_ID;
 /// The bundled primary's BOLD-ITALIC face identity.
 #[cfg(windows)]
-pub const PRIMARY_BOLD_ITALIC_ID: &str = CASCADIA_BOLD_ITALIC_ID;
+pub const PRIMARY_BOLD_ITALIC_ID: &str = IOSEVKA_SEMIBOLD_BOLD_ITALIC_ID;
 /// The bundled primary's BOLD-ITALIC face identity.
 #[cfg(not(windows))]
 pub const PRIMARY_BOLD_ITALIC_ID: &str = JETBRAINS_BOLD_ITALIC_ID;
@@ -243,12 +332,16 @@ const ALL_IDS: &[&str] = &[
     IOSEVKA_BOLD_ID,
     IOSEVKA_ITALIC_ID,
     IOSEVKA_BOLD_ITALIC_ID,
+    IOSEVKA_SEMIBOLD_ID,
+    IOSEVKA_SEMIBOLD_BOLD_ID,
+    IOSEVKA_SEMIBOLD_ITALIC_ID,
+    IOSEVKA_SEMIBOLD_BOLD_ITALIC_ID,
     DEJAVU_ID,
     NOTO_SYMBOLS2_ID,
     NOTO_MATH_ID,
 ];
 
-#[cfg(feature = "bundled-font-stack")]
+#[cfg(feature = "embedded-font")]
 mod bytes {
     #[cfg(not(target_os = "macos"))]
     pub(super) static JBM_REGULAR: &[u8] =
@@ -291,11 +384,27 @@ mod bytes {
     #[cfg(windows)]
     pub(super) static CASCADIA_BOLD_ITALIC: &[u8] =
         include_bytes!("../assets/bundled/CascadiaMonoPL-BoldItalic.ttf");
+    // Windows only: the Windows primary, Iosevka Term Semibold (subsets of
+    // the official SemiBold / ExtraBold faces and their italics, without
+    // `calt`). A Linux or macOS binary never selects it, so it does not carry
+    // the ~2.3 MB.
+    #[cfg(windows)]
+    pub(super) static IOSEVKA_SEMIBOLD: &[u8] =
+        include_bytes!("../assets/bundled/IosevkaTerm-SemiBold.ttf");
+    #[cfg(windows)]
+    pub(super) static IOSEVKA_EXTRABOLD: &[u8] =
+        include_bytes!("../assets/bundled/IosevkaTerm-ExtraBold.ttf");
+    #[cfg(windows)]
+    pub(super) static IOSEVKA_SEMIBOLD_ITALIC: &[u8] =
+        include_bytes!("../assets/bundled/IosevkaTerm-SemiBoldItalic.ttf");
+    #[cfg(windows)]
+    pub(super) static IOSEVKA_EXTRABOLD_ITALIC: &[u8] =
+        include_bytes!("../assets/bundled/IosevkaTerm-ExtraBoldItalic.ttf");
 }
 
 /// The bytes behind one virtual identity, or `None` for anything that is not a
 /// bundled identity in THIS build (on macOS: the Iosevka Term faces alone).
-#[cfg(feature = "bundled-font-stack")]
+#[cfg(feature = "embedded-font")]
 #[must_use]
 pub fn face_for_id(id: &str) -> Option<&'static [u8]> {
     match id {
@@ -307,6 +416,14 @@ pub fn face_for_id(id: &str) -> Option<&'static [u8]> {
         CASCADIA_ITALIC_ID => Some(bytes::CASCADIA_ITALIC),
         #[cfg(windows)]
         CASCADIA_BOLD_ITALIC_ID => Some(bytes::CASCADIA_BOLD_ITALIC),
+        #[cfg(windows)]
+        IOSEVKA_SEMIBOLD_ID => Some(bytes::IOSEVKA_SEMIBOLD),
+        #[cfg(windows)]
+        IOSEVKA_SEMIBOLD_BOLD_ID => Some(bytes::IOSEVKA_EXTRABOLD),
+        #[cfg(windows)]
+        IOSEVKA_SEMIBOLD_ITALIC_ID => Some(bytes::IOSEVKA_SEMIBOLD_ITALIC),
+        #[cfg(windows)]
+        IOSEVKA_SEMIBOLD_BOLD_ITALIC_ID => Some(bytes::IOSEVKA_EXTRABOLD_ITALIC),
         #[cfg(not(target_os = "macos"))]
         JETBRAINS_ID => Some(bytes::JBM_REGULAR),
         #[cfg(not(target_os = "macos"))]
@@ -330,7 +447,7 @@ pub fn face_for_id(id: &str) -> Option<&'static [u8]> {
 }
 
 /// The bytes behind one virtual identity: none, the stack being compiled out.
-#[cfg(not(feature = "bundled-font-stack"))]
+#[cfg(not(feature = "embedded-font"))]
 #[must_use]
 pub fn face_for_id(_id: &str) -> Option<&'static [u8]> {
     None
@@ -356,10 +473,12 @@ pub fn is_identity(family: &str) -> bool {
 /// (`JetBrains Mono`, `jetbrains-mono`, `JetBrainsMono`), plus the three styled
 /// spellings (`JetBrains Mono Bold` / `Italic` / `Bold Italic`) so the
 /// `font_family_bold`/`_italic`/`_bold_italic` keys can name them too — and, on
-/// Windows, the same four spellings of `Cascadia Mono PL`. The fallback-only
-/// faces (DejaVu, Noto) resolve by identity only: a family name such as
-/// "DejaVu Sans Mono" keeps meaning the INSTALLED face, as before. So does
-/// `Cascadia Mono`, which names the system's variable face, not this cut.
+/// Windows, the same four spellings of `Cascadia Mono PL` and of `Iosevka Term
+/// Semibold`, plus `Iosevka Term Extrabold` (`Italic`), the name its bold
+/// slots' own faces carry. The fallback-only faces (DejaVu, Noto) resolve by
+/// identity only: a family name such as "DejaVu Sans Mono" keeps meaning the
+/// INSTALLED face, as before. So does `Cascadia Mono`, which names the
+/// system's variable face, not this cut.
 #[must_use]
 pub fn face_for_family(family: &str) -> Option<(&'static str, &'static [u8])> {
     let trimmed = family.trim();
@@ -383,6 +502,16 @@ pub fn face_for_family(family: &str) -> Option<(&'static str, &'static [u8])> {
         "cascadiamonoplitalic" => CASCADIA_ITALIC_ID,
         #[cfg(windows)]
         "cascadiamonoplbolditalic" => CASCADIA_BOLD_ITALIC_ID,
+        #[cfg(windows)]
+        "iosevkatermsemibold" | "iosevkatermsemiboldregular" => IOSEVKA_SEMIBOLD_ID,
+        #[cfg(windows)]
+        "iosevkatermsemiboldbold" | "iosevkatermextrabold" => IOSEVKA_SEMIBOLD_BOLD_ID,
+        #[cfg(windows)]
+        "iosevkatermsemibolditalic" => IOSEVKA_SEMIBOLD_ITALIC_ID,
+        #[cfg(windows)]
+        "iosevkatermsemiboldbolditalic" | "iosevkatermextrabolditalic" => {
+            IOSEVKA_SEMIBOLD_BOLD_ITALIC_ID
+        }
         _ => return None,
     };
     face_for_id(id).map(|bytes| (id, bytes))
@@ -391,50 +520,62 @@ pub fn face_for_family(family: &str) -> Option<(&'static str, &'static [u8])> {
 /// The real `[bold, italic, bold-italic]` faces of a bundled primary, keyed by
 /// the primary's identity — what `Renderer::ensure_styled_faces` fills its
 /// slots from instead of deriving sibling FILE paths. Empty for any other
-/// primary. Both bundled primaries carry all three: the default one, and
-/// JetBrains Mono chosen by name on Windows.
+/// primary. Every bundled four-face family carries all three: the defaults,
+/// and the families chosen by name.
 #[must_use]
 pub fn styled_siblings(primary: &str) -> [Option<&'static [u8]>; 3] {
-    let ids = match primary {
-        JETBRAINS_ID => [
-            JETBRAINS_BOLD_ID,
-            JETBRAINS_ITALIC_ID,
-            JETBRAINS_BOLD_ITALIC_ID,
-        ],
+    let family = match primary {
+        JETBRAINS_ID => JETBRAINS_FACES,
         #[cfg(windows)]
-        CASCADIA_ID => [
-            CASCADIA_BOLD_ID,
-            CASCADIA_ITALIC_ID,
-            CASCADIA_BOLD_ITALIC_ID,
-        ],
-        IOSEVKA_ID => [IOSEVKA_BOLD_ID, IOSEVKA_ITALIC_ID, IOSEVKA_BOLD_ITALIC_ID],
+        CASCADIA_ID => CASCADIA_FACES,
+        #[cfg(windows)]
+        IOSEVKA_SEMIBOLD_ID => IOSEVKA_SEMIBOLD_FACES,
+        IOSEVKA_ID => IOSEVKA_FACES,
         _ => return [None; 3],
     };
-    ids.map(face_for_id)
+    [family[1], family[2], family[3]].map(face_for_id)
 }
 
+/// Cascadia Mono PL's four faces, `[regular, bold, italic, bold-italic]`.
+const CASCADIA_FACES: [&str; 4] = [
+    CASCADIA_ID,
+    CASCADIA_BOLD_ID,
+    CASCADIA_ITALIC_ID,
+    CASCADIA_BOLD_ITALIC_ID,
+];
+/// JetBrains Mono's four faces, `[regular, bold, italic, bold-italic]`.
+const JETBRAINS_FACES: [&str; 4] = [
+    JETBRAINS_ID,
+    JETBRAINS_BOLD_ID,
+    JETBRAINS_ITALIC_ID,
+    JETBRAINS_BOLD_ITALIC_ID,
+];
+/// Iosevka Term's four faces, `[regular, bold, italic, bold-italic]`.
+const IOSEVKA_FACES: [&str; 4] = [
+    IOSEVKA_ID,
+    IOSEVKA_BOLD_ID,
+    IOSEVKA_ITALIC_ID,
+    IOSEVKA_BOLD_ITALIC_ID,
+];
+/// Iosevka Term Semibold's four slots, `[regular, bold, italic, bold-italic]`:
+/// the SemiBold, ExtraBold, SemiBold Italic and ExtraBold Italic faces.
+const IOSEVKA_SEMIBOLD_FACES: [&str; 4] = [
+    IOSEVKA_SEMIBOLD_ID,
+    IOSEVKA_SEMIBOLD_BOLD_ID,
+    IOSEVKA_SEMIBOLD_ITALIC_ID,
+    IOSEVKA_SEMIBOLD_BOLD_ITALIC_ID,
+];
+
 /// The four-face families a bundled PRIMARY can come from, each in
-/// `[regular, bold, italic, bold-italic]` order: the two defaults, and Iosevka
-/// Term, which only a user's choice makes the primary.
-const PRIMARY_FAMILIES: [[&str; 4]; 3] = [
-    [
-        CASCADIA_ID,
-        CASCADIA_BOLD_ID,
-        CASCADIA_ITALIC_ID,
-        CASCADIA_BOLD_ITALIC_ID,
-    ],
-    [
-        JETBRAINS_ID,
-        JETBRAINS_BOLD_ID,
-        JETBRAINS_ITALIC_ID,
-        JETBRAINS_BOLD_ITALIC_ID,
-    ],
-    [
-        IOSEVKA_ID,
-        IOSEVKA_BOLD_ID,
-        IOSEVKA_ITALIC_ID,
-        IOSEVKA_BOLD_ITALIC_ID,
-    ],
+/// `[regular, bold, italic, bold-italic]` order: the defaults (Iosevka Term
+/// Semibold on Windows, JetBrains Mono elsewhere), and Cascadia Mono PL and
+/// Iosevka Term, which only a user's choice makes the primary. The order is
+/// only the letter floor's memo slot; nothing reads a family by its index.
+const PRIMARY_FAMILIES: [[&str; 4]; 4] = [
+    CASCADIA_FACES,
+    JETBRAINS_FACES,
+    IOSEVKA_FACES,
+    IOSEVKA_SEMIBOLD_FACES,
 ];
 
 /// THE CELL HOLDS THE FACE'S OWN LETTERS: when `bytes` is one of a bundled
@@ -467,6 +608,11 @@ const PRIMARY_FAMILIES: [[&str; 4]; 3] = [
 /// * Iosevka Term 34.9.0 (measured 2026-10-14, all four faces): 256 of 1000,
 ///   inside its 285 descent (ascent 965, no lineGap: a 1.25 em line). No
 ///   change.
+/// * Iosevka Term Semibold (measured 2026-10-16, its SemiBold, ExtraBold and
+///   both italics): 259 of 1000, inside the same 285 descent. No change: the
+///   clear row between lines it needs is the Windows 1.1 line height's, not
+///   the floor's (on a 1.0 line at 17 px a `j` ends on the row an `Š`'s caron
+///   starts under it).
 ///
 /// Only the bundled families, whose bytes this module owns and which were
 /// measured. An installed face — the system's variable Cascadia Mono has the
@@ -491,8 +637,10 @@ fn same_face(face: &[u8], bytes: &[u8]) -> bool {
 }
 
 /// The bundled faces whose PRIVATE-USE glyphs YIELD ([`yields_private_use`]):
-/// the four Cascadia Mono PL faces, `[regular, bold, italic, bold-italic]`.
-const PRIVATE_USE_YIELDING_IDS: [&str; 4] = PRIMARY_FAMILIES[0];
+/// the four Cascadia Mono PL faces, `[regular, bold, italic, bold-italic]`,
+/// named as Cascadia's — never as a position in [`PRIMARY_FAMILIES`], so a
+/// family added there, or a new default, cannot move the yield.
+const PRIVATE_USE_YIELDING_IDS: [&str; 4] = CASCADIA_FACES;
 
 /// THE ICONS COME FROM ONE FACE: whether `bytes` are a bundled face that
 /// leaves every PRIVATE-USE code point the embedded Symbols Nerd Font maps to
@@ -536,10 +684,93 @@ const PRIVATE_USE_YIELDING_IDS: [&str; 4] = PRIMARY_FAMILIES[0];
 /// bold and styled pushes too). A file with the same bytes IS this face, and
 /// the floor already gives it the same cell. Any OTHER face keeps every glyph
 /// it maps: the system's variable Cascadia Mono, a Nerd-patched font a user
-/// configures, another PL build, JetBrains Mono.
+/// configures, another PL build, JetBrains Mono, and both Iosevka Term sets —
+/// the Windows default among them, whose Powerline glyphs stand inside its
+/// line (MEASURED 2026-10-16 at 17 px on the 1.1 line: U+E0A0..E0A3 ink rows
+/// 3..19 of the 23-row cell, columns 0..9 of 9).
 #[must_use]
 pub fn yields_private_use(bytes: &[u8]) -> bool {
     PRIVATE_USE_YIELDING_IDS
+        .iter()
+        .any(|id| face_for_id(id).is_some_and(|face| same_face(face, bytes)))
+}
+
+/// The code points Iosevka Term draws TWO cells wide — an advance of 1000 per
+/// 1000 where every other glyph's is 500 — while the grid gives each ONE
+/// column (none is East Asian Wide): `⟝ ⟞` (U+27DD, U+27DE), the long arrows
+/// `⟵`..`⟿` (U+27F5..27FF) and `⬳` (U+2B33). MEASURED 2026-10-16 over the
+/// cmaps of all eight Iosevka Term faces, both sets; JetBrains Mono and
+/// Cascadia Mono PL draw no glyph wider than their cell.
+#[must_use]
+pub fn is_two_cell_glyph(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{27DD}' | '\u{27DE}' | '\u{27F5}'..='\u{27FF}' | '\u{2B33}'
+    )
+}
+
+/// THE GRID OWNS THE COLUMNS: whether `bytes` are a bundled face whose
+/// two-cell glyphs ([`is_two_cell_glyph`]) a window FITS into the one column
+/// the grid gives each, instead of drawing them across the next cell. True
+/// for the four Iosevka Term Semibold faces (compiled in on Windows only, so
+/// `false` everywhere else). The renderer reads it once per loaded primary
+/// and stamps such a cell's key one cell wide
+/// (`Renderer::resolve_cell_key_for_span`): the fit an explicit VS15 primary
+/// glyph already takes, the ink shrunk to the cell, level with its own
+/// centre.
+///
+/// MEASURED 2026-10-16: drawn at its own width, the face's `⟹` buried the
+/// `│` of a table to its right — the defect `fallback_harmony`'s
+/// `a_long_arrow_does_not_shear_a_box_drawing_row` was written for. Under
+/// Cascadia Mono PL, which has no `⟹`, the arrow came from Noto Sans Math
+/// through the fallback fit, the same shrink. Iosevka Term (Regular), the
+/// opt-in set every platform carries, maps the same fourteen and still draws
+/// them at their own width.
+///
+/// BY THE BYTES, like [`yields_private_use`]: a face can arrive without its
+/// identity (`Renderer::set_primary_font` takes bytes).
+#[must_use]
+pub fn fits_two_cell_glyphs(bytes: &[u8]) -> bool {
+    is_iosevka_semibold(bytes)
+}
+
+/// THE GRID OWNS THE COLUMNS, the other way round: whether `bytes` are a
+/// bundled face that leaves every character the grid ALWAYS gives two
+/// columns — East Asian Wide or Fullwidth, `aterm_grapheme::char_width` 2
+/// whatever `ambiguous_width` says — to the fallback chain, instead of
+/// drawing it with its own ONE-column glyph. True for the four Iosevka Term
+/// Semibold faces (compiled in on Windows only, so `false` everywhere else).
+/// The renderer reads it once per loaded primary and applies it per code
+/// point (`Renderer::primary_unicode_gid`), so the chain draws such a
+/// character fitted and centred across its two columns, from the face it
+/// came from under Cascadia Mono PL.
+///
+/// MEASURED 2026-10-16 over the cmaps: each Semibold face maps 38 such
+/// points, every one drawn one column wide (advance 500 per 1000, the
+/// cell's) — 22 whose default presentation is emoji (`⌚ ⌛ ⏩ ⏪ ⏫ ⏬ ⏰ ⏳
+/// ◽ ◾ ⚡ ⚪ ⚫ ✅ ❌ ❎ ➰ ➿ ⬛ ⬜ ⭐ ⭕`), the angle brackets `〈 〉` (U+2329,
+/// U+232A), the trigrams `☰`..`☷` and the monograms and digrams `⚊`..`⚏`.
+/// Drawn from the face, the `✅ ❌` of Claude Code's replies stood at the
+/// left of their slot at half its width, the right column blank. The engine
+/// marks none of the emoji for colour, VS16 or not (`emoji_presentation` is
+/// set only for a text-default emoji), so under Cascadia they came from the
+/// chain in monochrome — Segoe UI Symbol for the emoji, the brackets and
+/// `☰`, Noto Sans Symbols 2 and DejaVu Sans Mono for the rest — and so they
+/// do again: the same faces, measured. Only `◽ ◾ ⬛ ⬜`, the four Cascadia
+/// maps itself (as narrow), now come from the chain too. Iosevka Term
+/// (Regular), the opt-in set, maps the same 38 and still draws them itself.
+///
+/// BY THE BYTES, like [`yields_private_use`]: a face can arrive without its
+/// identity (`Renderer::set_primary_font` takes bytes).
+#[must_use]
+pub fn yields_wide_characters(bytes: &[u8]) -> bool {
+    is_iosevka_semibold(bytes)
+}
+
+/// Whether `bytes` are one of the four bundled Iosevka Term Semibold faces,
+/// by contents ([`same_face`]).
+fn is_iosevka_semibold(bytes: &[u8]) -> bool {
+    IOSEVKA_SEMIBOLD_FACES
         .iter()
         .any(|id| face_for_id(id).is_some_and(|face| same_face(face, bytes)))
 }
@@ -573,8 +804,8 @@ fn deepest_latin_letter(ids: &[&str; 4]) -> Option<f32> {
     deepest
 }
 
-/// The DEFAULT primary candidate: the bundled primary's identity (Cascadia
-/// Mono PL on Windows, JetBrains Mono elsewhere), placed ahead of the built-in
+/// The DEFAULT primary candidate: the bundled primary's identity (Iosevka
+/// Term Semibold on Windows, JetBrains Mono elsewhere), placed ahead of the built-in
 /// system `FONT_CANDIDATES` (so a system DejaVu Sans Mono — or, on Windows, the
 /// system's variable Cascadia Mono — no longer wins by default) and behind any
 /// configured family (so a user's choice still wins). Empty when the stack is
@@ -633,8 +864,9 @@ pub fn supersedes_system_face(path: &str) -> bool {
 }
 
 /// Families the bundled stack makes selectable by NAME (for `list-fonts`): the
-/// primary, on Windows JetBrains Mono beside it, and Iosevka Term everywhere
-/// (macOS included, where it is the one).
+/// primary first, on Windows Cascadia Mono PL (the default before it) and
+/// JetBrains Mono beside it, and Iosevka Term everywhere (macOS included,
+/// where it is the one).
 #[must_use]
 pub fn selectable_families() -> &'static [&'static str] {
     if !IOSEVKA_ACTIVE {
@@ -642,7 +874,12 @@ pub fn selectable_families() -> &'static [&'static str] {
     }
     #[cfg(windows)]
     {
-        &[CASCADIA_FAMILY, JETBRAINS_FAMILY, IOSEVKA_FAMILY]
+        &[
+            IOSEVKA_SEMIBOLD_FAMILY,
+            CASCADIA_FAMILY,
+            JETBRAINS_FAMILY,
+            IOSEVKA_FAMILY,
+        ]
     }
     #[cfg(target_os = "macos")]
     {
@@ -721,62 +958,44 @@ mod tests {
                 "{spelling:?}"
             );
         }
+        // Iosevka Term Semibold resolves by name, in all four styles and by
+        // its bold faces' own family name, exactly where it is compiled in
+        // (Windows), and nowhere else.
+        for (spelling, id) in [
+            ("Iosevka Term Semibold", IOSEVKA_SEMIBOLD_ID),
+            ("iosevka-term-semibold", IOSEVKA_SEMIBOLD_ID),
+            ("IosevkaTermSemiBold", IOSEVKA_SEMIBOLD_ID),
+            (" IOSEVKA TERM SEMIBOLD REGULAR ", IOSEVKA_SEMIBOLD_ID),
+            ("Iosevka Term Semibold Bold", IOSEVKA_SEMIBOLD_BOLD_ID),
+            ("Iosevka Term Semibold Italic", IOSEVKA_SEMIBOLD_ITALIC_ID),
+            (
+                "Iosevka Term Semibold Bold Italic",
+                IOSEVKA_SEMIBOLD_BOLD_ITALIC_ID,
+            ),
+            ("Iosevka Term Extrabold", IOSEVKA_SEMIBOLD_BOLD_ID),
+            (
+                "Iosevka Term ExtraBold Italic",
+                IOSEVKA_SEMIBOLD_BOLD_ITALIC_ID,
+            ),
+            (IOSEVKA_SEMIBOLD_ID, IOSEVKA_SEMIBOLD_ID),
+        ] {
+            assert_eq!(
+                face_for_family(spelling).map(|(id, _)| id),
+                IOSEVKA_SEMIBOLD_ACTIVE.then_some(id),
+                "{spelling:?}"
+            );
+        }
         // An installed family keeps meaning the installed face — including
         // `Cascadia Mono`, the system's variable cut, which is not this one,
         // and `Iosevka` (not Term), whose arrows are wide.
         assert!(face_for_family("Iosevka").is_none());
+        assert!(face_for_family("Iosevka Term Medium").is_none());
         assert!(face_for_family("DejaVu Sans Mono").is_none());
         assert!(face_for_family("JetBrains Mono NL").is_none());
         assert!(face_for_family("Cascadia Mono").is_none());
         assert!(face_for_family("Cascadia Code").is_none());
         assert!(face_for_family("Cascadia Code PL").is_none());
         assert!(face_for_family("").is_none());
-    }
-
-    /// The per-platform PRIMARY aliases name the face the decision picked:
-    /// Cascadia Mono PL on Windows, JetBrains Mono elsewhere.
-    #[test]
-    fn the_primary_aliases_follow_the_platform() {
-        if cfg!(windows) {
-            assert_eq!(
-                [PRIMARY_FAMILY, PRIMARY_ID, PRIMARY_BOLD_ID],
-                [CASCADIA_FAMILY, CASCADIA_ID, CASCADIA_BOLD_ID]
-            );
-            assert_eq!(
-                [PRIMARY_ITALIC_ID, PRIMARY_BOLD_ITALIC_ID],
-                [CASCADIA_ITALIC_ID, CASCADIA_BOLD_ITALIC_ID]
-            );
-        } else {
-            assert_eq!(
-                [PRIMARY_FAMILY, PRIMARY_ID, PRIMARY_BOLD_ID],
-                [JETBRAINS_FAMILY, JETBRAINS_ID, JETBRAINS_BOLD_ID]
-            );
-            assert_eq!(
-                [PRIMARY_ITALIC_ID, PRIMARY_BOLD_ITALIC_ID],
-                [JETBRAINS_ITALIC_ID, JETBRAINS_BOLD_ITALIC_ID]
-            );
-        }
-        // Linux carries no Cascadia bytes at all.
-        assert_eq!(CASCADIA_ACTIVE, ACTIVE && cfg!(windows));
-        assert_eq!(face_for_id(CASCADIA_ID).is_some(), CASCADIA_ACTIVE);
-        let order = selectable_families();
-        if !IOSEVKA_ACTIVE {
-            assert!(order.is_empty());
-        } else if cfg!(windows) {
-            assert_eq!(order, [CASCADIA_FAMILY, JETBRAINS_FAMILY, IOSEVKA_FAMILY]);
-        } else if cfg!(target_os = "macos") {
-            assert_eq!(order, [IOSEVKA_FAMILY]);
-        } else {
-            assert_eq!(order, [JETBRAINS_FAMILY, IOSEVKA_FAMILY]);
-        }
-        // Iosevka Term is no platform's default and no chain face.
-        assert!(!default_primary_candidates().contains(&IOSEVKA_ID));
-        assert!(!broad_fallback_ids().contains(&IOSEVKA_ID));
-        assert!(!symbol_fallback_ids().contains(&IOSEVKA_ID));
-        // The broad tier is DejaVu Sans Mono alone on every platform: JetBrains
-        // Mono is selectable on Windows, never a chain face there.
-        let broad: &[&str] = if ACTIVE { &[DEJAVU_ID] } else { &[] };
-        assert_eq!(broad_fallback_ids(), broad);
     }
 
     /// THE LETTER FLOOR is measured from the family's own outlines, answers
@@ -787,8 +1006,14 @@ mod tests {
         if IOSEVKA_ACTIVE {
             // Iosevka Term: 256 of 1000 (the comma-below letters), inside
             // its 285 descent — the floor exists and changes nothing.
-            for id in PRIMARY_FAMILIES[2] {
+            for id in IOSEVKA_FACES {
                 assert_eq!(per_em(id), Some(-0.256), "{id}");
+            }
+        }
+        if IOSEVKA_SEMIBOLD_ACTIVE {
+            // Iosevka Term Semibold: 259 of 1000, inside the same 285 descent.
+            for id in IOSEVKA_SEMIBOLD_FACES {
+                assert_eq!(per_em(id), Some(-0.259), "{id}");
             }
         }
         if !ACTIVE {
@@ -798,12 +1023,12 @@ mod tests {
         }
         // JetBrains Mono: 240 of 1000 (the comma-below letters), inside its
         // 300 descent — the floor exists and changes nothing.
-        for id in PRIMARY_FAMILIES[1] {
+        for id in JETBRAINS_FACES {
             assert_eq!(per_em(id), Some(-0.24), "{id}");
         }
         if CASCADIA_ACTIVE {
             // Cascadia Mono PL: the BOLD faces' 608 of 2048 governs all four.
-            for id in PRIMARY_FAMILIES[0] {
+            for id in CASCADIA_FACES {
                 assert_eq!(per_em(id), Some(-608.0 / 2048.0), "{id}");
             }
         }
@@ -820,7 +1045,10 @@ mod tests {
     /// Every identity this build serves parses, and each four-face family is a
     /// real monospace family whose files ARE the Regular / Bold / Italic /
     /// Bold Italic their identities claim — by the faces' own OS/2 weight and
-    /// italic bit, and by their `name`-table family (name ID 1).
+    /// italic bit, and by their `name`-table family (name ID 1). The Iosevka
+    /// Term Semibold slots are the SemiBold (600) and ExtraBold (800) faces,
+    /// whose name ID 1 reads `Iosevka Term Semibold` / `Iosevka Term
+    /// Extrabold`, and none of its four carries `calt`.
     #[test]
     fn every_bundled_face_parses_and_each_family_is_a_real_monospace_family() {
         let served: Vec<&str> = ALL_IDS
@@ -830,35 +1058,46 @@ mod tests {
             .collect();
         let expected_count = usize::from(ACTIVE) * 7
             + usize::from(CASCADIA_ACTIVE) * 4
-            + usize::from(IOSEVKA_ACTIVE) * 4;
+            + usize::from(IOSEVKA_ACTIVE) * 4
+            + usize::from(IOSEVKA_SEMIBOLD_ACTIVE) * 4;
         assert_eq!(served.len(), expected_count, "{served:?}");
         for id in &served {
             let bytes = face_for_id(id).expect("filtered to served ids");
             let face = aterm_font::Face::parse(bytes, 0).unwrap_or_else(|e| panic!("{id}: {e}"));
             assert!(face.number_of_glyphs() > 100, "{id}");
         }
-        let mut families = Vec::new();
+        /// A family's four identities, each face's name ID 1, and each
+        /// face's `(OS/2 weight, italic)`.
+        type Family = ([&'static str; 4], [&'static str; 4], [(u16, bool); 4]);
+        const PLAIN: [(u16, bool); 4] = [(400, false), (700, false), (400, true), (700, true)];
+        let mut families: Vec<Family> = Vec::new();
         if ACTIVE {
-            families.push((JETBRAINS_FAMILY, PRIMARY_FAMILIES[1]));
+            families.push((JETBRAINS_FACES, [JETBRAINS_FAMILY; 4], PLAIN));
         }
         if IOSEVKA_ACTIVE {
-            families.push((IOSEVKA_FAMILY, PRIMARY_FAMILIES[2]));
+            families.push((IOSEVKA_FACES, [IOSEVKA_FAMILY; 4], PLAIN));
         }
         if CASCADIA_ACTIVE {
+            families.push((CASCADIA_FACES, [CASCADIA_FAMILY; 4], PLAIN));
+        }
+        if IOSEVKA_SEMIBOLD_ACTIVE {
+            let extrabold = "Iosevka Term Extrabold";
             families.push((
-                CASCADIA_FAMILY,
+                IOSEVKA_SEMIBOLD_FACES,
                 [
-                    CASCADIA_ID,
-                    CASCADIA_BOLD_ID,
-                    CASCADIA_ITALIC_ID,
-                    CASCADIA_BOLD_ITALIC_ID,
+                    IOSEVKA_SEMIBOLD_FAMILY,
+                    extrabold,
+                    IOSEVKA_SEMIBOLD_FAMILY,
+                    extrabold,
                 ],
+                [(600, false), (800, false), (600, true), (800, true)],
             ));
         }
-        for (family, ids) in families {
+        for (ids, names, expected) in families {
             let weights: Vec<(u16, bool)> = ids
                 .iter()
-                .map(|id| {
+                .zip(names)
+                .map(|(id, family)| {
                     let f = aterm_font::Face::parse(face_for_id(id).unwrap(), 0).unwrap();
                     assert!(f.is_monospaced(), "{id} must be monospaced");
                     assert!(
@@ -876,24 +1115,28 @@ mod tests {
                     (f.weight().to_number(), f.is_italic())
                 })
                 .collect();
-            assert_eq!(
-                weights,
-                [(400, false), (700, false), (400, true), (700, true)],
-                "{family}"
-            );
+            assert_eq!(weights, expected, "{}", names[0]);
+        }
+        for id in IOSEVKA_SEMIBOLD_FACES {
+            if let Some(bytes) = face_for_id(id) {
+                assert!(
+                    !crate::ligature_shaping::font_has_ligature_features(bytes),
+                    "{id}: the Windows default must carry no ligature feature"
+                );
+            }
         }
     }
 
     // ---- the stack, bound to the real renderer ------------------------------
 
-    #[cfg(all(feature = "bundled-font-stack", not(target_os = "macos")))]
+    #[cfg(all(feature = "embedded-font", not(target_os = "macos")))]
     use crate::{FaceId, GlyphClass};
-    #[cfg(feature = "bundled-font-stack")]
+    #[cfg(feature = "embedded-font")]
     use crate::{Renderer, Theme};
 
     /// The default renderer a GUI window builds when nothing is configured,
     /// sealed exactly as the backend worker seals it.
-    #[cfg(all(feature = "bundled-font-stack", not(target_os = "macos")))]
+    #[cfg(all(feature = "embedded-font", not(target_os = "macos")))]
     fn default_sealed() -> Renderer {
         let mut r = Renderer::from_system(18.0, Theme::default()).expect("a default face");
         r.seal_admitted_font_sources();
@@ -902,7 +1145,7 @@ mod tests {
 
     /// Where `ch` resolves in the sealed default chain, as a readable label:
     /// the bundled identity or system path of the face that draws it.
-    #[cfg(all(feature = "bundled-font-stack", not(target_os = "macos")))]
+    #[cfg(all(feature = "embedded-font", not(target_os = "macos")))]
     fn resolved_face(r: &mut Renderer, ch: char) -> String {
         let key = r.glyph_key(ch);
         match key.source {
@@ -930,15 +1173,17 @@ mod tests {
     }
 
     /// DEFAULT SELECTION: with nothing configured, the primary is the bundled
-    /// platform face — Cascadia Mono PL on Windows (not the system's variable
-    /// `CascadiaMono.ttf`, the first Windows candidate), JetBrains Mono on
-    /// Linux (not the system DejaVu Sans Mono `fc-match monospace` answers,
-    /// which is the first system candidate and used to win).
+    /// platform face — Iosevka Term Semibold on Windows (not the system's
+    /// variable `CascadiaMono.ttf`, the first Windows candidate, nor the
+    /// bundled Cascadia Mono PL that was the default until 2026-10-16),
+    /// JetBrains Mono on Linux (not the system DejaVu Sans Mono `fc-match
+    /// monospace` answers, which is the first system candidate and used to
+    /// win).
     #[test]
-    #[cfg(all(feature = "bundled-font-stack", not(target_os = "macos")))]
+    #[cfg(all(feature = "embedded-font", not(target_os = "macos")))]
     fn the_default_primary_is_the_bundled_platform_face() {
         let expected = if cfg!(windows) {
-            CASCADIA_ID
+            IOSEVKA_SEMIBOLD_ID
         } else {
             JETBRAINS_ID
         };
@@ -952,13 +1197,11 @@ mod tests {
         assert_eq!(candidates.first().map(String::as_str), Some(expected));
     }
 
-    /// A CONFIGURED family still wins over the bundled default, by name or by
-    /// path; and every bundled family a build makes selectable resolves by
-    /// NAME through every resolver (startup, config admission, the catalogue
-    /// worker) — on Windows both Cascadia Mono PL and JetBrains Mono.
+    /// A CONFIGURED family still wins over the bundled default, by path; and
+    /// every bundled family a build compiles in is listed as selectable.
     #[test]
-    #[cfg(all(feature = "bundled-font-stack", not(target_os = "macos")))]
-    fn a_configured_font_still_wins_and_the_bundled_families_resolve_by_name() {
+    #[cfg(all(feature = "embedded-font", not(target_os = "macos")))]
+    fn a_configured_font_still_wins_over_the_bundled_default() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/DejaVuSansMono.ttf");
         let r = Renderer::from_system_with_family(Some(path), 18.0, Theme::default()).unwrap();
         assert_eq!(
@@ -966,59 +1209,102 @@ mod tests {
             Some(path),
             "a configured path wins"
         );
-
-        // (family, regular id, bold id, cell at the 16 px probe). JetBrains
-        // Mono's own line is 1.32 em (ascent 1020 + descent 300 per 1000 upem,
-        // no lineGap) and its advance 0.6 em: ceil(21.12) x round(9.6). Cascadia
-        // Mono PL's line at 16 px is its 1900 / 2048 ascent (14.84 px) over the
-        // depth of its deepest letter, 608 / 2048 (4.75 px), plus the hinter's
-        // pixel — not the vendor's 480 (`letter_descent_floor`) — no lineGap,
-        // and its advance 1200 / 2048 em: ceil(20.59) x round(9.375). The live
-        // renderer ROUNDS the line (`cell_h_baseline`), so a window draws
-        // JetBrains Mono 10x21 and Cascadia Mono PL 9x21 at 16 px.
-        let mut families = vec![(JETBRAINS_FAMILY, JETBRAINS_ID, JETBRAINS_BOLD_ID, (10, 22))];
+        let mut families = vec![JETBRAINS_FAMILY];
         if CASCADIA_ACTIVE {
-            families.push((CASCADIA_FAMILY, CASCADIA_ID, CASCADIA_BOLD_ID, (9, 21)));
+            families.push(CASCADIA_FAMILY);
         }
-        let mut checked = 0usize;
-        for (family, id, bold_id, cell) in families {
+        if IOSEVKA_SEMIBOLD_ACTIVE {
+            families.push(IOSEVKA_SEMIBOLD_FAMILY);
+        }
+        for family in families {
             assert!(
                 selectable_families().contains(&family),
                 "{family} is bundled but not listed as selectable"
             );
-            // The NAME yields to an installed copy (see
-            // `resolve_family_or_bundled`, and the catalogue's fixture test for
-            // that half); on a host with none, it is the bundled face everywhere.
-            if crate::resolve_font_family(family).is_some() {
-                eprintln!("SKIP by-name half: {family} is installed on this host");
-                continue;
-            }
-            for spelling in [family, id] {
-                let r = Renderer::from_system_with_family(Some(spelling), 18.0, Theme::default())
-                    .unwrap();
-                assert_eq!(r.primary_source_path(), Some(id), "{spelling}");
-                assert_eq!(crate::resolve_config_font(spelling).as_deref(), Ok(id));
-            }
-            let batch = crate::font_catalog::resolve_and_admit(&[
-                family.to_string(),
-                format!("{family} Bold"),
-            ]);
-            let admitted: Vec<_> = batch
-                .entries
-                .iter()
-                .map(|e| e.result.as_ref().map(|a| a.path.clone()).ok())
-                .collect();
-            assert_eq!(admitted, [Some(id.to_string()), Some(bold_id.to_string())]);
-            assert!(crate::list_fonts().iter().any(|f| f == family), "{family}");
-            let info = crate::face_info(family).expect("face_info resolves the bundle");
-            assert_eq!(info.path, id);
-            assert_eq!((info.cell_width, info.cell_height), cell, "{family}");
-            checked += 1;
         }
-        eprintln!("{checked} bundled famil(ies) resolved by name");
     }
 
-    /// IOSEVKA TERM BY NAME, on every platform the stack feature is on —
+    /// A bundled family resolves by NAME through every resolver (startup,
+    /// config admission, the catalogue worker) to its compiled-in faces, and
+    /// measures its own `cell` at the 16 px probe.
+    ///
+    /// The NAME yields to an installed copy (see `resolve_family_or_bundled`,
+    /// and the catalogue's fixture test for that half), so on a host that has
+    /// one the bundle cannot be asked by name: COULD NOT RUN.
+    #[cfg(all(feature = "embedded-font", not(target_os = "macos")))]
+    fn bundled_family_resolves_by_name(
+        family: &str,
+        id: &str,
+        bold_id: &str,
+        cell: (usize, usize),
+    ) {
+        if crate::resolve_font_family(family).is_some() {
+            aterm_spec::host::could_not_run(format!(
+                "{family} is installed on this host, and an installed copy wins the name"
+            ));
+        }
+        for spelling in [family, id] {
+            let r =
+                Renderer::from_system_with_family(Some(spelling), 18.0, Theme::default()).unwrap();
+            assert_eq!(r.primary_source_path(), Some(id), "{spelling}");
+            assert_eq!(crate::resolve_config_font(spelling).as_deref(), Ok(id));
+        }
+        let batch =
+            crate::font_catalog::resolve_and_admit(&[family.to_string(), format!("{family} Bold")]);
+        let admitted: Vec<_> = batch
+            .entries
+            .iter()
+            .map(|e| e.result.as_ref().map(|a| a.path.clone()).ok())
+            .collect();
+        assert_eq!(admitted, [Some(id.to_string()), Some(bold_id.to_string())]);
+        assert!(crate::list_fonts().iter().any(|f| f == family), "{family}");
+        let info = crate::face_info(family).expect("face_info resolves the bundle");
+        assert_eq!(info.path, id);
+        assert_eq!((info.cell_width, info.cell_height), cell, "{family}");
+    }
+
+    /// JetBrains Mono by name. Its own line is 1.32 em (ascent 1020 + descent
+    /// 300 per 1000 upem, no lineGap) and its advance 0.6 em: ceil(21.12) x
+    /// round(9.6) at the 16 px probe. The live renderer ROUNDS the line
+    /// (`cell_h_baseline`), so a window draws it 10x21 at 16 px.
+    #[test]
+    #[cfg(all(feature = "embedded-font", not(target_os = "macos")))]
+    fn jetbrains_mono_resolves_by_name() {
+        bundled_family_resolves_by_name(
+            JETBRAINS_FAMILY,
+            JETBRAINS_ID,
+            JETBRAINS_BOLD_ID,
+            (10, 22),
+        );
+    }
+
+    /// Cascadia Mono PL by name, on Windows, where it is compiled in. Its line
+    /// at 16 px is its 1900 / 2048 ascent (14.84 px) over the depth of its
+    /// deepest letter, 608 / 2048 (4.75 px), plus the hinter's pixel — not the
+    /// vendor's 480 (`letter_descent_floor`) — no lineGap, and its advance
+    /// 1200 / 2048 em: ceil(20.59) x round(9.375); a window draws it 9x21.
+    #[test]
+    #[cfg(all(feature = "embedded-font", windows))]
+    fn cascadia_mono_pl_resolves_by_name() {
+        bundled_family_resolves_by_name(CASCADIA_FAMILY, CASCADIA_ID, CASCADIA_BOLD_ID, (9, 21));
+    }
+
+    /// Iosevka Term Semibold by name, on Windows, where it is compiled in (the
+    /// platform's default face). Its line is 1.25 em (ascent 965 + descent 285
+    /// per 1000, no lineGap; its deepest letter, 259, is inside it) and its
+    /// advance 0.5 em: 8x20 at the 16 px probe, Iosevka Term's own cell.
+    #[test]
+    #[cfg(all(feature = "embedded-font", windows))]
+    fn iosevka_term_semibold_resolves_by_name() {
+        bundled_family_resolves_by_name(
+            IOSEVKA_SEMIBOLD_FAMILY,
+            IOSEVKA_SEMIBOLD_ID,
+            IOSEVKA_SEMIBOLD_BOLD_ID,
+            (8, 20),
+        );
+    }
+
+    /// IOSEVKA TERM BY NAME, on every platform the `embedded-font` feature is on —
     /// macOS included, where nothing else of the stack is compiled in: the
     /// family name and its identity resolve to the compiled-in faces (an
     /// installed Iosevka Term would win the name), a renderer built on it
@@ -1030,16 +1316,25 @@ mod tests {
     /// own: its Powerline points (U+E0A0..E0A3, U+E0B0..E0B3) stand inside
     /// its line (-285..965 of 1000), so it does not yield them.
     #[test]
-    #[cfg(feature = "bundled-font-stack")]
-    fn iosevka_term_is_selectable_by_name_on_every_platform() {
+    #[cfg(feature = "embedded-font")]
+    fn iosevka_term_is_selectable_on_every_platform() {
         assert!(selectable_families().contains(&IOSEVKA_FAMILY));
         assert!(crate::list_fonts().iter().any(|f| f == IOSEVKA_FAMILY));
-        for id in PRIMARY_FAMILIES[2] {
+        for id in IOSEVKA_FACES {
             assert!(!yields_private_use(face_for_id(id).unwrap()), "{id}");
         }
+    }
+
+    /// [`iosevka_term_is_selectable_on_every_platform`]'s by-name half: the
+    /// name resolves to the compiled-in faces everywhere. An installed Iosevka
+    /// Term wins the name, so on a host with one this half COULD NOT RUN.
+    #[test]
+    #[cfg(feature = "embedded-font")]
+    fn iosevka_term_resolves_by_name_on_every_platform() {
         if crate::resolve_font_family(IOSEVKA_FAMILY).is_some() {
-            eprintln!("SKIP by-name half: {IOSEVKA_FAMILY} is installed on this host");
-            return;
+            aterm_spec::host::could_not_run(format!(
+                "{IOSEVKA_FAMILY} is installed on this host, and an installed copy wins the name"
+            ));
         }
         for spelling in [IOSEVKA_FAMILY, IOSEVKA_ID] {
             assert_eq!(
@@ -1051,7 +1346,7 @@ mod tests {
             r.seal_admitted_font_sources();
             assert_eq!(r.primary_source_path(), Some(IOSEVKA_ID), "{spelling}");
             assert_eq!(r.debug_styled_face_indices(), [Some(0); 3]);
-            for (slot, id) in r.styled_faces.iter().zip(&PRIMARY_FAMILIES[2][1..]) {
+            for (slot, id) in r.styled_faces.iter().zip(&IOSEVKA_FACES[1..]) {
                 let face = slot.as_ref().expect("slot filled");
                 assert_eq!(&face.bytes[..], face_for_id(id).unwrap(), "{id}");
             }
@@ -1077,23 +1372,71 @@ mod tests {
         assert_eq!((info.cell_width, info.cell_height), (8, 20));
     }
 
-    /// The LIVE cell of the default face at the default Windows size (16 px):
-    /// what a window actually draws, measured through the renderer the GUI
-    /// builds rather than the `show-face` probe above.
+    /// The size and line height a Windows window draws the default face at:
+    /// aterm-gui's `FONT_PX` and its config's line-height default
+    /// (`app_config::DEFAULT_LINE_HEIGHT`), which the GUI hands the renderer
+    /// through `set_line_height`. The renderer itself knows neither, so the
+    /// GUI pins the same cell from its own constants
+    /// (`the_windows_defaults_draw_the_judged_9x23_cell`).
+    #[cfg(windows)]
+    const WINDOWS_DEFAULT_PX: f32 = 17.0;
+    /// See [`WINDOWS_DEFAULT_PX`].
+    #[cfg(windows)]
+    const WINDOWS_DEFAULT_LINE_HEIGHT: f32 = 1.1;
+
+    /// THE OLD LOOK, BACK BY NAME: `font_family = "Cascadia Mono PL"`,
+    /// `font_px = 16`, `line_height = 1.0` — the Windows default until
+    /// 2026-10-16 — still draws Cascadia's own 9x21 cell on baseline row 15,
+    /// from its real styled faces.
     #[test]
-    #[cfg(all(feature = "bundled-font-stack", not(target_os = "macos")))]
-    fn the_default_face_draws_its_measured_cell_at_16_px() {
-        let r = Renderer::from_system(16.0, Theme::default()).expect("a default face");
-        let expected = if cfg!(windows) { (9, 21) } else { (10, 21) };
-        assert_eq!(r.cell_size(), expected);
+    #[cfg(all(feature = "embedded-font", windows))]
+    fn cascadia_mono_pl_by_name_at_16_px_keeps_its_9x21_cell() {
+        let mut r = cascadia_sealed(16.0);
+        r.set_line_height(1.0);
+        assert_eq!((r.cell_size(), r.baseline()), ((9, 21), 15));
+        assert_eq!(r.debug_styled_face_indices(), [Some(0); 3]);
+        for (slot, id) in r.styled_faces.iter().zip(&CASCADIA_FACES[1..]) {
+            let face = slot.as_ref().expect("slot filled");
+            assert_eq!(&face.bytes[..], face_for_id(id).unwrap(), "{id}");
+        }
+    }
+
+    /// The bundled Cascadia Mono PL as the primary, by its identity (which
+    /// always means the compiled-in face, never an installed one): the face
+    /// the yield tests below are about, chosen by name now that it is not the
+    /// Windows default.
+    #[cfg(all(feature = "embedded-font", windows))]
+    fn cascadia(px: f32) -> Renderer {
+        let r = Renderer::from_system_with_family(Some(CASCADIA_ID), px, Theme::default())
+            .expect("the bundled Cascadia Mono PL");
+        assert_eq!(r.primary_source_path(), Some(CASCADIA_ID));
+        r
+    }
+
+    /// [`cascadia`], sealed as a window seals it.
+    #[cfg(all(feature = "embedded-font", windows))]
+    fn cascadia_sealed(px: f32) -> Renderer {
+        let mut r = cascadia(px);
+        r.seal_admitted_font_sources();
+        r
     }
 
     /// THE DEFAULT CELL HOLDS ITS LETTERS (`letter_descent_floor`). Measured on
-    /// the rasters the cell draws, at every size from 8 to 40 px and in all
-    /// four styles: every Latin letter that hangs a mark or a stroke below the
-    /// baseline ends INSIDE the cell, so the blit's row-band clip cuts nothing
-    /// visible off it. And at the default 16 px a row of descenders keeps at
-    /// least one clear pixel row above the capital accents of the row under it.
+    /// the rasters the cell draws, at every size from 8 to 40 px on the
+    /// platform's default line height (Windows 1.1, elsewhere the face's own)
+    /// and in all four styles: every Latin letter that hangs a mark or a
+    /// stroke below the baseline ends INSIDE the cell, so the blit's row-band
+    /// clip cuts nothing visible off it. And at the default size and line
+    /// height (Windows: 17 px on the 1.1 line; elsewhere 16 px on the face's
+    /// own) a row of descenders keeps at least one clear pixel row above the
+    /// capital accents of the row under it.
+    ///
+    /// On its own 1.0 line Iosevka Term Semibold keeps its letters too, at
+    /// every size but 9 px, where the hinter puts the comma-below and cedilla
+    /// letters' marks (`ș ț Ș Ț ķ ļ ņ ŗ Ģ Ķ Ļ Ņ Ŗ`) one row under the 11-row
+    /// cell (measured 2026-10-16); its 259 / 1000 is inside its 285 descent,
+    /// so the floor does not move its line, and a window's 1.1 line holds
+    /// them at every size.
     ///
     /// VISIBLE ink is a row whose strongest pixel reaches 1/8 coverage: the
     /// hinter leaves single-digit fringes (a bold `ķ` inks 5/255 one row
@@ -1102,9 +1445,12 @@ mod tests {
     /// Before the floor, on Windows (Cascadia Mono PL on its vendor line, a
     /// 9x19 cell at 16 px): a regular `ș` ended one row and a bold one two
     /// rows past the cell (coverage 55 and 54/255), and the caron of an `Š`
-    /// inked the row a `j` above it ended on.
+    /// inked the row a `j` above it ended on. On Windows now the clear row is
+    /// the 1.1 line's: Iosevka Term Semibold's accents rise to its line's top
+    /// at 17 px, and on its own 1.0 line they start on the row a `j` above
+    /// ends on — the collision the 2026-10-16 farm's first round saw.
     #[test]
-    #[cfg(all(feature = "bundled-font-stack", not(target_os = "macos")))]
+    #[cfg(all(feature = "embedded-font", not(target_os = "macos")))]
     fn the_default_cell_holds_its_letters_and_keeps_a_clear_row_between_lines() {
         use crate::{GlyphImage, StyleBits};
         const STYLES: [StyleBits; 4] = [
@@ -1137,9 +1483,14 @@ mod tests {
                 top + i32::try_from(last).unwrap() + 1,
             )
         };
+        #[cfg(windows)]
+        let (default_px, default_line_height) = (WINDOWS_DEFAULT_PX, WINDOWS_DEFAULT_LINE_HEIGHT);
+        #[cfg(not(windows))]
+        let (default_px, default_line_height) = (16.0, 1.0);
         let hanging = "șțȘȚķļņŗģĢĶĻŅŖşţŞŢçÇąęįųgjpqy";
         for px in 8..=40u8 {
             let mut r = Renderer::from_system(f32::from(px), Theme::default()).unwrap();
+            r.set_line_height(default_line_height);
             let cell_h = i32::try_from(r.cell_size().1).unwrap();
             for ch in hanging.chars() {
                 for style in STYLES {
@@ -1151,33 +1502,54 @@ mod tests {
                 }
             }
         }
-        // The default 16 px, on the SEALED generation a window draws with.
-        let mut r = Renderer::from_system(16.0, Theme::default()).unwrap();
-        r.seal_admitted_font_sources();
-        let cell_h = i32::try_from(r.cell_size().1).unwrap();
-        let (mut lowest, mut highest) = (i32::MIN, i32::MAX);
-        for style in STYLES {
-            for ch in "gjpqy".chars() {
-                lowest = lowest.max(ink(&mut r, ch, style).1);
+        // The clear pixel rows between a row's lowest descender and the
+        // highest capital accent of the row under it, at `px` on a
+        // `line_height` line, on the SEALED generation a window draws with.
+        let clear_rows = |px: f32, line_height: f32| -> i32 {
+            let mut r = Renderer::from_system(px, Theme::default()).unwrap();
+            r.set_line_height(line_height);
+            r.seal_admitted_font_sources();
+            let cell_h = i32::try_from(r.cell_size().1).unwrap();
+            let (mut lowest, mut highest) = (i32::MIN, i32::MAX);
+            for style in STYLES {
+                for ch in "gjpqy".chars() {
+                    lowest = lowest.max(ink(&mut r, ch, style).1);
+                }
+                for ch in "ŠŽČŘŇĎŤÂÊĚÉÈÅÑÄÖ".chars() {
+                    highest = highest.min(ink(&mut r, ch, style).0);
+                }
             }
-            for ch in "ŠŽČŘŇĎŤÂÊĚÉÈÅÑÄÖ".chars() {
-                highest = highest.min(ink(&mut r, ch, style).0);
-            }
-        }
-        // A descender of one row ends at `lowest`; the accent of the row under
-        // it starts at `cell_h + highest`.
+            // A descender of one row ends at `lowest`; the accent of the row
+            // under it starts at `cell_h + highest`.
+            cell_h + highest - lowest
+        };
+        let clear = clear_rows(default_px, default_line_height);
         assert!(
-            cell_h + highest - lowest >= 1,
-            "16 px: descenders end at row {lowest} of {cell_h}, the next row's accents start \
-             at its row {highest}: no clear row between them"
+            clear >= 1,
+            "{default_px} px on a {default_line_height} line: {clear} clear rows between a \
+             row's descenders and the accents of the row under it"
         );
+        // Windows: the line height is what buys the row. MEASURED 2026-10-16:
+        // two clear rows on the 1.1 line (the farm's J2-lh11 render drew no
+        // accent pixel touching a descender), none on the face's own line at
+        // the same 17 px.
+        #[cfg(windows)]
+        {
+            assert_eq!(clear, 2, "the measured gap moved");
+            let own_line = clear_rows(WINDOWS_DEFAULT_PX, 1.0);
+            assert!(
+                own_line < 1,
+                "CONTROL: on its own 1.0 line the default face kept {own_line} clear rows, so \
+                 this test cannot tell the line height's row from the face's"
+            );
+        }
     }
 
     /// BOLD / ITALIC RESOLUTION: the bundled primary's three styled slots are
     /// filled from its REAL compiled-in faces — never a sibling FILE lookup,
     /// never the synthetic dilation/shear.
     #[test]
-    #[cfg(all(feature = "bundled-font-stack", not(target_os = "macos")))]
+    #[cfg(all(feature = "embedded-font", not(target_os = "macos")))]
     fn the_bundled_primary_resolves_real_bold_italic_and_bold_italic_faces() {
         let r = default_sealed();
         assert_eq!(r.debug_styled_face_indices(), [Some(0); 3]);
@@ -1190,9 +1562,16 @@ mod tests {
                 (parsed.weight().to_number(), parsed.is_italic())
             })
             .collect();
-        assert_eq!(styles, [(700, false), (400, true), (700, true)]);
-        // And they are THIS build's primary family's own files (Cascadia Mono
-        // PL on Windows: its real cursive italic, not a shear of the upright).
+        // Windows: the ExtraBold, SemiBold Italic and ExtraBold Italic faces
+        // beside the SemiBold primary.
+        let expected = if cfg!(windows) {
+            [(800, false), (600, true), (800, true)]
+        } else {
+            [(700, false), (400, true), (700, true)]
+        };
+        assert_eq!(styles, expected);
+        // And they are THIS build's primary family's own files (Iosevka Term
+        // Semibold on Windows: its real italics, not a shear of the upright).
         for (slot, id) in
             r.styled_faces
                 .iter()
@@ -1203,28 +1582,32 @@ mod tests {
         }
     }
 
-    /// JetBrains Mono chosen BY NAME on Windows, where it is not the default,
-    /// still gets its own real styled faces.
+    /// THE WINDOWS DEFAULT IS THE JUDGED CUT, by the bytes: with nothing
+    /// configured, the primary and its bold, italic and bold-italic slots
+    /// hold exactly the four checked-in subsets of Iosevka Term's SemiBold,
+    /// ExtraBold, SemiBold Italic and ExtraBold Italic (each read here by its
+    /// own file name, not through the identity table), and the regular
+    /// weight is never one of the bundled Iosevka Term Regular set's faces.
     #[test]
-    #[cfg(all(feature = "bundled-font-stack", windows))]
-    fn a_named_jetbrains_mono_on_windows_resolves_its_own_styled_faces() {
-        // An installed JetBrains Mono wins the name, by design.
-        if crate::resolve_font_family(JETBRAINS_FAMILY).is_some() {
-            aterm_spec::host::could_not_run("JetBrains Mono is installed on this host");
-        }
-        let mut r =
-            Renderer::from_system_with_family(Some(JETBRAINS_FAMILY), 18.0, Theme::default())
-                .unwrap();
-        r.seal_admitted_font_sources();
-        assert_eq!(r.primary_source_path(), Some(JETBRAINS_ID));
-        assert_eq!(r.debug_styled_face_indices(), [Some(0); 3]);
-        for (slot, id) in r.styled_faces.iter().zip([
-            JETBRAINS_BOLD_ID,
-            JETBRAINS_ITALIC_ID,
-            JETBRAINS_BOLD_ITALIC_ID,
-        ]) {
+    #[cfg(all(feature = "embedded-font", windows))]
+    fn the_windows_default_slots_are_the_semibold_and_extrabold_subsets() {
+        let r = default_sealed();
+        let (primary, _) = r.chrome_primary_face().expect("primary bytes");
+        assert_eq!(
+            &primary[..],
+            include_bytes!("../assets/bundled/IosevkaTerm-SemiBold.ttf")
+        );
+        let files: [&[u8]; 3] = [
+            include_bytes!("../assets/bundled/IosevkaTerm-ExtraBold.ttf"),
+            include_bytes!("../assets/bundled/IosevkaTerm-SemiBoldItalic.ttf"),
+            include_bytes!("../assets/bundled/IosevkaTerm-ExtraBoldItalic.ttf"),
+        ];
+        for (slot, file) in r.styled_faces.iter().zip(files) {
             let face = slot.as_ref().expect("slot filled");
-            assert_eq!(&face.bytes[..], face_for_id(id).unwrap(), "{id}");
+            assert_eq!(&face.bytes[..], file);
+        }
+        for id in IOSEVKA_FACES {
+            assert_ne!(&primary[..], face_for_id(id).unwrap(), "{id}");
         }
     }
 
@@ -1232,21 +1615,26 @@ mod tests {
     /// generation a window publishes. Each expectation is the first face in the
     /// declared order whose cmap carries the code point — on Linux JetBrains
     /// Mono → DejaVu Sans Mono → Noto Sans Symbols 2 → Noto Sans Math → …, on
-    /// Windows Cascadia Mono PL → DejaVu Sans Mono → the same two Noto faces →
-    /// … — and NOTHING in the set may end as `.notdef`.
+    /// Windows Iosevka Term Semibold → DejaVu Sans Mono → the same two Noto
+    /// faces → … — and NOTHING in the set may end as `.notdef`.
     #[test]
-    #[cfg(all(feature = "bundled-font-stack", not(target_os = "macos")))]
+    #[cfg(all(feature = "embedded-font", not(target_os = "macos")))]
     fn the_test_set_resolves_in_the_declared_order_and_never_to_notdef() {
         let mut r = default_sealed();
         let primary = format!("primary:{PRIMARY_ID}");
         let dejavu = format!("fallback:{DEJAVU_ID}");
         let sym2 = format!("symbol:{NOTO_SYMBOLS2_ID}");
         let math = format!("symbol:{NOTO_MATH_ID}");
-        // WINDOWS, measured from the cmaps (2026-09-30): Cascadia Mono PL
-        // carries ◐ but none of ✗ ⚠ ⇒ ⇐ ⌘ ➜ ∴ ✔ ✘ ↵ ★ ⚙ ✻, all of which
-        // DejaVu Sans Mono — the broad tier's one bundled face — carries.
+        // WINDOWS, measured from the cmaps (2026-10-16): Iosevka Term
+        // Semibold carries the whole set but `ℒ` — the arrows, the checks and
+        // crosses, `⚠ ✻`, the media controls Claude Code draws (`⏺ ⏵`) and the
+        // math operators — so the chain answers only what it lacks. The tiers'
+        // order is held by points measured to reach each: DejaVu Sans Mono's
+        // `☎ ✂ ♔`, Noto Sans Symbols 2's `⮜ ⮞ ⛏`, Noto Sans Math's `ℒ ⏐ ⨍`.
+        // (Cascadia Mono PL, the default before it, carried only ◐ of
+        // `✗ ⚠ ⇒ ⇐ ⌘ ➜ ∴ ✔ ✘ ↵ ★ ⚙ ✻` and none of the media or math points.)
         #[cfg(windows)]
-        let platform: &[(char, &str)] = &[
+        let expected: &[(char, &str)] = &[
             ('▶', &primary),
             ('◀', &primary),
             ('●', &primary),
@@ -1257,22 +1645,41 @@ mod tests {
             ('∞', &primary),
             ('≈', &primary),
             ('◐', &primary),
-            ('✗', &dejavu),
-            ('⚠', &dejavu),
-            ('⇒', &dejavu),
-            ('⇐', &dejavu),
-            ('⌘', &dejavu),
-            ('➜', &dejavu),
-            ('∴', &dejavu),
-            ('✔', &dejavu),
-            ('✘', &dejavu),
-            ('↵', &dejavu),
-            ('★', &dejavu),
-            ('⚙', &dejavu),
-            ('✻', &dejavu),
+            ('✗', &primary),
+            ('⚠', &primary),
+            ('⇒', &primary),
+            ('⇐', &primary),
+            ('⌘', &primary),
+            ('➜', &primary),
+            ('∴', &primary),
+            ('✔', &primary),
+            ('✘', &primary),
+            ('↵', &primary),
+            ('★', &primary),
+            ('⚙', &primary),
+            ('✻', &primary),
+            ('⏴', &primary),
+            ('⏵', &primary),
+            ('⏶', &primary),
+            ('⏷', &primary),
+            ('⏺', &primary),
+            ('⏸', &primary),
+            ('⊨', &primary),
+            ('⨁', &primary),
+            ('⩽', &primary),
+            ('⟹', &primary),
+            ('☎', &dejavu),
+            ('✂', &dejavu),
+            ('♔', &dejavu),
+            ('⮜', &sym2),
+            ('⮞', &sym2),
+            ('⛏', &sym2),
+            ('ℒ', &math),
+            ('⏐', &math),
+            ('⨍', &math),
         ];
         #[cfg(not(windows))]
-        let platform: &[(char, &str)] = &[
+        let expected: &[(char, &str)] = &[
             // JetBrains Mono's own glyphs.
             ('▶', &primary),
             ('◀', &primary),
@@ -1292,8 +1699,6 @@ mod tests {
             ('↵', &dejavu),
             ('★', &dejavu),
             ('⚙', &dejavu),
-        ];
-        let shared: &[(char, &str)] = &[
             // Media / technical: Noto Sans Symbols 2 — a REAL glyph now beats
             // the synthetic tier that drew these before the stack shipped.
             ('⏴', &sym2),
@@ -1310,7 +1715,7 @@ mod tests {
             ('ℒ', &math),
         ];
         let mut wrong = Vec::new();
-        for &(ch, want) in platform.iter().chain(shared) {
+        for &(ch, want) in expected {
             let got = resolved_face(&mut r, ch);
             if got != want {
                 wrong.push(format!("{ch} U+{:04X}: want {want}, got {got}", ch as u32));
@@ -1322,8 +1727,10 @@ mod tests {
             wrong.join("\n")
         );
         // The rest of the set: braille is procedural, ⏩ is emoji-default (the
-        // colour face's, or the synthesis without one — never a bundled text
-        // face), and whatever carries ⎿ it must not be tofu.
+        // colour face's, or the synthesis without one — never a bundled CHAIN
+        // face; on Windows Segoe UI Symbol's, since the default leaves its own
+        // one-column glyph for this two-column character to the chain,
+        // `yields_wide_characters`), and whatever carries ⎿ it must not be tofu.
         for ch in ['⎿', '⏩', '⠀', '⣿'] {
             let got = resolved_face(&mut r, ch);
             assert_ne!(got, "NOTDEF", "{ch} U+{:04X} is tofu", ch as u32);
@@ -1336,17 +1743,19 @@ mod tests {
 
     /// THE WINDOWS PROMPT LINE: each Powerline / Nerd Font code point a shell
     /// prompt draws resolves to the face that owns it on the sealed default
-    /// chain — the separators U+E0B0..E0BF to the procedural tier, and
-    /// everything else to the embedded Symbols Nerd Font: the branch,
-    /// line-number, lock and column-number glyphs U+E0A0..E0A3 and the
-    /// Powerline-extra flames, pixels and trapezoids U+E0C0..E0D4, which
-    /// Cascadia Mono PL maps itself but yields (`yields_private_use`; its own
-    /// glyphs paint into the row above), the common Nerd Font prompt set, and
-    /// the points Segoe UI Symbol and Arial also map (U+E000, U+E200, U+F013,
-    /// U+F301) to an unrelated glyph (`FOREIGN_PRIVATE_USE_FACES` in the crate
-    /// root).
+    /// chain — the separators U+E0B0..E0BF to the procedural tier; the
+    /// branch, line-number, lock and column-number glyphs U+E0A0..E0A3 to
+    /// Iosevka Term Semibold itself, whose own glyphs stand inside its cell
+    /// (it does not yield them, `yields_private_use`); and everything else to
+    /// the embedded Symbols Nerd Font: the Powerline-extra flames, pixels and
+    /// trapezoids U+E0C0..E0D4, which the face does not map, the common Nerd
+    /// Font prompt set, and the points Segoe UI Symbol and Arial also map
+    /// (U+E000, U+E200, U+F013, U+F301) to an unrelated glyph
+    /// (`FOREIGN_PRIVATE_USE_FACES` in the crate root). Cascadia Mono PL,
+    /// chosen by name, yields its own U+E0A0..E0A3 too
+    /// (`the_yielded_powerline_glyphs_draw_inside_their_cell_at_16_px`).
     #[test]
-    #[cfg(all(windows, feature = "bundled-font-stack", feature = "embedded-symbols"))]
+    #[cfg(all(windows, feature = "embedded-font"))]
     fn the_windows_prompt_line_resolves_each_icon_to_the_face_that_owns_it() {
         let mut r = default_sealed();
         for ch in [
@@ -1359,12 +1768,77 @@ mod tests {
                 ch as u32
             );
         }
+        for ch in ['\u{E0A0}', '\u{E0A1}', '\u{E0A2}', '\u{E0A3}'] {
+            let key = r.glyph_key(ch);
+            assert_eq!(
+                (key.source, key.glyph_class),
+                (FaceId::Primary, GlyphClass::MonoGid),
+                "U+{:04X}: the default face draws its own",
+                ch as u32
+            );
+        }
         for ch in [
-            '\u{E0A0}', '\u{E0A1}', '\u{E0A2}', '\u{E0A3}', '\u{E0C0}', '\u{E0C4}', '\u{E0D2}',
-            '\u{F418}', '\u{F07C}', '\u{E718}', '\u{E7A8}', '\u{F0E7}', '\u{F120}', '\u{F308}',
-            '\u{E5FF}', '\u{F113}', '\u{E000}', '\u{E200}', '\u{F013}', '\u{F301}',
+            '\u{E0C0}', '\u{E0C4}', '\u{E0D2}', '\u{F418}', '\u{F07C}', '\u{E718}', '\u{E7A8}',
+            '\u{F0E7}', '\u{F120}', '\u{F308}', '\u{E5FF}', '\u{F113}', '\u{E000}', '\u{E200}',
+            '\u{F013}', '\u{F301}',
         ] {
             assert_embedded_nerd_lane(&mut r, ch);
+        }
+    }
+
+    /// The default face's own Powerline glyphs, which it keeps, stand inside
+    /// the cell a Windows window draws (17 px on the 1.1 line, 9x23): every
+    /// pixel of the face's U+E0A0..E0A3 rasters, regular and bold. MEASURED
+    /// 2026-10-16: ink rows 3..19 and columns 0..9 (half-open), where
+    /// Cascadia Mono PL's own trapezoid painted three rows into the row above
+    /// and a column either side. Its italic faces slant them like their
+    /// letters, a column left of the cell (the italic branch inks column -1),
+    /// as any italic glyph leans into its neighbour.
+    #[test]
+    #[cfg(all(windows, feature = "embedded-font"))]
+    fn the_default_faces_own_powerline_glyphs_stand_inside_the_windows_cell() {
+        use crate::StyleBits;
+        let mut r = Renderer::from_system(WINDOWS_DEFAULT_PX, Theme::default()).unwrap();
+        r.set_line_height(WINDOWS_DEFAULT_LINE_HEIGHT);
+        r.seal_admitted_font_sources();
+        let (cw, ch) = r.cell_size();
+        assert_eq!((cw, ch), (9, 23));
+        let baseline = r.baseline();
+        for style in [StyleBits::REGULAR, StyleBits::BOLD] {
+            for c in ['\u{E0A0}', '\u{E0A1}', '\u{E0A2}', '\u{E0A3}'] {
+                let key = r.glyph_key_styled(c, style);
+                assert_ne!(key.source, FaceId::RuntimeFallback, "U+{:04X}", c as u32);
+                let crate::GlyphImage::Mono {
+                    width,
+                    height,
+                    xmin,
+                    ymin,
+                    bytes,
+                    ..
+                } = r.glyph_image(key)
+                else {
+                    panic!("U+{:04X}: a coverage raster", c as u32);
+                };
+                let (w, h) = (*width, *height);
+                let top = baseline - (*ymin + i32::try_from(h).unwrap());
+                for y in 0..h {
+                    for x in 0..w {
+                        if bytes[y * w + x] == 0 {
+                            continue;
+                        }
+                        let (px, py) = (
+                            *xmin + i32::try_from(x).unwrap(),
+                            top + i32::try_from(y).unwrap(),
+                        );
+                        assert!(
+                            (0..i32::try_from(cw).unwrap()).contains(&px)
+                                && (0..i32::try_from(ch).unwrap()).contains(&py),
+                            "U+{:04X} {style:?}: ink at ({px}, {py}) leaves the {cw}x{ch} cell",
+                            c as u32
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -1373,7 +1847,7 @@ mod tests {
     /// [`FaceId::RuntimeFallback`], the decision the rasterizer recovers it
     /// from is the embedded face, and the bold / italic / bold-italic keys are
     /// that same face's (never a styled sibling of the primary).
-    #[cfg(all(windows, feature = "embedded-symbols"))]
+    #[cfg(all(windows, feature = "embedded-font"))]
     fn assert_embedded_nerd_lane(r: &mut Renderer, ch: char) {
         use crate::StyleBits;
         assert_eq!(
@@ -1442,7 +1916,7 @@ mod tests {
         assert_eq!(yielding, expected);
         #[cfg(feature = "embedded-font")]
         assert!(!yields_private_use(crate::embedded_font()));
-        #[cfg(feature = "embedded-symbols")]
+        #[cfg(feature = "embedded-font")]
         assert!(!yields_private_use(crate::embedded_symbols_font()));
         // A face of the same length that is not the face does not yield.
         if let Some(bytes) = face_for_id(CASCADIA_ID) {
@@ -1453,66 +1927,17 @@ mod tests {
         }
     }
 
-    /// The Cascadia Mono PL private-use set the yield moves, measured: each of
-    /// the four faces maps the same 38 points (U+E0A0..E0A3, U+E0B0..E0C8,
-    /// U+E0CA, U+E0CC..E0D2, U+E0D4), the embedded Nerd Font maps every one —
-    /// so the yield costs no point its glyph — and on the sealed default chain
-    /// every one of them that is not a procedural separator now draws from
-    /// the Nerd Font, in every style.
-    #[test]
-    #[cfg(all(windows, feature = "bundled-font-stack", feature = "embedded-symbols"))]
-    fn every_private_use_point_the_default_face_maps_draws_from_the_nerd_font() {
-        let mut r = default_sealed();
-        let mut expected: Vec<char> = ('\u{E0A0}'..='\u{E0A3}')
-            .chain('\u{E0B0}'..='\u{E0C8}')
-            .chain(['\u{E0CA}'])
-            .chain('\u{E0CC}'..='\u{E0D2}')
-            .chain(['\u{E0D4}'])
-            .collect();
-        expected.sort_unstable();
-        for id in PRIVATE_USE_YIELDING_IDS {
-            let face = aterm_font::Face::parse(face_for_id(id).unwrap(), 0).unwrap();
-            let mut mapped = Vec::new();
-            for sub in face.tables().cmap.unwrap().subtables {
-                if sub.is_unicode() {
-                    sub.codepoints(|cp| {
-                        if let Some(ch) = char::from_u32(cp)
-                            && crate::font_chain::is_private_use(ch)
-                            && face.glyph_index(ch).is_some_and(|g| g.0 != 0)
-                        {
-                            mapped.push(ch);
-                        }
-                    });
-                }
-            }
-            mapped.sort_unstable();
-            mapped.dedup();
-            assert_eq!(mapped, expected, "{id}: its private-use set moved");
-        }
-        let mut drawn = 0usize;
-        for &ch in &expected {
-            assert!(crate::embedded_symbols_map(ch), "U+{:04X}", ch as u32);
-            if crate::procedural::covers(ch) {
-                assert_eq!(r.glyph_key(ch).source, FaceId::Procedural);
-                continue;
-            }
-            assert_embedded_nerd_lane(&mut r, ch);
-            drawn += 1;
-        }
-        assert_eq!(drawn, 22, "U+E0A0..E0A3 and the 18 Powerline-extra points");
-    }
-
-    /// THE DEFECT, pinned on pixels at the default 16 px (9x21 cell, baseline
-    /// row 15). Cascadia Mono PL's own trapezoid U+E0D2 was 22 px tall,
+    /// THE DEFECT, pinned on pixels at Cascadia Mono PL's 16 px (9x21 cell,
+    /// baseline row 15; chosen by name). Its own trapezoid U+E0D2 was 22 px tall,
     /// rows -3..18: three rows painted into the row above, rows 19..20 left
     /// showing the next segment's colour. The yielded glyphs come from the
     /// embedded Nerd Font through the fallback fit, and every pixel of their
     /// raster lies in the cell box — GPU and CPU draw these same bytes at this
-    /// same placement. The NEGATIVE CONTROL is the same default face with the
+    /// same placement. The NEGATIVE CONTROL is the same face with the
     /// runtime tier closed, where nothing yields: its own U+E0D2 still pokes
     /// out of the cell, so the test sees the defect it was written for.
     #[test]
-    #[cfg(all(windows, feature = "bundled-font-stack", feature = "embedded-symbols"))]
+    #[cfg(all(windows, feature = "embedded-font"))]
     fn the_yielded_powerline_glyphs_draw_inside_their_cell_at_16_px() {
         // `(left, top, right, bottom)` of the raster box and of its ink
         // (coverage > 0), cell-relative, half-open.
@@ -1549,8 +1974,7 @@ mod tests {
                 ],
             )
         }
-        let mut r = Renderer::from_system(16.0, Theme::default()).expect("a default face");
-        r.seal_admitted_font_sources();
+        let mut r = cascadia_sealed(16.0);
         assert_eq!(r.cell_size(), (9, 21));
         assert_eq!(r.baseline(), 15);
         // The ink boxes the Nerd lane gives, MEASURED and pinned. The branch and
@@ -1582,7 +2006,7 @@ mod tests {
         // CONTROL: the runtime tier closed, so the primary keeps its own glyph —
         // the defect as measured on the renders: rows -3..18, and a column
         // either side of the 9-px cell too.
-        let mut closed = Renderer::from_system(16.0, Theme::default()).expect("a default face");
+        let mut closed = cascadia(16.0);
         closed.set_runtime_font_discovery(false);
         closed.seal_admitted_font_sources();
         assert_eq!(closed.glyph_key('\u{E0D2}').source, FaceId::Primary);
@@ -1604,7 +2028,7 @@ mod tests {
     /// BOLD or a STYLED face of such a primary yields too: the bold / italic
     /// cell keeps the primary's routing instead of drawing Cascadia's glyph.
     #[test]
-    #[cfg(all(windows, feature = "bundled-font-stack", feature = "embedded-symbols"))]
+    #[cfg(all(windows, feature = "embedded-font"))]
     fn a_face_that_is_not_the_bundled_cascadia_keeps_its_own_private_use_glyphs() {
         use crate::{GlyphClass, StyleBits};
         let branch = '\u{E0A0}';
@@ -1647,16 +2071,16 @@ mod tests {
     }
 
     /// THE RUNTIME SWITCH: with the runtime tier closed (the chrome and
-    /// Settings renderers) nothing could draw a yielded point, so the default
-    /// face keeps drawing its own — never `.notdef`. Opening the tier again
+    /// Settings renderers) nothing could draw a yielded point, so Cascadia
+    /// Mono PL keeps drawing its own — never `.notdef`. Opening the tier again
     /// re-resolves every memo, styled ones included, onto the runtime tier
     /// (`set_runtime_font_discovery` drops the styled memo with the rest).
     #[test]
-    #[cfg(all(windows, feature = "bundled-font-stack", feature = "embedded-symbols"))]
+    #[cfg(all(windows, feature = "embedded-font"))]
     fn the_yield_waits_for_the_runtime_tier_and_follows_it_open() {
         use crate::{GlyphClass, StyleBits};
         let branch = '\u{E0A0}';
-        let mut r = Renderer::from_system(16.0, Theme::default()).unwrap();
+        let mut r = cascadia(16.0);
         r.set_runtime_font_discovery(false);
         r.seal_admitted_font_sources();
         let key = r.glyph_key(branch);
@@ -1687,11 +2111,11 @@ mod tests {
     /// have drawn the changed gid from the face (`ColumnGlyph::Ligated`), past
     /// the yield: Cascadia's own branch again. The planner breaks the run at a
     /// yielded point instead, so those columns stay per-cell and draw from the
-    /// Nerd Font: on the default face, and in a BOLD run shaped on an injected
+    /// Nerd Font: on Cascadia Mono PL as the primary, and in a BOLD run shaped on an injected
     /// Cascadia bold beside a JetBrains Mono primary, whose own glyphs do not
     /// yield (the run's face follows its style).
     #[test]
-    #[cfg(all(windows, feature = "bundled-font-stack", feature = "embedded-symbols"))]
+    #[cfg(all(windows, feature = "embedded-font"))]
     fn a_yielded_point_breaks_the_shaping_run() {
         use crate::ColumnGlyph;
         use crate::ligature_shaping::{RowShaper, ShapedRun, build_feature_list, engine_features};
@@ -1723,14 +2147,13 @@ mod tests {
             plan
         };
         let per_cell = [ColumnGlyph::PerCell, ColumnGlyph::PerCell];
-        let mut r = Renderer::from_system(16.0, Theme::default()).unwrap();
-        r.seal_admitted_font_sources();
+        let mut r = cascadia_sealed(16.0);
         assert!(
             r.has_ligature_features,
-            "the default face's rows are shaped"
+            "Cascadia Mono PL's rows are shaped"
         );
         let plan = plan_of(&mut r, "");
-        assert_eq!(plan[1..3], per_cell, "the default face: {plan:?}");
+        assert_eq!(plan[1..3], per_cell, "Cascadia Mono PL: {plan:?}");
         for ch in ['\u{E0A0}', '\u{E0A2}'] {
             assert_eq!(r.glyph_key(ch).source, FaceId::RuntimeFallback);
         }
@@ -1754,12 +2177,82 @@ mod tests {
         );
     }
 
+    /// THE WINDOWS DEFAULT DRAWS NO PROGRAMMING LIGATURES — the 2026-10-16
+    /// farm's deal-breaker against Iosevka Term's `=>` drawn as `⇒` and `!=`
+    /// as `≠`. With `ligatures` at its default (on): shaped under the very
+    /// features the row shaper turns on, each of the four Semibold-set faces
+    /// returns every glyph of `=> != === -> <= >=` unchanged; the default
+    /// renderer never shapes its rows (no `liga` / `calt` in its `GSUB`); and
+    /// a row of them plans one per-cell glyph a column, each the face's own
+    /// glyph for its own character. CONTROL: the bundled Iosevka Term
+    /// (Regular), the same design with `calt` kept, ligates the same text.
+    #[test]
+    #[cfg(all(windows, feature = "embedded-font"))]
+    fn the_windows_default_draws_no_programming_ligatures() {
+        use crate::ColumnGlyph;
+        use crate::ligature_shaping::{RowShaper, build_feature_list, engine_features};
+        use aterm_core::terminal::Terminal;
+        let text = "=> != === -> <= >=";
+        let chars: Vec<char> = text.chars().collect();
+        let features = engine_features(&build_feature_list(&[], true));
+        let shaped_on = |id: &str| {
+            let face = aterm_font::shape::ShapeFace::from_slice(face_for_id(id).unwrap(), 0)
+                .expect("the face parses for shaping");
+            let mut buffer = aterm_font::shape::UnicodeBuffer::new();
+            RowShaper::new(face, &features).shape(text, &chars, false, &mut buffer)
+        };
+        for id in IOSEVKA_SEMIBOLD_FACES {
+            assert_eq!(shaped_on(id), None, "{id} substitutes a glyph in {text:?}");
+        }
+        assert!(
+            shaped_on(IOSEVKA_ID).is_some(),
+            "CONTROL: Iosevka Term (Regular) no longer ligates {text:?}"
+        );
+
+        let cols = u16::try_from(chars.len()).unwrap();
+        let plan_of = |r: &mut Renderer| {
+            let mut term = Terminal::new(1, cols);
+            term.process(format!("\x1b[?25l{text}").as_bytes());
+            let input = term.cell_frame(1, usize::from(cols));
+            let mut plan = Vec::new();
+            r.row_glyph_plan(&input, 0, &[], &mut plan);
+            plan
+        };
+        let mut r = default_sealed();
+        assert!(
+            !r.has_ligature_features,
+            "the default face advertises liga/calt, so its rows would be shaped"
+        );
+        let plan = plan_of(&mut r);
+        assert_eq!(plan.len(), chars.len());
+        assert!(
+            plan.iter().all(|c| *c == ColumnGlyph::PerCell),
+            "the default face ligates: {plan:?}"
+        );
+        for &ch in chars.iter().filter(|c| !c.is_whitespace()) {
+            let key = r.glyph_key(ch);
+            assert_eq!(
+                (key.source, key.glyph_class),
+                (FaceId::Primary, GlyphClass::MonoGid),
+                "{ch}"
+            );
+        }
+        let mut control =
+            Renderer::from_bytes(face_for_id(IOSEVKA_ID).unwrap(), 17.0, Theme::default()).unwrap();
+        control.seal_admitted_font_sources();
+        let plan = plan_of(&mut control);
+        assert!(
+            plan.iter().any(|c| *c != ColumnGlyph::PerCell),
+            "CONTROL: a renderer on Iosevka Term (Regular) planned no ligature: {plan:?}"
+        );
+    }
+
     /// The bundled faces lead their tiers but never TAKE what the host's own
     /// faces own: no emoji-default and no private-use point is ever picked
     /// from a bundled chain face (the colour face and the Symbols Nerd Font
     /// own those).
     #[test]
-    #[cfg(all(feature = "bundled-font-stack", not(target_os = "macos")))]
+    #[cfg(all(feature = "embedded-font", not(target_os = "macos")))]
     fn a_bundled_chain_face_never_takes_an_emoji_default_or_private_use_point() {
         let mut r = default_sealed();
         let mut checked = 0usize;
@@ -1804,7 +2297,7 @@ mod tests {
     /// Bold"`) and the Settings preview must never hand the identity to the
     /// filesystem, where it fails with ENOENT.
     #[test]
-    #[cfg(all(feature = "bundled-font-stack", not(target_os = "macos")))]
+    #[cfg(all(feature = "embedded-font", not(target_os = "macos")))]
     fn a_resolved_bundled_identity_reads_as_its_compiled_in_bytes() {
         let mut cases = Vec::new();
         if crate::resolve_font_family(JETBRAINS_FAMILY).is_none() {
@@ -1821,6 +2314,18 @@ mod tests {
                 ("Cascadia Mono PL Bold", CASCADIA_BOLD_ID),
                 ("Cascadia Mono PL Italic", CASCADIA_ITALIC_ID),
                 ("Cascadia Mono PL Bold Italic", CASCADIA_BOLD_ITALIC_ID),
+            ]);
+        }
+        if IOSEVKA_SEMIBOLD_ACTIVE && crate::resolve_font_family(IOSEVKA_SEMIBOLD_FAMILY).is_none()
+        {
+            cases.extend([
+                ("Iosevka Term Semibold", IOSEVKA_SEMIBOLD_ID),
+                ("Iosevka Term Semibold Bold", IOSEVKA_SEMIBOLD_BOLD_ID),
+                ("Iosevka Term Semibold Italic", IOSEVKA_SEMIBOLD_ITALIC_ID),
+                (
+                    "Iosevka Term Semibold Bold Italic",
+                    IOSEVKA_SEMIBOLD_BOLD_ITALIC_ID,
+                ),
             ]);
         }
         for (name, id) in cases {
@@ -1841,28 +2346,328 @@ mod tests {
         );
     }
 
+    /// THE TWO-CELL GLYPHS, measured from the faces themselves: in each of the
+    /// eight Iosevka Term faces exactly the fourteen [`is_two_cell_glyph`]
+    /// names advance wider than `M` (1000 against 500 per 1000), and the grid
+    /// gives each one column; JetBrains Mono and Cascadia Mono PL have none.
+    /// The Semibold set alone asks for the fit ([`fits_two_cell_glyphs`]), by
+    /// its bytes wherever they live.
+    #[test]
+    fn the_two_cell_glyphs_are_the_measured_fourteen_and_only_the_semibold_set_fits_them() {
+        let two_cell = |id: &str| -> Option<Vec<char>> {
+            let face = aterm_font::Face::parse(face_for_id(id)?, 0).unwrap();
+            let cell = face.glyph_hor_advance(face.glyph_index('M').unwrap())?;
+            let mut out = Vec::new();
+            for sub in face.tables().cmap.unwrap().subtables {
+                if sub.is_unicode() {
+                    sub.codepoints(|cp| {
+                        if let Some(ch) = char::from_u32(cp)
+                            && let Some(g) = face.glyph_index(ch).filter(|g| g.0 != 0)
+                            && face.glyph_hor_advance(g).is_some_and(|a| a > cell)
+                        {
+                            out.push(ch);
+                        }
+                    });
+                }
+            }
+            out.sort_unstable();
+            out.dedup();
+            Some(out)
+        };
+        let expected: Vec<char> = (0..=0x10_FFFFu32)
+            .filter_map(char::from_u32)
+            .filter(|&c| is_two_cell_glyph(c))
+            .collect();
+        assert_eq!(expected.len(), 14);
+        for &ch in &expected {
+            assert_eq!(aterm_grapheme::char_width(ch), 1, "{ch}: one grid column");
+        }
+        for id in IOSEVKA_FACES.iter().chain(&IOSEVKA_SEMIBOLD_FACES) {
+            if let Some(found) = two_cell(id) {
+                assert_eq!(found, expected, "{id}");
+            }
+        }
+        for id in JETBRAINS_FACES.iter().chain(&CASCADIA_FACES) {
+            if let Some(found) = two_cell(id) {
+                assert!(found.is_empty(), "{id}: {found:?}");
+            }
+        }
+        for &id in ALL_IDS {
+            let Some(bytes) = face_for_id(id) else {
+                continue;
+            };
+            let fits = fits_two_cell_glyphs(bytes);
+            assert_eq!(fits, IOSEVKA_SEMIBOLD_FACES.contains(&id), "{id}");
+            // A second allocation, so the contents decide, not the pointer.
+            let copy = bytes.to_vec();
+            assert_eq!(fits_two_cell_glyphs(&copy), fits, "{id}: a copy");
+        }
+    }
+
+    /// THE WINDOWS DEFAULT'S TWO-CELL GLYPHS STAY IN THEIR COLUMN: in a window
+    /// at the default size and line height, each of the fourteen draws from
+    /// the default face itself, keyed one cell wide, and its raster lies
+    /// inside its 9-px column — where drawn at its own width the long arrow
+    /// `⟹` buried the cell to its right (`fallback_harmony`'s
+    /// `a_long_arrow_does_not_shear_a_box_drawing_row`, the user-visible law).
+    /// A one-cell arrow keeps its ordinary key. CONTROL: on the opt-in Iosevka
+    /// Term (Regular), the same design, which does not ask for the fit, `⟹`
+    /// keeps its ordinary key and its raster still reaches past the column.
+    #[test]
+    #[cfg(all(windows, feature = "embedded-font"))]
+    fn the_windows_defaults_two_cell_glyphs_are_fitted_into_their_column() {
+        use aterm_core::terminal::Terminal;
+        let cell_of = |r: &mut Renderer, ch: char| {
+            let mut term = Terminal::new(1, 4);
+            term.process(format!("\x1b[?25l{ch}x").as_bytes());
+            let input = term.cell_frame(1, 4);
+            let span = crate::materialized_cell_span(&input.cells[0], 0);
+            assert_eq!(span, 1, "{ch}: the grid gives it one column");
+            let key = r.resolve_cell_key_for_span(None, &input.cells[0][0], span);
+            let img = r.glyph_image(key).clone();
+            (
+                key,
+                img.xmin(),
+                img.xmin() + i32::try_from(img.width()).unwrap(),
+            )
+        };
+        let mut r = Renderer::from_system(WINDOWS_DEFAULT_PX, Theme::default()).unwrap();
+        r.set_line_height(WINDOWS_DEFAULT_LINE_HEIGHT);
+        r.seal_admitted_font_sources();
+        let cw = i32::try_from(r.cell_size().0).unwrap();
+        assert_eq!(cw, 9);
+        let two_cell = ['\u{27DD}', '\u{27DE}', '\u{2B33}']
+            .into_iter()
+            .chain('\u{27F5}'..='\u{27FF}');
+        for ch in two_cell {
+            let (key, left, right) = cell_of(&mut r, ch);
+            assert_eq!(
+                (key.source, key.cell_span),
+                (FaceId::Primary, 1),
+                "U+{:04X}",
+                ch as u32
+            );
+            assert!(
+                left >= 0 && right <= cw,
+                "U+{:04X}: raster columns {left}..{right} leave the {cw}-px column",
+                ch as u32
+            );
+        }
+        let (key, ..) = cell_of(&mut r, '⇒');
+        assert_eq!((key.source, key.cell_span), (FaceId::Primary, 0), "⇒");
+
+        let mut control = Renderer::from_bytes(
+            face_for_id(IOSEVKA_ID).unwrap(),
+            WINDOWS_DEFAULT_PX,
+            Theme::default(),
+        )
+        .unwrap();
+        control.seal_admitted_font_sources();
+        let (key, _, right) = cell_of(&mut control, '⟹');
+        assert_eq!((key.source, key.cell_span), (FaceId::Primary, 0));
+        assert!(
+            right > i32::try_from(control.cell_size().0).unwrap(),
+            "CONTROL: Iosevka Term (Regular)'s own ⟹ fits its column ({right}), so this test \
+             cannot see the overflow it guards against"
+        );
+    }
+
+    /// The 38 code points the grid always gives two columns that Iosevka Term
+    /// maps (measured 2026-10-16, both sets), in code point order: the 22
+    /// emoji-presentation points, the angle brackets U+2329 / U+232A, the
+    /// trigrams `☰`..`☷` (U+2630..2637) and the monograms and digrams
+    /// `⚊`..`⚏` (U+268A..268F) — the last two blocks wide since Unicode 16.
+    const IOSEVKA_WIDE_CHARACTERS: [char; 38] = [
+        '\u{231A}', '\u{231B}', '\u{2329}', '\u{232A}', '\u{23E9}', '\u{23EA}', '\u{23EB}',
+        '\u{23EC}', '\u{23F0}', '\u{23F3}', '\u{25FD}', '\u{25FE}', '\u{2630}', '\u{2631}',
+        '\u{2632}', '\u{2633}', '\u{2634}', '\u{2635}', '\u{2636}', '\u{2637}', '\u{268A}',
+        '\u{268B}', '\u{268C}', '\u{268D}', '\u{268E}', '\u{268F}', '\u{26A1}', '\u{26AA}',
+        '\u{26AB}', '\u{2705}', '\u{274C}', '\u{274E}', '\u{27B0}', '\u{27BF}', '\u{2B1B}',
+        '\u{2B1C}', '\u{2B50}', '\u{2B55}',
+    ];
+
+    /// The code points `id`'s face maps that the grid always gives two
+    /// columns, each with whether its glyph is ONE cell wide (its advance is
+    /// `M`'s). `None` when the face is not compiled in.
+    fn wide_characters_of(id: &str) -> Option<Vec<(char, bool)>> {
+        let face = aterm_font::Face::parse(face_for_id(id)?, 0).unwrap();
+        let cell = face.glyph_hor_advance(face.glyph_index('M').unwrap())?;
+        let mut out = Vec::new();
+        for sub in face.tables().cmap.unwrap().subtables {
+            if sub.is_unicode() {
+                sub.codepoints(|cp| {
+                    if let Some(ch) = char::from_u32(cp)
+                        && aterm_grapheme::char_width(ch) == 2
+                        && let Some(g) = face.glyph_index(ch).filter(|g| g.0 != 0)
+                    {
+                        out.push((ch, face.glyph_hor_advance(g) == Some(cell)));
+                    }
+                });
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        Some(out)
+    }
+
+    /// THE WIDE CHARACTERS, measured from the faces themselves: in each of
+    /// the eight Iosevka Term faces the code points the grid always gives two
+    /// columns are exactly the 38 of [`IOSEVKA_WIDE_CHARACTERS`], and every
+    /// one is drawn ONE column wide. 22 are emoji by default; the rest are
+    /// the angle brackets, the trigrams, the monograms and the digrams. The Semibold set alone yields them
+    /// ([`yields_wide_characters`]), by its bytes wherever they live.
+    #[test]
+    fn the_wide_characters_are_the_measured_thirty_eight_and_only_the_semibold_set_yields_them() {
+        let expected: Vec<(char, bool)> = IOSEVKA_WIDE_CHARACTERS
+            .iter()
+            .map(|&ch| (ch, true))
+            .collect();
+        let emoji = IOSEVKA_WIDE_CHARACTERS
+            .iter()
+            .filter(|&&ch| aterm_grapheme::is_emoji_presentation(ch))
+            .count();
+        assert_eq!(emoji, 22);
+        for id in IOSEVKA_FACES.iter().chain(&IOSEVKA_SEMIBOLD_FACES) {
+            if let Some(found) = wide_characters_of(id) {
+                assert_eq!(found, expected, "{id}");
+            }
+        }
+        // The other bundled primaries map a few, also one column wide, and
+        // keep drawing them (Cascadia Mono PL's four were its own glyphs
+        // while it was the Windows default).
+        for (faces, theirs) in [
+            (
+                JETBRAINS_FACES,
+                ['\u{26A1}', '\u{FE62}', '\u{FF5B}', '\u{FF5D}'],
+            ),
+            (
+                CASCADIA_FACES,
+                ['\u{25FD}', '\u{25FE}', '\u{2B1B}', '\u{2B1C}'],
+            ),
+        ] {
+            for id in faces {
+                if let Some(found) = wide_characters_of(id) {
+                    let want: Vec<(char, bool)> = theirs.iter().map(|&ch| (ch, true)).collect();
+                    assert_eq!(found, want, "{id}");
+                }
+            }
+        }
+        for &id in ALL_IDS {
+            let Some(bytes) = face_for_id(id) else {
+                continue;
+            };
+            let yields = yields_wide_characters(bytes);
+            assert_eq!(yields, IOSEVKA_SEMIBOLD_FACES.contains(&id), "{id}");
+            // A second allocation, so the contents decide, not the pointer.
+            let copy = bytes.to_vec();
+            assert_eq!(yields_wide_characters(&copy), yields, "{id}: a copy");
+        }
+    }
+
+    /// THE WINDOWS DEFAULT'S WIDE CHARACTERS FILL THEIR TWO COLUMNS. In a
+    /// window at the default size and line height, each of the 38 wide
+    /// characters the default face maps resolves PAST it, to the face it
+    /// resolves to under Cascadia Mono PL (the default until 2026-10-16;
+    /// but the four Cascadia draws itself, `◽ ◾ ⬛ ⬜`), and never to
+    /// `.notdef`; and the `✅ ❌ ⭐ ⚡ ⏳` of an agent's reply draw centred in
+    /// their two-column slot, across both columns, where the face's own
+    /// one-column glyph stood at the left with the right column blank.
+    /// CONTROL: the opt-in Iosevka Term (Regular), which does not yield
+    /// them, still draws `✅` from its own glyph, inside the left column.
+    #[test]
+    #[cfg(all(windows, feature = "embedded-font"))]
+    fn the_windows_defaults_wide_characters_draw_centred_across_their_two_columns() {
+        use aterm_core::terminal::Terminal;
+        // The inked columns of `ch` as a window draws it, relative to its
+        // cell: the key from the materialized two-column span, then every
+        // column of its raster with a pixel of 1/8 coverage or more.
+        let ink_of = |r: &mut Renderer, ch: char| {
+            let mut term = Terminal::new(1, 4);
+            term.process(format!("\x1b[?25l{ch}x").as_bytes());
+            let input = term.cell_frame(1, 4);
+            let span = crate::materialized_cell_span(&input.cells[0], 0);
+            assert_eq!(span, 2, "{ch}: the grid gives it two columns");
+            let key = r.resolve_cell_key_for_span(None, &input.cells[0][0], span);
+            let img = r.glyph_image(key).clone();
+            let (w, h) = (img.width(), img.height());
+            let texel = if matches!(key.glyph_class, GlyphClass::Mono | GlyphClass::MonoGid) {
+                1
+            } else {
+                4
+            };
+            let inked: Vec<i32> = (0..w)
+                .filter(|&x| (0..h).any(|y| img.bytes()[(y * w + x) * texel + texel - 1] >= 32))
+                .map(|x| img.xmin() + i32::try_from(x).unwrap())
+                .collect();
+            let left = *inked.first().expect("the glyph draws ink");
+            let right = *inked.last().unwrap() + 1;
+            (key, left, right)
+        };
+        let mut r = Renderer::from_system(WINDOWS_DEFAULT_PX, Theme::default()).unwrap();
+        r.set_line_height(WINDOWS_DEFAULT_LINE_HEIGHT);
+        r.seal_admitted_font_sources();
+        assert_eq!(r.primary_source_path(), Some(IOSEVKA_SEMIBOLD_ID));
+        let mut cascadia = cascadia_sealed(WINDOWS_DEFAULT_PX);
+        let cascadia_primary = format!("primary:{CASCADIA_ID}");
+        for ch in IOSEVKA_WIDE_CHARACTERS {
+            let got = resolved_face(&mut r, ch);
+            assert!(
+                !got.starts_with("primary:") && got != "NOTDEF",
+                "U+{:04X} {ch}: {got}",
+                ch as u32
+            );
+            let before = resolved_face(&mut cascadia, ch);
+            if before != cascadia_primary {
+                assert_eq!(got, before, "U+{:04X} {ch}", ch as u32);
+            }
+        }
+        let cw = i32::try_from(r.cell_size().0).unwrap();
+        assert_eq!(cw, 9);
+        for ch in ['✅', '❌', '⭐', '⚡', '⏳'] {
+            let (key, left, right) = ink_of(&mut r, ch);
+            assert_ne!(key.source, FaceId::Primary, "{ch}");
+            assert!(
+                left < cw && right > cw && left >= 0 && right <= 2 * cw,
+                "{ch}: ink columns {left}..{right} do not span the two {cw}-px columns"
+            );
+            assert!(
+                (left - (2 * cw - right)).abs() <= 1,
+                "{ch}: ink columns {left}..{right} are not centred in the {}-px slot",
+                2 * cw
+            );
+        }
+
+        let mut control = Renderer::from_bytes(
+            face_for_id(IOSEVKA_ID).unwrap(),
+            WINDOWS_DEFAULT_PX,
+            Theme::default(),
+        )
+        .unwrap();
+        control.set_line_height(WINDOWS_DEFAULT_LINE_HEIGHT);
+        control.seal_admitted_font_sources();
+        let (key, left, right) = ink_of(&mut control, '✅');
+        assert_eq!(key.source, FaceId::Primary);
+        assert!(
+            left >= 0 && right <= cw,
+            "CONTROL: Iosevka Term (Regular)'s own ✅ ({left}..{right}) leaves its left column, \
+             so this test cannot see the half-width glyph it guards against"
+        );
+    }
+
     /// THE OWNER'S ORDER puts the embedded Symbols Nerd Font AHEAD of Noto Sans
     /// Symbols 2 / Noto Sans Math. Its private-use icons were never contested;
     /// the six non-private-use points both carry (measured with fontTools:
-    /// `⏻ ⏼ ⏽ ⏾ ☰ ⭘`) must not be drawn by a bundled Noto face.
+    /// `⏻ ⏼ ⏽ ⏾ ☰ ⭘`) must not be drawn by a bundled Noto face. The contest
+    /// is held under a primary that carries none of the six: the default on
+    /// Linux; on Windows Cascadia Mono PL, since the default there, Iosevka
+    /// Term Semibold, draws all six itself (a primary's own glyph comes
+    /// first, as everywhere).
     #[test]
-    #[cfg(all(
-        feature = "bundled-font-stack",
-        feature = "embedded-symbols",
-        not(target_os = "macos")
-    ))]
+    #[cfg(all(feature = "embedded-font", not(target_os = "macos")))]
     fn the_nerd_font_precedes_the_bundled_noto_faces_where_both_draw() {
-        // The measured set, pinned: a Nerd Font update that adds a text point
-        // announces itself here.
-        let owned: Vec<char> = (0u32..0x11_0000)
-            .filter_map(char::from_u32)
-            .filter(|&c| crate::embedded_symbols_own_text_point(c))
-            .collect();
-        assert_eq!(
-            owned.iter().collect::<String>(),
-            "⏻⏼⏽⏾☰♥⚡❬❭❮❯❰❱⭘",
-            "the embedded Nerd Font's non-private-use coverage moved"
-        );
+        #[cfg(windows)]
+        let mut r = cascadia_sealed(18.0);
+        #[cfg(not(windows))]
         let mut r = default_sealed();
         let contested = ['⏻', '⏼', '⏽', '⏾', '☰', '⭘'];
         for ch in contested {

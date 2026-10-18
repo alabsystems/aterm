@@ -87,15 +87,13 @@ pub(crate) fn engine_features(features: &[FontFeature]) -> Vec<Feature> {
 
 /// Whether [`crate::Renderer::row_glyph_plan`] should run the shaping pass
 /// for a row, vs short-circuit to an all-[`ColumnGlyph::PerCell`] plan. Factored out
-/// as a PURE function so its whole boolean input space is unit-tested
-/// independent of a live `Renderer`.
+/// as a PURE function so `tests/font_oracle.rs` asks the same gate the planner does.
 ///
 /// Run shaping iff the primary-face bytes are retained AND there is OpenType work to
 /// do: either the user configured `font_features` (`has_user_features`), OR ligatures
 /// are on for a font that advertises `liga`/`calt`. When `has_user_features` is false
 /// this reduces EXACTLY to the legacy gate (`rb_present && !globally_off && font_has`),
-/// so the no-features path stays byte-identical — proved for ALL inputs by
-/// `gate_no_features_is_legacy`.
+/// so the no-features path stays byte-identical.
 #[must_use]
 pub fn should_run_shaping(
     rb_present: bool,
@@ -108,9 +106,8 @@ pub fn should_run_shaping(
 
 /// The minimum run length the planner will attempt to shape: 1 when the user
 /// configured `font_features` (a single cell can substitute — `zero` on a lone `0`,
-/// `ss01` on one char), else 2 (a single cell cannot ligate). PURE, for unit
-/// tests; keeps the two `min_run` derivation sites (planner gate + run gate)
-/// from drifting.
+/// `ss01` on one char), else 2 (a single cell cannot ligate). PURE; keeps the two
+/// `min_run` derivation sites (planner gate + run gate) from drifting.
 #[must_use]
 pub fn shaping_min_run(has_user_features: bool) -> usize {
     if has_user_features { 1 } else { 2 }
@@ -137,9 +134,8 @@ pub fn shaping_min_run(has_user_features: bool) -> usize {
 /// Anything else — a partial collapse (`1 < n_out < n_in`), an expansion
 /// (`n_out > n_in`), or a collapse while `admit_collapsed` is off — is
 /// [`ShapeVerdict::Reject`]. This is the CONSERVATIVE gate: it never lets a
-/// non-grid-mappable shape reach the blitter. Proven total + conservative over the
-/// whole small-count lattice by `tests/ligature_slice.rs::classify_shape_lattice`,
-/// bound to the `LigatureGate` ty model by
+/// non-grid-mappable shape reach the blitter. Bound to the `LigatureGate` ty
+/// model over the whole small-count lattice by
 /// `classify_shape_conforms_to_ligature_gate_model` (Tier-1: the model's own
 /// `Classify` rule judges every real verdict), and caught at `Buggy=1` (a gate
 /// that admits collapse without the flag) by the derived ty model.
@@ -160,8 +156,8 @@ pub enum ShapeVerdict {
 /// bound to the `LigatureGate` ty model independent of a live shaper.
 ///
 /// With `admit_collapsed == false` this reduces EXACTLY to the legacy gate
-/// (`accept iff n_out == n_in`), so the no-flag path stays byte-identical — proved
-/// for the whole small-count lattice by `classify_shape_lattice`. The `Collapsed` branch is the ONLY
+/// (`accept iff n_out == n_in`), so the no-flag path stays byte-identical. The
+/// `Collapsed` branch is the ONLY
 /// behaviour the flag adds, and it admits EXACTLY the `N:1` (`N >= 2`) case.
 #[must_use]
 pub fn classify_shape(n_in: usize, n_out: usize, admit_collapsed: bool) -> ShapeVerdict {
@@ -462,9 +458,10 @@ fn map_shaped_run(
             b += ch.len_utf8();
         }
     }
-    // Start every column at `Some(0)`, overwrite with the shaped gid here, then
-    // demote the UNCHANGED columns to `None` in the cmap pass below.
-    let mut out: Vec<Option<u16>> = vec![Some(0u16); n];
+    // Start every column at `None`, populate each column once with its shaped
+    // gid here, then demote the UNCHANGED columns to `None` in the cmap pass
+    // below.
+    let mut out: Vec<Option<u16>> = vec![None; n];
     for info in glyphs {
         let gid = u16::try_from(info.glyph_id).ok()?;
         let cluster = info.cluster as usize;
@@ -480,7 +477,9 @@ fn map_shaped_run(
             };
             idx
         };
-        out[idx] = Some(gid);
+        if out[idx].replace(gid).is_some() {
+            return None; // non-1:1 cluster collision — bail to per-cell
+        }
     }
     // PER-COLUMN accept: a column is `Some(gid)` (drawn as the shaped primary glyph)
     // ONLY when shaping CHANGED its glyph vs the plain cmap glyph; otherwise it is
@@ -499,14 +498,12 @@ fn map_shaped_run(
     // return None so the whole run is byte-identical to the per-cell path.
     let mut any_changed = false;
     for (slot, &ch) in out.iter_mut().zip(run_chars) {
+        let gid = (*slot)?;
         let cmap = face.glyph_index(ch).map_or(0, |g| g.0);
-        if *slot == Some(0) && cmap != 0 {
+        if gid == 0 && cmap != 0 {
             return None;
         }
-        // Every column is `Some` here (the `Some(0)` fill above), so `*slot ==
-        // Some(cmap)` is exactly the old `gids[idx] == cmap` test; the unchanged
-        // columns are demoted to `None` and the changed ones keep their shaped gid.
-        if *slot == Some(cmap) {
+        if gid == cmap {
             *slot = None;
         } else {
             any_changed = true;
@@ -882,17 +879,34 @@ mod tests {
         );
     }
 
-    /// WIRE-FONTFEAT — the EMPTY-features path is unchanged: with no user
-    /// features the built array is exactly the base `[liga, calt]` pair (the
-    /// pre-feature behaviour). This is the common/hot path; it must not grow.
+    /// The feature list: the base `liga`/`calt` pair first (on when ligatures
+    /// are on, zeroed when off), then every user feature in order with its
+    /// exact value. Order is the contract: a user `liga=0` lands AFTER the base
+    /// `liga=1`, and the shaper is last-writer-wins.
     #[test]
-    fn build_feature_list_empty_is_base_liga_calt() {
-        let features = build_feature_list(&[], true);
-        assert_eq!(
-            features,
-            [FontFeature::new(*b"liga", 1), FontFeature::new(*b"calt", 1)],
-            "empty user features => only liga+calt"
-        );
+    fn build_feature_list_puts_the_base_pair_first_then_user_features() {
+        let user = [FontFeature::new(*b"cv01", 2), FontFeature::new(*b"liga", 0)];
+        #[expect(clippy::type_complexity, reason = "a test's case table")]
+        let cases: [(&[FontFeature], bool, &[([u8; 4], u32)]); 3] = [
+            (&[], true, &[(*b"liga", 1), (*b"calt", 1)]),
+            (
+                &user,
+                true,
+                &[(*b"liga", 1), (*b"calt", 1), (*b"cv01", 2), (*b"liga", 0)],
+            ),
+            (
+                &user[..1],
+                false,
+                &[(*b"liga", 0), (*b"calt", 0), (*b"cv01", 2)],
+            ),
+        ];
+        for (user, on, want) in cases {
+            let got: Vec<([u8; 4], u32)> = build_feature_list(user, on)
+                .iter()
+                .map(|f| (f.tag, f.value))
+                .collect();
+            assert_eq!(got, want, "ligatures_on={on} user={user:?}");
+        }
     }
 
     /// The engine form is the first-party list entry for entry, in order (order
@@ -909,97 +923,6 @@ mod tests {
             assert_eq!(e.tag.to_bytes(), f.tag);
             assert_eq!(e.value, f.value);
         }
-    }
-
-    /// Ligatures OFF: the base `liga`/`calt` pair is set to `0`, so a shaping run
-    /// driven for the user's OTHER features won't form `=>`/`!=` ligatures. User
-    /// features still carry their own values (here `zero` stays on).
-    #[test]
-    fn build_feature_list_ligatures_off_zeroes_base() {
-        let features = build_feature_list(&[FontFeature::new(*b"zero", 1)], false);
-        assert_eq!(features[0].tag, *b"liga");
-        assert_eq!(features[0].value, 0, "liga off");
-        assert_eq!(features[1].tag, *b"calt");
-        assert_eq!(features[1].value, 0, "calt off");
-        assert_eq!(features[2].tag, *b"zero");
-        assert_eq!(
-            features[2].value, 1,
-            "user feature still on with ligatures off"
-        );
-    }
-
-    /// With no user features the gate equals the legacy short-circuit for ALL 8
-    /// flag combinations.
-    #[test]
-    fn should_run_shaping_matches_legacy_without_user_features() {
-        for &rb in &[false, true] {
-            for &off in &[false, true] {
-                for &lig in &[false, true] {
-                    let legacy = rb && !off && lig;
-                    assert_eq!(should_run_shaping(rb, false, off, lig), legacy);
-                }
-            }
-        }
-    }
-
-    /// Companion to `gate_user_features_run_iff_bytes`: user features always shape when
-    /// the primary bytes are present, never when absent.
-    #[test]
-    fn should_run_shaping_user_features_need_bytes() {
-        for &off in &[false, true] {
-            for &lig in &[false, true] {
-                assert!(should_run_shaping(true, true, off, lig));
-                assert!(!should_run_shaping(false, true, off, lig));
-            }
-        }
-    }
-
-    #[test]
-    fn shaping_min_run_maps_user_features() {
-        assert_eq!(shaping_min_run(true), 1);
-        assert_eq!(shaping_min_run(false), 2);
-    }
-
-    /// WIRE-FONTFEAT — a user `FontFeature` is BUILT INTO the feature list with
-    /// the right tag bytes + value, appended after the base pair. This is the
-    /// testable seam the renderer hands the shaper (as `engine_features`).
-    #[test]
-    fn build_feature_list_appends_user_feature_with_tag_and_value() {
-        // 'ss01' enabled and 'zero' (slashed zero) enabled.
-        let user = [FontFeature::new(*b"ss01", 1), FontFeature::new(*b"zero", 1)];
-        let features = build_feature_list(&user, true);
-        assert_eq!(features.len(), 4, "liga + calt + 2 user features");
-        // Base pair first.
-        assert_eq!(features[0].tag, *b"liga");
-        assert_eq!(features[1].tag, *b"calt");
-        // User features appended in order, exact value.
-        assert_eq!(features[2..], user);
-    }
-
-    /// WIRE-FONTFEAT — a stylistic-alternate VALUE > 1 (e.g. `cv01=2`) and an
-    /// OFF value (`liga=0`) round-trip exactly: the user feature carries an
-    /// arbitrary u32, not just on/off.
-    #[test]
-    fn build_feature_list_preserves_arbitrary_value() {
-        let user = [FontFeature::new(*b"cv01", 2), FontFeature::new(*b"liga", 0)];
-        let features = build_feature_list(&user, true);
-        assert_eq!(features[2].tag, *b"cv01");
-        assert_eq!(features[2].value, 2);
-        // PRECEDENCE: the explicit user `liga=0` is appended AFTER the base
-        // `liga=1`. The shaper resolves a tag+range by last-writer-wins, so the
-        // user's value wins — explicit user features win for their tag.
-        assert_eq!(features[3].tag, *b"liga");
-        assert_eq!(features[3].value, 0);
-        let liga_entries: Vec<u32> = features
-            .iter()
-            .filter(|f| f.tag == *b"liga")
-            .map(|f| f.value)
-            .collect();
-        assert_eq!(
-            liga_entries,
-            vec![1, 0],
-            "base liga=1 precedes user liga=0 (last wins)"
-        );
     }
 
     /// A plain single-`char` cell (the kind a `=>` operator occupies). All
@@ -1021,24 +944,6 @@ mod tests {
             overline_color: None,
             script: aterm_core::terminal::Script::Normal,
         }
-    }
-
-    /// ITEM C — the shapeable predicate breaks on an IMAGE-covered cell. An ordinary
-    /// operator cell is shapeable; the SAME cell with `image_covered == true` is not,
-    /// so it can never join a ligature run. (Unit test on the predicate directly: a
-    /// real OSC-1337 image placement in the grid is impractical in a render unit
-    /// test, so we drive the documented `image_covered` argument instead.)
-    #[test]
-    fn image_covered_cell_is_not_shapeable() {
-        let c = cell('=');
-        assert!(
-            cell_is_shapeable(&c, false, false),
-            "a plain operator cell must be shapeable"
-        );
-        assert!(
-            !cell_is_shapeable(&c, false, true),
-            "an image-covered cell must NOT be shapeable (the run breaks on it)"
-        );
     }
 
     #[test]
@@ -1324,5 +1229,39 @@ mod tests {
         assert!(extract_cell_slice(&raster, raster_w, height, 0, 0, 0).is_empty());
         assert!(extract_cell_slice(&raster, raster_w, 0, 0, cell_w, 0).is_empty());
         assert!(extract_cell_slice(&[], raster_w, height, 0, cell_w, 0).is_empty());
+    }
+
+    #[test]
+    fn map_shaped_run_rejects_duplicate_cluster_collision() {
+        fn glyph(glyph_id: u32, cluster: u32) -> GlyphInfo {
+            let mut info = GlyphInfo::default();
+            info.glyph_id = glyph_id;
+            info.cluster = cluster;
+            info
+        }
+
+        let bytes = include_bytes!("../tests/fixtures/jetbrains-mono.ttf");
+        let face = aterm_font::Face::parse(bytes, 0).expect("fixture face");
+        let run = "==";
+        let run_chars = ['=', '='];
+
+        // Positive control: distinct 1:1 clusters (0 and 1) map cleanly.
+        let one_to_one = [glyph(900, 0), glyph(901, 1)];
+        assert_eq!(
+            map_shaped_run(&face, run, &run_chars, false, &one_to_one),
+            Some(ShapedRun::PerColumn(
+                vec![Some(900), Some(901)].into_boxed_slice()
+            ))
+        );
+
+        // A 2-in/2-out run where both glyphs share cluster 0 (e.g. a 2->1
+        // ligature followed by a 1->2 split) is not per-column 1:1 and must be
+        // rejected to PerCell rather than overwriting column 0 and leaving
+        // column 1 unpopulated.
+        let colliding = [glyph(900, 0), glyph(901, 0)];
+        assert_eq!(
+            map_shaped_run(&face, run, &run_chars, false, &colliding),
+            None
+        );
     }
 }

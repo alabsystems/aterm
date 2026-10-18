@@ -224,6 +224,9 @@ pub enum StepOut {
     Gone,
     /// A more reliable source contradicted it.
     Retracted,
+    /// Not known: a journal read found it open, never closed, and a later
+    /// restatement of the open path without it (design §5.4).
+    Unknown,
 }
 
 /// A session's outcome: `ExitReason`'s tokens.
@@ -294,6 +297,7 @@ impl Out {
                 StepOut::Interrupted => "interrupted",
                 StepOut::Gone => "gone",
                 StepOut::Retracted => "retracted",
+                StepOut::Unknown => "unknown",
             },
             Out::Session(o) => match o {
                 SessionOut::ShellExit => "shell-exit",

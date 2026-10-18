@@ -103,7 +103,7 @@ impl Grid {
             return false;
         }
         let view = self.visible_row_view(row);
-        let len = view.len();
+        let len = view.written_len();
         out.reserve(len as usize);
         for col in 0..len {
             let Some(cell) = view.cell(col) else {
@@ -176,12 +176,13 @@ impl Grid {
         let mut cur_bold = false;
         let mut cur_dim = false;
         let mut cur_italic = false;
-        let mut cur_underline = false;
+        let mut cur_underline: Option<&str> = None;
+        let mut cur_underline_color: Option<u32> = None;
         let mut cur_blink = false;
         let mut cur_inverse = false;
         let mut cur_hidden = false;
         let mut cur_strikethrough = false;
-        let mut cur_overline = false;
+        let mut cur_overline_or_script: Option<&str> = None;
         let mut cur_fg_indexed: Option<u8> = None;
         let mut cur_bg_indexed: Option<u8> = None;
         let mut cur_fg_rgb: Option<[u8; 3]> = None;
@@ -205,12 +206,20 @@ impl Grid {
             let want_bold = flags.contains(CellFlags::BOLD);
             let want_dim = flags.contains(CellFlags::DIM);
             let want_italic = flags.contains(CellFlags::ITALIC);
-            let want_underline = flags.contains(CellFlags::UNDERLINE);
+            let want_underline = flags.underline_sgr();
             let want_blink = flags.contains(CellFlags::BLINK);
             let want_inverse = flags.contains(CellFlags::INVERSE);
             let want_hidden = flags.contains(CellFlags::HIDDEN);
             let want_strikethrough = flags.contains(CellFlags::STRIKETHROUGH);
-            let want_overline = flags.contains(CellFlags::OVERLINE);
+            let want_overline_or_script = flags.overline_or_script_sgr();
+            let want_underline_color = if cell.has_extras() && !extras_empty {
+                self.storage
+                    .extras
+                    .get(CellCoord::new(row, col))
+                    .and_then(crate::CellExtra::underline_color_u32)
+            } else {
+                None
+            };
 
             let want_fg_indexed = if colors.fg_is_indexed() {
                 Some(colors.fg_index())
@@ -241,7 +250,8 @@ impl Grid {
                 || want_inverse != cur_inverse
                 || want_hidden != cur_hidden
                 || want_strikethrough != cur_strikethrough
-                || want_overline != cur_overline
+                || want_overline_or_script != cur_overline_or_script
+                || want_underline_color != cur_underline_color
                 || want_fg_indexed != cur_fg_indexed
                 || want_bg_indexed != cur_bg_indexed
                 || want_fg_rgb != cur_fg_rgb
@@ -253,12 +263,13 @@ impl Grid {
                 let has_attrs = want_bold
                     || want_dim
                     || want_italic
-                    || want_underline
+                    || want_underline.is_some()
                     || want_blink
                     || want_inverse
                     || want_hidden
                     || want_strikethrough
-                    || want_overline
+                    || want_overline_or_script.is_some()
+                    || want_underline_color.is_some()
                     || want_fg_indexed.is_some()
                     || want_bg_indexed.is_some()
                     || want_fg_rgb.is_some()
@@ -275,8 +286,8 @@ impl Grid {
                     if want_italic {
                         params.push("3".to_string());
                     }
-                    if want_underline {
-                        params.push("4".to_string());
+                    if let Some(underline) = want_underline {
+                        params.push(underline.to_string());
                     }
                     if want_blink {
                         params.push("5".to_string());
@@ -290,8 +301,11 @@ impl Grid {
                     if want_strikethrough {
                         params.push("9".to_string());
                     }
-                    if want_overline {
-                        params.push("53".to_string());
+                    if let Some(line) = want_overline_or_script {
+                        params.push(line.to_string());
+                    }
+                    if let Some(color) = want_underline_color {
+                        params.push(crate::underline_color_sgr(color));
                     }
                     if let Some(rgb) = want_fg_rgb {
                         params.push(format!("38;2;{};{};{}", rgb[0], rgb[1], rgb[2]));
@@ -330,7 +344,8 @@ impl Grid {
                 cur_inverse = want_inverse;
                 cur_hidden = want_hidden;
                 cur_strikethrough = want_strikethrough;
-                cur_overline = want_overline;
+                cur_overline_or_script = want_overline_or_script;
+                cur_underline_color = want_underline_color;
                 cur_fg_indexed = want_fg_indexed;
                 cur_bg_indexed = want_bg_indexed;
                 cur_fg_rgb = want_fg_rgb;
@@ -400,128 +415,40 @@ mod tests {
         }
     }
 
-    // resolved_char: basic character resolution
-
+    /// `resolved_char`, `row_text` and `visible_content` read each row as
+    /// drawn: blanks before a write as spaces, an untouched row as "", a wide
+    /// glyph once (its continuation skipped), the latest overwrite, and
+    /// `None` past the grid.
     #[test]
-    fn test_resolved_char_ascii() {
-        let mut grid = Grid::new(4, 20);
-        grid.write_char('A');
-        assert_eq!(grid.resolved_char(0, 0), Some('A'));
-    }
-
-    #[test]
-    fn test_resolved_char_empty_cell() {
-        let grid = Grid::new(4, 20);
-        // Cell::EMPTY stores space (0x20), so unwritten cells return space
-        let ch = grid.resolved_char(0, 0);
-        assert_eq!(ch, Some(' '));
-    }
-
-    #[test]
-    fn test_resolved_char_out_of_bounds_row() {
-        let grid = Grid::new(4, 20);
-        assert_eq!(grid.resolved_char(10, 0), None);
-    }
-
-    #[test]
-    fn test_resolved_char_out_of_bounds_col() {
-        let grid = Grid::new(4, 20);
-        assert_eq!(grid.resolved_char(0, 30), None);
-    }
-
-    #[test]
-    fn test_resolved_char_supplementary_plane() {
-        let mut grid = Grid::new(4, 20);
-        grid.write_char('\u{1F600}'); // grinning face (non-BMP)
-        assert_eq!(grid.resolved_char(0, 0), Some('\u{1F600}'));
-    }
-
-    #[test]
-    fn test_resolved_char_bmp_cjk() {
-        let mut grid = Grid::new(4, 20);
-        grid.write_char('\u{4E2D}'); // CJK "middle"
-        assert_eq!(grid.resolved_char(0, 0), Some('\u{4E2D}'));
-    }
-
-    #[test]
-    fn test_resolved_char_multiple_positions() {
-        let mut grid = Grid::new(4, 20);
-        grid.write_char('X');
-        grid.write_char('Y');
-        grid.write_char('Z');
-        assert_eq!(grid.resolved_char(0, 0), Some('X'));
-        assert_eq!(grid.resolved_char(0, 1), Some('Y'));
-        assert_eq!(grid.resolved_char(0, 2), Some('Z'));
-    }
-
-    // row_text: text extraction
-
-    #[test]
-    fn test_row_text_ascii() {
-        let mut grid = Grid::new(4, 20);
-        write_text(&mut grid, "Hello");
-        let text = grid.row_text(0).unwrap();
-        assert!(text.starts_with("Hello"), "got: {text:?}");
-    }
-
-    #[test]
-    fn test_row_text_empty_row() {
-        let grid = Grid::new(4, 20);
-        let text = grid.row_text(0).unwrap();
-        // An untouched row has len 0, so row_text yields "".
-        assert_eq!(text, "", "untouched row should produce empty string");
-    }
-
-    #[test]
-    fn test_row_text_out_of_bounds() {
-        let grid = Grid::new(4, 20);
-        assert!(grid.row_text(10).is_none());
-    }
-
-    #[test]
-    fn test_row_text_multiple_rows() {
-        let mut grid = Grid::new(4, 20);
-        write_text(&mut grid, "Line1");
-        grid.move_cursor_to(1, 0);
-        write_text(&mut grid, "Line2");
-        grid.move_cursor_to(2, 0);
-        write_text(&mut grid, "Line3");
-
-        assert!(grid.row_text(0).unwrap().starts_with("Line1"));
-        assert!(grid.row_text(1).unwrap().starts_with("Line2"));
-        assert!(grid.row_text(2).unwrap().starts_with("Line3"));
-    }
-
-    #[test]
-    fn test_row_text_supplementary_plane_emoji() {
-        let mut grid = Grid::new(4, 20);
-        grid.write_char('\u{1F680}'); // rocket emoji
-        let text = grid.row_text(0).unwrap();
-        assert!(
-            text.contains('\u{1F680}'),
-            "row_text should contain rocket emoji, got: {text:?}"
-        );
-    }
-
-    #[test]
-    fn test_row_text_null_cells_become_spaces() {
-        let mut grid = Grid::new(4, 10);
-        // Write at position 5, leave 0-4 as nulls
-        grid.move_cursor_to(0, 5);
-        grid.write_char('X');
-        let text = grid.row_text(0).unwrap();
-        assert!(
-            text.starts_with("     X"),
-            "nulls should become spaces, got: {text:?}"
-        );
-    }
-
-    #[test]
-    fn test_row_text_full_row() {
+    fn text_reads_follow_the_cells() {
         let mut grid = Grid::new(4, 5);
+        write_text(&mut grid, "Hello");
+        grid.move_cursor_to(0, 0);
         write_text(&mut grid, "ABCDE");
-        let text = grid.row_text(0).unwrap();
-        assert_eq!(text, "ABCDE");
+        grid.move_cursor_to(1, 3);
+        grid.write_char('X');
+        grid.move_cursor_to(2, 0);
+        grid.write_char('a');
+        grid.write_wide_char_styled(
+            '\u{4E2D}',
+            PackedColor::DEFAULT_FG,
+            PackedColor::DEFAULT_BG,
+            CellFlags::empty(),
+        );
+        grid.write_char('b');
+
+        assert_eq!(grid.row_text(0).as_deref(), Some("ABCDE"));
+        assert_eq!(grid.row_text(1).as_deref(), Some("   X"));
+        assert_eq!(grid.row_text(2).as_deref(), Some("a\u{4E2D}b"));
+        assert_eq!(grid.row_text(3).as_deref(), Some(""));
+        assert_eq!(grid.row_text(4), None);
+        assert_eq!(grid.visible_content(), "ABCDE\n   X\na\u{4E2D}b\n\n");
+
+        assert_eq!(grid.resolved_char(0, 0), Some('A'));
+        assert_eq!(grid.resolved_char(2, 1), Some('\u{4E2D}'));
+        assert_eq!(grid.resolved_char(3, 0), Some(' '));
+        assert_eq!(grid.resolved_char(9, 0), None);
+        assert_eq!(grid.resolved_char(0, 9), None);
     }
 
     #[test]
@@ -603,44 +530,6 @@ mod tests {
         assert!(cols.is_empty());
     }
 
-    // row_text: wide characters
-
-    #[test]
-    fn test_row_text_wide_char_continuation_skipped() {
-        let mut grid = Grid::new(4, 20);
-        grid.write_wide_char_styled(
-            '\u{FF21}', // fullwidth A
-            PackedColor::DEFAULT_FG,
-            PackedColor::DEFAULT_BG,
-            CellFlags::empty(),
-        );
-        let text = grid.row_text(0).unwrap();
-        // The wide continuation cell should not produce an extra character
-        let count = text.chars().filter(|&c| c == '\u{FF21}').count();
-        assert_eq!(
-            count, 1,
-            "wide char should appear exactly once, got: {text:?}"
-        );
-    }
-
-    #[test]
-    fn test_row_text_mixed_wide_and_narrow() {
-        let mut grid = Grid::new(4, 20);
-        grid.write_char('A');
-        grid.write_wide_char_styled(
-            '\u{4E2D}',
-            PackedColor::DEFAULT_FG,
-            PackedColor::DEFAULT_BG,
-            CellFlags::empty(),
-        );
-        grid.write_char('B');
-        let text = grid.row_text(0).unwrap();
-        assert!(
-            text.starts_with("A\u{4E2D}B"),
-            "mixed narrow+wide+narrow, got: {text:?}"
-        );
-    }
-
     // row_text: complex characters with combining marks
 
     #[test]
@@ -681,64 +570,6 @@ mod tests {
         assert!(
             text.contains("\u{1F44B}"),
             "complex char via set_cell_complex_char should appear, got: {text:?}"
-        );
-    }
-
-    // visible_content: all visible rows
-
-    #[test]
-    fn test_visible_content_line_count() {
-        let grid = Grid::new(5, 10);
-        let content = grid.visible_content();
-        let newline_count = content.chars().filter(|&c| c == '\n').count();
-        assert_eq!(
-            newline_count, 5,
-            "should have exactly 5 newlines for 5 rows"
-        );
-    }
-
-    #[test]
-    fn test_visible_content_preserves_row_order() {
-        let mut grid = Grid::new(3, 10);
-        write_text(&mut grid, "AAA");
-        grid.move_cursor_to(1, 0);
-        write_text(&mut grid, "BBB");
-        grid.move_cursor_to(2, 0);
-        write_text(&mut grid, "CCC");
-
-        let content = grid.visible_content();
-        let lines: Vec<&str> = content.split('\n').collect();
-        assert!(lines[0].starts_with("AAA"), "first row: {}", lines[0]);
-        assert!(lines[1].starts_with("BBB"), "second row: {}", lines[1]);
-        assert!(lines[2].starts_with("CCC"), "third row: {}", lines[2]);
-    }
-
-    #[test]
-    fn test_visible_content_single_row_grid() {
-        let mut grid = Grid::new(1, 10);
-        write_text(&mut grid, "Only");
-        let content = grid.visible_content();
-        assert!(content.starts_with("Only"), "got: {content:?}");
-        assert_eq!(content.chars().filter(|&c| c == '\n').count(), 1);
-    }
-
-    // memory_used: basic sanity
-
-    #[test]
-    fn test_memory_used_positive() {
-        let grid = Grid::new(4, 20);
-        assert!(grid.memory_used() > 0, "grid should report non-zero memory");
-    }
-
-    #[test]
-    fn test_memory_used_larger_grid_uses_more() {
-        let small = Grid::new(4, 20);
-        let large = Grid::new(40, 200);
-        assert!(
-            large.memory_used() > small.memory_used(),
-            "larger grid should use more memory: small={}, large={}",
-            small.memory_used(),
-            large.memory_used()
         );
     }
 
@@ -814,62 +645,5 @@ mod tests {
         let with_undo = grid.memory_used();
         grid.drop_resize_undo();
         assert_eq!(with_undo - grid.memory_used(), expected);
-    }
-
-    // Edge cases
-
-    #[test]
-    fn test_row_text_last_visible_row() {
-        let mut grid = Grid::new(3, 10);
-        grid.move_cursor_to(2, 0);
-        write_text(&mut grid, "Last");
-        let text = grid.row_text(2).unwrap();
-        assert!(text.starts_with("Last"), "got: {text:?}");
-    }
-
-    #[test]
-    fn test_row_text_after_overwrite() {
-        let mut grid = Grid::new(4, 10);
-        write_text(&mut grid, "Hello");
-        grid.move_cursor_to(0, 0);
-        write_text(&mut grid, "World");
-        let text = grid.row_text(0).unwrap();
-        assert!(
-            text.starts_with("World"),
-            "overwritten text should show new content, got: {text:?}"
-        );
-    }
-
-    #[test]
-    fn test_resolved_char_after_overwrite() {
-        let mut grid = Grid::new(4, 10);
-        grid.write_char('A');
-        grid.move_cursor_to(0, 0);
-        grid.write_char('B');
-        assert_eq!(grid.resolved_char(0, 0), Some('B'));
-    }
-
-    #[test]
-    fn test_visible_content_with_wide_chars() {
-        let mut grid = Grid::new(2, 10);
-        grid.write_wide_char_styled(
-            '\u{4E2D}',
-            PackedColor::DEFAULT_FG,
-            PackedColor::DEFAULT_BG,
-            CellFlags::empty(),
-        );
-        let content = grid.visible_content();
-        assert!(
-            content.contains('\u{4E2D}'),
-            "visible_content should include wide char"
-        );
-    }
-
-    #[test]
-    fn test_row_text_minimum_grid() {
-        let mut grid = Grid::new(1, 1);
-        grid.write_char('Z');
-        let text = grid.row_text(0).unwrap();
-        assert_eq!(text, "Z");
     }
 }

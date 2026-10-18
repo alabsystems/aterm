@@ -5,7 +5,7 @@
 //! the highlight, bound to the code that actually runs.
 //!
 //! `press_custody_model()` is model-checked in the abstract at Tier-0
-//! (`aterm-spec/tests/derived_ring_ty.rs`), which proves the DESIGN sound: a release,
+//! (`aterm-models/tests/derived_ring_ty.rs`), which proves the DESIGN sound: a release,
 //! an auto-repeat tick and a bare modifier each destroy nothing, typing takes the
 //! viewport back to live, output re-pins instead of snapping, output that replaced
 //! the selected rows may take the highlight but never the reading position, and an
@@ -187,7 +187,7 @@ use std::sync::{Arc, Mutex};
 
 use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::{CustodyTransition, Terminal};
-use aterm_spec::derive::press_custody_model;
+use aterm_models_misc::press_custody_model;
 use aterm_spec::xref::StepEvidence;
 
 use crate::input::{InputEvent, ScrollIntent, Source};
@@ -1068,14 +1068,15 @@ fn wheel_seams(validated: &mut usize, ev: &mut StepEvidence) {
                 app.input(
                     wid,
                     InputEvent::Wheel {
-                        // ONE line, so the abstract step is the model's exact
-                        // `offset + 1`. Off Windows `wheel_platform_lines` is the
-                        // identity, so this really is one row; a real notch moves
+                        // ONE row, so the abstract step is the model's exact
+                        // `offset + 1`: a precise device's row (`detent: false`) is
+                        // one row on every platform. A real notch moves
                         // `wheel_viewport_lines` rows, which is a granularity gap the
                         // record deliberately does not carry (it says the user took
                         // the viewport, not how far).
                         dir: aterm_types::mouse::WheelDir::Up,
                         lines: 1,
+                        detent: false,
                         row: 0,
                         col: 0,
                         mods: 0,

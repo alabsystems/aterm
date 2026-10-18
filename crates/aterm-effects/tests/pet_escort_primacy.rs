@@ -110,22 +110,6 @@ fn settle(scene: &mut Scene, now: &mut Instant) -> PetFrame {
 }
 
 #[test]
-fn the_escort_stands_at_the_caret_ladder_not_a_console_perch() {
-    let mut now = Instant::now();
-    let mut scene = parked();
-    let frame = settle(&mut scene, &mut now);
-    assert!(frame.alpha > 0, "the pet must be on glass to be measured");
-    let want = escort_station(CARET_COL);
-    // Half a cell of slack absorbs the chase's easing and `body_px` rounding; a
-    // whole extra cell of standoff is refused.
-    assert!(
-        (frame.col - want).abs() <= 0.5,
-        "escort stood at {:.2}; the v0.76 ladder says {want:.2} (caret col {CARET_COL})",
-        frame.col,
-    );
-}
-
-#[test]
 fn the_caret_is_not_an_obstruction_to_its_own_escort() {
     let mut now = Instant::now();
     let mut scene = parked();

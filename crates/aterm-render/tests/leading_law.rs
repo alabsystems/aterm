@@ -24,24 +24,6 @@ const GAPS: [f32; 6] = [0.0, 0.5, 1.0, 2.3, 4.0, 7.9];
 const SCALES: [f32; 8] = [0.5, 0.8, 0.9, 1.0, 1.05, 1.25, 1.5, 2.0];
 
 #[test]
-fn cell_height_is_the_rounded_scaled_line() {
-    for a in ASCENTS {
-        for d in DESCENTS {
-            for g in GAPS {
-                for s in SCALES {
-                    let (cell_h, _) = cell_h_baseline(a, d, g, s);
-                    let expect = (((a - d + g) * s).round()).max(1.0) as usize;
-                    assert_eq!(
-                        cell_h, expect,
-                        "cell_h law: ascent={a} descent={d} gap={g} scale={s}"
-                    );
-                }
-            }
-        }
-    }
-}
-
-#[test]
 fn half_leading_splits_within_one_px() {
     let mut split_moved_baseline = 0u32; // non-vacuity
     for a in ASCENTS {

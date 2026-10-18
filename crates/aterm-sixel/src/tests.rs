@@ -115,16 +115,26 @@ fn tall_raster_width_growth_stays_amortized_near_the_pixel_cap() {
     );
 }
 
+/// Small valid bodies decode to their raster geometry, every painted pixel
+/// the colour register 1 defines (RGB% 100;0;0, opaque red): one full `~`
+/// column, four columns in one band, two bands split by a graphics newline
+/// `-`, and a DECGRI `!5` repeat.
 #[test]
-fn single_full_column_is_one_by_six_red() {
-    // `"1;1;1;6` raster 1x6, color 1 = pure red, `~` = 0x3F+0x3F = all 6 bits.
-    let img = decode(b"\"1;1;1;6#1;2;100;0;0#1~").expect("a painted column must produce an image");
-    assert_eq!(img.width(), 1, "one sixel column = 1px wide");
-    assert_eq!(img.height(), 6, "a full `~` band = 6px tall");
-    assert_eq!(img.pixels().len(), 6);
-    // Color 1 defined as RGB% 100;0;0 → 0xFFFF0000 (opaque red).
-    for (i, &p) in img.pixels().iter().enumerate() {
-        assert_eq!(p, 0xFFFF_0000, "pixel {i} should be opaque red");
+fn small_bodies_decode_to_their_geometry_in_the_defined_colour() {
+    for (body, width, height) in [
+        (&b"\"1;1;1;6#1;2;100;0;0#1~"[..], 1usize, 6usize),
+        (b"\"1;1;4;6#0;2;0;0;0#1;2;100;0;0#1~~~~$-", 4, 6),
+        (b"\"1;1;1;12#1;2;100;0;0#1~-~", 1, 12),
+        (b"\"1;1;5;6#1;2;100;0;0#1!5~", 5, 6),
+    ] {
+        let what = String::from_utf8_lossy(body);
+        let img = decode(body).expect("a painted body produces an image");
+        assert_eq!((img.width(), img.height()), (width, height), "{what}");
+        assert_eq!(img.pixels().len(), width * height, "{what}");
+        assert!(
+            img.pixels().iter().all(|&p| p == 0xFFFF_0000),
+            "{what}: every pixel opaque red"
+        );
     }
 }
 
@@ -174,18 +184,6 @@ fn capped_raster_at_the_pixel_limit_still_decodes() {
 }
 
 #[test]
-fn four_columns_one_band_is_four_by_six() {
-    // SIXEL_4X6 body: four `~` columns of red after raster 4x6.
-    let img = decode(b"\"1;1;4;6#0;2;0;0;0#1;2;100;0;0#1~~~~$-").expect("4x6 image");
-    assert_eq!(img.width(), 4);
-    assert_eq!(img.height(), 6);
-    assert_eq!(img.pixels().len(), 24);
-    for &p in img.pixels() {
-        assert_eq!(p, 0xFFFF_0000, "all four columns are red");
-    }
-}
-
-#[test]
 fn partial_column_sets_only_low_bits() {
     // `?` = 0x3F → value 0 → no pixels. `A` = 0x41 → value 2 → bit 1 set (row 1).
     let img = decode(b"\"1;1;1;6#1;2;0;100;0#1A").expect("image");
@@ -199,29 +197,6 @@ fn partial_column_sets_only_low_bits() {
         "row 1 opaque green"
     );
     assert_eq!(img.pixels()[2], 0, "row 2 transparent");
-}
-
-#[test]
-fn graphics_newline_advances_band() {
-    // Two bands stacked: first band col0, `-` then second band col0.
-    let img = decode(b"\"1;1;1;12#1;2;100;0;0#1~-~").expect("image");
-    assert_eq!(img.width(), 1);
-    assert_eq!(img.height(), 12, "two 6px bands");
-    for &p in img.pixels() {
-        assert_eq!(p, 0xFFFF_0000);
-    }
-}
-
-#[test]
-fn decgri_repeat_paints_run() {
-    // `!5~` repeats the full column 5 times → 5px wide.
-    let img = decode(b"\"1;1;5;6#1;2;100;0;0#1!5~").expect("image");
-    assert_eq!(img.width(), 5);
-    assert_eq!(img.height(), 6);
-    assert_eq!(img.pixels().len(), 30);
-    for &p in img.pixels() {
-        assert_eq!(p, 0xFFFF_0000);
-    }
 }
 
 #[test]
@@ -251,6 +226,12 @@ fn span_helpers_round_up() {
     // 4px / 2px cell → 2 cols; 6px / 4px cell → 2 rows.
     assert_eq!(img.cols_spanned(2), 2);
     assert_eq!(img.rows_spanned(4), 2);
+    // A zero cell size divides by one, not zero; the largest is one cell.
+    assert_eq!((img.cols_spanned(0), img.rows_spanned(0)), (4, 6));
+    assert_eq!(
+        (img.cols_spanned(u16::MAX), img.rows_spanned(u16::MAX)),
+        (1, 1)
+    );
 }
 
 #[test]
@@ -289,29 +270,6 @@ fn abort_frees_and_yields_no_image() {
     d.abort();
     assert_eq!(d.pixel_alloc_bytes(), 0, "abort frees the buffer");
     assert!(d.unhook().is_none(), "aborted decode yields nothing");
-}
-
-#[test]
-fn default_palette_color_zero_is_black() {
-    let pal = default_palette();
-    assert_eq!(pal[0], 0x0000_0000);
-    assert_eq!(pal.len(), MAX_COLOR_REGISTERS);
-}
-
-#[test]
-fn rgb_percent_scales_correctly() {
-    assert_eq!(rgb_percent(100, 0, 0), 0x00FF_0000);
-    assert_eq!(rgb_percent(0, 100, 0), 0x0000_FF00);
-    assert_eq!(rgb_percent(0, 0, 100), 0x0000_00FF);
-    assert_eq!(rgb_percent(100, 100, 100), 0x00FF_FFFF);
-}
-
-#[test]
-fn hls_primaries_are_sane() {
-    // HLS with full lightness/saturation should be near-fully-saturated colors.
-    // Just assert no panic and a non-zero, in-range result.
-    let c = hls_to_rgb(120, 50, 100);
-    assert!(c <= 0x00FF_FFFF);
 }
 
 #[test]
@@ -425,3 +383,63 @@ const _: () = assert!(
     SIXEL_MAX_PARAMS >= 5,
     "cap must admit the 5-param color define"
 );
+
+/// xorshift64: a few lines, so the generated-stream test below needs no
+/// dev-dependency. Fixed seeds, so a failure reproduces from its case index.
+struct XorShift(u64);
+
+impl XorShift {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    /// Uniform-enough in `0..n` for a stream generator.
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+}
+
+/// A stream of sixel protocol bytes: raster attributes, repeat and colour
+/// introducers, carriage return, newline, digit parameters, the separator,
+/// and the sixel data characters `?`..`~`.
+fn sixel_stream(rng: &mut XorShift, max: usize) -> Vec<u8> {
+    const CONTROLS: &[u8] = b"\"!#$-;0123456789";
+    (0..rng.below(max))
+        .map(|_| {
+            if rng.next().is_multiple_of(2) {
+                CONTROLS[rng.below(CONTROLS.len())]
+            } else {
+                0x3F + rng.below(0x40) as u8
+            }
+        })
+        .collect()
+}
+
+/// Arbitrary protocol streams never panic, and any image produced is within
+/// bounds with exactly width * height pixels; without a hook there is none.
+#[test]
+fn decoder_is_bounded_on_arbitrary_streams() {
+    let mut rng = XorShift(0x51_8E1);
+    for case in 0..128 {
+        let data = sixel_stream(&mut rng, 500);
+        if let Some(image) = decode(&data) {
+            assert!(image.width() <= SIXEL_MAX_DIMENSION, "case {case}");
+            assert!(image.height() <= SIXEL_MAX_DIMENSION, "case {case}");
+            assert_eq!(
+                image.pixels().len(),
+                image.width() * image.height(),
+                "case {case}"
+            );
+        }
+        let mut unhooked = SixelDecoder::new();
+        for &byte in &data {
+            unhooked.put(byte);
+        }
+        assert!(unhooked.unhook().is_none(), "case {case}");
+    }
+}

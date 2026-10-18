@@ -1105,118 +1105,28 @@ mod tests {
         );
     }
 
+    /// Linux is declared, never defaulted away: a real cut that names neither
+    /// --linux-artifacts nor --mac-only is refused pre-claim, a contradiction is
+    /// refused, and a resume cannot change where the artifacts come from.
     #[test]
-    fn worker_and_cut_cli_reject_ambiguous_targets_and_allow_local_only_builds() {
+    fn a_real_cut_declares_its_linux_shape() {
         let parse = |args: &[&str]| {
             crate::cli::parse(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
         };
-        assert!(matches!(
-            parse(&[
-                "linux-build",
-                "--version",
-                "0.100.0",
-                "--build-number",
-                "100",
-                "--commit",
-                &"a".repeat(40),
-                "--out",
-                "/private/output"
-            ])
-            .unwrap(),
-            crate::cli::Cmd::LinuxBuild { .. }
-        ));
-        assert!(
-            parse(&[
-                "linux-build",
-                "--version",
-                "0.100.0",
-                "--build-number",
-                "0",
-                "--commit",
-                &"a".repeat(40),
-                "--out",
-                "/private/output"
-            ])
-            .is_err()
-        );
-        assert!(parse(&["cut", "--linux-target", "aarch64"]).is_err());
-        assert!(
-            parse(&[
-                "cut",
-                "--linux-artifacts",
-                "/private/output",
-                "--linux-target",
-                "riscv64"
-            ])
-            .is_err()
-        );
-        assert!(
-            parse(&[
-                "cut",
-                "--linux-artifacts",
-                "/private/output",
-                "--linux-target",
-                "aarch64",
-                "--linux-target",
-                "aarch64"
-            ])
-            .is_err()
-        );
-        assert!(parse(&["cut", "--resume", "--linux-artifacts", "/changed/output"]).is_err());
-        // A real or rehearsal cut that names neither --linux-artifacts nor --mac-only is
-        // refused pre-claim.
-        let silent = parse(&["cut"]).unwrap_err();
-        assert_eq!(silent, crate::cli::MAC_ONLY_REFUSAL);
-        assert!(parse(&["cut", "--rehearse", "o/r"]).is_err());
+        assert_eq!(parse(&["cut"]).unwrap_err(), crate::cli::MAC_ONLY_REFUSAL);
         assert!(parse(&["cut", "--mac-only"]).is_ok());
         assert!(parse(&["cut", "--linux-artifacts", "/private/output"]).is_ok());
-        assert!(
-            parse(&["cut", "--dry-run"]).is_ok(),
-            "a dry run publishes nothing"
-        );
-        assert!(
-            parse(&["cut", "--resume"]).is_ok(),
-            "a resume has its shape already"
-        );
-        assert!(
-            parse(&["cut", "--mac-only", "--linux-artifacts", "/private/output"]).is_err(),
-            "contradiction"
-        );
-        assert!(parse(&["cut", "--resume", "--mac-only"]).is_err());
-        assert!(parse(&["cut", "--abandon", "v0.26.0", "--mac-only"]).is_err());
-        // --linux-worker needs somewhere to land and a well-formed spec.
-        assert!(parse(&["cut", "--mac-only", "--linux-worker", "aarch64=h:/r"]).is_err());
-        assert!(
-            parse(&[
-                "cut",
-                "--linux-artifacts",
-                "/private/output",
-                "--linux-worker",
-                "aarch64=builder@buildhost:~/aterm"
-            ])
-            .is_ok()
-        );
-        assert!(
-            parse(&[
-                "cut",
-                "--linux-artifacts",
-                "/private/output",
-                "--linux-worker",
-                "aarch64=-oProxyCommand=x:/r"
-            ])
-            .is_err()
-        );
-        assert!(
-            parse(&[
-                "cut",
-                "--dry-run",
-                "--linux-artifacts",
-                "/private/output",
-                "--linux-target",
-                "aarch64"
-            ])
-            .is_ok()
-        );
+        assert!(parse(&["cut", "--dry-run"]).is_ok());
+        assert!(parse(&["cut", "--resume"]).is_ok());
+        for refused in [
+            &["cut", "--mac-only", "--linux-artifacts", "/private/output"][..],
+            &["cut", "--resume", "--mac-only"],
+            &["cut", "--resume", "--linux-artifacts", "/changed/output"],
+            &["cut", "--linux-target", "aarch64"],
+            &["cut", "--mac-only", "--linux-worker", "aarch64=h:/r"],
+        ] {
+            assert!(parse(refused).is_err(), "{refused:?}");
+        }
     }
 
     #[test]
@@ -1326,6 +1236,8 @@ mod tests {
 
     #[test]
     fn the_worker_script_is_parsed_whole_before_it_runs() {
+        // `umask 077`: a login's `umask 002` made a target root the worker refuses (the
+        // first live run).
         assert!(WORKER_SCRIPT.starts_with("main() {\n"));
         assert!(WORKER_SCRIPT.trim_end().ends_with("main \"$@\" </dev/null"));
         assert!(WORKER_SCRIPT.contains("umask 077"));

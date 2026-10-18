@@ -23,7 +23,6 @@ fn stale_snapshot(input: &mut aterm_core::render::RenderInput) {
 
 const ROWS: u16 = 58;
 const COLS: u16 = 116;
-const CARET: (u16, u16) = (55, 2);
 
 struct Scene {
     term: Terminal,
@@ -144,93 +143,14 @@ impl Scene {
     }
 }
 
-#[test]
-fn sparse_program_particles_do_not_send_a_fixed_caret_pet_across_the_pane() {
-    let mut s = Scene::new();
-    s.particles(33);
-    let mut frame = s.tick();
-    for _ in 0..240 {
-        frame = s.tick();
-    }
-    assert!(frame.alpha > 0, "fixture must put the resident on glass");
-    let initial = frame.col;
-    let mut min = initial;
-    let mut max = initial;
-    for round in 0..12 {
-        // Some frames place a real particle under the old footprint. The
-        // pet must avoid that glyph using nearby empty cells, not ignore it.
-        s.particles([2, 5, 33][round % 3]);
-        for _ in 0..32 {
-            frame = s.tick();
-            min = min.min(frame.col);
-            max = max.max(frame.col);
-        }
-    }
-    eprintln!(
-        "fixed caret sparse particles: initial_col={initial:.3} min_col={min:.3} max_col={max:.3} travel_px={:.3} action={} reason={}",
-        (max - min) * 8.0,
-        s.brain.pose_name(),
-        s.brain.console_reason()
-    );
-    assert_eq!(s.brain.console_input_seq(), 0);
-    assert_eq!((s.term.cursor().row, s.term.cursor().col), CARET);
-    // There is ample blank ground beside the caret in every particle frame:
-    // a lone distant glyph cannot turn the intervening spaces into a wall.
-    assert!(
-        max - min < 6.0,
-        "sparse ink caused a {}-cell trip",
-        max - min
-    );
-}
-
-#[test]
-fn a_single_incoherent_observation_does_not_commission_a_far_trip() {
-    let mut s = Scene::new();
-    s.particles(2);
-    let mut before = s.tick();
-    for _ in 0..240 {
-        before = s.tick();
-    }
-    assert_eq!(before.alpha, 255);
-    s.incoherent = true;
-    let unknown = s.tick();
-    // HELD, NOT CUT: the body already on glass stays exactly
-    // where the last certified frame judged it, at the same opacity — the
-    // visibility hold's unknown — and is never moved by a map it cannot read.
-    assert_eq!(
-        (unknown.alpha, unknown.col, unknown.row),
-        (before.alpha, before.col, before.row),
-        "an incoherent surface holds the body already on glass"
-    );
-    s.incoherent = false;
-    let mut min = before.col;
-    let mut max = before.col;
-    for _ in 0..200 {
-        let f = s.tick();
-        if f.alpha > 0 {
-            min = min.min(f.col);
-            max = max.max(f.col);
-        }
-    }
-    eprintln!(
-        "one unknown frame: before=({},{}) visible min={min} max={max} travel_px={} reason={}",
-        before.row,
-        before.col,
-        (max - min) * 8.0,
-        s.brain.console_reason()
-    );
-    assert_eq!(s.brain.console_input_seq(), 0);
-    assert_eq!((s.term.cursor().row, s.term.cursor().col), CARET);
-    assert!(
-        max - min < 6.0,
-        "a temporary unknown commissioned a {}-cell trip",
-        max - min
-    );
-}
-
+/// Sparse program particles do not send a fixed-caret pet across the pane,
+/// at the sampled Codex scene's size and either side of the observation
+/// budget's edges: some frames place a real particle under the old footprint,
+/// and the pet avoids that glyph using nearby empty cells. A lone distant
+/// glyph cannot turn the intervening spaces into a wall.
 #[test]
 fn sparse_ink_stays_local_across_observation_budget_edges() {
-    for (rows, cols) in [(64, 256), (65, 257), (100, 300), (200, 600)] {
+    for (rows, cols) in [(ROWS, COLS), (64, 256), (65, 257), (100, 300), (200, 600)] {
         let mut s = Scene::sized(rows, cols);
         s.particles(33);
         for _ in 0..240 {
@@ -328,7 +248,7 @@ fn a_real_caret_move_waits_for_coherence_then_follows_normally() {
 #[test]
 fn real_failed_observations_conform_for_idle_and_airborne_locomotion() {
     use aterm_effects::pet_world::PetWorld;
-    use aterm_spec::derive::console_observation_admission_model;
+    use aterm_models_effects::console_observation_admission_model;
     let model = console_observation_admission_model();
     for airborne in [false, true] {
         let mut s = Scene::new();

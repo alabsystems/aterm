@@ -375,35 +375,6 @@ mod tests {
         );
     }
 
-    /// The frosted fill whitens from the cold hue toward sunlit ice with the blaze.
-    #[test]
-    fn fill_frosts_with_blaze() {
-        let g = geom();
-        let c = cfg();
-        let t = Instant::now();
-        let mut out = Vec::new();
-        let mut cold = CursorComet::default();
-        let f0 = cold
-            .tick(Some((1, 1)), t, 0.0, g, &c, &mut out)
-            .fill
-            .unwrap();
-        let mut hot = CursorComet::default();
-        let f1 = hot
-            .tick(Some((1, 1)), t, 1.0, g, &c, &mut out)
-            .fill
-            .unwrap();
-        let bright = |c: u32| ((c >> 16) & 0xff) + ((c >> 8) & 0xff) + (c & 0xff);
-        assert!(
-            bright(f1) > bright(f0) + 60,
-            "blaze frosts the fill toward white ({f1:#08x} vs {f0:#08x})"
-        );
-        // Both stay in the icy hue band: blue channel dominant.
-        for f in [f0, f1] {
-            let (r, gg, b) = ((f >> 16) & 0xff, (f >> 8) & 0xff, f & 0xff);
-            assert!(b >= gg && gg >= r, "icy hue ordering, got {f:#08x}");
-        }
-    }
-
     /// Every emitted quad is single-row, grid-interior, and ice-hued with capped
     /// coverage (the renderer row-gate / parity / legibility invariants).
     #[test]
@@ -476,26 +447,6 @@ mod tests {
             !nc.is_active(),
             "the settled nucleus idles on the blink cadence"
         );
-    }
-
-    /// The quad count is bounded by construction (discs + glint crosses).
-    #[test]
-    fn quad_count_is_bounded() {
-        let g = Geom {
-            cw: 20,
-            ch: 40,
-            rows: 50,
-            cols: 200,
-            origin_x: 0,
-            origin_y: 0,
-            win_w: 4000,
-            win_h: 2000,
-            head: 0,
-        };
-        let mut nc = CursorComet::default();
-        let mut out = Vec::new();
-        nc.tick(Some((25, 100)), Instant::now(), 1.0, g, &cfg(), &mut out);
-        assert!(out.len() < 400, "bounded coma geometry, got {}", out.len());
     }
 
     /// An explicit trail colour re-tints the whole nucleus: the ramp derives

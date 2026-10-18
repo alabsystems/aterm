@@ -23,7 +23,7 @@
 // Mounted only on the seal lane (`cfg(all(clean_islands, trust_seals))`, config_watcher.rs):
 // `import Trust.Protocol` needs a Trust newer than the installed seal.
 //
-// The text is `aterm_spec::derive::harness_policy_one_writer_model` and its liveness obligation
+// The text is `aterm_models_harness::harness_policy_one_writer_model` and its liveness obligation
 // as `emit_clean_models` writes them, so the model here is the one `ty`, the interpreter and the
 // Tier-1 tests check.
 clean {

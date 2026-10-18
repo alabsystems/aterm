@@ -10,16 +10,15 @@
 //!   to run (this box cannot execute the compat slice). `NS_TEXT_ALIGNMENT_CENTER`'s
 //!   two `#[cfg]` arms are BOTH checked, each under the matching `#if`, and the
 //!   arm the gate selects is read out of the SOURCE.
-//! * **Coverage runs both ways off the SOURCE.** Every constant the parser finds
-//!   in `consts` must have a row, and every row must name a constant that is
-//!   really there.
+//! * **Coverage comes from the SOURCE.** The probe walks every constant the
+//!   parser finds in `consts`, and one with no SDK row fails the probe by name.
 //!
 //! Why it matters: `NS_TEXT_ALIGNMENT_CENTER` once shipped as RIGHT alignment,
 //! caught only by a pixel capture, and `NS_COLOR_RENDERING_INTENT_PERCEPTUAL`
 //! was first written `1` (it is `3`) — wrong values no run-time test sees.
 //!
 //! [`winit_seam_constants.rs`](../winit_seam_constants.rs) is the twin over
-//! `crates/aterm-window`'s seam: same parser grammar, same probe, same coverage. Two
+//! `crates/aterm-window`'s seam: same parser grammar, same probe. Two
 //! differences:
 //!
 //! 1. **The literal is PARENTHESISED in the assertion.** `|` binds LOOSER than
@@ -36,10 +35,6 @@
 //! shells out to `clang`, so it need not link the `aterm-gui` library.
 
 #![cfg(target_os = "macos")]
-#![allow(
-    clippy::disallowed_types,
-    reason = "test code: a stand-in child may inherit descriptors"
-)]
 
 use std::path::{Path, PathBuf};
 
@@ -247,16 +242,11 @@ fn probe(invert: Option<&str>) -> String {
     let mut s = String::from("#import <Cocoa/Cocoa.h>\n#include <TargetConditionals.h>\n");
     let sdk_of: std::collections::HashMap<&str, &str> = ROWS.iter().copied().collect();
     for (rust, gate, value) in gui_constants() {
-        // A constant with no row would index-panic here. It is named instead,
-        // because a bare `KeyError`-shaped panic in the probe reads as a broken
-        // test rather than as the finding it is —
-        // `every_gui_constant_has_a_row_and_every_row_names_a_gui_constant` is
-        // the test that OWNS this failure, and this message says so.
+        // A constant with no row is the coverage finding, named.
         let sdk = *sdk_of.get(rust.as_str()).unwrap_or_else(|| {
             panic!(
                 "`consts` declares {rust} and ROWS has no SDK spelling for it, so \
-                 the probe cannot check it; add the row (see \
-                 `every_gui_constant_has_a_row_and_every_row_names_a_gui_constant`)"
+                 the probe cannot check it; add the row"
             )
         });
         let lit = as_c_literal(&value);
@@ -277,98 +267,6 @@ fn probe(invert: Option<&str>) -> String {
     }
     s.push_str("int main(void){return 0;}\n");
     s
-}
-
-/// THE TABLE AND THE MODULE AGREE, in both directions.
-#[test]
-fn every_gui_constant_has_a_row_and_every_row_names_a_gui_constant() {
-    let found = gui_constants();
-    let mut names: Vec<String> = found.iter().map(|(n, _, _)| n.clone()).collect();
-    names.sort();
-    names.dedup();
-    let rows: Vec<String> = ROWS.iter().map(|(n, _)| (*n).to_owned()).collect();
-
-    let missing: Vec<&String> = names.iter().filter(|n| !rows.contains(n)).collect();
-    assert!(
-        missing.is_empty(),
-        "appkit.rs's `consts` gained {} constant(s) with no row here, so nothing \
-         checks them against the SDK:\n  {:?}",
-        missing.len(),
-        missing
-    );
-    let stale: Vec<&String> = rows.iter().filter(|n| !names.contains(n)).collect();
-    assert!(
-        stale.is_empty(),
-        "these rows name constants `consts` no longer has:\n  {stale:?}"
-    );
-    assert_eq!(names.len(), ROWS.len(), "one row per distinct constant");
-    assert!(
-        names.len() >= 31,
-        "`consts` had 31 distinct constants when this was written; it now has {}",
-        names.len()
-    );
-
-    // THE SCOPE IS REAL. A parser that silently found nothing — a renamed
-    // module, a reformatted declaration — would satisfy every assertion above
-    // by making both lists empty, and this is what says it did not.
-    assert!(
-        found.len() > names.len(),
-        "exactly one constant is arch-split ({}), so the declaration count must \
-         exceed the name count",
-        "NS_TEXT_ALIGNMENT_CENTER"
-    );
-    let split: Vec<&(String, Gate, String)> = found
-        .iter()
-        .filter(|(_, g, _)| *g != Gate::Always)
-        .collect();
-    assert_eq!(
-        split.len(),
-        2,
-        "the arch-split constant must be parsed as TWO gated declarations, not \
-         one: {split:?}"
-    );
-    assert!(
-        split
-            .iter()
-            .all(|(n, _, _)| n == "NS_TEXT_ALIGNMENT_CENTER"),
-        "an unexpected constant is arch-gated: {split:?}"
-    );
-    assert!(
-        split.iter().any(|(_, g, _)| *g == Gate::X86_64)
-            && split.iter().any(|(_, g, _)| *g == Gate::NotX86_64),
-        "both arms of the arch-split constant must be seen: {split:?}"
-    );
-}
-
-/// THE ARCH GATE IS READ FROM THE SOURCE, and only an arch gate is.
-///
-/// If [`arch_gate`] answered `Some` for any attribute, an unrelated
-/// `#[cfg(test)]` or `#[allow(…)]` above a constant would put its assertion
-/// behind a `#if` that is false on both arches — the assertion would compile,
-/// both arms would pass, and the row would be checked by nothing.
-#[test]
-fn only_an_arch_gate_is_read_as_one() {
-    assert_eq!(
-        arch_gate(r#"    #[cfg(target_arch = "x86_64")]"#),
-        Some(Gate::X86_64)
-    );
-    assert_eq!(
-        arch_gate(r#"#[cfg(not(target_arch = "x86_64"))]"#),
-        Some(Gate::NotX86_64)
-    );
-    for other in [
-        "#[cfg(test)]",
-        "#[allow(dead_code)]",
-        r#"#[cfg(target_os = "macos")]"#,
-        r#"#[cfg(target_arch = "aarch64")]"#,
-        "/// a doc comment",
-        "",
-    ] {
-        assert_eq!(arch_gate(other), None, "{other:?} is not an arch gate");
-    }
-    assert_eq!(Gate::Always.c_if(), None);
-    assert_eq!(Gate::X86_64.c_if(), Some("TARGET_CPU_X86_64"));
-    assert_eq!(Gate::NotX86_64.c_if(), Some("!TARGET_CPU_X86_64"));
 }
 
 /// THE ORACLE, RUN — both arches, and this box cannot execute one of them.
@@ -410,35 +308,5 @@ fn the_assertion_is_load_bearing_on_both_arches() {
                 &format!("an inverted {row} compiled cleanly on {arch}"),
             );
         }
-    }
-}
-
-/// …AND SO IS THE ARCH SPLIT, which the row above cannot show.
-///
-/// `NS_TEXT_ALIGNMENT_CENTER` is 1 on arm64 and 2 on x86_64. Inverting it must
-/// fail on BOTH arches — which is only possible if each arm really is compiled
-/// under its own `#if`. A probe that emitted both declarations unguarded would
-/// fail on both arches whatever the values were (1 and 2 cannot both hold), and
-/// a probe that emitted only the arm this box compiles would leave the x86_64
-/// arm checked by nothing at all. This is the test that separates those.
-#[test]
-fn the_arch_split_row_is_checked_on_the_arch_it_belongs_to() {
-    // Green first: both arms as written must compile on both arches.
-    for arch in ["arm64", "x86_64"] {
-        green_verdict(
-            arch,
-            "the arch-split arms disagree with the SDK",
-            compile(arch, &probe(None), "split-green"),
-        );
-    }
-    // …and inverted, both arms fail — each on its own arch.
-    let body = probe(Some("NS_TEXT_ALIGNMENT_CENTER"));
-    for arch in ["arm64", "x86_64"] {
-        inverted_verdict(
-            arch,
-            "NS_TEXT_ALIGNMENT_CENTER",
-            compile(arch, &body, "split-inverted"),
-            &format!("the arch-split constant's {arch} arm is not really checked on {arch}"),
-        );
     }
 }

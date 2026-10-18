@@ -18,6 +18,8 @@
 //! waiting for the watcher's next poll, so the new theme can be selected. A
 //! card's Trash moves the theme's file to the Trash ([`trash_from`]) —
 //! recoverable, never an unlink — and the folder is read again the same way.
+//! A Get More card adds a community pack theme ([`add_pack_into`]) through
+//! `aterm_theme_pack::install`, the path `aterm theme install` takes.
 
 use crate::native_app::{ThemesOutcome, ThemesRequest};
 
@@ -47,6 +49,32 @@ pub(crate) fn perform(request: &ThemesRequest) -> ThemesOutcome {
         }
         ThemesRequest::Save { id, text } => save_into(&dir, id, text),
         ThemesRequest::Trash { id } => trash_from(&dir, id, move_to_trash),
+        ThemesRequest::AddPack { id } => add_pack_into(&dir, id),
+    }
+}
+
+/// Install the community pack theme `id` into `dir`, never over a different
+/// file of that name (`aterm_theme_pack::install`, the path `aterm theme
+/// install` takes). A copy already there unchanged counts as added.
+pub(crate) fn add_pack_into(dir: &std::path::Path, id: &str) -> ThemesOutcome {
+    let Some(theme) = aterm_theme_pack::find(id) else {
+        return ThemesOutcome::Failed {
+            message: format!("{id} is not in the community pack"),
+        };
+    };
+    match aterm_theme_pack::install(theme, Some(dir), false) {
+        Ok(_) => ThemesOutcome::Added {
+            id: theme.id.to_string(),
+        },
+        Err(aterm_types::scheme_install::InstallError::Exists(_)) => ThemesOutcome::Failed {
+            message: format!(
+                "a theme named \"{}\" is already in the themes folder",
+                theme.id
+            ),
+        },
+        Err(error) => ThemesOutcome::Failed {
+            message: error.to_string(),
+        },
     }
 }
 
@@ -231,16 +259,17 @@ impl crate::App {
         let Some(dir) = aterm_types::scheme::user_theme_dir() else {
             return;
         };
-        let spawned = std::thread::Builder::new()
-            .name("aterm-theme-rescan".to_string())
-            .spawn(move || {
-                crate::qos::set_self(crate::qos::Role::Background);
+        let spawned = crate::qos::spawn_lane_thread(
+            "aterm-theme-rescan".to_string(),
+            crate::qos::Role::Background,
+            move || {
                 if let Ok(catalog) = crate::app_config::ThemeCatalog::try_discover_in(&dir) {
                     let _ = proxy.send_event(crate::Wake::ThemeCatalogChanged(
                         std::sync::Arc::new(catalog),
                     ));
                 }
-            });
+            },
+        );
         if let Err(error) = spawned {
             aterm_log::warn!("could not start the theme folder rescan: {error}");
         }
@@ -380,6 +409,73 @@ mod tests {
             ThemesOutcome::Failed { message } if message.contains("already")
         ));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A Get More add installs the pack's file; again it is already there
+    /// (still added); an unknown id or an edited file of that name fails
+    /// and leaves the file alone.
+    #[test]
+    fn add_pack_installs_once_and_keeps_an_edited_file() {
+        let dir = scratch("add-pack");
+        let added = ThemesOutcome::Added {
+            id: "Iceberg Dark".to_string(),
+        };
+        assert_eq!(add_pack_into(&dir, "Iceberg Dark"), added);
+        let file = dir.join("Iceberg Dark.conf");
+        let text = aterm_theme_pack::find("Iceberg Dark").unwrap().text;
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+        assert_eq!(add_pack_into(&dir, "iceberg dark"), added);
+        assert!(matches!(
+            add_pack_into(&dir, "Nope"),
+            ThemesOutcome::Failed { .. }
+        ));
+        std::fs::write(&file, "mine").unwrap();
+        assert!(matches!(
+            add_pack_into(&dir, "Iceberg Dark"),
+            ThemesOutcome::Failed { .. }
+        ));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "mine");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every pack theme, installed, loads through the catalog the window
+    /// reads, as exactly the colours its file holds. Negative control: a
+    /// broken copy beside them is listed, not loaded, with its reason.
+    #[test]
+    fn pack_themes_load_through_the_catalog() {
+        let dir = scratch("pack-catalog");
+        for theme in aterm_theme_pack::themes() {
+            aterm_theme_pack::install(theme, Some(&dir), false).expect("installs");
+        }
+        std::fs::write(
+            dir.join("Broken Copy.conf"),
+            "foreground = nonsense
+",
+        )
+        .unwrap();
+        let catalog = crate::app_config::ThemeCatalog::discover_in(&dir);
+        for theme in aterm_theme_pack::themes() {
+            let parsed = aterm_types::scheme::parse_theme_str(theme.text).unwrap();
+            assert_eq!(catalog.resolve(theme.id), Ok(parsed.scheme), "{}", theme.id);
+            assert!(
+                catalog.ready_names().any(|name| name == theme.id),
+                "{}",
+                theme.id
+            );
+        }
+        let broken = catalog
+            .listing()
+            .find(|(name, _)| *name == "Broken Copy")
+            .map(|(_, status)| status);
+        assert!(
+            matches!(
+                broken,
+                Some(crate::app_config::ThemeEntryStatus::Invalid(reason)) if !reason.is_empty()
+            ),
+            "{broken:?}"
+        );
+        assert!(catalog.resolve("Broken Copy").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 #[cfg(test)]

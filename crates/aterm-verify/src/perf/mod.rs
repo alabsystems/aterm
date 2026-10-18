@@ -9,13 +9,19 @@
 //! targo --unverified verify perf --list
 //! ```
 //!
-//! Two kinds of lane. The FLOOR lanes ([`floors`], [`wasm`]) measure the
+//! Three kinds of lane. The FLOOR lanes ([`floors`], [`wasm`]) measure the
 //! engine headless and judge each metric against its committed baseline in
 //! `crates/aterm-verify/perf/golden/`; whatever they measured then meets the
 //! same-box trend ledger ([`trend`]), and a green run appends to it. A bare `verify
 //! perf` runs every floor lane. The ARENA lanes ([`arena`]) open real
 //! windows and take minutes; they run only when named, and what they measure
-//! has no floor, so they report MEASURED, never a pass.
+//! has no floor, so they report MEASURED, never a pass. The MEASURED lanes
+//! ([`fabric`]) are headless but just as unjudgeable — their numbers are a
+//! disk's fsync before they are aterm's — so they too run only when named and
+//! report MEASURED, writing a ledger entry under `docs/measured/`.
+//!
+//! `--no-windows` (the house switch for an agent sharing the owner's desktop)
+//! turns every lane that opens a window into a named skip and runs the rest.
 //!
 //! Nothing runs this automatically: it measures when someone asks it to.
 
@@ -27,6 +33,8 @@ use std::time::Instant;
 #[cfg(unix)]
 pub(crate) mod arena;
 mod driver;
+#[cfg(unix)]
+mod fabric;
 mod floors;
 #[cfg(unix)]
 mod stats;
@@ -81,6 +89,7 @@ pub(crate) enum Lane {
     ScrollScrub,
     Search,
     Restore,
+    CrashRestore,
     Resize,
     Zstd,
     Wasm,
@@ -89,6 +98,7 @@ pub(crate) enum Lane {
     Cat,
     Scroll,
     Vte,
+    Fabric,
 }
 
 /// Which kind of lane, and so whether a bare run includes it.
@@ -98,15 +108,19 @@ pub(crate) enum Kind {
     Floor,
     /// A real-window head-to-head; run only when named.
     Arena,
+    /// Headless, real processes, nothing to judge against; run only when
+    /// named.
+    Measured,
 }
 
 impl Lane {
-    pub(crate) const ALL: [Lane; 13] = [
+    pub(crate) const ALL: [Lane; 15] = [
         Lane::Throughput,
         Lane::Pathological,
         Lane::ScrollScrub,
         Lane::Search,
         Lane::Restore,
+        Lane::CrashRestore,
         Lane::Resize,
         Lane::Zstd,
         Lane::Wasm,
@@ -115,6 +129,7 @@ impl Lane {
         Lane::Cat,
         Lane::Scroll,
         Lane::Vte,
+        Lane::Fabric,
     ];
 
     pub(crate) fn name(self) -> &'static str {
@@ -124,6 +139,7 @@ impl Lane {
             Lane::ScrollScrub => "scroll-scrub",
             Lane::Search => "search",
             Lane::Restore => "restore",
+            Lane::CrashRestore => "crash-restore",
             Lane::Resize => "resize",
             Lane::Zstd => "zstd",
             Lane::Wasm => "wasm",
@@ -132,6 +148,7 @@ impl Lane {
             Lane::Cat => "cat",
             Lane::Scroll => "scroll",
             Lane::Vte => "vte",
+            Lane::Fabric => "fabric",
         }
     }
 
@@ -142,11 +159,19 @@ impl Lane {
             | Lane::ScrollScrub
             | Lane::Search
             | Lane::Restore
+            | Lane::CrashRestore
             | Lane::Resize
             | Lane::Zstd
             | Lane::Wasm => Kind::Floor,
             Lane::Start | Lane::Compare | Lane::Cat | Lane::Scroll | Lane::Vte => Kind::Arena,
+            Lane::Fabric => Kind::Measured,
         }
+    }
+
+    /// Whether the lane puts a window on the desktop: the lanes `--no-windows`
+    /// skips. Every arena lane does; no other lane does.
+    pub(crate) fn opens_windows(self) -> bool {
+        self.kind() == Kind::Arena
     }
 
     /// What the lane measures, for `--list`.
@@ -157,6 +182,9 @@ impl Lane {
             Lane::ScrollScrub => "scrollback scrub read-path rates over a 100k-line tiered fill",
             Lane::Search => "search index build, cached query and retained memory",
             Lane::Restore => "serialize -> fresh engine -> replay rate",
+            Lane::CrashRestore => {
+                "crash-restore journal: tail-tap overhead, keyframe and recover rates"
+            }
             Lane::Resize => "resize/rewrap rates plus the absolute 42s-freeze fences",
             Lane::Zstd => {
                 "aterm-zstd decode MB/s over recorded zstd CLI frames (atpkg's installer)"
@@ -167,6 +195,10 @@ impl Lane {
             Lane::Cat => "cat 150 MB ascii + unicode, aterm vs the pinned ghostty tip",
             Lane::Scroll => "windowed 100k-line scrub + jump-to-top frame pacing",
             Lane::Vte => "vtebench's default suite, aterm vs the pinned ghostty tip",
+            Lane::Fabric => {
+                "fabric post->deliver latency, burst throughput, request/reply ping-pong, attach \
+                 time and records per message over a real broker, bridge and headless aterm"
+            }
         }
     }
 
@@ -178,16 +210,19 @@ impl Lane {
             | Lane::ScrollScrub
             | Lane::Search
             | Lane::Restore
+            | Lane::CrashRestore
             | Lane::Resize
             | Lane::Zstd => "targo (release build of aterm-bench)",
-            Lane::Wasm => {
-                "node, rustup stable + wasm32-unknown-unknown, wasm-opt, wasm-bindgen (pinned)"
-            }
+            Lane::Wasm => "node, rustup stable + wasm32-unknown-unknown, wasm-opt",
             Lane::Start => "macOS, a built aterm (--binary)",
             Lane::Compare => "macOS, two built aterm binaries (--baseline, --candidate)",
             Lane::Cat => "macOS on the M4-class bench box (or --dev-smoke), curl",
             Lane::Vte => "macOS on the M4-class bench box (or --dev-smoke), curl, git",
             Lane::Scroll => "macOS on the M4-class bench box (or --dev-smoke)",
+            Lane::Fabric => {
+                "unix, targo (builds aterm and its fabric_bench test: dev, or opt-test with \
+                 --profile opt)"
+            }
         }
     }
 
@@ -208,7 +243,8 @@ pub(crate) enum Status {
     /// Its baseline was rewritten from this run; nothing was compared.
     Recorded(PathBuf),
     /// It measured and reported, with no floor to judge against: where the
-    /// numbers went. Only the arena lanes measure this way, and they are unix.
+    /// numbers went. The arena and MEASURED lanes ([`Kind::Arena`],
+    /// [`Kind::Measured`]) report this way, and they are unix.
     #[cfg_attr(not(unix), allow(dead_code))]
     Measured(String),
     /// It could not measure on this box: why, and what to do about it.
@@ -302,6 +338,7 @@ struct OptSpec {
 }
 
 const START_LANES: &[Lane] = &[Lane::Start, Lane::Compare];
+const JSON_LANES: &[Lane] = &[Lane::Start, Lane::Compare, Lane::Fabric];
 const GHOSTTY_LANES: &[Lane] = &[Lane::Cat, Lane::Vte];
 const BENCH_BOX_LANES: &[Lane] = &[Lane::Cat, Lane::Scroll, Lane::Vte];
 
@@ -363,7 +400,7 @@ const OPTIONS: &[OptSpec] = &[
     OptSpec {
         flag: "--json-out",
         value: Some("PATH"),
-        lanes: START_LANES,
+        lanes: JSON_LANES,
         help: "write every raw sample and the summary as JSON",
     },
     OptSpec {
@@ -431,6 +468,56 @@ const OPTIONS: &[OptSpec] = &[
         value: Some("N"),
         lanes: &[Lane::Vte],
         help: "vtebench's per-benchmark sampling time (default 10)",
+    },
+    OptSpec {
+        flag: "--latency-samples",
+        value: Some("N"),
+        lanes: &[Lane::Fabric],
+        help: "measured post->deliver round trips (default 200)",
+    },
+    OptSpec {
+        flag: "--burst",
+        value: Some("N"),
+        lanes: &[Lane::Fabric],
+        help: "posts in the back-to-back burst (default 500)",
+    },
+    OptSpec {
+        flag: "--pingpong-rounds",
+        value: Some("N"),
+        lanes: &[Lane::Fabric],
+        help: "measured request/reply round trips, B replying on receipt (default 200)",
+    },
+    OptSpec {
+        flag: "--attach-sessions",
+        value: Some("N,N,..."),
+        lanes: &[Lane::Fabric],
+        help: "rising session counts a restarted bridge attaches with (default 1,8,32)",
+    },
+    OptSpec {
+        flag: "--attach-rounds",
+        value: Some("N"),
+        lanes: &[Lane::Fabric],
+        help: "bridge restarts measured per session count (default 3)",
+    },
+    OptSpec {
+        flag: "--durability",
+        value: Some("TIER"),
+        lanes: &[Lane::Fabric],
+        help: "the bench broker's tier: strict (default, as aterm opens it) or relaxed (no \
+               fsync: the ceiling arm)",
+    },
+    OptSpec {
+        flag: "--profile",
+        value: Some("dev|opt"),
+        lanes: &[Lane::Fabric],
+        help: "the build measured: dev (default) or opt (cargo profile opt-test: opt-level 3, \
+               debug assertions on)",
+    },
+    OptSpec {
+        flag: "--no-windows",
+        value: None,
+        lanes: &Lane::ALL,
+        help: "skip every lane that opens a window (the arena lanes); run the rest",
     },
 ];
 
@@ -506,6 +593,24 @@ pub(crate) fn parse(args: &[String]) -> Result<Cli, String> {
     {
         return Err("`compare` needs --baseline PATH and --candidate PATH".to_string());
     }
+    // ONE PATH, ONE WRITER: every lane that takes `--json-out` writes its own
+    // whole report to it, so a second such lane in the run would overwrite the
+    // first's and both would say they wrote it.
+    if cli.options.contains_key("--json-out") {
+        let writers: Vec<&str> = cli
+            .lanes
+            .iter()
+            .filter(|l| JSON_LANES.contains(l))
+            .map(|l| l.name())
+            .collect();
+        if writers.len() > 1 {
+            return Err(format!(
+                "`--json-out` names one file, and {} would each write their own report to it; \
+                 run them one at a time",
+                writers.join(" and ")
+            ));
+        }
+    }
     for flag in cli.options.keys() {
         let spec = OPTIONS
             .iter()
@@ -530,7 +635,7 @@ fn usage() -> String {
          No LANE runs every floor lane, then the same-box trend; a green run appends its\n\
          medians to crates/aterm-verify/perf/golden/perf-trend.tsv (commit it: that is the\n\
          history the trend reads). `--record` rewrites, from this run, the baseline of every floor lane\n\
-         named after it; an arena lane named there just runs.\n\
+         named after it; an arena or measured lane named there just runs.\n\
          Exit: 0 nothing failed (a SKIP names its fix) · 1 a lane failed · 2 usage.\n\
          \n\
          Options:\n",
@@ -548,7 +653,7 @@ fn usage() -> String {
 
 fn list() -> String {
     let mut s = String::new();
-    for kind in [Kind::Floor, Kind::Arena] {
+    for kind in [Kind::Floor, Kind::Arena, Kind::Measured] {
         s.push_str(match kind {
             Kind::Floor => {
                 "FLOOR lanes (the default set; judged against crates/aterm-verify/perf/golden, \
@@ -558,6 +663,11 @@ fn list() -> String {
                 "ARENA lanes (only when named; real windows, minutes; measured, not judged: \
                  cat, scroll and vte write a docs/measured/arena entry, start and compare \
                  print a summary, and JSON with --json-out)\n"
+            }
+            Kind::Measured => {
+                "MEASURED lanes (only when named; headless, real processes, minutes; measured, \
+                 not judged: fabric writes a docs/measured/fabric entry, and JSON with \
+                 --json-out)\n"
             }
         });
         for lane in Lane::ALL.into_iter().filter(|l| l.kind() == kind) {
@@ -571,6 +681,37 @@ fn list() -> String {
         }
     }
     s
+}
+
+/// The options lanes matching `reads` take: what one lane family's parser is
+/// handed. [`OPTIONS`] already says which lanes read each flag, so a parser
+/// sees only its own flags and can treat any other as a missing parser (an
+/// internal error) instead of keeping a list of the flags it skips.
+#[cfg(unix)]
+fn options_for(
+    options: &BTreeMap<&'static str, String>,
+    reads: impl Fn(Lane) -> bool,
+) -> BTreeMap<&'static str, String> {
+    options
+        .iter()
+        .filter(|(flag, _)| {
+            OPTIONS
+                .iter()
+                .find(|o| o.flag == **flag)
+                .is_some_and(|o| o.lanes.iter().any(|l| reads(*l)))
+        })
+        .map(|(flag, value)| (*flag, value.clone()))
+        .collect()
+}
+
+/// Each lane family's own options, parsed — before any lane runs, so a bad
+/// value is a usage error (exit 2) and never a lane that failed after a build.
+#[cfg(unix)]
+fn lane_args(cli: &Cli) -> Result<(arena::Args, fabric::Args), String> {
+    Ok((
+        arena::Args::from_options(&options_for(&cli.options, |l| l.kind() == Kind::Arena))?,
+        fabric::Args::from_options(&options_for(&cli.options, |l| l == Lane::Fabric))?,
+    ))
 }
 
 /// The `verify perf` verb.
@@ -591,17 +732,22 @@ fn main(args: &[String]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     #[cfg(unix)]
-    let arena_args = match arena::Args::from_options(&cli.options) {
+    let (arena_args, fabric_args) = match lane_args(&cli) {
         Ok(a) => a,
         Err(why) => {
             eprintln!("verify perf: {why}\n\n{}", usage());
             return ExitCode::from(2);
         }
     };
+    let no_windows = cli.options.contains_key("--no-windows");
     // Before any lane starts a thread: an interrupted arena run retires the
     // windows and scratch directories it made.
     #[cfg(unix)]
-    if cli.lanes.iter().any(|l| l.kind() == Kind::Arena) {
+    if cli
+        .lanes
+        .iter()
+        .any(|l| l.kind() == Kind::Arena && !(no_windows && l.opens_windows()))
+    {
         arena::live::guard();
     }
     let names: Vec<&str> = cli.lanes.iter().map(|l| l.name()).collect();
@@ -613,11 +759,16 @@ fn main(args: &[String]) -> ExitCode {
         let record = cli.record.contains(lane);
         eprintln!("--- {} ---", lane.name());
         let run = match lane {
+            lane if no_windows && lane.opens_windows() => LaneRun::skip(
+                "it opens a window on the desktop (--no-windows)",
+                "run it without --no-windows when the desktop is free",
+            ),
             Lane::Throughput => floors::gate_throughput(record),
             Lane::Pathological => floors::gate_keyed(&floors::PATHOLOGICAL_LANE, record),
             Lane::ScrollScrub => floors::gate_keyed(&floors::SCROLL_LANE, record),
             Lane::Search => floors::gate_keyed(&floors::SEARCH_LANE, record),
             Lane::Restore => floors::gate_keyed(&floors::RESTORE_LANE, record),
+            Lane::CrashRestore => floors::gate_crash_restore(record),
             Lane::Resize => floors::gate_resize(record),
             Lane::Zstd => floors::gate_keyed(&floors::ZSTD_LANE, record),
             Lane::Wasm => wasm::gate_wasm(record),
@@ -635,6 +786,13 @@ fn main(args: &[String]) -> ExitCode {
             Lane::Start | Lane::Compare | Lane::Cat | Lane::Scroll | Lane::Vte => LaneRun::skip(
                 "the arena lanes launch unix process groups and macOS windows",
                 "run them on the bench Mac",
+            ),
+            #[cfg(unix)]
+            Lane::Fabric => fabric::run(&fabric_args),
+            #[cfg(not(unix))]
+            Lane::Fabric => LaneRun::skip(
+                "the fabric bridge is unix-only (aterm-link)",
+                "run it on macOS or Linux",
             ),
         };
         ran.push((*lane, run, started.elapsed().as_secs_f64()));
@@ -748,6 +906,7 @@ mod tests {
                 Lane::ScrollScrub,
                 Lane::Search,
                 Lane::Restore,
+                Lane::CrashRestore,
                 Lane::Resize,
                 Lane::Zstd,
                 Lane::Wasm
@@ -792,6 +951,120 @@ mod tests {
         );
         assert!(parse(&args("compare --baseline a --candidate b")).is_ok());
         assert!(parse(&args("--bogus")).is_err());
+    }
+
+    #[test]
+    fn the_fabric_lane_runs_only_when_named_and_takes_its_own_options() {
+        let cli = parse(&args(
+            "fabric --burst 200 --attach-sessions 1,4 --json-out /tmp/f.json",
+        ))
+        .expect("parses");
+        assert_eq!(cli.lanes, vec![Lane::Fabric]);
+        assert_eq!(Lane::Fabric.kind(), Kind::Measured);
+        assert!(!Lane::Fabric.opens_windows());
+        assert!(!parse(&[]).expect("parses").lanes.contains(&Lane::Fabric));
+        // Its options need it named.
+        let why = parse(&args("restore --burst 9")).unwrap_err();
+        assert!(why.contains("--burst") && why.contains("fabric"), "{why}");
+        // Named after --record it just runs: it has no baseline to rewrite.
+        let cli = parse(&args("--record restore fabric")).expect("parses");
+        assert_eq!(cli.record, vec![Lane::Restore]);
+        assert_eq!(cli.lanes, vec![Lane::Restore, Lane::Fabric]);
+    }
+
+    #[test]
+    fn list_names_every_lane_once_under_its_kind() {
+        let listed = list();
+        for lane in Lane::ALL {
+            let rows = listed
+                .lines()
+                .filter(|l| l.starts_with("  ") && l.split_whitespace().next() == Some(lane.name()))
+                .count();
+            assert_eq!(rows, 1, "{}:\n{listed}", lane.name());
+        }
+        // One heading per kind, in the order the kinds run: every lane's row
+        // sits under the heading of its own kind.
+        let mut kind_at = Vec::new();
+        for line in listed.lines() {
+            if !line.starts_with(' ') {
+                kind_at.push(line);
+            } else if let Some(lane) = line.split_whitespace().next().and_then(Lane::from_name) {
+                let heading = kind_at.len().checked_sub(1).expect("a heading first");
+                let kind = [Kind::Floor, Kind::Arena, Kind::Measured][heading];
+                assert_eq!(lane.kind(), kind, "{}", lane.name());
+            }
+        }
+        assert_eq!(kind_at.len(), 3, "{listed}");
+    }
+
+    /// The path `main` takes from a command line to each lane family's
+    /// options: the arena parser, then the fabric parser, each handed only its
+    /// own flags.
+    #[cfg(unix)]
+    #[test]
+    fn every_lane_family_parses_only_its_own_options_before_anything_runs() {
+        let cli = parse(&args(
+            "fabric --latency-samples 7 --burst 200 --pingpong-rounds 30 --attach-sessions 1,4 \
+             --attach-rounds 2 --durability relaxed --json-out /tmp/f.json --no-windows",
+        ))
+        .expect("parses");
+        let (_, fabric_args) = lane_args(&cli).expect("both parsers take it");
+        assert_eq!(fabric_args.burst, Some(200));
+        assert_eq!(fabric_args.pingpong, Some(30));
+        assert_eq!(fabric_args.json_out, Some(PathBuf::from("/tmp/f.json")));
+        assert_eq!(
+            fabric_args.durability.map(|tier| tier.word()),
+            Some("relaxed")
+        );
+        // A flag the table gives only to the fabric lane never reaches the
+        // arena parser, which has no arm for it.
+        assert!(
+            arena::Args::from_options(&options_for(&cli.options, |l| l.kind() == Kind::Arena))
+                .is_ok()
+        );
+        // Past what the bench takes: a usage error here, before any build.
+        for line in [
+            "fabric --burst 6000",
+            "fabric --pingpong-rounds 0",
+            "fabric --attach-sessions 1,200",
+            "fabric --profile release",
+        ] {
+            let cli = parse(&args(line)).expect(line);
+            assert!(lane_args(&cli).is_err(), "{line}");
+        }
+        // The arm reaches the fabric parser, and only the fabric lane takes it.
+        let cli = parse(&args("fabric --profile opt --no-windows")).expect("parses");
+        let (_, fabric_args) = lane_args(&cli).expect("parses");
+        assert_eq!(fabric_args.profile.name(), "opt");
+        let why = parse(&args("start --profile opt")).unwrap_err();
+        assert!(why.contains("--profile") && why.contains("fabric"), "{why}");
+    }
+
+    #[test]
+    fn two_lanes_never_share_one_json_out() {
+        assert!(parse(&args("fabric --json-out /tmp/r.json")).is_ok());
+        assert!(parse(&args("start --json-out /tmp/r.json")).is_ok());
+        assert!(parse(&args("start fabric --json-out /tmp/r.json")).is_err());
+        assert!(
+            parse(&args(
+                "start compare --baseline /a --candidate /b --json-out /tmp/r.json"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn no_windows_is_accepted_beside_any_lane_and_names_the_windowed_ones() {
+        for line in ["fabric --no-windows", "--no-windows", "start --no-windows"] {
+            let cli = parse(&args(line)).expect(line);
+            assert!(cli.options.contains_key("--no-windows"), "{line}");
+        }
+        let windowed: Vec<&str> = Lane::ALL
+            .into_iter()
+            .filter(|l| l.opens_windows())
+            .map(Lane::name)
+            .collect();
+        assert_eq!(windowed, ["start", "compare", "cat", "scroll", "vte"]);
     }
 
     #[test]

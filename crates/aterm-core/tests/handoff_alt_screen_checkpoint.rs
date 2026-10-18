@@ -41,83 +41,33 @@ fn carry(t: &Terminal) -> TerminalCheckpoint {
     t.checkpoint_carry(CARRY).expect("parser is Ground")
 }
 
-/// Precondition: the primary really does carry history, so the alt-screen case
-/// below is not vacuous.
-#[test]
-fn the_primary_screen_carries_history() {
-    let cp = carry(&primary_with_history());
-    assert!(
-        cp.history_lines > 0,
-        "the primary must have scrollback for this suite to mean anything"
-    );
-}
-
 /// While the alternate screen is up, `alt_grid` holds the saved primary with
-/// its scrollback, and the wire still allows it exactly `rows` records.
+/// its scrollback, and the wire still allows it exactly `rows` records: the
+/// wire has one `history_lines` and it describes the MAIN blob, so a carried
+/// alt history is unrepresentable and the consumer refuses the whole capture.
+/// 1047 reaches the same parked primary by another path (it reuses the
+/// persistent alternate buffer); after a 1047 exit `alt_grid` holds that
+/// buffer, whose ring cap is 0 (a 1049 exit discards it, so it cannot be the
+/// control).
 #[test]
-fn the_alt_blob_is_exactly_rows_records_while_the_alternate_screen_is_up() {
-    let mut t = primary_with_history();
-    // DECSET 1049 — the primary, scrollback and all, is parked in `alt_grid`.
-    t.process(b"\x1b[?1049h");
-    t.process(b"a full-screen app draws here");
-
-    let cp = carry(&t);
-    let alt = cp
-        .alt_grid
-        .as_ref()
-        .expect("the saved primary is parked in alt_grid");
-
-    assert!(
-        is_canonical(alt, usize::from(cp.rows), cp.cols),
-        "the alt blob must hold exactly `rows` records: the wire has one \
-         `history_lines` and it describes the MAIN blob, so a carried alt \
-         history is unrepresentable and the consumer refuses the whole capture"
-    );
-}
-
-/// The other entry mode. 1047 reuses the persistent alternate buffer rather
-/// than allocating a cleared one, so it reaches the same parked saved primary
-/// by a different path.
-#[test]
-fn the_alt_blob_is_exactly_rows_records_under_mode_1047_too() {
-    let mut t = primary_with_history();
-    t.process(b"\x1b[?1047h");
-    t.process(b"a full-screen app draws here");
-
-    let cp = carry(&t);
-    let alt = cp
-        .alt_grid
-        .as_ref()
-        .expect("the saved primary is parked in alt_grid");
-
-    assert!(
-        is_canonical(alt, usize::from(cp.rows), cp.cols),
-        "the alt blob must hold exactly `rows` records under mode 1047 as well"
-    );
-}
-
-/// Control: back on the primary screen, `alt_grid` holds the persistent
-/// alternate buffer, whose ring cap is 0 (xterm).
-///
-/// Exit via 1047, not 1049: 1049 discards the alternate buffer (`alt_grid`
-/// becomes `None`), so it cannot exercise a parked alt blob.
-#[test]
-fn the_alt_blob_is_exactly_rows_records_after_leaving_the_alternate_screen() {
-    let mut t = primary_with_history();
-    t.process(b"\x1b[?1047h");
-    t.process(b"a full-screen app draws here");
-    t.process(b"\x1b[?1047l");
-
-    let cp = carry(&t);
-    let alt = cp
-        .alt_grid
-        .as_ref()
-        .expect("the alternate buffer is persistent and survives the exit");
-
-    assert!(
-        is_canonical(alt, usize::from(cp.rows), cp.cols),
-        "the parked alternate buffer must still be exactly `rows` records"
-    );
+fn the_alt_blob_is_exactly_rows_records() {
+    for (name, bytes) in [
+        ("1049 up", &b"\x1b[?1049ha full-screen app draws here"[..]),
+        ("1047 up", b"\x1b[?1047ha full-screen app draws here"),
+        (
+            "after a 1047 exit",
+            b"\x1b[?1047ha full-screen app draws here\x1b[?1047l",
+        ),
+    ] {
+        let mut t = primary_with_history();
+        t.process(bytes);
+        let cp = carry(&t);
+        let alt = cp.alt_grid.as_ref().expect("a parked alt_grid");
+        assert!(
+            is_canonical(alt, usize::from(cp.rows), cp.cols),
+            "{name}: the alt blob must hold exactly `rows` records"
+        );
+    }
 }
 
 /// The main blob, which `history_lines` describes, holds `rows + history_lines` records.
@@ -131,8 +81,8 @@ fn the_main_blob_is_rows_plus_its_declared_history() {
         "the main blob must hold exactly `rows + history_lines` records"
     );
     assert!(
-        cp.history_lines as usize <= CARRY,
-        "the carry bound is an upper bound on the declared history"
+        cp.history_lines > 0 && cp.history_lines as usize <= CARRY,
+        "the primary carries history, bounded by the carry target"
     );
 }
 

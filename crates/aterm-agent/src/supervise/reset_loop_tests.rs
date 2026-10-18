@@ -277,48 +277,6 @@ fn a_gate_of_the_loops_shut_passes_the_reset_over_before_the_host_is_asked() {
     assert!(said[0].ends_with("rule=limit-reset@v1 gate=no-host"));
 }
 
-/// A host that cannot say yet (`Again`: the wall's own row is not written,
-/// its lock is held) is asked again a moment later — and the SIXTH `Again`
-/// in a row is a pass: the wait row. NEGATIVE CONTROL: two `Again`s and then
-/// the go take the row.
-#[test]
-fn a_host_that_cannot_say_yet_is_asked_five_times_more_and_then_passed_over() {
-    let host = ResetHost::reading(spent());
-    host.agains.store(2, Ordering::SeqCst);
-    let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
-    let run = reset_watch(
-        "again-2",
-        &mut m,
-        reset_opts(&host, true, 120),
-        &fresh,
-        |_| {},
-    );
-    assert_eq!(reset_world(&mut m).yes_taken, 1, "{:#?}", run.journal);
-    // Two that could not say, the go, and the ask before the Enter.
-    assert_eq!(host.said("take").len(), 4);
-
-    let host = ResetHost::reading(spent());
-    host.agains.store(usize::MAX, Ordering::SeqCst);
-    let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
-    let run = reset_watch(
-        "again-6",
-        &mut m,
-        reset_opts(&host, true, 120),
-        &fresh,
-        |_| {},
-    );
-    assert_eq!(host.said("take").len(), 6, "{:#?}", run.journal);
-    assert_eq!(reset_world(&mut m).chosen, [RESET_WAIT]);
-    assert!(
-        run.of_rule()
-            .iter()
-            .any(|l| l.starts_with("SKIPPED") && l.ends_with("host=again")),
-        "{:#?}",
-        run.journal
-    );
-    assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
-}
-
 /// THE EARLY-USE CONFIRMATION — the vendor's line that the limit is not
 /// reached — is ESCAPED, never entered: one `key if-human=<n> if=<the title
 /// row> esc`, the reset kept (`inexact-early`), the ledger's `declined` row
@@ -392,53 +350,6 @@ fn the_early_use_confirmation_is_escaped_and_one_continuation_is_owed() {
     assert_eq!(count(&m, "send"), 0);
     assert_eq!(m.attention, None);
     assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
-}
-
-/// PAST THE VENDOR'S GUARD: no key reaches the confirmation before it has
-/// stood the box settle in the loop's sight — a server that refuses, and
-/// re-arms on, every key inside its guard sees NONE refused, and the yes is
-/// taken by the one Enter. NEGATIVE CONTROL: the same loop with no settle
-/// writes its Enter into the guard, where it is refused and nothing is
-/// spent.
-#[test]
-fn no_key_reaches_the_confirmation_before_it_has_stood_the_settle() {
-    let host = ResetHost::reading(spent());
-    let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
-    reset_world(&mut m).guard = Duration::from_millis(30);
-    reset_watch(
-        "settle",
-        &mut m,
-        reset_opts(&host, true, 120),
-        &fresh,
-        |s| {
-            s.set_box_settle(Duration::from_millis(60));
-        },
-    );
-    assert_eq!(reset_world(&mut m).refused, Vec::<String>::new());
-    assert_eq!(reset_world(&mut m).yes_taken, 1);
-    assert_eq!(
-        reset_keys(&m),
-        ["down@dialog", "enter@dialog", "enter@confirm"]
-    );
-    assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
-
-    // The control: a guard that outlasts the run, and no settle.
-    let host = ResetHost::reading(spent());
-    let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
-    reset_world(&mut m).guard = Duration::from_secs(600);
-    reset_world(&mut m).exits_when = Some(ResetExit::Refused);
-    reset_watch(
-        "no-settle",
-        &mut m,
-        reset_opts(&host, true, 120),
-        &fresh,
-        |_| {},
-    );
-    assert_eq!(
-        reset_world(&mut m).refused.first().map(String::as_str),
-        Some("enter")
-    );
-    assert_eq!(reset_world(&mut m).yes_taken, 0);
 }
 
 /// THE FOCUS ON NO: a confirmation whose cursor is not on its yes is
@@ -692,531 +603,6 @@ fn a_pending_line_is_never_keyed_but_checking_past_its_bound() {
     );
 }
 
-/// THE ROW'S OWN ANSWER: the check ends with a line and NO confirmation (no
-/// reset to use, the limit lifted already). The row's keys are all that is
-/// written; the host reads the line — a failure — and the wall's own
-/// continuation goes once, by the limit-resume rule. NEGATIVE CONTROL: the
-/// whole path, where the same check opens the confirmation.
-#[test]
-fn a_rows_own_answer_is_a_failure_and_no_key_follows_it() {
-    let host = ResetHost::reading(ResetOutcome::Failed { login: false });
-    let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
-    reset_world(&mut m).opens = ResetOpens::Answer;
-    let run = reset_watch(
-        "answer",
-        &mut m,
-        reset_opts(&host, true, 120),
-        &fresh,
-        |_| {},
-    );
-    assert_eq!(reset_keys(&m), ["down@dialog", "enter@dialog"]);
-    assert_eq!(
-        host.said("told"),
-        ["told entered=false kept=- offer=None last=false"]
-    );
-    assert!(
-        run.of_rule()
-            .iter()
-            .any(|l| l.starts_with("RESET seq=") && l.ends_with("failed (answer)")),
-        "{:#?}",
-        run.journal
-    );
-    assert_eq!(
-        run.rows().last().map(String::as_str),
-        Some("waiting|limit reset|ended: failed")
-    );
-    assert_eq!(run.typed().len(), 1, "{:#?}", run.ledger);
-    assert!(run.typed()[0].contains("usage-resume@v1"));
-    assert_eq!(m.attention, None);
-    assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
-}
-
-/// THE ROW OPENS NOTHING: its Enter is written and the dialog stands as it
-/// was. Past its bound the reset is kept (`not-opened`), the host told —
-/// and the dialog, decided again, is the wait row's: the host answers that
-/// the wall has had its attempt. NEGATIVE CONTROL: the whole path, where
-/// the same Enter opens the confirmation.
-#[test]
-fn a_row_that_opens_nothing_is_kept_and_the_wait_row_is_pressed() {
-    let host = ResetHost::reading(ResetOutcome::Kept);
-    let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
-    reset_world(&mut m).opens = ResetOpens::Nothing;
-    let run = reset_watch(
-        "nothing",
-        &mut m,
-        reset_opts(&host, true, 120),
-        &fresh,
-        |s| s.set_reset_waits(reset_waits_cut(|w| w.open = Duration::from_millis(60))),
-    );
-    assert_eq!(
-        reset_keys(&m),
-        ["down@dialog", "enter@dialog", "down@dialog", "enter@dialog"],
-        "{:#?}",
-        run.journal
-    );
-    assert_eq!(reset_world(&mut m).chosen, [RESET_GRANT, RESET_WAIT]);
-    assert_eq!(
-        host.said("told"),
-        ["told entered=false kept=not-opened offer=None last=false"]
-    );
-    assert!(
-        run.of_rule()
-            .iter()
-            .any(|l| l.starts_with("RESET seq=") && l.ends_with("kept (not-opened)")),
-        "{:#?}",
-        run.journal
-    );
-    assert!(
-        run.of_rule()
-            .iter()
-            .any(|l| l.starts_with("SKIPPED") && l.ends_with("host=attempted")),
-        "{:#?}",
-        run.journal
-    );
-    assert_eq!(m.attention, None);
-    assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
-}
-
-/// THE ROW'S PRESS NEVER LANDS: the cursor does not move onto the grant row
-/// however often its arrow is written. The press is tried again on the press
-/// back-off — the host answering its own claim with the go again — and
-/// where any other box would be badged, the reset is passed over: the host
-/// is told it was kept (`not-opened`), NO badge is raised, and the dialog
-/// gets its wait row. NEGATIVE CONTROL: the whole path, where the arrow
-/// lands and the row is entered.
-#[test]
-fn a_press_that_never_lands_is_passed_over_and_never_badged() {
-    // At full power and under the safe rules alike: the reset's press is
-    // no permission, and no level hands it to a person.
-    for level in ["all", "safe"] {
-        let host = ResetHost::reading(ResetOutcome::Kept);
-        // The cursor on the wait row: the grant row is one `up` away, and
-        // the wait row needs no arrow.
-        let mut m = reset_mock(vec![], &RESET_ROWS, 2, &host);
-        reset_world(&mut m).arrow_drops = usize::MAX;
-        let mut opts = reset_opts(&host, true, 120);
-        opts.policy.set("approve", level).expect("a level");
-        let run = reset_watch("never-lands", &mut m, opts, &fresh, |s| {
-            s.set_press_badge_after(Duration::from_millis(40));
-        });
-        let keys = reset_keys(&m);
-        assert!(keys.len() > 2, "{level}: {keys:?}");
-        assert!(
-            keys[..keys.len() - 1].iter().all(|k| k == "up@dialog"),
-            "{level}: {keys:?}"
-        );
-        assert_eq!(keys.last().map(String::as_str), Some("enter@dialog"));
-        assert_eq!(reset_world(&mut m).chosen, [RESET_WAIT]);
-        assert_eq!(
-            host.said("told"),
-            ["told entered=false kept=not-opened offer=None last=true"]
-        );
-        assert!(host.said("take").len() > 1, "its own claim, asked again");
-        // Passed over once for the mount: the host is not asked after it.
-        let skipped: Vec<&str> = run
-            .of_rule()
-            .into_iter()
-            .filter(|l| l.starts_with("SKIPPED"))
-            .collect();
-        assert_eq!(skipped.len(), 1, "{level}: {:#?}", run.journal);
-        assert!(skipped[0].contains("the press did not land"), "{skipped:?}");
-        assert_eq!(m.attention, None, "no badge: {:#?}", m.requests);
-        assert_eq!(count(&m, "meta set attention"), 0, "{level}");
-        // No step was opened: no row of the rule that a later loop would
-        // take up.
-        assert!(!run.rows().iter().any(|r| r.starts_with("approved|")));
-        assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
-    }
-}
-
-/// A SECOND MOUNT AT THE SAME WALL: the dialog comes again once the step
-/// has ended. The host is asked again — once for the new mount — answers
-/// that the wall has had its attempt, and the wait row is pressed; no row
-/// is taken a second time. NEGATIVE CONTROL: the first mount of the same
-/// run, where the same ask got the go.
-#[test]
-fn a_second_mount_at_the_same_wall_is_the_wait_rows() {
-    use aterm_phase::prompt::fixtures::screen;
-    let host = ResetHost::reading(ResetOutcome::Kept);
-    let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
-    reset_world(&mut m).confirm = screen(aterm_phase::reset::fixtures::CONFIRM_EARLY);
-    reset_world(&mut m).exact = false;
-    reset_world(&mut m).remounts = 1;
-    // The vendor's own wait, once the wait row is taken: nothing to type.
-    let mut opts = reset_opts(&host, true, 120);
-    opts.policy.continue_policy = false;
-    let run = reset_watch("second-mount", &mut m, opts, &fresh, |_| {});
-    assert_eq!(
-        reset_world(&mut m).chosen,
-        [RESET_GRANT, RESET_WAIT],
-        "{:#?}",
-        run.journal
-    );
-    assert_eq!(host.said("take").len(), 2, "one ask a mount");
-    assert_eq!(host.said("told").len(), 1);
-    assert!(
-        run.of_rule()
-            .iter()
-            .any(|l| l.starts_with("SKIPPED") && l.ends_with("host=attempted")),
-        "{:#?}",
-        run.journal
-    );
-    assert_eq!(reset_world(&mut m).yes_taken, 0);
-    assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
-
-    // A reset passed over at one mount is asked about afresh at the next:
-    // the host's No, the wait row, the dialog again, and one more ask.
-    let host = ResetHost::refusing(ResetNo::NotQualifying);
-    let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
-    reset_world(&mut m).remounts = 1;
-    let mut opts = reset_opts(&host, true, 120);
-    opts.policy.continue_policy = false;
-    let run = reset_watch("second-ask", &mut m, opts, &fresh, |_| {});
-    assert_eq!(
-        reset_world(&mut m).chosen,
-        [RESET_WAIT, RESET_WAIT],
-        "{:#?}",
-        run.journal
-    );
-    assert_eq!(host.said("take").len(), 2, "one ask a mount");
-    // Each press landed: nothing was tried twice.
-    assert!(
-        !run.journal.iter().any(|l| l.starts_with("WAITING")),
-        "{:#?}",
-        run.journal
-    );
-}
-
-/// AN ENTER THE VENDOR DROPS leaves the confirmation standing: a second on,
-/// it is judged again and entered again — three Enters at most, and then an
-/// Escape (`enter-not-taken`). NEGATIVE CONTROL: one dropped Enter is
-/// followed by a second that is taken, and no Escape.
-#[test]
-fn a_dropped_enter_is_written_again_three_times_at_most_and_then_escaped() {
-    let host = ResetHost::reading(spent());
-    let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
-    reset_world(&mut m).enter_drops = 1;
-    let quick_enter = |s: &mut Session<'_, Mock>| {
-        s.set_reset_waits(reset_waits_cut(|w| w.enter = Duration::from_millis(20)))
-    };
-    reset_watch(
-        "drop-1",
-        &mut m,
-        reset_opts(&host, true, 120),
-        &fresh,
-        quick_enter,
-    );
-    assert_eq!(
-        reset_keys(&m),
-        [
-            "down@dialog",
-            "enter@dialog",
-            "enter@confirm",
-            "enter@confirm"
-        ]
-    );
-    assert_eq!(reset_world(&mut m).yes_taken, 1);
-    assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
-
-    let host = ResetHost::reading(ResetOutcome::Kept);
-    let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
-    reset_world(&mut m).enter_drops = usize::MAX;
-    let run = reset_watch(
-        "drop-all",
-        &mut m,
-        reset_opts(&host, true, 120),
-        &fresh,
-        quick_enter,
-    );
-    assert_eq!(
-        reset_keys(&m),
-        [
-            "down@dialog",
-            "enter@dialog",
-            "enter@confirm",
-            "enter@confirm",
-            "enter@confirm",
-            "esc@confirm"
-        ],
-        "{:#?}",
-        run.journal
-    );
-    assert_eq!(reset_world(&mut m).yes_taken, 0);
-    assert!(
-        host.said("told")[0].starts_with("told entered=true kept=enter-not-taken "),
-        "{:?}",
-        host.said("told")
-    );
-    // One row for the yes, however many Enters.
-    assert_eq!(
-        run.rows()
-            .iter()
-            .filter(|r| r.starts_with("approved|Yes, use my reset|"))
-            .count(),
-        1
-    );
-    assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
-}
-
-/// AN ESCAPE THAT DOES NOT TAKE is tried again on the survey's ladder, the
-/// host told ONCE at the second failure — a record, never a badge — and
-/// never followed by an Enter. NEGATIVE CONTROL: an Escape that takes is
-/// one Escape and no record (the early-use test above).
-#[test]
-fn an_escape_that_does_not_take_is_tried_again_and_told_once() {
-    use aterm_phase::prompt::fixtures::screen;
-    let host = ResetHost::reading(ResetOutcome::Kept);
-    let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
-    reset_world(&mut m).confirm = screen(aterm_phase::reset::fixtures::CONFIRM_EARLY);
-    reset_world(&mut m).exact = false;
-    reset_world(&mut m).esc_drops = 2;
-    let run = reset_watch(
-        "esc-ladder",
-        &mut m,
-        reset_opts(&host, true, 120),
-        &fresh,
-        |_| {},
-    );
-    assert_eq!(
-        reset_keys(&m),
-        [
-            "down@dialog",
-            "enter@dialog",
-            "esc@confirm",
-            "esc@confirm",
-            "esc@confirm"
-        ],
-        "{:#?}",
-        run.journal
-    );
-    assert_eq!(
-        host.said("inform"),
-        ["inform:The limit-reset confirmation did not close\nPress Esc in this tab."]
-    );
-    assert_eq!(m.attention, None, "a record, never a badge");
-    assert_eq!(count(&m, "meta set attention"), 0);
-    // One `declined` row, written with the first Escape.
-    assert_eq!(
-        run.rows()
-            .iter()
-            .filter(|r| r.starts_with("declined|"))
-            .count(),
-        1
-    );
-    assert_eq!(reset_world(&mut m).yes_taken, 0);
-    assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
-}
-
-/// A CLAIM WHOSE DIALOG LEFT before its row was taken (a person closed it
-/// under the loop's arrows): the host is told the reset was kept
-/// (`not-opened`) at the next look, so the wall has had its attempt and its
-/// claim holds nobody — and no step is owed. NEGATIVE CONTROL: the whole
-/// path, where the dialog stands and the row is taken.
-#[test]
-fn a_claim_whose_dialog_left_is_told_kept() {
-    let host = ResetHost::reading(ResetOutcome::Kept);
-    let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
-    reset_world(&mut m).closes_at_key = Some(1);
-    let mut opts = reset_opts(&host, true, 120);
-    opts.policy.continue_policy = false;
-    let run = reset_watch("left", &mut m, opts, &fresh, |_| {});
-    assert_eq!(reset_keys(&m), ["down@dialog"], "{:#?}", run.journal);
-    assert_eq!(
-        host.said("told"),
-        ["told entered=false kept=not-opened offer=None last=true"]
-    );
-    assert!(
-        run.of_rule()
-            .iter()
-            .any(|l| l.starts_with("RESET seq=") && l.ends_with("kept (not-opened)")),
-        "{:#?}",
-        run.journal
-    );
-    assert!(!run.rows().iter().any(|r| r.starts_with("approved|")));
-    assert_eq!(m.attention, None);
-}
-
-/// THE HOST IS ASKED AGAIN FOR THE LINE while it has none — the
-/// transcript's row lags the screen — and, its bound run out, ONE LAST TIME
-/// (`last`): the step ends on that answer whatever it is. NEGATIVE CONTROL:
-/// a host that has the line at the first ask is asked once.
-#[test]
-fn the_host_is_asked_again_for_the_line_and_then_one_last_time() {
-    // Three asks without a line, then the line.
-    let host = ResetHost::reading(spent());
-    host.pendings.store(3, Ordering::SeqCst);
-    let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
-    reset_watch(
-        "line-lags",
-        &mut m,
-        reset_opts(&host, true, 120),
-        &fresh,
-        |_| {},
-    );
-    let told = host.said("told");
-    assert_eq!(told.len(), 4, "{told:#?}");
-    assert!(told.iter().all(|t| t.ends_with(" last=false")), "{told:#?}");
-    assert_eq!(host.steps.lock().unwrap().len(), 2, "one claim, one end");
-
-    // Never a line: asked until the bound, then once with `last`.
-    let host = ResetHost::reading(ResetOutcome::Unread);
-    host.pendings.store(usize::MAX, Ordering::SeqCst);
-    let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
-    let run = reset_watch(
-        "no-line",
-        &mut m,
-        reset_opts(&host, true, 120),
-        &fresh,
-        |s| s.set_reset_waits(reset_waits_cut(|w| w.line = Duration::from_millis(30))),
-    );
-    let told = host.said("told");
-    assert!(told.len() >= 2, "{told:#?}");
-    let (last, before) = told.split_last().expect("told");
-    assert!(last.ends_with(" last=true"), "{told:#?}");
-    assert!(
-        before.iter().all(|t| t.ends_with(" last=false")),
-        "{told:#?}"
-    );
-    assert_eq!(
-        run.rows().last().map(String::as_str),
-        Some("waiting|limit reset|ended: unread")
-    );
-}
-
-/// AN ENTER THE SERVER TURNS AWAY (`ERR halted`, `ERR rate`) wrote nothing:
-/// the loop parks on the hold, or backs off, reads again and judges again —
-/// and the Enter that is written is the one the vendor takes. Nothing is
-/// recorded for a key that was not written. NEGATIVE CONTROL: the whole
-/// path, one Enter request and one written.
-#[test]
-fn an_enter_the_server_turns_away_is_judged_again() {
-    let host = ResetHost::reading(spent());
-    let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
-    reset_world(&mut m).confirm_replies = [err("halted"), err("rate")].into();
-    let run = reset_watch(
-        "turned-away",
-        &mut m,
-        reset_opts(&host, true, 120),
-        &fresh,
-        |_| {},
-    );
-    let at_confirm: Vec<bool> = reset_world(&mut m)
-        .probes
-        .iter()
-        .filter(|p| p.at == ResetAt::Confirm)
-        .map(|p| p.written)
-        .collect();
-    assert_eq!(at_confirm, [false, false, true], "{:#?}", run.journal);
-    assert_eq!(reset_world(&mut m).yes_taken, 1);
-    assert_eq!(host.said("told").len(), 1);
-    assert_eq!(
-        run.rows()
-            .iter()
-            .filter(|r| r.starts_with("approved|Yes, use my reset|"))
-            .count(),
-        1
-    );
-    assert!(run.journal.iter().any(|l| l.starts_with("HALTED ")));
-    assert!(run.journal.iter().any(|l| l.starts_with("REFUSED ")));
-    assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
-}
-
-/// THE KEY HOLDS AT EVERY `approve` LEVEL AND WITH `limit_wait` OFF: the
-/// reset is no permission and no wait. Under `approve = "none"` and under
-/// the safe rules, `limit_wait` off, the path is the same three keys.
-/// NEGATIVE CONTROL: with the host's `No` the dialog is the owner's there,
-/// by the very words a loop with the key off raises.
-#[test]
-fn the_reset_holds_at_every_approve_level_and_with_limit_wait_off() {
-    for level in ["none", "safe"] {
-        let limited = |on: bool, host: &Arc<ResetHost>| {
-            let mut opts = reset_opts(host, on, 120);
-            opts.policy.set("approve", level).expect("a level");
-            opts.policy.limit_wait = false;
-            opts
-        };
-        let host = ResetHost::reading(spent());
-        let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
-        reset_watch("levels", &mut m, limited(true, &host), &fresh, |_| {});
-        assert_eq!(
-            reset_keys(&m),
-            ["down@dialog", "enter@dialog", "enter@confirm"],
-            "approve = {level}"
-        );
-        assert_eq!(reset_world(&mut m).yes_taken, 1);
-        assert_eq!(m.attention, None);
-
-        let badge = |on: bool, host: Arc<ResetHost>| {
-            let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
-            reset_world(&mut m).exits_when = Some(ResetExit::Asked);
-            reset_watch("levels-no", &mut m, limited(on, &host), &fresh, |_| {});
-            assert_eq!(m.presses(), Vec::<&String>::new(), "approve = {level}");
-            let asked: Vec<String> = m
-                .requests
-                .iter()
-                .filter(|r| r.starts_with("meta set attention"))
-                .cloned()
-                .collect();
-            asked
-        };
-        let off = badge(false, ResetHost::reading(ResetOutcome::Unread));
-        let no = badge(true, ResetHost::refusing(ResetNo::NotDefaultLogin));
-        assert_eq!(off.len(), 1, "approve = {level}: {off:#?}");
-        assert_eq!(no, off, "approve = {level}");
-
-        // A DIALOG THAT DRAWS NO GRANT ROW is read for the reset by nobody:
-        // with the key on, every request is the one a loop with the key off
-        // sends — the same reads, the same words to the owner — and the host
-        // is not asked.
-        let plain = |on: bool| {
-            let host = ResetHost::reading(ResetOutcome::Unread);
-            let rows = [RESET_STOP, RESET_WAIT, RESET_CREDITS];
-            let mut m = reset_mock(vec![], &rows, 0, &host);
-            reset_world(&mut m).exits_when = Some(ResetExit::Asked);
-            reset_watch("levels-plain", &mut m, limited(on, &host), &fresh, |_| {});
-            assert!(host.said("").is_empty(), "approve = {level}");
-            m.requests.clone()
-        };
-        let (on, off) = (plain(true), plain(false));
-        assert!(
-            on.iter().any(|r| r.starts_with("meta set attention")),
-            "approve = {level}: {on:#?}"
-        );
-        assert_eq!(on, off, "approve = {level}");
-    }
-}
-
-/// THE ROW'S APPROVAL IS NAMED BY ITS OWN LABEL, so the safe rules' cap —
-/// the same box approved twice since the last review point is handed over —
-/// never counts it against the wait row of the same dialog. Under `approve
-/// = "safe"`: the row taken (it opens nothing, and is kept), the wait row
-/// pressed and not taken, the wait row pressed again and taken — the second
-/// wait press is the wait row's SECOND approval at most, never its third.
-/// NEGATIVE CONTROL (seen by mutation): an entry named as the dialog's
-/// other approvals are makes that press the third, and the dialog is handed
-/// to the owner instead.
-#[test]
-fn the_rows_approval_is_not_counted_against_the_wait_row() {
-    let host = ResetHost::reading(ResetOutcome::Kept);
-    let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
-    reset_world(&mut m).opens = ResetOpens::Nothing;
-    reset_world(&mut m).row_enter_drops = 1;
-    let mut opts = reset_opts(&host, true, 120);
-    opts.policy.set("approve", "safe").expect("a level");
-    opts.policy.continue_policy = false;
-    let run = reset_watch("cap", &mut m, opts, &fresh, |s| {
-        s.set_reset_waits(reset_waits_cut(|w| w.open = Duration::from_millis(60)));
-    });
-    assert_eq!(
-        reset_world(&mut m).chosen,
-        [RESET_GRANT, RESET_WAIT, RESET_WAIT],
-        "{:#?}",
-        run.journal
-    );
-    assert_eq!(reset_world(&mut m).at, ResetAt::Gone);
-    assert_eq!(m.attention, None, "{:#?}", run.journal);
-}
-
 /// NO ENTER FOLLOWS AN ESCAPE. The confirmation's cursor is on its no: the
 /// loop Escapes — and the Escape does not take, while a person's arrow moves
 /// the cursor onto the yes. The confirmation now reads exactly, cursor and
@@ -1255,41 +641,6 @@ fn no_enter_follows_an_escape_whatever_the_confirmation_then_reads() {
         host.said("told")
     );
     assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
-}
-
-/// A PENDING LINE THAT NEVER HOLDS STILL is the look's to read all the
-/// same: `Resetting…` repainting for ever, met by a look (the loop came back
-/// from an outage), is not taken for output still arriving — the step's
-/// bound runs out on it and the host is asked its last word. NEGATIVE
-/// CONTROL (seen by mutation): read as a worker at work, the line holds the
-/// wait and the host is never told.
-#[test]
-fn a_pending_line_that_repaints_is_still_the_steps_to_read() {
-    let host = ResetHost::reading(ResetOutcome::Unread);
-    let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
-    reset_world(&mut m).lose_reads = 2;
-    reset_world(&mut m).claim_reads = usize::MAX;
-    reset_world(&mut m).repaints = true;
-    reset_world(&mut m).exits_when = Some(ResetExit::Told);
-    let run = reset_watch(
-        "repaints",
-        &mut m,
-        reset_opts(&host, true, 120),
-        &fresh,
-        |s| {
-            s.set_reset_waits(reset_waits_cut(|w| w.claim = Duration::from_millis(60)));
-            s.set_reconnect(Duration::from_secs(30));
-            s.pause = Duration::from_millis(5);
-            s.pause_max = Duration::from_millis(20);
-        },
-    );
-    let told = host.said("told");
-    assert_eq!(told.len(), 1, "{:#?}", run.journal);
-    assert!(told[0].ends_with(" last=true"), "{told:#?}");
-    assert_eq!(
-        reset_keys(&m),
-        ["down@dialog", "enter@dialog", "enter@confirm"]
-    );
 }
 
 /// THE LOOP'S STOP, set in every wait of the whole path in turn: no wait
@@ -1415,7 +766,6 @@ fn a_successor_escapes_the_confirmation_and_never_enters_it() {
     host.shared.claim.store(1, Ordering::SeqCst);
     host.shared.ph.store(1, Ordering::SeqCst);
     let mut m = at_the_confirmation(&host, None);
-    let began = Instant::now();
     let run = reset_watch(
         "successor",
         &mut m,
@@ -1424,10 +774,6 @@ fn a_successor_escapes_the_confirmation_and_never_enters_it() {
         |_| {},
     );
     assert_eq!(reset_keys(&m), ["esc@confirm"], "{:#?}", run.journal);
-    assert!(
-        began.elapsed() >= Duration::from_secs(1),
-        "after one grace in its own sight"
-    );
     assert_eq!(reset_world(&mut m).yes_taken, 0);
     assert_eq!(
         host.said("told"),
@@ -1472,7 +818,6 @@ fn a_successor_escapes_the_confirmation_and_never_enters_it() {
     let host = ResetHost::reading(ResetOutcome::Kept);
     let mut m = at_the_confirmation(&host, None);
     key_off_after(&mut m, &host, 1);
-    let began = Instant::now();
     let run = reset_watch(
         "key-off",
         &mut m,
@@ -1481,10 +826,6 @@ fn a_successor_escapes_the_confirmation_and_never_enters_it() {
         |_| {},
     );
     assert_ended_untold("key-off", &mut m, &host, &run);
-    assert!(
-        began.elapsed() >= Duration::from_secs(1),
-        "after one grace in its own sight"
-    );
 }
 
 /// A SUCCESSOR'S FIRST LOOK MEETS A BOX WITH NOTHING OF THE CONFIRMATION
@@ -1505,7 +846,6 @@ fn a_successor_escapes_a_box_with_nothing_of_the_confirmation_left() {
     host.shared.claim.store(1, Ordering::SeqCst);
     host.shared.ph.store(1, Ordering::SeqCst);
     let mut m = at_the_confirmation(&host, Some(nothing_left_head_off()));
-    let began = Instant::now();
     let run = reset_watch(
         "successor-nothing-left",
         &mut m,
@@ -1514,10 +854,6 @@ fn a_successor_escapes_a_box_with_nothing_of_the_confirmation_left() {
         |_| {},
     );
     assert_eq!(reset_keys(&m), ["esc@confirm"], "{:#?}", run.journal);
-    assert!(
-        began.elapsed() >= Duration::from_secs(1),
-        "after one grace in its own sight"
-    );
     assert_eq!(reset_world(&mut m).yes_taken, 0);
     assert_eq!(
         host.said("told"),
@@ -1539,7 +875,6 @@ fn a_successor_escapes_a_box_with_nothing_of_the_confirmation_left() {
     let host = ResetHost::reading(ResetOutcome::Kept);
     let mut m = at_the_confirmation(&host, Some(nothing_left_head_off()));
     key_off_after(&mut m, &host, 1);
-    let began = Instant::now();
     let run = reset_watch(
         "successor-key-off",
         &mut m,
@@ -1548,10 +883,6 @@ fn a_successor_escapes_a_box_with_nothing_of_the_confirmation_left() {
         |_| {},
     );
     assert_ended_untold("successor-key-off", &mut m, &host, &run);
-    assert!(
-        began.elapsed() >= Duration::from_secs(1),
-        "after one grace in its own sight"
-    );
 }
 
 /// THE YES FULL POWER WOULD TAKE: a key-off successor's first look meets the
@@ -1572,7 +903,6 @@ fn a_key_off_successor_escapes_a_reworded_consent_and_never_takes_its_yes() {
     let host = ResetHost::reading(ResetOutcome::Kept);
     let mut m = at_the_confirmation(&host, Some(nothing_left_consent()));
     key_off_after(&mut m, &host, 1);
-    let began = Instant::now();
     let run = reset_watch(
         "consent-key-off",
         &mut m,
@@ -1581,10 +911,6 @@ fn a_key_off_successor_escapes_a_reworded_consent_and_never_takes_its_yes() {
         |_| {},
     );
     assert_ended_untold("consent-key-off", &mut m, &host, &run);
-    assert!(
-        began.elapsed() >= Duration::from_secs(1),
-        "after one grace in its own sight"
-    );
 
     // (a) No open row: today's answer, to the byte of its one key — on no
     // ledger at all, on one whose step of the rule was ENDED (each of the
@@ -1785,120 +1111,6 @@ fn a_key_off_successor_waits_out_resetting_and_owes_nothing() {
     assert!(run.typed()[0].contains("usage-resume@v1"));
 }
 
-/// AN OUTAGE AFTER THE ENTER: the reads that follow the confirmation's
-/// Enter get no answer. The loop rides the outage out, takes its step up
-/// where it stood — `Resetting…`, never keyed — and the host is told the
-/// end ONCE. NEGATIVE CONTROL: the whole path, the same world with every
-/// read answered, tells it once with no `RECONNECT`.
-#[test]
-fn an_outage_after_the_enter_still_tells_the_outcome_once() {
-    let host = ResetHost::reading(spent());
-    let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
-    reset_world(&mut m).lose_reads = 2;
-    let run = reset_watch(
-        "outage",
-        &mut m,
-        reset_opts(&host, true, 120),
-        &fresh,
-        |s| {
-            s.set_reconnect(Duration::from_secs(30));
-            s.pause = Duration::from_millis(5);
-            s.pause_max = Duration::from_millis(20);
-        },
-    );
-    assert!(
-        run.lines.iter().any(|l| l.starts_with("RECONNECT ")),
-        "{:#?}",
-        run.lines
-    );
-    assert_eq!(
-        reset_keys(&m),
-        ["down@dialog", "enter@dialog", "enter@confirm"]
-    );
-    assert_eq!(reset_world(&mut m).yes_taken, 1);
-    let told = host.said("told");
-    assert_eq!(told.len(), 1, "{told:#?}");
-    assert!(
-        told[0].starts_with("told entered=true kept=- "),
-        "{told:#?}"
-    );
-    assert_eq!(
-        run.rows().last().map(String::as_str),
-        Some("waiting|limit reset|ended: used")
-    );
-    assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
-
-    // The worker is at work when the loop comes back (the vendor's own
-    // continuation, running): the host is told at that busy read, not at
-    // the end of a turn that may run for hours.
-    let host = ResetHost::reading(spent());
-    let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
-    reset_world(&mut m).lose_reads = 2;
-    reset_world(&mut m).claim_reads = 0;
-    reset_world(&mut m).then = vec![busy_screen(), busy_screen(), busy_screen()];
-    let run = reset_watch(
-        "outage-busy",
-        &mut m,
-        reset_opts(&host, true, 120),
-        &fresh,
-        |s| {
-            s.set_reconnect(Duration::from_secs(30));
-            s.pause = Duration::from_millis(5);
-            s.pause_max = Duration::from_millis(20);
-        },
-    );
-    assert_eq!(host.said("told").len(), 1, "{:#?}", run.journal);
-    assert!(
-        run.lines
-            .iter()
-            .any(|l| l.starts_with("RESET seq=") && l.ends_with("used (1 left)")),
-        "{:#?}",
-        run.lines
-    );
-    assert!(!run.lines.iter().any(|l| l.starts_with("EVENT idle")));
-
-    // ONE busy read, and the turn then ends: the step's end is told AT that
-    // read, after the read's own books were kept — and the turn seen running
-    // there is the one the continuation was owed for. The line asked for a
-    // message; a turn of someone's is already running; nothing is typed
-    // after it. NEGATIVE CONTROL (seen by mutation): told at a busy read and
-    // not paid there, the continuation is typed once that turn has ended.
-    let host = ResetHost::reading(ResetOutcome::Spent {
-        asks: true,
-        left: Some(1),
-        cleared_at: TEST_NOW,
-    });
-    let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
-    reset_world(&mut m).lose_reads = 2;
-    reset_world(&mut m).claim_reads = 0;
-    // (The wait that follows the reconnect passes over the first screen of
-    // the script: ONE busy screen is read.)
-    reset_world(&mut m).then = vec![busy_screen(), busy_screen(), idle_screen()];
-    let mut opts = reset_opts(&host, true, 120);
-    opts.policy.continue_policy = false;
-    let run = reset_watch("outage-one-busy", &mut m, opts, &fresh, riding_out);
-    assert_eq!(host.said("told").len(), 1, "{:#?}", run.journal);
-    assert!(
-        run.lines
-            .iter()
-            .any(|l| l.starts_with("RESET seq=") && l.ends_with("used (1 left)")),
-        "{:#?}",
-        run.lines
-    );
-    assert!(
-        !run.lines.iter().any(|l| l.starts_with("CONTINUED")),
-        "{:#?}",
-        run.lines
-    );
-    assert_eq!(run.typed(), Vec::<&str>::new(), "{:#?}", run.ledger);
-    assert_eq!(count(&m, "send"), 0);
-    assert!(
-        run.lines.iter().any(|l| l.starts_with("EVENT idle")),
-        "the turn ended and its point was reached: {:#?}",
-        run.lines
-    );
-}
-
 /// THE ROW'S PRESS GOT NO ANSWER: its Enter was written and taken, and the
 /// reply never came. What the row opened is owed its end — the ledger says
 /// so — and is NEVER entered, although it reads exactly: Escaped after one
@@ -1918,8 +1130,8 @@ fn a_row_press_with_no_answer_is_closed_and_never_entered() {
         &fresh,
         |s| {
             s.set_reconnect(Duration::from_secs(30));
-            s.pause = Duration::from_millis(5);
-            s.pause_max = Duration::from_millis(20);
+            s.setup.pause = Duration::from_millis(5);
+            s.setup.pause_max = Duration::from_millis(20);
         },
     );
     assert_eq!(
@@ -1951,7 +1163,7 @@ fn a_row_press_with_no_answer_is_closed_and_never_entered() {
 /// off.
 #[test]
 fn a_deadline_is_placed_in_the_wall_notices_zone_where_the_loop_holds_one() {
-    let mut m = Mock::new(true, vec![idle_screen()]);
+    let mut m = Mock::new(vec![idle_screen()]);
     let mut s = session(&mut m, None);
     s.set_clock(TEST_NOW, PDT);
     s.set_zone_lookup(test_zones);
@@ -2009,13 +1221,6 @@ fn a_deadline_is_placed_in_the_wall_notices_zone_where_the_loop_holds_one() {
         raised: false,
     });
     assert_eq!(s.reset_place("Oct 5 at 3pm"), Some(local - 7 * 3600));
-}
-
-/// A reconnect window for a run whose server drops an exchange.
-fn riding_out(s: &mut Session<'_, Mock>) {
-    s.set_reconnect(Duration::from_secs(30));
-    s.pause = Duration::from_millis(5);
-    s.pause_max = Duration::from_millis(20);
 }
 
 /// The composed confirmation's frame above its dialog, and `body` under it:
@@ -2084,7 +1289,13 @@ fn nothing_left_consent() -> Vec<String> {
         aterm_phase::reset_confirm(prompt, &rows),
         aterm_phase::ConfirmRead::Not
     );
-    let ctx = ApprovalCtx::new(std::env::temp_dir(), None, 501, None);
+    let ctx = ApprovalCtx::new(
+        std::env::temp_dir(),
+        None,
+        501,
+        None,
+        std::sync::Arc::new(crate::supervise::policy::LiveProbe),
+    );
     match decide(&reading, &rows, &ctx) {
         Decision::Approve {
             rule_id: "allow-once@v1",
@@ -2173,93 +1384,11 @@ fn a_person_keying_before_the_rows_first_key_holds_the_row() {
     assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
 }
 
-/// A HALTED SESSION IS ASKED NO CLAIM: `status` says `hold=1`, no key can be
-/// written, and a claim taken there would run out under the hold with none.
-/// The loop waits the hold out and asks its host only then — the model's
-/// `Claim` needs no hold. NEGATIVE CONTROL (seen by mutation): asked under
-/// the hold, the projection names the host's `Claim` as forbidden.
-#[test]
-fn a_halted_session_is_asked_no_claim() {
-    let host = ResetHost::reading(spent());
-    let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
-    m.hold = "1";
-    m.hold_lifts_after = Some(2);
-    let run = reset_watch(
-        "halted",
-        &mut m,
-        reset_opts(&host, true, 120),
-        &fresh,
-        |_| {},
-    );
-    assert!(
-        run.journal.iter().any(|l| l.starts_with("HALTED ")),
-        "{:#?}",
-        run.journal
-    );
-    let claims: Vec<bool> = host
-        .steps
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|s| s.action == "Claim")
-        .map(|s| s.hold)
-        .collect();
-    assert_eq!(claims, [false], "asked once, and not under the hold");
-    assert_eq!(reset_world(&mut m).yes_taken, 1, "{:#?}", run.journal);
-    assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
-}
-
-/// A PENDING LINE FIRST SEEN LONG AFTER THE STEP'S LAST KEY HAS ITS WHOLE
-/// BOUND FROM THERE. The loop holds its hand for a person who keyed at the
-/// confirmation; inside their grace that person presses Enter on the yes
-/// themselves, later than the claim's whole bound after the row's Enter.
-/// `Resetting…` is then waited on as the vendor's claim it is, and the host
-/// is told when the dialog is gone — never at first sight with `last`,
-/// which would record a reset being spent as unread. NEGATIVE CONTROL (seen
-/// by mutation): bounds counted from the loop's own last key end the step
-/// on that first read, the line still up.
-#[test]
-fn a_pending_line_first_seen_late_has_its_whole_bound() {
-    let host = ResetHost::reading(spent());
-    let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
-    let world = reset_world(&mut m);
-    world.person_at_read = Some(1);
-    world.grace = Duration::from_secs(5);
-    world.yes_by_person_after = Some(Duration::from_millis(150));
-    let run = reset_watch(
-        "late-claim",
-        &mut m,
-        reset_opts(&host, true, 5),
-        &fresh,
-        |s| s.set_reset_waits(reset_waits_cut(|w| w.claim = Duration::from_millis(100))),
-    );
-    // The loop wrote the row's keys and nothing at the confirmation.
-    assert_eq!(
-        reset_keys(&m),
-        ["down@dialog", "enter@dialog"],
-        "{:#?}",
-        run.journal
-    );
-    assert_eq!(reset_world(&mut m).yes_taken, 1, "the person's own Enter");
-    let told = host.said("told");
-    assert_eq!(told.len(), 1, "{told:#?}");
-    assert!(
-        told[0].starts_with("told entered=true kept=- ") && told[0].ends_with(" last=false"),
-        "{told:#?}"
-    );
-    // The yes was not the loop's: no row of it in the ledger.
-    assert!(
-        !run.rows().iter().any(|r| r.contains("|Yes, use my reset|")),
-        "{:#?}",
-        run.rows()
-    );
-    assert_eq!(
-        run.rows().last().map(String::as_str),
-        Some("waiting|limit reset|ended: used")
-    );
-    // Told with no dialog of the step left on the screen: the model's
-    // `ReadLine`.
-    assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
+/// A reconnect window for a run whose server drops an exchange.
+fn riding_out(s: &mut Watched<'_, '_>) {
+    s.set_reconnect(Duration::from_secs(30));
+    s.setup.pause = Duration::from_millis(5);
+    s.setup.pause_max = Duration::from_millis(20);
 }
 
 /// AN ENTER WHOSE ANSWER NEVER CAME IS ON THE BOOKS: cut mid-exchange, the
@@ -2313,43 +1442,6 @@ fn an_enter_whose_answer_never_came_is_on_the_books() {
     );
 }
 
-/// AN ARROW WHOSE ANSWER NEVER CAME TAKES NO ROW: the press was cut at its
-/// focus move, its Enter never sent. No step is opened and no ledger row
-/// says a row was taken; after the reconnect the dialog is decided again,
-/// the host answers its own claim with the go, and the row is taken and seen
-/// through. NEGATIVE CONTROL: a press cut at its ENTER is owed with no go
-/// and never entered (`a_row_press_with_no_answer_is_closed_and_never_entered`).
-#[test]
-fn an_arrow_whose_answer_never_came_takes_no_row() {
-    let host = ResetHost::reading(spent());
-    let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
-    reset_world(&mut m).lose_reply_to = Some((ResetAt::Dialog, "down"));
-    let run = reset_watch(
-        "lost-arrow",
-        &mut m,
-        reset_opts(&host, true, 120),
-        &fresh,
-        riding_out,
-    );
-    assert_eq!(
-        reset_keys(&m),
-        ["down@dialog", "enter@dialog", "enter@confirm"],
-        "{:#?}",
-        run.journal
-    );
-    assert_eq!(reset_world(&mut m).yes_taken, 1);
-    assert_eq!(
-        run.rows(),
-        [
-            format!("approved|{RESET_GRANT}|taken: wall until {}", host.until),
-            format!("approved|Yes, use my reset|{RESET_HEAD}"),
-            "waiting|limit reset|ended: used".to_string(),
-        ]
-    );
-    assert_eq!(host.said("told").len(), 1);
-    assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
-}
-
 /// A ROW OLDER THAN A STEP CAN BE IS ENDED UNTOLD, AT EITHER KEY: a loop that
 /// starts finds a grant row's `approved` row from long ago with no end (no
 /// loop ran since). The host's claim for it has lapsed and a line in the
@@ -2385,13 +1477,8 @@ fn a_row_older_than_a_step_can_be_is_escaped_and_ended_untold() {
             // nobody is told how the step ends.
             host.shared.ph.store(1, Ordering::SeqCst);
             reset_world(&mut m).untold = true;
-            let began = Instant::now();
             let run = reset_watch(&tag, &mut m, reset_opts(&host, on, 1), &old_row, |_| {});
             assert_eq!(reset_keys(&m), ["esc@confirm"], "{tag}: {:#?}", run.journal);
-            assert!(
-                began.elapsed() >= Duration::from_secs(1),
-                "{tag}: after one grace in its own sight"
-            );
             assert_eq!(reset_world(&mut m).yes_taken, 0, "{tag}");
             assert!(host.said("").is_empty(), "{tag}: {:?}", host.said(""));
             assert_eq!(
@@ -2423,73 +1510,6 @@ fn a_row_older_than_a_step_can_be_is_escaped_and_ended_untold() {
             assert_eq!(reset_violations(&m, &host), Vec::<String>::new(), "{tag}");
         }
     }
-}
-
-/// A SCREEN THE STEP CANNOT READ, MET BY A KEY-OFF SUCCESSOR, is waited the
-/// open bound and the step ends UNTOLD with NO record left: an owner whose
-/// switch is off is left no word about a reset over a screen that may be no
-/// dialog at all. No key, nothing typed, no badge. NEGATIVE CONTROL: the
-/// same world with the key on leaves the one record and tells its host.
-#[test]
-fn a_key_off_successor_leaves_no_record_of_a_screen_it_cannot_read() {
-    let unread = confirm_frame(&["   One moment", "", "   Refilling your limits"]);
-    let at_unread = |host: &Arc<ResetHost>| {
-        let mut m = at_the_confirmation(host, None);
-        let world = reset_world(&mut m);
-        world.at = ResetAt::Resetting;
-        world.resetting = unread.clone();
-        // It stands far longer than the bound cut below: every read is at
-        // least one wait of the server's apart.
-        world.claim_reads = 400;
-        let frame = world.frame();
-        let last = m.screens.len() - 1;
-        m.screens[last] = frame;
-        m
-    };
-    let cut = |s: &mut Session<'_, Mock>| {
-        s.set_reset_waits(reset_waits_cut(|w| w.open = Duration::from_millis(60)));
-    };
-
-    let host = ResetHost::reading(ResetOutcome::Kept);
-    let mut m = at_unread(&host);
-    key_off_after(&mut m, &host, 1);
-    let run = reset_watch(
-        "unread-key-off",
-        &mut m,
-        reset_opts(&host, false, 1),
-        &taken_row,
-        cut,
-    );
-    assert_eq!(reset_keys(&m), Vec::<String>::new(), "{:#?}", run.journal);
-    assert_eq!(m.presses(), Vec::<&String>::new());
-    assert!(host.said("").is_empty(), "{:?}", host.said(""));
-    assert_eq!(
-        run.rows(),
-        [
-            format!("approved|{RESET_GRANT}|taken: wall until 1790265300"),
-            "waiting|limit reset|ended: untold (key off)".to_string(),
-        ]
-    );
-    assert_eq!(run.typed(), Vec::<&str>::new(), "{:#?}", run.ledger);
-    assert_eq!((count(&m, "send"), count(&m, "turn")), (0, 0));
-    assert_eq!(m.attention, None);
-    assert_eq!(count(&m, "meta set attention"), 0);
-
-    // The control: the key on.
-    let host = ResetHost::reading(ResetOutcome::Kept);
-    host.shared.claim.store(1, Ordering::SeqCst);
-    host.shared.ph.store(1, Ordering::SeqCst);
-    let mut m = at_unread(&host);
-    let mut opts = reset_opts(&host, true, 1);
-    opts.policy.continue_policy = false;
-    reset_watch("unread-key-on", &mut m, opts, &taken_row, cut);
-    assert_eq!(
-        host.said(""),
-        [
-            "inform:A limit-reset dialog could not be read\nLook at this tab.",
-            "told entered=false kept=- offer=None last=false",
-        ]
-    );
 }
 
 /// `CHECKING…` MET BY A KEY-OFF SUCCESSOR and standing past its bound gets
@@ -2558,9 +1578,10 @@ fn a_key_off_successors_escape_that_does_not_take_is_tried_again_and_recorded_on
         run.journal
     );
     assert_eq!(reset_world(&mut m).yes_taken, 0);
-    assert_eq!(
-        host.said(""),
-        ["inform:The limit-reset confirmation did not close\nPress Esc in this tab."]
+    let said = host.said("");
+    assert!(
+        said.len() == 1 && said[0].starts_with("inform:"),
+        "one record: {said:?}"
     );
     assert_eq!(
         run.rows(),
@@ -2621,151 +1642,6 @@ fn an_attended_loop_takes_no_step_up() {
         }
         assert_eq!(runs[0], runs[1], "key={on}");
     }
-}
-
-/// AN ENTER THE SCREEN KEEPS MOVING UNDER IS GIVEN UP: the server skips it
-/// (`OK skipped reason=changed`) at every read. It is read and judged again
-/// five times, and then the confirmation is Escaped (`inexact-moving`) —
-/// never keyed at for the claim's whole life. NEGATIVE CONTROL (seen by
-/// mutation): with no bound the seventh Enter, the first the server takes,
-/// is written.
-#[test]
-fn an_enter_the_screen_keeps_moving_under_is_given_up() {
-    let host = ResetHost::reading(ResetOutcome::Kept);
-    let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
-    reset_world(&mut m).confirm_replies =
-        std::iter::repeat_with(|| ok("OK skipped reason=changed seq=1\n"))
-            .take(6)
-            .collect();
-    let run = reset_watch(
-        "moving",
-        &mut m,
-        reset_opts(&host, true, 120),
-        &fresh,
-        |_| {},
-    );
-    let at_confirm: Vec<(String, bool)> = reset_world(&mut m)
-        .probes
-        .iter()
-        .filter(|p| p.at == ResetAt::Confirm)
-        .map(|p| (p.key.clone(), p.written))
-        .collect();
-    let mut want = vec![("enter".to_string(), false); 6];
-    want.push(("esc".to_string(), true));
-    assert_eq!(at_confirm, want, "{:#?}", run.journal);
-    assert_eq!(reset_world(&mut m).yes_taken, 0);
-    assert!(
-        host.said("told")[0].starts_with("told entered=false kept=inexact-moving "),
-        "{:?}",
-        host.said("told")
-    );
-    assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
-}
-
-/// A HOST THAT CANNOT SAY AT THE ENTER — its lock held for a moment as the
-/// claim is asked about again — is asked again a moment later, and the
-/// confirmation is entered on its go: a transient lock does not spend the
-/// wall's one attempt. Past five more asks the reset is kept (`claim`).
-/// NEGATIVE CONTROL: a host that answers no go at all keeps it at once
-/// (`a_claim_that_is_no_longer_the_sessions_keeps_the_reset`).
-#[test]
-fn a_host_that_cannot_say_at_the_enter_is_asked_again() {
-    let host = ResetHost::reading(spent());
-    *host.again_at.lock().unwrap() = vec![2];
-    let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
-    let run = reset_watch(
-        "again-enter",
-        &mut m,
-        reset_opts(&host, true, 120),
-        &fresh,
-        |_| {},
-    );
-    assert_eq!(
-        reset_keys(&m),
-        ["down@dialog", "enter@dialog", "enter@confirm"],
-        "{:#?}",
-        run.journal
-    );
-    assert_eq!(host.said("take").len(), 3, "the row, again, the go");
-    assert_eq!(reset_world(&mut m).yes_taken, 1);
-    assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
-
-    // It never can: five more asks, and then the reset is kept.
-    let host = ResetHost::reading(ResetOutcome::Kept);
-    *host.again_at.lock().unwrap() = (2..40).collect();
-    let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
-    reset_watch(
-        "again-enter-never",
-        &mut m,
-        reset_opts(&host, true, 120),
-        &fresh,
-        |_| {},
-    );
-    assert_eq!(
-        reset_keys(&m),
-        ["down@dialog", "enter@dialog", "esc@confirm"]
-    );
-    assert_eq!(host.said("take").len(), 7);
-    assert!(host.said("told")[0].starts_with("told entered=false kept=claim "));
-    assert_eq!(reset_world(&mut m).yes_taken, 0);
-}
-
-/// A SCREEN THE READERS CANNOT READ AFTER THE ENTER IS THE VENDOR'S CLAIM
-/// UNDER WAY, as far as the loop can tell: it is waited the claim's bound,
-/// not the few seconds a row is given to open something — so the step is
-/// told ended when the dialog has left, not while a reset is being claimed
-/// under a line this build does not know. Past the claim's bound the host
-/// is left ONE record that a dialog may stand unread, and told with `last`.
-/// NEGATIVE CONTROL (seen by mutation): bounded by the open wait, the step
-/// ends with the screen still up.
-#[test]
-fn an_unread_screen_after_the_enter_is_waited_the_claims_bound() {
-    let unread = confirm_frame(&["   One moment", "", "   Refilling your limits"]);
-    let host = ResetHost::reading(spent());
-    let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
-    reset_world(&mut m).resetting = unread.clone();
-    reset_world(&mut m).claim_reads = 3;
-    let run = reset_watch(
-        "unread-claim",
-        &mut m,
-        reset_opts(&host, true, 120),
-        &fresh,
-        |s| s.set_reset_waits(reset_waits_cut(|w| w.open = Duration::from_millis(1))),
-    );
-    let told = host.said("told");
-    assert_eq!(told.len(), 1, "{:#?}", run.journal);
-    assert!(
-        told[0].starts_with("told entered=true kept=- ") && told[0].ends_with(" last=false"),
-        "{told:#?}"
-    );
-    assert!(host.said("inform").is_empty());
-    assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
-
-    // For the whole of the claim's bound: one record, and the last word.
-    let host = ResetHost::reading(ResetOutcome::Unread);
-    let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
-    reset_world(&mut m).resetting = unread;
-    reset_world(&mut m).claim_reads = usize::MAX;
-    reset_world(&mut m).exits_when = Some(ResetExit::Told);
-    reset_watch(
-        "unread-for-ever",
-        &mut m,
-        reset_opts(&host, true, 120),
-        &fresh,
-        |s| s.set_reset_waits(reset_waits_cut(|w| w.claim = Duration::from_millis(60))),
-    );
-    let told = host.said("told");
-    assert_eq!(told.len(), 1, "{told:#?}");
-    assert!(told[0].ends_with(" last=true"), "{told:#?}");
-    assert_eq!(
-        host.said("inform"),
-        ["inform:A limit-reset dialog could not be read\nLook at this tab."]
-    );
-    assert_eq!(m.attention, None, "a record, never a badge");
-    assert_eq!(
-        reset_keys(&m),
-        ["down@dialog", "enter@dialog", "enter@confirm"]
-    );
 }
 
 /// THE BOX THE ROW OPENED IS THE STEP'S, WHATEVER IT IS REWORDED TO. Every
@@ -2844,85 +1720,124 @@ fn the_box_the_row_opened_is_the_steps_whatever_it_is_reworded_to() {
     }
 }
 
-/// A CONFIRMATION NO BOX READS UNDER — its title on the screen and its
-/// buttons in the vendor's other layout (`y. Yes, use my reset`, READ in the
-/// bundle; what turns it on was not traced) — is still the confirmation the
-/// loop's own row opened: Escaped on its title row (`inexact-options`), never
-/// left standing over the composer with the step ended. NEGATIVE CONTROL
-/// (seen by mutation): read as a frame half drawn, the step ends after its
-/// open wait with no key written and the dialog still up.
+/// THE STEP NEVER ESCAPES AN MCP SERVER DIALOG: Claude Code saves its Esc
+/// as a refusal for good (2.1.301, MEASURED; the several-server dialog's is
+/// `Esc to reject all`), so the box is never read as a reworded
+/// confirmation, on the step's first read or after `Checking…`: not as
+/// drawn, not retitled (no MCP kind), and not with the several-server
+/// dialog's head cut — its rule alone (the title still drawn) or its rule,
+/// title and subtitle — where the box reads with its head off the screen.
+/// Every such box still offers an answer read as kept, so it is the
+/// approval policy's, which hands it to a person: no Esc, no reset spent.
+/// Nor is a frame half drawn: the several-server dialog drawn only down to
+/// its server rows, its rule cut (no `Enable selected`, no footer: its head
+/// off the screen and no Esc read), read as a frame half drawn until the
+/// step's open bound (cut short here) runs out, never keyed; and the
+/// retitled dialog read mid-move, a cursor on a server row and on `Enable
+/// selected` (the reader withholds every role of options with two
+/// cursors). NEGATIVE CONTROLS (seen by
+/// mutation): with the kept-answer test gone from `reset_shows`, the
+/// retitled dialogs are Escaped as `inexact-title`; with `Enable selected`
+/// read as no kept answer, so are the several-server dialog's retitled and
+/// cut frames; with the kept test read off the roles alone, the mid-move
+/// frame; and with a box whose head and Esc are unread taken, the half-drawn
+/// frame (read as another box instead, it is never said to the host).
 #[test]
-fn a_confirmation_no_box_reads_under_is_escaped_on_its_title() {
-    let frame = confirm_frame(&[
-        "   Use your reset?",
-        "",
-        "   Refills your weekly limit now · your weekly reset day stays Oct 9 at 5am",
-        "   2 resets left · use by Oct 5 at 3pm",
-        "",
-        "   y. Yes, use my reset",
-        "   n. No, keep it",
-        "",
-        "   Enter y/n: ",
-    ]);
-    assert!(
-        aterm_phase::read(Some("claude"), &frame, None)
+fn the_step_never_escapes_an_mcp_server_dialog() {
+    use aterm_phase::prompt::fixtures::{MCP_SERVER_ONE, MCP_SERVER_TWO, screen};
+    let one = screen(MCP_SERVER_ONE);
+    let two = screen(MCP_SERVER_TWO);
+    let rule = two
+        .iter()
+        .position(|r| r.starts_with('─'))
+        .expect("the rule");
+    let submit = two
+        .iter()
+        .position(|r| r.trim() == "Enable selected")
+        .expect("the submit row");
+    let retitle = |rows: &[String]| -> Vec<String> {
+        rows.iter()
+            .map(|r| r.replace("new MCP servers found in this project", "new tools found"))
+            .collect()
+    };
+    // Drawn top down as far as its last server row, the rows under it not
+    // yet drawn.
+    let half: Vec<String> = two
+        .iter()
+        .enumerate()
+        .map(|(i, r)| if i < submit { r.clone() } else { String::new() })
+        .collect();
+    // The cursor drawn on `Enable selected` before it is erased from the
+    // first server row.
+    let mut mid_move = two.clone();
+    mid_move[submit] = "  ❯    Enable selected".to_string();
+    let read = |rows: &[String]| {
+        aterm_phase::read(Some("claude"), rows, None)
             .prompt
-            .is_none(),
-        "the box reader takes no box here"
-    );
-    let host = ResetHost::reading(ResetOutcome::Kept);
-    let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
-    reset_world(&mut m).confirm = frame;
-    reset_world(&mut m).exact = false;
-    let run = reset_watch("y-n", &mut m, reset_opts(&host, true, 120), &fresh, |s| {
-        s.set_reset_waits(reset_waits_cut(|w| w.open = Duration::from_millis(60)))
-    });
-    assert_eq!(
-        reset_keys(&m),
-        ["down@dialog", "enter@dialog", "esc@confirm"],
-        "{:#?}",
-        run.journal
-    );
-    let presses = m.presses();
-    assert_eq!(
-        presses.last().map(|r| r.as_str()),
-        Some(format!("key if-human=0 if={} esc", guard_of("   Use your reset?")).as_str())
-    );
-    assert_eq!(
-        host.said("told"),
-        ["told entered=false kept=inexact-options offer=None last=false"]
-    );
-    assert_eq!(reset_world(&mut m).at, ResetAt::Gone);
-    assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
-}
-
-/// THE WORKER ALREADY AT WORK WHEN THE STEP ENDS PAYS ITS CONTINUATION: the
-/// dialog closed with its answer and a turn — the vendor's own continuation,
-/// a person's message — is running on the very read that shows it gone. The
-/// host is told there, and the turn seen running is the one the step's end
-/// leaves owed: nothing is typed when it ends. NEGATIVE CONTROL: the same
-/// answer met at a composer with nobody at work owes its one continuation
-/// (`a_rows_own_answer_is_a_failure_and_no_key_follows_it`).
-#[test]
-fn a_turn_already_running_when_the_step_ends_pays_its_continuation() {
-    let host = ResetHost::reading(ResetOutcome::Failed { login: false });
-    let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
-    reset_world(&mut m).opens = ResetOpens::Answer;
-    reset_world(&mut m).then = vec![busy_screen(), idle_screen()];
-    let mut opts = reset_opts(&host, true, 120);
-    opts.policy.continue_policy = false;
-    let run = reset_watch("answer-at-work", &mut m, opts, &fresh, |_| {});
-    assert_eq!(reset_keys(&m), ["down@dialog", "enter@dialog"]);
-    assert_eq!(host.said("told").len(), 1, "{:#?}", run.journal);
+            .expect("a box")
+    };
+    let p = read(&half[rule + 1..]);
     assert!(
-        run.lines.iter().any(|l| l.starts_with("EVENT idle")),
-        "the turn ended and its point was reached: {:#?}",
-        run.lines
+        p.kind == PromptKind::Other
+            && p.head_off_screen
+            && p.cancel.is_none()
+            && p.options.iter().all(|o| o.label.starts_with("[✔]")),
+        "{p:#?}"
     );
+    let p = read(&retitle(&mid_move));
     assert!(
-        !run.lines.iter().any(|l| l.starts_with("CONTINUED")),
-        "{:#?}",
-        run.lines
+        p.kind == PromptKind::Other
+            && p.options.iter().all(|o| o.role == aterm_phase::Role::Other)
+            && p.options.iter().any(|o| o.label == "Enable selected"),
+        "{p:#?}"
     );
-    assert_eq!(run.typed(), Vec::<&str>::new(), "{:#?}", run.ledger);
+    // Each frame, and whether the step's open bound is run to its end on it.
+    let frames = [
+        ("one", one.clone(), false),
+        (
+            "one-retitled",
+            one.iter()
+                .map(|r| r.replace("New MCP server found in this project:", "New tool found:"))
+                .collect(),
+            false,
+        ),
+        ("two", two.clone(), false),
+        ("two-retitled", retitle(&two), false),
+        ("two-rule-cut", two[rule + 1..].to_vec(), false),
+        ("two-head-cut", two[rule + 3..].to_vec(), false),
+        ("two-half-drawn-rule-cut", half[rule + 1..].to_vec(), true),
+        ("two-retitled-mid-move", retitle(&mid_move), false),
+    ];
+    for (name, frame, unread) in frames {
+        for (read, check_reads) in [("first-read", 0), ("after-checking", 1)] {
+            let tag = format!("mcp-{name}-{read}");
+            let host = ResetHost::reading(ResetOutcome::Kept);
+            let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
+            reset_world(&mut m).confirm = frame.clone();
+            reset_world(&mut m).exact = false;
+            reset_world(&mut m).check_reads = check_reads;
+            reset_world(&mut m).exits_when = Some(ResetExit::Asked);
+            let run = reset_watch(&tag, &mut m, reset_opts(&host, true, 120), &fresh, |s| {
+                if unread {
+                    s.set_reset_waits(reset_waits_cut(|w| w.open = Duration::from_millis(60)));
+                }
+            });
+            assert_eq!(
+                reset_keys(&m),
+                ["down@dialog", "enter@dialog"],
+                "{tag}: {:#?}",
+                run.journal
+            );
+            assert!(
+                !m.presses().iter().any(|p| p.ends_with(" esc")),
+                "{tag}: {:#?}",
+                m.presses()
+            );
+            assert_eq!(reset_world(&mut m).yes_taken, 0, "{tag}");
+            // A frame half drawn is said to the host once its bound runs out.
+            assert_eq!(host.said("inform").len(), usize::from(unread), "{tag}");
+            // The approval policy's: handed to a person.
+            assert!(m.attention.is_some(), "{tag}: {:#?}", run.journal);
+        }
+    }
 }

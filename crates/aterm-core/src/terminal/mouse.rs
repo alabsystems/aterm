@@ -220,39 +220,26 @@ mod tests {
         assert_eq!(String::from_utf8(bytes).expect("ascii"), "\x1b[<83;11;6M");
     }
 
-    /// Tracking off: every direction reports nothing; the wheel belongs to
+    /// Tracking off (never on, or turned on and off again) and X10 (DECSET 9,
+    /// press-only): every direction reports nothing; the wheel belongs to
     /// aterm's own viewport.
     #[test]
-    fn wheel_reports_nothing_without_tracking() {
-        let t = Terminal::new(24, 80);
-        for dir in [
-            WheelDir::Up,
-            WheelDir::Down,
-            WheelDir::Left,
-            WheelDir::Right,
-        ] {
-            assert_eq!(t.encode_mouse_wheel(dir, 10, 5, 0), None, "{dir:?}");
-        }
-        // …and after tracking is turned on and off again.
-        let mut t = Terminal::new(24, 80);
-        t.process(b"\x1b[?1000h\x1b[?1000l");
-        for dir in [WheelDir::Left, WheelDir::Right] {
-            assert_eq!(t.encode_mouse_wheel(dir, 10, 5, 0), None, "{dir:?}");
-        }
-    }
-
-    /// X10 (DECSET 9) is press-only: no wheel on either axis.
-    #[test]
-    fn wheel_reports_nothing_in_x10_mode() {
-        let mut t = Terminal::new(24, 80);
-        t.process(b"\x1b[?9h");
-        for dir in [
-            WheelDir::Up,
-            WheelDir::Down,
-            WheelDir::Left,
-            WheelDir::Right,
-        ] {
-            assert_eq!(t.encode_mouse_wheel(dir, 10, 5, 0), None, "{dir:?}");
+    fn wheel_reports_nothing_without_wheel_tracking() {
+        for setup in [&b""[..], b"\x1b[?1000h\x1b[?1000l", b"\x1b[?9h"] {
+            let mut t = Terminal::new(24, 80);
+            t.process(setup);
+            for dir in [
+                WheelDir::Up,
+                WheelDir::Down,
+                WheelDir::Left,
+                WheelDir::Right,
+            ] {
+                assert_eq!(
+                    t.encode_mouse_wheel(dir, 10, 5, 0),
+                    None,
+                    "{setup:?} {dir:?}"
+                );
+            }
         }
     }
 

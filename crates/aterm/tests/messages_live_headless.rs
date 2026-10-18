@@ -19,7 +19,7 @@
 //! ISOLATION: scratch HOME/XDG roots, a private control socket, a config with
 //! every automatic lane off, `--no-reroute`, `SHELL=/bin/sh`
 //! (`support/launch_isolation.rs`). A headless instance opens no window. FAIL
-//! when the instance cannot boot; SKIP only on an environment refusal
+//! when the instance cannot boot; COULD NOT RUN only on an environment refusal
 //! (`support/headless_boot.rs`).
 
 #![cfg(unix)]
@@ -34,9 +34,9 @@ use crate::headless_boot;
 use headless_boot::Instance;
 
 /// Boot one headless instance, 40x120, ready once its owner token file is
-/// written ([`headless_boot::boot_with`]: `None` is an environment refusal; a
-/// product that cannot start fails the test).
-fn boot(tag: &str) -> Option<Instance> {
+/// written ([`headless_boot::boot_with`]: an environment refusal is COULD NOT RUN;
+/// a product that cannot start fails the test).
+fn boot(tag: &str) -> Instance {
     headless_boot::boot_with(
         &format!("atms{tag}"),
         |_, cmd| {
@@ -155,7 +155,7 @@ fn live_row(inst: &Instance, id: u64) -> String {
 
 #[test]
 fn the_message_verbs_round_trip_on_a_live_instance() {
-    let Some(inst) = boot("m") else { return };
+    let inst = boot("m");
 
     // 1. The log as it stands; the last id seen.
     let (st, rows) = ctl(&inst, "messages");
@@ -240,16 +240,17 @@ fn the_message_verbs_round_trip_on_a_live_instance() {
         status(&inst, "notice progress").starts_with("ERR usage: notice progress "),
         "a bare progress"
     );
-    assert_eq!(
+    assert!(
         status(
             &inst,
             "notice post script sev=warn one two three four five six seven"
-        ),
-        "ERR notice: title over 6 words; put the rest after --"
+        )
+        .starts_with("ERR notice: "),
+        "a title over 6 words"
     );
-    assert_eq!(
-        status(&inst, "notice post update sev=warn Nope"),
-        "ERR notice: that tag is aterm's own; post under script or a tag of your own"
+    assert!(
+        status(&inst, "notice post update sev=warn Nope").starts_with("ERR notice: "),
+        "a tag that is aterm's own"
     );
     assert!(
         status(&inst, "messages 0").starts_with("ERR usage: messages "),

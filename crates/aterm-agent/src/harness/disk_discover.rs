@@ -12,9 +12,9 @@
 //! elsewhere — a checkout's `crates/target ->
 //! target.noindex` (49 GB), x.py's bootstrap trees under `build/<host>/`
 //! (77 GB), an agent worktree's build directory beside it rather than in it
-//! (19 GB), the scratch builds of Claude Code sessions that had ended (45 GB
-//! under `/private/tmp/claude-<uid>`), and the cells caches of removed
-//! checkouts (26 GB).
+//! (19 GB), and the scratch builds of Claude Code sessions that had ended (45 GB
+//! under `/private/tmp/claude-<uid>`). `~/.cache/aterm/cells` is a layout
+//! nothing writes, and the watch never looks there.
 //!
 //! # Where it looks ([`Roots`])
 //!
@@ -36,11 +36,10 @@
 //! * Claude Code's per-user temp root, each session's `scratchpad/` walked
 //!   [`SCRATCH_DEPTH`] levels down ([`Origin::ClaudeScratch`]) — only when
 //!   the root is this user's private directory (no link, this uid's, writable
-//!   by nobody else: on a shared `/tmp` another user could plant links);
-//! * the cells cache, `<cache>/<checkout key>/<cell>` ([`Origin::Cell`]).
+//!   by nobody else: on a shared `/tmp` another user could plant links).
 //!
 //! The roots with no owner that can end (the first three) are walked before
-//! the temp root and the cells ([`discover`]): a build directory one of them
+//! the temp root ([`discover`]): a build directory one of them
 //! names is theirs, and a walk cut short before they are done reaches no
 //! owner's at all.
 //!
@@ -61,9 +60,8 @@
 //! # Who owns it ([`Owned`])
 //!
 //! Most build directories belong to a checkout and nothing here can say the
-//! checkout is done with them. Two kinds have an owner that can be GONE:
-//!
-//! * a Claude Code session's scratch build. The temp root is every Claude
+//! checkout is done with them. One kind has an owner that can be GONE: a
+//! Claude Code session's scratch build. The temp root is every Claude
 //!   Code's of this uid, `<root>/<project>/<session>`, where `<project>` is
 //!   the directory the Claude Code was launched in with every character but
 //!   an ASCII letter or digit written `-` (past 200 characters, the first
@@ -95,12 +93,7 @@
 //!   was written for the quiet window. A session NO known directory holds a
 //!   transcript of is never called gone, and neither is one whose registry
 //!   cannot be read whole; the removal reads the running processes again
-//!   ([`still_gone`]);
-//! * a cells cache whose `.checkout` names a checkout SEEN to be no longer a
-//!   workspace — its folder there without a `Cargo.toml`, or the folder that
-//!   held it there without it — the one rule atpkg's build cache sweep
-//!   applies too ([`checkout`]: a checkout that cannot be read, is away, or
-//!   lies where it is never looked at is not gone).
+//!   ([`still_gone`]).
 //!
 //! An owner owns only what lies INSIDE its folder: a `target*` link in a
 //! scratchpad that points out of the session's directory (a scratch
@@ -148,16 +141,14 @@ pub const MAX_SESSION_ENTRIES: usize = 100_000;
 /// The levels a working directory's git worktree root is looked for above it.
 const MAX_ANCESTORS: usize = 32;
 
-/// When a cells cache's checkout is gone: the one rule, shared as source
-/// with atpkg's build cache sweep.
-#[path = "disk_checkout.rs"]
-pub mod checkout;
+/// Where the watch never looks, and when a checkout is gone: the one rule,
+/// shared with atpkg's build cache sweep.
+pub use aterm_toolchain::checkout;
 
 /// Directories never walked (as `$HOME`'s children, where a working
 /// directory that is `$HOME` meets them too) — the system's own trees and,
-/// on macOS, the privacy-guarded folders ([`checkout::HOME_SKIP`], never
-/// looked into for a cells checkout either). A checkout there is still
-/// searched from an agent working in it.
+/// on macOS, the privacy-guarded folders ([`checkout::HOME_SKIP`]). A
+/// checkout there is still searched from an agent working in it.
 pub use checkout::HOME_SKIP;
 
 /// What the kernel says of a running process's executable ([`Process::exe`]).
@@ -206,9 +197,6 @@ pub struct Roots {
     pub agent_target_dirs: Vec<PathBuf>,
     /// Claude Code's per-user temp root ([`claude_tmp_root`]).
     pub claude_tmp: Option<PathBuf>,
-    /// The cells cache root (`$XDG_CACHE_HOME/aterm/cells`, else
-    /// `~/.cache/aterm/cells`).
-    pub cells: Option<PathBuf>,
     /// The device of the volume whose free space is measured: a root, a
     /// directory or a build directory on any other is never entered or
     /// reported (removing it frees nothing there). `None`: any device.
@@ -677,18 +665,6 @@ pub fn running_claude_census(home: Option<&Path>) -> ClaudeCensus {
     claude_census(processes, home)
 }
 
-/// The cells cache root (`$XDG_CACHE_HOME/aterm/cells`, else
-/// `~/.cache/aterm/cells`): a retired layout nothing writes now, whose
-/// leftovers the watch reclaims.
-#[must_use]
-pub fn cells_root(home: &Path, xdg_cache: Option<&Path>) -> PathBuf {
-    xdg_cache
-        .filter(|p| p.is_absolute())
-        .map_or_else(|| home.join(".cache"), Path::to_path_buf)
-        .join("aterm")
-        .join("cells")
-}
-
 /// This process's real uid.
 #[must_use]
 pub fn own_uid() -> u32 {
@@ -819,10 +795,22 @@ pub enum Origin {
     AgentTargetDir,
     /// One workspace's build directory in the Rust build cache
     /// (`atpkg::build_cache`, `<cache><workspace>/.cargo-build`): its
-    /// intermediates, the workspace's `target/` holding its binaries. A gone
-    /// workspace's goes in the daily `aterm pkg machine apply`; here it is
+    /// intermediates, the workspace's `target/` holding its binaries. Its
+    /// OWNER is the workspace: one SEEN gone ([`checkout::gone`], the rule
+    /// `atpkg::build_cache::reclaim` shares) makes it [`Owned::Gone`], and
+    /// below the floor it goes whole after [`super::PRESSURE_MIN_IDLE_S`]
+    /// unwritten ([`Owner::quiet_s`]) — a removed worktree's 10-40 GiB cache
+    /// is what filled the disk twice (2026-10-16). A live workspace's is
     /// reclaimed as a checkout's is.
-    BuildCache,
+    BuildCache {
+        /// The workspace the mirror folder stands for: the folder holding
+        /// the `.cargo-build` with the cache root taken off, as an absolute
+        /// path (`atpkg::build_cache::build_dir`'s inverse).
+        workspace: PathBuf,
+        /// The mirror folder that holds the `.cargo-build`, canonical: the
+        /// build directory lies inside it.
+        mirror: PathBuf,
+    },
     /// One of x.py's cargo build directories under `<repo>/build/<host>/`.
     Bootstrap {
         /// The x.py checkout.
@@ -840,13 +828,6 @@ pub enum Origin {
         /// Claude Code directory holds it ([`Owners`]).
         session_dir: PathBuf,
     },
-    /// A cells cache `<cells>/<key>/<cell>`.
-    Cell {
-        /// The checkout its `.checkout` marker names, when it names one.
-        checkout: Option<PathBuf>,
-        /// `<cells>/<key>`, canonical: the cell is inside it.
-        key: PathBuf,
-    },
     /// Reached from an owner's folder by a `target*` link that points OUT of
     /// it, or from two owners' at once: it belongs to whatever else names it,
     /// never to an owner that can end. (A scratch worktree's `target ->
@@ -859,17 +840,20 @@ pub enum Origin {
 }
 
 impl Origin {
-    /// Can this origin's owner be GONE (a session, a cells checkout)?
+    /// Can this origin's owner be GONE (a session)?
     #[must_use]
     pub fn ownable(&self) -> bool {
-        matches!(self, Origin::ClaudeScratch { .. } | Origin::Cell { .. })
+        matches!(
+            self,
+            Origin::ClaudeScratch { .. } | Origin::BuildCache { .. }
+        )
     }
 
     /// The folder an ownable origin's build directory must lie inside.
     fn owner_dir(&self) -> Option<&Path> {
         match self {
             Origin::ClaudeScratch { session_dir, .. } => Some(session_dir),
-            Origin::Cell { key, .. } => Some(key),
+            Origin::BuildCache { mirror, .. } => Some(mirror),
             _ => None,
         }
     }
@@ -912,8 +896,7 @@ pub struct Discovered {
 ///
 /// The roots whose build directories have NO owner that can end are walked
 /// FIRST — the agents' `CARGO_TARGET_DIR`, their working directories,
-/// `$HOME`'s checkouts — and Claude Code's temp root and the cells cache
-/// after: a build directory any of those names is theirs ([`Origin::merge`]),
+/// `$HOME`'s checkouts — and Claude Code's temp root after: a build directory any of those names is theirs ([`Origin::merge`]),
 /// and a walk cut short before they are done reaches no owner's at all (each
 /// later walk reads nothing once the budget is spent), so an owner's build
 /// directory is never one a checkout the walk missed might use.
@@ -986,9 +969,6 @@ pub fn discover(roots: &Roots, budget: Budget) -> Discovered {
     }
     if let Some(tmp) = &roots.claude_tmp {
         w.claude_scratch(tmp);
-    }
-    if let Some(cells) = &roots.cells {
-        w.cells(cells);
     }
     let mut notes = w.notes;
     if let Some(why) = w.cut {
@@ -1415,38 +1395,18 @@ impl Walk {
                     continue;
                 }
                 if name == atpkg::build_cache::LEAF {
-                    if marked(&child) {
-                        self.add(&child, &Origin::BuildCache);
+                    if marked(&child)
+                        && let Ok(rel) = dir.strip_prefix(cache)
+                        && let Ok(mirror) = std::fs::canonicalize(&dir)
+                    {
+                        let origin = Origin::BuildCache {
+                            workspace: Path::new("/").join(rel),
+                            mirror,
+                        };
+                        self.add(&child, &origin);
                     }
                 } else if depth < 64 {
                     stack.push((child, depth + 1));
-                }
-            }
-        }
-    }
-
-    /// The cells caches: `<cells>/<key>/<cell>`, `<key>/.checkout` naming the
-    /// checkout each serves.
-    fn cells(&mut self, cells: &Path) {
-        if !self.on_device(cells) {
-            return;
-        }
-        for (_, key, ty) in self.children(cells) {
-            if !ty.is_dir() {
-                continue;
-            }
-            let Ok(key_dir) = std::fs::canonicalize(&key) else {
-                continue;
-            };
-            let checkout =
-                small_bytes(&key.join(".checkout")).and_then(|b| checkout::marker_checkout(&b));
-            let origin = Origin::Cell {
-                checkout,
-                key: key_dir,
-            };
-            for (_, cell, ty) in self.children(&key) {
-                if ty.is_dir() && marked(&cell) {
-                    self.add(&cell, &origin);
                 }
             }
         }
@@ -1475,12 +1435,14 @@ pub enum Owner {
         /// ([`still_gone`]).
         home: Option<PathBuf>,
     },
-    /// The checkout a cells cache serves.
-    Cell {
-        /// The checkout.
-        checkout: PathBuf,
-        /// `<cells>/<key>`: the folder the cell lies inside.
-        key: PathBuf,
+    /// The workspace a Rust build cache's build directory serves
+    /// ([`Origin::BuildCache`]).
+    BuildCache {
+        /// The workspace.
+        workspace: PathBuf,
+        /// The mirror folder under the cache root the build directory lies
+        /// inside.
+        mirror: PathBuf,
         /// `$HOME`, whose guarded folders are never looked into
         /// ([`checkout::gone`]).
         home: Option<PathBuf>,
@@ -1489,17 +1451,34 @@ pub enum Owner {
 
 impl Owner {
     /// The owner's own folder, which its build directory must lie INSIDE:
-    /// the session's temp directory, or the cells key directory.
+    /// the session's temp directory.
     #[must_use]
     pub fn dir(&self) -> &Path {
         match self {
             Owner::ClaudeSession { session_dir, .. } => session_dir,
-            Owner::Cell { key, .. } => key,
+            Owner::BuildCache { mirror, .. } => mirror,
         }
     }
 
-    /// Who it was, for the journal: the session id and its folder, or the
-    /// removed checkout and its cells folder.
+    /// How long nothing of a gone owner's build directory may have been
+    /// written before it goes whole, given the configured quiet window
+    /// `quiet_s` ([`super::Config::quiet_s`], at least a day): a session's
+    /// that window; a REMOVED WORKSPACE's build cache only
+    /// [`super::PRESSURE_MIN_IDLE_S`] — its workspace is SEEN gone, nobody
+    /// builds there again, and a day of waiting is a day of a full disk
+    /// (`atpkg::build_cache::RECLAIM_GONE` is that day for the sweep above the
+    /// floor). A build that recreated the worktree since writes a manifest,
+    /// which the recheck under the locks reads ([`still_gone`]), and a process
+    /// inside it keeps it ([`unused`]).
+    #[must_use]
+    pub fn quiet_s(&self, quiet_s: i64) -> i64 {
+        match self {
+            Owner::BuildCache { .. } => super::PRESSURE_MIN_IDLE_S,
+            Owner::ClaudeSession { .. } => quiet_s,
+        }
+    }
+
+    /// Who it was, for the journal: the session id and its folder.
     #[must_use]
     pub fn describe(&self) -> String {
         match self {
@@ -1511,10 +1490,12 @@ impl Owner {
                 "Claude Code session {session}, its folder {}",
                 session_dir.display()
             ),
-            Owner::Cell { checkout, key, .. } => format!(
-                "the cells of checkout {}, its folder {}",
-                checkout.display(),
-                key.display()
+            Owner::BuildCache {
+                workspace, mirror, ..
+            } => format!(
+                "the Rust build cache of workspace {}, its folder {}",
+                workspace.display(),
+                mirror.display()
             ),
         }
     }
@@ -1557,8 +1538,8 @@ impl Owners {
     /// the running Claude Codes `claudes` ([`Roots::claudes`]) and the Claude
     /// Code directories `claude_dirs` ([`Roots::claude_dirs`]) — none ended
     /// while `unread` says why a process that may be a Claude Code could not
-    /// be read ([`Roots::claude_unread`]) — a cells checkout never looked for
-    /// in `home`'s guarded folders.
+    /// be read ([`Roots::claude_unread`]); `home`'s guarded folders are never
+    /// read for a Claude Code directory.
     #[must_use]
     pub fn new(
         home: Option<PathBuf>,
@@ -1586,11 +1567,10 @@ impl Owners {
             Origin::Named
             | Origin::Checkout { .. }
             | Origin::AgentTargetDir
-            | Origin::BuildCache
             | Origin::Bootstrap { .. }
             | Origin::Linked { .. } => Owned::NotOwned,
-            Origin::Cell { checkout, key } => {
-                cell_owner(checkout.as_deref(), key, self.home.as_deref())
+            Origin::BuildCache { workspace, mirror } => {
+                build_cache_owner(workspace, mirror, self.home.as_deref())
             }
             Origin::ClaudeScratch {
                 session,
@@ -1670,21 +1650,19 @@ fn live_records(claude_dir: &Path) -> Registry {
     )
 }
 
-/// A cells cache's owner: gone only when its checkout is SEEN to be no
-/// longer a workspace ([`checkout::gone`]).
-fn cell_owner(checkout: Option<&Path>, key: &Path, home: Option<&Path>) -> Owned {
-    let Some(checkout) = checkout else {
-        return Owned::Live("its .checkout names no checkout".to_owned());
-    };
-    match self::checkout::gone(checkout, home) {
+/// A Rust build cache's owner: gone only when its workspace is SEEN to be
+/// no longer one ([`checkout::gone`], the rule `atpkg::build_cache::reclaim`
+/// reads too).
+fn build_cache_owner(workspace: &Path, mirror: &Path, home: Option<&Path>) -> Owned {
+    match self::checkout::gone(workspace, home) {
         Ok(seen) => Owned::Gone {
             evidence: format!(
-                "the cells cache of {}, a checkout that is gone: {seen}",
-                checkout.display()
+                "the Rust build cache of {}, a workspace that is gone: {seen}",
+                workspace.display()
             ),
-            owner: Owner::Cell {
-                checkout: checkout.to_path_buf(),
-                key: key.to_path_buf(),
+            owner: Owner::BuildCache {
+                workspace: workspace.to_path_buf(),
+                mirror: mirror.to_path_buf(),
                 home: home.map(Path::to_path_buf),
             },
         },
@@ -1832,11 +1810,11 @@ pub type Census<'a> = &'a dyn Fn(Option<&Path>) -> ClaudeCensus;
 /// Why it no longer is.
 pub fn still_gone(owner: &Owner, now: i64, quiet_s: i64, census: Census<'_>) -> Result<(), String> {
     let verdict = match owner {
-        Owner::Cell {
-            checkout,
-            key,
+        Owner::BuildCache {
+            workspace,
+            mirror,
             home,
-        } => cell_owner(Some(checkout), key, home.as_deref()),
+        } => build_cache_owner(workspace, mirror, home.as_deref()),
         Owner::ClaudeSession {
             session,
             session_dir,

@@ -19,7 +19,8 @@ use std::collections::BTreeMap;
 
 use aterm_core::search::SearchResults;
 use aterm_core::terminal::{BudgetedSearchStep, Terminal};
-use aterm_spec::derive::{Model, budgeted_search_resume_model};
+use aterm_models_misc::budgeted_search_resume_model;
+use aterm_spec::derive::Model;
 use aterm_spec::verify;
 
 const ROWS: u16 = 3;

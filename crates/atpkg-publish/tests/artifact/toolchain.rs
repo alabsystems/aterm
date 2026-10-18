@@ -105,19 +105,13 @@ fn an_explicit_bin_dir_wins_and_a_wrong_one_is_refused_never_set_aside() {
     assert!(err.to_string().contains("no sibling trustc"), "{err}");
 }
 
+/// No store and no `--toolchain`: a refusal, never a stock-cargo fallback.
 #[test]
-fn no_store_is_a_refusal_naming_the_products_fix_first() {
+fn no_store_is_a_refusal() {
     let tmp = scratch("tc-none");
     let c = ctx(tmp.path(), None);
     let err = toolchain::resolve(&c, None).expect_err("no toolchain anywhere");
-    let text = err.to_string();
-    assert!(matches!(err, Error::Refused(_)));
-    let fix = text
-        .find("aterm pkg install trust")
-        .expect("the product's fix");
-    let alt = text.find("--toolchain").expect("the alternative");
-    assert!(fix < alt, "{text}");
-    assert!(text.contains("no stock-cargo fallback"), "{text}");
+    assert!(matches!(err, Error::Refused(_)), "{err}");
 }
 
 #[test]

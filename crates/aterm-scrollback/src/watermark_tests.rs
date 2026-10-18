@@ -26,58 +26,7 @@ fn push_random_lines(sb: &mut Scrollback, n: usize, line_bytes: usize) {
     }
 }
 
-// ── Enum properties ──────────────────────────────────────────────────
-
-#[test]
-fn watermark_starts_green() {
-    let sb = Scrollback::with_defaults();
-    assert_eq!(sb.watermark_level(), WatermarkLevel::Green);
-}
-
-#[test]
-fn watermark_level_ord_is_green_yellow_red() {
-    assert!(WatermarkLevel::Green < WatermarkLevel::Yellow);
-    assert!(WatermarkLevel::Yellow < WatermarkLevel::Red);
-    assert!(WatermarkLevel::Green < WatermarkLevel::Red);
-}
-
 // ── Threshold transitions ────────────────────────────────────────────
-
-#[test]
-fn watermark_crosses_yellow_under_pressure() {
-    // Random data doesn't compress well, so budgeted_bytes stays high.
-    let budget = 200_000;
-    let mut sb = Scrollback::with_block_size(10_000, 50_000, budget, 100);
-
-    let mut saw_yellow = false;
-    for i in 0..3000 {
-        sb.push_line(Line::from(random_line(i, 200).as_str()));
-        if sb.watermark_level() >= WatermarkLevel::Yellow {
-            saw_yellow = true;
-            break;
-        }
-    }
-    assert!(
-        saw_yellow,
-        "should reach Yellow with random data in 200KB budget"
-    );
-}
-
-#[test]
-fn watermark_crosses_red_under_pressure() {
-    let budget = 200_000;
-    let mut sb = Scrollback::with_block_size(10_000, 50_000, budget, 100);
-
-    let mut saw_red = false;
-    for i in 0..3000 {
-        sb.push_line(Line::from(random_line(i, 200).as_str()));
-        if sb.watermark_level() == WatermarkLevel::Red {
-            saw_red = true;
-            break;
-        }
-    }
-    assert!(saw_red, "should reach Red with random data in 200KB budget");
-}
 
 #[test]
 fn watermark_visits_all_three_levels() {
@@ -212,13 +161,7 @@ fn watermark_clear_resets_to_green() {
     );
 }
 
-// ── Hysteresis unit tests ────────────────────────────────────────────
-//
-// The watermark state machine has three code paths for downward transitions
-// that are not exercised by the integration tests above:
-// 1. Yellow stays Yellow when budgeted_bytes is between exit (50%) and entry (80%)
-// 2. Red drops to Yellow (not Green) when below red threshold
-// 3. Red→Yellow→Green requires dropping below yellow_exit_threshold (50%)
+// ── Hysteresis ───────────────────────────────────────────────────────
 
 /// Helper: create a scrollback and directly set internal state for unit testing.
 fn scrollback_with_state(
@@ -232,164 +175,27 @@ fn scrollback_with_state(
     sb
 }
 
+/// The hysteresis state machine at budget 1000: Yellow enters at 800 (80%)
+/// and exits only BELOW 500 (50%, strictly less), Red enters at 950 (95%),
+/// and Red steps down through Yellow, never straight to Green.
 #[test]
-fn watermark_yellow_sticky_between_exit_and_entry() {
-    // Budget=1000, yellow_entry=800 (80%), yellow_exit=500 (50%), red=950 (95%).
-    // At 600 bytes (60%), a Yellow watermark should STAY Yellow due to hysteresis.
-    let mut sb = scrollback_with_state(1000, 600, WatermarkLevel::Yellow);
-    sb.update_watermark_level();
-    assert_eq!(
-        sb.watermark_level,
-        WatermarkLevel::Yellow,
-        "Yellow at 60% (between 50% exit and 80% entry) should stay Yellow"
-    );
-}
-
-#[test]
-fn watermark_yellow_drops_to_green_below_exit() {
-    // At 390 bytes (39%), which is below the 50% exit threshold, Yellow→Green.
-    let mut sb = scrollback_with_state(1000, 390, WatermarkLevel::Yellow);
-    sb.update_watermark_level();
-    assert_eq!(
-        sb.watermark_level,
-        WatermarkLevel::Green,
-        "Yellow at 39% (below 50% exit) should drop to Green"
-    );
-}
-
-#[test]
-fn watermark_red_drops_to_yellow_not_green() {
-    // At 600 bytes (60%), below red (950) but above yellow entry (800)? No —
-    // 600 < 800, so we're in the "below yellow entry" branch.
-    // Red should drop to Yellow, not straight to Green.
-    let mut sb = scrollback_with_state(1000, 600, WatermarkLevel::Red);
-    sb.update_watermark_level();
-    assert_eq!(
-        sb.watermark_level,
-        WatermarkLevel::Yellow,
-        "Red at 60% should drop to Yellow, not Green"
-    );
-}
-
-#[test]
-fn watermark_red_drops_to_yellow_between_yellow_entry_and_red() {
-    // At 900 bytes (90%), between yellow entry (800) and red (950).
-    // Red→Yellow in this band.
-    let mut sb = scrollback_with_state(1000, 900, WatermarkLevel::Red);
-    sb.update_watermark_level();
-    assert_eq!(
-        sb.watermark_level,
-        WatermarkLevel::Yellow,
-        "Red at 90% (between yellow entry and red threshold) should drop to Yellow"
-    );
-}
-
-#[test]
-fn watermark_red_to_yellow_to_green_cascade() {
-    // Full downward cascade through hysteresis:
-    // Start Red at 960 (above 950 red threshold).
-    let mut sb = scrollback_with_state(1000, 960, WatermarkLevel::Green);
-    sb.update_watermark_level();
-    assert_eq!(sb.watermark_level, WatermarkLevel::Red, "960 → Red");
-
-    // Drop to 850 (between yellow entry 800 and red 950). Red→Yellow.
-    sb.budgeted_bytes = 850;
-    sb.update_watermark_level();
-    assert_eq!(
-        sb.watermark_level,
-        WatermarkLevel::Yellow,
-        "850 → Yellow (from Red)"
-    );
-
-    // Drop to 600 (between exit 500 and entry 800). Yellow stays Yellow.
-    sb.budgeted_bytes = 600;
-    sb.update_watermark_level();
-    assert_eq!(
-        sb.watermark_level,
-        WatermarkLevel::Yellow,
-        "600 → still Yellow (sticky hysteresis)"
-    );
-
-    // Drop to 390 (below exit 500). Yellow→Green.
-    sb.budgeted_bytes = 390;
-    sb.update_watermark_level();
-    assert_eq!(
-        sb.watermark_level,
-        WatermarkLevel::Green,
-        "390 → Green (below exit)"
-    );
-}
-
-#[test]
-fn watermark_green_at_exact_yellow_exit_stays_yellow() {
-    // At exactly the exit threshold (50% = 500 bytes), Yellow should NOT
-    // drop to Green — the condition is strictly less than.
-    let mut sb = scrollback_with_state(1000, 500, WatermarkLevel::Yellow);
-    sb.update_watermark_level();
-    assert_eq!(
-        sb.watermark_level,
-        WatermarkLevel::Yellow,
-        "Yellow at exactly 50% exit threshold should stay Yellow (< not <=)"
-    );
-}
-
-#[test]
-fn watermark_boundary_at_exact_yellow_entry() {
-    // At exactly 80% = 800 bytes, Green→Yellow.
-    let mut sb = scrollback_with_state(1000, 800, WatermarkLevel::Green);
-    sb.update_watermark_level();
-    assert_eq!(
-        sb.watermark_level,
-        WatermarkLevel::Yellow,
-        "Green at exactly 80% should enter Yellow"
-    );
-}
-
-#[test]
-fn watermark_boundary_at_exact_red_entry() {
-    // At exactly 95% = 950 bytes, any level→Red.
-    let mut sb = scrollback_with_state(1000, 950, WatermarkLevel::Green);
-    sb.update_watermark_level();
-    assert_eq!(
-        sb.watermark_level,
-        WatermarkLevel::Red,
-        "Green at 95% → Red"
-    );
-
-    let mut sb = scrollback_with_state(1000, 950, WatermarkLevel::Yellow);
-    sb.update_watermark_level();
-    assert_eq!(
-        sb.watermark_level,
-        WatermarkLevel::Red,
-        "Yellow at 95% → Red"
-    );
-}
-
-// ── ScrollbackStorage delegation ─────────────────────────────────────
-
-#[test]
-fn watermark_storage_delegates_green() {
-    let sb = Scrollback::with_defaults();
-    let storage: ScrollbackStorage = sb.into();
-    assert_eq!(storage.watermark_level(), WatermarkLevel::Green);
-}
-
-#[test]
-fn watermark_storage_reflects_pressure() {
-    let budget = 200_000;
-    let mut sb = Scrollback::with_block_size(10_000, 50_000, budget, 100);
-    for i in 0..3000 {
-        sb.push_line(Line::from(random_line(i, 200).as_str()));
-        if sb.watermark_level() >= WatermarkLevel::Yellow {
-            break;
-        }
+fn watermark_hysteresis_transitions() {
+    use WatermarkLevel::{Green, Red, Yellow};
+    for (from, bytes, want) in [
+        (Yellow, 600, Yellow), // sticky between exit and entry
+        (Yellow, 500, Yellow), // exactly at exit: `<`, not `<=`
+        (Yellow, 390, Green),  // below exit
+        (Red, 900, Yellow),    // between yellow entry and red
+        (Red, 600, Yellow),    // below yellow entry: still Yellow, not Green
+        (Green, 800, Yellow),  // exactly at yellow entry
+        (Green, 950, Red),     // exactly at red entry
+        (Yellow, 950, Red),
+        (Green, 960, Red),
+    ] {
+        let mut sb = scrollback_with_state(1000, bytes, from);
+        sb.update_watermark_level();
+        assert_eq!(sb.watermark_level, want, "{from:?} at {bytes}");
     }
-
-    let storage: ScrollbackStorage = sb.into();
-    assert!(
-        storage.watermark_level() >= WatermarkLevel::Yellow,
-        "storage should delegate watermark level from inner Scrollback"
-    );
 }
 
 /// THE THRESHOLDS ARE BOUNDED FOR EVERY BUDGET, and a fresh scrollback

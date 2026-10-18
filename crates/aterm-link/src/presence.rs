@@ -257,7 +257,11 @@ pub struct Slot {
     /// The tokens on the bus — [`Fields::tokens`] for the mode the row was
     /// published in — and when. Tokens, not fields: a row is owed only when
     /// the ROW would differ, and a `minimal` row carries `attention=` alone.
+    /// A row SENT and not yet answered counts ([`Slot::mark_published`]).
     published: Option<(String, Instant)>,
+    /// The newest row the broker ANSWERED as landed: what `published` falls
+    /// back to when a row sent after it is refused ([`Slot::unmark`]).
+    landed: Option<(String, Instant)>,
 }
 
 /// [`Slot::due`]'s answer.
@@ -295,12 +299,45 @@ impl Slot {
         }
     }
 
-    /// Record that the fields as they are now went onto the bus at `now`, as
-    /// a row in `mode`.
-    pub fn note_published(&mut self, mode: Mode, now: Instant) {
-        self.published = Some((self.fields.tokens(mode), now));
+    /// Record that the fields as they are now were SENT onto the bus at `now`,
+    /// as a row in `mode`, and not yet answered — the bridge pipelines presence
+    /// rows, so the answer comes later — answering the mark its answer settles
+    /// ([`Slot::landed`], [`Slot::unmark`]). The one way a row is recorded:
+    /// there is no "it landed" without the send before it, so a refusal always
+    /// has a row that did land to fall back to.
+    ///
+    /// Marked at the send, not the answer, so the [`REPUBLISH_MIN`] window
+    /// counts from when the row left, exactly as it counted from a blocking
+    /// publish's answer a round trip later; marked at the answer instead, a
+    /// field that moved again in between would read the row as not yet on the
+    /// bus and send a second one inside the window.
+    pub(crate) fn mark_published(&mut self, mode: Mode, now: Instant) -> Marked {
+        let sent = (self.fields.tokens(mode), now);
+        self.published = Some(sent.clone());
+        Marked(sent)
+    }
+
+    /// The row `mark` stands for LANDED. Answers come in send order, so the
+    /// newest answered row is the last one recorded here.
+    pub(crate) fn landed(&mut self, mark: Marked) {
+        self.landed = Some(mark.0);
+    }
+
+    /// The row `mark` stands for did NOT land: fall back to the newest row the
+    /// broker answered as landed, so the next round owes the row again — what
+    /// an unanswered blocking publish left. Only while `mark` is the newest row
+    /// SENT: one sent after it is the bus's word as soon as it lands, and its
+    /// own answer settles it.
+    pub(crate) fn unmark(&mut self, mark: Marked) {
+        if self.published.as_ref() == Some(&mark.0) {
+            self.published.clone_from(&self.landed);
+        }
     }
 }
+
+/// One presence row as [`Slot::mark_published`] sent it: its tokens and when.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Marked((String, Instant));
 
 #[cfg(test)]
 mod tests {
@@ -422,6 +459,13 @@ mod tests {
         assert_eq!(token("ab%2", 8), "ab");
     }
 
+    /// A row sent and answered as landed: what the bridge records for a
+    /// presence row whose ack came back.
+    fn published(slot: &mut Slot, mode: Mode, now: Instant) {
+        let mark = slot.mark_published(mode, now);
+        slot.landed(mark);
+    }
+
     /// Change only, and at most once per [`REPUBLISH_MIN`].
     #[test]
     fn the_writer_publishes_on_change_only_and_at_most_once_per_window() {
@@ -430,7 +474,7 @@ mod tests {
         let mut slot = Slot::default();
         assert_eq!(slot.due(m, t0), Due::First);
         slot.fields.set_agent(Some("busy"));
-        slot.note_published(m, t0);
+        published(&mut slot, m, t0);
         // The same fields again: nothing.
         assert_eq!(slot.due(m, t0 + Duration::from_secs(5)), Due::Unchanged);
         // A change inside the window is CAPPED, not dropped: the next round
@@ -440,11 +484,64 @@ mod tests {
         assert_eq!(slot.due(m, t0 + REPUBLISH_MIN), Due::Changed);
         assert!(slot.due(m, t0 + REPUBLISH_MIN).now());
         assert!(!Due::Capped.now() && !Due::Unchanged.now());
-        slot.note_published(m, t0 + REPUBLISH_MIN);
+        published(&mut slot, m, t0 + REPUBLISH_MIN);
         assert_eq!(slot.due(m, t0 + REPUBLISH_MIN), Due::Unchanged);
         // A verdict the server retracts is a change too.
         slot.fields.set_agent(None);
         assert_eq!(slot.due(m, t0 + REPUBLISH_MIN * 2), Due::Changed);
+    }
+
+    /// A row marked at its SEND caps the window from the send; a refusal falls
+    /// back to the newest row that LANDED — not to a row sent before it that
+    /// was refused too — and leaves a newer row in flight standing.
+    #[test]
+    fn a_refused_row_falls_back_to_the_newest_row_that_landed() {
+        let t0 = Instant::now();
+        let m = Mode::Meta;
+        let mut slot = Slot::default();
+        slot.fields.set_agent(Some("busy"));
+        let first = slot.mark_published(m, t0);
+        assert_eq!(
+            slot.due(m, t0),
+            Due::Unchanged,
+            "in flight counts as on the bus"
+        );
+        slot.fields.set_agent(Some("idle"));
+        assert_eq!(
+            slot.due(m, t0),
+            Due::Capped,
+            "the window counts from the send"
+        );
+        slot.unmark(first);
+        assert_eq!(
+            slot.due(m, t0),
+            Due::First,
+            "refused: nothing is on the bus"
+        );
+
+        // `idle` lands; then `busy` and `prompt` go out, and BOTH are refused,
+        // in send order, as their answers arrive.
+        let idle = slot.mark_published(m, t0);
+        slot.landed(idle);
+        slot.fields.set_agent(Some("busy"));
+        let busy = slot.mark_published(m, t0 + REPUBLISH_MIN);
+        slot.fields.set_agent(Some("prompt"));
+        let prompt = slot.mark_published(m, t0 + REPUBLISH_MIN * 2);
+        slot.unmark(busy);
+        assert_eq!(
+            slot.due(m, t0 + REPUBLISH_MIN * 2),
+            Due::Unchanged,
+            "a row sent after the refused one stands until its own answer"
+        );
+        slot.unmark(prompt);
+        slot.fields.set_agent(Some("idle"));
+        assert_eq!(
+            slot.due(m, t0 + REPUBLISH_MIN * 3),
+            Due::Unchanged,
+            "the bus says `idle`, the row that landed, and not the refused `busy`"
+        );
+        slot.fields.set_agent(Some("busy"));
+        assert_eq!(slot.due(m, t0 + REPUBLISH_MIN * 3), Due::Changed);
     }
 
     /// A `minimal` row is owed only when `attention=` moved.
@@ -456,7 +553,7 @@ mod tests {
         slot.fields.read_meta(
             "OK title=one user_title=one description=- icon=- role=- attention=- cwd=- state=alive",
         );
-        slot.note_published(m, t0);
+        published(&mut slot, m, t0);
         assert_eq!(slot.due(m, t0 + REPUBLISH_MIN), Due::Unchanged);
         // Every unpublished field moves; the row does not.
         slot.fields.read_meta("OK title=two user_title=two description=- icon=- role=worker attention=- cwd=- state=alive");
@@ -472,17 +569,5 @@ mod tests {
         // The one field it does write moves: due.
         slot.fields.read_meta("OK title=two user_title=two description=- icon=- role=worker attention=stuck cwd=- state=alive");
         assert_eq!(slot.due(m, t0 + REPUBLISH_MIN * 2), Due::Changed);
-    }
-
-    /// The config spelling, and no other.
-    #[test]
-    fn the_mode_has_two_spellings() {
-        assert_eq!(Mode::parse("meta"), Some(Mode::Meta));
-        assert_eq!(Mode::parse(" minimal "), Some(Mode::Minimal));
-        assert_eq!(Mode::parse("full"), None);
-        assert_eq!(Mode::parse(""), None);
-        assert_eq!(Mode::default(), Mode::Meta);
-        assert_eq!(Mode::Meta.name(), "meta");
-        assert_eq!(Mode::Minimal.name(), "minimal");
     }
 }

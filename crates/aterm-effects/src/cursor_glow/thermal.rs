@@ -35,27 +35,22 @@ impl CursorGlow {
             .clamp(0.0, 1.0)
     }
 
-    /// The per-keystroke heat gain this style/pack charges. Fire earns its
-    /// blaze over ~30-40 keys; a custom Trail Pack may override; `None` and
-    /// every built-in keep the shared [`Self::HEAT_GAIN`].
-    pub(super) fn heat_gain(cfg: &GlowConfig, fire: bool) -> f32 {
+    /// The per-keystroke heat gain this style charges. Fire earns its blaze
+    /// over ~30-40 keys; every other style keeps the shared [`Self::HEAT_GAIN`].
+    pub(super) fn heat_gain(fire: bool) -> f32 {
         if fire {
             Self::FIRE_HEAT_GAIN
-        } else if let Some(g) = cfg.pack.as_ref().and_then(|p| p.heat.gain) {
-            g
         } else {
             Self::HEAT_GAIN
         }
     }
 
-    /// The heat cooling τ this style/pack runs. Fire cools on its own slower
-    /// τ (momentum survives a short thought); a custom Trail Pack may
-    /// override; `None` and every built-in keep [`Self::HEAT_DECAY_TAU`].
+    /// The heat cooling τ this style runs. Fire cools on its own slower τ
+    /// (momentum survives a short thought); every other style keeps
+    /// [`Self::HEAT_DECAY_TAU`].
     pub(super) fn heat_tau(cfg: &GlowConfig) -> f32 {
         if matches!(cfg.style, GlowStyle::Fire) {
             Self::FIRE_HEAT_TAU
-        } else if let Some(tau) = cfg.pack.as_ref().and_then(|p| p.heat.tau) {
-            tau
         } else {
             Self::HEAT_DECAY_TAU
         }
@@ -117,7 +112,6 @@ impl CursorGlow {
             pc,
             cc,
             now,
-            cfg,
             geom,
             wrap,
             re_anchor,
@@ -141,7 +135,7 @@ impl CursorGlow {
             // Forward-only momentum heats fire; the other styles keep direction-blind heat.
             if (forward || !fire) && !deletion && !navigation {
                 let cadence = Self::heat_cadence(gap);
-                let gain = Self::heat_gain(cfg, fire);
+                let gain = Self::heat_gain(fire);
                 self.heat = (self.heat + cadence * gain).min(1.0);
                 // Fire-only: the coal bed charges on a much wider cadence window, so human
                 // rhythm writing (300-400 ms/key) builds a persistent ember floor over a

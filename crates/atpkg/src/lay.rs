@@ -34,11 +34,17 @@ impl Executable {
 /// a shim only its owner can run in a system prefix), a flush, then `rename(2)` over the
 /// destination, so a shim on the user's PATH is never briefly absent or half-written.
 ///
-/// The flush is [`crate::platform::sync_durable`] (on Apple targets `F_FULLFSYNC`, a
-/// drive-cache barrier) because a real shim, a tombstone or a trust exec root's re-render
-/// is what a terminal outside aterm runs next, and no launch re-lays it before then.
+/// The flush is [`aterm_durable::ordered`] (on Apple targets `F_BARRIERFSYNC`): a real
+/// shim, a tombstone or a trust exec root's re-render is what a terminal outside aterm
+/// runs next, and no launch re-lays it before then, so its bytes must land before its
+/// name. This writer does not flush the shim's parent after the rename, so it does
+/// not promise that publication survives a power loss. A later `gc` full flush of the
+/// build-store parent covers that directory and earlier fsync-submitted I/O on its
+/// device; it does not submit this other, unflushed directory's rename. Thus the
+/// restored Durable cleanup does not establish a never-dangling PATH guarantee.
+/// This missing parent-publication persistence also existed with the former full-file flush.
 pub fn write_in_process(file: &Executable) -> io::Result<()> {
-    write_with(file, crate::platform::sync_durable)
+    write_with(file, aterm_durable::ordered)
 }
 
 /// [`write_in_process`] for a file the next seed lays again when it is missing or its bytes
@@ -78,13 +84,14 @@ fn write_with(file: &Executable, sync: fn(&std::fs::File) -> io::Result<()>) -> 
     write_bytes(file, sync)
 }
 
-/// The durable writer while the caller holds [`PUBLICATION_TURN`] across the read that
+/// The ordered writer while the caller holds [`PUBLICATION_TURN`] across the read that
 /// selected these bytes. Reacquiring the turn here would deadlock that reconcile.
 pub(crate) fn write_in_publication_turn(
     file: &Executable,
     _turn: &std::sync::MutexGuard<'_, ()>,
 ) -> io::Result<()> {
-    write_bytes(file, crate::platform::sync_durable)
+    // Ordered, as [`write_in_process`]: the old shim or the new one.
+    write_bytes(file, aterm_durable::ordered)
 }
 
 /// Remove a primary under [`PUBLICATION_TURN`]: a reconcile that already read it finishes
@@ -154,6 +161,18 @@ mod tests {
         crate::testdir::dir(&format!("atpkg-lay-{label}-"))
     }
 
+    /// A lay that a terminal outside aterm runs next is only ordered ahead of its rename
+    /// (aterm-durable's counting seam), never fully flushed.
+    #[test]
+    fn an_in_process_lay_is_ordered() {
+        use aterm_durable::{Flush, seam::Recording};
+        let d = tmp("flush-tiers");
+        let dest = d.join("tool");
+        let recording = Recording::start();
+        write_in_process(&Executable::new(&dest, "#!/bin/sh\n")).unwrap();
+        assert_eq!(recording.take(), [Flush::Ordered]);
+    }
+
     /// Both writers: mode 0755, the exact bytes, an existing file replaced by a rename (a
     /// new inode — never truncated in place, so a reader holding the old file reads it
     /// whole), no temp left behind.
@@ -163,7 +182,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         type Writer = fn(&Executable) -> io::Result<()>;
         let writers: [(&str, Writer); 2] = [
-            ("durable", write_in_process),
+            ("ordered", write_in_process),
             ("regenerable", write_regenerable),
         ];
         for (label, write) in writers {

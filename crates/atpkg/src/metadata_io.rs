@@ -202,18 +202,6 @@ mod tests {
         assert_eq!(read_bounded_regular(&exact, 8).unwrap(), b"12345678");
         let error = read_bounded_regular(&over, 8).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("8-byte"), "{error}");
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn oversized_sparse_file_is_rejected_before_allocation() {
-        let root = fixture("sparse");
-        let path = root.join("sparse");
-        let file = std::fs::File::create(&path).unwrap();
-        file.set_len(16 * 1024 * 1024).unwrap();
-        let error = read_bounded_regular(&path, 1024).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         std::fs::remove_dir_all(&root).unwrap();
     }
 

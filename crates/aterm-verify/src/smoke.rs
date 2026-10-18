@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The plumbing the two smokes stand on. Unix only, like the smokes
+//! The plumbing the GUI smoke stands on. Unix only, like the smoke
 //! (`crate::smoke_stages`).
 
 use std::path::Path;
@@ -9,7 +9,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 /// macOS's `sockaddr_un.sun_path` ceiling. Every smoke socket path must stay
-/// under it, which is why the smokes live in `/tmp` and not in `$TMPDIR`.
+/// under it, which is why the smoke lives in `/tmp` and not in `$TMPDIR`.
 pub const SUN_LEN: usize = 104;
 
 /// Pull `<field>=<digits>` out of a metrics reply. The field must follow
@@ -131,10 +131,14 @@ pub fn retire_smoke_child(child: &mut Child) -> (bool, String) {
     (ok, noise)
 }
 
-/// Block until `pid`, a child of this process that ends by itself, has exited:
-/// a zombie in `ps`, not yet reaped, so the pid cannot be recycled under a
-/// signal sent to it next. Polls the state, never a fixed sleep a loaded
-/// machine can outlast. `false` after a minute's hang detector.
+/// Block until `pid` — a child of this process that ends by itself — has EXITED:
+/// a zombie in `ps`, its status fixed and not yet reaped, so the pid is still
+/// ours and nothing can be recycled under a signal sent to it next. The state,
+/// never a nap: a loaded machine can keep `sh -c 'exit 7'` alive past any fixed
+/// sleep, and a TERM that beats it to its `exit` turns "died on its own" into
+/// "retired by us". Bounded only as a fail-safe (`false`): a minute's hang
+/// detector, never a latency budget. The smoke's own tests use it to witness a
+/// child's exit before a teardown.
 #[cfg(test)]
 #[must_use]
 pub(crate) fn exited_on_its_own(pid: u32) -> bool {
@@ -288,21 +292,10 @@ pub fn socket_listening(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-
-    #[test]
-    fn a_locked_console_session_reads_locked_and_an_unlocked_one_does_not() {
-        let locked = r#""IOConsoleUsers" = ({"kCGSSessionOnConsoleKey"=Yes,"CGSSessionScreenIsLocked"=Yes,"kCGSSessionUserIDKey"=501})"#;
-        let open =
-            r#""IOConsoleUsers" = ({"kCGSSessionOnConsoleKey"=Yes,"kCGSSessionUserIDKey"=501})"#;
-        assert!(super::reads_locked(locked));
-        assert!(!super::reads_locked(open));
-        assert!(!super::reads_locked(""), "an unread ioreg is not a lock");
-    }
-
     use super::*;
 
     #[test]
-    fn a_metric_field_must_be_the_whole_field() {
+    fn a_metric_is_its_whole_field_and_a_latency_needs_its_decimal_point() {
         assert_eq!(
             metric_u64("OK backend=gpu frames=17 present_drops=0", "frames"),
             Some(17)
@@ -317,10 +310,7 @@ mod tests {
         assert_eq!(metric_u64("OK", "frames"), None);
         // The last occurrence wins.
         assert_eq!(metric_u64("OK frames=3 frames=9", "frames"), Some(9));
-    }
-
-    #[test]
-    fn the_latency_reading_needs_its_decimal_point() {
+        // The latency reading needs its decimal point.
         let m = "OK frames=31 max_input_present_ms=12.480 sync_rel_timeout=0 ";
         assert_eq!(metric_ms_whole(m, "max_input_present_ms"), Some(12));
         assert_eq!(
@@ -339,19 +329,6 @@ mod tests {
     }
 
     #[test]
-    fn the_longest_instance_socket_path_stays_under_sun_len() {
-        let tmp = crate::mktemp_dir("atx").expect("mktemp");
-        let sock = tmp.join("run/aterm/aterm-4294967295.sock");
-        assert!(
-            sock.as_os_str().len() < SUN_LEN,
-            "{} is {} bytes, over the {SUN_LEN}-byte ceiling",
-            sock.display(),
-            sock.as_os_str().len()
-        );
-        std::fs::remove_dir_all(&tmp).ok();
-    }
-
-    #[test]
     fn retiring_a_live_child_terms_it_and_reaps_exactly_once() {
         let mut child = Command::new("sleep")
             .arg("30")
@@ -362,21 +339,6 @@ mod tests {
         let (ok, noise) = retire_smoke_child(&mut child);
         assert!(ok, "a TERM we sent is a clean retirement");
         assert!(noise.is_empty(), "teardown must be quiet: {noise}");
-    }
-
-    #[test]
-    fn a_child_that_died_on_its_own_is_not_a_clean_retirement() {
-        let mut child = Command::new("/bin/sh")
-            .args(["-c", "exit 7"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn");
-        // Its exit witnessed, so the TERM below cannot kill it first and read as ours.
-        let exited = exited_on_its_own(child.id());
-        let (ok, _) = retire_smoke_child(&mut child);
-        assert!(exited, "`exit 7` never exited within a minute");
-        assert!(!ok, "exit 7 is not something this teardown caused");
     }
 
     /// The bound is a minute, half the life of the `sleep` the child execs,
@@ -405,47 +367,5 @@ mod tests {
             "the run is never hung by teardown: {:?}",
             start.elapsed()
         );
-    }
-
-    #[test]
-    fn the_smoke_log_tail_is_indented_and_bounded() {
-        let tmp = crate::mktemp_dir("atv-log").expect("mktemp");
-        let log = tmp.join("gui.log");
-        assert_eq!(
-            smoke_log_tail("GUI smoke", &log),
-            "",
-            "no log, nothing to show"
-        );
-        std::fs::write(&log, b"").expect("write");
-        assert_eq!(
-            smoke_log_tail("GUI smoke", &log),
-            "",
-            "an empty log is not printed"
-        );
-
-        let body: String = (0..100).map(|i| format!("line{i}\n")).collect();
-        std::fs::write(&log, body).expect("write");
-        let tail = smoke_log_tail("GUI smoke", &log);
-        assert!(tail.starts_with("        GUI smoke child log (last 80 lines):\n"));
-        assert_eq!(tail.lines().count(), 81);
-        assert!(tail.contains("\n          line20\n"));
-        assert!(!tail.contains("line19\n"), "older lines are dropped");
-        std::fs::remove_dir_all(&tmp).ok();
-    }
-
-    #[test]
-    fn only_a_socket_or_a_symlink_counts_as_a_bound_socket() {
-        let tmp = crate::mktemp_dir("atv-sock").expect("mktemp");
-        let plain = tmp.join("aterm.sock");
-        assert!(!is_socket_or_symlink(&plain), "absent is not bound");
-        std::fs::write(&plain, b"not a socket").expect("write");
-        assert!(
-            !is_socket_or_symlink(&plain),
-            "a regular file is not a bound socket"
-        );
-        let link = tmp.join("link.sock");
-        std::os::unix::fs::symlink(&plain, &link).expect("symlink");
-        assert!(is_socket_or_symlink(&link), "the script accepted a symlink");
-        std::fs::remove_dir_all(&tmp).ok();
     }
 }

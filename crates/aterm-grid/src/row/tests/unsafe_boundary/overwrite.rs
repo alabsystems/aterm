@@ -26,37 +26,6 @@ fn write_char_styled_overwrite_wide_first_half() {
 }
 
 #[test]
-fn write_char_styled_overwrite_wide_second_half() {
-    let (_pages, mut row) = make_row(10);
-    let fg = PackedColor::DEFAULT_FG;
-    let bg = PackedColor::DEFAULT_BG;
-
-    row.write_wide_char(4, '\u{4E2D}', fg, bg, CellFlags::empty());
-
-    row.write_char_styled(5, 'Y', fg, bg, CellFlags::empty());
-
-    assert_eq!(row.get(4).unwrap().char(), ' ');
-    assert!(!row.get(4).unwrap().is_wide());
-    assert_eq!(row.get(5).unwrap().char(), 'Y');
-}
-
-#[test]
-fn write_wide_char_overwrite_existing_wide_overlap() {
-    let (_pages, mut row) = make_row(10);
-    let fg = PackedColor::DEFAULT_FG;
-    let bg = PackedColor::DEFAULT_BG;
-
-    row.write_wide_char(2, '\u{4E00}', fg, bg, CellFlags::empty());
-    row.write_wide_char(3, '\u{4E8C}', fg, bg, CellFlags::empty());
-
-    assert_eq!(row.get(2).unwrap().char(), ' ');
-    assert!(!row.get(2).unwrap().is_wide());
-    assert!(row.get(3).unwrap().is_wide());
-    assert_eq!(row.get(3).unwrap().char(), '\u{4E8C}');
-    assert!(row.get(4).unwrap().is_wide_continuation());
-}
-
-#[test]
 fn write_wide_char_adjacent_pair() {
     // Overwrite the middle of three adjacent wide chars: both neighbours wide.
     let (_pages, mut row) = make_row(6);

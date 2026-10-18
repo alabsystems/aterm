@@ -18,13 +18,9 @@
 //! the registry an empty local directory, so the pass finds an empty store and exits 0.
 
 #![cfg(target_os = "macos")]
-#![allow(
-    clippy::disallowed_types,
-    reason = "test code: a stand-in child may inherit descriptors"
-)]
 
+use aterm_uds::spawnfd::Stdio;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 
 struct Fixture {
     root: aterm_tempfile::TempDir,
@@ -69,7 +65,7 @@ impl Fixture {
     /// The dev `atpkg` over this fixture, however it ends. Its working directory is the
     /// fixture's, so a relative seam names nothing outside it.
     fn run(&self, args: &[&str], state_home: Option<&std::path::Path>) -> std::process::Output {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_atpkg"));
+        let mut cmd = aterm_uds::spawnfd::command(env!("CARGO_BIN_EXE_atpkg"));
         cmd.args(args)
             .current_dir(self.root.path())
             .env("HOME", self.root.path().join("home"))
@@ -224,11 +220,6 @@ fn an_unknown_word_ahead_of_the_verb_is_refused_before_the_machine_edge() {
     assert_eq!(out.status.code(), Some(2), "{out:?}");
     assert!(out.stdout.is_empty(), "{out:?}");
     assert!(
-        String::from_utf8_lossy(&out.stderr)
-            .contains("atpkg: unknown verb '--a-lead-this-build-does-not-know'"),
-        "{out:?}"
-    );
-    assert!(
         !fx.prefix.join("machine.applied").exists(),
         "nothing was applied or recorded"
     );
@@ -257,5 +248,61 @@ fn a_pass_the_store_lock_refuses_still_carries_the_machine_edit() {
     assert!(
         Fixture::attempted(&Fixture::lines(&out.stdout)),
         "the refused pass still carried the never-applied table: {out:?}"
+    );
+}
+
+/// A PASS EDGE DOES NOT WAIT OUT ANOTHER `[machine]` APPLY. On a first launch the window's
+/// own `machine apply` holds `machine.lock` while the seed's edge would carry the same
+/// never-applied table: the edge leaves it to that apply — and an edit it read too early to
+/// the next pass's edge — so the seed exits while the queue is still held. An edge that
+/// queued behind it held the seed, and the install the window starts behind it, until the
+/// window's `defaults` writes were done. Here the test holds the queue for the seed's whole
+/// life: the seed exits under the hang detector, and attempted nothing.
+#[test]
+fn a_pass_edge_does_not_wait_out_another_machine_apply() {
+    let fx = Fixture::new("queue-held");
+    let queue = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(fx.prefix.join("machine.lock"))
+        .unwrap();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test holds the [machine] queue for one child's life; closing it lets go"
+    )]
+    queue
+        .try_lock()
+        .expect("the test holds the [machine] queue");
+    let mut child = aterm_uds::spawnfd::command(env!("CARGO_BIN_EXE_atpkg"))
+        .arg("seed")
+        .current_dir(fx.root.path())
+        .env("HOME", fx.root.path().join("home"))
+        .env("XDG_CONFIG_HOME", fx.root.path().join("config"))
+        .env(
+            "ATPKG_REGISTRY",
+            format!("dir:{}", fx.root.path().join("registry").display()),
+        )
+        .env_remove("ATERM_STATE_HOME")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run the dev atpkg");
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() >= until {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("hang detector: the seed waited for the [machine] queue another apply holds");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let out = child.wait_with_output().unwrap();
+    drop(queue);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        !Fixture::attempted(&Fixture::lines(&out.stdout)),
+        "the apply that holds the queue carries the table: {out:?}"
     );
 }

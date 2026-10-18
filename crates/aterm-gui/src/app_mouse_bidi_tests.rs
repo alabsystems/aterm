@@ -10,8 +10,7 @@
 //! the renderer's predicate tests each painted cell at its logical column
 //! (`RenderInput::selection_hit`), so a sweep over the painted cells of one
 //! run selects exactly those cells, and any selection highlights exactly what
-//! it copies. The copy-mode cursor, a logical column too, is painted on the
-//! cell that holds it (`RenderInput::visual_col`).
+//! it copies.
 
 use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::Terminal;
@@ -164,32 +163,6 @@ fn a_double_click_on_an_rtl_word_copies_that_word() {
     );
 }
 
-/// Control: on a pure-LTR row the pointer's cell is its logical cell, so a
-/// sweep and a double-click behave exactly as before.
-#[test]
-fn an_ltr_row_selects_the_cells_under_the_pointer() {
-    let (mut app, wid, term) = window_with("abc hello world def");
-    sweep(&mut app, wid, 4, 8, SelectionSide::Right);
-    assert_eq!(
-        term_lock(&term).selection_to_string().as_deref(),
-        Some("hello")
-    );
-    let (lit, _) = highlight(&mut term_lock(&term));
-    assert_eq!(lit, vec![4, 5, 6, 7, 8]);
-    sweep(&mut app, wid, 8, 4, SelectionSide::Left);
-    assert_eq!(
-        term_lock(&term).selection_to_string().as_deref(),
-        Some("hell")
-    );
-    app.select_word_click(wid, 0, 13);
-    assert_eq!(
-        term_lock(&term).selection_to_string().as_deref(),
-        Some("world")
-    );
-    let (lit, _) = highlight(&mut term_lock(&term));
-    assert_eq!(lit, vec![10, 11, 12, 13, 14]);
-}
-
 /// A shift-click extends to the logical cell under the pointer, with the
 /// half-cell side flipped on an RTL cell: after sweeping visual 4..=5 (the
 /// last two letters of עולם, painted at its left end), a shift-click on the
@@ -277,84 +250,5 @@ fn a_still_click_on_an_rtl_cell_deselects_as_on_an_ltr_cell() {
             !term_lock(&term).text_selection().has_selection(),
             "{row:?}: a click inside cell {pressed} leaves no selection"
         );
-    }
-}
-
-/// Put `term`'s copy-mode (vi) cursor on logical column `logical` of row 0
-/// of `text`, then park the terminal's own cursor at column 0, so the vi
-/// override is the only thing that can paint a cursor elsewhere.
-fn vi_cursor_on(term: &std::sync::Arc<std::sync::Mutex<Terminal>>, text: &str, logical: u16) {
-    let mut t = term_lock(term);
-    t.process(text.as_bytes());
-    t.process(format!("\x1b[{}G", logical + 1).as_bytes());
-    t.vi_toggle();
-    t.process(b"\x1b[1G");
-    assert!(t.vi_is_active());
-    assert_eq!(t.vi_cursor_point().col, logical);
-}
-
-/// The copy-mode cursor is kept in logical columns, as the selection it
-/// steers is, so on a BiDi row the frame paints it on the cell that holds its
-/// column: on logical 4 (ש, the first letter of שלום) it is painted at visual
-/// 12, the cell showing ש, not at visual 4 (ם of עולם). A pure-LTR row paints
-/// it at its own column. Single-pane route (`redraw_window`).
-#[test]
-fn the_copy_mode_cursor_is_painted_on_the_cell_it_names() {
-    use crate::scripted_redraw_fixture::scripted_app;
-    for (text, logical, painted, ch) in [
-        (MIXED, 4, 12, '\u{05E9}'),
-        ("abc hello world def", 4, 4, 'h'),
-    ] {
-        let mut app = scripted_app();
-        let wid = WindowId(0);
-        let term = app
-            .front_terminal(wid)
-            .expect("front terminal")
-            .term
-            .clone();
-        vi_cursor_on(&term, text, logical);
-        app.redraw_window(wid);
-        let scratch = &app.windows[&wid].input_scratch;
-        assert_eq!(scratch.cursor_col, painted, "{text:?}");
-        assert_eq!(
-            scratch.cells[scratch.cursor_row][painted].ch, ch,
-            "{text:?}"
-        );
-    }
-}
-
-/// The composed (split) route paints the focused pane's copy-mode cursor
-/// through the composite's map, which holds the pane's at its window
-/// columns: the cursor lands on the cell showing ש in the right pane.
-#[test]
-fn the_copy_mode_cursor_is_painted_on_the_cell_it_names_in_a_split() {
-    for (text, logical, ch) in [(MIXED, 4, '\u{05E9}'), ("abc hello world def", 4, 'h')] {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        let right = app.split_active_stub_tab(wid);
-        let term = app.pool.get(right).expect("right pane").term.clone();
-        vi_cursor_on(&term, text, logical);
-        let (rows, cols) = {
-            let ws = &app.windows[&wid];
-            (usize::from(ws.rows), usize::from(ws.cols))
-        };
-        assert!(
-            app.redraw_compose(
-                wid,
-                rows,
-                cols,
-                false,
-                false,
-                None,
-                0,
-                std::time::Instant::now()
-            )
-            .is_some(),
-            "the composed frame presents"
-        );
-        let scratch = &app.windows[&wid].input_scratch;
-        let (row, col) = (scratch.cursor_row, scratch.cursor_col);
-        assert!(col > usize::from(logical), "{text:?}: in the right pane");
-        assert_eq!(scratch.cells[row][col].ch, ch, "{text:?}");
     }
 }

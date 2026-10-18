@@ -4,7 +4,7 @@
 // A live `GpuRenderer::set_text_shaping()` flip (which invalidates the atlas) reaches GPU pixels
 // and keeps CPU==GPU parity on the same renderer.
 //
-// No GPU: skip.
+// No GPU or no font: COULD NOT RUN.
 
 use aterm_core::terminal::Terminal;
 use aterm_render::{LigatureMode, TextShapingConfig, Theme};
@@ -90,11 +90,15 @@ fn live_ligature_flip_changes_gpu_pixels_and_keeps_parity() {
     );
 }
 
-/// A live `font_features` flip (`zero` = slashed zero) reaches GPU pixels and
-/// keeps CPU==GPU. Non-vacuity is enforced for the bundled fixture; a font
-/// from $ATERM_LIGATURE_TEST_FONT without `zero` skips (logged).
-#[test]
-fn live_font_feature_flip_reaches_gpu_pixels() {
+/// The frames of a live `font_features` flip (`zero` = slashed zero) on one
+/// pair: the GPU's before it, the GPU's and the CPU's after it, and whether the
+/// face is the committed fixture (whose `zero` is known to be observable).
+fn font_feature_flip_frames() -> (
+    aterm_render::Frame,
+    aterm_render::Frame,
+    aterm_render::Frame,
+    bool,
+) {
     let theme = Theme::default();
     let px = 18.0;
 
@@ -126,15 +130,13 @@ fn live_font_feature_flip_reaches_gpu_pixels() {
     let mut win_feat = aterm_gpu::WindowGpu::new();
     let gpu_feat = gpu.render_input(&mut win_feat, &input, None);
     let cpu_feat = cpu.render_input(&input);
+    (gpu_base, gpu_feat, cpu_feat, is_fixture)
+}
 
-    if gpu_base.pixels == gpu_feat.pixels {
-        if is_fixture {
-            panic!("the bundled fixture's `zero` feature did not reach GPU pixels");
-        }
-        eprintln!("SKIP: the resolved ligature font has no observable `zero` feature; parity-only");
-    }
-
-    // Parity holds under the live feature config either way.
+/// A live `font_features` flip keeps CPU==GPU, on whatever face resolves.
+#[test]
+fn live_font_feature_flip_keeps_parity() {
+    let (_, gpu_feat, cpu_feat, _) = font_feature_flip_frames();
     assert_eq!(
         (gpu_feat.width, gpu_feat.height),
         (cpu_feat.width, cpu_feat.height),
@@ -146,4 +148,21 @@ fn live_font_feature_flip_reaches_gpu_pixels() {
         delta <= 8,
         "CPU/GPU diverge under a live font_features flip: max per-channel delta {delta} > 8"
     );
+}
+
+/// A live `font_features` flip reaches GPU pixels. Required of the committed
+/// fixture; a face from $ATERM_LIGATURE_TEST_FONT with no observable `zero`
+/// cannot answer it, so that run ends COULD NOT RUN.
+#[test]
+fn live_font_feature_flip_reaches_gpu_pixels() {
+    let (gpu_base, gpu_feat, _, is_fixture) = font_feature_flip_frames();
+    if gpu_base.pixels == gpu_feat.pixels {
+        assert!(
+            !is_fixture,
+            "the bundled fixture's `zero` feature did not reach GPU pixels"
+        );
+        aterm_spec::host::could_not_run(
+            "the $ATERM_LIGATURE_TEST_FONT face has no observable `zero` feature",
+        );
+    }
 }

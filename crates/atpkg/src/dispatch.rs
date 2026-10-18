@@ -65,96 +65,30 @@ pub fn strategy_for(kind: &str, protocol: &str) -> ApplyStrategy {
 mod tests {
     use super::*;
 
+    /// Every known pair maps to its strategy; anything else — a known kind over a
+    /// protocol that cannot carry it, a deleted OS-installer protocol, a misspelling —
+    /// fails closed to `Unknown`, never `Shim`.
     #[test]
-    fn known_pairs_map_to_their_strategy() {
-        assert_eq!(
-            strategy_for("binary", "github-release"),
-            ApplyStrategy::Shim
-        );
-        assert_eq!(
-            strategy_for("cargo-src", "github-release"),
-            ApplyStrategy::Shim
-        );
-        assert_eq!(
-            strategy_for("sysroot-bundle", "github-release"),
-            ApplyStrategy::SysrootBundle
-        );
-        assert_eq!(
-            strategy_for("app-bundle", "github-release"),
-            ApplyStrategy::AppBundle
-        );
-        assert_eq!(strategy_for("binary", "https"), ApplyStrategy::Shim);
-        assert_eq!(
-            strategy_for("app-bundle", "https"),
-            ApplyStrategy::VendorApp
-        );
-    }
-
-    /// A kind over a protocol that cannot carry it is Unknown — not the kind's usual
-    /// strategy with a wrong download lane.
-    #[test]
-    fn a_kind_over_the_wrong_protocol_fails_closed() {
-        assert_eq!(
-            strategy_for("sysroot-bundle", "https"),
-            ApplyStrategy::Unknown
-        );
-        assert_eq!(strategy_for("cargo-src", "https"), ApplyStrategy::Unknown);
-        assert_eq!(strategy_for("binary", "pkg"), ApplyStrategy::Unknown);
-        assert_eq!(strategy_for("binary", "system-pm"), ApplyStrategy::Unknown);
-        assert_eq!(
-            strategy_for("installer-pkg", "github-release"),
-            ApplyStrategy::Unknown
-        );
-        assert_eq!(
-            strategy_for("installer-pkg", "https"),
-            ApplyStrategy::Unknown
-        );
-        assert_eq!(
-            strategy_for("system-package", "github-release"),
-            ApplyStrategy::Unknown
-        );
-        assert_eq!(strategy_for("app-bundle", "pkg"), ApplyStrategy::Unknown);
-        assert_eq!(
-            strategy_for("installer-pkg", "softwareupdate"),
-            ApplyStrategy::Unknown
-        );
-        assert_eq!(
-            strategy_for("binary", "softwareupdate"),
-            ApplyStrategy::Unknown
-        );
-        // The unsupported OS-installer protocols' own pairs.
-        for (kind, protocol) in [
-            ("installer-pkg", "pkg"),
-            ("system-package", "system-pm"),
-            ("system-package", "softwareupdate"),
+    fn pairs_map_to_their_strategy_and_the_rest_fail_closed() {
+        use ApplyStrategy::{AppBundle, Shim, SysrootBundle, Unknown, VendorApp};
+        for (kind, protocol, want) in [
+            ("binary", "github-release", Shim),
+            ("cargo-src", "github-release", Shim),
+            ("sysroot-bundle", "github-release", SysrootBundle),
+            ("app-bundle", "github-release", AppBundle),
+            ("binary", "https", Shim),
+            ("app-bundle", "https", VendorApp),
+            ("sysroot-bundle", "https", Unknown),
+            ("cargo-src", "https", Unknown),
+            ("binary", "pkg", Unknown),
+            ("system-package", "softwareupdate", Unknown),
+            ("installer-pkg", "github-release", Unknown),
+            ("binary", "HTTPS", Unknown),
+            ("Binary", "github-release", Unknown),
+            ("", "github-release", Unknown),
+            ("binary", "", Unknown),
         ] {
-            assert_eq!(
-                strategy_for(kind, protocol),
-                ApplyStrategy::Unknown,
-                "{kind}/{protocol}"
-            );
+            assert_eq!(strategy_for(kind, protocol), want, "{kind}/{protocol}");
         }
-        // Spelling is exact and case-sensitive on both axes.
-        assert_eq!(strategy_for("binary", "HTTPS"), ApplyStrategy::Unknown);
-        assert_eq!(strategy_for("binary", "http"), ApplyStrategy::Unknown);
-        assert_eq!(strategy_for("Binary", "https"), ApplyStrategy::Unknown);
-        assert_eq!(strategy_for("binary", ""), ApplyStrategy::Unknown);
-    }
-
-    #[test]
-    fn unknown_kind_fails_closed() {
-        assert_eq!(strategy_for("", "github-release"), ApplyStrategy::Unknown);
-        assert_eq!(
-            strategy_for("dmg", "github-release"),
-            ApplyStrategy::Unknown
-        );
-        assert_eq!(
-            strategy_for("Binary", "github-release"),
-            ApplyStrategy::Unknown
-        ); // case-sensitive
-        assert_eq!(
-            strategy_for("sysroot", "github-release"),
-            ApplyStrategy::Unknown
-        );
     }
 }

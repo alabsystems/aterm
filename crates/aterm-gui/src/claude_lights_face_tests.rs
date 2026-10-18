@@ -33,6 +33,18 @@ fn clock(h: u16, m: u16) -> Clock {
     Clock::of_minute(h * 60 + m)
 }
 
+/// The local day the table's faces were told on, and the day its titles are
+/// read against: a Friday (2024-10-11).
+const TODAY: i64 = 20_007;
+
+/// The stamp of `h:m` on [`TODAY`].
+fn stamp(h: u16, m: u16) -> Stamp {
+    Stamp {
+        clock: clock(h, m),
+        day: TODAY,
+    }
+}
+
 /// A timer landing at `h:m`, on another day where `day` names one.
 fn timer(h: u16, m: u16, day: Option<Weekday>) -> ChipGlass {
     ChipGlass {
@@ -48,14 +60,24 @@ fn timer(h: u16, m: u16, day: Option<Weekday>) -> ChipGlass {
 fn told(face: TaskFace) -> ChipGlass {
     ChipGlass {
         task: Some(face),
-        task_at: Some(clock(17, 42)),
+        task_at: Some(stamp(17, 42)),
         ..ChipGlass::default()
+    }
+}
+
+/// The task's face told at 17:42, under a timer landing at `h:m` (on another
+/// day where `day` names one).
+fn told_under(face: TaskFace, h: u16, m: u16, day: Option<Weekday>) -> ChipGlass {
+    ChipGlass {
+        land_at: timer(h, m, day).land_at,
+        ..told(face)
     }
 }
 
 /// One state of the chip: its view and its glass, and what the table gives
 /// it — the face as drawn, its glyph-only rung, its inks, its whole title
-/// (no trail, no menu), its short title and its spoken label.
+/// (no trail; the menu's line last, as every Autopilot chip's menu opens),
+/// its short title and its spoken label.
 struct Row {
     view: AutopilotView,
     glass: ChipGlass,
@@ -68,7 +90,7 @@ struct Row {
     spoken: String,
 }
 
-/// Every state of §§9.2–9.5, in the words of the design.
+/// Every state of §§9.2–9.5 and §10.2, in the words of the design.
 fn rows() -> Vec<Row> {
     use ChipTone::{Accent, Amber, Dim};
     let row = |view, glass, face, drawn, glyph, tones, whole: &str, short, spoken: &str| Row {
@@ -84,7 +106,8 @@ fn rows() -> Vec<Row> {
     };
     let spent = format!(
         "autopilot: land, quiet \u{2014} no done reply after the instruction and {LAND_NUDGES} \
-         nudges; the harness types nothing more but a land answer to a question \u{b7} click: off"
+         nudges; the harness types nothing more but a land answer to a question \u{b7} click: off \
+         \u{b7} right-click: more"
     );
     let spent_spoken = format!("Autopilot: land. Quiet: no done reply after {LAND_NUDGES} nudges.");
     vec![
@@ -95,7 +118,8 @@ fn rows() -> Vec<Row> {
             "\u{221e}",
             "\u{221e}",
             (Accent, Accent),
-            "autopilot: cruise \u{2014} keeps the work moving \u{b7} click: land",
+            "autopilot: cruise \u{2014} keeps the work moving \u{b7} click: land \u{b7} right-click: \
+             more",
             "autopilot: cruise",
             "Autopilot: cruise.",
         ),
@@ -107,7 +131,7 @@ fn rows() -> Vec<Row> {
             "\u{221e}",
             (Accent, Amber),
             "autopilot: cruise until 18:00, then land \u{2014} keeps the work moving \u{b7} \
-             click: land now",
+             click: land now \u{b7} right-click: more",
             "autopilot: cruise until 18:00, then land",
             "Autopilot: cruise. Lands at 18:00.",
         ),
@@ -119,9 +143,92 @@ fn rows() -> Vec<Row> {
             "\u{221e}",
             (Accent, Amber),
             "autopilot: cruise until Sat 16:00, then land \u{2014} keeps the work moving \u{b7} \
-             click: land now",
+             click: land now \u{b7} right-click: more",
             "autopilot: cruise until Sat 16:00, then land",
             "Autopilot: cruise. Lands Saturday at 16:00.",
+        ),
+        // §10.2.1: under Cruise a task's end wears `∞ ✓ done` / `∞ ✓ landed`
+        // in Cruise's accent, its rung the `✓`; an armed timer moves to the
+        // title, and a click lands now.
+        row(
+            AutopilotView::Cruise,
+            told(TaskFace::Done),
+            ChipFace::CruiseDone,
+            "\u{221e} \u{2713} done",
+            "\u{2713}",
+            (Accent, Accent),
+            "autopilot: cruise, done 17:42 \u{2014} the agent said it was finished; the harness \
+             types nothing more until someone else's turn, then keeps the work moving \u{b7} \
+             click: land \u{b7} right-click: more",
+            "autopilot: cruise, done 17:42",
+            "Autopilot: cruise. Done at 17:42.",
+        ),
+        row(
+            AutopilotView::Cruise,
+            told(TaskFace::Landed),
+            ChipFace::CruiseLanded,
+            "\u{221e} \u{2713} landed",
+            "\u{2713}",
+            (Accent, Accent),
+            "autopilot: cruise, landed 17:42 \u{2014} a landing ended the task; the harness types \
+             nothing more until someone else's turn, then keeps the work moving \u{b7} click: \
+             land \u{b7} right-click: more",
+            "autopilot: cruise, landed 17:42",
+            "Autopilot: cruise. Landed at 17:42.",
+        ),
+        row(
+            AutopilotView::Cruise,
+            told_under(TaskFace::Done, 18, 0, None),
+            ChipFace::CruiseDone,
+            "\u{221e} \u{2713} done",
+            "\u{2713}",
+            (Accent, Accent),
+            "autopilot: cruise, done 17:42, lands 18:00 \u{2014} the agent said it was finished; \
+             the harness types nothing more until someone else's turn, then keeps the work \
+             moving; at 18:00 the word turns land, with nothing left to land \u{b7} click: land \
+             now \u{b7} right-click: more",
+            "autopilot: cruise, done 17:42, lands 18:00",
+            "Autopilot: cruise. Done at 17:42. Lands at 18:00.",
+        ),
+        row(
+            AutopilotView::Cruise,
+            told_under(TaskFace::Landed, 16, 0, Some(Weekday::Sat)),
+            ChipFace::CruiseLanded,
+            "\u{221e} \u{2713} landed",
+            "\u{2713}",
+            (Accent, Accent),
+            "autopilot: cruise, landed 17:42, lands Sat 16:00 \u{2014} a landing ended the task; \
+             the harness types nothing more until someone else's turn, then keeps the work \
+             moving; at Sat 16:00 the word turns land, with nothing left to land \u{b7} click: \
+             land now \u{b7} right-click: more",
+            "autopilot: cruise, landed 17:42, lands Sat 16:00",
+            "Autopilot: cruise. Landed at 17:42. Lands Saturday at 16:00.",
+        ),
+        // A person's own exchange under Cruise keeps `∞` (§10.2.4), and with
+        // a timer armed, the timer's face.
+        row(
+            AutopilotView::Cruise,
+            told(TaskFace::Theirs),
+            ChipFace::Cruise,
+            "\u{221e}",
+            "\u{221e}",
+            (Accent, Accent),
+            "autopilot: cruise \u{2014} keeps the work moving \u{b7} click: land \u{b7} right-click: \
+             more",
+            "autopilot: cruise",
+            "Autopilot: cruise.",
+        ),
+        row(
+            AutopilotView::Cruise,
+            told_under(TaskFace::Theirs, 18, 0, None),
+            ChipFace::CruiseUntil,
+            "\u{221e} \u{2913}18:00",
+            "\u{221e}",
+            (Accent, Amber),
+            "autopilot: cruise until 18:00, then land \u{2014} keeps the work moving \u{b7} \
+             click: land now \u{b7} right-click: more",
+            "autopilot: cruise until 18:00, then land",
+            "Autopilot: cruise. Lands at 18:00.",
         ),
         row(
             AutopilotView::Land,
@@ -130,7 +237,7 @@ fn rows() -> Vec<Row> {
             "\u{2913} land",
             "\u{2913}",
             (Amber, Amber),
-            "autopilot: land \u{2014} wrapping up \u{b7} click: off",
+            "autopilot: land \u{2014} wrapping up \u{b7} click: off \u{b7} right-click: more",
             "autopilot: land",
             "Autopilot: land.",
         ),
@@ -141,7 +248,7 @@ fn rows() -> Vec<Row> {
             "\u{2913} land",
             "\u{2913}",
             (Amber, Amber),
-            "autopilot: land \u{2014} wrapping up \u{b7} click: off",
+            "autopilot: land \u{2014} wrapping up \u{b7} click: off \u{b7} right-click: more",
             "autopilot: land",
             "Autopilot: land.",
         ),
@@ -152,9 +259,10 @@ fn rows() -> Vec<Row> {
             "\u{2713} landed",
             "\u{2713}",
             (Amber, Amber),
-            "autopilot: land, landed \u{2014} the agent finished after the land instruction; \
-             the harness types nothing more until someone else's turn \u{b7} click: off",
-            "autopilot: land, landed",
+            "autopilot: land, landed 17:42 \u{2014} the agent finished after the land \
+             instruction; the harness types nothing more until someone else's turn \u{b7} click: \
+             off \u{b7} right-click: more",
+            "autopilot: land, landed 17:42",
             "Autopilot: land. Landed at 17:42.",
         ),
         row(
@@ -164,9 +272,10 @@ fn rows() -> Vec<Row> {
             "\u{2713} done",
             "\u{2713}",
             (Amber, Amber),
-            "autopilot: land, done \u{2014} the agent said it was finished before a landing was \
-             asked; the harness types nothing more until someone else's turn \u{b7} click: off",
-            "autopilot: land, done",
+            "autopilot: land, done 17:42 \u{2014} the agent said it was finished before a \
+             landing was asked; the harness types nothing more until someone else's turn \u{b7} \
+             click: off \u{b7} right-click: more",
+            "autopilot: land, done 17:42",
             "Autopilot: land. Done at 17:42.",
         ),
         row(
@@ -188,24 +297,9 @@ fn rows() -> Vec<Row> {
             "\u{2913}",
             (Dim, Dim),
             "autopilot: land, quiet \u{2014} a person's own exchange; the harness types nothing \
-             until someone else's turn ends \u{b7} click: off",
+             until someone else's turn ends \u{b7} click: off \u{b7} right-click: more",
             "autopilot: land, quiet",
             "Autopilot: land. Quiet: a person is driving the session.",
-        ),
-        row(
-            AutopilotView::Land,
-            ChipGlass {
-                held: true,
-                ..told(TaskFace::Landed)
-            },
-            ChipFace::Held,
-            "\u{2913} held",
-            "\u{2913}",
-            (Dim, Dim),
-            "autopilot: land, held \u{2014} Codex is pursuing its /goal, and Land types nothing \
-             while it runs \u{b7} click: off",
-            "autopilot: land, held",
-            "Autopilot: land. Held while Codex pursues its goal.",
         ),
         row(
             AutopilotView::Off,
@@ -214,7 +308,7 @@ fn rows() -> Vec<Row> {
             "\u{25cb} off",
             "\u{25cb}",
             (Dim, Dim),
-            "autopilot: off \u{2014} hands off \u{b7} click: cruise",
+            "autopilot: off \u{2014} hands off \u{b7} click: cruise \u{b7} right-click: more",
             "autopilot: off",
             "Autopilot: off.",
         ),
@@ -225,9 +319,24 @@ fn rows() -> Vec<Row> {
             "\u{2298} off",
             "\u{2298}",
             (Dim, Dim),
-            "harness off in Settings \u{b7} click: open Settings \u{25b8} Harness",
+            "harness off in Settings \u{b7} click: open Settings \u{25b8} Harness \u{b7} right-click: \
+             more",
             "harness off in Settings",
             "Autopilot: off. The harness is off in Settings.",
+        ),
+        // §10.2.1: the master on and an agent's own switch off names the
+        // switch, as its Settings row does.
+        row(
+            AutopilotView::AgentOff(aterm_phase::Program::Claude),
+            ChipGlass::default(),
+            ChipFace::AgentOff(aterm_phase::Program::Claude),
+            "\u{2298} off",
+            "\u{2298}",
+            (Dim, Dim),
+            "Supervise Claude Code sessions is off \u{b7} click: open Settings \u{25b8} Harness \
+             \u{b7} right-click: more",
+            "Supervise Claude Code sessions is off",
+            "Autopilot: off. Supervise Claude Code sessions is off in Settings.",
         ),
         row(
             AutopilotView::Unhosted,
@@ -237,7 +346,7 @@ fn rows() -> Vec<Row> {
             "\u{2298}",
             (Dim, Dim),
             "no harness: this aterm has no control socket \u{b7} click: open Settings \u{25b8} \
-             Harness",
+             Harness \u{b7} right-click: more",
             "no harness: this aterm has no control socket",
             "Autopilot: off. This aterm has no control socket.",
         ),
@@ -272,14 +381,19 @@ fn the_face_table_gives_every_state_its_face_ink_titles_and_words() {
     for row in rows() {
         let what = format!("{:?} {:?}", row.view, row.glass);
         assert_eq!(ChipFace::of(row.view, &row.glass), row.face, "{what}");
+        assert_eq!(row.face.rung(), row.glyph, "{what}: the glyph-only rung");
         seen.insert(format!("{:?}", row.face));
         assert_eq!(row.face.tones(), row.tones, "{what}");
         assert_eq!(
-            autopilot_title(row.view, &row.glass, "", false),
+            autopilot_title(row.view, &row.glass, "", Some(TODAY)),
             (row.whole.clone(), row.short.to_owned()),
             "{what}"
         );
-        assert_eq!(row.face.spoken(&row.glass), row.spoken, "{what}");
+        assert_eq!(
+            row.face.spoken(&row.glass, Some(TODAY)),
+            row.spoken,
+            "{what}"
+        );
         if row.view == AutopilotView::Unhosted {
             // No host: neither harness chip is drawn (§2.3).
             let w = lights(row.view, row.glass);
@@ -299,7 +413,7 @@ fn the_face_table_gives_every_state_its_face_ink_titles_and_words() {
             "{what}"
         );
         assert_eq!(block.cols[0], (0..n, Chip::Autopilot), "{what}");
-        let glyph = row.glyph.chars().count();
+        let glyph = row.face.glyph().chars().count();
         let (glyph_ink, word_ink) = (ink(row.tones.0), ink(row.tones.1));
         assert!(
             block.lights[..glyph].iter().all(|c| c.fg == glyph_ink),
@@ -318,9 +432,7 @@ fn the_face_table_gives_every_state_its_face_ink_titles_and_words() {
                     s,
                     Chip::row().filter(|chip| on(*chip)),
                     Keep::Drawn,
-                    ACCENT,
-                    blank().fg,
-                    dim_of(blank())
+                    Inks::of(blank(), ACCENT)
                 ),
                 block.lights.len(),
                 "{what}"
@@ -354,56 +466,180 @@ fn the_face_table_gives_every_state_its_face_ink_titles_and_words() {
             "{view:?}"
         );
     }
+    // The task's face is Land's and Cruise's (§10.2), never Off's, the
+    // master switch's or an agent's own switch's.
     for view in [
-        AutopilotView::Cruise,
         AutopilotView::Off,
         AutopilotView::MasterOff,
+        AutopilotView::AgentOff(aterm_phase::Program::Claude),
     ] {
-        let held = ChipGlass {
-            held: true,
-            ..told(TaskFace::Landed)
-        };
-        assert_eq!(
-            ChipFace::of(view, &held),
-            ChipFace::of(view, &ChipGlass::default()),
-            "{view:?}: v1's face"
-        );
+        for face in TaskFace::ALL {
+            assert_eq!(
+                ChipFace::of(view, &told(face)),
+                ChipFace::of(view, &ChipGlass::default()),
+                "{view:?} {face:?}: v1's face"
+            );
+        }
     }
 }
 
+/// CRUISE SAYS DONE (§10.2.3, item 1; §10.2.5): over view × task face ×
+/// timer, under Cruise a done or landed face beats an armed timer (the timer
+/// moves to the title), and every other face — a person's own exchange, a
+/// spent landing Cruise never has, open, unknown — reads `Cruise`, or
+/// `CruiseUntil` with the timer; Land's faces are §9.4's, the timer no part
+/// of them. NEGATIVE CONTROL: the timer's face with no task's end is still
+/// the timer's.
+#[test]
+fn under_cruise_a_tasks_end_beats_the_timer_and_land_is_unchanged() {
+    let faces = std::iter::once(None).chain(TaskFace::ALL.into_iter().map(Some));
+    for task in faces {
+        for armed in [false, true] {
+            let glass = ChipGlass {
+                task,
+                task_at: Some(stamp(17, 42)),
+                land_at: armed.then(|| timer(18, 0, None).land_at).flatten(),
+                ..ChipGlass::default()
+            };
+            let cruise = match (task, armed) {
+                (Some(TaskFace::Done), _) => ChipFace::CruiseDone,
+                (Some(TaskFace::Landed), _) => ChipFace::CruiseLanded,
+                (_, true) => ChipFace::CruiseUntil,
+                (_, false) => ChipFace::Cruise,
+            };
+            assert_eq!(
+                ChipFace::of(AutopilotView::Cruise, &glass),
+                cruise,
+                "{task:?} armed={armed}"
+            );
+            let land = match task {
+                Some(TaskFace::Landed) => ChipFace::Landed,
+                Some(TaskFace::Done) => ChipFace::Done,
+                Some(TaskFace::Spent) => ChipFace::Spent,
+                Some(TaskFace::Theirs) => ChipFace::Theirs,
+                Some(TaskFace::Open) | None => ChipFace::Land,
+            };
+            assert_eq!(
+                ChipFace::of(AutopilotView::Land, &glass),
+                land,
+                "{task:?} armed={armed}"
+            );
+        }
+    }
+    assert_eq!(
+        ChipFace::of(AutopilotView::Cruise, &timer(18, 0, None)),
+        ChipFace::CruiseUntil,
+        "NEGATIVE CONTROL"
+    );
+}
+
+/// EVERY FACE CLOCK NAMES ITS DAY WHEN IT IS NOT TODAY (§10.2.3 items 3
+/// and 4; §10.2.5, "The day"): read against the day after the faces were
+/// told, each task's end carries its weekday in the whole title, the short
+/// title (`autopilot: land, landed Fri 17:42`) and the spoken label
+/// (`Landed on Friday at 17:42.`); read against its own day, or with no day
+/// read at all (a title laid with no reading), none does — the clock stands.
+/// NEGATIVE CONTROL: a face with no clock names no day either way.
+#[test]
+fn every_face_clock_names_its_day_when_it_is_not_today() {
+    let tomorrow = Some(TODAY + 1);
+    for (view, task, word) in [
+        (AutopilotView::Land, TaskFace::Landed, "landed"),
+        (AutopilotView::Land, TaskFace::Done, "done"),
+        (AutopilotView::Cruise, TaskFace::Done, "done"),
+        (AutopilotView::Cruise, TaskFace::Landed, "landed"),
+    ] {
+        let glass = told(task);
+        let face = ChipFace::of(view, &glass);
+        let what = format!("{view:?} {task:?}");
+        let (whole, short) = autopilot_title(view, &glass, "", tomorrow);
+        assert!(
+            short.ends_with(&format!("{word} Fri 17:42")),
+            "{what}: {short}"
+        );
+        assert!(whole.starts_with(&short), "{what}: {whole}");
+        let said = face.spoken(&glass, tomorrow);
+        assert!(said.ends_with(" on Friday at 17:42."), "{what}: {said}");
+        for today in [Some(TODAY), None] {
+            let (whole, short) = autopilot_title(view, &glass, "", today);
+            assert!(
+                short.ends_with(&format!("{word} 17:42")),
+                "{what} {today:?}: {short}"
+            );
+            assert!(!whole.contains("Fri"), "{what} {today:?}: {whole}");
+            let said = face.spoken(&glass, today);
+            assert!(
+                said.ends_with(" at 17:42.") && !said.contains("Friday"),
+                "{said}"
+            );
+        }
+    }
+    // NEGATIVE CONTROL: no clock, no day.
+    let quiet = told(TaskFace::Spent);
+    let (whole, short) = autopilot_title(AutopilotView::Land, &quiet, "", tomorrow);
+    assert!(!whole.contains("Fri"), "{whole}");
+    assert_eq!(short, "autopilot: land, quiet");
+}
+
 /// EACH MODE PHRASE HOLDS NO ` — ` AND NO ` · `: the short title is the
-/// phrase whole, with a trail and the menu's line or without them — so a
-/// narrow rule shows the mode, and the whole title always keeps the
-/// explanation ahead of the trail.
+/// phrase whole, with a trail or without one, the menu's line always last —
+/// so a narrow rule shows the mode, and the whole title always keeps the
+/// explanation ahead of the trail and says the menu is there (§9.3.2).
 #[test]
 fn each_mode_phrase_holds_no_cut_mark() {
     for row in rows() {
-        let phrase = row.face.phrase(&row.glass);
+        let phrase = row.face.phrase(&row.glass, Some(TODAY));
         assert!(
             !phrase.contains(" \u{2014} ") && !phrase.contains(" \u{b7} "),
             "{phrase}"
         );
         assert_eq!(phrase, row.short);
         let trail = "\u{2713} approved 14:05, \u{21bb} kept going 14:02";
-        for (trail, menu) in [("", true), (trail, false), (trail, true)] {
-            let (whole, short) = autopilot_title(row.view, &row.glass, trail, menu);
+        for trail in ["", trail] {
+            let (whole, short) = autopilot_title(row.view, &row.glass, trail, Some(TODAY));
             assert_eq!(short, row.short, "{whole}");
             assert_eq!(short_title(&whole), row.short, "{whole}");
-            assert_eq!(
-                whole.ends_with(" \u{b7} right-click: more"),
-                menu,
-                "{whole}"
+            assert!(whole.ends_with(" \u{b7} right-click: more"), "{whole}");
+            assert!(
+                !short.contains("right-click"),
+                "the short form gives the clicks up: {short}"
             );
             if !trail.is_empty() {
                 let at = whole.find(" \u{b7} last: ").expect("the trail");
-                let explained = row.face.explanation().map_or(0, |e| {
+                let explained = row.face.explanation(&row.glass).map_or(0, |e| {
                     whole.find(e.as_ref()).expect("the explanation") + e.len()
                 });
                 assert!(explained <= at, "the explanation leads the trail: {whole}");
                 assert!(whole.contains(&format!(" \u{b7} last: {trail} \u{b7} click: ")));
             }
+            // THE LEANER FORMS (finding 2 of the wiring's review): the whole
+            // without its trail, where it has one, then v1's words — the
+            // whole with neither the trail nor the menu's line — each wider
+            // than the short form and narrower than the one before.
+            let [no_trail, words] = lean_titles(&whole).map(|(head, tail)| format!("{head}{tail}"));
+            let (bare, _) = autopilot_title(row.view, &row.glass, "", Some(TODAY));
+            if trail.is_empty() {
+                assert_eq!(no_trail, "", "no trail, no form without one: {whole}");
+            } else {
+                assert_eq!(no_trail, bare, "the trail given up: {whole}");
+                assert!(no_trail.len() < whole.len());
+            }
+            assert_eq!(
+                Some(words.as_str()),
+                bare.strip_suffix(" \u{b7} right-click: more"),
+                "the menu's line given up too: {whole}"
+            );
+            assert!(words.starts_with(row.short) && words.len() > row.short.len());
+            assert!(
+                words.contains(" \u{b7} click: "),
+                "the click stays: {words}"
+            );
+            assert_eq!(short_title(&words), row.short, "{words}");
         }
     }
+    // NEGATIVE CONTROL: a title that is no Autopilot whole title has none.
+    assert_eq!(lean_titles(SETTINGS_TITLE), [("", ""); 2]);
+    assert_eq!(lean_titles("autopilot: cruise"), [("", ""); 2]);
 }
 
 /// EACH SPOKEN LABEL HOLDS NO GLYPH: letters, digits, spaces and `.:,`
@@ -419,23 +655,20 @@ fn each_spoken_label_holds_no_glyph() {
         assert!(row.spoken.starts_with("Autopilot: "), "{}", row.spoken);
     }
     for act in Act::ALL {
-        let glass = ChipGlass {
-            last: Some((act, clock(14, 5))),
-            ..ChipGlass::default()
-        };
-        let said = spoken_last(&glass).expect("an act");
-        assert!(words(&said), "{said}");
-        assert!(said.ends_with(" at 14:05."), "{said}");
+        for day in [None, Some(Weekday::Thu)] {
+            let said = spoken_last(act, clock(14, 5), day);
+            assert!(words(&said), "{said}");
+            assert!(said.ends_with(" at 14:05."), "{said}");
+        }
     }
-    assert_eq!(spoken_last(&ChipGlass::default()), None);
-    // §9.2.1's own words.
-    let approved = ChipGlass {
-        last: Some((Act::Approved, clock(14, 5))),
-        ..ChipGlass::default()
-    };
+    // §9.2.1's own words, and an act from another day with its weekday.
     assert_eq!(
-        spoken_last(&approved).as_deref(),
-        Some("Last: approved at 14:05.")
+        spoken_last(Act::Approved, clock(14, 5), None),
+        "Last: approved at 14:05."
+    );
+    assert_eq!(
+        spoken_last(Act::Approved, clock(23, 58), Some(Weekday::Thu)),
+        "Last: approved on Thursday at 23:58."
     );
     // A face told where the zone could not be read says no time.
     let unplaced = ChipGlass {
@@ -443,14 +676,16 @@ fn each_spoken_label_holds_no_glyph() {
         ..ChipGlass::default()
     };
     assert_eq!(
-        ChipFace::Landed.spoken(&unplaced),
+        ChipFace::Landed.spoken(&unplaced, Some(TODAY)),
         "Autopilot: land. Landed."
     );
 }
 
-/// EACH `GlyphOnly` RUNG is the face's glyph alone, in the glyph's ink —
-/// `∞`, `⤓`, `✓`, `○`, `⊘` — with `⚙` and every light given up, and
-/// measured as laid out. A click in flight is `◐` there as everywhere.
+/// EACH `GlyphOnly` RUNG is the face's rung alone, in the glyph's ink —
+/// `∞`, `⤓`, `✓`, `○`, `⊘`, and Cruise's done and landed `✓` (§10.2.3, item
+/// 1), never their `∞` — with `⚙` and every light given up, and measured as
+/// laid out. A click in flight is `◐` there as everywhere. NEGATIVE CONTROL:
+/// only Cruise's two ends have a rung that is not their glyph.
 #[test]
 fn each_glyph_only_rung_is_the_glyph_alone() {
     let now = Instant::now();
@@ -474,9 +709,7 @@ fn each_glyph_only_rung_is_the_glyph_alone() {
                 s,
                 Chip::row().filter(|chip| on(*chip)),
                 Keep::GlyphOnly,
-                ACCENT,
-                blank().fg,
-                dim_of(blank())
+                Inks::of(blank(), ACCENT)
             ),
             block.lights.len(),
             "{what}"
@@ -494,13 +727,18 @@ fn each_glyph_only_rung_is_the_glyph_alone() {
         Some(&Keep::GlyphOnly),
         "the ladder's last rung"
     );
+    let apart: Vec<ChipFace> = ChipFace::ALL
+        .into_iter()
+        .filter(|face| face.rung() != face.glyph())
+        .collect();
+    assert_eq!(apart, [ChipFace::CruiseDone, ChipFace::CruiseLanded]);
 }
 
 /// A NARROW RULE GIVES A STANDING FACE DOWN TO ITS GLYPH (§9.3.2), and v1's
 /// faces as v1 did. Walked from a room that holds both chips down to none,
 /// each state's Autopilot chip is its whole face beside `⚙`, then its whole
 /// face alone, then — for a standing face of v2's alone (`∞ ⤓18:00`,
-/// `✓ landed`, `✓ done`, `⤓ quiet`, `⤓ held`) — its glyph alone, in the
+/// `✓ landed`, `✓ done`, `⤓ quiet`) — its glyph alone, in the
 /// glyph's ink and holding the room, down to one cell. v1's faces (`∞`,
 /// `⤓ land`, `○ off`, `⊘ off`) give the chip up whole below their width,
 /// as v1's ladder did, so the default glass draws nothing new. No chip comes
@@ -513,13 +751,14 @@ fn a_narrow_rule_gives_a_standing_face_down_to_its_glyph() {
         standing,
         [
             ChipFace::CruiseUntil,
+            ChipFace::CruiseDone,
+            ChipFace::CruiseLanded,
             ChipFace::Landed,
             ChipFace::Done,
             ChipFace::Spent,
             ChipFace::Theirs,
-            ChipFace::Held,
         ],
-        "CONTROL: v2's standing faces"
+        "CONTROL: v2's standing faces, and v3's Cruise ends"
     );
     for view in AutopilotView::ALL {
         assert!(
@@ -565,8 +804,9 @@ fn a_narrow_rule_gives_a_standing_face_down_to_its_glyph() {
 }
 
 /// THE DEFAULT GLASS IS v1's CHIP: for every view its face, inks, titles
-/// (no trail, no menu) and repaint term are v1's, so nothing a person sees
-/// moves until a fact is told.
+/// (no trail: v1's words, then the menu's line, §9.2.1) and repaint term
+/// are v1's, so nothing a person sees moves until a fact is told but the
+/// title's offer of the menu.
 #[test]
 fn the_default_glass_is_v1s_chip() {
     let now = Instant::now();
@@ -580,15 +820,25 @@ fn the_default_glass_is_v1s_chip() {
         assert_eq!(drawn, view.label(), "{view:?}");
         assert_eq!(face.tones(), (view.tone(), view.tone()), "{view:?}");
         assert_eq!(face.clock(&rest), None, "{view:?}");
-        let (whole, short) = autopilot_title(view, &rest, "", crate::autopilot_menu::OPENS);
-        assert_eq!(whole, view.title(), "{view:?}");
+        let (whole, short) = autopilot_title(view, &rest, "", None);
+        assert_eq!(
+            whole,
+            format!("{} \u{b7} right-click: more", view.title()),
+            "{view:?}"
+        );
         assert_eq!(short, short_title(view.title()), "{view:?}");
+        let [_, (head, tail)] = lean_titles(&whole);
+        assert_eq!(
+            format!("{head}{tail}"),
+            view.title(),
+            "{view:?}: v1's words"
+        );
         let mut w = WindowLights::default();
         w.note_autopilot(7, view.mode(), view, now);
         let v1 = |word: Option<Autopilot>| word.map_or(0, |w| 1 + w as u64);
         assert_eq!(
             w.autopilot_term(7, view.mode(), view, rest),
-            v1(view.mode()) | (view as u64) << 8,
+            v1(view.mode()) | view.code() << 8,
             "{view:?}"
         );
     }
@@ -597,26 +847,25 @@ fn the_default_glass_is_v1s_chip() {
 
 /// THE AUTOPILOT TITLE IS SIZED ONCE: built on every frame a hover or a
 /// selection is up, a face of v1's costs two allocations — the whole title
-/// and the short — as v1's copies of its static titles did, with the menu's
-/// line or without it; never one regrowth per part. CONTROL: the parts are
-/// all there (the title is v1's).
+/// and the short — as v1's copies of its static titles did, the menu's line
+/// sized in; never one regrowth per part. CONTROL: the parts are all there
+/// (the title is v1's, then the menu's line).
 #[test]
 fn the_autopilot_title_is_sized_once() {
     let rest = ChipGlass::default();
     for view in AutopilotView::ALL {
-        for menu in [false, true] {
-            let ((whole, short), allocations) =
-                crate::work_counts::allocations_in(|| autopilot_title(view, &rest, "", menu));
-            assert_eq!(allocations, 2, "{view:?} menu={menu}: {whole}");
-            assert!(whole.starts_with(view.title()), "CONTROL {view:?}: {whole}");
-            assert_eq!(short, short_title(view.title()), "CONTROL {view:?}");
-        }
+        let ((whole, short), allocations) =
+            crate::work_counts::allocations_in(|| autopilot_title(view, &rest, "", None));
+        assert_eq!(allocations, 2, "{view:?}: {whole}");
+        assert!(whole.starts_with(view.title()), "CONTROL {view:?}: {whole}");
+        assert!(whole.ends_with("right-click: more"), "CONTROL {view:?}");
+        assert_eq!(whole.capacity(), whole.len(), "sized exactly: {whole}");
+        assert_eq!(short, short_title(view.title()), "CONTROL {view:?}");
     }
-    // A trail and the menu's line are sized in too: one more part, no
-    // regrowth.
+    // A trail is sized in too: one more part, no regrowth.
     let trail = "\u{2713} approved 14:05";
     let ((whole, _), allocations) = crate::work_counts::allocations_in(|| {
-        autopilot_title(AutopilotView::Cruise, &rest, trail, true)
+        autopilot_title(AutopilotView::Cruise, &rest, trail, None)
     });
     assert_eq!(allocations, 2, "{whole}");
     assert_eq!(whole.capacity(), whole.len(), "sized exactly: {whole}");
@@ -627,10 +876,10 @@ fn the_autopilot_title_is_sized_once() {
 struct Unpacked {
     lit: Option<Act>,
     task: Option<TaskFace>,
-    held: bool,
     minute: Option<u16>,
     other_day: bool,
     trail: u8,
+    weekday: Option<Weekday>,
 }
 
 fn unpack(term: u64) -> Unpacked {
@@ -656,20 +905,39 @@ fn unpack(term: u64) -> Unpacked {
         0,
         "v1's bits are the word's, view's and click's"
     );
-    assert_eq!(term >> 56, 0, "bits 56–63 are spare");
+    assert_eq!(term >> 59, 0, "bits 59–63 are spare");
+    assert_eq!(
+        field(35, 1),
+        0,
+        "bit 35 is spare (the retired Codex goal hold)"
+    );
     Unpacked {
         lit,
         task,
-        held: field(35, 1) == 1,
         minute,
         other_day: field(47, 1) == 1,
         trail: u8::try_from(field(48, 8)).unwrap(),
+        weekday: match field(56, 3) {
+            0 => None,
+            n => Some(
+                [
+                    Weekday::Mon,
+                    Weekday::Tue,
+                    Weekday::Wed,
+                    Weekday::Thu,
+                    Weekday::Fri,
+                    Weekday::Sat,
+                    Weekday::Sun,
+                ][usize::try_from(n - 1).unwrap()],
+            ),
+        },
     }
 }
 
-/// THE BIT TABLE ROUND TRIPS: every act, face, hold, timer minute (the
-/// day's first and last among them), other-day bit and trail generation
-/// packs into its own bits and reads back — open reading as unknown (both
+/// THE BIT TABLE ROUND TRIPS: every act, face, timer minute (the
+/// day's first and last among them), other-day bit, trail generation and
+/// other day's weekday (bits 56–58, 2c74954acc) packs into its own bits
+/// and reads back — open reading as unknown (both
 /// draw Land's own face), and the trail only while the title is read.
 #[test]
 fn the_autopilot_terms_bit_table_round_trips() {
@@ -677,40 +945,37 @@ fn the_autopilot_terms_bit_table_round_trips() {
     for lit in acts {
         let faces = std::iter::once(None).chain(TaskFace::ALL.into_iter().map(Some));
         for task in faces {
-            for held in [false, true] {
-                for at in [
-                    None,
-                    Some((0, None)),
-                    Some((1439, Some(Weekday::Sun))),
-                    Some((1080, None)),
-                ] {
-                    for (trail, reading) in [(0, true), (7, true), (255, true), (9, false)] {
-                        let glass = ChipGlass {
+            for at in [
+                None,
+                Some((0, None)),
+                Some((1439, Some(Weekday::Sun))),
+                Some((1080, None)),
+            ] {
+                for (trail, reading) in [(0, true), (7, true), (255, true), (9, false)] {
+                    let glass = ChipGlass {
+                        lit,
+                        task,
+                        task_at: Some(stamp(17, 42)),
+                        land_at: at.map(|(minute, other_day)| LandAtGlass {
+                            clock: Clock::of_minute(minute),
+                            other_day,
+                        }),
+                        last: Some((Act::Approved, stamp(14, 5))),
+                        trail,
+                    };
+                    let back = unpack(glass_bits(glass, reading));
+                    assert_eq!(
+                        back,
+                        Unpacked {
                             lit,
-                            task,
-                            task_at: Some(clock(17, 42)),
-                            land_at: at.map(|(minute, other_day)| LandAtGlass {
-                                clock: Clock::of_minute(minute),
-                                other_day,
-                            }),
-                            held,
-                            last: Some((Act::Approved, clock(14, 5))),
-                            trail,
-                        };
-                        let back = unpack(glass_bits(glass, reading));
-                        assert_eq!(
-                            back,
-                            Unpacked {
-                                lit,
-                                task: task.filter(|f| *f != TaskFace::Open),
-                                held,
-                                minute: at.map(|(m, _)| m),
-                                other_day: at.is_some_and(|(_, d)| d.is_some()),
-                                trail: if reading { trail } else { 0 },
-                            },
-                            "{glass:?} reading={reading}"
-                        );
-                    }
+                            task: task.filter(|f| *f != TaskFace::Open),
+                            minute: at.map(|(m, _)| m),
+                            other_day: at.is_some_and(|(_, d)| d.is_some()),
+                            trail: if reading { trail } else { 0 },
+                            weekday: at.and_then(|(_, d)| d),
+                        },
+                        "{glass:?} reading={reading}"
+                    );
                 }
             }
         }
@@ -767,6 +1032,56 @@ fn the_trail_moves_the_term_only_while_the_chip_is_read() {
     assert_ne!(term(&w, 3), term(&w, 4), "the keyboard reads it");
 }
 
+/// A FACE THAT KEEPS ITS KIND AND MOVES ITS CLOCK REPAINTS A TITLE BEING
+/// READ (§10.2, slice 1c: the title carries the face's clock, `done 17:42`
+/// then `done 18:05`): the footer's term moves while the Autopilot chip is
+/// hovered, and not while no one reads its title, which a frame at rest
+/// does not draw.
+///
+/// NEGATIVE CONTROL: the moved glass with the trail's generation where it
+/// was leaves the term being read where it was — the clock has no bits of
+/// its own, so without the generation's move the title kept `17:42`.
+#[test]
+fn a_face_clock_that_moves_under_its_face_repaints_the_title_being_read() {
+    let mut app = App::headless_for_test();
+    let mut w = WindowLights::default();
+    let term =
+        |w: &WindowLights, glass: ChipGlass| w.autopilot_term(7, None, AutopilotView::Land, glass);
+    assert!(crate::harness_glass::on_task(
+        &mut app,
+        7,
+        Some(TaskFace::Done),
+        1_792_249_200_000
+    ));
+    let before = app.chip_glass(7);
+    let at_rest = term(&w, before);
+    w.hover = Some((7, Chip::Autopilot));
+    let read = term(&w, before);
+    assert!(crate::harness_glass::on_task(
+        &mut app,
+        7,
+        Some(TaskFace::Done),
+        1_792_250_700_000
+    ));
+    let after = app.chip_glass(7);
+    assert_eq!(after.task, before.task, "the same face");
+    assert_ne!(after.task_at, before.task_at, "its clock moved");
+    assert_ne!(term(&w, after), read, "the title being read is built again");
+    w.hover = None;
+    assert_eq!(
+        term(&w, after),
+        at_rest,
+        "no one reads it: nothing repaints"
+    );
+    // NEGATIVE CONTROL: the clock alone moves no bit.
+    w.hover = Some((7, Chip::Autopilot));
+    let clock_alone = ChipGlass {
+        trail: before.trail,
+        ..after
+    };
+    assert_eq!(term(&w, clock_alone), read);
+}
+
 /// THE ACT'S LABEL is its glyph and word in the chip's ink, and the clock
 /// and the weekday are the table's: `HH:MM` both ways, 1970-01-01 a
 /// Thursday.
@@ -795,35 +1110,137 @@ fn the_acts_label_and_the_glass_clock_are_the_tables() {
     );
 }
 
-/// A CODEX GOAL'S HOLD REACHES THE CHIP THROUGH THE APP's seam
-/// (`App::note_codex_goal_hold`, §9.5.4), so the Codex chips never edit the
-/// glass's reader: held, the session's glass holds and under Land its face is
-/// `⤓ held`, with the repaint term moved; told again it is no move; another
-/// session's glass stays v1's. Let go — or its session retired — the glass
-/// is v1's again and nothing is kept, so the frame looks nothing up.
-/// CONTROL: before any hold, the glass is v1's.
+/// LAND'S AMBER CLEARS THE TEXT FLOOR ON EVERY BUILT-IN THEME (the surfaces
+/// hunt's F2: `⤓ land` was the fixed `#E8B03C`, 1.88:1 on Aterm Day's
+/// `#f8fafd`): drawn on each built-in scheme's own ground, every amber cell
+/// — Land's `⤓ land`, its `✓ done`, a timed Cruise's `⤓18:00` and Land's act
+/// label — clears 4.5:1, the floor chrome's warn ink takes on the same
+/// themes (`chrome_band`'s `band_colors_meet_wcag_aa_on_every_builtin_scheme`);
+/// where the amber already clears it (the dark themes) it is the amber
+/// itself, the auto pill's hue. NEGATIVE CONTROL: the fixed amber is under
+/// the floor on some built-in ground, Aterm Day's among them.
 #[test]
-fn a_codex_goal_hold_reaches_the_chip_through_the_app() {
-    let mut app = App::headless_for_test();
-    assert_eq!(app.chip_glass(7), ChipGlass::default(), "CONTROL");
-    assert!(app.note_codex_goal_hold(7, true), "a hold is a move");
-    assert!(!app.note_codex_goal_hold(7, true), "told again: no move");
-    let held = app.chip_glass(7);
-    assert!(held.held);
-    assert_eq!(ChipFace::of(AutopilotView::Land, &held), ChipFace::Held);
-    assert_eq!(app.chip_glass(8), ChipGlass::default(), "another session's");
-    let w = WindowLights::default();
-    let land = Some(Autopilot::Land);
-    assert_ne!(
-        w.autopilot_term(7, land, AutopilotView::Land, held),
-        w.autopilot_term(7, land, AutopilotView::Land, ChipGlass::default()),
-        "the hold moves the repaint term"
+fn lands_amber_clears_the_text_floor_on_every_builtin_theme() {
+    use crate::chrome_band::contrast;
+    let now = Instant::now();
+    let rgb = |c: u32| [(c >> 16) as u8, (c >> 8) as u8, c as u8];
+    let mut under = Vec::new();
+    for name in aterm_types::scheme::builtin_names() {
+        let scheme = aterm_types::scheme::builtin(name).expect("a listed scheme exists");
+        let theme = aterm_render::Theme::from(&scheme);
+        let ground = rgb(theme.bg);
+        let row = RenderCell {
+            ch: ' ',
+            fg: rgb(theme.fg),
+            bg: ground,
+            ..RenderCell::default()
+        };
+        if contrast(AMBER, ground) < CHIP_INK_FLOOR {
+            under.push(name);
+        }
+        let floored = land_ink(ground);
+        assert!(
+            contrast(floored, ground) >= CHIP_INK_FLOOR,
+            "{name}: {floored:?} on {ground:?}"
+        );
+        if contrast(AMBER, ground) >= CHIP_INK_FLOOR {
+            assert_eq!(floored, AMBER, "{name}: the amber itself where it clears");
+        }
+        for (view, glass, amber) in [
+            (AutopilotView::Land, ChipGlass::default(), 0..6),
+            (AutopilotView::Land, told(TaskFace::Done), 0..6),
+            (AutopilotView::Cruise, timer(18, 0, None), 2..8),
+        ] {
+            let w = lights(view, glass);
+            let block = w.block(7, row, now, ACCENT, Keep::Drawn);
+            let cells = &block.lights[amber.clone()];
+            assert!(
+                cells.iter().all(|c| c.fg == floored),
+                "{name} {view:?}: {:?}",
+                text(cells)
+            );
+        }
+        // Land's act label, in the chip's ink.
+        let mut w = lights(
+            AutopilotView::Land,
+            ChipGlass {
+                lit: Some(Act::Approved),
+                ..ChipGlass::default()
+            },
+        );
+        w.hover = None;
+        let block = w.block(7, row, now, ACCENT, Keep::Drawn);
+        let label: Vec<&RenderCell> = block.title.iter().filter(|c| c.ch != ' ').collect();
+        assert!(!label.is_empty(), "{name}: the act's label");
+        assert!(
+            label.iter().all(|c| c.fg == floored),
+            "{name}: the act's label in Land's ink"
+        );
+    }
+    assert!(
+        under.contains(&"Aterm Day"),
+        "NEGATIVE CONTROL: the fixed amber fails a light ground: {under:?}"
     );
-    assert!(app.note_codex_goal_hold(7, false), "let go: a move");
-    assert!(!app.note_codex_goal_hold(7, false));
-    assert_eq!(app.chip_glass(7), ChipGlass::default());
-    assert!(app.codex_goal_holds.is_empty());
-    app.note_codex_goal_hold(9, true);
-    app.retire_session_registration(9);
-    assert!(app.codex_goal_holds.is_empty(), "retired with its session");
+}
+
+/// THE PERMISSION LIGHT'S OWN HUE CLEARS THE SAME FLOOR (the honest chip's
+/// review, finding 4: F2's defect on the light beside Land's chip): the mode
+/// light in Claude Code's bypass red or auto amber — drawn at rest only where
+/// it deviates, and in those hues where it is hovered or selected, just
+/// switched, refused or revealed — is floored on each built-in scheme's own
+/// ground as Land's amber is, its glyph and its word alike, and is the hue
+/// itself wherever that already clears 4.5:1 (every dark theme).
+///
+/// NEGATIVE CONTROL: both fixed hues are under the floor on Aterm Day's
+/// ground (`#e8b03c` 1.88:1, `#e05a5a` 3.47:1).
+#[test]
+fn the_lights_own_hue_clears_the_text_floor_on_every_builtin_theme() {
+    use crate::chrome_band::contrast;
+    let now = Instant::now();
+    let rgb = |c: u32| [(c >> 16) as u8, (c >> 8) as u8, c as u8];
+    let mut under = Vec::new();
+    for name in aterm_types::scheme::builtin_names() {
+        let scheme = aterm_types::scheme::builtin(name).expect("a listed scheme exists");
+        let theme = aterm_render::Theme::from(&scheme);
+        let ground = rgb(theme.bg);
+        let row = RenderCell {
+            ch: ' ',
+            fg: rgb(theme.fg),
+            bg: ground,
+            ..RenderCell::default()
+        };
+        for mode in [Mode::Auto, Mode::Bypass] {
+            let hue = mode.hue().expect("Claude gives it a hue");
+            if contrast(hue, ground) < CHIP_INK_FLOOR {
+                under.push((name, mode));
+            }
+            let mut w = lights(AutopilotView::Cruise, ChipGlass::default());
+            w.sessions.get_mut(&7).expect("session 7").shown.mode = Some(mode);
+            w.hover = Some((7, Chip::Light(Light::Mode)));
+            let block = w.block(7, row, now, ACCENT, Keep::Drawn);
+            let pill: String = format!("{} {}", mode.glyph(), mode.word());
+            let all = text(&block.lights);
+            let at = all
+                .find(&pill)
+                .unwrap_or_else(|| panic!("{name} {mode:?}: the light drawn: {all:?}"));
+            let first = all[..at].chars().count();
+            let cells = &block.lights[first..first + pill.chars().count()];
+            for cell in cells.iter().filter(|c| c.ch != ' ') {
+                assert!(
+                    contrast(cell.fg, ground) >= CHIP_INK_FLOOR,
+                    "{name} {mode:?}: {:?} on {ground:?}",
+                    cell.fg
+                );
+                if contrast(hue, ground) >= CHIP_INK_FLOOR {
+                    assert_eq!(cell.fg, hue, "{name} {mode:?}: the hue itself");
+                }
+            }
+        }
+    }
+    for mode in [Mode::Auto, Mode::Bypass] {
+        assert!(
+            under.contains(&("Aterm Day", mode)),
+            "NEGATIVE CONTROL: the fixed {mode:?} hue fails a light ground: {under:?}"
+        );
+    }
 }

@@ -43,21 +43,11 @@
 //!   upgrade) and `upgrade models` (its model priority list), plus the
 //!   retired hook-bridge verbs answered as tombstones.
 //! * [`upgrade`], [`upgrade_drive`], [`upgrade_wake`] — THE LIVE UPGRADE of a
-//!   running Claude Code or Codex onto a newer build: the pure plan, its steps
+//!   running Claude Code onto a newer build (a codex-alab's restart is
+//!   carried by [`codex_alab`]'s relaunch, never moved live): the pure plan, its steps
 //!   over one tab or every session, and atpkg's activation notice as a push.
 //!   The window's supervisor host takes the steps at each session's idle
 //!   points.
-//! * [`goal_hold`] — THE ONE RECORD OF A CODEX GOAL ATERM PAUSED, per tab:
-//!   which lane holds it (the live upgrade, for its move; the save-then-wait
-//!   switch) and what it still owes — written before each key, so a
-//!   restarted host resumes the goal once, and the two lanes never both hold
-//!   it.
-//! * [`upgrade_codex`] — the same step's CODEX branch, its pure half (the
-//!   daemon rule, the flag table, the exit hint, the rollout and composer
-//!   readers); its I/O half is `upgrade_drive`'s `codex` module. Codex's
-//!   shared daemon is moved first by the vendor's own verb, then each TUI by
-//!   a typed `/exit` and `codex resume` through [`relaunch`]'s line — never a
-//!   signal.
 //! * [`upgrade_models`], [`upgrade_catalog`] — THE MODEL HALF of the live
 //!   upgrade: the priority list (grown from Claude Code's own
 //!   recommendations), the managed build's baked catalog, and THE MODEL
@@ -66,20 +56,27 @@
 //!   chose; never down — on its relaunch line (`--model`, never `/model`).
 //! * [`lanes`] — WHICH LANES ARE WRITTEN FOR AN AGENT: the relaunch on exit,
 //!   the live upgrade and the restart in place, one [`lanes::Lanes`] per
-//!   program. agy is supervised with none (its exit is not relaunched, its
-//!   build not moved live), and Muse Code is not supervised.
+//!   program. Muse Code has the relaunch on exit (and so the restore) alone;
+//!   agy and Gemini CLI are supervised with none (an exit is not relaunched,
+//!   a build not moved live).
+//! * [`upgrade_muse`] — the MUSE CODE lane's pure half (relaunch on exit and
+//!   restore, no live upgrade): its flag table, the UUID-only session id, its
+//!   own exit table (a start it refused is no crash), the session-log
+//!   fallback and the `.session.lock` witness; its I/O half is
+//!   `upgrade_drive`'s `muse` module.
 //! * [`relaunch`] — THE RELAUNCH PRIMITIVE both the upgrade and relaunch on
 //!   exit use: an agent that no longer runs started again in its own tab, on
-//!   its own conversation (Claude Code's `--resume`, Codex's `resume`), and
-//!   the host's per-session back-off.
+//!   its own conversation (Claude Code's `--resume`, codex-alab's validated
+//!   line, Muse Code's `resume <uuid>`), and the host's per-session back-off.
 //! * [`resume`] — THE RESUME COMMAND a person is told to run for an agent
 //!   the harness cannot bring back itself: for Claude Code, `claude --resume
 //!   <this process's own conversation>` with its launch flags carried, read
 //!   from Claude Code's own `sessions/<pid>.json` — never `claude
 //!   --continue`, which resumes the directory's newest conversation, a
-//!   sibling tab's where two share it; for Codex, `codex resume <its kept
-//!   flags> <its thread>` ([`resume::codex_command`]), none where the thread
-//!   is not its own beyond doubt.
+//!   sibling tab's where two share it; for Muse Code, its own `muse resume
+//!   <uuid>` ([`upgrade_muse::told_line`]) behind the data and config homes
+//!   it ran under. None for a Codex: codex-alab comes back on the line
+//!   aterm's copy of its own record validated.
 //! * [`netwatch`] — THE API'S REACH, pure: which route an agent takes, what
 //!   one probe of the default route may conclude, and the one instance's
 //!   measure and schedule while a supervised session waits at a wall the
@@ -119,12 +116,13 @@
 //! names (in this module's tests, the window host's, or
 //! `aterm-agent/tests/conformance_*`). The footer reader's machine is
 //! `ClaudeFooterModel` (`tests/conformance_footer_model.rs`); the disk
-//! cleaner ([`disk`]) has no derived model. The Codex branch has run end to end
-//! against a REAL Codex through the window's own host
-//! (`targo --unverified lab codex-upgrade`); one of three full runs left an
-//! embedded session's carry-on owed, cause not captured. Nothing here has run
-//! against a REAL exhausted window: the `/usage` panel reader is exercised
-//! against captured and hand-built fixtures.
+//! cleaner ([`disk`]) has no derived model. codex-alab's watch beside its own
+//! harness (the proven claim, the crash relaunch on its validated line) runs
+//! end to end against the REAL package through a private headless aterm in
+//! `targo --unverified lab codex-alab-proof` (`docs/measured/`); no vendor
+//! Codex is supervised (the Codex screen lane's retirement, 2026-10-16).
+//! Nothing here has run against a REAL exhausted window: the `/usage` panel
+//! reader is exercised against captured and hand-built fixtures.
 
 /// The harness's mark as a literal ([`upgrade::HARNESS_MARK`] is this), for
 /// the texts `concat!` builds on it: every turn the harness types into an
@@ -142,9 +140,10 @@ pub mod accounts;
 pub mod acts;
 pub mod align;
 pub mod cli;
+pub mod codex_alab;
+pub mod codex_rollout;
 pub mod disk;
 pub mod footer;
-pub mod goal_hold;
 pub mod lanes;
 pub mod lights;
 pub mod netwatch;
@@ -159,12 +158,16 @@ pub mod source;
 pub mod spend;
 pub mod stats;
 pub mod tap;
+/// The harness's clock: every bounded wait of the live upgrade and the
+/// relaunch, as one value ([`Timings`]).
+pub mod timings;
+pub use timings::Timings;
 pub(crate) mod transcript;
 pub mod upgrade;
 pub mod upgrade_catalog;
-pub mod upgrade_codex;
 pub mod upgrade_drive;
 pub mod upgrade_models;
+pub mod upgrade_muse;
 pub mod upgrade_wake;
 pub mod usage;
 
@@ -224,6 +227,42 @@ fn is_one_line_already(text: &str) -> bool {
 #[cfg(all(test, unix))]
 struct FakeInstanceLease;
 
+/// How many fixtures may be open at once ([`FakeInstanceLease`]): four under
+/// a soft descriptor limit below a thousand — macOS's default is 256, and the
+/// 18-worker suite peaked at 226 descriptors with no bound — and no bound
+/// where the process may hold a thousand or more. The soft limit is raised
+/// toward 4096, within the hard limit, the first time a fixture is asked for:
+/// the bound was the descriptors', and four fixtures at a time held every
+/// other fixture test in a queue.
+#[cfg(all(test, unix))]
+fn fake_instance_bound() -> usize {
+    static BOUND: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BOUND.get_or_init(|| {
+        const WANT: libc::rlim_t = 4096;
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `getrlimit` writes the one `rlimit` it is handed, which
+        // lives on this frame.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut lim) } != 0 {
+            return 4;
+        }
+        if lim.rlim_cur < WANT && lim.rlim_max > lim.rlim_cur {
+            let raised = libc::rlimit {
+                rlim_cur: lim.rlim_max.min(WANT),
+                rlim_max: lim.rlim_max,
+            };
+            // SAFETY: `setrlimit` reads the one `rlimit` it is handed; a
+            // refusal leaves the limit as it was.
+            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const raised) } == 0 {
+                lim.rlim_cur = raised.rlim_cur;
+            }
+        }
+        if lim.rlim_cur >= 1024 { usize::MAX } else { 4 }
+    })
+}
+
 #[cfg(all(test, unix))]
 static FAKE_INSTANCE_ADMISSION: (std::sync::Mutex<usize>, std::sync::Condvar) =
     (std::sync::Mutex::new(0), std::sync::Condvar::new());
@@ -244,7 +283,8 @@ impl FakeInstanceLease {
             let (admission, changed) = &FAKE_INSTANCE_ADMISSION;
             let mut active = admission.lock().unwrap_or_else(|e| e.into_inner());
             let until = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
-            while *active >= 4 {
+            let bound = fake_instance_bound();
+            while *active >= bound {
                 let remaining = until
                     .checked_duration_since(std::time::Instant::now())
                     .expect("a control fixture did not release its resource lease");
@@ -451,6 +491,10 @@ impl Drop for FakeInstanceServer {
 }
 
 #[cfg(test)]
+#[path = "alab_marker_cross_tests.rs"]
+mod alab_marker_cross_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{one_line, truncate_bytes};
 
@@ -458,9 +502,7 @@ mod tests {
     fn one_line_folds_what_a_hand_rolled_control_sweep_misses() {
         assert_eq!(one_line("  a \n b  ", 99), "a b");
         assert_eq!(one_line("with\ta tab", 99), "with a tab");
-        // Negative control: `U+2028` is Zl, not Cc, so `char::is_control()` is
-        // false for it and a local sweep would pass it through.
-        assert!(!'\u{2028}'.is_control());
+        // `U+2028` is Zl, not Cc: a `char::is_control()` sweep would pass it.
         assert_eq!(one_line("a\u{2028}b", 99), "a b");
         assert_eq!(one_line("a\u{2029}b", 99), "a b");
         // The cut is a BYTE cut on a character boundary, taken before the

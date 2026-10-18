@@ -30,7 +30,7 @@ fn consumed_press_release_is_swallowed_exactly_once() {
     let wid = WindowId(0);
     let key = PhysicalKey::Code(KeyCode::KeyA);
     let other = PhysicalKey::Code(KeyCode::KeyB);
-    let model = aterm_spec::derive::input_release_pairing_model();
+    let model = aterm_models_misc::input_release_pairing_model();
     let mut state = model.init_state();
     // No tracked press yet: a normal key's release is forwarded.
     assert!(
@@ -81,7 +81,7 @@ fn repeat_does_not_note_and_release_is_not_swallowed() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     let key = PhysicalKey::Code(KeyCode::PageUp);
-    let model = aterm_spec::derive::input_release_pairing_model();
+    let model = aterm_models_misc::input_release_pairing_model();
     let mut state = model.init_state();
     pairing_step(&model, &mut state, "ForwardPress");
     // The press fell through to the encoder; repeat notes are no-ops, so the

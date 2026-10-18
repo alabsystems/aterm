@@ -11,16 +11,11 @@
 //! HOME, so a world never meets another run's daemons or the machine's own.
 //! `harness::boot_permit` caps the tests holding live stacks at once.
 //!
-//! libtest starts tests in name order, so a test whose length is the bridge's
-//! own pacing rather than the machine's sits in a module that sorts first and
-//! overlaps the rest instead of trailing them: `bridge_budget`.
-//!
 //! `two_nodes_sealed` is a target of its own: it needs `--features sealed`.
 #![cfg(unix)]
 
 mod harness;
 
-mod bridge_budget;
 mod bridge_e2e;
 mod bridge_line_bound;
 mod bridge_oversize;
@@ -31,8 +26,8 @@ mod doctor_retire;
 mod exactly_once;
 mod fabric_cli;
 mod fabric_on;
-mod harness_self;
 mod link_state;
+mod log_mirror;
 mod ls_paging;
 mod notify;
 mod one_state_dir;

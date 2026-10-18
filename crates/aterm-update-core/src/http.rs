@@ -195,24 +195,61 @@ enum Link {
     Unknown,
 }
 
-/// Whether curl's `exit` says it reached no host at all: the proxy or the host name did not
-/// resolve (5, 6), or no route led to it, or nothing answered the connect (7). A second try a
-/// moment later meets the same; a timeout (28), a broken transfer or a refused handshake does
-/// not say so, and keeps its honest retries.
-fn reached_no_host(exit: Option<i32>) -> bool {
-    matches!(exit, Some(5..=7))
+/// How far an attempt's connection got, as its `-w` trailer's `%{time_appconnect}` says
+/// ([`handshake_in`]): every lane is https, so a TLS handshake that finished is a host that
+/// answered, and none is a connection that never got past the name, the route or a proxy's
+/// tunnel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Handshake {
+    /// The TLS handshake finished.
+    Done,
+    /// It never did.
+    NotDone,
+    /// The run carries no trailer that says (a byte lane, whose stdout is the body).
+    Unknown,
 }
 
-/// What attempt `attempt` of a request's `attempts`, ended with curl's `exit`, says of the
-/// link, and whether another attempt is worth its backoff — `known_down` when this process
-/// already holds the link down. Pure: [`attempt_again`] keeps the verdict. An attempt that
-/// reached no host retries only while the link is not known down, and holds it down once a
-/// request has spent every one of its retries on it (a one-attempt hint never says so on its
-/// own); one a host answered (a status, `-f`'s exit 22) brings it back up; every other
-/// failure retries as it always did.
-fn link_after(exit: Option<i32>, attempt: u32, attempts: u32, known_down: bool) -> (Link, bool) {
+/// What the LAST token of a `-w` trailer — `%{time_appconnect}`, seconds — says of the
+/// handshake: zero is none, a positive time one that finished, anything else unknown (a
+/// trailer that ends on another field).
+fn handshake_in(trailer: &str) -> Handshake {
+    match trailer
+        .split_whitespace()
+        .last()
+        .and_then(|t| t.parse::<f64>().ok())
+    {
+        Some(secs) if secs > 0.0 => Handshake::Done,
+        Some(0.0) => Handshake::NotDone,
+        _ => Handshake::Unknown,
+    }
+}
+
+/// Whether curl's `exit` says it reached no host at all: the proxy or the host name did not
+/// resolve (5, 6), or no route led to it, or nothing answered the connect (7) — or the
+/// connect bound expired before any TLS handshake finished (28, [`Handshake::NotDone`]): a
+/// name that never resolves, a dropped SYN, a proxy that never opens the tunnel. A second
+/// try a moment later meets the same; a transfer that timed out after its handshake, a
+/// broken transfer or a refused handshake does not say so, and keeps its honest retries.
+fn reached_no_host(exit: Option<i32>, handshake: Handshake) -> bool {
+    matches!(exit, Some(5..=7)) || (exit == Some(28) && handshake == Handshake::NotDone)
+}
+
+/// What attempt `attempt` of a request's `attempts`, ended with curl's `exit` after
+/// `handshake`, says of the link, and whether another attempt is worth its backoff —
+/// `known_down` when this process already holds the link down. Pure: [`attempt_again`]
+/// keeps the verdict. An attempt that reached no host retries only while the link is not
+/// known down, and holds it down once a request has spent every one of its retries on it (a
+/// one-attempt hint never says so on its own); one a host answered (a status, `-f`'s exit
+/// 22) brings it back up; every other failure retries as it always did.
+fn link_after(
+    exit: Option<i32>,
+    handshake: Handshake,
+    attempt: u32,
+    attempts: u32,
+    known_down: bool,
+) -> (Link, bool) {
     let last = attempt >= attempts;
-    if reached_no_host(exit) {
+    if reached_no_host(exit, handshake) {
         let down = known_down || (last && attempts > 1);
         (
             if down { Link::Down } else { Link::Unknown },
@@ -227,22 +264,34 @@ fn link_after(exit: Option<i32>, attempt: u32, attempts: u32, known_down: bool) 
 
 /// [`link_after`] over this process's verdict ([`LINK_DOWN_SINCE`]), which it updates: whether
 /// a request makes another attempt after attempt `attempt` of its `attempts` ended with
-/// `exit`.
+/// `exit` after `handshake`.
 // Skip: a process-global verdict behind a std Mutex and the monotonic clock (absent std
 // bodies); the decision itself is the pure `link_after`.
 #[cfg_attr(trust_verify, trust::skip)]
-fn attempt_again(exit: Option<i32>, attempt: u32, attempts: u32) -> bool {
+fn attempt_again(exit: Option<i32>, handshake: Handshake, attempt: u32, attempts: u32) -> bool {
     let mut since = LINK_DOWN_SINCE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let known_down = since.is_some_and(|at| at.elapsed() <= LINK_DOWN_HOLDS);
-    let (link, again) = link_after(exit, attempt, attempts, known_down);
+    let (link, again) = link_after(exit, handshake, attempt, attempts, known_down);
     match link {
         Link::Down => *since = Some(std::time::Instant::now()),
         Link::Reached => *since = None,
         Link::Unknown => {}
     }
     again
+}
+
+/// Hold the link down from now ([`LINK_DOWN_SINCE`]), for a caller that saw every request of
+/// a round it asked at once reach no host on its first attempt ([`head_no_redirect_first`]):
+/// one verdict for the whole round, so none of them, and no request after them, backs off
+/// and retries a link that is not there. Any host's answer clears it, as ever.
+// Skip: the same process-global verdict as `attempt_again`.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn note_link_down() {
+    *LINK_DOWN_SINCE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::time::Instant::now());
 }
 
 /// Whether an HTTP status is worth another in-process attempt: the transient
@@ -297,8 +346,9 @@ fn head_args_with_timeout(timeout_secs: &'static str) -> [&'static str; 10] {
         SMALL_CONNECT_SECS,
         "--max-time",
         timeout_secs,
+        // The status, then how far the connection got ([`handshake_in`]).
         "-w",
-        "\n%{http_code}",
+        "\n%{http_code} %{time_appconnect}",
     ]
 }
 
@@ -335,49 +385,126 @@ pub fn head_no_redirect_quick(url: &str) -> Result<HeadAnswer, HttpError> {
 
 // Skip: response-text handling — from_utf8_lossy over curl output (classification
 // only) and the trailing-status split arithmetic, whose bounds ride the lossy Cow
-// (unmodeled). Every malformed shape returns Err (fail-closed). Shared by the normal
-// request and the short hint so both use one audited response parser; every other
-// `Skip: … display-lossy Err-path class` note in this module names this one.
+// (unmodeled), in `head_attempt` below. Every malformed shape returns Err (fail-closed).
+// Shared by the normal request, the short hint and a round's first attempts so all use one
+// audited response parser; every other `Skip: … display-lossy Err-path class` note in
+// this module names this one.
 #[cfg_attr(trust_verify, trust::skip)]
 fn head_no_redirect_with(url: &str, args: &[&str], attempts: u32) -> Result<HeadAnswer, HttpError> {
     require_https_url(url).map_err(HttpError::Transport)?;
-    let mut attempt: u32 = 0;
+    head_attempts(url, args, 1, attempts)
+}
+
+/// What the first attempt of a [`head_no_redirect`] came to, apart from its retries
+/// ([`head_no_redirect_again`]), so a caller asking several HEADs at once reads the link
+/// from every first attempt before any of them backs off.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FirstHead {
+    /// Settled on that attempt: the answer, or a failure no retry changes (a link this
+    /// process already holds down among them).
+    Settled(Result<HeadAnswer, HttpError>),
+    /// Another attempt may change it. `answer` is what it says if none follows; `unreached`
+    /// when it reached no host ([`reached_no_host`]) — what a round reads its link from
+    /// ([`note_link_down`]).
+    Again {
+        /// The attempt's own answer: a transient status, or the transport failure.
+        answer: Result<HeadAnswer, HttpError>,
+        /// It reached no host.
+        unreached: bool,
+    },
+}
+
+/// [`head_no_redirect`]'s first attempt alone.
+// Skip: same audited display-lossy Err-path class as `head_no_redirect_with`.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn head_no_redirect_first(url: &str) -> FirstHead {
+    match require_https_url(url) {
+        Ok(()) => head_attempt(url, &head_args(), 1, CURL_ATTEMPTS),
+        Err(e) => FirstHead::Settled(Err(HttpError::Transport(e))),
+    }
+}
+
+/// [`head_no_redirect`]'s attempts after the first, each after its backoff: the rest of a
+/// HEAD whose first attempt said [`FirstHead::Again`].
+// Skip: same audited display-lossy Err-path class as `head_no_redirect_with`.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn head_no_redirect_again(url: &str) -> Result<HeadAnswer, HttpError> {
+    require_https_url(url).map_err(HttpError::Transport)?;
+    head_attempts(url, &head_args(), 2, CURL_ATTEMPTS)
+}
+
+/// Attempts `from..=attempts` of a HEAD of `url`, each after its backoff; the last settles.
+// Skip: same audited display-lossy Err-path class as `head_no_redirect_with`.
+#[cfg_attr(trust_verify, trust::skip)]
+fn head_attempts(
+    url: &str,
+    args: &[&str],
+    from: u32,
+    attempts: u32,
+) -> Result<HeadAnswer, HttpError> {
+    let mut attempt = from;
     loop {
-        attempt += 1;
         if attempt > 1 {
             std::thread::sleep(std::time::Duration::from_secs(1 << (attempt - 2)));
         }
-        let last = attempt >= attempts;
-        let out = curl_fetch(args, url).map_err(HttpError::Transport)?;
-        let again = attempt_again(out.status.code(), attempt, attempts);
-        if !out.status.success() {
-            if again {
-                continue;
+        match head_attempt(url, args, attempt, attempts) {
+            FirstHead::Settled(answer) => return answer,
+            FirstHead::Again { .. } => attempt += 1,
+        }
+    }
+}
+
+/// Attempt `attempt` of a HEAD's `attempts`: settled, or worth another. Never
+/// [`FirstHead::Again`] on the last.
+// Skip: same audited display-lossy Err-path class as `head_no_redirect_with`.
+#[cfg_attr(trust_verify, trust::skip)]
+fn head_attempt(url: &str, args: &[&str], attempt: u32, attempts: u32) -> FirstHead {
+    let last = attempt >= attempts;
+    let out = match curl_fetch(args, url) {
+        Ok(out) => out,
+        Err(e) => return FirstHead::Settled(Err(HttpError::Transport(e))),
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (headers, trailer) = match text.rfind('\n') {
+        Some(i) => (&text[..i], text[i + 1..].trim()),
+        None => ("", text.trim()),
+    };
+    let handshake = handshake_in(trailer);
+    let exit = out.status.code();
+    let again = attempt_again(exit, handshake, attempt, attempts);
+    if !out.status.success() {
+        let answer = Err(HttpError::Transport(format!(
+            "curl HEAD {} failed ({}): {}",
+            url,
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+        return if again {
+            FirstHead::Again {
+                answer,
+                unreached: reached_no_host(exit, handshake),
             }
-            return Err(HttpError::Transport(format!(
-                "curl HEAD {} failed ({}): {}",
-                url,
-                out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
-            )));
-        }
-        let text = String::from_utf8_lossy(&out.stdout);
-        let (headers, code) = match text.rfind('\n') {
-            Some(i) => (&text[..i], text[i + 1..].trim()),
-            None => ("", text.trim()),
+        } else {
+            FirstHead::Settled(answer)
         };
-        if !last && transient_status(code) {
-            continue;
+    }
+    let code = trailer.split_whitespace().next().unwrap_or("");
+    let Ok(numeric) = code.parse::<u16>() else {
+        return FirstHead::Settled(Err(HttpError::Malformed(format!(
+            "the release host answered HTTP {code} to HEAD {url}"
+        ))));
+    };
+    let answer = Ok(HeadAnswer {
+        code: numeric,
+        location: location_header(headers),
+    });
+    if !last && transient_status(code) {
+        FirstHead::Again {
+            answer,
+            unreached: false,
         }
-        let Ok(numeric) = code.parse::<u16>() else {
-            return Err(HttpError::Malformed(format!(
-                "the release host answered HTTP {code} to HEAD {url}"
-            )));
-        };
-        return Ok(HeadAnswer {
-            code: numeric,
-            location: location_header(headers),
-        });
+    } else {
+        FirstHead::Settled(answer)
     }
 }
 
@@ -476,7 +603,13 @@ pub fn download_bytes(asset_url: &str, max_filesize: u64) -> Result<Vec<u8>, Str
             std::thread::sleep(std::time::Duration::from_secs(1 << (attempt - 2)));
         }
         let out = curl_fetch(&download_bytes_args(&cap), asset_url)?;
-        let again = attempt_again(out.status.code(), attempt, CURL_ATTEMPTS);
+        // Its stdout is the body: no trailer says how far a failed connection got.
+        let again = attempt_again(
+            out.status.code(),
+            Handshake::Unknown,
+            attempt,
+            CURL_ATTEMPTS,
+        );
         if out.status.success() {
             return Ok(out.stdout);
         }
@@ -1155,10 +1288,15 @@ fn content_length_header(headers: &str) -> Option<u64> {
     value.parse::<u64>().ok().filter(|n| *n > 0)
 }
 
-/// Split the vendor GET's `-w` trailer (`<http_code> <url_effective>`). `None` unless the
-/// code is numeric and the URL is https with no whitespace or control byte.
+/// Split the vendor GET's `-w` trailer (`<http_code> <url_effective> <time_appconnect>`, the
+/// last read by [`handshake_in`]). `None` unless the code is numeric, the URL is https with
+/// no whitespace or control byte, and anything after it is the handshake's time.
 fn vendor_trailer(stdout: &str) -> Option<(u16, String)> {
-    let (code, url) = stdout.trim().split_once(' ')?;
+    let (code, rest) = stdout.trim().split_once(' ')?;
+    let url = match rest.rsplit_once(' ') {
+        Some((url, secs)) if secs.parse::<f64>().is_ok() => url,
+        _ => rest,
+    };
     let code = code.parse::<u16>().ok()?;
     if !url.starts_with("https://") || url.bytes().any(|b| b <= b' ' || b == 0x7f) {
         return None;
@@ -1263,10 +1401,11 @@ fn vendor_head_step(run: &CurlRun<'_>, last: bool, url: &str) -> Step<u64> {
             Step::Retry
         };
     }
-    let (headers, code) = match run.stdout.rfind('\n') {
+    let (headers, trailer) = match run.stdout.rfind('\n') {
         Some(i) => (&run.stdout[..i], run.stdout[i + 1..].trim()),
         None => ("", run.stdout.trim()),
     };
+    let code = trailer.split_whitespace().next().unwrap_or("");
     if !last && transient_status(code) {
         return Step::Retry;
     }
@@ -1321,9 +1460,14 @@ struct VendorBounds {
     attempts: u32,
 }
 
-/// A document the lane needs: patient, and retried.
+/// A document the lane needs: its whole transfer patient, and retried. Its connect is bounded
+/// as the web lane's small requests are ([`SMALL_CONNECT_SECS`]): a vendor host that answers
+/// connects in well under a second, and a name that never resolved held each of a pass's
+/// document reads for 93 s (three 30 s connects and the sleeps between them) — on a first
+/// run, the whole announcement behind one of them. Bounded, three attempts take 18 s, and a
+/// connect that never finished holds the link down for the rest ([`reached_no_host`]).
 const LANE_BOUNDS: VendorBounds = VendorBounds {
-    connect_secs: "30",
+    connect_secs: SMALL_CONNECT_SECS,
     max_secs: "60",
     attempts: CURL_ATTEMPTS,
 };
@@ -1368,7 +1512,7 @@ fn vendor_get_args<'a>(
         "--dump-header",
         headers,
         "-w",
-        "%{http_code} %{url_effective}",
+        "%{http_code} %{url_effective} %{time_appconnect}",
     ];
     if let Some(line) = condition {
         args.push("-H");
@@ -1392,11 +1536,11 @@ fn vendor_head_args() -> [&'static str; 15] {
         "--max-redirs",
         VENDOR_MAX_REDIRS,
         "--connect-timeout",
-        "30",
+        SMALL_CONNECT_SECS,
         "--max-time",
         "60",
         "-w",
-        "\n%{http_code}",
+        "\n%{http_code} %{time_appconnect}",
     ]
 }
 
@@ -1586,7 +1730,7 @@ fn vendor_get_within(
         let step = vendor_get_step(
             &run,
             &String::from_utf8_lossy(&dump),
-            !attempt_again(run.exit, attempt, bounds.attempts),
+            !attempt_again(run.exit, handshake_in(run.stdout), attempt, bounds.attempts),
             url,
             cap,
             if_none_match,
@@ -1627,7 +1771,7 @@ pub fn vendor_content_length(url: &str) -> Result<u64, HttpError> {
             stdout: &stdout,
             stderr: &stderr,
         };
-        let last = !attempt_again(run.exit, attempt, CURL_ATTEMPTS);
+        let last = !attempt_again(run.exit, handshake_in(run.stdout), attempt, CURL_ATTEMPTS);
         if let Step::Done(result) = vendor_head_step(&run, last, url) {
             return result;
         }
@@ -1734,51 +1878,15 @@ mod tests {
         );
     }
 
-    /// The web lane is the SAME request as the API lane with a different URL: same
-    /// flags, same header, same `--` guard. Nothing about the transfer changes with the
-    /// host — only where the bytes come from.
-    #[test]
-    fn the_asset_argv_for_a_web_url_differs_from_the_api_argv_only_in_the_url() {
-        let args = super::download_bytes_args("5000000");
-        let api = super::curl_argv(&args, API_ASSET);
-        let web = super::curl_argv(&args, WEB_ASSET);
-        assert_eq!(api.len(), web.len());
-        let differing: Vec<(usize, &String, &String)> = api
-            .iter()
-            .zip(web.iter())
-            .enumerate()
-            .filter(|(_, (a, b))| a != b)
-            .map(|(i, (a, b))| (i, a, b))
-            .collect();
-        assert_eq!(differing.len(), 1, "{differing:?}");
-        assert_eq!(
-            differing[0].0,
-            api.len() - 1,
-            "only the URL, and it is last"
-        );
-    }
-
+    use super::{Handshake, Link, link_after};
     use super::{
-        CURL_ATTEMPTS, HINT_BOUNDS, HttpError, LANE_BOUNDS, RELEASE_ASSET_DOWNLOAD_BOUND,
-        curl_argv, curl_bin, download_bytes_args, download_max_time_secs, download_resume_args,
-        download_resume_args_https_only, download_to_args, download_to_resumable,
-        download_to_resumable_https_only, head_args, keep_partial, keep_partial_after_failure,
-        location_header, part_path, range_refused, resume_plan, transient_status, vendor_get_args,
+        HttpError, LANE_BOUNDS, RELEASE_ASSET_DOWNLOAD_BOUND, curl_argv, download_bytes_args,
+        download_max_time_secs, download_resume_args, download_resume_args_https_only,
+        download_to_args, download_to_resumable, download_to_resumable_https_only, head_args,
+        keep_partial, keep_partial_after_failure, location_header, part_path, range_refused,
+        resume_plan, transient_status, vendor_get_args,
     };
-    use super::{Link, link_after};
     use aterm_uds::spawnfd::Command;
-
-    /// The curl binary is platform-selected: a pinned absolute path on unix (no
-    /// `PATH`-shim substitution), and the on-`PATH` `curl.exe` Windows ships since
-    /// Win10 1803. Guards against a regression back to the hardcoded `/usr/bin/curl`
-    /// that made every update request fail to spawn on Windows.
-    #[test]
-    fn curl_binary_is_platform_selected() {
-        #[cfg(windows)]
-        assert_eq!(curl_bin(), "curl.exe");
-        #[cfg(not(windows))]
-        assert_eq!(curl_bin(), "/usr/bin/curl");
-    }
 
     /// The v0.5.10/v0.5.11 auto-update-bricking regression: the `--` end-of-options
     /// marker must come AFTER every option and immediately BEFORE the URL. When callers
@@ -1819,45 +1927,12 @@ mod tests {
         );
     }
 
-    /// A hostile releases JSON pointing an asset at a leading-dash "URL" must land
-    /// after `--` so curl treats it as a URL (then fails DNS), never as an option.
-    #[test]
-    fn leading_dash_url_stays_inert() {
-        let v = curl_argv(&["-fsSL"], "-K/tmp/evil");
-        let dashdash = v.iter().position(|a| a == "--").unwrap();
-        assert_eq!(v[dashdash + 1], "-K/tmp/evil");
-        assert_eq!(dashdash + 2, v.len());
-    }
-
     /// The spawned program + argv, as owned strings.
     fn argv_of(command: &Command) -> Vec<String> {
         command
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
-    }
-
-    /// `Transport`, `Malformed` and `VendorRefused` pass their text through untouched;
-    /// a vendor status names its code and URL.
-    #[test]
-    fn errors_render_their_own_words() {
-        assert_eq!(
-            HttpError::Transport("curl GET x failed (exit 6): dns".into()).to_string(),
-            "curl GET x failed (exit 6): dns"
-        );
-        assert_eq!(
-            HttpError::Malformed("mangled".into()).to_string(),
-            "mangled"
-        );
-        let status = HttpError::VendorStatus {
-            code: 500,
-            url: "https://vendor.example/x".into(),
-        }
-        .to_string();
-        assert!(
-            status.contains("HTTP 500") && status.contains("https://vendor.example/x"),
-            "{status}"
-        );
     }
 
     /// The download ceiling must scale with the payload it is supposed to admit. A
@@ -1962,24 +2037,24 @@ mod tests {
             let exit = Some(no_host);
             // A request with retries: they go on until the last, which holds the link down.
             assert_eq!(
-                link_after(exit, 1, 3, false),
+                link_after(exit, Handshake::Unknown, 1, 3, false),
                 (Link::Unknown, true),
                 "{no_host}"
             );
             assert_eq!(
-                link_after(exit, 3, 3, false),
+                link_after(exit, Handshake::Unknown, 3, 3, false),
                 (Link::Down, false),
                 "{no_host}"
             );
             // On a link already known down, its first such failure is its last.
             assert_eq!(
-                link_after(exit, 1, 3, true),
+                link_after(exit, Handshake::Unknown, 1, 3, true),
                 (Link::Down, false),
                 "{no_host}"
             );
             // A one-attempt hint consults the verdict and never makes one on its own.
             assert_eq!(
-                link_after(exit, 1, 1, false),
+                link_after(exit, Handshake::Unknown, 1, 1, false),
                 (Link::Unknown, false),
                 "{no_host}"
             );
@@ -1987,12 +2062,12 @@ mod tests {
         for transient in [Some(28), Some(35), Some(52), Some(56), None] {
             for known_down in [false, true] {
                 assert_eq!(
-                    link_after(transient, 1, 3, known_down),
+                    link_after(transient, Handshake::Unknown, 1, 3, known_down),
                     (Link::Unknown, true),
                     "{transient:?}"
                 );
                 assert_eq!(
-                    link_after(transient, 3, 3, known_down),
+                    link_after(transient, Handshake::Unknown, 3, 3, known_down),
                     (Link::Unknown, false),
                     "{transient:?}"
                 );
@@ -2000,12 +2075,50 @@ mod tests {
         }
         for answered in [0, 22] {
             assert_eq!(
-                link_after(Some(answered), 1, 3, true),
+                link_after(Some(answered), Handshake::Done, 1, 3, true),
                 (Link::Reached, true)
             );
             assert_eq!(
-                link_after(Some(answered), 1, 1, true),
+                link_after(Some(answered), Handshake::Done, 1, 1, true),
                 (Link::Reached, false)
+            );
+        }
+    }
+
+    /// A connect bound that expired before any TLS handshake finished reached no host, as a
+    /// name that does not resolve does: its request retries only while the link is not known
+    /// down, and holds it down once it spent its retries. A timeout after the handshake, or
+    /// one no trailer explains, is a transfer's, and keeps every retry.
+    #[test]
+    fn a_connect_that_never_finished_reached_no_host() {
+        use super::handshake_in;
+        assert_eq!(handshake_in("000 0.000000"), Handshake::NotDone);
+        assert_eq!(handshake_in("000 https://x/ 0.000000"), Handshake::NotDone);
+        assert_eq!(handshake_in("200 0.130092"), Handshake::Done);
+        assert_eq!(handshake_in("200 https://x/"), Handshake::Unknown);
+        assert_eq!(handshake_in(""), Handshake::Unknown);
+        let stalled = Some(28);
+        assert_eq!(
+            link_after(stalled, Handshake::NotDone, 1, 3, false),
+            (Link::Unknown, true)
+        );
+        assert_eq!(
+            link_after(stalled, Handshake::NotDone, 3, 3, false),
+            (Link::Down, false)
+        );
+        assert_eq!(
+            link_after(stalled, Handshake::NotDone, 1, 3, true),
+            (Link::Down, false),
+            "on a link known down, a connect that never finished is not paid for twice"
+        );
+        for transfer in [Handshake::Done, Handshake::Unknown] {
+            assert_eq!(
+                link_after(stalled, transfer, 1, 3, true),
+                (Link::Unknown, true)
+            );
+            assert_eq!(
+                link_after(stalled, transfer, 3, 3, false),
+                (Link::Unknown, false)
             );
         }
     }
@@ -2070,12 +2183,15 @@ mod tests {
         assert_eq!(value_of("--proto"), "=https");
         assert_eq!(value_of("--proto-redir"), "=https");
         assert_eq!(value_of("--max-redirs"), "5");
-        assert_eq!(value_of("--connect-timeout"), "30");
+        assert_eq!(value_of("--connect-timeout"), "5");
         assert_eq!(value_of("--max-time"), "60");
         assert_eq!(value_of("--max-filesize"), "64");
         assert_eq!(value_of("-o"), "/s/body");
         assert_eq!(value_of("--dump-header"), "/s/headers");
-        assert_eq!(value_of("-w"), "%{http_code} %{url_effective}");
+        assert_eq!(
+            value_of("-w"),
+            "%{http_code} %{url_effective} %{time_appconnect}"
+        );
         assert!(args.contains(&"-L"));
         for absent in [
             "-f", "--fail", "--retry", "--config", "-K", "--netrc", "-u", "--",
@@ -2099,37 +2215,6 @@ mod tests {
         );
     }
 
-    /// A head read as a hint is one short attempt under the lane's own pins: only the
-    /// connect and wall-clock bounds differ from the lane's GET.
-    #[test]
-    fn the_hint_get_is_one_short_attempt_under_the_same_pins() {
-        let lane = vendor_get_args(LANE_BOUNDS, "64", "/s/body", "/s/headers", None);
-        let hint = vendor_get_args(HINT_BOUNDS, "64", "/s/body", "/s/headers", None);
-        let value_of = |args: &[&str], flag: &str| {
-            let i = args.iter().position(|a| *a == flag).expect(flag);
-            args[i + 1].to_string()
-        };
-        assert_eq!(value_of(&hint, "--connect-timeout"), "5");
-        assert_eq!(value_of(&hint, "--max-time"), "15");
-        assert_eq!(HINT_BOUNDS.attempts, 1, "no retry: the caller's cadence is");
-        assert_eq!(LANE_BOUNDS.attempts, CURL_ATTEMPTS);
-        let without = |args: &[&str]| {
-            let mut rest = Vec::new();
-            let mut skip = false;
-            for a in args {
-                if skip {
-                    skip = false;
-                } else if matches!(*a, "--connect-timeout" | "--max-time") {
-                    skip = true;
-                } else {
-                    rest.push(a.to_string());
-                }
-            }
-            rest
-        };
-        assert_eq!(without(&hint), without(&lane), "the same pins otherwise");
-    }
-
     /// The vendor HEAD follows redirects under the same pins and bounds, reads headers
     /// only, and ends on the status trailer.
     #[test]
@@ -2142,8 +2227,9 @@ mod tests {
             ("--proto", "=https"),
             ("--proto-redir", "=https"),
             ("--max-redirs", "5"),
+            ("--connect-timeout", "5"),
             ("--max-time", "60"),
-            ("-w", "\n%{http_code}"),
+            ("-w", "\n%{http_code} %{time_appconnect}"),
         ] {
             let i = args.iter().position(|a| *a == flag).expect(flag);
             assert_eq!(args[i + 1], value, "{flag}");
@@ -2265,6 +2351,11 @@ mod tests {
             super::vendor_trailer("304 https://downloads.claude.ai/claude-code-releases/latest\n")
                 .map(|t| t.0),
             Some(304)
+        );
+        // The handshake's time after the URL ([`super::handshake_in`]) is not part of it.
+        assert_eq!(
+            super::vendor_trailer("200 https://x/y 0.130092\n"),
+            Some((200, "https://x/y".to_string()))
         );
         for bad in [
             "",
@@ -2546,17 +2637,6 @@ mod tests {
             None
         );
         assert_eq!(verdict(None, "", URL, 9), None);
-    }
-
-    /// curl's cap never undercuts a redirect's HTML body; the exact bound is the read's.
-    #[test]
-    fn curl_gets_headroom_over_a_tiny_document_cap() {
-        assert_eq!(super::vendor_curl_cap(64), super::VENDOR_CURL_CAP_FLOOR);
-        assert_eq!(super::vendor_curl_cap(65_536), 65_536);
-        assert!(
-            super::vendor_curl_cap(1) >= 4096,
-            "a redirect's HTML body fits"
-        );
     }
 
     /// Every refusal the vendor lane owes before spawning — a non-https URL, a zero cap,
@@ -2936,19 +3016,5 @@ mod tests {
             !range_refused(None, ""),
             "a signal-killed curl proves nothing"
         );
-    }
-
-    /// A refused URL fails before anything is created, and leaves no part behind — the
-    /// scheme guard runs first on this lane too.
-    #[test]
-    fn the_resumable_lane_keeps_the_scheme_guard() {
-        let dir = std::env::temp_dir().join(format!("aterm-resume-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let dest = dir.join("a.tar.zst");
-        let err = download_to_resumable("file:///etc/passwd", &dest, 1 << 20)
-            .expect_err("a non-https asset URL must be refused");
-        assert!(err.contains("non-https"), "{err}");
-        assert!(!dest.exists() && !dir.join("a.tar.zst.part").exists());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

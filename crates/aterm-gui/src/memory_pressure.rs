@@ -6,6 +6,8 @@
 use std::os::raw::c_void;
 use std::ptr;
 
+use crate::crash_restore::PressureLevel;
+
 type DispatchObject = *mut c_void;
 
 // DISPATCH_MEMORYPRESSURE_* mask bits (dispatch/source.h).
@@ -37,7 +39,7 @@ unsafe extern "C" {
 /// Leaked handler context: the user callback + the source whose pressure level the
 /// handler reads. Both live for the process lifetime.
 struct Ctx {
-    on_pressure: Box<dyn Fn(bool) + Send>,
+    on_level: Box<dyn Fn(PressureLevel) + Send>,
     source: DispatchObject,
 }
 
@@ -62,11 +64,31 @@ pub(crate) fn level_line(level: usize) -> String {
     format!("memory pressure: the system reports {word} (level {level:#x})")
 }
 
-/// What a reported level asks of the shed: `Some(critical)` for a warning or a
-/// critical level, `None` for a return to NORMAL — registered only so the line above
-/// records it; a level that is neither warning nor critical sheds nothing.
-fn shed_for(level: usize) -> Option<bool> {
-    (level & (WARN | CRITICAL) != 0).then_some(level & CRITICAL != 0)
+/// The level a reported mask is (`None` for a mask with no level bit, which the source
+/// never sends).
+fn level_of(level: usize) -> Option<PressureLevel> {
+    if level & CRITICAL != 0 {
+        Some(PressureLevel::Critical)
+    } else if level & WARN != 0 {
+        Some(PressureLevel::Warn)
+    } else if level & NORMAL != 0 {
+        Some(PressureLevel::Normal)
+    } else {
+        None
+    }
+}
+
+/// What a level asks of the scrollback's shed (`App::shed_memory_under_pressure`):
+/// `Some(critical)` for a warning or a critical level, `None` for a return to NORMAL.
+/// NORMAL reaches the window (the crash-restore journal's shed brings its history rings
+/// back once it has held, `crash_restore::ShedPolicy`) but trims nothing: before this
+/// source registered NORMAL, the scrollback's shed only ever saw warning and critical.
+pub(crate) fn scrollback_shed(level: PressureLevel) -> Option<bool> {
+    match level {
+        PressureLevel::Normal => None,
+        PressureLevel::Warn => Some(false),
+        PressureLevel::Critical => Some(true),
+    }
 }
 
 extern "C" fn handler(ctx: *mut c_void) {
@@ -76,25 +98,31 @@ extern "C" fn handler(ctx: *mut c_void) {
     // SAFETY: `ctx` is the leaked `Box<Ctx>` installed below.
     let ctx = unsafe { &*(ctx as *const Ctx) };
     // SAFETY: `ctx.source` is the live source this handler is attached to.
-    let level = unsafe { dispatch_source_get_data(ctx.source) };
-    let Some(critical) = shed_for(level) else {
-        aterm_log::info!("{}", level_line(level));
+    let raw = unsafe { dispatch_source_get_data(ctx.source) };
+    let Some(level) = level_of(raw) else {
+        aterm_log::info!("{}", level_line(raw));
         return;
     };
-    aterm_log::warn!("{}", level_line(level));
+    if level == PressureLevel::Normal {
+        aterm_log::info!("{}", level_line(raw));
+    } else {
+        aterm_log::warn!("{}", level_line(raw));
+    }
     // Never unwind across the C boundary.
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        (ctx.on_pressure)(critical);
+        (ctx.on_level)(level);
     }));
 }
 
 /// Register the process-wide macOS memory-pressure notifier. The callback runs on a
 /// libdispatch background thread and should only enqueue cheap, thread-safe work.
-/// It is called for WARN and CRITICAL only; a return to NORMAL is logged
-/// ([`level_line`]) and nothing else.
-pub(crate) fn install<F>(on_pressure: F)
+/// It is called for every level the OS reports: WARN and CRITICAL shed (the scrollback
+/// and the crash-restore journal's history rings), NORMAL is logged ([`level_line`]) and
+/// starts the journal's wait before its rings come back ([`scrollback_shed`]: the
+/// scrollback takes nothing from it).
+pub(crate) fn install<F>(on_level: F)
 where
-    F: Fn(bool) + Send + 'static,
+    F: Fn(PressureLevel) + Send + 'static,
 {
     // SAFETY: standard libdispatch source setup. The source and context are
     // deliberately process-lifetime allocations so no handler can race a free.
@@ -110,7 +138,7 @@ where
             return;
         }
         let ctx = Box::into_raw(Box::new(Ctx {
-            on_pressure: Box::new(on_pressure),
+            on_level: Box::new(on_level),
             source,
         }));
         dispatch_set_context(source, ctx.cast());
@@ -135,15 +163,21 @@ mod tests {
         }
     }
 
-    /// Registering NORMAL must not turn a return to normal into a shed: before this
-    /// source asked for it, the callback only ever saw warning and critical.
+    /// Every level reaches the window, highest bit first, and a return to NORMAL never
+    /// sheds the scrollback: before this source asked for NORMAL, the scrollback's shed
+    /// only ever saw warning and critical, and the journal's rings coming back is NORMAL's
+    /// one effect.
     #[test]
-    fn a_return_to_normal_is_recorded_and_never_shed() {
-        use super::{CRITICAL, NORMAL, WARN, shed_for};
-        assert_eq!(shed_for(NORMAL), None);
-        assert_eq!(shed_for(0), None);
-        assert_eq!(shed_for(WARN), Some(false));
-        assert_eq!(shed_for(CRITICAL), Some(true));
-        assert_eq!(shed_for(WARN | CRITICAL), Some(true));
+    fn a_return_to_normal_is_recorded_and_never_sheds_the_scrollback() {
+        use super::{CRITICAL, NORMAL, WARN, level_of, scrollback_shed};
+        use crate::crash_restore::PressureLevel;
+        assert_eq!(level_of(NORMAL), Some(PressureLevel::Normal));
+        assert_eq!(level_of(0), None);
+        assert_eq!(level_of(WARN), Some(PressureLevel::Warn));
+        assert_eq!(level_of(CRITICAL), Some(PressureLevel::Critical));
+        assert_eq!(level_of(WARN | CRITICAL), Some(PressureLevel::Critical));
+        assert_eq!(scrollback_shed(PressureLevel::Normal), None);
+        assert_eq!(scrollback_shed(PressureLevel::Warn), Some(false));
+        assert_eq!(scrollback_shed(PressureLevel::Critical), Some(true));
     }
 }

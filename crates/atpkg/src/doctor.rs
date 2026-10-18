@@ -147,13 +147,23 @@ pub(crate) fn recorded_problems(status: Option<&crate::Status>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The toolset-wide "no build for this architecture" verdict on Windows, the one platform
-/// where it is a state and not a fault: `Some(names)` (the programs whose own rows say
-/// `unavailable on <target>: …`) when it holds, `None` on every other platform. On an Intel
-/// Mac a missing build is a publishing gap that `aterm pkg install --default-set` answers;
-/// on Windows only the agents are published, so recommending it would be false.
+/// The toolset-wide "no build for this architecture" verdict, on the platforms where it
+/// is a state and not a fault: every one but macOS (Windows and Linux). `Some(names)` —
+/// the ALab programs whose own rows say `unavailable on <target>: …` — when those rows or
+/// the `*toolset*` row read that verdict here; `None` on macOS, whatever the rows say.
+///
+/// Why the platform split. On an Intel Mac the absence of an x86_64 build is a
+/// publishing gap the report is right to call a PROBLEM and to answer with `aterm pkg
+/// install --default-set`: the seal serves that machine the day it is cut. On Windows
+/// (index build 44) and on Linux (index build 71) every ALab row is `prebuilt-only` with
+/// no artifact for the target and only the agents are published, so `install
+/// --default-set` cannot change the state and a PROBLEM line recommending it would be
+/// false — `install` itself says "skipped, not failed". The `*toolset*` row is also
+/// STALE by construction: it is written when a pass installs nothing on an empty store
+/// and cleared only by a clean pass with something installed, so it outlives the day
+/// the agents became servable here.
 fn toolset_unserved_here(status: Option<&crate::Status>) -> Option<Vec<String>> {
-    if !cfg!(windows) {
+    if cfg!(target_os = "macos") {
         return None;
     }
     let s = status?;
@@ -179,8 +189,17 @@ fn toolset_unserved_here(status: Option<&crate::Status>) -> Option<Vec<String>> 
     Some(names)
 }
 
-/// [`split_missing`]'s "unexplained" list without the unserved members, each explained by
-/// its own `unavailable on <target>` row. Identity when `unserved` is `None`.
+/// Whether no managed Trust can be had on this target: trust's own row reads `unavailable on
+/// <target>` where that is a state, not a fault ([`toolset_unserved_here`]: never on macOS,
+/// where the seal serves the machine and a local `trust` stays a warning).
+fn trust_unserved_here(layout: &Layout) -> bool {
+    toolset_unserved_here(crate::status::read(layout).as_ref())
+        .is_some_and(|unserved| unserved.iter().any(|name| name == "trust"))
+}
+
+/// [`split_missing`]'s "unexplained" list with the unserved members taken out: on an
+/// unserved platform each of them IS explained — by its own `unavailable on <target>` row,
+/// which the note names. Identity when `unserved` is `None` (macOS).
 fn drop_unserved(missing: Vec<String>, unserved: Option<&[String]>) -> Vec<String> {
     match unserved {
         Some(unserved) => missing
@@ -355,7 +374,241 @@ pub struct Probes {
     /// or `None` when this report does not read it (the default: a fixture reads no
     /// machine, and off macOS there is no list).
     pub devtools: Option<crate::devtools::Facts>,
+    /// The directories on the active Trust build's physical chain that `targo trust`
+    /// refuses ([`probe_trust_chain`]), or `None` when this report does not walk it (the
+    /// default: a fixture's store sits under a temp dir whose own chain is the machine's).
+    pub trust_chain: Option<TrustChainProbe>,
 }
+
+/// What [`probe_trust_chain`] found on the active Trust build's chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustChainProbe {
+    /// The trust build whose `bin/` and `lib/` were walked.
+    pub build: u64,
+    /// Each refused directory, top down, once.
+    pub refused: Vec<ChainRefusal>,
+}
+
+/// A directory `targo trust` refuses on a toolchain's chain, and why
+/// ([`chain_component_refusal`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainRefusal {
+    pub dir: PathBuf,
+    pub why: ChainWhy,
+}
+
+/// Why `targo trust` refuses a chain component.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainWhy {
+    /// Group- or other-writable: `mode & 0o022 != 0`, a sticky bit no exemption. `yours`:
+    /// the invoking user owns it, so `chmod go-w` is theirs to run; root's (`/tmp`'s
+    /// `1777`, a `0775` mount point) is not, and must never be narrowed.
+    Writable { mode: u32, yours: bool },
+    /// Owned by neither root nor the invoking user.
+    Foreign { owner: u32, ours: u32 },
+    /// A runtime-library directory below the sysroot (`lib/`, `lib/rustlib`,
+    /// `lib/rustlib/<target>`, its `lib/`) that is not a plain directory: targo refuses
+    /// every redirection there, wherever it points.
+    Redirected,
+}
+
+/// `targo trust`'s rule for one component of the physical chain from `/` to a verified
+/// toolchain's launchers (`bin/`) and runtime libraries (`lib/`), Trust's
+/// `process_authority.rs`: owned by root or the invoking identity, and `mode & 0o022 == 0`
+/// with no sticky exemption. `None` when targo admits it. Not mirrored: its `access(W_OK)`
+/// refusal of an ACL-writable component the caller does not own.
+#[must_use]
+pub fn chain_component_refusal(ours: u32, owner: u32, mode: u32) -> Option<ChainWhy> {
+    if owner != 0 && owner != ours {
+        Some(ChainWhy::Foreign { owner, ours })
+    } else if mode & 0o022 != 0 {
+        Some(ChainWhy::Writable {
+            mode: mode & 0o7777,
+            yours: owner == ours,
+        })
+    } else {
+        None
+    }
+}
+
+/// The refused directories on the chains `targo trust` checks before it runs a verified
+/// command with the toolchain at `build`, top down, each once (Trust's
+/// `process_authority.rs`, `scan_verified_tool_runtime_library_paths`):
+///
+/// - the physical chain of `<build>/bin`, which targo resolves (a linked `bin/` is followed),
+///   and whose parent is the sysroot;
+/// - `<sysroot>/lib`, and `lib/rustlib/<T>/lib` for each non-file entry `<T>` of
+///   `lib/rustlib`: every component below the sysroot must be a plain directory, so a link
+///   (or a file) there is [`ChainWhy::Redirected`] whatever it points at, and nothing behind
+///   it is judged; a runtime directory that exists is held to [`chain_component_refusal`]
+///   component by component, as the sysroot's own chain is.
+///
+/// A missing `bin/` contributes nothing, as a missing `lib/` or `<T>/lib` does. Not
+/// mirrored: the launch spelling's own symlink hops and the launcher files themselves.
+#[cfg(unix)]
+#[must_use]
+pub fn trust_chain_refusals(build: &Path, ours: u32) -> Vec<ChainRefusal> {
+    let mut walk = ChainWalk {
+        ours,
+        seen: std::collections::BTreeSet::new(),
+        refused: Vec::new(),
+    };
+    let Ok(bin) = std::fs::canonicalize(build.join("bin")) else {
+        return walk.refused;
+    };
+    let chain: Vec<&Path> = bin.ancestors().collect();
+    for dir in chain.into_iter().rev() {
+        walk.judge(dir);
+    }
+    let Some(sysroot) = bin.parent() else {
+        return walk.refused;
+    };
+    let (lib, rustlib) = (OsStr::new("lib"), OsStr::new("rustlib"));
+    walk.runtime_dir(sysroot, &[lib]);
+    if walk.plain(sysroot, &[lib, rustlib]) {
+        let mut targets: Vec<std::ffi::OsString> = std::fs::read_dir(sysroot.join("lib/rustlib"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| !entry.file_type().is_ok_and(|t| t.is_file()))
+            .map(|entry| entry.file_name())
+            .collect();
+        targets.sort();
+        for target in &targets {
+            walk.runtime_dir(sysroot, &[lib, rustlib, target, lib]);
+        }
+    }
+    walk.refused
+}
+
+/// [`trust_chain_refusals`]'s state: each directory judged once, the refusals in order.
+#[cfg(unix)]
+struct ChainWalk {
+    ours: u32,
+    seen: std::collections::BTreeSet<PathBuf>,
+    refused: Vec<ChainRefusal>,
+}
+
+#[cfg(unix)]
+impl ChainWalk {
+    fn refuse(&mut self, dir: &Path, why: ChainWhy) {
+        if self.seen.insert(dir.to_path_buf()) {
+            self.refused.push(ChainRefusal {
+                dir: dir.to_path_buf(),
+                why,
+            });
+        }
+    }
+
+    /// One directory of a physical chain, held to [`chain_component_refusal`] once.
+    fn judge(&mut self, dir: &Path) {
+        use std::os::unix::fs::MetadataExt as _;
+        if self.seen.contains(dir) {
+            return;
+        }
+        match std::fs::symlink_metadata(dir)
+            .ok()
+            .and_then(|m| chain_component_refusal(self.ours, m.uid(), m.mode()))
+        {
+            Some(why) => self.refuse(dir, why),
+            None => {
+                self.seen.insert(dir.to_path_buf());
+            }
+        }
+    }
+
+    /// Targo's `validate_plain_toolchain_directory_path`: whether every component of `rel`
+    /// below `sysroot` is a plain directory. The first missing one answers `false`; the first
+    /// that is anything else (a link, a file) is refused as [`ChainWhy::Redirected`] and
+    /// answers `false`.
+    fn plain(&mut self, sysroot: &Path, rel: &[&OsStr]) -> bool {
+        let mut dir = sysroot.to_path_buf();
+        for name in rel {
+            dir.push(name);
+            match std::fs::symlink_metadata(&dir) {
+                Ok(m) if m.file_type().is_dir() => {}
+                Ok(_) => {
+                    self.refuse(&dir, ChainWhy::Redirected);
+                    return false;
+                }
+                Err(_) => return false,
+            }
+        }
+        true
+    }
+
+    /// A runtime-library directory targo puts on the loader path: when [`Self::plain`],
+    /// each component below the sysroot is judged.
+    fn runtime_dir(&mut self, sysroot: &Path, rel: &[&OsStr]) {
+        if self.plain(sysroot, rel) {
+            let mut dir = sysroot.to_path_buf();
+            for name in rel {
+                dir.push(name);
+                self.judge(&dir);
+            }
+        }
+    }
+}
+
+/// Walk the active Trust build's chain ([`trust_chain_refusals`]); `None` with no store
+/// build of `trust` active, and off Unix, where there are no mode bits to read.
+fn probe_trust_chain(layout: &Layout) -> Option<TrustChainProbe> {
+    #[cfg(unix)]
+    {
+        let build = crate::ops::active_builds(layout).get("trust").copied()?;
+        Some(TrustChainProbe {
+            build,
+            refused: trust_chain_refusals(
+                &layout.build_dir("trust", build),
+                crate::platform::our_uid(),
+            ),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = layout;
+        None
+    }
+}
+
+/// (5f)'s line for a directory `targo trust` refuses on trust build `build`'s chain. Doctor
+/// never chmods: the line names the one command that clears a writable component of the
+/// user's own, and for one of root's (`/tmp`'s `1777`, which must stay as it is) names a
+/// prefix of theirs instead, as `tools/install.sh`'s `check_install_path` does.
+fn trust_chain_line(p: &str, build: u64, refusal: &ChainRefusal) -> String {
+    let dir = refusal.dir.display();
+    let quoted = crate::platform::sh_quote_str(&refusal.dir.to_string_lossy());
+    let lead = format!("{p}: warn — trust build {build}: `targo trust` refuses this toolchain");
+    match refusal.why {
+        ChainWhy::Writable { mode, yours: true } => format!(
+            "{lead} — {dir} is group- or world-writable (mode {mode:o}), and targo runs no \
+             verified check whose compiler or runtime libraries sit below a directory another \
+             user could change; fix: run `chmod go-w {quoted}`"
+        ),
+        ChainWhy::Writable { mode, yours: false } => format!(
+            "{lead} — {dir} is group- or world-writable (mode {mode:o}) and root's, not yours \
+             to change, and targo runs no verified check whose compiler or runtime libraries \
+             sit below a directory another user could change; fix: set [packages].prefix, or \
+             HOME, under directories only you can write"
+        ),
+        ChainWhy::Foreign { owner, ours } => format!(
+            "{lead} — {dir} is owned by uid {owner}, neither root nor you (uid {ours}), and \
+             targo runs no verified check whose compiler or runtime libraries sit below a \
+             directory another user owns; fix: set [packages].prefix under directories root \
+             or you own"
+        ),
+        ChainWhy::Redirected => format!(
+            "{lead} — {dir} is not a plain directory, and targo loads a verified toolchain's \
+             runtime libraries through no link below its sysroot; the bundle's fix: \
+             {TRUST_LIB_FIX}"
+        ),
+    }
+}
+
+/// The fix a (5f)(g) [`ChainWhy::Redirected`] line names: the bundle's layout, which no
+/// command here changes (a store build is laid as its bundle ships it).
+const TRUST_LIB_FIX: &str = "ship lib/ and lib/rustlib/<target>/lib as real directories, \
+                             never symbolic links";
 
 impl Default for Probes {
     fn default() -> Self {
@@ -372,6 +625,7 @@ impl Default for Probes {
             cc: None,
             claude_defaults: None,
             devtools: None,
+            trust_chain: None,
         }
     }
 }
@@ -753,18 +1007,6 @@ pub const RETIRED_OPT_OUTS: &[(&str, &str)] = &[
         "the default (the registry PATH is always merged)",
     ),
     ("ATERM_NO_SHELL_INTEGRATION", "aterm --no-shell-integration"),
-    ("ATERM_OPERATOR", "[operator] enabled = true"),
-    (
-        "ATERM_NO_OPERATOR",
-        "[operator] enabled = false (the default)",
-    ),
-    (
-        "ATERM_OPERATOR_PROFILE",
-        "the default (one operator profile per state root)",
-    ),
-    ("ATERM_NET_LISTEN", "[net] listen"),
-    ("ATERM_NET_CERT", "[net] cert"),
-    ("ATERM_NET_KEY", "[net] key"),
     ("ATERM_VERBOSE", "aterm --verbose"),
     // `aterm drive`'s prompt-ready pattern.
     ("ATERM_DRIVE_READY", "aterm drive --ready <regex>"),
@@ -925,6 +1167,7 @@ pub fn run(layout: &Layout, prefix: &str, detail: Detail) -> bool {
         index_head: crate::index_probe::probes_this_source(),
         cc: Some(crate::prereq::probe(path.as_deref())),
         devtools: crate::devtools::facts(),
+        trust_chain: probe_trust_chain(layout),
     };
     let mut report = Vec::new();
     let mut faults = Vec::new();
@@ -1511,6 +1754,9 @@ pub fn run_with(
     //     ([`crate::compat::strays`]).
     // (e) A build that needs no root gets no (c) line.
     // (f) An unreadable `bin/rustc` or `bin/trustc` proves neither: a warn naming the read.
+    // (g) A directory on the build's chain that `targo trust` refuses (owned by neither root
+    //     nor us, group/other-writable, or a link below the sysroot) is a warn: `chmod go-w`
+    //     for a writable one of ours, a prefix of ours for root's, the bundle's fix for a link.
     //
     // Warns other than (d) withhold "healthy". "Cannot run" counts in `tools_cannot_run`,
     // "may not run" or "cannot tell" in `tools_unproven`, so the closing line never claims a
@@ -1540,6 +1786,16 @@ pub fn run_with(
             );
         }
         view_stock_names_check(out, p, layout, Some(bin.clone()), &mut tools_cannot_run);
+        // (g) One tool that cannot run, a line per refused directory.
+        if let Some(chain) = probes.trust_chain.as_ref()
+            && chain.build == trust_build
+            && !chain.refused.is_empty()
+        {
+            tools_cannot_run += 1;
+            for refusal in &chain.refused {
+                let _ = writeln!(out, "{}", trust_chain_line(p, trust_build, refusal));
+            }
+        }
         match crate::compat::inspect(layout, trust_build) {
             Some(Ok(inspection)) => {
                 let (line, claim) = exec_root_line(p, trust_build, &inspection);
@@ -1631,7 +1887,9 @@ pub fn run_with(
     // gets and the one re-point that hands it back (the only line about this entry; (9)
     // stays silent on it). Older or gone, it is stale and `repair` re-points the channel at
     // the store, as the next unattended pass does by itself for an older live build tree
-    // ([`crate::seam::live_build_tree`]); `repair` is named because it acts now.
+    // ([`crate::seam::live_build_tree`]); `repair` is named because it acts now. Where no
+    // Trust is published for this target and the store holds none, the local toolchain is
+    // the only Trust there is: a note ([`trust_unserved_here`]).
     if let Some(seal) = &probes.local_seal {
         let _ = match &seal.stale {
             Some(crate::seam::Stale::Dangling) => writeln!(
@@ -1657,29 +1915,52 @@ pub fn run_with(
             None => {
                 // `None` also covers no store build and a dev-linked trust, where the
                 // target may be gone and there is no managed toolchain to point at.
-                let what = if seal.link_target.exists() {
-                    format!(
-                        "names a local toolchain, not the managed one: {} (trustc {}); \
-                         `cargo +trust` and projects pinning `channel = \"trust\"` build with it",
+                let managed = layout.program_current("trust").join("bin").is_dir();
+                let exists = seal.link_target.exists();
+                if exists && !managed && trust_unserved_here(layout) {
+                    // Where no Trust build is published for this target (Linux, Windows:
+                    // trust's own row reads `unavailable on <target>`), a local toolchain
+                    // is the only Trust this machine can have, and the route
+                    // docs/LINUX-LOCAL-TOOLCHAIN.md gives: a fact, not a thing to look at.
+                    writeln!(
+                        out,
+                        "{p}: note — rustup `trust` names a local toolchain: {} (trustc {}); \
+                         no managed Trust is published for this target, so `cargo +trust` \
+                         and projects pinning `channel = \"trust\"` build with it{}",
                         seal.link_target.display(),
-                        seal.trustc
+                        seal.trustc,
+                        if cfg!(target_os = "linux") {
+                            " (docs/LINUX-LOCAL-TOOLCHAIN.md)"
+                        } else {
+                            ""
+                        }
                     )
                 } else {
-                    format!(
-                        "names {}, which no longer exists, so `cargo +trust` and projects \
-                         pinning `channel = \"trust\"` fail",
-                        seal.link_target.display()
-                    )
-                };
-                let fix = if layout.program_current("trust").join("bin").is_dir() {
-                    format!(
-                        " — to use the managed one: {}",
-                        repoint_fix(layout, &seal.link)
-                    )
-                } else {
-                    String::new()
-                };
-                writeln!(out, "{p}: warn — rustup `trust` {what}{fix}")
+                    let what = if exists {
+                        format!(
+                            "names a local toolchain, not the managed one: {} (trustc {}); \
+                             `cargo +trust` and projects pinning `channel = \"trust\"` build \
+                             with it",
+                            seal.link_target.display(),
+                            seal.trustc
+                        )
+                    } else {
+                        format!(
+                            "names {}, which no longer exists, so `cargo +trust` and projects \
+                             pinning `channel = \"trust\"` fail",
+                            seal.link_target.display()
+                        )
+                    };
+                    let fix = if managed {
+                        format!(
+                            " — to use the managed one: {}",
+                            repoint_fix(layout, &seal.link)
+                        )
+                    } else {
+                        String::new()
+                    };
+                    writeln!(out, "{p}: warn — rustup `trust` {what}{fix}")
+                }
             }
         };
     }
@@ -2251,10 +2532,14 @@ pub fn run_with(
             let fix = crate::cli::alias_fix(layout, &tool, program, path_var)
                 .map(|f| format!(" — {f}"))
                 .unwrap_or_default();
-            let managed = crate::vendor_direct::spec(program).map_or_else(
-                || String::from("the pinned build"),
-                |s| format!("the copy aterm updates from {}", s.vendor),
-            );
+            let managed = match crate::vendor_direct::spec(program) {
+                // An ALab build ([`crate::alab`]) is aterm's copy from ALab's channel.
+                Some(_) if crate::alab::build_is_alab(layout, program, *build) => {
+                    String::from("the ALab build aterm manages")
+                }
+                Some(s) => format!("the copy aterm updates from {}", s.vendor),
+                None => String::from("the pinned build"),
+            };
             let _ = writeln!(
                 out,
                 "{p}: warn — {program}: {} (not {managed}; atpkg never edits PATH — remove or \
@@ -2440,10 +2725,10 @@ pub fn run_with(
     }
     // Every problem, not the first one.
     let recorded_problems = recorded_problems(status.as_ref());
-    // (11a) An unserved platform is a state, not a fault (Windows only,
-    // `toolset_unserved_here`): the `*toolset*` "no build for this architecture" verdict
-    // leaves the problem list and is said below as a note. Only that verdict: an
-    // unreachable index or a refused publish is a fault everywhere.
+    // (11a) AN UNSERVED PLATFORM IS A STATE, NOT A FAULT — off macOS, see
+    // `toolset_unserved_here`. The `*toolset*` row's "no build for this architecture"
+    // verdict leaves the problem list (it is said below, as a note) — that one verdict and
+    // no other: an unreachable index or a refused publish is a fault on every platform.
     let toolset_unserved = toolset_unserved_here(status.as_ref());
     let recorded_problems: Vec<String> = if toolset_unserved.is_some() {
         recorded_problems
@@ -2471,21 +2756,48 @@ pub fn run_with(
     let (missing_unexplained, missing_on_purpose, _indexed_dev_linked) =
         missing_against_index(layout, &installed, &dev_linked);
     // (11b) An unserved member is explained by its own row, not missing without a reason
-    // (`drop_unserved`; identity everywhere but Windows).
+    // (`drop_unserved`; identity on macOS).
     let missing_unexplained = drop_unserved(missing_unexplained, toolset_unserved.as_deref());
     let mut toolset_problem = false;
     if let Some(unserved) = &toolset_unserved {
-        // Said once, as what it is: a fact about the index and this target that no command
-        // here changes. The served members (the agents) are reported like any other; their
-        // lines print above this note, so it does not point "below".
+        // Said once, as what it is: a fact about the index and this target, which no
+        // install on this machine changes — the state, and no act. The members it names
+        // are the ones whose own rows say so; the served members (the agents) are
+        // reported like any other — their per-program lines print ABOVE this note (the
+        // program loop runs first), so the note does not point "below". On Linux the one
+        // local route is a dev link of a locally built program (`aterm pkg link`,
+        // docs/LINUX-LOCAL-TOOLCHAIN.md), so the note names it instead of "nothing".
+        // A vendor-direct agent's `unavailable on` row is about that vendor's own
+        // publishing, not the ALab toolset: it is explained the same way, but named apart.
+        let (vendors, alab): (Vec<&String>, Vec<&String>) = unserved
+            .iter()
+            .partition(|name| crate::vendor_direct::is_vendor(name));
+        let named = |names: &[&String]| {
+            names
+                .iter()
+                .map(|n| n.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         let _ = writeln!(
             out,
             "{p}: note — the ALab toolset is unavailable on this platform: no build is \
-             published for this target{}; nothing on this machine changes that",
-            if unserved.is_empty() {
+             published for this target{}{}; {}",
+            if alab.is_empty() {
                 String::new()
             } else {
-                format!(" ({})", unserved.join(", "))
+                format!(" ({})", named(&alab))
+            },
+            if vendors.is_empty() {
+                String::new()
+            } else {
+                format!(", and {} publishes none for it either", named(&vendors))
+            },
+            if cfg!(target_os = "linux") {
+                "a local build links in with `aterm pkg link <program> <checkout>` \
+                 (docs/LINUX-LOCAL-TOOLCHAIN.md)"
+            } else {
+                "nothing on this machine changes that"
             }
         );
     }
@@ -3484,7 +3796,7 @@ pub(crate) fn output_bounded(
 }
 
 /// [`output_bounded`] within the caller's `within` instead of [`PROBE_TIMEOUT`]: a probe
-/// with its own ceiling (`crate::platform`'s Spotlight and `defaults` reads), whose tests
+/// with its own ceiling (`crate::platform`'s `defaults` reads), whose tests
 /// hand it a hang detector instead.
 pub(crate) fn output_bounded_within(
     cmd: &mut aterm_uds::spawnfd::Command,
@@ -3669,12 +3981,11 @@ impl Capture {
         if let Some(mut pipe) = pipe {
             // The thread's handle is not called `shared`: the lock-order census
             // names a lock by its receiver, and a `shared` taken in a fn named `new`
-            // reads as the one aterm-net's relay holds across `io::Error::new`.
+            // reads as a lock held across `io::Error::new`.
             let filled = std::sync::Arc::clone(&read);
             let spawned = std::thread::Builder::new()
                 .name("probe-pipe".into())
                 .spawn(move || {
-                    use std::io::Read as _;
                     let mut chunk = [0u8; 8192];
                     loop {
                         let got = pipe.read(&mut chunk);

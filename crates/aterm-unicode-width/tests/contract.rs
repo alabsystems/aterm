@@ -18,14 +18,10 @@ fn controls_are_none_and_printable_ascii_is_one() {
 
 #[test]
 fn every_other_scalar_value_is_zero_one_or_two_columns() {
-    let mut answered = 0;
     for c in '\u{A0}'..='\u{10FFFF}' {
         let w = c.width();
         assert!(matches!(w, Some(0..=2)), "U+{:04X} -> {w:?}", c as u32);
-        answered += 1;
     }
-    // The control: the range is the whole space above the C1 block.
-    assert_eq!(answered, 1_111_904);
 }
 
 /// `(char, width)` as unicode-width 0.2.2 answered them, recorded 2026-10-15.

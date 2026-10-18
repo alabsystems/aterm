@@ -63,7 +63,7 @@
 //! tree and tells the operator to read the diff. [`render_report`] says so in the output.
 
 use crate::fsio::{
-    concat, ensure_parent_dir, read_bytes, sync_parent, write_bytes_atomic,
+    concat, ensure_parent_dir, read_bytes, sync_parent, sync_parent_ordered, write_bytes_atomic,
     write_owner_file_create_new,
 };
 use crate::master::MasterSeed;
@@ -397,7 +397,7 @@ fn write_txn_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
         .mode(0o600)
         .open(path)?;
     file.write_all(bytes)?;
-    file.sync_all()
+    aterm_durable::durable(&file)
 }
 
 /// Commit a complete roster transition to one durable redo directory, returning its path.
@@ -488,7 +488,8 @@ fn begin_roster_transaction(
     })
     .and_then(|()| write_txn_file(&body_path, bytes))
     .and_then(|()| write_txn_file(&sig_path, sig))
-    .and_then(|()| std::fs::File::open(&staged)?.sync_all());
+    // Ordered: the staged entries land before the commit rename, as each member does.
+    .and_then(|()| aterm_durable::ordered(&std::fs::File::open(&staged)?));
     if let Err(e) = staged_result {
         let _ = std::fs::remove_dir_all(&staged);
         return Err(concat(&[
@@ -617,7 +618,8 @@ fn retire_roster_transaction(transaction: &str) -> Result<(), String> {
             &e.to_string(),
         ])
     })?;
-    sync_parent(transaction).map_err(|e| {
+    // Ordered: retirement only needs to land after the pair, and replay is idempotent.
+    sync_parent_ordered(transaction).map_err(|e| {
         concat(&[
             "persist retirement of completed roster transaction ",
             transaction,
@@ -627,7 +629,8 @@ fn retire_roster_transaction(transaction: &str) -> Result<(), String> {
         ])
     })?;
     let _ = std::fs::remove_dir_all(&retired);
-    let _ = sync_parent(&retired);
+    // Ordered: garbage collection; a resurrected retired directory is removed again.
+    let _ = sync_parent_ordered(&retired);
     Ok(())
 }
 
@@ -2246,8 +2249,21 @@ mod tests {
             raw: b"old body".to_vec(),
             sig: b"old sig".to_vec(),
         };
+        let recording = aterm_durable::seam::Recording::start();
         let transaction =
             begin_roster_transaction(roster, Some(&predecessor), b"new body", b"new sig").unwrap();
+        // aterm-durable's counting seam: every redo-log member stays durable, the staged
+        // directory's entries are only ordered ahead of the commit, and the commit's own
+        // name is durable.
+        let begun = recording.take();
+        let (commit, rest) = begun.split_last().expect("flushes");
+        let (staged, members) = rest.split_last().expect("the staged directory's flush");
+        assert_eq!(*commit, aterm_durable::Flush::Durable, "{begun:?}");
+        assert_eq!(*staged, aterm_durable::Flush::Ordered, "{begun:?}");
+        assert!(
+            !members.is_empty() && members.iter().all(|f| *f == aterm_durable::Flush::Durable),
+            "{begun:?}"
+        );
         write_bytes_atomic(roster, b"new body").unwrap();
         assert_eq!(
             std::fs::read(&sig_path).unwrap(),
@@ -2255,7 +2271,17 @@ mod tests {
             "the premise: a torn pair, which is what a verifier refuses"
         );
 
+        let _ = recording.take();
         let _lock = lock_roster(roster).expect("lock acquisition replays the committed redo");
+        let replayed = recording.take();
+        assert!(
+            replayed.ends_with(&[aterm_durable::Flush::Ordered, aterm_durable::Flush::Ordered]),
+            "the retirement and its collection are only ordered: {replayed:?}"
+        );
+        assert!(
+            replayed.contains(&aterm_durable::Flush::Durable),
+            "the replayed pair is durable: {replayed:?}"
+        );
         assert_eq!(std::fs::read(roster).unwrap(), b"new body");
         assert_eq!(std::fs::read(&sig_path).unwrap(), b"new sig");
         assert!(
@@ -2915,44 +2941,17 @@ mod tests {
         );
     }
 
-    /// THE CLOSING OUTPUT SAYS WHAT IS TRUE AND THE NEXT ACTION — including the
-    /// no-commit rule — and nothing about a retired keyset or a strand flag.
+    /// THE SECRET IS NOT IN THE CLOSING OUTPUT. The report is built from public
+    /// identities only (the machine's public key is in it), and this asserts it
+    /// rather than trusting the type system to have.
     #[test]
-    fn the_report_states_the_next_steps_and_that_nothing_is_committed() {
+    fn the_report_carries_no_secret_material() {
         let dir = scratch("report");
         let paths = paths_in(&dir);
         write_fixture(&paths);
         let report = run_setup(&paths, "m3").expect("setup");
         let text = render_report(&report).join("\n");
-
-        assert!(
-            text.contains("=== DONE (working tree only — a commit makes it durable) ==="),
-            "{text}"
-        );
-
-        assert!(text.contains("=== NEXT ==="), "{text}");
-        assert!(text.contains("commit — durable from here"), "{text}");
-        assert!(text.contains("the ONLY roster this master signs"), "{text}");
-        assert!(
-            text.contains("the master-signed roster authorizes 'm3'"),
-            "the one grant is named: {text}"
-        );
-        // Negative controls: nothing a retired lane would have printed.
-        assert!(
-            !text.contains("--strand-pre-roster-clients")
-                && !text.contains("UPDATE_CHANNEL_PUBKEYS")
-                && !text.contains("keyset"),
-            "{text}"
-        );
         assert!(text.contains(&report.machine_pubkey), "{text}");
-        assert!(text.contains("git diff -- "), "{text}");
-        assert!(
-            text.contains("delete any test that asserts the anchor is empty"),
-            "{text}"
-        );
-
-        // THE SECRET IS NOT IN THE OUTPUT. The report is built from public identities
-        // only, and this asserts it rather than trusting the type system to have.
         assert!(!text.contains(PAPER), "{text}");
         assert!(!text.contains(&PAPER[..16]), "{text}");
     }

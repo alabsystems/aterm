@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-1 bind for `HandoffAddressOwner`'s order half
-//! (`aterm_spec::derive::handoff_address_owner_model`,
+//! (`aterm_models_session::handoff_address_owner_model`,
 //! `CandidateNamedOnlyAfterCommit`): a per-process update candidate names itself in
 //! no `graph/<sid>` entry until the Commit, so one `@<sid>` is never answered by two
 //! live instances while the parent still owns the session (a supervisor reads that
@@ -25,8 +25,9 @@
 use std::path::Path;
 use std::sync::RwLock;
 
+use aterm_models_session::handoff_address_owner_model;
 use aterm_session::LaunchNonce;
-use aterm_spec::derive::{Model, handoff_address_owner_model};
+use aterm_spec::derive::Model;
 use aterm_spec::interp::{self, State};
 use aterm_spec::verify;
 
@@ -75,6 +76,9 @@ struct ProcessDiscoveryReset;
 impl Drop for ProcessDiscoveryReset {
     fn drop(&mut self) {
         crate::proxy::clear_self_sock();
+        // A write queued against the test's socket lands while its mirror
+        // override still stands, never in the real control dir.
+        let _ = crate::proxy::flush_publications(aterm_spec::wait::MUST_HAPPEN);
         crate::proxy::set_mirror_dir_override(None);
     }
 }
@@ -191,28 +195,33 @@ fn a_candidates_entries_name_it_only_after_the_commit() {
         })
     };
 
-    // The pre-Commit window (300 ms, past the 191–272 ms an ungated candidate took
-    // to publish): every carried entry still names the parent, and nothing moved.
-    let window = std::time::Instant::now() + std::time::Duration::from_millis(300);
-    while std::time::Instant::now() < window {
-        for sid in c.ids() {
-            assert_eq!(
-                project(&c.sock_dir, &sid, &c.sock_path, Some(&gate)),
-                before,
-                "a carried id named the candidate while the parent owns it"
-            );
-            assert_eq!(
-                crate::proxy::read_graph_entry(&c.sock_dir, &sid).map(|(sock, _)| sock),
-                Some(c.parent_sock.clone()),
-                "the parent's entry stands"
-            );
-        }
+    // THE PRE-COMMIT WINDOW: once the publisher is parked on the closed gate
+    // (a fact, awaited by a hang detector — never a guessed window), every
+    // carried entry still names the parent, and nothing moved.
+    let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    while gate.parked() == 0 {
         assert!(
-            std::fs::symlink_metadata(&c.link).is_err(),
-            "the latest alias moved before the Commit"
+            std::time::Instant::now() < deadline,
+            "the publisher never reached the gate"
         );
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
+    for sid in c.ids() {
+        assert_eq!(
+            project(&c.sock_dir, &sid, &c.sock_path, Some(&gate)),
+            before,
+            "a carried id named the candidate while the parent owns it"
+        );
+        assert_eq!(
+            crate::proxy::read_graph_entry(&c.sock_dir, &sid).map(|(sock, _)| sock),
+            Some(c.parent_sock.clone()),
+            "the parent's entry stands"
+        );
+    }
+    assert!(
+        std::fs::symlink_metadata(&c.link).is_err(),
+        "the latest alias moved before the Commit"
+    );
     assert!(
         !publisher.is_finished(),
         "the publication waits on the Commit"

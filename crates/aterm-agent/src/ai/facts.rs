@@ -410,21 +410,17 @@ fn codex_keyring(home: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// The end of Codex's usage limit, from its own newest `rate_limits` reading: a window at
-/// 100% whose reset is ahead. A reading older than 6 h says nothing.
+/// The end of Codex's usage limit, from its own `rate_limits` readings
+/// ([`super::codex_limits::home_pick`]: the newest login's, a passed reset void, the
+/// largest share within each window's anchor): a window at 100% whose reset is ahead. No
+/// reading of that login within 6 h says nothing.
 fn codex_limit(home: &Path, now: i64) -> Option<i64> {
-    use crate::supervise::codex_usage as usage;
-    let limits = usage::rollouts_by_write(home)
-        .into_iter()
-        .take(3)
-        .find_map(|(path, _)| {
-            usage::tail_of(&path, usage::TAIL_BYTES).and_then(|t| usage::rollout_rate_limits(&t))
-        })?;
-    if now.saturating_sub(limits.at_unix) > 6 * 3600 {
+    use super::codex_limits as limits;
+    let pick = limits::home_pick(home, now)?;
+    if now.saturating_sub(pick.newest) > limits::FRESH_S {
         return None;
     }
-    limits
-        .windows
+    pick.windows
         .iter()
         .filter(|w| w.used_percent >= 100.0)
         .filter_map(|w| w.resets_at)

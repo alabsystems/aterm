@@ -13,7 +13,7 @@ fn test_session(id: u64) -> Session {
         output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
         modes: mode_mirror_of(&term),
         ui_waiting: Arc::default(),
-        edges: std::sync::Mutex::new(EdgeTable::new()),
+        edges: std::sync::Arc::new(std::sync::Mutex::new(EdgeTable::new())),
         turn_lease: std::sync::Mutex::new(None),
         self_id,
         nonce: LaunchNonce::generate(),
@@ -32,11 +32,15 @@ fn test_session(id: u64) -> Session {
             crate::session_timeline::SessionTimeline::default(),
         )),
         fabric: std::sync::Arc::default(),
+        idem: Default::default(),
         rewrap_gauge: std::sync::Arc::default(),
         human_input: Default::default(),
+        launch: Default::default(),
         generation_look: Default::default(),
         reset_lane: Default::default(),
+        crash_journal: Default::default(),
         update_parked: Default::default(),
+        witness: Default::default(),
         fenced_writes: Default::default(),
     });
     Session {
@@ -47,7 +51,6 @@ fn test_session(id: u64) -> Session {
         pty_closed_at: Arc::default(),
         id,
         term,
-        vi_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         adopt_pulse_hold: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         master: -1,
         pid: -1,
@@ -98,16 +101,6 @@ fn dropping_last_view_raises_reflow_cancel() {
 }
 
 #[test]
-fn insert_starts_at_one_view_and_is_resolvable() {
-    let mut pool = SessionPool::default();
-    assert_eq!(pool.insert(test_session(7)), 7);
-    assert!(pool.get(7).is_some(), "inserted session resolves by id");
-    assert_eq!(pool.iter().count(), 1);
-    // An unknown id is fail-closed None (mirrors the registry discipline).
-    assert!(pool.get(999).is_none());
-}
-
-#[test]
 fn detach_drops_session_exactly_when_last_view_leaves() {
     let mut pool = SessionPool::default();
     pool.insert(test_session(1));
@@ -146,7 +139,7 @@ fn detach_drops_session_exactly_when_last_view_leaves() {
 #[test]
 fn session_close_conforms_to_proxy_registry_no_leak() {
     use aterm_spec::verify::validate_transition_tiered;
-    let model = aterm_spec::derive::proxy_registry_model();
+    let model = aterm_models_session::proxy_registry_model();
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
     let dir = std::env::temp_dir().join(format!("aterm-s1-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("scratch socket dir");

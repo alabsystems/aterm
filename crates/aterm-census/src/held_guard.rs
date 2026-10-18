@@ -36,7 +36,8 @@
 
 use std::path::Path;
 
-/// The source the GUI process runs under the per-session `term` mutex.
+/// The source the GUI process runs under the per-session `term` mutex, with
+/// the window crate's split-out libraries ([`crate::gui_split_src_dirs`]).
 pub(crate) const HELD_GUARD_SCOPE: &[&str] = &["crates/aterm-gui/src", "crates/aterm-control/src"];
 
 /// The O(history) methods that may never run on a held guard.
@@ -75,8 +76,9 @@ pub(crate) struct HeldGuardScan {
     pub(crate) findings: Vec<HeldGuardFinding>,
 }
 
-/// Scan [`HELD_GUARD_SCOPE`] under `root`. A scope directory that is missing is
-/// an `Err`: a guard whose scan set shrank has proven nothing about what left.
+/// Scan [`HELD_GUARD_SCOPE`] and the window crate's split-out libraries under
+/// `root`. A scope directory that is missing is an `Err`: a guard whose scan
+/// set shrank has proven nothing about what left.
 pub(crate) fn scan_tree(root: &Path) -> Result<HeldGuardScan, String> {
     let mut files = Vec::new();
     for dir in HELD_GUARD_SCOPE {
@@ -86,6 +88,10 @@ pub(crate) fn scan_tree(root: &Path) -> Result<HeldGuardScan, String> {
         }
         crate::collect_rs_files(&abs, &mut files)
             .map_err(|e| format!("cannot walk `{dir}`: {e}"))?;
+    }
+    for src in crate::gui_split_src_dirs(root) {
+        crate::collect_rs_files(&src, &mut files)
+            .map_err(|e| format!("cannot walk `{}`: {e}", src.display()))?;
     }
     files.retain(|p| !crate::is_test_file(p));
     files.sort();

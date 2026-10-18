@@ -13,7 +13,6 @@ repository.workspace = true
 description = "Shared types for aterm terminal engine (Rgb, CursorStyle, BiDiMode, ColorPalette)"
 
 [features]
-default = []
 serde = ["dep:serde"]
 # Development seams (`aterm_types::dev_seam!`) in an optimized build; debug builds
 # compile them anyway and the release build never enables this. `dev_seam!` reads
@@ -24,6 +23,10 @@ dev-seams = []
 # a crate of its own, as `aterm-winit-keymap` does.
 
 [dependencies]
+# Exclusive owned staging for the shared atomic theme writer.
+aterm-tempfile = { workspace = true }
+# The theme writer's full flush (aterm-durable: std plus astream-sys, no other code).
+aterm-durable = { workspace = true }
 aterm-alloc = { workspace = true }
 # FNV-1a/64 for `RowsFence::hash_rows`: server and clients must compute one hash.
 aterm-hash = { workspace = true }
@@ -35,6 +38,8 @@ serde = { workspace = true, optional = true, features = ["derive"] }
 
 [dev-dependencies]
 aterm-spec = { workspace = true }
+# Test-only: a serializer for the `serde` feature's round-trip tests.
+aterm-json = { workspace = true }
 
 [lints]
 workspace = true

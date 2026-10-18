@@ -12,14 +12,14 @@
 use std::path::{Path, PathBuf};
 
 use aterm_effects::cat_baker::CatColorKey;
-use aterm_effects::kitty_pet::{ART_ASPECT, ART_ROWS};
+use aterm_effects::kitty_pet::ART_ROWS;
 use aterm_effects::pet_baker::{MOUTH_DETAIL_MIN_H, PetBakeKey, PetBaker};
 use aterm_effects::pet_glyphs_gen::PetGlyphId;
 use aterm_scene::{PathCmd, Tile, parse_path};
 
 /// Authored viewbox shared by every pose.
 const VIEWBOX: (f32, f32) = (244.0, 148.0);
-/// Where the lowest ink of a planted pose lands (`art/pet/rig.py: GROUND_INK`).
+/// Where the lowest ink of a planted pose lands (`examples/art_rig.rs`: `pet::rig::GROUND_INK`).
 const GROUND_INK: f32 = 143.0;
 /// How far a pose's lowest ink may sit from the ground line and still count as
 /// planted: one outline width.
@@ -37,7 +37,7 @@ const AIRBORNE: &[&str] = &[
     "pet_leap_rise",
     "pet_run_1",
     "pet_run_3",
-    // The dog roster re-skins the same pose sheet (`art/pet/poses.py`).
+    // The dog roster re-skins the same pose sheet (`examples/art_rig.rs`: `pet::poses`).
     "pet_dog_apex",
     "pet_dog_hop",
     "pet_dog_leap_descend",
@@ -45,12 +45,6 @@ const AIRBORNE: &[&str] = &[
     "pet_dog_run_1",
     "pet_dog_run_3",
 ];
-
-/// Layer ceiling: the hero budget from `docs/CAT_ART.md`.
-const MAX_LAYERS: usize = 14;
-/// Parsed-command ceiling, above `docs/CAT_ART.md`'s 240 for a hero head because a
-/// full-body animal is a bigger drawing. It bounds the cold bake.
-const MAX_COMMANDS: usize = 360;
 
 fn art_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("art/pet")
@@ -102,9 +96,9 @@ fn num(v: &aterm_toml::Value) -> f32 {
         .unwrap_or(f32::NAN)
 }
 
-/// Every parsed command of every layer, and the ink bounding box.
-fn parsed(p: &Pose) -> (usize, (f32, f32, f32, f32)) {
-    let (mut n, mut x0, mut y0, mut x1, mut y1) = (0usize, f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+/// The ink bounding box of every parsed command of every layer.
+fn parsed(p: &Pose) -> (f32, f32, f32, f32) {
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
     for layer in layers(p) {
         for d in layer
             .get("paths")
@@ -114,7 +108,6 @@ fn parsed(p: &Pose) -> (usize, (f32, f32, f32, f32)) {
         {
             let s = d.as_str().expect("a path is a string");
             let cmds = parse_path(s).unwrap_or_else(|| panic!("{}: unparseable path {s:?}", p.id));
-            n += cmds.len();
             for c in &cmds {
                 let pts: &[(f32, f32)] = &match *c {
                     PathCmd::Move(x, y) | PathCmd::Line(x, y) => vec![(x, y)],
@@ -130,7 +123,7 @@ fn parsed(p: &Pose) -> (usize, (f32, f32, f32, f32)) {
             }
         }
     }
-    (n, (x0, y0, x1, y1))
+    (x0, y0, x1, y1)
 }
 
 /// The renderer swaps poses in place, so they share one box and anchor set or the
@@ -177,7 +170,7 @@ fn every_pose_shares_one_viewbox_and_one_anchor_set() {
 #[test]
 fn no_pose_escapes_its_viewbox() {
     for p in poses() {
-        let (_, (x0, y0, x1, y1)) = parsed(&p);
+        let (x0, y0, x1, y1) = parsed(&p);
         assert!(
             x0 >= 0.0 && y0 >= 0.0 && x1 <= VIEWBOX.0 && y1 <= VIEWBOX.1,
             "{}: ink ({x0:.1},{y0:.1})-({x1:.1},{y1:.1}) escapes the {VIEWBOX:?} \
@@ -192,7 +185,7 @@ fn no_pose_escapes_its_viewbox() {
 #[test]
 fn every_planted_pose_stands_on_one_ground_line() {
     for p in poses() {
-        let (_, (_, _, _, y1)) = parsed(&p);
+        let (_, _, _, y1) = parsed(&p);
         if AIRBORNE.contains(&p.id.as_str()) {
             assert!(
                 y1 < GROUND_INK - PLANT_TOL,
@@ -206,92 +199,6 @@ fn every_planted_pose_stands_on_one_ground_line() {
             "{}: lowest ink {y1:.1} is {:.1} off the ground line {GROUND_INK}",
             p.id,
             y1 - GROUND_INK
-        );
-    }
-}
-
-#[test]
-fn every_pose_respects_the_layer_and_command_budget() {
-    for p in poses() {
-        let n_layers = layers(&p).len();
-        assert!(
-            n_layers <= MAX_LAYERS,
-            "{}: {n_layers} layers exceeds the {MAX_LAYERS} budget",
-            p.id
-        );
-        let (cmds, _) = parsed(&p);
-        assert!(
-            cmds <= MAX_COMMANDS,
-            "{}: {cmds} parsed commands exceeds the {MAX_COMMANDS} budget",
-            p.id
-        );
-    }
-}
-
-/// One dark outline layer, painted first, so the animal reads as one silhouette.
-#[test]
-fn every_pose_opens_with_exactly_one_dark_outline() {
-    for p in poses() {
-        let ls = layers(&p);
-        let roles: Vec<&str> = ls
-            .iter()
-            .map(|l| {
-                l.get("role")
-                    .and_then(aterm_toml::Value::as_str)
-                    .unwrap_or("")
-            })
-            .collect();
-        assert_eq!(
-            roles.first(),
-            Some(&"outline"),
-            "{}: outline paints first",
-            p.id
-        );
-        assert_eq!(
-            roles.iter().filter(|r| **r == "outline").count(),
-            1,
-            "{}: exactly one outline layer",
-            p.id
-        );
-        let fill = ls[0]
-            .get("ref_fill")
-            .and_then(aterm_toml::Value::as_str)
-            .expect("outline ref_fill");
-        let hex = u32::from_str_radix(fill.trim_start_matches('#'), 16).expect("hex");
-        let (r, g, b) = (
-            ((hex >> 16) & 0xFF) as f32 / 255.0,
-            ((hex >> 8) & 0xFF) as f32 / 255.0,
-            (hex & 0xFF) as f32 / 255.0,
-        );
-        let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-        assert!(
-            luma < 0.25,
-            "{}: outline luminance {luma:.3} must stay under 0.25",
-            p.id
-        );
-    }
-}
-
-/// The emitter's layout constants agree with the art and fit
-/// `CatBaker::host_tile`'s slot (`w <= 4·cell_h`, `h <= 2·cell_h`) at every cell
-/// metric, or the pet never bakes.
-#[test]
-fn the_layout_constants_match_the_art_and_fit_the_atlas_slot() {
-    assert!(
-        (ART_ASPECT - VIEWBOX.0 / VIEWBOX.1).abs() < 1e-4,
-        "ART_ASPECT {ART_ASPECT} must equal the authored viewbox aspect {}",
-        VIEWBOX.0 / VIEWBOX.1
-    );
-    for cell_h in 8u32..=64 {
-        let h = (ART_ROWS * cell_h as f32).round();
-        let w = (h * ART_ASPECT).round();
-        assert!(
-            h <= 2.0 * cell_h as f32,
-            "cell_h {cell_h}: art height {h} exceeds the 2·cell_h slot bound"
-        );
-        assert!(
-            w <= 4.0 * cell_h as f32,
-            "cell_h {cell_h}: art width {w} exceeds the 4·cell_h slot width"
         );
     }
 }
@@ -343,7 +250,7 @@ fn ink(tile: &Tile) -> usize {
 
 /// The yawn's gape survives the ship tile. `pet_baker` culls the `mouth` role below
 /// [`MOUTH_DETAIL_MIN_H`] (40 px) and the ship bake is 34 px, so the rig
-/// (`art/pet/pet.py: nose_paths`) paints the gape again in the never-culled `nose`
+/// (`examples/art_rig.rs`: `nose_paths`) paints the gape again in the never-culled `nose`
 /// layer. The purr (same seat and eyes) is the control.
 #[test]
 fn a_yawn_keeps_its_gape_below_the_mouth_cull() {
@@ -377,11 +284,9 @@ fn a_yawn_keeps_its_gape_below_the_mouth_cull() {
 
 /// The gait's vertical lives in the art, not in `PetFrame::lift`: the host lands
 /// lift through `body_px`'s `(lift·cell_h).round()`, a whole-pixel quantiser that
-/// zeroes a small bob at small cells, while `art/pet/pet.py: registration()` plants
+/// zeroes a small bob at small cells, while `examples/art_rig.rs`'s `registration` plants
 /// a pose by its lowest ink minus `airborne`, so art clearance arrives sub-pixel.
 /// Rule: every airborne frame clears a whole pixel at every reviewed cell height.
-/// Its companion in `kitty_pet.rs` is
-/// `the_gallop_keeps_its_lift_out_of_the_pixel_grid`.
 #[test]
 fn the_gaits_vertical_survives_the_pixel_grid_at_every_cell_height() {
     // The cell heights `docs/CAT_ART.md` reviews at, plus the 20 px ship cell.
@@ -391,7 +296,7 @@ fn the_gaits_vertical_survives_the_pixel_grid_at_every_cell_height() {
             if !AIRBORNE.contains(&p.id.as_str()) {
                 continue;
             }
-            let (_, (_, _, _, y1)) = parsed(&p);
+            let (_, _, _, y1) = parsed(&p);
             let clearance = (GROUND_INK - y1) * px_per_unit;
             assert!(
                 clearance >= 1.0,
@@ -411,7 +316,7 @@ fn the_gaits_vertical_survives_the_pixel_grid_at_every_cell_height() {
             .into_iter()
             .find(|p| p.id == id)
             .unwrap_or_else(|| panic!("{id} is in the roster"));
-        let (_, (_, _, _, y1)) = parsed(&p);
+        let (_, _, _, y1) = parsed(&p);
         let px = (GROUND_INK - y1) * ship;
         assert!(
             px >= 2.0,

@@ -12,8 +12,8 @@
 //! `ERR rate` instead of saturating the engine. The cap is far above legitimate
 //! driving, so only a runaway loop is throttled.
 //!
-//! Its `NoOverdraft` bound (a write is admitted only with a spare token; tokens
-//! never exceed the cap) is model-checked by `inject_floor_model` (`aterm-spec`).
+//! Its `NoOverdraft` bound: a write is admitted only with a spare token, and
+//! tokens never exceed the cap.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};

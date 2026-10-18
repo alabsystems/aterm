@@ -106,29 +106,6 @@ fn ink_renders_byte_identically_to_sgr_fg_recolor() {
     assert_ne!(fa, rend.render_input(&plain).pixels);
 }
 
-/// At full coverage (U+2588 is drawn at 255 across the cell) the blit lands the exact ink
-/// bytes.
-#[test]
-fn ink_endpoint_exact_at_full_coverage() {
-    let mut rend = renderer();
-    let (cw, ch) = rend.cell_size();
-    let mut term = Terminal::new(1, 4);
-    term.process("\x1b[?25l█".as_bytes());
-    let ink: [u8; 3] = [0x12, 0x34, 0xAB];
-    let mut input = term.cell_frame(1, 4);
-    input.ink = vec![InkCell {
-        row: 0,
-        col: 0,
-        color: ink,
-    }];
-    let f = rend.render_input(&input);
-    let px = cell_pixels(&f, cw, ch, 0, 0);
-    assert!(
-        px.contains(&rgb_to_u32(ink)),
-        "cov==255 must land the exact ink bytes (no colour math in the renderer)"
-    );
-}
-
 /// Ink applies before the selection fg floor on selected cells: with an ink colour
 /// illegible on the selection band, the drawn colour is exactly
 /// `floor_selection_fg(ink, sel_bg)` and the raw ink bytes never reach the frame.

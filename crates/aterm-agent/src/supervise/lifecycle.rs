@@ -66,9 +66,14 @@ pub(super) fn refusal_key(said: &str) -> String {
 }
 
 impl<C: Ctl> Session<'_, C> {
-    /// The hosted loop's stop flag is set.
+    /// The hosted loop's stop flag is set: read through the door
+    /// ([`super::super::fx::Fx::raised`]), so a harness tape holds the read
+    /// that first saw it raised — and how many reads before it did not — in
+    /// the order the loop read it, whichever thread raised it.
     pub(super) fn stopped(&self) -> bool {
-        self.stop.as_ref().is_some_and(|s| s.load(Ordering::SeqCst))
+        self.fx.raised(super::super::tape::doors::RAISED_STOP, || {
+            self.stop.as_ref().is_some_and(|s| s.load(Ordering::SeqCst))
+        })
     }
 
     /// Record the session's working directory from a bare `meta` reply
@@ -147,10 +152,10 @@ impl<C: Ctl> Session<'_, C> {
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
         let why = clip(&one_line(why));
-        if self.refusal_news(&format!("HALTED {why}"), Instant::now()) {
+        if self.refusal_news(&format!("HALTED {why}"), self.fx.mono()) {
             review.note(&format!("HALTED seq={seq} {why}"));
         }
-        let since = Instant::now();
+        let since = self.fx.mono();
         loop {
             if self.stopped() {
                 return Ok(());
@@ -168,7 +173,7 @@ impl<C: Ctl> Session<'_, C> {
                 Some("0") => {
                     review.note(&format!(
                         "UNHALTED seq={seq} after {} ms",
-                        since.elapsed().as_millis()
+                        self.fx.since(since).as_millis()
                     ));
                     self.refusal_said = None;
                     return Ok(());
@@ -261,15 +266,15 @@ impl<C: Ctl> Session<'_, C> {
         ));
         self.lower_badges(seq, review)?;
         self.give_back_claim();
-        self.turn_end.park_off();
-        let since = Instant::now();
+        self.off_stood(seq);
+        let since = self.fx.mono();
         let mut seq = seq;
         loop {
-            if self.stopped() || Instant::now() >= deadline {
+            if self.stopped() || self.fx.mono() >= deadline {
                 return Ok(());
             }
             let step = deadline
-                .saturating_duration_since(Instant::now())
+                .saturating_duration_since(self.fx.mono())
                 .min(OFF_STEP);
             match self.wait(&["seq", &seq.to_string()], step)? {
                 Wait::Latched => {
@@ -307,7 +312,7 @@ impl<C: Ctl> Session<'_, C> {
                 review.note(&format!(
                     "UNPARKED seq={seq} autopilot={} after {} ms",
                     now.word(),
-                    since.elapsed().as_millis()
+                    self.fx.since(since).as_millis()
                 ));
                 // The session is supervised again: the claim the park gave
                 // back is taken before anything is pressed, typed or raised.
@@ -319,6 +324,22 @@ impl<C: Ctl> Session<'_, C> {
                 return Ok(());
             }
         }
+    }
+
+    /// AUTOPILOT OFF STANDS ON THE SESSION: what the park ends is over
+    /// ([`TurnEndState::park_off`]), and the ledger says so
+    /// ([`approvals::RULE_OFF_STOOD`]) for a loop that follows, which takes
+    /// up its books as this one holds them after the park
+    /// (`Session::seed_from_ledger`).
+    pub(super) fn off_stood(&mut self, seq: u64) {
+        self.turn_end.park_off();
+        self.ledger_row(
+            approvals::RULE_OFF_STOOD,
+            approvals::Outcome::Waiting,
+            "",
+            approvals::OFF_STOOD,
+            seq,
+        );
     }
 
     /// `ERR busy …` / `ERR rate`: wait [`Session::refusal_pause`] (doubling
@@ -342,7 +363,7 @@ impl<C: Ctl> Session<'_, C> {
             self.stall_suspect = true;
         }
         let said = clip(&one_line(why));
-        if self.refusal_news(&format!("REFUSED {said}"), Instant::now()) {
+        if self.refusal_news(&format!("REFUSED {said}"), self.fx.mono()) {
             review.note(&format!(
                 "REFUSED seq={seq} backoff={} {said}",
                 pause.as_millis()
@@ -407,7 +428,7 @@ impl<C: Ctl> Session<'_, C> {
             return Ok(());
         };
         let screen = self.screen()?;
-        let turn = self.turn_of(screen);
+        let turn = self.point_of(screen);
         // An idle point the turn-end policy escalated (`claude idle: …`,
         // `claude wall: …`) is adopted like a box or a question: a loop that
         // restarted over it decides nothing new there (no work seen since),
@@ -491,16 +512,14 @@ impl<C: Ctl> Session<'_, C> {
     /// after it ([`Self::adopted_limit_over`]) — so a limit met after that is
     /// a new episode, mailed. The TURN-END POLICY'S badge mostly carries no
     /// point the rejudge raises it again from — `/login`'s "finish sign-in",
-    /// a switch's note, a Codex sandbox fall, each said once — so its text is
+    /// said once — so its text is
     /// kept ([`Session::badge_parked`]) and set again as the park ends on a
     /// word ([`Self::raise_parked_badge`]), unless the worker is read working
     /// meanwhile, which is that badge's end as it is outside a park. One an
     /// act's own miss raised (a text the guard found no row for, one left
     /// typed, a draft with no fenced Enter) is kept and set again the same
     /// way, and its act, decided again after the park, may miss again and
-    /// escalate it once more. The note that Codex's goal runs on stays up
-    /// with its save-then-wait switch, which a park leaves standing (the
-    /// design's §7): an entry that holds it is `kept`. A request not served
+    /// escalate it once more. A request not served
     /// is the outage it is.
     pub(super) fn lower_badges(&mut self, seq: u64, review: &mut dyn Review) -> Result<(), Fail> {
         self.close_box(seq, review)?;
@@ -512,11 +531,8 @@ impl<C: Ctl> Session<'_, C> {
             self.lower_adopted_limit(seq, PARKED_OFF, review)?;
         }
         if std::mem::take(&mut self.turn_end_badge) {
-            let text = self
-                .attention_ours
-                .clone()
-                .filter(|t| !t.contains(GOAL_NOTE_HEAD));
-            let said = self.unset_if_ours(|t| !t.contains(GOAL_NOTE_HEAD))?;
+            let text = self.attention_ours.clone();
+            let said = self.unset_if_ours(|_| true)?;
             review.note(&format!(
                 "CLEARED seq={seq} {CLEARED_TURN_END} attention={said}"
             ));
@@ -589,20 +605,25 @@ impl<C: Ctl> Session<'_, C> {
         // No teller rides beside the hosted loop: the story lines it owes the
         // window (`story chose …`) go out on its own connection.
         self.tell_own = true;
-        if self.ledger_path.is_none() {
-            self.ledger_path.clone_from(&opts.ledger);
+        if self.setup.ledger_path.is_none() {
+            self.setup.ledger_path.clone_from(&opts.ledger);
         }
         let allow = opts.allow();
         let mut warn = std::io::stderr();
         if let Some(path) = opts.journal.as_deref() {
-            approvals::bound(path);
+            self.fx.bound(path);
         }
-        let journal = Journal::open(opts.journal.as_deref(), self.sid.as_deref(), &mut warn);
+        let journal = self.fx.open_journal(
+            opts.journal.as_deref(),
+            self.setup.sid.as_deref(),
+            &mut warn,
+        );
         let sink = Mutex::new(Sink {
             out,
             journal,
             warn: Some(&mut warn),
             teller: None,
+            fx: self.fx.clone(),
         });
         let mut review = Lines {
             sink: &sink,
@@ -612,11 +633,15 @@ impl<C: Ctl> Session<'_, C> {
         // A stop that cut a request short (the transport's interrupter)
         // ends the loop as a stop, not as the failure the cut request saw.
         let end = if self.stopped() { Ok(End::Quit) } else { end };
+        // The hand-over is read once, here, and only after a stop: one read
+        // through the door, so the latch a raised flag keeps never shows
+        // this loop a hand-over its host lowered again.
         let handed_over = self.stopped()
             && self
-                .handover
-                .as_ref()
-                .is_some_and(|h| h.load(Ordering::SeqCst));
+                .fx
+                .raised(super::super::tape::doors::RAISED_HANDOVER, || {
+                    self.setup.handover.raised()
+                });
         if handed_over {
             // The next loop adopts what this one raised: only the claim goes.
             if self.box_ask.is_some() || self.turn_end_badge || self.limit.is_some() {

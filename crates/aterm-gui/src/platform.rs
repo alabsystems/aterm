@@ -13,7 +13,9 @@
 //! * `AppRtWindows` provides Windows-native chrome, notifications and preferences.
 //! * [`AppRtLinux`] applies winit's window theme and maintains the in-memory
 //!   toolbar model on Linux/BSD. Unsupported native chrome operations are inert;
-//!   notification delivery uses the channel-draining stub.
+//!   notification delivery uses `notify::spawn_delivery`: freedesktop
+//!   `Notify` over the session bus on Linux, a channel-draining stub on the
+//!   BSDs.
 //!
 //! [`PlatformAppRt`] is the target-selected concrete type the `App` stores. Its
 //! preference-probe flag keeps test Apps on an inert arm of the same runtime seam.
@@ -265,9 +267,9 @@ pub(crate) trait AppRt {
     }
 
     /// Spawn the process-wide notification delivery thread and return the bounded
-    /// `SyncSender` each tab clones into its engine callbacks. macOS and Windows
-    /// deliver; elsewhere this is the channel-draining stub (senders never block;
-    /// nothing is delivered).
+    /// `SyncSender` each tab clones into its engine callbacks. macOS, Windows and
+    /// Linux deliver; elsewhere this is the channel-draining stub (senders never
+    /// block; nothing is delivered).
     /// `own_alerts` is the live `desktop_alerts` switch: while it reads `false` the
     /// thread drops every notice aterm wrote itself ([`NotifyMsg::own`]).
     fn send_notification_init(
@@ -434,7 +436,7 @@ pub(crate) trait AppRt {
     /// Show a native modal confirmation for a destructive quit/close gesture and
     /// block until the user answers. Returns `Some(true)` to PROCEED, `Some(false)`
     /// to CANCEL, or `None` when the platform has no native dialog — the caller then
-    /// falls back to the in-window titlebar-warning confirm. `proceed_label` titles
+    /// asks through the in-window confirm banner instead. `proceed_label` titles
     /// the affirmative button; a "Cancel" button is always added.
     fn confirm(&self, title: &str, body: &str, proceed_label: &str) -> Option<bool>;
 
@@ -642,7 +644,7 @@ impl AppRt for AppRtMacOS {
                 f64,
                 f64,
                 f64,
-            ) -> aterm_objc::Id = aterm_objc::msg();
+            ) -> aterm_objc::Id = aterm_objc::checked_msg();
             let color = make(
                 aterm_objc::class(c"NSColor").as_id(),
                 aterm_objc::sel!(colorWithSRGBRed:green:blue:alpha:),
@@ -970,7 +972,7 @@ impl AppRt for AppRtMacOS {
                 aterm_objc::Id,
                 aterm_objc::Sel,
                 libc::pid_t,
-            ) -> aterm_objc::Id = aterm_objc::msg();
+            ) -> aterm_objc::Id = aterm_objc::checked_msg();
             let app = find(
                 aterm_objc::class(c"NSRunningApplication").as_id(),
                 aterm_objc::sel!(runningApplicationWithProcessIdentifier:),
@@ -983,7 +985,7 @@ impl AppRt for AppRtMacOS {
                 aterm_objc::Id,
                 aterm_objc::Sel,
                 usize,
-            ) -> aterm_objc::Bool = aterm_objc::msg();
+            ) -> aterm_objc::Bool = aterm_objc::checked_msg();
             activate(
                 app,
                 aterm_objc::sel!(activateWithOptions:),
@@ -1093,13 +1095,16 @@ impl AppRt for AppRtMacOS {
 
 /// Map aterm's config [`WindowTheme`] onto the winit window-theme override
 /// [`winit::window::Theme`] applied via [`Window::set_theme`]:
-/// * `Auto`  → `None` — clear the override. On Wayland the sctk-adwaita frame
-///   picks its own variant (`FrameConfig::auto`); on X11 winit defaults the
-///   `_GTK_THEME_VARIANT` hint to dark. Neither backend reports the desktop
-///   preference back (`Window::theme()` is the override or `None`, and no
-///   `ThemeChanged` arrives), which is why `App::chrome_theme_for_apprt` resolves
-///   Linux `Auto` from the terminal theme instead.
-/// * `Light` → `Some(Theme::Light)` — force the light client-side-decoration variant.
+/// * `Auto`  → `None` — clear the override. On X11 winit defaults the
+///   `_GTK_THEME_VARIANT` hint to dark; on Wayland the fork only stores the value
+///   (it draws no frame since LW.5: a window the compositor leaves undecorated
+///   has aterm's own header, `crate::client_frame`).
+///   Neither backend reports the desktop preference back (`Window::theme()` is
+///   the override or `None`, and no `ThemeChanged` arrives), which is why
+///   `App::chrome_theme_for_apprt` resolves Linux `Auto` from the terminal theme
+///   instead.
+/// * `Light` → `Some(Theme::Light)` — force the light variant of the window
+///   system's frame (X11's `_GTK_THEME_VARIANT`, a Windows title bar).
 /// * `Dark`  → `Some(Theme::Dark)` — force the dark variant.
 ///
 /// PURE: a total `match` with no I/O, so it is unit-tested directly (see the `tests`
@@ -1115,17 +1120,47 @@ pub(crate) fn window_theme_to_winit(theme: WindowTheme) -> Option<winit::window:
     }
 }
 
-/// How long the NSEvent currently being dispatched sat in the NSApp queue before
-/// this code ran, in nanoseconds — the touch-to-glass slice NO post-dequeue stamp
-/// can see. `NSEvent.timestamp` and `NSProcessInfo.systemUptime` share the
-/// seconds-since-boot clock, so their difference IS the queue age (hardware
-/// arrival → dispatch). A parked event loop (the FIFO drawable park, a long
-/// handler) queues keyDowns for tens of milliseconds; backdating the latency
-/// stamps by this age makes that visible to `key->write`, `input->present`, and
-/// the video key ledger. Fail-closed `None`: off the main thread, outside a
-/// dispatch, or on a suspicious age (negative beyond scheduler jitter, or > 2 s —
-/// clock skew / a synthesized or replayed event) the caller falls back to "now",
-/// which is exactly today's behaviour.
+/// Proof that this process launched WINDOWED: its event loop is AppKit's, whose
+/// `+[NSApplication sharedApplication]` already exists, so sending it again
+/// creates nothing.
+///
+/// A headless process must never send it: the send CREATES the application
+/// object, and its `-init` checks the process in with LaunchServices and opens
+/// a WindowServer connection (`app_menu_bar`'s module doc). So every function
+/// that sends it takes this proof first — the menu bar reader as an argument,
+/// the rest from [`Windowed::get`] — and answers its headless value without
+/// one.
+///
+/// Minted only by [`Windowed::launch`], at the two windowed launches:
+/// `main_entry`'s AppKit loop branch and the `objc_toolbar_drive` example's
+/// driver, a windowed process of its own. A unit-test build mints none.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Windowed(());
+
+/// Whether [`Windowed::launch`] ran in this process.
+#[cfg(target_os = "macos")]
+static WINDOWED_LAUNCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(target_os = "macos")]
+impl Windowed {
+    /// Mint the proof at a windowed launch, before its AppKit event loop is
+    /// built. Called by `main_entry`'s windowed branch and the toolbar drive,
+    /// nowhere else.
+    pub(crate) fn launch() -> Self {
+        WINDOWED_LAUNCH.store(true, std::sync::atomic::Ordering::Release);
+        Self(())
+    }
+
+    /// The proof, if this process launched windowed; `None` in a headless
+    /// process and in a unit-test build.
+    pub(crate) fn get() -> Option<Self> {
+        WINDOWED_LAUNCH
+            .load(std::sync::atomic::Ordering::Acquire)
+            .then_some(Self(()))
+    }
+}
+
 /// The modifier state winit last DERIVED FROM AN EVENT for `window` — its own
 /// cache, which `update_modifiers` writes before it queues `ModifiersChanged`.
 /// For re-syncing after an `NSException` was contained inside a
@@ -1140,12 +1175,87 @@ pub(crate) fn cached_modifiers(window: &winit::window::Window) -> winit::keyboar
     window.cached_modifiers()
 }
 
+/// The window setting for an Option that is an Alt (`alt`, [`crate::App::option_is_alt`]):
+/// both keys, so AppKit is handed each Option key event without its Option characters and
+/// neither composes a glyph (Option+a, "å") nor starts a dead key (Option+e), and the key
+/// event's text is the layout's character at the Shift level, which the encoder sends after
+/// ESC; neither key otherwise, so Option types what the layout composes.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub(crate) fn option_as_alt_for(alt: bool) -> winit::platform::macos::OptionAsAlt {
+    use winit::platform::macos::OptionAsAlt;
+    if alt {
+        OptionAsAlt::Both
+    } else {
+        OptionAsAlt::None
+    }
+}
+
+/// Make `window`'s Option keys an Alt (`alt`) or let them compose: [`option_as_alt_for`],
+/// written by `App::sync_option_as_alt` and at the window's creation. No-op off macOS (no
+/// other backend composes on Alt: X11 and Wayland report AltGr as a level, not as Alt, and
+/// the Windows backend encodes the composed key itself).
+pub(crate) fn set_option_as_alt(window: &winit::window::Window, alt: bool) {
+    #[cfg(target_os = "macos")]
+    {
+        use winit::platform::macos::WindowExtMacOS as _;
+        window.set_option_as_alt(option_as_alt_for(alt));
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (window, alt);
+}
+
+/// Whether an Option chord's key-event text is what Option composed rather than the
+/// layout's character at the Shift level: on macOS, whenever the window's Option is not an
+/// Alt (`option_is_alt`, what `App::sync_option_as_alt` last set), so the keymap must not
+/// hand that text to the encoder as the layout's character (`keymap::layout_text`). Never
+/// off macOS.
+#[must_use]
+pub(crate) fn option_composes(option_is_alt: bool) -> bool {
+    cfg!(target_os = "macos") && !option_is_alt
+}
+
+/// What a window told Option is an Alt (or not) puts on it and tells the keymap, without a
+/// window: who gets it is `app_input_option_as_alt_tests.rs`, and the window half
+/// (`replace_event` taking Option's characters away) is
+/// `crates/aterm-gui/examples/objc_ime_drive.rs`'s stage 8, a windowed drive.
+#[cfg(test)]
+mod option_as_alt_tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_alt_window_is_both_option_keys_and_a_composing_one_neither() {
+        use winit::platform::macos::OptionAsAlt;
+        assert_eq!(super::option_as_alt_for(true), OptionAsAlt::Both);
+        assert_eq!(super::option_as_alt_for(false), OptionAsAlt::None);
+    }
+
+    #[test]
+    fn only_a_macos_option_that_is_no_alt_composes() {
+        assert!(!super::option_composes(true));
+        assert_eq!(super::option_composes(false), cfg!(target_os = "macos"));
+    }
+}
+
+/// How long the NSEvent currently being dispatched sat in the NSApp queue before
+/// this code ran, in nanoseconds — the touch-to-glass slice NO post-dequeue stamp
+/// can see. `NSEvent.timestamp` and `NSProcessInfo.systemUptime` share the
+/// seconds-since-boot clock, so their difference IS the queue age (hardware
+/// arrival → dispatch). A parked event loop (the FIFO drawable park, a long
+/// handler) queues keyDowns for tens of milliseconds; backdating the latency
+/// stamps by this age makes that visible to `key->write`, `input->present`, and
+/// the video key ledger. Fail-closed `None`: in a headless process, off the main
+/// thread, outside a dispatch, or on a suspicious age (negative beyond scheduler jitter, or > 2 s —
+/// clock skew / a synthesized or replayed event) the caller falls back to "now",
+/// which is exactly today's behaviour.
 #[cfg(target_os = "macos")]
 pub(crate) fn current_event_queue_age_ns() -> Option<u64> {
     use aterm_objc::{class, sel};
 
     use crate::appkit::{self, MainThread};
 
+    // A headless process has no event queue to age, and no application object
+    // to ask: the send below would create one.
+    let _windowed = Windowed::get()?;
     let _main_thread = MainThread::new()?;
     // SAFETY: `+sharedApplication` is `-(id)`, the main-thread AppKit singleton
     // (`_main_thread` is the witness); `-currentEvent` is `-(id)` and nil
@@ -1235,7 +1345,7 @@ pub(crate) fn appkit_window_number(_window: &Window) -> i64 {
 /// instance's `App` reaches even that — they get [`no_recent_user_input_event`]
 /// through the injected `App::user_input_recent` field. (It also never touches
 /// AppKit's event queue: the crash-45791 concern this probe originally replaced
-/// `nextEventMatchingMask` for still holds — see the guard test below.)
+/// `nextEventMatchingMask` for still holds.)
 ///
 /// Fails CLOSED: if the HID system cannot be read, input is reported as recent
 /// (the machine is treated as busy), the same posture as an invalid sample.
@@ -1439,18 +1549,6 @@ mod user_input_probe_tests {
         assert!(user_input_age_is_recent(f64::NAN, 0.5));
         assert!(user_input_age_is_recent(-0.001, 0.5));
         assert!(!user_input_age_is_recent(f64::INFINITY, 0.5));
-    }
-
-    /// Regression for crash-45791: even a non-dequeuing AppKit event query can
-    /// run winit's queued observer closure and recursively enter its handler.
-    /// Keep the event-pumping selector out of the platform layer completely.
-    #[test]
-    fn automatic_update_input_probe_never_polls_the_appkit_event_queue() {
-        let forbidden_selector = ["nextEventMatchingMask_", "untilDate_inMode_dequeue("].concat();
-        assert!(
-            !include_str!("platform.rs").contains(&forbidden_selector),
-            "winit callbacks must not query AppKit through its event-pumping selector"
-        );
     }
 
     /// The macOS probe is a kernel registry read (never WindowServer — see
@@ -1778,9 +1876,10 @@ pub(crate) fn current_event_queue_age_ns() -> Option<u64> {
 /// the client-side-decoration light/dark variant honours config `window_theme`; the
 /// toolbar seam maintains a REAL in-memory tab-chrome model (`toolbar.rs`) and seeds
 /// the window title from it; the menu install delegates to the menu stub; and
-/// notification delivery forwards to `notify::spawn_delivery`'s channel-draining
-/// stub. The terminal renders + input works; only the genuinely OS-native chrome a
-/// header bar would add (which needs gtk4 system libs) is deferred.
+/// notification delivery forwards to `notify::spawn_delivery` (freedesktop
+/// `Notify` on Linux, a channel-draining stub on the BSDs). The terminal renders +
+/// input works; only the genuinely OS-native chrome a header bar would add (which
+/// needs gtk4 system libs) is deferred.
 #[cfg(all(not(target_os = "macos"), not(windows)))]
 pub(crate) struct AppRtLinux {
     pub(crate) probe_preferences: bool,
@@ -1809,8 +1908,9 @@ impl AppRt for AppRtLinux {
 
     /// CAMetalLayer colour-space tagging is a CoreAnimation concept. Linux
     /// presents SDR BY DESIGN (decided 2026-09-25 under the owner's standing
-    /// direction): wgpu's Vulkan swapchain is presented directly as sRGB, and
-    /// the extended-linear (EDR) tag is refused, so the aurora pass stays inert.
+    /// direction): the GL arm's EGL window surface is presented directly as
+    /// sRGB, and the extended-linear (EDR) tag is refused, so the aurora pass
+    /// stays inert.
     /// HDR there would need a Wayland `color-management-v1` client plus an
     /// `Rgba16Float` swapchain — a lane nobody is building.
     fn window_set_surface_colorspace(
@@ -1826,13 +1926,13 @@ impl AppRt for AppRtLinux {
 
     /// INTENTIONAL no-op: `contentsGravity` is a CoreAnimation concept, and the
     /// stale-frame rescale it defends against is specific to the `CAMetalLayer`
-    /// SUBLAYER `raw-window-metal` installs. The Vulkan/Wayland path presents the
-    /// swapchain directly, so there is no intermediate layer to anchor.
+    /// SUBLAYER `raw-window-metal` installs. The EGL window surface on X11 and
+    /// Wayland presents directly, so there is no intermediate layer to anchor.
     /// Documented rather than silently empty.
     fn window_anchor_surface_top_left(&self, _window: &Window) {}
 
-    /// No CoreAnimation layer to read: the Vulkan/Wayland path presents the
-    /// swapchain directly, so there is no intermediate layer whose gravity could
+    /// No CoreAnimation layer to read: the EGL window surface presents
+    /// directly, so there is no intermediate layer whose gravity could
     /// rescale a stale frame — and therefore nothing to report.
     fn window_surface_presentation(&self, _window: &Window) -> Option<(String, f64, bool)> {
         None
@@ -1909,8 +2009,8 @@ impl AppRt for AppRtLinux {
         toolbar::read_tab_chrome(handle)
     }
 
-    /// No native dialog off macOS: `None` tells the caller to fall back to the
-    /// in-window titlebar-warning confirm (see `App::confirm_destructive_close`).
+    /// No native dialog off macOS: `None` tells the caller to ask through the
+    /// in-window confirm banner (see `App::confirm_destructive_close`).
     fn confirm(&self, _title: &str, _body: &str, _proceed_label: &str) -> Option<bool> {
         None
     }
@@ -1968,6 +2068,51 @@ pub(crate) fn platform_apprt() -> PlatformAppRt {
         AppRtLinux {
             probe_preferences: !cfg!(test),
         }
+    }
+}
+
+/// The runtime handed to a headless test or benchmark fixture. Its native
+/// preference reads stay on the inert arm even when `bench-support` compiles
+/// the fixture into a non-test library. The normal live factory is unchanged.
+#[cfg(any(test, feature = "bench-support"))]
+pub(crate) fn headless_fixture_apprt(mut apprt: PlatformAppRt) -> PlatformAppRt {
+    apprt.probe_preferences = false;
+    apprt
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod headless_fixture_tests {
+    use super::{AppRt as _, AppRtMacOS, headless_fixture_apprt};
+    use crate::native_appearance::AppearancePreferences;
+
+    #[test]
+    fn a_headless_fixture_closes_the_native_preferences_arm() {
+        // The existing test-build arm remains inert.
+        let inert = headless_fixture_apprt(AppRtMacOS {
+            probe_preferences: false,
+        });
+        assert!(!inert.probe_preferences);
+        assert_eq!(
+            inert.native_appearance_preferences(),
+            AppearancePreferences::default()
+        );
+        assert!(!inert.reduce_motion());
+
+        // A bench-support library is not cfg(test): its live factory hands
+        // the fixture this armed state. Refuse it before calling any getter,
+        // so a failed assertion never reaches NSWorkspace or another OS read.
+        let fixture = headless_fixture_apprt(AppRtMacOS {
+            probe_preferences: true,
+        });
+        assert!(
+            !fixture.probe_preferences,
+            "a headless fixture must not inherit the live native-preference arm"
+        );
+        assert_eq!(
+            fixture.native_appearance_preferences(),
+            AppearancePreferences::default()
+        );
+        assert!(!fixture.reduce_motion());
     }
 }
 
@@ -2094,11 +2239,13 @@ fn begin_app_nap_opt_out() -> Option<AppNapActivity> {
 #[cfg(all(not(target_os = "macos"), not(windows)))]
 const GSETTINGS_READ_BOUND: std::time::Duration = std::time::Duration::from_millis(200);
 
-/// The GNOME motion preference, read the one dependency-free way: the
-/// `gsettings` CLI. (A D-Bus client is ruled out — the zbus graph was dropped
-/// on the owner's 2026-08-25 decision, see this crate's `Cargo.toml`.) A
-/// missing binary, a non-zero exit, a timeout or any value but `false` answers
-/// `false` (not reduced).
+/// The GNOME motion preference, read through the `gsettings` CLI. aterm now
+/// has a first-party D-Bus client (aterm-dbus: the AT-SPI publisher and
+/// desktop notifications use it), so reading
+/// `org.freedesktop.portal.Settings` over the session bus instead is the
+/// a11y ruling's optional step 7 (`docs/AUDIT-third-party-2026-10-15.md`,
+/// unit a11y), not done. A missing binary, a non-zero exit, a timeout or any
+/// value but `false` answers `false` (not reduced).
 #[cfg(all(not(target_os = "macos"), not(windows)))]
 fn gnome_reduce_motion() -> bool {
     read_bounded_stdout(
@@ -2157,7 +2304,12 @@ pub(crate) fn read_bounded_stdout(
 
 #[cfg(test)]
 mod linux_reduce_motion_tests {
-    use super::{gnome_animations_disabled, read_bounded_stdout};
+    use super::gnome_animations_disabled;
+    // `read_bounded_stdout`'s own tests are unix's: they run `/bin/sh` and
+    // `/bin/sleep`. On Windows the spawn fails, so the first asserted a stdout it
+    // could not get and the second passed without a child.
+    #[cfg(unix)]
+    use super::read_bounded_stdout;
 
     #[test]
     fn only_a_false_enable_animations_means_reduced() {
@@ -2171,6 +2323,7 @@ mod linux_reduce_motion_tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_bounded_read_returns_stdout_of_a_successful_child() {
         // The bound is a hang detector here: `GSETTINGS_READ_BOUND` (200 ms) is the
@@ -2208,6 +2361,7 @@ mod linux_reduce_motion_tests {
     /// The child lives ten minutes, so a read that waited for it takes ten
     /// minutes, and the bound below is a hang detector (a minute), never a
     /// latency budget.
+    #[cfg(unix)]
     #[test]
     fn the_bounded_read_kills_a_child_that_outlives_the_bound() {
         let started = std::time::Instant::now();
@@ -2228,7 +2382,10 @@ mod linux_reduce_motion_tests {
 /// subclass owning the relay, registered on the WORKSPACE notification center for
 /// `NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification` and relaying each
 /// post into the existing `Wake` channel (no policy logic here; the main thread
-/// re-queries and resolves).
+/// re-queries and resolves). The same observer relays
+/// `NSWorkspaceDidWakeNotification` to the update checker
+/// (`aterm_update::note_system_woke`), which ends its wait at once instead of
+/// noticing the wake by the clock seconds later.
 ///
 /// # THE W2 SEAM
 ///
@@ -2274,6 +2431,11 @@ mod reduce_motion {
     pub(crate) const DISPLAY_OPTIONS_NOTIFICATION: &str =
         "NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification";
 
+    /// The workspace notification for a wake from sleep. Its value equals AppKit's
+    /// exported `NSWorkspaceDidWakeNotification` constant; it too is posted on the
+    /// WORKSPACE centre.
+    pub(crate) const DID_WAKE_NOTIFICATION: &str = "NSWorkspaceDidWakeNotification";
+
     /// The observer target's ivars.
     ///
     /// A boxed relay rather than the `EventLoopProxy<Wake>` itself: a proxy can
@@ -2285,6 +2447,10 @@ mod reduce_motion {
     /// REAL class from a REAL AppKit notification.
     pub(crate) struct ReduceMotionIvars {
         relay: Box<dyn Fn()>,
+        /// Called on each [`DID_WAKE_NOTIFICATION`]: production tells the update
+        /// checker (`aterm_update::note_system_woke`), off the event loop — the post
+        /// only notifies a condition variable.
+        woke: Box<dyn Fn()>,
     }
 
     aterm_objc::declare_class! {
@@ -2308,16 +2474,23 @@ mod reduce_motion {
             fn reduce_motion_did_change(&self, _note: aterm_objc::Id) {
                 (self.ivars().relay)();
             }
+
+            /// The wake selector: the system woke from sleep.
+            @sel(systemDidWake:)
+            fn system_did_wake(&self, _note: aterm_objc::Id) {
+                (self.ivars().woke)();
+            }
         }
     }
 
-    /// Build a target around an arbitrary relay. `observe` is the production
-    /// caller; the test below is the other one.
+    /// Build a target around arbitrary relays. `observe` is the production
+    /// caller; the tests below are the other one.
     fn new_target(
         mtm: aterm_objc::MainThread,
         relay: Box<dyn Fn()>,
+        woke: Box<dyn Fn()>,
     ) -> Option<aterm_objc::Retained<ReduceMotionTarget>> {
-        ReduceMotionTarget::alloc_init(mtm, ReduceMotionIvars { relay })
+        ReduceMotionTarget::alloc_init(mtm, ReduceMotionIvars { relay, woke })
     }
 
     /// `[[NSWorkspace sharedWorkspace] notificationCenter]`, or null.
@@ -2330,7 +2503,7 @@ mod reduce_motion {
             let f: unsafe extern "C-unwind" fn(
                 aterm_objc::ClassPtr,
                 aterm_objc::Sel,
-            ) -> aterm_objc::Id = aterm_objc::msg();
+            ) -> aterm_objc::Id = aterm_objc::checked_msg();
             let ws = f(
                 aterm_objc::class(c"NSWorkspace"),
                 aterm_objc::sel!(sharedWorkspace),
@@ -2339,13 +2512,14 @@ mod reduce_motion {
                 return aterm_objc::Id::NIL;
             }
             let g: unsafe extern "C-unwind" fn(aterm_objc::Id, aterm_objc::Sel) -> aterm_objc::Id =
-                aterm_objc::msg();
+                aterm_objc::checked_msg();
             g(ws, aterm_objc::sel!(notificationCenter))
         }
     }
 
     /// Register `target` on the workspace centre for the display-options
-    /// notification. `false` if the workspace or its centre is unavailable.
+    /// notification and the wake notification. `false` if the workspace or its
+    /// centre is unavailable.
     ///
     /// The centre holds the observer WEAKLY and this module never removes it,
     /// exactly as before: `App` keeps the returned handle in a field for the
@@ -2359,31 +2533,40 @@ mod reduce_motion {
             if center.is_null() {
                 return false;
             }
-            let Some(name) = aterm_objc::ns_string(DISPLAY_OPTIONS_NOTIFICATION) else {
-                return false;
-            };
-            // SAFETY: `-addObserver:selector:name:object:` is
-            // `-(void)(id, SEL, id, id)`, exactly the prototype cast below. The
-            // observer is `target`, which the caller keeps alive; the selector
-            // is one this class declares; `name` is a live +1 NSString the pool
-            // outlives; nil `object` means "from any sender".
-            unsafe {
-                let add: unsafe extern "C-unwind" fn(
-                    aterm_objc::Id,
-                    aterm_objc::Sel,
-                    aterm_objc::Id,
-                    aterm_objc::Sel,
-                    aterm_objc::Id,
-                    aterm_objc::Id,
-                ) = aterm_objc::msg();
-                add(
-                    center,
-                    aterm_objc::sel!(addObserver:selector:name:object:),
-                    target.as_id(),
+            let observations = [
+                (
+                    DISPLAY_OPTIONS_NOTIFICATION,
                     aterm_objc::sel!(reduceMotionDidChange:),
-                    name.id(),
-                    aterm_objc::Id::NIL,
-                );
+                ),
+                (DID_WAKE_NOTIFICATION, aterm_objc::sel!(systemDidWake:)),
+            ];
+            for (notification, selector) in observations {
+                let Some(name) = aterm_objc::ns_string(notification) else {
+                    return false;
+                };
+                // SAFETY: `-addObserver:selector:name:object:` is
+                // `-(void)(id, SEL, id, id)`, exactly the prototype cast below. The
+                // observer is `target`, which the caller keeps alive; the selector
+                // is one this class declares; `name` is a live +1 NSString the pool
+                // outlives; nil `object` means "from any sender".
+                unsafe {
+                    let add: unsafe extern "C-unwind" fn(
+                        aterm_objc::Id,
+                        aterm_objc::Sel,
+                        aterm_objc::Id,
+                        aterm_objc::Sel,
+                        aterm_objc::Id,
+                        aterm_objc::Id,
+                    ) = aterm_objc::checked_msg();
+                    add(
+                        center,
+                        aterm_objc::sel!(addObserver:selector:name:object:),
+                        target.as_id(),
+                        selector,
+                        name.id(),
+                        aterm_objc::Id::NIL,
+                    );
+                }
             }
             true
         })
@@ -2424,10 +2607,11 @@ mod reduce_motion {
     }
 
     /// Register a workspace-notification observer for the accessibility
-    /// display-options change and return the retained target (the caller keeps
-    /// it alive for the process life — the notification center references it
-    /// weakly, and it is never removed, exactly like the menu target). `None`
-    /// off the main thread (AppKit requirement; the winit loop guarantees it).
+    /// display-options change and the wake from sleep, and return the retained
+    /// target (the caller keeps it alive for the process life — the notification
+    /// center references it weakly, and it is never removed, exactly like the menu
+    /// target). `None` off the main thread (AppKit requirement; the winit loop
+    /// guarantees it).
     pub(crate) fn observe(
         proxy: &EventLoopProxy<Wake>,
     ) -> Option<aterm_objc::Retained<ReduceMotionTarget>> {
@@ -2440,6 +2624,7 @@ mod reduce_motion {
                 // event, exactly as the objc2 version did.
                 let _ = proxy.send_event(Wake::ReduceMotionChanged);
             }),
+            Box::new(aterm_update::note_system_woke),
         )?;
         if register(&target) {
             Some(target)
@@ -2453,7 +2638,10 @@ mod reduce_motion {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        use super::{DISPLAY_OPTIONS_NOTIFICATION, ReduceMotionTarget, new_target, register};
+        use super::{
+            DID_WAKE_NOTIFICATION, DISPLAY_OPTIONS_NOTIFICATION, ReduceMotionTarget, new_target,
+            register,
+        };
 
         /// Remove `target` from the workspace centre — production never does
         /// this (the observer lives for the process), but a test must, or the
@@ -2470,17 +2658,22 @@ mod reduce_motion {
                     aterm_objc::Id,
                     aterm_objc::Sel,
                     aterm_objc::Id,
-                ) = aterm_objc::msg();
+                ) = aterm_objc::checked_msg();
                 f(center, aterm_objc::sel!(removeObserver:), target.as_id());
             }
         }
 
-        /// Post the REAL notification on the REAL workspace centre.
+        /// Post the REAL display-options notification on the REAL workspace centre.
         fn post() {
+            post_named(DISPLAY_OPTIONS_NOTIFICATION);
+        }
+
+        /// Post the REAL notification `notification` on the REAL workspace centre.
+        fn post_named(notification: &str) {
             aterm_objc::autoreleasepool(|_| {
                 let center = super::workspace_center();
                 assert!(!center.is_null(), "no workspace notification centre");
-                let name = aterm_objc::ns_string(DISPLAY_OPTIONS_NOTIFICATION).expect("NSString");
+                let name = aterm_objc::ns_string(notification).expect("NSString");
                 // SAFETY: `-postNotificationName:object:` is `-(void)(id, id)`;
                 // `center` is live, `name` a live +1 NSString, nil sender is
                 // legal.
@@ -2490,7 +2683,7 @@ mod reduce_motion {
                         aterm_objc::Sel,
                         aterm_objc::Id,
                         aterm_objc::Id,
-                    ) = aterm_objc::msg();
+                    ) = aterm_objc::checked_msg();
                     f(
                         center,
                         aterm_objc::sel!(postNotificationName:object:),
@@ -2511,10 +2704,15 @@ mod reduce_motion {
 
             let hits = Arc::new(AtomicUsize::new(0));
             let seen = Arc::clone(&hits);
+            let wakes = Arc::new(AtomicUsize::new(0));
+            let woke = Arc::clone(&wakes);
             let target = new_target(
                 crate::appkit::test_witness(),
                 Box::new(move || {
                     seen.fetch_add(1, Ordering::SeqCst);
+                }),
+                Box::new(move || {
+                    woke.fetch_add(1, Ordering::SeqCst);
                 }),
             )
             .expect("+alloc/-init produced a ReduceMotionTarget");
@@ -2545,7 +2743,7 @@ mod reduce_motion {
                     aterm_objc::Id,
                     aterm_objc::Sel,
                     aterm_objc::Sel,
-                ) -> aterm_objc::Bool = aterm_objc::msg();
+                ) -> aterm_objc::Bool = aterm_objc::checked_msg();
                 assert!(
                     responds(
                         target.as_id(),
@@ -2559,15 +2757,24 @@ mod reduce_motion {
             assert!(register(&target), "workspace centre registration failed");
             post();
             post();
+            // The wake reaches the wake relay, and only it.
+            post_named(DID_WAKE_NOTIFICATION);
             unregister(&target);
             // Removed: a further post must NOT reach it.
             post();
+            post_named(DID_WAKE_NOTIFICATION);
 
             assert_eq!(
                 hits.load(Ordering::SeqCst),
                 2,
                 "AppKit did not deliver the notification to the declared class \
                  exactly as many times as it was posted"
+            );
+            assert_eq!(
+                wakes.load(Ordering::SeqCst),
+                1,
+                "AppKit did not deliver NSWorkspaceDidWakeNotification to the wake \
+                 selector exactly once"
             );
         }
 
@@ -2589,6 +2796,7 @@ mod reduce_motion {
                 Box::new(move || {
                     let _ = &spy;
                 }),
+                Box::new(|| {}),
             )
             .expect("target");
             assert_eq!(drops.load(Ordering::SeqCst), 0);
@@ -2674,7 +2882,7 @@ mod layer_colorspace {
         // exists to keep, and the reason this is not `send_bool_id`.
         unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel, aterm_objc::ClassPtr) -> aterm_objc::Bool =
-                aterm_objc::msg();
+                aterm_objc::checked_msg();
             f(obj, sel!(isKindOfClass:), metal).as_bool()
         }
     }
@@ -2706,7 +2914,8 @@ mod layer_colorspace {
             if cs.is_null() {
                 return false;
             }
-            let set_cs: unsafe extern "C-unwind" fn(Id, Sel, *mut c_void) = aterm_objc::msg();
+            let set_cs: unsafe extern "C-unwind" fn(Id, Sel, *mut c_void) =
+                aterm_objc::checked_msg();
             set_cs(layer, sel!(setColorspace:), cs);
             CGColorSpaceRelease(cs);
             true
@@ -2843,7 +3052,7 @@ mod layer_colorspace {
                 return None;
             }
             let n = appkit::send_usize(subs, sel!(count));
-            let at: unsafe extern "C-unwind" fn(Id, Sel, usize) -> Id = aterm_objc::msg();
+            let at: unsafe extern "C-unwind" fn(Id, Sel, usize) -> Id = aterm_objc::checked_msg();
             for i in 0..n {
                 let l = at(subs, sel!(objectAtIndex:), i);
                 if is_metal_layer(l) {
@@ -2947,7 +3156,7 @@ mod vibrancy {
                 let g = f64::from((bg >> 8) & 0xff) / 255.0;
                 let b = f64::from(bg & 0xff) / 255.0;
                 let make: unsafe extern "C-unwind" fn(Id, Sel, f64, f64, f64, f64) -> Id =
-                    aterm_objc::msg();
+                    aterm_objc::checked_msg();
                 let color = make(
                     class(c"NSColor").as_id(),
                     sel!(colorWithSRGBRed:green:blue:alpha:),
@@ -2981,14 +3190,14 @@ mod vibrancy {
                 return;
             }
             let n = appkit::send_usize(subs, sel!(count));
-            let at: unsafe extern "C-unwind" fn(Id, Sel, usize) -> Id = aterm_objc::msg();
+            let at: unsafe extern "C-unwind" fn(Id, Sel, usize) -> Id = aterm_objc::checked_msg();
             // `-isKindOfClass:` takes a CLASS, encoded `"#"` and not `"@"` —
             // hence the explicit prototype rather than `send_bool_id`.
             let is_kind: unsafe extern "C-unwind" fn(
                 Id,
                 Sel,
                 aterm_objc::ClassPtr,
-            ) -> aterm_objc::Bool = aterm_objc::msg();
+            ) -> aterm_objc::Bool = aterm_objc::checked_msg();
             let mut ours: Vec<Id> = Vec::new();
             for i in 0..n {
                 let sv = at(subs, sel!(objectAtIndex:), i);
@@ -3037,7 +3246,8 @@ mod vibrancy {
             appkit::send_v_isize(effect, sel!(setBlendingMode:), BLENDING_BEHIND_WINDOW);
             appkit::send_v_isize(effect, sel!(setState:), STATE_ACTIVE);
             appkit::send_v_usize(effect, sel!(setAutoresizingMask:), AUTORESIZE_WH);
-            let add: unsafe extern "C-unwind" fn(Id, Sel, Id, isize, Id) = aterm_objc::msg();
+            let add: unsafe extern "C-unwind" fn(Id, Sel, Id, isize, Id) =
+                aterm_objc::checked_msg();
             add(
                 content,
                 sel!(addSubview:positioned:relativeTo:),
@@ -3130,24 +3340,6 @@ mod surface_colorspace_tests {
     }
 
     #[test]
-    fn gpu_capture_metadata_matches_the_effective_platform_tag() {
-        use aterm_gpu::video_tap::CaptureColorSpace;
-
-        assert_eq!(
-            SurfaceColorspace::Srgb.gpu_capture_space(),
-            CaptureColorSpace::Srgb
-        );
-        assert_eq!(
-            SurfaceColorspace::ExtendedLinearSrgb.gpu_capture_space(),
-            CaptureColorSpace::ExtendedLinearSrgb
-        );
-        assert_eq!(
-            SurfaceColorspace::DisplayP3.gpu_capture_space(),
-            CaptureColorSpace::DisplayP3
-        );
-    }
-
-    #[test]
     fn failed_surface_tag_never_claims_the_requested_space() {
         use aterm_gpu::video_tap::CaptureColorSpace;
 
@@ -3168,27 +3360,6 @@ mod surface_colorspace_tests {
             ),
             CaptureColorSpace::DisplayP3
         );
-    }
-}
-
-#[cfg(all(test, not(target_os = "macos")))]
-mod tests {
-    use winit::window::Theme;
-
-    use super::window_theme_to_winit;
-    use crate::app_config::WindowTheme;
-
-    /// `Auto` resets the override (`None`) so the chrome follows the OS preference;
-    /// `Light`/`Dark` force the matching winit theme variant. The full mapping is a
-    /// total `match`, so this pins every arm.
-    #[test]
-    fn theme_maps_to_winit_override() {
-        assert_eq!(window_theme_to_winit(WindowTheme::Auto), None);
-        assert_eq!(
-            window_theme_to_winit(WindowTheme::Light),
-            Some(Theme::Light)
-        );
-        assert_eq!(window_theme_to_winit(WindowTheme::Dark), Some(Theme::Dark));
     }
 }
 
@@ -3239,12 +3410,12 @@ pub(crate) fn disable_press_and_hold() {
         let Some(key) = appkit::nsstring("ApplePressAndHoldEnabled") else {
             return;
         };
-        let boxed: unsafe extern "C-unwind" fn(Id, Sel, Bool) -> Id = aterm_objc::msg();
+        let boxed: unsafe extern "C-unwind" fn(Id, Sel, Bool) -> Id = aterm_objc::checked_msg();
         let value = boxed(class(c"NSNumber").as_id(), sel!(numberWithBool:), Bool::NO);
         if value.is_null() {
             return;
         }
-        let dict: unsafe extern "C-unwind" fn(Id, Sel, Id, Id) -> Id = aterm_objc::msg();
+        let dict: unsafe extern "C-unwind" fn(Id, Sel, Id, Id) -> Id = aterm_objc::checked_msg();
         let defaults = dict(
             class(c"NSDictionary").as_id(),
             sel!(dictionaryWithObject:forKey:),

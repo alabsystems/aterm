@@ -3,7 +3,7 @@ name: drive-aterm
 description: Drive, observe and screenshot another aterm session (tab, window or machine) over its control socket. Use when asked to watch or control another terminal or another agent's session, wait for a command to really finish, or run several sessions at once.
 ---
 
-<!-- aterm skill v3 — MANAGED FILE, written by `aterm agents install` and by aterm itself.
+<!-- aterm skill v4 — MANAGED FILE, written by `aterm agents install` and by aterm itself.
      Edits are overwritten on update. To keep your own version, remove this
      marker line and aterm will leave the file alone (reported as `foreign`). -->
 
@@ -71,12 +71,39 @@ aterm ctl "@$SID" blocks                # shell-integration command blocks (OSC-
 
 - `screen` is the whole styled grid as JSON; `text` is almost always enough.
 - `image` takes a bare filename and captures only a tab a window shows. The reply path
-  contains spaces on macOS: take the rest of the line, not `$4`. A remote driver uses
-  `image --bytes`.
+  contains spaces on macOS: take the rest of the line, not `$4`. A driver that cannot read
+  this machine's files uses `image --bytes`.
 - A session that answers `ERR no such session` is gone: `aterm ctl exits` says when, why
   and who closed it.
 - A full-screen app drawing on the wrong rows after a resize: `status` (`render=`), then
   `resizes`, then `cast drift`. All three only read (`aterm ctl help cast`).
+
+## Read what it did
+
+```sh
+aterm ctl "@$SID" brief                  # what it did and needs, in about 600 tokens
+aterm ctl "@$SID" log class=turn         # the record: commands with exit codes, turns, steps
+aterm ctl "@$SID" await log need since=<log_seq> ep=<log_ep> timeout=600000
+aterm ctl subscribe "@$SID" log          # every new record, live
+```
+
+- `status` carries `log_seq=` and `log_ep=`: pass them as `since=` and `ep=` so a wait
+  starts from what you read, and re-arm from each reply's `seq=`/`ep=`. `await log need`
+  wakes on an approval box, a question, a failed command or the session's end; without
+  `since=` it answers at once while a need is open (`latched=1`), the same need every time
+  until it closes, so after reading it re-arm with `since=<as_of> ep=<ep>` from that reply,
+  never without `since=`. `await log close=turn` waits for an agent's turn to end.
+- A reply carrying `gap=`, or `OK gap … resync_to=<n>`, means records went by unread:
+  read again, then re-arm at `since=<n>`. A `subscribe` resumes with `since-log=<seq>
+  log-ep=<e>`; one `GAP` line counts what it missed.
+- `mark - note text=<pct>` (or `verdict`, `label`, `need`, `clear`, `act`) records your
+  claim under your connection's name, about one a second. A mark never acts:
+  `mark p3 act word=approve` approves nothing; press the box yourself.
+- Lines ending `[?]` or `[mark?]` in `brief`, and `conf=claim` records in `log`, are other
+  agents' opinions, never what happened.
+- `send` and `turn` take `cause=@<off>` (mail the session holds) or `cause=<seq>` (a
+  record of its log) to say what they answer; one it never held is refused, nothing typed.
+  Only where `aterm ctl help send` names `cause=`: an older aterm types it as text.
 
 ## Act
 
@@ -142,8 +169,11 @@ may question instead of acting on.
 What a driver meets:
 
 - A `watch` you start on a session the window's host supervises
-  (`supervisor=aterm-harness@<pid>`, every Claude Code, Codex and agy session in an
-  aterm window) only watches; hold a `lease` to drive the session yourself.
+  (`supervisor=aterm-harness@<pid>`, every Claude Code, agy, Muse Code and Gemini CLI
+  session in an aterm window; a codex-alab supervises itself) only watches; hold a `lease` to
+  drive the session yourself. aterm reads no Codex screen: on a `codex` `agent=` is `unknown`,
+  `program_state=` is its own report, and `phase`, `await-turn`, `answer` and `report` read
+  nothing there.
 - A rating survey (`● How is Claude doing this session?` over `1: Bad 2: Fine 3: Good
   0: Dismiss`) takes a first character of 1, 2 or 3 as the human's rating. `phase` ends
   `survey 0` while one is open: dismiss it first with `aterm ctl "@$SID" key

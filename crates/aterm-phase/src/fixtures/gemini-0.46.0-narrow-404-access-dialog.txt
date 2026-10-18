@@ -1,0 +1,28 @@
+# gemini-cli 0.46.0 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (72x50, aterm 0.105.0) running the real Gemini CLI, launched by path with a scratch `HOME` whose settings select the API-key auth, a fake `GEMINI_API_KEY` and `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:<port>` (a local stub of the Gemini API, crates/aterm-lab) · the pane at 72 columns with a GEMINI.md, a custom stub mode: 404 NOT_FOUND, the turn's model not found for v1beta: its no-access dialog (`It seems like you don't have access to …`, `1. Keep trying`, `2. Stop`) before any key
+
+ ▝▜▄     Gemini CLI v0.46.0
+   ▝▜▄
+  ▗▟▀    Authenticated with gemini-api-key /auth
+ ▝▀
+
+
+Tips for getting started:
+1. /help for more information
+2. Ask coding questions, edit code or run commands
+3. Be specific for the best results
+▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+ > carry on after notfound404
+▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+
+╭──────────────────────────────────────────────────────────────────────╮
+│                                                                      │
+│ It seems like you don't have access to gemini-3.5-flash.             │
+│ Your admin might have disabled the access. Contact them to enable    │
+│ the Preview Release Channel.                                         │
+│                                                                      │
+│                                                                      │
+│ ● 1. Keep trying                                                     │
+│   2. Stop                                                            │
+│                                                                      │
+│                                                                      │
+╰──────────────────────────────────────────────────────────────────────╯

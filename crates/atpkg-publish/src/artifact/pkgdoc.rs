@@ -50,10 +50,16 @@ impl Kind {
     }
 }
 
-/// `pkg-<program>-<build>.toml`.
+/// `pkg-<program>-<build>.toml`: a program build's manifest asset, the one spelling.
 #[must_use]
-pub fn file_name(program: &str, build: Build) -> String {
+pub fn manifest_name(program: &str, build: Build) -> String {
     format!("pkg-{program}-{build}.toml")
+}
+
+/// `pkg-<program>-<build>.toml.sig`: its signature asset.
+#[must_use]
+pub fn sig_name(program: &str, build: Build) -> String {
+    format!("pkg-{program}-{build}.toml.sig")
 }
 
 /// The asset name of one target's pack. `aarch64-apple-darwin` keeps the bare

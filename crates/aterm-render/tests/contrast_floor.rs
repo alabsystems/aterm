@@ -13,11 +13,8 @@
 //! requested ratio whenever the background admits it, else the best achievable. This is
 //! what `minimum_contrast` (and the OSC-12 cursor floor on the same function) promises.
 //!
-//! The ty model `aterm_spec::derive::contrast_floor_model` proves the same
-//! `FloorDelivers` invariant over an abstract lattice and catches a midpoint pole rule
-//! (`L(bg) > 0.5` picks black) at `Buggy=1`. This file checks the bound against an
-//! independent WCAG oracle (re-derived from the sRGB EOTF), exhaustively on grayscale
-//! and over a dense RGB lattice.
+//! This file checks the bound against an independent WCAG oracle (re-derived from the
+//! sRGB EOTF), exhaustively on grayscale and over a dense RGB lattice.
 
 use aterm_render::{floor_fg_contrast, floor_min_contrast_fg};
 

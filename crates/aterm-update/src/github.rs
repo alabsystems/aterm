@@ -46,7 +46,7 @@
 //! A source-only head whose tag outranks the last one the ledger authorized for this
 //! source is an APP BUILD IN FLIGHT ([`app_build_in_flight`]): the publication train
 //! mints the release source-first and the app cut attaches its assets minutes later,
-//! so the next checks come on `cadence::IN_FLIGHT_RETRY` (2, 4, 8 minutes) instead of a
+//! so the next checks come every `cadence::IN_FLIGHT_RETRY` (a minute) instead of a
 //! whole interval, counted machine-wide on the check receipt ([`head_in_flight`]).
 //!
 //! The lane is not a trust decision. Artifact trust is the master-signed roster, the
@@ -69,7 +69,7 @@ static RATE_LIMITED: AtomicBool = AtomicBool::new(false);
 /// ([`app_build_in_flight`]) and, once the check receipt has counted it, how many
 /// consecutive completed checks machine-wide have found it so. Set by
 /// `check_and_stage_inner`, counted by [`check_and_stage`], read by the background
-/// loop through [`head_in_flight`] to take the quick `cadence::IN_FLIGHT_RETRY` ladder
+/// loop through [`head_in_flight`] to take the quick `cadence::IN_FLIGHT_RETRY` wait
 /// instead of a whole interval. Cleared at every check's start.
 static HEAD_IN_FLIGHT: std::sync::Mutex<Option<(String, u32)>> = std::sync::Mutex::new(None);
 
@@ -436,19 +436,6 @@ pub(crate) struct RosterPolicy<'a> {
     pub floor_refresh: Option<&'a dyn Fn() -> u64>,
 }
 
-impl RosterPolicy<'static> {
-    /// The tier switched off — the fixture every test that is not about the roster uses.
-    /// `#[cfg(test)]` because production always builds its policy from
-    /// `pins::PAPER_MASTER_PUBKEYS`.
-    #[cfg(test)]
-    pub(crate) const INERT: RosterPolicy<'static> = RosterPolicy {
-        master_pubkeys: &[],
-        floor_seq: 0,
-        now_unix: 0,
-        floor_refresh: None,
-    };
-}
-
 /// The marker a refusal carries when it is THIS BUILD's trust anchor that cannot verify the
 /// channel, rather than the channel that is broken: the pinned paper master cannot verify
 /// the machine roster (a master rotation this build predates). That is permanent for the
@@ -487,10 +474,6 @@ struct AuthoritativeFetch {
     /// tell a forged release from a revoked signer from a STRANDED client whose
     /// anchor predates a rotation and needs a reinstall ([`STALE_ANCHOR_KEY`]).
     rejection_reason: Option<String>,
-    /// Candidate-manifest fetches only. Detached-signature downloads are a
-    /// subordinate verification step and intentionally do not increment this.
-    #[cfg(test)]
-    manifest_fetch_attempts: u32,
     /// WHICH MACHINE SIGNED, when the roster tier is armed and the chain passed. `None`
     /// with an unpinned master (the tier is absent) and `None` on any rejection, because
     /// a rejection never produces a `selected` release either.
@@ -714,11 +697,6 @@ fn fetch_authoritative_release(
     let manifest_url = candidate.release.assets[candidate.manifest_index]
         .url
         .clone();
-
-    #[cfg(test)]
-    {
-        fetched.manifest_fetch_attempts = 1;
-    }
     let bytes = match download(&manifest_url, 5_000_000) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -1497,10 +1475,10 @@ fn end_failed_stage(
 /// The digest step: `None` when the container at `path` hashes (by `digest`) to
 /// `expected`, else the check's end — the container reclaimed and the failure
 /// booked at the one booking point ([`end_failed_stage`]): a mismatch is a verdict,
-/// and a hash that did not come back is booked by what it was (a helper past its
-/// deadline, or one the kernel would not start just then, answers passing from
-/// [`container_sha256`]: a moment). `digest` is [`container_sha256`] at
-/// [`CONTAINER_HASH_WAIT`] outside the tests.
+/// and a hash that did not come back is booked by what it was (a hash past its
+/// deadline, or one whose thread the system would not start just then, answers
+/// passing from [`container_sha256`]: a moment). `digest` is [`container_sha256`]
+/// at [`CONTAINER_HASH_WAIT`] outside the tests.
 fn check_container_digest(
     staging: &Staging,
     current_build: u64,
@@ -1520,22 +1498,39 @@ fn check_container_digest(
 }
 
 /// The bound on hashing the downloaded container ([`container_sha256`]). It reads
-/// the whole file — a few seconds for a release container, which the download has
-/// just written, on any disk — so a hash still running after two minutes is a
-/// read that is not coming back.
+/// the whole file — well under a second for a release container, which the
+/// download has just written, on any disk — so a hash still running after two
+/// minutes is a read that is not coming back.
 const CONTAINER_HASH_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// SHA-256 of the downloaded container, answered by `limit`: the checker thread holds
 /// the check lane and `stage.lock`, so an unbounded read would block every aterm on
-/// the Mac from staging. A `shasum` past its limit is killed and reaped, and both that
-/// and a spawn the kernel refused just then answer as a passing moment.
+/// the Mac from staging. The hash runs in process, on the CPU's SHA-256 instructions
+/// ([`aterm_update_core::sha256_file`]; a 47 MiB container in about 19 ms, where the
+/// `shasum` it replaced took about 100), on a thread of its own: one still reading at
+/// `limit` is left to finish on its own — a read wedged in the kernel, which no
+/// signal would have ended in a helper either — and, like a thread the system would
+/// not start just then, answers as a passing moment. A file that cannot be opened or
+/// read is a verdict, as `shasum`'s exit was.
 fn container_sha256(path: &std::path::Path, limit: std::time::Duration) -> Result<String, String> {
-    let out = crate::verify::output_within(
-        &mut aterm_update_core::shasum_command(path),
-        "shasum",
-        limit,
-    )?;
-    aterm_update_core::shasum_digest(&out)
+    let (answer, answered) = std::sync::mpsc::sync_channel(1);
+    let owned = path.to_path_buf();
+    let started = std::thread::Builder::new()
+        .name("aterm-update-hash".into())
+        .spawn(move || {
+            let _ = answer.send(aterm_update_core::sha256_file(&owned));
+        });
+    if let Err(error) = started {
+        return Err(crate::verify::mark_passing(format!(
+            "could not start the container hash: {error}"
+        )));
+    }
+    answered.recv_timeout(limit).unwrap_or_else(|_| {
+        Err(crate::verify::mark_passing(format!(
+            "the container hash did not finish within {}s; treating as a failure",
+            limit.as_secs()
+        )))
+    })
 }
 
 /// Book a container download that failed with `error` (a rate limit is not one: it
@@ -1588,11 +1583,28 @@ fn book_download_failure(
         });
         return end_failed_stage(staging, current_build, manifest, error);
     }
-    // The same note as the manifest leg: the download host did not serve it.
-    crate::status::set_delivery_note(ASSET_BLOCKED_NOTE);
     let error = format!("{container} download failed: {error}");
-    crate::health::Health::record_failure(&staging.health(), "pipeline", &error);
+    let class = asset_failure_class();
+    if class == "pipeline" {
+        // The same note as the manifest leg: the download host did not serve it.
+        crate::status::set_delivery_note(ASSET_BLOCKED_NOTE);
+    }
+    crate::health::Health::record_failure(&staging.health(), class, &error);
     Err(error)
+}
+
+/// The class a release-asset GET that failed after the channel answered books:
+/// `pipeline` (the download host did not serve what the release names) — unless the
+/// check began inside a wake's grace ([`crate::check_follows_wake`]). Then the
+/// network is still coming up (Wi-Fi associating, a VPN or a portal), which is
+/// `network`: weather, which neither starts a pipeline streak nor clears a standing
+/// `manifest` or `stage` diagnosis, as a `pipeline` booking would.
+fn asset_failure_class() -> &'static str {
+    if crate::check_follows_wake() {
+        "network"
+    } else {
+        "pipeline"
+    }
 }
 
 /// The exact asset names a release carries for the updater. The roster chain looks
@@ -2128,8 +2140,8 @@ fn floor_hold(build: u64, effective_min_build: u64, high_water: u64) -> Option<S
 /// admitted a roster retires the stage it revokes and confirms the one it trusts.
 /// Tier-1: `tests::roster_freshness_conformance`.
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "NativeUpdateRosterFreshness",
         action = "Check",
         project = "aterm_update::roster_freshness_projection"
@@ -2291,7 +2303,7 @@ fn observe_floor_and_withdraw_at(
 ///
 /// Compiled only for proof/test builds. Every input is an OBSERVATION of the real
 /// staging root and of the real gate's answer, never a second copy of either rule.
-#[cfg(any(test, feature = "spec-anchors"))]
+#[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
 #[must_use]
 pub fn roster_freshness_projection(
@@ -2538,14 +2550,18 @@ fn check_and_stage_inner(
         }
         let msg = if appcast_fetch_error {
             // Manifests exist but could not be downloaded while the channel head was
-            // readable — a `pipeline`-class failure. The ledger decides the honest
-            // wording: a persistent streak (`Health::persistent_class`: the count and
-            // the span) is not called "deferred".
+            // readable — a `pipeline`-class failure, or `network` inside a wake's grace
+            // ([`asset_failure_class`]). The ledger decides the honest wording: a
+            // persistent streak (`Health::persistent_class`: the count and the span)
+            // is not called "deferred".
             let host = ASSET_HOST;
-            crate::status::set_delivery_note(ASSET_BLOCKED_NOTE);
+            let class = asset_failure_class();
+            if class == "pipeline" {
+                crate::status::set_delivery_note(ASSET_BLOCKED_NOTE);
+            }
             let h = crate::health::Health::record_failure(
                 &staging.health(),
-                "pipeline",
+                class,
                 &format!("release manifests exist but could not be fetched from {host}"),
             );
             if h.persistent_class()
@@ -2562,7 +2578,11 @@ fn check_and_stage_inner(
                 format!(
                     "update check deferred: a release manifest could not be fetched \
                      from {host} (attempt {} — will retry)",
-                    h.pipeline_failures
+                    if class == "pipeline" {
+                        h.pipeline_failures
+                    } else {
+                        h.network_failures
+                    }
                 )
             }
         } else if manifest_rejected {
@@ -2852,8 +2872,8 @@ fn check_and_stage_inner(
     // exit here is booked: a machine that can never hash a download must still reach
     // the persistent-failure notice.
     //
-    // BOUNDED, AND BOOKED BY THE ONE RULE: the hash's helper has a
-    // deadline ([`container_sha256`]), and a helper past it or one the kernel would
+    // BOUNDED, AND BOOKED BY THE ONE RULE: the hash has a deadline
+    // ([`container_sha256`]), and a hash past it or one whose thread the system would
     // not start just then is a moment, booked as one at the one booking point.
     if let Some(end) = check_container_digest(
         &staging,

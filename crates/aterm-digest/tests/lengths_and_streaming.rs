@@ -1,13 +1,17 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The space between the published vectors (which live beside the
-//! implementation in `src/sha256.rs` and `src/hmac_sha256.rs`): every message
-//! length from 0 to 200, large inputs, every key length across the block
-//! boundary, and arbitrary streaming splits.
+//! The space between the published vectors (FIPS 180-4's beside the hash in
+//! astream-digest, `vendor/astream/crates/astream-digest/src/lib.rs`, and RFC
+//! 4231's beside the HMAC in `src/hmac_sha256.rs`): every message length from 0
+//! to 200, large inputs, every key length across the block boundary, and
+//! arbitrary streaming splits.
 //!
 //! The length sweeps are pinned by one SHA-256 over all their outputs, recorded
-//! when every output matched the `sha2`/`hmac` crates byte for byte.
+//! when every output matched the `sha2`/`hmac` crates byte for byte. They were
+//! recorded against this crate's own SHA-256, before it re-exported
+//! astream-digest's; the same pins hold the re-exported hash to the answers the
+//! copy it replaced gave, through aterm's HMAC as well as alone.
 
 use aterm_digest::{HmacSha256, Sha256};
 

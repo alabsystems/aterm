@@ -19,8 +19,8 @@ use std::time::Duration;
 use aterm_hash::{FNV64_OFFSET, fnv_mix_u64};
 use aterm_render::{
     BeamClip, BeamVertex, CharFg, CometSample, FireHaloCell, FireMode, FirePatch, GlowQuad,
-    HaloMode, RainHalo, beam_glow_quads, comet_beam, comet_glow_quads, custom_beam_quads,
-    phaser_streak_quads, premul_rgb,
+    HaloMode, RainHalo, beam_glow_quads, comet_beam, comet_glow_quads, phaser_streak_quads,
+    premul_rgb,
 };
 // The profile is the rasterizer's, and the ribbon reaches it only through
 // [`ribbon_beam`]: one law, evaluated in one place (the smoothness oracle
@@ -56,16 +56,8 @@ use crate::effect_util::{
 // of the rainbow family resolves colour through `spectrum` and every point-mark
 // snaps to a name through `spectrum_snap`.
 use crate::spectrum::{SPECTRUM_STOPS, spectrum, spectrum_snap};
-// The LUT length and named stops are asked for only by the proofs; test-gated
-// so the lint reflects the shipping binary.
-#[cfg(test)]
-use crate::spectrum::spectrum_stop;
 use crate::trail_sweep::line_cells_tail;
 use crate::typing_momentum::TypingMomentum;
-// Trail Packs — the user-generated custom trail params driven by `emit_custom`.
-// Re-exported here so the resolved `TrailParams` rides `GlowConfig` inline.
-pub use crate::trail_pack::TrailParams;
-use crate::trail_pack::{Envelope, HaloChannel, RampParams, ThemeArm};
 
 // The engine's parts. A part with public items is re-exported whole, so every
 // `cursor_glow::X` path resolves at its visibility here; parts with none are
@@ -244,7 +236,7 @@ struct Bolt {
 }
 
 /// One outgoing style crossfade: the complete animated state live when the
-/// style or pack switched, still ticking under its snapshotted old config
+/// style switched, still ticking under its snapshotted old config
 /// behind a cosine ramp-down (see the style-switch contract in
 /// [`CursorGlow::tick`]). The residue keeps rendering under the config it was
 /// forged under, so the whole animator moves here.
@@ -253,7 +245,7 @@ struct OutgoingFade {
     /// copied. Its own `fading` list is empty, so fade ticking is one level
     /// deep.
     engine: Box<CursorGlow>,
-    /// The outgoing config (style/colours/length/pack), frozen at the switch.
+    /// The outgoing config (style/colours/length), frozen at the switch.
     cfg: GlowConfig,
     /// The cursor cell frozen at the switch, fed as `cur` to every fade tick:
     /// `cur == engine.last`, so no move is observed and the residue only decays
@@ -437,10 +429,6 @@ pub struct CursorGlow {
     /// rendering it under its old config behind a ramp-down, while coordinate
     /// tracking and typing warmth stay live.
     last_style: Option<GlowStyle>,
-    /// The Trail Pack fingerprint of the last tick (0 for a built-in). A
-    /// pack→pack swap keeps `style == Custom`, so this catches pack changes
-    /// `last_style` misses (`TrailParams::pack_fp` hashes pack id and source).
-    last_pack_fp: u32,
     /// Rolling hue phase (turns) for rainbow/sparkle, advanced per spawn.
     hue: f32,
     /// Typing-cadence heat 0..1: sustained fast typing brightens and lengthens
@@ -468,6 +456,8 @@ pub struct CursorGlow {
     /// an already confirmed one-cell candidate as a deletion but never admits a
     /// move by itself. Expires after [`Self::QUENCH_HINT_FRESH`].
     quench_hint: Option<Instant>,
+    /// The last Backspace and what its echo still owes ([`EraseWitness`]).
+    last_erase: Option<EraseWitness>,
     /// A fresh navigation classifier ([`Self::note_navigation`]). It never
     /// admits a cursor delta; it suppresses an older ambiguous class so
     /// navigation cannot turn a later child relocation into heat or light.
@@ -691,6 +681,13 @@ pub struct CursorGlow {
     row_cur_meta: Option<RowProbe>,
     /// Metadata for `row_prev`.
     row_prev_meta: Option<RowProbe>,
+    /// The last caret-row probe that showed the caret, kept while the caret
+    /// is withheld (a torn repaint probes the write cursor's row): a
+    /// correction's repaint judged when the caret returns is compared against
+    /// it ([`Self::merged_correction`]). Reused capacity.
+    row_shown: Vec<char>,
+    /// Metadata for `row_shown`; `None` while the caret shows.
+    row_shown_meta: Option<RowProbe>,
     /// Exact glyphs of the last adjacent, licensed typed run. Kept outside
     /// the ribbon pool and deadline calculation after its visible cells
     /// retire; read only by the next typed echo on this row.
@@ -727,16 +724,15 @@ pub struct CursorGlow {
     last_type: Option<Instant>,
     /// Deterministic spark/ember PRNG state.
     rng: u32,
-    /// Swept-cell run builder reused each frame by [`Self::emit_comet`] and
-    /// [`Self::emit_custom`]; `comet_run` is the run in progress.
+    /// Swept-cell run builder reused each frame by [`Self::emit_comet`];
+    /// `comet_run` is the run in progress.
     ///
     /// Inner buffers are pooled: each emitter clears entries in place and
     /// publishes a finished run by swapping it with the pooled entry at the
     /// live watermark, so `comet_run` always returns holding an allocated,
     /// empty buffer. Entries past `runs_len` are spares, so consumers read
     /// `&comet_runs[..runs_len]`. Bounded by runs ≤ sparks ≤
-    /// [`Self::MAX_SPARKS`]. `tick` takes exactly one of the two emitters per
-    /// frame and both clear on entry.
+    /// [`Self::MAX_SPARKS`]. The emitter clears it on entry.
     comet_runs: Vec<Vec<CometSample>>,
     comet_run: Vec<CometSample>,
     /// Reused by [`Self::emit_water`] for the deduplicated curved wake spine
@@ -1374,17 +1370,6 @@ impl CursorGlow {
     /// cell keeps [`Self::FIRE_HEAD_COV_CAP`].
     const FIRE_STREAK_COV_CAP: f32 = 108.0;
     const FIRE_HEAD_COV_CAP: f32 = 168.0;
-    /// Structural legibility ceiling for the Trail Pack (`Custom`) path: a
-    /// non-configurable per-sample coverage cap, applied in the custom
-    /// interpreter's emission funnels (beam `CometSample` builder, particle
-    /// loop) and to custom birth coverage, so no pack can bury the glyphs.
-    /// Bounds only `GlowStyle::Custom`.
-    const CUSTOM_COV_CAP: f32 = 150.0;
-    /// Structural life ceiling for the Trail Pack (`Custom`) wake: caps a custom
-    /// spark's base heat life whatever `heat.life_base_mul`/`life_a`/`life_b`
-    /// say (chaining may still reach `chain_life_max`, ≤ 4 s by schema). Equal
-    /// to the pack particle-life ceiling; Custom-only.
-    const MAX_TRAIL_SPARK_LIFE: f32 = 2.0;
     /// How far back along the charged trail (live typing sparks, newest first)
     /// a crackle arc may root — the stray arcs dance over the whole lingering
     /// trail, not just off the write head.
@@ -1704,6 +1689,7 @@ impl CursorGlow {
         // Every licence term goes: a surviving hint would license the first
         // program move after the lights come back.
         self.quench_hint = None;
+        self.last_erase = None;
         self.nav_hint = None;
         self.type_hint.clear();
         self.kill_hint = None;
@@ -1722,6 +1708,7 @@ impl CursorGlow {
         self.row_prev.clear();
         self.row_cur_meta = None;
         self.row_prev_meta = None;
+        self.row_shown_meta = None;
         self.clear_neighbor_rows();
     }
 
@@ -2058,22 +2045,15 @@ impl CursorGlow {
         // phantom comet spawns and a pending key→echo pairing still lands.
         // Pending sound cues are dropped at the edge. Chained switches hand off
         // at the level reached (`OutgoingFade::level0`), capped at
-        // [`Self::FADE_CAP`]. A pack→pack swap keeps `style == Custom`, so a
-        // changed pack fingerprint also triggers the fade.
-        let live_pack_fp = cfg.pack.as_ref().map_or(0, |p| p.pack_fp);
-        let style_changed = self.last_style.is_some_and(|s| s != cfg.style);
-        let pack_changed = self.last_style.is_some() && self.last_pack_fp != live_pack_fp;
-        if style_changed || pack_changed {
+        // [`Self::FADE_CAP`].
+        if self.last_style.is_some_and(|s| s != cfg.style) {
             self.begin_style_fade(now);
         }
         self.last_style = Some(cfg.style);
-        self.last_pack_fp = live_pack_fp;
         // Compare-on-write: `last_cfg` backs one cold read (the fade snapshot
         // in `begin_style_fade`). After every enabled tick
-        // `last_cfg == Some(*cfg)` holds; the steady state pays a
-        // short-circuiting compare (the `Option<TrailParams>` discriminant
-        // skips the pack body when none is armed) instead of a copy. A NaN
-        // field compares unequal and re-stores.
+        // `last_cfg == Some(*cfg)` holds; the steady state pays a compare
+        // instead of a copy. A NaN field compares unequal and re-stores.
         if self.last_cfg.as_ref() != Some(cfg) {
             self.last_cfg = Some(*cfg);
         }
@@ -2101,9 +2081,8 @@ impl CursorGlow {
             let elapsed = now.saturating_duration_since(t0);
             let dt = elapsed.as_secs_f32();
             if dt > 0.0 {
-                // Fire cools on its own slower τ; other styles use 0.9 s. A
-                // Trail Pack may override the decay τ (Custom only). Shared with
-                // the key-time click's timbre prediction via `heat_tau`.
+                // Fire cools on its own slower τ; other styles use 0.9 s. Shared
+                // with the key-time click's timbre prediction via `heat_tau`.
                 let heat_tau = Self::heat_tau(cfg);
                 self.heat *= (-dt / heat_tau).exp();
                 if self.heat < 0.005 {
@@ -2217,6 +2196,44 @@ impl CursorGlow {
         // before anything this frame reads the row ([`HandRow::settle`]).
         if let (Some(hand), Some((caret_row, _))) = (self.hand_row.as_mut(), cur) {
             hand.settle(caret_row);
+        }
+        // The hand rides its line ([`Self::lift_hand_row`],
+        // [`rk::Engine::lift_hand`]): with a key in flight, a caret shown on a
+        // neighbouring row asks the follow pass first whether the hand's own
+        // line was repainted there with it (a composer's box grown or shrunk a
+        // row with no scroll, under the key's echo), judged on the hand's typed
+        // glyphs with the caret as a second witness. If so the move is judged
+        // in the text's own frame: the key's same-row echo. A relocation with
+        // no key behind it is the program's, and keeps its own judgment.
+        // The move starts at the last caret seen, or, after a repaint's hidden
+        // frames, at the last one shown (the hide bridge's own anchor).
+        let key_in_flight = self.key_in_flight(now);
+        let shown = self
+            .last
+            .or_else(|| self.last_visible.map(|(cell, _)| cell));
+        if key_in_flight
+            && self.v2.engaged()
+            && witness_n > 0
+            && let (Some((pr, _)), Some((cr, _))) = (shown, cur)
+            && pr.abs_diff(cr) == 1
+        {
+            let (samples, n) = witness_samples(&self.witness_rows, witness_n);
+            if let Some(run) = self.v2.hand_line_follow(&samples[..n], Some(cr))
+                && run.row == pr
+                && pr.checked_add_signed(run.dr) == Some(cr)
+            {
+                self.lift_hand_row(pr, cr);
+                self.v2.lift_hand(run);
+            }
+        }
+        // The caret goes hidden: keep the last probe that showed it.
+        if cur.is_none()
+            && let Some(meta) = self
+                .row_prev_meta
+                .filter(|m| self.last == Some((m.row, m.caret)))
+        {
+            self.row_shown.clone_from(&self.row_prev);
+            self.row_shown_meta = Some(meta);
         }
         // Spawn on a real move between two visible positions — where "visible"
         // bridges ConPTY's per-echo hide window ([`Self::hidden_bridge_source`]).
@@ -2361,150 +2378,150 @@ impl CursorGlow {
         // and truncation must shed beam haze, never a strike. Lightning (Laser
         // only) reuses the resident bolt scratch via `mem::take`.
         let mut bolt_verts = std::mem::take(&mut self.bolt_verts);
-        // One branch: a resolved Trail Pack drives the data interpreter; every
-        // built-in takes the emit sequence below. No built-in emitter reads
-        // `cfg.pack`, and the shared tail (MAX_QUADS/MAX_HALOS truncation and
-        // the fingerprint fold) runs for both. `cfg.pack` is `Some` only when
-        // `style == GlowStyle::Custom`.
-        if let Some(p) = cfg.pack.as_ref() {
-            self.emit_custom(now, cfg, geom, cur, out, &mut halos, p);
-            out.truncate(Self::MAX_QUADS);
+        self.emit_bolts(now, cfg, geom, out, &mut bolt_verts);
+        // No-op for Water/rainbow kitty (beam=false); on light themes the beam family
+        // emits source-over veil halos instead of additive quads.
+        self.emit_comet(now, cfg, geom, cur, out, &mut halos, &mut under);
+        out.truncate(Self::MAX_QUADS);
+        // Per-pixel fire (Fire only): FirePatches render at the under-ink
+        // seam through the shared byte-exact integer field. Not gated on
+        // the GlowQuad budget: the flame writes the separate patch/halo
+        // streams, each self-capped in `emit_flames`.
+        self.emit_flames(
+            now,
+            cfg,
+            geom,
+            &mut patches,
+            &mut charred,
+            &mut halo_cells,
+            &mut engulf,
+            &mut halos,
+        );
+        if out.len() < Self::MAX_QUADS {
+            self.emit_fire_meteors(now, cfg, geom, out); // jump streaks (Fire only)
+        }
+        if under.len() < Self::MAX_QUADS {
+            // Water's broad reflection belongs below glyph ink. Its crown,
+            // landing ripple and free droplets remain over-ink accents.
+            self.emit_water(now, cfg, geom, cur, &mut under, &mut halos);
+        }
+        if self.v2.engaged() {
+            // Seam point 3 (§17.2, D14): v2 owns the rainbow's whole emit
+            // phase (zooms, starburst, ribbon and starfield, fresh-ink light
+            // and glyph tint, the wake) in one call at the same position
+            // (after fire/water, before crown/forge/ring/particles/vapor),
+            // into the same `under` / `out` / `halos` scratch.
+            // `Config::from_glow` is a field copy; the beams scratch and cue
+            // sink are resident. `rainbow_exit_swoosh` stays v1-only.
+            //
+            // §18's zero allocation per frame for the lent streams: their
+            // peaks are state-dependent, so an on-demand scratch could still
+            // grow long after warm-up. They are sized to their caps once, on
+            // the first engaged frame; later frames pay a capacity compare.
+            Self::reserve_v2_scratch(&mut under, out, &mut halos);
+            if self.v2_beams.capacity() < Self::V2_BEAM_SCRATCH {
+                self.v2_beams.reserve(Self::V2_BEAM_SCRATCH);
+            }
+            if self.v2_cues.capacity() < Self::V2_CUE_SCRATCH {
+                self.v2_cues.reserve(Self::V2_CUE_SCRATCH);
+            }
+            let v2_cfg = rk::Config::from_glow(cfg, self.reduced_motion);
+            // The follow pass: before the tick replays this frame's events,
+            // the engine reads the rows the host sampled under its lock and
+            // carries every run whose text moved a row (a bottom-anchored
+            // composer growing without a scroll) to its glyphs' new row, with
+            // clocks intact (`rk::Engine::follow_rows`). The same samples
+            // feed the witness after the tick.
+            if witness_n > 0 {
+                let (samples, n) = witness_samples(&self.witness_rows, witness_n);
+                let park = self.held_park.filter(|p| !p.cross_row && p.fresh(now));
+                let pair = park.map(|p| ((p.row, p.origin), (p.landing_row, p.landing)));
+                // A key in flight under a withheld caret (a torn present, a
+                // repaint's bracket): the follow pass carries the hand with
+                // its line. A caret shown a row away was judged above.
+                let (_, proved) = self.v2.follow_rows_with_park(
+                    &samples[..n],
+                    &asked[..asked_n],
+                    now,
+                    pair,
+                    key_in_flight && cur.is_none(),
+                );
+                if proved && let Some(p) = self.held_park.as_mut() {
+                    p.content_followed = true;
+                }
+                if let Some((from, to)) = self.v2.take_hand_lift() {
+                    self.lift_hand_row(from, to);
+                }
+            }
+            let mut frame = rk::Frame {
+                under: &mut under,
+                out: &mut *out,
+                halos: &mut halos,
+                beams: &mut self.v2_beams,
+                cues: &mut self.v2_cues,
+                caret: CaretSeam::default(),
+                companion: None,
+                fp: 0,
+            };
+            self.v2.tick(now, geom, &v2_cfg, &mut frame);
+            self.v2_caret = frame.caret;
+            // Read the walk of the typed run this frame began off the cells
+            // just laid (§46), for a revive after a rest.
+            self.read_fresh_run_origin(now);
+            // Seam point 11 (§17.2): the frame's cues join the host's one
+            // backlog under the same refusal as `cue_sound` (a full backlog
+            // drops the newest), so a non-draining host sees a bound and the
+            // steady frame allocates nothing (§18).
+            for cue in self.v2_cues.drain(..) {
+                if self.sound_cues.len() < Self::MAX_SOUND_CUES {
+                    self.sound_cues.push(cue);
+                }
+            }
+            // The caret's stop is seated here, only on an event the caret
+            // can see: its cell moved (the frame's `Move` is already
+            // ingested, so `field_t` is this frame's answer at the new cell),
+            // or the cell under it owns field light. Otherwise the seat is
+            // held ([`Self::rainbow_head_rgb`]). `field_at` is O(1) in
+            // columns.
+            let owns_light = cur.is_some_and(|(r, c)| self.v2.field_at(r, c).is_some());
+            if owns_light || self.v2_stop.is_none_or(|(_, at)| at != cur) {
+                self.v2_stop = Some((self.v2_caret.field_t, cur));
+            }
+            // The content witness: after the tick that laid this frame's
+            // cells, read every resident cell against the rows the host
+            // sampled under its lock (with the batch applied, so a redraw
+            // restoring the same text is the same text, D2) and retire on
+            // the fast melt the cells whose glyph changed or went
+            // (`rk::witness`). This is where the absolute-cell ribbon
+            // learns its text has moved.
+            if witness_n > 0 {
+                let (samples, n) = witness_samples(&self.witness_rows, witness_n);
+                self.v2.witness_rows(&samples[..n], now);
+            }
         } else {
-            self.emit_bolts(now, cfg, geom, out, &mut bolt_verts);
-            // No-op for Water/rainbow kitty (beam=false); on light themes the beam family
-            // emits source-over veil halos instead of additive quads.
-            self.emit_comet(now, cfg, geom, cur, out, &mut halos, &mut under);
-            out.truncate(Self::MAX_QUADS);
-            // Per-pixel fire (Fire only): FirePatches render at the under-ink
-            // seam through the shared byte-exact integer field. Not gated on
-            // the GlowQuad budget: the flame writes the separate patch/halo
-            // streams, each self-capped in `emit_flames`.
-            self.emit_flames(
-                now,
-                cfg,
-                geom,
-                &mut patches,
-                &mut charred,
-                &mut halo_cells,
-                &mut engulf,
-                &mut halos,
-            );
-            if out.len() < Self::MAX_QUADS {
-                self.emit_fire_meteors(now, cfg, geom, out); // jump streaks (Fire only)
-            }
-            if under.len() < Self::MAX_QUADS {
-                // Water's broad reflection belongs below glyph ink. Its crown,
-                // landing ripple and free droplets remain over-ink accents.
-                self.emit_water(now, cfg, geom, cur, &mut under, &mut halos);
-            }
-            if self.v2.engaged() {
-                // Seam point 3 (§17.2, D14): v2 owns the rainbow's whole emit
-                // phase (zooms, starburst, ribbon and starfield, fresh-ink light
-                // and glyph tint, the wake) in one call at the same position
-                // (after fire/water, before crown/forge/ring/particles/vapor),
-                // into the same `under` / `out` / `halos` scratch.
-                // `Config::from_glow` is a field copy; the beams scratch and cue
-                // sink are resident. `rainbow_exit_swoosh` stays v1-only.
-                //
-                // §18's zero allocation per frame for the lent streams: their
-                // peaks are state-dependent, so an on-demand scratch could still
-                // grow long after warm-up. They are sized to their caps once, on
-                // the first engaged frame; later frames pay a capacity compare.
-                Self::reserve_v2_scratch(&mut under, out, &mut halos);
-                if self.v2_beams.capacity() < Self::V2_BEAM_SCRATCH {
-                    self.v2_beams.reserve(Self::V2_BEAM_SCRATCH);
-                }
-                if self.v2_cues.capacity() < Self::V2_CUE_SCRATCH {
-                    self.v2_cues.reserve(Self::V2_CUE_SCRATCH);
-                }
-                let v2_cfg = rk::Config::from_glow(cfg, self.reduced_motion);
-                // The follow pass: before the tick replays this frame's events,
-                // the engine reads the rows the host sampled under its lock and
-                // carries every run whose text moved a row (a bottom-anchored
-                // composer growing without a scroll) to its glyphs' new row, with
-                // clocks intact (`rk::Engine::follow_rows`). The same samples
-                // feed the witness after the tick.
-                if witness_n > 0 {
-                    let (samples, n) = witness_samples(&self.witness_rows, witness_n);
-                    let park = self.held_park.filter(|p| !p.cross_row && p.fresh(now));
-                    let pair = park.map(|p| ((p.row, p.origin), (p.landing_row, p.landing)));
-                    let (_, proved) =
-                        self.v2
-                            .follow_rows_with_park(&samples[..n], &asked[..asked_n], now, pair);
-                    if proved && let Some(p) = self.held_park.as_mut() {
-                        p.content_followed = true;
-                    }
-                }
-                let mut frame = rk::Frame {
-                    under: &mut under,
-                    out: &mut *out,
-                    halos: &mut halos,
-                    beams: &mut self.v2_beams,
-                    cues: &mut self.v2_cues,
-                    caret: CaretSeam::default(),
-                    companion: None,
-                    fp: 0,
-                };
-                self.v2.tick(now, geom, &v2_cfg, &mut frame);
-                self.v2_caret = frame.caret;
-                // Read the walk of the typed run this frame began off the cells
-                // just laid (§46), for a revive after a rest.
-                self.read_fresh_run_origin(now);
-                // Seam point 11 (§17.2): the frame's cues join the host's one
-                // backlog under the same refusal as `cue_sound` (a full backlog
-                // drops the newest), so a non-draining host sees a bound and the
-                // steady frame allocates nothing (§18).
-                for cue in self.v2_cues.drain(..) {
-                    if self.sound_cues.len() < Self::MAX_SOUND_CUES {
-                        self.sound_cues.push(cue);
-                    }
-                }
-                // The caret's stop is seated here, only on an event the caret
-                // can see: its cell moved (the frame's `Move` is already
-                // ingested, so `field_t` is this frame's answer at the new cell),
-                // or the cell under it owns field light. Otherwise the seat is
-                // held ([`Self::rainbow_head_rgb`]). `field_at` is O(1) in
-                // columns.
-                let owns_light = cur.is_some_and(|(r, c)| self.v2.field_at(r, c).is_some());
-                if owns_light || self.v2_stop.is_none_or(|(_, at)| at != cur) {
-                    self.v2_stop = Some((self.v2_caret.field_t, cur));
-                }
-                // The content witness: after the tick that laid this frame's
-                // cells, read every resident cell against the rows the host
-                // sampled under its lock (with the batch applied, so a redraw
-                // restoring the same text is the same text, D2) and retire on
-                // the fast melt the cells whose glyph changed or went
-                // (`rk::witness`). This is where the absolute-cell ribbon
-                // learns its text has moved.
-                if witness_n > 0 {
-                    let (samples, n) = witness_samples(&self.witness_rows, witness_n);
-                    self.v2.witness_rows(&samples[..n], now);
-                }
-            } else {
-                // The crown is the other styles' head light: radial light
-                // (RainHalo) capped by MAX_HALOS. v2 owns Rainbow Kitty's head
-                // (§7.1's caret seam, the ribbon's nozzle), so while v2 owns the
-                // frame the crown neither paints nor paces
-                // ([`Self::needs_frame_cadence`]).
-                self.emit_crown(now, cfg, geom, cur, &mut halos, &mut under);
-            }
-            // The forge dressing rides `cursor_temp`, not the crown's window,
-            // so it runs whether or not a crown is live.
-            if out.len() < Self::MAX_QUADS {
-                self.emit_forge_cursor(cfg, geom, cur, out, &mut halos);
-            }
-            if out.len() < Self::MAX_QUADS {
-                self.emit_ring(now, cfg, geom, out, &mut halos);
-            }
-            if out.len() < Self::MAX_QUADS {
-                self.emit_particles(now, cfg, geom, out, &mut halos);
-            }
-            self.emit_vapor(now, cfg, geom, &mut halos);
-            self.bolt_verts = bolt_verts;
-            // The halo cap (§18): every style's streams are self-capped at the
-            // emitter, so the only shared pass left is the halo count.
-            Self::cap_and_clear_v2_streams(&mut halos);
-        } // end built-in emit branch (the custom interpreter above is the other arm)
+            // The crown is the other styles' head light: radial light
+            // (RainHalo) capped by MAX_HALOS. v2 owns Rainbow Kitty's head
+            // (§7.1's caret seam, the ribbon's nozzle), so while v2 owns the
+            // frame the crown neither paints nor paces
+            // ([`Self::needs_frame_cadence`]).
+            self.emit_crown(now, cfg, geom, cur, &mut halos, &mut under);
+        }
+        // The forge dressing rides `cursor_temp`, not the crown's window,
+        // so it runs whether or not a crown is live.
+        if out.len() < Self::MAX_QUADS {
+            self.emit_forge_cursor(cfg, geom, cur, out, &mut halos);
+        }
+        if out.len() < Self::MAX_QUADS {
+            self.emit_ring(now, cfg, geom, out, &mut halos);
+        }
+        if out.len() < Self::MAX_QUADS {
+            self.emit_particles(now, cfg, geom, out, &mut halos);
+        }
+        self.emit_vapor(now, cfg, geom, &mut halos);
+        self.bolt_verts = bolt_verts;
+        // The halo cap (§18): every style's streams are self-capped at the
+        // emitter, so the only shared pass left is the halo count.
+        Self::cap_and_clear_v2_streams(&mut halos);
         self.halo_out = halos;
         self.patch_out = patches;
         self.under_out = under;
@@ -2577,7 +2594,7 @@ impl CursorGlow {
     /// in-flight collections into a boxed ghost animator, copy the thermal and
     /// phase scalars it needs, and leave the live engine's warmth in place so
     /// the incoming style does not start cold. Called from `tick` when the
-    /// style/pack guard disagrees, before `last_style`/`last_cfg` are
+    /// style guard disagrees, before `last_style`/`last_cfg` are
     /// overwritten.
     fn begin_style_fade(&mut self, now: Instant) {
         // The outgoing style hands off at the amplitude it held (a partial
@@ -2646,7 +2663,6 @@ impl CursorGlow {
         // Pin the ghost's own switch guard to its config so its ticks never
         // re-detect a change (and never nest another fade).
         ghost.last_style = Some(cfg.style);
-        ghost.last_pack_fp = cfg.pack.as_ref().map_or(0, |p| p.pack_fp);
         ghost.last_cfg = Some(cfg);
         // Style-specific phases restart for the incoming style: a fresh flame
         // field or ribbon spine attacks from 0 (the built-in half of the ramp).

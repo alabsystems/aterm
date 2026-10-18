@@ -329,8 +329,8 @@ impl TerminalHandler<'_> {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "FullReset",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
@@ -346,7 +346,6 @@ impl TerminalHandler<'_> {
             xterm_keyboard: self.xterm_keyboard,
             iterm2: self.iterm2,
             shell: self.shell,
-            #[cfg(feature = "sixel")]
             sixel: self.sixel,
             title: self.title,
             dcs: self.dcs,
@@ -380,6 +379,8 @@ impl TerminalHandler<'_> {
         self.modes.cursor_style = *self.default_cursor_style;
         // Mode 12 mirrors the style's blink bit.
         self.modes.cursor_blink = self.modes.cursor_style.blinks();
+        // So does the host's alternate scroll (1007).
+        self.modes.alternate_scroll = *self.host_alternate_scroll;
     }
 
     /// DECBI, Back Index (ESC 6, VT420+): at the left margin (column 0 without DECLRMM), scroll

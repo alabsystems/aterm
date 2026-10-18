@@ -48,6 +48,23 @@
 //!   wrong with it — missing, truncated, oversized, a bad sha, bad JSON —
 //!   drops the carry and nothing else: the session adopts as it did before.
 //!
+//! # The session log
+//!
+//! A handed session's log rides its sidecar too (`log`, design §5.2, phase
+//! 2A): at most 128 KiB of `aterm_slog` carry lines, cut in the eviction
+//! order, so the successor's log goes on as it stood ([`export_for_target`]).
+//! The member is written only for a successor at least as new as this build
+//! ([`successor_reads_session_log`]): below it the export is exactly what it
+//! was. Its timeline is locked in a pass of its own after every ledger and
+//! terminal, with its own patience, so a busy log costs only itself. Under
+//! the aggregate's pressure the log's skeleton is set aside after the cores
+//! and before the archive's rows, and its detail shares only what the rows
+//! left (at most [`MAX_AGGREGATE_LOG_DETAIL`]): log detail is shed first,
+//! then rows, then the differ's state, then the skeleton, then ledger
+//! records. A receiver reads the member leniently and apart: a value that is
+//! not a list of lines, or more of them than a carry holds, reads as no log,
+//! and the ledger and archive adopt as they would have.
+//!
 //! # Privacy
 //!
 //! The archive was built to live in memory. Carrying it puts scrolled-off text
@@ -110,6 +127,30 @@ pub(crate) const MAX_TURN_ID: u64 = i64::MAX as u64;
 /// never waits long on anyone.
 #[cfg(any(unix, test))]
 const LOCK_PATIENCE: Duration = Duration::from_millis(50);
+/// How long the worker waits, over the whole log pass (after every ledger
+/// and terminal was taken), for timelines other threads hold. A timeline not
+/// taken by then is taken only if free at once: a busy one costs its own
+/// session's log, never another's ledger.
+#[cfg(any(unix, test))]
+const LOG_LOCK_PATIENCE: Duration = Duration::from_millis(20);
+/// The most session-log DETAIL (past each log's skeleton) one handoff
+/// carries across every session. Both ends of it are inside the freeze: the
+/// export encodes it on the worker while every reader is parked, and the
+/// receiver decodes it before the reader starts. Set from
+/// `handoff_carry_tests::measure_log_carry_freeze` and aterm-slog's
+/// `measure_carry_encode_and_decode` (2026-10-16, owner Mac): a full 128 KiB
+/// log's cut and encode take 0.71 ms and its `Log::from_carry` 0.77 ms in
+/// release (3.5 and 3.6 ms in debug), so this cap, about sixteen full logs,
+/// is on the order of 12 ms of each end at worst in a shipped build. Every
+/// other handed session pays only its snapshot under its lock (0.14 ms for
+/// a full ring in release) and its skeleton's cut (0.02 ms): its detail is
+/// sized from what the ring already knows and never encoded. Measured in a
+/// debug build at 128 sessions with full logs, the export took 63 ms against
+/// 3.6 ms without logs (shell-only) and 287 ms against 249 ms (Claude-Code-
+/// like, whose rows take the aggregate); it was 360 and 685 ms when every
+/// log was encoded in full two to four times.
+#[cfg(any(unix, test))]
+pub(crate) const MAX_AGGREGATE_LOG_DETAIL: u64 = 2 * 1024 * 1024;
 
 /// One session's capture, taken in the freeze and exported on the worker.
 #[cfg(any(unix, test))]
@@ -123,6 +164,9 @@ pub(crate) struct CarrySource {
     head: AltArchiveCarry,
     /// Whether the differ's state may travel ([`Self::without_differ`]).
     keep_differ: bool,
+    /// The session's timeline, whose log a successor that reads one is
+    /// handed (`None`: a held pane's, which carries no log).
+    timeline: Option<Arc<Mutex<crate::session_timeline::SessionTimeline>>>,
 }
 
 #[cfg(any(unix, test))]
@@ -162,6 +206,7 @@ pub(crate) fn capture_head(
     terminal: &Terminal,
     term: &Arc<Mutex<Terminal>>,
     turns: &Arc<Mutex<TurnLedger>>,
+    timeline: Option<&Arc<Mutex<crate::session_timeline::SessionTimeline>>>,
     differ: bool,
 ) -> CarrySource {
     let (fence, head) = terminal.alt_archive_carry_head(differ);
@@ -172,7 +217,19 @@ pub(crate) fn capture_head(
         fence,
         head,
         keep_differ: true,
+        timeline: timeline.map(Arc::clone),
     }
+}
+
+/// Whether a successor of `target_build` reads the session log a handoff
+/// carries (the sidecar's `log`): one at least as new as this build, as for
+/// the mailbox (`app_update_handoff::successor_reads_fabric_carry`). Below
+/// it the export is exactly what it was without the member, so an older
+/// receiver adopts as before, its aggregate unspent on a member it skips.
+#[cfg(any(unix, test))]
+#[must_use]
+pub(crate) fn successor_reads_session_log(target_build: u64, running_build: u64) -> bool {
+    target_build >= running_build
 }
 
 /// Which turn-status words the receiving build reads, so [`export_for`]
@@ -245,6 +302,13 @@ pub(crate) enum CarryLoss {
     TerminalBusy,
     /// The archive moved after the freeze took its fence: its counters alone.
     ArchiveMoved,
+    /// Another thread kept the session's timeline past the log pass's
+    /// patience: it hands off without its log (the successor's starts over
+    /// after `gap why=handoff`).
+    LogBusy,
+    /// The session's log did not fit (its skeleton past its 32 KiB, or past
+    /// what the aggregate left): it hands off without its log.
+    LogNotCarried,
 }
 
 #[cfg(any(unix, test))]
@@ -266,6 +330,15 @@ impl CarryLoss {
             Self::ArchiveMoved => format!(
                 "update apply: session {local_id}'s archive moved after the freeze took it; it \
                  crosses as counters alone, its rows counted lost"
+            ),
+            Self::LogBusy => format!(
+                "update apply: session {local_id}'s timeline was held by another thread past the \
+                 log pass's {LOG_LOCK_PATIENCE:?}; it hands off without its session log, which \
+                 starts over after a handoff gap"
+            ),
+            Self::LogNotCarried => format!(
+                "update apply: session {local_id}'s session log does not fit its carry; it hands \
+                 off without it, and the log starts over after a handoff gap"
             ),
         }
     }
@@ -300,23 +373,146 @@ pub(crate) fn export(sources: &[CarrySource], turn_id_ceiling: u64) -> Vec<(u64,
 /// overflow it, they share it ([`core_shares`]): every session keeps its
 /// newest records, the longest ledgers are cut alike, and each carry names
 /// the turn ids it shed (round eight, finding 41).
-#[cfg(any(unix, test))]
+///
+/// No session log: what a successor older than the log's carry is handed
+/// ([`export_for_target`]).
+#[cfg(test)]
 pub(crate) fn export_for(
     sources: &[CarrySource],
     turn_id_ceiling: u64,
     words: StatusWords,
 ) -> Vec<(u64, Vec<u8>)> {
-    export_noting(sources, turn_id_ceiling, words, |local_id, loss| {
+    export_noting(sources, turn_id_ceiling, words, false, |local_id, loss| {
         loss.log(local_id);
     })
 }
 
-/// [`export_for`], each [`CarryLoss`] handed to `noted` with its session.
+/// [`export_for`] for a successor of `target_build`: its turn-status words
+/// ([`StatusWords::for_target`]) and, when it reads one
+/// ([`successor_reads_session_log`]), each handed session's log.
+#[cfg(any(unix, test))]
+pub(crate) fn export_for_target(
+    sources: &[CarrySource],
+    turn_id_ceiling: u64,
+    target_build: u64,
+) -> Vec<(u64, Vec<u8>)> {
+    export_noting(
+        sources,
+        turn_id_ceiling,
+        StatusWords::for_target(target_build),
+        successor_reads_session_log(target_build, crate::running_build_number()),
+        |local_id, loss| loss.log(local_id),
+    )
+}
+
+/// What the log pass took of a session: its carry's source, prepared (the
+/// records that always cross encoded once), its skeleton cut, and what its
+/// whole carry would take, sized from what the ring already knows of its
+/// records without encoding them. A session whose share is the skeleton
+/// crosses with that cut as it is, and its detail is never encoded; one
+/// granted detail is cut once at its share.
+#[cfg(any(unix, test))]
+struct LogTake {
+    source: crate::session_log::PreparedSlogCarry,
+    /// The carry with only what always crosses.
+    skeleton: aterm_slog::CarryOut,
+    /// `skeleton`'s lines as the member's JSON, its key included.
+    skeleton_json: u64,
+    /// The whole carry's member JSON, at most (the node lines its detail
+    /// needs aside): the skeleton's, its detail's line bytes, and two JSON
+    /// bytes a line.
+    full_json: u64,
+    /// The JSON's bytes per carry-line byte (its quotes, commas, escapes).
+    json_ratio: f64,
+}
+
+/// The bytes the JSON string literal of `text` takes, quotes included:
+/// `aterm_json`'s writer's escapes (`"` and `\` two, `\b \f \n \r \t`
+/// two, any other C0 control six, every other byte itself), counted rather
+/// than written.
+#[cfg(any(unix, test))]
+fn json_string_len(text: &str) -> u64 {
+    let escaped: u64 = text
+        .bytes()
+        .map(|b| match b {
+            b'"' | b'\\' | 0x08 | 0x0C | b'\n' | b'\r' | b'\t' => 2,
+            0x00..=0x1F => 6,
+            _ => 1,
+        })
+        .sum();
+    escaped + 2
+}
+
+/// The JSON a `log` member of `lines` takes (`,"log":[…]`), counted.
+#[cfg(any(unix, test))]
+fn log_json_len(lines: &[String]) -> u64 {
+    let items: u64 = lines.iter().map(|l| json_string_len(l)).sum();
+    let commas = lines.len().saturating_sub(1) as u64;
+    items + commas + 2 + 7
+}
+
+/// `sidecar` (a [`Wire`] as [`encode`] writes it, compact, its `log` member
+/// absent) with `log` as its `log` member, spliced in before the object's
+/// closing brace: the ledger and archive are not serialized again. `None`
+/// when `sidecar` is not such an object.
+#[cfg(any(unix, test))]
+fn with_log_member(sidecar: &[u8], log: &[String]) -> Option<Vec<u8>> {
+    let (last, body) = sidecar.split_last()?;
+    if *last != b'}' || body.len() < 2 || log.is_empty() {
+        return None;
+    }
+    let member = aterm_json::to_vec(log).ok()?;
+    let mut out = Vec::with_capacity(sidecar.len() + member.len() + 8);
+    out.extend_from_slice(body);
+    out.extend_from_slice(b",\"log\":");
+    out.extend_from_slice(&member);
+    out.push(b'}');
+    Some(out)
+}
+
+/// `sidecar` with a `log_mirror` member naming `prior` (`<ep>:<seq>:<ms>:<head>`),
+/// spliced in before the object's closing brace as [`with_log_member`] does.
+#[cfg(any(unix, test))]
+fn with_mirror_member(sidecar: &[u8], prior: aterm_slog::Prior) -> Option<Vec<u8>> {
+    let (last, body) = sidecar.split_last()?;
+    if *last != b'}' || body.len() < 2 {
+        return None;
+    }
+    let member = format!(
+        ",\"log_mirror\":\"{}:{}\"}}",
+        prior.landed.word(),
+        prior.ms_head
+    );
+    let mut out = Vec::with_capacity(sidecar.len() + member.len());
+    out.extend_from_slice(body);
+    out.extend_from_slice(member.as_bytes());
+    Some(out)
+}
+
+/// The most bytes [`with_mirror_member`] adds: `,"log_mirror":"` and four
+/// numbers (`u32`, then three `u64`) with their colons and closing quote.
+#[cfg(any(unix, test))]
+const MIRROR_MEMBER_MAX: u64 = 16 + 10 + 3 * 20 + 3 + 1;
+
+/// The `log_mirror` member read back (`<ep>:<seq>:<ms>:<head>`), or none.
+fn read_mirror_member(raw: &str) -> Option<aterm_slog::Prior> {
+    let (cursor, head) = raw.rsplit_once(':')?;
+    Some(aterm_slog::Prior {
+        landed: aterm_slog::BusCursor::parse(cursor)?,
+        ms_head: head.parse().ok()?,
+    })
+}
+
+/// [`export_for`], each [`CarryLoss`] handed to `noted` with its session;
+/// `logs`: whether the successor reads the session log (each source's
+/// timeline is then taken in a pass of its own, after every ledger and
+/// terminal).
 #[cfg(any(unix, test))]
 pub(crate) fn export_noting(
     sources: &[CarrySource],
     turn_id_ceiling: u64,
     words: StatusWords,
+    logs: bool,
     mut noted: impl FnMut(u64, CarryLoss),
 ) -> Vec<(u64, Vec<u8>)> {
     let patience = Instant::now() + LOCK_PATIENCE;
@@ -375,26 +571,104 @@ pub(crate) fn export_noting(
         let core = core_len(&turns, unheld_below, &archive);
         taken.push((source.local_id, turns, unheld_below, archive, core));
     }
+    // THE LOG PASS, after every ledger and terminal, with its own patience:
+    // each timeline's take (its snapshot and producers' lines, its readers
+    // fenced from here on) is the only thing done under its lock.
+    let log_patience = Instant::now() + LOG_LOCK_PATIENCE;
+    let mut log_takes: Vec<Option<LogTake>> = Vec::with_capacity(sources.len());
+    // THE BUS MIRROR's cursor and head under each fence just set (phase 4,
+    // ruling Q7): what a successor says of the old space's tail when this
+    // session's log does not cross, or crosses and its carry does not read
+    // there. `None` for an unmirrored log.
+    let mut log_priors: Vec<Option<aterm_slog::Prior>> = Vec::with_capacity(sources.len());
+    for source in sources {
+        let mut busy = false;
+        let mut prior = None;
+        let take = logs
+            .then_some(source.timeline.as_ref())
+            .flatten()
+            .and_then(|timeline| {
+                let Some(mut tl) = patiently(log_patience, || timeline.try_lock()) else {
+                    busy = true;
+                    return None;
+                };
+                let src = tl.slog_carry_source();
+                drop(tl);
+                // Off the lock: the skeleton cut (its records encoded once),
+                // the detail sized without encoding it.
+                let source = src.prepare();
+                prior = source.mirror_prior();
+                let skeleton = source.skeleton()?;
+                let skeleton_json = log_json_len(&skeleton.lines);
+                let (detail_bytes, detail_records) = source.detail();
+                let detail_json = (detail_bytes as u64).saturating_add(detail_records as u64 * 2);
+                let json_ratio = skeleton_json as f64 / skeleton.bytes.max(1) as f64;
+                // The carry never passes its session budget.
+                let cap_json = (aterm_slog::CARRY_TOTAL_BYTES as f64 * json_ratio) as u64;
+                let full_json = skeleton_json
+                    .saturating_add(detail_json)
+                    .min(cap_json.max(skeleton_json));
+                Some(LogTake {
+                    json_ratio,
+                    source,
+                    skeleton,
+                    skeleton_json,
+                    full_json,
+                })
+            });
+        if busy {
+            noted(source.local_id, CarryLoss::LogBusy);
+        } else if logs && source.timeline.is_some() && take.is_none() {
+            noted(source.local_id, CarryLoss::LogNotCarried);
+        }
+        log_takes.push(take);
+        log_priors.push(prior);
+    }
+    // Every carried log is fenced: this process's journal drains each to its
+    // fence and ends its chain `#handed` (phase 2B); the Commit never waits.
+    if logs {
+        crate::session_log_journal::note_handing();
+    }
     let cores: Vec<u64> = taken.iter().map(|(.., core)| *core).collect();
     let shares = core_shares(&cores, MAX_AGGREGATE_BYTES);
+    // The log skeletons from what the cores left, before any archive row.
+    let after_cores = MAX_AGGREGATE_BYTES.saturating_sub(shares.iter().sum());
+    let skeletons: Vec<u64> = log_takes
+        .iter()
+        .map(|t| t.as_ref().map_or(0, |t| t.skeleton_json))
+        .collect();
+    let skeleton_grants: Vec<u64> = core_shares(&skeletons, after_cores)
+        .into_iter()
+        .zip(&skeletons)
+        .map(|(granted, want)| if granted >= *want { *want } else { 0 })
+        .collect();
     // What the differs and the rows may spend, over every session's share.
-    let mut spare = MAX_AGGREGATE_BYTES.saturating_sub(shares.iter().sum());
+    let mut spare = after_cores.saturating_sub(skeleton_grants.iter().sum());
     let mut total = 0_u64;
     let (mut shed_sessions, mut shed_records) = (0_usize, 0_usize);
-    let mut out = Vec::with_capacity(taken.len());
-    for ((local_id, turns, unheld_below, archive, _), share) in taken.into_iter().zip(shares) {
+    // Each chosen sidecar keeps its source's index: its log take is that
+    // source's (`log_takes` is in source order).
+    let mut chosen: Vec<(usize, u64, Vec<TurnRecord>, Chosen, u64)> =
+        Vec::with_capacity(taken.len());
+    for (index, (((local_id, turns, unheld_below, archive, _), share), skeleton)) in taken
+        .into_iter()
+        .zip(shares)
+        .zip(&skeleton_grants)
+        .enumerate()
+    {
         let room = MAX_SIDECAR_BYTES
+            .saturating_sub(*skeleton)
             .min(share.saturating_add(spare))
             .min(MAX_AGGREGATE_BYTES.saturating_sub(total));
-        if let Some((bytes, shed)) = encode_within(turns, unheld_below, archive, room) {
-            let len = bytes.len() as u64;
+        if let Some((pick, shed)) = encode_within(&turns, unheld_below, archive, room) {
+            let len = pick.bytes.len() as u64;
             total = total.saturating_add(len);
             spare = spare.saturating_sub(len.saturating_sub(share));
             if shed > 0 {
                 shed_sessions += 1;
                 shed_records += shed;
             }
-            out.push((local_id, bytes));
+            chosen.push((index, local_id, turns, pick, *skeleton));
         } else {
             // SAID, not silent (round seven, finding 44): the session adopts
             // with an empty ledger and a fresh archive.
@@ -404,6 +678,55 @@ pub(crate) fn export_noting(
                  and archive tail"
             );
         }
+    }
+    // THE LOG DETAIL shares what the rows left, capped (the receiver decodes
+    // it inside the freeze), and each session's sidecar is written once.
+    let reserved: u64 = chosen.iter().map(|(.., skeleton)| *skeleton).sum();
+    let detail_budget = MAX_AGGREGATE_BYTES
+        .saturating_sub(total)
+        .saturating_sub(reserved)
+        .min(MAX_AGGREGATE_LOG_DETAIL);
+    let detail_wants: Vec<u64> = chosen
+        .iter()
+        .map(|(index, .., skeleton)| match log_takes[*index].as_ref() {
+            Some(t) if *skeleton > 0 => t.full_json.saturating_sub(t.skeleton_json),
+            _ => 0,
+        })
+        .collect();
+    let detail_shares = core_shares(&detail_wants, detail_budget);
+    let mut out = Vec::with_capacity(chosen.len());
+    for ((index, local_id, turns, pick, skeleton), detail) in chosen.into_iter().zip(detail_shares)
+    {
+        let take = log_takes[index].as_ref().filter(|_| skeleton > 0);
+        let prior = log_priors[index];
+        // The mirror's member is room kept back from the log's.
+        let member = if prior.is_some() {
+            MIRROR_MEMBER_MAX
+        } else {
+            0
+        };
+        let bytes = take
+            .and_then(|t| {
+                let room = MAX_SIDECAR_BYTES
+                    .min(pick.bytes.len() as u64 + skeleton + detail)
+                    .saturating_sub(member);
+                with_log(&turns, &pick, t, skeleton + detail, room)
+            })
+            .unwrap_or_else(|| {
+                if take.is_some() {
+                    noted(local_id, CarryLoss::LogNotCarried);
+                }
+                pick.bytes
+            });
+        // A MIRRORED log's cursor and head cross whether or not its log does,
+        // a few dozen bytes (ruling Q7): a successor whose `Log::from_carry`
+        // refuses the carry still says the old space's tail as one exact
+        // `gap why=reset`. An unmirrored one adds none.
+        let bytes = match prior {
+            Some(p) => with_mirror_member(&bytes, p).unwrap_or(bytes),
+            None => bytes,
+        };
+        out.push((local_id, bytes));
     }
     if shed_sessions > 0 {
         // COUNTED, and said: each of these carries names the ids it shed
@@ -415,6 +738,51 @@ pub(crate) fn export_noting(
         );
     }
     out
+}
+
+/// The sidecar `pick` chose, with the session's log cut to `log_json` bytes
+/// of member JSON and the whole within `room`. A share of the skeleton alone
+/// takes the take's own cut as it is; a larger one is cut once at it (the
+/// whole carry when it covers the take's estimate), taken down by what the
+/// JSON overran, twice at most, then to the skeleton. The member is spliced
+/// into the sidecar `pick` already encoded ([`with_log_member`]); a sidecar
+/// that cannot take it is encoded whole.
+#[cfg(any(unix, test))]
+fn with_log(
+    turns: &[TurnRecord],
+    pick: &Chosen,
+    take: &LogTake,
+    log_json: u64,
+    room: u64,
+) -> Option<Vec<u8>> {
+    let sidecar = |lines: &[String]| -> Option<Vec<u8>> {
+        with_log_member(&pick.bytes, lines)
+            .or_else(|| encode_wire(&turns[pick.cut..], pick.floor, &pick.archive, lines))
+    };
+    let fits = |b: &Vec<u8>| b.len() as u64 <= room;
+    if log_json <= take.skeleton_json {
+        return sidecar(&take.skeleton.lines).filter(fits);
+    }
+    let mut total = if log_json >= take.full_json {
+        aterm_slog::CARRY_TOTAL_BYTES
+    } else {
+        (log_json as f64 / take.json_ratio.max(1.0)) as usize
+    };
+    for _ in 0..3 {
+        let budget = aterm_slog::CarryBudget {
+            total: total.min(aterm_slog::CARRY_TOTAL_BYTES),
+            ..aterm_slog::CarryBudget::SESSION
+        };
+        let lines = take.source.encode(budget)?.lines;
+        let bytes = sidecar(&lines)?;
+        let len = bytes.len() as u64;
+        if len <= room {
+            return Some(bytes);
+        }
+        let over = usize::try_from(len - room).unwrap_or(usize::MAX);
+        total = total.saturating_sub(over.saturating_mul(2).max(1024));
+    }
+    sidecar(&take.skeleton.lines).filter(fits)
 }
 
 /// Each session's share of `budget` for its CORE ([`core_len`], `cores` in
@@ -527,6 +895,17 @@ fn patiently<G>(
     }
 }
 
+/// What [`encode_within`] chose: the ledger's cut (its first record carried
+/// and the floor below which the carry vouches for no id), the archive as it
+/// crosses, and the sidecar those encode to.
+#[cfg(any(unix, test))]
+struct Chosen {
+    cut: usize,
+    floor: u64,
+    archive: AltArchiveCarry,
+    bytes: Vec<u8>,
+}
+
 /// Encode, shedding what does not fit `room`: the rows first (counters
 /// only), then the differ's state, then the ledger's OLDEST records, no more
 /// of them than the room needs (the ids shed are ones the carried ledger no
@@ -537,19 +916,35 @@ fn patiently<G>(
 /// half the ledger at a time left up to half the room unspent.
 #[cfg(any(unix, test))]
 fn encode_within(
-    turns: Vec<TurnRecord>,
+    turns: &[TurnRecord],
     unheld_below: u64,
     archive: AltArchiveCarry,
     room: u64,
-) -> Option<(Vec<u8>, usize)> {
+) -> Option<(Chosen, usize)> {
     let fits = |b: &Vec<u8>| b.len() as u64 <= room;
     let mut archive = archive;
-    if let Some(bytes) = encode(&turns, unheld_below, &archive).filter(fits) {
-        return Some((bytes, 0));
+    if let Some(bytes) = encode(turns, unheld_below, &archive).filter(fits) {
+        return Some((
+            Chosen {
+                cut: 0,
+                floor: unheld_below,
+                archive,
+                bytes,
+            },
+            0,
+        ));
     }
     archive = counters_only(archive);
-    if let Some(bytes) = encode(&turns, unheld_below, &archive).filter(fits) {
-        return Some((bytes, 0));
+    if let Some(bytes) = encode(turns, unheld_below, &archive).filter(fits) {
+        return Some((
+            Chosen {
+                cut: 0,
+                floor: unheld_below,
+                archive,
+                bytes,
+            },
+            0,
+        ));
     }
     archive.differ = None;
     let mut lens: Option<Vec<u64>> = None;
@@ -562,7 +957,15 @@ fn encode_within(
         let bytes = encode(&turns[cut..], floor, &archive)?;
         let over = (bytes.len() as u64).saturating_sub(room);
         if over == 0 {
-            return Some((bytes, cut));
+            return Some((
+                Chosen {
+                    cut,
+                    floor,
+                    archive,
+                    bytes,
+                },
+                cut,
+            ));
         }
         if cut == turns.len() {
             return None;
@@ -610,6 +1013,40 @@ struct Wire {
     unheld_below: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     archive: Option<ArchiveWire>,
+    /// THE SESSION LOG (phase 2A): its carry lines, oldest part first
+    /// (`aterm_slog::Log::carry`). Absent (an older sender, or a successor
+    /// older than the carry) reads as none; a value that is not a list of
+    /// strings reads as none too and costs nothing else ([`lenient_log`]).
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "lenient_log"
+    )]
+    log: Vec<String>,
+    /// THE BUS MIRROR's cursor and head in the old seq space, for a mirrored
+    /// log that did not cross (phase 4, ruling Q7): `<ep>:<seq>:<ms>:<head>`.
+    /// Absent for every other sidecar, so an unmirrored instance's sidecars
+    /// are the bytes they were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    log_mirror: Option<String>,
+}
+
+/// The sidecar's `log` member, read so that nothing it holds can cost the
+/// rest: a list of strings is the log; anything else is none.
+fn lenient_log<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Member {
+        Lines(Vec<String>),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(match <Member as serde::Deserialize>::deserialize(d)? {
+        Member::Lines(lines) => lines,
+        Member::Other(_) => Vec::new(),
+    })
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
@@ -690,7 +1127,20 @@ fn turn_wire(t: &TurnRecord) -> TurnWire {
 
 #[cfg(any(unix, test))]
 fn encode(turns: &[TurnRecord], unheld_below: u64, archive: &AltArchiveCarry) -> Option<Vec<u8>> {
+    encode_wire(turns, unheld_below, archive, &[])
+}
+
+/// [`encode`] with the session log's carry `log` as its `log` member.
+#[cfg(any(unix, test))]
+fn encode_wire(
+    turns: &[TurnRecord],
+    unheld_below: u64,
+    archive: &AltArchiveCarry,
+    log: &[String],
+) -> Option<Vec<u8>> {
     let wire = Wire {
+        log: log.to_vec(),
+        log_mirror: None,
         version: WIRE_VERSION,
         unheld_below,
         turns: turns.iter().map(turn_wire).collect(),
@@ -737,6 +1187,12 @@ pub(crate) struct ControlCarry {
     pub unheld_below: u64,
     /// The carried archive.
     pub archive: Option<AltArchiveCarry>,
+    /// The carried session log's lines, when the sender wrote them and they
+    /// read as a list within a carry's bounds.
+    pub log: Option<Vec<String>>,
+    /// The bus mirror's old-space cursor and head, for a log that did not
+    /// cross (`Wire::log_mirror`).
+    pub log_mirror: Option<aterm_slog::Prior>,
 }
 
 impl ControlCarry {
@@ -761,6 +1217,17 @@ impl ControlCarry {
         if let Some(archive) = self.archive.as_mut() {
             archive.differ = None;
         }
+    }
+
+    /// The carried session log, taken (the adopting log reads it,
+    /// `session_log::SessionLog::adopt`).
+    pub(crate) fn take_log(&mut self) -> Option<Vec<String>> {
+        self.log.take()
+    }
+
+    /// The bus mirror's old-space cursor, taken (`LogAdopt::mirror`).
+    pub(crate) fn take_log_mirror(&mut self) -> Option<aterm_slog::Prior> {
+        self.log_mirror.take()
     }
 
     /// The highest carried turn id.
@@ -852,10 +1319,20 @@ pub(crate) fn decode_why(bytes: &[u8]) -> Result<ControlCarry, &'static str> {
             }
         }),
     });
+    // The log, bounded before anything reads it: more lines or bytes than
+    // a carry holds is no log (the log's own reader checks the rest).
+    let log = Some(wire.log).filter(|lines| {
+        !lines.is_empty()
+            && lines.len() <= aterm_slog::CARRY_MAX_LINES
+            && lines.iter().map(|l| l.len() + 1).sum::<usize>() <= aterm_slog::CARRY_MAX_BYTES
+    });
+    let log_mirror = wire.log_mirror.as_deref().and_then(read_mirror_member);
     Ok(ControlCarry {
         turns,
         unheld_below: unheld_below.min(MAX_TURN_ID.saturating_add(1)),
         archive,
+        log,
+        log_mirror,
     })
 }
 

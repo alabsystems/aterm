@@ -9,7 +9,7 @@
 //! at 150 ms, through two composers:
 //!
 //! * zsh: a word key moves the caret with one `CUB`/`CUF`, visibly, in one frame;
-//! * an Ink-shaped composer (`docs/design/repro/inkish.py`): every key and hop redraws the line
+//! * an Ink-shaped composer (this file's `Composer::Ink`): every key and hop redraws the line
 //!   inside a DECTCEM bracket, split so a present lands while the caret is hidden; the hop
 //!   reaches the engine through the nav hide-bridge, and the witness sees the same text put back.
 //!
@@ -41,7 +41,7 @@ const KEY_MS: u64 = 83;
 const HOP_MS: u64 = 150;
 /// The frame train.
 const FRAME_MS: u64 = 16;
-/// `inkish.py`'s split between the redraw's head and its tail.
+/// The Ink-shaped composer's split between the redraw's head and its tail.
 const INK_SPLIT_MS: u64 = 30;
 
 fn geom() -> Geom {
@@ -79,7 +79,6 @@ fn cfg() -> GlowConfig {
         ring: true,
         beam: false,
         head_dx: 0.5,
-        pack: None,
     }
 }
 
@@ -160,8 +159,8 @@ impl Host {
         twin.note_pane_columns(0, COLS);
         match composer {
             Composer::Zsh => term.process(format!("\x1b[{};1H", ROW + 1).as_bytes()),
-            // `inkish.py`'s entry: the alt screen, cleared, the caret on the
-            // line's row.
+            // The Ink-shaped composer's entry: the alt screen, cleared, the
+            // caret on the line's row.
             Composer::Ink => term.process(b"\x1b[?1049h\x1b[2J\x1b[3;1H"),
         }
         let mut h = Self {
@@ -451,7 +450,8 @@ fn gaps(before: &[Column], now: &[Column]) -> Vec<(u16, u8)> {
         .collect()
 }
 
-/// The word starts of the line, `inkish.py`'s `WORDS`.
+/// The word starts of the line: where the Ink-shaped composer's word keys
+/// land.
 fn words() -> Vec<usize> {
     let mut w = vec![0];
     for (i, ch) in LINE.char_indices() {

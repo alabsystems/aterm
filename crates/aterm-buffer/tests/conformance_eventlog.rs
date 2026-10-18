@@ -2,8 +2,8 @@
 // Copyright 2026 Andrew Yates
 //
 //! Tier-1 conformance: the real `EventLog` against the derived ring model
-//! (`aterm_spec::derive::ring_model()`, the same model Tier-0 checks in
-//! `aterm-spec/tests/derived_ring_ty.rs`). Each run drives `Surface::apply`,
+//! (`aterm_models_core::ring_model()`, the same model Tier-0 checks in
+//! `aterm-models/tests/derived_ring_ty.rs`). Each run drives `Surface::apply`,
 //! projects every state onto `<<seq, lo>>`, and validates each real transition
 //! as its own two-step trace: `ty trace validate` checks only the first
 //! transition strictly, so one long trace would miss a deep corruption.
@@ -17,7 +17,7 @@
 
 use crate::support::write_cap;
 use aterm_buffer::{Edit, Surface};
-use aterm_spec::derive::ring_model;
+use aterm_models_core::ring_model;
 use aterm_spec::verify;
 use std::collections::BTreeMap;
 

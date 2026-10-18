@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-1 conformance of the typed re-key (`shell_rekey::typed`) to
-//! `aterm_spec::derive::typed_rekey_model` (`TypedRekey`).
+//! `aterm_models_gui::typed_rekey_model` (`TypedRekey`).
 //!
 //! Every schedule of the model is replayed on the SHIPPING code: a real engine
 //! (lost nonce, or a working one), the real `typed::issue_in` writing a real
@@ -32,8 +32,9 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use aterm_core::terminal::{ShellIntegrationNonce, Terminal};
+use aterm_models_gui::typed_rekey_model;
 use aterm_session::SessionId;
-use aterm_spec::derive::{Model, typed_rekey_model};
+use aterm_spec::derive::Model;
 use aterm_spec::interp::{self, State};
 use aterm_spec::verify::validate_transition_tiered;
 

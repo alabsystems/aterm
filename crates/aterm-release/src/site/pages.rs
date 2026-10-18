@@ -6,16 +6,45 @@
 //!
 //! Every rule matches EXACTLY once or the page is refused: a page edit must never
 //! silently orphan a rule. The one exception is the platform attributes on the
-//! `/aterm` and `/terminal` anchors (`data-href-linux-<arch>`, `data-intel-proof`,
-//! `data-toolchain-<arch>`): inserted when known, removed when not, never duplicated;
-//! the site's `platform.js` renders from them. The homepage is one button, the DMG,
-//! and carries no platform attribute.
+//! `/aterm` and `/terminal` anchors (`data-href-linux-<arch>`,
+//! `data-install-linux-<arch>`, `data-intel-proof`, `data-toolchain-<arch>`):
+//! inserted when known, removed when not, never duplicated; the site's
+//! `platform.js` renders from them. The homepage is one button, the DMG, and
+//! carries no platform attribute.
+//!
+//! Linux installs through `install.sh`, which `ship site` serves at
+//! [`INSTALL_URL`] (the public commit's `tools/install.sh`): a Linux pick shows
+//! the command [`linux_install_command`] writes, offered only for an
+//! architecture whose signed executable the election proved.
 
 use std::fmt;
 
 use super::html_escape;
-use super::releases::{Facts, LINUX_ARCHES};
+use super::releases::{Facts, LINUX_ARCHES, LinuxKind};
 use super::toolchain::{Levels, MAC_ARCHES};
+
+/// Where alab.systems serves the installer (`public/install.sh`).
+pub const INSTALL_URL: &str = "https://alab.systems/install.sh";
+
+/// The one command a Linux visitor runs, when `arch` has a signed executable:
+/// the installer piped to bash, which picks the architecture itself and
+/// installs the latest release — pinned with `--version` only when the newest
+/// signed executable for `arch` is older than that release (the installer
+/// verifies it under the latest release's policy). `None` for a legacy tarball
+/// or no build: the installer installs neither.
+#[must_use]
+pub fn linux_install_command(facts: &Facts, arch: &str) -> Option<String> {
+    let d = facts.linux(arch)?;
+    if !matches!(d.kind, LinuxKind::SignedRaw { .. }) {
+        return None;
+    }
+    let pipe = format!("curl -fsSL {INSTALL_URL} | bash");
+    Some(if d.tag == facts.head {
+        pipe
+    } else {
+        format!("{pipe} -s -- --version {}", d.version)
+    })
+}
 
 /// The pages a sync rewrites, in the order it rewrites them.
 pub const PAGES: [&str; 3] = ["index.html", "aterm.html", "terminal.html"];
@@ -281,6 +310,12 @@ pub fn platform_attributes(
     {
         out.push((attr, facts.linux(arch).map(|d| d.url.clone())));
     }
+    for (arch, attr) in LINUX_ARCHES
+        .iter()
+        .zip(["data-install-linux-x86_64", "data-install-linux-aarch64"])
+    {
+        out.push((attr, linux_install_command(facts, arch)));
+    }
     out.push(("data-intel-proof", facts.intel_proof.clone()));
     for (slot, attr) in ["data-toolchain-x86_64", "data-toolchain-aarch64"]
         .into_iter()
@@ -452,6 +487,10 @@ pub enum Difference {
     },
     ReleasesNotFetched,
     ReleasesDiffer,
+    /// The checkout serves `/install.sh` and the live site does not.
+    InstallerNotFetched,
+    /// The live `/install.sh` is not the checkout's.
+    InstallerDiffers,
 }
 
 impl fmt::Display for Difference {
@@ -473,18 +512,22 @@ impl fmt::Display for Difference {
             } => write!(f, "{page} {attr} is {live:?}, expected {want:?}"),
             Self::ReleasesNotFetched => f.write_str("releases.html was not fetched"),
             Self::ReleasesDiffer => f.write_str("live /releases differs from the checkout"),
+            Self::InstallerNotFetched => f.write_str("/install.sh was not fetched"),
+            Self::InstallerDiffers => {
+                f.write_str("live /install.sh differs from the checkout's public/install.sh")
+            }
         }
     }
 }
 
-/// What the live site and the checkout hold, by file: `engine.js`, the three pages
-/// and `releases.html` (`None` = not fetched, or not in the checkout).
+/// What the live site and the checkout hold, by file: `engine.js`, the three pages,
+/// `releases.html` and `install.sh` (`None` = not fetched, or not in the checkout).
 pub struct Copies<'a> {
     pub get: &'a dyn Fn(&str) -> Option<String>,
 }
 
 /// How the live site differs from the checkout: the engine pair, every download
-/// href, every platform attribute (including absence), `/releases`.
+/// href, every platform attribute (including absence), `/releases`, `/install.sh`.
 #[must_use]
 pub fn compare(facts: &Facts, local: &Copies<'_>, live: &Copies<'_>) -> Vec<Difference> {
     let mut out = Vec::new();
@@ -532,6 +575,13 @@ pub fn compare(facts: &Facts, local: &Copies<'_>, live: &Copies<'_>) -> Vec<Diff
             Some(_) => {}
         }
     }
+    if let Some(local_installer) = (local.get)("install.sh") {
+        match (live.get)("install.sh") {
+            None => out.push(Difference::InstallerNotFetched),
+            Some(l) if l != local_installer => out.push(Difference::InstallerDiffers),
+            Some(_) => {}
+        }
+    }
     out
 }
 
@@ -561,6 +611,7 @@ mod tests {
                 url: DMG63.into(),
                 size_bytes: size,
             },
+            head: "v0.63.0".into(),
             intel_proof: None,
             linux: [None, None],
         }
@@ -651,6 +702,58 @@ mod tests {
         }
     }
 
+    fn signed(v: &str, arch: &str) -> LinuxDownload {
+        let label = format!("aterm-{v}-linux-{arch}");
+        LinuxDownload {
+            tag: format!("v{v}"),
+            version: v.into(),
+            url: format!("https://github.com/alabsystems/aterm/releases/download/v{v}/{label}"),
+            label,
+            kind: LinuxKind::SignedRaw {
+                sha256: "b".repeat(64),
+                size: 9000,
+            },
+        }
+    }
+
+    /// A Linux pick is the installer command, written only for an architecture with a
+    /// signed executable — plain when that executable is the head's (what an unpinned
+    /// install.sh installs), pinned to its release when it trails the head — and never
+    /// for a checksum-only tarball, which the installer does not install.
+    #[test]
+    fn the_install_command_is_written_only_for_a_signed_executable() {
+        let mut f = facts(Some(1));
+        f.linux = [Some(tar("0.61.0")), Some(signed("0.63.0", "aarch64"))];
+        let plain = "curl -fsSL https://alab.systems/install.sh | bash";
+        assert_eq!(linux_install_command(&f, "x86_64"), None);
+        assert_eq!(linux_install_command(&f, "aarch64").as_deref(), Some(plain));
+        for name in ["aterm.html", "terminal.html"] {
+            let out = rewrite(name, &page(name), &f, None).unwrap();
+            assert_eq!(
+                attribute_values(&out, "data-install-linux-aarch64"),
+                [plain],
+                "{name}"
+            );
+            assert!(
+                attribute_values(&out, "data-install-linux-x86_64").is_empty(),
+                "{name}"
+            );
+            // the raw link stays a literal the site can check; the command is beside it
+            assert_eq!(
+                attribute_values(&out, "data-href-linux-aarch64"),
+                [signed("0.63.0", "aarch64").url],
+                "{name}"
+            );
+        }
+        f.linux[0] = Some(signed("0.62.0", "x86_64"));
+        assert_eq!(
+            linux_install_command(&f, "x86_64").as_deref(),
+            Some("curl -fsSL https://alab.systems/install.sh | bash -s -- --version 0.62.0")
+        );
+        let home = rewrite("index.html", &page("index.html"), &f, None).unwrap();
+        assert!(attribute_values(&home, "data-install-linux-aarch64").is_empty());
+    }
+
     #[test]
     fn older_note_shapes_converge_on_name_and_size_and_a_rewrite_is_idempotent() {
         let f = facts(Some(1_067_044_990));
@@ -720,6 +823,20 @@ mod tests {
         };
         let (l, v) = (lookup(&local), lookup(&live));
         assert_eq!(compare(&f, &Copies { get: &l }, &Copies { get: &v }), []);
+        // the installer: compared once the checkout serves one
+        local.insert("install.sh", "#!/usr/bin/env bash\n".into());
+        let l = lookup(&local);
+        assert_eq!(
+            compare(&f, &Copies { get: &l }, &Copies { get: &v }),
+            [Difference::InstallerNotFetched]
+        );
+        live.insert("install.sh", "#!/bin/sh\n".into());
+        let v = lookup(&live);
+        assert_eq!(
+            compare(&f, &Copies { get: &l }, &Copies { get: &v }),
+            [Difference::InstallerDiffers]
+        );
+        live.insert("install.sh", local["install.sh"].clone());
         live.insert(
             "aterm.html",
             local["aterm.html"].replace(

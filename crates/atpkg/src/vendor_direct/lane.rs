@@ -59,10 +59,9 @@ pub(crate) struct Lane<'a> {
     /// The anchors.
     pub trust: &'a Trust,
     /// A verified index to read a legacy build's version from, when the caller holds one.
-    /// A version once read is kept in the stamp, and a legacy build at or below the
-    /// program's ceiling whose version cannot be read is replaced by any admissible head
-    /// (the floor is at or above its version); above the ceiling, an unread one waits for
-    /// this or for [`Self::asked`].
+    /// A version once read is kept in the stamp. An unread legacy build at or below the
+    /// program's ceiling is replaced by any admissible head; above it, it waits for this or
+    /// for [`Self::asked`].
     pub legacy_index: Option<&'a TrustedIndex>,
     /// A person asked for the program by name (`update <program>`, `install <program>`,
     /// `claude update`) — not a pass, and not the head watch.
@@ -134,11 +133,11 @@ pub(crate) enum Verdict {
         /// The yanked build.
         from: Installed,
     },
-    /// The verified build's platform signature check did not FINISH in time
+    /// The verified build's platform signature check did not finish in time
     /// ([`StageError::VerifyDeferred`]): no verdict on the bytes and no fault, so nothing
     /// moved, nothing is memoized, its archive is kept, and the next pass checks it again.
-    /// Not a failure ([`Outcome::is_failure`]): codex's 238 MB binary, IO-throttled under
-    /// the window's utility clamp, can run past the deadline and verify seconds later.
+    /// Not a failure ([`Outcome::is_failure`]): codex's 238 MB binary, IO-throttled under the
+    /// window's utility clamp, can run past the deadline and verify seconds later.
     Deferred {
         /// The version whose check did not finish.
         version: Version,
@@ -158,6 +157,43 @@ pub(crate) enum Verdict {
     },
     /// The program is dev-linked: managed from its checkout.
     Linked,
+    /// The active build is ALab's own ([`crate::alab::build_is_alab`]), no pin the channel
+    /// signs for this machine names a build it may install, and the signed policy revokes
+    /// nothing of it: kept, never decided against the vendor's head and never replaced by
+    /// it, asked or not ([`crate::alab`]'s source rule).
+    AlabKept {
+        /// How a line names the active build ([`crate::alab::build_words`]).
+        what: String,
+    },
+    /// The kept ALab build's missing commands could not be restored on this machine.
+    /// Its retained bytes remain, but the pass failed; no vendor head was read.
+    AlabRestoreFailed {
+        /// The retained build whose commands were not laid.
+        what: String,
+        /// The restoration I/O error.
+        error: String,
+    },
+    /// The active ALab build is revoked (a signed yank names it, or it is below the signed
+    /// floor) and the newest retained ALab build below it that nothing revokes is active
+    /// now. Never a vendor build.
+    AlabRolledBack {
+        /// How a line names the revoked build.
+        from: String,
+        /// The build now active.
+        to_build: u64,
+        /// How a line names it.
+        to: String,
+    },
+    /// The active ALab build is revoked and no retained ALab build is admissible: its
+    /// commands are disabled, as the index lane disables a revoked build ([`crate::gate`]),
+    /// until the channel pins one this machine may install or a person chooses the vendor's
+    /// build (`aterm pkg update <program> --vendor`). Never the vendor's build unasked.
+    AlabTombstoned {
+        /// How a line names the revoked build.
+        what: String,
+        /// Why it is revoked.
+        why: Revoked,
+    },
     /// The vendor publishes no build the lane can verify for this machine
     /// ([`VendorSpec::serves`]): nothing was asked of any host.
     Unavailable {
@@ -176,6 +212,37 @@ pub(crate) struct Outcome {
     /// The per-version staging name of a payload the lane resolved, so a pass-end gc
     /// spares its `.part`.
     pub asset: Option<String>,
+}
+
+/// Why the signed policy revokes an ALab build ([`Policy::revokes_alab`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Revoked {
+    /// A signed yank names it.
+    Yanked,
+    /// It is below the channel's signed build floor.
+    BelowFloor,
+}
+
+impl Revoked {
+    /// What the signed policy says of ALab-built `program`'s `build`, or `None` when it
+    /// revokes nothing of it.
+    fn of(policy: &Policy, program: &str, build: u64) -> Option<Self> {
+        if policy.is_legacy_yanked(program, build) {
+            Some(Self::Yanked)
+        } else if build < policy.alab_floor(program) {
+            Some(Self::BelowFloor)
+        } else {
+            None
+        }
+    }
+
+    /// The words after a build's name: `is yanked` / `is below the channel's build floor`.
+    const fn words(self) -> &'static str {
+        match self {
+            Self::Yanked => "is yanked",
+            Self::BelowFloor => "is below the ALab channel's build floor",
+        }
+    }
 }
 
 impl Outcome {
@@ -225,6 +292,14 @@ impl Outcome {
             Verdict::Deferred { version, .. } => {
                 format!("{latest} ({version}) waits for its signature check to finish")
             }
+            // Every ALab clause starts with the words that name the build now active
+            // ([`crate::state::alab_kept`]), which is how its row says whose build it is.
+            Verdict::AlabKept { what } => {
+                format!("{what}; the ALab channel pins no build this machine may install")
+            }
+            Verdict::AlabRolledBack { from, to, .. } => {
+                format!("{to}; rolled back from {from}, which the ALab channel revoked")
+            }
             _ => return None,
         })
     }
@@ -236,7 +311,11 @@ impl Outcome {
     pub(crate) const fn is_failure(&self) -> bool {
         matches!(
             self.verdict,
-            Verdict::Refused { .. } | Verdict::Failed { .. } | Verdict::Tombstoned { .. }
+            Verdict::Refused { .. }
+                | Verdict::Failed { .. }
+                | Verdict::Tombstoned { .. }
+                | Verdict::AlabTombstoned { .. }
+                | Verdict::AlabRestoreFailed { .. }
         )
     }
 
@@ -288,13 +367,24 @@ impl Outcome {
                 Vec::new(),
                 String::new(),
             )),
-            Verdict::Current(_) | Verdict::Kept { .. } if active.is_some() => Ok(report(
-                active.unwrap_or_default(),
-                true,
+            Verdict::AlabRolledBack { to_build, .. } => Ok(report(
+                *to_build,
+                false,
                 Vec::new(),
                 Vec::new(),
                 String::new(),
             )),
+            Verdict::Current(_) | Verdict::Kept { .. } | Verdict::AlabKept { .. }
+                if active.is_some() =>
+            {
+                Ok(report(
+                    active.unwrap_or_default(),
+                    true,
+                    Vec::new(),
+                    Vec::new(),
+                    String::new(),
+                ))
+            }
             Verdict::Linked => Err(FlowError::Linked(program.to_string())),
             // The vendor's release channel was not reached: its own error, so the verb
             // can add the one action the index lane's offline ending already gets — re-run
@@ -320,7 +410,13 @@ impl Outcome {
             | Verdict::Deferred { keeping, .. }
             | Verdict::Refused { keeping, .. }
             | Verdict::Failed { keeping, .. } => keeping.version(),
-            Verdict::Tombstoned { .. } | Verdict::Linked | Verdict::Unavailable { .. } => None,
+            Verdict::Tombstoned { .. }
+            | Verdict::Linked
+            | Verdict::Unavailable { .. }
+            | Verdict::AlabKept { .. }
+            | Verdict::AlabRolledBack { .. }
+            | Verdict::AlabTombstoned { .. }
+            | Verdict::AlabRestoreFailed { .. } => None,
         }
     }
 }
@@ -385,10 +481,184 @@ pub(crate) fn install_one(lane: &Lane<'_>, spec: &'static VendorSpec, held: bool
     }
 }
 
+/// What the lane read of one program before its pass's index landed ([`read_ahead`]): the
+/// head, and when it named a version other than the installed one, that version's
+/// documents, verified.
+#[derive(Debug, Clone)]
+pub(crate) struct ReadAhead {
+    head: Head,
+    verified: Option<(Version, Resolution)>,
+}
+
+/// The network half of [`plan_one`], which needs no index: `spec`'s head, conditional on its
+/// stamp's validator, and — when it names a version other than the installed one of a program
+/// no local pin holds, the one an install would fetch — that version's documents, verified
+/// ([`resolve::verify`] reads and
+/// checks; it writes nothing). The yanks, the decision and every write wait for the plan,
+/// which reads these instead of asking the hosts again ([`plan_one_with`]). `None` where the
+/// plan reads no head: a dev link, an ALab build the lane keeps, a target the vendor serves
+/// nothing.
+pub(crate) fn read_ahead(
+    layout: &Layout,
+    spec: &'static VendorSpec,
+    fetcher: &dyn Fetcher,
+    triple: &str,
+    trust: &Trust,
+    now: i64,
+) -> Option<ReadAhead> {
+    let program = spec.program;
+    if crate::linkmode::is_linked(layout, program)
+        || (!crate::alab::vendor_chosen(layout, program)
+            && crate::alab::active_alab_build(layout, program, triple).is_some())
+        || !spec.serves(triple)
+    {
+        return None;
+    }
+    let active = crate::ops::active_builds(layout).get(program).copied();
+    let stamp = ProgramStamp::read(layout, program).unwrap_or_default();
+    let etag = stamp.last_head.and(stamp.etag.clone());
+    let head = resolve::read_head(spec, fetcher, etag.as_deref());
+    let verified = match &head {
+        Head::Named { version, body, .. }
+            if installed_of(layout, program, active).version() != Some(*version)
+                && !crate::pin::is_pinned(layout, program) =>
+        {
+            let verified = resolve::verify(
+                spec,
+                triple,
+                fetcher,
+                *version,
+                body,
+                &trust.claude_key,
+                now,
+            );
+            Some((*version, verified))
+        }
+        _ => None,
+    };
+    Some(ReadAhead { head, verified })
+}
+
+/// The reads ahead of a pass's vendor plans, one slot per program of the table, each filled
+/// by a thread of its own ([`Reads::read`]) while the pass resolves its index, and taken by
+/// that program's plan ([`Reads::take_read`]).
+pub(crate) struct Reads {
+    answers: std::sync::Mutex<Vec<ReadSlot>>,
+    changed: std::sync::Condvar,
+}
+
+/// Where one program's read ahead stands.
+enum ReadSlot {
+    /// Out on the network.
+    Reading,
+    /// In: what was read (`None`, nothing to read, or a thread that never ran it).
+    Read(Option<ReadAhead>),
+    /// Its plan has it.
+    Taken,
+}
+
+/// A read its plan stopped waiting for ([`Reads::take_read`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StillReading;
+
+impl Reads {
+    /// Every program of the table still reading.
+    pub(crate) fn new() -> Self {
+        Self {
+            answers: std::sync::Mutex::new(
+                super::VENDORS.iter().map(|_| ReadSlot::Reading).collect(),
+            ),
+            changed: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Fill `program`'s slot with `read`'s answer, on the thread that reads it. One that
+    /// unwinds leaves the slot read as nothing, so its plan reads for itself and no plan waits
+    /// for it forever; a program left to read nothing is [`Self::read`] over `|| None`.
+    pub(crate) fn read(&self, program: &str, read: impl FnOnce() -> Option<ReadAhead>) {
+        struct Unread<'a>(&'a Reads, Option<usize>);
+        impl Drop for Unread<'_> {
+            fn drop(&mut self) {
+                if let Some(i) = self.1 {
+                    self.0.fill(i, None);
+                }
+            }
+        }
+        let Some(i) = super::VENDORS.iter().position(|s| s.program == program) else {
+            return;
+        };
+        let mut unread = Unread(self, Some(i));
+        let answer = read();
+        unread.1 = None;
+        self.fill(i, answer);
+    }
+
+    fn fill(&self, i: usize, answer: Option<ReadAhead>) {
+        if let Ok(mut slots) = self.answers.lock()
+            && matches!(slots[i], ReadSlot::Reading)
+        {
+            slots[i] = ReadSlot::Read(answer);
+        }
+        self.changed.notify_all();
+    }
+
+    /// `program`'s read, waited for until `until` (for as long as it takes with `None`):
+    /// what was read, or [`StillReading`] at `until`. A program the table does not hold, or
+    /// whose read was taken already, has nothing read: its plan reads for itself.
+    pub(crate) fn take_read(
+        &self,
+        program: &str,
+        until: Option<std::time::Instant>,
+    ) -> Result<Option<ReadAhead>, StillReading> {
+        let Some(i) = super::VENDORS.iter().position(|s| s.program == program) else {
+            return Ok(None);
+        };
+        let Ok(mut slots) = self.answers.lock() else {
+            return Ok(None);
+        };
+        loop {
+            match std::mem::replace(&mut slots[i], ReadSlot::Taken) {
+                ReadSlot::Read(read) => return Ok(read),
+                ReadSlot::Taken => return Ok(None),
+                ReadSlot::Reading => slots[i] = ReadSlot::Reading,
+            }
+            slots = match until {
+                None => self
+                    .changed
+                    .wait(slots)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                Some(until) => {
+                    let left = until.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        return Err(StillReading);
+                    }
+                    self.changed
+                        .wait_timeout(slots, left)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .0
+                }
+            };
+        }
+    }
+}
+
 /// The lane for `spec` short of payload bytes: the installed build, the head (a 304 when
 /// it has not moved), the decision, and for an install the verified candidate. `held` is
 /// the local pin. Rollbacks and tombstones, which move no bytes, happen here.
 pub(crate) fn plan_one(lane: &Lane<'_>, spec: &'static VendorSpec, held: bool) -> Step {
+    plan_one_with(lane, spec, held, None)
+}
+
+/// [`plan_one`] over what was read of `spec` before the pass's index landed ([`read_ahead`]):
+/// its head instead of asking again, and its verified documents when the decision installs
+/// the version they were verified for — the decision itself, under the yanks the fresh index
+/// binds, made here as ever.
+pub(crate) fn plan_one_with(
+    lane: &Lane<'_>,
+    spec: &'static VendorSpec,
+    held: bool,
+    ahead: Option<ReadAhead>,
+) -> Step {
     let layout = lane.layout;
     let program = spec.program;
     let done = |verdict: Verdict| {
@@ -407,6 +677,16 @@ pub(crate) fn plan_one(lane: &Lane<'_>, spec: &'static VendorSpec, held: bool) -
             verdict: Verdict::Linked,
             asset: None,
         });
+    }
+    // AN ALAB BUILD IS NEVER THIS LANE'S TO MOVE ([`crate::alab`]): classified by its
+    // package marker before anything reads a head or a legacy version, so it is never a
+    // `Legacy` build, never handed to `decide`, and never replaced by the vendor's head —
+    // unattended or asked. Only a person's recorded choice of the vendor's build
+    // (`aterm pkg update <program> --vendor`) lets the lane past it.
+    if !crate::alab::vendor_chosen(layout, program)
+        && let Some(build) = crate::alab::active_alab_build(layout, program, lane.triple)
+    {
+        return done(keep_alab(lane, spec, build));
     }
     if !spec.serves(lane.triple) {
         let hint = format!(
@@ -461,7 +741,13 @@ pub(crate) fn plan_one(lane: &Lane<'_>, spec: &'static VendorSpec, held: bool) -
     }
     // The idle path is one conditional GET; only a head that moved costs more.
     let etag = stamp.last_head.and(stamp.etag.clone());
-    let mut head = resolve::read_head(spec, lane.fetcher, etag.as_deref());
+    let (mut head, mut verified) = match ahead {
+        Some(read) => (read.head, read.verified),
+        None => (
+            resolve::read_head(spec, lane.fetcher, etag.as_deref()),
+            None,
+        ),
+    };
     let mut refetched = false;
     loop {
         let (head_version, body) = match &head {
@@ -508,10 +794,9 @@ pub(crate) fn plan_one(lane: &Lane<'_>, spec: &'static VendorSpec, held: bool) -
         };
         let mut decision = decide(&inputs);
         // A legacy build's version is looked up once, only when it could matter, and kept.
-        // Unread at or below the ceiling, the build is replaced all the same
-        // (`ReplacesLegacy`): the head is at or above the floor, and the floor at or above
-        // its version — so no pass, on any lane, waits on an index to move off it. Above
-        // the ceiling, unread, it waits for this lookup or a person (`LegacyUnread`).
+        // Unread at or below the ceiling, the build is replaced anyway (`ReplacesLegacy`), so
+        // no pass waits on an index to move off it; above, it waits for this lookup or a
+        // person (`LegacyUnread`).
         if let Installed::Legacy {
             build,
             version: None,
@@ -579,9 +864,9 @@ pub(crate) fn plan_one(lane: &Lane<'_>, spec: &'static VendorSpec, held: bool) -
                     head = resolve::reread_head(spec, lane.fetcher);
                     continue;
                 };
-                let pending = Pending {
-                    spec,
-                    candidate: match resolve::verify(
+                let resolution = match verified.take() {
+                    Some((read, resolution)) if read == version => resolution,
+                    _ => resolve::verify(
                         spec,
                         lane.triple,
                         lane.fetcher,
@@ -589,7 +874,11 @@ pub(crate) fn plan_one(lane: &Lane<'_>, spec: &'static VendorSpec, held: bool) -
                         &body,
                         &lane.trust.claude_key,
                         lane.now,
-                    ) {
+                    ),
+                };
+                let pending = Pending {
+                    spec,
+                    candidate: match resolution {
                         Resolution::Candidate(c) => *c,
                         Resolution::Unreachable => {
                             let v = Verdict::Unreachable {
@@ -768,9 +1057,8 @@ pub(crate) fn land_one(lane: &Lane<'_>, pending: &Pending) -> Outcome {
                     | FlowError::StageRefused(_)
                     | FlowError::VendorRefused(_)
             );
-            // The signature check did not finish: a wait, never a refusal or a failure.
-            // A yanked installed build still takes the fallback below, as
-            // for any landing that did not happen.
+            // The signature check did not finish: a wait, never a refusal or a failure. A
+            // yanked installed build still takes the fallback below.
             let v = if let FlowError::Stage(StageError::VerifyDeferred(why)) = &e {
                 Verdict::Deferred {
                     version: c.version,
@@ -995,6 +1283,47 @@ fn roll_back(
     }
 }
 
+/// The verdict for an active ALab `build` the source rule keeps ([`crate::alab`]): kept
+/// while the signed policy revokes nothing of it — its shims laid back first when a
+/// tombstone or a lost shim hid it — else rolled back onto the newest retained ALab build
+/// below it that nothing revokes, else tombstoned. Never a vendor build: a revoked ALab
+/// build with nothing to roll back onto stops running, as the index lane stops a revoked
+/// build ([`crate::gate`]), and is never revived from the vendor's head unasked.
+fn keep_alab(lane: &Lane<'_>, spec: &'static VendorSpec, build: u64) -> Verdict {
+    let (layout, program) = (lane.layout, spec.program);
+    let what = crate::alab::build_words(layout, program, build);
+    let exposes: Vec<String> = spec.exposes.iter().map(|t| (*t).to_string()).collect();
+    let shimmed = crate::ops::active_builds(layout).get(program).copied() == Some(build);
+    let Some(why) = Revoked::of(lane.policy, program, build) else {
+        if !shimmed
+            && crate::store::build_is_complete(&layout.build_dir(program, build))
+            && let Err(e) = crate::flow::roll_back_to(layout, program, build, &exposes)
+        {
+            return Verdict::AlabRestoreFailed {
+                what,
+                error: e.to_string(),
+            };
+        }
+        return Verdict::AlabKept { what };
+    };
+    let to = crate::alab::retained_alab_below(layout, program, build)
+        .into_iter()
+        .find(|b| Revoked::of(lane.policy, program, *b).is_none());
+    if let Some(to) = to
+        && crate::flow::roll_back_to(layout, program, to, &exposes).is_ok()
+    {
+        return Verdict::AlabRolledBack {
+            from: what,
+            to_build: to,
+            to: crate::alab::build_words(layout, program, to),
+        };
+    }
+    if shimmed {
+        crate::flow::install_tombstone_shims(layout, program, Some(build));
+    }
+    Verdict::AlabTombstoned { what, why }
+}
+
 /// The verdict for a head that was not read: refused for what it said, else unreachable,
 /// with what the host answered instead when it answered.
 fn unread_head(head: &Head, keeping: Installed) -> Verdict {
@@ -1109,14 +1438,13 @@ fn retained_legacy_below(layout: &Layout, program: &str, below: u64) -> Vec<u64>
     builds
 }
 
-/// THE VENDOR ROLLBACK TARGET PREDICATE: whether [`roll_back_by_hand`] may land `program`
-/// on its retained `build` — complete as [`installed_of`] reads one (a vendor build by its
-/// record, a legacy index build by its marker), with a `bin/` to run, and named by no yank
-/// in `policy`. ONE predicate for every reader, as [`crate::flow::rollback_lands_on`] is
-/// for the index lane: the verb lands on the newest retained build below the active one it
-/// admits, a yank's own move on the newest such vendor build ([`previous_of`]), and gc
-/// keeps exactly that build below the live one ([`crate::gc::reclaimable`]), under the
-/// latch the verb reads.
+/// Whether [`roll_back_by_hand`] may land `program` on its retained `build`: complete as
+/// [`installed_of`] reads one (a vendor build by its record, a legacy index build by its
+/// marker), with a `bin/` to run, and named by no yank in `policy`. The one predicate for
+/// every reader, as [`crate::flow::rollback_lands_on`] is for the index lane: the verb lands
+/// on the newest retained build below the active one it admits, a yank's own move on the
+/// newest such vendor build ([`previous_of`]), and gc keeps exactly that build below the live
+/// one ([`crate::gc::reclaimable`]), under the latch the verb reads.
 pub(crate) fn rollback_lands_on(
     layout: &Layout,
     policy: &Policy,
@@ -1126,6 +1454,12 @@ pub(crate) fn rollback_lands_on(
     layout.build_dir(program, build).join("bin").is_dir()
         && match installed_of(layout, program, Some(build)) {
             Installed::Vendor(view) => !policy.is_yanked(program, view.version),
+            // An ALab build is revoked by its yank or by the signed floor ([`Revoked`]).
+            Installed::Legacy { build, .. }
+                if crate::alab::build_is_alab(layout, program, build) =>
+            {
+                Revoked::of(policy, program, build).is_none()
+            }
             Installed::Legacy { build, .. } => !policy.is_legacy_yanked(program, build),
             Installed::Nothing => false,
         }
@@ -1158,8 +1492,14 @@ pub(crate) fn roll_back_by_hand(
 ) -> Result<HandRollback, String> {
     let program = spec.program;
     let active = crate::ops::active_builds(layout).get(program).copied();
+    // An ALab build rolls back onto an older ALab build only ([`crate::alab`]): never onto a
+    // legacy index build of the vendor's bytes that happens to sit below it in the store.
+    let alab = active.filter(|b| crate::alab::build_is_alab(layout, program, *b));
     let (from, below) = match installed_of(layout, program, active) {
         Installed::Vendor(current) => (current.version.to_string(), current.build),
+        Installed::Legacy { build, .. } if alab.is_some() => {
+            (crate::alab::build_words(layout, program, build), build)
+        }
         Installed::Legacy { build, .. } => (super::build_words(build), build),
         Installed::Nothing => {
             return Err(match active {
@@ -1177,15 +1517,22 @@ pub(crate) fn roll_back_by_hand(
     // (build, label) of every retained complete build below the active one, newest first:
     // every legacy number is below every vendor id. The verb lands on the first one
     // [`rollback_lands_on`] admits, so what it refuses of these is a yank.
-    let retained: Vec<(u64, String)> = retained_below(layout, program, below)
-        .into_iter()
-        .map(|v| (v.build, v.version.to_string()))
-        .chain(
-            retained_legacy_below(layout, program, below)
-                .into_iter()
-                .map(|b| (b, super::build_words(b))),
-        )
-        .collect();
+    let retained: Vec<(u64, String)> = if alab.is_some() {
+        crate::alab::retained_alab_below(layout, program, below)
+            .into_iter()
+            .map(|b| (b, crate::alab::build_words(layout, program, b)))
+            .collect()
+    } else {
+        retained_below(layout, program, below)
+            .into_iter()
+            .map(|v| (v.build, v.version.to_string()))
+            .chain(
+                retained_legacy_below(layout, program, below)
+                    .into_iter()
+                    .map(|b| (b, super::build_words(b))),
+            )
+            .collect()
+    };
     let Some((to_build, to)) = retained
         .iter()
         .find(|(b, _)| rollback_lands_on(layout, policy, program, *b))
@@ -1201,9 +1548,12 @@ pub(crate) fn roll_back_by_hand(
             ),
         });
     };
-    // The table's env, never the one an index manifest left beside a legacy build.
-    crate::shim_env::write_sidecar(&layout.build_dir(program, to_build), &spec.shim_env())
-        .map_err(|e| format!("the rollback could not be laid: {e}"))?;
+    // The table's env, never the one an index manifest left beside a legacy build. An ALab
+    // build keeps the env its own signed manifest laid beside it.
+    if alab.is_none() {
+        crate::shim_env::write_sidecar(&layout.build_dir(program, to_build), &spec.shim_env())
+            .map_err(|e| format!("the rollback could not be laid: {e}"))?;
+    }
     let exposes: Vec<String> = spec.exposes.iter().map(|t| (*t).to_string()).collect();
     crate::flow::roll_back_to(layout, program, to_build, &exposes)
         .map_err(|e| format!("the rollback could not be laid: {e}"))?;
@@ -1220,9 +1570,14 @@ pub(crate) fn roll_back_by_hand(
 /// program still vouches for its manifest through the roster that signs both.
 fn legacy_facts(lane: &Lane<'_>, program: &str, build: u64) -> Option<(Version, Option<String>)> {
     let index = lane.legacy_index?;
+    // A legacy build is the vendor's bytes the index published from its own repo. Once an
+    // ALab-built program's row names ALab's repo ([`crate::alab::AlabAgent::repo`]), that
+    // repo holds ALab's packs, never a legacy build's manifest.
     let repo = index
         .program(program)
-        .map_or(crate::manifest::INDEX_REPO, |p| p.repo.as_str());
+        .map(|p| p.repo.as_str())
+        .filter(|repo| !crate::alab::agent(program).is_some_and(|a| a.repo == *repo))
+        .unwrap_or(crate::manifest::INDEX_REPO);
     let (version, root) =
         crate::flow::legacy_facts_of_build(lane.fetcher, index, repo, program, build, lane.triple)?;
     Some((Version::parse(&version)?, root))
@@ -1243,11 +1598,11 @@ fn keep_legacy_facts(
     }
 }
 
-/// The legacy index build a rollback of `program` would land on — the `active` one, or the
-/// newest retained below the active vendor build — when no signed root is held for it:
-/// none kept in its stamp, and no recorded row for that build carrying one (an older
-/// client's first vendor install overwrote it, or its stamp rewrite dropped it); the lane
-/// reads it again from the build's signed manifest ([`plan_one`]), at most once a pass.
+/// The legacy index build a rollback of `program` would land on (the `active` one, or the
+/// newest retained below the active vendor build) when no signed root is held for it: none
+/// in its stamp and no recorded row for that build carrying one (an older client's first
+/// vendor install or stamp rewrite can drop it). [`plan_one`] reads it again from the build's
+/// signed manifest, at most once a pass.
 pub(crate) fn legacy_root_owed(layout: &Layout, program: &str, active: Option<u64>) -> Option<u64> {
     let build = match installed_of(layout, program, active) {
         Installed::Legacy { build, .. } => build,
@@ -1402,6 +1757,23 @@ fn verdict_line(spec: &VendorSpec, verdict: &Verdict) -> String {
         ),
         Verdict::Linked => format!("atpkg: {p} dev-linked — skipped"),
         Verdict::Unavailable { state } => format!("atpkg: {p}: {state}"),
+        Verdict::AlabKept { what } => format!(
+            "atpkg: {p} {what} kept — the ALab channel pins no build this machine may install, \
+             and an ALab build is never replaced by {latest} (`aterm pkg update {p} --vendor` \
+             chooses it)"
+        ),
+        Verdict::AlabRestoreFailed { what, error } => {
+            format!("atpkg: {p} {what}'s commands could not be restored: {error}")
+        }
+        Verdict::AlabTombstoned { what, why } => format!(
+            "atpkg: {p} {what} {} and no older ALab build is admissible — its commands are \
+             disabled until the ALab channel pins one this machine may install (`aterm pkg \
+             update {p} --vendor` chooses {latest})",
+            why.words()
+        ),
+        Verdict::AlabRolledBack { from, to, .. } => {
+            format!("atpkg: {p} {from} was revoked by the ALab channel — rolled back to {to}")
+        }
     }
 }
 
@@ -1534,9 +1906,9 @@ pub(crate) mod world {
     /// A signed document: `(bytes, signature)`.
     type SignedDoc = (Vec<u8>, Vec<u8>);
 
-    /// One of [`Fake`]'s fields: a lock with `RefCell`'s and `Cell`'s calls, because a pass
-    /// works its fetcher from several threads at once ([`Fetcher::shared`]) and the tests
-    /// read the fields as they always have.
+    /// One of [`Fake`]'s fields: a lock, since a pass works its fetcher from several threads
+    /// at once ([`Fetcher::shared`]), with `RefCell`'s and `Cell`'s calls so the tests read
+    /// it like either.
     #[derive(Default)]
     pub(crate) struct Shared<T>(std::sync::RwLock<T>);
 
@@ -1579,8 +1951,8 @@ pub(crate) mod world {
         pub downloads_fail: Shared<bool>,
         /// A signed index (bytes, signature) the index lane may resolve.
         pub index: Shared<Option<(Vec<u8>, Vec<u8>)>>,
-        /// With no index published, its host ANSWERS with a refusal (a 403) rather than not
-        /// at all — a rate-limited or revoked-token machine, never an offline one.
+        /// With no index published, its host answers with a refusal (a 403) rather than not
+        /// at all: a rate-limited or revoked-token machine, never an offline one.
         pub index_refused: Shared<bool>,
         /// How many times the index was asked for.
         pub index_reads: Shared<u32>,
@@ -1629,7 +2001,7 @@ pub(crate) mod world {
         }
 
         /// Publish the signed pkg manifest of `program`'s legacy index build `build`,
-        /// naming vendor `version` — what an index lane installed before this lane existed.
+        /// naming vendor `version`.
         pub(crate) fn publish_legacy_pkg(&self, program: &str, build: u64, version: &str) {
             let body = format!(
                 "schema = 2\nprogram = \"{program}\"\nversion = \"{version}\"\n\
@@ -1980,9 +2352,9 @@ pub(crate) mod world {
         }
     }
 
-    /// A signed index (bytes, machine signature) valid until `valid_until`, naming `ay`
-    /// (an ALab program with no published build) and the two vendor programs, its stable
-    /// channel pinning all three with `yanked` as given.
+    /// A signed index (bytes, machine signature) valid until `valid_until`, naming `ay` (an
+    /// ALab program with no published build), `claude` and `codex`, its stable channel
+    /// pinning all three with `yanked` as given.
     pub(crate) fn signed_index(
         index_build: u64,
         valid_until: &str,
@@ -1991,7 +2363,7 @@ pub(crate) mod world {
         signed_index_naming(index_build, valid_until, yanked, &["claude", "codex"])
     }
 
-    /// [`signed_index`], naming and pinning of the vendor programs only `vendors`.
+    /// [`signed_index`], with `vendors` the only vendor programs it names and pins.
     pub(crate) fn signed_index_naming(
         index_build: u64,
         valid_until: &str,
@@ -2033,6 +2405,10 @@ pub(crate) mod world {
         layout.build_dir(program, v.build_id())
     }
 }
+
+#[cfg(test)]
+#[path = "lane_alab_tests.rs"]
+mod alab_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2153,10 +2529,6 @@ mod tests {
             ),
             "{o:?}"
         );
-        assert_eq!(
-            o.line(),
-            "atpkg: claude 2.1.281 installed (Anthropic latest)"
-        );
         let dir = world::build_dir(&l, "claude", "2.1.281");
         assert_eq!(shim_build(&l, "claude"), Some(v("2.1.281").build_id()));
         assert_eq!(std::fs::read(dir.join("bin/claude")).unwrap(), payload);
@@ -2256,10 +2628,9 @@ mod tests {
         true
     }
 
-    /// AGY END TO END: Google's Run manifest and the bucket's copy beside the payload
-    /// agree, so the one file of the gzip tar lands at `bin/agy` under the sha512 they
-    /// name — recorded under its own key — and every shim exports the one value that turns
-    /// agy's own updater off.
+    /// agy end to end: the Run manifest and the bucket's copy agree, so the gzip tar's one
+    /// file lands at `bin/agy` under the sha512 they name (recorded under its own key), and
+    /// every shim exports the value that turns agy's own updater off.
     #[test]
     fn a_fresh_agy_lands_its_one_file_under_the_sha512_both_google_hosts_name() {
         let l = world::layout("fresh-agy");
@@ -2278,7 +2649,6 @@ mod tests {
             ),
             "{o:?}"
         );
-        assert_eq!(o.line(), "atpkg: agy 1.3.7 installed (Google latest)");
         let build = world::build_dir(&l, "agy", "1.3.7");
         assert_eq!(std::fs::read(build.join("bin/agy")).unwrap(), exe);
         let record = complete_record(&build).expect("a complete record");
@@ -2295,10 +2665,10 @@ mod tests {
         assert_eq!(f.downloads.borrow().as_slice(), [url]);
     }
 
-    /// MUSE, WHERE IT IS SERVED: the channel names a revision-form version, the release
-    /// manifest at the client-built URL its sha256 and size, and the raw binary lands at
-    /// `bin/muse`. Where it is not served, the lane is the canonical `unavailable on`
-    /// state: no host is asked, no stamp written, and it is no failure.
+    /// Where muse is served, the channel names a revision-form version, the release manifest
+    /// at the client-built URL its sha256 and size, and the raw binary lands at `bin/muse`.
+    /// Elsewhere the lane is the canonical `unavailable on` state: no host asked, no stamp
+    /// written, no failure.
     #[test]
     fn muse_lands_where_it_is_served_and_is_unavailable_elsewhere() {
         let elsewhere = "x86_64-unknown-linux-gnu";
@@ -2316,16 +2686,6 @@ mod tests {
             download_turn: None,
         };
         let o = install_one(&lane, muse(), false);
-        assert_eq!(
-            o.line(),
-            format!(
-                "atpkg: muse: {}",
-                crate::state::unavailable(
-                    elsewhere,
-                    "Meta publishes no Muse Code build aterm can verify for this target"
-                )
-            )
-        );
         assert!(matches!(o.verdict, Verdict::Unavailable { .. }));
         assert!(!o.is_failure());
         assert!(f.gets.borrow().is_empty(), "no host was asked");
@@ -2335,7 +2695,7 @@ mod tests {
             return;
         }
         let o = run(&l, &f, &Policy::default(), muse());
-        assert_eq!(o.line(), "atpkg: muse 1.4.9-R6298 installed (Meta latest)");
+        assert!(matches!(o.verdict, Verdict::Installed { .. }), "{o:?}");
         let build = world::build_dir(&l, "muse", "1.4.9-R6298");
         assert_eq!(std::fs::read(build.join("bin/muse")).unwrap(), exe);
         assert_eq!(complete_record(&build).unwrap().sha256, world::sha(&exe));
@@ -2350,16 +2710,13 @@ mod tests {
         run(&l, &f, &Policy::default(), claude());
         f.publish_claude("2.1.282", &native_exe("b"));
         let o = run(&l, &f, &Policy::default(), claude());
-        assert_eq!(
-            o.line(),
-            "atpkg: claude 2.1.281 → 2.1.282 (Anthropic latest)"
-        );
+        assert!(matches!(o.verdict, Verdict::Installed { .. }), "{o:?}");
         assert_eq!(shim_build(&l, "claude"), Some(v("2.1.282").build_id()));
         // The head has not moved: a 304, and nothing else is fetched.
         let gets_before = f.gets.borrow().len();
         let downloads_before = f.downloads.borrow().len();
         let o = run(&l, &f, &Policy::default(), claude());
-        assert_eq!(o.line(), "atpkg: claude 2.1.282 is Anthropic's latest");
+        assert!(matches!(o.verdict, Verdict::Current(_)), "{o:?}");
         let gets = f.gets.borrow()[gets_before..].to_vec();
         assert_eq!(gets.len(), 1, "{gets:?}");
         assert_eq!(gets[0].0, format!("{CLAUDE}latest"));
@@ -2385,18 +2742,10 @@ mod tests {
             ),
             "{o:?}"
         );
-        assert_eq!(
-            o.line(),
-            "atpkg: claude 2.1.286 is newer than Anthropic's latest (2.1.283); keeping 2.1.286"
-        );
         assert_eq!(shim_build(&l, "claude"), Some(v("2.1.286").build_id()));
         f.offline.set(true);
         let o = run(&l, &f, &Policy::default(), claude());
         assert!(!o.is_failure());
-        assert_eq!(
-            o.line(),
-            "atpkg: claude — Anthropic's release channel is unreachable; keeping 2.1.286"
-        );
     }
 
     /// Every refusal before the payload — a bad signature, a document redirected off its
@@ -2487,12 +2836,6 @@ mod tests {
                 );
                 assert!(o.is_failure(), "{label}");
                 assert!(
-                    o.line().contains(" refused: ")
-                        && o.line().ends_with("nothing is installed yet"),
-                    "{label}: {}",
-                    o.line()
-                );
-                assert!(
                     f.downloads.borrow().is_empty(),
                     "{label}: nothing downloaded"
                 );
@@ -2526,12 +2869,6 @@ mod tests {
         );
         let o = run(&l, &f, &Policy::default(), claude());
         assert!(matches!(o.verdict, Verdict::Refused { .. }), "{o:?}");
-        assert!(
-            o.line().starts_with("atpkg: claude 2.1.282 refused: "),
-            "{}",
-            o.line()
-        );
-        assert!(o.line().ends_with("— keeping 2.1.281"), "{}", o.line());
         assert_eq!(shim_build(&l, "claude"), Some(v("2.1.281").build_id()));
         assert!(!crate::store::build_is_complete(&world::build_dir(
             &l, "claude", "2.1.282"
@@ -2572,11 +2909,7 @@ mod tests {
         assert!(matches!(o.verdict, Verdict::Refused { .. }), "{o:?}");
         f.payload(&url, &signed);
         let o = run(&l, &f, &Policy::default(), claude());
-        assert_eq!(
-            o.line(),
-            "atpkg: claude 2.1.281 → 2.1.282 (Anthropic latest)",
-            "{o:?}"
-        );
+        assert!(matches!(o.verdict, Verdict::Installed { .. }), "{o:?}");
         assert_eq!(shim_build(&l, "claude"), Some(v("2.1.282").build_id()));
     }
 
@@ -2704,11 +3037,9 @@ mod tests {
         }
     }
 
-    /// A SIGNATURE CHECK THAT DID NOT FINISH IS A WAIT, NOT A FAILURE. A codesign timeout is
-    /// `Verdict::Deferred`: no failure, the installed build kept, nothing memoized (the
-    /// next pass is not refused as a signer memo would be), the verified archive carried
-    /// (the next pass re-stages it with no download), and that pass lands it. The control
-    /// in the same world: a real signature refusal is still a memoized failure
+    /// A codesign timeout is `Verdict::Deferred`, not a failure: the installed build is kept,
+    /// nothing is memoized, the verified archive is carried, and the next pass lands it with
+    /// no download. A real signature refusal stays a memoized failure
     /// (`a_signer_refusal_is_memoized_like_a_digest_refusal`).
     #[test]
     fn a_signature_check_that_did_not_finish_defers_and_the_next_pass_lands_it() {
@@ -2729,19 +3060,6 @@ mod tests {
         assert!(matches!(o.verdict, Verdict::Deferred { .. }), "{o:?}");
         assert!(!o.is_failure(), "a wait is never a failure");
         assert_eq!(o.active_version(), Some(v("2.1.281")));
-        assert!(
-            o.line().starts_with(
-                "atpkg: claude 2.1.282 deferred: its signature check did not \
-                 finish (bin/claude: /usr/bin/codesign did not finish in time)"
-            ),
-            "{}",
-            o.line()
-        );
-        assert!(o.line().ends_with("— keeping 2.1.281"), "{}", o.line());
-        assert_eq!(
-            o.kept_clause().as_deref(),
-            Some("Anthropic's latest (2.1.282) waits for its signature check to finish")
-        );
         assert_eq!(shim_build(&l, "claude"), Some(v("2.1.281").build_id()));
         // Not memoized, and the archive is carried: the next pass (codesign finishing now)
         // lands the same bytes without fetching them again.
@@ -2765,19 +3083,30 @@ mod tests {
         f.publish_claude("2.1.282", &native_exe("b"));
         let yanked = Policy::from_entries(["claude@2.1.282"]);
         let o = run(&l, &f, &yanked, claude());
-        assert_eq!(
-            o.line(),
-            "atpkg: claude — Anthropic's latest (2.1.282) is yanked; keeping 2.1.281"
+        assert!(
+            matches!(
+                o.verdict,
+                Verdict::Kept {
+                    reason: KeepReason::HeadYanked,
+                    ..
+                }
+            ),
+            "{o:?}"
         );
         assert!(
             f.downloads.borrow().len() == 1,
             "nothing fetched for a yanked head"
         );
         let o = run_with(&l, &f, &Policy::default(), &world::trust(), claude(), true);
-        assert_eq!(
-            o.line(),
-            "atpkg: claude not updated — you pinned it at 2.1.281 (`aterm pkg unpin claude` lets \
-             it update)"
+        assert!(
+            matches!(
+                o.verdict,
+                Verdict::Kept {
+                    reason: KeepReason::Held,
+                    ..
+                }
+            ),
+            "{o:?}"
         );
         assert_eq!(shim_build(&l, "claude"), Some(v("2.1.281").build_id()));
     }
@@ -2795,10 +3124,7 @@ mod tests {
         // 2.1.282 yanked, the head still names it: roll back to 2.1.281.
         let yanked = Policy::from_entries(["claude@2.1.282"]);
         let o = run(&l, &f, &yanked, claude());
-        assert_eq!(
-            o.line(),
-            "atpkg: claude 2.1.282 is yanked — rolled back to 2.1.281"
-        );
+        assert!(matches!(o.verdict, Verdict::RolledBack { .. }), "{o:?}");
         assert_eq!(shim_build(&l, "claude"), Some(v("2.1.281").build_id()));
         assert_eq!(
             ProgramStamp::read(&l, "claude").unwrap().high_water,
@@ -2807,16 +3133,28 @@ mod tests {
         // A fixed head then installs above the yanked one.
         f.publish_claude("2.1.283", &native_exe("c"));
         let o = run(&l, &f, &yanked, claude());
-        assert_eq!(
-            o.line(),
-            "atpkg: claude 2.1.281 → 2.1.283 (Anthropic latest)"
+        assert!(
+            matches!(
+                o.verdict,
+                Verdict::Installed {
+                    reason: InstallReason::Newer,
+                    ..
+                }
+            ),
+            "{o:?}"
         );
         // A yank of the active version with an admissible head moves straight to it.
         f.publish_claude("2.1.284", &native_exe("d"));
         let o = run(&l, &f, &Policy::from_entries(["claude@2.1.283"]), claude());
-        assert_eq!(
-            o.line(),
-            "atpkg: claude 2.1.283 → 2.1.284 (2.1.283 is yanked; Anthropic latest)"
+        assert!(
+            matches!(
+                o.verdict,
+                Verdict::Installed {
+                    reason: InstallReason::ReplacesYanked,
+                    ..
+                }
+            ),
+            "{o:?}"
         );
         // The head and the build just below it yanked too: the move rolls back past both to
         // the newest retained build a rollback lands on, never tombstones over it.
@@ -2826,10 +3164,7 @@ mod tests {
             &Policy::from_entries(["claude@2.1.283", "claude@2.1.284"]),
             claude(),
         );
-        assert_eq!(
-            o.line(),
-            "atpkg: claude 2.1.284 is yanked — rolled back to 2.1.282"
-        );
+        assert!(matches!(o.verdict, Verdict::RolledBack { .. }), "{o:?}");
         assert_eq!(shim_build(&l, "claude"), Some(v("2.1.282").build_id()));
     }
 
@@ -2851,11 +3186,6 @@ mod tests {
         let o = run(&l, &f, &yanked, claude());
         assert!(matches!(o.verdict, Verdict::Tombstoned { .. }), "{o:?}");
         assert!(o.is_failure());
-        assert_eq!(
-            o.line(),
-            "atpkg: claude 2.1.281 is yanked and no admissible build exists — its commands \
-             are disabled until one does"
-        );
     }
 
     /// The genuine codex shape: an executable-mode data file is demoted before the gate,
@@ -2868,7 +3198,7 @@ mod tests {
         let f = Fake::default();
         f.publish_codex_default("0.157.0");
         let o = run(&l, &f, &Policy::default(), codex());
-        assert_eq!(o.line(), "atpkg: codex 0.157.0 installed (OpenAI latest)");
+        assert!(matches!(o.verdict, Verdict::Installed { .. }), "{o:?}");
         let dir = world::build_dir(&l, "codex", "0.157.0");
         let mode = |rel: &str| {
             std::fs::metadata(dir.join(rel))
@@ -2949,10 +3279,9 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("bin/claude")).unwrap(), payload);
     }
 
-    /// R1 FOR LEGACY BUILDS: a legacy index build whose version cannot be read (no index
-    /// verifies — a lapsed roster, a cutover index without the row) is replaced by the
-    /// vendor's verified head on the unattended lane, never kept waiting on the index —
-    /// the floor is at or above every legacy pin, so it is no downgrade; a head below the
+    /// A legacy index build whose version cannot be read (no index verifies) is replaced by
+    /// the vendor's verified head on the unattended lane, never kept waiting on the index:
+    /// the floor is at or above every legacy pin, so it is no downgrade, and a head below the
     /// floor is still refused. Every line names versions.
     #[test]
     fn a_legacy_index_build_is_replaced_with_no_index_and_no_line_names_a_vendor_id() {
@@ -2983,10 +3312,6 @@ mod tests {
                 }
             ),
             "{o:?}"
-        );
-        assert_eq!(
-            o.line(),
-            "atpkg: claude build 2026091901 → 2.1.281 (Anthropic latest)"
         );
         assert_eq!(shim_build(&l, "claude"), Some(v("2.1.281").build_id()));
         for line in [
@@ -3029,7 +3354,6 @@ mod tests {
             Some(&index),
         );
         assert!(matches!(o.verdict, Verdict::Current(_)), "{o:?}");
-        assert_eq!(o.line(), "atpkg: claude 2.1.281 is Anthropic's latest");
         assert_eq!(
             ProgramStamp::read(&l, "claude")
                 .unwrap()
@@ -3054,16 +3378,11 @@ mod tests {
             ),
             "{o:?}"
         );
-        assert_eq!(
-            o.line(),
-            "atpkg: claude 2.1.281 → 2.1.282 (Anthropic latest)"
-        );
     }
 
-    /// A LEGACY ROOT NOTHING HOLDS IS READ AGAIN, ONCE. An older client's first vendor
-    /// install overwrote the row that held it, or its stamp rewrite dropped it. The next
-    /// pass holding a verified index reads the root from the build's signed manifest
-    /// and keeps it; no later pass asks again, and none asks with no index.
+    /// A legacy root nothing holds (an older client's first vendor install or stamp rewrite
+    /// dropped it) is read from the build's signed manifest by the next pass holding a
+    /// verified index, and kept; no later pass asks again, and none asks with no index.
     #[test]
     fn a_legacy_root_nothing_holds_is_read_from_its_signed_manifest_once() {
         let l = world::layout("legacy-root-owed");
@@ -3132,10 +3451,9 @@ mod tests {
         );
     }
 
-    /// THE LEGACY CEILING: a legacy build above the newest legacy pin this code knows
-    /// (pinned after it, so its version may be above the floor) whose version cannot be
-    /// read is kept by the unattended lane with a line that says why — until its version is
-    /// read, when it is judged like any other; a person asking replaces it.
+    /// An unread legacy build above the ceiling is kept by the unattended lane with a line
+    /// that says why, until its version is read (then judged like any other) or a person
+    /// asks.
     #[test]
     fn an_unread_legacy_build_above_the_ceiling_waits_for_its_version_or_a_person() {
         let above = claude().legacy_ceiling + 1;
@@ -3153,19 +3471,6 @@ mod tests {
                 }
             ),
             "{o:?}"
-        );
-        assert_eq!(
-            o.line(),
-            "atpkg: claude build 2026092402 is a legacy index build newer than this aterm, \
-             and its version could not be read; keeping build 2026092402 until it can be — \
-             `aterm pkg update claude` moves it to Anthropic's latest (2.1.282)"
-        );
-        assert_eq!(
-            o.kept_clause().as_deref(),
-            Some(
-                "its version could not be read; `aterm pkg update claude` moves it to \
-                 Anthropic's latest (2.1.282)"
-            )
         );
         assert!(!o.is_failure());
         assert_eq!(shim_build(&l, "claude"), Some(above));
@@ -3222,8 +3527,8 @@ mod tests {
         assert_eq!(shim_build(&l, "claude"), Some(v("2.1.282").build_id()));
     }
 
-    /// AN INDEX THAT NO LONGER NAMES THE PROGRAM still vouches for its legacy builds: the
-    /// roster signs the manifest, and the index repo holds it. A legacy build above the
+    /// An index that no longer names the program still vouches for its legacy builds: the
+    /// roster signs the manifest and the index repo holds it, so a legacy build above the
     /// ceiling is read and moves to the head, never kept unread for want of a
     /// `[programs.claude]` block.
     #[test]
@@ -3356,11 +3661,6 @@ mod tests {
         f.downloads_fail.set(true);
         let o = run(&l, &f, &Policy::default(), claude());
         assert!(matches!(o.verdict, Verdict::Failed { .. }), "{o:?}");
-        assert!(
-            o.line().ends_with("— nothing is installed yet"),
-            "{}",
-            o.line()
-        );
         f.downloads_fail.set(false);
         let o = run(&l, &f, &Policy::default(), claude());
         assert!(matches!(o.verdict, Verdict::Installed { .. }), "{o:?}");
@@ -3435,7 +3735,7 @@ mod tests {
         let genuine = native_exe("Meta's");
         publish_muse(&f, "1.4.9-R6298", &genuine);
         let o = run(&l, &f, &Policy::default(), muse());
-        assert_eq!(o.line(), "atpkg: muse 1.4.9-R6298 installed (Meta latest)");
+        assert!(matches!(o.verdict, Verdict::Installed { .. }), "{o:?}");
         let logged = std::fs::read_to_string(&log).unwrap();
         assert!(logged.contains(&world::sha(&genuine)), "{logged}");
         crate::ops::uninstall(&l, "muse").unwrap();

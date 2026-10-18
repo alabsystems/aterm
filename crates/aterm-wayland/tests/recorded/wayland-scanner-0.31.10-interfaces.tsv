@@ -1,0 +1,285 @@
+# The C interface tables wayland-scanner 0.31.10 (generate_interfaces!) builds
+# from aterm-wayland's protocol files, recorded 2026-10-17 by tests/recorder for
+# docs/AUDIT-third-party-2026-10-15.md LW.6, in aterm-wayland's file order.
+# iface <name> <version> <requests> <events>
+# req|evt <interface> <opcode> <name> <signature> <types per signature arg, - for none>
+iface	wl_display	1	2	2
+req	wl_display	0	sync	n	wl_callback
+req	wl_display	1	get_registry	n	wl_registry
+evt	wl_display	0	error	ous	-,-,-
+evt	wl_display	1	delete_id	u	-
+iface	wl_registry	1	1	2
+req	wl_registry	0	bind	usun	-,-,-,-
+evt	wl_registry	0	global	usu	-,-,-
+evt	wl_registry	1	global_remove	u	-
+iface	wl_callback	1	0	1
+evt	wl_callback	0	done	u	-
+iface	wl_compositor	7	3	0
+req	wl_compositor	0	create_surface	n	wl_surface
+req	wl_compositor	1	create_region	n	wl_region
+req	wl_compositor	2	release	7	-
+iface	wl_shm_pool	2	3	0
+req	wl_shm_pool	0	create_buffer	niiiiu	wl_buffer,-,-,-,-,-
+req	wl_shm_pool	1	destroy		-
+req	wl_shm_pool	2	resize	i	-
+iface	wl_shm	2	2	1
+req	wl_shm	0	create_pool	nhi	wl_shm_pool,-,-
+req	wl_shm	1	release	2	-
+evt	wl_shm	0	format	u	-
+iface	wl_buffer	1	1	1
+req	wl_buffer	0	destroy		-
+evt	wl_buffer	0	release		-
+iface	wl_data_offer	4	5	3
+req	wl_data_offer	0	accept	u?s	-,-
+req	wl_data_offer	1	receive	sh	-,-
+req	wl_data_offer	2	destroy		-
+req	wl_data_offer	3	finish	3	-
+req	wl_data_offer	4	set_actions	3uu	-,-
+evt	wl_data_offer	0	offer	s	-
+evt	wl_data_offer	1	source_actions	3u	-
+evt	wl_data_offer	2	action	3u	-
+iface	wl_data_source	4	3	6
+req	wl_data_source	0	offer	s	-
+req	wl_data_source	1	destroy		-
+req	wl_data_source	2	set_actions	3u	-
+evt	wl_data_source	0	target	?s	-
+evt	wl_data_source	1	send	sh	-,-
+evt	wl_data_source	2	cancelled		-
+evt	wl_data_source	3	dnd_drop_performed	3	-
+evt	wl_data_source	4	dnd_finished	3	-
+evt	wl_data_source	5	action	3u	-
+iface	wl_data_device	4	3	6
+req	wl_data_device	0	start_drag	?oo?ou	wl_data_source,wl_surface,wl_surface,-
+req	wl_data_device	1	set_selection	?ou	wl_data_source,-
+req	wl_data_device	2	release	2	-
+evt	wl_data_device	0	data_offer	n	wl_data_offer
+evt	wl_data_device	1	enter	uoff?o	-,wl_surface,-,-,wl_data_offer
+evt	wl_data_device	2	leave		-
+evt	wl_data_device	3	motion	uff	-,-,-
+evt	wl_data_device	4	drop		-
+evt	wl_data_device	5	selection	?o	wl_data_offer
+iface	wl_data_device_manager	4	3	0
+req	wl_data_device_manager	0	create_data_source	n	wl_data_source
+req	wl_data_device_manager	1	get_data_device	no	wl_data_device,wl_seat
+req	wl_data_device_manager	2	release	4	-
+iface	wl_shell	1	1	0
+req	wl_shell	0	get_shell_surface	no	wl_shell_surface,wl_surface
+iface	wl_shell_surface	1	10	3
+req	wl_shell_surface	0	pong	u	-
+req	wl_shell_surface	1	move	ou	wl_seat,-
+req	wl_shell_surface	2	resize	ouu	wl_seat,-,-
+req	wl_shell_surface	3	set_toplevel		-
+req	wl_shell_surface	4	set_transient	oiiu	wl_surface,-,-,-
+req	wl_shell_surface	5	set_fullscreen	uu?o	-,-,wl_output
+req	wl_shell_surface	6	set_popup	ouoiiu	wl_seat,-,wl_surface,-,-,-
+req	wl_shell_surface	7	set_maximized	?o	wl_output
+req	wl_shell_surface	8	set_title	s	-
+req	wl_shell_surface	9	set_class	s	-
+evt	wl_shell_surface	0	ping	u	-
+evt	wl_shell_surface	1	configure	uii	-,-,-
+evt	wl_shell_surface	2	popup_done		-
+iface	wl_surface	7	12	4
+req	wl_surface	0	destroy		-
+req	wl_surface	1	attach	?oii	wl_buffer,-,-
+req	wl_surface	2	damage	iiii	-,-,-,-
+req	wl_surface	3	frame	n	wl_callback
+req	wl_surface	4	set_opaque_region	?o	wl_region
+req	wl_surface	5	set_input_region	?o	wl_region
+req	wl_surface	6	commit		-
+req	wl_surface	7	set_buffer_transform	2i	-
+req	wl_surface	8	set_buffer_scale	3i	-
+req	wl_surface	9	damage_buffer	4iiii	-,-,-,-
+req	wl_surface	10	offset	5ii	-,-
+req	wl_surface	11	get_release	7n	wl_callback
+evt	wl_surface	0	enter	o	wl_output
+evt	wl_surface	1	leave	o	wl_output
+evt	wl_surface	2	preferred_buffer_scale	6i	-
+evt	wl_surface	3	preferred_buffer_transform	6u	-
+iface	wl_seat	10	4	2
+req	wl_seat	0	get_pointer	n	wl_pointer
+req	wl_seat	1	get_keyboard	n	wl_keyboard
+req	wl_seat	2	get_touch	n	wl_touch
+req	wl_seat	3	release	5	-
+evt	wl_seat	0	capabilities	u	-
+evt	wl_seat	1	name	2s	-
+iface	wl_pointer	10	2	11
+req	wl_pointer	0	set_cursor	u?oii	-,wl_surface,-,-
+req	wl_pointer	1	release	3	-
+evt	wl_pointer	0	enter	uoff	-,wl_surface,-,-
+evt	wl_pointer	1	leave	uo	-,wl_surface
+evt	wl_pointer	2	motion	uff	-,-,-
+evt	wl_pointer	3	button	uuuu	-,-,-,-
+evt	wl_pointer	4	axis	uuf	-,-,-
+evt	wl_pointer	5	frame	5	-
+evt	wl_pointer	6	axis_source	5u	-
+evt	wl_pointer	7	axis_stop	5uu	-,-
+evt	wl_pointer	8	axis_discrete	5ui	-,-
+evt	wl_pointer	9	axis_value120	8ui	-,-
+evt	wl_pointer	10	axis_relative_direction	9uu	-,-
+iface	wl_keyboard	10	1	6
+req	wl_keyboard	0	release	3	-
+evt	wl_keyboard	0	keymap	uhu	-,-,-
+evt	wl_keyboard	1	enter	uoa	-,wl_surface,-
+evt	wl_keyboard	2	leave	uo	-,wl_surface
+evt	wl_keyboard	3	key	uuuu	-,-,-,-
+evt	wl_keyboard	4	modifiers	uuuuu	-,-,-,-,-
+evt	wl_keyboard	5	repeat_info	4ii	-,-
+iface	wl_touch	10	1	7
+req	wl_touch	0	release	3	-
+evt	wl_touch	0	down	uuoiff	-,-,wl_surface,-,-,-
+evt	wl_touch	1	up	uui	-,-,-
+evt	wl_touch	2	motion	uiff	-,-,-,-
+evt	wl_touch	3	frame		-
+evt	wl_touch	4	cancel		-
+evt	wl_touch	5	shape	6iff	-,-,-
+evt	wl_touch	6	orientation	6if	-,-
+iface	wl_output	4	1	6
+req	wl_output	0	release	3	-
+evt	wl_output	0	geometry	iiiiissi	-,-,-,-,-,-,-,-
+evt	wl_output	1	mode	uiii	-,-,-,-
+evt	wl_output	2	done	2	-
+evt	wl_output	3	scale	2i	-
+evt	wl_output	4	name	4s	-
+evt	wl_output	5	description	4s	-
+iface	wl_region	7	3	0
+req	wl_region	0	destroy		-
+req	wl_region	1	add	iiii	-,-,-,-
+req	wl_region	2	subtract	iiii	-,-,-,-
+iface	wl_subcompositor	1	2	0
+req	wl_subcompositor	0	destroy		-
+req	wl_subcompositor	1	get_subsurface	noo	wl_subsurface,wl_surface,wl_surface
+iface	wl_subsurface	1	6	0
+req	wl_subsurface	0	destroy		-
+req	wl_subsurface	1	set_position	ii	-,-
+req	wl_subsurface	2	place_above	o	wl_surface
+req	wl_subsurface	3	place_below	o	wl_surface
+req	wl_subsurface	4	set_sync		-
+req	wl_subsurface	5	set_desync		-
+iface	wl_fixes	1	2	0
+req	wl_fixes	0	destroy		-
+req	wl_fixes	1	destroy_registry	o	wl_registry
+iface	xdg_wm_base	7	4	1
+req	xdg_wm_base	0	destroy		-
+req	xdg_wm_base	1	create_positioner	n	xdg_positioner
+req	xdg_wm_base	2	get_xdg_surface	no	xdg_surface,wl_surface
+req	xdg_wm_base	3	pong	u	-
+evt	xdg_wm_base	0	ping	u	-
+iface	xdg_positioner	7	10	0
+req	xdg_positioner	0	destroy		-
+req	xdg_positioner	1	set_size	ii	-,-
+req	xdg_positioner	2	set_anchor_rect	iiii	-,-,-,-
+req	xdg_positioner	3	set_anchor	u	-
+req	xdg_positioner	4	set_gravity	u	-
+req	xdg_positioner	5	set_constraint_adjustment	u	-
+req	xdg_positioner	6	set_offset	ii	-,-
+req	xdg_positioner	7	set_reactive	3	-
+req	xdg_positioner	8	set_parent_size	3ii	-,-
+req	xdg_positioner	9	set_parent_configure	3u	-
+iface	xdg_surface	7	5	1
+req	xdg_surface	0	destroy		-
+req	xdg_surface	1	get_toplevel	n	xdg_toplevel
+req	xdg_surface	2	get_popup	n?oo	xdg_popup,xdg_surface,xdg_positioner
+req	xdg_surface	3	set_window_geometry	iiii	-,-,-,-
+req	xdg_surface	4	ack_configure	u	-
+evt	xdg_surface	0	configure	u	-
+iface	xdg_toplevel	7	14	4
+req	xdg_toplevel	0	destroy		-
+req	xdg_toplevel	1	set_parent	?o	xdg_toplevel
+req	xdg_toplevel	2	set_title	s	-
+req	xdg_toplevel	3	set_app_id	s	-
+req	xdg_toplevel	4	show_window_menu	ouii	wl_seat,-,-,-
+req	xdg_toplevel	5	move	ou	wl_seat,-
+req	xdg_toplevel	6	resize	ouu	wl_seat,-,-
+req	xdg_toplevel	7	set_max_size	ii	-,-
+req	xdg_toplevel	8	set_min_size	ii	-,-
+req	xdg_toplevel	9	set_maximized		-
+req	xdg_toplevel	10	unset_maximized		-
+req	xdg_toplevel	11	set_fullscreen	?o	wl_output
+req	xdg_toplevel	12	unset_fullscreen		-
+req	xdg_toplevel	13	set_minimized		-
+evt	xdg_toplevel	0	configure	iia	-,-,-
+evt	xdg_toplevel	1	close		-
+evt	xdg_toplevel	2	configure_bounds	4ii	-,-
+evt	xdg_toplevel	3	wm_capabilities	5a	-
+iface	xdg_popup	7	3	3
+req	xdg_popup	0	destroy		-
+req	xdg_popup	1	grab	ou	wl_seat,-
+req	xdg_popup	2	reposition	3ou	xdg_positioner,-
+evt	xdg_popup	0	configure	iiii	-,-,-,-
+evt	xdg_popup	1	popup_done		-
+evt	xdg_popup	2	repositioned	3u	-
+iface	zxdg_decoration_manager_v1	1	2	0
+req	zxdg_decoration_manager_v1	0	destroy		-
+req	zxdg_decoration_manager_v1	1	get_toplevel_decoration	no	zxdg_toplevel_decoration_v1,xdg_toplevel
+iface	zxdg_toplevel_decoration_v1	1	3	1
+req	zxdg_toplevel_decoration_v1	0	destroy		-
+req	zxdg_toplevel_decoration_v1	1	set_mode	u	-
+req	zxdg_toplevel_decoration_v1	2	unset_mode		-
+evt	zxdg_toplevel_decoration_v1	0	configure	u	-
+iface	xdg_activation_v1	1	3	0
+req	xdg_activation_v1	0	destroy		-
+req	xdg_activation_v1	1	get_activation_token	n	xdg_activation_token_v1
+req	xdg_activation_v1	2	activate	so	-,wl_surface
+iface	xdg_activation_token_v1	1	5	1
+req	xdg_activation_token_v1	0	set_serial	uo	-,wl_seat
+req	xdg_activation_token_v1	1	set_app_id	s	-
+req	xdg_activation_token_v1	2	set_surface	o	wl_surface
+req	xdg_activation_token_v1	3	commit		-
+req	xdg_activation_token_v1	4	destroy		-
+evt	xdg_activation_token_v1	0	done	s	-
+iface	wp_viewporter	1	2	0
+req	wp_viewporter	0	destroy		-
+req	wp_viewporter	1	get_viewport	no	wp_viewport,wl_surface
+iface	wp_viewport	1	3	0
+req	wp_viewport	0	destroy		-
+req	wp_viewport	1	set_source	ffff	-,-,-,-
+req	wp_viewport	2	set_destination	ii	-,-
+iface	wp_fractional_scale_manager_v1	1	2	0
+req	wp_fractional_scale_manager_v1	0	destroy		-
+req	wp_fractional_scale_manager_v1	1	get_fractional_scale	no	wp_fractional_scale_v1,wl_surface
+iface	wp_fractional_scale_v1	1	1	1
+req	wp_fractional_scale_v1	0	destroy		-
+evt	wp_fractional_scale_v1	0	preferred_scale	u	-
+iface	wp_cursor_shape_manager_v1	2	3	0
+req	wp_cursor_shape_manager_v1	0	destroy		-
+req	wp_cursor_shape_manager_v1	1	get_pointer	no	wp_cursor_shape_device_v1,wl_pointer
+req	wp_cursor_shape_manager_v1	2	get_tablet_tool_v2	no	wp_cursor_shape_device_v1,zwp_tablet_tool_v2
+iface	wp_cursor_shape_device_v1	2	2	0
+req	wp_cursor_shape_device_v1	0	destroy		-
+req	wp_cursor_shape_device_v1	1	set_shape	uu	-,-
+iface	zwp_text_input_v3	1	8	6
+req	zwp_text_input_v3	0	destroy		-
+req	zwp_text_input_v3	1	enable		-
+req	zwp_text_input_v3	2	disable		-
+req	zwp_text_input_v3	3	set_surrounding_text	sii	-,-,-
+req	zwp_text_input_v3	4	set_text_change_cause	u	-
+req	zwp_text_input_v3	5	set_content_type	uu	-,-
+req	zwp_text_input_v3	6	set_cursor_rectangle	iiii	-,-,-,-
+req	zwp_text_input_v3	7	commit		-
+evt	zwp_text_input_v3	0	enter	o	wl_surface
+evt	zwp_text_input_v3	1	leave	o	wl_surface
+evt	zwp_text_input_v3	2	preedit_string	?sii	-,-,-
+evt	zwp_text_input_v3	3	commit_string	?s	-
+evt	zwp_text_input_v3	4	delete_surrounding_text	uu	-,-
+evt	zwp_text_input_v3	5	done	u	-
+iface	zwp_text_input_manager_v3	1	2	0
+req	zwp_text_input_manager_v3	0	destroy		-
+req	zwp_text_input_manager_v3	1	get_text_input	no	zwp_text_input_v3,wl_seat
+iface	zwp_primary_selection_device_manager_v1	1	3	0
+req	zwp_primary_selection_device_manager_v1	0	create_source	n	zwp_primary_selection_source_v1
+req	zwp_primary_selection_device_manager_v1	1	get_device	no	zwp_primary_selection_device_v1,wl_seat
+req	zwp_primary_selection_device_manager_v1	2	destroy		-
+iface	zwp_primary_selection_device_v1	1	2	2
+req	zwp_primary_selection_device_v1	0	set_selection	?ou	zwp_primary_selection_source_v1,-
+req	zwp_primary_selection_device_v1	1	destroy		-
+evt	zwp_primary_selection_device_v1	0	data_offer	n	zwp_primary_selection_offer_v1
+evt	zwp_primary_selection_device_v1	1	selection	?o	zwp_primary_selection_offer_v1
+iface	zwp_primary_selection_offer_v1	1	2	1
+req	zwp_primary_selection_offer_v1	0	receive	sh	-,-
+req	zwp_primary_selection_offer_v1	1	destroy		-
+evt	zwp_primary_selection_offer_v1	0	offer	s	-
+iface	zwp_primary_selection_source_v1	1	2	2
+req	zwp_primary_selection_source_v1	0	offer	s	-
+req	zwp_primary_selection_source_v1	1	destroy		-
+evt	zwp_primary_selection_source_v1	0	send	sh	-,-
+evt	zwp_primary_selection_source_v1	1	cancelled		-

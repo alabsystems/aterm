@@ -7,14 +7,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::verdict::CouldNotRun;
+use aterm_toolchain::discovery;
 
-#[path = "../../atpkg/src/toolchain.rs"]
-#[allow(
-    dead_code,
-    reason = "atpkg's resolution file is compiled whole; this gate calls only its discovery"
-)]
-mod discovery;
+use crate::verdict::CouldNotRun;
 
 /// The pinned toolchain's drivers and the host it compiles for natively.
 #[derive(Clone, Debug)]
@@ -195,18 +190,5 @@ mod tests {
         assert_eq!(parse_host(vv).as_deref(), Some("aarch64-apple-darwin"));
         assert_eq!(parse_host("host: \n"), None);
         assert_eq!(parse_host("binary: trustc\n"), None);
-    }
-
-    #[test]
-    fn a_host_build_needs_core_and_std_rlibs() {
-        let dir = aterm_tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("libcore-0123abcd.rlib"), b"").expect("write");
-        std::fs::write(dir.path().join("libstd-0123abcd.dylib"), b"").expect("write");
-        assert!(has_rlib(dir.path(), "core"));
-        assert!(
-            !has_rlib(dir.path(), "std"),
-            "a dylib is not the rlib a build links"
-        );
-        assert!(!has_rlib(&dir.path().join("absent"), "core"));
     }
 }

@@ -16,6 +16,7 @@
 
 /// Dispatch kind that selects the [`aterm_policy::selector::DispatchedSequence`]
 /// probe shape. Lives here because the terminal module is its only producer.
+/// Production probes only the response sink ([`Self::response_sink`]).
 #[derive(Debug, Clone, Copy)]
 pub(super) enum ProbeKind {
     /// DCS dispatch (ESC P ... `<final_byte>` ST).
@@ -87,25 +88,11 @@ impl ResponseCapability {
 /// [`super::policy_gates::PolicyGates`], so the compiled verdict is the per-dispatch one.
 #[must_use]
 pub(super) fn probe_for(kind: ProbeKind) -> aterm_policy::selector::DispatchedSequence {
-    match kind {
-        ProbeKind::Dcs { final_byte } => {
-            // DCS has no major code; the "response any" catch-all covers it via
-            // the wildcard bucket in the standard profile.
-            let suffix = std::str::from_utf8(&[final_byte])
-                .map(str::to_owned)
-                .unwrap_or_default();
-            aterm_policy::selector::DispatchedSequence::dcs(&suffix)
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The token is zero-sized: no payload, no heap.
-    #[test]
-    fn capability_is_zero_sized() {
-        assert_eq!(std::mem::size_of::<ResponseCapability>(), 0);
-    }
+    let ProbeKind::Dcs { final_byte } = kind;
+    // DCS has no major code; the "response any" catch-all covers it via the
+    // wildcard bucket in the standard profile.
+    let suffix = std::str::from_utf8(&[final_byte])
+        .map(str::to_owned)
+        .unwrap_or_default();
+    aterm_policy::selector::DispatchedSequence::dcs(&suffix)
 }

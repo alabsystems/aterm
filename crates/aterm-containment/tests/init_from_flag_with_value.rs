@@ -15,10 +15,10 @@ fn init_from_flag_uses_the_flag_over_default() {
         "init_from_flag_uses_the_flag_over_default",
         || {
             let mode =
-                aterm_containment::init_mode_from_flag(Some("safety"), ContainmentMode::Master)
+                aterm_containment::init_mode_from_flag(Some("safety"), ContainmentMode::User)
                     .expect("init_mode_from_flag should succeed");
 
-            // The flag's "safety" overrides the Master default.
+            // The flag's "safety" overrides the User default.
             assert_eq!(mode, ContainmentMode::Safety);
 
             // Global mode should now be Safety.

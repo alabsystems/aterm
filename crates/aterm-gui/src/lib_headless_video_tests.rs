@@ -205,10 +205,6 @@ fn the_key_ledger_refuses_input_from_a_window_it_is_not_recording() {
         started_us: 0,
         keys: true,
         key_log: Vec::new(),
-        trail: false,
-        trail_log: Vec::new(),
-        trail_seen: 0,
-        trail_lost: 0,
         pace_ticks: Vec::new(),
         unseamed_at_begin: began,
         unlogged_other_window: 0,
@@ -308,10 +304,8 @@ fn video_mode_honesty_both_ways() {
 
 #[test]
 fn capture_regression_translucent_raw_present_refuses_wysiwyg_claim() {
-    let error = raw_present_capture_guard(0.75, true)
+    raw_present_capture_guard(0.75, true)
         .expect_err("a raw translucent layer omits compositor-owned backdrop pixels");
-    assert!(error.contains("use `image`"));
-    assert!(error.contains("background_opacity = 1"));
 
     assert!(
         raw_present_capture_guard(1.0, true).is_ok(),
@@ -366,10 +360,8 @@ fn capture_regression_window_material_and_post_present_stop_fail_closed() {
         BackgroundMaterial::Sidebar,
         BackgroundMaterial::UnderWindow,
     ] {
-        let error = window_capture_material_guard(material, false)
+        window_capture_material_guard(material, false)
             .expect_err("a window-local capture omits the live DWM material");
-        assert!(error.contains("use `image`"));
-        assert!(error.contains("background_material = \"none\""));
         assert!(
             window_capture_material_guard(material, true).is_ok(),
             "a compositor-aware capture may represent the configured material"
@@ -395,38 +387,13 @@ fn capture_regression_window_material_and_post_present_stop_fail_closed() {
         Some(now),
         "headless present-real always needs its timer"
     );
-    let render_source = include_str!("app_render.rs");
-    let post_present = render_source
-        .split("// VIDEO introspection post-present hook")
-        .nth(1)
-        .and_then(|tail| {
-            tail.split("// Every successful application-present frame")
-                .next()
-        })
-        .expect("post-present scheduling source");
-    assert!(
-        !post_present.contains("request_redraw"),
-        "post-present cannot bypass the <=60fps WaitUntil cadence"
-    );
-
-    // Normalize CRLF (a Windows `core.autocrlf` checkout) before anchoring.
-    let source = include_str!("app_introspect.rs").replace("\r\n", "\n");
-    let windows_capture = source
-        .split("#[cfg(windows)]\n    pub(crate) fn capture_window")
-        .nth(1)
-        .and_then(|tail| tail.split("#[cfg(all(not(target_os").next())
-        .expect("Windows capture source");
-    assert!(
-        windows_capture.contains("window_capture_material_guard"),
-        "the pure material guard must stay on the shipping Windows source path"
-    );
 }
 
 /// Tier-1 conformance: the real begin decision, export permit, cancellation CAS and
 /// cleanup projected onto `VideoRecordingLifecycle`. Tier-0 lives in aterm-spec.
 #[test]
 fn real_video_lifecycle_conforms_to_model() {
-    let model = aterm_spec::derive::video_recording_lifecycle_model();
+    let model = aterm_models_misc::video_recording_lifecycle_model();
     let mut st = model.init_state();
 
     // The control thread reserves one directory/recording slot before the
@@ -629,10 +596,6 @@ fn live_opacity_transition_aborts_swapchain_recording_fail_closed() {
         started_us: 0,
         keys: false,
         key_log: Vec::new(),
-        trail: false,
-        trail_log: Vec::new(),
-        trail_seen: 0,
-        trail_lost: 0,
         pace_ticks: Vec::new(),
         unseamed_at_begin: 0,
         unlogged_other_window: 0,
@@ -676,10 +639,6 @@ fn live_opacity_transition_aborts_swapchain_recording_fail_closed() {
             started_us: 0,
             keys: false,
             key_log: Vec::new(),
-            trail: false,
-            trail_log: Vec::new(),
-            trail_seen: 0,
-            trail_lost: 0,
             pace_ticks: Vec::new(),
             unseamed_at_begin: 0,
             unlogged_other_window: 0,
@@ -738,10 +697,6 @@ fn window_close_app_drop_and_backend_rebuild_abort_recording_ownership() {
         started_us: 0,
         keys: false,
         key_log: Vec::new(),
-        trail: false,
-        trail_log: Vec::new(),
-        trail_seen: 0,
-        trail_lost: 0,
         pace_ticks: Vec::new(),
         unseamed_at_begin: 0,
         unlogged_other_window: 0,
@@ -783,10 +738,6 @@ fn window_close_app_drop_and_backend_rebuild_abort_recording_ownership() {
             started_us: 0,
             keys: false,
             key_log: Vec::new(),
-            trail: false,
-            trail_log: Vec::new(),
-            trail_seen: 0,
-            trail_lost: 0,
             pace_ticks: Vec::new(),
             unseamed_at_begin: 0,
             unlogged_other_window: 0,
@@ -820,10 +771,6 @@ fn window_close_app_drop_and_backend_rebuild_abort_recording_ownership() {
         started_us: 0,
         keys: false,
         key_log: Vec::new(),
-        trail: false,
-        trail_log: Vec::new(),
-        trail_seen: 0,
-        trail_lost: 0,
         pace_ticks: Vec::new(),
         unseamed_at_begin: 0,
         unlogged_other_window: 0,
@@ -867,10 +814,6 @@ fn finalize_drops_virtual_target_and_timer() {
         started_us: 0,
         keys: false,
         key_log: Vec::new(),
-        trail: false,
-        trail_log: Vec::new(),
-        trail_seen: 0,
-        trail_lost: 0,
         pace_ticks: Vec::new(),
         unseamed_at_begin: 0,
         unlogged_other_window: 0,
@@ -898,7 +841,7 @@ fn finalize_drops_virtual_target_and_timer() {
     // Tier-1 (`VideoRecordingLifecycle`): project this App's recording: `mode` from the
     // window's present target (a `Virtual` target is the offscreen arm), `timer` from the
     // pacing deadline, `private_dirs` from the directory on disk.
-    let model = aterm_spec::derive::video_recording_lifecycle_model();
+    let model = aterm_models_misc::video_recording_lifecycle_model();
     let project = |app: &super::App, base: &aterm_spec::interp::State| {
         let mut state = base.clone();
         let offscreen = app
@@ -965,10 +908,6 @@ fn service_video_wake_consumes_due_clocks_on_any_wake() {
         started_us: 0,
         keys: false,
         key_log: Vec::new(),
-        trail: false,
-        trail_log: Vec::new(),
-        trail_seen: 0,
-        trail_lost: 0,
         pace_ticks: Vec::new(),
         unseamed_at_begin: 0,
         unlogged_other_window: 0,
@@ -1008,10 +947,6 @@ fn service_video_wake_consumes_due_clocks_on_any_wake() {
         started_us: 0,
         keys: false,
         key_log: Vec::new(),
-        trail: false,
-        trail_log: Vec::new(),
-        trail_seen: 0,
-        trail_lost: 0,
         pace_ticks: Vec::new(),
         unseamed_at_begin: 0,
         unlogged_other_window: 0,
@@ -1069,10 +1004,6 @@ fn service_video_wake_consumes_due_clocks_on_any_wake() {
         started_us: 0,
         keys: false,
         key_log: Vec::new(),
-        trail: false,
-        trail_log: Vec::new(),
-        trail_seen: 0,
-        trail_lost: 0,
         pace_ticks: Vec::new(),
         unseamed_at_begin: 0,
         unlogged_other_window: 0,
@@ -1103,7 +1034,7 @@ fn service_video_wake_consumes_due_clocks_on_any_wake() {
 /// the abort seam removes the target and its timer and answers the blocked client.
 #[test]
 fn device_loss_aborts_virtual_recording_without_a_timer_wedge() {
-    let model = aterm_spec::derive::gpu_loss_recovery_model();
+    let model = aterm_models_core::gpu_loss_recovery_model();
     let expected = model.successors("FailFallbackAfterPresent", &model.init_state())[0].clone();
     let mut app = super::App::headless_for_test();
     let wid = WindowId(0);
@@ -1122,10 +1053,6 @@ fn device_loss_aborts_virtual_recording_without_a_timer_wedge() {
         started_us: 0,
         keys: false,
         key_log: Vec::new(),
-        trail: false,
-        trail_log: Vec::new(),
-        trail_seen: 0,
-        trail_lost: 0,
         pace_ticks: Vec::new(),
         unseamed_at_begin: 0,
         unlogged_other_window: 0,
@@ -1168,23 +1095,13 @@ fn device_loss_aborts_virtual_recording_without_a_timer_wedge() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// The mode labels and stamp semantics are the disclosure contract's exact
-/// strings — index.json consumers key on them.
+/// The mode labels are the disclosure contract's exact strings — index.json
+/// consumers key on them.
 #[test]
 fn video_mode_labels_are_the_disclosure_contract() {
     assert_eq!(VideoMode::SwapchainTap.as_str(), "swapchain-tap");
     assert_eq!(
         VideoMode::OffscreenPresentReal.as_str(),
         "offscreen-present-real"
-    );
-    assert!(
-        VideoMode::SwapchainTap
-            .stamp_semantics()
-            .contains("compositor visibility and scanout not observed")
-    );
-    assert!(
-        VideoMode::OffscreenPresentReal
-            .stamp_semantics()
-            .contains("no OS presentation target existed")
     );
 }

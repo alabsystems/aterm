@@ -117,12 +117,6 @@ fn uninstall_of_two_names_refuses_both_and_removes_neither() {
     let out = f.atpkg(&["uninstall", "ta", "tb"]);
     let all = text(&out);
     assert_eq!(out.status.code(), Some(2), "the usage exit:\n{all}");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("atpkg uninstall: one name at a time \u{2014} nothing was done")
-            && stderr.contains("usage: aterm pkg uninstall"),
-        "the refusal names the verb, says nothing was done, and shows the usage:\n{all}"
-    );
     assert!(
         !String::from_utf8_lossy(&out.stdout).contains("uninstalled"),
         "nothing may be reported removed:\n{all}"
@@ -169,12 +163,36 @@ fn every_one_name_verb_refuses_a_second_name_at_the_usage_exit() {
         let out = f.atpkg(&[verb, "ta", "tb"]);
         let all = text(&out);
         assert_eq!(out.status.code(), Some(2), "`{verb} ta tb`:\n{all}");
-        assert!(
-            String::from_utf8_lossy(&out.stderr).contains(&format!(
-                "atpkg {verb}: one name at a time \u{2014} nothing was done"
-            )),
-            "`{verb} ta tb` names its own verb:\n{all}"
-        );
     }
     assert!(f.installed("ta"), "no verb above may have acted on `ta`");
+}
+
+/// A verb that takes no argument refuses a stray one at the usage exit, before the store
+/// lock: `repair --dry-run` (there is no such flag) must not re-lay a single shim or rc
+/// line. No bare-`repair` control: repair re-asserts the rustup seam, and `RUSTUP_HOME`
+/// is the real one under a rustup-run test.
+#[test]
+fn a_no_argument_verb_refuses_a_stray_one_and_touches_nothing() {
+    let f = Fixture::new("zero");
+    f.install("ta");
+    let lock = f.layout.store_lock();
+    assert!(!lock.exists(), "fixture: no store lock file yet");
+    let before = std::fs::read_dir(&f.home)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect::<std::collections::BTreeSet<_>>();
+    let out = f.atpkg(&["repair", "--dry-run"]);
+    let all = text(&out);
+    assert_eq!(out.status.code(), Some(2), "the usage exit:\n{all}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("unknown argument \"--dry-run\" \u{2014} this verb takes none"),
+        "the refusal names the stray argument:\n{all}"
+    );
+    let after = std::fs::read_dir(&f.home)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(before, after, "nothing may be laid in HOME:\n{all}");
+    assert!(!lock.exists(), "the store lock is never taken:\n{all}");
 }

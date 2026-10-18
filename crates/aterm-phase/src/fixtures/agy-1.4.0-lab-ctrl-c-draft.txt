@@ -1,0 +1,27 @@
+# agy 1.4.0 · MEASURED 2026-10-17, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Antigravity CLI, launched by path with a scratch `HOME` whose settings name the Gemini API provider, its Google hosts black-holed, a fake `GEMINI_API_KEY` and `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:<port>` (a local stub of the Gemini API, crates/aterm-lab) · one ctrl+c over a held draft (`x`): the draft stays in the composer and the footer becomes `press ctrl+c again to exit` (a second ctrl+c exits and drops it)
+
+      ▄▀▀▄        Antigravity CLI 1.4.0
+     ▀▀▀▀▀▀       Gemini API key
+    ▀▀▀▀▀▀▀▀      Gemini 3.1 Pro (Low)
+   ▄▀▀    ▀▀▄     /private/tmp/at.hnic/proj
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+> remember the word PELICAN-7 for later
+
+  Hi! I am the local lab stub, not a model. (reply 1)
+
+────────────────────────────────────────────────────────────
+> what word did I ask you to remember
+
+  Hi! I am the local lab stub, not a model. (reply 2)
+
+────────────────────────────────────────────────────────────
+> after resume: say the word again
+
+  Hi! I am the local lab stub, not a model. (reply 3)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+> x
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+press ctrl+c again to exit                                                                                                  Gemini 3.1 Pro · low

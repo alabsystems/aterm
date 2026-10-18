@@ -631,7 +631,7 @@ fn provider_home_stage() {
         home.display()
     );
     let worker = WorkerEnv::hermetic(None).with(&format!("HOME={}", home.display()));
-    assert_eq!(worker.settings_env(&proj), Ok(()), "nothing there");
+    assert_eq!(worker.git_settings_env(&proj), Ok(()), "nothing there");
     assert!(
         found(owner_asks(&worker, &proj)).is_empty(),
         "nothing there"
@@ -641,13 +641,13 @@ fn provider_home_stage() {
         &local,
         r#"{"permissions":{"allow":["Bash(ls:*)"],"ask":["Write"]}}"#,
     );
-    assert_eq!(worker.settings_env(&proj), Ok(()), "a quiet local file");
+    assert_eq!(worker.git_settings_env(&proj), Ok(()), "a quiet local file");
     assert_eq!(
         found(owner_asks(&worker, &proj)),
         [("Write".to_string(), local.display().to_string())]
     );
     write(&local, r#"{"env":{"GIT_DIR":"elsewhere"}}"#);
-    let why = worker.settings_env(&proj).expect_err("an env it names");
+    let why = worker.git_settings_env(&proj).expect_err("an env it names");
     assert!(
         why.contains("gets `GIT_DIR` from Claude Code's settings"),
         "{why}"

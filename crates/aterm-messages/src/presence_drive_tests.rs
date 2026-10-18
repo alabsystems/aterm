@@ -481,6 +481,7 @@ fn leased() -> TFacts {
         agent_seq: 1,
         hand: Hand::DrivenLease {
             holder: "probe".into(),
+            pid: None,
         },
         typing: true,
         lease: LeaseMark::Typing,
@@ -802,6 +803,7 @@ fn the_deadline_folds_each_source_only_where_it_applies() {
         TFacts {
             hand: Hand::DrivenLease {
                 holder: "manager".into(),
+                pid: None,
             },
             lease_until: Some(l.now + Duration::from_secs(9)),
             ..TFacts::default()
@@ -829,6 +831,52 @@ fn the_deadline_folds_each_source_only_where_it_applies() {
     assert_eq!(drive::deadline(&l, past), Some(past));
 }
 
+/// A RENEWED CLAIM NEVER WAKES THE LOOP (D5, the Together run): a renewal
+/// posts nothing (`meta set supervisor` by the holder it names is no change),
+/// so no refresh re-reads it; the deadline reads the claim's lapse live and
+/// moves with each renewal. A holder that stops renewing is still caught at
+/// its last lapse, and a claim gone without a refresh falls back to the
+/// table's copy, so the tick re-reads it.
+///
+/// NEGATIVE CONTROL: the table's copy alone (what the deadline read before)
+/// is the stale lapse — a wake 20 s before the claim's real one, every lease.
+#[test]
+fn a_renewed_supervisor_claim_moves_the_deadline_without_a_refresh() {
+    let mut d = desk();
+    d.wins.get_mut(&0).unwrap().visible = false;
+    d.wins.get_mut(&1).unwrap().visible = false;
+    let t0 = d.now;
+    d.supervisors.insert(2, t0 + Duration::from_secs(90));
+    drive::refresh_session(&mut d, 2, false);
+    assert_eq!(drive::deadline(&d, t0), Some(t0 + Duration::from_secs(90)));
+    // Renewed 20 s on, with no refresh: the deadline is the new lapse.
+    d.supervisors.insert(2, t0 + Duration::from_secs(110));
+    let t = t0 + Duration::from_secs(20);
+    assert_eq!(
+        drive::deadline(&d, t),
+        Some(t0 + Duration::from_secs(110)),
+        "the live lapse, not the 90 s one the last refresh read"
+    );
+    // Negative control: the copy the table holds is the stale one.
+    let mut stale = desk();
+    stale.wins.get_mut(&0).unwrap().visible = false;
+    stale.wins.get_mut(&1).unwrap().visible = false;
+    stale.supervisors.insert(2, t0 + Duration::from_secs(90));
+    drive::refresh_session(&mut stale, 2, false);
+    stale.supervisors.remove(&2);
+    assert_eq!(
+        drive::deadline(&stale, t),
+        Some(t0 + Duration::from_secs(90)),
+        "a claim gone without a refresh: the table's copy fires, and the tick re-reads"
+    );
+    // The holder dies after its last renewal: caught at that lapse.
+    let lapse = t0 + Duration::from_secs(110);
+    assert_eq!(drive::deadline(&d, lapse), Some(lapse));
+    let _ = drive::tick(&mut d, lapse);
+    assert_eq!(d.took("lapse 2"), 1);
+    assert_eq!(drive::deadline(&d, lapse), None, "lapsed: nothing armed");
+}
+
 /// The tick: a lapsed supervisor is lapsed and its session re-read, a lapsed
 /// lease is re-read and dropped, a session the host no longer holds is
 /// forgotten, a finished ripple retires (a repaint), and a row recomposes
@@ -842,6 +890,7 @@ fn the_tick_lapses_retires_and_recomposes_on_its_own_clock() {
         TFacts {
             hand: Hand::DrivenLease {
                 holder: "manager".into(),
+                pid: None,
             },
             lease_until: Some(t0 + Duration::from_secs(2)),
             ..TFacts::default()
@@ -902,7 +951,7 @@ fn the_status_tail_and_the_chrome_line_are_the_engines_bytes() {
     let mut d = desk();
     assert_eq!(
         drive::status_tail(&d, 1),
-        "hand=- level=quiet story=0 why=-"
+        "hand=- hand_pid=- level=quiet story=0 why=-"
     );
     assert_eq!(drive::session_level(&d, 1), Level::Quiet);
     let quiet = "presence rim=none level=quiet band=\"\" sentence=\"\"";
@@ -928,7 +977,7 @@ fn the_status_tail_and_the_chrome_line_are_the_engines_bytes() {
     drive::refresh_session(&mut d, 1, false);
     assert_eq!(
         drive::status_tail(&d, 1),
-        "hand=turn:4:a%20\"b\"%20\\c level=driven story=0 why=-"
+        "hand=turn:4:a%20\"b\"%20\\c hand_pid=- level=driven story=0 why=-"
     );
     let line = drive::chrome_line(&d, Some(0), 80);
     let v = d.view(0);
@@ -955,14 +1004,14 @@ fn the_status_tail_and_the_chrome_line_are_the_engines_bytes() {
     let seq = drive::tell(&mut d, 2, StoryVerb::Approval, "").expect("held");
     assert_eq!(
         drive::status_tail(&d, 2),
-        format!("hand=- level=story story={seq} why=-")
+        format!("hand=- hand_pid=- level=story story={seq} why=-")
     );
     drive::human_acted(&mut d, 1);
     assert_eq!(d.view(0).watermark(2), 0);
     assert_eq!(drive::session_level(&d, 2), Level::Quiet);
     assert_eq!(
         drive::status_tail(&d, 2),
-        format!("hand=- level=quiet story={seq} why=-")
+        format!("hand=- hand_pid=- level=quiet story={seq} why=-")
     );
     // An escalation is why a session is at attention.
     d.facts.get_mut().insert(
@@ -976,7 +1025,7 @@ fn the_status_tail_and_the_chrome_line_are_the_engines_bytes() {
     drive::refresh_session(&mut d, 2, false);
     assert_eq!(
         drive::status_tail(&d, 2),
-        format!("hand=- level=attention story={seq} why=escalation")
+        format!("hand=- hand_pid=- level=attention story={seq} why=escalation")
     );
 }
 
@@ -987,6 +1036,7 @@ fn peer_leased() -> TFacts {
         agent_seq: 1,
         hand: Hand::DrivenLease {
             holder: "peer".into(),
+            pid: None,
         },
         ..TFacts::default()
     }

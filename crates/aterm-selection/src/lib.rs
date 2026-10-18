@@ -68,14 +68,8 @@ mod builtin_patterns;
 mod rules;
 mod text_selection;
 
-#[cfg(test)]
-pub(crate) use builtin_patterns::BuiltinRules;
-#[cfg(test)]
-pub use rules::SelectionMatch;
 pub use rules::SelectionRuleKind;
 pub use rules::SmartSelection;
-#[cfg(test)]
-pub(crate) use rules::{RulePriority, SelectionRule};
 
 pub use text_selection::SelectionState;
 pub use text_selection::{

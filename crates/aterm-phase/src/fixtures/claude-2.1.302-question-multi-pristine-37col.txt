@@ -1,0 +1,19 @@
+# claude-code 2.1.302 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (37x60, aterm 0.105.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a multi-select at 37 columns as the harness reads it before it types: the focus on option 1, the free-text row pristine (`4. [ ] Type something`, its text at column 9) (ATERM-KI-1015-1 F2)
+─────────────────────────────────────
+←  ☐ Checks  ✔ Submit  →
+
+Which checks should run?
+
+❯ 1. [ ] Unit tests (Recommended)
+         Fast
+  2. [ ] Lint
+         Style
+  3. [ ] Fuzz
+         Slow
+  4. [ ] Type something
+     Submit
+─────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate ·
+Esc to cancel

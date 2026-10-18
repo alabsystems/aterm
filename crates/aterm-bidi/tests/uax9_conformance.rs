@@ -7,9 +7,10 @@
 //! `BidiCharacterTest.txt` (UCD 18.0.0; Unicode License v3, UNICODE-LICENSE.txt
 //! at the repo root): every case of the hand-written sections of
 //! BidiCharacterTest (brackets, isolates, overrides, the UAX #9 examples) and an
-//! even sample of the generated remainder of both files — see `subset.py`
-//! beside the data for how it was cut. Each case checks the resolved level of
-//! every character not removed by rule X9 and the visual order through L2.
+//! even sample of the generated remainder of both files — see
+//! `examples/gen_tables.rs subset` for how it was cut. Each case checks the
+//! resolved level of every character not removed by rule X9 and the visual
+//! order through L2.
 
 use aterm_bidi::{
     BaseDirection, BidiClass, Bracket, bidi_class, bracket_of, removed_by_x9, reorder_from_levels,

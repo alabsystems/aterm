@@ -488,5 +488,6 @@ fn apply_config_text(app: &mut App, dir: &std::path::Path, text: &str) {
         fonts: None,
         warnings: Vec::new(),
         font_refusals: Vec::new(),
+        reason: crate::app_colorscheme::ThemeChange::ConfigReload,
     });
 }

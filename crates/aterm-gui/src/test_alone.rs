@@ -37,7 +37,7 @@
 //! exit: a pipe's end of file waits for every copy of its write end, and a
 //! child a sibling test forked in the instant the pipe existed holds one until
 //! it execs — seconds for a child demoted to the background band before its
-//! exec, as the since-retired managed Ollama daemon's once was.
+//! exec.
 //!
 //! A stand-in that needs a DESCRIPTOR of its starter's is given it by [`hand`]
 //! (whose hook makes that one spawn a fork) and takes it by [`handed`], which
@@ -128,6 +128,7 @@ pub(crate) struct StandIn {
 impl StandIn {
     /// The helper test `name` of `module` — the caller's `module_path!()`,
     /// so a renamed module cannot leave the name stale.
+    #[cfg(unix)]
     pub(crate) fn helper(module: &str, name: &str) -> Self {
         let module = module.split_once("::").map_or("", |(_, rest)| rest);
         let test = if module.is_empty() {
@@ -453,6 +454,7 @@ impl Running {
     ///
     /// When it ran no test of that name, or was wedged.
     #[track_caller]
+    #[cfg(unix)]
     pub(crate) fn selected(self) -> Ran {
         let ran = self.wait();
         if let Err(why) = ran.selected_one() {
@@ -561,6 +563,7 @@ impl Ran {
     }
 
     /// `Ok` when libtest selected exactly its test, however it ended.
+    #[cfg(unix)]
     fn selected_one(&self) -> Result<(), String> {
         if self.status.is_none() {
             return Err(self.wedged());
@@ -588,29 +591,5 @@ impl Ran {
             self.how,
             self.output()
         )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// NEGATIVE CONTROL: a name that selects no test — a test renamed under
-    /// a hand-written `--exact` string — exits 0, which the bare exit-status
-    /// check the older copies made passed; the verdict refuses it.
-    #[test]
-    fn a_name_that_selects_no_test_fails_where_an_exit_status_passed() {
-        let ran = StandIn::helper(module_path!(), "no_test_has_this_name")
-            .spawn()
-            .wait();
-        assert!(
-            ran.status.is_some_and(|status| status.success()),
-            "control: the child of a name that selects nothing exits 0\n{}",
-            ran.stdout
-        );
-        for refused in [ran.passed_one(), ran.selected_one()] {
-            let refused = refused.expect_err("a run of no test is no pass");
-            assert!(refused.contains("did not run that one test"), "{refused}");
-        }
     }
 }

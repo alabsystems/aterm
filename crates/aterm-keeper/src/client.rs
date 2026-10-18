@@ -16,6 +16,7 @@
 //!
 //! [`IdentityPolicy::Designated`]: crate::identity::IdentityPolicy::Designated
 
+use std::cell::Cell;
 use std::io;
 use std::os::fd::{AsFd as _, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -26,16 +27,36 @@ use aterm_uds::CtlStream;
 
 use crate::frameio::{Incoming, read_frame, write_frame};
 use crate::identity::{CheckError, Identity, IdentityPolicy};
-use crate::wire::{CAP_LINK, CAP_SENDS_BYE, Frame, MarkerRef, MasterHeader, PROTO, PeerClass};
+use crate::wire::{
+    CAP_JOURNAL, CAP_LINK, CAP_SENDS_BYE, COMPANION_JOURNAL, Frame, JournalOffer, MarkerRef,
+    MasterHeader, PROTO, PeerClass,
+};
 
-/// One OFFER as the window receives it: the master, its fixed header, and the
-/// two opaque blobs.
+/// One OFFER as the window receives it: the master, its fixed header, the
+/// two opaque blobs, and (to a window that journals) the session's journal
+/// region and the keeper's poison brake.
 #[derive(Debug)]
 pub struct Offered {
     pub master: OwnedFd,
     pub header: MasterHeader,
     pub tag: Vec<u8>,
     pub meta: Vec<u8>,
+    /// The crash-restore region offered with the master (a COMPANION_OFFER), only to a HELLO
+    /// that stated [`CAP_JOURNAL`].
+    pub companion: Option<OfferedCompanion>,
+    /// The keeper's poison brake (`JournalOffer::attempts`), as the OFFER stated it: 0 when the
+    /// region is the dead reader's own and its tail may be replayed, 1 for its keyframe alone
+    /// (from 2 no region comes). 0 from a keeper that stated none.
+    pub attempts: u8,
+}
+
+/// A crash-restore journal region a keeper offered: its read-only descriptor, which the window
+/// maps with `aterm_uds::shm::Region::map_readonly(region, len)`.
+#[derive(Debug)]
+pub struct OfferedCompanion {
+    pub region: OwnedFd,
+    pub kind: u8,
+    pub len: u64,
 }
 
 /// A keeper that answered but failed this build's identity check (§5.7), or
@@ -80,6 +101,9 @@ pub struct KeeperClient {
     /// The policy this client checked the keeper under, which the keeper's
     /// own must be no weaker than ([`KeeperClient::served`]).
     policy: IdentityPolicy,
+    /// The capabilities the keeper's WELCOME stated (0 before it, or from an older keeper):
+    /// a window sends companions only to one that states [`CAP_JOURNAL`].
+    keeper_caps: Cell<u8>,
 }
 
 impl KeeperClient {
@@ -98,7 +122,22 @@ impl KeeperClient {
         Ok(Self {
             stream,
             policy: identity.policy(),
+            keeper_caps: Cell::new(0),
         })
+    }
+
+    /// Whether the keeper's WELCOME stated it takes crash-restore companions.
+    #[must_use]
+    pub fn keeper_journals(&self) -> bool {
+        self.keeper_caps.get() & CAP_JOURNAL != 0
+    }
+
+    /// Read a WELCOME's policy and caps: the policy must serve this window ([`Self::served`]),
+    /// and the caps say whether companions may be sent here.
+    fn welcomed(&self, identity: Option<IdentityPolicy>, caps: Option<u8>) -> io::Result<()> {
+        self.served(identity)?;
+        self.keeper_caps.set(caps.unwrap_or(0));
+        Ok(())
     }
 
     /// Whether a keeper whose WELCOME stated `served` may be handed this window's masters: under
@@ -144,12 +183,14 @@ impl KeeperClient {
     /// # Errors
     /// The exchange failing or the keeper answering out of protocol.
     pub fn hello_app(&self, build: &str) -> io::Result<Vec<Offered>> {
-        self.hello_app_marked(build, None)
+        self.hello_app_marked(build, None, false)
     }
 
     /// [`Self::hello_app`], naming this window's crash marker (§5.4 row 3's
     /// cross-check): the keeper then reads a lost BYE with the marker gone and
-    /// `exit(0)` as the quit it was.
+    /// `exit(0)` as the quit it was. With `journal`, the HELLO states
+    /// [`CAP_JOURNAL`]: this window journals its sessions, and each OFFER may
+    /// bring the session's region (its COMPANION_OFFER, read right after it).
     ///
     /// # Errors
     /// The exchange failing or the keeper answering out of protocol.
@@ -157,12 +198,13 @@ impl KeeperClient {
         &self,
         build: &str,
         marker: Option<MarkerRef>,
+        journal: bool,
     ) -> io::Result<Vec<Offered>> {
         self.send(
             &Frame::Hello {
                 proto: PROTO,
                 class: PeerClass::App,
-                caps: CAP_SENDS_BYE,
+                caps: CAP_SENDS_BYE | if journal { CAP_JOURNAL } else { 0 },
                 build: build.to_string(),
                 marker,
             },
@@ -170,42 +212,90 @@ impl KeeperClient {
         )?;
         let n = match self.recv()?.map(|i| i.frame) {
             Some(Frame::Welcome {
-                offers, identity, ..
+                offers,
+                identity,
+                caps,
+                ..
             }) => {
-                self.served(identity)?;
+                self.welcomed(identity, caps)?;
                 offers
             }
             other => return Err(protocol(format!("expected WELCOME, got {other:?}"))),
         };
         let mut offers = Vec::with_capacity(usize::from(n));
         for _ in 0..n {
-            match self.recv()? {
+            let (master, header, tag, meta, trail) = match self.recv()? {
                 Some(Incoming {
-                    frame: Frame::Offer { header, tag, meta },
+                    frame:
+                        Frame::Offer {
+                            header,
+                            tag,
+                            meta,
+                            journal: trail,
+                        },
                     fd: Some(master),
-                }) => offers.push(Offered {
-                    master,
-                    header,
-                    tag,
-                    meta,
-                }),
+                }) => (master, header, tag, meta, trail),
                 other => return Err(protocol(format!("expected OFFER, got {other:?}"))),
-            }
+            };
+            // A keeper sends the trailing fields, and the region after them, only to a HELLO
+            // that stated CAP_JOURNAL; a window that did not reads the OFFER it always read.
+            let JournalOffer {
+                attempts,
+                companions,
+            } = trail.filter(|_| journal).unwrap_or_default();
+            let companion = match companions {
+                0 => None,
+                1 => Some(self.companion_offer(header.rdev)?),
+                n => return Err(protocol(format!("an OFFER of {n} companions"))),
+            };
+            offers.push(Offered {
+                master,
+                header,
+                tag,
+                meta,
+                companion,
+                attempts,
+            });
         }
         Ok(offers)
     }
 
+    /// The COMPANION_OFFER an OFFER of `rdev` said follows it.
+    fn companion_offer(&self, rdev: u64) -> io::Result<OfferedCompanion> {
+        match self.recv()? {
+            Some(Incoming {
+                frame:
+                    Frame::CompanionOffer {
+                        rdev: of,
+                        kind,
+                        len,
+                    },
+                fd: Some(region),
+            }) if of == rdev => Ok(OfferedCompanion { region, kind, len }),
+            other => Err(protocol(format!(
+                "expected the COMPANION_OFFER of rdev {rdev}, got {other:?}"
+            ))),
+        }
+    }
+
     /// HELLO as a window's link ([`CAP_LINK`]): registered masters only, no
-    /// offers, not a launch.
+    /// offers, not a launch. With `journal`, it states [`CAP_JOURNAL`] too, as
+    /// the window's boot HELLO did: the keeper reads a claim from a window that
+    /// does not state it as the end of every region the master had.
     ///
     /// # Errors
     /// The exchange failing or the keeper answering out of protocol.
-    pub fn hello_link(&self, build: &str, marker: Option<MarkerRef>) -> io::Result<()> {
+    pub fn hello_link(
+        &self,
+        build: &str,
+        marker: Option<MarkerRef>,
+        journal: bool,
+    ) -> io::Result<()> {
         self.send(
             &Frame::Hello {
                 proto: PROTO,
                 class: PeerClass::App,
-                caps: CAP_SENDS_BYE | CAP_LINK,
+                caps: CAP_SENDS_BYE | CAP_LINK | if journal { CAP_JOURNAL } else { 0 },
                 build: build.to_string(),
                 marker,
             },
@@ -215,8 +305,9 @@ impl KeeperClient {
             Some(Frame::Welcome {
                 offers: 0,
                 identity,
+                caps,
                 ..
-            }) => self.served(identity),
+            }) => self.welcomed(identity, caps),
             other => Err(protocol(format!(
                 "expected an empty WELCOME, got {other:?}"
             ))),
@@ -287,6 +378,37 @@ impl KeeperClient {
     pub fn register(&self, master: &OwnedFd, header: MasterHeader, tag: Vec<u8>) -> io::Result<()> {
         self.send(&Frame::Register { header, tag }, Some(master))
     }
+
+    /// COMPANION: the read-only custody descriptor of `rdev`'s journal region, `len` bytes, beside
+    /// a master this connection claimed. Only to a keeper that states [`CAP_JOURNAL`]
+    /// ([`Self::keeper_journals`]); an older one would refuse the kind and drop the connection.
+    ///
+    /// # Errors
+    /// The write failing.
+    pub fn companion(&self, rdev: u64, region: &OwnedFd, len: u64) -> io::Result<()> {
+        self.send(
+            &Frame::Companion {
+                rdev,
+                kind: COMPANION_JOURNAL,
+                len,
+            },
+            Some(region),
+        )
+    }
+
+    /// COMPANION_RELEASE: this connection's claim on `rdev` has no journal region.
+    ///
+    /// # Errors
+    /// The write failing.
+    pub fn companion_release(&self, rdev: u64) -> io::Result<()> {
+        self.send(
+            &Frame::CompanionRelease {
+                rdev,
+                kind: COMPANION_JOURNAL,
+            },
+            None,
+        )
+    }
 }
 
 fn protocol(why: String) -> io::Error {
@@ -312,6 +434,17 @@ pub enum LinkOp {
     /// The quit, written on the final-exit path just before `exit(0)`. The
     /// link sends nothing after it.
     Bye,
+    /// The journal region of a master already queued for REGISTER: the queue owns this
+    /// read-only custody descriptor, and the link keeps it with the master, telling a
+    /// restarted keeper again after the master's REGISTER.
+    Companion {
+        rdev: u64,
+        region: OwnedFd,
+        len: u64,
+    },
+    /// The master `rdev` has no journal region (any more): the link drops the one it kept
+    /// and tells the keeper, again after a restart too.
+    CompanionRelease { rdev: u64 },
 }
 
 /// The queue's bound: a window never blocks on the keeper.
@@ -331,6 +464,19 @@ pub struct KeeperLink {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
+/// Who a link is: the window it speaks for, as each of its HELLOs says.
+#[derive(Debug)]
+struct LinkPeer {
+    path: PathBuf,
+    identity: Identity,
+    build: String,
+    /// This window's crash marker, named in every link HELLO.
+    marker: Option<MarkerRef>,
+    /// This window journals its sessions: every link HELLO states [`CAP_JOURNAL`], and its
+    /// companions are told to a keeper that states it.
+    journal: bool,
+}
+
 impl KeeperLink {
     /// Start the worker for the keeper at `path`.
     ///
@@ -341,7 +487,9 @@ impl KeeperLink {
     }
 
     /// [`Self::start`], naming this window's crash marker in every link HELLO
-    /// (each connection is judged on its own, §5.4).
+    /// (each connection is judged on its own, §5.4). With `journal`, every link
+    /// HELLO states [`CAP_JOURNAL`], as the boot HELLO did, and the link carries
+    /// the window's companions ([`LinkOp::Companion`]).
     ///
     /// # Errors
     /// The thread failing to spawn.
@@ -351,11 +499,19 @@ impl KeeperLink {
         build: String,
         marker: Option<MarkerRef>,
         booted: Option<KeeperClient>,
+        journal: bool,
     ) -> io::Result<Self> {
         let (tx, rx) = mpsc::sync_channel(LINK_QUEUE);
+        let peer = LinkPeer {
+            path,
+            identity,
+            build,
+            marker,
+            journal,
+        };
         let thread = std::thread::Builder::new()
             .name("aterm-keeper-link".to_string())
-            .spawn(move || link_worker(&path, &identity, &build, marker.as_ref(), &rx, booted))?;
+            .spawn(move || link_worker(&peer, &rx, booted))?;
         Ok(Self {
             tx,
             thread: Some(thread),
@@ -376,7 +532,7 @@ impl KeeperLink {
         build: String,
         booted: Option<KeeperClient>,
     ) -> io::Result<Self> {
-        Self::start_marked(path, identity, build, None, booted)
+        Self::start_marked(path, identity, build, None, booted, false)
     }
 
     /// Queue `op`; `false` when the queue is full or the worker is gone (the
@@ -409,7 +565,32 @@ impl KeeperLink {
     }
 }
 
-type Held = std::collections::BTreeMap<u64, (OwnedFd, MasterHeader, Vec<u8>)>;
+/// What the link keeps of a master it registered, by rdev: the duplicate a restarted keeper is
+/// registered with again, and where the master's journal stands.
+#[derive(Debug)]
+struct HeldMaster {
+    master: OwnedFd,
+    header: MasterHeader,
+    tag: Vec<u8>,
+    journal: HeldJournal,
+}
+
+/// Where a held master's crash-restore journal stands, as the keeper is told it (and told again
+/// after a reconnect, behind the master's REGISTER).
+#[derive(Debug)]
+enum HeldJournal {
+    /// Nothing said yet: the window's COMPANION or COMPANION_RELEASE is still queued. A
+    /// reconnect says nothing for it, so the keeper's poison window stays open until the window
+    /// itself settles the claim (a premature "no journal" would close the region a recovering
+    /// window was offered, before it had a region of its own).
+    Unsaid,
+    /// The read-only custody descriptor of its region, and the region's length.
+    Region { region: OwnedFd, len: u64 },
+    /// It has no region.
+    Released,
+}
+
+type Held = std::collections::BTreeMap<u64, HeldMaster>;
 
 /// The registered masters whose RELEASE the link could not write, by rdev. A live keeper that
 /// saw only the link drop still holds what the dropped connection claimed, and a reconnect
@@ -421,6 +602,7 @@ type Owed = std::collections::BTreeSet<u64>;
 /// What one queued op sends once connected.
 enum Send {
     Register(u64),
+    Companion(u64),
     Frame(Frame),
 }
 
@@ -429,14 +611,7 @@ enum Send {
 /// keeper is told what this window holds without waiting for its next op (§5.3 step 9).
 pub const LINK_POLL: Duration = Duration::from_millis(500);
 
-fn link_worker(
-    path: &Path,
-    identity: &Identity,
-    build: &str,
-    marker: Option<&MarkerRef>,
-    rx: &Receiver<Queued>,
-    booted: Option<KeeperClient>,
-) {
+fn link_worker(peer: &LinkPeer, rx: &Receiver<Queued>, booted: Option<KeeperClient>) {
     // The duplicates this window still holds for the keeper, by rdev, so a
     // restarted keeper can be told again — and the newest META of each.
     let mut held: Held = std::collections::BTreeMap::new();
@@ -467,7 +642,15 @@ fn link_worker(
                 // A new master at a reused device number: an owed RELEASE of
                 // the old one must not close it.
                 owed.remove(&header.rdev);
-                held.insert(header.rdev, (master, header, tag));
+                held.insert(
+                    header.rdev,
+                    HeldMaster {
+                        master,
+                        header,
+                        tag,
+                        journal: HeldJournal::Unsaid,
+                    },
+                );
                 Some(Send::Register(header.rdev))
             }
             // A master this link never registered may be one the keeper offered on this
@@ -477,6 +660,7 @@ fn link_worker(
             // does not survive its connection, and on any other the keeper refuses it (drained).
             LinkOp::Release { rdev } => {
                 metas.remove(&rdev);
+                // The master's region, if it had one, closes here with it.
                 let registered = held.remove(&rdev).is_some();
                 if registered {
                     must_reach = Some(rdev);
@@ -492,6 +676,21 @@ fn link_worker(
             }
             LinkOp::Pending { pid } => Some(Send::Frame(Frame::Pending { pid })),
             LinkOp::Bye => Some(Send::Frame(Frame::Bye)),
+            // A region rides beside its master only: one for a master this link holds no
+            // registration of is dropped (its descriptor closes here).
+            LinkOp::Companion { rdev, region, len } => {
+                let entry = held.get_mut(&rdev)?;
+                entry.journal = HeldJournal::Region { region, len };
+                peer.journal.then_some(Send::Companion(rdev))
+            }
+            LinkOp::CompanionRelease { rdev } => {
+                let entry = held.get_mut(&rdev)?;
+                entry.journal = HeldJournal::Released;
+                peer.journal.then_some(Send::Frame(Frame::CompanionRelease {
+                    rdev,
+                    kind: COMPANION_JOURNAL,
+                }))
+            }
         });
         // An idle link with nothing held or owed has nothing to tell a keeper.
         if send.is_none() && held.is_empty() && owed.is_empty() {
@@ -503,7 +702,7 @@ fn link_worker(
         let fresh = client.is_none();
         // A caller waiting on this op does not wait out a backoff.
         if fresh && (ack.is_some() || std::time::Instant::now() >= next_try) {
-            client = reconnect(path, identity, build, marker, &held, &metas, &mut owed);
+            client = reconnect(peer, &held, &metas, &mut owed);
             if client.is_some() {
                 backoff = Duration::from_millis(50);
             } else {
@@ -521,14 +720,28 @@ fn link_worker(
             continue;
         };
         let sent = match &send {
-            // A fresh connection already registered everything held.
-            Send::Register(_) if fresh => Ok(()),
+            // A fresh connection already registered everything held, told it every META and
+            // every journal it could take.
+            Send::Register(_) | Send::Companion(_) if fresh => Ok(()),
+            Send::Frame(Frame::Meta { .. } | Frame::CompanionRelease { .. }) if fresh => Ok(()),
             Send::Register(rdev) => match held.get(rdev) {
-                Some((fd, header, tag)) => c.register(fd, *header, tag.clone()),
+                Some(h) => c.register(&h.master, h.header, h.tag.clone()),
                 None => Ok(()),
             },
-            // …and told it every META.
-            Send::Frame(Frame::Meta { .. }) if fresh => Ok(()),
+            // A keeper that does not take companions (an older one) would refuse their kinds
+            // and drop the connection: what is kept is told to the next keeper that does.
+            Send::Companion(_) | Send::Frame(Frame::CompanionRelease { .. })
+                if !c.keeper_journals() =>
+            {
+                Ok(())
+            }
+            Send::Companion(rdev) => match held.get(rdev) {
+                Some(HeldMaster {
+                    journal: HeldJournal::Region { region, len },
+                    ..
+                }) => c.companion(*rdev, region, *len),
+                _ => Ok(()),
+            },
             Send::Frame(frame) => c.send(frame, None),
         };
         if let Some(ack) = ack {
@@ -557,20 +770,28 @@ fn owe(owed: &mut Owed, rdev: Option<u64>) {
 }
 
 fn reconnect(
-    path: &Path,
-    identity: &Identity,
-    build: &str,
-    marker: Option<&MarkerRef>,
+    peer: &LinkPeer,
     held: &Held,
     metas: &std::collections::BTreeMap<u64, Vec<u8>>,
     owed: &mut Owed,
 ) -> Option<KeeperClient> {
-    let c = KeeperClient::connect(path, identity, Duration::from_secs(2)).ok()?;
+    let c = KeeperClient::connect(&peer.path, &peer.identity, Duration::from_secs(2)).ok()?;
     // A link registers; it takes no offers (the boot HELLO does, through the
     // window's admission).
-    c.hello_link(build, marker.cloned()).ok()?;
-    for (fd, header, tag) in held.values() {
-        c.register(fd, *header, tag.clone()).ok()?;
+    c.hello_link(&peer.build, peer.marker.clone(), peer.journal)
+        .ok()?;
+    let journals = peer.journal && c.keeper_journals();
+    for (rdev, h) in held {
+        c.register(&h.master, h.header, h.tag.clone()).ok()?;
+        // Each master's journal right behind its claim, as the window first told it: a
+        // restarted keeper holds no region, and a live one moved the dropped link's to this one.
+        if journals {
+            match &h.journal {
+                HeldJournal::Region { region, len } => c.companion(*rdev, region, *len).ok()?,
+                HeldJournal::Released => c.companion_release(*rdev).ok()?,
+                HeldJournal::Unsaid => {}
+            }
+        }
     }
     for (rdev, meta) in metas {
         c.send(
@@ -602,7 +823,7 @@ mod tests {
     /// `trustd` going silent after the one probe refuses every later check
     /// through the process's gate: the machine's moment, never the code's.
     const TRUSTD_SILENT: &str =
-        "COULD NOT RUN: the process trustd gate was silent — the machine's, not the code's";
+        "the process trustd gate was silent — the machine's, not the code's";
 
     /// Whether `why` is the identity check's words for a gate that refused it
     /// unanswered (`identity::unanswered`).
@@ -636,9 +857,7 @@ mod tests {
     #[test]
     fn a_listener_of_other_code_is_refused_as_not_this_build() {
         use std::os::unix::fs::PermissionsExt as _;
-        if aterm_uds::deadline::trust_service_silent() {
-            return;
-        }
+        crate::require_trust_service();
         let dir = std::env::temp_dir().join(format!("akl-other-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
@@ -674,7 +893,7 @@ mod tests {
         let _ = nc.wait();
         let e = refused.expect_err("nc is not this build's code");
         if trustd_silent(&e.to_string()) {
-            panic!("{TRUSTD_SILENT}: {e}");
+            aterm_spec::host::could_not_run(format_args!("{TRUSTD_SILENT}: {e}"));
         }
         assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
         assert!(refused_identity(&e), "{e}");
@@ -697,9 +916,7 @@ mod tests {
     /// both refused. Control: the same build serving under its designated requirement is accepted.
     #[test]
     fn a_keeper_at_the_uid_floor_is_refused_by_a_window_that_checks_code() {
-        if aterm_uds::deadline::trust_service_silent() {
-            return;
-        }
+        crate::require_trust_service();
         let dir = std::env::temp_dir().join(format!("akl-floor-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
@@ -721,7 +938,7 @@ mod tests {
                 let id = own();
                 // The check's deadline is a hang detector, not a budget.
                 let dial = || KeeperClient::connect(&sock, &id, Duration::from_secs(60));
-                let link = dial()?.hello_link("t", None);
+                let link = dial()?.hello_link("t", None, false);
                 let boot = dial()?.hello_app("t").map(|_| ());
                 Ok::<_, io::Error>((link, boot))
             });
@@ -743,14 +960,16 @@ mod tests {
             if let Err(e) = &joined
                 && silent(e)
             {
-                panic!("{TRUSTD_SILENT}: {name}: {e}");
+                aterm_spec::host::could_not_run(format_args!("{TRUSTD_SILENT}: {name}: {e}"));
             }
             let (link, boot) = joined.expect("the keeper's code is this build's");
             for (what, got) in [("link", link), ("boot", boot)] {
                 if let Err(e) = &got
                     && silent(e)
                 {
-                    panic!("{TRUSTD_SILENT}: {what} HELLO to {name}: {e}");
+                    aterm_spec::host::could_not_run(format_args!(
+                        "{TRUSTD_SILENT}: {what} HELLO to {name}: {e}"
+                    ));
                 }
                 if accepted {
                     got.unwrap_or_else(|e| panic!("{what} HELLO to {name}: {e}"));
@@ -815,6 +1034,95 @@ mod tests {
         });
         link.shutdown();
         drop(second);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The crash-restore plan §5, "K restart": a link that journals tells a restarted keeper each
+    /// master's region again right behind its REGISTER, and a released one as released; a
+    /// master whose region the window has not said yet is told nothing, so its claim stays
+    /// unsettled until the window settles it.
+    #[test]
+    fn a_restarted_keeper_is_told_each_region_again() {
+        let base = std::env::temp_dir();
+        let dir = base.join(format!("akl-journal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sock = dir.join("k.sock");
+        let mut first = serve(&sock);
+        let open = |path: &str, local_id| {
+            let master = std::fs::File::open(path).expect("open");
+            let rdev = master.metadata().expect("stat").rdev();
+            let op = LinkOp::Register {
+                master: OwnedFd::from(master),
+                header: MasterHeader {
+                    rdev,
+                    shell_pid: std::process::id(),
+                    shell_birth: Birth::default(),
+                    local_id,
+                },
+                tag: Vec::new(),
+            };
+            (rdev, op)
+        };
+        let (journaled, journaled_op) = open("/dev/null", 1);
+        let (unsaid, unsaid_op) = open("/dev/zero", 2);
+        let link = KeeperLink::start_marked(
+            sock.clone(),
+            Identity::same_uid(),
+            "t".into(),
+            None,
+            None,
+            true,
+        )
+        .expect("link");
+        assert!(link.enqueue(journaled_op));
+        assert!(link.enqueue(unsaid_op));
+        let len = aterm_uds::shm::PAGE;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a test playing the window makes the region the keeper is sent"
+        )]
+        // SAFETY: this fixture's link and keeper only transfer/hold/query custody, never
+        // reopen, map, write or resize it; `_region` remains inert until it is dropped.
+        let (_region, custody) = unsafe { aterm_uds::shm::Region::create(len) }.expect("a region");
+        assert!(link.enqueue(LinkOp::Companion {
+            rdev: journaled,
+            region: custody,
+            len: len as u64,
+        }));
+        let view = |s: &Server, rdev| s.core().companion_view(rdev);
+        let region_held = |s: &Server| {
+            s.holds(journaled)
+                && view(s, journaled)
+                    .is_some_and(|v| v.offered.is_some() && v.reader_settled == Some(true))
+        };
+        step_until(&mut first, "the first keeper holds the region", region_held);
+        drop(first);
+        let mut second = serve(&sock);
+        // The reconnect registers in rdev order, one frame a turn: wait for both masters.
+        step_until(&mut second, "the restarted keeper holds it again", |s| {
+            region_held(s) && s.holds(unsaid)
+        });
+        assert_eq!(
+            view(&second, unsaid).map(|v| (v.offered, v.reader_settled)),
+            Some((None, Some(false))),
+            "a region not yet said is not told as none"
+        );
+        assert!(link.enqueue(LinkOp::CompanionRelease { rdev: journaled }));
+        let released = |s: &Server| {
+            s.holds(journaled)
+                && view(s, journaled)
+                    .is_some_and(|v| v.offered.is_none() && v.reader_settled == Some(true))
+        };
+        step_until(&mut second, "the release reaches it", released);
+        drop(second);
+        let mut third = serve(&sock);
+        step_until(
+            &mut third,
+            "a third keeper is told it is released",
+            released,
+        );
+        link.shutdown();
+        drop(third);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

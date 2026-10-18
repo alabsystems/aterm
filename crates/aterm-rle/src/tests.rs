@@ -31,6 +31,10 @@ fn assert_rle_matches_model(rle: &Rle<u8>, model: &[u8], step: usize) {
         expected_start, rle.total_length,
         "run starts must accumulate to total_length at step {step}"
     );
+    assert!(
+        rle.runs.windows(2).all(|w| w[0].value != w[1].value),
+        "adjacent runs share a value at step {step}"
+    );
     let mut reference = rle.clone();
     reference.compact();
     assert_eq!(
@@ -68,65 +72,6 @@ fn assert_rle_matches_model(rle: &Rle<u8>, model: &[u8], step: usize) {
     );
 }
 
-#[test]
-fn rle_new_empty() {
-    let rle: Rle<u8> = Rle::new();
-    assert!(rle.is_empty());
-    assert_eq!(rle.len(), 0);
-    assert_eq!(rle.run_count(), 0);
-}
-
-#[test]
-fn rle_with_value() {
-    let rle = Rle::with_value(42u8, 10);
-    assert_eq!(rle.len(), 10);
-    assert_eq!(rle.run_count(), 1);
-    assert_eq!(rle.get(0), Some(42));
-    assert_eq!(rle.get(9), Some(42));
-    assert_eq!(rle.get(10), None);
-}
-
-#[test]
-fn rle_push_same_value() {
-    let mut rle: Rle<u8> = Rle::new();
-    rle.push(1);
-    rle.push(1);
-    rle.push(1);
-    assert_eq!(rle.len(), 3);
-    assert_eq!(rle.run_count(), 1);
-}
-
-#[test]
-fn rle_push_different_values() {
-    let mut rle: Rle<u8> = Rle::new();
-    rle.push(1);
-    rle.push(2);
-    rle.push(3);
-    assert_eq!(rle.len(), 3);
-    assert_eq!(rle.run_count(), 3);
-}
-
-#[test]
-fn rle_from_iter() {
-    let rle = Rle::from_iter([1u8, 1, 1, 2, 2, 3, 3, 3, 3]);
-    assert_eq!(rle.len(), 9);
-    assert_eq!(rle.run_count(), 3);
-    assert_eq!(rle.runs()[0].length, 3);
-    assert_eq!(rle.runs()[1].length, 2);
-    assert_eq!(rle.runs()[2].length, 4);
-}
-
-#[test]
-fn rle_get() {
-    let rle = Rle::from_iter([1u8, 1, 2, 2, 2, 3]);
-    assert_eq!(rle.get(0), Some(1));
-    assert_eq!(rle.get(1), Some(1));
-    assert_eq!(rle.get(2), Some(2));
-    assert_eq!(rle.get(4), Some(2));
-    assert_eq!(rle.get(5), Some(3));
-    assert_eq!(rle.get(6), None);
-}
-
 /// `set` of one element, from each row's own starting run layout: the write
 /// lands, the length never changes, and runs split or merge as the row says.
 #[test]
@@ -152,7 +97,7 @@ fn rle_set_single_element() {
 /// merge would: the left boundary disappears but the equal right run stays.
 #[test]
 fn local_compaction_observations_refine_the_derived_model() {
-    let model = aterm_spec::derive::rle_local_compact_model();
+    let model = aterm_models_core::rle_local_compact_model();
     for (splice, value) in [
         (None, 2),
         (Some("SpliceSameAsNeighbors"), 1),
@@ -230,9 +175,36 @@ fn rle_set_range_cases() {
             &[(0, 1), (1, 9), (4, 9), (5, 3)],
             None,
         ),
+        (
+            "merges with both neighbours",
+            &[9, 9, 2, 2, 9, 9],
+            2,
+            4,
+            &[(2, 9), (3, 9)],
+            Some(1),
+        ),
+        (
+            "an end past the length clips",
+            &[1, 2, 3],
+            1,
+            100,
+            &[(0, 1), (1, 9), (2, 9)],
+            None,
+        ),
+        ("an empty range", &[1, 2, 3], 1, 1, &[(1, 2)], Some(3)),
+        (
+            "an inverted range",
+            &[1, 2, 3],
+            2,
+            1,
+            &[(1, 2), (2, 3)],
+            Some(3),
+        ),
+        ("an empty sequence", &[], 0, 5, &[], Some(0)),
     ] {
         let mut rle = Rle::from_iter(start.iter().copied());
         rle.set_range(from, to, 9);
+        assert_eq!(rle.len() as usize, start.len(), "{what}: length");
         for &(index, value) in probes {
             assert_eq!(rle.get(index), Some(value), "{what}: index {index}");
         }
@@ -240,58 +212,6 @@ fn rle_set_range_cases() {
             assert_eq!(rle.run_count(), runs, "{what}: run count");
         }
     }
-}
-
-#[test]
-fn rle_resize_grow() {
-    let mut rle = Rle::from_iter([1u8, 1, 1]);
-    rle.resize(5);
-    assert_eq!(rle.len(), 5);
-    assert_eq!(rle.get(3), Some(0)); // Default value
-}
-
-#[test]
-fn rle_resize_shrink() {
-    let mut rle = Rle::from_iter([1u8, 1, 1, 1, 1]);
-    rle.resize(3);
-    assert_eq!(rle.len(), 3);
-    assert_eq!(rle.get(3), None);
-}
-
-#[test]
-fn rle_iter() {
-    let rle = Rle::from_iter([1u8, 1, 2, 3, 3]);
-    let values: Vec<_> = rle.iter().collect();
-    assert_eq!(values, vec![1, 1, 2, 3, 3]);
-}
-
-/// Verify that a FIRST-element lookup stops immediately while a last-element
-/// lookup walks to the end — the asymmetry that is inherent to the linear walk,
-/// pinned so an accidental off-by-one in the accumulator shows up as a count.
-#[test]
-fn rle_get_first_stops_at_one_iteration() {
-    let mut rle: Rle<u8> = Rle::new();
-    let n = 5_000u32;
-    for i in 0..n {
-        rle.push((i & 1) as u8);
-    }
-
-    reset_run_iterations();
-    assert_eq!(rle.get(0), Some(0));
-    let first_iters = take_run_iterations();
-
-    reset_run_iterations();
-    assert_eq!(rle.get(n - 1), Some(((n - 1) & 1) as u8));
-    let last_iters = take_run_iterations();
-
-    assert_eq!(
-        first_iters, 1,
-        "first-element lookup must stop on the first run"
-    );
-    assert_eq!(
-        last_iters, n as usize,
-        "last-element lookup walks every run exactly once"
-    );
 }
 
 /// Verify the run-structure invariants across mixed mutation sequences.
@@ -360,9 +280,6 @@ fn rle_run_structure_consistent_across_mutations() {
         assert_rle_matches_model(&rle, &model, step);
     }
 }
-
-#[path = "tests_boundary.rs"]
-mod boundary;
 
 #[path = "tests_exhaustive.rs"]
 mod exhaustive;

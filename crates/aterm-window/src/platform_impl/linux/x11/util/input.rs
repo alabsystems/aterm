@@ -4,9 +4,12 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/util/input.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
+// Modified by the aterm project in 2026; see the repository NOTICE. (XInput 2's requests are
+// aterm-x11's encoders, where upstream used x11rb's.)
+
 use std::{slice, str};
-use x11rb::protocol::xinput::{self, ConnectionExt as _};
-use x11rb::protocol::xkb;
+
+use aterm_x11::proto::xinput;
 
 use super::*;
 
@@ -23,26 +26,17 @@ impl XConnection {
         &self,
         window: xproto::Window,
         device_id: u16,
-        mask: xinput::XIEventMask,
+        mask: u32,
     ) -> Result<VoidCookie<'_>, X11Error> {
-        self.xcb_connection()
-            .xinput_xi_select_events(window, &[xinput::EventMask {
-                deviceid: device_id,
-                mask: vec![mask],
-            }])
-            .map_err(Into::into)
+        self.send_void(xinput::xi_select_events(self.xinput_major(), window, &[
+            xinput::EventMask { deviceid: device_id, mask: vec![mask] },
+        ]))
     }
 
-    pub fn select_xkb_events(
-        &self,
-        device_id: xkb::DeviceSpec,
-        mask: xkb::EventType,
-    ) -> Result<bool, X11Error> {
-        let mask = u16::from(mask) as _;
-        let status =
-            unsafe { (self.xlib.XkbSelectEvents)(self.display, device_id as _, mask, mask) };
+    pub fn select_xkb_events(&self, device_id: c_uint, mask: c_ulong) -> Result<bool, X11Error> {
+        let status = unsafe { (self.xlib.XkbSelectEvents)(self.display, device_id, mask, mask) };
 
-        if status == ffi::True {
+        if status == ffi::TRUE {
             self.flush_requests()?;
             Ok(true)
         } else {
@@ -56,10 +50,7 @@ impl XConnection {
         window: xproto::Window,
         device_id: u16,
     ) -> Result<xinput::XIQueryPointerReply, X11Error> {
-        self.xcb_connection()
-            .xinput_xi_query_pointer(window, device_id)?
-            .reply()
-            .map_err(Into::into)
+        self.request(xinput::xi_query_pointer(self.xinput_major(), window, device_id))
     }
 
     fn lookup_utf8_inner(
@@ -95,7 +86,7 @@ impl XConnection {
         let (_, status, count) =
             self.lookup_utf8_inner(ic, key_event, buffer.as_mut_ptr() as *mut u8, buffer.len());
 
-        let bytes = if status == ffi::XBufferOverflow {
+        let bytes = if status == ffi::X_BUFFER_OVERFLOW {
             vec = Vec::with_capacity(count as usize);
             let (_, _, new_count) =
                 self.lookup_utf8_inner(ic, key_event, vec.as_mut_ptr(), vec.capacity());

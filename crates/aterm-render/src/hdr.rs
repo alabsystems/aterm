@@ -18,8 +18,7 @@
 //!   blend.
 //!
 //! The gate deciding when any of this runs is `aterm-gpu::format_plan` (`hdr_present_plan`),
-//! modelled as `HdrPresentGate` (aterm-spec `derive/models_render.rs`) and enumerated in
-//! aterm-gpu `tests/hdr_gate.rs`.
+//! enumerated in aterm-gpu `tests/hdr_gate.rs`.
 
 /// Upper cap for a sanitized EDR maximum. Real panels report ≤ 16 (Pro Display
 /// XDR); the cap only bounds a corrupt query so the headroom stays finite.

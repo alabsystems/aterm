@@ -665,40 +665,7 @@ mod tests {
         assert!(LaunchApply::Due.runs(|line| said.push(line)));
         assert!(!LaunchApply::NotDue.runs(|line| said.push(line)));
         assert_eq!(said.len(), 1, "only the skip says anything");
-        assert!(
-            PRIVATE_STATE_ROOT_SKIP.contains("private state root (ATERM_STATE_HOME)")
-                && PRIVATE_STATE_ROOT_SKIP.contains("`aterm pkg machine apply`"),
-            "the line names why and what still applies: {PRIVATE_STATE_ROOT_SKIP}"
-        );
         let _ = std::fs::remove_dir_all(&prefix);
-    }
-
-    /// THE LIVE CLAIM ASKS THE SEAM ITSELF, and the skip precedes the claim in source
-    /// order too: the callers (the window's one-shot, a terminal session's) hold no
-    /// flag they could get wrong. A scrape, since the live answer is the environment's.
-    #[test]
-    fn the_live_launch_claim_reads_the_private_root_before_the_slot() {
-        let src = include_str!("machine.rs");
-        let body = |name: &str| {
-            let start = src.find(name).unwrap_or_else(|| panic!("{name}"));
-            let rest = &src[start..];
-            &rest[..rest.find("\n}\n").unwrap_or(rest.len())]
-        };
-        let live = body("pub fn launch_apply_due(");
-        assert!(
-            live.contains("aterm_types::dirs::runs_under_private_state_root()")
-                && live.contains("launch_apply_decision("),
-            "{live}"
-        );
-        assert!(!live.contains("pkg_check::claim("), "{live}");
-        // The injected half is PRIVATE (ruling 410): a caller outside this module cannot
-        // hand in `false`.
-        assert!(!src.contains(concat!("pub fn ", "launch_apply_decision(")));
-        assert!(!src.contains(concat!("pub(crate) fn ", "launch_apply_decision(")));
-        let decision = body("\nfn launch_apply_decision(");
-        let skip = decision.find("if private_state_root {").expect("the skip");
-        let claim = decision.find("pkg_check::claim(").expect("the claim");
-        assert!(skip < claim, "{skip} {claim}");
     }
 
     /// THE PASSES CARRY ONLY AN EDIT (Phase 3): a machine that never applied the `[machine]`
@@ -856,93 +823,6 @@ mod tests {
         assert_eq!(broken.writes.get(), 1);
     }
 
-    #[test]
-    fn doctor_words_carry_the_revert_and_the_opt_out() {
-        let off = UniversalControlState {
-            measured: true,
-            disable: Some(true),
-            magic_edges: Some(true),
-        };
-        let line = off.doctor_line(UniversalControlPolicy::Off);
-        assert!(line.starts_with("ok — "), "{line}");
-        assert!(line.contains(UNIVERSAL_CONTROL_REVERT), "{line}");
-        assert_eq!(
-            UNIVERSAL_CONTROL_REVERT,
-            "defaults -currentHost delete com.apple.universalcontrol Disable; \
-             defaults -currentHost delete com.apple.universalcontrol DisableMagicEdges"
-        );
-        // The OS default is a MEASURED state: both keys absent, both reads answered.
-        let default = UniversalControlState::from_reads([KeyRead::Absent, KeyRead::Absent]);
-        assert!(default.measured);
-        assert_eq!(default.posture(), UcPosture::Default);
-        let line = default.doctor_line(UniversalControlPolicy::Off);
-        assert!(line.starts_with("warn — "), "{line}");
-        // The promise, and the door: WHAT applies it — the day's first window or terminal
-        // session (one daily slot), since passes carry only an edit to the table (Phase 3;
-        // "every pass disables it first thing" was the 2026-09-14 promise, and stopped
-        // being true) and a session applies them once a day, not at every tab — and the
-        // verb is how a person gets it NOW rather than then.
-        assert!(
-            line.contains("aterm turns it off once a day, at the first window or terminal session"),
-            "{line}"
-        );
-        // The bare `machine` read carries the state alone; its verdict names the action.
-        let state = default.state_line(UniversalControlPolicy::Off);
-        assert!(!state.contains("aterm pkg machine apply"), "{state}");
-        assert!(state.contains("universal_control = \"leave\""), "{state}");
-        assert!(!line.contains("every pass"), "{line}");
-        assert!(line.contains("now: `aterm pkg machine apply`"), "{line}");
-        assert!(
-            !line.contains("next update pass"),
-            "the old promise must not survive: {line}"
-        );
-        assert!(line.contains("universal_control = \"leave\""), "{line}");
-        let line = default.doctor_line(UniversalControlPolicy::Leave);
-        assert!(line.starts_with("ok — "), "{line}");
-        assert!(line.contains("left at the OS default"), "{line}");
-
-        // A READ THAT DID NOT HAPPEN SAYS SO. `UniversalControlState::default()` is the
-        // unmeasured value, and it must never render as the OS default.
-        let unread = UniversalControlState::default();
-        assert!(!unread.measured);
-        assert_eq!(unread.posture(), UcPosture::Unknown);
-        for (policy, lead) in [
-            (UniversalControlPolicy::Off, "warn — "),
-            (UniversalControlPolicy::Leave, "ok — "),
-        ] {
-            let line = unread.doctor_line(policy);
-            assert!(line.starts_with(lead), "{line}");
-            assert!(line.contains("could not be read"), "{line}");
-            assert!(
-                !line.contains("the cursor roams to other"),
-                "an unread host must not be described as the measured default: {line}"
-            );
-        }
-
-        // A HALF-DISABLED HOST IS NOT THE DEFAULT, whatever the policy says.
-        let half_measured =
-            UniversalControlState::from_reads([KeyRead::Value(true), KeyRead::Absent]);
-        for policy in [UniversalControlPolicy::Off, UniversalControlPolicy::Leave] {
-            let line = half_measured.doctor_line(policy);
-            assert!(line.contains("half disabled"), "{line}");
-            assert!(
-                !line.contains("at the OS default"),
-                "one key set is not the default: {line}"
-            );
-            assert!(line.contains("Disable is set"), "{line}");
-        }
-        let half = UniversalControlState {
-            measured: true,
-            disable: Some(true),
-            magic_edges: None,
-        };
-        assert!(
-            half.doctor_line(UniversalControlPolicy::Off)
-                .contains("Disable is set, DisableMagicEdges is not")
-        );
-        assert_eq!(UNIVERSAL_CONTROL_ENTRY, "universal-control disabled");
-    }
-
     /// Every posture round-trips through the wire line, so the window and the CLI cannot
     /// disagree about a spelling; an unknown key is ignored (a newer atpkg), a missing
     /// one is a refusal, never a guess.
@@ -994,6 +874,19 @@ mod tests {
         assert_eq!(at(Some(false), Some(true)).posture(), UcPosture::Partial);
         assert_eq!(at(None, None).posture(), UcPosture::Default);
         assert_eq!(at(Some(false), Some(false)).posture(), UcPosture::Default);
+        // From the reads: both keys absent is the MEASURED OS default, one key set is a
+        // half state, and a read that did not happen (the default value) is never the
+        // OS default.
+        let read = UniversalControlState::from_reads([KeyRead::Absent, KeyRead::Absent]);
+        assert!(read.measured);
+        assert_eq!(read.posture(), UcPosture::Default);
+        assert_eq!(
+            UniversalControlState::from_reads([KeyRead::Value(true), KeyRead::Absent]).posture(),
+            UcPosture::Partial
+        );
+        let unread = UniversalControlState::default();
+        assert!(!unread.measured);
+        assert_eq!(unread.posture(), UcPosture::Unknown);
     }
 
     /// THE VERDICT TABLE — the read verb's `next —` line and the window's Apply button

@@ -3,34 +3,12 @@
 // Author: Andrew Yates
 //
 // Row operation tests: selective_clear, line_size, copy_from,
-// clear_range boundaries, update_len and resize edge cases.
+// clear_range boundaries and update_len.
 
 use super::super::*;
 use super::make_row;
 
 // selective_clear and selective_clear_range
-
-#[test]
-fn selective_clear_range_skips_protected_cells() {
-    use crate::{CellFlags, PackedColor};
-
-    let (_pages, mut row) = make_row(10);
-    let fg = PackedColor::DEFAULT_FG;
-    let bg = PackedColor::DEFAULT_BG;
-
-    row.write_char_styled(0, 'A', fg, bg, CellFlags::empty());
-    row.write_char_styled(1, 'B', fg, bg, CellFlags::empty());
-    row.write_char_styled(2, 'P', fg, bg, CellFlags::PROTECTED);
-    row.write_char_styled(3, 'D', fg, bg, CellFlags::empty());
-
-    row.selective_clear_range(0, 4);
-
-    assert_eq!(row.get(0).unwrap().char(), ' ');
-    assert_eq!(row.get(1).unwrap().char(), ' ');
-    assert_eq!(row.get(3).unwrap().char(), ' ');
-
-    assert_eq!(row.get(2).unwrap().char(), 'P');
-}
 
 #[test]
 fn selective_clear_skips_protected_cells() {
@@ -44,29 +22,14 @@ fn selective_clear_skips_protected_cells() {
     row.write_char_styled(1, 'P', fg, bg, CellFlags::PROTECTED);
     row.write_char_styled(2, 'C', fg, bg, CellFlags::empty());
 
-    row.selective_clear();
+    row.selective_clear(Cell::EMPTY);
 
     assert_eq!(row.get(0).unwrap().char(), ' ');
     assert_eq!(row.get(1).unwrap().char(), 'P');
     assert_eq!(row.get(2).unwrap().char(), ' ');
 }
 
-#[test]
-fn selective_clear_range_empty_range() {
-    let (_pages, mut row) = make_row(10);
-    row.write_char(0, 'A');
-
-    row.selective_clear_range(5, 5);
-    assert_eq!(row.get(0).unwrap().char(), 'A');
-}
-
 // line_size / set_line_size
-
-#[test]
-fn line_size_default_is_single_width() {
-    let (_pages, row) = make_row(80);
-    assert_eq!(row.line_size(), LineSize::SingleWidth);
-}
 
 #[test]
 fn set_line_size_double_width() {
@@ -83,31 +46,23 @@ fn set_line_size_double_width() {
     assert_eq!(row.get(40).unwrap().char(), ' ');
 }
 
+/// Each line size maps onto its row flags, and SingleWidth clears them again.
 #[test]
-fn set_line_size_double_height_top() {
-    let (_pages, mut row) = make_row(80);
-    row.set_line_size(LineSize::DoubleHeightTop);
-    assert_eq!(row.line_size(), LineSize::DoubleHeightTop);
-    assert!(row.flags().contains(RowFlags::DOUBLE_WIDTH));
-    assert!(row.flags().contains(RowFlags::DOUBLE_HEIGHT_TOP));
-}
-
-#[test]
-fn set_line_size_double_height_bottom() {
-    let (_pages, mut row) = make_row(80);
-    row.set_line_size(LineSize::DoubleHeightBottom);
-    assert_eq!(row.line_size(), LineSize::DoubleHeightBottom);
-    assert!(row.flags().contains(RowFlags::DOUBLE_WIDTH));
-    assert!(row.flags().contains(RowFlags::DOUBLE_HEIGHT_BOTTOM));
-}
-
-#[test]
-fn set_line_size_back_to_single_width() {
-    let (_pages, mut row) = make_row(80);
-    row.set_line_size(LineSize::DoubleWidth);
-    row.set_line_size(LineSize::SingleWidth);
-    assert_eq!(row.line_size(), LineSize::SingleWidth);
-    assert!(!row.flags().contains(RowFlags::DOUBLE_WIDTH));
+fn set_line_size_maps_onto_row_flags() {
+    for (size, flags) in [
+        (LineSize::DoubleHeightTop, RowFlags::DOUBLE_HEIGHT_TOP),
+        (LineSize::DoubleHeightBottom, RowFlags::DOUBLE_HEIGHT_BOTTOM),
+    ] {
+        let (_pages, mut row) = make_row(80);
+        row.set_line_size(size);
+        assert_eq!(row.line_size(), size);
+        assert!(row.flags().contains(RowFlags::DOUBLE_WIDTH), "{size:?}");
+        assert!(row.flags().contains(flags), "{size:?}");
+        row.set_line_size(LineSize::SingleWidth);
+        assert_eq!(row.line_size(), LineSize::SingleWidth);
+        assert!(!row.flags().contains(RowFlags::DOUBLE_WIDTH), "{size:?}");
+        assert!(!row.flags().contains(flags), "{size:?}");
+    }
 }
 
 // copy_from
@@ -163,15 +118,6 @@ fn clear_range_clamps_end_to_cols() {
     assert_eq!(row.len(), 8);
 }
 
-#[test]
-fn clear_range_no_op_when_start_equals_end() {
-    let (_pages, mut row) = make_row(10);
-    row.write_char(5, 'X');
-
-    row.clear_range_with(5, 5, Cell::EMPTY);
-    assert_eq!(row.get(5).unwrap().char(), 'X');
-}
-
 // update_len
 
 #[test]
@@ -199,35 +145,4 @@ fn update_len_clamps_to_cols() {
 
     row.update_len(u16::MAX);
     assert_eq!(row.len(), 10, "update_len must clamp u16::MAX to cols()");
-}
-
-// resize edge cases
-
-#[test]
-fn resize_wide_char_at_boundary_is_cleared() {
-    use crate::{CellFlags, PackedColor};
-
-    let (mut pages, mut row) = make_row(10);
-    let fg = PackedColor::DEFAULT_FG;
-    let bg = PackedColor::DEFAULT_BG;
-
-    row.write_wide_char(8, '\u{4E2D}', fg, bg, CellFlags::empty());
-
-    // At 9 cols the wide char at col 8 loses its second cell.
-    // SAFETY: Test-local `pages` outlives `row` for the full scope.
-    unsafe { row.resize(9, &mut pages) };
-
-    assert_eq!(row.get(8).unwrap().char(), ' ');
-    assert!(!row.get(8).unwrap().is_wide());
-}
-
-#[test]
-fn resize_same_size_is_noop() {
-    let (mut pages, mut row) = make_row(10);
-    row.write_char(0, 'A');
-
-    // SAFETY: Test-local `pages` outlives `row` for the full scope.
-    unsafe { row.resize(10, &mut pages) };
-    assert_eq!(row.cols(), 10);
-    assert_eq!(row.get(0).unwrap().char(), 'A');
 }

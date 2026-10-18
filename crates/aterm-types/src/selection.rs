@@ -161,97 +161,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_single_width_cell_is_its_own_whole_glyph() {
-        assert_eq!(glyph_cell_span(7, false, false), (7, 7));
-    }
-
-    #[test]
     fn both_halves_of_a_wide_glyph_name_the_same_pair_of_columns() {
+        assert_eq!(glyph_cell_span(7, false, false), (7, 7));
         // Whichever half a selection edge lands on, the widened span is the same
         // — that identity is what makes the highlight and the copy agree.
         assert_eq!(glyph_cell_span(4, true, false), (4, 5));
         assert_eq!(glyph_cell_span(5, false, true), (4, 5));
-    }
-
-    #[test]
-    fn a_glyph_span_never_wraps_past_the_ends_of_the_column_axis() {
         // A continuation at column 0 has no lead behind it, and a lead at the
         // last representable column has no continuation ahead: both stand alone
-        // rather than wrapping to the opposite edge and selecting the far end of
-        // the row.
+        // rather than wrapping to the opposite edge of the row.
         assert_eq!(glyph_cell_span(0, false, true), (0, 0));
         assert_eq!(glyph_cell_span(u16::MAX, true, false), (u16::MAX, u16::MAX));
-    }
-
-    #[test]
-    fn selection_side_ordering() {
-        assert!(SelectionSide::Left < SelectionSide::Right);
-        assert!(SelectionSide::Right > SelectionSide::Left);
-        assert_eq!(
-            SelectionSide::Left.cmp(&SelectionSide::Left),
-            Ordering::Equal
-        );
-        assert_eq!(
-            SelectionSide::Right.cmp(&SelectionSide::Right),
-            Ordering::Equal
-        );
-    }
-
-    #[test]
-    fn linear_contains_single_line() {
-        // Selection on line 5, cols 3..10
-        assert!(selection_contains_linear(5, 5, 5, 3, 5, 10));
-        assert!(selection_contains_linear(5, 3, 5, 3, 5, 10));
-        assert!(selection_contains_linear(5, 10, 5, 3, 5, 10));
-        assert!(!selection_contains_linear(5, 2, 5, 3, 5, 10));
-        assert!(!selection_contains_linear(5, 11, 5, 3, 5, 10));
-    }
-
-    #[test]
-    fn linear_contains_multi_line() {
-        // Selection from (1, 5) to (3, 10)
-        assert!(selection_contains_linear(2, 0, 1, 5, 3, 10)); // middle line, any col
-        assert!(selection_contains_linear(1, 5, 1, 5, 3, 10)); // start boundary
-        assert!(selection_contains_linear(1, 80, 1, 5, 3, 10)); // start line, after start col
-        assert!(selection_contains_linear(3, 0, 1, 5, 3, 10)); // end line, before end col
-        assert!(selection_contains_linear(3, 10, 1, 5, 3, 10)); // end boundary
-        assert!(!selection_contains_linear(0, 5, 1, 5, 3, 10)); // before start line
-        assert!(!selection_contains_linear(4, 0, 1, 5, 3, 10)); // after end line
-        assert!(!selection_contains_linear(1, 4, 1, 5, 3, 10)); // start line, before start col
-        assert!(!selection_contains_linear(3, 11, 1, 5, 3, 10)); // end line, after end col
-    }
-
-    #[test]
-    fn block_contains() {
-        // Block selection from (1, 5) to (3, 10)
-        assert!(selection_contains_block(2, 7, 1, 5, 3, 10));
-        assert!(selection_contains_block(1, 5, 1, 5, 3, 10));
-        assert!(selection_contains_block(3, 10, 1, 5, 3, 10));
-        assert!(!selection_contains_block(2, 4, 1, 5, 3, 10)); // wrong column
-        assert!(!selection_contains_block(2, 11, 1, 5, 3, 10)); // wrong column
-        assert!(!selection_contains_block(0, 7, 1, 5, 3, 10)); // wrong row
-        assert!(!selection_contains_block(4, 7, 1, 5, 3, 10)); // wrong row
-    }
-
-    #[test]
-    fn block_contains_reversed_columns() {
-        // Block where start_col > end_col (user dragged left)
-        assert!(selection_contains_block(2, 5, 1, 10, 3, 5));
-        assert!(selection_contains_block(2, 10, 1, 10, 3, 5));
-        assert!(!selection_contains_block(2, 4, 1, 10, 3, 5));
-        assert!(!selection_contains_block(2, 11, 1, 10, 3, 5));
-    }
-
-    #[test]
-    fn block_contains_reversed_rows_and_columns() {
-        // Block where the user dragged up and left from the initial anchor.
-        assert!(selection_contains_block(2, 7, 3, 10, 1, 5));
-        assert!(selection_contains_block(1, 5, 3, 10, 1, 5));
-        assert!(selection_contains_block(3, 10, 3, 10, 1, 5));
-        assert!(!selection_contains_block(0, 7, 3, 10, 1, 5));
-        assert!(!selection_contains_block(4, 7, 3, 10, 1, 5));
-        assert!(!selection_contains_block(2, 4, 3, 10, 1, 5));
-        assert!(!selection_contains_block(2, 11, 3, 10, 1, 5));
     }
 
     /// Containment against the shapes it names, over every point and both

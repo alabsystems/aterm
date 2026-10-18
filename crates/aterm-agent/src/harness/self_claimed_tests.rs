@@ -17,6 +17,7 @@ fn record(argv: &[&str], env: &[(&str, &str)]) -> Record {
         status: Some("busy".to_string()),
         exit: None,
         cwd: Some("/work".to_string()),
+        draft_empty: None,
     }
 }
 
@@ -282,6 +283,9 @@ fn the_exit_is_decided_from_the_copy_alone() {
         verdict(&copy(Seen::Unreadable("not-json")), false),
         Verdict::Orderly("not-json")
     );
+    // A record never written is no word of an end (AD-3): a crash.
+    assert_eq!(verdict(&copy(Seen::Never), false), Verdict::Crash);
+    assert!(!shows_end(&copy(Seen::Never)), "an agent that goes on");
     assert_eq!(verdict(&standing("busy", None), false), Verdict::Crash);
     assert_eq!(verdict(&standing("upgrading", None), false), Verdict::Crash);
     assert_eq!(
@@ -302,6 +306,116 @@ fn the_exit_is_decided_from_the_copy_alone() {
     );
 }
 
+/// A RECORD NO READ EVER FOUND IS NO REMOVAL (AD-3 of the end-to-end run,
+/// 2026-10-16: a relaunched codex-alab killed before its record writer's
+/// first write was read as an orderly end and left at its shell). [`fold`]
+/// makes a removal only of a record an earlier read of the SAME identity
+/// saw; NEGATIVE CONTROLS: a record read standing and then gone is removed
+/// (orderly), and another identity's read never counts.
+#[test]
+fn a_record_never_written_is_never_read_as_removed() {
+    let copy = |pid: u32, start: &str, seen: Seen| Copy {
+        pid,
+        start: start.to_string(),
+        home: PathBuf::from("/h"),
+        seen,
+        resume: Err("no-record-yet"),
+    };
+    let never = fold(None, copy(4242, "s", Seen::Never));
+    assert_eq!(never.seen, Seen::Never);
+    assert_eq!(verdict(&never, false), Verdict::Crash);
+    let again = fold(Some(&never), copy(4242, "s", Seen::Never));
+    assert_eq!(again.seen, Seen::Never, "two reads that found nothing");
+    // CONTROL: read standing, then gone: the orderly end.
+    let standing = copy(4242, "s", Seen::Present(record(&[], &[])));
+    let gone = fold(Some(&standing), copy(4242, "s", Seen::Never));
+    assert_eq!(gone.seen, Seen::Removed);
+    assert_eq!(gone.resume, Err("no-record"));
+    assert_eq!(verdict(&gone, false), Verdict::Orderly("removed"));
+    let unreadable = copy(4242, "s", Seen::Unreadable("not-json"));
+    assert_eq!(
+        fold(Some(&unreadable), copy(4242, "s", Seen::Never)).seen,
+        Seen::Removed
+    );
+    // CONTROL: another identity's record says nothing of this one's.
+    let other = copy(4242, "t", Seen::Present(record(&[], &[])));
+    assert_eq!(
+        fold(Some(&other), copy(4242, "s", Seen::Never)).seen,
+        Seen::Never
+    );
+}
+
+/// THE LINE A NEVER-WRITTEN RECORD INHERITS ([`inherited`]): the line aterm's
+/// crash rule typed, for the process that runs exactly it. NEGATIVE
+/// CONTROLS: no typed line; a process that resumes another conversation or
+/// none; a line whose launch path or flags the live process did not run.
+#[test]
+fn a_never_written_record_inherits_only_the_line_its_relaunch_typed() {
+    let mut relaunched = live();
+    relaunched.argv = [
+        "codex",
+        "--search",
+        "-m",
+        "gpt-5",
+        "-s",
+        "read-only",
+        "resume",
+        UUID,
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+    let typed = Resume {
+        argv: line("/store/codex-alab/bin/codex", &ROOT)
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        session: UUID.to_string(),
+        codex_home: Some("/Users//u/.codex".to_string()),
+        cwd: Some("/work".to_string()),
+    };
+    let got = inherited(Some(&typed), 4242, &relaunched).expect("its own relaunch's line");
+    assert_eq!(got.argv, typed.argv);
+    assert_eq!(got.session, UUID);
+    let made = copy_of(
+        4242,
+        "s",
+        PathBuf::from("/h"),
+        None,
+        &relaunched,
+        Some(&typed),
+    );
+    assert_eq!(made.seen, Seen::Never);
+    assert_eq!(made.resume.as_ref().map(|r| r.session.as_str()), Ok(UUID));
+    // NEGATIVE CONTROLS.
+    assert_eq!(inherited(None, 4242, &relaunched), Err("no-record-yet"));
+    assert_eq!(
+        copy_of(4242, "s", PathBuf::from("/h"), None, &relaunched, None).resume,
+        Err("no-record-yet")
+    );
+    // A person's fresh `codex` in the tab runs no `resume` of that thread.
+    assert_eq!(
+        inherited(Some(&typed), 4242, &live()),
+        Err("not-the-typed-line")
+    );
+    let mut elsewhere = relaunched.clone();
+    *elsewhere.argv.last_mut().expect("the id") =
+        "0199f2a4-6c1e-7a52-9d3b-000000000000".to_string();
+    assert_eq!(
+        inherited(Some(&typed), 4242, &elsewhere),
+        Err("not-the-typed-line")
+    );
+    let mut flags = relaunched.clone();
+    flags.argv.retain(|a| a != "--search");
+    assert_eq!(inherited(Some(&typed), 4242, &flags), Err("foreign-argv"));
+    let mut path = typed.clone();
+    path.argv[0] = "/elsewhere/codex".to_string();
+    assert_eq!(
+        inherited(Some(&path), 4242, &relaunched),
+        Err("launch-path")
+    );
+}
+
 #[test]
 fn a_witness_is_handled_once() {
     let dir = aterm_tempfile::TempDir::new().expect("dir");
@@ -317,11 +431,11 @@ fn a_witness_is_handled_once() {
 }
 
 #[test]
-fn record_reads_are_bounded_regular_files_and_only_absence_is_removed() {
+fn record_reads_are_bounded_regular_files_and_only_absence_is_never_seen() {
     let dir = aterm_tempfile::TempDir::new().expect("dir");
     let path = record_path(dir.path(), 4242);
     std::fs::create_dir_all(path.parent().expect("parent")).expect("parent");
-    assert_eq!(read_record(&path), Seen::Removed);
+    assert_eq!(read_record(&path), Seen::Never);
     let mut text = r#"{"v":1,"pid":4242}"#.to_string();
     text.extend(std::iter::repeat_n(
         ' ',
@@ -398,23 +512,144 @@ fn the_record_is_read_only_while_its_process_runs() {
         ),
     )
     .expect("the record");
-    let copy = read_copy(pid, &start).expect("read while it runs");
+    let copy = read_copy(pid, &start, None).expect("read while it runs");
     assert!(matches!(copy.seen, Seen::Present(_)), "{copy:?}");
     let resume = copy.resume.as_ref().expect("its own line validates");
     assert_eq!(resume.argv[0], sleep_s);
     assert_eq!(resume.codex_home.as_deref(), Some(home_s.as_ref()));
     assert_eq!(verdict(&copy, false), Verdict::Crash);
     std::fs::write(&path, vec![b' '; RECORD_MAX_BYTES as usize + 1]).expect("oversized record");
-    let unreadable = read_copy(pid, &start).expect("live identity still vouched for");
+    let unreadable = read_copy(pid, &start, None).expect("live identity still vouched for");
     assert_eq!(unreadable.seen, Seen::Unreadable("record-too-large"));
     assert_eq!(unreadable.resume, Err("no-record"));
     std::fs::remove_file(&path).expect("removed");
-    let copy = read_copy(pid, &start).expect("read while it runs");
-    assert_eq!(copy.seen, Seen::Removed);
+    let copy = read_copy(pid, &start, None).expect("read while it runs");
+    assert_eq!(
+        copy.seen,
+        Seen::Never,
+        "one read alone cannot tell a removal"
+    );
+    let copy = fold(Some(&unreadable), copy);
+    assert_eq!(
+        copy.seen,
+        Seen::Removed,
+        "after a read that found it: removed"
+    );
     assert_eq!(verdict(&copy, false), Verdict::Orderly("removed"));
     // NEGATIVE CONTROL: another identity of the same pid reads nothing.
-    assert_eq!(read_copy(pid, "Thu Jan  1 00:00:00 1970"), None);
+    assert_eq!(read_copy(pid, "Thu Jan  1 00:00:00 1970", None), None);
     let _ = child.kill();
     let _ = child.wait();
-    assert_eq!(read_copy(pid, &start), None, "gone: nothing is read");
+    assert_eq!(read_copy(pid, &start, None), None, "gone: nothing is read");
+}
+
+/// THE IDLE POINT IS THE RECORD'S OWN REST ([`idle_point`]): `status:
+/// "idle"` with `draftEmpty: true` and no word of an end. NEGATIVE
+/// CONTROLS: every other status, a draft in the composer, a draft not named
+/// (absent, `null`, or not a boolean — which reads as unknown and never
+/// refuses the record the crash rule decides from), and an idle record that
+/// names its end.
+#[test]
+fn the_idle_point_is_the_records_own_rest() {
+    let parsed = |status: &str, draft: &str, exit: &str| {
+        parse(&format!(
+            r#"{{"v":1,"pid":4242,"status":{status},"draftEmpty":{draft},"exit":{exit}}}"#
+        ))
+        .expect("a v1 record")
+    };
+    assert!(idle_point(&parsed(r#""idle""#, "true", "null")));
+    for (status, draft, exit) in [
+        (r#""busy""#, "true", "null"),
+        (r#""waiting""#, "true", "null"),
+        (r#""upgrading""#, "true", "null"),
+        (r#""exited""#, "true", "null"),
+        ("null", "true", "null"),
+        (r#""idle""#, "false", "null"),
+        (r#""idle""#, "null", "null"),
+        (r#""idle""#, r#""true""#, "null"),
+        (r#""idle""#, "1", "null"),
+        (r#""idle""#, "true", r#""signal:15""#),
+    ] {
+        let record = parsed(status, draft, exit);
+        assert!(!idle_point(&record), "{status} {draft} {exit}: {record:?}");
+    }
+    let absent = parse(r#"{"v":1,"pid":4242,"status":"idle"}"#).expect("a v1 record");
+    assert_eq!(absent.draft_empty, None);
+    assert!(!idle_point(&absent), "no draft named is no idle point");
+}
+
+/// THE IDLE POINT IS READ LIVE, of a real process, from a PLANTED record
+/// ([`read_idle`]): a stand-in process (a signed copy of `sleep`, its
+/// `CODEX_HOME` the test's directory) whose record says `idle` with an empty
+/// draft is at its idle point; the same process is not once its record says
+/// anything else. NEGATIVE CONTROLS: busy, a draft, no draft named, the
+/// record of another pid, a record removed or unreadable, another identity
+/// of the same pid, and the process gone — each reads no idle point.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn the_idle_point_is_read_live_from_the_record_of_a_running_process() {
+    let dir = aterm_tempfile::TempDir::new().expect("dir");
+    let home = std::fs::canonicalize(dir.path()).expect("canonical");
+    // A platform binary's environment is hidden from `KERN_PROCARGS2`: a
+    // copy, signed ad hoc, shows its own.
+    let sleep = home.join("sleep");
+    std::fs::copy("/bin/sleep", &sleep).expect("copy sleep");
+    let signed = aterm_uds::spawnfd::command("codesign")
+        .args(["--force", "--sign", "-"])
+        .arg(&sleep)
+        .output()
+        .expect("codesign");
+    assert!(signed.status.success(), "{signed:?}");
+    let sleep_s = sleep.to_string_lossy().into_owned();
+    let mut child = aterm_uds::spawnfd::command(&sleep)
+        .arg("60")
+        .env("CODEX_HOME", &home)
+        .spawn()
+        .expect("spawn sleep");
+    let pid = child.id();
+    // Its exec has landed once its own argv reads back (a hang detector).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !atpkg::caller_shell::process_args(pid).is_some_and(|a| a.argv.first() == Some(&sleep_s))
+    {
+        assert!(std::time::Instant::now() < deadline, "sleep never ran");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let start = super::super::restart_stamp::kernel_start(pid).expect("its start");
+    let path = record_path(&home, pid);
+    std::fs::create_dir_all(path.parent().expect("dir")).expect("sessions dir");
+    let plant = |pid: u32, status: &str, draft: &str| {
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"v":1,"pid":{pid},"sessionId":"{UUID}","status":"{status}","draftEmpty":{draft},"exit":null}}"#
+            ),
+        )
+        .expect("the record");
+    };
+    plant(pid, "idle", "true");
+    assert!(read_idle(pid, &start), "its own record says it rests");
+    plant(pid, "busy", "true");
+    assert!(!read_idle(pid, &start), "busy");
+    plant(pid, "idle", "false");
+    assert!(!read_idle(pid, &start), "a draft in the composer");
+    plant(pid, "idle", "null");
+    assert!(!read_idle(pid, &start), "no draft named");
+    plant(pid + 1, "idle", "true");
+    assert!(!read_idle(pid, &start), "another pid's record");
+    std::fs::write(&path, "not a record").expect("garbage");
+    assert!(!read_idle(pid, &start), "unreadable");
+    std::fs::remove_file(&path).expect("removed");
+    assert!(!read_idle(pid, &start), "removed");
+    plant(pid, "idle", "true");
+    assert!(
+        !read_idle(pid, "Thu Jan  1 00:00:00 1970"),
+        "another identity of the same pid"
+    );
+    assert!(read_idle(pid, &start), "positive control, again");
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        !read_idle(pid, &start),
+        "gone: a dead identity rests nowhere"
+    );
 }

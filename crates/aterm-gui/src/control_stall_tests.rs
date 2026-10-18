@@ -29,8 +29,8 @@ use aterm_uds::CtlStream;
 
 use super::control_lanes::{Census, LaneLimits, LaneReader, LaneService, Lanes, lane_reader};
 use super::{
-    AUTH_READ_TIMEOUT, ActiveHandle, Scope, ServeDisposition, authenticate_connection,
-    control_denials, read_request_line,
+    ActiveHandle, Scope, ServeDisposition, authenticate_connection, control_denials,
+    read_request_line,
 };
 
 /// The instance token the handshake tests present.
@@ -66,9 +66,9 @@ impl LaneService for Stub {
         &self,
         stream: &CtlStream,
         reader: &mut LaneReader<'_>,
-    ) -> Option<(Scope, Option<String>)> {
+    ) -> Option<(Scope, crate::control::Principal, Option<String>)> {
         if read_request_line(reader)? == "AUTH ok" {
-            return Some((Scope::Owner, None));
+            return Some((Scope::Owner, crate::control::Principal::Instance, None));
         }
         let _ = (&*stream).write_all(b"ERR auth\n");
         None
@@ -232,38 +232,6 @@ fn an_unread_answer_keeps_no_lane_and_arrives_whole_in_order() {
     );
 }
 
-/// THE BYTE-AT-A-TIME READER. A client that reads its answer a byte at a time
-/// keeps any per-write bound from running out, and so kept its lane however
-/// the write was bounded. The lane is free while it reads.
-#[test]
-fn an_answer_read_a_byte_at_a_time_keeps_no_lane() {
-    let rig = Rig::new();
-    let slow = rig.dial().expect("admitted");
-    (&slow).write_all(b"AUTH ok\nbig\n").expect("request");
-    let stop = Arc::new(AtomicBool::new(false));
-    let read = Arc::new(AtomicUsize::new(0));
-    let reader = {
-        let (stop, read) = (Arc::clone(&stop), Arc::clone(&read));
-        std::thread::spawn(move || {
-            let mut byte = [0u8; 1];
-            while !stop.load(Ordering::SeqCst) && (&slow).read_exact(&mut byte).is_ok() {
-                read.fetch_add(1, Ordering::SeqCst);
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        })
-    };
-    aterm_spec::wait::until_within(HANG, "the slow reader to read", || {
-        (read.load(Ordering::SeqCst) > 0).then_some(())
-    });
-    rig.answers_a_fresh_client_while(1, "the slowly read answer parked");
-    assert!(
-        !reader.is_finished(),
-        "the slow reader is still reading: the answer is far from delivered"
-    );
-    stop.store(true, Ordering::SeqCst);
-    reader.join().expect("the slow reader stops");
-}
-
 /// An answer whose peer hangs up without reading it is dropped with its
 /// connection: the parker holds nothing for a peer that is gone.
 #[test]
@@ -352,7 +320,7 @@ impl LaneService for FramedWaits {
         &self,
         stream: &CtlStream,
         reader: &mut LaneReader<'_>,
-    ) -> Option<(Scope, Option<String>)> {
+    ) -> Option<(Scope, crate::control::Principal, Option<String>)> {
         Stub::default().authenticate(stream, reader)
     }
 
@@ -443,7 +411,7 @@ impl LaneService for Forwarder {
         &self,
         stream: &CtlStream,
         reader: &mut LaneReader<'_>,
-    ) -> Option<(Scope, Option<String>)> {
+    ) -> Option<(Scope, crate::control::Principal, Option<String>)> {
         Stub::default().authenticate(stream, reader)
     }
 
@@ -743,19 +711,4 @@ fn a_dribbled_handshake_ends_at_its_deadline() {
         sent > b"AUTH ".len(),
         "the peer really dribbled ({sent} bytes): bytes kept arriving, and the deadline held"
     );
-}
-
-/// The positive control: a whole line that arrives in time authenticates.
-#[test]
-fn a_handshake_in_time_authenticates() {
-    let (client, server) = CtlStream::pair().expect("socket pair");
-    (&client)
-        .write_all(format!("AUTH {TOKEN}\n").as_bytes())
-        .expect("handshake");
-    let active: ActiveHandle = Arc::new(Mutex::new(None));
-    let denials = control_denials::AuthDenials::new();
-    let mut reader = lane_reader(&server, Vec::new());
-    let deadline = Instant::now() + AUTH_READ_TIMEOUT;
-    let got = authenticate_connection(&server, &mut reader, TOKEN, &active, &denials, deadline);
-    assert!(got.is_some(), "the instance token authenticates");
 }

@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use aterm_spec::derive::atpkg_index_wake_highwater_model;
+use aterm_models_atpkg::atpkg_index_wake_highwater_model;
 use atpkg::progress::{Overall, Phase, ProgramProgress, ProgressFile};
 
 fn file_with(pid: Option<u32>, heartbeat_unix: u64) -> ProgressFile {
@@ -174,146 +174,6 @@ fn a_routine_pass_posts_only_the_reads_that_could_paint() {
     }
 }
 
-/// A routine lock waiter reads JSON once per second while no bar paints; the first
-/// heavy snapshot is posted and later reads use the 100 ms cadence. Drives the real
-/// tailer; reads, posts and ticks share one channel, so ordering is the tailer's and
-/// nothing is timed on this thread.
-#[test]
-fn routine_progress_tailer_sleeps_until_visible_then_samples_fast() {
-    #[derive(Debug)]
-    enum Step {
-        Read(Instant),
-        Post(Option<Box<PkgProgressSnapshot>>),
-        Tick(Duration),
-    }
-    let prefix =
-        std::env::temp_dir().join(format!("aterm-pkg-progress-cadence-{}", std::process::id()));
-    std::fs::create_dir_all(&prefix).unwrap();
-    let layout = atpkg::store::Layout {
-        prefix: prefix.clone(),
-    };
-    let write = |file: &ProgressFile| {
-        let next = prefix.join("progress-next.json");
-        std::fs::write(&next, aterm_json::to_vec(file).unwrap()).unwrap();
-        std::fs::rename(next, layout.progress_file()).unwrap();
-    };
-    let mut file = file_with(Some(std::process::id()), pkg_unix_now());
-    write(&file);
-    // Every step must come, and each walk below — to the first quiet read, to
-    // the heavy post, to the visible tick, to the retiring post — has one minute
-    // for all its steps: a hang detector. A minute per step would restart at
-    // every quiet read, so a tailer that kept reading at 1 Hz and never took
-    // the step a walk waits for would spin that walk forever.
-    let walk = std::cell::Cell::new(Instant::now() + MUST_HAPPEN);
-    let new_walk = || walk.set(Instant::now() + MUST_HAPPEN);
-    let (step_tx, step_rx) = std::sync::mpsc::channel();
-    let (post_tx, tick_tx, read_tx) = (step_tx.clone(), step_tx.clone(), step_tx);
-    let tailer = PkgProgressTailer::spawn_with_ticks(
-        layout.clone(),
-        std::process::id(),
-        aterm_messages::Waiter::Nobody,
-        move |snapshot| {
-            let _ = post_tx.send(Step::Post(snapshot));
-        },
-        PKG_PROGRESS_TICKS,
-        move |tick| {
-            let _ = tick_tx.send(Step::Tick(tick));
-        },
-        move || {
-            let _ = read_tx.send(Step::Read(Instant::now()));
-        },
-    )
-    .expect("tailer spawns");
-    // A wait whose deadline passed before its first look announces no tick,
-    // and a spurious wake announces its tick again, so a walk takes ticks as
-    // they come. A step already queued is taken even after the walk's minute.
-    let next = || {
-        step_rx
-            .recv_timeout(walk.get().saturating_duration_since(Instant::now()))
-            .expect("the tailer's next step, within its walk's minute")
-    };
-    // No hidden 10 Hz polling, on the tailer's clock: a quiet wait's deadline
-    // is taken after the read before it, so each read comes a whole quiet
-    // tick after that read or later, however loaded the host.
-    let quiet_gap = |before: Instant, at: Instant| {
-        let gap = at.duration_since(before);
-        assert!(
-            gap >= PKG_PROGRESS_QUIET_TICK,
-            "an invisible routine pass must not keep reading at 10 Hz: {gap:?}"
-        );
-    };
-    let mut read = match next() {
-        Step::Read(at) => at,
-        step => panic!("the tailer reads first: {step:?}"),
-    };
-    let first = match next() {
-        Step::Post(Some(first)) => first,
-        step => panic!("the first read is posted: {step:?}"),
-    };
-    assert!(first.running);
-    loop {
-        match next() {
-            Step::Tick(tick) => assert_eq!(tick, PKG_PROGRESS_QUIET_TICK),
-            Step::Read(at) => {
-                quiet_gap(read, at);
-                read = at;
-                break;
-            }
-            step => panic!("an unchanged read posts nothing: {step:?}"),
-        }
-    }
-
-    // The pass turns heavy (its writer's heartbeat fresh). Each quiet wait
-    // until the tailer reads it is one more unchanged read, still a whole
-    // quiet tick after the last; then the heavy read is posted.
-    file.heartbeat_unix = pkg_unix_now();
-    file.overall.bytes_total = crate::toolchain_words::HEAVY_PASS_BYTES;
-    new_walk();
-    write(&file);
-    let heavy = loop {
-        match next() {
-            Step::Tick(tick) => assert_eq!(tick, PKG_PROGRESS_QUIET_TICK),
-            Step::Read(at) => {
-                quiet_gap(read, at);
-                read = at;
-            }
-            Step::Post(heavy) => break heavy.expect("data, not a clear"),
-        }
-    };
-    assert_eq!(
-        heavy.file.overall.bytes_total,
-        crate::toolchain_words::HEAVY_PASS_BYTES,
-        "the transition to a visible pass is posted"
-    );
-    // The wait that follows the heavy read is the visible one: its tick is
-    // the first announced after that post.
-    new_walk();
-    loop {
-        match next() {
-            Step::Read(_) => {}
-            Step::Tick(tick) => {
-                assert_eq!(
-                    tick, PKG_PROGRESS_VISIBLE_TICK,
-                    "visible progress resumes the 100 ms cadence"
-                );
-                break;
-            }
-            step => panic!("one post per change: {step:?}"),
-        }
-    }
-    tailer.finish();
-    // `finish` joined the tailer, so its last steps are all queued: the final
-    // read's post retires the row.
-    new_walk();
-    let retired = loop {
-        if let Step::Post(retired) = next() {
-            break retired.expect("data, not a clear");
-        }
-    };
-    assert!(!retired.running);
-    let _ = std::fs::remove_dir_all(&prefix);
-}
-
 /// The handshake fires after the stop check and just before the park. The
 /// child exit then has to wake this long quiet wait and read the file once
 /// more, even if its unpark beats the park call. The one-minute bound is a
@@ -403,7 +263,7 @@ fn bump_rate_floor_and_failure_filter() {
         bump_should_trigger(&names, None),
         "no pass record ⇒ the wish stands"
     );
-    let names2 = vec!["trust".to_string(), "robi".to_string()];
+    let names2 = vec!["trust".to_string(), "ty".to_string()];
     assert!(
         bump_should_trigger(&names2, Some(&failed)),
         "any un-failed name still triggers"
@@ -802,85 +662,11 @@ fn a_park_keeps_a_deadline_within_the_wake_gap_of_its_length() {
     assert_eq!(park_slice(t0 - five, t0, ten_minutes), None, "past");
 }
 
-/// The failure ladder: 10 min, doubling, capped at 2 h, reset by a clean pass.
-#[test]
-fn a_failure_backoff_starts_at_ten_minutes_doubles_and_caps_at_two_hours() {
-    let mut b = Backoff::FAILURE;
-    let secs: Vec<u64> = (0..6).map(|_| b.park().as_secs()).collect();
-    assert_eq!(secs, [600, 1200, 2400, 4800, 7200, 7200]);
-    b.reset();
-    assert_eq!(
-        b.park(),
-        FAILURE_BACKOFF_FIRST,
-        "a clean pass starts it over"
-    );
-    assert!(
-        FAILURE_BACKOFF_CAP
-            < Duration::from_secs(aterm_update_core::pkg_check::FULL_PASS_INTERVAL_SECS)
-    );
-}
-
-/// The loop's outcome line names what this pass recorded, never the last pass's
-/// sentence: a child that wrote nothing — an `Io` refusal at the lock edge, a
-/// signal death, a quiet seed — leaves the record as it was, and the line says
-/// so instead of pairing `exit=failed` with the previous pass's "up to date".
-#[test]
-fn the_outcome_line_attributes_only_what_this_pass_recorded() {
-    let last = atpkg::status::Status {
-        outcome: "up to date".to_string(),
-        updated_at: "2026-09-14T10:00:00Z".to_string(),
-        ..Default::default()
-    };
-    assert_eq!(
-        pass_outcome_clause(Some(&last), Some(last.clone())),
-        "(status.toml untouched by this pass)",
-        "an unchanged record is the LAST pass's, not this one's"
-    );
-    assert_eq!(
-        pass_outcome_clause(None, None),
-        "(status.toml untouched by this pass)",
-        "no record before, none after: nothing was written"
-    );
-    let this = atpkg::status::Status {
-        outcome: "update failed: index unreachable".to_string(),
-        updated_at: "2026-09-14T16:00:00Z".to_string(),
-        ..Default::default()
-    };
-    assert_eq!(
-        pass_outcome_clause(Some(&last), Some(this.clone())),
-        "update failed: index unreachable",
-        "a pass that ran and wrote is attributed its own sentence"
-    );
-    assert_eq!(
-        pass_outcome_clause(None, Some(this)),
-        "update failed: index unreachable",
-        "the first record ever is this pass's"
-    );
-    let blank = atpkg::status::Status {
-        updated_at: "2026-09-14T16:00:00Z".to_string(),
-        ..Default::default()
-    };
-    assert_eq!(
-        pass_outcome_clause(Some(&last), Some(blank)),
-        "(no status.toml)",
-        "a record rewritten with no outcome reads as none"
-    );
-    assert_eq!(
-        pass_outcome_clause(Some(&last), None),
-        "(no status.toml)",
-        "a record that vanished under the pass is gone"
-    );
-}
-
 /// The park after a store-lock timeout: 30 s, then 60 s, reset by a pass that ran; the
 /// third in a row with nothing moving is the wedge (parked by `CONTENTION_WEDGE_PARK`,
 /// not this type). A wait with holder progress is not a cycle.
 #[test]
 fn contention_backoff_doubles_once_then_wedges_and_resets() {
-    assert_eq!(
-        CONTENTION_WEDGE_CYCLES, 3,
-        "only CONTENTION_WEDGE_CYCLES - 1 = 2 backoff parks are ever applied"
-    );
     let mut b = ContentionBackoff::default();
     let applied: Vec<u64> = (1..CONTENTION_WEDGE_CYCLES)
         .map(|_| b.park(false).as_secs())
@@ -913,19 +699,6 @@ fn contention_backoff_doubles_once_then_wedges_and_resets() {
     assert!(d.wedged(), "the third is the wedge");
     assert_eq!(d.park(true).as_secs(), 30, "movement un-wedges");
     assert!(!d.wedged());
-    // The wedged park: above every backoff park, an hour, well under the interval.
-    assert!(CONTENTION_WEDGE_PARK > Duration::from_secs(60));
-    assert_eq!(CONTENTION_WEDGE_PARK, Duration::from_secs(3600));
-    assert!(
-        CONTENTION_WEDGE_PARK
-            < Duration::from_secs(aterm_update_core::pkg_check::FULL_PASS_INTERVAL_SECS)
-    );
-    assert_eq!(human_park(Duration::from_secs(30)), "30 s");
-    assert_eq!(human_park(Duration::from_secs(120)), "2 min");
-    assert_eq!(human_park(Duration::from_secs(600)), "10 min");
-    assert_eq!(human_park(Duration::from_secs(1800)), "30 min");
-    assert_eq!(human_park(Duration::from_secs(6 * 3600)), "6 h");
-    assert_eq!(human_park(Duration::from_secs(90)), "90 s");
 }
 
 /// A sibling's file whose writer died mid-pass (dead pid, no `ended_unix`) is

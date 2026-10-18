@@ -40,6 +40,12 @@ pub(crate) enum Host {
     ErrorStack,
     PerformanceNow,
     DateNow,
+    /// `aterm_host.object_drop`: a JS object's slot released
+    /// (aterm-wasm-abi's `js`).
+    ObjectDrop,
+    /// `aterm_gl.<name>`: one of WebGL2's imports under aterm-gpu's GL arm,
+    /// by its index in [`super::webgl::IMPORTS`].
+    Gl(usize),
 }
 
 impl Host {
@@ -52,15 +58,26 @@ impl Host {
             Host::ErrorStack => ("aterm_host", "error_stack", &[I32], &[]),
             Host::PerformanceNow => ("aterm_host", "performance_now", &[], &[F64]),
             Host::DateNow => ("aterm_host", "date_now", &[], &[F64]),
+            Host::ObjectDrop => ("aterm_host", "object_drop", &[I32], &[]),
+            Host::Gl(i) => {
+                let g = &super::webgl::IMPORTS[i];
+                (super::webgl::MODULE, g.name, g.params, g.results)
+            }
         }
     }
 
-    const ALL: [Host; 4] = [
-        Host::ConsoleError,
-        Host::ErrorStack,
-        Host::PerformanceNow,
-        Host::DateNow,
-    ];
+    /// Every import the glue provides.
+    fn all() -> impl Iterator<Item = Host> {
+        [
+            Host::ConsoleError,
+            Host::ErrorStack,
+            Host::PerformanceNow,
+            Host::DateNow,
+            Host::ObjectDrop,
+        ]
+        .into_iter()
+        .chain((0..super::webgl::IMPORTS.len()).map(Host::Gl))
+    }
 }
 
 /// Everything the glue is written from.
@@ -120,8 +137,11 @@ pub(crate) fn interface(m: &Module<'_>) -> Result<Interface, String> {
                 ));
             }
         }
-        for (name, _) in &record.params {
+        for (name, ty) in &record.params {
             identifier(name)?;
+            if let Ty::JsObject(ts) = ty {
+                identifier(ts)?;
+            }
         }
     }
     if records.is_empty() {
@@ -216,8 +236,7 @@ pub(crate) fn interface(m: &Module<'_>) -> Result<Interface, String> {
 
     let mut imports = Vec::new();
     for i in &m.imports {
-        let host = Host::ALL
-            .into_iter()
+        let host = Host::all()
             .find(|h| {
                 let (module, name, _, _) = h.spec();
                 module == i.module && name == i.name
@@ -225,7 +244,7 @@ pub(crate) fn interface(m: &Module<'_>) -> Result<Interface, String> {
             .ok_or_else(|| {
                 format!(
                     "the module imports `{}.{}`, which the glue does not provide (aterm-wasm-abi's \
-                     host.rs lists what it does)",
+                     host.rs and the glue's webgl.rs list what it does)",
                     i.module, i.name
                 )
             })?;
@@ -415,6 +434,29 @@ const GLUE_NAMES: &[&str] = &[
     "checkThrown",
     "getDataViewMemory0",
     "cachedDataViewMemory0",
+    "heap",
+    "heapFree",
+    "addHeapObject",
+    "getObject",
+    "dropObject",
+    "GLctx",
+    "glContexts",
+    "glContextFree",
+    "glObjects",
+    "glOwners",
+    "glFree",
+    "glCurrent",
+    "glNew",
+    "glGet",
+    "glRelease",
+    "glCString",
+    "glString",
+    "glReadCString",
+    "glView",
+    "glExtensions",
+    "glWriteLog",
+    "glGen",
+    "glDeleteNames",
     "exports",
     "require",
     "module",

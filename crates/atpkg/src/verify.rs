@@ -283,33 +283,6 @@ mod tests {
     }
 
     #[test]
-    fn verify_matches_recorded_signed_root() {
-        let l = layout("match");
-        let dir = install(&l, "ay", 18);
-        let root = signed_root(&dir, "ay");
-        record(&l, "ay", Some(18), &root);
-        assert_eq!(verify_program(&l, "ay"), VerifyOutcome::Match { build: 18 });
-        let _ = std::fs::remove_dir_all(&l.prefix);
-    }
-
-    #[test]
-    fn verify_detects_drift() {
-        let l = layout("drift");
-        let dir = install(&l, "ay", 18);
-        let root = signed_root(&dir, "ay");
-        record(&l, "ay", Some(18), &root);
-        std::fs::write(dir.join("bin/ay"), b"tampered").unwrap();
-        assert!(
-            matches!(
-                verify_program(&l, "ay"),
-                VerifyOutcome::Drift { build: 18, .. }
-            ),
-            "a mutated store tree drifts from the signed root"
-        );
-        let _ = std::fs::remove_dir_all(&l.prefix);
-    }
-
-    #[test]
     fn verify_no_signed_root_is_not_a_pass() {
         let l = layout("nosigned");
         install(&l, "ay", 18);

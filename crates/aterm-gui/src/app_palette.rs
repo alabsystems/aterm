@@ -170,6 +170,94 @@ impl App {
         self.palette_open_state(wid, state);
     }
 
+    /// View ▸ Choose Tab Theme…: the palette's Theme section scoped to the
+    /// front session. Its highlight draws on that session only
+    /// ([`Self::sync_palette_theme_preview`]), no instance preview is started,
+    /// Enter keeps it as the session's own theme and any other close puts the
+    /// session's previous theme back.
+    pub(crate) fn open_tab_theme_palette(&mut self) {
+        let Some(wid) = self.frontmost_window else {
+            return;
+        };
+        let Some(sid) = self.front_terminal(wid).map(|t| t.session) else {
+            return;
+        };
+        // There is one trial owner. Retire its actual window's palette and
+        // restore its prior theme before replacing that custody with this trial.
+        if let Some(previous) = self.palette_tab_theme.as_ref().map(|trial| trial.window) {
+            self.palette_exit_in(previous);
+            self.sync_tab_theme_trial(false, None);
+        }
+        if self.front().and_then(|ws| ws.palette()).is_some() {
+            self.palette_exit();
+        }
+        self.palette_tab_theme = Some(crate::session_theme::TabThemeTrial {
+            window: wid,
+            session: sid,
+            prior: self.pool.theme(sid).cloned(),
+        });
+        // The cursor starts on what the tab draws, not the instance's theme.
+        let drawn = self.resolved_colors_for_session(sid).id;
+        let themes = self
+            .palette_themes()
+            .into_iter()
+            .map(|mut theme| {
+                theme.current = theme.id.eq_ignore_ascii_case(&drawn);
+                theme
+            })
+            .collect();
+        let mut state = PaletteState::new().with_themes(themes);
+        state.resolve(&self.palette_live());
+        self.palette_open_state(wid, state.themes_only());
+    }
+
+    /// View ▸ Clear Tab Theme: the front session draws the instance theme.
+    pub(crate) fn clear_front_tab_theme(&mut self) {
+        let Some(sid) = self
+            .frontmost_window
+            .and_then(|wid| self.front_terminal(wid))
+            .map(|t| t.session)
+        else {
+            return;
+        };
+        if self.pool.theme(sid).is_some() {
+            self.set_session_theme(sid, None);
+        }
+    }
+
+    /// The Tab-scoped palette's turn: a highlight that moved in the trial's
+    /// own window draws its theme on the trial's session only; with that
+    /// window's palette closed the trial ends and the session's prior theme
+    /// comes back. A palette in another window neither keeps the trial alive
+    /// nor drives it.
+    fn sync_tab_theme_trial(&mut self, trial_open: bool, change: Option<Option<String>>) {
+        let Some(trial) = self.palette_tab_theme.clone() else {
+            return;
+        };
+        if !trial_open || self.pool.get(trial.session).is_none() {
+            self.palette_tab_theme = None;
+            if self.pool.get(trial.session).is_some() {
+                self.set_session_theme(trial.session, trial.prior);
+            }
+            return;
+        }
+        match change {
+            Some(Some(id)) if self.theme_preview_unavailable(&id).is_none() => {
+                self.set_session_theme(
+                    trial.session,
+                    Some(crate::session_theme::SessionTheme {
+                        selector: id,
+                        origin: crate::session_theme::SessionThemeOrigin::Ctl,
+                    }),
+                );
+            }
+            // Off the Theme section, or a row the catalog no longer draws:
+            // the tab's own theme as it was.
+            Some(_) => self.set_session_theme(trial.session, trial.prior),
+            None => {}
+        }
+    }
+
     /// Follow every open palette's theme highlight: a highlight that moved onto
     /// a theme previews it ([`PreviewHold::Palette`], no TTL); one that moved off
     /// the Theme section, or onto the configured theme, ends the palette's
@@ -177,9 +265,15 @@ impl App {
     /// (a palette closed by another overlay, or with its window). Run once per
     /// event-loop turn (`about_to_wait`) and at a close, so a run of moves within
     /// one turn costs one install. Edge-triggered on each palette's highlight,
-    /// so a `theme preview` from the control socket is not fought over.
+    /// so a `theme preview` from the control socket is not fought over. The
+    /// palette hosting a Choose Tab Theme… trial feeds that trial only
+    /// ([`Self::sync_tab_theme_trial`]); every other palette drives the
+    /// instance preview.
     pub(crate) fn sync_palette_theme_preview(&mut self) {
         let front = self.frontmost_window;
+        let trial_window = self.palette_tab_theme.as_ref().map(|trial| trial.window);
+        let mut trial_open = false;
+        let mut trial_ask: Option<Option<String>> = None;
         let mut any_open = false;
         let mut ask: Option<Option<String>> = None;
         let mut front_ask: Option<Option<String>> = None;
@@ -187,8 +281,14 @@ impl App {
             let Some(palette) = ws.palette_mut() else {
                 continue;
             };
+            let change = palette.take_theme_highlight_change();
+            if Some(wid) == trial_window {
+                trial_open = true;
+                trial_ask = change;
+                continue;
+            }
             any_open = true;
-            if let Some(change) = palette.take_theme_highlight_change() {
+            if let Some(change) = change {
                 if Some(wid) == front {
                     front_ask = Some(change);
                 } else {
@@ -196,6 +296,7 @@ impl App {
                 }
             }
         }
+        self.sync_tab_theme_trial(trial_open, trial_ask);
         let palette_held =
             |preview: &crate::control_theme::ThemePreview| preview.hold == PreviewHold::Palette;
         if !any_open {
@@ -219,25 +320,46 @@ impl App {
     }
 
     /// The name the configuration draws on the side the OS appearance picks
-    /// now: a plain name, the side of a `dark:…,light:…` pair, or the unset
-    /// default's side. A name the catalog misses is returned as written, so
-    /// choosing what it falls back to still writes.
+    /// now: a plain name, the side of a `dark:…,light:…` pair, or Default
+    /// when it names none. A name the catalog misses is returned as written,
+    /// so choosing what it falls back to still writes.
     fn configured_side_name(&self) -> String {
         crate::app_config::resolve_theme_name_value(
             self.config.theme.as_deref(),
             self.os_appearance,
         )
-        .unwrap_or_else(|| crate::app_config::unset_theme_name(self.os_appearance).to_string())
+        .unwrap_or_else(|| "Default".to_string())
     }
 
     /// Enter on a Theme row: keep `id` on screen while its `theme` write is in
     /// flight ([`PreviewHold::Committing`]), so closing the palette does not
     /// flash the old theme back, then queue exactly one write. The theme the
     /// config already draws on this side writes nothing — a `dark:…,light:…`
-    /// pair or an unset `theme` keeps following the OS — and only ends the
-    /// palette's preview. A write that cannot be queued reverts the preview
-    /// and says why.
+    /// pair keeps following the OS, an unset `theme` stays unset — and only
+    /// ends the palette's preview. A write that cannot be queued reverts the
+    /// preview and says why.
     pub(crate) fn palette_choose_theme(&mut self, id: &str) {
+        // The Tab-scoped palette keeps the row as the session's own theme and
+        // writes nothing. Only the trial's own window's palette settles it
+        // (the activating palette is the front window's); a palette elsewhere
+        // chooses the instance theme as usual.
+        if let Some(trial) = self
+            .palette_tab_theme
+            .take_if(|trial| Some(trial.window) == self.frontmost_window)
+        {
+            if self.pool.get(trial.session).is_none() {
+                return;
+            }
+            let theme = match self.theme_preview_unavailable(id) {
+                None => Some(crate::session_theme::SessionTheme {
+                    selector: id.to_string(),
+                    origin: crate::session_theme::SessionThemeOrigin::Ctl,
+                }),
+                Some(_) => trial.prior,
+            };
+            self.set_session_theme(trial.session, theme);
+            return;
+        }
         if id.eq_ignore_ascii_case(&self.configured_side_name()) {
             self.end_theme_preview_if(|preview| preview.hold == PreviewHold::Palette);
             return;
@@ -358,9 +480,15 @@ impl App {
             }
             hints
         };
+        // Whether the front session draws a theme of its own to clear.
+        let tab_theme = self
+            .frontmost_window
+            .and_then(|wid| self.front_terminal(wid))
+            .is_some_and(|terminal| self.pool.theme(terminal.session).is_some());
         PaletteLive {
             has_selection,
             can_rename,
+            tab_theme,
             rain_on,
             kitty_favourited,
             serious_mode: self.serious_mode_enabled(),
@@ -596,9 +724,15 @@ impl App {
 
     /// Close the command palette on the front window (no-op if already closed).
     pub(crate) fn palette_exit(&mut self) {
-        let wid = self.frontmost_window;
+        if let Some(wid) = self.frontmost_window {
+            self.palette_exit_in(wid);
+        }
+    }
+
+    /// Close a palette by its actual window, without moving front-window custody.
+    fn palette_exit_in(&mut self, wid: crate::WindowId) {
         let mut closed = false;
-        if let Some(ws) = self.front_mut()
+        if let Some(ws) = self.windows.get_mut(&wid)
             && ws.palette().is_some()
         {
             ws.overlay = None;
@@ -612,16 +746,14 @@ impl App {
             closed = true;
         }
         // Publish the now-empty tree (the overlay closed).
-        self.overlay_a11y_update();
+        #[cfg(a11y_tree)]
+        self.push_a11y_tree(wid);
         // Closing reverts what the palette's highlight was previewing (a theme
         // chosen with Enter is held as Committing, which this leaves standing).
         if closed {
             self.end_theme_preview_if(|preview| preview.hold == PreviewHold::Palette);
         }
-        if closed
-            && let Some(wid) = wid
-            && let Some((x, y)) = self.windows.get(&wid).map(|window| window.last_cursor_px)
-        {
+        if closed && let Some((x, y)) = self.windows.get(&wid).map(|window| window.last_cursor_px) {
             // Re-resolve the cursor immediately against the revealed surface. Keyboard
             // close must not leave a stale neutral pointer over editor text until motion.
             self.on_cursor_moved(wid, x, y);
@@ -645,18 +777,12 @@ impl App {
         self.palette_repaint_front();
     }
 
-    /// Append a filter character and re-narrow the list.
+    /// Append a filter character and re-narrow the list: the tests' typing seam. The
+    /// keyboard and the control seam both edit through [`Self::palette_edit`].
+    #[cfg(test)]
     pub(crate) fn palette_filter_push(&mut self, c: char) {
         if let Some(p) = self.front_mut().and_then(|ws| ws.palette_mut()) {
             p.push_char(c);
-        }
-        self.palette_repaint_front();
-    }
-
-    /// Delete the last filter character (Backspace).
-    pub(crate) fn palette_backspace(&mut self) {
-        if let Some(p) = self.front_mut().and_then(|ws| ws.palette_mut()) {
-            p.backspace();
         }
         self.palette_repaint_front();
     }
@@ -741,51 +867,52 @@ impl App {
         self.overlay_a11y_update();
     }
 
+    /// Apply one keyboard edit to the filter ([`PaletteState::edit`]).
+    pub(crate) fn palette_edit(&mut self, edit: crate::app_search::SearchEdit) {
+        if let Some(p) = self.front_mut().and_then(|ws| ws.palette_mut()) {
+            p.edit(edit);
+        }
+        self.palette_repaint_front();
+    }
+
+    /// Carry out one classified keystroke ([`palette_key`]): the physical press and its
+    /// auto-repeat (`LocalRepeatAction::Palette`) both land here.
+    pub(crate) fn apply_palette_key(&mut self, key: PaletteKey) {
+        match key {
+            PaletteKey::Close => self.palette_exit(),
+            PaletteKey::Move(delta) => self.palette_move(delta),
+            PaletteKey::Activate => self.palette_activate(),
+            PaletteKey::Edit(edit) => self.palette_edit(edit),
+            PaletteKey::Inert => {}
+        }
+    }
+
     /// While the palette is open on `wid`, drive it from the keyboard and SWALLOW every key
-    /// (return `true`): printable chars filter, Backspace deletes, Up/Down move, Enter
-    /// activates, Esc closes. Closed ⇒ `false` (keys flow normally).
+    /// (return `true`): typing filters, the field chords edit the filter, Up/Down move,
+    /// Enter activates, Esc closes ([`palette_key`]). Closed ⇒ `false` (keys flow normally).
     pub(crate) fn on_key_palette_mode(
         &mut self,
         wid: crate::WindowId,
+        mods: winit::keyboard::ModifiersState,
         ev: &winit::event::KeyEvent,
     ) -> bool {
-        use winit::keyboard::{Key, NamedKey};
         if self.windows.get(&wid).and_then(|ws| ws.palette()).is_none() {
             return false;
         }
-        match &ev.logical_key {
-            Key::Named(NamedKey::Escape) => self.palette_exit(),
-            Key::Named(NamedKey::ArrowUp) => self.palette_move(-1),
-            Key::Named(NamedKey::ArrowDown) => self.palette_move(1),
-            Key::Named(NamedKey::Enter) => self.palette_activate(),
-            Key::Named(NamedKey::Backspace) => self.palette_backspace(),
-            Key::Named(NamedKey::Space) => self.palette_filter_push(' '),
-            Key::Character(s) => {
-                for c in s.chars().filter(|c| !c.is_control()) {
-                    self.palette_filter_push(c);
-                }
-            }
-            _ => {
-                if let Some(t) = ev.text.as_deref() {
-                    for c in t.chars().filter(|c| !c.is_control()) {
-                        self.palette_filter_push(c);
-                    }
-                }
-            }
-        }
+        self.apply_palette_key(palette_key(mods, ev));
         true
     }
 
     /// The ENGINE-NEUTRAL twin of [`Self::on_key_palette_mode`] — reached by controller
     /// `key`/`text` verbs (introspection CONTROL of the overlay). The caller still
-    /// swallows the event from the PTY.
+    /// swallows the event from the PTY. It classifies through [`palette_input_key`],
+    /// the same table as the physical press, so `aterm ctl key ctrl+w` deletes a word
+    /// as a typed Ctrl+W does (it used to type `w`).
     pub(crate) fn palette_input_event(
         &mut self,
         wid: crate::WindowId,
         ev: &crate::input::InputEvent,
     ) {
-        use crate::input::InputEvent;
-        use aterm_types::keyboard::{Key as TKey, KeyEventType, NamedKey as TNamed};
         if self.windows.get(&wid).and_then(|ws| ws.palette()).is_none() {
             return;
         }
@@ -799,32 +926,132 @@ impl App {
         // pages, and a controller's `key kp5` takes the same road.
         let folded = ev.keypad_folded();
         let ev = folded.as_ref().unwrap_or(ev);
-        match ev {
-            InputEvent::Key {
-                key, event_type, ..
-            } => {
-                if matches!(event_type, KeyEventType::Release) {
-                    return;
-                }
-                match key {
-                    TKey::Named(TNamed::Escape) => self.palette_exit(),
-                    TKey::Named(TNamed::ArrowUp) => self.palette_move(-1),
-                    TKey::Named(TNamed::ArrowDown) => self.palette_move(1),
-                    TKey::Named(TNamed::Enter) => self.palette_activate(),
-                    TKey::Named(TNamed::Backspace) => self.palette_backspace(),
-                    TKey::Named(TNamed::Space) => self.palette_filter_push(' '),
-                    TKey::Character(c) if !c.is_control() => self.palette_filter_push(*c),
-                    _ => {}
-                }
-            }
-            InputEvent::Text(t) | InputEvent::Paste(t, _) => {
-                for c in t.chars().filter(|c| !c.is_control()) {
-                    self.palette_filter_push(c);
-                }
-            }
-            _ => {}
+        if let Some(key) = palette_input_key(ev) {
+            self.apply_palette_key(key);
         }
     }
+}
+
+/// What one physical keystroke does to the open palette. Classified once, so a held
+/// key repeats exactly what its press did (`LocalRepeatAction::Palette` carries it):
+/// a held `^W` keeps deleting words, where it used to repeat as the typed letter `w`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PaletteKey {
+    /// Esc: close (a theme preview reverts).
+    Close,
+    /// Up/Down: move the cursor over the filtered rows.
+    Move(isize),
+    /// Enter: run the selected row.
+    Activate,
+    /// A filter edit, typing included ([`crate::palette::PaletteState::edit`]).
+    Edit(crate::app_search::SearchEdit),
+    /// Swallowed, changing nothing.
+    Inert,
+}
+
+/// Classify a keystroke aimed at the open palette ([`PaletteKey`]).
+///
+/// The filter is a one-line text field, so after the palette's own keys (Esc, ↑/↓,
+/// Enter) it takes aterm's one in-grid field keymap, the find bar's and the inline
+/// rename's (`app_input::field_edit_action`): the readline Ctrl chords, the ⌥/Ctrl
+/// word kills and ⌘⌫ apply to the filter instead of typing their letter (`^E` used to
+/// insert `e`). [`crate::palette::PaletteState::edit`] says which of them change a
+/// caret-less filter.
+///
+/// A Ctrl+letter that keymap leaves unclaimed (`^N`, `^G`, a Ctrl+Shift app chord) is
+/// a command, never text: swallowed, as the find field swallows it
+/// (`App::on_key_search_mode`). Ctrl together with Alt is let through, because on
+/// Windows LeftCtrl+LeftAlt is the alternate spelling of AltGr and composes the
+/// layout's character (de-DE `@`, `{`, `[`).
+///
+/// What remains types its glyph, as the palette always did: a Character key or Space
+/// winit reported with no `text` (the field keymap types `text` only), and any other
+/// printable `text`.
+pub(crate) fn palette_key(
+    mods: winit::keyboard::ModifiersState,
+    ev: &winit::event::KeyEvent,
+) -> PaletteKey {
+    use crate::app_search::SearchEdit;
+    use winit::keyboard::{Key, NamedKey};
+    match &ev.logical_key {
+        Key::Named(NamedKey::Escape) => return PaletteKey::Close,
+        Key::Named(NamedKey::ArrowUp) => return PaletteKey::Move(-1),
+        Key::Named(NamedKey::ArrowDown) => return PaletteKey::Move(1),
+        Key::Named(NamedKey::Enter) => return PaletteKey::Activate,
+        _ => {}
+    }
+    if let Some(edit) = crate::app_input::field_edit_action(mods, ev) {
+        return PaletteKey::Edit(edit);
+    }
+    if mods.control_key() && !mods.alt_key() && matches!(ev.logical_key, Key::Character(_)) {
+        return PaletteKey::Inert;
+    }
+    let glyphs: String = match &ev.logical_key {
+        Key::Named(NamedKey::Space) => " ".to_string(),
+        Key::Character(s) => s.to_string(),
+        _ => ev.text.as_deref().unwrap_or_default().to_string(),
+    };
+    let glyphs: String = glyphs.chars().filter(|c| !c.is_control()).collect();
+    if glyphs.is_empty() {
+        PaletteKey::Inert
+    } else {
+        PaletteKey::Edit(SearchEdit::Insert(glyphs))
+    }
+}
+
+/// [`palette_key`] for an ENGINE-NEUTRAL event ([`App::palette_input_event`]): what a
+/// controller's `key`/`ctrl`/`text`/`paste` verb does to the open palette. `None` for a
+/// key release and for an event that is no keystroke.
+///
+/// The same table in the same order: the palette's own keys, then the field keymap
+/// through its engine projection (`app_input::field_edit_action_engine`), then a Ctrl
+/// chord on a character is swallowed unless Alt composes with it. One rule the physical
+/// press meets before [`palette_key`] is applied here too: a ⌘ chord on a character is a
+/// command, never text (`App::on_key_overlay_mode`'s `overlay_command_chord`). Text and
+/// a paste insert their printable characters, as typing does.
+pub(crate) fn palette_input_key(ev: &crate::input::InputEvent) -> Option<PaletteKey> {
+    use crate::app_search::SearchEdit;
+    use crate::input::InputEvent;
+    use aterm_types::keyboard::{Key as TKey, KeyEventType, Modifiers, NamedKey as TNamed};
+    let (key, mods, layout_text) = match ev {
+        InputEvent::Key {
+            event_type: KeyEventType::Release,
+            ..
+        } => return None,
+        InputEvent::Key {
+            key,
+            mods,
+            layout_text,
+            ..
+        } => (key, *mods, *layout_text),
+        InputEvent::Text(text) | InputEvent::Paste(text, _) => {
+            return Some(PaletteKey::Edit(SearchEdit::Insert(text.clone())));
+        }
+        _ => return None,
+    };
+    match key {
+        TKey::Named(TNamed::Escape) => return Some(PaletteKey::Close),
+        TKey::Named(TNamed::ArrowUp) => return Some(PaletteKey::Move(-1)),
+        TKey::Named(TNamed::ArrowDown) => return Some(PaletteKey::Move(1)),
+        TKey::Named(TNamed::Enter) => return Some(PaletteKey::Activate),
+        _ => {}
+    }
+    if let Some(edit) = crate::app_input::field_edit_action_engine(key, mods, layout_text) {
+        return Some(PaletteKey::Edit(edit));
+    }
+    let command = mods.contains(Modifiers::SUPER)
+        || (mods.contains(Modifiers::CTRL) && !mods.contains(Modifiers::ALT));
+    let glyph = match key {
+        TKey::Character(_) if command => return Some(PaletteKey::Inert),
+        TKey::Character(c) => crate::input::typed_glyph(*c, mods, layout_text),
+        TKey::Named(TNamed::Space) => ' ',
+        _ => return Some(PaletteKey::Inert),
+    };
+    Some(if glyph.is_control() {
+        PaletteKey::Inert
+    } else {
+        PaletteKey::Edit(SearchEdit::Insert(glyph.to_string()))
+    })
 }
 
 #[cfg(test)]
@@ -967,56 +1194,6 @@ mod tests {
         assert!(app.windows.get(&wid).unwrap().palette().is_some(), "opened");
         app.toggle_palette();
         assert!(app.windows.get(&wid).unwrap().palette().is_none(), "closed");
-    }
-
-    /// END TO END through the real `App`: the window's live keybinding table
-    /// reaches the painted card AND the `controls menu` introspection lines,
-    /// which are the same rows a screen reader is handed. Off macOS this is the
-    /// only way to learn a chord without leaving the app.
-    #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn palette_rows_carry_the_live_chord() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        // The harness constructs with an EMPTY table; a real launch installs
-        // `Keybindings::resolved(config)` — install exactly that.
-        app.keybindings = crate::keybinding::Keybindings::resolved(None);
-        let accel_of = |app: &App, label: &str| {
-            app.palette_snapshot(wid)
-                .controls_lines()
-                .into_iter()
-                .find(|line| line.contains(&format!("label={label:?}")))
-                .unwrap_or_else(|| panic!("{label} row"))
-        };
-        assert!(
-            accel_of(&app, "Enter Full Screen").contains(r#"accel="F11""#),
-            "{}",
-            accel_of(&app, "Enter Full Screen"),
-        );
-        assert!(
-            accel_of(&app, "New Terminal Tab").contains(r#"accel="Ctrl+Shift+T""#),
-            "{}",
-            accel_of(&app, "New Terminal Tab"),
-        );
-        // A user rebind is what the running app displays — the thing a static
-        // menu bar's key-equivalents structurally cannot do.
-        let mut table = std::collections::BTreeMap::new();
-        table.insert("ctrl+alt+n".to_string(), "new_window".to_string());
-        app.keybindings = crate::keybinding::Keybindings::resolved(Some(&table));
-        assert!(
-            accel_of(&app, "New Window").contains(r#"accel="Ctrl+Shift+N""#),
-            "the seeded chord still fires it, so it is still the label: {}",
-            accel_of(&app, "New Window"),
-        );
-        let mut table = std::collections::BTreeMap::new();
-        table.insert("ctrl+shift+n".to_string(), "rename_session".to_string());
-        table.insert("ctrl+alt+n".to_string(), "new_window".to_string());
-        app.keybindings = crate::keybinding::Keybindings::resolved(Some(&table));
-        assert!(
-            accel_of(&app, "New Window").contains(r#"accel="Ctrl+Alt+N""#),
-            "with the default rebound away, the user's own chord shows: {}",
-            accel_of(&app, "New Window"),
-        );
     }
 
     /// The join covers the find-again rows too: `find_next`/`find_prev` ship
@@ -1495,8 +1672,18 @@ mod tests {
 
     /// Move the cursor onto the first filtered row whose target is `id`.
     fn highlight(app: &mut App, id: &str) {
+        highlight_in(app, WindowId(0), id);
+    }
+
+    /// [`highlight`] in window `wid`'s palette, with `wid` brought to the
+    /// front (the palette keys act on the front window).
+    fn highlight_in(app: &mut App, wid: WindowId, id: &str) {
+        app.frontmost_window = Some(wid);
+        fn front_palette(app: &App, wid: WindowId) -> &crate::palette::PaletteState {
+            app.windows[&wid].palette().expect("the palette is open")
+        }
         let at = {
-            let palette = front_palette(app);
+            let palette = front_palette(app, wid);
             palette
                 .filtered()
                 .iter()
@@ -1504,7 +1691,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{id} is a row"))
         };
         let selected = {
-            let palette = front_palette(app);
+            let palette = front_palette(app, wid);
             palette
                 .filtered()
                 .iter()
@@ -1608,6 +1795,240 @@ mod tests {
         assert_eq!(durable(&app), durable_before, "and writes nothing");
     }
 
+    /// Spec `session-theme-install`: Choose Tab Theme… draws the highlighted
+    /// theme on the front session only — no instance preview, nothing written
+    /// — Esc puts the tab's previous theme back, and Enter keeps the row as
+    /// the tab's own theme. Clear Tab Theme then hands the tab back to the
+    /// window's theme.
+    #[test]
+    fn choose_tab_theme_draws_on_the_tab_and_esc_or_enter_settle_it() {
+        let mut app = themed_app("theme = \"Dracula\"\n");
+        let instance = app.theme;
+        let durable_before = durable(&app);
+        let bg = |app: &App| {
+            crate::term_lock(&app.pool.get(0).expect("session 0").term).default_background()
+        };
+        let dracula = aterm_types::scheme::builtin("Dracula").unwrap().background;
+        let light = aterm_types::scheme::builtin("Gruvbox Light")
+            .unwrap()
+            .background;
+        assert_eq!(bg(&app), dracula);
+        assert!(!app.palette_live().tab_theme, "nothing to clear yet");
+
+        app.open_tab_theme_palette();
+        highlight(&mut app, "Gruvbox Light");
+        app.sync_palette_theme_preview();
+        assert_eq!(bg(&app), light, "drawn on the tab");
+        assert_eq!(app.theme, instance, "the window's theme is untouched");
+        assert!(app.theme_preview.is_none(), "no instance preview");
+        let esc = crate::input::InputEvent::Key {
+            key: aterm_types::keyboard::Key::Named(aterm_types::keyboard::NamedKey::Escape),
+            mods: aterm_types::keyboard::Modifiers::empty(),
+            base_layout: None,
+            layout_text: None,
+            event_type: aterm_types::keyboard::KeyEventType::Press,
+        };
+        app.palette_input_event(WindowId(0), &esc);
+        app.sync_palette_theme_preview();
+        assert_eq!(bg(&app), dracula, "Esc puts the tab's theme back");
+        assert!(app.pool.theme(0).is_none());
+
+        app.open_tab_theme_palette();
+        highlight(&mut app, "Gruvbox Light");
+        app.sync_palette_theme_preview();
+        app.palette_activate();
+        app.sync_palette_theme_preview();
+        assert_eq!(bg(&app), light, "Enter keeps it");
+        assert_eq!(
+            app.pool.theme(0).map(|t| t.selector.as_str()),
+            Some("Gruvbox Light")
+        );
+        assert!(app.palette_live().tab_theme);
+        assert_eq!(durable(&app), durable_before, "nothing is written");
+
+        app.clear_front_tab_theme();
+        assert_eq!(bg(&app), dracula, "cleared, the window's theme");
+        assert!(app.pool.theme(0).is_none());
+    }
+
+    /// Spec `session-theme-carry`: a layout captured while Choose Tab Theme…
+    /// is open writes the tab's theme from before the trial, not the
+    /// tentative highlight; once Enter keeps the row, the row is written.
+    #[test]
+    fn a_layout_captured_mid_trial_keeps_the_prior_tab_theme() {
+        let mut app = themed_app("theme = \"Dracula\"\n");
+        app.set_session_theme(
+            0,
+            Some(crate::session_theme::SessionTheme {
+                selector: "Hearth".to_string(),
+                origin: crate::session_theme::SessionThemeOrigin::Ctl,
+            }),
+        );
+        let written = |app: &App| {
+            app.capture_restore_manifest()
+                .to_toml()
+                .expect("serializes")
+        };
+        app.open_tab_theme_palette();
+        highlight(&mut app, "Gruvbox Light");
+        app.sync_palette_theme_preview();
+        assert_eq!(
+            app.pool.theme(0).map(|t| t.selector.as_str()),
+            Some("Gruvbox Light"),
+            "PRECONDITION: the highlight draws on the tab"
+        );
+        let mid = written(&app);
+        assert!(mid.contains("theme = \"Hearth\""), "{mid}");
+        assert!(!mid.contains("Gruvbox Light"), "{mid}");
+        // Control: kept with Enter, the row is the tab's theme and is written.
+        app.palette_activate();
+        app.sync_palette_theme_preview();
+        let kept = written(&app);
+        assert!(kept.contains("theme = \"Gruvbox Light\""), "{kept}");
+    }
+
+    /// Spec `session-theme-install`: a Choose Tab Theme… trial belongs to the
+    /// window whose palette opened it. An ordinary palette in another window
+    /// previews and chooses on the instance, never on the trial's tab, and
+    /// Esc in the trial's window reverts the tab although that other palette
+    /// stays open.
+    #[test]
+    fn a_tab_theme_trial_answers_only_to_its_own_window() {
+        let mut app = themed_app("theme = \"Dracula\"\n");
+        let (a, b) = (WindowId(0), WindowId(1));
+        let bg = |app: &App| {
+            crate::term_lock(&app.pool.get(0).expect("session 0").term).default_background()
+        };
+        let light = aterm_types::scheme::builtin("Gruvbox Light")
+            .unwrap()
+            .background;
+        app.install_window_state(b, crate::stub_session(99), 38, 132);
+        app.palette_enter();
+        assert!(
+            app.windows[&b].palette().is_some(),
+            "an ordinary palette in B"
+        );
+
+        app.frontmost_window = Some(a);
+        app.open_tab_theme_palette();
+        highlight_in(&mut app, a, "Gruvbox Light");
+        app.sync_palette_theme_preview();
+        assert_eq!(bg(&app), light, "A's highlight draws on its tab");
+
+        app.frontmost_window = Some(b);
+        filter(&mut app, "nord");
+        highlight_in(&mut app, b, "Nord");
+        app.sync_palette_theme_preview();
+        assert_eq!(bg(&app), light, "B's highlight leaves A's tab alone");
+        assert_eq!(
+            app.theme_preview
+                .as_ref()
+                .map(|preview| preview.id.as_str()),
+            Some("Nord"),
+            "B previews on the instance"
+        );
+        app.palette_activate();
+        app.sync_palette_theme_preview();
+        assert_eq!(
+            app.pool.theme(0).map(|t| t.selector.as_str()),
+            Some("Gruvbox Light"),
+            "Enter in B does not settle A's trial"
+        );
+        assert!(app.palette_tab_theme.is_some(), "A's trial stands");
+        assert!(
+            app.has_live_message("Couldn't save the theme"),
+            "Enter in B tries to write the instance theme (refused headless)"
+        );
+
+        // Reopen an ordinary palette in B, then Esc in A.
+        app.palette_enter();
+        assert!(app.windows[&b].palette().is_some());
+        app.frontmost_window = Some(a);
+        let esc = crate::input::InputEvent::Key {
+            key: aterm_types::keyboard::Key::Named(aterm_types::keyboard::NamedKey::Escape),
+            mods: aterm_types::keyboard::Modifiers::empty(),
+            base_layout: None,
+            layout_text: None,
+            event_type: aterm_types::keyboard::KeyEventType::Press,
+        };
+        app.palette_input_event(a, &esc);
+        app.sync_palette_theme_preview();
+        assert!(app.palette_tab_theme.is_none(), "Esc in A ends its trial");
+        assert!(app.pool.theme(0).is_none(), "and puts the tab's theme back");
+        assert_ne!(bg(&app), light);
+    }
+
+    /// Opening a second Tab-theme trial must retire the first trial rather
+    /// than make its highlight permanent. A theme already kept with Enter is
+    /// not a trial and survives opening the other window's trial.
+    #[test]
+    fn a_second_tab_theme_trial_reverts_the_first_windows_unkept_highlight() {
+        let setup = || {
+            let mut app = themed_app("theme = \"Dracula\"\n");
+            app.install_window_state(WindowId(1), crate::stub_session(99), 38, 132);
+            app.frontmost_window = Some(WindowId(0));
+            app.set_session_theme(
+                0,
+                Some(crate::session_theme::SessionTheme {
+                    selector: "Hearth".into(),
+                    origin: crate::session_theme::SessionThemeOrigin::Ctl,
+                }),
+            );
+            app
+        };
+        // Kept-theme positive control runs before the unkept-trial witness.
+        let mut kept = setup();
+        kept.open_tab_theme_palette();
+        highlight_in(&mut kept, WindowId(0), "Gruvbox Light");
+        kept.sync_palette_theme_preview();
+        kept.palette_activate();
+        kept.sync_palette_theme_preview();
+        assert!(
+            kept.palette_tab_theme.is_none(),
+            "Enter settled the first trial"
+        );
+        kept.frontmost_window = Some(WindowId(1));
+        kept.open_tab_theme_palette();
+        assert_eq!(
+            kept.pool.theme(0).map(|t| t.selector.as_str()),
+            Some("Gruvbox Light")
+        );
+
+        let mut app = setup();
+        let before = durable(&app);
+        app.open_tab_theme_palette();
+        highlight_in(&mut app, WindowId(0), "Gruvbox Light");
+        app.sync_palette_theme_preview();
+        assert_eq!(
+            app.pool.theme(0).map(|t| t.selector.as_str()),
+            Some("Gruvbox Light"),
+            "the first highlight actually draws"
+        );
+        assert_eq!(
+            app.kept_session_theme(0).map(|t| t.selector.as_str()),
+            Some("Hearth"),
+            "the first trial is still tentative"
+        );
+        app.frontmost_window = Some(WindowId(1));
+        app.open_tab_theme_palette();
+        assert_eq!(
+            app.palette_tab_theme.as_ref().map(|t| t.window),
+            Some(WindowId(1)),
+            "the second trial actually opens"
+        );
+        assert!(app.windows[&WindowId(1)].palette().is_some());
+        assert_eq!(durable(&app), before, "the trials write no config");
+        assert_eq!(
+            (
+                app.pool.theme(0).map(|t| t.selector.as_str()),
+                app.kept_session_theme(0).map(|t| t.selector.as_str()),
+                app.windows[&WindowId(0)].palette().is_none()
+            ),
+            (Some("Hearth"), Some("Hearth"), true),
+            "the first trial is reverted and closed, not silently kept",
+        );
+    }
+
     /// A palette closed some other way (another overlay took the slot) reverts
     /// at the next turn's sync; a highlight that leaves the Theme section
     /// reverts at once.
@@ -1621,7 +2042,8 @@ mod tests {
         app.sync_palette_theme_preview();
         assert_ne!(app.theme, before);
         for _ in 0..4 {
-            app.palette_backspace(); // the cursor returns to the first (menu) row
+            // The cursor returns to the first (menu) row.
+            app.palette_edit(crate::app_search::SearchEdit::DeleteBack);
         }
         assert!(
             front_palette(&app)
@@ -1746,5 +2168,420 @@ mod tests {
             Some(crate::keybinding::Action::ChooseTheme)
         );
         assert!(crate::keybinding::ACTION_NAMES.contains(&"choose_theme"));
+    }
+
+    /// A press shaped like the platform's, through the shipping `on_key`. `text` is
+    /// what winit reports, so a Ctrl+letter carries its letter here: the harder case,
+    /// since a filter that typed `text` would type it.
+    fn press_key(
+        app: &mut App,
+        mods: winit::keyboard::ModifiersState,
+        code: winit::keyboard::KeyCode,
+        logical: winit::keyboard::Key,
+        text: Option<&str>,
+        repeat: bool,
+    ) {
+        use winit::event::{ElementState, KeyEvent};
+        use winit::keyboard::{KeyLocation, PhysicalKey, SmolStr};
+        app.windows.get_mut(&WindowId(0)).expect("window").mods = mods;
+        app.on_key(
+            WindowId(0),
+            KeyEvent::synthetic_for_test(
+                PhysicalKey::Code(code),
+                logical,
+                text.map(SmolStr::new),
+                KeyLocation::Standard,
+                ElementState::Pressed,
+                repeat,
+            ),
+        );
+    }
+
+    fn release_key(app: &mut App, code: winit::keyboard::KeyCode) {
+        app.release_physical_press(WindowId(0), winit::keyboard::PhysicalKey::Code(code));
+    }
+
+    /// A Ctrl+letter (`ctrl` = true) or a plain typed letter, pressed and released.
+    fn letter(app: &mut App, ctrl: bool, letter: &str) {
+        use winit::keyboard::{Key, KeyCode, ModifiersState, SmolStr};
+        let mods = if ctrl {
+            ModifiersState::CONTROL
+        } else {
+            ModifiersState::empty()
+        };
+        press_key(
+            app,
+            mods,
+            KeyCode::KeyA,
+            Key::Character(SmolStr::new(letter)),
+            Some(letter),
+            false,
+        );
+        release_key(app, KeyCode::KeyA);
+    }
+
+    fn typed(app: &mut App, text: &str) {
+        for c in text.chars() {
+            letter(app, false, &c.to_string());
+        }
+    }
+
+    fn query(app: &App) -> String {
+        front_palette(app).query().to_string()
+    }
+
+    /// THE PALETTE FILTER HONOURS READLINE EDITING, like the find bar and the inline
+    /// rename (one keymap, `app_input::field_edit_action`). `^E` used to type `e` into
+    /// the filter; now each readline chord edits it or, where a caret-less filter has
+    /// nothing to do (`^A`/`^E`/`^B`/`^F`, `^K` at the end), is swallowed. A Ctrl+letter
+    /// the keymap does not own types nothing either.
+    #[test]
+    fn the_filter_takes_the_readline_chords_instead_of_typing_their_letters() {
+        let mut app = App::headless_for_test();
+        app.palette_enter();
+        typed(&mut app, "new tab");
+        assert_eq!(query(&app), "new tab");
+
+        for motion in ["a", "e", "b", "f", "k", "d"] {
+            letter(&mut app, true, motion);
+            assert_eq!(query(&app), "new tab", "^{motion} types nothing");
+        }
+        letter(&mut app, true, "w");
+        assert_eq!(query(&app), "new ", "^W deletes the word before the caret");
+        letter(&mut app, true, "h");
+        assert_eq!(query(&app), "new", "^H deletes a character");
+        typed(&mut app, " win");
+        letter(&mut app, true, "u");
+        assert_eq!(query(&app), "", "^U clears the filter");
+        // Unclaimed Ctrl chords are commands, never text.
+        typed(&mut app, "ab");
+        for unclaimed in ["n", "p", "g"] {
+            letter(&mut app, true, unclaimed);
+        }
+        assert_eq!(query(&app), "ab", "^N/^P/^G type nothing");
+        assert!(
+            app.windows[&WindowId(0)].palette().is_some(),
+            "and close nothing"
+        );
+    }
+
+    /// Typing, Backspace, the word kills, Up/Down, Enter and Escape keep their
+    /// meaning, and Ctrl WITH Alt still types what it composes (Windows'
+    /// LeftCtrl+LeftAlt spelling of AltGr: de-DE `@`).
+    #[test]
+    fn typing_navigation_and_the_named_keys_still_drive_the_palette() {
+        use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, SmolStr};
+        let mut app = App::headless_for_test();
+        app.palette_enter();
+        typed(&mut app, "copy");
+        press_key(
+            &mut app,
+            ModifiersState::CONTROL | ModifiersState::ALT,
+            KeyCode::KeyQ,
+            Key::Character(SmolStr::new("@")),
+            Some("@"),
+            false,
+        );
+        release_key(&mut app, KeyCode::KeyQ);
+        assert_eq!(query(&app), "copy@", "Ctrl+Alt composes, as AltGr does");
+        let backspace = |app: &mut App, mods| {
+            press_key(
+                app,
+                mods,
+                KeyCode::Backspace,
+                Key::Named(NamedKey::Backspace),
+                Some("\u{8}"),
+                false,
+            );
+            release_key(app, KeyCode::Backspace);
+        };
+        backspace(&mut app, ModifiersState::empty());
+        assert_eq!(query(&app), "copy");
+        typed(&mut app, " sel");
+        backspace(&mut app, ModifiersState::ALT);
+        assert_eq!(query(&app), "copy ", "⌥⌫ deletes a word");
+        backspace(&mut app, ModifiersState::empty());
+        assert_eq!(query(&app), "copy");
+
+        // ←/→ are motions of a caret the filter does not have: they type nothing.
+        let arrow = |app: &mut App, code, key: NamedKey| {
+            press_key(
+                app,
+                ModifiersState::empty(),
+                code,
+                Key::Named(key),
+                None,
+                false,
+            );
+            release_key(app, code);
+        };
+        arrow(&mut app, KeyCode::ArrowLeft, NamedKey::ArrowLeft);
+        assert_eq!(query(&app), "copy");
+
+        let named = |app: &mut App, code, key: NamedKey, text: &str| {
+            press_key(
+                app,
+                ModifiersState::empty(),
+                code,
+                Key::Named(key),
+                Some(text),
+                false,
+            );
+            release_key(app, code);
+        };
+        named(&mut app, KeyCode::Escape, NamedKey::Escape, "\u{1b}");
+        assert!(app.windows[&WindowId(0)].palette().is_none(), "Esc closes");
+
+        // ↓/↑ walk the unfiltered list.
+        app.palette_enter();
+        let selected = |app: &App| front_palette(app).controls_lines()[0].clone();
+        assert!(
+            selected(&app).contains(" selected=0 "),
+            "{}",
+            selected(&app)
+        );
+        arrow(&mut app, KeyCode::ArrowDown, NamedKey::ArrowDown);
+        assert!(
+            selected(&app).contains(" selected=1 "),
+            "↓ {}",
+            selected(&app)
+        );
+        arrow(&mut app, KeyCode::ArrowUp, NamedKey::ArrowUp);
+        assert!(
+            selected(&app).contains(" selected=0 "),
+            "↑ {}",
+            selected(&app)
+        );
+
+        typed(&mut app, "new window");
+        assert!(
+            front_palette(&app).selected_target().is_some(),
+            "an enabled row is selected: {:?}",
+            front_palette(&app).controls_lines()
+        );
+        named(&mut app, KeyCode::Enter, NamedKey::Enter, "\r");
+        assert!(
+            app.windows[&WindowId(0)].palette().is_none(),
+            "Enter runs the row and closes"
+        );
+    }
+
+    /// A held chord repeats what its press did: a held `^W` keeps deleting words. Its
+    /// auto-repeat used to replay the key's letter, so holding `^W` typed `www…`.
+    #[test]
+    fn a_held_readline_chord_repeats_its_edit_not_its_letter() {
+        use winit::keyboard::{Key, KeyCode, ModifiersState, SmolStr};
+        let mut app = App::headless_for_test();
+        app.palette_enter();
+        typed(&mut app, "one two three");
+        let ctrl_w = |app: &mut App, repeat| {
+            press_key(
+                app,
+                ModifiersState::CONTROL,
+                KeyCode::KeyW,
+                Key::Character(SmolStr::new("w")),
+                Some("w"),
+                repeat,
+            );
+        };
+        ctrl_w(&mut app, false);
+        assert_eq!(query(&app), "one two ");
+        ctrl_w(&mut app, true);
+        assert_eq!(query(&app), "one ", "the repeat deleted another word");
+        ctrl_w(&mut app, true);
+        assert_eq!(query(&app), "");
+        release_key(&mut app, KeyCode::KeyW);
+        // A held unclaimed chord neither types on its press nor on its repeats.
+        let ctrl_n = |app: &mut App, repeat| {
+            press_key(
+                app,
+                ModifiersState::CONTROL,
+                KeyCode::KeyN,
+                Key::Character(SmolStr::new("n")),
+                Some("n"),
+                repeat,
+            );
+        };
+        ctrl_n(&mut app, false);
+        ctrl_n(&mut app, true);
+        release_key(&mut app, KeyCode::KeyN);
+        assert_eq!(query(&app), "");
+    }
+
+    /// A DRIVEN PALETTE EDITS ITS FILTER AS A TYPED ONE DOES. Each chord starts from
+    /// the same filter twice: once pressed through the shipping `on_key`, once as the
+    /// exact event `aterm ctl key <chord>` builds (`control_input::parse_key`) through
+    /// `App::input`, the controller's road (`palette_input_event`). Both must leave
+    /// the filter the case names. That road used to ignore modifiers: `ctrl+w` and
+    /// `super+x` typed their letter and `shift+x` typed `x`.
+    #[test]
+    fn a_driven_palette_edits_its_filter_as_a_typed_one_does() {
+        use winit::keyboard::{Key, KeyCode, ModifiersState as M, NamedKey, SmolStr};
+        let ch = |s: &str| Key::Character(SmolStr::new(s));
+        let named = Key::Named;
+        let start = "one two";
+        // (ctl chord, physical mods, code, logical key, winit text, filter after)
+        let cases = [
+            (
+                "ctrl+w",
+                M::CONTROL,
+                KeyCode::KeyW,
+                ch("w"),
+                Some("w"),
+                "one ",
+            ),
+            ("ctrl+u", M::CONTROL, KeyCode::KeyU, ch("u"), Some("u"), ""),
+            (
+                "ctrl+h",
+                M::CONTROL,
+                KeyCode::KeyH,
+                ch("h"),
+                Some("h"),
+                "one tw",
+            ),
+            (
+                "ctrl+e",
+                M::CONTROL,
+                KeyCode::KeyE,
+                ch("e"),
+                Some("e"),
+                start,
+            ),
+            (
+                "ctrl+n",
+                M::CONTROL,
+                KeyCode::KeyN,
+                ch("n"),
+                Some("n"),
+                start,
+            ),
+            (
+                "alt+backspace",
+                M::ALT,
+                KeyCode::Backspace,
+                named(NamedKey::Backspace),
+                Some("\u{8}"),
+                "one ",
+            ),
+            (
+                "backspace",
+                M::empty(),
+                KeyCode::Backspace,
+                named(NamedKey::Backspace),
+                Some("\u{8}"),
+                "one tw",
+            ),
+            (
+                "left",
+                M::empty(),
+                KeyCode::ArrowLeft,
+                named(NamedKey::ArrowLeft),
+                None,
+                start,
+            ),
+            (
+                "space",
+                M::empty(),
+                KeyCode::Space,
+                named(NamedKey::Space),
+                Some(" "),
+                "one two ",
+            ),
+            (
+                "x",
+                M::empty(),
+                KeyCode::KeyX,
+                ch("x"),
+                Some("x"),
+                "one twox",
+            ),
+            (
+                "shift+x",
+                M::SHIFT,
+                KeyCode::KeyX,
+                ch("X"),
+                Some("X"),
+                "one twoX",
+            ),
+            (
+                "super+x",
+                M::SUPER,
+                KeyCode::KeyX,
+                ch("x"),
+                Some("x"),
+                start,
+            ),
+        ];
+        for (chord, mods, code, logical, text, want) in cases {
+            let mut typed_app = App::headless_for_test();
+            typed_app.palette_enter();
+            typed(&mut typed_app, start);
+            press_key(&mut typed_app, mods, code, logical, text, false);
+            release_key(&mut typed_app, code);
+            assert_eq!(query(&typed_app), want, "typed {chord}");
+
+            let mut driven = App::headless_for_test();
+            driven.palette_enter();
+            typed(&mut driven, start);
+            let event = crate::control::parse_key(chord).expect("a ctl key chord");
+            assert_eq!(
+                driven.input(WindowId(0), event, crate::input::Source::Controller),
+                crate::input::InputOutcome::Ok,
+                "the overlay swallows {chord}"
+            );
+            assert_eq!(query(&driven), want, "driven {chord}");
+        }
+    }
+
+    /// The engine projection of the field keymap reads the arms a caret-less filter
+    /// cannot show (the motions, ⌘⌫) as the winit projection does: a sample of each
+    /// arm, and Ctrl+Alt (Windows' AltGr) composing its layout glyph in the palette
+    /// rather than reading as a readline chord.
+    #[test]
+    fn the_engine_key_projection_reads_the_field_keymap() {
+        use crate::app_input::field_edit_action_engine;
+        use crate::app_search::SearchEdit;
+        use aterm_types::keyboard::{Key as TKey, Modifiers, NamedKey as TNamed};
+        let ctrl = Modifiers::CTRL;
+        assert_eq!(
+            field_edit_action_engine(&TKey::Character('a'), ctrl, None),
+            Some(SearchEdit::MoveStart)
+        );
+        assert_eq!(
+            field_edit_action_engine(&TKey::Character('w'), ctrl, None),
+            Some(SearchEdit::DeleteWordBack)
+        );
+        assert_eq!(
+            field_edit_action_engine(&TKey::Named(TNamed::ArrowLeft), Modifiers::ALT, None),
+            Some(SearchEdit::MoveWordLeft)
+        );
+        assert_eq!(
+            field_edit_action_engine(&TKey::Named(TNamed::Backspace), Modifiers::SUPER, None),
+            Some(SearchEdit::KillToStart)
+        );
+        assert_eq!(
+            field_edit_action_engine(&TKey::Named(TNamed::Home), Modifiers::empty(), None),
+            Some(SearchEdit::MoveStart)
+        );
+        assert_eq!(
+            field_edit_action_engine(&TKey::Character('q'), ctrl | Modifiers::ALT, Some('@')),
+            None,
+            "Ctrl+Alt is no readline chord and types nothing through the field arm"
+        );
+        assert_eq!(
+            super::palette_input_key(&crate::input::InputEvent::Key {
+                key: TKey::Character('q'),
+                mods: ctrl | Modifiers::ALT,
+                base_layout: None,
+                layout_text: Some('@'),
+                event_type: aterm_types::keyboard::KeyEventType::Press,
+            }),
+            Some(super::PaletteKey::Edit(SearchEdit::Insert("@".to_string()))),
+            "the palette appends what Ctrl+Alt composes, as a typed AltGr does"
+        );
+        assert_eq!(
+            field_edit_action_engine(&TKey::Character('é'), Modifiers::empty(), None),
+            Some(SearchEdit::Insert("é".to_string()))
+        );
     }
 }

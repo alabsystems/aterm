@@ -235,9 +235,8 @@ pub struct Regex {
     /// Sticky: set the first time any search on this program (or on a clone of
     /// it — the flag is shared, like the program) is cut short. It exists
     /// because the infallible entry points have nowhere else to put the fact,
-    /// and because the call sites that consume a `Regex` through someone else's
-    /// scan loop (`aterm-search`'s streaming engine matches rows in a module
-    /// that never sees a `Result`) still have to be able to notice.
+    /// and because a call site that consumes a `Regex` through someone else's
+    /// scan loop, which never sees a `Result`, still has to be able to notice.
     cut_short: Arc<AtomicBool>,
 }
 

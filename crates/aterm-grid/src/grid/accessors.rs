@@ -12,11 +12,8 @@ use aterm_types::index::Dimensions;
 
 use super::Grid;
 use crate::Damage;
-use crate::StyleTable;
 use crate::extra_collection::CellRenderData;
 use crate::{CellCoord, CellExtra, CellExtras};
-#[cfg(test)]
-use crate::{ExtendedStyle, StyleId};
 
 /// `Dimensions` for `Grid`, so consumers need no foreign impl.
 impl Dimensions for Grid {
@@ -477,27 +474,6 @@ impl Grid {
         self.storage.extras_mut()
     }
 
-    /// Get the style table.
-    #[must_use]
-    #[inline]
-    pub fn styles(&self) -> &StyleTable {
-        self.storage.styles()
-    }
-
-    /// Get mutable access to the style table.
-    #[inline]
-    #[cfg(test)]
-    pub fn styles_mut(&mut self) -> &mut StyleTable {
-        self.storage.styles_mut()
-    }
-
-    /// Intern an extended style, keeping its color types (default/indexed/rgb).
-    #[inline]
-    #[cfg(test)]
-    pub fn intern_extended_style(&mut self, ext_style: ExtendedStyle) -> StyleId {
-        self.storage.styles_mut().intern_extended(ext_style)
-    }
-
     /// Mark that the grid has at least one double-width row (DECDWL/DECDHL),
     /// enabling the per-row `line_size` lookup in `effective_cols_for_row`.
     #[inline]
@@ -538,6 +514,14 @@ impl Grid {
     #[inline]
     pub fn cell_extra_mut(&mut self, row: u16, col: u16) -> &mut CellExtra {
         self.storage.cell_extra_mut(row, col)
+    }
+
+    /// Drop the dense-RGB-ring fg/bg bytes of a `width`-cell span, so a colour a
+    /// caller then stores through `cell_extra_mut` is not shadowed by an older
+    /// ring entry (reads consult the ring first).
+    #[inline]
+    pub fn clear_rgb_ring_cells(&mut self, row: u16, col: u16, width: u16) {
+        self.storage.extras.clear_rgb_ring_cell(row, col, width);
     }
 
     /// Make an inline-image ref a cell's only image (iTerm2 OSC 1337 / sixel,
@@ -1021,37 +1005,6 @@ impl Grid {
             0,
             aterm_scrollback::ScrollbackStorage::image_rows_dropped_by_compression,
         )
-    }
-
-    /// Set the ring byte watermark budget: ring-only grids with an unlimited
-    /// line limit have no other memory signal. With a budget set,
-    /// [`ring_watermark_level`](Self::ring_watermark_level) reports Yellow at
-    /// 80% and Red at 95%. `None` (default) disables it (Green). Advisory only:
-    /// nothing is evicted.
-    pub fn set_ring_byte_watermark(&mut self, budget: Option<usize>) {
-        self.storage.ring_byte_watermark = budget;
-    }
-
-    /// Ring-byte watermark level against the
-    /// [`set_ring_byte_watermark`](Self::set_ring_byte_watermark) budget, from
-    /// [`memory_used`](Self::memory_used) at query time (staged lazy lines
-    /// included, so it rises during a flood). No hysteresis.
-    #[must_use]
-    pub fn ring_watermark_level(&self) -> aterm_scrollback::WatermarkLevel {
-        use aterm_scrollback::WatermarkLevel;
-        let Some(budget) = self.storage.ring_byte_watermark else {
-            return WatermarkLevel::Green;
-        };
-        let used = self.memory_used();
-        // Same 80/95 thresholds as the tiered store's defaults; u128 products
-        // cannot overflow for real byte counts.
-        if used as u128 * 100 >= budget as u128 * 95 {
-            WatermarkLevel::Red
-        } else if used as u128 * 100 >= budget as u128 * 80 {
-            WatermarkLevel::Yellow
-        } else {
-            WatermarkLevel::Green
-        }
     }
 
     // ---- Damage control ----

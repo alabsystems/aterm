@@ -9,7 +9,9 @@
 //! SP-1 and on Trust's std since SP-1 (6eb03c9a18), which differ only in what
 //! a `std` child inherits above stdio, which no comparison here reads.
 
-use super::tests::{STAGE_ENV, park, run_staged, unflagged_at_or_above};
+use super::tests::{
+    STAGE_ENV, STD_SPAWN_MUTE, park, run_staged, translator, unflagged_at_or_above,
+};
 use super::*;
 use std::path::PathBuf;
 
@@ -83,9 +85,13 @@ fn a_transparent_child_holds_every_descriptor_this_process_hands_on_and_nothing_
 
 /// **IT FAILS AS `std` FAILS.** A missing program (by path or by name), one
 /// that may not be run (a directory) and a NUL each give `std`'s
-/// `io::ErrorKind`, and none of them a child.
+/// `io::ErrorKind`, and none of them a child. Under Rosetta `std` answers a
+/// failed `posix_spawn` with a child that exited 127 ([`STD_SPAWN_MUTE`]): such
+/// a row is still none of ours a child, and is said not run, never compared.
 #[test]
 fn a_transparent_spawn_fails_as_std_fails() {
+    let translator = translator();
+    let mut mute = Vec::new();
     for program in [
         "/nonexistent/aterm-transparent",
         "aterm-transparent-no-such-program",
@@ -97,7 +103,20 @@ fn a_transparent_spawn_fails_as_std_fails() {
             .status()
             .map_err(|e| e.kind());
         assert!(ours.is_err(), "{program:?}: {ours:?}");
+        if translator.is_some() && theirs.is_ok_and(|status| status.code() == Some(127)) {
+            mute.push(format!("{program:?}"));
+            continue;
+        }
         assert_eq!(ours, theirs, "{program:?}");
+    }
+    if let Some(translator) = translator
+        && !mute.is_empty()
+    {
+        println!(
+            "NOT RUN under {translator}: spawnfd::transparent_tests::\
+             a_transparent_spawn_fails_as_std_fails: std's error for {}: {STD_SPAWN_MUTE}",
+            mute.join(", ")
+        );
     }
     let mut command = transparent("prog");
     command.arg("a").args(["b", "c"]);

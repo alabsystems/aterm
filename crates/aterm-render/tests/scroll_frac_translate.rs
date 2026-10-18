@@ -5,11 +5,10 @@
 //! `render_input_cached`): at `scroll_frac_px == 0` it is the identity, and for
 //! any `scroll_frac_px` every pixel outside the grid band
 //! `[grid_top_row, grid_bot_row)` is byte-identical to the frac-0 frame. The
-//! geometry's own proofs and `ty` twin are `aterm_render::scroll_translate` and
-//! `grid_translate_model`.
+//! geometry's own lattice proofs are in `aterm_render::scroll_translate`.
 
 use aterm_core::terminal::Terminal;
-use aterm_render::{Renderer, Theme, WindowCpu};
+use aterm_render::{Renderer, Theme};
 
 const ROWS: usize = 8;
 const COLS: usize = 20;
@@ -114,42 +113,5 @@ fn chrome_pixels_are_invariant_under_any_frac() {
     assert!(
         any_down,
         "non-vacuity: a NEGATIVE frac (overscroll bounce) genuinely shifts pixels DOWN"
-    );
-}
-
-#[test]
-fn damage_cached_present_translates_without_perturbing_the_cache() {
-    // The translate shifts the presented frame while the untranslated damage
-    // cache drives the row diff: a frac-0 frame after a fractional one returns
-    // the untranslated pixels.
-    let mut r = Renderer::from_system(16.0, Theme::default())
-        .expect("no font: build with aterm-render's default embedded-font feature");
-    let mut wc = WindowCpu::new();
-    let mut t = seeded_terminal();
-
-    // Frame 1: frac 0 (seeds the cache).
-    let zero_a: Vec<u32> = r
-        .render_input_cached(&mut wc, &frame_with_partition(&mut t, 0))
-        .pixels()
-        .to_vec();
-    // Frame 2: a fractional present (shifts the grid band).
-    let shifted: Vec<u32> = r
-        .render_input_cached(&mut wc, &frame_with_partition(&mut t, 4))
-        .pixels()
-        .to_vec();
-    // Frame 3: back to frac 0, same viewport — must equal frame 1 exactly.
-    let zero_b: Vec<u32> = r
-        .render_input_cached(&mut wc, &frame_with_partition(&mut t, 0))
-        .pixels()
-        .to_vec();
-
-    assert_eq!(
-        zero_a, zero_b,
-        "a frac-0 present after a fractional one returns the pristine untranslated \
-         frame — the damage cache was never perturbed by the translate"
-    );
-    assert_ne!(
-        shifted, zero_a,
-        "non-vacuity: the fractional present genuinely differs from frac 0"
     );
 }

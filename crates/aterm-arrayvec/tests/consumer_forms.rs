@@ -1,8 +1,10 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Every invocation form the five third-party consumers of `arrayvec` write,
-//! reproduced verbatim against this crate.
+//! Every invocation form the four third-party consumers of `arrayvec` write,
+//! reproduced verbatim against this crate. (A fifth, `tiny-skia` 0.11.4 on
+//! Linux, left the graph with sctk-adwaita at linux-windowing LW.5,
+//! 2026-10-17, and its forms with it.)
 //!
 //! # Why this file is the deliverable and not a formality
 //!
@@ -11,8 +13,7 @@
 //! entire SPIR-V writer — where a third of the `ArrayVec` uses live — is
 //! `cfg`'d off; `wgpu-hal` resolves with `metal,portable-atomic`, and the Metal
 //! backend contains no `ArrayVec` at all, so `dx12`, `gles` and `vulkan` are
-//! dark; and `tiny-skia` only enters the graph on Linux, under `sctk-adwaita`.
-//! A macOS `cargo check -p aterm-gui` therefore
+//! dark. A macOS `cargo check -p aterm-gui` therefore
 //! exercises `Hash`, `Extend`, by-value `IntoIterator` and `into_inner` — and
 //! misses `drain`, by-`&`/`&mut` `IntoIterator`, `new_const` and `clone_from`
 //! entirely.
@@ -368,7 +369,7 @@ mod wgpu_core {
     // on the previous line, and it is the only place either shape appears
     // outside `track/texture.rs`: re-derive with
     // `grep -rn 'get_unchecked' <registry>/{naga,wgpu,wgpu-core,wgpu-hal}-29.0.3
-    //  <registry>/tiny-skia-0.11.4 --include='*.rs'`.
+    //  --include='*.rs'`.
     pub fn read_mip(complex: &ComplexTextureState, mip_id: usize) -> u32 {
         // SAFETY: the caller has already bounds-checked `mip_id`, exactly as
         // wgpu-core does one line above its own call
@@ -726,77 +727,6 @@ fn wgpu_hal_forms() {
     assert_eq!(validation_features(true), 1);
     assert_eq!(validation_features(false), 0);
     assert_eq!(queue_families(&[1, 2, 3]), 6);
-}
-
-// ── tiny-skia 0.11.4 (Linux only, via sctk-adwaita ← winit) ─────────────────
-
-mod tiny_skia {
-    use arrayvec::ArrayVec;
-
-    pub const MAX_VERBS: usize = 4;
-    pub const MAX_STAGES: usize = 8;
-
-    #[derive(Clone, Copy, Debug, PartialEq)]
-    pub struct PathEdge(pub u32);
-
-    // tiny-skia-0.11.4/src/edge_clipper.rs:37 — a public `type` alias
-    pub type ClippedEdges = ArrayVec<PathEdge, MAX_VERBS>;
-
-    // tiny-skia-0.11.4/src/edge_clipper.rs:68, :108, :233 — `is_empty()`
-    pub fn any(edges: &ClippedEdges) -> bool {
-        !edges.is_empty()
-    }
-
-    // tiny-skia-0.11.4/src/edge_builder.rs:104 — by-value loop
-    pub fn push_edges(edges: ClippedEdges) -> u32 {
-        let mut total = 0;
-        for edge in edges {
-            total += edge.0;
-        }
-        total
-    }
-
-    // tiny-skia-0.11.4/src/pipeline/mod.rs:394 — `.collect()` into an annotated
-    // local whose capacity is a plain const
-    pub fn functions(stages: &[u32]) -> ArrayVec<u32, MAX_STAGES> {
-        let functions: ArrayVec<_, MAX_STAGES> = stages.iter().map(|s| s * 2).collect();
-        functions
-    }
-
-    // tiny-skia-0.11.4/src/pipeline/mod.rs:407 and :440: `for x in &mut av`,
-    // the only by-`&mut` iteration sites in the graph, writing through every
-    // element: a walk bounded by `N` instead of `len` would store into
-    // uninitialized slots.
-    pub fn patch_tail(tail_functions: &mut ArrayVec<u32, MAX_STAGES>) {
-        for fun in tail_functions {
-            *fun += 1;
-        }
-    }
-
-    // tiny-skia-0.11.4/src/pipeline/mod.rs:379 — `is_empty()`
-    // tiny-skia-0.11.4/src/pipeline/mod.rs:406, :439 — `.clone()`
-    // tiny-skia-0.11.4/src/pipeline/mod.rs:498, :499, :513, :514 — `as_slice()`
-    // tiny-skia-0.11.4/src/pipeline/mod.rs:387, :395, :432 — `.iter()`
-    pub fn run(functions: &ArrayVec<u32, MAX_STAGES>) -> (bool, Vec<u32>, u32) {
-        let mut tail = functions.clone();
-        patch_tail(&mut tail);
-        (
-            functions.is_empty(),
-            tail.as_slice().to_vec(),
-            functions.iter().sum(),
-        )
-    }
-}
-
-#[test]
-fn tiny_skia_forms() {
-    use tiny_skia::*;
-    let edges: ClippedEdges = [PathEdge(1), PathEdge(2)].into_iter().collect();
-    assert!(any(&edges));
-    assert_eq!(push_edges(edges), 3);
-
-    let functions = functions(&[1, 2, 3]);
-    assert_eq!(run(&functions), (false, vec![3, 5, 7], 12));
 }
 
 // ── Deref coercion sites ────────────────────────────────────────────────────

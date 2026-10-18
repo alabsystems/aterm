@@ -409,6 +409,39 @@ impl CtlStream {
         Ok(())
     }
 
+    /// One read that never parks: the `recv` [`io::Read::read`] makes before
+    /// it waits, without the wait. `WouldBlock` when nothing is queued, and
+    /// end-of-file (`Ok(0)`) for a peer's close or write-half close and for a
+    /// local read shutdown, exactly as `read` reports them.
+    ///
+    /// For a liveness probe that must answer at once: the control socket's
+    /// push loop asks one before every pass it writes, and a probe that
+    /// borrowed `read` under a short read timeout made every pushed frame wait
+    /// that timeout out. A Unix caller peeks with `MSG_PEEK | MSG_DONTWAIT`
+    /// instead; this consumes what it reads, so it is for a stream whose next
+    /// byte ends it anyway (a push-only subscription's client sends none).
+    /// There is no per-call flag to borrow here and none is needed: arming
+    /// `WSAEventSelect` already made the socket non-blocking for every clone.
+    ///
+    /// # Errors
+    /// `WouldBlock` for a quiet open peer; the mapped winsock error otherwise.
+    pub fn read_nonblocking(&self, buf: &mut [u8]) -> io::Result<usize> {
+        let inner = &self.0;
+        let len = buf.len().min(i32::MAX as usize) as i32;
+        let n = unsafe { ffi::recv(inner.raw, buf.as_mut_ptr(), len, 0) };
+        if n != ffi::SOCKET_ERROR {
+            return Ok(n as usize);
+        }
+        let err = last_wsa_error();
+        match err.raw_os_error() {
+            // `read` would park here and then report a local shutdown as EOF
+            // (its wait re-checks the flag); answer the same without parking.
+            Some(ffi::WSAEWOULDBLOCK) if inner.recv_shutdown.load(Ordering::Acquire) => Ok(0),
+            Some(ffi::WSAESHUTDOWN) => Ok(0),
+            _ => Err(err),
+        }
+    }
+
     /// Set the read timeout (`None` clears it). Expiry surfaces as
     /// `ErrorKind::WouldBlock`. Shared by all clones and safe to call from any
     /// thread.
@@ -506,7 +539,7 @@ impl io::Write for &CtlStream {
                         deadline,
                     )? {
                         // Locally shut down for writing: `BrokenPipe`, as on
-                        // Unix (the relays' `is_normal_close` accepts it).
+                        // Unix.
                         return Err(io::Error::new(
                             io::ErrorKind::BrokenPipe,
                             "control socket shut down for writing",

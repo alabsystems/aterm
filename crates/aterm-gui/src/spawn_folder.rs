@@ -33,7 +33,10 @@
 
 use std::path::Path;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(unix)]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(unix)]
 use std::time::Duration;
 
 /// Why a shell cannot start in a folder.
@@ -58,14 +61,17 @@ impl Fault {
 /// How long a spawn waits for the folder check. A local folder answers in
 /// microseconds; a hung network mount would hold the thread for its whole
 /// timeout.
+#[cfg(unix)]
 const CHECK_BUDGET: Duration = Duration::from_millis(250);
 
 /// The most checks left waiting on a hung volume at once: past this, a spawn
 /// does not start another and judges its folder as one that did not answer
 /// ([`start_fault`]), so a mount that stopped answering costs a bounded number
 /// of parked threads.
+#[cfg(unix)]
 const CHECKS_IN_FLIGHT_MAX: usize = 4;
 
+#[cfg(unix)]
 static CHECKS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 /// Why a shell cannot start in `dir`, or `None` when it can or when that
@@ -138,16 +144,17 @@ fn within(
     }
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     let owned = dir.to_owned();
-    let spawned = std::thread::Builder::new()
-        .name("aterm-folder-check".to_string())
-        .spawn(move || {
+    let spawned = crate::qos::spawn_lane_thread(
+        "aterm-folder-check".to_string(),
+        crate::qos::Role::Interactive,
+        move || {
             // The spawn that asked waits on this answer, on the event loop or
             // the spawner thread a person watches: rank with it.
-            crate::qos::set_self(crate::qos::Role::Interactive);
             let fault = check(&owned);
             in_flight.fetch_sub(1, Ordering::AcqRel);
             let _ = tx.send(fault);
-        });
+        },
+    );
     if spawned.is_err() {
         in_flight.fetch_sub(1, Ordering::AcqRel);
         return None;

@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# wayland-scan, aterm-wayland's DEV-ONLY GENERATOR (LW.6,
+# docs/AUDIT-third-party-2026-10-15.md, linux-windowing), in ITS OWN
+# WORKSPACE (the empty `[workspace]` below) so it builds while the protocol
+# modules it writes do not: it reads ../protocols/*.xml and writes
+# ../src/protocols/. It depends on nothing. From this directory:
+#   targo --unverified run --release
+# aterm-wayland's tests/generated.rs compiles the same generate.rs and xml.rs
+# and holds the committed modules to a fresh run.
+[package]
+name = "aterm-wayland-scan"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "wayland-scan"
+path = "src/main.rs"

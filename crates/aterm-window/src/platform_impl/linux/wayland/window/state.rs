@@ -7,86 +7,216 @@
 //! Modified by the aterm project in 2026; see the repository NOTICE.
 //!
 //! The state of the window, which is shared with the event-loop.
+//!
+//! LOCAL PATCH (aterm), 2026-10-17 (docs/AUDIT-third-party-2026-10-15.md, LW.5): the window has
+//! no client-side frame. Upstream drew one (sctk-adwaita's, or sctk's `FallbackFrame`) as
+//! subsurfaces around the surface whenever the compositor settled on client-side decorations;
+//! here the application draws its own header inside the surface and drives the frame's
+//! gestures through `drag_window`, `drag_resize_window` and `show_window_menu`. The window
+//! geometry is the whole surface, and the negotiated mode is [`WindowState::client_decorations`].
+//!
+//! LOCAL PATCH (aterm), 2026-10-17 (docs/AUDIT-third-party-2026-10-15.md, LW.7 with winit-core
+//! WC.8): the window's objects (its `wl_surface`, `xdg_surface`, `xdg_toplevel`, toplevel
+//! decoration, viewport and fractional scale) are first-party `aterm-wayland` proxies this state
+//! owns, and the configure is the backend's own [`WindowConfigure`], assembled from the events
+//! in the order sctk's `WindowConfigure` was. CUT with sctk, each with no aterm caller: custom
+//! cursor images (`set_cursor(Cursor::Custom)` keeps the named cursor and says so), cursor grabs
+//! and `set_cursor_position` (no `zwp_pointer_constraints_v1`: `NotSupported`), and the
+//! `wayland-kwin-blur` feature (`set_blur` says blur is unavailable, as it did without it).
 
+use std::ffi::CString;
 use std::num::NonZeroU32;
-use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::sync::{Arc, Weak};
 
 use aterm_hash::FxHashSet;
+use aterm_wayland::output::Output;
+use aterm_wayland::protocols::text_input_unstable_v3::zwp_text_input_v3;
+use aterm_wayland::protocols::viewporter::wp_viewport;
+use aterm_wayland::protocols::wayland::{wl_compositor, wl_region, wl_surface};
+use aterm_wayland::protocols::xdg_decoration_unstable_v1::zxdg_toplevel_decoration_v1;
+use aterm_wayland::protocols::xdg_shell::{xdg_surface, xdg_toplevel};
+use aterm_wayland::proxy::Proxy;
+use aterm_wayland::seat::Seats;
+use aterm_wayland::xdg::Shell;
 use tracing::{info, warn};
 
-use sctk::reexports::client::backend::ObjectId;
-use sctk::reexports::client::protocol::wl_seat::WlSeat;
-use sctk::reexports::client::protocol::wl_shm::WlShm;
-use sctk::reexports::client::protocol::wl_surface::WlSurface;
-use sctk::reexports::client::{Connection, Proxy, QueueHandle};
-use sctk::reexports::csd_frame::{
-    DecorationsFrame, FrameAction, FrameClick, ResizeEdge, WindowState as XdgWindowState,
-};
-use sctk::reexports::protocols::wp::fractional_scale::v1::client::wp_fractional_scale_v1::WpFractionalScaleV1;
-use sctk::reexports::protocols::wp::text_input::zv3::client::zwp_text_input_v3::ZwpTextInputV3;
-use sctk::reexports::protocols::wp::viewporter::client::wp_viewport::WpViewport;
-use sctk::reexports::protocols::xdg::shell::client::xdg_toplevel::ResizeEdge as XdgResizeEdge;
-
-use sctk::compositor::{CompositorState, Region, SurfaceData, SurfaceDataExt};
-use sctk::seat::pointer::{PointerDataExt, ThemedPointer};
-use sctk::shell::xdg::window::{DecorationMode, Window, WindowConfigure};
-use sctk::shell::xdg::XdgSurface;
-use sctk::shell::WaylandSurface;
-use sctk::shm::slot::SlotPool;
-use sctk::shm::Shm;
-use sctk::subcompositor::SubcompositorState;
-
 use crate::cursor::CustomCursor as RootCustomCursor;
-use crate::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize, Size};
+use crate::dpi::{LogicalPosition, LogicalSize, PhysicalSize, Size};
 use crate::error::{ExternalError, NotSupportedError};
+use crate::platform::wayland::ClientDecorations;
 use crate::platform_impl::wayland::logical_to_physical_rounded;
-use crate::platform_impl::wayland::types::cursor::{sctk_icon, CustomCursor, SelectedCursor};
-#[cfg(feature = "wayland-kwin-blur")]
-use crate::platform_impl::wayland::types::kwin_blur::{KWinBlurManager, OrgKdeKwinBlur};
-use crate::platform_impl::{PlatformCustomCursor, WindowId};
+use crate::platform_impl::wayland::seat::{TextInput, WinitPointer};
+use crate::platform_impl::wayland::state::Connection;
+use crate::platform_impl::wayland::types::cursor::SelectedCursor;
+use crate::platform_impl::wayland::wire::Owned;
 use crate::window::{CursorGrabMode, CursorIcon, ImePurpose, ResizeDirection, Theme};
-
-use crate::platform_impl::wayland::seat::{
-    PointerConstraintsState, WinitPointerData, WinitPointerDataExt, ZwpTextInputV3Ext,
-};
-use crate::platform_impl::wayland::state::{WindowCompositorUpdate, WinitState};
-
-#[cfg(feature = "sctk-adwaita")]
-pub type WinitFrame = sctk_adwaita::AdwaitaFrame<WinitState>;
-#[cfg(not(feature = "sctk-adwaita"))]
-pub type WinitFrame = sctk::shell::xdg::fallback_frame::FallbackFrame<WinitState>;
 
 // Minimum window inner size.
 const MIN_WINDOW_SIZE: LogicalSize<u32> = LogicalSize::new(2, 1);
 
+aterm_types::bitflags! {
+    /// The `xdg_toplevel.state` values a configure carried (sctk's `WindowState`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct XdgWindowState: u16 {
+        const MAXIMIZED = 1 << 0;
+        const FULLSCREEN = 1 << 1;
+        const RESIZING = 1 << 2;
+        const ACTIVATED = 1 << 3;
+        const TILED_LEFT = 1 << 4;
+        const TILED_RIGHT = 1 << 5;
+        const TILED_TOP = 1 << 6;
+        const TILED_BOTTOM = 1 << 7;
+        const SUSPENDED = 1 << 8;
+        const TILED = Self::TILED_LEFT.bits()
+            | Self::TILED_RIGHT.bits()
+            | Self::TILED_TOP.bits()
+            | Self::TILED_BOTTOM.bits();
+    }
+}
+
+impl XdgWindowState {
+    /// The states a configure's array names; values this backend does not know (version 7's
+    /// constrained edges) are left out, as sctk left them.
+    pub fn from_wire(states: &[u32]) -> XdgWindowState {
+        use xdg_toplevel::state;
+        states.iter().fold(XdgWindowState::empty(), |mut acc, value| {
+            let flag = match *value {
+                state::MAXIMIZED => XdgWindowState::MAXIMIZED,
+                state::FULLSCREEN => XdgWindowState::FULLSCREEN,
+                state::RESIZING => XdgWindowState::RESIZING,
+                state::ACTIVATED => XdgWindowState::ACTIVATED,
+                state::TILED_LEFT => XdgWindowState::TILED_LEFT,
+                state::TILED_RIGHT => XdgWindowState::TILED_RIGHT,
+                state::TILED_TOP => XdgWindowState::TILED_TOP,
+                state::TILED_BOTTOM => XdgWindowState::TILED_BOTTOM,
+                state::SUSPENDED => XdgWindowState::SUSPENDED,
+                _ => XdgWindowState::empty(),
+            };
+            acc.insert(flag);
+            acc
+        })
+    }
+}
+
+aterm_types::bitflags! {
+    /// What the compositor can do for the window (`xdg_toplevel.wm_capabilities`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct WindowManagerCapabilities: u16 {
+        const WINDOW_MENU = 1 << 0;
+        const MAXIMIZE = 1 << 1;
+        const FULLSCREEN = 1 << 2;
+        const MINIMIZE = 1 << 3;
+    }
+}
+
+impl WindowManagerCapabilities {
+    /// The capabilities an event's array names; unknown values are left out.
+    pub fn from_wire(capabilities: &[u32]) -> WindowManagerCapabilities {
+        use xdg_toplevel::wm_capabilities as cap;
+        capabilities.iter().fold(WindowManagerCapabilities::empty(), |mut acc, value| {
+            let flag = match *value {
+                cap::WINDOW_MENU => WindowManagerCapabilities::WINDOW_MENU,
+                cap::MAXIMIZE => WindowManagerCapabilities::MAXIMIZE,
+                cap::FULLSCREEN => WindowManagerCapabilities::FULLSCREEN,
+                cap::MINIMIZE => WindowManagerCapabilities::MINIMIZE,
+                _ => WindowManagerCapabilities::empty(),
+            };
+            acc.insert(flag);
+            acc
+        })
+    }
+}
+
+/// Who draws the window's frame, as the configure says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecorationMode {
+    Client,
+    Server,
+}
+
+/// A configure: the compositor's suggestion, as sctk 0.19.2's `WindowConfigure` assembled it.
+/// Each event updates the window's pending one; `xdg_surface.configure` hands a copy to the
+/// window, and the pending one carries on (a later configure changes only what it says).
+#[derive(Debug, Clone)]
+pub struct WindowConfigure {
+    /// The suggested size; `None` leaves it to the window.
+    pub new_size: (Option<NonZeroU32>, Option<NonZeroU32>),
+    /// The compositor's bounds for the window (xdg-shell version 4).
+    pub suggested_bounds: Option<(u32, u32)>,
+    /// Client until the decoration's configure says otherwise.
+    pub decoration_mode: DecorationMode,
+    pub state: XdgWindowState,
+    /// Every capability until a `wm_capabilities` event (version 5) says which.
+    pub capabilities: WindowManagerCapabilities,
+}
+
+impl Default for WindowConfigure {
+    fn default() -> Self {
+        Self {
+            new_size: (None, None),
+            suggested_bounds: None,
+            decoration_mode: DecorationMode::Client,
+            state: XdgWindowState::empty(),
+            capabilities: WindowManagerCapabilities::all(),
+        }
+    }
+}
+
+impl WindowConfigure {
+    #[inline]
+    pub fn is_maximized(&self) -> bool {
+        self.state.contains(XdgWindowState::MAXIMIZED)
+    }
+
+    #[inline]
+    pub fn is_fullscreen(&self) -> bool {
+        self.state.contains(XdgWindowState::FULLSCREEN)
+    }
+
+    #[inline]
+    pub fn is_resizing(&self) -> bool {
+        self.state.contains(XdgWindowState::RESIZING)
+    }
+
+    #[inline]
+    pub fn is_tiled(&self) -> bool {
+        self.state.intersects(XdgWindowState::TILED)
+    }
+}
+
+/// The window's objects, in the order they are destroyed (sctk's: the decoration, the
+/// toplevel, the xdg surface, then the surface).
+pub(crate) struct WindowObjects {
+    pub(crate) frame_callback: Option<Owned>,
+    pub(crate) attention_token: Option<Owned>,
+    pub(crate) viewport: Option<Owned>,
+    pub(crate) fractional_scale: Option<Owned>,
+    pub(crate) decoration: Option<Owned>,
+    pub(crate) toplevel: Owned,
+    pub(crate) xdg_surface: Owned,
+    pub(crate) surface: Owned,
+}
+
 /// The state of the window which is being updated from the [`WinitState`].
+///
+/// [`WinitState`]: crate::platform_impl::wayland::state::WinitState
 pub struct WindowState {
-    /// The connection to Wayland server.
-    pub connection: Connection,
+    /// The seats, for the serials and the seat a move, a resize or a menu names.
+    seats: Arc<Seats>,
 
-    /// The `Shm` to set cursor.
-    pub shm: WlShm,
-
-    // A shared pool where to allocate custom cursors.
-    custom_cursor_pool: Arc<Mutex<SlotPool>>,
+    /// The configure being assembled from the events since the last one.
+    pub(crate) pending_configure: WindowConfigure,
 
     /// The last received configure.
     pub last_configure: Option<WindowConfigure>,
 
     /// The pointers observed on the window.
-    pub pointers: Vec<Weak<ThemedPointer<WinitPointerData>>>,
+    pub pointers: Vec<Weak<WinitPointer>>,
 
     selected_cursor: SelectedCursor,
 
     /// Whether the cursor is visible.
     pub cursor_visible: bool,
-
-    /// Pointer constraints to lock/confine pointer.
-    pub pointer_constraints: Option<Arc<PointerConstraintsState>>,
-
-    /// Queue handle.
-    pub queue_handle: QueueHandle<WinitState>,
 
     /// Theme variant.
     theme: Option<Theme>,
@@ -100,19 +230,13 @@ pub struct WindowState {
     // NOTE: we can't use simple counter, since it's racy when seat getting destroyed and new
     // is created, since add/removed stuff could be delivered a bit out of order.
     /// Seats that has keyboard focus on that window.
-    seat_focus: FxHashSet<ObjectId>,
+    seat_focus: FxHashSet<u32>,
 
     /// The scale factor of the window.
     scale_factor: f64,
 
     /// Whether the window is transparent.
     transparent: bool,
-
-    /// The state of the compositor to create WlRegions.
-    compositor: Arc<CompositorState>,
-
-    /// The current cursor grabbing mode.
-    cursor_grab_mode: GrabState,
 
     /// Whether the IME input is allowed for that window.
     ime_allowed: bool,
@@ -121,15 +245,19 @@ pub struct WindowState {
     ime_purpose: ImePurpose,
 
     /// The text inputs observed on the window.
-    text_inputs: Vec<ZwpTextInputV3>,
+    text_inputs: Vec<Weak<TextInput>>,
 
-    /// The inner size of the window, as in without client side decorations.
+    /// The outputs the surface is on, as it entered them.
+    pub(crate) outputs: Vec<Output>,
+
+    /// The inner size of the window: the whole surface, since the window has no client-side
+    /// frame around it (LW.5).
     size: LogicalSize<u32>,
 
-    /// Whether the CSD fail to create, so we don't try to create them on each iteration.
-    csd_fails: bool,
-
-    /// Whether we should decorate the frame.
+    /// Whether decorations were asked for (the attributes' default, `set_decorations`). Under
+    /// server-side decorations `false` asks the compositor for client mode, which takes its
+    /// decorations off; under client-side decorations it tells the application not to draw any
+    /// ([`Self::client_decorations`]).
     decorate: bool,
 
     /// Min size.
@@ -149,101 +277,87 @@ pub struct WindowState {
     /// The state of the frame callback.
     frame_callback_state: FrameCallbackState,
 
-    viewport: Option<WpViewport>,
-    fractional_scale: Option<WpFractionalScaleV1>,
-    #[cfg(feature = "wayland-kwin-blur")]
-    blur: Option<OrgKdeKwinBlur>,
-    #[cfg(feature = "wayland-kwin-blur")]
-    blur_manager: Option<KWinBlurManager>,
+    /// Whether an attention request waits for its activation token.
+    pub(crate) attention_requested: bool,
 
-    /// Whether the client side decorations have pending move operations.
-    ///
-    /// The value is the serial of the event triggered moved.
-    has_pending_move: Option<u32>,
+    /// The window's objects; destroyed before their global and connection keepalives.
+    pub(crate) objects: WindowObjects,
 
-    /// The underlying SCTK window.
-    pub window: Window,
+    /// Globals this window can still use after the event loop is gone. They drop
+    /// after its objects, so xdg_wm_base outlives every child surface.
+    compositor: Arc<Owned>,
+    _shell: Arc<Shell>,
 
-    // NOTE: The spec says that destroying parent(`window` in our case), will unmap the
-    // subsurfaces. Thus to achieve atomic unmap of the client, drop the decorations
-    // frame after the `window` is dropped. To achieve that we rely on rust's struct
-    // field drop order guarantees.
-    /// The window frame, which is created from the configure request.
-    frame: Option<WinitFrame>,
+    /// The connection the objects are on, which outlives them: a window kept past the event
+    /// loop keeps it.
+    _connection: Arc<Connection>,
 }
 
 impl WindowState {
-    /// Create new window state.
-    pub fn new(
-        connection: Connection,
-        queue_handle: &QueueHandle<WinitState>,
-        winit_state: &WinitState,
+    /// Create new window state over `objects`.
+    pub(crate) fn new(
+        compositor: Arc<Owned>,
+        shell: Arc<Shell>,
+        seats: Arc<Seats>,
+        connection: Arc<Connection>,
         initial_size: Size,
-        window: Window,
+        objects: WindowObjects,
         theme: Option<Theme>,
     ) -> Self {
-        let compositor = winit_state.compositor_state.clone();
-        let pointer_constraints = winit_state.pointer_constraints.clone();
-        let viewport = winit_state
-            .viewporter_state
-            .as_ref()
-            .map(|state| state.get_viewport(window.wl_surface(), queue_handle));
-        let fractional_scale = winit_state
-            .fractional_scaling_manager
-            .as_ref()
-            .map(|fsm| fsm.fractional_scaling(window.wl_surface(), queue_handle));
-
         Self {
-            #[cfg(feature = "wayland-kwin-blur")]
-            blur: None,
-            #[cfg(feature = "wayland-kwin-blur")]
-            blur_manager: winit_state.kwin_blur_manager.clone(),
             compositor,
-            connection,
-            csd_fails: false,
-            cursor_grab_mode: GrabState::new(),
+            _shell: shell,
+            seats,
+            pending_configure: WindowConfigure::default(),
             selected_cursor: Default::default(),
             cursor_visible: true,
             decorate: true,
-            fractional_scale,
-            frame: None,
             frame_callback_state: FrameCallbackState::None,
             seat_focus: Default::default(),
-            has_pending_move: None,
             ime_allowed: false,
             ime_purpose: ImePurpose::Normal,
             last_configure: None,
             max_inner_size: None,
             min_inner_size: MIN_WINDOW_SIZE,
             resize_increments: None,
-            pointer_constraints,
             pointers: Default::default(),
-            queue_handle: queue_handle.clone(),
             resizable: true,
             scale_factor: 1.,
-            shm: winit_state.shm.wl_shm().clone(),
-            custom_cursor_pool: winit_state.custom_cursor_pool.clone(),
             size: initial_size.to_logical(1.),
             stateless_size: initial_size.to_logical(1.),
             initial_size: Some(initial_size),
             text_inputs: Vec::new(),
+            outputs: Vec::new(),
             theme,
             title: String::default(),
             transparent: false,
-            viewport,
-            window,
+            attention_requested: false,
+            objects,
+            _connection: connection,
         }
     }
 
+    /// The `wl_compositor`, for regions.
+    #[inline]
+    pub(crate) fn compositor(&self) -> Proxy {
+        self.compositor.proxy()
+    }
+
+    /// The window's `wl_surface`.
+    #[inline]
+    pub(crate) fn surface(&self) -> Proxy {
+        self.objects.surface.proxy()
+    }
+
+    /// The window's `xdg_toplevel`.
+    #[inline]
+    pub(crate) fn xdg_toplevel(&self) -> Proxy {
+        self.objects.toplevel.proxy()
+    }
+
     /// Apply closure on the given pointer.
-    fn apply_on_pointer<F: FnMut(&ThemedPointer<WinitPointerData>, &WinitPointerData)>(
-        &self,
-        mut callback: F,
-    ) {
-        self.pointers.iter().filter_map(Weak::upgrade).for_each(|pointer| {
-            let data = pointer.pointer().winit_data();
-            callback(pointer.as_ref(), data);
-        })
+    fn apply_on_pointer<F: FnMut(&WinitPointer)>(&self, mut callback: F) {
+        self.pointers.iter().filter_map(Weak::upgrade).for_each(|pointer| callback(&pointer))
     }
 
     /// Get the current state of the frame callback.
@@ -254,6 +368,8 @@ impl WindowState {
     /// The frame callback was received, but not yet sent to the user.
     pub fn frame_callback_received(&mut self) {
         self.frame_callback_state = FrameCallbackState::Received;
+        // The callback ended with its event: its proxy goes now.
+        self.objects.frame_callback = None;
     }
 
     /// Reset the frame callbacks state.
@@ -262,23 +378,17 @@ impl WindowState {
     }
 
     /// Request a frame callback if we don't have one for this window in flight.
-    pub fn request_frame_callback(&mut self) {
-        let surface = self.window.wl_surface();
+    pub fn request_frame_callback(&mut self, make: impl FnOnce(Proxy) -> Option<Owned>) {
         match self.frame_callback_state {
             FrameCallbackState::None | FrameCallbackState::Received => {
                 self.frame_callback_state = FrameCallbackState::Requested;
-                surface.frame(&self.queue_handle, surface.clone());
+                self.objects.frame_callback = make(self.surface());
             },
             FrameCallbackState::Requested => (),
         }
     }
 
-    pub fn configure(
-        &mut self,
-        configure: WindowConfigure,
-        shm: &Shm,
-        subcompositor: &Option<Arc<SubcompositorState>>,
-    ) -> bool {
+    pub fn configure(&mut self, configure: WindowConfigure) -> bool {
         // NOTE: when using fractional scaling or wl_compositor@v6 the scaling
         // should be delivered before the first configure, thus apply it to
         // properly scale the physical sizes provided by the users.
@@ -287,60 +397,14 @@ impl WindowState {
             self.stateless_size = self.size;
         }
 
-        if let Some(subcompositor) = subcompositor.as_ref().filter(|_| {
-            configure.decoration_mode == DecorationMode::Client
-                && self.frame.is_none()
-                && !self.csd_fails
-        }) {
-            match WinitFrame::new(
-                &self.window,
-                shm,
-                #[cfg(feature = "sctk-adwaita")]
-                self.compositor.clone(),
-                subcompositor.clone(),
-                self.queue_handle.clone(),
-                #[cfg(feature = "sctk-adwaita")]
-                into_sctk_adwaita_config(self.theme),
-            ) {
-                Ok(mut frame) => {
-                    frame.set_title(&self.title);
-                    frame.set_scaling_factor(self.scale_factor);
-                    // Hide the frame if we were asked to not decorate.
-                    frame.set_hidden(!self.decorate);
-                    self.frame = Some(frame);
-                },
-                Err(_err) => {
-                    warn!("Failed to create client side decorations frame: {_err}");
-                    self.csd_fails = true;
-                },
-            }
-        } else if configure.decoration_mode == DecorationMode::Server {
-            // Drop the frame for server side decorations to save resources.
-            self.frame = None;
-        }
-
         let stateless = Self::is_stateless(&configure);
 
-        let (mut new_size, constrain) = if let Some(frame) = self.frame.as_mut() {
-            // Configure the window states.
-            frame.update_state(configure.state);
-
-            match configure.new_size {
-                (Some(width), Some(height)) => {
-                    let (width, height) = frame.subtract_borders(width, height);
-                    let width = width.map(|w| w.get()).unwrap_or(1);
-                    let height = height.map(|h| h.get()).unwrap_or(1);
-                    ((width, height).into(), false)
-                },
-                (..) if stateless => (self.stateless_size, true),
-                _ => (self.size, true),
-            }
-        } else {
-            match configure.new_size {
-                (Some(width), Some(height)) => ((width.get(), height.get()).into(), false),
-                _ if stateless => (self.stateless_size, true),
-                _ => (self.size, true),
-            }
+        // LOCAL PATCH (aterm), LW.5: no frame borders to subtract; the configure's size is the
+        // surface's.
+        let (mut new_size, constrain) = match configure.new_size {
+            (Some(width), Some(height)) => ((width.get(), height.get()).into(), false),
+            _ if stateless => (self.stateless_size, true),
+            _ => (self.size, true),
         };
 
         // Apply configure bounds only when compositor let the user decide what size to pick.
@@ -393,15 +457,22 @@ impl WindowState {
         let new_state = configure.state;
         let old_state = self.last_configure.as_ref().map(|configure| configure.state);
 
-        let state_change_requires_resize = old_state
-            .map(|old_state| {
-                !old_state
-                    .symmetric_difference(new_state)
-                    .difference(XdgWindowState::ACTIVATED | XdgWindowState::SUSPENDED)
-                    .is_empty()
-            })
-            // NOTE: `None` is present for the initial configure, thus we must always resize.
-            .unwrap_or(true);
+        // LOCAL PATCH (aterm), LW.5: a change of decoration mode or of the compositor's
+        // capabilities also counts, so the application hears it (as a `Resized`, possibly of
+        // the same size) and re-reads `client_decorations` before it draws its header again.
+        let decorations_moved = self.last_configure.as_ref().is_some_and(|last| {
+            last.decoration_mode != configure.decoration_mode
+                || last.capabilities != configure.capabilities
+        });
+        let state_change_requires_resize = decorations_moved
+            || old_state
+                .map(|old_state| {
+                    !XdgWindowState::from_bits_retain(old_state.bits() ^ new_state.bits())
+                        .difference(XdgWindowState::ACTIVATED | XdgWindowState::SUSPENDED)
+                        .is_empty()
+                })
+                // NOTE: `None` is present for the initial configure, thus we must always resize.
+                .unwrap_or(true);
 
         // NOTE: Set the configure before doing a resize, since we query it during it.
         self.last_configure = Some(configure);
@@ -419,19 +490,9 @@ impl WindowState {
         &self,
         configure: &WindowConfigure,
     ) -> (Option<NonZeroU32>, Option<NonZeroU32>) {
-        let configure_bounds = match configure.suggested_bounds {
+        match configure.suggested_bounds {
             Some((width, height)) => (NonZeroU32::new(width), NonZeroU32::new(height)),
             None => (None, None),
-        };
-
-        if let Some(frame) = self.frame.as_ref() {
-            let (width, height) = frame.subtract_borders(
-                configure_bounds.0.unwrap_or(NonZeroU32::new(1).unwrap()),
-                configure_bounds.1.unwrap_or(NonZeroU32::new(1).unwrap()),
-            );
-            (configure_bounds.0.and(width), configure_bounds.1.and(height))
-        } else {
-            configure_bounds
         }
     }
 
@@ -442,13 +503,17 @@ impl WindowState {
 
     /// Start interacting drag resize.
     pub fn drag_resize_window(&self, direction: ResizeDirection) -> Result<(), ExternalError> {
-        let xdg_toplevel = self.window.xdg_toplevel();
+        let xdg_toplevel = self.xdg_toplevel();
 
         // TODO(kchibisov) handle touch serials.
-        self.apply_on_pointer(|_, data| {
-            let serial = data.latest_button_serial();
-            let seat = data.seat();
-            xdg_toplevel.resize(seat, serial, direction.into());
+        self.apply_on_pointer(|pointer| {
+            self.seats.with_seat(pointer.seat(), |seat| {
+                let serial = seat.pointer_button_serial.unwrap_or_default();
+                // SAFETY: this window's live toplevel and the seat lent live.
+                unsafe {
+                    xdg_toplevel::resize(xdg_toplevel, seat.seat, serial, resize_edge(direction))
+                };
+            });
         });
 
         Ok(())
@@ -456,88 +521,17 @@ impl WindowState {
 
     /// Start the window drag.
     pub fn drag_window(&self) -> Result<(), ExternalError> {
-        let xdg_toplevel = self.window.xdg_toplevel();
+        let xdg_toplevel = self.xdg_toplevel();
         // TODO(kchibisov) handle touch serials.
-        self.apply_on_pointer(|_, data| {
-            let serial = data.latest_button_serial();
-            let seat = data.seat();
-            xdg_toplevel._move(seat, serial);
+        self.apply_on_pointer(|pointer| {
+            self.seats.with_seat(pointer.seat(), |seat| {
+                let serial = seat.pointer_button_serial.unwrap_or_default();
+                // SAFETY: this window's live toplevel and the seat lent live.
+                unsafe { xdg_toplevel::r#move(xdg_toplevel, seat.seat, serial) };
+            });
         });
 
         Ok(())
-    }
-
-    /// Tells whether the window should be closed.
-    #[allow(clippy::too_many_arguments)]
-    pub fn frame_click(
-        &mut self,
-        click: FrameClick,
-        pressed: bool,
-        seat: &WlSeat,
-        serial: u32,
-        timestamp: Duration,
-        window_id: WindowId,
-        updates: &mut Vec<WindowCompositorUpdate>,
-    ) -> Option<bool> {
-        match self.frame.as_mut()?.on_click(timestamp, click, pressed)? {
-            FrameAction::Minimize => self.window.set_minimized(),
-            FrameAction::Maximize => self.window.set_maximized(),
-            FrameAction::UnMaximize => self.window.unset_maximized(),
-            FrameAction::Close => WinitState::queue_close(updates, window_id),
-            FrameAction::Move => self.has_pending_move = Some(serial),
-            FrameAction::Resize(edge) => {
-                let edge = match edge {
-                    ResizeEdge::None => XdgResizeEdge::None,
-                    ResizeEdge::Top => XdgResizeEdge::Top,
-                    ResizeEdge::Bottom => XdgResizeEdge::Bottom,
-                    ResizeEdge::Left => XdgResizeEdge::Left,
-                    ResizeEdge::TopLeft => XdgResizeEdge::TopLeft,
-                    ResizeEdge::BottomLeft => XdgResizeEdge::BottomLeft,
-                    ResizeEdge::Right => XdgResizeEdge::Right,
-                    ResizeEdge::TopRight => XdgResizeEdge::TopRight,
-                    ResizeEdge::BottomRight => XdgResizeEdge::BottomRight,
-                    _ => return None,
-                };
-                self.window.resize(seat, serial, edge);
-            },
-            FrameAction::ShowMenu(x, y) => self.window.show_window_menu(seat, serial, (x, y)),
-            _ => (),
-        };
-
-        Some(false)
-    }
-
-    pub fn frame_point_left(&mut self) {
-        if let Some(frame) = self.frame.as_mut() {
-            frame.click_point_left();
-        }
-    }
-
-    // Move the point over decorations.
-    pub fn frame_point_moved(
-        &mut self,
-        seat: &WlSeat,
-        surface: &WlSurface,
-        timestamp: Duration,
-        x: f64,
-        y: f64,
-    ) -> Option<cursor_icon::CursorIcon> {
-        // Take the serial if we had any, so it doesn't stick around.
-        let serial = self.has_pending_move.take();
-
-        if let Some(frame) = self.frame.as_mut() {
-            let cursor = frame.click_point_moved(timestamp, &surface.id(), x, y);
-            // If we have a cursor change, that means that cursor is over the decorations,
-            // so try to apply move.
-            if let Some(serial) = cursor.is_some().then_some(serial).flatten() {
-                self.window.move_(seat, serial);
-                None
-            } else {
-                cursor
-            }
-        } else {
-            None
-        }
     }
 
     /// Get the stored resizable state.
@@ -562,11 +556,6 @@ impl WindowState {
         } else {
             self.set_min_inner_size(Some(self.size));
             self.set_max_inner_size(Some(self.size));
-        }
-
-        // Reload the state on the frame as well.
-        if let Some(frame) = self.frame.as_mut() {
-            frame.set_resizable(resizable);
         }
 
         true
@@ -596,62 +585,57 @@ impl WindowState {
         self.last_configure.is_some()
     }
 
+    /// Whether the window system decorates the window: the compositor granted server-side
+    /// decorations (and, before the first configure, the request for them stands).
+    ///
+    /// LOCAL PATCH (aterm), LW.5: `false` under client-side decorations, where upstream answered
+    /// `true` while its own frame showed. This backend draws none, so a window in client mode is
+    /// undecorated until the application draws its own ([`Self::client_decorations`]).
     #[inline]
-    pub fn is_decorated(&mut self) -> bool {
-        let csd = self
-            .last_configure
-            .as_ref()
-            .map(|configure| configure.decoration_mode == DecorationMode::Client)
-            .unwrap_or(false);
-        if let Some(frame) = csd.then_some(self.frame.as_ref()).flatten() {
-            !frame.is_hidden()
-        } else {
-            // Server side decorations.
-            true
+    pub fn is_decorated(&self) -> bool {
+        match self.last_configure.as_ref() {
+            Some(configure) => configure.decoration_mode == DecorationMode::Server,
+            None => self.decorate,
         }
     }
 
-    /// Get the outer size of the window.
+    /// The decorations the application must draw: `Some` once the compositor's configure has
+    /// settled on client-side decorations (it offers no xdg-decoration manager, or chose client
+    /// mode) while decorations are asked for, with what the compositor can do for the header's
+    /// buttons and menu; `None` under server-side decorations, with decorations off, and before
+    /// the first configure. A change arrives as a `Resized` (see [`Self::configure`]).
+    pub fn client_decorations(&self) -> Option<ClientDecorations> {
+        let configure = self.last_configure.as_ref()?;
+        if !self.decorate || configure.decoration_mode != DecorationMode::Client {
+            return None;
+        }
+        let can = |capability| configure.capabilities.contains(capability);
+        Some(ClientDecorations {
+            window_menu: can(WindowManagerCapabilities::WINDOW_MENU),
+            maximize: can(WindowManagerCapabilities::MAXIMIZE),
+            minimize: can(WindowManagerCapabilities::MINIMIZE),
+            maximized: configure.is_maximized(),
+            fullscreen: configure.is_fullscreen(),
+            tiled: configure.is_tiled(),
+            resizable: self.resizable,
+        })
+    }
+
+    /// Get the outer size of the window: the inner size, as the window has no frame of its own.
     #[inline]
     pub fn outer_size(&self) -> LogicalSize<u32> {
-        self.frame
-            .as_ref()
-            .map(|frame| frame.add_borders(self.size.width, self.size.height).into())
-            .unwrap_or(self.size)
+        self.size
     }
 
     /// Register pointer on the top-level.
-    pub fn pointer_entered(&mut self, added: Weak<ThemedPointer<WinitPointerData>>) {
+    pub fn pointer_entered(&mut self, added: Weak<WinitPointer>) {
         self.pointers.push(added);
         self.reload_cursor_style();
-
-        let mode = self.cursor_grab_mode.user_grab_mode;
-        let _ = self.set_cursor_grab_inner(mode);
     }
 
     /// Pointer has left the top-level.
-    pub fn pointer_left(&mut self, removed: Weak<ThemedPointer<WinitPointerData>>) {
-        let mut new_pointers = Vec::new();
-        for pointer in self.pointers.drain(..) {
-            if let Some(pointer) = pointer.upgrade() {
-                if pointer.pointer() != removed.upgrade().unwrap().pointer() {
-                    new_pointers.push(Arc::downgrade(&pointer));
-                }
-            }
-        }
-
-        self.pointers = new_pointers;
-    }
-
-    /// Refresh the decorations frame if it's present returning whether the client should redraw.
-    pub fn refresh_frame(&mut self) -> bool {
-        if let Some(frame) = self.frame.as_mut() {
-            if !frame.is_hidden() && frame.is_dirty() {
-                return frame.draw();
-            }
-        }
-
-        false
+    pub fn pointer_left(&mut self, removed: &Weak<WinitPointer>) {
+        self.pointers.retain(|pointer| pointer.strong_count() > 0 && !pointer.ptr_eq(removed));
     }
 
     /// Reload the cursor style on the given window.
@@ -659,7 +643,6 @@ impl WindowState {
         if self.cursor_visible {
             match &self.selected_cursor {
                 SelectedCursor::Named(icon) => self.set_cursor(*icon),
-                SelectedCursor::Custom(cursor) => self.apply_custom_cursor(cursor),
             }
         } else {
             self.set_cursor_visible(self.cursor_visible);
@@ -668,13 +651,22 @@ impl WindowState {
 
     /// Reissue the transparency hint to the compositor.
     pub fn reload_transparency_hint(&self) {
-        let surface = self.window.wl_surface();
+        let surface = self.surface();
 
         if self.transparent {
-            surface.set_opaque_region(None);
-        } else if let Ok(region) = Region::new(&*self.compositor) {
-            region.add(0, 0, i32::MAX, i32::MAX);
-            surface.set_opaque_region(Some(region.wl_region()));
+            // SAFETY: this window's live surface.
+            unsafe { wl_surface::set_opaque_region(surface, None) };
+        // SAFETY: the live compositor.
+        } else if let Some(region) =
+            unsafe { wl_compositor::create_region(self.compositor.proxy()) }
+        {
+            // SAFETY: the region made above, destroyed once here: the surface copies its
+            // contents at `set_opaque_region` (it is double-buffered state, not a reference).
+            unsafe {
+                wl_region::add(region, 0, 0, i32::MAX, i32::MAX);
+                wl_surface::set_opaque_region(surface, Some(region));
+                wl_region::destroy(region);
+            }
         } else {
             warn!("Failed to mark window opaque.");
         }
@@ -698,36 +690,31 @@ impl WindowState {
             self.stateless_size = inner_size;
         }
 
-        // Update the inner frame.
-        let ((x, y), outer_size) = if let Some(frame) = self.frame.as_mut() {
-            // Resize only visible frame.
-            if !frame.is_hidden() {
-                frame.resize(
-                    NonZeroU32::new(self.size.width).unwrap(),
-                    NonZeroU32::new(self.size.height).unwrap(),
-                );
-            }
-
-            (frame.location(), frame.add_borders(self.size.width, self.size.height).into())
-        } else {
-            ((0, 0), self.size)
-        };
-
         // Reload the hint.
         self.reload_transparency_hint();
 
-        // Set the window geometry.
-        self.window.xdg_surface().set_window_geometry(
-            x,
-            y,
-            outer_size.width as i32,
-            outer_size.height as i32,
-        );
+        // Set the window geometry: the whole surface (LW.5: no frame around it).
+        // SAFETY: this window's live xdg_surface.
+        unsafe {
+            xdg_surface::set_window_geometry(
+                self.objects.xdg_surface.proxy(),
+                0,
+                0,
+                self.size.width as i32,
+                self.size.height as i32,
+            )
+        };
 
         // Update the target viewport, this is used if and only if fractional scaling is in use.
-        if let Some(viewport) = self.viewport.as_ref() {
-            // Set inner size without the borders.
-            viewport.set_destination(self.size.width as _, self.size.height as _);
+        if let Some(viewport) = self.objects.viewport.as_ref() {
+            // SAFETY: this window's live viewport.
+            unsafe {
+                wp_viewport::set_destination(
+                    viewport.proxy(),
+                    self.size.width as _,
+                    self.size.height as _,
+                )
+            };
         }
     }
 
@@ -745,34 +732,19 @@ impl WindowState {
             return;
         }
 
-        self.apply_on_pointer(|pointer, _| {
-            if pointer.set_cursor(&self.connection, sctk_icon(cursor_icon)).is_err() {
+        self.apply_on_pointer(|pointer| {
+            if !pointer.set_cursor(&self.seats, cursor_icon) {
                 warn!("Failed to set cursor to {:?}", cursor_icon);
             }
         })
     }
 
     /// Set the custom cursor icon.
-    pub(crate) fn set_custom_cursor(&mut self, cursor: RootCustomCursor) {
-        let cursor = match cursor {
-            RootCustomCursor { inner: PlatformCustomCursor::Wayland(cursor) } => cursor.0,
-            #[cfg(x11_platform)]
-            RootCustomCursor { inner: PlatformCustomCursor::X(_) } => {
-                tracing::error!("passed a X11 cursor to Wayland backend");
-                return;
-            },
-        };
-
-        let cursor = {
-            let mut pool = self.custom_cursor_pool.lock().unwrap();
-            CustomCursor::new(&mut pool, &cursor)
-        };
-
-        if self.cursor_visible {
-            self.apply_custom_cursor(&cursor);
-        }
-
-        self.selected_cursor = SelectedCursor::Custom(cursor);
+    ///
+    /// LOCAL PATCH (aterm), LW.7: custom cursor images are not drawn on Wayland (no aterm
+    /// caller; their shm pool left with sctk). The named cursor stays.
+    pub(crate) fn set_custom_cursor(&mut self, _cursor: RootCustomCursor) {
+        warn!("custom cursors are not supported on Wayland; the named cursor stays");
     }
 
     /// Set the resize increments of the window.
@@ -787,42 +759,6 @@ impl WindowState {
         self.resize_increments
     }
 
-    fn apply_custom_cursor(&self, cursor: &CustomCursor) {
-        self.apply_on_pointer(|pointer, data| {
-            let surface = pointer.surface();
-
-            let scale = if let Some(viewport) = data.viewport() {
-                let scale = self.scale_factor();
-                let size = PhysicalSize::new(cursor.w, cursor.h).to_logical(scale);
-                viewport.set_destination(size.width, size.height);
-                scale
-            } else {
-                let scale = surface.data::<SurfaceData>().unwrap().surface_data().scale_factor();
-                surface.set_buffer_scale(scale);
-                scale as f64
-            };
-
-            surface.attach(Some(cursor.buffer.wl_buffer()), 0, 0);
-            if surface.version() >= 4 {
-                surface.damage_buffer(0, 0, cursor.w, cursor.h);
-            } else {
-                let size = PhysicalSize::new(cursor.w, cursor.h).to_logical(scale);
-                surface.damage(0, 0, size.width, size.height);
-            }
-            surface.commit();
-
-            let serial = pointer
-                .pointer()
-                .data::<WinitPointerData>()
-                .and_then(|data| data.pointer_data().latest_enter_serial())
-                .unwrap();
-
-            let hotspot =
-                PhysicalPosition::new(cursor.hotspot_x, cursor.hotspot_y).to_logical(scale);
-            pointer.pointer().set_cursor(serial, Some(surface), hotspot.x, hotspot.y);
-        });
-    }
-
     /// Set maximum inner window size.
     pub fn set_min_inner_size(&mut self, size: Option<LogicalSize<u32>>) {
         // Ensure that the window has the right minimum size.
@@ -830,55 +766,44 @@ impl WindowState {
         size.width = size.width.max(MIN_WINDOW_SIZE.width);
         size.height = size.height.max(MIN_WINDOW_SIZE.height);
 
-        // Add the borders.
-        let size = self
-            .frame
-            .as_ref()
-            .map(|frame| frame.add_borders(size.width, size.height).into())
-            .unwrap_or(size);
-
         self.min_inner_size = size;
-        self.window.set_min_size(Some(size.into()));
+        // SAFETY: this window's live toplevel.
+        unsafe {
+            xdg_toplevel::set_min_size(self.xdg_toplevel(), size.width as i32, size.height as i32)
+        };
     }
 
     /// Set maximum inner window size.
     pub fn set_max_inner_size(&mut self, size: Option<LogicalSize<u32>>) {
-        let size = size.map(|size| {
-            self.frame
-                .as_ref()
-                .map(|frame| frame.add_borders(size.width, size.height).into())
-                .unwrap_or(size)
-        });
-
         self.max_inner_size = size;
-        self.window.set_max_size(size.map(Into::into));
+        let size = size.unwrap_or(LogicalSize::new(0, 0));
+        // SAFETY: this window's live toplevel.
+        unsafe {
+            xdg_toplevel::set_max_size(self.xdg_toplevel(), size.width as i32, size.height as i32)
+        };
     }
 
-    /// Set the CSD theme.
+    /// Record the preferred theme. LW.5: there is no frame to recolour; the value is only
+    /// answered back by [`Self::theme`].
     pub fn set_theme(&mut self, theme: Option<Theme>) {
         self.theme = theme;
-        #[cfg(feature = "sctk-adwaita")]
-        if let Some(frame) = self.frame.as_mut() {
-            frame.set_config(into_sctk_adwaita_config(theme))
-        }
     }
 
-    /// The current theme for CSD decorations.
+    /// The preferred theme the window was given.
     #[inline]
     pub fn theme(&self) -> Option<Theme> {
         self.theme
     }
 
     /// Set the cursor grabbing state on the top-level.
+    ///
+    /// LOCAL PATCH (aterm), LW.7: no `zwp_pointer_constraints_v1` (no aterm caller), so only
+    /// [`CursorGrabMode::None`] is supported, as upstream answered on a compositor without it.
     pub fn set_cursor_grab(&mut self, mode: CursorGrabMode) -> Result<(), ExternalError> {
-        if self.cursor_grab_mode.user_grab_mode == mode {
-            return Ok(());
+        match mode {
+            CursorGrabMode::None => Ok(()),
+            _ => Err(ExternalError::NotSupported(NotSupportedError::new())),
         }
-
-        self.set_cursor_grab_inner(mode)?;
-        // Update user grab on success.
-        self.cursor_grab_mode.user_grab_mode = mode;
-        Ok(())
     }
 
     /// Reload the hints for minimum and maximum sizes.
@@ -887,89 +812,32 @@ impl WindowState {
         self.set_max_inner_size(self.max_inner_size);
     }
 
-    /// Set the grabbing state on the surface.
-    fn set_cursor_grab_inner(&mut self, mode: CursorGrabMode) -> Result<(), ExternalError> {
-        let pointer_constraints = match self.pointer_constraints.as_ref() {
-            Some(pointer_constraints) => pointer_constraints,
-            None if mode == CursorGrabMode::None => return Ok(()),
-            None => return Err(ExternalError::NotSupported(NotSupportedError::new())),
-        };
-
-        let mut unset_old = false;
-        match self.cursor_grab_mode.current_grab_mode {
-            CursorGrabMode::None => unset_old = true,
-            CursorGrabMode::Confined => self.apply_on_pointer(|_, data| {
-                data.unconfine_pointer();
-                unset_old = true;
-            }),
-            CursorGrabMode::Locked => {
-                self.apply_on_pointer(|_, data| {
-                    data.unlock_pointer();
-                    unset_old = true;
-                });
-            },
-        }
-
-        // In case we haven't unset the old mode, it means that we don't have a cursor above
-        // the window, thus just wait for it to re-appear.
-        if !unset_old {
-            return Ok(());
-        }
-
-        let mut set_mode = false;
-        let surface = self.window.wl_surface();
-        match mode {
-            CursorGrabMode::Locked => self.apply_on_pointer(|pointer, data| {
-                let pointer = pointer.pointer();
-                data.lock_pointer(pointer_constraints, surface, pointer, &self.queue_handle);
-                set_mode = true;
-            }),
-            CursorGrabMode::Confined => self.apply_on_pointer(|pointer, data| {
-                let pointer = pointer.pointer();
-                data.confine_pointer(pointer_constraints, surface, pointer, &self.queue_handle);
-                set_mode = true;
-            }),
-            CursorGrabMode::None => {
-                // Current lock/confine was already removed.
-                set_mode = true;
-            },
-        }
-
-        // Replace the current grab mode after we've ensure that it got updated.
-        if set_mode {
-            self.cursor_grab_mode.current_grab_mode = mode;
-        }
-
-        Ok(())
-    }
-
     pub fn show_window_menu(&self, position: LogicalPosition<u32>) {
+        let xdg_toplevel = self.xdg_toplevel();
         // TODO(kchibisov) handle touch serials.
-        self.apply_on_pointer(|_, data| {
-            let serial = data.latest_button_serial();
-            let seat = data.seat();
-            self.window.show_window_menu(seat, serial, position.into());
+        self.apply_on_pointer(|pointer| {
+            self.seats.with_seat(pointer.seat(), |seat| {
+                let serial = seat.pointer_button_serial.unwrap_or_default();
+                // SAFETY: this window's live toplevel and the seat lent live.
+                unsafe {
+                    xdg_toplevel::show_window_menu(
+                        xdg_toplevel,
+                        seat.seat,
+                        serial,
+                        position.x as i32,
+                        position.y as i32,
+                    )
+                };
+            });
         });
     }
 
-    /// Set the position of the cursor.
-    pub fn set_cursor_position(&self, position: LogicalPosition<f64>) -> Result<(), ExternalError> {
-        if self.pointer_constraints.is_none() {
-            return Err(ExternalError::NotSupported(NotSupportedError::new()));
-        }
-
-        // Position can be set only for locked cursor.
-        if self.cursor_grab_mode.current_grab_mode != CursorGrabMode::Locked {
-            return Err(ExternalError::Os(os_error!(crate::platform_impl::OsError::Misc(
-                "cursor position can be set only for locked cursor."
-            ))));
-        }
-
-        self.apply_on_pointer(|_, data| {
-            data.set_locked_cursor_position(position.x, position.y);
-        });
-
-        Ok(())
+    /// Set the position of the cursor: not supported (LW.7: no pointer constraints).
+    pub fn set_cursor_position(
+        &self,
+        _position: LogicalPosition<f64>,
+    ) -> Result<(), ExternalError> {
+        Err(ExternalError::NotSupported(NotSupportedError::new()))
     }
 
     /// Set the visibility state of the cursor.
@@ -979,14 +847,9 @@ impl WindowState {
         if self.cursor_visible {
             match &self.selected_cursor {
                 SelectedCursor::Named(icon) => self.set_cursor(*icon),
-                SelectedCursor::Custom(cursor) => self.apply_custom_cursor(cursor),
             }
         } else {
-            for pointer in self.pointers.iter().filter_map(|pointer| pointer.upgrade()) {
-                let latest_enter_serial = pointer.pointer().winit_data().latest_enter_serial();
-
-                pointer.pointer().set_cursor(latest_enter_serial, None, 0, 0);
-            }
+            self.apply_on_pointer(|pointer| pointer.hide_cursor(&self.seats));
         }
     }
 
@@ -1001,30 +864,34 @@ impl WindowState {
 
         match self.last_configure.as_ref().map(|configure| configure.decoration_mode) {
             Some(DecorationMode::Server) if !self.decorate => {
-                // To disable decorations we should request client and hide the frame.
-                self.window.request_decoration_mode(Some(DecorationMode::Client))
+                // To disable decorations we should request client mode, which has no frame.
+                self.request_decoration_mode(zxdg_toplevel_decoration_v1::mode::CLIENT_SIDE)
             },
-            _ if self.decorate => self.window.request_decoration_mode(Some(DecorationMode::Server)),
+            _ if self.decorate => {
+                self.request_decoration_mode(zxdg_toplevel_decoration_v1::mode::SERVER_SIDE)
+            },
             _ => (),
         }
+    }
 
-        if let Some(frame) = self.frame.as_mut() {
-            frame.set_hidden(!decorate);
-            // Force the resize.
-            self.resize(self.size);
+    /// Ask the compositor for a decoration mode, where it negotiates one.
+    fn request_decoration_mode(&self, mode: u32) {
+        if let Some(decoration) = self.objects.decoration.as_ref() {
+            // SAFETY: this window's live toplevel decoration.
+            unsafe { zxdg_toplevel_decoration_v1::set_mode(decoration.proxy(), mode) };
         }
     }
 
     /// Add seat focus for the window.
     #[inline]
-    pub fn add_seat_focus(&mut self, seat: ObjectId) {
+    pub fn add_seat_focus(&mut self, seat: u32) {
         self.seat_focus.insert(seat);
     }
 
     /// Remove seat focus from the window.
     #[inline]
-    pub fn remove_seat_focus(&mut self, seat: &ObjectId) {
-        self.seat_focus.remove(seat);
+    pub fn remove_seat_focus(&mut self, seat: u32) {
+        self.seat_focus.remove(&seat);
     }
 
     /// Returns `true` if the requested state was applied.
@@ -1032,7 +899,7 @@ impl WindowState {
         self.ime_allowed = allowed;
 
         let mut applied = false;
-        for text_input in &self.text_inputs {
+        for text_input in self.text_inputs.iter().filter_map(Weak::upgrade) {
             applied = true;
             if allowed {
                 text_input.enable();
@@ -1053,8 +920,11 @@ impl WindowState {
         // which seat we're setting IME position.
         let (x, y) = (position.x as i32, position.y as i32);
         let (width, height) = (size.width as i32, size.height as i32);
-        for text_input in self.text_inputs.iter() {
-            text_input.set_cursor_rectangle(x, y, width, height);
+        for text_input in self.text_inputs.iter().filter_map(Weak::upgrade) {
+            text_input.request(|proxy| {
+                // SAFETY: the seat's live text input, held by the upgrade.
+                unsafe { zwp_text_input_v3::set_cursor_rectangle(proxy, x, y, width, height) }
+            });
             text_input.commit();
         }
     }
@@ -1063,7 +933,7 @@ impl WindowState {
     pub fn set_ime_purpose(&mut self, purpose: ImePurpose) {
         self.ime_purpose = purpose;
 
-        for text_input in &self.text_inputs {
+        for text_input in self.text_inputs.iter().filter_map(Weak::upgrade) {
             text_input.set_content_type_by_purpose(purpose);
             text_input.commit();
         }
@@ -1080,34 +950,22 @@ impl WindowState {
         self.scale_factor = scale_factor;
 
         // NOTE: When fractional scaling is not used update the buffer scale.
-        if self.fractional_scale.is_none() {
-            let _ = self.window.set_buffer_scale(self.scale_factor as _);
-        }
-
-        if let Some(frame) = self.frame.as_mut() {
-            frame.set_scaling_factor(scale_factor);
+        let surface = self.surface();
+        // SAFETY: this window's live surface; `set_buffer_scale` is version 3's.
+        if self.objects.fractional_scale.is_none() && unsafe { surface.version() } >= 3 {
+            // SAFETY: as above.
+            unsafe { wl_surface::set_buffer_scale(surface, self.scale_factor as _) };
         }
     }
 
-    /// Make window background blurred (aterm: without `wayland-kwin-blur`, never bound)
+    /// Make window background blurred.
+    ///
+    /// LOCAL PATCH (aterm), LW.7: the `wayland-kwin-blur` feature left with
+    /// wayland-protocols-plasma, so blur is never available, as it was without the feature.
     #[inline]
     pub fn set_blur(&mut self, blurred: bool) {
-        #[cfg(not(feature = "wayland-kwin-blur"))]
         if blurred {
             info!("Blur manager unavailable, unable to change blur")
-        }
-        #[cfg(feature = "wayland-kwin-blur")]
-        if blurred && self.blur.is_none() {
-            if let Some(blur_manager) = self.blur_manager.as_ref() {
-                let blur = blur_manager.blur(self.window.wl_surface(), &self.queue_handle);
-                blur.commit();
-                self.blur = Some(blur);
-            } else {
-                info!("Blur manager unavailable, unable to change blur")
-            }
-        } else if !blurred && self.blur.is_some() {
-            self.blur_manager.as_ref().unwrap().unset(self.window.wl_surface());
-            self.blur.take().unwrap().release();
         }
     }
 
@@ -1125,13 +983,15 @@ impl WindowState {
             title.truncate(new_len);
         }
 
-        // Update the CSD title.
-        if let Some(frame) = self.frame.as_mut() {
-            frame.set_title(&title);
-        }
-
-        self.window.set_title(&title);
+        // SAFETY: this window's live toplevel.
+        unsafe { xdg_toplevel::set_title(self.xdg_toplevel(), &protocol_string(&title)) };
         self.title = title;
+    }
+
+    /// Set the window's app id (`xdg_toplevel.set_app_id`).
+    pub fn set_app_id(&self, app_id: &str) {
+        // SAFETY: this window's live toplevel.
+        unsafe { xdg_toplevel::set_app_id(self.xdg_toplevel(), &protocol_string(app_id)) };
     }
 
     /// Mark the window as transparent.
@@ -1143,18 +1003,18 @@ impl WindowState {
 
     /// Register text input on the top-level.
     #[inline]
-    pub fn text_input_entered(&mut self, text_input: &ZwpTextInputV3) {
-        if !self.text_inputs.iter().any(|t| t == text_input) {
-            self.text_inputs.push(text_input.clone());
+    pub fn text_input_entered(&mut self, text_input: &Arc<TextInput>) {
+        let weak = Arc::downgrade(text_input);
+        if !self.text_inputs.iter().any(|t| t.ptr_eq(&weak)) {
+            self.text_inputs.push(weak);
         }
     }
 
     /// The text input left the top-level.
     #[inline]
-    pub fn text_input_left(&mut self, text_input: &ZwpTextInputV3) {
-        if let Some(position) = self.text_inputs.iter().position(|t| t == text_input) {
-            self.text_inputs.remove(position);
-        }
+    pub fn text_input_left(&mut self, text_input: &Arc<TextInput>) {
+        let weak = Arc::downgrade(text_input);
+        self.text_inputs.retain(|t| t.strong_count() > 0 && !t.ptr_eq(&weak));
     }
 
     /// Get the cached title.
@@ -1164,40 +1024,11 @@ impl WindowState {
     }
 }
 
-impl Drop for WindowState {
-    fn drop(&mut self) {
-        #[cfg(feature = "wayland-kwin-blur")]
-        if let Some(blur) = self.blur.take() {
-            blur.release();
-        }
-
-        if let Some(fs) = self.fractional_scale.take() {
-            fs.destroy();
-        }
-
-        if let Some(viewport) = self.viewport.take() {
-            viewport.destroy();
-        }
-
-        // NOTE: the wl_surface used by the window is being cleaned up when
-        // dropping SCTK `Window`.
-    }
-}
-
-/// The state of the cursor grabs.
-#[derive(Clone, Copy)]
-struct GrabState {
-    /// The grab mode requested by the user.
-    user_grab_mode: CursorGrabMode,
-
-    /// The current grab mode.
-    current_grab_mode: CursorGrabMode,
-}
-
-impl GrabState {
-    fn new() -> Self {
-        Self { user_grab_mode: CursorGrabMode::None, current_grab_mode: CursorGrabMode::None }
-    }
+/// A Rust string as a protocol string: up to its first NUL, which a protocol string cannot
+/// carry (wayland-client would have refused the whole string).
+pub(crate) fn protocol_string(s: &str) -> CString {
+    let end = s.find('\0').unwrap_or(s.len());
+    CString::new(&s[..end]).unwrap_or_default()
 }
 
 /// The state of the frame callback.
@@ -1212,27 +1043,70 @@ pub enum FrameCallbackState {
     Received,
 }
 
-impl From<ResizeDirection> for XdgResizeEdge {
-    fn from(value: ResizeDirection) -> Self {
-        match value {
-            ResizeDirection::North => XdgResizeEdge::Top,
-            ResizeDirection::West => XdgResizeEdge::Left,
-            ResizeDirection::NorthWest => XdgResizeEdge::TopLeft,
-            ResizeDirection::NorthEast => XdgResizeEdge::TopRight,
-            ResizeDirection::East => XdgResizeEdge::Right,
-            ResizeDirection::SouthWest => XdgResizeEdge::BottomLeft,
-            ResizeDirection::SouthEast => XdgResizeEdge::BottomRight,
-            ResizeDirection::South => XdgResizeEdge::Bottom,
-        }
+/// `xdg_toplevel.resize`'s edge for `direction`.
+fn resize_edge(direction: ResizeDirection) -> u32 {
+    use xdg_toplevel::resize_edge as edge;
+    match direction {
+        ResizeDirection::North => edge::TOP,
+        ResizeDirection::West => edge::LEFT,
+        ResizeDirection::NorthWest => edge::TOP_LEFT,
+        ResizeDirection::NorthEast => edge::TOP_RIGHT,
+        ResizeDirection::East => edge::RIGHT,
+        ResizeDirection::SouthWest => edge::BOTTOM_LEFT,
+        ResizeDirection::SouthEast => edge::BOTTOM_RIGHT,
+        ResizeDirection::South => edge::BOTTOM,
     }
 }
 
-// NOTE: Rust doesn't allow `From<Option<Theme>>`.
-#[cfg(feature = "sctk-adwaita")]
-fn into_sctk_adwaita_config(theme: Option<Theme>) -> sctk_adwaita::FrameConfig {
-    match theme {
-        Some(Theme::Light) => sctk_adwaita::FrameConfig::light(),
-        Some(Theme::Dark) => sctk_adwaita::FrameConfig::dark(),
-        None => sctk_adwaita::FrameConfig::auto(),
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_configure_s_states_and_capabilities_are_read_and_unknown_values_left_out() {
+        use xdg_toplevel::{state, wm_capabilities as cap};
+        let states = XdgWindowState::from_wire(&[
+            state::MAXIMIZED,
+            state::ACTIVATED,
+            state::TILED_TOP,
+            state::CONSTRAINED_LEFT,
+            0xffff,
+        ]);
+        assert_eq!(
+            states,
+            XdgWindowState::MAXIMIZED | XdgWindowState::ACTIVATED | XdgWindowState::TILED_TOP
+        );
+        let configure = WindowConfigure { state: states, ..WindowConfigure::default() };
+        assert!(configure.is_maximized() && configure.is_tiled() && !configure.is_fullscreen());
+        assert_eq!(
+            WindowManagerCapabilities::from_wire(&[cap::MINIMIZE, cap::WINDOW_MENU, 9]),
+            WindowManagerCapabilities::MINIMIZE | WindowManagerCapabilities::WINDOW_MENU
+        );
+        // Before a `wm_capabilities` event every capability is assumed, as sctk assumed it.
+        assert!(WindowConfigure::default().capabilities.is_all());
+    }
+
+    #[test]
+    fn every_resize_direction_names_its_edge() {
+        use xdg_toplevel::resize_edge as edge;
+        let all = [
+            (ResizeDirection::North, edge::TOP),
+            (ResizeDirection::South, edge::BOTTOM),
+            (ResizeDirection::West, edge::LEFT),
+            (ResizeDirection::East, edge::RIGHT),
+            (ResizeDirection::NorthWest, edge::TOP_LEFT),
+            (ResizeDirection::NorthEast, edge::TOP_RIGHT),
+            (ResizeDirection::SouthWest, edge::BOTTOM_LEFT),
+            (ResizeDirection::SouthEast, edge::BOTTOM_RIGHT),
+        ];
+        for (direction, want) in all {
+            assert_eq!(resize_edge(direction), want, "{direction:?}");
+        }
+    }
+
+    #[test]
+    fn a_protocol_string_stops_at_a_nul() {
+        assert_eq!(protocol_string("aterm").as_bytes(), b"aterm");
+        assert_eq!(protocol_string("a\0b").as_bytes(), b"a");
     }
 }

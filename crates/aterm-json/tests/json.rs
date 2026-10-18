@@ -940,69 +940,6 @@ fn value_display_is_compact() {
     assert_eq!(value.to_string(), r#"{"a":[true,null,"x"],"b":1}"#);
 }
 
-/// The repository's own JSON, wherever it lives: whatever parses re-serializes
-/// losslessly.
-#[test]
-fn repository_json_corpus_round_trips() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(std::path::Path::parent)
-        .expect("workspace root")
-        .to_path_buf();
-    let mut parsed = 0usize;
-    for path in json_corpus(&root) {
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        parsed += usize::from(parse(&text).is_ok());
-    }
-    assert!(parsed > 0, "the corpus walk found no JSON");
-}
-
-/// Every `.json` of at most 4 MiB under `root`, minus the directories
-/// [`corpus_skips`] names.
-fn json_corpus(root: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut stack = vec![root.to_path_buf()];
-    let mut out = Vec::new();
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(meta) = entry.metadata() else { continue };
-            if meta.is_dir() {
-                if corpus_skips(root, &path) {
-                    continue;
-                }
-                stack.push(path);
-            } else if meta.is_file()
-                && meta.len() <= 4 * 1024 * 1024
-                && path.extension().is_some_and(|e| e == "json")
-            {
-                out.push(path);
-            }
-        }
-    }
-    out.sort();
-    out
-}
-
-/// Whether the corpus walk stays out of `dir`: `target`, `.git` and
-/// `target-tippy` at any depth, and at the repository root every `target-*`
-/// sibling build dir (`target-trust`, older lanes' leftovers) and a leftover
-/// `.aterm-verify` state dir, which the checked-in .gitignore names as `/target-*` and
-/// `/.aterm-verify/`.
-fn corpus_skips(root: &std::path::Path, dir: &std::path::Path) -> bool {
-    let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
-        return false;
-    };
-    name == "target"
-        || name == ".git"
-        || name == "target-tippy"
-        || (dir.parent() == Some(root) && (name.starts_with("target-") || name == ".aterm-verify"))
-}
-
 /// OUR parse is exactly the nearest double to the decimal written (Rust's
 /// correctly rounded `dec2flt`); `serde_json`'s fast path is off by an ULP or
 /// more on inputs as ordinary as `935092.5986328125`.

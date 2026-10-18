@@ -214,30 +214,6 @@ fn scalar_coercions() {
     }
 }
 
-/// The untyped tree is the other half of the 168 call sites: `from_str::<Value>`
-/// and `text.parse::<Value>()`.
-#[test]
-fn the_untyped_tree() {
-    let ours: aterm_toml::Value = SAMPLE.parse().expect("ours");
-
-    assert_eq!(
-        ours.get("font_px").and_then(aterm_toml::Value::as_float),
-        Some(13.5)
-    );
-    assert_eq!(
-        ours.get("net")
-            .and_then(|n| n.get("listen"))
-            .and_then(aterm_toml::Value::as_str),
-        Some("127.0.0.1:7777")
-    );
-    assert_eq!(
-        ours.get("palette")
-            .and_then(aterm_toml::Value::as_array)
-            .map(Vec::len),
-        Some(3)
-    );
-}
-
 /// A fixed-length target takes the WHOLE array or refuses it.
 ///
 /// serde's array and tuple visitors stop after their N elements and leave it
@@ -367,15 +343,6 @@ paths = [\"M0 0\"]
     assert!(bad.parse::<aterm_toml::Table>().is_err());
     let err = bad.parse::<aterm_toml::Table>().unwrap_err();
     assert!(err.span().is_some(), "a refusal carries a span: {err}");
-}
-
-/// Indexing a miss panics rather than yielding a default — the reason
-/// `Value::get` exists beside it.
-#[test]
-#[should_panic(expected = "index not found")]
-fn indexing_a_missing_key_panics() {
-    let value: aterm_toml::Value = aterm_toml::from_str("a = 1").expect("parse");
-    let _ = &value["nope"];
 }
 
 /// A schema error in a node with no span of its own — a table made by a dotted

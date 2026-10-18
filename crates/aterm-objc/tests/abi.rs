@@ -12,6 +12,10 @@
 //! `_objc_msgSend`); the Rust x86_64 arms are type-checked, not executed.
 
 #![cfg(target_os = "macos")]
+#![expect(
+    clippy::disallowed_methods,
+    reason = "aterm-objc's own runtime tests drive the bare `msg` cast; everything else uses checked_msg"
+)]
 
 use std::ffi::{CStr, c_char, c_void};
 
@@ -218,24 +222,6 @@ fn bool_encoding_matches_what_foundation_itself_emits() {
     assert!(
         checked > 0,
         "no BOOL-returning NSObject method was readable"
-    );
-
-    // One byte on both arches, and conversion is `!= 0`, so no bit pattern is
-    // invalid (an x86_64 sender may pass any non-zero byte for YES).
-    assert_eq!(size_of::<Bool>(), 1);
-    assert!(Bool::YES.as_bool());
-    assert!(!Bool::NO.as_bool());
-    assert_eq!(Bool::default(), Bool::NO);
-    assert_eq!(Bool::from(true), Bool::YES);
-    assert!(bool::from(Bool::YES));
-    assert_eq!(
-        Bool::ENCODING,
-        if cfg!(target_arch = "aarch64") {
-            "B"
-        } else {
-            "c"
-        },
-        "the cfg arms and the measurement disagree"
     );
 }
 

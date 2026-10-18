@@ -323,10 +323,96 @@ pub(crate) fn capped_labels(labels: &[String]) -> Cow<'_, [String]> {
     )
 }
 
+/// Whether `ch` is a frame of a busy spinner an agent animates at the head
+/// of its OSC title: any braille pattern (U+2800–U+28FF — every braille set
+/// of cli-spinners, Codex's `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏` among them), and the circle and
+/// corner sets (`◐◑◒◓◔◕`, Claude Code's moons; `◴◵◶◷`, `◰◱◲◳`, `◜◝◞◟◠◡`,
+/// `◢◣◤◥`). A rest mark an agent keeps while idle (Claude Code's `✳`) is no
+/// frame.
+#[must_use]
+pub(crate) fn is_spinner_frame(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{2800}'..='\u{28FF}'
+            | '\u{25D0}'..='\u{25D5}'
+            | '\u{25F4}'..='\u{25F7}'
+            | '\u{25F0}'..='\u{25F3}'
+            | '\u{25DC}'..='\u{25E1}'
+            | '\u{25E2}'..='\u{25E5}'
+    )
+}
+
+/// AN AGENT'S TITLE SUBJECT WITHOUT ITS SPINNER FRAME: `title` past a leading
+/// frame ([`is_spinner_frame`]) and the blanks after it. A surface that
+/// shows the subject as a snapshot — a Settings ▸ Harness row, the
+/// Autopilot menu's name, the menu bar's window rows, a session's name on a
+/// card, a picker, a connection line or the connection map
+/// (`SessionHandle::display_title`) — reads it through here, so it never freezes one frame
+/// of an animation (a braille frame draws as a blank indent in a UI face:
+/// the Together run's D7). The live chrome (the strip, the window title)
+/// keeps the frame and coalesces its phases instead
+/// (`toolbar::busy_spinner_phase_only_change`). A frame with no blank after
+/// it, or with nothing after it, is the title's own text and stays.
+#[must_use]
+pub(crate) fn without_spinner_frame(title: &str) -> &str {
+    let mut chars = title.chars();
+    match chars.next() {
+        Some(frame) if is_spinner_frame(frame) => {
+            let rest = chars.as_str();
+            let subject = rest.trim_start();
+            if subject.len() < rest.len() && !subject.is_empty() {
+                subject
+            } else {
+                title
+            }
+        }
+        _ => title,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use aterm_grapheme::GraphemeClusters as _;
+
+    /// A SNAPSHOT OF AN AGENT'S TITLE DROPS ITS SPINNER FRAME (the Together
+    /// run's D7: `⠦ Add tested calculator functions | proj-codex` on the
+    /// Settings ▸ Harness row, drawn as a blank indent): every braille frame
+    /// and every circle or corner frame, generally — not one glyph. NEGATIVE
+    /// CONTROLS: Claude Code's rest mark `✳` stays; a frame glued to a word,
+    /// a frame alone, a frame in the middle and a plain title are untouched.
+    #[test]
+    fn a_titles_leading_spinner_frame_is_dropped_and_nothing_else() {
+        let subject = "Add tested calculator functions | proj-codex";
+        for frame in ('\u{2800}'..='\u{28FF}').chain(
+            "\u{25D0}\u{25D1}\u{25D2}\u{25D3}\u{25D4}\u{25D5}\u{25F4}\u{25F5}\u{25F6}\u{25F7}\
+             \u{25F0}\u{25F1}\u{25F2}\u{25F3}\u{25DC}\u{25DD}\u{25DE}\u{25DF}\u{25E0}\u{25E1}\
+             \u{25E2}\u{25E3}\u{25E4}\u{25E5}"
+                .chars(),
+        ) {
+            let title = format!("{frame} {subject}");
+            assert_eq!(without_spinner_frame(&title), subject, "{frame:?}");
+            let title = format!("{frame}\u{a0} {subject}");
+            assert_eq!(without_spinner_frame(&title), subject, "{frame:?}");
+        }
+        assert_eq!(
+            without_spinner_frame("\u{25D1} Calc.py small tested module"),
+            "Calc.py small tested module",
+            "Claude Code's busy moon"
+        );
+        for kept in [
+            "\u{2733} Calc.py small tested module",
+            "\u{2733} Claude Code",
+            "\u{2826}Add",
+            "\u{2826}",
+            "\u{2826}  ",
+            "proj \u{2826} codex",
+            "Add tested calculator functions",
+            "",
+        ] {
+            assert_eq!(without_spinner_frame(kept), kept, "{kept:?}");
+        }
+    }
 
     /// Where the mark sits for a cap of 96: after the 48-cluster head.
     const MARK: usize = MAX_CHROME_TITLE_GRAPHEMES - MAX_CHROME_TITLE_GRAPHEMES / 2;

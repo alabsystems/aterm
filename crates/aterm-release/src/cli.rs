@@ -7,11 +7,11 @@
 //! [--release-credentials <profile.toml>] [--engine DIR] [--dry-run] [--verbose]
 //! [--prepare] [--forget | --abandon vX.Y.Z]`, `build` (the release bundle, or
 //! HEAD's provisional bundle between releases), `cut [--dry-run]
-//! [--resume] [--abandon vX.Y.Z] [--min-build N] [--rehearse OWNER/REPO]
+//! [--resume] [--abandon vX.Y.Z] [--min-build N]
 //! [--release-credentials <profile.toml>]` (the release's `cut`),
 //! `recover vX.Y.Z <claim-sha> --old-publisher-stopped`, `status`,
 //! `check [--commit REV] [--engine DIR] [--cut] [--export] [--wasm32]`,
-//! `trust run|candidate|verdict|judge|pending|compare`,
+//! `trust run|candidate|judge|compare`,
 //! `verify [vX.Y.Z]`, `site [--latest] [--dry-run] …` (alab.systems brought to a release),
 //! `hook pre-promote|post-promote|transforms` (the publication engine's hooks),
 //! `yank <build> [--release-credentials <profile.toml>] --mac-only|--linux-artifacts DIRECTORY`,
@@ -22,24 +22,7 @@ use std::process::Command;
 use crate::ledger::{self, Error};
 use crate::{publish, verify};
 
-/// The retired pre-roster acknowledgement. A leftover spelling in a script or a
-/// runbook is refused by name, in one sentence, rather than as an unknown flag.
-pub const RETIRED_STRAND_FLAG: &str = "--strand-pre-roster-clients";
-
-/// The one sentence [`RETIRED_STRAND_FLAG`] is refused with.
-pub const RETIRED_STRAND_REFUSAL: &str = "--strand-pre-roster-clients is retired: installs older \
-     than v0.21.0 are abandoned and every current client authorizes a release by the machine \
-     roster alone, so a rostered key needs no acknowledgement — drop the flag";
-
-/// The retired exit for a cut that went live on the private origin and could not be
-/// mirrored. A cut publishes once now, onto the channel, so that state cannot exist.
-pub const RETIRED_UNMIRRORED_FLAG: &str = "--retire-unmirrored";
-
-/// The one sentence [`RETIRED_UNMIRRORED_FLAG`] is refused with.
-pub const RETIRED_UNMIRRORED_REFUSAL: &str = "--retire-unmirrored is retired: a cut publishes \
-     once, onto the channel; withdraw an unpublished cut with `ship release --abandon vX.Y.Z`";
-
-/// Why a real or rehearsal cut that says nothing about Linux is refused.
+/// Why a real cut that says nothing about Linux is refused.
 pub const MAC_ONLY_REFUSAL: &str = "this cut says nothing about Linux: pass --linux-artifacts \
      DIRECTORY (with --linux-worker ARCH=HOST:REPO for each native host the cutter should drive, \
      or build there by hand) to ship Linux, or --mac-only to ship a Mac-only release on purpose. \
@@ -54,8 +37,7 @@ USAGE
                  [--release-credentials <profile.toml>] [--engine DIRECTORY]
                  [--dry-run] [--verbose] [--prepare] [--forget | --abandon vX.Y.Z]
       THE way to release aterm, from a clean clone of its own on main: checks,
-      sync, commit, the stage (R's commit-only gates, then pub stage beside the
-      handoff fixture guard and the L0 censuses), the
+      sync, commit, the stage (R's commit-only gates, then pub stage), the
       ONE build (both slices at once, kept in the release cache), `verify
       release` on those bytes (every check a release requires, MEASURE among
       them), READY, pub publish, the cut (it claims, then signs the verified
@@ -118,8 +100,7 @@ USAGE
       then give the complete handoff directory to the canonical cutter.
 
   targo --unverified ship cut [--dry-run] [--resume] [--abandon vX.Y.Z]
-                 [--min-build N] [--rehearse OWNER/REPO]
-                 [--release-credentials <profile.toml>]
+                 [--min-build N] [--release-credentials <profile.toml>]
                  [--linux-artifacts DIRECTORY [--linux-target aarch64|x86_64]...
                   [--linux-worker ARCH=HOST:REPO]... | --mac-only]
       The CUT step of `ship release`, which runs it (a release is `ship release` and
@@ -127,8 +108,8 @@ USAGE
       byte copy of the VERIFIED bundle signed, notarized and packaged (the cut
       never builds) → tag → ONE publication onto the release channel, made the
       head last — the binary of the commit `pub publish` published, by that
-      commit's own cutter (the release re-runs as it). A real or rehearsal cut
-      must name --linux-artifacts or --mac-only.
+      commit's own cutter (the release re-runs as it). A real cut must name
+      --linux-artifacts or --mac-only.
         --dry-run          gates + a byte copy of the VERIFIED bundle this
                            clone's release built of the checkout's commit,
                            under its reserved number (claimed nowhere), signed
@@ -141,9 +122,6 @@ USAGE
                            release; its origin tag and the local journal deleted
                            (the claim commit stays; a later cut recuts)
         --min-build N      emit an operator apply floor into the manifest
-        --rehearse O/R     full real cut of that verified bundle published to
-                           the scratch channel O/R, which must be PUBLIC (its
-                           reserved number, no ledger push, no tag on origin)
         --linux-artifacts DIRECTORY
                            require declared Linux handoffs before signing;
                            missing workers pause the journaled cut for resume
@@ -154,8 +132,8 @@ USAGE
                            throwaway worktree of REPO at the claim commit) and
                            copy its pair into --linux-artifacts; the pair is
                            checked exactly like a hand-carried one
-        --mac-only         ship no Linux build, on purpose; a real or rehearsal
-                           cut must say this or --linux-artifacts
+        --mac-only         ship no Linux build, on purpose; a real cut must say
+                           this or --linux-artifacts
         --release-credentials <profile.toml>
                            the signing profile: a rostered, unrevoked machine
                            key and its notary credential (this machine's is
@@ -172,8 +150,7 @@ USAGE
                            stage2 (real smoke-compile), the targo/tippy/ty
                            drivers, the store's targo + trustc front door
                            (rustup's link reported informationally), the stable x86_64
-                           slice, the stable std of the foreign cells `verify
-                           release` type-checks, Apple identity + live-tested notary
+                           slice, Apple identity + live-tested notary
                            credential, the credentials profile, gh auth, channel
                            token — each gap with its exact remedy, and only on a
                            CLEAN pass mints this machine's key via the join
@@ -234,31 +211,30 @@ USAGE
                            workspace library and vendored fork (--whole-tree), or
                            only what the stored facts of this tree left undecided
                            (--remeasure), each check in a slot of its own under
-                           --target-root (default <repo>/target-trust), ended at
-                           --crate-budget (default 21600 s) as OVER-BUDGET; then
-                           the judge holds what each measured to
+                           --target-root, ended at --crate-budget (default
+                           21600 s) as OVER-BUDGET; then the judge holds what
+                           each measured to
                            crates/aterm-release/trust/floors.tsv. A whole-tree run
-                           on a clean checkout files the facts a release reads.
+                           on a clean checkout files facts for explicit verdicts.
                            A member feature that turns on fork code is a row of
                            its own, <lib>+<feature> (aterm-link+sealed), checked
                            with --features <feature>; -p <lib> selects it too.
                            --update-ratchet raises floors it meets (never lowers
-                           one) and keeps trust/memory.tsv current; --try-refused
-                           verifies what this host would refuse for memory;
-                           --stop-if-narrowed stops before any check when it
-                           would; --obligations keeps each check's
-                           per-obligation record (the candidate gate's). Exit 0
+                           one) and keeps trust/memory.tsv and trust/costs.tsv
+                           current; --try-refused verifies what this host would
+                           refuse for memory; --stop-if-narrowed stops before
+                           any check when it would; --obligations keeps each check's
+                           per-obligation record (the candidate gate's).
+                           --target-root defaults to <repo>/target-trust, or,
+                           where `targo trust` refuses a component of that (a
+                           checkout made under umask 002 is 0775), to this
+                           checkout's aterm-trust-lane/<dir>-<hash> in
+                           $XDG_CACHE_HOME or ~/.cache (macOS:
+                           ~/Library/Caches/aterm-trust-lane.noindex/), said on
+                           one line; a named root never moves. Before any check
+                           a refused root or prover is COULD NOT RUN with its fix
+                           (chmod go-w <dir> for a directory of yours). Exit 0
                            pass, 1 fail, 2 nothing decided, 4 narrowed by memory
-  targo --unverified ship trust verdict [--commit REV] [--prover BIN-DIR]
-                           the whole-tree Trust lane's verdict for REV (default
-                           HEAD), JUDGED NOW: the facts a whole-tree run filed
-                           for REV's tree less its floors (trust/floors.tsv and
-                           trust/memory.tsv), from the prover the cut judges
-                           with (--prover names its bin/; default: the cut's
-                           own), held to REV's own floors. One line; exit 0
-                           VERIFIED, 1 not, 2 could not answer. A commit that
-                           changes only the floors reuses the facts of the run
-                           before it, its floors held to the up-only rule
   targo --unverified ship trust judge [--commit REV] [--prover BIN-DIR] [--update-ratchet [--reason WHY]]
                            the lane's whole report for REV's stored facts,
                            judged against the WORKING tree's floors;
@@ -269,11 +245,6 @@ USAGE
                            recorded that the facts fall below is lowered onto
                            this prover, WHY in its fifth column; working floors
                            the up-only rule refuses are named LOWERED, and fail
-  targo --unverified ship trust pending [--commit REV] [--prover BIN-DIR]
-                           the libraries REV's stored facts leave undecided
-                           (trustd did not admit them, or lapsed budgets could
-                           cover their shortfall), one per line: what
-                           `trust run --remeasure` runs again
   targo --unverified ship trust candidate --candidate <staged toolchain dir>
         [--base <bin> | --base-build N] [--crate-budget SECONDS] [--jobs N|auto]
         [--out DIR] [--min-free-gib N] [--no-guard | [--guard-footprint-gib G]
@@ -361,6 +332,14 @@ USAGE
                            its pre-claim gates (0 yes, 1 refused, 2 not asked);
                            post-promote is `ship site` (its promote-time run defers
                            to the cut); transforms rewrites the export at EXPORT
+  targo --unverified ship tap deploy <tap checkout> [--dry-run]
+                           mirror distribution/homebrew-tap (README.md,
+                           MAINTENANCE.md, Casks/*.rb) into a checkout of
+                           alabsystems/homebrew-tap, keeping each live cask's
+                           version and sha256 lines (`pub tap --bump` owns them),
+                           refusing a .github/ or internal-only wording, and
+                           commit it there; the push is the owner's, with the
+                           owner's credential. --dry-run prints the plan
   targo --unverified ship yank <build> [--release-credentials <profile.toml>]
                  (--linux-artifacts DIRECTORY [--linux-target aarch64|x86_64]...
                   [--linux-worker ARCH=HOST:REPO]... | --mac-only)
@@ -423,6 +402,8 @@ pub enum Cmd {
     Site(Vec<String>),
     /// `hook <name> …` — the publication engine's hooks ([`crate::hook`]).
     Hook(Vec<String>),
+    /// `tap deploy …` — the Homebrew tap's structure, mirrored ([`crate::tap`]).
+    Tap(Vec<String>),
     Yank {
         build: u64,
         /// A yank PUBLISHES a successor before it deletes anything, so it takes
@@ -755,7 +736,7 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
             // cut, and a real cut that says nothing about Linux is refused.
             //
             // Nothing else: every other cut flag either contradicts what
-            // a yank's successor is (--dry-run/--rehearse publish nothing to
+            // a yank's successor is (--dry-run publishes nothing to
             // prove, --resume belongs to the journal) or is the yank's own
             // decision (--min-build is fixed at bad build + 1), so accepting one
             // could only mean ignoring it.
@@ -773,7 +754,6 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
                     "--linux-artifacts" | "--linux-worker" | "--mac-only" | "--linux-target" => {
                         yank_linux(&mut opts).take(flag, &mut it)?;
                     }
-                    RETIRED_STRAND_FLAG => return Err(RETIRED_STRAND_REFUSAL.to_string()),
                     extra => {
                         return Err(format!(
                             "yank takes one build number, optionally --release-credentials \
@@ -794,6 +774,7 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
         "dev-app" => crate::dev_app::parse(&mut it).map(Cmd::DevApp),
         "site" => Ok(Cmd::Site(it.map(str::to_string).collect())),
         "hook" => Ok(Cmd::Hook(it.map(str::to_string).collect())),
+        "tap" => Ok(Cmd::Tap(it.map(str::to_string).collect())),
         other => Err(format!("unknown command {other:?}")),
     }
 }
@@ -983,7 +964,6 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
     let mut abandon: Option<String> = None;
     while let Some(flag) = it.next() {
         match flag {
-            RETIRED_UNMIRRORED_FLAG => return Err(RETIRED_UNMIRRORED_REFUSAL.to_string()),
             "--dry-run" => opts.dry_run = true,
             "--resume" => opts.resume = true,
             "--linux-artifacts" | "--linux-worker" | "--mac-only" | "--linux-target" => {
@@ -995,7 +975,6 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
                 }
                 .take(flag, it)?;
             }
-            RETIRED_STRAND_FLAG => return Err(RETIRED_STRAND_REFUSAL.to_string()),
             // The ONE signing input. A path in the command, never an ambient file:
             // "what signed this?" is answered by reading the command that ran.
             "--release-credentials" => {
@@ -1017,15 +996,6 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
                     .map_err(|_| format!("--min-build: {n:?} is not a u64"))?;
                 opts.min_build = Some(n);
             }
-            "--rehearse" => {
-                let slug = it.next().ok_or("--rehearse needs OWNER/REPO")?;
-                let ok = matches!(slug.split('/').collect::<Vec<_>>().as_slice(),
-                    [o, r] if !o.is_empty() && !r.is_empty());
-                if !ok {
-                    return Err(format!("--rehearse: {slug:?} is not OWNER/REPO"));
-                }
-                opts.rehearse = Some(slug.to_string());
-            }
             other => return Err(format!("unknown cut flag {other:?}")),
         }
     }
@@ -1038,8 +1008,7 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
             || opts.linux_artifacts.is_some()
             || !opts.linux_workers.is_empty()
             || opts.mac_only
-            || opts.min_build.is_some()
-            || opts.rehearse.is_some())
+            || opts.min_build.is_some())
     {
         return Err("--abandon combines with no other cut flag".to_string());
     }
@@ -1048,17 +1017,13 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
             || opts.linux_artifacts.is_some()
             || !opts.linux_workers.is_empty()
             || opts.mac_only
-            || opts.min_build.is_some()
-            || opts.rehearse.is_some())
+            || opts.min_build.is_some())
     {
         return Err(
             "--resume combines with no other cut flag (the journal already fixed the \
              cut's parameters)"
                 .to_string(),
         );
-    }
-    if opts.dry_run && opts.rehearse.is_some() {
-        return Err("--dry-run and --rehearse are mutually exclusive".to_string());
     }
     LinuxFlags {
         artifacts: &mut opts.linux_artifacts,
@@ -1165,15 +1130,15 @@ fn dispatch(cmd: Cmd) -> ledger::Result<()> {
             0 => Ok(()),
             code => Err(Error::new(format!("trust exited {code}"))),
         },
-        Cmd::Site(_) | Cmd::Hook(_) => match own_code(&cmd) {
+        Cmd::Site(_) | Cmd::Hook(_) | Cmd::Tap(_) => match own_code(&cmd) {
             Some(0) | None => Ok(()),
             Some(code) => Err(Error::new(format!("exited {code}"))),
         },
     }
 }
 
-/// `site` and `hook`, which answer with their own exit codes: the code, or `None` for
-/// every other command.
+/// `site`, `hook` and `tap`, which answer with their own exit codes: the code, or `None`
+/// for every other command.
 fn own_code(cmd: &Cmd) -> Option<i32> {
     match cmd {
         Cmd::Site(args) => Some(match repo_root() {
@@ -1187,6 +1152,13 @@ fn own_code(cmd: &Cmd) -> Option<i32> {
             args,
             &std::env::current_dir().unwrap_or_default(),
         )),
+        Cmd::Tap(args) => Some(match repo_root() {
+            Ok(root) => crate::tap::run_cli(args, &root),
+            Err(e) => {
+                eprintln!("aterm-release tap: {e}");
+                2
+            }
+        }),
         _ => None,
     }
 }

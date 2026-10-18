@@ -74,7 +74,7 @@
 //! **Codex** rollouts ([`Spend::fold_codex_home`], the design's C1): every
 //! `rollout-*.jsonl` under a Codex home's `sessions/` modified in the last
 //! [`HORIZON_S`], `codex exec` ones included, is read from the same byte
-//! cursors by the Codex reader (`supervise::codex_usage::TurnReader`, whose
+//! cursors by the Codex reader (`harness::codex_rollout::TurnReader`, whose
 //! state each cursor keeps), which yields each served turn once: the
 //! `last_token_usage` of a `token_count` whose running total grew, on the
 //! model of the latest `turn_context`, and nothing of a fork's copied prefix
@@ -87,7 +87,7 @@
 //!
 //! This is a LEAF (§8.2): it depends on `usage`, `transcript`, `accounts`
 //! (for the store's directory and label rule) and the Codex reader
-//! (`supervise::codex_usage`, which imports nothing of it), and nothing that
+//! (`harness::codex_rollout`, which imports nothing of it), and nothing that
 //! decides anything imports it. Its API is report functions; there is no "best" or
 //! "next" accessor.
 //!
@@ -120,7 +120,7 @@ use aterm_json::{Map, Value};
 use super::usage::{
     MAX_ID_BYTES, MAX_LINE_BYTES, MAX_MODELS, OTHER_MODEL, SEEN_IDS_MAX, TokenUsage, UNKNOWN_MODEL,
 };
-use crate::supervise::codex_usage::{Prefix, Row, Turn, TurnReader};
+use crate::harness::codex_rollout::{Prefix, Row, Turn, TurnReader};
 
 /// The shipped price table, `prices.toml` beside this file, for the caller
 /// to load ([`PriceTable::from_toml`]) and hand in.
@@ -640,7 +640,7 @@ pub fn fold_conversation(
             Row::Unparsed => out.unparsed = out.unparsed.saturating_add(1),
             Row::Other => {}
         };
-        let read = crate::supervise::codex_usage::read_rollout(path, &mut reader, left, &mut each);
+        let read = crate::harness::codex_rollout::read_rollout(path, &mut reader, left, &mut each);
         let Some(read) = read else {
             out.unread += 1;
             continue;
@@ -2270,7 +2270,8 @@ impl SpendStore {
         aterm_types::fs_restricted::ensure_private_dir(&self.dir)?;
         let mut text = spend.to_json();
         text.push('\n');
-        super::upgrade_models::write_atomic(&path, &text)
+        // Ordered: a fold over transcripts, recomputed from them when it is lost.
+        super::upgrade_models::write_atomic_ordered(&path, &text)
     }
 }
 
@@ -2303,8 +2304,10 @@ fn tokens_of(v: &Value) -> Option<TokenUsage> {
 }
 
 /// A rollout reader as the spend file keeps it: `[where, newest copied stamp
-/// (ms) or null, largest total, model or null, service tier named]`, `where`
-/// one of `start`, `copy`, `own`.
+/// (ms) or null, largest total, model or null, service tier named, the
+/// fork's own thread or null]`, `where` one of `start`, `copy`, `own`. A
+/// reader kept before the thread was (five entries) reads with none: its
+/// copy ends by the stamps alone.
 fn reader_json(r: &TurnReader) -> Value {
     let (word, at) = match r.prefix {
         Prefix::Start => ("start", None),
@@ -2317,11 +2320,12 @@ fn reader_json(r: &TurnReader) -> Value {
         Value::from(r.top),
         r.model.as_deref().map_or(Value::Null, Value::from),
         Value::from(r.tier),
+        r.thread.as_deref().map_or(Value::Null, Value::from),
     ])
 }
 
 fn reader_of(v: &Value) -> Option<TurnReader> {
-    let a = v.as_array().filter(|a| a.len() == 5)?;
+    let a = v.as_array().filter(|a| matches!(a.len(), 5 | 6))?;
     let prefix = match (a.first()?.as_str()?, a.get(1)?) {
         ("start", Value::Null) => Prefix::Start,
         ("copy", at) => Prefix::Copy(at.as_i64()?),
@@ -2336,11 +2340,20 @@ fn reader_of(v: &Value) -> Option<TurnReader> {
                 .to_owned(),
         ),
     };
+    let thread = match a.get(5) {
+        None | Some(Value::Null) => None,
+        Some(t) => Some(
+            t.as_str()
+                .filter(|t| super::codex_rollout::is_thread_id(t))?
+                .to_owned(),
+        ),
+    };
     Some(TurnReader {
         prefix,
         top: a.get(2)?.as_u64()?,
         model,
         tier: a.get(4)?.as_bool()?,
+        thread,
     })
 }
 

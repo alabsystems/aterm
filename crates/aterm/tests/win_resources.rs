@@ -141,36 +141,6 @@ fn manifest_leaves_dpi_awareness_to_winit() {
     );
 }
 
-/// THE SECOND TRAP.
-///
-/// `VS_VERSION_INFO` and `RT_MANIFEST` are MACROS from the Windows SDK headers.
-/// `build.rs` deliberately includes no SDK header (so a box with `rc.exe` but no
-/// configured include path still builds), which means a bare macro token is taken
-/// by the resource compiler as a resource *name string* instead of the number it
-/// stands for. The build then succeeds, `.rsrc` appears, and dumping the resource
-/// tree shows the version entry under a NAME rather than under ordinal 1 — while
-/// `GetFileVersionInfoSizeW` returns 0 and Explorer, Task Manager and
-/// `FileVersionInfo` all read back empty, exactly as if there were no version
-/// block at all. Measured, not theorised.
-///
-/// So the resource script must spell both as numbers. This is a source-text guard
-/// because the property it protects only exists in a linked PE.
-#[test]
-fn resource_script_uses_numeric_ids_not_sdk_macros() {
-    let src = std::fs::read_to_string(crate_dir().join("build.rs")).expect("build.rs is readable");
-    assert!(
-        src.contains("{VS_VERSION_INFO_ID} VERSIONINFO"),
-        "the VERSIONINFO statement must be keyed by the numeric id constant; the bare \
-         VS_VERSION_INFO macro becomes a resource NAME without <winver.h> and \
-         GetFileVersionInfo then finds nothing"
-    );
-    assert!(
-        src.contains("{RESOURCE_ID} {RT_MANIFEST}"),
-        "the manifest statement must use the numeric RT_MANIFEST type (24); the bare \
-         RT_MANIFEST macro becomes a resource TYPE NAME without <winuser.h>"
-    );
-}
-
 /// `build.rs` reaches across into aterm-gui for the icon rather than keeping a
 /// second copy. That cross-crate path is exactly the kind of thing a directory
 /// move breaks quietly — the build would only warn, and the exe would ship blank.

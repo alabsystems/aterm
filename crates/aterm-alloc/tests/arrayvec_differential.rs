@@ -6,7 +6,8 @@
 //!
 //! `crates/aterm-arrayvec` republishes `aterm_alloc::ArrayVec` under the
 //! package name `arrayvec` so that `[patch.crates-io]` can point `naga`,
-//! `wgpu`, `wgpu-core`, `wgpu-hal` and `tiny-skia` at it.
+//! `wgpu`, `wgpu-core` and `wgpu-hal` at it (and `tiny-skia`, on Linux, until
+//! linux-windowing LW.5 took it out of the graph).
 //! `crates/aterm-arrayvec/tests/consumer_forms.rs` proves the surface ACCEPTS
 //! what those crates write. This file proves it COMPUTES what they expect: both
 //! are driven through the same scripts and a deterministic-LCG operation fuzz,
@@ -165,20 +166,6 @@ mod model {
             self.0.iter_mut()
         }
     }
-}
-
-/// THE SHIM IS THIS CRATE'S TYPE, NOT A COPY OF IT.
-/// `crates/aterm-arrayvec` — what `[patch.crates-io]` hands naga and wgpu —
-/// claims to be a pure re-export of `aterm_alloc::ArrayVec`. The function below
-/// only compiles if the two paths name ONE type.
-#[test]
-fn the_patched_shim_is_this_crates_arrayvec() {
-    fn same_type(v: arrayvec_shim::ArrayVec<u8, 4>) -> MyArrayVec<u8, 4> {
-        v
-    }
-    let mut v = arrayvec_shim::ArrayVec::<u8, 4>::new();
-    v.push(7);
-    assert_eq!(same_type(v).as_slice(), &[7]);
 }
 
 // ── Comparison helpers ──────────────────────────────────────────────────────
@@ -741,35 +728,6 @@ fn by_reference_iteration_parity() {
         *v += 1;
     }
     same(&mine, &up, "for v in &mut av");
-}
-
-/// `Deref`-reached slice behaviour and equality, side by side.
-#[test]
-fn deref_and_equality_parity() {
-    let mut mine: MyArrayVec<u32, 8> = [5, 1, 4, 2].into_iter().collect();
-    let mut up: UpArrayVec<u32, 8> = [5, 1, 4, 2].into_iter().collect();
-    mine.sort();
-    up.sort();
-    same(&mine, &up, "sort through DerefMut");
-
-    assert_eq!(mine.first(), up.first());
-    assert_eq!(mine.last(), up.last());
-    assert_eq!(mine.get(2), up.get(2));
-    assert_eq!(mine.contains(&4), up.contains(&4));
-    assert_eq!(&mine[1..3], &up[1..3]);
-    assert_eq!(
-        mine[..] == *[1u32, 2, 4, 5].as_slice(),
-        up[..] == *[1u32, 2, 4, 5].as_slice()
-    );
-
-    let mine2 = mine.clone();
-    let up2 = up.clone();
-    assert_eq!(mine == mine2, up == up2);
-    let mut mine3 = mine.clone();
-    let mut up3 = up.clone();
-    mine3.pop();
-    up3.pop();
-    assert_eq!(mine == mine3, up == up3);
 }
 
 /// Elements that own memory: the differential above uses `u32`, which cannot

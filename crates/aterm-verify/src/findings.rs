@@ -317,16 +317,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_test_name_a_shell_would_split_is_quoted() {
-        let log = failed_log("src/lib.rs - f (line 3)", "boom");
-        let found = test_findings("targo test --doc", &log, &[]);
-        assert_eq!(
-            found[0].rerun.as_deref(),
-            Some("targo --unverified test -p atpkg --test x -- 'src/lib.rs - f (line 3)' --exact")
-        );
-    }
-
     /// The rerun keeps the child's variables and drops the ones that only place the build.
     #[test]
     fn a_rerun_sets_what_the_test_child_ran_under() {
@@ -349,15 +339,17 @@ mod tests {
     }
 
     #[test]
-    fn an_excerpt_leaves_targos_lane_banners_out() {
-        let out = "warning: UNVERIFIED: `targo run` was explicitly authorized\n\
-                   note: compiled WITHOUT Trust verification — 0 obligations checked\n\
-                   aterm-census: unknown option \"--all\"\n";
-        assert_eq!(excerpt(out, 12), ["aterm-census: unknown option \"--all\""]);
-    }
-
-    #[test]
     fn an_excerpt_is_the_errors_first_never_the_progress() {
+        assert_eq!(
+            excerpt(
+                "warning: UNVERIFIED: `targo run` was explicitly authorized\n\
+                 note: compiled WITHOUT Trust verification — 0 obligations checked\n\
+                 aterm-census: unknown option \"--all\"\n",
+                12
+            ),
+            ["aterm-census: unknown option \"--all\""],
+            "targo's lane banners are never the excerpt"
+        );
         let out = "   Compiling a v0.1.0\nwarning: a build script said so\nnote: x\nnote: y\n\
                    note: z\n    Checking b v0.1.0\nerror: unused variable: `x`\n  \
                    --> src/lib.rs:3:9\n   |\n    Finished dev\n";

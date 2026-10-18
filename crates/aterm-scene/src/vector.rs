@@ -712,55 +712,8 @@ pub fn parse_path(d: &str) -> Option<Vec<PathCmd>> {
 mod tests {
     use super::*;
 
-    /// A unit circle at (0.5, 0.5), radius r, as 4 cubics (kappa arcs).
-    fn circle(r: f32) -> Vec<PathCmd> {
-        let k = 0.552_284_8 * r;
-        let (cx, cy) = (0.5f32, 0.5f32);
-        vec![
-            PathCmd::Move(cx + r, cy),
-            PathCmd::Cubic(cx + r, cy + k, cx + k, cy + r, cx, cy + r),
-            PathCmd::Cubic(cx - k, cy + r, cx - r, cy + k, cx - r, cy),
-            PathCmd::Cubic(cx - r, cy - k, cx - k, cy - r, cx, cy - r),
-            PathCmd::Cubic(cx + k, cy - r, cx + r, cy - k, cx + r, cy),
-            PathCmd::Close,
-        ]
-    }
-
     fn alpha_at(t: &Tile, x: u32, y: u32) -> u8 {
         t.pixels()[((y * t.width() + x) * 4 + 3) as usize]
-    }
-
-    #[test]
-    fn two_layer_asset_is_deterministic() {
-        let tri = [
-            PathCmd::Move(0.1, 0.9),
-            PathCmd::Line(0.9, 0.9),
-            PathCmd::Line(0.5, 0.2),
-            PathCmd::Close,
-        ];
-        let render = || {
-            let mut t = Tile::new(64, 64);
-            fill_path(
-                &mut t,
-                &[&circle(0.4)],
-                (1.0, 0.5, 0.2),
-                1.0,
-                PathTransform::fit(64, 64),
-            );
-            fill_path(
-                &mut t,
-                &[&tri],
-                (0.1, 0.2, 0.9),
-                0.8,
-                PathTransform::fit(64, 64),
-            );
-            t.pixels().to_vec()
-        };
-        let a = render();
-        let b = render();
-        assert_eq!(a, b, "same asset ⇒ byte-identical raster");
-        // And it actually painted something opaque in the middle.
-        assert!(a[(32 * 64 + 32) * 4 + 3] > 200, "center covered");
     }
 
     #[test]

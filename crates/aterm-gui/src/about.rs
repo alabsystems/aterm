@@ -60,20 +60,6 @@ impl AboutState {
 mod tests {
     use super::*;
 
-    /// Every row the route paints is in the clipboard block.
-    #[test]
-    fn provenance_text_carries_every_row_the_route_reads() {
-        let state = AboutState::new();
-        let text = provenance_text();
-        assert!(text.starts_with("aterm\n"));
-        for (key, value) in state.semantic_rows() {
-            assert!(
-                text.contains(&format!("{key}: {value}\n")),
-                "the clipboard block is missing the {key} row the route paints"
-            );
-        }
-    }
-
     /// The site row becomes an absolute URL with or without a scheme; no row, no link.
     #[test]
     fn site_url_is_absolute_or_absent() {

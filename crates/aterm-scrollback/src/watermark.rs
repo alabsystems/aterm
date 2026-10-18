@@ -43,8 +43,8 @@ pub(crate) fn threshold_bytes(percent: usize, budget: usize) -> usize {
 
 /// Recompute watermark level from current budgeted bytes vs thresholds.
 ///
-/// Shared by `Scrollback` and `DiskBackedScrollback`. Hysteresis: Yellow→Green
-/// requires dropping below `yellow_exit_threshold`, not just `yellow_threshold`.
+/// Used by [`Scrollback`]'s accounting sync. Hysteresis: Yellow→Green requires
+/// dropping below `yellow_exit_threshold`, not just `yellow_threshold`.
 #[inline]
 pub(crate) fn recompute_watermark(
     current: WatermarkLevel,

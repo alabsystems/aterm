@@ -11,7 +11,7 @@
 Source: `crates/aterm-hash` (read only). I read every `#[test]` (`src/fnv.rs` 2, `src/lib.rs` 4 = 6)
 and the code each one reaches. Nothing was compiled or run. The claims below come from reading the code.
 
-Result: **6 specs**, covering **5 tests**. **1 test is not a spec sample** (§4).
+Result: **6 specs**, covering **5 tests**. **1 test was not a spec sample** (§4); it is deleted.
 
 ## 0. Notation used in the statements
 
@@ -86,7 +86,7 @@ HASH-FX-2 (`multiply_mix`, then the read helpers) → HASH-FX-3. HASH-FX-1 depen
 only through its u128 path. HASH-FX-1 and HASH-FX-3 compose for `FxHasher::write`. On the FNV side,
 HASH-FNV-1 → HASH-FNV-2 → HASH-FNV-3.
 
-## 2. Test → spec map (TSV; all 6)
+## 2. Test → spec map (TSV; the 5 spec samples)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 
@@ -97,12 +97,11 @@ src/fnv.rs	a_stream_of_writes_is_the_hash_of_their_concatenation	HASH-FNV-3	HASH
 src/lib.rs	test_fxhasher_unsigned_integers_match_rustc_hash	HASH-FX-1	HASH-FX-2 (u128 path through read_u64_le)
 src/lib.rs	test_fxhasher_signed_integers_match_rustc_hash	HASH-FX-1	
 src/lib.rs	test_fxhasher_bytes_match_rustc_hash	HASH-FX-3	HASH-FX-2, HASH-FX-1 (write_u64, finish)
-src/lib.rs	test_fxhasher_default_via_buildhasherdefault	(none: §4)	HASH-FX-1 (default state 0)
 ```
 
 ## 3. Coverage
 
-- 6 tests read. 5 map to one of the 6 specs and 1 samples no spec (§4).
+- 6 tests read. 5 map to one of the 6 specs; the 1 that sampled no spec (§4) is deleted.
 - Retiring `test_fxhasher_bytes_match_rustc_hash` needs HASH-FX-1, -2 and -3 all Certified.
   Retiring `a_stream_of_writes_is_the_hash_of_their_concatenation` needs all three FNV specs.
 - Every test here is a short list of sampled vectors. The specs replace them with the reference
@@ -113,9 +112,8 @@ src/lib.rs	test_fxhasher_default_via_buildhasherdefault	(none: §4)	HASH-FX-1 (d
 
 > Status 2026-10-16: `lib::test_fxhasher_default_via_buildhasherdefault` is deleted.
 
-| test | why | action |
-|---|---|---|
-| lib::test_fxhasher_default_via_buildhasherdefault | A tautology by construction. `BuildHasherDefault<FxHasher>::build_hasher` is std calling `FxHasher::default()`, and the body of `FxBuildHasher::build_hasher` is `FxHasher::default()`, so both `hash_one` calls run the same code from the same state. The one real fact here (both build a hasher in state 0) is a clause of HASH-FX-1. | **delete** |
+> Status 2026-10-17: none left. Its row here and in §2 is gone; its one real fact (both build
+> hashers start in state 0) is a clause of HASH-FX-1.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 

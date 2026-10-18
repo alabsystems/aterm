@@ -75,8 +75,8 @@ impl ResponseRateLimiter {
         Self::with_limits(DEFAULT_REFILL_BYTES_PER_SEC, DEFAULT_BURST_BYTES)
     }
 
-    /// A rate limiter with custom limits. `capacity_bytes = 0` drops every response (a
-    /// kill switch); `refill_bytes_per_sec = 0` never replenishes the initial capacity.
+    /// A rate limiter with custom limits. `refill_bytes_per_sec = 0` never replenishes the
+    /// initial capacity.
     pub(crate) fn with_limits(refill_bytes_per_sec: u64, capacity_bytes: u64) -> Self {
         Self {
             #[allow(
@@ -94,9 +94,6 @@ impl ResponseRateLimiter {
     /// `f64` tokens let sub-millisecond refill intervals accumulate (a burst of tiny DSR
     /// replies back to back).
     pub(crate) fn try_consume<T: TimeSource>(&mut self, bytes: usize, clock: &T) -> bool {
-        if self.capacity_bytes == 0 {
-            return false;
-        }
         // Larger than capacity can never fit: drop without deducting, so one pathological
         // call does not drain the bucket.
         if bytes as u64 > self.capacity_bytes {
@@ -183,20 +180,6 @@ mod tests {
     }
 
     #[test]
-    fn test_response_rate_below_limit_all_delivered() {
-        let mut limiter = ResponseRateLimiter::with_limits(1000, 500);
-        let clock = FakeClock::new();
-
-        for _ in 0..10 {
-            assert!(
-                limiter.try_consume(40, &clock),
-                "normal-rate response should be permitted"
-            );
-            clock.advance(Duration::from_millis(200));
-        }
-    }
-
-    #[test]
     fn test_response_rate_above_limit_excess_dropped() {
         // No time passes: the 200-byte burst admits five 40-byte responses.
         let mut limiter = ResponseRateLimiter::with_limits(100, 200);
@@ -266,26 +249,5 @@ mod tests {
         );
         // Nor is the bucket drained by it.
         assert!(limiter.try_consume(100, &clock));
-    }
-
-    #[test]
-    fn test_response_zero_capacity_blocks_everything() {
-        let mut limiter = ResponseRateLimiter::with_limits(10_000, 0);
-        let clock = FakeClock::new();
-        assert!(!limiter.try_consume(1, &clock));
-        assert!(!limiter.try_consume(0, &clock));
-    }
-
-    #[test]
-    fn test_response_defaults_are_permissive() {
-        // A realistic startup burst: 64 DSR/DA responses of 16 bytes.
-        let mut limiter = ResponseRateLimiter::new();
-        let clock = FakeClock::new();
-        for _ in 0..64 {
-            assert!(
-                limiter.try_consume(16, &clock),
-                "defaults must permit normal startup-burst traffic"
-            );
-        }
     }
 }

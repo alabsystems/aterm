@@ -8,7 +8,7 @@
 
 use crate::animate::Look;
 use crate::center::{EchoKind, MessageCenter};
-use crate::glass::{Links, Presentation, RowKind};
+use crate::glass::{Links, Presentation};
 use crate::log::MessageLog;
 use crate::model::{Amount, Hold, Message, Meter, Severity, Unit, WallStamp, tags};
 use crate::text::char_width;
@@ -108,69 +108,6 @@ fn a_count_that_stops_says_stalled_not_less_than_five_seconds() {
         Some(STALLED_WORD),
         "{said:?}"
     );
-}
-
-/// One echo for every reporter: `done build ok Built aterm` declares the
-/// finished words, so the echo is `✓ Built aterm` with its percent blank,
-/// never `✓ Built aterm 100%`; the record is `Built aterm` under ✓ Success
-/// with no in-flight frame, filed under the script's own tag.
-#[test]
-fn a_scripts_finished_words_echo_like_every_reporters() {
-    let t0 = Instant::now();
-    let mut c = MessageCenter::new(MessageLog::empty(), t0);
-    let mut g = WireGate::default();
-    for k in 0..=20u64 {
-        let now = t0 + ms(k * 1000);
-        notice(
-            &mut c,
-            &mut g,
-            &format!(
-                "progress build pct={} Building aterm -- step {k} of 20",
-                k * 5
-            ),
-            now,
-        );
-        sweep(&mut c, now);
-    }
-    let id = c.live_rows().next().unwrap().id;
-    let end = t0 + ms(20_500);
-    notice(&mut c, &mut g, "done build ok Built aterm", end);
-    let p = present(&c, 120);
-    let echo = &p.rows[0];
-    assert!(matches!(echo.kind, RowKind::Echo(_)));
-    assert_eq!(echo.title.1.trim_end(), "Built aterm");
-    assert_eq!(echo.pct, None, "no `100%` beside the finished words");
-    assert_eq!(c.echoes()[0].kind, EchoKind::Complete);
-    let rec = c.log().get(id).unwrap();
-    assert_eq!(rec.title, "Built aterm");
-    assert!(rec.detail.is_empty(), "{:?}", rec.detail);
-    assert_eq!(
-        (rec.severity, rec.glyph.ch(), rec.tag.as_str()),
-        (Severity::Success, '\u{2713}', "script")
-    );
-}
-
-/// A withdrawn row reads as ended: `done index withdraw` on a busy `Indexing
-/// docs` is logged `Indexing ended` under ℹ, its live title the first detail
-/// line.
-#[test]
-fn a_withdrawn_rows_record_reads_as_ended() {
-    let t0 = Instant::now();
-    let mut c = MessageCenter::new(MessageLog::empty(), t0);
-    let mut g = WireGate::default();
-    notice(
-        &mut c,
-        &mut g,
-        "progress index tag=search busy Indexing docs",
-        t0,
-    );
-    sweep(&mut c, t0 + PROGRESS_GRACE);
-    let id = c.live_rows().next().unwrap().id;
-    notice(&mut c, &mut g, "done index withdraw", t0 + ms(47_000));
-    let rec = c.log().get(id).unwrap();
-    assert_eq!(rec.title, "Indexing ended");
-    assert_eq!(rec.detail, vec!["Indexing docs".to_string()]);
-    assert_eq!((rec.severity, rec.glyph.ch()), (Severity::Info, '\u{2139}'));
 }
 
 /// A script's own ending words stand: `done <key> withdraw <words>` and

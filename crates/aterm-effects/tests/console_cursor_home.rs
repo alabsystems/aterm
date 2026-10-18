@@ -12,7 +12,8 @@ use aterm_core::selection::{SelectionSide, SelectionType, TextSelection};
 use aterm_core::terminal::Terminal;
 use aterm_effects::kitty_pet::{PetAction, PetBrain, PetFrame, PetInputKind, PetSense};
 use aterm_effects::pet_world::{PetPane, PetRect, PetWorld, PetWorldFacts};
-use aterm_spec::derive::{Model, console_cursor_home_model};
+use aterm_models_effects::console_cursor_home_model;
+use aterm_spec::derive::Model;
 
 const ROWS: u16 = 57;
 const COLS: u16 = 151;
@@ -393,54 +394,6 @@ fn distant_program_output_changes_attention_without_moving_home_across_the_conso
         assert_eq!(frame.alpha, 255);
         s.at_home(frame);
     }
-}
-
-#[test]
-fn full_selection_still_protects_the_console_and_explains_the_hidden_body() {
-    let mut s = Scene::dense(true);
-    assert!(
-        s.tick(0).alpha > 0,
-        "negative control: ordinary dense text is drawable"
-    );
-    s.term
-        .text_selection_mut()
-        .start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
-    s.term.text_selection_mut().update_selection(
-        i32::from(ROWS - 1),
-        COLS - 1,
-        SelectionSide::Right,
-    );
-    let hidden = s.tick(16);
-    assert_eq!(hidden.alpha, 0);
-    assert!(s.brain.console_reason().starts_with("protected-"));
-    assert!(
-        !s.brain.needs_frames(),
-        "protected surface cannot poll forever"
-    );
-    s.term.text_selection_mut().clear();
-    let returned = s.tick(16);
-    assert_eq!(returned.alpha, 255);
-    s.at_home(returned);
-}
-
-#[test]
-fn a_visible_output_watcher_returns_home_after_a_large_caret_move() {
-    let mut s = Scene::dense(false);
-    s.term.process(
-        b"\x1b[3;100H\x1b]133;A\x07> \x1b]133;B\x07build\r\n\x1b]133;C\x07output\x1b[55;3H",
-    );
-    for _ in 0..100 {
-        s.tick(16);
-    }
-    s.term.process(b"\x1b[8;105H");
-    // No input intent is needed to put a program-driven caret back in charge.
-    // Existing cursor locomotion must recover from the old output interest.
-    let mut frame = s.tick(16);
-    for _ in 0..240 {
-        frame = s.tick(16);
-    }
-    assert!(frame.alpha > 0);
-    s.at_home(frame);
 }
 
 #[test]

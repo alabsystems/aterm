@@ -22,9 +22,9 @@
 //!   framebuffer column, never a per-cell origin, so a pattern's value at a
 //!   pixel is independent of HOW the run was partitioned into cells — the
 //!   phase-continuity theorem (`tests/deco_lines.rs::
-//!   pattern_rects_are_partition_invariant`, Tier-1 of the `deco_phase`
-//!   derived ty model). The historical code restarted the phase at every cell
-//!   seam (dash/dot patterns reset per glyph, the curly wave per cell).
+//!   pattern_rects_are_partition_invariant`). The historical code restarted
+//!   the phase at every cell seam (dash/dot patterns reset per glyph, the
+//!   curly wave per cell).
 //!
 //! * **Descender ink-skip only ERASES.** [`keep_spans_after_ink`] subtracts a
 //!   1px-dilated glyph-ink column set from an underline span; it can only
@@ -183,32 +183,6 @@ pub fn squarewave_up(x: usize, cell_h: usize) -> bool {
     (x / seg) % 2 == 1
 }
 
-/// Group the columns of `[x0, x0 + w)` where `on(x)` holds into maximal
-/// `(start, len)` spans. Because `on` is a pure function of the ABSOLUTE
-/// column, the union of spans over any partition of a run equals the spans
-/// over the whole run (the phase-continuity theorem; proven in
-/// `tests/deco_lines.rs`).
-pub fn pattern_spans_into(
-    out: &mut Vec<(usize, usize)>,
-    x0: usize,
-    w: usize,
-    on: impl Fn(usize) -> bool,
-) {
-    let mut x = x0;
-    let end = x0 + w;
-    while x < end {
-        if on(x) {
-            let s = x;
-            while x < end && on(x) {
-                x += 1;
-            }
-            out.push((s, x - s));
-        } else {
-            x += 1;
-        }
-    }
-}
-
 /// The maximum deco-atlas texture dimension both renderers agree on (the
 /// downlevel/WebGL2 `max_texture_dimension_2d`). The GPU sprite atlas packs
 /// [`DECO_ATLAS_SPRITES`] cell-wide sprites in one row.
@@ -234,11 +208,43 @@ pub fn undercurl_supported(cell_w: usize, cell_h: usize) -> bool {
         && cell_h <= DECO_ATLAS_MAX_DIM
 }
 
+/// The cell-relative rows `[top, cell_h)` the undercurl wave fills: from the
+/// resolved underline top to the cell bottom, raised — never past the cell
+/// top — until it is at least `max(t + 3, 4)` rows tall for stroke `t`.
+///
+/// WHY THE FLOOR. The wave's amplitude is `(band_h - t)/2 - 0.5`, so a band of
+/// `t + 1` rows or fewer has NO amplitude and the curly underline drew as a
+/// straight one — LSP diagnostics and spell-check marks indistinguishable from
+/// a plain underline. That was every size from 10 to 32 px for Ubuntu Mono
+/// (its `post` underline sits 0.138 em below a 0.189 em descent: 16 px gives
+/// cell 18, underline row 17, a one-row band), most sizes of Liberation Mono,
+/// and the bundled JetBrains Mono at 13 and 14 px. `t + 3` rows is the
+/// smallest band whose amplitude is a whole pixel for any `t`, and it lifts
+/// the crest (which falls mid-cell, under the glyph) at most two rows above
+/// the single underline. A roomy cell's band is unchanged.
+///
+/// The one band both renderers and the descender ink-skip probe use: the
+/// CPU blend loop, the GPU's full-cell curl sprite (the tile carries no
+/// coverage outside it) and [`underline_band`].
+#[must_use]
+pub fn undercurl_band(cell_h: usize, deco: DecoMetrics) -> (usize, usize) {
+    if cell_h == 0 {
+        return (0, 0);
+    }
+    let t = deco.underline_t.clamp(1, cell_h);
+    let floor = (t + 3).max(4);
+    let top = deco
+        .underline_y
+        .min(cell_h - 1)
+        .min(cell_h.saturating_sub(floor));
+    (top, cell_h)
+}
+
 /// The anti-aliased cosine undercurl coverage tile for one BASE-width cell:
 /// row-major `cell_w * cell_h` bytes of coverage `0..=255`, exactly ONE wave
 /// period per tile so adjacent tiles continue the wave seamlessly. The wave
-/// fills the band from the resolved underline top to the cell bottom, with
-/// the resolved underline thickness as stroke width.
+/// fills [`undercurl_band`], with the resolved underline thickness as stroke
+/// width.
 ///
 /// # Invariants (proven, `tests/deco_lines.rs`)
 ///
@@ -246,9 +252,11 @@ pub fn undercurl_supported(cell_w: usize, cell_h: usize) -> bool {
 ///   which is `cw`-periodic in the absolute column BY CONSTRUCTION (integer
 ///   `%`), so the wave's value at a pixel is a pure function of absolute x.
 /// * **Amplitude bounds** — every nonzero coverage byte lies within the
-///   `[underline_y, cell_h)` band rows (`undercurl_stays_inside_its_band`):
-///   the amplitude is derived as `(band_h - t)/2 - 0.5` so the stroke's AA
+///   [`undercurl_band`] rows (`undercurl_stays_inside_its_band`): the
+///   amplitude is derived as `(band_h - t)/2 - 0.5` so the stroke's AA
 ///   fringe never exits the band (and therefore never the cell).
+/// * **It waves** — wherever the cell has `t + 3` rows, the amplitude is at
+///   least one pixel (`undercurl_waves_however_low_the_font_puts_its_underline`).
 #[must_use]
 pub fn undercurl_coverage(cell_w: usize, cell_h: usize, deco: DecoMetrics) -> Vec<u8> {
     let mut buf = vec![0u8; cell_w * cell_h];
@@ -256,7 +264,7 @@ pub fn undercurl_coverage(cell_w: usize, cell_h: usize, deco: DecoMetrics) -> Ve
         return buf;
     }
     let t = deco.underline_t.clamp(1, cell_h) as f32;
-    let band_top = deco.underline_y.min(cell_h - 1) as f32;
+    let band_top = undercurl_band(cell_h, deco).0 as f32;
     let band_h = cell_h as f32 - band_top;
     let mid = band_top + band_h / 2.0;
     let amp = ((band_h - t) / 2.0 - 0.5).max(0.0);
@@ -312,7 +320,7 @@ pub fn underline_band(
             let gap = t.saturating_mul(2).max(2);
             Some((uy.saturating_sub(gap), uy + t))
         }
-        UnderlineStyle::Curly => Some((uy, cell_h)),
+        UnderlineStyle::Curly => Some(undercurl_band(cell_h, deco)),
     }
 }
 
@@ -353,8 +361,7 @@ pub fn underline_band(
 /// Latin, Greek, Cyrillic — every script with a descender — is narrow. This
 /// predicate is FALSE only for cells the terminal itself measured at 2 columns,
 /// so no narrow cell changes code path, and the descender behaviour the feature
-/// exists for is byte-identical by construction (pinned by
-/// `latin_descender_skip_survives_the_wide_glyph_exemption`).
+/// exists for is byte-identical by construction.
 ///
 /// # Known, deliberate limit
 ///

@@ -23,9 +23,10 @@ path = "src/main.rs"
 
 [dependencies]
 aterm-json = { workspace = true }
+# The repo's one toolchain resolution (`trust::find`), std only.
+aterm-toolchain = { workspace = true }
 aterm-tempfile = { workspace = true }
 aterm-uds = { workspace = true }
-serde = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
 aterm-spec = { workspace = true }

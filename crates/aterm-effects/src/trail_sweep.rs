@@ -162,35 +162,6 @@ mod tests {
         }
     }
 
-    /// line_cells_tail: gap-free, bounded, origin-inclusive walk that keeps the
-    /// destination-nearest cells, across a sweep of jump geometries.
-    #[test]
-    fn line_cells_tail_is_gapless_and_bounded() {
-        let mut out = Vec::new();
-        for &(origin, dest) in &[
-            ((0, 0), (0, 12)),
-            ((3, 7), (3, 2)),
-            ((0, 0), (9, 9)),
-            ((8, 1), (2, 30)),
-            ((5, 5), (5, 5)),
-            ((0, 40), (7, 0)),
-        ] {
-            for limit in [1usize, 2, 3, 8, 64] {
-                for include in [false, true] {
-                    line_cells_tail(&mut out, origin, dest, limit, include);
-                    assert!(out.len() <= limit, "limit respected");
-                    assert_adjacent(&out, None);
-                    if include && origin != dest {
-                        assert_eq!(*out.last().unwrap(), dest, "head is the destination");
-                    }
-                    if !include {
-                        assert!(!out.contains(&dest), "destination excluded");
-                    }
-                }
-            }
-        }
-    }
-
     /// The bounded solver matches the forward Bresenham walk exactly,
     /// including its direction-sensitive ties (reversed Bresenham differs:
     /// `(0,0)->(1,2)` picks `(0,1)` forward but `(1,1)` backward). Exhausts

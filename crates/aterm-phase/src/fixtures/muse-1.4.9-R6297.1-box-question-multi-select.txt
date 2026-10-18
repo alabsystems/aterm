@@ -1,0 +1,19 @@
+# muse 1.4.9-R6297.1 · MEASURED 2026-10-16, `aterm ctl text --json` of a private headless aterm 120x40 (aterm 0.105.0 80b670745), the atpkg-managed muse (Meta latest) launched through its shim with a scratch HOME, `--base-url` at a local scripted stand-in for Meta's Responses endpoint (`--model fake-1`, a dummy META_API_KEY: no login and no model; the stand-in returns the tool call that raises the box, the box is muse's own), harness off · a multi-select question: options `  ⟩ 1. [ ] Email  Send an email` … `    4. [ ] None of the above  …`, then `    5. Submit answer (0 checked)`, the key row `  Enter to toggle · Submit row to continue · ↑/↓ to move · Tab for an optional note · Esc to interrupt`; Enter or Space toggles `[x]` · cursor=2,21 (hidden) · scratch path redacted at equal length
+❯ ASKMULTI please
+
+◈ Request user input Notify — running (2s)
+
+  Which channels should get the note?
+
+  ⟩ 1. [ ] Email              Send an email
+    2. [ ] Chat               Post in chat
+    3. [ ] Pager              Page on call
+    4. [ ] None of the above  Optionally, add details in notes (tab).
+    5. Submit answer (0 checked)
+
+  Enter to toggle · Submit row to continue · ↑/↓ to move · Tab for an optional note · Esc to interrupt
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  fake-1 · high · /private/tmp/at.XXXXXX/mwork · Auto-review

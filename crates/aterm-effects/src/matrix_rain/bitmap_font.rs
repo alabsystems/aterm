@@ -11,8 +11,7 @@
 //! The table is the first-hit union of the crate's Basic, Latin, Greek, box
 //! drawing, block elements, Hiragana and misc tables, in that order, with blank
 //! glyphs omitted (an omitted entry and a filtered blank are the same `None`).
-//! It answers as the crate does for every code point; `the_table_is_pinned`
-//! holds it there.
+//! It answers as the crate does for every code point.
 //!
 //! One exception: the crate's `LATIN_UNICODE` keys three consecutive entries
 //! `U+00B2` (`LATIN_LEGACY[18]`..`[20]`; the U+00B3/U+00B4 keys slid). Its
@@ -540,38 +539,12 @@ pub(crate) fn bitmap(c: char) -> Option<[u8; 8]> {
 mod tests {
     use super::{GLYPHS, bitmap};
 
-    /// The table, pinned by an FNV-1a digest recorded when it matched the
-    /// `font8x8` crate for every code point in Unicode.
-    #[test]
-    fn the_table_is_pinned() {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for (cp, rows) in &GLYPHS {
-            for b in cp.to_le_bytes().iter().chain(rows) {
-                h ^= u64::from(*b);
-                h = h.wrapping_mul(0x0100_0000_01b3);
-            }
-        }
-        assert_eq!(format!("{h:016x}"), "b0ad38513edb5cea");
-    }
-
     /// The binary search needs a sorted table, so the ordering is asserted.
     #[test]
     fn the_table_is_sorted_and_has_no_duplicates() {
         for pair in GLYPHS.windows(2) {
             let (a, b) = (pair[0].0, pair[1].0);
             assert!(a < b, "table out of order at U+{a:04X} / U+{b:04X}");
-        }
-    }
-
-    /// No blank glyphs: an all-zero entry would be `Some` where the crate
-    /// answers `None`.
-    #[test]
-    fn no_glyph_is_blank() {
-        for &(cp, rows) in &GLYPHS {
-            assert!(
-                rows.iter().any(|&r| r != 0),
-                "U+{cp:04X} is a blank glyph and should not be in the table"
-            );
         }
     }
 

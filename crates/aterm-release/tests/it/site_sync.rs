@@ -3,10 +3,13 @@
 
 //! `ship site` end to end over the fixtures: the public repo cloned over `file://`, a
 //! site checkout with a bare origin to push to, and a fixture [`World`] standing in for
-//! `gh`, the release download host, the live site, the site's build and deploy scripts
-//! and `firebase` — so nothing here reaches a network or the live site. Each test reads
-//! what the sync left behind: the pages' parsed hrefs, notes and attributes, the site
-//! repo's commits, and the typed calls the world saw.
+//! `gh`, the release download host, the live site, the engine's stock wasm32 build and
+//! `wasm-opt`, the site's deploy script and `firebase` — so nothing here reaches a
+//! network or the live site. The engine's own steps run for real: the fixture build
+//! hands back aterm-wasm-abi's committed toy module, which `verify glue`'s generator
+//! binds in process. Each test reads what the sync left behind: the pages' parsed
+//! hrefs, notes and attributes, the engine pair, the site repo's commits, and the typed
+//! calls the world saw.
 
 use std::cell::Cell;
 use std::io::Write as _;
@@ -14,9 +17,12 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use aterm_uds::spawnfd::{Child, Command};
+use aterm_verify::wasm_glue::Flavor;
 
 use crate::site::pages::{self, Difference};
-use crate::site::{Disagreement, Env, Failure, Guard, Launch, Options, Outcome, Ran, World};
+use crate::site::{
+    Disagreement, Env, Failure, Guard, Launch, Options, Outcome, Ran, Refusal, Stop, World,
+};
 
 const SLUG: &str = "alabsystems/aterm";
 const PIN: &str = "1.97.1";
@@ -28,6 +34,8 @@ const DMG64: &str =
     "https://github.com/alabsystems/aterm/releases/download/v0.64.0/aterm-0.64.0.dmg";
 const LINUX63: &str = "https://github.com/alabsystems/aterm/releases/download/v0.63.0/aterm-0.63.0-linux-x86_64.tar.gz";
 const GHOST: &str = "ffffffffffffffffffffffffffffffffffffffff";
+/// The pages whose download anchor carries the platform attributes.
+const PAGES_WITH_PICKS: [&str; 2] = ["aterm.html", "terminal.html"];
 
 fn fixture(rel: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -35,8 +43,66 @@ fn fixture(rel: &str) -> PathBuf {
         .join(rel)
 }
 
+/// This checkout's `tools/install.sh`, which the fixture public commits carry.
+fn installer() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(crate::site::INSTALLER_SOURCE)
+}
+
 fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+/// aterm-wasm-abi's committed toy module: a real `#[export]` module with its `aterm_abi`
+/// descriptor, standing in for the CPU module the stock build would write.
+fn toy_module() -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../aterm-wasm-abi/tests/toy/aterm_wasm_abi_toy.wasm");
+    std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+/// A wasm custom section `name` holding `payload`.
+fn custom_section(name: &str, payload: &[u8]) -> Vec<u8> {
+    fn leb(mut n: usize, out: &mut Vec<u8>) {
+        loop {
+            let byte = (n & 0x7f) as u8;
+            n >>= 7;
+            if n == 0 {
+                out.push(byte);
+                return;
+            }
+            out.push(byte | 0x80);
+        }
+    }
+    let mut body = Vec::new();
+    leb(name.len(), &mut body);
+    body.extend_from_slice(name.as_bytes());
+    body.extend_from_slice(payload);
+    let mut section = vec![0];
+    leb(body.len(), &mut section);
+    section.extend(body);
+    section
+}
+
+/// What the fixture `wasm-opt` appends: a module that went through it ends with this.
+fn optimised_mark() -> Vec<u8> {
+    custom_section("fixture-wasm-opt", b"-O3")
+}
+
+/// The engine pair in `term`: its hash (from its name), its glue, its module.
+fn installed_pair(term: &Path) -> (String, String, Vec<u8>) {
+    let mut modules: Vec<String> = std::fs::read_dir(term)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("aterm_wasm.") && n.ends_with(".wasm"))
+        .collect();
+    assert_eq!(modules.len(), 1, "one pair: {modules:?}");
+    let name = modules.remove(0);
+    let hash = name["aterm_wasm.".len()..name.len() - ".wasm".len()].to_string();
+    let js = read(&term.join(format!("aterm_wasm.{hash}.js")));
+    let wasm = std::fs::read(term.join(&name)).unwrap();
+    (hash, js, wasm)
 }
 
 fn copy_tree(from: &Path, to: &Path) {
@@ -101,6 +167,22 @@ impl Git {
     }
 }
 
+/// How the engine's stock build and `wasm-opt` misbehave.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum EngineFault {
+    /// The toy module, built and optimised.
+    #[default]
+    None,
+    /// The build exits non-zero.
+    BuildFails,
+    /// A module with no `aterm_abi` descriptor (a wasm-bindgen-era build, say).
+    NoDescriptor,
+    /// The builder's home survives in the module.
+    LeaksHome,
+    /// `wasm-opt` leaves the module as it was.
+    OptimiseNothing,
+}
+
 /// A deploy as the site's `deploy.sh` would end.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum Deploy {
@@ -127,9 +209,18 @@ enum Call {
     Gh(String),
     Download(String),
     Live(String),
-    Build { commit: String, pin: Option<String> },
+    Build {
+        commit: String,
+        pin: String,
+        rustflags: Vec<String>,
+        /// The clone as cargo names its sources: the resolved path of the one handed over.
+        sources: PathBuf,
+    },
+    Optimise,
     Deploy(PathBuf),
-    Firebase { account: Option<String> },
+    Firebase {
+        account: Option<String>,
+    },
 }
 
 /// How the fixture world starts the sync's children: as they are, except that a signal
@@ -165,12 +256,17 @@ impl Launch for Signals {
 }
 
 /// The fixture world: canned GitHub answers, a directory as the live site, the
-/// engine build and the deploy as the site's scripts behave.
+/// engine's stock build (the toy module) and `wasm-opt`, and the deploy as the site's
+/// script behaves.
 struct Fake {
     releases: String,
     main_sha: Option<String>,
     gh_dead: bool,
+    /// The live site cannot be fetched at all (no network, a DNS failure).
+    live_dead: bool,
     live: PathBuf,
+    home: PathBuf,
+    engine: EngineFault,
     deploy: Deploy,
     firebase_ok: bool,
     git: Git,
@@ -179,11 +275,11 @@ struct Fake {
 }
 
 impl Fake {
-    fn builds(&self) -> Vec<(String, Option<String>)> {
+    fn builds(&self) -> Vec<(String, String)> {
         self.calls
             .iter()
             .filter_map(|c| match c {
-                Call::Build { commit, pin } => Some((commit.clone(), pin.clone())),
+                Call::Build { commit, pin, .. } => Some((commit.clone(), pin.clone())),
                 _ => None,
             })
             .collect()
@@ -237,6 +333,9 @@ impl World for Fake {
 
     fn live(&mut self, url: &str) -> Result<Vec<u8>, String> {
         self.calls.push(Call::Live(url.into()));
+        if self.live_dead {
+            return Err(format!("curl: (6) Could not resolve host for {url}"));
+        }
         let path = url
             .strip_prefix(ORIGIN)
             .ok_or_else(|| format!("unreachable host: {url}"))?;
@@ -249,51 +348,50 @@ impl World for Fake {
         std::fs::read(self.live.join(&rel)).map_err(|_| format!("404 {url}"))
     }
 
-    fn build_engine(
+    fn build_module(
         &mut self,
-        script: &Path,
         clone: &Path,
-        pin: Option<&str>,
+        pin: &str,
+        rustflags: &[String],
         _out: &mut dyn std::io::Write,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<u8>, String> {
         // asked: recorded before anything can fail, so no build asked is ever missed
         let head = self.git.output(clone, &["rev-parse", "HEAD"]);
         let commit = String::from_utf8_lossy(&head.stdout).trim().to_string();
         self.calls.push(Call::Build {
             commit: commit.clone(),
-            pin: pin.map(str::to_string),
+            pin: pin.into(),
+            rustflags: rustflags.to_vec(),
+            sources: clone.canonicalize().unwrap_or_else(|_| clone.to_path_buf()),
         });
-        // the site script's contract: a clean checkout of aterm in, one hash-named pair
-        // and an engine.js pointing at it out
-        if !clone.join("crates/aterm-wasm").is_dir() || commit.len() < 12 {
+        // the stock build's contract: a clean checkout of aterm in, the module out
+        if !clone.join("crates/aterm-wasm").is_dir() {
             return Err(format!("no aterm checkout at {}", clone.display()));
         }
         if !self.git.ok(clone, &["status", "--porcelain"]).is_empty() {
-            return Err("refusing: uncommitted changes".into());
+            return Err("the clone has uncommitted changes".into());
         }
-        let h = &commit[..12];
-        let dest = script.parent().unwrap().join("public/assets/term");
-        for e in std::fs::read_dir(&dest).unwrap() {
-            let name = e.unwrap().file_name().to_string_lossy().into_owned();
-            if name.starts_with("aterm_wasm.") {
-                std::fs::remove_file(dest.join(name)).unwrap();
-            }
+        let mut module = match self.engine {
+            EngineFault::BuildFails => return Err("the wasm32 build exited 101".into()),
+            EngineFault::NoDescriptor => b"\0asm\x01\0\0\0".to_vec(),
+            _ => toy_module(),
+        };
+        // each commit's module is its own, so each commit's pair is
+        module.extend(custom_section("fixture-commit", commit.as_bytes()));
+        if self.engine == EngineFault::LeaksHome {
+            let panic = format!("{}/crates/aterm-wasm/src/lib.rs", self.home.display());
+            module.extend(custom_section("fixture-panic", panic.as_bytes()));
         }
-        std::fs::write(
-            dest.join(format!("aterm_wasm.{h}.js")),
-            format!("glue {commit}\n"),
-        )
-        .unwrap();
-        std::fs::write(
-            dest.join(format!("aterm_wasm.{h}.wasm")),
-            format!("wasm {commit}\n"),
-        )
-        .unwrap();
-        std::fs::write(
-            dest.join("engine.js"),
-            format!("export * from \"./aterm_wasm.{h}.js\";\n"),
-        )
-        .unwrap();
+        Ok(module)
+    }
+
+    fn optimise(&mut self, wasm: &Path, _out: &mut dyn std::io::Write) -> Result<(), String> {
+        self.calls.push(Call::Optimise);
+        if self.engine != EngineFault::OptimiseNothing {
+            let mut bytes = std::fs::read(wasm).unwrap();
+            bytes.extend(optimised_mark());
+            std::fs::write(wasm, bytes).unwrap();
+        }
         Ok(())
     }
 
@@ -409,12 +507,19 @@ impl Lab {
         lab
     }
 
-    /// A promote: a new public commit (CHANGELOG.md or not), as the only commit of a
-    /// fresh bare repo.
+    /// A promote: a new public commit (CHANGELOG.md or not) carrying this checkout's
+    /// own installer, as the only commit of a fresh bare repo.
     fn publish(&mut self, changelog: bool) {
+        self.publish_with(changelog, |_| {});
+    }
+
+    /// [`Lab::publish`], with `edit` applied to the tree before it is committed.
+    fn publish_with(&mut self, changelog: bool, edit: impl FnOnce(&Path)) {
         self.generation += 1;
         let src = self.root.join(format!("public-src-{}", self.generation));
         std::fs::create_dir_all(src.join("crates/aterm-wasm")).unwrap();
+        std::fs::create_dir_all(src.join("tools")).unwrap();
+        std::fs::copy(installer(), src.join(crate::site::INSTALLER_SOURCE)).unwrap();
         std::fs::write(
             src.join("crates/aterm-wasm/Cargo.toml"),
             format!(
@@ -426,6 +531,7 @@ impl Lab {
         if changelog {
             std::fs::copy(fixture("CHANGELOG.md"), src.join("CHANGELOG.md")).unwrap();
         }
+        edit(&src);
         self.git.ok(
             &self.root,
             &["init", "-q", "-b", "main", &src.to_string_lossy()],
@@ -445,28 +551,21 @@ impl Lab {
         self.public_sha = self.git.ok(&src, &["rev-parse", "HEAD"]);
     }
 
-    /// The site checkout (the fixture's public/ and its two scripts, which the fixture
-    /// world stands in for and nothing runs), pushed to a fresh bare origin; the live
-    /// site serves the same public/.
+    /// The site checkout (the fixture's public/ and its deploy script, which the
+    /// fixture world stands in for and nothing runs — and no engine build script: the
+    /// sync builds the engine itself), pushed to a fresh bare origin; the live site
+    /// serves the same public/.
     fn make_site(&mut self) {
         for d in [&self.site_root, &self.origin, &self.live] {
             let _ = std::fs::remove_dir_all(d);
         }
         copy_tree(&fixture("public"), &self.site.join("public"));
-        for script in ["build-terminal-wasm.sh", "deploy.sh"] {
-            let path = self.site.join(script);
-            // never run: the fixture world builds and deploys (and the build script's
-            // text says it reads the pin, as the site's does)
-            std::fs::write(
-                &path,
-                "#!/bin/sh\n# fixture; reads TERMINAL_WASM_TOOLCHAIN\nexit 64\n",
-            )
-            .unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-            }
+        let deploy = self.site.join("deploy.sh");
+        std::fs::write(&deploy, "#!/bin/sh\n# fixture; never run\nexit 64\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&deploy, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         self.git.ok(
             &self.root,
@@ -521,6 +620,7 @@ impl Lab {
             author: Some(("Andrew Yates (pub)".into(), "pub@example.invalid".into())),
             subject_prefix: "site: ".into(),
             wasm_pin: Some(PIN.into()),
+            home: Some(self.root.join("home")),
             masters: Vec::new(),
             now_unix: 1_790_000_000,
             git_env: self.git.env.clone(),
@@ -538,7 +638,10 @@ impl Lab {
             releases,
             main_sha: None,
             gh_dead: false,
+            live_dead: false,
             live: self.live.clone(),
+            home: self.root.join("home"),
+            engine: EngineFault::None,
             deploy: Deploy::Ok,
             firebase_ok: true,
             git: self.git.clone(),
@@ -613,15 +716,32 @@ fn deployed(ended: &Result<Outcome, Failure>, out: &str) {
     assert_eq!(ended, &Ok(Outcome::Synced { deployed: true }), "{out}");
 }
 
-fn failure(ended: Result<Outcome, Failure>, out: &str) -> String {
+fn failure(ended: Result<Outcome, Failure>, out: &str) -> Failure {
     match ended {
-        Err(Failure(why)) => why,
+        Err(failed) => failed,
         other => panic!("expected a failure, got {other:?}\n{out}"),
     }
 }
 
+/// The child that failed, or a panic naming what ended the sync instead.
+fn failed_child(ended: Result<Outcome, Failure>, out: &str) -> (&'static str, String) {
+    match failure(ended, out) {
+        Failure::Child { child, said } => (child, said),
+        other => panic!("expected a child that failed, got {other:?}\n{out}"),
+    }
+}
+
+/// The words of a refusal of `kind`, or a panic naming what ended the sync instead.
+fn refused(ended: Result<Outcome, Failure>, out: &str, kind: Refusal) -> String {
+    match failure(ended, out) {
+        Failure::Refused { kind: k, why } if k == kind => why,
+        other => panic!("expected a {kind:?} refusal, got {other:?}\n{out}"),
+    }
+}
+
 /// TODAY'S RELEASE: the newest stable release's versioned DMG is what the buttons name,
-/// at its true size; the engine is rebuilt from the promoted commit on the wasm32 pin;
+/// at its true size; the engine is rebuilt from the promoted commit on the wasm32 pin,
+/// bound, optimised and installed as one pair named by its module's hash;
 /// `/releases` and the sitemap follow; ONE commit of exactly the owned files is pushed,
 /// deployed once and verified live. A re-run then has nothing to do.
 #[test]
@@ -661,16 +781,77 @@ fn a_release_sync_rewrites_rebuilds_commits_pushes_deploys_and_verifies() {
     assert!(pages::attribute_values(&lab.page("index.html"), "data-href-linux-x86_64").is_empty());
     let aterm = lab.page("aterm.html");
     assert!(aterm.contains("<a href=\"/releases\">release notes</a>"));
-
-    // the engine: rebuilt once, from the promoted commit, on the wasm32 pin
-    assert_eq!(
-        world.builds(),
-        [(lab.public_sha.clone(), Some(PIN.to_string()))]
+    // /install.sh is the public commit's installer, byte for byte; a checksum-only
+    // tarball is no build the installer installs, so no page offers the command
+    assert_eq!(lab.page("install.sh"), read(&installer()));
+    for name in PAGES_WITH_PICKS {
+        for attr in ["data-install-linux-x86_64", "data-install-linux-aarch64"] {
+            assert!(
+                pages::attribute_values(&lab.page(name), attr).is_empty(),
+                "{name} {attr}"
+            );
+        }
+    }
+    assert!(
+        out.contains("== linux-x86_64 install: no signed executable — the page offers no command"),
+        "{out}"
     );
+
+    // the engine: built once, from the promoted commit, on the wasm32 pin, +simd128, the
+    // clone (as cargo names its sources) and the builder's home remapped; optimised once
+    assert_eq!(world.builds(), [(lab.public_sha.clone(), PIN.to_string())]);
+    let home = lab.root.join("home");
+    let Some(Call::Build {
+        rustflags, sources, ..
+    }) = world.calls.iter().find(|c| matches!(c, Call::Build { .. }))
+    else {
+        unreachable!()
+    };
+    assert_eq!(rustflags[..2], ["-C", "target-feature=+simd128"]);
+    assert!(
+        rustflags.contains(&format!("--remap-path-prefix={}=/aterm", sources.display())),
+        "the clone remap names {} as cargo does: {rustflags:?}",
+        sources.display()
+    );
+    assert_eq!(
+        rustflags.last().unwrap(),
+        &format!("--remap-path-prefix={}=/build", home.display())
+    );
+    assert_eq!(world.count(|c| *c == Call::Optimise), 1);
+    // ...installed as one pair: the bound module after wasm-opt, named by its own hash,
+    // its glue loading exactly it, behind engine.js; the old pair gone
     let term = lab.site.join("public/assets/term");
     assert_eq!(read(&term.join("ENGINE_SOURCE")).trim(), lab.public_sha);
+    let (h, js, wasm) = installed_pair(&term);
+    assert_eq!(
+        h,
+        aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(&wasm))[..12]
+    );
     assert!(
-        read(&term.join("engine.js")).contains(&format!("aterm_wasm.{}.js", &lab.public_sha[..12]))
+        wasm.ends_with(&optimised_mark()),
+        "the shipped module is the optimised one"
+    );
+    assert!(wasm.windows(40).any(|w| w == lab.public_sha.as_bytes()));
+    // the glue is the generator's for the module built, its module URL alone renamed
+    let mut built = toy_module();
+    built.extend(custom_section("fixture-commit", lab.public_sha.as_bytes()));
+    let generated = aterm_verify::wasm_glue::glue(&built, "aterm_wasm", Flavor::Web).unwrap();
+    let (_, generated) = generated
+        .into_iter()
+        .find(|(name, _)| name == "aterm_wasm.js")
+        .unwrap();
+    let generated = String::from_utf8(generated).unwrap();
+    assert_eq!(generated.matches("\"aterm_wasm_bg.wasm\"").count(), 1);
+    assert_eq!(
+        js,
+        generated.replace(
+            "\"aterm_wasm_bg.wasm\"",
+            &format!("\"aterm_wasm.{h}.wasm\"")
+        )
+    );
+    assert_eq!(
+        read(&term.join("engine.js")),
+        crate::site::engine::engine_js(&h)
     );
     assert!(
         !term.join("aterm_wasm.000000000000.js").exists(),
@@ -730,7 +911,6 @@ fn a_release_sync_rewrites_rebuilds_commits_pushes_deploys_and_verifies() {
         "{out}"
     );
     let w = "web/site/public";
-    let h = &lab.public_sha[..12];
     let mut committed: Vec<String> = lab
         .git
         .ok(
@@ -751,6 +931,7 @@ fn a_release_sync_rewrites_rebuilds_commits_pushes_deploys_and_verifies() {
         "assets/term/engine.js".into(),
         "aterm.html".into(),
         "index.html".into(),
+        "install.sh".into(),
         "releases.html".into(),
         "sitemap.xml".into(),
         "terminal.html".into(),
@@ -888,6 +1069,7 @@ fn a_dry_run_plans_and_changes_nothing() {
                     "public/terminal.html",
                     "public/releases.html",
                     "public/assets/releases.css",
+                    "public/install.sh",
                     "public/sitemap.xml",
                 ]
                 .map(String::from)
@@ -900,6 +1082,7 @@ fn a_dry_run_plans_and_changes_nothing() {
         assert_eq!(lab.status(), "");
         assert_eq!(lab.head(), before);
         assert!(!lab.site.join("public/releases.html").exists());
+        assert!(!lab.site.join("public/install.sh").exists());
         assert!(!lab.site.join("public/assets/term/ENGINE_SOURCE").exists());
     }
 }
@@ -982,8 +1165,7 @@ fn a_missing_firebase_login_commits_and_pushes_but_never_hides_a_real_failure() 
         world.firebase_ok = firebase_ok;
         let (ended, out) = lab.run(&mut world);
         if want_failure {
-            let why = failure(ended, &out);
-            assert!(why.contains("deploy.sh failed (rc 1)"), "{deploy:?}: {why}");
+            assert_eq!(failed_child(ended, &out).0, "deploy.sh", "{deploy:?}");
             assert_eq!(
                 world.count(|c| *c
                     == Call::Firebase {
@@ -1066,7 +1248,10 @@ fn an_interrupt_starts_nothing_further() {
     let (ended, out) = lab.run(&mut world);
     assert_eq!(
         failure(ended, &out),
-        "interrupted (signal 15) before the deploy — nothing further was started"
+        Failure::Interrupted {
+            signal: 15,
+            step: Stop::Before("the deploy")
+        }
     );
     assert!(world.deploys().is_empty());
     assert_eq!(
@@ -1092,20 +1277,146 @@ fn an_interrupt_starts_nothing_further() {
         ..Signals::default()
     });
     let (ended, out) = lab.run(&mut world);
-    let why = failure(ended, &out);
-    assert!(
-        why.starts_with(
-            "interrupted (signal 15) — nothing further was started; the step it \
-                         stopped said: "
+    match failure(ended, &out) {
+        Failure::Interrupted {
+            signal: 15,
+            step: Stop::During(stopped),
+        } => assert!(
+            matches!(*stopped, Failure::Child { .. }),
+            "a git it never started: {stopped:?}"
         ),
-        "{why}"
-    );
+        other => panic!("{other:?}"),
+    }
     assert!(world.builds().is_empty() && world.deploys().is_empty());
     assert_eq!(
         world.count(|c| matches!(c, Call::Gh(_) | Call::Download(_))),
         0
     );
     assert_eq!((lab.head(), lab.status()), (before, String::new()));
+}
+
+/// AN INTERRUPTED SYNC'S OWN FILES ARE PUT BACK, a person's never are: a sync stopped
+/// after it wrote (and staged) the owned files but before its commit leaves them dirty
+/// and itself in flight; the next run, with no commit of ours owed, restores them from
+/// HEAD and finishes the job. The same files dirty with nothing in flight, with a commit
+/// still owed, or under --dry-run are refused and left as they are.
+#[test]
+fn an_interrupted_syncs_own_files_are_put_back_and_a_persons_are_refused() {
+    let lab = Lab::new();
+    let in_flight = lab.site_root.join(".git").join(crate::site::IN_FLIGHT_MARK);
+    let mut world = lab.fake("releases-fat.json");
+    world.signals = Rc::new(Signals {
+        during: Some("add"),
+        ..Signals::default()
+    });
+    let (ended, out) = lab.run(&mut world);
+    assert!(
+        matches!(
+            failure(ended, &out),
+            Failure::Interrupted { signal: 15, .. }
+        ),
+        "{out}"
+    );
+    assert_eq!(lab.commits(), 1, "stopped before its commit");
+    assert!(!lab.status().is_empty(), "its writes are left");
+    assert!(in_flight.is_file(), "and it is in flight");
+    let left = lab.status();
+
+    // a commit of ours still owed: refused, nothing touched
+    std::fs::write(lab.owed_marker(), "0123456789\n").unwrap();
+    let mut world = lab.fake("releases-fat.json");
+    let _ = refused(lab.run(&mut world).0, "", Refusal::DirtyOwed);
+    assert_eq!(lab.status(), left);
+    std::fs::remove_file(lab.owed_marker()).unwrap();
+    // a dry run changes nothing, so it cannot put them back either
+    let dry = Options {
+        dry_run: true,
+        ..Options::default()
+    };
+    let (ended, out) = lab.sync(&dry, &lab.env(), &mut world);
+    let _ = refused(ended, &out, Refusal::DirtyDryRun);
+    assert_eq!(lab.status(), left);
+
+    let mut world = lab.fake("releases-fat.json");
+    let (ended, out) = lab.run(&mut world);
+    deployed(&ended, &out);
+    assert_eq!(lab.commits(), 2, "one sync commit, of what this run wrote");
+    assert_eq!(lab.status(), "");
+    assert!(!in_flight.exists(), "nothing in flight once committed");
+
+    // the same kind of edit with nothing in flight is a person's: refused, kept
+    let path = lab.site.join("public/index.html");
+    std::fs::write(&path, read(&path) + "<!-- wip -->\n").unwrap();
+    let mut world = lab.fake("releases-fat.json");
+    let _ = refused(lab.run(&mut world).0, "", Refusal::DirtyOwned);
+    assert!(read(&path).ends_with("<!-- wip -->\n"));
+}
+
+/// A STAGED FILE THE SYNC DOES NOT OWN, beside an interrupted sync's own: the put-back
+/// touches only what the sync owns, and the staged change still refuses the run, left
+/// staged as it was.
+#[test]
+fn an_interrupted_sync_beside_a_staged_file_it_does_not_own_is_refused() {
+    let lab = Lab::new();
+    let mut world = lab.fake("releases-fat.json");
+    world.signals = Rc::new(Signals {
+        during: Some("add"),
+        ..Signals::default()
+    });
+    let (ended, out) = lab.run(&mut world);
+    assert!(
+        matches!(
+            failure(ended, &out),
+            Failure::Interrupted { signal: 15, .. }
+        ),
+        "{out}"
+    );
+    std::fs::write(lab.site_root.join("NOTES.md"), "a person's\n").unwrap();
+    lab.git.ok(&lab.site_root, &["add", "NOTES.md"]);
+
+    let mut world = lab.fake("releases-fat.json");
+    let (ended, out) = lab.run(&mut world);
+    let _ = refused(ended, &out, Refusal::StagedUnrelated);
+    assert!(world.builds().is_empty() && world.deploys().is_empty());
+    assert_eq!(lab.commits(), 1, "nothing committed");
+    assert_eq!(
+        lab.git
+            .ok(&lab.site_root, &["diff", "--cached", "--name-only"]),
+        "NOTES.md",
+        "theirs is left staged, and only theirs"
+    );
+}
+
+/// DEPLOYED, BUT THE LIVE SITE COULD NOT BE READ: never reported as synced — the
+/// outcome says the release was not verified live, the CLI warns and exits 0, and the
+/// release's after-cut step carries it as a note, not a stop.
+#[test]
+fn a_live_site_that_cannot_be_fetched_is_unchecked_never_synced() {
+    let lab = Lab::new();
+    let mut world = lab.fake("releases-fat.json");
+    world.live_dead = true;
+    let (ended, out) = lab.run(&mut world);
+    assert_eq!(
+        ended,
+        Ok(Outcome::LiveUnchecked { deployed: true }),
+        "{out}"
+    );
+    assert_eq!(world.deploys().len(), 1);
+    assert!(world.count(|c| matches!(c, Call::Live(_))) > 0);
+    assert_eq!(crate::site::report(&ended), 0);
+    let after = crate::release_steps::site_outcome(&ended, Vec::new()).expect("a note");
+    assert!(!after.site_deferred);
+    assert!(
+        after.note.contains("could NOT be verified live"),
+        "{after:?}"
+    );
+    // nothing changed and the live site still unreadable: the same, undeployed
+    let (ended, out) = lab.run(&mut world);
+    assert_eq!(
+        ended,
+        Ok(Outcome::LiveUnchecked { deployed: false }),
+        "{out}"
+    );
 }
 
 /// DEPLOYED, BUT THE LIVE SITE DISAGREES: exit 4, naming what differs — a CDN that still
@@ -1166,12 +1477,12 @@ fn an_engine_the_site_repo_does_not_hold_is_never_deployed() {
         .ok(&lab.site_root, &["push", "-q", "origin", "main"]);
     let mut world = lab.fake("releases-fat.json");
     let (ended, out) = lab.run(&mut world);
-    let why = failure(ended, &out);
-    assert!(
-        why.contains("ignored by one of your .gitignore files"),
-        "{why}"
+    let (child, said) = failed_child(ended, &out);
+    assert_eq!(
+        child, "git add",
+        "refused at the staging, in git's words: {said}"
     );
-    assert!(why.contains("public/assets/term/ENGINE_SOURCE"), "{why}");
+    assert!(said.contains("public/assets/term/ENGINE_SOURCE"), "{said}");
     assert!(world.deploys().is_empty());
 
     let mut lab = Lab::new();
@@ -1199,14 +1510,10 @@ fn an_engine_the_site_repo_does_not_hold_is_never_deployed() {
     assert_ne!(lab.public_sha, first);
     world.calls.clear();
     let (ended, out) = lab.run(&mut world);
-    let why = failure(ended, &out);
-    assert!(
-        why.contains("deploying would publish an engine that is not in git"),
-        "{why}"
-    );
+    let why = refused(ended, &out, Refusal::EngineNotInGit);
     assert!(
         why.contains(&lab.public_sha) && why.contains(&first),
-        "{why}"
+        "the engine on disk and the one committed, by sha: {why}"
     );
     assert!(world.deploys().is_empty());
 }
@@ -1238,8 +1545,8 @@ fn a_page_out_of_shape_or_dirty_is_refused_before_anything_is_written() {
         let before = lab.head();
         let mut world = lab.fake("releases-fat.json");
         let (ended, out) = lab.run(&mut world);
-        let why = failure(ended, &out);
-        assert!(why.contains(rule), "{why}");
+        let why = refused(ended, &out, Refusal::Page);
+        assert!(why.starts_with(rule.split(':').next().unwrap()), "{why}");
         assert_eq!(lab.head(), before);
         assert!(world.builds().is_empty() && world.deploys().is_empty());
         assert_eq!(lab.status(), "");
@@ -1249,10 +1556,10 @@ fn a_page_out_of_shape_or_dirty_is_refused_before_anything_is_written() {
     std::fs::write(&path, read(&path) + "<!-- wip -->\n").unwrap();
     let mut world = lab.fake("releases-fat.json");
     let (ended, out) = lab.run(&mut world);
-    let why = failure(ended, &out);
+    let why = refused(ended, &out, Refusal::DirtyOwned);
     assert!(
-        why.contains("uncommitted changes in files this sync rewrites"),
-        "{why}"
+        why.contains("public/aterm.html"),
+        "names the dirty file: {why}"
     );
     assert!(
         world.calls.is_empty(),
@@ -1271,11 +1578,7 @@ fn a_stream_with_nothing_installable_keeps_the_previous_link() {
         {"name":"aterm.dmg","size":31457280},{"name":"aterm-0.65.0-mac.zip","size":28219832}]}]"#;
     let mut world = lab.fake(nodmg);
     let (ended, out) = lab.run(&mut world);
-    let why = failure(ended, &out);
-    assert!(
-        why.contains("no stable release carries its versioned DMG"),
-        "{why}"
-    );
+    let _ = refused(ended, &out, Refusal::Release);
     assert!(world.builds().is_empty() && world.deploys().is_empty());
     assert_eq!((lab.head(), lab.status()), (before, String::new()));
     assert_eq!(
@@ -1290,13 +1593,10 @@ fn a_stream_with_nothing_installable_keeps_the_previous_link() {
 #[test]
 fn the_commit_is_the_promoted_one_and_github_is_read_through_gh_only() {
     let lab = Lab::new();
-    for (commit, words) in [
-        (
-            Some("0000000000000000000000000000000000000000"),
-            "is not on alabsystems/aterm",
-        ),
-        (Some("abc"), "must be a full hex commit sha"),
-        (None, "PUB_PUBLIC_COMMIT is required"),
+    for (commit, fetched) in [
+        (Some("0000000000000000000000000000000000000000"), true),
+        (Some("abc"), false),
+        (None, false),
     ] {
         let mut world = lab.fake("releases-fat.json");
         let env = Env {
@@ -1304,8 +1604,12 @@ fn the_commit_is_the_promoted_one_and_github_is_read_through_gh_only() {
             ..lab.env()
         };
         let (ended, out) = lab.sync(&Options::default(), &env, &mut world);
-        let why = failure(ended, &out);
-        assert!(why.contains(words), "{commit:?}: {why}");
+        if fetched {
+            // a full sha the public repo does not have: the fetch of it fails
+            assert_eq!(failed_child(ended, &out).0, "git fetch", "{commit:?}");
+        } else {
+            let _ = refused(ended, &out, Refusal::Commit);
+        }
     }
     let latest = Options {
         latest: true,
@@ -1333,10 +1637,7 @@ fn the_commit_is_the_promoted_one_and_github_is_read_through_gh_only() {
     let mut world = lab.fake("releases-fat.json");
     world.gh_dead = true;
     let (ended, out) = lab.sync(&latest, &env, &mut world);
-    assert!(
-        failure(ended, &out)
-            .contains("could not read the tip of alabsystems/aterm main through gh")
-    );
+    assert_eq!(failed_child(ended, &out).0, "gh", "main's tip");
     let (ended, out) = lab.sync(
         &Options {
             no_deploy: true,
@@ -1345,9 +1646,7 @@ fn the_commit_is_the_promoted_one_and_github_is_read_through_gh_only() {
         &lab.env(),
         &mut world,
     );
-    assert!(
-        failure(ended, &out).contains("could not list releases for alabsystems/aterm through gh")
-    );
+    assert_eq!(failed_child(ended, &out).0, "gh", "the release list");
     assert!(
         world.calls.iter().all(|c| matches!(c, Call::Gh(_))),
         "{:?}",
@@ -1379,30 +1678,17 @@ fn a_site_dir_with_spaces_syncs() {
     assert_eq!(lab.head(), lab.origin_main());
 }
 
-/// THE ENGINE'S COMPILER: the wasm32 pin is handed to the site's build, and the transcript
-/// never claims a pin the build did not use — a site script that does not read it yet
-/// is said to build on its own default; with no pin, nothing is handed.
+/// THE ENGINE'S COMPILER: the engine is built on the wasm32 pin and the transcript says
+/// so; with no pin it is built on rustup's stable, as the site's script did, and the
+/// transcript says that instead.
 #[test]
-fn the_engine_is_handed_the_pin_and_never_claims_one_it_did_not_use() {
+fn the_engine_is_built_on_the_pin_and_says_which() {
     let lab = Lab::new();
-    std::fs::write(
-        lab.site.join("build-terminal-wasm.sh"),
-        "#!/bin/sh\n# from before the pin\nexit 64\n",
-    )
-    .unwrap();
-    lab.git
-        .commit_all(&lab.site_root, "site: a build script from before the pin");
-    lab.git
-        .ok(&lab.site_root, &["push", "-q", "origin", "main"]);
     let mut world = lab.fake("releases-fat.json");
     let (ended, out) = lab.run(&mut world);
     deployed(&ended, &out);
-    assert_eq!(
-        world.builds(),
-        [(lab.public_sha.clone(), Some(PIN.to_string()))]
-    );
-    assert!(out.contains(&format!("NOT the wasm32 pin {PIN}")), "{out}");
-    assert!(!out.contains(&format!("on the wasm32 pin {PIN}")), "{out}");
+    assert_eq!(world.builds(), [(lab.public_sha.clone(), PIN.to_string())]);
+    assert!(out.contains(&format!("on the wasm32 pin {PIN}")), "{out}");
 
     let lab = Lab::new();
     let mut world = lab.fake("releases-fat.json");
@@ -1412,7 +1698,58 @@ fn the_engine_is_handed_the_pin_and_never_claims_one_it_did_not_use() {
     };
     let (ended, out) = lab.sync(&Options::default(), &env, &mut world);
     deployed(&ended, &out);
-    assert_eq!(world.builds(), [(lab.public_sha.clone(), None)]);
+    assert_eq!(
+        world.builds(),
+        [(lab.public_sha.clone(), "stable".to_string())]
+    );
+    assert!(out.contains("on rustup's stable"), "{out}");
+    assert!(!out.contains("wasm32 pin"), "{out}");
+}
+
+/// AN ENGINE THAT CANNOT BE SHIPPED IS NEVER INSTALLED: a build that fails, a module the
+/// glue generator refuses, one that still holds the builder's home, or one wasm-opt left
+/// as it was each fail the sync before the checkout is written — the old pair, no
+/// marker, no commit, no deploy — and say which.
+#[test]
+fn an_engine_that_cannot_ship_fails_the_sync_and_writes_nothing() {
+    for (fault, said) in [
+        (EngineFault::BuildFails, "the wasm32 build exited 101"),
+        (
+            EngineFault::NoDescriptor,
+            "verify glue's generator refused aterm_wasm.wasm",
+        ),
+        (EngineFault::LeaksHome, "survived the path remapping"),
+        (
+            EngineFault::OptimiseNothing,
+            "the engine never ships pre-opt",
+        ),
+    ] {
+        let lab = Lab::new();
+        let before = lab.head();
+        let mut world = lab.fake("releases-fat.json");
+        world.engine = fault;
+        let (ended, out) = lab.run(&mut world);
+        let (child, why) = failed_child(ended, &out);
+        assert_eq!(child, "the /terminal engine build", "{fault:?}: {why}");
+        assert!(
+            why.starts_with("the /terminal engine build failed: "),
+            "{fault:?}: {why}"
+        );
+        assert!(why.contains(said), "{fault:?}: {why}");
+        assert_eq!(world.builds().len(), 1, "{fault:?}");
+        assert_eq!(
+            (lab.head(), lab.status()),
+            (before, String::new()),
+            "{fault:?}"
+        );
+        let term = lab.site.join("public/assets/term");
+        assert!(
+            term.join("aterm_wasm.000000000000.wasm").is_file(),
+            "{fault:?}"
+        );
+        assert!(!term.join("ENGINE_SOURCE").exists(), "{fault:?}");
+        assert!(world.deploys().is_empty(), "{fault:?}");
+    }
 }
 
 /// THE PROMOTE-TIME RUN DEFERS TO THE CUT: the engine's hook carries PUB_STAGING_COMMIT and
@@ -1463,11 +1800,7 @@ fn a_failed_push_deploys_nothing_and_the_next_run_finishes_the_job() {
     lab.refuse_pushes(true);
     let mut world = lab.fake("releases-fat.json");
     let (ended, out) = lab.run(&mut world);
-    let why = failure(ended, &out);
-    assert!(
-        why.contains("push to origin main failed (above) — the site commit is on THIS MACHINE ONLY and NOTHING WAS DEPLOYED"),
-        "{why}"
-    );
+    assert_eq!(failed_child(ended, &out).0, "git push");
     assert!(world.deploys().is_empty());
     assert_eq!(world.count(|c| matches!(c, Call::Live(_))), 0);
     assert_eq!(lab.commits(), 2);
@@ -1508,7 +1841,7 @@ fn a_failed_push_deploys_nothing_and_the_next_run_finishes_the_job() {
         ..Options::default()
     };
     let (ended, out) = lab.sync(&opts, &lab.env(), &mut world);
-    assert!(failure(ended, &out).contains("push to origin main failed"));
+    assert_eq!(failed_child(ended, &out).0, "git push");
 }
 
 /// A FAILED PULL is as fatal and as early, leaves no rebase behind, and its remedy leads to
@@ -1534,11 +1867,8 @@ fn a_failed_pull_and_its_remedy_end_in_a_deploy_and_an_owed_commit_is_shipped_on
         .ok(&lab.site_root, &["remote", "set-url", "origin", &nowhere]);
     let mut world = lab.fake("releases-fat.json");
     let (ended, out) = lab.run(&mut world);
-    let why = failure(ended, &out);
-    assert!(
-        why.contains("pull --rebase from origin main failed (above)"),
-        "{why}"
-    );
+    let (child, why) = failed_child(ended, &out);
+    assert_eq!(child, "git pull");
     assert!(
         why.contains(&format!(
             "Resolve the pull by hand, and do not push: (cd {} && git pull --rebase origin main)",
@@ -1722,5 +2052,86 @@ fn the_intel_mark_and_the_toolchain_facts_reach_the_committed_pages() {
                 "{name} {attr}"
             );
         }
+    }
+}
+
+/// `/install.sh` IS THE PUBLIC COMMIT'S INSTALLER, and one it cannot serve honestly is
+/// refused before anything is written: a public commit with no `tools/install.sh`
+/// (the Linux command would fetch a 404), or one whose piped run would install from
+/// another repository than the one whose releases the site links.
+#[test]
+fn an_installer_the_site_cannot_serve_is_refused_before_anything_is_written() {
+    for (label, edit, words) in [
+        (
+            "no installer",
+            (|src: &Path| std::fs::remove_file(src.join("tools/install.sh")).unwrap()) as fn(&Path),
+            "the public commit has no readable tools/install.sh to serve as /install.sh",
+        ),
+        (
+            "another channel",
+            |src: &Path| {
+                let path = src.join("tools/install.sh");
+                let text = std::fs::read_to_string(&path).unwrap().replace(
+                    "OFFICIAL_REPO_SLUG=\"alabsystems/aterm\"",
+                    "OFFICIAL_REPO_SLUG=\"someone-else/aterm\"",
+                );
+                std::fs::write(&path, text).unwrap();
+            },
+            "does not declare OFFICIAL_REPO_SLUG=\"alabsystems/aterm\"",
+        ),
+    ] {
+        let mut lab = Lab::new();
+        lab.publish_with(true, edit);
+        let before = lab.head();
+        let mut world = lab.fake("releases-fat.json");
+        let (ended, out) = lab.run(&mut world);
+        let why = refused(ended, &out, Refusal::Installer);
+        assert!(why.contains(words), "{label}: {why}");
+        assert!(
+            world.builds().is_empty() && world.deploys().is_empty(),
+            "{label}"
+        );
+        assert_eq!(
+            (lab.head(), lab.status()),
+            (before, String::new()),
+            "{label}"
+        );
+        assert!(!lab.site.join("public/install.sh").exists(), "{label}");
+    }
+}
+
+/// The live check holds `/install.sh` to the checkout's: one the live site does not
+/// serve, or serves stale, is a disagreement named as such — never redeployed on a
+/// guess.
+#[test]
+fn a_live_installer_that_is_missing_or_stale_is_named() {
+    let lab = Lab::new();
+    let mut world = lab.fake("releases-fat.json");
+    let (ended, out) = lab.run(&mut world);
+    deployed(&ended, &out);
+    assert_eq!(read(&lab.live.join("install.sh")), read(&installer()));
+    for (stale, want) in [
+        (None, Difference::InstallerNotFetched),
+        (
+            Some("#!/bin/sh\necho stale\n"),
+            Difference::InstallerDiffers,
+        ),
+    ] {
+        let live = lab.live.join("install.sh");
+        match stale {
+            None => std::fs::remove_file(&live).unwrap(),
+            Some(text) => std::fs::write(&live, text).unwrap(),
+        }
+        world.calls.clear();
+        let (ended, out) = lab.run(&mut world);
+        assert_eq!(
+            ended,
+            Ok(Outcome::LiveDisagrees {
+                deployed: false,
+                why: vec![Disagreement::Page(want.clone())],
+            }),
+            "{out}"
+        );
+        assert!(world.deploys().is_empty());
     }
 }

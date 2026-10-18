@@ -1,0 +1,20 @@
+# claude-code 2.1.302 · MEASURED 2026-10-17, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a Stop hook (command ./sj) that blocks once with {"decision": "block", "reason": "check the tests"} (exit 0) and turns the stub too-long, the reply before it EMPTY: the reason behind Claude Code's label (Stop hook error: check the tests) under the summary, then Claude Code's own context wall for the continuation's request
+ ▐▛███▛█   Claude Code v2.1.302
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ /clear
+
+❯ say nothing
+
+⏺ Ran 1 stop hook (ctrl+o to expand)
+  ⎿  Stop hook error: check the tests
+  ⎿  Context limit reached · /compact or /clear to continue
+
+✻ Cooked for 0s · done 12:48 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)                                                                Stop hook error occurred · ctrl+o to see

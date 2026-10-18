@@ -8,7 +8,8 @@
 //! multi-row actions, including limit shrink and stale-offset recovery.
 
 use crate::native_settings::{SettingsPageScrollCommand, settings_page_scroll_transition};
-use aterm_spec::derive::{Model, settings_page_scroll_model};
+use aterm_models_misc::settings_page_scroll_model;
+use aterm_spec::derive::Model;
 use aterm_spec::interp::State;
 
 const MODEL_MAX: usize = 3;

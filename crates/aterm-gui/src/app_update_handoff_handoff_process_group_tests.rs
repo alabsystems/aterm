@@ -100,8 +100,6 @@ fn final_handoff_admission_conforms_to_every_model_guard() {
         native_safe: true,
         proof_exact: true,
         commit_channel: true,
-        operator_idle: true,
-        operator_quiesced: true,
     };
     assert!(handoff_commit_admitted(all));
 
@@ -205,32 +203,13 @@ fn final_handoff_admission_conforms_to_every_model_guard() {
             },
             "LoseCommitChannel",
         ),
-        // The resident operator, both of its facts: busy at the Commit, and refusing for any
-        // other reason.
-        (
-            "busy resident operator",
-            HandoffCommitFacts {
-                operator_idle: false,
-                operator_quiesced: false,
-                ..all
-            },
-            "ResidentOperatorBusyAtCommit",
-        ),
-        (
-            "unfenced resident operator",
-            HandoffCommitFacts {
-                operator_quiesced: false,
-                ..all
-            },
-            "ResidentOperatorBusyAtCommit",
-        ),
     ];
     for (name, facts, revoked_action) in cases {
         assert!(
             !handoff_commit_admitted(facts),
             "missing {name} was admitted"
         );
-        let model = aterm_spec::derive::native_update_overlap_handoff_model();
+        let model = aterm_models_misc::native_update_overlap_handoff_model();
         let mut state = model.init_state();
         assert!(model.fire("ParkParentReaders", &mut state));
         assert!(model.fire("SpawnReaderlessChild", &mut state));
@@ -246,7 +225,7 @@ fn final_handoff_admission_conforms_to_every_model_guard() {
         );
     }
 
-    let model = aterm_spec::derive::native_update_overlap_handoff_model();
+    let model = aterm_models_misc::native_update_overlap_handoff_model();
     let mut exact = model.init_state();
     for action in [
         "ParkParentReaders",
@@ -257,50 +236,6 @@ fn final_handoff_admission_conforms_to_every_model_guard() {
         assert!(model.fire(action, &mut exact), "{action}: {exact:?}");
     }
     assert_eq!(exact["arbiter"], 1);
-}
-
-/// Model level: queued PTY output and drained hardware input buffer through the
-/// overlap; Commit stays reachable with output queued, while an undrained OS
-/// input queue parks (never fails) Commit until the drain delivers it.
-#[test]
-fn queued_output_and_drained_input_buffer_through_commit_in_the_model() {
-    let model = aterm_spec::derive::native_update_overlap_handoff_model();
-    let mut state = model.init_state();
-    for action in [
-        "ParkParentReaders",
-        "SpawnReaderlessChild",
-        "ChildPaintsExactProof",
-        "PtyOutputQueues",
-        "QueueHardwareInput",
-    ] {
-        assert!(model.fire(action, &mut state), "{action}: {state:?}");
-    }
-    // Undispatched hardware input parks Commit (it would die with _exit)…
-    assert!(
-        model.successors("MainWinsCommitArbiter", &state).is_empty(),
-        "commit admitted with an undrained OS input queue: {state:?}"
-    );
-    // …but is not a failure: the reject arbiter has no authority either.
-    assert!(
-        model
-            .successors("WorkerWinsRejectArbiter", &state)
-            .is_empty(),
-        "queued input must defer, not fail, the attempt: {state:?}"
-    );
-    for action in [
-        "DrainQueuedHardwareInput",
-        "MainWinsCommitArbiter",
-        "CommitModern",
-        "ReleaseModernReaders",
-    ] {
-        assert!(model.fire(action, &mut state), "{action}: {state:?}");
-    }
-    assert_eq!(state["commit"], 1);
-    assert_eq!(state["child_readers"], 1);
-    assert_eq!(
-        state["pty_output_queued"], 1,
-        "the committed run carried queued output the whole way — the child drains it"
-    );
 }
 
 /// Descriptor level: readable bytes on a handed master are visible to the
@@ -658,7 +593,7 @@ fn pre_ready_death_preserves_leader_identity_until_normal_group_reap() {
 
     // Tier-1 projection: an exited, unreaped leader with a live same-group descendant; rollback
     // is enabled only after the group is signalled and then the direct child reaped.
-    let model = aterm_spec::derive::native_update_overlap_handoff_model();
+    let model = aterm_models_misc::native_update_overlap_handoff_model();
     let mut model_state = model.init_state();
     for action in [
         "ParkParentReaders",
@@ -769,7 +704,7 @@ fn a_launchservices_pid_mismatch_after_transfer_is_rejected_and_reaped() {
     let mut cleanup = ProcessGroupCleanup::new(leader);
 
     // Tier-1 projection: a launch answer naming another pid is the model's mismatched proof.
-    let model = aterm_spec::derive::native_update_overlap_handoff_model();
+    let model = aterm_models_misc::native_update_overlap_handoff_model();
     let mut model_state = model.init_state();
     for action in [
         "ParkParentReaders",
@@ -917,6 +852,13 @@ fn a_candidate_that_ends_behind_a_stray_proof_writer_ends_the_ready_wait() {
     );
 
     // A match, not a `let … else`: off macOS the fork lane is the only variant.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        expect(
+            clippy::infallible_destructuring_match,
+            reason = "`Launched` is the macOS-only arm"
+        )
+    )]
     let mut child = match handle {
         HandoffCandidateHandle::Forked(child) => child,
         #[cfg(target_os = "macos")]

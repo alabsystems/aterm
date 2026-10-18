@@ -14,20 +14,29 @@
 //!
 //! WGSL's `@group @binding` has no Metal equivalent, so this module binds by
 //! reading `Pipeline::Blit.spec().binds` ([`crate::pipeline_table::BindSpec`]).
-//! The twin scan in `crate::shader_twins` holds that column equal to `blit.metal`,
-//! and the differential pins the bytes, so a swapped slot fails both.
+//! The Metal-vs-wgpu blit differential pins the bytes, so a swapped slot
+//! fails it.
 //!
 //! Test-only: the macOS backend runs its blit from the same row inside
 //! [`super::present::encode_present_sequence`].
 
+#[cfg(wgpu_arm)]
 use super::ffi::{self, Device, Obj, PixelFormat, SamplerDesc};
+#[cfg(wgpu_arm)]
 use super::pipelines;
+#[cfg(wgpu_arm)]
 use crate::pipeline_table::Pipeline;
+
+/// Bytes per `BlitUniform`, asserted against the Rust struct where it is
+/// filled, so a field added on one side only fails loudly.
+pub(crate) const UNIFORM_BYTES: usize = 112;
 
 /// Metal twin of `renderer.rs::build_blit_resources`: the shader library, the
 /// pipeline state for one destination format, the nearest sampler and the
 /// 112-byte uniform buffer. wgpu's bind-group and pipeline layouts have no
-/// Metal counterpart; Metal binds by slot at encode time.
+/// Metal counterpart; Metal binds by slot at encode time. The differential is
+/// the wgpu oracle's, so the pass compiles with it (`--features wgpu-oracle`).
+#[cfg(wgpu_arm)]
 pub(crate) struct MetalBlit {
     device: Device,
     queue: Obj,
@@ -42,10 +51,10 @@ pub(crate) struct MetalBlit {
     format: PixelFormat,
 }
 
+#[cfg(wgpu_arm)]
 impl MetalBlit {
-    /// Bytes per `BlitUniform`, asserted against the Rust struct where it is
-    /// filled, so a field added on one side only fails loudly.
-    pub(crate) const UNIFORM_BYTES: usize = 112;
+    /// [`UNIFORM_BYTES`], where the differential reads it.
+    pub(crate) const UNIFORM_BYTES: usize = UNIFORM_BYTES;
 
     /// The offscreen frame's format; the upload stride uses its
     /// [`PixelFormat::bytes_per_texel`].

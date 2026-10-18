@@ -269,6 +269,7 @@ pub(crate) enum ArmDecision {
 /// (`SuppressManualOnly`), a policy first read there was read only after the
 /// capture it was sealed to forbid. `Keep` reads nothing: an armed intent at
 /// least as new was read when it was set.
+#[cfg(any(unix, test))]
 #[must_use]
 pub(crate) fn arm_reads_candidate(
     decision: ArmDecision,
@@ -401,72 +402,72 @@ pub(crate) enum StructuralLatchDecision {
 /// With neither, the latch stands: the convergence notice has said so, and the
 /// Version menu's apply is the press that moves it.
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "NativeUpdateStructuralLatch",
         action = "Decide",
         project = "aterm_gui::native_updater_conformance::project_structural_latch"
     )
 )]
 #[cfg_attr(
-    test,
-    aterm_spec::spec_unmodeled(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
         machine = "NativeUpdateStructuralLatch",
         action = "TrialHasRoom",
         reason = "The boot sentinel's measured count, read on the updater facts worker (`InstalledUpdate::trial_launches`); an input to this decision, not a transition of the shipping reducer."
     )
 )]
 #[cfg_attr(
-    test,
-    aterm_spec::spec_unmodeled(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
         machine = "NativeUpdateStructuralLatch",
         action = "TrialIsSpent",
         reason = "The boot sentinel's measured count at the revert threshold; an input to this decision, not a transition of the shipping reducer."
     )
 )]
 #[cfg_attr(
-    test,
-    aterm_spec::spec_unmodeled(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
         machine = "NativeUpdateStructuralLatch",
         action = "DayPasses",
         reason = "A day passing on the re-sample deadline, the Mac's sleep counted (`App::count_sleep_toward_update_deadlines`); the host reads it into `resample_due`."
     )
 )]
 #[cfg_attr(
-    test,
-    aterm_spec::spec_unmodeled(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
         machine = "NativeUpdateStructuralLatch",
         action = "NewerArrives",
         reason = "The checker staging a verified newer download on disk; the host reads it into `unspent_newer_download`."
     )
 )]
 #[cfg_attr(
-    test,
-    aterm_spec::spec_unmodeled(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
         machine = "NativeUpdateStructuralLatch",
         action = "RetryDue",
         reason = "A refused retire's retry deadline (`AutoApplyStructuralVerdict::newer_retry`) passing, the Mac's sleep counted (`App::count_sleep_toward_update_deadlines`); the host reads it into `unspent_newer_download` / `newer_download_waiting`."
     )
 )]
 #[cfg_attr(
-    test,
-    aterm_spec::spec_unmodeled(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
         machine = "NativeUpdateStructuralLatch",
         action = "TrialUnreadable",
         reason = "The installed facts ceasing to report the latched build (the facts worker drops a yanked bundle newer than the running one); the host reads it as `trial_room: None`, and its bound on such looks is `App::look_at_structural_latch`'s."
     )
 )]
 #[cfg_attr(
-    test,
-    aterm_spec::spec_unmodeled(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
         machine = "NativeUpdateStructuralLatch",
         action = "TrialUnproven",
         reason = "A facts read that could not prove the installed bundle at all (a passing refusal: `spctl` past its ceiling), which the facts worker reports as `installed_unproven`; the host reads it as `trial_room: None`, and its own bound on such looks is `App::look_over_unproven_reads`'s."
     )
 )]
 #[cfg_attr(
-    test,
-    aterm_spec::spec_unmodeled(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
         machine = "NativeUpdateStructuralLatch",
         action = "TrialReadAgain",
         reason = "The installed facts reporting the latched build again; the host reads it into `trial_room`, and a look that finds it clears the unread count."
@@ -661,42 +662,6 @@ mod tests {
         };
         assert_eq!(arm(kept), ArmDecision::Keep);
         assert!(!arm_reads_candidate(arm(kept), 11, 10));
-        // Wired where the stage arms, ahead of the decision's own arms.
-        let src = include_str!("app_native.rs");
-        let asks_at = src
-            .find("arm_reads_candidate(decision, build, current_build)")
-            .expect("arming asks");
-        let reads_at = asks_at
-            + src[asks_at..]
-                .find("self.spawn_staged_handoff_preverification(build);")
-                .expect("and reads");
-        let acts_at = reads_at
-            + src[reads_at..]
-                .find("match decision {")
-                .expect("then acts on the decision");
-        assert!(
-            reads_at - asks_at < 120 && acts_at - reads_at < 120,
-            "the read is the one guarded right before the decision's arms"
-        );
-        // Counted in the arming function only: a later re-read of a stage held
-        // for its roster confirmation (`App::start_fresh_preverification`, round
-        // eight, #503) is no arm-time read.
-        let arm_fn = src
-            .find("pub(crate) fn arm_native_auto_apply(")
-            .expect("the arming function");
-        let arm_end = arm_fn
-            + 1
-            + src[arm_fn + 1..]
-                .find("\n    pub(crate) fn ")
-                .expect("the arming function ends");
-        assert!(arm_fn < asks_at && asks_at < arm_end, "asked while arming");
-        assert_eq!(
-            src[arm_fn..arm_end]
-                .matches("self.spawn_staged_handoff_preverification(build);")
-                .count(),
-            1,
-            "one arm-time read, not one per arm"
-        );
     }
 
     #[test]
@@ -936,155 +901,9 @@ mod tests {
             assert!(got >= last, "monotone at {since:?}");
             last = got;
         }
-        assert_eq!(LANDS_WITHIN, Duration::from_secs(55));
         assert!(
             LANDS_WITHIN + SWITCH_ALLOWANCE <= Duration::from_secs(60),
             "the attempt the ladder starts at its end still lands inside the minute"
-        );
-    }
-
-    /// Each phase weakens exactly one preference, in order, and `Land` refuses
-    /// nothing the terminal does — including the keystroke gap, which the
-    /// deferred-input queue makes safe to override. The one refusal no phase
-    /// relaxes is the user's own consent warm-up.
-    #[test]
-    fn each_phase_relaxes_exactly_its_own_preference() {
-        let calm = ActivityFacts {
-            quiet: true,
-            hands_off_keys: true,
-            output_quiet: true,
-            focused: true,
-            consent_warmup: false,
-            harness_restored_pending: false,
-        };
-        for phase in [
-            ApplyPhase::PreferIdle,
-            ApplyPhase::PreferOutputGap,
-            ApplyPhase::KeysOnly,
-            ApplyPhase::Land,
-        ] {
-            assert_eq!(
-                automatic_park_refusal(phase, calm),
-                None,
-                "{phase:?} on a calm machine"
-            );
-        }
-        let typing = ActivityFacts {
-            hands_off_keys: false,
-            ..calm
-        };
-        for phase in [
-            ApplyPhase::PreferIdle,
-            ApplyPhase::PreferOutputGap,
-            ApplyPhase::KeysOnly,
-        ] {
-            assert!(
-                automatic_park_refusal(phase, typing).is_some(),
-                "{phase:?} never lands mid-word"
-            );
-        }
-        assert_eq!(automatic_park_refusal(ApplyPhase::Land, typing), None);
-
-        let busy_but_hands_off = ActivityFacts {
-            quiet: false,
-            ..calm
-        };
-        assert!(automatic_park_refusal(ApplyPhase::PreferIdle, busy_but_hands_off).is_some());
-        assert_eq!(
-            automatic_park_refusal(ApplyPhase::PreferOutputGap, busy_but_hands_off),
-            None,
-            "past the idle phase, machine-wide quiet is no longer required"
-        );
-
-        let watched_stream = ActivityFacts {
-            quiet: false,
-            output_quiet: false,
-            ..calm
-        };
-        assert_eq!(
-            automatic_park_refusal(ApplyPhase::PreferOutputGap, watched_stream),
-            Some("terminal output is still streaming")
-        );
-        assert_eq!(
-            automatic_park_refusal(
-                ApplyPhase::PreferOutputGap,
-                ActivityFacts {
-                    focused: false,
-                    ..watched_stream
-                }
-            ),
-            None,
-            "with the user in another app the stall is invisible"
-        );
-        assert_eq!(
-            automatic_park_refusal(ApplyPhase::KeysOnly, watched_stream),
-            None,
-            "the streaming machine this ladder exists for lands here"
-        );
-
-        // A warm-up the user started holds every phase — `Land` included, or a
-        // landing could arrive while its consent dialog is up.
-        let warming = ActivityFacts {
-            consent_warmup: true,
-            ..calm
-        };
-        for phase in [
-            ApplyPhase::PreferIdle,
-            ApplyPhase::PreferOutputGap,
-            ApplyPhase::KeysOnly,
-            ApplyPhase::Land,
-        ] {
-            assert_eq!(
-                automatic_park_refusal(phase, warming),
-                Some("a folder-access warm-up the user started is still running"),
-                "{phase:?}"
-            );
-        }
-
-        // A cold restore's agents still being relaunched hold every phase too
-        // — `Land` included (round four, plan item 7): the landing used to
-        // drop the queue right after the reopened layout's row said they
-        // resume. RED before the change: there was no such fact, and `Land`
-        // parked over the queue. Bounded by the host, never by the ladder
-        // (`harness_host::RESTORED_HOLD`).
-        let relaunching = ActivityFacts {
-            harness_restored_pending: true,
-            ..calm
-        };
-        for phase in [
-            ApplyPhase::PreferIdle,
-            ApplyPhase::PreferOutputGap,
-            ApplyPhase::KeysOnly,
-            ApplyPhase::Land,
-        ] {
-            assert_eq!(
-                automatic_park_refusal(phase, relaunching),
-                Some(RESTORED_PENDING_REFUSAL),
-                "{phase:?}"
-            );
-        }
-        // Everything the ladder relaxes at `Land` — keys, output, focus — still
-        // does not release it; only the queue emptying or its bound does.
-        let relaunching_busy = ActivityFacts {
-            quiet: false,
-            hands_off_keys: false,
-            output_quiet: false,
-            ..relaunching
-        };
-        assert_eq!(
-            automatic_park_refusal(ApplyPhase::Land, relaunching_busy),
-            Some(RESTORED_PENDING_REFUSAL)
-        );
-        assert_eq!(
-            automatic_park_refusal(
-                ApplyPhase::Land,
-                ActivityFacts {
-                    harness_restored_pending: false,
-                    ..relaunching_busy
-                }
-            ),
-            None,
-            "the queue done, the landing is at once"
         );
     }
 

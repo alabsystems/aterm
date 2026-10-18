@@ -1,0 +1,21 @@
+# agy 1.4.0 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Antigravity CLI, launched by path with a scratch `HOME` whose settings name the Gemini API provider, its Google hosts black-holed, a fake `GEMINI_API_KEY` and `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:<port>` (a local stub of the Gemini API, crates/aterm-lab) · the stub's `bad-key`: 400 INVALID_ARGUMENT, ErrorInfo reason API_KEY_INVALID (what Google answers a key that is no key), on the first turn (not retried)
+
+      ▄▀▀▄        Antigravity CLI 1.4.0
+     ▀▀▀▀▀▀       Gemini API key
+    ▀▀▀▀▀▀▀▀      Gemini 3.1 Pro (Low)
+   ▄▀▀    ▀▀▄     /private/tmp/at.KyRH/proj
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+> carry on with the task
+
+⚠ agent executor error: generating and executing: Error 400, Message: API key not valid. Please pass a valid API key., Status:
+INVALID_ARGUMENT, Details: [map[@type:type.googleapis.com/google.rpc.ErrorInfo domain:googleapis.com
+metadata:map[service:generativelanguage.googleapis.com] reason:API_KEY_INVALID] map[@type:type.googleapis.com/google.rpc.LocalizedMessage
+locale:en-US message:API key not valid. Please pass a valid API key.]]
+Error ID: eeb1f54b-6c2f-4187-94cd-1916fe79779f-1
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts                                                                                                             Gemini 3.1 Pro · low

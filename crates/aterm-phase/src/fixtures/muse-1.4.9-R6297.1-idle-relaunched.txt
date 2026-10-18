@@ -1,0 +1,16 @@
+# muse 1.4.9-R6297.1 · MEASURED 2026-10-16, `aterm ctl text --json` of a private headless aterm 120x40 (aterm 0.105.0 80b670745), the atpkg-managed muse (Meta latest) launched through its shim with a scratch HOME, `--base-url` at a local scripted stand-in for Meta's Responses endpoint (`--model fake-1`, a dummy META_API_KEY: no login and no model; the stand-in returns the tool call that raises the box, the box is muse's own) and `--approval-mode untrusted`, harness off · muse launched again in the same tab after `/exit`: the earlier session's transcript (its `❯` message, its reply, the interrupted marker), the resume line and the shell's command line stay above the new banner `  Muse Code 1.4.9` and the idle composer, no turn yet in this session · cursor=12,2 (visible) · scratch path redacted at equal length
+❯ SLOW reply
+
+◆ Thinking about it slowly, one
+
+◆ Interrupted · Report issues with /feedback
+
+To continue this session, run muse resume 01a1469b-70e5-7f20-b6c1-60bf737f2cab
+$ muse-fake --approval-mode untrusted
+
+  Muse Code 1.4.9
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  fake-1 · high · /private/tmp/at.XXXXXX/mwork · Launch overrides

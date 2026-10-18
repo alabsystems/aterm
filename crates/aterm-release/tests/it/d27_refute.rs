@@ -52,7 +52,7 @@ fn plan(prover: &str, driver_id: &str) -> String {
 fn plan_at(prover: &str, driver_id: &str, commit: &str) -> String {
     let mut t = String::from("aterm-trust plan 1\n");
     t.push_str(&format!(
-        "driver /t/bin/targo\ndriver-id {driver_id}\nonly \nper-commit 0\n"
+        "driver /t/bin/targo\ndriver-id {driver_id}\nonly \n"
     ));
     t.push_str("logdir /gone\nhost-mem 25769803776\nhost-mem-os -\nnow 2026-10-03T00:00:00Z\n");
     t.push_str("crate-budget 21600\nobligations 1\n");
@@ -1132,6 +1132,21 @@ fn holds_no_wildcard_or_prefix_row_excuses() {
     let b = run_dir(SEAL, &driver_of(&s), &x("proved"));
     let c = run_dir(MAIN, &driver_of(&cc), &x("failed"));
     let d_ = "arithmetic overflow (Add)";
+    const SITE: &str = "src/lib.rs:6:4-6:9";
+    let v3 = |site: &str, commit: &str, seal: &str| {
+        row_at(
+            "alpha::f",
+            ADD,
+            "src/lib.rs",
+            "a + 1",
+            "1/1",
+            d_,
+            site,
+            commit,
+            seal,
+            &f,
+        )
+    };
     for r in [
         row("alpha::*", ADD, "src/lib.rs", "a + 1", "1/1", d_, &s, &f),
         row("alpha::", ADD, "src/lib.rs", "a + 1", "1/1", d_, &s, &f),
@@ -1184,140 +1199,19 @@ fn holds_no_wildcard_or_prefix_row_excuses() {
         // The site and aterm commit (v3): a wildcard, no span, another span, another file's;
         // a commit short, upper-case, a wildcard, or one the runs did not measure (with no
         // repository holding the ledger to compare trees in).
-        row_at(
-            "alpha::f",
-            ADD,
-            "src/lib.rs",
-            "a + 1",
-            "1/1",
-            d_,
-            "*",
-            COMMIT,
-            &s,
-            &f,
-        ),
-        row_at(
-            "alpha::f",
-            ADD,
-            "src/lib.rs",
-            "a + 1",
-            "1/1",
-            d_,
-            "src/lib.rs",
-            COMMIT,
-            &s,
-            &f,
-        ),
-        row_at(
-            "alpha::f",
-            ADD,
-            "src/lib.rs",
-            "a + 1",
-            "1/1",
-            d_,
-            "src/lib.rs:6:4-6:10",
-            COMMIT,
-            &s,
-            &f,
-        ),
-        row_at(
-            "alpha::f",
-            ADD,
-            "src/lib.rs",
-            "a + 1",
-            "1/1",
-            d_,
-            "src/main.rs:6:4-6:9",
-            COMMIT,
-            &s,
-            &f,
-        ),
-        row_at(
-            "alpha::f",
-            ADD,
-            "src/lib.rs",
-            "a + 1",
-            "1/1",
-            d_,
-            "src/lib.rs:6:4-6:9",
-            &COMMIT[..12],
-            &s,
-            &f,
-        ),
-        row_at(
-            "alpha::f",
-            ADD,
-            "src/lib.rs",
-            "a + 1",
-            "1/1",
-            d_,
-            "src/lib.rs:6:4-6:9",
-            &COMMIT.to_uppercase(),
-            &s,
-            &f,
-        ),
-        row_at(
-            "alpha::f",
-            ADD,
-            "src/lib.rs",
-            "a + 1",
-            "1/1",
-            d_,
-            "src/lib.rs:6:4-6:9",
-            "*",
-            &s,
-            &f,
-        ),
-        row_at(
-            "alpha::f",
-            ADD,
-            "src/lib.rs",
-            "a + 1",
-            "1/1",
-            d_,
-            "src/lib.rs:6:4-6:9",
-            TREE,
-            &s,
-            &f,
-        ),
+        v3("*", COMMIT, &s),
+        v3("src/lib.rs", COMMIT, &s),
+        v3("src/lib.rs:6:4-6:10", COMMIT, &s),
+        v3("src/main.rs:6:4-6:9", COMMIT, &s),
+        v3(SITE, &COMMIT[..12], &s),
+        v3(SITE, &COMMIT.to_uppercase(), &s),
+        v3(SITE, "*", &s),
+        v3(SITE, TREE, &s),
         // The seal it was audited against: a wildcard, short, or another
         // commit than the base ran (the fix's, here).
-        row_at(
-            "alpha::f",
-            ADD,
-            "src/lib.rs",
-            "a + 1",
-            "1/1",
-            d_,
-            "src/lib.rs:6:4-6:9",
-            COMMIT,
-            "*",
-            &f,
-        ),
-        row_at(
-            "alpha::f",
-            ADD,
-            "src/lib.rs",
-            "a + 1",
-            "1/1",
-            d_,
-            "src/lib.rs:6:4-6:9",
-            COMMIT,
-            &s[..12],
-            &f,
-        ),
-        row_at(
-            "alpha::f",
-            ADD,
-            "src/lib.rs",
-            "a + 1",
-            "1/1",
-            d_,
-            "src/lib.rs:6:4-6:9",
-            COMMIT,
-            &f,
-            &f,
-        ),
+        v3(SITE, COMMIT, "*"),
+        v3(SITE, COMMIT, &s[..12]),
+        v3(SITE, COMMIT, &f),
         // The v2 form: ten fields, no site and no aterm commit.
         format!(
             "alpha\talpha::f\t{ADD}\tsrc/lib.rs\ta + 1\t1/1\t{d_}\t{f}\t{REPRO}::guard_by_reaching_def\treviewer 2026-10-07 class A"

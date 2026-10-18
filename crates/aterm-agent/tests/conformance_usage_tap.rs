@@ -29,7 +29,8 @@ use std::path::Path;
 use aterm_agent::harness::accounts;
 use aterm_agent::harness::netwatch::Source;
 use aterm_agent::harness::tap::{self, Fresh, Heard, Reading, Silence, Window};
-use aterm_spec::derive::{Model, harness_usage_tap_model};
+use aterm_models_harness::harness_usage_tap_model;
+use aterm_spec::derive::Model;
 
 type S = BTreeMap<&'static str, i64>;
 

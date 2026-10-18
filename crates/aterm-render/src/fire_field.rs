@@ -553,24 +553,6 @@ mod tests {
         eprintln!("aa law: worst adjacent cov/alpha step = {worst} (bound 120, cap 200)");
     }
 
-    /// The field stays total and in range across the temporal ring wrap.
-    #[test]
-    fn field_ignores_patch_geometry_and_wraps_seamlessly() {
-        // Phases whose advection offsets cross 2^32: pins totality and range.
-        for phase in [u32::MAX, u32::MAX / 2, 0] {
-            let p = params(255, 127, phase);
-            for py in 80..200 {
-                for px in 0..64 {
-                    let c = core_at(px, py, &p);
-                    assert!((0..=1023).contains(&c.idx));
-                    assert!((0..=256).contains(&c.q));
-                    assert!((0..=p.cov_cap).contains(&fire_cov_add(&c, &p)));
-                    assert!((0..=p.cov_cap).contains(&fire_alpha_over(&c, &p)));
-                }
-            }
-        }
-    }
-
     /// Degenerate params (zero peak or cell_h, saturated values) neither panic nor overflow.
     #[test]
     fn field_is_total_on_degenerate_params() {

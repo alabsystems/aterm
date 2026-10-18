@@ -603,6 +603,7 @@ pub fn prompt_kind_words(detail: Option<&str>) -> Option<&str> {
         "rate-nudge" => "rate-limit model",
         "model-pick" => "model picker",
         "goal-resume" => "paused goal",
+        "mcp-server" => "MCP server",
         "trust" => "folder trust",
         "powershell" => "PowerShell",
         other => other,
@@ -926,7 +927,7 @@ fn story_phase<V: Host>(
             .count()
     };
     let timeouts = count(StoryVerb::TurnTimedOut);
-    let turns = count(StoryVerb::Turn) + timeouts;
+    let turns = count(StoryVerb::Turn) + count(StoryVerb::ProgramDone) + timeouts;
     let mut story = Vec::new();
     for (n, word) in [
         (turns, "turn"),
@@ -1061,7 +1062,7 @@ fn hand_words<V: Host>(slot: &Slot<V>) -> (String, String, String) {
             format!("\u{25c2} turn {id}"),
             format!("driven, turn {id}"),
         ),
-        (None, Hand::DrivenLease { holder }) => {
+        (None, Hand::DrivenLease { holder, .. }) => {
             let h = sanitize_token::<V>(holder, 32);
             (
                 format!("\u{25c2} {h}"),

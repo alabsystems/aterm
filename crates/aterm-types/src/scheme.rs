@@ -17,6 +17,11 @@
 
 use crate::{ColorPalette, Rgb};
 
+pub use crate::scheme_typography::{
+    MAX_SKIPPED_THEME_KEY_BYTES, MAX_SKIPPED_THEME_KEYS, MAX_THEME_FEATURES, MAX_THEME_FONT_LIST,
+    MAX_THEME_FONT_NAME_CHARS, THEME_SCHEMA_VERSION, ThemeTypography,
+};
+
 /// Maximum bytes admitted from one user theme definition. Shared by direct
 /// loaders and GUI catalog discovery so every entry point has the same bound.
 pub const MAX_USER_THEME_FILE_BYTES: usize = 256 * 1024;
@@ -91,11 +96,96 @@ pub struct ColorScheme {
     /// The 16 ANSI slots: `[0..8)` normal (black, red, green, yellow, blue, magenta,
     /// cyan, white), `[8..16)` their bright variants. THE authoritative ANSI table.
     pub ansi: [Rgb; 16],
+    /// The colours of aterm's own chrome the theme authors (`accent_color`,
+    /// `active_tab_color`, `border_color`, `search_match_color`); empty for
+    /// every built-in. Not projected by [`Self::to_theme_parts`]: the
+    /// renderer's grid never draws chrome; `aterm-gui` derives the chrome
+    /// tokens from these.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "ChromeColors::is_empty")
+    )]
+    pub chrome: ChromeColors,
+    /// Whether slots 16-255 derive from this scheme's own colours
+    /// ([`crate::scheme_palette256::generated_extended_palette`]) instead of
+    /// keeping xterm's cube and grey ramp. A theme file opts in with
+    /// `palette_generate = true`; of the built-ins only aterm's signature
+    /// themes do. `false` for Default, so an empty config keeps today's
+    /// colours.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "core::ops::Not::not")
+    )]
+    pub palette_generate: bool,
+}
+
+/// The chrome colours a theme may author: each is optional and each is also
+/// an `aterm.toml` key spelled the same way, which beats the theme's. Every
+/// one is still held to its floor where it is drawn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ChromeColors {
+    /// `accent_color`: the active-tab rule, the message band's meter,
+    /// Settings' selected rows, the find highlight's hue.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub accent: Option<Rgb>,
+    /// `active_tab_color`: the selected tab's background.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub active_tab: Option<Rgb>,
+    /// `border_color`: split-pane dividers and the chrome bands' seams.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub border: Option<Rgb>,
+    /// `search_match_color`: find's highlight on every match but the current.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub search_match: Option<Rgb>,
+}
+
+impl ChromeColors {
+    /// Whether the theme authors no chrome colour.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The slot a chrome key sets; `None` for a key that is not a chrome key.
+    #[must_use]
+    pub fn slot(&self, key: ThemeKey) -> Option<Option<Rgb>> {
+        match key {
+            ThemeKey::AccentColor => Some(self.accent),
+            ThemeKey::ActiveTabColor => Some(self.active_tab),
+            ThemeKey::BorderColor => Some(self.border),
+            ThemeKey::SearchMatchColor => Some(self.search_match),
+            _ => None,
+        }
+    }
+
+    /// The slot a chrome key sets, to write; `None` for a key that is not a
+    /// chrome key.
+    pub fn slot_mut(&mut self, key: ThemeKey) -> Option<&mut Option<Rgb>> {
+        match key {
+            ThemeKey::AccentColor => Some(&mut self.accent),
+            ThemeKey::ActiveTabColor => Some(&mut self.active_tab),
+            ThemeKey::BorderColor => Some(&mut self.border),
+            ThemeKey::SearchMatchColor => Some(&mut self.search_match),
+            _ => None,
+        }
+    }
 }
 
 /// Default's selection colour (`aterm_render::Theme::default().selection`,
-/// `#33415E`). Verified by the `default_theme_parts_are_historical` test in
-/// this module. A scheme that leaves `selection` as `None` does not get it:
+/// `#33415E`). A scheme that leaves `selection` as `None` does not get it:
 /// it gets [`derived_selection`], which follows its own background.
 ///
 /// Darker, lower-saturation than the old `#264F78`: selected COLOURED text keeps its
@@ -126,15 +216,20 @@ impl Default for ColorScheme {
             selection: Some(SELECTION_DEFAULT),
             selection_fg: None,
             ansi,
+            chrome: ChromeColors::default(),
+            palette_generate: false,
         }
     }
 }
 
 impl ColorScheme {
     /// Build the engine indexed palette from this scheme: each of the 16 ANSI slots
-    /// is applied via [`ColorPalette::set`], leaving indices 16-255 as the computed
-    /// xterm cube/ramp. (`set` elides a slot that equals `default_color(i)`, but that
-    /// is render-identical: `get(i)` then falls back to the same `default_color(i)`.)
+    /// is applied via [`ColorPalette::set`]. Indices 16-255 stay the computed xterm
+    /// cube/ramp unless [`Self::palette_generate`] is set, when they are
+    /// [`crate::scheme_palette256::generated_extended_palette`] of the ANSI
+    /// slots, foreground and background.
+    /// (`set` elides a slot that equals `default_color(i)`, but that is
+    /// render-identical: `get(i)` then falls back to the same `default_color(i)`.)
     #[must_use]
     pub fn to_color_palette(&self) -> ColorPalette {
         let mut p = ColorPalette::new();
@@ -143,6 +238,16 @@ impl ColorScheme {
             // is identity — the mask only proves the narrowing lossless to the
             // Trust gate.
             p.set((i & 0xF) as u8, *c);
+        }
+        if self.palette_generate {
+            let generated = crate::scheme_palette256::generated_extended_palette(
+                &self.ansi,
+                self.foreground,
+                self.background,
+            );
+            for (slot, c) in (16u8..=255).zip(generated.iter()) {
+                p.set(slot, *c);
+            }
         }
         p
     }
@@ -206,6 +311,8 @@ struct Builtin {
     /// after Default and the `signature_themes_meet_their_bars` test holds to
     /// the stricter signature laws.
     signature: bool,
+    /// The project a port's palette comes from; `None` for aterm's own.
+    source: Option<BuiltinSource>,
     fg: Rgb,
     bg: Rgb,
     cursor: Rgb,
@@ -221,6 +328,7 @@ impl Builtin {
             description: self.description,
             pair: self.pair,
             signature: self.signature,
+            source: self.source,
         }
     }
 
@@ -234,6 +342,11 @@ impl Builtin {
             selection: Some(self.selection),
             selection_fg: None,
             ansi: self.ansi,
+            chrome: ChromeColors::default(),
+            // aterm's own signature themes derive slots 16-255; a port keeps
+            // xterm's, which its upstream (and every 256-colour scheme
+            // written against it) assumes.
+            palette_generate: self.signature,
         }
     }
 }
@@ -260,6 +373,7 @@ static BUILTINS: &[Builtin] = &[
         description: "aterm's signature night: low-glare blue-black, cool slate ink and a sea-glass cyan cursor",
         pair: Some("Aterm Day"),
         signature: true,
+        source: None,
         fg: c(0xd8, 0xe1, 0xec),
         bg: c(0x12, 0x17, 0x21),
         cursor: c(0x56, 0xd2, 0xdf),
@@ -289,6 +403,7 @@ static BUILTINS: &[Builtin] = &[
         description: "aterm's signature day: soft paper-white, deep ink-blue text and a cobalt cursor",
         pair: Some("Aterm Night"),
         signature: true,
+        source: None,
         fg: c(0x20, 0x27, 0x33),
         bg: c(0xf8, 0xfa, 0xfd),
         cursor: c(0x29, 0x71, 0xc6),
@@ -318,6 +433,7 @@ static BUILTINS: &[Builtin] = &[
         description: "embers after dark: a warm umber ground, parchment ink and an amber cursor",
         pair: Some("Linen"),
         signature: true,
+        source: None,
         fg: c(0xea, 0xdc, 0xc5),
         bg: c(0x1e, 0x15, 0x10),
         cursor: c(0xf4, 0xa4, 0x37),
@@ -347,6 +463,7 @@ static BUILTINS: &[Builtin] = &[
         description: "sunlit linen: warm cream paper, walnut ink and a rust-red cursor",
         pair: Some("Hearth"),
         signature: true,
+        source: None,
         fg: c(0x3c, 0x29, 0x1e),
         bg: c(0xf9, 0xf3, 0xe6),
         cursor: c(0xbf, 0x49, 0x22),
@@ -383,6 +500,11 @@ static BUILTINS: &[Builtin] = &[
         description: "vibrant dark theme — the Dracula palette",
         pair: None,
         signature: false,
+        source: Some(BuiltinSource {
+            project: "dracula/dracula-theme",
+            url: "https://github.com/dracula/dracula-theme",
+            licence: "MIT",
+        }),
         fg: c(0xf8, 0xf8, 0xf2),
         bg: c(0x28, 0x2a, 0x36),
         cursor: c(0xf8, 0xf8, 0xf2),
@@ -412,6 +534,11 @@ static BUILTINS: &[Builtin] = &[
         description: "arctic, north-bluish palette for dark UIs",
         pair: None,
         signature: false,
+        source: Some(BuiltinSource {
+            project: "nordtheme/nord",
+            url: "https://github.com/nordtheme/nord",
+            licence: "MIT",
+        }),
         fg: c(0xd8, 0xde, 0xe9),
         bg: c(0x2e, 0x34, 0x40),
         cursor: c(0xec, 0xef, 0xf4),
@@ -441,6 +568,11 @@ static BUILTINS: &[Builtin] = &[
         description: "deep blue/purple dark theme",
         pair: None,
         signature: false,
+        source: Some(BuiltinSource {
+            project: "folke/tokyonight.nvim",
+            url: "https://github.com/folke/tokyonight.nvim",
+            licence: "Apache-2.0",
+        }),
         fg: c(0xc0, 0xca, 0xf5),
         bg: c(0x1a, 0x1b, 0x26),
         // Accent blue, not the fg lavender — a fg-coloured full-cell block reads as a
@@ -478,6 +610,11 @@ static BUILTINS: &[Builtin] = &[
         description: "warm, soothing dark theme (Catppuccin mocha)",
         pair: Some("Catppuccin Latte"),
         signature: false,
+        source: Some(BuiltinSource {
+            project: "catppuccin/catppuccin",
+            url: "https://github.com/catppuccin/catppuccin",
+            licence: "MIT",
+        }),
         fg: c(0xcd, 0xd6, 0xf4),
         bg: c(0x1e, 0x1e, 0x2e),
         cursor: c(0xf5, 0xe0, 0xdc),
@@ -507,6 +644,11 @@ static BUILTINS: &[Builtin] = &[
         description: "retro-groove dark theme, warm earthy colours",
         pair: Some("Gruvbox Light"),
         signature: false,
+        source: Some(BuiltinSource {
+            project: "morhetz/gruvbox",
+            url: "https://github.com/morhetz/gruvbox",
+            licence: "MIT",
+        }),
         fg: c(0xeb, 0xdb, 0xb2),
         bg: c(0x28, 0x28, 0x28),
         cursor: c(0xeb, 0xdb, 0xb2),
@@ -537,6 +679,11 @@ static BUILTINS: &[Builtin] = &[
         description: "dark variant of the Solarized precision palette",
         pair: Some("Solarized Light"),
         signature: false,
+        source: Some(BuiltinSource {
+            project: "altercation/solarized",
+            url: "https://github.com/altercation/solarized",
+            licence: "MIT",
+        }),
         fg: c(0x83, 0x94, 0x96),
         bg: c(0x00, 0x2b, 0x36),
         cursor: c(0x83, 0x94, 0x96),
@@ -569,6 +716,11 @@ static BUILTINS: &[Builtin] = &[
         description: "Atom One Dark — atom-inspired dark theme",
         pair: None,
         signature: false,
+        source: Some(BuiltinSource {
+            project: "atom/one-dark-syntax",
+            url: "https://github.com/atom/one-dark-syntax",
+            licence: "MIT",
+        }),
         fg: c(0xab, 0xb2, 0xbf),
         bg: c(0x21, 0x25, 0x2b),
         cursor: c(0xab, 0xb2, 0xbf),
@@ -613,13 +765,15 @@ static BUILTINS: &[Builtin] = &[
     // shared step (L -0.06) below their normals, so each is at least 0.05
     // OkLab from its normal (ls shows both) and 6:1 or more on the
     // background; color15 is a dark slate between color8 and the ink, 7.9:1.
-    // A light-mode OS gets this with no config.
+    // Default's pair: Settings' Follow system switch writes
+    // `dark:Default,light:Default Light`; an unset theme stays Default.
     Builtin {
         name: "Default Light",
         appearance: Appearance::Light,
         description: "aterm's own light look, the light half of Default",
         pair: Some("Default"),
         signature: false,
+        source: None,
         fg: c(0x2b, 0x2d, 0x33),
         bg: c(0xf6, 0xf7, 0xf9),
         cursor: c(0x1a, 0x7f, 0x37),
@@ -649,6 +803,11 @@ static BUILTINS: &[Builtin] = &[
         description: "light variant of the Solarized precision palette",
         pair: Some("Solarized Dark"),
         signature: false,
+        source: Some(BuiltinSource {
+            project: "altercation/solarized",
+            url: "https://github.com/altercation/solarized",
+            licence: "MIT",
+        }),
         // base01, Solarized's emphasised-content tone: upstream's base00
         // #657b83 is 4.1:1 on base3, below the 4.5:1 body-text floor.
         fg: c(0x58, 0x6e, 0x75),
@@ -683,6 +842,11 @@ static BUILTINS: &[Builtin] = &[
         description: "retro-groove light theme, warm earthy colours",
         pair: Some("Gruvbox Dark"),
         signature: false,
+        source: Some(BuiltinSource {
+            project: "morhetz/gruvbox",
+            url: "https://github.com/morhetz/gruvbox",
+            licence: "MIT",
+        }),
         fg: c(0x3c, 0x38, 0x36),
         bg: c(0xfb, 0xf1, 0xc7),
         cursor: c(0x3c, 0x38, 0x36),
@@ -716,6 +880,11 @@ static BUILTINS: &[Builtin] = &[
         description: "warm, soothing light theme (Catppuccin latte)",
         pair: Some("Catppuccin Mocha"),
         signature: false,
+        source: Some(BuiltinSource {
+            project: "catppuccin/catppuccin",
+            url: "https://github.com/catppuccin/catppuccin",
+            licence: "MIT",
+        }),
         fg: c(0x4c, 0x4f, 0x69),
         bg: c(0xef, 0xf1, 0xf5),
         // Rosewater, deepened (upstream #dc8a78 is 2.3:1 on the background, a
@@ -750,6 +919,11 @@ static BUILTINS: &[Builtin] = &[
         description: "GitHub's light UI palette — crisp on white",
         pair: None,
         signature: false,
+        source: Some(BuiltinSource {
+            project: "primer/github-vscode-theme",
+            url: "https://github.com/primer/github-vscode-theme",
+            licence: "MIT",
+        }),
         fg: c(0x1f, 0x23, 0x28),
         bg: c(0xff, 0xff, 0xff),
         cursor: c(0x09, 0x69, 0xda), // GitHub accent blue — upstream value, highly legible
@@ -820,6 +994,22 @@ pub struct BuiltinTheme {
     pub pair: Option<&'static str>,
     /// One of aterm's own signature themes (listed right after Default).
     pub signature: bool,
+    /// Where a ported palette comes from, for its licence notice; `None` for
+    /// the themes designed here.
+    pub source: Option<BuiltinSource>,
+}
+
+/// The upstream project a built-in port's palette is taken from, and the
+/// licence it is used under. `aterm theme pack --licences` and the pack's
+/// ATTRIBUTION.md print one notice per project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuiltinSource {
+    /// `owner/repo` on GitHub.
+    pub project: &'static str,
+    /// The project's home page.
+    pub url: &'static str,
+    /// The licence's SPDX identifier.
+    pub licence: &'static str,
 }
 
 /// `Default` lives in [`ColorScheme::default`], not [`struct@BUILTINS`]; this is
@@ -830,6 +1020,7 @@ const DEFAULT_THEME: BuiltinTheme = BuiltinTheme {
     description: "aterm's historical dark look: pale grey text and a green cursor",
     pair: Some("Default Light"),
     signature: false,
+    source: None,
 };
 
 /// The built-in theme a name means (case-insensitive, `Default` included).
@@ -1087,6 +1278,45 @@ pub struct ParsedTheme {
     /// `scheme.appearance` is a `Dark` placeholder until admission
     /// ([`ThemeMeta::admit`]) writes the measured one.
     pub appearance_declared: bool,
+    /// The type settings the file names ([`ThemeTypography::NONE`] when it
+    /// names none). aterm.toml keys of the same name win over them.
+    pub typography: ThemeTypography,
+    /// The file's `bold_is_bright`: a colour rung under aterm.toml's key of
+    /// the same name.
+    pub bold_is_bright: Option<bool>,
+    /// The file's `schema` line, if it has one.
+    pub schema: Option<u16>,
+    /// Keys a newer-schema file sets that this aterm does not know: skipped,
+    /// at most [`MAX_SKIPPED_THEME_KEYS`] names of at most
+    /// [`MAX_SKIPPED_THEME_KEY_BYTES`] bytes each.
+    pub skipped_keys: Vec<String>,
+    /// How many keys were skipped, in full.
+    pub skipped_count: u16,
+}
+
+impl ParsedTheme {
+    /// A theme that carries colours and identity only: no typography, no
+    /// `bold_is_bright`, no `schema` line and nothing skipped. What a
+    /// built-in, an import and a colours-only writer describe.
+    #[must_use]
+    pub fn colours_only(
+        scheme: ColorScheme,
+        appearance_declared: bool,
+        description: Option<String>,
+        author: Option<String>,
+    ) -> Self {
+        Self {
+            scheme,
+            description,
+            author,
+            appearance_declared,
+            typography: ThemeTypography::NONE,
+            bold_is_bright: None,
+            schema: None,
+            skipped_keys: Vec::new(),
+            skipped_count: 0,
+        }
+    }
 }
 
 /// Where a theme's [`Appearance`] came from.
@@ -1107,6 +1337,25 @@ pub const MIN_SELECTION_CONTRAST: f64 = 1.3;
 /// Lowest cursor-on-background contrast a theme is admitted without a warning
 /// ([`ThemeWarning::LowCursorContrast`]).
 pub const MIN_CURSOR_CONTRAST: f64 = 3.0;
+
+/// Lowest authored `accent_color`-on-background contrast a theme is admitted
+/// without a warning ([`ThemeWarning::ChromeBelowFloor`]): the non-text floor
+/// every chrome surface raises the accent to where it is drawn
+/// (`aterm_messages::tokens::ACCENT_FLOOR` is this constant).
+pub const MIN_ACCENT_CONTRAST: f64 = 3.0;
+/// Lowest authored `border_color`-on-background contrast admitted without a
+/// warning: the seam floor (`aterm_messages::tokens::SEAM_FLOOR` is this constant).
+pub const MIN_BORDER_CONTRAST: f64 = 1.5;
+/// Lowest authored `search_match_color`-on-background contrast admitted
+/// without a warning: the match tint's rise
+/// (`aterm_messages::tokens::MATCH_RISE`).
+pub const MIN_SEARCH_MATCH_CONTRAST: f64 = 1.5;
+/// Least `OkLab` distance between an authored `search_match_color` and the
+/// selection band admitted without a warning
+/// ([`ThemeWarning::SearchMatchLikeSelection`]): the current match is the
+/// selection, so a tint that close makes every match look current
+/// (`aterm_messages::tokens::MATCH_DISTINCT_OKLAB`).
+pub const MIN_SEARCH_MATCH_DISTANCE: f64 = 0.06;
 
 /// A problem a theme file is admitted with: it still loads, but the listing
 /// and picker say what will be hard to read. Ratios are WCAG contrast in
@@ -1135,6 +1384,20 @@ pub enum ThemeWarning {
         /// The measured ratio, in hundredths.
         hundredths: u32,
     },
+    /// An authored chrome colour on the background below its floor. aterm
+    /// still draws it, raised to the floor on each surface.
+    ChromeBelowFloor {
+        /// The chrome key.
+        key: ThemeKey,
+        /// The measured ratio, in hundredths.
+        hundredths: u32,
+        /// The floor, in hundredths.
+        floor_hundredths: u32,
+    },
+    /// The authored `search_match_color` sits within
+    /// [`MIN_SEARCH_MATCH_DISTANCE`] of the selection band, so every match
+    /// looks like the current one.
+    SearchMatchLikeSelection,
     /// The file declares one appearance and its background measures as the
     /// other.
     AppearanceMismatch {
@@ -1142,6 +1405,15 @@ pub enum ThemeWarning {
         declared: Appearance,
         /// What its background measures as.
         measured: Appearance,
+    },
+    /// The file was written for a newer theme schema and sets keys this
+    /// aterm does not know; they were skipped (the names are
+    /// [`ThemeMeta::skipped_keys`]).
+    SkippedNewerKeys {
+        /// The file's `schema`.
+        schema: u16,
+        /// How many keys were skipped.
+        count: u16,
     },
 }
 
@@ -1181,11 +1453,29 @@ impl core::fmt::Display for ThemeWarning {
                 ratio(f, hundredths)?;
                 f.write_str(" (below 3:1)")
             }
+            Self::ChromeBelowFloor {
+                key,
+                hundredths,
+                floor_hundredths,
+            } => {
+                write!(f, "{} is ", theme_key_spec(key).name)?;
+                ratio(f, hundredths)?;
+                f.write_str(" on the background; aterm raises it to ")?;
+                ratio(f, floor_hundredths)?;
+                f.write_str(" where it is drawn")
+            }
+            Self::SearchMatchLikeSelection => f.write_str(
+                "search_match_color is too close to the selection, so every match looks like the current one",
+            ),
             Self::AppearanceMismatch { declared, measured } => write!(
                 f,
                 "declares appearance = {} but its background is {}",
                 appearance_word(declared),
                 appearance_word(measured)
+            ),
+            Self::SkippedNewerKeys { schema, count } => write!(
+                f,
+                "written for theme schema {schema}; {count} key(s) this aterm does not know were skipped"
             ),
         }
     }
@@ -1210,6 +1500,9 @@ pub struct ThemeMeta {
     pub pair: Option<String>,
     /// Non-fatal admission problems, in a fixed order.
     pub warnings: Vec<ThemeWarning>,
+    /// The keys a newer-schema file sets that this aterm skipped (bounded as
+    /// [`ParsedTheme::skipped_keys`]); empty for a file read in full.
+    pub skipped_keys: Vec<String>,
 }
 
 impl ThemeMeta {
@@ -1225,6 +1518,7 @@ impl ThemeMeta {
             appearance_source: AppearanceSource::Declared,
             pair: theme.pair.map(str::to_string),
             warnings: Vec::new(),
+            skipped_keys: Vec::new(),
         }
     }
 
@@ -1247,21 +1541,88 @@ impl ThemeMeta {
         } else {
             scheme.name.clone()
         };
+        let mut warnings = admission_warnings(scheme, measured);
+        let appearance = scheme.appearance;
+        if parsed.skipped_count > 0 {
+            warnings.push(ThemeWarning::SkippedNewerKeys {
+                schema: parsed.schema.unwrap_or(THEME_SCHEMA_VERSION),
+                count: parsed.skipped_count,
+            });
+        }
         Self {
             display_name,
             description: parsed.description.clone(),
             author: parsed.author.clone(),
-            appearance: scheme.appearance,
+            appearance,
             appearance_source,
             pair: None,
-            warnings: admission_warnings(scheme, measured),
+            warnings,
+            skipped_keys: parsed.skipped_keys.clone(),
         }
     }
 }
 
+/// A whole admitted theme (DTP §3.1): its identity, its colours, its
+/// typography and its `bold_is_bright`. What the catalog holds for a theme
+/// file and what a theme switch applies; [`ColorScheme`] stays the colours
+/// alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThemePackage {
+    /// Identity: name, appearance (declared or measured), pair, warnings.
+    pub meta: ThemeMeta,
+    /// The colours.
+    pub colors: ColorScheme,
+    /// The type settings ([`ThemeTypography::NONE`] for none).
+    pub typography: ThemeTypography,
+    /// The theme's `bold_is_bright`, a colour rung under the config's key.
+    pub bold_is_bright: Option<bool>,
+}
+
+impl ThemePackage {
+    /// Admit a parsed theme file whose id is `id`, as [`ThemeMeta::admit`]
+    /// does (`measured` is its background's appearance by the caller's
+    /// classifier).
+    #[must_use]
+    pub fn admit(mut parsed: ParsedTheme, id: &str, measured: Appearance) -> Self {
+        let meta = ThemeMeta::admit(&mut parsed, id, measured);
+        Self {
+            meta,
+            colors: parsed.scheme,
+            typography: parsed.typography,
+            bold_is_bright: parsed.bold_is_bright,
+        }
+    }
+
+    /// The `Default` built-in as a package (what an unresolvable selection
+    /// draws).
+    #[must_use]
+    pub fn default_theme() -> Self {
+        Self {
+            meta: ThemeMeta::of_builtin(DEFAULT_THEME),
+            colors: ColorScheme::default(),
+            typography: ThemeTypography::NONE,
+            bold_is_bright: None,
+        }
+    }
+
+    /// A built-in theme as a package: built-ins carry no typography and no
+    /// `bold_is_bright`. `None` for a name that is not a built-in.
+    #[must_use]
+    pub fn of_builtin(theme: BuiltinTheme) -> Option<Self> {
+        Some(Self {
+            meta: ThemeMeta::of_builtin(theme),
+            colors: builtin(theme.name)?,
+            typography: ThemeTypography::NONE,
+            bold_is_bright: None,
+        })
+    }
+}
+
 /// Every [`ThemeWarning`] `scheme` earns, in a fixed order: text, selection,
-/// ANSI slots (ascending), cursor, appearance. The contrast warnings are
-/// exactly the [`contrast_report`] rows below their minimum.
+/// ANSI slots (ascending), cursor, the authored chrome colours (accent,
+/// border, search match, then the search match's distance from the
+/// selection), appearance. The contrast warnings are exactly the
+/// [`contrast_report`] rows below their minimum.
 #[must_use]
 pub fn admission_warnings(scheme: &ColorScheme, measured: Appearance) -> Vec<ThemeWarning> {
     let bg = scheme.background;
@@ -1286,6 +1647,30 @@ pub fn admission_warnings(scheme: &ColorScheme, measured: Appearance) -> Vec<The
     }
     if let Some(hundredths) = below(ContrastPair::CursorOnBackground) {
         warnings.push(ThemeWarning::LowCursorContrast { hundredths });
+    }
+    for (pair, key) in [
+        (ContrastPair::AccentOnBackground, ThemeKey::AccentColor),
+        (ContrastPair::BorderOnBackground, ThemeKey::BorderColor),
+        (
+            ContrastPair::SearchMatchOnBackground,
+            ThemeKey::SearchMatchColor,
+        ),
+    ] {
+        if let Some(row) = report
+            .iter()
+            .find(|row| row.pair == pair && row.below_minimum())
+        {
+            warnings.push(ThemeWarning::ChromeBelowFloor {
+                key,
+                hundredths: row.hundredths,
+                floor_hundredths: row.minimum.unwrap_or(0),
+            });
+        }
+    }
+    if let Some(tint) = scheme.chrome.search_match
+        && oklab_distance(tint, scheme.selection_band()) < MIN_SEARCH_MATCH_DISTANCE
+    {
+        warnings.push(ThemeWarning::SearchMatchLikeSelection);
     }
     if scheme.appearance != measured {
         warnings.push(ThemeWarning::AppearanceMismatch {
@@ -1312,6 +1697,12 @@ pub enum ContrastPair {
     SelectionTextOnSelection,
     /// The cursor on the background.
     CursorOnBackground,
+    /// The authored `accent_color` on the background.
+    AccentOnBackground,
+    /// The authored `border_color` on the background.
+    BorderOnBackground,
+    /// The authored `search_match_color` on the background.
+    SearchMatchOnBackground,
 }
 
 impl ContrastPair {
@@ -1330,6 +1721,9 @@ impl ContrastPair {
             Self::TextOnSelection => (key(ThemeKey::Foreground), "selection"),
             Self::SelectionTextOnSelection => (key(ThemeKey::SelectionForeground), "selection"),
             Self::CursorOnBackground => (key(ThemeKey::Cursor), "background"),
+            Self::AccentOnBackground => (key(ThemeKey::AccentColor), "background"),
+            Self::BorderOnBackground => (key(ThemeKey::BorderColor), "background"),
+            Self::SearchMatchOnBackground => (key(ThemeKey::SearchMatchColor), "background"),
         }
     }
 }
@@ -1360,7 +1754,8 @@ impl ContrastRow {
 /// Every contrast a theme's legibility rests on, in a fixed order: text on
 /// background, each ANSI slot on background, the selection band on
 /// background, text on the selection (and `selection_foreground` on it, when
-/// set), then the cursor on background. A pair has a minimum when admission
+/// set), the cursor on background, then each authored chrome colour on the
+/// background (accent, border, search match). A pair has a minimum when admission
 /// warns below it: text and an explicit cursor at [`MIN_TEXT_CONTRAST`] and
 /// [`MIN_CURSOR_CONTRAST`], the band at [`MIN_SELECTION_CONTRAST`]. A cursor
 /// the theme leaves out follows the foreground, so it has no bar of its own.
@@ -1413,7 +1808,63 @@ pub fn contrast_report(scheme: &ColorScheme) -> Vec<ContrastRow> {
         bg,
         scheme.cursor.map(|_| MIN_CURSOR_CONTRAST),
     ));
+    for (pair, colour, minimum) in [
+        (
+            ContrastPair::AccentOnBackground,
+            scheme.chrome.accent,
+            MIN_ACCENT_CONTRAST,
+        ),
+        (
+            ContrastPair::BorderOnBackground,
+            scheme.chrome.border,
+            MIN_BORDER_CONTRAST,
+        ),
+        (
+            ContrastPair::SearchMatchOnBackground,
+            scheme.chrome.search_match,
+            MIN_SEARCH_MATCH_CONTRAST,
+        ),
+    ] {
+        if let Some(colour) = colour {
+            rows.push(row(pair, colour, bg, Some(minimum)));
+        }
+    }
     rows
+}
+
+/// The Euclidean `OkLab` distance between two colours (Björn Ottosson's
+/// `OkLab`): how far apart they look. `aterm_messages::palette::oklab_distance`
+/// is the chrome's copy; theme admission only compares it with
+/// [`MIN_SEARCH_MATCH_DISTANCE`], far from where the two could round apart.
+// Skip: f64 arithmetic with `powf`/`cbrt` — the float-interval lane.
+#[cfg_attr(trust_verify, trust::skip)]
+#[allow(
+    clippy::excessive_precision,
+    clippy::unreadable_literal,
+    reason = "Björn Ottosson's published `OkLab` matrices, digit for digit"
+)]
+fn oklab_distance(a: Rgb, b: Rgb) -> f64 {
+    let lin = |v: u8| {
+        let c = f64::from(v) / 255.0;
+        if c <= 0.040_45 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let lab = |c: Rgb| {
+        let (r, g, b) = (lin(c.r), lin(c.g), lin(c.b));
+        let l = (0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b).cbrt();
+        let m = (0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b).cbrt();
+        let s = (0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b).cbrt();
+        [
+            0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+            1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+            0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s,
+        ]
+    };
+    let (p, q) = (lab(a), lab(b));
+    (p[0] - q[0]).hypot(p[1] - q[1]).hypot(p[2] - q[2])
 }
 
 /// A theme as the catalog holds it, under the id `theme = "<id>"` names: a
@@ -1437,12 +1888,12 @@ impl CatalogTheme {
         let scheme = builtin(identity.name)?;
         Some(Self {
             id: identity.name.to_string(),
-            theme: ParsedTheme {
+            theme: ParsedTheme::colours_only(
                 scheme,
-                description: Some(identity.description.to_string()),
-                author: None,
-                appearance_declared: true,
-            },
+                true,
+                Some(identity.description.to_string()),
+                None,
+            ),
             meta: ThemeMeta::of_builtin(identity),
         })
     }
@@ -1473,6 +1924,46 @@ pub enum ThemeKey {
     SelectionForeground,
     /// `color<N>` / `palette<N>` / `ansi<N>`: ANSI slot `N`.
     Palette,
+    /// `palette_generate`: derive slots 16-255 from the ANSI colours.
+    PaletteGenerate,
+    /// `accent_color`: the chrome accent.
+    AccentColor,
+    /// `active_tab_color`: the selected tab's background.
+    ActiveTabColor,
+    /// `border_color`: dividers and the chrome bands' seams.
+    BorderColor,
+    /// `search_match_color`: find's highlight on the other matches.
+    SearchMatchColor,
+    /// `schema`: the theme format version the file was written for.
+    Schema,
+    /// `bold_is_bright`: whether bold text in ANSI colours 0-7 uses 8-15.
+    BoldIsBright,
+    /// `font_family`: the regular face's family.
+    FontFamily,
+    /// `font_family_bold`.
+    FontFamilyBold,
+    /// `font_family_italic`.
+    FontFamilyItalic,
+    /// `font_family_bold_italic`.
+    FontFamilyBoldItalic,
+    /// `fallback_fonts`: families tried for characters the primary lacks.
+    FallbackFonts,
+    /// `symbol_font`: the family for symbols and icons.
+    SymbolFont,
+    /// `emoji_font`: the family for colour emoji.
+    EmojiFont,
+    /// `line_height`: the line height multiplier.
+    LineHeight,
+    /// `ligatures`: whether programming ligatures are drawn.
+    Ligatures,
+    /// `font_features`: OpenType feature specs.
+    FontFeatures,
+    /// `font_synthetic_style`: whether missing bold/italic faces are synthesized.
+    FontSyntheticStyle,
+    /// `font_weight`: the regular face's weight.
+    FontWeight,
+    /// `font_size_scale`: the text size multiplier.
+    FontSizeScale,
 }
 
 impl ThemeKey {
@@ -1486,12 +1977,32 @@ impl ThemeKey {
             Self::Description => 1,
             Self::Author => 2,
             Self::Appearance => 3,
-            Self::Foreground => 4,
-            Self::Background => 5,
-            Self::Cursor => 6,
-            Self::Selection => 7,
-            Self::SelectionForeground => 8,
-            Self::Palette => 9,
+            Self::Schema => 4,
+            Self::Foreground => 5,
+            Self::Background => 6,
+            Self::Cursor => 7,
+            Self::Selection => 8,
+            Self::SelectionForeground => 9,
+            Self::Palette => 10,
+            Self::PaletteGenerate => 11,
+            Self::BoldIsBright => 12,
+            Self::AccentColor => 13,
+            Self::ActiveTabColor => 14,
+            Self::BorderColor => 15,
+            Self::SearchMatchColor => 16,
+            Self::FontFamily => 17,
+            Self::FontFamilyBold => 18,
+            Self::FontFamilyItalic => 19,
+            Self::FontFamilyBoldItalic => 20,
+            Self::FallbackFonts => 21,
+            Self::SymbolFont => 22,
+            Self::EmojiFont => 23,
+            Self::LineHeight => 24,
+            Self::Ligatures => 25,
+            Self::FontFeatures => 26,
+            Self::FontSyntheticStyle => 27,
+            Self::FontWeight => 28,
+            Self::FontSizeScale => 29,
         }
     }
 }
@@ -1506,6 +2017,34 @@ pub enum ThemeValueType {
     Text,
     /// One of [`APPEARANCE_VALUES`], case-insensitive.
     Appearance,
+    /// One font family name, never a path or a font file
+    /// ([`crate::scheme_typography::parse_font_name`]).
+    FontName,
+    /// A comma-separated list of font family names, `1..=`
+    /// [`MAX_THEME_FONT_LIST`] entries, none empty.
+    FontNameList,
+    /// `true` or `false`, case-insensitive.
+    Flag,
+    /// A decimal with at most three fraction digits, within `[min, max]`
+    /// (thousandths): `1.15` is 1150.
+    Milli {
+        /// The least value, in thousandths.
+        min: u16,
+        /// The greatest value, in thousandths.
+        max: u16,
+    },
+    /// A whole number within `[min, max]`.
+    Integer {
+        /// The least value.
+        min: u16,
+        /// The greatest value.
+        max: u16,
+    },
+    /// OpenType feature specs (`tag`, `+tag`, `-tag`, `tag=N`) separated by
+    /// commas or spaces, `1..=`[`MAX_THEME_FEATURES`] of them.
+    FeatureList,
+    /// The theme format version: a whole number from 1.
+    SchemaVersion,
 }
 
 impl ThemeValueType {
@@ -1516,6 +2055,42 @@ impl ThemeValueType {
             Self::Colour => "colour",
             Self::Text => "text",
             Self::Appearance => "appearance",
+            Self::FontName => "font name",
+            Self::FontNameList => "font list",
+            Self::Flag => "true|false",
+            Self::Milli { .. } => "number",
+            Self::Integer { .. } => "integer",
+            Self::FeatureList => "feature list",
+            Self::SchemaVersion => "schema version",
+        }
+    }
+}
+
+/// Which part of a theme a key belongs to: what `aterm theme schema` and the
+/// manual group the keys by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThemeKeyGroup {
+    /// Who the theme is: its name, description, author and appearance.
+    Identity,
+    /// The terminal's colours: foreground, background, cursor, selection and
+    /// the ANSI palette.
+    Colour,
+    /// The optional colours of aterm's own chrome.
+    Chrome,
+    /// The optional type settings: font families, line height, ligatures,
+    /// features, weight and size scale. aterm.toml keys of the same name win.
+    Typography,
+}
+
+impl ThemeKeyGroup {
+    /// The group's name in `aterm theme schema`.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Identity => "identity",
+            Self::Colour => "colour",
+            Self::Chrome => "chrome",
+            Self::Typography => "typography",
         }
     }
 }
@@ -1544,6 +2119,11 @@ pub struct ThemeKeySpec {
     /// For an indexed key, how many slots it has (`0..indexed`); `0` for a
     /// plain key.
     pub indexed: u8,
+    /// The part of the theme the key belongs to.
+    pub group: ThemeKeyGroup,
+    /// The aterm.toml key that overrides this one when set (its spelling
+    /// there); `None` for an identity key, which aterm.toml cannot set.
+    pub config_key: Option<&'static str>,
     /// What leaving the key out means.
     pub when_omitted: &'static str,
     /// One line on what the key does.
@@ -1568,7 +2148,7 @@ impl ThemeKeySpec {
 /// `aterm theme schema` and the `aterm theme new` template are printed from
 /// it, so neither can describe a key the parser does not read the same way.
 /// The order is the order a theme file is written in.
-pub const THEME_KEYS: [ThemeKeySpec; 10] = [
+pub const THEME_KEYS: [ThemeKeySpec; 30] = [
     ThemeKeySpec {
         key: ThemeKey::Name,
         name: "name",
@@ -1576,6 +2156,8 @@ pub const THEME_KEYS: [ThemeKeySpec; 10] = [
         value: ThemeValueType::Text,
         required: false,
         indexed: 0,
+        group: ThemeKeyGroup::Identity,
+        config_key: None,
         when_omitted: "the file name without .conf is shown",
         description: "The name listings and the picker show. The file name stays the id that theme = \"<id>\" names.",
         example: "Harbour Night",
@@ -1587,6 +2169,8 @@ pub const THEME_KEYS: [ThemeKeySpec; 10] = [
         value: ThemeValueType::Text,
         required: false,
         indexed: 0,
+        group: ThemeKeyGroup::Identity,
+        config_key: None,
         when_omitted: "no description",
         description: "One line that listings and the picker show under the name.",
         example: "Deep navy with warm accents",
@@ -1598,6 +2182,8 @@ pub const THEME_KEYS: [ThemeKeySpec; 10] = [
         value: ThemeValueType::Text,
         required: false,
         indexed: 0,
+        group: ThemeKeyGroup::Identity,
+        config_key: None,
         when_omitted: "no author",
         description: "Who made the theme.",
         example: "Jane Doe",
@@ -1609,9 +2195,24 @@ pub const THEME_KEYS: [ThemeKeySpec; 10] = [
         value: ThemeValueType::Appearance,
         required: false,
         indexed: 0,
+        group: ThemeKeyGroup::Identity,
+        config_key: None,
         when_omitted: "measured from the background",
         description: "Whether the theme is drawn for a dark or a light background; a dark:/light: theme split picks by it.",
         example: "dark",
+    },
+    ThemeKeySpec {
+        key: ThemeKey::Schema,
+        name: "schema",
+        aliases: &[],
+        value: ThemeValueType::SchemaVersion,
+        required: false,
+        indexed: 0,
+        group: ThemeKeyGroup::Identity,
+        config_key: None,
+        when_omitted: "the file is read as written for this aterm's schema, so an unknown key is refused",
+        description: "The theme format version the file was written for. A newer aterm's file loads here with the keys this aterm does not know skipped and listed.",
+        example: "1",
     },
     ThemeKeySpec {
         key: ThemeKey::Foreground,
@@ -1620,6 +2221,8 @@ pub const THEME_KEYS: [ThemeKeySpec; 10] = [
         value: ThemeValueType::Colour,
         required: true,
         indexed: 0,
+        group: ThemeKeyGroup::Colour,
+        config_key: Some("foreground"),
         when_omitted: "the theme is refused",
         description: "The default text colour.",
         example: "#c0caf5",
@@ -1631,6 +2234,8 @@ pub const THEME_KEYS: [ThemeKeySpec; 10] = [
         value: ThemeValueType::Colour,
         required: true,
         indexed: 0,
+        group: ThemeKeyGroup::Colour,
+        config_key: Some("background"),
         when_omitted: "the theme is refused",
         description: "The default background, which also fills the window's padding.",
         example: "#1a1b26",
@@ -1642,6 +2247,8 @@ pub const THEME_KEYS: [ThemeKeySpec; 10] = [
         value: ThemeValueType::Colour,
         required: false,
         indexed: 0,
+        group: ThemeKeyGroup::Colour,
+        config_key: Some("cursor_color"),
         when_omitted: "the cursor follows the foreground",
         description: "The cursor colour.",
         example: "#7aa2f7",
@@ -1653,6 +2260,8 @@ pub const THEME_KEYS: [ThemeKeySpec; 10] = [
         value: ThemeValueType::Colour,
         required: false,
         indexed: 0,
+        group: ThemeKeyGroup::Colour,
+        config_key: Some("selection_color"),
         when_omitted: "derived from the background, moved toward the foreground",
         description: "The selection band's background.",
         example: "#283457",
@@ -1664,6 +2273,8 @@ pub const THEME_KEYS: [ThemeKeySpec; 10] = [
         value: ThemeValueType::Colour,
         required: false,
         indexed: 0,
+        group: ThemeKeyGroup::Colour,
+        config_key: Some("selection_foreground"),
         when_omitted: "selected text keeps its own colour",
         description: "The text colour inside the selection.",
         example: "#c0caf5",
@@ -1675,9 +2286,264 @@ pub const THEME_KEYS: [ThemeKeySpec; 10] = [
         value: ThemeValueType::Colour,
         required: false,
         indexed: THEME_PALETTE_SLOTS,
+        group: ThemeKeyGroup::Colour,
+        config_key: Some("palette"),
         when_omitted: "the slot's xterm default",
         description: "ANSI slot N: 0-7 black, red, green, yellow, blue, magenta, cyan, white; 8-15 their bright forms.",
         example: "#f7768e",
+    },
+    ThemeKeySpec {
+        key: ThemeKey::PaletteGenerate,
+        name: "palette_generate",
+        aliases: &[],
+        value: ThemeValueType::Flag,
+        required: false,
+        indexed: 0,
+        group: ThemeKeyGroup::Colour,
+        config_key: Some("palette_generate"),
+        when_omitted: "slots 16-255 keep the xterm cube and grey ramp",
+        description: "Derive the 256-colour cube and grey ramp (slots 16-255) from this theme's colours: its bright row colours the cube, and its darkest ink (color0 or color15) and lightest colour anchor black and white, so dark slots stay dark on light themes too.",
+        example: "true",
+    },
+    ThemeKeySpec {
+        key: ThemeKey::BoldIsBright,
+        name: "bold_is_bright",
+        aliases: &[],
+        value: ThemeValueType::Flag,
+        required: false,
+        indexed: 0,
+        group: ThemeKeyGroup::Colour,
+        config_key: Some("bold_is_bright"),
+        when_omitted: "your aterm.toml value, else aterm's default",
+        description: "Whether bold text in ANSI colours 0-7 is drawn in their bright forms 8-15.",
+        example: "true",
+    },
+    ThemeKeySpec {
+        key: ThemeKey::AccentColor,
+        name: "accent_color",
+        aliases: &[],
+        value: ThemeValueType::Colour,
+        required: false,
+        indexed: 0,
+        group: ThemeKeyGroup::Chrome,
+        config_key: Some("accent_color"),
+        when_omitted: "the cursor when it has colour, else the theme's ANSI blue or cyan",
+        description: "The chrome accent: the active-tab rule, the message band's meter, Settings' selected rows, the find highlight's hue. Each surface holds it to 3:1 on its own ground.",
+        example: "#7aa2f7",
+    },
+    ThemeKeySpec {
+        key: ThemeKey::ActiveTabColor,
+        name: "active_tab_color",
+        aliases: &[],
+        value: ThemeValueType::Colour,
+        required: false,
+        indexed: 0,
+        group: ThemeKeyGroup::Chrome,
+        config_key: Some("active_tab_color"),
+        when_omitted: "the selected tab is a raised card in the theme's own tones",
+        description: "The selected tab's background; its label is black or white by luminance.",
+        example: "#2b3a57",
+    },
+    ThemeKeySpec {
+        key: ThemeKey::BorderColor,
+        name: "border_color",
+        aliases: &[],
+        value: ThemeValueType::Colour,
+        required: false,
+        indexed: 0,
+        group: ThemeKeyGroup::Chrome,
+        config_key: Some("border_color"),
+        when_omitted: "the background stepped 30% toward the foreground",
+        description: "Split-pane dividers and the seams under the tab strip and over the find bar; held to 1.5:1 on each.",
+        example: "#3b4261",
+    },
+    ThemeKeySpec {
+        key: ThemeKey::SearchMatchColor,
+        name: "search_match_color",
+        aliases: &[],
+        value: ThemeValueType::Colour,
+        required: false,
+        indexed: 0,
+        group: ThemeKeyGroup::Chrome,
+        config_key: Some("search_match_color"),
+        when_omitted: "a tint of the background toward the accent, apart from the selection",
+        description: "Find's highlight on every match but the current one (the current match is the selection).",
+        example: "#3d4f2f",
+    },
+    ThemeKeySpec {
+        key: ThemeKey::FontFamily,
+        name: "font_family",
+        aliases: &[],
+        value: ThemeValueType::FontName,
+        required: false,
+        indexed: 0,
+        group: ThemeKeyGroup::Typography,
+        config_key: Some("font_family"),
+        when_omitted: "your aterm.toml value, else aterm's default",
+        description: "The terminal text's font family, by name (never a file or a path). display:<id> names one of aterm's built-in display faces.",
+        example: "JetBrains Mono",
+    },
+    ThemeKeySpec {
+        key: ThemeKey::FontFamilyBold,
+        name: "font_family_bold",
+        aliases: &[],
+        value: ThemeValueType::FontName,
+        required: false,
+        indexed: 0,
+        group: ThemeKeyGroup::Typography,
+        config_key: Some("font_family_bold"),
+        when_omitted: "your aterm.toml value, else aterm's default",
+        description: "The family for bold text.",
+        example: "JetBrains Mono",
+    },
+    ThemeKeySpec {
+        key: ThemeKey::FontFamilyItalic,
+        name: "font_family_italic",
+        aliases: &[],
+        value: ThemeValueType::FontName,
+        required: false,
+        indexed: 0,
+        group: ThemeKeyGroup::Typography,
+        config_key: Some("font_family_italic"),
+        when_omitted: "your aterm.toml value, else aterm's default",
+        description: "The family for italic text.",
+        example: "JetBrains Mono",
+    },
+    ThemeKeySpec {
+        key: ThemeKey::FontFamilyBoldItalic,
+        name: "font_family_bold_italic",
+        aliases: &[],
+        value: ThemeValueType::FontName,
+        required: false,
+        indexed: 0,
+        group: ThemeKeyGroup::Typography,
+        config_key: Some("font_family_bold_italic"),
+        when_omitted: "your aterm.toml value, else aterm's default",
+        description: "The family for bold italic text.",
+        example: "JetBrains Mono",
+    },
+    ThemeKeySpec {
+        key: ThemeKey::FallbackFonts,
+        name: "fallback_fonts",
+        aliases: &[],
+        value: ThemeValueType::FontNameList,
+        required: false,
+        indexed: 0,
+        group: ThemeKeyGroup::Typography,
+        config_key: Some("fallback_fonts"),
+        when_omitted: "your aterm.toml value, else aterm's default",
+        description: "Families tried, in order, for a character the main font lacks (comma-separated, at most 8).",
+        example: "Sarasa Mono J, Apple Symbols",
+    },
+    ThemeKeySpec {
+        key: ThemeKey::SymbolFont,
+        name: "symbol_font",
+        aliases: &[],
+        value: ThemeValueType::FontName,
+        required: false,
+        indexed: 0,
+        group: ThemeKeyGroup::Typography,
+        config_key: Some("symbol_font"),
+        when_omitted: "your aterm.toml value, else aterm's default",
+        description: "The family for symbols and icons (Nerd Font glyphs).",
+        example: "Symbols Nerd Font Mono",
+    },
+    ThemeKeySpec {
+        key: ThemeKey::EmojiFont,
+        name: "emoji_font",
+        aliases: &[],
+        value: ThemeValueType::FontName,
+        required: false,
+        indexed: 0,
+        group: ThemeKeyGroup::Typography,
+        config_key: Some("emoji_font"),
+        when_omitted: "your aterm.toml value, else aterm's default",
+        description: "The family for colour emoji.",
+        example: "Noto Color Emoji",
+    },
+    ThemeKeySpec {
+        key: ThemeKey::LineHeight,
+        name: "line_height",
+        aliases: &[],
+        value: ThemeValueType::Milli {
+            min: 800,
+            max: 2000,
+        },
+        required: false,
+        indexed: 0,
+        group: ThemeKeyGroup::Typography,
+        config_key: Some("line_height"),
+        when_omitted: "your aterm.toml value, else aterm's default",
+        description: "Line height as a multiple of the font's own, 0.8 to 2.0.",
+        example: "1.15",
+    },
+    ThemeKeySpec {
+        key: ThemeKey::Ligatures,
+        name: "ligatures",
+        aliases: &[],
+        value: ThemeValueType::Flag,
+        required: false,
+        indexed: 0,
+        group: ThemeKeyGroup::Typography,
+        config_key: Some("ligatures"),
+        when_omitted: "your aterm.toml value, else aterm's default",
+        description: "Whether programming ligatures (-> and != drawn as one glyph) are shown.",
+        example: "true",
+    },
+    ThemeKeySpec {
+        key: ThemeKey::FontFeatures,
+        name: "font_features",
+        aliases: &[],
+        value: ThemeValueType::FeatureList,
+        required: false,
+        indexed: 0,
+        group: ThemeKeyGroup::Typography,
+        config_key: Some("font_features"),
+        when_omitted: "your aterm.toml value, else aterm's default",
+        description: "OpenType features: tag, +tag or tag=N turns one on, -tag off (comma or space separated, at most 16).",
+        example: "calt, ss02",
+    },
+    ThemeKeySpec {
+        key: ThemeKey::FontSyntheticStyle,
+        name: "font_synthetic_style",
+        aliases: &[],
+        value: ThemeValueType::Flag,
+        required: false,
+        indexed: 0,
+        group: ThemeKeyGroup::Typography,
+        config_key: Some("font_synthetic_style"),
+        when_omitted: "your aterm.toml value, else aterm's default",
+        description: "Whether a missing bold or italic face is synthesized from the regular one.",
+        example: "true",
+    },
+    ThemeKeySpec {
+        key: ThemeKey::FontWeight,
+        name: "font_weight",
+        aliases: &[],
+        value: ThemeValueType::Integer { min: 1, max: 1000 },
+        required: false,
+        indexed: 0,
+        group: ThemeKeyGroup::Typography,
+        config_key: Some("font_weight"),
+        when_omitted: "your aterm.toml value, else aterm's default",
+        description: "The regular text's weight, 1 to 1000 (400 is regular), for a variable font.",
+        example: "450",
+    },
+    ThemeKeySpec {
+        key: ThemeKey::FontSizeScale,
+        name: "font_size_scale",
+        aliases: &[],
+        value: ThemeValueType::Milli {
+            min: 800,
+            max: 1250,
+        },
+        required: false,
+        indexed: 0,
+        group: ThemeKeyGroup::Typography,
+        config_key: Some("font_size_scale"),
+        when_omitted: "your aterm.toml value, else aterm's default",
+        description: "Scales the text size, 0.8 to 1.25, without fixing a pixel size: your font size or aterm's default is multiplied by it.",
+        example: "1.08",
     },
 ];
 
@@ -1843,6 +2709,7 @@ fn parse_theme_lines(text: &str) -> Result<(ParsedTheme, ThemeKeyLines), ThemeEr
     let mut cursor: Option<Rgb> = None;
     let mut selection: Option<Rgb> = None;
     let mut selection_fg: Option<Rgb> = None;
+    let mut chrome = ChromeColors::default();
     // Start from the engine defaults so an omitted `colorN` is render-identical to
     // an unthemed slot.
     let mut ansi = ColorScheme::default().ansi;
@@ -1852,6 +2719,16 @@ fn parse_theme_lines(text: &str) -> Result<(ParsedTheme, ThemeKeyLines), ThemeEr
         plain: [None; THEME_KEYS.len()],
         palette: [None; THEME_PALETTE_SLOTS as usize],
     };
+    let mut typography = ThemeTypography::NONE;
+    let mut bold_is_bright: Option<bool> = None;
+    let mut palette_generate = false;
+    let mut schema: Option<u16> = None;
+    let mut skipped_keys: Vec<String> = Vec::new();
+    let mut skipped_count: u16 = 0;
+    // Pass 0: a file written for a newer schema skips the keys this aterm
+    // does not know. The `schema` line itself is checked strictly by the
+    // main pass (malformed, zero or duplicated is an error there).
+    let future = declared_schema(text).is_some_and(|n| n > THEME_SCHEMA_VERSION);
 
     for (idx, raw) in text.lines().enumerate() {
         // Trust gate: `saturating_add(1)` is identical to `+ 1` here — `idx`
@@ -1882,6 +2759,18 @@ fn parse_theme_lines(text: &str) -> Result<(ParsedTheme, ThemeKeyLines), ThemeEr
             ));
         }
         let Some((row, index)) = lookup_theme_key(&key) else {
+            if future {
+                skipped_count = skipped_count.saturating_add(1);
+                if skipped_keys.len() < MAX_SKIPPED_THEME_KEYS {
+                    // Printable from here on: the key is untrusted text that
+                    // `theme check` and `theme import` print to a terminal.
+                    skipped_keys.push(truncate_at_char(
+                        &escape_controls(&key),
+                        MAX_SKIPPED_THEME_KEY_BYTES,
+                    ));
+                }
+                continue;
+            }
             return Err(parse_error(lineno, Some(&key), "unknown key ", &key));
         };
         let spec = &THEME_KEYS[row];
@@ -1926,8 +2815,13 @@ fn parse_theme_lines(text: &str) -> Result<(ParsedTheme, ThemeKeyLines), ThemeEr
                     (ThemeKey::Selection, _) => selection = Some(colour),
                     (ThemeKey::SelectionForeground, _) => selection_fg = Some(colour),
                     (ThemeKey::Palette, Some(slot)) => ansi[usize::from(slot)] = colour,
-                    // The table types no other key as a colour.
-                    _ => {}
+                    (key, _) => {
+                        // The chrome keys; the table types no other key as a
+                        // colour.
+                        if let Some(slot) = chrome.slot_mut(key) {
+                            *slot = Some(colour);
+                        }
+                    }
                 }
             }
             ThemeValueType::Text => {
@@ -1939,6 +2833,71 @@ fn parse_theme_lines(text: &str) -> Result<(ParsedTheme, ThemeKeyLines), ThemeEr
                     // The table types no other key as text.
                     _ => {}
                 }
+            }
+            ThemeValueType::FontName => {
+                let name = crate::scheme_typography::parse_font_name(&value)
+                    .map_err(|reason| value_error(lineno, &canonical, &reason))?;
+                match spec.key {
+                    ThemeKey::FontFamily => typography.font_family = Some(name),
+                    ThemeKey::FontFamilyBold => typography.font_family_bold = Some(name),
+                    ThemeKey::FontFamilyItalic => typography.font_family_italic = Some(name),
+                    ThemeKey::FontFamilyBoldItalic => {
+                        typography.font_family_bold_italic = Some(name);
+                    }
+                    ThemeKey::SymbolFont => typography.symbol_font = Some(name),
+                    ThemeKey::EmojiFont => typography.emoji_font = Some(name),
+                    // The table types no other key as a font name.
+                    _ => {}
+                }
+            }
+            ThemeValueType::FontNameList => {
+                let names = crate::scheme_typography::parse_font_list(&value)
+                    .map_err(|reason| value_error(lineno, &canonical, &reason))?;
+                if spec.key == ThemeKey::FallbackFonts {
+                    typography.fallback_fonts = Some(names);
+                }
+            }
+            ThemeValueType::Flag => {
+                let flag = crate::scheme_typography::parse_flag(&value)
+                    .map_err(|reason| value_error(lineno, &canonical, &reason))?;
+                match spec.key {
+                    ThemeKey::BoldIsBright => bold_is_bright = Some(flag),
+                    ThemeKey::PaletteGenerate => palette_generate = flag,
+                    ThemeKey::Ligatures => typography.ligatures = Some(flag),
+                    ThemeKey::FontSyntheticStyle => typography.font_synthetic_style = Some(flag),
+                    // The table types no other key as a flag.
+                    _ => {}
+                }
+            }
+            ThemeValueType::Milli { min, max } => {
+                let milli = crate::scheme_typography::parse_milli(&value, min, max)
+                    .map_err(|reason| value_error(lineno, &canonical, &reason))?;
+                match spec.key {
+                    ThemeKey::LineHeight => typography.line_height_milli = Some(milli),
+                    ThemeKey::FontSizeScale => typography.font_size_scale_milli = Some(milli),
+                    // The table types no other key as a decimal.
+                    _ => {}
+                }
+            }
+            ThemeValueType::Integer { min, max } => {
+                let n = crate::scheme_typography::parse_integer(&value, min, max)
+                    .map_err(|reason| value_error(lineno, &canonical, &reason))?;
+                if spec.key == ThemeKey::FontWeight {
+                    typography.font_weight = Some(n);
+                }
+            }
+            ThemeValueType::FeatureList => {
+                let specs = crate::scheme_typography::parse_feature_list(&value)
+                    .map_err(|reason| value_error(lineno, &canonical, &reason))?;
+                if spec.key == ThemeKey::FontFeatures {
+                    typography.font_features = Some(specs);
+                }
+            }
+            ThemeValueType::SchemaVersion => {
+                schema = Some(
+                    crate::scheme_typography::parse_schema(&value)
+                        .map_err(|reason| value_error(lineno, &canonical, &reason))?,
+                );
             }
             ThemeValueType::Appearance => {
                 let word = value.to_ascii_lowercase();
@@ -1984,12 +2943,70 @@ fn parse_theme_lines(text: &str) -> Result<(ParsedTheme, ThemeKeyLines), ThemeEr
             selection,
             selection_fg,
             ansi,
+            chrome,
+            palette_generate,
         },
         description,
         author,
         appearance_declared: appearance.is_some(),
+        typography,
+        bold_is_bright,
+        schema,
+        skipped_keys,
+        skipped_count,
     };
     Ok((parsed, lines))
+}
+
+/// The value of the first `schema` line, read leniently (`None` when there
+/// is none or it does not parse): only whether a file is from a newer schema
+/// rides on it. The main pass reads the line strictly.
+fn declared_schema(text: &str) -> Option<u16> {
+    text.lines().find_map(|raw| {
+        let line = raw.trim();
+        if line.starts_with('#') || line.starts_with(';') {
+            return None;
+        }
+        let (key, value) = line.split_once('=')?;
+        if !key.trim().eq_ignore_ascii_case("schema") {
+            return None;
+        }
+        crate::scheme_typography::parse_schema(strip_inline_comment(value)).ok()
+    })
+}
+
+/// `text` cut to at most `max` bytes at a char boundary.
+/// `text` with every control character (C0, DEL, C1) written as its
+/// escape (`\u{1b}`), so untrusted text reaches a terminal as text, never as
+/// an escape sequence; anything else is kept as written.
+fn escape_controls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control() {
+            out.extend(c.escape_unicode());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn truncate_at_char(text: &str, max: usize) -> String {
+    let mut end = text.len().min(max);
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.get(..end).unwrap_or_default().to_string()
+}
+
+/// A [`ThemeError::Parse`] for a malformed value of `key`: the value
+/// reader's reason, prefixed with the key.
+fn value_error(line: usize, key: &str, reason: &str) -> ThemeError {
+    let mut text = String::from("invalid value for ");
+    text.push_str(&crate::trust_fmt::debug_string(key));
+    text.push_str(": ");
+    text.push_str(reason);
+    ThemeError::at(line, Some(key.to_string()), text)
 }
 
 /// A whole-file [`ThemeError::Parse`] for a required key the file leaves out.
@@ -2051,6 +3068,11 @@ fn strip_inline_comment(value: &str) -> &str {
     }
     value
 }
+
+/// How many theme files the themes folder is read for: discovery opens and
+/// parses at most this many `.conf` files (the lowest names win), and a
+/// writer that adds many (`aterm theme install --all`) warns past it.
+pub const MAX_USER_THEME_FILES: usize = 128;
 
 /// The user theme directory: `themes` inside the folder that holds
 /// `aterm.toml` ([`crate::dirs::aterm_config_dir`]), so it follows the same
@@ -2280,33 +3302,118 @@ impl ThemeSelector {
     }
 }
 
+/// What an unset `theme` means, written as the selector it equals: Default
+/// on every appearance, as a value that names no theme at all (blank, or a
+/// split whose every segment is unusable) also draws. aterm follows the OS
+/// only when a `dark:…,light:…` pair is written (Settings' Follow system
+/// switch writes `dark:Default,light:Default Light` over an unset theme), so
+/// an update never turns an unconfigured terminal light.
+pub const UNSET_THEME: &str = "Default";
+
+/// What a selector draws for one appearance, as far as the built-ins can say
+/// ([`ThemeSelector::draw_builtin`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectorDraw {
+    /// No name at all: the unset default, [`UNSET_THEME`] on every
+    /// appearance.
+    Unset(ColorScheme),
+    /// A built-in, canonically named.
+    Builtin(ColorScheme),
+    /// A name the built-ins do not know: the caller's catalog (theme files
+    /// natively, registered themes on the web) resolves it.
+    Other(String),
+}
+
+impl SelectorDraw {
+    /// The unset default: [`UNSET_THEME`], whatever the appearance.
+    #[must_use]
+    pub fn unset() -> Self {
+        Self::Unset(builtin(UNSET_THEME).unwrap_or_default())
+    }
+}
+
+impl ThemeSelector {
+    /// The built-in side of [`name_for`](Self::name_for): no name draws the
+    /// unset default, a built-in name (case-insensitive) draws that built-in,
+    /// and any other name is left to the caller's catalog. Built-ins win over
+    /// any catalog (a file named like a built-in is shadowed), so native and
+    /// web cannot disagree about what a selector draws.
+    #[must_use]
+    pub fn draw_builtin(&self, appearance: Appearance) -> SelectorDraw {
+        match self.name_for(appearance) {
+            None => SelectorDraw::unset(),
+            Some(name) => builtin(name).map_or_else(
+                || SelectorDraw::Other(name.to_string()),
+                SelectorDraw::Builtin,
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Law: `draw_builtin` is `name_for` split three ways: no name draws the
+    /// unset default, a built-in (case-insensitive) draws it canonically (the
+    /// pair for an omitted side), anything else is `Other`.
     #[test]
-    fn builtin_themes_cover_every_name_default_first_and_resolve() {
-        let names = builtin_names();
-        let themes = builtin_themes();
-        // Same set, same order, as builtin_names — Default first.
-        assert_eq!(
-            names,
-            themes.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
-            "builtin_themes must mirror builtin_names"
-        );
-        assert_eq!(themes.first().map(|(n, _)| *n), Some("Default"));
-        // Every name resolves to a scheme whose appearance is the identity
-        // row's, and every description is non-empty and its own.
-        let mut descriptions = std::collections::BTreeSet::new();
-        for (name, desc) in &themes {
-            assert!(!desc.is_empty(), "{name} has an empty description");
-            assert!(descriptions.insert(*desc), "{name} reuses a description");
-            let scheme = builtin(name).expect("a listed built-in resolves");
-            let identity = builtin_theme(name).expect("a listed built-in has an identity");
-            assert_eq!(identity.name, *name);
-            assert_eq!(scheme.appearance, identity.appearance, "{name}");
+    fn draw_builtin_follows_name_for() {
+        let selectors = [
+            "",
+            "Nord",
+            "nord",
+            "dark:Gruvbox Dark",
+            "light:Linen",
+            "dark:Mine,light:Hearth",
+            "Mine",
+        ];
+        for raw in selectors {
+            let (selector, _) = ThemeSelector::parse(raw);
+            for appearance in [Appearance::Dark, Appearance::Light] {
+                let draw = selector.draw_builtin(appearance);
+                let at = format!("{raw:?} on {appearance:?}");
+                match selector.name_for(appearance) {
+                    None => assert_eq!(draw, SelectorDraw::Unset(ColorScheme::default()), "{at}"),
+                    Some(name) => match builtin(name) {
+                        Some(scheme) => assert_eq!(draw, SelectorDraw::Builtin(scheme), "{at}"),
+                        None => assert_eq!(draw, SelectorDraw::Other(name.to_string()), "{at}"),
+                    },
+                }
+            }
         }
-        assert_eq!(builtin_theme("no such theme"), None);
+        let draw = |raw: &str, a| ThemeSelector::parse(raw).0.draw_builtin(a);
+        let builtin_named = |d: SelectorDraw| match d {
+            SelectorDraw::Builtin(s) => s.name,
+            other => panic!("expected a built-in, got {other:?}"),
+        };
+        assert_eq!(builtin_named(draw("nord", Appearance::Light)), "Nord");
+        assert_eq!(
+            builtin_named(draw("dark:Gruvbox Dark", Appearance::Light)),
+            "Gruvbox Light"
+        );
+        assert_eq!(
+            builtin_named(draw("dark:Mine,light:Hearth", Appearance::Light)),
+            "Hearth"
+        );
+        // An unset value is Default on a light appearance too; only a written
+        // pair follows the OS (negative control: Default's pair draws Default
+        // Light there).
+        assert!(
+            matches!(draw("", Appearance::Light), SelectorDraw::Unset(s) if s.name == "Default")
+        );
+        assert_eq!(
+            builtin_named(draw("dark:Default,light:Default Light", Appearance::Light)),
+            "Default Light"
+        );
+        // Negative control: an unknown name is never a built-in.
+        for a in [Appearance::Dark, Appearance::Light] {
+            assert_eq!(draw("Mine", a), SelectorDraw::Other("Mine".into()));
+        }
+        assert_eq!(
+            draw("dark:Mine,light:Hearth", Appearance::Dark),
+            SelectorDraw::Other("Mine".into())
+        );
     }
 
     /// Law: a built-in pair is symmetric, crosses appearances and names a
@@ -2408,6 +3515,8 @@ mod tests {
             selection: Some(Rgb::new(0x40, 0x48, 0x60)),
             selection_fg: None,
             ansi: ColorScheme::default().ansi,
+            chrome: ChromeColors::default(),
+            palette_generate: false,
         };
         // Negative control: the clean base earns nothing.
         assert_eq!(admission_warnings(&base, Appearance::Dark), vec![]);
@@ -2455,6 +3564,40 @@ mod tests {
         let mut s = base.clone();
         s.cursor = None;
         assert_eq!(kinds(&s), vec![]);
+        // Authored chrome at the background is below its floor; the warning
+        // names the key and the floor aterm raises it to.
+        for (key, floor) in [
+            (ThemeKey::AccentColor, 300),
+            (ThemeKey::BorderColor, 150),
+            (ThemeKey::SearchMatchColor, 150),
+        ] {
+            let mut s = base.clone();
+            *s.chrome.slot_mut(key).expect("a chrome key") = Some(s.background);
+            assert_eq!(
+                admission_warnings(&s, Appearance::Dark),
+                vec![ThemeWarning::ChromeBelowFloor {
+                    key,
+                    hundredths: 100,
+                    floor_hundredths: floor,
+                }],
+                "{key:?}"
+            );
+        }
+        let mut s = base.clone();
+        s.chrome.search_match = s.selection;
+        assert_eq!(
+            admission_warnings(&s, Appearance::Dark),
+            vec![ThemeWarning::SearchMatchLikeSelection]
+        );
+        // Negative control: good chrome earns nothing.
+        let mut s = base.clone();
+        s.chrome = ChromeColors {
+            accent: Some(Rgb::new(0x7a, 0xa2, 0xf7)),
+            active_tab: Some(Rgb::new(0x10, 0x10, 0x10)),
+            border: Some(Rgb::new(0x50, 0x50, 0x50)),
+            search_match: Some(Rgb::new(0x3d, 0x6f, 0x2f)),
+        };
+        assert_eq!(admission_warnings(&s, Appearance::Dark), vec![]);
         // The ratio is carried in hundredths and printed as a ratio.
         let mut s = base;
         s.foreground = Rgb::new(0x30, 0x30, 0x30);
@@ -2682,21 +3825,6 @@ mod tests {
             let idx = i as u8;
             assert_eq!(p.get(idx), ColorPalette::default_color(idx), "index {idx}");
         }
-        // The blue lift is reflected (index 4 is the readable blue, not pure blue).
-        assert_eq!(s.ansi[4], Rgb::new(59, 142, 234));
-        assert_ne!(s.ansi[4], Rgb::new(0, 0, 238));
-    }
-
-    /// Default chrome projects to the historical renderer Theme values.
-    #[test]
-    fn default_theme_parts_are_historical() {
-        let tp = ColorScheme::default().to_theme_parts();
-        assert_eq!(tp.fg, 0x00D0_D0D0);
-        assert_eq!(tp.bg, 0x0011_1318);
-        assert_eq!(tp.cursor, 0x0050_FA7B);
-        // Selection darkened from #264F78 → #33415E so selected coloured text stays
-        // readable (LLM-judge finding V3); kept in sync with the renderer Theme.
-        assert_eq!(tp.selection, 0x0033_415E);
     }
 
     /// `builtin("default")` round-trips; an unknown name is `None`.
@@ -2706,73 +3834,6 @@ mod tests {
         assert_eq!(builtin("DEFAULT"), Some(ColorScheme::default()));
         assert!(builtin("no-such-theme-xyz").is_none());
         assert_eq!(builtin_names()[0], "Default");
-    }
-
-    /// Every built-in is internally well-formed (non-empty name, distinct from the
-    /// reserved "Default" sentinel) and round-trips through `to_scheme`.
-    #[test]
-    fn builtins_well_formed() {
-        for b in BUILTINS {
-            assert!(!b.name.is_empty());
-            assert!(
-                !b.name.eq_ignore_ascii_case("default"),
-                "{} shadows Default",
-                b.name
-            );
-            let s = b.to_scheme();
-            assert_eq!(s.name, b.name);
-            assert_eq!(builtin(b.name).as_ref(), Some(&s));
-        }
-    }
-
-    /// Golden spot-checks of actual palette VALUES (not just structure), so a
-    /// corrupted/typo'd source constant can't pass vacuously — including the
-    /// deliberate Nord/Catppuccin dark-selection substitutions. Verified against
-    /// github.com/mbadolato/iTerm2-Color-Schemes.
-    #[test]
-    fn builtin_palette_values_are_canonical() {
-        let g = |name: &str| builtin(name).expect("builtin exists");
-        // Dracula: bg, fg, ANSI red, ANSI bright-blue.
-        assert_eq!(g("Dracula").background, Rgb::new(0x28, 0x2a, 0x36));
-        assert_eq!(g("Dracula").foreground, Rgb::new(0xf8, 0xf8, 0xf2));
-        assert_eq!(g("Dracula").ansi[1], Rgb::new(0xff, 0x55, 0x55));
-        assert_eq!(g("Dracula").ansi[12], Rgb::new(0xd6, 0xac, 0xff));
-        // Nord: bg + the substituted dark selection (#4c566a, not the white #eceff4).
-        assert_eq!(g("Nord").background, Rgb::new(0x2e, 0x34, 0x40));
-        assert_eq!(g("Nord").selection, Some(Rgb::new(0x4c, 0x56, 0x6a)));
-        // Catppuccin Mocha: the substituted dark selection (#585b70).
-        assert_eq!(
-            g("Catppuccin Mocha").selection,
-            Some(Rgb::new(0x58, 0x5b, 0x70))
-        );
-        // Tokyo Night + Solarized Dark + Gruvbox + One Dark anchors.
-        assert_eq!(g("Tokyo Night").background, Rgb::new(0x1a, 0x1b, 0x26));
-        assert_eq!(g("Solarized Dark").ansi[1], Rgb::new(0xdc, 0x32, 0x2f));
-        assert_eq!(g("Solarized Dark").background, Rgb::new(0x00, 0x2b, 0x36));
-        assert_eq!(g("Gruvbox Dark").foreground, Rgb::new(0xeb, 0xdb, 0xb2));
-        assert_eq!(g("One Dark").ansi[4], Rgb::new(0x61, 0xaf, 0xef));
-        // Light schemes: a chrome anchor + the deliberate light-selection
-        // substitutions (so a corrupted constant can't pass vacuously).
-        assert_eq!(g("Solarized Light").background, Rgb::new(0xfd, 0xf6, 0xe3));
-        assert_eq!(
-            g("Solarized Light").selection,
-            Some(Rgb::new(0xcf, 0xc9, 0xb7))
-        );
-        assert_eq!(g("Gruvbox Light").background, Rgb::new(0xfb, 0xf1, 0xc7));
-        assert_eq!(
-            g("Gruvbox Light").selection,
-            Some(Rgb::new(0xbd, 0xae, 0x93))
-        );
-        assert_eq!(g("Catppuccin Latte").background, Rgb::new(0xef, 0xf1, 0xf5));
-        assert_eq!(
-            g("Catppuccin Latte").selection,
-            Some(Rgb::new(0xac, 0xb0, 0xbe))
-        );
-        assert_eq!(g("GitHub Light").background, Rgb::new(0xff, 0xff, 0xff));
-        assert_eq!(
-            g("GitHub Light").selection,
-            Some(Rgb::new(0x80, 0xcc, 0xff))
-        );
     }
 
     /// Law: every built-in, Default included, is legible as shipped. Body
@@ -3023,6 +4084,26 @@ color15 = #c0caf5
 
     /// Malformed inputs surface a precise `ThemeError::Parse` (line + reason);
     /// missing required keys are rejected.
+    /// Spec `scheme-palette-generate-key`: `palette_generate` reads `true` and
+    /// `false` in any case, and an omitted key is off. NEGATIVE: any other
+    /// value, and the key set twice, are errors at their line.
+    #[test]
+    fn palette_generate_key_parses() {
+        let base = "foreground = #d0d0d0\nbackground = #101010\n";
+        let read = |line: &str| parse_scheme_str(&format!("{base}{line}\n"));
+        assert!(read("palette_generate = true").unwrap().palette_generate);
+        assert!(read("palette_generate = TRUE").unwrap().palette_generate);
+        assert!(!read("palette_generate = false").unwrap().palette_generate);
+        assert!(!parse_scheme_str(base).unwrap().palette_generate);
+        let e = read("palette_generate = yes").unwrap_err();
+        assert!(matches!(e, ThemeError::Parse { line: 3, .. }), "{e:?}");
+        let e = read("palette_generate = true\npalette_generate = false").unwrap_err();
+        assert!(
+            matches!(&e, ThemeError::Parse { line: 4, reason, .. } if reason.contains("duplicate")),
+            "{e:?}"
+        );
+    }
+
     #[test]
     fn parse_scheme_str_rejects_malformed() {
         // No '=' on a content line.
@@ -3296,7 +4377,9 @@ color15 = #c0caf5
             "cursor_text_color",
             "palette",
             "color16",
-            "bold_is_bright",
+            // A theme sets a size only as `font_size_scale`, never in pixels.
+            "font_px",
+            "font_size",
         ] {
             let e = parse_scheme_str(&format!("{base}{key} = #123456\n")).unwrap_err();
             assert!(
@@ -3304,15 +4387,6 @@ color15 = #c0caf5
                 "{key}: {e:?}"
             );
         }
-    }
-
-    /// Inline comments after a value are stripped; a leading `#` hex value is kept.
-    #[test]
-    fn parse_scheme_str_inline_comments() {
-        let s = parse_scheme_str("foreground = #abcdef  # the fg\nbackground = #001122 ; bg\n")
-            .expect("parses with inline comments");
-        assert_eq!(s.foreground, Rgb::new(0xab, 0xcd, 0xef));
-        assert_eq!(s.background, Rgb::new(0x00, 0x11, 0x22));
     }
 
     /// No spelling (name or alias, stem or plain) belongs to two rows. (That
@@ -3389,6 +4463,52 @@ color15 = #c0caf5
             parse_theme_str(&extra),
             Err(ThemeError::Parse { key: Some(ref k), .. }) if k == "colour16"
         ));
+        // Each chrome key parses into its own slot.
+        let chrome = canonical.scheme.chrome;
+        for (key, slot) in [
+            (ThemeKey::AccentColor, chrome.accent),
+            (ThemeKey::ActiveTabColor, chrome.active_tab),
+            (ThemeKey::BorderColor, chrome.border),
+            (ThemeKey::SearchMatchColor, chrome.search_match),
+        ] {
+            assert_eq!(slot, Some(example(key)), "{key:?}");
+            assert_eq!(chrome.slot(key), Some(slot));
+            assert_eq!(theme_key_spec(key).group, ThemeKeyGroup::Chrome);
+        }
+        // All four round-trip through both writers.
+        for written in [
+            crate::scheme_import::to_native_conf(&canonical.scheme, true, None, None, &[]),
+            crate::scheme_import::to_native_conf_commented(
+                &canonical.scheme,
+                true,
+                None,
+                None,
+                &[],
+            ),
+        ] {
+            let back = parse_theme_str(&written).expect("the writer's file parses");
+            assert_eq!(back.scheme, canonical.scheme, "{written}");
+        }
+        // Negative controls: a chrome key set twice is a duplicate naming the
+        // first line, and a near-miss spelling is an unknown key.
+        let mut twice = file_from_examples(None, false);
+        let first = twice
+            .lines()
+            .position(|l| l.starts_with("accent_color"))
+            .expect("set")
+            + 1;
+        twice.push_str("accent_color = #ffffff\n");
+        let Err(ThemeError::Parse { reason, key, .. }) = parse_theme_str(&twice) else {
+            panic!("a duplicate accent_color is refused");
+        };
+        assert_eq!(key.as_deref(), Some("accent_color"));
+        assert!(reason.contains(&format!("line {first}")), "{reason}");
+        let mut near = file_from_examples(None, false);
+        near.push_str("accent = #ffffff\n");
+        assert!(matches!(
+            parse_theme_str(&near),
+            Err(ThemeError::Parse { key: Some(ref k), .. }) if k == "accent"
+        ));
         assert_eq!(lookup_theme_key("color+1"), None);
         assert_eq!(lookup_theme_key("color16"), None);
         assert_eq!(
@@ -3428,6 +4548,12 @@ color15 = #c0caf5
                 foreground: Rgb::new(grey, grey, grey),
                 selection: Some(Rgb::new(grey / 2, grey / 2, grey)),
                 cursor: (grey % 2 == 0).then_some(Rgb::new(grey, 0x20, 0x20)),
+                chrome: ChromeColors {
+                    accent: (grey % 3 == 0).then_some(Rgb::new(grey, grey / 2, 0x40)),
+                    border: (grey % 3 == 1).then_some(Rgb::new(grey, grey, grey)),
+                    search_match: (grey % 3 == 2).then_some(Rgb::new(0x20, grey, 0x20)),
+                    active_tab: None,
+                },
                 ..ColorScheme::default()
             });
         }
@@ -3447,12 +4573,29 @@ color15 = #c0caf5
                     ContrastPair::CursorOnBackground => ThemeWarning::LowCursorContrast {
                         hundredths: row.hundredths,
                     },
+                    pair @ (ContrastPair::AccentOnBackground
+                    | ContrastPair::BorderOnBackground
+                    | ContrastPair::SearchMatchOnBackground) => ThemeWarning::ChromeBelowFloor {
+                        key: match pair {
+                            ContrastPair::AccentOnBackground => ThemeKey::AccentColor,
+                            ContrastPair::BorderOnBackground => ThemeKey::BorderColor,
+                            _ => ThemeKey::SearchMatchColor,
+                        },
+                        hundredths: row.hundredths,
+                        floor_hundredths: row.minimum.unwrap_or(0),
+                    },
                     other => panic!("{other:?} has no bar"),
                 })
                 .collect();
             let admitted: Vec<ThemeWarning> = admission_warnings(scheme, scheme.appearance)
                 .into_iter()
-                .filter(|w| !matches!(w, ThemeWarning::AnsiMatchesBackground { .. }))
+                .filter(|w| {
+                    !matches!(
+                        w,
+                        ThemeWarning::AnsiMatchesBackground { .. }
+                            | ThemeWarning::SearchMatchLikeSelection
+                    )
+                })
                 .collect();
             assert_eq!(admitted, from_rows, "{}", scheme.name);
             warned += admitted.len();
@@ -3466,11 +4609,39 @@ color15 = #c0caf5
                 has(ContrastPair::SelectionTextOnSelection),
                 scheme.selection_fg.is_some()
             );
+            // A chrome row only for an authored key.
+            assert_eq!(
+                has(ContrastPair::AccentOnBackground),
+                scheme.chrome.accent.is_some()
+            );
+            assert_eq!(
+                has(ContrastPair::BorderOnBackground),
+                scheme.chrome.border.is_some()
+            );
             assert!((0u8..16).all(|slot| has(ContrastPair::AnsiOnBackground(slot))));
         }
         assert!(
             warned > 0,
             "the sweep must include themes that earn a warning"
         );
+    }
+
+    /// A scheme with no chrome serializes exactly as before the field
+    /// existed (no `chrome` key), and one with chrome round-trips. NEGATIVE
+    /// CONTROL: the authored scheme's text does carry the key.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn chrome_serializes_only_when_authored() {
+        let plain = ColorScheme::default();
+        let text = aterm_json::to_string(&plain).expect("serializes");
+        assert!(!text.contains("chrome"), "{text}");
+        let back: ColorScheme = aterm_json::from_str(&text).expect("reads back");
+        assert_eq!(back, plain);
+        let mut authored = plain;
+        authored.chrome.accent = Some(Rgb::new(0x7a, 0xa2, 0xf7));
+        let text = aterm_json::to_string(&authored).expect("serializes");
+        assert!(text.contains("\"chrome\""), "{text}");
+        let back: ColorScheme = aterm_json::from_str(&text).expect("reads back");
+        assert_eq!(back, authored);
     }
 }

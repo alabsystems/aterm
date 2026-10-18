@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 of `TrickFlashLifecycle` (`aterm_spec::derive::trick_flash_lifecycle_model`):
+//! Tier-1 of `TrickFlashLifecycle` (`aterm_models_effects::trick_flash_lifecycle_model`):
 //! the real `WordDecorations` over a real terminal, driven the way the split
 //! host drives it, its `trick_flash_phase` checked against the model after
 //! every call. A call the model names no step for (a bind between panes, a
@@ -13,10 +13,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::word_decorations::{DecoConfig, TrickFlashPhase, WordDecorations};
 use aterm_core::terminal::Terminal;
-use aterm_effects::word_decorations::{DecoConfig, TrickFlashPhase, WordDecorations};
 use aterm_lexicon::Lexicon;
-use aterm_spec::derive::{Model, trick_flash_lifecycle_model};
+use aterm_models_effects::trick_flash_lifecycle_model;
+use aterm_spec::derive::Model;
 use aterm_spec::{interp, verify, xref};
 use aterm_time::Instant;
 

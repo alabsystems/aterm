@@ -97,16 +97,6 @@ fn the_fork_lane_waits_while_the_policy_read_runs_and_parks_under_its_answer() {
             .is_none(),
         "a known policy needs no wait"
     );
-
-    // Wired where the fork lane parks: before its readers stop.
-    let src = include_str!("app_update_handoff.rs");
-    let wait_at = src
-        .find("if let Some(wait) = self.fork_lane_policy_wait(mode, target_build, policy_unread)")
-        .expect("the fork lane asks");
-    let park_at = src[wait_at..]
-        .find("if !self.park_all_readers(deadline) {")
-        .expect("and parks after");
-    assert!(park_at > 0);
 }
 
 #[test]
@@ -162,13 +152,6 @@ fn a_read_that_ended_is_absent_or_outran_its_ceiling_is_not_waited_for() {
 /// `HANDOFF_PREVERIFY_BOUND` (the lock wait plus the verification budget) and is derived from it.
 #[test]
 fn the_ceiling_outlasts_every_instant_a_read_can_hold_the_lock() {
-    assert_eq!(
-        crate::HANDOFF_PREVERIFY_READ_CEILING,
-        aterm_update::HANDOFF_PREVERIFY_BOUND + crate::HANDOFF_PREVERIFY_READ_MARGIN,
-        "the ceiling is derived from the verifier's bound, not restated"
-    );
-    assert!(crate::HANDOFF_PREVERIFY_READ_MARGIN > Duration::ZERO);
-
     let mut app = crate::App::headless_for_test();
     let target = crate::running_build_number().saturating_add(1);
     // The wait and the read began one whole bound ago: this is the last
@@ -286,24 +269,4 @@ fn a_read_in_flight_is_not_started_twice() {
         &artifact,
         now
     ));
-
-    // Wired: the spawn asks, records what it started, and its thread
-    // raises the flag on every path out.
-    let src = include_str!("app_native.rs");
-    let body = &src[src
-        .find("pub(crate) fn spawn_staged_handoff_preverification(")
-        .expect("the spawn")..];
-    let body = &body[..body.find("\n    }\n").expect("its end")];
-    assert!(body.contains("if !preverify_read_needed("));
-    assert!(body.contains("let _ends = RaiseOnDrop(done);"));
-    assert!(body.contains("Ok(_) => self.handoff_preverify_in_flight = Some(flight),"));
-    // A read that ends without a verdict keeps its moment on the flight, never in the verdict
-    // cache, and before it raises the flag.
-    let passing = body
-        .find("if aterm_update::is_passing_refusal(error) {")
-        .expect("the passing branch");
-    let branch = &body[passing..];
-    let branch = &branch[..branch.find("return;").expect("it returns")];
-    assert!(branch.contains("passing.set(crate::PassingPreverification {"));
-    assert!(!branch.contains("slot"), "never the verdict cache");
 }

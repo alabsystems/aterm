@@ -61,8 +61,6 @@ const SYNC_END: &str = "\x1b[?2026l";
 /// wraps.
 const LINE1: &str =
     "HEY!!! [Image #1] in the other tab in aterm, I got this confirmation message. AUDIT";
-/// The keys after the wrap, typed on the continuation row.
-const AFTER: &str = " ATERM claude code h";
 
 /// Rainbow kitty at intensity 0.70 on the default dark theme (fg `0xD0D0D0`, bg `0x111318`).
 fn cfg() -> GlowConfig {
@@ -625,51 +623,6 @@ fn the_followed_row_flows_into_the_fold_and_is_dark_by_the_flows_end() {
         dark >= FLOW_TOTAL_S - FLOW_TAIL_S,
         "…and not before the flow's last breath (its body thins out of the row's centre only \
          then): dark at {dark}"
-    );
-}
-
-/// The new row's walk has no step: after the wrap and a few more keys, the continuation row's
-/// cells (relaid `WH`, reused `Y`, later keys) carry a `t` monotone at the old row's pace
-/// ([`WALK_LAY_RATE`] a step), and the relaid word's first cell keeps its old-row `t`.
-#[test]
-fn the_new_rows_cells_carry_a_monotone_walk_and_the_relaid_word_keeps_the_t_it_had() {
-    let (mut h, _, _, t_w) = typed_to_the_wrap();
-    h.wrap(LINE1);
-    h.next_frame();
-    h.type_str(AFTER);
-    h.next_frame();
-    h.idle(100);
-    let rib = h.ribbon();
-    let last = 4 + AFTER.len() as u16;
-    let ts: Vec<(u16, f32)> = (2..=last)
-        .map(|col| {
-            let t = rib.field_at(OLD_ROW, col).unwrap_or_else(|| {
-                panic!(
-                    "column {col} of the new row is laid: {:?}",
-                    h.cells(OLD_ROW)
-                )
-            });
-            (col, t)
-        })
-        .collect();
-    for w in ts.windows(2) {
-        let (c0, t0) = w[0];
-        let (c1, t1) = w[1];
-        assert!(
-            t1 >= t0 - 1e-5,
-            "a backward step from {t0} at column {c0} to {t1} at column {c1}: {ts:?}"
-        );
-        assert!(
-            (t1 - t0 - WALK_LAY_RATE).abs() < 1e-4,
-            "a step off the walk's pace from {t0} at column {c0} to {t1} at column {c1} — \
-             the old row laid at WALK_LAY_RATE: {ts:?}"
-        );
-    }
-    let (_, t_first) = ts[0];
-    assert!(
-        (t_first - t_w).abs() < 1e-5,
-        "the relaid word's first cell has exactly the t its column had on the old row: \
-         {t_first} against {t_w}: {ts:?}"
     );
 }
 

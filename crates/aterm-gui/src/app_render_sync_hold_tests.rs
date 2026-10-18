@@ -202,7 +202,7 @@ fn closed_bracket_presents_even_while_level_stays_true() {
 /// negative controls.
 #[test]
 fn sync_reopen_visibility_model_conforms_to_terminal_and_gui_hold() {
-    let model = aterm_spec::derive::sync_reopen_visibility_model();
+    let model = aterm_models_effects::sync_reopen_visibility_model();
     let timeout = Duration::from_millis(150);
     let t0 = Instant::now();
     let d = |ms| t0 + Duration::from_millis(ms);
@@ -424,7 +424,7 @@ fn composed_hold_releases_only_after_every_real_pane_releases() {
     let wid = WindowId(0);
     let t0 = Instant::now();
     let timeout = Duration::from_millis(150);
-    let model = aterm_spec::derive::composed_sync_hold_model();
+    let model = aterm_models_effects::composed_sync_hold_model();
 
     let held = update_sync_frame_holds(
         app.windows.get_mut(&wid).expect("test window"),

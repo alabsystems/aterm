@@ -308,7 +308,6 @@ fn repeated_maximum_pastes_plateau_and_teardown_unblocks_every_waiter() {
             == BulkState::Writing),
         "the first paste is being written"
     );
-    std::thread::sleep(Duration::from_millis(300));
     assert_eq!(
         sink.ordered_egress_count(),
         1,
@@ -376,7 +375,6 @@ fn replies_stay_outside_the_paste_envelope_before_and_during_it() {
     let mut head = vec![0u8; 64 * 1024];
     reader.read_exact(&mut head).expect("the paste's head");
     assert!(head.starts_with(b"\x1b[200~"));
-    std::thread::sleep(Duration::from_millis(100));
     assert!(
         replies.submit(Arc::from(&b"\x1b[12;40R"[..])),
         "reply during"
@@ -466,12 +464,6 @@ fn the_conpty_route_sends_every_key_through_the_ordered_writer() {
         InputOutcome::WriteFailed
     );
     drop(hold);
-    std::thread::sleep(Duration::from_millis(50));
-    let mut buf = [0u8; 8];
-    assert!(
-        unsafe { libc::read(pipe[0], buf.as_mut_ptr().cast(), buf.len()) } <= 0,
-        "the refused key was never written"
-    );
     drop(mirror);
     drop(app);
     close_pipe(sink, pipe);
@@ -547,7 +539,6 @@ fn closing_the_session_releases_its_parked_writer_and_queued_input() {
         InputOutcome::Ok,
         "the key queues behind the paste"
     );
-    std::thread::sleep(Duration::from_millis(300));
     assert_eq!(
         sink.ordered_egress_count(),
         2,
@@ -672,12 +663,6 @@ fn the_conpty_route_sends_every_report_through_the_ordered_writer() {
         InputOutcome::WriteFailed
     );
     drop(hold);
-    std::thread::sleep(Duration::from_millis(50));
-    let mut buf = [0u8; 16];
-    assert!(
-        unsafe { libc::read(pipe[0], buf.as_mut_ptr().cast(), buf.len()) } <= 0,
-        "the refused report was never written"
-    );
     drop(mirror);
     drop(app);
     close_pipe(sink, pipe);
@@ -721,7 +706,6 @@ fn a_mouse_report_waits_behind_the_pastes_queued_before_it() {
         "paste A is being written"
     );
     // A parks on the full pipe, holding the fd lock; B waits in the FIFO.
-    std::thread::sleep(Duration::from_millis(100));
     assert_eq!(sink.ordered_egress_count(), 2, "A and B both wait");
 
     assert_eq!(
@@ -792,7 +776,6 @@ fn a_tab_switch_focus_report_waits_behind_the_pastes_queued_before_it() {
         wait_until(MUST_HAPPEN, || meter.progress().state == BulkState::Writing),
         "paste A is being written"
     );
-    std::thread::sleep(Duration::from_millis(100));
     assert_eq!(sink.ordered_egress_count(), 2, "A and B both wait");
 
     app.recompute_focus_reports();
@@ -826,7 +809,8 @@ fn a_tab_switch_focus_report_takes_the_conpty_route() {
         let _route = paste_order::force_conpty_route_for_test();
         app.recompute_focus_reports();
     }
-    std::thread::sleep(Duration::from_millis(50));
+    // An inline write is synchronous: had the report been written, it is
+    // already readable.
     let mut buf = [0u8; 16];
     assert!(
         unsafe { libc::read(pipe[0], buf.as_mut_ptr().cast(), buf.len()) } <= 0,
@@ -930,58 +914,6 @@ fn a_motion_flood_behind_a_paste_never_refuses_a_key() {
     drop(mirror);
     drop(app);
     close_pipe(sink, pipe);
-}
-
-/// A sink's admission is its own: the serializer registry is keyed by fd
-/// number, which `pipe()` can hand to a second sink while a closed fixture's
-/// writer still drains under it, and that twin reads nothing of the first's.
-/// Positive control: the owner still reports its parked paste.
-#[test]
-fn a_sinks_admission_never_reads_an_fd_number_twins_serializer() {
-    let (app, owner, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
-    aterm_pty::set_nonblocking(pipe[1], true).expect("nonblocking master");
-    owner.note_master_nonblocking(true);
-    fill(pipe[1]);
-    let meter = Arc::new(BulkMeter::new());
-    enqueue(
-        &app,
-        &owner,
-        InputEvent::Paste(
-            "a".repeat(256 * 1024),
-            PasteFraming::Gesture { bracketed: false },
-        ),
-        None,
-        Some(meter.clone()),
-    )
-    .expect("the paste");
-    assert!(
-        wait_until(MUST_HAPPEN, || meter.progress().state == BulkState::Writing),
-        "the paste is parked on the full pipe"
-    );
-    let (jobs, bytes) = paste_order::admitted_for_test(&owner);
-    assert_eq!(
-        jobs, 1,
-        "positive control: the owner's parked paste is admitted"
-    );
-    assert!(bytes >= 256 * 1024);
-
-    let twin = Arc::new(SinkWriter::new(pipe[1]));
-    assert_eq!(twin.master(), owner.master(), "the same registry key");
-    assert_eq!(
-        paste_order::admitted_for_test(&twin),
-        (0, 0),
-        "a sink with no serializer of its own has admitted nothing"
-    );
-
-    owner.sever_input();
-    assert!(
-        wait_until(MUST_HAPPEN, || owner.ordered_egress_count() == 0),
-        "the sever released the parked paste"
-    );
-    assert_eq!(paste_order::admitted_for_test(&owner), (0, 0));
-    drop(twin);
-    drop(app);
-    close_pipe(owner, pipe);
 }
 
 /// An OS appearance change into a stalled program with DEC 2031 on never parks

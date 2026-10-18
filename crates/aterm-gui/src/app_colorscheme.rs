@@ -10,15 +10,19 @@
 //! only in the [`ThemeChange`] they name.
 //!
 //! What the engine REPORTS to programs (DEC private mode 2031 and DSR
-//! `CSI ? 996 n` → `CSI ? 997 ; Ps n`) is the appearance of the palette on
-//! screen, [`ResolvedColors::reported`]: `theme = "GitHub Light"` on a dark
-//! desktop reports light. The OS appearance only picks the side of a
-//! `dark:…,light:…` split. When mode 2031 is set and the reported scheme
-//! CHANGES, `set_color_scheme` queues an unsolicited `CSI ? 997 ; Ps n`; it is
-//! drained in the same critical section that applied the new palette and sent by
-//! the route every UI-thread report takes (`app_input::write_ui_report`: queued
-//! behind earlier input, never a write that can park the event loop), so a
-//! program that re-queries OSC 10/11 on the push reads the new colours.
+//! `CSI ? 996 n` → `CSI ? 997 ; Ps n`) is owned by the engine: the background
+//! on screen. The install hands it the baseline inside the projection
+//! (`TerminalConfig::color_scheme`, the configured palette's appearance,
+//! [`ResolvedColors::reported`]): `theme = "GitHub Light"` on a dark desktop
+//! reports light. The OS appearance only picks the side of a
+//! `dark:…,light:…` split. A program's own OSC 11 background outranks the
+//! baseline while it holds (`Terminal::color_scheme`). When mode 2031 is set
+//! and the reported scheme CHANGES, the same `apply_config` that lands the
+//! palette queues an unsolicited `CSI ? 997 ; Ps n`
+//! (`ConfigChange::ColorScheme`); it is drained in that critical section and
+//! sent by the route every UI-thread report takes (`app_input::write_ui_report`:
+//! queued behind earlier input, never a write that can park the event loop), so
+//! a program that re-queries OSC 10/11 on the push reads the new colours.
 //!
 //! The OS appearance comes from [`crate::os_appearance`], a source independent
 //! of any window's chrome: macOS observes the application's
@@ -30,7 +34,21 @@
 //! [`Config::resolved_colors`]: crate::app_config::Config::resolved_colors
 //! [`ResolvedColors::reported`]: crate::resolved_colors::ResolvedColors::reported
 
-use crate::{App, WindowId, term_lock};
+use crate::{App, WindowId};
+
+/// The `scheme_from=` word of a session's `status`: `theme` while the reported
+/// scheme is the theme's baseline, `program` while the session's program holds
+/// its own background (OSC 11), `-` when the engine could not be read.
+pub(crate) fn scheme_from_word(
+    source: Option<aterm_core::terminal::ColorSchemeSource>,
+) -> &'static str {
+    use aterm_core::terminal::ColorSchemeSource;
+    match source {
+        Some(ColorSchemeSource::Configured) => "theme",
+        Some(ColorSchemeSource::Program) => "program",
+        None => "-",
+    }
+}
 
 /// Map a winit window [`Theme`](winit::window::Theme) onto the engine's
 /// [`Appearance`](aterm_types::Appearance).
@@ -91,6 +109,18 @@ impl ThemeChange {
         }
     }
 
+    /// One reason for two triggers folded into one install (a held colour
+    /// swap and the generation that releases it): a config reload dominates,
+    /// since it ends previews the others keep; otherwise the earlier one.
+    pub(crate) fn merged(self, other: Option<Self>) -> Self {
+        match other {
+            None => self,
+            Some(Self::ConfigReload) => Self::ConfigReload,
+            Some(_) if self == Self::ConfigReload => Self::ConfigReload,
+            Some(other) => other,
+        }
+    }
+
     /// Whether this install reloads what a selector draws, so a kept preview
     /// must be re-checked against the new config and catalog.
     const fn reloads(self) -> bool {
@@ -107,6 +137,10 @@ pub(crate) struct ThemeInstall {
     /// The renderer [`Theme`](aterm_render::Theme) differed, so it went
     /// through [`App::apply_theme_live`].
     pub(crate) theme_changed: bool,
+    /// The authored chrome colours (`accent_color` and its kin, theme or
+    /// config) differed, so every chrome surface was invalidated to re-derive
+    /// its tokens.
+    pub(crate) chrome_changed: bool,
 }
 
 impl App {
@@ -130,13 +164,20 @@ impl App {
     ///
     /// 1. the engine projection, onto every session and the session factory,
     ///    skipped when it equals the installed one (an unrelated edit or an
-    ///    unused theme file costs no `apply_config`);
-    /// 2. in the SAME per-session critical section, the reported scheme
-    ///    ([`ResolvedColors::reported`](crate::resolved_colors::ResolvedColors)):
-    ///    DSR 996 / mode 2031 describe the palette on screen, not the OS. The
-    ///    `CSI ? 997 ; Ps n` push it queues is drained only after the palette
-    ///    is in, so a program that answers it with an OSC 10/11 query reads
-    ///    the new colours;
+    ///    unused theme file costs no `apply_config`). It carries the scheme
+    ///    baseline ([`ResolvedColors::reported`](crate::resolved_colors::ResolvedColors)),
+    ///    so the colours and the baseline land in one `apply_config`. A session
+    ///    that draws a theme of its own ([`crate::session_theme`]) gets ITS
+    ///    projection instead, applied only when that moved, and one that just
+    ///    left its own theme is re-based on the instance's;
+    /// 2. in the SAME per-session critical section, the `CSI ? 997 ; Ps n`
+    ///    push that `apply_config` queued when the session's reported scheme
+    ///    moved (`ConfigChange::ColorScheme`) and its program set mode 2031.
+    ///    DSR 996 / mode 2031 describe the background on screen, not the OS: a
+    ///    session whose program holds its own background is not told about a
+    ///    theme change that leaves that background alone. The push is drained
+    ///    only after the palette is in, so a program that answers it with an
+    ///    OSC 10/11 query reads the new colours;
     /// 3. the renderer theme, through [`Self::apply_theme_live`] when it
     ///    changed, and the selected-text foreground knob;
     /// 4. every colour-derived cache, invalidated here and nowhere else.
@@ -152,64 +193,55 @@ impl App {
         reason: ThemeChange,
     ) -> ThemeInstall {
         self.settle_theme_preview(reason);
-        let tc = self.config.applied_terminal_config_from(&colors);
-        let engine_changed = self.session_factory.terminal_config.as_ref() != Some(&tc);
+        let tc = std::sync::Arc::new(self.config.applied_terminal_config_from(&colors));
+        let engine_changed = self.session_factory.terminal_config.as_ref() != Some(tc.as_ref());
         let reported = colors.reported;
-        for session in self.pool.iter() {
-            let push = {
-                let mut term = term_lock(&session.term);
-                if engine_changed {
-                    term.apply_config(&tc);
-                }
-                let scheme_changed = term.color_scheme() != reported;
-                term.set_color_scheme(reported);
-                // The unsolicited `CSI ? 997 ; Ps n` is queued only when the
-                // scheme moved AND the program enabled mode 2031; take nothing
-                // otherwise, so a pending reply the reader owns stays put.
-                if scheme_changed {
-                    term.take_response()
-                } else {
-                    None
-                }
-            };
-            if let Some(push) = push {
-                // The route every report takes (`write_ui_report`): the UI thread
-                // only enqueues it behind earlier input, or writes it through the
-                // egress that never parks — never the blocking write, which would
-                // park this thread (and every window) on a program that has
-                // stopped reading, at the spill cap or on a parked paste's fd
-                // lock (2026-09-26). A refusal (a full queue) or a closed PTY
-                // just drops the report: it is advisory.
-                crate::app_input::write_ui_report(
-                    &session.term,
-                    &session.ctx.modes,
-                    &session.ctx.sink,
-                    &crate::input::InputEvent::KeySequence(push),
-                );
-            }
-        }
+        // A warm spare's rc may have read the old colours (OSC 10/11): it goes.
         if engine_changed {
-            self.session_factory.terminal_config = Some(tc);
+            self.spare_colors_changed();
+        }
+        // Every session, in one plan made before any terminal lock: a session
+        // drawing the instance's theme gets `tc` when it moved, one drawing its
+        // own ([`crate::session_theme`]) gets that when IT moved. Each apply and
+        // its DEC 2031 push share the session's critical section.
+        let own_applies = self.install_session_fanout(&tc, engine_changed);
+        if engine_changed {
+            self.session_factory.terminal_config = Some(std::sync::Arc::unwrap_or_clone(tc));
             self.engine_color_fanouts = self.engine_color_fanouts.saturating_add(1);
         }
-        // A tab or split spawned from here on starts at the same reported
-        // scheme (`spawn::new_live_terminal`).
-        self.session_factory.appearance = reported;
 
         let theme = colors.theme();
         let theme_changed = theme != self.theme;
-        if theme_changed {
-            self.apply_theme_live(theme);
-        }
+        let chrome_changed = colors.scheme.chrome != self.installed_colors.scheme.chrome;
+        // The tokens borrow the palette's hues (a grey-cursor theme's accent is
+        // its ANSI blue or cyan).
+        let hues_changed = colors.scheme.ansi != self.installed_colors.scheme.ansi;
         // A theme file's `selection_foreground` reaches the renderer knob too,
         // not only the engine.
         let selection_fg = colors.selection_fg().map(crate::app_config::rgb_u32);
+        let (id, side) = (colors.id.clone(), colors.side);
+        // Installed before the theme goes live, so every chrome surface the
+        // repaint derives reads this resolution's authored chrome.
+        self.installed_colors = colors;
+        if theme_changed {
+            self.apply_theme_live(theme);
+        } else if chrome_changed || hues_changed {
+            // Only the chrome or the palette moved (a grey-cursor theme's accent
+            // is its ANSI blue or cyan): the theme-keyed caches (the strip rows,
+            // the raster caches, the present gate) would keep the old tokens, so
+            // drop them and re-pin the native strip. The composed frame's
+            // retention compares its seam cell, so a new divider rebuilds it
+            // unasked.
+            self.publish_theme_chrome();
+            self.rain_dirty = true;
+            self.introspect_gpu.invalidate_present();
+        }
         if self.render_knobs.selection_fg != selection_fg {
             self.render_knobs.selection_fg = selection_fg;
             self.apply_render_knob(crate::app_config::KnobChange::SelectionFg(selection_fg));
         }
 
-        if engine_changed || theme_changed {
+        if engine_changed || theme_changed || own_applies > 0 {
             // Sparkle and rain read the palette; a resident pet keeps its place
             // but retires its contrast sample.
             self.sparkle_dirty = true;
@@ -218,20 +250,18 @@ impl App {
                 ws.fx.companion_mut().invalidate_colors();
             }
         }
-        if engine_changed && !theme_changed {
+        if (engine_changed || own_applies > 0) && !theme_changed {
             // Cells re-coloured under an unchanged chrome: each window's repaint
             // key keeps an untouched presentation cheap.
             self.request_redraw_all_windows();
         }
         aterm_log::debug!(
-            "theme install ({reason:?}): {} side={:?} reported={reported:?} engine_changed={engine_changed} theme_changed={theme_changed}",
-            colors.id,
-            colors.side,
+            "theme install ({reason:?}): {id} side={side:?} reported={reported:?} engine_changed={engine_changed} theme_changed={theme_changed} chrome_changed={chrome_changed} session_applies={own_applies}",
         );
-        self.installed_colors = colors;
         ThemeInstall {
             engine_changed,
             theme_changed,
+            chrome_changed,
         }
     }
 
@@ -259,7 +289,10 @@ impl App {
     /// appearance is unchanged. Re-resolves from the retained live
     /// [`Config`](crate::Config) and the admitted theme catalog (no disk read),
     /// and a changed chrome goes through the colour-only
-    /// [`Self::apply_theme_live`]: the backend is never rebuilt here.
+    /// [`Self::apply_theme_live`]: the backend is never rebuilt here. When the
+    /// new side's theme draws a different face, the face is prepared on the
+    /// font worker (`App::request_theme_typography_refresh`) and installed with
+    /// its colours by `rebuild_backend_with_prepared` through the config apply.
     ///
     /// Callers are [`Self::on_os_appearance`] (the platform observer and the
     /// `appearance` control verb), window attach, and on Windows the window's
@@ -312,6 +345,14 @@ impl App {
         }
         self.os_appearance = appearance;
 
+        // A side whose theme names a different face (split typography) is
+        // prepared on the font worker and lands with its colours through the
+        // config apply; the colour swap is held until then, so the old face
+        // never draws in the new colours. Otherwise, or when the worker cannot
+        // take the request, the colours install now.
+        if self.request_theme_typography_refresh(ThemeChange::OsFlip) {
+            return;
+        }
         // The OS appearance only picks the side of a split `theme`; what is
         // reported to programs is the palette that side draws.
         let installed = self.install_resolved_colors(ThemeChange::OsFlip);
@@ -334,14 +375,13 @@ impl App {
     }
 
     /// The `theme_side=` word: the side the OS appearance picked of a `theme`
-    /// that follows it — a `dark:…,light:…` pair, or an unset (or nameless)
-    /// `theme`, which draws [`crate::app_config::UNSET_THEME`]'s sides — and
-    /// `-` for a single named theme (which no appearance moves).
+    /// that follows it (a `dark:…,light:…` pair that names a theme), and `-`
+    /// for a single theme or none (Default), which no appearance moves.
     pub(crate) fn theme_side_word(&self) -> &'static str {
         use aterm_types::scheme::ThemeSelector;
         let (selector, _) = ThemeSelector::parse(self.config.theme.as_deref().unwrap_or(""));
         let follows = matches!(selector, ThemeSelector::Split { .. })
-            || selector.name_for(aterm_types::Appearance::Dark).is_none();
+            && selector.name_for(aterm_types::Appearance::Dark).is_some();
         if follows {
             crate::os_appearance::appearance_word(self.installed_colors.side)
         } else {
@@ -349,17 +389,23 @@ impl App {
         }
     }
 
-    /// `os_appearance= theme_side= reported_scheme= bg_dark=`, the appearance
-    /// fields of a session's `status`: the OS reading and the split side are the
-    /// instance's; `reported` (what DSR 996 / mode 2031 answer) and `bg` (the
-    /// engine's default background) are the session's own, read by the caller
-    /// under its terminal guard. `-` for a value the caller could not read.
+    /// `os_appearance= theme_side= reported_scheme= [scheme_from=] bg_dark=`,
+    /// the appearance fields of a session's `status`: the OS reading and the
+    /// split side are the instance's; `reported` (what DSR 996 / mode 2031
+    /// answer), `scheme_from` ([`scheme_from_word`]: whether that is the
+    /// theme's baseline or the background the session's program set) and `bg`
+    /// (the engine's default background) are the session's own, read by the
+    /// caller under its terminal guard. `-` for a value the caller could not
+    /// read; `scheme_from: None` omits the field (the `appearance` verb, which
+    /// describes the theme, not a session).
     pub(crate) fn appearance_status_fields(
         &self,
         reported: Option<aterm_types::Appearance>,
+        scheme_from: Option<&str>,
         bg: Option<aterm_types::Rgb>,
     ) -> String {
         let reported = reported.map_or("-", crate::os_appearance::appearance_word);
+        let scheme_from = scheme_from.map_or_else(String::new, |w| format!(" scheme_from={w}"));
         let bg_dark = bg.map_or("-", |bg| {
             if aterm_messages::ink::bg_is_light([bg.r, bg.g, bg.b]) {
                 "0"
@@ -368,7 +414,7 @@ impl App {
             }
         });
         format!(
-            "os_appearance={} theme_side={} reported_scheme={reported} bg_dark={bg_dark}",
+            "os_appearance={} theme_side={} reported_scheme={reported}{scheme_from} bg_dark={bg_dark}",
             crate::os_appearance::appearance_word(self.os_appearance),
             self.theme_side_word(),
         )
@@ -382,16 +428,18 @@ impl App {
     pub(crate) fn appearance_status_line(&self) -> String {
         let fields = self.appearance_status_fields(
             Some(self.installed_colors.reported),
+            None,
             Some(self.installed_colors.scheme.background),
         );
         let mut fields = fields.splitn(2, ' ');
         let os = fields.next().unwrap_or_default();
         let rest = fields.next().unwrap_or_default();
         format!(
-            "{os} source={} {rest} theme={} installs={}",
+            "{os} source={} {rest} theme={} installs={} session_installs={}",
             self.os_appearance_source.wire_name(),
             aterm_control::wire::pct_encode(&self.installed_colors.id),
             self.engine_color_fanouts,
+            self.session_color_installs,
         )
     }
 
@@ -467,24 +515,34 @@ mod tests {
         );
     }
 
+    /// The scheme baseline the session factory's projection carries.
+    fn factory_scheme(app: &crate::App) -> Appearance {
+        app.session_factory
+            .terminal_config
+            .as_ref()
+            .and_then(|tc| tc.color_scheme)
+            .unwrap_or_default()
+    }
+
     /// BROKEN-2 — an OS light/dark flip that moves the palette's appearance
-    /// updates the SESSION FACTORY's reported scheme, so a tab/split spawned AFTER
-    /// the flip starts at it (its engine is built with
-    /// `set_color_scheme(factory.appearance)`). A plain dark theme keeps reporting
-    /// dark on a light OS: the factory follows the palette, not the OS.
+    /// updates the SESSION FACTORY's scheme baseline, so a tab/split spawned AFTER
+    /// the flip starts at it (its engine is built from the factory's
+    /// `terminal_config`, whose `color_scheme` it carries). A plain dark theme
+    /// keeps reporting dark on a light OS: the factory follows the palette, not
+    /// the OS.
     #[test]
     fn os_flip_updates_the_session_factory_appearance() {
         let mut app = crate::App::headless_for_test();
         app.config = aterm_toml::from_str(r#"theme = "dark:Dracula,light:GitHub Light""#)
             .expect("split theme");
         assert_eq!(
-            app.session_factory.appearance,
+            factory_scheme(&app),
             Appearance::Dark,
             "the factory is seeded to the engine default"
         );
         app.sync_app_theme_to_appearance(Appearance::Light);
         assert_eq!(
-            app.session_factory.appearance,
+            factory_scheme(&app),
             Appearance::Light,
             "BROKEN-2: the factory tracks the light side the OS picked"
         );
@@ -493,7 +551,7 @@ mod tests {
         plain.config = aterm_toml::from_str(r#"theme = "Dracula""#).expect("plain theme");
         plain.sync_app_theme_to_appearance(Appearance::Light);
         assert_eq!(
-            plain.session_factory.appearance,
+            factory_scheme(&plain),
             Appearance::Dark,
             "negative control: a dark theme on a light OS still reports dark"
         );
@@ -521,6 +579,48 @@ pub(crate) mod install_resolved_colors {
     use crate::app_config::{Config, ThemeCatalog};
     use aterm_types::{Appearance, ColorScheme, Rgb};
 
+    /// A CHROME-ONLY EDIT REPAINTS: re-resolving with only `accent_color`
+    /// changed leaves the renderer theme alone but reports the chrome change,
+    /// drops every window's strip-row cache, and the new accent is what the
+    /// header's tokens carry. NEGATIVE CONTROL: re-installing the identical
+    /// config reports no chrome change and leaves a seeded cache alone.
+    #[test]
+    fn a_chrome_only_edit_repaints() {
+        let mut app = App::headless_for_test();
+        let wid = crate::WindowId(0);
+        let seed = |app: &mut App| {
+            app.windows.get_mut(&wid).expect("window").last_strip_fp = Some((
+                0xFEED,
+                80,
+                false,
+                None,
+                false,
+                None,
+                crate::tab_bar::VersionSlotCols::NONE,
+                false,
+                crate::tab_bar::CaptionSlot::NONE,
+                None,
+            ));
+        };
+        let install = |app: &mut App, text: &str| {
+            app.config = aterm_toml::from_str(text).expect("valid toml");
+            app.install_resolved_colors(ThemeChange::ConfigReload)
+        };
+        let _ = install(&mut app, "theme = \"Nord\"\n");
+        seed(&mut app);
+        let same = install(&mut app, "theme = \"Nord\"\n");
+        assert!(!same.chrome_changed && !same.theme_changed, "{same:?}");
+        assert!(app.windows[&wid].last_strip_fp.is_some(), "CONTROL: kept");
+        let edited = install(&mut app, "theme = \"Nord\"\naccent_color = \"#ff00aa\"\n");
+        assert!(edited.chrome_changed, "{edited:?}");
+        assert!(!edited.theme_changed, "{edited:?}");
+        assert!(app.windows[&wid].last_strip_fp.is_none(), "strip cache");
+        let header = app
+            .chrome_palette(crate::app_render::ChromeSurface::Header)
+            .tokens();
+        assert_eq!(header.accent, [0xff, 0x00, 0xaa]);
+    }
+
     /// Apply `text` as `aterm.toml` through the real admission path (the
     /// prepared generation a config watcher hands the App).
     pub(crate) fn apply_config_text(app: &mut App, dir: &std::path::Path, text: &str) {
@@ -544,6 +644,7 @@ pub(crate) mod install_resolved_colors {
                 sparkle,
                 fonts: None,
                 font_refusals: Vec::new(),
+                reason: crate::app_colorscheme::ThemeChange::ConfigReload,
                 warnings: Vec::new(),
             },
         );
@@ -668,6 +769,95 @@ pub(crate) mod install_resolved_colors {
         assert!(
             drain(fds[0]).is_empty(),
             "an unrelated key change sends no push"
+        );
+        drop(app);
+        unsafe { libc::close(fds[0]) };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A program's own background outranks the theme in what its session
+    /// reports (DSR 996 / mode 2031 / `status`), and a theme switch that leaves
+    /// that background alone tells the program nothing. Its OSC 111 hands the
+    /// report back to the theme, with one push. Negative control: a session
+    /// with no override in the same app follows every theme switch.
+    #[cfg(unix)]
+    #[test]
+    fn a_program_background_outranks_the_theme_until_it_resets() {
+        let dir = scratch_dir("program-bg");
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        assert_eq!(
+            unsafe { libc::fcntl(fds[0], libc::F_SETFL, libc::O_NONBLOCK) },
+            0,
+            "nonblocking read end"
+        );
+        let sink = std::sync::Arc::new(aterm_session::sink::SinkWriter::new(fds[1]));
+        let mut app = App::headless_for_test_with_sink(sink);
+        app.pool.insert(crate::stub_session(1));
+        apply_config_text(&mut app, &dir, "theme = \"Dracula\"\n");
+        let field = |record: &str, key: &str| {
+            record
+                .split_whitespace()
+                .find_map(|kv| Some(kv.strip_prefix(key)?.strip_prefix('=')?.to_string()))
+        };
+        let dsr = |app: &App, id: u64| {
+            let mut term = crate::term_lock(&app.pool.get(id).expect("session").term);
+            term.process(b"\x1b[?996n");
+            term.take_response().expect("DSR 996 answers")
+        };
+        let process = |app: &App, bytes: &[u8]| {
+            let mut term = crate::term_lock(&app.pool.get(0).expect("session 0").term);
+            term.process(bytes);
+            term.take_response()
+        };
+
+        assert_eq!(process(&app, b"\x1b[?2031h"), None);
+        assert_eq!(
+            process(&app, b"\x1b]11;#ffffff\x07").as_deref(),
+            Some(&b"\x1b[?997;2n"[..]),
+            "the reader drains the push for the program's own light background"
+        );
+        assert_eq!(dsr(&app, 0), b"\x1b[?997;2n");
+        let record = app.session_status_record(0).expect("status");
+        assert_eq!(
+            field(&record, "reported_scheme").as_deref(),
+            Some("light"),
+            "{record}"
+        );
+        assert_eq!(
+            field(&record, "scheme_from").as_deref(),
+            Some("program"),
+            "{record}"
+        );
+        assert_eq!(field(&record, "bg_dark").as_deref(), Some("0"), "{record}");
+
+        apply_config_text(&mut app, &dir, "theme = \"Solarized Light\"\n");
+        assert!(drain(fds[0]).is_empty(), "the program's view is unchanged");
+        assert_eq!(
+            dsr(&app, 1),
+            b"\x1b[?997;2n",
+            "negative control: a session without an override follows the theme"
+        );
+        apply_config_text(&mut app, &dir, "theme = \"Dracula\"\n");
+        assert!(drain(fds[0]).is_empty(), "nor back to a dark theme");
+        assert_eq!(dsr(&app, 0), b"\x1b[?997;2n");
+        assert_eq!(dsr(&app, 1), b"\x1b[?997;1n");
+
+        assert_eq!(
+            process(&app, b"\x1b]111\x07").as_deref(),
+            Some(&b"\x1b[?997;1n"[..]),
+            "OSC 111 lands on Dracula's baseline, with one push"
+        );
+        let record = app.session_status_record(0).expect("status");
+        assert_eq!(
+            field(&record, "reported_scheme").as_deref(),
+            Some("dark"),
+            "{record}"
+        );
+        assert_eq!(
+            field(&record, "scheme_from").as_deref(),
+            Some("theme"),
+            "{record}"
         );
         drop(app);
         unsafe { libc::close(fds[0]) };
@@ -918,8 +1108,14 @@ mod appearance_source {
         assert_eq!(field(&record, "os_appearance"), Some("light"), "{record}");
         assert_eq!(field(&record, "theme_side"), Some("light"), "{record}");
         assert_eq!(field(&record, "reported_scheme"), Some("light"), "{record}");
+        assert_eq!(field(&record, "scheme_from"), Some("theme"), "{record}");
         assert_eq!(field(&record, "bg_dark"), Some("0"), "{record}");
         let line = app.appearance_status_line();
+        assert_eq!(
+            field(&line, "scheme_from"),
+            None,
+            "the appearance line describes the theme, not a session: {line}"
+        );
         assert_eq!(field(&line, "os_appearance"), Some("light"), "{line}");
         assert_eq!(field(&line, "source"), Some("inert"), "{line}");
         assert_eq!(field(&line, "theme_side"), Some("light"), "{line}");
@@ -942,13 +1138,13 @@ mod appearance_source {
         );
         assert_eq!(field(&record, "bg_dark"), Some("1"), "{record}");
 
-        // An unset theme follows the OS like a pair: on a light OS it draws
-        // and names the light side.
+        // An unset theme is Default, one theme: on a light OS it has no side
+        // and reports dark.
         app.config = crate::app_config::Config::default();
         app.install_resolved_colors(super::ThemeChange::ConfigReload);
         let record = app.session_status_record(0).expect("status");
-        assert_eq!(app.installed_colors.id, "Default Light");
-        assert_eq!(field(&record, "theme_side"), Some("light"), "{record}");
-        assert_eq!(field(&record, "reported_scheme"), Some("light"), "{record}");
+        assert_eq!(app.installed_colors.id, "Default");
+        assert_eq!(field(&record, "theme_side"), Some("-"), "{record}");
+        assert_eq!(field(&record, "reported_scheme"), Some("dark"), "{record}");
     }
 }

@@ -1,0 +1,17 @@
+# muse 1.4.9-R6297.1 · MEASURED 2026-10-16, `aterm ctl text --json` of a private headless aterm 120x40 (aterm 0.105.0 80b670745), the atpkg-managed muse (Meta latest) launched through its shim with a scratch HOME, `--base-url` at a local scripted stand-in for Meta's Responses endpoint (`--model fake-1`, a dummy META_API_KEY: no login and no model; the stand-in returns the tool call that raises the box, the box is muse's own), harness off · the model's `request_user_input` (one single-select question, cleared screen): the tool row `◆ Request user input Colour — running (2s)` (its text shimmers; the diamond cycles ◇◈◆), the question `  Which colour should the marker file be?` (bold ccd3db), `  ⟩ 1. Red (Recommended)  The usual colour` focused (bold 5aa0ff, the description 656a70), `    2. Blue …`, `    3. None of the above  Optionally, add details in notes (tab).` (muse's own), the key row `  Enter to select · ↑/↓ to move · Tab for an optional note · Esc to interrupt` (8a9098), then the composer, which stays on the screen dimmed (676c74); cursor hidden; a digit only moves the focus, Enter answers, Esc interrupts the turn · cursor=2,27 (hidden) · scratch path redacted at equal length
+❯ ASK me something
+
+◆ Request user input Colour — running (2s)
+
+  Which colour should the marker file be?
+
+  ⟩ 1. Red (Recommended)  The usual colour
+    2. Blue               A calmer colour
+    3. None of the above  Optionally, add details in notes (tab).
+
+  Enter to select · ↑/↓ to move · Tab for an optional note · Esc to interrupt
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  fake-1 · high · /private/tmp/at.XXXXXX/mwork · Auto-review

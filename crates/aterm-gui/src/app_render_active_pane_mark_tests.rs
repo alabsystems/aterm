@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-use super::{
-    ActivePaneEdge, ActivePaneMark, active_pane_edge_cell, divider_cell, fill_divider_grid,
-};
+use super::{ActivePaneMark, divider_cell, fill_divider_grid};
 use aterm_render::{RenderInput, Theme};
 
 /// Every cell of a composed frame that is not the plain divider seam, as `(row, col, glyph)`:
@@ -99,19 +97,6 @@ fn a_pane_with_a_divider_below_and_beside_it_is_inked_on_those_two_sides() {
     );
 }
 
-/// A frame that marks no pane is the plain seam grid.
-#[test]
-fn an_unmarked_composite_is_the_plain_seam_grid() {
-    let theme = Theme::default();
-    let mut dst = RenderInput::empty();
-    fill_divider_grid(&mut dst, 3, 7, theme, None);
-    assert!(
-        stripes(&dst, theme).is_empty(),
-        "no mark, no ink: {:?}",
-        stripes(&dst, theme)
-    );
-}
-
 /// A pane that fills the composite has no divider to mark, so a single-pane (or zoomed)
 /// frame is the plain seam grid even with the mark resolved and the window focused.
 #[test]
@@ -161,34 +146,6 @@ fn the_setting_and_the_windows_own_focus_each_withhold_the_mark() {
     );
 }
 
-/// Each stripe sits on the half of the divider cell facing the pane: a 1-cell divider is
-/// shared by two panes, and only the side the ink is on says which is live.
-#[test]
-fn each_edge_inks_the_side_of_the_divider_cell_that_faces_the_pane() {
-    let theme = Theme::default();
-    let seam = divider_cell(theme);
-    for (edge, ch) in [
-        (ActivePaneEdge::Top, '▁'),
-        (ActivePaneEdge::Bottom, '▔'),
-        (ActivePaneEdge::Left, '▐'),
-        (ActivePaneEdge::Right, '▌'),
-    ] {
-        let cell = active_pane_edge_cell(theme, edge);
-        assert_eq!(cell.ch, ch, "{edge:?} inks the edge touching the pane");
-        assert_eq!(
-            cell.bg, seam.bg,
-            "{edge:?} keeps the seam as its GROUND, so the contrast floor \
-             resolves every side of the ring the same way"
-        );
-        assert_ne!(cell.fg, seam.fg, "{edge:?} has ink to show");
-        assert_eq!(
-            (cell.wide, cell.bold, cell.underline),
-            (seam.wide, seam.bold, seam.underline),
-            "{edge:?} is a divider cell with a glyph, nothing more"
-        );
-    }
-}
-
 /// The RepaintKey term is `0` with no mark (the idle invariant) and moves with the marked
 /// rectangle, so the present early-out never swallows the frame that moves the ring.
 #[test]
@@ -202,4 +159,48 @@ fn the_repaint_key_term_is_zero_for_no_mark_and_moves_with_the_rectangle() {
         ActivePaneMark::key_term(right),
         "focus moving to the sibling pane must reach glass"
     );
+}
+
+/// THE DIVIDER IS THE SEAM TOKEN, AND HIGH CONTRAST'S ONE INK: with no OS
+/// palette the divider is the seam on the terminal background (an authored
+/// border included), and under each stock High Contrast scheme it is
+/// `COLOR_WINDOWTEXT`, the line HC separates surfaces with. NEGATIVE CONTROL:
+/// the same themes without HC are not the window text, and an authored border
+/// moves the divider off the derived seam.
+#[test]
+fn divider_tracks_high_contrast() {
+    use crate::chrome_band::{ChromePalette, hc_fixtures};
+    for name in aterm_types::scheme::builtin_names() {
+        let theme = Theme::from(&aterm_types::scheme::builtin(name).expect("a built-in"));
+        let bg = crate::settings::u32_rgb(theme.bg);
+        let derived = ChromePalette::from(theme).tokens().seam_on(bg);
+        assert_eq!(divider_cell(theme).bg, derived, "{name}");
+        assert_eq!(divider_cell(theme).fg, derived, "{name}");
+        let bordered = ChromePalette {
+            authored: aterm_messages::tokens::AuthoredChrome {
+                border: Some([0x5a; 3]),
+                ..aterm_messages::tokens::AuthoredChrome::NONE
+            },
+            ..ChromePalette::from(theme)
+        };
+        assert_eq!(
+            divider_cell(bordered).bg,
+            bordered.tokens().seam_on(bg),
+            "{name}"
+        );
+        assert_ne!(divider_cell(bordered).bg, derived, "{name}: CONTROL");
+        for (scheme, hc) in hc_fixtures::STOCK {
+            let cell = hc_fixtures::with_forced(hc, || divider_cell(bordered));
+            assert_eq!(
+                (cell.bg, cell.fg),
+                (hc.window_text, hc.window_text),
+                "{name} {scheme}"
+            );
+            assert_ne!(
+                divider_cell(theme).bg,
+                hc.window_text,
+                "{name} {scheme}: CONTROL"
+            );
+        }
+    }
 }

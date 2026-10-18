@@ -3,8 +3,9 @@
 
 //! The one colour resolver: [`Config::resolved_colors`] picks the theme for an
 //! appearance, applies every colour override in `aterm.toml` once (fg, bg,
-//! cursor, selection, selection foreground, `palette[]`), and records where each
-//! slot came from. The renderer [`Theme`] and the engine `TerminalConfig`
+//! cursor, selection, selection foreground, `palette[]`, and the chrome keys
+//! `accent_color`, `active_tab_color`, `border_color`, `search_match_color`),
+//! and records where each slot came from. The renderer [`Theme`] and the engine `TerminalConfig`
 //! colours are projections of that one result, so "config beats theme" holds in
 //! one place, and a bad hex value is reported once, by one reader
 //! ([`aterm_types::scheme::parse_hex`]).
@@ -13,13 +14,15 @@ use aterm_core::terminal::{ColorPalette, Rgb};
 use aterm_render::Theme;
 use aterm_types::{Appearance, ColorScheme};
 
-use crate::app_config::{Config, ThemeCatalog, resolve_theme_name_value, unset_theme_name};
+use aterm_types::scheme::{SelectorDraw, ThemeSelector};
+
+use crate::app_config::{Config, ThemeCatalog};
 
 /// Where the theme a resolution draws came from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ThemeSource {
-    /// A built-in scheme; also what an unset `theme` draws (Default, or
-    /// Default Light on a light appearance: [`crate::app_config::UNSET_THEME`]).
+    /// A built-in scheme; `Default` too, which is also what an unset `theme`
+    /// draws on every appearance.
     Builtin,
     /// A loaded custom theme file, by its catalog id (the file stem).
     File(String),
@@ -35,8 +38,7 @@ pub(crate) enum ColorOrigin {
     Theme,
     /// A colour key in `aterm.toml`.
     Config,
-    /// Nobody: the unset default (no theme selected: Default, or Default Light
-    /// on a light appearance), the Default fallback (the selected theme does
+    /// Nobody: the Default scheme (no theme selected, or the selected one does
     /// not resolve), or for `selection_fg` / a missing cursor the renderer's
     /// own rule.
     Default,
@@ -51,6 +53,56 @@ pub(crate) struct ColorProvenance {
     pub(crate) selection: ColorOrigin,
     pub(crate) selection_fg: ColorOrigin,
     pub(crate) ansi: [ColorOrigin; 16],
+    pub(crate) chrome: ChromeProvenance,
+}
+
+/// The origin of each chrome colour ([`aterm_types::scheme::ChromeColors`]):
+/// the theme's file, the config's key, or [`ColorOrigin::Default`] when nobody
+/// authored it and the chrome derives it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ChromeProvenance {
+    pub(crate) accent: ColorOrigin,
+    pub(crate) active_tab: ColorOrigin,
+    pub(crate) border: ColorOrigin,
+    pub(crate) search_match: ColorOrigin,
+}
+
+/// The chrome keys, as `aterm.toml` and a theme file spell them, with the
+/// slot each sets.
+pub(crate) const CHROME_KEYS: [(&str, aterm_types::scheme::ThemeKey); 4] = [
+    ("accent_color", aterm_types::scheme::ThemeKey::AccentColor),
+    (
+        "active_tab_color",
+        aterm_types::scheme::ThemeKey::ActiveTabColor,
+    ),
+    ("border_color", aterm_types::scheme::ThemeKey::BorderColor),
+    (
+        "search_match_color",
+        aterm_types::scheme::ThemeKey::SearchMatchColor,
+    ),
+];
+
+impl ChromeProvenance {
+    /// The origin of the slot `key` sets (a chrome key of [`CHROME_KEYS`]).
+    pub(crate) fn of(&self, key: aterm_types::scheme::ThemeKey) -> ColorOrigin {
+        use aterm_types::scheme::ThemeKey;
+        match key {
+            ThemeKey::AccentColor => self.accent,
+            ThemeKey::ActiveTabColor => self.active_tab,
+            ThemeKey::BorderColor => self.border,
+            _ => self.search_match,
+        }
+    }
+
+    fn of_mut(&mut self, key: aterm_types::scheme::ThemeKey) -> &mut ColorOrigin {
+        use aterm_types::scheme::ThemeKey;
+        match key {
+            ThemeKey::AccentColor => &mut self.accent,
+            ThemeKey::ActiveTabColor => &mut self.active_tab,
+            ThemeKey::BorderColor => &mut self.border,
+            _ => &mut self.search_match,
+        }
+    }
 }
 
 /// One colour value in `aterm.toml` that is not a hex colour. The slot keeps
@@ -96,17 +148,53 @@ pub(crate) struct ResolvedColors {
     /// engine default).
     pub(crate) bold_is_bright: bool,
     pub(crate) provenance: ColorProvenance,
-    /// The appearance the palette on screen reads as, which DSR 996 and mode
-    /// 2031 report: the scheme's appearance (declared or measured at
-    /// admission) unless `background` is overridden, then the final
-    /// background's polarity.
+    /// The appearance of the configured palette: the scheme's appearance
+    /// (declared or measured at admission) unless `background` is overridden,
+    /// then the final background's polarity. It is the engine's baseline
+    /// (`TerminalConfig::color_scheme`), which DSR 996 and mode 2031 report; a
+    /// session whose program set its own background reports that background
+    /// instead (`Terminal::color_scheme`).
     pub(crate) reported: Appearance,
     /// Every colour value that did not parse, once each, in key order.
     pub(crate) issues: Vec<ColorIssue>,
-    /// Whether the engine gets an explicit palette: a theme was selected, the
-    /// unset default drew slots other than the xterm table (Default Light), or
-    /// a `palette[]` entry landed. Otherwise the engine keeps its xterm table.
+    /// Whether slots 16-255 derive from the final colours
+    /// ([`aterm_types::scheme_palette256::generated_extended_palette`]):
+    /// `scheme.palette_generate`, kept equal to it.
+    pub(crate) palette_generate: bool,
+    /// Who decided [`Self::palette_generate`]: the theme's own key, the
+    /// config's `palette_generate = "always"|"never"`, or nobody (the unset
+    /// default or a fallback, which derive nothing).
+    pub(crate) palette_generate_origin: ColorOrigin,
+    /// Whether the engine gets an explicit palette: a theme was selected, a
+    /// `palette[]` entry landed, or slots 16-255 are derived. Otherwise the
+    /// engine keeps its xterm table.
     custom_palette: bool,
+}
+
+/// Who set one slot of the 256-colour palette, for `theme palette`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SlotOrigin {
+    /// One of the 16 ANSI slots, by the origin of its colour.
+    Ansi(ColorOrigin),
+    /// Slot 16-255 set by `palette[N]` or `palette_overrides.N`.
+    Config,
+    /// Slot 16-255 derived from the theme's colours.
+    Generated,
+    /// Slot 16-255 at xterm's own value.
+    Xterm,
+}
+
+impl SlotOrigin {
+    /// The word `theme palette` prints for this origin.
+    pub(crate) fn word(self) -> &'static str {
+        match self {
+            Self::Ansi(ColorOrigin::Theme) => "theme",
+            Self::Ansi(ColorOrigin::Config) | Self::Config => "config",
+            Self::Ansi(ColorOrigin::Default) => "default",
+            Self::Generated => "generated",
+            Self::Xterm => "xterm",
+        }
+    }
 }
 
 impl ResolvedColors {
@@ -121,8 +209,25 @@ impl ResolvedColors {
         self.scheme.selection_fg
     }
 
-    /// The engine's indexed palette: the scheme's 16 ANSI slots plus the
-    /// extended `palette[]` entries, or `None` for the engine's own table.
+    /// Who set palette slot `index`: an ANSI slot's colour origin, else a
+    /// config entry, a derived slot or xterm's own value.
+    pub(crate) fn extended_origin(&self, index: u8) -> SlotOrigin {
+        if let Some(origin) = self.provenance.ansi.get(usize::from(index)) {
+            return SlotOrigin::Ansi(*origin);
+        }
+        if self.extended_palette.iter().any(|(at, _)| *at == index) {
+            SlotOrigin::Config
+        } else if self.palette_generate {
+            SlotOrigin::Generated
+        } else {
+            SlotOrigin::Xterm
+        }
+    }
+
+    /// The engine's indexed palette: the scheme's 16 ANSI slots, slots
+    /// 16-255 derived from them when [`Self::palette_generate`] is on, then
+    /// the extended `palette[]` entries over those (a config slot wins over a
+    /// derived one); `None` for the engine's own table.
     pub(crate) fn custom_palette(&self) -> Option<ColorPalette> {
         self.custom_palette.then(|| {
             let mut palette = self.scheme.to_color_palette();
@@ -133,8 +238,14 @@ impl ResolvedColors {
         })
     }
 
+    /// The chrome colours the theme or the config authored (config over theme),
+    /// for the chrome tokens.
+    pub(crate) fn authored_chrome(&self) -> aterm_messages::tokens::AuthoredChrome {
+        crate::chrome_band::authored_of(&self.scheme.chrome)
+    }
+
     /// The `aterm.toml` keys that set a slot here, in slot order (`palette[i]`
-    /// per index).
+    /// per index, then the chrome keys).
     pub(crate) fn config_keys(&self) -> Vec<String> {
         let p = &self.provenance;
         let mut keys: Vec<String> = [
@@ -159,6 +270,12 @@ impl ResolvedColors {
                 .overrides
                 .iter()
                 .map(|&i| palette_override_key(usize::from(i))),
+        );
+        keys.extend(
+            CHROME_KEYS
+                .iter()
+                .filter(|(_, key)| p.chrome.of(*key) == ColorOrigin::Config)
+                .map(|(name, _)| (*name).to_string()),
         );
         keys
     }
@@ -203,24 +320,123 @@ fn override_color(key: &str, raw: Option<&str>, issues: &mut Vec<ColorIssue>) ->
     parsed
 }
 
+/// What `palette_generate` in `aterm.toml` says
+/// ([`crate::prefs::PALETTE_GENERATE_MODES`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PaletteGenerateMode {
+    /// Absent, `"theme"` or a value it does not know: the theme's own key.
+    Theme,
+    /// `"always"`: derive slots 16-255 for every theme.
+    Always,
+    /// `"never"`: keep xterm's slots 16-255.
+    Never,
+}
+
+impl Config {
+    /// The config's `palette_generate`, read case-insensitively; an unknown
+    /// value follows the theme (the config walk warns about it once).
+    pub(crate) fn palette_generate_mode(&self) -> PaletteGenerateMode {
+        match self
+            .palette_generate
+            .as_deref()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("always") => PaletteGenerateMode::Always,
+            Some("never") => PaletteGenerateMode::Never,
+            _ => PaletteGenerateMode::Theme,
+        }
+    }
+}
+
 /// The lowest text contrast a side of a `dark:…,light:…` split may be left
 /// at by the colour keys in `aterm.toml` before validation warns
 /// ([`Config::split_override_warnings`]).
 pub(crate) const SPLIT_OVERRIDE_MIN_CONTRAST: f64 = 3.0;
 
 /// The theme a selection draws for one appearance, before any `aterm.toml`
-/// colour key: its id, where it came from, its colours, whether a theme was
-/// named at all, and whether its ANSI slots differ from the engine's own
-/// xterm table (so the engine needs them as a custom palette).
+/// colour key: its id, where it came from, its colours, and whether a theme
+/// was named at all.
 struct ThemeDraw {
     id: String,
     source: ThemeSource,
     scheme: ColorScheme,
     named: bool,
-    custom_palette: bool,
+    /// The theme's `bold_is_bright`: a rung under the config's key.
+    bold_is_bright: Option<bool>,
+}
+
+/// The one theme a selection picks for one appearance: its id, where it came
+/// from, the whole package (colours, identity, typography), and whether a
+/// theme was named at all. [`Config::theme_draw`] (colours) and
+/// `Config::resolved_typography` (type) both start here, so the two can never
+/// pick different themes.
+pub(crate) struct ThemeSelection<'a> {
+    pub(crate) id: String,
+    pub(crate) source: ThemeSource,
+    pub(crate) package: std::borrow::Cow<'a, aterm_types::scheme::ThemePackage>,
+    pub(crate) named: bool,
+}
+
+/// A built-in's whole package (a built-in carries no typography), `Default`'s
+/// for a name that is not one.
+fn builtin_package(name: &str) -> aterm_types::scheme::ThemePackage {
+    aterm_types::scheme::builtin_theme(name)
+        .and_then(aterm_types::scheme::ThemePackage::of_builtin)
+        .unwrap_or_else(aterm_types::scheme::ThemePackage::default_theme)
 }
 
 impl Config {
+    /// The theme `appearance` selects (`candidate`, when given, standing in
+    /// for the configured `theme`), as a whole package.
+    pub(crate) fn theme_selection<'a>(
+        &self,
+        appearance: Appearance,
+        themes: &'a ThemeCatalog,
+        candidate: Option<&str>,
+    ) -> ThemeSelection<'a> {
+        // The one shared draw (aterm-types), so native and the web embeds agree
+        // on what a selector draws; only `Other` reaches the theme catalog.
+        let draw = match candidate.or(self.theme.as_deref()) {
+            None => SelectorDraw::unset(),
+            Some(raw) => ThemeSelector::parse(raw).0.draw_builtin(appearance),
+        };
+        let theme_named = !matches!(draw, SelectorDraw::Unset(_));
+        let (id, source, package) = match draw {
+            // No name: the unset default, Default on every appearance
+            // (following the OS is a written pair). A built-in carries its
+            // own package.
+            SelectorDraw::Unset(scheme) | SelectorDraw::Builtin(scheme) => {
+                let package = builtin_package(&scheme.name);
+                (
+                    package.colors.name.clone(),
+                    ThemeSource::Builtin,
+                    std::borrow::Cow::Owned(package),
+                )
+            }
+            SelectorDraw::Other(name) => match themes.resolve_package(&name) {
+                Ok(package) => {
+                    let id = themes
+                        .ready_names()
+                        .find(|ready| ready.eq_ignore_ascii_case(&name))
+                        .map_or(name, str::to_string);
+                    (id.clone(), ThemeSource::File(id), package)
+                }
+                Err(reason) => (
+                    "Default".to_string(),
+                    ThemeSource::DefaultFallback { reason },
+                    std::borrow::Cow::Owned(builtin_package("Default")),
+                ),
+            },
+        };
+        ThemeSelection {
+            id,
+            source,
+            package,
+            named: theme_named,
+        }
+    }
+
     /// The theme `appearance` draws, before the colour keys apply.
     fn theme_draw(
         &self,
@@ -228,49 +444,20 @@ impl Config {
         themes: &ThemeCatalog,
         candidate: Option<&str>,
     ) -> ThemeDraw {
-        let selector = candidate.or(self.theme.as_deref());
-        let named = resolve_theme_name_value(selector, appearance);
-        let theme_named = named.is_some();
-        let (id, source, scheme) = match named {
-            // No name: the unset default follows the OS. Its dark side is
-            // `ColorScheme::default()` itself, so a dark appearance draws
-            // exactly what it always did.
-            None => {
-                let scheme =
-                    aterm_types::scheme::builtin(unset_theme_name(appearance)).unwrap_or_default();
-                (scheme.name.clone(), ThemeSource::Builtin, scheme)
-            }
-            Some(name) => {
-                if let Some(scheme) = aterm_types::scheme::builtin(&name) {
-                    (scheme.name.clone(), ThemeSource::Builtin, scheme)
-                } else {
-                    match themes.resolve(&name) {
-                        Ok(scheme) => {
-                            let id = themes
-                                .ready_names()
-                                .find(|ready| ready.eq_ignore_ascii_case(&name))
-                                .map_or(name, str::to_string);
-                            (id.clone(), ThemeSource::File(id), scheme)
-                        }
-                        Err(reason) => (
-                            "Default".to_string(),
-                            ThemeSource::DefaultFallback { reason },
-                            ColorScheme::default(),
-                        ),
-                    }
-                }
-            }
-        };
-        // Default's ANSI slots ARE the engine's xterm table, so an unset
-        // theme on a dark appearance keeps the engine's own palette; any other
-        // draw hands its slots over.
-        let custom_palette = theme_named || scheme.ansi != ColorScheme::default().ansi;
+        let ThemeSelection {
+            id,
+            source,
+            package,
+            named: theme_named,
+        } = self.theme_selection(appearance, themes, candidate);
+        let bold_is_bright = package.bold_is_bright;
+        let scheme = package.into_owned().colors;
         ThemeDraw {
             id,
             source,
             scheme,
             named: theme_named,
-            custom_palette,
+            bold_is_bright,
         }
     }
 
@@ -289,7 +476,7 @@ impl Config {
             source,
             mut scheme,
             named: theme_named,
-            custom_palette: theme_palette,
+            bold_is_bright: theme_bold_is_bright,
         } = self.theme_draw(appearance, themes, candidate);
         let base = if matches!(source, ThemeSource::DefaultFallback { .. }) || !theme_named {
             ColorOrigin::Default
@@ -315,7 +502,18 @@ impl Config {
                 ColorOrigin::Default
             },
             ansi: [base; 16],
+            chrome: ChromeProvenance {
+                accent: ColorOrigin::Default,
+                active_tab: ColorOrigin::Default,
+                border: ColorOrigin::Default,
+                search_match: ColorOrigin::Default,
+            },
         };
+        for (_, key) in CHROME_KEYS {
+            if scheme.chrome.slot(key).flatten().is_some() {
+                *provenance.chrome.of_mut(key) = base;
+            }
+        }
 
         let mut issues = Vec::new();
         if let Some(rgb) = override_color("foreground", self.foreground.as_deref(), &mut issues) {
@@ -347,6 +545,20 @@ impl Config {
         ) {
             scheme.selection_fg = Some(rgb);
             provenance.selection_fg = ColorOrigin::Config;
+        }
+        for (name, key) in CHROME_KEYS {
+            let raw = match key {
+                aterm_types::scheme::ThemeKey::AccentColor => self.accent_color.as_deref(),
+                aterm_types::scheme::ThemeKey::ActiveTabColor => self.active_tab_color.as_deref(),
+                aterm_types::scheme::ThemeKey::BorderColor => self.border_color.as_deref(),
+                _ => self.search_match_color.as_deref(),
+            };
+            if let Some(rgb) = override_color(name, raw, &mut issues)
+                && let Some(slot) = scheme.chrome.slot_mut(key)
+            {
+                *slot = Some(rgb);
+                *provenance.chrome.of_mut(key) = ColorOrigin::Config;
+            }
         }
         let mut extended_palette: Vec<(u8, Rgb)> = Vec::new();
         let mut palette_keys = PaletteKeys::default();
@@ -394,6 +606,18 @@ impl Config {
         palette_keys.overrides.sort_unstable();
         let palette_landed = !palette_keys.list.is_empty() || !palette_keys.overrides.is_empty();
 
+        // Slots 16-255: the config's `palette_generate` beats the theme's key.
+        // The derivation reads the FINAL colours (the `palette[0..16]` and
+        // fg/bg overrides above are already in `scheme`), so the cube follows
+        // an ANSI override; `palette[N]` for N >= 16 lands over it in
+        // `custom_palette`.
+        let (palette_generate, palette_generate_origin) = match self.palette_generate_mode() {
+            PaletteGenerateMode::Always => (true, ColorOrigin::Config),
+            PaletteGenerateMode::Never => (false, ColorOrigin::Config),
+            PaletteGenerateMode::Theme => (scheme.palette_generate, base),
+        };
+        scheme.palette_generate = palette_generate;
+
         let reported = match bg_override {
             None => scheme.appearance,
             Some(_) => {
@@ -412,13 +636,17 @@ impl Config {
             scheme,
             extended_palette,
             palette_keys,
+            // config > theme > the engine's default.
             bold_is_bright: self
                 .bold_is_bright
+                .or(theme_bold_is_bright)
                 .unwrap_or(aterm_core::config::TerminalConfig::default().bold_is_bright),
             provenance,
             reported,
             issues,
-            custom_palette: theme_palette || palette_landed,
+            palette_generate,
+            palette_generate_origin,
+            custom_palette: theme_named || palette_landed || palette_generate,
         }
     }
 
@@ -527,6 +755,7 @@ impl Config {
         tc.selection_foreground = resolved.selection_fg();
         tc.custom_palette = resolved.custom_palette();
         tc.bold_is_bright = resolved.bold_is_bright;
+        tc.color_scheme = Some(resolved.reported);
         tc
     }
 }
@@ -674,65 +903,54 @@ mod tests {
         assert!(cases > 100, "the matrix ran: {cases}");
     }
 
-    /// An unset `theme` follows the OS: a pristine config on a light
-    /// appearance draws Default Light (its colours, its ANSI slots handed to
-    /// the engine, and a light report for DSR 996), and on a dark one it is
-    /// Default with no custom palette: the engine keeps its xterm table.
+    /// An unset `theme` (absent, blank, or naming no theme) is Default on
+    /// every appearance: on a light one it draws exactly what an explicit
+    /// `theme = "Default"` draws, reports Dark to DSR 996, and hands the
+    /// engine the very config a dark one gets (no custom palette: Default's
+    /// slots are the engine's own xterm table). Following the OS is a pair the
+    /// config spells out (negative control: Default's pair on a light
+    /// appearance draws its light side).
     #[test]
-    fn resolved_colors_unset_theme_follows_the_os() {
+    fn resolved_colors_unset_theme_is_the_dark_default() {
         let themes = ThemeCatalog::default();
-        let pristine = Config::default();
-
-        let light = resolve(&pristine, Appearance::Light);
-        let default_light = aterm_types::scheme::builtin("Default Light").expect("a built-in");
-        assert_eq!(light.id, "Default Light");
-        assert_eq!(light.source, ThemeSource::Builtin);
-        assert_eq!(light.scheme, default_light);
-        assert_eq!(light.reported, Appearance::Light);
-        assert_eq!(light.provenance.background, ColorOrigin::Default);
-        assert!(light.config_keys().is_empty());
-        let palette = light.custom_palette().expect("Default Light's slots");
-        for (i, slot) in default_light.ansi.iter().enumerate() {
-            assert_eq!(palette.get(i as u8), *slot, "ansi {i}");
+        let explicit = cfg("theme = \"Default\"");
+        let default = resolve(&explicit, Appearance::Light);
+        for unset in [
+            Config::default(),
+            cfg("theme = \"\""),
+            cfg("theme = \"dark:,light:\""),
+        ] {
+            let label = format!("{:?}", unset.theme);
+            let light = resolve(&unset, Appearance::Light);
+            assert_eq!(light.id, "Default", "{label}");
+            assert_eq!(light.source, ThemeSource::Builtin, "{label}");
+            assert_eq!(light.scheme, default.scheme, "{label}");
+            assert_eq!(light.scheme, ColorScheme::default(), "{label}");
+            assert_eq!(light.reported, Appearance::Dark, "{label}");
+            assert_eq!(
+                light.custom_palette(),
+                None,
+                "{label}: the engine keeps its table"
+            );
+            assert_eq!(
+                unset.theme_for_with_assets(Appearance::Light, &themes),
+                explicit.theme_for_with_assets(Appearance::Light, &themes),
+                "{label}"
+            );
+            assert_eq!(
+                unset.applied_terminal_config_for_with_assets(Appearance::Light, &themes),
+                unset.applied_terminal_config_for_with_assets(Appearance::Dark, &themes),
+                "{label}: one engine config on both appearances"
+            );
         }
-        // The same pixels as writing the unset rule out.
-        let written = cfg(&format!("theme = {:?}", crate::app_config::UNSET_THEME));
-        assert_eq!(
-            engine_view(
-                pristine.applied_terminal_config_for_with_assets(Appearance::Light, &themes)
-            ),
-            engine_view(
-                written.applied_terminal_config_for_with_assets(Appearance::Light, &themes)
-            ),
-        );
-        assert_eq!(
-            pristine.theme_for_with_assets(Appearance::Light, &themes),
-            written.theme_for_with_assets(Appearance::Light, &themes),
-        );
 
-        let dark = resolve(&pristine, Appearance::Dark);
-        assert_eq!(dark.id, "Default");
-        assert_eq!(dark.scheme, ColorScheme::default());
-        assert_eq!(dark.reported, Appearance::Dark);
-        assert_eq!(dark.custom_palette(), None, "the engine keeps its table");
-        let default = ColorScheme::default();
-        let applied = pristine.applied_terminal_config_for_with_assets(Appearance::Dark, &themes);
-        assert_eq!(applied.default_foreground, default.foreground);
-        assert_eq!(applied.default_background, default.background);
-        assert_eq!(applied.custom_palette, None);
-        assert_eq!(
-            pristine.theme_for_with_assets(Appearance::Dark, &themes),
-            Theme::from(&default),
+        let pair = resolve(
+            &cfg("theme = \"dark:Default,light:Default Light\""),
+            Appearance::Light,
         );
-
-        // Negative controls: a named theme is not replaced on a light
-        // appearance, and `theme = "Default"` pins the dark Default there.
-        let nord = resolve(&cfg("theme = \"Nord\""), Appearance::Light);
-        assert_eq!(nord.id, "Nord");
-        let pinned = resolve(&cfg("theme = \"Default\""), Appearance::Light);
-        assert_eq!(pinned.id, "Default");
-        assert_eq!(pinned.scheme.background, ColorScheme::default().background);
-        assert_ne!(light.scheme.background, pinned.scheme.background);
+        assert_eq!(pair.id, "Default Light");
+        assert_eq!(pair.reported, Appearance::Light);
+        assert_ne!(pair.scheme.background, default.scheme.background);
     }
 
     /// Each value that is not a colour is one issue, under its own key; the
@@ -788,6 +1006,59 @@ mod tests {
         let bad = resolve(&cfg("foreground = \"#ffff\""), Appearance::Dark);
         assert_eq!(bad.issues.len(), 1);
         assert_eq!(bad.scheme.foreground, ColorScheme::default().foreground);
+    }
+
+    /// THE CHROME KEYS: a theme file's chrome colour is drawn unless
+    /// `aterm.toml` sets the same key, which wins with provenance Config and
+    /// is named by `config_keys`. A bad hex is one issue, and the theme's
+    /// colour survives it. NEGATIVE CONTROL: the config without the key keeps
+    /// the theme's colour, with provenance Theme; a slot nobody authored is
+    /// Default.
+    #[test]
+    fn resolved_colors_chrome_keys_beat_the_theme() {
+        let mut scheme = aterm_types::scheme::builtin("Dracula").unwrap();
+        scheme.name = "Mine".to_string();
+        scheme.chrome.accent = Some(Rgb::new(0x11, 0x22, 0x33));
+        scheme.chrome.border = Some(Rgb::new(0x44, 0x55, 0x66));
+        let themes = ThemeCatalog::from_schemes([("Mine".to_string(), scheme)]);
+        let at = |text: &str| cfg(text).resolved_colors(Appearance::Dark, &themes, None);
+        let won = at("theme = \"Mine\"\naccent_color = \"#ff00aa\"");
+        assert_eq!(won.scheme.chrome.accent, Some(Rgb::new(0xff, 0x00, 0xaa)));
+        assert_eq!(won.provenance.chrome.accent, ColorOrigin::Config);
+        assert_eq!(won.config_keys(), vec!["accent_color".to_string()]);
+        assert_eq!(won.authored_chrome().accent, Some([0xff, 0x00, 0xaa]));
+        assert_eq!(won.scheme.chrome.border, Some(Rgb::new(0x44, 0x55, 0x66)));
+        assert_eq!(won.provenance.chrome.border, ColorOrigin::Theme);
+        assert_eq!(won.provenance.chrome.search_match, ColorOrigin::Default);
+        let bad = at("theme = \"Mine\"\naccent_color = \"#nope\"");
+        assert_eq!(bad.issues.len(), 1, "{:?}", bad.issues);
+        assert_eq!(bad.issues[0].key, "accent_color");
+        assert_eq!(bad.scheme.chrome.accent, Some(Rgb::new(0x11, 0x22, 0x33)));
+        assert_eq!(bad.provenance.chrome.accent, ColorOrigin::Theme);
+        let theirs = at("theme = \"Mine\"");
+        assert_eq!(theirs.provenance.chrome.accent, ColorOrigin::Theme);
+        assert!(theirs.config_keys().is_empty());
+        // Every chrome key lands from aterm.toml alone, too.
+        let all = cfg(
+            "accent_color = \"#010101\"\nactive_tab_color = \"#020202\"\n\
+                       border_color = \"#030303\"\nsearch_match_color = \"#040404\"",
+        )
+        .resolved_colors(Appearance::Dark, &ThemeCatalog::default(), None);
+        assert_eq!(
+            all.config_keys(),
+            super::CHROME_KEYS
+                .map(|(name, _)| name.to_string())
+                .to_vec()
+        );
+        assert_eq!(
+            all.authored_chrome(),
+            aterm_messages::tokens::AuthoredChrome {
+                accent: Some([1; 3]),
+                active_tab: Some([2; 3]),
+                border: Some([3; 3]),
+                search_match: Some([4; 3]),
+            }
+        );
     }
 
     /// Provenance names who set each slot: the theme, a config key, or nobody.
@@ -1081,5 +1352,104 @@ mod tests {
                 "palette_overrides.x"
             ]
         );
+    }
+
+    /// The slot-100 value the derivation gives `theme`'s colours.
+    fn generated_100(config: &Config, theme: Option<&str>) -> Rgb {
+        let mut scheme = config
+            .resolved_colors(Appearance::Dark, &ThemeCatalog::default(), theme)
+            .scheme;
+        scheme.palette_generate = true;
+        scheme.to_color_palette().get(100)
+    }
+
+    /// Spec `resolved-colors-generate`: a signature theme derives slots
+    /// 16-255 from its own colours by its key; `palette_generate = "never"`
+    /// keeps xterm's (the negative control); `"always"` derives them even for
+    /// the unset theme, which otherwise hands the engine no palette.
+    #[test]
+    fn palette_generate_follows_the_theme_unless_the_config_says() {
+        let themes = ThemeCatalog::default();
+        let plain = cfg("");
+        let night = plain.resolved_colors(Appearance::Dark, &themes, Some("Aterm Night"));
+        assert!(night.palette_generate);
+        assert_eq!(night.palette_generate_origin, ColorOrigin::Theme);
+        let palette = night
+            .custom_palette()
+            .expect("a theme hands its palette over");
+        assert_eq!(palette.get(100), generated_100(&plain, Some("Aterm Night")));
+        assert_ne!(palette.get(100), ColorPalette::default_color(100));
+
+        let never = cfg("palette_generate = \"never\"");
+        let kept = never.resolved_colors(Appearance::Dark, &themes, Some("Aterm Night"));
+        assert!(!kept.palette_generate);
+        assert_eq!(kept.palette_generate_origin, ColorOrigin::Config);
+        assert_eq!(
+            kept.custom_palette().expect("palette").get(100),
+            ColorPalette::default_color(100)
+        );
+
+        // A port keeps xterm's slots by its own key.
+        let nord = plain.resolved_colors(Appearance::Dark, &themes, Some("Nord"));
+        assert!(!nord.palette_generate);
+        assert_eq!(
+            nord.custom_palette().expect("palette").get(100),
+            ColorPalette::default_color(100)
+        );
+
+        assert_eq!(resolve(&plain, Appearance::Dark).custom_palette(), None);
+        let always = cfg("palette_generate = \"always\"");
+        let unset = resolve(&always, Appearance::Dark);
+        assert!(unset.palette_generate);
+        assert_eq!(unset.palette_generate_origin, ColorOrigin::Config);
+        assert_eq!(
+            unset.custom_palette().expect("derived").get(100),
+            generated_100(&always, None)
+        );
+        // An unknown word follows the theme.
+        let odd = cfg("palette_generate = \"sometimes\"");
+        assert!(
+            odd.resolved_colors(Appearance::Dark, &themes, Some("Aterm Night"))
+                .palette_generate
+        );
+    }
+
+    /// Spec `resolved-colors-generate`: a config slot past 15 wins over a
+    /// derived one and leaves its neighbours derived, and the cube follows
+    /// an ANSI override (slot 196 is `palette[9]`), so `theme palette` names
+    /// each slot's origin.
+    #[test]
+    fn config_slots_win_over_derived_ones_and_the_cube_follows_ansi_overrides() {
+        let themes = ThemeCatalog::default();
+        let config = cfg("palette_overrides = { 100 = \"#123456\", 9 = \"#00ff00\" }");
+        let resolved = config.resolved_colors(Appearance::Dark, &themes, Some("Aterm Night"));
+        let palette = resolved.custom_palette().expect("palette");
+        assert_eq!(palette.get(100), Rgb::new(0x12, 0x34, 0x56));
+        assert_eq!(palette.get(196), Rgb::new(0x00, 0xff, 0x00));
+        assert_eq!(
+            palette.get(101),
+            {
+                let mut scheme = resolved.scheme.clone();
+                scheme.palette_generate = true;
+                scheme.to_color_palette().get(101)
+            },
+            "the neighbour stays derived"
+        );
+        use super::SlotOrigin;
+        assert_eq!(resolved.extended_origin(100), SlotOrigin::Config);
+        assert_eq!(resolved.extended_origin(101), SlotOrigin::Generated);
+        assert_eq!(
+            resolved.extended_origin(9),
+            SlotOrigin::Ansi(ColorOrigin::Config)
+        );
+        assert_eq!(
+            resolved.extended_origin(1),
+            SlotOrigin::Ansi(ColorOrigin::Theme)
+        );
+        // Negative control: with derivation off the untouched slot is xterm's.
+        let off = cfg("palette_generate = \"never\"\npalette_overrides = { 100 = \"#123456\" }")
+            .resolved_colors(Appearance::Dark, &themes, Some("Aterm Night"));
+        assert_eq!(off.extended_origin(101), SlotOrigin::Xterm);
+        assert_eq!(off.extended_origin(100), SlotOrigin::Config);
     }
 }

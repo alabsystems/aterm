@@ -58,10 +58,9 @@ fn warm_block_decompress_rejects_truncated_serialized_payload() {
     let err = block
         .decompress()
         .expect_err("truncated serialized payload must not masquerade as a repaired suffix");
-    let err_text = format!("{err}");
     assert!(
-        err_text.contains("decoded 2 complete lines"),
-        "error should explain the serialized/header mismatch: {err_text}"
+        matches!(&err, crate::ScrollbackError::Io(e) if e.kind() == std::io::ErrorKind::InvalidData),
+        "{err:?}"
     );
 }
 

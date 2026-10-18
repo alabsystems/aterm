@@ -275,8 +275,8 @@ fn only_rm_expansions_changed(orig: &str, new: &str) -> Result<Vec<(String, Stri
 /// SKIPPED, LOUDLY, until a bypass capture exists: the corpus was first
 /// captured in manual mode only (2.1.278), which is a prompt the owner never
 /// sees. A skip is printed on the raw stderr every run ([`loud`]); the day
-/// `tools/harness-capture.sh --bypass` records one, this law judges it, and a
-/// payload the harness mishandles FAILS it.
+/// a hook-bridge capture records one (none in the tree does), this law judges
+/// it, and a payload the harness mishandles FAILS it.
 #[test]
 fn the_owners_bypass_rm_box_is_answered_with_a_rewrite_of_only_its_expansions() {
     let found = bypass_rm_payloads();
@@ -286,7 +286,7 @@ fn the_owners_bypass_rm_box_is_answered_with_a_rewrite_of_only_its_expansions() 
             "vendor corpus: SKIPPED the owner's bypass rm box — no bypassPermissions \
              PermissionRequest for a variable rm target is in the corpus ({versions:?}), so the \
              one rm prompt `claude --dangerously-skip-permissions` still shows is NOT replayed. \
-             Record one: tools/harness-capture.sh --bypass"
+             No tool in the tree records one (tests/testdata/vendor/README.md)."
         ));
         return;
     }

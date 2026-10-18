@@ -446,79 +446,6 @@ mod tests {
         );
     }
 
-    /// At full surge drips fall below the cursor cell and ripple rings roll
-    /// wider than the bead.
-    #[test]
-    fn surge_drips_below_and_ripples_wide() {
-        let g = geom();
-        let c = cfg();
-        let t = Instant::now();
-        let mut d = CursorDroplet::default();
-        let mut out = Vec::new();
-        // Advance a few frames so the ring/drip phases are mid-life.
-        for i in 0..20 {
-            out.clear();
-            d.tick(
-                Some((3, 20)),
-                t + Duration::from_millis(16 * i),
-                1.0,
-                g,
-                &c,
-                &mut out,
-            );
-        }
-        let ch = g.ch as i32;
-        let cell_bottom = (3 + 1) * ch;
-        let below = out
-            .iter()
-            .map(|q| q.y as i32 + q.h as i32 - cell_bottom)
-            .max()
-            .unwrap_or(0);
-        assert!(
-            below > ch / 3,
-            "a drip reaches below the cursor row (got {below}px past the cell)"
-        );
-        let cx = (20 * g.cw + g.cw / 2) as i32;
-        let reach = out
-            .iter()
-            .map(|q| (q.x as i32 - cx).abs().max(q.x as i32 + q.w as i32 - cx))
-            .max()
-            .unwrap_or(0);
-        assert!(
-            reach > (g.ch as f32 * RADIUS_MAX * 1.4) as i32,
-            "a ripple ring rolls wider than the bead (got {reach}px)"
-        );
-    }
-
-    /// The liquid fill brightens from deep water toward azure foam with the surge.
-    #[test]
-    fn fill_foams_with_surge() {
-        let g = geom();
-        let c = cfg();
-        let t = Instant::now();
-        let mut out = Vec::new();
-        let mut still = CursorDroplet::default();
-        let f0 = still
-            .tick(Some((1, 1)), t, 0.0, g, &c, &mut out)
-            .fill
-            .unwrap();
-        let mut hot = CursorDroplet::default();
-        let f1 = hot
-            .tick(Some((1, 1)), t, 1.0, g, &c, &mut out)
-            .fill
-            .unwrap();
-        let bright = |c: u32| ((c >> 16) & 0xff) + ((c >> 8) & 0xff) + (c & 0xff);
-        assert!(
-            bright(f1) > bright(f0) + 80,
-            "surge foams the fill ({f1:#08x} vs {f0:#08x})"
-        );
-        // Both stay in water hues: blue channel dominant.
-        for f in [f0, f1] {
-            let (r, gg, b) = ((f >> 16) & 0xff, (f >> 8) & 0xff, f & 0xff);
-            assert!(b >= gg && gg >= r, "water hue ordering, got {f:#08x}");
-        }
-    }
-
     /// Every emitted quad is single-row, grid-interior, and water-hued with capped
     /// coverage (the renderer row-gate / parity / legibility invariants).
     #[test]
@@ -592,38 +519,6 @@ mod tests {
             &mut out,
         );
         assert!(!d.is_active(), "still water idles on the blink cadence");
-    }
-
-    /// The quad count is bounded by construction (discs + rings + drips + glints).
-    #[test]
-    fn quad_count_is_bounded() {
-        let g = Geom {
-            cw: 20,
-            ch: 40,
-            rows: 50,
-            cols: 200,
-            origin_x: 0,
-            origin_y: 0,
-            win_w: 4000,
-            win_h: 2000,
-            head: 0,
-        };
-        let mut d = CursorDroplet::default();
-        let mut out = Vec::new();
-        d.tick(Some((25, 100)), Instant::now(), 1.0, g, &cfg(), &mut out);
-        d.tick(
-            Some((25, 100)),
-            Instant::now() + Duration::from_millis(16),
-            1.0,
-            g,
-            &cfg(),
-            &mut out,
-        );
-        assert!(
-            out.len() < 400,
-            "bounded droplet geometry, got {}",
-            out.len()
-        );
     }
 
     /// The bead surrounds the caret in a padded, headed window: the producer

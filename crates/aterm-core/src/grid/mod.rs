@@ -30,9 +30,6 @@ pub mod damage {
         BitsetRowIterator, Damage, DamageBoundsIterator, DamageTracker, DamagedRowIterator,
         LineDamageBounds, RowDamageBounds,
     };
-    // Preserve the testing-only module-path facade surface from aterm-grid.
-    #[cfg(test)]
-    pub use aterm_grid::damage::{DamageRect, MergedDamageIterator};
 }
 /// Page-backed memory storage. Re-exported from `aterm-grid`.
 pub mod page {
@@ -41,14 +38,6 @@ pub mod page {
 /// Row storage for terminal grid. Re-exported from `aterm-grid`.
 pub mod row {
     pub use aterm_grid::row::{LineSize, Row, RowFlags};
-}
-/// Style deduplication and interning. Re-exported from `aterm-grid`.
-pub mod style {
-    #[cfg(test)]
-    pub use aterm_grid::style::ExtendedStyleInfo;
-    pub use aterm_grid::style::{
-        Color, ColorType, ExtendedStyle, Style, StyleAttrs, StyleId, StyleTable,
-    };
 }
 /// Cell extras for rarely-used attributes. Re-exported from `aterm-grid`.
 pub mod extra {
@@ -88,10 +77,6 @@ pub use aterm_grid::{
     HistoryFence, HistoryFenceBroken, OlderHistory, OlderHistoryClaim, OlderHistoryRefusal,
 };
 
-#[cfg(test)]
-#[path = "../../test_support/grid/tests/mod.rs"]
-mod tests;
-
 // ============================================================================
 // Re-exports
 // ============================================================================
@@ -101,7 +86,6 @@ pub use damage::{Damage, DamagedRowIterator, LineDamageBounds, RowDamageBounds};
 pub use extra::{CellCoord, CellExtra, CellExtras, UniformExtras};
 pub use page::PageStore;
 pub use row::{LineSize, Row, RowFlags};
-pub use style::{Color, ColorType, ExtendedStyle, Style, StyleAttrs, StyleId, StyleTable};
 
 pub use aterm_grid::{CurrentStyle, Cursor, SavedCursor, SavedCursorState};
 

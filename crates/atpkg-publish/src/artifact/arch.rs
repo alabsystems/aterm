@@ -349,7 +349,7 @@ pub struct TreeGate {
 ///
 /// A missing directory, a tree with no object, or [`gate`]'s refusal.
 pub fn gate_tree(triple: Triple, dir: &Path) -> Result<TreeGate, Refusal> {
-    let files = atpkg::relocate::walk_files(dir).map_err(|_| Refusal::MissingDir {
+    let files = crate::artifact::relocate::walk_files(dir).map_err(|_| Refusal::MissingDir {
         dir: dir.to_path_buf(),
     })?;
     let mut scripts = Vec::new();

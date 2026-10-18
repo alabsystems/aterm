@@ -51,6 +51,11 @@ pub struct RelayCtl {
     shut: Arc<Mutex<Option<CtlStream>>>,
     /// Set by the interrupter: every request from then on fails.
     cut: Arc<AtomicBool>,
+    /// The token given up front is one a listener may refuse (the in-GUI
+    /// harness's in-memory token, which only the process that minted it
+    /// knows): on `ERR auth` the transport drops it for good and reads the
+    /// one beside the socket, once ([`Self::preferring`]).
+    beside_on_refusal: bool,
 }
 
 impl RelayCtl {
@@ -62,6 +67,20 @@ impl RelayCtl {
             conn: None,
             shut: Arc::default(),
             cut: Arc::default(),
+            beside_on_refusal: false,
+        }
+    }
+
+    /// A transport that presents `token` first and, should the listener
+    /// answer `ERR auth` (a seamless update's successor rebound the socket,
+    /// and does not know a token this process held only in memory), the
+    /// token beside the socket from then on: the request is sent again on
+    /// that connection, once — the refused one ran nothing (design §2.5,
+    /// phase 3A ruling R10).
+    pub fn preferring(endpoint: Endpoint, token: String) -> Self {
+        Self {
+            beside_on_refusal: true,
+            ..Self::new(endpoint, Some(token))
         }
     }
 
@@ -245,6 +264,15 @@ impl Ctl for RelayCtl {
             _ => conn.request_line(&line).map(|h| (h, Vec::new())),
         };
         match got {
+            Ok((header, _)) if header == "ERR auth" && self.beside_on_refusal => {
+                // The token given up front was refused: from now on, the
+                // one beside the socket. The listener closes a refused
+                // connection, and ran nothing on it.
+                self.beside_on_refusal = false;
+                self.token = None;
+                self.drop_conn();
+                self.call(args)
+            }
             Ok((header, body)) => Ok(render(verb, framing, &header, body)),
             Err(e) if e.kind() == io::ErrorKind::InvalidInput => Ok(client_failure(&e.to_string())),
             Err(e) => {
@@ -361,6 +389,79 @@ mod tests {
             seen
         });
         (path, h)
+    }
+
+    /// R10 (phase 3A): a token given up front that the listener refuses
+    /// (`ERR auth`: an update's successor rebound the socket and never knew
+    /// a token held only in memory) is dropped for the one beside the socket,
+    /// and the request goes out again on that connection, once; every later
+    /// request uses it. NEGATIVE CONTROL: a transport built with `new` keeps
+    /// the refusal.
+    #[test]
+    fn a_refused_preferred_token_falls_back_to_the_one_beside_the_socket() {
+        let dir = crate::supervise::test_scratch_path("relayctl", "prefer");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let sock = dir.join("a.sock");
+        let names = aterm_types::control_socket::token_names_for_sock("a.sock");
+        std::fs::write(dir.join(&names[0]), "beside-tok\n").expect("token");
+        let listener = UnixListener::bind(&sock).expect("bind");
+        let path = sock.to_string_lossy().into_owned();
+        let h = std::thread::spawn(move || {
+            let mut seen: Vec<(String, String)> = Vec::new();
+            for _ in 0..3 {
+                let Ok((stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut w = stream.try_clone().expect("clone");
+                let mut r = BufReader::new(stream);
+                let mut auth = String::new();
+                let _ = r.read_line(&mut auth);
+                let token = auth.trim_end().trim_start_matches("AUTH ").to_string();
+                loop {
+                    let mut line = String::new();
+                    if r.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    seen.push((token.clone(), line.trim_end().to_string()));
+                    if token != "beside-tok" {
+                        let _ = w.write_all(b"ERR auth\n");
+                        break;
+                    }
+                    let _ = w.write_all(b"OK\n");
+                }
+            }
+            seen
+        });
+        let mut c = RelayCtl::preferring(Endpoint::Socket(path.clone()), "memory-tok".to_string());
+        let first = c.call(&["@s-1", "send", "x"]).expect("send");
+        assert_eq!(
+            (first.code, first.stdout.as_str()),
+            (0, "OK\n"),
+            "{first:?}"
+        );
+        let second = c.call(&["@s-1", "send", "y"]).expect("send");
+        assert_eq!(second.code, 0, "{second:?}");
+        // Closed, so the scratch server takes the next connection.
+        drop(c);
+        let mut plain = RelayCtl::new(Endpoint::Socket(path), Some("memory-tok".to_string()));
+        let refused = plain.call(&["@s-1", "send", "z"]).expect("send");
+        assert!(
+            refused.code == 1 && refused.stderr.contains("ERR auth"),
+            "{refused:?}"
+        );
+        drop(plain);
+        let seen = h.join().expect("server");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            seen,
+            vec![
+                ("memory-tok".to_string(), "@s-1 send x".to_string()),
+                ("beside-tok".to_string(), "@s-1 send x".to_string()),
+                ("beside-tok".to_string(), "@s-1 send y".to_string()),
+                ("memory-tok".to_string(), "@s-1 send z".to_string()),
+            ]
+        );
     }
 
     /// Every reply shape the loop reads comes out as `aterm-ctl` prints it.

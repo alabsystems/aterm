@@ -75,9 +75,8 @@ impl TerminalBuilder {
     ///
     /// Prefer this to a bare `ring_buffer_size(N)`, which keeps raw cells (~640 B/line at
     /// 80 cols): the tiered store holds attributed history at roughly 1/3 to 1/10 of that
-    /// and enables off-thread history reflow. Cold pages are LZ4; the disk spill follows
-    /// the `disk-tier` feature
-    /// ([`TierCapabilities::current`](crate::scrollback::TierCapabilities::current)).
+    /// and enables off-thread history reflow. Cold pages are LZ4 and held in memory in
+    /// every build ([`TierCapabilities::current`](crate::scrollback::TierCapabilities::current)).
     ///
     /// Without a compression-drain thread, scrolled-off lines compress inline in ~1000-line
     /// batches on the feeding thread; a throughput-critical host calls

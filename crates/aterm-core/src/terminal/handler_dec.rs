@@ -10,7 +10,9 @@ use crate::grid::{CellFlags, Grid};
 
 use super::handler::TerminalHandler;
 use super::stack_response::StackResponse;
+use super::types::CurrentStyle;
 use super::{MouseEncoding, MouseMode, SavedCursorState};
+use aterm_types::CharacterSetState;
 use core::fmt::Write as _;
 
 impl TerminalHandler<'_> {
@@ -61,7 +63,15 @@ impl TerminalHandler<'_> {
                     }
                 }
                 12 => {
-                    self.set_cursor_blink(set);
+                    // Keep the configured/DECSCUSR style while the current
+                    // host uses win32 input mode; a stale negotiated bit is not enough.
+                    #[allow(
+                        clippy::collapsible_match,
+                        reason = "an active console host still consumes recognized mode 12"
+                    )]
+                    if !self.modes.win32_input_active() {
+                        self.set_cursor_blink(set);
+                    }
                 }
                 25 => {
                     if set {
@@ -201,30 +211,26 @@ impl TerminalHandler<'_> {
                         self.disable_synchronized_output();
                     }
                 }
-                // DEC 2031: report each OS appearance change as CSI ? 997 ; Ps n
-                // (Terminal::set_color_scheme). DSR CSI ? 996 n answers regardless.
+                // DEC 2031: report each scheme change (a theme install, or a background a
+                // program set; Terminal::color_scheme) as CSI ? 997 ; Ps n. DSR CSI ? 996 n
+                // answers regardless.
                 2031 => {
                     self.modes.report_color_scheme = set;
                 }
                 // DEC 2048: in-band size reports. Enabling emits the current geometry at once;
-                // Terminal::resize emits on each change.
+                // Terminal::resize and a new host cell box (set_cell_pixel_size) emit on each
+                // change.
                 2048 => {
                     let was = self.modes.in_band_size_reports;
                     self.modes.in_band_size_reports = set;
-                    // Emit only on a disabled->enabled transition (as xterm does) and only
-                    // under the buffer cap: this writes the buffer directly, bypassing
-                    // send_response's rate limit, so a `?2048l?2048h` flood must not grow it.
-                    // 48 is `push_in_band_size_report`'s capacity.
-                    const IN_BAND_SIZE_REPORT_MAX_LEN: usize = 48;
-                    if set && !was && self.can_append_response_bytes(IN_BAND_SIZE_REPORT_MAX_LEN) {
-                        let (rows, cols) = (self.grid.rows(), self.grid.cols());
-                        let (cw, ch) = self.iterm2.cell_px;
+                    // Emit only on a disabled->enabled transition (as xterm does); the
+                    // emitter holds the buffer cap a `?2048l?2048h` flood would test.
+                    if set && !was {
                         super::state_accessors::push_in_band_size_report(
                             &mut self.transient.response_buffer,
-                            rows,
-                            cols,
-                            cw,
-                            ch,
+                            self.grid.rows(),
+                            self.grid.cols(),
+                            self.iterm2.host_cell_px(),
                         );
                     }
                 }
@@ -315,8 +321,8 @@ impl TerminalHandler<'_> {
 
     /// Enter the alternate screen for mode 47/1047: buffer swap only, no cursor save, no clear.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "SetAlternateScreen",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
@@ -335,10 +341,7 @@ impl TerminalHandler<'_> {
         self.transient.current_hyperlink = None;
         self.transient.current_hyperlink_id = None;
         self.transient.update_has_transient_extras();
-        #[cfg(feature = "sixel")]
-        {
-            self.sixel.pending_image = None;
-        }
+        self.sixel.pending_image = None;
         // xterm has one persistent alternate buffer: 47/1047 never clear it on entry (only
         // 1049 does), so reuse the one the last exit kept. It has no scrollback.
         let mut new_grid = self
@@ -355,12 +358,31 @@ impl TerminalHandler<'_> {
         new_grid.set_cursor(cursor.row, cursor.col);
         new_grid.set_pending_wrap(self.grid.pending_wrap());
         Self::copy_margins(self.grid, &mut new_grid);
+        // The BCE template lives on each grid but the pen is the terminal's: the
+        // buffer swapped in erases and scrolls with the CURRENT background, not
+        // the one current when it was last up (or a fresh buffer's default).
+        Self::sync_bce_template(self.style, &mut new_grid);
         self.park_main_row_counter();
         let old_grid = std::mem::replace(self.grid, new_grid);
         *self.alt_grid = Some(old_grid);
         self.modes.alternate_screen = true;
         self.note_screen_replaced();
         self.grid.invalidate_host_coordinates();
+    }
+
+    /// Point `grid`'s BCE template at the current pen's background. A buffer
+    /// switch that keeps the pen (`?47`/`?1047`, either way) must do this for
+    /// the grid it swaps in: xterm fills every blank from the one current
+    /// colour pair (screen.c `ClearCells`, `ScrnClearLines`), whichever buffer
+    /// is up. Found by the astream-term differential oracle
+    /// (aterm-conformance `tests/vt_oracle`): a line scrolled in after
+    /// `CSI 44 m CSI ? 47 h` came up in the alternate buffer's stale default.
+    fn sync_bce_template(style: &mut CurrentStyle, grid: &mut Grid) {
+        style.update_cached_colors();
+        grid.set_cursor_template(
+            crate::grid::Cell::bce_blank(style.cached_colors()),
+            style.bce_bg_rgb(),
+        );
     }
 
     /// Count a whole-screen replacement for the resize journal's readers
@@ -382,8 +404,8 @@ impl TerminalHandler<'_> {
 
     /// Exit the alternate screen for mode 47: buffer swap only, no cursor restore, no clear.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "ResetAlternateScreen",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
@@ -399,10 +421,7 @@ impl TerminalHandler<'_> {
         self.transient.current_hyperlink = None;
         self.transient.current_hyperlink_id = None;
         self.transient.update_has_transient_extras();
-        #[cfg(feature = "sixel")]
-        {
-            self.sixel.pending_image = None;
-        }
+        self.sixel.pending_image = None;
         // Tab stops set on the alt screen carry back (they are global).
         let tab_stops = self.grid.tab_stops().to_vec();
         let tab_suppressed = self.grid.tab_defaults_suppressed();
@@ -412,6 +431,8 @@ impl TerminalHandler<'_> {
             main_grid.set_cursor(cursor.row, cursor.col);
             main_grid.set_pending_wrap(self.grid.pending_wrap());
             Self::copy_margins(self.grid, &mut main_grid);
+            // The pen carries back unchanged, so does its background.
+            Self::sync_bce_template(self.style, &mut main_grid);
             // Keep the alternate buffer: xterm's is persistent, and a re-entry shows it again.
             let mut alt = std::mem::replace(self.grid, main_grid);
             alt.drop_resize_undo();
@@ -428,8 +449,8 @@ impl TerminalHandler<'_> {
 
     /// Exit the alternate screen for mode 1047: clear it, then swap back. No cursor restore.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "ResetAlternateScreen",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
@@ -452,10 +473,10 @@ impl TerminalHandler<'_> {
     }
 
     /// Enter the alternate screen for mode 1049: save the cursor, switch, clear the alt screen.
-    /// The altscreen model's `Enter`.
+    /// [`Self::exit_alternate_screen`] undoes it losslessly.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "SetAlternateScreen",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
@@ -464,8 +485,8 @@ impl TerminalHandler<'_> {
     // The `alt_screen` refinement is checked by `tests/conformance_altscreen.rs`, which
     // drives `process` and projects each state onto the spec's variables.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "alt_screen",
             action = "Enter",
             project = "aterm_core::terminal::project_altscreen"
@@ -494,10 +515,7 @@ impl TerminalHandler<'_> {
         self.transient.alt_entered_without_cursor_save = false;
         self.transient.conhost_alt_screen_left_up = false;
         self.kitty_keyboard.switch_screen(true);
-        #[cfg(feature = "sixel")]
-        {
-            self.sixel.pending_image = None;
-        }
+        self.sixel.pending_image = None;
         self.transient.current_hyperlink = None;
         self.transient.current_hyperlink_id = None;
         self.transient.update_has_transient_extras();
@@ -526,19 +544,18 @@ impl TerminalHandler<'_> {
         self.grid.invalidate_host_coordinates();
     }
 
-    /// Exit the alternate screen for mode 1049, restoring the saved cursor: the altscreen
-    /// model's `Leave`.
+    /// Exit the alternate screen for mode 1049, restoring the saved cursor.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "ResetAlternateScreen",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "alt_screen",
             action = "Leave",
             project = "aterm_core::terminal::project_altscreen"
@@ -547,15 +564,27 @@ impl TerminalHandler<'_> {
     fn exit_alternate_screen(&mut self) {
         if !self.modes.alternate_screen {
             self.keep_screen_from_conhost_repaint();
+            // A stray `?1049l` moves nothing. xterm's 1049 reset is
+            // `FromAlternate; CursorRestore` (charproc.c `srm_OPT_ALTBUF_CURSOR`)
+            // and only the first half needs the alternate screen up, so xterm
+            // (and Ghostty) restore the main DECSC slot, or home the cursor when
+            // none was saved; Alacritty and WezTerm ignore it, and so does aterm,
+            // deliberately. aterm leaves an orphaned alternate screen itself
+            // (`leave_orphaned_alternate_screen`, on the shell's next prompt
+            // mark after a full-screen app died) and restores the slot then
+            // without consuming it, as DECRC must keep it; the user's own
+            // `tput rmcup` afterwards, or a script's unconditional rmcup in an
+            // exit trap, would jump the cursor back to the dead app's launch row
+            // (or home) and the next prompt would overwrite live output. The
+            // altscreen model agrees: its `Leave` is guarded by `active = alt`,
+            // and this arm is a stutter. The oracle records the difference
+            // (aterm-conformance `tests/vt_oracle`, `stray_1049l_*`).
             return;
         }
 
         // xterm's 1049 reset (FromAlternate + CursorRestore) saves the alt cursor nowhere.
         self.kitty_keyboard.switch_screen(false);
-        #[cfg(feature = "sixel")]
-        {
-            self.sixel.pending_image = None;
-        }
+        self.sixel.pending_image = None;
         self.transient.current_hyperlink = None;
         self.transient.current_hyperlink_id = None;
         self.transient.update_has_transient_extras();
@@ -598,7 +627,12 @@ impl TerminalHandler<'_> {
             .leave_orphaned(self.grid, self.transient.sync_end_seq);
         let conhost = self.modes.win32_input_active();
         let conhost_cursor = (self.grid.cursor(), self.grid.pending_wrap());
-        if self.transient.alt_entered_without_cursor_save {
+        // An empty main slot proves the screen was not entered by `?1049h`, which
+        // always fills it (and nothing on the alternate screen empties it): a
+        // checkpoint restore forgets the transient flag, and the 1049 exit of an
+        // unsaved slot homes the cursor, so the shell's prompt would overwrite the
+        // output a `?47h`/`?1047h` app left above it.
+        if self.transient.alt_entered_without_cursor_save || self.cursor_save.main.is_none() {
             self.exit_alternate_screen_1047();
         } else {
             self.exit_alternate_screen();
@@ -618,9 +652,11 @@ impl TerminalHandler<'_> {
     /// Reset the modes a dead full-screen app owned, which its own exit would
     /// have reset and the exits above carry over: scroll region and horizontal
     /// margins (shell output would never reach the scrollback), mouse tracking,
-    /// application cursor keys and keypad, and an open 2026 window. Focus
-    /// reporting (conhost asks for it at ConPTY start), bracketed paste and the
-    /// keyboard protocols stay: the shell sets those itself.
+    /// application cursor keys and keypad, and an open 2026 window, the
+    /// program's own frame included after the timeout cleared the mode
+    /// (`Terminal::sync_frame_unfinished`). Focus reporting (conhost asks for
+    /// it at ConPTY start), bracketed paste and the keyboard protocols stay:
+    /// the shell sets those itself.
     fn release_dead_app_modes(&mut self) {
         self.grid.reset_scroll_region();
         self.modes.left_right_margin_mode = false;
@@ -629,7 +665,7 @@ impl TerminalHandler<'_> {
         self.modes.mouse_encoding = MouseEncoding::X10;
         self.modes.application_cursor_keys = false;
         self.modes.application_keypad = false;
-        if self.modes.synchronized_output {
+        if self.modes.synchronized_output || self.transient.app_sync_open {
             self.disable_synchronized_output();
         }
     }
@@ -660,8 +696,8 @@ impl TerminalHandler<'_> {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "SetBracketedPaste",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
@@ -672,8 +708,8 @@ impl TerminalHandler<'_> {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "ResetBracketedPaste",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
@@ -684,8 +720,8 @@ impl TerminalHandler<'_> {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "SetMouseMode",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
@@ -696,8 +732,8 @@ impl TerminalHandler<'_> {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "SetMouseMode",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
@@ -708,8 +744,8 @@ impl TerminalHandler<'_> {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "SetMouseMode",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
@@ -720,8 +756,8 @@ impl TerminalHandler<'_> {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "SetMouseMode",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
@@ -732,8 +768,8 @@ impl TerminalHandler<'_> {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "ResetMouseMode",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
@@ -744,8 +780,8 @@ impl TerminalHandler<'_> {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "SetSgrMouseEncoding",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
@@ -756,8 +792,8 @@ impl TerminalHandler<'_> {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "ResetSgrMouseEncoding",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
@@ -785,7 +821,22 @@ impl TerminalHandler<'_> {
     /// Restore cursor position, style and modes from a snapshot (if any). With origin mode
     /// restored on, the cursor is clamped as DECRC clamps it.
     fn restore_cursor_snapshot(&mut self, state: Option<SavedCursorState>) {
-        if let Some(state) = state {
+        let Some(state) = state else {
+            // xterm's `CursorRestore` of a slot never saved (cursor.c: the
+            // zeroed `SavedCursor`): home, origin mode off, rendition and
+            // charsets reset, as DECRC does (`restore_cursor_state`). Reached by
+            // a stray `?1049l`, and by `?47h`/`?1047h` left with `?1049l`.
+            self.modes.origin_mode = false;
+            *self.style = CurrentStyle::default();
+            *self.charset = CharacterSetState::default();
+            self.transient.current_underline_color = None;
+            self.transient.update_has_transient_extras();
+            self.grid.set_cursor(0, 0);
+            self.grid
+                .set_cursor_template(crate::grid::Cell::EMPTY, None);
+            return;
+        };
+        {
             // DECAWM is not restored: xterm's CursorRestoreFlags applies only
             // ATTRIBUTES|ORIGIN|PROTECTED (cursor.c).
             self.modes.origin_mode = state.origin_mode;
@@ -1395,16 +1446,6 @@ mod decbkm_tests {
                 .contains(KeyboardMode::BACKARROW_SENDS_BS)
         );
     }
-
-    #[test]
-    fn decrqm_reports_mode_67_state() {
-        let mut term = Terminal::new(24, 80);
-        term.process(b"\x1b[?67$p");
-        assert_eq!(term.take_response().unwrap_or_default(), b"\x1b[?67;2$y");
-        term.process(b"\x1b[?67h");
-        term.process(b"\x1b[?67$p");
-        assert_eq!(term.take_response().unwrap_or_default(), b"\x1b[?67;1$y");
-    }
 }
 
 /// Mode 2027 is permanently reset, since the print path does not keep each UAX #29 cluster
@@ -1445,27 +1486,6 @@ mod xterm_keyboard_mode_tests {
     use aterm_types::keyboard::{Key, KeyboardMode, Modifiers, encode_key};
 
     // --- DECSET/DECRST -> KeyboardMode projection ---
-
-    #[test]
-    fn mode_1039_reset_sets_alt_no_esc_flag() {
-        let mut term = Terminal::new(24, 80);
-        // altSendsEscape is on by default, so ALT_NO_ESC is absent.
-        assert!(!term.keyboard_mode().contains(KeyboardMode::ALT_NO_ESC));
-        term.process(b"\x1b[?1039l");
-        assert!(term.keyboard_mode().contains(KeyboardMode::ALT_NO_ESC));
-        term.process(b"\x1b[?1039h");
-        assert!(!term.keyboard_mode().contains(KeyboardMode::ALT_NO_ESC));
-    }
-
-    #[test]
-    fn mode_1036_meta_send_escape_toggles_flag() {
-        let mut term = Terminal::new(24, 80);
-        assert!(!term.keyboard_mode().contains(KeyboardMode::META_SENDS_ESC));
-        term.process(b"\x1b[?1036h");
-        assert!(term.keyboard_mode().contains(KeyboardMode::META_SENDS_ESC));
-        term.process(b"\x1b[?1036l");
-        assert!(!term.keyboard_mode().contains(KeyboardMode::META_SENDS_ESC));
-    }
 
     #[test]
     fn mode_1035_special_modifiers_toggles_flag() {
@@ -1552,15 +1572,6 @@ mod xterm_keyboard_mode_tests {
         term.process(b"\x1b[?1045$p");
         assert_eq!(term.take_response().unwrap_or_default(), b"\x1b[?1045;1$y");
     }
-
-    #[test]
-    fn mode_1045_tracked_but_does_not_affect_encoding() {
-        let mut term = Terminal::new(24, 80);
-        let before = term.keyboard_mode();
-        term.process(b"\x1b[?1045h");
-        // Mode 1045 is tracked-only: the KeyboardMode is unchanged.
-        assert_eq!(term.keyboard_mode(), before);
-    }
 }
 
 #[cfg(test)]
@@ -1576,50 +1587,6 @@ mod win32_input_mode_tests {
         let mut term = Terminal::new(24, 80);
         term.set_win32_input_enabled(true);
         term
-    }
-
-    #[test]
-    fn mode_9001_is_off_by_default_and_toggles_the_win32_input_bit() {
-        let mut term = conpty_term();
-        assert!(!term.modes().win32_input_mode);
-        assert!(!term.keyboard_mode().contains(KeyboardMode::WIN32_INPUT));
-        term.process(b"\x1b[?9001h");
-        assert!(term.modes().win32_input_mode);
-        assert!(term.keyboard_mode().contains(KeyboardMode::WIN32_INPUT));
-        term.process(b"\x1b[?9001l");
-        assert!(!term.modes().win32_input_mode);
-        assert!(!term.keyboard_mode().contains(KeyboardMode::WIN32_INPUT));
-    }
-
-    #[test]
-    fn mode_9001_is_consumed_not_echoed_to_the_grid() {
-        // conhost sends it at session start: consumed whole, nothing on the grid.
-        let mut term = conpty_term();
-        term.process(b"\x1b[?9001h");
-        let cursor = term.cursor();
-        assert_eq!((cursor.row, cursor.col), (0, 0));
-    }
-
-    #[test]
-    fn decrqm_reports_mode_9001_state() {
-        let mut term = conpty_term();
-        term.process(b"\x1b[?9001$p");
-        assert_eq!(term.take_response().unwrap_or_default(), b"\x1b[?9001;2$y");
-        term.process(b"\x1b[?9001h");
-        term.process(b"\x1b[?9001$p");
-        assert_eq!(term.take_response().unwrap_or_default(), b"\x1b[?9001;1$y");
-    }
-
-    #[test]
-    fn xtsave_and_xtrestore_carry_mode_9001() {
-        // XTSAVE's table (`query_dec_mode`) must carry every mode DECRQM reports, 9001 too.
-        let mut term = conpty_term();
-        term.process(b"\x1b[?9001h");
-        term.process(b"\x1b[?9001s"); // XTSAVE
-        term.process(b"\x1b[?9001l");
-        assert!(!term.modes().win32_input_mode);
-        term.process(b"\x1b[?9001r"); // XTRESTORE
-        assert!(term.modes().win32_input_mode);
     }
 
     #[test]
@@ -2151,6 +2118,143 @@ mod conhost_left_alt_screen_tests {
     }
 }
 
+/// `?1049l` on the primary screen moves nothing (see `exit_alternate_screen`:
+/// xterm restores the DECSC slot there, Alacritty and WezTerm ignore it, and
+/// aterm's own orphaned-screen recovery makes the restore dangerous). A `?47h`
+/// screen left with `?1049l` is a real exit and restores as xterm does.
+#[cfg(test)]
+mod stray_1049_reset_tests {
+    use crate::grid::CellFlags;
+    use crate::terminal::Terminal;
+
+    fn cursor(term: &Terminal) -> (u16, u16) {
+        let c = term.cursor();
+        (c.row, c.col)
+    }
+
+    #[test]
+    fn a_stray_1049l_leaves_the_cursor_and_the_pen_put() {
+        let mut term = Terminal::new(4, 20);
+        term.process(b"\x1b[2;6H\x1b7\x1b[4;12H\x1b[1m\x1b[?1049l");
+        assert!(!term.is_alternate_screen());
+        assert_eq!(cursor(&term), (3, 11), "not back to the DECSC position");
+        assert!(
+            term.style().flags.contains(CellFlags::BOLD),
+            "the pen stays"
+        );
+        let mut term = Terminal::new(4, 20);
+        term.process(b"\t\x1b[1;31m\x1b[?1049l");
+        assert_eq!(cursor(&term), (0, 8), "nor home with nothing saved");
+        assert!(term.style().flags.contains(CellFlags::BOLD));
+    }
+
+    /// The case that rules out xterm's restore: a full-screen app dies on the
+    /// alternate screen, the shell's prompt mark leaves it for the app
+    /// (restoring the slot its `?1049h` saved, which DECRC must keep), output
+    /// and prompts follow, and then the user types `tput rmcup`. A restore
+    /// there put the cursor back on the dead app's launch row, and the next
+    /// prompt overwrote `fileA fileB`.
+    #[test]
+    fn a_rmcup_after_the_orphaned_screen_recovery_keeps_the_cursor() {
+        let mut term = Terminal::new(8, 30);
+        term.process(b"out1\r\nout2\r\n$ vim\r\n\x1b[?1049h\x1b[H\x1b[2Jvim screen");
+        // vim is SIGKILLed; the shell paints its prompt with a 133 mark.
+        term.process(b"\x1b]133;A\x07$ ");
+        assert!(
+            !term.is_alternate_screen(),
+            "the prompt mark left the dead screen"
+        );
+        assert_eq!(
+            cursor(&term),
+            (3, 2),
+            "the slot vim's ?1049h saved, plus the prompt"
+        );
+        term.process(b"ls\r\nfileA fileB\r\n\x1b]133;A\x07$ echo hi\r\nhi\r\n\x1b]133;A\x07$ ");
+        // The rmcup line's LF scrolls the screen one row, so `fileA fileB`
+        // is on row 3, the row the slot names.
+        term.process(b"tput rmcup\r\n\x1b[?1049l\x1b[23;0;0t\x1b]133;A\x07$ ");
+        assert_eq!(cursor(&term), (7, 2), "the prompt lands below the output");
+        let row = |r: u16| term.grid().row_text(r).unwrap_or_default();
+        assert_eq!(
+            row(3).trim_end(),
+            "fileA fileB",
+            "nothing overwrote the output"
+        );
+        assert_eq!(row(7).trim_end(), "$");
+    }
+
+    #[test]
+    fn a_47_screen_left_with_1049l_restores_like_xterm() {
+        // `?47h` saves nothing; the `?1049l` exit restores the main slot (here
+        // unsaved, so home) exactly as a 1049 exit does.
+        let mut term = Terminal::new(4, 20);
+        term.process(b"\x1b[3;9H\x1b[?47h\x1b[2;2Hx\x1b[?1049l");
+        assert!(!term.is_alternate_screen());
+        assert_eq!(cursor(&term), (0, 0));
+    }
+
+    #[test]
+    fn a_restored_session_leaves_a_dead_1047_screen_where_the_live_one_would() {
+        // An app entered with `?1047h` (no cursor ever saved) when a seamless update
+        // checkpointed the session; it then dies and the shell's prompt mark leaves
+        // its screen. The checkpoint does not carry which mode entered the screen,
+        // so the restored session must reach the live one's 1047 exit from the
+        // empty main slot, not a 1049 exit that homes the cursor onto `out1`.
+        let mut live = Terminal::new(8, 30);
+        live.process(
+            b"out1\r\nout2\r\nout3\r\n$ app\r\n\x1b[?1047h\x1b[H\x1b[2Jfull screen\x1b[5;3H",
+        );
+        let mut restored = Terminal::from_checkpoint(&live.checkpoint());
+        for term in [&mut live, &mut restored] {
+            assert!(term.is_alternate_screen());
+            term.process(b"\x1b]133;A\x07$ ");
+            assert!(
+                !term.is_alternate_screen(),
+                "the prompt mark left the dead screen"
+            );
+        }
+        assert_eq!(cursor(&restored), cursor(&live));
+        let row = |t: &Terminal, r: u16| t.grid().row_text(r).unwrap_or_default();
+        assert_eq!(
+            row(&restored, 0).trim_end(),
+            "out1",
+            "nothing overwrote the output"
+        );
+        for r in 0..8 {
+            assert_eq!(row(&restored, r), row(&live, r), "row {r}");
+        }
+    }
+}
+
+/// The BCE template across `?47`/`?1047` switches: the pen stays, so the
+/// buffer swapped in must erase and scroll with the current background
+/// (xterm's `ClearCells`/`ScrnClearLines` read the one colour pair). Found by
+/// the astream-term differential oracle (aterm-conformance `tests/vt_oracle`).
+#[cfg(test)]
+mod alt_switch_bce_tests {
+    use crate::terminal::Terminal;
+
+    fn bg_index(term: &Terminal, row: u16, col: u16) -> Option<u8> {
+        let colors = term.grid().cell(row, col)?.colors();
+        colors.bg_is_indexed().then(|| colors.bg_index())
+    }
+
+    #[test]
+    fn a_line_scrolled_in_on_the_switched_in_buffer_takes_the_current_background() {
+        for enter in [&b"\x1b[?47h"[..], b"\x1b[?1047h"] {
+            let mut term = Terminal::new(3, 10);
+            term.process(b"\x1b[44m");
+            term.process(enter);
+            term.process(b"\x1b[3;1H\n");
+            assert_eq!(bg_index(&term, 2, 0), Some(4), "entering with {enter:?}");
+        }
+        // And back on the main buffer after a background set on the alternate.
+        let mut term = Terminal::new(3, 10);
+        term.process(b"\x1b[?47h\x1b[42m\x1b[?47l\x1b[3;1H\n");
+        assert_eq!(bg_index(&term, 2, 0), Some(2), "leaving ?47");
+    }
+}
+
 #[cfg(test)]
 #[path = "conpty_dead_alt_screen_replay_tests.rs"]
 mod conpty_dead_alt_screen_replay_tests;
@@ -2160,13 +2264,37 @@ mod in_band_size_tests {
     use crate::terminal::Terminal;
 
     #[test]
-    fn mode_2048_emits_on_enable_with_default_cell_px() {
+    fn mode_2048_reports_no_pixels_before_a_host_measures() {
+        // No host has reported a cell box: 0 pixels, as the PTY's winsize says,
+        // never the 8x16 placeholder.
         let mut term = Terminal::new(24, 80);
-        // Default cell px is 8x16 -> pixH = 24*16 = 384, pixW = 80*8 = 640.
         term.process(b"\x1b[?2048h");
         assert_eq!(
             term.take_response().unwrap_or_default(),
-            b"\x1b[48;24;80;384;640t"
+            b"\x1b[48;24;80;0;0t"
+        );
+    }
+
+    #[test]
+    fn mode_2048_reports_a_new_cell_box_at_the_same_size() {
+        // The first measurement, then a DPI move: rows/cols stay, pixels change.
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b[?2048h");
+        let _ = term.take_response(); // enable report
+        term.set_cell_pixel_size(9, 19);
+        assert_eq!(
+            term.take_response().unwrap_or_default(),
+            b"\x1b[48;24;80;456;720t"
+        );
+        term.set_cell_pixel_size(18, 38);
+        assert_eq!(
+            term.take_response().unwrap_or_default(),
+            b"\x1b[48;24;80;912;1440t"
+        );
+        term.set_cell_pixel_size(18, 38);
+        assert!(
+            term.take_response().is_none(),
+            "an unchanged box (a host's next layout pass) reports nothing"
         );
     }
 
@@ -2181,7 +2309,7 @@ mod in_band_size_tests {
         term.process(&input);
         assert_eq!(
             term.take_response().unwrap_or_default(),
-            b"\x1b[48;24;80;384;640t",
+            b"\x1b[48;24;80;0;0t",
             "10k repeated enables emit exactly one report"
         );
     }
@@ -2226,17 +2354,6 @@ mod in_band_size_tests {
             term.take_response().is_none(),
             "no in-band report unless mode 2048 is set"
         );
-    }
-
-    #[test]
-    fn decrqm_reports_mode_2048_state() {
-        let mut term = Terminal::new(24, 80);
-        term.process(b"\x1b[?2048$p");
-        assert_eq!(term.take_response().unwrap_or_default(), b"\x1b[?2048;2$y");
-        term.process(b"\x1b[?2048h");
-        let _ = term.take_response(); // enable report
-        term.process(b"\x1b[?2048$p");
-        assert_eq!(term.take_response().unwrap_or_default(), b"\x1b[?2048;1$y");
     }
 }
 
@@ -2315,6 +2432,76 @@ mod mode_and_query_agreement_tests {
             };
             assert_eq!(decrqss, expect_decrqss, "DECRQSS after DECSCUSR {param}");
         }
+    }
+
+    /// Replay the recovered mode-12 request with the current explicit ConPTY
+    /// capability: mode 12 must not replace the configured or DECSCUSR style.
+    #[test]
+    fn mode_12_under_conhost_keeps_the_configured_cursor() {
+        const VIM_START: &[u8] = b"\x1b[?1049h\x1b[?12h\x1b[?12l";
+        const VIM_EXIT: &[u8] = b"\x1b[?25h\x1b[?1049l";
+
+        let mut term = Terminal::new(24, 80);
+        term.set_win32_input_enabled(true);
+        term.process(b"\x1b[?9001h");
+        assert!(
+            term.modes().win32_input_mode,
+            "the console-host mode is active"
+        );
+        term.process(VIM_START);
+        assert_eq!(term.cursor_style(), CursorStyle::BlinkingBlock);
+        assert_eq!(decrqm(&mut term, 12), b"\x1b[?12;1$y");
+        term.process(VIM_EXIT);
+        assert_eq!(
+            term.cursor_style(),
+            CursorStyle::BlinkingBlock,
+            "the prompt cursor still blinks after the alternate screen closes"
+        );
+
+        // DECTCEM in the same request still controls visibility.
+        term.process(b"\x1b[?25l");
+        assert!(!term.cursor_visible());
+        term.process(b"\x1b[?12;25h");
+        assert!(term.cursor_visible());
+        assert_eq!(term.cursor_style(), CursorStyle::BlinkingBlock);
+
+        // DECSCUSR still chooses the style, including its blink bit.
+        term.process(b"\x1b[6 q");
+        term.process(b"\x1b[?12h");
+        assert_eq!(term.cursor_style(), CursorStyle::SteadyBar);
+        assert_eq!(decrqm(&mut term, 12), b"\x1b[?12;2$y");
+
+        let mut term = Terminal::new(24, 80);
+        term.set_default_cursor_style(CursorStyle::SteadyUnderline);
+        term.set_win32_input_enabled(true);
+        term.process(b"\x1b[?9001h\x1b[?12h");
+        assert!(term.modes().win32_input_mode);
+        assert_eq!(term.cursor_style(), CursorStyle::SteadyUnderline);
+    }
+
+    #[test]
+    fn mode_12_still_applies_when_unix_ignores_mode_9001() {
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b[?9001h");
+        assert!(!term.modes().win32_input_mode);
+        term.process(b"\x1b[?1049h\x1b[?12h\x1b[?12l");
+        term.process(b"\x1b[?25h\x1b[?1049l");
+        assert_eq!(term.cursor_style(), CursorStyle::SteadyBlock);
+        assert!(term.cursor_visible());
+        assert_eq!(decrqm(&mut term, 12), b"\x1b[?12;2$y");
+
+        // Host posture can revoke a previously negotiated mode. Its stored
+        // bit alone must not suppress ordinary mode 12 on the new host.
+        let mut term = Terminal::new(24, 80);
+        term.set_win32_input_enabled(true);
+        term.process(b"\x1b[?9001h");
+        assert!(term.modes().win32_input_active());
+        term.set_win32_input_enabled(false);
+        assert!(term.modes().win32_input_mode, "the negotiated bit is stale");
+        assert!(!term.modes().win32_input_active());
+        term.process(b"\x1b[?12l");
+        assert_eq!(term.cursor_style(), CursorStyle::SteadyBlock);
+        assert_eq!(decrqm(&mut term, 12), b"\x1b[?12;2$y");
     }
 
     /// Every mode DECRQM can report is one XTSAVE/XTRESTORE can carry: the two

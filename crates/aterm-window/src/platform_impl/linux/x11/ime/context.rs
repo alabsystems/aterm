@@ -4,12 +4,15 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/ime/context.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
+// Modified by the aterm project in 2026; see the repository NOTICE. (aterm-x11's XIM
+// declarations, where upstream used x11-dl's.)
+
 use std::ffi::CStr;
 use std::os::raw::c_short;
 use std::sync::Arc;
 use std::{mem, ptr};
 
-use x11_dl::xlib::{XIMCallback, XIMPreeditCaretCallbackStruct, XIMPreeditDrawCallbackStruct};
+use super::ffi::{XIMCallback, XIMPreeditCaretCallbackStruct, XIMPreeditDrawCallbackStruct};
 
 use super::{ffi, util, XConnection, XError};
 use crate::platform_impl::platform::x11::ime::input_method::{InputMethod, Style, XIMStyle};
@@ -138,7 +141,7 @@ extern "C" fn preedit_caret_callback(
     let client_data = unsafe { &mut *(client_data as *mut ImeContextClientData) };
     let call_data = unsafe { &mut *(call_data as *mut XIMPreeditCaretCallbackStruct) };
 
-    if call_data.direction == ffi::XIMCaretDirection::XIMAbsolutePosition {
+    if call_data.direction == ffi::xim_caret::ABSOLUTE_POSITION {
         client_data.cursor_pos = call_data.position as usize;
         let cursor_byte_pos = calc_byte_position(&client_data.text, client_data.cursor_pos);
 
@@ -258,9 +261,9 @@ impl ImeContext {
         let ic = unsafe {
             (xconn.xlib.XCreateIC)(
                 im,
-                ffi::XNInputStyle_0.as_ptr() as *const _,
+                ffi::xn::INPUT_STYLE.as_ptr() as *const _,
                 style,
-                ffi::XNClientWindow_0.as_ptr() as *const _,
+                ffi::xn::CLIENT_WINDOW.as_ptr() as *const _,
                 window,
                 ptr::null_mut::<()>(),
             )
@@ -280,13 +283,13 @@ impl ImeContext {
         let preedit_attr = util::memory::XSmartPointer::new(xconn, unsafe {
             (xconn.xlib.XVaCreateNestedList)(
                 0,
-                ffi::XNPreeditStartCallback_0.as_ptr() as *const _,
+                ffi::xn::PREEDIT_START_CALLBACK.as_ptr() as *const _,
                 &(preedit_callbacks.start_callback) as *const _,
-                ffi::XNPreeditDoneCallback_0.as_ptr() as *const _,
+                ffi::xn::PREEDIT_DONE_CALLBACK.as_ptr() as *const _,
                 &(preedit_callbacks.done_callback) as *const _,
-                ffi::XNPreeditCaretCallback_0.as_ptr() as *const _,
+                ffi::xn::PREEDIT_CARET_CALLBACK.as_ptr() as *const _,
                 &(preedit_callbacks.caret_callback) as *const _,
-                ffi::XNPreeditDrawCallback_0.as_ptr() as *const _,
+                ffi::xn::PREEDIT_DRAW_CALLBACK.as_ptr() as *const _,
                 &(preedit_callbacks.draw_callback) as *const _,
                 ptr::null_mut::<()>(),
             )
@@ -296,11 +299,11 @@ impl ImeContext {
         let ic = unsafe {
             (xconn.xlib.XCreateIC)(
                 im,
-                ffi::XNInputStyle_0.as_ptr() as *const _,
+                ffi::xn::INPUT_STYLE.as_ptr() as *const _,
                 style,
-                ffi::XNClientWindow_0.as_ptr() as *const _,
+                ffi::xn::CLIENT_WINDOW.as_ptr() as *const _,
                 window,
-                ffi::XNPreeditAttributes_0.as_ptr() as *const _,
+                ffi::xn::PREEDIT_ATTRIBUTES.as_ptr() as *const _,
                 preedit_attr.ptr,
                 ptr::null_mut::<()>(),
             )
@@ -318,9 +321,9 @@ impl ImeContext {
         let ic = unsafe {
             (xconn.xlib.XCreateIC)(
                 im,
-                ffi::XNInputStyle_0.as_ptr() as *const _,
+                ffi::xn::INPUT_STYLE.as_ptr() as *const _,
                 style,
-                ffi::XNClientWindow_0.as_ptr() as *const _,
+                ffi::xn::CLIENT_WINDOW.as_ptr() as *const _,
                 window,
                 ptr::null_mut::<()>(),
             )
@@ -364,7 +367,7 @@ impl ImeContext {
                 xconn,
                 (xconn.xlib.XVaCreateNestedList)(
                     0,
-                    ffi::XNSpotLocation_0.as_ptr(),
+                    ffi::xn::SPOT_LOCATION.as_ptr(),
                     &self.ic_spot,
                     ptr::null_mut::<()>(),
                 ),
@@ -373,7 +376,7 @@ impl ImeContext {
 
             (xconn.xlib.XSetICValues)(
                 self.ic,
-                ffi::XNPreeditAttributes_0.as_ptr() as *const _,
+                ffi::xn::PREEDIT_ATTRIBUTES.as_ptr() as *const _,
                 preedit_attr.ptr,
                 ptr::null_mut::<()>(),
             );

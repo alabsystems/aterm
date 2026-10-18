@@ -24,6 +24,15 @@ fn dispatch(lab: &mut Lab, event: AppEvent) {
     lab.dispatch(event);
 }
 
+/// A wide window whose Security list scrolls: the shipped 1074×684 where the
+/// page holds This Mac's Universal Control and Secure Keyboard Entry (macOS's
+/// rows, `native_advanced_effect`), a shorter one where its six other rows
+/// fit 684 whole.
+fn wide_scrolling_security() -> (f32, f32) {
+    let macos_rows = native_advanced_key(prefs::EDIT_MACHINE_UNIVERSAL_CONTROL);
+    (1_074.0, if macos_rows { 684.0 } else { 560.0 })
+}
+
 /// A switch keeps its place when its Reset comes: every row keeps Reset's
 /// place, on a wide page and a compact one.
 #[test]
@@ -233,6 +242,7 @@ fn home_and_end_move_the_list_to_its_ends() {
 /// Up does the same, to the screen's first control too.
 #[test]
 fn the_sidebar_keys_act_on_what_the_keyboard_is_in() {
+    let (width, height) = wide_scrolling_security();
     let mut lab = Lab::new("");
     lab.state_mut().navigate(SettingsRoute::Security);
     for (event, row) in [
@@ -240,9 +250,9 @@ fn the_sidebar_keys_act_on_what_the_keyboard_is_in() {
         (TextInputEvent::End { extend: false }, "settings/nav/about"),
     ] {
         lab.state_mut().common.last_focus = Some(UiKey::new("settings/nav/security"));
-        let _ = lab.compile(1_074.0, 684.0);
+        let _ = lab.compile(width, height);
         dispatch(&mut lab, AppEvent::TextInput(event));
-        let _ = lab.compile(1_074.0, 684.0);
+        let _ = lab.compile(width, height);
         let state = lab.state();
         assert_eq!(
             state.route,
@@ -258,9 +268,9 @@ fn the_sidebar_keys_act_on_what_the_keyboard_is_in() {
     }
 
     lab.state_mut().common.last_focus = Some(UiKey::new("settings/nav/security"));
-    let _ = lab.compile(1_074.0, 684.0);
+    let _ = lab.compile(width, height);
     dispatch(&mut lab, AppEvent::ScrollPage(1));
-    let _ = lab.compile(1_074.0, 684.0);
+    let _ = lab.compile(width, height);
     let (plan, shown) = lab.state().scroll_shown().expect("a list");
     assert!(shown.start > 0, "Page Down turns the list from the sidebar");
     let first_on_screen = plan
@@ -277,7 +287,7 @@ fn the_sidebar_keys_act_on_what_the_keyboard_is_in() {
         &mut lab,
         AppEvent::TextInput(TextInputEvent::Home { extend: false }),
     );
-    let _ = lab.compile(1_074.0, 684.0);
+    let _ = lab.compile(width, height);
     let (plan, shown) = lab.state().scroll_shown().expect("a list");
     assert_eq!(shown.start, 0, "Home then takes the list to its top");
     assert_eq!(
@@ -291,9 +301,9 @@ fn the_sidebar_keys_act_on_what_the_keyboard_is_in() {
     // and the keyboard goes to the screen's first control, never down to its
     // last.
     lab.state_mut().common.last_focus = Some(UiKey::new("settings/nav/security"));
-    let _ = lab.compile(1_074.0, 684.0);
+    let _ = lab.compile(width, height);
     dispatch(&mut lab, AppEvent::ScrollPage(-1));
-    let _ = lab.compile(1_074.0, 684.0);
+    let _ = lab.compile(width, height);
     let (plan, shown) = lab.state().scroll_shown().expect("a list");
     assert_eq!(shown.start, 0, "the list stays at its top");
     assert_eq!(
@@ -398,7 +408,7 @@ fn home_and_end_reach_the_first_and_last_category() {
 #[test]
 fn a_status_bar_never_takes_a_row_from_the_screen() {
     let key = prefs::EDIT_ALLOW_OSC52_QUERY;
-    for (width, height) in [(738.0, 418.0), (1_074.0, 684.0)] {
+    for (width, height) in [(738.0, 418.0), wide_scrolling_security()] {
         let mut lab = Lab::new("");
         lab.state_mut().navigate(SettingsRoute::Security);
         let control = format!("settings/control/{key}");
@@ -634,6 +644,80 @@ fn the_sidebar_is_one_tab_stop_and_its_arrows_open_pages() {
     );
 }
 
+/// SETTINGS ▸ THEMES HAS A RAIL ROW THE KEYBOARD REACHES. Opening it from
+/// the rail leaves the keyboard on its own row, a node the tree has (it was
+/// a key with no node when the rail listed no Themes row, so the keyboard
+/// was lost); Up from it opens Appearance and the row goes, Down opens
+/// Wallpaper, and Tab into the sidebar lands on it.
+#[test]
+fn arrows_and_tab_reach_the_themes_row() {
+    let key = |key: &str| UiKey::new(key);
+    let focus = |lab: &Lab| {
+        lab.state()
+            .common
+            .last_focus
+            .as_ref()
+            .map(|key| key.as_str().to_string())
+    };
+    let open_themes = |lab: &mut Lab| {
+        dispatch(
+            lab,
+            AppEvent::FocusChanged(Some(key("settings/nav/appearance"))),
+        );
+        let _ = lab.invoke(route_action(SettingsRoute::Themes).as_str(), None);
+        assert_eq!(lab.state().route, SettingsRoute::Themes);
+    };
+    let mut lab = Lab::new("");
+    lab.state_mut().navigate(SettingsRoute::Appearance);
+    let _ = lab.compile(1_200.0, 820.0);
+    open_themes(&mut lab);
+    assert_eq!(focus(&lab).as_deref(), Some("settings/nav/themes"));
+    let compiled = lab.compile(1_200.0, 820.0);
+    assert!(
+        compiled.semantic(&key("settings/nav/themes")).is_some(),
+        "the keyboard is on a row the tree has"
+    );
+    assert!(compiled.focus_order.contains(&key("settings/nav/themes")));
+    let order = compiled.focus_order.clone();
+    assert_eq!(
+        lab.state().tab_past_navigation(
+            Some(&key("settings/search")),
+            &key("settings/nav/home"),
+            true,
+            &order
+        ),
+        Some(key("settings/nav/themes")),
+        "Tab into the sidebar lands on the selected Themes row"
+    );
+
+    dispatch(&mut lab, AppEvent::StepFocus(-1));
+    assert_eq!(lab.state().route, SettingsRoute::Appearance);
+    assert_eq!(focus(&lab).as_deref(), Some("settings/nav/appearance"));
+    let compiled = lab.compile(1_200.0, 820.0);
+    assert!(
+        compiled.semantic(&key("settings/nav/themes")).is_none(),
+        "the row goes with its page"
+    );
+
+    open_themes(&mut lab);
+    let _ = lab.compile(1_200.0, 820.0);
+    dispatch(&mut lab, AppEvent::StepFocus(1));
+    assert_eq!(lab.state().route, SettingsRoute::Wallpaper);
+    assert_eq!(focus(&lab).as_deref(), Some("settings/nav/wallpaper"));
+
+    // From Appearance's row while Themes shows, Down is the Themes row: the
+    // page it already shows.
+    open_themes(&mut lab);
+    let _ = lab.compile(1_200.0, 820.0);
+    dispatch(
+        &mut lab,
+        AppEvent::FocusChanged(Some(key("settings/nav/appearance"))),
+    );
+    dispatch(&mut lab, AppEvent::StepFocus(1));
+    assert_eq!(lab.state().route, SettingsRoute::Themes);
+    assert_eq!(focus(&lab).as_deref(), Some("settings/nav/themes"));
+}
+
 /// The compact category sheet opens on the page it came from, and its arrow
 /// keys move down a column and along a row.
 #[test]
@@ -720,11 +804,23 @@ fn timing_is_plain_words_and_says_nothing_when_live() {
     lab.state_mut().navigate(SettingsRoute::Security);
     let compiled = lab.compile(1_074.0, 900.0);
     let key = prefs::EDIT_MACHINE_UNIVERSAL_CONTROL;
-    assert!(
-        painted_text(&compiled, &format!("settings/detail/{key}/"))
-            .contains("Applies at the next ALab tools check"),
-        "Universal Control says when it applies"
-    );
+    // Universal Control is a Security row only where it actuates (macOS's
+    // `defaults`, `native_advanced_effect`); elsewhere it lives in Modified,
+    // which says the same timing (`settings_modified_tests`).
+    if native_advanced_key(key) {
+        assert!(
+            painted_text(&compiled, &format!("settings/detail/{key}/"))
+                .contains("Applies at the next ALab tools check"),
+            "Universal Control says when it applies"
+        );
+    } else {
+        assert!(
+            compiled
+                .semantic(&UiKey::new(format!("settings/control/{key}")))
+                .is_none(),
+            "Security offers no Universal Control where it has no effect"
+        );
+    }
     lab.state_mut().navigate(SettingsRoute::Harness);
     let compiled = lab.compile(584.0, 900.0);
     for key in [
@@ -894,7 +990,6 @@ fn a_choice_set_in_its_words_saves_its_option() {
         semantic_value_for_field(
             field,
             Some(SemanticInput::Text(text.to_string())),
-            &[],
             &crate::app_config::ThemeCatalog::default(),
         )
     };

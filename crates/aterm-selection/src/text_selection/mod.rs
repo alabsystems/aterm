@@ -6,7 +6,7 @@
 //!
 //! Specified in `docs/DESIGN-selection-custody-2026-08-21.md` §5.2; the
 //! lifecycle below is the `TextSelectionLifecycle` model
-//! (`aterm_spec::derive::text_selection_lifecycle_model`), bound to these calls
+//! (`aterm_models_core::text_selection_lifecycle_model`), bound to these calls
 //! by `tests/conformance_text_selection.rs`.
 //!
 //! Selection lifecycle:
@@ -436,8 +436,8 @@ impl TextSelection {
     ///
     /// This clears any existing selection and begins a new one at the given position.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "text_selection_lifecycle",
             action = "Start",
             project = "conformance_text_selection::project"
@@ -464,8 +464,8 @@ impl TextSelection {
     ///
     /// Only works when selection is in progress.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "text_selection_lifecycle",
             action = "Update",
             project = "conformance_text_selection::project"
@@ -479,8 +479,8 @@ impl TextSelection {
 
     /// Complete the selection (mouse button released).
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "text_selection_lifecycle",
             action = "Complete",
             project = "conformance_text_selection::project"
@@ -494,8 +494,8 @@ impl TextSelection {
 
     /// Clear the selection.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "text_selection_lifecycle",
             action = "Clear",
             project = "conformance_text_selection::project"
@@ -514,8 +514,8 @@ impl TextSelection {
     /// state so that `update_selection` / `complete_selection` can refine
     /// the endpoint further.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "text_selection_lifecycle",
             action = "Extend",
             project = "conformance_text_selection::project"

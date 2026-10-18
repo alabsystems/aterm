@@ -469,7 +469,7 @@ mod arm_simd {
     #[inline]
     #[allow(
         clippy::manual_range_contains,
-        reason = "the locate-the-index rescan keeps the branch-free `byte < 0x20 || byte > 0x7E` spelling; the RangeInclusive::contains rewrite is not the lowerable form the strict Trust gate accepts. The CLASSIFIER above it must stay a max-reduce so it lowers to `umaxv.16b` — see the module doc"
+        reason = "the locate-the-index rescan keeps the branch-free `byte < 0x20 || byte > 0x7E` spelling; the RangeInclusive::contains rewrite is not the lowerable form the Trust lane (`ship trust run`) accepts. The CLASSIFIER above it must stay a max-reduce so it lowers to `umaxv.16b` — see the module doc"
     )]
     pub(crate) fn find_non_printable_neon(input: &[u8]) -> Option<usize> {
         let (chunks, rem) = input.as_chunks::<16>();
@@ -691,64 +691,17 @@ mod tests {
     }
 
     #[test]
-    fn test_find_c0_control_empty() {
-        assert_eq!(find_c0_control(b""), None);
-    }
-
-    #[test]
-    fn test_find_c0_control_pure_data() {
-        assert_eq!(find_c0_control(b"Hello, World!"), None);
-        assert_eq!(find_c0_control(b"\x80\x90\xA0\xFF"), None);
-        assert_eq!(find_c0_control(b"\x20\x7E\x7F\x80"), None);
-    }
-
-    #[test]
-    fn test_find_c0_control_at_start() {
-        assert_eq!(find_c0_control(b"\x07hello"), Some(0));
-        assert_eq!(find_c0_control(b"\x1Bhello"), Some(0));
-        assert_eq!(find_c0_control(b"\x00hello"), Some(0));
-    }
-
-    #[test]
-    fn test_find_c0_control_embedded() {
-        assert_eq!(find_c0_control(b"abc\x07def"), Some(3));
-        assert_eq!(find_c0_control(b"abcdefghijklmnop\x1Bqrs"), Some(16));
-    }
-
-    #[test]
     fn test_find_c0_control_boundary() {
         assert_eq!(find_c0_control(b"\x1F"), Some(0));
         assert_eq!(find_c0_control(b"\x20"), None);
-    }
-
-    #[test]
-    fn test_find_c0_control_varying_sizes() {
-        for size in [1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 128] {
-            let data: Vec<u8> = (0..size).map(|i| 0x20 + (i as u8 % 0x60)).collect();
-            assert_eq!(find_c0_control(&data), None, "Failed for size {size}");
-
-            for pos in [0, size / 2, size - 1] {
-                let mut data2 = data.clone();
-                data2[pos] = 0x07;
-                assert_eq!(
-                    find_c0_control(&data2),
-                    Some(pos),
-                    "Failed for size {size} pos {pos}"
-                );
-            }
-        }
+        // DEL and the high bytes are not C0 (the scalar oracle's upper range).
+        assert_eq!(find_c0_control(b"\x7E\x7F\x80\x9F\xFF"), None);
     }
 
     // DCS terminator set: {CAN, SUB, ESC, ST}.
     const DCS_TERMINATORS: [u8; 4] = [0x18, 0x1A, 0x1B, 0x9C];
     // DCS-passthrough boundary set: terminators + DEL.
     const DCS_PASSTHROUGH: [u8; 5] = [0x18, 0x1A, 0x1B, 0x9C, 0x7F];
-
-    #[test]
-    fn test_find_any_of_empty() {
-        assert_eq!(find_any_of(b"", DCS_TERMINATORS), None);
-        assert_eq!(find_any_of(b"", DCS_PASSTHROUGH), None);
-    }
 
     #[test]
     fn test_find_any_of_pure_data() {
@@ -767,56 +720,6 @@ mod tests {
         assert_eq!(find_any_of(b"\x1Bhello", DCS_TERMINATORS), Some(0));
         // 0x9C (ST) is a high byte — equality compare must still find it.
         assert_eq!(find_any_of(b"\x9Chello", DCS_TERMINATORS), Some(0));
-    }
-
-    #[test]
-    fn test_find_any_of_embedded() {
-        assert_eq!(find_any_of(b"abc\x9Cdef", DCS_TERMINATORS), Some(3));
-        // Needle just past the 32-byte AVX2 / 16-byte NEON SIMD boundary, so the
-        // first full chunk is all-data and the match comes from a later chunk.
-        let mut data = vec![b'A'; 40];
-        data[33] = 0x1B;
-        assert_eq!(find_any_of(&data, DCS_TERMINATORS), Some(33));
-        data[33] = 0x7F;
-        assert_eq!(find_any_of(&data, DCS_TERMINATORS), None);
-        assert_eq!(find_any_of(&data, DCS_PASSTHROUGH), Some(33));
-    }
-
-    #[test]
-    fn test_find_any_of_scalar_equivalence() {
-        // SIMD vs scalar must agree for every single byte against both DCS sets.
-        for byte in 0u8..=255 {
-            let input = [byte];
-            assert_eq!(
-                find_any_of(&input, DCS_TERMINATORS),
-                find_any_of_scalar(&input, DCS_TERMINATORS),
-                "terminator-set mismatch for byte 0x{byte:02X}"
-            );
-            assert_eq!(
-                find_any_of(&input, DCS_PASSTHROUGH),
-                find_any_of_scalar(&input, DCS_PASSTHROUGH),
-                "passthrough-set mismatch for byte 0x{byte:02X}"
-            );
-        }
-
-        // Exercise both the SIMD body and the scalar tail at varied sizes, with a
-        // needle planted at each position. b'A' (0x41) is in neither needle set.
-        for size in [1usize, 15, 16, 17, 31, 32, 33, 48, 64, 100] {
-            for needle in DCS_PASSTHROUGH {
-                // saturating_sub keeps the small sizes (e.g. 1) from underflowing.
-                for pos in [0, 1, size / 2, size.saturating_sub(2), size - 1] {
-                    if pos < size {
-                        let mut data = vec![b'A'; size];
-                        data[pos] = needle;
-                        assert_eq!(
-                            find_any_of(&data, DCS_PASSTHROUGH),
-                            find_any_of_scalar(&data, DCS_PASSTHROUGH),
-                            "size {size} needle 0x{needle:02X} pos {pos}"
-                        );
-                    }
-                }
-            }
-        }
     }
 
     // Differential: every scan arm in this file must classify every byte

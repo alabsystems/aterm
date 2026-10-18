@@ -12,7 +12,7 @@
 //!
 //! The laws drive the shipping `CompanionOwner` over a real `Terminal` in the
 //! native frame order (observe, prepare, tick, rescan) and conform each seam to
-//! `PetSurfaceSeam` (`aterm_spec::derive::pet_surface_seam_model`). Negative
+//! `PetSurfaceSeam` (`aterm_models_effects::pet_surface_seam_model`). Negative
 //! controls replay the retiring seams (`retire_coordinate_space`, `retire_owner`)
 //! on the same real state and reproduce the cut the model refuses.
 //!
@@ -39,7 +39,8 @@ use aterm_effects::pet_glyphs_gen::PetGlyphId;
 use aterm_effects::pet_world::{PetPane, PetWorldFacts};
 use aterm_effects::word_decorations::{DecoConfig, WordDecorations};
 use aterm_lexicon::Lexicon;
-use aterm_spec::derive::{Model, pet_surface_seam_model};
+use aterm_models_effects::pet_surface_seam_model;
+use aterm_spec::derive::Model;
 
 const FRAME: Duration = Duration::from_millis(16);
 /// The prompt the pet settles beside: `$ ` on row 10, the caret at (10, 2).

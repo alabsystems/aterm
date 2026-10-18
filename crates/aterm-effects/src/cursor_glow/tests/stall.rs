@@ -5,67 +5,46 @@
 
 use super::*;
 
-/// Thirty keys at 85 ms into a stall, the row echoing 400 ms after the last
-/// key as one 30-cell hop: licensed as one sweep, every cell lit, no
-/// `no-credits`, nothing for the ledger to bridge.
+/// Keys at 85 ms into a stall, the row echoing late as one hop: thirty keys
+/// echoed 400 ms after the last, and fifty keys (the oldest press 5.3 s old)
+/// echoed a second after the last. Each is licensed as one sweep, every cell
+/// lit, no `no-credits`, nothing for the ledger to bridge.
 #[test]
 fn thirty_keys_typed_into_a_stall_are_laid_as_one_sweep_when_the_row_echoes() {
     let g = wide_geom();
     let c = cfg(GlowStyle::RainbowKitty, true);
-    let mut out = Vec::new();
-    let mut glow = CursorGlow::default();
-    let t0 = Instant::now();
-    let pre = pre_roll(&mut glow, 27, t0, &c, g);
-    let licensed_before = glow.admission_tally().licensed;
-    let last = stalled_keys(&mut glow, 30, pre);
-    let echo = last + Duration::from_millis(400);
-    glow.tick(Some((27, 35)), echo, &c, g, &mut out);
-    let dark = dark_in(&glow, 27, 5..35);
-    assert!(
-        dark.is_empty(),
-        "thirty keys typed into a 2.9 s stall left {dark:?} dark; lit: {:?}",
-        v2_cols(&glow, 27)
-    );
-    let tally = glow.admission_tally();
-    assert_eq!(
-        (tally.declined, tally.last_decline_reason),
-        (0, None),
-        "the batch is typing observed late, not a refused hop"
-    );
-    assert_eq!(
-        tally.licensed,
-        licensed_before + 1,
-        "one merged frame, one licensed sweep"
-    );
-    assert_eq!(
-        bridged(&glow),
-        0,
-        "the host laid it; the ledger bridged nothing"
-    );
-}
-
-/// Fifty keys into a five-second stall: one sweep, 5..55, nothing refused.
-#[test]
-fn a_fifty_key_batch_after_a_five_second_stall_is_one_sweep() {
-    let g = wide_geom();
-    let c = cfg(GlowStyle::RainbowKitty, true);
-    let mut out = Vec::new();
-    let mut glow = CursorGlow::default();
-    let t0 = Instant::now();
-    let pre = pre_roll(&mut glow, 27, t0, &c, g);
-    let last = stalled_keys(&mut glow, 50, pre);
-    // 50 × 85 ms = 4.25 s of typing, the echo 1 s after the last key: the
-    // oldest press is 5.3 s old at the echo.
-    let echo = last + Duration::from_millis(1000);
-    glow.tick(Some((27, 55)), echo, &c, g, &mut out);
-    let dark = dark_in(&glow, 27, 5..55);
-    assert!(dark.is_empty(), "the 50-key batch left {dark:?} dark");
-    let tally = glow.admission_tally();
-    assert_eq!(
-        (tally.declined, tally.last_decline_reason),
-        (0, None),
-        "a 50-cell echo backed by 50 presses is typing"
-    );
+    for (keys, lag_ms) in [(30u16, 400u64), (50, 1000)] {
+        let mut out = Vec::new();
+        let mut glow = CursorGlow::default();
+        let t0 = Instant::now();
+        let pre = pre_roll(&mut glow, 27, t0, &c, g);
+        let licensed_before = glow.admission_tally().licensed;
+        let last = stalled_keys(&mut glow, u64::from(keys), pre);
+        let echo = last + Duration::from_millis(lag_ms);
+        glow.tick(Some((27, 5 + keys)), echo, &c, g, &mut out);
+        let dark = dark_in(&glow, 27, 5..5 + keys);
+        assert!(
+            dark.is_empty(),
+            "{keys} keys typed into a stall left {dark:?} dark; lit: {:?}",
+            v2_cols(&glow, 27)
+        );
+        let tally = glow.admission_tally();
+        assert_eq!(
+            (tally.declined, tally.last_decline_reason),
+            (0, None),
+            "{keys} keys: the batch is typing observed late, not a refused hop"
+        );
+        assert_eq!(
+            tally.licensed,
+            licensed_before + 1,
+            "{keys} keys: one merged frame, one licensed sweep"
+        );
+        assert_eq!(
+            bridged(&glow),
+            0,
+            "{keys} keys: the host laid it; the ledger bridged nothing"
+        );
+    }
 }
 
 /// A batch whose last key is three seconds old when the row echoes is licensed and lit in the

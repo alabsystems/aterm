@@ -39,14 +39,6 @@ struct Step {
 
 fn no_host(_: &mut RenderInput) {}
 
-/// The stream-fade shape: tint a cell's foreground in place, bump the seq.
-fn host_stream_fade(input: &mut RenderInput) {
-    if let Some(cell) = input.cells.get_mut(2).and_then(|row| row.get_mut(3)) {
-        cell.fg = [cell.fg[0].wrapping_add(9), cell.fg[1], cell.fg[2]];
-    }
-    input.snapshot_seq = input.snapshot_seq.wrapping_add(1);
-}
-
 /// The prediction-ghost shape: write a speculative glyph past the cursor.
 fn host_prediction_ghost(input: &mut RenderInput) {
     if let Some(cell) = input.cells.get_mut(0).and_then(|row| row.get_mut(5)) {
@@ -237,16 +229,6 @@ fn corpus() -> Vec<Step> {
                 t.grid_mut().scroll_to_bottom();
             },
             host: no_host,
-        },
-        Step {
-            name: "host_stream_fade",
-            engine: |t| t.process(b"fade"),
-            host: host_stream_fade,
-        },
-        Step {
-            name: "host_stream_fade_erase",
-            engine: |_| {},
-            host: host_stream_fade,
         },
         Step {
             name: "host_prediction_ghost",

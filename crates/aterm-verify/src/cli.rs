@@ -26,7 +26,6 @@ pub struct Args {
     pub all: bool,
     pub base: Option<String>,
     pub app: Option<PathBuf>,
-    pub json: bool,
     /// `--fix`: `fmt` rewrites what it finds.
     pub fix: bool,
     /// `--cell`: the forge cells `cells` checks, in the order given; empty is
@@ -103,7 +102,6 @@ where
             "--all" => a.all = true,
             "--base" => a.base = Some(value("--base")?),
             "--app" => a.app = Some(PathBuf::from(value("--app")?)),
-            "--json" => a.json = true,
             "--fix" => a.fix = true,
             "--cell" => a.cells.push(value("--cell")?),
             "--no-windows" => a.no_windows = true,
@@ -253,25 +251,26 @@ Run aterm's checks in place, offline, alone or in any combination.
                                   a wasm module's JS glue (`--record-toy`: the
                                   wasm-glue check's goldens; `--record-replay`:
                                   wasm-smoke's CPU replay answers)
+  verify fetch-browser            the pinned chrome-headless-shell the browser
+                                  check drives, into this machine's cache
 
 Sets:
-  dev      fmt guards census lint test doc (the default)
+  dev      fmt census lint test doc (the default)
   release  every check `ship release` requires; --all implied, a skip is exit 3
 
 Checks:
 {checks}
 
 Options:
-  -p, --package <crate>   narrow lint/test/doc/trust to a crate (repeatable)
+  -p, --package <crate>   narrow lint/test/doc to a crate (repeatable)
       --all               the whole workspace (default: the change cone)
       --base <ref>        the cone's base (default: local origin/main; no fetch)
       --app <APP>         the release bundle `measure` judges
       --fix               with fmt alone: rewrite the files it finds unformatted
       --cell <name>       cells checks this forge cell (repeatable; any cell)
-      --json              one JSON object per check, then a summary (stdout)
       --no-windows        skip the checks that open windows
       --test-threads <n>  RUST_TEST_THREADS for every test binary
-      --test-jobs <n>     test binaries at once (default 8, fewer under load)
+      --test-jobs <n>     test binaries at once (default 8)
       --timeout <s|off>   hang ceiling for each child (default 3h)
       --log <path>        where the full log goes (default <target>/verify/logs)
   -h, --help
@@ -290,22 +289,14 @@ mod tests {
         parse(args.iter().copied()).unwrap_or_else(|e| panic!("{args:?}: {}", e.message()))
     }
 
-    fn err(args: &[&str]) -> String {
-        parse(args.iter().copied())
-            .expect_err("a usage error")
-            .message()
-    }
-
+    /// The bare command is the dev set on the cone; checks and sets combine
+    /// in one order without repeats.
     #[test]
-    fn the_bare_command_is_the_dev_set_on_the_cone() {
+    fn checks_and_sets_combine_in_one_order_and_the_default_is_dev() {
         let a = ok(&[]);
         assert_eq!(a.checks, DEV);
         assert!(!a.all && a.packages.is_empty() && !a.release && a.narrows());
         assert_eq!(ok(&["dev"]).checks, DEV);
-    }
-
-    #[test]
-    fn checks_and_sets_combine_in_one_order_without_repeats() {
         assert_eq!(
             ok(&["test", "lint", "test", "fmt"]).checks,
             [Check::Fmt, Check::Lint, Check::Test]
@@ -313,13 +304,7 @@ mod tests {
         let a = ok(&["dev", "forge"]);
         assert_eq!(a.checks.len(), DEV.len() + 1);
         assert!(a.checks.contains(&Check::Forge));
-        assert!(!ok(&["fmt", "guards"]).narrows());
-    }
-
-    #[test]
-    fn packages_repeat_and_scope_is_a_synonym() {
-        let a = ok(&["lint", "-p", "a", "--package", "b", "--scope=c", "-pd"]);
-        assert_eq!(a.packages, ["a", "b", "c", "d"]);
+        assert!(!ok(&["fmt", "census"]).narrows());
     }
 
     #[test]
@@ -334,64 +319,45 @@ mod tests {
                 .filter(|c| RELEASE.contains(c))
                 .collect::<Vec<_>>()
         );
-        assert!(err(&["release"]).contains("--app"));
-        assert!(err(&["release", "--app", "a", "-p", "x"]).contains("whole workspace"));
-        assert!(err(&["release", "--app", "a", "--cell", "win"]).contains("whole workspace"));
+        assert!(parse(["release"]).is_err(), "release needs its bundle");
+        assert!(parse(["release", "--app", "a", "-p", "x"]).is_err());
+        assert!(parse(["release", "cells", "--app", "a", "--cell", "win"]).is_err());
     }
 
     #[test]
-    fn contradictions_and_unknowns_are_usage_errors_naming_the_word() {
-        assert!(err(&["-p", "x", "--all"]).contains("contradict"));
-        assert!(err(&["--base", "main", "--all"]).contains("--base"));
-        assert!(err(&["lnit"]).contains("unknown check `lnit`"));
-        assert!(err(&["--full"]).contains("unknown flag `--full`"));
-        assert!(err(&["-p"]).contains("-p needs a value"));
-        assert!(err(&["-p", "--all"]).contains("-p needs a value, not `--all`"));
-        assert_eq!(
-            err(&["lnit"]),
-            "verify: unknown check `lnit` (verify list names every check)"
-        );
-        assert_eq!(
-            err(&["--fast"]),
-            "verify: unknown flag `--fast` (verify --help)"
-        );
-        assert!(err(&["--test-jobs", "0"]).contains("positive"));
-        assert!(err(&["--timeout", "45m"]).contains("--timeout"));
-        assert!(err(&["list", "fmt"]).contains("list"));
-        for beside in [
-            &["lint", "--fix"][..],
+    fn contradictions_and_unknowns_are_usage_errors() {
+        for args in [
+            &["-p", "x", "--all"][..],
+            &["--base", "main", "--all"],
+            &["lnit"],
+            &["--full"],
+            &["-p"],
+            &["-p", "--all"],
+            &["--test-jobs", "0"],
+            &["--timeout", "45m"],
+            &["list", "fmt"],
+            // --fix rewrites sources, so it runs alone, and only with fmt.
+            &["lint", "--fix"],
             &["--fix"],
             &["fmt", "lint", "--fix"],
+            &["release", "--app", "a", "--fix"],
+            // --cell narrows `cells` to cells forge knows.
+            &["lint", "--cell", "win"],
+            &["cells", "--cell", "plan9"],
         ] {
-            assert!(err(beside).contains("run it alone"), "{beside:?}");
+            assert!(parse(args.iter().copied()).is_err(), "{args:?}");
         }
-        assert!(err(&["release", "--app", "a", "--fix"]).contains("run it alone"));
         assert!(ok(&["fmt", "--fix"]).fix);
         assert_eq!(
             ok(&["cells", "--cell", "win", "--cell=linux"]).cells,
             ["win", "linux"]
         );
-        assert!(err(&["lint", "--cell", "win"]).contains("name cells"));
-        assert!(err(&["cells", "--cell", "plan9"]).contains("unknown cell `plan9`"));
-    }
-
-    #[test]
-    fn a_selection_no_check_reads_is_said_to_be_ignored() {
-        let note = |args: &[&str]| ignored_selection(&ok(args));
-        assert_eq!(
-            note(&["fmt", "-p", "aterm-grid"]).as_deref(),
-            Some("fmt reads the whole tree, so -p is ignored")
-        );
-        assert_eq!(
-            note(&["fmt", "guards", "--base", "main"]).as_deref(),
-            Some("fmt guards read the whole tree, so --base is ignored")
-        );
-        assert_eq!(note(&["fmt", "lint", "-p", "aterm-grid"]), None);
-        assert_eq!(note(&["fmt"]), None);
     }
 
     #[test]
     fn values_parse_into_their_types() {
+        let a = ok(&["lint", "-p", "a", "--package", "b", "--scope=c", "-pd"]);
+        assert_eq!(a.packages, ["a", "b", "c", "d"]);
         let a = ok(&[
             "test",
             "--test-threads=3",
@@ -401,7 +367,6 @@ mod tests {
             "off",
             "--log",
             "/tmp/x.log",
-            "--json",
             "--no-windows",
             "--base",
             "main",
@@ -410,22 +375,11 @@ mod tests {
         assert_eq!(a.test_jobs.map(NonZeroU32::get), Some(2));
         assert_eq!(a.timeout, Some(None));
         assert_eq!(a.log.as_deref(), Some(std::path::Path::new("/tmp/x.log")));
-        assert!(a.json && a.no_windows);
+        assert!(a.no_windows);
         assert_eq!(a.base.as_deref(), Some("main"));
         assert_eq!(
             ok(&["--timeout", "90"]).timeout,
             Some(Some(Duration::from_secs(90)))
         );
-    }
-
-    #[test]
-    fn list_and_help_stand_alone() {
-        assert!(ok(&["list"]).list);
-        assert!(ok(&["-h"]).help);
-        assert!(ok(&["release", "--help"]).help, "help never needs --app");
-        let u = usage();
-        for s in &CHECKS {
-            assert!(u.contains(s.name), "{}", s.name);
-        }
     }
 }

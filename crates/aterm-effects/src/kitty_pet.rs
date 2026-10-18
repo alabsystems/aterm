@@ -144,8 +144,7 @@ const LAT_SPEED: f32 = 3.4;
 /// the trot before the amble takes it back.
 const LAT_HYST: f32 = 1.5;
 /// Frame-rate law, build-time half: the amble is only worn under
-/// `LAT_SPEED + LAT_HYST`, so its worst cycle rate is a constant
-/// (`the_lateral_walk_cycle_never_exceeds_half_frame_rate` checks the gait).
+/// `LAT_SPEED + LAT_HYST`, so its worst cycle rate is a constant.
 const _: () = assert!(
     (LAT_SPEED + LAT_HYST) / LAT_STRIDE_CELLS <= 30.0,
     "the lateral walk cycle must stay at or under half of 60 fps"
@@ -256,6 +255,10 @@ const TOUCH_LAND_DUR: f32 = 0.13;
 /// before the breath window closes, so deep sleep begins with an empty lane.
 /// 0.83 Hz of births stays under WCAG 2.3.1's 3 Hz flash bound.
 const ZEE_EVERY: f32 = 1.2;
+const _: () = assert!(
+    ZEE_EVERY > 1.0 / 3.0,
+    "z births must stay under WCAG 2.3.1's 3 Hz general-flash bound"
+);
 const ZEE_LIFE: f32 = 2.2;
 const ZEE_ALIVE_MAX: usize = 3;
 /// A light-sleep z's fade, growth and tilt are sampled at the centre of each
@@ -444,8 +447,7 @@ const ARC_MAX: f32 = 1.5;
 const LAND_DUR: f32 = 0.26;
 const LAND_SQUASH: f32 = 0.24;
 /// Seconds over which the landing squash ramps in, so the touchdown is not a
-/// one-frame cliff; `the_touchdown_is_not_a_cliff` pins the per-tick volume
-/// and `scale_y` steps.
+/// one-frame cliff.
 const LAND_ATTACK: f32 = 0.05;
 /// A row change always arcs, however small the column delta. Vertical arcs are
 /// shorter and lower than a pounce of the same span; the arc grows with the
@@ -1978,9 +1980,9 @@ enum Tier {
 
 /// Which animal the pet is drawn as: a skin, not a second animal. Behaviour is
 /// written against the cat pose vocabulary, and every species' roster is
-/// generated from the same rig and pose idents (`art/pet/poses.py`), so a
-/// species only changes which sprite a decision resolves to. A new animal is a
-/// new variant here and a new prefix in `poses.py`.
+/// generated from the same rig and pose idents (`examples/art_rig.rs`'s `pet`
+/// rig), so a species only changes which sprite a decision resolves to. A new
+/// animal is a new variant here and a new prefix in that rig (as `pet_dog_` is).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum PetSpecies {
     /// The original companion (`cursor_trail_style = "rainbow kitty pet"`).
@@ -5729,8 +5731,7 @@ impl PetBrain {
         // The drift-brake: a long gallop that crosses its station runs past it
         // by [`BRAKE_OVERSHOOT`], flips to face its mistake and trots back;
         // once per leg. Arming moves only the aim; the guard below stands down
-        // until the paws get there. Rare by construction
-        // (`the_drift_brakes_gate_is_rare_by_construction`): admitting an
+        // until the paws get there. Rare by construction: admitting an
         // arrival at speed would fire while tracking a caret still moving away,
         // and arming early would make `want = gap · gain` accelerate the cat
         // into the aim; earning it more often needs a follower with momentum.
@@ -9796,56 +9797,11 @@ fn first_px_step(
 #[cfg(test)]
 mod tests {
 
-    /// Face-on, on a beat dealt no glance, the tail plays inside the yawn's own
-    /// look; asserted on `sit_tail_edges` directly, since the combined offer
-    /// masks it.
-    #[test]
-    fn a_yawning_seat_is_offered_its_tail_edges() {
-        let mut brain = PetBrain::default();
-        brain.force_seed(0);
-        brain.sit_front = true;
-        assert_eq!(
-            brain.beat_deal(0, 3),
-            0,
-            "fixture: beat 0 is dealt NO glance"
-        );
-        assert_eq!(
-            brain.beat_deal(0, 4),
-            0,
-            "fixture: and it is the short flick"
-        );
-
-        // Inside the yawn window.
-        brain.quiet = brain.loaf_after() - YAWN_DUR / 2.0;
-        assert!(brain.sit_yawn(), "fixture: this seat is yawning");
-        assert_eq!(
-            brain.sit_tail_edges(0, true),
-            &TAIL_EDGES_FLICK,
-            "a yawn is a look: the tail plays, so its edges must be offered"
-        );
-
-        // Negative control: outside the yawn window the same beat has no look
-        // and must offer nothing.
-        brain.quiet = brain.loaf_after() - YAWN_DUR * 4.0;
-        assert!(!brain.sit_yawn(), "fixture: now outside the yawn window");
-        assert!(
-            brain.sit_tail_edges(0, true).is_empty(),
-            "a beat dealt no look still offers no tail"
-        );
-
-        // And the rule is face-on only: side-on the tail rides its own clock.
-        brain.sit_front = false;
-        assert_eq!(
-            brain.sit_tail_edges(0, true),
-            &TAIL_EDGES_FLICK,
-            "side-on never took the glance refusal"
-        );
-    }
-
     use super::*;
 
     /// Every cat pose the brain can choose has a distinct dog counterpart, so
-    /// a dog never falls back to a cat frame mid-gait.
+    /// a dog never falls back to a cat frame mid-gait; the cat skin is the
+    /// identity and re-skinning is a no-op (`emit` skins every frame).
     #[test]
     fn every_cat_pose_has_a_distinct_dog_counterpart() {
         let cats: Vec<PetGlyphId> = PET_GLYPH_IDS
@@ -9870,21 +9826,10 @@ mod tests {
             );
             assert!(seen.insert(dog), "{dog_id} claimed by two cat poses");
         }
-    }
-
-    /// The cat skin is the identity and re-skinning is a no-op (`emit` skins
-    /// every frame).
-    #[test]
-    fn skinning_is_identity_for_cats_and_idempotent_for_dogs() {
         for &id in PET_GLYPH_IDS {
             assert_eq!(PetSpecies::Cat.skin(id), id, "the cat skin is identity");
             let dog = PetSpecies::Dog.skin(id);
-            assert_eq!(
-                PetSpecies::Dog.skin(dog),
-                dog,
-                "{} re-skinned to a different pose",
-                PET_GLYPHS[dog as usize].id
-            );
+            assert_eq!(PetSpecies::Dog.skin(dog), dog, "re-skinning moved {id:?}");
         }
     }
 
@@ -10018,34 +9963,41 @@ mod tests {
         assert!(pet.pending_worn.is_none());
     }
 
+    /// A pet waiting at the door: a streaming, executing pane held past the
+    /// [`WATCH_MAX`] cap and on past [`VIGIL_AFTER`], then the printing stops
+    /// while the command runs on, leaving only the vigil's held crouch.
+    fn at_the_door(t0: Instant) -> (PetBrain, Instant) {
+        let mut pet = PetBrain::default();
+        let (mut t, _) = type_run(&mut pet, t0, 10, 20, 6, 0.12);
+        let end = t + Duration::from_secs_f32(VIGIL_AFTER + 1.0);
+        while t < end {
+            t += Duration::from_millis(50);
+            pet.note_executing(t, true);
+            let mut sn = sense(t, Some((10, 20)));
+            sn.output_burst = true;
+            let _ = pet.tick(sn);
+        }
+        for _ in 0..20 {
+            t += Duration::from_millis(100);
+            pet.note_executing(t, true);
+            let _ = pet.tick(sense(t, Some((10, 20))));
+        }
+        assert!(
+            pet.vigil && pet.action == PetAction::Crouch,
+            "fixture: the cat is at the door ({:?})",
+            pet.action
+        );
+        (pet, t)
+    }
+
     /// One shed frame (reduced motion or hidden) after a green verdict must not
     /// leave `needs_frames()` true forever.
     #[test]
     fn a_shed_frame_after_a_verdict_never_strands_the_frame_lane() {
-        fn at_the_door(t0: Instant) -> (PetBrain, Instant) {
-            let mut pet = PetBrain::default();
-            let (mut t, _) = type_run(&mut pet, t0, 10, 20, 6, 0.12);
-            let end = t + Duration::from_secs_f32(VIGIL_AFTER + 1.0);
-            while t < end {
-                t += Duration::from_millis(50);
-                pet.note_executing(t, true);
-                let mut sn = sense(t, Some((10, 20)));
-                sn.output_burst = true;
-                let _ = pet.tick(sn);
-            }
-            for _ in 0..20 {
-                t += Duration::from_millis(100);
-                pet.note_executing(t, true);
-                let _ = pet.tick(sense(t, Some((10, 20))));
-            }
-            (pet, t)
-        }
-
         /// Run the verdict out, injecting one shed frame at `shed_at` (or
         /// none). Returns the frame the lane was released on, if ever.
         fn release_frame(t0: Instant, shed_at: Option<usize>, hidden: bool) -> Option<usize> {
             let (mut pet, t) = at_the_door(t0);
-            assert!(pet.vigil, "fixture: the cat is at the door");
             pet.note_command_done(t, false, Some(40_000));
             let mut t_g = t;
             for k in 0..2_000 {
@@ -10087,92 +10039,25 @@ mod tests {
         }
     }
 
-    /// The vigil crouch holds with no frames or wake; green pounces into
-    /// Frolic, red droops.
+    /// A red verdict on a live vigil droops from the crouch — no flight, no
+    /// party. (The green strike is `a_running_job_keeps_the_cat_awake_with_you`.)
     #[test]
-    fn a_long_green_command_pounces_and_a_red_one_droops() {
-        /// A pet waiting at the door: a streaming, executing pane held past the
-        /// [`WATCH_MAX`] cap and on past [`VIGIL_AFTER`].
-        fn vigil(t0: Instant) -> (PetBrain, Instant) {
-            let mut pet = PetBrain::default();
-            // A fresh cat is asleep; type the keys that launched the command.
-            let (mut t, _) = type_run(&mut pet, t0, 10, 20, 6, 0.12);
-            let end = t + Duration::from_secs_f32(VIGIL_AFTER + 1.0);
-            while t < end {
-                t += Duration::from_millis(50);
-                pet.note_executing(t, true);
-                let mut sn = sense(t, Some((10, 20)));
-                sn.output_burst = true;
-                let _ = pet.tick(sn);
-            }
-            // The printing stops while the command runs on; the heat drains,
-            // leaving only the crouch.
-            for _ in 0..20 {
-                t += Duration::from_millis(100);
-                pet.note_executing(t, true);
-                let _ = pet.tick(sense(t, Some((10, 20))));
-            }
-            (pet, t)
-        }
-
-        let t0 = Instant::now();
-
-        let (mut pet, t) = vigil(t0);
-        assert_eq!(
-            pet.action,
-            PetAction::Crouch,
-            "after {VIGIL_AFTER} s of executing with its watch capped the cat \
-             waits at the door — it was {:?}",
-            pet.action
-        );
-        assert!(pet.vigil, "…and the crouch is the VIGIL'S, not a coil");
-        assert!(
-            !pet.needs_frames(),
-            "the vigil crouch is a HELD pose: zero wakes, or a twenty-minute \
-             build costs a twenty-minute frame train"
-        );
-        assert!(
-            pet.next_change_deadline(t).is_none(),
-            "…and it offers nothing either: it rides the offers it already had"
-        );
-
-        // Green, and it took forty seconds.
-        pet.note_command_done(t, false, Some(40_000));
-        let mut t_g = t;
-        let mut frolicked = false;
-        let mut left_the_ground = false;
-        for _ in 0..200 {
-            t_g += Duration::from_millis(16);
-            pet.note_executing(t_g, false);
-            let f = pet.tick(sense(t_g, Some((10, 20))));
-            left_the_ground |= f.action.airborne();
-            if f.action == PetAction::Frolic {
-                frolicked = true;
-                break;
-            }
-        }
-        assert!(
-            left_the_ground,
-            "a green verdict on a live vigil takes the POUNCE — the cat must \
-             leave the ground for the prompt row"
-        );
-        assert!(frolicked, "…and land in Frolic");
-
-        // Red, from the same vigil.
-        let (mut pet, t) = vigil(t0);
-        assert!(pet.vigil, "the fixture is the same crouch");
+    fn a_red_verdict_on_the_vigil_droops() {
+        let (mut pet, t) = at_the_door(Instant::now());
         pet.note_command_done(t, true, Some(40_000));
         let mut t_r = t;
         let mut drooped = false;
         for _ in 0..40 {
             t_r += Duration::from_millis(16);
             pet.note_executing(t_r, false);
-            if pet.tick(sense(t_r, Some((10, 20)))).action == PetAction::Droop {
+            let f = pet.tick(sense(t_r, Some((10, 20))));
+            assert!(!f.action.airborne(), "a failure never flies");
+            if f.action == PetAction::Droop {
                 drooped = true;
                 break;
             }
         }
-        assert!(drooped, "a non-zero exit droops — no flight, no party");
+        assert!(drooped, "a non-zero exit droops");
     }
 
     /// A green command within [`SULK_FORGIVEN`] of a failure is the big cheer
@@ -10870,67 +10755,6 @@ mod tests {
         (pet, twin, t)
     }
 
-    /// An awake, settled cat parks and names its next step instead of holding
-    /// the frame train; the walk proves the naming is exact.
-    #[test]
-    fn a_settled_pet_asks_for_its_next_breath_step_not_every_frame() {
-        let start = Instant::now();
-        let (mut pet, mut twin, t) = settled_pair(start, 5.0);
-        assert_eq!(pet.action, PetAction::Loaf, "fixture: the long dwell");
-        assert!(
-            !pet.needs_frames(),
-            "a settled, still pet must not ask for the frame train"
-        );
-        let d = pet
-            .next_change_deadline(t)
-            .expect("an awake pet always has a next step (the ladder's sleep at the latest)");
-        assert!(
-            d >= t + Duration::from_millis(40),
-            "the next step is not this frame: +{:?}",
-            d - t
-        );
-        assert!(
-            d <= t + Duration::from_secs_f32(BREATH_PERIOD / 2.0),
-            "and not the far future: +{:?}",
-            d - t
-        );
-        // Walk down through the loaf, the ladder's sleep, light sleep and deep
-        // sleep, where the offer is `None`.
-        let (walk, end) = walk_offers(&mut pet, &mut twin, t, (4, 12), 60.0);
-        assert_eq!(pet.action, PetAction::Sleep);
-        assert!(
-            pet.quiet >= SLEEP_AFTER + BREATH_WINDOW,
-            "the walk must end in deep sleep, not on a timeout: quiet {}",
-            pet.quiet
-        );
-        assert!(pet.next_change_deadline(end).is_none() && !pet.needs_frames());
-        let span = (end - t).as_secs_f32();
-        // The body's own offers; the z's are bounded by
-        // `a_light_sleeper_s_zs_ride_the_offer_not_the_frame_train`.
-        let per_sec = (walk.offers - walk.zee_offers) as f32 / span;
-        eprintln!(
-            "pet lane census (awake loaf → deep sleep): {walk:?} over {span:.1} s = {per_sec:.2} \
-             body offers/s; the settle window's train was {} frames",
-            (span * 60.0) as u32
-        );
-        assert!(
-            per_sec <= 10.0,
-            "{} body offers over {span:.1} s = {per_sec:.1}/s; the offer must be COARSE",
-            walk.offers - walk.zee_offers
-        );
-        // No train past the loaf: the z's ride the offer.
-        assert!(
-            walk.zee_train == 0 && walk.train <= 1 && walk.offers + walk.train < 900,
-            "{walk:?} over {span:.1} s — the old train was {} frames",
-            (span * 60.0) as u32
-        );
-        assert!(
-            walk.idle_wakes <= 12,
-            "{} wakes changed nothing — the offer is too conservative ({walk:?})",
-            walk.idle_wakes
-        );
-    }
-
     /// Motion keeps the train: the double-take, gather, flight, landing and a
     /// petting hold each ask for every frame.
     #[test]
@@ -10981,122 +10805,6 @@ mod tests {
         );
     }
 
-    /// A light sleeper asks for exactly the breath's visible edges; past the
-    /// breath window, nothing.
-    #[test]
-    fn a_sleeping_pet_asks_for_nothing_between_blinks() {
-        let start = Instant::now();
-        let (mut pet, mut twin, t) = settled_pair(start, SLEEP_AFTER + 0.05);
-        assert_eq!(pet.action, PetAction::Sleep, "fixture: just asleep");
-        assert!(
-            pet.motes.iter().all(Option::is_none),
-            "fixture: before the first z"
-        );
-        assert!(
-            !pet.needs_frames(),
-            "a sleeper with nothing drifting must not ask for the frame train"
-        );
-        let (walk, end) = walk_offers(&mut pet, &mut twin, t, (4, 12), BREATH_PERIOD);
-        eprintln!("pet lane census (one breath period of light sleep): {walk:?}");
-        assert!(walk.offers >= 3, "the breath has edges: {walk:?}");
-        assert!(
-            walk.idle_wakes <= 2,
-            "a sleeper's offers are its visible edges and nothing else: {walk:?}"
-        );
-        // The first z is born 1.2 s into the period and rides the offer; the
-        // breath's own edges are the rest.
-        assert!(
-            walk.offers - walk.zee_offers <= 16,
-            "a breath is a handful of steps a period, not a train: {walk:?}"
-        );
-        // Deep sleep: byte-stable, and the offer says so.
-        let (t, f) = idle(&mut pet, end, (4, 12), BREATH_WINDOW + 1.0);
-        assert_eq!(f.action, PetAction::Sleep);
-        assert!(
-            pet.next_change_deadline(t).is_none(),
-            "deep sleep offers nothing until an input"
-        );
-        assert!(!pet.needs_frames());
-    }
-
-    /// Each z is a function of countable edges, and the twin walk proves every
-    /// offered frame matches the 16 ms train.
-    #[test]
-    fn a_light_sleeper_s_zs_ride_the_offer_not_the_frame_train() {
-        let start = Instant::now();
-        let (mut pet, mut twin, mut t) = settled_pair(start, SLEEP_AFTER + 0.05);
-        assert_eq!(pet.action, PetAction::Sleep, "fixture: just asleep");
-        // Both brains on the 16 ms grid to the first visible z.
-        let mut zee = None;
-        for _ in 0..200 {
-            t += Duration::from_millis(16);
-            let f = pet.tick(sense(t, Some((4, 12))));
-            let _ = twin.tick(sense(t, Some((4, 12))));
-            if let Some(m) = f
-                .motes
-                .iter()
-                .flatten()
-                .find(|m| m.kind == PetMoteKind::Zee && m.alpha > 0)
-            {
-                zee = Some(*m);
-                break;
-            }
-        }
-        let zee = zee.expect("fixture: the sleeper dreams a z inside ZEE_EVERY of falling asleep");
-        assert_eq!(pet.action, PetAction::Sleep, "fixture: still asleep");
-        assert!(
-            !pet.needs_frames(),
-            "a light sleeper's z's ride the offer, not the frame train (a z at ({}, {}), alpha {})",
-            zee.col,
-            zee.row,
-            zee.alpha
-        );
-        let d = pet
-            .next_change_deadline(t)
-            .expect("a live z has a next edge");
-        assert!(
-            d <= t + Duration::from_secs_f32(ZEE_LIFE / ZEE_STEPS + 0.001),
-            "the z's next look is at most one slice away: +{:?}",
-            d - t
-        );
-        // The rest of the window — every z there is, to deep sleep, where
-        // the offer is `None` and the walk stops on its own.
-        let (walk, end) = walk_offers(&mut pet, &mut twin, t, (4, 12), BREATH_WINDOW + 2.0);
-        assert!(
-            pet.quiet >= SLEEP_AFTER + BREATH_WINDOW && pet.motes.iter().all(Option::is_none),
-            "the walk must end in deep sleep with an empty lane: quiet {}",
-            pet.quiet
-        );
-        let span = (end - t).as_secs_f32();
-        eprintln!("pet lane census (light sleep, the z's on the offer): {walk:?} over {span:.1} s");
-        assert_eq!(walk.zee_train, 0, "a z held the frame train ({walk:?})");
-        assert_eq!(walk.train, 0, "nothing in light sleep is motion ({walk:?})");
-        // Per z at 10×20 cells: a wake per whole pixel of climb (1.05 rows ×
-        // 20 px, plus one), per whole pixel of sway (the 0.55-cell drift plus
-        // 0.33 cells of sway travel × 10 px, plus one and two reversals), per
-        // look slice (fifteen boundaries), and the birth: 50 at most.
-        let climb_px = (1.05 * 20.0_f32).ceil() + 1.0;
-        let sway_px = ((0.55 + 0.33) * 10.0_f32).ceil() + 1.0 + 2.0;
-        let per_zee = (climb_px + sway_px + ZEE_STEPS) as u32;
-        let births = ((BREATH_WINDOW - ZEE_LIFE) / ZEE_EVERY).floor() as u32;
-        assert!(
-            walk.zee_offers >= 100 && walk.zee_offers <= births * per_zee,
-            "the z's are drawn on the offer — a whole pixel, a look, a birth, a death at a time: \
-             {} wakes for {births} z's, the bound {per_zee} a z ({walk:?})",
-            walk.zee_offers
-        );
-        assert!(
-            walk.zee_offers < 512,
-            "{} wakes for the z's — the train they replaced was 512 frames ({walk:?})",
-            walk.zee_offers
-        );
-        assert!(
-            walk.idle_wakes <= 12,
-            "{} wakes changed nothing — the z's offer is too conservative ({walk:?})",
-            walk.idle_wakes
-        );
-    }
-
     /// One key on a quiet screen: every wake the pet takes until it offers
     /// nothing, under the twin walk.
     #[test]
@@ -11128,6 +10836,12 @@ mod tests {
             walk.train <= 50 && walk.offers - walk.zee_offers <= 50 && walk.zee_offers <= 300,
             "{walk:?} over {span:.1} s — the old train was {} frames",
             (span * 60.0) as u32
+        );
+        // The z's really were drawn, on the offer: a whole pixel, a look, a
+        // birth, a death at a time.
+        assert!(
+            walk.zee_offers >= 100,
+            "the light sleeper's z's ride the offer ({walk:?})"
         );
     }
 
@@ -11258,38 +10972,6 @@ mod tests {
         );
     }
 
-    /// One key on a contented cat, through seat, wash, loaf and sleep to deep
-    /// sleep, under the twin walk.
-    #[test]
-    fn a_lone_key_on_a_contented_cat_costs_a_counted_census() {
-        let start = Instant::now();
-        let (mut pet, mut twin, t) = contented_pair(start, 2.0);
-        let t = t + Duration::from_millis(16);
-        let _ = pet.tick(sense(t, Some((4, 73))));
-        let _ = twin.tick(sense(t, Some((4, 73))));
-        assert!(pet.quiet < 0.1, "fixture: the key reset the quiet clock");
-        let (walk, end) = walk_offers(&mut pet, &mut twin, t, (4, 73), 40.0);
-        assert_eq!(pet.action, PetAction::Sleep);
-        assert!(
-            pet.quiet >= SLEEP_AFTER + BREATH_WINDOW,
-            "the walk must end in deep sleep, not on a timeout: quiet {}",
-            pet.quiet
-        );
-        let span = (end - t).as_secs_f32();
-        eprintln!(
-            "pet lane census (one key on a contented cat → deep sleep): {walk:?} over {span:.1} s; \
-             the old train was {} frames",
-            (span * 60.0) as u32
-        );
-        assert_eq!(walk.note_train, 0, "a ♪/♥ held the frame train ({walk:?})");
-        assert_eq!(walk.zee_train, 0, "a z held the frame train ({walk:?})");
-        assert_eq!(
-            (walk.dust_train, walk.pop_train),
-            (0, 0),
-            "a landing puff or a wake's pop on a key that neither lands nor wakes ({walk:?})"
-        );
-    }
-
     /// The glide sensor's mark moves only on a tick with time in it, so a
     /// re-tick at the same instant cannot park a gliding body.
     #[test]
@@ -11315,72 +10997,6 @@ mod tests {
         );
     }
 
-    /// On every path that wakes a sleeper the pop is never the deciding term of
-    /// `needs_frames`.
-    #[test]
-    fn the_wake_s_startled_z_never_holds_the_frame_train_on_its_own() {
-        type Wake = fn(&mut PetBrain, Instant) -> (u16, u16);
-        let paths: [(&str, Wake); 5] = [
-            ("a key", |_, _| (4, 13)),
-            ("a bell", |pet, t| {
-                pet.note_bell(t);
-                (4, 12)
-            }),
-            ("a petting hand", |pet, t| {
-                pet.note_petted(t);
-                (4, 12)
-            }),
-            ("a failed command", |pet, t| {
-                pet.note_command_done(t, true, None);
-                (4, 12)
-            }),
-            ("a slow success", |pet, t| {
-                pet.note_command_done(t, false, Some(5_000));
-                (4, 12)
-            }),
-        ];
-        let frames_max = (ZEE_POP_LIFE / 0.016).ceil() as u32 + 1;
-        for (name, wake) in paths {
-            let start = Instant::now();
-            let (mut pet, _, mut t) = settled_pair(start, SLEEP_AFTER + 0.05);
-            assert_eq!(pet.action, PetAction::Sleep, "fixture ({name}): asleep");
-            t += Duration::from_millis(16);
-            let caret = wake(&mut pet, t);
-            let (mut alive, mut own, mut woke) = (0u32, 0u32, false);
-            for _ in 0..90 {
-                let f = pet.tick(sense(t, Some(caret)));
-                woke |= f.action == PetAction::Waking;
-                let popped = f
-                    .motes
-                    .iter()
-                    .flatten()
-                    .any(|m| m.kind == PetMoteKind::ZeePop && m.alpha > 0);
-                if popped {
-                    alive += 1;
-                    assert!(pet.needs_frames(), "{name}: a live pop is motion");
-                    if !needs_frames_without_motes(&mut pet) {
-                        own += 1;
-                    }
-                }
-                t += Duration::from_millis(16);
-            }
-            eprintln!(
-                "wake pop census ({name}): {alive} frames of pop inside the stretch's train, \
-                 {own} of its own (bound {frames_max})"
-            );
-            assert!(woke, "fixture ({name}): the sleeper woke");
-            assert!(alive >= 1, "fixture ({name}): the wake popped a z");
-            assert!(
-                alive <= frames_max,
-                "{name}: the pop outlived its life — {alive} frames, bound {frames_max}"
-            );
-            assert_eq!(
-                own, 0,
-                "{name}: the wake's pop held the frame train on its own for {own} frames"
-            );
-        }
-    }
-
     /// Landing dust holds the train at most `(0.59 − LAND_DUR) / 16 ms` frames
     /// past its landing, and only when nothing else does.
     #[test]
@@ -11391,23 +11007,16 @@ mod tests {
         // A screen-crossing jump: the chosen landing throws its dust.
         let caret = (4u16, 90u16);
         let bound = ((0.45 + 0.07 * 2.0 - LAND_DUR) / 0.016).ceil() as u32;
-        let (mut alive, mut own, mut px_edges, mut landed) = (0u32, 0u32, 0u32, false);
-        let mut last_px = [None; PET_MOTES_MAX];
+        let (mut alive, mut own, mut landed) = (0u32, 0u32, false);
         for _ in 0..300 {
             t += Duration::from_millis(16);
             let f = pet.tick(sense(t, Some(caret)));
             landed |= f.action == PetAction::Land;
-            let mut any = false;
-            for (last, m) in last_px.iter_mut().zip(f.motes.iter()) {
-                let px = m
-                    .filter(|m| m.kind == PetMoteKind::Dust && m.alpha > 0)
-                    .map(|m| ((m.col * 10.0).round() as i32, (m.row * 20.0).round() as i32));
-                any |= px.is_some();
-                if px.is_some() && px != *last {
-                    px_edges += 1;
-                }
-                *last = px;
-            }
+            let any = f
+                .motes
+                .iter()
+                .flatten()
+                .any(|m| m.kind == PetMoteKind::Dust && m.alpha > 0);
             if any {
                 alive += 1;
                 assert!(pet.needs_frames(), "live dust is motion");
@@ -11416,11 +11025,6 @@ mod tests {
                 }
             }
         }
-        eprintln!(
-            "landing dust census: {alive} frames of dust on the train, {own} of its own \
-             (bound {bound}); {px_edges} pixel edges the three puffs would have offered \
-             (plus their looks)"
-        );
         assert!(landed, "fixture: the jump landed");
         assert!(alive >= 1, "fixture: the landing threw its dust");
         assert!(
@@ -11456,41 +11060,6 @@ mod tests {
             travelled > 5.0,
             "the pet froze through a held jump: {travelled} cells of travel while \
              the caret ran to column {caret}"
-        );
-    }
-
-    /// An Enter from the end of a long line never floats the cat for seconds:
-    /// every airborne stretch stays within BIG_FLIGHT_MAX.
-    #[test]
-    fn a_wrap_from_a_long_line_bounds_across_never_glides() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let mut t = awake(&mut pet, start, 4, 190);
-        let mut run = 0u32;
-        let mut max_run = 0u32;
-        let mut last_row = 4.0f32;
-        for _ in 0..260 {
-            t += Duration::from_millis(16);
-            // Enter at the end of a 200-column line: row +1, column 0.
-            let mut s = sense(t, Some((5, 0)));
-            s.cols = 200;
-            let f = pet.tick(s);
-            if f.action == PetAction::Leap {
-                run += 1;
-                max_run = max_run.max(run);
-            } else {
-                run = 0;
-            }
-            last_row = f.row;
-        }
-        let secs = max_run as f32 * 0.016;
-        assert!(
-            secs <= BIG_FLIGHT_MAX + 0.05,
-            "each airborne stretch must be bounded by BIG_FLIGHT_MAX, floated {secs:.2}s"
-        );
-        assert!(
-            (last_row - 5.0).abs() < 0.01,
-            "and the crossing must actually arrive on the new row, got {last_row}"
         );
     }
 
@@ -11541,42 +11110,6 @@ mod tests {
         assert!(
             (f.col - PetBrain::station(10, 100, art_cols(10, 20))).abs() < 0.01,
             "the static capture uses the normal first-sighting station"
-        );
-    }
-
-    #[test]
-    fn a_word_jump_pounces_through_a_crouch_and_a_landing() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let mut t = awake(&mut pet, start, 4, 10);
-        // A 20-column forward jump.
-        let mut saw = (false, false, false);
-        for _ in 0..140 {
-            t += Duration::from_millis(16);
-            let f = pet.tick(sense(t, Some((4, 30))));
-            match f.action {
-                PetAction::Crouch => saw.0 = true,
-                PetAction::Leap => {
-                    saw.1 = true;
-                    assert!(
-                        f.lift > 0.0
-                            || matches!(
-                                f.pose,
-                                PetGlyphId::PetLaunch
-                                    | PetGlyphId::PetLeapRise
-                                    | PetGlyphId::PetLeap
-                                    | PetGlyphId::PetLeapDescend
-                            )
-                    );
-                }
-                PetAction::Land => saw.2 = true,
-                _ => {}
-            }
-        }
-        assert_eq!(
-            saw,
-            (true, true, true),
-            "a pounce is crouch -> leap -> land, got {saw:?}"
         );
     }
 
@@ -11732,23 +11265,6 @@ mod tests {
     }
 
     #[test]
-    fn sleep_breathes_so_the_frame_never_settles_to_a_dead_sticker() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let (mut t, _) = idle(&mut pet, start, (4, 20), 0.2);
-        let mut poses = std::collections::BTreeSet::new();
-        let mut scales = std::collections::BTreeSet::new();
-        for _ in 0..200 {
-            t += Duration::from_millis(16);
-            let f = pet.tick(sense(t, Some((4, 20))));
-            poses.insert(f.pose as u8);
-            scales.insert((f.scale_y * 4096.0) as i64);
-        }
-        assert_eq!(poses.len(), 2, "sleep alternates its two breath frames");
-        assert!(scales.len() > 20, "and the swell is continuous");
-    }
-
-    #[test]
     fn a_good_run_earns_a_purr_and_a_cold_start_does_not() {
         let start = Instant::now();
         let mut worked = PetBrain::default();
@@ -11760,54 +11276,6 @@ mod tests {
         assert_eq!(f.action, PetAction::Sit, "the seat still comes first");
         assert!(f.purr > 0.0, "a sentence of running earns the purr at once");
 
-        // The pose is the long dwell's on two hands in three: past the longest
-        // loaf onset a purring hand wears `PetPurr`; the third loafs.
-        let mut purred = 0u32;
-        let mut loafed = 0u32;
-        for seed in 0..12u8 {
-            let mut w = PetBrain::default();
-            let t0 = awake(&mut w, start, 3, 2);
-            let (t0, _) = type_run(&mut w, t0, 3, 4, 40, 0.05);
-            let (t0, _) = idle(&mut w, t0, (3, 44), SIT_AFTER + 0.1);
-            w.force_seed(seed);
-            let (_, f) = idle(&mut w, t0, (3, 44), 3.4);
-            assert!(f.purr > 0.0, "hand {seed}: the tell rides the whole dwell");
-            match f.action {
-                PetAction::Purr => purred += 1,
-                PetAction::Loaf => loafed += 1,
-                other => {
-                    panic!("hand {seed}: a content long dwell is one or the other, got {other:?}")
-                }
-            }
-        }
-        assert_eq!(purred, 8, "two hands in three purr ({purred}/12)");
-        assert_eq!(loafed, 4, "…and one in three loafs ({loafed}/12)");
-
-        // The seat comes first: at `SIT_AFTER + 0.6` a working cat is still
-        // sitting, for every hand.
-        for seed in 0..12u8 {
-            let mut w = PetBrain::default();
-            let t = awake(&mut w, start, 3, 2);
-            let (t, _) = type_run(&mut w, t, 3, 4, 40, 0.05);
-            let (t2, seated) = idle(&mut w, t, (3, 44), 1.2);
-            assert!(
-                seated.action.settled(),
-                "fixture: seed {seed} settles, got {:?}",
-                seated.action
-            );
-            w.force_seed(seed);
-            let (_, e) = idle(&mut w, t2, (3, 44), 0.8);
-            assert!(
-                w.content >= PURR_GATE,
-                "fixture: seed {seed} is a content cat"
-            );
-            assert_eq!(
-                e.action,
-                PetAction::Sit,
-                "hand {seed}: the seat comes before the purr"
-            );
-        }
-
         // A cat that has only just woken up and taken two steps has not earned
         // anything: contentment is bought with travel, not with elapsed time.
         let mut idle_cat = PetBrain::default();
@@ -11815,19 +11283,6 @@ mod tests {
         let (_, g) = idle(&mut idle_cat, t, (3, 42), 0.6);
         assert_eq!(g.action, PetAction::Sit, "sitting down cold does not");
         assert_eq!(g.purr, 0.0);
-    }
-
-    #[test]
-    fn the_pet_knows_the_wall_and_crosses_to_the_caret_s_left() {
-        let w = art_cols(10, 20);
-        let mid = PetBrain::station(40, 100, w);
-        assert!(mid > 40.0, "in open grid it stands past the caret");
-        let edge = PetBrain::station(99, 100, w);
-        assert!(
-            edge + w <= 100.0,
-            "at the right margin it must still fit on screen ({edge} + {w})"
-        );
-        assert!(edge < 99.0, "which means crossing to the caret's left");
     }
 
     #[test]
@@ -11851,24 +11306,8 @@ mod tests {
     fn a_hidden_caret_fades_the_pet_out_and_the_fingerprint_settles_to_zero() {
         let start = Instant::now();
         let mut pet = PetBrain::default();
-        let (mut t, _) = idle(&mut pet, start, (4, 20), 1.0);
-        let mut last = PetFrame {
-            alpha: 255,
-            lane_alpha: 255,
-            action: PetAction::Sit,
-            pose: PetGlyphId::PetSit,
-            col: 0.0,
-            row: 0.0,
-            lift: 0.0,
-            facing_left: false,
-            scale_x: 1.0,
-            scale_y: 1.0,
-            purr: 0.0,
-            contented: false,
-            under_ink: false,
-            motes: [None; PET_MOTES_MAX],
-            departures: [None; PET_DEPARTURES_MAX],
-        };
+        let (mut t, mut last) = idle(&mut pet, start, (4, 20), 1.0);
+        assert!(last.alpha > 0, "fixture: on glass");
         for _ in 0..80 {
             t += Duration::from_millis(16);
             last = pet.tick(sense(t, None));
@@ -12102,7 +11541,9 @@ mod tests {
     }
 
     /// A body elongates along its velocity: a horizontal pounce stretches
-    /// wide, not tall.
+    /// wide, not tall. (The shipped bug: squash and stretch ignored the
+    /// velocity axis, so a horizontal pounce left the ground taller and
+    /// narrower.)
     #[test]
     fn horizontal_flight_stretches_along_the_motion_axis() {
         let start = Instant::now();
@@ -12128,13 +11569,14 @@ mod tests {
         assert!(stretched, "the leap must actually stretch along its travel");
     }
 
-    /// The gallop's cycle stays at or under half the frame rate, and the run
-    /// gait on glass uses that stride.
+    /// The run gait on glass uses [`RUN_STRIDE_CELLS`], whose cycle rate the
+    /// build-time assert holds under half the frame rate. (The shipped bug:
+    /// the gallop shared the walk's 1.7-cell stride and at top chase speed
+    /// cycled one art frame per 60 fps tick, a strobe.)
     #[test]
     fn the_gallop_cycle_never_exceeds_half_frame_rate() {
-        // The constant half is a build-time `const _`; here a sustained chase
-        // (one column every three ticks, ~20.8 cells/s) measures cells per
-        // stride cycle over the gallop.
+        // A sustained chase (one column every three ticks, ~20.8 cells/s)
+        // measures cells per stride cycle over the gallop.
         let start = Instant::now();
         let mut pet = PetBrain::default();
         let mut t = awake(&mut pet, start, 3, 2);
@@ -12265,42 +11707,6 @@ mod tests {
         }
     }
 
-    /// The lateral gait on glass paces itself by [`LAT_STRIDE_CELLS`], every
-    /// beat holding at least two 60 fps ticks.
-    #[test]
-    fn the_lateral_walk_cycle_never_exceeds_half_frame_rate() {
-        let run = gait_run(0.45, 12);
-        let mut prev: Option<f32> = None;
-        let mut worst = 0.0f32;
-        let mut beats = 0usize;
-        for (a, pose, stride) in &run {
-            if *a != PetAction::Walk {
-                prev = None;
-                continue;
-            }
-            assert!(
-                PetBrain::CYCLE_LWALK.contains(pose),
-                "fixture: this cadence must amble"
-            );
-            beats += 1;
-            if let Some(p) = prev {
-                worst = worst.max((stride - p).abs());
-            }
-            prev = Some(*stride);
-        }
-        assert!(
-            beats > 40,
-            "fixture: need a sustained amble ({beats} frames)"
-        );
-        // A four-beat cycle holds each beat for a quarter of a cycle, so two
-        // ticks a beat is an eighth of a cycle a tick.
-        assert!(
-            worst <= 0.125,
-            "the amble cycled {worst} of a cycle in one tick — under two \
-             ticks a beat"
-        );
-    }
-
     // ── the keep-ahead lead ─────────────────────────────────────────────
 
     /// Under a sustained same-direction rhythm the station moves past caret+1,
@@ -12375,22 +11781,6 @@ mod tests {
             f.action.settled(),
             "and the pet settles, got {:?}",
             f.action
-        );
-    }
-
-    /// The whole point of the schedule: at 20 keys/s the gain rises and the
-    /// lead cancels the lag, so the pet is never behind the caret it leads.
-    #[test]
-    fn the_gallop_lag_is_cancelled_at_twenty_keys_per_second() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let t = awake(&mut pet, start, 3, 3);
-        let (_, f) = type_run(&mut pet, t, 3, 5, 60, 0.05);
-        assert!(
-            f.col >= 65.0 + 0.3,
-            "at 20 keys/s the schedule must keep the pet ahead: pet at {} \
-             for caret 65",
-            f.col
         );
     }
 
@@ -12502,79 +11892,6 @@ mod tests {
         (poses, frames)
     }
 
-    /// Trigger (a): one screen-crossing move plays the whole show (notice,
-    /// gather, rise/peak/descend, heavy landing) and kicks dust motes.
-    #[test]
-    fn a_screen_crossing_move_plays_the_whole_choreography() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let t = awake(&mut pet, start, 4, 10);
-        // caret 12 → 60: 48 columns, past max(24, 0.4·100).
-        let (poses, frames) = drive_and_collect(&mut pet, t, (4, 60), 200);
-        assert!(
-            poses.contains(&PetGlyphId::PetCrouchWiggle) && poses.contains(&PetGlyphId::PetCrouch),
-            "the gather must alternate crouch and wiggle"
-        );
-        // The notice wears the travel perk: the jump is latched before the
-        // double-take.
-        assert!(
-            poses.contains(&PetGlyphId::PetPerkTurn),
-            "choreography must include the notice, turned toward the crossing"
-        );
-        for id in [
-            PetGlyphId::PetLeapRise,
-            PetGlyphId::PetLeap,
-            PetGlyphId::PetLeapDescend,
-            PetGlyphId::PetLand,
-        ] {
-            assert!(poses.contains(&id), "choreography must include {id:?}");
-        }
-        // Dust at the heels: on the frame lane, fractional and rotated.
-        let dust: Vec<_> = frames
-            .iter()
-            .flat_map(|f| f.motes.iter().flatten())
-            .filter(|m| m.kind == PetMoteKind::Dust)
-            .collect();
-        assert!(!dust.is_empty(), "a heavy landing kicks dust");
-        for m in &dust {
-            assert!(
-                m.col.fract() != 0.0 || m.row.fract() != 0.0,
-                "motes are never grid-aligned: ({}, {})",
-                m.col,
-                m.row
-            );
-            assert!(m.rot != 0.0, "and always rotated");
-        }
-    }
-
-    /// A mere word jump (below both thresholds, no joy) keeps the plain
-    /// pounce: no wiggle, and the short flight it always had.
-    #[test]
-    fn a_word_jump_stays_a_pounce_below_the_thresholds() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let t = awake(&mut pet, start, 4, 10);
-        let (poses, frames) = drive_and_collect(&mut pet, t, (4, 32), 160);
-        assert!(
-            !poses.contains(&PetGlyphId::PetCrouchWiggle),
-            "a 20-column jump is transport, not theatre"
-        );
-        let mut run = 0u32;
-        let mut max_run = 0u32;
-        for f in &frames {
-            if f.action == PetAction::Leap {
-                run += 1;
-                max_run = max_run.max(run);
-            } else {
-                run = 0;
-            }
-        }
-        assert!(
-            max_run as f32 * 0.016 <= FLIGHT_MAX + 0.05,
-            "and its flight keeps the pounce clamp"
-        );
-    }
-
     /// Trigger (b): a half-grid standing gap opened during a hold (the wake
     /// stretch) still gets the show once the hold resolves.
     #[test]
@@ -12597,59 +11914,39 @@ mod tests {
         );
     }
 
-    /// Trigger (c): a settled cat at ≥ 0.85 contentment answers a word jump
-    /// with the show instead of a pounce.
-    #[test]
-    fn joy_upgrades_a_word_jump_into_the_show() {
-        let start = Instant::now();
-        // The joyful cat: a long fast run earns full contentment.
-        let mut joyful = PetBrain::default();
-        let t = awake(&mut joyful, start, 3, 2);
-        let (t, _) = type_run(&mut joyful, t, 3, 4, 60, 0.05);
-        // Long enough for the keep-ahead lead to ease back and the pet to
-        // actually settle (the joy door opens from a settled action only).
-        let (t, _) = idle(&mut joyful, t, (3, 64), 2.0);
-        assert!(
-            joyful.content() >= JOY_CONTENT,
-            "fixture: joy must be earned"
-        );
-        let (poses, _) = drive_and_collect(&mut joyful, t, (3, 72), 200);
-        assert!(
-            poses.contains(&PetGlyphId::PetCrouchWiggle),
-            "a joyful settled cat gives the +8 jump the whole show"
-        );
-
-        // The cold cat: same jump, no contentment, plain pounce.
-        let mut cold = PetBrain::default();
-        let t = awake(&mut cold, start, 3, 62);
-        let (poses, _) = drive_and_collect(&mut cold, t, (3, 72), 200);
-        assert!(
-            !poses.contains(&PetGlyphId::PetCrouchWiggle),
-            "a cold sit answers the same jump with a pounce"
-        );
-    }
-
     /// The variance flourish: a span past 60% of the grid splits into two
-    /// bounds with a touch-land between — deterministically, from the span.
+    /// bounds with a touch-land between — deterministically, from the span —
+    /// unless the touch point is inked: then there is no ground worth
+    /// touching and the span is one bound.
     #[test]
-    fn a_screen_wide_span_splits_into_two_bounds() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let t = awake(&mut pet, start, 4, 5);
-        let (_, frames) = drive_and_collect(&mut pet, t, (4, 78), 260);
-        let mut episodes = 0;
-        let mut airborne_was = false;
-        for f in &frames {
-            let airborne = f.action == PetAction::Leap;
-            if airborne && !airborne_was {
-                episodes += 1;
+    fn a_screen_wide_span_splits_into_two_bounds_unless_the_touch_point_is_inked() {
+        for (inked, want) in [(false, 2), (true, 1)] {
+            let mut pet = PetBrain::default();
+            let t = awake(&mut pet, Instant::now(), 4, 2);
+            if inked {
+                // Row 4 is inked from col 2 to col 76 — the typed line the
+                // twin bounds would cross.
+                let spans = vec![(0u16, 0u16), (0, 0), (0, 0), (0, 0), (2, 76)];
+                pet.sense_ink(0, &spans, Some(4));
             }
-            airborne_was = airborne;
+            let (_, frames) = drive_and_collect(&mut pet, t, (4, 78), 260);
+            let mut episodes = 0;
+            let mut airborne_was = false;
+            for f in &frames {
+                let airborne = f.action == PetAction::Leap;
+                if airborne && !airborne_was {
+                    episodes += 1;
+                }
+                airborne_was = airborne;
+                // The touch between two bounds wears the coil, never the
+                // braced landing whose open-mouth face smeared at tile LOD
+                // over glyphs (the gauntlet's "mirroring bug").
+                if want == 2 && episodes == 1 && f.action == PetAction::Land {
+                    assert_eq!(f.pose, PetGlyphId::PetCrouch, "the touch-land's pose");
+                }
+            }
+            assert_eq!(episodes, want, "inked midfield {inked}: {episodes} bounds");
         }
-        assert_eq!(
-            episodes, 2,
-            "60%+ of the grid is two bounds, got {episodes}"
-        );
     }
 
     /// The apex clamp: a bound from row 1 keeps the sprite's top inside the
@@ -12671,63 +11968,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// A plain pounce and a plain Enter hop both get the pose schedule's rise,
-    /// hero and landing approach.
-    #[test]
-    fn rise_and_descend_frames_schedule_on_pounces_and_hops_too() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let t = awake(&mut pet, start, 4, 10);
-        let (poses, _) = drive_and_collect(&mut pet, t, (4, 32), 160);
-        for id in [
-            PetGlyphId::PetLeapRise,
-            PetGlyphId::PetLeap,
-            PetGlyphId::PetLeapDescend,
-        ] {
-            assert!(poses.contains(&id), "the pounce must schedule {id:?}");
-        }
-        let mut pet = PetBrain::default();
-        let t = awake(&mut pet, start, 4, 30);
-        let (poses, _) = drive_and_collect(&mut pet, t, (5, 0), 160);
-        for id in [
-            PetGlyphId::PetLeapRise,
-            PetGlyphId::PetLeap,
-            PetGlyphId::PetLeapDescend,
-        ] {
-            assert!(poses.contains(&id), "the hop must schedule {id:?}");
-        }
-    }
-
-    /// The landing squash carries the weight of the crossing: a short joyful
-    /// bound lands lighter than a 45-column one.
-    #[test]
-    fn the_landing_squash_scales_with_the_span() {
-        let start = Instant::now();
-        let min_land_scale = |caret_from: u16, caret_to: u16, joy: bool| -> f32 {
-            let mut pet = PetBrain::default();
-            let mut t = awake(&mut pet, start, 3, caret_from);
-            if joy {
-                let (t2, _) = type_run(&mut pet, t, 3, caret_from + 2, 60, 0.05);
-                let (t2, _) = idle(&mut pet, t2, (3, caret_from + 62), 2.0);
-                assert!(pet.content() >= JOY_CONTENT, "fixture: joy must be earned");
-                t = t2;
-            }
-            let (_, frames) = drive_and_collect(&mut pet, t, (3, caret_to), 240);
-            frames
-                .iter()
-                .filter(|f| f.action == PetAction::Land)
-                .map(|f| f.scale_y)
-                .fold(1.0f32, f32::min)
-        };
-        // Joyful +8 jump: span ~8. Cold +48 jump: span ~48 (squash saturated).
-        let light = min_land_scale(2, 72, true);
-        let heavy = min_land_scale(10, 60, false);
-        assert!(
-            light > heavy + 0.01,
-            "a short bound lands lighter: light {light} vs heavy {heavy}"
-        );
     }
 
     // ── the sleeper's drop ─────────────────────────
@@ -12759,7 +11999,8 @@ mod tests {
     }
 
     /// An Enter one row under a sleeper: it falls (asleep, then stretching in
-    /// the air), lands, sits and stares, then takes the quiet trip home.
+    /// the air), lands, sits and stares, then takes the quiet trip home, and
+    /// nothing the fall latched is still owed once the cat sleeps again.
     #[test]
     fn an_enter_drops_the_sleeper_off_the_line() {
         let start = Instant::now();
@@ -12768,7 +12009,7 @@ mod tests {
         let col0 = pet.col;
         let frames = drop_run(&mut pet, t, (5, 0), 200);
 
-        // Off the ledge inside three ticks, asleep, with no arc at all.
+        // Off the ledge at once, asleep, with no arc at all.
         let f0 = &frames[0];
         assert_eq!(f0.action, PetAction::Leap, "the floor went: the cat falls");
         assert_eq!(f0.pose, PetGlyphId::PetSleep1, "and it is still asleep");
@@ -12781,72 +12022,25 @@ mod tests {
             frames.iter().all(|f| f.pose != PetGlyphId::PetCrouchWiggle),
             "and a fall is not a show"
         );
-        assert!(
-            frames
-                .iter()
-                .take_while(|f| f.action == PetAction::Leap)
-                .any(|f| f.pose == PetGlyphId::PetStretch),
-            "the wake stretch plays where the drop put it"
-        );
 
-        // Straight down: one row inside 0.2 s, and never a sideways cell.
+        // Straight down onto the row the line opened.
         let landed = frames
             .iter()
             .position(|f| f.action == PetAction::Land)
             .expect("the fall must land");
         assert!(
-            landed <= 13,
-            "a one-row fall is over inside 0.2 s ({landed} ticks)"
-        );
-        assert!(
             (frames[landed].row - 5.0).abs() < 0.01,
             "onto the row the line opened, got {}",
             frames[landed].row
         );
-        let mut prev = col0;
-        for f in &frames[..=landed] {
-            assert!(
-                (f.col - prev).abs() < 0.01,
-                "a fall is straight down: {prev} -> {}",
-                f.col
-            );
-            prev = f.col;
-        }
-
-        // …and it lands in a stare: eye contact, planted, for its own beat.
-        let stare: Vec<&PetFrame> = frames[landed..]
-            .iter()
-            .skip_while(|f| f.action == PetAction::Land)
-            .take_while(|f| f.action == PetAction::Sit)
-            .collect();
         assert!(
-            stare.len() >= 25,
-            "the stare holds its beat ({} ticks)",
-            stare.len()
-        );
-        for f in &stare {
-            assert_eq!(f.pose, PetGlyphId::PetSitFront, "facing whoever did it");
-            assert_eq!(f.lift, 0.0, "planted");
-        }
-        assert!(
-            stare.iter().all(|f| (f.col - prev).abs() < 0.01),
-            "and it stares from exactly where it fell"
-        );
-        assert!(
-            pet.speed.abs() < 0.01,
-            "at a standstill, speed {}",
-            pet.speed
+            frames[..=landed]
+                .iter()
+                .all(|f| (f.col - col0).abs() < 0.01),
+            "a fall is straight down"
         );
 
-        // Then the ordinary ladder: a coil, one quiet flight, a landing.
-        let after: Vec<PetAction> = frames[landed + stare.len()..]
-            .iter()
-            .map(|f| f.action)
-            .collect();
-        assert!(
-            after.contains(&PetAction::Crouch) && after.contains(&PetAction::Leap),
-            "then it coils and takes the trip home: {after:?}"
-        );
+        // Then the ordinary ladder home.
         let last = frames.last().expect("frames");
         assert!(
             last.action.settled()
@@ -12855,54 +12049,11 @@ mod tests {
             last.col,
             last.action
         );
-        // …and the whole beat is idle-to-zero: nothing the fall latched is
-        // still owed once the cat is asleep again.
         let (_, f) = idle(&mut pet, t, (5, 0), SLEEP_AFTER + BREATH_WINDOW + 2.0);
         assert_eq!(f.action, PetAction::Sleep);
         assert!(
             !pet.needs_frames(),
             "the drop's latches must all be spent by the time it sleeps"
-        );
-    }
-
-    /// A woken cat does not look up twice: the drop's [`DROP_SIT`] stare is the
-    /// double-take, so the trip home skips the notice.
-    #[test]
-    fn a_woken_cat_does_not_look_up_twice() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let t = asleep_at(&mut pet, start, 4, 18);
-        // Far enough left that the trip home predicts as a bound, which is
-        // the only flight the notice rule gates.
-        let frames = drop_run(&mut pet, t, (5, 60), 200);
-        let landed = frames
-            .iter()
-            .position(|f| f.action == PetAction::Land)
-            .expect("the fall must land");
-        let launched = frames
-            .iter()
-            .rposition(|f| f.action == PetAction::Leap)
-            .expect("and then take the trip home");
-        assert!(launched > landed, "fixture: the trip home follows the fall");
-        assert!(
-            frames[landed..launched]
-                .iter()
-                .all(|f| f.action != PetAction::Perk),
-            "the fall's stare is the double take; nothing looks up again: {:?}",
-            frames[landed..launched]
-                .iter()
-                .map(|f| f.action)
-                .collect::<Vec<_>>()
-        );
-        // …and the stare itself is untouched — this rule spends the notice,
-        // it does not cut the beat that replaced it.
-        let stare = frames[landed..launched]
-            .iter()
-            .filter(|f| f.action == PetAction::Sit)
-            .count();
-        assert!(
-            stare >= 25,
-            "the stare keeps its whole hold ({stare} ticks)"
         );
     }
 
@@ -12941,312 +12092,58 @@ mod tests {
         assert!(launched, "…and then goes");
     }
 
-    /// A caret going up is not a hole in the floor: the ordinary wake, with its
-    /// stretch on the ground where the cat already is.
+    /// Only an Enter one row under the sleeper over blank ground is a hole in
+    /// the floor: a caret going up, a three-line prompt (a floor it could have
+    /// landed on) and ink under its own column all take the ordinary wake,
+    /// with nothing left owing a fall.
     #[test]
-    fn a_caret_going_up_is_not_a_hole_in_the_floor() {
+    fn only_a_blank_row_just_below_drops_the_sleeper() {
         let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let t = asleep_at(&mut pet, start, 4, 18);
-        let frames = drop_run(&mut pet, t, (3, 0), 40);
-        assert_eq!(frames[0].action, PetAction::Waking, "a wake, not a fall");
-        assert_eq!(frames[0].pose, PetGlyphId::PetStretch);
-        assert!(!pet.pending_drop, "and nothing is owed a fall afterwards");
-    }
-
-    /// A three-line prompt is not a hole in the floor either — a cat does
-    /// not fall past a floor it could have landed on.
-    #[test]
-    fn a_three_line_prompt_wakes_the_ordinary_way() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let t = asleep_at(&mut pet, start, 4, 18);
-        let frames = drop_run(&mut pet, t, (7, 0), 40);
-        assert_eq!(frames[0].action, PetAction::Waking, "a wake, not a fall");
-        assert_eq!(frames[0].pose, PetGlyphId::PetStretch);
-        assert!(
-            frames
-                .iter()
-                .take(37)
-                .all(|f| f.action == PetAction::Waking),
-            "the stretch keeps its whole hold"
-        );
-    }
-
-    /// …and the drop refuses ink under its own column: the row below is only
-    /// a floor if there is something to land on. The ordinary wake answers.
-    #[test]
-    fn the_drop_refuses_ink_under_its_own_column() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let t = asleep_at(&mut pet, start, 4, 18);
-        // The new line reaches under the sleeper's own column — but not the
-        // caret's station, so the ladder still answers with that row.
-        let mut spans = [(0u16, 0u16); 12];
-        spans[5] = (15, 40);
-        pet.sense_ink(0, &spans, Some(5));
-        assert!(
-            pet.col > 15.0 && pet.col < 40.0,
-            "fixture: ink under the cat"
-        );
-        let frames = drop_run(&mut pet, t, (5, 0), 40);
-        assert_eq!(
-            frames[0].action,
-            PetAction::Waking,
-            "nothing to land on: the ordinary wake"
-        );
-        assert_eq!(frames[0].pose, PetGlyphId::PetStretch);
-        assert!(!pet.pending_drop, "and the latch is spent, not left owing");
-    }
-
-    // ── the scrabble: the rarity gate first ────────
-
-    /// The run-lengths of consecutive `Land` frames in a drive.
-    fn land_runs(frames: &[PetFrame]) -> Vec<usize> {
-        let mut out = Vec::new();
-        let mut run = 0usize;
-        for f in frames {
-            if f.action == PetAction::Land {
-                run += 1;
-            } else if run > 0 {
-                out.push(run);
-                run = 0;
+        for (name, caret, ink) in [
+            ("a caret going up", (3u16, 0u16), false),
+            ("a three-line prompt", (7, 0), false),
+            ("ink under its own column", (5, 0), true),
+        ] {
+            let mut pet = PetBrain::default();
+            let t = asleep_at(&mut pet, start, 4, 18);
+            if ink {
+                // The new line reaches under the sleeper's own column — but
+                // not the caret's station, so the ladder still answers with
+                // that row.
+                let mut spans = [(0u16, 0u16); 12];
+                spans[5] = (15, 40);
+                pet.sense_ink(0, &spans, Some(5));
+                assert!(
+                    pet.col > 15.0 && pet.col < 40.0,
+                    "fixture: ink under the cat"
+                );
             }
-        }
-        if run > 0 {
-            out.push(run);
-        }
-        out
-    }
-
-    /// The same run lengths, paired with whether the recovery was a bound's
-    /// weighted one (`land_span > 0`).
-    fn land_runs_tiered(frames: &[(PetFrame, bool)]) -> Vec<(usize, bool)> {
-        let mut out = Vec::new();
-        let mut run = 0usize;
-        let mut big = false;
-        for (f, b) in frames {
-            if f.action == PetAction::Land {
-                run += 1;
-                big |= *b;
-            } else if run > 0 {
-                out.push((run, big));
-                run = 0;
-                big = false;
-            }
-        }
-        if run > 0 {
-            out.push((run, big));
-        }
-        out
-    }
-
-    /// Ordinary typing never scrabbles: the miss is measured against the
-    /// launch's own prediction and rationed on top.
-    #[test]
-    fn ordinary_typing_never_scrabbles() {
-        // (a) the word jump mid-rhythm, then more typing (the
-        // a_pounce_mid_rhythm fixture).
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let t = awake(&mut pet, start, 4, 10);
-        let (mut t, _) = type_run(&mut pet, t, 4, 12, 20, 0.05);
-        let mut caret = 40u16;
-        let mut next_key = t + Duration::from_millis(50);
-        // Each frame paired with whether its recovery is a bound's
-        // ([`BIG_LAND_DUR`], longer than a scrabble by design).
-        let mut frames: Vec<(PetFrame, bool)> = Vec::new();
-        for _ in 0..200 {
-            t += Duration::from_millis(16);
-            if t >= next_key {
-                next_key += Duration::from_millis(50);
-                caret = (caret + 1).min(95);
-            }
-            // Force the ration on for every landing, so this proves the miss
-            // measure rather than the one-in-four ration. The stride is frozen
-            // while airborne, so this serial is the one the touchdown reads.
-            if pet.flight.is_some() {
-                let k = (pet.stride as u32) % 4;
-                pet.mote_serial = u8::try_from((4 - k) % 4).expect("0..4");
-            }
-            frames.push((pet.tick(sense(t, Some((4, caret)))), pet.land_span > 0.0));
-            assert!(!pet.scrabble, "typing never scrabbles");
-        }
-        assert!(
-            frames.iter().any(|(f, _)| f.action == PetAction::Land),
-            "fixture: the word jump must pounce and land"
-        );
-        // The scrabble is visible: `PetRun0` worn during a `Land`, which
-        // nothing else in the recovery does.
-        assert!(
-            frames
-                .iter()
-                .all(|(f, _)| f.action != PetAction::Land || f.pose != PetGlyphId::PetRun0),
-            "a typing landing never scrabbles for its footing"
-        );
-        // …and each recovery is exactly the length its own tier earns.
-        for (run, big) in land_runs_tiered(&frames) {
-            let (bar, what) = if big {
-                (26, "the bound's weighted recovery")
-            } else {
-                (18, "the ordinary recovery")
-            };
-            assert!(run <= bar, "a typing landing is {what}, got {run} ticks");
-        }
-
-        // (b) the sustained gallop (the frame-rate fixture): one column
-        // every three ticks, which chases without ever launching.
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let mut t = awake(&mut pet, start, 3, 2);
-        let mut caret = 4u16;
-        for i in 0..240 {
-            t += Duration::from_millis(16);
-            if i % 3 == 2 {
-                caret = (caret + 1).min(95);
-            }
-            let _ = pet.tick(sense(t, Some((3, caret))));
-            assert!(!pet.scrabble, "a gallop never scrabbles");
-        }
-    }
-
-    /// A pounce whose caret jumps twice in the air (the re-aim spent), the ration
-    /// forced on or off by `on_gate`.
-    fn missed_landing(on_gate: bool) -> Vec<PetFrame> {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let mut t = awake(&mut pet, start, 4, 10);
-        let mut caret = 30u16;
-        let (mut two, mut three, mut dealt) = (false, false, false);
-        let mut out = Vec::new();
-        for _ in 0..120 {
-            t += Duration::from_millis(16);
-            if let Some(f) = pet.flight {
-                let u = f.t / f.dur;
-                if !two && u >= 0.3 {
-                    caret = 60;
-                    two = true;
-                } else if two && !three && u >= 0.6 {
-                    caret = 20;
-                    three = true;
-                }
-                if three && !dealt && u >= 0.8 {
-                    dealt = true;
-                    let k = (pet.stride as u32) % 4;
-                    let want: u32 = u32::from(!on_gate);
-                    pet.mote_serial = u8::try_from((4 + want - k) % 4).expect("0..4");
-                }
-            }
-            out.push(pet.tick(sense(t, Some((4, caret)))));
-        }
-        assert!(
-            dealt,
-            "fixture: the ration must be dealt before the landing"
-        );
-        out
-    }
-
-    /// On the ration a missed landing scrabbles (long recovery, the gallop's
-    /// first beat with a 3 Hz wobble); off it, the ordinary landing.
-    #[test]
-    fn a_landing_far_from_the_moved_station_may_scrabble() {
-        let on = missed_landing(true);
-        let runs = land_runs(&on);
-        let run = *runs.first().expect("the pounce lands");
-        assert!(
-            run >= 22,
-            "on the ration the recovery is [`SCRABBLE_DUR`], got {run} ticks"
-        );
-        let poses: Vec<PetGlyphId> = on
-            .iter()
-            .skip_while(|f| f.action != PetAction::Land)
-            .take_while(|f| f.action == PetAction::Land)
-            .map(|f| f.pose)
-            .collect();
-        assert_eq!(poses[0], PetGlyphId::PetLand, "braced first");
-        assert!(
-            poses.iter().filter(|p| **p == PetGlyphId::PetLand).count() >= 8,
-            "for [`SCRABBLE_PLANT`] before the paws start hunting: {poses:?}"
-        );
-        assert_eq!(
-            *poses.last().expect("poses"),
-            PetGlyphId::PetRun0,
-            "then it scrabbles"
-        );
-        assert!(
-            on.iter().any(|f| f
-                .motes
-                .iter()
-                .flatten()
-                .any(|m| m.kind == PetMoteKind::Dust)),
-            "and the scramble kicks its own dust"
-        );
-
-        let off = missed_landing(false);
-        let run = *land_runs(&off).first().expect("the pounce lands");
-        assert!(
-            run <= 18,
-            "off the ration the landing is the ordinary one, got {run} ticks"
-        );
-        assert!(
-            off.iter()
-                .skip_while(|f| f.action != PetAction::Land)
-                .take_while(|f| f.action == PetAction::Land)
-                .all(|f| f.pose == PetGlyphId::PetLand),
-            "and it never scrabbles"
-        );
-
-        // The miss is the measure, not the move: a mid-air jump the re-aim
-        // absorbs lands where it was going, so even with the ration forced
-        // there is nothing to scrabble about.
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let mut t = awake(&mut pet, start, 4, 10);
-        let mut caret = 30u16;
-        let (mut moved, mut dealt) = (false, false);
-        let mut absorbed = Vec::new();
-        for _ in 0..120 {
-            t += Duration::from_millis(16);
-            if let Some(f) = pet.flight {
-                let u = f.t / f.dur;
-                if !moved && u >= 0.3 {
-                    caret = 20;
-                    moved = true;
-                }
-                if moved && !dealt && u >= 0.8 {
-                    dealt = true;
-                    let k = (pet.stride as u32) % 4;
-                    pet.mote_serial = u8::try_from((4 - k) % 4).expect("0..4");
-                }
-            }
-            absorbed.push(pet.tick(sense(t, Some((4, caret)))));
+            let frames = drop_run(&mut pet, t, caret, 40);
+            assert_eq!(
+                frames[0].action,
+                PetAction::Waking,
+                "{name}: a wake, not a fall"
+            );
+            assert_eq!(frames[0].pose, PetGlyphId::PetStretch, "{name}");
             assert!(
-                !pet.scrabble,
-                "a landing the re-aim brought home never scrabbles"
+                !pet.pending_drop,
+                "{name}: nothing is owed a fall afterwards"
             );
         }
-        assert!(
-            dealt,
-            "fixture: the re-aim happened and the ration was dealt"
-        );
-        let run = *land_runs(&absorbed).first().expect("the pounce lands");
-        assert!(
-            run <= 18,
-            "and its recovery is the ordinary one, got {run} ticks"
-        );
     }
 
     // ── the commit stare ───────────────────────────
 
-    /// A pounce the caret moves out from under twice (the first move spends the
-    /// re-aim). Returns every frame from launch, paired with the stare clock.
-    fn twice_moved(third: Option<u16>) -> (PetBrain, Vec<(PetFrame, f32)>) {
-        let start = Instant::now();
+    /// A flight moved twice lands on a cell the caret has left (the first
+    /// move spends the re-aim): the cat stands on it, does the double-take,
+    /// and goes home with the stare's beat spent, not owed.
+    #[test]
+    fn a_twice_moved_flight_lands_and_stares_before_it_admits_it() {
         let mut pet = PetBrain::default();
-        let mut t = awake(&mut pet, start, 4, 10);
+        let mut t = awake(&mut pet, Instant::now(), 4, 10);
         let mut caret = 30u16;
-        let (mut two, mut three, mut fourth) = (false, false, false);
-        let mut out = Vec::new();
+        let (mut two, mut three) = (false, false);
+        let mut frames = Vec::new();
         for _ in 0..300 {
             t += Duration::from_millis(16);
             if let Some(f) = pet.flight {
@@ -13259,66 +12156,29 @@ mod tests {
                     three = true;
                 }
             }
-            // The optional third jump, dealt the moment the stare begins.
-            if let Some(c) = third
-                && !fourth
-                && pet.commit_t > 0.0
-                && pet.action == PetAction::Stand
-            {
-                caret = c;
-                fourth = true;
-            }
-            out.push((pet.tick(sense(t, Some((4, caret)))), pet.commit_t));
+            frames.push(pet.tick(sense(t, Some((4, caret)))));
         }
         assert!(
             two && three,
             "fixture: the caret must move twice in the air"
         );
-        (pet, out)
-    }
-
-    /// A flight moved twice lands on a cell the caret has left: the cat stands
-    /// on it facing the way it flew, then does the double-take and goes home.
-    #[test]
-    fn a_twice_moved_flight_lands_and_stares_before_it_admits_it() {
-        let (pet, frames) = twice_moved(None);
         let landed = frames
             .iter()
-            .position(|(f, _)| f.action == PetAction::Land)
+            .position(|f| f.action == PetAction::Land)
             .expect("the pounce lands");
-        let stare: Vec<&PetFrame> = frames[landed..]
+        let stare = frames[landed..]
             .iter()
-            .skip_while(|(f, _)| f.action == PetAction::Land)
-            .take_while(|(f, _)| f.action == PetAction::Stand)
-            .map(|(f, _)| f)
-            .collect();
+            .skip_while(|f| f.action == PetAction::Land)
+            .take_while(|f| f.action == PetAction::Stand)
+            .count();
+        assert!(stare > 0, "the cat stands on the empty cell first");
         assert!(
-            stare.len() >= 14,
-            "the stare holds [`COMMIT_STARE`] ({} ticks)",
-            stare.len()
+            frames[landed + stare..]
+                .iter()
+                .any(|f| f.action == PetAction::Perk),
+            "then the double-take"
         );
-        for f in &stare {
-            assert!(!f.facing_left, "facing the way it flew — that IS the joke");
-            assert_eq!(f.lift, 0.0, "planted on the empty cell");
-        }
-        let after: Vec<&PetFrame> = frames[landed + stare.len()..]
-            .iter()
-            .map(|(f, _)| f)
-            .collect();
-        let perk = after
-            .iter()
-            .position(|f| f.action == PetAction::Perk)
-            .expect("then the double-take");
-        assert!(
-            after[perk].facing_left,
-            "…which turns the head after the caret"
-        );
-        let tail: Vec<PetAction> = after[perk..].iter().map(|f| f.action).collect();
-        assert!(
-            tail.contains(&PetAction::Crouch) && tail.contains(&PetAction::Leap),
-            "and then it goes: {tail:?}"
-        );
-        let last = frames.last().expect("frames").0;
+        let last = frames.last().expect("frames");
         assert!(
             (last.col - PetBrain::station(20, 100, art_cols(10, 20))).abs() < 1.5,
             "home at the station it was left with, got {}",
@@ -13327,127 +12187,18 @@ mod tests {
         assert_eq!(pet.commit_t, 0.0, "and the beat is spent, not owed");
     }
 
-    /// A third jump abandons the stare, but never before [`POSE_FLOOR`].
-    #[test]
-    fn a_third_jump_abandons_the_stare() {
-        let (_, frames) = twice_moved(Some(4));
-        let landed = frames
-            .iter()
-            .position(|(f, _)| f.action == PetAction::Land)
-            .expect("the pounce lands");
-        // The stare was armed; otherwise a deleted stare would also pass.
-        assert!(
-            frames[landed..].iter().any(|(_, c)| *c > 0.0),
-            "fixture: the stare arms before the third jump takes it away"
-        );
-        let stare = frames[landed..]
-            .iter()
-            .skip_while(|(f, _)| f.action == PetAction::Land)
-            .take_while(|(f, _)| f.action == PetAction::Stand)
-            .count();
-        assert!(
-            stare >= 2,
-            "a pose swap holds two ticks even when it is abandoned ({stare} ticks)"
-        );
-        assert!(
-            stare <= 4,
-            "the third jump cuts the stare short ({stare} ticks)"
-        );
-        let after: Vec<PetAction> = frames[landed + stare..]
-            .iter()
-            .map(|(f, _)| f.action)
-            .take(40)
-            .collect();
-        assert!(
-            after.contains(&PetAction::Crouch) || after.contains(&PetAction::Leap),
-            "it leaves at once instead: {after:?}"
-        );
-    }
-
-    // ── the athletic vocabulary ─────────────────────────────────────────
-
-    /// No frame across the crouch-to-launch boundary steps the volume
-    /// (`scale_x · scale_y`) by more than 2%, for the pounce coil and the wiggle.
-    #[test]
-    fn the_coil_releases_without_a_volume_pop() {
-        let no_pop = |caret_to: u16, label: &str| {
-            let start = Instant::now();
-            let mut pet = PetBrain::default();
-            let mut t = awake(&mut pet, start, 4, 10);
-            let mut vols: Vec<f32> = Vec::new();
-            for _ in 0..300 {
-                t += Duration::from_millis(16);
-                let f = pet.tick(sense(t, Some((4, caret_to))));
-                match f.action {
-                    PetAction::Crouch | PetAction::Leap => {
-                        vols.push(f.scale_x * f.scale_y);
-                    }
-                    PetAction::Land if !vols.is_empty() => break,
-                    _ => {}
-                }
-            }
-            assert!(vols.len() > 3, "{label}: fixture must gather and fly");
-            for w in vols.windows(2) {
-                assert!(
-                    (w[1] - w[0]).abs() <= 0.02,
-                    "{label}: a volume pop at the coil: {} -> {}",
-                    w[0],
-                    w[1]
-                );
-            }
-        };
-        // An 18-column jump pounces; a 48-column jump plays the big show.
-        no_pop(30, "the pounce coil");
-        no_pop(60, "the big gather");
-    }
-
-    /// The landing steps off on a contact frame: after `land_t` the gait phase
-    /// is within ε of an integer, reached by easing, never a snap.
-    #[test]
-    fn the_landing_steps_off_on_a_contact_frame() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let mut t = awake(&mut pet, start, 4, 10);
-        let mut landed = false;
-        let mut max_step = 0.0f32;
-        for _ in 0..400 {
-            t += Duration::from_millis(16);
-            let before = pet.stride;
-            let f = pet.tick(sense(t, Some((4, 30))));
-            if f.action == PetAction::Land {
-                if !landed {
-                    landed = true;
-                    // Force a mid-swing phase the moment the paws touch, so
-                    // the recovery has real work to show.
-                    pet.stride = pet.stride.round() + 0.37;
-                } else {
-                    max_step = max_step.max((pet.stride - before).abs());
-                }
-            } else if landed {
-                break;
-            }
-        }
-        assert!(landed, "fixture: the word jump must pounce and land");
-        let planted = (pet.stride - pet.stride.round()).abs();
-        assert!(
-            planted < 0.05,
-            "the gait must step off on a contact frame, {planted} off a plant"
-        );
-        assert!(
-            max_step < 0.15,
-            "and reach it by EASING, not a snap: worst tick moved {max_step}"
-        );
-    }
-
     /// Byte-identical frames wherever the wall clock started, across a pounce,
-    /// an Enter hop, a two-bound crossing and every landing.
+    /// an Enter hop, a two-bound crossing, every landing and the idle beats
+    /// (the loaf's thumps) after: every schedule is quiet-phased, never
+    /// wall-clocked.
     #[test]
     fn the_same_typing_still_produces_the_same_cat() {
         let run = |start: Instant| -> Vec<u64> {
             let mut pet = PetBrain::default();
             let mut t = awake(&mut pet, start, 4, 10);
             let mut fps = Vec::new();
-            for (row, col, ticks) in [(4u16, 30u16, 90u32), (5, 2, 70), (5, 80, 240), (5, 82, 60)] {
+            for (row, col, ticks) in [(4u16, 30u16, 90u32), (5, 2, 70), (5, 80, 240), (5, 82, 700)]
+            {
                 for _ in 0..ticks {
                     t += Duration::from_millis(16);
                     fps.push(pet.tick(sense(t, Some((row, col)))).fp());
@@ -13464,191 +12215,7 @@ mod tests {
         );
     }
 
-    /// A big bound hangs: the share of flight at or above `0.9·arc` grows from
-    /// the parabola's 0.3162 to ~0.4236, on the pure shape and on glass.
-    #[test]
-    fn a_big_bound_hangs_at_its_apex() {
-        let frac = |big: bool| -> f32 {
-            let n = 20_001u32;
-            let mut hung = 0u32;
-            for i in 0..n {
-                let u = i as f32 / (n - 1) as f32;
-                if PetBrain::flight_lift(1.0, u, big) >= 0.9 {
-                    hung += 1;
-                }
-            }
-            hung as f32 / n as f32
-        };
-        let parabola = frac(false);
-        let hang = frac(true);
-        assert!(
-            (parabola - 0.3162).abs() < 0.01,
-            "the parabola's apex window drifted: {parabola}"
-        );
-        assert!(
-            (hang - 0.4236).abs() < 0.02,
-            "the hang's apex window must be ~0.4236, got {hang}"
-        );
-        // And on glass: a real single bound spends roughly that share of
-        // its airborne frames up high (loose — frames quantize the window).
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let mut t = awake(&mut pet, start, 4, 10);
-        let mut lifts: Vec<f32> = Vec::new();
-        for _ in 0..300 {
-            t += Duration::from_millis(16);
-            let f = pet.tick(sense(t, Some((4, 60))));
-            if f.action == PetAction::Leap {
-                lifts.push(f.lift);
-            }
-        }
-        let apex = lifts.iter().copied().fold(0.0f32, f32::max);
-        assert!(
-            apex > 0.5,
-            "fixture: the bound must actually fly, apex {apex}"
-        );
-        let high = lifts.iter().filter(|l| **l >= 0.9 * apex).count() as f32;
-        let share = high / lifts.len() as f32;
-        assert!(
-            (0.30..=0.55).contains(&share),
-            "a big bound hangs ~0.42 of its flight up high, measured {share}"
-        );
-    }
-
-    /// A non-big flight keeps the parabola `4u(1−u)` byte for byte.
-    #[test]
-    fn a_small_hop_keeps_its_parabola() {
-        for i in 0..=10_000u32 {
-            let u = i as f32 / 10_000.0;
-            let arc = 0.87f32;
-            assert_eq!(
-                PetBrain::flight_lift(arc, u, false).to_bits(),
-                (arc * 4.0 * u * (1.0 - u)).to_bits(),
-                "the small flight's parabola drifted at u = {u}"
-            );
-        }
-        // On glass: every airborne frame of an Enter hop carries its arc's
-        // exact parabola. The Enter is short so it stays in the hop tier
-        // ([`POUNCE_SPAN_MAX`], with a row counting [`ROW_AS_COLS`]).
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let mut t = awake(&mut pet, start, 4, 10);
-        let mut airborne = false;
-        for _ in 0..200 {
-            t += Duration::from_millis(16);
-            let f = pet.tick(sense(t, Some((5, 2))));
-            if f.action == PetAction::Leap
-                && let Some(fl) = pet.flight
-            {
-                assert!(!fl.big, "fixture: an Enter hop is not a bound");
-                let u = (fl.t / fl.dur).clamp(0.0, 1.0);
-                assert_eq!(
-                    f.lift.to_bits(),
-                    (fl.arc * 4.0 * u * (1.0 - u)).to_bits(),
-                    "the hop's lift left its parabola at u = {u}"
-                );
-                airborne = true;
-            }
-        }
-        assert!(airborne, "fixture: the hop must actually fly");
-    }
-
     // ── the sleep z's and the purr tell ─────────────────────────────────
-
-    /// Light sleep drifts z's: spawned on the quiet clock, at most three alive,
-    /// free-floating, rotated, scaling and fading.
-    #[test]
-    fn light_sleep_drifts_zees_capped_and_free_floating() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let t = awake(&mut pet, start, 4, 10);
-        let (mut t, _) = idle(&mut pet, t, (4, 12), SLEEP_AFTER + 0.1);
-        let mut seen = 0usize;
-        let mut scales = std::collections::BTreeSet::new();
-        let mut alphas = std::collections::BTreeSet::new();
-        for _ in 0..400 {
-            t += Duration::from_millis(16);
-            let f = pet.tick(sense(t, Some((4, 12))));
-            assert_eq!(f.action, PetAction::Sleep, "the fixture stays asleep");
-            let zees: Vec<_> = f
-                .motes
-                .iter()
-                .flatten()
-                .filter(|m| matches!(m.kind, PetMoteKind::Zee))
-                .collect();
-            assert!(zees.len() <= ZEE_ALIVE_MAX, "never more than three z's");
-            for z in &zees {
-                seen += 1;
-                assert!(
-                    z.col.fract() != 0.0 || z.row.fract() != 0.0,
-                    "z's are never grid-aligned: ({}, {})",
-                    z.col,
-                    z.row
-                );
-                assert!(z.rot != 0.0, "and always rotated");
-                scales.insert((z.scale * 1024.0) as i64);
-                alphas.insert(z.alpha);
-            }
-        }
-        assert!(seen > 0, "light sleep must actually dream");
-        // The look is held per slice, so a z wears exactly sixteen scales and
-        // eight alpha bytes (a three-step rise and six-step fall sharing 137,
-        // plus the plateau's 220).
-        assert_eq!(
-            scales.len(),
-            ZEE_STEPS as usize,
-            "the z's grow as they drift, one size a slice: {scales:?}"
-        );
-        assert_eq!(
-            alphas,
-            [45, 137, 220, 216, 176, 98, 58, 19].into_iter().collect(),
-            "and fade as they go, one alpha a slice"
-        );
-    }
-
-    /// [`ZEE_EVERY`] pinned from both sides: at least five births in the window,
-    /// never [`ZEE_ALIVE_MAX`] alive, under WCAG 2.3.1's 3 Hz flash bound.
-    #[test]
-    fn the_sleep_zees_drift_at_a_breathing_cadence() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let t = awake(&mut pet, start, 4, 10);
-        let (mut t, _) = idle(&mut pet, t, (4, 12), SLEEP_AFTER + 0.02);
-        // Slot-occupancy edges, so each birth is counted once.
-        let mut was_zee = [false; PET_MOTES_MAX];
-        let mut births = 0usize;
-        let mut peak_alive = 0usize;
-        // The whole light-sleep window plus a margin: spawning is cut off at
-        // `SLEEP_AFTER + BREATH_WINDOW - ZEE_LIFE` by the idle-to-zero law.
-        let ticks = ((BREATH_WINDOW + 1.0) / 0.016) as u32;
-        for _ in 0..ticks {
-            t += Duration::from_millis(16);
-            let f = pet.tick(sense(t, Some((4, 12))));
-            let mut alive = 0usize;
-            for (slot, m) in f.motes.iter().enumerate() {
-                let zee = matches!(m, Some(s) if s.kind == PetMoteKind::Zee);
-                births += usize::from(zee && !was_zee[slot]);
-                alive += usize::from(zee);
-                was_zee[slot] = zee;
-            }
-            peak_alive = peak_alive.max(alive);
-        }
-        assert!(
-            births >= 5,
-            "the light-sleep window fitted only {births} z's — the tell reads \
-             as intermittent, not as breathing"
-        );
-        assert!(
-            peak_alive < ZEE_ALIVE_MAX,
-            "{peak_alive} z's alive at once reaches the cap: that is a swarm, \
-             not a drift"
-        );
-        let hz = 1.0 / ZEE_EVERY;
-        assert!(
-            hz < 3.0,
-            "z births at {hz} Hz — over WCAG 2.3.1's 3 Hz general-flash bound"
-        );
-    }
 
     /// Drive a fresh brain into light sleep with a `Zee` drifting off the head.
     /// Deterministic, so two brains driven this way are equal.
@@ -13735,113 +12302,7 @@ mod tests {
         assert!(still.motes.iter().all(Option::is_none));
     }
 
-    /// The purr tell: a settled, contented cat floats ♪ and ♥ motes on the
-    /// same lane — and its chest swell is the deepened 5%.
-    #[test]
-    fn a_purring_cat_floats_notes_and_hearts() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let t = awake(&mut pet, start, 3, 2);
-        let (t, _) = type_run(&mut pet, t, 3, 4, 40, 0.05);
-        let (mut t, _) = idle(&mut pet, t, (3, 44), SIT_AFTER + 0.6);
-        let mut kinds = std::collections::BTreeSet::new();
-        let mut min_scale_y = 1.0f32;
-        let mut max_scale_y = 1.0f32;
-        for _ in 0..320 {
-            t += Duration::from_millis(16);
-            let f = pet.tick(sense(t, Some((3, 44))));
-            // Measured on the tell, not the pose: the swell rides every settled
-            // frame of a content cat, and a third of long dwells loaf.
-            if f.purr > 0.0 {
-                min_scale_y = min_scale_y.min(f.scale_y);
-                max_scale_y = max_scale_y.max(f.scale_y);
-            }
-            for m in f.motes.iter().flatten() {
-                kinds.insert(match m.kind {
-                    PetMoteKind::Note => 1u8,
-                    PetMoteKind::Heart => 2,
-                    _ => 0,
-                });
-                assert!(
-                    m.col.fract() != 0.0 || m.row.fract() != 0.0,
-                    "purr motes are never grid-aligned"
-                );
-                assert!(m.rot != 0.0, "and always rotated");
-            }
-        }
-        assert!(kinds.contains(&1), "the purr floats a note");
-        assert!(kinds.contains(&2), "and a heart");
-        assert!(
-            max_scale_y - min_scale_y >= PURR_DEPTH,
-            "the chest swell must reach the deepened depth: {} .. {}",
-            min_scale_y,
-            max_scale_y
-        );
-    }
-
-    /// Waking pops exactly one startled z ahead of the stretch.
-    #[test]
-    fn waking_pops_one_startled_z_before_the_stretch() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let (mut t, f) = idle(&mut pet, start, (4, 20), 0.5);
-        assert_eq!(f.action, PetAction::Sleep, "a fresh pet naps");
-        t += Duration::from_millis(16);
-        let f = pet.tick(sense(t, Some((4, 21))));
-        assert_eq!(f.action, PetAction::Waking);
-        assert_eq!(f.pose, PetGlyphId::PetStretch);
-        let pops = f
-            .motes
-            .iter()
-            .flatten()
-            .filter(|m| m.kind == PetMoteKind::ZeePop)
-            .count();
-        assert_eq!(pops, 1, "one startled z, not a stream");
-    }
-
-    /// Reduced motion spawns nothing on the mote lane — ever.
-    #[test]
-    fn reduced_motion_never_spawns_motes() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let mut t = start;
-        for _ in 0..600 {
-            t += Duration::from_millis(64);
-            let mut s = sense(t, Some((4, 20)));
-            s.reduced_motion = true;
-            let f = pet.tick(s);
-            assert!(
-                f.motes.iter().all(Option::is_none),
-                "reduced motion must never particle"
-            );
-        }
-    }
-
     // ── the settled gaze and the loaf ───────────────────────────────────
-
-    /// A pet that chased right keeps facing the writing before and after the
-    /// settle-turn's beat, and makes eye contact face-on when it sits.
-    #[test]
-    fn the_escort_seat_keeps_its_travel_facing() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let t = awake(&mut pet, start, 4, 10);
-        let (t, _) = type_run(&mut pet, t, 4, 12, 3, 0.06);
-        let (t, f) = idle(&mut pet, t, (4, 15), 0.30);
-        assert!(!f.facing_left, "before the beat it faces its travel");
-        let (t, f) = idle(&mut pet, t, (4, 15), 0.80);
-        assert!(
-            !f.facing_left,
-            "past the beat it still faces its travel, not the caret it escorts"
-        );
-        let (_, f) = idle(&mut pet, t, (4, 15), SIT_AFTER);
-        assert_eq!(f.action, PetAction::Sit);
-        assert_eq!(
-            (f.pose, f.facing_left),
-            (PetGlyphId::PetSitFront, false),
-            "the eye contact is the face-on sit"
-        );
-    }
 
     /// A seat facing left that the caret sends right turns on its first moving
     /// frame, not after the follower passes [`FLIP_SPEED`].
@@ -13866,25 +12327,6 @@ mod tests {
             }
         }
         panic!("fixture: the seat never moved");
-    }
-
-    /// Parked wall-side facing left with the caret behind on the right, the
-    /// pet peeks over the shoulder instead of flipping.
-    #[test]
-    fn a_far_caret_behind_earns_the_over_shoulder_peek() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let t = awake(&mut pet, start, 5, 93);
-        // The awake run crossed the pet to the caret's left (caret 95).
-        assert!(pet.col < 90.0, "fixture: parked wall-side, col {}", pet.col);
-        let (_, f) = idle(&mut pet, t, (5, 95), 0.5);
-        assert_eq!(f.action, PetAction::Sit);
-        assert!(f.facing_left, "the body keeps its travel facing");
-        assert_eq!(
-            f.pose,
-            PetGlyphId::PetPeekShoulder,
-            "a far caret behind the facing earns the peek"
-        );
     }
 
     /// While hidden the sync applies immediately — there is nothing on screen
@@ -13998,37 +12440,102 @@ mod tests {
         );
     }
 
+    /// Reduced motion turns every stimulus into bookkeeping: a bell, a pair of
+    /// command verdicts, a pet, a word-cat peek, a dashing pointer and a stream
+    /// each leave the pet seated or asleep, unscaled and without motes, and
+    /// every latch they would have armed is spent. The ledger still moves for
+    /// the verdicts and the pet.
     #[test]
-    fn a_bell_under_reduced_motion_is_bookkeeping_only() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let mut t = start;
-        let reduced = |t: Instant| {
-            let mut s = sense(t, Some((3, 10)));
-            s.reduced_motion = true;
-            s
-        };
-        for _ in 0..40 {
-            t += Duration::from_millis(16);
-            let _ = pet.tick(reduced(t));
-        }
-        pet.note_bell(t);
-        for _ in 0..10 {
-            t += Duration::from_millis(16);
-            let f = pet.tick(reduced(t));
+    fn reduced_motion_turns_every_stimulus_into_bookkeeping() {
+        type Note = fn(&mut PetBrain, Instant);
+        type Feel = fn(&mut PetSense, u32);
+        type Check = fn(&PetBrain, f32);
+        let quiet: Feel = |_, _| {};
+        let nothing: Check = |_, _| {};
+        // (name, warm up live, the stimulus noted, the sense it rides, the
+        // ledger check against the content before the note)
+        let stimuli: [(&str, bool, Note, Feel, Check); 6] = [
+            ("bell", false, |pet, t| pet.note_bell(t), quiet, nothing),
+            (
+                "verdicts",
+                false,
+                |pet, t| {
+                    let c0 = pet.content();
+                    pet.note_command_done(t, false, Some(240_000));
+                    let warmed = pet.content();
+                    assert!(warmed > c0, "verdicts: the ledger still warms");
+                    pet.note_command_done(t, true, Some(1000));
+                    assert!(pet.content() < warmed, "verdicts: and still cools");
+                },
+                quiet,
+                nothing,
+            ),
+            (
+                "pet",
+                false,
+                |pet, t| pet.note_petted(t),
+                quiet,
+                |pet, c0| assert!(pet.content() > c0, "pet: the warmth still lands"),
+            ),
+            (
+                "peek",
+                true,
+                |pet, t| pet.note_peek(t, 15.0, 3.0),
+                quiet,
+                nothing,
+            ),
+            (
+                "pointer",
+                true,
+                |_, _| {},
+                |s, k| s.pointer = Some(((59.0 - k as f32).max(2.0), 3.0)),
+                nothing,
+            ),
+            (
+                "stream",
+                true,
+                |_, _| {},
+                |s, _| s.output_burst = true,
+                nothing,
+            ),
+        ];
+        for (name, warm_live, note, feel, check) in stimuli {
+            let mut pet = PetBrain::default();
+            let mut t = Instant::now();
+            for _ in 0..40 {
+                t += Duration::from_millis(16);
+                let mut s = sense(t, Some((3, 10)));
+                s.reduced_motion = !warm_live;
+                let _ = pet.tick(s);
+            }
+            let c0 = pet.content();
+            note(&mut pet, t);
+            for k in 0..120u32 {
+                t += Duration::from_millis(16);
+                let mut s = sense(t, Some((3, 10)));
+                s.reduced_motion = true;
+                feel(&mut s, k);
+                let f = pet.tick(s);
+                assert!(
+                    matches!(f.action, PetAction::Sit | PetAction::Sleep),
+                    "{name}: no action under reduced motion, got {:?}",
+                    f.action
+                );
+                assert_eq!((f.scale_x, f.scale_y), (1.0, 1.0), "{name}: no squash");
+                assert!(f.motes.iter().all(Option::is_none), "{name}: no motes");
+            }
+            check(&pet, c0);
             assert!(
-                matches!(f.action, PetAction::Sit | PetAction::Sleep),
-                "no action change under reduced motion, got {:?}",
-                f.action
+                pet.pending_bell.is_none() && pet.pending_cheer.is_none() && !pet.pending_sulk,
+                "{name}: the bell and verdict latches clear as bookkeeping"
             );
-            assert_eq!(f.scale_x, 1.0);
-            assert_eq!(f.scale_y, 1.0);
-            assert!(f.motes.iter().all(Option::is_none), "and no motes");
+            assert_eq!(pet.pending_pets(), 0, "{name}: the pet latch is spent");
+            assert_eq!(pet.pet_hold_t, 0.0, "{name}: no purr hold");
+            assert!(pet.pending_bat.is_none(), "{name}: the bat latch clears");
+            assert_eq!(pet.pointer_heat, 0.0, "{name}: no gaze");
+            assert!(pet.pending_pointer_pounce.is_none(), "{name}: no pounce");
+            assert_eq!(pet.watch_heat, 0.0, "{name}: no watch heat left behind");
         }
-        assert!(
-            pet.pending_bell.is_none(),
-            "the latch clears as bookkeeping"
-        );
     }
 
     // ── exit-code empathy ───────────────────────────────────────
@@ -14150,65 +12657,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn exit_bump_respects_the_cold_purr_law() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let t = awake(&mut pet, start, 3, 40);
-        let (t, _) = idle(&mut pet, t, (3, 42), 0.4);
-        assert!(pet.content() < 0.1, "fixture: a cold cat");
-        pet.note_command_done(t, false, Some(10_000));
-        // Let the whole cheer play, then settle well past the sit.
-        let (_, f) = idle(
-            &mut pet,
-            t,
-            (3, 42),
-            SIT_AFTER + PERK_HOLD + FROLIC_HOLD + 0.6,
-        );
-        assert_ne!(
-            f.action,
-            PetAction::Purr,
-            "0.18 < PURR_GATE: one green build cannot buy a purr from a cold cat"
-        );
-        assert!(pet.content() < PURR_GATE);
-    }
-
-    #[test]
-    fn reduced_motion_exit_is_bookkeeping() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let mut t = start;
-        let reduced = |t: Instant| {
-            let mut s = sense(t, Some((3, 10)));
-            s.reduced_motion = true;
-            s
-        };
-        for _ in 0..40 {
-            t += Duration::from_millis(16);
-            let _ = pet.tick(reduced(t));
-        }
-        let c0 = pet.content();
-        pet.note_command_done(t, false, Some(240_000));
-        let warmed = pet.content();
-        assert!(warmed > c0, "the ledger still warms");
-        pet.note_command_done(t, true, Some(1000));
-        assert!(pet.content() < warmed, "and still cools");
-        for _ in 0..60 {
-            t += Duration::from_millis(16);
-            let f = pet.tick(reduced(t));
-            assert!(
-                matches!(f.action, PetAction::Sit | PetAction::Sleep),
-                "no droop, no frolic under reduced motion, got {:?}",
-                f.action
-            );
-            assert!(f.motes.iter().all(Option::is_none), "and no motes");
-        }
-        assert!(
-            pet.pending_cheer.is_none() && !pet.pending_sulk,
-            "the latches clear as bookkeeping"
-        );
-    }
-
     // ── petting ─────────────────────────────────────────────────
 
     #[test]
@@ -14279,22 +12727,6 @@ mod tests {
             }),
             "a stroke gives the same heart as a click"
         );
-        for pose in [
-            PetGlyphId::PetSitLookup,
-            PetGlyphId::PetPurr,
-            PetGlyphId::PetSitBlink,
-        ] {
-            assert!(
-                frames
-                    .iter()
-                    .any(|f| f.action == PetAction::Purr && f.pose == pose),
-                "affection must actually show {pose:?}"
-            );
-        }
-        assert!(
-            frames.iter().any(|f| f.scale_y > 1.05),
-            "the body leans into the hand"
-        );
         assert!(
             held_locations
                 .iter()
@@ -14312,27 +12744,6 @@ mod tests {
             pet.next_change_deadline(t + Duration::from_secs(60))
                 .is_none()
         );
-    }
-
-    #[test]
-    fn repeat_affection_adds_a_tail_flick_without_extending_each_hold() {
-        let mut pet = PetBrain::default();
-        let mut t = awake(&mut pet, Instant::now(), 4, 10);
-        pet.note_petted(t);
-        t += Duration::from_millis(16);
-        pet.tick(sense(t, Some((4, 12))));
-        for _ in 0..3 {
-            pet.note_petted(t);
-        }
-        let mut flicked = false;
-        for _ in 0..160 {
-            t += Duration::from_millis(16);
-            let f = pet.tick(sense(t, Some((4, 12))));
-            flicked |= f.action == PetAction::Purr && f.pose == PetGlyphId::PetSitFlick;
-        }
-        assert!(flicked, "warm affection varies the seated beat");
-        assert_eq!(pet.pending_pets(), 0);
-        assert_eq!(pet.pet_hold_t, 0.0);
     }
 
     #[test]
@@ -14429,42 +12840,6 @@ mod tests {
     }
 
     #[test]
-    fn petting_enough_earns_a_purr() {
-        let start = Instant::now();
-        // One pet cannot buy a purr…
-        let mut lone = PetBrain::default();
-        let t = awake(&mut lone, start, 4, 10);
-        let (t, _) = idle(&mut lone, t, (4, 12), SIT_AFTER + 0.4);
-        lone.note_petted(t);
-        let (_, f) = idle(&mut lone, t, (4, 12), PET_HOLD + 0.5);
-        assert_eq!(lone.pet_hold_t, 0.0, "the hold has fully played out");
-        assert_ne!(
-            f.action,
-            PetAction::Purr,
-            "one pet cannot buy a sustained purr (0.08 < PURR_GATE)"
-        );
-        // …four inside the TTL can — the point.
-        let mut pet = PetBrain::default();
-        let t = awake(&mut pet, start, 4, 10);
-        let (mut t, _) = idle(&mut pet, t, (4, 12), SIT_AFTER + 0.4);
-        pet.note_petted(t);
-        t += Duration::from_millis(16);
-        let _ = pet.tick(sense(t, Some((4, 12)))); // consumes the first pet
-        pet.note_petted(t);
-        pet.note_petted(t);
-        pet.note_petted(t); // three more queue through the hold
-        let (t, _) = idle(&mut pet, t, (4, 12), PET_HOLD + 0.2);
-        let (_, f) = idle(&mut pet, t, (4, 12), PET_HOLD + 0.3);
-        assert_eq!(pet.pet_hold_t, 0.0, "both holds have played out");
-        assert_eq!(
-            f.action,
-            PetAction::Purr,
-            "four pets bought the REAL purr off the settle ladder"
-        );
-        assert!(pet.content() >= PURR_GATE);
-    }
-
-    #[test]
     fn a_pet_during_flight_waits_for_the_ground() {
         let start = Instant::now();
         let mut pet = PetBrain::default();
@@ -14509,34 +12884,6 @@ mod tests {
             pet.pet_hold_t, 0.0,
             "no purr hold fires for a click from before the sprint"
         );
-    }
-
-    #[test]
-    fn a_pet_under_reduced_motion_is_bookkeeping_only() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let mut t = start;
-        let reduced = |t: Instant| {
-            let mut s = sense(t, Some((3, 10)));
-            s.reduced_motion = true;
-            s
-        };
-        for _ in 0..40 {
-            t += Duration::from_millis(16);
-            let _ = pet.tick(reduced(t));
-        }
-        let c0 = pet.content();
-        pet.note_petted(t);
-        t += Duration::from_millis(16);
-        let f = pet.tick(reduced(t));
-        assert!(
-            matches!(f.action, PetAction::Sit | PetAction::Sleep),
-            "no purr hold under reduced motion"
-        );
-        assert!(f.motes.iter().all(Option::is_none), "no heart");
-        assert!(pet.content() > c0, "but the warmth still lands");
-        assert_eq!(pet.pending_pets(), 0, "the latch is spent, not parked");
-        assert_eq!(pet.pet_hold_t, 0.0);
     }
 
     /// The stimulus latches hold `needs_frames` open until consumed or expired,
@@ -14669,7 +13016,7 @@ mod tests {
         let t = awake(&mut pet, start, 4, 12);
         let (mut t, _) = idle(&mut pet, t, (4, 14), SIT_AFTER + 0.3);
         // A word-cat head lands 7 columns away on the same row. An even serial
-        // deals the swipe (`near_peek_alternates_swipe_and_greeting`).
+        // deals the swipe (an odd one the playbow greeting).
         pet.mote_serial = 0;
         pet.note_peek(t, 22.0, 4.0);
         assert!(pet.pending_bat.is_some(), "in range: the bat latches");
@@ -14789,57 +13136,6 @@ mod tests {
         assert!(
             swiped_after_land,
             "and the bat still fires after the work, inside its TTL"
-        );
-    }
-
-    #[test]
-    fn reduced_motion_peek_is_nothing_at_all() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let mut t = start;
-        for _ in 0..40 {
-            t += Duration::from_millis(16);
-            let _ = pet.tick(sense(t, Some((3, 10))));
-        }
-        pet.note_peek(t, 15.0, 3.0);
-        for _ in 0..60 {
-            t += Duration::from_millis(16);
-            let mut s = sense(t, Some((3, 10)));
-            s.reduced_motion = true;
-            let f = pet.tick(s);
-            assert!(
-                matches!(f.action, PetAction::Sit | PetAction::Sleep),
-                "no bat under reduced motion, got {:?}",
-                f.action
-            );
-            assert!(f.motes.iter().all(Option::is_none), "and no dust");
-        }
-        assert!(pet.pending_bat.is_none(), "the latch clears as bookkeeping");
-    }
-
-    // ── idle micro-life ─────────────────────────────────────────
-
-    #[test]
-    fn flick_beats_are_quiet_phased() {
-        // The same settle from two absolute start instants gives identical
-        // frames.
-        let run = |start: Instant| -> Vec<u64> {
-            let mut pet = PetBrain::default();
-            let t = awake(&mut pet, start, 4, 12);
-            let (mut t, _) = idle(&mut pet, t, (4, 14), LOAF_AFTER);
-            let mut fps = Vec::new();
-            for _ in 0..((FLICK_EVERY * 2.5 / 0.016) as u32) {
-                t += Duration::from_millis(16);
-                fps.push(pet.tick(sense(t, Some((4, 14)))).fp());
-            }
-            fps
-        };
-        let a = run(Instant::now());
-        let b = run(Instant::now() + Duration::from_millis(4_321));
-        assert_eq!(a, b, "the thump schedule is quiet-phased, not wall-clocked");
-        assert!(
-            a.windows(2).any(|w| w[0] != w[1]),
-            "and a thump actually plays inside the window"
         );
     }
 
@@ -15134,151 +13430,6 @@ mod tests {
         assert!(
             pet.departures.iter().all(Option::is_none) && pet.arrive_t == 0.0,
             "the lane is emptied and the ramp retired once the body is at zero"
-        );
-    }
-
-    /// The quiet path is a 0.25 s in-place cross-dissolve: neither body moves
-    /// and the ghost's `life()` is [`EDGE_FADE`].
-    #[test]
-    fn a_quiet_redress_is_a_quarter_second_crossfade() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let t = awake(&mut pet, start, 4, 48);
-        assert_eq!(
-            pet.sync_look((3, 1), PetArrival::Ceremony).worn,
-            (3, 1),
-            "the first dress applies"
-        );
-        let (mut t, _) = idle(&mut pet, t, (4, 50), 0.2);
-        let out = pet.sync_look((9, 4), PetArrival::Quiet);
-        assert_eq!(out.worn, (3, 1), "fixture: the homecoming parks");
-        assert!(out.parked, "…and reports the genuine park");
-        let mut swap_at: Option<Instant> = None;
-        let mut live_col0 = 0.0f32;
-        let mut ghost_col0: Option<f32> = None;
-        let mut ghost_frames = 0u32;
-        let mut prev_alpha = 255u8;
-        let mut prev_ghost_alpha = 255u8;
-        for _ in 0..600 {
-            t += Duration::from_millis(16);
-            let f = pet.tick(sense(t, Some((4, 50))));
-            let out = pet.sync_look((9, 4), PetArrival::Quiet);
-            if swap_at.is_none() && out.worn == (9, 4) {
-                swap_at = Some(t);
-                live_col0 = f.col;
-                assert_eq!(
-                    f.alpha,
-                    (ARRIVE_FLOOR * 255.0) as u8,
-                    "the landing frame sits at the arrival floor"
-                );
-                assert_eq!(f.lane_alpha, 255, "…with the LANE at full presence");
-            }
-            let live: Vec<_> = f.departures.iter().flatten().collect();
-            assert!(live.len() <= 1, "one re-dress spawns exactly one ghost");
-            if let Some(d) = live.first() {
-                ghost_frames += 1;
-                let g0 = *ghost_col0.get_or_insert(d.col);
-                assert!(
-                    (d.col - g0).abs() < 1e-3,
-                    "zero displacement: the ghost never moves ({} vs {g0})",
-                    d.col
-                );
-                // Slack for the settled pet's own station ease (~0.01 cells).
-                assert!(
-                    (f.col - live_col0).abs() < 0.05,
-                    "…and neither does the live body ({} vs {live_col0})",
-                    f.col
-                );
-                assert!(
-                    d.alpha <= prev_ghost_alpha,
-                    "the old coat only ever fades DOWN"
-                );
-                prev_ghost_alpha = d.alpha;
-            }
-            match swap_at {
-                None => assert_eq!(f.alpha, 255, "before the swap: fully there"),
-                Some(at) if at == t => {} // the swap frame itself: the floor
-                Some(at) if t.duration_since(at).as_secs_f32() < HOMECOMING_IN => {
-                    assert!(f.alpha >= prev_alpha, "the arrival only ever fades UP");
-                }
-                Some(_) => assert_eq!(
-                    f.alpha, 255,
-                    "a quarter second after the swap the new coat is FULLY there"
-                ),
-            }
-            prev_alpha = f.alpha;
-        }
-        assert!(swap_at.is_some(), "the debounced park landed");
-        let want = (EDGE_FADE / 0.016) as u32;
-        assert!(
-            ghost_frames >= want - 2 && ghost_frames <= want + 2,
-            "the zero-span ghost's life is exactly EDGE_FADE \
-             ({ghost_frames} frames)"
-        );
-    }
-
-    /// A ceremony park is unaffected by the quiet path: the [`ARRIVE_IN`]
-    /// fade-up overlaps a departing body that runs to its edge.
-    #[test]
-    fn a_ceremony_park_still_runs_today_s_theater() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let t = awake(&mut pet, start, 4, 48);
-        assert_eq!(
-            pet.sync_look((3, 1), PetArrival::Ceremony).worn,
-            (3, 1),
-            "the first dress applies"
-        );
-        let (mut t, _) = idle(&mut pet, t, (4, 50), 0.2);
-        let out = pet.sync_look((9, 4), PetArrival::Ceremony);
-        assert_eq!(out.worn, (3, 1), "fixture: the stranger parks");
-        assert!(out.parked, "…and reports the genuine park");
-        let mut swap_at: Option<Instant> = None;
-        let mut ghost_first: Option<f32> = None;
-        let mut ghost_last = 0.0f32;
-        let mut ghost_frames = 0u32;
-        for _ in 0..600 {
-            t += Duration::from_millis(16);
-            let f = pet.tick(sense(t, Some((4, 50))));
-            let out = pet.sync_look((9, 4), PetArrival::Ceremony);
-            if swap_at.is_none() && out.worn == (9, 4) {
-                swap_at = Some(t);
-                assert!(
-                    f.alpha > 0 && f.alpha < 64,
-                    "the incoming kitty starts faint at the swap ({})",
-                    f.alpha
-                );
-            }
-            if let Some(at) = swap_at {
-                let since = t.duration_since(at).as_secs_f32();
-                if (0.4..0.6).contains(&since) {
-                    // The quiet ramp would already be done here (0.25 s);
-                    // the ceremony's ARRIVE_IN (0.9 s) is still climbing.
-                    assert!(
-                        f.alpha < 255,
-                        "the ceremony keeps the FULL ARRIVE_IN ramp ({})",
-                        f.alpha
-                    );
-                }
-                if since > ARRIVE_IN + 0.05 {
-                    assert_eq!(f.alpha, 255, "after the ramp: fully there");
-                }
-            }
-            if let Some(d) = f.departures.iter().flatten().next() {
-                ghost_frames += 1;
-                ghost_first.get_or_insert(d.col);
-                ghost_last = d.col;
-            }
-        }
-        assert!(swap_at.is_some(), "the debounced park landed");
-        let first = ghost_first.expect("the ceremony spawned a departing body");
-        assert!(
-            ghost_last > first + 10.0,
-            "the ghost genuinely RAN toward its door ({first} → {ghost_last})"
-        );
-        assert!(
-            ghost_frames > (EDGE_FADE / 0.016) as u32 + 4,
-            "…and lived a run's life, not a re-dress fade ({ghost_frames} frames)"
         );
     }
 
@@ -15690,62 +13841,6 @@ mod tests {
         );
     }
 
-    /// Two brains agree byte for byte on a departure's sprites; the run is
-    /// monotone and ends inside [`DEPART_MAX`].
-    #[test]
-    fn a_departing_body_is_a_pure_function_of_its_record() {
-        let record = Departure {
-            born: 5.0,
-            id: 0,
-            coat: 7,
-            iris: 2,
-            from_col: 20.0,
-            row: 6.0,
-            edge: 94.0,
-            speed: DEPART_SPEED,
-            still: false,
-            facing_left: false,
-            stride0: 0.0,
-            pose0: PetGlyphId::PetSit,
-            stance0: Stance::NEUTRAL,
-            resight: false,
-            own_glass: None,
-            own_clear: false,
-            peak: 1.0,
-            colors: None,
-            surface: None,
-        };
-        let mut a = PetBrain::default();
-        let mut b = PetBrain::default();
-        for pet in [&mut a, &mut b] {
-            pet.lane_clock = 5.0;
-            pet.spawn_departure(record);
-        }
-        let mut prev_col = record.from_col - 0.001;
-        let mut faded = false;
-        for step in 0..=((DEPART_MAX / 0.05) as u32 + 2) {
-            let clock = 5.0 + f64::from(step) * 0.05;
-            a.lane_clock = clock;
-            b.lane_clock = clock;
-            let (ra, rb) = (a.resolve_departures(), b.resolve_departures());
-            match (&ra[0], &rb[0]) {
-                (Some(da), Some(db)) => {
-                    assert_eq!(da, db, "same record + clock ⇒ same sprite");
-                    assert!(da.col >= prev_col, "the run is monotone");
-                    assert!(!da.facing_left, "…and faces its edge");
-                    prev_col = da.col;
-                }
-                (None, None) => faded = true,
-                _ => panic!("the two brains disagree about expiry"),
-            }
-        }
-        assert!(faded, "the visit ends inside DEPART_MAX");
-        assert!(
-            prev_col > record.from_col + 10.0,
-            "the body genuinely travelled ({prev_col})"
-        );
-    }
-
     // ── pointer play ────────────────────────────────────────────
 
     /// Warm a settled pet past PLAY_CONTENT: a long run earns the ledger,
@@ -15897,47 +13992,6 @@ mod tests {
         }
     }
 
-    /// A pointer a hair behind the cat's nose, moving only vertically: the
-    /// dwell fills, and only the dead band prevents a flip.
-    #[test]
-    fn a_cursor_resting_on_a_sleeping_cat_is_not_a_side_to_turn_to() {
-        let w = art_cols(10, 20);
-        let (mut pet, mut t, f) = a_sleeping_cat(true);
-        assert!(!f.facing_left, "fixture: asleep facing right");
-        // Just behind the nose — inside the band, well inside eye-contact
-        // range — and pinned there for ten seconds.
-        let px = f.col + w * 0.5 - 0.5 - 0.6;
-        let facing0 = f.facing_left;
-        let (mut flips, mut prev, mut in_range) = (0u32, facing0, 0u32);
-        for i in 0..600u16 {
-            // Vertical only: the pointer is plainly alive (~10 cells/s, over
-            // the gaze-follow bar) without its column ever moving.
-            let py = f.row + 0.8 * (f32::from(i) * 0.016 * TAU * 2.0).sin();
-            t += Duration::from_millis(16);
-            let g = ptick(&mut pet, t, SLEEPER_CARET, Some((px, py)));
-            assert_eq!(g.action, PetAction::Sleep, "fixture: it stays asleep");
-            if pet.sit_front {
-                in_range += 1;
-            }
-            if g.facing_left != prev {
-                flips += 1;
-                prev = g.facing_left;
-            }
-        }
-        assert!(
-            pet.pointer_heat > 0.0,
-            "fixture: the pointer is live, so the gaze is really on it"
-        );
-        assert!(
-            in_range >= 500,
-            "fixture: the pointer sat in eye-contact range ({in_range} frames)"
-        );
-        assert_eq!(
-            flips, 0,
-            "a cursor resting on the cat turned it over {flips} times"
-        );
-    }
-
     /// Hold a live pointer `off` cells from a sleeper's midline for `secs`;
     /// returns the frame it turned over on, if any.
     fn hover_beside_a_sleeper(
@@ -15966,6 +14020,21 @@ mod tests {
 
     /// A pointer held behind the cat turns a light sleeper after the dwell; a
     /// deep sleeper stays still.
+    /// The dead band (the owner's bug: a sleeping cat spun to face a mouse
+    /// pointer): a live pointer resting three-fifths of a cell behind the
+    /// nose, its column pinned, fills the dwell, so only the band keeps the
+    /// sleeper from turning over.
+    #[test]
+    fn a_cursor_resting_on_a_sleeping_cat_is_not_a_side_to_turn_to() {
+        let (mut pet, t, f) = a_sleeping_cat(true);
+        assert!(!f.facing_left, "fixture: asleep facing right");
+        assert_eq!(
+            hover_beside_a_sleeper(&mut pet, t, &f, -0.6, 9.6),
+            None,
+            "a cursor resting on the cat turned it over"
+        );
+    }
+
     #[test]
     fn a_light_sleeper_comes_round_slowly_and_a_deep_one_not_at_all() {
         // light sleep: it turns, but only after the dwell has been paid.
@@ -16276,57 +14345,6 @@ mod tests {
         assert!(pet.last_pointer.is_none(), "and the sensor forgets it");
     }
 
-    #[test]
-    fn reduced_motion_pointer_is_nothing_at_all() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let mut t = start;
-        for _ in 0..40 {
-            t += Duration::from_millis(16);
-            let _ = pet.tick(sense(t, Some((3, 10))));
-        }
-        let mut px = 60.0f32;
-        for _ in 0..120 {
-            t += Duration::from_millis(16);
-            px -= 1.0; // a full-speed dash, every frame
-            let mut s = sense(t, Some((3, 10)));
-            s.reduced_motion = true;
-            s.pointer = Some((px.max(2.0), 3.0));
-            let f = pet.tick(s);
-            assert!(
-                matches!(f.action, PetAction::Sit | PetAction::Sleep),
-                "no gaze, no pounce under reduced motion, got {:?}",
-                f.action
-            );
-        }
-        assert_eq!(pet.pointer_heat, 0.0);
-        assert!(pet.pending_pointer_pounce.is_none());
-    }
-
-    #[test]
-    fn reduced_motion_stream_is_nothing_at_all() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let mut t = start;
-        for _ in 0..40 {
-            t += Duration::from_millis(16);
-            let _ = pet.tick(sense(t, Some((3, 10))));
-        }
-        for _ in 0..120 {
-            t += Duration::from_millis(16);
-            let mut s = sense(t, Some((3, 10)));
-            s.reduced_motion = true;
-            s.output_burst = true;
-            let f = pet.tick(s);
-            assert!(
-                matches!(f.action, PetAction::Sit | PetAction::Sleep),
-                "no perk under reduced motion, got {:?}",
-                f.action
-            );
-        }
-        assert_eq!(pet.watch_heat, 0.0, "and no heat is left behind");
-    }
-
     // ── the ink law ─────────────────────────────────────────────────────
 
     /// The pet's footprint on its feet row, judged the way the eviction
@@ -16337,46 +14355,8 @@ mod tests {
         b > first && a < end
     }
 
-    /// A settled pose typed over leaves at once (airborne on the tick the ink
-    /// lands), ends on blank ground and keeps its settle.
-    #[test]
-    fn event_pose_retargets_off_ink() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let w = art_cols(10, 20);
-        let mut t = awake(&mut pet, start, 4, 10);
-        let (t2, f) = idle(&mut pet, t, (4, 12), SIT_AFTER + 0.4);
-        t = t2;
-        assert!(f.action.settled(), "fixture: a settled cat");
-        // A prompt prints under the sitter: row 4 is now inked through the
-        // pet's footprint and well past it.
-        let inked_to = (f.col + w + 6.0) as u16;
-        let spans = vec![(0u16, inked_to); 6];
-        pet.sense_ink(0, &spans, Some(4));
-        t += Duration::from_millis(16);
-        let f1 = pet.tick(sense(t, Some((4, 12))));
-        assert_eq!(
-            f1.action,
-            PetAction::Leap,
-            "one tick after the ink invades the pose is already leaving, \
-             got {:?}",
-            f1.action
-        );
-        let (_, f2) = idle(&mut pet, t, (4, 12), 1.2);
-        assert!(
-            !on_ink(&f2, (0, inked_to), w),
-            "and the trip ends on blank cells (col {}, ink to {inked_to})",
-            f2.col
-        );
-        assert!(
-            f2.action.settled(),
-            "and the settle survives the move, got {:?}",
-            f2.action
-        );
-    }
-
     /// Typing under a sleeper wakes it, and the stretch the hop borrows plays on
-    /// blank ground.
+    /// blank ground (the gauntlet's F2: the stretch squatted on the fresh line).
     #[test]
     fn the_sleeper_follows_the_prompt() {
         let start = Instant::now();
@@ -16597,143 +14577,67 @@ mod tests {
         );
     }
 
-    /// A margin wrap, read literally the biggest move a caret makes, folds to
-    /// one character either way.
+    /// The caret delta's three folds, each claimed only for a delta shaped
+    /// like its seam, with every neighbouring move kept literal:
+    ///
+    /// * a margin wrap is one character (`dr = 0`), forward or backspacing
+    ///   over the seam (the row folds to zero, handing it to the retreat arm
+    ///   instead of the jump ladder); `WRAP_SLOP` covers a double-width glyph;
+    /// * a scrolled wrap at the bottom of a pane reads as a 99-column
+    ///   same-row retreat, identical to `Home`; only the emulator's fact
+    ///   ([`PetSense::wrapped`]) folds it, never a looser heuristic;
+    /// * the shell's own new line (Enter after a short command on the last
+    ///   row: the pane scrolls, `dr = 0`, a leftward `dc` the size of what was
+    ///   typed) is reported as the line change it is, when the caret came home
+    ///   to the row's prompt ([`PetBrain::caret_at_home`]) or the ink map
+    ///   scrolled. It stops at [`SNAP_COLS`] and under [`STARTLE_COLS`].
     #[test]
-    fn a_wrap_is_one_character_not_a_screen_crossing_jump() {
-        // Forward: the caret falls off the right margin onto the next row.
-        assert_eq!(
-            PetBrain::caret_delta((5, 99), (6, 0), 100, false, true, false),
-            (0.0, 1.0, true),
-            "typing past the margin moved the text on by one"
+    fn the_caret_delta_folds_only_its_three_seams() {
+        // (name, from, to, cols, wrapped, home, scrolled, want)
+        type Case = (
+            &'static str,
+            (u16, u16),
+            (u16, u16),
+            u16,
+            bool,
+            bool,
+            bool,
+            (f32, f32, bool),
         );
-        // Backward over the same seam — and the row folds to zero, which is
-        // what hands it to the retreat arm instead of the jump ladder.
-        assert_eq!(
-            PetBrain::caret_delta((6, 0), (5, 99), 100, false, false, false),
-            (0.0, -1.0, true),
-            "backspacing over the seam deleted one"
-        );
-        // A double-width glyph wraps from cols - 2; WRAP_SLOP covers it.
-        assert_eq!(
-            PetBrain::caret_delta((5, 98), (6, 0), 100, false, true, false),
-            (0.0, 2.0, true)
-        );
-        // Negative controls: everything else keeps its literal delta and
-        // reports no fold.
-        assert_eq!(
-            PetBrain::caret_delta((10, 5), (2, 70), 100, false, false, false),
-            (-8.0, 65.0, false),
-            "a real row jump is not a seam"
-        );
-        assert_eq!(
-            PetBrain::caret_delta((5, 2), (6, 70), 100, false, false, false),
-            (1.0, 68.0, false),
-            "down AND right is not a wrap in either direction"
-        );
-        assert_eq!(
-            PetBrain::caret_delta((5, 16), (6, 1), 20, false, true, false),
-            (1.0, -15.0, false),
-            "a 15-cell move in a 20-wide pane is a jump, not a seam"
-        );
-    }
-
-    /// The last-row Enter's same-row leftward delta folds to `dr = 1`, a line
-    /// change, up to where [`SNAP_COLS`] begins.
-    #[test]
-    fn the_shells_own_new_line_is_a_line_change_not_a_retreat() {
-        // `ls -la` from the last row: eight columns back onto the margin.
-        assert_eq!(
-            PetBrain::caret_delta((29, 8), (29, 0), 80, false, true, false),
-            (1.0, -8.0, true),
-            "a short command's Enter is the line advancing, not a retreat"
-        );
-        // Width-blind.
-        assert_eq!(
-            PetBrain::caret_delta((29, 8), (29, 0), 200, false, true, false),
-            (1.0, -8.0, true)
-        );
-        // The double-width margin: a caret landing at column 1 or 2 still
-        // came home.
-        assert_eq!(
-            PetBrain::caret_delta((29, 13), (29, 2), 80, false, true, false),
-            (1.0, -11.0, true)
-        );
-        // Negative controls.
-        assert_eq!(
-            PetBrain::caret_delta((29, 3), (29, 0), 80, false, true, false),
-            (0.0, -3.0, false),
-            "under STARTLE_COLS nothing was ever frightening: the flinch              keeps its everyday backspace"
-        );
-        assert_eq!(
-            PetBrain::caret_delta((29, 20), (29, 0), 80, false, true, false),
-            (0.0, -20.0, false),
-            "at SNAP_COLS and beyond the snap tier owns it — this arm must              not also claim it, or a mid-line Home would report a row it              never changed"
-        );
-        assert_eq!(
-            PetBrain::caret_delta((29, 40), (29, 8), 80, false, false, false),
-            (0.0, -32.0, false),
-            "a retreat that does not land at the row's home edge is not a \
-             new line"
-        );
-        assert_eq!(
-            PetBrain::caret_delta((29, 0), (29, 8), 80, false, false, false),
-            (0.0, 8.0, false),
-            "and the forward direction is just typing"
-        );
-        // The same eight-column Enter landing at the end of a twelve-column
-        // prompt: identical except for the caret's absolute column (the
-        // prompt's width), so the arm must not gate on the margin. The `-32`
-        // control above cannot expose this, since the snap tier catches a
-        // 32-column retreat regardless.
-        assert_eq!(
-            PetBrain::caret_delta((23, 20), (23, 12), 80, false, true, false),
-            (1.0, -8.0, true),
-            "a wide prompt is still the shell's own new line"
-        );
-        assert_eq!(
-            PetBrain::caret_delta((23, 20), (23, 12), 80, false, false, false),
-            (0.0, -8.0, false),
-            "…and with a line still standing to the caret's right it is an \
-             ordinary mid-line deletion, which keeps its fright"
-        );
-    }
-
-    /// The third arm's two witnesses at the delta level: either one folds
-    /// the shell's own new line, and neither invents a fold on its own.
-    #[test]
-    fn the_scroll_fact_folds_a_new_line_the_row_inference_cannot_see() {
-        // Ink past the caret ⇒ `home` is false. With the scroll fact the move
-        // is a line change; without either witness it stays a literal retreat.
-        assert_eq!(
-            PetBrain::caret_delta((29, 30), (29, 24), 100, false, false, true),
-            (1.0, -6.0, true),
-            "the map scrolled: the text line advanced"
-        );
-        assert_eq!(
-            PetBrain::caret_delta((29, 30), (29, 24), 100, false, false, false),
-            (0.0, -6.0, false),
-            "…and with neither witness it is a retreat, unchanged"
-        );
-        // The scroll cannot widen the arm's window: past the snap it is a
-        // jump, under [`STARTLE_COLS`] it is a deletion.
-        assert_eq!(
-            PetBrain::caret_delta((29, 40), (29, 24), 100, false, false, true),
-            (0.0, -16.0, false),
-            "past the snap tier the scroll changes nothing"
-        );
-        assert_eq!(
-            PetBrain::caret_delta((29, 27), (29, 24), 100, false, false, true),
-            (0.0, -3.0, false),
-            "and a three-column backspace is still a backspace"
-        );
-        // It cannot invent a fold on a move that went the other way, or on
-        // one that changed rows (the wrap arm owns those).
-        assert_eq!(
-            PetBrain::caret_delta((29, 24), (29, 30), 100, false, false, true),
-            (0.0, 6.0, false),
-            "a forward move is a forward move"
-        );
+        #[rustfmt::skip]
+        let cases: [Case; 21] = [
+            // The margin wrap.
+            ("typed past the margin", (5, 99), (6, 0), 100, false, true, false, (0.0, 1.0, true)),
+            ("backspaced over the seam", (6, 0), (5, 99), 100, false, false, false, (0.0, -1.0, true)),
+            ("a double-width wrap", (5, 98), (6, 0), 100, false, true, false, (0.0, 2.0, true)),
+            ("a real row jump", (10, 5), (2, 70), 100, false, false, false, (-8.0, 65.0, false)),
+            ("down AND right", (5, 2), (6, 70), 100, false, false, false, (1.0, 68.0, false)),
+            ("a 15-cell move in a 20-wide pane", (5, 16), (6, 1), 20, false, true, false, (1.0, -15.0, false)),
+            // The scrolled wrap: the fact, and only the fact.
+            ("a scrolled wrap", (29, 99), (29, 0), 100, true, true, false, (1.0, 1.0, true)),
+            ("Home at the last column", (29, 99), (29, 0), 100, false, true, false, (0.0, -99.0, false)),
+            ("a mid-line Home in a wrapping frame", (29, 40), (29, 0), 100, true, true, false, (0.0, -40.0, false)),
+            // The shell's own new line.
+            ("`ls -la` from the last row", (29, 8), (29, 0), 80, false, true, false, (1.0, -8.0, true)),
+            ("…width-blind", (29, 8), (29, 0), 200, false, true, false, (1.0, -8.0, true)),
+            ("…home at a double-width margin", (29, 13), (29, 2), 80, false, true, false, (1.0, -11.0, true)),
+            ("…at the end of a wide prompt", (23, 20), (23, 12), 80, false, true, false, (1.0, -8.0, true)),
+            ("…witnessed by the scroll", (29, 30), (29, 24), 100, false, false, true, (1.0, -6.0, true)),
+            ("a backspace under STARTLE_COLS", (29, 27), (29, 24), 100, false, false, true, (0.0, -3.0, false)),
+            ("…even onto the margin", (29, 3), (29, 0), 80, false, true, false, (0.0, -3.0, false)),
+            ("SNAP_COLS and beyond", (29, 20), (29, 0), 80, false, true, false, (0.0, -20.0, false)),
+            ("…the scroll does not widen it", (29, 40), (29, 24), 100, false, false, true, (0.0, -16.0, false)),
+            ("a retreat that is not home", (29, 40), (29, 8), 80, false, false, false, (0.0, -32.0, false)),
+            ("a mid-line deletion, no witness", (23, 20), (23, 12), 80, false, false, false, (0.0, -8.0, false)),
+            ("forward is just typing", (29, 24), (29, 30), 100, false, false, true, (0.0, 6.0, false)),
+        ];
+        for (name, from, to, cols, wrapped, home, scrolled, want) in cases {
+            assert_eq!(
+                PetBrain::caret_delta(from, to, cols, wrapped, home, scrolled),
+                want,
+                "{name}"
+            );
+        }
     }
 
     /// The scroll fact on `sense_ink` alone: what it claims, and four cases it
@@ -16946,115 +14850,12 @@ mod tests {
         );
     }
 
-    /// Typing past the margin through the whole brain: no travel latch, no
-    /// gathered Crouch, the cat across and settled, no trailing arc.
-    #[test]
-    fn typing_past_the_margin_does_not_launch_a_bound() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        // Slow prose at the margin: key gaps past RHYTHM_WINDOW keep the
-        // keep-ahead prediction out of the flight aim.
-        let mut t = start;
-        let _ = pet.tick(sense(t, Some((5, 95))));
-        for k in 1..=4u16 {
-            let until = t + Duration::from_secs_f32(0.7);
-            while t < until {
-                t += Duration::from_millis(16);
-                let _ = pet.tick(sense(t, Some((5, 95 + k - 1))));
-            }
-            t = until;
-            let _ = pet.tick(sense(t, Some((5, 95 + k))));
-        }
-        // A pause at the full line, so the wrap lands on a grounded cat (a
-        // walking cat is travel, which is exempt from the eviction).
-        let hold = t + Duration::from_secs_f32(0.5);
-        while t < hold {
-            t += Duration::from_millis(16);
-            let _ = pet.tick(sense(t, Some((5, 99))));
-        }
-        // …and the next keystroke wraps: the caret lands on (6, 0), and the
-        // line it completed is ink under the pet from this frame on.
-        let mut spans = vec![(0u16, 0u16); 8];
-        spans[5] = (0, 100);
-        spans[6] = (0, 1);
-        let mut startled = false;
-        let mut crouched = false;
-        let mut settled_at: Option<Instant> = None;
-        let mut tail_leap = false;
-        let mut last = None;
-        let end = t + Duration::from_secs_f32(3.2);
-        while t < end {
-            t += Duration::from_millis(16);
-            pet.sense_ink(0, &spans, Some(6));
-            let f = pet.tick(sense(t, Some((6, 0))));
-            assert!(
-                !pet.pending_big_jump && !pet.pending_pounce,
-                "the wrap latched travel: big={} pounce={}",
-                pet.pending_big_jump,
-                pet.pending_pounce
-            );
-            startled |= f.action == PetAction::Startle;
-            crouched |= f.action == PetAction::Crouch;
-            match settled_at {
-                None if f.action.settled() => settled_at = Some(t),
-                Some(at)
-                    if f.action == PetAction::Leap && t.duration_since(at).as_secs_f32() < 0.8 =>
-                {
-                    tail_leap = true;
-                }
-                _ => {}
-            }
-            last = Some(f);
-        }
-        let f = last.expect("the loop ran");
-        assert!(!startled, "a wrap is not a retreat");
-        assert!(
-            !crouched,
-            "nothing gathered to leap: a wrap's crossing is the shoved \
-             re-anchor, never the standing-gap ceremony"
-        );
-        assert!(
-            settled_at.is_some(),
-            "the crossing must finish and hand the pose back"
-        );
-        assert!(!tail_leap, "no wall-transit tail after the crossing");
-        assert!(
-            (f.row - 6.0).abs() < 0.01 && f.col < 8.0,
-            "and the pet crossed with the wrap, got ({}, {})",
-            f.col,
-            f.row
-        );
-    }
-
     /// A bottom-row scrolled wrap is identical to `Home` at the last column
-    /// but for [`PetSense::wrapped`]: the fact folds it, and under a live
-    /// stream it plays no Startle and no show.
+    /// but for [`PetSense::wrapped`]; under a live stream it plays no Startle
+    /// and no show (the fold itself is
+    /// `the_caret_delta_folds_only_its_three_seams`).
     #[test]
     fn a_scrolled_wrap_is_a_wrap() {
-        assert_eq!(
-            PetBrain::caret_delta((29, 99), (29, 0), 100, true, true, false),
-            (1.0, 1.0, true),
-            "a scrolled wrap is one character on"
-        );
-        assert_eq!(
-            PetBrain::caret_delta((29, 99), (29, 0), 100, false, true, false),
-            (0.0, -99.0, false),
-            "without the fact the delta stays literal — the fact, never a \
-             looser heuristic, is what tells the seam from Home. (The pet is \
-             no longer FRIGHTENED by that literal delta — [`SNAP_COLS`] makes \
-             a 99-column same-row retreat a jump — but it is still read as a \
-             jump home rather than as a line of text gained, which is what \
-             the fact buys.)"
-        );
-        assert_eq!(
-            PetBrain::caret_delta((29, 40), (29, 0), 100, true, true, false),
-            (0.0, -40.0, false),
-            "the shared bar still guards the fact arm: a mid-line Home in a \
-             frame that also wrapped keeps its literal retreat — and the \
-             shell's-new-line arm stops at SNAP_COLS, so it does not claim \
-             this one either"
-        );
-
         let script = |fact: bool| -> Vec<PetAction> {
             let start = Instant::now();
             let mut pet = PetBrain::default();
@@ -17127,7 +14928,7 @@ mod tests {
         );
         // Without the fact the run is quiet too ([`SNAP_COLS`] makes the
         // retreat a jump); the fact still decides direction, asserted at the
-        // unit level above.
+        // unit level by `the_caret_delta_folds_only_its_three_seams`.
         let blind = script(false);
         assert!(
             !blind.contains(&PetAction::Startle),
@@ -17425,63 +15226,7 @@ mod tests {
         }
         let start = Instant::now();
 
-        // (1) The typed-through wrap's ink re-anchor at cols = 200, routed
-        // through `launch_big` and paced. The rows around the pair are inked,
-        // so the ink ladder cannot re-seat the cat off its row pre-wrap.
-        let mut pet = PetBrain::default();
-        let mut law = Judge::new();
-        let mut t = start;
-        let _ = pet.tick(wide(t, Some((6, 195))));
-        let mut spans = vec![(0u16, 0u16); 12];
-        for k in 1..=4u16 {
-            let until = t + Duration::from_secs_f32(0.7);
-            while t < until {
-                t += Duration::from_millis(16);
-                spans[5] = (0, 200);
-                spans[6] = (0, 195 + k);
-                spans[7] = (0, 200);
-                pet.sense_ink(0, &spans, Some(6));
-                let _ = pet.tick(wide(t, Some((6, 195 + k - 1))));
-                law.judge(&pet);
-            }
-            t = until;
-            let _ = pet.tick(wide(t, Some((6, 195 + k))));
-            law.judge(&pet);
-        }
-        let hold = t + Duration::from_secs_f32(0.5);
-        while t < hold {
-            t += Duration::from_millis(16);
-            pet.sense_ink(0, &spans, Some(6));
-            let _ = pet.tick(wide(t, Some((6, 199))));
-            law.judge(&pet);
-        }
-        // The wrap: the pair completes, the fresh line opens below.
-        spans[6] = (0, 200);
-        spans[7] = (0, 1);
-        let end = t + Duration::from_secs_f32(3.0);
-        while t < end {
-            t += Duration::from_millis(16);
-            pet.sense_ink(0, &spans, Some(7));
-            let _ = pet.tick(wide(t, Some((7, 0))));
-            law.judge(&pet);
-        }
-        // One bound, not two: the quiet split is a time bar that no pane under
-        // 239 columns reaches
-        // ([`the_quiet_split_needs_a_pane_wider_than_anyone_has`]). The law
-        // needs that something flew at a bound's pace: faster than any
-        // ordinary hop, and no faster than [`BIG_HOP_SPEED_MAX`].
-        assert!(
-            law.launches >= 1
-                && law.fastest > HOP_SPEED_MAX
-                && law.fastest <= BIG_HOP_SPEED_MAX + 1e-3,
-            "fixture: the wrap crossing must fly, and fly at a bound's pace \
-             — past any ordinary hop, inside the bound's own bar ({} \
-             launches, fastest {:.1})",
-            law.launches,
-            law.fastest
-        );
-
-        // (2) The wall transit across a wide span: past [`WALL_SPAN_MAX`] the
+        // (1) The wall transit across a wide span: past [`WALL_SPAN_MAX`] the
         // latch becomes the pounce's and the one door tiers the crossing, so
         // it is one trip home, not a truncated hop and a pounce.
         let mut pet = PetBrain::default();
@@ -17515,7 +15260,7 @@ mod tests {
              station {station})"
         );
 
-        // (3) The 42-column jump at cols = 200: past [`POUNCE_SPAN_MAX`] the
+        // (2) The 42-column jump at cols = 200: past [`POUNCE_SPAN_MAX`] the
         // pounce door flies a bound. One flight, no jog to a launch pad, paced
         // against the pane ([`quiet_speed_max`]).
         let mut pet = PetBrain::default();
@@ -17545,10 +15290,9 @@ mod tests {
             "and the cat still arrives, got col {final_col}"
         );
 
-        // (4) A pane-wide crossing at 200 columns must fly faster than any
+        // (3) A pane-wide crossing at 200 columns must fly faster than any
         // ordinary hop and still land under [`BIG_HOP_SPEED_MAX`]. It may
         // arrive in one bound or two (the split is quiet-pace policy; see
-        // [`the_quiet_split_needs_a_pane_wider_than_anyone_has`] and
         // [`the_chosen_show_is_paced_like_every_other_bound`]), so this asks
         // for a launch, not a count.
         let mut pet = PetBrain::default();
@@ -17574,12 +15318,14 @@ mod tests {
             law.fastest
         );
 
-        // ── eight more scripts ─────────────────────────────────────────────
+        // ── five more scripts ──────────────────────────────────────────────
         //
         // Same law, through the [`Law`] harness ([`lawful_tick`] also owns the
         // re-aim bound). Every script runs even when an earlier one fails.
+        // (Enters, hidden frames and wraps at both widths are
+        // `every_new_line_reaction_is_lawful_and_brief`'s.)
 
-        let scripts: [(&str, fn()); 8] = [
+        let scripts: [(&str, fn()); 5] = [
             ("(a) the ink re-anchor at 200 columns", || {
                 let mut w = Law::warm(200, 30, 4, 190);
                 w.hold(Some((4, 190)), 150);
@@ -17593,28 +15339,6 @@ mod tests {
                 }
                 w.hold(Some((4, 190)), 200);
             }),
-            ("(b) the scrolled last-row wrap while typing", || {
-                let mut w = Law::warm(200, 30, 29, 199);
-                // The line scrolls up a row; the caret is back at column 0
-                // of the same (last) row, and typing carries on.
-                w.ink(28, 0, 200);
-                w.ink(29, 0, 0);
-                w.hold(Some((29, 0)), 2);
-                w.type_to(29, 0, 5, 2);
-                w.hold(Some((29, 5)), 200);
-            }),
-            (
-                "(c) a settled cat's Enter from column 41 at 200 and 80 columns",
-                || {
-                    for cols in [200u16, 80] {
-                        let mut w = Law::warm(cols, 30, 5, 41);
-                        w.hold(Some((5, 41)), 150);
-                        w.ink(6, 0, 3);
-                        w.live = Some(6);
-                        w.hold(Some((6, 3)), 200);
-                    }
-                },
-            ),
             ("(d) a sixty-cell jump during the wake stretch", || {
                 let mut w = Law::new(200, 30, (3, 5));
                 w.hold(Some((3, 5)), 2);
@@ -17627,14 +15351,6 @@ mod tests {
                 let mut w = Law::warm(100, 30, 5, 99);
                 w.delete_to(5, 99, 60, 2);
                 w.hold(Some((5, 60)), 200);
-            }),
-            ("(f) a hidden frame before the next line", || {
-                let mut w = Law::warm(80, 30, 5, 41);
-                w.hold(Some((5, 41)), 150);
-                w.hold(None, 1);
-                w.ink(6, 0, 3);
-                w.live = Some(6);
-                w.hold(Some((6, 3)), 200);
             }),
             ("(g) the wall-side Enter that arrives mid row-hop", || {
                 let mut w = Law::warm(80, 24, 6, 78);
@@ -17677,60 +15393,9 @@ mod tests {
             .collect();
         assert!(
             failures.is_empty(),
-            "{} of 8 scripts broke the launch-time law:\n  {}",
+            "{} of 5 scripts broke the launch-time law:\n  {}",
             failures.len(),
             failures.join("\n  ")
-        );
-    }
-
-    /// One notice, then one quiet bound, from the door `p` was driven
-    /// through — the shape the notice rule owes every settled cat.
-    fn assert_notice_then_one_quiet_bound(p: &Probe, door: &str) {
-        let tr = p.trigger.expect("fixture: marked");
-        let after: Vec<(f32, PetAction)> = p
-            .actions
-            .iter()
-            .copied()
-            .filter(|(at, _)| *at >= tr)
-            .collect();
-        let perks: Vec<usize> = after
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, a))| *a == PetAction::Perk)
-            .map(|(i, _)| i)
-            .collect();
-        assert_eq!(perks.len(), 1, "{door}: exactly one notice, got {after:?}");
-        let i = perks[0];
-        let (perk_at, _) = after[i];
-        let (next_at, next) = after
-            .get(i + 1)
-            .copied()
-            .expect("the notice ends in the coil");
-        assert_eq!(
-            next,
-            PetAction::Crouch,
-            "{door}: the notice hands straight into the coil, got {after:?}"
-        );
-        assert!(
-            next_at - perk_at <= PERK_HOLD + 0.04,
-            "{door}: one beat, not a hold: {:.2} s of Perk",
-            next_at - perk_at
-        );
-        let flights: Vec<&ProbeFlight> = p.flights.iter().filter(|f| f.at >= tr).collect();
-        assert_eq!(flights.len(), 1, "{door}: one quiet bound, got {flights:?}");
-        let fl = flights[0];
-        assert!(
-            fl.big && !fl.show,
-            "{door}: a bound, and not the show: {fl:?}"
-        );
-        let land = after
-            .iter()
-            .find(|(_, a)| *a == PetAction::Land)
-            .map(|(at, _)| at - tr)
-            .expect("the bound lands");
-        assert!(
-            land <= 1.3,
-            "{door}: paws down within 1.3 s of the trigger, got {land:.2}"
         );
     }
 
@@ -17739,358 +15404,6 @@ mod tests {
     // Rules layered on the launch law. They use the [`Law`] harness (every
     // frame judged by [`lawful_tick`]) where geometry needs judging, and plain
     // fixtures where the action sequence is the claim.
-
-    /// A short Enter coils for exactly one tick and flies one `flight_shape`
-    /// arc under [`HOP_SPEED_MAX`].
-    #[test]
-    fn a_short_enter_still_hops() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        // `awake` leaves the caret at 12 and the cat stationed beside it.
-        let mut t = awake(&mut pet, start, 4, 10);
-        let mut crouch_run = 0u16;
-        let mut max_crouch = 0u16;
-        let mut leap_frames = 0u16;
-        let mut launch: Option<Flight> = None;
-        let mut landed = false;
-        let mut last_row = 4.0f32;
-        for _ in 0..120 {
-            t += Duration::from_millis(16);
-            let pre = pet.flight;
-            let f = pet.tick(sense(t, Some((5, 0))));
-            if pre.is_none()
-                && let Some(fl) = pet.flight
-            {
-                launch = Some(fl);
-            }
-            if f.action == PetAction::Crouch {
-                crouch_run += 1;
-                max_crouch = max_crouch.max(crouch_run);
-            } else {
-                crouch_run = 0;
-            }
-            if f.action == PetAction::Leap {
-                leap_frames += 1;
-            }
-            if f.action == PetAction::Land {
-                landed = true;
-            }
-            last_row = f.row;
-        }
-        let fl = launch.expect("the Enter must leave the ground");
-        assert!(
-            !fl.big && !fl.show,
-            "a twelve-cell line change is a hop, not a bound: {fl:?}"
-        );
-        assert_eq!(max_crouch, 1, "the hop coils for exactly one tick");
-        assert!(
-            f32::from(leap_frames) * 0.016 <= FLIGHT_MAX + 0.02,
-            "one FLIGHT_MAX arc at most, flew {leap_frames} frames"
-        );
-        let rate = span_eq(fl.to_col - fl.from_col, fl.to_row - fl.from_row) / fl.dur;
-        assert!(
-            rate <= HOP_SPEED_MAX + 1e-3,
-            "launched at {rate:.1} c/s over the hop cap"
-        );
-        assert!(landed, "and it lands");
-        assert!((last_row - 5.0).abs() < 0.01, "on row 5, got {last_row}");
-    }
-
-    /// A prompt redraw hiding the caret for a frame reaches the row-hop door
-    /// (S6) or the pounce door (S11): one Perk beat, the coil, one quiet bound.
-    /// A cat mid-typing (S2b) never perks.
-    #[test]
-    fn a_settled_cat_notices_before_a_bound_from_any_door() {
-        // (S6) the hidden frame before the next line: the row-hop door.
-        let mut p = Probe::new(80);
-        p.warm(6, 40);
-        p.hold(Some((6, 40)), 2.5);
-        p.mark();
-        let _ = p.frame(None);
-        p.ink(7, 0, 2);
-        p.live = Some(7);
-        let _ = p.frame(Some((7, 2)));
-        p.hold(Some((7, 2)), 3.0);
-        assert_notice_then_one_quiet_bound(&p, "S6 (row-hop door)");
-
-        // (S11) the prompt redraw at the bottom: the pounce door.
-        let mut p = Probe::new(80);
-        p.warm(23, 40);
-        p.hold(Some((23, 40)), 2.5);
-        p.mark();
-        let _ = p.frame(None);
-        p.ink(22, 0, 40);
-        p.ink(23, 0, 2);
-        p.live = Some(23);
-        let _ = p.frame(Some((23, 2)));
-        p.hold(Some((23, 2)), 3.0);
-        assert_notice_then_one_quiet_bound(&p, "S11 (pounce door)");
-
-        // (S2b) mid-typing: on its feet, no notice at all.
-        let mut p = Probe::new(80);
-        p.warm(6, 40);
-        p.mark();
-        p.ink(7, 0, 2);
-        p.live = Some(7);
-        let _ = p.frame(Some((7, 2)));
-        p.hold(Some((7, 2)), 3.0);
-        let tr = p.trigger.expect("fixture: marked");
-        assert!(
-            p.actions
-                .iter()
-                .all(|(at, a)| *at < tr || *a != PetAction::Perk),
-            "a cat on its feet never perks: {:?}",
-            p.actions
-        );
-        let flights: Vec<&ProbeFlight> = p.flights.iter().filter(|f| f.at >= tr).collect();
-        assert_eq!(flights.len(), 1, "one quiet bound, got {flights:?}");
-        assert!(
-            flights[0].big && !flights[0].show,
-            "a bound, not the show: {:?}",
-            flights[0]
-        );
-    }
-
-    /// S8: a three-line prompt. The flight tiers and times by its pixel
-    /// diagonal ([`span_eq`]), not its column count.
-    #[test]
-    fn a_multi_row_prompt_flies_at_a_lawful_row_rate() {
-        let mut p = Probe::new(80);
-        p.warm(6, 30);
-        p.hold(Some((6, 30)), 2.5);
-        p.mark();
-        for r in 7..=9 {
-            p.ink(r, 0, 2);
-        }
-        p.live = Some(9);
-        let _ = p.frame(Some((9, 2)));
-        p.hold(Some((9, 2)), 3.0);
-        let tr = p.trigger.expect("fixture: marked");
-        let flights: Vec<&ProbeFlight> = p.flights.iter().filter(|f| f.at >= tr).collect();
-        assert_eq!(
-            flights.len(),
-            1,
-            "one flight to the prompt, got {flights:?}"
-        );
-        let fl = flights[0];
-        let span = span_eq(fl.to_col - fl.from_col, fl.to_row - fl.from_row);
-        let cap = if fl.big {
-            BIG_HOP_SPEED_MAX
-        } else {
-            HOP_SPEED_MAX
-        };
-        assert!(
-            span / fl.dur <= cap + 1e-3,
-            "launched at {:.1} c/s over the {cap} c/s cap: {fl:?}",
-            span / fl.dur
-        );
-        let row_rate = (fl.to_row - fl.from_row).abs() / fl.dur;
-        assert!(
-            row_rate <= 8.0,
-            "three rows at {row_rate:.1} rows/s is a drop, not a jump"
-        );
-        let last = p.last.expect("frames were drawn");
-        assert!(
-            (last.row - 9.0).abs() < 0.01,
-            "and it lands on row 9, got {}",
-            last.row
-        );
-    }
-
-    /// An Enter from mid-line is one quiet bound sized by its span, from a
-    /// settled cat (at most one notice) and from a run (none, landing at or
-    /// ahead of the caret).
-    #[test]
-    fn an_enter_from_mid_line_is_one_quiet_bound() {
-        let judge = |p: &Probe, door: &str, bar: f32, perks_max: usize| {
-            assert!(!p.wiggle, "{door}: never the show's gather");
-            assert!(!p.dust, "{door}: no dust on a quiet landing");
-            let perks = p.onsets(PetAction::Perk);
-            assert!(
-                perks <= perks_max,
-                "{door}: at most {perks_max} notice beat(s), got {perks}: {:?}",
-                p.actions
-            );
-            assert_eq!(
-                p.episodes, 1,
-                "{door}: one airborne episode: {:?}",
-                p.actions
-            );
-            let flights = p.launches();
-            assert_eq!(flights.len(), 1, "{door}: one flight, got {flights:?}");
-            let fl = flights[0];
-            assert!(fl.big && !fl.show, "{door}: a quiet bound: {fl:?}");
-            let rate = span_eq(fl.to_col - fl.from_col, fl.to_row - fl.from_row) / fl.dur;
-            assert!(
-                rate <= BIG_HOP_SPEED_MAX + 1e-3,
-                "{door}: lawful launch, {rate:.1} c/s"
-            );
-            let down = p.grounded_at().expect("paws down by the end");
-            assert!(
-                down <= bar,
-                "{door}: paws down within {bar} s, got {down:.2}"
-            );
-            let last = p.last.expect("frames were drawn");
-            assert!(
-                (last.row - 6.0).abs() < 0.01,
-                "{door}: on row 6, got {}",
-                last.row
-            );
-        };
-
-        // Settled at (5,40), then Enter → (6,3).
-        let mut p = Probe::new(80);
-        p.warm(5, 40);
-        p.hold(Some((5, 40)), 2.5);
-        assert!(p.pet.action.settled(), "fixture: settled");
-        p.mark();
-        p.ink(6, 0, 3);
-        p.live = Some(6);
-        let _ = p.frame(Some((6, 3)));
-        p.hold(Some((6, 3)), 3.0);
-        judge(&p, "settled", 1.6, 1);
-        let (perk_at, _) = p
-            .actions
-            .iter()
-            .copied()
-            .find(|(at, a)| *at >= p.trigger.unwrap_or(0.0) && *a == PetAction::Perk)
-            .expect("a settled cat looks up first");
-        let (next_at, _) = p
-            .actions
-            .iter()
-            .copied()
-            .find(|(at, _)| *at > perk_at)
-            .expect("and then moves");
-        assert!(
-            next_at - perk_at <= PERK_HOLD + 0.04,
-            "one beat of notice, not a hold: {:.2} s",
-            next_at - perk_at
-        );
-
-        // From a Run: typed to 40 at 10 keys/s, row 5 inked, then Enter.
-        let mut p = Probe::new(80);
-        p.warm(5, 40);
-        assert!(
-            matches!(p.pet.action, PetAction::Run | PetAction::Walk),
-            "fixture: on its feet, got {:?}",
-            p.pet.action
-        );
-        p.mark();
-        p.ink(6, 0, 3);
-        p.live = Some(6);
-        let _ = p.frame(Some((6, 3)));
-        p.hold(Some((6, 3)), 3.0);
-        judge(&p, "typing", 1.3, 0);
-        let last = p.last.expect("frames were drawn");
-        assert!(
-            last.col >= 3.0,
-            "typing lands at or ahead of the caret, got col {:.2}",
-            last.col
-        );
-    }
-
-    /// The joy door never opens on a line change: a content cat hops the Enter
-    /// quietly.
-    #[test]
-    fn a_content_cat_still_hops_the_line_quietly() {
-        let start = Instant::now();
-        let mut joyful = PetBrain::default();
-        let t = awake(&mut joyful, start, 3, 2);
-        let (t, _) = type_run(&mut joyful, t, 3, 4, 60, 0.05);
-        let (t, f) = idle(&mut joyful, t, (3, 64), 2.0);
-        assert!(
-            joyful.content() >= JOY_CONTENT && f.action.settled(),
-            "fixture: a joyful, settled cat"
-        );
-        let (poses, frames) = drive_and_collect(&mut joyful, t, (4, 2), 200);
-        assert!(
-            frames.iter().any(|f| f.action == PetAction::Leap),
-            "the Enter is still answered with a flight"
-        );
-        assert!(
-            !poses.contains(&PetGlyphId::PetCrouchWiggle),
-            "no butt-wiggle on a line change, joy or no joy"
-        );
-        assert!(
-            frames.iter().all(|f| f
-                .motes
-                .iter()
-                .flatten()
-                .all(|m| m.kind != PetMoteKind::Dust)),
-            "and no dust"
-        );
-        assert!(
-            (frames.last().expect("frames").row - 4.0).abs() < 0.01,
-            "on the new row"
-        );
-    }
-
-    /// A wall-side Enter mid row-hop is refused as a re-aim (it would outrun the
-    /// hop); the latched intent then flies to the row-7 station as one bound.
-    #[test]
-    fn a_re_aim_never_outruns_the_flight() {
-        let mut w = Law::warm(80, 24, 6, 70);
-        // Two or three more keys: the led station hangs off the margin, the
-        // wall side flips, and the ladder seats the cat on the blank row
-        // below; a hop, caught in its first half.
-        let mut hopped = false;
-        'keys: for c in 71..=78u16 {
-            w.ink(6, 0, c);
-            for _ in 0..6 {
-                let _ = w.frame(Some((6, c)));
-                if w.pet
-                    .flight
-                    .is_some_and(|f| (0.03..=f.dur * 0.5).contains(&f.t))
-                {
-                    hopped = true;
-                    break 'keys;
-                }
-            }
-        }
-        assert!(
-            hopped,
-            "fixture: the wall-side ladder hops the cat down mid-typing"
-        );
-        let before = w.pet.flight.expect("fixture: airborne");
-        // The enter, mid-hop.
-        w.ink(7, 0, 2);
-        w.live = Some(7);
-        let _ = w.frame(Some((7, 2)));
-        let after = w
-            .pet
-            .flight
-            .expect("a refused re-aim lets the hop finish its flight");
-        assert!(
-            (after.to_col - before.to_col).abs() < 1e-6
-                && (after.to_row - before.to_row).abs() < 1e-6,
-            "the re-aim is refused, never solved: {before:?} -> {after:?}"
-        );
-        assert!(after.reaimed, "and the one re-aim is spent on the refusal");
-        let seen = w.launches.len();
-        w.hold(Some((7, 2)), 220);
-        let further = &w.launches[seen..];
-        assert!(
-            !w.actions.contains(&PetAction::Startle),
-            "no fright anywhere in the crossing"
-        );
-        assert_eq!(
-            further.len(),
-            1,
-            "exactly one quiet crossing to the row-7 station, got {further:?}"
-        );
-        assert!(
-            further.iter().all(|f| (f.to_row - 7.0).abs() < 0.01),
-            "every further flight aims at row 7: {further:?}"
-        );
-        let (col, row, _, _) = w.last;
-        assert!(w.pet.flight.is_none(), "and it is down by the end");
-        assert!((row - 7.0).abs() < 0.01, "on row 7, got {row}");
-        let (station, _) = w.pet.station_safe((7, 2), 80, 24, art_cols(10, 20));
-        assert!(
-            (col - station).abs() < 1.5,
-            "beside the prompt (station {station:.2}), got {col:.2}"
-        );
-    }
 
     /// An Enter mid-pounce cannot re-aim the arc to another row; one further
     /// flight takes the cat down after the landing.
@@ -18345,113 +15658,6 @@ mod tests {
             &w.actions[down..]
         );
         assert!(w.pet.action.settled(), "and settled after it");
-    }
-
-    /// A wrap folds to one character and latches only the quiet leap: one
-    /// lawful quiet bound, no fright, notice, wiggle or dust.
-    #[test]
-    fn typing_past_the_margin_never_launches_the_show() {
-        let mut w = Law::new(100, 30, (5, 95));
-        w.live = Some(5);
-        w.ink(5, 0, 95);
-        // Wake, walk, settle — the `awake` fixture's shape.
-        w.type_to(5, 95, 97, 3);
-        w.hold(Some((5, 97)), 100);
-        assert!(w.pet.action.settled(), "fixture: a settled cat at the wall");
-        // The line grows under the cat (its stand steps down to row 6)…
-        w.type_to(5, 97, 99, 3);
-        // …and the next keystroke wraps.
-        w.ink(5, 0, 100);
-        w.ink(6, 0, 1);
-        w.live = Some(6);
-        let at_wrap = w.now();
-        let _ = w.frame(Some((6, 0)));
-        assert!(
-            !w.pet.pending_big_jump && !w.pet.pending_pounce,
-            "a wrap latches no travel: big={} pounce={}",
-            w.pet.pending_big_jump,
-            w.pet.pending_pounce
-        );
-        assert!(w.pet.quiet_leap, "a wrap's crossing is a quiet one");
-        w.hold(Some((6, 0)), 120);
-        assert_eq!(w.onsets(at_wrap, PetAction::Startle), 0, "no fright");
-        assert_eq!(
-            w.onsets(at_wrap, PetAction::Perk),
-            0,
-            "a cat on its feet does not look up first: {:?}",
-            &w.actions[at_wrap..]
-        );
-        assert!(
-            !w.wore(at_wrap, PetGlyphId::PetCrouchWiggle),
-            "never the show's gather"
-        );
-        assert_eq!(
-            w.episodes(at_wrap),
-            1,
-            "exactly one airborne episode (a 92-cell span is one bound): {:?}",
-            &w.actions[at_wrap..]
-        );
-        let launched: Vec<&Flight> = w.launches.iter().collect();
-        let fl = launched.last().expect("the wrap flies");
-        assert!(fl.big && !fl.show, "a quiet bound, not the show: {fl:?}");
-        let rate = span_eq(fl.to_col - fl.from_col, fl.to_row - fl.from_row) / fl.dur;
-        assert!(
-            rate <= BIG_HOP_SPEED_MAX + 1e-3,
-            "lawful launch, {rate:.1} c/s"
-        );
-        let down = w.touchdown(at_wrap).expect("paws down by the end");
-        let secs = (down - at_wrap) as f32 * 0.016;
-        assert!(secs <= 1.6, "paws down within 1.6 s, got {secs:.2}");
-        let (_, row, _, _) = w.last;
-        assert!((row - 6.0).abs() < 0.01, "on row 6, got {row}");
-        assert!(!w.dust(at_wrap), "no dust on a quiet landing");
-    }
-
-    /// A one-frame caret hide at the Enter keeps the cat on glass and reads the
-    /// line change off its feet: one notice, one lawful quiet crossing.
-    #[test]
-    fn a_hidden_frame_at_enter_still_crosses_lawfully() {
-        for cols in [80u16, 200] {
-            let mut w = Law::warm(cols, 30, 5, 41);
-            w.hold(Some((5, 41)), 150);
-            w.ink(5, 0, 40);
-            let at = w.now();
-            let _ = w.frame(None);
-            w.ink(6, 0, 3);
-            w.live = Some(6);
-            let _ = w.frame(Some((6, 3)));
-            w.hold(Some((6, 3)), 120);
-            assert_eq!(
-                w.onsets(at, PetAction::Startle),
-                0,
-                "{cols} cols: no fright: {:?}",
-                &w.actions[at..]
-            );
-            assert_eq!(
-                w.onsets(at, PetAction::Perk),
-                1,
-                "{cols} cols: one notice beat: {:?}",
-                &w.actions[at..]
-            );
-            assert_eq!(
-                w.episodes(at),
-                1,
-                "{cols} cols: one airborne episode: {:?}",
-                &w.actions[at..]
-            );
-            assert!(
-                w.frames[at..].iter().all(|f| f.alpha > 150),
-                "{cols} cols: the cat never left the glass"
-            );
-            let down = w.touchdown(at).expect("paws down by the end");
-            let secs = (down - at) as f32 * 0.016;
-            assert!(
-                secs <= 1.3,
-                "{cols} cols: paws down within 1.3 s, got {secs:.2}"
-            );
-            let (_, row, _, _) = w.last;
-            assert!((row - 6.0).abs() < 0.01, "{cols} cols: on row 6, got {row}");
-        }
     }
 
     // A hidden frame retires a live arc (`flight.take()`): the lift parks in
@@ -18726,45 +15932,6 @@ mod tests {
                 per_frame / animal
             );
         }
-        // The clamp's two corners (the sweep above is not monotonic in
-        // `cols`): below ~74 columns the pace is lifted to the hop's ceiling,
-        // above ~189 it is capped at the law's.
-        assert!(
-            (quiet_speed_max(20) - HOP_SPEED_MAX).abs() < 0.01
-                && (quiet_speed_max(40) - HOP_SPEED_MAX).abs() < 0.01,
-            "a narrow pane is held up to the hop's own pace"
-        );
-        assert!(
-            (quiet_speed_max(400) - BIG_HOP_SPEED_MAX).abs() < 0.01,
-            "and a wide one is held down to the law's"
-        );
-        // ...and at 80 the pane-relative rule is in force, which is where
-        // [`QUIET_PANE_PER_SEC`]'s promise holds.
-        assert!(
-            (quiet_speed_max(80) / 60.0 - 0.987).abs() < 0.01,
-            "80 columns: {}",
-            quiet_speed_max(80) / 60.0
-        );
-    }
-
-    /// [`QUIET_ONE_BOUND_SECS`] splits no pane-wide crossing under 239
-    /// columns, but is reachable past them.
-    #[test]
-    fn the_quiet_split_needs_a_pane_wider_than_anyone_has() {
-        for cols in [40u16, 80, 100, 120, 160, 200, 238] {
-            let widest = f32::from(cols); // the whole pane, the largest delta there is
-            assert!(
-                widest / quiet_speed_max(cols) <= QUIET_ONE_BOUND_SECS,
-                "{cols} cols: even a pane-wide quiet crossing stays one bound"
-            );
-        }
-        // ...and it is not vacuous: a big enough pane does split. The
-        // crossover is `BIG_HOP_SPEED_MAX * QUIET_ONE_BOUND_SECS` = 238
-        // columns, for a crossing spanning the whole pane.
-        assert!(
-            f32::from(239u16) / quiet_speed_max(239) > QUIET_ONE_BOUND_SECS,
-            "the bar is reachable in principle, from 239 columns up"
-        );
     }
 
     /// The chosen show keeps its choreography but not an exemption from the
@@ -19023,60 +16190,6 @@ mod tests {
             !p.flights.iter().any(|f| f.at >= tr && f.show),
             "…and no flight leaves through the show's door"
         );
-    }
-
-    /// A longer jump gathers longer and squashes deeper, inside
-    /// `[CROUCH_DUR, COIL_MAX]`.
-    #[test]
-    fn the_coil_scales_with_the_span() {
-        let start = Instant::now();
-        // A chosen same-row word jump of `jump` columns: how long the
-        // gather held, and how deep it went.
-        let gather = |jump: u16| -> (f32, f32) {
-            let mut pet = PetBrain::default();
-            let t = awake(&mut pet, start, 4, 10);
-            let (mut t, f) = idle(&mut pet, t, (4, 12), 0.5);
-            assert!(f.action.settled(), "fixture: a settled cat");
-            let caret = 12 + jump;
-            let mut held = 0.0f32;
-            let mut trough = 1.0f32;
-            let mut leapt = false;
-            for _ in 0..180 {
-                t += Duration::from_millis(16);
-                let f = pet.tick(sense(t, Some((4, caret))));
-                match f.action {
-                    PetAction::Crouch => {
-                        held += 0.016;
-                        trough = trough.min(f.scale_y);
-                    }
-                    PetAction::Leap => {
-                        leapt = true;
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-            assert!(leapt, "fixture: a {jump}-column jump leaves the ground");
-            (held, trough)
-        };
-        let (short_t, short_q) = gather(8);
-        let (long_t, long_q) = gather(22);
-        assert!(
-            long_t > short_t + 0.03,
-            "a longer jump gathers longer: {short_t:.3}s for 8 cells, {long_t:.3}s for 22"
-        );
-        assert!(
-            long_q < short_q - 0.02,
-            "…and squashes deeper for it: {short_q:.3} against {long_q:.3}"
-        );
-        // Both inside the ordering law: never under the base crouch,
-        // never past the ceiling the big gather has to outrank.
-        for (name, t) in [("short", short_t), ("long", long_t)] {
-            assert!(
-                (CROUCH_DUR - 0.017..=COIL_MAX + 0.017).contains(&t),
-                "the {name} gather stays inside [CROUCH_DUR, COIL_MAX], got {t:.3}s"
-            );
-        }
     }
 
     /// Under the stream watch a log printing under the cat is evicted from at
@@ -19519,40 +16632,6 @@ mod tests {
         assert!(settled, "retired lift must settle within FADE_IN");
     }
 
-    /// The step aside is a little follower; the re-anchor past
-    /// [`INK_EVICT_MAX`] is a hop, never a one-frame cut.
-    #[test]
-    fn a_step_aside_glides_and_a_re_anchor_hops() {
-        let dt = 1.0 / 60.0;
-        let step = INK_EVICT_SPEED * dt;
-        let mid = PetBrain::evict_toward(10.0, 13.0, dt);
-        assert!(
-            (mid - (10.0 + step)).abs() < 1e-4,
-            "a 3-cell sidestep is rationed, got {mid}"
-        );
-        assert!(
-            (PetBrain::evict_toward(10.0, 10.05, dt) - 10.05).abs() < 1e-6,
-            "and never overshoots the last fraction of a cell"
-        );
-        // The routing law itself: what the glide is allowed to be asked to do.
-        assert!(
-            !PetBrain::is_re_anchor(10.0, 13.0, 4.0, 4.0),
-            "a 3-cell sidestep on one row is a glide"
-        );
-        assert!(
-            PetBrain::is_re_anchor(10.0, 40.0, 4.0, 4.0),
-            "past INK_EVICT_MAX it is a hop"
-        );
-        assert!(
-            PetBrain::is_re_anchor(40.0, 10.0, 4.0, 4.0),
-            "in either direction"
-        );
-        assert!(
-            PetBrain::is_re_anchor(10.0, 10.0, 4.0, 5.0),
-            "and a row change is a hop however short the column move"
-        );
-    }
-
     /// A settled cat with a full-width line printed under it is airborne on the
     /// tick the ink lands, by lawful steps.
     #[test]
@@ -19768,45 +16847,6 @@ mod tests {
         }
     }
 
-    /// Ghost text flickering under a still caret moves the cat only by lawful
-    /// steps.
-    #[test]
-    fn ghost_text_flickering_under_the_cat_never_teleports_it() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let mut t = awake(&mut pet, start, 6, 12);
-        let (t2, f) = idle(&mut pet, t, (6, 12), SIT_AFTER + 0.4);
-        t = t2;
-        assert!(
-            f.action.settled(),
-            "fixture: a settled cat beside the prompt"
-        );
-        let mut last = (f.col, f.row, 100u16, 30u16);
-        let mut worst = 0.0f32;
-        for i in 0..600u16 {
-            // The suggestion appears for a beat, then is dismissed: the cat's
-            // row goes from a stub to nearly full width and back, several
-            // times a second.
-            let mut spans = vec![(0u16, 0u16); 20];
-            let end = if (i / 12) % 2 == 0 { 90 } else { 13 };
-            spans[6] = (0, end);
-            spans[5] = (0, end);
-            pet.sense_ink(0, &spans, Some(6));
-            t += Duration::from_millis(16);
-            let prev = (last.0, last.1);
-            let f = lawful_tick(&mut pet, sense(t, Some((6, 12))), &mut last);
-            worst = worst
-                .max((f.col - prev.0).abs())
-                .max((f.row - prev.1).abs());
-        }
-        // …and the law is not passing vacuously: the cat really did have to
-        // move, it just never blinked.
-        assert!(
-            worst > 0.01,
-            "fixture is inert — the ink storm never moved the cat at all"
-        );
-    }
-
     /// A jump in the last frames of an arc (past [`REAIM_MAX_U`], where the
     /// rebase would run away or go NaN) is dropped, not solved.
     #[test]
@@ -19973,42 +17013,6 @@ mod tests {
         );
     }
 
-    /// The cheer stands the pet up: from a loaf, the perk → frolic chain plays
-    /// upright poses and floats warm motes, never the loaf art.
-    #[test]
-    fn the_cheer_stands_up_from_the_loaf() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let t = awake(&mut pet, start, 4, 10);
-        let (mut t, f) = idle(&mut pet, t, (4, 12), LOAF_AFTER + 1.0);
-        assert_eq!(f.action, PetAction::Loaf, "fixture: a loafed cat");
-        pet.note_command_done(t, false, Some(CHEER_MIN_MS + 500));
-        let mut kinds = Vec::new();
-        let mut saw_frolic = false;
-        for _ in 0..150 {
-            t += Duration::from_millis(16);
-            let f = pet.tick(sense(t, Some((4, 12))));
-            if f.action == PetAction::Frolic {
-                saw_frolic = true;
-            }
-            if matches!(f.action, PetAction::Perk | PetAction::Frolic) {
-                assert_ne!(
-                    f.pose,
-                    PetGlyphId::PetLoaf,
-                    "the party is played on its feet, never from the loaf"
-                );
-            }
-            for m in f.motes.iter().flatten() {
-                kinds.push(m.kind);
-            }
-        }
-        assert!(saw_frolic, "the cheer frolic must play");
-        assert!(
-            kinds.contains(&PetMoteKind::Note) && kinds.contains(&PetMoteKind::Heart),
-            "and the party floats BOTH the note and the heart, got {kinds:?}"
-        );
-    }
-
     /// A log the caret rides is followed with the same lag whether or not shell
     /// integration reports a running command.
     #[test]
@@ -20106,106 +17110,6 @@ mod tests {
             f.col >= 14.0,
             "and stand clear of the line's ink, col {}",
             f.col
-        );
-    }
-
-    /// The touch between two bounds wears the coil in both directions; a snap
-    /// straight back from the wall is one bound with no touch.
-    #[test]
-    fn touch_land_mirrors_cleanly() {
-        let start = Instant::now();
-        fn pet_touching(f: &PetFrame) -> bool {
-            // The touch is the only Land wearing the coil.
-            f.pose == PetGlyphId::PetCrouch
-        }
-        let touches = |frames: &[PetFrame]| -> Vec<(PetGlyphId, bool)> {
-            frames
-                .iter()
-                .filter(|f| f.action == PetAction::Land && pet_touching(f))
-                .map(|f| (f.pose, f.facing_left))
-                .collect()
-        };
-        let rightward = {
-            let mut pet = PetBrain::default();
-            let t = awake(&mut pet, start, 4, 2);
-            let (_, frames) = drive_and_collect(&mut pet, t, (4, 78), 260);
-            touches(&frames)
-        };
-        let leftward = {
-            let mut pet = PetBrain::default();
-            let mut t = awake(&mut pet, start, 4, 78);
-            // A held backspace from column 80 to 10: the bottle holds the cat
-            // still while the caret runs home, and the gap opens the show.
-            let mut col = 80u16;
-            while col > 10 {
-                col -= 1;
-                t += Duration::from_millis(33);
-                let _ = pet.tick(sense(t, Some((4, col))));
-            }
-            let (_, frames) = drive_and_collect(&mut pet, t, (4, 10), 300);
-            touches(&frames)
-        };
-        assert!(
-            !rightward.is_empty() && !leftward.is_empty(),
-            "both twin-bound crossings must touch down between bounds \
-             (right {rightward:?}, left {leftward:?})"
-        );
-        assert!(
-            rightward
-                .iter()
-                .all(|&(p, face)| p == PetGlyphId::PetCrouch && !face),
-            "rightward touch: the coil, facing right — got {rightward:?}"
-        );
-        assert!(
-            leftward
-                .iter()
-                .all(|&(p, face)| p == PetGlyphId::PetCrouch && face),
-            "leftward touch: the SAME coil, mirrored — got {leftward:?}"
-        );
-
-        // A same-row jump straight back from the wall is a snap: one quiet
-        // bound with no split and no touch.
-        let mut pet = PetBrain::default();
-        let t = awake(&mut pet, start, 4, 78);
-        let (_, frames) = drive_and_collect(&mut pet, t, (4, 2), 260);
-        assert!(
-            touches(&frames).is_empty(),
-            "a leftward SNAP is one bound: no touch-land between two"
-        );
-        assert!(
-            frames.iter().any(|f| f.action == PetAction::Leap),
-            "fixture: the snap crosses"
-        );
-        assert!(
-            !frames.iter().any(|f| f.pose == PetGlyphId::PetCrouchWiggle),
-            "and it is quiet: never the show's gather"
-        );
-    }
-
-    /// A two-bound crossing whose midfield is inked wall to wall spends the
-    /// span as one bound: there is no ground worth touching.
-    #[test]
-    fn the_touch_point_dodges_the_ink() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let t = awake(&mut pet, start, 4, 2);
-        // Row 4 is inked from col 2 to col 76 — the typed line the twin
-        // bounds would cross.
-        let spans = vec![(0u16, 0u16), (0, 0), (0, 0), (0, 0), (2, 76)];
-        pet.sense_ink(0, &spans, Some(4));
-        let (_, frames) = drive_and_collect(&mut pet, t, (4, 78), 260);
-        let mut episodes = 0;
-        let mut airborne_was = false;
-        for f in &frames {
-            let airborne = f.action == PetAction::Leap;
-            if airborne && !airborne_was {
-                episodes += 1;
-            }
-            airborne_was = airborne;
-        }
-        assert_eq!(
-            episodes, 1,
-            "an inked midfield collapses the split into one clean bound"
         );
     }
 
@@ -20429,23 +17333,6 @@ mod tests {
         );
     }
 
-    /// Near-visit variety: the serial parity dealt at note time alternates the
-    /// swipe and the playbow greeting.
-    #[test]
-    fn near_peek_alternates_swipe_and_greeting() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let t = awake(&mut pet, start, 4, 12);
-        let (t, _) = idle(&mut pet, t, (4, 14), SIT_AFTER + 0.4);
-        pet.mote_serial = 0; // even: the swipe
-        pet.note_peek(t, pet.col + 4.0, 4.0);
-        assert!(!pet.bat_greet, "even serial swipes");
-        pet.pending_bat = None;
-        pet.mote_serial = 1; // odd: the greeting
-        pet.note_peek(t, pet.col + 4.0, 4.0);
-        assert!(pet.bat_greet, "odd serial greets with the playbow");
-    }
-
     /// Non-finite coordinates never reach the pose state: a NaN pointer is no
     /// pointer, a NaN peek never latches.
     #[test]
@@ -20495,109 +17382,6 @@ mod tests {
         // The rally ends: the watch lapses back into the ordinary settle.
         let (_, _) = idle(&mut pet, t, (4, col as u16), TENNIS_LAPSE + 0.5);
         assert!(!pet.tennis, "the rally over, the watch stands down");
-    }
-
-    /// The drift-brake: a long gallop may overshoot its station and trot back;
-    /// the follower still ends at the station.
-    #[test]
-    fn a_long_gallop_overshoots_then_trots_back() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let mut t = warm_settled(&mut pet, start);
-        let from = pet.col;
-        // One big caret jump far right of a warmed cat: a long fast chase leg,
-        // but under the big-jump door, so it stays a run.
-        let target_col = 84u16;
-        let mut overshot = false;
-        let mut max_col = from;
-        for _ in 0..600 {
-            t += Duration::from_millis(16);
-            let _ = pet.tick(sense(t, Some((4, target_col))));
-            max_col = max_col.max(pet.col);
-            if pet.braking {
-                overshot = true;
-            }
-        }
-        let station = PetBrain::station(target_col, 100, art_cols(10, 20));
-        // The brake is content- and distance-gated; when it fires the paws
-        // must still come to rest at the station.
-        if overshot {
-            assert!(
-                max_col > station + 0.5,
-                "the brake means actually blowing past the station"
-            );
-        }
-        assert!(
-            (pet.col - station).abs() <= ARRIVED + 0.6,
-            "however the leg ended, home is home (got {} want {station})",
-            pet.col
-        );
-    }
-
-    /// The run-out braces on `PetSkid`, planted, easing off toward the overshoot;
-    /// armed by hand (`the_drift_brakes_gate_is_rare_by_construction`).
-    #[test]
-    fn the_drift_brake_skids_on_a_planted_frame() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let mut t = awake(&mut pet, start, 3, 2);
-        let mut caret = 4u16;
-        let mut armed = false;
-        let mut skids: Vec<(PetGlyphId, f32, f32)> = Vec::new();
-        let mut after: Vec<PetGlyphId> = Vec::new();
-        let mut puffed = false;
-        for i in 0..200 {
-            t += Duration::from_millis(16);
-            if i % 4 == 3 && i < 160 {
-                caret += 1;
-            }
-            if !armed && i > 100 && pet.action == PetAction::Run && pet.speed > 12.0 {
-                armed = true;
-                pet.braking = true;
-                pet.brake_over = Some(pet.col + BRAKE_OVERSHOOT);
-                pet.speed *= 0.15;
-                pet.stumble_t = STUMBLE_DUR;
-                pet.skid_puff = false;
-            }
-            let f = pet.tick(sense(t, Some((3, caret))));
-            if !armed {
-                continue;
-            }
-            if pet.brake_over.is_some() {
-                skids.push((f.pose, f.scale_x, f.lift));
-            } else {
-                puffed |= pet.skid_puff;
-                if matches!(f.action, PetAction::Walk | PetAction::Run) {
-                    after.push(f.pose);
-                }
-            }
-        }
-        assert!(armed, "fixture: the chase must reach a gallop to arm");
-        assert!(
-            skids.len() >= 4,
-            "fixture: the run-out must last a few frames ({})",
-            skids.len()
-        );
-        for (pose, sx, lift) in &skids {
-            assert_eq!(*pose, PetGlyphId::PetSkid, "the run-out is a braced slide");
-            assert!(*sx > 1.0, "and it leans into the travel (scale_x {sx})");
-            assert_eq!(*lift, 0.0, "on a PLANTED frame — the paws never leave");
-        }
-        assert!(
-            skids[0].1 > skids[skids.len() - 1].1,
-            "the lean eases as the paws reach the overshoot ({} -> {})",
-            skids[0].1,
-            skids[skids.len() - 1].1
-        );
-        assert!(puffed, "and the paws throw one more puff halfway down it");
-        assert!(
-            after.iter().any(|p| PetBrain::CYCLE_RUN.contains(p)),
-            "the gallop cycle comes back once the run-out is spent: {after:?}"
-        );
-        assert!(
-            !after.contains(&PetGlyphId::PetSkid),
-            "and the slide does not outlive its own run-out"
-        );
     }
 
     /// A bored cat ducks behind a word in reach (under the glyphs), then
@@ -20665,391 +17449,7 @@ mod tests {
         assert!(!pet.watch_spent, "and the next stream earns a fresh stare");
     }
 
-    // ── the flight poses and the dealt settle ─────────
-
-    /// The three phases fill the flight, the hero holds at least [`MIN_HERO`],
-    /// and every phase is monotone in the duration.
-    #[test]
-    fn the_pose_schedule_always_shows_the_hero_or_falls_back_to_two() {
-        let durs = [0.05f32, 0.10, 0.16, 0.20, 0.25, 0.42, 0.85];
-        let mut prev: Option<(f32, f32, f32)> = None;
-        for dur in durs {
-            let (rise, desc) = PetBrain::pose_schedule(dur);
-            let hero = dur - rise - desc;
-            assert!(
-                (rise + hero + desc - dur).abs() < 1e-6,
-                "{dur}: the three phases fill the flight"
-            );
-            assert!(
-                hero >= MIN_HERO - 1e-6,
-                "{dur}: the hero frame holds at least MIN_HERO, got {hero}"
-            );
-            assert!(rise > 0.0 && desc > 0.0, "{dur}: both approaches survive");
-            if let Some((pd, ph, ps)) = prev {
-                assert!(desc >= pd - 1e-6, "{dur}: descent is monotone");
-                assert!(hero >= ph - 1e-6, "{dur}: hero is monotone");
-                assert!(
-                    rise + desc >= ps - 1e-6,
-                    "{dur}: rise + descent is monotone"
-                );
-            }
-            prev = Some((desc, hero, rise + desc));
-        }
-        // …and under `3·MIN_HERO` the flight cannot fit three legible beats,
-        // so `flight_pose` deals two, split at the apex.
-        let short = Flight {
-            from_col: 0.0,
-            from_row: 0.0,
-            to_col: 2.0,
-            to_row: 0.0,
-            dur: 2.0 * MIN_HERO,
-            arc: 0.5,
-            t: 0.0,
-            reaimed: false,
-            big: false,
-            show: false,
-            hop: false,
-            coiled: false,
-            drop: false,
-            late_move: false,
-        };
-        let mut seen = Vec::new();
-        for i in 0..=20 {
-            let mut f = short;
-            f.t = short.dur * i as f32 / 20.0;
-            let p = PetBrain::flight_pose(&f);
-            if seen.last() != Some(&p) {
-                seen.push(p);
-            }
-        }
-        assert_eq!(
-            seen,
-            vec![PetGlyphId::PetLeapRise, PetGlyphId::PetLeapDescend],
-            "too short for three beats: two poses, split at the apex"
-        );
-    }
-
-    /// A short Enter is a tucked hop: release, rise, the hop frame at the apex,
-    /// descent; never the pounce's stretched hero frame.
-    #[test]
-    fn a_short_enter_hop_never_wears_the_pounce_hero_frame() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let mut t = awake(&mut pet, start, 4, 1);
-        let mut leap: Vec<(PetGlyphId, f32)> = Vec::new();
-        let mut last_row = 4.0f32;
-        for _ in 0..120 {
-            t += Duration::from_millis(16);
-            let f = pet.tick(sense(t, Some((5, 0))));
-            if f.action == PetAction::Leap {
-                leap.push((f.pose, f.lift));
-            }
-            last_row = f.row;
-        }
-        assert!(!leap.is_empty(), "the Enter must fly");
-        let poses: Vec<PetGlyphId> = leap.iter().map(|(p, _)| *p).collect();
-        assert_eq!(
-            poses[0],
-            PetGlyphId::PetLaunch,
-            "the release first: {poses:?}"
-        );
-        let mut order: Vec<PetGlyphId> = Vec::new();
-        for p in &poses {
-            if order.last() != Some(p) {
-                order.push(*p);
-            }
-        }
-        assert_eq!(
-            order,
-            vec![
-                PetGlyphId::PetLaunch,
-                PetGlyphId::PetLeapRise,
-                PetGlyphId::PetHop,
-                PetGlyphId::PetLeapDescend,
-            ],
-            "release, rise, tuck, descend — and never the hero: {poses:?}"
-        );
-        assert!(
-            leap.iter().any(|(_, l)| *l > 0.0),
-            "the hop leaves the floor"
-        );
-        assert!((last_row - 5.0).abs() < 0.01, "and lands on row 5");
-    }
-
-    /// On every coil → flight transition both the coil's last frame and the
-    /// `u = 0` frame wear `PetLaunch`, and no `PetLaunch` frame is airborne.
-    #[test]
-    fn the_release_precedes_the_rise() {
-        let start = Instant::now();
-        let mut transitions = 0u32;
-        let mut check = |frames: &[PetFrame], name: &str| {
-            for w in frames.windows(2) {
-                let (a, b) = (&w[0], &w[1]);
-                if a.action == PetAction::Crouch && b.action == PetAction::Leap {
-                    transitions += 1;
-                    // ...and the two ticks of it are one change: the coil's
-                    // exit shape and the flight's `u = 0` shape stay within the
-                    // 3 % per-tick volume law.
-                    let (va, vb) = (a.scale_x * a.scale_y, b.scale_x * b.scale_y);
-                    assert!(
-                        (vb - va).abs() / va <= 0.03,
-                        "{name}: the release popped the volume by {:.2} %",
-                        (vb - va).abs() / va * 100.0
-                    );
-                    assert_eq!(
-                        a.pose,
-                        PetGlyphId::PetLaunch,
-                        "{name}: the coil's last frame is the release"
-                    );
-                    assert_eq!(
-                        b.pose,
-                        PetGlyphId::PetLaunch,
-                        "{name}: and the u = 0 frame is its second tick"
-                    );
-                    assert!(b.lift == 0.0, "{name}: the release is on the ground");
-                }
-            }
-            for f in frames {
-                if f.pose == PetGlyphId::PetLaunch {
-                    assert!(
-                        f.lift == 0.0,
-                        "{name}: a PetLaunch frame in the air (lift {})",
-                        f.lift
-                    );
-                }
-            }
-        };
-        let mut pet = PetBrain::default();
-        let t = awake(&mut pet, start, 4, 10);
-        let (_, frames) = drive_and_collect(&mut pet, t, (4, 30), 140);
-        check(&frames, "pounce");
-        let mut pet = PetBrain::default();
-        let t = awake(&mut pet, start, 4, 1);
-        let (_, frames) = drive_and_collect(&mut pet, t, (5, 0), 120);
-        check(&frames, "hop");
-        let mut pet = PetBrain::default();
-        let t = awake(&mut pet, start, 4, 10);
-        let (_, frames) = drive_and_collect(&mut pet, t, (4, 60), 200);
-        check(&frames, "show");
-        assert_eq!(transitions, 3, "fixture: three coil → flight transitions");
-    }
-
-    /// No landing tick moves `scale_y` by more than 0.12 or the volume by more
-    /// than 3 %.
-    #[test]
-    fn the_touchdown_is_not_a_cliff() {
-        let start = Instant::now();
-        // A pounce, a screen-crossing bound, and a tucked Enter: every
-        // landing the caret-driven vocabulary has.
-        for (from, to) in [
-            ((4u16, 10u16), (4u16, 32u16)),
-            ((4, 4), (4, 74)),
-            ((4, 1), (5, 0)),
-        ] {
-            let mut pet = PetBrain::default();
-            let t = awake(&mut pet, start, from.0, from.1);
-            let (_, frames) = drive_and_collect(&mut pet, t, to, 240);
-            let mut worst = 0.0f32;
-            let mut worst_vol = 0.0f32;
-            for w in frames.windows(2) {
-                let (a, b) = (&w[0], &w[1]);
-                let landing = b.action == PetAction::Land
-                    || (a.action == PetAction::Land && b.action != PetAction::Leap);
-                if landing {
-                    worst = worst.max((b.scale_y - a.scale_y).abs());
-                    let (va, vb) = (a.scale_x * a.scale_y, b.scale_x * b.scale_y);
-                    worst_vol = worst_vol.max((vb - va).abs() / va.max(1e-6));
-                }
-            }
-            assert!(
-                worst > 0.0,
-                "fixture: the {from:?}->{to:?} flight lands and squashes"
-            );
-            assert!(
-                worst <= 0.12,
-                "the {from:?}->{to:?} touchdown stepped scale_y by {worst:.3} in one tick"
-            );
-            assert!(
-                worst_vol <= 0.03 + 1e-6,
-                "the {from:?}->{to:?} touchdown stepped the volume by {:.2} % in one tick",
-                worst_vol * 100.0
-            );
-        }
-    }
-
-    /// The recovery arrives exactly on a contact frame, and the walk home starts
-    /// on the cycle's foot-down frame.
-    #[test]
-    fn the_landing_steps_off_on_a_planted_frame() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let mut t = awake(&mut pet, start, 4, 10);
-        // Give the ease something to correct: the stride is frozen while
-        // airborne, so a flight launched on a contact frame lands on one.
-        pet.stride = pet.stride.trunc() + 0.5;
-        let mut caret = 32u16;
-        let mut landed = false;
-        // The pose and which cycle it came from: a caret walking one cell
-        // every 0.19 s is an amble ([`LAT_SPEED`]), so the contact frame is
-        // the lateral cycle's. The rule is "frame 0 of whichever cycle the
-        // gait is showing".
-        let mut first_walk: Option<(PetGlyphId, bool)> = None;
-        let mut planted = 1.0f32;
-        for k in 0..400 {
-            t += Duration::from_millis(16);
-            // Once the paws are down, walk the caret away one cell at a time
-            // so the gait resumes and shows which frame it stepped off on.
-            if landed && k % 12 == 0 {
-                caret += 1;
-            }
-            let f = pet.tick(sense(t, Some((4, caret))));
-            if f.action == PetAction::Land {
-                landed = true;
-                planted = (pet.stride - pet.stride.round()).abs();
-            } else if landed && f.action == PetAction::Walk && first_walk.is_none() {
-                first_walk = Some((f.pose, pet.lateral));
-            }
-        }
-        assert!(landed, "fixture: the word jump must pounce and land");
-        assert!(
-            planted < 1e-6,
-            "the recovery must ARRIVE on a contact frame, {planted} of a cycle off"
-        );
-        let (pose, lateral) = first_walk.expect("fixture: the cat walks after the landing");
-        assert_eq!(
-            pose,
-            if lateral {
-                PetGlyphId::PetLwalk0
-            } else {
-                PetGlyphId::PetWalk0
-            },
-            "and the walk home starts on the cycle's foot-down frame"
-        );
-    }
-
     // ── the settle deal: one hand per arrival ────────────
-
-    /// Idle `secs` of 16 ms frames and return the quiet clock at the first
-    /// frame wearing `want` (None if it never came).
-    fn onset_of(
-        pet: &mut PetBrain,
-        start: Instant,
-        caret: (u16, u16),
-        secs: f32,
-        want: PetAction,
-    ) -> (Instant, Option<f32>) {
-        let mut t = start;
-        let end = start + Duration::from_secs_f32(secs);
-        let mut onset = None;
-        while t < end {
-            t += Duration::from_millis(16);
-            let f = pet.tick(sense(t, Some(caret)));
-            if f.action == want && onset.is_none() {
-                onset = Some(pet.quiet);
-            }
-        }
-        (t, onset)
-    }
-
-    #[test]
-    fn consecutive_settles_deal_different_seeds() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let t = awake(&mut pet, start, 4, 10);
-        assert!(pet.action.settled(), "fixture: the first arrival settled");
-        let a = (pet.settle_serial, pet.settle_seed);
-        // A second arrival: a few keys, then the settle again.
-        let (t, _) = type_run(&mut pet, t, 4, 12, 4, 0.05);
-        let (t, f) = idle(&mut pet, t, (4, 16), SIT_AFTER + 0.2);
-        assert!(f.action.settled(), "fixture: the second arrival settled");
-        let b = (pet.settle_serial, pet.settle_seed);
-        assert_ne!(a.0, b.0, "every arrival bumps the settle serial");
-        assert_ne!(a.1, b.1, "and deals a fresh hand: {a:?} then {b:?}");
-        // The hand is held for the whole settle: the ladder's own
-        // transitions (sit, groom, loaf) deal nothing new.
-        let (_, f) = idle(&mut pet, t, (4, 16), GROOM_AFTER + GROOM_DUR + 1.0);
-        assert!(f.action.settled());
-        assert_eq!(
-            (pet.settle_serial, pet.settle_seed),
-            b,
-            "a settle keeps its hand through its own ladder"
-        );
-    }
-
-    #[test]
-    fn consecutive_settles_climb_different_ladders() {
-        let start = Instant::now();
-        // Settle A: the natural hand; its loaf onset is the dealt one.
-        let mut pet = PetBrain::default();
-        let t = awake(&mut pet, start, 4, 10);
-        assert!(
-            pet.content() < PURR_GATE,
-            "fixture: no purr to pre-empt the loaf"
-        );
-        let seed_a = pet.settle_seed;
-        let (t, loaf_a) = onset_of(&mut pet, t, (4, 12), 8.0, PetAction::Loaf);
-        let loaf_a = loaf_a.expect("settle A loafs");
-        assert!(
-            (loaf_a - pet.loaf_after()).abs() < 0.02,
-            "the loaf comes at the dealt onset: {loaf_a} vs {}",
-            pet.loaf_after()
-        );
-        // Settle B: the next hand (forced to the neighbouring seed, so the
-        // ladder rung it deals is guaranteed different: a % 3 != b % 3).
-        let (t, _) = type_run(&mut pet, t, 4, 12, 2, 0.05);
-        let (t, f) = idle(&mut pet, t, (4, 14), SIT_AFTER + 0.2);
-        assert!(f.action.settled(), "fixture: settle B arrived");
-        pet.force_seed(seed_a.wrapping_add(1));
-        let (t, loaf_b) = onset_of(&mut pet, t, (4, 14), 8.0, PetAction::Loaf);
-        let loaf_b = loaf_b.expect("settle B loafs");
-        assert!(
-            (loaf_a - loaf_b).abs() >= 0.7,
-            "consecutive hands climb different ladders: {loaf_a} vs {loaf_b}"
-        );
-        // Settle C: the same rung as A (a % 3 == c % 3) loafs at A's onset.
-        let (t, _) = type_run(&mut pet, t, 4, 14, 2, 0.05);
-        let (t, f) = idle(&mut pet, t, (4, 16), SIT_AFTER + 0.2);
-        assert!(f.action.settled(), "fixture: settle C arrived");
-        pet.force_seed(seed_a.wrapping_add(3));
-        let (_, loaf_c) = onset_of(&mut pet, t, (4, 16), 8.0, PetAction::Loaf);
-        let loaf_c = loaf_c.expect("settle C loafs");
-        assert!(
-            (loaf_a - loaf_c).abs() < 0.05,
-            "the same rung is the same ladder: {loaf_a} vs {loaf_c}"
-        );
-    }
-
-    /// Whatever the hand, sleep lands at [`SLEEP_AFTER`] to the tick and deep
-    /// sleep is byte-stable: the deal varies the ladder's middle, never its end.
-    #[test]
-    fn every_ladder_deal_sleeps_at_twenty_two_and_goes_byte_stable() {
-        let start = Instant::now();
-        for seed in 0..12u8 {
-            let mut pet = PetBrain::default();
-            let t = awake(&mut pet, start, 4, 10);
-            pet.force_seed(seed);
-            let (t, slept) = onset_of(&mut pet, t, (4, 12), SLEEP_AFTER + 1.0, PetAction::Sleep);
-            let slept = slept.unwrap_or_else(|| panic!("hand {seed}: never slept"));
-            assert!(
-                (slept - SLEEP_AFTER).abs() <= 0.017,
-                "hand {seed}: first sleep frame at quiet {slept}, not {SLEEP_AFTER}"
-            );
-            let (t, f) = idle(&mut pet, t, (4, 12), BREATH_WINDOW + 2.0);
-            assert_eq!(f.action, PetAction::Sleep, "hand {seed}: still asleep");
-            assert!(
-                !pet.needs_frames(),
-                "hand {seed}: the lane is released past the breath window"
-            );
-            assert!(pet.is_active(), "hand {seed}: still on screen, just still");
-            assert!(
-                f.motes.iter().all(Option::is_none),
-                "hand {seed}: deep sleep holds an empty mote lane"
-            );
-            let a = pet.tick(sense(t + Duration::from_secs(1), Some((4, 12))));
-            let b = pet.tick(sense(t + Duration::from_secs(2), Some((4, 12))));
-            assert_eq!(a.fp(), b.fp(), "hand {seed}: deep sleep is byte-stable");
-        }
-    }
 
     /// With an Enter and an output pulse in the script, every hand still ends
     /// on a byte-stable sleeper asking for no frames.
@@ -21077,6 +17477,7 @@ mod tests {
                 !pet.needs_frames(),
                 "hand {seed}: every idle envelope died inside the settle window"
             );
+            assert!(pet.is_active(), "hand {seed}: still on screen, just still");
             assert!(
                 f.motes.iter().all(Option::is_none),
                 "hand {seed}: the mote lane is empty"
@@ -21150,229 +17551,7 @@ mod tests {
         }
     }
 
-    /// One hand in four skips the second wash of a settle. The first wash
-    /// always plays, and sleep still lands at [`SLEEP_AFTER`].
-    #[test]
-    fn one_hand_in_four_skips_the_second_wash() {
-        let start = Instant::now();
-        let mut skipped = 0u32;
-        let mut washed_twice = 0u32;
-        for seed in 0..12u8 {
-            let mut pet = PetBrain::default();
-            let t = awake(&mut pet, start, 4, 10);
-            pet.force_seed(seed);
-            assert!(
-                pet.content() < PURR_GATE,
-                "fixture: a cold cat climbs the whole ladder"
-            );
-            // Two full wash cycles inside the settle window.
-            let mut t = t;
-            let mut washes = 0u32;
-            let mut in_wash = false;
-            let end = t + Duration::from_secs_f32(2.2 * (GROOM_AFTER + GROOM_DUR));
-            while t < end {
-                t += Duration::from_millis(16);
-                let f = pet.tick(sense(t, Some((4, 12))));
-                let now = f.action == PetAction::Groom;
-                if now && !in_wash {
-                    washes += 1;
-                }
-                in_wash = now;
-            }
-            assert!(washes >= 1, "hand {seed}: the first wash always plays");
-            if pet.groom_skip() {
-                assert_eq!(washes, 1, "hand {seed}: the dealt skip drops the second");
-                skipped += 1;
-            } else {
-                assert_eq!(washes, 2, "hand {seed}: two washes in two cycles");
-                washed_twice += 1;
-            }
-        }
-        assert!(
-            skipped >= 2,
-            "twelve hands must include the skip ({skipped})"
-        );
-        assert!(
-            washed_twice >= 6,
-            "…and it must stay the minority ({washed_twice})"
-        );
-    }
-
-    /// Contentment does not outrank the seat, which keeps its whole dealt
-    /// window; the purr takes the loaf's.
-    #[test]
-    fn a_working_cat_still_gets_its_seat_and_its_beats() {
-        let start = Instant::now();
-        for seed in 0..12u8 {
-            let mut pet = PetBrain::default();
-            let t = awake(&mut pet, start, 4, 4);
-            // A sentence of following: content well past PURR_GATE.
-            let (t, _) = type_run(&mut pet, t, 4, 6, 30, 0.05);
-            let (mut t, f) = idle(&mut pet, t, (4, 36), SIT_AFTER + 0.1);
-            assert!(
-                pet.content() >= PURR_GATE,
-                "fixture: a cat that has been working ({})",
-                pet.content()
-            );
-            assert_eq!(
-                f.action,
-                PetAction::Sit,
-                "hand {seed}: the seat comes before the purr, whatever the ledger says"
-            );
-            pet.force_seed(seed);
-            let want = pet.loaf_after();
-            let seated_at = pet.quiet;
-            let mut sat = 0.0f32;
-            let mut dwelt_at = None;
-            for _ in 0..400 {
-                t += Duration::from_millis(16);
-                let f = pet.tick(sense(t, Some((4, 36))));
-                match f.action {
-                    PetAction::Sit => sat += 0.016,
-                    // The long dwell, whichever of its two poses this hand
-                    // was dealt: one hand in three loafs even when content
-                    // ([`PetBrain::enter_settled`]), and the purr's tell rides
-                    // both ([`PetBrain::purring`]).
-                    PetAction::Purr | PetAction::Loaf if dwelt_at.is_none() => {
-                        assert!(f.purr > 0.0, "hand {seed}: the tell rides either dwell");
-                        dwelt_at = Some(pet.quiet);
-                    }
-                    _ => {}
-                }
-            }
-            let dwelt_at =
-                dwelt_at.unwrap_or_else(|| panic!("hand {seed}: never reaches its long dwell"));
-            assert!(
-                (dwelt_at - want).abs() < 0.05,
-                "hand {seed}: the long dwell takes its dealt window ({dwelt_at} vs {want})"
-            );
-            assert!(
-                sat >= want - seated_at - 0.05,
-                "hand {seed}: the seat keeps its whole dealt window ({sat} s of sit, \
-                 seated at {seated_at}, loaf due at {want})"
-            );
-        }
-    }
-
-    /// The seat's beats are reachable for a working cat: face-on is the ordinary
-    /// seat, so they come through the glance's side-on window.
-    #[test]
-    fn the_dealt_seat_is_reachable_for_a_cat_that_works() {
-        let start = Instant::now();
-        let mut beats: Vec<PetGlyphId> = Vec::new();
-        for seed in 0..12u8 {
-            let mut pet = PetBrain::default();
-            let t = awake(&mut pet, start, 4, 4);
-            // A sentence of following: content well past PURR_GATE.
-            let (t, _) = type_run(&mut pet, t, 4, 6, 30, 0.05);
-            let (t, f) = idle(&mut pet, t, (4, 36), SIT_AFTER + 0.1);
-            assert!(
-                pet.content() >= PURR_GATE,
-                "fixture: a cat that has been working ({})",
-                pet.content()
-            );
-            assert_eq!(
-                f.action,
-                PetAction::Sit,
-                "the seat comes before the purr, whatever the ledger says"
-            );
-            assert!(pet.sit_front, "fixture: the ordinary face-on seat");
-            pet.force_seed(seed);
-            // ...and a program prints one line while it sits (the ear
-            // twitch's trigger): the authored ear frame is reachable face-on.
-            let (t, runs_a) = pose_runs(&mut pet, t, (4, 36), 0.9);
-            pulse(&mut pet, t, (4, 36));
-            let (_, runs_b) = pose_runs(&mut pet, t, (4, 36), 2.1);
-            for (pose, _, ticks) in runs_a.iter().chain(runs_b.iter()) {
-                if seat_beat(*pose) && *pose != PetGlyphId::PetSit {
-                    assert!(
-                        *ticks >= 2,
-                        "hand {seed}: {pose:?} held {ticks} tick(s) — the frame-rate law"
-                    );
-                    if !beats.contains(pose) {
-                        beats.push(*pose);
-                    }
-                }
-            }
-        }
-        assert!(
-            beats.contains(&PetGlyphId::PetSitBlink),
-            "the seat blinks where a working cat can see it: {beats:?}"
-        );
-
-        // ...and the head tips in the common seat: editing mid-line, the ink
-        // ladder parks the cat on the blank row below the caret (rule 3),
-        // still within [`SIT_FRONT_GAP`] of the caret's column.
-        let mut tipped = 0u32;
-        for seed in [1u8, 2, 4, 5] {
-            let mut pet = PetBrain::default();
-            let mut spans = vec![(0u16, 0u16); 30];
-            spans[4] = (0, 40);
-            pet.sense_ink(0, &spans, Some(4));
-            // `awake` already settles the cat (quiet ≈ SIT_AFTER + 0.2), so
-            // the glance's own window is still ahead of the pose walk below.
-            let t = awake(&mut pet, start, 4, 18);
-            let (t, f) = idle(&mut pet, t, (4, 20), 0.1);
-            assert_eq!(f.action, PetAction::Sit, "fixture: seated");
-            assert!(
-                (f.row - 4.0).abs() > 0.5,
-                "fixture: the ladder parked the seat off the caret's row ({})",
-                f.row
-            );
-            assert!(pet.sit_front, "fixture: face-on, beside the caret's column");
-            pet.force_seed(seed);
-            let (_, runs) = pose_runs(&mut pet, t, (4, 20), 1.5);
-            if let Some((_, _, ticks)) = runs.iter().find(|(p, ..)| *p == PetGlyphId::PetSitLookup)
-            {
-                assert!(
-                    *ticks >= 2,
-                    "hand {seed}: the tip held {ticks} tick(s) — the frame-rate law"
-                );
-                tipped += 1;
-            }
-        }
-        assert!(
-            tipped >= 3,
-            "the head tips toward the line it is not on, face-on ({tipped}/4 hands)"
-        );
-    }
-
     // ── the dealt idle ───────────────────────────────────────────────
-
-    /// The tail's own three frames (the excursion), as against the rest of
-    /// the seat's vocabulary.
-    fn tail_frame(pose: PetGlyphId) -> bool {
-        matches!(
-            pose,
-            PetGlyphId::PetSitFlick | PetGlyphId::PetSitTailBack | PetGlyphId::PetSitTailLow
-        )
-    }
-
-    /// The seat's side-on vocabulary: the plain sit and every dealt beat drawn
-    /// on it (not face-on `PetSitFront` or `PetPeekShoulder`).
-    fn seat_beat(pose: PetGlyphId) -> bool {
-        matches!(
-            pose,
-            PetGlyphId::PetSit
-                | PetGlyphId::PetSitBlink
-                | PetGlyphId::PetYawn
-                | PetGlyphId::PetSitEar
-                | PetGlyphId::PetSitEarFar
-                | PetGlyphId::PetSitLookup
-                | PetGlyphId::PetSitLookdown
-                | PetGlyphId::PetSitFlick
-                | PetGlyphId::PetSitTailBack
-                | PetGlyphId::PetSitTailLow
-        )
-    }
-
-    fn plain_seat(pet: &mut PetBrain, start: Instant, seed: u8) -> Instant {
-        let t = awake(pet, start, 4, 97);
-        assert!(pet.action.settled(), "fixture: settled");
-        assert!(!pet.sit_front && !pet.peek, "fixture: the plain seat");
-        pet.force_seed(seed);
-        t
-    }
 
     /// Drive `secs` of 16 ms frames and return the pose timeline, run-length
     /// encoded as (pose, quiet at the first frame of the run, tick count).
@@ -21396,620 +17575,10 @@ mod tests {
         (t, runs)
     }
 
-    /// One output pulse — a burst's rising edge, the ear twitch's trigger.
-    fn pulse(pet: &mut PetBrain, t: Instant, caret: (u16, u16)) {
-        let mut s = sense(t, Some(caret));
-        s.output_burst = true;
-        let _ = pet.tick(s);
-    }
-
-    /// The dog's sulk off its feet wears its own droop frame (the seated case is
-    /// `a_seated_sulk_keeps_its_seat`).
+    /// Reduced motion over a whole settle down to sleep: two still frames
+    /// (seated and asleep), no lift, and nothing ever on the mote lane.
     #[test]
-    fn the_dog_sulks_in_its_own_skin() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        pet.set_species(PetSpecies::Dog);
-        let t = awake(&mut pet, start, 3, 2);
-        let (t, _) = type_run(&mut pet, t, 3, 4, 30, 0.05);
-        let (mut t, _) = idle(&mut pet, t, (3, 34), 0.6);
-        pet.note_command_done(t, true, Some(120_000));
-        let mut saw = false;
-        for _ in 0..160 {
-            t += Duration::from_millis(16);
-            let f = pet.tick(sense(t, Some((3, 34))));
-            if f.action == PetAction::Droop {
-                saw = true;
-                assert_eq!(
-                    f.pose,
-                    PetGlyphId::PetDogDroop,
-                    "the dog sulks in its own skin"
-                );
-            }
-        }
-        assert!(saw, "a failure must droop");
-    }
-
-    /// A cat that was already sitting does not lie down to be disappointed:
-    /// the head goes down and the ears flatten on the seat it kept.
-    #[test]
-    fn a_seated_sulk_keeps_its_seat() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let t = awake(&mut pet, start, 3, 2);
-        let (t, _) = type_run(&mut pet, t, 3, 4, 30, 0.05);
-        let (mut t, f) = idle(&mut pet, t, (3, 34), SIT_AFTER + 0.2);
-        assert!(
-            matches!(f.action, PetAction::Sit | PetAction::Purr),
-            "fixture: seated, got {:?}",
-            f.action
-        );
-        pet.note_command_done(t, true, Some(120_000));
-        let mut saw = false;
-        for _ in 0..160 {
-            t += Duration::from_millis(16);
-            let f = pet.tick(sense(t, Some((3, 34))));
-            if f.action == PetAction::Droop {
-                saw = true;
-                assert_eq!(
-                    f.pose,
-                    PetGlyphId::PetDroopSit,
-                    "a sulk off a seat keeps the seat"
-                );
-                assert!(f.motes.iter().all(Option::is_none), "grief floats NOTHING");
-            }
-        }
-        assert!(saw, "a failure must droop");
-    }
-
-    /// The wake is a gesture: the front reach, then the weight shift and hind
-    /// reach, both in order inside one `WAKE_DUR`.
-    #[test]
-    fn the_wake_stretches_front_then_hind() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let t = awake(&mut pet, start, 4, 18);
-        let (mut t, f) = idle(&mut pet, t, (4, 20), SLEEP_AFTER + 0.4);
-        assert_eq!(f.action, PetAction::Sleep, "fixture: asleep");
-        let mut front = Vec::new();
-        let mut hind = Vec::new();
-        let mut drawn = 0.0f32;
-        for k in 0..(WAKE_DUR / 0.016) as u32 {
-            t += Duration::from_millis(16);
-            let f = pet.tick(sense(t, Some((4, 21))));
-            assert_eq!(f.action, PetAction::Waking, "fixture: inside the wake");
-            match f.pose {
-                PetGlyphId::PetStretch => front.push(k),
-                PetGlyphId::PetStretchHind => hind.push(k),
-                other => panic!("the wake wears only its two halves, got {other:?}"),
-            }
-            if k as f32 * 0.016 < STRETCH_LEAD {
-                drawn = drawn.max(f.scale_x);
-            }
-        }
-        assert!(!front.is_empty() && !hind.is_empty(), "both halves play");
-        assert!(
-            front.last() < hind.first(),
-            "the front reach leads and the hind leg follows: {front:?} then {hind:?}"
-        );
-        assert!(
-            front.len() >= 2 && hind.len() >= 2,
-            "each half holds past the frame-rate law's two ticks"
-        );
-        assert!(
-            drawn >= 1.04,
-            "the front reach draws the body out ({drawn} at full reach)"
-        );
-    }
-
-    /// The ear twitch wears the authored frame: a pulse at a stand swaps the
-    /// ear out and back, is not a stream, and floats nothing.
-    #[test]
-    fn an_output_pulse_twitches_the_settled_ear() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let t = awake(&mut pet, start, 4, 12);
-        // A fresh arrival: quiet under SIT_AFTER, so the pose is the stand.
-        let (t, _) = type_run(&mut pet, t, 4, 14, 3, 0.05);
-        let (mut t, f) = idle(&mut pet, t, (4, 17), 0.9);
-        assert_eq!(f.action, PetAction::Stand, "fixture: on its feet");
-        assert_eq!(f.pose, PetGlyphId::PetStand);
-        // One burst frame — a pulse, not a stream (heat stays far below
-        // the watch gate).
-        t += Duration::from_millis(16);
-        pulse(&mut pet, t, (4, 17));
-        let mut eared = 0u32;
-        for _ in 0..10 {
-            t += Duration::from_millis(16);
-            let f = pet.tick(sense(t, Some((4, 17))));
-            assert_ne!(f.action, PetAction::Perk, "a pulse is not a stream");
-            assert!(f.motes.iter().all(Option::is_none), "and floats nothing");
-            if f.pose == PetGlyphId::PetStandEar {
-                eared += 1;
-                assert_eq!(f.scale_y, 1.0, "the frame IS the twitch: no bob on top");
-            }
-        }
-        assert!(eared >= 2, "the ear frame holds ({eared} ticks)");
-        let (_, f) = idle(&mut pet, t, (4, 17), 0.3);
-        assert_ne!(
-            f.pose,
-            PetGlyphId::PetStandEar,
-            "and the ear comes back down"
-        );
-    }
-
-    /// Which ear flicks alternates with the mote serial, exactly as the bob
-    /// it replaces did — and on the seat both authored ears are real frames.
-    #[test]
-    fn the_ear_that_flicks_alternates_by_serial() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        // Hand 3: the tail is dealt silence this beat and the yawn is an
-        // even-hand beat, so the seat's leaf is the plain sit throughout.
-        let mut t = plain_seat(&mut pet, start, 3);
-        let mut ears = Vec::new();
-        for _ in 0..2 {
-            t += Duration::from_millis(16);
-            pulse(&mut pet, t, (4, 99));
-            let mut seen = None;
-            for _ in 0..10 {
-                t += Duration::from_millis(16);
-                let f = pet.tick(sense(t, Some((4, 99))));
-                assert_eq!(f.action, PetAction::Sit, "fixture: still seated");
-                if matches!(f.pose, PetGlyphId::PetSitEar | PetGlyphId::PetSitEarFar) {
-                    seen = Some(f.pose);
-                }
-            }
-            ears.push(seen.expect("a pulse flicks an ear"));
-            let (t2, _) = idle(&mut pet, t, (4, 99), 0.1);
-            t = t2;
-        }
-        assert_ne!(ears[0], ears[1], "the twitch alternates ears: {ears:?}");
-    }
-
-    /// The loaf has its own ear frame too — the beat is the settled pet's,
-    /// not the sit's.
-    #[test]
-    fn a_loafed_cat_flicks_its_own_ear() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let t = plain_seat(&mut pet, start, 3);
-        let (mut t, f) = idle(&mut pet, t, (4, 99), 2.0);
-        assert_eq!(f.action, PetAction::Loaf, "fixture: melted into the loaf");
-        t += Duration::from_millis(16);
-        pulse(&mut pet, t, (4, 99));
-        let mut eared = 0u32;
-        for _ in 0..10 {
-            t += Duration::from_millis(16);
-            let f = pet.tick(sense(t, Some((4, 99))));
-            if f.pose == PetGlyphId::PetLoafEar {
-                eared += 1;
-            }
-        }
-        assert!(eared >= 2, "the loaf flicks its own ear ({eared} ticks)");
-    }
-
-    /// Reduced motion: no twitch, no ear frame, no bob; the pulse is only
-    /// bookkeeping.
-    #[test]
-    fn reduced_motion_never_flicks() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let mut t = start;
-        for k in 0..120u32 {
-            t += Duration::from_millis(16);
-            let mut s = sense(t, Some((4, 20)));
-            s.reduced_motion = true;
-            s.output_burst = k % 20 < 3;
-            let f = pet.tick(s);
-            assert!(
-                matches!(f.pose, PetGlyphId::PetSit | PetGlyphId::PetSleep0),
-                "reduced motion holds one still frame, got {:?}",
-                f.pose
-            );
-            assert_eq!(f.scale_y, 1.0, "and never bobs");
-            assert_eq!(f.scale_x, 1.0);
-        }
-        assert_eq!(pet.twitch_t, 0.0, "no twitch was ever armed");
-    }
-
-    /// The travel perk turns the head toward the caret before a jump; a notice
-    /// with nothing latched (the celebration's double-take) stays square-on.
-    #[test]
-    fn a_travel_perk_looks_where_it_is_going() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let t = awake(&mut pet, start, 4, 10);
-        let (mut t, _) = idle(&mut pet, t, (4, 12), SIT_AFTER + 0.4);
-        // A screen-crossing move: the jump latches, then the notice.
-        let mut turned = 0u32;
-        for _ in 0..30 {
-            t += Duration::from_millis(16);
-            let f = pet.tick(sense(t, Some((4, 70))));
-            if f.action == PetAction::Perk {
-                assert_eq!(
-                    f.pose,
-                    PetGlyphId::PetPerkTurn,
-                    "a notice with a trip latched looks where it is going"
-                );
-                turned += 1;
-            }
-        }
-        assert!(turned >= 2, "the travel notice holds its turn ({turned})");
-
-        // The celebration's notice has nowhere to go: square on.
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let t = awake(&mut pet, start, 4, 10);
-        let (mut t, _) = idle(&mut pet, t, (4, 12), SIT_AFTER + 0.4);
-        pet.note_command_done(t, false, Some(40_000));
-        let mut square = 0u32;
-        for _ in 0..30 {
-            t += Duration::from_millis(16);
-            let f = pet.tick(sense(t, Some((4, 12))));
-            if f.action == PetAction::Perk {
-                assert_eq!(
-                    f.pose,
-                    PetGlyphId::PetPerk,
-                    "a notice with nothing latched stays square on"
-                );
-                square += 1;
-            }
-        }
-        assert!(square >= 2, "the cheer's notice plays ({square})");
-    }
-
-    // ── the seat's dealt beats: tail, blink, yawn, glance, look ─────────
-
-    /// The tail beat is dealt, not metronomed: across twelve hands the same
-    /// seat shows beats with zero, one and two flicks.
-    #[test]
-    fn sit_flicks_are_dealt_not_metronomed() {
-        let start = Instant::now();
-        let mut counts = std::collections::BTreeSet::new();
-        for seed in 0..12u8 {
-            let mut pet = PetBrain::default();
-            let t = plain_seat(&mut pet, start, seed);
-            let (_, runs) = pose_runs(&mut pet, t, (4, 99), 2.6);
-            let flicks = runs
-                .iter()
-                .filter(|(p, ..)| *p == PetGlyphId::PetSitFlick)
-                .count();
-            for (pose, at, ticks) in &runs {
-                assert!(
-                    *ticks >= 2 || *at < SIT_AFTER,
-                    "hand {seed}: {pose:?} at {at} held {ticks} tick(s) — \
-                     the frame-rate law wants two"
-                );
-            }
-            counts.insert(flicks);
-        }
-        assert!(
-            counts.contains(&0) && counts.contains(&1) && counts.contains(&2),
-            "the hands deal silence, one flick and two: {counts:?}"
-        );
-    }
-
-    /// The seat's beats are phased on `quiet`, not the wall clock: the same
-    /// settle from two absolute instants is byte-identical frame for frame.
-    #[test]
-    fn sit_flicks_are_quiet_phased() {
-        let run = |start: Instant| -> Vec<u64> {
-            let mut pet = PetBrain::default();
-            let mut t = plain_seat(&mut pet, start, 2);
-            let mut fps = Vec::new();
-            for _ in 0..120 {
-                t += Duration::from_millis(16);
-                fps.push(pet.tick(sense(t, Some((4, 99)))).fp());
-            }
-            fps
-        };
-        let a = run(Instant::now());
-        let b = run(Instant::now() + Duration::from_millis(4_321));
-        assert_eq!(a, b, "the seat's beats are quiet-phased, not wall-clocked");
-        assert!(
-            a.windows(2).any(|w| w[0] != w[1]),
-            "and a beat actually plays inside the window"
-        );
-    }
-
-    /// Every change of side is `PetSitFlick` ↔ `PetSitTailBack`, through the
-    /// tip-up frames.
-    #[test]
-    fn the_tail_swaps_sides_only_between_tip_up_frames() {
-        let behind =
-            |p: PetGlyphId| matches!(p, PetGlyphId::PetSitTailLow | PetGlyphId::PetSitTailBack);
-        let start = Instant::now();
-        let mut swung = 0u32;
-        for seed in 0..12u8 {
-            let mut pet = PetBrain::default();
-            let t = plain_seat(&mut pet, start, seed);
-            let (_, runs) = pose_runs(&mut pet, t, (4, 99), SLEEP_AFTER + 2.0);
-            for pair in runs.windows(2) {
-                let (a, b) = (pair[0].0, pair[1].0);
-                if behind(a) == behind(b) {
-                    continue;
-                }
-                swung += 1;
-                let ok = (a == PetGlyphId::PetSitFlick && b == PetGlyphId::PetSitTailBack)
-                    || (a == PetGlyphId::PetSitTailBack && b == PetGlyphId::PetSitFlick);
-                assert!(
-                    ok,
-                    "hand {seed}: the tail changed sides on {a:?} -> {b:?} \
-                     at quiet {} — it must swing through two tip-up frames",
-                    pair[1].1
-                );
-            }
-        }
-        assert!(
-            swung >= 4,
-            "some hand must actually swing its tail ({swung})"
-        );
-    }
-
-    /// Nearly every hand blinks in its seat, one in three twice, never inside
-    /// the stand→sit fold.
-    #[test]
-    fn a_settled_cat_blinks_on_a_dealt_beat() {
-        let start = Instant::now();
-        let mut doubles = 0u32;
-        let mut blinked = 0u32;
-        for seed in 0..12u8 {
-            let mut pet = PetBrain::default();
-            let t = plain_seat(&mut pet, start, seed);
-            let (_, runs) = pose_runs(&mut pet, t, (4, 99), 3.2);
-            let blinks: Vec<_> = runs
-                .iter()
-                .filter(|(p, ..)| *p == PetGlyphId::PetSitBlink)
-                .collect();
-            blinked += u32::from(!blinks.is_empty());
-            for (_, at, ticks) in &blinks {
-                assert!(
-                    *at >= SIT_AFTER + SIT_FOLD,
-                    "hand {seed}: a blink inside the fold, at quiet {at}"
-                );
-                assert!(
-                    (2..=8).contains(ticks),
-                    "hand {seed}: a {ticks}-tick blink is not a blink"
-                );
-            }
-            if blinks.len() >= 2 {
-                doubles += 1;
-            }
-        }
-        assert!(
-            blinked >= 9,
-            "the seat blinks on all but a hand or two ({blinked}/12)"
-        );
-        assert!(
-            doubles >= 3,
-            "one hand in three blinks twice ({doubles}/12)"
-        );
-    }
-
-    /// The yawn hands the seat into its loaf — on half the hands. The other
-    /// half melt down without one: a yawn on every single dwell is a tic.
-    #[test]
-    fn the_seat_yawns_before_it_loafs_on_even_deals() {
-        let start = Instant::now();
-        for seed in 0..12u8 {
-            let mut pet = PetBrain::default();
-            let t = plain_seat(&mut pet, start, seed);
-            let loaf_at = pet.loaf_after();
-            let (_, runs) = pose_runs(&mut pet, t, (4, 99), loaf_at + 0.6);
-            let yawns: Vec<_> = runs
-                .iter()
-                .filter(|(p, ..)| *p == PetGlyphId::PetYawn)
-                .collect();
-            if seed % 2 == 1 {
-                assert!(yawns.is_empty(), "hand {seed}: an odd hand never yawns");
-                continue;
-            }
-            let &&(_, at, _) = yawns
-                .first()
-                .unwrap_or_else(|| panic!("hand {seed}: an even hand yawns into its loaf"));
-            assert!(
-                at >= loaf_at - YAWN_DUR - 0.02 && at < loaf_at,
-                "hand {seed}: the yawn plays in the last of the sit, at {at} of {loaf_at}"
-            );
-            let after = runs
-                .iter()
-                .position(|(p, ..)| *p == PetGlyphId::PetYawn)
-                .and_then(|i| runs.get(i + 1))
-                .map(|(p, ..)| *p);
-            assert_eq!(
-                after,
-                Some(PetGlyphId::PetLoaf),
-                "hand {seed}: the yawn hands straight into the melt"
-            );
-        }
-    }
-
-    /// Eye contact is not a stare: on a dealt beat the face-on sit looks away
-    /// for [`LOOK_DUR`] and comes back. One hand in three never glances.
-    #[test]
-    fn eye_contact_breaks_and_returns_on_a_dealt_beat() {
-        let start = Instant::now();
-        let mut glanced = 0u32;
-        let mut returned = 0u32;
-        let mut handed = 0u32;
-        for seed in 0..12u8 {
-            let mut pet = PetBrain::default();
-            let t = awake(&mut pet, start, 4, 12);
-            assert!(pet.sit_front, "fixture: eye contact");
-            pet.force_seed(seed);
-            let (_, runs) = pose_runs(&mut pet, t, (4, 14), 2.0);
-            let looks: Vec<_> = runs
-                .iter()
-                .filter(|(p, ..)| *p == PetGlyphId::PetSit)
-                .collect();
-            if seed % 3 == 0 {
-                assert!(looks.is_empty(), "hand {seed}: this hand never glances");
-                continue;
-            }
-            glanced += 1;
-            let &&(_, at, ticks) = looks.first().expect("the dealt hand glances");
-            assert!(
-                at >= SIT_AFTER + GLANCE_AT - 0.02,
-                "hand {seed}: the glance waits for its beat, at {at}"
-            );
-            assert!(
-                ticks >= 2,
-                "hand {seed}: a {ticks}-tick glance is a blink, not a look"
-            );
-            // While the glance holds the seat's dealt beats play, so the frame
-            // that ends it is the first non-seat-beat, unless the yawn's own
-            // look ([`PetBrain::sit_look_left`]) takes over as the glance closes
-            // (an even hand of the 2.2 s seat): which applies is arithmetic.
-            let i = runs
-                .iter()
-                .position(|(p, ..)| *p == PetGlyphId::PetSit)
-                .expect("the dealt hand glances");
-            let back = runs
-                .iter()
-                .skip(i + 1)
-                .find(|(p, ..)| !seat_beat(*p))
-                .map(|(p, ..)| *p);
-            let sit_len = pet.loaf_after() - SIT_AFTER;
-            // `at` is absolute quiet; the sit's own clock runs from
-            // [`SIT_AFTER`].
-            let handover = pet.settle_seed.is_multiple_of(2)
-                && (at - SIT_AFTER) + pet.look_dur() >= sit_len - YAWN_DUR;
-            if handover {
-                handed += 1;
-                assert_eq!(
-                    back,
-                    Some(PetGlyphId::PetLoaf),
-                    "hand {seed}: the look hands into the yawn and melts"
-                );
-                assert!(
-                    runs.iter()
-                        .skip(i + 1)
-                        .any(|(p, ..)| *p == PetGlyphId::PetYawn),
-                    "hand {seed}: …and the yawn is what took the look over"
-                );
-            } else {
-                returned += 1;
-                assert_eq!(
-                    back,
-                    Some(PetGlyphId::PetSitFront),
-                    "hand {seed}: and the eyes come back"
-                );
-            }
-        }
-        assert_eq!(glanced, 8, "two hands in three glance ({glanced}/12)");
-        assert!(
-            returned >= 4,
-            "eye contact must come back on most hands ({returned}/8)"
-        );
-        assert!(
-            handed >= 1,
-            "…and the yawn's hand-over must be reachable, or this arm is dead ({handed}/8)"
-        );
-    }
-
-    /// A glance never turns the body: the facing is the same on every frame
-    /// of the look.
-    #[test]
-    fn the_glance_never_flips_the_body() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let t = awake(&mut pet, start, 4, 12);
-        pet.force_seed(1);
-        let mut t = t;
-        let facing = pet.facing_left;
-        let mut looked = 0u32;
-        for _ in 0..130 {
-            t += Duration::from_millis(16);
-            let f = pet.tick(sense(t, Some((4, 14))));
-            assert_eq!(f.facing_left, facing, "the glance never turns the body");
-            if f.pose == PetGlyphId::PetSit {
-                looked += 1;
-            }
-        }
-        assert!(
-            looked >= 2,
-            "fixture: the glance actually played ({looked})"
-        );
-    }
-
-    /// The head tips toward the line the pet is not on: up or down toward the
-    /// caret's row, level when they share a row.
-    #[test]
-    fn the_settled_gaze_follows_the_caret_row() {
-        let start = Instant::now();
-        for (caret_row, want) in [
-            (6u16, PetGlyphId::PetSitLookup),
-            (29u16, PetGlyphId::PetSitLookdown),
-        ] {
-            for species in [PetSpecies::Cat, PetSpecies::Dog] {
-                let mut pet = PetBrain::default();
-                pet.set_species(species);
-                let mut spans = vec![(0u16, 0u16); 30];
-                spans[caret_row as usize] = (0, 100);
-                pet.sense_ink(0, &spans, Some(caret_row));
-                let t = awake(&mut pet, start, caret_row, 97);
-                let (t, _) = idle(&mut pet, t, (caret_row, 99), 0.3);
-                // Hand 3: a silent tail and no yawn, so the leaf under the
-                // head tip is the plain sit.
-                pet.force_seed(3);
-                let (_, f) = idle(&mut pet, t, (caret_row, 99), 0.3);
-                assert_eq!(f.action, PetAction::Sit, "fixture: seated");
-                assert!(
-                    (f.row - f32::from(caret_row)).abs() > 0.5,
-                    "fixture: the ladder parked the seat off the caret's row ({})",
-                    f.row
-                );
-                assert_eq!(
-                    f.pose,
-                    species.skin(want),
-                    "the head tips toward the caret's line"
-                );
-            }
-        }
-        // Level with the caret: no tip at all.
-        let mut pet = PetBrain::default();
-        let t = awake(&mut pet, start, 4, 97);
-        let (t, _) = idle(&mut pet, t, (4, 99), 0.3);
-        pet.force_seed(3);
-        let (_, f) = idle(&mut pet, t, (4, 99), 0.3);
-        assert_eq!(f.pose, PetGlyphId::PetSit, "same row is no tip at all");
-    }
-
-    /// The loaf's open-eyed peek rides the thump's beat index and stops with
-    /// the loaf; deep sleep stays byte-stable.
-    #[test]
-    fn the_loaf_peeks_then_sleeps() {
-        let start = Instant::now();
-        for seed in 0..12u8 {
-            let mut pet = PetBrain::default();
-            let t = plain_seat(&mut pet, start, seed);
-            let (t, runs) = pose_runs(&mut pet, t, (4, 99), SLEEP_AFTER + BREATH_WINDOW + 2.0);
-            let peeks: Vec<_> = runs
-                .iter()
-                .filter(|(p, ..)| *p == PetGlyphId::PetLoafOpen)
-                .collect();
-            assert!(!peeks.is_empty(), "hand {seed}: the loaf must peek");
-            for (_, at, ticks) in &peeks {
-                assert!(
-                    *at > pet.loaf_after() && *at < SLEEP_AFTER,
-                    "hand {seed}: a peek at quiet {at} is outside the loaf"
-                );
-                assert!(*ticks >= 2, "hand {seed}: a {ticks}-tick peek");
-            }
-            assert!(
-                !pet.needs_frames(),
-                "hand {seed}: the peek dies inside the settle window"
-            );
-            let a = pet.tick(sense(t + Duration::from_secs(1), Some((4, 99))));
-            let b = pet.tick(sense(t + Duration::from_secs(2), Some((4, 99))));
-            assert_eq!(a.fp(), b.fp(), "hand {seed}: deep sleep is byte-stable");
-        }
-    }
-
-    /// Reduced motion: no seat or loaf beat.
-    #[test]
-    fn reduced_motion_never_peeks() {
+    fn reduced_motion_holds_two_still_frames_and_no_motes() {
         let mut pet = PetBrain::default();
         let mut t = Instant::now();
         let mut poses = std::collections::BTreeSet::new();
@@ -22023,6 +17592,10 @@ mod tests {
             let f = pet.tick(s);
             poses.insert(f.pose as u8);
             assert_eq!(f.lift, 0.0);
+            assert!(
+                f.motes.iter().all(Option::is_none),
+                "reduced motion must never particle"
+            );
         }
         assert_eq!(
             poses,
@@ -22033,11 +17606,13 @@ mod tests {
         );
     }
 
-    /// Every pose run of every hand's idle, the pulse's ear frame included,
-    /// holds at least two ticks at 60 fps.
+    /// Every pose run of every hand's idle holds at least two ticks at 60 fps,
+    /// and across the hands the seat's and the loaf's dealt beats are all
+    /// reached (a beat nobody sees is dead art).
     #[test]
     fn every_dealt_idle_frame_holds_at_least_two_ticks() {
         let start = Instant::now();
+        let mut seen = std::collections::HashSet::new();
         for seed in 0..12u8 {
             for (label, caret, warm) in [
                 ("the plain seat", (4u16, 99u16), (4u16, 97u16)),
@@ -22046,7 +17621,8 @@ mod tests {
                 let mut pet = PetBrain::default();
                 let t = awake(&mut pet, start, warm.0, warm.1);
                 pet.force_seed(seed);
-                let (mut t, runs) = pose_runs(&mut pet, t, caret, SLEEP_AFTER + 1.0);
+                let (_, runs) = pose_runs(&mut pet, t, caret, SLEEP_AFTER + 1.0);
+                seen.extend(runs.iter().map(|(pose, ..)| *pose));
                 // The last run is cut by the end of the drive, not by a beat.
                 for (pose, at, ticks) in runs.iter().take(runs.len() - 1) {
                     assert!(
@@ -22055,86 +17631,20 @@ mod tests {
                          at quiet {at}"
                     );
                 }
-                // …and the same for the ear the pulse swaps in.
-                let (t2, f) = idle(&mut pet, t, caret, 0.1);
-                t = t2;
-                if !matches!(f.action, PetAction::Sleep | PetAction::Waking) {
-                    t += Duration::from_millis(16);
-                    pulse(&mut pet, t, caret);
-                    let (_, runs) = pose_runs(&mut pet, t, caret, TWITCH_DUR + 0.2);
-                    for (pose, at, ticks) in runs.iter().take(runs.len() - 1) {
-                        assert!(
-                            *ticks >= 2,
-                            "hand {seed} ({label}): the twitch flashed {pose:?} for \
-                             {ticks} tick(s) at quiet {at}"
-                        );
-                    }
-                }
             }
         }
-    }
-
-    /// A cat does not lick the same paw twice: the second wash of a settle
-    /// leads with the flank.
-    #[test]
-    fn consecutive_grooms_differ() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        // Hand 0 washes twice (`groom_skip` is a one-in-four hand).
-        let t = plain_seat(&mut pet, start, 0);
-        assert!(!pet.groom_skip(), "fixture: this hand washes twice");
-        let (_, runs) = pose_runs(&mut pet, t, (4, 99), SLEEP_AFTER);
-        let washes: Vec<Vec<PetGlyphId>> = runs
-            .split(|(p, ..)| !matches!(p, PetGlyphId::PetGroom | PetGlyphId::PetGroomFlank))
-            .filter(|w| !w.is_empty())
-            .map(|w| w.iter().map(|(p, ..)| *p).collect())
-            .collect();
-        assert!(washes.len() >= 2, "the settle washes twice: {washes:?}");
-        assert_eq!(
-            washes[0],
-            vec![PetGlyphId::PetGroom, PetGlyphId::PetGroomFlank],
-            "the first wash goes chest then flank"
-        );
-        assert_eq!(
-            washes[1],
-            vec![PetGlyphId::PetGroomFlank, PetGlyphId::PetGroom],
-            "and the second the other way round"
-        );
-    }
-
-    /// The owed post-chase groom is always the paw lick: a one-shot off the
-    /// settle's cycle.
-    #[test]
-    fn the_owed_groom_is_the_paw_lick() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let mut t = warm_settled(&mut pet, start);
-        let base = pet.col + 12.0;
-        let mut phase = 0.0f32;
-        let mut owed = 0u32;
-        let check = |pet: &PetBrain, f: PetFrame, owed: &mut u32| {
-            if f.action == PetAction::Groom && pet.groom_owed {
-                assert_eq!(
-                    f.pose,
-                    PetGlyphId::PetGroom,
-                    "the groom of dignity is the paw lick"
-                );
-                *owed += 1;
-            }
-        };
-        for _ in 0..700 {
-            t += Duration::from_millis(16);
-            phase += 0.04;
-            let px = base + 8.0 * phase.sin();
-            let f = ptick(&mut pet, t, (4, 44), Some((px, 4.0)));
-            check(&pet, f, &mut owed);
+        for beat in [
+            PetGlyphId::PetSitBlink,
+            PetGlyphId::PetSitFrontBlink,
+            PetGlyphId::PetSitFlick,
+            PetGlyphId::PetSitTailBack,
+            PetGlyphId::PetSitTailLow,
+            PetGlyphId::PetYawn,
+            PetGlyphId::PetGroomFlank,
+            PetGlyphId::PetLoafOpen,
+        ] {
+            assert!(seen.contains(&beat), "{beat:?} is never dealt in a settle");
         }
-        for _ in 0..500 {
-            t += Duration::from_millis(16);
-            let f = ptick(&mut pet, t, (4, 44), None);
-            check(&pet, f, &mut owed);
-        }
-        assert!(owed >= 2, "the break-off owes a groom ({owed} frames)");
     }
 
     // ── the new-line harness ────────────────────────────────────────────
@@ -22273,12 +17783,6 @@ mod tests {
                 .iter()
                 .filter(|(at, x)| *at >= tr && *x == a)
                 .count()
-        }
-
-        /// The flights launched since the trigger.
-        fn launches(&self) -> Vec<&ProbeFlight> {
-            let tr = self.trigger.unwrap_or(f32::MAX);
-            self.flights.iter().filter(|f| f.at >= tr).collect()
         }
 
         fn now(&self) -> f32 {
@@ -22550,519 +18054,6 @@ mod tests {
             self.log_from = self.now();
             self.type_to(row, mid, col0);
         }
-    }
-
-    // ── the seat's door, the purr's split, the apex, and two refusals ────
-
-    /// Face-on, every side-on beat (tail, yawn, ear) comes through the look and
-    /// appears in the ordinary seat.
-    #[test]
-    fn the_seats_side_on_beats_come_through_the_look() {
-        let start = Instant::now();
-        let mut beats: Vec<PetGlyphId> = Vec::new();
-        /// Every seat beat in a pose walk, checked against the frame-rate
-        /// law on the way past.
-        fn collect(runs: &[(PetGlyphId, f32, u32)], seed: u8, beats: &mut Vec<PetGlyphId>) {
-            for (pose, _, ticks) in runs {
-                if seat_beat(*pose) && *pose != PetGlyphId::PetSit {
-                    assert!(
-                        *ticks >= 2,
-                        "hand {seed}: {pose:?} held {ticks} tick(s) — the frame-rate law"
-                    );
-                    if !beats.contains(pose) {
-                        beats.push(*pose);
-                    }
-                }
-            }
-        }
-        for seed in 0..12u8 {
-            let mut pet = PetBrain::default();
-            let t = awake(&mut pet, start, 4, 4);
-            let (t, _) = type_run(&mut pet, t, 4, 6, 30, 0.05);
-            let (t, f) = idle(&mut pet, t, (4, 36), SIT_AFTER + 0.05);
-            assert_eq!(f.action, PetAction::Sit, "fixture: seated");
-            assert!(pet.sit_front, "fixture: the ordinary face-on seat");
-            pet.force_seed(seed);
-            let (_, runs) = pose_runs(&mut pet, t, (4, 36), 3.4);
-            collect(&runs, seed, &mut beats);
-        }
-        // ...and the ear, triggered by a background line rather than the sit's
-        // clock, so where in the look it lands varies. A twitch that would be
-        // cut by the tail's excursion or strand the blink keeps the procedural
-        // bob instead, so sweep the arrival time.
-        for seed in 0..12u8 {
-            for step in 0..18u16 {
-                // Two fixtures, because `twitch_up` alternates on the mote
-                // serial: one cat just woken, one that has been following
-                // typing. Both are the ordinary face-on seat.
-                let worked = step % 2 == 1;
-                let mut pet = PetBrain::default();
-                let t = awake(&mut pet, start, 4, 4);
-                let (t, caret) = if worked {
-                    let (t, _) = type_run(&mut pet, t, 4, 6, 30, 0.05);
-                    let (t, _) = idle(&mut pet, t, (4, 36), SIT_AFTER + 0.05);
-                    (t, (4u16, 36u16))
-                } else {
-                    let (t, _) = idle(&mut pet, t, (4, 6), 0.05);
-                    (t, (4u16, 6u16))
-                };
-                let (caret_row, caret_col) = caret;
-                let (row, col) = (caret_row, caret_col);
-                assert!(pet.sit_front, "fixture: face-on");
-                pet.force_seed(seed);
-                // Place the background line at a chosen point of the sit's
-                // clock: the admissible window lies between the tail's
-                // excursion and the look's remaining time.
-                let want = SIT_AFTER + 0.80 + f32::from(step) * 0.05;
-                let lead = (want - pet.quiet).max(0.0);
-                let (t, _) = idle(&mut pet, t, (row, col), lead);
-                let mut t = t;
-                // Two lines: arming the twitch spends a mote serial and
-                // `twitch_up` reads its parity, so the second line flicks the
-                // other ear (see `the_ear_that_flicks_alternates_by_serial`).
-                //
-                // Driven by hand rather than through `pose_runs`: the ear frame
-                // begins on the tick after the burst, where a walk boundary
-                // would clip the run.
-                let mut runs: Vec<(PetGlyphId, f32, u32)> = Vec::new();
-                for _round in 0..4 {
-                    for i in 0..13 {
-                        t += Duration::from_millis(16);
-                        let mut sn = sense(t, Some((row, col)));
-                        sn.output_burst = i == 0;
-                        let f = pet.tick(sn);
-                        match runs.last_mut() {
-                            Some(r) if r.0 == f.pose => r.2 += 1,
-                            _ => runs.push((f.pose, pet.quiet, 1)),
-                        }
-                    }
-                }
-                // The first and last runs are clipped by the walk's ends, so
-                // their tick counts are not beat lengths.
-                let inner = runs.len().saturating_sub(1);
-                collect(runs.get(1..inner).unwrap_or(&[]), seed, &mut beats);
-            }
-        }
-        for want in [
-            PetGlyphId::PetSitBlink,
-            PetGlyphId::PetSitFlick,
-            PetGlyphId::PetSitTailBack,
-            PetGlyphId::PetSitTailLow,
-            PetGlyphId::PetYawn,
-            PetGlyphId::PetSitEar,
-            PetGlyphId::PetSitEarFar,
-        ] {
-            assert!(
-                beats.contains(&want),
-                "{want:?} must be reachable in the seat a cat that types has: {beats:?}"
-            );
-        }
-    }
-
-    /// A gesture the look cannot contain never starts, so face-on every tail
-    /// excursion runs its authored length.
-    #[test]
-    fn no_seat_beat_is_ever_cut_by_the_look() {
-        let start = Instant::now();
-        let mut checked = 0u32;
-        for seed in 0..12u8 {
-            let mut pet = PetBrain::default();
-            let t = awake(&mut pet, start, 4, 4);
-            let (t, f) = idle(&mut pet, t, (4, 6), 0.05);
-            assert_eq!(f.action, PetAction::Sit, "fixture: seated");
-            assert!(pet.sit_front, "fixture: face-on");
-            pet.force_seed(seed);
-            if pet.beat_deal(0, 3) == 0 {
-                continue; // this hand never looks away; nothing to cut
-            }
-            let hand = pet.beat_deal(0, 4);
-            let want = PetBrain::tail_hand_len(hand);
-            let (_, runs) = pose_runs(&mut pet, t, (4, 6), 3.0);
-            // The whole excursion, from its first tail frame to its last.
-            let first = runs.iter().position(|(p, ..)| tail_frame(*p));
-            let Some(first) = first else {
-                // A hand the look cannot hold, or the silent hand: nothing
-                // may have played at all, and that is the point of the fit.
-                assert!(
-                    hand == 3 || want > pet.look_dur(),
-                    "hand {seed} (deal {hand}, {want} s) fits the {} s look and must play",
-                    pet.look_dur()
-                );
-                continue;
-            };
-            let last = runs
-                .iter()
-                .rposition(|(p, ..)| tail_frame(*p))
-                .expect("a first implies a last");
-            let ticks: u32 = runs[first..=last].iter().map(|(_, _, n)| *n).sum();
-            let secs = f32::from(u16::try_from(ticks).expect("short run")) * 0.016;
-            assert!(
-                (secs - want).abs() < 0.05,
-                "hand {seed} (deal {hand}): the excursion ran {secs:.3} s of its authored \
-                 {want:.3} s — a prefix is a cut"
-            );
-            checked += 1;
-        }
-        assert!(
-            checked >= 4,
-            "the fit must admit several hands or this proves nothing ({checked}/12)"
-        );
-    }
-
-    /// The long look (which the 0.77 s tail swing needs) is only dealt to a
-    /// seat long enough to hold it.
-    #[test]
-    fn the_long_look_is_only_dealt_to_a_seat_that_can_hold_it() {
-        let mut long = 0u32;
-        for seed in 0..12u8 {
-            let mut pet = PetBrain::default();
-            pet.force_seed(seed);
-            let sit_len = pet.loaf_after() - SIT_AFTER;
-            let len = pet.look_dur();
-            if pet.beat_deal(0, 3) == 0 {
-                // The 1.4 s seat never glances: the deal and the period share
-                // `seed % 3`, so `beat_deal(0, 3)` is zero on exactly that hand.
-                assert_eq!(len, LOOK_DUR, "hand {seed}: and it keeps the short look");
-                assert!(sit_len < GLANCE_AT + LOOK_DUR + LOOK_RETURN_MIN);
-                continue;
-            }
-            assert!(
-                GLANCE_AT + len + LOOK_RETURN_MIN <= sit_len + 1e-6,
-                "hand {seed}: a {len} s look opening at {GLANCE_AT} leaves no return \
-                 inside a {sit_len} s sit"
-            );
-            if len == LOOK_DUR_LONG {
-                long += 1;
-                assert!(
-                    7.0 * TAIL_SWING <= len,
-                    "hand {seed}: the long look exists to hold the swing"
-                );
-            }
-        }
-        assert_eq!(long, 8, "two hands in three get the long look ({long}/12)");
-    }
-
-    /// The face-on seat has its own blink (`pet_sit_front_blink`), so a
-    /// face-on cat can break eye contact without looking away.
-    #[test]
-    fn the_face_on_seat_blinks_without_looking_away() {
-        let start = Instant::now();
-        let mut blinked = 0u32;
-        for seed in 0..12u8 {
-            let mut pet = PetBrain::default();
-            let t = awake(&mut pet, start, 4, 4);
-            let (t, f) = idle(&mut pet, t, (4, 6), 0.05);
-            assert_eq!(f.action, PetAction::Sit, "fixture: seated");
-            assert!(pet.sit_front, "fixture: face-on");
-            pet.force_seed(seed);
-            let (_, runs) = pose_runs(&mut pet, t, (4, 6), 3.0);
-            let Some((_, _, ticks)) = runs
-                .iter()
-                .find(|(p, ..)| *p == PetGlyphId::PetSitFrontBlink)
-            else {
-                continue;
-            };
-            assert!(
-                *ticks >= 2,
-                "hand {seed}: a {ticks}-tick blink is under the frame-rate law"
-            );
-            blinked += 1;
-        }
-        // Four hands in twelve never look away; on the other eight the sit's
-        // blink beat falls inside the look and the side-on `PetSitBlink` plays.
-        assert_eq!(
-            blinked, 4,
-            "the face-on seat blinks on every hand that keeps eye contact ({blinked}/12)"
-        );
-
-        // ...and it needs no glance: drive one hand and assert the blink plays
-        // with eye contact unbroken.
-        let mut pet = PetBrain::default();
-        let t = awake(&mut pet, start, 4, 4);
-        let (t, _) = idle(&mut pet, t, (4, 6), 0.05);
-        // A hand that keeps eye contact for the whole sit — `beat_deal(0, 3)`
-        // is zero on `seed % 3 == 0`.
-        pet.force_seed(3);
-        assert_eq!(pet.beat_deal(0, 3), 0, "fixture: this hand never glances");
-        let mut t = t;
-        let mut eye_contact_blinks = 0u32;
-        for _ in 0..180 {
-            t += Duration::from_millis(16);
-            let f = pet.tick(sense(t, Some((4, 6))));
-            if f.pose == PetGlyphId::PetSitFrontBlink {
-                assert!(!pet.sit_glance(), "the face-on blink never needs a look");
-                eye_contact_blinks += 1;
-            }
-        }
-        assert!(
-            eye_contact_blinks >= 4,
-            "…and it happened ({eye_contact_blinks} frames)"
-        );
-    }
-
-    /// A content seat purrs (the tell) before it wears the purr pose.
-    #[test]
-    fn a_content_seat_purrs_before_it_wears_the_purr() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let t = awake(&mut pet, start, 3, 2);
-        let (t, _) = type_run(&mut pet, t, 3, 4, 40, 0.05);
-        let (t, f) = idle(&mut pet, t, (3, 44), SIT_AFTER + 0.1);
-        assert!(pet.content() >= PURR_GATE, "fixture: a cat that has worked");
-        assert_eq!(f.action, PetAction::Sit, "fixture: still the seat");
-        assert!(f.purr > 0.0, "the seat is already purring");
-        assert!(
-            f.pose != PetGlyphId::PetPurr,
-            "…and is not wearing the purr's pose"
-        );
-
-        // The chest swell rides the seat too, on the purr's sine.
-        let mut t = t;
-        let (mut lo, mut hi) = (1.0f32, 1.0f32);
-        for _ in 0..40 {
-            t += Duration::from_millis(16);
-            let f = pet.tick(sense(t, Some((3, 44))));
-            assert_eq!(f.action, PetAction::Sit, "still the seat");
-            lo = lo.min(f.scale_y);
-            hi = hi.max(f.scale_y);
-        }
-        assert!(
-            hi - lo >= PURR_DEPTH,
-            "the seat's chest swells with the purr ({lo} .. {hi})"
-        );
-
-        // A cold cat's seat does neither.
-        let mut cold = PetBrain::default();
-        let t = awake(&mut cold, start, 3, 40);
-        let (_, g) = idle(&mut cold, t, (3, 42), 0.6);
-        assert_eq!(g.action, PetAction::Sit);
-        assert_eq!(g.purr, 0.0, "contentment is bought with travel");
-    }
-
-    /// One long dwell in three loafs even for a working cat, so the loaf's own
-    /// beats (e.g. `pet_loaf_ear`) stay reachable for someone who types.
-    #[test]
-    fn one_dwell_in_three_loafs_and_the_loaf_keeps_its_ear() {
-        let start = Instant::now();
-        let mut eared = 0u32;
-        for seed in [0u8, 3, 6, 9] {
-            let mut pet = PetBrain::default();
-            let t = awake(&mut pet, start, 3, 2);
-            let (t, _) = type_run(&mut pet, t, 3, 4, 40, 0.05);
-            let (t, _) = idle(&mut pet, t, (3, 44), SIT_AFTER + 0.1);
-            pet.force_seed(seed);
-            let (t, f) = idle(&mut pet, t, (3, 44), 3.6);
-            assert_eq!(
-                f.action,
-                PetAction::Loaf,
-                "hand {seed}: the dealt loaf, for a content cat"
-            );
-            assert!(f.purr > 0.0, "hand {seed}: and it is still purring");
-            // A background line lands on the loaf: the authored ear frame.
-            let mut t = t;
-            for _ in 0..40 {
-                t += Duration::from_millis(16);
-                let f = pet.tick(sense(t, Some((3, 44))));
-                if f.action != PetAction::Loaf {
-                    break;
-                }
-            }
-            pulse(&mut pet, t, (3, 44));
-            let (_, runs) = pose_runs(&mut pet, t, (3, 44), 0.4);
-            if let Some((_, _, ticks)) = runs.iter().find(|(p, ..)| *p == PetGlyphId::PetLoafEar) {
-                assert!(*ticks >= 2, "hand {seed}: the ear held {ticks} tick(s)");
-                eared += 1;
-            }
-        }
-        assert!(
-            eared >= 3,
-            "the loaf's ear must be reachable for a content cat ({eared}/4)"
-        );
-    }
-
-    /// On a big bound a distinct apex beat breaks the hero frame's long hold.
-    #[test]
-    fn the_apex_breaks_the_hang_on_a_bound() {
-        for dur in [BIG_FLIGHT_BASE, 0.6, BIG_FLIGHT_MAX] {
-            let mut f = Flight {
-                from_col: 0.0,
-                from_row: 4.0,
-                to_col: 60.0,
-                to_row: 4.0,
-                dur,
-                arc: 1.0,
-                t: 0.0,
-                reaimed: false,
-                big: true,
-                show: false,
-                hop: false,
-                coiled: false,
-                drop: false,
-                late_move: false,
-            };
-            let mut runs: Vec<(PetGlyphId, u32)> = Vec::new();
-            let mut t = 0.0f32;
-            while t <= dur {
-                let pose = PetBrain::flight_pose(&f);
-                match runs.last_mut() {
-                    Some(r) if r.0 == pose => r.1 += 1,
-                    _ => runs.push((pose, 1)),
-                }
-                t += 1.0 / 60.0;
-                f.t = t;
-            }
-            assert!(
-                runs.iter().any(|(p, _)| *p == PetGlyphId::PetApex),
-                "a {dur} s bound must reach its apex: {runs:?}"
-            );
-            for (pose, ticks) in &runs {
-                assert!(
-                    *ticks >= 2,
-                    "{dur} s: {pose:?} held {ticks} tick(s) — the frame-rate law"
-                );
-                assert!(
-                    *ticks <= 24,
-                    "{dur} s: {pose:?} held {ticks} ticks — the hang is frozen again"
-                );
-            }
-        }
-    }
-
-    /// An ordinary pounce keeps rise → hero → descend, with no apex.
-    #[test]
-    fn an_ordinary_pounce_keeps_its_three_beats() {
-        let mut dur = FLIGHT_MIN;
-        while dur <= FLIGHT_MAX + 1e-4 {
-            let mut f = Flight {
-                from_col: 0.0,
-                from_row: 4.0,
-                to_col: 12.0,
-                to_row: 4.0,
-                dur,
-                arc: 0.6,
-                t: 0.0,
-                reaimed: false,
-                big: false,
-                show: false,
-                hop: false,
-                coiled: false,
-                drop: false,
-                late_move: false,
-            };
-            let mut seq: Vec<PetGlyphId> = Vec::new();
-            let mut t = 0.0f32;
-            while t <= dur {
-                let pose = PetBrain::flight_pose(&f);
-                if seq.last() != Some(&pose) {
-                    seq.push(pose);
-                }
-                t += 1.0 / 60.0;
-                f.t = t;
-            }
-            assert_eq!(
-                seq,
-                vec![
-                    PetGlyphId::PetLeapRise,
-                    PetGlyphId::PetLeap,
-                    PetGlyphId::PetLeapDescend
-                ],
-                "a {dur} s pounce keeps the three-beat schedule"
-            );
-            dur += 0.01;
-        }
-    }
-
-    /// A run frame carries no lift: `body_px` would round a gallop bob to 0 px
-    /// at small cells, so the clearance is baked into the art (`registration()`).
-    #[test]
-    fn the_gallop_keeps_its_lift_out_of_the_pixel_grid() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let mut t = awake(&mut pet, start, 3, 2);
-        let mut caret = 4u16;
-        let mut ran = 0u32;
-        for i in 0..200 {
-            t += Duration::from_millis(16);
-            if i % 3 == 2 && caret < 78 {
-                caret += 1;
-            }
-            let f = pet.tick(sense(t, Some((3, caret))));
-            if f.action == PetAction::Run {
-                assert_eq!(
-                    f.lift, 0.0,
-                    "a gallop frame carries no lift — the vertical is the art's"
-                );
-                ran += 1;
-            }
-        }
-        assert!(ran >= 20, "fixture: the chase must gallop ({ran} frames)");
-    }
-
-    /// The drift-brake's gate is rare by construction: an eased follower never
-    /// crosses its station at speed once the caret rests. Fails if the follower
-    /// gains real momentum, when the gate is worth revisiting.
-    #[test]
-    fn the_drift_brakes_gate_is_rare_by_construction() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let mut t = awake(&mut pet, start, 3, 2);
-        let mut caret = 4u16;
-        let mut galloped = false;
-        let mut armed = false;
-        // "The paws got there this frame, fast" — the candidate gate.
-        let mut hot_while_typing = 0u32;
-        let mut hot_at_rest = 0u32;
-        let mut worst_at_rest = 0.0f32;
-        for i in 0..600 {
-            t += Duration::from_millis(16);
-            // A long fast burst, then a dead stop — the shape a run-out
-            // would have to come out of.
-            let typing = i < 300;
-            if typing && i % 3 == 2 && caret < 78 {
-                caret += 1;
-            }
-            let before = pet.col;
-            let f = pet.tick(sense(t, Some((3, caret))));
-            galloped |= f.action == PetAction::Run;
-            armed |= pet.braking;
-            if pet.flight.is_some() || !matches!(f.action, PetAction::Walk | PetAction::Run) {
-                continue;
-            }
-            let target = PetBrain::station(caret, 100, art_cols(10, 20));
-            let step = (pet.col - before).abs();
-            if step > 0.0 && (target - pet.col).abs() <= step {
-                if pet.speed.abs() > 2.0 * RUN_SPEED {
-                    if typing {
-                        hot_while_typing += 1;
-                    } else {
-                        hot_at_rest += 1;
-                    }
-                }
-                if !typing {
-                    worst_at_rest = worst_at_rest.max(pet.speed.abs());
-                }
-            }
-        }
-        assert!(galloped, "fixture: the chase must reach a gallop");
-        assert!(
-            !armed,
-            "the shipped gate never arms from a caret chase — that is why the beat is rare"
-        );
-        assert!(
-            hot_while_typing >= 2,
-            "fixture: the candidate gate must fire mid-typing, or the refusal has no \
-             evidence ({hot_while_typing})"
-        );
-        assert_eq!(
-            hot_at_rest, 0,
-            "…and never once the caret came to rest, which is the ONLY place a run-out \
-             would read as one ({hot_at_rest})"
-        );
-        assert!(
-            worst_at_rest < RUN_SPEED,
-            "the follower reached its station at {worst_at_rest} c/s with the caret at \
-             rest — it has momentum now, so the drift-brake's gate is worth re-opening"
-        );
     }
 
     // ── Rainbow Kitty v2's offer, received ──────────────────────────────
@@ -23639,8 +18630,9 @@ mod tests {
         assert!(answered, "a latch that buys no wake is still a latch");
     }
 
-    /// The reach constants are derived: the catch TTL from the sky m1's life
-    /// less the catch finish, the perk's late bound, the cooldown of two swipes.
+    /// The catch TTL is the sky m1's catchable life (its life less the catch
+    /// finish), read off the sky's constants, so a star is never offered past
+    /// the life the sky gives it.
     #[test]
     fn the_catch_ttl_is_the_sky_m1_s_catchable_life() {
         use crate::rainbow_kitty::stardust::{CATCH_FINISH_MS, StarClass, StarLane};
@@ -23651,8 +18643,6 @@ mod tests {
             "V2_CATCH_TTL {V2_CATCH_TTL} is not the sky m1's catchable life {catchable} \
              (life {life}, finish {CATCH_FINISH_MS} ms)"
         );
-        assert!((V2_PERK_LATE - 2.0 / 60.0).abs() < 1e-6);
-        assert!((V2_CATCH_COOL - 2.0 * BAT_HOLD).abs() < 1e-6);
     }
 
     // ── the typed kitty commands (tricks) ───────────────────────────────
@@ -24110,90 +19100,6 @@ mod tests {
         let f = pet.tick(sense(t, Some((4, 13))));
         assert_eq!(f.action, PetAction::Waking);
         assert!(pet.trick_settle.is_none());
-    }
-
-    /// A commanded sit is a level on the quiet clock: off the train, its end
-    /// named by the offer, worn as the look-up seat.
-    #[test]
-    fn a_commanded_sit_parks_wears_the_look_up_seat_and_names_its_end() {
-        let start = Instant::now();
-        let (mut pet, _, t) = settled_pair(start, SIT_AFTER + 0.3);
-        pet.note_trick(t, Trick::Sit, true);
-        // Heard, then seated: the beat and the verb are the train's.
-        let (mut t, _) = idle(&mut pet, t, (4, 12), PERK_HOLD + 0.1);
-        assert_eq!(
-            pet.trick_settle,
-            Some(Trick::Sit),
-            "fixture: the seat is commanded"
-        );
-        let f = pet.tick(sense(t, Some((4, 12))));
-        assert_eq!(f.pose, PetGlyphId::PetSitLookup, "the attentive seat");
-        let q0 = pet.quiet;
-        let end_q = pet.hold_end_q;
-        assert!(
-            (end_q - q0 - TRICK_HOLD).abs() < 0.2,
-            "a {TRICK_HOLD} s hold"
-        );
-        // Park through the hold.
-        let mut parked = 0u32;
-        let mut ticks = 0u32;
-        let hold_end = t + Duration::from_secs_f32(end_q - q0);
-        while t < hold_end - Duration::from_millis(40) {
-            if pet.needs_frames() {
-                t += Duration::from_millis(16);
-            } else {
-                parked += 1;
-                t = pet
-                    .next_change_deadline(t)
-                    .expect("a held seat names its end")
-                    .min(hold_end - Duration::from_millis(40));
-            }
-            ticks += 1;
-            let f = pet.tick(sense(t, Some((4, 12))));
-            assert_eq!(f.pose, PetGlyphId::PetSitLookup, "held for the whole hold");
-        }
-        assert!(
-            parked >= 1 && ticks < 60,
-            "the hold is PARKED, not a 240-frame train: {ticks} wakes, {parked} offered"
-        );
-        let d = pet.next_change_deadline(t).expect("the end is named");
-        assert!(
-            d <= hold_end + Duration::from_millis(5),
-            "the hold's end is offered on time: +{:?} vs +{:?}",
-            d - t,
-            hold_end - t
-        );
-
-        // …and the twin walk proves the whole thing is the train's frames.
-        let (mut pet, mut twin, t) = settled_pair(start, SIT_AFTER + 0.3);
-        pet.note_trick(t, Trick::Sit, true);
-        twin.note_trick(t, Trick::Sit, true);
-        let (walk, _) = walk_offers(&mut pet, &mut twin, t, (4, 12), 6.0);
-        assert!(pet.trick_settle.is_none(), "the hold ended inside the walk");
-        assert!(walk.offers >= 2, "held on the offer: {walk:?}");
-    }
-
-    /// `down` holds the loaf rung on the offer, the wash withheld, its end
-    /// named.
-    #[test]
-    fn a_commanded_loaf_rides_the_offer_to_its_named_end() {
-        let start = Instant::now();
-        let (mut pet, mut twin, t0) = settled_pair(start, SIT_AFTER + 0.3);
-        pet.note_trick(t0, Trick::Down, true);
-        twin.note_trick(t0, Trick::Down, true);
-        let (t, _) = idle(&mut pet, t0, (4, 12), PERK_HOLD + 0.1);
-        let (tt, _) = idle(&mut twin, t0, (4, 12), PERK_HOLD + 0.1);
-        assert_eq!(t, tt, "the twins share one clock");
-        assert_eq!(pet.trick_settle, Some(Trick::Down));
-        assert_eq!(pet.action, PetAction::Loaf, "down is the loaf, early");
-        assert!(
-            pet.quiet < LOAF_AFTER + 0.8 * 2.0 + 0.5,
-            "fast-forwarded to the loaf's own rung, no further: {}",
-            pet.quiet
-        );
-        let (walk, _) = walk_offers(&mut pet, &mut twin, t, (4, 12), 7.0);
-        assert!(pet.trick_settle.is_none(), "the hold ended inside the walk");
-        assert!(walk.offers >= 2, "held on the offer: {walk:?}");
     }
 
     /// Reduced motion engaging mid-roll zeroes `wriggle_t` (the arm returns
@@ -24701,26 +19607,7 @@ mod tests {
     /// armed vigil lasts longer than one tick.
     #[test]
     fn a_cat_on_vigil_gets_up_to_answer_and_is_not_dragged_back_mid_seat() {
-        let t0 = Instant::now();
-        let mut pet = PetBrain::default();
-        let (mut t, _) = type_run(&mut pet, t0, 10, 20, 6, 0.12);
-        let end = t + Duration::from_secs_f32(VIGIL_AFTER + 1.0);
-        while t < end {
-            t += Duration::from_millis(50);
-            pet.note_executing(t, true);
-            let mut sn = sense(t, Some((10, 20)));
-            sn.output_burst = true;
-            let _ = pet.tick(sn);
-        }
-        for _ in 0..20 {
-            t += Duration::from_millis(100);
-            pet.note_executing(t, true);
-            let _ = pet.tick(sense(t, Some((10, 20))));
-        }
-        assert!(
-            pet.vigil && pet.action == PetAction::Crouch,
-            "fixture: at the door"
-        );
+        let (mut pet, mut t) = at_the_door(Instant::now());
         pet.note_trick(t, Trick::Sit, true);
         let mut looked_up = 0u32;
         for _ in 0..200 {

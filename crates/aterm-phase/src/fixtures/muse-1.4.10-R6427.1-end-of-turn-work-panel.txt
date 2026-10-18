@@ -1,0 +1,44 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab) · the monitor's network box refused with Esc: the turn's end, and under the composer's bottom rule the background-work panel (`main · ↓ to select`, `└ ◆ Watch the lab socket  failed  14s`) above the footer · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+    The execution environment is broken: the command was never started and every later command will fail the same way. Do not retry and do not f
+    abricate command output; report this environment failure.
+
+◆ Tool call done. Result: tool failed: environment failure: sandbox enforcement unavailable: macOS sandbox executable /usr/bin/sandbox-exec
+  failed enforcement probe: allowed probe write did not complete, status=exit status:~
+
+❯ toolstart
+
+◆ Fetched http://127.0.0.1:50581/lab-probe — denied
+
+◆ Tool call done. Result: tool failed: web_fetch failed: network access denied
+
+❯ toolstart
+
+◆ Message not sent to lab-no-such-session · ✗ · not found · ctrl+o
+└ "hello from the lab stub"
+
+◆ Tool call done. Result:
+  {"outcome":{"command_id":"3e766412-a4f5-4412-8938-8ecf13187be2","status":"target_not_found","duplicate_of":null,"item_id":null,"submitted_surf
+  ace":"agent_tool","lowered_command_name":"send_session_me~
+
+❯ toolstart
+
+  Read /etc/hosts
+
+◆ Tool call done. Result: Read text file /etc/hosts. 1|## 2|# Host Database 3|# (more lines below)
+
+❯ toolstart
+
+  (↓ to view monitors)
+
+◆ Monitor Watch the lab socket — failed
+└ network access denied
+
+◆ Tool call done. Result: tool failed: network access denied
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+main · ↓ to select
+└ ◆ Watch the lab socket  failed                                                                                                             14s
+  lab-stub · high · /private/tmp/at.lab0/proj · Auto-review

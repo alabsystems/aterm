@@ -211,6 +211,35 @@ pub(crate) const FACES: &[FaceFile] = &[
         READ | HINT,
     )
     .of("IosevkaTerm-Regular"),
+    // The Windows default since 2026-10-16, Iosevka Term Semibold: subsets of
+    // the SemiBold and ExtraBold cuts and their italics, without `calt`, so
+    // the run shaper reaches them only under a configured `frac`, `numr` or
+    // `dnom`. Their hinting answers were recorded on Windows 2026-10-16,
+    // where the recorder answered every committed face's lines as recorded
+    // on macOS.
+    repo(
+        "IosevkaTerm-SemiBold",
+        "assets/bundled/IosevkaTerm-SemiBold.ttf",
+        READ | PRIMARY | HINT,
+    ),
+    repo(
+        "IosevkaTerm-ExtraBold",
+        "assets/bundled/IosevkaTerm-ExtraBold.ttf",
+        READ | HINT,
+    )
+    .of("IosevkaTerm-SemiBold"),
+    repo(
+        "IosevkaTerm-SemiBoldItalic",
+        "assets/bundled/IosevkaTerm-SemiBoldItalic.ttf",
+        READ | HINT,
+    )
+    .of("IosevkaTerm-SemiBold"),
+    repo(
+        "IosevkaTerm-ExtraBoldItalic",
+        "assets/bundled/IosevkaTerm-ExtraBoldItalic.ttf",
+        READ | HINT,
+    )
+    .of("IosevkaTerm-SemiBold"),
     repo(
         "DejaVuSansMono",
         "assets/DejaVuSansMono.ttf",
@@ -429,8 +458,9 @@ pub(crate) const FACES: &[FaceFile] = &[
 /// The faces whose `read` answers live in `reader-gvar-alloc.txt`, not
 /// `reader.txt`: each has glyphs with more than 32 `gvar` tuples, which
 /// ttf-parser 0.25.1 draws only under its `gvar-alloc` feature. aterm's Linux
-/// build turns that on (winit's `wayland-csd-adwaita` -> sctk-adwaita ->
-/// ab_glyph), its macOS, Windows and wasm builds do not, and without it such a
+/// build turned that on (winit's `wayland-csd-adwaita` -> sctk-adwaita ->
+/// ab_glyph, until LW.5 retired the three), its macOS, Windows and wasm builds
+/// did not, and without it such a
 /// glyph has no outline at any instance. `tests/font_oracle.rs` reads
 /// ttf-parser as `-p aterm-render` resolves it (no `gvar-alloc`), so these
 /// faces are recorded by the recorder, which builds it with the feature; a

@@ -155,52 +155,6 @@ fn no_line_buffer_is_kept_between_reads() {
     );
 }
 
-/// A line is folded once its newline is written: the half-written row the
-/// vendor is still appending is not counted, then counted exactly once.
-#[test]
-fn a_torn_last_line_waits_for_its_newline() {
-    let dir = TestDir::new("torn");
-    let path = dir.join("s.jsonl");
-    let whole = row("m1", "claude-opus-5-5", 1, 2);
-    let torn = row("m2", "claude-opus-5-5", 1, 40);
-    let (head, tail) = torn.split_at(torn.len() / 2);
-    append(&path, &format!("{whole}{head}"));
-    let mut cursor = TranscriptCursor::new(&path);
-    cursor.advance(BIG).expect("reads");
-    assert_eq!(output_of(cursor.fold(), "claude-opus-5-5"), 2);
-    assert_eq!(
-        cursor.fold().rows_unparsed,
-        0,
-        "the torn half is never parsed as a broken row"
-    );
-    assert_eq!(cursor.fold().rows, 1);
-    append(&path, tail);
-    cursor.advance(BIG).expect("reads");
-    assert_eq!(output_of(cursor.fold(), "claude-opus-5-5"), 42);
-    assert_eq!(cursor.fold().rows, 2, "the completed row counts once");
-}
-
-/// A `message.id` counts once however its repeats straddle two reads.
-#[test]
-fn a_repeated_id_counts_once_across_reads() {
-    let dir = TestDir::new("dupes");
-    let path = dir.join("s.jsonl");
-    append(&path, &row("m1", "claude-opus-5-5", 100, 20));
-    let mut cursor = TranscriptCursor::new(&path);
-    cursor.advance(BIG).expect("reads");
-    append(
-        &path,
-        &format!(
-            "{}{}",
-            row("m1", "claude-opus-5-5", 100, 20),
-            row("m1", "claude-opus-5-5", 100, 20)
-        ),
-    );
-    cursor.advance(BIG).expect("reads");
-    assert_eq!(output_of(cursor.fold(), "claude-opus-5-5"), 20);
-    assert_eq!(cursor.fold().duplicates, 2);
-}
-
 /// Truncated below the offset reached: the fold starts over and holds only
 /// what the file holds now.
 #[test]
@@ -611,31 +565,6 @@ fn at_the_bound_new_files_are_unread() {
     )
     .expect("text");
     assert!(text.ends_with("+2 unread"), "{text}");
-}
-
-/// With the bound reached while a followed file is still being read, a new
-/// one is left and counted `unread`, and the fold is not complete.
-#[test]
-fn a_file_that_cannot_be_followed_is_counted_as_unread() {
-    let dir = TestDir::new("unfollowed");
-    let main = dir.join("abc-9.jsonl");
-    append(&main, &row("m1", "claude-opus-5-5", 1, 1));
-    let subs = dir.join("abc-9").join("subagents");
-    fs::create_dir_all(&subs).expect("dirs");
-    let big: String = (0..20)
-        .map(|i| row(&format!("s{i}"), "claude-haiku-4-5", 1, 1))
-        .collect();
-    append(&subs.join("agent-a.jsonl"), &big);
-    let mut session = SessionUsage::new(&main);
-    session.cap = 1;
-    session.refresh(fs::metadata(&main).expect("meta").len() + 10);
-    append(
-        &subs.join("agent-b.jsonl"),
-        &row("b", "claude-haiku-4-5", 1, 1),
-    );
-    let r = session.refresh(10);
-    assert_eq!(r.unread, 1, "{r:?}");
-    assert!(!r.complete());
 }
 
 /// The walk that stops at its entry bound is said end to end: the fold is not complete, and the

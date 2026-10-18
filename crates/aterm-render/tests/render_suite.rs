@@ -7,15 +7,22 @@
 //! gates the module.
 //!
 //! No file below sets or removes an environment variable, installs a hook or
-//! an allocator, re-executes itself, reads the process's resident-set size, or
-//! reads a process-global counter a sibling's renderer would move. Files that
-//! do are their own `[[test]]`s in `Cargo.toml`, each with its reason.
+//! an allocator, or reads the process's resident-set size or a process-global
+//! counter a sibling's renderer would move, except from its own process: the
+//! two that read those (`seal_maps_discovered_faces`,
+//! `sealed_never_consults_coverage_index`) re-run this binary on their one test
+//! (`common/alone.rs`) and read them there. The allocation-counting files
+//! install a `#[global_allocator]` and are their own `[[test]]`s in
+//! `Cargo.toml`, each with its reason.
 //!
 //! `autotests = false`: a `tests/*.rs` file that is neither a `mod` line here
 //! nor a `[[test]]` of its own never compiles. Run one file's tests with
 //! `targo --unverified test -p aterm-render --test render_suite -- <file>::`;
 //! an ignored perf gate with `-- <file>:: --ignored --nocapture` in `--release`,
 //! never a bare `--ignored`.
+
+#[path = "common/alone.rs"]
+mod alone;
 
 mod anchor_reuse;
 mod asymmetric_pad_layout;
@@ -46,8 +53,6 @@ mod free_overlay;
 mod fuzz_render_never_panics;
 mod glow_halo;
 mod glow_under;
-mod glyph_key_injectivity;
-mod grid_integrity;
 mod incoming_row_apron;
 mod ink;
 mod inline_image;
@@ -70,16 +75,17 @@ mod script_support_matrix;
 mod scroll_blit;
 mod scroll_flood;
 mod scroll_frac_translate;
-mod scroll_raster_invariance;
+mod seal_maps_discovered_faces;
 mod sealed_keeps_embedded_backstop;
+mod sealed_never_consults_coverage_index;
 mod selection_highlight;
 mod set_px_rerasterizes;
 mod shade_phase;
-mod stream_fade_blend;
 mod styled_faces;
 mod synthetic_symbols;
 mod text_blending;
 mod variation_instantiation;
+mod vibrancy_contrast;
 mod vibrancy_ink;
 mod visual_regression;
 mod w5_floors;

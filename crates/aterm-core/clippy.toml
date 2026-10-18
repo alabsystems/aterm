@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Andrew Yates
 #
-# aterm-core's lint config: the workspace clippy.toml's rows (clippy reads only the
-# nearest file, so they are repeated here word for word; the root file says why
-# each exists) and THE INJECTED CLOCK.
+# aterm-core's lint config: the workspace clippy.toml's rows that can resolve in a
+# crate with no libc, winit or windows dependency (clippy reads only the nearest
+# file, so they are repeated here; the root file says why each exists) and THE
+# INJECTED CLOCK.
 #
 # THE INJECTED CLOCK. `Terminal::process` is a pure function of (bytes,
 # injected instant), so a hydrated buffer replays exactly: every
@@ -17,24 +18,10 @@ disallowed-methods = [
   { path = "std::fs::File::try_lock", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
   { path = "std::fs::File::lock_shared", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
   { path = "std::fs::File::try_lock_shared", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
-  { path = "libc::flock", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
-  { path = "rustix::fs::flock", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
-  { path = "nix::fcntl::flock", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
-  { path = "libc::forkpty", reason = "the shell runs through aterm-pty's confined spawn (clippy.toml: the confined shell)" },
-  { path = "libc::execvp", reason = "the shell runs through aterm-pty's confined spawn (clippy.toml: the confined shell)" },
+  { path = "std::fs::File::sync_all", reason = "finish the write with aterm_durable::durable or aterm_durable::ordered: name what a power loss may leave (clippy.toml: a chosen flush)" },
+  { path = "std::fs::File::sync_data", reason = "finish the write with aterm_durable::durable_data or aterm_durable::ordered: name what a power loss may leave (clippy.toml: a chosen flush)" },
   { path = "std::process::abort", reason = "die by SIGKILL: aterm_uds::process::kill_self_now() (clippy.toml: no core-dump death)" },
-  { path = "libc::abort", reason = "die by SIGKILL: aterm_uds::process::kill_self_now() (clippy.toml: no core-dump death)" },
-  { path = "libc::raise", reason = "a raised core signal writes a crash report: die by SIGKILL (clippy.toml: no core-dump death)" },
   { path = "std::os::windows::process::CommandExt::creation_flags", reason = "set a child's console with aterm_uds::spawn (clippy.toml: one Windows console decision)", allow-invalid = true },
-  { path = "windows_sys::Win32::System::Threading::CreateProcessW", reason = "start children with aterm_uds::spawnfd::command (clippy.toml: one Windows console decision)", allow-invalid = true },
-  { path = "windows_sys::Win32::System::Threading::CreateProcessA", reason = "start children with aterm_uds::spawnfd::command (clippy.toml: one Windows console decision)", allow-invalid = true },
-  { path = "windows_sys::Win32::UI::Shell::ShellExecuteW", reason = "start children with aterm_uds::spawnfd::command (clippy.toml: one Windows console decision)", allow-invalid = true },
-  { path = "windows_sys::Win32::UI::Shell::ShellExecuteExW", reason = "start children with aterm_uds::spawnfd::command (clippy.toml: one Windows console decision)", allow-invalid = true },
-  { path = "windows::Win32::System::Threading::CreateProcessW", reason = "start children with aterm_uds::spawnfd::command (clippy.toml: one Windows console decision)", allow-invalid = true },
-  { path = "windows::Win32::UI::Shell::ShellExecuteW", reason = "start children with aterm_uds::spawnfd::command (clippy.toml: one Windows console decision)", allow-invalid = true },
-  { path = "winit::event_loop::EventLoop::new", reason = "build the loop with aterm_gui's driver_event_loop_builder (clippy.toml: a quiet event loop)" },
-  { path = "winit::event_loop::EventLoop::builder", reason = "build the loop with aterm_gui's driver_event_loop_builder (clippy.toml: a quiet event loop)" },
-  { path = "winit::event_loop::EventLoop::with_user_event", reason = "build the loop with aterm_gui's driver_event_loop_builder (clippy.toml: a quiet event loop)" },
   { path = "std::time::Instant::now", reason = "the engine reads no clock: take the instant process_at was given (clippy.toml: the injected clock)" },
   { path = "std::time::SystemTime::now", reason = "the engine reads no clock: take the instant process_at was given (clippy.toml: the injected clock)" },
   { path = "std::time::Instant::elapsed", reason = "the engine reads no clock: take the instant process_at was given (clippy.toml: the injected clock)" },

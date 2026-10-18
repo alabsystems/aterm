@@ -34,6 +34,7 @@
     reason = "test code: a stand-in child may inherit descriptors"
 )]
 
+#[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -112,9 +113,7 @@ fn settle<T: PartialEq + std::fmt::Debug>(what: &str, want: T, mut probe: impl F
 
 #[test]
 fn closing_the_boot_session_closes_its_pty_master() {
-    let Some(inst) = headless_boot::boot("atz0", &["--lines", "24", "--columns", "80"]) else {
-        return;
-    };
+    let inst = headless_boot::boot("atz0", &["--lines", "24", "--columns", "80"]);
     let pid = inst.child.id();
     // The boot session is local 0.
     let sessions = ctl_ok(&inst, &["sessions"]);

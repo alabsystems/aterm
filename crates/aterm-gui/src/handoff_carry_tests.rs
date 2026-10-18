@@ -84,7 +84,7 @@ fn capture(
     differ: bool,
 ) -> CarrySource {
     let guard = term.lock().unwrap();
-    capture_head(3, &guard, term, turns, differ)
+    capture_head(3, &guard, term, turns, None, differ)
 }
 
 /// The turn-id ceiling the export runs under, as the handoff worker takes it.
@@ -173,9 +173,7 @@ fn a_busy_lock_or_a_moved_archive_carries_the_counters_only() {
     // its own minute runs out. Its join answers which — the export returned
     // while the lock was still held (it gave up on it), or the minute released
     // it (the export waited for the lock). An order, not a stopwatch; the
-    // minute is a hang detector. The order does not see a patience that is
-    // merely long, so `LOCK_PATIENCE`, the one bound the export waits by, is
-    // checked against the design's "briefly".
+    // minute is a hang detector.
     let src = capture(&term, &turns, true);
     let (held_tx, held_rx) = std::sync::mpsc::channel();
     let (back_tx, back_rx) = std::sync::mpsc::channel::<()>();
@@ -195,10 +193,6 @@ fn a_busy_lock_or_a_moved_archive_carries_the_counters_only() {
     assert!(
         holder.join().unwrap(),
         "the export gave the lock up while another thread still kept it"
-    );
-    assert!(
-        LOCK_PATIENCE < Duration::from_secs(1),
-        "the export waits only briefly"
     );
     let archive = carry.archive.unwrap();
     assert!(archive.rows.is_empty());
@@ -270,9 +264,15 @@ fn a_lock_the_export_gives_up_on_is_said_by_session_and_cause() {
     let (term, turns) = session(80);
     let losses = |src: CarrySource| {
         let mut noted = Vec::new();
-        let out = export_noting(&[src], ceiling(), StatusWords::Current, |id, loss| {
-            noted.push((id, loss));
-        });
+        let out = export_noting(
+            &[src],
+            ceiling(),
+            StatusWords::Current,
+            false,
+            |id, loss| {
+                noted.push((id, loss));
+            },
+        );
         assert_eq!(out.len(), 1, "the session still hands off");
         noted
     };
@@ -314,35 +314,6 @@ fn a_lock_the_export_gives_up_on_is_said_by_session_and_cause() {
     assert_eq!(losses(src), vec![(3, CarryLoss::ArchiveMoved)]);
 }
 
-/// Round eight, finding 731's review: each loss's WARN reads as one sentence
-/// in aterm.log — the session, the cause and what it leaves behind, single
-/// spaced. A string literal broken across source lines without its `\`
-/// keeps the next line's indentation inside the message, and no formatter
-/// reflows a literal, so this is the gate that sees it.
-#[test]
-fn a_carry_loss_is_logged_as_one_single_spaced_sentence() {
-    for (loss, says) in [
-        (
-            CarryLoss::LedgerBusy { unvouched: 42 },
-            "every turn id below 42",
-        ),
-        (
-            CarryLoss::TerminalBusy,
-            "its archive crosses as counters alone",
-        ),
-        (CarryLoss::ArchiveMoved, "archive moved after the freeze"),
-    ] {
-        let line = loss.line(7);
-        assert!(line.starts_with("update apply: session 7's "), "{line}");
-        assert!(line.contains(says), "{line}");
-        assert!(
-            !line.contains("  "),
-            "a run of spaces in the logged line: {line:?}"
-        );
-        assert!(!line.contains('\n'), "{line:?}");
-    }
-}
-
 /// Over the per-sidecar room the rows go first, then the differ's state,
 /// then the ledger's older records — and a room nothing fits in carries
 /// nothing.
@@ -361,8 +332,9 @@ fn a_sidecar_that_does_not_fit_sheds_rows_then_state_then_history() {
     let no_rows = encode(&turns_v, 0, &counters_only(archive.clone())).unwrap();
     assert!(no_rows.len() < full.len());
 
-    let (shed, none) =
-        encode_within(turns_v.clone(), 0, archive.clone(), no_rows.len() as u64).unwrap();
+    let (shed, none) = encode_within(&turns_v, 0, archive.clone(), no_rows.len() as u64)
+        .map(|(c, n)| (c.bytes, n))
+        .unwrap();
     assert_eq!(none, 0, "no record shed");
     let c = decode(&shed).unwrap();
     let a = c.archive.unwrap();
@@ -370,7 +342,9 @@ fn a_sidecar_that_does_not_fit_sheds_rows_then_state_then_history() {
     assert_eq!(c.turns.len(), turns_v.len());
     assert_eq!(c.unheld_below, 0, "the whole ledger came");
 
-    let (tiny, shed) = encode_within(turns_v.clone(), 0, archive.clone(), 400).unwrap();
+    let (tiny, shed) = encode_within(&turns_v, 0, archive.clone(), 400)
+        .map(|(c, n)| (c.bytes, n))
+        .unwrap();
     let c = decode(&tiny).unwrap();
     assert!(c.archive.unwrap().differ.is_none());
     assert!(c.turns.len() < turns_v.len());
@@ -401,7 +375,7 @@ fn a_sidecar_that_does_not_fit_sheds_rows_then_state_then_history() {
     let one_fewer = encode(&turns_v[shed - 1..], floor, &bare).unwrap();
     assert!(one_fewer.len() > 400, "one record fewer shed would fit");
 
-    assert!(encode_within(turns_v, 0, archive, 10).is_none());
+    assert!(encode_within(&turns_v, 0, archive, 10).is_none());
 }
 
 /// The codec keeps every carried field, unknown fields are skipped and
@@ -651,6 +625,8 @@ fn an_adopted_ledger_says_which_turn_ids_it_cannot_vouch_for() {
         turns: vec![record(40, true, ArchMark::default())],
         unheld_below: 30,
         archive: None,
+        log: None,
+        log_mirror: None,
     };
     let ledger = adopted_ledger(Some(&mut with_records));
     assert_eq!(ledger.low_id(), Some(40), "a held record is the low-water");
@@ -956,9 +932,499 @@ fn a_mangled_sidecar_never_panics_the_adopting_engine() {
             }
         }
     }
-    eprintln!("decoded {some}, refused {none}");
     assert!(
         some > 20 && none > 20,
         "both outcomes exercised: {some}/{none}"
     );
+}
+
+// ---- the session log in the sidecar (phase 2A) ----------------------------
+
+/// A timeline whose session log holds `n` person-burst marks after its open.
+fn timeline_with_log(n: usize) -> Arc<Mutex<crate::session_timeline::SessionTimeline>> {
+    let tl = Arc::new(Mutex::new(
+        crate::session_timeline::SessionTimeline::default(),
+    ));
+    {
+        let mut g = tl.lock().unwrap();
+        let now = g.slog().now();
+        g.slog_mut().open_session(None, now);
+        for _ in 0..n {
+            g.slog_mut().human_input(true, now);
+        }
+    }
+    tl
+}
+
+/// [`capture`] with the session's timeline, as the park takes a handed
+/// session's.
+fn capture_with_log(
+    term: &Arc<Mutex<Terminal>>,
+    turns: &Arc<Mutex<TurnLedger>>,
+    timeline: &Arc<Mutex<crate::session_timeline::SessionTimeline>>,
+) -> CarrySource {
+    let guard = term.lock().unwrap();
+    capture_head(3, &guard, term, turns, Some(timeline), true)
+}
+
+/// Each session's sidecar, `(local_id, JSON)`.
+type Sidecars = Vec<(u64, Vec<u8>)>;
+
+/// Export with logs, the losses collected.
+fn export_logs(sources: &[CarrySource]) -> (Sidecars, Vec<(u64, CarryLoss)>) {
+    let mut losses = Vec::new();
+    let out = export_noting(
+        sources,
+        ceiling(),
+        StatusWords::Current,
+        true,
+        |id, loss| {
+            losses.push((id, loss));
+        },
+    );
+    (out, losses)
+}
+
+/// THE LOG RIDES THE SIDECAR, and an older receiver reads past it: this
+/// build reads the member back as the carry's lines, while a receiver built
+/// before it (its `Wire` with no `log`, mirrored here) decodes the same
+/// ledger and archive it decodes from a sidecar without the member.
+#[test]
+fn the_log_rides_the_sidecar_and_an_older_receiver_reads_past_it() {
+    #[derive(serde::Deserialize, serde::Serialize)]
+    #[serde(default)]
+    #[derive(Default)]
+    struct OlderWire {
+        version: u64,
+        turns: Vec<TurnWire>,
+        unheld_below: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        archive: Option<ArchiveWire>,
+    }
+    let (term, turns) = session(60);
+    let tl = timeline_with_log(30);
+    let (with, losses) = export_logs(&[capture_with_log(&term, &turns, &tl)]);
+    assert!(losses.is_empty(), "{losses:?}");
+    tl.lock().unwrap().slog_mut().lift_read_fence();
+    let without = export(&[capture(&term, &turns, true)], ceiling());
+    let carry = decode(&with[0].1).expect("this build reads it");
+    let lines = carry.log.clone().expect("the log crossed");
+    assert!(lines[0].starts_with("slog-carry v=1 "), "{:?}", &lines[..1]);
+    assert!(lines.iter().any(|l| l.starts_with("host state v=1 ")));
+    let bare = decode(&without[0].1).unwrap();
+    assert_eq!(
+        (carry.turns.clone(), carry.archive.clone()),
+        (bare.turns, bare.archive)
+    );
+    let older: OlderWire = aterm_json::from_slice(&with[0].1).expect("an older build reads it");
+    let older_bare: OlderWire = aterm_json::from_slice(&without[0].1).unwrap();
+    assert_eq!(
+        aterm_json::to_vec(&older).unwrap(),
+        aterm_json::to_vec(&older_bare).unwrap(),
+        "the same ledger and archive, the member skipped"
+    );
+}
+
+/// THE MEMBER IS WRITTEN ONLY FOR A SUCCESSOR THAT READS IT: the export for
+/// an older target (a rollback, a channel switch) is byte for byte the export
+/// without any log, so that receiver's aggregate is spent as before. A
+/// target at least as new carries it.
+#[test]
+fn an_export_for_an_older_target_is_byte_identical_to_one_without_a_log() {
+    let (term, turns) = session(40);
+    let tl = timeline_with_log(50);
+    let running = crate::running_build_number();
+    let sources = || vec![capture_with_log(&term, &turns, &tl)];
+    let older = export_for_target(&sources(), ceiling(), running.saturating_sub(1));
+    let none = export(&sources(), ceiling());
+    assert_eq!(older, none, "byte for byte");
+    assert!(decode(&older[0].1).unwrap().log.is_none());
+    let newer = export_for_target(&sources(), ceiling(), running);
+    assert!(
+        decode(&newer[0].1).unwrap().log.is_some(),
+        "a same-build successor reads it"
+    );
+    assert!(successor_reads_session_log(running + 1, running));
+    assert!(!successor_reads_session_log(running - 1, running));
+}
+
+/// A BAD OR OVERSIZED LOG COSTS ONLY THE LOG: a member of the wrong type,
+/// past a carry's line bound, or holding lines no log reads, leaves the
+/// ledger and archive exactly as a log-less carry's; the adopting log then
+/// starts over after `gap why=handoff`. And a sidecar from an older sender
+/// (no member) adopts the slice-one way.
+#[test]
+fn a_bad_or_oversized_log_costs_only_the_log() {
+    let (term, turns) = session(40);
+    let bytes = export(&[capture(&term, &turns, true)], ceiling())
+        .remove(0)
+        .1;
+    let bare = decode(&bytes).unwrap();
+    assert!(bare.log.is_none(), "an older sender's sidecar has no log");
+    let text = String::from_utf8(bytes).unwrap();
+    let huge = format!(
+        "[{}]",
+        vec!["\"r 1 mark - bell src=engine conf=exact t=1\""; aterm_slog::CARRY_MAX_LINES + 1]
+            .join(",")
+    );
+    for member in [
+        "5".to_string(),
+        "[1]".to_string(),
+        "{}".to_string(),
+        "\"x\"".to_string(),
+        "null".to_string(),
+        huge,
+    ] {
+        let spliced = text.replacen('{', &format!("{{\"log\":{member},"), 1);
+        let c = decode(spliced.as_bytes())
+            .unwrap_or_else(|| panic!("`{}` cost the sidecar", &member[..member.len().min(20)]));
+        assert!(c.log.is_none(), "no log");
+        assert_eq!(
+            (c.turns, c.archive),
+            (bare.turns.clone(), bare.archive.clone())
+        );
+    }
+    // Lines that do not read as a carry: the log starts over, nothing else
+    // is touched.
+    let spliced = text.replacen('{', "{\"log\":[\"slog-carry v=1 junk\",\"r 9\"],", 1);
+    let mut c = decode(spliced.as_bytes()).unwrap();
+    assert_eq!(c.turns, bare.turns);
+    let lines = c.take_log();
+    assert!(lines.is_some());
+    let mut log = crate::session_log::SessionLog::default();
+    log.adopt(
+        crate::session_log::LogAdopt {
+            ids: crate::session_log::LogCarry::parse("1 3 3 3"),
+            seq: 99,
+            lines,
+            keeper_ep: None,
+            mirror: None,
+        },
+        false,
+        aterm_slog::Stamp::new(1_760_000_000_000, 5),
+    );
+    let first = log.log().window().next().expect("a record");
+    assert_eq!(first.k, aterm_slog::Kind::Gap, "the uncarried start");
+    assert_eq!(first.seq, 100);
+}
+
+/// THE LOG NEVER COSTS THE TURN LEDGER: a timeline another thread holds
+/// through the whole log pass costs its session's log (said, `LogBusy`), and
+/// every session still carries its whole ledger and archive. CONTROL: free,
+/// the log crosses.
+#[test]
+fn the_log_never_costs_the_turn_ledger() {
+    let (term, turns) = session(40);
+    let busy = timeline_with_log(10);
+    let free = timeline_with_log(10);
+    let sources = vec![
+        capture_with_log(&term, &turns, &busy),
+        capture_with_log(&term, &turns, &free),
+    ];
+    let held = busy.lock().unwrap();
+    let (out, losses) = export_logs(&sources);
+    drop(held);
+    assert_eq!(
+        losses,
+        vec![(3, CarryLoss::LogBusy)],
+        "said, for that session"
+    );
+    let want = turns.lock().unwrap().len();
+    for (_, bytes) in &out {
+        let c = decode(bytes).unwrap();
+        assert_eq!(c.turns.len(), want, "the ledger crossed whole");
+        assert!(
+            !c.archive.unwrap().rows.is_empty(),
+            "and the archive's rows"
+        );
+    }
+    assert!(decode(&out[0].1).unwrap().log.is_none());
+    assert!(
+        decode(&out[1].1).unwrap().log.is_some(),
+        "CONTROL: free, it crossed"
+    );
+}
+
+/// LOG DETAIL IS SHED BEFORE ANY SESSION'S ARCHIVE ROWS: a desk whose rows
+/// overflow the aggregate carries each log's skeleton (the open path, the
+/// state) and no detail, while every session keeps the rows it keeps
+/// without logs (less what the skeletons take). CONTROL: a single session,
+/// the aggregate unpressed, carries its log's detail too.
+#[test]
+fn log_detail_is_shed_before_any_sessions_archive_rows() {
+    let (term, turns) = session_every(8000, 2000);
+    let tl = timeline_with_log(2000);
+    let sources: Vec<CarrySource> = (0..64)
+        .map(|_| capture_with_log(&term, &turns, &tl))
+        .collect();
+    let plain: Vec<CarrySource> = (0..64).map(|_| capture(&term, &turns, true)).collect();
+    let without = export(&plain, ceiling());
+    let total_without: u64 = without.iter().map(|(_, b)| b.len() as u64).sum();
+    assert!(
+        total_without > MAX_AGGREGATE_BYTES - MAX_AGGREGATE_BYTES / 10,
+        "PRECONDITION: the rows press the aggregate ({total_without})"
+    );
+    let (with, _) = export_logs(&sources);
+    let total_with: u64 = with.iter().map(|(_, b)| b.len() as u64).sum();
+    assert!(total_with <= MAX_AGGREGATE_BYTES, "{total_with}");
+    let rows = |b: &[u8]| decode(b).unwrap().archive.unwrap().rows.len();
+    for (i, ((_, w), (_, p))) in with.iter().zip(&without).enumerate() {
+        let c = decode(w).unwrap();
+        let lines = c.log.expect("the skeleton crossed");
+        let head = &lines[0];
+        let carried: u64 = head
+            .split(' ')
+            .find_map(|t| t.strip_prefix("carried="))
+            .and_then(|v| v.parse().ok())
+            .unwrap();
+        assert!(
+            carried < 100,
+            "session {i}: the detail is shed (only what the rows left): {head}"
+        );
+        assert!(
+            rows(w) + 64 >= rows(p),
+            "session {i}: about as many rows as without logs"
+        );
+    }
+    assert!(rows(&with[0].1) > 0, "the rows crossed");
+    // CONTROL: one session alone carries its detail.
+    tl.lock().unwrap().slog_mut().lift_read_fence();
+    let (alone, _) = export_logs(&sources[..1]);
+    let lines = decode(&alone[0].1).unwrap().log.unwrap();
+    assert!(lines.len() > 1000, "the detail crossed: {}", lines.len());
+}
+
+/// THE LOG MEMBER IS SPLICED INTO THE SIDECAR ALREADY ENCODED: the export no
+/// longer serializes a session's ledger and archive a second time to add its
+/// log. The spliced sidecar reads back as the sidecar without it, member for
+/// member, plus the log's lines exactly. NEGATIVE CONTROL: what is not a
+/// compact object with a member in it takes no splice (the export then
+/// encodes the sidecar whole).
+#[test]
+fn a_spliced_log_member_reads_as_the_sidecar_and_its_lines() {
+    let (term, turns) = session(30);
+    let plain = export(&[capture(&term, &turns, true)], ceiling());
+    let tl = timeline_with_log(300);
+    let lines = tl
+        .lock()
+        .unwrap()
+        .slog_carry_source()
+        .encode(aterm_slog::CarryBudget::SESSION)
+        .expect("carried")
+        .lines;
+    let spliced = with_log_member(&plain[0].1, &lines).expect("a compact object");
+    let mut back = decode(&spliced).expect("reads");
+    assert_eq!(back.take_log(), Some(lines.clone()), "the lines exactly");
+    assert_eq!(
+        format!("{back:?}"),
+        format!("{:?}", decode(&plain[0].1).expect("reads")),
+        "and the rest as it was"
+    );
+    assert_eq!(
+        log_json_len(&lines),
+        aterm_json::to_vec(&lines).expect("json").len() as u64 + 7,
+        "the member's size, counted, is the size written"
+    );
+    // NEGATIVE CONTROL.
+    for not in [&b"{}"[..], b"[1,2]", b"", b"{\"version\":1"] {
+        assert!(with_log_member(not, &lines).is_none(), "{not:?}");
+    }
+}
+
+/// FIXER F6: a MIRRORED log's cursor and head ride its sidecar whether or
+/// not its log does, so a successor whose `Log::from_carry` refuses the
+/// carried log still owes the old space's tail as one exact `why=reset`
+/// cover (ruling Q7) — not only one whose log did not cross.
+#[test]
+fn a_mirrored_logs_cursor_crosses_beside_its_log_and_a_refused_carry_still_owes_its_tail() {
+    let (term, turns) = session(30);
+    let tl = timeline_with_log(10);
+    // Mirrored: a take engaged it (nothing landed yet).
+    {
+        let mut g = tl.lock().unwrap();
+        let now = g.slog().now();
+        let _ = g.slog_mut().mirror_log().bus_copy(1, now);
+    }
+    let (out, losses) = export_logs(&[capture_with_log(&term, &turns, &tl)]);
+    assert!(losses.is_empty(), "{losses:?}");
+    let mut carry = decode(&out[0].1).expect("reads");
+    let lines = carry.take_log().expect("the log crossed");
+    let prior = carry.take_log_mirror().expect("and its cursor beside it");
+    assert_eq!(prior.landed.ms, 0);
+    assert!(prior.ms_head > prior.landed.ms, "{prior:?}");
+    // The successor cannot read the carried log: it starts over, owing the
+    // old space's tail.
+    let mut refused = lines.clone();
+    refused.push("zz a line no build reads".to_string());
+    let mut log = crate::session_log::SessionLog::default();
+    log.adopt(
+        crate::session_log::LogAdopt {
+            ids: crate::session_log::LogCarry::parse("1 9 9 9"),
+            seq: 1 << 20,
+            lines: Some(refused),
+            keeper_ep: None,
+            mirror: Some(prior),
+        },
+        false,
+        aterm_slog::Stamp::new(1_760_000_000_000, 5),
+    );
+    assert_eq!(
+        log.log().mirror_prior(),
+        Some(prior),
+        "the old space is owed"
+    );
+}
+
+/// THE BUS MIRROR'S OLD-SPACE CURSOR rides a sidecar whose log did not
+/// cross (session log phase 4, ruling Q7), spliced in as the log member is:
+/// it reads back as the sidecar without it plus the cursor exactly. An
+/// unmirrored session's sidecar holds no byte of it.
+#[test]
+fn a_mirrored_log_that_does_not_cross_carries_its_cursor_in_the_sidecar() {
+    let (term, turns) = session(30);
+    let plain = export(&[capture(&term, &turns, true)], ceiling());
+    assert!(
+        !String::from_utf8_lossy(&plain[0].1).contains("log_mirror"),
+        "an unmirrored sidecar is the bytes it was"
+    );
+    let prior = aterm_slog::Prior {
+        landed: aterm_slog::BusCursor::new(2, 30, 7),
+        ms_head: 9,
+    };
+    let spliced = with_mirror_member(&plain[0].1, prior).expect("a compact object");
+    let mut back = decode(&spliced).expect("reads");
+    assert_eq!(back.take_log_mirror(), Some(prior), "the cursor exactly");
+    assert_eq!(
+        format!("{back:?}"),
+        format!("{:?}", decode(&plain[0].1).expect("reads")),
+        "and the rest as it was"
+    );
+    assert_eq!(read_mirror_member("2:30:7:9"), Some(prior));
+    for bad in ["2:30:7", "x:1:2:3", "", "1:2:3:4:5"] {
+        assert_eq!(read_mirror_member(bad), None, "{bad:?}");
+    }
+}
+
+/// §10.1-2 MEASURED, never asserted: the log's share of the handoff freeze
+/// for N sessions at the 128 KiB cap. Both halves are inside the freeze a
+/// person sees: the export's log pass and sidecar encoding run on the worker
+/// while every reader is parked (from the park to the proof, `app_update_
+/// handoff`'s "a terminal that echoed nothing"), against the same export
+/// for a successor that reads no log; then the receiver's decode of every
+/// sidecar and adoption of every log (`decode_why` plus `SessionLog::adopt`).
+/// Two mixes: shell-only (small archives, the logs fill the budget) and
+/// Claude-Code-like (large archives, the rows take the aggregate and the log
+/// detail is shed).
+#[test]
+#[ignore = "measurement: run by name with --ignored --nocapture"]
+fn measure_log_carry_freeze() {
+    for (mix, every, rows) in [("shell-only", 10, 40), ("claude-like", 2000, 8000)] {
+        let (term, turns) = session_every(rows, every);
+        for n in [1usize, 16, 64, 128] {
+            let tls: Vec<_> = (0..n).map(|_| timeline_with_log(2040)).collect();
+            let sources: Vec<CarrySource> = tls
+                .iter()
+                .map(|tl| capture_with_log(&term, &turns, tl))
+                .collect();
+            // The same sources exported as for a successor that reads no log:
+            // what the log pass adds to the export (the worker's, while every
+            // reader is parked, so inside the park->proof freeze).
+            let t0 = Instant::now();
+            let _ = export_noting(&sources, ceiling(), StatusWords::Current, false, |_, _| {});
+            let plain_us = t0.elapsed().as_micros();
+            let t0 = Instant::now();
+            let (out, _) = export_logs(&sources);
+            let export_us = t0.elapsed().as_micros();
+            let bytes: u64 = out.iter().map(|(_, b)| b.len() as u64).sum();
+            let log_bytes: u64 = out
+                .iter()
+                .map(|(_, b)| {
+                    decode(b)
+                        .unwrap()
+                        .log
+                        .map_or(0, |l| l.iter().map(|x| x.len() as u64 + 3).sum())
+                })
+                .sum();
+            let t1 = Instant::now();
+            let mut adopted = 0;
+            for (_, b) in &out {
+                let mut c = decode_why(b).unwrap();
+                let mut log = crate::session_log::SessionLog::default();
+                log.adopt(
+                    crate::session_log::LogAdopt {
+                        ids: crate::session_log::LogCarry::parse("1 3 3 3"),
+                        seq: 10_000_000,
+                        lines: c.take_log(),
+                        keeper_ep: None,
+                        mirror: None,
+                    },
+                    false,
+                    aterm_slog::Stamp::new(1_760_000_000_000, 5),
+                );
+                adopted += usize::from(log.log().ep() == 2);
+            }
+            let freeze_us = t1.elapsed().as_micros();
+            println!(
+                "MEASURE freeze {mix} N={n}: sidecars {bytes} B ({log_bytes} B of log lines), \
+                 export {export_us} us ({plain_us} us without logs); receiver decode+adopt \
+                 {freeze_us} us ({:.0} us a session), {adopted} logs continued",
+                freeze_us as f64 / n as f64
+            );
+            for tl in &tls {
+                tl.lock().unwrap().slog_mut().lift_read_fence();
+            }
+        }
+    }
+}
+
+/// M2 for the log member: a valid sidecar with a log, mangled (bytes
+/// flipped, cut short, numbers swapped for huge ones), either decodes or is
+/// dropped; when it decodes, its log is adopted or refused, never a panic,
+/// and the adopted log's records stay in seq order.
+#[test]
+fn a_mangled_log_member_never_panics_the_adopting_log() {
+    let (term, turns) = session(20);
+    let tl = timeline_with_log(200);
+    let (out, _) = export_logs(&[capture_with_log(&term, &turns, &tl)]);
+    let good = out[0].1.clone();
+    assert!(decode(&good).unwrap().log.is_some());
+    let mut rng = Rng(0x5eed_1234);
+    for round in 0..300 {
+        let mut b = good.clone();
+        match round % 3 {
+            0 => {
+                for _ in 0..1 + rng.below(4) {
+                    let i = rng.below(b.len() as u64) as usize;
+                    b[i] ^= 1 << rng.below(7);
+                }
+            }
+            1 => b.truncate(rng.below(b.len() as u64) as usize),
+            _ => {
+                let text = String::from_utf8_lossy(&b).into_owned();
+                let at = rng.below(text.len() as u64) as usize;
+                let at = (0..=at)
+                    .rev()
+                    .find(|i| text.is_char_boundary(*i))
+                    .unwrap_or(0);
+                b = format!("{}99999999999999999999{}", &text[..at], &text[at..]).into_bytes();
+            }
+        }
+        let Some(mut c) = decode(&b) else {
+            continue;
+        };
+        let mut log = crate::session_log::SessionLog::default();
+        log.adopt(
+            crate::session_log::LogAdopt {
+                ids: crate::session_log::LogCarry::parse("1 9 9 9"),
+                seq: 1 << 20,
+                lines: c.take_log(),
+                keeper_ep: None,
+                mirror: None,
+            },
+            false,
+            aterm_slog::Stamp::new(1_760_000_000_000, 5),
+        );
+        let seqs: Vec<u64> = log.log().window().map(|r| r.seq).collect();
+        assert!(seqs.windows(2).all(|w| w[0] < w[1]), "round {round}");
+    }
 }

@@ -16,8 +16,8 @@
 //! stack at the panic, which carries the wasm frames.
 //!
 //! A module passes the two JS calls in a [`Console`]: `host::CONSOLE` (the
-//! raw `aterm_host` imports) for one on this crate's export layer, or its own
-//! bindings (`crates/aterm-gpu-web/src/host.rs`, wasm-bindgen until WP.8).
+//! raw `aterm_host` imports) for one on this crate's export layer, as both
+//! web modules are, or its own bindings.
 
 use std::fmt::Display;
 use std::sync::Once;

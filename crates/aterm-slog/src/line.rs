@@ -31,6 +31,11 @@ pub const MAX_RECORD_BYTES: usize = 512;
 pub enum EncodeError {
     /// The encoding would take this many bytes, over [`MAX_RECORD_BYTES`].
     TooLarge(usize),
+    /// A record the bus mirror does not carry ([`Rec::is_bus_class`]): a
+    /// mail mark, a tool step, a verdict. The second wall behind the class
+    /// itself ([`encode_mirror`]), so a producer that misclassifies a record
+    /// still cannot put its wire-tier `kind=`, `dir=` or `inbox=` on the bus.
+    NotBusClass,
 }
 
 /// Why a line did not decode to a record.
@@ -132,6 +137,38 @@ pub fn encode_bus(rec: &Rec, tier: Tier, ep: u32, ms: Option<u64>) -> Result<Str
     checked(out)
 }
 
+/// `rec` as the bus mirror's `v=2` body (§5.5, phase 4): [`encode_bus`] for
+/// a record of the bus class only, with an edge's actor written as its
+/// stable alias (ruling Q6). `alias` maps a session's sid to the token the
+/// bus shows for it (`e<8 hex>`, a keyed hash only this node can make), so
+/// two records by one edge still name one actor and the sid stays local;
+/// `None` writes `by=-`. No other actor is rewritten: `human ctl harness
+/// bridge aterm vendor` name a connection's class, not a session.
+///
+/// # Errors
+///
+/// [`EncodeError::NotBusClass`] for a record the mirror does not carry, and
+/// otherwise as [`encode`].
+pub fn encode_mirror(
+    rec: &Rec,
+    tier: Tier,
+    ep: u32,
+    ms: Option<u64>,
+    alias: &dyn Fn(&ShortId) -> Option<ShortId>,
+) -> Result<String, EncodeError> {
+    if !rec.is_bus_class() {
+        return Err(EncodeError::NotBusClass);
+    }
+    match rec.by {
+        Actor::Sid(sid) => {
+            let mut aliased = rec.clone();
+            aliased.by = alias(&sid).map_or(Actor::Nobody, Actor::sid);
+            encode_bus(&aliased, tier, ep, ms)
+        }
+        _ => encode_bus(rec, tier, ep, ms),
+    }
+}
+
 /// The bytes a record takes at `tier` (what the ring's byte budget counts),
 /// or the refusal.
 ///
@@ -150,8 +187,12 @@ fn checked(out: String) -> Result<String, EncodeError> {
     }
 }
 
-/// The tier `table` gives `key`.
+/// The tier `table` gives `key`: the key's own row when `table` is
+/// [`FIELDS`] (no scan), else the row `table` lists.
 fn tier_in(table: &[(Key, Tier, Cap)], key: Key) -> Tier {
+    if std::ptr::eq(table, FIELDS) {
+        return key.tier();
+    }
     table
         .iter()
         .find(|row| row.0 == key)
@@ -170,7 +211,7 @@ fn push_fields(out: &mut String, f: &Fields, tier: Tier, table: &[(Key, Tier, Ca
     }
 }
 
-fn push_val(out: &mut String, val: &Val) {
+pub(crate) fn push_val(out: &mut String, val: &Val) {
     match val {
         Val::Word(w) => out.push_str(w),
         Val::U(n) => {
@@ -187,7 +228,7 @@ fn push_val(out: &mut String, val: &Val) {
 
 /// The value `raw` decodes to for `key`, or `None` when it does not have the
 /// key's shape (the token is then skipped).
-fn decode_val(key: Key, raw: &str) -> Option<Val> {
+pub(crate) fn decode_val(key: Key, raw: &str) -> Option<Val> {
     match key.cap() {
         Cap::Word(list) => Some(Val::Word(lookup_or_unknown(list, raw))),
         Cap::U => raw.parse().ok().map(Val::U),
@@ -255,7 +296,9 @@ pub fn decode(line: &str) -> Result<Rec, DecodeError> {
 }
 
 /// A decoded bus body: the record and the session's epoch and turn-class
-/// counter.
+/// counter. A body this build cannot place ([`decode_bus`]: an `op=` word or
+/// a `node=` id it does not know) holds a mark of kind `unknown` on the
+/// session, which no bus class holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BusRec {
     /// The session's epoch (`ep=`).
@@ -266,12 +309,42 @@ pub struct BusRec {
     pub rec: Rec,
 }
 
+impl BusRec {
+    /// THE RECORD OF A BODY THIS BUILD CANNOT PLACE ([`decode_bus`]): a mark
+    /// of kind `unknown` on the session, its node and parent unread and its
+    /// fields dropped. No bus class holds it ([`Rec::is_bus_class`]), so a
+    /// reader folds nothing of it and still holds its `ms`
+    /// (`aterm_slog::bus::BusSpace::offer`); its `t`, `by`, `src` and `conf`
+    /// are the body's.
+    fn unplaced(mut self) -> BusRec {
+        self.rec.op = Op::Mark;
+        self.rec.node = Node::SESSION;
+        self.rec.par = None;
+        self.rec.k = Kind::Unknown;
+        self.rec.f = Fields::new();
+        self
+    }
+}
+
 /// A `v=2` bus body back to its record.
+///
+/// UNKNOWN WORDS ARE NOT LOSS (§3.4: new keys and words never change `v`): a
+/// fleet runs mixed builds, and a newer writer may name an operation or a
+/// node level this build does not know. A body whose `seq` reads and whose
+/// `op=` word, or (its operation known) whose `node=` id, this build does
+/// not know decodes to a record it cannot place — a mark of kind `unknown`
+/// on the session, its fields dropped, which no bus class holds — with its
+/// `ep`, `seq` and `ms`: a reader holds that `ms` and folds nothing of it,
+/// as it does a record of a kind it does not know. Unknown keys are skipped
+/// and unknown words of a known key read `unknown`, as [`decode`] reads them.
 ///
 /// # Errors
 ///
 /// [`DecodeError::Opaque`] for a body of another version (a reader keeps it
-/// opaque, §3.4); otherwise as [`decode`].
+/// opaque, §3.4); [`DecodeError::Seq`], [`DecodeError::Op`],
+/// [`DecodeError::Node`] or [`DecodeError::Kind`] for a body with no seq, no
+/// operation, no node or no kind; [`DecodeError::TooLong`] past
+/// [`MAX_RECORD_BYTES`].
 pub fn decode_bus(body: &str) -> Result<BusRec, DecodeError> {
     if body.len() > MAX_RECORD_BYTES {
         return Err(DecodeError::TooLong);
@@ -306,8 +379,8 @@ pub fn decode_bus(body: &str) -> Result<BusRec, DecodeError> {
             "ep" => out.ep = v.parse().unwrap_or(0),
             "seq" => seq = v.parse().ok(),
             "ms" => out.ms = v.parse().ok(),
-            "op" => op = Op::from_word(v),
-            "node" => node = Node::parse(v),
+            "op" => op = Some(Op::from_word(v)),
+            "node" => node = Some(Node::parse(v)),
             "k" => kind = Some(Kind::from_word(v)),
             "par" => out.rec.par = Node::parse(v),
             "by" => out.rec.by = Actor::from_word(v),
@@ -317,8 +390,16 @@ pub fn decode_bus(body: &str) -> Result<BusRec, DecodeError> {
         }
     }
     out.rec.seq = seq.ok_or(DecodeError::Seq)?;
-    out.rec.op = op.ok_or(DecodeError::Op)?;
-    out.rec.node = node.ok_or(DecodeError::Node)?;
+    // A word this build does not know is a record it cannot place, never
+    // a body that is not there (the doc).
+    let Some(op) = op.ok_or(DecodeError::Op)? else {
+        return Ok(out.unplaced());
+    };
+    out.rec.op = op;
+    let Some(node) = node.ok_or(DecodeError::Node)? else {
+        return Ok(out.unplaced());
+    };
+    out.rec.node = node;
     out.rec.k = kind.ok_or(DecodeError::Kind)?;
     Ok(out)
 }

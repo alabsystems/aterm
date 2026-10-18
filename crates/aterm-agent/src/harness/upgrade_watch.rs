@@ -24,9 +24,14 @@
 //! 3. THE RE-ARM ([`super::rearm`]): a stopped round that has rested, where
 //!    the reducer's own read says so.
 //!
-//! The aterm-census guard `watch-hands` fences this file: `watch` and everything it reaches
-//! here may not call a hand (`turn_fenced`, `turn`, `type_line`, `terminate`,
-//! `restart`, a kill, a signal) nor name an input verb.
+//! NO HANDS, BY THE CONNECTION: every connection the watch's read makes is
+//! READ-ONLY (`RelayClient::reads_only`): the pass connects through
+//! `connect_at`, which makes a dry run's read-only; a roster read's always is
+//! (`roster_connection`). Such a connection sends the read verbs alone
+//! (`aterm_agent::READ_VERBS`: status, screen, `await`, …) and refuses every
+//! other request before a byte is written, so no path the watch takes can
+//! type, press, paste, lease or signal over it
+//! (`a_dry_runs_connection_reads_and_has_no_hands`).
 
 use std::path::PathBuf;
 
@@ -144,22 +149,22 @@ pub fn watch(opts: &Opts, tab: &str, how: &Watcher) -> Watched {
 /// handed a dry run of `opts` for `tab`.
 ///
 /// The look and the hands-free re-arm of `HarnessUpgradeProgress`
-/// (`aterm_spec::derive::harness_upgrade_progress_model`): the watch records
+/// (`aterm_models_harness::harness_upgrade_progress_model`): the watch records
 /// what holds the move now as its read found it ([`look_word`]), and re-arms a
 /// rested round, typing nothing, in that order when it does both, so the word
 /// recorded is the new round's. Bound in `upgrade_watch_tests.rs`
 /// (`the_real_watch_is_the_derived_look`).
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "HarnessUpgradeProgress",
         action = "Watch",
         project = "aterm_agent::harness::upgrade_drive::progress_projection"
     )
 )]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "HarnessUpgradeProgress",
         action = "WatchRearms",
         project = "aterm_agent::harness::upgrade_drive::progress_projection"
@@ -172,14 +177,10 @@ pub(super) fn watch_with(
     now: u64,
     read: &dyn Fn(&Opts) -> Report,
 ) -> Watched {
-    watch_in(opts, tab, how, now, read, &super::Live)
+    watch_in(opts, tab, how, now, read)
 }
 
-/// [`watch_with`] reading a Codex record's process facts through `k` (the
-/// zone its wall's reset was printed in, `codex::keep_wall`): the product's
-/// [`super::Live`], a test's stand-in kernel.
-///
-/// The whole look runs at `now` ([`at_second`]): its read decides whether a
+/// [`watch_with`]'s look. The whole look runs at `now` ([`at_second`]): its read decides whether a
 /// limit still holds, a wait has run out or a reset has passed at the second
 /// the watch was given, as the look itself does — never the wall clock, which
 /// would read a limit handed a second before its reset as over.
@@ -189,9 +190,8 @@ pub(super) fn watch_in(
     how: &Watcher,
     now: u64,
     read: &dyn Fn(&Opts) -> Report,
-    k: &dyn super::codex::CodexKernel,
 ) -> Watched {
-    at_second(now, || look_at(opts, tab, how, now, read, k))
+    at_second(now, || look_at(opts, tab, how, now, read))
 }
 
 /// [`watch_in`]'s look, on a thread whose [`now_s`] reads `now`.
@@ -201,7 +201,6 @@ fn look_at(
     how: &Watcher,
     now: u64,
     read: &dyn Fn(&Opts) -> Report,
-    k: &dyn super::codex::CodexKernel,
 ) -> Watched {
     let records = tab_records(opts, tab);
     if records.is_empty() {
@@ -254,24 +253,6 @@ fn look_at(
         .map(|p| tail_to_end(&p, TAIL_BYTES).0);
     let limit_until = tail.as_deref().and_then(upgrade::transcript_limit_until);
     let limit_reset = tail.as_deref().and_then(upgrade::transcript_limit_reset);
-    // A CODEX record's reset is its wall's, on the screen: its words read
-    // once (`codex::screen_wall_text`; `None`: no screen read, and the
-    // record keeps what it had), kept as its visit keeps them
-    // (`codex::keep_wall`: placed in the zone of the Codex the read found,
-    // `r.pid`, the same words kept as first placed).
-    let codex = owed.iter().find(|(name, st)| {
-        session.as_deref() == Some(name.as_str()) && reads_screen_wall(st.agent)
-    });
-    let codex_wall = codex.and_then(|_| super::codex::screen_wall_text(opts, tab));
-    let keep_wall = |st: &mut St, text: Option<&str>| {
-        let home = PathBuf::from(&st.codex_home);
-        super::codex::keep_wall(st, text, k, r.pid, &home, now);
-    };
-    let codex_limit = codex.zip(codex_wall.as_ref()).map(|((_, st), (text, _))| {
-        let mut preview = st.clone();
-        keep_wall(&mut preview, text.as_deref());
-        preview.limit_until
-    });
     // The word the look records on the read's own record: only a Claude Code
     // visit's dry read says where it read, so only its act reads are worded.
     let claude = owed
@@ -282,7 +263,7 @@ fn look_at(
         step: r.step.clone(),
         wait,
         to: r.to.clone(),
-        limit_until: limit_reset.or(codex_limit.filter(|&until| until != 0)),
+        limit_until: limit_reset,
         wrote: Vec::new(),
         skipped: None,
     };
@@ -353,22 +334,14 @@ fn look_at(
             }
         }
         // The limit's reset as this read says it, for the owner's view
-        // (`Row::limit_passed`): Claude Code's transcript's, Codex's wall's.
-        // And whether that limit is money, no usage window
-        // (`St::limit_spend`).
+        // (`Row::limit_passed`): Claude Code's transcript's. And whether that
+        // limit is money, no usage window (`St::limit_spend`).
         if let Some(tail) = tail
             .as_deref()
             .filter(|_| ours && reads_transcript(st.agent))
         {
             st.limit_until = limit_reset.unwrap_or(0);
             st.limit_spend = upgrade::transcript_limit_spend(tail);
-        }
-        if ours
-            && reads_screen_wall(st.agent)
-            && let Some((text, spend)) = &codex_wall
-        {
-            keep_wall(&mut st, text.as_deref());
-            st.limit_spend = *spend;
         }
         out.wrote.extend(changed);
         if due {
@@ -395,21 +368,18 @@ fn look_at(
 /// Whether the watch reads `agent`'s record as Claude Code's: through its
 /// transcript, which names its limit's reset, and through its visit's dry
 /// read, which says where it read and the target it found ([`look_word`],
-/// [`sanctioned`]). A Codex record's limit is its screen's wall
-/// ([`reads_screen_wall`]).
+/// [`sanctioned`]). A Codex record (a codex-alab's relaunch) has none: its
+/// agent keeps its own limits.
 fn reads_transcript(agent: upgrade::Agent) -> bool {
     match agent {
         upgrade::Agent::Claude => true,
-        upgrade::Agent::Codex => false,
-    }
-}
-
-/// Whether `agent`'s limit is the wall on its screen, read and kept as its
-/// lane keeps it (`codex::screen_wall_text`, `codex::keep_wall`): Codex's.
-fn reads_screen_wall(agent: upgrade::Agent) -> bool {
-    match agent {
-        upgrade::Agent::Claude => false,
-        upgrade::Agent::Codex => true,
+        // Muse Code: no upgrade record of its is watched, and no Claude Code
+        // transcript is read for it. No lane yet (agy, Gemini CLI): no Claude
+        // Code transcript is read for them.
+        upgrade::Agent::Codex
+        | upgrade::Agent::Muse
+        | upgrade::Agent::Agy
+        | upgrade::Agent::Gemini => false,
     }
 }
 

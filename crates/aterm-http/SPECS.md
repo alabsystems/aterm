@@ -3,10 +3,16 @@
 
 # aterm-http: spec recovery from its 106 unit tests
 
-> Status 2026-10-16: this is the crate's migration worklist. Each of the 35 specs below is
+> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 18 tests it
+> deleted and 1 spec whose functions it deleted are gone, and the spec rows no longer cite those
+> tests. Since then the strict PEM decoder is deleted, and with it the spec relating it to the
+> lossy one, and the 2 tests §4 marked **delete** are deleted with their rows. 33 specs remain and
+> §2 maps 88 tests: the result line, the kind table, the gap histogram and §3 count those. The
+> per-file census of the 106 tests read was taken before.
+
+> Status 2026-10-16: this is the crate's migration worklist. Each of the 33 specs below is
 > proved through Trust/Clean about the compiled Rust fn, and then the tests it subsumes are
-> deleted. The 2 tests in §4 marked **delete** sample no spec and can go now. The 2 marked
-> **move-to-bench** check test data, not production code, and leave with the fixture corpus.
+> deleted. The 4 tests §4 listed outside any spec are all deleted.
 
 Source: `crates/aterm-http` (read only). I read every `#[test]` (src/client.rs 28, src/pem.rs 11,
 src/proxy.rs 16, src/stream.rs 4, src/tls.rs 2, src/uri.rs 10, src/verifier/tests.rs 10,
@@ -15,10 +21,12 @@ tests/trust_config.rs 2 = 106) and the code each one reaches. `tests/http_suite.
 fn: it only declares modules, and a grep counts 107 because of the `#[test]` in its doc comment.
 Nothing was compiled or run. The claims below come from reading the code.
 
-Result: **35 specs** cover **102 tests**. 30 specs are the primary spec of at least one test. Five
+Result: **33 specs** cover **88 tests**. 27 specs are the primary spec of at least one test. Four
 are lemmas that the others need and are only secondary specs of tests: `uri-render`,
-`pem-strict-implies-lossy`, `proxy-target-debug-redacts`, `http-number-grammar` and
-`response-accessors`. **4 tests are not spec samples** (§4).
+`proxy-target-debug-redacts`, `http-number-grammar` and `response-accessors`.
+`client-config-roots-fail-closed` is now only a secondary spec too, and
+`provider-advertises-modern-schemes` has no test left.
+**No test outside a spec is left** (§4).
 
 ## 0. Notation used in the statements
 
@@ -66,9 +74,7 @@ id	kind	functions	statement	subsumes	difficulty	blocking_gaps
 uri-parse-accept-set	contract	uri::Uri::parse, uri::{strip_prefix_ascii_ci, split_authority, parse_port, parse_port_digits, host_is_plausible}	∀ text: Uri::parse(text).is_some() ⇔ (a) 1 ≤ text.len() ≤ 8192; (b) no char c has c.is_control() or c == ' '; (c) text starts with "https://" or "http://" under ci (https tried first), rest = what follows; (d) A is non-empty and has no '@'; (e) A is either the bracket form "[" h "]" T (h = text before the first ']', non-empty, parses as Ipv6Addr; T empty or ":" P) or the plain form with at most one ':', host H before it non-empty with every byte ASCII alphanumeric or one of - . _ ~ %, and port text P after it; P, when present, is non-empty ASCII digits with 1 ≤ val_10(P) ≤ 65535. Corollaries: userinfo is rejected, never stripped; CR, LF or NUL anywhere, a non-http(s) scheme, an unbracketed IPv6 literal and a port that is 0, empty or out of range are all rejected.	userinfo_is_rejected_rather_than_stripped, control_characters_and_spaces_cannot_smuggle_a_header, only_http_and_https_are_accepted, malformed_authorities_are_rejected	&str slicing, chars()/bytes() with closures, find with a char-array pattern, split(':'), std parse::<Ipv6Addr> and ::<u16>, Option ? chaining	0,1,3,5,7,13
 uri-parse-fields	contract	uri::Uri::parse, uri::origin_form, uri::Uri::{scheme, host, port, path_and_query, authority_as_written}	∀ text with Uri::parse(text) = Some(u), using the decomposition of uri-parse-accept-set: u.scheme() = Https ⇔ the https:// prefix matched (ci); u.authority_as_written() = A byte for byte, brackets included; u.host() = h (unbracketed) in the bracket form, H in the plain form; u.port() = val_10(P) if P is present, else u.scheme().default_port(), and explicit_port ⇔ P is present; u.path_and_query() = origin(F) byte for byte (no percent-decoding or re-encoding; the fragment is dropped). Invariant: path_and_query starts with '/', and neither it nor host contains a control char or a space.	parses_a_loopback_and_a_remote_endpoint, missing_path_becomes_root_and_a_bare_query_keeps_it, a_fragment_is_dropped_and_never_reaches_the_request_line, percent_encoding_is_carried_through_verbatim, ipv6_literals_round_trip_through_brackets, the_raw_authority_and_bare_path_are_available_for_agreement_checks	String/&str contents (not just lengths), struct field views, split/starts_with/format!	0,1,2,3,5,7
 uri-render	contract	uri::Uri::{host_header, authority, path}, uri::Scheme::{default_port, as_str}	∀ u: u.host_header() = bracket(u.host) + (":" + dec(u.port) if u.explicit_port ∧ u.port ≠ u.scheme.default_port(), else ""); u.authority() = bracket(u.host) + ":" + dec(u.port); u.path() = the prefix of u.path_and_query before its first '?' (all of it if none). default_port(Http) = 80, as_str(Http) = "http"; default_port(Https) = 443, as_str(Https) = "https".	(secondary only; see §2)	&self views of String fields, format!, contains(':'), split('?')	0,1,2,3
-pem-strict	contract	pem::decode_certificates	∀ text: decode_certificates(text) = Ok(v) ⇔ Scan(text) visits k ≥ 1 blocks and every block i has a begin line terminated by SUF, label L_i = "CERTIFICATE" exactly, an end marker END + L_i + SUF after it, W(body_i) non-empty, and aterm_codec::base64::decode_strict(W(body_i)) = Ok(d_i) with d_i non-empty; then v = [d_1, …, d_k] in file order. Otherwise Err. Text outside blocks (prose, CRLF) does not affect the result. A non-CERTIFICATE label is an error, never a skip; a mismatched end label is an error (the marker is never found); an empty or certificate-free bundle is an error.	decodes_every_block_in_file_order, surrounding_prose_and_crlf_line_endings_are_tolerated, a_private_key_in_the_bundle_is_an_error_not_a_skip, a_mismatched_end_label_is_malformed, an_empty_or_certificate_free_bundle_is_an_error, invalid_base64_is_rejected, a_non_canonical_body_is_rejected, an_unterminated_block_is_rejected, trust_config::an_unparseable_ca_bundle_is_refused_rather_than_silently_empty	while-let loop over a shrinking &str, find, slicing, format!, char filter/collect into String, Vec<Vec<u8>> push, cross-crate aterm_codec base64 (needs its own spec)	0,1,3,5,7,12
-pem-lossy	contract	pem::decode_certificates_lossy	∀ text: decode_certificates_lossy(text) terminates and never panics (decreases rest.len()), and equals the in-order list of d_i over the blocks of ScanLossy(text) with L_i = "CERTIFICATE" and aterm_codec::base64::decode(W(body_i)) = Ok(d_i), d_i non-empty. Any other label (TRUSTED CERTIFICATE, PRIVATE KEY, …) and any undecodable or empty CERTIFICATE block contributes nothing; an unterminated begin line or a missing end marker ends the scan.	the_lossy_parser_skips_what_the_strict_one_refuses, the_lossy_parser_drops_undecodable_blocks_and_keeps_going, the_lossy_parser_terminates_on_every_malformed_input	loop with a decreases measure, let-else, if-let chains, &str slicing, Vec, cross-crate base64 decode	0,1,3,5,7,12
-pem-strict-implies-lossy	equivalence	pem::decode_certificates, pem::decode_certificates_lossy	∀ text: decode_certificates(text) = Ok(v) ⇒ decode_certificates_lossy(text) = v. The lossy parser loses nothing the strict one accepts. Needs the aterm_codec lemma decode_strict(x) = Ok(d) ⇒ decode(x) = Ok(d).	(secondary only; see §2)	two loops over the same scan (simulation relation), cross-crate base64 lemma	0,1,5,7,12
+pem-lossy	contract	pem::decode_certificates_lossy	∀ text: decode_certificates_lossy(text) terminates and never panics (decreases rest.len()), and equals the in-order list of d_i over the blocks of ScanLossy(text) with L_i = "CERTIFICATE" and aterm_codec::base64::decode(W(body_i)) = Ok(d_i), d_i non-empty. Any other label (TRUSTED CERTIFICATE, PRIVATE KEY, …) and any undecodable or empty CERTIFICATE block contributes nothing; an unterminated begin line or a missing end marker ends the scan.	the_lossy_parser_drops_undecodable_blocks_and_keeps_going, the_lossy_parser_terminates_on_every_malformed_input	loop with a decreases measure, let-else, if-let chains, &str slicing, Vec, cross-crate base64 decode	0,1,3,5,7,12
 proxy-resolve-selection	contract	proxy::resolve, proxy::env_text	∀ mode, target t, env: (1) resolve(Direct, t, env) = Ok(None) and env.var_os is never called. (2) resolve(Environment, t, env): let np = EnvText(env, NO_PROXY), else EnvText(env, no_proxy); if no_proxy_matches(t, np) then Ok(None). (3) Otherwise take the first n in [HTTPS_PROXY, https_proxy] (t https) or [HTTP_PROXY, http_proxy] (t http), then [ALL_PROXY, all_proxy], with EnvText(env, n) = Some(raw); the result is parse_proxy(n, raw).map(Some). (4) No such n: Ok(None). A set but unusable value (including non-Unicode, read as text with U+FFFD) decides the outcome: it is never skipped for a later variable and never becomes a direct connection.	direct_mode_ignores_every_proxy_variable, scheme_selects_the_variable, uppercase_wins_over_lowercase_and_lowercase_is_a_fallback, all_proxy_is_the_fallback_after_the_schemes_own_variable, absent_configuration_is_a_direct_connection, an_unusable_proxy_setting_is_an_error_naming_the_variable_not_a_direct_connection, a_value_that_is_not_valid_unicode_fails_closed_naming_its_variable	generic E: EnvSource (abstract oracle), OsString::to_string_lossy, trim, into_iter().chain().find_map with closures	0,1,3,4,5,11,13
 proxy-parse	contract	proxy::parse_proxy, proxy::ProxyTarget::{uri, basic_auth}	∀ name, raw: parse_proxy(name, raw) = Ok(pt) ⇔ raw.len() ≤ 8192; no char of raw is a control char, ' ' or U+FFFD; raw starts with "http://" (ci), rest = what follows; with auth = rest up to its first '/', '?' or '#' and tail the remainder: if auth contains '@', split at its LAST '@' into userinfo and HP, and userinfo at its FIRST ':' into u and p (p = "" with no ':'), requiring userinfo ≠ "", pct::decode(u) free of ':' and U+FFFD, and pct::decode(p) free of U+FFFD; with no '@', HP = auth; and Uri::parse("http://" + HP + tail) = Some(x). Then pt.uri() = x, and pt.basic_auth() = Some(base64(pct::decode(u) + ":" + pct::decode(p))) when userinfo is present, else None.	userinfo_becomes_a_basic_credential_and_leaves_the_proxy_uri, a_credential_escape_that_is_not_utf8_is_refused_not_altered	split/rsplit_once/split_once, closures, format!, cross-crate aterm_codec pct::decode and base64::encode, composition with Uri::parse ensures	0,1,3,4,5,12
 proxy-refusal-names-variable-never-value	contract	proxy::parse_proxy, proxy::resolve	∀ name, raw: parse_proxy(name, raw) = Err(e) ⇒ e = Error::Invalid(m) with m one of exactly two strings: name + " names an https:// proxy, which this client does not support; use an http:// proxy URL", chosen ⇔ raw passes the character screen, does not start with http:// (ci) and does start with https:// (ci); otherwise name + " is set but is not a usable http:// proxy URL". So every refusal from resolve names the deciding variable, and its text depends on raw only through that one bit; no credential, host or other byte of raw is echoed.	a_refusal_never_echoes_the_value, https_proxy_urls_are_refused_not_spoken_to_in_plaintext	String equality to a format! template, enum Error payload, closure `unusable`	0,1,3,5
@@ -89,13 +95,13 @@ send-pipeline-order	refinement	client::RequestBuilder::{send_with_env, send}, cl
 tls-config-lazy-and-shared	contract	client::TlsConfigCache::get, client::Client::{new, with_shared_trust}, <client::Client as Clone>::clone	∀ c and all its clones: Arc::ptr_eq on their trust and tls_config fields; with_shared_trust(a, ..).trust is ptr_eq to a. Over one TlsConfigCache's lifetime, tls::client_config(trust) is evaluated at most once whatever the number of get calls or threads, and every get returns a clone of that one result (Ok values ptr_eq, Err strings equal). A send to an Http target never calls get, so an unusable trust never fails a plain HTTP request.	repeated_https_requests_and_client_clones_build_one_tls_config, shared_trust_constructor_retains_the_callers_root_allocation, cached_tls_configuration_errors_are_shared_by_clones, plain_http_never_constructs_the_deferred_tls_configuration	Arc, OnceLock::get_or_init with a closure (concurrency), derived Clone, Result<Arc<_>,String> clone	0,2,8,13
 error-is-revoked	contract	client::Error::is_revoked, stream::revoked_error, <client::Error as From<io::Error>>::from	∀ e: e.is_revoked() ⇔ e = Io(x) ∧ x.kind() = PermissionDenied; revoked_error().kind() = PermissionDenied; From<io::Error> wraps without changing the kind. So a connect failure (ConnectionRefused) is never reported as revoked, and a guard refusal always is.	loopback::a_refused_port_is_an_error_not_a_panic	enum match with a guard, io::Error kind view	0,1,2
 stream-admit-before-every-syscall	invariant	stream::Bounded::{admit, admit_read, admit_write}, <stream::Bounded as Read/Write>, <stream::Stream as Read/Write>, stream::Stream::start_tls, stream::as_deadline_timeout	∀ Stream (plain or TLS), ∀ sequence of read/write/flush calls, including the socket calls rustls makes in complete_io and its record-read loop: each socket read, write or flush in Obs is immediately preceded, on the same thread, by an admit step: guard.is_authorized() false → Err(PermissionDenied), no socket call; deadline.remaining() None → Err(TimedOut), no socket call; otherwise only that direction's timeout is set to the remaining d (read sets the read timeout; write and flush set the write timeout). The same admit gates Stream::read/write/flush before rustls is consulted. A socket WouldBlock or TimedOut is reported as TimedOut. start_tls passes PermissionDenied and TimedOut through and returns UnexpectedEof when complete_io makes no progress mid-handshake. Consequences: once the guard turns false no further request byte reaches the socket, and no Stream operation's last socket call starts after the deadline, so a trickling peer cannot extend the total time.	plaintext_io_sets_only_its_socket_timeout_direction, a_revoked_guard_stops_writes_and_reads_on_an_open_socket, loopback::authority_revoked_before_the_write_stops_the_body_leaving_the_process, loopback::a_silent_server_hits_the_deadline_instead_of_hanging, loopback::a_dribbling_tls_peer_cannot_outlive_the_global_deadline, tls_stream::a_record_dribbled_after_the_handshake_cannot_outlive_the_global_deadline, tls_stream::authority_revoked_during_a_tls_read_stops_it	&mut self over an enum with Box<rustls::StreamOwned>, dyn Guard, atomics read on another thread, sockets and timeouts, rustls internal loops calling back into Bounded	0,2,8,12,13
-deadline-remaining	contract	stream::Deadline::{after, remaining, remaining_or_timeout}	In the clock model, for d = Deadline::after(b) taken at t0 and observed at t ≥ t0: d.remaining() = Some(t0 + b − t) if t < t0 + b, else None; never Some(0); Some(r) ⇒ r ≤ b. remaining_or_timeout() = Ok(r) ⇔ remaining() = Some(r), else Err with kind TimedOut. In particular Deadline::after(0).remaining() = None at once.	an_expired_deadline_is_a_timeout_not_a_hang, a_live_deadline_reports_a_positive_budget	Instant::now (time effect), checked_duration_since, Duration filter	0,8
+deadline-remaining	contract	stream::Deadline::{after, remaining, remaining_or_timeout}	In the clock model, for d = Deadline::after(b) taken at t0 and observed at t ≥ t0: d.remaining() = Some(t0 + b − t) if t < t0 + b, else None; never Some(0); Some(r) ⇒ r ≤ b. remaining_or_timeout() = Ok(r) ⇔ remaining() = Some(r), else Err with kind TimedOut. In particular Deadline::after(0).remaining() = None at once.	an_expired_deadline_is_a_timeout_not_a_hang	Instant::now (time effect), checked_duration_since, Duration filter	0,8
 init-crypto-installs-provider	contract	tls::{init_crypto, provider}	After any init_crypto() returns, rustls::crypto::CryptoProvider::get_default().is_some(). Every call after the first is a no-op, including calls from other threads and calls after another component installed its own provider.	init_crypto_is_idempotent	std::sync::Once with a closure, rustls process-global state	0,8,12,13
-client-config-roots-fail-closed	contract	tls::client_config	∀ ders: client_config(Roots(ders)), first rule that applies: some element is rejected by RootCertStore::add, the first at index i → Err(m) with m starting "CA bundle certificate {i+1} is not usable"; ders empty → Err("CA bundle yielded no usable certificates"); otherwise Ok(config) whose root store holds exactly the anchors from ders, with a webpki verifier and no platform anchors (Roots replaces the platform roots). Every Roots error string contains "CA bundle".	trust_config::an_empty_root_store_is_refused_rather_than_silently_trusting_nothing	for loop over enumerate, rustls RootCertStore and ClientConfig builder, String errors	0,1,7,8,12
+client-config-roots-fail-closed	contract	tls::client_config	∀ ders: client_config(Roots(ders)), first rule that applies: some element is rejected by RootCertStore::add, the first at index i → Err(m) with m starting "CA bundle certificate {i+1} is not usable"; ders empty → Err("CA bundle yielded no usable certificates"); otherwise Ok(config) whose root store holds exactly the anchors from ders, with a webpki verifier and no platform anchors (Roots replaces the platform roots). Every Roots error string contains "CA bundle".	-	for loop over enumerate, rustls RootCertStore and ClientConfig builder, String errors	0,1,7,8,12
 verifier-accepts-only-through-arm	contract	<verifier::PlatformVerifier as ServerCertVerifier>::verify_server_cert, verifier::apple::cf_string	∀ inputs: verify_server_cert(ee, ims, name, ocsp, now) = Ok(_) ⇒ name.to_str() ≠ "" ∧ inner.verify(ee, ims, name, name.to_str(), ocsp-or-None, now) = Ok(()). An empty rendered name is Err without calling the arm. On Apple, a hostname cf_string cannot encode is Err, never a NULL hostname. The arm is Ok only on an explicit positive platform verdict, so an empty name or an embedded NUL never reaches an evaluation with name checking off.	verifier::tests::a_degenerate_server_name_fails_closed_instead_of_disabling_name_checking	&self, Cow<str>, trait impl, unsafe FFI to Security.framework in the arm	0,1,2,8
 verifier-delegates-signatures	equivalence	<verifier::PlatformVerifier as ServerCertVerifier>::{verify_tls12_signature, verify_tls13_signature, supported_verify_schemes}, verifier::PlatformVerifier::new	∀ v = PlatformVerifier::new(p)?, ∀ inputs: v.verify_tls12_signature(m, c, d) = rustls::crypto::verify_tls12_signature(m, c, d, &p.signature_verification_algorithms); likewise for TLS 1.3; v.supported_verify_schemes() = p.signature_verification_algorithms.supported_schemes(). No narrowing of the scheme set, no stubbed result: a signature rustls rejects is rejected.	verifier::tests::handshake_signature_verification_is_delegated_to_the_provider, signature_methods::tls13_rejects_a_signature_that_verifies_against_nothing, signature_methods::tls12_rejects_a_signature_that_verifies_against_nothing	&self field view (Arc<CryptoProvider>), calls into rustls	0,2,12
-provider-advertises-modern-schemes	contract	tls::provider	provider().signature_verification_algorithms.supported_schemes() is non-empty and contains ECDSA_NISTP256_SHA256 and RSA_PSS_SHA256: a fact about ring's default provider, which the one-provider seam pins.	signature_methods::the_verifier_still_advertises_real_schemes	rustls/ring provider constant table, Vec contains	0,1,12
-platform-verifier-conformance	refinement	<verifier::PlatformVerifier as ServerCertVerifier>::verify_server_cert, verifier::PlatformVerifier::{new, build}, verifier::unix::Verifier::verify, verifier::apple::Verifier::verify, verifier::eku_rejected	∀ chain (ee, ims), name n, OCSP, pinned now: the arm's verdict refines V(anchors, ee, ims, n, now) (Apple additionally requires an explicit EKU), with anchors = platform anchors ∪ extra_roots (extras ADD to the system set) and new() having extra_roots = []. verify is Ok only if V accepts. The error class is one of: BadEncoding, reported before any trust evaluation for non-DER bytes (including empty); NotValidForName; UnknownIssuer; eku_rejected() for any webpki InvalidPurpose; other. Consequences: a chain rooted only in a fixture CA is rejected by new(); a chain a real system anchor validates is accepted for its own name and rejected for any other.	verifier::tests::{the_first_party_verifier_matches_its_recorded_expectations, the_webpki_chain_math_matches_its_recorded_expectations, the_shipped_constructor_trusts_no_fixture_anchor, the_system_trust_store_is_actually_consulted, extra_anchors_add_to_the_system_set_rather_than_replacing_it, a_parse_failure_is_reported_as_one_and_never_as_a_trust_verdict}	FFI (Security.framework, CryptoAPI), trustd deadline, rustls/webpki, fixture DER bytes, an X.509 model on the Lean side	0,1,8,10,12
+provider-advertises-modern-schemes	contract	tls::provider	provider().signature_verification_algorithms.supported_schemes() is non-empty and contains ECDSA_NISTP256_SHA256 and RSA_PSS_SHA256: a fact about ring's default provider, which the one-provider seam pins.	-	rustls/ring provider constant table, Vec contains	0,1,12
+platform-verifier-conformance	refinement	<verifier::PlatformVerifier as ServerCertVerifier>::verify_server_cert, verifier::PlatformVerifier::{new, build}, verifier::unix::Verifier::verify, verifier::apple::Verifier::verify, verifier::eku_rejected	∀ chain (ee, ims), name n, OCSP, pinned now: the arm's verdict refines V(anchors, ee, ims, n, now) (Apple additionally requires an explicit EKU), with anchors = platform anchors ∪ extra_roots (extras ADD to the system set) and new() having extra_roots = []. verify is Ok only if V accepts. The error class is one of: BadEncoding, reported before any trust evaluation for non-DER bytes (including empty); NotValidForName; UnknownIssuer; eku_rejected() for any webpki InvalidPurpose; other. Consequences: a chain rooted only in a fixture CA is rejected by new(); a chain a real system anchor validates is accepted for its own name and rejected for any other.	verifier::tests::{the_first_party_verifier_matches_its_recorded_expectations, the_shipped_constructor_trusts_no_fixture_anchor, the_system_trust_store_is_actually_consulted, extra_anchors_add_to_the_system_set_rather_than_replacing_it, a_parse_failure_is_reported_as_one_and_never_as_a_trust_verdict}	FFI (Security.framework, CryptoAPI), trustd deadline, rustls/webpki, fixture DER bytes, an X.509 model on the Lean side	0,1,8,10,12
 unix-store-fail-closed	contract	verifier::unix::Verifier::{from_ders, new}	∀ extra, sys, provider: some extra root rejected by RootCertStore::add → from_ders is Err (strict); otherwise S = extra ∪ {d ∈ sys | webpki parses d} (unparseable system roots skipped); S empty → Err(General(m)) with m containing "system trust store"; webpki builder failure → Err(General("system trust store is unusable: ...")); otherwise Ok with a verifier over exactly S. Verifier::new(extra, p) = from_ders(extra, system_root_ders(), p): either Ok or that loud Err, never a verifier over an empty store.	verifier::unix::{an_empty_system_store_is_a_loud_failure_not_a_silent_verifier, unparseable_system_roots_are_skipped_but_do_not_take_the_store_with_them, an_unusable_extra_anchor_is_an_error_rather_than_a_skip, the_shipped_constructor_reads_this_hosts_store}	for loop over Vec, rustls RootCertStore, Result mapping, fs effects in new()	0,1,7,8,12
 unix-cert-path-selection	contract	verifier::unix::{bundle_file, bundle_dirs, system_root_ders, collect_ders, read_pem_file}	Against FS: bundle_file(Some(p)) = Some(p) ⇔ FS.exists(p), else None (never a fallback to the built-in list); bundle_file(None) = the first existing path in CERTIFICATE_FILES; bundle_dirs(Some(l)) = [q ∈ split_paths(l) in order | q ≠ "" ∧ FS.exists(q)]; bundle_dirs(None) = the existing CERTIFICATE_DIRS in order; system_root_ders consults NEITHER built-in list when SSL_CERT_FILE is set, or SSL_CERT_DIR is set with a non-empty entry; collect_ders(f, ds) = sort_dedup(lossy(f) ++ concat over d ∈ ds and regular files e in d (symlinks followed; dangling or unreadable skipped) of lossy(e)), where lossy(x) = decode_certificates_lossy(read_to_string(x)), or [] when x is not readable as UTF-8.	verifier::unix::{a_configured_path_replaces_the_built_in_search, a_configured_cert_dir_is_a_list_of_directories, the_built_in_search_finds_this_machines_real_bundle}	PathBuf/OsString, std::fs (exists, read_dir, metadata, read_to_string), env::var_os, split_paths, iterator closures, Vec sort/dedup	0,1,7,8,13
 ```
@@ -105,12 +111,12 @@ Unqualified test names in `subsumes` are in the file that holds the spec's funct
 `trust_config::`, `tls_stream::` or `signature_methods::` prefix is the file under `tests/`;
 `verifier::tests::` and `verifier::unix::` are `src/verifier/tests.rs` and `src/verifier/unix.rs`.
 
-### Distribution by kind (35)
+### Distribution by kind (33)
 
 | kind | count | ids |
 |---|---|---|
-| contract | 27 | uri-parse-accept-set, uri-parse-fields, uri-render, pem-strict, pem-lossy, proxy-resolve-selection, proxy-parse, proxy-refusal-names-variable-never-value, proxy-target-debug-redacts, no-proxy-match, header-validation-grammar, response-header-fields, http-number-grammar, status-line-grammar, read-head-skips-interim, response-accessors, render-request-exact, connect-tunnel-exchange, tls-config-lazy-and-shared, error-is-revoked, deadline-remaining, init-crypto-installs-provider, client-config-roots-fail-closed, verifier-accepts-only-through-arm, provider-advertises-modern-schemes, unix-store-fail-closed, unix-cert-path-selection |
-| equivalence | 2 | pem-strict-implies-lossy, verifier-delegates-signatures |
+| contract | 26 | uri-parse-accept-set, uri-parse-fields, uri-render, pem-lossy, proxy-resolve-selection, proxy-parse, proxy-refusal-names-variable-never-value, proxy-target-debug-redacts, no-proxy-match, header-validation-grammar, response-header-fields, http-number-grammar, status-line-grammar, read-head-skips-interim, response-accessors, render-request-exact, connect-tunnel-exchange, tls-config-lazy-and-shared, error-is-revoked, deadline-remaining, init-crypto-installs-provider, client-config-roots-fail-closed, verifier-accepts-only-through-arm, provider-advertises-modern-schemes, unix-store-fail-closed, unix-cert-path-selection |
+| equivalence | 1 | verifier-delegates-signatures |
 | refinement | 3 | response-body-framing, send-pipeline-order, platform-verifier-conformance |
 | table-property | 1 | decide-framing-table |
 | invariant | 1 | stream-admit-before-every-syscall |
@@ -120,12 +126,12 @@ Unqualified test names in `subsumes` are in the file that holds the spec's funct
 
 | gap | specs | gap | specs |
 |---|---|---|---|
-| 0 seal admission | 35 | 7 loops | 17 |
-| 1 non-scalar carriers | 30 | 8 effects/FFI | 11 |
+| 0 seal admission | 33 | 7 loops | 15 |
+| 1 non-scalar carriers | 28 | 8 effects/FFI | 11 |
 | 2 `&self`/`&mut` views | 16 | 10 model→code refinement | 1 |
-| 3 E6 body widening | 13 | 11 generics | 6 |
-| 4 callee-ensures composition | 8 | 12 cross-crate citation | 12 |
-| 5 quantified clauses | 15 | 13 closures/threads/`OnceLock` | 13 |
+| 3 E6 body widening | 12 | 11 generics | 6 |
+| 4 callee-ensures composition | 8 | 12 cross-crate citation | 10 |
+| 5 quantified clauses | 13 | 13 closures/threads/`OnceLock` | 13 |
 
 No spec is blocked by gap 0 alone. Gap 1 is the crate's bottleneck: only 5 specs avoid it
 (`tls-config-lazy-and-shared`, `stream-admit-before-every-syscall`, `deadline-remaining`,
@@ -136,8 +142,8 @@ gap 8 or 12 instead.
 
 `http-number-grammar`, `uri-render` and `error-is-revoked` → `uri-parse-accept-set` /
 `uri-parse-fields` → `proxy-parse`, `proxy-refusal-names-variable-never-value`, `no-proxy-match` →
-`proxy-resolve-selection`. Separately: aterm_codec base64/pct specs → `pem-strict`, `pem-lossy` →
-`pem-strict-implies-lossy` → `client-config-roots-fail-closed`, `unix-cert-path-selection` →
+`proxy-resolve-selection`. Separately: aterm_codec base64/pct specs → `pem-lossy` →
+`client-config-roots-fail-closed`, `unix-cert-path-selection` →
 `unix-store-fail-closed`. On the wire: `header-validation-grammar`, `response-header-fields`,
 `status-line-grammar` → `read-head-skips-interim` + `decide-framing-table` → `response-body-framing`,
 `response-parse-no-panic` → `render-request-exact`, `connect-tunnel-exchange` → `deadline-remaining`,
@@ -145,10 +151,9 @@ gap 8 or 12 instead.
 (`verifier-delegates-signatures`, `verifier-accepts-only-through-arm`, `platform-verifier-conformance`)
 come last; the conformance spec needs the X.509 model `V`.
 
-## 2. Test → spec map (TSV; all 106)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
-`(none; §4)` marks a test that samples no spec.
 
 ```tsv
 file	test	primary	also
@@ -174,22 +179,12 @@ src/client.rs	malformed_status_lines_are_rejected	status-line-grammar
 src/client.rs	non_2xx_status_is_reported_not_hidden	response-body-framing	response-accessors
 src/client.rs	plain_http_never_constructs_the_deferred_tls_configuration	tls-config-lazy-and-shared	
 src/client.rs	plain_http_through_a_proxy_uses_absolute_form	render-request-exact	
-src/client.rs	plain_stub_drains_fragmented_request_head_and_body	(none; §4)	
 src/client.rs	repeated_https_requests_and_client_clones_build_one_tls_config	tls-config-lazy-and-shared	
 src/client.rs	response_headers_preserve_values_and_reject_controls	response-header-fields	header-validation-grammar
 src/client.rs	shared_trust_constructor_retains_the_callers_root_allocation	tls-config-lazy-and-shared	
 src/client.rs	the_parser_frames_through_decide_framing	response-body-framing	
 src/client.rs	the_proxy_credential_rides_the_absolute_form_and_never_the_tunnel	render-request-exact	
-src/pem.rs	a_mismatched_end_label_is_malformed	pem-strict	
-src/pem.rs	a_non_canonical_body_is_rejected	pem-strict	
-src/pem.rs	a_private_key_in_the_bundle_is_an_error_not_a_skip	pem-strict	
-src/pem.rs	an_empty_or_certificate_free_bundle_is_an_error	pem-strict	
-src/pem.rs	an_unterminated_block_is_rejected	pem-strict	
-src/pem.rs	decodes_every_block_in_file_order	pem-strict	
-src/pem.rs	invalid_base64_is_rejected	pem-strict	
-src/pem.rs	surrounding_prose_and_crlf_line_endings_are_tolerated	pem-strict	
 src/pem.rs	the_lossy_parser_drops_undecodable_blocks_and_keeps_going	pem-lossy	
-src/pem.rs	the_lossy_parser_skips_what_the_strict_one_refuses	pem-lossy	pem-strict-implies-lossy
 src/pem.rs	the_lossy_parser_terminates_on_every_malformed_input	pem-lossy	
 src/proxy.rs	a_credential_escape_that_is_not_utf8_is_refused_not_altered	proxy-parse	proxy-refusal-names-variable-never-value
 src/proxy.rs	a_refusal_never_echoes_the_value	proxy-refusal-names-variable-never-value	
@@ -207,12 +202,10 @@ src/proxy.rs	no_proxy_star_exempts_everything	no-proxy-match
 src/proxy.rs	scheme_selects_the_variable	proxy-resolve-selection	
 src/proxy.rs	uppercase_wins_over_lowercase_and_lowercase_is_a_fallback	proxy-resolve-selection	
 src/proxy.rs	userinfo_becomes_a_basic_credential_and_leaves_the_proxy_uri	proxy-parse	proxy-target-debug-redacts
-src/stream.rs	a_live_deadline_reports_a_positive_budget	deadline-remaining	
 src/stream.rs	a_revoked_guard_stops_writes_and_reads_on_an_open_socket	stream-admit-before-every-syscall	
 src/stream.rs	an_expired_deadline_is_a_timeout_not_a_hang	deadline-remaining	
 src/stream.rs	plaintext_io_sets_only_its_socket_timeout_direction	stream-admit-before-every-syscall	
 src/tls.rs	init_crypto_is_idempotent	init-crypto-installs-provider	
-src/tls.rs	the_platform_verifier_is_the_default_trust_model	(none; §4)	
 src/uri.rs	a_fragment_is_dropped_and_never_reaches_the_request_line	uri-parse-fields	
 src/uri.rs	control_characters_and_spaces_cannot_smuggle_a_header	uri-parse-accept-set	
 src/uri.rs	ipv6_literals_round_trip_through_brackets	uri-parse-fields	uri-render
@@ -225,14 +218,11 @@ src/uri.rs	the_raw_authority_and_bare_path_are_available_for_agreement_checks	ur
 src/uri.rs	userinfo_is_rejected_rather_than_stripped	uri-parse-accept-set	
 src/verifier/tests.rs	a_degenerate_server_name_fails_closed_instead_of_disabling_name_checking	verifier-accepts-only-through-arm	
 src/verifier/tests.rs	a_parse_failure_is_reported_as_one_and_never_as_a_trust_verdict	platform-verifier-conformance	
-src/verifier/tests.rs	every_local_fixture_is_hermetic	(none; §4)	
 src/verifier/tests.rs	extra_anchors_add_to_the_system_set_rather_than_replacing_it	platform-verifier-conformance	
 src/verifier/tests.rs	handshake_signature_verification_is_delegated_to_the_provider	verifier-delegates-signatures	
-src/verifier/tests.rs	the_corpus_is_armed_in_both_directions	(none; §4)	
 src/verifier/tests.rs	the_first_party_verifier_matches_its_recorded_expectations	platform-verifier-conformance	
 src/verifier/tests.rs	the_shipped_constructor_trusts_no_fixture_anchor	platform-verifier-conformance	
 src/verifier/tests.rs	the_system_trust_store_is_actually_consulted	platform-verifier-conformance	
-src/verifier/tests.rs	the_webpki_chain_math_matches_its_recorded_expectations	platform-verifier-conformance	
 src/verifier/unix.rs	a_configured_cert_dir_is_a_list_of_directories	unix-cert-path-selection	
 src/verifier/unix.rs	a_configured_path_replaces_the_built_in_search	unix-cert-path-selection	
 src/verifier/unix.rs	an_empty_system_store_is_a_loud_failure_not_a_silent_verifier	unix-store-fail-closed	
@@ -251,77 +241,56 @@ tests/loopback.rs	an_https_proxy_is_refused_before_any_byte_reaches_it	send-pipe
 tests/loopback.rs	an_unusable_endpoint_fails_before_any_socket_is_opened	send-pipeline-order	
 tests/loopback.rs	authority_revoked_before_the_write_stops_the_body_leaving_the_process	stream-admit-before-every-syscall	error-is-revoked
 tests/loopback.rs	userinfo_in_the_proxy_url_authenticates_the_connect	connect-tunnel-exchange	proxy-parse
-tests/signature_methods.rs	the_verifier_still_advertises_real_schemes	provider-advertises-modern-schemes	
 tests/signature_methods.rs	tls12_rejects_a_signature_that_verifies_against_nothing	verifier-delegates-signatures	
 tests/signature_methods.rs	tls13_rejects_a_signature_that_verifies_against_nothing	verifier-delegates-signatures	
 tests/tls_stream.rs	a_record_dribbled_after_the_handshake_cannot_outlive_the_global_deadline	stream-admit-before-every-syscall	
 tests/tls_stream.rs	authority_revoked_during_a_tls_read_stops_it	stream-admit-before-every-syscall	
-tests/trust_config.rs	an_empty_root_store_is_refused_rather_than_silently_trusting_nothing	client-config-roots-fail-closed	
-tests/trust_config.rs	an_unparseable_ca_bundle_is_refused_rather_than_silently_empty	pem-strict	pem-lossy, client-config-roots-fail-closed
 ```
 
 ## 3. Coverage
 
-- 106 tests read. 102 map to one of the 35 specs; 4 are not spec samples (§4).
-- The biggest collapses: `pem-strict` (9 primary), `proxy-resolve-selection` (7),
-  `response-body-framing` (7), `stream-admit-before-every-syscall` (7, across three test files),
-  `uri-parse-fields` (6), `platform-verifier-conformance` (6).
-- `http-number-grammar`, `uri-render`, `pem-strict-implies-lossy`, `proxy-target-debug-redacts` and
-  `response-accessors` retire no test alone, but the larger specs cite them as lemmas, and they
-  are a secondary spec of 11 tests.
+- 106 tests read. 102 mapped to one of the 35 specs and 4 were not spec samples (§4). After the
+  deletions since, 88 map to one of the 33 specs and none is outside a spec.
+- The biggest collapses: `proxy-resolve-selection` (7 primary), `response-body-framing` (7),
+  `stream-admit-before-every-syscall` (7, across three test files), `uri-parse-fields` (6), then
+  `render-request-exact`, `no-proxy-match` and `platform-verifier-conformance` (5 each).
+- `http-number-grammar`, `uri-render`, `proxy-target-debug-redacts` and `response-accessors` retire
+  no test alone, but the larger specs cite them as lemmas, and they are a secondary spec of 10
+  tests.
 - A test leaves the suite only when **every** spec in its row (primary and `also`) is proved. For
   example, `framing_refuses_every_response_whose_end_is_ambiguous` waits on both
   `decide-framing-table` and `http-number-grammar`.
 
 ## 4. Tests that are not spec samples
 
-Status (2026-10-16): the two **delete** rows below are deleted from the crate.
+Status (2026-10-16): none is left. The 2 tests this section marked **delete** and the 2 it marked
+**move-to-bench** are deleted from the crate, and their rows are gone from it and from §2.
 
-| test | why | action |
-|---|---|---|
-| src/client.rs::plain_stub_drains_fragmented_request_head_and_body | It tests only the `#[cfg(test)]` fixture helper `read_plain_request`, plus std's `Chain`/`Cursor` read semantics. No production code is reached. | **delete** |
-| src/tls.rs::the_platform_verifier_is_the_default_trust_model | It only checks that `client_config(&Trust::PlatformVerifier)` builds on this host. `tests/signature_methods.rs::verifier()` makes the same call with the same `expect`, and the verifier corpus covers construction. `Trust` has no `Default`, so the name claims a property it never checks. | **delete** |
-| src/verifier/tests.rs::the_corpus_is_armed_in_both_directions | It counts accept and reject rows in the test-only `CORPUS` const: a check on test data, meaningful only while the corpus conformance test exists. | **move-to-bench** (with the fixture corpus) |
-| src/verifier/tests.rs::every_local_fixture_is_hermetic | It byte-scans the fixture DER files for AIA and CRLDP OIDs: a lint on test data with no production caller. | **move-to-bench** (with the fixture corpus) |
-
-By action: delete 2, move-to-bench 2. No test is a pure regression of a removed bug with no general
-property; every regression-shaped test (header smuggling, the usize chunk-size wrap, the dribbling
+No test is a pure regression of a removed bug with no general property; every regression-shaped test (header smuggling, the usize chunk-size wrap, the dribbling
 TLS peer) is an instance of a spec above.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
 1. **The crate's test count is 106, not 107.** `tests/http_suite.rs` contains no `#[test]` fn; the
    only `#[test]` is in a doc comment, and the file just declares modules. A grep-based count is off by one.
-2. **The webpki column checks a copy of the shipped arm.**
-   `verifier::tests::the_webpki_chain_math_matches_its_recorded_expectations` rewrites the Unix arm's
-   `InvalidPurpose → eku_rejected` mapping inline instead of calling
-   `unix::Verifier::from_ders(..).verify`, although `unix` is compiled in Apple test builds. Its verdicts
-   are about a copy that can drift from the arm. `platform-verifier-conformance` is stated about the
-   arm itself.
-3. **A mislabelled test.** `tls::the_platform_verifier_is_the_default_trust_model` checks no default;
-   `Trust` has no `Default` impl (§4).
-4. **Misleading leftover code.** In
+2. **Misleading leftover code.** In
    `verifier::tests::a_parse_failure_is_reported_as_one_and_never_as_a_trust_verdict` the per-iteration
    `Case` is built with chain `&[MALFORMED]` for both inputs, and only its `now` field is used. The
    verified bytes come from the loop variable.
-5. **A framing case the shipped parser cannot reach.**
+3. **A framing case the shipped parser cannot reach.**
    `framing_refuses_every_response_whose_end_is_ambiguous` includes `("Content-Length", "5 ")`. Through
    the real parser `read_header_fields` trims SP/HTAB, so `Content-Length: 5 ` on the wire is
    **accepted** as 5. The case samples `decide_framing` in isolation, not the end-to-end behaviour its
    comment implies. `decide-framing-table` and `response-header-fields` together state what actually
    happens.
-6. **Timing-shaped stream tests.** `stream::an_expired_deadline_is_a_timeout_not_a_hang` sleeps 2 ms
-   for nothing: `Deadline::after(0)` is already expired (`remaining` filters out zero), and no hang is
-   exercised. `stream::a_live_deadline_reports_a_positive_budget` asserts a wall-clock ratio (more than
-   20 s left of 30 s). `deadline-remaining` replaces both with the clock-model statement.
-7. **A latency budget that passes vacuously.**
+4. **A latency budget that passes vacuously.**
    `loopback::authority_revoked_before_the_write_stops_the_body_leaving_the_process` waits on the server
    with `recv_timeout(5 s).unwrap_or_default()`. That is a latency budget, against the AGENTS.md
    hang-detector rule, and a timeout yields an empty buffer that passes. The guard is also false from
    the start, so the test checks revocation before connect, not while the request is in flight;
    `TcpConnector` opens the socket without consulting the guard. `stream-admit-before-every-syscall`
    states the in-flight property.
-8. **An unchecked error kind.** `loopback::a_silent_server_hits_the_deadline_instead_of_hanging`
+5. **An unchecked error kind.** `loopback::a_silent_server_hits_the_deadline_instead_of_hanging`
    discards the error (`let _ = error`) and never checks that it is a `TimedOut` Io error; only the
    elapsed time is bounded. The spec requires `Err(TimedOut)`.
 
@@ -334,7 +303,7 @@ No spec here is blocked by gap 0 alone, so the order prefers the smallest remain
    `a_refused_port_is_an_error_not_a_panic`, and is the error vocabulary that
    `stream-admit-before-every-syscall` and `send-pipeline-order` cite.
 2. **`deadline-remaining`** (gaps 0, 8). Pure `Duration` arithmetic once `Instant::now` is a clock
-   effect. It replaces two timing-shaped tests (§5.6) and is the timeout half of the stream invariant.
+   effect. It is the timeout half of the stream invariant.
 3. **`http-number-grammar`** (gaps 0, 1, 3, 5, 7). A single `chars().all` loop and a `from_str_radix`
    std spec over `&str`. It is the lemma under `status-line-grammar`, `decide-framing-table` and the
    chunk sizes of `response-body-framing`, which together hold 13 primary tests.

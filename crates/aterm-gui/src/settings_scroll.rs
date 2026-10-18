@@ -474,6 +474,17 @@ impl SettingsViewState {
         self.landing_reveal = false;
     }
 
+    /// A page opened FOR one of its controls (Settings ▸ Harness's `⚙`,
+    /// `docs/DESIGN-harness-autopilot-2026-10-15.md` §10.3.3 item 8): the
+    /// list LANDS on `key`'s stop — a landing's reveal, which the render
+    /// follows whether or not one has measured the list yet, and which a
+    /// stop already drawn whole leaves where it is — and the keyboard stays
+    /// where it was.
+    pub(super) fn land_on_control(&mut self, key: UiKey) {
+        self.page_reveal = Some(key);
+        self.landing_reveal = true;
+    }
+
     /// Forget the list: a new route, search or sheet starts at its top —
     /// except that the Cursor Styles list has a current item, so it opens with
     /// the saved style's row in view, as Down and every cursor style control
@@ -1097,12 +1108,15 @@ impl SplitCard {
     /// The card's rows grouped into list stops, so no screen ends on a card's
     /// words without the control they belong to: a row with no control keeps
     /// with the row after it while a control still follows in the card (a
-    /// description with the first control, a status line with its switch, an
-    /// unavailable slider's words with it), and trailing rows with no control
-    /// keep with the row before (a caption with the switches it explains) —
-    /// each only while the stop still fits `room` under the card's head. A
-    /// card of words alone (About's build facts) is a stop per row, so a
-    /// screen holds as many of them as fit.
+    /// description with the first control, a CLI's state with its switch, an
+    /// unavailable slider's words with it); a status line (a
+    /// [`SemanticRole::Status`] group) right under a control's row is that
+    /// control's own and keeps with it instead, and where the two outgrow a
+    /// screen it is the stop right after that row, never the next control's;
+    /// and trailing rows with no control keep with the row before (a caption
+    /// with the switches it explains) — each only while the stop still fits
+    /// `room` under the card's head. A card of words alone (About's build
+    /// facts) is a stop per row, so a screen holds as many of them as fit.
     pub(super) fn stops(&self, room: f32) -> Vec<Range<usize>> {
         let room = room - self.height_of_head();
         let height = |rows: Range<usize>| {
@@ -1117,11 +1131,31 @@ impl SplitCard {
             .map(|(node, _)| holds_control(node))
             .collect();
         let has_control = |rows: &Range<usize>| controls[rows.clone()].iter().any(|row| *row);
+        // Whether `row` is a status line right under a control's row: it says
+        // how that control stands, so it belongs to it. Every other row of
+        // words keeps the forward rule (the AI card's CLI state row heads the
+        // switch after it, though the previous CLI's switch is right above).
+        let under_control = |row: usize| {
+            row > 0
+                && controls[row - 1]
+                && !controls[row]
+                && matches!(
+                    &self.rows[row].0.content,
+                    UiContent::Group(GroupSpec {
+                        role: SemanticRole::Status,
+                        ..
+                    })
+                )
+        };
         let mut stops: Vec<Range<usize>> = Vec::new();
         for row in 0..self.rows.len() {
             match stops.last_mut() {
+                Some(stop) if under_control(row) && height(stop.start..row + 1) <= room + 0.01 => {
+                    stop.end = row + 1;
+                }
                 Some(stop)
                     if !has_control(stop)
+                        && !under_control(stop.start)
                         && controls[row..].iter().any(|control| *control)
                         && height(stop.start..row + 1) <= room + 0.01 =>
                 {
@@ -1466,6 +1500,39 @@ mod tests {
         assert_eq!(card.stops(1_000.0), vec![0..2, 2..4]);
         // A stop that would outgrow the room stays a row.
         assert_eq!(card.stops(60.0), vec![0..1, 1..2, 2..3, 3..4]);
+
+        // A status line right under a control's row (its switch) keeps with
+        // it; where the two outgrow a screen it is the stop right after it,
+        // never joined to the next control it says nothing about.
+        let status = UiNode::new(
+            "status",
+            UiContent::Group(GroupSpec {
+                label: Some("Audio unavailable".to_string()),
+                role: SemanticRole::Status,
+                style: StyleRef::Quiet,
+            }),
+        );
+        let card = SplitCard {
+            rows: vec![
+                (control("switch"), 40.0),
+                (status, 10.0),
+                (control("next"), 20.0),
+            ],
+            ..card
+        };
+        assert_eq!(card.stops(1_000.0), vec![0..2, 2..3]);
+        assert_eq!(card.stops(60.0), vec![0..1, 1..2, 2..3]);
+        // Other words under a control go with the next one, as a CLI's state
+        // row goes with its switch.
+        let card = SplitCard {
+            rows: vec![
+                (control("switch"), 40.0),
+                (words("next/words"), 10.0),
+                (control("next"), 20.0),
+            ],
+            ..card
+        };
+        assert_eq!(card.stops(1_000.0), vec![0..1, 1..3]);
     }
 
     fn words(key: &str) -> UiNode {

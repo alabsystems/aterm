@@ -7,8 +7,11 @@
 //! Added by the aterm project in 2026; see the repository NOTICE.
 //!
 //! The Wayland CLIPBOARD and PRIMARY selections — a clipboard API upstream winit
-//! does not have, over the sctk data device this backend already binds per seat
-//! for drag-and-drop, plus a primary-selection device bound beside it.
+//! does not have, over the data device this backend already binds per seat
+//! for drag-and-drop, plus a primary-selection device bound beside it. Both are
+//! first-party `aterm_wayland::selection`'s since LW.7 (sctk's before;
+//! docs/AUDIT-third-party-2026-10-15.md), whose answers LW.6 held to Mutter with
+//! a real seat.
 //!
 //! WHY (aterm, 2026-09-15): on a Wayland session with no XWayland the GUI's only
 //! clipboard was X11, so every copy, paste, copy-on-select and OSC 52 was inert
@@ -36,25 +39,20 @@
 //! loop on its own reply, so it answers `None` there — callers run foreign reads
 //! on a worker, exactly as they already do for the X11 backend.
 
-use std::io::{Read, Write};
+use std::ffi::{CStr, CString};
+use std::io::{PipeReader, Read, Write};
+use std::os::fd::OwnedFd;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
-use sctk::data_device_manager::data_source::CopyPasteSource;
-use sctk::data_device_manager::{ReadPipe, WritePipe};
-use sctk::primary_selection::device::PrimarySelectionDeviceHandler;
-use sctk::primary_selection::selection::{PrimarySelectionSource, PrimarySelectionSourceHandler};
-use sctk::reexports::calloop::channel::Sender;
-use sctk::reexports::client::backend::ObjectId;
-use sctk::reexports::client::protocol::wl_data_source::WlDataSource;
-use sctk::reexports::client::{Connection, QueueHandle};
-use sctk::reexports::protocols::wp::primary_selection::zv1::client::zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1;
-use sctk::reexports::protocols::wp::primary_selection::zv1::client::zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1;
+use aterm_wayland::selection::{Source, SourceEvent};
 use tracing::{debug, warn};
 
+use super::seat::data_device::set_nonblocking;
 use super::state::WinitState;
+use crate::platform_impl::common::poll::Waker;
 
 /// Which selection a request addresses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -68,6 +66,10 @@ pub enum WaylandSelection {
 /// The text mime types a copy offers, and the order a paste prefers them in.
 const TEXT_MIMES: [&str; 5] =
     ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain", "TEXT", "STRING"];
+
+/// [`TEXT_MIMES`] as a source offers them.
+const TEXT_MIMES_C: [&CStr; 5] =
+    [c"text/plain;charset=utf-8", c"UTF8_STRING", c"text/plain", c"TEXT", c"STRING"];
 
 /// A foreign paste larger than this is cut off: a terminal paste is text, and an
 /// unbounded read of a hostile source must not exhaust memory.
@@ -189,20 +191,48 @@ impl Shared {
 #[derive(Default)]
 pub(crate) struct ClipboardState {
     shared: Arc<Mutex<Shared>>,
-    clipboard_source: Option<CopyPasteSource>,
-    primary_source: Option<PrimarySelectionSource>,
+    clipboard_source: Option<Offered>,
+    primary_source: Option<Offered>,
+    /// How many sources this client has made: the last one's number.
+    sources_made: u64,
+}
+
+/// A source this client offers, with the number the clipboard gave it when it was made: its
+/// requests reach the loop's inbox under that number, and only the current source's are
+/// served (as sctk's handlers compared the source they were called for with the current one).
+pub(crate) struct Offered {
+    number: u64,
+    /// Dropping it destroys it, which is the release.
+    _source: Source,
 }
 
 impl ClipboardState {
     pub(crate) fn shared(&self) -> Arc<Mutex<Shared>> {
         Arc::clone(&self.shared)
     }
+
+    /// The source this client offers for `selection`.
+    fn offered(&self, selection: WaylandSelection) -> Option<&Offered> {
+        match selection {
+            WaylandSelection::Clipboard => self.clipboard_source.as_ref(),
+            WaylandSelection::Primary => self.primary_source.as_ref(),
+        }
+    }
+
+    fn offered_mut(&mut self, selection: WaylandSelection) -> &mut Option<Offered> {
+        match selection {
+            WaylandSelection::Clipboard => &mut self.clipboard_source,
+            WaylandSelection::Primary => &mut self.primary_source,
+        }
+    }
 }
 
 /// The public handle: clone it anywhere, call it from any thread.
 #[derive(Clone)]
 pub struct WaylandClipboard {
-    sender: Arc<Mutex<Sender<ClipboardRequest>>>,
+    sender: mpsc::Sender<ClipboardRequest>,
+    /// Wakes the loop for a request it should answer now.
+    waker: Waker,
     shared: Arc<Mutex<Shared>>,
     loop_thread: ThreadId,
 }
@@ -223,15 +253,20 @@ impl std::fmt::Debug for WaylandClipboard {
 
 impl WaylandClipboard {
     pub(crate) fn new(
-        sender: Sender<ClipboardRequest>,
+        sender: mpsc::Sender<ClipboardRequest>,
+        waker: Waker,
         shared: Arc<Mutex<Shared>>,
         loop_thread: ThreadId,
     ) -> Self {
-        Self { sender: Arc::new(Mutex::new(sender)), shared, loop_thread }
+        Self { sender, waker, shared, loop_thread }
     }
 
     fn send(&self, request: ClipboardRequest) -> bool {
-        self.sender.lock().map(|s| s.send(request).is_ok()).unwrap_or(false)
+        let sent = self.sender.send(request).is_ok();
+        if sent {
+            self.waker.wake();
+        }
+        sent
     }
 
     /// Place `text` on `selection`. The own slot is written at once; the loop takes
@@ -313,21 +348,25 @@ fn copy_verdict(verdict: &mpsc::Receiver<CopyOutcome>) -> bool {
     }
 }
 
-/// Write `bytes` to a requester's pipe on a helper thread. The pipe may be
-/// non-blocking (the requester made it), so `WouldBlock` is waited out; a closed
-/// reader (`EPIPE`) ends the write — the requester gave up, nothing to do.
-fn write_on_thread(mut pipe: WritePipe, bytes: Vec<u8>) {
+/// Write `bytes` to a requester's pipe on a helper thread. Refuse a pipe we
+/// cannot make non-blocking, so a stalled reader cannot park the worker in a write.
+/// A closed reader (`EPIPE`) ends the write — the requester gave up, nothing to do.
+fn write_on_thread(pipe: OwnedFd, bytes: Vec<u8>) {
+    if set_nonblocking(&pipe).is_err() {
+        return;
+    }
+    let mut pipe = std::fs::File::from(pipe);
     let _ = std::thread::Builder::new().name("wayland-clipboard-send".into()).spawn(move || {
         let deadline = Instant::now() + PASTE_TIMEOUT;
         let mut at = 0;
         while at < bytes.len() {
+            if Instant::now() >= deadline {
+                break;
+            }
             match pipe.write(&bytes[at..]) {
                 Ok(0) => break,
                 Ok(n) => at += n,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    if Instant::now() >= deadline {
-                        break;
-                    }
                     std::thread::sleep(Duration::from_millis(2));
                 },
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {},
@@ -339,12 +378,20 @@ fn write_on_thread(mut pipe: WritePipe, bytes: Vec<u8>) {
 }
 
 /// Read a foreign offer's pipe to EOF on a helper thread and answer `reply`.
-fn read_on_thread(mut pipe: ReadPipe, reply: mpsc::Sender<Option<String>>) {
+/// Refuse a pipe we cannot make non-blocking before starting the worker.
+fn read_on_thread(mut pipe: PipeReader, reply: mpsc::Sender<Option<String>>) {
+    if set_nonblocking(&pipe).is_err() {
+        let _ = reply.send(None);
+        return;
+    }
     let _ = std::thread::Builder::new().name("wayland-clipboard-recv".into()).spawn(move || {
         let deadline = Instant::now() + PASTE_TIMEOUT;
         let mut bytes = Vec::new();
         let mut buf = [0u8; 8192];
         loop {
+            if Instant::now() >= deadline {
+                break;
+            }
             match pipe.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
@@ -355,9 +402,6 @@ fn read_on_thread(mut pipe: ReadPipe, reply: mpsc::Sender<Option<String>>) {
                     }
                 },
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    if Instant::now() >= deadline {
-                        break;
-                    }
                     std::thread::sleep(Duration::from_millis(2));
                 },
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {},
@@ -458,13 +502,13 @@ pub(crate) trait SelectionPort {
 
 /// [`SelectionPort`] over the real thing: one seat of the event loop's state.
 ///
-/// The seat is held by OBJECT ID, not by reference, so [`SelectionPort::release`]
-/// can take the standing source out of the state before [`SelectionPort::claim`]
-/// borrows the seat again; a reference held across both steps would pin it.
+/// The seat is held by its registry NAME, not by reference, so
+/// [`SelectionPort::release`] can take the standing source out of the state before
+/// [`SelectionPort::claim`] borrows the seat again; a reference held across both
+/// steps would pin it.
 struct WinitSelectionPort<'a> {
     state: &'a mut WinitState,
-    seat: ObjectId,
-    qh: QueueHandle<WinitState>,
+    seat: u32,
 }
 
 impl SelectionPort for WinitSelectionPort<'_> {
@@ -476,70 +520,62 @@ impl SelectionPort for WinitSelectionPort<'_> {
     }
 
     fn offers(&self, selection: WaylandSelection) -> bool {
-        match selection {
-            WaylandSelection::Clipboard => self.state.clipboard.clipboard_source.is_some(),
-            WaylandSelection::Primary => self.state.clipboard.primary_source.is_some(),
-        }
+        self.state.clipboard.offered(selection).is_some()
     }
 
-    /// Dropping the source IS the release: in the pinned smithay-client-toolkit
-    /// 0.19.2, `CopyPasteSource` (`data_device_manager/data_source.rs:127`) and
-    /// `PrimarySelectionSource` (`primary_selection/selection.rs:54`) each destroy
-    /// their proxy in `Drop`, so the `inner().destroy()` that used to stand beside
-    /// the drop only ever queued a second destroy for wayland-rs to discard.
+    /// Dropping the source IS the release: aterm-wayland's `Source` destroys its
+    /// proxy in `Drop` (as smithay-client-toolkit 0.19.2's `CopyPasteSource` and
+    /// `PrimarySelectionSource` did before LW.7).
     fn release(&mut self, selection: WaylandSelection) {
-        match selection {
-            WaylandSelection::Clipboard => drop(self.state.clipboard.clipboard_source.take()),
-            WaylandSelection::Primary => drop(self.state.clipboard.primary_source.take()),
-        }
+        drop(self.state.clipboard.offered_mut(selection).take());
     }
 
     fn claim(&mut self, selection: WaylandSelection, serial: u32) -> bool {
-        let seat = &self.seat;
-        match selection {
-            WaylandSelection::Clipboard => {
-                let device = self.state.seats.get(seat).and_then(|seat| seat.data_device.as_ref());
-                match (self.state.data_device_manager_state.as_ref(), device) {
-                    (Some(manager), Some(device)) => {
-                        let source = manager.create_copy_paste_source(&self.qh, TEXT_MIMES);
-                        source.set_selection(device, serial);
-                        self.state.clipboard.clipboard_source = Some(source);
-                        true
-                    },
-                    _ => false,
-                }
+        let number = self.state.clipboard.sources_made + 1;
+        let seat = self.state.seats.get(&self.seat);
+        let (manager, device) = match selection {
+            WaylandSelection::Clipboard => (
+                self.state.data_device_manager.as_ref(),
+                seat.and_then(|seat| seat.data_device.as_ref()),
+            ),
+            WaylandSelection::Primary => (
+                self.state.primary_selection_manager.as_ref(),
+                seat.and_then(|seat| seat.primary_device.as_ref()),
+            ),
+        };
+        let (Some(manager), Some(device)) = (manager, device) else {
+            return false;
+        };
+        let requests = self.state.inbox.source_sink(selection, number);
+        let source = match Source::new(manager, &TEXT_MIMES_C, 0, requests) {
+            Ok(source) => source,
+            Err(_error) => {
+                warn!("wayland clipboard: no {selection:?} source: {_error}");
+                return false;
             },
-            WaylandSelection::Primary => {
-                let device =
-                    self.state.seats.get(seat).and_then(|seat| seat.primary_device.as_ref());
-                match (self.state.primary_selection_manager_state.as_ref(), device) {
-                    (Some(manager), Some(device)) => {
-                        let source = manager.create_selection_source(&self.qh, TEXT_MIMES);
-                        source.set_selection(device, serial);
-                        self.state.clipboard.primary_source = Some(source);
-                        true
-                    },
-                    _ => false,
-                }
-            },
-        }
+        };
+        device.set_selection(Some(&source), serial);
+        let clipboard = &mut self.state.clipboard;
+        clipboard.sources_made = number;
+        *clipboard.offered_mut(selection) = Some(Offered { number, _source: source });
+        true
     }
 }
 
 impl WinitState {
     /// The seat a copy speaks for: the one whose keyboard or pointer last gave
     /// this client a serial — the compositor validates `set_selection` against it.
-    /// Answered by OBJECT ID rather than by reference, so the caller can take the
-    /// standing source out of `self` before it borrows the seat again.
-    fn clipboard_seat(&self) -> Option<(ObjectId, u32)> {
+    /// Answered by registry name rather than by reference, so the caller can take
+    /// the standing source out of `self` before it borrows the seat again.
+    fn clipboard_seat(&self) -> Option<(u32, u32)> {
         self.seats
-            .iter()
-            .map(|(id, seat)| (id.clone(), seat.latest_serial()))
+            .keys()
+            .map(|id| (*id, self.seats_book.latest_serial(*id).unwrap_or_default()))
             .filter(|(_, serial)| *serial != 0)
             .max_by_key(|(_, serial)| *serial)
     }
 
-    /// The loop-thread side of a request (the calloop channel callback).
+    /// The loop-thread side of a request (the loop's request channel).
     pub(crate) fn handle_clipboard_request(&mut self, request: ClipboardRequest) {
         match request {
             ClipboardRequest::Copy { selection, ack } => {
@@ -559,13 +595,12 @@ impl WinitState {
     /// seat pick and what a refusal costs — the own slot, which must not keep
     /// answering with text the compositor never took.
     fn clipboard_copy(&mut self, selection: WaylandSelection) -> CopyOutcome {
-        let qh: QueueHandle<Self> = self.queue_handle.clone();
         let Some((seat, serial)) = self.clipboard_seat() else {
             warn!("wayland clipboard: no seat has given this client an input serial yet — {selection:?} copy not offered");
             self.clipboard_disown(selection);
             return CopyOutcome::Refused(CopyRefusal::NoSerial);
         };
-        let outcome = WinitSelectionPort { state: self, seat, qh }.copy(selection, serial);
+        let outcome = WinitSelectionPort { state: self, seat }.copy(selection, serial);
         if let CopyOutcome::Refused(refusal) = outcome {
             match refusal {
                 CopyRefusal::NoDevice => {
@@ -591,10 +626,7 @@ impl WinitState {
     /// empty the own slot. The two belong together — the old code emptied the slot
     /// while still owning the selection, which left our source serving nothing.
     fn clipboard_disown(&mut self, selection: WaylandSelection) {
-        match selection {
-            WaylandSelection::Clipboard => drop(self.clipboard.clipboard_source.take()),
-            WaylandSelection::Primary => drop(self.clipboard.primary_source.take()),
-        }
+        drop(self.clipboard.offered_mut(selection).take());
         if let Ok(mut shared) = self.clipboard.shared.lock() {
             *shared.slot(selection) = None;
         }
@@ -613,18 +645,15 @@ impl WinitState {
                 return;
             }
         }
-        let pipe: Option<ReadPipe> = match selection {
-            WaylandSelection::Clipboard => self.seats.values().find_map(|seat| {
-                let offer = seat.data_device.as_ref()?.data().selection_offer()?;
-                let mime = offer.with_mime_types(pick_text_mime)?;
-                offer.receive(mime).ok()
-            }),
-            WaylandSelection::Primary => self.seats.values().find_map(|seat| {
-                let offer = seat.primary_device.as_ref()?.data().selection_offer()?;
-                let mime = offer.with_mime_types(pick_text_mime)?;
-                offer.receive(mime).ok()
-            }),
-        };
+        let pipe: Option<PipeReader> = self.seats.values().find_map(|seat| {
+            let device = match selection {
+                WaylandSelection::Clipboard => seat.data_device.as_ref(),
+                WaylandSelection::Primary => seat.primary_device.as_ref(),
+            }?;
+            let offer = device.selection()?;
+            let mime = CString::new(pick_text_mime(&offer.mime_types)?).ok()?;
+            device.receive_selection(&mime).ok()
+        });
         match pipe {
             Some(pipe) => read_on_thread(pipe, reply),
             None => {
@@ -633,84 +662,37 @@ impl WinitState {
         }
     }
 
-    /// `wl_data_source.send` for a source of ours: serve the CLIPBOARD text.
-    pub(crate) fn clipboard_send_request(&mut self, source: &WlDataSource, fd: WritePipe) -> bool {
-        if !self.clipboard.clipboard_source.as_ref().is_some_and(|ours| ours.inner() == source) {
-            return false;
-        }
-        let text = self
-            .clipboard
-            .shared
-            .lock()
-            .ok()
-            .and_then(|shared| shared.clipboard.clone())
-            .unwrap_or_default();
-        write_on_thread(fd, text.into_bytes());
-        true
-    }
-
-    /// `wl_data_source.cancelled` for a source of ours: a foreign client took
-    /// the CLIPBOARD (or ours was replaced). Only the CURRENT source disowns.
-    pub(crate) fn clipboard_cancelled(&mut self, source: &WlDataSource) -> bool {
-        let ours =
-            self.clipboard.clipboard_source.as_ref().is_some_and(|ours| ours.inner() == source);
-        if ours {
-            self.clipboard_disown(WaylandSelection::Clipboard);
-        } else {
-            source.destroy();
-        }
-        ours
-    }
-}
-
-impl PrimarySelectionDeviceHandler for WinitState {
-    fn selection(
+    /// A request to one of the sources this client offers, where the inbox has it: a `send` is
+    /// served the selection's text on a helper thread, and a `cancelled` (a foreign client took
+    /// the selection, or ours was replaced) disowns it. A request to a source that is no longer
+    /// the selection's is dropped with its descriptor: only the CURRENT source disowns, and a
+    /// replaced one is gone already.
+    pub(crate) fn source_event(
         &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _device: &ZwpPrimarySelectionDeviceV1,
+        selection: WaylandSelection,
+        source: u64,
+        event: SourceEvent,
     ) {
-        // sctk stores the offer on the device's data; a paste reads it on demand.
-    }
-}
-
-impl PrimarySelectionSourceHandler for WinitState {
-    fn send_request(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        source: &ZwpPrimarySelectionSourceV1,
-        _mime: String,
-        write_pipe: WritePipe,
-    ) {
-        if !self.clipboard.primary_source.as_ref().is_some_and(|ours| ours.inner() == source) {
+        if self.clipboard.offered(selection).map(|offered| offered.number) != Some(source) {
             return;
         }
-        let text = self
-            .clipboard
-            .shared
-            .lock()
-            .ok()
-            .and_then(|shared| shared.primary.clone())
-            .unwrap_or_default();
-        write_on_thread(write_pipe, text.into_bytes());
-    }
-
-    fn cancelled(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        source: &ZwpPrimarySelectionSourceV1,
-    ) {
-        if self.clipboard.primary_source.as_ref().is_some_and(|ours| ours.inner() == source) {
-            self.clipboard_disown(WaylandSelection::Primary);
-        } else {
-            source.destroy();
+        match event {
+            SourceEvent::Send { fd, .. } => {
+                let text = self
+                    .clipboard
+                    .shared
+                    .lock()
+                    .ok()
+                    .and_then(|mut shared| shared.slot(selection).clone())
+                    .unwrap_or_default();
+                write_on_thread(fd, text.into_bytes());
+            },
+            SourceEvent::Cancelled => self.clipboard_disown(selection),
+            // Drag requests; no source of ours is dragged.
+            _ => {},
         }
     }
 }
-
-sctk::delegate_primary_selection!(WinitState);
 
 #[cfg(test)]
 mod tests {
@@ -750,7 +732,7 @@ mod tests {
     /// The two requests a copy can send.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Step {
-        /// `wl_data_source.destroy` — sctk sends it from the source's `Drop`.
+        /// `wl_data_source.destroy` — aterm-wayland's `Source` sends it from its `Drop`.
         Destroy(u32),
         /// `wl_data_device.set_selection(source, serial)`.
         SetSelection { source: u32, serial: u32 },
@@ -828,7 +810,7 @@ mod tests {
                 self.selection = Some((source, serial));
                 self.cached = self.slot.clone();
             }
-            // Installing the new source destroys the one it displaces (sctk's `Drop`).
+            // Installing the new source destroys the one it displaces (its `Drop`).
             if let Some(displaced) = self.offered.replace(source) {
                 self.destroy(displaced);
             }
@@ -945,12 +927,13 @@ mod tests {
 
     #[test]
     fn a_copy_with_no_loop_left_to_answer_it_is_false_and_leaves_no_own_slot_behind() {
-        let (sender, receiver) = sctk::reexports::calloop::channel::channel();
+        let (sender, receiver) = mpsc::channel();
         let shared = Arc::new(Mutex::new(Shared::default()));
         // A finished thread's id: never this one, so the copy takes the OFF-loop
         // path and would wait for a verdict if the request had been accepted.
         let loop_thread = std::thread::spawn(|| std::thread::current().id()).join().unwrap();
-        let handle = WaylandClipboard::new(sender, Arc::clone(&shared), loop_thread);
+        let waker = Waker::new().expect("eventfd");
+        let handle = WaylandClipboard::new(sender, waker, Arc::clone(&shared), loop_thread);
         drop(receiver);
         assert!(!handle.copy(WaylandSelection::Clipboard, "hello"));
         assert_eq!(handle.paste_owned(WaylandSelection::Clipboard), None);
@@ -970,16 +953,15 @@ mod tests {
 
     #[test]
     fn the_own_slot_answers_synchronously_and_a_foreign_slot_answers_none() {
-        let (sender, _receiver) = sctk::reexports::calloop::channel::channel();
+        let (sender, _receiver) = mpsc::channel();
         let shared = Arc::new(Mutex::new(Shared::default()));
+        let waker = Waker::new().expect("eventfd");
         let handle =
-            WaylandClipboard::new(sender, Arc::clone(&shared), std::thread::current().id());
+            WaylandClipboard::new(sender, waker, Arc::clone(&shared), std::thread::current().id());
         assert_eq!(handle.paste_owned(WaylandSelection::Clipboard), None);
         // THIS thread is the loop thread, so the copy must not wait for a verdict
-        // only this thread could deliver.
-        let began = Instant::now();
+        // only this thread could deliver (waiting, it would time out and answer false).
         assert!(handle.copy(WaylandSelection::Clipboard, "hello"));
-        assert!(began.elapsed() < COPY_TIMEOUT, "a copy on the loop thread waited on the loop");
         assert_eq!(handle.paste_owned(WaylandSelection::Clipboard).as_deref(), Some("hello"));
         assert_eq!(handle.paste_owned(WaylandSelection::Primary), None);
         // On the loop thread a foreign read must not wait on the loop.

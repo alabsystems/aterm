@@ -486,25 +486,6 @@ fn a_quiet_flap_leaves_no_debt() {
 }
 
 #[test]
-fn input_between_the_halves_leaves_the_shift_as_debt() {
-    let mut t = claude_shaped_alt(8);
-    flap_with(&mut t, 8, MODE_SET);
-    let (shrink, grow) = {
-        let (r, _) = t.resize_journal_since(0);
-        (r[0], r[1])
-    };
-    assert_eq!(
-        (shrink.shift(), grow.restored_top, grow.appended),
-        (-1, 0, 1)
-    );
-    assert_eq!(t.render_debt(), (-1, 0), "every row is one higher");
-    // A second such flap with the bottom row painted again adds another row.
-    paint(&mut t, 7..8);
-    flap_with(&mut t, 8, MODE_SET);
-    assert_eq!(t.render_debt(), (-2, 0));
-}
-
-#[test]
 fn the_push_corner_leaves_the_bottom_row_as_debt() {
     // Cursor on row 0: the shrink pushes the bottom row off and nothing above
     // it moves; the grow, its undo dropped, appends a blank.

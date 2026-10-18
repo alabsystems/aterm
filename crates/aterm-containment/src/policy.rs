@@ -41,9 +41,7 @@ impl ContainmentPolicy {
     #[must_use]
     pub const fn network(mode: ContainmentMode) -> NetworkCapability {
         match mode {
-            ContainmentMode::Master | ContainmentMode::User | ContainmentMode::Safety => {
-                NetworkCapability::Full
-            }
+            ContainmentMode::User | ContainmentMode::Safety => NetworkCapability::Full,
             ContainmentMode::Containment => NetworkCapability::None,
         }
     }
@@ -53,7 +51,6 @@ impl ContainmentPolicy {
     #[must_use]
     pub(crate) const fn fs(mode: ContainmentMode) -> FsCapability {
         match mode {
-            ContainmentMode::Master => FsCapability::Full,
             ContainmentMode::User => FsCapability::HomeReadWrite,
             ContainmentMode::Safety => FsCapability::ProjectReadWrite,
             ContainmentMode::Containment => FsCapability::TmpOnly,
@@ -65,7 +62,7 @@ impl ContainmentPolicy {
     #[must_use]
     pub const fn process(mode: ContainmentMode) -> ProcessCapability {
         match mode {
-            ContainmentMode::Master | ContainmentMode::User => ProcessCapability::Full,
+            ContainmentMode::User => ProcessCapability::Full,
             ContainmentMode::Safety => ProcessCapability::Restricted,
             ContainmentMode::Containment => ProcessCapability::NoFork,
         }
@@ -83,7 +80,6 @@ mod tests {
             ContainmentMode::Containment,
             ContainmentMode::Safety,
             ContainmentMode::User,
-            ContainmentMode::Master,
         ];
         for (i, &lower) in modes.iter().enumerate() {
             for &higher in &modes[i..] {
@@ -107,18 +103,16 @@ mod tests {
     #[test]
     fn test_numeric_policy_table() {
         // [mode_level] -> (net, fs, proc)
-        let table: [(u8, [u8; 3]); 4] = [
+        let table: [(u8, [u8; 3]); 3] = [
             (0, [0, 0, 0]), // Containment
             (1, [1, 1, 1]), // Safety
             (2, [1, 2, 2]), // User
-            (3, [1, 3, 2]), // Master
         ];
 
         let modes = [
             ContainmentMode::Containment,
             ContainmentMode::Safety,
             ContainmentMode::User,
-            ContainmentMode::Master,
         ];
 
         for (mode, &(expected_level, ref expected_caps)) in modes.iter().zip(table.iter()) {

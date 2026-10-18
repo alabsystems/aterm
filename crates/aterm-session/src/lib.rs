@@ -18,8 +18,8 @@
 //!
 //! The per-edge object identity (which `src → dst` for which op) is the whole
 //! gate; `Spawn` is the one effect marker a seam requires. The
-//! `aterm_cap::Authority` mint is sealed behind the `launcher-mint` feature
-//! (`aterm_spec::derive::mint_reachability_model`), so no in-process code can
+//! `aterm_cap::Authority` mint is sealed behind the `launcher-mint` feature,
+//! so no in-process code can
 //! reach it; a tier for untrusted in-process writers is unbuilt because aterm
 //! runs none. The same-uid cross-process path rides the runtime [`EdgeToken`]
 //! over the uid-checked control socket and is sound independently of the mint.
@@ -36,7 +36,7 @@ pub mod input_backlog;
 pub mod sink;
 
 pub use edge::{ConnectionKind, Edge, EdgeDecision, EdgeTable, EdgeToken, Op, decide_edge};
-pub use id::{LaunchNonce, SessionId};
+pub use id::{LaunchNonce, SessionId, is_minted_sid};
 
 /// Lowercase-hex digit for a nibble (low 4 bits). A branch table keeps this
 /// free of arithmetic panic obligations.

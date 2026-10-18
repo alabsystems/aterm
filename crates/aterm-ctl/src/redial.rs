@@ -13,9 +13,7 @@
 //!    is over, exit 0;
 //! 2. the same server process still answers `version` on the dialled socket
 //!    ([`serving_pid_within`]) through the same listening socket
-//!    ([`ListenerId`]): it ended the stream on purpose, exit 0 — except a
-//!    `dial <name> …`, which the local server only relays, so the remote closed
-//!    under it: exit [`EXIT_REPLACED`];
+//!    ([`ListenerId`]): it ended the stream on purpose, exit 0;
 //! 3. otherwise, within [`SUCCESSOR_BOUND`], another live server answering
 //!    where this call's own resolution now points ([`Follow`]) is the
 //!    successor: a different process, or the same pid through a fresh listening
@@ -460,8 +458,8 @@ fn version_at(path: &str, wait: Duration) -> Option<(Option<u32>, String)> {
 /// any answer to `version`: `OK`, or the busy refusal of a listener with every
 /// lane at work. Either is a live accept loop (a dying one, or its backlog,
 /// writes nothing), so a successor that closed on a resume ask without a word
-/// is still there to ask again ([`relay_subscription`]); by `OK` alone
-/// ([`still_serving`]) a saturated successor would read as gone.
+/// is still there to ask again ([`relay_subscription`]); by `OK` alone a
+/// saturated successor would read as gone.
 ///
 /// A busy answer often has no pid ([`version_at`]); the listening socket, read
 /// once a connection to `pid` was up and unchanged since, then names the
@@ -482,16 +480,6 @@ pub(crate) fn server_pid(stream: &CtlStream) -> Option<u32> {
     aterm_uds::fdpass::peer_pid(stream).ok()
 }
 
-/// Whether the server `old` still answers at `dialed` through `listener`:
-/// [`Redial::after_hangup`]'s first look alone, with no wait; `false` when it
-/// cannot tell.
-pub(crate) fn still_serving(dialed: &str, old: Option<u32>, listener: Option<ListenerId>) -> bool {
-    old.is_some_and(|old| {
-        serving_pid_within(dialed, PROBE_TIMEOUT)
-            .is_some_and(|pid| is_the_same_server(pid, dialed, old, listener))
-    })
-}
-
 /// Which listening socket a path names, since a pid alone does not name a
 /// server ([`aterm_uds::listener`]).
 pub(crate) use aterm_uds::listener::{ListenerId, listener_at};
@@ -501,16 +489,6 @@ pub(crate) use aterm_uds::listener::{ListenerId, listener_at};
 /// listening socket ([`ListenerId`]).
 fn is_the_same_server(pid: u32, path: &str, old: u32, listener: Option<ListenerId>) -> bool {
     pid == old && aterm_uds::listener::still_names(path, listener)
-}
-
-/// The saved connection a `dial <name> …` request relays to, `None` for any
-/// other request. The local server only relays a dial: when it still serves
-/// after a hang-up, the connection that closed is the one to that remote.
-pub(crate) fn dial_name<S: AsRef<str>>(request_parts: &[S]) -> Option<&str> {
-    match request_parts {
-        [dial, name, ..] if dial.as_ref() == "dial" => Some(name.as_ref()),
-        _ => None,
-    }
 }
 
 /// The one session a request names by id (`@s-<hex>`): the first word of a
@@ -527,53 +505,6 @@ pub(crate) fn target_sid<S: AsRef<str>>(request_parts: &[S]) -> Option<&str> {
     let sid = selector.strip_prefix('@')?;
     let hex = sid.strip_prefix("s-")?;
     (!hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit())).then_some(sid)
-}
-
-/// The note for a `dial <name> …` request (`request_parts`, the whole request)
-/// whose remote hung up while the local server still serves — before its reply,
-/// or (`mid_stream`) in a `subscribe` stream before its sessions exited
-/// ([`remote_closed_note`]). `None` for a request that is not a dial.
-pub(crate) fn remote_closed_note_for<S: AsRef<str>>(
-    request_parts: &[S],
-    mid_stream: bool,
-) -> Option<String> {
-    let name = dial_name(request_parts)?;
-    Some(remote_closed_note(name, mid_stream, &request_parts[2..]))
-}
-
-/// The note for a `dial` to `name` whose remote hung up while the local server
-/// still serves; `relayed` is the request past `dial <name>`. A `turn` or `post`
-/// may already have taken effect on the remote, and what an armed wait
-/// ([`armed_wait`]) waits for may already have happened there, so their notes
-/// say to look there before re-sending; anything else can be dialled again.
-fn remote_closed_note<S: AsRef<str>>(name: &str, mid_stream: bool, relayed: &[S]) -> String {
-    let when = if mid_stream {
-        "before its sessions exited"
-    } else {
-        "before it answered"
-    };
-    let then = match (verb_and_args(relayed).0, armed_wait(relayed)) {
-        (Some("turn"), _) => {
-            "its `turn` may already have been typed, and submitted, on the remote — read the \
-             screen there (`text`) before sending it again; never retry it blind"
-                .to_owned()
-        }
-        (Some("post"), _) => {
-            "its `post` may already be queued on the remote — never post it again blind: \
-             re-post it with the same `key=`, or look for it there first (`outbox`, and the \
-             `post`/`post-landed` rows of `timeline`)"
-                .to_owned()
-        }
-        (_, Some(wait)) => format!(
-            "its `{wait}` waits for a change after it was armed, which may have happened on the \
-             remote; read the session there (`status`, `text`) before waiting again"
-        ),
-        _ => "the exchange cannot be resumed".to_owned(),
-    };
-    format!(
-        "the connection to the remote '{}' closed {when}; {then} (exit {EXIT_REPLACED})",
-        name.escape_debug()
-    )
 }
 
 /// A moment as this machine's clocks read it: what a hang-up and a
@@ -674,8 +605,15 @@ pub(crate) fn is_hangup(e: &io::Error) -> bool {
 ///   since=<id>`: a successor restarts grid counters and numbers the rows it
 ///   re-delivers afresh;
 /// * waits anchored at the moment they were armed (`await block`, a bare
-///   `await seq`, `await consent`): what they wait for may be what a parked
-///   producer deferred to the successor, parsed before any retry can arm;
+///   `await seq`, `await consent`, an `await log` with no `since=` other than
+///   the latching `need`): what they wait for may be what a parked producer
+///   deferred to the successor, parsed before any retry can arm (a resting
+///   turn's settle close, written by the successor before a retry arms at
+///   its head, would never answer). `await log … since=<seq> ep=<e>` is
+///   retried: the session log's seq space continues across an update, and
+///   the successor's read says the handoff's hole as `OK gap why=handoff`;
+///   so is a since-less `await log need`, which latches on the needs the
+///   carried fold holds open;
 /// * a request naming its session by local number (`@<n>`,
 ///   [`is_local_selector`]), which a successor assigns afresh.
 pub(crate) fn retries_across_replacement(request_parts: &[String]) -> bool {
@@ -691,11 +629,23 @@ pub(crate) fn retries_across_replacement(request_parts: &[String]) -> bool {
         Some("await") => match args.first() {
             Some(&("seq" | "block" | "consent")) => false,
             Some(&"inbox") => !args.iter().any(|a| a.starts_with("since=")),
+            Some(&"log") => log_wait_resumes(&args),
             Some(_) => true,
             None => false,
         },
         _ => false,
     }
+}
+
+/// Whether an `await log` (its arguments, `log` first) names where it reads
+/// from on its own: a `since=` cursor, which means the same on a successor
+/// (the log's seq space continues across an update), or the `need` form,
+/// which latches on the needs the carried fold holds open. Every other
+/// since-less `await log` is anchored at the moment it was armed.
+fn log_wait_resumes(args: &[&str]) -> bool {
+    args.iter()
+        .skip(1)
+        .any(|a| a.starts_with("since=") || *a == "need")
 }
 
 /// Whether an `inbox` request is a plain read of what is queued now: a
@@ -762,7 +712,7 @@ fn verb_and_args<S: AsRef<str>>(request_parts: &[S]) -> (Option<&str>, Vec<&str>
 /// bare `await seq` (no counter after `seq`; a `key=value` such as
 /// `timeout=0` is not one). `None` otherwise. Its event may have happened while
 /// the connection was down, so it is never asked again blind
-/// ([`not_asked_again_note`], [`remote_closed_note`]).
+/// ([`not_asked_again_note`]).
 fn armed_wait<S: AsRef<str>>(request_parts: &[S]) -> Option<&'static str> {
     let (Some("await"), args) = verb_and_args(request_parts) else {
         return None;
@@ -771,6 +721,7 @@ fn armed_wait<S: AsRef<str>>(request_parts: &[S]) -> Option<&'static str> {
         Some("block") => Some("await block"),
         Some("consent") => Some("await consent"),
         Some("seq") if args.get(1).is_none_or(|a| a.contains('=')) => Some("await seq"),
+        Some("log") if !log_wait_resumes(&args) => Some("await log"),
         _ => None,
     }
 }
@@ -796,6 +747,13 @@ pub(crate) fn not_asked_again_note(request_parts: &[String]) -> String {
         (_, Some("await seq")) => {
             "a bare `await seq` waits for the next change after it was armed, and the update \
              may have made it — read the session (`status`, `text`) before waiting again"
+                .to_owned()
+        }
+        (_, Some("await log")) => {
+            "an `await log` with no `since=` waits from the moment it was armed, and the record \
+             it waits for may have been written during the update — read `status` (its \
+             `log_seq=` and `log_ep=`) or `log`, then wait again with `since=<log_seq> \
+             ep=<log_ep>`"
                 .to_owned()
         }
         (_, Some(_)) => {
@@ -870,8 +828,14 @@ pub(crate) fn is_local_selector(sel: &str) -> bool {
 /// event anchors `since-block=` and `since-turn=` mean the same on the successor
 /// (the handoff carries blocks and turn ids), so they are kept and advanced past
 /// the newest this relay saw ([`EventAnchors`]); a successor below an anchor
-/// seeds at its live high. Only a single-target stream carries them (the server
-/// takes resume anchors for one target only).
+/// seeds at its live high. The `log` stream's `since-log=<seq> log-ep=<e>` is
+/// never the request's own once the relay knows better: it is the last record
+/// relayed and the epoch it was read in (a carried update continues the seq
+/// space, so the successor's read goes on from exactly there and says the
+/// handoff's hole as a `GAP … why=handoff`; the request's own would re-push
+/// what was relayed, and none would lose what came between the legs). Only a
+/// single-target stream carries them (the server takes resume anchors for one
+/// target only).
 ///
 /// A self target (`@.`, `@`, or none) is pinned to the sid the stream's `sub`
 /// line named, since self resolves again on the successor; with no sid, the
@@ -929,6 +893,8 @@ fn resume_request_with(
     let mut out: Vec<String> = Vec::new();
     let mut block = seen.block;
     let mut turn = seen.turn;
+    // The request's own log cursor, which what the relay saw since replaces.
+    let (mut log_seq, mut log_ep) = (None, None);
     let anchor = |v: &str| v.parse::<u64>().ok();
     for token in request.split_whitespace() {
         if token.starts_with("since=") {
@@ -940,6 +906,14 @@ fn resume_request_with(
         }
         if let Some(v) = token.strip_prefix("since-turn=") {
             turn = turn.max(anchor(v));
+            continue;
+        }
+        if let Some(v) = token.strip_prefix("since-log=") {
+            log_seq = anchor(v);
+            continue;
+        }
+        if let Some(v) = token.strip_prefix("log-ep=") {
+            log_ep = v.parse::<u32>().ok();
             continue;
         }
         if !token.starts_with('@') {
@@ -973,6 +947,10 @@ fn resume_request_with(
         }
         if let Some(id) = turn {
             out.push(format!("since-turn={id}"));
+        }
+        // Both or neither: the server takes one only with the other.
+        if let (Some(seq), Some(ep)) = (seen.log_seq.or(log_seq), seen.log_ep.or(log_ep)) {
+            out.push(format!("since-log={seq} log-ep={ep}"));
         }
     }
     let mut line = out.join(" ");
@@ -1017,12 +995,20 @@ fn self_sid(sids: &[(String, String)]) -> Option<&str> {
 }
 
 /// The newest `block-complete` and `turn` ids a relayed `events` stream has
-/// shown, across every leg: what a resumed request continues after
-/// ([`resume_request`]).
+/// shown, and where its `log` stream stands (the seq of the last `LOG` line
+/// relayed and the epoch it reads in), across every leg: what a resumed
+/// request continues after ([`resume_request`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct EventAnchors {
     pub(crate) block: Option<u64>,
     pub(crate) turn: Option<u64>,
+    /// The `log` stream's cursor: the seq of the newest record relayed (or
+    /// the stream's start, its `sub` line's `log_seq=`, or a `GAP`'s
+    /// `resync_to=`) …
+    pub(crate) log_seq: Option<u64>,
+    /// … and the epoch that seq is read in (the `sub` line's `log_ep=`, a
+    /// `GAP`'s `ep=`).
+    pub(crate) log_ep: Option<u32>,
 }
 
 /// Whether the subscription's target set is the live `@*` roster, which never
@@ -1184,10 +1170,42 @@ impl FrameTracker {
 
     fn header(&mut self, line: &str) {
         let tokens: Vec<&str> = line.split_whitespace().collect();
+        let value = |key: &str| {
+            tokens
+                .iter()
+                .find_map(|t| t.strip_prefix(key)?.strip_prefix('='))
+        };
         match tokens.as_slice() {
             ["sub", local, sid, ..] => {
                 self.targets
                     .push(((*local).to_string(), (*sid).to_string(), false));
+                // Where the target's `log` stream starts (a server that
+                // names it): the cursor a resume continues from until a
+                // record is relayed.
+                if let (Some(seq), Some(ep)) = (
+                    value("log_seq").and_then(|v| v.parse().ok()),
+                    value("log_ep").and_then(|v| v.parse().ok()),
+                ) {
+                    self.anchors.log_seq = Some(seq);
+                    self.anchors.log_ep = Some(ep);
+                }
+            }
+            // A session-log record: its seq is the stream's cursor now.
+            ["LOG", _, seq, ..] => {
+                if let Ok(seq) = seq.parse::<u64>() {
+                    self.anchors.log_seq = Some(seq);
+                }
+            }
+            // A loss on the log stream: the read moved on to `resync_to=`,
+            // in epoch `ep=` (a reset or an update's).
+            ["GAP", _, lost, ..] if lost.starts_with("log-lost=") => {
+                if let (Some(seq), Some(ep)) = (
+                    value("resync_to").and_then(|v| v.parse().ok()),
+                    value("ep").and_then(|v| v.parse().ok()),
+                ) {
+                    self.anchors.log_seq = Some(seq);
+                    self.anchors.log_ep = Some(ep);
+                }
             }
             ["EVENT", local, "exited", ..] => {
                 for (known, _, exited) in &mut self.targets {
@@ -1662,15 +1680,6 @@ pub(crate) fn relay_subscription(
             }
             None => redial.after_hangup(&dialed, server, listener, until),
         };
-        // The local server only relays a `dial`: still serving, it did not end
-        // the stream — the connection to the remote closed under it.
-        let parts: Vec<&str> = request.split_whitespace().collect();
-        if hangup == Hangup::StillServing
-            && let Some(note) = remote_closed_note_for(&parts, true)
-        {
-            super::stderr_line(&note)?;
-            return Ok(ExitCode::from(EXIT_REPLACED));
-        }
         // A live successor that closed on the ask it was given: the stream
         // is not over, and it did not go on — exit 75 and a note, never 0.
         if hangup == Hangup::StillServing

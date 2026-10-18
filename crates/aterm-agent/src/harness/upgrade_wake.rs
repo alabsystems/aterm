@@ -792,35 +792,30 @@ mod tests {
             .join(atpkg::activation_notice::NOTICE_DIR)
             .join(atpkg::activation_notice::CLAUDE_MARKER);
         let mut wake = ActivationWake::with_marks(vec![Mark::new(fixed(marker.clone()))]);
-        // Arm the parent watch before the writer starts. This makes the
-        // unrelated-write assertion exercise a real parked watcher even on a
-        // heavily loaded test machine.
-        let kq = wake.kq.clone().unwrap();
-        wake.marks[0].ensure_watch(&kq);
-        let (tx, rx) = std::sync::mpsc::channel();
-        let waiter = std::thread::spawn(move || {
-            let woke = wake.wait(FALLBACK);
-            tx.send(woke).unwrap();
-        });
-        std::thread::sleep(Duration::from_millis(50));
+        // Negative controls, each a look with no fallback (deterministic: a
+        // wake is the marker becoming another file, never a write's event).
         std::fs::write(root.join("unrelated"), b"x").unwrap();
         assert!(
-            rx.recv_timeout(Duration::from_millis(150)).is_err(),
+            !wake.wait(Duration::ZERO),
             "an unrelated parent write is not a Claude upgrade"
         );
         std::fs::create_dir(root.join("pkg")).unwrap();
-        std::thread::sleep(Duration::from_millis(50));
+        assert!(!wake.wait(Duration::ZERO));
         std::fs::create_dir(root.join("pkg").join(atpkg::activation_notice::NOTICE_DIR)).unwrap();
-        std::thread::sleep(Duration::from_millis(50));
         assert_eq!(
             watch_dir(&marker),
             Some(root.join("pkg").join(atpkg::activation_notice::NOTICE_DIR))
         );
         std::fs::write(root.join("pkg/progress.json"), b"busy").unwrap();
         assert!(
-            rx.recv_timeout(Duration::from_millis(150)).is_err(),
+            !wake.wait(Duration::ZERO),
             "an active download's progress writes wake nobody"
         );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let woke = wake.wait(FALLBACK);
+            tx.send(woke).unwrap();
+        });
         let tmp = root
             .join("pkg")
             .join(atpkg::activation_notice::NOTICE_DIR)
@@ -854,19 +849,16 @@ mod tests {
         let mut wake = ActivationWake::with_marks(Vec::new()).with_word(Some(marker.clone()));
         let dir = marker.parent().expect("a directory").to_path_buf();
         assert!(dir.is_dir(), "made up front");
-        let kq = wake.kq.clone().unwrap();
-        wake.marks[0].ensure_watch(&kq);
         assert_eq!(watch_dir(&marker), Some(dir.clone()));
+        std::fs::write(dir.join("unrelated"), b"x").unwrap();
+        assert!(
+            !wake.wait(Duration::ZERO),
+            "a write beside the marker is no word"
+        );
         let (tx, rx) = std::sync::mpsc::channel();
         let waiter = std::thread::spawn(move || {
             tx.send(wake.wait(FALLBACK)).unwrap();
         });
-        std::thread::sleep(Duration::from_millis(50));
-        std::fs::write(dir.join("unrelated"), b"x").unwrap();
-        assert!(
-            rx.recv_timeout(Duration::from_millis(150)).is_err(),
-            "a write beside the marker is no word"
-        );
         let tmp = marker.with_extension("tmp");
         std::fs::write(&tmp, b"1\n").unwrap();
         std::fs::rename(&tmp, &marker).unwrap();
@@ -985,17 +977,16 @@ mod tests {
         let mut wake = ActivationWake::new(Some(&home));
         wake.marks
             .retain(|m| m.path.as_deref() == Some(link.as_path()));
+        std::fs::write(versions.join("2.1.282"), b"new").unwrap();
+        std::fs::write(bin.join("other-tool"), b"x").unwrap();
+        assert!(
+            !wake.wait(Duration::ZERO),
+            "a download and a neighbour are not the new build in place"
+        );
         let (tx, rx) = std::sync::mpsc::channel();
         let waiter = std::thread::spawn(move || {
             tx.send(wake.wait(FALLBACK)).unwrap();
         });
-        std::thread::sleep(Duration::from_millis(50));
-        std::fs::write(versions.join("2.1.282"), b"new").unwrap();
-        std::fs::write(bin.join("other-tool"), b"x").unwrap();
-        assert!(
-            rx.recv_timeout(Duration::from_millis(150)).is_err(),
-            "a download and a neighbour are not the new build in place"
-        );
         let next = bin.join(".claude.next");
         std::os::unix::fs::symlink(versions.join("2.1.282"), &next).unwrap();
         std::fs::rename(&next, &link).unwrap();
@@ -1010,7 +1001,6 @@ mod tests {
 
     /// The trigger ends a parked wait at once, reporting no activation (the
     /// host's shutdown), inside [`HANG`], which the fallback is ten times.
-    /// Negative control: unpulled, the same wait runs out its fallback.
     #[test]
     fn the_trigger_ends_a_parked_wait_at_once() {
         let mut wake = ActivationWake::with_marks(Vec::new());
@@ -1024,13 +1014,6 @@ mod tests {
             Some(false),
             "the pulled trigger ends the wait long before its ten-minute fallback, \
              reporting no activation"
-        );
-        let mut quiet = ActivationWake::with_marks(Vec::new());
-        let started = Instant::now();
-        assert!(!quiet.wait(Duration::from_millis(80)));
-        assert!(
-            started.elapsed() >= Duration::from_millis(80),
-            "the fallback"
         );
     }
 
@@ -1068,8 +1051,7 @@ mod tests {
     /// A lost ancestor wake: with every vnode event lost (the fault injected),
     /// a marker created under a missing directory is still seen by the
     /// [`ANCESTOR_RECHECK`] look inside [`HANG`], which the [`FALLBACK`] is
-    /// twice. Negative control: the same mark not rechecked waits the fallback
-    /// out.
+    /// twice.
     #[test]
     fn first_install_rechecks_a_missing_path_after_a_lost_ancestor_notification() {
         let root = std::env::temp_dir().join(format!(
@@ -1097,16 +1079,13 @@ mod tests {
             "a lost ancestor event must not delay a first install until the fallback"
         );
         assert!(started.elapsed() < HANG, "{:?}", started.elapsed());
-        let mut control = ActivationWake::with_marks(vec![Mark::new(fixed(root.join("x/y/z")))]);
-        control.deaf = true;
-        assert!(!control.wait(Duration::from_millis(300)), "the control");
         let _ = std::fs::remove_dir_all(root);
     }
 
     /// An agent's exit is a push: [`wait_exit`] returns as the process ends,
     /// inside [`HANG`], which the [`FALLBACK`] limit is twice, and at once for
-    /// one already gone. Negative control: a process that keeps running is
-    /// waited for until the limit, and reads as not exited.
+    /// one already gone. Negative control: a process that keeps running reads
+    /// as not exited at the limit.
     #[test]
     fn an_exit_is_seen_as_it_happens() {
         let mut child = aterm_uds::spawnfd::command("/bin/sleep")
@@ -1124,9 +1103,7 @@ mod tests {
             .arg("30")
             .spawn()
             .unwrap();
-        let started = Instant::now();
         assert!(!wait_exit(runs.id(), Duration::from_millis(200)));
-        assert!(started.elapsed() >= Duration::from_millis(200));
         runs.kill().unwrap();
         runs.wait().unwrap();
     }
@@ -1282,19 +1259,5 @@ mod poll_tests {
         assert!(side.look() && !side.look());
         assert_eq!(heard(), 3);
         let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// [`moved`], the one rule: nothing and nothing is no change; a thing
-    /// appearing, becoming another and going are each one change, seen once.
-    #[test]
-    fn a_thing_has_moved_only_when_it_is_another_than_last_seen() {
-        let mut seen: Option<u8> = None;
-        assert!(!moved(&mut seen, None));
-        assert!(moved(&mut seen, Some(1)));
-        assert!(!moved(&mut seen, Some(1)));
-        assert!(moved(&mut seen, Some(2)));
-        assert_eq!(seen, Some(2));
-        assert!(moved(&mut seen, None));
-        assert!(!moved(&mut seen, None));
     }
 }

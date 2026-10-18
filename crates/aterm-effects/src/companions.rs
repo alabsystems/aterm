@@ -3,7 +3,7 @@
 
 //! The companions a window keeps beside its resident pet: the earned flying
 //! head, its sing-along and music notes, the typed-word detectors (kitty summon,
-//! tone of typing), the typed dog and Robi. The host feeds them from its
+//! tone of typing) and the typed dog. The host feeds them from its
 //! committed key-press path and performs what they hand back (a Kitty Log row, a
 //! notice, a sound). None reads a clock: every call takes `now`.
 //!
@@ -17,7 +17,6 @@ use crate::dog_cameo::DogCameo;
 use crate::kitty_cursor::CursorCat;
 use crate::kitty_sing::{KittySing, MusicNotes};
 use crate::kitty_summon::{TypedHit, TypedKittySummon};
-use crate::robi::RobiShow;
 use crate::tone_infer::ToneTracker;
 
 /// One classified key press from the host's committed key path, the only input
@@ -117,17 +116,6 @@ pub struct Companions {
     /// window and a tab switch retires nothing, so this tag alone keeps a
     /// visitor summoned in tab A off tab B's glass.
     pub dog_cameo_session: Option<u64>,
-    /// Robi the helper robot ([`crate::robi`]): the resident's birth instant and
-    /// tip roll; everything else derives per frame. Once born he stays on the
-    /// glass (per window, on whichever tab fronts); `stop` is only for
-    /// config/motion/Serious Mode hygiene.
-    pub robi_show: RobiShow,
-    /// Lifetime (re)birth counter — the seed fold, so name-summons rotate
-    /// through different tips.
-    pub robi_shows: u64,
-    /// Rolling lowercase 8-char tail of recent printed keystrokes, matched
-    /// literally against `robi`/`robot` (no lexicon class).
-    pub robi_tail: String,
 }
 
 impl Companions {
@@ -175,35 +163,6 @@ impl Companions {
             },
         );
         fired
-    }
-
-    /// Robi's name: printed glyphs extend a rolling lowercase 8-char tail, and
-    /// a tail ending in `robi` or `robot` pokes him: the tail clears (holding
-    /// the last key cannot re-poke) and his show restarts at the greeting.
-    /// Returns whether he was poked. The host gates this (config, motion,
-    /// Serious Mode) as it gates his draw.
-    pub fn note_robi_press(&mut self, press: TypedPress<'_>, now: Instant) -> bool {
-        if press.brk || press.backspace {
-            return false;
-        }
-        let mut typed = false;
-        for c in press.chars() {
-            typed = true;
-            for lc in c.to_lowercase() {
-                self.robi_tail.push(lc);
-            }
-            while self.robi_tail.chars().count() > 8 {
-                let first_len = self.robi_tail.chars().next().map_or(0, char::len_utf8);
-                self.robi_tail.drain(..first_len);
-            }
-        }
-        if !typed || !(self.robi_tail.ends_with("robi") || self.robi_tail.ends_with("robot")) {
-            return false;
-        }
-        self.robi_tail.clear();
-        self.robi_shows += 1;
-        self.robi_show.start(now, self.robi_shows);
-        true
     }
 
     /// Serious Mode's drain, the companions' half: the flying head, the
@@ -303,35 +262,5 @@ mod tests {
         );
         assert_eq!(c.tone_tracker.window_chars(), 7, "the tone window is kept");
         assert!(feed_line(&mut c, " kitty", words, now).feline);
-    }
-
-    /// Robi answers to his name, in any case and through an IME commit;
-    /// the poke clears the tail, so holding the last key cannot poke again;
-    /// a break or a Backspace never pokes.
-    #[test]
-    fn robi_answers_to_his_name_once_per_spelling() {
-        let now = Instant::now();
-        let mut c = Companions::default();
-        for ch in "ROBO".chars() {
-            assert!(!c.note_robi_press(glyph(ch), now));
-        }
-        assert!(c.note_robi_press(glyph('T'), now), "`robot` pokes him");
-        assert_eq!(c.robi_shows, 1);
-        assert!(!c.note_robi_press(glyph('t'), now), "the tail cleared");
-        let ime = TypedPress {
-            ime: Some("xrobi"),
-            ..TypedPress::default()
-        };
-        assert!(c.note_robi_press(ime, now), "an IME commit spells it too");
-        for ch in "rob".chars() {
-            c.note_robi_press(glyph(ch), now);
-        }
-        let brk = TypedPress {
-            brk: true,
-            typed: Some('i'),
-            ..TypedPress::default()
-        };
-        assert!(!c.note_robi_press(brk, now), "a break never pokes");
-        assert_eq!(c.robi_shows, 2);
     }
 }

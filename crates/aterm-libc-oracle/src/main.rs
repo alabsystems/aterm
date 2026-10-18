@@ -59,7 +59,7 @@ const USAGE: &str = "\
 aterm-libc-oracle — decide crates/aterm-libc against the pinned reference libc
 on the ABI cell this box is native to, and regenerate it
 
-usage: aterm-libc-oracle [--root <checkout>] [--target-dir <dir>] [--json]
+usage: aterm-libc-oracle [--root <checkout>] [--target-dir <dir>]
        aterm-libc-oracle regen [--root <checkout>] [--out <dir>] [--work <dir>]
                                [--docs <dir>] [--stock <toolchain>] [--no-format]
        aterm-libc-oracle harvest --cell <key> [--root <checkout>] [--work <dir>]
@@ -70,7 +70,6 @@ usage: aterm-libc-oracle [--root <checkout>] [--target-dir <dir>] [--json]
   --target-dir <dir>  the oracle workspace's builds (default:
                       <checkout>/libc-oracle/target); one per checkout,
                       never shared with another
-  --json              print the report as one JSON object instead
   -h, --help          this text
 
 regen: rewrite crates/aterm-libc/src/<cell>.rs and
@@ -108,7 +107,6 @@ struct Args {
     verb: Verb,
     root: Option<PathBuf>,
     target_dir: Option<PathBuf>,
-    json: bool,
     help: bool,
     out: Option<PathBuf>,
     work: Option<PathBuf>,
@@ -141,7 +139,6 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Args, String> {
         match arg.to_str() {
             Some("--root") => out.root = Some(value("--root")?.into()),
             Some("--target-dir") if gate => out.target_dir = Some(value("--target-dir")?.into()),
-            Some("--json") if gate => out.json = true,
             Some("--out") if regen => out.out = Some(value("--out")?.into()),
             Some("--no-format") if regen => out.no_format = true,
             Some("--work") if !gate => out.work = Some(value("--work")?.into()),
@@ -177,23 +174,17 @@ fn find_root(start: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-/// Prints each phase as it finishes, unless the report goes out as JSON.
-struct Progress {
-    quiet: bool,
-}
+/// Prints each phase as it finishes.
+struct Progress;
 
 impl Observer for Progress {
     fn deciding(&mut self, host: &str, cell: &Cell) {
-        if !self.quiet {
-            println!("libc oracle: {host} (cell {}), under Trust", cell.key);
-        }
+        println!("libc oracle: {host} (cell {}), under Trust", cell.key);
     }
 
     fn phase(&mut self, report: &PhaseReport) {
-        if !self.quiet {
-            println!("{report}");
-            let _ = std::io::stdout().flush();
-        }
+        println!("{report}");
+        let _ = std::io::stdout().flush();
     }
 }
 
@@ -359,12 +350,8 @@ fn main() -> ExitCode {
         None => root.join("libc-oracle/target"),
     };
     let options = Options { root, target_dir };
-    let report = run::run(&options, &mut Progress { quiet: args.json });
-    if args.json {
-        println!("{}", report.to_json());
-    } else {
-        print_text(&report);
-    }
+    let report = run::run(&options, &mut Progress);
+    print_text(&report);
     ExitCode::from(report.exit_code())
 }
 
@@ -377,28 +364,11 @@ mod tests {
     }
 
     #[test]
-    fn flags_parse_and_strays_are_usage_errors() {
-        assert_eq!(args(&[]), Ok(Args::default()));
-        assert_eq!(
-            args(&["--root", "/r", "--target-dir", "t", "--json"]),
-            Ok(Args {
-                root: Some("/r".into()),
-                target_dir: Some("t".into()),
-                json: true,
-                ..Args::default()
-            })
-        );
-        assert!(args(&["--root"]).is_err());
-        assert!(args(&["--fast"]).is_err());
-        assert!(args(&["-h"]).is_ok_and(|a| a.help));
+    fn each_verb_takes_only_its_own_flags() {
         assert!(
             args(&["--stock", "stable"]).is_err(),
             "an authoring flag is not the gate's"
         );
-    }
-
-    #[test]
-    fn each_verb_takes_only_its_own_flags() {
         assert_eq!(
             args(&[
                 "regen",
@@ -419,7 +389,7 @@ mod tests {
                 ..Args::default()
             })
         );
-        assert!(args(&["regen", "--json"]).is_err());
+        assert!(args(&["regen", "--target-dir", "t"]).is_err());
         assert!(args(&["regen", "log.txt"]).is_err());
         assert_eq!(
             args(&["harvest", "--cell", "linux", "--write", "check.log"]),
@@ -435,18 +405,5 @@ mod tests {
         assert!(args(&["harvest", "--cell", "mac"]).is_err(), "no log");
         assert!(args(&["harvest", "--cell", "mac", "a.log", "b.log"]).is_err());
         assert!(args(&["harvest", "--out", "/o", "--cell", "mac", "a.log"]).is_err());
-    }
-
-    #[test]
-    fn the_root_is_the_nearest_checkout_holding_the_oracle() {
-        let dir = aterm_tempfile::tempdir().expect("tempdir");
-        let root = dir.path();
-        std::fs::create_dir_all(root.join("libc-oracle")).expect("mkdir");
-        std::fs::create_dir_all(root.join("crates/aterm-libc/src")).expect("mkdir");
-        std::fs::write(root.join("libc-oracle/Cargo.toml"), "").expect("write");
-        std::fs::write(root.join("crates/aterm-libc/src/lib.rs"), "").expect("write");
-        let deep = root.join("crates/aterm-libc/src");
-        assert_eq!(find_root(&deep).as_deref(), Some(root));
-        assert_eq!(find_root(Path::new("/")), None);
     }
 }

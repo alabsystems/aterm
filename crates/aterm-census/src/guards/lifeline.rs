@@ -56,16 +56,17 @@ fn launcher_source(rel: &str) -> bool {
         || rel.starts_with("crates/aterm-release/src/")
 }
 
-/// How many launcher files must name `--headless` (27 today): fewer means the
-/// scope lost the tree (a moved `tests/`, a narrowed [`launcher_source`]), and
-/// a rule that reads no launch holds vacuously.
-const LAUNCH_FILES_FLOOR: usize = 20;
+/// The launch every live headless suite boots through. A read that does not
+/// reach it lost the tree (a moved `tests/`, a narrowed [`launcher_source`]),
+/// and a rule that reads no launch holds vacuously. An anchor, not a count: a
+/// launcher deleted on purpose moves no number.
+const ANCHOR_LAUNCH_FILE: &str = "crates/aterm/tests/support/headless_boot.rs";
 
 fn headless_lifeline(tree: &Tree<'_>, out: &mut Vec<Finding>) {
-    let mut read = 0usize;
+    let mut anchored = false;
     for file in tree.corpus.under(&["crates/"]) {
         if launcher_source(&file.rel) && file.mentions(&["--headless"]) {
-            read += 1;
+            anchored |= file.rel == ANCHOR_LAUNCH_FILE;
             out.extend(lifeline_findings(file));
         }
     }
@@ -74,14 +75,14 @@ fn headless_lifeline(tree: &Tree<'_>, out: &mut Vec<Finding>) {
             out.extend(script_findings(script));
         }
     }
-    if read < LAUNCH_FILES_FLOOR {
+    if !anchored {
         out.push(Finding {
             rule: HEADLESS_LIFELINE.id,
             path: "crates/".to_string(),
             line: 0,
             detail: format!(
-                "read {read} launch file(s), too few to be the tree (at least \
-                 {LAUNCH_FILES_FLOOR})"
+                "read no launch in {ANCHOR_LAUNCH_FILE}, the boot every live headless suite \
+                 uses: the scope lost the tree"
             ),
         });
     }
@@ -408,21 +409,18 @@ mod tests {
     }
 
     #[test]
-    fn a_scope_with_too_few_launch_files_is_a_finding() {
-        let found = run(&HEADLESS_LIFELINE, &[]);
-        assert_eq!(found.len(), 1, "{found:?}");
-        assert!(
-            found[0].detail.starts_with("read 0 launch file(s)"),
-            "{found:?}"
-        );
+    fn a_scope_that_misses_the_one_boot_is_a_finding() {
+        let lost = |found: &[Finding]| {
+            found.len() == 1 && found[0].detail.starts_with("read no launch in ")
+        };
+        assert!(lost(&run(&HEADLESS_LIFELINE, &[])));
 
         let armed = "fn boot(root: &Path) {\n    cmd.arg(\"--headless\");\n    \
                      let l = launch_isolation::lifeline(&mut cmd, root);\n}\n";
-        let paths: Vec<String> = (0..LAUNCH_FILES_FLOOR)
-            .map(|i| format!("crates/aterm/tests/t{i}.rs"))
-            .collect();
-        let files: Vec<(&str, &str)> = paths.iter().map(|p| (p.as_str(), armed)).collect();
-        assert!(run(&HEADLESS_LIFELINE, &files).is_empty());
+        // Armed launches elsewhere do not stand in for the boot.
+        let elsewhere = run(&HEADLESS_LIFELINE, &[("crates/aterm/tests/t.rs", armed)]);
+        assert!(lost(&elsewhere), "{elsewhere:?}");
+        assert!(run(&HEADLESS_LIFELINE, &[(ANCHOR_LAUNCH_FILE, armed)]).is_empty());
     }
 
     /// Each unarmed launch shape, with the line and shape its finding prints.

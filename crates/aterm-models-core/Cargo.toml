@@ -1,0 +1,29 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "aterm-models-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "aterm's models of the terminal core, the keeper and the selection (ty_model!), for their crates' Tier-1 tests and spec-check"
+# The Tier-0 tests compile as ONE suite (tests/suite.rs): a tests/*.rs that is neither
+# the suite nor a `mod` of it compiles into nothing.
+autotests = false
+
+[lib]
+# No unit tests and no doctests live in src/: the models' tests are tests/suite.rs.
+test = false
+doctest = false
+
+[dependencies]
+aterm-spec.workspace = true
+
+[lints]
+workspace = true
+
+[[test]]
+name = "suite"
+path = "tests/suite.rs"

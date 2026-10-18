@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use crate::geom_24x80_for_test as output_streak_geom;
 
-/// The chrome-decoration lane (Robi, the typed dog, the reduced-motion sing
+/// The chrome-decoration lane (the typed dog, the reduced-motion sing
 /// still, the companion's wince follow-up) arms a deadline rather than
 /// calling `request_redraw()` from the redraw handler, which winit's Windows
 /// backend turns into an immediate re-invalidation and a free-running loop.
@@ -80,8 +80,8 @@ fn a_decoration_latch_is_a_bounded_level_on_the_shared_phase_locked_lane() {
 
 /// An event-loop turn that redraws some other window, or none, between the arm and the
 /// fire keeps the armed decoration tick. A park that dropped it
-/// (`park_terminal_effect_scheduler`) would freeze Robi mid-stride: he has no
-/// focus-gated or blink wake to revive him.
+/// (`park_terminal_effect_scheduler`) would freeze a decoration mid-stride: it has no
+/// focus-gated or blink wake to revive it.
 #[test]
 fn an_unrelated_wake_between_arm_and_fire_keeps_the_decoration_tick() {
     let mut app = App::headless_for_test();
@@ -104,7 +104,7 @@ fn an_unrelated_wake_between_arm_and_fire_keeps_the_decoration_tick() {
     );
     assert_eq!(ws.next_trail_tick, None);
 
-    // A redraw draws Robi mid-stride. The next park arms his slot.
+    // A redraw draws a decoration mid-stride. The next park arms its slot.
     ws.note_deco_animating(t0);
     let armed = ws
         .plan_terminal_effect_lane(t0, false, true)
@@ -304,47 +304,6 @@ fn a_decoration_arm_never_inherits_a_slot_that_outlives_its_own_latch() {
         ws.deco_anim_frame_active(d),
         "and the latch must still be live when its own slot fires — that is \
          the coupling the clamp exists to guarantee"
-    );
-}
-
-/// The decoration lane arms before the RepaintKey early-out, so it arms a
-/// deadline instead of re-requesting a redraw: a walk step that bakes to the
-/// same sprite is correctly not presented, and a wake requested only after a
-/// present would be lost on exactly those frames. The deadline is armed by
-/// the frame that drew him, presented or not.
-///
-/// Scope: the pure helpers only (`take_due_trail_tick`,
-/// `rebase_pending_trail_tick_after_present`, `phase_locked_effect_deadline`),
-/// pinning that no present is required to keep the train phased. The
-/// arm/park branch is covered by
-/// `an_unrelated_wake_between_arm_and_fire_keeps_the_decoration_tick`.
-#[test]
-fn an_early_out_frame_still_owes_the_decoration_its_next_slot() {
-    let interval = Duration::from_millis(4);
-    let base = Instant::now();
-    let fired = base + interval;
-
-    // `new_events` fired the slot and handed ownership to the anchor; the
-    // redraw it requested then early-outed, so no present ever ran and
-    // `rebase_pending_trail_tick_after_present` had nothing to consume.
-    let mut next = Some(fired);
-    let mut anchor = None;
-    assert!(take_due_trail_tick(&mut next, &mut anchor, fired));
-    let early_out_at = fired + Duration::from_millis(1);
-    rebase_pending_trail_tick_after_present(&mut next, &mut anchor, early_out_at);
-    assert_eq!(
-        (next, anchor),
-        (None, Some(fired)),
-        "an early-out leaves the fired anchor exactly as the timer set it"
-    );
-
-    // `about_to_wait` re-arms from the decoration request alone. Same slot,
-    // same cadence a presented frame would have produced — the animation
-    // cannot stall on a repeated fingerprint.
-    let last_fire = anchor.take();
-    assert_eq!(
-        phase_locked_effect_deadline(early_out_at, interval, last_fire, None, true),
-        base + Duration::from_millis(8),
     );
 }
 
@@ -572,7 +531,7 @@ fn coarse_engine_deadline_is_preserved_exactly() {
 
 #[test]
 fn content_present_rebase_conforms_to_derived_model() {
-    let model = aterm_spec::derive::effect_present_rebase_model();
+    let model = aterm_models_effects::effect_present_rebase_model();
     let state = |pending: i64, anchor: i64, after_content: i64, steps: i64| {
         BTreeMap::from([
             ("pending", pending),
@@ -645,64 +604,8 @@ fn content_present_rebase_conforms_to_derived_model() {
 }
 
 #[test]
-fn phase_locked_deadline_conforms_to_derived_model() {
-    let model = aterm_spec::derive::effect_phase_lock_model();
-    let state = |now: i64,
-                 anchor: i64,
-                 schedule_base: i64,
-                 deadline: i64,
-                 pending: i64,
-                 rendering: i64,
-                 phase_locked: i64,
-                 fresh: i64| {
-        BTreeMap::from([
-            ("now", now),
-            ("anchor", anchor),
-            ("schedule_base", schedule_base),
-            ("deadline", deadline),
-            ("pending", pending),
-            ("rendering", rendering),
-            ("phase_locked", phase_locked),
-            ("fresh", fresh),
-        ])
-    };
-    let base = Instant::now();
-    let interval = Duration::from_millis(2);
-    let actual = phase_locked_effect_deadline(
-        base + Duration::from_millis(3),
-        interval,
-        Some(base + Duration::from_millis(2)),
-        None,
-        true,
-    );
-    let actual_tick = actual.duration_since(base).as_millis() as i64;
-    let prev = state(3, 2, 0, 2, 0, 1, 0, 0);
-    let next = state(3, 2, 2, actual_tick, 1, 0, 1, 1);
-    let (ok, why) = aterm_spec::verify::validate_transition_tiered(
-        &model,
-        &[],
-        &prev,
-        &next,
-        Some("Rearm"),
-        "effect phase-lock conformance",
-    );
-    assert!(ok, "shipping phase-lock transition rejected: {why}");
-
-    let slid = state(3, 2, 3, 5, 1, 0, 1, 1);
-    let (ok, _) = aterm_spec::verify::validate_transition_tiered(
-        &model,
-        &[],
-        &prev,
-        &slid,
-        Some("Rearm"),
-        "effect phase-lock negative control",
-    );
-    assert!(!ok, "render-cost cadence slide must fail conformance");
-}
-
-#[test]
 fn event_loop_fire_present_rearm_trace_conforms_end_to_end() {
-    let model = aterm_spec::derive::effect_phase_lock_model();
+    let model = aterm_models_effects::effect_phase_lock_model();
     let state = |now: i64,
                  anchor: i64,
                  schedule_base: i64,

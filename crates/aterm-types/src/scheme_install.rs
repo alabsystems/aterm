@@ -164,12 +164,12 @@ fn install_with(
     let text = report.to_native_conf(&[&header_source]);
     // The written file must read back as exactly what was converted: the
     // native parser is the only reader the window has.
-    let expected = ParsedTheme {
-        scheme: report.scheme.clone(),
-        description: report.description.clone(),
-        author: report.author.clone(),
-        appearance_declared: report.appearance_declared,
-    };
+    let expected = ParsedTheme::colours_only(
+        report.scheme.clone(),
+        report.appearance_declared,
+        report.description.clone(),
+        report.author.clone(),
+    );
     match scheme::parse_theme_str(&text) {
         Ok(read_back) if read_back == expected => {}
         Ok(_) => {
@@ -277,7 +277,7 @@ pub fn read_bounded(path: &Path) -> Result<Vec<u8>, String> {
 pub fn write_atomically(
     dir: &Path,
     dest: &Path,
-    id: &str,
+    _id: &str,
     bytes: &[u8],
     replace: bool,
 ) -> Result<(), InstallError> {
@@ -290,35 +290,34 @@ pub fn write_atomically(
     let failed =
         |path: &Path, e: std::io::Error| InstallError::Failed(format!("{}: {e}", path.display()));
     std::fs::create_dir_all(dir).map_err(|e| failed(dir, e))?;
-    // Not `.conf`, so the catalog never lists a half-written file.
-    let mut tmp = dir.join(format!(".{id}.conf.import-{}", std::process::id()));
-    // An export can choose any filename, including our usual temporary name.
-    // Keep its destination distinct even when its parent is spelled `.`.
-    if tmp.file_name() == dest.file_name() {
-        tmp.set_extension(format!("import-{}.tmp", std::process::id()));
-    }
-    let _ = std::fs::remove_file(&tmp);
-    let written = std::fs::OpenOptions::new()
+    // The catalog skips this exclusively created staging directory. Its
+    // guard removes only our own stage on every error; no predictable old
+    // entry is adopted, overwritten or removed.
+    let stage = aterm_tempfile::Builder::new()
+        .prefix(".theme-import-")
+        .tempdir_in(dir)
+        .map_err(|e| failed(dir, e))?;
+    let tmp = stage.path().join("theme");
+    let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&tmp)
-        .and_then(|mut file| {
-            file.write_all(bytes)?;
-            file.sync_all()
-        });
-    if let Err(e) = written {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(failed(&tmp, e));
-    }
-    let committed = if replace {
+        .map_err(|e| failed(&tmp, e))?;
+    // Durable: the person imported this theme and is told so.
+    let written = file
+        .write_all(bytes)
+        .and_then(|()| aterm_durable::durable(&file));
+    // Windows must release the file before rename; the directory guard
+    // remains responsible for any unpublished payload.
+    drop(file);
+    written.map_err(|e| failed(&tmp, e))?;
+    if replace {
         std::fs::rename(&tmp, dest).map_err(|e| failed(dest, e))
     } else {
         // Only an exclusive operation can publish without replacement: a
         // theme may appear after any check that the name is free.
         publish_new(&tmp, dest, |from, to| std::fs::hard_link(from, to))
-    };
-    let _ = std::fs::remove_file(&tmp);
-    committed
+    }
 }
 
 /// Link `tmp` in as `dest` only if `dest` is free. A filesystem that cannot
@@ -502,5 +501,48 @@ mod tests {
         }
         assert!(!themes.exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Publishing must not remove a preexisting staging-name collision;
+    /// a failed commit must clean only the stage this call created.
+    #[test]
+    fn atomic_writes_keep_foreign_stage_entries_and_clean_owned_failures() {
+        let owned = aterm_tempfile::TempDir::new().expect("owned fixture");
+        let dir = owned.path().join("themes");
+        std::fs::create_dir(&dir).unwrap();
+        let id = "owned-stage";
+        let collision = dir.join(format!(".{id}.conf.import-{}", std::process::id()));
+        std::fs::write(&collision, b"keep collision").unwrap();
+        let dest = dir.join("ordinary.conf");
+        write_atomically(&dir, &dest, id, b"first", false).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"first");
+        assert!(matches!(
+            write_atomically(&dir, &dest, id, b"refused", false),
+            Err(InstallError::Exists(_))
+        ));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"first");
+        write_atomically(&dir, &dest, id, b"replacement", true).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"replacement");
+
+        let directory = dir.join("cannot-replace-directory");
+        std::fs::create_dir(&directory).unwrap();
+        assert!(write_atomically(&dir, &directory, "failure", b"not published", true).is_err());
+        assert!(directory.is_dir());
+        let mut names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        let mut wanted = vec![
+            collision.file_name().unwrap().to_os_string(),
+            dest.file_name().unwrap().to_os_string(),
+            directory.file_name().unwrap().to_os_string(),
+        ];
+        wanted.sort();
+        assert_eq!(
+            names, wanted,
+            "no owned stage remains and the collision stays"
+        );
+        assert_eq!(std::fs::read(&collision).unwrap(), b"keep collision");
     }
 }

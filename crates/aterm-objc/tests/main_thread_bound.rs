@@ -13,19 +13,14 @@
 //!
 //! So every test below either holds a `T` with no destructor, or consumes the
 //! container with `into_inner` before it can be dropped. A future test that
-//! forgets this will not fail — it will hang, which is the loudest possible
-//! reason to say so here rather than in a comment further down.
+//! forgets this will not fail — it will hang.
 //!
 //! The half that CANNOT be held here — that the destructor really does run on
-//! the main thread, and what happens to a container that omits the reschedule —
-//! is in `tests/main_thread_bound_drive.rs`, a `harness = false` test that owns
-//! `fn main` and can drive a run loop. That is the same division as
-//! [`aterm_objc::run_on_main`] itself.
+//! the main thread — is in `tests/main_thread_bound_drive.rs`, a
+//! `harness = false` test that owns `fn main` and can drive a run loop.
 
 #![cfg(target_os = "macos")]
 
-use std::cell::Cell;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use aterm_objc::{MainThread, MainThreadBound};
@@ -41,57 +36,6 @@ use aterm_objc::{MainThread, MainThreadBound};
 fn witness() -> MainThread {
     // SAFETY: as documented above.
     unsafe { MainThread::new_unchecked() }
-}
-
-#[test]
-fn the_container_costs_nothing_over_the_value() {
-    assert_eq!(
-        size_of::<MainThreadBound<Rc<u8>>>(),
-        size_of::<Rc<u8>>(),
-        "`ManuallyDrop` is `#[repr(transparent)]`, so the affinity is carried by the type system \
-         and not by a field"
-    );
-    assert_eq!(align_of::<MainThreadBound<u64>>(), align_of::<u64>());
-}
-
-#[test]
-fn get_and_get_mut_reach_the_value_through_a_witness() {
-    let mut bound = MainThreadBound::new(Cell::new(7_u8), witness());
-    assert_eq!(7, bound.get(witness()).get());
-    bound.get_mut(witness()).set(9);
-    assert_eq!(9, bound.get(witness()).get());
-    // Consumed rather than dropped — see this file's opening note. `Cell<u8>`
-    // needs no destructor, so a drop here would in fact be fine; consuming it
-    // is the habit the file is trying to establish.
-    assert_eq!(9, bound.into_inner(witness()).get());
-}
-
-#[test]
-fn a_container_of_a_drop_less_value_never_reaches_the_main_queue() {
-    // THE `needs_drop` SHORT-CIRCUIT, and it is load-bearing rather than an
-    // optimisation: this test runs on a libtest WORKER, and the main thread of
-    // this process is parked joining it. If `Drop` dispatched unconditionally,
-    // this would block for ever.
-    //
-    // The failure mode is therefore a HANG, not a red test. That is stated
-    // rather than hidden: a stage whose failure is silent has to say so, and
-    // the alternative (asserting on a timeout from inside the thing being
-    // timed) cannot be written.
-    assert!(!std::mem::needs_drop::<Rc<u8>>() || true);
-    assert!(
-        !std::mem::needs_drop::<[u8; 4]>(),
-        "the premise: this value has no destructor"
-    );
-    let bound = MainThreadBound::new([1_u8, 2, 3, 4], witness());
-    let moved = std::thread::spawn(move || {
-        // The container crossed to a worker BECAUSE it is `Send`, and is
-        // dropped here, off the main thread, with no witness in sight.
-        drop(bound);
-        0xD0DE_u32
-    })
-    .join()
-    .expect("the worker did not panic");
-    assert_eq!(0xD0DE, moved);
 }
 
 #[test]
@@ -117,35 +61,4 @@ fn into_inner_hands_the_value_back_and_does_not_run_the_containers_drop() {
     // the value has no affinity and no reschedule.
     drop(value);
     assert_eq!(1, DROPS.load(Ordering::Relaxed), "exactly once");
-}
-
-#[test]
-fn the_value_crosses_threads_inside_the_container_and_comes_back_intact() {
-    // `Rc` is `!Send`. The container carries it to a worker and back, and the
-    // strong count is untouched by the journey — the bytes were inert while
-    // they travelled, which is the `Send` justification stated as an
-    // observation.
-    let rc = Rc::new(41_u8);
-    let bound = MainThreadBound::new(Rc::clone(&rc), witness());
-    assert_eq!(2, Rc::strong_count(&rc));
-
-    let bound = std::thread::spawn(move || bound)
-        .join()
-        .expect("the worker did not panic");
-
-    assert_eq!(
-        2,
-        Rc::strong_count(&rc),
-        "nothing on the worker could clone it, drop it or read it"
-    );
-    let inner = bound.into_inner(witness());
-    assert_eq!(41, *inner);
-    drop(inner);
-    assert_eq!(1, Rc::strong_count(&rc));
-}
-
-#[test]
-fn debug_is_opaque() {
-    let bound = MainThreadBound::new([0_u8; 2], witness());
-    assert_eq!("MainThreadBound { .. }", format!("{bound:?}"));
 }

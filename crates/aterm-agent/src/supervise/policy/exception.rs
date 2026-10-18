@@ -14,7 +14,7 @@
 //! and a `why` that names no waiting or retrying (a wait with an end is never
 //! an exception). A lost login's, a spend wall's and a futile limit's words
 //! are the session's program's ([`TurnEndReading::program`]): Claude Code's,
-//! Codex's, or words that name no vendor — never a page or a command its
+//! agy's, Muse Code's, Gemini CLI's, or words that name no vendor — never a page or a command its
 //! agent does not have.
 
 use std::time::{Duration, Instant};
@@ -52,9 +52,9 @@ impl Urgency {
 pub struct Exception {
     pub kind: ExceptionKind,
     pub when: Urgency,
-    /// Why a person, and not the machine (at most [`WHY_MAX`] characters).
+    /// Why a person, and not the machine.
     pub why: String,
-    /// The one thing to do (at most [`ACTION_MAX`] characters).
+    /// The one thing to do.
     pub action: String,
     /// What clears it.
     pub clears: &'static str,
@@ -130,17 +130,118 @@ impl Exception {
             escalated: false,
         }
     }
+
+    /// [`Self::context`] for the full context whose notice `message` is: a
+    /// conversation of ONE EXCHANGE that the vendor says cannot be compacted
+    /// (`Prompt is too long · … A single-exchange conversation cannot be
+    /// compacted; reduce attached files/tools or start with less context.`,
+    /// 2.1.300) has no messages to go back over, and what fills it is the
+    /// tab's tools and attachments: its own remedy, done in the tab. Any
+    /// other full context is [`Self::context`].
+    #[must_use]
+    pub fn context_of(message: &str) -> Self {
+        let single = message
+            .to_lowercase()
+            .contains(&aterm_phase::anchor("wall.cannot_be_compacted").to_lowercase());
+        if !single {
+            return Self::context();
+        }
+        Self {
+            why: "One exchange fills the context, and compaction cannot shrink it.".to_string(),
+            action: "Trim this tab's MCP tools and attachments, then run /clear in it.".to_string(),
+            ..Self::context()
+        }
+    }
+
+    /// A REQUEST THE API REFUSES the same way each time it is sent
+    /// ([`aterm_phase::ApiCause::Request`]), its slow ladder tried
+    /// [`FUTILE_AFTER_TRIES`] times: what ends it is a person's change in the
+    /// tab, named by the notice ([`refused_action`]). `Later`: the ladder
+    /// goes on, and nothing says a person is needed this minute.
+    #[must_use]
+    pub fn refused(typed: Option<&str>, message: &str) -> Self {
+        Self {
+            kind: ExceptionKind::Refused,
+            when: Urgency::Later,
+            why: "Claude's API refuses this request the same way each time it is sent.".to_string(),
+            action: refused_action(typed, message).to_string(),
+            clears: "the agent working",
+            escalated: false,
+        }
+    }
 }
 
-/// The longest `why`, in characters.
-pub const WHY_MAX: usize = 90;
+/// What a person does about a REFUSED REQUEST ([`Exception::refused`]):
+/// `(typed kinds, needles, action)` — the first row one of whose typed kinds
+/// is the one Claude Code wrote with the notice (its `apiError`, else its
+/// `error`, read from the session's transcript:
+/// [`TurnEndState::notice_typed`]), else the first whose needle the notice's
+/// words hold; the last row is every other. Fixed aterm words: nothing of
+/// the notice is quoted.
+const REFUSED_ACTIONS: &[(&[&str], &[&str], &str)] = &[
+    (
+        &["tool_history_mismatch"],
+        &[
+            "/rewind",
+            "tool use concurrency",
+            "tool_result in",
+            "tool_use id",
+        ],
+        "Use /rewind in this tab to go back before the failed step.",
+    ),
+    (
+        &["claude_code_version_too_old"],
+        &["claude update", "minimum version"],
+        "Update Claude Code: run aterm pkg update claude in a shell.",
+    ),
+    (
+        &["safety_monitor_blocked"],
+        &["can't help", "safeguards"],
+        "Press Esc twice in this tab and rephrase the flagged message.",
+    ),
+    (
+        &["model_not_found"],
+        &["/model", "selected model", "deployment", "pro plan"],
+        "Run /model in this tab and pick a model this account can use.",
+    ),
+    (
+        &["account_on_hold"],
+        &["on hold"],
+        "Open claude.ai/restricted to see why the account is held.",
+    ),
+    (
+        &["effort_requires_thinking"],
+        &["/effort", "with thinking"],
+        "Run /effort high in this tab.",
+    ),
+    (
+        &[],
+        &[],
+        "Open the tab and do what Claude Code's last error asks.",
+    ),
+];
+
+/// The action for a refused request ([`REFUSED_ACTIONS`]): by `typed`, the
+/// kind Claude Code wrote with the notice, where there is one the table
+/// names, else by the words of `message`, the notice.
+#[must_use]
+pub fn refused_action(typed: Option<&str>, message: &str) -> &'static str {
+    let lower = message.to_lowercase().replace('\u{2019}', "'");
+    REFUSED_ACTIONS
+        .iter()
+        .find(|(kinds, _, _)| typed.is_some_and(|t| kinds.contains(&t)))
+        .or_else(|| {
+            REFUSED_ACTIONS
+                .iter()
+                .find(|(_, needles, _)| needles.iter().any(|n| lower.contains(n)))
+        })
+        .map_or(REFUSED_ACTIONS[REFUSED_ACTIONS.len() - 1].2, |row| row.2)
+}
 
 /// The step of a stuck RENEWABLE login's exception, up to the label it names
 /// (`Run aterm harness accounts renew <label>.`): the words a host gathers
 /// the labels of such asks by.
 pub const RENEW_STEP: &str = "Run aterm harness accounts renew ";
-/// The longest `action`, in characters.
-pub const ACTION_MAX: usize = 90;
 
 /// `Goal cleared after an unrecoverable error (<label>)`'s label, from a
 /// wall's message.
@@ -201,6 +302,13 @@ const ACCOUNT_LIMITS: &[(&str, &str, &str)] = &[
         "Long context needs extra usage, which is not on.",
         "Turn extra usage on in claude.ai settings.",
     ),
+    // The same entitlement as 2.1.300 words it (`API Error: Usage credits
+    // required for 1M context · run /model to switch to standard context`).
+    (
+        "usage credits required for 1m context",
+        "Long context needs usage credits, which this account lacks.",
+        "Add usage credits in claude.ai settings.",
+    ),
     (
         "spend limit",
         "A spend limit, not a time window, stopped it.",
@@ -238,17 +346,11 @@ fn title(alias: &str) -> String {
 
 /// The `(why, action)` for a spend-class wall's message in a session of
 /// `program`. Claude Code's by its notice's own words
-/// ([`account_limit_text`]). Codex's notices name a spend cap or credits
-/// (aterm-phase's `codex::WALLS`) and each says its own step, and no page of
-/// its account was measured: the action sends the person to that notice.
-/// Any other program's, in words that name no vendor.
+/// ([`account_limit_text`]). Any other program's sends the person to its own
+/// notice, in words that name no vendor where none was measured.
 fn spend_text(program: Program, message: &str) -> (&'static str, &'static str) {
     match program {
         Program::Claude => account_limit_text(message),
-        Program::Codex => (
-            "Its Codex account is out of credits or at its spend cap, and no time window ends that.",
-            "Do what Codex's notice in this tab says to lift the account's limit.",
-        ),
         Program::Agy => (
             "Its agy account is out of quota or at a spend limit, and no time window ends that.",
             "Do what agy's notice in this tab says to lift the account's limit.",
@@ -257,7 +359,11 @@ fn spend_text(program: Program, message: &str) -> (&'static str, &'static str) {
             "Its Muse Code account is out of credits or at a spend limit, and no time window ends that.",
             "Do what Muse Code's notice in this tab says to lift the account's limit.",
         ),
-        Program::Generic => (
+        Program::Gemini => (
+            "Its Gemini CLI account is out of quota or at a spend limit, and no time window ends that.",
+            "Do what Gemini CLI's notice in this tab says to lift the account's limit.",
+        ),
+        Program::Codex | Program::Generic => (
             "Its account is out of credits or at a spend limit, and no time window ends that.",
             "Do what the program's notice in this tab says to lift the account's limit.",
         ),
@@ -265,48 +371,52 @@ fn spend_text(program: Program, message: &str) -> (&'static str, &'static str) {
 }
 
 /// Where a person reads what holds a limit an hour past its reset, in a
-/// session of `program`: Claude Code's usage page; Codex's own `/status`,
-/// whose card draws its usage windows and names its usage page (measured on
-/// 0.156.1, aterm-phase's `codex::fixtures::STATUS`); any other program's
-/// account, in words that name no vendor.
+/// session of `program`: Claude Code's usage page; Muse Code's `/upgrade`,
+/// which its usage wall names `for increased limits` (measured on 1.4.10;
+/// its `/status` and `/usage` cards draw the session's tokens, no limit);
+/// Gemini CLI's own `/stats model`, which its usage-limit dialog names
+/// (measured on 0.46.0);
+/// any other program's account, in words that name no vendor.
 fn futile_action(program: Program) -> &'static str {
     match program {
         Program::Claude => "Check claude.ai/settings/usage for what holds it.",
-        Program::Codex => "Run /status in this tab to see which limit holds it.",
         Program::Agy => "Check agy's account usage for what holds it.",
-        Program::Muse => "Check Muse Code's account usage for what holds it.",
-        Program::Generic => "Check the program's account usage for what holds it.",
+        Program::Muse => {
+            "Run /upgrade in this tab for increased limits, as Muse Code's usage wall says."
+        }
+        Program::Gemini => "Run /stats model in this tab to see which limit holds it.",
+        Program::Codex | Program::Generic => "Check the program's account usage for what holds it.",
     }
 }
 
-/// A lost login's `(why, action, clears)` in a session of `program`. Claude
-/// Code's `/login`, typed at the point, opened a page in the browser and
-/// says `Login successful` when done. Codex signs in outside its TUI
-/// ([`sign_in_how`]), so nothing on its screen says the login is back. Any
-/// other program's step is its own notice's.
-fn login_text(program: Program) -> (&'static str, String, &'static str) {
+/// A lost login's `(why, action, clears)` in a session of `program`, its
+/// wall reading `message`. Claude Code's `/login`, typed at the point, opened
+/// a page in the browser and says `Login successful` when done. Muse Code's step is its key wall's own remedy where it
+/// names one. Any other program's step is its own notice's.
+fn login_text(program: Program, message: &str) -> (&'static str, String, &'static str) {
     match program {
         Program::Claude => (
             "Its login is gone, and only a browser sign-in restores it.",
             "Finish signing in on the page /login opened in your browser.".to_string(),
             "`Login successful` on the screen, or the agent working",
         ),
-        Program::Codex => (
-            "Its Codex login is gone, and only your own sign-in restores it.",
-            format!("{}.", title(sign_in_how(program))),
-            "the agent working",
-        ),
         Program::Agy => (
-            "Its agy login is gone, and only your own sign-in restores it.",
-            format!("{}.", title(sign_in_how(program))),
+            "Its agy login or Gemini API key was refused, and only your own sign-in or a \
+             valid key restores it.",
+            format!("{}.", title(&sign_in_how(program, message))),
             "the agent working",
         ),
         Program::Muse => (
             "Its Muse Code login is gone, and only your own sign-in restores it.",
-            format!("{}.", title(sign_in_how(program))),
+            format!("{}.", title(&sign_in_how(program, message))),
             "the agent working",
         ),
-        Program::Generic => (
+        Program::Gemini => (
+            "Its Gemini CLI key or login was refused, and only your own sign-in restores it.",
+            format!("{}.", title(&sign_in_how(program, message))),
+            "the agent working",
+        ),
+        Program::Codex | Program::Generic => (
             "Its login is gone, and only your own sign-in restores it.",
             "Sign the program in again as its notice in this tab says.".to_string(),
             "the agent working",
@@ -385,6 +495,9 @@ pub fn exception_for(
         // session's own move AT A WALL chose is the old process's notice, no
         // login gone ([`TurnEndState::login_left`]).
         WallKind::Auth if state.login_left(reading) => None,
+        // A bucket the fallback's relaunch moved the session off, its notice
+        // redrawn by the relaunched process ([`TurnEndState::bucket_left`]).
+        WallKind::ModelBucket { .. } if state.bucket_left(reading) => None,
         // A lost login right after the session's own account move is the
         // move's, not the person's: it is answered by the next account while
         // one is advised, and nothing is raised for it ([`login_wall_moves`]).
@@ -431,7 +544,7 @@ pub fn exception_for(
             })
         }
         WallKind::Auth if attempts > 0 || !cfg.retry_api_errors => {
-            let (why, action, clears) = login_text(reading.program);
+            let (why, action, clears) = login_text(reading.program, &reading.wall_message);
             Some(Exception {
                 kind: ExceptionKind::Login,
                 when: Urgency::Now,
@@ -441,10 +554,7 @@ pub fn exception_for(
                 // The loop's own escalation (owner = supervisor) is the surface
                 // for this login (design-exceptions 8.4): raised with the
                 // `/login` the point typed, or as the point's act under
-                // `retry_api_errors = false`. Nothing is typed into Codex, so
-                // its lost login reaches this arm only under that switch; with
-                // it on, the point's escalation, naming `codex login`, stands
-                // alone.
+                // `retry_api_errors = false`.
                 escalated: true,
             })
         }
@@ -527,13 +637,22 @@ pub fn exception_for(
         // request error on a later rung does not end the line) and the loop has
         // tried three times. The ladder goes on (hourly), and so does the line:
         // the `/compact` the loop types is no sign the agent works
-        // ([`TurnEndState::compacting`]). A Codex tab's `ran out of room in the
-        // model's context window` never says it, so Codex raises nothing here.
+        // ([`TurnEndState::compacting`]).
         WallKind::Context
             if attempts >= CONTEXT_EXHAUSTED_AFTER && state.compaction_exhausted() =>
         {
-            Some(Exception::context())
+            Some(Exception::context_of(&reading.wall_message))
         }
+        // A request the API refuses the same way each time: tried three times
+        // on its slow ladder, which goes on; a person's change in the tab ends
+        // it ([`Exception::refused`]).
+        WallKind::ApiError {
+            cause: aterm_phase::ApiCause::Request,
+            ..
+        } if cfg.retry_api_errors && attempts >= FUTILE_AFTER_TRIES => Some(Exception::refused(
+            state.notice_typed(),
+            &reading.wall_message,
+        )),
         _ => None,
     }
 }

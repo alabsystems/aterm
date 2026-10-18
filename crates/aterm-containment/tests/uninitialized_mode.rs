@@ -8,9 +8,7 @@
 //! OnceLock has NOT been initialized. All gates should default to Containment mode
 //! (maximally restrictive).
 
-use aterm_containment::{
-    ContainmentMode, ContainmentPolicy, FsCapability, NetworkCapability, ProcessCapability,
-};
+use aterm_containment::ContainmentMode;
 
 #[test]
 fn mode_or_containment_defaults_to_containment_when_uninit() {
@@ -23,22 +21,6 @@ fn mode_or_containment_defaults_to_containment_when_uninit() {
 
             let mode = aterm_containment::mode_or_containment();
             assert_eq!(mode, ContainmentMode::Containment);
-        },
-    );
-}
-
-#[test]
-fn uninitialized_mode_gets_most_restrictive_capabilities() {
-    crate::in_fresh_process(
-        module_path!(),
-        "uninitialized_mode_gets_most_restrictive_capabilities",
-        || {
-            let mode = aterm_containment::mode_or_containment();
-            let caps = ContainmentPolicy::capabilities(mode);
-
-            assert_eq!(caps.network, NetworkCapability::None);
-            assert_eq!(caps.fs, FsCapability::TmpOnly);
-            assert_eq!(caps.process, ProcessCapability::NoFork);
         },
     );
 }

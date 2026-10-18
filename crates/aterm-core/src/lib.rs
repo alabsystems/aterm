@@ -8,13 +8,12 @@
 //!
 //! ## Verification
 //!
-//! - **TLA+ specs** for key invariants: `crates/aterm-spec-models/specs/`
-//! - **Generated-input tests**: `src/tests/generated.rs`
-//! - **Fuzz-shaped tests** are ordinary integration tests in the `core_fuzz`
-//!   binary (`tests/fuzz_process_never_panics.rs`, `tests/fuzz_alt_screen.rs`).
-//!   The workspace's `cargo-fuzz` targets are `crates/aterm-scrollback/fuzz`,
-//!   `crates/aterm-font/fuzz`, `crates/aterm-zstd/fuzz` and
-//!   `crates/aterm-dbus/fuzz`.
+//! - **Derived models** (`ty_model!`) for key invariants: `crates/aterm-models-core`
+//!   (the alternate-screen round trip, `tests/conformance_altscreen.rs`)
+//! - **Fuzz-shaped tests** are modules of the `core_suite` integration binary
+//!   (`tests/fuzz_process_never_panics.rs`, `tests/fuzz_alt_screen.rs`).
+//!   The workspace's `cargo-fuzz` targets are `crates/aterm-font/fuzz`,
+//!   `crates/aterm-zstd/fuzz` and `crates/aterm-dbus/fuzz`.
 //!
 //! ## Components
 //!
@@ -32,9 +31,8 @@
 //! primitive; consumers such as `aterm-observe` and `aterm-agent` read it over
 //! the engine.
 //!
-//! Internal: `parser` (`aterm-parser`), `domain` value types, `sixel` (the
-//! off-by-default `sixel` feature: decodes a sixel DCS into an inline image and
-//! advertises DA1 code 4), `vt_level`, and `aterm-vi` for vi-mode navigation.
+//! Internal: `parser` (`aterm-parser`), `domain` value types, `sixel` (decodes
+//! a sixel DCS into an inline image; DA1 advertises code 4) and `vt_level`.
 
 #![warn(missing_docs)]
 #![warn(clippy::pedantic)]
@@ -133,20 +131,11 @@ pub mod scrollback;
 pub mod search;
 
 /// Sixel graphics decoder (extracted to `aterm-sixel` crate).
-#[cfg(feature = "sixel")]
 pub(crate) use aterm_sixel as sixel;
 pub mod terminal;
-/// Vi mode navigation (the `aterm-vi` crate), owned by [`terminal::Terminal`].
-pub(crate) use aterm_vi as vi_mode;
-/// Vi-mode value types taken and returned by `Terminal`'s vi accessors,
-/// re-exported so downstream crates can name them.
-pub use aterm_vi::{InlineSearchKind, ViBoundary, ViMotion, ViPoint, ViVisualType};
 pub(crate) mod vt_level;
 
 /// Shell integration injection (zsh, bash, fish).
 ///
 /// Re-exported from the standalone `aterm-shell-integration` crate.
 pub use aterm_shell_integration as shell_integration;
-
-#[cfg(test)]
-mod tests;

@@ -9,7 +9,9 @@
 //! pop after a theme switch lands on the new theme.
 //!
 //! Negative controls: the resets (OSC 104/110/111/112, RIS) land on the NEW
-//! theme, and a pop under a closed palette gate leaves the palette alone.
+//! theme, closing the palette gate puts the theme palette back (and keeps the
+//! ungated colours), and a pop under a closed palette gate leaves the palette
+//! alone.
 
 use aterm_core::config::{ConfigChange, TerminalConfig};
 use aterm_core::terminal::{ColorPalette, Rgb, Terminal};
@@ -154,7 +156,44 @@ fn a_colour_stack_pop_after_a_theme_switch_lands_on_the_new_theme() {
 }
 
 #[test]
+fn closing_the_palette_gate_puts_the_theme_palette_back() {
+    let theme_p4 = theme(OLD).custom_palette.expect("theme palette").get(4);
+    let closed = TerminalConfig {
+        allow_palette_reconfigure: false,
+        ..theme(OLD)
+    };
+    let mut t = running_program();
+    let changes = t.apply_config(&closed);
+    assert_eq!(
+        t.palette_color(4),
+        theme_p4,
+        "the program's palette entry is dropped with the gate"
+    );
+    assert_eq!(
+        t.default_background(),
+        PROGRAM_BG,
+        "OSC 11 is ungated and stays"
+    );
+    assert_eq!(t.cursor_color(), Some(PROGRAM_CURSOR), "OSC 12 likewise");
+    assert!(changes.contains(&ConfigChange::Colors), "{changes:?}");
+    assert!(
+        t.program_color_overrides().palette.is_empty(),
+        "nothing of the program's palette is left to replay"
+    );
+
+    // Control: a reload that keeps the gate open (an unrelated key moved)
+    // keeps the program's palette.
+    let mut open = running_program();
+    open.apply_config(&TerminalConfig {
+        faint_opacity: 0.4,
+        ..theme(OLD)
+    });
+    assert_eq!(open.palette_color(4), PROGRAM_P4);
+}
+
+#[test]
 fn a_pop_under_a_closed_palette_gate_leaves_the_palette_alone() {
+    let theme_p4 = theme(OLD).custom_palette.expect("theme palette").get(4);
     let mut t = Terminal::new(8, 40);
     t.apply_config(&theme(OLD));
     t.process(b"\x1b]4;4;rgb:28/2a/36\x07");
@@ -165,10 +204,15 @@ fn a_pop_under_a_closed_palette_gate_leaves_the_palette_alone() {
         ..theme(OLD)
     };
     t.apply_config(&closed);
+    assert_eq!(
+        t.palette_color(4),
+        theme_p4,
+        "closing the gate put the theme's entry back"
+    );
     t.process(b"\x1b]30101\x07");
     assert_eq!(
         t.palette_color(4),
-        rgb(1, 1, 1),
+        theme_p4,
         "a pop is a palette write, and the gate refuses it"
     );
 

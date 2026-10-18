@@ -127,15 +127,6 @@ fn is_snooze_names_exactly_the_snoozes() {
         },
         not_today(),
         skip_version(),
-        // the group row's buttons decline for the tabs they list
-        Intent::AgentUpgradeTabs {
-            word: UpgradeWord::NotToday,
-            moves: vec![("s-1".into(), "2".into())],
-        },
-        Intent::AgentUpgradeTabs {
-            word: UpgradeWord::Skip,
-            moves: vec![("s-1".into(), "2".into())],
-        },
     ];
     for d in &declines {
         assert!(d.is_snooze(), "{d:?}");
@@ -159,10 +150,6 @@ fn is_snooze_names_exactly_the_snoozes() {
             word: UpgradeWord::Now,
         },
         Intent::EndRecovered,
-        Intent::AgentUpgradeTabs {
-            word: UpgradeWord::Now,
-            moves: vec![("s-1".into(), "2".into())],
-        },
     ];
     for a in &actions {
         assert!(!a.is_snooze(), "{a:?}");

@@ -1,0 +1,22 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Muse Code outside the lab's jail, against a local fake backend: launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a scripted stand-in for Meta's model API, which the proxy variables also pointed at and which refused every request for another host; an lsof sampler over the process tree saw no endpoint but loopback), so Muse Code's own managed sandbox applied · the stand-in's call `mcp__probe__ping {text: "hi"}` (namespace `mcp__probe`) of a local stdio MCP server `probe` named in the scratch HOME's `settings.json` (its tool `ping` carries no annotations; a `readOnlyHint` tool of it ran unasked): the tool-action box after one Down: the session grant focused
+
+  Muse Code 1.4.10
+
+❯ use the probe
+
+◆ I will call mcp__probe__ping.
+
+◈ Calling tools (2s · esc to interrupt)
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+Would you like to allow this tool action?
+
+  tool action: mcp__probe__ping
+
+  1. Yes, proceed (y)
+⟩ 2. Yes, don't ask again this session (p)  tool `mcp__probe__ping`
+  3. Always allow this MCP tool  tool `mcp__probe__ping`
+  4. No, and tell Muse Code what to do differently (esc)
+Change approval defaults in /permissions
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  fake-model · high · ~/proj · Auto-review

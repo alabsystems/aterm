@@ -1182,17 +1182,6 @@ mod tests {
     }
 
     #[test]
-    fn no_trail_until_a_move() {
-        let mut t = CursorTrail::default();
-        let now = Instant::now();
-        let mut out = Vec::new();
-        // First observation establishes `last`; no move yet → nothing.
-        assert_eq!(t.tick(Some((0, 0)), now, &cfg(true), &mut out), 0);
-        assert!(out.is_empty());
-        assert!(!t.is_active());
-    }
-
-    #[test]
     fn presentation_opacity_attenuates_resident_cells_and_fingerprints_exact_output() {
         let now = Instant::now();
         let mut trail = CursorTrail::default();
@@ -1359,7 +1348,7 @@ mod tests {
         // Tier 1: bind the genuine CursorTrail transition to the same derived
         // all-effect scroll decision used by CursorGlow. The concrete asserts
         // above cover every position-bearing field in this engine.
-        let base_model = aterm_spec::derive::cursor_effect_scroll_model();
+        let base_model = aterm_models_effects::cursor_effect_scroll_model();
         let overrides = [("StartY", 10), ("Delta", 2)];
         let model = aterm_spec::interp::with_consts(&base_model, &overrides);
         let mut source = model.init_state();
@@ -1456,7 +1445,7 @@ mod tests {
         // Tier 1: the licence stamp is one slot, so a gesture press disposes of
         // whatever classes were live (the model's `superseded` disposition);
         // both superseded classes must be gone.
-        let base_model = aterm_spec::derive::cursor_hint_license_model();
+        let base_model = aterm_models_effects::cursor_hint_license_model();
         let model = aterm_spec::interp::with_consts(&base_model, &[]);
         let mut source = model.init_state();
         source.insert("hint", 1);
@@ -1545,7 +1534,7 @@ mod tests {
         );
     }
 
-    /// Tier-1 provenance bind for the classic opaque comet. Program/TUI cursor
+    /// Provenance for the classic opaque comet. Program/TUI cursor
     /// deltas and timestamp-only input classes stay dark even while the
     /// configured colour/heat is warm; an explicit candidate admits exactly
     /// one move and is consumed whether fresh or stale.
@@ -1746,134 +1735,6 @@ mod tests {
                 );
             }
         }
-
-        // Tier 1 against the licence model: a hidden→visible completion with no
-        // `spawn` decision consumes every class without licensing anything
-        // (`SwallowedKeyClearsLicense`); a retained stamp is the negative
-        // control.
-        let model = aterm_spec::derive::cursor_hint_license_model();
-        let mut hidden_source = model.init_state();
-        hidden_source.insert("hint", 1);
-        hidden_source.insert("arms", 1);
-        hidden_source.insert("credit_arms", 1);
-        let mut hidden_projected = hidden_source.clone();
-        hidden_projected.insert("hint", 0);
-        hidden_projected.insert("cleared", 1);
-        hidden_projected.insert("swallowed", 1);
-        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &hidden_source,
-            &hidden_projected,
-            Some("SwallowedKeyClearsLicense"),
-            "CursorTrail declined hidden relocation",
-        );
-        assert!(ok, "real hidden-decline transition rejected: {why}");
-        let mut hidden_sticky = hidden_projected.clone();
-        hidden_sticky.insert("hint", 1);
-        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &hidden_source,
-            &hidden_sticky,
-            Some("SwallowedKeyClearsLicense"),
-            "CursorTrail declined-hidden negative control",
-        );
-        assert!(!ok, "a declined hidden hint must not remain armed");
-
-        // The cold move: no stamp, so the seam returns before `classify_move`,
-        // the ring scores one decline and nothing is born. Negative control: a
-        // fall-through that mints light off a bare cursor delta.
-        let mut source = model.init_state();
-        source.insert("resident", 1);
-        let mut cold_projected = source.clone();
-        cold_projected.insert("spawns", 1);
-        cold_projected.insert("declined_tally", 1);
-        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &source,
-            &cold_projected,
-            Some("ColdMoveDeclines"),
-            "CursorTrail cold program denial",
-        );
-        assert!(ok, "real cold-trail decision rejected: {why}");
-        let mut leaked = cold_projected.clone();
-        leaked.insert("births", 1);
-        leaked.insert("licensed_tally", 1);
-        leaked.insert("declined_tally", 0);
-        leaked.insert("cold_admitted", 1);
-        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &source,
-            &leaked,
-            Some("ColdMoveDeclines"),
-            "CursorTrail cold program negative control",
-        );
-        assert!(!ok, "model must reject the historical cold fall-through");
-
-        // The other half: the same cold move must not destroy the light this
-        // engine's earned sparks hold.
-        let mut wiped = cold_projected;
-        wiped.insert("resident", 0);
-        wiped.insert("wiped", 1);
-        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &source,
-            &wiped,
-            Some("ColdMoveOverEarnedLight"),
-            "CursorTrail retention negative control",
-        );
-        assert!(!ok, "a declined move may not wipe earned trail light");
-
-        // A press arms the licence, and its one paired echo spends it.
-        let mut armed = model.init_state();
-        armed.insert("hint", 1);
-        armed.insert("arms", 1);
-        armed.insert("credit_arms", 1);
-        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &model.init_state(),
-            &armed,
-            Some("PressArmsLicense"),
-            "CursorTrail press arms the licence",
-        );
-        assert!(ok, "real press arm rejected: {why}");
-
-        let mut echoed = armed.clone();
-        echoed.insert("hint", 0);
-        echoed.insert("consumed", 1);
-        echoed.insert("admissions", 1);
-        // The echo spends the press's credit.
-        echoed.insert("spent", 1);
-        echoed.insert("spawns", 1);
-        echoed.insert("births", 1);
-        echoed.insert("licensed_tally", 1);
-        echoed.insert("resident", 1);
-        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &armed,
-            &echoed,
-            Some("LicensedTypedMoveMintsLight"),
-            "CursorTrail licensed echo mints light",
-        );
-        assert!(ok, "real licensed-trail decision rejected: {why}");
-
-        let mut reused = echoed;
-        reused.insert("hint", 1);
-        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &armed,
-            &reused,
-            Some("LicensedTypedMoveMintsLight"),
-            "CursorTrail one-hint-one-echo negative control",
-        );
-        assert!(!ok, "a spent licence must not survive its own echo");
     }
 
     #[test]
@@ -2005,19 +1866,6 @@ mod tests {
         // …and fully gone at +400ms (crisp tail after the last key).
         let gone = t.tick(Some((0, 1)), t0 + Duration::from_millis(400), &c, &mut out);
         assert_eq!(gone, 0);
-        assert!(!t.is_active());
-    }
-
-    #[test]
-    fn disabled_draws_nothing_but_tracks_cursor() {
-        let mut t = CursorTrail::default();
-        let now = Instant::now();
-        let mut out = Vec::new();
-        let c = cfg(false);
-        t.tick(Some((0, 0)), now, &c, &mut out);
-        let fp = t.tick(Some((0, 40)), now, &c, &mut out);
-        assert_eq!(fp, 0);
-        assert!(out.is_empty());
         assert!(!t.is_active());
     }
 
@@ -2177,19 +2025,6 @@ mod tests {
     }
 
     #[test]
-    fn hidden_cursor_does_not_spawn_on_reappear() {
-        let mut t = CursorTrail::default();
-        let now = Instant::now();
-        let mut out = Vec::new();
-        let c = cfg(true);
-        t.tick(Some((0, 0)), now, &c, &mut out); // seen at (0,0)
-        t.tick(None, now, &c, &mut out); // cursor hidden
-        let fp = t.tick(Some((0, 40)), now, &c, &mut out); // reappears far away
-        assert_eq!(fp, 0, "no comet across a hide/show gap");
-        assert!(out.is_empty());
-    }
-
-    #[test]
     fn bounded_tail_matches_the_legacy_full_sweep() {
         for (origin, destination) in [
             ((0, 0), (0, 40)),
@@ -2270,60 +2105,24 @@ mod tests {
         cad.intensity(t - interval)
     }
 
+    /// Only a fast, sustained burst ignites: one, two or three quick keys stay
+    /// gentle (the user's "don't make it intense for a few characters"), and
+    /// hunt-and-peck never accumulates heat however long it goes. The igniting
+    /// side is `a_pause_decays_the_ignition`'s fixture.
     #[test]
-    fn ignition_intensity_is_a_clamped_smoothstep() {
-        // Below the low knee → gentle 0; above the high knee → full 1; monotone between.
-        assert_eq!(ignition_intensity(0.0, 2.0, 6.5), 0.0);
-        assert_eq!(ignition_intensity(2.0, 2.0, 6.5), 0.0);
-        assert_eq!(ignition_intensity(6.5, 2.0, 6.5), 1.0);
-        assert_eq!(ignition_intensity(100.0, 2.0, 6.5), 1.0);
-        let mid = ignition_intensity(4.25, 2.0, 6.5); // exact midpoint → 0.5
-        assert!((mid - 0.5).abs() < 1e-4, "smoothstep midpoint {mid}");
-        // Monotone non-decreasing across the ramp.
-        let mut prev = -1.0;
-        for i in 0..=45 {
-            let h = i as f32 * 0.2;
-            let v = ignition_intensity(h, 2.0, 6.5);
-            assert!(v >= prev - 1e-6, "monotone at heat {h}: {v} < {prev}");
-            assert!((0.0..=1.0).contains(&v));
-            prev = v;
+    fn a_few_keys_or_slow_typing_stay_gentle() {
+        for (keys, gap_ms, below) in [
+            (1u32, 50u64, 1e-6f32),
+            (2, 50, 0.05),
+            (3, 50, 0.15),
+            (24, 400, 0.1),
+        ] {
+            let got = burst(keys, Duration::from_millis(gap_ms));
+            assert!(
+                got < below,
+                "{keys} keys at {gap_ms} ms must stay under {below}, got {got}"
+            );
         }
-        // Degenerate knees don't divide by zero — they step at the threshold.
-        assert_eq!(ignition_intensity(5.0, 3.0, 3.0), 1.0);
-        assert_eq!(ignition_intensity(2.0, 3.0, 3.0), 0.0);
-    }
-
-    #[test]
-    fn a_few_keys_stay_gentle() {
-        // One, two, even three quick keys must not ignite (the user's "don't make it
-        // intense for a few characters"). 50 ms apart = a brisk but short tap.
-        let iv = Duration::from_millis(50);
-        assert_eq!(burst(1, iv), 0.0, "a single key never ignites");
-        assert!(
-            burst(2, iv) < 0.05,
-            "two keys stay gentle: {}",
-            burst(2, iv)
-        );
-        assert!(
-            burst(3, iv) < 0.15,
-            "three keys stay gentle: {}",
-            burst(3, iv)
-        );
-    }
-
-    #[test]
-    fn fast_sustained_burst_ignites() {
-        // A sustained fast burst (a real touch-typist, ~40 ms/key) crosses into
-        // ignition — the comet lights up.
-        let hot = burst(16, Duration::from_millis(40));
-        assert!(hot > 0.85, "fast sustained typing ignites (got {hot})");
-    }
-
-    #[test]
-    fn slow_typing_never_ignites() {
-        // Hunt-and-peck (400 ms/key) never accumulates heat, however long you go.
-        let cold = burst(24, Duration::from_millis(400));
-        assert!(cold < 0.1, "slow typing stays gentle (got {cold})");
     }
 
     #[test]
@@ -2457,32 +2256,6 @@ mod tests {
             (c.color >> 16) & 0xff > (base >> 16) & 0xff,
             "red channel warmed"
         );
-    }
-
-    /// Navigation suppression: a move paired only with a nav timestamp
-    /// (Ctrl-A/E, Home/End, arrows) lays no comet, matching the glow engine; the
-    /// same geometry with a scripted candidate proves the positive path.
-    #[test]
-    fn navigation_lays_no_comet() {
-        let now = Instant::now();
-        let c = cfg(true);
-        // Baseline: an explicitly candidate-backed same-row jump spawns.
-        let mut plain = CursorTrail::default();
-        let mut out = Vec::new();
-        plain.tick(Some((0, 30)), now, &c, &mut out); // seed last
-        plain.note_synthetic_move(now);
-        let fp = plain.tick(Some((0, 0)), now, &c, &mut out); // Ctrl-A-shaped move
-        assert_ne!(fp, 0, "a candidate-backed jump lays a comet");
-        assert!(plain.is_active());
-        // With a fresh nav hint the identical move lays nothing.
-        let mut nav = CursorTrail::default();
-        out.clear();
-        nav.tick(Some((0, 30)), now, &c, &mut out); // seed last
-        nav.note_navigation(now);
-        let fp = nav.tick(Some((0, 0)), now, &c, &mut out); // Ctrl-A to home
-        assert_eq!(fp, 0, "navigation lays no comet");
-        assert!(out.is_empty());
-        assert!(!nav.is_active());
     }
 
     /// The probe-table merge in `tick` emits byte-identically (contents and

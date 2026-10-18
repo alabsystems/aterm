@@ -583,7 +583,13 @@ fn a_second_fold_reads_only_the_appended_bytes() {
     assert_eq!(fresh, Some(Fresh::NoFile));
     let first = spend.fold_claude_home(&table(), now, Limits::none());
     assert_eq!(first.read, first_rows.len() as u64);
+    let recording = aterm_durable::seam::Recording::start();
     store.save(&spend).expect("save");
+    assert_eq!(
+        recording.take(),
+        [aterm_durable::Flush::Ordered],
+        "a fold is only ordered"
+    );
     // Unchanged: not even opened.
     let (mut again, fresh) = store.load(Agent::Claude, "main", home.path(), &table());
     assert_eq!(fresh, None, "the file is this home's, under this table");
@@ -2149,7 +2155,7 @@ fn add_message_is_the_seam_and_a_codex_spend_folds_no_home() {
 // Codex rollouts (C1)
 // ---------------------------------------------------------------------------
 
-use crate::supervise::codex_usage::fixtures::{context, copied, count, message, meta};
+use crate::harness::codex_rollout::fixtures::{context, copied, count, message, meta};
 
 /// Thread ids in UUIDv7 form: a conversation's own thread and a subagent
 /// forked from it.
@@ -2341,6 +2347,60 @@ fn a_second_codex_fold_reads_only_the_appended_bytes_through_its_spend_file() {
     assert_eq!(fresh, Some(Fresh::Unreadable));
 }
 
+/// A LEGACY FORK FOLDED INSIDE ITS COPY keeps its own thread through the
+/// spend file (Codex 0.163.0, `harness::codex_rollout`'s module header): its
+/// own `thread_settings_applied`, appended 17 ms after the copy with a
+/// prompt's turn behind it, ends the copy, and the turn counts on its own
+/// model. A reader kept before the thread was (five entries) still loads.
+/// Negative control: that older reader, with no thread to end the copy by,
+/// takes the turn, inside the burst, for the copy's.
+#[test]
+fn a_legacy_fork_folded_inside_its_copy_keeps_its_thread_through_the_spend_file() {
+    use crate::harness::codex_rollout::fixtures::{meta_as, settings};
+    let home = Home::new("codex-prompted");
+    let now = now();
+    let fork = rollout(&home, SUB);
+    let at = (now - HOUR) * 1000;
+    let copy = [
+        meta_as(at, SUB, SUB, Some(ROOT), Some("legacy"), None),
+        copied(&parent_lines(now), at),
+    ]
+    .concat();
+    let own = [
+        settings(at + 20, SUB),
+        context(at + 30, "gpt-6-luna", None),
+        count(at + 45, (3500, 2600, 250), (500, 0, 100)),
+    ]
+    .concat();
+    fs::write(&fork, &copy).expect("write");
+    let store = SpendStore {
+        dir: home.path().join("spend"),
+    };
+    let (mut spend, _) = store.load(Agent::Codex, "codex", home.path(), &codex_table());
+    let first = spend.fold_codex_home(&codex_table(), now, Limits::none());
+    assert_eq!((first.messages, first.copied), (0, 2));
+    store.save(&spend).expect("save");
+    let path = store.path(Agent::Codex, "codex").expect("a path");
+    let kept = fs::read_to_string(&path).expect("read");
+    let (mut again, fresh) = store.load(Agent::Codex, "codex", home.path(), &codex_table());
+    assert_eq!(fresh, None, "kept");
+    assert_eq!(again, spend, "the reader's thread came back");
+    append(&fork, &own);
+    let second = again.fold_codex_home(&codex_table(), now, Limits::none());
+    assert_eq!((second.messages, second.copied), (1, 0), "{second:?}");
+    assert_eq!(everything(&again, now).tokens.input, 500);
+    assert!(again.buckets().any(|(_, m)| m.contains_key("gpt-6-luna")));
+
+    // NEGATIVE CONTROL.
+    let thread = format!(",\"{SUB}\"]");
+    assert!(kept.contains(&thread), "the thread is kept");
+    fs::write(&path, kept.replace(&thread, "]")).expect("write");
+    let (mut older, fresh) = store.load(Agent::Codex, "codex", home.path(), &codex_table());
+    assert_eq!(fresh, None, "a five-entry reader loads");
+    let third = older.fold_codex_home(&codex_table(), now, Limits::none());
+    assert_eq!((third.messages, third.copied), (0, 1), "{third:?}");
+}
+
 /// A ROLLOUT READ AGAIN FROM ITS START (another file at its path) counts
 /// none of its turns twice: the home knows them by their fingerprints.
 /// Negative control: with the counted fingerprints forgotten, its turns
@@ -2387,7 +2447,7 @@ fn a_rollout_folded_again_counts_its_turns_once() {
 /// exact.
 #[test]
 fn a_codex_turn_maps_into_one_message() {
-    use crate::supervise::codex_usage::{Turn, TurnTokens};
+    use crate::harness::codex_rollout::{Turn, TurnTokens};
     let turn = |input, cached, cache_write, tier| Turn {
         at: 1_790_000_000,
         model: Some("gpt-6-luna".to_owned()),
@@ -2508,7 +2568,7 @@ fn each_fold_folds_its_own_agents_files_and_a_claude_spend_file_is_unchanged() {
 /// one.
 #[test]
 fn two_threads_served_the_same_counts_each_count() {
-    use crate::supervise::codex_usage::{Row, TurnReader};
+    use crate::harness::codex_rollout::{Row, TurnReader};
     let home = Home::new("codex-twice");
     let now = now();
     let b = (now - HOUR) * 1000;

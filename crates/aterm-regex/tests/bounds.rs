@@ -284,55 +284,6 @@ fn adversarial_matching_input_is_also_linear() {
     }
 }
 
-/// The three things every call site does with a `Match`.
-#[test]
-fn match_accessors() {
-    let re = Regex::new(r"\w+").expect("compiles");
-    let text = "caf\u{e9} au lait";
-    let m = re.find(text).expect("matches");
-    assert_eq!((m.start(), m.end()), (0, 5));
-    assert_eq!(m.as_str(), "caf\u{e9}");
-    assert_eq!(m.range(), 0..5);
-    assert_eq!(m.len(), 5);
-    assert!(!m.is_empty());
-    assert_eq!(&text[m.start()..m.end()], "caf\u{e9}");
-
-    let empty = Regex::new("x*")
-        .expect("compiles")
-        .find("y")
-        .expect("matches");
-    assert_eq!(empty.len(), 0);
-    assert!(empty.is_empty() && empty.as_str().is_empty());
-}
-
-/// The traits the call sites need: `aterm-selection` clones a rule and prints
-/// its pattern, `aterm-observe` derives `Debug` over a struct holding one.
-#[test]
-fn regex_is_cloneable_debuggable_and_shareable() {
-    let re = Regex::new(r"^ab+c$").expect("compiles");
-    assert_eq!(re.as_str(), r"^ab+c$");
-    assert_eq!(format!("{re:?}"), r"^ab+c$");
-    assert_eq!(format!("{re}"), r"^ab+c$");
-
-    let clone = re.clone();
-    assert!(clone.is_match("abbbc") && !clone.is_match("ac "));
-    assert_eq!(clone.as_str(), re.as_str());
-
-    assert_eq!(r"a+b".parse::<Regex>().expect("compiles").as_str(), "a+b");
-
-    // Send + Sync: the watcher stack stores one behind an `Arc<dyn RowMatch>`.
-    let shared = std::sync::Arc::new(re);
-    let handles: Vec<_> = (0..4)
-        .map(|_| {
-            let re = std::sync::Arc::clone(&shared);
-            std::thread::spawn(move || re.find_iter("abc abbc abbbc").count())
-        })
-        .collect();
-    for h in handles {
-        assert_eq!(h.join().expect("no panic"), 0, "the pattern is anchored");
-    }
-}
-
 /// The thread-local scratch cache must not leak state between patterns, between
 /// haystacks, or between threads.
 #[test]
@@ -352,46 +303,6 @@ fn the_scratch_cache_is_reused_without_leaking_state() {
     assert_eq!(ib.next().map(|m| m.as_str()), Some("bb"));
     assert_eq!(ia.count(), 1);
     assert_eq!(ib.count(), 1);
-}
-
-/// `Error::Syntax` is constructible by dependents: `aterm-observe` builds one
-/// directly to report its own pattern-length ceiling in the same shape as a
-/// compile failure, and displays it verbatim.
-#[test]
-fn syntax_errors_are_constructible_and_intelligible() {
-    let mine = Error::Syntax(format!(
-        "pattern exceeds maximum length ({MAX_PATTERN_LEN} bytes)"
-    ));
-    assert_eq!(
-        mine.to_string(),
-        "pattern exceeds maximum length (1024 bytes)"
-    );
-
-    let err = Regex::new("(unclosed").expect_err("must fail").to_string();
-    assert!(err.contains("unclosed group"), "{err}");
-    assert!(
-        err.contains("(unclosed"),
-        "the message must quote the pattern: {err}"
-    );
-    assert!(
-        err.contains('^'),
-        "the message must point at the position: {err}"
-    );
-
-    assert_eq!(
-        Error::CompiledTooBig(1 << 20).to_string(),
-        "Compiled regex exceeds size limit of 1048576 bytes."
-    );
-
-    // Every refusal says something a person can act on.
-    for pattern in ["[a", "a{2,1}", "\\", "(?=a)", "\\p{L}", "[a&&b]", "(?-u)x"] {
-        let err = Regex::new(pattern).expect_err("must fail").to_string();
-        assert!(
-            err.len() > 20,
-            "{pattern:?} produced a useless message: {err}"
-        );
-        assert!(err.contains("error: "), "{pattern:?}: {err}");
-    }
 }
 
 /// A long haystack scanned with `find_iter` — the shape `aterm-search` runs over

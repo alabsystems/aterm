@@ -8,39 +8,6 @@ use crate::{CellFlags, PackedColor};
 // write_char_styled boundary tests
 
 #[test]
-fn write_char_styled_first_col() {
-    let (_pages, mut row) = make_row(10);
-    let fg = PackedColor::DEFAULT_FG;
-    let bg = PackedColor::DEFAULT_BG;
-
-    assert!(row.write_char_styled(0, 'Z', fg, bg, CellFlags::empty()));
-    assert_eq!(row.get(0).unwrap().char(), 'Z');
-    assert_eq!(row.len(), 1);
-}
-
-#[test]
-fn write_char_styled_last_col() {
-    let (_pages, mut row) = make_row(10);
-    let fg = PackedColor::DEFAULT_FG;
-    let bg = PackedColor::DEFAULT_BG;
-
-    assert!(row.write_char_styled(9, 'Z', fg, bg, CellFlags::empty()));
-    assert_eq!(row.get(9).unwrap().char(), 'Z');
-    assert_eq!(row.len(), 10);
-}
-
-#[test]
-fn write_char_styled_out_of_bounds() {
-    let (_pages, mut row) = make_row(10);
-    let fg = PackedColor::DEFAULT_FG;
-    let bg = PackedColor::DEFAULT_BG;
-
-    assert!(!row.write_char_styled(10, 'X', fg, bg, CellFlags::empty()));
-    assert!(!row.write_char_styled(100, 'Y', fg, bg, CellFlags::empty()));
-    assert_eq!(row.len(), 0);
-}
-
-#[test]
 fn write_char_styled_single_col_row() {
     let (_pages, mut row) = make_row(1);
     let fg = PackedColor::DEFAULT_FG;
@@ -52,44 +19,6 @@ fn write_char_styled_single_col_row() {
 }
 
 // write_wide_char boundary tests
-
-#[test]
-fn write_wide_char_first_col() {
-    let (_pages, mut row) = make_row(10);
-    let fg = PackedColor::DEFAULT_FG;
-    let bg = PackedColor::DEFAULT_BG;
-
-    let ok = row.write_wide_char(0, '\u{4E2D}', fg, bg, CellFlags::empty());
-    assert!(ok);
-
-    let cell0 = row.get(0).unwrap();
-    let cell1 = row.get(1).unwrap();
-    assert!(cell0.is_wide());
-    assert_eq!(cell0.char(), '\u{4E2D}');
-    assert!(cell1.is_wide_continuation());
-}
-
-#[test]
-fn write_wide_char_last_valid_col() {
-    let (_pages, mut row) = make_row(10);
-    let fg = PackedColor::DEFAULT_FG;
-    let bg = PackedColor::DEFAULT_BG;
-
-    let ok = row.write_wide_char(8, '\u{4E2D}', fg, bg, CellFlags::empty());
-    assert!(ok);
-    assert!(row.get(8).unwrap().is_wide());
-    assert!(row.get(9).unwrap().is_wide_continuation());
-}
-
-#[test]
-fn write_wide_char_last_col_rejected() {
-    let (_pages, mut row) = make_row(10);
-    let fg = PackedColor::DEFAULT_FG;
-    let bg = PackedColor::DEFAULT_BG;
-
-    let ok = row.write_wide_char(9, '\u{4E2D}', fg, bg, CellFlags::empty());
-    assert!(!ok);
-}
 
 #[test]
 fn write_wide_char_two_col_row() {

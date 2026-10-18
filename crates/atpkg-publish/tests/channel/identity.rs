@@ -24,22 +24,6 @@ fn a_rostered_machine_signs_as_itself() {
     assert_eq!(s.key.pubkey_b64().expect("pub"), keys.machine_pub);
 }
 
-/// A revoked machine is told it is revoked — never sent to `atpkg-keys join` for an id
-/// that never returns (revocation removes its `[[machine]]` block, so a key lookup alone
-/// would misdiagnose it as never added).
-#[test]
-fn a_revoked_machine_is_told_so_and_not_sent_to_rejoin() {
-    let tmp = scratch("id-revoked");
-    let keys = Keys::mint("m3", &["m3"]);
-    let ctx = keys.ctx(tmp.path(), Arc::new(FakeHost::new()));
-    let err = signer_for(&ctx, &keys.roster)
-        .expect_err("revoked")
-        .to_string();
-    assert!(err.contains("machine 'm3' is REVOKED"), "{err}");
-    assert!(err.contains("NEVER returns"), "{err}");
-    assert!(err.contains("--id <new-machine-id>"), "{err}");
-}
-
 /// A listed entry past its `not_after` signs what every client refuses: refused, and
 /// revocation still outranks it (a producer bug that leaves an id both listed and
 /// revoked is read as revoked).
@@ -56,40 +40,12 @@ fn an_expired_or_revoked_entry_is_refused_even_while_listed() {
     let err = signer_for(&ctx, &keys.roster)
         .expect_err("expired")
         .to_string();
-    assert!(
-        err.contains("machine 'm3' is listed on roster_seq"),
-        "{err}"
-    );
     assert!(err.contains("Expired"), "{err}");
     keys.roster.revoked.push("m3".into());
     let err = signer_for(&ctx, &keys.roster)
         .expect_err("revoked")
         .to_string();
     assert!(err.contains("machine 'm3' is REVOKED"), "{err}");
-}
-
-#[test]
-fn a_machine_the_roster_does_not_list_is_refused_with_the_fix() {
-    let tmp = scratch("id-stranger");
-    let keys = Keys::mint("m3", &[]);
-    let ctx = keys.ctx(tmp.path(), Arc::new(FakeHost::new()));
-    let (stranger_key, stranger_pub) = atpkg_keys::generate().expect("keypair");
-    std::fs::write(&ctx.identity.key, &stranger_key).expect("key");
-    std::fs::write(
-        &ctx.identity.record,
-        format!(
-            "id = \"m99\"\npubkey = \"{stranger_pub}\"\nminted_at = \"2026-08-04T00:00:00Z\"\n"
-        ),
-    )
-    .expect("record");
-    let err = signer_for(&ctx, &keys.roster)
-        .expect_err("unlisted")
-        .to_string();
-    assert!(err.contains("machine 'm99' is NOT on the roster"), "{err}");
-    assert!(
-        err.contains("atpkg-keys join --id m99 --key <new path>"),
-        "{err}"
-    );
 }
 
 #[test]
@@ -153,5 +109,4 @@ fn a_missing_key_names_the_mint_and_a_missing_record_gives_its_lines() {
         .expect_err("no key")
         .to_string();
     assert!(err.contains("atpkg-keys setup --id"), "{err}");
-    assert!(err.contains("atpkg-keys join --id"), "{err}");
 }

@@ -28,7 +28,7 @@
 //! which ones varies — macOS 26.6 (25G83) writes two Info `AttributionChain:`
 //! lines per request and only sometimes a Default `AUTHREQ_ATTRIBUTION:` line
 //! (measured 2026-10-08; a census that required `AUTHREQ_ATTRIBUTION` missed
-//! most controls and said `CENSUS NOT RUN`). Every such line carries the same
+//! most controls and could not run). Every such line carries the same
 //! `accessing=` pid, so the pids are de-duplicated.
 //!
 //! NON-VACUITY: THE POSITIVE CONTROL. An empty census proves nothing unless the
@@ -40,12 +40,11 @@
 //! absence counts. The control runs LAST, so seeing it also means the log had
 //! caught up with everything the instance did before it. `/usr/bin` is a small
 //! directory, and osascript is the tool the activation test already runs. When
-//! the control cannot be seen the test says `CENSUS NOT RUN`, uncaptured, and
-//! returns: nothing was decided. libtest still reports the test `ok`, so that
-//! notice is the record that it decided nothing (AGENTS.md: a notice, never a
-//! silent ok).
+//! the control cannot be seen the test ends COULD NOT RUN
+//! (`aterm_spec::host::could_not_run`): nothing was decided, and `verify`
+//! records it so, never as a pass.
 //!
-//! A REWORDED LINE FAILS. Before it says NOT RUN, the census asks tccd's log
+//! A REWORDED LINE FAILS. Before it gives up as not run, the census asks tccd's log
 //! once more without its own predicate or parser, for any line naming both
 //! WindowServer and the control's pid. If tccd recorded the control and the
 //! census still cannot read it, the census is stale for this macOS, and that
@@ -74,7 +73,7 @@
 //! under its own `atws-<pid>` scratch name, and the BOOT is the shared
 //! `support/headless_boot.rs`: an instance that cannot start FAILS (and one
 //! whose log shows it asked for a WindowServer connection fails naming that);
-//! a scratch, log, spawn or bind refusal is `CENSUS NOT RUN`, uncaptured.
+//! a scratch, log, spawn or bind refusal is COULD NOT RUN.
 
 #![cfg(target_os = "macos")]
 #![allow(
@@ -87,6 +86,8 @@ use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use aterm_spec::host::could_not_run;
+
 use crate::{headless_boot, launch_isolation};
 
 use headless_boot::{Instance, log_tail};
@@ -97,7 +98,7 @@ const IDLE: Duration = Duration::from_secs(3);
 /// How long the census waits for the positive control's line to reach the log:
 /// a hang detector for a line that must arrive, never a latency budget
 /// (AGENTS.md: a minute), so a lagging unified log on a loaded machine is waited
-/// out rather than turned into a `CENSUS NOT RUN`.
+/// out rather than turned into a COULD NOT RUN.
 const CONTROL_VISIBLE_DEADLINE: Duration = Duration::from_secs(60);
 const LOG_SHOW_DEADLINE: Duration = Duration::from_secs(60);
 
@@ -110,8 +111,8 @@ const PREDICATE: &str = "process == \"tccd\" \
 
 /// A notice written straight to this process's stderr handle, not through
 /// `eprintln!`: libtest captures the print macros of a PASSING test and throws
-/// the text away, so a `CENSUS NOT RUN` (or a SKIP) would vanish from a green
-/// run — exactly the silent pass it exists to prevent (the `aterm_spec::verify`
+/// the text away, so a proof-it-ran line would vanish from a green run — the
+/// silent pass it exists to prevent (the `aterm_spec::verify`
 /// provenance line's reason and shape).
 fn notice(line: &str) {
     use std::io::Write as _;
@@ -119,7 +120,7 @@ fn notice(line: &str) {
 }
 
 /// Boot the instance under the shared fixture: CPU rendering, 24x80.
-fn boot() -> Option<Instance> {
+fn boot() -> Instance {
     headless_boot::boot("atws", &["--cpu", "--lines", "24", "--columns", "80"])
 }
 
@@ -279,22 +280,12 @@ fn positive_control() -> Option<u32> {
 #[test]
 fn a_driven_headless_instance_draws_no_window_server_preflight() {
     if !Path::new("/usr/bin/log").exists() || !Path::new("/usr/bin/osascript").exists() {
-        notice(
-            "CENSUS NOT RUN: /usr/bin/log or /usr/bin/osascript is missing; nothing was decided",
-        );
-        return;
+        could_not_run("/usr/bin/log or /usr/bin/osascript is missing; nothing was decided");
     }
     let Some(start) = log_timestamp() else {
-        notice("CENSUS NOT RUN: /bin/date could not name the census start; nothing was decided");
-        return;
+        could_not_run("/bin/date could not name the census start; nothing was decided");
     };
-    let Some(inst) = boot() else {
-        notice(
-            "CENSUS NOT RUN: the instance could not boot for an environment reason (the SKIP \
-             above); nothing was decided",
-        );
-        return;
-    };
+    let inst = boot();
     let pid = inst.child.id();
 
     let spawned = client_ok(&inst, &["spawn"]);
@@ -327,8 +318,7 @@ fn a_driven_headless_instance_draws_no_window_server_preflight() {
     drop(inst);
 
     let Some(control) = positive_control() else {
-        notice("CENSUS NOT RUN: the osascript positive control did not run; nothing was decided");
-        return;
+        could_not_run("the osascript positive control did not run; nothing was decided");
     };
     let until = Instant::now() + CONTROL_VISIBLE_DEADLINE;
     let pids = loop {
@@ -351,19 +341,17 @@ fn a_driven_headless_instance_draws_no_window_server_preflight() {
                     ),
                     _ => {}
                 }
-                notice(&format!(
-                    "CENSUS NOT RUN: tccd's log never showed the positive control (osascript pid \
-                     {control}) within {}s — no WindowServer session here, or the log dropped or \
-                     reworded the line; saw preflights for {pids:?}. Nothing was decided.",
+                could_not_run(format!(
+                    "tccd's log never showed the positive control (osascript pid {control}) \
+                     within {}s — no WindowServer session here, or the log dropped or reworded \
+                     the line; saw preflights for {pids:?}. Nothing was decided.",
                     CONTROL_VISIBLE_DEADLINE.as_secs()
                 ));
-                return;
             }
             Err(e) => {
-                notice(&format!(
-                    "CENSUS NOT RUN: the unified log could not be read ({e}); nothing was decided"
+                could_not_run(format!(
+                    "the unified log could not be read ({e}); nothing was decided"
                 ));
-                return;
             }
         }
     };

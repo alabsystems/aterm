@@ -8,7 +8,7 @@
 // contract and `fire_halo_alpha` byte), scale with engulfment strength, and be gated on fire
 // (`fire_halo` without `fire_patch`, and `char_fg` alone, stay byte-exact).
 //
-// No GPU or no font: no-op.
+// No GPU or no font: COULD NOT RUN.
 
 use aterm_core::render::{CharFg, FireHaloCell};
 use aterm_core::terminal::Terminal;

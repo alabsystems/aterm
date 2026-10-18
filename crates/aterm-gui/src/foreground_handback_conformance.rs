@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-1 bind for `ForegroundHandback`
-//! (`aterm_spec::derive::foreground_handback_model`) — the 2026-09-25
+//! (`aterm_models_gui::foreground_handback_model`) — the 2026-09-25
 //! "crashed" tab, where a Claude Code killed while it held the terminal left
 //! the alt screen, kitty flags, modifyOtherKeys, mouse tracking, focus
 //! reports, 2026 and a hidden cursor armed under the zsh that reclaimed it.
@@ -75,7 +75,8 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use aterm_core::terminal::{Terminal, program_evidence};
-use aterm_spec::derive::{Model, foreground_handback_model, foreground_handback_ownership_model};
+use aterm_models_gui::{foreground_handback_model, foreground_handback_ownership_model};
+use aterm_spec::derive::Model;
 use aterm_spec::interp;
 
 use super::{attach_reader_inner, park_reader};
@@ -1786,7 +1787,7 @@ fn manual_reset_hands_back_what_the_shell_armed_and_the_handback_never_will() {
 
 // ---- ForegroundHandbackOwnership (2026-09-27, the lane at load 59-65) ------
 //
-// Tier-1 for `aterm_spec::derive::foreground_handback_ownership_model`: who
+// Tier-1 for `aterm_models_gui::foreground_handback_ownership_model`: who
 // owns an input mode across jobs when the reader MISSES one. The scripted
 // probe never shows the missed one-shot (its whole life fell between two
 // samples, or its bytes were read after the shell's reclaim — the starved
@@ -1804,13 +1805,13 @@ const OWNERSHIP_PROJECTED: [&str; 4] = ["life", "n", "bit", "backs"];
 // The machine's other four actions carry `#[refines]` anchors on the shipping
 // code: `Arm` and `ShellArm` on `FgOwners::observe` (whose slice holder decides
 // which), `Reclaim` on `FgOwners::orphaned_by`, `Sample` on `FgCutter::sample`.
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "foreground_handback_ownership",
     action = "Launch",
     reason = "The shell's `tcsetpgrp` giving a job the terminal: an environment step. The \
               Tier-1 rows move the scripted foreground probe exactly there."
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "foreground_handback_ownership",
     action = "Die",
     reason = "A process's death: an environment step. The Tier-1 rows add the job to the \

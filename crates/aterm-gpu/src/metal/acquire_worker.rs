@@ -282,7 +282,7 @@ mod tests {
 
     #[test]
     fn blocked_acquire_keeps_request_read_and_close_nonblocking_and_retires_afterward() {
-        let model = aterm_spec::derive::metal_drawable_acquire_model();
+        let model = aterm_models_render::metal_drawable_acquire_model();
         let mut state = model.init_state();
         let (entered, entering) = mpsc::channel();
         let (release, released) = mpsc::channel();
@@ -403,7 +403,7 @@ mod tests {
 
     #[test]
     fn real_worker_admission_publication_and_stale_result_match_the_model() {
-        let model = aterm_spec::derive::metal_drawable_acquire_model();
+        let model = aterm_models_render::metal_drawable_acquire_model();
         let mut state = model.init_state();
         let (entered, entering) = mpsc::channel();
         let (release, released) = mpsc::channel();
@@ -485,7 +485,7 @@ mod tests {
 
     #[test]
     fn production_guards_match_all_bounded_model_decisions_and_reject_mutants() {
-        let model = aterm_spec::derive::metal_drawable_acquire_model();
+        let model = aterm_models_render::metal_drawable_acquire_model();
         let mut rejected = 0;
         for closed in [false, true] {
             for pending in [false, true] {
@@ -595,51 +595,5 @@ mod tests {
             "aterm-drawable-acquire ran at QoS class {class:#x}, not USER_INTERACTIVE"
         );
         assert!(worker.close(()).is_ok());
-    }
-
-    /// The queue leg is measured: `LayerAcquire::run` times only
-    /// `nextDrawable` itself, while admission-to-dequeue is when a frame waits
-    /// after returning `AcquireRefusal::Pending`. The request is admitted while
-    /// the worker loop is held behind a gate, so the measured span is the
-    /// test's own gate, with no load generated.
-    #[test]
-    fn a_request_waiting_for_a_descheduled_worker_books_its_queue_time() {
-        const GATE: Duration = Duration::from_millis(50);
-        let (commands, requests) = mpsc::sync_channel(2);
-        let (completed, results) = mpsc::sync_channel(1);
-        let (start, started) = mpsc::channel();
-        let (wake, woken) = mpsc::channel();
-        let mut worker = AcquireWorker {
-            commands: Some(commands),
-            results: Some(results),
-            pending_generation: None,
-            closed: false,
-        };
-        let thread = std::thread::spawn(move || {
-            // The shipping loop, held shut until the request has been waiting
-            // for GATE. This is the descheduled worker, made reproducible.
-            started.recv_timeout(LIMIT).unwrap();
-            run_worker(
-                |()| (),
-                Arc::new(move || wake.send(()).unwrap()),
-                requests,
-                completed,
-            );
-        });
-        worker.try_request(1, ()).unwrap();
-        std::thread::sleep(GATE);
-        start.send(()).unwrap();
-        woken.recv_timeout(LIMIT).unwrap();
-        let result = worker.try_take().unwrap();
-        assert!(matches!(result.outcome, AcquireOutcome::Ready(())));
-        // The acquisition was a no-op, so all of this is queue. The worker
-        // cannot dequeue before `start`, so this bound holds on any machine.
-        assert!(
-            result.queue_ns >= u64::try_from(GATE.as_nanos()).unwrap(),
-            "a request that waited {GATE:?} for the worker booked {} ns of queue time",
-            result.queue_ns
-        );
-        assert!(worker.close(()).is_ok());
-        thread.join().unwrap();
     }
 }

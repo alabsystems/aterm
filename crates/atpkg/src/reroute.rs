@@ -119,6 +119,12 @@
 //! exception came the same day, and no setting lifts it: inside a Trust source checkout a
 //! `cargo`/`rustc` that is not Trust does not run ([`trust_checkout_refusal`], above).
 //!
+//! A row whose tool has NO BUILD FOR THIS TARGET says nothing at all ([`unserved_here`]:
+//! the program's recorded row reads `unavailable on <target>` and nothing here runs the
+//! tool). Its line could only name commands that cannot run on this machine — aarch64
+//! Linux, where every `cargo` printed six lines about `targo` — so upstream runs as typed,
+//! as under `[reroute] announce = false`; the checkout refusal still holds.
+//!
 //! # Escapes, all of them
 //!
 //! * `aterm --no-reroute` starts a session with every upstream tool: it stamps the
@@ -381,8 +387,7 @@ const RUSTC_LANES: &[Lane] = &[
 /// spelling and no lane question — tippy lints and trustfmt formats, neither
 /// proves nor builds. Every other verb is spelled by `aterm_types::rust_lane`
 /// (2026-09-23): both lanes for `build`/`check`/`test`, the unverified one for a
-/// verb with no verified lane, none for a verb that takes no lane — pinned
-/// against this table by `the_table_speaks_the_shared_rust_lane_vocabulary`.
+/// verb with no verified lane, none for a verb that takes no lane.
 pub const CARGO_VERB_REROUTES: &[(&str, &str)] = &[("clippy", "targo tippy"), ("fmt", "targo fmt")];
 
 /// THE table. Order is the order doctor and `aterm help reroute` list it in.
@@ -1052,6 +1057,14 @@ pub const EXPLICIT_LANE_VERBS: &[&str] = &["trust", "--unverified"];
 
 /// The program `aterm pkg install` names for `targo`, the tool an explicit lane runs.
 pub const EXPLICIT_LANE_PROGRAM: &str = "trust";
+
+/// `cargo metadata`, `cargo locate-project`, `cargo version` and `cargo --version`: the
+/// lane-free queries rust-analyzer, an editor and a build script make by name. They compile
+/// nothing, so there is no lane to name, and whoever asked parses their stdout — so they run
+/// the managed `targo` itself, saying nothing (`.vscode` used to work around the refusal
+/// with `CARGO=targo`). Every other verb keeps its signpost or refusal; with no runnable
+/// `targo` these are answered as any other verb.
+pub const LANE_FREE_QUERIES: &[&str] = &["metadata", "locate-project", "version", "--version"];
 
 /// The one line printed when `cargo trust …`/`cargo --unverified …` runs `targo`. No
 /// escape: stock cargo has no such subcommand, so upstream would not run this command.
@@ -2061,6 +2074,9 @@ pub fn run(layout: &Layout, upstream: &str, args: &[String]) -> ExitCode {
         aterm_types::dirs::home_dir().as_deref(),
     );
     let identity_cache = layout.prefix.join(crate::upstream_identity::CACHE_FILE);
+    // Read once, and only where a line would be said: one `stat` walk and, when the
+    // branded tool does not run here, one `status.toml` read.
+    let unserved = std::cell::OnceCell::new();
     let machine = Machine {
         // Belt and braces: the stub decides this first, but `aterm <upstream>` and a
         // direct `atpkg __reroute` call arrive here without it. A stock cargo's compile
@@ -2072,8 +2088,16 @@ pub fn run(layout: &Layout, upstream: &str, args: &[String]) -> ExitCode {
         announced: engaged(std::env::var(ANNOUNCED_ENV).ok().as_deref()),
         // ANNOUNCE, THEN RUN — the 2026-09-08 ruling. `[reroute] announce = false`
         // (the owner's "suppressed with a flag", a setting since 2026-09-23) drops
-        // the line but never the run.
-        announce: &|| crate::config::cached_reroute().announce(),
+        // the line but never the run. A row whose tool has no build for this target
+        // ([`unserved_here`]) has nothing to announce: its line would name commands that
+        // cannot run here, so upstream runs as typed, unannounced — and is still judged
+        // inside a Trust source checkout, which is a refusal, not an announcement.
+        announce: &|| {
+            crate::config::cached_reroute().announce()
+                && unserved
+                    .get_or_init(|| unserved_here(layout, branded_of(row), program_of(row)))
+                    .is_none()
+        },
         // WARN, DO NOT STOP — the 2026-09-29 ruling. `[reroute] strict = true` puts the
         // refusals back for whoever wants them.
         strict: &|| crate::config::cached_reroute().strict(),
@@ -2123,6 +2147,7 @@ pub fn run(layout: &Layout, upstream: &str, args: &[String]) -> ExitCode {
             };
             exec_upstream(&target, &args)
         }
+        Plan::Quiet { copy, args } => exec_branded(layout, &copy, &args),
         Plan::Branded { say, copy, args } => {
             eprintln!("{say}");
             let args = if upstream == "cargo" {
@@ -2230,27 +2255,38 @@ enum Install {
     Absent,
 }
 
-/// A branded tool's managed copy, as its shim would exec it.
-#[derive(Debug, PartialEq, Eq)]
-struct Managed {
-    /// Through the store, never PATH: [`crate::ops::exec_path`]'s, not `which`'s — this
-    /// execs the tool without its shim, so it takes the exec root the shim's guard would
-    /// (`crate::compat` — a trust build whose tippy refuses the store's own `bin/rustc`
-    /// copy lints only from there).
-    target: PathBuf,
-    /// What the shim would export before its `exec` (`ops::exec_env`, design S7) —
-    /// `atpkg run`'s rule, so a branded program whose policy declares an environment gets
-    /// it by either door.
-    env: crate::shim_env::ShimEnv,
+/// Why `branded`, one of the tools `program` ships, cannot be had on this machine: the
+/// row the last pass recorded for `program` when it says the index publishes no build for
+/// this target (`unavailable on <target>: …`, [`crate::state::UNAVAILABLE_PREFIX`]) and
+/// nothing here runs `branded` — no store build, no dev link, at most a pending stub that
+/// answers with that same row. `None` wherever the tool runs or can still arrive (no row
+/// yet, a held or failed row, a served target).
+///
+/// Keyed on the recorded state, never on the platform: on aarch64 Linux (index build 71
+/// publishes no Trust build for any Linux triple) every `cargo` in a tab printed a six-line
+/// signpost naming `targo trust build`, a command whose pending stub answers "trust is not
+/// coming on its own" and whose install answers "unavailable". Where Trust is served (an
+/// Apple-silicon Mac) the row never reads `unavailable on`, so nothing changes there.
+#[must_use]
+pub fn unserved_here(layout: &Layout, branded: &str, program: &str) -> Option<String> {
+    if !matches!(
+        installed(layout, branded, program),
+        Install::Pending(_) | Install::Absent
+    ) {
+        return None;
+    }
+    let state = crate::status::read(layout)?.programs.remove(program)?.state;
+    state
+        .starts_with(crate::state::UNAVAILABLE_PREFIX)
+        .then_some(state)
 }
 
-/// The managed copy of `branded`, `None` when it is not installed.
-fn managed(layout: &Layout, branded: &str) -> Option<Managed> {
-    Some(Managed {
-        target: crate::ops::exec_path(layout, branded)?,
-        env: crate::ops::exec_env(layout, branded),
-    })
-}
+/// A branded tool's managed copy, as its shim would exec it: through the store, never
+/// PATH, at the exec root the shim's guard would take (`crate::compat` — a trust build whose
+/// tippy refuses the store's own `bin/rustc` copy lints only from there), with what the
+/// shim would export (design S7) — `atpkg run`'s rule, so a branded program whose policy
+/// declares an environment gets it by either door.
+use crate::ops::{Managed, managed};
 
 /// Where `branded`, one of the tools `program` ships, stands on this machine ([`Install`]).
 fn installed(layout: &Layout, branded: &str, program: &str) -> Install {
@@ -2290,6 +2326,9 @@ enum Plan {
         copy: Managed,
         args: Vec<String>,
     },
+    /// Exec the managed `copy`, saying nothing: a [`LANE_FREE_QUERIES`] call, whose
+    /// caller parses what it prints.
+    Quiet { copy: Managed, args: Vec<String> },
     /// Say `say` and exit [`REFUSAL_EXIT`]: the ORACLE row under `[reroute] strict`, and a
     /// `cargo`/`rustc` that is not Trust inside a Trust source checkout
     /// ([`trust_checkout_refusal`]).
@@ -2441,6 +2480,18 @@ fn plan(row: &Row, args: &[String], machine: &Machine<'_>) -> Plan {
             })
         }
         Policy::Signpost { branded, lanes, .. } => {
+            // A lane-free query runs targo itself, quietly, wherever targo runs.
+            if upstream == "cargo"
+                && shown
+                    .first()
+                    .is_some_and(|verb| LANE_FREE_QUERIES.contains(&verb.as_str()))
+                && let Install::Runs(copy) = (machine.branded)(branded, EXPLICIT_LANE_PROGRAM)
+            {
+                return Plan::Quiet {
+                    copy,
+                    args: shown.to_vec(),
+                };
+            }
             // `+trust…` keeps the lane question, and the first line names that toolchain
             // as what runs.
             if upstream == "cargo"
@@ -2695,7 +2746,7 @@ pub fn run_storeless(upstream: &str, args: &[String]) -> ExitCode {
             eprintln!("{say}");
             ExitCode::from(127)
         }
-        Plan::Branded { .. } | Plan::Shim { .. } => {
+        Plan::Branded { .. } | Plan::Quiet { .. } | Plan::Shim { .. } => {
             unreachable!("no store: nothing branded is planned")
         }
     }
@@ -2783,7 +2834,7 @@ fn direct_args(source_verb: Option<SourceVerb>, args: &[String]) -> Vec<String> 
     }
 }
 
-/// A branded tool's managed `copy` ([`managed`]), exec'd with the managed `bin/` appended
+/// A branded tool's managed `copy` ([`crate::ops::managed`]), exec'd with the managed `bin/` appended
 /// for its children and its shim's environment exported — `atpkg run`'s discipline.
 #[expect(
     clippy::disallowed_types,

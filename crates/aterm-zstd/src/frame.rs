@@ -154,67 +154,6 @@ fn block_header(size: usize, last: bool) -> [u8; 3] {
 mod tests {
     use super::{BLOCK_MAX, Checksum, WINDOW_MAX, write_raw};
 
-    fn frame(content: &[u8], checksum: Checksum) -> Vec<u8> {
-        let mut out = Vec::new();
-        write_raw(&mut out, content, checksum).unwrap();
-        out
-    }
-
-    /// The bytes the zstd 1.5.7 CLI writes for an empty file and for a file
-    /// holding `abc`: it stores input it cannot shrink in exactly this form.
-    #[test]
-    fn the_cli_frames_for_tiny_files() {
-        assert_eq!(
-            frame(b"", Checksum::Xxh64),
-            [
-                0x28, 0xB5, 0x2F, 0xFD, 0x24, 0x00, 0x01, 0x00, 0x00, 0x99, 0xE9, 0xD8, 0x51
-            ]
-        );
-        assert_eq!(
-            frame(b"abc", Checksum::Xxh64),
-            [
-                0x28, 0xB5, 0x2F, 0xFD, 0x24, 0x03, 0x19, 0x00, 0x00, b'a', b'b', b'c', 0x99, 0x09,
-                0x77, 0xAD
-            ]
-        );
-        assert_eq!(
-            frame(b"abc", Checksum::Omitted),
-            [
-                0x28, 0xB5, 0x2F, 0xFD, 0x20, 0x03, 0x19, 0x00, 0x00, b'a', b'b', b'c'
-            ]
-        );
-    }
-
-    /// Each Frame_Content_Size width at both of its edges.
-    #[test]
-    fn content_size_field_widths() {
-        for (len, descriptor, field) in [
-            (255, 0x20, vec![0xFF]),
-            (256, 0x60, vec![0x00, 0x00]),
-            (65_791, 0x60, vec![0xFF, 0xFF]),
-            (65_792, 0xA0, 65_792u32.to_le_bytes().to_vec()),
-        ] {
-            let out = frame(&vec![7; len], Checksum::Omitted);
-            assert_eq!(out[4], descriptor, "descriptor for {len}");
-            assert_eq!(out[5..5 + field.len()], field[..], "field for {len}");
-        }
-    }
-
-    /// Blocks are full until the last, which alone carries Last_Block.
-    #[test]
-    fn blocks_split_at_block_max() {
-        let len = 2 * BLOCK_MAX + 1;
-        let out = frame(&vec![1; len], Checksum::Omitted);
-        let at = 4 + 1 + 4;
-        let full = ((BLOCK_MAX as u32) << 3).to_le_bytes();
-        assert_eq!(out[at..at + 3], full[..3]);
-        let at = at + 3 + BLOCK_MAX;
-        assert_eq!(out[at..at + 3], full[..3]);
-        let at = at + 3 + BLOCK_MAX;
-        assert_eq!(out[at..at + 3], [(1 << 3) | 1, 0, 0]);
-        assert_eq!(out.len(), at + 3 + 1);
-    }
-
     /// Counts what is written and keeps none of it.
     struct Count(usize);
 

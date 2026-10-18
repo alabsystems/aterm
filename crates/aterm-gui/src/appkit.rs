@@ -161,9 +161,9 @@ pub(crate) fn test_witness() -> MainThread {
 /// WHY THEY LEFT: `crates/aterm-window`'s `window_delegate.rs` and `view.rs` need the
 /// same shapes and CANNOT import this module, which is `pub(crate)` to
 /// `aterm-gui`. The two honest options were a second copy inside the fork or
-/// one copy somewhere both can reach. A second copy would have cost the
-/// ratcheted `third_party_loc` ~500 lines of first-party ABI plumbing — in the
-/// budget the campaign exists to SHRINK — and left two copies of a
+/// one copy somewhere both can reach. A second copy would have added ~500
+/// lines of first-party ABI plumbing to the fork's third-party line count —
+/// the surface the campaign exists to SHRINK — and left two copies of a
 /// safety-critical layer free to drift apart.
 ///
 /// WHY `aterm-objc` IS WHERE THEY WENT, and not a new binding crate: not one of
@@ -312,9 +312,9 @@ pub(crate) mod consts {
     /// ```
     ///
     /// Inverting either assertion fails to compile, so the check is
-    /// load-bearing rather than vacuous. `verify cells` has no
-    /// `x86_64-apple-darwin` cell — its `win` cell is x86_64 but not Apple — so
-    /// this is the only thing standing behind the `= 2` arm.
+    /// load-bearing rather than vacuous. No check compiles the
+    /// `x86_64-apple-darwin` cell, so this is the only thing standing behind
+    /// the `= 2` arm.
     #[cfg(target_arch = "x86_64")]
     pub(crate) const NS_TEXT_ALIGNMENT_CENTER: isize = 2;
     /// See the `x86_64` twin above: `TARGET_ABI_USES_IOS_VALUES` is TRUE here.

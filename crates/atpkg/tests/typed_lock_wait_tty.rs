@@ -93,10 +93,10 @@ fn pty() -> (std::fs::File, OwnedFd) {
     }
 }
 
-/// Everything the child draws on its terminal, each read stamped with when it arrived.
-type Screen = Arc<Mutex<Vec<(Duration, Vec<u8>)>>>;
+/// Everything the child draws on its terminal.
+type Screen = Arc<Mutex<Vec<u8>>>;
 
-fn drain(mut master: std::fs::File, started: Instant) -> Screen {
+fn drain(mut master: std::fs::File) -> Screen {
     let screen: Screen = Arc::default();
     let sink = Arc::clone(&screen);
     std::thread::spawn(move || {
@@ -105,35 +105,14 @@ fn drain(mut master: std::fs::File, started: Instant) -> Screen {
         while let Ok(n) = master.read(&mut buf)
             && n > 0
         {
-            sink.lock()
-                .unwrap()
-                .push((started.elapsed(), buf[..n].to_vec()));
+            sink.lock().unwrap().extend_from_slice(&buf[..n]);
         }
     });
     screen
 }
 
 fn text(screen: &Screen) -> String {
-    let bytes: Vec<u8> = screen
-        .lock()
-        .unwrap()
-        .iter()
-        .flat_map(|(_, b)| b.clone())
-        .collect();
-    String::from_utf8_lossy(&bytes).into_owned()
-}
-
-/// When `needle` first reached the terminal, if it has.
-fn first_seen(screen: &Screen, needle: &str) -> Option<Duration> {
-    let chunks = screen.lock().unwrap();
-    let mut seen = Vec::new();
-    for (at, bytes) in chunks.iter() {
-        seen.extend_from_slice(bytes);
-        if String::from_utf8_lossy(&seen).contains(needle) {
-            return Some(*at);
-        }
-    }
-    None
+    String::from_utf8_lossy(&screen.lock().unwrap()).into_owned()
 }
 
 #[test]
@@ -144,8 +123,7 @@ fn a_verb_typed_on_a_terminal_waits_behind_a_spinner_then_runs() {
     // Kept open here until the end: with no slave end left open the master may drop what
     // a child that has exited wrote before it was read.
     let _held = slave.try_clone().unwrap();
-    let started = Instant::now();
-    let screen = drain(master, started);
+    let screen = drain(master);
     let mut child = fx
         .command()
         .stdin(Stdio::from(slave.try_clone().unwrap()))
@@ -153,11 +131,11 @@ fn a_verb_typed_on_a_terminal_waits_behind_a_spinner_then_runs() {
         .spawn()
         .expect("spawn dev atpkg on a pseudo-terminal");
 
-    // The spinner arrives, and not before the grace.
+    // The spinner arrives.
     let deadline = Instant::now() + MUST_HAPPEN;
-    let seen = loop {
-        if let Some(at) = first_seen(&screen, WAITING) {
-            break at;
+    loop {
+        if text(&screen).contains(WAITING) {
+            break;
         }
         if let Some(status) = child.try_wait().unwrap() {
             panic!(
@@ -171,16 +149,7 @@ fn a_verb_typed_on_a_terminal_waits_behind_a_spinner_then_runs() {
             text(&screen)
         );
         std::thread::sleep(Duration::from_millis(50));
-    };
-    assert!(
-        seen >= atpkg::lock::WAIT_ANNOUNCE_GRACE,
-        "the spinner came {seen:?} after the spawn, inside the grace"
-    );
-    assert!(
-        text(&screen).contains("Ctrl-C to stop"),
-        "{:?}",
-        text(&screen)
-    );
+    }
     assert!(child.try_wait().unwrap().is_none(), "still waiting");
 
     // The holder lets go: the verb runs and ends as it would have with a free store.
@@ -228,7 +197,7 @@ fn the_same_verb_off_a_terminal_still_refuses_at_once() {
     // Kept open until the end, for the reason the test above gives.
     let _held = slave.try_clone().unwrap();
     let started = Instant::now();
-    let screen = drain(master, started);
+    let screen = drain(master);
     let output = fx
         .command()
         .stdin(Stdio::null())

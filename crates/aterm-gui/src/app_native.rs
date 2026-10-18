@@ -140,6 +140,10 @@ thread_local! {
 /// Evidence that the main-thread native document/restore preflight was Ready.
 /// Only this module constructs it; process replacement carries the token to its
 /// final admission gate.
+#[cfg_attr(
+    not(unix),
+    expect(dead_code, reason = "only the unix lanes spend its counts")
+)]
 pub(crate) struct NativeUpdateSafetyToken {
     /// Unsaved editor drafts certified as carried (journaled and verified on
     /// disk). Only a lane whose successor restores document tabs may spend the
@@ -162,16 +166,19 @@ impl NativeUpdateSafetyToken {
         true
     }
 
+    #[cfg(unix)]
     #[must_use]
     pub(crate) fn carried_drafts(&self) -> usize {
         self.carried_drafts
     }
 
+    #[cfg(unix)]
     #[must_use]
     pub(crate) fn carried_settings_drafts(&self) -> usize {
         self.carried_settings_drafts
     }
 
+    #[cfg(unix)]
     #[must_use]
     pub(crate) fn failed_checkpoints(&self) -> usize {
         self.failed_checkpoints
@@ -219,8 +226,8 @@ impl SettingsDraftTally {
     /// native tabs from a handed-over layout
     /// ([`App::successor_restores_document_tabs`]); without it nothing rides.
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "NativeUpdateSettingsDraftCarry",
             action = "Start",
             project = "aterm_gui::settings_draft_carry_conformance::Rig::project"
@@ -602,12 +609,12 @@ pub(crate) fn spawn_native_update_reconcile_worker(
 ) -> Result<NativeUpdateReconcileSender, String> {
     let (sender, receiver) =
         std::sync::mpsc::sync_channel::<NativeUpdateWorkerRequest>(NATIVE_UPDATE_WORKER_CAPACITY);
-    std::thread::Builder::new()
-        .name("aterm-update-facts".to_string())
-        .spawn(move || {
+    crate::qos::spawn_lane_thread(
+        "aterm-update-facts".to_string(),
+        crate::qos::Role::Background,
+        move || {
             // Reconcile facts feed a settings screen, not a frame; results return
             // through the proxy and no lock is held.
-            crate::qos::set_self(crate::qos::Role::Background);
             let health_proxy = drain_proxy.clone();
             run_native_update_worker(
                 receiver,
@@ -620,8 +627,9 @@ pub(crate) fn spawn_native_update_reconcile_worker(
                     let _ = drain_proxy.send_event(Wake::NativeUpdateWorkerDrained);
                 },
             );
-        })
-        .map_err(|error| format!("could not start updater facts worker: {error}"))?;
+        },
+    )
+    .map_err(|error| format!("could not start updater facts worker: {error}"))?;
     Ok(sender)
 }
 
@@ -1752,7 +1760,7 @@ pub(crate) enum NativeCompiledPhase {
 }
 
 /// The exact semantic/layout product lowered into the native tray for a frame.
-/// Control inspection, pixels, hit testing and AccessKit all observe this one
+/// Control inspection, pixels, hit testing and the accessibility tree all observe this one
 /// artifact rather than a second compile.
 #[derive(Clone, Debug)]
 pub(crate) struct NativeCompiledFrame {
@@ -2613,11 +2621,8 @@ impl App {
         // it off the terminal theme, and color overrides do not reach it);
         // hashing the resolved fields re-lowers retained pages exactly when
         // their pixels move.
-        let chrome_theme = self.native_page_palette_theme();
-        chrome_theme.fg.hash(&mut paint);
-        chrome_theme.bg.hash(&mut paint);
-        chrome_theme.cursor.hash(&mut paint);
-        chrome_theme.selection.hash(&mut paint);
+        self.chrome_palette(crate::app_render::ChromeSurface::NativePage)
+            .hash(&mut paint);
         self.win_font_px(wid).to_bits().hash(&mut paint);
         self.font_family.hash(&mut paint);
         self.font_config.styled_paths.hash(&mut paint);
@@ -4073,9 +4078,7 @@ impl App {
                         }
                         (
                             request_id,
-                            edit.value
-                                .clone()
-                                .unwrap_or_else(|| crate::prefs::UNSET_THEME_LABEL.to_string()),
+                            edit.value.clone().unwrap_or_else(|| "Default".to_string()),
                         )
                     })
                     .map(Box::new);
@@ -4328,6 +4331,7 @@ impl App {
                     crate::native_app::ThemesOutcome::Saved { .. }
                         | crate::native_app::ThemesOutcome::Imported { .. }
                         | crate::native_app::ThemesOutcome::Trashed { .. }
+                        | crate::native_app::ThemesOutcome::Added { .. }
                 ) {
                     self.rediscover_themes_now();
                 }
@@ -4361,6 +4365,8 @@ impl App {
                 self.ai_sign_in(wid, id);
             }
             AppEffect::Harness(request) => self.execute_native_harness(request),
+            // Its timer press, through the App's one writer.
+            AppEffect::HarnessTimer(request) => self.execute_harness_timer(request),
             AppEffect::InvalidateOwnPresentation => {
                 self.refresh_native_presentation(wid, instance, view);
             }
@@ -4636,11 +4642,9 @@ impl App {
     /// Queue the durable `theme` write for a theme chosen in the command
     /// palette, through the lane and OCC materialization the presence toggles
     /// use. The value is the Settings pickers' ([`crate::prefs::theme_choice_value`]):
-    /// over a plain name, the name itself — Default too, which stays dark on
-    /// a light OS; while `theme` is a `dark:…,light:…` pair, the pair with
-    /// only the side on screen replaced; while it is unset (following the
-    /// OS), a pair with the name on the side on screen and its partner on the
-    /// other, so the choice keeps following the OS.
+    /// over a plain name or an unset `theme`, the name itself (Default too);
+    /// while `theme` is a `dark:…,light:…` pair, the pair with only the side
+    /// on screen replaced, so the choice keeps following the OS.
     pub(crate) fn queue_theme_choice(&mut self, id: &str) -> Result<(), String> {
         self.proxy
             .as_ref()
@@ -4812,7 +4816,7 @@ impl App {
             edits: vec![crate::native_app::ConfigEdit {
                 key: crate::prefs::EDIT_THEME.to_string(),
                 expected: ExpectedConfigValue::Exact(expected),
-                value,
+                value: Some(value),
             }],
         })
     }
@@ -5239,7 +5243,7 @@ impl App {
         let current = &self.native_config_service.snapshot().assets.themes;
         if !std::sync::Arc::ptr_eq(&prepared.assets.themes, current) {
             prepared.assets = std::sync::Arc::new(crate::app_config::ConfigAssetCatalog {
-                trail_packs: std::sync::Arc::clone(&prepared.assets.trail_packs),
+                trail_style: std::sync::Arc::clone(&prepared.assets.trail_style),
                 kitty_sprite: prepared.assets.kitty_sprite.clone(),
                 wallpaper: prepared.assets.wallpaper.clone(),
                 themes: std::sync::Arc::clone(current),
@@ -5422,8 +5426,8 @@ impl App {
     /// read's `[harness]`. Workers restart under a changed policy, and
     /// `enabled = false` stops them within one wait (`harness_host`).
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "HarnessPolicyOneWriter",
             action = "Deliver",
             project = "aterm_gui::config_watcher::tests::project_harness_writer"
@@ -5582,7 +5586,7 @@ impl App {
                     // only this request's own committing hold may be retired.
                     self.publish_theme_choice_completion(
                         request_id,
-                        value.as_deref().unwrap_or(crate::prefs::UNSET_THEME_LABEL),
+                        value.as_deref().unwrap_or("Default"),
                         &outcome,
                         authoritative.as_ref(),
                         false,
@@ -5611,12 +5615,6 @@ impl App {
                 }
                 self.refresh_serious_mode_queued_projection();
                 let _ = reply.send(response);
-                if key == crate::prefs::EDIT_ROBI {
-                    // The click-dismissal seam holds this reply's receiver;
-                    // settle it now, since a failure requests no redraw and the
-                    // banner (and Robi's return) must not wait for the next frame.
-                    self.poll_robi_dismissal();
-                }
                 if matches!(&outcome, ConfigPatchOutcome::Applied { undo: Some(_), .. })
                     || reconciled_changed
                     || (serious_mode && authoritative.is_some())
@@ -5884,13 +5882,13 @@ impl App {
         };
         // The busy flip is observable: publish before the worker starts.
         self.publish_native_packages_state();
-        let spawn = std::thread::Builder::new()
-            .name("aterm-packages-verb".into())
-            .spawn(move || {
+        let spawn = crate::qos::spawn_lane_thread(
+            "aterm-packages-verb",
+            crate::qos::Role::Background,
+            move || {
                 // Same lane, store and children as the six-hourly pass. Nobody
                 // blocks on it, and a QoS role does not pass from a thread's
                 // creator (see qos.rs).
-                crate::qos::set_self(crate::qos::Role::Background);
                 // atpkg records durable status in status.toml; the process result
                 // is kept separately because that status may predate a failed
                 // launch or non-zero exit. Stderr is kept: atpkg explains refusals
@@ -5936,7 +5934,7 @@ impl App {
                     let reads_stdout = machine_apply || busy.applies_machine_settings();
                     // QoS-classed spawner: a background pass must not compete with
                     // the window for the scheduler.
-                    let mut child = crate::qos::command(crate::qos::Role::Background, &atpkg);
+                    let mut child = crate::qos::atpkg_command(&atpkg);
                     // The check is the window's own pass: the same argv
                     // (`--wait-lock` with the lanes' bound, `--progress-file`), the
                     // spawner's pid and the login shell's PATH, so a window quitting
@@ -6098,7 +6096,8 @@ impl App {
                     sequence,
                     completion,
                 });
-            });
+            },
+        );
         match spawn {
             Ok(_) => PackagesOutcome::Accepted,
             Err(error) => {
@@ -6126,19 +6125,20 @@ impl App {
         // The stat is `current_exe`-sibling metadata (cheap); the status.toml
         // parse stays on the worker.
         let available = crate::co_located_atpkg().is_some();
-        let spawn = std::thread::Builder::new()
-            .name("aterm-packages-status".into())
-            .spawn(move || {
+        let spawn = crate::qos::spawn_lane_thread(
+            "aterm-packages-status",
+            crate::qos::Role::Background,
+            move || {
                 // A package inventory probe is cosmetic to the terminal; it lands
                 // via the proxy when done.
-                crate::qos::set_self(crate::qos::Role::Background);
                 let report = crate::packages_screen::collect_packages_status(available);
                 let completion = PackagesWorkerCompletion::refresh(report);
                 let _ = proxy.send_event(Wake::NativePackagesFinished {
                     sequence,
                     completion,
                 });
-            });
+            },
+        );
         if spawn.is_err() {
             // Release the reservation via abort, never a fabricated report: a
             // never-observed surface stays on "Reading package status…", and an
@@ -6372,6 +6372,9 @@ impl App {
         {
             return;
         }
+        // When the Timer's `at` offer turns its words, noted before they are
+        // read (`App::note_land_at_offer`).
+        self.note_land_at_offer();
         let state = self.harness_state();
         self.harness_screen.revision = self.harness_screen.revision.saturating_add(1);
         let revision = self.harness_screen.revision;
@@ -6550,18 +6553,19 @@ impl App {
                 let provider = crate::update_control::check_settings_provider(proxy.clone());
                 let snapshot = self.native_updater_service.snapshot();
                 let build = snapshot.current_build;
-                let spawn = std::thread::Builder::new()
-                    .name("aterm-native-update-check".into())
-                    .spawn(move || {
+                let spawn = crate::qos::spawn_lane_thread(
+                    "aterm-native-update-check",
+                    crate::qos::Role::Background,
+                    move || {
                         // A network update probe; nobody at the keyboard waits on
                         // it.
-                        crate::qos::set_self(crate::qos::Role::Background);
                         let status = aterm_update::check_now_with_settings(build, &provider);
                         let _ = proxy.send_event(Wake::NativeUpdateFinished {
                             ticket,
                             status: durable_update_status(status),
                         });
-                    });
+                    },
+                );
                 match spawn {
                     Ok(_) => UpdateOutcome::Accepted,
                     Err(error) => {
@@ -6782,17 +6786,31 @@ impl App {
     /// trial under [`BOOT_TRIAL_LAUNCH_LIMIT`], from the sentinel's count the
     /// last updater observation measured; `None` when none has yet.
     ///
-    /// A DOWNLOAD's candidate cannot be the reverting launch: it swaps before
-    /// it runs, and the swap re-arms the trial from zero (`prepare_trial`).
-    /// (Its first image is the RUNNING build, whose own trial
-    /// `check_boot_health` may count before any swap; a candidate that stays
-    /// that build refuses its target as no verdict on it — exit 75 — and
-    /// gives that launch back on its way out: round eight, #75.)
+    /// A DOWNLOAD's latched build has no launch counted yet: it is not
+    /// installed, and the swap that installs it arms its trial from zero
+    /// (`prepare_trial`). That does NOT make its candidate safe from being a
+    /// reverting launch. The candidate's first image is the RUNNING build, whose
+    /// own trial `check_boot_health` may count before any swap. A candidate
+    /// that stays that build because its boot apply had nothing it may do now,
+    /// or deferred on a passing refusal, refuses its target as no verdict on
+    /// it — exit 75 — and gives that launch back on its way out (round eight,
+    /// #75). One whose boot apply DEFERRED ON A VERDICT (the running build's
+    /// own trial whose recovery proof fails, "trial recovery proof: …") does
+    /// neither: `seamless::passing_refusal_exit` answers no 75, and the parent
+    /// gives back only the TARGET's launch, under a build no trial is armed
+    /// for. That launch stays counted on the running build's trial, so such
+    /// attempts can spend its budget, and the launch that exhausts it is the
+    /// one `check_boot_health` reverts on (or disarms, with no verified
+    /// predecessor) — a download's candidate among them.
     /// The installed ACTIVATION is where the count matters: a structural
     /// `ChildDied` keeps its counted launch, so after two of them the next
     /// launch of the bundle is the one `check_boot_health` reverts on.
     fn structural_latch_trial_room(&self, latch: crate::AutoApplyManualOnly) -> Option<bool> {
         if !latch.activation {
+            // The latched build's own trial has counted nothing (above). This is
+            // no answer for the RUNNING build's trial, which a deferred-on-a-
+            // verdict candidate can spend: that count is not this latch's, and
+            // the lane does not read it here.
             return Some(true);
         }
         self.native_installed_trial
@@ -6848,8 +6866,8 @@ impl App {
     /// model's `looks` / `UnreadLooks`) is this host's, bound by
     /// `a_latch_whose_activation_leaves_the_installed_facts_is_decided_within_a_bound`.
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "NativeUpdateStructuralLatch",
             action = "Decide",
             project = "aterm_gui::native_updater_conformance::project_structural_latch"
@@ -7286,10 +7304,10 @@ impl App {
         let reconcile = self
             .ensure_native_update_reconcile_worker()
             .zip(self.mint_native_update_reconcile_ticket());
-        std::thread::Builder::new()
-            .name("aterm-update-supersede".to_string())
-            .spawn(move || {
-                crate::qos::set_self(crate::qos::Role::Background);
+        crate::qos::spawn_lane_thread(
+            "aterm-update-supersede".to_string(),
+            crate::qos::Role::Background,
+            move || {
                 let outcome = aterm_update::supersede_installed_activation(
                     job.current_build,
                     crate::build_info::git_commit(),
@@ -7313,8 +7331,9 @@ impl App {
                         facts,
                     },
                 )));
-            })
-            .is_ok()
+            },
+        )
+        .is_ok()
     }
 
     /// Unit tests never run the retire (it would act on this machine's install):
@@ -7345,8 +7364,8 @@ impl App {
     /// retire (the next boot apply finishes the crash cut); it is logged as
     /// such, never said as a refusal.
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "NativeUpdateStructuralLatch",
             action = "Supersede",
             project = "aterm_gui::native_updater_conformance::project_structural_latch"
@@ -7449,8 +7468,8 @@ impl App {
     /// ran out of budget, a stage being replaced) puts nothing on glass, since
     /// the lane retries by itself.
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "NativeUpdateStructuralLatch",
             action = "SupersedeRefused",
             project = "aterm_gui::native_updater_conformance::project_structural_latch"
@@ -9891,8 +9910,8 @@ impl App {
     /// converges immediately. [`PhysicalFailureShape::Unexplained`] rides the
     /// epoch machinery (it may be about the machine), with fewer epochs.
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "NativeUpdateStructuralLatch",
             action = "AttemptFails",
             project = "aterm_gui::native_updater_conformance::project_structural_latch"
@@ -11000,16 +11019,16 @@ impl App {
     }
 
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "NativeUpdateEditorCarry",
             action = "Start",
             project = "aterm_gui::editor_carry_conformance::Rig::project"
         )
     )]
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "NativeUpdateEditorCarry",
             action = "Commit",
             project = "aterm_gui::editor_carry_conformance::Rig::project"
@@ -11506,16 +11525,17 @@ fn spawn_native_machine_read(
     proxy: winit::event_loop::EventLoopProxy<Wake>,
     atpkg: std::path::PathBuf,
 ) -> std::io::Result<()> {
-    std::thread::Builder::new()
-        .name("aterm-machine-status".into())
-        .spawn(move || {
+    crate::qos::spawn_lane_thread(
+        "aterm-machine-status",
+        crate::qos::Role::Background,
+        move || {
             // A host-settings probe is cosmetic to the terminal; it lands via
             // the proxy when done.
-            crate::qos::set_self(crate::qos::Role::Background);
             let result = read_machine_state(&atpkg);
             let _ = proxy.send_event(Wake::NativeMachineStateFinished { result });
-        })
-        .map(drop)
+        },
+    )
+    .map(drop)
 }
 
 /// Run bare `atpkg machine` and parse its `machine-state:` line. The child gets the
@@ -11523,7 +11543,7 @@ fn spawn_native_machine_read(
 /// and the atpkg child PATH. Both streams are bounded; only the stdout state line is
 /// the contract.
 fn read_machine_state(atpkg: &std::path::Path) -> Result<atpkg::machine::MachineState, String> {
-    let mut command = crate::qos::command(crate::qos::Role::Background, atpkg);
+    let mut command = crate::qos::atpkg_command(atpkg);
     command
         .arg("machine")
         .env(atpkg::cli::SPAWNER_PID_ENV, std::process::id().to_string())
@@ -11577,6 +11597,14 @@ enum Overflow {
     Truncate,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The pid of the last child [`machine_command_output_bounded`] spawned on
+    /// this thread, so a test names its child without the child's help.
+    static LAST_MACHINE_CHILD: std::cell::Cell<Option<u32>> =
+        const { std::cell::Cell::new(None) };
+}
+
 #[cfg(unix)]
 fn machine_command_output_bounded(
     command: &mut aterm_uds::spawnfd::Command,
@@ -11603,6 +11631,8 @@ fn machine_command_output_bounded(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("could not launch {operation}: {error}"))?;
+    #[cfg(test)]
+    LAST_MACHINE_CHILD.set(Some(child.id()));
     let result = (|| {
         let mut stdout_pipe = child
             .stdout

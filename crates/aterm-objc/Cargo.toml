@@ -9,32 +9,29 @@ license.workspace = true
 repository.workspace = true
 description = "aterm's first-party Objective-C runtime layer: typed message sends, ownership, runtime class creation, and the block ABI — the foundation that retires the objc2 cluster."
 
-# Zero dependencies by design: this crate replaces objc2, block2 and the
-# objc2-* binding crates. Everything is std plus libobjc, Foundation and
-# CoreFoundation (and, under `cg`, CoreGraphics), which ship with the OS.
+# ZERO dependencies, by construction. This crate exists to REMOVE third-party
+# code (objc2 + block2 + the objc2-* binding crates), so adding one here would
+# defeat the whole point. Everything below is std plus `libobjc`, `Foundation`
+# and `CoreFoundation`, which ship with the OS and are already loaded in every
+# aterm process. CoreGraphics is `aterm-cg`'s, so no feature here can make a
+# binary that reaches this crate load a GUI framework.
 #
-# Integration files that only read the runtime are modules of one binary,
-# `tests/objc_static_suite.rs`; each file that owns process-global state (a
-# swizzle, a panic hook, a global allocator, a self re-exec) is its own
-# `[[test]]` below. With autotests off, a `tests/*.rs` file listed nowhere
-# never compiles.
+# The integration files that only READ the runtime are modules of one binary,
+# `tests/objc_static_suite.rs`; the files whose subject is a process death (a
+# self re-exec) or the containment sink are modules of `tests/objc_process_suite.rs`;
+# every file that owns other process-global state (a swizzle, a global
+# allocator, the protocol table) is its own `[[test]]` below. With
+# autotests off a `tests/*.rs` file listed nowhere never compiles.
 autotests = false
 
 [lints]
 workspace = true
 
-[features]
-# `aterm_objc::cg`, which links CoreGraphics. Off by default: the link is not
-# dead-stripped, so with it on every consumer binary loads a GUI framework
-# (`otool -L` on `aterm-sysprobe`'s display-less test binary shows it). winit
-# (crates/aterm-window), its one user, turns it on. Features unify per build:
-# `-p aterm-sysprobe` stays CG-free, a `--workspace` build links it everywhere.
-cg = []
-
-# No libtest harness: libtest runs each `#[test]` on a worker and parks the
-# main thread, so neither branch of `run_on_main` (which `MainThreadBound`'s
-# `Drop` goes through) is reachable from one. Here `main` is the process main
-# thread; the file answers libtest's argv itself, as one test of this name.
+# THE CONTAINER DRIVE, as a test with no libtest harness. libtest runs every
+# `#[test]` on a worker and parks its main thread, so neither branch of
+# `run_on_main` (which `MainThreadBound`'s `Drop` goes through) can be driven
+# from one. Without the harness `main` is the process main thread; the file
+# answers libtest's argv itself, as one test of this name.
 [[test]]
 name = "main_thread_bound_drive"
 harness = false
@@ -43,11 +40,10 @@ harness = false
 # `run_loop_waker_model` beside the real wake timer.
 [dev-dependencies]
 aterm-spec = { workspace = true }
-# `cg` for this crate's own tests and lint (`--all-targets`): the self-dev-
-# dependency unifies the feature into the lib under test. A dev edge, so no
-# consumer's normal graph turns it on.
-aterm-objc = { path = ".", features = ["cg"] }
-# Scratch directories for the SDK-constant probes.
+# The models its tests drive (a model edit rebuilds only their tests).
+aterm-models-core = { workspace = true }
+# The SDK-constant probes' scratch directories, removed on drop. Workspace crate,
+# std-only, zero dependencies; already in the dev graph via aterm-spec.
 aterm-tempfile = { workspace = true }
 
 [[test]]
@@ -59,12 +55,6 @@ path = "tests/objc_static_suite.rs"
 name = "swizzle"
 path = "tests/swizzle.rs"
 
-# Alone: installs a process panic hook. aterm-gui's `objc_live_class_audit`
-# example cites this test name.
-[[test]]
-name = "winit_seam"
-path = "tests/winit_seam.rs"
-
 # Alone: installs a quarantining #[global_allocator].
 [[test]]
 name = "weak"
@@ -75,32 +65,8 @@ path = "tests/weak.rs"
 name = "protocol_registration"
 path = "tests/protocol_registration.rs"
 
-# Alone: re-execs itself with --exact and records process-wide ObjC exceptions.
+# The process suite: every test that re-runs the binary on itself (`--exact`)
+# to watch a child die, plus the process-wide containment sink.
 [[test]]
-name = "exception_containment"
-path = "tests/exception_containment.rs"
-
-# Alone: re-execs itself with --exact.
-[[test]]
-name = "pools"
-path = "tests/pools.rs"
-
-# Alone: re-execs itself with --exact.
-[[test]]
-name = "adversary_w2"
-path = "tests/adversary_w2.rs"
-
-# Alone: re-execs itself with --exact.
-[[test]]
-name = "adversary_w2b"
-path = "tests/adversary_w2b.rs"
-
-# Alone: re-execs itself with --exact.
-[[test]]
-name = "adversary_w2c"
-path = "tests/adversary_w2c.rs"
-
-# Alone: installs a panic hook and re-execs itself with --exact.
-[[test]]
-name = "adversary_w2d"
-path = "tests/adversary_w2d.rs"
+name = "objc_process_suite"
+path = "tests/objc_process_suite.rs"

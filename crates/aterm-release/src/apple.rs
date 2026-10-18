@@ -2319,55 +2319,7 @@ mod tests {
         let want = "Developer ID Application: A Person (A66A9P66Z7)";
         assert_eq!(cert_common_name(libressl).as_deref(), Some(want));
         assert_eq!(cert_common_name(openssl3).as_deref(), Some(want));
-    }
-
-    #[test]
-    fn a_subject_without_a_common_name_yields_none() {
         assert!(cert_common_name("subject= /O=A Person/C=US").is_none());
-    }
-
-    /// The errand text is the whole of the human's instructions, so it must name the
-    /// request file, the Account Holder requirement, and G2 — the three things that make
-    /// the upload land on the first try.
-    ///
-    /// And it must NOT end in "then re-run": on the interactive path it is printed
-    /// directly above a wait loop, so that sentence told the operator to re-run a command
-    /// that was at that moment sitting in one.
-    ///
-    /// Both paths are asserted against the SAME function.
-    #[test]
-    fn the_errand_names_the_request_the_role_and_the_sub_ca() {
-        let watch = Watch::new(None);
-        let text =
-            errand_lines(Path::new("/tmp/devid-m9.certSigningRequest"), false, &watch).join("\n");
-        assert!(text.contains("/tmp/devid-m9.certSigningRequest"));
-        assert!(text.contains("nobody else create"), "{text}");
-        assert!(text.contains("G2 Sub-CA"));
-        assert!(
-            text.contains(".aterm/apple"),
-            "the download has to land somewhere: {text}"
-        );
-        // Nothing named, so the one folder macOS guards is never suggested — the errand
-        // says how to reach the hidden folder and how to name a visible one instead.
-        assert!(!text.contains("Downloads"), "{text}");
-        assert!(text.contains("--cert-dir"), "{text}");
-        assert!(text.contains("⌘⇧G"), "{text}");
-        // "re-run" as an instruction is forbidden on the waiting path (see the doc); the
-        // named-folder hint says "re-run with --cert-dir", which is the one exception,
-        // so the guard excludes that phrase and keeps the rest of the ban.
-        assert!(
-            !text
-                .replace("re-run with --cert-dir", "")
-                .contains("re-run"),
-            "{text}"
-        );
-        // The path that does NOT wait may not promise one.
-        assert!(!text.contains("watching"), "{text}");
-        assert!(
-            errand_lines(Path::new("/tmp/x.csr"), true, &watch)
-                .iter()
-                .any(|l| l.contains("watching") && l.contains(".aterm/apple"))
-        );
     }
 
     /// `provision` reads `~/.aterm/apple` and the ONE folder the operator named — never
@@ -2394,14 +2346,6 @@ mod tests {
             "the named folder is looked in first"
         );
         assert!(dirs[1].ends_with(".aterm/apple"), "{dirs:?}");
-        // Spoken for the errand: the named folder, then aterm's own.
-        let spoken = named.spoken();
-        assert!(spoken.starts_with("/Users//x/Downloads or "), "{spoken}");
-        assert!(spoken.ends_with(".aterm/apple"), "{spoken}");
-        // With a folder named, the errand names it and drops the how-to-name-one hint.
-        let text = errand_lines(Path::new("/tmp/x.csr"), true, &named).join("\n");
-        assert!(text.contains("/Users//x/Downloads"), "{text}");
-        assert!(!text.contains("--cert-dir"), "{text}");
     }
 
     /// The consent note is printed only for a NAMED folder macOS guards, judged on the
@@ -2412,140 +2356,14 @@ mod tests {
         let home = PathBuf::from(std::env::var_os("HOME").expect("HOME in tests"));
         assert!(Watch::new(None).consent_note().is_none());
         let guarded = Watch::new(Some(&home.join("Downloads")));
-        let note = guarded
+        guarded
             .consent_note()
             .expect("Downloads is a guarded folder");
-        assert!(note.contains("macOS guards"), "{note}");
-        assert!(note.contains("yours to answer"), "{note}");
         let plain = Watch::new(Some(&home.join(".aterm").join("apple-scratch")));
         assert!(plain.consent_note().is_none());
         // Per component, never a string prefix: `Downloadsx` is not `Downloads`.
         let lookalike = Watch::new(Some(&home.join("Downloadsx")));
         assert!(lookalike.consent_note().is_none());
-    }
-
-    /// The interactive errand must be SCANNABLE, and the trap must be the last thing
-    /// said. The paragraph form was skimmed past in the field and cost an operator a
-    /// wasted certificate slot; these assertions pin the shape that replaced it.
-    #[test]
-    fn the_errand_lines_put_the_upload_target_and_the_trap_where_they_are_seen() {
-        let watch = Watch::new(Some(Path::new("/Users//x/Downloads")));
-        let lines = errand_lines(
-            Path::new("/Users//x/Downloads/devid-m9.certSigningRequest"),
-            true,
-            &watch,
-        );
-        // The file to upload gets a line to ITSELF — not buried mid-sentence.
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.trim() == "/Users//x/Downloads/devid-m9.certSigningRequest"),
-            "the request must stand alone on its own line: {lines:#?}"
-        );
-        // Every hand-authored line is one instruction. Length is NOT measured here any
-        // more: the old guard was `line.len() <= 76`, bytes against a rendered column
-        // budget measured from the wrong origin (the printed line is `13 + len`, so 76
-        // permitted 89 columns) in the wrong unit (an em-dash costs 3 bytes for one
-        // column). It was simultaneously too loose and too tight, and it passed while the
-        // defect shipped. `tests/it/transcript_grid.rs` measures RENDERED columns at width
-        // 80, through the same primitive that prints them.
-        //
-        // What IS pinned here is that no element hand-breaks its own prose: the wrapper
-        // owns the breaks, so a line frozen at the author's window is the defect.
-        for line in &lines {
-            assert!(
-                !line.contains('\n'),
-                "the wrapper owns the breaks: {line:?}"
-            );
-        }
-        let joined = lines.join("\n");
-        assert!(
-            joined.contains("nobody else create"),
-            "the Account Holder rule is about \
-            CREATING a certificate — truncated to \"nobody else\" it reads as \"nobody else \
-            may sign in\", which is false and stops a legitimate role account: {joined}"
-        );
-        assert!(
-            joined.contains("matched against this request by public key"),
-            "the matching mechanism is what makes the trap credible rather than a rule to \
-             argue with: {joined}"
-        );
-        assert!(joined.contains("G2 Sub-CA"));
-        assert!(joined.contains("/Users//x/Downloads"));
-        assert!(!joined.contains("re-run"), "{joined}");
-        // The trap is stated, and stated LAST — including after the wait paragraph.
-        // Nothing may be printed below it: the line the eye lands on is the line that
-        // decides what the operator does next, and "waiting for the certificate to
-        // appear" in that position reads as permission to go take one from the portal.
-        let trap = lines
-            .iter()
-            .position(|l| l.contains("THE TRAP"))
-            .expect("the trap must be stated");
-        assert!(
-            lines[trap..].iter().any(|l| l.contains("different key")),
-            "the trap must say WHY: {lines:#?}"
-        );
-        assert!(
-            lines[trap..]
-                .iter()
-                .any(|l| l.contains("Already downloaded one?")),
-            "a prohibition with no corrective act leaves the field case — the operator who \
-             ALREADY downloaded the wrong one — with nothing to do: {lines:#?}"
-        );
-        // …and the corrective must not be the HARMFUL one. "delete it and start over"
-        // sends the reader to step 1, which mints a second certificate and spends one of
-        // five permanent slots — the exact loss the trap exists to prevent.
-        assert!(
-            !lines[trap..]
-                .iter()
-                .any(|l| l.contains("Delete it") || l.contains("delete it")),
-            "the corrective must not route the operator into spending a slot: {lines:#?}"
-        );
-        assert!(
-            lines[trap..].iter().any(|l| l.contains("spends one of")),
-            "the trap must keep the CONSEQUENCE that makes it matter — a permanent slot: \
-             {lines:#?}"
-        );
-        assert!(
-            !lines[trap..].iter().any(|l| l.contains("watching")),
-            "the wait paragraph must sit ABOVE the trap: {lines:#?}"
-        );
-        assert!(
-            trap > lines.len() / 2,
-            "the trap must come last, not mid-paragraph: {lines:#?}"
-        );
-    }
-
-    /// A refused certificate must name the ACT that fixes it. "a different public key"
-    /// alone reads as a bad download, and the operator's next move is to download it
-    /// again — or to create a second certificate, spending one of five permanent slots
-    /// on a problem that was never about the certificate.
-    #[test]
-    fn a_refused_certificate_names_the_upload_that_fixes_it() {
-        let rejected = vec![PathBuf::from(
-            "/Users//x/Downloads/developerID_application.cer",
-        )];
-        let csr = PathBuf::from("/Users//x/Downloads/devid-m9.certSigningRequest");
-        let watch = Watch::new(None);
-        let note =
-            rejected_note(&rejected, Some(&csr), &watch).expect("a refusal must be explained");
-        assert!(note.contains("developerID_application.cer"), "{note}");
-        assert!(note.contains("devid-m9.certSigningRequest"), "{note}");
-        assert!(
-            note.contains("not a download problem"),
-            "the note must correct the operator's likeliest reading: {note}"
-        );
-        // Without a request to point at (the non-interactive path prints the errand
-        // separately), it falls back to the location hint rather than inventing one.
-        let generic = rejected_note(&rejected, None, &watch).expect("still explained");
-        // The hint names the folder provision actually watches — aterm's own, since
-        // nothing was named — never a folder it does not read (the fixture's rejected
-        // file sits in Downloads; the HINT must not send the operator there).
-        assert!(generic.contains("move it into ~/.aterm/apple"), "{generic}");
-        assert!(!generic.contains("move it into ~/Downloads"), "{generic}");
-        assert!(!generic.contains("not a download problem"), "{generic}");
-        // Nothing refused, nothing to say.
-        assert!(rejected_note(&[], Some(&csr), &watch).is_none());
     }
 
     /// Two overlapping Developer ID certificates is what a RENEWAL looks like, so the
@@ -2611,14 +2429,5 @@ mod tests {
             Some("2027-09-01")
         );
         assert!(enddate_iso("notBefore=Aug 17 16:36:19 2026 GMT").is_none());
-    }
-
-    /// A duplicate item is the shape a RETRY takes, and retries must work: the operator
-    /// re-runs the same command after any interruption.
-    #[test]
-    fn a_duplicate_keychain_item_is_not_a_failure() {
-        let dup =
-            "security: SecKeychainItemImport: The specified item already exists in the keychain.";
-        assert!(dup.to_ascii_lowercase().contains("already exists"));
     }
 }

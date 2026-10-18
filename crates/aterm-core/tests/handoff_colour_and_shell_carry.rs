@@ -17,8 +17,9 @@ const ROWS: u16 = 12;
 const COLS: u16 = 60;
 const CARRY: usize = 256;
 
-/// A host theme from a host that opted in to palette reconfigure (the GUI's
-/// `allow_palette_reconfigure` defaults off), so applications may recolour it.
+/// A host theme from a host that allows palette reconfigure, as the aterm app
+/// does by default (the engine library's own default stays off), so
+/// applications may recolour it.
 fn theme(fg: Rgb) -> TerminalConfig {
     TerminalConfig {
         default_foreground: fg,

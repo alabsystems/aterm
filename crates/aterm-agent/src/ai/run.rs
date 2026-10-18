@@ -33,13 +33,13 @@ impl RunDir {
         sweep(&root);
         let token = aterm_uds::rand::hex_token::<8>()?;
         let path = root.join(format!("{}-{token}", std::process::id()));
-        let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt as _;
-            builder.mode(0o700);
+            std::fs::DirBuilder::new().mode(0o700).create(&path)?;
         }
-        builder.create(&path)?;
+        #[cfg(not(unix))]
+        std::fs::DirBuilder::new().create(&path)?;
         Ok(RunDir { path })
     }
 
@@ -75,13 +75,13 @@ impl RunDir {
     /// It exists already, or it could not be made.
     pub fn subdir(&self, name: &str) -> io::Result<PathBuf> {
         let path = self.path.join(name);
-        let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt as _;
-            builder.mode(0o700);
+            std::fs::DirBuilder::new().mode(0o700).create(&path)?;
         }
-        builder.create(&path)?;
+        #[cfg(not(unix))]
+        std::fs::DirBuilder::new().create(&path)?;
         Ok(path)
     }
 }

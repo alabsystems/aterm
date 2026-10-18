@@ -111,13 +111,17 @@ pub struct TerminalModes {
     /// Tracks which VT terminal level (VT100-VT520) the terminal emulates.
     /// Queried via DECRQSS with `"p` mnemonic.
     pub vt_level: VtLevel,
-    /// The host OS color scheme (light/dark) reported via the DEC color-scheme
-    /// protocol. Updated by the host (`Terminal::set_color_scheme`); queried by
-    /// apps via DSR `CSI ? 996 n`. Default [`Appearance::Dark`].
+    /// The colour scheme last announced to the program: the last 997 push or
+    /// DSR 996 reply, or the value at the last reconciliation. The live value
+    /// is `Terminal::color_scheme()`, derived from the colours. Change
+    /// detection for the mode-2031 push reads this; a checkpoint carries it so
+    /// a successor knows what the program was last told. Default
+    /// [`Appearance::Dark`].
     pub color_scheme: Appearance,
     /// DEC private mode 2031: when set, the terminal emits an unsolicited
-    /// `CSI ? 997 ; Ps n` whenever [`color_scheme`](Self::color_scheme) changes,
-    /// so apps can live-update their theme. Off by default.
+    /// `CSI ? 997 ; Ps n` whenever the reported scheme
+    /// (`Terminal::color_scheme()`) changes, so apps can live-update their
+    /// theme. Off by default.
     pub report_color_scheme: bool,
     /// DECBKM (DEC private mode 67): when set, the Backspace key sends BS (0x08)
     /// instead of the default DEL (0x7f). Folded into the legacy `KeyboardMode`.
@@ -160,10 +164,12 @@ pub struct TerminalModes {
     /// ConPTY win32-input-mode (DEC private mode 9001, microsoft/terminal spec
     /// #4999). conhost sets it at every ConPTY start (`CSI ? 9001 h`) to ask the
     /// hosting terminal for INPUT_RECORD-faithful key reports. Folded into the
-    /// keyboard encoding as `KeyboardMode::WIN32_INPUT`, where an Enter chord
-    /// (Shift/Ctrl, with or without Alt) becomes a win32 key-record pair —
-    /// the only way conhost can learn a modifier legacy VT cannot spell.
-    /// Everything else stays legacy VT; conhost accepts the mixed stream.
+    /// keyboard encoding as `KeyboardMode::WIN32_INPUT`, where a key conhost
+    /// cannot read from legacy VT, or reads as another key, becomes a win32
+    /// key-record pair: an Enter chord (Shift/Ctrl, with or without Alt), the
+    /// keys whose legacy bytes are a bare or dangling ESC, and Ctrl+H
+    /// (`KeyboardMode::WIN32_INPUT` lists them). Everything else stays legacy
+    /// VT; conhost accepts the mixed stream.
     /// Reported by DECRQM, carried by XTSAVE/XTRESTORE, cleared by RIS like
     /// every other negotiated mode. Never reaches an application: it is a
     /// negotiation with the console host, not a kitty flag. Default `false`.
@@ -270,7 +276,8 @@ pub struct TerminalModes {
     /// explicitly via `TerminalConfig::allow_palette_reconfigure = true`.
     /// This parallels `allow_window_ops`, `allow_osc52_query`, and
     /// `allow_notifications`: reachable over the wire, defaults off, host
-    /// opts in consciously.
+    /// opts in consciously. The aterm app enables this unless its config says
+    /// false (`Config::allow_palette_reconfigure_or_default`).
     pub allow_palette_reconfigure: bool,
     /// Require OSC 133 / OSC 633 shell-integration sequences to carry an
     /// `id=<64-hex>` capability nonce (#7937 F01-2, #7960).

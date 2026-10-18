@@ -576,12 +576,17 @@ pub struct KeyEvent {
     pub(crate) platform_specific: platform_impl::KeyEventExtra,
 }
 
-#[cfg(feature = "aterm-test-key-event")]
+// A test or debug build only: a release build has no way to mint a key event
+// the platform did not deliver. Gated on the profile, not a feature, so the
+// downstream test build and the shipped build compile one winit. The cost:
+// aterm-gui's tests build only under a profile with debug assertions on, never
+// `--release` or an optimized test profile that turns them off.
+#[cfg(any(test, debug_assertions))]
 impl KeyEvent {
     /// Construct a synthetic event for downstream conformance tests.
     ///
-    /// This is feature-gated because real events normally come only from the
-    /// platform event loop. The constructor also initializes winit's private
+    /// Test and debug builds only, because real events normally come only from
+    /// the platform event loop. The constructor also initializes winit's private
     /// modifier-supplement payload, letting a downstream test exercise the same
     /// `key_without_modifiers()` path as a native event without unsafe layout
     /// fabrication.

@@ -291,14 +291,6 @@ impl PackedColor {
         let b = (self.0 & 0xFF) as u8;
         (r, g, b)
     }
-
-    /// Get the raw packed u32 value.
-    #[must_use]
-    #[inline]
-    #[cfg(test)]
-    pub const fn raw(self) -> u32 {
-        self.0
-    }
 }
 
 #[cfg(test)]
@@ -452,17 +444,5 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn packed_color_rgb_raw_encoding() {
-        let c = PackedColor::rgb(0xAB, 0xCD, 0xEF);
-        assert_eq!(c.raw(), 0x01_ABCDEF);
-    }
-
-    #[test]
-    fn packed_color_indexed_raw_encoding() {
-        let c = PackedColor::indexed(42);
-        assert_eq!(c.raw(), 42);
     }
 }

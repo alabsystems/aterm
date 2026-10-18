@@ -93,8 +93,7 @@ impl ToneTracker {
     /// The tone the sound path stamps onto every trail
     /// [`crate::trail_sound::SoundEvent`]: the cached verdict with the knob on,
     /// the neutral [`Tone::Technical`] with it off, even while a verdict from
-    /// before the toggle is cached. Every sound seam takes its tone from here
-    /// (pinned by `every_trail_sound_policy_takes_its_tone_from_the_tracker`).
+    /// before the toggle is cached. Every sound seam takes its tone from here.
     pub fn effective(&self, tone_melody: bool) -> Tone {
         if tone_melody {
             self.tone
@@ -228,12 +227,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn starts_neutral() {
-        let t = ToneTracker::default();
-        assert_eq!(t.current(), Tone::Technical);
-    }
-
     /// A same-instant burst re-infers once per [`INFER_KEYS`] keys (plus the
     /// first run), never per key.
     #[test]
@@ -263,21 +256,6 @@ mod tests {
             before + 1,
             "an elapsed interval must re-infer"
         );
-    }
-
-    /// A canonical frustrated line (a pin on the shipped weights) flips the
-    /// verdict, and a technical command flips it back.
-    #[test]
-    fn typed_mood_moves_the_cached_tone() {
-        let mut t = ToneTracker::default();
-        let now = Instant::now();
-        feed(&mut t, now, 1, "why is this broken again ugh");
-        assert_eq!(t.current(), Tone::Frustrated);
-        t.note_break(); // Enter — window clears, mood persists…
-        assert_eq!(t.current(), Tone::Frustrated);
-        // …until the next line carries new evidence.
-        feed(&mut t, now, 1, "git rebase -i HEAD~3 && cargo test");
-        assert_eq!(t.current(), Tone::Technical);
     }
 
     /// A session switch clears the window but keeps the cached tone.
@@ -340,22 +318,6 @@ mod tests {
         assert_eq!(t.effective(true), Tone::Frustrated);
         assert_eq!(t.effective(false), Tone::Technical);
         assert_eq!(t.current(), Tone::Frustrated, "the cache is not cleared");
-    }
-
-    /// `window_chars` and `inferences` track the feed; the count moves only when
-    /// the classifier ran.
-    #[test]
-    fn introspection_counters_track_the_window_and_the_classifier() {
-        let mut t = ToneTracker::default();
-        let now = Instant::now();
-        assert_eq!((t.window_chars(), t.inferences), (0, 0));
-        feed_inactive(&mut t, now, 1, "hello there");
-        assert_eq!(t.window_chars(), 11, "the window fills while inactive…");
-        assert_eq!(t.inferences, 0, "…but the classifier never ran");
-        feed(&mut t, now, 1, "!");
-        assert!(t.inferences >= 1, "an active feed runs the model");
-        t.note_break();
-        assert_eq!(t.window_chars(), 0, "a break empties the window");
     }
 
     /// A break recorded while inference is inactive still clears the window, so

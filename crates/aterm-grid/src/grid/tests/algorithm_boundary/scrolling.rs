@@ -7,134 +7,6 @@
 use super::*;
 
 #[test]
-fn line_feed_within_scroll_region_moves_down() {
-    let mut grid = Grid::new(10, 10);
-    grid.set_scroll_region(2, 7);
-    grid.set_cursor(4, 5);
-
-    grid.line_feed();
-
-    assert_eq!(grid.cursor_row(), 5);
-    assert_eq!(grid.cursor_col(), 5);
-}
-
-#[test]
-fn line_feed_at_bottom_margin_scrolls_region() {
-    let mut grid = Grid::new(10, 10);
-    grid.set_scroll_region(2, 5);
-
-    for row in 2..=5 {
-        grid.set_cursor(row, 0);
-        grid.write_char((b'A' + (row - 2) as u8) as char);
-    }
-
-    grid.set_cursor(5, 0);
-    grid.line_feed();
-
-    assert_eq!(grid.cursor_row(), 5);
-    assert_eq!(grid.cell(2, 0).unwrap().char(), 'B');
-    assert_eq!(grid.cell(3, 0).unwrap().char(), 'C');
-    assert_eq!(grid.cell(4, 0).unwrap().char(), 'D');
-    assert!(
-        grid.row(5).unwrap().is_empty(),
-        "bottom of region should be blank after scroll"
-    );
-    assert!(grid.row(0).unwrap().is_empty());
-    assert!(grid.row(1).unwrap().is_empty());
-}
-
-#[test]
-fn line_feed_below_scroll_region_moves_down() {
-    let mut grid = Grid::new(10, 10);
-    grid.set_scroll_region(2, 5);
-    grid.set_cursor(7, 3);
-
-    grid.line_feed();
-
-    assert_eq!(grid.cursor_row(), 8);
-    assert_eq!(grid.cursor_col(), 3);
-}
-
-#[test]
-fn line_feed_below_region_clamped_at_screen_bottom() {
-    let mut grid = Grid::new(10, 10);
-    grid.set_scroll_region(2, 5);
-    grid.set_cursor(9, 0);
-
-    grid.line_feed();
-
-    assert_eq!(grid.cursor_row(), 9);
-}
-
-#[test]
-fn line_feed_above_scroll_region_moves_down() {
-    let mut grid = Grid::new(10, 10);
-    grid.set_scroll_region(5, 8);
-    grid.set_cursor(1, 0);
-
-    grid.line_feed();
-
-    assert_eq!(grid.cursor_row(), 2);
-}
-
-#[test]
-fn reverse_line_feed_within_scroll_region_moves_up() {
-    let mut grid = Grid::new(10, 10);
-    grid.set_scroll_region(2, 7);
-    grid.set_cursor(5, 3);
-
-    grid.reverse_line_feed();
-
-    assert_eq!(grid.cursor_row(), 4);
-    assert_eq!(grid.cursor_col(), 3);
-}
-
-#[test]
-fn reverse_line_feed_at_top_margin_scrolls_region_down() {
-    let mut grid = Grid::new(10, 10);
-    grid.set_scroll_region(2, 5);
-
-    for row in 2..=5 {
-        grid.set_cursor(row, 0);
-        grid.write_char((b'A' + (row - 2) as u8) as char);
-    }
-
-    grid.set_cursor(2, 0);
-    grid.reverse_line_feed();
-
-    assert_eq!(grid.cursor_row(), 2);
-    assert!(
-        grid.row(2).unwrap().is_empty(),
-        "top of region should be blank after reverse scroll"
-    );
-    assert_eq!(grid.cell(3, 0).unwrap().char(), 'A');
-    assert_eq!(grid.cell(4, 0).unwrap().char(), 'B');
-    assert_eq!(grid.cell(5, 0).unwrap().char(), 'C');
-}
-
-#[test]
-fn reverse_line_feed_above_scroll_region_moves_up() {
-    let mut grid = Grid::new(10, 10);
-    grid.set_scroll_region(5, 8);
-    grid.set_cursor(2, 0);
-
-    grid.reverse_line_feed();
-
-    assert_eq!(grid.cursor_row(), 1);
-}
-
-#[test]
-fn reverse_line_feed_above_region_clamped_at_row_zero() {
-    let mut grid = Grid::new(10, 10);
-    grid.set_scroll_region(5, 8);
-    grid.set_cursor(0, 0);
-
-    grid.reverse_line_feed();
-
-    assert_eq!(grid.cursor_row(), 0);
-}
-
-#[test]
 fn single_row_scroll_region_rejected_per_vt510() {
     let mut grid = Grid::new(10, 10);
     grid.set_scroll_region(3, 3);
@@ -157,116 +29,237 @@ fn single_row_scroll_region_rejected_per_vt510() {
     grid.assert_invariants();
 }
 
-#[test]
-fn two_row_scroll_region_line_feed() {
-    let mut grid = Grid::new(10, 10);
-    grid.set_scroll_region(3, 4);
-
-    grid.set_cursor(3, 0);
-    grid.write_char('A');
-    grid.set_cursor(4, 0);
-    grid.write_char('B');
-
-    grid.set_cursor(4, 0);
-    grid.line_feed();
-
-    assert_eq!(grid.cursor_row(), 4);
-    assert_eq!(grid.cell(3, 0).unwrap().char(), 'B');
-    assert!(grid.row(4).unwrap().is_empty());
+/// The first char of every row: a letter, or ' ' for a blank row.
+fn column_zero(grid: &Grid) -> String {
+    (0..grid.rows())
+        .map(|r| grid.cell(r, 0).map_or(' ', |c| c.char()))
+        .collect()
 }
 
+/// SU/SD, scroll_region_up/down and LF/RI at a margin move only the rows of
+/// the scroll region, blank-filling what they vacate and clamping the count to
+/// the region; a degenerate one-row region (which DECSTBM never sets) is a
+/// no-op on every path.
 #[test]
-fn two_row_scroll_region_reverse_line_feed() {
-    let mut grid = Grid::new(10, 10);
-    grid.set_scroll_region(3, 4);
-
-    grid.set_cursor(3, 0);
-    grid.write_char('A');
-    grid.set_cursor(4, 0);
-    grid.write_char('B');
-
-    grid.set_cursor(3, 0);
-    grid.reverse_line_feed();
-
-    assert_eq!(grid.cursor_row(), 3);
-    assert!(grid.row(3).unwrap().is_empty());
-    assert_eq!(grid.cell(4, 0).unwrap().char(), 'A');
-}
-
-#[test]
-fn write_char_wrap_at_scroll_region_bottom_scrolls_region_only() {
-    let mut grid = build_autowrap_scroll_region_fixture();
-    grid.set_cursor(3, 0);
-
-    for c in "XXXXX".chars() {
-        grid.write_char_wrap(c);
+fn scrolls_move_only_the_region_rows() {
+    type Op = fn(&mut Grid);
+    // (name, rows, region, cursor, op, column 0 after; rows start "ABCDEF...")
+    #[expect(clippy::type_complexity, reason = "a test's case table")]
+    let cases: &[(&str, u16, Option<(u16, u16)>, u16, Op, &str)] = &[
+        ("SU 1", 3, None, 0, |g| g.scroll_up(1), "BC "),
+        ("SD 1", 3, None, 0, |g| g.scroll_down(1), " AB"),
+        ("SU 2", 4, None, 0, |g| g.scroll_up(2), "CD  "),
+        ("SD 2", 4, None, 0, |g| g.scroll_down(2), "  AB"),
+        ("SU 0", 3, None, 0, |g| g.scroll_up(0), "ABC"),
+        (
+            "full-screen region up",
+            3,
+            Some((0, 2)),
+            0,
+            |g| g.scroll_region_up(1),
+            "BC ",
+        ),
+        (
+            "region up past its size",
+            3,
+            Some((0, 2)),
+            0,
+            |g| g.scroll_region_up(100),
+            "   ",
+        ),
+        (
+            "region down past its size",
+            3,
+            Some((0, 2)),
+            0,
+            |g| g.scroll_region_down(100),
+            "   ",
+        ),
+        (
+            "region up",
+            6,
+            Some((2, 4)),
+            0,
+            |g| g.scroll_region_up(1),
+            "ABDE F",
+        ),
+        (
+            "region down",
+            6,
+            Some((2, 4)),
+            0,
+            |g| g.scroll_region_down(1),
+            "AB CDF",
+        ),
+        (
+            "region up n == size",
+            6,
+            Some((1, 3)),
+            0,
+            |g| g.scroll_region_up(3),
+            "A   EF",
+        ),
+        (
+            "region down n == size",
+            6,
+            Some((1, 3)),
+            0,
+            |g| g.scroll_region_down(3),
+            "A   EF",
+        ),
+        (
+            "region up n > size",
+            6,
+            Some((1, 3)),
+            0,
+            |g| g.scroll_region_up(100),
+            "A   EF",
+        ),
+        (
+            "two-row region up",
+            5,
+            Some((2, 3)),
+            0,
+            |g| g.scroll_region_up(1),
+            "ABD E",
+        ),
+        (
+            "LF at the bottom margin",
+            10,
+            Some((2, 5)),
+            5,
+            Grid::line_feed,
+            "ABDEF GHIJ",
+        ),
+        (
+            "RI at the top margin",
+            10,
+            Some((2, 5)),
+            2,
+            Grid::reverse_line_feed,
+            "AB CDEGHIJ",
+        ),
+        (
+            "LF in a two-row region",
+            10,
+            Some((3, 4)),
+            4,
+            Grid::line_feed,
+            "ABCE FGHIJ",
+        ),
+        (
+            "RI in a two-row region",
+            10,
+            Some((3, 4)),
+            3,
+            Grid::reverse_line_feed,
+            "ABC DFGHIJ",
+        ),
+    ];
+    for &(name, rows, region, cursor, op, want) in cases {
+        let mut grid = Grid::new(rows, 10);
+        fill_grid_rows(&mut grid, rows);
+        if let Some((top, bottom)) = region {
+            grid.set_scroll_region(top, bottom);
+        }
+        grid.set_cursor(cursor, 0);
+        op(&mut grid);
+        assert_eq!(column_zero(&grid), want, "{name}");
+        grid.assert_invariants();
     }
-    grid.write_char_wrap('Z');
 
-    assert_rows_outside_scroll_region_preserved(&grid);
-    assert_eq!(grid.cell(1, 0).unwrap().char(), 'C');
-    assert_eq!(grid.cell(2, 0).unwrap().char(), 'X');
-    assert_eq!(grid.cell(3, 0).unwrap().char(), 'Z');
-    assert_eq!(grid.cursor_row(), 3);
-    assert_eq!(grid.cursor_col(), 1);
-}
-
-#[test]
-fn write_char_wrap_styled_at_scroll_region_bottom_scrolls_region_only() {
-    let mut grid = build_autowrap_scroll_region_fixture();
-    grid.set_cursor(3, 0);
-
-    let fg = PackedColor::indexed(196);
-    let bg = PackedColor::indexed(22);
-    let flags = CellFlags::BOLD;
-    for c in "XXXXX".chars() {
-        grid.write_char_wrap_styled(c, fg, bg, flags);
+    let degenerate: [(&str, Op); 4] = [
+        ("up", |g| g.scroll_region_up(1)),
+        ("down", |g| g.scroll_region_down(1)),
+        ("up margined", |g| g.scroll_region_up_margined(1, 2, 5)),
+        ("down margined", |g| g.scroll_region_down_margined(1, 2, 5)),
+    ];
+    for (name, op) in degenerate {
+        let mut grid = Grid::new(6, 10);
+        fill_grid_rows(&mut grid, 6);
+        // Bypass set_scroll_region validation (DECSTBM rejects top == bottom).
+        grid.storage.cursor_state.scroll_region = ScrollRegion { top: 3, bottom: 3 };
+        op(&mut grid);
+        assert_eq!(column_zero(&grid), "ABCDEF", "degenerate region {name}");
+        grid.assert_invariants();
     }
-    grid.write_char_wrap_styled('Z', fg, bg, flags);
-
-    assert_rows_outside_scroll_region_preserved(&grid);
-    assert_eq!(grid.cell(1, 0).unwrap().char(), 'C');
-    assert_eq!(grid.cell(2, 0).unwrap().char(), 'X');
-    assert_eq!(grid.cell(3, 0).unwrap().char(), 'Z');
-    assert_eq!(grid.cursor_row(), 3);
-    assert_eq!(grid.cursor_col(), 1);
 }
 
+/// Every autowrapping write path that wraps off the bottom margin scrolls the
+/// region only: the rows outside it keep their content.
 #[test]
-fn write_ascii_blast_at_scroll_region_bottom_scrolls_region_only() {
-    let mut grid = build_autowrap_scroll_region_fixture();
-    grid.set_cursor(3, 0);
-
-    let written = grid.write_ascii_blast(b"XXXXXZ");
-    assert_eq!(written, 6);
-
-    assert_rows_outside_scroll_region_preserved(&grid);
-    assert_eq!(grid.cell(1, 0).unwrap().char(), 'C');
-    assert_eq!(grid.cell(2, 0).unwrap().char(), 'X');
-    assert_eq!(grid.cell(3, 0).unwrap().char(), 'Z');
-    assert_eq!(grid.cursor_row(), 3);
-    assert_eq!(grid.cursor_col(), 1);
+fn autowrap_at_the_region_bottom_scrolls_the_region_only() {
+    type Write = fn(&mut Grid);
+    let writes: [(&str, Write); 4] = [
+        ("write_char_wrap", |g| {
+            for c in "XXXXXZ".chars() {
+                g.write_char_wrap(c);
+            }
+        }),
+        ("write_char_wrap_styled", |g| {
+            for c in "XXXXXZ".chars() {
+                g.write_char_wrap_styled(
+                    c,
+                    PackedColor::indexed(196),
+                    PackedColor::indexed(22),
+                    CellFlags::BOLD,
+                );
+            }
+        }),
+        ("write_ascii_blast", |g| {
+            assert_eq!(g.write_ascii_blast(b"XXXXXZ"), 6);
+        }),
+        ("write_ascii_run_styled", |g| {
+            let mut last_byte = None;
+            let written = g.write_ascii_run_styled(
+                b"XXXXXZ",
+                PackedColor::indexed(33),
+                PackedColor::indexed(235),
+                CellFlags::ITALIC,
+                &mut last_byte,
+            );
+            assert_eq!((written, last_byte), (6, Some(b'Z')));
+        }),
+    ];
+    for (name, write) in writes {
+        let mut grid = build_autowrap_scroll_region_fixture();
+        grid.set_cursor(3, 0);
+        write(&mut grid);
+        assert_rows_outside_scroll_region_preserved(&grid);
+        assert_eq!(column_zero(&grid), "ACXZEF", "{name}");
+        assert_eq!((grid.cursor_row(), grid.cursor_col()), (3, 1), "{name}");
+    }
 }
 
+/// Whatever scrolls the region while the viewport is in history snaps the view
+/// back to the live screen first (and does not panic doing it).
 #[test]
-fn write_ascii_run_styled_at_scroll_region_bottom_scrolls_region_only() {
-    let mut grid = build_autowrap_scroll_region_fixture();
-    grid.set_cursor(3, 0);
-
-    let fg = PackedColor::indexed(33);
-    let bg = PackedColor::indexed(235);
-    let flags = CellFlags::ITALIC;
-    let mut last_byte = None;
-    let written = grid.write_ascii_run_styled(b"XXXXXZ", fg, bg, flags, &mut last_byte);
-    assert_eq!(written, 6);
-    assert_eq!(last_byte, Some(b'Z'));
-
-    assert_rows_outside_scroll_region_preserved(&grid);
-    assert_eq!(grid.cell(1, 0).unwrap().char(), 'C');
-    assert_eq!(grid.cell(2, 0).unwrap().char(), 'X');
-    assert_eq!(grid.cell(3, 0).unwrap().char(), 'Z');
-    assert_eq!(grid.cursor_row(), 3);
-    assert_eq!(grid.cursor_col(), 1);
+fn a_region_scroll_from_a_scrolled_back_view_snaps_to_live() {
+    type Op = fn(&mut Grid);
+    let ops: [(&str, u16, u16, Op); 4] = [
+        ("LF at the bottom margin", 7, 0, Grid::line_feed),
+        ("RI at the top margin", 2, 0, Grid::reverse_line_feed),
+        ("autowrap at the bottom margin", 7, 9, |g| {
+            g.write_char_wrap('X');
+            g.resolve_pending_wrap();
+        }),
+        ("scroll_region_up", 7, 0, |g| g.scroll_region_up(1)),
+    ];
+    for (name, row, col, op) in ops {
+        let mut grid = Grid::with_scrollback(10, 10, 20);
+        fill_grid_rows(&mut grid, 10);
+        grid.set_cursor(9, 0);
+        for _ in 0..5 {
+            grid.line_feed();
+        }
+        grid.set_scroll_region(2, 7);
+        grid.set_cursor(row, col);
+        grid.scroll_display(3);
+        assert!(grid.display_offset() > 0, "{name}: precondition");
+        op(&mut grid);
+        assert_eq!(grid.display_offset(), 0, "{name}");
+        grid.assert_invariants();
+    }
 }
 
 #[test]
@@ -314,91 +307,6 @@ fn line_feed_full_screen_region_scrolls_with_scrollback() {
 
 // Scroll region boundary conditions
 
-/// Scroll region up with n == region_size clears all rows in the region.
-#[test]
-fn scroll_region_up_n_equals_region_size() {
-    let mut grid = Grid::new(6, 10);
-    fill_grid_rows(&mut grid, 6);
-
-    grid.set_scroll_region(1, 3);
-    grid.scroll_region_up(3);
-
-    assert_eq!(grid.cell(0, 0).unwrap().char(), 'A', "row 0 preserved");
-    assert_eq!(grid.cell(4, 0).unwrap().char(), 'E', "row 4 preserved");
-    assert_eq!(grid.cell(5, 0).unwrap().char(), 'F', "row 5 preserved");
-
-    for row in 1..=3 {
-        assert!(
-            grid.row(row).unwrap().is_empty(),
-            "row {row} should be empty after scrolling entire region up",
-        );
-    }
-}
-
-/// Scroll region down with n == region_size clears all rows in the region.
-#[test]
-fn scroll_region_down_n_equals_region_size() {
-    let mut grid = Grid::new(6, 10);
-    fill_grid_rows(&mut grid, 6);
-
-    grid.set_scroll_region(1, 3);
-    grid.scroll_region_down(3);
-
-    assert_eq!(grid.cell(0, 0).unwrap().char(), 'A', "row 0 preserved");
-    assert_eq!(grid.cell(4, 0).unwrap().char(), 'E', "row 4 preserved");
-    assert_eq!(grid.cell(5, 0).unwrap().char(), 'F', "row 5 preserved");
-
-    for row in 1..=3 {
-        assert!(
-            grid.row(row).unwrap().is_empty(),
-            "row {row} should be empty after scrolling entire region down",
-        );
-    }
-}
-
-/// Scroll region up with n > region_size is clamped to region_size.
-#[test]
-fn scroll_region_up_n_exceeds_region_size() {
-    let mut grid = Grid::new(6, 10);
-    fill_grid_rows(&mut grid, 6);
-
-    grid.set_scroll_region(1, 3);
-    grid.scroll_region_up(100);
-
-    assert_eq!(grid.cell(0, 0).unwrap().char(), 'A', "row 0 preserved");
-    assert_eq!(grid.cell(4, 0).unwrap().char(), 'E', "row 4 preserved");
-
-    for row in 1..=3 {
-        assert!(
-            grid.row(row).unwrap().is_empty(),
-            "row {row} should be empty after oversized scroll",
-        );
-    }
-}
-
-/// Two-row scroll region: scroll up by 1 shifts content within region only.
-#[test]
-fn scroll_region_up_two_row() {
-    let mut grid = Grid::new(5, 10);
-    fill_grid_rows(&mut grid, 5);
-
-    grid.set_scroll_region(2, 3);
-    grid.scroll_region_up(1);
-
-    assert_eq!(grid.cell(0, 0).unwrap().char(), 'A', "row 0 preserved");
-    assert_eq!(grid.cell(1, 0).unwrap().char(), 'B', "row 1 preserved");
-    assert_eq!(
-        grid.cell(2, 0).unwrap().char(),
-        'D',
-        "row 3 content shifts to row 2"
-    );
-    assert!(
-        grid.row(3).unwrap().is_empty(),
-        "bottom of region should be cleared"
-    );
-    assert_eq!(grid.cell(4, 0).unwrap().char(), 'E', "row 4 preserved");
-}
-
 /// advance_autowrap_line with the cursor below the scroll region at the screen
 /// bottom does not scroll (xterm's CursorDown clamps at `max_row`); the cursor
 /// returns to column 0 of the last row.
@@ -433,126 +341,6 @@ fn write_char_wrap_below_scroll_region_at_screen_bottom_does_not_scroll() {
     assert_eq!(grid.cursor_row(), 4, "cursor stays on the bottom row");
     assert_eq!(grid.cursor_col(), 0, "cursor at col 0 after wrap");
     grid.assert_invariants();
-}
-
-/// scroll_display then line_feed at the bottom of a scroll region does not panic.
-#[test]
-fn line_feed_after_scroll_display_resets_offset() {
-    let mut grid = Grid::with_scrollback(10, 10, 20);
-
-    for row in 0..10 {
-        grid.set_cursor(row, 0);
-        grid.write_char((b'A' + row as u8) as char);
-    }
-    grid.set_cursor(9, 0);
-    for _ in 0..5 {
-        grid.line_feed();
-    }
-    assert!(grid.scrollback_lines() > 0, "should have scrollback");
-
-    grid.set_scroll_region(2, 7);
-    grid.set_cursor(7, 0);
-
-    grid.scroll_display(3);
-    assert!(grid.display_offset() > 0, "should be scrolled back");
-
-    grid.line_feed();
-
-    assert_eq!(grid.display_offset(), 0, "should snap to live view");
-    assert_eq!(grid.cursor_row(), 7, "cursor stays at bottom of region");
-    grid.assert_invariants();
-}
-
-/// Same as above but for reverse_line_feed + scroll_region_down.
-#[test]
-fn reverse_line_feed_after_scroll_display_resets_offset() {
-    let mut grid = Grid::with_scrollback(10, 10, 20);
-
-    for row in 0..10 {
-        grid.set_cursor(row, 0);
-        grid.write_char((b'A' + row as u8) as char);
-    }
-    grid.set_cursor(9, 0);
-    for _ in 0..5 {
-        grid.line_feed();
-    }
-
-    grid.set_scroll_region(2, 7);
-    grid.set_cursor(2, 0);
-
-    grid.scroll_display(3);
-    assert!(grid.display_offset() > 0, "should be scrolled back");
-
-    grid.reverse_line_feed();
-
-    assert_eq!(grid.display_offset(), 0, "should snap to live view");
-    assert_eq!(grid.cursor_row(), 2, "cursor stays at top of region");
-    grid.assert_invariants();
-}
-
-/// write_char_wrap at end of line in a scroll region with a nonzero
-/// display_offset does not panic.
-#[test]
-fn write_char_wrap_after_scroll_display_resets_offset() {
-    let mut grid = Grid::with_scrollback(10, 10, 20);
-
-    for row in 0..10 {
-        grid.set_cursor(row, 0);
-        grid.write_char((b'A' + row as u8) as char);
-    }
-    grid.set_cursor(9, 0);
-    for _ in 0..5 {
-        grid.line_feed();
-    }
-
-    grid.set_scroll_region(2, 7);
-    grid.set_cursor(7, 9);
-
-    grid.scroll_display(3);
-    assert!(grid.display_offset() > 0, "should be scrolled back");
-
-    grid.write_char_wrap('X');
-    grid.resolve_pending_wrap();
-
-    assert_eq!(grid.display_offset(), 0, "should snap to live view");
-    grid.assert_invariants();
-}
-
-/// scroll_region_up with a nonzero display_offset self-heals.
-#[test]
-fn scroll_region_up_direct_with_nonzero_display_offset() {
-    let mut grid = Grid::with_scrollback(10, 10, 20);
-
-    for row in 0..10 {
-        grid.set_cursor(row, 0);
-        grid.write_char((b'A' + row as u8) as char);
-    }
-    grid.set_cursor(9, 0);
-    for _ in 0..5 {
-        grid.line_feed();
-    }
-
-    grid.set_scroll_region(2, 7);
-    grid.scroll_display(3);
-    assert!(grid.display_offset() > 0);
-
-    grid.scroll_region_up(1);
-    assert_eq!(grid.display_offset(), 0);
-    grid.assert_invariants();
-}
-
-/// set_scroll_region with top == bottom falls back to full screen.
-#[test]
-fn scroll_region_degenerate_top_equals_bottom() {
-    let mut grid = Grid::new(5, 10);
-    fill_grid_rows(&mut grid, 5);
-
-    grid.set_scroll_region(2, 2);
-
-    assert!(
-        grid.scroll_region().is_full(5),
-        "degenerate region should fall back to full screen"
-    );
 }
 
 // Targeted damage: mark_rows instead of mark_full
@@ -765,140 +553,5 @@ fn scroll_up_mixed_phase_scrollback_content() {
         "scrollback should have at least 2 lines from Phase 2 eviction, got {line_count}"
     );
 
-    grid.assert_invariants();
-}
-
-// Degenerate single-row scroll region: top == bottom
-
-/// scroll_region_up with top == bottom must be a no-op: line content preserved.
-#[test]
-fn scroll_region_up_top_equals_bottom_is_noop() {
-    let mut grid = Grid::new(6, 10);
-    fill_grid_rows(&mut grid, 6);
-
-    // Bypass set_scroll_region validation (DECSTBM rejects top == bottom).
-    grid.storage.cursor_state.scroll_region = ScrollRegion { top: 3, bottom: 3 };
-
-    grid.scroll_region_up(1);
-
-    for row in 0..6u16 {
-        assert_eq!(
-            grid.cell(row, 0).unwrap().char(),
-            (b'A' + row as u8) as char,
-            "row {row} should be unchanged after degenerate scroll_region_up",
-        );
-    }
-    grid.assert_invariants();
-}
-
-/// scroll_region_down with top == bottom must be a no-op: line content preserved.
-#[test]
-fn scroll_region_down_top_equals_bottom_is_noop() {
-    let mut grid = Grid::new(6, 10);
-    fill_grid_rows(&mut grid, 6);
-
-    grid.storage.cursor_state.scroll_region = ScrollRegion { top: 3, bottom: 3 };
-
-    grid.scroll_region_down(1);
-
-    for row in 0..6u16 {
-        assert_eq!(
-            grid.cell(row, 0).unwrap().char(),
-            (b'A' + row as u8) as char,
-            "row {row} should be unchanged after degenerate scroll_region_down",
-        );
-    }
-    grid.assert_invariants();
-}
-
-/// scroll_region_up_margined with top == bottom must be a no-op.
-#[test]
-fn scroll_region_up_margined_top_equals_bottom_is_noop() {
-    let mut grid = Grid::new(6, 10);
-    fill_grid_rows(&mut grid, 6);
-
-    grid.storage.cursor_state.scroll_region = ScrollRegion { top: 3, bottom: 3 };
-
-    grid.scroll_region_up_margined(1, 2, 5);
-
-    for row in 0..6u16 {
-        assert_eq!(
-            grid.cell(row, 0).unwrap().char(),
-            (b'A' + row as u8) as char,
-            "row {row} should be unchanged after degenerate scroll_region_up_margined",
-        );
-    }
-    grid.assert_invariants();
-}
-
-/// scroll_region_down_margined with top == bottom must be a no-op.
-#[test]
-fn scroll_region_down_margined_top_equals_bottom_is_noop() {
-    let mut grid = Grid::new(6, 10);
-    fill_grid_rows(&mut grid, 6);
-
-    grid.storage.cursor_state.scroll_region = ScrollRegion { top: 3, bottom: 3 };
-
-    grid.scroll_region_down_margined(1, 2, 5);
-
-    for row in 0..6u16 {
-        assert_eq!(
-            grid.cell(row, 0).unwrap().char(),
-            (b'A' + row as u8) as char,
-            "row {row} should be unchanged after degenerate scroll_region_down_margined",
-        );
-    }
-    grid.assert_invariants();
-}
-
-/// Normal scroll_region_up with top < bottom still works.
-#[test]
-fn scroll_region_up_normal_still_works() {
-    let mut grid = Grid::new(6, 10);
-    fill_grid_rows(&mut grid, 6);
-
-    grid.set_scroll_region(2, 4);
-    grid.scroll_region_up(1);
-
-    assert_eq!(grid.cell(0, 0).unwrap().char(), 'A', "row 0 preserved");
-    assert_eq!(grid.cell(1, 0).unwrap().char(), 'B', "row 1 preserved");
-    assert_eq!(
-        grid.cell(2, 0).unwrap().char(),
-        'D',
-        "row 3 shifted to row 2"
-    );
-    assert_eq!(
-        grid.cell(3, 0).unwrap().char(),
-        'E',
-        "row 4 shifted to row 3"
-    );
-    assert!(grid.row(4).unwrap().is_empty(), "bottom of region cleared");
-    assert_eq!(grid.cell(5, 0).unwrap().char(), 'F', "row 5 preserved");
-    grid.assert_invariants();
-}
-
-/// Normal scroll_region_down with top < bottom still works.
-#[test]
-fn scroll_region_down_normal_still_works() {
-    let mut grid = Grid::new(6, 10);
-    fill_grid_rows(&mut grid, 6);
-
-    grid.set_scroll_region(2, 4);
-    grid.scroll_region_down(1);
-
-    assert_eq!(grid.cell(0, 0).unwrap().char(), 'A', "row 0 preserved");
-    assert_eq!(grid.cell(1, 0).unwrap().char(), 'B', "row 1 preserved");
-    assert!(grid.row(2).unwrap().is_empty(), "top of region cleared");
-    assert_eq!(
-        grid.cell(3, 0).unwrap().char(),
-        'C',
-        "row 2 shifted to row 3"
-    );
-    assert_eq!(
-        grid.cell(4, 0).unwrap().char(),
-        'D',
-        "row 3 shifted to row 4"
-    );
-    assert_eq!(grid.cell(5, 0).unwrap().char(), 'F', "row 5 preserved");
     grid.assert_invariants();
 }

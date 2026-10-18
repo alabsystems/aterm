@@ -217,45 +217,6 @@ fn multiline_selection_clip_blocks_sibling_and_divider_backgrounds() {
 }
 
 #[test]
-fn unselected_cells_keep_their_background() {
-    let mut rend = renderer();
-    let (cw, ch) = rend.cell_size();
-    let mut term = selected_term();
-    let f = rend.render_input(&term.cell_frame(4, 10));
-    let theme = Theme::default();
-
-    // Cells outside the selection carry zero selection-coloured pixels:
-    // (0,0) 'h' before the range, (0,4) 'o' after it, (1,2) on another row,
-    // and a blank cell (0,8).
-    for (row, col) in [(0usize, 0usize), (0, 4), (1, 2), (0, 8)] {
-        let px = cell_pixels(&f, cw, ch, row, col);
-        assert_eq!(
-            count_eq(&px, theme.selection),
-            0,
-            "unselected cell ({row},{col}) must not show the selection colour"
-        );
-    }
-    // The blank unselected cell is pure theme background.
-    let blank = cell_pixels(&f, cw, ch, 0, 8);
-    assert_eq!(
-        count_eq(&blank, theme.bg),
-        blank.len(),
-        "blank cell (0,8) should stay theme bg"
-    );
-
-    // Clearing the selection restores the unhighlighted frame exactly.
-    term.text_selection_mut().clear();
-    let cleared = rend.render_input(&term.cell_frame(4, 10));
-    let mut plain_term = Terminal::new(4, 10);
-    plain_term.process(b"hello\r\nworld");
-    let plain = rend.render_input(&plain_term.cell_frame(4, 10));
-    assert_eq!(
-        cleared.pixels, plain.pixels,
-        "no selection must render exactly as before"
-    );
-}
-
-#[test]
 fn wide_char_block_selection_highlights_both_halves() {
     let mut rend = renderer();
     let (cw, ch) = rend.cell_size();

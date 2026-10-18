@@ -18,9 +18,12 @@
 //! it verifies its own download — the signed digest before any parse, the signed
 //! `tree_root` after the extract ([`super::verify_and_stage`]) — so a prefetched archive is
 //! never a shortcut past a gate. Everything that moves the store stays on the pass's thread:
-//! the stage, the flip, the status rows, the fault tally. A download that failed here comes
-//! back to the pass as its own fetch failure and is counted there (`note_fetch_fault`), so
-//! the offline verdict reads one tally as before.
+//! the stage, the flip, the status rows, the fault tally. A download that failed here does
+//! not stop the lane, and is not the pass's answer: the lane goes on to the next archive, and
+//! the pass fetches the failed one itself when it reaches it — continuing its `.part` — and
+//! counts that download's own fault, if any (`note_fetch_fault`), so the offline verdict
+//! reads one tally as before. One dropped transfer on a flaky link costs that archive a
+//! second try, not the rest of the set its download ahead.
 //!
 //! What it fetches is decided before any byte moves ([`Ahead::plan`]): every member of a
 //! unit, admitted as the pass will admit it (the pin, the verified manifest bound to it, the
@@ -33,7 +36,8 @@
 //!
 //! The moment its last archive is in is news to the pass's other lanes: the link is then
 //! free of the set's bytes, and the set completion's agents take it while the pass is still
-//! extracting and flipping ([`Ahead::all_fetched`], asked after every download that lands).
+//! extracting and flipping ([`Ahead::all_fetched`], asked after every download that lands —
+//! the pass's own of an archive this lane failed included, [`fetched_inline`]).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -72,9 +76,14 @@ enum Slot {
     Wanted,
     /// Downloading.
     Running,
-    /// Downloaded, or failed; not yet taken by the pass.
-    Done(Result<(), String>),
-    /// The pass has it: the answer, or the download itself when it fetched inline.
+    /// Downloaded; not yet taken by the pass.
+    Done,
+    /// This lane's download failed; not yet taken. The pass fetches it itself.
+    Failed,
+    /// The pass is fetching it itself, after this lane's download failed: its success counts
+    /// toward [`Ahead::all_fetched`] ([`fetched_inline`]).
+    Inline,
+    /// The pass has it: the archive, or the download itself when it fetched inline.
     Taken,
     /// Never fetched here — skipped (the pass's own gates decide the member), or left behind
     /// by a unit the pass is done with.
@@ -90,9 +99,10 @@ struct State {
     current: Option<usize>,
     /// The units the pass is done with.
     passed: BTreeSet<usize>,
-    /// Whether this lane's download of each job succeeded ([`Ahead::all_fetched`]).
+    /// Whether each job's archive is in, fetched by this lane — or by the pass after this
+    /// lane's download of it failed ([`Ahead::all_fetched`]).
     fetched: Vec<bool>,
-    /// No more downloads start: the pass ended, a download failed, or the thread is gone.
+    /// No more downloads start: the pass ended, or the thread is gone.
     halted: bool,
 }
 
@@ -186,39 +196,64 @@ impl Ahead {
     /// The worker: fetch job after job until none is left to fetch or the lane halts. Run on
     /// a thread of its own inside the pass (its store lock, its progress pass lent to it),
     /// with `fetcher` shared; the pass thread enters the lane before it stages anything.
-    /// `landed` is told, on this thread, after each archive this lane fetched is in.
+    /// `landed` is told, on this thread, after each archive this lane fetched is in, and
+    /// after each the pass fetched itself once this lane's download of it failed.
     pub(crate) fn work(&self, fetcher: &dyn Fetcher, layout: &Layout, landed: &dyn Fn(&Self)) {
+        self.work_with_bump(fetcher, landed, || crate::progress::read_bump(layout));
+    }
+
+    fn work_with_bump(
+        &self,
+        fetcher: &dyn Fetcher,
+        landed: &dyn Fn(&Self),
+        read_bump: impl Fn() -> Vec<String>,
+    ) {
         let _gone = Gone(self);
+        let mut told = 0usize;
         loop {
+            let now_in = self.archives_in();
+            if now_in > told {
+                told = now_in;
+                landed(self);
+            }
             // Read outside the lock, every time a job is chosen: a person's bump reorders
             // what has not started, as the pass's own read between units does.
-            let bump = crate::progress::read_bump(layout);
+            let bump = read_bump();
             let i = match self.next(&bump) {
                 Next::Fetch(i) => i,
                 Next::Again => continue,
-                Next::Exit => return,
+                Next::Exit => {
+                    // An inline success can land after the loop's count and before next's
+                    // final locked decision. Tell it before leaving, outside the lock.
+                    if self.archives_in() > told {
+                        landed(self);
+                    }
+                    return;
+                }
             };
             let answer = fetch_ahead(fetcher, &self.jobs[i]);
             let Ok(mut state) = self.state.lock() else {
                 return;
             };
-            let fetched = matches!(answer, Some(Ok(())));
-            state.fetched[i] = fetched;
+            state.fetched[i] = matches!(answer, Some(Ok(())));
             state.slots[i] = match answer {
-                Some(fetched) => {
-                    // A failed download stops the lane: the link is the likeliest cause, and
-                    // the pass then fetches the rest itself, as it always did.
-                    state.halted |= fetched.is_err();
-                    Slot::Done(fetched)
-                }
+                Some(Ok(())) => Slot::Done,
+                // NOT A HALT: the next archive is fetched as planned, and this one is the
+                // pass's to fetch when it reaches it ([`Ahead::claim`]), its own fault counted
+                // there if its download fails too.
+                Some(Err(_)) => Slot::Failed,
                 None => Slot::Dropped,
             };
             drop(state);
             self.changed.notify_all();
-            if fetched {
-                landed(self);
-            }
         }
+    }
+
+    /// How many of the jobs' archives are in ([`State::fetched`]).
+    fn archives_in(&self) -> usize {
+        self.state
+            .lock()
+            .map_or(0, |state| state.fetched.iter().filter(|f| **f).count())
     }
 
     /// Whether every archive this lane holds is in, each fetched by this lane — whatever the
@@ -238,6 +273,17 @@ impl Ahead {
     /// The job to fetch next, marked running; waits once when the budget is spent or the
     /// pass has not caught up.
     fn next(&self, bump: &[String]) -> Next {
+        self.next_with_wait(bump, |state| match self.changed.wait(state) {
+            Ok(_) => Next::Again,
+            Err(_) => Next::Exit,
+        })
+    }
+
+    fn next_with_wait<'a>(
+        &'a self,
+        bump: &[String],
+        wait: impl FnOnce(std::sync::MutexGuard<'a, State>) -> Next,
+    ) -> Next {
         let Ok(mut state) = self.state.lock() else {
             return Next::Exit;
         };
@@ -245,12 +291,22 @@ impl Ahead {
             return Next::Exit;
         }
         let Some(i) = self.pick(&state, bump) else {
+            // Nothing left to start. The pass's own download of an archive this lane failed
+            // is still news to tell ([`fetched_inline`]): wait for it, until the pass is done.
+            if state
+                .slots
+                .iter()
+                .any(|s| matches!(s, Slot::Failed | Slot::Inline))
+            {
+                return wait(state);
+            }
             return Next::Exit;
         };
         let fits = || {
             let ahead = (0..self.jobs.len())
                 .filter(|&k| {
-                    !state.claimed[k] && matches!(state.slots[k], Slot::Running | Slot::Done(_))
+                    !state.claimed[k]
+                        && matches!(state.slots[k], Slot::Running | Slot::Done | Slot::Failed)
                 })
                 .map(|k| self.jobs[k].artifact.size)
                 .fold(0u64, u64::saturating_add);
@@ -260,10 +316,7 @@ impl Ahead {
             state.slots[i] = Slot::Running;
             return Next::Fetch(i);
         }
-        match self.changed.wait(state) {
-            Ok(_) => Next::Again,
-            Err(_) => Next::Exit,
-        }
+        wait(state)
     }
 
     /// The job the pass will want soonest among those not started: the one it is waiting
@@ -301,11 +354,12 @@ impl Ahead {
         units.into_iter().find_map(queued_in)
     }
 
-    /// On the pass thread: take `program`'s archive at `dl` from this lane. `Some` with the
-    /// download's own answer when this lane fetched it — waiting for it when it is still
-    /// moving, or when it had not started and the lane is idle, which then fetches it at
-    /// once. `None` when the pass fetches it itself, as it would with no lane: no such job,
-    /// a lane that halted or is busy with another archive, or a job it skipped.
+    /// On the pass thread: take `program`'s archive at `dl` from this lane. `Some(Ok(()))` when
+    /// this lane fetched it — waiting for it when it is still moving, or when it had not
+    /// started and the lane is idle, which then fetches it at once. `None` when the pass
+    /// fetches it itself, as it would with no lane: no such job, a lane that halted or is
+    /// busy with another archive, a job it skipped — or one whose download here failed,
+    /// which the pass then tries itself (reporting a success, [`fetched_inline`]).
     ///
     /// A job for `program` at ANOTHER path — a singleton's own resolve found a newer pin
     /// than the plan's — never stands in for the pass's archive, and never moves beside it:
@@ -321,7 +375,11 @@ impl Ahead {
         self.changed.notify_all();
         loop {
             match std::mem::replace(&mut state.slots[i], Slot::Taken) {
-                Slot::Done(fetched) => return ours.then_some(fetched),
+                Slot::Done => return ours.then_some(Ok(())),
+                Slot::Failed if ours => {
+                    state.slots[i] = Slot::Inline;
+                    return None;
+                }
                 Slot::Running => state.slots[i] = Slot::Running,
                 Slot::Queued | Slot::Wanted
                     if ours
@@ -332,7 +390,12 @@ impl Ahead {
                     self.changed.notify_all();
                 }
                 // Left `Taken`: the pass fetches it, and this lane never will.
-                Slot::Queued | Slot::Wanted | Slot::Taken | Slot::Dropped => return None,
+                Slot::Queued
+                | Slot::Wanted
+                | Slot::Failed
+                | Slot::Inline
+                | Slot::Taken
+                | Slot::Dropped => return None,
             }
             state = self.changed.wait(state).ok()?;
         }
@@ -365,9 +428,31 @@ impl Ahead {
         self.jobs
             .iter()
             .zip(&state.slots)
-            .filter(|(_, slot)| matches!(slot, Slot::Done(_) | Slot::Running))
+            .filter(|(_, slot)| matches!(slot, Slot::Done | Slot::Failed | Slot::Running))
             .map(|(job, _)| (job.program.clone(), job.artifact.asset.clone()))
             .collect()
+    }
+
+    /// On the pass thread: its own download of `program`'s archive at `dl` — one this lane's
+    /// download failed ([`Slot::Inline`]) — is in. The archive counts as fetched, and the
+    /// worker tells `landed` so ([`Ahead::work`]).
+    fn fetched_inline(&self, program: &str, dl: &Path) {
+        let Some(i) = self
+            .jobs
+            .iter()
+            .position(|j| j.program == program && j.dl == dl)
+        else {
+            return;
+        };
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if matches!(state.slots[i], Slot::Inline) {
+            state.slots[i] = Slot::Taken;
+            state.fetched[i] = true;
+            drop(state);
+            self.changed.notify_all();
+        }
     }
 
     /// On the pass thread: route its member fetches through this lane ([`claim`]) until the
@@ -425,6 +510,15 @@ thread_local! {
 /// every call off a thread that entered a lane.
 pub(crate) fn claim(program: &str, dl: &Path) -> Option<Result<(), String>> {
     PASS.with(|pass| pass.borrow().clone())?.claim(program, dl)
+}
+
+/// On the pass thread, after its own download of `program`'s archive to `dl` succeeded: news
+/// for the lane when its download of that archive had failed ([`Ahead::fetched_inline`]);
+/// nothing anywhere else.
+pub(crate) fn fetched_inline(program: &str, dl: &Path) {
+    if let Some(lane) = PASS.with(|pass| pass.borrow().clone()) {
+        lane.fetched_inline(program, dl);
+    }
 }
 
 /// One member's [`Job`], or `None` when the pass would not fetch its archive as it stands.
@@ -507,4 +601,243 @@ fn fetch_ahead(fetcher: &dyn Fetcher, job: &Job) -> Option<Result<(), String>> {
         }
     }
     Some(fetched)
+}
+
+#[cfg(test)]
+mod callback_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    struct NoFetch;
+
+    impl Fetcher for NoFetch {
+        fn index_candidates(&self) -> Result<Vec<crate::select::Candidate>, String> {
+            panic!("the prepared lane never resolves an index");
+        }
+
+        fn pkg_manifest(
+            &self,
+            _repo: &str,
+            _program: &str,
+            _build: u64,
+        ) -> Result<(Vec<u8>, Vec<u8>), String> {
+            panic!("the prepared lane never resolves a package");
+        }
+
+        fn download(&self, _repo: &str, _asset: &str, _dest: &Path) -> Result<(), String> {
+            panic!("these completed or inline jobs never download on the worker");
+        }
+    }
+
+    fn lane(slots: Vec<Slot>, sizes: &[u64], budget: u64) -> Ahead {
+        assert_eq!(slots.len(), sizes.len());
+        let jobs = sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &size)| Job {
+                unit: i,
+                program: format!("p{i}"),
+                pinned: 1,
+                repo: "model/repository".to_string(),
+                artifact: crate::manifest::Artifact {
+                    target: "model-target".to_string(),
+                    kind: "binary".to_string(),
+                    protocol: "github-release".to_string(),
+                    asset: format!("p{i}.tar.zst"),
+                    sha256: String::new(),
+                    sha512: String::new(),
+                    tree_root: String::new(),
+                    size,
+                    reloc: "self-contained".to_string(),
+                    cost: crate::manifest::Cost::default(),
+                    url: String::new(),
+                    payload: String::new(),
+                    entry: String::new(),
+                    strip_components: 0,
+                    links: Default::default(),
+                    vendor: String::new(),
+                    provenance: None,
+                },
+                dl: PathBuf::from(format!("/model/p{i}/p{i}.tar.zst")),
+            })
+            .collect();
+        let n = sizes.len();
+        Ahead {
+            jobs,
+            budget,
+            state: Mutex::new(State {
+                slots,
+                claimed: vec![false; n],
+                current: None,
+                passed: BTreeSet::new(),
+                fetched: vec![false; n],
+                halted: false,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn notices(lane: &Ahead, read_bump: impl Fn() -> Vec<String>) -> usize {
+        let count = Cell::new(0);
+        lane.work_with_bump(
+            &NoFetch,
+            &|seen| {
+                // A callback may re-enter this exact lane: no state lock is held.
+                assert!(seen.all_fetched(&[0]));
+                count.set(count.get() + 1);
+            },
+            read_bump,
+        );
+        count.get()
+    }
+
+    #[test]
+    fn a_last_inline_archive_is_announced_before_the_worker_leaves() {
+        let already_in = lane(vec![Slot::Failed], &[7], 7);
+        let dl = already_in.jobs[0].dl.clone();
+        assert!(already_in.claim("p0", &dl).is_none());
+        already_in.fetched_inline("p0", &dl);
+        assert_eq!(notices(&already_in, Vec::new), 1);
+
+        let refused = lane(vec![Slot::Failed], &[7], 7);
+        assert_eq!(
+            notices(&refused, || {
+                assert!(refused.claim("p0", &refused.jobs[0].dl).is_none());
+                refused.halt();
+                Vec::new()
+            }),
+            0
+        );
+
+        let wrong_path = lane(vec![Slot::Failed], &[7], 7);
+        assert_eq!(
+            notices(&wrong_path, || {
+                assert!(wrong_path.claim("p0", &wrong_path.jobs[0].dl).is_none());
+                wrong_path.fetched_inline("p0", Path::new("/model/another.tar.zst"));
+                wrong_path.halt();
+                Vec::new()
+            }),
+            0
+        );
+
+        let last_inline = lane(vec![Slot::Failed], &[7], 7);
+        let bump_reads = Cell::new(0);
+        let count = notices(&last_inline, || {
+            bump_reads.set(bump_reads.get() + 1);
+            assert!(last_inline.claim("p0", &last_inline.jobs[0].dl).is_none());
+            last_inline.fetched_inline("p0", &last_inline.jobs[0].dl);
+            Vec::new()
+        });
+        assert_eq!(bump_reads.get(), 1);
+        assert!(last_inline.all_fetched(&[0]));
+        assert!(last_inline.state.lock().unwrap().halted);
+        assert_eq!(
+            count, 1,
+            "LAST_INLINE_ARCHIVE_MUST_BE_ANNOUNCED_BEFORE_EXIT"
+        );
+    }
+}
+
+#[cfg(test)]
+mod reservation_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn lane(slots: Vec<Slot>, sizes: &[u64], budget: u64) -> Ahead {
+        assert_eq!(slots.len(), sizes.len());
+        let jobs = sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &size)| Job {
+                unit: i,
+                program: format!("p{i}"),
+                pinned: 1,
+                repo: "model/repository".to_string(),
+                artifact: crate::manifest::Artifact {
+                    target: "model-target".to_string(),
+                    kind: "binary".to_string(),
+                    protocol: "github-release".to_string(),
+                    asset: format!("p{i}.tar.zst"),
+                    sha256: String::new(),
+                    sha512: String::new(),
+                    tree_root: String::new(),
+                    size,
+                    reloc: "self-contained".to_string(),
+                    cost: crate::manifest::Cost::default(),
+                    url: String::new(),
+                    payload: String::new(),
+                    entry: String::new(),
+                    strip_components: 0,
+                    links: Default::default(),
+                    vendor: String::new(),
+                    provenance: None,
+                },
+                dl: PathBuf::from(format!("/model/p{i}/p{i}.tar.zst")),
+            })
+            .collect();
+        let n = sizes.len();
+        Ahead {
+            jobs,
+            budget,
+            state: Mutex::new(State {
+                slots,
+                claimed: vec![false; n],
+                current: None,
+                passed: BTreeSet::new(),
+                fetched: vec![false; n],
+                halted: false,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn next_without_wait(lane: &Ahead) -> (Next, bool) {
+        let waited = Cell::new(false);
+        let next = lane.next_with_wait(&[], |state| {
+            waited.set(true);
+            drop(state);
+            Next::Again
+        });
+        (next, waited.get())
+    }
+
+    #[test]
+    fn failed_partial_bytes_hold_the_budget_until_the_pass_takes_them() {
+        const MIB: u64 = 1 << 20;
+        let complete = lane(vec![Slot::Done, Slot::Queued], &[400 * MIB; 2], 512 * MIB);
+        let (next, waited) = next_without_wait(&complete);
+        assert!(matches!(next, Next::Again) && waited);
+        assert!(matches!(
+            complete.state.lock().unwrap().slots[1],
+            Slot::Queued
+        ));
+
+        let taken = lane(vec![Slot::Failed, Slot::Queued], &[400 * MIB; 2], 512 * MIB);
+        assert!(taken.claim("p0", &taken.jobs[0].dl).is_none());
+        assert!(taken.state.lock().unwrap().claimed[0]);
+        let (next, waited) = next_without_wait(&taken);
+        assert!(matches!(next, Next::Fetch(1)) && !waited);
+
+        let room = lane(
+            vec![Slot::Failed, Slot::Queued],
+            &[100 * MIB, 400 * MIB],
+            512 * MIB,
+        );
+        let (next, waited) = next_without_wait(&room);
+        assert!(matches!(next, Next::Fetch(1)) && !waited);
+
+        let stopped = lane(vec![Slot::Failed, Slot::Queued], &[400 * MIB; 2], 512 * MIB);
+        stopped.halt();
+        let (next, waited) = next_without_wait(&stopped);
+        assert!(matches!(next, Next::Exit) && !waited);
+
+        let partial = lane(vec![Slot::Failed, Slot::Queued], &[400 * MIB; 2], 512 * MIB);
+        let (next, waited) = next_without_wait(&partial);
+        let still_queued = matches!(partial.state.lock().unwrap().slots[1], Slot::Queued);
+        let retained = partial.untaken() == vec![("p0".to_string(), "p0.tar.zst".to_string())];
+        assert!(
+            matches!(next, Next::Again) && waited && still_queued && retained,
+            "FAILED_PARTIAL_BYTES_MUST_HOLD_THE_AHEAD_RESERVATION"
+        );
+    }
 }

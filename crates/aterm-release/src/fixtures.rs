@@ -12,7 +12,10 @@
 //!   the reserved identity's pins (release commit C and build n, and the prover's
 //!   `TRUST_STAGE2_BIN`) into the release cache, self-checking every desk against the
 //!   release's own consumer. A refusal, or a missing required desk, refuses the release
-//!   with nothing claimed.
+//!   with nothing claimed. It compiles in a target directory of its own, made afresh
+//!   and removed after: `-p aterm-gui` resolves its dependencies' features apart from
+//!   `verify release`'s `--workspace` compile, so the two never share a unit, and a
+//!   whole-workspace compile beside the build is not short work.
 //! * [`land`], after the cut: one commit on origin/main's tip adding `vX.Y.0/`
 //!   and its `PINNED_DESKS` rows, pushed as a compare-and-swap like the claim's
 //!   ([`crate::ledger::claim`]). A tip that already holds them is a no-op, so a re-run

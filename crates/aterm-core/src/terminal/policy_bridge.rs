@@ -177,56 +177,22 @@ mod tests {
         one_rule_policy(sequence, response, origin_min, Response::Drop)
     }
 
+    /// The bridge's decision tree, for both bridges: no engine and no matching
+    /// rule fall back to the host bool; a matching `Execute` allows and any
+    /// other response denies; the deny-by-default bridge treats only a
+    /// universal wildcard `Execute` as a fallback.
     #[test]
-    fn decision_none_engine_yields_fallback() {
-        let seq = DispatchedSequence::osc(52, ["c".to_owned(), "?".to_owned()]);
-        assert_eq!(
-            engine_decision(None, &seq, OriginTag::Pty),
-            BridgeDecision::Fallback,
-        );
-    }
-
-    #[test]
-    fn decision_matching_execute_rule_allows() {
-        let policy = policy_with_rule(
-            "OSC 52 query",
-            Response::Execute,
-            OriginTag::NetworkUntrusted,
-        );
-        let engine = PolicyEngine::new(policy);
-        let seq = DispatchedSequence::osc(52, ["c".to_owned(), "?".to_owned()]);
-        assert_eq!(
-            engine_decision(Some(&engine), &seq, OriginTag::Pty),
-            BridgeDecision::Allow,
-        );
-    }
-
-    #[test]
-    fn decision_matching_drop_rule_denies() {
-        let policy = policy_with_rule("OSC 52 query", Response::Drop, OriginTag::NetworkUntrusted);
-        let engine = PolicyEngine::new(policy);
-        let seq = DispatchedSequence::osc(52, ["c".to_owned(), "?".to_owned()]);
-        assert_eq!(
-            engine_decision(Some(&engine), &seq, OriginTag::Pty),
-            BridgeDecision::Deny,
-        );
-    }
-
-    #[test]
-    fn decision_matching_warn_rule_denies() {
-        let policy = policy_with_rule("OSC 52 query", Response::Warn, OriginTag::NetworkUntrusted);
-        let engine = PolicyEngine::new(policy);
-        let seq = DispatchedSequence::osc(52, ["c".to_owned(), "?".to_owned()]);
-        assert_eq!(
-            engine_decision(Some(&engine), &seq, OriginTag::Pty),
-            BridgeDecision::Deny,
-        );
-    }
-
-    #[test]
-    fn decision_no_rule_match_yields_fallback() {
-        // Empty rule set → engine always falls through to `defaults.unmatched`.
-        let policy = Policy {
+    fn the_bridge_decision_tree() {
+        let set = DispatchedSequence::osc(52, ["c".to_owned(), "SGVsbG8=".to_owned()]);
+        let query = DispatchedSequence::osc(52, ["c".to_owned(), "?".to_owned()]);
+        let rule = |sequence, response| {
+            Some(PolicyEngine::new(policy_with_rule(
+                sequence,
+                response,
+                OriginTag::NetworkUntrusted,
+            )))
+        };
+        let empty = Some(PolicyEngine::new(Policy {
             schema_version: SCHEMA_VERSION,
             profile: Profile::Standard,
             defaults: Defaults {
@@ -235,71 +201,70 @@ mod tests {
             },
             rules: vec![],
             rate_limits: vec![],
-        };
-        let engine = PolicyEngine::new(policy);
-        let seq = DispatchedSequence::osc(52, ["c".to_owned(), "?".to_owned()]);
-        assert_eq!(
-            engine_decision(Some(&engine), &seq, OriginTag::Pty),
-            BridgeDecision::Fallback,
-        );
+        }));
+        // The standard profile's `response any` wildcard catches an OSC 52 set
+        // whose own rule's origin gate (User or higher) a PTY fails.
+        let standard = Some(PolicyEngine::new(profiles::standard()));
+        use BridgeDecision::{Allow, Deny, Fallback};
+        // (case, engine, sequence, plain bridge, deny-by-default bridge)
+        let cases: [(&str, Option<PolicyEngine>, &DispatchedSequence, _, _); 8] = [
+            ("no engine", None, &query, Fallback, Fallback),
+            (
+                "execute",
+                rule("OSC 52 query", Response::Execute),
+                &query,
+                Allow,
+                Allow,
+            ),
+            (
+                "drop",
+                rule("OSC 52 query", Response::Drop),
+                &query,
+                Deny,
+                Deny,
+            ),
+            (
+                "warn",
+                rule("OSC 52 query", Response::Warn),
+                &query,
+                Deny,
+                Deny,
+            ),
+            ("no rule", empty, &query, Fallback, Fallback),
+            ("wildcard execute", standard, &set, Allow, Fallback),
+            (
+                "explicit execute",
+                rule("OSC 52 set", Response::Execute),
+                &set,
+                Allow,
+                Allow,
+            ),
+            (
+                "wildcard drop",
+                rule("response any", Response::Drop),
+                &set,
+                Deny,
+                Deny,
+            ),
+        ];
+        for (case, engine, seq, plain, deny_by_default) in cases {
+            assert_eq!(
+                engine_decision(engine.as_ref(), seq, OriginTag::Pty),
+                plain,
+                "{case}"
+            );
+            assert_eq!(
+                engine_decision_deny_by_default_capability(engine.as_ref(), seq, OriginTag::Pty),
+                deny_by_default,
+                "{case}: deny-by-default"
+            );
+        }
     }
 
     #[test]
-    fn decision_origin_gate_failure_falls_through_to_wildcard() {
-        // An OSC 52 set from Pty fails the Standard set rule's User-or-higher origin gate, but
-        // the `response any = Execute` wildcard (origin_min NetworkUntrusted) catches it.
-        let engine = PolicyEngine::new(profiles::standard());
-        let seq = DispatchedSequence::osc(52, ["c".to_owned(), "SGVsbG8=".to_owned()]);
-        assert_eq!(
-            engine_decision(Some(&engine), &seq, OriginTag::Pty),
-            BridgeDecision::Allow,
-        );
-    }
-
-    #[test]
-    fn deny_by_default_bridge_treats_wildcard_execute_as_fallback() {
-        let engine = PolicyEngine::new(profiles::standard());
-        let seq = DispatchedSequence::osc(52, ["c".to_owned(), "SGVsbG8=".to_owned()]);
-        assert_eq!(
-            engine_decision_deny_by_default_capability(Some(&engine), &seq, OriginTag::Pty),
-            BridgeDecision::Fallback,
-        );
-    }
-
-    #[test]
-    fn deny_by_default_bridge_keeps_explicit_execute_authoritative() {
-        let policy = policy_with_rule("OSC 52 set", Response::Execute, OriginTag::NetworkUntrusted);
-        let engine = PolicyEngine::new(policy);
-        let seq = DispatchedSequence::osc(52, ["c".to_owned(), "SGVsbG8=".to_owned()]);
-        assert_eq!(
-            engine_decision_deny_by_default_capability(Some(&engine), &seq, OriginTag::Pty),
-            BridgeDecision::Allow,
-        );
-    }
-
-    #[test]
-    fn deny_by_default_bridge_keeps_wildcard_drop_authoritative() {
-        let policy = policy_with_rule("response any", Response::Drop, OriginTag::NetworkUntrusted);
-        let engine = PolicyEngine::new(policy);
-        let seq = DispatchedSequence::osc(52, ["c".to_owned(), "SGVsbG8=".to_owned()]);
-        assert_eq!(
-            engine_decision_deny_by_default_capability(Some(&engine), &seq, OriginTag::Pty),
-            BridgeDecision::Deny,
-        );
-    }
-
-    #[test]
-    fn resolve_allow_overrides_false_bool() {
+    fn resolve_overrides_the_bool_except_on_fallback() {
         assert!(BridgeDecision::Allow.resolve(false));
-    }
-
-    #[test]
-    fn resolve_deny_overrides_true_bool() {
         assert!(!BridgeDecision::Deny.resolve(true));
-    }
-
-    #[test]
-    fn resolve_fallback_defers_to_bool() {
         assert!(BridgeDecision::Fallback.resolve(true));
         assert!(!BridgeDecision::Fallback.resolve(false));
     }
@@ -324,18 +289,6 @@ mod tests {
         );
     }
 
-    /// With no policy engine the reply is emitted (default-allow).
-    #[test]
-    fn no_engine_still_replies() {
-        use crate::terminal::Terminal;
-        let mut term = Terminal::new(24, 80);
-        term.process(b"\x1b[c"); // DA1; no engine installed
-        assert!(
-            term.take_response().is_some(),
-            "with no policy engine the DA1 reply must be emitted unchanged (P4 default-allow)"
-        );
-    }
-
     /// The Kitty `a=q` probe reply goes through the same `send_response` sink as every PTY reply.
     #[test]
     fn drop_policy_suppresses_kitty_query_reply() {
@@ -351,18 +304,6 @@ mod tests {
         assert!(
             term.take_response().is_none(),
             "`response any = Drop` must suppress the Kitty a=q OK reply at the send_response sink"
-        );
-    }
-
-    /// Control: with no policy engine the a=q probe replies.
-    #[test]
-    fn no_engine_kitty_query_replies() {
-        use crate::terminal::Terminal;
-        let mut term = Terminal::new(24, 80);
-        term.process(b"\x1b_Ga=q,i=1\x1b\\");
-        assert!(
-            term.take_response().is_some(),
-            "with no policy engine the Kitty a=q reply must be emitted (default-allow)"
         );
     }
 }

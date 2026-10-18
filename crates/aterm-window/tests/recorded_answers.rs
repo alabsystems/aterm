@@ -7,7 +7,8 @@
 //! Recorded answers for the leaf types this crate absorbs in winit-core step 5
 //! (docs/AUDIT-third-party-2026-10-15.md, WC.5): `winit::dpi` (from `dpi` 0.1.2),
 //! `winit::window::CursorIcon` (from `cursor-icon` 1.2.0, the six icons aterm
-//! sets) and the `bitflags!` types (`bitflags` 2).
+//! sets, and the eight edge-resize icons LW.5 added) and the `bitflags!` types
+//! (`bitflags` 2).
 //!
 //! Every expected value below was recorded from the third-party crates while
 //! they were still what these paths named. The absorb then keeps this file
@@ -219,8 +220,10 @@ fn the_rounding_rows_reject_every_plausible_wrong_rounding() {
         .all(|&((w, h), sf, want)| ((w * sf).round() as u32, (h * sf).round() as u32) == want));
 }
 
-/// The six icons aterm sets.
-const CURSOR_ICONS: [IconRow; 6] = [
+/// The icons aterm sets: six from winit-core step 5, and the eight edge-resize icons of
+/// aterm's own Wayland frame (LW.5, 2026-10-17), recorded from cursor-icon 1.2.0's `name` and
+/// `alt_names` by a scratch crate outside the workspace.
+const CURSOR_ICONS: [IconRow; 14] = [
     (
         CursorIcon::Default,
         "default",
@@ -242,6 +245,14 @@ const CURSOR_ICONS: [IconRow; 6] = [
         &["split_v", "v_double_arrow", "sb_v_double_arrow"],
         "RowResize",
     ),
+    (CursorIcon::NResize, "n-resize", &["top_side"], "NResize"),
+    (CursorIcon::NeResize, "ne-resize", &["top_right_corner"], "NeResize"),
+    (CursorIcon::EResize, "e-resize", &["right_side"], "EResize"),
+    (CursorIcon::SeResize, "se-resize", &["bottom_right_corner"], "SeResize"),
+    (CursorIcon::SResize, "s-resize", &["bottom_side"], "SResize"),
+    (CursorIcon::SwResize, "sw-resize", &["bottom_left_corner"], "SwResize"),
+    (CursorIcon::WResize, "w-resize", &["left_side"], "WResize"),
+    (CursorIcon::NwResize, "nw-resize", &["top_left_corner"], "NwResize"),
 ];
 
 #[test]

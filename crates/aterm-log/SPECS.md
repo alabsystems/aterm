@@ -3,6 +3,10 @@
 
 # aterm-log: spec recovery from its 23 unit tests
 
+> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 11 tests it
+> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
+> were taken before.
+
 > Status 2026-10-16: this is the crate's migration worklist. The 10 specs below are each proved
 > through Trust/Clean, and then the tests each one subsumes are deleted. The 2 tests in §4 sample no
 > spec and can be deleted now.
@@ -49,51 +53,36 @@ Columns: `id`, `kind`, `functions`, `statement`, `subsumes (primary tests; secon
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
-level-severity-order	table-property	Level (derived PartialOrd/Ord), LevelFilter (derived PartialOrd/Ord)	∀ a,b ∈ Level: a < b ⇔ (a as usize) < (b as usize), with Error=1 < Warn=2 < Info=3 < Debug=4 < Trace=5. The same holds for LevelFilter, with Off=0 below every other variant. ∀ l ∈ Level: (l as usize) = (lf(l) as usize). This correspondence is what makes __log's `level as usize > MAX_LEVEL` compare like with like. The domain is finite (5×5 and 6×6), so the property is decidable by evaluation.	test_level_ordering, test_level_filter_ordering	EASY: fieldless #[repr(usize)] enums, derived PartialOrd (discriminant_value), `as usize` casts	1, 3
+level-severity-order	table-property	Level (derived PartialOrd/Ord), LevelFilter (derived PartialOrd/Ord)	∀ a,b ∈ Level: a < b ⇔ (a as usize) < (b as usize), with Error=1 < Warn=2 < Info=3 < Debug=4 < Trace=5. The same holds for LevelFilter, with Off=0 below every other variant. ∀ l ∈ Level: (l as usize) = (lf(l) as usize). This correspondence is what makes __log's `level as usize > MAX_LEVEL` compare like with like. The domain is finite (5×5 and 6×6), so the property is decidable by evaluation.	-	EASY: fieldless #[repr(usize)] enums, derived PartialOrd (discriminant_value), `as usize` casts	1, 3
 level-display-names	table-property	<Level as Display>::fmt, LevelFilter::parse	∀ l ∈ Level: l.to_string() = ascii_uppercase(NAMES[lf(l)]), i.e. "ERROR","WARN","INFO","DEBUG","TRACE". fmt writes exactly that string with one write_str and returns that call's result. Round trip: ∀ l: LevelFilter::parse(&l.to_string()) = Some(lf(l)).	test_level_display	MEDIUM: &mut fmt::Formatter, a Display trait impl, &str literals, String from to_string; the round trip composes with parse	1, 2, 3, 4
-level-filter-parse	contract	LevelFilter::parse	∀ s: &str, ∀ f ∈ LevelFilter: parse(s) = Some(f) ⇔ s.trim().eq_ignore_ascii_case(NAMES[f]); parse(s) = None ⇔ no f satisfies that. The names are pairwise distinct ignoring ASCII case, so the result is well defined. trim strips Unicode White_Space at both ends (§5.4); the match is ASCII-case-insensitive only.	test_parse_level_filter_names, test_parse_level_filter_case_and_whitespace, test_parse_level_filter_rejects_junk	MEDIUM: &str, str::trim (a char loop over Unicode whitespace), eq_ignore_ascii_case (a byte loop), an if-chain, Option<enum>	1, 3, 5, 7
-should-rotate-threshold	contract	should_rotate	∀ len: u64: should_rotate(len) ⇔ len > MAX_LOG_BYTES = 4·1024·1024 = 4194304.	test_should_rotate_threshold	TRIVIAL: one u64 comparison against a const; a straight-line admissible body	0
+level-filter-parse	contract	LevelFilter::parse	∀ s: &str, ∀ f ∈ LevelFilter: parse(s) = Some(f) ⇔ s.trim().eq_ignore_ascii_case(NAMES[f]); parse(s) = None ⇔ no f satisfies that. The names are pairwise distinct ignoring ASCII case, so the result is well defined. trim strips Unicode White_Space at both ends (§5.4); the match is ASCII-case-insensitive only.	-	MEDIUM: &str, str::trim (a char loop over Unicode whitespace), eq_ignore_ascii_case (a byte loop), an if-chain, Option<enum>	1, 3, 5, 7
+should-rotate-threshold	contract	should_rotate	∀ len: u64: should_rotate(len) ⇔ len > MAX_LOG_BYTES = 4·1024·1024 = 4194304.	(none; its test went when the spec was proved)	TRIVIAL: one u64 comparison against a const; a straight-line admissible body	0
 record-cap-by-level	contract	record_cap	∀ l ∈ Level: record_cap(l) = if l ≤ Level::Warn then MAX_ALERT_RECORD_BYTES (1024) else MAX_RECORD_BYTES (512). Hence record_cap(l) ≤ MAX_ALERT_RECORD_BYTES, which is sanitize_capped's precondition.	(shared: test_warn_and_error_keep_the_longer_cap)	EASY: an enum match with or-patterns, usize consts	1, 3
-sanitize-record	contract	sanitize_capped, sanitize_record, sanitize_record_for	∀ msg: &str, ∀ cap ≤ MAX_ALERT_RECORD_BYTES, let r = sanitize_capped(msg, cap). (a) Value: r.as_ref() = San(msg, cap). (b) Borrowing: r is Cow::Borrowed ⇔ (∀ c ∈ msg.chars(): ¬ctl(c)) ∧ msg.len() ≤ cap, and then r = Borrowed(msg), the same pointer. (c) Consequences of (a), stated for the proof: r has no control chars; r.len() ≤ cap + 3; if r ends with an added '…' then M(msg).len() > cap and r.len() > cap − 3; every char of r except an added final '…' is repl of the char at the same index of msg, so no code point is split; for Owned, out never outgrows its reservation: len ≤ OUT_CAPACITY = 1028 and capacity is unchanged. Wrappers: sanitize_record(m) = sanitize_capped(m, MAX_RECORD_BYTES); sanitize_record_for(l, m) = sanitize_capped(m, record_cap(l)).	test_warn_and_error_keep_the_longer_cap, test_sanitize_record_for_control_char_at_the_alert_boundary_stays_within_reservation, test_sanitize_record_clean_input_is_borrowed, test_sanitize_record_replaces_control_characters, test_sanitize_record_caps_length, test_sanitize_record_cap_respects_char_boundaries, test_sanitize_record_control_char_at_boundary_stays_within_reservation	MEDIUM-HARD: &str and Cow<'_, str> carriers; a chars() loop with break and the invariant out = Prefix of M over the chars consumed so far ∧ out.len() ≤ cap; String::with_capacity/push/len; char::is_control/len_utf8; saturating_add; usize::min; a call to record_cap (composition); a quantifier over chars	1, 3, 4, 5, 7
-record-accessors	contract	Record::{level,target,args,file,line,metadata}, Metadata::level	∀ r = Record{level,target,args,file,line}: r.level() = level, r.target() = target (the same &'a str), r.file() = file, r.line() = line, r.args() points to r.args, and r.metadata().level() = level.	test_record_fields, test_metadata_from_record	EASY once views are certified: &self views on a struct with &'a str, Option<&str>, Option<u32> and fmt::Arguments fields; field projection	1, 2
-log-gate	contract	set_max_level, __log	After set_max_level(f), with no intervening set_max_level: MAX_LEVEL holds f as usize, and __log(l, t, a, fi, li) calls logger.log(&Record{l,t,a,fi,li}) exactly once ⇔ Gate(l, f) ∧ a logger L was installed by set_logger ∧ L.enabled(&Metadata{level: l}). Otherwise it calls neither log nor anything else, except that enabled is called when Gate holds and a logger is installed. No current test samples the gate itself.	(none; replaces test_max_level_round_trips, §4)	HARD: AtomicUsize store/load (Relaxed), OnceLock get, a dyn Log trait-object call; __log carries trust::skip today	2, 8, 13
-env-mutators	contract	env::{take,unset,set,env_lock,remove_locked,set_locked}	Sequential semantics on Env E, ∀ k, v: take(k) returns E(k) and leaves E' = E\k, so a second take(k) returns None (one-shot). unset(k) leaves E' = E\k, whether or not k was set. set(k,v) leaves E' = E[k:=v]. All are linearizable with respect to each other and to scoped/scoped_unset, because each holds ENV_LOCK for its whole effect. A poisoned lock is recovered, not propagated: none of them panics on a poisoned lock.	take_reads_and_removes_in_one_step, unset_clears_a_key_that_was_never_set	HARD: process environment (unsafe set_var/remove_var, var_os), a static Mutex and MutexGuard, poison recovery, impl AsRef<OsStr> generics, OsStr/OsString	1, 8, 11, 13
+sanitize-record	contract	sanitize_capped, sanitize_record, sanitize_record_for	∀ msg: &str, ∀ cap ≤ MAX_ALERT_RECORD_BYTES, let r = sanitize_capped(msg, cap). (a) Value: r.as_ref() = San(msg, cap). (b) Borrowing: r is Cow::Borrowed ⇔ (∀ c ∈ msg.chars(): ¬ctl(c)) ∧ msg.len() ≤ cap, and then r = Borrowed(msg), the same pointer. (c) Consequences of (a), stated for the proof: r has no control chars; r.len() ≤ cap + 3; if r ends with an added '…' then M(msg).len() > cap and r.len() > cap − 3; every char of r except an added final '…' is repl of the char at the same index of msg, so no code point is split; for Owned, out never outgrows its reservation: len ≤ OUT_CAPACITY = 1028 and capacity is unchanged. Wrappers: sanitize_record(m) = sanitize_capped(m, MAX_RECORD_BYTES); sanitize_record_for(l, m) = sanitize_capped(m, record_cap(l)).	test_warn_and_error_keep_the_longer_cap, test_sanitize_record_replaces_control_characters, test_sanitize_record_cap_respects_char_boundaries, test_sanitize_record_control_char_at_boundary_stays_within_reservation	MEDIUM-HARD: &str and Cow<'_, str> carriers; a chars() loop with break and the invariant out = Prefix of M over the chars consumed so far ∧ out.len() ≤ cap; String::with_capacity/push/len; char::is_control/len_utf8; saturating_add; usize::min; a call to record_cap (composition); a quantifier over chars	1, 3, 4, 5, 7
+record-accessors	contract	Record::{level,target,args,file,line,metadata}, Metadata::level	∀ r = Record{level,target,args,file,line}: r.level() = level, r.target() = target (the same &'a str), r.file() = file, r.line() = line, r.args() points to r.args, and r.metadata().level() = level.	-	EASY once views are certified: &self views on a struct with &'a str, Option<&str>, Option<u32> and fmt::Arguments fields; field projection	1, 2
+log-gate	contract	set_max_level, __log	After set_max_level(f), with no intervening set_max_level: MAX_LEVEL holds f as usize, and __log(l, t, a, fi, li) calls logger.log(&Record{l,t,a,fi,li}) exactly once ⇔ Gate(l, f) ∧ a logger L was installed by set_logger ∧ L.enabled(&Metadata{level: l}). Otherwise it calls neither log nor anything else, except that enabled is called when Gate holds and a logger is installed. No current test samples the gate itself.	(none; §4)	HARD: AtomicUsize store/load (Relaxed), OnceLock get, a dyn Log trait-object call; __log carries trust::skip today	2, 8, 13
+env-mutators	contract	env::{take,unset,set,env_lock,remove_locked,set_locked}	Sequential semantics on Env E, ∀ k, v: take(k) returns E(k) and leaves E' = E\k, so a second take(k) returns None (one-shot). unset(k) leaves E' = E\k, whether or not k was set. set(k,v) leaves E' = E[k:=v]. All are linearizable with respect to each other and to scoped/scoped_unset, because each holds ENV_LOCK for its whole effect. A poisoned lock is recovered, not propagated: none of them panics on a poisoned lock.	take_reads_and_removes_in_one_step	HARD: process environment (unsafe set_var/remove_var, var_os), a static Mutex and MutexGuard, poison recovery, impl AsRef<OsStr> generics, OsStr/OsString	1, 8, 11, 13
 env-scoped-restore	contract	env::{scoped,scoped_unset,scoped_opt}, Restore::drop	∀ k, v: Option<OsStr>, body: let E0 be the environment on entry. body runs under E0[k:=v], or under E0\k when v = None. If body returns x, scoped_opt returns x. If body panics, the panic propagates unchanged. In both cases, on exit E'(k) = E0(k): a present value is set back, and an absent key is removed, never set to an empty value. Keys other than k are left as body left them. ENV_LOCK is held from before the override until after the restore, so no other env:: call can observe the override.	scoped_restores_the_previous_value_and_the_previous_absence, scoped_unset_hides_a_set_key_for_exactly_the_body, scoped_restores_even_when_the_body_panics	VERY HARD: an FnOnce closure (a higher-order spec), unwinding with Drop of a local guard struct (Option::take), a MutexGuard moved into a struct, generics T and impl AsRef<OsStr>, unsafe process-environment effects	1, 8, 11, 13
 ```
 
 ## 2. Test → spec map (TSV; all 23)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
-`—` in `primary` means the test samples no spec (§4).
 
 ```tsv
 file	test	primary	also
-src/lib.rs	test_level_ordering	level-severity-order	
 src/lib.rs	test_level_display	level-display-names	
-src/lib.rs	test_level_filter_ordering	level-severity-order	
-src/lib.rs	test_max_level_round_trips	—	log-gate (replaces it; see §4)
-src/lib.rs	test_record_fields	record-accessors	
-src/lib.rs	test_metadata_from_record	record-accessors	
-src/lib.rs	test_set_logger_error_display	—	
-src/lib.rs	test_parse_level_filter_names	level-filter-parse	
-src/lib.rs	test_parse_level_filter_case_and_whitespace	level-filter-parse	
-src/lib.rs	test_parse_level_filter_rejects_junk	level-filter-parse	
-src/lib.rs	test_should_rotate_threshold (DELETED: proved)	should-rotate-threshold	
 src/lib.rs	test_warn_and_error_keep_the_longer_cap	sanitize-record	record-cap-by-level
-src/lib.rs	test_sanitize_record_for_control_char_at_the_alert_boundary_stays_within_reservation	sanitize-record	record-cap-by-level
-src/lib.rs	test_sanitize_record_clean_input_is_borrowed	sanitize-record	
 src/lib.rs	test_sanitize_record_replaces_control_characters	sanitize-record	
-src/lib.rs	test_sanitize_record_caps_length	sanitize-record	
 src/lib.rs	test_sanitize_record_cap_respects_char_boundaries	sanitize-record	
 src/lib.rs	test_sanitize_record_control_char_at_boundary_stays_within_reservation	sanitize-record	
 src/lib.rs	take_reads_and_removes_in_one_step	env-mutators	
-src/lib.rs	unset_clears_a_key_that_was_never_set	env-mutators	
 src/lib.rs	scoped_restores_the_previous_value_and_the_previous_absence	env-scoped-restore	env-mutators
 src/lib.rs	scoped_unset_hides_a_set_key_for_exactly_the_body	env-scoped-restore	
 src/lib.rs	scoped_restores_even_when_the_body_panics	env-scoped-restore	
 ```
 
-The first 18 rows are `mod tests`; the last 5 are `mod env_tests`.
+The first 5 rows are `mod tests`; the last 4 are `mod env_tests`.
 
 ## 3. Coverage
 
@@ -105,22 +94,17 @@ The first 18 rows are `mod tests`; the last 5 are `mod env_tests`.
 
 ## 4. Tests that are not spec samples
 
-> Status 2026-10-15: both tests below are deleted, with the `#[cfg(test)]`-only `max_level()` and
-> `LEVEL_TEST_LOCK` they alone used.
-
-| test | why | recommendation |
-|---|---|---|
-| test_max_level_round_trips | It reads the level back through `max_level()`, which is `#[cfg(test)]`-only and has no production caller. It also mutates process-global state under a test-only lock. The property that matters, that `set_max_level` drives `__log`'s gate, is the `log-gate` spec, and this test does not sample it. | **delete** (and `max_level()` with it if nothing else uses it) |
-| test_set_logger_error_display | It pins the prose of a constant error message ("logger already set"). The `Display` body is one `write_str` of a literal, so there is no behaviour to generalise. | **delete** |
-
-Action counts: delete 2, become-spec 0, keep 0.
+> Status 2026-10-15: both tests this section listed (`test_max_level_round_trips` and
+> `test_set_logger_error_display`) are deleted, with the `#[cfg(test)]`-only `max_level()` and
+> `LEVEL_TEST_LOCK` they alone used. The first read the level back through `max_level()` (the property
+> that matters, that `set_max_level` drives `__log`'s gate, is `log-gate`); the second pinned the prose
+> of a constant error message. Every test left samples a spec.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
-1. **The two "stays within reservation" tests do not check the reservation.**
-   `test_sanitize_record_control_char_at_boundary_stays_within_reservation` and
-   `test_sanitize_record_for_control_char_at_the_alert_boundary_stays_within_reservation` are named
-   for the `String` reservation (`OUT_CAPACITY = 1028`, no realloc), but they only assert
+1. **The "stays within reservation" test does not check the reservation.**
+   `test_sanitize_record_control_char_at_boundary_stays_within_reservation` (a table over both caps) is
+   named for the `String` reservation (`OUT_CAPACITY = 1028`, no realloc), but it only asserts
    `out.len() ≤ cap + 3`. A variant that measured the original char's width instead of the 3-byte
    U+FFFD would still pass, because its result is at most `cap + 2`. `sanitize-record` (c) states
    `len ≤ OUT_CAPACITY` and that the capacity is unchanged.

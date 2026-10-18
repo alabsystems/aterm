@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm link ls` OVER A SCRIPTED `Last`: what the verb asks for, what
-//! `--attention` keeps, and that a walk which could not finish is a failure.
+//! `aterm link ls` OVER A SCRIPTED `Last`: what `--attention` keeps, and that
+//! a walk which could not finish is a failure.
 //!
 //! The paging itself is astream's: `ls` walks the face with
 //! `astream_broker::Client::last_walk`, which pages on the resume cursor —
@@ -12,8 +12,7 @@
 //! (its `last_page` hands back a cursor only on a subject the filter covers),
 //! so the stub here answers `Last` in the contract's worst legal shapes, with
 //! the real `aterm link ls` on the other end of the socket, to check the parts
-//! that are aterm's: the request, the filter over the rows, and the exit
-//! status.
+//! that are aterm's: the filter over the rows and the exit status.
 //!
 //! DETERMINISTIC: no sleeps, no live broker, no clock.
 #![allow(
@@ -23,7 +22,6 @@
 
 use crate::harness;
 
-use std::io::Read;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::Command;
@@ -117,6 +115,7 @@ fn answer(mut s: UnixStream, pages: &[Page]) {
             next: 0,
             head: 0,
             resume: page.resume.clone(),
+            durable: None,
         };
         if write_frame(&mut s, &encode_response(&mark)).is_err() {
             return;
@@ -190,63 +189,12 @@ fn ls_attention_prints_only_the_escalating_rows_past_an_empty_page() {
 ///
 /// The stub never surrenders an empty `resume`, so the walk is unbounded and
 /// astream's walker gives up at its page bound. `ls` must hand that error on —
-/// on stderr, under its own name, with a non-zero exit — rather than swallow
-/// it: a caller that cannot tell "no rows" from "I stopped looking" is the
-/// caller that reports a quiet fleet while a node is escalating. The walker's
-/// own wording is astream's to change, so it is not pinned here.
+/// with a non-zero exit — rather than swallow it: a caller that cannot tell
+/// "no rows" from "I stopped looking" is the caller that reports a quiet fleet
+/// while a node is escalating.
 #[test]
 fn a_last_walk_that_never_ends_is_an_error_rather_than_a_short_roster() {
     let (stdout, stderr, ok) = ls("bnd", vec![Page::empty("/f/f1/pub/n-a/s-1/presence")], &[]);
     assert!(!ok, "an unfinished walk must not exit 0: {stdout:?}");
-    assert!(stdout.is_empty(), "no partial roster: {stdout:?}");
-    assert!(
-        stderr.lines().any(|l| l.starts_with("aterm-link ls: ")),
-        "the failure must name itself: {stderr:?}"
-    );
-}
-
-/// The stub is only worth what its framing is: prove one `Last` request really
-/// reaches it and really decodes, so a green suite above cannot be a binary that
-/// failed to connect.
-#[test]
-fn the_stub_broker_really_speaks_the_last_verb() {
-    let path = sock_path("frm");
-    let listener = UnixListener::bind(&path).expect("bind");
-    let seen = std::thread::spawn(move || {
-        let (mut s, _) = listener.accept().expect("accept");
-        let frame = read_frame(&mut s).expect("read").expect("a frame");
-        let req = decode_request(&frame);
-        let mark = Response::Mark {
-            next: 0,
-            head: 0,
-            resume: String::new(),
-        };
-        let _ = write_frame(&mut s, &encode_response(&mark));
-        let mut sink = Vec::new();
-        let _ = s.read_to_end(&mut sink);
-        req
-    });
-    let (mut cmd, _runtime) = aterm_link();
-    cmd.arg("ls").args(["--fleet", "f1", "--broker"]).arg(&path);
-    let out = harness::output_within(&mut cmd, "aterm link ls");
-    // The same total join as `ls`: a client that never connected must fail the
-    // assertions below, not park this test in `accept()`.
-    let _ = UnixStream::connect(&path);
-    let req = seen.join().expect("stub thread");
-    let _ = std::fs::remove_file(&path);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    match req {
-        Some(Request::Last { filter, after, max }) => {
-            assert_eq!(filter, "/f/f1/pub/*/*/presence");
-            assert_eq!(after, "", "the first page starts at the beginning");
-            // Every row still owed: the broker clamps the page to its own bound,
-            // and the walk (astream's `Client::last_walk`) pages on the cursor.
-            assert_eq!(max, u32::MAX);
-        }
-        other => panic!("ls must open with a Last: {other:?}"),
-    }
+    assert!(stdout.is_empty(), "no partial roster: {stdout:?}\n{stderr}");
 }

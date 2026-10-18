@@ -6,17 +6,18 @@
 //! Each file keeps its path (so citations of `aterm-core/tests/<file>.rs` still
 //! resolve) and becomes a module here, instead of linking and exec'ing its own
 //! binary per test run. None of them sets the environment, installs a hook or
-//! an allocator, re-executes itself or keeps a process global. The one direct
-//! `ty` spawn (`conformance_altscreen`, one `#[ignore]`d `_under_ty` test, run
-//! by `-- --ignored _under_ty` only) writes into a scratch directory of its
-//! own file's name and goes through `aterm_spec::verify::TyCommand`, which fails
-//! it closed on a stopped search; every other `ty` check goes through
-//! `aterm_spec::verify`'s drivers, which also give each call a scratch
+//! an allocator, re-executes itself or keeps a process global. Every `ty` check
+//! goes through `aterm_spec::verify`'s drivers, which give each call a scratch
 //! directory of its own.
 //!
 //! The crate sets `autotests = false`, so a new `tests/*.rs` file compiles ONLY
-//! once it is listed here, in `core_fuzz.rs`, or as its own `[[test]]` in
+//! once it is listed here or as its own `[[test]]` in
 //! Cargo.toml (with the hazard that requires it).
+//!
+//! The deterministic-LCG fuzzers (`fuzz_process_never_panics`, `fuzz_alt_screen`) are
+//! modules here too: they set nothing process-wide, so a binary of their own bought no
+//! isolation, only a second link (`fuzz_process_never_panics`'s fresh-terminal properties
+//! print their own replay line).
 //!
 //! Run one file's tests with
 //! `targo --unverified test -p aterm-core --test core_suite -- <file>::`.
@@ -24,6 +25,7 @@
 mod alt_archive_claude_like;
 mod chunked_process_equivalence;
 mod codex_insert_history_scrollback;
+mod color_scheme_follows_background;
 mod conformance_altscreen;
 mod conformance_budgeted_search;
 mod conformance_hyperlink_scheme_cap;
@@ -33,6 +35,8 @@ mod conformance_recording;
 mod conformance_repaint_nudge;
 mod control_string_cancel;
 mod empty_param_default;
+mod fuzz_alt_screen;
+mod fuzz_process_never_panics;
 mod grid_column_agreement;
 mod handoff_alt_screen_checkpoint;
 mod handoff_colour_and_shell_carry;
@@ -66,7 +70,6 @@ mod sgr_rendition_parity;
 mod shell_mark_rows_across_resize;
 mod tab_stops_across_grid_seams;
 mod unicode_content_generation;
-mod vi_motions_scrolled_back;
 
 // OSC 1337 `File=` fixtures shared by the `image_*` modules.
 #[path = "support/osc1337.rs"]

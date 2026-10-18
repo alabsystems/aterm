@@ -16,11 +16,21 @@
 //! (`hidden_caret_withheld`). [`Contract::HandedOver`] is the negative control. The mode level
 //! (`synchronized_output()`) is not enough: the terminal force-clears it when a bracket outlives
 //! `sync_timeout_ms` (1 s) with the program still mid-frame ([`Contract::ModeLevel`]).
+//!
+//! The print anchor is the other half of that write position: Claude Code's mid-line echo
+//! reprints the tail after the caret, so a torn echo's run ends at the line's end, where nobody
+//! typed. `aterm_effects::host::motion_print_anchor` withholds it exactly where the caret is
+//! withheld ([`MidLine`], the owner's `the▯subtrees`); [`Contract::CaretOnly`] hands it over raw.
+//!
+//! The same takes carry the hand's corrections with Claude Code lagging: a key erased before its
+//! echo shows, whose echo still lands ahead of the Backspace's retreat (bytes are processed in
+//! order), and corrections rendered as one repaint, apart, late or torn (`CursorGlow::erase_hop`,
+//! `CursorGlow::merged_correction`).
 
 use aterm_core::render::GlowQuad;
 use aterm_core::terminal::{ClockReading, Terminal};
 use aterm_effects::cursor_glow::{AdmissionPhase, CursorGlow, Geom, GlowConfig, GlowStyle};
-use aterm_effects::host::{hidden_caret_withheld, motion_caret};
+use aterm_effects::host::{hidden_caret_withheld, motion_caret, motion_print_anchor};
 use aterm_effects::rainbow_kitty::TypedClass;
 use aterm_effects::rainbow_kitty::witness::WITNESS_ROWS;
 use std::fmt::Write as _;
@@ -77,7 +87,6 @@ fn cfg() -> GlowConfig {
         ring: true,
         beam: false,
         head_dx: 0.5,
-        pack: None,
     }
 }
 
@@ -112,18 +121,23 @@ fn sync_frame_hold(
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Contract {
     /// The composed, focus and headless paths and `EffectsPipeline`: a
-    /// hidden caret is `None`.
+    /// hidden caret is `None`, and the echo anchor goes through the anchor
+    /// law (`motion_print_anchor`).
     Withheld,
     /// A hidden caret is always handed over; `observe_caret_drawn(false)`
     /// says so.
     HandedOver,
     /// The shipping single-pane present: the hidden caret handed over
     /// through `motion_caret` with the program's account of its frame, so
-    /// an unfinished frame withholds it.
+    /// an unfinished frame withholds it, and its echo anchor through
+    /// `motion_print_anchor`, which withholds that frame's anchor too.
     SinglePane,
     /// `motion_caret` fed the mode level, which the terminal's timeout
     /// force-clears mid-frame.
     ModeLevel,
+    /// [`Contract::SinglePane`]'s caret with the echo anchor handed over
+    /// raw: the single-pane present before the anchor law.
+    CaretOnly,
 }
 
 struct Host {
@@ -144,13 +158,19 @@ struct Host {
 
 impl Host {
     fn new(contract: Contract) -> Self {
+        Self::with_composer(contract, "")
+    }
+
+    /// [`Host::new`] with `after` already standing after the composer's
+    /// caret when the first frame is presented.
+    fn with_composer(contract: Contract, after: &str) -> Self {
         let mut term = Terminal::new(ROWS as u16, COLS as u16);
         let now = Instant::now();
         let mut glow = CursorGlow::default();
         glow.note_pane_columns(0, COLS);
         term.process(
             format!(
-                "\x1b[?1049h\x1b[2J\x1b[{};1H❯\u{a0}\x1b[{};{}H",
+                "\x1b[?1049h\x1b[2J\x1b[{};1H❯\u{a0}{after}\x1b[{};{}H",
                 ROW + 1,
                 ROW + 1,
                 COL0 + 1
@@ -195,7 +215,9 @@ impl Host {
         let cur = match self.contract {
             Contract::Withheld => caret.filter(|_| visible),
             Contract::HandedOver => caret,
-            Contract::SinglePane => motion_caret(caret, visible, hidden_caret_withheld(&self.term)),
+            Contract::SinglePane | Contract::CaretOnly => {
+                motion_caret(caret, visible, hidden_caret_withheld(&self.term))
+            }
             Contract::ModeLevel => {
                 motion_caret(caret, visible, self.term.modes().synchronized_output())
             }
@@ -209,8 +231,15 @@ impl Host {
         self.term
             .row_cols_into(usize::from(c.row), &mut self.row_buf);
         self.glow.observe_row(c.row, c.col, &self.row_buf, self.now);
-        self.glow
-            .observe_print_anchor_glyph(self.term.print_anchor(), self.term.print_anchor_glyph());
+        // Every shipping path hands the echo anchor over through the anchor
+        // law; the pre-fix contracts hand it over raw.
+        let (anchor, glyph) = match self.contract {
+            Contract::Withheld | Contract::SinglePane => motion_print_anchor(&self.term),
+            Contract::HandedOver | Contract::ModeLevel | Contract::CaretOnly => {
+                (self.term.print_anchor(), self.term.print_anchor_glyph())
+            }
+        };
+        self.glow.observe_print_anchor_glyph(anchor, glyph);
         if self.contract != Contract::Withheld {
             self.glow.observe_caret_drawn(visible);
         }
@@ -269,6 +298,17 @@ impl Host {
             TypedClass::Glyph
         };
         self.glow.note_typed_glyph(self.now, 1, false, class);
+    }
+
+    /// A key as the window notes it: its exact glyph rides the stamp.
+    fn typed(&mut self, ms: u64, ch: char) {
+        self.to(ms);
+        let class = if ch == ' ' {
+            TypedClass::Space
+        } else {
+            TypedClass::Glyph
+        };
+        self.glow.note_typed_expected(self.now, 1, false, class, ch);
     }
 
     fn write(&mut self, ms: u64, bytes: &str) {
@@ -489,51 +529,26 @@ fn cross_row_licences(h: &Host) -> Vec<String> {
         .collect()
 }
 
-/// Control: the bracket closing inside the cap (no torn present) lights every cell under both
-/// single-pane contracts, so a hole in the takes below is the torn present's.
-#[test]
-fn a_repaint_closing_inside_the_cap_keeps_the_boundary_space_lit() {
-    for contract in [Contract::HandedOver, Contract::SinglePane] {
-        let h = take(contract, 120);
-        let (dark, rep) = report(&h);
-        assert_eq!(
-            h.torn_presents, 0,
-            "{contract:?}: control must present no torn frame: {rep}"
-        );
-        assert!(dark.is_empty(), "{contract:?} control: {rep}");
-    }
-}
-
-/// Control: a host that hands a hidden caret over as `None` (the composed
-/// and headless paths) keeps the line whole through the same torn present.
-#[test]
-fn a_torn_repaint_with_the_hidden_caret_withheld_keeps_the_boundary_space_lit() {
-    let h = take(Contract::Withheld, 280);
-    let (dark, rep) = report(&h);
-    assert!(h.torn_presents > 0, "the take must present torn: {rep}");
-    assert!(dark.is_empty(), "withheld-caret control: {rep}");
-}
-
-/// Negative control: with the hidden caret always handed over, the torn present's write cursor
-/// is judged as the caret, the keys in flight license cross-row moves and the boundary cells go
-/// dark. If this stops reproducing, the fixed take proves nothing.
-#[test]
-fn the_pre_fix_contract_spends_the_keys_on_the_write_cursor() {
-    let h = take(Contract::HandedOver, 280);
-    let (dark, rep) = report(&h);
-    assert!(h.torn_presents > 0, "the take must present torn: {rep}");
-    assert!(!dark.is_empty(), "the gap must reproduce: {rep}");
-    assert!(
-        !cross_row_licences(&h).is_empty(),
-        "the write cursor must be licensed as the caret: {rep}"
-    );
-}
-
 /// The shipping single-pane contract: the torn present's hidden write
 /// cursor is not judged as the caret, no licence leaves the composer row,
-/// and the line stays one band.
+/// and the line stays one band. Negative control: with the hidden caret
+/// always handed over (the pre-fix contract), the write cursor is judged as
+/// the caret, the keys in flight license the cross-row moves and the boundary
+/// cells go dark; if that stops reproducing, the fixed take proves nothing.
 #[test]
 fn a_torn_full_screen_repaint_keeps_the_boundary_space_lit() {
+    let pre_fix = take(Contract::HandedOver, 280);
+    let (dark, rep) = report(&pre_fix);
+    assert!(
+        pre_fix.torn_presents > 0,
+        "the take must present torn: {rep}"
+    );
+    assert!(!dark.is_empty(), "the gap must reproduce: {rep}");
+    assert!(
+        !cross_row_licences(&pre_fix).is_empty(),
+        "the write cursor must be licensed as the caret: {rep}"
+    );
+
     let h = take(Contract::SinglePane, 280);
     let (dark, rep) = report(&h);
     assert!(h.torn_presents > 0, "the take must present torn: {rep}");
@@ -618,5 +633,478 @@ fn every_bracket_length_keeps_the_line_whole_under_the_shipping_contract() {
                 "open {open_ms} ms, late keys {late}: {rep}"
             );
         }
+    }
+}
+
+/// A Backspace among a take's keys.
+const BS: char = '\u{8}';
+
+/// Claude Code's mid-line insert (the owner's 2026-10-16 screenshot: `all
+/// the▯subtrees`, typed before ` carefully and ultrathink design this.`),
+/// one key every 110 ms, a Backspace among them as [`BS`]. Each key's echo is
+/// Ink's cell diff of the composer row, so it prints from the first changed
+/// column through the end of the reprinted tail and then parks the caret.
+/// Before a space-led tail a typed Space changes no cell of its own (blank for
+/// blank), so its echo prints from the landing column on.
+#[derive(Clone, Copy)]
+struct MidLine<'a> {
+    keys: &'a str,
+    /// Each key's echo latency; echoes queue behind a stalled write.
+    lag_ms: u64,
+    /// The key whose echo is torn before its parking CUP and finished this
+    /// many ms later (Node stalled mid-write). Past the hold cap the host
+    /// presents the half-written frame: the caret hidden, and the print run
+    /// ended at the tail's end, where nobody typed.
+    tear: Option<(usize, u64)>,
+    /// Keys whose echo is not rendered alone: the next key's repaint carries
+    /// it (Ink rendering a lagging state).
+    merged: &'a [usize],
+    /// Claude Code's keyless `ultrathink` shimmer recolouring one tail letter
+    /// on the caret row at this period, the caret returned.
+    shimmer_ms: Option<u64>,
+}
+
+impl MidLine<'_> {
+    /// The take of the owner's keys, echoed 12 ms after each.
+    const PLAIN: MidLine<'static> = MidLine {
+        keys: TYPED,
+        lag_ms: 12,
+        tear: None,
+        merged: &[],
+        shimmer_ms: None,
+    };
+}
+
+/// The owner's typed line, and the composer's tail after it.
+const TYPED: &str = "all the subtrees";
+const TAIL: &str = " carefully and ultrathink design this.";
+
+/// Run a [`MidLine`] take; returns the host after the settle, and the
+/// composer line it left. The settle runs 400 ms past the later of the last
+/// key's echo lag and the program's last byte: a torn echo's finish and the
+/// echoes queued behind it land after the hand's last key, and the host
+/// presents every frame they write.
+fn mid_line(contract: Contract, take: MidLine) -> (Host, String) {
+    let mut h = Host::with_composer(contract, TAIL);
+    let mut line: Vec<char> = TAIL.chars().collect();
+    let mut shown = line.clone();
+    let mut caret = 0usize;
+    let paint = |line: &[char]| line.iter().collect::<String>();
+    let echo = |from: usize, line: &[char], caret: usize| {
+        format!(
+            "{SYNC_ON}{HIDE}\x1b[H\r\x1b[{}C\x1b[{ROW}B{}\x1b[K",
+            usize::from(COL0) + from,
+            paint(&line[from.min(line.len())..])
+        ) + &format!(
+            "\x1b[{ROWS};1H\x1b[{};{}H{SHOW}{SYNC_OFF}",
+            ROW + 1,
+            usize::from(COL0) + caret + 1
+        )
+    };
+    // Every output in time order, `(ms, bytes, the caret it parks)`; keys
+    // are typed on their own clock and queue behind a stalled write.
+    let mut outs: Vec<(u64, String, usize)> = Vec::new();
+    let mut keys: Vec<(u64, char)> = Vec::new();
+    let mut busy_until = 0u64;
+    let mut torn: Option<(u64, u64)> = None;
+    for (i, ch) in take.keys.chars().enumerate() {
+        let press = 200 + 110 * i as u64;
+        keys.push((press, ch));
+        if ch == BS {
+            caret -= 1;
+            line.remove(caret);
+        } else {
+            line.insert(caret, ch);
+            caret += 1;
+        }
+        if take.merged.contains(&i) {
+            continue;
+        }
+        let from = (0..line.len().max(shown.len()))
+            .find(|&c| shown.get(c) != line.get(c))
+            .unwrap_or(caret);
+        shown.clone_from(&line);
+        let full = echo(from, &line, caret);
+        let at = (press + take.lag_ms).max(busy_until);
+        if let Some((_, stall)) = take.tear.filter(|&(key, _)| key == i) {
+            let cut = full.find(&format!("\x1b[{ROWS};1H")).expect("the park");
+            outs.push((at, full[..cut].to_string(), caret));
+            outs.push((at + stall, full[cut..].to_string(), caret));
+            torn = Some((at, at + stall));
+            busy_until = at + stall + 1;
+        } else {
+            outs.push((at, full, caret));
+            busy_until = at + 1;
+        }
+    }
+    // Measured from the last key alone, a stall past the settle leaves the
+    // caret's return written and never presented, so no frame judges it.
+    let last_out = outs.iter().map(|o| o.0).max().unwrap_or(0);
+    let end = (keys.last().expect("a key").0 + take.lag_ms).max(last_out) + 400;
+    if let Some(period) = take.shimmer_ms {
+        // Recolour `ultrathink`'s `u`, right of the caret the program last
+        // parked; never inside the stalled write.
+        let echoes = outs.clone();
+        let mut t = 230;
+        while t < end {
+            let inside = torn.is_some_and(|(a, b)| t >= a && t <= b);
+            if !inside {
+                let parked = echoes
+                    .iter()
+                    .filter(|o| o.0 <= t)
+                    .map(|o| o.2)
+                    .next_back()
+                    .unwrap_or(0);
+                let col = usize::from(COL0) + parked + 15;
+                let bracket = format!(
+                    "{SYNC_ON}{HIDE}\x1b[H\r\x1b[{col}C\x1b[{ROW}B\x1b[38;2;250;195;95mu\x1b[39m\x1b[{ROWS};1H\x1b[{};{}H{SHOW}{SYNC_OFF}",
+                    ROW + 1,
+                    usize::from(COL0) + parked + 1
+                );
+                outs.push((t, bracket, parked));
+            }
+            t += period;
+        }
+    }
+    let mut events: Vec<(u64, Option<char>, String)> = keys
+        .iter()
+        .map(|&(at, ch)| (at, Some(ch), String::new()))
+        .chain(outs.into_iter().map(|(at, b, _)| (at, None, b)))
+        .collect();
+    events.sort_by_key(|e| (e.0, e.1.is_none()));
+    for (at, key, bytes) in events {
+        match key {
+            Some(BS) => {
+                h.to(at);
+                h.glow.note_backspace_erasing(h.now, Some(1));
+            }
+            Some(ch) => h.typed(at, ch),
+            None => h.write(at, &bytes),
+        }
+    }
+    h.to(end);
+    (h, line.iter().collect())
+}
+
+/// The owner's take with the Space's echo torn for `stall_ms`; returns the
+/// host and the Space's column.
+fn mid_line_take(contract: Contract, stall_ms: u64, shimmer_ms: Option<u64>) -> (Host, u16) {
+    let space = TYPED.find("the ").expect("the Space") + 3;
+    let take = MidLine {
+        tear: Some((space, stall_ms)),
+        shimmer_ms,
+        ..MidLine::PLAIN
+    };
+    (mid_line(contract, take).0, COL0 + space as u16)
+}
+
+/// The owner's typed line's dark columns, by glyph.
+fn mid_line_report(h: &Host) -> (Vec<u16>, String) {
+    mid_line_report_of(h, TYPED)
+}
+
+/// The dark columns of the typed line `typed`, by glyph.
+fn mid_line_report_of(h: &Host, typed: &str) -> (Vec<u16>, String) {
+    let dark: Vec<u16> = (COL0..COL0 + typed.chars().count() as u16)
+        .filter(|&c| !h.lit(c))
+        .collect();
+    let glyphs: Vec<String> = dark
+        .iter()
+        .map(|&c| {
+            format!(
+                "{c}:{:?}",
+                typed.chars().nth(usize::from(c - COL0)).unwrap_or('?')
+            )
+        })
+        .collect();
+    (
+        dark,
+        format!(
+            "torn presents={} dark={}{}",
+            h.torn_presents,
+            glyphs.join(","),
+            h.ring()
+        ),
+    )
+}
+
+/// A licence on the composer row landing right of the typed text: the key in
+/// flight spent where the torn echo's print run ended.
+fn line_end_licences(h: &Host) -> Vec<String> {
+    let typed_end = COL0 + TYPED.len() as u16;
+    h.glow
+        .admission_log()
+        .filter(|r| {
+            r.phase != AdmissionPhase::Declined && r.target.0 == ROW && r.target.1 > typed_end + 1
+        })
+        .map(|r| {
+            format!(
+                "{} ({},{})->({},{})",
+                r.reason, r.origin.0, r.origin.1, r.target.0, r.target.1
+            )
+        })
+        .collect()
+}
+
+/// Negative control: with the echo anchor handed over raw, the torn Space
+/// echo's run end (the tail's end) is judged on the hidden-caret lane, the
+/// Space's licence is spent there, and its column stays dark under a new
+/// band (the owner's `the▯subtrees`). Under the shimmer the keys typed into
+/// the stall go dark with it. If this stops reproducing, the takes below
+/// prove nothing.
+#[test]
+fn a_raw_echo_anchor_spends_a_torn_space_at_the_line_end() {
+    let (h, space) = mid_line_take(Contract::CaretOnly, 200, None);
+    let (dark, rep) = mid_line_report(&h);
+    assert!(h.torn_presents > 0, "must present torn: {rep}");
+    assert_eq!(dark, vec![space], "the owner's hole: {rep}");
+    assert!(
+        !line_end_licences(&h).is_empty(),
+        "spent at the line end: {rep}"
+    );
+
+    let (h, space) = mid_line_take(Contract::CaretOnly, 200, Some(130));
+    let (dark, rep) = mid_line_report(&h);
+    assert_eq!(
+        dark.first(),
+        Some(&space),
+        "shimmer: the Space goes dark: {rep}"
+    );
+}
+
+/// The owner's shape, fixed: a torn mid-line echo hands over no echo anchor
+/// (`motion_print_anchor`), so the Space is judged when its caret shows and
+/// `all the subtrees` stays one band, under the single-pane contract and the
+/// composed/headless one, which the same law fixes. Control: the same take
+/// closing inside the hold cap.
+///
+/// A stall well past the terminal's 1 s sync timeout keeps the line whole: the
+/// keys typed into it still wait in flight, and the caret's return is their
+/// same-row echo whatever the hide's age, which they pay
+/// (`unpaid_typed_echo`). The shimmer's keyless recolouring after the return
+/// spends nothing at the line end.
+#[test]
+fn a_torn_mid_line_echo_keeps_the_space_lit() {
+    for shimmer in [None, Some(130), Some(50)] {
+        for (contract, stall) in [
+            (Contract::SinglePane, 200),
+            (Contract::SinglePane, 1_200),
+            (Contract::SinglePane, 1_500),
+            (Contract::SinglePane, 2_000),
+            (Contract::SinglePane, 3_000),
+            (Contract::Withheld, 200),
+            (Contract::Withheld, 2_000),
+            (Contract::SinglePane, 60),
+        ] {
+            let (h, _) = mid_line_take(contract, stall, shimmer);
+            let (dark, rep) = mid_line_report(&h);
+            if stall > 150 {
+                assert!(
+                    h.torn_presents > 0,
+                    "{contract:?} {stall} ms {shimmer:?}: must present torn: {rep}"
+                );
+            }
+            assert!(
+                dark.is_empty(),
+                "{contract:?} {stall} ms {shimmer:?}: {rep}"
+            );
+            let spent = line_end_licences(&h);
+            assert!(
+                spent.is_empty(),
+                "{contract:?} {stall} ms {shimmer:?}: {spent:?}{rep}"
+            );
+        }
+    }
+}
+
+/// The derived erase-order licence on `path`: whether the next key is lit
+/// (`aterm_models_effects::erased_key_echo_order_model`).
+fn erase_order_lights(path: &[&str]) -> bool {
+    let model = aterm_models_effects::erased_key_echo_order_model();
+    let mut state = model.init_state();
+    for action in path {
+        assert!(model.fire(action, &mut state), "{path:?}: {action}");
+    }
+    state["lit"] == 1
+}
+
+/// The owner's `the▯subtrees` (2026-10-16) with Claude Code lagging: `all
+/// thes`, Backspace, Space, `subtrees`, each key's echo `lag` ms after it, the
+/// Backspace's echo apart or carried by the Space's repaint. From about one
+/// key gap of lag, the `s` is erased before its echo shows, and bytes are
+/// processed in order: that echo lands after the Backspace, then the retreat,
+/// then the Space. The late `s` is paid by no press and leaves the erase
+/// owed, so its retreat is the deletion, never Ink's park, and the Space
+/// lights its own column, as the derived licence says
+/// (`erased_key_echo_order_model`). Before the law the late `s` spent the
+/// Backspace's licence and the Space's column stayed dark from 100 ms of lag
+/// on, apart and merged.
+///
+/// With the line ending at the Space no later key's stamp licenses the late
+/// retreat: the erase still owed licenses it, or the Space's press is
+/// forgotten with a keyless backward hop.
+#[test]
+fn a_key_erased_before_its_echo_keeps_the_next_key_lit() {
+    let erase = "all thes".len();
+    let erase_at = Duration::from_millis(200 + 110 * erase as u64);
+    let typo = COL0 + erase as u16 - 1;
+    for (keys, typed) in [
+        ("all thes\u{8} subtrees", TYPED),
+        ("all thes\u{8} ", "all the "),
+    ] {
+        for lag in [12, 100, 200, 300, 900] {
+            for merged in [&[][..], &[erase][..]] {
+                let take = MidLine {
+                    keys,
+                    lag_ms: lag,
+                    merged,
+                    ..MidLine::PLAIN
+                };
+                let (h, text) = mid_line(Contract::SinglePane, take);
+                let (dark, rep) = mid_line_report_of(&h, typed);
+                assert!(text.starts_with(typed), "lag {lag} {merged:?}: {text:?}");
+                // The typo's echo is the first hop out of its column.
+                let late = h
+                    .glow
+                    .admission_log()
+                    .find(|r| r.origin == (ROW, typo) && r.target == (ROW, typo + 1))
+                    .is_some_and(|r| r.at >= h.t0 + erase_at);
+                assert_eq!(
+                    late,
+                    lag >= 100,
+                    "lag {lag} {merged:?}: the typo's echo must land after the Backspace exactly when lagging: {rep}"
+                );
+                assert!(dark.is_empty(), "{keys:?} lag {lag} {merged:?}: {rep}");
+            }
+        }
+    }
+    assert!(erase_order_lights(&[
+        "EraseUnechoed",
+        "NextKey",
+        "LateEcho",
+        "Retreat",
+        "NextEcho"
+    ]));
+    assert!(erase_order_lights(&[
+        "EraseUnechoed",
+        "NextKey",
+        "LateEcho",
+        "MergedCorrection"
+    ]));
+}
+
+/// Corrections of more than one key, echoed late, apart or as one repaint: an
+/// overshoot (`thes⌫⌫e␣`, the retyped `e` the one erased), a transposition
+/// (`teh⌫⌫he`), two keys erased before their echoes (`thexs⌫⌫`) and an
+/// overshoot whose first Backspace echoes alone exactly as the correction
+/// would (`thee⌫⌫e`: `the`, the caret after it). Each Backspace owes its own
+/// retreat, the keys erased unseen echo late and are paid by none, and a
+/// repaint carrying the erases and the keys typed since is the erases'
+/// retreat and those keys' advance, whichever way the caret ends
+/// (`CursorGlow::merged_correction`); a lit glyph standing keeps its light.
+#[test]
+fn every_correction_echoed_late_or_merged_keeps_the_line_lit() {
+    for keys in [
+        "all thes\u{8}\u{8}e subtrees",
+        "all teh\u{8}\u{8}he subtrees",
+        "all thexs\u{8}\u{8} subtrees",
+        "all thee\u{8}\u{8}e subtrees",
+    ] {
+        let first = keys.chars().position(|c| c == BS).expect("a Backspace");
+        for lag in [12, 200, 500] {
+            for merged in [&[][..], &[first, first + 1][..]] {
+                let take = MidLine {
+                    keys,
+                    lag_ms: lag,
+                    merged,
+                    ..MidLine::PLAIN
+                };
+                let (h, text) = mid_line(Contract::SinglePane, take);
+                let (dark, rep) = mid_line_report(&h);
+                assert!(text.starts_with(TYPED), "{keys:?} lag {lag}: {text:?}");
+                assert!(dark.is_empty(), "{keys:?} lag {lag} {merged:?}: {rep}");
+            }
+        }
+    }
+}
+
+/// A correction's one repaint stalled before its parking CUP past the hold
+/// cap: the torn frames withhold the caret and probe the write cursor's row,
+/// so the repaint is judged when the caret returns, against the probe that
+/// last showed it, whether the caret returns to that cell (`s⌫␣`) or a cell
+/// left of it (`⌫⌫h`). Control: the same keys echoed apart.
+#[test]
+fn a_correction_repainted_torn_keeps_its_keys_lit() {
+    for keys in ["all thes\u{8} subtrees", "all teh\u{8}\u{8}he subtrees"] {
+        let first = keys.chars().position(|c| c == BS).expect("a Backspace");
+        let erases = keys.chars().filter(|&c| c == BS).count();
+        let merged: Vec<usize> = (first..first + erases).collect();
+        for lag in [12, 300] {
+            for stall in [200, 600, 1_500] {
+                for merged in [&[][..], &merged[..]] {
+                    let take = MidLine {
+                        keys,
+                        lag_ms: lag,
+                        merged,
+                        tear: Some((first + erases, stall)),
+                        ..MidLine::PLAIN
+                    };
+                    let (h, text) = mid_line(Contract::SinglePane, take);
+                    let (dark, rep) = mid_line_report(&h);
+                    assert!(text.starts_with(TYPED), "{keys:?}: {text:?}");
+                    assert!(
+                        h.torn_presents > 0,
+                        "{keys:?} {stall} ms: must present torn"
+                    );
+                    assert!(
+                        dark.is_empty(),
+                        "{keys:?} lag {lag} stall {stall} {merged:?}: {rep}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Negative control of the late echo's glyph: a key typed and erased inside
+/// one echo lag that the app never draws (`s⌫` processed with the Space, one
+/// repaint). The Space's echo after them prints a blank, not the erased `s`,
+/// so it is no late echo of the erased key, and the Space's own press pays
+/// it.
+#[test]
+fn a_key_erased_and_never_drawn_leaves_the_next_key_its_echo() {
+    let keys = "all thes\u{8} subtrees";
+    let erase = keys.chars().position(|c| c == BS).expect("the Backspace");
+    for lag in [12, 200] {
+        let take = MidLine {
+            keys,
+            lag_ms: lag,
+            merged: &[erase - 1, erase],
+            ..MidLine::PLAIN
+        };
+        let (h, text) = mid_line(Contract::SinglePane, take);
+        let (dark, rep) = mid_line_report(&h);
+        assert!(text.starts_with(TYPED), "lag {lag}: {text:?}");
+        assert!(dark.is_empty(), "lag {lag}: {rep}");
+    }
+}
+
+/// Negative control of the correction's change: a key retyped equal to the
+/// one it erased (`thee⌫e`). Until the app draws the erase the row is as it
+/// was, the retyped `e` already standing before the unchanged caret, which is
+/// no correction: the key's press waits for its own echo.
+#[test]
+fn a_correction_the_app_has_not_drawn_spends_no_key() {
+    let keys = "all thee\u{8}e subtrees";
+    for lag in [200, 500] {
+        let take = MidLine {
+            keys,
+            lag_ms: lag,
+            ..MidLine::PLAIN
+        };
+        let (h, text) = mid_line(Contract::SinglePane, take);
+        let (dark, rep) = mid_line_report_of(&h, "all thee subtrees");
+        assert!(text.starts_with("all thee subtrees"), "lag {lag}: {text:?}");
+        assert!(dark.is_empty(), "lag {lag}: {rep}");
     }
 }

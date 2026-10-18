@@ -36,6 +36,43 @@ pub(super) fn host_holds(need: RawFd, what: &str) -> bool {
     false
 }
 
+/// The binary translator this process runs under, named, when one does: its
+/// code is built for one architecture and the kernel is another's. Linux names
+/// its own in `/proc/sys/kernel/arch`, which the translator leaves alone while
+/// it rewrites `uname` and `/proc/cpuinfo` (Rosetta answers `x86_64` and
+/// `VirtualApple` there, measured 2026-10-17). `None` natively, on a kernel
+/// that names no architecture, and off Linux, where no test here depends on
+/// one (Darwin's `posix_spawn` is a single system call, and no `binfmt_misc`
+/// names an interpreter as a process's executable).
+#[cfg(target_os = "linux")]
+pub(crate) fn translator() -> Option<String> {
+    let kernel = std::fs::read_to_string("/proc/sys/kernel/arch").ok()?;
+    let (kernel, code) = (kernel.trim(), std::env::consts::ARCH);
+    if kernel.is_empty() || kernel == code {
+        return None;
+    }
+    let rosetta =
+        std::fs::read_to_string("/proc/cpuinfo").is_ok_and(|info| info.contains("VirtualApple"));
+    Some(if rosetta {
+        "Rosetta".to_string()
+    } else {
+        format!("a translator ({code} code on an {kernel} kernel)")
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn translator() -> Option<String> {
+    None
+}
+
+/// Why `std` is no oracle for a spawn that fails under Rosetta on Linux, for
+/// the line a test prints instead of the comparison ([`translator`]).
+pub(super) const STD_SPAWN_MUTE: &str = "std's answer comes from glibc's posix_spawn, whose \
+    child reports a failed exec or chdir through memory it shares with its parent \
+    (clone with CLONE_VM|CLONE_VFORK); Rosetta runs that child in a copy, where the store \
+    is lost (measured 2026-10-17), so std answers a child that exited 127; a real x86_64 \
+    CPU decides these rows";
+
 /// `fcntl(F_GETFD)` on `fd`, or -1 when the number is not open.
 pub(super) fn flags(fd: RawFd) -> i32 {
     // SAFETY: `F_GETFD` reads one descriptor's flags; a closed number is -1.
@@ -76,19 +113,73 @@ fn round_trip_probe(
     got.trim_end().to_string()
 }
 
+/// The numbers a stage that must find them free is started with held: 3 and 4,
+/// where the lanes land, and 5 to 8, where `std`'s exec-status pipe would. A
+/// fresh exec does not leave them free everywhere. What a binary translator
+/// opens at the exec takes the lowest free numbers: Rosetta holds the binary it
+/// translates (binfmt_misc's `O` flag hands it over), itself, and two AOT cache
+/// files, measured on 3, 4, 6 and 7 in every process it runs (2026-10-17). So
+/// [`run_staged_held`]'s launcher holds these across the exec, whatever the
+/// translator opens lands above them, and the staged child frees exactly these
+/// ([`release_held`]) before it stages.
+const HELD: std::ops::RangeInclusive<RawFd> = 3..=8;
+
+/// Present in a staged child's environment when its launcher holds [`HELD`].
+const HELD_ENV: &str = "ATERM_UDS_SPAWNFD_HELD";
+
 /// Re-run this test binary as the staged child for `test` / `stage`, through
-/// [`InheritStrip`] so its table starts at stdio, and return its stdout.
+/// [`InheritStrip`] so it inherits stdio alone, and return its stdout.
 pub(super) fn run_staged(test: &str, stage: &str) -> String {
-    run_staged_with(test, stage, &[])
+    let mut launch = std::process::Command::new(std::env::current_exe().expect("the test binary"));
+    launch.args(["--exact", test, "--nocapture", "--test-threads=1"]);
+    launch_staged(launch, stage)
 }
 
-/// [`run_staged`] with more arguments for libtest (`--include-ignored`).
-pub(super) fn run_staged_with(test: &str, stage: &str, extra: &[&str]) -> String {
-    let mut launch = std::process::Command::new(std::env::current_exe().expect("the test binary"));
+/// [`run_staged`] for a stage that needs [`HELD`] free: `/bin/sh` opens
+/// `/dev/null` on each of them and `exec`s this test binary with them, and the
+/// staged child calls [`release_held`].
+fn run_staged_held(test: &str, stage: &str) -> String {
+    let redirections: String = HELD.map(|fd| format!(" {fd}</dev/null")).collect();
+    let mut launch = std::process::Command::new("/bin/sh");
     launch
+        .arg("-c")
+        .arg(format!("exec \"$0\" \"$@\"{redirections}"))
+        .arg(std::env::current_exe().expect("the test binary"))
         .args(["--exact", test, "--nocapture", "--test-threads=1"])
-        .args(extra)
-        .env(STAGE_ENV, stage);
+        .env(HELD_ENV, "1");
+    launch_staged(launch, stage)
+}
+
+/// Free [`HELD`] in a staged child whose launcher held them: each must still be
+/// the launcher's `/dev/null`, and is closed. A child launched without them
+/// ([`run_staged`]) is left as it is.
+fn release_held() {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+    if std::env::var_os(HELD_ENV).is_none() {
+        return;
+    }
+    let null = std::fs::metadata("/dev/null")
+        .expect("stat /dev/null")
+        .rdev();
+    for fd in HELD {
+        assert_ne!(flags(fd), -1, "fd {fd}, which the launcher held, is closed");
+        // SAFETY: `fd` is open (just checked); the `File` is never dropped, so
+        // it only borrows the descriptor for one `fstat`.
+        let file = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
+        let meta = file.metadata().expect("fstat a held descriptor");
+        assert!(
+            meta.file_type().is_char_device() && meta.rdev() == null,
+            "fd {fd} is not the /dev/null the launcher held there: {meta:?}"
+        );
+        // SAFETY: the launcher's descriptor, which nothing else here owns.
+        drop(unsafe { OwnedFd::from_raw_fd(fd) });
+    }
+}
+
+/// Start a staged child (`launch`, the stage named in [`STAGE_ENV`]) through
+/// [`InheritStrip`] and return its stdout, failing on its failure.
+fn launch_staged(mut launch: std::process::Command, stage: &str) -> String {
+    launch.env(STAGE_ENV, stage);
     let strip = InheritStrip::prepare();
     // SAFETY: the closure runs between fork and exec and calls only
     // `InheritStrip::apply`, which is async-signal-safe.
@@ -98,7 +189,7 @@ pub(super) fn run_staged_with(test: &str, stage: &str, extra: &[&str]) -> String
             Ok(())
         });
     }
-    let out = launch.output().expect("re-exec this test binary");
+    let out = launch.output().expect("start the staged child");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
         out.status.success(),
@@ -210,18 +301,6 @@ pub(super) fn raise_soft_limit(want: u64) -> u64 {
 // The lanes, end to end
 // ---------------------------------------------------------------------------
 
-/// END TO END: a child that reads fd 3 and writes fd 4 sees the parent's
-/// socketpair ends at those exact numbers.
-#[test]
-fn a_child_reads_fd_three_and_writes_fd_four() {
-    let (near_verb, far_verb) = UnixStream::pair().expect("socketpair");
-    let (near_push, far_push) = UnixStream::pair().expect("socketpair");
-    assert_eq!(
-        round_trip(far_verb.into(), far_push.into(), (near_verb, near_push)),
-        "got:hello:"
-    );
-}
-
 /// **THE LANE CHILD INHERITS ITS TWO LANES AND NOTHING ELSE ABOVE STDIO.** An
 /// unflagged descriptor of this process (from 64 up) must not reach it, while
 /// fds 3 and 4 still round-trip. (In process: the stand-in lives for the one
@@ -251,6 +330,7 @@ const HIGH_VERB: RawFd = 10_240;
 
 /// One placement scenario, run INSIDE the staged child.
 fn staged_placement(which: &str) {
+    release_held();
     let (near_verb, far_verb) = UnixStream::pair().expect("socketpair");
     let (near_push, far_push) = UnixStream::pair().expect("socketpair");
     // Everything to 20 and up first, so 3..=6 are free to stage on.
@@ -306,8 +386,8 @@ fn staged_placement(which: &str) {
 /// target (3, or 4), the two sources on each other's targets, and sources at
 /// 10 240 and 20 000 (where Darwin's libc refuses a file action; 20 000 or the
 /// host's highest number) — each in a fresh table where those numbers are
-/// exactly where the staging put them. A host that cannot hand out a number
-/// above 10 240 skips the high stage, saying so.
+/// exactly where the staging put them (held across the exec, [`HELD`]). A host
+/// that cannot hand out a number above 10 240 skips the high stage, saying so.
 #[test]
 fn every_lane_source_reaches_its_number_wherever_it_started() {
     const NAME: &str = "spawnfd::tests::every_lane_source_reaches_its_number_wherever_it_started";
@@ -319,7 +399,7 @@ fn every_lane_source_reaches_its_number_wherever_it_started() {
         if stage == "high" && !host_holds(HIGH_VERB + 1, " (stage high)") {
             continue;
         }
-        let out = run_staged(NAME, stage);
+        let out = run_staged_held(NAME, stage);
         assert!(
             out.contains(&format!("STAGED {stage} ok")),
             "stage {stage}: {out}"
@@ -384,18 +464,19 @@ fn lanes() -> (OwnedFd, OwnedFd) {
     (a.into(), b.into())
 }
 
-/// One exec-failure scenario in the staged child: fds 3..=8 FREE at the spawn,
+/// One exec-failure scenario in the staged child: fds 3..=8 ([`HELD`]) FREE at the spawn,
 /// which is where a `Command`'s own exec-status pipe would land — and where a
 /// `pre_exec` `dup2` onto 3 and 4 would clobber it, turning the failure into
 /// `Ok` (refuted by name by the descriptor-protocol model).
 fn staged_exec_failure() {
+    release_held();
     let dir = std::env::temp_dir().join(format!("spawnfd-noexec-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("scratch dir");
     let not_executable = dir.join("plain");
     std::fs::write(&not_executable, b"#!/bin/sh\nexit 0\n").expect("write");
     let (a, b) = lanes();
     let (a, b) = (park(a, 20), park(b, 20));
-    for fd in 3..=8 {
+    for fd in HELD {
         assert_eq!(flags(fd), -1, "fd {fd} must be free for this stage");
     }
     let missing = spawn_with_two_fds(LaneCommand::new("/nonexistent/aterm-spawnfd"), a, b);
@@ -425,7 +506,7 @@ fn a_failed_exec_is_an_error_never_a_child() {
         staged_exec_failure();
         return;
     }
-    let out = run_staged(NAME, "exec-failure");
+    let out = run_staged_held(NAME, "exec-failure");
     assert!(out.contains("STAGED exec-failure ok"), "{out}");
 }
 
@@ -1046,4 +1127,27 @@ fn preparing_a_fork_passes_the_libnotify_gate() {
         let out = run_staged(NAME, stage);
         assert!(out.contains(&format!("STAGED {stage} ok")), "{out}");
     }
+}
+
+/// The raw boundary's valid caller gives up its only owner before admission.
+/// Compile-only controls separately require an explicit unsafe call.
+#[test]
+fn adoption_takes_an_exclusively_owned_inherited_socket() {
+    let (near, mut far) = UnixStream::pair().expect("socketpair");
+    let fd = std::os::fd::IntoRawFd::into_raw_fd(near);
+    // SAFETY: this fixture alone holds the unowned raw number; the other end
+    // has a different descriptor, and nobody closes/replaces this one.
+    assert_eq!(unsafe { fcntl(fd, F_SETFD, 0) }, 0);
+    // SAFETY: the owner was given up above; this call consumes it exactly once.
+    let adopted = unsafe { adopt_inherited_socket(fd) }.expect("adopt inherited socket");
+    assert_ne!(adopted.as_raw_fd(), fd, "the adoption is a copy");
+    assert_ne!(flags(adopted.as_raw_fd()) & FD_CLOEXEC, 0);
+    let mut adopted = UnixStream::from(adopted);
+    let limit = Some(Duration::from_secs(60));
+    adopted.set_write_timeout(limit).unwrap();
+    far.set_read_timeout(limit).unwrap();
+    adopted.write_all(b"x").expect("write through the copy");
+    let mut byte = [0u8; 1];
+    far.read_exact(&mut byte).expect("the far end reads it");
+    assert_eq!(&byte, b"x");
 }

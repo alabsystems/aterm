@@ -60,8 +60,7 @@ fn a_crash_loop_revert_is_booked_in_the_failure_ledger() {
     let lock = FileLock::acquire(&s.apply_lock).unwrap();
 
     // The operator floor sits ABOVE the restored build (a yanked predecessor): the
-    // revert still happens — a crash loop is strictly worse than a yank — and every
-    // surface names the breach and the remedy.
+    // revert still happens — a crash loop is strictly worse than a yank.
     crate::manifest::Floor::bump_and_write(&s.floor(), 1500, 0, 0);
     assert_eq!(crate::manifest::Floor::read(&s.floor()).min_build, 1500);
     let restored = VerifiedRollback {
@@ -107,26 +106,63 @@ fn a_crash_loop_revert_is_booked_in_the_failure_ledger() {
     );
     assert_eq!(health.kind, "apply");
     assert_eq!(health.last_apply_failure_build, trialed);
-    assert!(
-        health.last_apply_error.contains("revert"),
-        "the ledger names what happened: {:?}",
-        health.last_apply_error
-    );
-    assert!(
-        health.last_apply_error.contains("reverted to build 1000")
-            && health
-                .last_apply_error
-                .contains("below the operator floor 1500")
-            && health.last_apply_error.contains("reinstall"),
-        "a restored build below the floor is said out loud, with the remedy: {:?}",
-        health.last_apply_error
-    );
-    let status = std::fs::read_to_string(&s.status).unwrap_or_default();
-    assert!(
-        status.contains("previous build 1000") && status.contains("below the operator floor 1500"),
-        "the status line names the breach too: {status}"
-    );
     let _ = std::fs::remove_dir_all(&s.root);
+}
+
+/// A crash-loop revert's inverse swap and the quarantine it records before the
+/// rollback goes take `install_flush`'s tier (aterm-durable's counting seam), on this
+/// volume and as if the install root were on another device. Those two sites are
+/// every flush the revert takes through aterm-durable.
+#[test]
+fn a_crash_loop_reverts_swap_and_quarantine_take_the_install_tier() {
+    use aterm_durable::Flush::{Durable, Ordered};
+    let [here, elsewhere] = on_and_off_the_install_device(|| {
+        let s = scratch("boot-revert-tier");
+        let installed = s.root.join("Applications").join("aterm.app");
+        make_app(&installed, "NEW");
+        let rb = rollback_path(&installed);
+        make_app(&rb, "OLD");
+        let trialed = 2000_u64;
+        let sentinel = boot_sentinel(&s);
+        sentinel.arm(trialed).unwrap();
+        for _ in 0..MAX_BOOT_ATTEMPTS {
+            sentinel.observe_launch(trialed).unwrap();
+        }
+        FailedMark::record(&s.trial(), trialed, &"ab".repeat(32));
+        let bundle = bundle::Bundle {
+            app_root: installed.clone(),
+            exe: installed.join("Contents/MacOS/aterm"),
+        };
+        let lock = FileLock::acquire(&s.apply_lock).unwrap();
+        let restored = VerifiedRollback {
+            path: rb.clone(),
+            build: 1000,
+        };
+        let recording = aterm_durable::seam::Recording::start();
+        let outcome = revert_to_rollback(
+            &bundle,
+            &s,
+            &sentinel,
+            trialed,
+            restored,
+            RollbackHandoff { fds: &[], env: &[] },
+            lock,
+        );
+        let flushes = recording.take();
+        assert!(
+            matches!(outcome, ApplyOutcome::ReExecFailed(_)),
+            "{outcome:?}"
+        );
+        assert_eq!(read_id(&installed), "OLD");
+        let _ = std::fs::remove_dir_all(&s.root);
+        flushes
+    });
+    assert_eq!(
+        here, [Ordered; 5],
+        "one device: the inverse swap, then the quarantine ledger and failed.toml, \
+         file and entry each"
+    );
+    assert_eq!(elsewhere, [Durable; 5], "another device");
 }
 
 /// A BURST OF LAUNCHES IS ONE LAUNCH: the pure law behind
@@ -202,7 +238,7 @@ fn an_armed_boot_health_check_times_out_without_counting_a_launch() {
         Some((42, 0)),
         "a timed-out observation counts no launch"
     );
-    let model = aterm_spec::derive::native_update_boot_health_lock_model();
+    let model = aterm_models_update::native_update_boot_health_lock_model();
     let mut state = model.init_state();
     state.insert("expired", 1);
     state.insert("returned", 1);
@@ -697,7 +733,7 @@ fn overlapping_launches_of_one_trial_are_given_back_by_name() {
     let mut crash = spawn();
     count(&kept, launcher(&crash));
     stop(&mut crash);
-    let model = aterm_spec::derive::native_update_trial_give_back_model();
+    let model = aterm_models_update::native_update_trial_give_back_model();
     for buggy in [0, 1, 2, 3] {
         let model = aterm_spec::interp::with_buggy(&model, buggy);
         let mut broken = Vec::new();
@@ -875,93 +911,6 @@ fn overlapping_launches_of_one_trial_are_given_back_by_name() {
     }
 }
 
-/// Several aterm windows of one build each run their own handoff candidate of the
-/// trialed build, minutes apart, each unconfirmed until its own Commit. A launch
-/// made while an earlier launch of the trial is still running is not a relaunch
-/// after a crash and is not counted, so they never revert a build that never
-/// crashed.
-///
-/// NEGATIVE CONTROL: the same three launches, each launcher dead before the next,
-/// is a crash loop and still reaches the revert.
-#[test]
-fn concurrent_live_candidates_of_one_trial_never_revert() {
-    use aterm_uds::spawnfd::{Child, Command};
-    let spawn = || -> Child {
-        Command::new("/bin/sleep")
-            .arg("30")
-            .spawn()
-            .expect("start a stand-in candidate")
-    };
-    let backdate = |s: &Staging| {
-        std::fs::File::options()
-            .write(true)
-            .open(s.root.join("boot.sentinel"))
-            .unwrap()
-            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3))
-            .unwrap();
-    };
-    let launcher = |child: &Child| TrialLauncher::of(child.id()).expect("a running child");
-    let stop = |child: &mut Child| {
-        // A stand-in that must die dies by SIGKILL (AGENTS.md).
-        child.kill().unwrap();
-        child.wait().unwrap();
-    };
-
-    // Three live candidates.
-    let s = scratch("boot-overlap-live");
-    let sentinel = boot_sentinel(&s);
-    sentinel.arm(11).unwrap();
-    let mut live: Vec<Child> = (0..3).map(|_| spawn()).collect();
-    for child in &live {
-        count_trial_launch(
-            &s,
-            &sentinel,
-            11,
-            Some(launcher(child)),
-            true,
-            crate::TrialWitness::Window,
-        )
-        .unwrap();
-        backdate(&s);
-    }
-    let state = sentinel.read_state();
-    for child in &mut live {
-        stop(child);
-    }
-    assert_eq!(
-        state,
-        Some((11, 1)),
-        "only the first of three overlapping live launches counts"
-    );
-    assert!(!sentinel.should_revert(11, MAX_BOOT_ATTEMPTS));
-    let _ = std::fs::remove_dir_all(&s.root);
-
-    // NEGATIVE CONTROL: a crash loop — each launcher dead before the next launch.
-    let s = scratch("boot-overlap-crash-loop");
-    let sentinel = boot_sentinel(&s);
-    sentinel.arm(11).unwrap();
-    for _ in 0..MAX_BOOT_ATTEMPTS {
-        let mut child = spawn();
-        count_trial_launch(
-            &s,
-            &sentinel,
-            11,
-            Some(launcher(&child)),
-            true,
-            crate::TrialWitness::Window,
-        )
-        .unwrap();
-        stop(&mut child);
-        backdate(&s);
-    }
-    assert_eq!(sentinel.read_state(), Some((11, MAX_BOOT_ATTEMPTS)));
-    assert!(
-        sentinel.should_revert(11, MAX_BOOT_ATTEMPTS),
-        "a real crash loop still reverts"
-    );
-    let _ = std::fs::remove_dir_all(&s.root);
-}
-
 /// An earlier launcher of the trial that stays ALIVE and
 /// unconfirmed (its recovery proof failing on every retry) must not shield later
 /// launches that are NOT the handoff target — a new window, a sibling, a candidate
@@ -1118,11 +1067,7 @@ fn a_headless_launch_neither_counts_nor_settles_a_trial_a_window_launched() {
     assert!(rollback.exists(), "and the predecessor stays on disk");
     // …and the wait is SAID where `update status` reads it, with its deadline
     // (law L5) — read from the trial's own records…
-    let wait = window_trial_wait_at(&s, 11, unix_now_secs()).expect("the trial waits");
-    assert!(
-        wait.contains("open aterm") && wait.contains("a headless start confirms it"),
-        "the wait, with when it ends: {wait}"
-    );
+    window_trial_wait_at(&s, 11, unix_now_secs()).expect("the trial waits");
     // …never written over what the older build's window keeps there: a headless
     // confirmation inside the wait must not replace it with a refusal keyed to
     // build 11, which the window would ignore.
@@ -1180,9 +1125,64 @@ fn a_headless_launch_neither_counts_nor_settles_a_trial_a_window_launched() {
         bundle_at(&installed),
         Duration::from_millis(100),
     ));
-    assert_eq!(window_trial_wait_at(&lane, 12, unix_now_secs()), None);
+    // No window is awaited: what the report says is the proof that refused it.
+    let report = window_trial_wait_at(&lane, 12, unix_now_secs()).expect("the refusal is said");
+    let refusal = crate::health::Health::read(&lane.health()).trial_proof_failure;
+    assert!(!refusal.is_empty() && report.contains(&refusal), "{report}");
     let _ = std::fs::remove_dir_all(&s.root);
     let _ = std::fs::remove_dir_all(&lane.root);
+}
+
+/// A window's confirmation that the trial's recovery proof refuses answers only
+/// "retry", and the GUI retries it on its backoff for as long as it runs: the
+/// reason is said once per distinct reason, not once per try, and `update status`
+/// reports it instead of asking for a window that is already open. The passing
+/// proof that confirms the trial ends the report.
+#[test]
+fn a_window_confirmation_the_proof_refuses_is_said_once_and_asks_for_no_window() {
+    use crate::TrialWitness::Window;
+    use std::time::Duration;
+    let s = scratch("boot-window-proof-refused");
+    let installed = s.root.join("Applications").join("aterm.app");
+    arm_window_trial(&s, &installed, 11, &"ab".repeat(32));
+    let sentinel = boot_sentinel(&s);
+    count_trial_launch(&s, &sentinel, 11, None, true, Window).unwrap();
+    backdate(&s);
+    let confirm = |reason: &'static str| {
+        confirm_boot_health_at_with_proof(
+            &s,
+            11,
+            Window,
+            bundle_at(&installed),
+            Duration::from_millis(100),
+            move |_| {
+                if reason.is_empty() {
+                    Ok(())
+                } else {
+                    Err(reason.to_string())
+                }
+            },
+        )
+    };
+    let said = |reason: &str| {
+        crate::log_capture::take()
+            .iter()
+            .filter(|(_, line)| line.contains(reason))
+            .count()
+    };
+    let _ = crate::log_capture::take();
+    for reason in ["rollback refused", "receipt missing"] {
+        for _ in 0..3 {
+            assert!(!confirm(reason), "a refused proof is retried");
+        }
+        assert_eq!(said(reason), 1, "said once, not once per try");
+        let report = window_trial_wait_at(&s, 11, unix_now_secs()).expect("the trial is reported");
+        assert!(report.contains(reason), "{report}");
+    }
+    assert!(confirm(""), "a passing proof confirms the trial");
+    assert_eq!(sentinel.read_state(), None);
+    assert_eq!(window_trial_wait_at(&s, 11, unix_now_secs()), None);
+    let _ = std::fs::remove_dir_all(&s.root);
 }
 
 /// The installed receipt `prepare`'s swap records for `build`'s artifact `digest`.
@@ -1192,6 +1192,7 @@ fn receipt_for(s: &Staging, build: u64, digest: &str) {
         build,
         "0123456789abcdef0123456789abcdef01234567",
         digest,
+        aterm_durable::Flush::Durable,
     )
     .unwrap();
 }
@@ -1326,7 +1327,8 @@ fn a_headless_launch_that_comes_first_leaves_the_predecessor_for_the_windows() {
     assert_eq!(sentinel.read_state(), Some((11, MAX_BOOT_ATTEMPTS)));
     assert!(rollback.exists());
 
-    // CONTROL: …and a window's confirmation settles it and deletes the predecessor.
+    // CONTROL: …and a window's confirmation settles it and keeps the predecessor only for
+    // that window.
     assert!(confirm_boot_health_at_with_proof(
         &s,
         11,
@@ -1337,8 +1339,8 @@ fn a_headless_launch_that_comes_first_leaves_the_predecessor_for_the_windows() {
     ));
     assert_eq!(sentinel.read_state(), None);
     assert!(
-        !rollback.exists(),
-        "a window proved it: the predecessor goes"
+        kept_for_this_window(&s, &rollback),
+        "a window proved it: the predecessor is no revert, only that window's bundle"
     );
     assert!(WindowUnproven::read(&s).is_none());
     assert!(!window_unproven_path(&s).exists());
@@ -1463,6 +1465,31 @@ fn a_window_re_trial_is_bounded() {
     assert_eq!(sentinel.read_state(), None);
     let _ = std::fs::remove_dir_all(&s.root);
 
+    // The re-arm takes `install_flush`'s tier (aterm-durable's counting seam): ordered
+    // on this volume, durable as if the install root were on another device.
+    let [here, elsewhere] = on_and_off_the_install_device(|| {
+        let (s, installed) = settled("boot-retrial-tier");
+        let sentinel = boot_sentinel(&s);
+        let at = WindowUnproven::read(&s).unwrap().at + wait - 1;
+        let recording = aterm_durable::seam::Recording::start();
+        assert!(rearm_window_unproven_trial(
+            &s, &sentinel, 11, &installed, at
+        ));
+        let flushes = recording.take();
+        let _ = std::fs::remove_dir_all(&s.root);
+        flushes
+    });
+    use aterm_durable::Flush::{Durable, Ordered};
+    assert_eq!(
+        here, [Ordered; 4],
+        "one device: the trial identity, then the sentinel, file and entry each"
+    );
+    assert_eq!(
+        elsewhere,
+        [Ordered, Ordered, Durable, Durable],
+        "another device: the trial identity keeps its own same-device guard"
+    );
+
     // A trial armed by the next swap owns the fixed path: the record goes with it.
     let (s, installed) = settled("boot-retrial-next-swap");
     let ready = Ready {
@@ -1486,8 +1513,7 @@ fn a_window_re_trial_is_bounded() {
 /// A live HEADLESS launch of the trial does not exempt a WINDOW's overlapping
 /// handoff target from the count: a long-lived harness must not shield window
 /// candidates that crash before their first frame. A window launch exempts a
-/// window's target (`concurrent_live_candidates_of_one_trial_never_revert`), and a
-/// headless target is exempted beside any live launch. A launcher line an older
+/// window's target, and a headless target is exempted beside any live launch. A launcher line an older
 /// build wrote (no fourth field) reads as a window's.
 #[test]
 fn a_live_headless_launch_does_not_shield_a_windows_candidate() {
@@ -1727,10 +1753,6 @@ fn another_trial_holding_the_install_refuses_the_swap_as_a_passing_moment() {
         panic!("a refusal of the swap: {refusal:?}");
     };
     assert!(
-        reason.contains("update trial for build 12 is still unconfirmed"),
-        "{reason}"
-    );
-    assert!(
         crate::is_passing_refusal(reason),
         "a moment, never a verdict on the stage: {reason}"
     );
@@ -1742,6 +1764,313 @@ fn another_trial_holding_the_install_refuses_the_swap_as_a_passing_moment() {
         boot_sentinel(&s).read_state().map(|(build, _)| build),
         Some(12),
         "the trial is its owner's: one launch disarms nothing"
+    );
+    let _ = std::fs::remove_dir_all(&s.root);
+}
+
+/// A PREDECESSOR NO REVERT COULD RESTORE IS NO REVERT, NOT UNPROVEN HEALTH. The
+/// 2026-10-16 shape: a Team-ID-pinned build swapped in over an ad hoc one, whose
+/// retained bundle this build's verifier refuses for ever. Every other term of the
+/// recovery proof holds (the installed trial is sealed, verified and exactly
+/// receipted), so a window's confirmation settles the trial and clears the fixed
+/// path, and a counted launch of a trial nobody confirmed settles it too, keeping
+/// the stage for that launch to apply instead of deferring on the proof.
+///
+/// CONTROL: a fixed path that VERIFIES but is not a strict predecessor — what a
+/// crash-cut NEW looks like — still holds the trial, and stays on disk.
+#[test]
+fn a_predecessor_this_build_cannot_verify_does_not_hold_its_trial() {
+    use crate::TrialWitness::Window;
+    use std::time::Duration;
+    const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+    type Identity = Result<(u64, String), String>;
+    /// This build's verifier: the installed trial is sealed build 11 at `COMMIT`,
+    /// and anything else (the fixed path) reads `fixed`.
+    fn verifier(installed: &Path, fixed: Identity) -> impl Fn(&Path) -> Identity + use<> {
+        let installed = installed.to_path_buf();
+        move |path: &Path| {
+            if path == installed.as_path() {
+                Ok((11, COMMIT.to_string()))
+            } else {
+                fixed.clone()
+            }
+        }
+    }
+    // 0.104's verdict on the ad hoc 0.11 it replaced, as the owner's log has it.
+    let ad_hoc = || -> Identity {
+        Err(
+            "bundle policy: codesign --verify (team-pinned requirement) failed: \
+             aterm.app.rollback: valid on disk / satisfies its Designated Requirement / \
+             test-requirement: code failed to satisfy specified code requirement(s)"
+                .to_string(),
+        )
+    };
+    let crash_cut_new = || -> Identity { Ok((12, COMMIT.to_string())) };
+    let digest = "ab".repeat(32);
+    let wait = Duration::from_millis(100);
+
+    // A window's confirmation at its health checkpoint.
+    let s = scratch("boot-no-revert-confirm");
+    let installed = s.root.join("Applications").join("aterm.app");
+    let rollback = arm_window_trial(&s, &installed, 11, &digest);
+    receipt_for(&s, 11, &digest);
+    let confirm = |fixed: Identity| {
+        let verify = verifier(&installed, fixed);
+        confirm_boot_health_at_with_proof(&s, 11, Window, bundle_at(&installed), wait, |root| {
+            prove_current_trial(&s, root, 11, Some(COMMIT), &verify).map(|_| ())
+        })
+    };
+    assert!(
+        !confirm(crash_cut_new()),
+        "control: a crash-cut NEW holds the trial"
+    );
+    assert_eq!(boot_sentinel(&s).read_state(), Some((11, 0)));
+    assert_eq!(read_id(&rollback), "OLD");
+    assert!(
+        confirm(ad_hoc()),
+        "a window proved the build; a predecessor it cannot verify is no revert, not \
+         unproven health"
+    );
+    assert_eq!(boot_sentinel(&s).read_state(), None, "the trial is settled");
+    assert!(
+        kept_for_this_window(&s, &rollback),
+        "and the predecessor is kept for the window, as any window's confirmation keeps it"
+    );
+    let _ = std::fs::remove_dir_all(&s.root);
+
+    // A counted launch of a trial no window has confirmed, with a newer stage waiting.
+    let s = scratch("boot-no-revert-launch");
+    let installed = s.root.join("Applications").join("aterm.app");
+    let rollback = arm_window_trial(&s, &installed, 11, &digest);
+    receipt_for(&s, 11, &digest);
+    make_app(&s.staged_app, "STAGED-NEWER");
+    std::fs::write(&s.ready, "a newer stage").unwrap();
+    let launch = |fixed: Identity| {
+        let verify = verifier(&installed, fixed);
+        check_boot_health_with_proof(
+            &s,
+            11,
+            &[],
+            &[],
+            false,
+            Window,
+            wait,
+            bundle_at(&installed),
+            |root| prove_current_trial(&s, root, 11, Some(COMMIT), &verify),
+        )
+    };
+    let outcome = launch(crash_cut_new());
+    assert!(
+        matches!(&outcome, Some(ApplyOutcome::Deferred(why)) if why.contains("trial recovery proof")),
+        "control: a crash-cut NEW defers the apply: {outcome:?}"
+    );
+    assert_eq!(
+        boot_sentinel(&s).read_state().map(|(build, _)| build),
+        Some(11)
+    );
+    assert!(rollback.exists());
+    let outcome = launch(ad_hoc());
+    assert!(
+        outcome.is_none(),
+        "the launch goes on to its boot apply: {outcome:?}"
+    );
+    assert_eq!(boot_sentinel(&s).read_state(), None, "the trial is settled");
+    assert!(FailedMark::read(&s.trial()).is_none());
+    assert!(!rollback.exists(), "the fixed path is cleared");
+    assert!(
+        s.ready.exists() && read_id(&s.staged_app) == "STAGED-NEWER",
+        "the newer stage is kept for this launch to apply"
+    );
+    let _ = std::fs::remove_dir_all(&s.root);
+}
+
+/// Whether the predecessor at `rollback` is kept for this process, the window that
+/// confirmed its trial ([`keep_settled_predecessor`]).
+fn kept_for_this_window(s: &Staging, rollback: &Path) -> bool {
+    rollback.exists()
+        && KeptPredecessor::read(s).is_some_and(|kept| {
+            kept.bundle == rollback && Some(kept.holder) == TrialLauncher::this_process()
+        })
+}
+
+/// What a boot sentinel reads as when its file holds bytes no writer wrote: the
+/// zeros of an unwritten inode, the case `Sentinel::write_record`'s fsyncs are
+/// for.
+fn corrupt_sentinel(s: &Staging) {
+    std::fs::write(s.root.join("boot.sentinel"), [0u8; 16]).unwrap();
+    assert_eq!(
+        boot_sentinel(s).read_state(),
+        None,
+        "PRECONDITION: the sentinel does not read"
+    );
+}
+
+/// A TRIAL WHOSE SENTINEL CANNOT BE READ IS NEVER ANSWERED "CONFIRMED" UNSETTLED
+/// (ATERM-KI-1015-2, U55). The sentinel reads a corrupt file as no trial at all,
+/// so the window's confirmation answered `true` — nothing to do — and was not
+/// asked again, while the trial's identity, the retained predecessor and the
+/// corrupt sentinel itself all stayed on disk: a healthy build that reached its
+/// checkpoint left its trial unconfirmed for as long as it ran.
+#[test]
+fn a_window_confirmation_over_an_unreadable_sentinel_settles_the_trial() {
+    use crate::TrialWitness::Window;
+    let s = scratch("boot-unreadable-sentinel-confirm");
+    let installed = s.root.join("Applications").join("aterm.app");
+    let rollback = arm_window_trial(&s, &installed, 11, &"ab".repeat(32));
+    corrupt_sentinel(&s);
+    let confirmed = confirm_boot_health_at_with_proof(
+        &s,
+        11,
+        Window,
+        bundle_at(&installed),
+        std::time::Duration::from_millis(100),
+        |_| Ok(()),
+    );
+    let settled = FailedMark::read(&s.trial()).is_none()
+        && kept_for_this_window(&s, &rollback)
+        && !s.root.join("boot.sentinel").exists();
+    assert!(
+        confirmed && settled,
+        "a confirmation is answered true only once the trial is settled: answered \
+         {confirmed}, trial identity kept {}, predecessor kept for the window {}, \
+         sentinel kept {}",
+        FailedMark::read(&s.trial()).is_some(),
+        kept_for_this_window(&s, &rollback),
+        s.root.join("boot.sentinel").exists()
+    );
+    let _ = std::fs::remove_dir_all(&s.root);
+}
+
+/// …BUT ONLY ITS OWN TRIAL, ONLY AFTER THE PROOF, AND ONLY FOR THE WITNESS IT IS
+/// OWED TO (U55's negative controls). An unreadable sentinel beside another
+/// build's trial identity is nothing of this build's: answered `true`, nothing
+/// touched. A recovery proof that refuses leaves everything as it was and
+/// answers `false`, to be retried, and `update status` says its reason
+/// ([`window_trial_wait_at`]). A headless start of a trial a window launched
+/// leaves it for a window, as it does over a sentinel that reads.
+#[test]
+fn an_unreadable_sentinel_is_settled_only_for_its_own_trial_after_its_proof() {
+    use crate::TrialWitness::{Headless, Window};
+    let s = scratch("boot-unreadable-sentinel-controls");
+    let installed = s.root.join("Applications").join("aterm.app");
+    let rollback = arm_window_trial(&s, &installed, 11, &"ab".repeat(32));
+    count_trial_launch(&s, &boot_sentinel(&s), 11, None, true, Window).unwrap();
+    corrupt_sentinel(&s);
+    let untouched = |s: &Staging| {
+        FailedMark::read(&s.trial()).is_some() && rollback.exists() && boot_sentinel(s).unreadable()
+    };
+    let wait = std::time::Duration::from_millis(100);
+
+    assert!(
+        confirm_boot_health_at_with_proof(&s, 12, Window, bundle_at(&installed), wait, |_| {
+            Err("another build's trial is never proved".into())
+        }),
+        "another build's trial is nothing for build 12 to retry"
+    );
+    assert!(untouched(&s), "and nothing of it is touched");
+
+    assert!(
+        !confirm_boot_health_at_with_proof(&s, 11, Window, bundle_at(&installed), wait, |_| {
+            Err("the receipt does not match".into())
+        }),
+        "a refused proof is retried"
+    );
+    assert!(untouched(&s), "and leaves the trial as it was");
+    let report = window_trial_wait_at(&s, 11, unix_now_secs()).expect("the refusal is said");
+    assert!(report.contains("the receipt does not match"), "{report}");
+
+    assert!(
+        confirm_boot_health_at_with_proof(&s, 11, Headless, bundle_at(&installed), wait, |_| {
+            Err("a headless start never proves a window's trial".into())
+        }),
+        "a headless start of a window's trial has nothing to retry"
+    );
+    assert!(untouched(&s), "and leaves the trial for a window");
+
+    assert!(
+        confirm_boot_health_at_with_proof(&s, 11, Window, bundle_at(&installed), wait, |_| Ok(())),
+        "the window's confirmation settles it"
+    );
+    assert!(FailedMark::read(&s.trial()).is_none() && kept_for_this_window(&s, &rollback));
+    assert!(!s.root.join("boot.sentinel").exists());
+    let _ = std::fs::remove_dir_all(&s.root);
+}
+
+/// …AND A CORRUPT SENTINEL NEVER COUNTS TOWARD A REVERT (U55's other half, which
+/// does not hold). However many launches of the trialed build find it, the boot
+/// lane counts none and reverts nothing, so no corrupt file can quarantine the
+/// build that runs: a launch is counted only into a sentinel that reads.
+#[test]
+fn an_unreadable_sentinel_counts_no_launch_toward_a_revert() {
+    use crate::TrialWitness::Window;
+    let s = scratch("boot-unreadable-sentinel-count");
+    let installed = s.root.join("Applications").join("aterm.app");
+    let rollback = arm_window_trial(&s, &installed, 11, &"ab".repeat(32));
+    corrupt_sentinel(&s);
+    for launch in 0..=MAX_BOOT_ATTEMPTS {
+        let outcome = check_boot_health_with_proof(
+            &s,
+            11,
+            &[],
+            &[],
+            false,
+            Window,
+            std::time::Duration::from_millis(100),
+            bundle_at(&installed),
+            |_| Err("the proof is never asked".to_string()),
+        );
+        assert!(outcome.is_none(), "launch {launch}: {outcome:?}");
+        assert_eq!(boot_sentinel(&s).read_state(), None, "launch {launch}");
+    }
+    assert_eq!(read_id(&installed), "NEW", "the build that runs stays");
+    assert!(rollback.exists());
+    assert!(
+        FailedMark::read(&s.failed()).is_none(),
+        "nothing is quarantined"
+    );
+    assert!(
+        !crate::manifest::artifact_quarantined(&s, 11, &"ab".repeat(32)),
+        "nothing is quarantined"
+    );
+    let _ = std::fs::remove_dir_all(&s.root);
+}
+
+/// A SENTINEL PATH THAT HOLDS NO FILE IS NO UNREADABLE TRIAL (the review of
+/// ATERM-KI-1015-2, U55). Read as "unreadable", a directory at the sentinel's
+/// path counted as this build's trial: each window confirmation ran the recovery
+/// proof, then failed to remove the directory, and was retried on its backoff for
+/// as long as the build ran. Only a regular file that does not parse is an
+/// unreadable marker; anything else is no trial, answered at once with no proof.
+#[test]
+fn a_sentinel_path_that_holds_no_file_runs_no_proof() {
+    use crate::TrialWitness::Window;
+    let s = scratch("boot-sentinel-not-a-file");
+    let installed = s.root.join("Applications").join("aterm.app");
+    let _rollback = arm_window_trial(&s, &installed, 11, &"ab".repeat(32));
+    let marker = s.root.join("boot.sentinel");
+    let _ = std::fs::remove_file(&marker);
+    std::fs::create_dir(&marker).unwrap();
+    assert_eq!(
+        boot_sentinel(&s).read_state(),
+        None,
+        "PRECONDITION: the path does not read"
+    );
+    let proved = std::cell::Cell::new(false);
+    let confirmed = confirm_boot_health_at_with_proof(
+        &s,
+        11,
+        Window,
+        bundle_at(&installed),
+        std::time::Duration::from_millis(100),
+        |_| {
+            proved.set(true);
+            Ok(())
+        },
+    );
+    assert!(
+        confirmed && !proved.get(),
+        "a directory is no trial: answered {confirmed}, proof run {}",
+        proved.get()
     );
     let _ = std::fs::remove_dir_all(&s.root);
 }

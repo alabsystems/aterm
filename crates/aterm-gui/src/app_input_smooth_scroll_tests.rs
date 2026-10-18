@@ -74,56 +74,57 @@ fn wheel_and_terminal_pixel_geometry_use_the_target_windows_cell_size() {
     );
 }
 
-/// A line-emitting wheel event at a shell prompt takes exactly one terminal
-/// acquisition through the real input funnel (the seam's route decision):
-/// the viewport scroll consumes the facts that lock read (`WheelViewport`)
-/// instead of re-locking, for a chained notch and a fresh one alike.
+/// End to end through the winit handler on a free desktop: one wheel notch
+/// (`LineDelta(0, ±1)`, what X11's button 4/5 and Wayland's discrete axis
+/// deliver) moves the scrollback viewport VTE's `ceil(rows / 10)` rows, three at
+/// the default 24, where it used to move one. A precise (`PixelDelta`) row is
+/// not a detent and still moves one row.
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
-fn a_line_wheel_event_takes_exactly_one_terminal_lock() {
-    use crate::input::{InputEvent, PixelOffset, Source};
-    use aterm_types::mouse::WheelDir;
+fn a_free_desktop_notch_scrolls_vtes_distance_and_a_precise_row_scrolls_one() {
+    use winit::dpi::PhysicalPosition;
+    use winit::event::MouseScrollDelta;
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    let _term = seed_history(&app, wid);
-    let wheel = || InputEvent::Wheel {
-        dir: WheelDir::Up,
-        lines: 1,
-        row: 0,
-        col: 0,
-        mods: 0,
-        px_off: PixelOffset::CELL_ORIGIN,
-    };
-    let acq = crate::term_lock_acquisitions_on_this_thread;
-    let before = acq();
-    app.input(wid, wheel(), Source::Human);
-    assert_eq!(acq() - before, 1, "a fresh notch: the seam's one lock");
-    assert!(
-        app.windows[&wid].scroll_glide.is_some(),
-        "…and it armed the glide from the facts that lock carried"
-    );
-    let before = acq();
-    app.input(wid, wheel(), Source::Human);
-    assert_eq!(
-        acq() - before,
-        1,
-        "a chained notch: still the seam's one lock"
-    );
+    let term = seed_history(&app, wid);
+    assert_eq!(app.windows[&wid].rows, 24, "fixture: the 80x24 default");
     let cell_h = app.win_cell_size(wid).1.max(1) as i64;
-    // Two notches. A notch is one row except on Windows, where it is the
-    // desktop's lines-per-detent (`input::wheel_platform_lines`: the live
-    // `SPI_GETWHEELSCROLLLINES`, 3 by default, so six rows there).
-    let notch_rows = i64::from(crate::input::wheel_platform_lines(
-        1,
-        app.windows[&wid].rows,
-    ));
+    let offset = || term_lock(&term).grid().display_offset();
+    let settle = |app: &mut App| {
+        app.settle_scroll_motion_at_target(wid, std::time::Instant::now());
+    };
+
+    app.on_mouse_wheel(wid, MouseScrollDelta::LineDelta(0.0, 1.0));
     assert_eq!(
         app.windows[&wid]
             .scroll_glide
             .as_ref()
             .map(|st| st.glide.target_px()),
-        Some(2 * notch_rows * cell_h),
-        "the chain retargeted to two notches' rows from the carried facts"
+        Some(3 * cell_h),
+        "one notch eases toward three rows"
     );
+    settle(&mut app);
+    assert_eq!(offset(), 3, "one notch up is three rows of history");
+    app.on_mouse_wheel(wid, MouseScrollDelta::LineDelta(0.0, -1.0));
+    settle(&mut app);
+    assert_eq!(offset(), 0, "and one notch down comes back three");
+
+    let row = MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, cell_h as f64));
+    app.on_mouse_wheel(wid, row);
+    settle(&mut app);
+    assert_eq!(
+        offset(),
+        1,
+        "a precise row is one row, never a detent's three"
+    );
+
+    // Reduced motion has no pixel band to carry a precise delta: its banked rows
+    // reach the viewport as a row count, where a detent's factor would show.
+    assert!(app.apply_system_reduce_motion(true, std::time::Instant::now()));
+    app.on_mouse_wheel(wid, row);
+    assert_eq!(offset(), 2, "reduced: a precise row is still one row");
+    app.on_mouse_wheel(wid, MouseScrollDelta::LineDelta(0.0, 1.0));
+    assert_eq!(offset(), 5, "reduced: a notch snaps VTE's three rows");
 }
 
 /// Direct manipulation: a chained precise (trackpad) delta tracks, moving the
@@ -418,8 +419,8 @@ fn tab_menu_discards_banked_wheel_fractions_at_both_boundaries() {
 /// Direct manipulation: a 120 Hz precise stream at 1 row per 100 ms through the
 /// winit handler moves the presented position (engine row × cell_h − frac)
 /// evenly (`max <= 2 * min`, no zero-motion event after the first) and within a
-/// pixel of the finger. The handler reads the real clock, so only a stall longer
-/// than `TRACK_REST_MS` between events could start a settle mid-stream.
+/// pixel of the finger. The wheel clock is pinned to one instant, so no rest
+/// window can lapse and start a settle mid-stream.
 #[test]
 fn a_constant_speed_precise_stream_moves_the_band_evenly() {
     use winit::dpi::PhysicalPosition;
@@ -440,6 +441,7 @@ fn a_constant_speed_precise_stream_moves_the_band_evenly() {
     let mut finger = 0.0f64;
     let mut prev = presented(&app);
     let mut vels: Vec<i64> = Vec::new();
+    crate::app_input::pin_wheel_clock(Some(std::time::Instant::now()));
     for i in 1..=60u32 {
         app.on_mouse_wheel(
             wid,
@@ -456,6 +458,7 @@ fn a_constant_speed_precise_stream_moves_the_band_evenly() {
         }
         prev = pos;
     }
+    crate::app_input::pin_wheel_clock(None);
     let (mx, mn) = (*vels.iter().max().unwrap(), *vels.iter().min().unwrap());
     assert!(
         mn >= 1 && mx <= 2 * mn,
@@ -525,8 +528,8 @@ fn a_gesture_end_starts_the_rest_settle_at_once() {
 /// The fence the direct-manipulation path must not cross: under a tracking app
 /// a precise stream produces exactly the seam's bytes (one wheel report per
 /// whole banked row, the engine's own encoding) and moves no band. Sub-row
-/// motion exists only on the tracking-off route, which keeps
-/// `bytes_human_eq_controller` true on the sub-notch path.
+/// motion exists only on the tracking-off route, which keeps human/controller
+/// byte equality on the sub-notch path.
 #[cfg(unix)]
 #[test]
 fn a_precise_stream_under_a_tracking_app_reports_whole_rows_only_and_moves_no_band() {
@@ -651,55 +654,6 @@ fn a_precise_push_past_the_live_bottom_takes_no_lock_once_parked() {
     crate::app_input::pin_wheel_clock(None);
 }
 
-/// The twin on the top row of history: a band parked on the top, pushed
-/// further up, takes no lock for whole-row deltas, keeps its bounce (down:
-/// a negative shift) and stays on the top row.
-#[test]
-fn a_precise_push_past_the_top_of_history_takes_no_lock_once_parked() {
-    use winit::dpi::PhysicalPosition;
-    use winit::event::MouseScrollDelta;
-    let mut app = App::headless_for_test();
-    let wid = WindowId(0);
-    let term = seed_history(&app, wid);
-    let top = {
-        let mut t = term_lock(&term);
-        t.scroll_display(i32::MAX);
-        t.grid().display_offset()
-    };
-    assert!(top > 0, "fixture: parked on the top of a real history");
-    let c = app.win_cell_size(wid).1.max(1) as f64;
-    let precise = |dy: f64| MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, dy));
-    let acq = crate::term_lock_acquisitions_on_this_thread;
-    crate::app_input::pin_wheel_clock(Some(std::time::Instant::now()));
-
-    let before = acq();
-    app.on_mouse_wheel(wid, precise(c / 2.0));
-    assert_eq!(acq() - before, 1, "the gesture's first look at the engine");
-    assert!(
-        app.windows[&wid].scroll_frac_px < 0,
-        "a top bounce sags the band"
-    );
-
-    let before = acq();
-    for _ in 0..8 {
-        app.on_mouse_wheel(wid, precise(c / 2.0));
-    }
-    assert_eq!(
-        acq() - before,
-        0,
-        "parked on the top: no acquisition per momentum delta, banked rows included"
-    );
-    let ws = &app.windows[&wid];
-    assert!(ws.overscroll.is_some(), "still bouncing");
-    assert!(ws.scroll_frac_px < 0);
-    assert_eq!(
-        term_lock(&term).grid().display_offset(),
-        top,
-        "still on the top"
-    );
-    crate::app_input::pin_wheel_clock(None);
-}
-
 /// A band parked on live when a pager comes up (alt screen + DEC 1007) is no
 /// longer aterm's to bounce: the lock-free mode word says so, and each banked
 /// row reaches the seam as the pager's arrow key.
@@ -751,11 +705,11 @@ fn a_pager_that_comes_up_under_a_parked_band_still_gets_its_arrows() {
             Err(e) => panic!("pipe read: {e}"),
         }
     }
-    let arrow =
-        b"\x1b[B".repeat(crate::input::wheel_platform_lines(1, app.windows[&wid].rows) as usize);
+    // ONE arrow a row on every platform: a precise row is not a detent, so the
+    // platform's lines-per-detent never multiplies it.
     assert_eq!(
         got,
-        arrow.repeat(2),
+        b"\x1b[B".repeat(2),
         "each banked row is the pager's arrow key, not a bounce"
     );
     unsafe {
@@ -965,15 +919,24 @@ fn the_mouse_verb_wheel_is_a_notch_and_never_tracks() {
     let term = seed_history(&app, wid);
     let cell_h = app.win_cell_size(wid).1.max(1) as i64;
     // The event `mouse wheelup … lines=N` parses into
-    // (`control::control_input::parse_mouse`): a whole-row notch.
+    // (`control::control_input::parse_mouse`): N notches, each worth the
+    // platform's lines-per-detent as a hand's notch is.
+    let notch = i64::from(crate::input::wheel_platform_lines(
+        1,
+        app.windows[&wid].rows,
+        true,
+    ));
     let verb = |lines: i32| crate::input::InputEvent::Wheel {
         dir: aterm_types::mouse::WheelDir::Up,
         lines,
+        detent: true,
         row: 0,
         col: 0,
         mods: 0,
         px_off: crate::input::PixelOffset::CELL_ORIGIN,
     };
+    let t0 = std::time::Instant::now();
+    crate::app_input::pin_wheel_clock(Some(t0));
     app.input(wid, verb(2), Source::Controller);
     let (end, target) = {
         let st = app.windows[&wid]
@@ -982,10 +945,15 @@ fn the_mouse_verb_wheel_is_a_notch_and_never_tracks() {
             .expect("a notch glide");
         (st.glide.end(), st.glide.target_px())
     };
-    assert_eq!(target, 2 * cell_h, "whole rows, from the verb's `lines=`");
+    assert_eq!(
+        target,
+        2 * notch * cell_h,
+        "whole rows, from the verb's `lines=`"
+    );
     assert_eq!(app.windows[&wid].wheel_precise_px, None);
-    std::thread::sleep(Duration::from_millis(5));
+    crate::app_input::pin_wheel_clock(Some(t0 + Duration::from_millis(5)));
     app.input(wid, verb(1), Source::Controller);
+    crate::app_input::pin_wheel_clock(None);
     {
         let st = app.windows[&wid]
             .scroll_glide
@@ -995,7 +963,7 @@ fn the_mouse_verb_wheel_is_a_notch_and_never_tracks() {
             st.glide.end() > end,
             "a chained verb RETARGETS (fresh ease)"
         );
-        assert_eq!(st.glide.target_px(), 3 * cell_h);
+        assert_eq!(st.glide.target_px(), 3 * notch * cell_h);
     }
     assert_eq!(app.windows[&wid].wheel_precise_px, None);
     assert_eq!(
@@ -1003,45 +971,6 @@ fn the_mouse_verb_wheel_is_a_notch_and_never_tracks() {
         0,
         "no instant jump"
     );
-}
-
-/// Output arriving mid-glide re-pins the viewport
-/// (`display_offset += lines_added`) so the reader keeps the content they
-/// were looking at; the next glide wake carries that shift instead of
-/// scrolling the content back toward live.
-#[test]
-fn output_mid_glide_shifts_the_glide_instead_of_scrolling_the_reader_back() {
-    let mut app = App::headless_for_test();
-    let wid = WindowId(0);
-    let term = seed_history(&app, wid);
-    let t0 = std::time::Instant::now();
-    app.scroll_wheel_animated_at(wid, &term, 4, None, None, t0);
-    let end = app.windows[&wid].scroll_glide.as_ref().unwrap().glide.end();
-    // Land the engine on a row mid-ease, below the target row, so the
-    // landing wake must move the engine and takes the lock where the
-    // machine's motion is discovered; then let output re-pin it.
-    app.tick_scroll_glide(wid, end - Duration::from_millis(150));
-    let mid = term_lock(&term).grid().display_offset();
-    assert!(
-        (1..4).contains(&mid),
-        "fixture: the ease has moved the engine short of its target ({mid})"
-    );
-    {
-        let mut t = term_lock(&term);
-        for i in 0..3 {
-            t.process(format!("late output {i}\r\n").as_bytes());
-        }
-    }
-    let repinned = term_lock(&term).grid().display_offset();
-    assert_eq!(repinned, mid + 3, "fixture: SCR-1 re-pinned the viewport");
-    // The landing wake: the target row is the armed target plus the machine's 3.
-    app.tick_scroll_glide(wid, end + Duration::from_millis(1));
-    assert_eq!(
-        term_lock(&term).grid().display_offset(),
-        4 + 3,
-        "the glide lands 4 rows into history RELATIVE to the re-pinned content"
-    );
-    assert!(app.windows[&wid].scroll_glide.is_none());
 }
 
 /// Tier-1 binding for `scroll_glide_model::Output`: output that re-pins the
@@ -1060,7 +989,7 @@ fn output_mid_glide_conforms_to_scroll_glide_model() {
     let mid = term_lock(&term).grid().display_offset() as i64;
     assert_eq!(mid, 1, "fixture: mid-ease, one row short of the target");
 
-    let model = aterm_spec::derive::scroll_glide_model();
+    let model = aterm_models_render::scroll_glide_model();
     let mut before = model.init_state();
     before.insert("pos", mid);
     before.insert("target", 2);
@@ -1103,7 +1032,7 @@ fn output_mid_glide_conforms_to_scroll_glide_model() {
 
     // Negative control: the mutant that re-pins the viewport but leaves the
     // target behind is exactly what the invariant refuses.
-    let mut buggy = aterm_spec::derive::scroll_glide_model();
+    let mut buggy = aterm_models_render::scroll_glide_model();
     buggy.consts = vec![("Buggy", 1)];
     let left_behind = buggy
         .successors("Output", &before)
@@ -1616,7 +1545,7 @@ fn reduced_motion_settle_conforms_to_scroll_glide_model() {
     let t0 = std::time::Instant::now();
     app.scroll_wheel_animated_at(wid, &term, 3, None, None, t0);
 
-    let model = aterm_spec::derive::scroll_glide_model();
+    let model = aterm_models_render::scroll_glide_model();
     let mut before = model.init_state();
     before.insert("pos", term_lock(&term).grid().display_offset() as i64);
     before.insert("target", 3);

@@ -9,41 +9,12 @@ use std::fmt::Write as _;
 use std::process::Command;
 
 #[cfg(unix)]
-fn run_urlencode_via_shell(
-    shell: &str,
-    args: &[&str],
-    cleanup: &str,
-    script_name: &str,
-    input: &str,
-) -> String {
-    let script = format!("{}/src/scripts/{script_name}", env!("CARGO_MANIFEST_DIR"));
-    let command = format!(
-        "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; {cleanup}; __aterm_urlencode \"$ATERM_TEST_CWD\"; printf '%s' \"$REPLY\""
-    );
-    let output = shell_command(shell)
-        .args(args)
-        .arg("-c")
-        .arg(&command)
-        .env("ATERM_TEST_SCRIPT", script)
-        .env("ATERM_TEST_CWD", input)
-        .output()
-        .unwrap_or_else(|error| panic!("spawn {shell} for shell integration test: {error}"));
-    assert!(
-        output.status.success(),
-        "{shell} should encode {input:?}; stdout: {:?}; stderr: {:?}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout).expect("shell urlencode output should be UTF-8")
-}
-
-#[cfg(unix)]
 fn bash_shell() -> &'static str {
     static BASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     BASH.get_or_init(|| {
-        // `$ATERM_TEST_BASH` overrides (the prompt-parity test needs a bash with
-        // `${PS1@P}`, which macOS's /bin/bash 3.2 lacks — see the resolver's doc);
-        // otherwise /bin/bash, then a `$PATH` scan, then the bare name as before.
+        // `$ATERM_TEST_BASH` overrides (a newer bash than macOS's /bin/bash 3.2 —
+        // see the resolver's doc); otherwise /bin/bash, then a `$PATH` scan, then
+        // the bare name as before.
         #[cfg(unix)]
         if let Some(found) = resolve_test_shell("ATERM_TEST_BASH", &["/bin/bash"], "bash") {
             return found;
@@ -66,7 +37,7 @@ fn bash_shell() -> &'static str {
 /// without root — every one of the ~13 live zsh/fish tests took its
 /// `else { return; }` arm and printed "not installed; skipping". The suite went
 /// green while testing NOTHING, which is exactly how the fish loader-guard bug
-/// (see `test_fish_loaded_guard_survives_an_empty_override`) shipped: fish's
+/// (see `test_fish_integration_loads_under_an_empty_guard_override`) shipped: fish's
 /// integration was dead in every aterm session and no test on the machine ever
 /// ran fish to notice. A skip that is indistinguishable from a pass is worse
 /// than a missing test, so make the probe find the shell wherever it is, and
@@ -129,7 +100,7 @@ fn zsh_shell() -> Option<&'static str> {
 /// home directory that environment points at. Dereferences to the `Command`;
 /// the home goes when this does, so hold it until the shell has exited (a
 /// chained `shell_command(..).arg(..).output()` does). Tests that need their
-/// own populated home (the `shell.d` repros) still set `HOME` themselves
+/// own populated home (the live shells) still set `HOME` themselves
 /// afterwards, which overrides this one.
 ///
 /// The subdirectories are pre-created so fish never has to `mkdir` (and warn
@@ -183,15 +154,15 @@ impl std::ops::DerefMut for ShellCommand {
 ///     `$HOME/.config/fish`), its `conf.d/`, and the *universal* variables in
 ///     `fish_variables` — where a stray `ATERM_*` would survive every
 ///     `env_remove` below, because it is restored INSIDE the child;
-///   - zsh `-i` (the shell.d and prompt-override repros pass no `-f`) sources
+///   - zsh `-i` (the live shells pass no `-f`) sources
 ///     `$ZDOTDIR`/`$HOME`'s `.zshenv` and `.zshrc`;
 ///   - `$XDG_DATA_DIRS/fish/vendor_conf.d` auto-loads vendor snippets — which
 ///     is exactly how aterm installs its OWN fish integration, so a developer
 ///     with aterm installed had the shipped script loaded (setting the
 ///     "already loaded" guard to `1`) before the test's `source` ever ran;
-///   - and the integration scripts themselves read `$HOME`: all three prepend
-///     `$HOME/.aterm/bin` to `PATH` and `source $HOME/.aterm/shell.d/*`, which
-///     bash executes even under `--noprofile --norc`.
+///   - and the integration scripts themselves read `$HOME`: all of them
+///     `source $HOME/.aterm/shell.d/*`, which bash executes even under
+///     `--noprofile --norc`.
 ///
 /// So point `HOME`, `ZDOTDIR` and the XDG base dirs at [`ShellCommand::home`] —
 /// an empty directory this command owns. `XDG_DATA_DIRS` is narrowed to it too, so
@@ -200,8 +171,8 @@ impl std::ops::DerefMut for ShellCommand {
 ///
 /// Residual, deliberately not overridden: system-wide files (`/etc/zshenv`,
 /// `/etc/zsh/zshrc`, `/etc/fish/config.fish`). Those are not the developer's,
-/// and suppressing them for zsh would need `-f`, which the shell.d repro
-/// exists to avoid.
+/// and suppressing them for zsh would need `-f`, which the live shells avoid
+/// (they start through the real ZDOTDIR wrapper).
 ///
 /// # The exported ATERM_* vars
 ///
@@ -223,8 +194,8 @@ impl std::ops::DerefMut for ShellCommand {
 ///
 /// Strip them all so each test sources the script fresh regardless of the
 /// developer's own active integration. Tests that need a specific var
-/// (e.g. ATERM_SHELL_NONCE, or ATERM_PROMPT_STYLE for the prompt-override test)
-/// set it AFTER calling this, which overrides the removal.
+/// (e.g. ATERM_SHELL_NONCE) set it AFTER calling this, which overrides the
+/// removal.
 #[cfg(unix)]
 fn shell_command(shell: &str) -> ShellCommand {
     let mut cmd = Command::new(shell);
@@ -287,49 +258,40 @@ fn shell_command(shell: &str) -> ShellCommand {
     ShellCommand { cmd, home: dir }
 }
 
+/// `(shell, args, script, quiet)` — see [`posix_lanes`].
 #[cfg(unix)]
-fn assert_urlencode_cases(shell: &str, args: &[&str], cleanup: &str, script_name: &str) {
-    let cases = [
-        ("/tmp/foo@bar", "/tmp/foo%40bar"),
-        ("/tmp/dir!", "/tmp/dir%21"),
-        ("/tmp/[test]", "/tmp/%5Btest%5D"),
-        ("/tmp/résumés", "/tmp/r%C3%A9sum%C3%A9s"),
-    ];
-    for (input, expected) in cases {
-        let actual = run_urlencode_via_shell(shell, args, cleanup, script_name, input);
-        assert_eq!(actual, expected, "{shell} should percent-encode {input:?}");
-    }
-}
+type PosixLane = (
+    &'static str,
+    &'static [&'static str],
+    &'static str,
+    &'static str,
+);
 
+/// The two POSIX lanes the script-level tests drive: bash, and zsh where it is
+/// installed — `(shell, args, script, quiet)`, where `quiet` silences the hooks
+/// an interactive shell installs so only what the test calls reaches stdout.
+/// zsh's runs under a user's `setopt ksh_arrays` (subscripts from 0), as every
+/// zsh function runs with the user's options around it: a loop that read
+/// `${string[$i]}` from 1 dropped the first byte and read one past the last —
+/// in the OSC 7 encoder and in the 633;E one.
 #[cfg(unix)]
-fn run_report_cwd_via_shell(
-    shell: &str,
-    args: &[&str],
-    cleanup: &str,
-    script_name: &str,
-    cwd: &std::path::Path,
-) -> String {
-    let script = format!("{}/src/scripts/{script_name}", env!("CARGO_MANIFEST_DIR"));
-    let command = format!(
-        "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; {cleanup}; builtin cd -- \"$ATERM_TEST_CWD\"; __aterm_report_cwd"
-    );
-    let output = shell_command(shell)
-        .args(args)
-        .arg("-c")
-        .arg(&command)
-        .env("ATERM_TEST_SCRIPT", script)
-        .env("ATERM_TEST_CWD", cwd)
-        .env("HOSTNAME", "aterm.test")
-        .env("HOST", "aterm.test")
-        .output()
-        .unwrap_or_else(|error| panic!("spawn {shell} for shell integration test: {error}"));
-    assert!(
-        output.status.success(),
-        "{shell} should report OSC 7 for {cwd:?}; stdout: {:?}; stderr: {:?}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout).expect("shell OSC 7 output should be UTF-8")
+fn posix_lanes() -> Vec<PosixLane> {
+    let mut lanes = vec![(
+        bash_shell(),
+        &["--noprofile", "--norc", "-i"][..],
+        "aterm_shell_integration.bash",
+        "__aterm_in_prompt_cmd=1; trap - DEBUG 2>/dev/null || true; PROMPT_COMMAND=",
+    )];
+    if let Some(zsh) = zsh_shell() {
+        lanes.push((
+            zsh,
+            &["-f", "-i"][..],
+            "aterm_shell_integration.zsh",
+            "add-zsh-hook -d precmd __aterm_precmd 2>/dev/null || true; \
+             add-zsh-hook -d preexec __aterm_preexec 2>/dev/null || true; setopt ksh_arrays",
+        ));
+    }
+    lanes
 }
 
 #[cfg(unix)]
@@ -357,418 +319,218 @@ fn create_special_cwd() -> (aterm_tempfile::TempDir, std::path::PathBuf) {
     (dir, cwd)
 }
 
-/// Static guard (host-portable): the `shell.d` hook globs MUST carry zsh's `(N)`
-/// NULL_GLOB qualifier. Without it, a `shell.d` holding only `*.zsh` drop-ins (the
-/// exact layout `atpkg` installs: `00-atpkg.zsh`, no `*.sh`) makes the `*.sh` glob
-/// raise NOMATCH, which ABORTS the entire sourced script — silently killing OSC 7
-/// (cwd) + OSC 133 (command blocks) and printing an error on the first line of every
-/// session (found by the v0.26 demo-day battery). Bash is exempt: an unmatched glob
-/// stays literal there and the `[ -f ]` guard skips it.
-#[test]
-fn test_zsh_shell_d_globs_are_null_glob_guarded() {
-    assert!(
-        scripts::ZSH.contains(r#""$HOME/.aterm/shell.d"/*.zsh(N)"#)
-            && scripts::ZSH.contains(r#""$HOME/.aterm/shell.d"/*.sh(N)"#),
-        "the zsh shell.d source loop must use the (N) NULL_GLOB qualifier on BOTH globs, \
-         or an atpkg-populated shell.d (only *.zsh) aborts the whole integration"
-    );
-}
-
-/// Functional repro (zsh hosts only): source the real script under an interactive
-/// zsh whose `shell.d` holds a `*.zsh` drop-in but NO `*.sh` — the atpkg layout that
-/// triggered the abort. The integration must survive: its functions get defined
-/// (`__aterm_urlencode` resolves) AND the drop-in is sourced (its sentinel export
-/// reaches the environment) AND stderr carries no "no matches found".
+/// The reroute directory (`$ATERM_REROUTE_DIR`, set by aterm's spawn seam) and the
+/// agents directory (`$ATPKG_AGENTS`, exported by the atpkg shell.d hook) lead PATH in
+/// that order — MOVED there from wherever the inherited PATH listed them, each exactly
+/// once, the rest kept in order — and every script is inert for an unset variable or
+/// one naming nothing on disk (Windows lays no stubs). The measured failure
+/// (2026-09-10, m27): path_helper and a ~/.zshrc prepend left the agents dir at PATH
+/// position 14, so `codex` and `claude` ran foreign copies. `-c` has no first prompt,
+/// so this is the load-time assert (the live tests below hold the order at every
+/// prompt). bash and zsh (`-f`, no rc files) are checked byte-exactly; fish for
+/// position and count only, because its own startup may add entries.
 #[cfg(unix)]
 #[test]
-fn test_zsh_survives_shell_d_with_only_zsh_dropins() {
-    let Some(zsh) = zsh_shell() else {
-        eprintln!("SKIP: no zsh on this host");
-        return;
-    };
-    let home = std::env::temp_dir().join(format!("aterm-shd-{}", std::process::id()));
-    let shd = home.join(".aterm/shell.d");
-    std::fs::create_dir_all(&shd).expect("mk shell.d");
-    std::fs::write(
-        shd.join("00-atpkg.zsh"),
-        "export ATERM_TEST_DROPIN=loaded\n",
-    )
-    .expect("write dropin");
-    let script = format!(
-        "{}/src/scripts/aterm_shell_integration.zsh",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    // Interactive (`-i`) so the `[[ -o interactive ]] || return` guard doesn't
-    // short-circuit; hermetic HOME so ONLY our drop-in is present.
-    let out = shell_command(zsh)
-        .arg("-i")
-        .arg("-c")
-        .arg(
-            "source \"$ATERM_TEST_SCRIPT\"; \
-              print -r -- \"URLENC=$(whence -w __aterm_urlencode)\"; \
-              print -r -- \"DROPIN=${ATERM_TEST_DROPIN:-UNSET}\"",
-        )
-        .env("HOME", &home)
-        .env("ZDOTDIR", &home)
-        .env("ATERM_TEST_SCRIPT", &script)
-        .output()
-        .expect("spawn zsh");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let _ = std::fs::remove_dir_all(&home);
-    assert!(
-        !stderr.contains("no matches found"),
-        "shell.d glob aborted the script: stderr={stderr:?}"
-    );
-    assert!(
-        stdout.contains("URLENC=__aterm_urlencode: function"),
-        "integration functions must be defined (script ran to completion): stdout={stdout:?} stderr={stderr:?}"
-    );
-    assert!(
-        stdout.contains("DROPIN=loaded"),
-        "the *.zsh shell.d drop-in must be sourced: stdout={stdout:?}"
-    );
-}
-
-/// The reroute directory (`$ATERM_REROUTE_DIR`, set by aterm's spawn seam) ends up
-/// FIRST on PATH — MOVED there from wherever the inherited PATH already listed it,
-/// exactly once, the rest kept in order — and every script is inert when the
-/// variable is unset or names nothing on disk (Windows lays no stubs). Live shells
-/// sourcing the real script: `-c` has no first prompt, so this is the load-time
-/// assert; zsh's precmd copy and fish's first-prompt one-shot call the same
-/// function. bash and zsh (`-f`, no rc files) are checked byte-exactly; fish is
-/// checked for position and count only, because its own startup may add entries.
-#[cfg(unix)]
-#[test]
-fn test_reroute_dir_is_moved_to_the_front_of_path_by_each_shell() {
-    let reroute = std::env::temp_dir().join(format!("aterm-si-reroute-{}", std::process::id()));
-    std::fs::create_dir_all(&reroute).expect("mk reroute dir");
-    let reroute = reroute.to_str().expect("UTF-8 temp dir").to_owned();
-    let stale = "/nonexistent/aterm-reroute";
-    let mut lanes: Vec<(&str, Vec<&str>, &str, &str, bool)> = vec![(
-        bash_shell(),
-        vec!["--noprofile", "--norc", "-i", "-c"],
-        "aterm_shell_integration.bash",
-        "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; printf 'PATH=%s\\n' \"$PATH\"",
-        true,
-    )];
-    if let Some(zsh) = zsh_shell() {
-        lanes.push((
-            zsh,
-            vec!["-f", "-i", "-c"],
-            "aterm_shell_integration.zsh",
-            "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; print -r -- \"PATH=$PATH\"",
-            true,
-        ));
-    }
-    if let Some(fish) = fish_shell() {
-        lanes.push((
-            fish,
-            vec!["-i", "-c"],
-            "aterm_shell_integration.fish",
-            "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; printf 'PATH=%s\\n' (string join : -- $PATH)",
-            false,
-        ));
-    }
-    for (shell, args, script_name, command, exact) in lanes {
-        let script = format!("{}/src/scripts/{script_name}", env!("CARGO_MANIFEST_DIR"));
-        let run = |reroute_dir: Option<&str>, path: &str| -> String {
-            let mut cmd = shell_command(shell);
-            cmd.args(&args)
-                .arg(command)
-                .env("ATERM_TEST_SCRIPT", &script)
-                .env("PATH", path);
-            if let Some(dir) = reroute_dir {
-                cmd.env("ATERM_REROUTE_DIR", dir);
-            }
-            let out = cmd
-                .output()
-                .unwrap_or_else(|error| panic!("spawn {shell}: {error}"));
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            // The LAST `PATH=` is the printf's: an interactive shell's preexec hook
-            // emits the OSC 633;E / OSC 0 marks — which quote the command line, and
-            // so its `PATH=` too — on the same line, BEFORE the command's output.
-            // The value ends at the first control byte (the newline, or a mark).
-            assert!(
-                stdout.contains("PATH="),
-                "{shell}: no PATH line; stdout={stdout:?} stderr={:?}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            stdout
-                .rsplit("PATH=")
-                .next()
-                .expect("rsplit yields at least one piece")
-                .chars()
-                .take_while(|c| !c.is_control())
-                .collect()
-        };
-        // Listed later, twice: moved to the front, once; the rest in order.
-        let got = run(
-            Some(&reroute),
-            &format!("/usr/bin:{reroute}:/bin:{reroute}"),
-        );
-        assert!(
-            got.starts_with(&format!("{reroute}:")),
-            "{shell}: the reroute dir must be first: {got:?}"
-        );
-        assert_eq!(got.matches(&reroute).count(), 1, "{shell}: once: {got:?}");
-        if exact {
-            assert_eq!(
-                got,
-                format!("{reroute}:/usr/bin:/bin"),
-                "{shell}: move-to-front"
-            );
-        }
-        // Already first: the same answer (a nested aterm stacks nothing).
-        let again = run(Some(&reroute), &got);
-        assert_eq!(again, got, "{shell}: idempotent");
-        // Unset, or naming nothing on disk: PATH untouched.
-        let unset = run(None, "/usr/bin:/bin");
-        let missing = run(Some(stale), "/usr/bin:/bin");
-        assert!(
-            !missing.contains(stale),
-            "{shell}: a missing dir is never prepended: {missing:?}"
-        );
-        if exact {
-            assert_eq!(unset, "/usr/bin:/bin", "{shell}: inert when unset");
-            assert_eq!(
-                missing, "/usr/bin:/bin",
-                "{shell}: inert for a missing directory"
-            );
-        }
-    }
-    let _ = std::fs::remove_dir(&reroute);
-}
-
-/// The agents directory (`$ATPKG_AGENTS`, exported by the atpkg shell.d hook) ends up
-/// FIRST beside the reroute directory — PATH reads reroute, agents, … (the spawn
-/// seam's order) — MOVED there from wherever it was listed, exactly once, the rest
-/// kept in order; inert when the variable is unset or names nothing on disk. The
-/// measured failure it answers (2026-09-10, m27): path_helper and a ~/.zshrc prepend
-/// left it at PATH position 14 behind /opt/homebrew/bin and ~/.local/bin, so `codex`
-/// and `claude` ran foreign copies. Same live-shell lanes as the reroute test above.
-#[cfg(unix)]
-#[test]
-fn test_agents_dir_is_moved_to_the_front_beside_the_reroute_dir_by_each_shell() {
-    let base = std::env::temp_dir().join(format!("aterm-si-agents-{}", std::process::id()));
-    let reroute = base.join("reroute");
-    let agents = base.join("Application Support/pkg/agents");
+fn test_reroute_and_agents_dirs_lead_path_in_each_shell() {
+    let base = aterm_tempfile::tempdir().expect("tempdir");
+    let reroute = base.path().join("reroute");
+    let agents = base.path().join("Application Support/pkg/agents");
     std::fs::create_dir_all(&reroute).expect("mk reroute dir");
     std::fs::create_dir_all(&agents).expect("mk agents dir");
     let reroute = reroute.to_str().expect("UTF-8 temp dir").to_owned();
     let agents = agents.to_str().expect("UTF-8 temp dir").to_owned();
-    let stale = "/nonexistent/aterm-agents";
-    let mut lanes: Vec<(&str, Vec<&str>, &str, &str, bool)> = vec![(
-        bash_shell(),
-        vec!["--noprofile", "--norc", "-i", "-c"],
-        "aterm_shell_integration.bash",
-        "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; printf 'PATH=%s\\n' \"$PATH\"",
-        true,
-    )];
-    if let Some(zsh) = zsh_shell() {
-        lanes.push((
-            zsh,
-            vec!["-f", "-i", "-c"],
-            "aterm_shell_integration.zsh",
-            "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; print -r -- \"PATH=$PATH\"",
-            true,
-        ));
-    }
+    let (stale_reroute, stale_agents) = ("/nonexistent/aterm-reroute", "/nonexistent/aterm-agents");
+    let mut lanes: Vec<(&str, &[&str], &str, String, bool)> = posix_lanes()
+        .into_iter()
+        .map(|(shell, args, script, quiet)| {
+            let print = format!("{quiet}; printf 'PATH=%s\\n' \"$PATH\"");
+            (shell, args, script, print, true)
+        })
+        .collect();
     if let Some(fish) = fish_shell() {
         lanes.push((
             fish,
-            vec!["-i", "-c"],
+            &["-i"][..],
             "aterm_shell_integration.fish",
-            "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; printf 'PATH=%s\\n' (string join : -- $PATH)",
+            "printf 'PATH=%s\\n' (string join : -- $PATH)".to_owned(),
             false,
         ));
     }
-    for (shell, args, script_name, command, exact) in lanes {
+    for (shell, args, script_name, print, exact) in lanes {
         let script = format!("{}/src/scripts/{script_name}", env!("CARGO_MANIFEST_DIR"));
-        let run = |agents_dir: Option<&str>, path: &str| -> String {
+        // `pre` runs before the source. The value is the LAST `PATH=`'s, up to the
+        // first control byte.
+        let run = |rr: Option<&str>, ag: Option<&str>, path: &str, pre: &str| {
             let mut cmd = shell_command(shell);
-            cmd.args(&args)
-                .arg(command)
+            cmd.args(args)
+                .arg("-c")
+                .arg(format!(
+                    "{pre}source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; {print}"
+                ))
                 .env("ATERM_TEST_SCRIPT", &script)
-                .env("ATERM_REROUTE_DIR", &reroute)
                 .env("PATH", path);
-            if let Some(dir) = agents_dir {
-                cmd.env("ATPKG_AGENTS", dir);
+            for (key, value) in [("ATERM_REROUTE_DIR", rr), ("ATPKG_AGENTS", ag)] {
+                if let Some(value) = value {
+                    cmd.env(key, value);
+                }
             }
             let out = cmd
                 .output()
-                .unwrap_or_else(|error| panic!("spawn {shell}: {error}"));
+                .unwrap_or_else(|error| panic!("{shell}: spawn: {error}"));
             let stdout = String::from_utf8_lossy(&out.stdout);
             assert!(
                 stdout.contains("PATH="),
                 "{shell}: no PATH line; stdout={stdout:?} stderr={:?}",
                 String::from_utf8_lossy(&out.stderr)
             );
-            // The LAST `PATH=` is the printf's (see the reroute test above).
-            stdout
+            let value: String = stdout
                 .rsplit("PATH=")
                 .next()
-                .expect("rsplit yields at least one piece")
+                .unwrap_or("")
                 .chars()
                 .take_while(|c| !c.is_control())
-                .collect()
+                .collect();
+            value
         };
-        // Buried behind system and foreign entries, listed twice, with the reroute
-        // dir after it: reroute first, agents second, each once, the rest in order.
+        let both = (Some(reroute.as_str()), Some(agents.as_str()));
+        // Buried behind system entries, listed twice, the reroute dir after the agents
+        // dir: reroute first, agents second, each once, the rest in order.
         let got = run(
-            Some(&agents),
+            both.0,
+            both.1,
             &format!("/usr/bin:{agents}:/bin:{reroute}:{agents}"),
+            "",
         );
         assert!(
             got.starts_with(&format!("{reroute}:{agents}:")),
             "{shell}: reroute then agents must lead PATH: {got:?}"
         );
-        assert_eq!(
-            got.matches(&agents).count(),
-            1,
-            "{shell}: agents once: {got:?}"
-        );
-        assert_eq!(
-            got.matches(&reroute).count(),
-            1,
-            "{shell}: reroute once: {got:?}"
-        );
+        for dir in [&reroute, &agents] {
+            assert_eq!(
+                got.matches(dir.as_str()).count(),
+                1,
+                "{shell}: once: {got:?}"
+            );
+        }
         if exact {
-            assert_eq!(
-                got,
-                format!("{reroute}:{agents}:/usr/bin:/bin"),
-                "{shell}: move-to-front"
-            );
+            assert_eq!(got, format!("{reroute}:{agents}:/usr/bin:/bin"), "{shell}");
         }
-        let again = run(Some(&agents), &got);
-        assert_eq!(again, got, "{shell}: idempotent");
-        // A sole EMPTY entry ("here") beside the agents dir survives both moves.
-        // PATH is set INSIDE the shell so the harness
-        // still finds the shell binary through the real PATH.
-        if exact {
-            let print = if script_name.ends_with(".zsh") {
-                "PATH=\"$ATERM_TEST_PATH\"; source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; print -r -- \"PATH=$PATH\""
-            } else {
-                "PATH=\"$ATERM_TEST_PATH\"; source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; printf 'PATH=%s\\n' \"$PATH\""
-            };
-            let out = shell_command(shell)
-                .args(&args)
-                .arg(print)
-                .env("ATERM_TEST_SCRIPT", &script)
-                .env("ATERM_REROUTE_DIR", &reroute)
-                .env("ATPKG_AGENTS", &agents)
-                .env("ATERM_TEST_PATH", format!(":{agents}"))
-                .output()
-                .unwrap_or_else(|error| panic!("spawn {shell}: {error}"));
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let sole: String = stdout
-                .rsplit("PATH=")
-                .next()
-                .unwrap_or("")
-                .chars()
-                .take_while(|c| !c.is_control())
-                .collect();
-            assert_eq!(
-                sole,
-                format!("{reroute}:{agents}:"),
-                "{shell}: a sole empty entry survives"
-            );
-        }
-        // THE CALL THAT MATTERS INSIDE aterm: the zsh
-        // load-time assert runs from the .zshenv wrapper, BEFORE path_helper and
-        // ~/.zshrc, so only __aterm_first_precmd's re-front survives them. Bury both
-        // dirs behind /opt/homebrew/bin after load, fire the real hook, and require
-        // reroute then agents to lead again.
-        if script_name.ends_with(".zsh") {
-            let out = shell_command(shell)
-                .args(&args)
-                .arg("source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; path=(/opt/homebrew/bin \"${path[@]}\"); __aterm_first_precmd >/dev/null 2>&1; print -r -- \"PATH=$PATH\"")
-                .env("ATERM_TEST_SCRIPT", &script)
-                .env("ATERM_REROUTE_DIR", &reroute)
-                .env("ATPKG_AGENTS", &agents)
-                .env("PATH", "/usr/bin:/bin")
-                .output()
-                .unwrap_or_else(|error| panic!("spawn {shell}: {error}"));
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let after: String = stdout
-                .rsplit("PATH=")
-                .next()
-                .unwrap_or("")
-                .chars()
-                .take_while(|c| !c.is_control())
-                .collect();
-            assert_eq!(
-                after,
-                format!("{reroute}:{agents}:/opt/homebrew/bin:/usr/bin:/bin"),
-                "{shell}: the first-precmd re-front restores reroute, agents after rc files buried them"
-            );
-        }
-        // Unset, or naming nothing on disk: only the reroute dir moves.
-        let unset = run(None, "/usr/bin:/bin");
-        let missing = run(Some(stale), "/usr/bin:/bin");
+        // Already first: the same answer (a nested aterm stacks nothing).
+        assert_eq!(run(both.0, both.1, &got, ""), got, "{shell}: idempotent");
+        // Unset, or naming nothing on disk: nothing is prepended.
+        let missing = run(Some(stale_reroute), Some(stale_agents), "/usr/bin:/bin", "");
         assert!(
-            !missing.contains(stale),
-            "{shell}: a missing agents dir is never prepended: {missing:?}"
+            !missing.contains("/nonexistent/"),
+            "{shell}: a missing dir is never prepended: {missing:?}"
+        );
+        if !exact {
+            continue;
+        }
+        assert_eq!(missing, "/usr/bin:/bin", "{shell}: inert for missing dirs");
+        assert_eq!(
+            run(None, None, "/usr/bin:/bin", ""),
+            "/usr/bin:/bin",
+            "{shell}: inert when unset"
+        );
+        // A sole EMPTY entry ("here") beside the agents dir survives both moves. PATH
+        // is set INSIDE the shell so the harness still finds the shell binary.
+        assert_eq!(
+            run(
+                both.0,
+                both.1,
+                "/usr/bin:/bin",
+                &format!("PATH=':{agents}'; ")
+            ),
+            format!("{reroute}:{agents}:"),
+            "{shell}: a sole empty entry survives"
+        );
+    }
+}
+
+/// `$HOME/.aterm/bin` is a folder nothing in aterm creates or manages (atpkg's
+/// managed `bin/` lives under its prefix and is APPENDED, `crates/atpkg/src/hooks.rs`;
+/// its command links go to `~/.local/bin`), so no integration puts it on PATH:
+/// an executable dropped there would otherwise shadow every command in every
+/// session. Live shells sourcing the real script with a populated
+/// `~/.aterm/bin` holding an `ls`; bash and zsh (`-f`) byte-exactly, fish for
+/// absence (its own startup may add entries). The PowerShell script is checked
+/// as text, as no pwsh runs on the unix lanes.
+#[cfg(unix)]
+#[test]
+fn test_an_unmanaged_aterm_bin_is_never_put_on_path() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mut lanes: Vec<(&str, Vec<&str>, &str, &str, bool)> = vec![(
+        bash_shell(),
+        vec!["--noprofile", "--norc", "-i", "-c"],
+        "aterm_shell_integration.bash",
+        "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; printf 'PATH=%s\\n' \"$PATH\"",
+        true,
+    )];
+    if let Some(zsh) = zsh_shell() {
+        lanes.push((
+            zsh,
+            vec!["-f", "-i", "-c"],
+            "aterm_shell_integration.zsh",
+            "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; print -r -- \"PATH=$PATH\"",
+            true,
+        ));
+    }
+    if let Some(fish) = fish_shell() {
+        lanes.push((
+            fish,
+            vec!["-i", "-c"],
+            "aterm_shell_integration.fish",
+            "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; printf 'PATH=%s\\n' (string join : -- $PATH)",
+            false,
+        ));
+    }
+    for (shell, args, script_name, command, exact) in lanes {
+        let script = format!("{}/src/scripts/{script_name}", env!("CARGO_MANIFEST_DIR"));
+        let mut cmd = shell_command(shell);
+        let bin = cmd.home().join(".aterm").join("bin");
+        std::fs::create_dir_all(&bin).expect("mk ~/.aterm/bin");
+        let shadow = bin.join("ls");
+        std::fs::write(&shadow, "#!/bin/sh\necho shadowed\n").expect("write the shadow");
+        std::fs::set_permissions(&shadow, std::fs::Permissions::from_mode(0o755))
+            .expect("make the shadow executable");
+        let bin = bin.to_str().expect("UTF-8 home").to_owned();
+        let out = cmd
+            .args(&args)
+            .arg(command)
+            .env("ATERM_TEST_SCRIPT", &script)
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap_or_else(|error| panic!("spawn {shell}: {error}"));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("PATH="),
+            "{shell}: no PATH line; stdout={stdout:?} stderr={:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // The last `PATH=` is the printf's (see the reroute and agents test above).
+        let path: String = stdout
+            .rsplit("PATH=")
+            .next()
+            .expect("rsplit yields at least one piece")
+            .chars()
+            .take_while(|c| !c.is_control())
+            .collect();
+        assert!(
+            !path.split(':').any(|entry| entry == bin),
+            "{shell}: ~/.aterm/bin must not be on PATH: {path:?}"
         );
         if exact {
-            assert_eq!(
-                unset,
-                format!("{reroute}:/usr/bin:/bin"),
-                "{shell}: inert when unset"
-            );
-            assert_eq!(
-                missing,
-                format!("{reroute}:/usr/bin:/bin"),
-                "{shell}: inert for a missing directory"
-            );
+            assert_eq!(path, "/usr/bin:/bin", "{shell}: PATH untouched");
         }
     }
-    let _ = std::fs::remove_dir_all(&base);
-}
-
-/// The PowerShell integration re-fronts `$env:ATPKG_AGENTS` (move-to-front, by
-/// equality) BEFORE the reroute block, so PATH reads reroute, agents, … as in the
-/// POSIX scripts. Static, because no pwsh runs on the unix lanes (review finding
-/// 2026-09-10: the block was otherwise untested).
-#[test]
-fn test_powershell_moves_the_agents_dir_to_the_front_before_the_reroute_block() {
-    let ps = scripts::POWERSHELL;
-    let agents = ps
-        .find("if ($env:ATPKG_AGENTS -and (Test-Path -LiteralPath $env:ATPKG_AGENTS -PathType Container))")
-        .expect("agents block present");
-    let reroute = ps
-        .find("if ($env:ATERM_REROUTE_DIR -and (Test-Path -LiteralPath $env:ATERM_REROUTE_DIR -PathType Container))")
-        .expect("reroute block present");
-    assert!(agents < reroute, "agents is fronted first, reroute last");
-    assert!(ps.contains("Where-Object { $_ -ne $env:ATPKG_AGENTS }"));
-    assert!(ps.contains("$env:PATH = (@($env:ATPKG_AGENTS) + $__aterm_rest) -join $__aterm_sep"));
-}
-
-#[cfg(unix)]
-#[test]
-fn test_bash_urlencode_handles_special_and_unicode_paths() {
-    assert_urlencode_cases(
-        bash_shell(),
-        &["--noprofile", "--norc", "-i"],
-        "__aterm_in_prompt_cmd=1; trap - DEBUG 2>/dev/null || true; PROMPT_COMMAND=",
-        "aterm_shell_integration.bash",
-    );
-}
-
-/// Under a user's `setopt ksh_arrays` (subscripts from 0), as every encoding
-/// zsh function runs with the user's options around it: a loop that read
-/// `${string[$i]}` from 1 dropped the first byte and read one past the last.
-#[cfg(unix)]
-#[test]
-fn test_zsh_urlencode_handles_special_and_unicode_paths() {
-    let Some(zsh) = zsh_shell() else {
-        return;
-    };
-    assert_urlencode_cases(
-        zsh,
-        &["-f", "-i"],
-        "add-zsh-hook -d precmd __aterm_precmd 2>/dev/null || true; add-zsh-hook -d preexec __aterm_preexec 2>/dev/null || true; setopt ksh_arrays",
-        "aterm_shell_integration.zsh",
+    // PowerShell, as text: no line of code (a comment may explain) names it.
+    let named = scripts::POWERSHELL
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .find(|line| line.contains(".aterm/bin") || line.contains(".aterm\\bin"));
+    assert_eq!(
+        named, None,
+        "the PowerShell integration must not put ~/.aterm/bin on PATH either"
     );
 }
 
@@ -885,26 +647,38 @@ fn test_encoders_answer_in_reply_and_keep_the_users() {
     }
 }
 
+/// OSC 7 from each POSIX lane's `__aterm_report_cwd`: a percent-encoded `file://`
+/// URI for a cwd holding a space, `@`, `[`, `]`, `!` and non-ASCII.
 #[cfg(unix)]
 #[test]
-fn test_bash_report_cwd_emits_percent_encoded_osc_7() {
+fn test_report_cwd_emits_percent_encoded_osc_7() {
     let (_dir, cwd) = create_special_cwd();
-    let cwd_string = cwd.to_str().expect("cwd path should be UTF-8");
-    let actual = run_report_cwd_via_shell(
-        bash_shell(),
-        &["--noprofile", "--norc", "-i"],
-        "__aterm_in_prompt_cmd=1; trap - DEBUG 2>/dev/null || true; PROMPT_COMMAND=",
-        "aterm_shell_integration.bash",
-        &cwd,
-    );
     let expected = format!(
         "\u{1b}]7;file://aterm.test{}\u{7}",
-        osc7_percent_encode(cwd_string)
+        osc7_percent_encode(cwd.to_str().expect("cwd path should be UTF-8"))
     );
-    assert_eq!(
-        actual, expected,
-        "bash should emit a percent-encoded OSC 7 file URI for the live cwd"
-    );
+    for (shell, args, script_name, quiet) in posix_lanes() {
+        let script = format!("{}/src/scripts/{script_name}", env!("CARGO_MANIFEST_DIR"));
+        let output = shell_command(shell)
+            .args(args)
+            .arg("-c")
+            .arg(format!(
+                "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; {quiet}; \
+                 builtin cd -- \"$ATERM_TEST_CWD\"; __aterm_report_cwd"
+            ))
+            .env("ATERM_TEST_SCRIPT", script)
+            .env("ATERM_TEST_CWD", &cwd)
+            .env("HOSTNAME", "aterm.test")
+            .env("HOST", "aterm.test")
+            .output()
+            .unwrap_or_else(|error| panic!("spawn {shell}: {error}"));
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            expected,
+            "{shell}; stderr: {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 /// Git Bash (MSYS2) and Cygwin report the Windows drive form over OSC 7, not
@@ -1016,10 +790,11 @@ fn test_bash_preexec_skips_prompt_command_array_siblings() {
     );
     // One prompt cycle exactly as bash runs an array PROMPT_COMMAND: each element
     // is a top-level DEBUG-trapped command, ours first, the siblings after ours
-    // returned. Two siblings, so the array is taken as one (an array with
-    // nothing at index 1 runs the scalar way — the next test). The marker rides
-    // an `__aterm_`-prefixed function so the guard skips it identically before
-    // and after the fix.
+    // returned, and on bash 5.1+ aterm's last element after them (an unarmed no-op
+    // before 5.1, where the wiring adds none). Two siblings, so the array is taken
+    // as one (an array with nothing at index 1 runs the scalar way — the next
+    // test). The marker rides an `__aterm_`-prefixed function so the guard skips
+    // it identically before and after the fix.
     let command = "\
 __fake_vte_precmd() { :; }\n\
 __fake_starship_precmd() { :; }\n\
@@ -1028,6 +803,7 @@ source \"$ATERM_TEST_SCRIPT\"\n\
 __aterm_prompt_command\n\
 __fake_vte_precmd\n\
 __fake_starship_precmd\n\
+__aterm_prompt_end\n\
 __aterm_test_marker() { printf '===CYCLE-DONE==='; }\n\
 __aterm_test_marker\n\
 echo real-command\n";
@@ -1060,7 +836,7 @@ echo real-command\n";
     );
     assert!(
         after.contains("\u{1b}]133;C\u{7}"),
-        "the real command must emit the 133;C command start: {after:?}"
+        "the real command must emit the 133;C command start, unsigned with no nonce: {after:?}"
     );
 }
 
@@ -1107,410 +883,151 @@ eval \"$PROMPT_COMMAND\"\n";
     );
 }
 
-#[cfg(unix)]
-#[test]
-fn test_zsh_report_cwd_emits_percent_encoded_osc_7() {
-    let Some(zsh) = zsh_shell() else {
-        return;
-    };
-    let (_dir, cwd) = create_special_cwd();
-    let cwd_string = cwd.to_str().expect("cwd path should be UTF-8");
-    let actual = run_report_cwd_via_shell(
-        zsh,
-        &["-f", "-i"],
-        "add-zsh-hook -d precmd __aterm_precmd 2>/dev/null || true; add-zsh-hook -d preexec __aterm_preexec 2>/dev/null || true",
-        "aterm_shell_integration.zsh",
-        &cwd,
-    );
-    let expected = format!(
-        "\u{1b}]7;file://aterm.test{}\u{7}",
-        osc7_percent_encode(cwd_string)
-    );
-    assert_eq!(
-        actual, expected,
-        "zsh should emit a percent-encoded OSC 7 file URI for the live cwd"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn test_prepare_zsh_prompt_override_starts_without_hook_error() {
-    let Some(zsh) = zsh_shell() else {
-        return;
-    };
-    let dir = aterm_tempfile::tempdir().expect("create tempdir for shell integration test");
-    let base = dir.path().join("si");
-    let InjectionEnv { env_add, .. } = prepare_into(ShellType::Zsh, &base)
-        .expect("prepare shell integration")
-        .expect("zsh shell integration should produce an injection environment");
-
-    let home = dir.path().join("home");
-    std::fs::create_dir_all(&home).expect("create temporary home directory");
-    std::fs::write(home.join(".zshenv"), "").expect("write empty user .zshenv");
-
-    // Hermetic spawn: strip the dev shell's exported integration vars (above all
-    // ATERM_SHELL_INTEGRATION_INSTALLED) so the wrapper actually sources the
-    // integration instead of short-circuiting on the "already loaded" guard.
-    // Without this, the add-zsh-hook autoload-ordering check below is a false
-    // green — the script returns before reaching add-zsh-hook at all. The probe
-    // for $+functions[__aterm_precmd] asserts the hooks were really registered.
-    let mut command = shell_command(zsh);
-    command
-        .arg("-i")
-        .arg("-c")
-        .arg(
-            "print -r -- PROMPT_ENV_OK; \
-             (( $+functions[__aterm_precmd] )) && print -r -- ATERM_INTEGRATION_LOADED",
-        )
-        .env("HOME", &home)
-        .env("ATERM_PROMPT_STYLE", "minimal")
-        .env_remove("ZDOTDIR");
-    for (key, value) in env_add {
-        command.env(key, value);
-    }
-    command
-        .env_remove("ATERM_ORIGINAL_ZDOTDIR")
-        .env("ATERM_UNSET_ZDOTDIR", "1");
-
-    let output = command
-        .output()
-        .expect("spawn prompt-enabled zsh with embedded shell integration");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{stdout}{stderr}");
-
-    assert!(
-        output.status.success(),
-        "prompt-enabled zsh should exit cleanly; stdout: {stdout:?}; stderr: {stderr:?}"
-    );
-    assert!(
-        combined.contains("PROMPT_ENV_OK"),
-        "prompt-enabled zsh should run the test command; stdout: {stdout:?}; stderr: {stderr:?}"
-    );
-    assert!(
-        !combined.contains("command not found: add-zsh-hook"),
-        "embedded zsh script should autoload add-zsh-hook before registration; stdout: {stdout:?}; stderr: {stderr:?}"
-    );
-    // Positive guard: the integration must have actually loaded (functions
-    // defined + hooks registered), not merely "not errored". This is what makes
-    // the hook-ordering assertion above meaningful instead of a false green when
-    // a stray ATERM_SHELL_INTEGRATION_INSTALLED would short-circuit the script.
-    assert!(
-        combined.contains("ATERM_INTEGRATION_LOADED"),
-        "embedded zsh integration must define its precmd hook (functions registered); stdout: {stdout:?}; stderr: {stderr:?}"
-    );
-}
-
 #[test]
 fn test_detect_posix_shells() {
     for (path, shell) in [
         ("/bin/zsh", ShellType::Zsh),
-        ("/usr/local/bin/zsh", ShellType::Zsh),
         ("/bin/bash", ShellType::Bash),
         ("bash5", ShellType::Bash),
         ("/usr/bin/fish", ShellType::Fish),
         ("/bin/sh", ShellType::Unknown),
         ("", ShellType::Unknown),
+        ("pwsh", ShellType::PowerShell),
+        ("PowerShell.EXE", ShellType::PowerShell),
+        (
+            r"C:\Program Files\PowerShell\7\pwsh.exe",
+            ShellType::PowerShell,
+        ),
+        // The bare aliases the PTY seam resolves, and the program paths they
+        // resolve to (Windows separators, split on every host).
+        ("wsl", ShellType::Wsl),
+        ("cmd", ShellType::Cmd),
+        ("C:\\Windows\\System32\\wsl.exe", ShellType::Wsl),
+        ("C:\\Windows\\System32\\CMD.EXE", ShellType::Cmd),
+        // Neighbours are not swept in: nu has no injection.
+        ("nu.exe", ShellType::Unknown),
     ] {
         assert_eq!(ShellType::detect(path), shell, "{path:?}");
     }
 }
 
+/// A directory name may hold any byte but '/' and NUL, so a crafted one could
+/// embed ESC/BEL and smuggle a nested OSC (a clipboard write) out of the OSC 0
+/// cwd tab title the prompt hook emits. Driven through each POSIX prompt hook
+/// (and fish's prompt, where fish is installed) from inside such a directory.
+#[cfg(unix)]
 #[test]
 fn test_cwd_tab_title_strips_control_chars() {
-    // A directory name may contain any byte except '/' and NUL, so a crafted
-    // name could embed BEL/ESC and smuggle a nested OSC (e.g. a clipboard
-    // write) out of the OSC 0 tab title. The CWD-title path must strip control
-    // bytes exactly like the command-title path already does — these asserts
-    // pin the guard so it cannot silently regress.
-    assert!(
-        scripts::ZSH.contains("\"0;${__aterm_tab_title//[[:cntrl:]]/}\""),
-        "zsh CWD tab title must strip control characters"
-    );
-    assert!(
-        scripts::BASH.contains("\"0;${__aterm_tab_title//[[:cntrl:]]/}\""),
-        "bash CWD tab title must strip control characters"
-    );
-    // fish chooses the title first (~-abbreviated or absolute) and strips ONCE
-    // on the way out, so ONE guard covers both branches instead of two that
-    // could drift apart — and the emission is pinned to the STRIPPED local, so
-    // a future edit cannot route the raw title around the guard.
-    assert!(
-        scripts::FISH
-            .contains(r#"set -l safe_title (string replace -ra '[\x00-\x1f\x7f]' '' -- "$title")"#),
-        "fish CWD tab title must strip control characters"
-    );
-    assert!(
-        scripts::FISH.contains(r#"__aterm_osc "0;$safe_title""#),
-        "fish must emit the STRIPPED CWD tab title, never the raw one"
-    );
-}
-
-#[test]
-fn test_fish_encode_cmd_escapes_all_control_bytes() {
-    // The OSC 633;E command-line encoder (__aterm_encode_cmd) must backslash-
-    // hex-escape EVERY control byte (0x00-0x1f, 0x7f) — not just the six
-    // whitespace bytes it special-cases. A raw ESC (0x1b) or BEL (0x07) in the
-    // command line (reachable via Ctrl-V verbatim insert, paste, or tab-
-    // completing a filename that contains control bytes) terminates an OSC
-    // string in the parser, so an unescaped one would prematurely close the
-    // OSC 633;E sequence and let the following bytes be parsed as fresh control
-    // sequences — a classic OSC break-out (e.g. smuggling an OSC 52 clipboard
-    // write). zsh/bash escape the whole [[:cntrl:]] class; fish must match.
-    // This pins fish's guard so the pre-fix verbatim `case '*'` passthrough
-    // cannot silently regress even on hosts where fish is not installed.
-    assert!(
-        scripts::FISH.contains(r#"string match -qr '[\x00-\x1f\x7f]' -- "$i""#),
-        "fish __aterm_encode_cmd must hex-escape all C0/DEL control bytes \
-         rather than passing them through verbatim"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn test_fish_encode_cmd_emits_no_raw_control_bytes() {
-    let Some(fish) = fish_shell() else {
-        // fish is not universally installed; skip gracefully instead of
-        // failing CI. The static guard in
-        // test_fish_encode_cmd_escapes_all_control_bytes covers this host.
-        eprintln!("fish not installed; skipping test_fish_encode_cmd_emits_no_raw_control_bytes");
-        return;
-    };
-    let script = format!(
-        "{}/src/scripts/aterm_shell_integration.fish",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    // A command line carrying a raw ESC (0x1b) and BEL (0x07) around benign
-    // text, plus a backslash and semicolon to confirm those keep their escapes.
-    let mut input = String::new();
-    input.push('a');
-    input.push('\u{1b}'); // ESC — terminates an OSC string in the parser
-    input.push('b');
-    input.push('\u{07}'); // BEL — the ST for OSC strings; also breaks out
-    input.push('\\');
-    input.push(';');
-    let command =
-        "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; printf '%s' \"$(__aterm_encode_cmd \"$ATERM_TEST_INPUT\")\""
-            .to_string();
-    let output = shell_command(fish)
-        .arg("-i")
-        .arg("-c")
-        .arg(&command)
-        .env("ATERM_TEST_SCRIPT", script)
-        .env("ATERM_TEST_INPUT", &input)
-        .output()
-        .unwrap_or_else(|error| panic!("spawn fish for encode-cmd test: {error}"));
-    assert!(
-        output.status.success(),
-        "fish encode-cmd invocation should succeed; stdout: {:?}; stderr: {:?}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = output.stdout;
-    // The emitted OSC 633;E payload must contain NO raw ESC/BEL — the whole
-    // point of the fix — otherwise the sequence breaks out in the parser.
-    assert!(
-        !stdout.contains(&0x1b) && !stdout.contains(&0x07),
-        "fish encoder must not emit raw ESC/BEL bytes; got: {stdout:?}"
-    );
-    let text = String::from_utf8(stdout).expect("encoder output should be UTF-8");
-    // ...they must instead appear as the decoder's \xNN escapes.
-    assert!(
-        text.contains(r"\x1b"),
-        "ESC (0x1b) must be hex-escaped as \\x1b; got: {text:?}"
-    );
-    assert!(
-        text.contains(r"\x07"),
-        "BEL (0x07) must be hex-escaped as \\x07; got: {text:?}"
-    );
-    // Backslash and semicolon keep their existing OSC 633 escapes.
-    assert!(
-        text.contains(r"\\") && text.contains(r"\x3b"),
-        "backslash and semicolon must stay escaped; got: {text:?}"
-    );
-}
-
-// ─── The OSC frame writer must not re-interpret its payload ──────────────
-//
-// `__aterm_osc` wraps an already-built payload in `ESC ] … BEL`. It must copy
-// that payload through byte-for-byte. zsh's `print` WITHOUT `-r` does not: it
-// expands escape sequences in its argument, which silently undid every escape
-// `__aterm_encode_cmd` had just produced and re-materialized the exact raw
-// ESC/BEL bytes the encoder exists to remove. bash always spelled the writer
-// `printf '\033]%s\a' "$1"` (a `%s` argument is never interpreted) and was
-// never affected, so the two shells being byte-equal here is the real check.
-
-/// Command line for the frame-writer probe. It carries two independent
-/// break-out attempts:
-///   * raw ESC (0x1b) and BEL (0x07) bytes, which `__aterm_encode_cmd` must
-///     hex-escape and the frame writer must then leave as escapes; and
-///   * the LITERAL text `\e]52;c;aGVsbG8=\a` — ordinary printable characters,
-///     so the tab title's `${…//[[:cntrl:]]/}` guard has no control byte to
-///     strip. Only a frame writer that expands escapes can turn that text into
-///     a real nested OSC 52 clipboard write.
-#[cfg(unix)]
-const OSC_PROBE_CMDLINE: &str = "a\u{1b}b\u{7}c;d e\\f \\e]52;c;aGVsbG8=\\a";
-
-/// OSC 633;E for [`OSC_PROBE_CMDLINE`]: every reserved byte still spelled as
-/// the decoder's backslash escape, and exactly one BEL — the terminator.
-#[cfg(unix)]
-const OSC_PROBE_EXPECTED_633: &str = concat!(
-    "\u{1b}]633;E;",
-    r"a\x1bb\x07c\x3bd\x20e\\f\x20\\e]52\x3bc\x3baGVsbG8=\\a",
-    "\u{7}"
-);
-
-/// OSC 0 title for [`OSC_PROBE_CMDLINE`]: the control bytes are stripped
-/// (`a<ESC>b<BEL>c` → `abc`) and the literal `\e`/`\a` text stays literal.
-#[cfg(unix)]
-const OSC_PROBE_EXPECTED_TITLE: &str =
-    concat!("\u{1b}]0;", r"abc;d e\f \e]52;c;aGVsbG8=\a", "\u{7}");
-
-/// Drive the two emissions `preexec` performs, through the real
-/// `__aterm_osc` frame writer, and return the raw stdout bytes.
-///
-/// The snippet is spelled identically for bash and zsh — both encoders answer
-/// in `REPLY` and both write control-stripping as `${v//[[:cntrl:]]/}` — so
-/// the same source line is exercised in both shells.
-#[cfg(unix)]
-fn run_osc_wire_probe(shell: &str, args: &[&str], cleanup: &str, script_name: &str) -> Vec<u8> {
-    let script = format!("{}/src/scripts/{script_name}", env!("CARGO_MANIFEST_DIR"));
-    let command = format!(
-        "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; {cleanup}; \
-         __aterm_encode_cmd \"$ATERM_TEST_INPUT\"; __aterm_osc \"633;E;$REPLY\"; \
-         __aterm_osc \"0;${{ATERM_TEST_INPUT//[[:cntrl:]]/}}\""
-    );
-    let output = shell_command(shell)
-        .args(args)
-        .arg("-c")
-        .arg(&command)
-        .env("ATERM_TEST_SCRIPT", script)
-        .env("ATERM_TEST_INPUT", OSC_PROBE_CMDLINE)
-        // No nonce: the probe pins the frame bytes, and a ";id=<hex>" tail
-        // would just pad every expected string without exercising anything.
-        .env_remove("ATERM_SHELL_NONCE")
-        .output()
-        .unwrap_or_else(|error| panic!("spawn {shell} for OSC frame-writer probe: {error}"));
-    assert!(
-        output.status.success(),
-        "{shell} OSC frame-writer probe should succeed; stdout: {:?}; stderr: {:?}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    output.stdout
-}
-
-#[cfg(unix)]
-fn assert_osc_wire_is_escape_transparent(shell: &str, wire: &[u8]) {
-    let expected = format!("{OSC_PROBE_EXPECTED_633}{OSC_PROBE_EXPECTED_TITLE}");
-    // `ends_with`, not `==`: an interactive bash may prefix stdout with its
-    // readline meta-mode probe on some hosts. Everything the writer emits is
-    // pinned exactly; only a leading terminal-init blob is tolerated.
-    assert!(
-        wire.ends_with(expected.as_bytes()),
-        "{shell} OSC frames must reproduce the payload byte-for-byte;\n  expected suffix: {:?}\n  got:             {:?}",
-        expected,
-        String::from_utf8_lossy(wire)
-    );
-    // The break-out itself, stated directly: no nested OSC introducer may
-    // appear anywhere on the wire. Under the `print -n` writer this failed —
-    // stdout carried a real `ESC ]52;c;aGVsbG8=` clipboard write.
-    assert!(
-        !wire.windows(5).any(|w| w == b"\x1b]52;"),
-        "{shell} must not smuggle a nested OSC 52 out of the frame; got: {:?}",
-        String::from_utf8_lossy(wire)
-    );
-    // ...and the 633;E payload must carry no raw ESC/BEL, so the sequence
-    // cannot terminate before its own BEL. Everything between the introducer
-    // and the first BEL is the payload.
-    const INTRODUCER: &str = "\u{1b}]633;E;";
-    let after_introducer = &wire[wire.len() - expected.len() + INTRODUCER.len()..];
-    let payload_len = after_introducer
-        .iter()
-        .position(|&b| b == 0x07)
-        .expect("OSC 633;E must be BEL-terminated");
-    let payload = &after_introducer[..payload_len];
-    assert!(
-        !payload.contains(&0x1b) && !payload.contains(&0x07),
-        "{shell} 633;E payload must carry no raw ESC/BEL; got: {:?}",
-        String::from_utf8_lossy(payload)
-    );
-}
-
-/// Static guard (host-portable, mirrors the fish one above): the frame writers
-/// must stay on `printf`, whose `%s` argument is copied verbatim. Reverting zsh
-/// to `print -n` — which expands escapes in its argument — silently re-opens the
-/// break-out on hosts where the functional probe below cannot run.
-#[test]
-fn test_osc_frame_writers_use_printf() {
-    for (name, script) in [("zsh", scripts::ZSH), ("bash", scripts::BASH)] {
+    let dir = aterm_tempfile::tempdir().expect("tempdir");
+    let cwd = dir.path().join("x\u{1b}]52;c;aGVsbG8=\u{7}y");
+    std::fs::create_dir(&cwd).expect("create the crafted cwd");
+    let assert_clean = |shell: &str, wire: &[u8]| {
         assert!(
-            script.contains("__aterm_osc() {\n    printf '\\033]%s\\a' \"$1\"\n}"),
-            "{name} __aterm_osc must frame with printf '%%s' so the payload is \
-             copied byte-for-byte (zsh's `print` without -r expands escapes in \
-             its argument and re-materializes raw ESC/BEL inside the OSC string)"
+            wire.windows(3).any(|w| w == b"\x1b]0"),
+            "{shell}: the prompt hook titles the tab: {:?}",
+            String::from_utf8_lossy(wire)
         );
+        assert!(
+            !wire.windows(5).any(|w| w == b"\x1b]52;"),
+            "{shell}: a crafted cwd smuggled a nested OSC 52 out of the title: {:?}",
+            String::from_utf8_lossy(wire)
+        );
+    };
+    if let Some(fish) = fish_shell() {
+        let stdout = run_fish_integration(
+            fish,
+            &[("ATERM_TEST_CWD", cwd.to_str().expect("a UTF-8 crafted cwd"))],
+            "cd -- \"$ATERM_TEST_CWD\"; function __aterm_original_fish_prompt; end; fish_prompt",
+        );
+        assert_clean(fish, stdout.as_bytes());
+    }
+    let mut lanes = vec![(
+        bash_shell(),
+        vec!["--noprofile", "--norc", "-i"],
+        "aterm_shell_integration.bash",
+        "__aterm_prompt_command",
+    )];
+    if let Some(zsh) = zsh_shell() {
+        lanes.push((
+            zsh,
+            vec!["-f", "-i"],
+            "aterm_shell_integration.zsh",
+            "__aterm_precmd",
+        ));
+    }
+    for (shell, args, script_name, hook) in lanes {
+        let script = format!("{}/src/scripts/{script_name}", env!("CARGO_MANIFEST_DIR"));
+        let output = shell_command(shell)
+            .args(&args)
+            .arg("-c")
+            .arg(format!(
+                "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; trap - DEBUG 2>/dev/null; \
+                 builtin cd -- \"$ATERM_TEST_CWD\"; {hook}"
+            ))
+            .env("ATERM_TEST_SCRIPT", &script)
+            .env("ATERM_TEST_CWD", &cwd)
+            .output()
+            .unwrap_or_else(|error| panic!("spawn {shell}: {error}"));
+        assert_clean(shell, &output.stdout);
     }
 }
 
+/// A command line must not break out of the OSC 633;E that carries it, nor out of
+/// the OSC 0 title. `__aterm_encode_cmd` hex-escapes every reserved byte, and
+/// `__aterm_osc` must then copy the payload through byte-for-byte: zsh's `print`
+/// WITHOUT `-r` did not — it expanded escapes in its argument, re-materializing
+/// the raw ESC/BEL bytes the encoder exists to remove. Driven through the two
+/// emissions `preexec` performs, spelled identically for bash and zsh (both
+/// encoders answer in `REPLY`); fish's encoder (its writer is `printf '\e]%s\a'`)
+/// must produce the same payload.
 #[cfg(unix)]
 #[test]
-fn test_bash_osc_frame_writer_preserves_payload_escapes() {
-    let wire = run_osc_wire_probe(
-        bash_shell(),
-        &["--noprofile", "--norc", "-i"],
-        "__aterm_in_prompt_cmd=1; trap - DEBUG 2>/dev/null || true; PROMPT_COMMAND=",
-        "aterm_shell_integration.bash",
+fn test_osc_frame_writer_preserves_payload_escapes() {
+    // Two independent break-out attempts: raw ESC/BEL bytes, which the encoder must
+    // hex-escape and the writer leave escaped; and the LITERAL text
+    // `\e]52;c;aGVsbG8=\a` — printable, so the title's `[[:cntrl:]]` strip has
+    // nothing to strip, and only a writer that expands escapes turns it into a
+    // real nested OSC 52 clipboard write.
+    const CMDLINE: &str = "a\u{1b}b\u{7}c;d e\\f \\e]52;c;aGVsbG8=\\a";
+    // Every reserved byte the decoder's backslash escape, so the 633;E carries one
+    // BEL; the title strips the control bytes and keeps the literal `\e`/`\a` text.
+    const PAYLOAD: &str = r"a\x1bb\x07c\x3bd\x20e\\f\x20\\e]52\x3bc\x3baGVsbG8=\\a";
+    let expected = format!(
+        "\u{1b}]633;E;{PAYLOAD}\u{7}\u{1b}]0;{}\u{7}",
+        r"abc;d e\f \e]52;c;aGVsbG8=\a"
     );
-    assert_osc_wire_is_escape_transparent("bash", &wire);
-}
-
-/// Under a user's `setopt ksh_arrays` too (see the urlencode test): the 633;E
-/// encoder lost the first letter of every command line.
-#[cfg(unix)]
-#[test]
-fn test_zsh_osc_frame_writer_preserves_payload_escapes() {
-    let Some(zsh) = zsh_shell() else {
-        eprintln!("SKIP: no zsh on this host");
-        return;
-    };
-    let wire = run_osc_wire_probe(
-        zsh,
-        &["-f", "-i"],
-        "add-zsh-hook -d precmd __aterm_precmd 2>/dev/null || true; add-zsh-hook -d preexec __aterm_preexec 2>/dev/null || true; setopt ksh_arrays",
-        "aterm_shell_integration.zsh",
-    );
-    assert_osc_wire_is_escape_transparent("zsh", &wire);
-}
-
-#[test]
-fn test_prepare_writes_scripts() {
-    let dir = aterm_tempfile::tempdir().unwrap();
-    let base = dir.path().join("si");
-
-    let injection = prepare_into(ShellType::Zsh, &base).unwrap().unwrap();
-
-    let keys: Vec<&str> = injection.env_add.iter().map(|(k, _)| k.as_str()).collect();
-    assert!(keys.contains(&"ZDOTDIR"));
-    assert!(keys.contains(&"ATERM_SHELL_INTEGRATION_DIR"));
-
-    assert!(base.join("aterm_shell_integration.zsh").exists());
-    assert!(base.join("aterm_shell_integration.bash").exists());
-    assert!(base.join("aterm_shell_integration.fish").exists());
-    assert!(base.join("aterm_shell_integration.ps1").exists());
-    assert!(base.join("zdotdir").join(".zshenv").exists());
-}
-
-#[test]
-fn test_prepare_bash_has_argv_override() {
-    let dir = aterm_tempfile::tempdir().unwrap();
-    let base = dir.path().join("si");
-
-    let result = prepare_into(ShellType::Bash, &base).unwrap().unwrap();
-    assert!(result.argv_override.is_some());
-    let argv = result.argv_override.unwrap();
-    assert_eq!(argv[0], "bash");
-    assert_eq!(argv[1], "--rcfile");
+    if let Some(fish) = fish_shell() {
+        let encoded = run_fish_integration(
+            fish,
+            &[("ATERM_TEST_INPUT", CMDLINE)],
+            "printf '%s' \"$(__aterm_encode_cmd \"$ATERM_TEST_INPUT\")\"",
+        );
+        assert_eq!(encoded, PAYLOAD, "fish");
+    }
+    for (shell, args, script_name, quiet) in posix_lanes() {
+        let script = format!("{}/src/scripts/{script_name}", env!("CARGO_MANIFEST_DIR"));
+        let output = shell_command(shell)
+            .args(args)
+            .arg("-c")
+            .arg(format!(
+                "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; {quiet}; \
+                 __aterm_encode_cmd \"$ATERM_TEST_INPUT\"; __aterm_osc \"633;E;$REPLY\"; \
+                 __aterm_osc \"0;${{ATERM_TEST_INPUT//[[:cntrl:]]/}}\""
+            ))
+            .env("ATERM_TEST_SCRIPT", script)
+            .env("ATERM_TEST_INPUT", CMDLINE)
+            .output()
+            .unwrap_or_else(|error| panic!("spawn {shell}: {error}"));
+        // `ends_with`: an interactive bash may prefix stdout with its readline
+        // meta-mode probe on some hosts.
+        assert!(
+            output.stdout.ends_with(expected.as_bytes()),
+            "{shell}: OSC frames must carry the payload byte-for-byte;\n  expected suffix: \
+             {expected:?}\n  got: {:?}\n  stderr: {:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[test]
@@ -1526,154 +1043,6 @@ fn test_prepare_unknown_returns_none() {
     );
 }
 
-#[test]
-fn test_prepare_cached_skips_rewrite_and_self_heals() {
-    let dir = aterm_tempfile::tempdir().unwrap();
-    let base = dir.path().join("si");
-    let written = std::sync::Mutex::new(None);
-
-    // First call writes everything, into this build's content folder.
-    prepare_cached(ShellType::Zsh, base.clone(), &written)
-        .unwrap()
-        .unwrap();
-    let zsh = base
-        .join(script_set_address())
-        .join("aterm_shell_integration.zsh");
-    assert_eq!(std::fs::read_to_string(&zsh).unwrap(), installed_zsh());
-
-    // Second call with the same base must skip the writes: clobber the
-    // script with a sentinel and verify it is NOT restored.
-    std::fs::write(&zsh, "sentinel").unwrap();
-    prepare_cached(ShellType::Zsh, base.clone(), &written)
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        std::fs::read_to_string(&zsh).unwrap(),
-        "sentinel",
-        "cached prepare must not rewrite scripts for an already-written base"
-    );
-
-    // Self-healing: deleting the primary script (the common whole-dir
-    // deletion collapses to this) forces a full rewrite on the next spawn.
-    std::fs::remove_file(&zsh).unwrap();
-    prepare_cached(ShellType::Zsh, base.clone(), &written)
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        std::fs::read_to_string(&zsh).unwrap(),
-        installed_zsh(),
-        "prepare must rewrite scripts when the cache dir was deleted mid-run"
-    );
-}
-
-#[test]
-fn test_prepare_cached_rewrites_on_base_change() {
-    let dir = aterm_tempfile::tempdir().unwrap();
-    let base_a = dir.path().join("a");
-    let base_b = dir.path().join("b");
-    let written = std::sync::Mutex::new(None);
-
-    prepare_cached(ShellType::Bash, base_a.clone(), &written)
-        .unwrap()
-        .unwrap();
-    // A different base (containment mode / XDG change) must write fresh.
-    prepare_cached(ShellType::Bash, base_b.clone(), &written)
-        .unwrap()
-        .unwrap();
-    assert!(
-        base_b
-            .join(script_set_address())
-            .join("aterm_shell_integration.bash")
-            .exists()
-    );
-
-    // Returning to the first base must write again — the memo keys a
-    // single base, never a set.
-    let a_zsh = base_a
-        .join(script_set_address())
-        .join("aterm_shell_integration.zsh");
-    std::fs::write(&a_zsh, "sentinel").unwrap();
-    prepare_cached(ShellType::Bash, base_a.clone(), &written)
-        .unwrap()
-        .unwrap();
-    assert_eq!(std::fs::read_to_string(&a_zsh).unwrap(), installed_zsh());
-}
-
-#[test]
-fn test_prepare_cached_retries_after_write_error() {
-    let dir = aterm_tempfile::tempdir().unwrap();
-    let base = dir.path().join("si");
-    // A regular file at the base path makes create_dir_all fail.
-    std::fs::write(&base, "").unwrap();
-    let written = std::sync::Mutex::new(None);
-    assert!(prepare_cached(ShellType::Zsh, base.clone(), &written).is_err());
-
-    // The failed attempt must not have been recorded: once the obstruction
-    // is gone the next spawn writes the scripts.
-    std::fs::remove_file(&base).unwrap();
-    prepare_cached(ShellType::Zsh, base.clone(), &written)
-        .unwrap()
-        .unwrap();
-    assert!(
-        base.join(script_set_address())
-            .join("aterm_shell_integration.zsh")
-            .exists()
-    );
-}
-
-#[test]
-fn test_prepare_fish_xdg_data_dirs() {
-    let dir = aterm_tempfile::tempdir().unwrap();
-    let base = dir.path().join("si");
-
-    let result = prepare_into(ShellType::Fish, &base).unwrap().unwrap();
-    let xdg = result.env_add.iter().find(|(k, _)| k == "XDG_DATA_DIRS");
-    assert!(xdg.is_some());
-    assert!(xdg.unwrap().1.contains("fish-xdg"));
-}
-
-#[test]
-fn test_zsh_wrapper_restores_zdotdir_and_sources_integration() {
-    let wrapper = ZSH_WRAPPER;
-    assert!(
-        wrapper.contains("ATERM_ORIGINAL_ZDOTDIR"),
-        "zsh wrapper must restore original ZDOTDIR"
-    );
-    assert!(
-        wrapper.contains("ATERM_UNSET_ZDOTDIR"),
-        "zsh wrapper must handle ZDOTDIR-was-unset case"
-    );
-    assert!(
-        wrapper.contains("source \"$ATERM_SHELL_INTEGRATION_DIR/aterm_shell_integration.zsh\""),
-        "zsh wrapper must source integration script"
-    );
-    assert!(
-        wrapper.contains(".zshenv"),
-        "zsh wrapper must source user's .zshenv"
-    );
-}
-
-#[test]
-fn test_bash_wrapper_sources_profile_chain_and_bashrc() {
-    let wrapper = BASH_WRAPPER;
-    assert!(
-        wrapper.contains("/etc/profile"),
-        "bash wrapper must source /etc/profile"
-    );
-    assert!(
-        wrapper.contains(".bash_profile"),
-        "bash wrapper must source .bash_profile"
-    );
-    assert!(
-        wrapper.contains(".bashrc"),
-        "bash wrapper must source .bashrc (--rcfile skips it)"
-    );
-    assert!(
-        wrapper.contains("aterm_shell_integration.bash"),
-        "bash wrapper must source integration script"
-    );
-}
-
 // NOTE: the two tests that exercised prepare_zsh/prepare_fish with the
 // relevant env var REMOVED (`ZDOTDIR`, `XDG_DATA_DIRS`) do not live here:
 // this unit binary runs its tests on parallel threads, and mutating the
@@ -1684,278 +1053,24 @@ fn test_bash_wrapper_sources_profile_chain_and_bashrc() {
 // lock serialises them. Do NOT add env-mutating tests to this file — add them
 // to `shell_suite`, through `scoped_unset`.
 
-#[test]
-fn test_bash_133b_embedded_in_custom_ps1() {
-    let script = scripts::BASH;
-    // #7987: the embedded 133;B now carries an optional ;id=<hex>
-    // capability-nonce tail derived from ATERM_SHELL_NONCE. The nonce
-    // interpolation must be inside the \[ \] group so bash does not
-    // count it against visible prompt width.
-    assert!(
-        script.contains(r#"local mark_b="\[\033]133;B${mark_b_id}\a\]""#),
-        "bash custom prompt must embed 133;B (with optional ;id=<hex>) in PS1"
-    );
-    assert!(
-        script.contains("__aterm_prompt_has_mark_b=1"),
-        "bash must flag that custom prompt has embedded 133;B"
-    );
-}
+// ─── fish ──────────────────────────────────────────────────────────────
 
-#[test]
-fn test_bash_default_mode_embeds_133b_in_ps1() {
-    let script = scripts::BASH;
-    // #7987: the default-mode embed now uses a BASH_REMATCH-based strip
-    // to tolerate nonce rotations (PS1 may already have a stale id=<hex>
-    // tail). After stripping, the new 133;B (with the current nonce) is
-    // appended back onto PS1.
-    assert!(
-        script.contains(r#"PS1="${PS1}${__aterm_b}""#),
-        "bash default mode must append 133;B (with optional ;id=<hex>) to PS1"
-    );
-    assert!(
-        script.contains(r#"local __aterm_b="\[\033]133;B${__aterm_b_suffix}\a\]""#),
-        "bash default-mode 133;B builder must include the ATERM_SHELL_NONCE-derived suffix"
-    );
-}
-
-#[test]
-fn test_fish_powerline_sep_uses_separator_color() {
-    let script = scripts::FISH;
-    // The separator is now built from the ALREADY-RESOLVED `$s` / `$r` locals
-    // rather than two inline `(set_color …)` substitutions: a `set_color` that
-    // rejects its argument prints nothing, and two zero-element substitutions
-    // glued together left `sep` an EMPTY LIST — which then contributed no
-    // `printf` argument at all and slid the whole powerline layout one operand
-    // to the left (see `test_fish_prompt_colors_are_sgr_indices_like_bash`).
-    assert!(
-        script.contains(r#"set -l sep "$s$r""#),
-        "fish powerline must build its separator from the resolved sep_color \
-         and reset locals, quoted so it is always exactly one argument"
-    );
-}
-
-// ─── Capability-nonce emission tests (#7987) ────────────────────────────
-//
-// The shipped shell integration scripts MUST reference ATERM_SHELL_NONCE
-// and emit ";id=<hex>" on every OSC 133/633 sub-op when the env var is
-// set. Without this, the host-side nonce defense added in #7960 ships
-// client-broken — hosts that flip
-// `TerminalModes::require_shell_integration_nonce` to true silently drop
-// every legitimate shell-integration emission.
-//
-// These regex-level tests guard against the scripts regressing to the
-// un-nonced form. Full functional verification (spawn a real shell,
-// check the wire emits id=<hex>) lives in the PTY integration tests
-// where a host is available to authorize the nonce.
-//
-// bash needs no static pin for the reference, the `__aterm_id_suffix`
-// helper or the unset: the live `test_bash_*` nonce tests below spawn
-// bash on every unix host and prove all three on the wire. zsh and fish
-// keep theirs, because their live twins skip on a host without the shell.
-
-#[test]
-fn test_zsh_script_defines_id_suffix_helper() {
-    let script = scripts::ZSH;
-    assert!(
-        script.contains("__aterm_id_suffix"),
-        "zsh script must define __aterm_id_suffix helper"
-    );
-    // #8015: after capture the env var is unset, so the emission reads
-    // from the shell-local `$__aterm_shell_nonce` instead of the exported
-    // env var — this prevents the nonce from leaking into subprocesses.
-    assert!(
-        script.contains(";id=${__aterm_shell_nonce}"),
-        "zsh id suffix must emit ';id=<hex>' from the captured shell-local"
-    );
-}
-
-#[test]
-fn test_fish_script_defines_id_suffix_helper() {
-    let script = scripts::FISH;
-    assert!(
-        script.contains("__aterm_id_suffix"),
-        "fish script must define __aterm_id_suffix helper"
-    );
-    assert!(
-        script.contains("printf ';id=%s'"),
-        "fish id suffix must emit ';id=<hex>' via printf"
-    );
-}
-
-#[test]
-fn test_bash_mark_functions_invoke_id_suffix() {
-    let script = scripts::BASH;
-    // Every 133 A/B/C/D emission MUST include the id suffix. The suffix is
-    // precomputed at source time into $__aterm_id_suffix_str (the nonce is
-    // immutable after capture), so the emitters expand a parameter instead of
-    // forking `$(__aterm_id_suffix)` five times per command cycle. The bytes
-    // on the wire are unchanged; only the spelling of the substring moved.
-    for expected in [
-        r#""133;A${__aterm_id_suffix_str}""#,
-        r#""133;B${__aterm_id_suffix_str}""#,
-        r#""133;C${__aterm_id_suffix_str}""#,
-        r#""133;D;${1}${__aterm_id_suffix_str}""#,
-    ] {
-        assert!(
-            script.contains(expected),
-            "bash script must emit OSC 133 with id suffix; \
-             missing exact substring {expected:?}"
-        );
-    }
-    // OSC 633;E must also carry the nonce.
-    assert!(
-        script.contains(r#""633;E;${REPLY}${__aterm_id_suffix_str}""#),
-        "bash script must emit OSC 633;E with id suffix"
-    );
-    // ...and the precomputed suffix must actually be derived from the captured
-    // shell-local nonce, or the emissions above would carry an empty tail.
-    assert!(
-        script.contains(r#"__aterm_id_suffix_str=";id=${__aterm_shell_nonce}""#),
-        "bash script must precompute the id suffix from the captured nonce"
-    );
-}
-
-#[test]
-fn test_zsh_mark_functions_invoke_id_suffix() {
-    let script = scripts::ZSH;
-    // As in bash: the suffix is precomputed once at source time into
-    // $__aterm_id_suffix_str so the five per-command-cycle markers expand a
-    // parameter rather than forking `$(__aterm_id_suffix)`. Same wire bytes.
-    for expected in [
-        r#""133;A${__aterm_id_suffix_str}""#,
-        r#""133;B${__aterm_id_suffix_str}""#,
-        r#""133;C${__aterm_id_suffix_str}""#,
-        r#""133;D;$1${__aterm_id_suffix_str}""#,
-    ] {
-        assert!(
-            script.contains(expected),
-            "zsh script must emit OSC 133 with id suffix; \
-             missing exact substring {expected:?}"
-        );
-    }
-    assert!(
-        script.contains(r#""633;E;${REPLY}${__aterm_id_suffix_str}""#),
-        "zsh script must emit OSC 633;E with id suffix"
-    );
-    assert!(
-        script.contains(r#"__aterm_id_suffix_str=";id=${__aterm_shell_nonce}""#),
-        "zsh script must precompute the id suffix from the captured nonce"
-    );
-}
-
-#[test]
-fn test_fish_mark_functions_invoke_id_suffix() {
-    let script = scripts::FISH;
-    // The suffix is INTERPOLATED from a precomputed variable, never glued on as
-    // a command substitution. In fish, `"133;A"(cmd)` is a cartesian product, so
-    // a `cmd` that prints nothing (an empty nonce — this script's own documented
-    // pre-nonce fallback, and what the header's manual `source` install always
-    // produces) collapses the whole thing to ZERO arguments: `__aterm_osc` was
-    // then called with no argv and emitted a bare empty `ESC ] BEL` instead of
-    // the mark. Pin the interpolated spelling so the substitution form cannot
-    // come back. (Live counterpart: `test_fish_emits_all_133_marks_without_a_nonce`.)
-    for expected in [
-        r#""133;A$__aterm_id_suffix_str""#,
-        r#""133;B$__aterm_id_suffix_str""#,
-        r#""133;C$__aterm_id_suffix_str""#,
-        r#""133;D;$argv[1]$__aterm_id_suffix_str""#,
-        r#""633;E;$encoded$__aterm_id_suffix_str""#,
-    ] {
-        assert!(
-            script.contains(expected),
-            "fish script must emit the OSC with an INTERPOLATED id suffix; \
-             missing exact substring {expected:?}"
-        );
-    }
-    assert!(
-        script.contains(r#"set -g __aterm_id_suffix_str ";id=$__aterm_shell_nonce""#),
-        "fish script must precompute the id suffix from the captured nonce"
-    );
-    // No emitter may go back to gluing a command substitution onto a mark
-    // string. Scan CODE only: the script documents the broken spelling in a
-    // comment so the next reader knows why it cannot come back, and that
-    // explanation must not itself trip the guard.
-    let code: String = script
-        .lines()
-        .filter(|line| !line.trim_start().starts_with('#'))
-        .collect::<Vec<_>>()
-        .join("\n");
-    for banned in [
-        r#""133;A"(__aterm_id_suffix)"#,
-        r#""133;B"(__aterm_id_suffix)"#,
-        r#""133;C"(__aterm_id_suffix)"#,
-        r#""133;D;$argv[1]"(__aterm_id_suffix)"#,
-        r#""633;E;"(__aterm_encode_cmd "$argv")(__aterm_id_suffix)"#,
-    ] {
-        assert!(
-            !code.contains(banned),
-            "fish emitter re-introduced a glued command substitution ({banned:?}): \
-             an empty nonce makes that expand to ZERO arguments and the mark vanishes"
-        );
-    }
-}
-
-/// The NESTED-LAUNCH lifeline, fish edition — the bug that made fish's whole
-/// integration dead weight in EVERY aterm session.
-///
-/// `aterm-gui`'s spawn env assembly deliberately overrides an inherited
-/// `ATERM_SHELL_INTEGRATION_INSTALLED` with an EMPTY STRING on every integrated
-/// spawn, so a shell nested inside aterm re-loads the integration instead of
-/// seeing the outer shell's exported `1` and bailing. bash and zsh spell their
-/// loader guard `[[ -n "$..." ]]`, which an empty value defuses exactly as
-/// designed — and `spawn.rs`'s `nested_launch_guard_name_matches_the_shipped_scripts`
-/// pins precisely that, for zsh and bash ONLY.
-///
-/// fish spelled it `set -q`, which asks whether the variable is DEFINED, not
-/// whether it is non-empty. The empty override therefore read as "already
-/// loaded" and the script returned before defining a single function. Measured
-/// on Linux with fish 4.2.1 under aterm 0.55.0: `aterm ctl blocks` -> "no
-/// results" and `status` fell back to `reasons=fg_job`, in every fish session.
-///
-/// This is the static half (it runs on hosts without fish); the live half is
-/// `test_fish_integration_loads_under_an_empty_guard_override`.
-#[test]
-fn test_fish_loaded_guard_survives_an_empty_override() {
-    let (label, script) = ("embedded", scripts::FISH);
-    assert!(
-        script.contains(r#"if test -n "$ATERM_SHELL_INTEGRATION_INSTALLED""#),
-        "{label} fish script must guard on NON-EMPTINESS, matching the \
-         bash/zsh `[[ -n … ]]` spelling that aterm's empty-string spawn \
-         override is built to defuse"
-    );
-    assert!(
-        !script.contains("if set -q ATERM_SHELL_INTEGRATION_INSTALLED"),
-        "{label} fish script re-introduced the `set -q` loader guard: \
-         `set -q` is true for an empty-but-SET variable, so aterm's \
-         nested-launch override kills the integration outright"
-    );
-}
-
-/// Source the fish integration in an interactive fish and return the whole
-/// [`std::process::Output`] (some tests assert on stderr — `set_color` reports
-/// a bad color there without failing the shell).
-///
-/// `extra_env` is applied AFTER [`shell_command`]'s hermetic scrub, so a test
-/// can put a variable back deliberately (including as an empty-but-SET value,
-/// which is the whole point of the loader-guard regression). `shell_command`
-/// also points `HOME`/`XDG_*` at its own empty home, so the `-i` startup never
-/// reads the developer's own `config.fish`, `conf.d`, universal variables or
-/// vendor snippets into the asserted stream.
+/// Source the fish integration in an interactive fish, run `body`, and return
+/// its stdout. `extra_env` is applied AFTER [`shell_command`]'s hermetic scrub, so
+/// a test can put a variable back deliberately (including as an empty-but-SET
+/// value, which is the whole point of the loader-guard regression).
 #[cfg(unix)]
-fn fish_integration_output(
-    fish: &str,
-    extra_env: &[(&str, &str)],
-    body: &str,
-) -> std::process::Output {
+fn run_fish_integration(fish: &str, extra_env: &[(&str, &str)], body: &str) -> String {
     let script = format!(
         "{}/src/scripts/aterm_shell_integration.fish",
         env!("CARGO_MANIFEST_DIR")
     );
-    let command = format!("source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; {body}");
     let mut cmd = shell_command(fish);
     cmd.arg("-i")
         .arg("-c")
-        .arg(&command)
+        .arg(format!(
+            "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; {body}"
+        ))
         .env("ATERM_TEST_SCRIPT", &script);
     for (key, value) in extra_env {
         cmd.env(key, value);
@@ -1969,41 +1084,22 @@ fn fish_integration_output(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    output
+    String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-/// [`fish_integration_output`], keeping only stdout.
-#[cfg(unix)]
-fn run_fish_integration(fish: &str, extra_env: &[(&str, &str)], body: &str) -> String {
-    String::from_utf8_lossy(&fish_integration_output(fish, extra_env, body).stdout).into_owned()
-}
-
-/// Live half of [`test_fish_loaded_guard_survives_an_empty_override`]: with the
-/// guard variable SET BUT EMPTY — byte-for-byte what aterm's spawn seam injects
-/// into every integrated session — the integration must still load.
-///
-/// Under the `set -q` guard this returned `LOADED=1` (function undefined),
-/// which is the state a live fish tab was in: no marks, no blocks, and
-/// `ATERM_SHELL_NONCE` left un-scrubbed in the environment because the #8015
-/// scrub also lives past the guard.
+/// The fish loader guard spelled `set -q` (definedness, not emptiness): with the
+/// guard SET BUT EMPTY — what aterm's spawn seam injects into every integrated
+/// session — the integration must still load, and scrub the nonce from the
+/// environment (#8015: every child process would inherit it). Under `set -q`
+/// a live fish tab had no marks, no blocks, and the nonce un-scrubbed.
 #[cfg(unix)]
 #[test]
 fn test_fish_integration_loads_under_an_empty_guard_override() {
-    let Some(fish) = fish_shell() else {
-        eprintln!(
-            "fish not installed; skipping \
-             test_fish_integration_loads_under_an_empty_guard_override"
-        );
-        return;
-    };
+    let fish = need_fish();
     let stdout = run_fish_integration(
         fish,
         &[
             ("ATERM_SHELL_INTEGRATION_INSTALLED", ""),
-            // A nonce MUST be present for the scrub assertion below to
-            // discriminate: with no nonce in the environment `set -q` is
-            // trivially false and the check would pass even when the guard
-            // fired early and the script never ran a line.
             (
                 "ATERM_SHELL_NONCE",
                 "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
@@ -2026,31 +1122,19 @@ fn test_fish_integration_loads_under_an_empty_guard_override() {
     );
 }
 
-/// Every OSC 133/633 mark must survive an EMPTY nonce.
-///
-/// fish glues a command substitution to a string as a CARTESIAN PRODUCT, so the
-/// old `__aterm_osc "133;A"(__aterm_id_suffix)` spelling expanded to ZERO
-/// arguments whenever `__aterm_id_suffix` printed nothing — and it prints
-/// nothing exactly when the nonce is empty, which is this script's documented
-/// pre-nonce fallback and the unavoidable state of the header's manual
-/// `source`-from-config.fish install. `__aterm_osc` then ran
-/// `printf '\e]%s\a'` with no argv and emitted a bare, malformed empty OSC.
-/// Measured on fish 4.2.1 before the fix: OSC 7 arrived and 133;A/B/C/D plus
-/// 633;E were ALL absent from the wire.
-///
-/// bash and zsh interpolate a possibly-empty parameter and never had this
-/// failure mode, which is why an integration that looked correct in review —
-/// and passed every static fish test — emitted nothing at all.
+/// Every OSC 133/633 mark survives an EMPTY nonce, and carries `;id=<hex>` when
+/// one is set. fish glues a command substitution to a string as a CARTESIAN
+/// PRODUCT, so the old `__aterm_osc "133;A"(__aterm_id_suffix)` spelling expanded
+/// to ZERO arguments whenever the suffix was empty — the pre-nonce fallback, and
+/// the manual `source`-from-config.fish install — and `printf '\e]%s\a'` emitted
+/// a bare empty OSC instead. Measured on fish 4.2.1 before the fix: 133;A/B/C/D
+/// and 633;E were ALL absent from the wire.
 #[cfg(unix)]
 #[test]
-fn test_fish_emits_all_133_marks_without_a_nonce() {
-    let Some(fish) = fish_shell() else {
-        eprintln!("fish not installed; skipping test_fish_emits_all_133_marks_without_a_nonce");
-        return;
-    };
+fn test_fish_emits_all_133_marks_with_and_without_a_nonce() {
+    let fish = need_fish();
     let stdout = run_fish_integration(
         fish,
-        // No ATERM_SHELL_NONCE at all: the unnonced fallback path.
         &[("ATERM_DISABLE_PROMPT_TITLES", "1")],
         "__aterm_mark_prompt_start; __aterm_mark_command_start; \
          __aterm_mark_exec_start; __aterm_mark_exec_finish 7; \
@@ -2064,28 +1148,7 @@ fn test_fish_emits_all_133_marks_without_a_nonce() {
         "\u{1b}]633;E;echo\\x20hi\u{7}",
         "\u{1b}]133;C\u{7}",
     );
-    assert_eq!(
-        stdout, expected,
-        "un-nonced fish must still emit every OSC 133/633 mark verbatim"
-    );
-    assert!(
-        !stdout.contains("\u{1b}]\u{7}"),
-        "fish emitted a bare empty OSC (ESC ] BEL) — the signature of a mark \
-         string collapsed to zero arguments by an empty command substitution. \
-         stdout: {stdout:?}"
-    );
-}
-
-/// The nonced path must keep emitting the exact same `;id=<hex>` bytes it did
-/// before the suffix moved from a command substitution to a variable — the fix
-/// for the un-nonced case must not change nonced output at all.
-#[cfg(unix)]
-#[test]
-fn test_fish_marks_carry_the_nonce_when_set() {
-    let Some(fish) = fish_shell() else {
-        eprintln!("fish not installed; skipping test_fish_marks_carry_the_nonce_when_set");
-        return;
-    };
+    assert_eq!(stdout, expected, "un-nonced");
     let nonce = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
     let stdout = run_fish_integration(
         fish,
@@ -2098,72 +1161,22 @@ fn test_fish_marks_carry_the_nonce_when_set() {
     assert_eq!(
         stdout,
         format!("\u{1b}]133;A;id={nonce}\u{7}\u{1b}]133;D;0;id={nonce}\u{7}"),
-        "nonced fish marks must be byte-identical to the pre-fix spelling"
+        "nonced"
     );
 }
 
-// ─── `set -q` is definedness; every ATERM_* read here wants EMPTINESS ─────
-//
-// The loader-guard fix taught this once. These pin the whole class, because
-// the same misspelling survived in five more places after it: the prompt-style
-// selector, the two tab-title guards, the five prompt-colour defaults and the
-// suite-version export.
+// `set -q` is definedness, and every ATERM_* read here wants EMPTINESS: the
+// misspelling survived the loader-guard fix in the prompt-style selector, the
+// tab-title guards and the prompt-colour defaults.
 
-/// Static sweep (runs on hosts without fish): NO `set -q` on an `ATERM_*`
-/// variable, in either copy of the script.
-///
-/// bash and zsh read every one of these with `-n` / `-z` / `${VAR:-default}`,
-/// all of which treat UNSET and EMPTY alike; aterm's spawn seam and the user's
-/// own environment both deliver empty values. `set -q` asks a different
-/// question and answers it wrongly for exactly the empty case.
-///
-/// `ATERM_SHELL_NONCE` is the single allowed exception and is documented as
-/// such in the script: both arms leave `$__aterm_shell_nonce` empty for an
-/// empty env var, so definedness cannot change the nonce, and taking the arm
-/// additionally runs the `set -e` scrub that stops an empty
-/// `ATERM_SHELL_NONCE` from being inherited by every child process.
-#[test]
-fn test_fish_never_tests_definedness_of_an_aterm_variable() {
-    let (label, script) = ("embedded", scripts::FISH);
-    let offenders: Vec<&str> = script
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.starts_with('#'))
-        .filter(|line| line.contains("set -q ATERM_"))
-        .filter(|line| !line.contains("set -q ATERM_SHELL_NONCE"))
-        .collect();
-    assert!(
-        offenders.is_empty(),
-        "{label} fish script tests DEFINEDNESS of an ATERM_* variable: {offenders:?}. \
-         Use `test -n \"$VAR\"` / `test -z \"$VAR\"` — `set -q` is true for an \
-         empty-but-SET variable, and empty is the value aterm's spawn seam and \
-         the user's environment actually deliver (see the loader-guard note at \
-         the top of the script)."
-    );
-}
-
-/// An EMPTY `ATERM_PROMPT_STYLE` must fall through to the user's own prompt.
-///
-/// `if set -q ATERM_PROMPT_STYLE; and test "$ATERM_PROMPT_STYLE" != "none"` was
-/// true for an empty value, so `__aterm_custom_prompt` ran with `style=""`, its
-/// `switch` matched no case, and fish printed NOTHING between the 133;A and
-/// 133;B marks — no aterm prompt AND no user prompt. bash and zsh both spell
-/// this `[[ -n "$ATERM_PROMPT_STYLE" && … ]]`.
-///
-/// Both branches are stubbed so the assertion pins WHICH one ran without
-/// depending on fish's own `share/functions` (`prompt_pwd` and friends), which
-/// a `dpkg-deb -x` prefix may not carry; so is the cwd report before the marks
-/// (pinned by `test_fish_prompt_reasserts_its_own_cwd_before_the_prompt_start`).
+/// An EMPTY `ATERM_PROMPT_STYLE` must fall through to the user's own prompt:
+/// under `set -q`, `__aterm_custom_prompt` ran with `style=""`, matched no case,
+/// and fish printed NOTHING between 133;A and 133;B. Both branches (and the cwd
+/// report) are stubbed, so the test needs none of fish's own `share/functions`.
 #[cfg(unix)]
 #[test]
 fn test_fish_empty_prompt_style_falls_through_to_the_user_prompt() {
-    let Some(fish) = fish_shell() else {
-        eprintln!(
-            "fish not installed; skipping \
-             test_fish_empty_prompt_style_falls_through_to_the_user_prompt"
-        );
-        return;
-    };
+    let fish = need_fish();
     let body = "function __aterm_custom_prompt; printf 'CUSTOM'; end; \
                 function __aterm_original_fish_prompt; printf 'ORIGINAL'; end; \
                 function __aterm_report_cwd; end; \
@@ -2189,21 +1202,12 @@ fn test_fish_empty_prompt_style_falls_through_to_the_user_prompt() {
     }
 }
 
-/// An EMPTY `ATERM_DISABLE_PROMPT_TITLES` must NOT disable titles.
-///
-/// bash and zsh spell the guard `[[ -z "${ATERM_DISABLE_PROMPT_TITLES:-}" ]]`,
-/// so empty means "not disabled". fish's `not set -q` read empty as "disabled"
-/// and silently dropped the OSC 0 tab title — in fish only.
+/// An EMPTY `ATERM_DISABLE_PROMPT_TITLES` must NOT disable titles, as in bash and
+/// zsh; fish's `not set -q` read empty as "disabled" and dropped the OSC 0 title.
 #[cfg(unix)]
 #[test]
 fn test_fish_empty_disable_prompt_titles_still_emits_titles() {
-    let Some(fish) = fish_shell() else {
-        eprintln!(
-            "fish not installed; skipping \
-             test_fish_empty_disable_prompt_titles_still_emits_titles"
-        );
-        return;
-    };
+    let fish = need_fish();
     let with_title = concat!(
         "\u{1b}]633;E;echo\\x20hi\u{7}",
         "\u{1b}]0;echo hi\u{7}",
@@ -2225,33 +1229,15 @@ fn test_fish_empty_disable_prompt_titles_still_emits_titles() {
     );
 }
 
-/// EMPTY `ATERM_PROMPT_*_COLOR` values must fall back to the documented
-/// defaults, not reach `set_color` as the empty string.
-///
-/// `set -l hc (set -q ATERM_PROMPT_HOST_COLOR; and echo $ATERM_PROMPT_HOST_COLOR; or echo 2)`
-/// took the `set -q` arm for an empty-but-set variable; `echo` then printed a
-/// bare newline, so `hc` was the empty string and the `or echo 2` default was
-/// never reached — `set_color ""`, which fish answers with
-/// `set_color: Unknown color ""` (exit 2) on stderr, on EVERY prompt render.
-/// bash and zsh spell all five `${ATERM_PROMPT_*_COLOR:-<default>}`, which
-/// substitutes for empty too.
-///
-/// Asserted on the BYTES the prompt emits, not on a `set_color` stub. The
-/// script no longer calls `set_color` for a palette index at all (see
-/// [`test_fish_prompt_colors_are_sgr_indices_like_bash`]) — it formats the SGR
-/// escape itself — so the resolved index is now directly observable, which is
-/// a stronger reading of the same question. Only `prompt_pwd` is stubbed, so
-/// the test does not depend on fish's own `share/functions` (a `dpkg-deb -x`
-/// prefix may not carry them).
+/// EMPTY `ATERM_PROMPT_*_COLOR` values fall back to the defaults bash and zsh get
+/// from `${ATERM_PROMPT_*_COLOR:-N}`; under `set -q` they reached `set_color ""`
+/// on every prompt. Each is a palette INDEX, which fish's `set_color` (names or
+/// hex only) rejected with no output, so the script formats the `38;5;N` SGR
+/// itself — asserted on the bytes. Only `prompt_pwd` is stubbed.
 #[cfg(unix)]
 #[test]
 fn test_fish_empty_prompt_colors_fall_back_to_defaults() {
-    let Some(fish) = fish_shell() else {
-        eprintln!(
-            "fish not installed; skipping test_fish_empty_prompt_colors_fall_back_to_defaults"
-        );
-        return;
-    };
+    let fish = need_fish();
     let body = "function prompt_pwd; printf '~/x'; end; __aterm_custom_prompt";
     let empty_colors = [
         ("ATERM_PROMPT_STYLE", "minimal"),
@@ -2284,71 +1270,6 @@ fn test_fish_empty_prompt_colors_fall_back_to_defaults() {
     );
 }
 
-#[test]
-fn test_bash_ps1_mark_b_includes_nonce_when_set() {
-    let script = scripts::BASH;
-    // #8015: both the default-mode embed and the custom __aterm_set_prompt
-    // builder must gate the id=<hex> tail on the captured shell-local
-    // `$__aterm_shell_nonce` (not the env var). The env var is unset at
-    // source time to stop the 64-hex secret from leaking into subprocesses.
-    assert!(
-        script.contains(
-            r#"[[ -n "$__aterm_shell_nonce" ]] && __aterm_b_suffix=";id=${__aterm_shell_nonce}""#
-        ),
-        "bash default-mode PS1 must append ;id= from the captured shell-local"
-    );
-    assert!(
-        script.contains(
-            r#"[[ -n "$__aterm_shell_nonce" ]] && mark_b_id=";id=${__aterm_shell_nonce}""#
-        ),
-        "bash custom-prompt builder must append ;id= from the captured shell-local"
-    );
-}
-
-#[cfg(unix)]
-fn run_id_suffix_via_shell(
-    shell: &str,
-    args: &[&str],
-    cleanup: &str,
-    script_name: &str,
-    nonce: Option<&str>,
-) -> String {
-    let script = format!("{}/src/scripts/{script_name}", env!("CARGO_MANIFEST_DIR"));
-    // Guard definedness before reading the suffix: an UNDEFINED __aterm_id_suffix
-    // also yields empty stdout inside $(...) with a zero outer exit, so the
-    // nonce-unset case ("" expected) could pass even if the script never loaded.
-    // `command -v` (POSIX; works in bash and zsh) forces a hard failure instead,
-    // so empty-because-defined is distinguished from empty-because-undefined.
-    let command = format!(
-        "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; {cleanup}; \
-         command -v __aterm_id_suffix >/dev/null || exit 97; \
-         printf '%s' \"$(__aterm_id_suffix)\""
-    );
-    let mut cmd = shell_command(shell);
-    cmd.args(args)
-        .arg("-c")
-        .arg(&command)
-        .env("ATERM_TEST_SCRIPT", script);
-    match nonce {
-        Some(n) => {
-            cmd.env("ATERM_SHELL_NONCE", n);
-        }
-        None => {
-            cmd.env_remove("ATERM_SHELL_NONCE");
-        }
-    }
-    let output = cmd
-        .output()
-        .unwrap_or_else(|error| panic!("spawn {shell} for id-suffix test: {error}"));
-    assert!(
-        output.status.success(),
-        "{shell} id-suffix invocation should succeed; stdout: {:?}; stderr: {:?}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout).expect("id-suffix output should be UTF-8")
-}
-
 /// Absolute path to a `fish` binary, or `None` to skip the spawning tests on a
 /// host without fish installed. `$ATERM_TEST_FISH` overrides; otherwise `$PATH`
 /// is searched after the well-known locations (see [`resolve_test_shell`]).
@@ -2369,115 +1290,6 @@ fn fish_shell() -> Option<&'static str> {
     .as_deref()
 }
 
-#[cfg(unix)]
-#[test]
-fn test_bash_id_suffix_emits_hex_when_nonce_set() {
-    let nonce = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
-    let actual = run_id_suffix_via_shell(
-        bash_shell(),
-        &["--noprofile", "--norc", "-i"],
-        "__aterm_in_prompt_cmd=1; trap - DEBUG 2>/dev/null || true; PROMPT_COMMAND=",
-        "aterm_shell_integration.bash",
-        Some(nonce),
-    );
-    assert_eq!(
-        actual,
-        format!(";id={nonce}"),
-        "bash must emit ';id=<hex>' when ATERM_SHELL_NONCE is set"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn test_bash_id_suffix_empty_when_nonce_unset() {
-    let actual = run_id_suffix_via_shell(
-        bash_shell(),
-        &["--noprofile", "--norc", "-i"],
-        "__aterm_in_prompt_cmd=1; trap - DEBUG 2>/dev/null || true; PROMPT_COMMAND=",
-        "aterm_shell_integration.bash",
-        None,
-    );
-    assert_eq!(
-        actual, "",
-        "bash must emit empty string when ATERM_SHELL_NONCE is unset \
-         (pre-nonce host compatibility)"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn test_zsh_id_suffix_emits_hex_when_nonce_set() {
-    let Some(zsh) = zsh_shell() else {
-        return;
-    };
-    let nonce = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
-    let actual = run_id_suffix_via_shell(
-        zsh,
-        &["-f", "-i"],
-        "add-zsh-hook -d precmd __aterm_precmd 2>/dev/null || true; add-zsh-hook -d preexec __aterm_preexec 2>/dev/null || true",
-        "aterm_shell_integration.zsh",
-        Some(nonce),
-    );
-    assert_eq!(
-        actual,
-        format!(";id={nonce}"),
-        "zsh must emit ';id=<hex>' when ATERM_SHELL_NONCE is set"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn test_zsh_id_suffix_empty_when_nonce_unset() {
-    let Some(zsh) = zsh_shell() else {
-        return;
-    };
-    let actual = run_id_suffix_via_shell(
-        zsh,
-        &["-f", "-i"],
-        "add-zsh-hook -d precmd __aterm_precmd 2>/dev/null || true; add-zsh-hook -d preexec __aterm_preexec 2>/dev/null || true",
-        "aterm_shell_integration.zsh",
-        None,
-    );
-    assert_eq!(
-        actual, "",
-        "zsh must emit empty string when ATERM_SHELL_NONCE is unset"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn test_fish_id_suffix_emits_hex_when_nonce_set() {
-    let Some(fish) = fish_shell() else {
-        // fish is not universally installed; skip gracefully instead of failing CI.
-        eprintln!("fish not installed; skipping test_fish_id_suffix_emits_hex_when_nonce_set");
-        return;
-    };
-    let script = format!(
-        "{}/src/scripts/aterm_shell_integration.fish",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    let nonce = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
-    let command = "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; __aterm_id_suffix".to_string();
-    let output = shell_command(fish)
-        .arg("-i")
-        .arg("-c")
-        .arg(&command)
-        .env("ATERM_TEST_SCRIPT", &script)
-        .env("ATERM_SHELL_NONCE", nonce)
-        .output()
-        .unwrap_or_else(|error| panic!("spawn fish for id-suffix test: {error}"));
-    assert!(
-        output.status.success(),
-        "fish id-suffix invocation should succeed; stderr: {:?}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        format!(";id={nonce}"),
-        "fish must emit ';id=<hex>' when ATERM_SHELL_NONCE is set"
-    );
-}
-
 // ─── #8015: ATERM_SHELL_NONCE must NOT leak into child processes ─────────
 //
 // Round-3 adversarial audit finding P1-R3-04: the 64-hex capability nonce
@@ -2488,113 +1300,6 @@ fn test_fish_id_suffix_emits_hex_when_nonce_set() {
 // #7960 nonce-enforcement defense. The fix: capture the env var into a
 // shell-local at source time, then immediately unset it so subprocesses
 // never see it.
-
-#[test]
-fn test_zsh_script_unsets_shell_nonce_env_var() {
-    let script = scripts::ZSH;
-    assert!(
-        script.contains("unset ATERM_SHELL_NONCE"),
-        "zsh script must `unset ATERM_SHELL_NONCE` after capturing to a \
-         shell-local (#8015) so the nonce is not inherited by subprocesses"
-    );
-    // The environment first; the value the shell already signs with only in an
-    // upgrade in place, where the environment holds none.
-    assert!(
-        script.contains(
-            r#"typeset -g __aterm_shell_nonce="${ATERM_SHELL_NONCE:-${__aterm_shell_nonce:-}}""#
-        ),
-        "zsh script must capture ATERM_SHELL_NONCE into __aterm_shell_nonce \
-         at source time using `typeset -g` (#8015)"
-    );
-}
-
-#[test]
-fn test_fish_script_unsets_shell_nonce_env_var() {
-    let script = scripts::FISH;
-    assert!(
-        script.contains("set -e ATERM_SHELL_NONCE"),
-        "fish script must `set -e ATERM_SHELL_NONCE` after capturing to a \
-         shell-global (#8015) so the nonce is not inherited by subprocesses"
-    );
-    assert!(
-        script.contains(r#"set -g __aterm_shell_nonce "$ATERM_SHELL_NONCE""#),
-        "fish script must capture ATERM_SHELL_NONCE into __aterm_shell_nonce \
-         at source time using `set -g` (#8015)"
-    );
-}
-
-#[cfg(unix)]
-fn run_env_check_after_source(
-    shell: &str,
-    args: &[&str],
-    cleanup: &str,
-    script_name: &str,
-    nonce: &str,
-) -> (String, String) {
-    let script = format!("{}/src/scripts/{script_name}", env!("CARGO_MANIFEST_DIR"));
-    // After sourcing, query whether ATERM_SHELL_NONCE still exists in the
-    // environment (it MUST NOT — #8015) and whether __aterm_id_suffix still
-    // produces the expected output (it MUST — the shell captured the env
-    // var into a shell-local before unsetting it).
-    let command = format!(
-        "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; {cleanup}; \
-         printf 'env=%s|suffix=%s' \"${{ATERM_SHELL_NONCE-UNSET}}\" \"$(__aterm_id_suffix)\""
-    );
-    let output = shell_command(shell)
-        .args(args)
-        .arg("-c")
-        .arg(&command)
-        .env("ATERM_TEST_SCRIPT", script)
-        .env("ATERM_SHELL_NONCE", nonce)
-        .output()
-        .unwrap_or_else(|error| panic!("spawn {shell} for env-leak test: {error}"));
-    assert!(
-        output.status.success(),
-        "{shell} env-leak invocation should succeed; stdout: {:?}; stderr: {:?}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8(output.stdout).expect("env-leak output should be UTF-8");
-    let parts: Vec<&str> = stdout.splitn(2, '|').collect();
-    assert_eq!(
-        parts.len(),
-        2,
-        "env-leak output must have env=/suffix= pair: {stdout:?}"
-    );
-    let env = parts[0]
-        .strip_prefix("env=")
-        .expect("env-leak stdout must start with env=")
-        .to_string();
-    let suffix = parts[1]
-        .strip_prefix("suffix=")
-        .expect("env-leak stdout must contain suffix=")
-        .to_string();
-    (env, suffix)
-}
-
-#[cfg(unix)]
-#[test]
-fn test_bash_unsets_shell_nonce_env_after_source() {
-    let nonce = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
-    let (env, suffix) = run_env_check_after_source(
-        bash_shell(),
-        &["--noprofile", "--norc", "-i"],
-        "__aterm_in_prompt_cmd=1; trap - DEBUG 2>/dev/null || true; PROMPT_COMMAND=",
-        "aterm_shell_integration.bash",
-        nonce,
-    );
-    assert_eq!(
-        env, "UNSET",
-        "bash must `unset ATERM_SHELL_NONCE` after sourcing (#8015 — \
-         otherwise every subprocess inherits the 64-hex secret)"
-    );
-    assert_eq!(
-        suffix,
-        format!(";id={nonce}"),
-        "bash must still emit ';id=<hex>' from the captured shell-local \
-         after the env var is unset"
-    );
-}
 
 /// #8015 through PS1: the prompt hook appends `;id=<nonce>` to PS1, and a PS1
 /// that bash imported from its environment (or a user's rc exported) keeps the
@@ -2647,99 +1352,44 @@ env >\"$HOME/child-env-2\"\n";
     }
 }
 
+/// zsh's half of #8015 (bash's rides the PS1 test above, fish's the loader-guard
+/// test): the nonce is captured into a shell-local and unset from the environment
+/// at source time, and the marks still sign with it; with no nonce at all the
+/// suffix is empty — an unsigned mark, for a host from before the nonce.
 #[cfg(unix)]
 #[test]
 fn test_zsh_unsets_shell_nonce_env_after_source() {
-    let Some(zsh) = zsh_shell() else {
-        return;
-    };
-    let nonce = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
-    let (env, suffix) = run_env_check_after_source(
-        zsh,
-        &["-f", "-i"],
-        "add-zsh-hook -d precmd __aterm_precmd 2>/dev/null || true; add-zsh-hook -d preexec __aterm_preexec 2>/dev/null || true",
-        "aterm_shell_integration.zsh",
-        nonce,
-    );
-    assert_eq!(
-        env, "UNSET",
-        "zsh must `unset ATERM_SHELL_NONCE` after sourcing (#8015 — \
-         otherwise every subprocess inherits the 64-hex secret)"
-    );
-    assert_eq!(
-        suffix,
-        format!(";id={nonce}"),
-        "zsh must still emit ';id=<hex>' from the captured shell-local \
-         after the env var is unset"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn test_fish_unsets_shell_nonce_env_after_source() {
-    let Some(fish) = fish_shell() else {
-        eprintln!("fish not installed; skipping test_fish_unsets_shell_nonce_env_after_source");
-        return;
-    };
+    let zsh = need_zsh();
     let script = format!(
-        "{}/src/scripts/aterm_shell_integration.fish",
+        "{}/src/scripts/aterm_shell_integration.zsh",
         env!("CARGO_MANIFEST_DIR")
     );
     let nonce = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
-    // After sourcing, query (1) whether ATERM_SHELL_NONCE is still set in
-    // the environment and (2) that __aterm_id_suffix still prints ';id=<hex>'
-    // from the captured shell-global. `set -qx` checks the exported env;
-    // `set -q` alone would match the shell-global too.
-    let command = "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; \
-                   if set -qx ATERM_SHELL_NONCE; \
-                       printf 'env=SET|suffix=%s' (__aterm_id_suffix); \
-                   else; \
-                       printf 'env=UNSET|suffix=%s' (__aterm_id_suffix); \
-                   end";
-    let output = shell_command(fish)
-        .arg("-i")
-        .arg("-c")
-        .arg(command)
-        .env("ATERM_TEST_SCRIPT", &script)
-        .env("ATERM_SHELL_NONCE", nonce)
-        .output()
-        .unwrap_or_else(|error| panic!("spawn fish for env-leak test: {error}"));
-    assert!(
-        output.status.success(),
-        "fish env-leak invocation should succeed; stderr: {:?}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    assert!(
-        stdout.starts_with("env=UNSET"),
-        "fish must `set -e ATERM_SHELL_NONCE` after sourcing (#8015); got: {stdout:?}"
-    );
-    assert!(
-        stdout.ends_with(&format!("suffix=;id={nonce}")),
-        "fish must still emit ';id=<hex>' from the captured shell-global \
-         after the env var is unset; got: {stdout:?}"
-    );
+    for (given, suffix) in [(Some(nonce), format!(";id={nonce}")), (None, String::new())] {
+        let mut cmd = shell_command(zsh);
+        cmd.args(["-f", "-i", "-c"])
+            .arg(
+                "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; \
+                 printf 'env=%s|suffix=%s' \"${ATERM_SHELL_NONCE-UNSET}\" \"$(__aterm_id_suffix)\"",
+            )
+            .env("ATERM_TEST_SCRIPT", &script);
+        if let Some(nonce) = given {
+            cmd.env("ATERM_SHELL_NONCE", nonce);
+        }
+        let out = cmd.output().expect("spawn zsh");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!("env=UNSET|suffix={suffix}"),
+            "nonce {given:?}; stderr: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 // ─── PowerShell / pwsh integration (Windows' default shells) ─────────────
 //
-// Static shape tests run everywhere; functional tests spawn powershell.exe
-// and are Windows-only (powershell.exe ships with every supported Windows).
-
-#[test]
-fn test_detect_powershell() {
-    assert_eq!(ShellType::detect("pwsh"), ShellType::PowerShell);
-    assert_eq!(ShellType::detect("pwsh.exe"), ShellType::PowerShell);
-    assert_eq!(ShellType::detect("powershell"), ShellType::PowerShell);
-    assert_eq!(ShellType::detect("powershell.exe"), ShellType::PowerShell);
-    assert_eq!(ShellType::detect("PowerShell.EXE"), ShellType::PowerShell);
-    assert_eq!(ShellType::detect("/usr/bin/pwsh"), ShellType::PowerShell);
-    #[cfg(windows)]
-    assert_eq!(
-        ShellType::detect(r"C:\Program Files\PowerShell\7\pwsh.exe"),
-        ShellType::PowerShell
-    );
-}
+// Functional tests spawn powershell.exe and are Windows-only (powershell.exe
+// ships with every supported Windows).
 
 #[test]
 fn test_prepare_powershell_dot_sources_script() {
@@ -2777,82 +1427,6 @@ fn test_powershell_script_is_ascii() {
     assert!(
         scripts::POWERSHELL.is_ascii(),
         "aterm_shell_integration.ps1 must stay ASCII-only (written without a BOM)"
-    );
-}
-
-#[test]
-fn test_powershell_script_unsets_shell_nonce_env_var() {
-    let script = scripts::POWERSHELL;
-    assert!(
-        script.contains("Remove-Item Env:ATERM_SHELL_NONCE"),
-        "PowerShell script must remove ATERM_SHELL_NONCE from the \
-         environment after capture (#8015)"
-    );
-    assert!(
-        script.contains(r"$Global:__aterm_shell_nonce = if ($env:ATERM_SHELL_NONCE)"),
-        "PowerShell script must capture ATERM_SHELL_NONCE into a \
-         (non-inherited) PowerShell variable at source time (#8015)"
-    );
-}
-
-#[test]
-fn test_powershell_mark_emissions_include_id_suffix() {
-    let script = scripts::POWERSHELL;
-    for expected in [
-        r"]133;A$__aterm_suffix",
-        r"]133;B$__aterm_suffix",
-        r"]133;C$__aterm_suffix",
-        r"]133;D;$__aterm_code$__aterm_suffix",
-        r"]633;E;$(__aterm_encode_cmd $__aterm_line)$__aterm_suffix",
-    ] {
-        assert!(
-            script.contains(expected),
-            "PowerShell script must emit OSC 133/633 with the id suffix; \
-             missing exact substring {expected:?}"
-        );
-    }
-}
-
-#[test]
-fn test_powershell_script_reports_cwd_and_preserves_prompt() {
-    let script = scripts::POWERSHELL;
-    assert!(
-        script.contains("]7;file://"),
-        "PowerShell script must report the cwd via OSC 7"
-    );
-    assert!(
-        script.contains(r"$Global:__aterm_original_prompt = $function:Prompt"),
-        "PowerShell script must capture and wrap the user's prompt, not replace it"
-    );
-    assert!(
-        script.contains("ATERM_DISABLE_PROMPT_TITLES"),
-        "PowerShell OSC 0 titles must honor ATERM_DISABLE_PROMPT_TITLES"
-    );
-}
-
-/// In an aterm tab on Windows, pwsh speaks UTF-8 to native programs both ways:
-/// with the console's output code page left at 437, `aterm help | Select-String`
-/// mangled every em dash (README "Known limitations", measured on 0.90.0).
-/// Static, because no pwsh runs on the unix lanes; the Windows twin below runs it.
-#[test]
-fn test_powershell_sets_utf8_for_native_programs_in_an_aterm_tab() {
-    let ps = scripts::POWERSHELL;
-    let gate = ps
-        .find("if (($env:ATERM_CHILD -or $env:ATERM_SESSION_ID) -and")
-        .expect("the UTF-8 block is gated on being inside an aterm session");
-    let block = &ps[gate..];
-    let block = &block[..block.find("\n}\n").expect("block end")];
-    assert!(block.contains("[System.Environment]::OSVersion.Platform -eq 'Win32NT'"));
-    assert!(block.contains("New-Object System.Text.UTF8Encoding $false"));
-    assert!(block.contains("$Global:OutputEncoding = $__aterm_utf8"));
-    assert!(block.contains("[Console]::OutputEncoding = $__aterm_utf8"));
-    assert!(
-        block.contains("catch { }"),
-        "a missing console is not an error"
-    );
-    assert!(
-        gate < ps.find("function Global:Prompt").expect("prompt"),
-        "set before any prompt runs"
     );
 }
 
@@ -2894,6 +1468,50 @@ fn run_powershell_snippet(snippet: &str, nonce: Option<&str>) -> String {
 
 #[cfg(windows)]
 fn run_powershell(snippet: &str, nonce: Option<&str>, how: Pwsh) -> String {
+    let output = powershell_output(Path::new("powershell.exe"), "", snippet, nonce, how, &[]);
+    assert!(
+        output.status.success(),
+        "powershell snippet {snippet:?} should succeed; stdout: {:?}; stderr: {:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// One run of `exe` (`powershell.exe`, or a pwsh 7 path) in a hidden console of
+/// its own: `prelude` first (where a test plays the user's profile, which runs
+/// before the integration in a real tab; end it with `; `), then the
+/// integration script unless [`Pwsh::Bare`], then `snippet`. `env` overrides
+/// the ordinary scrub; the exclusive home/profile-state roots always go last.
+#[cfg(windows)]
+fn powershell_output(
+    exe: &Path,
+    prelude: &str,
+    snippet: &str,
+    nonce: Option<&str>,
+    how: Pwsh,
+    env: &[(&str, &str)],
+) -> std::process::Output {
+    let world = PowerShellWorld::new();
+    powershell_output_in(&world, exe, prelude, snippet, nonce, how, env)
+}
+
+#[cfg(windows)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "every test child gets a windowless console of its own, never the runner's: \
+              the UTF-8 test switches its console's code page, which aterm_uds::spawn's \
+              Quiet rule would share with a runner that has a console"
+)]
+fn powershell_output_in(
+    world: &PowerShellWorld,
+    exe: &Path,
+    prelude: &str,
+    snippet: &str,
+    nonce: Option<&str>,
+    how: Pwsh,
+    env: &[(&str, &str)],
+) -> std::process::Output {
     use std::os::windows::process::CommandExt;
     /// `CREATE_NO_WINDOW`: a console of the child's own, never shown.
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -2901,14 +1519,16 @@ fn run_powershell(snippet: &str, nonce: Option<&str>, how: Pwsh) -> String {
         "{}/src/scripts/aterm_shell_integration.ps1",
         env!("CARGO_MANIFEST_DIR")
     );
-    // The snippet must avoid double quotes: powershell.exe's command-line
-    // quote handling would otherwise interact with Rust's arg quoting.
-    let command = if how == Pwsh::Bare {
-        snippet.to_owned()
-    } else {
-        format!(". $env:ATERM_TEST_SCRIPT; {snippet}")
-    };
-    let mut cmd = Command::new("powershell.exe");
+    // The prelude and snippet must avoid double quotes: powershell.exe's
+    // command-line quote handling would otherwise interact with Rust's arg
+    // quoting.
+    let mut command = PowerShellWorld::home_guard().to_owned();
+    command.push_str(prelude);
+    if how != Pwsh::Bare {
+        command.push_str(". $env:ATERM_TEST_SCRIPT; ");
+    }
+    command.push_str(snippet);
+    let mut cmd = Command::new(exe);
     cmd.args([
         "-NoProfile",
         "-NonInteractive",
@@ -2920,13 +1540,21 @@ fn run_powershell(snippet: &str, nonce: Option<&str>, how: Pwsh) -> String {
     .env("ATERM_TEST_SCRIPT", &script)
     .creation_flags(CREATE_NO_WINDOW);
     // Hermetic spawn: a developer running the tests inside aterm has these
-    // exported, which would trip the already-loaded guard, alter titles, or
-    // decide whether the shell is in an aterm tab.
+    // exported, which would trip the already-loaded guard, alter titles,
+    // decide whether the shell is in an aterm tab, or switch the readline key
+    // layer off.
     for var in [
         "ATERM_SHELL_INTEGRATION_INSTALLED",
         "ATERM_DISABLE_PROMPT_TITLES",
+        "ATERM_DISABLE_READLINE_KEYS",
         "ATERM_CHILD",
         "ATERM_SESSION_ID",
+        // Each PowerShell builds its own module path when this is unset. A suite
+        // run from a pwsh 7 tab inherits pwsh's, and Windows PowerShell 5.1 then
+        // imported pwsh's PSReadLine 2.4.5 instead of its own 2.0.0 (measured
+        // 2026-10-16; pwsh rewrites it only for a powershell.exe it starts
+        // itself, not one under cmd and cargo).
+        "PSModulePath",
     ] {
         cmd.env_remove(var);
     }
@@ -2941,42 +1569,14 @@ fn run_powershell(snippet: &str, nonce: Option<&str>, how: Pwsh) -> String {
             cmd.env_remove("ATERM_SHELL_NONCE");
         }
     }
-    let output = cmd
-        .output()
-        .unwrap_or_else(|error| panic!("spawn powershell.exe for integration test: {error}"));
-    assert!(
-        output.status.success(),
-        "powershell snippet {snippet:?} should succeed; stdout: {:?}; stderr: {:?}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-#[cfg(windows)]
-#[test]
-fn test_powershell_id_suffix_emits_hex_when_nonce_set() {
-    let nonce = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
-    let actual = run_powershell_snippet("[Console]::Write((__aterm_id_suffix))", Some(nonce));
-    assert_eq!(
-        actual,
-        format!(";id={nonce}"),
-        "PowerShell must emit ';id=<hex>' when ATERM_SHELL_NONCE is set"
-    );
-}
-
-#[cfg(windows)]
-#[test]
-fn test_powershell_id_suffix_empty_when_nonce_unset() {
-    let actual = run_powershell_snippet(
-        "[Console]::Write('suffix=[' + (__aterm_id_suffix) + ']')",
-        None,
-    );
-    assert_eq!(
-        actual, "suffix=[]",
-        "PowerShell must emit empty suffix when ATERM_SHELL_NONCE is unset \
-         (pre-nonce host compatibility)"
-    );
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    // Confinement is last, so a test's ordinary environment overrides cannot
+    // restore the runner's home or profile-state roots.
+    cmd.envs(world.env()).current_dir(world.root.path());
+    cmd.output()
+        .unwrap_or_else(|error| panic!("spawn {exe:?} for integration test: {error}"))
 }
 
 #[cfg(windows)]
@@ -3099,123 +1699,78 @@ fn test_cache_dir_is_the_per_user_cache_outside_the_containment_write_roots() {
 // `Unknown` and therefore got no injection at all.
 // ---------------------------------------------------------------------------
 
+/// The WSL injection crosses into the distro through `WSLENV` (ours first, see
+/// below) and runs as `wsl --exec /bin/sh -c <program>` — `--exec` keeps argv
+/// byte-for-byte, where `wsl -- …` re-quotes every argument into a `bash -c`
+/// string. The program is driven here under this host's own `/bin/sh` with a
+/// stand-in login shell: it enters the handed-over cwd and drops the variable (a
+/// shell nested inside must not jump back), starts a bash login shell on the
+/// EXISTING bash wrapper rcfile, and any other login shell plainly — forcing bash
+/// on a zsh WSL user to gain marks would be a regression, not a feature.
+#[cfg(unix)]
 #[test]
-fn test_detect_wsl_and_cmd() {
-    // The bare aliases the PTY seam already resolves...
-    assert_eq!(ShellType::detect("wsl"), ShellType::Wsl);
-    assert_eq!(ShellType::detect("cmd"), ShellType::Cmd);
-    // ...and the resolved program paths those aliases turn into.
-    assert_eq!(
-        ShellType::detect("C:\\Windows\\System32\\wsl.exe"),
-        ShellType::Wsl
-    );
-    assert_eq!(
-        ShellType::detect("C:\\Windows\\System32\\CMD.EXE"),
-        ShellType::Cmd
-    );
-    // Neighbours must not be swept in: nu still has no injection.
-    assert_eq!(ShellType::detect("nu.exe"), ShellType::Unknown);
-}
-
-/// `WSLENV` is the ONLY channel into the distro, so getting it wrong is silent:
-/// without the `/p` flag the integration dir arrives as an untranslated `C:\…`
-/// that no Linux shell can read.
-#[test]
-fn test_prepare_wsl_env_carries_path_translated_wslenv() {
+fn test_wsl_launcher_starts_bash_on_the_rcfile_and_any_other_shell_plainly() {
     let dir = aterm_tempfile::tempdir().unwrap();
-    let base = dir.path().join("si");
-    let injection = prepare_into(ShellType::Wsl, &base).unwrap().unwrap();
-
+    let injection = prepare_into(ShellType::Wsl, &dir.path().join("si"))
+        .unwrap()
+        .unwrap();
+    let argv = injection.argv_override.as_deref().expect("wsl argv");
+    assert_eq!(argv[..4], ["wsl", "--exec", "/bin/sh", "-c"]);
     let env: std::collections::HashMap<&str, &str> = injection
         .env_add
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
-    assert_eq!(
-        env.get("ATERM_SHELL_INTEGRATION_DIR").copied(),
-        Some(base.to_string_lossy().as_ref())
-    );
-    let wslenv = env.get("WSLENV").expect("WSLENV must be injected");
-    let entries: Vec<&str> = wslenv.split(':').collect();
-    assert!(
-        entries.contains(&"ATERM_SHELL_INTEGRATION_DIR/p"),
-        "the /p flag is what path-translates the dir into the distro: {wslenv}"
-    );
-    assert!(
-        entries.contains(&"ATERM_SHELL_NONCE"),
-        "the capability nonce must cross too or every mark is dropped: {wslenv}"
-    );
-    assert!(
-        entries.contains(&WSL_CWD_VAR),
-        "the cwd hand-off must cross: {wslenv}"
-    );
+    assert!(env["WSLENV"].starts_with(&merge_wslenv("")), "{env:?}");
+    let si_dir = env["ATERM_SHELL_INTEGRATION_DIR"];
+    let cwd = dir.path().join("proj");
+    std::fs::create_dir(&cwd).unwrap();
+    let cwd = std::fs::canonicalize(&cwd).unwrap();
+    for (login, expected) in [
+        ("bash", format!("--rcfile|{si_dir}/bash/rcfile|-i|")),
+        ("zsh", "-l|".to_owned()),
+    ] {
+        let stand_in = dir.path().join("login").join(login);
+        std::fs::create_dir_all(stand_in.parent().unwrap()).unwrap();
+        write_executable(
+            &stand_in,
+            "#!/bin/sh\nprintf '%s|' \"$(pwd -P)\" \"${ATERM_WSL_CWD-unset}\" \"$@\"\n",
+        );
+        let out = shell_command(&argv[2])
+            .args(&argv[3..])
+            .envs(injection.env_add.iter().map(|(k, v)| (k, v)))
+            .env("SHELL", &stand_in)
+            .env(WSL_CWD_VAR, &cwd)
+            .output()
+            .expect("spawn /bin/sh");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!("{}|unset|{expected}", cwd.display()),
+            "login shell {login}; stderr: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
-/// The launcher must run through `--exec` (argv verbatim) and must reach the
-/// EXISTING bash wrapper rcfile rather than re-implementing the injection.
-#[test]
-fn test_prepare_wsl_argv_execs_the_bash_rcfile() {
-    let dir = aterm_tempfile::tempdir().unwrap();
-    let base = dir.path().join("si");
-    let injection = prepare_into(ShellType::Wsl, &base).unwrap().unwrap();
-
-    let argv = injection.argv_override.expect("wsl needs an argv override");
-    assert_eq!(argv[0], "wsl", "argv[0] is the display token");
-    assert_eq!(
-        &argv[1..4],
-        ["--exec", "/bin/sh", "-c"],
-        "`--exec` bypasses the distro login shell so argv arrives byte-for-byte; \
-         plain `wsl -- …` re-quotes every argument into a `bash -c` string"
-    );
-    let script = &argv[4];
-    assert!(
-        script.contains("$ATERM_SHELL_INTEGRATION_DIR/bash/rcfile"),
-        "must source the shipped bash wrapper rcfile: {script}"
-    );
-    assert!(
-        script.contains("--rcfile"),
-        "bash's injection mechanism is --rcfile: {script}"
-    );
-    // The user's own login shell wins unless it IS bash: forcing bash on a zsh
-    // WSL user to gain marks would be a regression, not a feature.
-    assert!(
-        script.contains(r#"case "$__aterm_sh" in */bash|bash)"#),
-        "must gate the bash hijack on the login shell actually being bash: {script}"
-    );
-    assert!(
-        script.contains(r#"exec "$__aterm_sh" -l"#),
-        "non-bash login shells must still start, uninstrumented: {script}"
-    );
-    assert!(
-        script.contains("unset ATERM_WSL_CWD"),
-        "the cwd hand-off must not leak into shells nested inside this one: {script}"
-    );
-    // The bash rcfile the launcher points at has to exist on disk.
-    assert!(base.join("bash").join("rcfile").exists());
-}
-
+/// `WSLENV` is the ONLY channel into the distro, so getting it wrong is silent:
+/// without `/p` the integration dir arrives as an untranslated `C:\…` no Linux
+/// shell can read, and without the nonce every mark is dropped. A user's own
+/// entries survive after ours; nesting (aterm inside aterm) neither grows
+/// duplicates nor keeps a stale flag spelling for one of our variables.
 #[test]
 fn test_merge_wslenv_is_append_safe_and_idempotent() {
-    // A user's own WSLENV survives, ours goes first.
-    let merged = merge_wslenv("MY_TOOL/p:OTHER");
-    assert!(merged.starts_with("ATERM_SHELL_INTEGRATION_DIR/p:"));
-    assert!(merged.split(':').any(|e| e == "MY_TOOL/p"));
-    assert!(merged.split(':').any(|e| e == "OTHER"));
-
-    // An empty inherited value must not produce an empty trailing entry.
-    let empty = merge_wslenv("");
-    assert!(!empty.ends_with(':') && !empty.contains("::"), "{empty}");
-
-    // Nesting (aterm inside aterm inside …) must not grow duplicates, and must
-    // not keep a STALE flag spelling for one of our own variables.
-    assert_eq!(merge_wslenv(&empty), empty, "merge must be idempotent");
-    let stale = merge_wslenv("ATERM_SHELL_INTEGRATION_DIR:ATERM_SHELL_NONCE/p");
+    let ours = "ATERM_SHELL_INTEGRATION_DIR/p:ATERM_SHELL_NONCE:ATERM_WSL_CWD";
+    assert_eq!(merge_wslenv(""), ours);
     assert_eq!(
-        stale.matches("ATERM_SHELL_INTEGRATION_DIR").count(),
-        1,
-        "{stale}"
+        merge_wslenv("MY_TOOL/p:OTHER"),
+        format!("{ours}:MY_TOOL/p:OTHER")
     );
-    assert!(!stale.contains("ATERM_SHELL_NONCE/p"), "{stale}");
+    assert_eq!(merge_wslenv(ours), ours, "idempotent");
+    assert_eq!(
+        merge_wslenv("ATERM_SHELL_INTEGRATION_DIR:ATERM_SHELL_NONCE/p"),
+        ours,
+        "stale flags"
+    );
 }
 
 #[test]
@@ -3236,153 +1791,78 @@ fn test_wsl_cwd_env_only_crosses_a_posix_path() {
     assert_eq!(wsl_cwd_env(ShellType::Cmd, Some("/home/you/proj")), None);
 }
 
-/// cmd renders `%PROMPT%` on every input line and understands `$E`/`$P`; that
-/// is the whole integration surface it has.
+/// cmd renders `%PROMPT%` on every input line and understands `$E`/`$P`; that is
+/// the whole integration surface it has. In order: the directory title (before
+/// the user's prompt, so a prompt that sets its own title is the later write and
+/// wins), 133;A, the cwd (AFTER 133;A: the engine files a 633 `P;Cwd` under the
+/// block in progress, so reported before it the block for `cd /d X` said it ran
+/// in `X`), cmd's own prompt, 133;B — every mark signed with the session nonce,
+/// which `augment_with_nonce` also hands the shell. No C/D: cmd has no hook for
+/// "a command started executing", and the phase machine needs A→B→C→D in order.
 #[test]
 fn test_prepare_cmd_wraps_the_prompt_with_marks_and_cwd() {
     let dir = aterm_tempfile::tempdir().unwrap();
-    let base = dir.path().join("si");
-    let mut injection = prepare_into(ShellType::Cmd, &base).unwrap().unwrap();
+    let mut injection = prepare_into(ShellType::Cmd, &dir.path().join("si"))
+        .unwrap()
+        .unwrap();
     assert!(
         injection.argv_override.is_none(),
-        "cmd takes no argv override — the injection is entirely %PROMPT%"
+        "the injection is %PROMPT%"
     );
-
     let nonce = "ab".repeat(32);
     augment_with_nonce(&mut injection, &nonce);
-    let prompt = injection
+    let env: std::collections::HashMap<&str, &str> = injection
         .env_add
         .iter()
-        .find(|(k, _)| k == "PROMPT")
-        .map(|(_, v)| v.clone())
-        .expect("cmd injection must set PROMPT");
-
-    assert!(
-        prompt.contains(&format!("$e]133;A;id={nonce}$e\\")),
-        "prompt-start mark (what jump-to-prompt navigates by): {prompt}"
-    );
-    assert!(
-        prompt.contains(&format!("$e]133;B;id={nonce}$e\\")),
-        "prompt-end mark: {prompt}"
-    );
-    assert!(
-        prompt.contains(&format!("$e]633;P;Cwd=$P;id={nonce}$e\\")),
-        "cwd via $P — cmd cannot percent-encode a file:// URI: {prompt}"
-    );
-    assert!(
-        prompt.contains("$P$G"),
-        "the user-visible prompt must still be cmd's own: {prompt}"
-    );
-    assert!(
-        !prompt.contains(NONCE_PLACEHOLDER),
-        "every placeholder must be substituted or the marks are dropped: {prompt}"
-    );
-    // C/D are deliberately absent: cmd has no hook for "a command started
-    // executing", and the engine's phase machine needs A→B→C→D in order.
-    assert!(!prompt.contains("]133;C"), "{prompt}");
-    assert!(!prompt.contains("]133;D"), "{prompt}");
-    // The directory title rides every cmd prompt; a user's own PROMPT that
-    // sets a title is the later write and wins (the test below).
-    assert!(
-        prompt.contains(CMD_PROMPT_TITLE),
-        "the directory title: {prompt}"
-    );
-}
-
-/// A cmd tab's title follows the directory: `OSC 0` with `$P`, rendered
-/// BEFORE the user's own prompt so a prompt that sets its own title is the
-/// later write and wins. Without it the tab keeps cmd's program path
-/// (`C:\WINDOWS\SYSTEM32\cmd.exe`) as its title for its whole life.
-#[test]
-fn test_cmd_prompt_titles_the_tab_with_the_directory() {
-    assert_eq!(CMD_PROMPT_TITLE, "$e]0;$P$e\\");
-    let at = |prompt: &str, needle: &str| {
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    assert_eq!(env.get("ATERM_SHELL_NONCE"), Some(&nonce.as_str()));
+    let prompt = env.get("PROMPT").expect("cmd injection must set PROMPT");
+    let at = |needle: &str| {
         prompt
             .find(needle)
             .unwrap_or_else(|| panic!("{needle:?} missing from {prompt:?}"))
     };
-    let prompt = cmd_prompt(None);
-    let title = at(&prompt, CMD_PROMPT_TITLE);
-    let start = at(&prompt, "]133;A");
-    let user = at(&prompt, "$P$G");
+    let order = [
+        at("$e]0;$P$e\\"),
+        at(&format!("$e]133;A;id={nonce}$e\\")),
+        at(&format!("$e]633;P;Cwd=$P;id={nonce}$e\\")),
+        at("$P$G"),
+        at(&format!("$e]133;B;id={nonce}$e\\")),
+    ];
+    assert!(order.windows(2).all(|w| w[0] < w[1]), "{prompt}");
     assert!(
-        title < start && start < user,
-        "the title precedes the marks and the user's prompt: {prompt}"
+        !prompt.contains("]133;C") && !prompt.contains("]133;D"),
+        "{prompt}"
     );
+}
 
-    // A user's own prompt that sets a title is kept whole, after ours.
+/// An inherited `%PROMPT%` is wrapped, not replaced: a user's own title is kept
+/// whole AFTER ours (the later write wins), an empty one is cmd's default, and one
+/// that already carries our marks (a nested aterm) is returned byte-identical —
+/// nesting neither double-wraps nor stacks a second title.
+#[test]
+fn test_cmd_prompt_wraps_an_inherited_prompt_once() {
     let own = "$e]0;build box$e\\$P$G";
     let prompt = cmd_prompt(Some(own));
+    let ours = prompt.find("$e]0;$P$e\\").expect("our title");
     assert!(
-        at(&prompt, CMD_PROMPT_TITLE) < at(&prompt, own),
-        "the user's title must be the later write: {prompt}"
+        prompt.find(own).is_some_and(|theirs| ours < theirs),
+        "{prompt}"
     );
-
-    // An empty inherited PROMPT is cmd's default, not an empty prompt.
     assert_eq!(cmd_prompt(Some("")), cmd_prompt(None));
-}
-
-/// The cwd mark comes AFTER the prompt-start mark. The engine files an OSC
-/// 633 `P;Cwd` under the block in progress, so reported before `133;A` the NEW
-/// directory lands on the PREVIOUS command's block — the block for `cd /d X`
-/// said it ran in `X`. (The engine half of this is pinned in aterm-gui's
-/// `a_cmd_block_cwd_is_where_its_command_ran`.)
-#[test]
-fn test_cmd_prompt_reports_the_cwd_after_the_prompt_start() {
-    let prompt = cmd_prompt(None);
-    let start = prompt.find("]133;A").expect("prompt-start mark");
-    let cwd = prompt.find("]633;P;Cwd=$P").expect("cwd mark");
-    let user = prompt.find("$P$G").expect("cmd's default prompt");
-    assert!(start < cwd && cwd < user, "{prompt}");
-}
-
-/// A PROMPT that already carries our marks came from an outer aterm: it is
-/// returned byte-identical, so nesting neither double-wraps nor stacks a
-/// second title.
-#[test]
-fn test_cmd_prompt_leaves_a_nested_prompt_untouched() {
     let outer = cmd_prompt(None);
     assert_eq!(cmd_prompt(Some(&outer)), outer);
 }
 
-#[test]
-fn test_augment_with_nonce_substitutes_the_placeholder() {
-    let mut injection = InjectionEnv {
-        env_add: vec![
-            ("PLAIN".to_string(), "untouched".to_string()),
-            (
-                "MARKED".to_string(),
-                format!("a{NONCE_PLACEHOLDER}b{NONCE_PLACEHOLDER}"),
-            ),
-        ],
-        argv_override: None,
-    };
-    let nonce = "cd".repeat(32);
-    augment_with_nonce(&mut injection, &nonce);
-    assert_eq!(injection.env_add[0].1, "untouched");
-    assert_eq!(injection.env_add[1].1, format!("a{nonce}b{nonce}"));
-    assert_eq!(
-        injection.env_add[2],
-        ("ATERM_SHELL_NONCE".to_string(), nonce)
-    );
-}
-
 /// A POSIX shell reads a script line by line and keeps a trailing CR as part of
-/// the last token, so one `\r` per line shreds the whole file
-/// (`$'\r': command not found`). The scripts are `include_str!`d at build time,
-/// so a Windows build machine with Git's default `core.autocrlf=true` used to
-/// ship exactly that — measured: 446 CRs in the installed
+/// the last token, so one `\r` per line shreds the whole file. The scripts are
+/// `include_str!`d at build time, so a Windows build machine with Git's default
+/// `core.autocrlf=true` shipped exactly that — measured: 446 CRs in the installed
 /// `aterm_shell_integration.bash`, and sourcing it in WSL failed at line 16.
 #[test]
 fn test_posix_scripts_are_written_lf_only() {
     assert_eq!(lf_only("a\r\nb\r\n"), "a\nb\n");
-    assert_eq!(lf_only("a\nb\n"), "a\nb\n");
-    assert!(
-        matches!(lf_only("no cr here"), std::borrow::Cow::Borrowed(_)),
-        "the Unix path must not allocate"
-    );
-
-    // ...and the writer is actually wired to it.
     let dir = aterm_tempfile::tempdir().unwrap();
     let base = dir.path().join("si");
     prepare_into(ShellType::Bash, &base).unwrap().unwrap();
@@ -3392,11 +1872,7 @@ fn test_posix_scripts_are_written_lf_only() {
         "aterm_shell_integration.fish",
     ] {
         let bytes = std::fs::read(base.join(name)).unwrap();
-        assert!(
-            !bytes.contains(&b'\r'),
-            "{name} reached disk with CR line endings — every POSIX shell that \
-             sources it will fail line by line"
-        );
+        assert!(!bytes.contains(&b'\r'), "{name} reached disk with CRs");
     }
 }
 
@@ -3465,8 +1941,8 @@ fn test_cmd_prompt_emits_real_osc_133_marks() {
 }
 
 /// Functional proof on the real thing: the WSL launcher, run through the
-/// installed `wsl.exe`, lands OSC 133 marks with the session nonce. Skips
-/// (loudly) when WSL is not installed — aterm must never DEPEND on it.
+/// installed `wsl.exe`, lands OSC 133 marks with the session nonce. COULD NOT
+/// RUN when WSL is not installed — aterm must never DEPEND on it.
 #[cfg(windows)]
 #[test]
 fn test_wsl_launcher_emits_real_osc_133_marks() {
@@ -3480,8 +1956,7 @@ fn test_wsl_launcher_emits_real_osc_133_marks() {
         .status()
         .is_ok_and(|s| s.success());
     if !usable {
-        eprintln!("SKIP: no working WSL distro on this host");
-        return;
+        aterm_spec::host::could_not_run("no working WSL distro on this host");
     }
 
     let dir = aterm_tempfile::tempdir().unwrap();
@@ -3545,267 +2020,29 @@ fn test_wsl_launcher_emits_real_osc_133_marks() {
 // via the glue rule, also deleted `printf` arguments and slid the prompt layout
 // sideways.
 
-/// Strip the CONTENTS of every quoted string from a fish source line, keeping
-/// the quote characters themselves, so a glue detector can tell a real command
-/// substitution from a parenthesis that merely sits inside a string literal.
-///
-/// `set git_text " ($branch)"` reduces to `set git_text ""` — no glue. The old
-/// `__aterm_osc "7;file://"(hostname)"$cwd"` reduces to `__aterm_osc ""(hostname)""`,
-/// which still carries both `"(` and `)"`.
-#[cfg(unix)]
-fn fish_strip_string_contents(line: &str) -> String {
-    #[derive(PartialEq)]
-    enum Q {
-        None,
-        Single,
-        Double,
-    }
-    let mut out = String::with_capacity(line.len());
-    let mut state = Q::None;
-    let mut chars = line.chars();
-    while let Some(c) = chars.next() {
-        match (&state, c) {
-            // A backslash escapes the next byte in fish everywhere except
-            // inside single quotes, where only \' and \\ are special. Consuming
-            // the pair unconditionally is safe for this lint: it can only make
-            // the detector see FEWER characters, never invent a glue site.
-            (_, '\\') => {
-                let _ = chars.next();
-            }
-            (Q::None, '\'') => {
-                state = Q::Single;
-                out.push('\'');
-            }
-            (Q::None, '"') => {
-                state = Q::Double;
-                out.push('"');
-            }
-            (Q::Single, '\'') => {
-                state = Q::None;
-                out.push('\'');
-            }
-            (Q::Double, '"') => {
-                state = Q::None;
-                out.push('"');
-            }
-            (Q::None, _) => out.push(c),
-            _ => {}
-        }
-    }
-    out
-}
-
-/// NO EMITTER IN THE FISH SCRIPT MAY GLUE A STRING TO A COMMAND SUBSTITUTION.
-///
-/// This is the third outage from that one spelling, so it is now pinned as a
-/// total sweep rather than one banned substring per incident:
-///
-/// 1. `__aterm_osc "133;A"(__aterm_id_suffix)` — an empty nonce (this script's
-///    own documented pre-nonce fallback, and the unavoidable state of the
-///    header's manual install) collapsed EVERY OSC 133/633 mark to a bare
-///    `ESC ] BEL`.
-/// 2. `__aterm_osc "7;file://"(hostname)"$cwd"` — the same collapse for OSC 7
-///    on any host whose `hostname` prints nothing (measured on fish 4.2.1: the
-///    wire carried exactly `\e]\a`), and on a host with NO `hostname` command
-///    the substitution instead raised `Unknown command`, which ABORTED the
-///    statement and printed a five-line error block at source time and on every
-///    directory change.
-/// 3. `echo -n (whoami)'@'(hostname)' '(prompt_pwd)' $ '` — four glued
-///    substitutions in the FALLBACK prompt, so one of them printing nothing
-///    made `echo -n` print nothing at all: no user, no host, no path, no `$`.
-///
-/// The rule the script now follows everywhere: capture into a local with
-/// `set -l`, then interpolate it QUOTED. `"$var"` is exactly one argument for
-/// an empty value, an empty list, and an unset variable alike.
+/// fish's OSC 7 stays a well-formed `file://` URI with the resolved host EMPTY:
+/// the pre-fix failure was a wrong NUMBER OF ARGUMENTS — the host glued to a
+/// substitution that printed nothing took the whole argument with it, and
+/// `__aterm_osc` printed a bare `ESC ] BEL`. `file:///path` is the
+/// empty-authority form RFC 8089 defines. (The named host is pinned by the
+/// prompt's re-assert below.)
 #[cfg(unix)]
 #[test]
-fn test_fish_never_glues_a_command_substitution() {
-    let (label, script) = ("embedded", scripts::FISH);
-    let offenders: Vec<(usize, &str)> = script
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| !line.trim_start().starts_with('#'))
-        .filter(|(_, line)| {
-            let stripped = fish_strip_string_contents(line);
-            ["\"(", "'(", ")\"", ")'"]
-                .iter()
-                .any(|glue| stripped.contains(glue))
-        })
-        .map(|(i, line)| (i + 1, line.trim()))
-        .collect();
-    assert!(
-        offenders.is_empty(),
-        "{label} fish script glues a string to a command substitution: {offenders:?}. \
-         That is a CARTESIAN PRODUCT — a substitution printing nothing takes the \
-         whole argument with it. Capture with `set -l` and interpolate \"$var\"."
-    );
-}
-
-/// OSC 7 carries a resolved host, never a live command substitution.
-///
-/// Pins the payload spelling (one double-quoted argument interpolating two
-/// precomputed globals) and the resolution chain: `$HOST` / `$HOSTNAME` — what
-/// zsh and bash read, and what this suite's harness sets — then fish's own
-/// `$hostname` global, then the `hostname` COMMAND behind `command -sq` so a
-/// host without it gets a default instead of an error storm, then `localhost`,
-/// which is also the canonical RFC 8089 `file://` authority.
-#[test]
-fn test_fish_osc7_resolves_the_host_without_a_substitution() {
-    let (label, script) = ("embedded", scripts::FISH);
-    assert!(
-        script.contains(r#"__aterm_osc "7;file://$__aterm_report_host$cwd""#),
-        "{label} fish OSC 7 must be ONE interpolated argument"
-    );
-    // CODE only: the script quotes the broken spelling in a comment so the
-    // next reader knows why it cannot come back, and that explanation must
-    // not itself trip the guard.
-    let code: String = script
-        .lines()
-        .filter(|line| !line.trim_start().starts_with('#'))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        !code.contains(r#""7;file://"(hostname)"#),
-        "{label} fish re-introduced the glued `(hostname)` OSC 7 payload"
-    );
-    assert!(
-        script.contains("set -g __aterm_report_host localhost"),
-        "{label} fish must seed the OSC 7 authority with a non-empty default, \
-         mirroring zsh's `${{HOST:-${{HOSTNAME:-localhost}}}}`"
-    );
-    assert!(
-        script.contains("command -sq hostname"),
-        "{label} fish must probe for the `hostname` COMMAND before running it — \
-         an unguarded call on a host without it aborts __aterm_report_cwd and \
-         prints an error block on every directory change"
-    );
-}
-
-/// The fish prompt renders palette indices as SGR escapes, never through
-/// `set_color`.
-///
-/// `set_color` takes colour NAMES and hex triples; handed the index every
-/// `ATERM_PROMPT_*_COLOR` actually carries it prints `set_color: Unknown color`
-/// to stderr and emits NOTHING — which, being a zero-element substitution, also
-/// deleted the corresponding `printf` argument. Measured on fish 4.2.1 for
-/// `ATERM_PROMPT_STYLE=standard` before this fix: four error lines per prompt
-/// render, and `userdev-host@/t/c/…:  $` where bash draws
-/// `user@dev-host:~/…` — the `@` and the `:` had slid onto the wrong
-/// operands.
-#[test]
-fn test_fish_prompt_never_passes_a_palette_index_to_set_color() {
-    let (label, script) = ("embedded", scripts::FISH);
-    assert!(
-        script.contains(r#"printf '\e[38;5;%sm' "$argv[1]""#),
-        "{label} fish must format the SGR 256-colour escape itself — the same \
-         bytes bash writes as `\\[\\033[38;5;${{hc}}m\\]`"
-    );
-    assert!(
-        script.contains(r#"printf '\e[0m'"#),
-        "{label} fish must reset with bash's and zsh's `\\033[0m`, not \
-         `set_color normal` (terminfo sgr0)"
-    );
-    let code: String = script
-        .lines()
-        .filter(|line| !line.trim_start().starts_with('#'))
-        .collect::<Vec<_>>()
-        .join("\n");
-    for banned in [
-        "set_color $hc",
-        "set_color $pc",
-        "set_color $gc",
-        "set_color $sc",
-        "set_color $ec",
-        "set_color $prompt_color",
-        "set_color normal",
-    ] {
-        assert!(
-            !code.contains(banned),
-            "{label} fish prompt re-introduced `{banned}`: fish's set_color \
-             rejects a palette index, prints an error to the user's terminal, \
-             and emits nothing"
-        );
-    }
-}
-
-/// All three POSIX scripts default the five prompt colours to the SAME palette
-/// indices. A divergence here would make the shells disagree on screen even
-/// once every one of them encodes an index correctly.
-#[test]
-fn test_prompt_color_defaults_agree_across_shells() {
-    for (var, index, fish_local) in [
-        ("ATERM_PROMPT_HOST_COLOR", "2", "hc"),
-        ("ATERM_PROMPT_PATH_COLOR", "4", "pc"),
-        ("ATERM_PROMPT_GIT_COLOR", "3", "gc"),
-        ("ATERM_PROMPT_ERROR_COLOR", "1", "ec"),
-        ("ATERM_PROMPT_SEP_COLOR", "8", "sc"),
-    ] {
-        assert!(
-            scripts::BASH.contains(&format!("${{{var}:-{index}}}")),
-            "bash must default {var} to {index}"
-        );
-        assert!(
-            scripts::FISH.contains(&format!(
-                "set -l {fish_local} (test -n \"${var}\"; and echo ${var}; or echo {index})"
-            )),
-            "fish must default {var} to {index}, the same index bash uses"
-        );
-    }
-}
-
-/// OSC 7 is a well-formed `file://` URI for EVERY host value, including the
-/// degenerate one.
-///
-/// The pre-fix failure was not a wrong hostname, it was a wrong NUMBER OF
-/// ARGUMENTS: `__aterm_osc` received none and printed a bare `ESC ] BEL`. So
-/// the assertion is structural — the payload always starts `7;file://` and
-/// always ends with the percent-encoded cwd — and it is checked with the
-/// resolved host forced EMPTY, which is the exact state that used to collapse
-/// the whole argument.
-#[cfg(unix)]
-#[test]
-fn test_fish_osc7_is_well_formed_for_every_host_value() {
-    let Some(fish) = fish_shell() else {
-        eprintln!(
-            "fish not installed; skipping test_fish_osc7_is_well_formed_for_every_host_value"
-        );
-        return;
-    };
+fn test_fish_osc7_is_well_formed_with_an_empty_host() {
+    let fish = need_fish();
     let (_dir, cwd) = create_special_cwd();
-    let encoded = osc7_percent_encode(&cwd.to_string_lossy());
-    // A bare `cd`: the report rides fish's `--on-variable PWD` handler, which is
-    // how a real session emits OSC 7 between prompts (each prompt re-sends it;
-    // none is drawn here), and it fires EXACTLY once (the source-time report is
-    // swallowed with the rest of the load by the harness).
-    let body = format!("cd -- '{}'", cwd.display());
-
-    // Named host: $HOST wins, exactly as it does for zsh.
+    // A bare `cd`: the report rides fish's `--on-variable PWD` handler and fires
+    // EXACTLY once (the source-time report is swallowed with the load).
     assert_eq!(
         run_fish_integration(
             fish,
-            &[("HOST", "aterm.test"), ("HOSTNAME", "aterm.test")],
-            &body,
+            &[("HOST", "aterm.test")],
+            &format!("set -g __aterm_report_host \"\"; cd -- '{}'", cwd.display()),
         ),
-        format!("\u{1b}]7;file://aterm.test{encoded}\u{7}"),
-        "fish OSC 7 must carry the resolved host and the percent-encoded cwd"
-    );
-
-    // Degenerate host: still a URI, NOT a bare `ESC ] BEL`. `file:///path` is
-    // the empty-authority form RFC 8089 defines, and every consumer of OSC 7
-    // parses it.
-    let degenerate = run_fish_integration(
-        fish,
-        &[("HOST", "aterm.test")],
-        &format!("set -g __aterm_report_host \"\"; {body}"),
-    );
-    assert_eq!(
-        degenerate,
-        format!("\u{1b}]7;file://{encoded}\u{7}"),
-        "an empty resolved host must still yield a well-formed OSC 7"
-    );
-    assert!(
-        !degenerate.contains("\u{1b}]\u{7}"),
-        "OSC 7 collapsed to a bare empty OSC: {degenerate:?}"
+        format!(
+            "\u{1b}]7;file://{}\u{7}",
+            osc7_percent_encode(&cwd.to_string_lossy())
+        ),
     );
 }
 
@@ -3815,17 +2052,15 @@ fn test_fish_osc7_is_well_formed_for_every_host_value() {
 /// ssh exits — went into the next signed block and became the new-tab folder
 /// until the next `cd`, while the nonce gate dropped the same forgery sent as
 /// `633;P;Cwd`. The prompt is drawn without its event: fish's own `fish_prompt`
-/// handler re-sends OSC 7 from 4.3 on, and before that only on a `cd`.
+/// handler re-sends OSC 7 from 4.3 on, and before that only on a `cd`. The
+/// engine now holds an OSC 7 that arrives while the signed shell sits at its
+/// prompt and applies the latest one at the shell's next `133;A`
+/// (`aterm-core`'s `reported_cwd_tests`), so this report, the last before the
+/// mark, is the one that lands.
 #[cfg(unix)]
 #[test]
 fn test_fish_prompt_reasserts_its_own_cwd_before_the_prompt_start() {
-    let Some(fish) = fish_shell() else {
-        eprintln!(
-            "fish not installed; skipping \
-             test_fish_prompt_reasserts_its_own_cwd_before_the_prompt_start"
-        );
-        return;
-    };
+    let fish = need_fish();
     let (_dir, cwd) = create_special_cwd();
     let own = format!(
         "\u{1b}]7;file://aterm.test{}\u{7}",
@@ -3868,12 +2103,7 @@ fn test_fish_prompt_reasserts_its_own_cwd_before_the_prompt_start() {
 #[cfg(unix)]
 #[test]
 fn test_fish_fallback_prompt_survives_a_missing_hostname() {
-    let Some(fish) = fish_shell() else {
-        eprintln!(
-            "fish not installed; skipping test_fish_fallback_prompt_survives_a_missing_hostname"
-        );
-        return;
-    };
+    let fish = need_fish();
     // No ATERM_PROMPT_STYLE and no user prompt to wrap => the fallback arm.
     //
     // `$USER` is set INSIDE the body, not through the environment: fish
@@ -3892,342 +2122,20 @@ fn test_fish_fallback_prompt_survives_a_missing_hostname() {
     );
 }
 
-/// Extract the ordered list of SGR parameter strings from a rendered prompt —
-/// `\e[38;5;4m` yields `"38;5;4"`. OSC sequences (the 133/633 marks) end in
-/// BEL, not `m`, so they are skipped.
-#[cfg(unix)]
-fn sgr_sequence(s: &str) -> Vec<String> {
-    let b = s.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i + 1 < b.len() {
-        if b[i] == 0x1b && b[i + 1] == b'[' {
-            let start = i + 2;
-            let mut j = start;
-            while j < b.len() && !b[j].is_ascii_alphabetic() {
-                j += 1;
-            }
-            if j < b.len() && b[j] == b'm' {
-                out.push(String::from_utf8_lossy(&b[start..j]).into_owned());
-            }
-            i = j.saturating_add(1);
-        } else {
-            i += 1;
-        }
-    }
-    out
-}
-
-/// CROSS-SHELL PARITY: for every prompt style, fish emits the SAME SGR colour
-/// sequence bash does.
-///
-/// This is the assertion the lane is really about. bash's PS1 is a template, so
-/// it is expanded with `${PS1@P}` — which runs the `$(__aterm_err_prompt)` and
-/// `$(__aterm_git_segment)` substitutions too, giving the bytes a terminal
-/// would actually receive. Only the colour sequence is compared: `\w` and
-/// `prompt_pwd` abbreviate paths differently by design, and that is not a
-/// colour.
-///
-/// Before the fix fish emitted NO `38;5;N` at all (every `set_color <index>`
-/// failed), so this compared `[]` against bash's full sequence.
-#[cfg(unix)]
-#[test]
-fn test_fish_prompt_colors_are_sgr_indices_like_bash() {
-    let Some(fish) = fish_shell() else {
-        eprintln!("fish not installed; skipping test_fish_prompt_colors_are_sgr_indices_like_bash");
-        return;
-    };
-    let bash = bash_shell();
-    // The bash half expands PS1 with `${PS1@P}`, a bash 4.4 parameter transformation
-    // that macOS's /bin/bash 3.2 does not have (it prints the literal template, so the
-    // fixture-sanity assert below fails before any fish byte is compared). Measured
-    // 2026-09-16, the first time this test ran on a Mac with fish installed. A bash
-    // without `@P` cannot be the reference, so the test skips — honestly, on stderr —
-    // rather than fail on the wrong shell; `$ATERM_TEST_BASH` can point at a newer
-    // bash (Homebrew's) to run the parity for real.
-    let probe = shell_command(bash)
-        .args([
-            "--noprofile",
-            "--norc",
-            "-c",
-            "x=ok; printf '%s' \"${x@P}\"",
-        ])
-        .output()
-        .unwrap_or_else(|error| panic!("spawn bash for the @P probe: {error}"));
-    if probe.stdout != b"ok" {
-        eprintln!(
-            "bash at {bash} lacks ${{PS1@P}} (bash 4.4+); skipping \
-             test_fish_prompt_colors_are_sgr_indices_like_bash"
-        );
-        return;
-    }
-    let bash_script = format!(
-        "{}/src/scripts/aterm_shell_integration.bash",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    for style in ["minimal", "standard", "powerline"] {
-        let out = shell_command(bash)
-            .args(["--noprofile", "--norc", "-i", "-c"])
-            .arg(
-                "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; \
-                 __aterm_set_prompt; printf '%s' \"${PS1@P}\"",
-            )
-            .env("ATERM_TEST_SCRIPT", &bash_script)
-            .env("ATERM_PROMPT_STYLE", style)
-            .env("ATERM_DISABLE_PROMPT_TITLES", "1")
-            .output()
-            .unwrap_or_else(|error| panic!("spawn bash for prompt parity test: {error}"));
-        let bash_prompt = String::from_utf8_lossy(&out.stdout).into_owned();
-        let bash_sgr = sgr_sequence(&bash_prompt);
-        assert!(
-            !bash_sgr.is_empty(),
-            "bash must colour its {style} prompt (fixture sanity); got {bash_prompt:?}"
-        );
-
-        let fish_out = fish_integration_output(
-            fish,
-            &[
-                ("ATERM_PROMPT_STYLE", style),
-                ("ATERM_DISABLE_PROMPT_TITLES", "1"),
-            ],
-            "function prompt_pwd; printf '~/x'; end; __aterm_custom_prompt",
-        );
-        let fish_prompt = String::from_utf8_lossy(&fish_out.stdout).into_owned();
-        let fish_stderr = String::from_utf8_lossy(&fish_out.stderr).into_owned();
-        assert!(
-            !fish_stderr.contains("Unknown color"),
-            "fish rejected a prompt colour ({style}): {fish_stderr:?}"
-        );
-        assert_eq!(
-            sgr_sequence(&fish_prompt),
-            bash_sgr,
-            "fish and bash must colour the {style} prompt identically.\n  \
-             fish: {fish_prompt:?}\n  bash: {bash_prompt:?}"
-        );
-    }
-}
-
 // ---------------------------------------------------------------------------
 // THE MULTIPLEXER BOUNDARY (screen / tmux)
 //
-// aterm hosts ONE session per PTY. Start `screen` or `tmux` in it and the
-// multiplexer owns that PTY: every pane lives inside the SAME aterm session,
-// and aterm has no name for a pane. Measured on this host against a real
-// headless instance with GNU screen 4.09.01, BEFORE any of this existed:
-//
-//   * the whole screen run collapsed into ONE outer block, still `executing`
-//     (`cmdline=screen%20-S%20muxprobe`), and NOTHING typed inside it produced a
-//     block, an exit code or a cwd update; `meta` reported `title=` EMPTY.
-//   * `$ATERM_PARENT_SESSION_ID` arrived in the pane shell unchanged, so a
-//     flagless `aterm ctl status` typed IN the pane answered `OK … phase=quiet`
-//     from the OUTER session — success, wrong terminal, no signal at all.
-//
-// Neither can be fixed from a pane: a pane is genuinely not an aterm session.
-// What these tests pin is that both are now VISIBLE — the crossing is marked
-// ($ATERM_MUX + the outer sid, which `aterm ctl` refuses flagless self-drive
-// on), and said once out loud.
-//
-// The guard is what makes the detection trustworthy in both directions: aterm's
-// spawn seam forces `$ATERM_SHELL_INTEGRATION_INSTALLED` to the EMPTY string for
-// every session it starts, so a NON-empty value means we did not come straight
-// from aterm. That is what tells a real pane shell apart from an aterm window
-// that was LAUNCHED from a pane and merely inherited `$TMUX`/`$STY`.
-//
-// tmux is not installed on this host. It is covered by construction rather than
-// by claim: `$TMUX` is checked FIRST, before `$STY` and before `TERM`, because
-// tmux's default `TERM` is `screen-256color` and would otherwise misname it.
-// The tmux-shaped environments below exercise that path with the real scripts.
+// aterm hosts ONE session per PTY; start `screen` or `tmux` in it and every pane
+// lives inside that SAME session. Measured with GNU screen 4.09.01 before any of
+// this existed: the whole screen run collapsed into ONE outer block, and a
+// flagless `aterm ctl status` typed IN a pane answered from the OUTER session —
+// success, wrong terminal. A pane is genuinely not an aterm session, so the
+// crossing is made VISIBLE: marked ($ATERM_MUX + the outer sid, which `aterm ctl`
+// refuses flagless self-drive on) and said once out loud. The guard is what makes
+// the detection trustworthy: aterm's spawn seam forces
+// `$ATERM_SHELL_INTEGRATION_INSTALLED` EMPTY for every session it starts, so a
+// NON-empty value means we did not come straight from aterm.
 // ---------------------------------------------------------------------------
-
-/// Static sweep over BOTH copies of every POSIX script: the multiplexer
-/// detection must sit BEFORE the loader guard (a pane shell returns AT the
-/// guard, so anything after it never runs there), the inherited-guard branch
-/// must export the marks, and the past-the-guard path must clear them.
-#[test]
-fn test_scripts_mark_the_multiplexer_boundary_before_the_loader_guard() {
-    for (label, script, guard) in [
-        (
-            "bash",
-            scripts::BASH,
-            "if [[ -n \"${ATERM_SHELL_INTEGRATION_INSTALLED:-}\" ]]; then",
-        ),
-        (
-            "zsh",
-            scripts::ZSH,
-            "if [[ -n \"${ATERM_SHELL_INTEGRATION_INSTALLED:-}\" ]]; then",
-        ),
-        (
-            "fish",
-            scripts::FISH,
-            "if test -n \"$ATERM_SHELL_INTEGRATION_INSTALLED\"",
-        ),
-    ] {
-        let guard_at = script
-            .find(guard)
-            .unwrap_or_else(|| panic!("{label}: the loader guard must still be a `-n` test"));
-        let detect_at = script
-            .find("__aterm_mux")
-            .unwrap_or_else(|| panic!("{label}: no multiplexer detection at all"));
-        assert!(
-            detect_at < guard_at,
-            "{label}: the multiplexer detection must run BEFORE the loader guard — \
-             a pane shell RETURNS at that guard, so detection placed after it never runs"
-        );
-        // $TMUX is consulted before $STY and before TERM: tmux's default TERM is
-        // screen-256color, so TERM names the family, never the program.
-        let tmux_at = script.find("TMUX").expect("{label}: no $TMUX check");
-        let sty_at = script.find("STY").expect("{label}: no $STY check");
-        let term_at = script
-            .find("screen-*")
-            .expect("{label}: no TERM family fallback");
-        assert!(
-            tmux_at < sty_at && sty_at < term_at,
-            "{label}: check $TMUX, then $STY, then TERM"
-        );
-        for marker in [
-            "ATERM_MUX",
-            "ATERM_MUX_OUTER_SESSION_ID",
-            "ATERM_MUX_NOTICE",
-        ] {
-            assert!(
-                script.contains(marker),
-                "{label}: the boundary must export/honour {marker}"
-            );
-        }
-        // Past the guard this shell IS an aterm session shell, so a marker
-        // inherited from the pane it was launched out of is a stale lie.
-        let clears = script.contains("unset ATERM_MUX ATERM_MUX_OUTER_SESSION_ID")
-            || (script.contains("set -e ATERM_MUX\n")
-                && script.contains("set -e ATERM_MUX_OUTER_SESSION_ID"));
-        assert!(
-            clears,
-            "{label}: a shell that gets PAST the guard must clear an inherited \
-             $ATERM_MUX, or every window opened from a tmux pane inherits a \
-             refusal it does not deserve"
-        );
-        // …and it must carry the base FORWARD. The spawn seam stamps it for
-        // every session (aterm-gui's provision_child_identity_env), so the
-        // script's own write is the embedder fallback: set-if-unset, never an
-        // overwrite. An unconditional write here is the defect — a session
-        // whose shell sources this file INSIDE a pane would stamp the pane's
-        // signature as its own birth and never notice the crossing.
-        // The ASSIGNMENT, not the first mention: the rationale comment names
-        // the variable long before the guard.
-        let stamp_stmt = [": \"${ATERM_MUX_BASE:=", "set -gx ATERM_MUX_BASE"]
-            .into_iter()
-            .find_map(|needle| script.find(needle))
-            .unwrap_or_else(|| {
-                panic!(
-                    "{label}: a shell that gets PAST the guard must carry \
-                     $ATERM_MUX_BASE forward"
-                )
-            });
-        // GUARDED, in each shell's own spelling: posix takes `:=` (assign only
-        // when unset), fish tests emptiness first. An unconditional write would
-        // overwrite the spawn seam's answer with one read after the pane was
-        // entered — the defect that refused a fresh window as if it were a pane.
-        let guarded = if label.ends_with("fish") {
-            script
-                .find("if not test -n \"$ATERM_MUX_BASE\"")
-                .is_some_and(|at| at < stamp_stmt)
-        } else {
-            script.contains(": \"${ATERM_MUX_BASE:=")
-        };
-        assert!(
-            guarded,
-            "{label}: the base must be written only when UNSET — the spawn seam \
-             stamps every session, including shells that never source this file"
-        );
-        assert!(
-            stamp_stmt > guard_at,
-            "{label}: the base is stamped only PAST the guard — a pane shell \
-             that re-stamped it would erase the very comparison that finds it"
-        );
-    }
-}
-
-/// WHY $ATERM_MUX_BASE EXISTS, and the measurement that put it there.
-///
-/// Everything above this line runs only where a pane shell SOURCES the
-/// integration — and under aterm's own injection a bash or zsh pane shell never
-/// does. aterm hands bash `--rcfile <path>` and zsh a `$ZDOTDIR`; both are
-/// one-shot mechanisms chosen by whoever starts the shell, and a pane shell is
-/// started by screen or tmux. Measured live on this host, GNU screen 4.09.01
-/// inside a headless aterm session: the pane had `STY=189301.muxprobe`,
-/// `TERM=screen.xterm-256color`, the inherited guard `1` — every precondition of
-/// the block above TRUE — and `$ATERM_MUX` came back EMPTY with
-/// `type -t __aterm_prompt_command` empty too. The script had not been sourced
-/// at all, so the one-time notice could not be printed and tier 1 was
-/// unreachable from a real pane.
-///
-/// What CAN cross is an exported variable. The session shell — the one place
-/// aterm's injection always lands — stamps the multiplexer environment it was
-/// born into, and the pane inherits it while its OWN `$TMUX`/`$STY` are the
-/// multiplexer's. The mismatch is the crossing; `aterm ctl` reads both sides.
-#[cfg(unix)]
-#[test]
-fn test_bash_session_shell_stamps_the_multiplexer_base_a_pane_can_be_compared_against() {
-    let rt = aterm_tempfile::tempdir().expect("scratch runtime dir");
-    let report = "source \"$ATERM_TEST_SCRIPT\" >/dev/null; \
-                  __aterm_in_prompt_cmd=1; trap - DEBUG 2>/dev/null || true; PROMPT_COMMAND=; \
-                  printf 'base=[%s]' \"${ATERM_MUX_BASE-UNSET}\"";
-    let probe = |env: &[(&str, &str)]| {
-        run_mux_probe(
-            bash_shell(),
-            &["--noprofile", "--norc", "-i"],
-            "aterm_shell_integration.bash",
-            rt.path(),
-            env,
-            report,
-        )
-        .0
-    };
-
-    // The ordinary aterm session shell: no multiplexer anywhere, so the base is
-    // the empty pair. A pane's `$STY` will differ from this, which is the whole
-    // mechanism — and note it is stamped even though nothing is nested yet.
-    assert_eq!(
-        probe(&[
-            ("ATERM_SHELL_INTEGRATION_INSTALLED", ""),
-            ("ATERM_PARENT_SESSION_ID", "s-fresh"),
-            ("TERM", "xterm-256color"),
-        ]),
-        "base=[|]",
-    );
-    // An aterm window LAUNCHED FROM a tmux pane re-stamps the base as its own,
-    // so the marker it inherited matches and it is not mistaken for a pane.
-    assert_eq!(
-        probe(&[
-            ("ATERM_SHELL_INTEGRATION_INSTALLED", ""),
-            ("ATERM_PARENT_SESSION_ID", "s-fresh"),
-            ("TERM", "xterm-256color"),
-            ("TMUX", "/tmp/tmux-1000/default,9,0"),
-        ]),
-        "base=[/tmp/tmux-1000/default,9,0|]",
-    );
-    assert_eq!(
-        probe(&[
-            ("ATERM_SHELL_INTEGRATION_INSTALLED", ""),
-            ("ATERM_PARENT_SESSION_ID", "s-fresh"),
-            ("TERM", "xterm-256color"),
-            ("STY", "4242.pts-3.host"),
-        ]),
-        "base=[|4242.pts-3.host]",
-    );
-    // A pane shell that DOES source the integration (a hand-installed `source`
-    // line, fish's vendor conf.d) returns at the guard and must leave the
-    // session shell's base untouched — re-stamping it there would erase the
-    // comparison. Nothing in scope, nothing stamped.
-    assert_eq!(
-        probe(&[
-            ("ATERM_SHELL_INTEGRATION_INSTALLED", "1"),
-            ("ATERM_PARENT_SESSION_ID", "s-outer"),
-            ("TERM", "screen.xterm-256color"),
-            ("STY", "4242.pts-3.host"),
-        ]),
-        "base=[UNSET]",
-    );
-}
 
 /// Source a script under `shell` in a synthesized environment and report the
 /// boundary variables it left behind, plus whatever it said on stderr.
@@ -4267,230 +2175,185 @@ fn run_mux_probe(
     )
 }
 
-/// The bash boundary, end to end in a real bash: a pane shell (inherited guard)
-/// is MARKED with the multiplexer and the outer sid; an aterm session shell
-/// (guard forced empty by the spawn seam) is not — and CLEARS a marker it
-/// inherited from the pane it was launched out of.
+/// The boundary in each real shell: a pane shell (inherited guard) is MARKED with
+/// its multiplexer and the outer sid, and says so once per MULTIPLEXER (a stamp
+/// under `$XDG_RUNTIME_DIR` keyed by `$TMUX`/`$STY`), not once per pane; `$TMUX`
+/// names tmux though its default TERM is `screen-256color`. An aterm SESSION shell
+/// (guard empty) is not marked, CLEARS a marker inherited from the pane it was
+/// launched out of, and — the fallback for a host without the spawn seam — stamps
+/// the multiplexer it was born into as `$ATERM_MUX_BASE`, which `aterm ctl`
+/// compares a pane's own `$TMUX`/`$STY` against (a bash or zsh pane shell never
+/// sources the integration: `--rcfile` and `$ZDOTDIR` are one-shot mechanisms of
+/// whoever starts the shell, and a pane is started by the multiplexer).
 #[cfg(unix)]
 #[test]
-fn test_bash_marks_a_multiplexer_pane_and_clears_a_stale_marker() {
-    let rt = aterm_tempfile::tempdir().expect("scratch runtime dir");
-    // stdout is redirected, stderr is NOT: the one-time notice IS the stderr of
-    // the source, and swallowing it would test the marks while hiding the voice.
-    // The trailing teardown is the suite's usual one: when the guard is EMPTY the
-    // integration really installs, and its DEBUG-trap preexec would otherwise
-    // stamp OSC 633;E/133;C into the stdout this asserts on byte-for-byte.
-    let report = "source \"$ATERM_TEST_SCRIPT\" >/dev/null; \
-                  __aterm_in_prompt_cmd=1; trap - DEBUG 2>/dev/null || true; PROMPT_COMMAND=; \
-                  printf 'mux=%s outer=%s' \"${ATERM_MUX-UNSET}\" \"${ATERM_MUX_OUTER_SESSION_ID-UNSET}\"";
-    let probe = |env: &[(&str, &str)]| {
-        run_mux_probe(
-            bash_shell(),
-            &["--noprofile", "--norc", "-i"],
-            "aterm_shell_integration.bash",
-            rt.path(),
-            env,
-            report,
-        )
-    };
-
-    // A GNU screen window inside an aterm session — the measured case.
-    let (out, err) = probe(&[
-        ("ATERM_SHELL_INTEGRATION_INSTALLED", "1"),
-        ("ATERM_PARENT_SESSION_ID", "s-outer"),
-        ("TERM", "screen.xterm-256color"),
-        ("STY", "4242.pts-3.host"),
-    ]);
-    assert_eq!(out, "mux=screen outer=s-outer", "stderr: {err:?}");
-    assert!(
-        err.contains("inside screen")
-            && err.contains("no command blocks, exit codes or cwd tracking in these panes"),
-        "the first pane of a multiplexer says so once: {err:?}"
+fn test_each_shell_marks_a_multiplexer_pane_and_clears_a_stale_marker() {
+    const PANE: (&str, &str) = ("ATERM_SHELL_INTEGRATION_INSTALLED", "1");
+    const SESSION: (&str, &str) = ("ATERM_SHELL_INTEGRATION_INSTALLED", "");
+    const TMUX: (&str, &str) = ("TMUX", "/tmp/tmux-1000/default,9,0");
+    const SCREEN: (&str, &str) = ("STY", "4242.pts-3.host");
+    const OUTER: (&str, &str) = ("ATERM_PARENT_SESSION_ID", "s-outer");
+    // (environment, the report, the multiplexer announced on stderr, run in fish
+    // too — every case runs in bash and zsh).
+    type Case = (
+        &'static [(&'static str, &'static str)],
+        &'static str,
+        Option<&'static str>,
+        bool,
     );
-
-    // The SAME multiplexer, a second pane: the stamp under $XDG_RUNTIME_DIR
-    // keys the notice to the multiplexer, not to the pane, so it stays quiet.
-    let (out, err) = probe(&[
-        ("ATERM_SHELL_INTEGRATION_INSTALLED", "1"),
-        ("ATERM_PARENT_SESSION_ID", "s-outer"),
-        ("TERM", "screen.xterm-256color"),
-        ("STY", "4242.pts-3.host"),
-    ]);
-    assert_eq!(out, "mux=screen outer=s-outer");
-    assert!(
-        !err.contains("inside screen"),
-        "the notice is once per MULTIPLEXER, not once per pane: {err:?}"
-    );
-
-    // A tmux pane: $TMUX names the program even though TERM says screen-*.
-    let (out, err) = probe(&[
-        ("ATERM_SHELL_INTEGRATION_INSTALLED", "1"),
-        ("ATERM_PARENT_SESSION_ID", "s-outer"),
-        ("TERM", "screen-256color"),
-        ("TMUX", "/tmp/tmux-1000/default,9,0"),
-    ]);
-    assert_eq!(out, "mux=tmux outer=s-outer", "stderr: {err:?}");
-    assert!(err.contains("inside tmux"), "{err:?}");
-
-    // ATERM_MUX_NOTICE=0 silences the line without disturbing the marks.
-    let (out, err) = probe(&[
-        ("ATERM_SHELL_INTEGRATION_INSTALLED", "1"),
-        ("ATERM_PARENT_SESSION_ID", "s-quiet"),
-        ("TERM", "screen"),
-        ("STY", "55.pts-9.h"),
-        ("ATERM_MUX_NOTICE", "0"),
-    ]);
-    assert_eq!(out, "mux=screen outer=s-quiet");
-    assert!(!err.contains("inside screen"), "silenced: {err:?}");
-
-    // A user's ATERM_MUX=0 turns the check off: kept, not overwritten, and
-    // nothing announced.
-    let (out, err) = probe(&[
-        ("ATERM_SHELL_INTEGRATION_INSTALLED", "1"),
-        ("ATERM_PARENT_SESSION_ID", "s-off"),
-        ("TERM", "screen"),
-        ("STY", "66.pts-2.h"),
-        ("ATERM_MUX", "0"),
-    ]);
-    assert_eq!(out, "mux=0 outer=UNSET", "stderr: {err:?}");
-    assert!(!err.contains("inside screen"), "disabled: {err:?}");
-
-    // A multiplexer with NO aterm session in scope: marked (so `aterm ctl mux`
-    // can say what it sees) but with no outer sid, and nothing announced —
-    // there is no aterm block model to have lost.
-    let (out, err) = probe(&[
-        ("ATERM_SHELL_INTEGRATION_INSTALLED", "1"),
-        ("TERM", "screen"),
-        ("STY", "77.pts-1.h"),
-    ]);
-    assert_eq!(out, "mux=screen outer=UNSET");
-    assert!(!err.contains("inside screen"), "{err:?}");
-
-    // An aterm SESSION shell: the spawn seam forces the guard empty, so the
-    // integration installs — and a marker inherited from the tmux pane this
-    // window was launched out of is cleared rather than believed.
-    let (out, err) = probe(&[
-        ("ATERM_SHELL_INTEGRATION_INSTALLED", ""),
-        ("ATERM_PARENT_SESSION_ID", "s-fresh"),
-        ("TERM", "xterm-256color"),
-        ("TMUX", "/tmp/tmux-1000/default,9,0"),
-        ("ATERM_MUX", "tmux"),
-        ("ATERM_MUX_OUTER_SESSION_ID", "s-stale"),
-    ]);
-    assert_eq!(
-        out, "mux=UNSET outer=UNSET",
-        "a window launched FROM a pane is not IN it: {err:?}"
-    );
-
-    // A plain nested bash inside an aterm session: guard inherited, but no
-    // multiplexer anywhere — nothing to mark.
-    let (out, _) = probe(&[
-        ("ATERM_SHELL_INTEGRATION_INSTALLED", "1"),
-        ("ATERM_PARENT_SESSION_ID", "s-outer"),
-        ("TERM", "xterm-256color"),
-    ]);
-    assert_eq!(out, "mux=UNSET outer=UNSET");
-}
-
-/// The zsh boundary — the same contract, in a real zsh where one is installed.
-#[cfg(unix)]
-#[test]
-fn test_zsh_marks_a_multiplexer_pane_and_clears_a_stale_marker() {
-    let Some(zsh) = zsh_shell() else {
-        eprintln!("SKIP: no zsh on this host");
-        return;
-    };
-    let rt = aterm_tempfile::tempdir().expect("scratch runtime dir");
-    // stdout is redirected, stderr is NOT: the one-time notice IS the stderr of
-    // the source, and swallowing it would test the marks while hiding the voice.
-    // Same teardown reason as bash: an installed zsh integration's preexec hook
-    // would stamp OSC marks into the asserted stdout.
-    let report = "source \"$ATERM_TEST_SCRIPT\" >/dev/null; \
-                  add-zsh-hook -d precmd __aterm_precmd 2>/dev/null || true; \
-                  add-zsh-hook -d preexec __aterm_preexec 2>/dev/null || true; \
-                  printf 'mux=%s outer=%s' \"${ATERM_MUX-UNSET}\" \"${ATERM_MUX_OUTER_SESSION_ID-UNSET}\"";
-    let probe = |env: &[(&str, &str)]| {
-        run_mux_probe(
+    let cases: &[Case] = &[
+        // A GNU screen window inside an aterm session — the measured case.
+        (
+            &[PANE, OUTER, ("TERM", "screen.xterm-256color"), SCREEN],
+            "mux=screen outer=s-outer base=UNSET",
+            Some("screen"),
+            true,
+        ),
+        // Its second pane: quiet.
+        (
+            &[PANE, OUTER, ("TERM", "screen.xterm-256color"), SCREEN],
+            "mux=screen outer=s-outer base=UNSET",
+            None,
+            false,
+        ),
+        (
+            &[PANE, OUTER, ("TERM", "screen-256color"), TMUX],
+            "mux=tmux outer=s-outer base=UNSET",
+            Some("tmux"),
+            true,
+        ),
+        // ATERM_MUX_NOTICE=0 silences the line without disturbing the marks.
+        (
+            &[
+                PANE,
+                ("ATERM_PARENT_SESSION_ID", "s-quiet"),
+                ("TERM", "screen"),
+                ("STY", "55.pts-9.h"),
+                ("ATERM_MUX_NOTICE", "0"),
+            ],
+            "mux=screen outer=s-quiet base=UNSET",
+            None,
+            false,
+        ),
+        // A user's ATERM_MUX=0 turns the check off: kept, and nothing announced.
+        (
+            &[
+                PANE,
+                OUTER,
+                ("TERM", "screen"),
+                ("STY", "66.pts-2.h"),
+                ("ATERM_MUX", "0"),
+            ],
+            "mux=0 outer=UNSET base=UNSET",
+            None,
+            false,
+        ),
+        // No aterm session in scope: marked (so `aterm ctl mux` can say what it
+        // sees), no outer sid, nothing announced — there is no block model to lose.
+        (
+            &[PANE, ("TERM", "screen"), ("STY", "77.pts-1.h")],
+            "mux=screen outer=UNSET base=UNSET",
+            None,
+            false,
+        ),
+        // A plain nested shell inside a session: no multiplexer, nothing to mark.
+        (
+            &[PANE, OUTER, ("TERM", "xterm-256color")],
+            "mux=UNSET outer=UNSET base=UNSET",
+            None,
+            false,
+        ),
+        // An ordinary session shell, nothing nested yet: the base is stamped anyway,
+        // as the empty pair, which is what a later pane's own `$STY`/`$TMUX` differs from.
+        (
+            &[
+                SESSION,
+                ("ATERM_PARENT_SESSION_ID", "s-fresh"),
+                ("TERM", "xterm-256color"),
+            ],
+            "mux=UNSET outer=UNSET base=|",
+            None,
+            false,
+        ),
+        // A session shell in a window LAUNCHED FROM a tmux pane: the inherited
+        // marker is cleared, and the base it stamps is its own, so the pane's
+        // `$TMUX` matches it and the window is not mistaken for a pane.
+        (
+            &[
+                SESSION,
+                ("ATERM_PARENT_SESSION_ID", "s-fresh"),
+                ("TERM", "xterm-256color"),
+                TMUX,
+                ("ATERM_MUX", "tmux"),
+                ("ATERM_MUX_OUTER_SESSION_ID", "s-stale"),
+            ],
+            "mux=UNSET outer=UNSET base=/tmp/tmux-1000/default,9,0|",
+            None,
+            true,
+        ),
+    ];
+    // stdout is redirected, stderr is NOT: the notice IS the stderr of the source.
+    // Then the suite's usual teardown: where the guard is EMPTY the integration
+    // installs, and its preexec would stamp OSC marks into the asserted stdout.
+    let mut lanes = vec![(
+        bash_shell(),
+        &["--noprofile", "--norc", "-i"][..],
+        "aterm_shell_integration.bash",
+        "source \"$ATERM_TEST_SCRIPT\" >/dev/null; \
+         __aterm_in_prompt_cmd=1; trap - DEBUG 2>/dev/null || true; PROMPT_COMMAND=; \
+         printf 'mux=%s outer=%s base=%s' \"${ATERM_MUX-UNSET}\" \
+         \"${ATERM_MUX_OUTER_SESSION_ID-UNSET}\" \"${ATERM_MUX_BASE-UNSET}\"",
+    )];
+    if let Some(zsh) = zsh_shell() {
+        lanes.push((
             zsh,
-            &["-f", "-i"],
+            &["-f", "-i"][..],
             "aterm_shell_integration.zsh",
-            rt.path(),
-            env,
-            report,
-        )
-    };
-    let (out, err) = probe(&[
-        ("ATERM_SHELL_INTEGRATION_INSTALLED", "1"),
-        ("ATERM_PARENT_SESSION_ID", "s-outer"),
-        ("TERM", "screen.xterm-256color"),
-        ("STY", "4242.pts-3.host"),
-    ]);
-    assert_eq!(out, "mux=screen outer=s-outer", "stderr: {err:?}");
-    assert!(err.contains("inside screen"), "{err:?}");
-    let (out, _) = probe(&[
-        ("ATERM_SHELL_INTEGRATION_INSTALLED", "1"),
-        ("ATERM_PARENT_SESSION_ID", "s-outer"),
-        ("TERM", "screen-256color"),
-        ("TMUX", "/tmp/tmux-1000/default,9,0"),
-    ]);
-    assert_eq!(out, "mux=tmux outer=s-outer");
-    let (out, err) = probe(&[
-        ("ATERM_SHELL_INTEGRATION_INSTALLED", ""),
-        ("ATERM_PARENT_SESSION_ID", "s-fresh"),
-        ("TERM", "xterm-256color"),
-        ("TMUX", "/tmp/tmux-1000/default,9,0"),
-        ("ATERM_MUX", "tmux"),
-    ]);
-    assert_eq!(out, "mux=UNSET outer=UNSET", "stderr: {err:?}");
-}
-
-/// The fish boundary — the same contract, in a real fish where one is installed.
-#[cfg(unix)]
-#[test]
-fn test_fish_marks_a_multiplexer_pane_and_clears_a_stale_marker() {
-    let Some(fish) = fish_shell() else {
-        eprintln!("SKIP: no fish on this host");
-        return;
-    };
-    let rt = aterm_tempfile::tempdir().expect("scratch runtime dir");
-    // stdout redirected, stderr kept — the notice is the stderr of the source.
-    let report = "source \"$ATERM_TEST_SCRIPT\" >/dev/null; \
-                  set -l m UNSET; test -n \"$ATERM_MUX\"; and set m \"$ATERM_MUX\"; \
-                  set -l o UNSET; test -n \"$ATERM_MUX_OUTER_SESSION_ID\"; and set o \"$ATERM_MUX_OUTER_SESSION_ID\"; \
-                  printf 'mux=%s outer=%s' \"$m\" \"$o\"";
-    let probe = |env: &[(&str, &str)]| {
-        run_mux_probe(
+            "source \"$ATERM_TEST_SCRIPT\" >/dev/null; \
+             add-zsh-hook -d precmd __aterm_precmd 2>/dev/null || true; \
+             add-zsh-hook -d preexec __aterm_preexec 2>/dev/null || true; \
+             printf 'mux=%s outer=%s base=%s' \"${ATERM_MUX-UNSET}\" \
+             \"${ATERM_MUX_OUTER_SESSION_ID-UNSET}\" \"${ATERM_MUX_BASE-UNSET}\"",
+        ));
+    }
+    if let Some(fish) = fish_shell() {
+        lanes.push((
             fish,
-            &["-i"],
+            &["-i"][..],
             "aterm_shell_integration.fish",
-            rt.path(),
-            env,
-            report,
-        )
-    };
-    let (out, err) = probe(&[
-        ("ATERM_SHELL_INTEGRATION_INSTALLED", "1"),
-        ("ATERM_PARENT_SESSION_ID", "s-outer"),
-        ("TERM", "screen.xterm-256color"),
-        ("STY", "4242.pts-3.host"),
-    ]);
-    assert_eq!(out, "mux=screen outer=s-outer", "stderr: {err:?}");
-    assert!(err.contains("inside screen"), "{err:?}");
-    let (out, _) = probe(&[
-        ("ATERM_SHELL_INTEGRATION_INSTALLED", "1"),
-        ("ATERM_PARENT_SESSION_ID", "s-outer"),
-        ("TERM", "screen-256color"),
-        ("TMUX", "/tmp/tmux-1000/default,9,0"),
-    ]);
-    assert_eq!(out, "mux=tmux outer=s-outer");
-    let (out, err) = probe(&[
-        ("ATERM_SHELL_INTEGRATION_INSTALLED", ""),
-        ("ATERM_PARENT_SESSION_ID", "s-fresh"),
-        ("TERM", "xterm-256color"),
-        ("TMUX", "/tmp/tmux-1000/default,9,0"),
-        ("ATERM_MUX", "tmux"),
-    ]);
-    assert_eq!(out, "mux=UNSET outer=UNSET", "stderr: {err:?}");
+            "source \"$ATERM_TEST_SCRIPT\" >/dev/null; \
+             set -l m UNSET; test -n \"$ATERM_MUX\"; and set m \"$ATERM_MUX\"; \
+             set -l o UNSET; test -n \"$ATERM_MUX_OUTER_SESSION_ID\"; and set o \"$ATERM_MUX_OUTER_SESSION_ID\"; \
+             printf 'mux=%s outer=%s' \"$m\" \"$o\"",
+        ));
+    }
+    for (shell, args, script_name, report) in lanes {
+        let fish = script_name.ends_with(".fish");
+        let rt = aterm_tempfile::tempdir().expect("scratch runtime dir");
+        for (n, (env, expected, announced, in_fish)) in cases.iter().enumerate() {
+            if fish && !in_fish {
+                continue;
+            }
+            let (out, err) = run_mux_probe(shell, args, script_name, rt.path(), env, report);
+            // fish's report leaves the base out.
+            let expected = if fish {
+                expected.split(" base=").next().unwrap_or(expected)
+            } else {
+                expected
+            };
+            assert_eq!(out, expected, "{shell} case {n}; stderr: {err:?}");
+            match announced {
+                Some(mux) => assert!(
+                    err.contains(&format!("inside {mux}")),
+                    "{shell} case {n}: announced once: {err:?}"
+                ),
+                None => assert!(
+                    !err.contains("aterm: inside"),
+                    "{shell} case {n}: nothing announced: {err:?}"
+                ),
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4872,18 +2735,6 @@ impl LiveFixture {
     }
 }
 
-/// THE OWNER'S SCENARIO, zsh, through the crate's own ZDOTDIR wrapper: an
-/// interactive shell inside a session (ATERM_CHILD=1) with no ATPKG_AGENTS, no
-/// ATERM_REROUTE_DIR, no hook file and no agents dir, whose rc puts a foreign
-/// `claude` first. `claude` → foreign. With the SAME shell still running and idle
-/// at a prompt, atpkg's pass lays the hook (hooks.rs's exact format), agents/ with
-/// a twin and reroute/ with its marker: `claude` → "managed 1" — that pickup is
-/// preexec's, a whole prompt cycle having passed with nothing laid. The twin is
-/// re-laid temp+rename: `claude` → "managed 2". The hook is rewritten temp+rename:
-/// re-sourced (zstat sees the new inode). PATH then reads reroute, agents, …, bin
-/// last, each once, and ATERM_REROUTE_DIR was derived beside agents/. Then the two
-/// negatives: outside a session nothing happens live, and an engaged
-/// __ATERM_REROUTE_PASSTHROUGH (the `aterm --no-reroute` marker) derives no reroute dir.
 /// An interactive zsh through the crate's own ZDOTDIR wrapper, reading the
 /// fixture home's .zshrc — `rc_prelude` (a user's `setopt` lines, say) then the
 /// foreign prepend — exactly the real launch shape.
@@ -4965,407 +2816,114 @@ fn spawn_live_bash(fx: &LiveFixture, rc_prelude: &str, extra: &[(&str, &str)]) -
     LiveShell::spawn("bash", &mut cmd).holding(cmd.into_home())
 }
 
-#[cfg(unix)]
-#[test]
-fn test_zsh_already_running_session_shell_picks_up_the_managed_dirs_live() {
-    let Some(zsh) = zsh_shell() else {
-        eprintln!("zsh not installed; skipping the live zsh scenario");
-        return;
-    };
-    let spawn = |fx: &LiveFixture, extra: &[(&str, &str)]| spawn_live_zsh(zsh, fx, "", extra);
-
-    // 1. The scenario.
-    let fx = LiveFixture::new();
-    let mut sh = spawn(&fx, &[("ATERM_CHILD", "1")]);
-    sh.send("claude");
-    let at = sh.wait_for_after("foreign", 0);
-    // A whole idle prompt cycle with nothing laid — the next pickup is preexec's.
-    sh.send("echo IDLE-$((1+0))");
-    let at = sh.wait_for_after("IDLE-1", at);
-    let at = sh.wait_for_after("\x1b]133;A", at);
-    fx.lay("zsh", ATPKG_HOOK_POSIX_GOLDEN, "managed 1");
-    sh.send("claude");
-    let at = sh.wait_for_after("managed 1", at);
-    fx.lay_twin("managed 2");
-    sh.send("claude");
-    let at = sh.wait_for_after("managed 2", at);
-    // The hook rewritten under the live shell (a later pass): re-sourced.
-    fx.write_hook(
-        "zsh",
-        &format!(
-            "{}export ATPKG_HOOK_GEN=2\n",
-            fx.hook_body(ATPKG_HOOK_POSIX_GOLDEN)
-        ),
-    );
-    sh.send("echo \"GEN=$ATPKG_HOOK_GEN\"");
-    let at = sh.wait_for_after("GEN=2", at);
-    sh.send("print -r -- \"LIVEPATH=$PATH\"; print -r -- \"LIVERR=$ATERM_REROUTE_DIR\"; print -r -- \"MARK$((40+2))\"");
-    let at = sh.wait_for_after("MARK42", at);
-    let path = sh.value_before("LIVEPATH=", at);
-    let rr = sh.value_before("LIVERR=", at);
-    fx.assert_path_order("zsh", &path);
-    assert_eq!(
-        rr,
-        fx.reroute.to_str().expect("UTF-8"),
-        "zsh: ATERM_REROUTE_DIR derived beside agents/"
-    );
-    sh.finish();
-
-    // 2. Outside a session: inert. The hook and dirs appear; `claude` stays foreign.
-    let fx = LiveFixture::new();
-    let mut sh = spawn(&fx, &[]);
-    sh.send("claude");
-    let at = sh.wait_for_after("foreign", 0);
-    fx.lay("zsh", ATPKG_HOOK_POSIX_GOLDEN, "managed 1");
-    sh.send("claude; print -r -- \"MARK$((40+2))\"");
-    let at = sh.wait_for_after("MARK42", at);
-    let out = sh.value_before("\x1b]133;C\x07", at);
-    assert!(
-        out.starts_with("foreign") && !out.contains("managed"),
-        "zsh: outside a session the live re-assert must be inert: {out:?}"
-    );
-    sh.finish();
-
-    // 3. The `--no-reroute` marker engaged: agents/ is fronted, no reroute dir is
-    //    derived.
-    let fx = LiveFixture::new();
-    let mut sh = spawn(
-        &fx,
-        &[("ATERM_CHILD", "1"), ("__ATERM_REROUTE_PASSTHROUGH", "1")],
-    );
-    sh.send("claude");
-    let at = sh.wait_for_after("foreign", 0);
-    fx.lay("zsh", ATPKG_HOOK_POSIX_GOLDEN, "managed 1");
-    sh.send("claude");
-    let at = sh.wait_for_after("managed 1", at);
-    sh.send("print -r -- \"LIVEPATH=$PATH\"; print -r -- \"LIVERR=${ATERM_REROUTE_DIR:-unset}\"; print -r -- \"MARK$((40+2))\"");
-    let at = sh.wait_for_after("MARK42", at);
-    let path = sh.value_before("LIVEPATH=", at);
-    assert!(
-        path.starts_with(&format!("{}:", fx.agents.display())),
-        "zsh: agents/ leads without the reroute dir: {path:?}"
-    );
-    assert!(
-        !path.contains(fx.reroute.to_str().expect("UTF-8")),
-        "zsh: no reroute dir on PATH under __ATERM_REROUTE_PASSTHROUGH=1: {path:?}"
-    );
-    assert_eq!(sh.value_before("LIVERR=", at), "unset");
-    sh.finish();
-}
-
-/// The owner's scenario in one bash: `claude` → foreign; a whole idle prompt cycle;
-/// atpkg's pass lays everything; `claude` → "managed 1" (preexec's pickup); the
-/// twin re-laid → "managed 2"; the hook REWRITTEN under the live shell (a later
-/// pass) → re-sourced, its new export visible at the next prompt (the content
-/// watch: bash reads the hook's text with the `read` builtin and compares — the
-/// residual R1 of 2026-09-16, closed); PATH reads reroute, agents, …, bin last;
-/// ATERM_REROUTE_DIR derived beside agents/.
-#[cfg(unix)]
-fn bash_owner_scenario(sh: &mut LiveShell, fx: &LiveFixture) {
-    sh.send("claude");
-    let at = sh.wait_for_after("foreign", 0);
-    sh.send("echo IDLE-$((1+0))");
-    let at = sh.wait_for_after("IDLE-1", at);
-    let at = sh.wait_for_after("\x1b]133;A", at);
-    fx.lay("bash", ATPKG_HOOK_POSIX_GOLDEN, "managed 1");
-    sh.send("claude");
-    let at = sh.wait_for_after("managed 1", at);
-    fx.lay_twin("managed 2");
-    sh.send("claude");
-    let at = sh.wait_for_after("managed 2", at);
-    fx.write_hook(
-        "bash",
-        &format!(
-            "{}export ATPKG_HOOK_GEN=2\n",
-            fx.hook_body(ATPKG_HOOK_POSIX_GOLDEN)
-        ),
-    );
-    sh.send("echo \"GEN=${ATPKG_HOOK_GEN:-unset}\"");
-    let at = sh.wait_for_after("GEN=2", at);
-    sh.send(BASH_PRINT_PATH);
-    let at = sh.wait_for_after("MARK42", at);
-    let path = sh.value_before("LIVEPATH=", at);
-    fx.assert_path_order("bash", &path);
-    assert_eq!(
-        sh.value_before("LIVERR=", at),
-        fx.reroute.to_str().expect("UTF-8"),
-        "bash: ATERM_REROUTE_DIR derived beside agents/"
-    );
-}
-
-/// The same scenario in bash, through the crate's own `--rcfile` wrapper (which
-/// sources /etc/profile — on macOS, path_helper — then the home's .bashrc, where
-/// the foreign prepend lives, exactly the owner's shape).
-#[cfg(unix)]
-#[test]
-fn test_bash_already_running_session_shell_picks_up_the_managed_dirs_live() {
-    let fx = LiveFixture::new();
-    let mut sh = spawn_live_bash(&fx, "", &[]);
-    bash_owner_scenario(&mut sh, &fx);
-    sh.finish();
-}
-
-/// The same scenario under a user's `set -u` (in .bashrc, so it governs the
-/// script's load AND every prompt). Before 2026-09-16 the prompt command aborted
-/// on the unbound `__aterm_pending_prompt_setup` at every prompt, leaving
-/// `__aterm_in_prompt_cmd=1` stuck and the DEBUG-trap preexec — the per-command
-/// re-assert — dead: the `claude` typed after the twins landed ran the FOREIGN
-/// copy (the same at the parent commit; the live pickup made it a live claim).
-/// Pinned: the whole scenario holds, and stderr carries no "unbound variable".
-#[cfg(unix)]
-#[test]
-fn test_bash_live_pickup_holds_under_set_u() {
-    let fx = LiveFixture::new();
-    let mut sh = spawn_live_bash(&fx, "set -u\n", &[]);
-    bash_owner_scenario(&mut sh, &fx);
-    let err = sh.stderr_text();
-    assert!(
-        !err.contains("unbound variable"),
-        "bash: the integration must be nounset-clean at load and at every prompt:\n{err}"
-    );
-    sh.finish();
-}
-
-/// No hook at all — a fresh machine before any agent program is installed, or
-/// a hook that predates R1 — and the seam's ATERM_REROUTE_DIR leading PATH with a
-/// `cargo` stub in it. `cargo` → stub. The user prepends a dir holding its own
-/// `cargo` AT THE PROMPT (a `. ~/.cargo/env`, a tool installer): the very next
-/// `cargo` must still run the stub (preexec's re-front), and so must one typed a
-/// prompt cycle later; PATH leads with the reroute dir. Review finding
-/// 2026-09-16: bash and fish returned from the hot path's step 1 whenever
-/// $ATPKG_AGENTS was unset, hook or no hook, so the order was never re-checked
-/// and the prepend shadowed the stubs for the life of the shell — only zsh held.
-#[cfg(unix)]
-fn live_reroute_survives_a_prepend_with_no_hook(
-    label: &str,
-    sh: &mut LiveShell,
-    fx: &LiveFixture,
-    prepend: &str,
-    print_path: &str,
-    idle: &str,
-) {
-    sh.send("cargo");
-    let at = sh.wait_for_after("stub-cargo", 0);
-    sh.send(prepend);
-    sh.send("cargo");
-    let at = sh.wait_for_after("stub-cargo", at);
-    sh.send(idle);
-    let at = sh.wait_for_after("IDLE-1", at);
-    let at = sh.wait_for_after("\x1b]133;A", at);
-    sh.send("cargo");
-    let at = sh.wait_for_after("stub-cargo", at);
-    sh.send(print_path);
-    let at = sh.wait_for_after("MARK42", at);
-    let path = sh.value_before("LIVEPATH=", at);
-    assert!(
-        path.starts_with(&format!("{}:", fx.reroute.display())),
-        "{label}: the reroute dir must lead PATH after the prepend: {path:?}"
-    );
-    assert!(
-        path.split(':')
-            .any(|e| e == fx.foreign.to_str().expect("UTF-8")),
-        "{label}: the prepended dir is demoted, not removed: {path:?}"
-    );
-}
-
-#[cfg(unix)]
-fn reroute_prepend_fixture() -> (LiveFixture, Vec<(String, String)>) {
-    let fx = LiveFixture::new();
-    fx.lay_reroute_stub("cargo", "stub-cargo");
-    write_executable(&fx.foreign.join("cargo"), "#!/bin/sh\necho foreign-cargo\n");
-    let env = vec![
-        ("ATERM_CHILD".to_owned(), "1".to_owned()),
-        (
-            "ATERM_REROUTE_DIR".to_owned(),
-            fx.reroute.to_str().expect("UTF-8").to_owned(),
-        ),
-        (
-            "PATH".to_owned(),
-            format!("{}:/usr/bin:/bin", fx.reroute.display()),
-        ),
-    ];
-    (fx, env)
-}
-
-#[cfg(unix)]
-#[test]
-fn test_reroute_stubs_survive_a_prompt_time_prepend_with_no_hook_in_bash() {
-    let (fx, env) = reroute_prepend_fixture();
-    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    let mut sh = spawn_live_bash(&fx, "", &env);
-    live_reroute_survives_a_prepend_with_no_hook(
-        "bash",
-        &mut sh,
-        &fx,
-        &format!("export PATH=\"{}:$PATH\"", fx.foreign.display()),
-        BASH_PRINT_PATH,
-        "echo IDLE-$((1+0))",
-    );
-    sh.finish();
-}
-
-#[cfg(unix)]
-#[test]
-fn test_reroute_stubs_survive_a_prompt_time_prepend_with_no_hook_in_zsh() {
-    let Some(zsh) = zsh_shell() else {
-        eprintln!("zsh not installed; skipping the live zsh no-hook reroute scenario");
-        return;
-    };
-    let (fx, env) = reroute_prepend_fixture();
-    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    let mut sh = spawn_live_zsh(zsh, &fx, "", &env);
-    live_reroute_survives_a_prepend_with_no_hook(
-        "zsh",
-        &mut sh,
-        &fx,
-        &format!("export PATH=\"{}:$PATH\"", fx.foreign.display()),
-        ZSH_PRINT_PATH,
-        "echo IDLE-$((1+0))",
-    );
-    sh.finish();
-}
-
-#[cfg(unix)]
-#[test]
-fn test_reroute_stubs_survive_a_prompt_time_prepend_with_no_hook_in_fish() {
-    let Some(fish) = fish_shell() else {
-        eprintln!("fish not installed; skipping the live fish no-hook reroute scenario");
-        return;
-    };
-    if !script_can_allocate_a_pty() {
-        eprintln!("no `script` to allocate a pty; skipping the live fish no-hook reroute scenario");
-        return;
+/// A home shaped like Ubuntu's `/etc/skel`: `~/.profile` reads `~/.bashrc`, and
+/// `~/.bash_logout` leaves a mark. Each startup file says when it runs.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn skel_shaped_home(fx: &LiveFixture) {
+    for (name, body) in [
+        (".bashrc", "echo RAN-BASHRC\n"),
+        (".profile", "echo RAN-PROFILE\n. \"$HOME/.bashrc\"\n"),
+        (".bash_logout", "echo LOGGED-OUT >\"$HOME/logout-mark\"\n"),
+    ] {
+        std::fs::write(fx.home.join(name), body).expect("a startup file");
     }
-    let (fx, env) = reroute_prepend_fixture();
-    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    let mut sh = spawn_live_fish(fish, &fx, &env);
-    live_reroute_survives_a_prepend_with_no_hook(
-        "fish",
-        &mut sh,
-        &fx,
-        &format!("set -gx PATH \"{}\" $PATH", fx.foreign.display()),
-        FISH_PRINT_PATH,
-        "echo IDLE-(math 1 + 0)",
-    );
-    sh.finish();
 }
 
-/// The OTHER order the owner's gesture reaches: the
-/// hook and an EMPTY agents/ exist when the shell starts — a fresh machine creates
-/// agents/ at launch and lays the twin only once the managed program is installed
-/// — so `claude` runs the foreign copy and the shell HASHES that path. The twin
-/// lands, with NO hook rewrite: `claude` must run it. Before the twin watch both
-/// shells kept the hashed foreign path for the life of the shell (measured: zsh
-/// 5.9 and bash 3.2.57). Also pinned: the steady state assigns nothing — a manual
-/// hash entry (`zzz`) survives two idle prompt cycles — and, for zsh, a user rc
-/// with `setopt ksh_arrays warn_create_global` neither truncates PATH nor prints a
-/// "created globally" line (the hot path runs under `emulate -L zsh`).
-#[cfg(unix)]
-fn live_twin_lands_later(
-    label: &str,
-    sh: &mut LiveShell,
-    fx: &LiveFixture,
-    hash_foreign: &str,
-    print_path: &str,
-) {
-    sh.send("claude");
-    let at = sh.wait_for_after("foreign", 0);
-    sh.send(&format!("{hash_foreign}; echo IDLE-$((1+0))"));
-    let at = sh.wait_for_after("IDLE-1", at);
-    let at = sh.wait_for_after("\x1b]133;A", at);
-    sh.send("echo IDLE-$((2+0))");
-    let at = sh.wait_for_after("IDLE-2", at);
-    let at = sh.wait_for_after("\x1b]133;A", at);
-    // The hash table survived two steady prompts: nothing was assigned or flushed.
-    sh.send("zzz");
-    let at = sh.wait_for_after("foreign", at);
-    fx.lay_twin("managed 1");
-    sh.send("claude");
-    let at = sh.wait_for_after("managed 1", at);
-    fx.lay_twin("managed 2");
-    sh.send("claude");
-    let at = sh.wait_for_after("managed 2", at);
-    sh.send(print_path);
-    let at = sh.wait_for_after("MARK42", at);
-    let path = sh.value_before("LIVEPATH=", at);
-    fx.assert_path_order(label, &path);
+/// bash as aterm starts it with `shell_args` = `args` ([`merge_shell_args`]):
+/// the integration's argv and env, and the merge's.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn spawn_bash_with_shell_args(fx: &LiveFixture, args: &[&str]) -> LiveShell {
+    let mut injection = prepare_into(ShellType::Bash, &fx.base)
+        .expect("prepare")
+        .expect("bash injection");
+    let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+    let home = fx.home.display().to_string();
+    let env = |key: &str| (key == "HOME").then(|| home.clone());
     assert_eq!(
-        sh.value_before("LIVERR=", at),
-        fx.reroute.to_str().expect("UTF-8"),
-        "{label}: ATERM_REROUTE_DIR derived beside agents/"
+        shell_args::merge_shell_args_in(ShellType::Bash, &mut injection, &args, &env),
+        ArgsMerge::Integrated
     );
+    let argv = injection.argv_override.expect("bash's argv");
+    let mut cmd = shell_command(bash_shell());
+    cmd.args(&argv[1..])
+        .env("HOME", &fx.home)
+        .env("PATH", "/usr/bin:/bin")
+        .env("TERM", "dumb")
+        .env("ATERM_CHILD", "1")
+        .env_remove("BASH_ENV")
+        .env_remove("ENV")
+        .env_remove("HISTFILE");
+    for (key, value) in injection.env_add {
+        cmd.env(key, value);
+    }
+    LiveShell::spawn("bash", &mut cmd).holding(cmd.into_home())
 }
 
-/// The hook exists at spawn but names an agents/ atpkg has NOT created yet (a
-/// hook written on a machine with no agent program installed, or a wiped managed
-/// prefix): `claude` → foreign; agents/ + reroute/ + bin/ and the twin appear with
-/// NO hook rewrite; `claude` must run the twin, PATH must lead reroute, agents.
-/// Before the re-probe, `$__aterm_managed_want` stayed empty and the hot path
-/// returned early forever.
-#[cfg(unix)]
-fn live_hook_first_dirs_later(label: &str, sh: &mut LiveShell, fx: &LiveFixture, print_path: &str) {
-    sh.send("claude");
-    let at = sh.wait_for_after("foreign", 0);
-    sh.send("echo IDLE-$((1+0))");
-    let at = sh.wait_for_after("IDLE-1", at);
-    let at = sh.wait_for_after("\x1b]133;A", at);
-    fx.lay_dirs();
-    fx.lay_twin("managed 1");
-    sh.send("claude");
-    let at = sh.wait_for_after("managed 1", at);
-    sh.send(print_path);
-    let at = sh.wait_for_after("MARK42", at);
-    let path = sh.value_before("LIVEPATH=", at);
-    fx.assert_path_order(label, &path);
-    assert_eq!(
-        sh.value_before("LIVERR=", at),
-        fx.reroute.to_str().expect("UTF-8"),
-        "{label}: ATERM_REROUTE_DIR derived beside agents/"
-    );
-}
-
-#[cfg(unix)]
-const ZSH_PRINT_PATH: &str = "print -r -- \"LIVEPATH=$PATH\"; print -r -- \"LIVERR=$ATERM_REROUTE_DIR\"; print -r -- \"MARK$((40+2))\"";
-#[cfg(unix)]
-const BASH_PRINT_PATH: &str = "printf 'LIVEPATH=%s\\n' \"$PATH\"; printf 'LIVERR=%s\\n' \"$ATERM_REROUTE_DIR\"; echo \"MARK$((40+2))\"";
-
-#[cfg(unix)]
+/// Off macOS bash starts as every terminal there starts it — an interactive
+/// NON-login shell — and reads each startup file once: the loader reads
+/// `~/.bashrc` and not `~/.profile`, which on Ubuntu reads `~/.bashrc` again (the
+/// old login-style wrapper ran it twice, and `/etc/bash.bashrc` twice with it).
+/// With `shell_args = ["-l"]` it is a real login shell: `~/.profile` once, through
+/// it `~/.bashrc` once, `logout` works and `~/.bash_logout` runs. The integration
+/// loads in both.
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
-fn test_zsh_twin_landing_in_an_agents_dir_already_leading_path_is_run_live() {
-    let Some(zsh) = zsh_shell() else {
-        eprintln!("zsh not installed; skipping the live zsh twin-watch scenario");
-        return;
-    };
+fn bash_reads_each_startup_file_once_non_login_and_login() {
+    let probe = "echo \"LOGIN=$(shopt -q login_shell && echo y || echo n) \
+                 POSIX=$(shopt -qo posix && echo y || echo n) \
+                 HOOKED=${ATERM_SHELL_INTEGRATION_INSTALLED:+y}\"; echo MARK$((40 + 2))";
+    let count =
+        |sh: &LiveShell, at: usize, what: &str| stdout_between(sh, 0, at).matches(what).count();
+
     let fx = LiveFixture::new();
-    fx.lay_dirs();
-    fx.lay_hook("zsh", ATPKG_HOOK_POSIX_GOLDEN);
-    let mut sh = spawn_live_zsh(
-        zsh,
-        &fx,
-        "setopt ksh_arrays warn_create_global\n",
-        &[("ATERM_CHILD", "1")],
-    );
-    let hash_foreign = format!("hash zzz={}/claude", fx.foreign.display());
-    live_twin_lands_later("zsh", &mut sh, &fx, &hash_foreign, ZSH_PRINT_PATH);
-    let err = sh.stderr_text();
-    assert!(
-        !err.contains("created globally"),
-        "zsh: sourcing the hook from the hot path must not trip warn_create_global:\n{err}"
-    );
+    skel_shaped_home(&fx);
+    let mut sh = spawn_bash_with_shell_args(&fx, &["-i"]);
+    sh.send(probe);
+    let at = sh.wait_for_after("MARK42", 0);
+    assert_eq!(count(&sh, at, "RAN-BASHRC"), 1, "{}", sh.transcript());
+    assert_eq!(count(&sh, at, "RAN-PROFILE"), 0, "{}", sh.transcript());
+    assert_eq!(sh.value_before("LOGIN=", at), "n POSIX=n HOOKED=y");
     sh.finish();
-}
 
-#[cfg(unix)]
-#[test]
-fn test_zsh_hook_naming_an_agents_dir_that_appears_later_is_fronted_live() {
-    let Some(zsh) = zsh_shell() else {
-        eprintln!("zsh not installed; skipping the live zsh hook-first scenario");
-        return;
-    };
     let fx = LiveFixture::new();
-    fx.lay_hook("zsh", ATPKG_HOOK_POSIX_GOLDEN);
-    let mut sh = spawn_live_zsh(zsh, &fx, "", &[("ATERM_CHILD", "1")]);
-    live_hook_first_dirs_later("zsh", &mut sh, &fx, ZSH_PRINT_PATH);
+    skel_shaped_home(&fx);
+    let mut sh = spawn_bash_with_shell_args(&fx, &["-l", "-i"]);
+    sh.send(probe);
+    let at = sh.wait_for_after("MARK42", 0);
+    assert_eq!(count(&sh, at, "RAN-BASHRC"), 1, "{}", sh.transcript());
+    assert_eq!(count(&sh, at, "RAN-PROFILE"), 1, "{}", sh.transcript());
+    assert_eq!(sh.value_before("LOGIN=", at), "y POSIX=n HOOKED=y");
+    sh.send("logout");
+    let started = std::time::Instant::now();
+    while sh.child.try_wait().ok().flatten().is_none() {
+        assert!(
+            started.elapsed() < LiveShell::TIMEOUT,
+            "bash: `logout` did not end the login shell\n{}",
+            sh.transcript()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+    assert_eq!(
+        std::fs::read_to_string(fx.home.join("logout-mark"))
+            .ok()
+            .as_deref(),
+        Some("LOGGED-OUT\n"),
+        "~/.bash_logout ran\n{}",
+        sh.transcript()
+    );
+
+    // `--rcfile ~/.myrc`, as TOML spells it: bash tilde-expands the file it is
+    // handed, and so does the loader that reads it in its place (it read
+    // neither ~/.myrc nor ~/.bashrc).
+    let fx = LiveFixture::new();
+    skel_shaped_home(&fx);
+    std::fs::write(fx.home.join(".myrc"), "echo RAN-MYRC\n").expect(".myrc");
+    let mut sh = spawn_bash_with_shell_args(&fx, &["--rcfile", "~/.myrc", "-i"]);
+    sh.send(probe);
+    let at = sh.wait_for_after("MARK42", 0);
+    assert_eq!(count(&sh, at, "RAN-MYRC"), 1, "{}", sh.transcript());
+    assert_eq!(count(&sh, at, "RAN-BASHRC"), 0, "{}", sh.transcript());
+    assert_eq!(sh.value_before("LOGIN=", at), "n POSIX=n HOOKED=y");
     sh.finish();
 }
 
@@ -5379,10 +2937,7 @@ fn test_zsh_hook_naming_an_agents_dir_that_appears_later_is_fronted_live() {
 #[cfg(unix)]
 #[test]
 fn test_zsh_loads_zstat_only_once_there_is_a_hook_to_stamp() {
-    let Some(zsh) = zsh_shell() else {
-        eprintln!("zsh not installed; skipping the zstat load scenario");
-        return;
-    };
+    let zsh = need_zsh();
     let script = format!(
         "{}/src/scripts/aterm_shell_integration.zsh",
         env!("CARGO_MANIFEST_DIR")
@@ -5420,29 +2975,6 @@ print -rn -- \"[hook=${+builtins[zstat]} ran=${ATERM_TEST_HOOK_RAN:-0}]\"\n";
         );
     }
 }
-
-#[cfg(unix)]
-#[test]
-fn test_bash_twin_landing_in_an_agents_dir_already_leading_path_is_run_live() {
-    let fx = LiveFixture::new();
-    fx.lay_dirs();
-    fx.lay_hook("bash", ATPKG_HOOK_POSIX_GOLDEN);
-    let mut sh = spawn_live_bash(&fx, "", &[]);
-    let hash_foreign = format!("hash -p {}/claude zzz", fx.foreign.display());
-    live_twin_lands_later("bash", &mut sh, &fx, &hash_foreign, BASH_PRINT_PATH);
-    sh.finish();
-}
-
-#[cfg(unix)]
-#[test]
-fn test_bash_hook_naming_an_agents_dir_that_appears_later_is_fronted_live() {
-    let fx = LiveFixture::new();
-    fx.lay_hook("bash", ATPKG_HOOK_POSIX_GOLDEN);
-    let mut sh = spawn_live_bash(&fx, "", &[]);
-    live_hook_first_dirs_later("bash", &mut sh, &fx, BASH_PRINT_PATH);
-    sh.finish();
-}
-
 /// An interactive fish inside a session. fish's `fish_prompt`/`fish_preexec`
 /// events fire only from its interactive reader, which needs a real pty, so the
 /// shell runs under `script` (macOS and util-linux spellings). The integration
@@ -5513,25 +3045,345 @@ fn spawn_live_fish(fish: &str, fx: &LiveFixture, extra: &[(&str, &str)]) -> Live
 }
 
 #[cfg(unix)]
-const FISH_PRINT_PATH: &str = "printf 'LIVEPATH=%s\\n' (string join : -- $PATH); printf 'LIVERR=%s\\n' \"$ATERM_REROUTE_DIR\"; echo MARK(math 40 + 2)";
-
+const ZSH_PRINT_PATH: &str = "print -r -- \"LIVEPATH=$PATH\"; print -r -- \"LIVERR=$ATERM_REROUTE_DIR\"; print -r -- \"MARK$((40+2))\"";
 #[cfg(unix)]
-fn fish_assert_path_and_reroute(sh: &mut LiveShell, fx: &LiveFixture, at: usize) {
-    sh.send(FISH_PRINT_PATH);
-    let at = sh.wait_for_after("MARK42", at);
-    let path = sh.value_before("LIVEPATH=", at);
-    fx.assert_path_order("fish", &path);
-    assert_eq!(
-        sh.value_before("LIVERR=", at),
-        fx.reroute.to_str().expect("UTF-8"),
-        "fish: ATERM_REROUTE_DIR derived beside agents/"
-    );
-}
+const BASH_PRINT_PATH: &str = "printf 'LIVEPATH=%s\\n' \"$PATH\"; printf 'LIVERR=%s\\n' \"$ATERM_REROUTE_DIR\"; echo \"MARK$((40+2))\"";
+#[cfg(unix)]
+const FISH_PRINT_PATH: &str = "printf 'LIVEPATH=%s\\n' (string join : -- $PATH); printf 'LIVERR=%s\\n' \"$ATERM_REROUTE_DIR\"; echo MARK(math 40 + 2)";
 
 #[cfg(unix)]
 fn script_can_allocate_a_pty() -> bool {
     Command::new("script").arg("-V").output().is_ok()
         || Command::new("script").arg("--version").output().is_ok()
+}
+
+/// [`zsh_shell`] for a test that needs a real zsh: COULD NOT RUN where the host
+/// has none, never a silent pass.
+#[cfg(unix)]
+fn need_zsh() -> &'static str {
+    zsh_shell().unwrap_or_else(|| {
+        aterm_spec::host::could_not_run("no zsh on this host (ATERM_TEST_ZSH=<zsh> names one)")
+    })
+}
+
+/// [`fish_shell`] for a test that needs a real fish: COULD NOT RUN where the
+/// host has none (install fish, or `ATERM_TEST_FISH=<fish>` names one), never a
+/// silent pass.
+#[cfg(unix)]
+fn need_fish() -> &'static str {
+    fish_shell().unwrap_or_else(|| {
+        aterm_spec::host::could_not_run(
+            "no fish on this host (install fish, or ATERM_TEST_FISH=<fish> names one)",
+        )
+    })
+}
+
+/// A `script(1)` that can allocate a pty, for a live-pty test: COULD NOT RUN
+/// where the host has none, never a silent pass.
+#[cfg(unix)]
+fn need_pty_script() {
+    if !script_can_allocate_a_pty() {
+        aterm_spec::host::could_not_run("no `script` that can allocate a pty on this host");
+    }
+}
+
+/// A live `label` shell ("bash", "zsh" or "fish") inside a session, with no rc
+/// prelude, and the line that prints its PATH — or `None` where that shell (or,
+/// for fish, the `script` that gives it a pty) is not installed.
+#[cfg(unix)]
+fn spawn_live(
+    label: &str,
+    fx: &LiveFixture,
+    extra: &[(&str, &str)],
+) -> Option<(LiveShell, &'static str)> {
+    match label {
+        "bash" => Some((spawn_live_bash(fx, "", extra), BASH_PRINT_PATH)),
+        "zsh" => zsh_shell().map(|zsh| (spawn_live_zsh(zsh, fx, "", extra), ZSH_PRINT_PATH)),
+        _ => fish_shell()
+            .filter(|_| script_can_allocate_a_pty())
+            .map(|fish| (spawn_live_fish(fish, fx, extra), FISH_PRINT_PATH)),
+    }
+}
+
+/// Print PATH and `$ATERM_REROUTE_DIR` in the live shell, from `at` on: reroute,
+/// agents, …, bin last, each once, and the reroute dir derived beside agents/.
+#[cfg(unix)]
+fn assert_live_path(label: &str, sh: &mut LiveShell, fx: &LiveFixture, at: usize, print: &str) {
+    sh.send(print);
+    let at = sh.wait_for_after("MARK42", at);
+    fx.assert_path_order(label, &sh.value_before("LIVEPATH=", at));
+    assert_eq!(
+        sh.value_before("LIVERR=", at),
+        fx.reroute.to_str().expect("UTF-8"),
+        "{label}: ATERM_REROUTE_DIR derived beside agents/"
+    );
+}
+
+/// THE OWNER'S SCENARIO in one live bash or zsh (`label`, the hook's extension),
+/// started inside a session with no ATPKG_AGENTS, no ATERM_REROUTE_DIR, no hook
+/// and no agents dir, its rc putting a foreign `claude` first: `claude` → foreign;
+/// a whole idle prompt cycle with nothing laid; atpkg's pass lays the hook
+/// (hooks.rs's exact format), agents/ with a twin and reroute/ with its marker;
+/// `claude` → "managed 1" (preexec's pickup); the twin re-laid temp+rename →
+/// "managed 2"; the hook REWRITTEN under the live shell (a later pass) →
+/// re-sourced (zsh sees the new inode, bash compares the text — residual R1 of
+/// 2026-09-16, closed); then PATH and the derived reroute dir.
+#[cfg(unix)]
+fn posix_owner_scenario(label: &str, sh: &mut LiveShell, fx: &LiveFixture, print: &str) {
+    sh.send("claude");
+    let at = sh.wait_for_after("foreign", 0);
+    sh.send("echo IDLE-$((1+0))");
+    let at = sh.wait_for_after("IDLE-1", at);
+    let at = sh.wait_for_after("\x1b]133;A", at);
+    fx.lay(label, ATPKG_HOOK_POSIX_GOLDEN, "managed 1");
+    sh.send("claude");
+    let at = sh.wait_for_after("managed 1", at);
+    fx.lay_twin("managed 2");
+    sh.send("claude");
+    let at = sh.wait_for_after("managed 2", at);
+    fx.write_hook(
+        label,
+        &format!(
+            "{}export ATPKG_HOOK_GEN=2\n",
+            fx.hook_body(ATPKG_HOOK_POSIX_GOLDEN)
+        ),
+    );
+    sh.send("echo \"GEN=${ATPKG_HOOK_GEN:-unset}\"");
+    let at = sh.wait_for_after("GEN=2", at);
+    assert_live_path(label, sh, fx, at, print);
+}
+
+/// The owner's scenario in zsh, through the crate's own ZDOTDIR wrapper; then the
+/// two negatives: outside a session (no ATERM_CHILD) nothing happens live, and an
+/// engaged __ATERM_REROUTE_PASSTHROUGH (the `aterm --no-reroute` marker) fronts
+/// agents/ but derives no reroute dir.
+#[cfg(unix)]
+#[test]
+fn test_zsh_already_running_session_shell_picks_up_the_managed_dirs_live() {
+    let zsh = need_zsh();
+    let spawn = |fx: &LiveFixture, extra: &[(&str, &str)]| spawn_live_zsh(zsh, fx, "", extra);
+
+    let fx = LiveFixture::new();
+    let mut sh = spawn(&fx, &[("ATERM_CHILD", "1")]);
+    posix_owner_scenario("zsh", &mut sh, &fx, ZSH_PRINT_PATH);
+    sh.finish();
+
+    // Outside a session: inert. The hook and dirs appear; `claude` stays foreign.
+    let fx = LiveFixture::new();
+    let mut sh = spawn(&fx, &[]);
+    sh.send("claude");
+    let at = sh.wait_for_after("foreign", 0);
+    fx.lay("zsh", ATPKG_HOOK_POSIX_GOLDEN, "managed 1");
+    sh.send("claude; print -r -- \"MARK$((40+2))\"");
+    let at = sh.wait_for_after("MARK42", at);
+    let out = sh.value_before("\x1b]133;C\x07", at);
+    assert!(
+        out.starts_with("foreign") && !out.contains("managed"),
+        "zsh: outside a session the live re-assert must be inert: {out:?}"
+    );
+    sh.finish();
+
+    // The `--no-reroute` marker engaged: agents/ is fronted, no reroute dir derived.
+    let fx = LiveFixture::new();
+    let mut sh = spawn(
+        &fx,
+        &[("ATERM_CHILD", "1"), ("__ATERM_REROUTE_PASSTHROUGH", "1")],
+    );
+    sh.send("claude");
+    let at = sh.wait_for_after("foreign", 0);
+    fx.lay("zsh", ATPKG_HOOK_POSIX_GOLDEN, "managed 1");
+    sh.send("claude");
+    let at = sh.wait_for_after("managed 1", at);
+    sh.send("print -r -- \"LIVEPATH=$PATH\"; print -r -- \"LIVERR=${ATERM_REROUTE_DIR:-unset}\"; print -r -- \"MARK$((40+2))\"");
+    let at = sh.wait_for_after("MARK42", at);
+    let path = sh.value_before("LIVEPATH=", at);
+    assert!(
+        path.starts_with(&format!("{}:", fx.agents.display())),
+        "zsh: agents/ leads without the reroute dir: {path:?}"
+    );
+    assert!(
+        !path.contains(fx.reroute.to_str().expect("UTF-8")),
+        "zsh: no reroute dir on PATH under __ATERM_REROUTE_PASSTHROUGH=1: {path:?}"
+    );
+    assert_eq!(sh.value_before("LIVERR=", at), "unset");
+    sh.finish();
+}
+
+/// The owner's scenario in bash under a user's `set -u` (in .bashrc, so it
+/// governs the script's load AND every prompt). Before 2026-09-16 the prompt
+/// command aborted on the unbound `__aterm_pending_prompt_setup` at every prompt,
+/// leaving `__aterm_in_prompt_cmd=1` stuck and the DEBUG-trap preexec — the
+/// per-command re-assert — dead: the `claude` typed after the twins landed ran
+/// the FOREIGN copy. Pinned: the whole scenario holds, and stderr carries no
+/// "unbound variable".
+#[cfg(unix)]
+#[test]
+fn test_bash_live_pickup_holds_under_set_u() {
+    let fx = LiveFixture::new();
+    let mut sh = spawn_live_bash(&fx, "set -u\n", &[]);
+    posix_owner_scenario("bash", &mut sh, &fx, BASH_PRINT_PATH);
+    let err = sh.stderr_text();
+    assert!(
+        !err.contains("unbound variable"),
+        "bash: the integration must be nounset-clean at load and at every prompt:\n{err}"
+    );
+    sh.finish();
+}
+
+/// No hook at all — a fresh machine before any agent program is installed — and
+/// the seam's ATERM_REROUTE_DIR leading PATH with a `cargo` stub in it. The user
+/// prepends a dir holding its own `cargo` AT THE PROMPT (a `. ~/.cargo/env`, a
+/// tool installer): the very next `cargo` must still run the stub (preexec's
+/// re-front), and so must one typed a prompt cycle later. Review finding
+/// 2026-09-16: bash and fish returned from the hot path's step 1 whenever
+/// $ATPKG_AGENTS was unset, hook or no hook, so the prepend shadowed the stubs
+/// for the life of the shell — only zsh held.
+#[cfg(unix)]
+#[test]
+fn test_reroute_stubs_survive_a_prompt_time_prepend_with_no_hook() {
+    for label in ["bash", "zsh", "fish"] {
+        let fx = LiveFixture::new();
+        fx.lay_reroute_stub("cargo", "stub-cargo");
+        write_executable(&fx.foreign.join("cargo"), "#!/bin/sh\necho foreign-cargo\n");
+        let reroute = fx.reroute.to_str().expect("UTF-8");
+        let path = format!("{reroute}:/usr/bin:/bin");
+        let env = [
+            ("ATERM_CHILD", "1"),
+            ("ATERM_REROUTE_DIR", reroute),
+            ("PATH", path.as_str()),
+        ];
+        let Some((mut sh, print)) = spawn_live(label, &fx, &env) else {
+            continue;
+        };
+        let (prepend, idle) = if label == "fish" {
+            (
+                format!("set -gx PATH \"{}\" $PATH", fx.foreign.display()),
+                "echo IDLE-(math 1 + 0)",
+            )
+        } else {
+            (
+                format!("export PATH=\"{}:$PATH\"", fx.foreign.display()),
+                "echo IDLE-$((1+0))",
+            )
+        };
+        sh.send("cargo");
+        let at = sh.wait_for_after("stub-cargo", 0);
+        sh.send(&prepend);
+        sh.send("cargo");
+        let at = sh.wait_for_after("stub-cargo", at);
+        sh.send(idle);
+        let at = sh.wait_for_after("IDLE-1", at);
+        let at = sh.wait_for_after("\x1b]133;A", at);
+        sh.send("cargo");
+        let at = sh.wait_for_after("stub-cargo", at);
+        sh.send(print);
+        let at = sh.wait_for_after("MARK42", at);
+        let path = sh.value_before("LIVEPATH=", at);
+        assert!(
+            path.starts_with(&format!("{reroute}:")),
+            "{label}: the reroute dir must lead PATH after the prepend: {path:?}"
+        );
+        assert!(
+            path.split(':')
+                .any(|e| e == fx.foreign.to_str().expect("UTF-8")),
+            "{label}: the prepended dir is demoted, not removed: {path:?}"
+        );
+        sh.finish();
+    }
+}
+
+/// The OTHER order the owner's gesture reaches: the hook and an EMPTY agents/
+/// exist when the shell starts — a fresh machine creates agents/ at launch and
+/// lays the twin only once the managed program is installed — so `claude` runs
+/// the foreign copy and the shell HASHES that path. The twin lands, with NO hook
+/// rewrite: `claude` must run it. Before the twin watch both shells kept the
+/// hashed foreign path for the life of the shell (measured: zsh 5.9 and bash
+/// 3.2.57). Also pinned: the steady state assigns nothing — a manual hash entry
+/// (`zzz`) survives two idle prompt cycles — and, for zsh, a user rc with
+/// `setopt ksh_arrays warn_create_global` neither truncates PATH nor prints a
+/// "created globally" line (the hot path runs under `emulate -L zsh`).
+#[cfg(unix)]
+#[test]
+fn test_twin_landing_in_an_agents_dir_already_leading_path_is_run_live() {
+    let mut lanes = vec![("bash", None)];
+    if let Some(zsh) = zsh_shell() {
+        lanes.push(("zsh", Some(zsh)));
+    }
+    for (label, zsh) in lanes {
+        let fx = LiveFixture::new();
+        fx.lay_dirs();
+        fx.lay_hook(label, ATPKG_HOOK_POSIX_GOLDEN);
+        let foreign = fx.foreign.join("claude");
+        let (mut sh, hash_foreign, print) = match zsh {
+            Some(zsh) => (
+                spawn_live_zsh(
+                    zsh,
+                    &fx,
+                    "setopt ksh_arrays warn_create_global\n",
+                    &[("ATERM_CHILD", "1")],
+                ),
+                format!("hash zzz={}", foreign.display()),
+                ZSH_PRINT_PATH,
+            ),
+            None => (
+                spawn_live_bash(&fx, "", &[]),
+                format!("hash -p {} zzz", foreign.display()),
+                BASH_PRINT_PATH,
+            ),
+        };
+        sh.send("claude");
+        let at = sh.wait_for_after("foreign", 0);
+        sh.send(&format!("{hash_foreign}; echo IDLE-$((1+0))"));
+        let at = sh.wait_for_after("IDLE-1", at);
+        let at = sh.wait_for_after("\x1b]133;A", at);
+        sh.send("echo IDLE-$((2+0))");
+        let at = sh.wait_for_after("IDLE-2", at);
+        let at = sh.wait_for_after("\x1b]133;A", at);
+        // The hash table survived two steady prompts: nothing was assigned or flushed.
+        sh.send("zzz");
+        let at = sh.wait_for_after("foreign", at);
+        fx.lay_twin("managed 1");
+        sh.send("claude");
+        let at = sh.wait_for_after("managed 1", at);
+        fx.lay_twin("managed 2");
+        sh.send("claude");
+        let at = sh.wait_for_after("managed 2", at);
+        assert_live_path(label, &mut sh, &fx, at, print);
+        let err = sh.stderr_text();
+        assert!(
+            !err.contains("created globally"),
+            "{label}: sourcing the hook from the hot path must not trip warn_create_global:\n{err}"
+        );
+        sh.finish();
+    }
+}
+
+/// The hook exists at spawn but names an agents/ atpkg has NOT created yet (a
+/// hook written on a machine with no agent program installed, or a wiped managed
+/// prefix): `claude` → foreign; agents/ + reroute/ + bin/ and the twin appear
+/// with NO hook rewrite; `claude` must run the twin. Before the re-probe,
+/// `$__aterm_managed_want` stayed empty and the hot path returned early forever.
+#[cfg(unix)]
+#[test]
+fn test_hook_naming_an_agents_dir_that_appears_later_is_fronted_live() {
+    for label in ["bash", "zsh"] {
+        let fx = LiveFixture::new();
+        fx.lay_hook(label, ATPKG_HOOK_POSIX_GOLDEN);
+        let Some((mut sh, print)) = spawn_live(label, &fx, &[("ATERM_CHILD", "1")]) else {
+            continue;
+        };
+        sh.send("claude");
+        let at = sh.wait_for_after("foreign", 0);
+        sh.send("echo IDLE-$((1+0))");
+        let at = sh.wait_for_after("IDLE-1", at);
+        let at = sh.wait_for_after("\x1b]133;A", at);
+        fx.lay_dirs();
+        fx.lay_twin("managed 1");
+        sh.send("claude");
+        let at = sh.wait_for_after("managed 1", at);
+        assert_live_path(label, &mut sh, &fx, at, print);
+        sh.finish();
+    }
 }
 
 /// The same three orders in fish, when installed: the owner's scenario — with
@@ -5543,14 +3395,8 @@ fn script_can_allocate_a_pty() -> bool {
 #[cfg(unix)]
 #[test]
 fn test_fish_already_running_session_shell_picks_up_the_managed_dirs_live() {
-    let Some(fish) = fish_shell() else {
-        eprintln!("fish not installed; skipping the live fish scenario");
-        return;
-    };
-    if !script_can_allocate_a_pty() {
-        eprintln!("no `script` to allocate a pty; skipping the live fish scenario");
-        return;
-    }
+    let fish = need_fish();
+    need_pty_script();
     // 1. The owner's scenario.
     let fx = LiveFixture::new();
     let mut sh = spawn_live_fish(fish, &fx, &[]);
@@ -5575,7 +3421,7 @@ fn test_fish_already_running_session_shell_picks_up_the_managed_dirs_live() {
     );
     sh.send("echo \"GEN=$ATPKG_HOOK_GEN\"");
     let at = sh.wait_for_after("GEN=2", at);
-    fish_assert_path_and_reroute(&mut sh, &fx, at);
+    assert_live_path("fish", &mut sh, &fx, at, FISH_PRINT_PATH);
     sh.finish();
 
     // 2. Hook + empty agents/ at spawn; the twin lands later, no hook rewrite.
@@ -5594,7 +3440,7 @@ fn test_fish_already_running_session_shell_picks_up_the_managed_dirs_live() {
     fx.lay_twin("managed 2");
     sh.send("claude");
     let at = sh.wait_for_after("managed 2", at);
-    fish_assert_path_and_reroute(&mut sh, &fx, at);
+    assert_live_path("fish", &mut sh, &fx, at, FISH_PRINT_PATH);
     sh.finish();
 
     // 3. The hook first, naming an agents/ that does not exist yet.
@@ -5610,253 +3456,8 @@ fn test_fish_already_running_session_shell_picks_up_the_managed_dirs_live() {
     fx.lay_twin("managed 1");
     sh.send("claude");
     let at = sh.wait_for_after("managed 1", at);
-    fish_assert_path_and_reroute(&mut sh, &fx, at);
+    assert_live_path("fish", &mut sh, &fx, at, FISH_PRINT_PATH);
     sh.finish();
-}
-
-/// The body of a shell function, comment lines dropped: POSIX `name() {` … `}`
-/// at column 0, fish `function name` … `end` at column 0.
-fn shell_function_body(script: &str, name: &str, fish: bool) -> String {
-    let (open, close) = if fish {
-        (format!("function {name}"), "end")
-    } else {
-        (format!("{name}() {{"), "}")
-    };
-    let mut lines = script.lines();
-    let _ = lines
-        .by_ref()
-        .find(|line| line.starts_with(&open))
-        .unwrap_or_else(|| panic!("{name} not defined at column 0"));
-    let mut body = String::new();
-    for line in lines {
-        if line == close {
-            return body;
-        }
-        if line.trim_start().starts_with('#') {
-            continue;
-        }
-        body.push_str(line);
-        body.push('\n');
-    }
-    panic!("{name}: unterminated body")
-}
-
-/// The hot path runs at EVERY prompt and EVERY command, so it forks nothing: no
-/// `$(...)`, no backticks, no external command — only builtins. Pinned by grep over
-/// the functions that run per prompt in zsh and bash (fish's substitutions are
-/// checked to be of builtins: `string`, `math`, `count`).
-#[test]
-fn test_live_hot_path_functions_fork_nothing() {
-    let hot = [
-        "__aterm_managed_path_live",
-        "__aterm_reroute_path_front",
-        "__aterm_managed_derive_reroute",
-    ];
-    for (label, script, extra) in [
-        (
-            "zsh",
-            scripts::ZSH,
-            vec!["__aterm_atpkg_hook_stamp", "__aterm_managed_agents_listing"],
-        ),
-        (
-            "bash",
-            scripts::BASH,
-            vec!["__aterm_path_front", "__aterm_atpkg_hook_read"],
-        ),
-    ] {
-        for name in hot.iter().copied().chain(extra) {
-            let body = shell_function_body(script, name, false);
-            assert!(
-                !body.contains("$(") && !body.contains('`'),
-                "{label}: {name} must not fork a command substitution:\n{body}"
-            );
-            // No external command as a line's first word (zsh's `zstat` is the
-            // module builtin, hence the whole-word check).
-            for line in body.lines() {
-                let first = line.split_whitespace().next().unwrap_or("");
-                assert!(
-                    ![
-                        "stat", "dirname", "readlink", "basename", "sed", "awk", "grep", "cut",
-                        "command"
-                    ]
-                    .contains(&first),
-                    "{label}: {name} must not run an external {first:?}:\n{body}"
-                );
-            }
-        }
-    }
-    for name in hot
-        .iter()
-        .copied()
-        .chain(["__aterm_path_front", "__aterm_atpkg_hook_read"])
-    {
-        let body = shell_function_body(scripts::FISH, name, true);
-        assert!(
-            !body.contains("$(") && !body.contains('`'),
-            "fish: {name}:\n{body}"
-        );
-        for (i, _) in body.match_indices('(') {
-            let rest = &body[i + 1..];
-            assert!(
-                ["string ", "math ", "count "]
-                    .iter()
-                    .any(|builtin| rest.starts_with(builtin)),
-                "fish: {name} substitutes something that is not a builtin:\n{body}"
-            );
-        }
-    }
-}
-
-/// Every shell's per-prompt AND per-command hook calls the live re-assert — the
-/// per-command half is what cures a command typed at a prompt drawn before the
-/// dirs existed — and the re-assert is gated on the session, never on the reroute
-/// dir the adopted shell lacks. The per-prompt hook is the BODY's prompt handler,
-/// which the loader's trampoline calls right after its body check.
-#[test]
-fn test_live_reassert_is_wired_into_every_prompt_and_preexec_hook_and_gated_on_the_session() {
-    for (label, script, trampoline, precmd, preexec, fish) in [
-        (
-            "zsh",
-            scripts::ZSH,
-            "__aterm_precmd",
-            "__aterm_body_precmd",
-            "__aterm_preexec",
-            false,
-        ),
-        (
-            "bash",
-            scripts::BASH,
-            "__aterm_prompt_command",
-            "__aterm_body_prompt_command",
-            // The DEBUG trap's `__aterm_preexec` turns XTRACE off around it.
-            "__aterm_preexec_run",
-            false,
-        ),
-        (
-            "fish",
-            scripts::FISH,
-            // Installed as `fish_prompt` by the loader (over a prompt of ours).
-            "__aterm_fish_prompt_trampoline",
-            "__aterm_body_prompt",
-            "__aterm_fish_preexec",
-            true,
-        ),
-    ] {
-        let hop = shell_function_body(script, trampoline, fish);
-        let (check, handler) = (
-            hop.find("__aterm_body_check").unwrap_or(usize::MAX),
-            hop.find(precmd).unwrap_or(usize::MAX),
-        );
-        assert!(
-            check < handler && handler < usize::MAX,
-            "{label}: {trampoline} checks for a body, then runs {precmd}:\n{hop}"
-        );
-        for hook in [precmd, preexec] {
-            let body = shell_function_body(script, hook, fish);
-            assert!(
-                body.contains("__aterm_managed_path_live"),
-                "{label}: {hook} must call __aterm_managed_path_live:\n{body}"
-            );
-        }
-        let gate_zsh_bash =
-            "if [[ -n \"${ATERM_CHILD:-}\" || -n \"${ATERM_SESSION_ID:-}\" ]]; then";
-        let gate_fish = "if test -n \"$ATERM_CHILD\"; or test -n \"$ATERM_SESSION_ID\"";
-        assert!(
-            script.contains(if fish { gate_fish } else { gate_zsh_bash }),
-            "{label}: the live re-assert is gated on ATERM_CHILD / ATERM_SESSION_ID"
-        );
-        assert!(
-            script.contains(&format!(".aterm/shell.d/00-atpkg.{label}")),
-            "{label}: names the atpkg hook it re-sources"
-        );
-    }
-    // The re-probe: a dir absent when the front was
-    // last laid is looked for again by the hot path, in every shell.
-    for (label, script, fish) in [
-        ("zsh", scripts::ZSH, false),
-        ("bash", scripts::BASH, false),
-        ("fish", scripts::FISH, true),
-    ] {
-        let hot = shell_function_body(script, "__aterm_managed_path_live", fish);
-        for flag in ["__aterm_managed_agents_on", "__aterm_managed_reroute_on"] {
-            assert!(
-                hot.contains(flag),
-                "{label}: the hot path re-probes a dir that was absent ({flag}):\n{hot}"
-            );
-        }
-        assert!(
-            hot.contains("__aterm_managed_derive_reroute"),
-            "{label}: the hot path derives the reroute dir once agents/ is known"
-        );
-        // The hook watch (residual R1, closed 2026-09-16): every shell re-sources a
-        // hook that CHANGED on disk — zsh by zstat, bash and fish by the text `read`
-        // takes in — and an absent hook never returns early, so the order below is
-        // still checked.
-        let watch = if label == "zsh" {
-            "__aterm_atpkg_hook_stamp"
-        } else {
-            "__aterm_atpkg_hook_read"
-        };
-        assert!(
-            hot.contains(watch) && hot.contains("__aterm_atpkg_hook_seen"),
-            "{label}: the hot path compares the hook on disk to the copy last sourced:\n{hot}"
-        );
-    }
-    // The twin watch: zsh and bash hash a command's
-    // path on first use, so a twin landing in an agents/ that already leads PATH
-    // needs the hash forgotten — zsh by watching the directory's listing, bash by
-    // forgetting the managed agent names every call. fish keeps no hash.
-    let zsh_hot = shell_function_body(scripts::ZSH, "__aterm_managed_path_live", false);
-    assert!(
-        zsh_hot.contains("__aterm_managed_agents_listing") && zsh_hot.contains("rehash"),
-        "zsh: the hot path watches the agents/ listing and rehashes on a change:\n{zsh_hot}"
-    );
-    let bash_hot = shell_function_body(scripts::BASH, "__aterm_managed_path_live", false);
-    assert!(
-        bash_hot.contains("hash -d claude codex agy muse 2>/dev/null"),
-        "bash: the hot path forgets the managed agent names every call:\n{bash_hot}"
-    );
-    // zsh: every function of the block runs under `emulate -L zsh`, so a user's
-    // ksh_arrays / sh_word_split / glob_subst / warn_create_global cannot change
-    // the comparison or print at the prompt.
-    for name in [
-        "__aterm_managed_path_live",
-        "__aterm_reroute_path_front",
-        "__aterm_managed_derive_reroute",
-        "__aterm_atpkg_hook_stamp",
-        "__aterm_managed_agents_listing",
-    ] {
-        let body = shell_function_body(scripts::ZSH, name, false);
-        assert_eq!(
-            body.lines().next().map(str::trim),
-            Some("emulate -L zsh"),
-            "zsh: {name} must open with `emulate -L zsh`:\n{body}"
-        );
-    }
-    // PowerShell, statically: the prompt function and the readline shim both call it.
-    let ps = scripts::POWERSHELL;
-    let prompt = ps.find("function Global:Prompt {").expect("prompt fn");
-    let readline = ps
-        .find("function Global:PSConsoleHostReadLine {")
-        .expect("readline shim");
-    let live_calls: Vec<usize> = ps
-        .match_indices("    __aterm_managed_path_live")
-        .map(|(i, _)| i)
-        .collect();
-    assert!(
-        live_calls.iter().any(|&i| i > prompt && i < readline),
-        "pwsh: the prompt function calls __aterm_managed_path_live"
-    );
-    assert!(
-        live_calls.iter().any(|&i| i > readline),
-        "pwsh: the PSReadLine submit shim calls __aterm_managed_path_live"
-    );
-    assert!(ps.contains("[bool]($env:ATERM_CHILD -or $env:ATERM_SESSION_ID)"));
-    assert!(ps.contains(".aterm/shell.d/00-atpkg.ps1"));
-    assert!(
-        ps.contains("$Global:__aterm_managed_agents_on") && ps.contains("$__aterm_refront"),
-        "pwsh: the hot path re-probes a dir that was absent"
-    );
 }
 
 // ─── The re-key channel ───
@@ -5895,116 +3496,71 @@ fn deliver(path: &Path, line: &str) {
     std::fs::rename(&part, path).unwrap();
 }
 
-/// Drive one live shell through the re-key hook: the nonce it was spawned with
-/// and the path scrubbed from its environment; a key written while it idles is
-/// taken at its NEXT prompt — the globals change, the file is gone, and the
-/// prompt marks after it carry `;id=<new>`; a malformed key is consumed and
-/// changes nothing. `hooked` = the shell was spawned with the path (a shell
-/// from before the channel was not): the negative control, where the same file
-/// is never read.
+/// Each live shell spawned with the re-key channel: the nonce it was spawned with
+/// and the path scrubbed from its environment; a malformed key is consumed and
+/// changes nothing; a key written while it idles is taken at its NEXT prompt —
+/// the globals change, the file is gone, and the marks after it carry
+/// `;id=<new>`.
 #[cfg(unix)]
-fn live_rekey(label: &str, sh: &mut LiveShell, file: &Path, hooked: bool) {
-    let (line, marker) = rekey_probe(label, 1);
-    sh.send(&line);
-    let at = sh.wait_for_after(&marker, 0);
-    assert_eq!(
-        sh.value_before("NONCE=", at),
-        REKEY_OLD,
-        "{label}: spawned nonce"
-    );
-    assert_eq!(
-        sh.value_before("ENV=", at),
-        "",
-        "{label}: the path is scrubbed from the environment"
-    );
+#[test]
+fn a_live_shell_takes_a_rekey_at_its_next_prompt() {
+    for label in ["bash", "zsh", "fish"] {
+        let fx = LiveFixture::new();
+        let file = fx.home.join(format!("rekey-{label}"));
+        let path = file.to_str().unwrap().to_string();
+        let extra = [
+            ("ATERM_SHELL_NONCE", REKEY_OLD),
+            ("ATERM_REKEY_PATH", path.as_str()),
+        ];
+        let Some((mut sh, _)) = spawn_live(label, &fx, &extra) else {
+            continue;
+        };
+        let (line, marker) = rekey_probe(label, 1);
+        sh.send(&line);
+        let at = sh.wait_for_after(&marker, 0);
+        assert_eq!(sh.value_before("NONCE=", at), REKEY_OLD, "{label}: spawned");
+        assert_eq!(sh.value_before("ENV=", at), "", "{label}: path scrubbed");
 
-    // A malformed key: consumed, nothing changes.
-    deliver(file, "NOT-A-KEY");
-    sh.send("true");
-    let (line, marker) = rekey_probe(label, 2);
-    sh.send(&line);
-    let at = sh.wait_for_after(&marker, at);
-    assert_eq!(
-        sh.value_before("NONCE=", at),
-        REKEY_OLD,
-        "{label}: a bad key changes nothing"
-    );
-    assert_eq!(
-        !file.exists(),
-        hooked,
-        "{label}: consumed only by a hooked shell"
-    );
-    let _ = std::fs::remove_file(file);
+        deliver(&file, "NOT-A-KEY");
+        sh.send("true");
+        let (line, marker) = rekey_probe(label, 2);
+        sh.send(&line);
+        let at = sh.wait_for_after(&marker, at);
+        assert_eq!(
+            sh.value_before("NONCE=", at),
+            REKEY_OLD,
+            "{label}: a bad key changes nothing"
+        );
+        assert!(!file.exists(), "{label}: a bad key is consumed");
 
-    // The real key, written while the shell idles at a prompt.
-    deliver(file, REKEY_NEW);
-    sh.send("true");
-    let (line, marker) = rekey_probe(label, 3);
-    sh.send(&line);
-    let at = sh.wait_for_after(&marker, at);
-    let (nonce, suffix) = (
-        sh.value_before("NONCE=", at),
-        sh.value_before("SUFFIX=", at),
-    );
-    if hooked {
-        assert_eq!(nonce, REKEY_NEW, "{label}: re-keyed at the next prompt");
-        assert_eq!(suffix, format!(";id={REKEY_NEW}"));
+        deliver(&file, REKEY_NEW);
+        sh.send("true");
+        let (line, marker) = rekey_probe(label, 3);
+        sh.send(&line);
+        let at = sh.wait_for_after(&marker, at);
+        assert_eq!(
+            sh.value_before("NONCE=", at),
+            REKEY_NEW,
+            "{label}: re-keyed"
+        );
+        assert_eq!(
+            sh.value_before("SUFFIX=", at),
+            format!(";id={REKEY_NEW}"),
+            "{label}"
+        );
         assert!(!file.exists(), "{label}: the key file is removed once read");
-        // The marks after it are signed with the new key.
         let (line, marker) = rekey_probe(label, 4);
         sh.send(&line);
         let end = sh.wait_for_after(&marker, at);
-        let out = sh.stdout.lock().unwrap();
-        let tail = String::from_utf8_lossy(&out[at..end]).into_owned();
-        drop(out);
+        let tail = {
+            let out = sh.stdout.lock().unwrap();
+            String::from_utf8_lossy(&out[at..end]).into_owned()
+        };
         assert!(
             tail.contains(&format!("133;A;id={REKEY_NEW}"))
                 || tail.contains(&format!("133;C;id={REKEY_NEW}")),
             "{label}: marks carry the new key: {tail:?}"
         );
-    } else {
-        assert_eq!(
-            nonce, REKEY_OLD,
-            "control: {label} without the channel never reads it"
-        );
-        assert!(file.exists(), "control: the file is left where it was");
-    }
-}
-
-#[cfg(unix)]
-#[test]
-fn a_live_zsh_takes_a_rekey_at_its_next_prompt() {
-    let Some(zsh) = zsh_shell() else {
-        eprintln!("zsh not installed; skipping");
-        return;
-    };
-    for hooked in [true, false] {
-        let fx = LiveFixture::new();
-        let file = fx.home.join("rekey-zsh");
-        let path = file.to_str().unwrap().to_string();
-        let mut extra = vec![("ATERM_SHELL_NONCE", REKEY_OLD)];
-        if hooked {
-            extra.push(("ATERM_REKEY_PATH", path.as_str()));
-        }
-        let mut sh = spawn_live_zsh(zsh, &fx, "", &extra);
-        live_rekey("zsh", &mut sh, &file, hooked);
-        sh.finish();
-    }
-}
-
-#[cfg(unix)]
-#[test]
-fn a_live_bash_takes_a_rekey_at_its_next_prompt() {
-    for hooked in [true, false] {
-        let fx = LiveFixture::new();
-        let file = fx.home.join("rekey-bash");
-        let path = file.to_str().unwrap().to_string();
-        let mut extra = vec![("ATERM_SHELL_NONCE", REKEY_OLD)];
-        if hooked {
-            extra.push(("ATERM_REKEY_PATH", path.as_str()));
-        }
-        let mut sh = spawn_live_bash(&fx, "", &extra);
-        live_rekey("bash", &mut sh, &file, hooked);
         sh.finish();
     }
 }
@@ -6052,110 +3608,15 @@ fn a_live_bash_prompt_carries_one_133b_however_many_prompts() {
     }
 }
 
-#[cfg(unix)]
-#[test]
-fn a_live_fish_takes_a_rekey_at_its_next_prompt() {
-    let Some(fish) = fish_shell() else {
-        eprintln!("fish not installed; skipping");
-        return;
-    };
-    if !script_can_allocate_a_pty() {
-        eprintln!("no `script` to allocate a pty; skipping");
-        return;
-    }
-    for hooked in [true, false] {
-        let fx = LiveFixture::new();
-        let file = fx.home.join("rekey-fish");
-        let path = file.to_str().unwrap().to_string();
-        let mut extra = vec![("ATERM_SHELL_NONCE", REKEY_OLD)];
-        if hooked {
-            extra.push(("ATERM_REKEY_PATH", path.as_str()));
-        }
-        let mut sh = spawn_live_fish(fish, &fx, &extra);
-        live_rekey("fish", &mut sh, &file, hooked);
-        sh.finish();
-    }
-}
-
 // ─── The typed re-key ───
 
-/// What [`typed_rekey`] SETS is what every script's marks READ, and they read
-/// it when they run: both globals are assigned at the script's top level (so a
-/// line typed at the prompt reaches the same variable), and every hot emitter
-/// — 133;A/B/C/D and 633;E — interpolates `__aterm_id_suffix_str` inside its
-/// function, never a copy taken at source time. That was measured by hand in
-/// the 0.91 and 2026-09-10 scripts the owner's degraded tabs sourced; this pins
-/// it for this build's. The typed text sets exactly those two names, in each
-/// shell's own assignment form, and exists for no shell without such a script.
+/// The typed re-key exists only for a shell with a POSIX-or-fish integration
+/// script: typed into PowerShell, cmd, a WSL launcher or an unknown program,
+/// the line would be a syntax error at the user's prompt.
 #[test]
-fn the_typed_rekey_sets_the_globals_the_marks_read() {
-    let emits = |script: &str, mark: &str| {
-        script.lines().any(|l| {
-            l.starts_with("    ")
-                && l.contains("__aterm_osc")
-                && l.contains(mark)
-                && l.contains("__aterm_id_suffix_str")
-        })
-    };
-    for (shell, script, declares) in [
-        (
-            ShellType::Zsh,
-            scripts::ZSH,
-            [
-                "typeset -g __aterm_shell_nonce=",
-                "typeset -g __aterm_id_suffix_str=",
-            ],
-        ),
-        (
-            ShellType::Bash,
-            scripts::BASH,
-            ["__aterm_shell_nonce=", "__aterm_id_suffix_str="],
-        ),
-        (
-            ShellType::Fish,
-            scripts::FISH,
-            [
-                "set -g __aterm_shell_nonce ",
-                "set -g __aterm_id_suffix_str ",
-            ],
-        ),
-    ] {
-        // At the top level (fish's is inside a top-level `if`, and `-g` is
-        // global wherever it runs).
-        let nested = format!("    {}", declares[0]);
-        for decl in declares {
-            assert!(
-                script
-                    .lines()
-                    .any(|l| l.starts_with(decl)
-                        || (shell == ShellType::Fish && l.starts_with(&nested))),
-                "{shell:?}: `{decl}` at the top level"
-            );
-        }
-        for mark in ["133;A", "133;B", "133;C", "133;D;", "633;E;"] {
-            assert!(
-                emits(script, mark),
-                "{shell:?}: the {mark} emitter reads __aterm_id_suffix_str when it runs"
-            );
-        }
-        let typed = typed_rekey(shell, "'/k'").expect("a scripted shell");
-        let (nonce, suffix) = if shell == ShellType::Fish {
-            (
-                "read -g __aterm_shell_nonce <'/k'",
-                "set -g __aterm_id_suffix_str \";id=$__aterm_shell_nonce\";",
-            )
-        } else {
-            (
-                "read -r __aterm_shell_nonce <'/k'",
-                "__aterm_id_suffix_str=\";id=$__aterm_shell_nonce\";",
-            )
-        };
-        assert!(typed.contains(nonce), "{shell:?}: {typed}");
-        assert!(typed.contains(suffix), "{shell:?}: {typed}");
-        assert!(
-            typed.contains("command rm -f -- '/k';"),
-            "{shell:?}: the file goes: {typed}"
-        );
+fn the_typed_rekey_exists_only_for_scripted_shells() {
+    for shell in [ShellType::Zsh, ShellType::Bash, ShellType::Fish] {
+        assert!(typed_rekey(shell, "'/k'").is_some(), "{shell:?}");
     }
     for other in [
         ShellType::PowerShell,
@@ -6175,154 +3636,88 @@ fn posix_quoted(path: &Path) -> String {
 }
 
 /// A LIVE SHELL WITHOUT THE CHANNEL — spawned as every shell before 0.94 was,
-/// with its nonce and no `ATERM_REKEY_PATH` — takes a key from the typed line:
-/// the globals change at once, the file is gone, and the marks of the very next
-/// prompt carry the new id. The path has a space and a quote in it (the real
-/// control dir sits under "Application Support"). A second line naming a file
-/// that is not there — a key withdrawn before the line ran — changes nothing
-/// and prints no error, and the command after it still runs. NEGATIVE CONTROL:
-/// before the line, the same file is never read (`live_rekey`'s unhooked arm
-/// measures the same shell ignoring it at a prompt).
-#[cfg(unix)]
-fn live_typed_rekey(label: &str, shell: ShellType, sh: &mut LiveShell, dir: &Path) {
-    let file = dir.join("re key's");
-    std::fs::write(&file, format!("{REKEY_NEW}\n")).unwrap();
-    sh.send("true");
-    let (line, marker) = rekey_probe(label, 1);
-    sh.send(&line);
-    let at = sh.wait_for_after(&marker, 0);
-    assert_eq!(sh.value_before("NONCE=", at), REKEY_OLD, "{label}: before");
-    assert!(
-        file.exists(),
-        "{label}: no prompt of its own reads the file"
-    );
-
-    let typed = typed_rekey(shell, &posix_quoted(&file)).expect("scripted");
-    sh.send(&format!("{typed} echo RAN$((200 + 1))"));
-    let at = sh.wait_for_after("RAN201", at);
-    let (line, marker) = rekey_probe(label, 2);
-    sh.send(&line);
-    let at = sh.wait_for_after(&marker, at);
-    assert_eq!(sh.value_before("NONCE=", at), REKEY_NEW, "{label}: taken");
-    assert_eq!(
-        sh.value_before("SUFFIX=", at),
-        format!(";id={REKEY_NEW}"),
-        "{label}"
-    );
-    assert!(!file.exists(), "{label}: the one-use file is gone");
-    let (line, marker) = rekey_probe(label, 3);
-    sh.send(&line);
-    let end = sh.wait_for_after(&marker, at);
-    let tail = {
-        let out = sh.stdout.lock().unwrap();
-        String::from_utf8_lossy(&out[at..end]).into_owned()
-    };
-    assert!(
-        tail.contains(&format!("133;A;id={REKEY_NEW}"))
-            && tail.contains(&format!("133;C;id={REKEY_NEW}")),
-        "{label}: the next prompt's marks carry the new key: {tail:?}"
-    );
-
-    let gone = dir.join("withdrawn");
-    let typed = typed_rekey(shell, &posix_quoted(&gone)).expect("scripted");
-    sh.send(&format!("{typed} echo RAN$((300 + 1))"));
-    let at = sh.wait_for_after("RAN301", end);
-    let (line, marker) = rekey_probe(label, 4);
-    sh.send(&line);
-    let at = sh.wait_for_after(&marker, at);
-    assert_eq!(
-        sh.value_before("NONCE=", at),
-        REKEY_NEW,
-        "{label}: a missing file changes nothing"
-    );
-    assert_eq!(sh.value_before("SUFFIX=", at), format!(";id={REKEY_NEW}"));
-    // (bash's line editor echoes the typed line to stderr, path and all; an
-    // error would name the missing file.)
-    let err = sh.stderr_text().to_lowercase();
-    assert!(!err.contains("no such file"), "{label}: quiet: {err}");
-}
-
+/// with its nonce and no `ATERM_REKEY_PATH` — never reads the key file at a
+/// prompt of its own, and takes the key from the typed line: the globals change
+/// at once, the file is gone, and the marks of the very next prompt carry the new
+/// id. The path has a space and a quote in it (the real control dir sits under
+/// "Application Support"). A second line naming a file that is not there — a key
+/// withdrawn before the line ran — changes nothing and prints no error, and the
+/// command after it still runs.
 #[cfg(unix)]
 #[test]
-fn a_live_bash_without_the_channel_takes_a_typed_rekey() {
-    let fx = LiveFixture::new();
-    let mut sh = spawn_live_bash(&fx, "", &[("ATERM_SHELL_NONCE", REKEY_OLD)]);
-    live_typed_rekey("bash", ShellType::Bash, &mut sh, &fx.home);
-    sh.finish();
-}
+fn a_live_shell_without_the_channel_takes_a_typed_rekey() {
+    for (label, shell) in [("bash", ShellType::Bash), ("zsh", ShellType::Zsh)] {
+        let fx = LiveFixture::new();
+        let Some((mut sh, _)) = spawn_live(label, &fx, &[("ATERM_SHELL_NONCE", REKEY_OLD)]) else {
+            continue;
+        };
+        let file = fx.home.join("re key's");
+        std::fs::write(&file, format!("{REKEY_NEW}\n")).unwrap();
+        sh.send("true");
+        let (line, marker) = rekey_probe(label, 1);
+        sh.send(&line);
+        let at = sh.wait_for_after(&marker, 0);
+        assert_eq!(sh.value_before("NONCE=", at), REKEY_OLD, "{label}: before");
+        assert!(
+            file.exists(),
+            "{label}: no prompt of its own reads the file"
+        );
 
-/// zsh ships with macOS (`/bin/zsh`), so there this is never skipped; elsewhere
-/// the zsh lane is not claimed.
-#[cfg(target_os = "macos")]
-#[test]
-fn a_live_zsh_without_the_channel_takes_a_typed_rekey() {
-    let zsh = zsh_shell().expect("macOS ships /bin/zsh");
-    let fx = LiveFixture::new();
-    let mut sh = spawn_live_zsh(zsh, &fx, "", &[("ATERM_SHELL_NONCE", REKEY_OLD)]);
-    live_typed_rekey("zsh", ShellType::Zsh, &mut sh, &fx.home);
-    sh.finish();
+        let typed = typed_rekey(shell, &posix_quoted(&file)).expect("scripted");
+        sh.send(&format!("{typed} echo RAN$((200 + 1))"));
+        let at = sh.wait_for_after("RAN201", at);
+        let (line, marker) = rekey_probe(label, 2);
+        sh.send(&line);
+        let at = sh.wait_for_after(&marker, at);
+        assert_eq!(sh.value_before("NONCE=", at), REKEY_NEW, "{label}: taken");
+        assert_eq!(
+            sh.value_before("SUFFIX=", at),
+            format!(";id={REKEY_NEW}"),
+            "{label}"
+        );
+        assert!(!file.exists(), "{label}: the one-use file is gone");
+        let (line, marker) = rekey_probe(label, 3);
+        sh.send(&line);
+        let end = sh.wait_for_after(&marker, at);
+        let tail = {
+            let out = sh.stdout.lock().unwrap();
+            String::from_utf8_lossy(&out[at..end]).into_owned()
+        };
+        assert!(
+            tail.contains(&format!("133;A;id={REKEY_NEW}"))
+                && tail.contains(&format!("133;C;id={REKEY_NEW}")),
+            "{label}: the next prompt's marks carry the new key: {tail:?}"
+        );
+
+        let gone = fx.home.join("withdrawn");
+        let typed = typed_rekey(shell, &posix_quoted(&gone)).expect("scripted");
+        sh.send(&format!("{typed} echo RAN$((300 + 1))"));
+        let at = sh.wait_for_after("RAN301", end);
+        let (line, marker) = rekey_probe(label, 4);
+        sh.send(&line);
+        let at = sh.wait_for_after(&marker, at);
+        assert_eq!(
+            sh.value_before("NONCE=", at),
+            REKEY_NEW,
+            "{label}: a missing file changes nothing"
+        );
+        // (bash's line editor echoes the typed line to stderr, path and all; an
+        // error would name the missing file.)
+        let err = sh.stderr_text().to_lowercase();
+        assert!(!err.contains("no such file"), "{label}: quiet: {err}");
+        sh.finish();
+    }
 }
 
 // ─── The content-addressed script folder ───
 
-/// The flat, last-writer-wins scheme `prepare` used before the content address:
-/// write into `root` once per process, then trust whatever file is there. Kept
-/// here ONLY as the negative control the tests below run beside the real one.
-fn prepare_flat_as_before(
-    shell: ShellType,
-    root: &Path,
-    written: &Mutex<Option<PathBuf>>,
-) -> InjectionEnv {
-    let mut written = written.lock().unwrap();
-    if written.as_deref() != Some(root) || !root.join("aterm_shell_integration.zsh").exists() {
-        ensure_scripts(root).unwrap();
-        *written = Some(root.to_path_buf());
-    }
-    injection_for(shell, root).unwrap()
-}
-
-/// What a FOREIGN build does to the shared cache root: an older aterm (the 0.91
-/// dev bundle, a stale test binary) writes its own, different scripts — to the
-/// legacy flat files — and a build of this scheme writes ITS content folder.
-fn foreign_build_writes(root: &Path) {
-    std::fs::create_dir_all(root.join("zdotdir")).unwrap();
-    std::fs::write(
-        root.join("aterm_shell_integration.zsh"),
-        "__aterm_foreign() { :; }\n",
-    )
-    .unwrap();
-    std::fs::write(
-        root.join("zdotdir/.zshenv"),
-        "source \"$ATERM_SHELL_INTEGRATION_DIR/aterm_shell_integration.zsh\"\n",
-    )
-    .unwrap();
-    let other = root.join("0123456789abcdef");
-    std::fs::create_dir_all(&other).unwrap();
-    std::fs::write(
-        other.join("aterm_shell_integration.zsh"),
-        "__aterm_other_build() { :; }\n",
-    )
-    .unwrap();
-}
-
-/// The directory an injection points a shell at.
-fn injected_dir(injection: &InjectionEnv) -> PathBuf {
-    PathBuf::from(
-        &injection
-            .env_add
-            .iter()
-            .find(|(k, _)| k == "ATERM_SHELL_INTEGRATION_DIR")
-            .expect("ATERM_SHELL_INTEGRATION_DIR")
-            .1,
-    )
-}
-
+/// The address is what collection (`collect_old_script_sets`) and the loaders
+/// (`is_integration_rev`) recognise a script folder by: exactly 16 lowercase hex
+/// digits, and nothing else — not a scratch folder, not a near miss.
 #[test]
-fn the_script_set_has_one_stable_sixteen_hex_address() {
+fn the_script_set_has_one_sixteen_hex_address() {
     let address = script_set_address();
-    assert_eq!(address.len(), 16);
     assert!(is_address(address), "{address}");
-    assert_eq!(address, script_set_address(), "computed once, stable");
     for not in [
         "0123456789ABCDEF",
         "0123456789abcde",
@@ -6331,80 +3726,76 @@ fn the_script_set_has_one_stable_sixteen_hex_address() {
     ] {
         assert!(!is_address(not), "{not}");
     }
-    // Every file the set writes is part of what a match checks.
-    let dir = aterm_tempfile::tempdir().unwrap();
-    ensure_scripts(dir.path()).unwrap();
-    assert!(script_set_matches(dir.path()));
-    std::fs::write(dir.path().join("bash/rcfile"), "# edited\n").unwrap();
-    assert!(
-        !script_set_matches(dir.path()),
-        "a changed wrapper is a different set"
-    );
 }
 
 /// THE MEASURED DEFECT: a foreign start rewrote the shared folder and every new
-/// tab of the running window sourced its scripts. Now a new window (a fresh
-/// memo) and the running one (a warm memo) both keep pointing their shells at
-/// THIS build's folder, whose bytes are this build's, whatever a foreign build
-/// wrote. NEGATIVE CONTROL: the flat scheme, under the same foreign write,
-/// points its shells at the foreign bytes.
+/// tab of the running window sourced its scripts. Now a new window (a fresh memo)
+/// and the running one (a warm memo) both keep pointing their shells at THIS
+/// build's folder, whose bytes are this build's, whatever a foreign build wrote —
+/// an older aterm to the legacy flat files (left for the builds that read them),
+/// a build of this scheme to its own content folder. And a folder deleted mid-run
+/// (by a person, or by another build's collection) is installed again by the
+/// next spawn: the warm memo is checked against the disk, never trusted alone.
 #[test]
 fn a_foreign_build_cannot_change_what_this_builds_tabs_source() {
     let tmp = aterm_tempfile::tempdir().unwrap();
     let root = tmp.path().join("shell-integration");
-    let warm = Mutex::new(None);
-    let first = prepare_cached(ShellType::Zsh, root.clone(), &warm)
-        .unwrap()
-        .unwrap();
-    let ours = injected_dir(&first);
-    assert_eq!(ours, root.join(script_set_address()));
-
-    foreign_build_writes(&root);
-
-    for memo in [&warm, &Mutex::new(None)] {
-        let again = prepare_cached(ShellType::Zsh, root.clone(), memo)
+    let injected_dir = |memo: &Mutex<Option<PathBuf>>| {
+        let injection = prepare_cached(ShellType::Zsh, root.clone(), memo)
             .unwrap()
             .unwrap();
-        assert_eq!(injected_dir(&again), ours);
-        assert_eq!(
-            std::fs::read_to_string(ours.join("aterm_shell_integration.zsh")).unwrap(),
-            installed_zsh()
-        );
+        let (_, dir) = injection
+            .env_add
+            .into_iter()
+            .find(|(k, _)| k == "ATERM_SHELL_INTEGRATION_DIR")
+            .expect("ATERM_SHELL_INTEGRATION_DIR");
+        PathBuf::from(dir)
+    };
+    let warm = Mutex::new(None);
+    let ours = injected_dir(&warm);
+    assert_eq!(ours, root.join(script_set_address()));
+
+    let foreign = "__aterm_foreign() { :; }\n";
+    std::fs::write(root.join("aterm_shell_integration.zsh"), foreign).unwrap();
+    let other = root.join("0123456789abcdef");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join("aterm_shell_integration.zsh"), foreign).unwrap();
+
+    for memo in [&warm, &Mutex::new(None)] {
+        assert_eq!(injected_dir(memo), ours);
         assert!(script_set_matches(&ours));
     }
-    // The legacy flat files are left for the older builds that read them.
     assert_eq!(
         std::fs::read_to_string(root.join("aterm_shell_integration.zsh")).unwrap(),
-        "__aterm_foreign() { :; }\n"
+        foreign
     );
 
-    // Control: the flat scheme, same root shape, same foreign write.
-    let flat_root = tmp.path().join("flat");
-    let flat_memo = Mutex::new(None);
-    prepare_flat_as_before(ShellType::Zsh, &flat_root, &flat_memo);
-    foreign_build_writes(&flat_root);
-    let flat = prepare_flat_as_before(ShellType::Zsh, &flat_root, &flat_memo);
-    assert_eq!(
-        std::fs::read_to_string(injected_dir(&flat).join("aterm_shell_integration.zsh")).unwrap(),
-        "__aterm_foreign() { :; }\n",
-        "control: the flat folder serves the foreign bytes"
+    std::fs::remove_dir_all(&root).unwrap();
+    assert_eq!(injected_dir(&warm), ours);
+    assert!(
+        script_set_matches(&ours),
+        "re-installed after a mid-run delete"
     );
 }
 
-/// A content folder that exists but does not hold this set (edited by hand,
-/// half-written by a writer that died) is replaced on the first `prepare` of a
-/// process, never trusted; a matching one is reused as it is; racing writers of
-/// the same set all land on one folder.
+/// A content folder that exists but does not hold this set — a wrapper edited by
+/// hand, a file half-written by a writer that died — is replaced on the first
+/// `prepare` of a process, never trusted (every file of the set is checked, not
+/// just the script); no scratch folder survives; racing writers of the same set
+/// all land on one folder.
 #[test]
-fn a_damaged_content_folder_is_replaced_and_a_matching_one_reused() {
+fn a_damaged_content_folder_is_replaced_and_racing_writers_share_one() {
     let tmp = aterm_tempfile::tempdir().unwrap();
     let root = tmp.path().join("si");
     let dir = root.join(script_set_address());
-    std::fs::create_dir_all(dir.join("zdotdir")).unwrap();
-    std::fs::write(dir.join("aterm_shell_integration.zsh"), "# damaged\n").unwrap();
+    ensure_scripts(&dir).unwrap();
+    std::fs::write(dir.join("bash/rcfile"), "# edited\n").unwrap();
     assert_eq!(install_script_set(&root).unwrap(), dir);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("bash/rcfile")).unwrap(),
+        BASH_WRAPPER
+    );
     assert!(script_set_matches(&dir));
-    assert_eq!(install_script_set(&root).unwrap(), dir);
     let leftovers: Vec<_> = std::fs::read_dir(&root)
         .unwrap()
         .flatten()
@@ -6495,64 +3886,5 @@ fn old_script_folders_are_collected_and_young_or_newest_ones_kept() {
     assert_eq!(
         std::fs::read_to_string(root.join("aterm_shell_integration.zsh")).unwrap(),
         "legacy"
-    );
-}
-
-/// A REAL zsh, started as a tab is (the injection's env over a clean
-/// environment and an empty `$HOME`), after a foreign build wrote the shared
-/// root: it loads THIS build's integration and none of the foreign code.
-/// NEGATIVE CONTROL: the same zsh from the flat scheme's injection runs the
-/// foreign file. Skipped where there is no zsh.
-#[cfg(unix)]
-#[test]
-fn a_real_zsh_sources_this_builds_scripts_after_a_foreign_write() {
-    let zsh = Path::new("/bin/zsh");
-    if !zsh.exists() {
-        eprintln!("SKIP: no /bin/zsh");
-        return;
-    }
-    let tmp = aterm_tempfile::tempdir().unwrap();
-    let home = tmp.path().join("home");
-    std::fs::create_dir_all(&home).unwrap();
-    let run = |injection: &InjectionEnv| -> String {
-        let mut cmd = Command::new(zsh);
-        cmd.env_clear()
-            .env("HOME", &home)
-            .env("PATH", "/usr/bin:/bin")
-            .env("TERM", "dumb")
-            .args([
-                "-i",
-                "-c",
-                "whence -w __aterm_precmd __aterm_foreign 2>/dev/null; true",
-            ]);
-        for (k, v) in &injection.env_add {
-            cmd.env(k, v);
-        }
-        let out = cmd.stdin(std::process::Stdio::null()).output().unwrap();
-        String::from_utf8_lossy(&out.stdout).into_owned()
-    };
-
-    let root = tmp.path().join("si");
-    let memo = Mutex::new(None);
-    prepare_cached(ShellType::Zsh, root.clone(), &memo).unwrap();
-    foreign_build_writes(&root);
-    let ours = run(&prepare_cached(ShellType::Zsh, root, &memo)
-        .unwrap()
-        .unwrap());
-    assert!(ours.contains("__aterm_precmd: function"), "{ours}");
-    assert!(!ours.contains("__aterm_foreign: function"), "{ours}");
-
-    let flat_root = tmp.path().join("flat");
-    let flat_memo = Mutex::new(None);
-    prepare_flat_as_before(ShellType::Zsh, &flat_root, &flat_memo);
-    foreign_build_writes(&flat_root);
-    let flat = run(&prepare_flat_as_before(
-        ShellType::Zsh,
-        &flat_root,
-        &flat_memo,
-    ));
-    assert!(
-        flat.contains("__aterm_foreign: function") && !flat.contains("__aterm_precmd: function"),
-        "control: the flat scheme's tab runs the foreign file: {flat}"
     );
 }

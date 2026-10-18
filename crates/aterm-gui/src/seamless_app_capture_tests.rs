@@ -547,10 +547,12 @@ fn set_chrome(app: &mut crate::App, wid: WindowId, font_px: u32) {
 }
 
 /// Case 0's window: a 99x338 grid at the park, with the band at
-/// `capture_band` rows. The 5K display's width at the first font the grid law
-/// gives 338 columns (24 px), and the height at which it gives 99 rows (the
-/// headless cell box, 15x28 px at 24 px, is not CoreText's, so the display's
-/// full-screen height alone gives 101).
+/// `capture_band` rows, on the 5K display at the largest font that fits that
+/// grid there: the display's own width where it gives 338 columns (24 px of the
+/// headless macOS cell box, 15x28 px, which is not CoreText's, so the display's
+/// full-screen height alone gives 101), else the narrowest window that does (a
+/// face whose cell is taller for its width, as Linux's bundled one is, fits 99
+/// rows of 338 columns only at a smaller font).
 fn field_report_window(
     app: &mut crate::App,
     wid: WindowId,
@@ -558,22 +560,30 @@ fn field_report_window(
 ) -> (u32, PhysicalSize<u32>) {
     let band = app.message_band_rows;
     app.message_band_rows = capture_band;
-    let width = DISPLAYS[2].0;
+    let (display_width, display_height) = DISPLAYS[2];
     let smallest = crate::FONT_PX_MIN as u32;
-    let font_px = (smallest..=48)
-        .find(|font_px| {
-            set_chrome(app, wid, *font_px);
-            app.grid_dims_for(wid, PhysicalSize::new(width, DISPLAYS[2].1))
-                .1
-                == 338
+    let found = (smallest..=48)
+        .rev()
+        .find_map(|font_px| {
+            set_chrome(app, wid, font_px);
+            let cols = |width| {
+                app.grid_dims_for(wid, PhysicalSize::new(width, display_height))
+                    .1
+            };
+            let width = if cols(display_width) == 338 {
+                display_width
+            } else {
+                (1..=display_width).find(|width| cols(*width) == 338)?
+            };
+            let height = (1..=display_height).find(|height| {
+                app.grid_dims_for(wid, PhysicalSize::new(width, *height)) == (99, 338)
+            })?;
+            Some((font_px, PhysicalSize::new(width, height)))
         })
-        .expect("PRECONDITION: some font makes the 5K display 338 columns");
-    set_chrome(app, wid, font_px);
-    let height = (1..=DISPLAYS[2].1)
-        .find(|height| app.grid_dims_for(wid, PhysicalSize::new(width, *height)) == (99, 338))
-        .expect("PRECONDITION: a 5K window height is 99 rows at that font");
+        .expect("PRECONDITION: some font makes a 99x338 window on the 5K display");
+    set_chrome(app, wid, found.0);
     app.message_band_rows = band;
-    (font_px, PhysicalSize::new(width, height))
+    found
 }
 
 /// The message band's committed rows move to `rows`, and every window re-grids

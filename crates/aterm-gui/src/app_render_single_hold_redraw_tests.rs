@@ -161,7 +161,6 @@ fn single_pane_glow_handoff_reuses_buffers_and_erases_on_disable() {
     let wid = WindowId(0);
     let mut app = lit_app();
     app.config.motion = Some("full".into());
-    app.config.stream_fade = Some(false);
     let (first_source, second_source) = {
         let ws = app.windows.get_mut(&wid).expect("scripted window");
         ws.focused = true;
@@ -331,7 +330,10 @@ fn a_predicted_frame_takes_one_terminal_lock_and_never_blanks_on_interleaved_ech
     );
 }
 
-fn arm_prediction(app: &mut crate::App, ch: char) {
+/// Type `ch` as a guess at the front terminal's cursor. Returns what a predictor
+/// holding only that guess hands over ([`crate::predict::Predictor::take_link_estimate`]):
+/// a link nothing has measured, owing that one keystroke's echo.
+fn arm_prediction(app: &mut crate::App, ch: char) -> crate::predict::LinkEstimate {
     let wid = WindowId(0);
     let term = app
         .front_terminal(wid)
@@ -347,9 +349,13 @@ fn arm_prediction(app: &mut crate::App, ch: char) {
             (term.cols(), term.rows()),
         )
     };
+    let born = std::time::Instant::now();
     let predictor = &mut app.windows.get_mut(&wid).unwrap().predictor;
     predictor.set_mode(crate::predict::PredictMode::Always);
-    assert!(predictor.predict_char_in_grid(ch, cursor, coords, grid, std::time::Instant::now()));
+    assert!(predictor.predict_char_in_grid(ch, cursor, coords, grid, born));
+    let mut unmeasured = crate::predict::Predictor::new(crate::predict::PredictMode::Always);
+    assert!(unmeasured.predict_char_in_grid(ch, cursor, coords, grid, born));
+    unmeasured.take_link_estimate()
 }
 
 #[test]
@@ -374,9 +380,8 @@ fn prediction_reconcile_confirms_rtl_echo_in_logical_columns() {
         "logical and visual columns differ"
     );
     assert!(ws.predictor.idle());
-    assert_ne!(
-        ws.predictor.take_link_estimate(),
-        Default::default(),
+    assert!(
+        ws.predictor.take_link_estimate().has_sample(),
         "a real RTL echo confirms the prediction and records its RTT"
     );
 }
@@ -389,14 +394,20 @@ fn prediction_reconcile_never_confirms_uncommitted_ime_text() {
     app.predict_mode_cache = None;
     feed(&app, b"$ ");
     app.redraw_window(wid);
-    arm_prediction(&mut app, 'k');
+    let unmeasured = arm_prediction(&mut app, 'k');
     app.on_ime_preedit(wid, "k".into(), Some((1, 1)));
     app.redraw_window(wid);
     let ws = app.windows.get_mut(&wid).unwrap();
     assert!(!ws.predictor.idle(), "IME preedit has not reached the PTY");
-    assert_eq!(
-        ws.predictor.take_link_estimate(),
-        Default::default(),
+    // The armed guess still owes its echo (custody, 90bb2dc9b7): taking the
+    // estimate retires it with that debt. What must not happen is a measurement.
+    let estimate = ws.predictor.take_link_estimate();
+    assert!(
+        !estimate.has_sample(),
         "host-painted composition must not count as an echo RTT sample"
+    );
+    assert_eq!(
+        estimate, unmeasured,
+        "nothing past the pending guess's own echo debt"
     );
 }

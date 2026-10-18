@@ -20,7 +20,7 @@ pub(crate) const MAX_LINE_CONTENT_BYTES: usize = 2 * 1024 * 1024;
 
 /// Cap on a single deserialized hyperlink URL: the OSC 8 ingestion ceiling
 /// (`aterm-core`'s `MAX_HYPERLINK_URL_BYTES`). A larger `url_len` is a crafted
-/// checkpoint or `.dtrm` page, and [`MAX_LINE_CONTENT_BYTES`] does not cover the
+/// checkpoint or cold page, and [`MAX_LINE_CONTENT_BYTES`] does not cover the
 /// hyperlink section. An over-cap span is skipped; its bytes are stepped over.
 pub(crate) const MAX_HYPERLINK_URL_BYTES: usize = 8192;
 
@@ -104,8 +104,8 @@ impl Line {
     ///
     /// [`Line::images`] has no wire section. An inline image lives as long as its
     /// line stays in the in-memory hot tier and is dropped at the one boundary
-    /// where a surviving line is serialized, `promote_hot_to_warm`; the warm, cold
-    /// and disk tiers carry already-serialized bytes. The wire has no cross-line
+    /// where a surviving line is serialized, `promote_hot_to_warm`; the warm and
+    /// cold tiers carry already-serialized bytes. The wire has no cross-line
     /// dictionary, so a payload shared across a footprint would be written once
     /// per covered row (a 2 MiB screenshot over 20 rows is 40 MiB of warm blocks);
     /// keeping it needs a page-level payload table, a wire-format change.
@@ -138,10 +138,10 @@ impl Line {
     }
 
     /// Exact per-line serialized-size estimate shared by line and block
-    /// serialization (capacity hint only). Saturating, with an explicit slice
-    /// loop, so the strict L0 gate can prove it.
+    /// serialization. Saturation is safe for bounded serialization: a finite
+    /// output budget refuses the saturated value before allocation.
     // Skip: the residual row is `Rvalue::UnaryOp(PtrMetadata)`, diagnostic-only
-    // until the metadata lane is modeled. Every use is advisory.
+    // until the metadata lane is modeled.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(super) fn serialized_size_estimate(&self) -> usize {
         let content_len = self.content.as_bytes().len();
@@ -732,5 +732,5 @@ pub(crate) use super::line_codec_block::{
 pub use super::line_codec_block::{
     deserialize_lines, deserialize_lines_strict, deserialize_lines_strict_dropping_over_cap_links,
     deserialize_lines_tail_strict, deserialize_page_lines, max_linked_record_bytes,
-    serialize_lines,
+    serialize_lines, serialize_lines_bounded,
 };

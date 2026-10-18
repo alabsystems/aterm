@@ -18,12 +18,15 @@
 //!    supervise: the Harness page's "Supervise … sessions" switches are the
 //!    harness's hold on an agent's sessions, a thing apart. Sign in opens a
 //!    new tab that runs `aterm ai login <id>` (`App::ai_sign_in`).
-//! 3. **REVIEWS** — the egress grant `[ai] reviewers` and where it came from,
-//!    shown and never edited here (a Settings row is drivable by `settings
-//!    set`), with Open aterm.toml at it.
-//! 4. **FLEET DOCUMENT** — this machine's name, the document and what became
-//!    of it, and what the readers said, with Open aterm.toml at `[ai]
-//!    machine`.
+//! 3. **REVIEWS** — the rows Reviews across AIs (`ai.reviews`, on by
+//!    default) and Reviewer permissions (`ai.review_permissions`, inherit by
+//!    default), then who reviews and for how long, with Open aterm.toml at
+//!    `[ai] reviewers` (the list's order is a Manual row).
+//! 4. **FLEET DOCUMENT** — the rows This machine's name in the fleet
+//!    (`ai.machine`), Fleet document (`ai.fleet`, a path or an https:// URL)
+//!    and Fleet signer's public key (`ai.fleet_key`), then what became of the
+//!    document and what aterm holds of a URL's, with Fetch now (off the event
+//!    loop) and Open aterm.toml at `[ai] fleet`.
 //!
 //! The ordinary `settings/set/<key>` controls carry the rows, so OCC saves,
 //! Undo, Reset (which removes this machine's key, so it follows the fleet
@@ -48,8 +51,11 @@ pub(super) const AI_REFRESH: &str = "ai/refresh";
 /// The REVIEWS card's Open aterm.toml: the editor at `[ai] reviewers`.
 pub(super) const AI_OPEN_REVIEWS: &str = "ai/open-config/reviewers";
 
-/// The FLEET DOCUMENT card's Open aterm.toml: the editor at `[ai] machine`.
+/// The FLEET DOCUMENT card's Open aterm.toml: the editor at `[ai] fleet`.
 pub(super) const AI_OPEN_FLEET: &str = "ai/open-config/fleet";
+
+/// The FLEET DOCUMENT card's Fetch now: fetch the document from its URL.
+pub(super) const AI_FLEET_FETCH: &str = "ai/fleet-fetch";
 
 /// A CLI's Sign in (or Install): `ai/sign-in/<id>`.
 const AI_SIGN_IN_PREFIX: &str = "ai/sign-in/";
@@ -70,6 +76,16 @@ pub(super) fn ai_page_rows() -> impl Iterator<Item = &'static str> {
 
 /// The THIS MACHINE card's rows.
 const MACHINE_ROWS: [&str; 2] = [prefs::EDIT_AI_PREFERRED, prefs::EDIT_AI_ENABLED];
+
+/// The REVIEWS card's rows.
+const REVIEW_ROWS: [&str; 2] = [prefs::EDIT_AI_REVIEWS, prefs::EDIT_AI_REVIEW_PERMISSIONS];
+
+/// The FLEET DOCUMENT card's rows.
+const FLEET_ROWS: [&str; 3] = [
+    prefs::EDIT_AI_MACHINE,
+    prefs::EDIT_AI_FLEET,
+    prefs::EDIT_AI_FLEET_KEY,
+];
 
 /// The words a row adds where its value came from the fleet document.
 const FROM_FLEET: &str = "From the fleet document.";
@@ -105,6 +121,18 @@ pub(super) fn ai_commands(ai: &crate::ai_screen::AiState) -> Vec<Command> {
             shortcut: None,
             enabled: true,
         },
+        Command {
+            id: ActionId::new(AI_FLEET_FETCH),
+            title: "AI CLIs: Fetch the fleet document".to_string(),
+            shortcut: None,
+            enabled: ai.enabled
+                && !ai.looking
+                && ai
+                    .choices
+                    .fleet_source
+                    .as_deref()
+                    .is_some_and(aterm_agent::ai::fleet::is_url),
+        },
     ]
 }
 
@@ -122,6 +150,9 @@ impl SettingsApp {
     ) -> EventResult {
         if action == AI_REFRESH {
             cx.harness(HarnessRequest::AiLook);
+        } else if action == AI_FLEET_FETCH {
+            cx.harness(HarnessRequest::AiFleetFetch);
+            view.feedback = Some("Fetching the fleet document\u{2026}".to_string());
         } else if action == AI_OPEN_REVIEWS || action == AI_OPEN_FLEET {
             if view
                 .pending
@@ -133,7 +164,7 @@ impl SettingsApp {
                 let key = if action == AI_OPEN_REVIEWS {
                     "ai.reviewers"
                 } else {
-                    "ai.machine"
+                    "ai.fleet"
                 };
                 let operation =
                     cx.open_config_editor_at(Some(ConfigEditorTarget::Key(key.to_string())));
@@ -264,9 +295,16 @@ fn ai_cards(
         room,
         card_width,
     ));
+    cards.extend(row_cards(
+        "ai/review-rows",
+        ("Reviews", ("REVIEWS", "REVIEWS")),
+        setting_rows(state, &REVIEW_ROWS, width, inner, row_room),
+        room,
+        card_width,
+    ));
     cards.extend(metadata_cards(
         "ai/reviews",
-        ("REVIEWS", "REVIEWS"),
+        ("WHO REVIEWS", "WHO"),
         &ai.review_rows,
         inner,
         (value_width, label_width),
@@ -276,18 +314,21 @@ fn ai_cards(
         "Open aterm.toml at [ai] reviewers",
         card_width,
     ));
+    cards.extend(row_cards(
+        "ai/fleet-rows",
+        ("Fleet document", ("FLEET DOCUMENT", "FLEET")),
+        setting_rows(state, &FLEET_ROWS, width, inner, row_room),
+        room,
+        card_width,
+    ));
     cards.extend(metadata_cards(
         "ai/fleet",
-        ("FLEET DOCUMENT", "FLEET"),
+        ("WHAT IS HELD", "HELD"),
         &ai.fleet_rows,
         inner,
         (value_width, label_width),
     ));
-    cards.push(open_config_button(
-        AI_OPEN_FLEET,
-        "Open aterm.toml at [ai] machine",
-        card_width,
-    ));
+    cards.push(fleet_actions(ai, card_width));
     cards
 }
 
@@ -314,6 +355,23 @@ fn machine_rows(
                 note
             };
             page_setting_rows_noted(state, key, width, inner, note.as_deref(), row_room)
+        })
+        .collect()
+}
+
+/// A card's setting rows, each the way every page draws a setting, with its
+/// own note.
+fn setting_rows(
+    state: &SettingsViewState,
+    keys: &[&str],
+    width: SettingsWidth,
+    inner: f32,
+    row_room: f32,
+) -> Vec<(UiNode, f32)> {
+    keys.iter()
+        .flat_map(|key| {
+            let note = prefs::footnote_of(key);
+            page_setting_rows_noted(state, key, width, inner, note, row_room)
         })
         .collect()
 }
@@ -551,6 +609,49 @@ fn ai_actions(ai: &AiProjection, card_width: f32) -> (UiNode, f32) {
                 .gap(CARD_GAP),
         )
         .children(vec![button]),
+        control_height,
+    )
+}
+
+/// The FLEET DOCUMENT card's actions: Fetch now (busy while a look runs,
+/// inert while the look is off or `[ai] fleet` names no URL) and Open
+/// aterm.toml at `[ai] fleet`.
+fn fleet_actions(ai: &AiProjection, card_width: f32) -> (UiNode, f32) {
+    let control_height = scaled_control_height();
+    let label = "Fetch now";
+    let width = (crate::native_ui::native_button_label_width(label) + 40.0).min(card_width);
+    let fetch = UiNode::new(
+        AI_FLEET_FETCH,
+        UiContent::Button(
+            Control::new(
+                ButtonSpec::new("Fetch the fleet document now").visual_label(label),
+                ActionId::new(AI_FLEET_FETCH),
+            )
+            .state(ControlState {
+                busy: ai.looking,
+                enabled: ai.enabled && ai.fleet_from_url,
+                ..ControlState::default()
+            })
+            .style(StyleRef::Secondary),
+        ),
+    )
+    .layout(
+        Layout::default()
+            .width(Length::Fixed(width))
+            .height(Length::Fixed(control_height)),
+    );
+    let (open, _) = open_config_button(AI_OPEN_FLEET, "Open aterm.toml at [ai] fleet", card_width);
+    (
+        UiNode::new(
+            "ai/fleet-actions",
+            UiContent::Group(GroupSpec::new("Fleet document actions")),
+        )
+        .layout(
+            Layout::row()
+                .height(Length::Fixed(control_height))
+                .gap(CARD_GAP),
+        )
+        .children(vec![fetch, open]),
         control_height,
     )
 }

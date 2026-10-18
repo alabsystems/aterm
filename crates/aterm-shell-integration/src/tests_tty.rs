@@ -398,18 +398,12 @@ fn spawn_pty_shell(
     sh
 }
 
-/// A zsh and a pty, or a skip that says so.
+/// A zsh and a pty, or COULD NOT RUN that says which is missing.
 #[cfg(unix)]
-fn live_pty_zsh() -> Option<&'static str> {
-    let Some(zsh) = zsh_shell() else {
-        eprintln!("zsh not installed; skipping (ATERM_TEST_ZSH=<zsh> runs it)");
-        return None;
-    };
-    if !script_can_allocate_a_pty() {
-        eprintln!("no `script` to allocate a pty; skipping");
-        return None;
-    }
-    Some(zsh)
+fn live_pty_zsh() -> &'static str {
+    let zsh = need_zsh();
+    need_pty_script();
+    zsh
 }
 
 /// A NEW integrated zsh: a raw-mode child dying by SIGKILL, `exit 1` or `exit 0`
@@ -420,7 +414,7 @@ fn live_pty_zsh() -> Option<&'static str> {
 #[cfg(unix)]
 #[test]
 fn an_integrated_zsh_keeps_its_tty_when_a_raw_program_dies() {
-    let Some(zsh) = live_pty_zsh() else { return };
+    let zsh = live_pty_zsh();
     let fx = LiveFixture::new();
     std::fs::write(fx.home.join(".zshrc"), "").expect(".zshrc");
     let ours = install_script_set(&fx.base).expect("install");
@@ -460,7 +454,7 @@ fn an_integrated_zsh_keeps_its_tty_when_a_raw_program_dies() {
 #[cfg(unix)]
 #[test]
 fn an_integrated_zsh_whose_rc_broke_the_tty_runs_its_first_command_sane() {
-    let Some(zsh) = live_pty_zsh() else { return };
+    let zsh = live_pty_zsh();
     let fx = LiveFixture::new();
     std::fs::write(fx.home.join(".zshrc"), "sh -c 'stty raw -echo'\n").expect(".zshrc");
     let ours = install_script_set(&fx.base).expect("install");
@@ -489,7 +483,7 @@ fn an_integrated_zsh_whose_rc_broke_the_tty_runs_its_first_command_sane() {
 #[cfg(unix)]
 #[test]
 fn an_integrated_zsh_with_its_own_stty_is_repaired_not_frozen() {
-    let Some(zsh) = live_pty_zsh() else { return };
+    let zsh = live_pty_zsh();
     let fx = LiveFixture::new();
     std::fs::write(fx.home.join(".zshrc"), "stty() { command stty \"$@\"; }\n").expect(".zshrc");
     let ours = install_script_set(&fx.base).expect("install");
@@ -528,7 +522,7 @@ fn an_integrated_zsh_with_its_own_stty_is_repaired_not_frozen() {
 #[cfg(unix)]
 #[test]
 fn a_running_zsh_with_a_broken_tty_is_repaired_by_the_body_the_loader_delivers() {
-    let Some(zsh) = live_pty_zsh() else { return };
+    let zsh = live_pty_zsh();
     let fx = LiveFixture::new();
     std::fs::write(fx.home.join(".zshrc"), "").expect(".zshrc");
     let ours = install_script_set(&fx.base).expect("install");
@@ -578,10 +572,7 @@ fn a_running_zsh_with_a_broken_tty_is_repaired_by_the_body_the_loader_delivers()
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_repairs_its_tty_after_a_raw_program_fails() {
-    if !script_can_allocate_a_pty() {
-        eprintln!("no `script` to allocate a pty; skipping");
-        return;
-    }
+    need_pty_script();
     let bash = bash_shell();
     let fx = LiveFixture::new();
     std::fs::write(fx.home.join(".bashrc"), "").expect(".bashrc");
@@ -622,7 +613,7 @@ fn an_integrated_bash_repairs_its_tty_after_a_raw_program_fails() {
 #[cfg(unix)]
 #[test]
 fn an_integrated_zsh_with_err_return_stays_frozen_after_a_failing_stty() {
-    let Some(zsh) = live_pty_zsh() else { return };
+    let zsh = live_pty_zsh();
     let fx = LiveFixture::new();
     std::fs::write(fx.home.join(".zshrc"), "setopt err_return\n").expect(".zshrc");
     let ours = install_script_set(&fx.base).expect("install");
@@ -660,7 +651,7 @@ fn an_integrated_zsh_with_err_return_stays_frozen_after_a_failing_stty() {
 #[cfg(unix)]
 #[test]
 fn an_integrated_zsh_refreezes_when_a_thawed_command_is_interrupted() {
-    let Some(zsh) = live_pty_zsh() else { return };
+    let zsh = live_pty_zsh();
     let fx = LiveFixture::new();
     std::fs::write(fx.home.join(".zshrc"), "").expect(".zshrc");
     let ours = install_script_set(&fx.base).expect("install");
@@ -774,7 +765,7 @@ __aterm_zle_line_init() {
 #[cfg(unix)]
 #[test]
 fn an_integrated_zsh_marks_every_prompt_whatever_its_rc_does_to_zle_line_init() {
-    let Some(zsh) = live_pty_zsh() else { return };
+    let zsh = live_pty_zsh();
     let fx = LiveFixture::new();
     let ours = install_script_set(&fx.base).expect("install");
     let ours_rev = ours
@@ -1103,7 +1094,7 @@ fn an_integrated_zsh_marks_every_prompt_whatever_its_rc_does_to_zle_line_init() 
 #[cfg(unix)]
 #[test]
 fn an_integrated_zsh_under_xtrace_traces_the_users_commands_and_not_aterms() {
-    let Some(zsh) = live_pty_zsh() else { return };
+    let zsh = live_pty_zsh();
     let fx = LiveFixture::new();
     let dir = install_script_set(&fx.base).expect("install");
     std::fs::write(fx.home.join(".zshenv"), "setopt xtrace\n").expect(".zshenv");
@@ -1175,10 +1166,7 @@ fn cut_osc(raw: &str) -> String {
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_under_xtrace_traces_the_users_commands_and_not_aterms() {
-    if !script_can_allocate_a_pty() {
-        eprintln!("no `script` to allocate a pty; skipping");
-        return;
-    }
+    need_pty_script();
     let fx = LiveFixture::new();
     let dir = install_script_set(&fx.base).expect("install");
     std::fs::write(
@@ -1201,10 +1189,13 @@ fn an_integrated_bash_under_xtrace_traces_the_users_commands_and_not_aterms() {
         !text.contains(REKEY_OLD),
         "bash: the capability nonce reached the trace\n{text}"
     );
-    // (the function a traced line runs in, the line)
+    // (the function a traced line runs in, the line). Readline in bash 5.1+
+    // ends each accepted line with `\e[?2004l\r` (bracketed paste off), and
+    // the command's trace follows it on the same line: a line is what its
+    // last `\r` left on the screen.
     let traced: Vec<(&str, &str)> = text
         .lines()
-        .filter_map(|line| line.strip_prefix('+'))
+        .filter_map(|line| line.rsplit('\r').next()?.strip_prefix('+'))
         .filter_map(|line| line.trim_start_matches('+').split_once("> "))
         .map(|(frame, line)| (frame, line.trim_end()))
         .collect();
@@ -1250,10 +1241,7 @@ fn an_integrated_bash_under_xtrace_traces_the_users_commands_and_not_aterms() {
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_keeps_the_users_err_trap_errexit_and_functrace_as_bare_bash_does() {
-    if !script_can_allocate_a_pty() {
-        eprintln!("no `script` to allocate a pty; skipping");
-        return;
-    }
+    need_pty_script();
     let fx = LiveFixture::new();
     let dir = install_script_set(&fx.base).expect("install");
     // atpkg's dirs, its hook not yet written: a tab of a machine with atpkg.
@@ -1309,7 +1297,10 @@ fn an_integrated_bash_keeps_the_users_err_trap_errexit_and_functrace_as_bare_bas
     };
     assert_eq!(
         reported(stdout_between(&sh, from, sh.len())),
-        ["f", "echo\\x20hi"],
+        [
+            "f()\\x20{\\x20echo\\x20in-f\\x3b\\x20}\\x3b\\x20f",
+            "echo\\x20hi"
+        ],
         "bash: the commands 633;E reported under functrace\n{}",
         stdout_between(&sh, from, sh.len())
     );
@@ -1331,6 +1322,146 @@ fn an_integrated_bash_keeps_the_users_err_trap_errexit_and_functrace_as_bare_bas
     sh.finish();
 }
 
+/// The block's command and the tab title are the LINE as typed — a list, a
+/// pipeline, an alias — where they were its first simple command, alias-expanded
+/// (`true && sleep 3 | cat` showed `true` while it ran, `ll` was `ls -alF`). A
+/// line bash did not save (ignorespace) is reported as before, never as the
+/// previous line, and a user PROMPT_COMMAND that rewrites the history (`history
+/// -a; history -c; history -r`) does not make a saved line look unsaved.
+#[cfg(unix)]
+#[test]
+fn an_integrated_bash_reports_the_line_as_typed() {
+    if !script_can_allocate_a_pty() {
+        eprintln!("no `script` to allocate a pty; skipping");
+        return;
+    }
+    let fx = LiveFixture::new();
+    let dir = install_script_set(&fx.base).expect("install");
+    std::fs::write(
+        fx.home.join(".bashrc"),
+        "alias ll='ls -alF'\nHISTCONTROL=ignorespace\n\
+         PROMPT_COMMAND='history -a; history -c; history -r'\n",
+    )
+    .expect(".bashrc");
+    let mut sh = spawn_pty_shell(
+        ShellType::Bash,
+        bash_shell(),
+        &fx,
+        &dir,
+        &[("ATERM_CHILD", "1")],
+    );
+    let reported = |text: &str| -> Vec<String> {
+        text.split("\x1b]633;E;")
+            .skip(1)
+            .map(|rest| rest.split([';', '\x07']).next().unwrap_or("").to_owned())
+            .collect()
+    };
+    let from = sh.len();
+    sh.run_line("true && echo a$((40+2))", "0");
+    sh.run_line("echo b | cat", "0");
+    sh.run_line("echo c; (exit 7)", "7");
+    sh.run_line("ll -d / >/dev/null", "0");
+    let end = sh.run_line(" echo hidden && true", "0");
+    let text = stdout_between(&sh, from, end);
+    assert_eq!(
+        reported(&text),
+        [
+            "true\\x20&&\\x20echo\\x20a$((40+2))",
+            "echo\\x20b\\x20|\\x20cat",
+            "echo\\x20c\\x3b\\x20(exit\\x207)",
+            "ll\\x20-d\\x20/\\x20>/dev/null",
+            "echo\\x20hidden",
+        ],
+        "bash: the lines 633;E reported\n{}",
+        sh.transcript()
+    );
+    assert!(
+        text.contains("\x1b]0;true && echo a$((40+2))\x07"),
+        "bash: the title while the line runs is the line\n{}",
+        sh.transcript()
+    );
+    sh.finish();
+}
+
+/// An ARRAY PROMPT_COMMAND (bash 5.1+ runs every element, aterm's first): the
+/// user's elements are no typed line, and the line typed after them is judged
+/// against the history as they left it. An element holding several commands
+/// (`__x=1; __y=2`) made a block at every prompt, an empty Enter's too, and a
+/// `history -a; history -c; history -r` element that read another tab's line
+/// made an ignorespace line typed next be reported, and titled, as that line.
+#[cfg(unix)]
+#[test]
+fn an_integrated_bash_with_an_array_prompt_command_reports_only_typed_lines() {
+    if !script_can_allocate_a_pty() {
+        eprintln!("no `script` to allocate a pty; skipping");
+        return;
+    }
+    let fx = LiveFixture::new();
+    let dir = install_script_set(&fx.base).expect("install");
+    let history = fx.home.join(".bash_history");
+    std::fs::write(
+        fx.home.join(".bashrc"),
+        "HISTFILE=~/.bash_history\nHISTCONTROL=ignoreboth\n\
+         PROMPT_COMMAND=('__x=1; __y=2' 'history -a; history -c; history -r')\n",
+    )
+    .expect(".bashrc");
+    let mut sh = spawn_pty_shell(
+        ShellType::Bash,
+        bash_shell(),
+        &fx,
+        &dir,
+        &[("ATERM_CHILD", "1")],
+    );
+    let reported = |text: &str| -> Vec<String> {
+        text.split("\x1b]633;E;")
+            .skip(1)
+            .map(|rest| rest.split([';', '\x07']).next().unwrap_or("").to_owned())
+            .collect()
+    };
+    // Another tab's line, as its own `history -a` writes it.
+    let other_tab_appends = || {
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&history)
+            .and_then(|mut file| file.write_all(b"echo OTHER-TAB-LINE\n"))
+            .expect("append to the history file");
+    };
+    let enter = |sh: &mut LiveShell| {
+        let at = sh.len();
+        sh.send_bytes(b"\r");
+        sh.wait_for_after("\x1b]133;A", at)
+    };
+    let from = sh.len();
+    sh.run_line("echo a$((40+2)) && true", "0");
+    enter(&mut sh);
+    other_tab_appends();
+    sh.run_line(" echo hidden && true", "0");
+    other_tab_appends();
+    enter(&mut sh);
+    sh.run_line(" echo hidden2 && true", "0");
+    let end = sh.run_line("echo z | cat", "0");
+    let text = stdout_between(&sh, from, end);
+    assert_eq!(
+        reported(&text),
+        [
+            "echo\\x20a$((40+2))\\x20&&\\x20true",
+            "echo\\x20hidden",
+            "echo\\x20hidden2",
+            "echo\\x20z\\x20|\\x20cat",
+        ],
+        "bash: the lines 633;E reported\n{}",
+        sh.transcript()
+    );
+    assert!(
+        !text.contains("OTHER-TAB-LINE"),
+        "bash: another tab's line reported or titled\n{}",
+        sh.transcript()
+    );
+    sh.finish();
+}
+
 /// The user's `$_` reaches the user's code as in bare bash: `mkdir -p d && cd
 /// "$_"` enters d, a command reads the last argument of the one before it, and so
 /// does the user's PROMPT_COMMAND. The DEBUG trap's own command is the last one
@@ -1340,10 +1471,7 @@ fn an_integrated_bash_keeps_the_users_err_trap_errexit_and_functrace_as_bare_bas
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_keeps_the_users_last_argument() {
-    if !script_can_allocate_a_pty() {
-        eprintln!("no `script` to allocate a pty; skipping");
-        return;
-    }
+    need_pty_script();
     let fx = LiveFixture::new();
     let dir = install_script_set(&fx.base).expect("install");
     std::fs::write(
@@ -1368,5 +1496,116 @@ fn an_integrated_bash_keeps_the_users_last_argument() {
     for said in ["in=last42", "pc_=[last41]", "was=[last41]"] {
         assert!(text.contains(said), "bash: {said}\n{}", sh.transcript());
     }
+    sh.finish();
+}
+
+/// A compound command typed with its stdout redirected leaves the file holding
+/// its output and nothing else, and its block on the terminal. The DEBUG trap
+/// fires for the first simple command inside the compound once bash has applied
+/// the compound's redirections, so the preexec's 633;E (the line and the
+/// capability nonce), running title and 133;C went into the user's file ahead of
+/// its data, and the block never started on the terminal (measured on bash
+/// 5.2.21 in a real aterm: 419 bytes in `f` for `{ echo …; echo …; } > f`). The
+/// shapes: a group, `for`, `if`, `while` with a here-string, stdout and stderr
+/// both on the file (the marks then take /dev/tty: `script` gives the shell a
+/// controlling terminal), and stdout moved for the shell itself (`exec >f`),
+/// which put every mark of every prompt in the file. This build's script with
+/// the writer's terminal test cut is the negative control.
+#[cfg(unix)]
+#[test]
+fn an_integrated_bash_keeps_its_marks_out_of_a_redirected_compound_command() {
+    if !script_can_allocate_a_pty() {
+        eprintln!("no `script` to allocate a pty; skipping");
+        return;
+    }
+    // (the line, the file it writes, what the file must hold)
+    let compounds = [
+        ("{ echo a; } > out-group", "out-group", "a\n"),
+        (
+            "for i in 1 2; do echo for-$i; done > out-for",
+            "out-for",
+            "for-1\nfor-2\n",
+        ),
+        (
+            "if true; then echo if-body; fi > out-if",
+            "out-if",
+            "if-body\n",
+        ),
+        (
+            "while read -r l; do echo got-$l; done <<< x > out-while",
+            "out-while",
+            "got-x\n",
+        ),
+        ("{ echo both; } > out-both 2>&1", "out-both", "both\n"),
+    ];
+    let fx = LiveFixture::new();
+    std::fs::write(fx.home.join(".bashrc"), "cd \"$HOME\"\n").expect(".bashrc");
+    let nonce = [("ATERM_SHELL_NONCE", REKEY_OLD), ("ATERM_CHILD", "1")];
+    let read = |file: &str| {
+        let path = fx.home.join(file);
+        let text =
+            std::fs::read(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        String::from_utf8_lossy(&text).into_owned()
+    };
+
+    let unfixed = folder_with_edits(
+        &fx.base,
+        UNFIXED_REV,
+        &[(
+            "bash",
+            scripts::BASH,
+            &[(
+                "    if [[ -t 1 || ${__aterm_osc_tty-} != 1 ]]; then\n",
+                "    if :; then\n",
+            )],
+        )],
+    );
+    let mut sh = spawn_pty_shell(ShellType::Bash, bash_shell(), &fx, &unfixed, &nonce);
+    for (line, file, _) in compounds {
+        sh.run_line(line, "0");
+        assert!(
+            read(file).contains("\x1b]133;C"),
+            "unfixed: `{line}` should show the defect, its marks in {file}: {:?}\n{}",
+            read(file),
+            sh.transcript()
+        );
+    }
+    sh.finish();
+
+    let ours = install_script_set(&fx.base).expect("install");
+    let mut sh = spawn_pty_shell(ShellType::Bash, bash_shell(), &fx, &ours, &nonce);
+    let block = |sh: &mut LiveShell, line: &str| {
+        let from = sh.len();
+        let end = sh.run_line(line, "0");
+        let text = stdout_between(sh, from, end);
+        let typed = line
+            .replace('\\', "\\\\")
+            .replace(';', "\\x3b")
+            .replace(' ', "\\x20");
+        let title: String = line.chars().take(64).collect();
+        let mut at = 0;
+        for mark in [
+            format!("\x1b]633;E;{typed};id={REKEY_OLD}\x07"),
+            format!("\x1b]0;{title}\x07"),
+            format!("\x1b]133;C;id={REKEY_OLD}\x07"),
+            format!("\x1b]133;D;0;id={REKEY_OLD}\x07"),
+        ] {
+            let Some(found) = text[at..].find(&mark) else {
+                panic!(
+                    "bash: `{line}`: {mark:?} did not reach the terminal after the marks before it\n{}",
+                    sh.transcript()
+                );
+            };
+            at += found + mark.len();
+        }
+    };
+    for (line, file, want) in compounds {
+        block(&mut sh, line);
+        assert_eq!(read(file), want, "bash: `{line}` wrote into {file}");
+    }
+    block(&mut sh, "exec 3>&1 >out-exec");
+    block(&mut sh, "echo in-log");
+    block(&mut sh, "exec >&3 3>&-");
+    assert_eq!(read("out-exec"), "in-log\n", "bash: `exec >out-exec`");
     sh.finish();
 }

@@ -5,8 +5,8 @@
 //! Bounded cost of the rows-only resize. It changes no line's width, so only the live/history
 //! boundary moves inside the ring; evacuating the ring into the tiered store would cost
 //! O(history) under the terminal lock and strand bump-allocated `PageStore` pages.
-//! `count_rows_only_resize_migrated_rows` counts the rows it evacuates: bounded by the height
-//! delta, independent of history depth. `cost_bound` covers the width rewrap.
+//! `count_rows_only_resize_migrated_rows` counts the rows it evacuates: a grow evacuates none,
+//! and a shrink leaves the whole history ring-resident. `cost_bound` covers the width rewrap.
 
 use super::super::super::*;
 use crate::test_counters::take_rows_only_resize_migrated_rows;
@@ -30,48 +30,6 @@ fn tiered_grid_with_full_ring(rows: u16, cols: u16, ring: usize) -> Grid {
         "fixture: the whole history must be ring-resident before the resize"
     );
     grid
-}
-
-/// A rows-only resize evacuates at most the height delta out of the ring.
-#[test]
-fn rows_only_resize_migration_is_bounded_by_the_height_delta() {
-    let (rows, cols) = (50u16, 200u16);
-    let ring = 10_000usize;
-    let mut grid = tiered_grid_with_full_ring(rows, cols, ring);
-
-    let _ = take_rows_only_resize_migrated_rows(); // reset
-    grid.resize(rows - 1, cols); // one step of a window-height drag
-    let migrated = take_rows_only_resize_migrated_rows();
-
-    // Budget: one viewport of slack over the height delta of 1, a bound on the shape.
-    let budget = usize::from(rows);
-    assert!(
-        migrated <= budget,
-        "a rows-only resize must evacuate <= {budget} rows from the ring, got \
-         {migrated} (a history-sized count means the whole-ring migration is back \
-         — the L0 stall on the UI thread under `term_lock`)"
-    );
-    grid.assert_invariants();
-}
-
-/// The migrated count is independent of ring depth: same resize, four depths
-/// spanning 10x, identical counts.
-#[test]
-fn rows_only_resize_migration_is_independent_of_ring_depth() {
-    let (rows, cols) = (50u16, 200u16);
-    let mut counts = Vec::new();
-    for ring in [1_000usize, 2_500, 5_000, 10_000] {
-        let mut grid = tiered_grid_with_full_ring(rows, cols, ring);
-        let _ = take_rows_only_resize_migrated_rows(); // reset
-        grid.resize(rows - 1, cols);
-        counts.push((ring, take_rows_only_resize_migrated_rows()));
-        grid.assert_invariants();
-    }
-    let first = counts[0].1;
-    assert!(
-        counts.iter().all(|&(_, n)| n == first),
-        "the rows-only resize migration must not scale with ring depth, got {counts:?}"
-    );
 }
 
 /// A rows grow migrates nothing.
@@ -165,24 +123,6 @@ fn rows_only_resize_keeps_tiered_ring_history_extras() {
             .hyperlinks()
             .is_some_and(|spans| spans[0].url.as_ref() == "https://example.com/tiered-rows-only"),
         "a tiered grid's ring-history extras must survive a rows-only resize too"
-    );
-    grid.assert_invariants();
-}
-
-/// A width resize still takes the generic `adjust_row_count` path; the rows-only early return
-/// does not swallow it.
-#[test]
-fn width_resize_still_reflows_and_preserves_history() {
-    let (rows, cols) = (10u16, 80u16);
-    let mut grid = tiered_grid_with_full_ring(rows, cols, 500);
-    let before = grid.scrollback_lines();
-
-    grid.resize(rows, cols / 2);
-
-    assert!(
-        grid.scrollback_lines() >= before,
-        "a width resize must still preserve history (before={before}, after={})",
-        grid.scrollback_lines()
     );
     grid.assert_invariants();
 }

@@ -18,8 +18,8 @@
 /// `Emoji_Presentation=Yes` ranges, inclusive `(lo, hi)`, sorted and disjoint.
 ///
 /// Source: Unicode 16.0.0 `emoji-data.txt`, the same UCD version as the
-/// tables in [`crate::tables`], range-merged and checked by the boundary tests
-/// below. Re-extract from the matching UCD release to update.
+/// tables in [`crate::tables`], range-merged and checked against that file, every
+/// code point, by `tests/emoji_data.rs`. Re-extract from the matching UCD release to update.
 static EMOJI_PRESENTATION: &[(u32, u32)] = &[
     (0x231A, 0x231B),
     (0x23E9, 0x23EC),
@@ -284,80 +284,4 @@ pub fn is_emoji_presentation(c: char) -> bool {
 #[must_use]
 pub fn is_vs16_emoji_capable(c: char) -> bool {
     in_ranges(TEXT_DEFAULT_EMOJI, c as u32)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_text_emoji_are_not_emoji_presentation() {
-        // Emoji=Yes but Emoji_Presentation=No: default TEXT, need VS16 for colour.
-        // U+23FA is the exact code point Claude Code prints before each line.
-        for c in ['\u{23F8}', '\u{23F9}', '\u{23FA}'] {
-            assert!(
-                !is_emoji_presentation(c),
-                "{c:?} (U+{:04X}) is Emoji_Presentation=No — must default to text",
-                c as u32
-            );
-        }
-    }
-
-    #[test]
-    fn non_emoji_symbols_are_not_emoji_presentation() {
-        // Plain symbols, not emoji at all: bullet, black circle, six-pointed star.
-        for c in ['\u{2022}', '\u{25CF}', '\u{2736}', 'a', '世'] {
-            assert!(!is_emoji_presentation(c), "{c:?} is not an emoji");
-        }
-    }
-
-    #[test]
-    fn default_emoji_are_emoji_presentation() {
-        // Emoji_Presentation=Yes: default colour/wide even without VS16.
-        for c in [
-            '\u{231A}',  // ⌚ watch
-            '\u{2614}',  // ☔ umbrella with rain
-            '\u{2728}',  // ✨ sparkles
-            '\u{2B50}',  // ⭐ star
-            '\u{26AA}',  // ⚪ medium white circle
-            '\u{1F680}', // 🚀 rocket
-            '\u{1F600}', // 😀 grinning face
-        ] {
-            assert!(
-                is_emoji_presentation(c),
-                "{c:?} (U+{:04X}) is Emoji_Presentation=Yes — must default to emoji",
-                c as u32
-            );
-        }
-    }
-
-    #[test]
-    fn tables_are_sorted_and_disjoint() {
-        // The binary search depends on this invariant; assert it holds so a
-        // future hand-edit of a table can't silently break membership.
-        for table in [EMOJI_PRESENTATION, TEXT_DEFAULT_EMOJI] {
-            for w in table.windows(2) {
-                assert!(w[0].0 <= w[0].1, "range not ordered lo<=hi: {:?}", w[0]);
-                assert!(
-                    w[0].1 < w[1].0,
-                    "ranges not strictly increasing/disjoint: {:?} then {:?}",
-                    w[0],
-                    w[1]
-                );
-            }
-            let last = table.last().unwrap();
-            assert!(last.0 <= last.1, "final range not ordered: {last:?}");
-        }
-    }
-
-    #[test]
-    fn range_boundaries_are_exact() {
-        // Spot-check that membership is exact at range edges, not just interiors.
-        assert!(is_emoji_presentation('\u{231A}')); // lo of first range
-        assert!(is_emoji_presentation('\u{231B}')); // hi of first range
-        assert!(!is_emoji_presentation('\u{2319}')); // just below
-        assert!(!is_emoji_presentation('\u{231C}')); // just above
-        assert!(is_emoji_presentation('\u{1FAF8}')); // hi of last range
-        assert!(!is_emoji_presentation('\u{1FAF9}')); // just above last
-    }
 }

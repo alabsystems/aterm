@@ -1,0 +1,20 @@
+# claude-code 2.1.302 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a Stop hook (command ./h) that blocks once (exit 2), its stderr 'Not logged in · Please run /login', the reply before it and the continuation's reply EMPTY (a custom stub mode streaming no text): Stop hook error: [./h]: and the stderr on one row
+ ▐▛███▛█   Claude Code v2.1.302
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ /clear
+
+❯ say nothing
+
+⏺ Ran 1 stop hook (ctrl+o to expand)
+  ⎿  Stop hook error: [./h]: Not logged in · Please run /login
+
+
+✻ Sautéed for 0s · done 7:13 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts                                                                  Stop hook error occurred · ctrl+o to see

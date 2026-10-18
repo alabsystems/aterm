@@ -16,9 +16,9 @@
 //! still succeed — into the 8 KiB buffer, then they block (measured on macOS
 //! 26.6). A push loop that waited for a write to fail therefore pushed every
 //! teardown frame into a dead socket, went quiet, and parked on its 250 ms
-//! tick for good: a 25-minute hang of
-//! `owner_subscription_keeps_the_instance_sessions_stream` on 2026-09-30. A
-//! relay's client-to-child pump, waiting for that EOF, parks the same way.
+//! tick for good: a 25-minute hang of a `sessions`-stream subscription test on
+//! 2026-09-30. A relay's client-to-child pump, waiting for that EOF, parks the
+//! same way.
 //!
 //! [`hang_up`] acts on the socket instead of the descriptor. A real `aterm ctl`
 //! client is a process of its own, whose exit closes the last descriptor; this

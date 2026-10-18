@@ -13,9 +13,7 @@ use crate::log::{LogLine, MessageLog, Retired};
 use crate::model::{
     Decision, Hold, Intent, Message, MessageId, Restatement, Severity, WallStamp, tags,
 };
-use crate::{
-    Duration, HOLD_ASK, HOLD_INFO, HOLD_WARN, Instant, LOG_CAP, MARGIN, MAX_LIVE, STALE_HANDOFF,
-};
+use crate::{Duration, HOLD_ASK, HOLD_INFO, HOLD_WARN, Instant, LOG_CAP, MARGIN};
 
 fn t0() -> Instant {
     Instant::now()
@@ -55,46 +53,6 @@ fn caps(intents: &[Intent]) -> Vec<CapsuleSpec> {
     v
 }
 
-/// §1.8 "a restate or supersede clears the carried flag": a carried held row
-/// restated before the handoff commit folds on its own hold (45 s), never
-/// lingering to leave as `Stale` (125 s). Arming is `center`'s
-/// `a_carried_held_row_restated_before_commit_still_folds`.
-#[test]
-fn a_carried_held_row_restated_before_commit_leaves_on_time_and_as_folded() {
-    let now = t0();
-    let mut parent = fresh(now);
-    let id = parent
-        .post(
-            Message::new(tags::CONFIG, Severity::Warn, "3 keybindings were skipped")
-                .key("config.keybindings"),
-            stamp(1),
-            now,
-        )
-        .id;
-    parent.commit_rows(now, 3);
-    let carry = parent.carried();
-    let later = now + secs(5);
-    let mut child = fresh(later);
-    child.seed_carried(&carry, stamp(5_000), later);
-    child.restate(
-        id,
-        Restatement {
-            title: Some("2 keybindings were skipped".into()),
-            ..Restatement::default()
-        },
-        later + secs(1),
-    );
-    let commit = later + secs(2);
-    child.after_handoff_commit(commit);
-    let on_time = child.settle(commit + HOLD_WARN, true);
-    assert_eq!(
-        on_time.retired,
-        vec![(id, Retired::Folded)],
-        "the Warn row folds after HOLD_WARN; instead it lingers (and later retires as {:?})",
-        child.settle(later + STALE_HANDOFF, true).retired
-    );
-}
-
 /// A carried held row still queued at the handoff commit gets no `fold_at`, so
 /// it never folds unpainted.
 #[test]
@@ -130,75 +88,6 @@ fn a_queued_carried_held_row_is_not_folded_as_read_after_commit() {
     );
 }
 
-/// §1.4 and stable order: a flood of queued Warn posts past MAX_LIVE never
-/// evicts the row at the top of the glass
-/// (`center::tests::a_flood_takes_every_queued_row_before_one_on_glass`).
-#[test]
-fn a_flood_past_max_live_does_not_evict_a_row_on_glass() {
-    let now = t0();
-    let mut c = fresh(now);
-    let a = c.post(info("a"), stamp(1), now).id;
-    let b = c.post(info("b"), stamp(2), now).id;
-    let third = c.post(info("c"), stamp(3), now).id;
-    c.commit_rows(now, 3);
-    assert_eq!(glass_ids(&c), vec![a, b, third]);
-    for i in 0..(MAX_LIVE - 3 + 1) {
-        c.post(
-            Message::new(tags::PACKAGES, Severity::Warn, &format!("warn {i}")),
-            stamp(10 + i as u64),
-            now + Duration::from_millis(1 + i as u64),
-        );
-    }
-    assert_eq!(c.live_rows().count(), MAX_LIVE);
-    assert!(
-        c.live(a).is_some(),
-        "the top glass row was evicted by a flood of queued rows: glass now {:?}, evicted {:?}",
-        glass_ids(&c),
-        c.log()
-            .pending_lines()
-            .filter_map(|l| match l {
-                LogLine::Retired {
-                    id,
-                    how: Retired::Evicted,
-                    title,
-                    ..
-                } => Some((*id, title.clone())),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-    );
-}
-
-/// The meter is the row: at every width from 200 cols down to 8 it is
-/// `(0, cols, fill)`, so a capsule long→short switch cannot move it.
-#[test]
-fn the_meter_spans_the_row_at_every_width() {
-    let spec = RowSpec {
-        kind: RowKind::Message(MessageId::from_raw(1).unwrap()),
-        severity: Severity::Info,
-        live: true,
-        glyph: '\u{21bb}',
-        title: "Downloading aterm v0.91.0",
-        detail0: None,
-        meter: Some((Some(500), "45 MB / 90 MB")),
-        animated: false,
-        level: false,
-        busy: false,
-        eta: false,
-        load: None,
-        load_slot: crate::model::Loads::NONE,
-        capsules: caps(&[Intent::OpenSettings {
-            route: "/updates".into(),
-        }]),
-    };
-    let off: Vec<(usize, Option<(usize, usize, u16)>)> = (8..=200)
-        .rev()
-        .map(|cols| (cols, layout_row(&spec, cols, &chars).meter))
-        .filter(|&(cols, meter)| meter != Some((0, cols, 500)))
-        .collect();
-    assert!(off.is_empty(), "(cols, meter) off the whole row: {off:?}");
-}
-
 /// Narrowing an unmetered row, an excerpt once dropped never comes back, even
 /// where two capsules' long→short switch frees room for it.
 #[test]
@@ -212,7 +101,6 @@ fn the_excerpt_never_comes_back_while_narrowing() {
         detail0: Some("skipping \"cmd+shift+k\": unknown action \"foo\""),
         meter: None,
         animated: false,
-        level: false,
         busy: false,
         eta: false,
         load: None,
@@ -321,37 +209,6 @@ fn layout_never_panics_below_eight_cols() {
             for progress in [None, Some("Downloading aterm v0.91.0 45%")] {
                 let words = overflow_words(99, links, progress);
                 let _ = layout_row(&overflow_spec(99, &words), 0, &chars);
-            }
-        }
-    }
-}
-
-/// The hit test agrees with the layout in the degenerate clip too
-/// (cols 8..40, where capsules may stand from column 0).
-#[test]
-fn hit_test_agrees_with_layout_in_the_degenerate_clip() {
-    let fixtures = crate::glass::tests::fixtures();
-    for cols in 8..40usize {
-        let rows: Vec<_> = fixtures
-            .iter()
-            .map(|(_, s)| layout_row(s, cols, &chars))
-            .collect();
-        let p = Presentation { cols, rows };
-        for (r, row) in p.rows.iter().enumerate() {
-            let RowKind::Message(id) = row.kind else {
-                unreachable!()
-            };
-            for col in 0..cols {
-                let want = match row
-                    .capsules
-                    .iter()
-                    .find(|c| col >= c.col && col < c.col + c.width)
-                {
-                    Some(c) if c.action.is_details() => Hit::Details(id),
-                    Some(c) => Hit::Capsule(id, c.action),
-                    None => Hit::Body(id),
-                };
-                assert_eq!(p.hit(r, col), want, "row {r} col {col} @ {cols}");
             }
         }
     }

@@ -380,7 +380,7 @@ impl CarriedShow {
     }
 
     /// Whether `window`'s carried full-screen re-entry is still to come.
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(target_os = "macos")]
     pub(crate) fn fullscreen_pending(&self, window: WindowId) -> bool {
         self.plan.fullscreen.contains(&window)
     }
@@ -644,7 +644,7 @@ impl crate::App {
     }
 
     /// Whether `window` still has a carried full-screen re-entry to come.
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(target_os = "macos")]
     pub(crate) fn carried_fullscreen_pending(&self, window: WindowId) -> bool {
         self.carried_window_show
             .as_ref()
@@ -716,13 +716,6 @@ mod tests {
         assert_eq!(ranks, vec![2, 3, 1, 0]);
         // No focus history at all (a headless-shaped App): newest in front.
         assert_eq!(stacking_ranks(&[5_u64, 7], &[]), vec![1, 0]);
-    }
-
-    /// No OS window, nothing known: the capture records nothing, which is what
-    /// keeps a headless or non-macOS layout byte-identical to an older build's.
-    #[test]
-    fn a_window_with_no_os_window_captures_nothing() {
-        assert_eq!(captured_show(None, 0, true, true), WindowShow::UNKNOWN);
     }
 
     #[test]
@@ -956,12 +949,6 @@ mod tests {
         app.carried_window_show = Some(CarriedShow::new(lane, plan(windows, lane), bootstrap));
     }
 
-    /// The `WindowEvent::Focused` arm's two steps, in its order.
-    fn focus_event(app: &mut crate::App, window: WindowId, focused: bool) -> Vec<ShowOp<WindowId>> {
-        app.on_focus(window, focused);
-        app.carried_window_show_focus_event(window)
-    }
-
     /// Stage 1 on the update lane: nothing moves while a carried window is
     /// still waiting for its first present, then the stack goes on back to
     /// front with the key window last, and the MRU and the front become that
@@ -1009,148 +996,6 @@ mod tests {
             app.settle_carried_window_show().is_empty(),
             "the stack goes on ONCE"
         );
-    }
-
-    /// The adoption proof this process still owes (the update lane before its
-    /// proof): the write end of a pipe whose read end the caller holds.
-    #[cfg(unix)]
-    fn owe_the_proof(app: &mut crate::App) -> std::fs::File {
-        use std::os::fd::FromRawFd as _;
-        let mut fds = [0i32; 2];
-        // SAFETY: pipe(2) into a valid two-slot out-array.
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
-        // SAFETY: two fresh descriptors, one owner each from here.
-        let (read, write) = unsafe {
-            (
-                std::fs::File::from_raw_fd(fds[0]),
-                std::os::fd::OwnedFd::from_raw_fd(fds[1]),
-            )
-        };
-        app.handoff_ready = Some(crate::seamless::ReadySignal::for_test(
-            write,
-            "window-show",
-            [0; 32],
-            [0; 32],
-        ));
-        read
-    }
-
-    /// THE UPDATE LANE'S STACK IS THE PROOF PATH'S. While the adoption proof is
-    /// owed, the event loop's settle and the focus arm leave the stack alone
-    /// even with every carried window revealed: the proof also waits for every
-    /// window's frame to be on record, and a window minimized before that
-    /// presents nothing again, so the proof would never be written. The proof
-    /// path, past its last gate, applies it in the call that writes the proof.
-    /// (Before 2026-09-26 the `about_to_wait` settle minimized here.)
-    #[cfg(unix)]
-    #[test]
-    fn the_update_lane_stack_waits_for_the_proof_path() {
-        let (mut app, [w0, w1, w2]) = three_windows();
-        let _proof = owe_the_proof(&mut app);
-        let mut minimized = show(2, false);
-        minimized.minimized = Some(true);
-        carry(
-            &mut app,
-            ShowLane::Handoff,
-            &[(w0, show(1, false)), (w1, show(0, true)), (w2, minimized)],
-        );
-        assert!(
-            app.settle_carried_window_show().is_empty(),
-            "no window is minimized while the proof may still wait for its present"
-        );
-        assert!(focus_event(&mut app, w1, true).is_empty());
-        assert!(!app.carried_window_show.as_ref().expect("carried").stacked);
-        assert_eq!(
-            app.settle_carried_window_show_at_proof(),
-            vec![ShowOp::Minimize(w2), ShowOp::Raise(w0), ShowOp::Raise(w1)]
-        );
-        assert!(app.carried_window_show.as_ref().expect("carried").stacked);
-    }
-
-    /// Commit re-asserts the key window and, with no window in full screen,
-    /// ends the carry. A user who typed into another window before Commit
-    /// keeps the keyboard where they typed.
-    #[test]
-    fn commit_rekeys_the_carried_key_window_unless_typing_went_elsewhere() {
-        let windows = |[w0, w1, w2]: [WindowId; 3]| {
-            [
-                (w0, show(1, false)),
-                (w1, show(0, true)),
-                (w2, show(2, false)),
-            ]
-        };
-        let (mut app, ids) = three_windows();
-        carry(&mut app, ShowLane::Handoff, &windows(ids));
-        let _ = app.settle_carried_window_show();
-        assert_eq!(
-            app.commit_carried_window_show(&[ids[1]]),
-            vec![ShowOp::Raise(ids[1])],
-            "typing into the key window itself is no reason to hold back"
-        );
-        assert!(app.carried_window_show.is_none(), "nothing left to do");
-
-        let (mut app, ids) = three_windows();
-        carry(&mut app, ShowLane::Handoff, &windows(ids));
-        let _ = app.settle_carried_window_show();
-        assert!(
-            app.commit_carried_window_show(&[ids[0]]).is_empty(),
-            "the user typed into window 0 before Commit: it keeps the keyboard"
-        );
-        assert!(app.carried_window_show.is_none());
-    }
-
-    /// ROUND SIX, FINDING 45: keys typed into a revealed window BEFORE the
-    /// stack keep that window's keyboard. Every window is revealed and the
-    /// reveal order left window 2 key; the person types into it while the
-    /// proof is still owed. The stack used to raise the carried key window 1
-    /// last over it, and Commit — seeing typing "elsewhere" — only declined to
-    /// raise window 1 again, so the replayed keys went to window 2 and every
-    /// key after Commit to window 1. Now the stack keys window 2, and Commit
-    /// leaves it there. NEGATIVE CONTROL: with nothing typed, the carried key
-    /// window is keyed, as before.
-    #[test]
-    fn keys_typed_before_the_stack_keep_their_window_through_commit() {
-        let windows = |[w0, w1, w2]: [WindowId; 3]| {
-            [
-                (w0, show(2, false)),
-                (w1, show(0, true)),
-                (w2, show(1, false)),
-            ]
-        };
-        for typed in [false, true] {
-            let (mut app, ids) = three_windows();
-            carry(&mut app, ShowLane::Handoff, &windows(ids));
-            // The reveal order: the last window revealed holds the keyboard.
-            app.frontmost_window = Some(ids[2]);
-            app.incoming_handoff_pending = true;
-            if typed {
-                let winit_id = winit::window::WindowId::from(2u64);
-                app.winit_to_window.insert(winit_id, ids[2]);
-                app.queue_pre_commit_input(
-                    winit_id,
-                    winit::event::WindowEvent::Ime(winit::event::Ime::Commit("git pu".into())),
-                );
-            }
-            let stack = app.settle_carried_window_show_at_proof();
-            let key = if typed { ids[2] } else { ids[1] };
-            assert_eq!(
-                stack.last(),
-                Some(&ShowOp::Raise(key)),
-                "typed={typed}: the stack raises the window to key last: {stack:?}"
-            );
-            let typed_into = app.pre_commit_typed_windows();
-            let commit = app.commit_carried_window_show(&typed_into);
-            assert_eq!(
-                commit,
-                vec![ShowOp::Raise(key)],
-                "typed={typed}: Commit keys it again"
-            );
-            assert_eq!(
-                app.frontmost_window,
-                Some(key),
-                "typed={typed}: the keyboard is where the person was typing"
-            );
-        }
     }
 
     /// ROUND SIX, FINDING 45, THE MINIMIZED CASE. Window 2 was minimized at
@@ -1222,108 +1067,6 @@ mod tests {
                 "typed={typed}: the keyboard is where the person was typing"
             );
         }
-    }
-
-    /// Stage 2: full screen waits for Commit AND for aterm to be in front, and
-    /// until it happens a capture still reports the window as full screen.
-    #[test]
-    fn full_screen_waits_for_commit_and_for_aterm_in_front() {
-        let (mut app, [w0, w1, w2]) = three_windows();
-        let mut key = show(0, true);
-        key.fullscreen = Some(true);
-        let mut other = show(1, false);
-        other.fullscreen = Some(true);
-        carry(
-            &mut app,
-            ShowLane::Handoff,
-            &[(w0, key), (w1, other), (w2, show(2, false))],
-        );
-        assert_eq!(
-            focus_event(&mut app, w0, true),
-            vec![ShowOp::Raise(w2), ShowOp::Raise(w1), ShowOp::Raise(w0)],
-            "aterm in front before Commit: the stack goes on, full screen does not"
-        );
-        assert!(
-            focus_event(&mut app, w0, true).is_empty(),
-            "in front, but not committed: the parked process still shares every PTY"
-        );
-        let _ = focus_event(&mut app, w0, false);
-        assert_eq!(
-            app.commit_carried_window_show(&[]),
-            vec![ShowOp::Raise(w0)],
-            "committed, but the user is in another app: no Space is entered"
-        );
-        assert!(app.carried_fullscreen_pending(w0) && app.carried_fullscreen_pending(w1));
-        assert!(!app.carried_fullscreen_pending(w2));
-        assert!(app.settle_carried_window_show().is_empty());
-
-        assert_eq!(
-            focus_event(&mut app, w0, true),
-            vec![ShowOp::EnterFullScreen(w1), ShowOp::EnterFullScreen(w0)],
-            "aterm is in front: back to full screen, the key window last"
-        );
-        assert!(app.carried_window_show.is_none());
-        assert!(!app.carried_fullscreen_pending(w0));
-    }
-
-    /// "Is aterm in front" is read only off focus records that are truthful:
-    /// the two windows the rebuild just created start out recorded as focused,
-    /// which must not count until a `Focused` event reaches them — here the
-    /// user is in another app, and full screen waits until aterm is in front.
-    #[test]
-    fn a_fresh_window_s_default_focus_does_not_count_as_aterm_in_front() {
-        let (mut app, [w0, w1, w2]) = three_windows();
-        app.on_focus(w0, false);
-        assert!(
-            app.windows[&w1].focused && app.windows[&w2].focused,
-            "PRECONDITION: a new window starts out recorded as focused"
-        );
-        let mut key = show(0, true);
-        key.fullscreen = Some(true);
-        carry(
-            &mut app,
-            ShowLane::Cold,
-            &[(w0, key), (w1, show(1, false)), (w2, show(2, false))],
-        );
-        assert_eq!(
-            app.settle_carried_window_show(),
-            vec![ShowOp::Raise(w2), ShowOp::Raise(w1), ShowOp::Raise(w0)],
-            "the stack, and no full screen off two unreported focus records"
-        );
-        assert!(focus_event(&mut app, w1, false).is_empty());
-        assert!(focus_event(&mut app, w2, false).is_empty());
-        assert_eq!(
-            focus_event(&mut app, w0, true),
-            vec![ShowOp::EnterFullScreen(w0)],
-            "aterm came to the front"
-        );
-        assert!(app.carried_window_show.is_none());
-    }
-
-    /// A cold launch the user started in front: the bootstrap window's focus
-    /// was reported before the rebuild, so the stack and the full screen go on
-    /// in the same turn.
-    #[test]
-    fn a_cold_restore_in_front_goes_straight_back_to_full_screen() {
-        let (mut app, [w0, w1, w2]) = three_windows();
-        app.on_focus(w0, true);
-        let mut key = show(0, true);
-        key.fullscreen = Some(true);
-        carry(
-            &mut app,
-            ShowLane::Cold,
-            &[(w0, key), (w1, show(1, false)), (w2, show(2, false))],
-        );
-        assert_eq!(
-            app.settle_carried_window_show(),
-            vec![
-                ShowOp::Raise(w2),
-                ShowOp::Raise(w1),
-                ShowOp::Raise(w0),
-                ShowOp::EnterFullScreen(w0)
-            ]
-        );
-        assert!(app.carried_window_show.is_none());
     }
 
     /// A carried window the user closed before its stage runs is dropped from

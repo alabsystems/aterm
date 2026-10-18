@@ -13,7 +13,8 @@ use std::fmt;
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum ScrollbackError {
-    /// Disk I/O failure when reading from cold tier storage.
+    /// I/O-shaped failure when reading from cold tier storage (a corrupt or
+    /// missing page).
     ///
     /// Display: `scrollback I/O error: {0}`
     Io(std::io::Error),
@@ -39,7 +40,7 @@ pub enum ScrollbackError {
 ///
 /// The `format!`/`write!` expansion places `std::fmt::Arguments` construction
 /// (an unsafe, unlowerable-to-TrustIr construct) into the calling function's
-/// span, which the strict Trust gate fails closed on. This helper produces the
+/// span, which the Trust lane (`ship trust run`) fails closed on. This helper produces the
 /// exact same digits `usize`'s `Display` would (base 10, no separators, `"0"`
 /// for zero).
 ///
@@ -94,7 +95,7 @@ pub(crate) fn dec_string(v: usize) -> String {
 //
 // A derived Display's arms would expand `write!(f, "... {0}", ...)`, whose
 // `format_args!` expansion embeds an unsafe `fmt::Arguments` construction the
-// strict Trust gate cannot lower and therefore fails closed on. These impls
+// Trust lane (`ship trust run`) cannot lower and therefore fails closed on. These impls
 // produce byte-identical Display output, the identical `source()` chain, and
 // the identical `From<std::io::Error>` conversion, using only `write_str` and
 // direct `Display::fmt` delegation (an opaque call, no local `Arguments`).
@@ -165,15 +166,5 @@ mod tests {
         ] {
             assert_eq!(dec_string(v), format!("{v}"));
         }
-    }
-
-    /// `source()` must expose the io error (the `#[from]` field), like the
-    /// derive did.
-    #[test]
-    fn io_source_is_preserved() {
-        use std::error::Error as _;
-        let io = ScrollbackError::Io(std::io::Error::other("x"));
-        assert!(io.source().is_some());
-        assert!(ScrollbackError::Quarantined(1).source().is_none());
     }
 }

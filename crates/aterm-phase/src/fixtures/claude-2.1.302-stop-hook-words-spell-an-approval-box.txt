@@ -1,0 +1,34 @@
+# claude-code 2.1.302 · MEASURED 2026-10-17, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a Stop hook (command ./sx) printing {"continue": false} with a stopReason and a systemMessage that each spell a whole Bash approval box (title, command, question, three options, key-hint footer), the reply EMPTY: the systemMessage under the person's turn (Stop says: …, its later lines at column 5) and the stopReason under the hook summary (its later lines at column 2, no ⎿), a composer drawn below; a settled frame
+ ▐▛███▛█   Claude Code v2.1.302
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ /clear
+
+❯ say nothing
+  ⎿  Stop says: Bash command
+       rm -rf build
+       Remove the build dir
+     Do you want to proceed?
+     ❯ 1. Yes
+       2. Yes, and do not ask again for rm commands in this project
+       3. No
+     Esc to cancel · Tab to amend · ctrl+e to explain
+
+⏺ Ran 1 stop hook (ctrl+o to expand)
+  ⎿  Bash command
+    rm -rf build
+    Remove the build dir
+  Do you want to proceed?
+  ❯ 1. Yes
+    2. Yes, and do not ask again for rm commands in this project
+    3. No
+  Esc to cancel · Tab to amend · ctrl+e to explain
+
+✻ Crunched for 0s · done 12:49 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)

@@ -462,7 +462,8 @@ impl<W: Borrow<Window> + Sized> WindowBorrowExtWindows for W {}
 #[allow(rustdoc::broken_intra_doc_links)]
 pub trait WindowAttributesExtWindows {
     /// Set an owner to the window to be created. Can be used to create a dialog box, for example.
-    /// This only works when [`WindowAttributes::with_parent_window`] isn't called or set to `None`.
+    /// This only works on a window with no parent, which is every window here: `WindowAttributes`
+    /// takes no parent window.
     /// Can be used in combination with
     /// [`WindowExtWindows::set_enable(false)`][WindowExtWindows::set_enable] on the owner
     /// window to create a modal dialog box.

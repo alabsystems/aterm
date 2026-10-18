@@ -1,0 +1,1105 @@
+// Copyright 2026 Andrew Yates
+// SPDX-License-Identifier: Apache-2.0
+
+//! Codex's usage limits as its own records write them: what `aterm ai`'s
+//! AI connections read of a Codex login's limit ([`home_pick`]). Read from
+//! the rollouts under its `$CODEX_HOME` (`sessions/<y>/<m>/<d>/rollout-*.jsonl`,
+//! `harness::codex_rollout`), never the screen, and never for a supervisor:
+//! the Codex harness is retired.
+//!
+//! Usage ([`rollout_rate_limits`], [`rollout_readings`], [`pick`]; the
+//! account stats' C1,
+//! `docs/DESIGN-account-stats-2026-10-15.md` §3.3, §3.5, §4.3): every
+//! `token_count` event carries the account's `rate_limits` for one family
+//! (`limit_id`: `codex`, another model's `codex_bengalfox`, the
+//! metadata-only `premium`): its `primary` and `secondary` windows (each
+//! `{used_percent, window_minutes, resets_at}`), `credits`, `plan_type`,
+//! `individual_limit`, `spend_control_reached` and
+//! `rate_limit_reached_type`. Each is kept ([`CodexLimits`]), and a window is
+//! placed by its length, never its slot ([`Bucket`]). A rollout's readings
+//! are keyed by the login its `session_meta` names ([`opening_account`]),
+//! and a fork's copied prefix gives none. The AI connections' limit reads
+//! the `codex` family by [`pick`]: the login the
+//! newest reading names; per kind, a passed reset void, the resets within
+//! [`ANCHOR_SLACK_S`] of the latest one anchor, the readings before a drop
+//! within one rollout's own lines out of it, the largest share of the rest,
+//! the earliest stamp of a tie. So neither a fork's copied 60% nor a
+//! signed-out login's 97% stands for a real 95% or for the login signed in
+//! since. The account was read lately when its newest reading is within
+//! [`FRESH_S`]. Nothing here
+//! records the families for the account stats: their per-account record and
+//! `stats_step` (the design's A1) are that design's own later slice.
+//!
+//! What the lab measured of forks, logins and the rate limits on Codex
+//! 0.163.0 is `harness::codex_rollout`'s module header.
+
+use std::path::Path;
+
+use aterm_json::Value;
+
+use crate::harness::codex_rollout::{
+    Prefix, TurnReader, first_line, rollouts_by_write, stamp_ms, stream_lines, tail_after,
+};
+use crate::harness::profile::{AccountKey, Word};
+
+/// How much of a rollout's end is read for its usage reading: rollouts reach
+/// gigabytes, and a `token_count` is written after every model response.
+pub const TAIL_BYTES: u64 = 512 * 1024;
+
+/// How old a usage reading may be and still be read: Codex writes one only
+/// when some turn runs, so an idle account's last reading ages.
+pub const FRESH_S: i64 = 6 * 3600;
+
+/// How far back from a rollout's end its readings are looked for
+/// ([`rollout_readings`]): past it, the candidate gives no verdict.
+pub const CONTEXT_REACH: u64 = 64 * 1024 * 1024;
+
+/// How many of the newest rollouts are read for a usage reading before the
+/// search gives up.
+pub const NEWEST_READ: usize = 6;
+
+/// The limit family the shipped decisions read ([`pick`]): Codex's own
+/// usage limit. Another model's (`codex_bengalfox`) is a record only.
+pub const CODEX_FAMILY: &str = "codex";
+
+/// How far apart two resets of one window may be and still be one anchor
+/// ([`pick`], design §3.5): Codex's anchors move. An early reset moves one
+/// later (F11), and each answer places it anew (the lab's stub places it at
+/// the answer's own second plus the window, so its anchor moved with every
+/// turn, 2026-10-16).
+pub const ANCHOR_SLACK_S: i64 = 600;
+
+/// The slot of a family's `rate_limits` a window came in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Slot {
+    /// `primary`.
+    Primary,
+    /// `secondary`.
+    Secondary,
+}
+
+/// What a window is, by its length (design §3.3, F11). A slot is no kind: a
+/// plan can carry its weekly window in `primary` and no five-hour window. So
+/// a window is placed by its `window_minutes`, within 5% as Codex's own
+/// source names it (300 `5h`, 1440 `daily`, 10080 `weekly`); `0` is a
+/// placeholder, and a window naming no length is placed by its slot alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Bucket {
+    /// 300 minutes, within 5%.
+    FiveHour,
+    /// 1440 minutes, within 5%.
+    Day,
+    /// 10080 minutes, within 5%.
+    Week,
+    /// Another length, in minutes.
+    Minutes(u64),
+    /// No length given (absent, or the `0` placeholder).
+    Unplaced(Slot),
+}
+
+/// One usage window of a limit family.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Window {
+    /// The slot it came in.
+    pub slot: Slot,
+    pub used_percent: f64,
+    pub window_minutes: Option<u64>,
+    /// Epoch seconds.
+    pub resets_at: Option<i64>,
+}
+
+impl Window {
+    /// Its kind ([`Bucket`]).
+    #[must_use]
+    pub fn bucket(&self) -> Bucket {
+        let near = |minutes: u64, of: u64| minutes.abs_diff(of).saturating_mul(20) <= of;
+        match self.window_minutes {
+            Some(m) if m > 0 && near(m, 300) => Bucket::FiveHour,
+            Some(m) if m > 0 && near(m, 1440) => Bucket::Day,
+            Some(m) if m > 0 && near(m, 10080) => Bucket::Week,
+            Some(m) if m > 0 => Bucket::Minutes(m),
+            _ => Bucket::Unplaced(self.slot),
+        }
+    }
+}
+
+/// A family's usage credits (`credits`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Credits {
+    /// `has_credits`.
+    pub has_credits: Option<bool>,
+    /// `unlimited`.
+    pub unlimited: Option<bool>,
+    /// `balance`, in Codex's credits and never dollars (design Q12), as
+    /// written (`"12"`); `None` where null.
+    pub balance: Option<Word>,
+}
+
+/// One `token_count`'s `rate_limits` (module header, design F10): one
+/// family's windows and what Codex writes beside them, and the account the
+/// rollout's `session_meta` names. Every word kept from the file is a
+/// [`Word`] (printable ASCII, at most 64 bytes); one that is not reads as
+/// absent, and a family that names none is no reading.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodexLimits {
+    /// When the reading was written, epoch seconds.
+    pub at_unix: i64,
+    /// The same, in milliseconds: the earliest of a tie is kept ([`pick`]).
+    pub at_ms: i64,
+    /// `limit_id`: `codex`, another model's limit (`codex_bengalfox`), the
+    /// metadata-only `premium`.
+    pub family: Word,
+    /// `limit_name`.
+    pub name: Option<Word>,
+    /// `primary`, then `secondary`, where written.
+    pub windows: Vec<Window>,
+    /// `credits`. A line keeps only the last family of its response, so
+    /// credits and the plan can be carried over from another family (F10).
+    pub credits: Option<Credits>,
+    /// `plan_type` (`plus`, `pro`, `prolite`, …): null on every line the
+    /// lab's provider served, since no header carries it (Codex's source
+    /// fills it from its websocket's rate-limit event and its account reads,
+    /// `docs/measured/real-claude-lab-2026-10-15.md` M1).
+    pub plan_type: Option<Word>,
+    /// `individual_limit`, a number or a number written as text, in Codex's
+    /// credits (design §3.3); null in every capture, so its shape is
+    /// UNKNOWN and anything else reads as absent.
+    pub individual_limit: Option<f64>,
+    /// `spend_control_reached`; null in every capture.
+    pub spend_control_reached: Option<bool>,
+    /// `rate_limit_reached_type` (`workspace_member_credits_depleted`, …).
+    pub reached_type: Option<Word>,
+    /// The account the rollout's thread was made under ([`opening_account`]);
+    /// `None` where its `session_meta` names none, and for a reading read
+    /// from text alone ([`rollout_rate_limits`]).
+    pub account: Option<AccountKey>,
+}
+
+/// A word of the vendor's file ([`Word`]); `None` for null, another type, or
+/// text that is no word.
+fn word_of(v: Option<&Value>) -> Option<Word> {
+    v.and_then(Value::as_str).and_then(Word::new)
+}
+
+fn window(slot: Slot, v: Option<&Value>) -> Option<Window> {
+    let v = v?;
+    Some(Window {
+        slot,
+        used_percent: v.get("used_percent")?.as_f64()?,
+        window_minutes: v.get("window_minutes").and_then(Value::as_u64),
+        resets_at: v.get("resets_at").and_then(Value::as_i64),
+    })
+}
+
+/// One rollout line read as a `token_count`'s `rate_limits` ([`CodexLimits`],
+/// its `account` none); `None` for any other line, one with no readable
+/// stamp, and a family that names no word.
+fn limits_line(line: &str) -> Option<CodexLimits> {
+    if !line.contains("\"token_count\"") || !line.contains("\"rate_limits\"") {
+        return None;
+    }
+    let v = crate::harness::transcript::codex_limits(line.trim()).ok()?;
+    let payload = v.get("payload")?;
+    if payload.get("type").and_then(Value::as_str) != Some("token_count") {
+        return None;
+    }
+    let at_ms = v
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(stamp_ms)?;
+    let l = payload.get("rate_limits").filter(|l| l.is_object())?;
+    let credits = l.get("credits").filter(|c| c.is_object()).map(|c| Credits {
+        has_credits: c.get("has_credits").and_then(Value::as_bool),
+        unlimited: c.get("unlimited").and_then(Value::as_bool),
+        balance: word_of(c.get("balance")),
+    });
+    let individual_limit = l.get("individual_limit").and_then(|v| {
+        v.as_f64()
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+            .filter(|n| n.is_finite())
+    });
+    Some(CodexLimits {
+        at_unix: at_ms.div_euclid(1000),
+        at_ms,
+        family: word_of(l.get("limit_id"))?,
+        name: word_of(l.get("limit_name")),
+        windows: [(Slot::Primary, "primary"), (Slot::Secondary, "secondary")]
+            .into_iter()
+            .filter_map(|(slot, key)| window(slot, l.get(key)))
+            .collect(),
+        credits,
+        plan_type: word_of(l.get("plan_type")),
+        individual_limit,
+        spend_control_reached: l.get("spend_control_reached").and_then(Value::as_bool),
+        reached_type: word_of(l.get("rate_limit_reached_type")),
+        account: None,
+    })
+}
+
+/// Every `token_count` reading in `tail`, every family, in the order written
+/// (module header); their `account` is none, which [`rollout_readings`]
+/// fills from the rollout's first line. A line that is not JSON — the tail's
+/// cut first line — is skipped.
+#[must_use]
+pub fn rollout_rate_limits(tail: &str) -> Vec<CodexLimits> {
+    tail.lines().filter_map(limits_line).collect()
+}
+
+/// The account a rollout's thread was made under (design §3.1, F14): the
+/// `creator_account_id` and `creator_user_id` of its `session_meta`, the
+/// first line, hashed as they are read ([`AccountKey::codex`]: the ids are
+/// kept nowhere). `None` where the line is no `session_meta` or names
+/// neither (an API-key login writes none; Codex before 0.159.2 neither).
+///
+/// MEASURED (the lab, Codex 0.163.0, 2026-10-16): the ids are written once,
+/// as the thread is made. A thread resumed under another login wrote no
+/// second `session_meta`: its later readings were served to the new login
+/// under the first one's ids (a smaller share there is read as a drop,
+/// [`pick`]). A fork made under the new login names it.
+#[must_use]
+pub fn opening_account(first_line: &str) -> Option<AccountKey> {
+    let v = crate::harness::transcript::codex_meta(first_line.trim()).ok()?;
+    if v.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return None;
+    }
+    let p = v.get("payload")?;
+    AccountKey::codex(
+        p.get("creator_account_id")?.as_str()?,
+        p.get("creator_user_id")?.as_str()?,
+    )
+}
+
+/// Where the rollout at `path`'s own lines begin (module header): the byte
+/// offset of its first line past a fork's copied prefix, read from its start
+/// through a [`TurnReader`], at most `reach` bytes. A rollout that is no
+/// fork, or a paginated one, begins at 0; one that ends inside its copy, at
+/// its length. `None` where it cannot be opened, or its copy runs past
+/// `reach`.
+fn copy_end(path: &Path, reach: u64) -> Option<u64> {
+    let mut reader = TurnReader::default();
+    let mut own = None;
+    let read = stream_lines(path, reach, |start, text| {
+        if let Some(text) = text {
+            let _ = reader.line(text);
+        }
+        if reader.prefix == Prefix::Own {
+            own = Some(start);
+            return std::ops::ControlFlow::Break(());
+        }
+        std::ops::ControlFlow::Continue(())
+    })?;
+    own.or_else(|| read.complete.then_some(read.read))
+}
+
+/// The usage readings of the rollout at `path` (module header): every
+/// `token_count` in its last [`TAIL_BYTES`] past a fork's copied prefix
+/// (`copy_end`, read as far as `reach`), each keyed by the account its
+/// first line names ([`opening_account`]). A copy's readings are its
+/// parent's, rewritten under new stamps and keyed to the fork's maker, so
+/// none is read. `None` where the file cannot be read, or its copy runs past
+/// `reach`.
+#[must_use]
+pub fn rollout_readings(path: &Path, reach: u64) -> Option<Vec<CodexLimits>> {
+    let own_from = copy_end(path, reach)?;
+    let account = first_line(path).as_deref().and_then(opening_account);
+    let tail = tail_after(path, own_from, TAIL_BYTES)?;
+    let mut readings = rollout_rate_limits(&tail);
+    for r in &mut readings {
+        r.account = account;
+    }
+    Some(readings)
+}
+
+/// One window as [`pick`] read it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Picked {
+    /// Its kind.
+    pub bucket: Bucket,
+    /// The largest share read within its anchor.
+    pub used_percent: f64,
+    /// The anchor: the latest reset among the readings within it (epoch
+    /// seconds); `None` where none of them named one.
+    pub resets_at: Option<i64>,
+    /// When that share was read, the earliest of a tie (unix seconds).
+    pub as_of: i64,
+}
+
+/// One family's windows as [`pick`] read them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pick {
+    /// The account whose readings these are: the one the newest reading with
+    /// a window names (`None`: its rollout names none).
+    pub account: Option<AccountKey>,
+    /// That newest reading's stamp (unix seconds): how lately the account was
+    /// read at all ([`FRESH_S`]).
+    pub newest: i64,
+    /// Each kind with a window whose reset is ahead (or names none).
+    pub windows: Vec<Picked>,
+    /// Each kind whose every reading's reset has passed: void, read as
+    /// empty, never as the share it last had (design §3.4).
+    pub void: Vec<Bucket>,
+}
+
+/// The `family`'s windows at `now_unix` from `rollouts`, each one's
+/// readings in the order written ([`rollout_readings`]; module header,
+/// design §3.5): the account the newest reading with a window names, and of
+/// that account's readings only, per kind ([`Bucket`]):
+/// * a passed reset is void;
+/// * the resets within [`ANCHOR_SLACK_S`] of the latest are one anchor;
+/// * a drop within one rollout's own lines inside the anchor — a later
+///   reading of a smaller share than the one before it — is the server
+///   saying the window was refilled (a reset used inside it) or another
+///   login answering (a thread resumed under it keeps its first login's
+///   key, module header): readings stamped before the newest such drop leave
+///   it;
+/// * of the rest, the largest share wins, and on a tie the earliest stamp
+///   is kept, so a copy the fork rule missed never makes an old figure look
+///   fresh.
+///
+/// Usage only grows inside a window, so a reading taken earlier in it, or a
+/// count another thread wrote again from what it held, never hides a later,
+/// larger one; a figure of another login, or of a window already reset,
+/// never stands for the account's. A reading with no window (a
+/// metadata-only family; a count written with no rate headers) is no reading
+/// here. The drop is read from the readings at each pick and recorded
+/// nowhere. `None`: no reading of the family has a window.
+#[must_use]
+pub fn pick(rollouts: &[Vec<CodexLimits>], family: &str, now_unix: i64) -> Option<Pick> {
+    let has = |r: &&CodexLimits| r.family.as_str() == family && !r.windows.is_empty();
+    let newest = rollouts
+        .iter()
+        .flatten()
+        .filter(has)
+        .max_by_key(|r| r.at_ms)?;
+    let account = newest.account;
+    // Per kind, each live window of the account's: (rollout, stamp, window),
+    // each rollout's in the order written.
+    type Seen<'a> = Vec<(usize, i64, &'a Window)>;
+    let mut kinds: std::collections::BTreeMap<Bucket, Seen<'_>> = std::collections::BTreeMap::new();
+    for (i, rollout) in rollouts.iter().enumerate() {
+        for r in rollout.iter().filter(has).filter(|r| r.account == account) {
+            for w in &r.windows {
+                kinds.entry(w.bucket()).or_default().push((i, r.at_ms, w));
+            }
+        }
+    }
+    let mut windows = Vec::new();
+    let mut void = Vec::new();
+    for (bucket, all) in kinds {
+        let live: Seen<'_> = all
+            .into_iter()
+            .filter(|(_, _, w)| w.resets_at.is_none_or(|r| r > now_unix))
+            .collect();
+        let anchor = live.iter().filter_map(|(_, _, w)| w.resets_at).max();
+        let within = |w: &Window| match (anchor, w.resets_at) {
+            (Some(a), Some(r)) => r >= a.saturating_sub(ANCHOR_SLACK_S),
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
+        let held: Seen<'_> = live.into_iter().filter(|(_, _, w)| within(w)).collect();
+        let drop = held
+            .windows(2)
+            .filter(|pair| {
+                pair[0].0 == pair[1].0
+                    && pair[0].1 < pair[1].1
+                    && pair[1].2.used_percent < pair[0].2.used_percent
+            })
+            .map(|pair| pair[1].1)
+            .max();
+        let best = held
+            .iter()
+            .filter(|(_, at_ms, _)| drop.is_none_or(|d| *at_ms >= d))
+            .min_by(|a, b| {
+                b.2.used_percent
+                    .total_cmp(&a.2.used_percent)
+                    .then(a.1.cmp(&b.1))
+            });
+        match best {
+            Some((_, at_ms, w)) => windows.push(Picked {
+                bucket,
+                used_percent: w.used_percent,
+                resets_at: anchor,
+                as_of: at_ms.div_euclid(1000),
+            }),
+            None => void.push(bucket),
+        }
+    }
+    Some(Pick {
+        account,
+        newest: newest.at_unix,
+        windows,
+        void,
+    })
+}
+
+/// The `codex` family's pick at `now_unix` over the six (`NEWEST_READ`) rollouts
+/// of `home` written last ([`rollout_readings`], [`pick`]): Codex's own usage
+/// limit as one read sees it.
+#[must_use]
+pub fn home_pick(home: &Path, now_unix: i64) -> Option<Pick> {
+    let rollouts: Vec<Vec<CodexLimits>> = rollouts_by_write(home)
+        .iter()
+        .take(NEWEST_READ)
+        .filter_map(|(path, _)| rollout_readings(path, CONTEXT_REACH))
+        .collect();
+    pick(&rollouts, CODEX_FAMILY, now_unix)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::harness::codex_rollout::PAGINATED;
+    use crate::harness::codex_rollout::fixtures::{context, message, meta, meta_as, rate};
+    use crate::harness::codex_rollout::tail_of;
+    use std::time::SystemTime;
+
+    const ROOT: &str = "01900000-0000-7000-8000-000000000001";
+    const SUB: &str = "01900000-0000-7000-8000-000000000002";
+    const OTHER: &str = "01900000-0000-7000-8000-000000000003";
+    const T0: i64 = 1_790_000_000_000;
+
+    /// A real `token_count` line (99% of the weekly window), its numbers set.
+    fn token_count(at: &str, limit_id: &str, used: f64, resets_at: i64) -> String {
+        format!(
+            "{{\"timestamp\":\"{at}\",\"ordinal\":1,\"type\":\"event_msg\",\"payload\":{{\"type\":\
+             \"token_count\",\"info\":null,\"rate_limits\":{{\"limit_id\":\"{limit_id}\",\
+             \"limit_name\":null,\"primary\":{{\"used_percent\":{used},\"window_minutes\":10080,\
+             \"resets_at\":{resets_at}}},\"secondary\":null,\"credits\":{{\"has_credits\":false,\
+             \"unlimited\":false,\"balance\":\"0\"}},\"plan_type\":\"pro\",\
+             \"rate_limit_reached_type\":null}}}}}}"
+        )
+    }
+
+    const PREMIUM: &str = "{\"timestamp\":\"2026-09-27T20:45:24.900Z\",\"type\":\"event_msg\",\
+        \"payload\":{\"type\":\"token_count\",\"info\":null,\"rate_limits\":{\"limit_id\":\
+        \"premium\",\"primary\":null,\"secondary\":null}}}";
+
+    fn unix(s: &str) -> i64 {
+        aterm_types::rfc3339::parse_utc_fractional(s).expect("a stamp")
+    }
+
+    /// Recorded readings: 99% of the weekly window is picked, with its reset;
+    /// 1% twenty minutes after a usage reset is picked as the new window's.
+    /// `codex_bengalfox` and `premium` rows are other families; within the
+    /// `codex` family the largest share of the window wins. Negative
+    /// controls: one whose reset has passed is void; a metadata-only family,
+    /// and a line that is not JSON, are no window.
+    #[test]
+    fn the_incidents_readings_pick_the_largest_share_of_the_window() {
+        let first = [
+            token_count("2026-09-27T20:30:00.000Z", "codex", 97.0, 1_791_082_750),
+            token_count("2026-09-27T20:37:17.251Z", "codex", 99.0, 1_791_082_750),
+            token_count(
+                "2026-09-27T20:38:00.000Z",
+                "codex_bengalfox",
+                3.0,
+                1_791_082_999,
+            ),
+            PREMIUM.to_string(),
+        ]
+        .join("\n");
+        let readings = rollout_rate_limits(&first);
+        assert_eq!(readings.len(), 4, "every family is a reading");
+        let one = [readings.clone()];
+        let now = unix("2026-09-27T20:39:47Z");
+        let p = pick(&one, CODEX_FAMILY, now).expect("a pick");
+        assert_eq!(p.newest, unix("2026-09-27T20:37:17.251Z"));
+        assert_eq!(
+            p.windows,
+            vec![Picked {
+                bucket: Bucket::Week,
+                used_percent: 99.0,
+                resets_at: Some(1_791_082_750),
+                as_of: unix("2026-09-27T20:37:17Z"),
+            }]
+        );
+        let other = pick(&one, "codex_bengalfox", now).expect("its pick");
+        assert_eq!(other.windows[0].used_percent, 3.0);
+        assert_eq!(pick(&one, "premium", now), None, "no window");
+        let second = token_count("2026-09-28T03:29:30.000Z", "codex", 1.0, 1_791_169_817);
+        let at_press = unix("2026-09-28T03:30:24Z");
+        let p2 = pick(&[rollout_rate_limits(&second)], CODEX_FAMILY, at_press).expect("a pick");
+        assert_eq!(p2.windows[0].used_percent, 1.0);
+        // The window's reset passed a minute ago: void, and it reads empty.
+        let mut just_reset = readings[1].clone();
+        just_reset.at_ms = 1_791_082_700_000;
+        just_reset.at_unix = 1_791_082_700;
+        let p = pick(&[vec![just_reset]], CODEX_FAMILY, 1_791_082_760).expect("a pick");
+        assert_eq!(
+            (p.windows.len(), p.void.as_slice()),
+            (0, &[Bucket::Week][..])
+        );
+        assert_eq!(
+            pick(&[rollout_rate_limits(PREMIUM)], CODEX_FAMILY, now),
+            None
+        );
+        assert_eq!(rollout_rate_limits("not json\n{\"cut"), Vec::new());
+    }
+
+    /// The lab's two composed logins (Codex 0.163.0 wrote them into its
+    /// `session_meta`s, 2026-10-16): stand-in ids, no real account's.
+    const LOGIN_A: (&str, &str) = ("acct-lab-1", "user-lab");
+
+    const LOGIN_B: (&str, &str) = ("acct-lab-2", "user-lab");
+
+    fn key(login: (&str, &str)) -> Option<AccountKey> {
+        AccountKey::codex(login.0, login.1)
+    }
+
+    /// A reading of the `codex` family at `ms` under `account`: each window a
+    /// `(slot, used_percent, window_minutes, resets_at)`.
+    fn reading(
+        ms: i64,
+        account: Option<AccountKey>,
+        windows: &[(Slot, f64, u64, i64)],
+    ) -> CodexLimits {
+        CodexLimits {
+            at_unix: ms.div_euclid(1000),
+            at_ms: ms,
+            family: Word::new(CODEX_FAMILY).expect("a word"),
+            name: None,
+            windows: windows
+                .iter()
+                .map(|&(slot, used_percent, minutes, resets_at)| Window {
+                    slot,
+                    used_percent,
+                    window_minutes: Some(minutes),
+                    resets_at: Some(resets_at),
+                })
+                .collect(),
+            credits: None,
+            plan_type: None,
+            individual_limit: None,
+            spend_control_reached: None,
+            reached_type: None,
+            account,
+        }
+    }
+
+    /// `readings`, each its own rollout's (another thread, another process).
+    fn apart(readings: &[CodexLimits]) -> Vec<Vec<CodexLimits>> {
+        readings.iter().map(|r| vec![r.clone()]).collect()
+    }
+
+    /// EVERY FAMILY, AND WHAT CODEX WRITES BESIDE ITS WINDOWS (design F10,
+    /// §4.3): a `token_count` in 0.163.0's shape gives its family and name,
+    /// each window with its slot and kind (a weekly window in `primary`, the
+    /// `0` placeholder placed by its slot), the credits, the plan, the
+    /// individual limit (a number written as text), the spend-control flag
+    /// and the reached type; another model's family and a metadata-only one
+    /// are readings too. Negative controls: a family that is no word (an
+    /// escape in it), or none at all, is no reading; a balance written as a
+    /// number and an individual limit written as an object read as absent.
+    #[test]
+    fn every_family_is_read_with_what_codex_writes_beside_it() {
+        let line = "{\"timestamp\":\"2026-10-16T22:20:05.645Z\",\"ordinal\":14,\"type\":\"event_msg\",\
+            \"payload\":{\"type\":\"token_count\",\"info\":null,\"rate_limits\":{\"limit_id\":\"codex\",\
+            \"limit_name\":\"Codex\",\"primary\":{\"used_percent\":30.0,\"window_minutes\":10080,\
+            \"resets_at\":1792192805},\"secondary\":{\"used_percent\":10.0,\"window_minutes\":0,\
+            \"resets_at\":null},\"credits\":{\"has_credits\":true,\"unlimited\":false,\"balance\":\"12\"},\
+            \"individual_limit\":\"2500\",\"spend_control_reached\":true,\"plan_type\":\"prolite\",\
+            \"rate_limit_reached_type\":\"workspace_member_usage_limit_reached\",\
+            \"normal_model_slug\":\"gpt-6.1-sol\"}}}";
+        let read = rollout_rate_limits(line);
+        let [r] = read.as_slice() else {
+            panic!("one reading: {read:?}");
+        };
+        assert_eq!(r.at_ms, unix("2026-10-16T22:20:05Z") * 1000 + 645);
+        assert_eq!(r.at_unix, unix("2026-10-16T22:20:05Z"));
+        assert_eq!(r.family.as_str(), "codex");
+        assert_eq!(r.name.as_ref().map(Word::as_str), Some("Codex"));
+        assert_eq!(
+            r.windows,
+            vec![
+                Window {
+                    slot: Slot::Primary,
+                    used_percent: 30.0,
+                    window_minutes: Some(10080),
+                    resets_at: Some(1_792_192_805),
+                },
+                Window {
+                    slot: Slot::Secondary,
+                    used_percent: 10.0,
+                    window_minutes: Some(0),
+                    resets_at: None,
+                },
+            ]
+        );
+        assert_eq!(r.windows[0].bucket(), Bucket::Week, "a slot is no kind");
+        assert_eq!(r.windows[1].bucket(), Bucket::Unplaced(Slot::Secondary));
+        assert_eq!(
+            r.credits,
+            Some(Credits {
+                has_credits: Some(true),
+                unlimited: Some(false),
+                balance: Word::new("12"),
+            })
+        );
+        assert_eq!(r.individual_limit, Some(2500.0));
+        assert_eq!(r.spend_control_reached, Some(true));
+        assert_eq!(r.plan_type.as_ref().map(Word::as_str), Some("prolite"));
+        assert_eq!(
+            r.reached_type.as_ref().map(Word::as_str),
+            Some("workspace_member_usage_limit_reached")
+        );
+        assert_eq!(r.account, None, "text alone names no account");
+        let other = rate(T0, "codex_bengalfox", Some((3.0, 300, 1_792_200_000)), None);
+        let premium = rate(T0 + 1, "premium", None, None);
+        let both = rollout_rate_limits(&format!("{other}{premium}"));
+        assert_eq!(
+            both.iter().map(|r| r.family.as_str()).collect::<Vec<_>>(),
+            ["codex_bengalfox", "premium"]
+        );
+        assert!(both[1].windows.is_empty(), "a metadata-only family");
+        // A kind by its length, within 5%.
+        let kind = |minutes: Option<u64>| {
+            Window {
+                slot: Slot::Primary,
+                used_percent: 1.0,
+                window_minutes: minutes,
+                resets_at: None,
+            }
+            .bucket()
+        };
+        assert_eq!(kind(Some(285)), Bucket::FiveHour);
+        assert_eq!(kind(Some(315)), Bucket::FiveHour);
+        assert_eq!(kind(Some(284)), Bucket::Minutes(284));
+        assert_eq!(kind(Some(316)), Bucket::Minutes(316));
+        assert_eq!(kind(Some(1440)), Bucket::Day);
+        assert_eq!(kind(Some(10_584)), Bucket::Week);
+        assert_eq!(kind(Some(10_585)), Bucket::Minutes(10_585));
+        assert_eq!(kind(None), Bucket::Unplaced(Slot::Primary));
+        // NEGATIVE CONTROLS.
+        assert_eq!(
+            rollout_rate_limits(
+                &line.replace("\"limit_id\":\"codex\"", "\"limit_id\":\"co\\u001bdex\"")
+            ),
+            Vec::new()
+        );
+        assert_eq!(
+            rollout_rate_limits(&line.replace("\"limit_id\":\"codex\"", "\"limit_id\":null")),
+            Vec::new()
+        );
+        let drift = rollout_rate_limits(
+            &line
+                .replace("\"balance\":\"12\"", "\"balance\":12")
+                .replace(
+                    "\"individual_limit\":\"2500\"",
+                    "\"individual_limit\":{\"cap\":2500}",
+                ),
+        );
+        assert_eq!(
+            drift[0].credits.as_ref().and_then(|c| c.balance.clone()),
+            None
+        );
+        assert_eq!(drift[0].individual_limit, None);
+        assert_eq!(drift[0].windows.len(), 2, "the rest still reads");
+    }
+
+    /// THE ACCOUNT KEY IS THE FIRST LINE'S (design §3.1, F14): a rollout's
+    /// readings are keyed by the login its `session_meta` names, hashed; a
+    /// subagent's copy of its parent's `session_meta` further on (measured on
+    /// 0.163.0) does not rename it. Negative controls: an API-key login's
+    /// `session_meta` (no ids, measured), one with only one of the two ids,
+    /// and a line that is no `session_meta` name no account.
+    #[test]
+    fn a_rollouts_readings_are_keyed_by_its_first_lines_login() {
+        let first = meta_as(T0, SUB, ROOT, Some(ROOT), Some(PAGINATED), Some(LOGIN_A));
+        assert_eq!(opening_account(&first), key(LOGIN_A));
+        assert!(
+            key(LOGIN_A).is_some_and(|k| k.to_string().starts_with("x-")),
+            "Codex's key"
+        );
+        assert_ne!(key(LOGIN_A), key(LOGIN_B));
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("codex-usage-key-")
+            .tempdir()
+            .expect("temp dir");
+        let path = dir.path().join("rollout.jsonl");
+        let reset = T0 / 1000 + 3600;
+        std::fs::write(
+            &path,
+            [
+                first.clone(),
+                meta_as(T0, ROOT, ROOT, None, Some(PAGINATED), Some(LOGIN_B)),
+                context(T0 + 9, "gpt-6.1-sol", None),
+                rate(T0 + 24, "codex", Some((30.0, 300, reset)), None),
+            ]
+            .concat(),
+        )
+        .expect("write");
+        let read = rollout_readings(&path, CONTEXT_REACH).expect("read");
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].account, key(LOGIN_A));
+        // NEGATIVE CONTROLS.
+        let api_key = meta_as(T0, ROOT, ROOT, None, Some(PAGINATED), None);
+        assert_eq!(opening_account(&api_key), None);
+        let half = first.replace(",\"creator_user_id\":\"user-lab\"", "");
+        assert_eq!(opening_account(&half), None);
+        assert_eq!(opening_account(&context(T0, "gpt-6.1-sol", None)), None);
+        std::fs::write(
+            &path,
+            [
+                api_key,
+                rate(T0 + 24, "codex", Some((30.0, 300, reset)), None),
+            ]
+            .concat(),
+        )
+        .expect("write");
+        let read = rollout_readings(&path, CONTEXT_REACH).expect("read");
+        assert_eq!((read.len(), read[0].account), (1, None));
+    }
+
+    /// THE PICK (design §3.5, §4.3), decision by decision, each beside the
+    /// figure the rule it replaces — the newest reading by stamp — would
+    /// have given:
+    /// * a passed reset is void: the 95% of a window that has reset never
+    ///   stands, and a kind with nothing else reads empty;
+    /// * resets within [`ANCHOR_SLACK_S`] of the latest are one anchor, and
+    ///   the largest share within it wins: a later reading of 60% (a fork's
+    ///   copy, a stale process) never hides the real 95%;
+    /// * an earlier anchor is another window: a 99% read before an early
+    ///   reset moved the anchor 601 s later does not stand; at 600 s it is
+    ///   the same window;
+    /// * on a tie the earliest stamp is kept.
+    #[test]
+    fn the_pick_voids_passed_resets_and_keeps_the_largest_share_of_the_latest_anchor() {
+        let now = T0 / 1000;
+        let a = key(LOGIN_A);
+        let week = |ms: i64, used: f64, resets: i64| {
+            reading(ms, a, &[(Slot::Secondary, used, 10_080, resets)])
+        };
+        let newest_by_stamp = |rs: &[CodexLimits]| {
+            rs.iter()
+                .max_by_key(|r| r.at_ms)
+                .map(|r| r.windows[0].used_percent)
+        };
+        // Void.
+        let passed = week(T0 - 7_200_000, 95.0, now - 10);
+        let live = week(T0 - 3_600_000, 10.0, now + 432_000);
+        let p = pick(&apart(&[passed.clone(), live]), CODEX_FAMILY, now).expect("a pick");
+        assert_eq!(p.windows[0].used_percent, 10.0);
+        assert_eq!(p.void, Vec::<Bucket>::new());
+        let p = pick(&apart(&[passed]), CODEX_FAMILY, now).expect("a pick");
+        assert_eq!(
+            (p.windows.len(), p.void.as_slice()),
+            (0, &[Bucket::Week][..])
+        );
+        // The largest share of the anchor, never the newest stamp's.
+        let real = week(T0 - 1_800_000, 95.0, now + 432_000);
+        let copy = week(T0 - 60_000, 60.0, now + 432_100);
+        let rs = [real, copy];
+        assert_eq!(newest_by_stamp(&rs), Some(60.0), "the rule replaced");
+        let p = pick(&apart(&rs), CODEX_FAMILY, now).expect("a pick");
+        assert_eq!(p.windows[0].used_percent, 95.0);
+        assert_eq!(p.windows[0].resets_at, Some(now + 432_100), "the anchor");
+        assert_eq!(p.newest, (T0 - 60_000) / 1000);
+        // The anchor's edge.
+        let before = |moved: i64| {
+            [
+                week(T0 - 1_800_000, 99.0, now + 432_000),
+                week(T0 - 60_000, 50.0, now + 432_000 + moved),
+            ]
+        };
+        let same = pick(&apart(&before(ANCHOR_SLACK_S)), CODEX_FAMILY, now).expect("a pick");
+        assert_eq!(same.windows[0].used_percent, 99.0, "one anchor");
+        let later = pick(&apart(&before(ANCHOR_SLACK_S + 1)), CODEX_FAMILY, now).expect("a pick");
+        assert_eq!(
+            later.windows[0].used_percent, 50.0,
+            "an early reset's later anchor"
+        );
+        // The earliest stamp of a tie.
+        let tie = [
+            week(T0 - 25_200_000, 40.0, now + 432_000),
+            week(T0 - 3_600_000, 40.0, now + 432_000),
+        ];
+        let p = pick(&[tie.to_vec()], CODEX_FAMILY, now).expect("a pick");
+        assert_eq!(p.windows[0].as_of, (T0 - 25_200_000) / 1000);
+        // A flat share first read 7 h ago, read again within the hour: the
+        // account was read lately.
+        assert_eq!(p.newest, (T0 - 3_600_000) / 1000);
+        // NEGATIVE CONTROL: an account last read 7 h ago was not
+        // ([`FRESH_S`]).
+        let stale = pick(&apart(&tie[..1]), CODEX_FAMILY, now).expect("a pick");
+        assert!(now.saturating_sub(stale.newest) > FRESH_S);
+    }
+
+    /// ONE LOGIN'S FIGURES (design §3.5: the max rule merges by account key
+    /// and kind): after the home signs in to another login, the pick reads
+    /// the login the newest reading names, never the signed-out one's 97%.
+    /// A count written with no window (a tool call's answer carried no rate
+    /// headers in the lab, 2026-10-16) is no reading, so it neither names the
+    /// account nor freshens it. Negative control: the same readings with no
+    /// key — a home whose rollouts name no login — keep the 97% of the window
+    /// that resets last.
+    #[test]
+    fn the_pick_reads_the_newest_login_only() {
+        let now = T0 / 1000;
+        let signed_out = reading(
+            T0 - 3_600_000,
+            key(LOGIN_A),
+            &[(Slot::Secondary, 97.0, 10_080, now + 500_000)],
+        );
+        let signed_in = reading(
+            T0 - 600_000,
+            key(LOGIN_B),
+            &[(Slot::Secondary, 10.0, 10_080, now + 100_000)],
+        );
+        let p = pick(
+            &apart(&[signed_out.clone(), signed_in.clone()]),
+            CODEX_FAMILY,
+            now,
+        )
+        .expect("a pick");
+        assert_eq!(p.account, key(LOGIN_B));
+        assert_eq!(p.windows[0].used_percent, 10.0);
+        let bare = reading(T0 - 60_000, key(LOGIN_A), &[]);
+        let p = pick(
+            &apart(&[signed_out.clone(), signed_in.clone(), bare]),
+            CODEX_FAMILY,
+            now,
+        )
+        .expect("a pick");
+        assert_eq!((p.account, p.newest), (key(LOGIN_B), (T0 - 600_000) / 1000));
+        // NEGATIVE CONTROL.
+        let unkeyed = |mut r: CodexLimits| {
+            r.account = None;
+            r
+        };
+        let p = pick(
+            &apart(&[unkeyed(signed_out), unkeyed(signed_in)]),
+            CODEX_FAMILY,
+            now,
+        )
+        .expect("a pick");
+        assert_eq!(p.windows[0].used_percent, 97.0);
+    }
+
+    /// A DROP WITHIN ONE ROLLOUT OPENS THE WINDOW ANEW (design §3.5): the
+    /// lab's thread made under login A read 95% of its five-hour window;
+    /// resumed under login B (no second `session_meta`, so still A's key) its
+    /// next count read 20%, the anchor 42 s later. Inside one rollout a
+    /// smaller share in the same anchor is the server's word — a refill, or
+    /// another login answering — so the readings before it leave the max,
+    /// and a later, larger reading elsewhere still counts. Negative control:
+    /// the same readings in two rollouts are two threads, and a thread's
+    /// smaller share never cuts another's (a count written again from what
+    /// a thread held): the 95% stands.
+    #[test]
+    fn a_drop_within_one_rollout_opens_the_window_anew() {
+        let now = T0 / 1000;
+        let five = |ms: i64, used: f64, resets: i64| {
+            reading(ms, key(LOGIN_A), &[(Slot::Primary, used, 300, resets)])
+        };
+        let before = five(T0 - 42_000, 95.0, now + 3021);
+        let after = five(T0, 20.0, now + 3063);
+        let p = pick(&[vec![before.clone(), after.clone()]], CODEX_FAMILY, now).expect("a pick");
+        assert_eq!(p.windows[0].used_percent, 20.0);
+        let since = five(T0 + 60_000, 25.0, now + 3100);
+        let p = pick(
+            &[vec![before.clone(), after.clone()], vec![since]],
+            CODEX_FAMILY,
+            now + 60,
+        )
+        .expect("a pick");
+        assert_eq!(p.windows[0].used_percent, 25.0);
+        // NEGATIVE CONTROL.
+        let p = pick(&apart(&[before, after]), CODEX_FAMILY, now).expect("a pick");
+        assert_eq!(p.windows[0].used_percent, 95.0);
+    }
+
+    /// A LEGACY FORK'S COPY GIVES NO READING (module header, design §3.5):
+    /// 0.163.0's fork of a legacy thread copies its parent's counts, their
+    /// rate limits among them, under one fresh stamp; the readings of the
+    /// file are those past the copy, keyed by the fork's login. A rollout
+    /// that ends inside its copy gives none yet, and one whose copy runs
+    /// past the reach is unread. Negative control: read whole, a fork that
+    /// has served no turn yet would read its parent's 99% as its own newest
+    /// reading.
+    #[test]
+    fn a_legacy_forks_copied_readings_are_none_of_its_own() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("codex-usage-copy-")
+            .tempdir()
+            .expect("temp dir");
+        let path = dir.path().join("rollout.jsonl");
+        let now = T0 / 1000 + 30;
+        let reset = now + 3600;
+        let copy = [
+            meta_as(T0, SUB, SUB, Some(ROOT), Some("legacy"), Some(LOGIN_A)),
+            meta(T0, ROOT, ROOT, None),
+            context(T0, "gpt-6-luna", None),
+            rate(T0, "codex", Some((99.0, 300, reset)), None),
+            message(T0 + 1),
+        ]
+        .concat();
+        let own = [
+            context(T0 + 21_000, "gpt-6.1-sol", None),
+            rate(T0 + 21_010, "codex", Some((40.0, 300, reset + 30)), None),
+        ]
+        .concat();
+        std::fs::write(&path, format!("{copy}{own}")).expect("write");
+        let read = rollout_readings(&path, CONTEXT_REACH).expect("read");
+        assert_eq!(read.len(), 1, "{read:?}");
+        assert_eq!(read[0].windows[0].used_percent, 40.0);
+        assert_eq!(read[0].account, key(LOGIN_A));
+        assert_eq!(
+            pick(&[read], CODEX_FAMILY, now).map(|p| p.windows[0].used_percent),
+            Some(40.0)
+        );
+        assert_eq!(
+            rollout_readings(&path, 64),
+            None,
+            "a copy past the reach is unread"
+        );
+        let whole = rollout_rate_limits(&tail_of(&path, TAIL_BYTES).expect("tail"));
+        assert_eq!(whole.len(), 2, "the copy's 99% is in the text");
+        // Inside its copy still: no reading yet.
+        std::fs::write(&path, &copy).expect("write");
+        assert_eq!(rollout_readings(&path, CONTEXT_REACH), Some(Vec::new()));
+        // NEGATIVE CONTROL: read whole, the parent's 99% is the fork's newest
+        // reading, as fresh as the fork, before the fork has served a turn.
+        let whole = rollout_rate_limits(&tail_of(&path, TAIL_BYTES).expect("tail"));
+        let p = pick(&[whole], CODEX_FAMILY, now).expect("a pick");
+        assert_eq!((p.windows[0].used_percent, p.newest), (99.0, T0 / 1000));
+    }
+
+    /// ONE PICK, THE WAY THE AI CONNECTIONS READ IT ([`home_pick`]): a legacy
+    /// fork written
+    /// last, whose copy holds a fresh-stamped 60% of the window, does not
+    /// hide the real 95%; once the home's newest rollout is another login's,
+    /// that login's 10% is read. Negative controls: the newest reading by
+    /// stamp — the rule replaced — is the copy's 60%; and the same rollouts
+    /// naming no login keep the signed-out 95%.
+    #[test]
+    fn a_home_pick_trusts_neither_a_copy_nor_another_login() {
+        let home = aterm_tempfile::Builder::new()
+            .prefix("codex-usage-pick-")
+            .tempdir()
+            .expect("temp dir");
+        let day = home.path().join("sessions/2026/10/16");
+        std::fs::create_dir_all(&day).expect("mkdir");
+        let now = SystemTime::now();
+        let now_ms = i64::try_from(
+            now.duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock")
+                .as_millis(),
+        )
+        .expect("fits");
+        let now_unix = now_ms / 1000;
+        let week = now_unix + 300_000;
+        let write = |name: &str, body: String, age_s: u64| {
+            let path = day.join(name);
+            std::fs::write(&path, body).expect("write");
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .and_then(|f| f.set_modified(now - std::time::Duration::from_secs(age_s)))
+                .expect("mtime");
+        };
+        let real = [
+            meta_as(
+                now_ms - 7_200_000,
+                ROOT,
+                ROOT,
+                None,
+                Some(PAGINATED),
+                Some(LOGIN_A),
+            ),
+            rate(
+                now_ms - 1_800_000,
+                "codex",
+                None,
+                Some((95.0, 10_080, week)),
+            ),
+        ]
+        .concat();
+        let fork = [
+            meta_as(
+                now_ms - 60_000,
+                SUB,
+                SUB,
+                Some(ROOT),
+                Some("legacy"),
+                Some(LOGIN_A),
+            ),
+            rate(now_ms - 60_000, "codex", None, Some((60.0, 10_080, week))),
+        ]
+        .concat();
+        write(
+            &format!("rollout-2026-10-16T08-00-00-{ROOT}.jsonl"),
+            real.clone(),
+            1800,
+        );
+        write(
+            &format!("rollout-2026-10-16T09-00-00-{SUB}.jsonl"),
+            fork.clone(),
+            60,
+        );
+        let p = home_pick(home.path(), now_unix).expect("a pick");
+        assert_eq!(
+            (p.account, p.windows[0].used_percent, p.windows[0].resets_at),
+            (key(LOGIN_A), 95.0, Some(week))
+        );
+        // NEGATIVE CONTROL: the newest reading by stamp is the copy's.
+        let newest = [&real, &fork]
+            .iter()
+            .flat_map(|t| rollout_rate_limits(t))
+            .max_by_key(|r| r.at_ms)
+            .map(|r| r.windows[0].used_percent);
+        assert_eq!(newest, Some(60.0));
+        // Signed in to login B since: its own thread, its window resetting
+        // sooner.
+        let other = [
+            meta_as(
+                now_ms - 30_000,
+                OTHER,
+                OTHER,
+                None,
+                Some(PAGINATED),
+                Some(LOGIN_B),
+            ),
+            rate(
+                now_ms - 20_000,
+                "codex",
+                None,
+                Some((10.0, 10_080, week - 200_000)),
+            ),
+        ]
+        .concat();
+        write(
+            &format!("rollout-2026-10-16T10-00-00-{OTHER}.jsonl"),
+            other.clone(),
+            20,
+        );
+        let p = home_pick(home.path(), now_unix).expect("a pick");
+        assert_eq!((p.account, p.windows[0].used_percent), (key(LOGIN_B), 10.0));
+        // NEGATIVE CONTROL: no login named, the signed-out window stands.
+        let unnamed = |t: &str, login: (&str, &str)| {
+            t.replace(
+                &format!(
+                    ",\"creator_account_id\":\"{}\",\"creator_user_id\":\"{}\"",
+                    login.0, login.1
+                ),
+                "",
+            )
+        };
+        write(
+            &format!("rollout-2026-10-16T08-00-00-{ROOT}.jsonl"),
+            unnamed(&real, LOGIN_A),
+            1800,
+        );
+        write(
+            &format!("rollout-2026-10-16T09-00-00-{SUB}.jsonl"),
+            unnamed(&fork, LOGIN_A),
+            60,
+        );
+        write(
+            &format!("rollout-2026-10-16T10-00-00-{OTHER}.jsonl"),
+            unnamed(&other, LOGIN_B),
+            20,
+        );
+        let p = home_pick(home.path(), now_unix).expect("a pick");
+        assert_eq!((p.account, p.windows[0].used_percent), (None, 95.0));
+    }
+}

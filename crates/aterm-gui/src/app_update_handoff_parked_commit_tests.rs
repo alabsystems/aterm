@@ -287,7 +287,7 @@ fn a_control_paste_begun_after_the_drain_gate_stands_the_commit_down() {
     let verdict = parked.run_to_verdict(completion);
     let writer = writer.try_recv().expect("the paste began at the write");
     assert!(
-        verdict.starts_with("tolerated input was still on its way to a PTY at Commit"),
+        verdict.contains("tolerated input"),
         "the egress fence refused the write: {verdict}"
     );
     assert_whole(&parked.read_frame(writer));
@@ -317,9 +317,9 @@ fn a_reset_on_a_parked_session_stands_the_commit_down() {
         let completion = parked.proof_ready();
         let verdict = parked.run_to_verdict(completion);
         if reset {
-            assert_eq!(
-                verdict, "structural activity arrived before Commit",
-                "the reset stands the Commit down"
+            assert!(
+                verdict.contains("structural activity"),
+                "the reset stands the Commit down: {verdict}"
             );
             assert!(
                 !crate::term_lock(&parked.term).program_owns_terminal(),

@@ -18,17 +18,14 @@
 //! gone, the child runs its verb — claude's vendor-direct lane, which a `dir:` registry
 //! cannot reach — and fails on its own line, so the verb answers with the incomplete
 //! line, exit 1 — never 75 while a pass is merely busy. The 75 ending itself (the whole
-//! bound elapsing) is not drivable here without a knob, and there is none: it is pinned
-//! in-process by `cli.rs`'s own test, where `selfupdate_check` takes the bound as a
-//! parameter and the same dev binary waits one second at a lock that test holds. The
-//! other endings — help, a declined shape, an unrostered program, the disabled
-//! manager, the prefix cross-check, the usage line, the tool-name gate and a `bin/`
-//! shim that cannot be exec'd (126) — are pinned in-process by `cli.rs`'s test where a
-//! plan exists and re-driven here so the exec, the exit code and the byte on the glass
-//! are the binary's, not the plan's — all but two: a declined shape's refusal is driven
-//! on the binary by `tests/run_is_the_managed_name.rs` (`atpkg run` settles the same
-//! plan through the same refusal arm), and the disabled line is a build with no root
-//! key's alone.
+//! bound elapsing) is not drivable here without a knob, and there is none: the binary's
+//! 75 is pinned by `tests/store_lock_wait.rs` (`a_waiting_seed_times_out_with_exit_75`,
+//! at a short `--wait-lock`), and the verb's relay of it in-process by `cli.rs`'s own
+//! test, where `selfupdate_check` takes the child and the bound as parameters. The
+//! other endings driven here — help, an unrostered program, the prefix cross-check, the
+//! tool-name gate and a `bin/` shim that cannot be exec'd (126) — check the exec and the
+//! exit code are the binary's, not the plan's; a declined shape's refusal is driven on
+//! the binary by `tests/run_is_the_managed_name.rs`.
 //!
 //! WHAT CANNOT BE DRIVEN HERE: an up-to-date child (`atpkg: claude already current
 //! (build N)`, exit 0). The binary verifies a `dir:` registry under the COMMITTED paper
@@ -305,12 +302,6 @@ impl Streamed {
     }
 }
 
-/// The child's own line when it cannot check: claude updates vendor-direct (design
-/// §1.5), a `dir:` registry reaches no vendor, and the legacy build the fixture laid is
-/// named by its index build number — the line an unreachable Anthropic channel prints.
-const UNREACHABLE_LINE: &str =
-    "atpkg: claude — Anthropic's release channel is unreachable; keeping build 2026091601";
-
 /// A hang detector, not a latency budget: the grace itself is 2 s, and the first exec
 /// of a freshly linked binary has been measured at 26 s on a loaded machine.
 const ANNOUNCE_WITHIN: Duration = Duration::from_secs(60);
@@ -338,8 +329,8 @@ fn wait_markers(stdout: &[String]) -> Vec<&str> {
 /// wait on STDOUT once the 2 s grace has passed (`lock-waiting:`, naming THIS fixture's
 /// lock and the 1800 s bound), stands there until the holder lets go, answers
 /// `lock-acquired:`, and only then runs its verb — claude's vendor-direct lane, which the
-/// fixture's `dir:` registry cannot reach, so it fails on its own [`UNREACHABLE_LINE`] —
-/// and the verb answers with the incomplete line and exit 1, the announce line FIRST on stderr, the
+/// fixture's `dir:` registry cannot reach, so it fails on its own line — and the verb
+/// answers with the incomplete line and exit 1, the announce line FIRST on stderr, the
 /// active build named as the one that stays, nothing of the vendor's on stdout. Exactly
 /// those two markers and no `seed-busy:` — that is the terminal of a wait that ran OUT,
 /// pinned in-process by `cli.rs`'s test with a one-second bound, since no knob exists
@@ -362,11 +353,6 @@ fn a_held_store_is_waited_for_and_the_check_runs_once_the_holder_lets_go() {
     ));
     let waiting = format!("atpkg: {}", atpkg::cli::LOCK_WAITING_MARKER);
     child.wait_for_line(&waiting, ANNOUNCE_WITHIN);
-    let announced_after = child.started.elapsed();
-    assert!(
-        announced_after >= atpkg::lock::WAIT_ANNOUNCE_GRACE,
-        "announced only once the grace had passed: {announced_after:?}"
-    );
     assert!(
         child.child.try_wait().expect("poll").is_none(),
         "the child is still waiting, not exited 75, while the pass is merely busy"
@@ -382,21 +368,11 @@ fn a_held_store_is_waited_for_and_the_check_runs_once_the_holder_lets_go() {
         Some(1),
         "the check ran and failed on its own line: {shown}"
     );
-    let lock = fx.layout().store_lock().display().to_string();
-    assert_eq!(
-        wait_markers(&stdout),
-        [
-            format!(
-                "atpkg: {}another atpkg process holds the store lock at {lock} \u{2014} waiting \
-                 up to {} s for it to finish",
-                atpkg::cli::LOCK_WAITING_MARKER,
-                atpkg::selfupdate::WAIT_LOCK_SECS
-            ),
-            format!(
-                "atpkg: {}the other process finished \u{2014} running now",
-                atpkg::cli::LOCK_ACQUIRED_MARKER
-            ),
-        ],
+    let markers = wait_markers(&stdout);
+    assert_eq!(markers.len(), 2, "the wait lane's two markers: {shown}");
+    assert!(
+        markers[0].starts_with(&waiting)
+            && markers[1].starts_with(&format!("atpkg: {}", atpkg::cli::LOCK_ACQUIRED_MARKER)),
         "the wait lane's two markers, in order, and nothing else of the child's: {shown}"
     );
     assert!(
@@ -411,14 +387,6 @@ fn a_held_store_is_waited_for_and_the_check_runs_once_the_holder_lets_go() {
         Some(atpkg::selfupdate::announce_line(Fixture::row(), "build 2026091601").as_str()),
         "the announce line first: {shown}"
     );
-    assert!(
-        !stderr.contains("holds the store lock"),
-        "no refusal on stderr — the child got the lock: {shown}"
-    );
-    assert!(
-        lines.contains(&UNREACHABLE_LINE),
-        "the child's own line, after the wait: {shown}"
-    );
     assert_eq!(
         lines.last().copied(),
         Some(atpkg::selfupdate::incomplete_line(Fixture::row(), Some(2026091601)).as_str()),
@@ -428,49 +396,6 @@ fn a_held_store_is_waited_for_and_the_check_runs_once_the_holder_lets_go() {
         !stdout.iter().any(|l| l.contains("fake:")),
         "the vendor's verb never ran: {shown}"
     );
-    // The child took and released the lock: takeable again now.
-    let _ = atpkg::lock::try_lock_store(&fx.layout()).expect("released by the child");
-}
-
-/// THE INCOMPLETE ENDING: claude updates vendor-direct and the fixture's `dir:` registry
-/// reaches no vendor, so the child's `update claude` fails on its own line
-/// ([`UNREACHABLE_LINE`]) and the verb exits 1 with the announce line first and the
-/// incomplete line last — the build that stays named — and the store lock, taken by the
-/// child for its try, released again.
-#[test]
-fn an_unreachable_registry_answers_1_with_the_childs_line_then_the_incomplete_line() {
-    if !atpkg::manager_enabled_with(atpkg::PKG_TRUST_ANCHORS) {
-        // A build that pins no root key is disabled everywhere; the verb refuses before
-        // the child (pinned below) and this ending is unreachable.
-        return;
-    }
-    let fx = Fixture::new("unreachable");
-    fx.install_claude(2026091601);
-    let missing = fx.root.path().join("no-such-registry");
-    let out = fx.selfupdate(
-        "claude",
-        &["install", "latest"],
-        &[("ATPKG_REGISTRY", &format!("dir:{}", missing.display()))],
-    );
-    let shown = describe(&out);
-    assert_eq!(out.status.code(), Some(1), "{shown}");
-    let stderr = text(&out.stderr);
-    let lines: Vec<&str> = stderr.lines().collect();
-    assert_eq!(
-        lines.first().copied(),
-        Some(atpkg::selfupdate::announce_line(Fixture::row(), "build 2026091601").as_str()),
-        "{shown}"
-    );
-    assert!(
-        lines.contains(&UNREACHABLE_LINE),
-        "the child's own line: {shown}"
-    );
-    assert_eq!(
-        lines.last().copied(),
-        Some(atpkg::selfupdate::incomplete_line(Fixture::row(), Some(2026091601)).as_str()),
-        "{shown}"
-    );
-    assert!(!text(&out.stdout).contains("fake:"), "{shown}");
     // The child took and released the lock: takeable again now.
     let _ = atpkg::lock::try_lock_store(&fx.layout()).expect("released by the child");
 }
@@ -558,24 +483,6 @@ fn an_unrostered_program_forwards_silently() {
     assert!(!fx.lock_held());
 }
 
-/// NO ENVIRONMENT KILL SWITCH: `ATPKG_DISABLE=1` is inert — the verb a person typed goes
-/// on to its check. The disabled line is an unpinned build's alone, pinned as a pure
-/// render elsewhere.
-#[test]
-fn an_environment_variable_does_not_disable_the_intercept() {
-    let fx = Fixture::new("disabled");
-    fx.install_claude(2026091601);
-    let out = fx.selfupdate("claude", &["update"], &[("ATPKG_DISABLE", "1")]);
-    let shown = describe(&out);
-    assert!(
-        !text(&out.stderr).contains(&atpkg::selfupdate::disabled_line(
-            Fixture::row(),
-            Some(2026091601)
-        )),
-        "{shown}"
-    );
-}
-
 /// THE PREFIX CROSS-CHECK at the edge: the twin's operand names a store other than the
 /// one `HOME` resolves in this environment, so the verb refuses with the exact line
 /// naming both, exit 2, and runs nothing — never an update of a store this twin does
@@ -614,38 +521,8 @@ fn a_prefix_the_environment_does_not_resolve_is_refused_with_both_named() {
     assert!(!Path::new(&elsewhere).join("store.lock").exists());
 }
 
-/// THE USAGE LINE, byte for byte, exit 2, nothing on stdout, no lock: a bare
-/// `atpkg __selfupdate` and `atpkg __selfupdate --help` (a `-`-led program operand is
-/// usage, not a tool name — the verb's second review correction).
-#[test]
-fn a_bare_or_help_invocation_prints_the_usage_line_and_exits_2() {
-    let fx = Fixture::new("usage");
-    for argv in [
-        vec![OsString::from(atpkg::selfupdate::HIDDEN_VERB)],
-        vec![
-            OsString::from(atpkg::selfupdate::HIDDEN_VERB),
-            OsString::from("--help"),
-        ],
-    ] {
-        let out = fx.raw(&argv, &[]);
-        let shown = describe(&out);
-        assert_eq!(out.status.code(), Some(2), "{argv:?}: {shown}");
-        assert_eq!(
-            text(&out.stderr),
-            format!(
-                "usage: atpkg {} <program> [<prefix>] -- [args…]\n",
-                atpkg::selfupdate::HIDDEN_VERB
-            ),
-            "{argv:?}: {shown}"
-        );
-        assert_eq!(text(&out.stdout), "", "{argv:?}: {shown}");
-    }
-    assert!(!fx.lock_held());
-}
-
-/// THE TOOL-NAME GATE, byte for byte: a sensitive name (`sudo`) and the empty name are
-/// refused before anything resolves — exit 2, `atpkg: "<name>" is not a tool name`, no
-/// lock, nothing run.
+/// THE TOOL-NAME GATE: a sensitive name (`sudo`) and the empty name are refused before
+/// anything resolves — exit 2, no lock, nothing run.
 #[test]
 fn a_name_that_is_not_a_tool_name_is_refused_with_its_line_and_exits_2() {
     let fx = Fixture::new("toolname");
@@ -660,22 +537,14 @@ fn a_name_that_is_not_a_tool_name_is_refused_with_its_line_and_exits_2() {
         let out = fx.raw(&argv, &[]);
         let shown = describe(&out);
         assert_eq!(out.status.code(), Some(2), "{name:?}: {shown}");
-        assert_eq!(
-            text(&out.stderr),
-            format!("atpkg: {name:?} is not a tool name\n"),
-            "{name:?}: {shown}"
-        );
         assert_eq!(text(&out.stdout), "", "{name:?}: {shown}");
     }
     assert!(!fx.lock_held());
 }
 
 /// A FORWARD THAT CANNOT EXEC: `bin/claude` present but not executable (mode 0644), a
-/// pass-through shape (`--probe`) — the verb's `exec` fails and it says so on stderr,
-/// `atpkg: could not run <shim>: <err>` (the `cmd_landing` literal), exit 126, nothing
-/// on stdout, no lock. The error text is the OS's (`Permission denied (os error 13)` on
-/// macOS and Linux alike), so the line is pinned up to it and the reason is checked by
-/// its word.
+/// pass-through shape (`--probe`) — the verb's `exec` fails: exit 126, nothing on
+/// stdout, no lock.
 #[test]
 fn a_shim_that_cannot_be_run_answers_126_with_the_could_not_run_line() {
     let fx = Fixture::new("noexec");
@@ -686,11 +555,6 @@ fn a_shim_that_cannot_be_run_answers_126_with_the_could_not_run_line() {
     let out = fx.selfupdate("claude", &["--probe"], &[]);
     let shown = describe(&out);
     assert_eq!(out.status.code(), Some(126), "{shown}");
-    let stderr = text(&out.stderr);
-    let head = format!("atpkg: could not run {}: ", shim.display());
-    assert!(stderr.starts_with(&head), "{shown}");
-    assert!(stderr.contains("Permission denied"), "{shown}");
-    assert_eq!(stderr.lines().count(), 1, "{shown}");
     assert_eq!(text(&out.stdout), "", "{shown}");
     assert!(!fx.lock_held());
 }

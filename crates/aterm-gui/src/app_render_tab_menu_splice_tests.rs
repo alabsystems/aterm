@@ -214,3 +214,69 @@ fn the_card_is_pinned_out_of_the_sub_row_scroll_band() {
     app.splice_tab_menu(wid);
     assert_eq!(app.windows[&wid].input_scratch.grid_top_row, 1);
 }
+
+/// THE TAB MENU'S CARD IS ON TOP TOO (review of surfaces-F3): the card a
+/// right-click hangs under the strip is painted after the frame published
+/// its overlays, so a caret under it and a pet across its edge would paint
+/// over its rows. The splice hides the caret on the card and cuts the pet
+/// at the card's edge — its part beside the card stays. NEGATIVE CONTROL:
+/// with no card the same caret and pet stand whole.
+#[test]
+fn the_tab_menus_card_hides_the_caret_and_cuts_the_pet_under_it() {
+    use aterm_core::render::FreeSprite;
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    app.tab_strip_rows = 1;
+    assert!(app.open_tab_context_menu(wid, 0, 3, false));
+    composed_frame(&mut app, wid);
+    app.splice_tab_menu(wid);
+    let rect = app.windows[&wid].tab_menu_rect.expect("painted");
+    let (cw, ch) = app.win_cell_size(wid);
+    let px = |cells: usize, size: usize| i32::try_from(cells * size).unwrap();
+    let right = rect.col + rect.w;
+    assert!(
+        right + 3 < app.windows[&wid].input_scratch.cols,
+        "room beside it"
+    );
+    // A pet four cells wide across the card's right edge, on its second row,
+    // and the caret on the card.
+    let pet = FreeSprite {
+        x: px(right - 2, cw),
+        y: px(rect.row + 2, ch),
+        w: u16::try_from(4 * cw).unwrap(),
+        h: u16::try_from(ch).unwrap(),
+        aw: u16::try_from(4 * cw).unwrap(),
+        ah: u16::try_from(ch).unwrap(),
+        ..FreeSprite::default()
+    };
+    let publish = |app: &mut App| {
+        let s = &mut app.windows.get_mut(&wid).unwrap().input_scratch;
+        (s.cursor_row, s.cursor_col, s.cursor_visible) = (rect.row + 2, rect.col + 2, true);
+        s.free_sprites = vec![pet];
+    };
+    composed_frame(&mut app, wid);
+    publish(&mut app);
+    app.splice_tab_menu(wid);
+    let s = &app.windows[&wid].input_scratch;
+    assert!(!s.cursor_visible, "the caret under the card is hidden");
+    assert_eq!(
+        s.free_sprites
+            .iter()
+            .map(|q| (q.x, q.w, q.ax))
+            .collect::<Vec<_>>(),
+        [(
+            px(right, cw),
+            u16::try_from(2 * cw).unwrap(),
+            u16::try_from(2 * cw).unwrap()
+        )],
+        "the pet beside the card stays, the part on it goes"
+    );
+    // CONTROL: closed, the splice leaves both whole.
+    assert!(app.close_tab_menu(wid));
+    composed_frame(&mut app, wid);
+    publish(&mut app);
+    app.splice_tab_menu(wid);
+    let s = &app.windows[&wid].input_scratch;
+    assert!(s.cursor_visible, "CONTROL: no card, the caret stands");
+    assert_eq!(s.free_sprites, [pet], "CONTROL: no card, the pet is whole");
+}

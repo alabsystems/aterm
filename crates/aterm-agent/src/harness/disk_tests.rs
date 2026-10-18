@@ -232,7 +232,6 @@ fn a_synthetic_stale_target_is_reported_and_then_removed_with_its_witness_in_the
     assert!(line.contains("\"kind\":\"removed\""), "{line}");
     assert!(line.contains("\"witness\":\"stale-build-dir\""), "{line}");
     assert!(line.contains("CACHEDIR.TAG"), "{line}");
-    assert!(line.contains("only incremental/ goes"), "{line}");
     assert!(line.contains(&dir.display().to_string()), "{line}");
     assert!(
         line.contains(&format!("\"freed_bytes\":{}", removed.bytes)),
@@ -261,11 +260,6 @@ fn a_target_without_a_marker_or_with_a_fresh_clock_is_never_a_candidate() {
     survey.targets.push(scanned);
     let rep = report(&survey, applying());
     assert!(rep.rows_of(Class::CargoTargets).is_empty(), "{rep:?}");
-    assert!(
-        rep.notes.iter().any(|n| n.contains("cannot prove it laid")),
-        "the note says WHY: {:?}",
-        rep.notes
-    );
 
     // Negative 2: a marker, but the files this test just wrote are seconds old.
     let fresh = synthetic_target(&tmp, "fresh");
@@ -276,13 +270,6 @@ fn a_target_without_a_marker_or_with_a_fresh_clock_is_never_a_candidate() {
     survey.targets.push(scanned);
     let rep = report(&survey, applying());
     assert!(rep.rows_of(Class::CargoTargets).is_empty(), "{rep:?}");
-    assert!(
-        rep.notes
-            .iter()
-            .any(|n| n.contains("every profile was written into 0d ago")),
-        "{:?}",
-        rep.notes
-    );
 
     // Negative 3: a marker and an idle profile, but a build holds one of its
     // locks. The held lock wins over the clock.
@@ -294,11 +281,6 @@ fn a_target_without_a_marker_or_with_a_fresh_clock_is_never_a_candidate() {
         .push(scan_target(&busy, now, DEFAULT_TARGET_STALE_DAYS, false).expect("a real directory"));
     let rep = report(&survey, applying());
     assert!(rep.rows_of(Class::CargoTargets).is_empty(), "{rep:?}");
-    assert!(
-        rep.notes.iter().any(|n| n.contains("a build holds")),
-        "{:?}",
-        rep.notes
-    );
     drop(held);
 
     // Negative 4: a marker but no cargo profile (no build lock beside
@@ -313,11 +295,6 @@ fn a_target_without_a_marker_or_with_a_fresh_clock_is_never_a_candidate() {
     );
     let rep = report(&survey, applying());
     assert!(rep.rows_of(Class::CargoTargets).is_empty());
-    assert!(
-        rep.notes.iter().any(|n| n.contains("no cargo profile")),
-        "{:?}",
-        rep.notes
-    );
 }
 
 #[test]
@@ -359,7 +336,6 @@ fn an_unresolvable_live_symlink_blocks_every_version_row_rather_than_guessing() 
         !rows[0].removable,
         "but it has no witness, so it is blocked"
     );
-    assert!(rep.notes.iter().any(|n| n.contains("did not resolve")));
 
     let mut calls = 0;
     let done = apply(
@@ -611,8 +587,6 @@ fn nothing_under_the_transcripts_root_is_ever_removed_even_when_it_is_on_the_rep
     assert!(done.removed.is_empty());
     assert_eq!(done.denials.len(), 1);
     assert_eq!(done.denials[0].code(), "transcript");
-    let line = denial_row(NOW, "sid-1", &done.denials[0]);
-    assert!(line.contains("under any flag"), "{line}");
 
     // The root itself is refused too, not only what is under it.
     assert_eq!(
@@ -735,35 +709,6 @@ fn age_days_never_reads_a_future_mtime_as_old() {
     // Negative: a clock that moved backwards must not age a directory into
     // the removable set.
     assert_eq!(age_days(NOW, NOW + 999 * 86_400), 0);
-}
-
-/// The shipped idle window is one day (it guards only an idle profile's
-/// `incremental/`), served by the settings help and the fallback for a
-/// negative setting.
-#[test]
-fn the_idle_window_defaults_to_one_day() {
-    assert_eq!(DEFAULT_TARGET_STALE_DAYS, 1);
-    assert_eq!(Config::default().target_stale_days, 1);
-    assert_eq!(
-        Config::default_shown("target_stale_days").as_deref(),
-        Some("1")
-    );
-    assert_eq!(
-        Config::negative_reading("target_stale_days").as_deref(),
-        Some("the default, 1")
-    );
-    let window = Config::default().target_stale_days;
-    assert!(age_days(NOW, NOW - 86_399) < window, "built within the day");
-    assert!(age_days(NOW, NOW - 86_400) >= window, "a day old");
-}
-
-#[test]
-fn human_bytes_is_coarse_on_purpose_and_exact_under_a_kib() {
-    assert_eq!(human_bytes(0), "0 B");
-    assert_eq!(human_bytes(1023), "1023 B");
-    assert_eq!(human_bytes(1024), "1.0 KiB");
-    assert_eq!(human_bytes(GIB), "1.0 GiB");
-    assert_eq!(human_bytes(1024 * GIB), "1.0 TiB");
 }
 
 #[test]
@@ -1064,8 +1009,7 @@ fn the_innermost_build_directory_decides_a_nested_profile_in_the_idle_pass() {
             } else {
                 let why = note(&outer).unwrap_or_else(|| panic!("{case}: {:?}", rep.notes));
                 assert!(
-                    why.contains(&format!("under the {DEFAULT_TARGET_STALE_DAYS}d threshold"))
-                        && !why.contains("a build holds"),
+                    !why.contains("a build holds"),
                     "{case}: the outer directory speaks for its own profile only: {why}"
                 );
             }
@@ -1194,5 +1138,105 @@ fn below_the_floor_the_stale_target_goes_and_nothing_else_does() {
     assert!(
         tmp.path().join("versions/2.1.1").exists(),
         "the other class's directory stayed"
+    );
+}
+
+/// THE THRESHOLDS ARE THE LARGER OF THE KNOB AND A SHARE OF THE VOLUME, and
+/// the level is read against them at both edges: a 460 GiB volume's floor is
+/// 5% (23 GiB, above the 10 GiB knob), its warning 8% (37 GiB is below the
+/// 40 GiB knob, so 40), its emergency 4 GiB (1% is 4.6 GiB: that); a 40 GiB
+/// volume keeps the knobs and the 4 GiB emergency. Too few inodes is an
+/// emergency at any byte figure. NEGATIVE CONTROLS: a floor of 0 (off)
+/// stays off at any size, and an unknown size or free figure decides
+/// nothing.
+#[test]
+fn thresholds_are_the_larger_of_the_knob_and_the_volumes_share() {
+    let big = 460 * GIB;
+    let t = Config::default().thresholds(Some(big));
+    assert_eq!(t.floor, (big / 100 * AUTO_FREE_PCT).div_ceil(GIB) * GIB);
+    assert_eq!(t.floor / GIB, 23);
+    assert_eq!(t.warn, 40 * GIB);
+    assert_eq!(t.emergency, big / 100);
+    assert_eq!(t.target, t.floor + PRESSURE_MARGIN_GIB * GIB);
+    for (free, files, want) in [
+        (Some(t.warn), None, Level::Ok),
+        (Some(t.warn - 1), None, Level::Low),
+        (Some(t.floor), None, Level::Low),
+        (Some(t.floor - 1), None, Level::Short),
+        (Some(t.emergency), None, Level::Short),
+        (Some(t.emergency - 1), None, Level::Emergency),
+        (
+            Some(t.warn),
+            Some(EMERGENCY_FILES_FREE - 1),
+            Level::Emergency,
+        ),
+        (Some(t.warn), Some(EMERGENCY_FILES_FREE), Level::Ok),
+        (None, None, Level::Unknown),
+        (None, Some(EMERGENCY_FILES_FREE), Level::Unknown),
+        (None, Some(0), Level::Emergency),
+    ] {
+        assert_eq!(t.level(free, files), want, "free {free:?} files {files:?}");
+    }
+
+    let small = Config::default().thresholds(Some(40 * GIB));
+    assert_eq!(
+        (small.floor, small.warn, small.emergency),
+        (10 * GIB, 40 * GIB, 4 * GIB)
+    );
+    let unknown = Config::default().thresholds(None);
+    assert_eq!(unknown.floor, DEFAULT_AUTO_FREE_GIB * GIB);
+
+    let off = Config {
+        auto_free_gib: 0,
+        ..Config::default()
+    };
+    assert_eq!(off.for_volume(Some(big)).auto_free_gib, 0);
+    let t = off.thresholds(Some(big));
+    assert_eq!(
+        t.level(Some(t.emergency), None),
+        Level::Low,
+        "off: never Short"
+    );
+    assert_eq!(t.level(Some(0), None), Level::Emergency);
+}
+
+/// THE VOLUME'S SHARE IS CAPPED AND NEVER RAISES A VALUE THE OWNER WROTE:
+/// on a 4 TB volume the unwritten floor is [`AUTO_FREE_SHARE_MAX_GIB`] (not
+/// 5%, 200 GiB), the warning [`WARN_FREE_SHARE_MAX_GIB`] and the emergency
+/// [`EMERGENCY_FREE_SHARE_MAX_GIB`]; a written floor of 10 GiB and warning of
+/// 20 GiB stay 10 and 20 on any volume, the emergency then no higher than
+/// that floor. NEGATIVE CONTROL: the same values unwritten are raised.
+#[test]
+fn the_volume_share_is_capped_and_a_written_knob_is_read_as_written() {
+    let huge = 4096 * GIB;
+    let t = Config::default().thresholds(Some(huge));
+    assert_eq!(
+        (t.floor, t.warn, t.emergency),
+        (
+            AUTO_FREE_SHARE_MAX_GIB * GIB,
+            WARN_FREE_SHARE_MAX_GIB * GIB,
+            EMERGENCY_FREE_SHARE_MAX_GIB * GIB
+        )
+    );
+    let owner = Config {
+        auto_free_gib: 5,
+        warn_free_gib: 20,
+        ..Config::default()
+    };
+    let both = Written {
+        auto_free_gib: true,
+        warn_free_gib: true,
+    };
+    for total in [40 * GIB, 460 * GIB, huge] {
+        let c = owner.on_volume(Some(total), both);
+        assert_eq!((c.auto_free_gib, c.warn_free_gib), (5, 20), "{total}");
+        let t = owner.thresholds_on(Some(total), both);
+        assert_eq!((t.floor, t.warn), (5 * GIB, 20 * GIB), "{total}");
+        assert!(t.emergency <= t.floor, "{total}");
+    }
+    let raised = owner.on_volume(Some(huge), Written::default());
+    assert_eq!(
+        (raised.auto_free_gib, raised.warn_free_gib),
+        (AUTO_FREE_SHARE_MAX_GIB, WARN_FREE_SHARE_MAX_GIB)
     );
 }

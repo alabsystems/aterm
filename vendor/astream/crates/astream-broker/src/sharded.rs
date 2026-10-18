@@ -39,6 +39,25 @@ use std::path::Path;
 use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
 
+#[cfg(clean_islands)]
+#[path = "sharded_island.rs"]
+mod sharded_island;
+#[cfg(not(clean_islands))]
+pub use crate::twins::sharded_clamp_index;
+#[cfg(clean_islands)]
+pub use sharded_island::sharded_clamp_index;
+
+contract_fn! {
+    /// Verified check that a shard count is positive (`0 < shards`),
+    /// linked via `clean-kernel-defeq` to `sharded_count_nonzero_isl`.
+    #[must_use]
+    pub fn sharded_count_nonzero(shards: u32) -> bool
+    clauses [ensures result == (0 < shards)]
+    {
+        0 < shards
+    }
+}
+
 /// The sidecar file (in the log directory and in the socket directory) that records
 /// the shard count a deployment was created with.
 pub const SHARDS_FILE: &str = "shards";
@@ -185,7 +204,7 @@ impl ShardedBroker {
         std::fs::create_dir_all(dir)?;
         let shards = shards.max(1);
         check_or_record_log_shards(dir, shards)?;
-        let mut brokers = Vec::with_capacity(shards as usize);
+        let mut brokers = Vec::new();
         for i in 0..shards {
             brokers.push(Broker::open_with(
                 dir.join(format!("shard-{i}.log")),
@@ -203,7 +222,7 @@ impl ShardedBroker {
         let dir = sock_dir.as_ref();
         std::fs::create_dir_all(dir)?;
         write_shards_file(dir, self.shards)?;
-        let mut handles = Vec::with_capacity(self.shards as usize);
+        let mut handles = Vec::new();
         for (i, b) in self.brokers.iter().enumerate() {
             handles.push(b.serve(dir.join(format!("shard-{i}.sock")))?);
         }
@@ -254,7 +273,7 @@ impl ShardedClient {
         let dir = sock_dir.as_ref();
         let shards = shards.max(1);
         check_sock_shards(dir, shards)?;
-        let mut conns = Vec::with_capacity(shards as usize);
+        let mut conns = Vec::new();
         for i in 0..shards {
             conns.push(Client::connect(dir.join(format!("shard-{i}.sock")))?);
         }
@@ -334,8 +353,8 @@ impl ShardedSubscription {
         // Drop closes + joins whatever was already spawned.
         let mut this = ShardedSubscription {
             rx,
-            closers: Vec::with_capacity(shards as usize),
-            forwarders: Vec::with_capacity(shards as usize),
+            closers: Vec::new(),
+            forwarders: Vec::new(),
         };
         for i in 0..shards {
             let mut sub = Client::connect(dir.join(format!("shard-{i}.sock")))?

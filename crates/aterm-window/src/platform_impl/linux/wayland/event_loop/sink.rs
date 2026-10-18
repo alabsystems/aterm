@@ -5,14 +5,16 @@
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
 //! An event loop's sink to deliver events from the Wayland event callbacks.
+//!
+//! Modified by the aterm project in 2026; see the repository NOTICE. (`push_device_event`
+//! left with the relative pointer, its one caller: docs/AUDIT-third-party-2026-10-15.md, LW.7.)
 
 use std::vec::Drain;
 
-use crate::event::{DeviceEvent, DeviceId as RootDeviceId, Event, WindowEvent};
-use crate::platform_impl::platform::DeviceId as PlatformDeviceId;
+use crate::event::{Event, WindowEvent};
 use crate::window::WindowId as RootWindowId;
 
-use super::{DeviceId, WindowId};
+use crate::platform_impl::wayland::WindowId;
 
 /// An event loop's sink to deliver events from the Wayland event callbacks
 /// to the winit's user.
@@ -30,15 +32,6 @@ impl EventSink {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.window_events.is_empty()
-    }
-
-    /// Add new device event to a queue.
-    #[inline]
-    pub fn push_device_event(&mut self, event: DeviceEvent, device_id: DeviceId) {
-        self.window_events.push(Event::DeviceEvent {
-            event,
-            device_id: RootDeviceId(PlatformDeviceId::Wayland(device_id)),
-        });
     }
 
     /// Add new window event to a queue.

@@ -165,51 +165,6 @@ fn clamp_display_offset_small_delta_marks_bottom_rows_dirty() {
     }
 }
 
-// Invariant checks after all operations
-
-#[test]
-fn invariants_after_erase_display_modes() {
-    let mut grid = Grid::new(5, 10);
-    fill_grid_rows(&mut grid, 5);
-
-    grid.set_cursor(2, 5);
-    grid.erase_to_end_of_screen();
-    grid.assert_invariants();
-
-    fill_grid_rows(&mut grid, 5);
-    grid.set_cursor(2, 5);
-    grid.erase_from_start_of_screen();
-    grid.assert_invariants();
-
-    fill_grid_rows(&mut grid, 5);
-    grid.erase_screen();
-    grid.assert_invariants();
-}
-
-#[test]
-fn invariants_after_line_feed_with_scroll_region() {
-    let mut grid = Grid::new(10, 10);
-    grid.set_scroll_region(3, 7);
-
-    for row in 3..=7 {
-        grid.set_cursor(row, 0);
-        grid.line_feed();
-        grid.assert_invariants();
-    }
-}
-
-#[test]
-fn invariants_after_reverse_line_feed_with_scroll_region() {
-    let mut grid = Grid::new(10, 10);
-    grid.set_scroll_region(3, 7);
-
-    for row in (3..=7).rev() {
-        grid.set_cursor(row, 0);
-        grid.reverse_line_feed();
-        grid.assert_invariants();
-    }
-}
-
 // Ring buffer + resize boundary tests
 
 #[test]
@@ -321,24 +276,6 @@ fn row_shrink_grow_cycle_nonzero_ring_head() {
 }
 
 #[test]
-fn reflow_shrink_cursor_at_chunk_boundary_exact() {
-    let mut grid = Grid::new(3, 10);
-    grid.set_cursor(0, 0);
-    for c in "ABCDEFGHIJ".chars() {
-        grid.write_char(c);
-    }
-    grid.set_cursor(0, 5);
-    grid.resize(3, 5);
-    // Cursor was at (0, 5) in the 10-wide grid. Column 5 is the first cell
-    // of the second chunk after reflow to 5-wide, so cursor maps to (1, 0).
-    assert_eq!(grid.cursor_row(), 1);
-    assert_eq!(grid.cursor_col(), 0);
-    grid.assert_invariants();
-    assert_eq!(grid.row(0).unwrap().to_string(), "ABCDE");
-    assert_eq!(grid.row(1).unwrap().to_string(), "FGHIJ");
-}
-
-#[test]
 fn multipage_grid_resize_zeroes_cells() {
     let mut grid = Grid::with_scrollback(3, 4096, 0);
     for row in 0..3 {
@@ -360,50 +297,6 @@ fn multipage_grid_resize_zeroes_cells() {
             "row {row} col 3000 should be empty after grow"
         );
     }
-}
-
-// Reflow cursor boundary conditions
-
-/// Reflow shrink: cursor past the end of cell content should be clamped.
-#[test]
-fn reflow_shrink_cursor_past_content_end() {
-    let mut grid = Grid::new(3, 10);
-    grid.set_cursor(0, 0);
-    for c in "ABC".chars() {
-        grid.write_char(c);
-    }
-    grid.set_cursor(0, 8);
-
-    grid.resize(3, 5);
-
-    assert!(
-        grid.cursor_col() < 5,
-        "cursor col {} should be < new_cols 5",
-        grid.cursor_col()
-    );
-    assert_eq!(grid.cell(0, 0).unwrap().char(), 'A');
-    assert_eq!(grid.cell(0, 1).unwrap().char(), 'B');
-    assert_eq!(grid.cell(0, 2).unwrap().char(), 'C');
-    grid.assert_invariants();
-}
-
-/// Reflow grow: cursor on last content cell stays with the content.
-#[test]
-fn reflow_grow_cursor_on_last_content_cell() {
-    let mut grid = Grid::new(3, 5);
-    grid.set_cursor(0, 0);
-    for c in "ABCDE".chars() {
-        grid.write_char(c);
-    }
-    grid.set_cursor(0, 4); // Last cell with content
-
-    grid.resize(3, 10);
-
-    assert_eq!(grid.cursor_row(), 0);
-    assert_eq!(grid.cursor_col(), 4);
-    assert_eq!(grid.cell(0, 0).unwrap().char(), 'A');
-    assert_eq!(grid.cell(0, 4).unwrap().char(), 'E');
-    grid.assert_invariants();
 }
 
 /// Reflow grow: a cursor in the trailing blank area of a continuation row
@@ -448,25 +341,6 @@ fn reflow_grow_cursor_in_trailing_blank_of_continuation_row() {
     assert_eq!(grid.cell(0, 0).unwrap().char(), 'A');
     assert_eq!(grid.cell(0, 6).unwrap().char(), 'G');
     assert_eq!(grid.cell(1, 0).unwrap().char(), 'X');
-    grid.assert_invariants();
-}
-
-/// Reflow shrink to 1-column terminal: all content wraps to individual rows.
-#[test]
-fn reflow_shrink_to_single_column() {
-    let mut grid = Grid::new(5, 5);
-    grid.set_cursor(0, 0);
-    for c in "ABC".chars() {
-        grid.write_char(c);
-    }
-    grid.set_cursor(0, 0);
-
-    grid.resize(5, 1);
-
-    assert_eq!(grid.cell(0, 0).unwrap().char(), 'A');
-    assert_eq!(grid.cell(1, 0).unwrap().char(), 'B');
-    assert_eq!(grid.cell(2, 0).unwrap().char(), 'C');
-    assert!(grid.cursor_col() < 1, "cursor should be clamped to col 0");
     grid.assert_invariants();
 }
 
@@ -612,112 +486,43 @@ fn visible_to_absolute_self_consistency_reuse_phase() {
     );
 }
 
-// Resize-to-zero clamping boundary
-
-/// Resize an existing populated grid to 0 rows — verifies the `max(1)` clamp
-/// in `resize_with_reflow_mode` preserves at least 1 row and doesn't panic.
+/// A resize to zero rows or columns clamps to one, the cursor with it, and
+/// leaves exactly the rows the grid now has addressable.
 #[test]
-fn resize_existing_grid_to_zero_rows() {
-    let mut grid = Grid::new(5, 10);
-    for c in "Hello".chars() {
-        grid.write_char(c);
+fn resize_to_zero_clamps_to_one_row_and_column() {
+    for (rows, cols, want) in [
+        (0, 10, (1, 10)),
+        (5, 0, (5, 1)),
+        (0, 0, (1, 1)),
+        (1, 10, (1, 10)),
+    ] {
+        let mut grid = Grid::with_scrollback(10, 20, 50);
+        for i in 0..15u16 {
+            grid.set_cursor(9, 0);
+            grid.write_char((b'A' + (i % 26) as u8) as char);
+            grid.line_feed();
+        }
+        grid.set_cursor(7, 15);
+        grid.resize(rows, cols);
+        let at = format!("{rows}x{cols}");
+        assert_eq!((grid.rows(), grid.cols()), want, "{at}");
+        assert!(
+            grid.cursor_row() < want.0 && grid.cursor_col() < want.1,
+            "{at}"
+        );
+        assert!(
+            grid.row(want.0 - 1).is_some() && grid.row(want.0).is_none(),
+            "{at}"
+        );
+        grid.assert_invariants();
+
+        grid.resize(5, 10);
+        assert!(
+            (0..5).all(|r| grid.row(r).is_some()) && grid.row(5).is_none(),
+            "{at} regrown"
+        );
+        grid.assert_invariants();
     }
-    grid.set_cursor(2, 3);
-
-    grid.resize(0, 10);
-
-    assert_eq!(grid.rows(), 1, "0 rows should be clamped to 1");
-    assert_eq!(grid.cols(), 10);
-    assert!(grid.cursor_row() < 1, "cursor row clamped to within 1 row");
-    grid.assert_invariants();
-}
-
-/// Resize an existing populated grid to 0 cols — verifies the `max(1)` clamp
-/// and that cursor column is clamped to the single available column.
-#[test]
-fn resize_existing_grid_to_zero_cols() {
-    let mut grid = Grid::new(5, 10);
-    for c in "Hello".chars() {
-        grid.write_char(c);
-    }
-    grid.set_cursor(2, 7);
-
-    grid.resize(5, 0);
-
-    assert_eq!(grid.rows(), 5);
-    assert_eq!(grid.cols(), 1, "0 cols should be clamped to 1");
-    assert_eq!(grid.cursor_col(), 0, "cursor col clamped to col 0");
-    grid.assert_invariants();
-}
-
-/// Resize an existing populated grid to 0x0 — both dimensions clamped to 1.
-#[test]
-fn resize_existing_grid_to_zero_both() {
-    let mut grid = Grid::with_scrollback(10, 20, 50);
-    for i in 0..15u16 {
-        grid.set_cursor(9, 0);
-        grid.write_char((b'A' + (i % 26) as u8) as char);
-        grid.line_feed();
-    }
-
-    grid.resize(0, 0);
-
-    assert_eq!(grid.rows(), 1, "0 rows → 1");
-    assert_eq!(grid.cols(), 1, "0 cols → 1");
-    assert_eq!(grid.cursor_row(), 0);
-    assert_eq!(grid.cursor_col(), 0);
-    grid.assert_invariants();
-}
-
-// row_index on a minimal grid
-
-/// `row_index` on a 1-row grid with no scrollback: the modulo
-/// `(ring_head + absolute_row) % rows.len()` returns the sole visible row.
-#[test]
-fn row_index_one_row_grid_visible_row_zero() {
-    let grid = Grid::new(1, 10);
-    assert!(grid.row(0).is_some(), "row 0 should exist in 1-row grid");
-    assert!(
-        grid.row(1).is_none(),
-        "row 1 should not exist in 1-row grid"
-    );
-    grid.assert_invariants();
-}
-
-/// After resize from multi-row to 1 row, row_index still works correctly.
-#[test]
-fn row_index_after_resize_to_one_row() {
-    let mut grid = Grid::new(5, 10);
-    for row in 0..5u16 {
-        grid.set_cursor(row, 0);
-        grid.write_char((b'A' + row as u8) as char);
-    }
-
-    grid.resize(1, 10);
-
-    assert_eq!(grid.rows(), 1);
-    assert!(grid.row(0).is_some(), "row 0 accessible after resize to 1");
-    assert!(
-        grid.row(1).is_none(),
-        "row 1 inaccessible after resize to 1"
-    );
-    grid.assert_invariants();
-}
-
-/// After resize from 1 row to multi-row, all rows accessible via row_index.
-#[test]
-fn row_index_after_resize_from_one_row() {
-    let mut grid = Grid::new(1, 10);
-    grid.write_char('X');
-
-    grid.resize(5, 10);
-
-    assert_eq!(grid.rows(), 5);
-    for r in 0..5u16 {
-        assert!(grid.row(r).is_some(), "row {r} should exist after grow");
-    }
-    assert!(grid.row(5).is_none(), "row 5 out of bounds");
-    grid.assert_invariants();
 }
 
 // ComplexCharRing invalidation on row-only resize

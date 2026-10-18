@@ -5,7 +5,11 @@
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
 // Modified by the aterm project in 2026; see the repository NOTICE. (Dropped the startup
-// notification flow: it served only the deleted `startup_notify` extension.)
+// notification flow's token request, which served only the deleted `startup_notify`
+// extension; the launchee's half lives on in `startup_notify.rs`. A broken X connection ends
+// the loop with the errno Xlib saw: `end_if_connection_lost`. The server is spoken to through
+// first-party `aterm-x11` and the loop waits in `common::poll`, where upstream used x11rb,
+// x11-dl and calloop: docs/AUDIT-third-party-2026-10-15.md, LW.7.)
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -14,30 +18,20 @@ use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::ops::Deref;
 use std::os::raw::*;
-use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use std::{fmt, ptr, slice, str};
 
-use calloop::generic::Generic;
-use calloop::ping::Ping;
-use calloop::{EventLoop as Loop, Readiness};
+use aterm_x11::proto::{xinput, xproto};
 use libc::{setlocale, LC_CTYPE};
 use tracing::warn;
-
-use x11rb::connection::RequestConnection;
-use x11rb::errors::{ConnectError, ConnectionError, IdsExhausted, ReplyError};
-use x11rb::protocol::xinput::{self, ConnectionExt as _};
-use x11rb::protocol::xkb;
-use x11rb::protocol::xproto::{self, ConnectionExt as _};
-use x11rb::x11_utils::X11Error as LogicalError;
-use x11rb::xcb_ffi::ReplyOrIdError;
 
 use crate::error::{EventLoopError, OsError as RootOsError};
 use crate::event::{Event, StartCause, WindowEvent};
 use crate::event_loop::{ActiveEventLoop as RootAEL, ControlFlow, DeviceEvents, EventLoopClosed};
 use crate::platform::pump_events::PumpStatus;
+use crate::platform_impl::common::poll::{self, Waker};
 use crate::platform_impl::common::xkb::Context;
 use crate::platform_impl::platform::{min_timeout, WindowId};
 use crate::platform_impl::{
@@ -51,6 +45,7 @@ mod event_processor;
 pub mod ffi;
 mod ime;
 mod monitor;
+mod startup_notify;
 mod util;
 mod window;
 mod xdisplay;
@@ -66,19 +61,18 @@ pub(crate) use monitor::{MonitorHandle, VideoModeHandle};
 use window::UnownedWindow;
 pub(crate) use xdisplay::{XConnection, XError, XNotSupported};
 
-// Xinput constants not defined in x11rb
-const ALL_DEVICES: u16 = 0;
-const ALL_MASTER_DEVICES: u16 = 1;
+const ALL_DEVICES: u16 = xinput::ALL_DEVICES;
+const ALL_MASTER_DEVICES: u16 = xinput::ALL_MASTER_DEVICES;
 const ICONIC_STATE: u32 = 3;
 
-/// The underlying x11rb connection that we are using.
-type X11rbConnection = x11rb::xcb_ffi::XCBConnection;
-
-type X11Source = Generic<BorrowedFd<'static>>;
+/// XKB's `EventType` bits that `XkbSelectEvents` takes (`X11/XKB.h`).
+const XKB_NEW_KEYBOARD_NOTIFY_MASK: c_ulong = 1 << 0;
+const XKB_MAP_NOTIFY_MASK: c_ulong = 1 << 1;
+const XKB_STATE_NOTIFY_MASK: c_ulong = 1 << 2;
 
 struct WakeSender<T> {
     sender: Sender<T>,
-    waker: Ping,
+    waker: Waker,
 }
 
 impl<T> Clone for WakeSender<T> {
@@ -91,7 +85,7 @@ impl<T> WakeSender<T> {
     pub fn send(&self, t: T) -> Result<(), EventLoopClosed<T>> {
         let res = self.sender.send(t).map_err(|e| EventLoopClosed(e.0));
         if res.is_ok() {
-            self.waker.ping();
+            self.waker.wake();
         }
         res
     }
@@ -149,20 +143,11 @@ pub struct ActiveEventLoop {
 
 pub struct EventLoop<T: 'static> {
     loop_running: bool,
-    event_loop: Loop<'static, EventLoopState>,
-    waker: calloop::ping::Ping,
+    waker: Waker,
     event_processor: EventProcessor,
     redraw_receiver: PeekableReceiver<WindowId>,
     user_receiver: PeekableReceiver<T>,
     user_sender: Sender<T>,
-
-    /// The current state of the event loop.
-    state: EventLoopState,
-}
-
-struct EventLoopState {
-    /// The latest readiness state for the x11 file descriptor
-    x11_readiness: Readiness,
 }
 
 pub struct EventLoopProxy<T: 'static> {
@@ -226,52 +211,24 @@ impl<T: 'static> EventLoop<T> {
 
         let xi2ext = xconn
             .xcb_connection()
-            .extension_information(xinput::X11_EXTENSION_NAME)
+            .extension(xinput::NAME)
             .expect("Failed to query XInput extension")
             .expect("X server missing XInput extension");
         let xkbext = xconn
             .xcb_connection()
-            .extension_information(xkb::X11_EXTENSION_NAME)
+            .extension(xdisplay::XKB_EXTENSION_NAME)
             .expect("Failed to query XKB extension")
             .expect("X server missing XKB extension");
 
         // Check for XInput2 support.
         xconn
-            .xcb_connection()
-            .xinput_xi_query_version(2, 3)
-            .expect("Failed to send XInput2 query version request")
-            .reply()
+            .request(xinput::xi_query_version(xi2ext.major_opcode, 2, 3))
             .expect("Error while checking for XInput2 query version reply");
 
         xconn.update_cached_wm_info(root);
 
-        // Create an event loop.
-        let event_loop =
-            Loop::<EventLoopState>::try_new().expect("Failed to initialize the event loop");
-        let handle = event_loop.handle();
-
-        // Create the X11 event dispatcher.
-        let source = X11Source::new(
-            // SAFETY: xcb owns the FD and outlives the source.
-            unsafe { BorrowedFd::borrow_raw(xconn.xcb_connection().as_raw_fd()) },
-            calloop::Interest::READ,
-            calloop::Mode::Level,
-        );
-        handle
-            .insert_source(source, |readiness, _, state| {
-                state.x11_readiness = readiness;
-                Ok(calloop::PostAction::Continue)
-            })
-            .expect("Failed to register the X11 event dispatcher");
-
-        let (waker, waker_source) =
-            calloop::ping::make_ping().expect("Failed to create event loop waker");
-        event_loop
-            .handle()
-            .insert_source(waker_source, move |_, _, _| {
-                // No extra handling is required, we just need to wake-up.
-            })
-            .expect("Failed to register the event loop waker source");
+        // The loop waits on the X connection's socket and this waker.
+        let waker = Waker::new().expect("Failed to create event loop waker");
 
         // Create a channel for handling redraw requests.
         let (redraw_sender, redraw_channel) = mpsc::channel();
@@ -279,8 +236,7 @@ impl<T: 'static> EventLoop<T> {
         // Create a channel for sending user events.
         let (user_sender, user_channel) = mpsc::channel();
 
-        let xkb_context =
-            Context::from_x11_xkb(xconn.xcb_connection().get_raw_xcb_connection()).unwrap();
+        let xkb_context = Context::from_x11_xkb(xconn.xcb_connection().as_raw().as_ptr()).unwrap();
 
         let mut xmodmap = util::ModifierKeymap::new();
         xmodmap.reload_from_x_connection(&xconn);
@@ -333,19 +289,13 @@ impl<T: 'static> EventLoop<T> {
         let xconn = &EventProcessor::window_target(&event_processor.target).xconn;
 
         xconn
-            .select_xinput_events(
-                root,
-                ALL_DEVICES,
-                x11rb::protocol::xinput::XIEventMask::HIERARCHY,
-            )
+            .select_xinput_events(root, ALL_DEVICES, xinput::event_mask::HIERARCHY)
             .expect_then_ignore_error("Failed to register for XInput2 device hotplug events");
 
         xconn
             .select_xkb_events(
-                0x100, // Use the "core keyboard device"
-                xkb::EventType::NEW_KEYBOARD_NOTIFY
-                    | xkb::EventType::MAP_NOTIFY
-                    | xkb::EventType::STATE_NOTIFY,
+                ffi::XKB_USE_CORE_KBD, // Use the "core keyboard device"
+                XKB_NEW_KEYBOARD_NOTIFY_MASK | XKB_MAP_NOTIFY_MASK | XKB_STATE_NOTIFY_MASK,
             )
             .unwrap();
 
@@ -353,13 +303,11 @@ impl<T: 'static> EventLoop<T> {
 
         EventLoop {
             loop_running: false,
-            event_loop,
             waker,
             event_processor,
             redraw_receiver: PeekableReceiver::from_recv(redraw_channel),
             user_receiver: PeekableReceiver::from_recv(user_channel),
             user_sender,
-            state: EventLoopState { x11_readiness: Readiness::EMPTY },
         }
     }
 
@@ -394,11 +342,13 @@ impl<T: 'static> EventLoop<T> {
         // Applications aren't allowed to carry windows between separate
         // `run_on_demand` calls but if they have only just dropped their
         // windows we need to make sure those last requests are sent to the
-        // X Server.
+        // X Server. A broken connection has no server to sync with.
         let wt = EventProcessor::window_target(&self.event_processor.target);
-        wt.x_connection().sync_with_server().map_err(|x_err| {
-            EventLoopError::Os(os_error!(OsError::XError(Arc::new(X11Error::Xlib(x_err)))))
-        })?;
+        if wt.x_connection().connection_lost().is_none() {
+            wt.x_connection().sync_with_server().map_err(|x_err| {
+                EventLoopError::Os(os_error!(OsError::XError(Arc::new(X11Error::Xlib(x_err)))))
+            })?;
+        }
 
         exit
     }
@@ -416,7 +366,7 @@ impl<T: 'static> EventLoop<T> {
 
         // Consider the possibility that the `StartCause::Init` iteration could
         // request to Exit.
-        if !self.exiting() {
+        if !self.exiting() && !self.end_if_connection_lost() {
             self.poll_events_with_timeout(timeout, &mut callback);
         }
         if let Some(code) = self.exit_code() {
@@ -428,6 +378,28 @@ impl<T: 'static> EventLoop<T> {
         } else {
             PumpStatus::Continue
         }
+    }
+
+    /// End the loop, with the errno Xlib saw when it names a connection's end
+    /// (else 1), once the connection to the X server is broken
+    /// ([`XConnection::connection_lost`]): no further iteration runs, so no
+    /// callback makes a request on the dead connection. Whether it was.
+    fn end_if_connection_lost(&self) -> bool {
+        let wt = EventProcessor::window_target(&self.event_processor.target);
+        let Some(errno) = wt.x_connection().connection_lost() else {
+            return false;
+        };
+        if self.exit_code().is_none() {
+            // Xlib's errno is whatever the last call left: with Xvfb killed
+            // under aterm-gui it was EPIPE, EAGAIN or EINVAL from run to run
+            // (the Linux lane, 2026-10-17), and only the first says why.
+            let names_the_end = matches!(
+                errno,
+                libc::EPIPE | libc::ECONNRESET | libc::ECONNABORTED | libc::ENOTCONN
+            );
+            self.set_exit_code(if names_the_end { errno } else { 1 });
+        }
+        true
     }
 
     fn has_pending(&mut self) -> bool {
@@ -442,7 +414,12 @@ impl<T: 'static> EventLoop<T> {
     {
         let start = Instant::now();
 
+        // `XPending` reads the connection, so it is where Xlib usually finds
+        // it broken.
         let has_pending = self.has_pending();
+        if self.end_if_connection_lost() {
+            return;
+        }
 
         timeout = if has_pending {
             // If we already have work to do then we don't want to block on the next poll.
@@ -459,13 +436,22 @@ impl<T: 'static> EventLoop<T> {
             min_timeout(control_flow_timeout, timeout)
         };
 
-        self.state.x11_readiness = Readiness::EMPTY;
-        if let Err(error) =
-            self.event_loop.dispatch(timeout, &mut self.state).map_err(std::io::Error::from)
-        {
+        let x11_fd = {
+            let wt = EventProcessor::window_target(&self.event_processor.target);
+            wt.xconn.xcb_connection().file_descriptor()
+        };
+        let mut fds = [poll::readable(x11_fd), poll::readable(self.waker.as_raw_fd())];
+        if let Err(error) = poll::wait(&mut fds, timeout) {
             tracing::error!("Failed to poll for events: {error:?}");
             let exit_code = error.raw_os_error().unwrap_or(1);
             self.set_exit_code(exit_code);
+            return;
+        }
+        if poll::ready(&fds[1]) {
+            // No extra handling is required, we just need to wake-up.
+            self.waker.drain();
+        }
+        if self.end_if_connection_lost() {
             return;
         }
 
@@ -515,6 +501,11 @@ impl<T: 'static> EventLoop<T> {
 
         // Process all pending events
         self.drain_events(callback);
+        // Reading them can find the connection broken: nothing after this
+        // may make a request on it.
+        if self.end_if_connection_lost() {
+            return;
+        }
 
         // Empty the user event buffer
         {
@@ -590,18 +581,6 @@ impl<T: 'static> EventLoop<T> {
     }
 }
 
-impl<T> AsFd for EventLoop<T> {
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        self.event_loop.as_fd()
-    }
-}
-
-impl<T> AsRawFd for EventLoop<T> {
-    fn as_raw_fd(&self) -> RawFd {
-        self.event_loop.as_raw_fd()
-    }
-}
-
 impl ActiveEventLoop {
     /// Returns the `XConnection` of this events loop.
     #[inline]
@@ -630,13 +609,13 @@ impl ActiveEventLoop {
         let device_events = self.device_events.get() == DeviceEvents::Always
             || (focus && self.device_events.get() == DeviceEvents::WhenFocused);
 
-        let mut mask = xinput::XIEventMask::from(0u32);
+        let mut mask = 0;
         if device_events {
-            mask = xinput::XIEventMask::RAW_MOTION
-                | xinput::XIEventMask::RAW_BUTTON_PRESS
-                | xinput::XIEventMask::RAW_BUTTON_RELEASE
-                | xinput::XIEventMask::RAW_KEY_PRESS
-                | xinput::XIEventMask::RAW_KEY_RELEASE;
+            mask = xinput::event_mask::RAW_MOTION
+                | xinput::event_mask::RAW_BUTTON_PRESS
+                | xinput::event_mask::RAW_BUTTON_RELEASE
+                | xinput::event_mask::RAW_KEY_PRESS
+                | xinput::event_mask::RAW_KEY_RELEASE;
         }
 
         self.xconn
@@ -764,7 +743,7 @@ impl Drop for Window {
         let window = self.deref();
         let xconn = &window.xconn;
 
-        if let Ok(c) = xconn.xcb_connection().destroy_window(window.id().0 as xproto::Window) {
+        if let Ok(c) = xconn.send_void(xproto::destroy_window(window.id().0 as xproto::Window)) {
             c.ignore_error();
         }
     }
@@ -776,17 +755,10 @@ pub enum X11Error {
     /// An error from the Xlib library.
     Xlib(XError),
 
-    /// An error that occurred while trying to connect to the X server.
-    Connect(ConnectError),
-
-    /// An error that occurred over the connection medium.
-    Connection(ConnectionError),
-
-    /// An error that occurred logically on the X11 end.
-    X11(LogicalError),
-
-    /// The XID range has been exhausted.
-    XidsExhausted(IdsExhausted),
+    /// A request, its reply or the connection under Xlib failed: the server's error for
+    /// the request, a broken connection, an answer that did not parse, or the XID range
+    /// spent.
+    X11(aterm_x11::Error),
 
     /// Got `null` from an Xlib function without a reason.
     UnexpectedNull(&'static str),
@@ -808,11 +780,8 @@ impl fmt::Display for X11Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             X11Error::Xlib(e) => write!(f, "Xlib error: {e}"),
-            X11Error::Connect(e) => write!(f, "X11 connection error: {e}"),
-            X11Error::Connection(e) => write!(f, "X11 connection error: {e}"),
-            X11Error::XidsExhausted(e) => write!(f, "XID range exhausted: {e}"),
             X11Error::GetProperty(e) => write!(f, "Failed to get X property {e}"),
-            X11Error::X11(e) => write!(f, "X11 error: {e:?}"),
+            X11Error::X11(e) => write!(f, "X11 error: {e}"),
             X11Error::UnexpectedNull(s) => write!(f, "Xlib function returned null: {s}"),
             X11Error::MissingExtension(s) => write!(f, "Missing X11 extension: {s}"),
             X11Error::NoSuchVisual(visualid) => {
@@ -829,9 +798,7 @@ impl std::error::Error for X11Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             X11Error::Xlib(e) => Some(e),
-            X11Error::Connect(e) => Some(e),
-            X11Error::Connection(e) => Some(e),
-            X11Error::XidsExhausted(e) => Some(e),
+            X11Error::X11(e) => Some(e),
             _ => None,
         }
     }
@@ -843,30 +810,9 @@ impl From<XError> for X11Error {
     }
 }
 
-impl From<ConnectError> for X11Error {
-    fn from(e: ConnectError) -> Self {
-        X11Error::Connect(e)
-    }
-}
-
-impl From<ConnectionError> for X11Error {
-    fn from(e: ConnectionError) -> Self {
-        X11Error::Connection(e)
-    }
-}
-
-impl From<LogicalError> for X11Error {
-    fn from(e: LogicalError) -> Self {
+impl From<aterm_x11::Error> for X11Error {
+    fn from(e: aterm_x11::Error) -> Self {
         X11Error::X11(e)
-    }
-}
-
-impl From<ReplyError> for X11Error {
-    fn from(value: ReplyError) -> Self {
-        match value {
-            ReplyError::ConnectionError(e) => e.into(),
-            ReplyError::X11Error(e) => e.into(),
-        }
     }
 }
 
@@ -875,16 +821,6 @@ impl From<ime::ImeContextCreationError> for X11Error {
         match value {
             ime::ImeContextCreationError::XError(e) => e.into(),
             ime::ImeContextCreationError::Null => Self::UnexpectedNull("XOpenIM"),
-        }
-    }
-}
-
-impl From<ReplyOrIdError> for X11Error {
-    fn from(value: ReplyOrIdError) -> Self {
-        match value {
-            ReplyOrIdError::ConnectionError(e) => e.into(),
-            ReplyOrIdError::X11Error(e) => e.into(),
-            ReplyOrIdError::IdsExhausted => Self::XidsExhausted(IdsExhausted),
         }
     }
 }
@@ -902,7 +838,17 @@ impl From<util::GetPropertyError> for X11Error {
 }
 
 /// Type alias for a void cookie.
-type VoidCookie<'a> = x11rb::cookie::VoidCookie<'a, X11rbConnection>;
+type VoidCookie<'a> = aterm_x11::VoidCookie<'a>;
+
+/// x11rb's name for dropping a void request's cookie: the request's error, if the server
+/// sends one, is discarded when it arrives.
+trait IgnoreError {
+    fn ignore_error(self);
+}
+
+impl IgnoreError for VoidCookie<'_> {
+    fn ignore_error(self) {}
+}
 
 /// Extension trait for `Result<VoidCookie, E>`.
 trait CookieResultExt {
@@ -953,14 +899,14 @@ impl Device {
         if Device::physical_device(info) {
             // Identify scroll axes
             for &class_ptr in Device::classes(info) {
-                let ty = unsafe { (*class_ptr)._type };
-                if ty == ffi::XIScrollClass {
+                let ty = unsafe { (*class_ptr).type_ };
+                if ty == ffi::xi::SCROLL_CLASS {
                     let info = unsafe { &*(class_ptr as *const ffi::XIScrollClassInfo) };
                     scroll_axes.push((info.number, ScrollAxis {
                         increment: info.increment,
                         orientation: match info.scroll_type {
-                            ffi::XIScrollTypeHorizontal => ScrollOrientation::Horizontal,
-                            ffi::XIScrollTypeVertical => ScrollOrientation::Vertical,
+                            ffi::xi::SCROLL_TYPE_HORIZONTAL => ScrollOrientation::Horizontal,
+                            ffi::xi::SCROLL_TYPE_VERTICAL => ScrollOrientation::Vertical,
                             _ => unreachable!(),
                         },
                         position: 0.0,
@@ -978,8 +924,8 @@ impl Device {
     fn reset_scroll_position(&mut self, info: &ffi::XIDeviceInfo) {
         if Device::physical_device(info) {
             for &class_ptr in Device::classes(info) {
-                let ty = unsafe { (*class_ptr)._type };
-                if ty == ffi::XIValuatorClass {
+                let ty = unsafe { (*class_ptr).type_ };
+                if ty == ffi::xi::VALUATOR_CLASS {
                     let info = unsafe { &*(class_ptr as *const ffi::XIValuatorClassInfo) };
                     if let Some(&mut (_, ref mut axis)) =
                         self.scroll_axes.iter_mut().find(|&&mut (axis, _)| axis == info.number)
@@ -993,9 +939,9 @@ impl Device {
 
     #[inline]
     fn physical_device(info: &ffi::XIDeviceInfo) -> bool {
-        info._use == ffi::XISlaveKeyboard
-            || info._use == ffi::XISlavePointer
-            || info._use == ffi::XIFloatingSlave
+        info.use_ == ffi::xi::SLAVE_KEYBOARD
+            || info.use_ == ffi::xi::SLAVE_POINTER
+            || info.use_ == ffi::xi::FLOATING_SLAVE
     }
 
     #[inline]

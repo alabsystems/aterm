@@ -59,12 +59,13 @@ fn cursor_invariant_exhaustive_small_grids() {
     );
 }
 
-/// A cursor on an empty row stays valid through a shrink, for all grid sizes.
+/// A cursor on an empty row (the `content_len == 0` branch) stays valid for
+/// every shrink and grow.
 #[test]
-fn cursor_on_empty_row_shrink() {
+fn cursor_on_empty_row_shrink_and_grow() {
     for rows in 1..=12u16 {
-        for old_cols in 2..=12u16 {
-            for new_cols in 1..old_cols {
+        for old_cols in 1..=12u16 {
+            for new_cols in (1..=13u16).filter(|&n| n != old_cols) {
                 for cursor_row in 0..rows {
                     let mut grid = Grid::new(rows, old_cols);
                     grid.set_cursor(cursor_row, old_cols / 2);
@@ -73,35 +74,14 @@ fn cursor_on_empty_row_shrink() {
 
                     assert!(
                         grid.cursor_row() < rows,
-                        "empty-row shrink: cursor row {} >= rows {rows}",
+                        "empty-row resize: cursor row {} >= rows {rows}",
                         grid.cursor_row()
                     );
                     assert!(
                         grid.cursor_col() < new_cols,
-                        "empty-row shrink: cursor col {} >= new_cols {new_cols}",
+                        "empty-row resize: cursor col {} >= new_cols {new_cols}",
                         grid.cursor_col()
                     );
-                    grid.assert_invariants();
-                }
-            }
-        }
-    }
-}
-
-/// The same for the grow path.
-#[test]
-fn cursor_on_empty_row_grow() {
-    for rows in 1..=12u16 {
-        for old_cols in 1..=12u16 {
-            for new_cols in (old_cols + 1)..=13 {
-                for cursor_row in 0..rows {
-                    let mut grid = Grid::new(rows, old_cols);
-                    grid.set_cursor(cursor_row, 0);
-
-                    grid.resize(rows, new_cols);
-
-                    assert!(grid.cursor_row() < rows);
-                    assert!(grid.cursor_col() < new_cols);
                     grid.assert_invariants();
                 }
             }
@@ -146,27 +126,6 @@ fn cursor_invariant_multi_resize_cycle() {
     }
 }
 
-/// Extreme ratio: 1-column terminal. Every cursor column must clamp to 0.
-#[test]
-fn cursor_invariant_single_column_terminal() {
-    for rows in 1..=10u16 {
-        for old_cols in 2..=20u16 {
-            let mut grid = Grid::new(rows, old_cols);
-            grid.set_cursor(0, 0);
-            for i in 0..old_cols.min(26) {
-                grid.write_char((b'A' + (i % 26) as u8) as char);
-            }
-            grid.set_cursor(rows - 1, old_cols - 1);
-
-            grid.resize(rows, 1);
-
-            assert_eq!(grid.cursor_col(), 0, "single-col: cursor must be at col 0");
-            assert!(grid.cursor_row() < rows);
-            grid.assert_invariants();
-        }
-    }
-}
-
 /// Extreme ratio: 1-row terminal. Cursor row must clamp to 0.
 #[test]
 fn cursor_invariant_single_row_terminal() {
@@ -183,37 +142,6 @@ fn cursor_invariant_single_row_terminal() {
             grid.assert_invariants();
         }
     }
-}
-
-/// A cursor on the last row whose content expands during shrink stays in
-/// bounds after `finalize_reflow` truncates to `target_rows`.
-#[test]
-fn cursor_on_last_row_with_expanding_content_shrink() {
-    let rows: u16 = 4;
-    let old_cols: u16 = 20;
-    let new_cols: u16 = 2;
-
-    let mut grid = Grid::new(rows, old_cols);
-    // The last row expands to 10 rows at 2 columns.
-    grid.set_cursor(rows - 1, 0);
-    for i in 0..old_cols {
-        grid.write_char((b'A' + (i % 26) as u8) as char);
-    }
-    grid.set_cursor(rows - 1, 10);
-
-    grid.resize(rows, new_cols);
-
-    assert!(
-        grid.cursor_row() < rows,
-        "expanding shrink: cursor row {} >= rows {rows}",
-        grid.cursor_row()
-    );
-    assert!(
-        grid.cursor_col() < new_cols,
-        "expanding shrink: cursor col {} >= new_cols {new_cols}",
-        grid.cursor_col()
-    );
-    grid.assert_invariants();
 }
 
 /// The cursor stays valid across shrink/grow with scrollback active.

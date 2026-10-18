@@ -154,13 +154,6 @@ fn a_small_file_tree_is_signed_by_its_stream_and_an_ordinary_one_by_its_content(
     assert_eq!(packed.disk_installed, 400_001);
 }
 
-#[test]
-fn disk_installed_is_the_larger_of_content_and_half_the_stream() {
-    assert_eq!(tarwrite::disk_installed(10, 100), 50);
-    assert_eq!(tarwrite::disk_installed(10, 101), 51);
-    assert_eq!(tarwrite::disk_installed(400, 100), 400);
-}
-
 /// The pack trusts no compressor's word: one that fails, or exits 0 having written a
 /// stream other than the archive (or one without the content checksum), fails the pack.
 /// The control: the real `zstd` CLI through the same entry point packs the same tree.

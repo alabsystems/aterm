@@ -2,42 +2,62 @@
 // Copyright 2026 Andrew Yates
 
 //! The machine's [`World`]: `gh`, the release download host, `curl` for the live
-//! site, the site's own scripts and `firebase`.
+//! site, the wasm32 pin's stock cargo and `wasm-opt` for the `/terminal` engine, the
+//! site's `deploy.sh` and `firebase`.
 
 use std::io::{BufRead as _, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use aterm_uds::spawnfd::{Command, Stdio, command};
+use aterm_verify::wasm_glue::WASM_OPT_FLAGS;
 
+use super::engine::{STEM, TARGET};
 use super::{Launch, Ran, World, output};
 
 /// The variables that relocate cargo's output or replace its compiler or flags: the
-/// engine's inputs are the fresh clone, its pin and the site's script, never the
-/// caller's shell (a `CARGO_TARGET_DIR` makes the site's script read an empty
-/// target directory; a `RUSTC_WRAPPER` that caps lints changes what compiles).
-pub const ENGINE_BUILD_UNSET: [&str; 10] = [
+/// engine's inputs are the fresh clone and its pin, never the caller's shell (a
+/// `CARGO_TARGET_DIR` or build dir moves the build out of the clone the remaps cover; a
+/// `RUSTC_WRAPPER` that caps lints changes what compiles). The build then sets `RUSTC`,
+/// `CARGO_TARGET_DIR` and `CARGO_ENCODED_RUSTFLAGS` itself; the last outranks every
+/// other rustflags source, so the caller's flags never reach the module.
+pub const ENGINE_BUILD_UNSET: [&str; 12] = [
     "CARGO_TARGET_DIR",
     "CARGO_BUILD_TARGET_DIR",
+    "CARGO_BUILD_BUILD_DIR",
     "RUSTC",
     "CARGO_BUILD_RUSTC",
     "RUSTC_WRAPPER",
     "CARGO_BUILD_RUSTC_WRAPPER",
     "RUSTC_WORKSPACE_WRAPPER",
     "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+    "RUSTFLAGS",
     "CARGO_ENCODED_RUSTFLAGS",
     "CARGO_BUILD_RUSTFLAGS",
 ];
 
-/// The site's `build-terminal-wasm.sh` over `clone`, from the site directory, handed
-/// the wasm32 pin, with [`ENGINE_BUILD_UNSET`] and `unset` removed.
-#[must_use]
-pub fn engine_command(script: &Path, clone: &Path, pin: Option<&str>, unset: &[String]) -> Command {
-    let mut build = command(script);
-    build.arg(clone);
-    if let Some(dir) = script.parent() {
-        build.current_dir(dir);
-    }
+/// `pin`'s own `cargo` (STOCK EXCEPTION: Trust ships only its host std) building the
+/// CPU module in `clone`: release profile, the clone's own lock, wasm32, the output in
+/// the clone's `target/`. [`ENGINE_BUILD_UNSET`] and `unset` are removed, then `pin`'s
+/// `rustc` is named and `rustflags` are handed over as `CARGO_ENCODED_RUSTFLAGS`
+/// ([`encoded_rustflags`]). Cargo takes that variable over every other rustflags source
+/// (`RUSTFLAGS`, `CARGO_TARGET_<TRIPLE>_RUSTFLAGS`, `--config`, the `target` and `build`
+/// rustflags of any config file above the clone or in `CARGO_HOME`), exactly as the site
+/// script's `RUSTFLAGS` did, and with `--target` hands it to the wasm32 units alone.
+///
+/// # Errors
+/// A flag [`encoded_rustflags`] cannot carry.
+pub fn module_command(
+    cargo: &Path,
+    rustc: &Path,
+    pin: &str,
+    clone: &Path,
+    rustflags: &[String],
+    unset: &[String],
+) -> Result<Command, String> {
+    let encoded = encoded_rustflags(rustflags)?;
+    let mut build = command(cargo);
+    build.current_dir(clone);
     for name in ENGINE_BUILD_UNSET
         .iter()
         .copied()
@@ -45,10 +65,56 @@ pub fn engine_command(script: &Path, clone: &Path, pin: Option<&str>, unset: &[S
     {
         build.env_remove(name);
     }
-    if let Some(pin) = pin {
-        build.env("TERMINAL_WASM_TOOLCHAIN", pin);
-    }
     build
+        .env("RUSTC", rustc)
+        .env("RUSTUP_TOOLCHAIN", pin)
+        .env("CARGO_TARGET_DIR", clone.join("target"))
+        .env("CARGO_ENCODED_RUSTFLAGS", encoded)
+        .args([
+            "build",
+            "--release",
+            "--locked",
+            "--target",
+            TARGET,
+            "-p",
+            "aterm-wasm",
+        ]);
+    Ok(build)
+}
+
+/// `flags` as `CARGO_ENCODED_RUSTFLAGS` spells them: joined by the unit separator
+/// (0x1f), so a path with a space stays one flag.
+///
+/// # Errors
+/// A flag that holds 0x1f itself, which cargo would split in two.
+pub fn encoded_rustflags(flags: &[String]) -> Result<String, String> {
+    match flags.iter().find(|f| f.contains('\x1f')) {
+        Some(flag) => Err(format!(
+            "the rustflag {flag:?} holds 0x1f, which CARGO_ENCODED_RUSTFLAGS splits on"
+        )),
+        None => Ok(flags.join("\x1f")),
+    }
+}
+
+/// Where [`module_command`] leaves the CPU module.
+#[must_use]
+pub fn module_path(clone: &Path) -> PathBuf {
+    clone
+        .join("target")
+        .join(TARGET)
+        .join("release")
+        .join(format!("{STEM}.wasm"))
+}
+
+/// This process's `RUSTUP_HOME` and `CARGO_HOME`, handed back to a rustup or cargo
+/// child after the release's scrub (which drops every `RUST*`/`CARGO*` name), as the
+/// release's wasm32 gate keeps them: the pin lives where this machine's rustup put it.
+fn keep_rust_homes(cmd: &mut Command) {
+    for name in ["RUSTUP_HOME", "CARGO_HOME"] {
+        if let Some(v) = std::env::var_os(name) {
+            cmd.env(name, v);
+        }
+    }
 }
 
 /// The site's `deploy.sh`, run in `site`, with `unset` removed.
@@ -89,11 +155,30 @@ pub fn firebase_probe_command(
     probe
 }
 
+/// How long the output is still read once the child has exited: a daemon it left
+/// behind may hold the pipe for ever, and the deploy must not wait on it
+/// (`release_steps`' rule for a streamed step).
+const DRAIN_AFTER_EXIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// What the reader and the waiter hand the copying loop.
+enum Event {
+    Line(Vec<u8>),
+    End,
+    Exited(std::io::Result<std::process::ExitStatus>),
+}
+
 /// `cmd` started through `launch` with its stdout and stderr on one pipe, each line
 /// copied to `out` as it arrives: its exit code and everything it printed. Bytes that
-/// are not UTF-8 are shown replaced and the pipe is read to its end, so the child never
-/// meets a closed pipe mid-deploy.
-fn streamed(launch: &dyn Launch, cmd: &mut Command, out: &mut dyn Write) -> Result<Ran, String> {
+/// are not UTF-8 are shown replaced. The pipe is read to its end while the child runs,
+/// so the child never meets a closed pipe mid-deploy; once it has exited, for at most
+/// `drain` more ([`DRAIN_AFTER_EXIT`] in a deploy) — whatever it left holding the pipe
+/// is not waited on.
+fn streamed(
+    launch: &dyn Launch,
+    cmd: &mut Command,
+    out: &mut dyn Write,
+    drain: std::time::Duration,
+) -> Result<Ran, String> {
     let (reader, writer) = std::io::pipe().map_err(|e| format!("cannot make a pipe: {e}"))?;
     let second = writer
         .try_clone()
@@ -104,26 +189,60 @@ fn streamed(launch: &dyn Launch, cmd: &mut Command, out: &mut dyn Write) -> Resu
     cmd.stdout(Stdio::null()).stderr(Stdio::null());
     let (mut child, guard) =
         spawned.map_err(|e| format!("cannot run {:?}: {e}", cmd.get_program()))?;
+    let (tx, rx) = std::sync::mpsc::channel::<Event>();
+    let lines = tx.clone();
+    // Detached: a reader blocked on a pipe a daemon holds ends when the daemon does.
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(reader);
+        loop {
+            let mut line = Vec::new();
+            match reader.read_until(b'\n', &mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    if lines.send(Event::Line(line)).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+        let _ = lines.send(Event::End);
+    });
+    let waiter = std::thread::spawn(move || {
+        let _ = tx.send(Event::Exited(child.wait()));
+    });
     let mut log = String::new();
-    let mut reader = BufReader::new(reader);
-    let mut line = Vec::new();
-    loop {
-        line.clear();
-        match reader.read_until(b'\n', &mut line) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {
+    let (mut status, mut ended, mut until) = (None, false, None);
+    while status.is_none() || !ended {
+        let event = match until {
+            None => rx.recv().ok(),
+            Some(until) => rx
+                .recv_timeout(until - std::time::Instant::now().min(until))
+                .ok(),
+        };
+        match event {
+            Some(Event::Line(line)) => {
                 let text = String::from_utf8_lossy(&line);
                 let text = text.strip_suffix('\n').unwrap_or(&text);
                 let _ = writeln!(out, "{text}");
                 log.push_str(text);
                 log.push('\n');
             }
+            Some(Event::End) => ended = true,
+            Some(Event::Exited(s)) => {
+                status = Some(s);
+                until = Some(std::time::Instant::now() + drain);
+            }
+            // the drain's bound passed with the pipe still held
+            None => break,
         }
     }
-    let status = child.wait().map_err(|e| format!("wait: {e}"));
+    let _ = waiter.join();
     drop(guard);
+    let status = status
+        .ok_or_else(|| "wait: the child's status was never read".to_string())?
+        .map_err(|e| format!("wait: {e}"))?;
     Ok(Ran {
-        code: status?.code().unwrap_or(-1),
+        code: status.code().unwrap_or(-1),
         log,
     })
 }
@@ -191,28 +310,101 @@ impl World for Real {
         }
     }
 
-    fn build_engine(
+    fn build_module(
         &mut self,
-        script: &Path,
         clone: &Path,
-        pin: Option<&str>,
+        pin: &str,
+        rustflags: &[String],
         out: &mut dyn Write,
-    ) -> Result<(), String> {
-        let ran = streamed(
-            &*self.launch,
-            &mut engine_command(script, clone, pin, &self.unset),
-            out,
-        )?;
+    ) -> Result<Vec<u8>, String> {
+        let launch = &*self.launch;
+        let unset = &self.unset;
+        let plain = |program: &Path| {
+            let mut cmd = command(program);
+            for name in unset {
+                cmd.env_remove(name);
+            }
+            keep_rust_homes(&mut cmd);
+            cmd
+        };
+        // wasm-opt is asked first: the build takes minutes, and its module never ships
+        // without the pass
+        let mut probe = plain(Path::new("wasm-opt"));
+        probe.arg("--version");
+        if !output(launch, &mut probe).is_ok_and(|o| o.status.success()) {
+            return Err(
+                "wasm-opt not found — the engine never ships without its -O3 pass (brew install \
+                 binaryen)"
+                    .into(),
+            );
+        }
+        let rustup = aterm_verify::rustup::find_rustup().ok_or_else(|| {
+            format!(
+                "no rustup ({}) — the wasm32 pin {pin} is a stock channel rustup installs",
+                aterm_verify::rustup::RUSTUP_LOOKED
+            )
+        })?;
+        // the pin's wasm32 std, added as the release's wasm32 gate adds it
+        let mut add = plain(&rustup);
+        add.args(["target", "add", "--toolchain", pin, TARGET]);
+        let added = streamed(launch, &mut add, out, DRAIN_AFTER_EXIT)?;
+        if added.code != 0 {
+            return Err(format!(
+                "rustup could not add {TARGET} to {pin} (exit {}) — rustup toolchain install \
+                 {pin} --target {TARGET}",
+                added.code
+            ));
+        }
+        let which = |tool: &str| -> Result<PathBuf, String> {
+            let mut ask = plain(&rustup);
+            ask.args(["which", "--toolchain", pin, tool]);
+            let o = output(launch, &mut ask).map_err(|e| format!("cannot run rustup: {e}"))?;
+            let path = PathBuf::from(String::from_utf8_lossy(&o.stdout).trim());
+            if o.status.success() && path.is_file() {
+                Ok(path)
+            } else {
+                Err(format!(
+                    "`rustup which --toolchain {pin} {tool}` names no file: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ))
+            }
+        };
+        let (cargo, rustc) = (which("cargo")?, which("rustc")?);
+        let mut build = module_command(&cargo, &rustc, pin, clone, rustflags, unset)?;
+        keep_rust_homes(&mut build);
+        let ran = streamed(launch, &mut build, out, DRAIN_AFTER_EXIT)?;
+        if ran.code != 0 {
+            return Err(format!(
+                "the wasm32 build of aterm-wasm on {pin} exited {}",
+                ran.code
+            ));
+        }
+        let module = module_path(clone);
+        std::fs::read(&module).map_err(|e| format!("{}: {e}", module.display()))
+    }
+
+    fn optimise(&mut self, wasm: &Path, out: &mut dyn Write) -> Result<(), String> {
+        let mut opt = command("wasm-opt");
+        opt.args(WASM_OPT_FLAGS).arg("-o").arg(wasm).arg(wasm);
+        for name in &self.unset {
+            opt.env_remove(name);
+        }
+        let ran = streamed(&*self.launch, &mut opt, out, DRAIN_AFTER_EXIT)?;
         if ran.code == 0 {
             Ok(())
         } else {
-            Err(format!("exit {}", ran.code))
+            Err(format!("wasm-opt exited {}", ran.code))
         }
     }
 
     fn deploy(&mut self, site: &Path, out: &mut dyn Write) -> Ran {
-        streamed(&*self.launch, &mut deploy_command(site, &self.unset), out)
-            .unwrap_or_else(|e| Ran { code: -1, log: e })
+        streamed(
+            &*self.launch,
+            &mut deploy_command(site, &self.unset),
+            out,
+            DRAIN_AFTER_EXIT,
+        )
+        .unwrap_or_else(|e| Ran { code: -1, log: e })
     }
 
     fn firebase_refuses(
@@ -260,18 +452,28 @@ mod tests {
     }
 
     #[test]
-    fn the_callers_cargo_never_steers_the_engine_build_and_the_pin_is_handed_over() {
+    fn the_callers_cargo_never_steers_the_engine_build_and_the_pin_builds_it() {
         let unset = vec!["CARGO_MANIFEST_DIR".to_string()];
-        let cmd = engine_command(
-            Path::new("/site/build-terminal-wasm.sh"),
-            Path::new("/scratch/clone"),
-            Some("1.97.1"),
+        let clone = Path::new("/scratch/a \"clone\"");
+        let flags = super::super::engine::rustflags(clone, Some(Path::new("/Users//b")));
+        let cmd = module_command(
+            Path::new("/rustup/1.97.1/bin/cargo"),
+            Path::new("/rustup/1.97.1/bin/rustc"),
+            "1.97.1",
+            clone,
+            &flags,
             &unset,
-        );
+        )
+        .unwrap();
+        assert_eq!(cmd.get_program(), "/rustup/1.97.1/bin/cargo");
+        assert_eq!(cmd.get_current_dir(), Some(clone));
+        // every steering variable is gone, but the three the build names itself
+        let own = ["RUSTC", "CARGO_TARGET_DIR", "CARGO_ENCODED_RUSTFLAGS"];
         let gone = removed(&cmd);
         for name in ENGINE_BUILD_UNSET
             .iter()
             .chain(["CARGO_MANIFEST_DIR"].iter())
+            .filter(|n| !own.contains(n))
         {
             assert!(
                 gone.iter().any(|g| g == name),
@@ -279,17 +481,43 @@ mod tests {
             );
         }
         assert_eq!(
-            set(&cmd, "TERMINAL_WASM_TOOLCHAIN"),
-            Some(OsStr::new("1.97.1"))
+            set(&cmd, "RUSTC"),
+            Some(OsStr::new("/rustup/1.97.1/bin/rustc"))
         );
+        assert_eq!(set(&cmd, "RUSTUP_TOOLCHAIN"), Some(OsStr::new("1.97.1")));
+        assert_eq!(
+            set(&cmd, "CARGO_TARGET_DIR"),
+            Some(clone.join("target").as_os_str())
+        );
+        // the flags reach cargo as CARGO_ENCODED_RUSTFLAGS, which splits back into exactly
+        // them, a path with a space and quotes included; nothing on the command line
+        let encoded = set(&cmd, "CARGO_ENCODED_RUSTFLAGS")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(encoded.split('\x1f').collect::<Vec<_>>(), flags);
         assert_eq!(
             cmd.get_args().collect::<Vec<_>>(),
-            [OsStr::new("/scratch/clone")]
+            [
+                "build",
+                "--release",
+                "--locked",
+                "--target",
+                "wasm32-unknown-unknown",
+                "-p",
+                "aterm-wasm"
+            ]
         );
-        assert_eq!(cmd.get_current_dir(), Some(Path::new("/site")));
-        // no pin: nothing is handed, the script keeps its own default
-        let cmd = engine_command(Path::new("/site/b.sh"), Path::new("/c"), None, &[]);
-        assert_eq!(set(&cmd, "TERMINAL_WASM_TOOLCHAIN"), None);
+        assert_eq!(
+            module_path(clone),
+            clone.join("target/wasm32-unknown-unknown/release/aterm_wasm.wasm")
+        );
+        // a flag holding the separator would split, so it is refused
+        let split = vec!["--cfg".to_string(), "a\x1fb".to_string()];
+        let why = module_command(Path::new("c"), Path::new("r"), "p", clone, &split, &[])
+            .err()
+            .unwrap();
+        assert!(why.contains("0x1f"), "{why}");
     }
 
     /// A line that is not UTF-8 is shown replaced, and the pipe is read to its end: the
@@ -300,7 +528,7 @@ mod tests {
         let mut sh = command("/bin/sh");
         sh.args(["-c", "printf 'a\\377b\\n'; printf 'after\\n'; exit 3"]);
         let mut shown = Vec::new();
-        let ran = streamed(&super::super::Plain, &mut sh, &mut shown).unwrap();
+        let ran = streamed(&super::super::Plain, &mut sh, &mut shown, DRAIN_AFTER_EXIT).unwrap();
         assert_eq!(ran.code, 3);
         assert_eq!(ran.log, "a\u{fffd}b\nafter\n");
         assert_eq!(String::from_utf8(shown).unwrap(), ran.log);
@@ -342,5 +570,59 @@ mod tests {
         // a key named but absent falls back to the account
         let cmd = firebase_probe_command(site, Some("a@b.invalid"), Some(&dir.path().join("gone")));
         assert_eq!(cmd.get_args().next(), Some(OsStr::new("--account")));
+    }
+
+    /// The daemon a test's child left, ended however the test ends: its pid is the
+    /// file's first line once the child wrote it.
+    struct Daemon(std::path::PathBuf);
+
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            if let Ok(pid) = std::fs::read_to_string(&self.0) {
+                let _ = command("/bin/kill")
+                    .args(["-KILL", pid.trim()])
+                    .stdin(Stdio::null())
+                    .status();
+            }
+        }
+    }
+
+    /// A CHILD THAT LEAVES A DAEMON HOLDING THE PIPE does not hang the deploy: its
+    /// output up to its exit is copied, its status read, and the pipe the grandchild
+    /// still holds is left the drain's bound after the exit.
+    #[test]
+    fn a_grandchild_holding_the_pipe_is_not_waited_on() {
+        const DRAIN: std::time::Duration = std::time::Duration::from_millis(100);
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("aterm-site-daemon-")
+            .tempdir()
+            .unwrap();
+        let _daemon = Daemon(dir.path().join("pid"));
+        let mut cmd = command("/bin/sh");
+        cmd.args([
+            "-c",
+            "echo before; sleep 600 & echo \"$!\" > \"$1\"; echo after; exit 3",
+            "sh",
+        ])
+        .arg(dir.path().join("pid"));
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let started = std::time::Instant::now();
+            let ran = streamed(&super::super::Plain, &mut cmd, &mut out, DRAIN);
+            let _ = done.send((ran, out, started.elapsed()));
+        });
+        let (ran, out, took) = finished
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("streamed returned once the child exited, the daemon notwithstanding");
+        let ran = ran.expect("it ran");
+        assert_eq!(ran.code, 3, "{ran:?}");
+        assert_eq!(ran.log, "before\nafter\n");
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            ran.log,
+            "each line copied out"
+        );
+        assert!(took >= DRAIN, "the drain is bounded, not skipped: {took:?}");
     }
 }

@@ -322,7 +322,8 @@ fn hot_owner_or_style_change_grounds_an_invisible_ordinary_flight() {
 
 /// The cursor-viewport lifecycle: charged Glow/Trail and cursor-body state
 /// retire on the first history snapshot. The resident pet's half is
-/// `aterm_effects::companion`'s `history_lets_the_fading_pet_brain_settle`.
+/// `aterm_effects::companion`'s
+/// `the_brain_ticks_even_when_undrawable_so_the_lane_is_released`.
 #[test]
 fn history_retires_cursor_pixels_and_cursor_bodies() {
     let mut app = App::headless_for_test();
@@ -389,7 +390,7 @@ fn history_retires_cursor_pixels_and_cursor_bodies() {
         "every cursor-body family is dark in history"
     );
 
-    let model = aterm_spec::derive::cursor_viewport_lifecycle_model();
+    let model = aterm_models_effects::cursor_viewport_lifecycle_model();
     let charged = model.successors("ChargeLive", &model.init_state())[0].clone();
     let mut projected = charged.clone();
     projected.insert("live_viewport", 0);

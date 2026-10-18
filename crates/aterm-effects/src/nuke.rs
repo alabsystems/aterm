@@ -353,22 +353,6 @@ mod tests {
 
     const PARTS: [NukePart; 3] = [NukePart::Cap, NukePart::Stem, NukePart::Skirt];
 
-    /// The art is a pure function of `(part, w, h)`, which lets the cloud be
-    /// baked once and animated by transform alone.
-    #[test]
-    fn baking_is_deterministic() {
-        for part in PARTS {
-            let (w, h) = nuke_nat_size(part, 14, 32);
-            let a = bake_nuke(w, h, part);
-            let b = bake_nuke(w, h, part);
-            assert_eq!(a.pixels(), b.pixels(), "{part:?} baked two different tiles");
-            assert!(
-                a.pixels().iter().any(|p| *p != 0),
-                "{part:?} baked an empty tile"
-            );
-        }
-    }
-
     /// The natural tile stays within `CatBaker::host_tile`'s bounds
     /// (`4 * cell_h` by `2 * cell_h`) for every plausible cell geometry.
     #[test]

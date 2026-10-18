@@ -7,27 +7,28 @@
 //! Seat handling.
 //!
 //! Modified by the aterm project in 2026; see the repository NOTICE.
+//!
+//! LOCAL PATCH (aterm), 2026-10-17 (docs/AUDIT-third-party-2026-10-15.md, LW.7 with winit-core
+//! WC.8): the seats are first-party `aterm_wayland::seat::Seats`, which binds every `wl_seat` (at
+//! version 7, as smithay-client-toolkit did), makes and releases its devices as its capabilities
+//! come and go (in sctk's order) and records their events in the backend's one inbox as they
+//! are heard (`wire::Inbox::seat_sink`); this module keeps what winit keeps per seat and applies
+//! those events where the inbox has them, as sctk's `SeatHandler` and the device handlers did.
+//! CUT with sctk, each with no aterm caller: the relative pointer (`DeviceEvent::MouseMotion` and
+//! the motion axes) and pointer constraints.
 
 use std::sync::Arc;
 
 use aterm_hash::FxHashMap;
+use aterm_wayland::protocols::wayland::wl_seat;
+use aterm_wayland::seat::Input;
+use aterm_wayland::selection::{Device, Manager};
 use tracing::warn;
-
-use sctk::reexports::client::backend::ObjectId;
-use sctk::reexports::client::protocol::wl_seat::WlSeat;
-use sctk::reexports::client::protocol::wl_touch::WlTouch;
-use sctk::reexports::client::{Connection, Proxy, QueueHandle};
-use sctk::reexports::protocols::wp::relative_pointer::zv1::client::zwp_relative_pointer_v1::ZwpRelativePointerV1;
-use sctk::reexports::protocols::wp::text_input::zv3::client::zwp_text_input_v3::ZwpTextInputV3;
-
-use sctk::data_device_manager::data_device::DataDevice;
-use sctk::primary_selection::device::PrimarySelectionDevice;
-use sctk::seat::pointer::{ThemeSpec, ThemedPointer};
-use sctk::seat::{Capability as SeatCapability, SeatHandler, SeatState};
 
 use crate::event::WindowEvent;
 use crate::keyboard::ModifiersState;
 use crate::platform_impl::wayland::state::WinitState;
+use crate::platform_impl::wayland::wire::Inbox;
 
 pub(crate) mod data_device;
 mod keyboard;
@@ -35,47 +36,41 @@ mod pointer;
 mod text_input;
 mod touch;
 
-pub use pointer::relative_pointer::RelativePointerState;
-pub use pointer::{PointerConstraintsState, WinitPointerData, WinitPointerDataExt};
-pub use text_input::{TextInputState, ZwpTextInputV3Ext};
+pub(crate) use pointer::WinitPointer;
+pub(crate) use text_input::{TextInput, TextInputData};
 
-use keyboard::{KeyboardData, KeyboardState};
-use text_input::TextInputData;
+use keyboard::KeyboardState;
 use touch::TouchPoint;
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct WinitSeatState {
-    /// The pointer bound on the seat.
-    pointer: Option<Arc<ThemedPointer<WinitPointerData>>>,
+    /// The capabilities the seat last announced (`wl_seat.capability` bits).
+    capabilities: u32,
 
-    /// The touch bound on the seat.
-    touch: Option<WlTouch>,
+    /// The pointer bound on the seat, with its cursor.
+    pointer: Option<Arc<WinitPointer>>,
+
+    /// Whether the seat has a touch device.
+    touch: bool,
 
     /// The mapping from touched points to the surfaces they're present.
     touch_map: FxHashMap<i32, TouchPoint>,
 
-    /// The text input bound on the seat.
-    text_input: Option<Arc<ZwpTextInputV3>>,
-
-    /// The relative pointer bound on the seat.
-    relative_pointer: Option<ZwpRelativePointerV1>,
+    /// The text input bound on the seat, and what it has said since its last `done`.
+    text_input: Option<(Arc<TextInput>, TextInputData)>,
 
     /// The keyboard bound on the seat.
     keyboard_state: Option<KeyboardState>,
 
     /// The data device bound on the seat, driving drag-and-drop (and clipboard)
     /// offers. `None` when the compositor has no `wl_data_device_manager`. Kept
-    /// alive here so its offer events keep flowing (see `data_device.rs`). Set
-    /// from `state.rs` (startup seats) and `new_seat` (later seats).
-    pub(crate) data_device: Option<DataDevice>,
+    /// alive here so its offer events keep flowing (see `data_device.rs`). Made
+    /// when the seat is first seen (see [`WinitState::sync_seats`]).
+    pub(crate) data_device: Option<Device>,
 
     /// The primary-selection device bound on the seat (see `clipboard.rs`).
     /// `None` when the compositor has no `zwp_primary_selection_device_manager_v1`.
-    pub(crate) primary_device: Option<PrimarySelectionDevice>,
-
-    /// The newest serial the seat's keyboard handed this client (enter, key,
-    /// modifiers) — what a clipboard copy gives `set_selection`. See `clipboard.rs`.
-    pub(crate) latest_keyboard_serial: u32,
+    pub(crate) primary_device: Option<Device>,
 
     /// Whether the seat's keyboard is currently ON one of this client's surfaces
     /// — set by `wl_keyboard.enter`, cleared by `wl_keyboard.leave`. Read by
@@ -90,23 +85,29 @@ pub struct WinitSeatState {
 }
 
 impl WinitSeatState {
-    pub fn new() -> Self {
-        Default::default()
-    }
-
-    /// The newest input serial this seat gave the client, across its keyboard
-    /// and pointer — `0` when it never has (the compositor would refuse a
-    /// `set_selection` with it, so a copy is not attempted).
-    pub(crate) fn latest_serial(&self) -> u32 {
-        let pointer = self
-            .pointer
-            .as_ref()
-            .map(|pointer| {
-                let data = pointer.pointer().winit_data();
-                data.latest_button_serial().max(data.latest_enter_serial())
+    /// A seat first seen (its registry name `id`): its data devices, where the compositor
+    /// offers their managers, their drags recorded in `inbox`.
+    fn new(
+        id: u32,
+        seat: aterm_wayland::proxy::Proxy,
+        data: Option<&Manager>,
+        primary: Option<&Manager>,
+        inbox: &Inbox,
+    ) -> Self {
+        // SAFETY: the seat aterm-wayland's `Seats` holds live; its devices are dropped before it
+        // is released (`WinitState::sync_seats` drops this state first).
+        let device = |manager: Option<&Manager>| {
+            manager.and_then(|manager| {
+                match unsafe { Device::new(manager, seat, inbox.drag_sink(id)) } {
+                    Ok(device) => Some(device),
+                    Err(_error) => {
+                        warn!("wayland: a seat has no data device: {_error}");
+                        None
+                    },
+                }
             })
-            .unwrap_or_default();
-        self.latest_keyboard_serial.max(pointer)
+        };
+        Self { data_device: device(data), primary_device: device(primary), ..Default::default() }
     }
 
     /// Whether this client holds the seat's keyboard focus — the fact a clipboard
@@ -127,130 +128,198 @@ impl WinitSeatState {
     }
 }
 
-impl SeatHandler for WinitState {
-    fn seat_state(&mut self) -> &mut SeatState {
-        &mut self.seat_state
+/// A seat's pointer or text input after its capability (or its seat) went. A window keeps a weak
+/// reference to each and upgrades it for a request on whatever thread the application calls it
+/// from; were that thread's reference the last, the object would be destroyed, and its listener
+/// freed, there, while the loop's thread may be dispatching its events (wayland-rs kept an
+/// object's data alive across its dispatch; libwayland and aterm-wayland do not). So the loop
+/// keeps its reference here and lets go only once it is the last one
+/// ([`WinitState::reap_retired`]): the object is destroyed on the loop's thread, between
+/// dispatches.
+pub(crate) enum Retired {
+    Pointer(Arc<WinitPointer>),
+    TextInput(Arc<TextInput>),
+}
+
+/// One `wl_seat.capability` bit, in the order sctk 0.19.2 handled them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeatCapability {
+    Keyboard,
+    Pointer,
+    Touch,
+}
+
+impl SeatCapability {
+    const ORDER: [SeatCapability; 3] =
+        [SeatCapability::Keyboard, SeatCapability::Pointer, SeatCapability::Touch];
+
+    fn bit(self) -> u32 {
+        match self {
+            SeatCapability::Keyboard => wl_seat::capability::KEYBOARD,
+            SeatCapability::Pointer => wl_seat::capability::POINTER,
+            SeatCapability::Touch => wl_seat::capability::TOUCH,
+        }
+    }
+}
+
+impl WinitState {
+    /// Bring the seats up to the registry: a seat the registry no longer lists is torn down
+    /// here first (its devices before aterm-wayland releases it), then `Seats` binds the new
+    /// ones, and each seat first seen gets its data devices (sctk's `new_seat`).
+    pub(crate) fn sync_seats(&mut self) {
+        let listed: Vec<u32> = self
+            .registry()
+            .globals()
+            .into_iter()
+            .filter(|g| g.interface.as_c_str() == c"wl_seat")
+            .map(|g| g.name)
+            .collect();
+        let gone: Vec<u32> =
+            self.seats.keys().copied().filter(|seat| !listed.contains(seat)).collect();
+        for seat in gone {
+            // sctk's `remove_seat`; the seat's pointer and text input are retired, as a removed
+            // capability's are.
+            if let Some(mut seat_state) = self.seats.remove(&seat) {
+                if let Some((text_input, _)) = seat_state.text_input.take() {
+                    self.retired.push(Retired::TextInput(text_input));
+                }
+                if let Some(pointer) = seat_state.pointer.take() {
+                    self.retire_pointer(pointer);
+                }
+            }
+            self.on_keyboard_destroy(seat);
+        }
+        if let Err(_error) = self.seats_book.sync(self.registry()) {
+            warn!("wayland: the seats could not be bound: {_error}");
+        }
+        self.add_new_seats();
     }
 
-    fn new_capability(
-        &mut self,
-        _: &Connection,
-        queue_handle: &QueueHandle<Self>,
-        seat: WlSeat,
-        capability: SeatCapability,
-    ) {
-        let seat_state = match self.seats.get_mut(&seat.id()) {
-            Some(seat_state) => seat_state,
-            None => {
-                warn!("Received wl_seat::new_capability for unknown seat");
-                return;
+    /// A [`WinitSeatState`] for each seat `Seats` holds that has none yet.
+    pub(crate) fn add_new_seats(&mut self) {
+        for info in self.seats_book.infos() {
+            if self.seats.contains_key(&info.id) {
+                continue;
+            }
+            let Some(proxy) = self.seats_book.proxy(info.id) else {
+                continue;
+            };
+            let seat = WinitSeatState::new(
+                info.id,
+                proxy,
+                self.data_device_manager.as_ref(),
+                self.primary_selection_manager.as_ref(),
+                &self.inbox,
+            );
+            self.seats.insert(info.id, seat);
+        }
+    }
+
+    /// One seat's input, where the inbox has it.
+    pub(crate) fn seat_input(&mut self, input: Input) {
+        match input {
+            Input::Capabilities { seat, capabilities } => {
+                self.capabilities_changed(seat, capabilities)
             },
+            Input::Pointer { seat, frame } => self.pointer_frame(seat, &frame),
+            Input::Keyboard { seat, event } => self.keyboard_event(seat, event),
+            Input::Touch { seat, event } => self.touch_event(seat, event),
+        }
+    }
+
+    /// `wl_seat.capabilities`: each capability that came or went, as sctk 0.19.2 told
+    /// winit's `SeatHandler` (keyboard, pointer, touch).
+    fn capabilities_changed(&mut self, seat: u32, capabilities: u32) {
+        let Some(old) = self.seats.get(&seat).map(|s| s.capabilities) else {
+            warn!("Received wl_seat::capabilities for unknown seat");
+            return;
+        };
+        if let Some(seat_state) = self.seats.get_mut(&seat) {
+            seat_state.capabilities = capabilities;
+        }
+        for capability in SeatCapability::ORDER {
+            let (had, has) = (old & capability.bit() != 0, capabilities & capability.bit() != 0);
+            match (had, has) {
+                (false, true) => self.new_capability(seat, capability),
+                (true, false) => self.remove_capability(seat, capability),
+                _ => (),
+            }
+        }
+    }
+
+    fn new_capability(&mut self, seat: u32, capability: SeatCapability) {
+        let compositor = self.compositor();
+        let cursor_shape_manager = self.cursor_shape_manager.as_ref().map(|m| m.proxy());
+        let shm = self.shm();
+        let pointer_proxy = self.seats_book.pointer(seat);
+        let seat_proxy = self.seats_book.proxy(seat);
+        let inbox = self.inbox.clone();
+        let connection = Arc::clone(&self.connection);
+        let Some(seat_state) = self.seats.get_mut(&seat) else {
+            warn!("Received wl_seat::new_capability for unknown seat");
+            return;
         };
 
         match capability {
-            SeatCapability::Touch if seat_state.touch.is_none() => {
-                seat_state.touch = self.seat_state.get_touch(queue_handle, &seat).ok();
-            },
+            SeatCapability::Touch => seat_state.touch = true,
             SeatCapability::Keyboard if seat_state.keyboard_state.is_none() => {
-                let keyboard = seat.get_keyboard(queue_handle, KeyboardData::new(seat.clone()));
-                seat_state.keyboard_state =
-                    Some(KeyboardState::new(keyboard, self.loop_handle.clone()));
+                seat_state.keyboard_state = KeyboardState::new();
             },
             SeatCapability::Pointer if seat_state.pointer.is_none() => {
-                let surface = self.compositor_state.create_surface(queue_handle);
-                let viewport = self
-                    .viewporter_state
-                    .as_ref()
-                    .map(|state| state.get_viewport(&surface, queue_handle));
-                let surface_id = surface.id();
-                let pointer_data = WinitPointerData::new(seat.clone(), viewport);
-                let themed_pointer = self
-                    .seat_state
-                    .get_pointer_with_theme_and_data(
-                        queue_handle,
-                        &seat,
-                        self.shm.wl_shm(),
-                        surface,
-                        ThemeSpec::System,
-                        pointer_data,
-                    )
-                    .expect("failed to create pointer with present capability.");
-
-                seat_state.relative_pointer = self.relative_pointer.as_ref().map(|manager| {
-                    manager.get_relative_pointer(
-                        themed_pointer.pointer(),
-                        queue_handle,
-                        sctk::globals::GlobalData,
+                let pointer = pointer_proxy.and_then(|pointer_proxy| {
+                    WinitPointer::new(
+                        seat,
+                        Arc::clone(&connection),
+                        compositor,
+                        shm,
+                        pointer_proxy,
+                        cursor_shape_manager,
+                        &inbox,
                     )
                 });
-
-                let themed_pointer = Arc::new(themed_pointer);
-
-                // Register cursor surface.
-                self.pointer_surfaces.insert(surface_id, themed_pointer.clone());
-
-                seat_state.pointer = Some(themed_pointer);
+                if let Some(pointer) = pointer {
+                    let pointer = Arc::new(pointer);
+                    // Register cursor surface.
+                    self.pointer_surfaces.insert(pointer.surface_id(), pointer.clone());
+                    seat_state.pointer = Some(pointer);
+                } else {
+                    warn!("failed to create pointer with present capability.");
+                }
             },
             _ => (),
         }
 
-        if let Some(text_input_state) =
-            seat_state.text_input.is_none().then_some(self.text_input_state.as_ref()).flatten()
-        {
-            seat_state.text_input = Some(Arc::new(text_input_state.get_text_input(
-                &seat,
-                queue_handle,
-                TextInputData::default(),
-            )));
+        if seat_state.text_input.is_none() {
+            if let (Some(manager), Some(seat_proxy)) =
+                (self.text_input_manager.as_ref(), seat_proxy)
+            {
+                seat_state.text_input =
+                    TextInput::new(connection, manager.proxy(), seat_proxy, seat, &inbox)
+                        .map(|text_input| (Arc::new(text_input), TextInputData::default()));
+            }
         }
     }
 
-    fn remove_capability(
-        &mut self,
-        _: &Connection,
-        _queue_handle: &QueueHandle<Self>,
-        seat: WlSeat,
-        capability: SeatCapability,
-    ) {
-        let seat_state = match self.seats.get_mut(&seat.id()) {
-            Some(seat_state) => seat_state,
-            None => {
-                warn!("Received wl_seat::remove_capability for unknown seat");
-                return;
-            },
+    fn remove_capability(&mut self, seat: u32, capability: SeatCapability) {
+        let Some(seat_state) = self.seats.get_mut(&seat) else {
+            warn!("Received wl_seat::remove_capability for unknown seat");
+            return;
         };
 
-        if let Some(text_input) = seat_state.text_input.take() {
-            text_input.destroy();
+        // The text input goes with any capability (a window keeps only a weak reference; it is
+        // destroyed on this thread once no window holds it).
+        if let Some((text_input, _)) = seat_state.text_input.take() {
+            self.retired.push(Retired::TextInput(text_input));
         }
 
         match capability {
             SeatCapability::Touch => {
-                if let Some(touch) = seat_state.touch.take() {
-                    if touch.version() >= 3 {
-                        touch.release();
-                    }
-                }
+                seat_state.touch = false;
+                seat_state.touch_map.clear();
             },
             SeatCapability::Pointer => {
-                if let Some(relative_pointer) = seat_state.relative_pointer.take() {
-                    relative_pointer.destroy();
-                }
-
                 if let Some(pointer) = seat_state.pointer.take() {
-                    let pointer_data = pointer.pointer().winit_data();
-
-                    // Remove the cursor from the mapping.
-                    let surface_id = pointer.surface().id();
-                    let _ = self.pointer_surfaces.remove(&surface_id);
-
-                    // Remove the inner locks/confines before dropping the pointer.
-                    pointer_data.unlock_pointer();
-                    pointer_data.unconfine_pointer();
-
-                    if pointer.pointer().version() >= 3 {
-                        pointer.pointer().release();
-                    }
+                    self.retire_pointer(pointer);
                 }
             },
             SeatCapability::Keyboard => {
@@ -258,43 +327,35 @@ impl SeatHandler for WinitState {
                 // The keyboard is gone, so it is on none of our surfaces; a later
                 // one re-binds and re-enters before it hands out another serial.
                 seat_state.set_keyboard_entered(false);
-                self.on_keyboard_destroy(&seat.id());
+                self.on_keyboard_destroy(seat);
             },
-            _ => (),
         }
     }
 
-    fn new_seat(
-        &mut self,
-        _connection: &Connection,
-        queue_handle: &QueueHandle<Self>,
-        seat: WlSeat,
-    ) {
-        let mut seat_state = WinitSeatState::new();
-        // Bind a data device so this seat delivers drag-and-drop offers. (Seats
-        // already present at startup get theirs in `WinitState::new`.)
-        if let Some(manager) = self.data_device_manager_state.as_ref() {
-            seat_state.data_device = Some(manager.get_data_device(queue_handle, &seat));
-        }
-        if let Some(manager) = self.primary_selection_manager_state.as_ref() {
-            seat_state.primary_device = Some(manager.get_selection_device(queue_handle, &seat));
-        }
-        self.seats.insert(seat.id(), seat_state);
+    /// A pointer whose capability or seat went: out of the cursor mapping, then retired.
+    fn retire_pointer(&mut self, pointer: Arc<WinitPointer>) {
+        let _ = self.pointer_surfaces.remove(&pointer.surface_id());
+        let _ = self.surface_scales.remove(&pointer.surface_id());
+        self.retired.push(Retired::Pointer(pointer));
     }
 
-    fn remove_seat(
-        &mut self,
-        _connection: &Connection,
-        _queue_handle: &QueueHandle<Self>,
-        seat: WlSeat,
-    ) {
-        let _ = self.seats.remove(&seat.id());
-        self.on_keyboard_destroy(&seat.id());
+    /// Destroy the retired objects no window holds any more (between dispatches, on the loop's
+    /// thread).
+    pub(crate) fn reap_retired(&mut self) {
+        for retired in std::mem::take(&mut self.retired) {
+            // `try_unwrap` succeeds only for the last reference, and a window's weak reference
+            // can no longer be upgraded once it has; the object is dropped here when it does.
+            let kept = match retired {
+                Retired::Pointer(pointer) => Arc::try_unwrap(pointer).err().map(Retired::Pointer),
+                Retired::TextInput(text_input) => {
+                    Arc::try_unwrap(text_input).err().map(Retired::TextInput)
+                },
+            };
+            self.retired.extend(kept);
+        }
     }
-}
 
-impl WinitState {
-    fn on_keyboard_destroy(&mut self, seat: &ObjectId) {
+    fn on_keyboard_destroy(&mut self, seat: u32) {
         for (window_id, window) in self.windows.get_mut() {
             let mut window = window.lock().unwrap();
             let had_focus = window.has_focus();
@@ -305,5 +366,3 @@ impl WinitState {
         }
     }
 }
-
-sctk::delegate_seat!(WinitState);

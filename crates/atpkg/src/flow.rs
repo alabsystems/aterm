@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use crate::activate::install_tools;
 use crate::activate::{Aliases, activate_build, install_tombstone_shim, install_tools_env};
-use crate::apply::{Group, TxnOutcome, plan_groups, transact_holding};
+use crate::apply::{Group, TxnOutcome, transact_holding};
 use crate::gate::{ApplyDecision, decide};
 use crate::install::StageError;
 use crate::manifest::{Channel, Index, parse_pkg};
@@ -74,6 +74,30 @@ fn verify_and_stage(
         crate::shim_env::remove_sidecar(build_dir);
     }
     staged
+}
+
+/// The pre-swap gate an index-lane stage of `program` runs: for an ALab-built agent program
+/// ([`crate::alab::agent`], which reaches the index lane only where the source rule hands it
+/// there) the ALab pack gate ([`crate::install::alab_pack_gate`]: the package marker, and
+/// `codesign --verify --strict` on every Mach-O); for every other program none, as before.
+fn alab_pack_gate(program: &str, exposes: &[String]) -> Option<Box<StageGate>> {
+    crate::alab::agent(program).map(|_| -> Box<StageGate> {
+        Box::new(crate::install::alab_pack_gate(
+            exposes,
+            crate::install::codesign_strict_check,
+        ))
+    })
+}
+
+/// A pre-swap gate, owned.
+type StageGate = dyn Fn(&Path) -> Result<(), StageError>;
+
+/// The stage hooks that run `gate` (none without one).
+fn stage_hooks(gate: Option<&StageGate>) -> crate::install::StageHooks<'_> {
+    crate::install::StageHooks {
+        pre_swap: gate,
+        sidecars: None,
+    }
 }
 
 /// What [`Fetcher::vendor_get`] came back with (mirrors `aterm_update_core::VendorResponse`).
@@ -717,8 +741,21 @@ fn install_inner(
         return Err(FlowError::Linked(program.to_string()));
     }
     // A vendor-direct program never waits on the index resolve below (design §1.5): the
-    // vendor lane under the compiled anchors, as the flow's report.
-    if let Some(spec) = crate::vendor_direct::spec(program) {
+    // vendor lane under the compiled anchors, as the flow's report. The one exception is
+    // the source rule's ([`crate::alab`]): an ALab-built program on a target ALab builds it
+    // for asks the verified index first, and goes on to the index lane below when that
+    // index pins an ALab build for it here. Anything else (no index, the legacy row, a
+    // revoked pin) is the vendor lane, whose door keeps an installed ALab build.
+    if let Some(spec) = crate::vendor_direct::spec(program)
+        && !crate::alab::agent(program).is_some_and(|agent| {
+            agent.serves(triple)
+                && resolve_verified_index(fetcher, layout, anchor, floor, now_unix)
+                    .ok()
+                    .is_some_and(|index| {
+                        crate::alab::index_owns(layout, program, triple, Some(&index))
+                    })
+        })
+    {
         return vendor_install_outcome(
             fetcher,
             layout,
@@ -957,6 +994,8 @@ fn install_inner(
 
     // 6–7. Download → verify-and-stage → activate → shim, the steps both lanes share.
     let shim_env = pkg.shim_env();
+    let alab_gate = alab_pack_gate(program, &pkg.exposes);
+    let hooks = stage_hooks(alab_gate.as_deref());
     let landed = land_artifact(
         layout,
         &Landing {
@@ -970,7 +1009,7 @@ fn install_inner(
             aliases: Aliases::for_program(program, index.program(program)),
             installed,
             strategy,
-            hooks: &crate::install::StageHooks::NONE,
+            hooks: &hooks,
             download_turn: None,
         },
         &|dl| fetch_artifact(fetcher, program, repo, artifact, dl),
@@ -1273,16 +1312,22 @@ pub(crate) fn land_artifact(
             "atpkg: {program}: reusing verified archive {} from the last attempt",
             artifact.asset
         );
-    } else if let Err(e) = ahead.unwrap_or_else(|| fetch(&dl)) {
-        // An aborted transfer leaves bytes in `<dl>.part`, not at `<dl>`: the production
-        // fetcher promotes the part onto `dl` only on curl success, so `dl` is either
-        // absent or complete. The part is deliberately LEFT for the next attempt to
-        // continue from (`aterm_update_core::download_to_resumable`); `dl` itself is
-        // reclaimed on this exit exactly as on the stage exit below, because a `dir:`
-        // registry's copy lane writes there directly.
-        let _ = std::fs::remove_file(&dl);
-        note_fetch_fault();
-        return Err(FlowError::Download(e));
+    } else {
+        let inline = ahead.is_none();
+        if let Err(e) = ahead.unwrap_or_else(|| fetch(&dl)) {
+            // An aborted transfer leaves bytes in `<dl>.part`, not at `<dl>`: the production
+            // fetcher promotes the part onto `dl` only on curl success, so `dl` is either
+            // absent or complete. The part is deliberately LEFT for the next attempt to
+            // continue from (`aterm_update_core::download_to_resumable`); `dl` itself is
+            // reclaimed on this exit exactly as on the stage exit below, because a `dir:`
+            // registry's copy lane writes there directly.
+            let _ = std::fs::remove_file(&dl);
+            note_fetch_fault();
+            return Err(FlowError::Download(e));
+        }
+        if inline {
+            ahead::fetched_inline(program, &dl);
+        }
     }
     // The transfer is over either way — stop the poller before the phase moves on, and let
     // the next landing's transfer start.
@@ -1716,7 +1761,7 @@ pub fn apply_channel_gated(
         index,
         &ch,
         triple,
-        &plan_groups(index, &ch),
+        &crate::apply::plan_groups_here(layout, index, &ch, triple),
         installed,
         excluded,
         flip,
@@ -1893,7 +1938,7 @@ pub(crate) fn pin_gate_members(
     excluded: &[String],
 ) -> Vec<String> {
     let absent = deliberately_absent(layout, active, excluded);
-    plan_groups(index, ch)
+    crate::apply::plan_groups_here(layout, index, ch, crate::cli::current_triple())
         .into_iter()
         .find(|g| g.members.iter().any(|m| m == program))
         .map_or_else(|| vec![program.to_string()], |g| g.members)
@@ -2108,6 +2153,20 @@ pub fn group_missing_triple(
     triple: &str,
     members: &[String],
 ) -> Option<String> {
+    group_missing_triple_reading(fetcher, index, channel, triple, members, &mut |_, _| {})
+}
+
+/// [`group_missing_triple`], handing `read` each member whose verified manifest carries this
+/// triple, with that manifest: the one verified read per member answers both questions (the
+/// set completion's pending stubs take each member's `exposes` from it).
+pub(crate) fn group_missing_triple_reading(
+    fetcher: &dyn Fetcher,
+    index: &TrustedIndex,
+    channel: &str,
+    triple: &str,
+    members: &[String],
+    read: &mut dyn FnMut(&str, &crate::manifest::PkgManifest),
+) -> Option<String> {
     let ch = index.channel_for(channel, triple)?;
     let ch = &ch;
     for m in members {
@@ -2117,6 +2176,7 @@ pub fn group_missing_triple(
         if pkg.artifact_for(triple).is_none() {
             return Some(m.clone());
         }
+        read(m, &pkg);
     }
     None
 }
@@ -3826,14 +3886,15 @@ pub fn apply_program(
     floor: BuildFloor,
     now_unix: i64,
 ) -> Result<ChannelApplyReport, FlowError> {
-    refuse_vendor_program(program)?;
+    refuse_vendor_program(program, triple)?;
     let index = verify_select_fresh(fetcher, layout, anchor, floor, now_unix)?;
     // The channel as THIS target sees it (`pin_by_target` laid over `pin`): every decide,
     // plan and fetch below reads this view, never the raw platform-agnostic pin.
     let ch = index
         .channel_for(channel, triple)
         .ok_or_else(|| FlowError::NoChannel(channel.to_string()))?;
-    let groups = plan_groups(&index, &ch);
+    refuse_unrouted(layout, &index, &ch, program, triple)?;
+    let groups = crate::apply::plan_groups_here(layout, &index, &ch, triple);
     let group = groups
         .into_iter()
         .find(|g| g.members.iter().any(|m| m == program))
@@ -3879,13 +3940,14 @@ pub fn plan_update(
     floor: BuildFloor,
     now_unix: i64,
 ) -> Result<UpdatePlan, FlowError> {
-    refuse_vendor_program(program)?;
+    refuse_vendor_program(program, triple)?;
     let index = verify_select_fresh(fetcher, layout, anchor, floor, now_unix)?;
     // Decide against the pin THIS target installs (`pin_by_target` overlay), or a build
     // `install` placed from the overlay reads as out of date against another target's pin.
     let ch = index
         .channel_for(channel, triple)
         .ok_or_else(|| FlowError::NoChannel(channel.to_string()))?;
+    refuse_unrouted(layout, &index, &ch, program, triple)?;
     let p = index
         .program(program)
         .ok_or_else(|| FlowError::NotReachable(program.to_string(), index_roster(&index)))?;
@@ -3901,15 +3963,42 @@ pub fn plan_update(
 }
 
 /// A vendor-direct program's decisions are its vendor lane's; the index's rules never
-/// reach it.
-fn refuse_vendor_program(program: &str) -> Result<(), FlowError> {
+/// reach it. An ALab-built one ([`crate::alab::agent`]) on a target ALab builds it for is
+/// asked again once the index is in hand ([`refuse_unrouted`]): the index lane may own it
+/// there. Everywhere else the refusal comes before any index is fetched, as it always did.
+fn refuse_vendor_program(program: &str, triple: &str) -> Result<(), FlowError> {
     match crate::vendor_direct::spec(program) {
-        Some(spec) => Err(FlowError::Vendor(format!(
-            "{program} is updated from {}, not through the ALab index",
-            spec.vendor
-        ))),
-        None => Ok(()),
+        Some(spec) if !crate::alab::agent(program).is_some_and(|a| a.serves(triple)) => {
+            Err(vendor_refusal(program, spec))
+        }
+        _ => Ok(()),
     }
+}
+
+/// [`refuse_vendor_program`]'s second half, over the verified `index` and its channel `ch`
+/// as `triple` sees it: a vendor-table program the source rule does not hand to the index
+/// lane here ([`crate::alab::source_in`]) is refused.
+fn refuse_unrouted(
+    layout: &Layout,
+    index: &Index,
+    ch: &Channel,
+    program: &str,
+    triple: &str,
+) -> Result<(), FlowError> {
+    match crate::vendor_direct::spec(program) {
+        Some(spec) if !crate::alab::source_in(layout, index, ch, program, triple).index_lane() => {
+            Err(vendor_refusal(program, spec))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// `<program> is updated from <vendor>, not through the ALab index`.
+fn vendor_refusal(program: &str, spec: &crate::vendor_direct::VendorSpec) -> FlowError {
+    FlowError::Vendor(format!(
+        "{program} is updated from {}, not through the ALab index",
+        spec.vendor
+    ))
 }
 
 /// [`Fetcher::prefetch_manifests`] for the manifests [`verified_pkg`] reads for `members` on
@@ -4264,12 +4353,16 @@ fn fetch_member(
             artifact.asset
         );
     } else {
+        let inline = ahead.is_none();
         let fetched = ahead.unwrap_or_else(|| {
             // The transfer is over when this returns — the poller stops before the phase
             // moves on.
             let _download_watch = crate::progress::watch_download(program, &dl, artifact.size);
             fetch_artifact(fetcher, program, &repo, artifact, &dl)
         });
+        if inline && fetched.is_ok() {
+            ahead::fetched_inline(program, &dl);
+        }
         if let Err(e) = fetched {
             // SAY WHY (see `stage_failure_note`). The transfer is the failure
             // this exit meets most often and `e` carries the fetcher's own words — HTTP
@@ -4345,7 +4438,13 @@ fn stage_fetched(
         return None;
     }
     let extract_scope = crate::progress::extract_scope(program, artifact.cost.disk_installed);
-    let staged = verify_and_stage(artifact, &dl, &build_dir, &crate::install::StageHooks::NONE);
+    let alab_gate = alab_pack_gate(program, &pkg.exposes);
+    let staged = verify_and_stage(
+        artifact,
+        &dl,
+        &build_dir,
+        &stage_hooks(alab_gate.as_deref()),
+    );
     drop(extract_scope);
     if let Err(e) = staged {
         // Reclaimed on THIS exit for a DIGEST failure only (the bytes are wrong — the
@@ -4770,7 +4869,7 @@ fn apply_sysroot_bundle(reloc: &str) -> Result<(), FlowError> {
 /// whether its loader resolves is not a property of the install. It also names the binary via
 /// [`ToolName::exe_file`] rather than joining the bare tool — the same omission
 /// `rollback_member` had, harmless in practice (a PE starts with `MZ`, which fails
-/// [`crate::relocate::is_native_object`], and the bundle backend errors on Windows anyway) but
+/// [`crate::macho::is_native_object`], and the bundle backend errors on Windows anyway) but
 /// not worth leaving as the one site that still spells the rule by hand.
 ///
 /// The checks run side by side ([`crate::net::fan_out`]), and the verdict is the first
@@ -4792,11 +4891,14 @@ fn bundle_resolve_check_with(
     check: &(dyn Fn(&Path) -> Result<(), String> + Sync),
 ) -> Result<(), FlowError> {
     // Only native objects (the compilers that link dylibs) have libraries to resolve; a
-    // wrapper script has none, so it is skipped.
+    // wrapper script has none, so it is skipped. Sniffed through a symlink, as the loader
+    // reaches it: a `bin/<tool>` that links to its object is checked like the object.
     let bins: Vec<PathBuf> = exposes
         .iter()
         .map(|tool| build_dir.join("bin").join(tool.exe_file()))
-        .filter(|bin| bin.is_file() && crate::relocate::is_native_object(bin))
+        .filter(|bin| {
+            std::fs::canonicalize(bin).is_ok_and(|object| crate::macho::is_native_object(&object))
+        })
         .collect();
     crate::net::fan_out(&bins, &|bin: &PathBuf| check(bin))
         .into_iter()

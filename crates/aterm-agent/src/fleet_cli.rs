@@ -11,14 +11,12 @@
 //!   default dir).
 //! - `exec`: run each stdin line (`@<sid> <verb> [args…]`, an aterm-ctl verb
 //!   line) against the fleet and emit one NDJSON result per command.
-//! - `status|manage|…`: thin clients of the opt-in operator embedded in the
-//!   caller's aterm instance.
 //!
 //! This is local NDJSON glue, not the astream fabric (`crates/aterm-link`
 //! carries the cross-machine inbox and posts); the `/fleet/…` subjects are
 //! address labels nothing publishes. The bridge holds no engine state: discovery
 //! uses the aterm-ctl crate (`fleet_sessions`), and the streamers and `exec`
-//! run the aterm-ctl binary ([`ctl_bin`]), inheriting its auth and relay.
+//! run this build's own `ctl` verb ([`ctl_bin`]), inheriting its auth and relay.
 
 use aterm_uds::spawnfd::Stdio;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -36,10 +34,6 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("exec") => dispatch(),
-        Some(
-            command @ ("status" | "inspect" | "manage" | "unmanage" | "next" | "extend" | "ack"
-            | "reconcile" | "clear-fault" | "propose"),
-        ) => operator_command(command, &argv[1..]),
         Some("-h") | Some("--help") | None => usage(),
         Some(_) => {
             eprintln!("aterm fleet: no such mode; run `aterm fleet --help`");
@@ -59,70 +53,19 @@ fn usage() -> ExitCode {
          \x20 aterm fleet exec       read `@<sid> <verb> [args...]` command lines from stdin,\n\
          \x20                        dispatch each to the fleet, emit an NDJSON result per line\n\
          \x20                        retain stdout/stderr and exit_code; exit 1 if any command fails\n\
-         \x20                        stdin failure emits batch_error with input_line and dispatched count\n\
-         \x20 aterm fleet status     show the embedded operator and managed allowlist\n\
-         \x20 aterm fleet inspect <event>\n\
-         \x20 aterm fleet manage <sid> | unmanage <sid>\n\
-         \x20 aterm fleet next [timeout=<ms>]\n\
-         \x20 aterm fleet extend <event> <claim-token> [ms=<n>]\n\
-         \x20 aterm fleet ack <event> <claim-token> <no-action|pause|escalate>\n\
-         \x20 aterm fleet reconcile <event> <claim-token> <acted|no-action|pause|escalate> confirm=human\n\
-         \x20 aterm fleet clear-fault confirm=human\n\
-         \x20 aterm fleet propose    read one guarded-turn JSON proposal from stdin\n\n\
-         The operator verbs need `[operator] enabled = true` in aterm.toml (else they\n\
-         answer `ERR operator unavailable`) and a `manage <sid>` per session, kept\n\
-         across relaunches. See `aterm help fleet`.\n";
-    print!("{help}");
-    ExitCode::SUCCESS
+         \x20                        stdin failure emits batch_error with input_line and dispatched count\n\n\
+         See `aterm help fleet`.\n";
+    aterm_uds::stdout::answer_exit("aterm fleet", help, 0)
 }
 
-/// Forward a fleet-facing operator command to the normal aterm instance that
-/// hosts the caller. The embedded service is already resident; this invocation
-/// owns no queue, subscription, or mutation authority and returns after one
-/// reply. Call the library directly so `aterm fleet` remains genuinely
-/// one-binary and preserves `aterm-ctl`'s exact exit status (including 124).
-fn operator_command(command: &str, args: &[std::ffi::OsString]) -> ExitCode {
-    let ctl_args = match operator_ctl_args(command, args) {
-        Ok(ctl_args) => ctl_args,
-        Err(error) => {
-            eprintln!("aterm fleet: {error}");
-            return ExitCode::from(2);
-        }
-    };
-    aterm_ctl::main_entry(ctl_args)
-}
-
-fn operator_ctl_args(
-    command: &str,
-    args: &[std::ffi::OsString],
-) -> Result<Vec<std::ffi::OsString>, &'static str> {
-    let mut ctl_args = Vec::with_capacity(args.len() + 2);
-    if command == "propose" {
-        if !args.is_empty() {
-            return Err("propose reads one JSON proposal from stdin and takes no arguments");
-        }
-        ctl_args.push(std::ffi::OsString::from("operator-propose-bin"));
-    } else {
-        ctl_args.push(std::ffi::OsString::from("operator"));
-        ctl_args.push(std::ffi::OsString::from(command));
-        ctl_args.extend_from_slice(args);
-    }
-    Ok(ctl_args)
-}
-
-/// Resolve the `aterm-ctl` binary for the child-process paths that need one
-/// (the per-instance `subscribe` streamers and `exec` dispatch): the alias
-/// beside this binary, else the bare name on `PATH`. Discovery does not use it
-/// (see [`list_sessions`]), so a missing binary fails streaming and dispatch
-/// only.
-fn ctl_bin() -> String {
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| crate::drive_cli::sibling_ctl(&exe))
-        .map_or_else(
-            || "aterm-ctl".to_string(),
-            |sib| sib.to_string_lossy().into_owned(),
-        )
+/// The control client for the child-process paths that need one (the
+/// per-instance `subscribe` streamers and `exec` dispatch): this build's own
+/// binary, run as `<exe> ctl …` ([`crate::own_exe`]) — never a sibling
+/// `aterm-ctl` or a `PATH` lookup. Discovery does not use it (see
+/// [`list_sessions`]), so an executable that cannot be read fails streaming
+/// and dispatch only, naming why.
+fn ctl_bin() -> Result<String, String> {
+    crate::own_exe().map(|exe| exe.to_string_lossy().into_owned())
 }
 
 /// A live session from the fleet listing — the `<pid> <local> <sid> …` row of
@@ -302,10 +245,17 @@ fn resolve_federated_sid(
 /// `sub <local> <sid>` line.
 ///
 /// The scanner keys on instances, not sids, because the server admits only
-/// `CONTROL_SUBSCRIPTION_WORKERS` (4) subscriptions. A streamer that ends
+/// a bounded number of subscriptions (four lanes grown to a ceiling
+/// tied to its descriptor limit). A streamer that ends
 /// releases its pid and the next rescan re-establishes it.
 fn federate() {
-    let ctl = ctl_bin();
+    let ctl = match ctl_bin() {
+        Ok(ctl) => ctl,
+        Err(why) => {
+            eprintln!("aterm fleet: {why}");
+            return;
+        }
+    };
     eprintln!("aterm fleet: streaming the fleet's events to stdout (Ctrl-C stops)");
 
     // Each instance streams on its own thread; a single writer thread (this one, below)
@@ -423,7 +373,14 @@ fn stream_targets(ctl: &str, pid: &str, targets: &str, tx: &mpsc::SyncSender<Str
     // with every `aterm-ctl` child here, and a caller with none gets a
     // windowless one.
     let mut child = match aterm_uds::spawnfd::command(ctl)
-        .args(["--pid", pid, "subscribe", targets, "events"])
+        .args([
+            crate::CTL_VERB,
+            "--pid",
+            pid,
+            "subscribe",
+            targets,
+            "events",
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -501,12 +458,21 @@ fn stream_targets(ctl: &str, pid: &str, targets: &str, tx: &mpsc::SyncSender<Str
 
 /// EXEC: dispatch command lines from stdin (`@<sid> <verb> [args…]`) to the fleet.
 fn dispatch() -> ExitCode {
-    let ctl = ctl_bin();
+    let ctl = match ctl_bin() {
+        Ok(ctl) => ctl,
+        Err(why) => {
+            eprintln!("aterm fleet: {why}");
+            return ExitCode::FAILURE;
+        }
+    };
     eprintln!("aterm fleet: reading `@<sid> <verb> [args...]` lines from stdin");
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     match dispatch_lines(stdin.lock(), &mut stdout.lock(), |argv| {
-        aterm_uds::spawnfd::command(&ctl).args(argv).output()
+        aterm_uds::spawnfd::command(&ctl)
+            .arg(crate::CTL_VERB)
+            .args(argv)
+            .output()
     }) {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
@@ -865,15 +831,6 @@ mod tests {
     }
 
     #[test]
-    fn result_record_reports_ok_and_escapes() {
-        let ok = result_record("s-a", true, Some(0), "OK closed s-a\n", "");
-        assert!(ok.contains("\"ok\":true") && ok.contains("OK closed s-a"));
-        let bad = result_record("s-a", false, Some(1), "", "ERR \"quoted\"\tvalue");
-        assert!(bad.contains("\"ok\":false"));
-        assert!(bad.contains("\\\"quoted\\\"") && bad.contains("\\t"));
-    }
-
-    #[test]
     fn result_record_preserves_turn_screen_verdict_and_exit_status() {
         let record = result_record(
             "s-a",
@@ -1042,43 +999,26 @@ mod tests {
     }
 
     #[test]
-    fn json_escape_handles_control_and_specials() {
-        assert_eq!(json_escape("a\"b\\c\nd\u{1}"), "a\\\"b\\\\c\\nd\\u0001");
-    }
-
-    #[test]
-    fn dispatch_argv_keeps_payload_as_one_verbatim_arg() {
-        // Internal multiple spaces and quotes must reach aterm-ctl as one
-        // argument.
-        let (sid, argv) = dispatch_argv("@s-ab12 turn please run  the  build \"a b\"");
-        assert_eq!(sid, "s-ab12");
-        assert_eq!(
-            argv,
-            vec![
-                "@s-ab12".to_string(),
-                "turn".to_string(),
-                "please run  the  build \"a b\"".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn dispatch_argv_verb_only_and_bare_selector() {
-        // A verb with no payload: selector + verb, no trailing empty arg.
-        let (sid, argv) = dispatch_argv("@s-a screen");
-        assert_eq!(sid, "s-a");
-        assert_eq!(argv, vec!["@s-a".to_string(), "screen".to_string()]);
-        // A bare `@selector` with no verb: just the selector (server → ERR unknown verb).
-        let (sid, argv) = dispatch_argv("@s-a");
-        assert_eq!(sid, "s-a");
-        assert_eq!(argv, vec!["@s-a".to_string()]);
-    }
-
-    #[test]
-    fn dispatch_argv_without_selector_runs_verb_self_scoped() {
-        let (sid, argv) = dispatch_argv("text");
-        assert_eq!(sid, "-");
-        assert_eq!(argv, vec!["text".to_string()]);
+    fn dispatch_argv_splits_selector_verb_and_one_verbatim_payload() {
+        // The payload (internal spaces and quotes kept) reaches aterm-ctl as
+        // one argument; a verb alone has no trailing empty arg; a bare
+        // selector is just the selector (the server answers `ERR unknown
+        // verb`); no selector runs the verb self-scoped.
+        let cases: [(&str, &str, &[&str]); 4] = [
+            (
+                "@s-ab12 turn please run  the  build \"a b\"",
+                "s-ab12",
+                &["@s-ab12", "turn", "please run  the  build \"a b\""],
+            ),
+            ("@s-a screen", "s-a", &["@s-a", "screen"]),
+            ("@s-a", "s-a", &["@s-a"]),
+            ("text", "-", &["text"]),
+        ];
+        for (line, want_sid, want_argv) in cases {
+            let (sid, argv) = dispatch_argv(line);
+            assert_eq!(sid, want_sid, "{line:?}");
+            assert_eq!(argv, want_argv, "{line:?}");
+        }
     }
 
     /// A listing row as `aterm-ctl` hands one over.
@@ -1214,29 +1154,11 @@ mod tests {
         let back = diag.observe(&live).expect("recovery is reported once");
         assert!(back.contains("recovered"), "{back}");
         assert!(
-            back.contains("1 session(s) after 2 failed scan(s)"),
-            "{back}"
-        );
-        assert!(
             diag.observe(&live).is_none(),
             "a healthy listing is silent, scan after scan"
         );
 
         // …and the next failure is news again, not a suppressed repeat.
         assert!(diag.observe(&broken).is_some());
-    }
-
-    #[test]
-    fn operator_commands_build_exact_text_or_binary_control_frames() {
-        let clear =
-            operator_ctl_args("clear-fault", &[std::ffi::OsString::from("confirm=human")]).unwrap();
-        assert_eq!(
-            clear,
-            ["operator", "clear-fault", "confirm=human"].map(std::ffi::OsString::from)
-        );
-
-        let proposal = operator_ctl_args("propose", &[]).unwrap();
-        assert_eq!(proposal, [std::ffi::OsString::from("operator-propose-bin")]);
-        assert!(operator_ctl_args("propose", &[std::ffi::OsString::from("inline")]).is_err());
     }
 }

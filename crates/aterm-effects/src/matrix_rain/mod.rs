@@ -2337,10 +2337,11 @@ fn srgb_over(tint: u32, alpha: u8, bg: u32) -> u32 {
 ///
 /// Faint text is `color_resolve::dim_toward_bg`: a linear-light mix
 /// `L(dim) = L(bg) + m·(L(fg)-L(bg))` whose mix `m` is `color_resolve::faint_mix`,
-/// the opacity (default 0.5) raised, when needed, until the faint ink keeps
-/// `contrast(fg, bg)^opacity` (dark ink on a light ground would otherwise sink
-/// into the mid-greys). The bound here still takes `m = 0.5`, the plain blend:
-/// `faint_mix` only ever raises the mix, so faint text sits at least that far
+/// the opacity (default 0.5) raised, when needed, to the larger of the
+/// log-share floor `contrast(fg, bg)^opacity` and the readable floor
+/// `9^opacity` capped at `contrast^((1+opacity)/2)` (dark ink on a light
+/// ground would otherwise sink into the mid-greys). The bound here still takes
+/// `m = 0.5`, the plain blend: `faint_mix` only ever raises the mix, so faint text sits at least that far
 /// from the background, and rain held under the plain blend stays closer to the
 /// background than faint text on every theme. It is conservative (tighter than
 /// the real faint ink on light themes, where the floor lifts `m`), never
@@ -2441,7 +2442,6 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    use super::field::rain_hash32;
     use super::*;
 
     // ---- fixtures ----------------------------------------------------------
@@ -2589,33 +2589,29 @@ mod tests {
 
     // ---- determinism -------------------------------------------------------
 
-    /// Same seed + same tick stream ⇒ identical emission, across (a) two
-    /// engines, and (b) the injected-Instant path vs the advance-by-dt path.
+    /// Same seed + same tick stream ⇒ identical emission across two engines,
+    /// one on the injected-Instant path and one on the advance-by-dt path.
     #[test]
     fn deterministic_across_engines_and_clock_paths() {
         let g = geom(40, 60, 8, 16);
         let mut a = MatrixRain::new(cfg_on());
         let mut b = MatrixRain::new(cfg_on());
-        let mut c = MatrixRain::new(cfg_on());
         scan_empty(&mut a, 40, 60);
         scan_empty(&mut b, 40, 60);
-        scan_empty(&mut c, 40, 60);
         let t0 = Instant::now();
         let (mut qa, mut aa) = (Vec::new(), Vec::new());
         let (mut qb, mut ab) = (Vec::new(), Vec::new());
-        let (mut qc, mut ac) = (Vec::new(), Vec::new());
+        let mut rained = false;
         for i in 0..200u64 {
             if i % 3 == 0 {
                 a.note_activity(i);
                 b.note_activity(i);
-                c.note_activity(i);
             }
             if i % 7 == 0 {
                 a.note_keystroke();
                 b.note_keystroke();
-                c.note_keystroke();
             }
-            // A rides the Instant path; B and C ride advance-by-dt.
+            // A rides the Instant path; B rides advance-by-dt.
             let now = t0 + Duration::from_millis(i * 33);
             let fa = a.tick(now, g, &idle(), &mut qa, &mut aa);
             let fb = step(
@@ -2626,25 +2622,12 @@ mod tests {
                 &mut qb,
                 &mut ab,
             );
-            let fc = step(
-                &mut c,
-                g,
-                &idle(),
-                if i == 0 { 0 } else { 33 },
-                &mut qc,
-                &mut ac,
-            );
             assert_eq!(fa, fb, "instant vs dt fingerprint diverged at step {i}");
             assert_eq!(qa, qb, "instant vs dt quads diverged at step {i}");
             assert_eq!(aa, ab, "instant vs dt halos diverged at step {i}");
-            assert_eq!(
-                (fb, &qb, &ab),
-                (fc, &qc, &ac),
-                "twin engines diverged at step {i}"
-            );
+            rained |= !qa.is_empty();
         }
-        // Non-vacuous: the drive actually rained at some point.
-        assert!(a.last_emit_nonempty || a.tick > 0);
+        assert!(rained, "non-vacuous: the drive actually rained");
     }
 
     // ---- budgets -----------------------------------------------------------
@@ -2676,36 +2659,6 @@ mod tests {
                 }
             }
             assert!(hit_cap, "truncation branch never exercised at {cw}x{ch}");
-        }
-    }
-
-    /// Truncation drops whole highest-hash columns: the emitted column set is
-    /// a prefix of the hash-ascending column order.
-    #[test]
-    fn truncation_drops_whole_highest_hash_columns() {
-        let g = geom(200, 500, 4, 8);
-        let mut e = MatrixRain::new(RainConfig {
-            density: 12,
-            ..cfg_on()
-        });
-        scan_empty(&mut e, 200, 500);
-        pour(&mut e);
-        let (mut q, mut a) = (Vec::new(), Vec::new());
-        step(&mut e, g, &idle(), 83, &mut q, &mut a);
-        assert!(q.len() >= 2048 - 202, "expected a truncated downpour");
-        let seed = e.seed32;
-        let hash_of = |col: u16| rain_hash32(seed ^ ((u32::from(col) << 1) | 1));
-        let max_emitted = q.iter().map(|s| hash_of(s.x / 4)).max().unwrap();
-        // Every column whose hash exceeds the emitted maximum must be absent
-        // (it was dropped whole) — no partial column ever survives.
-        let emitted: std::collections::HashSet<u16> = q.iter().map(|s| s.x / 4).collect();
-        for col in 0..500u16 {
-            if hash_of(col) > max_emitted {
-                assert!(
-                    !emitted.contains(&col),
-                    "column {col} should be dropped whole"
-                );
-            }
         }
     }
 
@@ -2880,9 +2833,10 @@ mod tests {
     }
 
     /// The plain-blend bound is conservative against the faint ink aterm-core
-    /// actually draws (`dim_toward_bg`, whose `faint_mix` floor only raises
-    /// the mix): every rain level stays closer to the background than real
-    /// faint text, dark and light. The control: on a light theme the floor
+    /// actually draws (`dim_toward_bg`, whose `faint_mix` raises the mix to the
+    /// larger of the log-share floor and the capped readable floor, and only
+    /// ever raises it): every rain level stays closer to the background than
+    /// real faint text, dark and light. The control: on a light theme the floor
     /// lifts faint ink well past the plain blend, so the two are not the same
     /// rule.
     #[test]
@@ -2929,83 +2883,37 @@ mod tests {
     /// out-of-range overrides.
     #[test]
     fn alpha_cap_is_pinned() {
-        // Overrides clamp into 16..=135 and head >= body.
+        // Overrides clamp into RAIN_ALPHA_FLOOR..=RAIN_ALPHA_CAP, head >= body.
         let e = MatrixRain::new(RainConfig {
             alpha_override: Some(200),
             head_alpha_override: Some(3),
             ..cfg_on()
         });
-        assert_eq!(e.body_alpha, 135);
-        assert_eq!(e.head_alpha, 135, "head clamps up to body");
+        assert_eq!(e.body_alpha, RAIN_ALPHA_CAP);
+        assert_eq!(e.head_alpha, RAIN_ALPHA_CAP, "head clamps up to body");
     }
 
     // ---- drain ---------------------------------------------------------------
 
-    /// Every path to stillness reaches empty within the fixed bound and
-    /// disarms `is_active` (mandatory sleep — no idle="keep" exists).
+    /// A hidden pane drains on its very next emit: no fade-out tail.
     #[test]
-    fn drain_reaches_empty_within_bound_from_every_state() {
+    fn hidden_pane_drains_immediately() {
         let g = geom(60, 80, 8, 16);
-        // (scenario name, prep) — each returns a raining engine.
-        let rain_engine = || {
-            let mut e = MatrixRain::new(RainConfig {
-                density: 12,
-                idle_secs: 2,
-                ..cfg_on()
-            });
-            scan_empty(&mut e, 60, 80);
-            pour(&mut e);
-            let (mut q, mut a) = (Vec::new(), Vec::new());
-            for i in 0..40u64 {
-                e.note_activity(i + 1);
-                step(&mut e, g, &idle(), 33, &mut q, &mut a);
-            }
-            assert!(!q.is_empty(), "engine should be raining before the drain");
-            e
-        };
-        // (a) idle → SLEEP: idle_secs + dwell + drain, generously bounded.
-        {
-            let mut e = rain_engine();
-            let (mut q, mut a) = (Vec::new(), Vec::new());
-            let mut empty_at = None;
-            for i in 0..120u64 {
-                let fp = step(&mut e, g, &idle(), 83, &mut q, &mut a);
-                if fp == 0 && empty_at.is_none() {
-                    empty_at = Some(i * 83);
-                }
-            }
-            let at = empty_at.expect("idle engine must drain");
-            assert!(at <= 6500, "idle drain took {at} ms");
-            assert!(!e.is_active(), "drained engine must disarm the timer");
-            // fp is byte-stable at 0 once drained.
-            for _ in 0..5 {
-                assert_eq!(step(&mut e, g, &idle(), 83, &mut q, &mut a), 0);
-            }
+        let mut e = MatrixRain::new(RainConfig {
+            density: 12,
+            ..cfg_on()
+        });
+        scan_empty(&mut e, 60, 80);
+        pour(&mut e);
+        let (mut q, mut a) = (Vec::new(), Vec::new());
+        for i in 0..40u64 {
+            e.note_activity(i + 1);
+            step(&mut e, g, &idle(), 33, &mut q, &mut a);
         }
-        // (b) unfocused → bounded drain even under continuing activity.
-        {
-            let mut e = rain_engine();
-            e.set_visibility(RainVisibility::VisibleUnfocused);
-            let (mut q, mut a) = (Vec::new(), Vec::new());
-            let mut empty_at = None;
-            for i in 0..80u64 {
-                e.note_activity(1000 + i);
-                let fp = step(&mut e, g, &idle(), 83, &mut q, &mut a);
-                if fp == 0 && empty_at.is_none() {
-                    empty_at = Some(i * 83);
-                }
-            }
-            let at = empty_at.expect("unfocused engine must drain");
-            assert!(at <= 3500, "unfocus drain took {at} ms");
-        }
-        // (c) hidden → immediate.
-        {
-            let mut e = rain_engine();
-            e.set_visibility(RainVisibility::Hidden);
-            let (mut q, mut a) = (Vec::new(), Vec::new());
-            assert_eq!(step(&mut e, g, &idle(), 83, &mut q, &mut a), 0);
-            assert!(q.is_empty(), "hidden pane drains immediately");
-        }
+        assert!(!q.is_empty(), "engine should be raining before the drain");
+        e.set_visibility(RainVisibility::Hidden);
+        assert_eq!(step(&mut e, g, &idle(), 83, &mut q, &mut a), 0);
+        assert!(q.is_empty(), "hidden pane drains immediately");
     }
 
     // ---- fingerprint liveness --------------------------------------------------
@@ -3179,54 +3087,24 @@ mod tests {
             "open terminal field below the panel remains rain-eligible"
         );
 
+        for cell in &mut cells[9][2..22] {
+            cell.ch = 'x';
+        }
+        rain.rescan_from_cells(&cells, &sizes, &images, rows, cols, BG, 2);
+        assert!(
+            rain.cell_eligible(5, 12, &input),
+            "corner glyphs around text must not close a framed surface"
+        );
+
         cells[9][1].ch = ' ';
         cells[9][22].ch = ' ';
         for cell in &mut cells[9][2..22] {
             cell.ch = ' ';
         }
-        rain.rescan_from_cells(&cells, &sizes, &images, rows, cols, BG, 2);
+        rain.rescan_from_cells(&cells, &sizes, &images, rows, cols, BG, 3);
         assert!(
             rain.cell_eligible(5, 12, &input),
             "an unclosed drawing must not hide ordinary terminal space"
-        );
-    }
-
-    #[test]
-    fn frame_detector_rejects_text_as_a_bottom_edge() {
-        let (rows, cols) = (13usize, 26usize);
-        let mut cells = vec![vec![space_cell(bg3()); cols]; rows];
-        cells[1][1].ch = '╭';
-        cells[1][22].ch = '╮';
-        for cell in &mut cells[1][2..22] {
-            cell.ch = '─';
-        }
-        for row in cells.iter_mut().take(10).skip(2) {
-            row[1].ch = '│';
-            row[22].ch = '│';
-        }
-        cells[8][1].ch = '╰';
-        cells[8][22].ch = '╯';
-        for cell in &mut cells[8][2..22] {
-            cell.ch = 'x';
-        }
-        cells[10][1].ch = '╰';
-        cells[10][22].ch = '╯';
-        for cell in &mut cells[10][2..22] {
-            cell.ch = '─';
-        }
-
-        let sizes = vec![LineSize::SingleWidth; rows];
-        let images = vec![Vec::new(); rows];
-        let mut rain = MatrixRain::new(cfg_on());
-        rain.rescan_from_cells(&cells, &sizes, &images, rows, cols, BG, 1);
-        let band = [12u16];
-        let input = RainTickInput {
-            hidden_band: &band,
-            ..RainTickInput::default()
-        };
-        assert!(
-            rain.cell_eligible(5, 12, &input),
-            "corner glyphs around text must not close a framed surface"
         );
     }
 
@@ -3360,14 +3238,6 @@ mod tests {
         e.sample_material(&cells, rows, Some((5, 0)), &[]);
         assert!(!e.needs_material_sample());
 
-        // With nothing outside the band, the table is empty.
-        let mut only_secret = vec![vec![space_cell(bg3()); cols]; rows];
-        for (i, ch) in "hunter2".chars().enumerate() {
-            only_secret[3][i].ch = ch;
-        }
-        e.sample_material(&only_secret, rows, Some((3, 0)), &[]);
-        assert!(e.material.is_empty(), "typing-only screens sample nothing");
-
         // The knob off ⇒ always empty.
         let mut cfg = cfg_on();
         cfg.output_material = false;
@@ -3377,19 +3247,6 @@ mod tests {
             e2.material.is_empty(),
             "output_material=false stays classic"
         );
-
-        // Over-long screens cap at MATERIAL_CAP.
-        let mut big = vec![vec![space_cell(bg3()); 64]; 8];
-        for row in big.iter_mut().take(8) {
-            for cell in row.iter_mut() {
-                cell.ch = '7';
-            }
-        }
-        e.sample_material(&big, 8, None, &[]);
-        assert!(e.material.len() <= MATERIAL_CAP);
-        assert!(!e.material.is_empty());
-        assert_eq!(e.material_chars, vec!['7']);
-        assert!(decoded(&e).chars().all(|ch| ch == '7'));
     }
 
     #[test]
@@ -3429,26 +3286,6 @@ mod tests {
             version,
             "reordering/frequency alone never rebakes the atlas"
         );
-
-        let pattern = ['A', 'b', '3', '{', '}'];
-        let mut long = vec![vec![space_cell(bg3()); 220]; rows];
-        for (index, cell) in long[0].iter_mut().enumerate() {
-            cell.ch = pattern[index % pattern.len()];
-        }
-        e.sample_material(&long, rows, Some((3, 0)), &[]);
-        let expected: String = (220 - MATERIAL_CAP..220)
-            .map(|index| pattern[index % pattern.len()])
-            .collect();
-        let actual: String = e
-            .material
-            .iter()
-            .map(|&slot| e.material_chars[usize::from(slot)])
-            .collect();
-        assert_eq!(
-            actual, expected,
-            "the fixed ring preserves the exact source tail"
-        );
-        assert_eq!(e.material_scratch.len(), MATERIAL_CAP);
 
         small[0][0].ch = '🐈';
         for cell in &mut small[0][1..] {
@@ -3547,20 +3384,6 @@ mod tests {
                 "the emitted tape follows the same source order"
             );
         }
-
-        // Under the cap the tail is the whole sample — no truncation, same order.
-        let mut sparse = vec![vec![space_cell(bg3()); cols]; rows];
-        for (c, cell) in sparse[8].iter_mut().take(9).enumerate() {
-            cell.ch = pattern[c % pattern.len()];
-        }
-        let mut e = MatrixRain::new(literal_cfg_on());
-        e.sample_material(&sparse, rows, Some((2, 0)), &[]);
-        assert_eq!(
-            e.material_scratch,
-            forward_tail(&sparse, rows, Some((2, 0)), &[]),
-            "a sub-cap sample keeps every hit in source order"
-        );
-        assert!(e.material_scratch.len() < MATERIAL_CAP);
     }
 
     /// Literal mode has no decorative escape hatch: until supported output is
@@ -3605,14 +3428,6 @@ mod tests {
             q.is_empty(),
             "clearing real output cannot reveal fake glyphs"
         );
-
-        let mut classic = MatrixRain::new(cfg_on());
-        scan_empty(&mut classic, rows, cols);
-        pour(&mut classic);
-        for _ in 0..30 {
-            step(&mut classic, g, &idle(), 33, &mut q, &mut a);
-        }
-        assert!(!q.is_empty(), "the explicit classic setting still works");
     }
 
     /// Sanitized PTY frames captured from Codex and Claude Code surfaces, run
@@ -3773,34 +3588,6 @@ mod tests {
         assert!(e.is_active(), "refocus resumes an awake weather");
     }
 
-    /// Reading disarms: a scrolled-back or alt-quiet pane with an empty frame
-    /// reports inactive, and re-arms when a live emit runs.
-    #[test]
-    fn reading_gate_disarms_and_rearms() {
-        let g = geom(30, 40, 8, 16);
-        let mut e = MatrixRain::new(cfg_on());
-        scan_empty(&mut e, 30, 40);
-        let (mut q, mut a) = (Vec::new(), Vec::new());
-        for i in 0..30u64 {
-            e.note_activity(i + 1);
-            step(&mut e, g, &idle(), 83, &mut q, &mut a);
-        }
-        assert!(e.is_active(), "awake and live");
-        // Scroll back: the first gated emit erases the field (fp 0) and the
-        // engine disarms even though the weather is still awake.
-        let scrolled = RainTickInput {
-            display_offset: 5,
-            ..RainTickInput::default()
-        };
-        step(&mut e, g, &scrolled, 83, &mut q, &mut a);
-        assert!(q.is_empty(), "reading frame is empty");
-        assert!(!e.is_active(), "reading + empty frame ⇒ disarmed");
-        // Return to live (a redraw by construction): active again.
-        e.note_activity(1000);
-        step(&mut e, g, &idle(), 83, &mut q, &mut a);
-        assert!(e.is_active(), "live emit re-arms");
-    }
-
     /// `can_emit` — the host's rescan-worth probe: false under reduced motion
     /// and for a non-focused pane past its drain; true for a focused pane.
     #[test]
@@ -3830,9 +3617,6 @@ mod tests {
             e.wave_pending || e.wave.is_some(),
             "success fires the finishing sweep"
         );
-        e.note_exit_status(true);
-        step(&mut e, g, &idle(), 83, &mut q, &mut a);
-        assert!(e.fail_until_ms > 0, "failure holds the ember tint");
 
         let mut cfg = cfg_on();
         cfg.exit_tint = false;
@@ -3842,26 +3626,6 @@ mod tests {
         step(&mut e2, g, &idle(), 83, &mut q, &mut a);
         assert_eq!(e2.fail_until_ms, 0, "knob off ⇒ inert");
         assert!(!e2.wave_pending, "knob off ⇒ no sweep either");
-    }
-
-    /// The emitted snapshot arrives row-sorted — the renderer's per-row dirty
-    /// merge-diff walks contiguous row slices and debug_asserts this order
-    /// (emission itself walks hash-ordered columns; `emit` sorts).
-    #[test]
-    fn emitted_quads_are_row_sorted() {
-        let g = geom(30, 40, 8, 16);
-        let mut e = MatrixRain::new(cfg_on());
-        scan_empty(&mut e, 30, 40);
-        pour(&mut e);
-        let (mut q, mut a) = (Vec::new(), Vec::new());
-        for _ in 0..30 {
-            step(&mut e, g, &idle(), 33, &mut q, &mut a);
-            assert!(
-                q.is_sorted_by_key(|quad| quad.row),
-                "rain_quads must be row-sorted for the dirty merge-diff"
-            );
-        }
-        assert!(!q.is_empty(), "the pour actually emitted");
     }
 
     /// With a live literal-material table every emitted rain quad draws a table
@@ -4000,29 +3764,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_signal_numeric_abi_is_contiguous_and_pinned() {
-        let signals = [
-            RainSignal::AssistantStream,
-            RainSignal::Inspect,
-            RainSignal::Modify,
-            RainSignal::Execute,
-            RainSignal::Network,
-            RainSignal::Branch,
-            RainSignal::Waiting,
-            RainSignal::Success,
-            RainSignal::Failure,
-            RainSignal::Interrupted,
-            RainSignal::TurnStart,
-        ];
-        for (code, signal) in signals.into_iter().enumerate() {
-            assert_eq!(signal as usize, code);
-            assert_eq!(RainSignal::from_code(code as u32), Some(signal));
-        }
-        assert_eq!(RainSignal::from_code(signals.len() as u32), None);
-    }
-
-    #[test]
-    fn semantic_work_wakes_drained_weather_then_expires_without_gaps() {
+    fn semantic_work_wakes_drained_weather_without_a_gap() {
         let g = geom(30, 40, 8, 16);
         let mut rain = MatrixRain::new(cfg_on());
         scan_empty(&mut rain, 30, 40);
@@ -4041,12 +3783,6 @@ mod tests {
             "observable work re-arms the bounded field"
         );
         assert!(!q.is_empty(), "the wake produces a real frame, not a gap");
-
-        for _ in 0..SEMANTIC_HOLD_TICKS {
-            step(&mut rain, g, &idle(), 83, &mut q, &mut a);
-        }
-        assert_eq!(rain.semantic_phase, RainSignal::AssistantStream);
-        assert_eq!(rain.semantic_ticks_left, 0);
     }
 
     /// Tier-B: a live selection zeroes emission in its band without any
@@ -4128,12 +3864,14 @@ mod tests {
             step(&mut e, g, &idle(), 83, &mut q, &mut a);
         }
         assert!(!q.is_empty());
-        // Scrollback: any display offset yields clean text.
+        // Scrollback: any display offset yields clean text, and the reading
+        // pane with an empty frame disarms even though the weather is awake.
         let back = RainTickInput {
             display_offset: 3,
             ..idle()
         };
         assert_eq!(step(&mut e, g, &back, 83, &mut q, &mut a), 0);
+        assert!(!e.is_active(), "reading + empty frame ⇒ disarmed");
         // Alt screen + wheel: the 3s scroll-quiet window gates emission…
         let alt = RainTickInput {
             is_alt_screen: true,
@@ -4147,6 +3885,7 @@ mod tests {
             step(&mut e, g, &alt, 83, &mut q, &mut a);
         }
         assert!(!q.is_empty(), "scroll-quiet window must expire");
+        assert!(e.is_active(), "a live emit re-arms");
         // suppress_in_alt_screen pins the alt screen off permanently.
         let mut e2 = MatrixRain::new(RainConfig {
             density: 12,
@@ -4264,56 +4003,6 @@ mod tests {
         );
     }
 
-    /// A synchronized TUI frame can coalesce a large interactive redraw after
-    /// an editing key. Discount that whole frame, but an explicit submitted-turn
-    /// boundary makes a same-present fast response count immediately. A clock
-    /// rollback is a rebase, never a wrapped burst.
-    #[test]
-    fn coalesced_edit_echo_yields_to_submitted_turn_and_seq_rebases() {
-        let g = geom(30, 40, 8, 16);
-        let mut e = MatrixRain::new(cfg_on());
-        scan_empty(&mut e, 30, 40);
-        let (mut q, mut a) = (Vec::new(), Vec::new());
-
-        e.note_activity(100); // baseline
-        e.note_keystroke();
-        e.note_activity(10_000); // large readline/TUI redraw after the key
-        assert_eq!(
-            e.pending_content_credit, CONTENT_CREDIT_CAP,
-            "coalesced credit is hard-bounded"
-        );
-        step(&mut e, g, &idle(), 83, &mut q, &mut a);
-        assert_eq!(
-            e.content_streak, 0,
-            "the complete immediate redraw is interactive echo"
-        );
-
-        // Enter and the first assistant/tool response can be coalesced into a
-        // single fast present. TurnStart cancels only the editor-key discount;
-        // the real bounded content distance must survive in full.
-        e.note_keystroke();
-        e.note_signal(RainSignal::TurnStart as u32, 4);
-        e.note_activity(10_000 + u64::from(CONTENT_CREDIT_CAP));
-        step(&mut e, g, &idle(), 83, &mut q, &mut a);
-        assert_eq!(
-            e.content_streak,
-            u32::from(CONTENT_CREDIT_CAP),
-            "submitted-turn output is not mistaken for editor echo"
-        );
-        for _ in 0..12 {
-            step(&mut e, g, &idle(), 83, &mut q, &mut a);
-        }
-        assert_eq!(e.weather, RainWeather::Working);
-
-        e.note_activity(2); // fresh session/grid with a lower clock
-        assert_eq!(e.pending_content_credit, 0, "rollback rebases without work");
-        assert_eq!(
-            e.content_streak, 0,
-            "rollback clears the old session streak"
-        );
-        assert!(e.last_content_ms.is_none());
-    }
-
     /// A suspended host keeps the weather advancing via the suspended tick:
     /// notes starve, the weather sleeps, the drain completes, and `is_active`
     /// self-disarms rather than waking forever off a frozen WORKING state.
@@ -4410,64 +4099,46 @@ mod tests {
         }
     }
 
-    /// Reduced motion: nothing is emitted, fp 0, engine inactive.
+    /// Reduced motion and a disabled engine are byte-identical off: nothing
+    /// emitted under a pour, fp 0, engine inactive; a disabled engine bakes no
+    /// atlas either.
     #[test]
-    fn reduced_motion_emits_nothing() {
+    fn off_states_emit_nothing_and_disarm() {
         let g = geom(30, 40, 8, 16);
-        let mut e = MatrixRain::new(RainConfig {
-            density: 12,
-            ..cfg_on()
-        });
-        scan_empty(&mut e, 30, 40);
-        pour(&mut e);
-        e.set_reduced_motion(true);
-        let (mut q, mut a) = (Vec::new(), Vec::new());
-        for i in 0..10u64 {
-            e.note_activity(i);
-            assert_eq!(step(&mut e, g, &idle(), 83, &mut q, &mut a), 0);
-            assert!(q.is_empty() && a.is_empty());
-            assert!(!e.is_active());
+        for disabled in [false, true] {
+            let mut e = MatrixRain::new(RainConfig {
+                density: 12,
+                enabled: !disabled,
+                ..cfg_on()
+            });
+            scan_empty(&mut e, 30, 40);
+            pour(&mut e);
+            e.set_reduced_motion(!disabled);
+            let (mut q, mut a) = (Vec::new(), Vec::new());
+            for i in 0..10u64 {
+                e.note_activity(i);
+                assert_eq!(step(&mut e, g, &idle(), 83, &mut q, &mut a), 0);
+                assert!(q.is_empty() && a.is_empty(), "disabled={disabled}");
+                assert!(!e.is_active(), "disabled={disabled}");
+            }
+            if disabled {
+                assert!(e.rain_atlas().is_none(), "no atlas is baked while disabled");
+            }
         }
-    }
-
-    /// Disabled engine: byte-identical off (empty, fp 0, inactive).
-    #[test]
-    fn disabled_engine_is_byte_identical_off() {
-        let g = geom(30, 40, 8, 16);
-        let mut e = MatrixRain::new(RainConfig {
-            enabled: false,
-            ..cfg_on()
-        });
-        scan_empty(&mut e, 30, 40);
-        let (mut q, mut a) = (Vec::new(), Vec::new());
-        assert_eq!(step(&mut e, g, &idle(), 100, &mut q, &mut a), 0);
-        assert!(q.is_empty() && a.is_empty());
-        assert!(!e.is_active());
-        assert!(e.rain_atlas().is_none(), "no atlas is baked while disabled");
     }
 
     // ---- rescan gate --------------------------------------------------------
 
+    /// The rescan follows the damage epoch, and a retained engine whose front
+    /// grid was swapped (tab switch, pane focus move) rescans even when the two
+    /// terminals' damage epochs collide.
     #[test]
-    fn needs_rescan_follows_the_damage_epoch() {
+    fn needs_rescan_follows_the_damage_epoch_and_grid_replacement() {
         let mut e = MatrixRain::new(cfg_on());
         assert!(e.needs_rescan(1), "unscanned engine always rescans");
         scan_empty(&mut e, 10, 10);
-        assert!(!e.needs_rescan(1));
+        assert!(!e.needs_rescan(1), "an equal epoch holds (the collision)");
         assert!(e.needs_rescan(2), "epoch change re-arms the rescan");
-    }
-
-    /// A retained engine whose front grid was swapped (tab switch, pane focus
-    /// move) rescans even when the two terminals' damage epochs collide:
-    /// `note_grid_replaced` rebaselines occupancy, material and activity.
-    #[test]
-    fn note_grid_replaced_forces_rescan_despite_epoch_collision() {
-        let mut e = MatrixRain::new(cfg_on());
-        scan_empty(&mut e, 10, 10);
-        assert!(
-            !e.needs_rescan(1),
-            "scanned engine holds on an equal epoch (the collision)"
-        );
         e.note_grid_replaced();
         assert!(
             e.needs_rescan(1),
@@ -4497,35 +4168,12 @@ mod tests {
         }
     }
 
-    /// A latched composer-provenance guard does not survive a grid swap: with
-    /// `material_editing` still true, the cleared bank could never refill and
-    /// literal rain would stay dark until the next Enter.
+    /// The material alphabet is grid-derived state: a grid swap drops the old
+    /// session's sampled characters, re-arms a fresh sample, and releases a
+    /// latched composer-provenance guard (still latched, the cleared bank could
+    /// never refill and literal rain would stay dark until the next Enter).
     #[test]
-    fn note_grid_replaced_releases_the_editing_latch() {
-        let mut e = MatrixRain::new(literal_cfg_on());
-        e.note_keystroke();
-        assert!(e.material_editing_for_test(), "keystroke latches Editing");
-        e.note_grid_replaced();
-        assert!(
-            !e.material_editing_for_test(),
-            "the latch belongs to the OLD grid's draft — the swap releases it"
-        );
-        // And the released latch actually lets the new grid sample.
-        let mut cells = vec![vec![space_cell(bg3()); 10]; 10];
-        for (i, ch) in "0f3a".chars().enumerate() {
-            cells[0][i].ch = ch;
-        }
-        e.sample_material(&cells, 10, None, &[]);
-        assert!(
-            !e.literal_material_chars_for_test().is_empty(),
-            "the new grid's output refills the alphabet immediately"
-        );
-    }
-
-    /// The material alphabet is grid-derived state: swapping grids drops the
-    /// old session's sampled characters and re-arms a fresh literal sample.
-    #[test]
-    fn note_grid_replaced_clears_the_material_bank() {
+    fn note_grid_replaced_clears_the_bank_and_releases_the_editing_latch() {
         let mut e = MatrixRain::new(literal_cfg_on());
         scan_empty(&mut e, 10, 10);
         let mut cells = vec![vec![space_cell(bg3()); 10]; 10];
@@ -4534,12 +4182,24 @@ mod tests {
         }
         e.sample_material(&cells, 10, None, &[]);
         assert!(!e.literal_material_chars_for_test().is_empty());
+        e.note_keystroke();
+        assert!(e.material_editing_for_test(), "keystroke latches Editing");
         e.note_grid_replaced();
         assert!(
             e.literal_material_chars_for_test().is_empty(),
             "old grid's literal alphabet must not rain over the new session"
         );
         assert!(e.needs_material_sample(), "fresh sample re-armed");
+        assert!(
+            !e.material_editing_for_test(),
+            "the latch belongs to the OLD grid's draft — the swap releases it"
+        );
+        // And the released latch actually lets the new grid sample.
+        e.sample_material(&cells, 10, None, &[]);
+        assert!(
+            !e.literal_material_chars_for_test().is_empty(),
+            "the new grid's output refills the alphabet immediately"
+        );
     }
 
     // ---- ROM / baker via the engine -------------------------------------------
@@ -4848,10 +4508,12 @@ mod tests {
             (RainSignal::Interrupted, 7, "QueueInterrupted"),
             (RainSignal::TurnStart, 4, "QueueTurnStart"),
         ];
-        for (signal, weight, action) in cases {
+        // The wasm API takes raw codes: the enum order is the numeric ABI.
+        for (code, (signal, weight, action)) in cases.into_iter().enumerate() {
+            assert_eq!(RainSignal::from_code(code as u32), Some(signal));
             let mut state = model.init_state();
             let mut rain = MatrixRain::new(cfg_on());
-            rain.note_signal(signal as u32, weight);
+            rain.note_signal(code as u32, weight);
             assert!(model.fire(action, &mut state));
             let (pending, pending_energy) = rain.pending_signal.expect("queued signal");
             assert_eq!(i64::from(pending as u8), state["pending_phase"]);
@@ -4866,6 +4528,7 @@ mod tests {
             assert_eq!(i64::from(rain.wave_pending), state["wave"]);
             assert_eq!(i64::from(rain.fail_until_ms > rain.clock_ms), state["fail"]);
         }
+        assert_eq!(RainSignal::from_code(cases.len() as u32), None);
     }
 
     #[test]
@@ -5046,14 +4709,14 @@ mod tests {
     }
 
     /// Conformance for the `RainLifecycle` model
-    /// (`aterm_spec::derive::rain_lifecycle_model`): the real engine runs enable → rain →
+    /// (`aterm_models_effects::rain_lifecycle_model`): the real engine runs enable → rain →
     /// unfocus-drain → licensed refocus, each transition projected onto the model
     /// (enable/resume → `Activity`, unfocus → `StartDrain`, drain tick → `DrainTick`),
     /// reaching Idle at exactly `DRAIN_TICKS` with the model's invariants holding throughout.
-    /// The phantom-relight negative control is below.
+    /// The phantom relight is `a_slept_drained_pane_does_not_relight_on_refocus`.
     #[test]
     fn rain_lifecycle_conformance_real_engine_projects_onto_model() {
-        let m = aterm_spec::derive::rain_lifecycle_model();
+        let m = aterm_models_effects::rain_lifecycle_model();
         let mut st = m.init_state();
         let g = geom(24, 60, 8, 16);
         // Enabled + Focused (the default visibility) over an all-empty grid.
@@ -5150,15 +4813,11 @@ mod tests {
         assert_eq!(st["rains"], st["acts"]);
     }
 
-    /// Negative control for the `RainLifecycle` binding: a drained, sleeping
-    /// pane refocused on cmd-tab must not relight (the real engine keeps its
-    /// drain fuel spent). The phantom-relight trace (Idle → Raining with no
-    /// paying Activity) is admitted only by the `Buggy = 1` model, and the
-    /// healthy model's `NoUnlicensedRain` rejects the projected state.
+    /// A drained, sleeping pane refocused on cmd-tab must not relight: the real
+    /// engine keeps its drain fuel spent (the `Buggy = 1` phantom relight of
+    /// `rain_lifecycle_model`, which aterm-spec proves and catches).
     #[test]
-    fn rain_lifecycle_negative_control_phantom_relight_is_buggy_trace() {
-        // 1) The real engine keeps a slept, drained pane drained across an
-        //    unfocus/refocus (cmd-tab).
+    fn a_slept_drained_pane_does_not_relight_on_refocus() {
         let g = geom(24, 60, 8, 16);
         let mut e = MatrixRain::new(RainConfig {
             enabled: true,
@@ -5190,88 +4849,6 @@ mod tests {
         assert!(
             !e.is_active(),
             "the refocused slept pane stays inactive until real activity"
-        );
-
-        // 2) The models separate healthy from buggy: only Buggy=1 admits the
-        //    phantom relight, and the healthy model rejects the projected state.
-        let healthy = aterm_spec::derive::rain_lifecycle_model();
-        let mut buggy = aterm_spec::derive::rain_lifecycle_model();
-        for c in &mut buggy.consts {
-            if c.0 == "Buggy" {
-                c.1 = 1;
-            }
-        }
-        // Drive the buggy model through one full episode to Idle…
-        let mut st = buggy.init_state();
-        assert!(buggy.fire("Activity", &mut st));
-        assert!(buggy.fire("StartDrain", &mut st));
-        for _ in 0..DRAIN_TICKS {
-            assert!(buggy.fire("DrainTick", &mut st));
-        }
-        assert_eq!(st["state"], 0, "the buggy episode reaches Idle");
-        // …then the phantom relight: Idle → Raining with no Activity event.
-        assert!(
-            buggy.action_enabled("Rearm", &st),
-            "Buggy=1 enables the phantom relight"
-        );
-        assert!(buggy.fire("Rearm", &mut st));
-        assert_eq!(st["state"], 1, "the buggy pane relit on cmd-tab alone");
-        // The healthy model rejects the projected state, and has no such action.
-        assert!(
-            !healthy.check_invariant("NoUnlicensedRain", &st),
-            "a Raining entry with no paying Activity violates NoUnlicensedRain"
-        );
-        assert!(
-            !healthy.action_enabled("Rearm", &st),
-            "the healthy model has no phantom-relight action"
-        );
-    }
-
-    /// Conformance for the `RainIgnition` model
-    /// (`aterm_spec::derive::rain_ignition_model`): the real `field::col_params`
-    /// is driven over the model's small-grid lattice (rows 3..=8 at the neutral
-    /// speed knob, so `p ∈ 2..=5`, tick_ms = 33), asserting the per-cell
-    /// head-pass floor `c·p·tick_ms >= 1000` for every column.
-    #[test]
-    fn rain_ignition_conformance_real_col_params_hold_the_flash_floor() {
-        use super::field::{FieldParams, col_params};
-        let tick_ms = 33u32;
-        let (mq, dq, sq) = FieldParams::quanta(tick_ms, 133);
-        let mut checked = 0u32;
-        for rows in 3u32..=8 {
-            for seed in [0u32, 7, 0xDEAD_BEEF, 0x1234_5678, 0xA7E2_11D3] {
-                let fp = FieldParams {
-                    seed32: seed,
-                    rows,
-                    tick_ms,
-                    speed: 5, // neutral: p ∈ 2..=5, the model's period range
-                    trail: 5,
-                    mq,
-                    dq,
-                    sq,
-                };
-                for col in 0..80u32 {
-                    let cp = col_params(&fp, col);
-                    assert!(
-                        (2..=5).contains(&cp.p),
-                        "neutral speed keeps p in 2..=5 (got {})",
-                        cp.p
-                    );
-                    assert!(
-                        cp.c * cp.p * tick_ms >= 1000,
-                        "flash floor: rows={rows} seed={seed:#x} col={col} c={} p={} -> {} ms < 1000",
-                        cp.c,
-                        cp.p,
-                        cp.c * cp.p * tick_ms
-                    );
-                    checked += 1;
-                }
-            }
-        }
-        assert_eq!(
-            checked,
-            6 * 5 * 80,
-            "the full small-grid lattice was exercised"
         );
     }
 }

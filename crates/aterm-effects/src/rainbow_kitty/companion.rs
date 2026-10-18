@@ -36,7 +36,7 @@
 //! Both host render arms reach this router through ONE seam,
 //! [`crate::pipeline::EffectsPipeline::route_flying_head`] — the single-pane
 //! arm (the live present and both capture splices) and the split path —
-//! which runs [`body_for`], [`impulse_for`] and [`placement`] in `duty`'s
+//! which runs [`body_for`], [`impulse_for`] and [`placement`] in that
 //! order. On a [`BodyImpulse::Fly`] it applies the TELEPORT by rebasing the
 //! placement follower on a horizontal flight, so the next placement snaps to
 //! [`Flight::land`], and hands the head the meteor
@@ -110,8 +110,6 @@ use aterm_time::Instant;
 use crate::companion::CompanionDuty;
 use crate::cursor_glow::Geom;
 use crate::kitty_pet::PetFrame;
-#[cfg(test)]
-use crate::kitty_registry::KittyLook;
 use crate::word_decorations::CatFootprint;
 
 use super::timing;
@@ -151,7 +149,7 @@ pub const FLYING_LEAD_MAX: f32 = 0.22;
 /// The 1-px look-back toward the launch lasts **250 ms** after arrival (§7.2,
 /// row "Eyes"). This is the LONGEST thing v2 itself still computes after the
 /// arrival edge, so it — and not the landing squash — is what
-/// [`BodyImpulse::deadline`] asks the cadence for. The squash (`LAND_DUR 0.42`)
+/// [`Flight::settled_at`] asks the cadence for. The squash (`LAND_DUR 0.42`)
 /// belongs to the head's own animator, which keeps its own cadence; v2 does not
 /// hold the frame open for a clock it does not own.
 pub const FLYING_LOOKBACK_MS: f32 = 250.0;
@@ -269,14 +267,6 @@ pub struct Flight {
 }
 
 impl Flight {
-    /// Draw the body mirrored — the existing `facing_left` bank, and no other
-    /// facing state (§7.2: "no facing flip beyond the existing bank").
-    #[must_use]
-    #[cfg(test)]
-    pub fn facing_left(&self) -> bool {
-        matches!(self.dir, Dir::Left)
-    }
-
     /// The spine value to force on frame 0 ([`FLYING_DISP_FLOOR`]), as a floor
     /// so a cat already at full momentum is not pulled down.
     #[must_use]
@@ -294,14 +284,6 @@ impl Flight {
         FLYING_LEAD_0 + (FLYING_LEAD_MAX - FLYING_LEAD_0) * timing::spring_whip(age)
     }
 
-    /// True once the caret's own landing frame has passed — the edge the
-    /// squash, the pin, the ring and the bell all key on.
-    #[cfg(test)]
-    #[must_use]
-    pub fn landed(&self, now: Instant) -> bool {
-        now >= self.land_at
-    }
-
     /// The squint (§7.2(a), row "Eyes") holds through the flight and
     /// [`FLYING_SQUINT_TAIL_MS`] past the arrival edge.
     #[must_use]
@@ -311,8 +293,7 @@ impl Flight {
 
     /// The 1-px look-back toward the launch ends here
     /// ([`FLYING_LOOKBACK_MS`] after arrival) — and this is the last thing v2
-    /// itself still computes for the flight, hence
-    /// [`BodyImpulse::deadline`]'s answer.
+    /// itself still computes for the flight.
     #[must_use]
     pub fn settled_at(&self) -> Instant {
         add_ms(self.land_at, FLYING_LOOKBACK_MS)
@@ -350,23 +331,7 @@ pub enum BodyImpulse {
     Ignore,
 }
 
-impl BodyImpulse {
-    /// The instant after which v2 itself is done computing for this impulse,
-    /// or `None` when it was done on handover. This is all of
-    /// [`Duty::needs_frames`]: v2 holds the cadence only for what it still
-    /// evaluates (a [`BodyImpulse::Fly`]'s whip, squint and look-back).
-    /// `React` and `Perk` are edges; the pet's latch holds whatever cadence the
-    /// perk needs, and pose clocks belong to the animators (`PetFrame::fp`,
-    /// `CursorCat::is_active`).
-    #[must_use]
-    #[cfg(test)]
-    pub fn deadline(&self) -> Option<Instant> {
-        match self {
-            Self::Fly(flight) => Some(flight.settled_at()),
-            Self::Perk { .. } | Self::React(_) | Self::Ignore => None,
-        }
-    }
-}
+impl BodyImpulse {}
 
 /// One impulse, two readings (§7.2, D13): route a [`CompanionImpulse`] to what
 /// the owning body does with it.
@@ -843,108 +808,6 @@ impl PetOffer {
     }
 }
 
-// ===========================================================================
-// 6. The one call the host makes
-// ===========================================================================
-
-/// The launch identity, threaded through the router untouched. The launch
-/// kitty never changes mid-process except by a deliberate favourite pin, so no
-/// code path here constructs a [`KittyLook`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg(test)]
-pub struct Identity {
-    /// The look this process launched with, or the one a favourite pin
-    /// replaced it with.
-    pub look: KittyLook,
-    /// True when [`Self::look`] came from a favourite pin rather than the
-    /// launch roll, the one sanctioned way it may differ.
-    pub pinned: bool,
-}
-
-/// One [`duty`] call's inputs — the whole of what the host knows this frame.
-/// No `Debug`, for [`SeatQuery`]'s reason.
-#[derive(Clone, Copy)]
-#[cfg(test)]
-pub struct DutyQuery {
-    /// The host's already-reached companion verdicts.
-    pub admitted: CompanionAdmission,
-    /// This frame's impulse, if [`super::Engine`] minted one.
-    pub impulse: Option<CompanionImpulse>,
-    /// The flying head's shipped footprint and geometry, or `None` when the host
-    /// has none this frame (kitty disabled, or a grid narrower than the cat):
-    /// then no seat is minted and the head is not drawn. Unread for the pet.
-    pub seat: Option<SeatQuery>,
-    /// The launch identity, passed through.
-    pub identity: Identity,
-    /// The frame's present time (T7).
-    pub now: Instant,
-}
-
-/// Everything the host needs, in one value.
-#[derive(Clone, Copy, Debug, PartialEq)]
-#[cfg(test)]
-pub struct Duty {
-    /// Which body to draw (L-A: exactly one, possibly none).
-    pub body: Body,
-    /// What this frame's impulse means to that body.
-    pub impulse: BodyImpulse,
-    /// The flying head's seat, or `None` for the pet (it seats itself), for no
-    /// body, and for a frame with no footprint. On a [`BodyImpulse::Fly`] frame
-    /// this is the snap-to ([`Flight::land`]).
-    pub seat: Option<Seat>,
-    /// The launch identity, unchanged.
-    pub identity: Identity,
-    /// m1 heroes this frame's impulse earned (§5.8) — 0 or 1, counted per
-    /// IMPULSE and therefore never twice.
-    pub heroes: u8,
-    /// v2 is still computing something for this impulse at
-    /// [`DutyQuery::now`]. The body's animator ORs its own answer in; this is
-    /// v2's half only (see [`BodyImpulse::deadline`]).
-    pub needs_frames: bool,
-    /// The instant v2's own half of the cadence can stop, or `None`.
-    pub deadline: Option<Instant>,
-}
-
-/// **THE SEAM'S COMPOSITION, test side** — body, impulse, seat, identity and
-/// cadence, from one query.
-///
-/// The same three steps, in the same order, that
-/// `EffectsPipeline::route_flying_head` makes (which both render arms call),
-/// as a free function over plain values so this module's tests can pin the
-/// composition without a pipeline. The route runs them inline because it
-/// also needs the impulse's transferring read, the teleport rebase and the
-/// animator's meteor between them.
-///
-/// The order is fixed and each step depends on the last: the body first
-/// (nothing else is meaningful without it), then the impulse for that body,
-/// then the seat — computed only for the flying head, so an ink-probing loop
-/// is never paid for the pet or for a frame that draws no cat.
-#[must_use]
-#[cfg(test)]
-pub fn duty<F>(query: &DutyQuery, ink: F) -> Duty
-where
-    F: Fn(u16, u16) -> Option<bool>,
-{
-    let body = body_for(query.admitted);
-    let impulse = query
-        .impulse
-        .map_or(BodyImpulse::Ignore, |imp| impulse_for(body, imp));
-    let seat = match (body, query.seat) {
-        (Body::Flying { cell }, Some(q)) => Some(placement(cell, &q, ink)),
-        _ => None,
-    };
-    let deadline = impulse.deadline();
-    Duty {
-        body,
-        impulse,
-        seat,
-        identity: query.identity,
-        heroes: query.impulse.map_or(0, heroes_earned),
-        needs_frames: deadline.is_some_and(|at| query.now < at),
-        deadline,
-    }
-}
-
 /// `at + ms`, saturating rather than panicking on an absurd offset. The one
 /// place milliseconds become an `Instant` in this module, so nobody rounds on
 /// the way and lands a frame early (§8.1's reasoning for [`timing::flight`]).
@@ -956,8 +819,6 @@ fn add_ms(at: Instant, ms: f32) -> Instant {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::companion::cursor_companion_duty;
-    use crate::cursor_glow::GlowStyle;
     use std::time::Duration;
 
     const CW: i32 = 9;
@@ -1012,23 +873,6 @@ mod tests {
         }
     }
 
-    fn identity() -> Identity {
-        Identity {
-            look: KittyLook::default(),
-            pinned: false,
-        }
-    }
-
-    /// The host's custody chain for a raw style string with the head fully
-    /// lit and the pet fully faded in: `style_names_any_pet` →
-    /// `cursor_companion_duty`. Pet mode admits the pet and never the flying
-    /// head, whatever the song (`_sing`).
-    fn host_duty(spelling: &str, _sing: f32, caret: Option<(u16, u16)>) -> CompanionDuty {
-        let pet_mode = GlowStyle::style_names_any_pet(spelling);
-        let kitty_alpha = if pet_mode { 0 } else { 255 };
-        cursor_companion_duty(pet_mode, kitty_alpha, caret)
-    }
-
     fn admitted(duty: CompanionDuty) -> CompanionAdmission {
         CompanionAdmission {
             duty,
@@ -1044,72 +888,6 @@ mod tests {
     /// The inclusive cells a seat covers, from its final `x`.
     fn covered(s: &Seat) -> (u16, u16) {
         cell_span(s.x, i32::from(s.w), CW, 120)
-    }
-
-    /// The spelling rule through the host's custody chain: every spelling the
-    /// pet predicate owns (`rainbow kitty` and bare `kitty` included) resolves
-    /// to the resident pet.
-    #[test]
-    fn rainbow_kitty_and_bare_kitty_mean_the_pet() {
-        for spelling in [
-            "rainbow kitty",
-            "kitty",
-            "rainbow kitty pet",
-            "kitty pet",
-            "pet kitty",
-            "rainbow kitty underline",
-            "rainbow dog pet",
-            "dog pet",
-        ] {
-            assert!(
-                GlowStyle::style_names_any_pet(spelling),
-                "{spelling:?} must name a pet upstream"
-            );
-            assert_eq!(
-                body_for(admitted(host_duty(spelling, 0.0, Some((4, 9))))),
-                Body::Pet,
-                "{spelling:?} must draw the resident pet"
-            );
-        }
-    }
-
-    /// The flying head is reachable only through its own spelling (or the bare
-    /// `nyan`/`rainbow` aliases) and escorts exactly the cell the host's duty
-    /// names. A pet-mode song keeps the full resident.
-    #[test]
-    fn the_flying_head_needs_its_own_spelling() {
-        for spelling in [
-            "rainbow kitty flying",
-            "flying kitty",
-            "kitty flying",
-            "nyan",
-            "rainbow",
-            "nyan rainbow",
-        ] {
-            assert!(
-                !GlowStyle::style_names_any_pet(spelling),
-                "{spelling:?} must not name a pet"
-            );
-            assert_eq!(
-                body_for(admitted(host_duty(spelling, 0.0, Some((4, 9))))),
-                Body::Flying { cell: (4, 9) },
-                "{spelling:?} must draw the flying head at the caret"
-            );
-        }
-        // Singing never exchanges the resident for a floating head.
-        for drive in [1.0, 0.4, 0.329, 0.1, 0.0] {
-            assert_eq!(
-                body_for(admitted(host_duty("rainbow kitty", drive, Some((4, 9))))),
-                Body::Pet,
-                "the resident owns the song and tail at drive={drive}"
-            );
-        }
-        // The head has no independent placement: no visible caret, no head.
-        assert_eq!(
-            body_for(admitted(host_duty("nyan", 0.0, None))),
-            Body::None,
-            "the host's duty is Idle without a caret, and the router agrees"
-        );
     }
 
     /// L-A: the router names one body, the host duty's, and a frame whose body
@@ -1157,10 +935,7 @@ mod tests {
         };
         assert_eq!(flight.land_at, land, "the arrival edge is minted once");
         assert_eq!(flight.land, (7, 80), "the snap-to is the escorted cell");
-        assert!(!flight.facing_left());
         assert!(flight.disp_floor() >= 0.97, "§7.2: disp = max(disp, 0.97)");
-        assert!(!flight.landed(t0));
-        assert!(flight.landed(land));
 
         // The pet: an OFFER of the same edge, carrying nothing else. The
         // variant has exactly one field, which is the law made structural.
@@ -1173,11 +948,6 @@ mod tests {
         assert!(
             !matches!(pet, BodyImpulse::Fly(_)),
             "a v2 meteor must never relocate the pet (owner Q14: no teleport)"
-        );
-        assert_eq!(
-            pet.deadline(),
-            None,
-            "the offer is an edge: v2 computes nothing after minting it"
         );
 
         // No body ⇒ nothing, and the three reactions never fork.
@@ -1195,51 +965,6 @@ mod tests {
                 "a reaction with no body is not a pose"
             );
         }
-    }
-
-    /// §20.1's flying-head law, the ROUTER's half (the whole of it, through
-    /// the pipeline and the animator, is `pipeline_native.rs`'s
-    /// `the_flying_head_is_at_the_landing_on_frame_zero_and_squashes_on_arrival`):
-    /// on the spawn frame the head's seat is resolved
-    /// at the LANDING — the shipped footprint for that cell, byte-for-byte on
-    /// blank glass — the impulse names that cell as the snap-to, `disp ≥ 0.97`
-    /// and `lead == −0.30` at `t₀`, and `land_at == t₀ + T`.
-    #[test]
-    fn the_router_seats_the_flying_head_at_the_landing_on_the_spawn_frame() {
-        let t0 = Instant::now();
-        let t_flight = Duration::from_millis(90);
-        let landing = (7, 80);
-        let d = duty(
-            &DutyQuery {
-                admitted: admitted(CompanionDuty::FlyingHead { cell: landing }),
-                impulse: Some(CompanionImpulse::Meteor {
-                    dir: Dir::Right,
-                    t0,
-                    t_flight,
-                }),
-                seat: Some(seat_query(landing, 120)),
-                identity: identity(),
-                now: t0,
-            },
-            blank,
-        );
-        let BodyImpulse::Fly(flight) = d.impulse else {
-            panic!("the head takes the meteor, got {:?}", d.impulse);
-        };
-        assert_eq!(flight.land, landing);
-        assert!(flight.disp_floor() >= 0.97);
-        assert!((flight.lead_at(t0) - (-0.30)).abs() < 1e-6);
-        assert_eq!(flight.land_at, t0 + t_flight);
-        let seat = d.seat.expect("the head has a seat on the spawn frame");
-        let shipped = footprint(landing, 120);
-        assert_eq!(
-            (seat.x, seat.y, seat.w, seat.h),
-            (shipped.x, shipped.y, shipped.w, shipped.h),
-            "blank glass: the snap-to is the shipped seat at the landing"
-        );
-        assert_eq!(seat.row, landing.0);
-        assert!(!seat.over_ink);
-        assert!(d.needs_frames, "the whip is still being computed at t0");
     }
 
     /// L-D: whatever the caret column and ink, the seat never covers the caret
@@ -1478,165 +1203,5 @@ mod tests {
             (r != 7 || c != 8).then_some(false)
         });
         assert_ne!(mixed.row, 7, "a single unknowable cell in the span yields");
-    }
-
-    /// A Delight earns exactly one m1, keyed on the impulse, so it cannot be
-    /// counted twice and still happens when the body was vetoed.
-    #[test]
-    fn a_delight_earns_exactly_one_hero() {
-        let t0 = Instant::now();
-        assert_eq!(heroes_earned(CompanionImpulse::Delight), 1);
-        assert_eq!(heroes_earned(CompanionImpulse::Land), 0);
-        assert_eq!(heroes_earned(CompanionImpulse::Wince), 0);
-        assert_eq!(
-            heroes_earned(CompanionImpulse::Meteor {
-                dir: Dir::Left,
-                t0,
-                t_flight: Duration::from_millis(90),
-            }),
-            0
-        );
-
-        let mut total = 0_u32;
-        for adm in [
-            admitted(CompanionDuty::Pet),
-            admitted(CompanionDuty::FlyingHead { cell: (3, 10) }),
-            admitted(CompanionDuty::Idle),
-        ] {
-            let d = duty(
-                &DutyQuery {
-                    admitted: adm,
-                    impulse: Some(CompanionImpulse::Delight),
-                    seat: Some(seat_query((3, 10), 120)),
-                    identity: identity(),
-                    now: t0,
-                },
-                blank,
-            );
-            assert_eq!(d.heroes, 1, "one hero per Delight, whatever the body");
-            total += u32::from(d.heroes);
-        }
-        assert_eq!(total, 3, "one per frame — never one per body");
-    }
-
-    /// §7.2's whip: the head starts BEHIND its rest (yanked), overshoots on
-    /// `spring-whip` (ζ 0.6, under 1 on purpose) and is settled ≈ 180 ms in.
-    #[test]
-    fn the_whip_starts_against_travel_and_springs_past_its_rest() {
-        let t0 = Instant::now();
-        let flight = Flight {
-            dir: Dir::Right,
-            t0,
-            land_at: t0 + Duration::from_millis(100),
-            land: (3, 40),
-        };
-        assert!(
-            (flight.lead_at(t0) - FLYING_LEAD_0).abs() < 1e-6,
-            "frame 0 is a full −0.30 cell of yank"
-        );
-        let mut peak = f32::MIN;
-        for ms in 0..400 {
-            peak = peak.max(flight.lead_at(t0 + Duration::from_millis(ms)));
-        }
-        assert!(
-            peak > FLYING_LEAD_MAX,
-            "spring-whip overshoots its rest (ζ < 1)"
-        );
-        // "Settled ≈ 180 ms" is the spec's own reading of `e^(−ζωt) = e^(−2.6)
-        // ≈ 0.07`: a residual under a tenth of the whip's 0.52-cell travel.
-        let settled = flight.lead_at(t0 + Duration::from_millis(180));
-        let travel = FLYING_LEAD_MAX - FLYING_LEAD_0;
-        assert!(
-            (settled - FLYING_LEAD_MAX).abs() < 0.15 * travel,
-            "settled by ≈180 ms, got {settled}"
-        );
-        // Facing is the existing `facing_left` bank and nothing else.
-        let leftward = Flight {
-            dir: Dir::Left,
-            ..flight
-        };
-        assert!(leftward.facing_left());
-        assert!(!flight.facing_left());
-    }
-
-    /// Cadence: v2 arms the frame clock only for what it still computes (the
-    /// flight's whip, squint and look-back), never for an animator's pose or
-    /// the pet's offer; the pet is never handed a seat.
-    #[test]
-    fn v2_holds_the_cadence_only_for_its_own_clocks() {
-        let t0 = Instant::now();
-        let flight = CompanionImpulse::Meteor {
-            dir: Dir::Right,
-            t0,
-            t_flight: Duration::from_millis(100),
-        };
-        let mk = |adm, imp, now| {
-            duty(
-                &DutyQuery {
-                    admitted: adm,
-                    impulse: imp,
-                    seat: Some(seat_query((3, 10), 120)),
-                    identity: identity(),
-                    now,
-                },
-                blank,
-            )
-        };
-        let head = admitted(CompanionDuty::FlyingHead { cell: (3, 10) });
-        let live = mk(head, Some(flight), t0);
-        assert_eq!(live.body, Body::Flying { cell: (3, 10) });
-        assert!(live.needs_frames, "the whip is still being computed");
-        assert_eq!(
-            live.deadline,
-            Some(t0 + Duration::from_millis(350)),
-            "flight 100 ms + the 250 ms look-back"
-        );
-        assert!(live.seat.is_some(), "the head always has a seat");
-
-        let done = mk(head, Some(flight), t0 + Duration::from_millis(400));
-        assert!(!done.needs_frames, "v2 is finished; the head keeps its own");
-
-        let pose = mk(head, Some(CompanionImpulse::Wince), t0);
-        assert_eq!(pose.deadline, None, "a reaction is an edge, not a clock");
-        assert!(!pose.needs_frames);
-
-        let quiet = mk(head, None, t0);
-        assert_eq!(quiet.impulse, BodyImpulse::Ignore);
-        assert_eq!(quiet.heroes, 0);
-        assert!(!quiet.needs_frames);
-
-        // The pet: offered the edge, no cadence for it, and NO seat.
-        let pet = mk(admitted(CompanionDuty::Pet), Some(flight), t0);
-        assert_eq!(pet.body, Body::Pet);
-        assert!(matches!(pet.impulse, BodyImpulse::Perk { .. }));
-        assert!(!pet.needs_frames, "an offer holds no cadence");
-        assert!(pet.seat.is_none(), "the pet seats itself (§7.2(b))");
-
-        // No body ⇒ no seat, so a host can never draw a cat it was not given.
-        let none = mk(
-            CompanionAdmission {
-                body_claimed: true,
-                ..head
-            },
-            Some(flight),
-            t0,
-        );
-        assert_eq!(none.body, Body::None);
-        assert!(none.seat.is_none());
-        assert_eq!(none.impulse, BodyImpulse::Ignore);
-
-        // No footprint ⇒ no seat, even for the head: the host has nothing to
-        // draw this frame (`kitty_cursor_footprint` returned `None`).
-        let unseated = duty(
-            &DutyQuery {
-                admitted: head,
-                impulse: None,
-                seat: None,
-                identity: identity(),
-                now: t0,
-            },
-            blank,
-        );
-        assert!(unseated.seat.is_none());
     }
 }

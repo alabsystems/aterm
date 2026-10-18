@@ -10,10 +10,6 @@
 //!
 //! * the published agent verdict ([`crate::presence::agent_verdict_guarded`],
 //!   from `session_status`'s sweep — the main thread);
-//! * the operator's approval check (`crate::operator_host::approval_gate`,
-//!   behind `looks_like_approval` for the refusal sites in `control.rs`, and
-//!   the operator Classifier / `manage` baseline that announce boxes), and
-//!   its ready check's read of agy's composer (`operator_host::agy_at_rest`);
 //! * the Claude Code footer (`crate::claude_footer`: the composer's frame
 //!   (`aterm_phase::phase::FrameReach`) + `footer::mode_row_under`, and
 //!   `footer::launch_card` while a process's model or effort is unnamed —
@@ -37,10 +33,6 @@
 //!
 //! * the agent verdict degrades to `unknown` (never `prompt`: nothing is
 //!   pressed or announced off a screen the reader could not read);
-//! * the approval check reads `Unreadable`: the refusal sites FAIL CLOSED
-//!   (their contract: a miss there is a keystroke into a box — the operator
-//!   is refused, as over a box), and the announcing sites announce NOTHING
-//!   (no "waiting for human approval" off a screen nobody could read);
 //! * the footer paints no row (the vendor's own row stays) — a panic in the
 //!   upgrade note's composer read drops only the note, the facts still
 //!   paint — and the lights keep what they last showed, take no toggle step,
@@ -56,6 +48,14 @@
 //! happened. [`warn_once`] logs ONE warn per session per distinct panic
 //! location, with the screen's SHAPE (one glyph class per row, no text) —
 //! enough to build the fixture that reproduces it.
+//!
+//! One caller that is no screen reader shares the fence for its hook half: the crash
+//! restore's replay of a dead window's region (`crash_restore::restore_offered`), whose
+//! panic costs one recovered session its screen (the META rung). Filed as
+//! `crash-<pid>.log`, that caught panic would be what this launch's crash scan
+//! (`logging::take_crash_evidence`, which runs after the keeper's boot) shows as the DEAD
+//! window's crash, and the dead window's own report would be renamed unseen. It logs its
+//! one warn itself.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
@@ -92,6 +92,12 @@ pub(crate) fn absorb(info: &PanicHookInfo<'_>) -> bool {
     );
     CAUGHT.with(|c| *c.borrow_mut() = Some(at));
     true
+}
+
+/// Whether this thread runs inside [`guarded`] now: a test's view of a caller's fence.
+#[cfg(test)]
+pub(crate) fn inside() -> bool {
+    DEPTH.with(Cell::get) > 0
 }
 
 /// Wrap whatever hook is installed with [`absorb`], once per process. The
@@ -162,7 +168,7 @@ const WARN_CAP: usize = 256;
 static WARNED: Mutex<Option<HashSet<(String, String)>>> = Mutex::new(None);
 
 /// Log ONE warn for `p` per `session` per panic location — `what` names the
-/// caller (`agent verdict`, `operator approval gate`), `rows` the screen
+/// caller (`agent verdict`), `rows` the screen
 /// (only its [`screen_shape`] is logged, never its text). Whether this call
 /// logged.
 pub(crate) fn warn_once(session: &str, what: &str, p: &ReaderPanic, rows: &[String]) -> bool {

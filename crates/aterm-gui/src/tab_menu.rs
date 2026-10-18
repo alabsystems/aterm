@@ -28,7 +28,7 @@
 //!   popup would be the one visible seam.
 //!
 //! Costs: Esc/arrows/Enter are implemented here, and there is no UI-Automation menu
-//! role (a screen reader sees cells); accessibility parity needs an AccessKit node.
+//! role (a screen reader sees cells); accessibility parity needs an accessibility node.
 //!
 //! # Shape
 //!
@@ -175,6 +175,9 @@ pub(crate) fn ellipsize(s: &str, max: usize) -> String {
 fn entry_text(entry: &TabMenuEntry) -> &str {
     match entry {
         TabMenuEntry::Header(t) => t.as_str(),
+        // The card's rows are aged as it opens (`App::tab_context_menu_model`);
+        // unaged, its words alone.
+        TabMenuEntry::Event { words, .. } => words,
         TabMenuEntry::Separator => "",
         TabMenuEntry::Action { label, .. } => label,
         TabMenuEntry::ConnectionAction { label, .. } => label,
@@ -376,21 +379,25 @@ pub(crate) fn nav_for_key(key: &aterm_types::keyboard::Key) -> MenuNav {
 /// The card's paint tones, derived from `chrome_band::band_colors` like the find bar
 /// and config banner, one shade further from the terminal background because the
 /// card floats over live output.
-struct MenuColors {
-    band: BandColors,
+/// Shared with the Autopilot menu (`crate::autopilot_menu`), the other card
+/// drawn over the pane.
+pub(crate) struct MenuColors {
+    pub(crate) band: BandColors,
     /// The card ground: the band tone pushed further from the terminal bg.
-    card_bg: [u8; 3],
+    pub(crate) card_bg: [u8; 3],
     /// Border / separator rule ink.
-    rule: [u8; 3],
+    pub(crate) rule: [u8; 3],
     /// The highlighted row's ground + ink.
-    sel_bg: [u8; 3],
-    sel_fg: [u8; 3],
+    pub(crate) sel_bg: [u8; 3],
+    pub(crate) sel_fg: [u8; 3],
     /// A disabled action's ink, dimmer than a header.
-    disabled: [u8; 3],
+    pub(crate) disabled: [u8; 3],
 }
 
-fn menu_colors(theme: Theme) -> MenuColors {
-    let band = chrome_band::band_colors(theme);
+pub(crate) fn menu_colors(palette: impl Into<chrome_band::ChromePalette>) -> MenuColors {
+    let palette = palette.into();
+    let theme = palette.theme;
+    let band = chrome_band::band_colors(palette);
     let fg = [
         ((theme.fg >> 16) & 0xff) as u8,
         ((theme.fg >> 8) & 0xff) as u8,
@@ -423,7 +430,7 @@ fn menu_colors(theme: Theme) -> MenuColors {
 /// Write `s` into `row` from `col`, stopping before `end`, emitting lead +
 /// continuation pairs for width-2 chars; a wide glyph that would straddle `end` is
 /// dropped whole.
-fn put_text(
+pub(crate) fn put_text(
     row: &mut [RenderCell],
     mut col: usize,
     end: usize,
@@ -461,9 +468,9 @@ pub(crate) fn paint(
     rect: MenuRect,
     entries: &[TabMenuEntry],
     highlight: Option<usize>,
-    theme: Theme,
+    palette: impl Into<chrome_band::ChromePalette>,
 ) -> Vec<Vec<RenderCell>> {
-    let c = menu_colors(theme);
+    let c = menu_colors(palette.into());
     let w = rect.w;
     let inner = w.saturating_sub(2);
     let text_start = 1 + H_PAD;
@@ -491,7 +498,7 @@ pub(crate) fn paint(
         let selected = highlight == Some(i) && is_selectable(entry);
         let bg = if selected { c.sel_bg } else { c.card_bg };
         let (fg, bold) = match entry {
-            TabMenuEntry::Header(_) => (c.band.label, false),
+            TabMenuEntry::Header(_) | TabMenuEntry::Event { .. } => (c.band.label, false),
             TabMenuEntry::Action { enabled: false, .. }
             | TabMenuEntry::ConnectionAction { enabled: false, .. } => (c.disabled, false),
             TabMenuEntry::Action { .. }
@@ -569,6 +576,7 @@ pub(crate) fn fingerprint(menu: Option<&TabMenu>, rect: Option<MenuRect>) -> u64
     for e in &menu.entries {
         match e {
             TabMenuEntry::Header(t) => (0u8, t.as_str()).hash(&mut h),
+            TabMenuEntry::Event { words, at_ms } => (5u8, words.as_str(), *at_ms).hash(&mut h),
             TabMenuEntry::Separator => 1u8.hash(&mut h),
             TabMenuEntry::Action { label, enabled, .. } => {
                 (2u8, label.as_str(), *enabled).hash(&mut h);

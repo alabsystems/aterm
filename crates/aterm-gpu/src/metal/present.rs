@@ -4,17 +4,13 @@
 //! The Metal present arm, twin of the wgpu present path's seams:
 //!
 //! 1. [`MetalWindowSurface`]: one [`Swapchain`] plus the config it was last
-//!    configured to, with the per-present reconcile
-//!    ([`MetalWindowSurface::reconcile`]) mapping alpha-mode, usage, HDR and
-//!    size drift onto `Swapchain::reconfigure`, and a drift-checked acquire.
+//!    configured to; [`MetalWindowSurface::reconcile`] maps alpha-mode, usage,
+//!    HDR and size drift onto `Swapchain::reconfigure`, and the acquire is
+//!    drift-checked.
 //! 2. [`AcquireRefusal`] and [`surface_present_failure`]: the
-//!    `SurfacePresentFailure` mapping (table on `surface_present_failure`).
-//! 3. [`encode_present_sequence`]: Submit B as one command buffer, in order:
-//!    compose copy, bloom extract, bloom composite, shimmer stage and refract,
-//!    tray, then the blit pass onto the drawable (viewport and scissor
-//!    letterbox, with the HDR/SDR crown in the same pass), and the tap copy
-//!    appended before commit. Binding indices come from the table's
-//!    `BindSpec` via the caller.
+//!    `SurfacePresentFailure` mapping.
+//! 3. [`encode_present_sequence`]: Submit B as one command buffer, with the
+//!    tap copy appended before commit.
 //!
 //! Attached GUI surfaces use a demand-driven drawable worker; standalone tests
 //! acquire synchronously.
@@ -88,8 +84,7 @@ impl Drop for MetalWindowSurface {
 }
 
 impl MetalWindowSurface {
-    /// Attach under a parent `CALayer` (the winit view's layer — the stacking
-    /// tests prove coexistence with a leftover wgpu layer).
+    /// Attach under a parent `CALayer` (the winit view's layer).
     pub(crate) fn attached(
         device: &ffi::Device,
         parent: &Obj,
@@ -148,15 +143,11 @@ impl MetalWindowSurface {
         self.worker.is_some()
     }
 
-    /// Request the next frame's drawable now.
-    ///
-    /// Without this, the only request happened inside [`Self::acquire`], so
-    /// every frame composed once, found no drawable, requested one and
-    /// composed again. Called after a successful present, not at the top of a
-    /// redraw: a redraw that returns early would hand back an unpresented
-    /// drawable, which is not immediately re-vendable and stalls later acquires
-    /// for about a display period.
-    ///
+    /// Request the next frame's drawable now, so the next redraw finds it
+    /// ready instead of composing, requesting and composing again. Called after
+    /// a successful present, not at the top of a redraw: a redraw that returns
+    /// early would hand back an unpresented drawable, which is not immediately
+    /// re-vendable and stalls later acquires for about a display period.
     /// Idempotent and non-blocking.
     pub(crate) fn prefetch_drawable(&mut self) {
         if self.ready.is_some() {
@@ -225,13 +216,6 @@ impl MetalWindowSurface {
     #[cfg(test)]
     pub(crate) fn contents_scale(&self) -> f64 {
         self.swapchain.contents_scale()
-    }
-
-    /// Whether this is the EDR (`Rgba16Float` extended-linear) target;
-    /// `GpuSurface::is_hdr`'s twin.
-    #[cfg(test)]
-    pub(crate) fn is_hdr(&self) -> bool {
-        self.config.format == PixelFormat::Rgba16Float
     }
 
     /// Per-present reconcile, Metal twin of the wgpu drift check in
@@ -331,14 +315,14 @@ fn terminal_worker_refusal(latch: &LossLatch) -> AcquireRefusal {
 /// parent [`MetalWindowSurface::attached`] attaches under. `None` for a target
 /// with no view (nil off the main thread) or a layerless view. Main thread only.
 pub(crate) fn parent_layer_of<W: aterm_objc::HasNsView>(target: &W) -> Option<Obj> {
-    let view: ffi::Id = target.ns_view().as_ptr();
+    let view: ffi::Id = target.ns_view();
     if view.is_null() {
         return None;
     }
     // SAFETY: `view` is a live NSView while `target` is borrowed (`HasNsView`);
     // `layer` is a +0 property read retained to +1 by `Obj::retain`.
     unsafe {
-        let f: unsafe extern "C" fn(ffi::Id, ffi::Sel) -> ffi::Id = ffi::msg();
+        let f: unsafe extern "C-unwind" fn(ffi::Id, ffi::Sel) -> ffi::Id = ffi::checked_msg();
         Obj::retain(f(view, ffi::sel(c"layer")))
     }
 }
@@ -346,28 +330,24 @@ pub(crate) fn parent_layer_of<W: aterm_objc::HasNsView>(target: &W) -> Option<Ob
 /// The EDR potential of the target window's screen
 /// (`NSScreen.maximumPotentialExtendedDynamicRangeColorComponentValue`, 1.0 on
 /// an SDR-only screen). `None` for a target with no view, a view with no
-/// window, or a window on no screen.
-///
-/// The attach gates the `Rgba16Float` pick through
-/// `format_plan::hdr_swapchain_wants_f16_on_screen`, where `None` keeps the
-/// pick. `GpuRenderer::upgrade_surface_for_screen` gates an 8-bit window's
-/// upgrade through `format_plan::hdr_screen_upgrade_wants_f16`, where `None`
-/// upgrades nothing. Not cached: each call reads `-window` and `-screen`
-/// afresh. A not-yet-ordered-front window already reports its screen. Main
+/// window, or a window on no screen; the attach's f16 gate
+/// (`format_plan::hdr_swapchain_wants_f16_on_screen`) then keeps its pick and
+/// `GpuRenderer::upgrade_surface_for_screen` upgrades nothing. Read afresh on
+/// each call; a window not yet ordered front already reports its screen. Main
 /// thread only.
 #[cfg(not(wgpu_arm))]
 pub(crate) fn screen_edr_potential_of<W: aterm_objc::HasNsView>(target: &W) -> Option<f32> {
-    let view: ffi::Id = target.ns_view().as_ptr();
+    let view: ffi::Id = target.ns_view();
     if view.is_null() {
         return None;
     }
     // SAFETY: `view` is live while `target` is borrowed (`HasNsView`). Callers
-    // run on the main thread. `-window` and `-screen` are
-    // +0 reads, nil-checked. The potential getter exists on macOS 10.15+ (the
-    // app requires 11.0) and returns a `CGFloat` in the FP register plain
+    // run on the main thread. `-window` and `-screen` are +0 reads,
+    // nil-checked. The potential getter exists on macOS 10.15+ (the app
+    // requires 11.0) and returns a `CGFloat` in the FP register plain
     // `objc_msgSend` returns. Nothing is retained.
     unsafe {
-        let obj: unsafe extern "C" fn(ffi::Id, ffi::Sel) -> ffi::Id = ffi::msg();
+        let obj: unsafe extern "C-unwind" fn(ffi::Id, ffi::Sel) -> ffi::Id = ffi::checked_msg();
         let window = obj(view, ffi::sel(c"window"));
         if window.is_null() {
             return None;
@@ -376,7 +356,7 @@ pub(crate) fn screen_edr_potential_of<W: aterm_objc::HasNsView>(target: &W) -> O
         if screen.is_null() {
             return None;
         }
-        let f64_of: unsafe extern "C" fn(ffi::Id, ffi::Sel) -> f64 = ffi::msg();
+        let f64_of: unsafe extern "C-unwind" fn(ffi::Id, ffi::Sel) -> f64 = ffi::checked_msg();
         let potential = f64_of(
             screen,
             ffi::sel(c"maximumPotentialExtendedDynamicRangeColorComponentValue"),
@@ -409,6 +389,7 @@ pub(crate) enum AcquireRefusal {
 ///
 /// | failure | Metal signal |
 /// |---|---|
+/// | `AcquirePending` | the drawable worker has not vended yet |
 /// | `Validation` | the process [`LossLatch`] is set; acquire and present refuse before FFI |
 /// | `Reconfigured` | drawable texture extent differs from the retained config |
 /// | `Occluded` | nil acquire with the frontend's occlusion hint set (`NSWindow.occlusionState`; the layer has no such signal, and wgpu-hal reads the same window bit) |
@@ -447,7 +428,7 @@ pub(crate) struct PostPass<'a> {
 
 /// The bloom pair: extract pass and composite pass.
 pub(crate) struct BloomPasses<'a> {
-    /// Half-res target, cleared TRANSPARENT, drawn with row 4 `GlowAdd`.
+    /// Half-res target, cleared transparent, drawn with row 4 `GlowAdd`.
     pub(crate) half_target: &'a SealedTexture,
     pub(crate) extract_pso: &'a Obj,
     /// The 16-byte cell `Uniforms` block at row 4's `vertex_uniform` slot.
@@ -518,7 +499,7 @@ pub(crate) struct TrayPass<'a> {
 /// crown-scissored, instanced over the ungated glow stream.
 pub(crate) struct CrownPass<'a> {
     pub(crate) pso: &'a Obj,
-    /// `HdrGlowUniform` at the row's `vertex_uniform` slot AND its
+    /// `HdrGlowUniform` at the row's `vertex_uniform` slot and its
     /// `fragment_buffers[0]` slot (`BindSpec::CROWN`: one block, two stages).
     pub(crate) uniform: &'a Obj,
     pub(crate) vertex_uniform_slot: usize,
@@ -544,7 +525,7 @@ pub(crate) struct PresentSequence<'a> {
     pub(crate) bloom: Option<BloomPasses<'a>>,
     pub(crate) shimmer: Option<ShimmerPass<'a>>,
     /// The sub-row scroll translate, over the copy (requires `present_off`;
-    /// the sequence REFUSES it against the bare offscreen).
+    /// refused against the bare offscreen).
     pub(crate) band_shift: Option<BandShiftPass<'a>>,
     /// The incoming row over the strip the translate exposed (requires
     /// `band_shift`'s present copy; refused likewise).
@@ -558,10 +539,9 @@ pub(crate) struct PresentSequence<'a> {
 }
 
 /// Encode Submit B onto `cb`, targeting `dest` (the drawable's sealed render
-/// target) at `dest_w`×`dest_h`, in the wgpu path's order: compose copy, bloom
-/// extract, bloom composite, shimmer, tray, then one blit pass carrying the
-/// letterbox blit and the crown. The caller appends the tap copy before
-/// commit.
+/// target) at `dest_w`×`dest_h`, in the wgpu path's order: compose copy, bloom,
+/// shimmer, band shift, apron, tray, then one blit pass carrying the letterbox
+/// blit and the crown. The caller appends the tap copy before commit.
 pub(crate) fn encode_present_sequence(
     cb: &mut CommandBuffer<'_>,
     dest: &SealedTexture,
@@ -629,8 +609,8 @@ pub(crate) fn encode_present_sequence(
         }
     }
 
-    // 3. Shimmer: stage the sample rect, then the scissored refract — AFTER
-    //    the halo, so the haze refracts the finished frame.
+    // 3. Shimmer: stage the sample rect, then the scissored refract, after
+    //    the halo so the haze refracts the finished frame.
     if let Some(shimmer) = &seq.shimmer {
         let [sx0, sy0, sx1, sy1] = shimmer.stage_rect;
         cb.copy_texture_sub_rect(
@@ -706,7 +686,7 @@ pub(crate) fn encode_present_sequence(
     }
 
     // 4. Tray: the card over the finished copy (straight-alpha src-over,
-    //    4-vertex strip) — chrome above halo and haze, the z-order law.
+    //    4-vertex strip), so chrome sits above halo and haze.
     if let Some(tray) = &seq.tray {
         let pass = cb.render_pass(&RenderPassDesc {
             target: composed,
@@ -766,11 +746,9 @@ pub(crate) fn encode_present_sequence(
 mod tests {
     use std::sync::Arc;
 
-    use super::super::encoder::EncodeSession;
     use super::super::loss::{CbOutcome, LossLatch};
     use super::*;
-    use crate::metal::test_support::{as_bytes, device, plain_calayer};
-    use crate::pipeline_table::Pipeline;
+    use crate::metal::test_support::{device, plain_calayer};
 
     /// A bare `CALayer` at a caller-chosen `contentsScale` — the headless
     /// stand-in for the winit view's backing layer on a Retina display.
@@ -779,7 +757,7 @@ mod tests {
         let _pool = ffi::AutoreleasePool::new();
         // SAFETY: a scalar `CGFloat` setter on the live layer.
         unsafe {
-            let set: unsafe extern "C" fn(ffi::Id, ffi::Sel, f64) = ffi::msg();
+            let set: unsafe extern "C-unwind" fn(ffi::Id, ffi::Sel, f64) = ffi::checked_msg();
             set(layer.id(), ffi::sel(c"setContentsScale:"), scale);
         }
         layer
@@ -811,11 +789,11 @@ mod tests {
             surface.contents_scale()
         );
 
-        // The display drag, with the config held EXACTLY where it was.
+        // The display move, with the config unchanged.
         let _pool = ffi::AutoreleasePool::new();
         // SAFETY: scalar `CGFloat` setter on the live parent layer.
         unsafe {
-            let set: unsafe extern "C" fn(ffi::Id, ffi::Sel, f64) = ffi::msg();
+            let set: unsafe extern "C-unwind" fn(ffi::Id, ffi::Sel, f64) = ffi::checked_msg();
             set(parent.id(), ffi::sel(c"setContentsScale:"), 1.0);
         }
         let reconfigured = surface
@@ -834,43 +812,6 @@ mod tests {
         );
     }
 
-    /// The 112-byte blit uniform as `repr(C)`; the production layout is checked
-    /// by `MetalBlit::UNIFORM_BYTES` and the differentials.
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct BlitU {
-        flag: u32,
-        overlay: u32,
-        border_px: f32,
-        encode_srgb: f32,
-        accent: [f32; 3],
-        chrome_y1: f32,
-        dims: [f32; 2],
-        wash_a: f32,
-        border_a: f32,
-        band: [f32; 4],
-        content_off: [f32; 2],
-        hdr: f32,
-        translucent: f32,
-        sdr_white_scale: f32,
-        visible_y: f32,
-        visible_h: f32,
-        premult: f32,
-        chrome_y0: f32,
-        chrome_pad: [f32; 3],
-    }
-
-    /// The 32-byte crown uniform (`HdrGlowUniform`'s layout).
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct CrownU {
-        screen: [f32; 2],
-        content_off: [f32; 2],
-        boost: f32,
-        headroom: f32,
-        _pad: [f32; 2],
-    }
-
     #[test]
     fn terminal_worker_failure_enters_permanent_backend_recovery() {
         let latch = LossLatch::new();
@@ -887,16 +828,8 @@ mod tests {
         );
     }
 
-    /// The failure mapping:
-    ///
-    /// * latch lost -> `Validation`: an injected `Lost` makes the next acquire
-    ///   refuse before FFI;
-    /// * config drift -> `Reconfigured`: the drawable extent disagrees with a
-    ///   desynced retained config;
-    /// * bounded nil -> `Timeout`/`Occluded`: with the layer's device stripped
-    ///   the acquire returns a real `AcquireNil`; the hint set maps to
-    ///   `Occluded`, clear to `Timeout`, and restoring the device restores
-    ///   acquire.
+    /// Live drift, deviceless-nil and latch refusals map to `Reconfigured`,
+    /// `Timeout`/`Occluded` (by the hint) and `Validation`.
     #[test]
     fn acquire_refusals_map_to_the_wgpu_failure_contract() {
         let dev = device();
@@ -930,11 +863,12 @@ mod tests {
         // The nil arm: strip the layer's device so the acquire returns nil.
         // SAFETY: `setDevice:` accepts nil; the layer stays live.
         unsafe {
-            let set_obj: unsafe extern "C" fn(ffi::Id, ffi::Sel, ffi::Id) = ffi::msg();
+            let set_obj: unsafe extern "C-unwind" fn(ffi::Id, ffi::Sel, ffi::Id) =
+                ffi::checked_msg();
             set_obj(
                 surface.swapchain.layer_ptr(),
                 ffi::sel(c"setDevice:"),
-                std::ptr::null_mut(),
+                ffi::Id::NIL,
             );
         }
         let t0 = std::time::Instant::now();
@@ -946,8 +880,8 @@ mod tests {
             matches!(nil, AcquireRefusal::AcquireNil),
             "the deviceless refusal is the nil arm, not drift/latch: {nil:?}"
         );
-        // A hang detector: the deviceless nil is immediate and a parked thread
-        // never returns, so a minute loses nothing 8 s caught.
+        // A hang detector: the deviceless nil is immediate; a parked thread
+        // never returns.
         assert!(
             waited < std::time::Duration::from_secs(60),
             "the live nil is BOUNDED — {waited:?} is not a parked thread"
@@ -963,7 +897,8 @@ mod tests {
         // Recovery: hand the device back and the surface vends again.
         // SAFETY: as the strip above, with the real device.
         unsafe {
-            let set_obj: unsafe extern "C" fn(ffi::Id, ffi::Sel, ffi::Id) = ffi::msg();
+            let set_obj: unsafe extern "C-unwind" fn(ffi::Id, ffi::Sel, ffi::Id) =
+                ffi::checked_msg();
             set_obj(
                 surface.swapchain.layer_ptr(),
                 ffi::sel(c"setDevice:"),
@@ -990,339 +925,6 @@ mod tests {
         crate::stderr_line!(
             "failure mapping on {}: drift->Reconfigured (live), deviceless \
              nil->Timeout/Occluded (live, hint-split), latch->Validation (live)",
-            dev.name()
-        );
-    }
-
-    /// The frame cycle with the crown in the blit pass and the reconcile driven
-    /// mid-cycle:
-    ///
-    /// * frames 0-1: SDR, letterboxed blit only (band pixel is the clear,
-    ///   content pixel the offscreen's);
-    /// * frame 2: SDR with the `sdr_glow` crown, crown-scissored (inside
-    ///   brightens, outside unchanged);
-    /// * frame 3: reconcile flips `opaque`;
-    /// * frames 4-5: reconcile flips to `Rgba16Float`; the `hdr_glow` crown adds
-    ///   f16 light inside the scissor only.
-    ///
-    /// Every present uses the one session queue, is tap-read before present
-    /// and polled to terminal; the latch stays healthy.
-    #[test]
-    fn the_present_arm_cycles_reconciles_and_crowns_on_the_drawable() {
-        let dev = device();
-        let _pool = ffi::AutoreleasePool::new();
-        const W: usize = 32;
-        const H: usize = 24;
-        // The letterboxed content: 24x18 at offset (4, 3).
-        const CW: usize = 24;
-        const CH: usize = 18;
-        const OFF: (usize, usize) = (4, 3);
-
-        let latch = Arc::new(LossLatch::new());
-        let session = EncodeSession::new(&dev, Arc::clone(&latch)).expect("session");
-        let mint = super::super::resources::MetalResourceDevice::new(&dev, Arc::clone(&latch));
-        let usage = ffi::TEXTURE_USAGE_RENDER_TARGET | ffi::TEXTURE_USAGE_SHADER_READ;
-
-        let mut config = SwapchainConfig {
-            format: PixelFormat::Bgra8Unorm,
-            width: W,
-            height: H,
-            framebuffer_only: false,
-            display_sync: false,
-            maximum_drawables: 3,
-            opaque: true,
-        };
-        let mut surface =
-            MetalWindowSurface::standalone(&dev, config, Arc::clone(&latch)).expect("surface");
-
-        // A mid-grey offscreen (CW x CH) so the SCREEN-blend crown has
-        // headroom to brighten into.
-        let offscreen = mint
-            .texture_2d(PixelFormat::Rgba8Unorm, CW, CH, usage)
-            .expect("offscreen");
-        let grey = vec![0x60u8; CW * CH * 4];
-        // SAFETY: fresh managed texture, tight stride.
-        unsafe {
-            ffi::texture_upload(
-                offscreen.obj(),
-                ffi::MtlRegion::full_2d(CW, CH),
-                &grey,
-                CW * 4,
-            );
-        }
-        let nearest = mint
-            .sampler(ffi::SamplerDesc::NEAREST_CLAMP)
-            .expect("sampler");
-
-        #[expect(clippy::cast_precision_loss, reason = "test extents")]
-        let blit_u = BlitU {
-            flag: 0,
-            overlay: 0,
-            border_px: 0.0,
-            encode_srgb: 0.0,
-            accent: [0.0; 3],
-            chrome_y1: 0.0,
-            dims: [CW as f32, CH as f32],
-            wash_a: 0.0,
-            border_a: 0.0,
-            band: [1.0, 0.0, 0.0, 1.0], // red letterbox band
-            content_off: [OFF.0 as f32, OFF.1 as f32],
-            hdr: 0.0,
-            translucent: 0.0,
-            sdr_white_scale: 1.0,
-            visible_y: 0.0,
-            visible_h: CH as f32,
-            premult: 0.0,
-            chrome_y0: 0.0,
-            chrome_pad: [0.0; 3],
-        };
-        let blit_ubuf = dev.new_buffer(size_of::<BlitU>()).expect("blit uniform");
-        // SAFETY: repr(C) into an exactly-sized fresh shared buffer.
-        unsafe { ffi::buffer_write(&blit_ubuf, as_bytes(&blit_u)) };
-
-        #[expect(clippy::cast_precision_loss, reason = "test extents")]
-        let crown_u = CrownU {
-            screen: [W as f32, H as f32],
-            content_off: [OFF.0 as f32, OFF.1 as f32],
-            boost: 1.0,
-            headroom: 0.35,
-            _pad: [0.0; 2],
-        };
-        let crown_ubuf = dev.new_buffer(size_of::<CrownU>()).expect("crown uniform");
-        // SAFETY: as above.
-        unsafe { ffi::buffer_write(&crown_ubuf, as_bytes(&crown_u)) };
-        // One glow quad: offscreen-px rect (6,4,8,6), warm colour.
-        let mut stream_bytes: Vec<u8> = Vec::new();
-        for v in [6u16, 4, 8, 6] {
-            stream_bytes.extend_from_slice(&v.to_le_bytes());
-        }
-        stream_bytes.extend_from_slice(&[0xff, 0xa0, 0x40, 0xff]);
-        let crown_stream = dev.new_buffer(stream_bytes.len()).expect("crown stream");
-        // SAFETY: as above.
-        unsafe { ffi::buffer_write(&crown_stream, &stream_bytes) };
-        // The crown scissor clips the quad (dest x 10..18, scissor ends at 14),
-        // so the scissor is load-bearing for the outside asserts.
-        let crown_scissor = (OFF.0 as u32, OFF.1 as u32, 10u32, CH as u32);
-
-        let blit_spec = Pipeline::Blit.spec();
-        let blit_lib = super::super::pipelines::compile(&dev, blit_spec).expect("blit.metal");
-        let blit_sdr =
-            super::super::pipelines::build(&dev, &blit_lib, blit_spec, PixelFormat::Bgra8Unorm)
-                .expect("blit row, SDR");
-        let blit_edr =
-            super::super::pipelines::build(&dev, &blit_lib, blit_spec, PixelFormat::Rgba16Float)
-                .expect("blit row, EDR");
-        let sdr_spec = Pipeline::SdrGlow.spec();
-        let crown_lib = super::super::pipelines::compile(&dev, sdr_spec).expect("hdr_glow.metal");
-        let sdr_crown =
-            super::super::pipelines::build(&dev, &crown_lib, sdr_spec, PixelFormat::Bgra8Unorm)
-                .expect("row 15 on the SDR drawable");
-        let hdr_spec = Pipeline::HdrGlow.spec();
-        let hdr_crown = super::super::pipelines::build(
-            &dev,
-            &crown_lib,
-            hdr_spec,
-            PixelFormat::Bgra8Unorm, // Edr role pins f16 regardless
-        )
-        .expect("row 14 on the EDR drawable");
-
-        let crown_binds = |spec: &crate::pipeline_table::PipelineSpec| {
-            (
-                spec.binds.vertex_uniform.expect("crown vertex uniform") as usize,
-                spec.binds.fragment_buffers[0] as usize,
-            )
-        };
-        let (sdr_vu, sdr_fu) = crown_binds(sdr_spec);
-        let (hdr_vu, hdr_fu) = crown_binds(hdr_spec);
-
-        // Probe points: BAND (top-left corner), CONTENT outside the crown
-        // rect, CROWNED inside it. Crown rect in dest px = OFF + (6..14, 4..10).
-        let band_px = (0usize, 0usize);
-        let content_px = (OFF.0 + 20, OFF.1 + 15);
-        let crowned_px = (OFF.0 + 7, OFF.1 + 6);
-        // Inside the quad's extent, OUTSIDE the crown scissor — the pixel the
-        // clip must protect. If the crown paints here, the scissor was lost.
-        let clipped_px = (OFF.0 + 12, OFF.1 + 6);
-
-        let mut sdr_plain: Option<Vec<u8>> = None;
-        let mut sdr_crowned: Option<Vec<u8>> = None;
-        for frame_no in 0..6usize {
-            // The per-present reconcile flips the translucency axis at 3 and
-            // the EDR axis at 4, each a real reconfigure through the verb.
-            if frame_no == 3 {
-                config.opaque = false;
-            }
-            if frame_no == 4 {
-                config.format = PixelFormat::Rgba16Float;
-            }
-            let reconfigured = surface.reconcile(&dev, &config).expect("reconcile");
-            assert_eq!(
-                reconfigured,
-                frame_no == 3 || frame_no == 4,
-                "frame {frame_no}: reconcile fires exactly on drift"
-            );
-
-            let is_hdr = surface.is_hdr();
-            // The layer colorspace follows the format across the mid-cycle HDR
-            // flip.
-            let space = surface.swapchain.colorspace_name();
-            if is_hdr {
-                assert_eq!(
-                    space.as_deref(),
-                    Some("kCGColorSpaceExtendedLinearSRGB"),
-                    "frame {frame_no}: the EDR drawable must carry extended-linear scRGB"
-                );
-                assert!(
-                    surface.swapchain.wants_extended_dynamic_range(),
-                    "frame {frame_no}: the EDR flip must opt the layer in"
-                );
-            } else {
-                assert_eq!(
-                    space.as_deref(),
-                    Some("kCGColorSpaceSRGB"),
-                    "frame {frame_no}: the SDR drawable must carry sRGB"
-                );
-                assert!(
-                    !surface.swapchain.wants_extended_dynamic_range(),
-                    "frame {frame_no}: SDR must not opt into EDR"
-                );
-            }
-            let with_crown = frame_no == 2 || frame_no >= 4;
-            let seq = PresentSequence {
-                offscreen: &offscreen,
-                present_off: None,
-                copy_rect: [0, 0, 0, 0],
-                bloom: None,
-                shimmer: None,
-                band_shift: None,
-                apron: None,
-                tray: None,
-                blit: PostPass {
-                    pso: if is_hdr { &blit_edr } else { &blit_sdr },
-                    tex: offscreen.obj(),
-                    tex_slot: blit_spec.binds.fragment_textures[0] as usize,
-                    sampler: &nearest,
-                    sampler_slot: blit_spec.binds.fragment_samplers[0] as usize,
-                    uniform: &blit_ubuf,
-                    uniform_slot: blit_spec.binds.fragment_buffers[0] as usize,
-                },
-                clear: ffi::ClearColor {
-                    r: 1.0,
-                    g: 0.0,
-                    b: 0.0,
-                    a: 1.0,
-                },
-                crown: with_crown.then_some(CrownPass {
-                    pso: if is_hdr { &hdr_crown } else { &sdr_crown },
-                    uniform: &crown_ubuf,
-                    vertex_uniform_slot: if is_hdr { hdr_vu } else { sdr_vu },
-                    fragment_uniform_slot: if is_hdr { hdr_fu } else { sdr_fu },
-                    stream: &crown_stream,
-                    count: 1,
-                    scissor: crown_scissor,
-                }),
-            };
-
-            let frame = surface
-                .acquire()
-                .unwrap_or_else(|r| panic!("frame {frame_no}: acquire refused: {r:?}"));
-            let target = frame.render_target();
-            let bpt = if is_hdr { 8 } else { 4 };
-            let row = W * bpt;
-            let readback = dev.new_buffer(row * H).expect("tap readback");
-            let mut cb = session.begin().expect("cb");
-            encode_present_sequence(&mut cb, &target, (W as u32, H as u32), &seq)
-                .expect("the sequence encodes");
-            cb.copy_texture_to_buffer(&target, W, H, &readback, row)
-                .expect("tap copy");
-            let submitted = cb.commit();
-            let ticket = frame.present(&session).expect("present");
-            assert_eq!(submitted.wait_outcome(), CbOutcome::Completed);
-            assert_eq!(ticket.wait_outcome(), CbOutcome::Completed);
-            assert!(!latch.is_lost(), "frame {frame_no}: healthy cycle");
-
-            // SAFETY: shared storage; both command buffers terminal above.
-            let bytes = unsafe { ffi::buffer_bytes(&readback, row * H) };
-            let px4 = |b: &[u8], (x, y): (usize, usize)| -> [u8; 4] {
-                let o = y * row + x * 4;
-                [b[o], b[o + 1], b[o + 2], b[o + 3]]
-            };
-            if is_hdr {
-                // f16 lanes: band red = (1,0,0), crowned pixel gains >0 light
-                // in at least one lane vs the flat grey, outside stays grey.
-                let half = |b: &[u8], (x, y): (usize, usize), lane: usize| -> u16 {
-                    let o = y * row + x * 8 + lane * 2;
-                    u16::from_le_bytes([b[o], b[o + 1]])
-                };
-                assert_eq!(
-                    half(&bytes, band_px, 0),
-                    0x3c00, // f16 1.0
-                    "frame {frame_no}: the EDR band is the clear red"
-                );
-                let crowned = half(&bytes, crowned_px, 1);
-                let content = half(&bytes, content_px, 1);
-                assert!(
-                    crowned > content,
-                    "frame {frame_no}: the EDR crown must ADD light inside its \
-                     scissor (crowned g={crowned:04x} vs content g={content:04x})"
-                );
-                let clipped = half(&bytes, clipped_px, 1);
-                assert_eq!(
-                    clipped, content,
-                    "frame {frame_no}: the EDR crown must NOT paint outside its \
-                     scissor — the quad crosses the clip edge and the clipped \
-                     half must stay flat grey"
-                );
-            } else {
-                assert_eq!(
-                    px4(&bytes, band_px),
-                    [0, 0, 0xff, 0xff], // BGRA red
-                    "frame {frame_no}: the letterbox band is the clear colour"
-                );
-                assert_eq!(
-                    px4(&bytes, content_px),
-                    [0x60, 0x60, 0x60, 0xff],
-                    "frame {frame_no}: the content region blits the offscreen"
-                );
-                if with_crown {
-                    sdr_crowned = Some(bytes.clone());
-                } else {
-                    sdr_plain = Some(bytes.clone());
-                }
-            }
-        }
-        let (plain, crowned) = (
-            sdr_plain.expect("an SDR plain frame ran"),
-            sdr_crowned.expect("an SDR crowned frame ran"),
-        );
-        let at = |b: &[u8], (x, y): (usize, usize)| -> [u8; 4] {
-            let o = y * W * 4 + x * 4;
-            [b[o], b[o + 1], b[o + 2], b[o + 3]]
-        };
-        let (p, c) = (at(&plain, crowned_px), at(&crowned, crowned_px));
-        assert!(
-            c.iter()
-                .take(3)
-                .zip(p.iter().take(3))
-                .any(|(cc, pp)| cc > pp),
-            "the SDR crown must brighten inside its scissor: {p:02x?} -> {c:02x?}"
-        );
-        assert_eq!(
-            at(&plain, content_px),
-            at(&crowned, content_px),
-            "a pixel outside the crown quad must not move"
-        );
-        assert_eq!(
-            at(&plain, clipped_px),
-            at(&crowned, clipped_px),
-            "the crown must NOT paint outside its scissor — this pixel is \
-             inside the quad's extent and outside the clip, and it is the \
-             assert a full-destination scissor plant must turn RED"
-        );
-        crate::stderr_line!(
-            "present arm on {}: 6 frames, reconcile fired on the opaque + EDR \
-             flips, crown drew IN the blit pass on both formats, letterbox + \
-             content verified per frame",
             dev.name()
         );
     }

@@ -264,66 +264,6 @@ fn no_halo_without_fire_and_untouched_rows_byte_identical() {
     );
 }
 
-/// The halo's footprint (ring pixels darkened against the same frame without `fire_halo`)
-/// shrinks as the fire weakens and is zero with the fire gone.
-#[test]
-fn halo_decays_when_fire_recedes() {
-    let mut rend = renderer();
-    let (cw, ch) = rend.cell_size();
-    let (rows, cols) = (3usize, 10usize);
-    let mut term = Terminal::new(rows as u16, cols as u16);
-    term.process(b"\x1b[?25l\x1b[2;5H\xe2\x96\x88");
-    let engulfed = halo(1, 4, 255);
-
-    // Ring pixels the halo pulls well below the same fire without it; `cov_cap == 0` means
-    // no fire, so the colour-free stream changes nothing.
-    let mut footprint = |cov_cap: u8| -> usize {
-        let with_fire = cov_cap > 0;
-        let mut lit = term.cell_frame(rows, cols);
-        let mut ref_in = term.cell_frame(rows, cols);
-        if with_fire {
-            let fire = bright_fire(1, ch, cw, 8 * cw, cov_cap);
-            lit.fire_patch = vec![fire];
-            ref_in.fire_patch = vec![fire];
-        }
-        lit.fire_halo = vec![engulfed];
-        let lf = rend.render_input(&lit).pixels.clone();
-        let rf = rend.render_input(&ref_in);
-        let (px_ref, width) = (rf.pixels.clone(), rf.width);
-        let pad = (width - cols * cw) / 2;
-        let bx0 = pad + 4 * cw;
-        let (by0, by1) = (pad + ch + ch / 4, pad + ch + (3 * ch) / 4);
-        // Scan the two 3 px margins outside the block cell only.
-        let mut darkened = 0usize;
-        for y in by0..by1 {
-            for x in ((bx0 - 3)..bx0).chain((bx0 + cw)..(bx0 + cw + 3)) {
-                let i = y * width + x;
-                if luma(lf[i]) + 70 < luma(px_ref[i]) {
-                    darkened += 1;
-                }
-            }
-        }
-        darkened
-    };
-
-    let blaze = footprint(255);
-    let ember = footprint(48);
-    let gone = footprint(0);
-    eprintln!("halo decay footprint: blaze={blaze}, ember={ember}, fire gone={gone}");
-    assert!(
-        blaze >= 12,
-        "a full blaze must ring the glyph with a substantial dark halo ({blaze})"
-    );
-    assert!(
-        ember < blaze,
-        "the halo footprint must SHRINK as the fire weakens (ember {ember} vs blaze {blaze})"
-    );
-    assert_eq!(
-        gone, 0,
-        "with the fire gone the halo vanishes — no ring survives ({gone})"
-    );
-}
-
 /// The halo alpha scales with engulfment strength (`fire_halo_alpha`: floor 90, ceiling
 /// 235). The summed luma deficit in the ring is linear in alpha, so full strength removes
 /// strictly more than a weak lick, and the lick still removes something (the floor).

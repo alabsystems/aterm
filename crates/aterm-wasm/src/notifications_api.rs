@@ -124,13 +124,10 @@ web_terminal_impl!(bind);
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::MAX_QUEUED_NOTIFICATIONS;
-    use crate::WebTerminal;
 
     #[test]
     fn authorized_osc9_round_trips_through_the_drain() {
-        let Some(mut t) = WebTerminal::new_from_system(24, 80, 16.0) else {
-            return; // no system font in this environment
-        };
+        let mut t = crate::system_font_terminal(24, 80, 16.0);
         t.authorize_notifications(true);
         t.process(b"\x1b]9;Build finished\x07");
         assert_eq!(
@@ -143,9 +140,7 @@ mod tests {
 
     #[test]
     fn unauthorized_notifications_never_enqueue() {
-        let Some(mut t) = WebTerminal::new_from_system(24, 80, 16.0) else {
-            return;
-        };
+        let mut t = crate::system_font_terminal(24, 80, 16.0);
         // No authorize call: the engine's fail-closed default must hold.
         t.process(b"\x1b]9;nope\x07");
         t.process(b"\x1b]99;u=2;nope\x07");
@@ -166,9 +161,7 @@ mod tests {
 
     #[test]
     fn advanced_forms_carry_id_title_body_urgency() {
-        let Some(mut t) = WebTerminal::new_from_system(24, 80, 16.0) else {
-            return;
-        };
+        let mut t = crate::system_font_terminal(24, 80, 16.0);
         t.authorize_notifications(true);
         t.process(b"\x1b]99;i=7:u=2:p=title;Alert\x07");
         t.process(b"\x1b]777;notify;Title Here;Body Here\x07");
@@ -184,9 +177,7 @@ mod tests {
 
     #[test]
     fn queue_is_bounded_and_drops_new_when_full() {
-        let Some(mut t) = WebTerminal::new_from_system(24, 80, 16.0) else {
-            return;
-        };
+        let mut t = crate::system_font_terminal(24, 80, 16.0);
         t.authorize_notifications(true);
         for i in 0..(MAX_QUEUED_NOTIFICATIONS + 8) {
             t.process(format!("\x1b]9;n {i}\x07").as_bytes());
@@ -218,9 +209,7 @@ mod tests {
 
     #[test]
     fn cursor_color_follows_osc12_and_resets_on_112() {
-        let Some(mut t) = WebTerminal::new_from_system(24, 80, 16.0) else {
-            return;
-        };
+        let mut t = crate::system_font_terminal(24, 80, 16.0);
         let theme_cursor = t.theme_cursor;
         assert_eq!(
             t.cursor_color(),

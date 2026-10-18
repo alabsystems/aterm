@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-1 conformance of the window show carry (`crate::window_show`) to
-//! `aterm_spec::derive::native_update_window_show_model`
+//! `aterm_models_update::native_update_window_show_model`
 //! (`NativeUpdateWindowShow`).
 //!
 //! Each model schedule is replayed on the shipping App carry: a headless App
@@ -27,7 +27,8 @@ use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::os::fd::FromRawFd as _;
 
-use aterm_spec::derive::{Model, native_update_window_show_model};
+use aterm_models_update::native_update_window_show_model;
+use aterm_spec::derive::Model;
 use aterm_spec::interp::{self, State};
 use aterm_spec::verify::validate_transition_tiered;
 

@@ -28,6 +28,7 @@ const ENGINE_CRATES: &[&str] = &[
     "crates/aterm-effects/",
     "crates/aterm-messages/",
     "crates/aterm-slog/",
+    "crates/aterm-restore/",
 ];
 
 /// What an engine crate's shipped code may not name, and what each is.
@@ -44,7 +45,22 @@ const ENGINE_BANNED: &[(&str, Bound, &str)] = &[
     ("AsRawFd", Bound::Sub, "a raw fd"),
     ("libc", Bound::Word, "libc"),
     ("thread::spawn", Bound::Sub, "a thread"),
+    ("thread::Builder", Bound::Sub, "a thread"),
+    // The modules themselves, whatever is imported or called from them
+    // (`use std::thread::{Builder, spawn};`, `std::thread::scope`); a word, so
+    // `std::thread_local!` is not one.
+    ("std::thread", Bound::Word, "a thread"),
+    ("std::net", Bound::Word, "a socket"),
     ("#[link", Bound::Word, "a native library"),
+];
+
+/// The `std` modules a grouped import (`use std::{fs, net::TcpStream};`) may
+/// not name in an engine crate, which the path needles above miss: the group
+/// splits `std::` from the module.
+const ENGINE_STD_MODULES: &[(&str, &str)] = &[
+    ("fs", "the filesystem"),
+    ("net", "a socket"),
+    ("thread", "a thread"),
 ];
 
 /// The platform frameworks, read on the TEXT view: a framework is linked or
@@ -57,8 +73,8 @@ const ENGINE_FRAMEWORKS: &[(&str, Bound)] = &[
 ];
 
 /// Is `rel` an engine crate's shipped default build? Test code (any path
-/// naming a test), build scripts, examples, the scrollback disk tier (the
-/// `disk-tier` feature) and the effects pack reader are not.
+/// naming a test), build scripts, examples and the effects pack reader are
+/// not.
 fn engine_shipped(rel: &str) -> bool {
     if !ENGINE_CRATES.iter().any(|c| rel.starts_with(c)) {
         return false;
@@ -66,12 +82,7 @@ fn engine_shipped(rel: &str) -> bool {
     if test_path(rel) || rel.ends_with("/build.rs") || rel.contains("/examples/") {
         return false;
     }
-    if rel == "crates/aterm-effects/src/file_feed.rs" {
-        return false;
-    }
-    !rel.strip_prefix("crates/aterm-scrollback/src/")
-        .and_then(|name| name.strip_suffix(".rs"))
-        .is_some_and(is_disk_tier_stem)
+    rel != "crates/aterm-effects/src/file_feed.rs"
 }
 
 /// Does a directory or file of `rel` name test code: a `_`-separated word of
@@ -82,19 +93,6 @@ pub(super) fn test_path(rel: &str) -> bool {
         part.trim_end_matches(".rs")
             .split('_')
             .any(|word| word.starts_with("test"))
-    })
-}
-
-/// `mmap`, `storage` or `disk`, alone or followed by `_…`/`.…`.
-fn is_disk_tier_stem(stem: &str) -> bool {
-    ["mmap", "storage", "disk"].iter().any(|head| {
-        stem.strip_prefix(head).is_some_and(|rest| {
-            rest.is_empty()
-                || (rest.starts_with(['_', '.'])
-                    && rest[1..]
-                        .bytes()
-                        .all(|b| b.is_ascii_alphabetic() || b == b'_'))
-        })
     })
 }
 
@@ -116,10 +114,24 @@ fn engine_platform(tree: &Tree<'_>, out: &mut Vec<Finding>) {
             .iter()
             .map(|b| b.0)
             .chain(ENGINE_FRAMEWORKS.iter().map(|f| f.0))
-            .chain(["link"])
+            .chain(["link", "std"])
             .collect();
         if !file.mentions(&needles) {
             continue;
+        }
+        let shipped: std::collections::BTreeSet<usize> =
+            file.shipped_lines().map(|l| l.no).collect();
+        for (no, module) in grouped_std_modules(&file.lexed().code) {
+            let Some((_, what)) = ENGINE_STD_MODULES.iter().find(|(m, _)| *m == module) else {
+                continue;
+            };
+            if shipped.contains(&no) {
+                out.push(file.finding(
+                    ENGINE_PLATFORM.id,
+                    no,
+                    format!("imports `std::{module}` in a group ({what})"),
+                ));
+            }
         }
         for line in file.shipped_lines() {
             for (token, bound, what) in ENGINE_BANNED {
@@ -149,6 +161,46 @@ fn engine_platform(tree: &Tree<'_>, out: &mut Vec<Finding>) {
             }
         }
     }
+}
+
+/// Every first segment of a `std::{…}` group in a file's code: its 1-based
+/// line and the segment (`use std::{fs, io::{self, Read}};` gives `fs` and
+/// `io`), however the group wraps. Nested groups below the first level are
+/// paths inside a module already named.
+fn grouped_std_modules(code: &str) -> Vec<(usize, &str)> {
+    let b = code.as_bytes();
+    let mut out = Vec::new();
+    for at in hits(code, "std", Bound::Word) {
+        let Some(open) = after_ws(&code[at + 3..], "::").and_then(|r| after_ws(r, "{")) else {
+            continue;
+        };
+        let mut i = code.len() - open.len();
+        let mut depth = 1usize;
+        let mut item_start = i;
+        while i < b.len() && depth > 0 {
+            match b[i] {
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 || (depth == 1 && b[i] == b',') {
+                let item = &code[item_start..i];
+                let lead = item.len() - item.trim_start().len();
+                let head: &str = item
+                    .trim_start()
+                    .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .next()
+                    .unwrap_or("");
+                if !head.is_empty() {
+                    let line = code[..item_start + lead].matches('\n').count() + 1;
+                    out.push((line, head));
+                }
+                item_start = i + 1;
+            }
+            i += 1;
+        }
+    }
+    out
 }
 
 /// `link(name =`, spaces allowed: a link attribute however it is reached
@@ -306,7 +358,13 @@ fn input_probe(tree: &Tree<'_>, out: &mut Vec<Finding>) {
 // protected-folder: TCC consent.
 // ---------------------------------------------------------------------------
 
-const PROTECTED_SCOPE: &[&str] = &["crates/aterm-gui/src/", "crates/aterm-cli/src/"];
+/// aterm-gui's source (the window crate's and its split-out libraries',
+/// `crates/aterm-gui-*`) and aterm-cli's.
+const PROTECTED_SCOPE: &[&str] = &[
+    "crates/aterm-gui/src/",
+    "crates/aterm-gui-",
+    "crates/aterm-cli/src/",
+];
 const PROTECTED_HOME_DIRS: &[&str] = &[
     "Documents",
     "Desktop",
@@ -492,6 +550,145 @@ fn links_gui(text: &str) -> Option<String> {
         .map(|n| format!("names `{n}`"))
 }
 
+// ---------------------------------------------------------------------------
+// keeper-no-mmap: the keeper holds crash-restore regions and never maps one
+// (the crash-restore plan §5).
+// ---------------------------------------------------------------------------
+
+/// The keeper's own source. aterm-uds, which it links, maps regions for the windows (the
+/// journal's writer and its restorer), code the keeper never calls.
+const KEEPER_OWN: &[&str] = &["crates/aterm-keeper/src/"];
+
+/// The mapping calls by NAME: what a local `extern` declaration in the keeper (whose OS half
+/// declares its own calls, `src/sys.rs`) would spell, which no clippy path can name. aterm-uds's
+/// region API (`Region::create`, `Region::map_readonly`, the writable test twin) and libc's calls
+/// are `crates/aterm-keeper/clippy.toml` rows instead: resolved by type, they catch any import
+/// (a grouped `use`, an alias), where a text scan for their spelling did not.
+const KEEPER_MAPS: &[(&str, Bound)] = &[
+    ("mmap", Bound::Word),
+    ("munmap", Bound::Word),
+    ("mprotect", Bound::Word),
+];
+
+pub(super) const KEEPER_NO_MMAP: Rule = Rule {
+    id: "keeper-no-mmap",
+    why: "the keeper holds each session's crash-restore region beside its master and never maps \
+          it: mapped, every session's screen and scrollback would sit in the keeper's memory and \
+          jetsam's ledger, against its rule that it never touches PTY bytes (keeper decision \
+          10), on which the region's privacy argument rests",
+    scope: KEEPER_OWN,
+    check: keeper_no_mmap,
+};
+
+fn keeper_no_mmap(tree: &Tree<'_>, out: &mut Vec<Finding>) {
+    for file in tree.corpus.under(KEEPER_OWN) {
+        if test_path(&file.rel) {
+            continue;
+        }
+        for line in file.shipped_lines() {
+            for (token, bound) in KEEPER_MAPS {
+                if has(line.code, token, *bound) {
+                    out.push(file.finding(
+                        KEEPER_NO_MMAP.id,
+                        line.no,
+                        format!("names `{token}`: the keeper maps no region"),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// restore-stays-local: a crash-restore region never leaves the host (the
+// crash-restore plan §5, privacy claim 5).
+// ---------------------------------------------------------------------------
+
+/// The crash restore's own source: the region's layout, records, writer and recovery.
+const RESTORE_OWN: &[&str] = &["crates/aterm-restore/src/"];
+/// The crash restore's crate, as a closure names it.
+const RESTORE_CRATE: &str = "crates/aterm-restore";
+/// The crates that carry bytes off the host: the fabric's link.
+const OFF_HOST_CRATES: &[&str] = &["crates/aterm-link"];
+
+/// What reaches a socket: std's and aterm-uds's socket types, the calls by name, and
+/// the off-host crates themselves.
+const SOCKET_APIS: &[(&str, Bound)] = &[
+    ("std::net", Bound::Sub),
+    ("UnixStream", Bound::Word),
+    ("UnixListener", Bound::Word),
+    ("UnixDatagram", Bound::Word),
+    ("TcpStream", Bound::Word),
+    ("TcpListener", Bound::Word),
+    ("UdpSocket", Bound::Word),
+    ("CtlStream", Bound::Word),
+    ("CtlListener", Bound::Word),
+    ("socket", Bound::Word),
+    ("sendmsg", Bound::Word),
+    ("recvmsg", Bound::Word),
+    ("sendto", Bound::Word),
+    ("recvfrom", Bound::Word),
+    ("aterm_link", Bound::Word),
+];
+
+pub(super) const RESTORE_STAYS_LOCAL: Rule = Rule {
+    id: "restore-stays-local",
+    why: "a crash-restore region is the window's memory (screens, scrollback, and the nonce a \
+          shell prints in its marks) and never leaves the host: the fabric's crate (aterm-link) may \
+          not have aterm-restore in its closure, and aterm-restore's own source names no socket \
+          (the plan's privacy claim 5; status reports counts only)",
+    scope: RESTORE_OWN,
+    check: restore_stays_local,
+};
+
+fn restore_stays_local(tree: &Tree<'_>, out: &mut Vec<Finding>) {
+    use crate::scan_set::member_reach;
+    for file in tree.corpus.under(RESTORE_OWN) {
+        if test_path(&file.rel) {
+            continue;
+        }
+        for line in file.shipped_lines() {
+            for (token, bound) in SOCKET_APIS {
+                if has(line.code, token, *bound) {
+                    out.push(file.finding(
+                        RESTORE_STAYS_LOCAL.id,
+                        line.no,
+                        format!("names `{token}`: the crash restore reaches no socket"),
+                    ));
+                }
+            }
+        }
+    }
+    for dir in OFF_HOST_CRATES {
+        let manifest = format!("{dir}/Cargo.toml");
+        if !tree.root.join(&manifest).is_file() {
+            continue;
+        }
+        match member_reach(tree.root, dir) {
+            Ok(reach) => {
+                if let Some(chain) = reach.get(RESTORE_CRATE) {
+                    out.push(Finding {
+                        rule: RESTORE_STAYS_LOCAL.id,
+                        path: manifest,
+                        line: 0,
+                        detail: format!(
+                            "aterm-restore is in {dir}'s closure (through {}): a crash-restore \
+                             region would be one dependency from the fabric",
+                            chain.join(" -> ")
+                        ),
+                    });
+                }
+            }
+            Err(why) => out.push(Finding {
+                rule: RESTORE_STAYS_LOCAL.id,
+                path: manifest,
+                line: 0,
+                detail: format!("{dir}'s closure cannot be derived: {why}"),
+            }),
+        }
+    }
+}
+
 /// The keeper's crate: the root of the process closure.
 const KEEPER_CRATE: &str = "crates/aterm-keeper";
 /// Workspace crates that are the GUI.
@@ -506,64 +703,239 @@ const GUI_CRATES: &[&str] = &[
 /// Is `dep` (a dependency name) a GUI crate from outside the workspace? One of
 /// the workspace's is a node of the closure, found as such.
 fn is_external_gui(dep: &str) -> bool {
-    matches!(
-        dep,
-        "winit" | "objc" | "objc2" | "core-graphics" | "cocoa" | "wgpu"
-    ) || dep.starts_with("objc2-")
+    matches!(dep, "winit" | "core-graphics" | "cocoa" | "wgpu") || dep.starts_with("objc")
 }
 
 pub(super) const KEEPER_GUI_DEPS: Rule = Rule {
     id: "keeper-gui-deps",
     why: "a GUI crate anywhere in the keeper's process closure links its frameworks into the \
-          keeper (the closure is derived from the manifests as cargo resolves it)",
+          keeper (the closure is derived from the manifests as cargo resolves it, and its \
+          external packages from Cargo.lock, transitively)",
     scope: &[],
     check: keeper_gui_deps,
 };
 
+/// One step of the keeper's closure walk: a workspace crate, read by its
+/// manifest (normal edges only), or a `Cargo.lock` package, read by its lock
+/// entry; each with the chain that reached it.
+enum Hop {
+    Member(String),
+    Locked(usize),
+}
+
 fn keeper_gui_deps(tree: &Tree<'_>, out: &mut Vec<Finding>) {
-    let manifest = format!("{KEEPER_CRATE}/Cargo.toml");
-    let set = match crate::scan_set::derive_process_scan_set(tree.root, &[KEEPER_CRATE]) {
-        Ok(set) => set,
-        Err(why) => {
-            out.push(Finding {
-                rule: KEEPER_GUI_DEPS.id,
-                path: manifest,
-                line: 0,
-                detail: format!("the keeper's process closure cannot be derived: {why}"),
-            });
+    use crate::scan_set::{
+        derive_process_scan_set, external_dependency_names, member_patch_targets, read_lock,
+    };
+    let finding = |path: String, detail: String| Finding {
+        rule: KEEPER_GUI_DEPS.id,
+        path,
+        line: 0,
+        detail,
+    };
+    let keeper = format!("{KEEPER_CRATE}/Cargo.toml");
+    let closure = |dir: &str| {
+        derive_process_scan_set(tree.root, &[dir]).map(|set| {
+            set.scan_dirs
+                .iter()
+                .map(|d| d.strip_suffix("/src").unwrap_or(d).to_string())
+                .collect::<Vec<_>>()
+        })
+    };
+    let (members, lock, patched) = match (
+        closure(KEEPER_CRATE),
+        read_lock(tree.root),
+        member_patch_targets(tree.root),
+    ) {
+        (Ok(m), Ok(l), Ok(p)) => (m, l, p),
+        (m, l, p) => {
+            for why in [m.err(), l.err(), p.err()].into_iter().flatten() {
+                out.push(finding(
+                    keeper.clone(),
+                    format!("the keeper's process closure cannot be derived: {why}"),
+                ));
+            }
             return;
         }
     };
-    for dir in &set.scan_dirs {
-        let crate_dir = dir.strip_suffix("/src").unwrap_or(dir);
-        let at = format!("{crate_dir}/Cargo.toml");
-        if GUI_CRATES.contains(&crate_dir) {
-            out.push(Finding {
-                rule: KEEPER_GUI_DEPS.id,
-                path: at.clone(),
-                line: 0,
-                detail: format!("`{crate_dir}` is in the keeper's process closure"),
-            });
-        }
-        match crate::scan_set::normal_dependency_names(tree.root, crate_dir) {
-            Ok(deps) => {
-                for dep in deps.iter().filter(|d| is_external_gui(d)) {
-                    out.push(Finding {
-                        rule: KEEPER_GUI_DEPS.id,
-                        path: at.clone(),
-                        line: 0,
-                        detail: format!("depends on `{dep}`, inside the keeper's process"),
-                    });
+    // Breadth-first from the keeper's own closure, each node once, so a GUI
+    // package is reported with its shortest chain, at the manifest of the
+    // keeper-closure crate it is reached from.
+    let mut seen_members: std::collections::BTreeSet<String> = members.iter().cloned().collect();
+    let mut seen_locked = vec![false; lock.len()];
+    let mut queue: std::collections::VecDeque<(Hop, String, Vec<String>)> = members
+        .into_iter()
+        .map(|dir| {
+            let at = format!("{dir}/Cargo.toml");
+            (Hop::Member(dir), at, Vec::new())
+        })
+        .collect();
+    while let Some((hop, at, chain)) = queue.pop_front() {
+        let through = |name: &str| {
+            let mut c = chain.clone();
+            c.push(name.to_string());
+            c
+        };
+        let mut enqueue_name = |name: &str, version: Option<&str>, chain: Vec<String>| {
+            let mut found = false;
+            for (i, p) in lock.iter().enumerate() {
+                if p.name == name && version.is_none_or(|v| p.version == v) {
+                    found = true;
+                    if !std::mem::replace(&mut seen_locked[i], true) {
+                        queue.push_back((Hop::Locked(i), at.clone(), chain.clone()));
+                    }
                 }
             }
-            Err(why) => out.push(Finding {
-                rule: KEEPER_GUI_DEPS.id,
-                path: at.clone(),
-                line: 0,
-                detail: format!("unreadable manifest: {why}"),
-            }),
+            found
+        };
+        match hop {
+            Hop::Member(dir) => {
+                if GUI_CRATES.contains(&dir.as_str()) {
+                    let detail = if chain.is_empty() {
+                        format!("`{dir}` is in the keeper's process closure")
+                    } else {
+                        format!(
+                            "`{dir}` is in the keeper's process closure, through {}",
+                            chain.join(" -> ")
+                        )
+                    };
+                    out.push(finding(at.clone(), detail));
+                }
+                match external_dependency_names(tree.root, &dir) {
+                    Ok(deps) => {
+                        for dep in deps {
+                            if is_external_gui(&dep) {
+                                out.push(finding(
+                                    at.clone(),
+                                    format!("depends on `{dep}`, inside the keeper's process"),
+                                ));
+                            } else if !enqueue_name(&dep, None, through(&dep)) {
+                                out.push(finding(
+                                    at.clone(),
+                                    format!(
+                                        "depends on `{dep}`, which Cargo.lock does not hold \
+                                         (a stale lock), so its closure is unread"
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    Err(why) => out.push(finding(
+                        format!("{dir}/Cargo.toml"),
+                        format!("unreadable manifest: {why}"),
+                    )),
+                }
+            }
+            Hop::Locked(i) => {
+                let p = &lock[i];
+                if is_external_gui(&p.name) && !chain.is_empty() {
+                    out.push(finding(
+                        at.clone(),
+                        format!(
+                            "reaches `{}` through {}, inside the keeper's process",
+                            p.name,
+                            chain.join(" -> ")
+                        ),
+                    ));
+                }
+                // A workspace member's lock entry lists its dev-dependencies
+                // too: read it by its manifest, as the closure does.
+                if p.source.is_none()
+                    && let Some(path) = patched.get(&p.name)
+                {
+                    match closure(path) {
+                        Ok(dirs) => {
+                            for dir in dirs {
+                                if seen_members.insert(dir.clone()) {
+                                    queue.push_back((Hop::Member(dir), at.clone(), chain.clone()));
+                                }
+                            }
+                        }
+                        Err(why) => out.push(finding(
+                            format!("{path}/Cargo.toml"),
+                            format!("the closure of `{}` cannot be derived: {why}", p.name),
+                        )),
+                    }
+                    continue;
+                }
+                for (dep, version) in &p.deps {
+                    enqueue_name(dep, version.as_deref(), through(dep));
+                }
+            }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// std-command: a child built from the alias clippy cannot see through.
+// ---------------------------------------------------------------------------
+
+/// The crate that owns child construction, and the alias's home.
+const UDS_CRATE: &str = "crates/aterm-uds/";
+
+pub(super) const STD_COMMAND: Rule = Rule {
+    id: "std-command",
+    why: "aterm_uds::spawnfd::StdCommand is std::process::Command under another name, and \
+          clippy's disallowed_types row does not see through an alias: a command built from it \
+          hands its child every descriptor not yet close-on-exec (clippy.toml, ONE CHILD \
+          CONSTRUCTOR). Outside aterm-uds the alias only types a command aterm_uds::spawnfd \
+          built; it is never constructed, renamed or re-aliased",
+    scope: &[UDS_CRATE],
+    check: std_command,
+};
+
+fn std_command(tree: &Tree<'_>, out: &mut Vec<Finding>) {
+    for file in tree.corpus.under(PRODUCT) {
+        if file.rel.starts_with(UDS_CRATE) || !file.mentions(&["StdCommand"]) {
+            continue;
+        }
+        for line in file.lines() {
+            if let Some(what) = std_command_door(line.code) {
+                out.push(file.finding(STD_COMMAND.id, line.no, what.to_string()));
+            }
+        }
+    }
+}
+
+/// The door one line of code opens on the alias: `StdCommand::new`, a rename
+/// (`StdCommand as …`) or a re-alias (`type … = StdCommand`, its path spelled
+/// or not).
+fn std_command_door(code: &str) -> Option<&'static str> {
+    for at in hits(code, "StdCommand", Bound::Word) {
+        let rest = &code[at + "StdCommand".len()..];
+        if after_ws(rest, "::").is_some_and(|r| {
+            r.trim_start_matches([' ', '\t'])
+                .strip_prefix("new")
+                .is_some_and(|t| !t.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_'))
+        }) {
+            return Some("constructs a command from the StdCommand alias (`StdCommand::new`)");
+        }
+        if rest
+            .trim_start_matches([' ', '\t'])
+            .strip_prefix("as")
+            .is_some_and(|t| t.starts_with([' ', '\t']))
+        {
+            return Some("renames the StdCommand alias (`StdCommand as …`)");
+        }
+        if has(&code[..at], "type", Bound::Word) && path_prefix_trimmed(&code[..at]).ends_with('=')
+        {
+            return Some("re-aliases StdCommand (`type … = StdCommand`)");
+        }
+    }
+    None
+}
+
+/// `s` without the `a::b::` path (spaces allowed, a leading `::` too) and
+/// the spaces that end it.
+fn path_prefix_trimmed(s: &str) -> &str {
+    let mut s = s.trim_end();
+    while let Some(r) = s.strip_suffix("::") {
+        s = r
+            .trim_end()
+            .trim_end_matches(|c: char| c.is_ascii_alphanumeric() || c == '_')
+            .trim_end();
+    }
+    s
 }
 
 // ---------------------------------------------------------------------------
@@ -662,6 +1034,939 @@ fn syscalls_by_number(code: &str) -> Vec<usize> {
 }
 
 // ---------------------------------------------------------------------------
+// supervise-fx: the supervising loop reads its clocks and sleeps through its
+// one door (`crates/aterm-agent/src/supervise/fx.rs`), and looks at the
+// machine only through a derived door (the policy probe, or `Fx`'s own).
+// ---------------------------------------------------------------------------
+
+/// The supervisor's source: the loop and everything it calls in its own
+/// module (the policy under `policy/` included).
+const SUPERVISE: &[&str] = &["crates/aterm-agent/src/supervise/"];
+
+/// The supervisor files a direct clock read belongs in: the door itself and
+/// the tape behind it; the transport, which sits BELOW the loop's `Ctl` door
+/// (its socket timeouts are the request's, and a tape holds the request's
+/// reply, not them); and the mail lane, its own thread with its own injected
+/// clock (`mail::task_with_clock`), which a tape refuses outright.
+const SUPERVISE_CLOCK_HOMES: &[&str] = &[
+    "crates/aterm-agent/src/supervise/fx.rs",
+    "crates/aterm-agent/src/supervise/tape/",
+    "crates/aterm-agent/src/supervise/transport.rs",
+    "crates/aterm-agent/src/supervise/mail.rs",
+];
+
+/// How a clock name must sit in a line to be a read.
+#[derive(Clone, Copy)]
+enum ClockShape {
+    /// Anywhere (a word): `Instant::now`, `thread::sleep`, called or passed.
+    Named,
+    /// A free reader: called (`unix_ms(`) or named by a path (`limit::unix_now`,
+    /// passed as a fn item) — never a local or a field of the same name
+    /// (`Due::unix_ms`, `settle.unix_ms`). The reader's own `fn` is its home
+    /// ([`reader_homes`]).
+    Reader,
+    /// A method: called on a receiver (`t.elapsed()`) or named by a path
+    /// (`Instant::elapsed`), never a field of the same name.
+    Method,
+    /// A free function: called bare (`read_small(`) or by a path
+    /// (`limit::offset_at(`, `footer::shell_cwds`, also passed as a fn item
+    /// when pathed) — never a method of the same name (the probe's own
+    /// `self.fx.zone_offset(…)`, `ctx.probe.shell_cwds(…)`), a field
+    /// (`l.tz_offset_s`), or the name's own `fn` line.
+    Free,
+    /// The head of a path that is CALLED: `fs::read(…)`,
+    /// `std::fs::OpenOptions::new()`, `File::open(…)` — never the path named
+    /// as a type (`Option<std::fs::File>`), where nothing is looked at.
+    PathCall,
+}
+
+/// Each direct clock read or sleep, its shape, and what it is. Read on the
+/// CODE view, so a comment or a string naming one is no finding.
+const SUPERVISE_CLOCKS: &[(&str, ClockShape, &str)] = &[
+    ("Instant::now", ClockShape::Named, "the monotonic clock"),
+    ("SystemTime::now", ClockShape::Named, "the wall clock"),
+    ("thread::sleep", ClockShape::Named, "a sleep"),
+    (
+        "elapsed",
+        ClockShape::Method,
+        "the monotonic clock (`.elapsed()`)",
+    ),
+    (
+        "unix_now",
+        ClockShape::Reader,
+        "the wall clock (`limit::unix_now`)",
+    ),
+    (
+        "unix_now_ms",
+        ClockShape::Reader,
+        "the wall clock (`limit::unix_now_ms`)",
+    ),
+    (
+        "unix_ms",
+        ClockShape::Reader,
+        "the wall clock (`journal::unix_ms`)",
+    ),
+    (
+        "unix_secs",
+        ClockShape::Reader,
+        "the wall clock (`aterm_time::unix_secs`)",
+    ),
+    (
+        "unix_millis",
+        ClockShape::Reader,
+        "the wall clock (`aterm_time::unix_millis`)",
+    ),
+    (
+        "since_epoch",
+        ClockShape::Reader,
+        "the wall clock (`aterm_time::since_epoch`)",
+    ),
+];
+
+/// PHASE 2 (the recorder, the replay plan's T4): the other values the loop
+/// observes that its door records — this process's id (the claim's holder,
+/// resolved once into a setup), a delivery handed over by another thread (the
+/// mail lane's: `Fx::try_recv_mail`, `Fx::recv_mail_timeout`), and the
+/// approval ledger's readers and its bound,
+/// which read or cut a file by its path (the loop reads the ledger ONCE through
+/// `Fx::read_text` and hands the text to the `approvals::*_in` forms; it cuts
+/// through `Fx::bound`). Read on the code view, in the same shapes. Every
+/// other reader of the ledger by path is named by its convention, beside its
+/// `_in` form ([`ledger_by_path`]), so one added later needs no row here.
+const SUPERVISE_READS: &[(&str, ClockShape, &str)] = &[
+    (
+        "process::id",
+        ClockShape::Named,
+        "this process's id (`std::process::id`)",
+    ),
+    (
+        "try_recv",
+        ClockShape::Method,
+        "a delivery from another thread (`.try_recv()`)",
+    ),
+    (
+        "recv_timeout",
+        ClockShape::Method,
+        "a delivery from another thread (`.recv_timeout()`)",
+    ),
+    (
+        "approvals::typed_at",
+        ClockShape::Named,
+        "the approval ledger by its path (`approvals::typed_at`)",
+    ),
+    (
+        "approvals::typed_texts",
+        ClockShape::Named,
+        "the approval ledger by its path (`approvals::typed_texts`)",
+    ),
+    (
+        "approvals::usage_attempt_at",
+        ClockShape::Named,
+        "the approval ledger by its path (`approvals::usage_attempt_at`)",
+    ),
+    (
+        "approvals::open_model_switch",
+        ClockShape::Named,
+        "the approval ledger by its path (`approvals::open_model_switch`)",
+    ),
+    (
+        "approvals::account_moves",
+        ClockShape::Named,
+        "the approval ledger by its path (`approvals::account_moves`)",
+    ),
+    (
+        "approvals::open_account_move",
+        ClockShape::Named,
+        "the approval ledger by its path (`approvals::open_account_move`)",
+    ),
+    (
+        "approvals::open_wind_down",
+        ClockShape::Named,
+        "the approval ledger by its path (`approvals::open_wind_down`)",
+    ),
+    (
+        "approvals::open_wall",
+        ClockShape::Named,
+        "the approval ledger by its path (`approvals::open_wall`)",
+    ),
+    (
+        "approvals::relaunch_waiting",
+        ClockShape::Named,
+        "the approval ledger by its path (`approvals::relaunch_waiting`)",
+    ),
+    (
+        "approvals::bound",
+        ClockShape::Named,
+        "a cut of a per-session file (`approvals::bound`)",
+    ),
+];
+
+/// The `fn`s a phase-2 read belongs in, by name and needle: the holder's
+/// resolution (`claim::default_holder`, read where a setup is made, so a
+/// replay names the recorded holder and never this process).
+const SUPERVISE_READ_HOMES: &[(&str, &str)] = &[("default_holder", "process::id")];
+
+/// PHASE 3 (the policy probe, the replay plan's T5): the looks at the
+/// machine itself — the filesystem, a process, the kernel, the zone, the
+/// environment — which the approval policy and the loop make only through a
+/// derived door, so a harness tape holds what each concluded
+/// (`policy::probe::PolicyProbe`, handed out by `Fx::policy_probe`; the
+/// loop's own `Fx::tz_offset`, `Fx::zone_offset`, `Fx::local_offset_at`).
+/// The session's injected readers (`self.zone_offset`, `self.local_offset_at`) are
+/// named too: each is read by one Session helper that asks the door; and so is
+/// the live probe (`LiveProbe`), which only the door hands out. Besides these
+/// names, a call of a door's LIVE BODY from above the door is named
+/// ([`live_readers`]): `shell_startup::read`, `WorkerEnv::raw_git_view` and
+/// the rest look at the machine inside their homes, out of this list's sight.
+const SUPERVISE_LOOKS: &[(&str, ClockShape, &str)] = &[
+    ("fs", ClockShape::PathCall, "the filesystem (`std::fs`)"),
+    ("File", ClockShape::PathCall, "a file opened (`File::open`)"),
+    (
+        "read_dir",
+        ClockShape::Named,
+        "a folder's listing (`read_dir`)",
+    ),
+    (
+        "canonicalize",
+        ClockShape::Named,
+        "where a path leads (`canonicalize`)",
+    ),
+    (
+        "symlink_metadata",
+        ClockShape::Named,
+        "a link on the disk (`symlink_metadata`)",
+    ),
+    (
+        "read_link",
+        ClockShape::Named,
+        "a link's target (`read_link`)",
+    ),
+    (
+        "OpenOptions",
+        ClockShape::Named,
+        "a file opened (`OpenOptions`)",
+    ),
+    (
+        "metadata",
+        ClockShape::Method,
+        "a file's metadata (`.metadata()`)",
+    ),
+    ("exists", ClockShape::Method, "the disk (`.exists()`)"),
+    ("is_dir", ClockShape::Method, "the disk (`.is_dir()`)"),
+    ("is_file", ClockShape::Method, "the disk (`.is_file()`)"),
+    (
+        "spawnfd::command",
+        ClockShape::Named,
+        "a child process (`spawnfd::command`)",
+    ),
+    (
+        "process_args",
+        ClockShape::Named,
+        "a process's environment and argv (`process_args`)",
+    ),
+    (
+        "aterm_sysprobe",
+        ClockShape::Named,
+        "the kernel (`aterm_sysprobe`)",
+    ),
+    (
+        "env::var",
+        ClockShape::Named,
+        "this process's environment (`std::env::var`)",
+    ),
+    (
+        "account_home",
+        ClockShape::Named,
+        "the passwd database (`account_home`)",
+    ),
+    (
+        "tz_offset_s",
+        ClockShape::Free,
+        "the zone (`limit::tz_offset_s`)",
+    ),
+    (
+        "offset_at",
+        ClockShape::Free,
+        "a zone's offset (`limit::offset_at`)",
+    ),
+    (
+        "zone_offset_at",
+        ClockShape::Free,
+        "a zone's offset (`limit::zone_offset_at`)",
+    ),
+    (
+        "local_offset_at",
+        ClockShape::Free,
+        "the local zone's offset (`limit::local_offset_at`)",
+    ),
+    (
+        "self.zone_offset",
+        ClockShape::Named,
+        "the session's zone reader (`Session::zone_offset`)",
+    ),
+    (
+        "self.local_offset_at",
+        ClockShape::Named,
+        "the session's local-offset reader (`Session::local_offset_at`)",
+    ),
+    (
+        "read_small",
+        ClockShape::Free,
+        "a file (`footer::read_small`)",
+    ),
+    (
+        "open_regular",
+        ClockShape::Free,
+        "a file (`footer::open_regular`)",
+    ),
+    (
+        "shell_cwds",
+        ClockShape::Free,
+        "Claude Code's transcripts (`footer::shell_cwds`)",
+    ),
+    (
+        "under_file_provider_domain",
+        ClockShape::Free,
+        "the disk (`footer::under_file_provider_domain`)",
+    ),
+    (
+        "LiveProbe",
+        ClockShape::Named,
+        "the machine through the live probe (`LiveProbe`), whose looks no tape holds",
+    ),
+];
+
+/// The supervisor files every look belongs in: the policy probe's live arm,
+/// where the policy's looks were moved unchanged, and the probe's door itself
+/// (`policy/probe.rs`), which names the live probe it wraps. `Fx`, which hands
+/// the live probe out when nothing records, is a clock home, outside the rule.
+const SUPERVISE_LOOK_FILES: &[&str] = &[
+    "crates/aterm-agent/src/supervise/policy/probe_live.rs",
+    "crates/aterm-agent/src/supervise/policy/probe.rs",
+];
+
+/// The `fn`s a phase-3 look belongs in, by file (under the supervisor) and
+/// name, each with why: the LIVE BODIES of the derived doors, which run
+/// below their door so a tape holds only what they concluded; the readers the
+/// window's host shares; the outputs a door already records (the journal's
+/// file, the notes line, the ledger's bound); and the setup read once before
+/// the loop runs.
+///
+/// A row says where a look is MADE. That a live body's callers are below its
+/// door — the probe's live arm, `Fx`'s doors — is checked, not claimed: every
+/// `fn` of a live body's file that reaches one of its homes (through the
+/// file's own calls, or another home file's live body) is part of it, and a
+/// call of one from any other supervisor file is a finding
+/// ([`live_readers`]).
+const SUPERVISE_LOOK_HOMES: &[(&str, &str, &str)] = &[
+    // The live body of `probe.git_view` (the probe's live arm calls
+    // `WorkerEnv::raw_git_view`): git spawned as the worker runs it.
+    ("policy/git_config.rs", "git", GIT_VIEW),
+    ("policy/git_config.rs", "view_at", GIT_VIEW),
+    ("policy/git_config.rs", "is_executable", GIT_VIEW),
+    // The worker's Claude Code directory, read inside the live bodies of
+    // `probe.shell_cwds`, `probe.shell_startup`, `probe.owner_asks` and
+    // `probe.settings_env`; the passwd reader is `claude_dir_at`'s parameter.
+    ("policy/git_config.rs", "claude_dir", WORKER_LIVE),
+    ("policy/git_config.rs", "claude_dir_at", INJECTED),
+    // The live bodies of `probe.settings_env`, `probe.owner_asks` and
+    // `probe.shell_startup` (Claude Code's settings files), shared with the
+    // window's host.
+    ("policy/claude_settings.rs", "managed_preferences", SETTINGS),
+    ("policy/claude_settings.rs", "main_worktree", SETTINGS),
+    ("policy/claude_settings.rs", "drop_ins", SETTINGS),
+    ("policy/claude_settings.rs", "opens", SETTINGS),
+    ("policy/claude_settings.rs", "read_settings_in", SETTINGS),
+    // The live body of `probe.shell_startup`: the shell's snapshots and rc
+    // files.
+    ("policy/shell_startup.rs", "read", SHELL),
+    ("policy/shell_startup.rs", "snapshots", SHELL),
+    ("policy/shell_startup.rs", "hook_env_scripts", SHELL),
+    ("policy/shell_startup.rs", "zshenv", SHELL),
+    // The zone readers themselves, which `Fx`'s derived doors ask
+    // (`probe.tz_offset`, `probe.zone_offset`, `probe.local_offset_at`) and
+    // the window's host calls; and the placement helpers whose injected
+    // reader is a parameter of that name.
+    ("limit.rs", "tz_offset_s", ZONE),
+    ("limit.rs", "zone_offset_at", ZONE),
+    ("limit.rs", "local_offset_at", ZONE),
+    ("limit.rs", "date_offset", ZONE),
+    ("limit.rs", "zone_known", ZONE),
+    ("limit.rs", "offset_in", INJECTED),
+    ("limit.rs", "reset_in_zone", INJECTED),
+    // The one reader of each injected `fn` field, through its door; and the
+    // constructor naming the shipped readers as the fields' defaults.
+    ("run.rs", "zone_lookup", FIELD_DOOR),
+    ("run.rs", "local_offset_then", FIELD_DOOR),
+    ("run.rs", "from_setup", FIELD_DOOR),
+    // Outputs a door records: the notes line written inside the `notes`
+    // door's live call, the journal's own file (`Fx::emit` holds each row).
+    ("run.rs", "append_note_at", OUTPUT),
+    ("journal.rs", "open", OUTPUT),
+    // Files read by their path for the window's host and the CLI, never by
+    // the loop, which reads each once through `Fx::read_text` (phase 2 names
+    // a loop call of the ledger's): the ledger's directory and its reader
+    // that has no `_in` form (every by-path reader beside an `_in` form is a
+    // home by that convention: `ledger_by_path`), the standing rules, a
+    // journal `aterm drive ledger` replays, the owner's policy file (a tape
+    // holds the policy itself, in its header).
+    ("approvals.rs", "path_under", BY_PATH),
+    ("approvals.rs", "typed_texts", BY_PATH),
+    ("turn_end_loop.rs", "standing_rules", BY_PATH),
+    ("journal.rs", "read_journal", BY_PATH),
+    ("config.rs", "from_path", BY_PATH),
+];
+
+const GIT_VIEW: &str = "the live body of `probe.git_view`";
+const WORKER_LIVE: &str = "read inside the live bodies of the worker's probes";
+const INJECTED: &str = "the reader is an injected parameter of that name";
+const SETTINGS: &str = "the live body of `probe.settings_env`/`owner_asks`/`shell_startup`";
+const SHELL: &str = "the live body of `probe.shell_startup`";
+const ZONE: &str = "a zone reader, asked through `Fx`'s derived doors";
+const FIELD_DOOR: &str = "an injected reader's one door, or its default named";
+const OUTPUT: &str = "an output a door already records";
+const BY_PATH: &str = "read by its path for the host or the CLI, never by the loop";
+
+/// The reasons a [`SUPERVISE_LOOK_HOMES`] row gives for a derived door's LIVE
+/// BODY: code that runs below its door, so that a tape holds what it
+/// concluded and a replay answers the door without running it. A live body is
+/// reached only from below the door — the probe's live arm, `Fx`'s doors, or
+/// another `fn` of a live body — and phase 3 names a call of one from
+/// anywhere else ([`live_readers`]): the look it makes would reach no tape
+/// while every look INSIDE it stays a home. The other reasons are no live
+/// body: an injected reader's parameter, a door's own field, an output a door
+/// records, a file the loop never reads by its path.
+const LIVE_BODY: &[&str] = &[GIT_VIEW, WORKER_LIVE, SETTINGS, SHELL, ZONE];
+
+/// One `fn` of a live body ([`live_readers`]): the home file it is in, its
+/// module's name, its own, and how it can be called, read off its signature.
+struct LiveReader<'t> {
+    rel: &'t str,
+    module: &'t str,
+    name: &'t str,
+    /// It takes `self`: called `.name(…)` or by a type's path.
+    method: bool,
+    /// Visible outside its module (`pub`, `pub(crate)`, …): a call from
+    /// another file is the guard's to see; a private one's is the compiler's.
+    public: bool,
+}
+
+/// THE LIVE BODIES, read from the code rather than listed: in each file that
+/// holds a live body's home ([`SUPERVISE_LOOK_HOMES`] rows whose reason is in
+/// [`LIVE_BODY`]), every `fn` that reaches a home through the file's own
+/// calls (`super::graph::reach`, by name, as `test-appkit-door` reads a
+/// file), or calls another home file's live body, is part of that live body
+/// — its entry included (`shell_startup::read`, `claude_settings::owner_asks`,
+/// `WorkerEnv::raw_git_view`) — until nothing more is
+/// reached. So the homes table lists only where a look is MADE; what leads to
+/// one is found, and a reader added later is guarded where it is called the
+/// moment it reaches a home. How each is called comes from its signature.
+fn live_readers<'t>(tree: &'t Tree<'_>) -> Vec<LiveReader<'t>> {
+    let mut files: Vec<(&SourceFile, Vec<&'static str>)> = Vec::new();
+    for &(home, name, why) in SUPERVISE_LOOK_HOMES {
+        if !LIVE_BODY.contains(&why) {
+            continue;
+        }
+        let rel = format!("{}{home}", SUPERVISE[0]);
+        let Some(file) = tree.corpus.get(&rel) else {
+            continue;
+        };
+        match files.iter_mut().find(|(f, _)| f.rel == rel) {
+            Some((_, homes)) => homes.push(name),
+            None => files.push((file, vec![name])),
+        }
+    }
+    let graphs: Vec<_> = files
+        .iter()
+        .map(|(file, homes)| {
+            // A fn whose reader is an injected parameter named as a home is
+            // (`INJECTED`: `offset_in`'s `zone_offset_at`) calls the
+            // parameter, never the home: its lines are no edge.
+            let injected = |func: &str| {
+                SUPERVISE_LOOK_HOMES.iter().any(|&(home, name, why)| {
+                    why == INJECTED && name == func && file.rel.ends_with(home)
+                })
+            };
+            let mut callers: std::collections::BTreeMap<&str, Vec<&str>> =
+                std::collections::BTreeMap::new();
+            let mut lines: Vec<(&str, &str)> = Vec::new();
+            for l in super::graph::attribute(file) {
+                let Some(func) = l.func.filter(|f| !l.in_test && !injected(f)) else {
+                    continue;
+                };
+                lines.push((func, l.line.code));
+                for callee in super::calls(l.line.code) {
+                    if callee != func {
+                        callers.entry(callee).or_default().push(func);
+                    }
+                }
+            }
+            (*file, homes, callers, lines)
+        })
+        .collect();
+    let mut readers: Vec<LiveReader<'t>> = Vec::new();
+    loop {
+        let mut grown = Vec::new();
+        for (file, homes, callers, lines) in &graphs {
+            let across = lines
+                .iter()
+                .filter(|(_, code)| live_call(code, &file.rel, &readers).is_some())
+                .map(|(func, _)| *func);
+            for name in super::graph::reach(homes.iter().copied().chain(across), callers).keys() {
+                let known = |r: &LiveReader<'_>| r.rel == file.rel && r.name == *name;
+                if readers.iter().chain(&grown).any(known) {
+                    continue;
+                }
+                let Some((method, public)) = signature(file, name) else {
+                    continue; // a name called here that is no `fn` of this file
+                };
+                let module = file.name().strip_suffix(".rs").unwrap_or(file.name());
+                grown.push(LiveReader {
+                    rel: &file.rel,
+                    module,
+                    name,
+                    method,
+                    public,
+                });
+            }
+        }
+        if grown.is_empty() {
+            return readers;
+        }
+        readers.extend(grown);
+    }
+}
+
+/// Whether the shipped `fn name` of `file` takes `self`, and whether it is
+/// visible outside its module: read from its signature, the `fn` line to the
+/// line that opens its body (or ends a declaration). `None` when the file
+/// defines no such `fn`.
+fn signature(file: &SourceFile, name: &str) -> Option<(bool, bool)> {
+    let attributed = super::graph::attribute(file);
+    let start = attributed.iter().position(|l| {
+        !l.in_test
+            && l.func == Some(name)
+            && hits(l.line.code, "fn", Bound::Word).any(|at| {
+                after_ws(&l.line.code[at + 2..], name)
+                    .is_some_and(|rest| rest.bytes().next().is_none_or(|b| !is_word(b)))
+            })
+    })?;
+    let head = attributed[start].line.code;
+    let public = has(&head[..head.find("fn").unwrap_or(0)], "pub", Bound::Word);
+    let mut sig = String::new();
+    for l in &attributed[start..] {
+        sig.push_str(l.line.code);
+        sig.push(' ');
+        if l.line.code.contains('{') || l.line.code.trim_end().ends_with(';') {
+            break;
+        }
+    }
+    Some((has(&sig, "self", Bound::Word), public))
+}
+
+/// The live body of ANOTHER file one line of code in the supervisor file
+/// `rel` calls, if any ([`live_readers`]): a method by `.name(…)` or a type's
+/// path (`WorkerEnv::raw_git_view`), a free `fn` by its module's path
+/// (`shell_startup::read`, `super::limit::zone_offset_at`). A call in the live
+/// body's own file makes its caller part of the live body; a private `fn` is
+/// the compiler's outside its file.
+fn live_call<'r, 't>(
+    code: &str,
+    rel: &str,
+    readers: &'r [LiveReader<'t>],
+) -> Option<&'r LiveReader<'t>> {
+    readers.iter().find(|r| {
+        if r.rel == rel || !r.public {
+            return false;
+        }
+        if r.method {
+            return method_call(code, r.name);
+        }
+        module_path(code, r)
+    })
+}
+
+/// Whether `code` calls the method `name`: `.name(…)` or by a type's path.
+fn method_call(code: &str, name: &str) -> bool {
+    hits(code, name, Bound::Word).any(|at| {
+        let before = code[..at].trim_end_matches([' ', '\t']);
+        let after = code[at + name.len()..].trim_start_matches([' ', '\t']);
+        before.ends_with("::") || (after.starts_with('(') && before.ends_with('.'))
+    })
+}
+
+/// Whether `code` names the free live body `r` by its module's path.
+fn module_path(code: &str, r: &LiveReader<'_>) -> bool {
+    hits(code, &format!("{}::{}", r.module, r.name), Bound::Word)
+        .next()
+        .is_some()
+}
+
+/// Each `use` statement of `file`'s shipped code, joined across its lines,
+/// with its first line's number: a live body imported into a file outside the
+/// door is called there bare, which [`live_call`] cannot tell from a local of
+/// the same name, so the import is what is named ([`live_import`]).
+fn use_statements(file: &SourceFile) -> Vec<(usize, String)> {
+    let mut out: Vec<(usize, String)> = Vec::new();
+    let mut open = false;
+    for line in file.shipped_lines() {
+        if !open && starts_use(line.code) {
+            out.push((line.no, String::new()));
+            open = true;
+        }
+        if open && let Some((_, text)) = out.last_mut() {
+            text.push_str(line.code);
+            text.push(' ');
+            open = !line.code.contains(';');
+        }
+    }
+    out
+}
+
+/// The free live body of another file a `use` statement imports, if any: by
+/// its module's path (`use super::shell_startup::read;`) or in a group of that
+/// module (`shell_startup::{ShellStartup, read}`, across lines).
+fn live_import<'r, 't>(
+    stmt: &str,
+    rel: &str,
+    readers: &'r [LiveReader<'t>],
+) -> Option<&'r LiveReader<'t>> {
+    readers.iter().find(|r| {
+        if r.method || !r.public || r.rel == rel {
+            return false;
+        }
+        module_path(stmt, r)
+            || hits(stmt, r.module, Bound::Word).any(|at| {
+                let Some(group) = stmt[at + r.module.len()..].strip_prefix("::{") else {
+                    return false;
+                };
+                let mut depth = 1usize;
+                let end = group
+                    .char_indices()
+                    .find_map(|(i, c)| {
+                        match c {
+                            '{' => depth += 1,
+                            '}' => depth -= 1,
+                            _ => {}
+                        }
+                        (depth == 0).then_some(i)
+                    })
+                    .unwrap_or(group.len());
+                has(&group[..end], r.name, Bound::Word)
+            })
+    })
+}
+
+/// How a phase-3 finding names the live body `r`.
+fn live_name(r: &LiveReader<'_>) -> String {
+    if r.method {
+        format!("`.{}()` ({}.rs)", r.name, r.module)
+    } else {
+        format!("`{}::{}`", r.module, r.name)
+    }
+}
+
+pub(super) const SUPERVISE_FX: Rule = Rule {
+    id: "supervise-fx",
+    why: "a harness tape holds every value the supervising loop observed, in order, so a clock \
+          read or a sleep that skips the session's `Fx` (supervise/fx.rs) is a hole a recorder \
+          misses and a replay answers from the real clock: read it through `self.fx` (`mono`, \
+          `since`, `wall_ms`, `wall_s`, `stamp_ms`, `sleep`), or take `now` from the caller; \
+          and so is this process's id, a delivery from another thread and the approval ledger \
+          by its path: through `Fx` (`try_recv_mail`, `recv_mail_timeout`, `read_text` and an \
+          `approvals::*_in` reader, `bound`), or resolved once into the setup; and so \
+          is a look at the machine itself — the filesystem, a child process, the kernel, the \
+          zone, this process's environment — which goes through a derived door that tapes \
+          what it concluded: the approval policy's probe (`ctx.probe`, `Fx::policy_probe`, \
+          its live bodies in policy/probe_live.rs) or `Fx`'s own (`tz_offset`, `zone_offset`, \
+          `local_offset_at`) — never the live probe named, nor a door's live body \
+          (`shell_startup::read`, `WorkerEnv::raw_git_view`, …) called or imported from above \
+          its door",
+    scope: SUPERVISE,
+    check: supervise_fx,
+};
+
+/// A shipped supervisor file outside the clock's homes.
+fn supervise_fx_scope(rel: &str) -> bool {
+    rel.starts_with(SUPERVISE[0])
+        && !test_path(rel)
+        && !SUPERVISE_CLOCK_HOMES
+            .iter()
+            .any(|home| rel.starts_with(home))
+}
+
+fn supervise_fx(tree: &Tree<'_>, out: &mut Vec<Finding>) {
+    let mut needles: Vec<&str> = SUPERVISE_CLOCKS
+        .iter()
+        .chain(SUPERVISE_READS)
+        .chain(SUPERVISE_LOOKS)
+        .map(|c| c.0)
+        .collect();
+    needles.push("approvals::");
+    let by_path = ledger_by_path(tree);
+    let readers = live_readers(tree);
+    needles.extend(readers.iter().map(|r| r.name));
+    for file in tree.corpus.under(SUPERVISE) {
+        if !supervise_fx_scope(&file.rel) || !file.mentions(&needles) {
+            continue;
+        }
+        let homes = reader_homes(file);
+        let read_homes = read_homes(file);
+        let mut look_homes = look_homes(file);
+        if file.rel == SUPERVISE_LEDGER {
+            look_homes.extend(
+                super::graph::attribute(file)
+                    .iter()
+                    .filter(|l| l.func.is_some_and(|f| by_path.contains(f)))
+                    .map(|l| l.line.no),
+            );
+        }
+        let looks_home = SUPERVISE_LOOK_FILES.contains(&file.rel.as_str());
+        let live_file = readers.iter().any(|r| r.rel == file.rel);
+        for line in file.shipped_lines() {
+            if let Some((needle, what)) = supervise_clock(line.code) {
+                let home = homes.contains(&line.no)
+                    || read_homes
+                        .get(&line.no)
+                        .is_some_and(|func| SUPERVISE_READ_HOMES.contains(&(*func, needle)));
+                if !home {
+                    out.push(file.finding(
+                        SUPERVISE_FX.id,
+                        line.no,
+                        format!("reads {what} past the session's `Fx`"),
+                    ));
+                    continue;
+                }
+            }
+            if let Some(reader) = ledger_read(line.code, &by_path) {
+                out.push(file.finding(
+                    SUPERVISE_FX.id,
+                    line.no,
+                    format!(
+                        "reads the approval ledger by its path (`approvals::{reader}`) past the \
+                         session's `Fx`: read the text through `Fx::read_text` and hand it to \
+                         `approvals::{reader}_in`"
+                    ),
+                ));
+                continue;
+            }
+            if looks_home || look_homes.contains(&line.no) {
+                continue;
+            }
+            if let Some((_, what)) = supervise_look(line.code) {
+                out.push(file.finding(
+                    SUPERVISE_FX.id,
+                    line.no,
+                    format!("looks at {what} past a derived door (a policy probe or `Fx`)"),
+                ));
+                continue;
+            }
+            // In a live body's own file, a fn that calls one IS one
+            // ([`live_readers`]): the call is named where that fn is called.
+            if starts_use(line.code) || live_file {
+                continue;
+            }
+            if let Some(r) = live_call(line.code, &file.rel, &readers) {
+                out.push(file.finding(SUPERVISE_FX.id, line.no, live_bypass(r, "calls")));
+            }
+        }
+        if looks_home {
+            continue;
+        }
+        for (no, stmt) in use_statements(file) {
+            if let Some(r) = live_import(&stmt, &file.rel, &readers) {
+                out.push(file.finding(SUPERVISE_FX.id, no, live_bypass(r, "imports")));
+            }
+        }
+    }
+}
+
+/// A phase-3 finding's detail for a live body `r` called or imported above
+/// its door.
+fn live_bypass(r: &LiveReader<'_>, how: &str) -> String {
+    format!(
+        "{how} {}, the live body of a derived door, above its door: its look reaches no \
+         tape — ask the door (`ctx.probe`, `Fx::policy_probe`, `Fx`'s own), or make this `fn` a \
+         home of that live body",
+        live_name(r)
+    )
+}
+
+/// The approval ledger's module: its readers by path are found by the
+/// convention every one of them keeps ([`ledger_by_path`]).
+const SUPERVISE_LEDGER: &str = "crates/aterm-agent/src/supervise/approvals.rs";
+
+/// The ledger's BY-PATH READERS: each `fn X` of its module that has an
+/// `fn X_in` beside it — `X(path, …)` is `X_in` over the file read by its
+/// path, for the window's host and the CLI, and the loop reads the file once
+/// through `Fx::read_text` and hands the text to `X_in`. Found by the
+/// convention rather than listed, so a reader added beside its `_in` form is
+/// a phase-3 home in the module (where it reads the file) and a phase-2
+/// finding wherever the loop calls it, with no list to keep in step.
+fn ledger_by_path<'t>(tree: &'t Tree<'_>) -> std::collections::BTreeSet<&'t str> {
+    let Some(file) = tree.corpus.get(SUPERVISE_LEDGER) else {
+        return std::collections::BTreeSet::new();
+    };
+    let names: std::collections::BTreeSet<&str> = super::graph::attribute(file)
+        .iter()
+        .filter(|l| !l.in_test)
+        .filter_map(|l| l.func)
+        .collect();
+    names
+        .iter()
+        .filter(|n| names.contains(format!("{n}_in").as_str()))
+        .copied()
+        .collect()
+}
+
+/// The ledger reader by path ([`ledger_by_path`]) one line of code calls
+/// through its module's path (`approvals::open_wall(…)`, or passes as a fn
+/// item), if any — never its `_in` form, a name the path only begins.
+fn ledger_read<'a>(code: &str, by_path: &std::collections::BTreeSet<&'a str>) -> Option<&'a str> {
+    for at in hits(code, "approvals::", Bound::Sub) {
+        if at > 0 && is_word(code.as_bytes()[at - 1]) {
+            continue;
+        }
+        let rest = &code[at + "approvals::".len()..];
+        let len = rest.bytes().take_while(|&b| is_word(b)).count();
+        if let Some(reader) = by_path.get(&rest[..len]) {
+            return Some(reader);
+        }
+    }
+    None
+}
+
+/// The lines of a file that belong to a phase-3 look's home `fn`
+/// ([`SUPERVISE_LOOK_HOMES`]: this file's, by name).
+fn look_homes(file: &SourceFile) -> std::collections::BTreeSet<usize> {
+    let rel = file.rel.strip_prefix(SUPERVISE[0]).unwrap_or(&file.rel);
+    super::graph::attribute(file)
+        .iter()
+        .filter(|l| {
+            l.func.is_some_and(|func| {
+                SUPERVISE_LOOK_HOMES
+                    .iter()
+                    .any(|(home, name, _)| *home == rel && *name == func)
+            })
+        })
+        .map(|l| l.line.no)
+        .collect()
+}
+
+/// The lines of a file that belong to a phase-2 read's home `fn`
+/// ([`SUPERVISE_READ_HOMES`]), each with that `fn`'s name.
+fn read_homes(file: &SourceFile) -> std::collections::BTreeMap<usize, &'static str> {
+    super::graph::attribute(file)
+        .iter()
+        .filter_map(|l| {
+            let func = l.func?;
+            SUPERVISE_READ_HOMES
+                .iter()
+                .find(|(home, _)| *home == func)
+                .map(|(home, _)| (l.line.no, *home))
+        })
+        .collect()
+}
+
+/// The lines of a file that belong to a wall reader's own `fn` (`fn unix_ms`,
+/// `fn unix_now`: [`ClockShape::Reader`] names), signature and body: the
+/// reader wraps the system's clock — that is what it is for, and the crate's
+/// callers outside the supervisor read it too — so it is the clock's home, and
+/// the rule is about its callers.
+fn reader_homes(file: &SourceFile) -> std::collections::BTreeSet<usize> {
+    super::graph::attribute(file)
+        .iter()
+        .filter(|l| {
+            l.func.is_some_and(|f| {
+                SUPERVISE_CLOCKS
+                    .iter()
+                    .any(|(name, shape, _)| matches!(shape, ClockShape::Reader) && *name == f)
+            })
+        })
+        .map(|l| l.line.no)
+        .collect()
+}
+
+/// The direct clock read, sleep or phase-2 read one line of code makes, if
+/// any, and the name that hit: the first word hit of a [`SUPERVISE_CLOCKS`]
+/// or [`SUPERVISE_READS`] name that sits in its [`ClockShape`]. The door's own
+/// `self.fx.sleep(…)` is no hit: `sleep` counts only as `thread::sleep`; nor
+/// is `self.fx.try_recv_mail(…)` or an `approvals::typed_at_in(…)`: a name is
+/// a word, never the start of a longer one.
+fn supervise_clock(code: &str) -> Option<(&'static str, &'static str)> {
+    first_hit(code, SUPERVISE_CLOCKS.iter().chain(SUPERVISE_READS))
+}
+
+/// The look at the machine one line of code makes past a derived door, if
+/// any ([`SUPERVISE_LOOKS`], in their [`ClockShape`]s), and the name that hit.
+/// An import is no look (`use crate::harness::footer::read_small;`): the
+/// calls it makes possible are each a finding where they are made.
+fn supervise_look(code: &str) -> Option<(&'static str, &'static str)> {
+    if starts_use(code) {
+        return None;
+    }
+    first_hit(code, SUPERVISE_LOOKS.iter())
+}
+
+/// Whether a line of code begins a `use` statement.
+fn starts_use(code: &str) -> bool {
+    let head = code.trim_start();
+    ["use ", "pub use ", "pub(crate) use ", "pub(super) use "]
+        .iter()
+        .any(|u| head.starts_with(u))
+}
+
+/// The first of `names` that sits in `code` in its shape.
+fn first_hit<'a>(
+    code: &str,
+    names: impl Iterator<Item = &'a (&'static str, ClockShape, &'static str)>,
+) -> Option<(&'static str, &'static str)> {
+    for (needle, shape, what) in names {
+        for at in hits(code, needle, Bound::Word) {
+            let before = code[..at].trim_end_matches([' ', '\t']);
+            let after = code[at + needle.len()..].trim_start_matches([' ', '\t']);
+            let pathed = before.ends_with("::");
+            let called = after.starts_with('(');
+            let read = match shape {
+                ClockShape::Named => true,
+                ClockShape::Reader => called || pathed,
+                ClockShape::Method => pathed || (called && before.ends_with('.')),
+                ClockShape::Free => {
+                    pathed || (called && !before.ends_with('.') && !ends_with_word(before, "fn"))
+                }
+                ClockShape::PathCall => !before.ends_with('.') && path_called(after),
+            };
+            if read {
+                return Some((needle, what));
+            }
+        }
+    }
+    None
+}
+
+/// Whether `rest`, what follows a [`ClockShape::PathCall`] head, is one or
+/// more `::segment`s and then a call: `::read(`, `::OpenOptions::new()`.
+fn path_called(rest: &str) -> bool {
+    let mut rest = rest;
+    let mut segments = 0;
+    while let Some(after) = rest.strip_prefix("::") {
+        let len = after.bytes().take_while(|&b| is_word(b)).count();
+        if len == 0 {
+            return false;
+        }
+        rest = after[len..].trim_start_matches([' ', '\t']);
+        segments += 1;
+    }
+    segments > 0 && rest.starts_with('(')
+}
+
+/// Whether `text` ends with the word `word` (`    fn`, never `cfn`).
+fn ends_with_word(text: &str, word: &str) -> bool {
+    text.strip_suffix(word)
+        .is_some_and(|rest| rest.as_bytes().last().is_none_or(|&b| !is_word(b)))
+}
+
+// ---------------------------------------------------------------------------
 // store-current: a store `current` path is resolved before anything runs from
 // it.
 // ---------------------------------------------------------------------------
@@ -679,9 +1984,12 @@ pub(super) const STORE_CURRENT: Rule = Rule {
 /// How many lines after a `current` join its resolve may sit.
 const RESOLVE_REACH: usize = 6;
 
-/// Shipped Rust outside atpkg, which owns the store and the link.
+/// Shipped Rust outside atpkg, which owns the store and the link, and
+/// aterm-toolchain, atpkg's std-only half (its discovery names the store's
+/// `current` as a candidate and resolves every candidate it chooses).
 fn store_current_scope(rel: &str) -> bool {
     !(rel.starts_with("crates/atpkg/")
+        || rel.starts_with("crates/aterm-toolchain/")
         || rel.contains("/tests/")
         || rel.ends_with("_tests.rs")
         || rel.ends_with("/build.rs")
@@ -797,9 +2105,7 @@ mod tests {
             &[
                 ("crates/aterm-grid/src/lib.rs", src),
                 ("crates/aterm-grid/src/grid/test_support.rs", src),
-                ("crates/aterm-scrollback/src/mmap.rs", src),
-                ("crates/aterm-scrollback/src/disk_tier.rs", src),
-                ("crates/aterm-scrollback/src/diskless.rs", src),
+                ("crates/aterm-scrollback/src/storage.rs", src),
                 ("crates/aterm-effects/src/file_feed.rs", src),
                 ("crates/aterm-gui/src/lib.rs", src),
             ],
@@ -809,12 +2115,49 @@ mod tests {
             [
                 "crates/aterm-grid/src/lib.rs:1",
                 "crates/aterm-grid/src/lib.rs:2",
+                "crates/aterm-grid/src/lib.rs:2",
                 "crates/aterm-grid/src/lib.rs:4",
                 "crates/aterm-grid/src/lib.rs:5",
-                "crates/aterm-scrollback/src/diskless.rs:1",
-                "crates/aterm-scrollback/src/diskless.rs:2",
-                "crates/aterm-scrollback/src/diskless.rs:4",
-                "crates/aterm-scrollback/src/diskless.rs:5",
+                "crates/aterm-scrollback/src/storage.rs:1",
+                "crates/aterm-scrollback/src/storage.rs:2",
+                "crates/aterm-scrollback/src/storage.rs:2",
+                "crates/aterm-scrollback/src/storage.rs:4",
+                "crates/aterm-scrollback/src/storage.rs:5",
+            ]
+        );
+    }
+
+    /// The thread, socket and filesystem shapes the path needles miss: a
+    /// `thread::Builder`, a module named inside a grouped `std` import however
+    /// it wraps, and a module's own items imported or called by path.
+    #[test]
+    fn a_thread_builder_and_a_grouped_std_import_are_found() {
+        let src = "use std::{fs, io::{self, Read}};\n\
+                   use std::{\n    collections::HashMap,\n    net::TcpStream as Tcp,\n    thread,\n};\n\
+                   fn f() { let _ = std::thread::Builder::new(); }\n\
+                   use std::{io, sync::Arc};\n\
+                   // use std::{fs};\n\
+                   #[cfg(test)]\nmod tests {\n    use std::{fs, thread};\n}\n\
+                   use std::thread::{Builder, spawn};\n\
+                   fn g() { std::thread::scope(|s| { s.spawn(|| ()); }); }\n\
+                   use std::net::*;\n\
+                   std::thread_local! { static N: u8 = 0; }\n";
+        let found = run(&ENGINE_PLATFORM, &[("crates/aterm-grid/src/lib.rs", src)]);
+        assert_eq!(
+            found
+                .iter()
+                .map(|f| format!("{}:{}", f.line, f.detail))
+                .collect::<Vec<_>>(),
+            [
+                "1:imports `std::fs` in a group (the filesystem)",
+                "4:imports `std::net` in a group (a socket)",
+                "4:names `TcpStream` (a socket)",
+                "5:imports `std::thread` in a group (a thread)",
+                "7:names `thread::Builder` (a thread)",
+                "7:names `std::thread` (a thread)",
+                "14:names `std::thread` (a thread)",
+                "15:names `std::thread` (a thread)",
+                "16:names `std::net` (a socket)",
             ]
         );
     }
@@ -978,6 +2321,124 @@ mod tests {
     }
 
     #[test]
+    fn the_keeper_maps_no_region() {
+        // Line 2 is the region API, clippy's to catch by path (crates/aterm-keeper/clippy.toml);
+        // lines 4 and 6 name a mapping call no path could, a libc call and a local declaration.
+        let src = "fn hold(fd: OwnedFd) { let len = fd_size(fd.as_fd()); }\n\
+                   let r = aterm_uds::shm::Region::map_readonly(fd.as_fd(), len);\n\
+                   // a comment may say mmap\n\
+                   unsafe { libc::mmap(p, n, 1, 1, fd, 0) };\n\
+                   let s = \"mmap in a literal\";\n\
+                   unsafe extern \"C\" { fn munmap(addr: *mut u8, len: usize) -> i32; }\n\
+                   #[cfg(test)]\nfn t() { let _ = mmap(16384); }\n";
+        let found = run(
+            &KEEPER_NO_MMAP,
+            &[
+                ("crates/aterm-keeper/src/server.rs", src),
+                ("crates/aterm-keeper/src/core_companion_tests.rs", src),
+                ("crates/aterm-keeper/tests/kernel_custody.rs", src),
+                ("crates/aterm-uds/src/shm.rs", src),
+            ],
+        );
+        assert_eq!(
+            spots(&found),
+            [
+                "crates/aterm-keeper/src/server.rs:4",
+                "crates/aterm-keeper/src/server.rs:6",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_crash_restore_names_no_socket() {
+        let src = "use std::net::TcpStream;\n\
+                   // a comment may say socket\n\
+                   let s = \"a UnixStream in a literal\";\n\
+                   fn f(s: aterm_uds::CtlStream) {}\n\
+                   let n = sockets_seen + 1;\n\
+                   #[cfg(test)]\nfn t() { let _ = std::os::unix::net::UnixStream::pair(); }\n";
+        let found = run(
+            &RESTORE_STAYS_LOCAL,
+            &[
+                ("crates/aterm-restore/src/recover.rs", src),
+                ("crates/aterm-restore/src/recover_tests.rs", src),
+                ("crates/aterm-restore/tests/engine_conformance.rs", src),
+                ("crates/aterm-gui/src/crash_restore.rs", src),
+            ],
+        );
+        assert_eq!(
+            spots(&found),
+            [
+                "crates/aterm-restore/src/recover.rs:1",
+                "crates/aterm-restore/src/recover.rs:1",
+                "crates/aterm-restore/src/recover.rs:4",
+            ]
+        );
+    }
+
+    #[test]
+    fn no_off_host_crate_has_the_crash_restore_in_its_closure() {
+        use crate::scan_set::test_fixtures::{synth_tree, workspace_manifests};
+        let closure = |link_deps: &str, session_deps: &str, label: &str| {
+            let mut files = workspace_manifests(&[
+                ("aterm-link", link_deps),
+                ("aterm-session", session_deps),
+                ("aterm-uds", ""),
+                (
+                    "aterm-restore",
+                    "[dependencies]\naterm-uds = { workspace = true }\n",
+                ),
+            ]);
+            for dir in [
+                "aterm-gui",
+                "aterm-types",
+                "aterm-link",
+                "aterm-session",
+                "aterm-uds",
+                "aterm-restore",
+            ] {
+                files.push((format!("crates/{dir}/src/lib.rs"), String::new()));
+            }
+            files.push(("Cargo.lock".to_string(), "version = 4\n".to_string()));
+            let root = synth_tree("aterm-census-guards", label, &files);
+            let corpus = super::super::Corpus::of(&[]);
+            let tree = Tree {
+                root: &root,
+                corpus: &corpus,
+            };
+            let mut found = Vec::new();
+            restore_stays_local(&tree, &mut found);
+            let _ = std::fs::remove_dir_all(&root);
+            found
+        };
+        let link_via_session = "[dependencies]\naterm-uds = { workspace = true }\naterm-session = { workspace = true }\n";
+        let found = closure(link_via_session, "", "restore-local-clean");
+        assert!(found.is_empty(), "{found:?}");
+        let found = closure(
+            "[dependencies]\naterm-restore = { workspace = true }\n",
+            "",
+            "restore-local-link",
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].path, "crates/aterm-link/Cargo.toml");
+        assert!(found[0].detail.contains("aterm-restore is in"), "{found:?}");
+        // Through a crate between them: the closure is walked, not the direct edges.
+        let found = closure(
+            link_via_session,
+            "[target.'cfg(unix)'.dependencies]\naterm-restore = { workspace = true }\n",
+            "restore-local-session",
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].path, "crates/aterm-link/Cargo.toml");
+        assert!(
+            found[0]
+                .detail
+                .contains("through aterm-session -> aterm-restore"),
+            "{found:?}"
+        );
+    }
+
+    #[test]
     fn the_keepers_closure_holds_no_gui_crate() {
         use crate::scan_set::test_fixtures::{synth_tree, workspace_manifests};
         let mut files = workspace_manifests(&[
@@ -985,11 +2446,12 @@ mod tests {
                 "aterm-keeper",
                 "[dependencies]\naterm-uds = { workspace = true }\n",
             ),
-            ("aterm-uds", "[dependencies]\nobjc2 = \"0.6\"\n"),
+            ("aterm-uds", "[dependencies]\nobjc-sys = \"0.3\"\n"),
         ]);
         for dir in ["aterm-gui", "aterm-types", "aterm-keeper", "aterm-uds"] {
             files.push((format!("crates/{dir}/src/lib.rs"), String::new()));
         }
+        files.push(("Cargo.lock".to_string(), "version = 4\n".to_string()));
         let root = synth_tree("aterm-census-guards", "keeper-deps", &files);
         let corpus = super::super::Corpus::of(&[]);
         let tree = Tree {
@@ -1001,7 +2463,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].path, "crates/aterm-uds/Cargo.toml");
-        assert!(found[0].detail.contains("`objc2`"), "{found:?}");
+        assert!(found[0].detail.contains("`objc-sys`"), "{found:?}");
 
         // A GUI crate of the workspace in the closure, through a path edge.
         let mut files = workspace_manifests(&[
@@ -1024,6 +2486,7 @@ mod tests {
         ] {
             files.push((format!("crates/{dir}/src/lib.rs"), String::new()));
         }
+        files.push(("Cargo.lock".to_string(), "version = 4\n".to_string()));
         let root = synth_tree("aterm-census-guards", "keeper-gui-crate", &files);
         let tree = Tree {
             root: &root,
@@ -1053,6 +2516,7 @@ mod tests {
         for dir in ["aterm-gui", "aterm-types", "aterm-keeper", "aterm-uds"] {
             files.push((format!("crates/{dir}/src/lib.rs"), String::new()));
         }
+        files.push(("Cargo.lock".to_string(), "version = 4\n".to_string()));
         let root = synth_tree("aterm-census-guards", "keeper-renamed-gui", &files);
         let tree = Tree {
             root: &root,
@@ -1064,6 +2528,126 @@ mod tests {
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].path, "crates/aterm-uds/Cargo.toml");
         assert!(found[0].detail.contains("`winit`"), "{found:?}");
+    }
+
+    /// A GUI package two registry hops below the keeper's closure is found
+    /// through Cargo.lock, with its chain; a member reached through the lock is
+    /// read by its manifest, so its dev-dependencies (which its lock entry
+    /// lists) are not followed; a dependency the lock lacks is a finding.
+    #[test]
+    fn the_keepers_closure_is_walked_through_cargo_lock() {
+        use crate::scan_set::test_fixtures::{synth_tree, workspace_manifests};
+        let lock = "version = 4\n\n\
+                    [[package]]\nname = \"aterm-uds\"\nversion = \"0.1.0\"\n\
+                    dependencies = [\n \"helper\",\n]\n\n\
+                    [[package]]\nname = \"helper\"\nversion = \"1.0.0\"\n\
+                    source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+                    dependencies = [\n \"log\",\n \"middle\",\n]\n\n\
+                    [[package]]\nname = \"middle\"\nversion = \"0.2.0\"\n\
+                    source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+                    dependencies = [\n \"objc2-foundation 0.3.1\",\n]\n\n\
+                    [[package]]\nname = \"objc2-foundation\"\nversion = \"0.3.1\"\n\
+                    source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\n\
+                    [[package]]\nname = \"objc2-foundation\"\nversion = \"0.2.2\"\n\
+                    source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\n\
+                    [[package]]\nname = \"log\"\nversion = \"0.4.0\"\n\
+                    dependencies = [\n \"winit\",\n]\n\n\
+                    [[package]]\nname = \"winit\"\nversion = \"0.30.0\"\n\
+                    source = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+        let tree_with = |name: &str, uds_deps: &str| {
+            let mut files = workspace_manifests(&[
+                (
+                    "aterm-keeper",
+                    "[dependencies]\naterm-uds = { workspace = true }\n",
+                ),
+                ("aterm-uds", uds_deps),
+                ("aterm-log", "[dev-dependencies]\nwinit = \"0.30\"\n"),
+            ]);
+            for (path, contents) in files.iter_mut() {
+                if path == "Cargo.toml" {
+                    contents.push_str("log = { path = \"crates/aterm-log\" }\n");
+                }
+            }
+            for dir in [
+                "aterm-gui",
+                "aterm-types",
+                "aterm-keeper",
+                "aterm-uds",
+                "aterm-log",
+            ] {
+                files.push((format!("crates/{dir}/src/lib.rs"), String::new()));
+            }
+            files.push(("Cargo.lock".to_string(), lock.to_string()));
+            synth_tree("aterm-census-guards", name, &files)
+        };
+        let run_on = |root: &std::path::Path| {
+            let corpus = super::super::Corpus::of(&[]);
+            let tree = Tree {
+                root,
+                corpus: &corpus,
+            };
+            let mut found = Vec::new();
+            keeper_gui_deps(&tree, &mut found);
+            let _ = std::fs::remove_dir_all(root);
+            found
+        };
+        let found = run_on(&tree_with(
+            "keeper-lock",
+            "[dependencies]\nhelper = \"1\"\n",
+        ));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].path, "crates/aterm-uds/Cargo.toml");
+        assert!(
+            found[0].detail.contains(
+                "reaches `objc2-foundation` through helper -> middle -> objc2-foundation"
+            ),
+            "{found:?}"
+        );
+        let found = run_on(&tree_with(
+            "keeper-lock-stale",
+            "[dependencies]\nnot-locked = \"1\"\n",
+        ));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0]
+                .detail
+                .contains("`not-locked`, which Cargo.lock does not hold"),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn the_std_command_alias_is_built_renamed_or_re_aliased_only_in_aterm_uds() {
+        let src = "use aterm_uds::spawnfd::StdCommand;\n\
+                   fn a(c: &mut StdCommand) -> &mut StdCommand { c }\n\
+                   let c = StdCommand::new(\"ls\");\n\
+                   let d = aterm_uds::spawnfd::StdCommand :: new (\"ls\");\n\
+                   use aterm_uds::spawnfd::StdCommand as Cmd;\n\
+                   type Cmd2 = StdCommand;\n\
+                   type Cmd3 = ::aterm_uds :: spawnfd::StdCommand;\n\
+                   // StdCommand::new in prose\n\
+                   let s = \"StdCommand::new\";\n\
+                   let e = StdCommand::new_with(x);\n\
+                   #[cfg(test)]\nmod tests {\n    fn t() { let _ = StdCommand::new(\"x\"); }\n}\n";
+        let found = run(
+            &STD_COMMAND,
+            &[
+                ("crates/aterm-gui/src/x.rs", src),
+                ("crates/aterm-uds/src/spawnfd.rs", src),
+            ],
+        );
+        assert_eq!(
+            spots(&found),
+            [
+                "crates/aterm-gui/src/x.rs:3",
+                "crates/aterm-gui/src/x.rs:4",
+                "crates/aterm-gui/src/x.rs:5",
+                "crates/aterm-gui/src/x.rs:6",
+                "crates/aterm-gui/src/x.rs:7",
+                "crates/aterm-gui/src/x.rs:13",
+            ],
+            "{found:?}"
+        );
     }
 
     /// Each door the lint cannot name, with the line it fires on.
@@ -1127,6 +2711,518 @@ mod tests {
                 &[("crates/aterm-libc/src/darwin_aarch64.rs", libc)]
             )
             .is_empty()
+        );
+    }
+
+    /// Each way the supervisor's code can read a clock or sleep past its
+    /// door, with the line it fires on.
+    #[test]
+    fn every_clock_read_past_the_supervisors_door_is_found() {
+        let cases: &[(&str, &str, usize)] = &[
+            ("a monotonic read", "let now = Instant::now();\n", 1),
+            (
+                "a qualified one",
+                "fn f() {\n    let t = std::time::Instant::now();\n}\n",
+                2,
+            ),
+            (
+                "the monotonic clock passed as a fn item",
+                "let at = *since.get_or_insert_with(Instant::now);\n",
+                1,
+            ),
+            ("an elapsed", "if at.elapsed() < step {\n}\n", 1),
+            (
+                "an elapsed on its own chained line",
+                "let ms = since\n    .elapsed()\n    .as_millis();\n",
+                2,
+            ),
+            (
+                "an elapsed by path",
+                "let d = marks.map(Instant::elapsed);\n",
+                1,
+            ),
+            ("a wall read", "let w = std::time::SystemTime::now();\n", 1),
+            ("limit's wall reader", "let s = limit::unix_now();\n", 1),
+            (
+                "limit's wall reader passed as a fn item",
+                "self.clock.map_or_else(limit::unix_now_ms, |s| s * 1000)\n",
+                1,
+            ),
+            (
+                "the journal's wall reader",
+                "let age = unix_ms().saturating_sub(taken);\n",
+                1,
+            ),
+            (
+                "aterm_time's wall reader",
+                "let secs = aterm_time::unix_secs().unwrap_or(0);\n",
+                1,
+            ),
+            ("a sleep", "std::thread::sleep(BACKOFF);\n", 1),
+            ("a sleep imported", "use std::thread::sleep;\n", 1),
+            // Phase 2: the recorder's other doors.
+            (
+                "this process's id",
+                "let holder = format!(\"x:{}\", std::process::id());\n",
+                1,
+            ),
+            (
+                "a delivery taken",
+                "match m.rx.try_recv() {\n    _ => {}\n}\n",
+                1,
+            ),
+            (
+                "a delivery awaited",
+                "let got = m.rx.recv_timeout(slice);\n",
+                1,
+            ),
+            (
+                "the ledger read by its path",
+                "let typed = approvals::typed_at(path, sid);\n",
+                1,
+            ),
+            (
+                "another reader of the ledger by its path",
+                "open_wall = approvals::open_wall(path, sid);\n",
+                1,
+            ),
+            (
+                "the relaunch's wait read off the ledger by its path",
+                "let w = approvals::relaunch_waiting(path, sid);\n",
+                1,
+            ),
+            ("the ledger cut", "approvals::bound(path);\n", 1),
+        ];
+        for (why, src, line) in cases {
+            let found = run(
+                &SUPERVISE_FX,
+                &[("crates/aterm-agent/src/supervise/run.rs", src)],
+            );
+            assert_eq!(
+                spots(&found),
+                [format!("crates/aterm-agent/src/supervise/run.rs:{line}")],
+                "MISS — {why}:\n{src}"
+            );
+        }
+    }
+
+    /// The door's own reads, a value or a field of a reader's name, prose,
+    /// test code, a reader's own definition, the clock's home files and code
+    /// outside the supervisor are silent.
+    #[test]
+    fn the_door_and_the_clocks_homes_are_silent() {
+        let src = "let now = self.fx.mono();\nlet d = self.fx.since(at);\nself.fx.sleep(pause);\n\
+                   let w = fx.wall_ms() + self.fx.stamp_ms();\n\
+                   // Instant::now() and t.elapsed() in prose\n\
+                   let s = \"thread::sleep(1)\";\nlet unix_ms = d.unix_ms;\nsettle.unix_ms = unix_ms;\n\
+                   fn wall_reset_at(unix_ms: i64, elapsed: Duration) {}\nlet x = r.elapsed;\n\
+                   pub fn unix_now() -> i64 {\n    aterm_time::unix_secs().map_or(0, |s| s as i64)\n}\n\
+                   pub fn unix_ms() -> i64 {\n    aterm_time::unix_millis().map_or(0, |m| m as i64)\n}\n\
+                   #[cfg(test)]\nmod tests {\n    fn t() { let _ = Instant::now(); std::thread::sleep(D); }\n}\n";
+        assert!(
+            run(
+                &SUPERVISE_FX,
+                &[("crates/aterm-agent/src/supervise/run.rs", src)]
+            )
+            .is_empty()
+        );
+        // Phase 2's doors, their homes, and names a door's are the start of.
+        let doors = "match self.fx.try_recv_mail(&m.rx) {\n    _ => {}\n}\n\
+                     let got = self.fx.recv_mail_timeout(&m.rx, slice);\n\
+                     let typed = approvals::typed_at_in(&body, sid);\n\
+                     let w = approvals::open_wall_in(&body, sid);\nself.fx.bound(path);\n\
+                     let r = approvals::relaunch_waiting_in(body, sid);\n\
+                     pub(super) fn default_holder() -> String {\n    \
+                     format!(\"aterm-supervise:{}\", std::process::id())\n}\n\
+";
+        assert!(
+            run(
+                &SUPERVISE_FX,
+                &[("crates/aterm-agent/src/supervise/run.rs", doors)]
+            )
+            .is_empty()
+        );
+        // A home is a home for its own read alone.
+        let elsewhere = "fn output_within() {\n    let _ = std::process::id();\n}\n\
+                         fn default_holder() {\n    let _ = rx.try_recv();\n}\n";
+        assert_eq!(
+            spots(&run(
+                &SUPERVISE_FX,
+                &[("crates/aterm-agent/src/supervise/run.rs", elsewhere)]
+            )),
+            [
+                "crates/aterm-agent/src/supervise/run.rs:2",
+                "crates/aterm-agent/src/supervise/run.rs:5",
+            ]
+        );
+        let bypass =
+            "let now = Instant::now();\nstd::thread::sleep(D);\nlet w = limit::unix_now();\n";
+        assert!(
+            run(
+                &SUPERVISE_FX,
+                &[
+                    ("crates/aterm-agent/src/supervise/fx.rs", bypass),
+                    ("crates/aterm-agent/src/supervise/tape/codec.rs", bypass),
+                    ("crates/aterm-agent/src/supervise/transport.rs", bypass),
+                    ("crates/aterm-agent/src/supervise/mail.rs", bypass),
+                    ("crates/aterm-agent/src/supervise/run_tests.rs", bypass),
+                    ("crates/aterm-agent/src/harness/upgrade_drive.rs", bypass),
+                    ("crates/aterm-gui/src/harness_host.rs", bypass),
+                ]
+            )
+            .is_empty()
+        );
+        // The supervisor's policy is the supervisor's: in scope.
+        assert_eq!(
+            spots(&run(
+                &SUPERVISE_FX,
+                &[(
+                    "crates/aterm-agent/src/supervise/policy/turn_end.rs",
+                    bypass
+                )]
+            )),
+            [
+                "crates/aterm-agent/src/supervise/policy/turn_end.rs:1",
+                "crates/aterm-agent/src/supervise/policy/turn_end.rs:2",
+                "crates/aterm-agent/src/supervise/policy/turn_end.rs:3",
+            ]
+        );
+    }
+
+    /// PHASE 3: each look at the machine made past a derived door is a
+    /// finding, in each shape it is written.
+    #[test]
+    fn a_look_at_the_machine_past_a_derived_door_is_named() {
+        let cases = [
+            ("a folder listed", "let e = std::fs::read_dir(&dir)?;\n"),
+            ("a file read through fs", "let b = fs::read(&p)?;\n"),
+            ("a file opened by its type", "let f = File::open(&p)?;\n"),
+            (
+                "a file opened with options",
+                "let f = std::fs::OpenOptions::new().append(true).open(p)?;\n",
+            ),
+            (
+                "a path resolved",
+                "let r = std::fs::canonicalize(p).ok();\n",
+            ),
+            ("a path resolved as a method", "let r = p.canonicalize();\n"),
+            (
+                "a link examined",
+                "let m = std::fs::symlink_metadata(&p);\n",
+            ),
+            ("a link read", "let to = std::fs::read_link(&p);\n"),
+            ("a metadata read", "let m = p.metadata()?;\n"),
+            ("an existence asked", "if p.exists() {\n}\n"),
+            ("a directory asked", "if p.is_dir() {\n}\n"),
+            ("a file asked", "if p.is_file() {\n}\n"),
+            (
+                "a child spawned",
+                "let mut c = aterm_uds::spawnfd::command(\"lsof\");\n",
+            ),
+            (
+                "a process read through the kernel",
+                "let a = atpkg::caller_shell::process_args(pid);\n",
+            ),
+            (
+                "the kernel asked",
+                "let cwd = aterm_sysprobe::process_cwd(pid);\n",
+            ),
+            (
+                "this process's environment",
+                "let p = std::env::var(\"PATH\");\n",
+            ),
+            (
+                "the passwd database",
+                "let h = atpkg::platform::account_home();\n",
+            ),
+            ("the zone read", "let o = limit::tz_offset_s();\n"),
+            ("a zone's offset", "let o = limit::offset_at(Some(z), t);\n"),
+            (
+                "a named zone's offset",
+                "let o = super::limit::zone_offset_at(z, t);\n",
+            ),
+            (
+                "the local zone's offset passed as a fn item",
+                "let at = limit::reset_at_with(&s, n, l, &limit::local_offset_at);\n",
+            ),
+            (
+                "the injected zone reader read past its door",
+                "let at = limit::reset_at_with(&s, n, l, &self.zone_offset);\n",
+            ),
+            (
+                "the injected local reader called",
+                "let o = (self.local_offset_at)(at);\n",
+            ),
+            ("a small file read bare", "let t = read_small(&p, 4096);\n"),
+            (
+                "a file opened by the footer's reader",
+                "let f = crate::harness::footer::open_regular(&p)?;\n",
+            ),
+            (
+                "the transcripts read",
+                "ctx.shell_cwds = crate::harness::footer::shell_cwds(&claude, cwd);\n",
+            ),
+        ];
+        for (why, src) in cases {
+            let found = run(
+                &SUPERVISE_FX,
+                &[("crates/aterm-agent/src/supervise/approval_loop.rs", src)],
+            );
+            assert_eq!(
+                spots(&found),
+                ["crates/aterm-agent/src/supervise/approval_loop.rs:1"],
+                "MISS — {why}:\n{src}"
+            );
+        }
+    }
+
+    /// PHASE 3's doors, homes and look-alikes are silent: the probe's and
+    /// `Fx`'s own methods, a field or a type of a look's name, an import, a
+    /// `fn` line, a home `fn` in its own file, and the probe's live arm.
+    #[test]
+    fn the_derived_doors_and_their_homes_are_silent() {
+        let doors = "ctx.shell_cwds = ctx.probe.shell_cwds(w, cwd);\n\
+                     let real = ctx.probe.real_components(comps);\n\
+                     let o = self.fx.zone_offset(live, z, t);\n\
+                     let o = self.fx.local_offset_at(live, t);\n\
+                     let o = self.fx.tz_offset();\n\
+                     let s = stamp(l.now_ms, l.tz_offset_s, true);\n\
+                     file: Option<std::fs::File>,\n\
+                     use crate::harness::footer::read_small;\n\
+                     use std::fs;\n\
+                     fn shell_cwds(&self, worker: &WorkerEnv, cwd: &Path) -> Vec<PathBuf>;\n\
+                     let started_ms = thread.is_none();\n\
+                     zone_offset: limit::zone_offset_at,\n\
+                     // std::fs::read_dir(p) in prose\n\
+                     let s = \"p.exists()\";\n\
+                     #[cfg(test)]\nmod tests {\n    fn t() { let _ = std::fs::read(p); }\n}\n";
+        assert_eq!(
+            spots(&run(
+                &SUPERVISE_FX,
+                &[("crates/aterm-agent/src/supervise/approval_loop.rs", doors)]
+            )),
+            // The constructor's default, a pathed fn item outside its home `fn`.
+            ["crates/aterm-agent/src/supervise/approval_loop.rs:12"]
+        );
+        // A home `fn` in its own file is a home; the same `fn` name in another
+        // file is not, and a look in another `fn` of the home's file is not.
+        let homes = "fn read(worker: &WorkerEnv) {\n    let t = read_small(p, 9);\n}\n\
+                     fn parse(text: &str) {\n    let t = read_small(p, 9);\n}\n";
+        assert_eq!(
+            spots(&run(
+                &SUPERVISE_FX,
+                &[
+                    (
+                        "crates/aterm-agent/src/supervise/policy/shell_startup.rs",
+                        homes
+                    ),
+                    ("crates/aterm-agent/src/supervise/policy/question.rs", homes),
+                ]
+            )),
+            [
+                "crates/aterm-agent/src/supervise/policy/question.rs:2",
+                "crates/aterm-agent/src/supervise/policy/question.rs:5",
+                "crates/aterm-agent/src/supervise/policy/shell_startup.rs:5",
+            ]
+        );
+        // The probe's live arm is where the policy's looks live.
+        let live = "let e = std::fs::read_dir(&dir);\n\
+                    let a = atpkg::caller_shell::process_args(group);\n\
+                    let r = std::fs::canonicalize(p);\n";
+        assert!(
+            run(
+                &SUPERVISE_FX,
+                &[(
+                    "crates/aterm-agent/src/supervise/policy/probe_live.rs",
+                    live
+                )]
+            )
+            .is_empty()
+        );
+        // A clock read in a phase-3 home is still a clock read.
+        let clock = "fn read(worker: &WorkerEnv) {\n    let n = Instant::now();\n}\n";
+        assert_eq!(
+            spots(&run(
+                &SUPERVISE_FX,
+                &[(
+                    "crates/aterm-agent/src/supervise/policy/shell_startup.rs",
+                    clock
+                )]
+            )),
+            ["crates/aterm-agent/src/supervise/policy/shell_startup.rs:2"]
+        );
+    }
+
+    /// Stand-ins for the files that hold the policy's live bodies: each home
+    /// `fn` of [`SUPERVISE_LOOK_HOMES`] makes its look, and the entries the
+    /// probe's live arm calls reach a home only through their file's own calls
+    /// (or another home file's), as the real ones do.
+    fn live_body_files() -> Vec<(&'static str, &'static str)> {
+        vec![
+            (
+                "crates/aterm-agent/src/supervise/policy/shell_startup.rs",
+                "pub fn read(worker: &WorkerEnv, launch: &Path) -> Result<S, String> {\n    \
+                 let s = snapshots(&claude)?;\n}\n\
+                 fn snapshots(claude: &Path) -> Result<Vec<PathBuf>, String> {\n    \
+                 let e = std::fs::read_dir(claude);\n}\n\
+                 pub fn tool_kinds(worker: &WorkerEnv) -> Vec<Kind> {\n    Vec::new()\n}\n",
+            ),
+            (
+                "crates/aterm-agent/src/supervise/policy/claude_settings.rs",
+                "pub fn owner_asks(worker: &WorkerEnv, launch: &Path) -> Vec<OwnerAsk> {\n    \
+                 for (s, v) in parsed(worker, launch) {}\n}\n\
+                 pub(crate) fn parsed(worker: &WorkerEnv, launch: &Path) -> Vec<Doc> {\n    \
+                 let t = read_settings_in(None, p);\n}\n\
+                 fn read_settings_in(fence: Option<&Path>, path: &Path) -> Option<String> {\n    \
+                 crate::harness::footer::read_small(path, 9)\n}\n\
+                 pub fn rule_tool(rule: &str) -> Option<&str> {\n    None\n}\n",
+            ),
+            (
+                "crates/aterm-agent/src/supervise/policy/git_config.rs",
+                "impl WorkerEnv {\n    pub fn raw_git_view(\n        &self,\n        dir: &Path,\n    \
+                 ) -> Result<GitView, String> {\n        self.view_at(dir)\n    }\n    \
+                 fn view_at(&self, dir: &Path) -> Result<GitView, String> {\n        \
+                 let o = aterm_uds::spawnfd::command(\"git\");\n    }\n    \
+                 pub fn git_settings_env(&self, launch: &Path) -> Result<(), String> {\n        \
+                 self.settings_env_where(launch)\n    }\n    \
+                 pub fn settings_env_where(&self, launch: &Path) -> Result<(), String> {\n        \
+                 for d in super::claude_settings::parsed(self, launch) {}\n    }\n    \
+                 pub fn var(&self, key: &str) -> Option<&str> {\n        None\n    }\n}\n",
+            ),
+            (
+                "crates/aterm-agent/src/supervise/limit.rs",
+                "pub fn zone_offset_at(zone: &str, unix: i64) -> Option<i64> {\n    \
+                 let t = std::fs::read(zone);\n}\n\
+                 fn offset_in(zone_offset_at: &dyn Fn(&str) -> Option<i64>) -> i64 {\n    \
+                 zone_offset_at(\"z\").unwrap_or(0)\n}\n\
+                 pub fn reset_at_with(zone_offset_at: &dyn Fn(&str) -> Option<i64>) -> i64 {\n    \
+                 offset_in(zone_offset_at)\n}\n\
+                 fn date_offset(zone: &str, unix: i64) -> Option<i64> {\n    \
+                 let t = std::fs::read(zone);\n}\n\
+                 pub fn rogue_reset(unix: i64) -> i64 {\n    \
+                 date_offset(\"z\", unix).unwrap_or(0)\n}\n",
+            ),
+        ]
+    }
+
+    /// A PROBE'S LIVE BODY CALLED FROM ABOVE ITS DOOR IS NAMED: each call the
+    /// policy made before T5 — the shell's startup, the owner's asks, the git
+    /// view and the settings' `env` read off the worker — made again from the
+    /// loop or the policy, and the live probe itself named
+    /// there, is a finding, as is a live body imported to be called bare (on
+    /// one line, or in a group across lines). Control: the footer's transcript
+    /// reader, a phase-3 look by name, is found among them.
+    #[test]
+    fn a_probes_live_body_called_above_its_door_is_named() {
+        let lp = "let s = crate::supervise::policy::shell_startup::read(w, cwd);\n\
+                  let a = crate::supervise::policy::claude_settings::owner_asks(w, cwd);\n\
+                  let w = crate::supervise::policy::LiveProbe.worker_proc(group, &sid);\n\
+                  ctx.shell_cwds = crate::harness::footer::shell_cwds(&claude, cwd);\n";
+        let policy = "worker.git_settings_env(&ctx.cwd)?;\n\
+                      let v = worker.raw_git_view(dir, &|_| false)?;\n\
+                      let t = LiveProbe.hidden_twin(comps)?;\n\
+                      let d = super::claude_settings::parsed(worker, launch);\n";
+        let te = "let r = super::limit::rogue_reset(now);\n";
+        let imports = "use super::policy::shell_startup::read;\n\
+                       use super::policy::{\n    \
+                       claude_settings::{OwnerAsk, owner_asks},\n    \
+                       probe::PolicyProbe,\n};\n";
+        let mut files = live_body_files();
+        files.extend([
+            ("crates/aterm-agent/src/supervise/approval_loop.rs", lp),
+            (
+                "crates/aterm-agent/src/supervise/policy/approval.rs",
+                policy,
+            ),
+            ("crates/aterm-agent/src/supervise/turn_end_loop.rs", te),
+            ("crates/aterm-agent/src/supervise/run.rs", imports),
+        ]);
+        assert_eq!(
+            spots(&run(&SUPERVISE_FX, &files)),
+            [
+                "crates/aterm-agent/src/supervise/approval_loop.rs:1",
+                "crates/aterm-agent/src/supervise/approval_loop.rs:2",
+                "crates/aterm-agent/src/supervise/approval_loop.rs:3",
+                "crates/aterm-agent/src/supervise/approval_loop.rs:4",
+                "crates/aterm-agent/src/supervise/policy/approval.rs:1",
+                "crates/aterm-agent/src/supervise/policy/approval.rs:2",
+                "crates/aterm-agent/src/supervise/policy/approval.rs:3",
+                "crates/aterm-agent/src/supervise/policy/approval.rs:4",
+                "crates/aterm-agent/src/supervise/run.rs:1",
+                "crates/aterm-agent/src/supervise/run.rs:2",
+                "crates/aterm-agent/src/supervise/turn_end_loop.rs:1",
+            ]
+        );
+    }
+
+    /// THE PROBE, ITS LIVE BODIES' OWN FILES AND THEIR PURE NEIGHBOURS ARE
+    /// SILENT: a call of the probe (a method of the same name as a live body
+    /// included), a pure `fn` of a live body's file, a fn that hands an
+    /// injected reader on (`INJECTED`: its call of the home's name is its
+    /// parameter), a type imported from a live body's module, and the chain
+    /// inside the live bodies' files — an entry, the `fn`s it reaches, and a
+    /// call into another home file's live body from one of them. The probe's
+    /// door and live arm name the live probe.
+    #[test]
+    fn the_probe_and_its_live_bodies_own_files_are_silent() {
+        let policy = "ctx.probe.settings_env(worker, &ctx.cwd)?;\n\
+                      let v = ctx.probe.git_view(worker, dir, &writes)?;\n\
+                      let s = ctx.probe.shell_startup(w, cwd);\n\
+                      let a = ctx.probe.owner_asks(w, cwd);\n\
+                      let k = super::shell_startup::tool_kinds(&w);\n\
+                      let r = super::claude_settings::rule_tool(rule);\n\
+                      let e = worker.var(\"HOME\");\n\
+                      let p = self.fx.policy_probe();\n\
+                      let at = super::limit::reset_at_with(&|z| self.fx.zone_offset(z));\n\
+                      use super::shell_startup::ShellStartup;\n\
+                      fn read(&self) -> u8 {\n    0\n}\n";
+        let door = "pub struct LiveProbe;\n\
+                    #[derive(Clone)]\npub(crate) struct TapedProbe {\n    live: LiveProbe,\n}\n";
+        let arm = "impl PolicyProbe for LiveProbe {\n    \
+                   fn shell_startup(&self, w: &WorkerEnv, l: &Path) -> R {\n        \
+                   super::shell_startup::read(w, l)\n    }\n    \
+                   fn settings_env(&self, w: &WorkerEnv, l: &Path) -> Result<(), String> {\n        \
+                   w.git_settings_env(l)\n    }\n}\n";
+        let mut files = live_body_files();
+        files.extend([
+            (
+                "crates/aterm-agent/src/supervise/policy/approval.rs",
+                policy,
+            ),
+            ("crates/aterm-agent/src/supervise/policy/probe.rs", door),
+            ("crates/aterm-agent/src/supervise/policy/probe_live.rs", arm),
+        ]);
+        let found = run(&SUPERVISE_FX, &files);
+        assert!(found.is_empty(), "{:?}", spots(&found));
+    }
+
+    /// THE LEDGER'S READERS BY PATH ARE FOUND BY THEIR CONVENTION: a reader
+    /// beside its `_in` form reads the file in the ledger's module unnamed
+    /// (phase 3's home there) and is named wherever the loop calls it (phase
+    /// 2), while a look in another `fn` of the module, and the `_in` form
+    /// called from the loop, are what they are.
+    #[test]
+    fn the_ledgers_readers_by_path_are_found_by_their_convention() {
+        let ledger = "pub fn awaited_try_in(body: &str) -> u8 {\n    0\n}\n\
+                      pub fn awaited_try(path: &Path) -> u8 {\n    \
+                      awaited_try_in(&std::fs::read_to_string(path).unwrap_or_default())\n}\n\
+                      pub fn rogue(path: &Path) {\n    let _ = std::fs::read(path);\n}\n";
+        let lp = "let t = approvals::awaited_try(path, sid);\n\
+                  let u = approvals::awaited_try_in(&body, sid);\n\
+                  let v = super::approvals::awaited_try(path, sid);\n";
+        assert_eq!(
+            spots(&run(
+                &SUPERVISE_FX,
+                &[
+                    ("crates/aterm-agent/src/supervise/approvals.rs", ledger),
+                    ("crates/aterm-agent/src/supervise/turn_end_loop.rs", lp),
+                ]
+            )),
+            [
+                "crates/aterm-agent/src/supervise/approvals.rs:8",
+                "crates/aterm-agent/src/supervise/turn_end_loop.rs:1",
+                "crates/aterm-agent/src/supervise/turn_end_loop.rs:3",
+            ]
         );
     }
 

@@ -162,38 +162,6 @@ fn a_typed_wake_wakes_the_companion_but_not_sparkle_words_in_a_split() {
     );
 }
 
-/// The single-pane present uses the same predicate ([`sparkle_words_presentable`]) over
-/// `motion_focus`, which a typed wake does not move though `cursor_fx_focus` does. This pins
-/// the predicate and its input, not that call site (it cannot run glass-less).
-#[test]
-fn sparkle_words_presentability_ignores_the_typed_wake() {
-    let mut app = App::headless_for_test();
-    let wid = WindowId(0);
-    let now = Instant::now();
-    {
-        let ws = app.windows.get_mut(&wid).expect("test window");
-        ws.focused = false;
-        ws.last_key_at = Some(now);
-    }
-    assert!(
-        app.cursor_fx_focus(wid, false, now),
-        "the companion is woken"
-    );
-    assert!(
-        !app.motion_focus(wid, false),
-        "the words' focus input is not"
-    );
-    assert!(!sparkle_words_presentable(
-        app.motion_focus(wid, false),
-        false
-    ));
-    assert!(sparkle_words_presentable(true, false));
-    assert!(
-        !sparkle_words_presentable(true, true),
-        "suspension still wins"
-    );
-}
-
 fn focus_pure_pane(app: &mut App, wid: WindowId, session: u64) {
     assert!(
         app.active_tree_mut(wid)

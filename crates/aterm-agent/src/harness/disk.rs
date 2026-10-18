@@ -33,8 +33,8 @@
 //!    `disk.dead_build_dirs`, on by default): an ended
 //!    Claude Code session's scratch build — no running Claude Code names the
 //!    session in its own registry, nothing of it written for
-//!    [`Config::quiet_s`] (`target_stale_days`, at least a day) — or a cells
-//!    cache whose checkout was removed ([`discover`]'s owners). A signed
+//!    [`Config::quiet_s`] (`target_stale_days`, at least a day) ([`discover`]'s
+//!    owners). A signed
 //!    `CACHEDIR.TAG` (the specification's mark of regenerable contents), no
 //!    source at its root, every profile known, none locked and every one
 //!    unwritten for the quiet window; no running process using it or the
@@ -73,7 +73,7 @@
 //! worktrees, `$HOME`'s checkouts and their git worktrees two levels down
 //! (a `target -> target.noindex` link resolved), x.py's bootstrap build
 //! directories (never a sysroot, stage0 or `llvm`), the agents'
-//! `CARGO_TARGET_DIR`, Claude Code's temp root and the cells cache. What no
+//! `CARGO_TARGET_DIR` and Claude Code's temp root. What no
 //! row can free is the report's [`Report::hogs`]: the largest build
 //! directories left, each with what frees it (`$HOME/trust/build 94.0 GiB (x.py
 //! bootstrap; run scripts/slim_build.py)`), which the window's "Disk space is
@@ -217,11 +217,48 @@ pub const DEFAULT_APPLY: bool = false;
 /// at this floor plus [`PRESSURE_MARGIN_GIB`]. `0` turns it off.
 pub const DEFAULT_AUTO_FREE_GIB: u64 = 10;
 
-/// How far above the floor the pressure pass reclaims before it stops: one
-/// GiB, a tenth of the default floor, so the next build's writes do not push
-/// the volume straight back under it before the next tick. A target, not a
+/// How far above the floor the pressure pass reclaims before it stops: five
+/// GiB, so the next build's writes (one aterm workspace's cache is 12-43
+/// GiB) do not push the volume straight back under it before the next look.
+/// It was one GiB until the disk filled twice on 2026-10-16. A target, not a
 /// measurement.
-pub const PRESSURE_MARGIN_GIB: u64 = 1;
+pub const PRESSURE_MARGIN_GIB: u64 = 5;
+
+/// The automatic floor is at least this percent of the volume's size
+/// ([`Config::for_volume`]): ten GiB is one build from full on a 460 GiB
+/// disk where one workspace's build cache is 12-43 GiB.
+pub const AUTO_FREE_PCT: u64 = 5;
+
+/// The warning threshold is at least this percent of the volume's size
+/// ([`Config::for_volume`]).
+pub const WARN_FREE_PCT: u64 = 8;
+
+/// The most the volume's share ([`AUTO_FREE_PCT`]) raises the automatic
+/// floor to: on a 4 TB volume 5% is 200 GiB, and a floor there would take
+/// live checkouts' caches with 150 GiB free. A floor the owner WROTE is
+/// never raised at all ([`Written`]).
+pub const AUTO_FREE_SHARE_MAX_GIB: u64 = 32;
+
+/// The most the volume's share ([`WARN_FREE_PCT`]) raises the warning to.
+pub const WARN_FREE_SHARE_MAX_GIB: u64 = 64;
+
+/// The most the volume's share ([`EMERGENCY_FREE_PCT`]) raises the
+/// emergency line to.
+pub const EMERGENCY_FREE_SHARE_MAX_GIB: u64 = 8;
+
+/// THE EMERGENCY: below the larger of this many GiB and
+/// [`EMERGENCY_FREE_PCT`] of the volume ([`Thresholds::emergency`]), or with
+/// fewer than [`EMERGENCY_FILES_FREE`] inodes, writes are about to fail with
+/// `ENOSPC`: the watch releases its reserve ([`reserve`]), passes at once,
+/// and an owner alert follows when nothing safe is left to free.
+pub const EMERGENCY_FREE_GIB: u64 = 4;
+
+/// See [`EMERGENCY_FREE_GIB`].
+pub const EMERGENCY_FREE_PCT: u64 = 1;
+
+/// Fewer free inodes than this is an emergency whatever the bytes say: a
+/// volume out of inodes fails a write with `ENOSPC` too.
+pub const EMERGENCY_FILES_FREE: u64 = 50_000;
 
 /// The `CACHEDIR.TAG` signature every cargo-compatible build tool writes into
 /// a target directory (the Cache Directory Tagging Specification's fixed
@@ -237,6 +274,12 @@ pub mod target;
 
 #[path = "disk_discover.rs"]
 pub mod discover;
+
+#[path = "disk_reserve.rs"]
+pub mod reserve;
+
+#[path = "disk_poke.rs"]
+pub mod poke;
 
 pub use target::{CARGO_LOCKS, INCREMENTAL, Judge, PRESSURE_MIN_IDLE_S, Profile, TargetDir};
 
@@ -262,9 +305,8 @@ pub const MAX_HOGS: usize = 5;
 /// `disk.dead_build_dirs`: below the floor, a build directory whose OWNER IS
 /// GONE goes WHOLE ([`Witness::OwnerGone`]) — a Claude Code session's scratch
 /// build once no running Claude Code names the session and nothing of it
-/// was written for the quiet window ([`Config::quiet_s`]), or a cells cache
-/// of a removed checkout (measured: 45 GB of ended sessions' scratch builds
-/// and 26 GB of orphaned cells on a volume at 3-6 GB free). `false`: such a directory is
+/// was written for the quiet window ([`Config::quiet_s`]) (measured: 45 GB of
+/// ended sessions' scratch builds on a volume at 3-6 GB free). `false`: such a directory is
 /// any other, its idle and least-recently-used `incremental/` only.
 pub const DEFAULT_DEAD_BUILD_DIRS: bool = true;
 
@@ -409,8 +451,8 @@ impl Default for Config {
 }
 
 /// Every `[disk]` key of `aterm.toml`, in the order the help lists them. The
-/// window's settings checker knows each one (aterm-gui's config language pins
-/// the two lists), so none of them reads there as "unknown".
+/// window's settings checker reads this list, so none of them reads there as
+/// "unknown".
 pub const KEYS: &[&str] = &[
     "apply",
     "warn_free_gib",
@@ -467,6 +509,76 @@ impl Config {
             .saturating_mul(GIB)
     }
 
+    /// This config on a volume of `total` bytes with no knob written
+    /// ([`Self::on_volume`]).
+    #[must_use]
+    pub fn for_volume(self, total: Option<u64>) -> Config {
+        self.on_volume(total, Written::default())
+    }
+
+    /// This config on a volume of `total` bytes: a floor the owner did not
+    /// write raised to [`AUTO_FREE_PCT`] of it, at most
+    /// [`AUTO_FREE_SHARE_MAX_GIB`], and a warning not written to
+    /// [`WARN_FREE_PCT`], at most [`WARN_FREE_SHARE_MAX_GIB`] — each the
+    /// larger of the knob and the share. A value the owner WROTE is read as
+    /// written ([`Written`]); a floor of `0`, off, stays off. An unknown size
+    /// changes nothing.
+    #[must_use]
+    pub fn on_volume(self, total: Option<u64>, written: Written) -> Config {
+        let Some(total) = total else {
+            return self;
+        };
+        let share = |pct: u64, max: u64| (total / 100).saturating_mul(pct).div_ceil(GIB).min(max);
+        Config {
+            warn_free_gib: if written.warn_free_gib {
+                self.warn_free_gib
+            } else {
+                self.warn_free_gib
+                    .max(share(WARN_FREE_PCT, WARN_FREE_SHARE_MAX_GIB))
+            },
+            auto_free_gib: if self.auto_free_gib == 0 || written.auto_free_gib {
+                self.auto_free_gib
+            } else {
+                self.auto_free_gib
+                    .max(share(AUTO_FREE_PCT, AUTO_FREE_SHARE_MAX_GIB))
+            },
+            ..self
+        }
+    }
+
+    /// The thresholds in force on a volume of `total` bytes with no knob
+    /// written ([`Self::thresholds_on`]).
+    #[must_use]
+    pub fn thresholds(self, total: Option<u64>) -> Thresholds {
+        self.thresholds_on(total, Written::default())
+    }
+
+    /// The thresholds in force on a volume of `total` bytes
+    /// ([`Self::on_volume`]), in bytes. The emergency line is the larger of
+    /// [`EMERGENCY_FREE_GIB`] and [`EMERGENCY_FREE_PCT`] of the volume (that
+    /// share at most [`EMERGENCY_FREE_SHARE_MAX_GIB`]), and never above a
+    /// floor that is on: below the emergency the pass must be able to run.
+    #[must_use]
+    pub fn thresholds_on(self, total: Option<u64>, written: Written) -> Thresholds {
+        let c = self.on_volume(total, written);
+        let pct = |p: u64| total.map_or(0, |t| (t / 100).saturating_mul(p));
+        let floor = c.auto_free_gib.saturating_mul(GIB);
+        let emergency = EMERGENCY_FREE_GIB
+            .saturating_mul(GIB)
+            .max(pct(EMERGENCY_FREE_PCT).min(EMERGENCY_FREE_SHARE_MAX_GIB.saturating_mul(GIB)));
+        Thresholds {
+            warn: c.warn_free_gib.saturating_mul(GIB),
+            floor,
+            target: c.pressure_target_bytes(),
+            emergency: if floor > 0 {
+                emergency.min(floor)
+            } else {
+                emergency
+            },
+            files_emergency: EMERGENCY_FILES_FREE,
+        }
+    }
+
     /// How long nothing of a gone owner may have been written before its
     /// build directory goes whole: `target_stale_days`, and never less than
     /// ONE day (a window of `0` makes every profile idle; it does not make a
@@ -474,6 +586,84 @@ impl Config {
     #[must_use]
     pub fn quiet_s(&self) -> i64 {
         self.target_stale_days.max(1).saturating_mul(DAY_S)
+    }
+}
+
+/// Which of the volume-scaled `[disk]` knobs the owner WROTE in aterm.toml
+/// ([`Config::on_volume`]): a written one is read as written, never raised
+/// to the volume's share.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Written {
+    /// `disk.auto_free_gib` is written.
+    pub auto_free_gib: bool,
+    /// `disk.warn_free_gib` is written.
+    pub warn_free_gib: bool,
+}
+
+/// The free-space thresholds in force on one volume ([`Config::thresholds`]),
+/// in bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Thresholds {
+    /// Below this the report warns.
+    pub warn: u64,
+    /// Below this the automatic pass runs (`0`: off).
+    pub floor: u64,
+    /// Where the pressure pass stops: the floor plus [`PRESSURE_MARGIN_GIB`].
+    pub target: u64,
+    /// Below this writes are about to fail ([`EMERGENCY_FREE_GIB`]).
+    pub emergency: u64,
+    /// Fewer free inodes than this is an emergency ([`EMERGENCY_FILES_FREE`]).
+    pub files_emergency: u64,
+}
+
+/// Where a volume stands against its [`Thresholds`] ([`Thresholds::level`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Level {
+    /// Free bytes were not measured, and no measured inode emergency is known.
+    Unknown,
+    /// At or above the warning threshold.
+    Ok,
+    /// Below the warning threshold, at or above the floor.
+    Low,
+    /// Below the automatic floor: the pass runs.
+    Short,
+    /// Below the emergency line, or out of inodes: writes are failing or
+    /// about to.
+    Emergency,
+}
+
+impl Level {
+    /// The wire spelling (`disk=` of a status line, `level` of the JSON).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Level::Unknown => "unknown",
+            Level::Ok => "ok",
+            Level::Low => "low",
+            Level::Short => "short",
+            Level::Emergency => "emergency",
+        }
+    }
+}
+
+impl Thresholds {
+    /// Where `free` bytes and `files_free` inodes stand. Without free bytes,
+    /// only a measured inode emergency is decisive; otherwise the level is
+    /// [`Level::Unknown`]. The floor at `0` (off) is never crossed, the
+    /// emergency always can be.
+    #[must_use]
+    pub fn level(&self, free: Option<u64>, files_free: Option<u64>) -> Level {
+        if free.is_some_and(|f| f < self.emergency)
+            || files_free.is_some_and(|f| f < self.files_emergency)
+        {
+            return Level::Emergency;
+        }
+        match free {
+            Some(f) if self.floor > 0 && f < self.floor => Level::Short,
+            Some(f) if f < self.warn => Level::Low,
+            Some(_) => Level::Ok,
+            None => Level::Unknown,
+        }
     }
 }
 
@@ -637,8 +827,8 @@ pub enum Witness {
         device: u64,
     },
     /// Below the floor, a WHOLE build directory whose owner is gone (a Claude
-    /// Code session no running process names, a cells cache of a removed
-    /// checkout), every profile unwritten for the quiet window, none locked
+    /// Code session no running process names), every profile unwritten for
+    /// the quiet window, none locked
     /// (the module docs; [`target::reclaim_whole`]). The row's path is the
     /// build directory's.
     OwnerGone {
@@ -1045,8 +1235,8 @@ fn row_value(r: &Row) -> Value {
     {
         o.insert("last_used".to_owned(), Value::from(rfc3339_utc(*last_used)));
     }
-    // Whose it was: the session and its folder, or the removed checkout and
-    // its cells folder — what the ledger needs to explain a whole removal.
+    // Whose it was: the session and its folder — what the ledger needs to
+    // explain a whole removal.
     if let Witness::OwnerGone { owner, .. } = &r.witness {
         o.insert(
             "owner".to_owned(),
@@ -1331,11 +1521,12 @@ fn whole_verdict(
             newest = newest.max(m);
         }
         let age_s = survey.now.saturating_sub(newest);
-        if age_s < config.quiet_s() {
+        let quiet_s = owner.quiet_s(config.quiet_s());
+        if age_s < quiet_s {
             return Err(format!(
                 "a profile was written into {} ago, inside the {} quiet window",
                 target::human_age(age_s),
-                target::human_age(config.quiet_s())
+                target::human_age(quiet_s)
             ));
         }
         if t.total.is_none() {
@@ -1347,7 +1538,7 @@ fn whole_verdict(
             owner: owner.clone(),
             last_used: newest,
             age_s,
-            quiet_s: config.quiet_s(),
+            quiet_s,
             floor_gib: config.auto_free_gib,
             until_gib: config.auto_free_gib.saturating_add(PRESSURE_MARGIN_GIB),
             device,
@@ -1545,20 +1736,6 @@ fn hog_of(t: &TargetDir, config: Config, survey: &Survey, notes: &[String]) -> (
             t.path.clone(),
             "a Claude Code session's scratch build".to_owned(),
         ),
-        (Origin::Cell { .. }, Owned::Gone { .. }) => (
-            t.path.clone(),
-            gone_why("a cells cache of a removed checkout"),
-        ),
-        (Origin::Cell { checkout, .. }, _) => (
-            t.path.clone(),
-            match checkout {
-                Some(c) => format!(
-                    "the retired cells cache of {}: nothing writes it now, remove it",
-                    display_home(c, survey.home.as_deref())
-                ),
-                None => "a retired cells cache: nothing writes it now, remove it".to_owned(),
-            },
-        ),
         (Origin::Linked { from }, _) => (
             t.path.clone(),
             format!(
@@ -1570,7 +1747,11 @@ fn hog_of(t: &TargetDir, config: Config, survey: &Survey, notes: &[String]) -> (
             t.path.clone(),
             "an agent's CARGO_TARGET_DIR: deps/ and build/ are `targo clean`'s".to_owned(),
         ),
-        (Origin::BuildCache, _) => (
+        (Origin::BuildCache { .. }, Owned::Gone { .. }) => (
+            t.path.clone(),
+            gone_why("the Rust build cache of a removed workspace"),
+        ),
+        (Origin::BuildCache { .. }, _) => (
             t.path.clone(),
             "a workspace's Rust build cache: `targo clean` in that workspace".to_owned(),
         ),
@@ -2242,6 +2423,80 @@ pub fn step_row(now: i64, sid: &str, step: &Step<'_>) -> String {
     }
 }
 
+/// One `reserve` row of the disk ledger: the reserve ([`reserve`]) was
+/// `released` (its `bytes` unlinked, so the rows after it can be written) or
+/// `written`, or `refused` (something not ours in its place).
+#[must_use]
+pub fn reserve_row(now: i64, action: &str, bytes: Option<u64>, text: &str) -> String {
+    let mut o = Map::new();
+    o.insert("ts".to_owned(), Value::from(rfc3339_utc(now)));
+    o.insert("sid".to_owned(), Value::from(String::new()));
+    o.insert("kind".to_owned(), Value::from("reserve".to_owned()));
+    o.insert("action".to_owned(), Value::from(action.to_owned()));
+    o.insert("bytes".to_owned(), bytes.map_or(Value::Null, Value::from));
+    o.insert(
+        "text".to_owned(),
+        Value::from(truncate_bytes(text, ROW_TEXT_CAP).to_owned()),
+    );
+    aterm_json::to_string(&Value::Object(o))
+        .unwrap_or_else(|_| "{\"kind\":\"reserve\",\"reason\":\"unserializable\"}".to_owned())
+}
+
+/// One `build-cache-sweep` row of the disk ledger: a removed workspace's
+/// build directory in aterm's Rust build cache, `bytes` in it, about to go
+/// whole under its locks (`action` `removing`, the write-ahead intent row)
+/// or gone (`removed`) (`atpkg::build_cache::reclaim_under_pressure`).
+#[must_use]
+pub fn sweep_row(now: i64, path: &Path, action: &str, bytes: u64) -> String {
+    let mut o = Map::new();
+    o.insert("ts".to_owned(), Value::from(rfc3339_utc(now)));
+    o.insert("sid".to_owned(), Value::from(String::new()));
+    o.insert(
+        "kind".to_owned(),
+        Value::from("build-cache-sweep".to_owned()),
+    );
+    o.insert("action".to_owned(), Value::from(action.to_owned()));
+    o.insert("path".to_owned(), Value::from(path_text(path)));
+    o.insert("bytes".to_owned(), Value::from(bytes));
+    o.insert(
+        "text".to_owned(),
+        Value::from(
+            "a removed workspace's build cache, whole: unwritten ten minutes, no build \
+             holding its locks"
+                .to_owned(),
+        ),
+    );
+    aterm_json::to_string(&Value::Object(o))
+        .unwrap_or_else(|_| "{\"kind\":\"build-cache-sweep\"}".to_owned())
+}
+
+/// One `poke` row of the disk ledger: something saw the disk full and asked
+/// for a look now ([`poke`]), with the free figure measured on it.
+#[must_use]
+pub fn poke_row(now: i64, cause: &poke::Cause, free: Option<u64>, level: Level) -> String {
+    let mut o = Map::new();
+    o.insert("ts".to_owned(), Value::from(rfc3339_utc(now)));
+    o.insert(
+        "sid".to_owned(),
+        Value::from(match cause {
+            poke::Cause::Screen { sid, .. } => sid.clone(),
+            poke::Cause::Write(_) => String::new(),
+        }),
+    );
+    o.insert("kind".to_owned(), Value::from("poke".to_owned()));
+    o.insert(
+        "free_bytes".to_owned(),
+        free.map_or(Value::Null, Value::from),
+    );
+    o.insert("level".to_owned(), Value::from(level.as_str().to_owned()));
+    o.insert(
+        "text".to_owned(),
+        Value::from(truncate_bytes(&cause.describe(), ROW_TEXT_CAP).to_owned()),
+    );
+    aterm_json::to_string(&Value::Object(o))
+        .unwrap_or_else(|_| "{\"kind\":\"poke\",\"reason\":\"unserializable\"}".to_owned())
+}
+
 /// One stop row: where the pressure pass stopped, on what free figure, and
 /// how many rows it left.
 #[must_use]
@@ -2595,6 +2850,62 @@ pub(crate) fn remover_among(
 }
 
 // ---------------------------------------------------------------------------
+// The resume — a session the full disk stopped is told once space is back
+// ---------------------------------------------------------------------------
+
+/// The ledger's name for the resume typed into a session whose screen said
+/// the disk was full ([`resume_text`]), once space is back.
+pub const RULE_DISK_RESUME: &str = "disk-resume@v1";
+
+/// What is typed into a session whose Claude Code said `ENOSPC` (or
+/// `EDQUOT`) while the volume measured full, once a look measures it back:
+/// the harness's mark, what aterm freed (`freed` bytes; `top`, the largest
+/// of what went, at most two named), and the ask to retry what failed. It
+/// says no more than was measured.
+#[must_use]
+pub fn resume_text(code: &str, freed: u64, top: &[String]) -> String {
+    let what = if freed == 0 {
+        "space is free again".to_owned()
+    } else {
+        let named: Vec<&str> = top.iter().take(2).map(String::as_str).collect();
+        if named.is_empty() {
+            format!("aterm freed {}", human_bytes(freed))
+        } else {
+            format!("aterm freed {} ({})", human_bytes(freed), named.join("; "))
+        }
+    };
+    format!(
+        "{} The disk ran out of space ({code}) and {what}. Writes work again: retry what failed \
+         with {code} and carry on.",
+        super::upgrade::HARNESS_MARK
+    )
+}
+
+/// Type `text` into tab `sid` of the instance at `sock` as one fenced turn
+/// (`upgrade_drive::type_fenced`: under the hand, judged on a fresh read —
+/// a box, a draft, a person typing or an owner's hold refuses it). The
+/// step's word: `typed`, or `wait:<why>` to try again at the next idle
+/// point.
+#[must_use]
+pub fn type_resume(sock: &str, sid: &str, text: &str) -> String {
+    let mut c = match crate::RelayClient::connect_local_beside(sock) {
+        Ok(c) => c,
+        Err(e) => return format!("wait:no-socket:{e}"),
+    };
+    match super::upgrade_drive::type_fenced(
+        &mut c,
+        sid,
+        text,
+        None,
+        super::upgrade_drive::Put::Paste,
+        super::Timings::for_build().fence_every,
+    ) {
+        Ok(()) => "typed".to_owned(),
+        Err(why) => format!("wait:{}", why.word()),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The scan — the one impure half
 // ---------------------------------------------------------------------------
 
@@ -2619,8 +2930,7 @@ pub struct Roots {
     pub found: Vec<discover::Found>,
     /// What discovery could not finish, carried into the report's notes.
     pub found_notes: Vec<String>,
-    /// `$HOME`: how the report's lines abbreviate paths, and whose guarded
-    /// folders a cells checkout is never looked for in.
+    /// `$HOME`: how the report's lines abbreviate paths.
     pub home: Option<PathBuf>,
     /// The Claude Code directories whose registries and transcripts say
     /// whether a session ended ([`discover::Roots::claude_dirs`]).

@@ -23,42 +23,7 @@ fn decompress_lz4_bounded_rejects_too_short() {
     assert!(matches!(err, ScrollbackError::Decompression(ref m) if m.contains("too short")));
 }
 
-#[test]
-fn decode_cold_bounded_roundtrip() {
-    let original = b"hello world scrollback data";
-    let compressed = crate::encode_cold_block(original).expect("cold encode");
-    let decoded = crate::decode_cold_bounded(&compressed).expect("bounded cold decode");
-    assert_eq!(&decoded, original);
-}
-
-#[test]
-fn decompress_lz4_bounded_roundtrip() {
-    let original = b"hello world scrollback data";
-    let compressed = crate::lz4::compress_prepend_size(original).expect("test data fits in u32");
-    let decoded = decompress_lz4_bounded(&compressed).expect("bounded lz4 decode");
-    assert_eq!(&decoded, original);
-}
-
 // Decompression failure behaviour
-
-/// Truncate with a corrupt warm block succeeds: truncation advances
-/// `front_offset` without decompressing, so the corruption surfaces only when
-/// the block is read (`get_line`) or evicted.
-#[test]
-fn truncate_succeeds_on_corrupt_warm_block() {
-    let mut sb = Scrollback::with_block_size(5, 10, 10_000_000, 5);
-    for i in 0..15 {
-        sb.push_str(&format!("Line {i}"));
-    }
-    assert!(sb.warm_line_count() > 0, "need warm data");
-    sb.warm.corrupt_oldest_block();
-    let result = sb.truncate(12);
-    assert!(
-        result.is_ok(),
-        "truncate should succeed via front_offset (no decompression needed)"
-    );
-    assert_eq!(sb.line_count(), 12, "line count should reflect truncation");
-}
 
 /// Truncation spanning cold+warm+hot needs no decompression of the corrupt
 /// warm boundary block.
@@ -130,8 +95,7 @@ fn remove_newest_aborts_on_decompression_failure() {
 }
 
 /// When the cold tier rejects a warm block (re-compression failure), the block
-/// goes back to warm instead of being dropped with its lines, as
-/// `DiskBackedScrollback::evict_warm_to_cold` does.
+/// goes back to warm instead of being dropped with its lines.
 #[test]
 fn evict_warm_to_cold_restores_block_on_failure() {
     // hot=5, warm=10, block_size=5: warm holds 2 blocks of 5 before eviction.

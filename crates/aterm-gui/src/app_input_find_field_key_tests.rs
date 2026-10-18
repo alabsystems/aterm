@@ -301,7 +301,6 @@ fn other_input_doors_defer_to_an_open_field() {
         Action::ScrollToTop,
         Action::ScrollPageUp,
         Action::JumpPrevPrompt,
-        Action::ToggleViMode,
         // Not text-level, but its default chord is the field's only word-motion
         // chord off macOS (Alt+←/→), and this block runs above the find gate.
         Action::FocusPaneLeft,

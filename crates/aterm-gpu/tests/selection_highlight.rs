@@ -6,7 +6,7 @@
 // unselected cells keep theirs, and the GPU matches the CPU within the
 // `gpu_matches_cpu` tolerance.
 //
-// A host with no GPU ends each test as could-not-run (`common::backends`).
+// No GPU or no font: COULD NOT RUN.
 
 use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::Terminal;

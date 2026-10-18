@@ -66,6 +66,16 @@ impl Grid {
         }
     }
 
+    /// Give the wide halves a row op blanked with the BCE fill
+    /// ([`BlankedHalves`](crate::row::BlankedHalves)) the fill's ring bytes, as
+    /// [`Self::fill_bce_rgb_range`] gives the span it vacated. Call it after the
+    /// extras shift, which moves the ring with the cells.
+    pub(in crate::grid) fn fill_bce_rgb_cols(&mut self, row: u16, cols: crate::row::BlankedHalves) {
+        for col in cols.into_iter().flatten() {
+            self.fill_bce_rgb_range(row, col, col.saturating_add(1));
+        }
+    }
+
     /// Write BCE truecolor background for a range of full rows.
     ///
     /// No-op when `cursor_template_bg_rgb` is `None`.
@@ -85,6 +95,25 @@ impl Grid {
             for row in rows {
                 self.fill_bce_rgb_range(row, cols.start, cols.end);
             }
+        }
+    }
+
+    /// Write the BCE truecolor background for the cells of `cols` on `row`
+    /// that a selective erase cleared: every cell there that is not protected
+    /// afterwards (the fill never is, and a protected cell keeps its own
+    /// colours and ring bytes).
+    ///
+    /// No-op when `cursor_template_bg_rgb` is `None`.
+    fn fill_bce_rgb_unprotected(&mut self, row: u16, cols: core::ops::Range<u16>) {
+        if self.storage.cursor_template_bg_rgb.is_none() {
+            return;
+        }
+        let cleared: Vec<u16> = match self.row(row) {
+            Some(r) => cols.filter(|&c| !r.is_cell_protected(c)).collect(),
+            None => return,
+        };
+        for col in cleared {
+            self.fill_bce_rgb_range(row, col, col.saturating_add(1));
         }
     }
 
@@ -118,7 +147,7 @@ impl Grid {
             let mut bce = cursor_col..right_bound;
             if let Some(row) = self.row_mut(cursor_row) {
                 if selective {
-                    row.selective_clear_range(cursor_col, right_bound);
+                    bce = row.selective_clear_range(cursor_col, right_bound, fill);
                 } else {
                     // xterm `ClearRight`: the orphaned wide half goes through the
                     // same `ClearCells` as the erased span, so it receives the BCE
@@ -130,11 +159,13 @@ impl Grid {
             if selective {
                 // DECSEL resets the unprotected cells it clears (and the halves of
                 // their pairs); their extras go with them, a protected cell keeps
-                // its claim.
+                // its claim. The cleared cells take the BCE blank, so a truecolor
+                // background needs its ring bytes, for them alone.
                 self.drop_unclaimed_extras(
                     cursor_row,
                     cursor_col.saturating_sub(1)..right_bound.saturating_add(1),
                 );
+                self.fill_bce_rgb_unprotected(cursor_row, bce);
             } else {
                 // `bce` reaches the orphaned head left of the span, so its extras
                 // go too.
@@ -200,7 +231,7 @@ impl Grid {
             let mut bce = 0..end;
             if let Some(row) = self.row_mut(cursor_row) {
                 if selective {
-                    row.selective_clear_range(0, end);
+                    bce = row.selective_clear_range(0, end, fill);
                 } else {
                     // BCE blank on the orphan, per xterm `ClearRight` (see
                     // `erase_to_end_of_line_core`).
@@ -210,6 +241,7 @@ impl Grid {
             if selective {
                 // As in `erase_to_end_of_line_core`.
                 self.drop_unclaimed_extras(cursor_row, 0..end.saturating_add(1));
+                self.fill_bce_rgb_unprotected(cursor_row, bce);
             } else {
                 // `bce` reaches the orphaned continuation right of the span.
                 self.storage
@@ -233,7 +265,7 @@ impl Grid {
         let fill = self.storage.cursor_template;
         if let Some(row) = self.row_mut(cursor_row) {
             if selective {
-                row.selective_clear();
+                row.selective_clear(fill);
             } else {
                 // `erase_with()` keeps DECDWL/DECDHL line attributes, which EL
                 // keeps where ED 2 drops them, as in xterm (`ClearInLine2` never
@@ -244,6 +276,7 @@ impl Grid {
         if selective {
             // As in `erase_to_end_of_line_core`.
             self.drop_unclaimed_extras(cursor_row, 0..self.storage.cols);
+            self.fill_bce_rgb_unprotected(cursor_row, 0..self.storage.cols);
         } else {
             self.storage.extras.clear_row(cursor_row);
             self.fill_bce_rgb_range(cursor_row, 0, self.storage.cols);
@@ -260,7 +293,7 @@ impl Grid {
         for row in range.clone() {
             if let Some(r) = self.row_mut(row) {
                 if selective {
-                    r.selective_clear();
+                    r.selective_clear(fill);
                 } else {
                     // A complete row a plain ED erases comes back single-width
                     // and single-height (xterm `ClearBufRows`: "clearing the
@@ -275,6 +308,7 @@ impl Grid {
             // As in `erase_to_end_of_line_core`.
             for row in range.clone() {
                 self.drop_unclaimed_extras(row, 0..self.storage.cols);
+                self.fill_bce_rgb_unprotected(row, 0..self.storage.cols);
             }
         } else {
             self.storage.extras.clear_rows(range.clone());
@@ -471,7 +505,6 @@ impl Grid {
                 aterm_log::warn!("scrollback clear failed: {e}");
             }
             self.storage.lazy_buffer.clear();
-            self.storage.generations.evict_all();
             self.storage.ring_extras.clear();
             self.storage.display_offset = 0;
             self.storage.mark_content_full();
@@ -512,7 +545,6 @@ impl Grid {
             aterm_log::warn!("scrollback clear failed: {e}");
         }
         self.storage.lazy_buffer.clear();
-        self.storage.generations.evict_all();
         self.storage.ring_extras.clear();
         // Extras are keyed by visible row, and the visible rows stay put.
         self.storage.mark_content_full();
@@ -908,19 +940,10 @@ impl Grid {
         toggle: super::CellFlags,
         toggle_underline: bool,
     ) -> super::CellFlags {
-        // Every bit any underline style can occupy, spelled out because
-        // `CellFlags::ALL_UNDERLINES` exists only under the `alacritty-compat`
-        // feature, which this crate's own test build lacks.
-        const UNDERLINE_BITS: super::CellFlags = super::CellFlags::from_bits(
-            super::CellFlags::UNDERLINE.bits()
-                | super::CellFlags::DOUBLE_UNDERLINE.bits()
-                | super::CellFlags::CURLY_UNDERLINE.bits(),
-        );
-
         let mut flags = super::CellFlags::from_bits(flags.bits() ^ toggle.bits());
         if toggle_underline {
-            if flags.intersects(UNDERLINE_BITS) {
-                flags = flags.difference(UNDERLINE_BITS);
+            if flags.intersects(super::CellFlags::ALL_UNDERLINES) {
+                flags = flags.difference(super::CellFlags::ALL_UNDERLINES);
             } else {
                 flags = flags.union(super::CellFlags::UNDERLINE);
             }
@@ -1088,12 +1111,12 @@ impl Grid {
                 if let Some(extra) = self.storage.extras.get(coord) {
                     extras_buf.push((row_offset, col_offset, extra.clone()));
                 }
-                let fg = if cell.fg_needs_overflow() && !cell.uses_style_id() {
+                let fg = if cell.fg_needs_overflow() {
                     self.storage.extras.fg_rgb_for(src_row, src_col)
                 } else {
                     None
                 };
-                let bg = if cell.bg_needs_overflow() && !cell.uses_style_id() {
+                let bg = if cell.bg_needs_overflow() {
                     self.storage.extras.bg_rgb_for(src_row, src_col)
                 } else {
                     None
@@ -1286,15 +1309,6 @@ mod tests {
         );
     }
 
-    /// Helper: protect every cell of the given rows (DECSCA 1 content).
-    fn protect_rows(grid: &mut Grid, rows: core::ops::Range<u16>, cols: u16) {
-        for row in rows {
-            for col in 0..cols {
-                protect_cell(grid, row, col);
-            }
-        }
-    }
-
     /// Helper: after an erase reset the wrap, the next printable must overwrite
     /// the parked last column of `row` — not wrap to the next row.
     fn assert_next_glyph_overwrites_last_col(grid: &mut Grid, row: u16, cols: u16) {
@@ -1308,66 +1322,334 @@ mod tests {
         assert!(grid.pending_wrap(), "the new glyph re-arms the wrap");
     }
 
-    // erase_to_end_of_line (EL 0)
+    #[derive(Clone, Copy, Debug)]
+    enum Erase {
+        El0,
+        El1,
+        El2,
+        Ed0,
+        Ed1,
+        Ed2,
+        Ed3,
+        Sel0,
+        Sel1,
+        Sel2,
+        Sed0,
+        Sed1,
+        Sed2,
+    }
 
-    #[test]
-    fn test_el0_erases_from_cursor_to_end() {
-        let mut grid = Grid::new(4, 10);
-        fill_row(&mut grid, 0, 10);
-        grid.move_cursor_to(0, 5);
-        grid.erase_to_end_of_line();
+    impl Erase {
+        const DISPLAY_AND_LINE: [Self; 12] = [
+            Self::El0,
+            Self::El1,
+            Self::El2,
+            Self::Ed0,
+            Self::Ed1,
+            Self::Ed2,
+            Self::Sel0,
+            Self::Sel1,
+            Self::Sel2,
+            Self::Sed0,
+            Self::Sed1,
+            Self::Sed2,
+        ];
 
-        for col in 0..5 {
-            assert!(!is_empty_at(&grid, 0, col), "col {col} should be preserved");
+        fn apply(self, grid: &mut Grid) {
+            match self {
+                Self::El0 => grid.erase_to_end_of_line(),
+                Self::El1 => grid.erase_from_start_of_line(),
+                Self::El2 => grid.erase_line(),
+                Self::Ed0 => grid.erase_to_end_of_screen(),
+                Self::Ed1 => grid.erase_from_start_of_screen(),
+                Self::Ed2 => grid.erase_screen(),
+                Self::Ed3 => grid.erase_scrollback(),
+                Self::Sel0 => grid.selective_erase_to_end_of_line(),
+                Self::Sel1 => grid.selective_erase_from_start_of_line(),
+                Self::Sel2 => grid.selective_erase_line(),
+                Self::Sed0 => grid.selective_erase_to_end_of_screen(),
+                Self::Sed1 => grid.selective_erase_from_start_of_screen(),
+                Self::Sed2 => grid.selective_erase_screen(),
+            }
         }
-        for col in 5..10 {
-            assert_eq!(char_at(&grid, 0, col), ' ', "col {col} should be erased");
+
+        /// Whether the erase reaches `(row, col)` with the cursor at
+        /// `(cr, cc)`: the cursor cell is always inclusive.
+        fn covers(self, (cr, cc): (u16, u16), (row, col): (u16, u16)) -> bool {
+            match self {
+                Self::El0 | Self::Sel0 => row == cr && col >= cc,
+                Self::El1 | Self::Sel1 => row == cr && col <= cc,
+                Self::El2 | Self::Sel2 => row == cr,
+                Self::Ed0 | Self::Sed0 => row > cr || (row == cr && col >= cc),
+                Self::Ed1 | Self::Sed1 => row < cr || (row == cr && col <= cc),
+                Self::Ed2 | Self::Sed2 => true,
+                Self::Ed3 => false,
+            }
+        }
+
+        fn selective(self) -> bool {
+            matches!(
+                self,
+                Self::Sel0 | Self::Sel1 | Self::Sel2 | Self::Sed0 | Self::Sed1 | Self::Sed2
+            )
         }
     }
 
-    #[test]
-    fn test_el0_cursor_at_column_zero_erases_entire_line() {
-        let mut grid = Grid::new(4, 10);
-        fill_row(&mut grid, 0, 10);
-        grid.move_cursor_to(0, 0);
-        grid.erase_to_end_of_line();
+    /// Run `op` on a filled `size` grid with the cursor at `cursor` (parked
+    /// there by a real deferred wrap when `armed`) and `protected` cells, then
+    /// check every cell: erased exactly where the op reaches, minus protected
+    /// cells for the selective ops. Returns the grid for the wrap checks.
+    fn erase_and_check(
+        op: Erase,
+        size: (u16, u16),
+        cursor: (u16, u16),
+        armed: bool,
+        protected: &[(u16, u16)],
+    ) -> Grid {
+        let (rows, cols) = size;
+        let mut grid = Grid::new(rows, cols);
+        fill_grid(&mut grid, rows, cols);
+        if armed {
+            assert_eq!(cursor.1, cols - 1, "a wrap parks on the last column");
+            arm_wrap_on_row(&mut grid, cursor.0, cols);
+        } else {
+            grid.move_cursor_to(cursor.0, cursor.1);
+        }
+        for &(row, col) in protected {
+            protect_cell(&mut grid, row, col);
+        }
+        op.apply(&mut grid);
+        grid.assert_invariants();
+        for row in 0..rows {
+            for col in 0..cols {
+                let erased = op.covers(cursor, (row, col))
+                    && !(op.selective() && protected.contains(&(row, col)));
+                let want = if erased {
+                    ' '
+                } else {
+                    (b'A' + (col % 26) as u8) as char
+                };
+                assert_eq!(
+                    char_at(&grid, row, col),
+                    want,
+                    "{op:?} at {cursor:?} (armed {armed}, protected {protected:?}): ({row}, {col})"
+                );
+            }
+        }
+        grid
+    }
 
-        for col in 0..10 {
-            assert_eq!(char_at(&grid, 0, col), ' ', "col {col} should be erased");
+    /// EVERY EL/ED/DECSEL/DECSED ERASES EXACTLY ITS SPAN: from the cursor
+    /// (inclusive) to the end, from the start, or the whole line or screen,
+    /// leaving every other row alone, and the selective forms skip DECSCA
+    /// protected cells — at every cursor corner and on a 1x1 grid.
+    #[test]
+    fn every_erase_clears_exactly_its_span() {
+        const PROTECTED: &[(u16, u16)] = &[(0, 1), (1, 3), (1, 6), (2, 0), (2, 8), (3, 4), (3, 9)];
+        for op in Erase::DISPLAY_AND_LINE {
+            let protected = if op.selective() { PROTECTED } else { &[] };
+            for cursor in [(0, 0), (1, 5), (2, 4), (3, 9)] {
+                erase_and_check(op, (4, 10), cursor, false, protected);
+            }
+            erase_and_check(op, (1, 1), (0, 0), false, &[]);
+            erase_and_check(op, (1, 10), (0, 5), false, &[]);
         }
     }
 
+    /// THE DEFERRED WRAP FOLLOWS XTERM'S util.c. Every EL/ED resets it (ED 3
+    /// touches only history and keeps it); DECSEL 0 / DECSED 0 away from the
+    /// origin end in `ClearRight`'s unconditional `ResetWrap`, even over a
+    /// protected parked glyph; DECSEL 1/2 and DECSED 1/2 reach `ResetWrap`
+    /// through `ClearInLine2` only when their span holds an unprotected cell;
+    /// and at the origin (DECSED 0) or bottom-right (DECSED 1) xterm reduces to
+    /// the DECSED 2 loop. After a reset the next glyph overwrites the parked
+    /// column instead of wrapping (Ghostty's "eraseLine resets pending wrap").
     #[test]
-    fn test_el0_cursor_at_last_column() {
-        let mut grid = Grid::new(4, 10);
-        fill_row(&mut grid, 0, 10);
-        grid.move_cursor_to(0, 9);
-        grid.erase_to_end_of_line();
-
-        for col in 0..9 {
-            assert!(!is_empty_at(&grid, 0, col), "col {col} should be preserved");
+    fn erases_reset_the_pending_wrap_as_xterm_does() {
+        const ROW_0: &[(u16, u16)] = &[(0, 0), (0, 1), (0, 2), (0, 3), (0, 4)];
+        const ROWS_0_1: &[(u16, u16)] = &[
+            (0, 0),
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (0, 4),
+            (1, 0),
+            (1, 1),
+            (1, 2),
+            (1, 3),
+            (1, 4),
+        ];
+        let screen = |rows: u16, cols: u16| -> Vec<(u16, u16)> {
+            (0..rows)
+                .flat_map(|r| (0..cols).map(move |c| (r, c)))
+                .collect()
+        };
+        use Erase::*;
+        #[expect(clippy::type_complexity, reason = "a test's case table")]
+        let cases: Vec<(Erase, (u16, u16), u16, Vec<(u16, u16)>, bool)> = vec![
+            (El0, (4, 5), 0, vec![], false),
+            (El1, (4, 5), 0, vec![], false),
+            (El2, (4, 5), 0, vec![], false),
+            (Ed0, (4, 5), 0, vec![], false),
+            (Ed0, (3, 1), 0, vec![], false),
+            (Ed1, (4, 5), 1, vec![], false),
+            (Ed1, (3, 5), 2, vec![], false),
+            (Ed2, (4, 5), 1, vec![], false),
+            (Ed3, (4, 5), 1, vec![], true),
+            (Sel0, (4, 5), 0, vec![], false),
+            (Sel0, (4, 5), 0, vec![(0, 4)], false),
+            (Sel1, (4, 5), 0, vec![], false),
+            (Sel1, (4, 5), 0, ROW_0.to_vec(), true),
+            (Sel1, (4, 5), 0, vec![(0, 0), (0, 1), (0, 3), (0, 4)], false),
+            (Sel2, (4, 5), 0, vec![(0, 4)], false),
+            (Sel2, (4, 5), 0, ROW_0.to_vec(), true),
+            (Sed0, (4, 5), 1, vec![], false),
+            (Sed0, (4, 5), 1, vec![(1, 4)], false),
+            (Sed0, (3, 1), 0, screen(3, 1), true),
+            (Sed0, (3, 1), 0, vec![(0, 0), (1, 0)], false),
+            (Sed1, (4, 5), 1, vec![], false),
+            (Sed1, (4, 5), 1, ROWS_0_1.to_vec(), true),
+            (Sed1, (2, 3), 1, screen(2, 3), true),
+            (Sed2, (4, 5), 1, vec![(1, 4)], false),
+            (Sed2, (3, 4), 1, screen(3, 4), true),
+        ];
+        for (op, size, row, protected, keeps_wrap) in cases {
+            let cursor = (row, size.1 - 1);
+            let mut grid = erase_and_check(op, size, cursor, true, &protected);
+            assert_eq!(
+                grid.pending_wrap(),
+                keeps_wrap,
+                "{op:?} on {size:?} row {row}, protected {protected:?}"
+            );
+            if !keeps_wrap {
+                assert_next_glyph_overwrites_last_col(&mut grid, row, size.1);
+            }
         }
-        assert_eq!(char_at(&grid, 0, 9), ' ', "last col should be erased");
     }
 
+    /// DECALN fills the whole screen with default-attribute 'E's over whatever
+    /// was there, homes the cursor, resets the scroll region, clears the
+    /// pending wrap and returns every row to single width.
     #[test]
-    fn test_el0_at_pending_wrap_clears_parked_glyph_and_wrap() {
-        // xterm util.c `ClearRight` clears from `cur_col` inclusive (the parked
-        // last column) and ends with `ResetWrap`.
-        let mut grid = Grid::new(4, 5);
-        arm_wrap_on_row(&mut grid, 0, 5);
-        grid.erase_to_end_of_line();
-        assert_eq!(char_at(&grid, 0, 4), ' ', "the parked glyph is erased");
+    fn decaln_fills_the_screen_and_resets_the_cursor_state() {
+        for (rows, cols) in [(4, 10), (1, 1)] {
+            let mut grid = Grid::new(rows, cols);
+            fill_grid(&mut grid, rows, cols);
+            if rows > 2 {
+                grid.set_scroll_region(1, rows - 2);
+            }
+            if let Some(r) = grid.row_mut(0) {
+                r.set_line_size(crate::LineSize::DoubleWidth);
+            }
+            grid.mark_has_double_width();
+            grid.move_cursor_to(rows - 1, cols - 1);
+            grid.set_pending_wrap(true);
+
+            grid.screen_alignment_pattern();
+
+            for row in 0..rows {
+                for col in 0..cols {
+                    let cell = grid.cell(row, col).expect("cell");
+                    assert_eq!(cell.char(), 'E', "({row}, {col})");
+                    assert!(cell.flags().is_empty(), "({row}, {col})");
+                }
+            }
+            assert_eq!((grid.cursor_row(), grid.cursor_col()), (0, 0));
+            let region = grid.scroll_region();
+            assert_eq!((region.top, region.bottom), (0, rows - 1));
+            assert!(!grid.pending_wrap());
+            assert!(!grid.storage.any_double_width);
+        }
+    }
+
+    /// DECERA, DECSERA, DECFRA and DECCARA touch exactly their rectangle,
+    /// clamped to the grid; an inverted rectangle is a no-op; DECSERA alone
+    /// skips protected cells; and none of them (nor DECCRA) consumes the
+    /// pending wrap.
+    #[test]
+    fn rect_ops_touch_exactly_their_rectangle() {
+        type Rect = (u16, u16, u16, u16);
+        const PROTECTED: &[(u16, u16)] = &[(1, 3), (2, 4)];
+        #[expect(clippy::type_complexity, reason = "a test's case table")]
+        let ops: [(&str, fn(&mut Grid, Rect)); 5] = [
+            ("DECERA", |g, (t, l, b, r)| g.erase_rect(t, l, b, r)),
+            ("DECSERA", |g, (t, l, b, r)| {
+                g.selective_erase_rect(t, l, b, r)
+            }),
+            ("DECFRA", |g, (t, l, b, r)| {
+                g.fill_rect(crate::Cell::from_ascii_fast(b'X'), t, l, b, r, None, None);
+            }),
+            ("DECCARA set", |g, (t, l, b, r)| {
+                g.change_attrs_rect(t, l, b, r, CellFlags::BOLD, CellFlags::empty());
+            }),
+            ("DECCARA clear", |g, (t, l, b, r)| {
+                g.change_attrs_rect(0, 0, 3, 9, CellFlags::BOLD, CellFlags::empty());
+                g.change_attrs_rect(t, l, b, r, CellFlags::empty(), CellFlags::BOLD);
+            }),
+        ];
+        for rect in [
+            (1, 2, 2, 5),
+            (2, 3, 2, 3),
+            (2, 8, 100, 100),
+            (0, 0, 3, 9),
+            (3, 5, 1, 2),
+        ] {
+            let (top, left, bottom, right) = rect;
+            let inside =
+                |r: u16, c: u16| (top..=bottom).contains(&r) && (left..=right).contains(&c);
+            for (name, op) in ops {
+                let mut grid = Grid::new(4, 10);
+                fill_grid(&mut grid, 4, 10);
+                for &(row, col) in PROTECTED {
+                    protect_cell(&mut grid, row, col);
+                }
+                grid.set_pending_wrap(true);
+                op(&mut grid, rect);
+                assert!(grid.pending_wrap(), "{name} {rect:?} consumed the wrap");
+                for row in 0..4 {
+                    for col in 0..10 {
+                        let original = (b'A' + col as u8) as char;
+                        let hit = inside(row, col);
+                        let at = format!("{name} {rect:?} at ({row}, {col})");
+                        let cell = grid.cell(row, col).expect("cell");
+                        match name {
+                            "DECERA" => {
+                                assert_eq!(cell.char(), if hit { ' ' } else { original }, "{at}");
+                            }
+                            "DECSERA" => {
+                                let erased = hit && !PROTECTED.contains(&(row, col));
+                                assert_eq!(
+                                    cell.char(),
+                                    if erased { ' ' } else { original },
+                                    "{at}"
+                                );
+                            }
+                            "DECFRA" => {
+                                assert_eq!(cell.char(), if hit { 'X' } else { original }, "{at}");
+                            }
+                            "DECCARA set" => {
+                                assert_eq!(cell.flags().contains(CellFlags::BOLD), hit, "{at}");
+                            }
+                            _ => {
+                                assert_eq!(cell.flags().contains(CellFlags::BOLD), !hit, "{at}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut grid = Grid::new(4, 10);
+        fill_grid(&mut grid, 4, 10);
+        grid.set_pending_wrap(true);
+        grid.copy_rect(3, 5, 1, 2, 2, 0);
         assert_eq!(
-            char_at(&grid, 0, 3),
-            'D',
-            "cells left of the cursor survive"
+            char_at(&grid, 2, 0),
+            'A',
+            "an inverted DECCRA source copies nothing"
         );
-        assert!(!grid.pending_wrap(), "EL 0 resets the deferred wrap");
-        // Ghostty golden 'eraseLine resets pending wrap': ABCDE, EL 0, B -> ABCDB.
-        assert_next_glyph_overwrites_last_col(&mut grid, 0, 5);
-        assert_eq!(char_at(&grid, 0, 3), 'D');
-        assert!(is_empty_at(&grid, 1, 0), "row 1 untouched");
+        grid.copy_rect(0, 0, 0, 4, 1, 0);
+        assert!(grid.pending_wrap(), "DECCRA consumed the wrap");
     }
 
     #[test]
@@ -1404,22 +1686,6 @@ mod tests {
         }
         assert_eq!(char_at(&grid, 0, 2), 'C', "cells left of the glyph survive");
         assert!(!grid.pending_wrap(), "EL 0 resets the deferred wrap");
-    }
-
-    #[test]
-    fn test_el0_does_not_affect_other_rows() {
-        let mut grid = Grid::new(4, 10);
-        fill_row(&mut grid, 0, 10);
-        fill_row(&mut grid, 1, 10);
-        grid.move_cursor_to(0, 5);
-        grid.erase_to_end_of_line();
-
-        for col in 0..10 {
-            assert!(
-                !is_empty_at(&grid, 1, col),
-                "row 1 col {col} should be preserved"
-            );
-        }
     }
 
     #[test]
@@ -1471,363 +1737,6 @@ mod tests {
         grid.erase_to_end_of_line();
     }
 
-    // erase_from_start_of_line (EL 1)
-
-    #[test]
-    fn test_el1_erases_from_start_to_cursor() {
-        let mut grid = Grid::new(4, 10);
-        fill_row(&mut grid, 0, 10);
-        grid.move_cursor_to(0, 4);
-        grid.erase_from_start_of_line();
-
-        for col in 0..=4 {
-            assert_eq!(char_at(&grid, 0, col), ' ', "col {col} should be erased");
-        }
-        for col in 5..10 {
-            assert!(!is_empty_at(&grid, 0, col), "col {col} should be preserved");
-        }
-    }
-
-    #[test]
-    fn test_el1_cursor_at_last_column_erases_entire_line() {
-        let mut grid = Grid::new(4, 10);
-        fill_row(&mut grid, 0, 10);
-        grid.move_cursor_to(0, 9);
-        grid.erase_from_start_of_line();
-
-        for col in 0..10 {
-            assert_eq!(char_at(&grid, 0, col), ' ', "col {col} should be erased");
-        }
-    }
-
-    #[test]
-    fn test_el1_cursor_at_column_zero() {
-        let mut grid = Grid::new(4, 10);
-        fill_row(&mut grid, 0, 10);
-        grid.move_cursor_to(0, 0);
-        grid.erase_from_start_of_line();
-
-        assert_eq!(char_at(&grid, 0, 0), ' ', "col 0 should be erased");
-        for col in 1..10 {
-            assert!(!is_empty_at(&grid, 0, col), "col {col} should be preserved");
-        }
-    }
-
-    #[test]
-    fn test_el1_clears_pending_wrap() {
-        // xterm util.c `ClearLeft` -> `ClearInLine` -> `ClearInLine2`, which calls
-        // `ResetWrap`.
-        let mut grid = Grid::new(4, 5);
-        arm_wrap_on_row(&mut grid, 0, 5);
-        grid.erase_from_start_of_line();
-        for col in 0..5 {
-            assert_eq!(char_at(&grid, 0, col), ' ', "col {col} erased");
-        }
-        assert!(!grid.pending_wrap(), "EL 1 resets the deferred wrap");
-        // Ghostty golden 'eraseLine left resets wrap': ABCDE, EL 1, B -> '    B'.
-        assert_next_glyph_overwrites_last_col(&mut grid, 0, 5);
-        assert!(is_empty_at(&grid, 1, 0), "nothing wrapped to row 1");
-    }
-
-    // erase_line (EL 2)
-
-    #[test]
-    fn test_el2_erases_entire_line() {
-        let mut grid = Grid::new(4, 10);
-        fill_row(&mut grid, 0, 10);
-        grid.move_cursor_to(0, 5);
-        grid.erase_line();
-
-        for col in 0..10 {
-            assert_eq!(char_at(&grid, 0, col), ' ', "col {col} should be erased");
-        }
-    }
-
-    #[test]
-    fn test_el2_does_not_affect_other_rows() {
-        let mut grid = Grid::new(4, 10);
-        fill_grid(&mut grid, 4, 10);
-        grid.move_cursor_to(1, 3);
-        grid.erase_line();
-
-        // Row 0 and 2 should be intact.
-        assert!(!is_empty_at(&grid, 0, 0));
-        assert!(!is_empty_at(&grid, 2, 0));
-        // Row 1 should be erased.
-        for col in 0..10 {
-            assert_eq!(
-                char_at(&grid, 1, col),
-                ' ',
-                "row 1 col {col} should be erased"
-            );
-        }
-    }
-
-    #[test]
-    fn test_el2_clears_pending_wrap() {
-        // xterm util.c `ClearLine` -> `ClearInLine` -> `ClearInLine2`, which calls
-        // `ResetWrap`.
-        let mut grid = Grid::new(4, 5);
-        arm_wrap_on_row(&mut grid, 0, 5);
-        grid.erase_line();
-        for col in 0..5 {
-            assert_eq!(char_at(&grid, 0, col), ' ', "col {col} erased");
-        }
-        assert!(!grid.pending_wrap(), "EL 2 resets the deferred wrap");
-        assert_next_glyph_overwrites_last_col(&mut grid, 0, 5);
-        assert!(is_empty_at(&grid, 1, 0), "nothing wrapped to row 1");
-    }
-
-    #[test]
-    fn test_el2_at_pending_wrap_leaves_the_row_below_intact() {
-        // xterm util.c `ClearLine` spans the cursor row only. The test above
-        // cannot see an over-clear of the row below (that row starts empty), so
-        // this one gives row 1 content before arming the wrap on row 0.
-        let mut grid = Grid::new(4, 5);
-        fill_row(&mut grid, 1, 5);
-        arm_wrap_on_row(&mut grid, 0, 5);
-        grid.erase_line();
-        for col in 0..5 {
-            assert_eq!(char_at(&grid, 0, col), ' ', "row 0 col {col} erased");
-            assert_eq!(
-                char_at(&grid, 1, col),
-                (b'A' + col as u8) as char,
-                "row 1 col {col} survives EL 2 on row 0"
-            );
-        }
-        assert!(!grid.pending_wrap(), "EL 2 resets the deferred wrap");
-    }
-
-    // erase_to_end_of_screen (ED 0)
-
-    #[test]
-    fn test_ed0_erases_from_cursor_to_end_of_screen() {
-        let mut grid = Grid::new(4, 10);
-        fill_grid(&mut grid, 4, 10);
-        grid.move_cursor_to(1, 5);
-        grid.erase_to_end_of_screen();
-
-        for col in 0..10 {
-            assert!(
-                !is_empty_at(&grid, 0, col),
-                "row 0 col {col} should be preserved"
-            );
-        }
-        for col in 0..5 {
-            assert!(
-                !is_empty_at(&grid, 1, col),
-                "row 1 col {col} should be preserved"
-            );
-        }
-        for col in 5..10 {
-            assert_eq!(
-                char_at(&grid, 1, col),
-                ' ',
-                "row 1 col {col} should be erased"
-            );
-        }
-        for row in 2..4 {
-            for col in 0..10 {
-                assert_eq!(
-                    char_at(&grid, row, col),
-                    ' ',
-                    "row {row} col {col} should be erased"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_ed0_cursor_at_top_left_erases_everything() {
-        let mut grid = Grid::new(4, 10);
-        fill_grid(&mut grid, 4, 10);
-        grid.move_cursor_to(0, 0);
-        grid.erase_to_end_of_screen();
-
-        for row in 0..4 {
-            for col in 0..10 {
-                assert_eq!(
-                    char_at(&grid, row, col),
-                    ' ',
-                    "({row},{col}) should be erased"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_ed0_cursor_at_last_row_last_col() {
-        let mut grid = Grid::new(4, 10);
-        fill_grid(&mut grid, 4, 10);
-        grid.move_cursor_to(3, 9);
-        grid.erase_to_end_of_screen();
-
-        // Only cell (3,9) should be erased.
-        assert!(!is_empty_at(&grid, 3, 8));
-        assert_eq!(char_at(&grid, 3, 9), ' ');
-    }
-
-    #[test]
-    fn test_ed0_at_pending_wrap_clears_parked_glyph_and_wrap() {
-        // xterm util.c `ClearBelow` starts with `ClearRight(xw, -1)`: the cursor
-        // row is cleared from the parked column inclusive, and the wrap resets.
-        let mut grid = Grid::new(4, 5);
-        fill_row(&mut grid, 1, 5);
-        arm_wrap_on_row(&mut grid, 0, 5);
-        grid.erase_to_end_of_screen();
-        assert_eq!(char_at(&grid, 0, 4), ' ', "the parked glyph is erased");
-        assert_eq!(
-            char_at(&grid, 0, 3),
-            'D',
-            "cells left of the cursor survive"
-        );
-        for col in 0..5 {
-            assert!(is_empty_at(&grid, 1, col), "row 1 col {col} erased");
-        }
-        assert!(!grid.pending_wrap(), "ED 0 resets the deferred wrap");
-        assert_next_glyph_overwrites_last_col(&mut grid, 0, 5);
-        assert!(is_empty_at(&grid, 1, 0), "nothing wrapped to row 1");
-    }
-
-    #[test]
-    fn test_ed0_one_column_grid_pending_wrap_at_origin_clears_screen_and_wrap() {
-        // A wrap pending at (0,0) needs a one-column line. xterm reduces ED 0 at
-        // the origin to ED 2 (`ClearScreen` -> `ResetWrap`); clearing from (0,0)
-        // is the same cell set.
-        let mut grid = Grid::new(3, 1);
-        for row in 1..3 {
-            grid.move_cursor_to(row, 0);
-            grid.write_char('x');
-        }
-        grid.move_cursor_to(0, 0);
-        grid.write_char_wrap('A');
-        assert!(
-            grid.pending_wrap(),
-            "precondition: 1-col line arms the wrap"
-        );
-        assert_eq!((grid.cursor_row(), grid.cursor_col()), (0, 0));
-        grid.erase_to_end_of_screen();
-        for row in 0..3 {
-            assert!(is_empty_at(&grid, row, 0), "row {row} erased");
-        }
-        assert!(!grid.pending_wrap(), "ED 0 at the origin resets the wrap");
-    }
-
-    // erase_from_start_of_screen (ED 1)
-
-    #[test]
-    fn test_ed1_erases_from_start_of_screen_to_cursor() {
-        let mut grid = Grid::new(4, 10);
-        fill_grid(&mut grid, 4, 10);
-        grid.move_cursor_to(2, 4);
-        grid.erase_from_start_of_screen();
-
-        for row in 0..2 {
-            for col in 0..10 {
-                assert_eq!(
-                    char_at(&grid, row, col),
-                    ' ',
-                    "({row},{col}) should be erased"
-                );
-            }
-        }
-        for col in 0..=4 {
-            assert_eq!(
-                char_at(&grid, 2, col),
-                ' ',
-                "row 2 col {col} should be erased"
-            );
-        }
-        for col in 5..10 {
-            assert!(
-                !is_empty_at(&grid, 2, col),
-                "row 2 col {col} should be preserved"
-            );
-        }
-        for col in 0..10 {
-            assert!(
-                !is_empty_at(&grid, 3, col),
-                "row 3 col {col} should be preserved"
-            );
-        }
-    }
-
-    #[test]
-    fn test_ed1_cursor_at_bottom_right_erases_everything() {
-        let mut grid = Grid::new(4, 10);
-        fill_grid(&mut grid, 4, 10);
-        grid.move_cursor_to(3, 9);
-        grid.erase_from_start_of_screen();
-
-        for row in 0..4 {
-            for col in 0..10 {
-                assert_eq!(
-                    char_at(&grid, row, col),
-                    ' ',
-                    "({row},{col}) should be erased"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_ed1_clears_pending_wrap() {
-        // xterm util.c `ClearAbove` ends with `ClearLeft` -> `ClearInLine2`
-        // `ResetWrap`.
-        let mut grid = Grid::new(4, 5);
-        fill_row(&mut grid, 0, 5);
-        fill_row(&mut grid, 2, 5);
-        arm_wrap_on_row(&mut grid, 1, 5);
-        grid.erase_from_start_of_screen();
-        for row in 0..2 {
-            for col in 0..5 {
-                assert!(is_empty_at(&grid, row, col), "({row},{col}) erased");
-            }
-        }
-        assert_eq!(char_at(&grid, 2, 0), 'A', "row below the cursor survives");
-        assert!(!grid.pending_wrap(), "ED 1 resets the deferred wrap");
-        assert_next_glyph_overwrites_last_col(&mut grid, 1, 5);
-        assert_eq!(char_at(&grid, 2, 0), 'A', "nothing wrapped onto row 2");
-    }
-
-    #[test]
-    fn test_ed1_bottom_right_pending_wrap_clears_screen_and_wrap() {
-        // A glyph printed into the last cell parks the cursor at bottom-right,
-        // where xterm reduces ED 1 to ED 2 (`ClearScreen` -> `ResetWrap`).
-        let mut grid = Grid::new(3, 5);
-        fill_row(&mut grid, 0, 5);
-        fill_row(&mut grid, 1, 5);
-        arm_wrap_on_row(&mut grid, 2, 5);
-        grid.erase_from_start_of_screen();
-        for row in 0..3 {
-            for col in 0..5 {
-                assert!(is_empty_at(&grid, row, col), "({row},{col}) erased");
-            }
-        }
-        assert!(!grid.pending_wrap(), "ED 1 at bottom-right resets the wrap");
-        assert_next_glyph_overwrites_last_col(&mut grid, 2, 5);
-    }
-
-    // erase_screen (ED 2)
-
-    #[test]
-    fn test_ed2_erases_entire_screen() {
-        let mut grid = Grid::new(4, 10);
-        fill_grid(&mut grid, 4, 10);
-        grid.move_cursor_to(2, 5);
-        grid.erase_screen();
-
-        for row in 0..4 {
-            for col in 0..10 {
-                assert_eq!(
-                    char_at(&grid, row, col),
-                    ' ',
-                    "({row},{col}) should be erased"
-                );
-            }
-        }
-    }
-
     #[test]
     fn test_ed2_resets_display_offset() {
         let mut grid = Grid::new(4, 10);
@@ -1842,710 +1751,134 @@ mod tests {
         assert_eq!(grid.display_offset(), 0);
     }
 
+    /// DECSEL/DECSED erase with the BCE background, as EL/ED do: xterm's
+    /// protected erases reach the same `ClearCells` (screen.c), which writes
+    /// the current colour pair over each unprotected segment, and Ghostty's
+    /// `clearUnprotectedCells` clears each run with its blank cell. A protected
+    /// cell keeps its glyph and its colours. Found by the astream-term
+    /// differential oracle (aterm-conformance `tests/vt_oracle`), which had the
+    /// selective erases leave a default-coloured hole where xterm paints.
     #[test]
-    fn test_ed2_clears_pending_wrap() {
-        // xterm util.c `ClearScreen` calls `ResetWrap`.
-        let mut grid = Grid::new(4, 5);
-        fill_row(&mut grid, 3, 5);
-        arm_wrap_on_row(&mut grid, 1, 5);
-        grid.erase_screen();
-        for row in 0..4 {
-            for col in 0..5 {
-                assert!(is_empty_at(&grid, row, col), "({row},{col}) erased");
+    fn selective_erases_fill_with_the_bce_background() {
+        use crate::{Cell, PackedColors};
+        let fill = Cell::bce_blank(PackedColors::with_indexed_bg(4));
+        // (what, cursor, the erase, cells it must blank)
+        type Case = (
+            &'static str,
+            (u16, u16),
+            fn(&mut Grid),
+            &'static [(u16, u16)],
+        );
+        let cases: [Case; 5] = [
+            (
+                "DECSEL 0",
+                (1, 2),
+                Grid::selective_erase_to_end_of_line,
+                &[(1, 2), (1, 4)],
+            ),
+            (
+                "DECSEL 1",
+                (1, 4),
+                Grid::selective_erase_from_start_of_line,
+                &[(1, 0), (1, 2), (1, 4)],
+            ),
+            (
+                "DECSEL 2",
+                (1, 0),
+                Grid::selective_erase_line,
+                &[(1, 0), (1, 4)],
+            ),
+            (
+                "DECSED 0",
+                (1, 2),
+                Grid::selective_erase_to_end_of_screen,
+                &[(1, 2), (1, 4), (2, 0)],
+            ),
+            (
+                "DECSED 2",
+                (0, 0),
+                Grid::selective_erase_screen,
+                &[(0, 0), (1, 4), (2, 4)],
+            ),
+        ];
+        for (what, (row, col), erase, erased) in cases {
+            let mut grid = Grid::new(3, 5);
+            fill_grid(&mut grid, 3, 5);
+            protect_cell(&mut grid, 1, 3);
+            grid.set_cursor_template(fill, None);
+            grid.move_cursor_to(row, col);
+            erase(&mut grid);
+            for &(r, c) in erased {
+                let cell = grid.cell(r, c).unwrap();
+                assert_eq!(cell.char(), ' ', "{what}: ({r},{c}) erased");
+                assert_eq!(
+                    cell.colors(),
+                    fill.colors(),
+                    "{what}: ({r},{c}) takes the BCE blank"
+                );
             }
+            let kept = grid.cell(1, 3).unwrap();
+            assert_ne!(
+                kept.char(),
+                ' ',
+                "{what}: the protected cell keeps its glyph"
+            );
+            assert_eq!(
+                kept.colors(),
+                PackedColors::DEFAULT,
+                "{what}: and its colours"
+            );
         }
-        assert!(!grid.pending_wrap(), "ED 2 resets the deferred wrap");
-        assert_next_glyph_overwrites_last_col(&mut grid, 1, 5);
-        assert!(is_empty_at(&grid, 2, 0), "nothing wrapped to row 2");
     }
 
-    // erase_scrollback (ED 3)
-
+    /// A BCE blank is content: a selective erase that paints past the old end
+    /// of a short row grows the row's length to the last coloured cell, so the
+    /// renderer draws the run (the non-selective erases' `len` rule).
     #[test]
-    fn test_erase_scrollback_no_scrollback() {
-        let mut grid = Grid::new(4, 10);
-        fill_grid(&mut grid, 4, 10);
-        // No scrollback was generated, total_lines == visible_rows.
-        grid.erase_scrollback();
-        assert_eq!(grid.display_offset(), 0);
-        assert_eq!(grid.total_lines(), 4);
-    }
-
-    #[test]
-    fn test_erase_scrollback_keeps_pending_wrap() {
-        // ED 3 touches only scrollback, not the active line — the wrap survives
-        // (xterm util.c `do_erase_display` case 3 never calls `ResetWrap`).
-        let mut grid = Grid::new(4, 5);
-        grid.set_pending_wrap(true);
-        assert!(grid.pending_wrap());
-        grid.erase_scrollback();
-        assert!(grid.pending_wrap());
-    }
-
-    // selective_erase_to_end_of_line (DECSEL 0)
-
-    #[test]
-    fn test_sel0_erases_unprotected_from_cursor_to_end() {
-        let mut grid = Grid::new(4, 10);
-        fill_row(&mut grid, 0, 10);
-
-        // Protect cells at columns 6 and 8.
-        protect_cell(&mut grid, 0, 6);
-        protect_cell(&mut grid, 0, 8);
-
-        grid.move_cursor_to(0, 5);
-        grid.selective_erase_to_end_of_line();
-
-        for col in 0..5 {
-            assert!(!is_empty_at(&grid, 0, col), "col {col} should be preserved");
-        }
-        // Col 5 erased (unprotected, at cursor).
-        assert_eq!(char_at(&grid, 0, 5), ' ');
-        // Col 6 protected -> preserved.
-        assert_ne!(
-            char_at(&grid, 0, 6),
-            ' ',
-            "col 6 is protected, should be preserved"
-        );
-        // Col 7 erased.
-        assert_eq!(char_at(&grid, 0, 7), ' ');
-        // Col 8 protected -> preserved.
-        assert_ne!(
-            char_at(&grid, 0, 8),
-            ' ',
-            "col 8 is protected, should be preserved"
-        );
-        // Col 9 erased.
-        assert_eq!(char_at(&grid, 0, 9), ' ');
-    }
-
-    #[test]
-    fn test_sel0_all_protected_nothing_erased() {
-        let mut grid = Grid::new(4, 5);
-        fill_row(&mut grid, 0, 5);
-        for col in 0..5 {
-            protect_cell(&mut grid, 0, col);
-        }
+    fn a_selective_bce_erase_counts_as_row_content() {
+        use crate::{Cell, PackedColors};
+        let mut grid = Grid::new(2, 8);
         grid.move_cursor_to(0, 0);
-        grid.selective_erase_to_end_of_line();
-
-        for col in 0..5 {
-            assert_ne!(char_at(&grid, 0, col), ' ', "col {col} is protected");
-        }
-    }
-
-    #[test]
-    fn test_sel0_clears_pending_wrap() {
-        // xterm `CASE_DECSEL` -> util.c `ClearRight`, which ends with `ResetWrap`.
-        let mut grid = Grid::new(4, 5);
-        arm_wrap_on_row(&mut grid, 0, 5);
-        grid.selective_erase_to_end_of_line();
-        assert_eq!(char_at(&grid, 0, 4), ' ', "unprotected parked glyph erased");
-        assert_eq!(char_at(&grid, 0, 3), 'D');
-        assert!(!grid.pending_wrap(), "DECSEL 0 resets the deferred wrap");
-        assert_next_glyph_overwrites_last_col(&mut grid, 0, 5);
-    }
-
-    #[test]
-    fn test_sel0_protected_parked_cell_survives_but_wrap_resets() {
-        // ClearRight's trailing `ResetWrap` ignores ClearInLine's protected-cell
-        // result, so the wrap resets even though nothing was erased.
-        let mut grid = Grid::new(4, 5);
-        arm_wrap_on_row(&mut grid, 0, 5);
-        protect_cell(&mut grid, 0, 4);
-        grid.selective_erase_to_end_of_line();
-        assert_eq!(char_at(&grid, 0, 4), 'E', "protected parked glyph survives");
-        assert!(!grid.pending_wrap(), "DECSEL 0 resets the wrap regardless");
-        assert_next_glyph_overwrites_last_col(&mut grid, 0, 5);
-    }
-
-    // selective_erase_from_start_of_line (DECSEL 1)
-
-    #[test]
-    fn test_sel1_erases_unprotected_from_start_to_cursor() {
-        let mut grid = Grid::new(4, 10);
-        fill_row(&mut grid, 0, 10);
-
-        // Protect cells at columns 1 and 3.
-        protect_cell(&mut grid, 0, 1);
-        protect_cell(&mut grid, 0, 3);
-
-        grid.move_cursor_to(0, 5);
-        grid.selective_erase_from_start_of_line();
-
-        // Col 0 erased.
-        assert_eq!(char_at(&grid, 0, 0), ' ');
-        // Col 1 protected -> preserved.
-        assert_ne!(char_at(&grid, 0, 1), ' ');
-        // Col 2 erased.
-        assert_eq!(char_at(&grid, 0, 2), ' ');
-        // Col 3 protected -> preserved.
-        assert_ne!(char_at(&grid, 0, 3), ' ');
-        // Col 4-5 erased (cursor inclusive).
-        assert_eq!(char_at(&grid, 0, 4), ' ');
-        assert_eq!(char_at(&grid, 0, 5), ' ');
-        for col in 6..10 {
-            assert!(!is_empty_at(&grid, 0, col), "col {col} should be preserved");
-        }
-    }
-
-    #[test]
-    fn test_sel1_clears_pending_wrap() {
-        // xterm `CASE_DECSEL` -> util.c `ClearLeft` -> `ClearInLine2` reaches
-        // `ResetWrap` over an unprotected span.
-        let mut grid = Grid::new(4, 5);
-        arm_wrap_on_row(&mut grid, 0, 5);
-        grid.selective_erase_from_start_of_line();
-        for col in 0..5 {
-            assert_eq!(char_at(&grid, 0, col), ' ', "col {col} erased");
-        }
-        assert!(!grid.pending_wrap(), "DECSEL 1 resets the deferred wrap");
-        assert_next_glyph_overwrites_last_col(&mut grid, 0, 5);
-    }
-
-    #[test]
-    fn test_sel1_all_protected_span_keeps_pending_wrap() {
-        // ClearInLine2 returns before `ResetWrap` when every cell of its span is
-        // protected.
-        let mut grid = Grid::new(4, 5);
-        arm_wrap_on_row(&mut grid, 0, 5);
-        protect_rows(&mut grid, 0..1, 5);
-        grid.selective_erase_from_start_of_line();
-        for col in 0..5 {
-            assert_ne!(char_at(&grid, 0, col), ' ', "protected col {col} kept");
-        }
-        assert!(grid.pending_wrap(), "an all-protected span keeps the wrap");
-    }
-
-    #[test]
-    fn test_sel1_one_unprotected_cell_resets_pending_wrap() {
-        let mut grid = Grid::new(4, 5);
-        arm_wrap_on_row(&mut grid, 0, 5);
-        for col in [0, 1, 3, 4] {
-            protect_cell(&mut grid, 0, col);
-        }
-        grid.selective_erase_from_start_of_line();
-        assert_eq!(
-            char_at(&grid, 0, 2),
-            ' ',
-            "the one unprotected cell is erased"
-        );
-        assert_eq!(char_at(&grid, 0, 4), 'E', "protected parked glyph kept");
-        assert!(
-            !grid.pending_wrap(),
-            "one unprotected cell in the span resets the wrap (recursive ClearInLine)"
-        );
-    }
-
-    // selective_erase_line (DECSEL 2)
-
-    #[test]
-    fn test_sel2_erases_unprotected_entire_line() {
-        let mut grid = Grid::new(4, 10);
-        fill_row(&mut grid, 0, 10);
-
-        // Protect columns 0, 5, 9.
-        protect_cell(&mut grid, 0, 0);
-        protect_cell(&mut grid, 0, 5);
-        protect_cell(&mut grid, 0, 9);
-
+        grid.write_char('a');
+        grid.set_cursor_template(Cell::bce_blank(PackedColors::with_indexed_bg(2)), None);
         grid.move_cursor_to(0, 3);
-        grid.selective_erase_line();
-
-        assert_ne!(char_at(&grid, 0, 0), ' ', "col 0 is protected");
-        assert_ne!(char_at(&grid, 0, 5), ' ', "col 5 is protected");
-        assert_ne!(char_at(&grid, 0, 9), ' ', "col 9 is protected");
-        for col in [1, 2, 3, 4, 6, 7, 8] {
-            assert_eq!(char_at(&grid, 0, col), ' ', "col {col} should be erased");
-        }
-    }
-
-    #[test]
-    fn test_sel2_clears_pending_wrap() {
-        // xterm `CASE_DECSEL` -> util.c `ClearLine` -> `ClearInLine2` reaches
-        // `ResetWrap` over an unprotected row.
-        let mut grid = Grid::new(4, 5);
-        arm_wrap_on_row(&mut grid, 0, 5);
-        protect_cell(&mut grid, 0, 4);
-        grid.selective_erase_line();
-        assert_eq!(char_at(&grid, 0, 0), ' ', "unprotected cells erased");
-        assert_eq!(char_at(&grid, 0, 4), 'E', "protected parked glyph kept");
-        assert!(!grid.pending_wrap(), "DECSEL 2 resets the deferred wrap");
-        assert_next_glyph_overwrites_last_col(&mut grid, 0, 5);
-    }
-
-    #[test]
-    fn test_sel2_all_protected_row_keeps_pending_wrap() {
-        let mut grid = Grid::new(4, 5);
-        fill_row(&mut grid, 1, 5);
-        arm_wrap_on_row(&mut grid, 0, 5);
-        protect_rows(&mut grid, 0..1, 5);
-        grid.selective_erase_line();
-        assert_eq!(char_at(&grid, 0, 0), 'A', "protected row kept");
-        assert!(grid.pending_wrap(), "a fully protected row keeps the wrap");
-    }
-
-    // selective_erase_to_end_of_screen (DECSED 0)
-
-    #[test]
-    fn test_decsed0_erases_unprotected_to_end_of_screen() {
-        let mut grid = Grid::new(3, 5);
-        fill_grid(&mut grid, 3, 5);
-
-        // Protect cell at row 1, col 3 and row 2, col 0.
-        protect_cell(&mut grid, 1, 3);
-        protect_cell(&mut grid, 2, 0);
-
-        grid.move_cursor_to(1, 2);
-        grid.selective_erase_to_end_of_screen();
-
-        for col in 0..5 {
-            assert!(!is_empty_at(&grid, 0, col), "row 0 col {col} preserved");
-        }
-        // Row 1, cols 0-1 preserved (before cursor).
-        assert!(!is_empty_at(&grid, 1, 0));
-        assert!(!is_empty_at(&grid, 1, 1));
-        // Row 1, col 2 erased (unprotected, at cursor).
-        assert_eq!(char_at(&grid, 1, 2), ' ');
-        // Row 1, col 3 protected -> preserved.
-        assert_ne!(char_at(&grid, 1, 3), ' ');
-        // Row 1, col 4 erased.
-        assert_eq!(char_at(&grid, 1, 4), ' ');
-        // Row 2, col 0 protected -> preserved.
-        assert_ne!(char_at(&grid, 2, 0), ' ');
-        for col in 1..5 {
-            assert_eq!(char_at(&grid, 2, col), ' ', "row 2 col {col} erased");
-        }
-    }
-
-    #[test]
-    fn test_decsed0_clears_pending_wrap() {
-        // xterm `CASE_DECSED` -> util.c `ClearBelow` -> `ClearRight`, whose
-        // trailing `ResetWrap` is unconditional.
-        let mut grid = Grid::new(4, 5);
-        fill_row(&mut grid, 2, 5);
-        arm_wrap_on_row(&mut grid, 1, 5);
-        grid.selective_erase_to_end_of_screen();
-        assert_eq!(char_at(&grid, 1, 4), ' ', "unprotected parked glyph erased");
-        assert!(is_empty_at(&grid, 2, 0), "row below erased");
-        assert!(!grid.pending_wrap(), "DECSED 0 resets the deferred wrap");
-        assert_next_glyph_overwrites_last_col(&mut grid, 1, 5);
-    }
-
-    #[test]
-    fn test_decsed0_protected_parked_cell_survives_but_wrap_resets() {
-        let mut grid = Grid::new(4, 5);
-        arm_wrap_on_row(&mut grid, 1, 5);
-        protect_cell(&mut grid, 1, 4);
-        grid.selective_erase_to_end_of_screen();
-        assert_eq!(char_at(&grid, 1, 4), 'E', "protected parked glyph survives");
-        assert!(!grid.pending_wrap(), "DECSED 0 away from the origin resets");
-    }
-
-    #[test]
-    fn test_decsed0_one_column_all_protected_at_origin_keeps_pending_wrap() {
-        // At the origin xterm reduces DECSED 0 to the DECSED 2 loop, whose
-        // `ClearInLine2` calls return before `ResetWrap` on protected rows.
-        let mut grid = Grid::new(3, 1);
-        for row in 1..3 {
-            grid.move_cursor_to(row, 0);
-            grid.write_char('x');
-        }
-        grid.move_cursor_to(0, 0);
-        grid.write_char_wrap('A');
-        assert!(
-            grid.pending_wrap(),
-            "precondition: wrap armed at the origin"
+        grid.selective_erase_to_end_of_line();
+        assert_eq!(
+            grid.row(0).unwrap().len(),
+            8,
+            "coloured through the last column"
         );
-        protect_rows(&mut grid, 0..3, 1);
-        grid.selective_erase_to_end_of_screen();
-        assert_eq!(char_at(&grid, 0, 0), 'A');
-        assert!(
-            grid.pending_wrap(),
-            "a fully protected screen keeps the wrap"
+        grid.set_cursor_template(Cell::EMPTY, None);
+        grid.move_cursor_to(0, 1);
+        grid.selective_erase_to_end_of_line();
+        assert_eq!(
+            grid.row(0).unwrap().len(),
+            1,
+            "a default erase shrinks it back to 'a'"
         );
     }
 
+    /// The truecolor half: the cleared cells carry only the RGB marker, so the
+    /// ring must hold their bytes; a protected cell's stay untouched.
     #[test]
-    fn test_decsed0_one_column_one_unprotected_cell_at_origin_resets_pending_wrap() {
-        let mut grid = Grid::new(3, 1);
-        for row in 1..3 {
-            grid.move_cursor_to(row, 0);
-            grid.write_char('x');
-        }
-        grid.move_cursor_to(0, 0);
-        grid.write_char_wrap('A');
-        assert!(
-            grid.pending_wrap(),
-            "precondition: wrap armed at the origin"
-        );
-        protect_rows(&mut grid, 0..2, 1);
-        grid.selective_erase_to_end_of_screen();
-        assert!(is_empty_at(&grid, 2, 0), "the unprotected cell is erased");
-        assert!(!grid.pending_wrap(), "one unprotected cell resets the wrap");
-    }
-
-    // selective_erase_from_start_of_screen (DECSED 1)
-
-    #[test]
-    fn test_decsed1_erases_unprotected_from_start_of_screen() {
-        let mut grid = Grid::new(3, 5);
-        fill_grid(&mut grid, 3, 5);
-
-        // Protect cell at row 0, col 2 and row 1, col 1.
-        protect_cell(&mut grid, 0, 2);
-        protect_cell(&mut grid, 1, 1);
-
-        grid.move_cursor_to(1, 3);
-        grid.selective_erase_from_start_of_screen();
-
-        // Row 0, col 2 protected.
-        assert_ne!(char_at(&grid, 0, 2), ' ');
-        // Row 0, other cols erased.
-        assert_eq!(char_at(&grid, 0, 0), ' ');
-        assert_eq!(char_at(&grid, 0, 1), ' ');
-        assert_eq!(char_at(&grid, 0, 3), ' ');
-        assert_eq!(char_at(&grid, 0, 4), ' ');
-        // Row 1, col 1 protected.
-        assert_ne!(char_at(&grid, 1, 1), ' ');
-        // Row 1, cols 0, 2, 3 erased (up to and including cursor).
-        assert_eq!(char_at(&grid, 1, 0), ' ');
-        assert_eq!(char_at(&grid, 1, 2), ' ');
-        assert_eq!(char_at(&grid, 1, 3), ' ');
-        // Row 1, col 4 preserved (after cursor).
-        assert!(!is_empty_at(&grid, 1, 4));
-        for col in 0..5 {
-            assert!(!is_empty_at(&grid, 2, col), "row 2 col {col} preserved");
-        }
-    }
-
-    #[test]
-    fn test_decsed1_clears_pending_wrap() {
-        // xterm `CASE_DECSED` -> util.c `ClearAbove` (protected branch) ->
-        // `ClearInLine2` reaches `ResetWrap` over unprotected spans.
-        let mut grid = Grid::new(4, 5);
-        fill_row(&mut grid, 0, 5);
-        arm_wrap_on_row(&mut grid, 1, 5);
-        grid.selective_erase_from_start_of_screen();
-        assert!(is_empty_at(&grid, 0, 0), "row above erased");
-        assert_eq!(char_at(&grid, 1, 4), ' ', "parked glyph erased");
-        assert!(!grid.pending_wrap(), "DECSED 1 resets the deferred wrap");
-        assert_next_glyph_overwrites_last_col(&mut grid, 1, 5);
-    }
-
-    #[test]
-    fn test_decsed1_all_protected_span_keeps_pending_wrap() {
-        // The span is the rows above plus [0, cursor_col] of the cursor row; an
-        // unprotected row below the cursor is outside it and must not count.
-        let mut grid = Grid::new(4, 5);
-        fill_row(&mut grid, 0, 5);
-        fill_row(&mut grid, 2, 5);
-        arm_wrap_on_row(&mut grid, 1, 5);
-        protect_rows(&mut grid, 0..2, 5);
-        grid.selective_erase_from_start_of_screen();
-        assert_eq!(char_at(&grid, 0, 0), 'A', "protected row above kept");
-        assert_eq!(char_at(&grid, 2, 0), 'A', "row below untouched");
-        assert!(grid.pending_wrap(), "an all-protected span keeps the wrap");
-    }
-
-    #[test]
-    fn test_decsed1_bottom_right_fully_protected_screen_keeps_pending_wrap() {
-        // At bottom-right xterm reduces DECSED 1 to the DECSED 2 loop.
-        let mut grid = Grid::new(2, 3);
-        fill_row(&mut grid, 0, 3);
-        arm_wrap_on_row(&mut grid, 1, 3);
-        protect_rows(&mut grid, 0..2, 3);
-        grid.selective_erase_from_start_of_screen();
-        assert_eq!(char_at(&grid, 1, 2), 'C', "protected parked glyph kept");
-        assert!(
-            grid.pending_wrap(),
-            "a fully protected screen keeps the wrap"
-        );
-    }
-
-    // selective_erase_screen (DECSED 2)
-
-    #[test]
-    fn test_decsed2_erases_unprotected_entire_screen() {
-        let mut grid = Grid::new(3, 5);
-        fill_grid(&mut grid, 3, 5);
-
-        // Protect one cell per row.
-        protect_cell(&mut grid, 0, 0);
-        protect_cell(&mut grid, 1, 2);
-        protect_cell(&mut grid, 2, 4);
-
-        grid.selective_erase_screen();
-
-        // Protected cells preserved.
-        assert_ne!(char_at(&grid, 0, 0), ' ');
-        assert_ne!(char_at(&grid, 1, 2), ' ');
-        assert_ne!(char_at(&grid, 2, 4), ' ');
-
-        // All other cells erased.
-        for col in 1..5 {
-            assert_eq!(char_at(&grid, 0, col), ' ', "row 0 col {col}");
-        }
-        for col in [0, 1, 3, 4] {
-            assert_eq!(char_at(&grid, 1, col), ' ', "row 1 col {col}");
-        }
-        for col in 0..4 {
-            assert_eq!(char_at(&grid, 2, col), ' ', "row 2 col {col}");
-        }
-    }
-
-    #[test]
-    fn test_decsed2_clears_pending_wrap() {
-        // xterm `CASE_DECSED` -> util.c `do_erase_display` case 2: the protected
-        // `ClearInLine` loop reaches `ResetWrap` on any unprotected row.
-        let mut grid = Grid::new(4, 5);
-        arm_wrap_on_row(&mut grid, 1, 5);
-        protect_cell(&mut grid, 1, 4);
-        grid.selective_erase_screen();
-        assert_eq!(char_at(&grid, 1, 4), 'E', "protected parked glyph kept");
-        assert_eq!(char_at(&grid, 1, 0), ' ', "unprotected cells erased");
-        assert!(!grid.pending_wrap(), "DECSED 2 resets the deferred wrap");
-        assert_next_glyph_overwrites_last_col(&mut grid, 1, 5);
-    }
-
-    #[test]
-    fn test_decsed2_fully_protected_screen_keeps_pending_wrap() {
-        let mut grid = Grid::new(3, 4);
-        fill_row(&mut grid, 0, 4);
-        fill_row(&mut grid, 2, 4);
-        arm_wrap_on_row(&mut grid, 1, 4);
-        protect_rows(&mut grid, 0..3, 4);
-        grid.selective_erase_screen();
-        assert_eq!(char_at(&grid, 1, 3), 'D', "protected parked glyph kept");
-        assert!(
-            grid.pending_wrap(),
-            "a fully protected screen keeps the wrap"
-        );
-    }
-
-    // screen_alignment_pattern (DECALN)
-
-    #[test]
-    fn test_decaln_fills_entire_screen_with_e() {
-        let mut grid = Grid::new(4, 10);
-        grid.screen_alignment_pattern();
-
-        for row in 0..4 {
-            for col in 0..10 {
-                assert_eq!(char_at(&grid, row, col), 'E', "({row},{col}) should be 'E'");
-            }
-        }
-    }
-
-    #[test]
-    fn test_decaln_resets_cursor_to_home() {
-        let mut grid = Grid::new(4, 10);
-        grid.move_cursor_to(3, 8);
-        grid.screen_alignment_pattern();
-
-        assert_eq!(grid.cursor_row(), 0, "cursor row should be 0 after DECALN");
-        assert_eq!(grid.cursor_col(), 0, "cursor col should be 0 after DECALN");
-    }
-
-    #[test]
-    fn test_decaln_resets_scroll_region() {
-        let mut grid = Grid::new(4, 10);
-        // The scroll_region should be full after DECALN.
-        grid.screen_alignment_pattern();
-
-        let sr = grid.scroll_region();
-        assert_eq!(sr.top, 0);
-        assert_eq!(sr.bottom, 3);
-    }
-
-    #[test]
-    fn test_decaln_overwrites_existing_content() {
-        let mut grid = Grid::new(4, 10);
-        fill_grid(&mut grid, 4, 10);
-
-        // Verify some cells are not 'E'.
-        assert_ne!(char_at(&grid, 0, 0), 'E');
-
-        grid.screen_alignment_pattern();
-
-        for row in 0..4 {
-            for col in 0..10 {
-                assert_eq!(char_at(&grid, row, col), 'E');
-            }
-        }
-    }
-
-    #[test]
-    fn test_decaln_clears_pending_wrap() {
-        let mut grid = Grid::new(4, 5);
-        grid.set_pending_wrap(true);
-        assert!(grid.pending_wrap());
-        grid.screen_alignment_pattern();
-        assert!(!grid.pending_wrap());
-    }
-
-    #[test]
-    fn test_decaln_cells_have_default_attributes() {
+    fn a_selective_erase_writes_the_truecolor_ring_for_the_cleared_cells_only() {
+        use crate::{Cell, PackedColor};
         let mut grid = Grid::new(2, 5);
-        grid.screen_alignment_pattern();
-
-        // Cells should have 'E' with default colors and no flags.
-        let cell = grid.cell(0, 0).unwrap();
-        assert_eq!(cell.char(), 'E');
-        assert!(cell.flags().is_empty(), "DECALN cells should have no flags");
-    }
-
-    /// DECALN clears the `any_double_width` flag after resetting all rows to
-    /// single-width.
-    #[test]
-    fn test_decaln_clears_any_double_width_flag() {
-        let mut grid = Grid::new(5, 40);
-        // Set a row to double-width via the row API, then mark the grid flag.
-        if let Some(r) = grid.row_mut(1) {
-            r.set_line_size(crate::LineSize::DoubleWidth);
+        fill_grid(&mut grid, 2, 5);
+        protect_cell(&mut grid, 0, 2);
+        let fill = Cell::bce_blank_from_bg(PackedColor::rgb(10, 20, 30));
+        grid.set_cursor_template(fill, Some([10, 20, 30]));
+        grid.move_cursor_to(0, 0);
+        grid.selective_erase_line();
+        for col in [0, 1, 3, 4] {
+            assert_eq!(grid.bg_rgb_at(0, col), Some([10, 20, 30]), "col {col}");
         }
-        grid.mark_has_double_width();
-        assert!(grid.storage.any_double_width);
-
-        // DECALN resets all rows to single-width.
-        grid.screen_alignment_pattern();
-        assert!(
-            !grid.storage.any_double_width,
-            "DECALN should clear any_double_width after resetting all rows"
+        assert_eq!(
+            grid.bg_rgb_at(0, 2),
+            None,
+            "the protected cell has no truecolor"
         );
-    }
-
-    // erase_rect (DECERA)
-
-    #[test]
-    fn test_erase_rect_clears_region() {
-        let mut grid = Grid::new(4, 10);
-        fill_grid(&mut grid, 4, 10);
-        grid.erase_rect(1, 2, 2, 5);
-
-        // Erased region: rows 1-2, cols 2-5.
-        for row in 1..=2 {
-            for col in 2..=5 {
-                assert_eq!(
-                    char_at(&grid, row, col),
-                    ' ',
-                    "({row},{col}) should be erased"
-                );
-            }
-        }
-        // Surrounding cells should be preserved.
-        assert!(!is_empty_at(&grid, 0, 2));
-        assert!(!is_empty_at(&grid, 3, 2));
-        assert!(!is_empty_at(&grid, 1, 1));
-        assert!(!is_empty_at(&grid, 1, 6));
-    }
-
-    #[test]
-    fn test_erase_rect_single_cell() {
-        let mut grid = Grid::new(4, 10);
-        fill_grid(&mut grid, 4, 10);
-        grid.erase_rect(2, 3, 2, 3);
-
-        assert_eq!(char_at(&grid, 2, 3), ' ');
-        assert!(!is_empty_at(&grid, 2, 2));
-        assert!(!is_empty_at(&grid, 2, 4));
-    }
-
-    #[test]
-    fn test_erase_rect_inverted_coords_noop() {
-        let mut grid = Grid::new(4, 10);
-        fill_grid(&mut grid, 4, 10);
-        grid.erase_rect(3, 5, 1, 2); // top > bottom, left > right
-
-        // Nothing should be erased.
-        for row in 0..4 {
-            for col in 0..10 {
-                assert!(
-                    !is_empty_at(&grid, row, col),
-                    "({row},{col}) should still have content"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_erase_rect_clamps_to_bounds() {
-        let mut grid = Grid::new(4, 10);
-        fill_grid(&mut grid, 4, 10);
-        // Coordinates exceed grid bounds — should clamp.
-        grid.erase_rect(2, 8, 100, 100);
-
-        // Should erase rows 2-3, cols 8-9 (clamped).
-        for row in 2..4 {
-            for col in 8..10 {
-                assert_eq!(
-                    char_at(&grid, row, col),
-                    ' ',
-                    "({row},{col}) should be erased"
-                );
-            }
-        }
-    }
-
-    // fill_rect (DECFRA)
-
-    #[test]
-    fn test_fill_rect_fills_with_character() {
-        let mut grid = Grid::new(4, 10);
-        let fill = crate::Cell::from_raw_parts(
-            'X' as u16,
-            crate::PackedColors::DEFAULT,
-            CellFlags::empty(),
-        );
-        grid.fill_rect(fill, 1, 2, 2, 5, None, None);
-
-        for row in 1..=2 {
-            for col in 2..=5 {
-                assert_eq!(char_at(&grid, row, col), 'X', "({row},{col}) should be 'X'");
-            }
-        }
-    }
-
-    #[test]
-    fn test_fill_rect_does_not_affect_surrounding() {
-        let mut grid = Grid::new(4, 10);
-        fill_grid(&mut grid, 4, 10);
-        let fill = crate::Cell::from_raw_parts(
-            'Z' as u16,
-            crate::PackedColors::DEFAULT,
-            CellFlags::empty(),
-        );
-        grid.fill_rect(fill, 1, 3, 2, 6, None, None);
-
-        // Outside the rect should be unchanged.
-        assert_eq!(char_at(&grid, 0, 3), 'D');
-        assert_eq!(char_at(&grid, 3, 3), 'D');
-        assert_eq!(char_at(&grid, 1, 2), 'C');
-    }
-
-    // selective_erase_rect (DECSERA)
-
-    #[test]
-    fn test_selective_erase_rect_respects_protection() {
-        let mut grid = Grid::new(4, 10);
-        fill_grid(&mut grid, 4, 10);
-
-        // Protect cell at (1, 3) and (2, 4).
-        protect_cell(&mut grid, 1, 3);
-        protect_cell(&mut grid, 2, 4);
-
-        grid.selective_erase_rect(1, 2, 2, 5);
-
-        assert_ne!(char_at(&grid, 1, 3), ' ', "(1,3) is protected");
-        assert_ne!(char_at(&grid, 2, 4), ' ', "(2,4) is protected");
-
-        // Unprotected cells in rect erased.
-        assert_eq!(char_at(&grid, 1, 2), ' ');
-        assert_eq!(char_at(&grid, 1, 4), ' ');
-        assert_eq!(char_at(&grid, 1, 5), ' ');
-        assert_eq!(char_at(&grid, 2, 2), ' ');
-        assert_eq!(char_at(&grid, 2, 3), ' ');
-        assert_eq!(char_at(&grid, 2, 5), ' ');
+        assert_ne!(char_at(&grid, 0, 2), ' ');
     }
 
     #[test]
@@ -2678,87 +2011,6 @@ mod tests {
                 .contains(CellFlags::WIDE_CONTINUATION),
             "continuation flag cleared (no orphaned spacer)"
         );
-    }
-
-    // change_attrs_rect (DECCARA)
-
-    #[test]
-    fn test_change_attrs_rect_sets_bold() {
-        let mut grid = Grid::new(4, 10);
-        fill_grid(&mut grid, 4, 10);
-
-        grid.change_attrs_rect(1, 2, 2, 5, CellFlags::BOLD, CellFlags::empty());
-
-        for row in 1..=2 {
-            for col in 2..=5 {
-                let cell = grid.cell(row, col).unwrap();
-                assert!(
-                    cell.flags().contains(CellFlags::BOLD),
-                    "({row},{col}) should be bold"
-                );
-            }
-        }
-        // Outside the rect should not be bold.
-        let cell_outside = grid.cell(0, 0).unwrap();
-        assert!(!cell_outside.flags().contains(CellFlags::BOLD));
-    }
-
-    #[test]
-    fn test_change_attrs_rect_clears_flags() {
-        let mut grid = Grid::new(4, 10);
-        fill_grid(&mut grid, 4, 10);
-
-        // First set bold on a region.
-        grid.change_attrs_rect(0, 0, 3, 9, CellFlags::BOLD, CellFlags::empty());
-        // Then clear bold on a sub-region.
-        grid.change_attrs_rect(1, 2, 2, 5, CellFlags::empty(), CellFlags::BOLD);
-
-        // Inside the cleared sub-region should not be bold.
-        for row in 1..=2 {
-            for col in 2..=5 {
-                let cell = grid.cell(row, col).unwrap();
-                assert!(
-                    !cell.flags().contains(CellFlags::BOLD),
-                    "({row},{col}) should not be bold"
-                );
-            }
-        }
-        // Outside the sub-region should still be bold.
-        assert!(grid.cell(0, 0).unwrap().flags().contains(CellFlags::BOLD));
-        assert!(grid.cell(3, 9).unwrap().flags().contains(CellFlags::BOLD));
-    }
-
-    // copy_rect (DECCRA)
-
-    #[test]
-    fn test_copy_rect_basic() {
-        let mut grid = Grid::new(4, 10);
-        fill_grid(&mut grid, 4, 10);
-
-        // Copy row 0, cols 0-4 to row 2, col 5.
-        grid.copy_rect(0, 0, 0, 4, 2, 5);
-
-        for col in 0..5 {
-            assert_eq!(
-                char_at(&grid, 2, col + 5),
-                char_at(&grid, 0, col),
-                "copied cell at col {} mismatch",
-                col + 5
-            );
-        }
-    }
-
-    #[test]
-    fn test_copy_rect_inverted_source_noop() {
-        let mut grid = Grid::new(4, 10);
-        fill_grid(&mut grid, 4, 10);
-
-        // Save original state at destination.
-        let orig = char_at(&grid, 2, 0);
-        grid.copy_rect(3, 5, 1, 2, 2, 0); // inverted src
-
-        // Destination unchanged.
-        assert_eq!(char_at(&grid, 2, 0), orig);
     }
 
     #[test]
@@ -3253,7 +2505,7 @@ mod tests {
     /// rectangle.
     #[test]
     fn fill_rect_keeps_the_wide_orphan_empty() {
-        use crate::{Cell, PackedColors, StyleId};
+        use crate::{Cell, PackedColors};
 
         let mut grid = Grid::new(2, 10);
         grid.move_cursor_to(0, 0);
@@ -3265,7 +2517,7 @@ mod tests {
         );
         grid.set_cursor_template(Cell::bce_blank(PackedColors::with_indexed_bg(4)), None);
 
-        let fill = Cell::with_style_id('X', StyleId::DEFAULT, CellFlags::empty());
+        let fill = Cell::new('X');
         grid.fill_rect(fill, 0, 1, 0, 5, None, None);
 
         assert_eq!(char_at(&grid, 0, 3), 'X', "the rect itself takes the fill");
@@ -3273,181 +2525,6 @@ mod tests {
             is_empty_at(&grid, 0, 0),
             "#7522: the DECFRA fill glyph must not bleed onto the orphan"
         );
-    }
-
-    // Edge cases
-
-    #[test]
-    fn test_erase_on_1x1_grid() {
-        let mut grid = Grid::new(1, 1);
-        grid.write_char('Z');
-        grid.move_cursor_to(0, 0);
-        grid.erase_to_end_of_line();
-        assert_eq!(char_at(&grid, 0, 0), ' ');
-    }
-
-    #[test]
-    fn test_erase_line_on_1x1_grid() {
-        let mut grid = Grid::new(1, 1);
-        grid.write_char('Z');
-        grid.erase_line();
-        assert_eq!(char_at(&grid, 0, 0), ' ');
-    }
-
-    #[test]
-    fn test_erase_screen_on_1x1_grid() {
-        let mut grid = Grid::new(1, 1);
-        grid.write_char('Z');
-        grid.erase_screen();
-        assert_eq!(char_at(&grid, 0, 0), ' ');
-    }
-
-    #[test]
-    fn test_ed0_on_single_row_grid() {
-        let mut grid = Grid::new(1, 10);
-        fill_row(&mut grid, 0, 10);
-        grid.move_cursor_to(0, 5);
-        grid.erase_to_end_of_screen();
-
-        for col in 0..5 {
-            assert!(!is_empty_at(&grid, 0, col), "col {col} preserved");
-        }
-        for col in 5..10 {
-            assert_eq!(char_at(&grid, 0, col), ' ', "col {col} erased");
-        }
-    }
-
-    #[test]
-    fn test_decaln_on_1x1_grid() {
-        let mut grid = Grid::new(1, 1);
-        grid.screen_alignment_pattern();
-        assert_eq!(char_at(&grid, 0, 0), 'E');
-        assert_eq!(grid.cursor_row(), 0);
-        assert_eq!(grid.cursor_col(), 0);
-    }
-
-    #[test]
-    fn test_selective_erase_no_protected_cells_erases_all() {
-        let mut grid = Grid::new(2, 5);
-        fill_grid(&mut grid, 2, 5);
-
-        grid.selective_erase_screen();
-
-        for row in 0..2 {
-            for col in 0..5 {
-                assert_eq!(
-                    char_at(&grid, row, col),
-                    ' ',
-                    "({row},{col}) should be erased"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_multiple_erases_in_sequence() {
-        let mut grid = Grid::new(4, 10);
-        fill_grid(&mut grid, 4, 10);
-
-        // First erase from cursor to end of line on row 1.
-        grid.move_cursor_to(1, 5);
-        grid.erase_to_end_of_line();
-        for col in 5..10 {
-            assert_eq!(char_at(&grid, 1, col), ' ');
-        }
-
-        // Then erase entire row 2.
-        grid.move_cursor_to(2, 0);
-        grid.erase_line();
-        for col in 0..10 {
-            assert_eq!(char_at(&grid, 2, col), ' ');
-        }
-
-        // Rows 0 and 3 should be completely untouched.
-        for col in 0..10 {
-            assert!(!is_empty_at(&grid, 0, col));
-            assert!(!is_empty_at(&grid, 3, col));
-        }
-    }
-
-    #[test]
-    fn test_erase_rect_full_screen() {
-        let mut grid = Grid::new(3, 5);
-        fill_grid(&mut grid, 3, 5);
-        grid.erase_rect(0, 0, 2, 4);
-
-        for row in 0..3 {
-            for col in 0..5 {
-                assert_eq!(char_at(&grid, row, col), ' ', "({row},{col}) erased");
-            }
-        }
-    }
-
-    #[test]
-    fn test_fill_rect_single_cell() {
-        let mut grid = Grid::new(4, 10);
-        let fill = crate::Cell::from_raw_parts(
-            'Q' as u16,
-            crate::PackedColors::DEFAULT,
-            CellFlags::empty(),
-        );
-        grid.fill_rect(fill, 2, 3, 2, 3, None, None);
-        assert_eq!(char_at(&grid, 2, 3), 'Q');
-    }
-
-    #[test]
-    fn test_erase_rect_keeps_pending_wrap() {
-        // Rectangular erase preserves the deferred wrap (xterm: DECERA).
-        let mut grid = Grid::new(4, 5);
-        grid.set_pending_wrap(true);
-        assert!(grid.pending_wrap());
-        grid.erase_rect(0, 0, 0, 4);
-        assert!(grid.pending_wrap());
-    }
-
-    #[test]
-    fn test_fill_rect_keeps_pending_wrap() {
-        // Rectangular fill preserves the deferred wrap (xterm: DECFRA).
-        let mut grid = Grid::new(4, 5);
-        grid.set_pending_wrap(true);
-        assert!(grid.pending_wrap());
-        let fill = crate::Cell::from_raw_parts(
-            'X' as u16,
-            crate::PackedColors::DEFAULT,
-            CellFlags::empty(),
-        );
-        grid.fill_rect(fill, 0, 0, 0, 4, None, None);
-        assert!(grid.pending_wrap());
-    }
-
-    #[test]
-    fn test_selective_erase_rect_keeps_pending_wrap() {
-        // Selective rectangular erase preserves the deferred wrap (xterm: DECSERA).
-        let mut grid = Grid::new(4, 5);
-        grid.set_pending_wrap(true);
-        assert!(grid.pending_wrap());
-        grid.selective_erase_rect(0, 0, 0, 4);
-        assert!(grid.pending_wrap());
-    }
-
-    #[test]
-    fn test_change_attrs_rect_keeps_pending_wrap() {
-        // Attribute change preserves the deferred wrap (xterm: DECCARA).
-        let mut grid = Grid::new(4, 5);
-        grid.set_pending_wrap(true);
-        assert!(grid.pending_wrap());
-        grid.change_attrs_rect(0, 0, 0, 4, CellFlags::BOLD, CellFlags::empty());
-        assert!(grid.pending_wrap());
-    }
-
-    #[test]
-    fn test_copy_rect_keeps_pending_wrap() {
-        // Rectangular copy preserves the deferred wrap (xterm: DECCRA).
-        let mut grid = Grid::new(4, 5);
-        grid.set_pending_wrap(true);
-        assert!(grid.pending_wrap());
-        grid.copy_rect(0, 0, 0, 4, 1, 0);
-        assert!(grid.pending_wrap());
     }
 
     #[test]

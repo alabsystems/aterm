@@ -13,12 +13,6 @@ description = "aterm control verbs parameterized over a SessionHost — the head
 [lints]
 workspace = true
 
-[features]
-# Compile the reference `MemoryHost` + verb-matrix suite into a NON-test build so
-# a downstream host (aterm-gui) can run it as a dev-dependency. It
-# is always built under `cfg(test)` here, so it cannot rot when the feature is off.
-conformance = []
-
 [dependencies]
 # The engine the verbs read and mutate. Every item used here is unconditional
 # (no feature gate), so a consumer's feature selection cannot change this crate.
@@ -27,6 +21,9 @@ aterm-core = { workspace = true }
 # this dependency-free leaf so clients that cannot link this crate share it.
 # Already in the graph through aterm-core.
 aterm-codec = { workspace = true }
+# `hangup`: whether the client of the connection a lane serves has closed it
+# (a zero-timeout poll). Dependency-free, and already in the GUI's graph.
+aterm-uds = { workspace = true }
 
 [dev-dependencies]
 # A real JSON reader for the tests that read a reply back (`blocks --json`'s

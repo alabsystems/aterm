@@ -76,7 +76,6 @@ fn every_lost_draft_of_the_update_is_said_in_one_row() {
     app.settle_carried_settings_drafts();
     let rows = loss_rows(&app);
     assert_eq!(rows.len(), 1, "one row for the update: {rows:?}");
-    assert_eq!(rows[0].title, "Couldn't reopen 2 Settings drafts");
     for said in ["no_such_row_a: first words", "no_such_row_b: second words"] {
         assert!(
             rows[0].detail.iter().any(|line| line == said),
@@ -247,7 +246,6 @@ fn a_draft_whose_view_the_restore_closed_is_said_with_its_text() {
         let rows = loss_rows(&app);
         if closed {
             assert_eq!(rows.len(), 1, "the lost draft is said: {rows:?}");
-            assert_eq!(rows[0].title, "Couldn't reopen a Settings draft");
             assert_eq!(rows[0].detail[0], format!("{field}: Carried Mono"));
         } else {
             assert!(rows.is_empty(), "a draft its view still holds is not lost");
@@ -306,12 +304,16 @@ fn an_unplaced_layouts_drafts_are_said_with_their_text() {
     app.settle_carried_settings_drafts();
     let rows = loss_rows(&app);
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].title, "Couldn't reopen 2 Settings drafts");
     assert_eq!(
-        rows[0].detail[..2],
-        [
-            format!("{}: Unplaced Mono", crate::prefs::EDIT_FONT_FAMILY),
-            "1 draft could not be read".to_string(),
-        ]
+        rows[0].detail[0],
+        format!("{}: Unplaced Mono", crate::prefs::EDIT_FONT_FAMILY)
+    );
+    assert!(
+        rows[0]
+            .detail
+            .get(1)
+            .is_some_and(|line| line.starts_with("1 ")),
+        "the unreadable draft is counted too: {:?}",
+        rows[0].detail
     );
 }

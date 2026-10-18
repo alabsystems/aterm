@@ -6,6 +6,8 @@
 
 use std::sync::Mutex;
 
+use aterm_x11::proto::atom;
+
 use super::*;
 
 // https://specifications.freedesktop.org/wm-spec/latest/ar01s04.html#idm46075117309248
@@ -44,7 +46,7 @@ impl XConnection {
     fn get_supported_hints(&self, root: xproto::Window) -> Vec<xproto::Atom> {
         let atoms = self.atoms();
         let supported_atom = atoms[_NET_SUPPORTED];
-        self.get_property(root, supported_atom, xproto::Atom::from(xproto::AtomEnum::ATOM))
+        self.get_property(root, supported_atom, atom::ATOM)
             .unwrap_or_else(|_| Vec::with_capacity(0))
     }
 
@@ -76,11 +78,7 @@ impl XConnection {
         // Querying this property on the root window will give us the ID of a child window created
         // by the WM.
         let root_window_wm_check = {
-            let result = self.get_property::<xproto::Window>(
-                root,
-                check_atom,
-                xproto::Atom::from(xproto::AtomEnum::WINDOW),
-            );
+            let result = self.get_property::<xproto::Window>(root, check_atom, atom::WINDOW);
 
             let wm_check = result.ok().and_then(|wm_check| wm_check.first().cloned());
 
@@ -93,7 +91,7 @@ impl XConnection {
             let result = self.get_property::<xproto::Window>(
                 root_window_wm_check.into(),
                 check_atom,
-                xproto::Atom::from(xproto::AtomEnum::WINDOW),
+                atom::WINDOW,
             );
 
             let wm_check = result.ok().and_then(|wm_check| wm_check.first().cloned());
@@ -121,17 +119,13 @@ impl XConnection {
             // The unofficial 1.4 fork of IceWM still includes the extra details, but properly
             // returns a UTF8 string that isn't null-terminated.
             let no_utf8 = if let Err(ref err) = result {
-                err.is_actual_property_type(xproto::Atom::from(xproto::AtomEnum::STRING))
+                err.is_actual_property_type(atom::STRING)
             } else {
                 false
             };
 
             if no_utf8 {
-                self.get_property(
-                    root_window_wm_check.into(),
-                    wm_name_atom,
-                    xproto::Atom::from(xproto::AtomEnum::STRING),
-                )
+                self.get_property(root_window_wm_check.into(), wm_name_atom, atom::STRING)
             } else {
                 result
             }

@@ -168,7 +168,7 @@ impl XConnection {
             window,
             motif_hints,
             motif_hints,
-            xproto::PropMode::REPLACE,
+            xproto::PropMode::Replace,
             &hints_data,
         )
     }

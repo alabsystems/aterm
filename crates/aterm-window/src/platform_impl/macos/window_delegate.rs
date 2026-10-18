@@ -73,7 +73,7 @@ use crate::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize, P
 use crate::error::{ExternalError, NotSupportedError, OsError as RootOsError};
 use crate::event::{InnerSizeWriter, WindowEvent};
 use crate::keyboard::ModifiersState;
-use crate::platform::macos::WindowExtMacOS;
+use crate::platform::macos::{OptionAsAlt, WindowExtMacOS};
 use crate::window::{Cursor, ImePurpose, Theme, UserAttentionType, WindowAttributes};
 
 // LOCAL PATCH (aterm), 2026-10-15 (docs/AUDIT-third-party-2026-10-15.md, winit-core step 5):
@@ -162,12 +162,7 @@ pub(crate) struct State {
 // registered is now read back off the LIVE class by
 // `crates/aterm-gui/examples/objc_live_class_audit.rs`, which the verify
 // ladder runs — and which audits `view.rs`'s `WinitView` beside this class as
-// of W3 phase 2. `crates/aterm-objc/tests/winit_seam.rs` is the census beside
-// it: 72 rows over the fork's five macOS classes, 70 of them with an authority,
-// and it checks a MIRROR — which is why the auditor had to exist. (This
-// sentence said "the 70-row census" until 2026-09-01; 70 is the number of
-// AUTHORITATIVE rows, not the number of rows, and a file that has already been
-// corrected twice for a loose count should not carry a third.)
+// of W3 phase 2.
 //
 // TWO THINGS CHANGED SHAPE, and neither is silent:
 //
@@ -422,11 +417,7 @@ aterm_objc::declare_class! {
         // compat slice is where the old row lied: `setne %al` writes only AL
         // and leaves RAX's upper 56 bits holding the last `objc_msgSend`'s
         // pointer result, which AppKit would read as an enormous
-        // NSDragOperation mask. Codegen for all three shapes, the census that
-        // proves this is the ONLY disagreeing row of the 70 with an authority,
-        // and the
-        // arming that grows and empties the disagreement set:
-        // `crates/aterm-objc/tests/winit_seam.rs`.
+        // NSDragOperation mask.
         @sel(draggingEntered:)
         fn dragging_entered(&self, sender: Id) -> usize {
             trace_scope!("draggingEntered:");
@@ -721,7 +712,7 @@ fn new_window(
                 usize,
                 usize,
                 Bool,
-            ) -> Id = aterm_objc::msg();
+            ) -> Id = aterm_objc::checked_msg();
             aterm_objc::Retained::from_owned(init(
                 raw,
                 aterm_objc::sel!(initWithContentRect:styleMask:backing:defer:),
@@ -1634,6 +1625,15 @@ impl WindowExtMacOS for WindowDelegate {
     // LOCAL PATCH (aterm): see `WinitView::cached_modifiers`.
     fn cached_modifiers(&self) -> ModifiersState {
         self.view().cached_modifiers()
+    }
+
+    // LOCAL PATCH (aterm), 2026-10-16: upstream's option-as-alt, restored; the view keeps it.
+    fn set_option_as_alt(&self, option_as_alt: OptionAsAlt) {
+        self.view().set_option_as_alt(option_as_alt);
+    }
+
+    fn option_as_alt(&self) -> OptionAsAlt {
+        self.view().option_as_alt()
     }
 }
 

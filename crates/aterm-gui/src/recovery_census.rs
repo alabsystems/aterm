@@ -48,7 +48,8 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use aterm_update::recovery_ledger::{
-    EndClass, LaunchKind, Pressure, PrevRun, Row, Tri, Uptime, append_row, ledger_path, read_rows,
+    EndClass, LaunchKind, Pressure, PrevRun, Restores, Row, Tri, Uptime, append_row, ledger_path,
+    read_rows,
 };
 
 /// The final exit's log line (lib.rs `main_entry`), which dates a clean quit.
@@ -73,6 +74,9 @@ const MAX_LOG_BYTES: u64 = 12 * 1024 * 1024;
 pub(crate) struct Me {
     pub(crate) pid: u32,
     pub(crate) started: u64,
+    /// The microseconds of the kernel's birth record within [`Self::started`]; `None`
+    /// when the birth came from the clock.
+    pub(crate) started_us: Option<u32>,
     pub(crate) build: u64,
     pub(crate) version: String,
 }
@@ -80,19 +84,29 @@ pub(crate) struct Me {
 impl Me {
     fn current() -> Self {
         let pid = std::process::id();
+        let birth = process_birth(pid);
         Self {
             pid,
-            started: own_birth().unwrap_or_else(now_secs),
+            started: birth.map_or_else(now_secs, |birth| birth.seconds),
+            started_us: birth.and_then(|birth| birth.micros),
             build: crate::running_build_number(),
             version: crate::build_info::version().to_string(),
         }
     }
 }
 
+/// The kernel's birth record for a process: Unix seconds, and the microseconds within
+/// them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Birth {
+    pub(crate) seconds: u64,
+    pub(crate) micros: Option<u32>,
+}
+
 /// What the census asks the system, so tests can answer instead.
 pub(crate) trait Probe {
-    /// The birth (Unix seconds) of a live process of ours with this pid.
-    fn birth(&self, pid: u32) -> Option<u64>;
+    /// The birth of a live process of ours with this pid.
+    fn birth(&self, pid: u32) -> Option<Birth>;
     /// Launches the boot sentinel has counted against `build`.
     fn trial(&self, build: u64) -> u32;
 }
@@ -100,7 +114,7 @@ pub(crate) trait Probe {
 struct System;
 
 impl Probe for System {
-    fn birth(&self, pid: u32) -> Option<u64> {
+    fn birth(&self, pid: u32) -> Option<Birth> {
         process_birth(pid)
     }
     fn trial(&self, build: u64) -> u32 {
@@ -108,18 +122,15 @@ impl Probe for System {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn process_birth(pid: u32) -> Option<u64> {
-    crate::seamless::read_process_birth(libc::pid_t::try_from(pid).ok()?).map(|b| b.seconds)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn process_birth(_pid: u32) -> Option<u64> {
-    None
-}
-
-fn own_birth() -> Option<u64> {
-    process_birth(std::process::id())
+/// The kernel's birth record for `pid` (macOS; `None` elsewhere).
+fn process_birth(pid: u32) -> Option<Birth> {
+    let birth = aterm_uds::process::read_process_birth(i32::try_from(pid).ok()?)?;
+    Some(Birth {
+        seconds: birth.seconds,
+        micros: u32::try_from(birth.microseconds)
+            .ok()
+            .filter(|us| *us < 1_000_000),
+    })
 }
 
 fn now_secs() -> u64 {
@@ -129,16 +140,19 @@ fn now_secs() -> u64 {
 /// Record this launch in the ledger, on a thread of its own: the log scan reads up
 /// to [`MAX_LOG_BYTES`], and nothing on the launch path waits for it. Call after the
 /// crash scans, whose renames it reads. A no-op without a private log directory.
-pub(crate) fn record(launch: LaunchKind) {
-    let spawned = std::thread::Builder::new()
-        .name("aterm-recovery-census".into())
-        .spawn(move || {
+/// `restores`: how this launch's keeper recovery brought its screens back, when it
+/// recovered any (the crash restore's rungs), recorded on the row.
+pub(crate) fn record(launch: LaunchKind, restores: Option<Restores>) {
+    let spawned = crate::qos::spawn_lane_thread(
+        "aterm-recovery-census",
+        crate::qos::Role::Background,
+        move || {
             // Nobody waits on the census: it reads files and appends one line.
-            crate::qos::set_self(crate::qos::Role::Background);
             let Some(dir) = crate::logging::log_dir() else {
                 return;
             };
-            let row = census_row(&dir, &Me::current(), launch, now_secs(), &System);
+            let mut row = census_row(&dir, &Me::current(), launch, now_secs(), &System);
+            row.restores = restores;
             let path = ledger_path(&dir);
             match append_row(&path, &row) {
                 Ok(()) => aterm_log::info!(
@@ -153,7 +167,8 @@ pub(crate) fn record(launch: LaunchKind) {
                     path.display()
                 ),
             }
-        });
+        },
+    );
     if let Err(e) = spawned {
         aterm_log::warn!("recovery census: no thread for the census: {e}");
     }
@@ -168,7 +183,7 @@ pub(crate) fn census_row(
     probe: &dyn Probe,
 ) -> Row {
     let rows = read_rows(&ledger_path(dir));
-    let is_me = |row: &Row| row.pid == me.pid && row.started == me.started;
+    let is_me = |row: &Row| row.is_process(me.pid, me.started, me.started_us);
     let own_image = rows.last().filter(|row| is_me(row)).cloned();
     let last = rows.into_iter().rev().find(|row| !is_me(row));
     let prev = match (launch, own_image, last) {
@@ -185,10 +200,12 @@ pub(crate) fn census_row(
         at: now,
         pid: me.pid,
         started: me.started,
+        started_us: me.started_us,
         build: me.build,
         version: me.version.clone(),
         launch,
         prev,
+        restores: None,
     }
 }
 
@@ -221,7 +238,11 @@ fn handoff_prev(dir: &Path, last: Option<&Row>, now: u64, probe: &dyn Probe) -> 
 fn cold_prev(dir: &Path, last: &Row, probe: &dyn Probe) -> PrevRun {
     let facts = scan_logs(dir, last.pid, last.started);
     let evidence = find_evidence(dir, last.pid, last.started);
-    let running = probe.birth(last.pid) == Some(last.started);
+    // Alive only as the very process the row names: a pid reused since is another
+    // (to the microsecond, where both sides carry it).
+    let running = probe
+        .birth(last.pid)
+        .is_some_and(|birth| last.is_process(last.pid, birth.seconds, birth.micros));
     let (class, end) = if running {
         (EndClass::Running, None)
     } else {
@@ -573,8 +594,13 @@ mod tests {
     }
 
     impl Probe for Fake {
-        fn birth(&self, pid: u32) -> Option<u64> {
-            self.alive.filter(|(p, _)| *p == pid).map(|(_, b)| b)
+        fn birth(&self, pid: u32) -> Option<Birth> {
+            self.alive
+                .filter(|(p, _)| *p == pid)
+                .map(|(_, seconds)| Birth {
+                    seconds,
+                    micros: None,
+                })
         }
         fn trial(&self, _build: u64) -> u32 {
             self.trial
@@ -617,6 +643,7 @@ mod tests {
         Me {
             pid,
             started: BORN + 5000,
+            started_us: None,
             build: 1_790_400_000,
             version: "0.94.0".into(),
         }
@@ -628,10 +655,12 @@ mod tests {
             at: BORN,
             pid: 4242,
             started: BORN,
+            started_us: None,
             build: 1_790_305_290,
             version: "0.93.0".into(),
             launch: LaunchKind::Cold,
             prev: PrevRun::none(),
+            restores: None,
         };
         append_row(&ledger_path(s.0.path()), &previous).expect("seed the ledger");
     }
@@ -886,6 +915,63 @@ mod tests {
             EndClass::Running,
             "a recycled pid is not the run"
         );
+    }
+
+    /// THE ROW NAMES ITS PROCESS TO THE MICROSECOND. A launch records the kernel's
+    /// birth microseconds on its row, and the next launch finds the previous run still
+    /// alive only when the live process at that pid has that exact birth: a pid reused
+    /// within the same SECOND is another process, and the run before is classified by
+    /// its evidence instead of as `running`. Negative control: the same birth to the
+    /// microsecond is the run, alive.
+    #[test]
+    fn a_pid_reused_within_the_same_second_is_not_the_previous_run() {
+        struct Exact(u32, Birth);
+        impl Probe for Exact {
+            fn birth(&self, pid: u32) -> Option<Birth> {
+                (pid == self.0).then_some(self.1)
+            }
+            fn trial(&self, _build: u64) -> u32 {
+                0
+            }
+        }
+        let s = Scratch::new("reused-second");
+        let first = Me {
+            pid: 4242,
+            started: BORN,
+            started_us: Some(250_000),
+            ..me(4242)
+        };
+        let row = census_row(s.0.path(), &first, LaunchKind::Cold, BORN + 1, &NOBODY);
+        assert_eq!(row.started_us, Some(250_000), "the row carries the birth");
+        append_row(&ledger_path(s.0.path()), &row).expect("append");
+        let reused = Exact(
+            4242,
+            Birth {
+                seconds: BORN,
+                micros: Some(750_000),
+            },
+        );
+        let next = census_row(
+            s.0.path(),
+            &me(5000),
+            LaunchKind::Cold,
+            BORN + 5000,
+            &reused,
+        );
+        assert_ne!(
+            next.prev.class,
+            EndClass::Running,
+            "a pid reused within the second is not the run"
+        );
+        let same = Exact(
+            4242,
+            Birth {
+                seconds: BORN,
+                micros: Some(250_000),
+            },
+        );
+        let next = census_row(s.0.path(), &me(5000), LaunchKind::Cold, BORN + 5000, &same);
+        assert_eq!(next.prev.class, EndClass::Running);
     }
 
     #[test]

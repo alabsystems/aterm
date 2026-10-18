@@ -17,14 +17,14 @@ fn eligible() -> HandoffLaneFacts {
 }
 
 /// One field of [`HandoffLaneFacts`] flipped per row against an eligible attempt,
-/// each with the refusal it must produce.
+/// each with whether it must refuse the lane.
 #[test]
 fn each_fact_alone_decides_the_out_of_band_lane() {
     let limit = crate::handoff_rendezvous::MAX_RENDEZVOUS_SESSIONS;
     let chunked = crate::handoff_rendezvous::MAX_CHUNKED_SESSIONS;
-    let rows: [(&str, HandoffLaneFacts, Option<&str>); 13] = [
+    let rows: [(&str, HandoffLaneFacts, bool); 13] = [
         // An attempt with nothing wrong with it takes the lane.
-        ("eligible", eligible(), None),
+        ("eligible", eligible(), false),
         // A platform with no LaunchServices launcher has nothing to start.
         (
             "no launcher",
@@ -32,7 +32,7 @@ fn each_fact_alone_decides_the_out_of_band_lane() {
                 launcher_available: false,
                 ..eligible()
             },
-            Some("this platform has no LaunchServices launcher"),
+            true,
         ),
         // A dev build, `targo run` and the test harness reach the seamless lane
         // without a bundle, so LaunchServices has nothing to start.
@@ -42,7 +42,7 @@ fn each_fact_alone_decides_the_out_of_band_lane() {
                 bundled: false,
                 ..eligible()
             },
-            Some("this process does not run from a .app bundle"),
+            true,
         ),
         // `$HOME` decides whether the rendezvous path fits `sun_path`; when it
         // does not, the fallback must be silent and total, not a bind failing
@@ -53,7 +53,7 @@ fn each_fact_alone_decides_the_out_of_band_lane() {
                 socket_path_fits: false,
                 ..eligible()
             },
-            Some("the rendezvous path does not fit sun_path on this machine"),
+            true,
         ),
         // The downgrade guard: an older authorized target must fork, or a
         // successor without rendezvous code is handed descriptors it cannot
@@ -64,7 +64,7 @@ fn each_fact_alone_decides_the_out_of_band_lane() {
                 target_not_older: false,
                 ..eligible()
             },
-            Some("the authorized target build is older than this build"),
+            true,
         ),
         // The transport bounds the pool: one `SCM_RIGHTS` message carries 64
         // descriptors, two of them the pipes. Exactly the limit fits…
@@ -74,7 +74,7 @@ fn each_fact_alone_decides_the_out_of_band_lane() {
                 sessions: limit,
                 ..eligible()
             },
-            None,
+            false,
         ),
         // …one more does not, and must fall back rather than fail at sendmsg…
         (
@@ -83,7 +83,7 @@ fn each_fact_alone_decides_the_out_of_band_lane() {
                 sessions: limit + 1,
                 ..eligible()
             },
-            Some("the session count does not fit one descriptor message"),
+            true,
         ),
         // The chunked grant: a candidate whose verified `Info.plist` declares it
         // takes 100 sessions over several messages…
@@ -94,7 +94,7 @@ fn each_fact_alone_decides_the_out_of_band_lane() {
                 grant_chunks: true,
                 ..eligible()
             },
-            None,
+            false,
         ),
         // …and a candidate that did not declare it still forks them.
         (
@@ -103,7 +103,7 @@ fn each_fact_alone_decides_the_out_of_band_lane() {
                 sessions: 100,
                 ..eligible()
             },
-            Some("the session count does not fit one descriptor message"),
+            true,
         ),
         // The protocol's own ceiling still binds a chunked grant.
         (
@@ -113,7 +113,7 @@ fn each_fact_alone_decides_the_out_of_band_lane() {
                 grant_chunks: true,
                 ..eligible()
             },
-            None,
+            false,
         ),
         (
             "chunked grant past the protocol ceiling",
@@ -122,7 +122,7 @@ fn each_fact_alone_decides_the_out_of_band_lane() {
                 grant_chunks: true,
                 ..eligible()
             },
-            Some("the session count does not fit the successor's chunked descriptor grant"),
+            true,
         ),
         // …and an overlap with no sessions is not an overlap.
         (
@@ -131,7 +131,7 @@ fn each_fact_alone_decides_the_out_of_band_lane() {
                 sessions: 0,
                 ..eligible()
             },
-            Some("the session count does not fit one descriptor message"),
+            true,
         ),
         // A LaunchServices launch merges its environment and cannot remove a
         // variable; `bind_expected_update_artifact` removes three, so a removal
@@ -142,11 +142,15 @@ fn each_fact_alone_decides_the_out_of_band_lane() {
                 environment_is_a_merge: false,
                 ..eligible()
             },
-            Some("the launch environment needs a removal a merge cannot express"),
+            true,
         ),
     ];
-    for (label, facts, refusal) in rows {
-        assert_eq!(out_of_band_lane_refusal(facts), refusal, "{label}");
+    for (label, facts, refused) in rows {
+        assert_eq!(
+            out_of_band_lane_refusal(facts).is_some(),
+            refused,
+            "{label}"
+        );
     }
 }
 

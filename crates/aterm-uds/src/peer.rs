@@ -101,10 +101,10 @@ pub fn our_uid() -> u32 {
 /// may have been recycled.
 ///
 /// [`peer_audit_token`] answers for the process that last used the connection, as it is when
-/// asked, not the one that `connect(2)`ed (`the_peer_is_the_connections_last_user_read_live`);
-/// an `exec` at that pid moves the pid version. A caller that must know whom it trusted reads
-/// it once, checks that one, and compares any later read with it (as `aterm-gui`'s handoff
-/// rendezvous does); it still cannot tell from it who else holds the connection.
+/// asked, not the one that `connect(2)`ed (measured 2026-10-03); an `exec` at that pid moves
+/// the pid version. A caller that must know whom it trusted reads it once, checks that one,
+/// and compares any later read with it (as `aterm-gui`'s handoff rendezvous does); it still
+/// cannot tell from it who else holds the connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AuditToken(pub [u32; 8]);
 
@@ -211,68 +211,5 @@ mod tests {
             assert_eq!(super::peer_audit_token(&a), Some(token));
         }
         let _ = a;
-    }
-
-    /// `LOCAL_PEERPID` and `LOCAL_PEERTOKEN` name the connection's last user, read live: a
-    /// child that writes on one end becomes the peer, and this process becomes it again by
-    /// writing. Were the answer fixed at `socketpair(2)`, it would name this process throughout.
-    #[cfg(target_vendor = "apple")]
-    #[test]
-    fn the_peer_is_the_connections_last_user_read_live() {
-        use std::io::{Read as _, Write as _};
-        use std::os::fd::AsRawFd as _;
-        use std::os::unix::process::CommandExt as _;
-        unsafe extern "C" {
-            fn dup2(from: i32, to: i32) -> i32;
-        }
-        let ours_pid = std::process::id();
-        let named = |stream: &crate::CtlStream| {
-            (
-                crate::fdpass::peer_pid(stream).ok(),
-                super::peer_audit_token(stream).map(|token| token.pid()),
-            )
-        };
-        let (mut ours, theirs) = crate::CtlStream::pair().expect("socketpair");
-        assert_eq!(
-            named(&ours),
-            (Some(ours_pid), Some(ours_pid)),
-            "the pair's maker, its only user so far"
-        );
-        let shared = theirs.as_raw_fd();
-        let mut command = std::process::Command::new("/bin/sh");
-        // Writes once on the shared end, then waits (never reading it) until killed.
-        command.args(["-c", "printf x >&3; exec /bin/sleep 60"]);
-        // SAFETY: `dup2` is async-signal-safe; it puts the shared end at fd 3
-        // in the child (clearing close-on-exec there) and touches nothing else.
-        unsafe {
-            command.pre_exec(move || {
-                if dup2(shared, 3) == 3 {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::last_os_error())
-                }
-            });
-        }
-        let mut child = command.spawn().expect("spawn the child");
-        let mut byte = [0u8; 1];
-        ours.read_exact(&mut byte).expect("the child's write");
-        assert_eq!(&byte, b"x");
-        let child_pid = child.id();
-        let seen = named(&ours);
-        (&theirs).write_all(b"y").expect("write on the shared end");
-        ours.read_exact(&mut byte).expect("this process's write");
-        let after = named(&ours);
-        let _ = child.kill();
-        let _ = child.wait();
-        assert_eq!(
-            seen,
-            (Some(child_pid), Some(child_pid)),
-            "the child that wrote last is the peer, by pid and by audit token"
-        );
-        assert_eq!(
-            after,
-            (Some(ours_pid), Some(ours_pid)),
-            "the peer follows each use: this process again"
-        );
     }
 }

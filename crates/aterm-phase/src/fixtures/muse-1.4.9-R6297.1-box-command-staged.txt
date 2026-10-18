@@ -1,0 +1,18 @@
+# muse 1.4.9-R6297.1 · MEASURED 2026-10-16, `aterm ctl text --json` of a private headless aterm 120x40 (aterm 0.105.0 80b670745), the atpkg-managed muse (Meta latest) launched through its shim with a scratch HOME, `--base-url` at a local scripted stand-in for Meta's Responses endpoint (`--model fake-1`, a dummy META_API_KEY: no login and no model; the stand-in returns the tool call that raises the box, the box is muse's own) and `--approval-mode untrusted`, harness off · a sandboxed command in the untrusted mode: under `  $ ls -la` the rows `  Stage 1/1` (bold ccd3db) and `  Current argv: ["ls","-la"]` (bold 5aa0ff), then `⟩ 1. Allow this stage once (y)`, `  2. Always allow in this workspace: ls ... (p)`, `  3. Abort the entire command (esc)`; the footer's right side reads `Launch overrides`; the digit 1 or y allows the stage at once · cursor=2,15 (hidden) · scratch path redacted at equal length
+❯ PLAINCMD please
+
+◈ Calling tools (2s · esc to interrupt)
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────
+Would you like to run the following command?
+
+  $ ls -la
+  Stage 1/1
+  Current argv: ["ls","-la"]
+
+⟩ 1. Allow this stage once (y)
+  2. Always allow in this workspace: ls ... (p)
+  3. Abort the entire command (esc)
+Change approval defaults in /permissions
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  fake-1 · high · /private/tmp/at.XXXXXX/mwork · Launch overrides

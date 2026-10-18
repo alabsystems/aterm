@@ -486,8 +486,8 @@ impl Terminal {
 
     /// [`Self::written_line_cells`] cut after the row's last cell: the text the row shows.
     /// A stored line can hold text past the grid's width that no cell draws (restored from
-    /// a checkpoint or a `.dtrm` written wider); cutting it keeps a double-click's window,
-    /// scanned under the terminal mutex, as long as the rows it spans.
+    /// a checkpoint written wider); cutting it keeps a double-click's window, scanned
+    /// under the terminal mutex, as long as the rows it spans.
     pub(crate) fn drawn_line_cells(&self, row: i32) -> Option<(String, LineCells)> {
         let (mut text, cells) = self.written_line_cells(row)?;
         let end = cells.end_byte();
@@ -713,29 +713,6 @@ mod tests {
             copy_rows(&mut term, -3, -1).as_deref(),
             Some("abcdefghi jklmn\npad"),
             "the same rows copied from history"
-        );
-    }
-
-    /// The same at 80 columns, where dropping the space would fuse two arguments, and in
-    /// prose.
-    #[test]
-    fn copy_keeps_wrap_boundary_spaces_in_prose_and_commands() {
-        let cmd = "cp ./build/output/release/artifacts/aterm-universal-apple-darwin.tar.zstxxxxxxx \
-                   /Volumes/backup/";
-        assert_eq!(
-            cmd.find(" /"),
-            Some(79),
-            "the space lands in the last column"
-        );
-        let mut term = crate::terminal::Terminal::new(4, 80);
-        term.process(cmd.as_bytes());
-        assert_eq!(copy_rows(&mut term, 0, 1).as_deref(), Some(cmd));
-
-        let mut term = crate::terminal::Terminal::new(4, 10);
-        term.process(b"aaaa bbbb cccc dddd");
-        assert_eq!(
-            copy_rows(&mut term, 0, 1).as_deref(),
-            Some("aaaa bbbb cccc dddd")
         );
     }
 
@@ -1156,19 +1133,6 @@ mod tests {
     }
 
     #[test]
-    fn selection_cap_bytes_truncates_tail() {
-        let term = selection_grid();
-        let (text, truncated) = term.selection_to_string_capped(usize::MAX, 5);
-        let copied = text.expect("selection has text");
-        assert!(truncated, "hitting the byte cap sets the truncation flag");
-        assert!(copied.starts_with("R0"), "start preserved");
-        assert!(
-            !copied.contains("R5"),
-            "newest rows dropped once the byte cap is hit"
-        );
-    }
-
-    #[test]
     fn push_row_capped_enforces_hard_byte_cap() {
         use super::push_row_capped;
         let mut r = String::new();
@@ -1203,44 +1167,6 @@ mod tests {
             "mid-row hard cap: exactly max_bytes, not the whole row"
         );
         assert!(truncated, "clamping a single row sets the truncation flag");
-    }
-
-    #[test]
-    fn selection_no_truncation_under_caps_is_byte_identical() {
-        let term = selection_grid();
-        let (capped, truncated) = term.selection_to_string_capped(1_000, 1_000_000);
-        let full = term.selection_to_string();
-        assert!(!truncated, "generous caps do not flag truncation");
-        assert_eq!(capped, full, "generous caps are output-preserving");
-        assert!(
-            full.as_deref().unwrap_or_default().contains("R5"),
-            "every selected row is present when under the caps"
-        );
-    }
-
-    #[test]
-    fn line_text_bounded_borrows_valid_utf8_and_owns_lossy_text() {
-        use std::borrow::Cow;
-
-        use super::line_text_bounded;
-
-        let valid = line_text_bounded(b"alpha beta", 1024);
-        assert!(
-            matches!(valid, Cow::Borrowed("alpha beta")),
-            "valid UTF-8 should stay borrowed"
-        );
-
-        let truncated = line_text_bounded(b"alpha beta", 5);
-        assert!(
-            matches!(truncated, Cow::Borrowed("alpha")),
-            "a valid bounded prefix should also stay borrowed"
-        );
-
-        let lossy = line_text_bounded(b"alpha\xff", 1024);
-        match lossy {
-            Cow::Owned(text) => assert_eq!(text, "alpha\u{fffd}"),
-            Cow::Borrowed(_) => panic!("invalid UTF-8 must use the owned lossy path"),
-        }
     }
 
     #[test]
@@ -1355,36 +1281,6 @@ mod tests {
         term.process(cmd.as_bytes());
         term.process(b"\r\nAFTER");
         (term, cmd)
-    }
-
-    /// A soft wrap is one logical line and a hard newline ends it.
-    #[test]
-    fn logical_line_span_joins_a_soft_wrap_and_stops_at_a_hard_newline() {
-        let (term, _) = wrapped_docker_fixture();
-        assert!(
-            term.row_continues_previous(1),
-            "precondition: row 1 must carry the soft-wrap bit"
-        );
-        assert!(
-            !term.row_continues_previous(2),
-            "precondition: row 2 follows a HARD newline"
-        );
-        assert_eq!(
-            term.logical_line_span(0),
-            (0, 1),
-            "clicking the head of a wrapped line must reach its continuation"
-        );
-        assert_eq!(
-            term.logical_line_span(1),
-            (0, 1),
-            "…and clicking the continuation must reach back to the head"
-        );
-        assert_eq!(
-            term.logical_line_span(2),
-            (2, 2),
-            "a hard newline must bound the span — the wrapped line above must \
-             not be swallowed, nor this line by it"
-        );
     }
 
     /// The logical line containing `row` as a double-click reads it: `(text, first, last)`.

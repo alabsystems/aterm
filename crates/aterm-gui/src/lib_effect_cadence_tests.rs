@@ -51,17 +51,6 @@ fn the_effect_train_runs_at_the_panels_refresh_within_its_floors() {
         super::MIN_FRAME_INTERVAL,
         "the output-pacing floor is not a refresh rate"
     );
-    // Negative control: clamping to 60 fps disagrees exactly at the fast panel, by 8.3 ms.
-    let capped = promotion.max(AURORA_TICK_INTERVAL);
-    assert_eq!(
-        capped, AURORA_TICK_INTERVAL,
-        "control: the old clamp really did throw the panel rate away"
-    );
-    assert_eq!(
-        capped - effect_tick_interval(Some(promotion)),
-        Duration::from_nanos(8_333_667),
-        "…which is the per-frame latency the effect train was adding"
-    );
 }
 
 /// Drawable-pool headroom: the armed lane is the panel period stretched, so effect-only

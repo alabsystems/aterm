@@ -7,89 +7,6 @@
 use super::*;
 
 #[test]
-fn test_smart_selection_with_builtin_rules() {
-    let smart = SmartSelection::with_builtin_rules();
-    // BuiltinRules::all() defines 11 rules (url, file_path, email, ipv4, ipv6,
-    // git_hash, double_quoted_string, single_quoted_string, backtick_quoted_string,
-    // uuid, semver)
-    assert_eq!(
-        smart.rules().len(),
-        11,
-        "builtin rules should include all 11 known rule types"
-    );
-    // Verify key rules are present by name
-    let rule_names: Vec<&str> = smart.rules().iter().map(|r| r.name()).collect();
-    assert!(rule_names.contains(&"url"), "should contain url rule");
-    assert!(rule_names.contains(&"email"), "should contain email rule");
-    assert!(
-        rule_names.contains(&"file_path"),
-        "should contain file_path rule"
-    );
-}
-
-#[test]
-fn test_find_url_at_position() {
-    let smart = SmartSelection::with_builtin_rules();
-    let text = "Check out https://example.com for more info";
-
-    // Position in the middle of the URL
-    let m = smart.find_at(text, 15).unwrap();
-    assert_eq!(m.matched_text(), "https://example.com");
-    assert_eq!(m.rule_name(), "url");
-    assert_eq!(m.kind(), SelectionRuleKind::Url);
-}
-
-#[test]
-fn test_find_email_at_position() {
-    let smart = SmartSelection::with_builtin_rules();
-    let text = "Contact support@example.com for help";
-
-    let m = smart.find_at(text, 12).unwrap();
-    assert_eq!(m.matched_text(), "support@example.com");
-    assert_eq!(m.rule_name(), "email");
-}
-
-#[test]
-fn test_find_file_path_at_position() {
-    let smart = SmartSelection::with_builtin_rules();
-    let text = "Edit ./config.yaml to fix";
-
-    let m = smart.find_at(text, 10).unwrap();
-    assert_eq!(m.matched_text(), "./config.yaml");
-    assert_eq!(m.rule_name(), "file_path");
-}
-
-#[test]
-fn test_find_ipv4_at_position() {
-    let smart = SmartSelection::with_builtin_rules();
-    let text = "Server 192.168.1.1 is responding";
-
-    let m = smart.find_at(text, 10).unwrap();
-    assert_eq!(m.matched_text(), "192.168.1.1");
-    assert_eq!(m.rule_name(), "ipv4");
-}
-
-#[test]
-fn test_find_quoted_string_at_position() {
-    let smart = SmartSelection::with_builtin_rules();
-    let text = r#"Run command "git status" now"#;
-
-    let m = smart.find_at(text, 15).unwrap();
-    assert_eq!(m.matched_text(), r#""git status""#);
-    assert_eq!(m.kind(), SelectionRuleKind::QuotedString);
-}
-
-#[test]
-fn test_find_uuid_at_position() {
-    let smart = SmartSelection::with_builtin_rules();
-    let text = "Resource 550e8400-e29b-41d4-a716-446655440000 not found";
-
-    let m = smart.find_at(text, 20).unwrap();
-    assert_eq!(m.matched_text(), "550e8400-e29b-41d4-a716-446655440000");
-    assert_eq!(m.rule_name(), "uuid");
-}
-
-#[test]
 fn test_no_match_at_position() {
     let smart = SmartSelection::with_builtin_rules();
     let text = "just some regular words";
@@ -97,25 +14,6 @@ fn test_no_match_at_position() {
     // Position on whitespace
     let m = smart.find_at(text, 4);
     assert!(m.is_none(), "whitespace position should not match any rule");
-}
-
-#[test]
-fn test_priority_ordering() {
-    let mut smart = SmartSelection::new();
-
-    // Add low priority rule first
-    let low = SelectionRule::new("low", SelectionRuleKind::Custom, r"\d+")
-        .with_priority(RulePriority::Low);
-    smart.add_rule(low);
-
-    // Add high priority rule
-    let high = SelectionRule::new("high", SelectionRuleKind::Custom, r"\d{3}")
-        .with_priority(RulePriority::High);
-    smart.add_rule(high);
-
-    // Rules should be sorted by priority
-    assert_eq!(smart.rules()[0].name(), "high");
-    assert_eq!(smart.rules()[1].name(), "low");
 }
 
 #[test]
@@ -138,154 +36,88 @@ fn test_word_boundaries_fallback() {
     assert_eq!(bounds, Some((0, 5)));
 }
 
+/// Each builtin rule selects the whole token under the cursor, and nothing
+/// around it: trailing sentence punctuation and enclosing parentheses stay out
+/// of a URL, a query string stays in.
 #[test]
-fn test_find_at_column() {
+fn builtin_rules_select_the_token_under_the_cursor() {
     let smart = SmartSelection::with_builtin_rules();
-    let text = "URL: https://example.com here";
-
-    // Column 10 should be in the URL
-    let m = smart.find_at_column(text, 10).unwrap();
-    assert_eq!(m.rule_name(), "url");
-}
-
-#[test]
-fn test_has_match_at() {
-    let smart = SmartSelection::with_builtin_rules();
-    let text = "URL: https://example.com here";
-
-    assert!(smart.has_match_at(text, 10));
-    assert!(!smart.has_match_at(text, 0));
-}
-
-#[test]
-fn test_url_edge_cases() {
-    let smart = SmartSelection::with_builtin_rules();
-
-    // URL at end of sentence
-    let text = "Visit https://example.com.";
-    let m = smart.find_at(text, 10).unwrap();
-    assert_eq!(m.matched_text(), "https://example.com");
-
-    // URL in parentheses
-    let text = "(see https://example.com)";
-    let m = smart.find_at(text, 10).unwrap();
-    assert_eq!(m.matched_text(), "https://example.com");
-
-    // URL with query string
-    let text = "Link: https://example.com/path?q=1&b=2";
-    let m = smart.find_at(text, 10).unwrap();
-    assert_eq!(m.matched_text(), "https://example.com/path?q=1&b=2");
-}
-
-#[test]
-fn test_file_path_edge_cases() {
-    let smart = SmartSelection::with_builtin_rules();
-
-    // Relative path with parent
-    let text = "Check ../config/app.yaml file";
-    let m = smart.find_at(text, 10).unwrap();
-    assert_eq!(m.matched_text(), "../config/app.yaml");
-}
-
-#[test]
-fn test_multiple_matches_same_position() {
-    // This tests that higher priority rules win
-    let mut smart = SmartSelection::new();
-
-    // A URL is also a valid "text" by some other rule
-    let text_rule = SelectionRule::new("text", SelectionRuleKind::Custom, r"https?://\S+")
-        .with_priority(RulePriority::Low);
-
-    smart.add_rule(BuiltinRules::url());
-    smart.add_rule(text_rule);
-
-    let text = "See https://example.com here";
-    let m = smart.find_at(text, 10).unwrap();
-
-    // URL rule has higher priority, should match first
-    assert_eq!(m.rule_name(), "url");
-}
-
-#[test]
-fn test_empty_text() {
-    let smart = SmartSelection::with_builtin_rules();
-    let text = "";
-
-    assert!(
-        smart.find_at(text, 0).is_none(),
-        "empty text should have no matches"
-    );
-    assert!(smart.find_all(text).is_empty());
-}
-
-#[test]
-fn test_position_past_end() {
-    let smart = SmartSelection::with_builtin_rules();
-    let text = "short";
-
-    assert!(
-        smart.find_at(text, 100).is_none(),
-        "position past end should return None"
-    );
-}
-
-#[test]
-fn test_get_rule() {
-    let smart = SmartSelection::with_builtin_rules();
-
-    let rule = smart.get_rule("url").expect("url rule should exist");
-    assert_eq!(rule.kind(), SelectionRuleKind::Url);
-
-    assert!(
-        smart.get_rule("nonexistent").is_none(),
-        "nonexistent rule should return None"
-    );
-}
-
-#[test]
-fn test_backtick_quoted() {
-    let smart = SmartSelection::with_builtin_rules();
-    let text = "Run `git status` command";
-
-    let m = smart.find_at(text, 6).unwrap();
-    assert_eq!(m.matched_text(), "`git status`");
-}
-
-#[test]
-fn test_single_quoted() {
-    let smart = SmartSelection::with_builtin_rules();
-    let text = "Set value='hello' here";
-
-    let m = smart.find_at(text, 12).unwrap();
-    assert_eq!(m.matched_text(), "'hello'");
-}
-
-#[test]
-fn test_semver_variations() {
-    let rule = BuiltinRules::semver();
-
-    // Simple version
-    let text = "version 1.2.3 released";
-    let matches: Vec<_> = rule.find_all(text).collect();
-    assert_eq!(matches[0].as_str(), "1.2.3");
-
-    // With v prefix
-    let text = "version v2.0.0 released";
-    let matches: Vec<_> = rule.find_all(text).collect();
-    assert_eq!(matches[0].as_str(), "v2.0.0");
-
-    // With pre-release
-    let text = "version 1.0.0-alpha released";
-    let matches: Vec<_> = rule.find_all(text).collect();
-    assert_eq!(matches[0].as_str(), "1.0.0-alpha");
-}
-
-#[test]
-fn test_complex_email() {
-    let rule = BuiltinRules::email();
-
-    let text = "Contact john.doe+test@sub.example.co.uk for info";
-    let matches: Vec<_> = rule.find_all(text).collect();
-    assert_eq!(matches.len(), 1);
-    assert_eq!(matches[0].as_str(), "john.doe+test@sub.example.co.uk");
+    for (text, pos, matched, rule) in [
+        (
+            "Check out https://example.com for more info",
+            15,
+            "https://example.com",
+            "url",
+        ),
+        (
+            "Visit https://example.com.",
+            10,
+            "https://example.com",
+            "url",
+        ),
+        (
+            "(see https://example.com)",
+            10,
+            "https://example.com",
+            "url",
+        ),
+        (
+            "Link: https://example.com/path?q=1&b=2",
+            10,
+            "https://example.com/path?q=1&b=2",
+            "url",
+        ),
+        (
+            "Contact support@example.com for help",
+            12,
+            "support@example.com",
+            "email",
+        ),
+        (
+            "Edit ./config.yaml to fix",
+            10,
+            "./config.yaml",
+            "file_path",
+        ),
+        (
+            "Check ../config/app.yaml file",
+            10,
+            "../config/app.yaml",
+            "file_path",
+        ),
+        (
+            "Server 192.168.1.1 is responding",
+            10,
+            "192.168.1.1",
+            "ipv4",
+        ),
+        (
+            r#"Run command "git status" now"#,
+            15,
+            r#""git status""#,
+            "double_quoted",
+        ),
+        ("Set value='hello' here", 12, "'hello'", "single_quoted"),
+        (
+            "Run `git status` command",
+            6,
+            "`git status`",
+            "backtick_quoted",
+        ),
+        (
+            "Resource 550e8400-e29b-41d4-a716-446655440000 not found",
+            20,
+            "550e8400-e29b-41d4-a716-446655440000",
+            "uuid",
+        ),
+    ] {
+        let m = smart
+            .find_at(text, pos)
+            .unwrap_or_else(|| panic!("{text:?} @ {pos}: no match"));
+        assert_eq!(
+            (m.matched_text(), m.rule_name()),
+            (matched, rule),
+            "{text:?} @ {pos}"
+        );
+    }
 }

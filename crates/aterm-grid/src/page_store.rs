@@ -57,8 +57,8 @@ impl PageStore {
     /// Create a new, empty page store.
     #[must_use]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "ResizeRowReuse",
             action = "Rebuild",
             project = "grid::tests::resize_row_reuse::resize_row_reuse_conforms"
@@ -76,19 +76,8 @@ impl PageStore {
         store
     }
 
-    /// Pre-allocate pages into the free list (64KB each). Exposed under
-    /// `cfg(miri)` for the memory-safety tests.
-    #[cfg(miri)]
-    pub fn preheat(&mut self, page_count: usize) {
-        self.preheat_impl(page_count);
-    }
-
-    #[cfg(not(miri))]
+    /// Pre-allocate pages into the free list (64KB each).
     pub(crate) fn preheat(&mut self, page_count: usize) {
-        self.preheat_impl(page_count);
-    }
-
-    fn preheat_impl(&mut self, page_count: usize) {
         for _ in 0..page_count {
             let page = Page::new();
             // Fresh pages are already zeroed, used_bytes = 0
@@ -276,6 +265,7 @@ impl PageStore {
         PageSlice {
             ptr,
             len,
+            #[cfg(any(test, debug_assertions))]
             page_id,
             #[cfg(test)]
             // offset bounded by PAGE_SIZE (64KB) — always fits in u32

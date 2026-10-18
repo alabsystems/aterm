@@ -31,33 +31,6 @@ fn test_file_path_bare_relative_is_whole_not_fabricated_absolute() {
 }
 
 #[test]
-fn test_ipv4_pattern() {
-    let rule = BuiltinRules::ipv4();
-    let text = "Server at 192.168.1.100:8080 is up";
-    let matches: Vec<_> = rule.find_all(text).collect();
-    assert_eq!(matches.len(), 1);
-    assert_eq!(matches[0].as_str(), "192.168.1.100:8080");
-}
-
-#[test]
-fn test_git_hash_pattern() {
-    let rule = BuiltinRules::git_hash();
-    let text = "Commit abc1234 fixed the bug";
-    let matches: Vec<_> = rule.find_all(text).collect();
-    assert_eq!(matches.len(), 1);
-    assert_eq!(matches[0].as_str(), "abc1234");
-}
-
-#[test]
-fn test_quoted_string_with_escape() {
-    let rule = BuiltinRules::double_quoted_string();
-    let text = r#"echo "hello \"world\"" done"#;
-    let matches: Vec<_> = rule.find_all(text).collect();
-    assert_eq!(matches.len(), 1);
-    assert_eq!(matches[0].as_str(), r#""hello \"world\"""#);
-}
-
-#[test]
 fn uuid_outranks_git_hash_on_first_and_last_hex_groups() {
     // Regression: double-clicking (find_at) the 8-hex first group or the
     // 12-hex last group of a UUID must select the whole 36-char UUID, not
@@ -94,265 +67,133 @@ fn standalone_git_hash_still_matches_with_uuid_at_high() {
     assert_eq!(m.kind(), SelectionRuleKind::GitHash);
 }
 
-#[test]
-fn test_semver_pattern() {
-    let rule = BuiltinRules::semver();
-    let text = "Version v1.2.3-beta.1+build.456 released";
-    let matches: Vec<_> = rule.find_all(text).collect();
-    assert_eq!(matches.len(), 1);
-    assert_eq!(matches[0].as_str(), "v1.2.3-beta.1+build.456");
-}
-
 // ── Negative tests: verify patterns do NOT match non-targets ──────
 
+/// Each pattern finds exactly its token, whole.
 #[test]
-fn url_rejects_plain_words() {
-    let rule = BuiltinRules::url();
-    for text in [
-        "just some plain text",
-        "not-a-url",
-        "foo.bar.baz", // domain-like but no scheme
-        "//no-scheme.example.com",
-        "mailto:user@example.com", // different scheme class
+fn builtin_patterns_match_their_tokens() {
+    for (rule, text, want) in [
+        (
+            BuiltinRules::ipv4(),
+            "Server at 192.168.1.100:8080 is up",
+            "192.168.1.100:8080",
+        ),
+        (
+            BuiltinRules::git_hash(),
+            "Commit abc1234 fixed the bug",
+            "abc1234",
+        ),
+        (
+            BuiltinRules::double_quoted_string(),
+            r#"echo "hello \"world\"" done"#,
+            r#""hello \"world\"""#,
+        ),
+        (BuiltinRules::semver(), "version 1.2.3 released", "1.2.3"),
+        (
+            BuiltinRules::semver(),
+            "version 1.0.0-alpha released",
+            "1.0.0-alpha",
+        ),
+        (
+            BuiltinRules::semver(),
+            "Version v1.2.3-beta.1+build.456 released",
+            "v1.2.3-beta.1+build.456",
+        ),
+        (
+            BuiltinRules::email(),
+            "Contact john.doe+test@sub.example.co.uk for info",
+            "john.doe+test@sub.example.co.uk",
+        ),
     ] {
-        let matches: Vec<_> = rule.find_all(text).collect();
-        assert!(
-            matches.is_empty(),
-            "url() should NOT match {:?}, got {:?}",
-            text,
-            matches.iter().map(|m| m.as_str()).collect::<Vec<_>>()
-        );
+        let got: Vec<&str> = rule.find_all(text).map(|m| m.as_str()).collect();
+        assert_eq!(got, [want], "{text:?}");
     }
 }
 
+/// Negative controls: each pattern rejects the lookalikes of its token.
 #[test]
-fn email_rejects_non_emails() {
-    let rule = BuiltinRules::email();
-    for text in [
-        "not an email",
-        "@missing-local.com",
-        "user@",
-        "user@.com",
-        "user@com", // no dot in domain
-        "user@@double.com",
+fn builtin_patterns_reject_lookalikes() {
+    for (rule, texts) in [
+        (
+            BuiltinRules::url(),
+            &[
+                "just some plain text",
+                "not-a-url",
+                "foo.bar.baz",
+                "//no-scheme.example.com",
+                "mailto:user@example.com",
+            ][..],
+        ),
+        (
+            BuiltinRules::email(),
+            &[
+                "not an email",
+                "@missing-local.com",
+                "user@",
+                "user@.com",
+                "user@com",
+                "user@@double.com",
+            ][..],
+        ),
+        (
+            BuiltinRules::ipv4(),
+            &["999.999.999.999", "1.2.3", "not an ip address"][..],
+        ),
+        (
+            BuiltinRules::git_hash(),
+            &["abc123", "not hex at all", "12345"][..],
+        ),
+        (
+            BuiltinRules::uuid(),
+            &[
+                "not-a-uuid-at-all",
+                "550e8400-e29b-41d4-a716",
+                "550e8400e29b41d4a716446655440000",
+                "ZZZZZZZZ-ZZZZ-ZZZZ-ZZZZ-ZZZZZZZZZZZZ",
+            ][..],
+        ),
+        (
+            BuiltinRules::file_path(),
+            &["just a sentence", "no-slashes-here", "123.456"][..],
+        ),
     ] {
-        let matches: Vec<_> = rule.find_all(text).collect();
-        assert!(
-            matches.is_empty(),
-            "email() should NOT match {:?}, got {:?}",
-            text,
-            matches.iter().map(|m| m.as_str()).collect::<Vec<_>>()
-        );
+        for text in texts {
+            let got: Vec<&str> = rule.find_all(text).map(|m| m.as_str()).collect();
+            assert!(got.is_empty(), "{} matched {text:?}: {got:?}", rule.name);
+        }
     }
 }
 
+/// The default classifier's word under a byte position: alphanumerics and `_`,
+/// CJK, Cyrillic, precomposed and decomposed accents, Hebrew with niqqud; a
+/// position inside a multi-byte character snaps to its start; a space or a
+/// lone combining mark is no word.
 #[test]
-fn ipv4_rejects_non_ips() {
-    let rule = BuiltinRules::ipv4();
-    for text in [
-        "999.999.999.999", // octets > 255
-        "1.2.3",           // only 3 octets
-        "not an ip address",
+fn basic_word_boundaries_over_scripts() {
+    let hebrew = "\u{05E9}\u{05B8}\u{05C1}\u{05DC}\u{05D5}\u{05B9}\u{05DD}";
+    let qamats = hebrew.find('\u{05B8}').expect("qamats");
+    for (text, pos, want) in [
+        ("hello world_test foo", 2, Some((0, 5))),
+        ("hello world_test foo", 8, Some((6, 16))),
+        ("hello world_test foo", 5, None),
+        ("\u{65E5}\u{672C}\u{8A9E}", 3, Some((0, 9))),
+        ("caf\u{E9}", 3, Some((0, 5))),
+        ("cafe\u{301}", 5, Some((0, 6))),
+        ("\u{0301}", 0, None),
+        (hebrew, qamats, Some((0, hebrew.len()))),
+        (
+            "\u{41F}\u{440}\u{438}\u{432}\u{435}\u{442}",
+            0,
+            Some((0, 12)),
+        ),
+        ("hello \u{65E5}\u{672C}\u{8A9E} world", 6, Some((6, 15))),
+        ("hello \u{65E5}\u{672C}\u{8A9E} world", 16, Some((16, 21))),
+        ("\u{E9}", 1, Some((0, 2))),
     ] {
-        let matches: Vec<_> = rule.find_all(text).collect();
-        assert!(
-            matches.is_empty(),
-            "ipv4() should NOT match {:?}, got {:?}",
-            text,
-            matches.iter().map(|m| m.as_str()).collect::<Vec<_>>()
-        );
-    }
-}
-
-#[test]
-fn git_hash_rejects_short_hex() {
-    let rule = BuiltinRules::git_hash();
-    for text in [
-        "abc123", // 6 chars — below 7 minimum
-        "not hex at all",
-        "12345", // 5 digits
-    ] {
-        let matches: Vec<_> = rule.find_all(text).collect();
-        assert!(
-            matches.is_empty(),
-            "git_hash() should NOT match {:?}, got {:?}",
-            text,
-            matches.iter().map(|m| m.as_str()).collect::<Vec<_>>()
-        );
-    }
-}
-
-#[test]
-fn uuid_rejects_malformed() {
-    let rule = BuiltinRules::uuid();
-    for text in [
-        "not-a-uuid-at-all",
-        "550e8400-e29b-41d4-a716",              // truncated
-        "550e8400e29b41d4a716446655440000",     // no hyphens
-        "ZZZZZZZZ-ZZZZ-ZZZZ-ZZZZ-ZZZZZZZZZZZZ", // non-hex
-    ] {
-        let matches: Vec<_> = rule.find_all(text).collect();
-        assert!(
-            matches.is_empty(),
-            "uuid() should NOT match {:?}, got {:?}",
-            text,
-            matches.iter().map(|m| m.as_str()).collect::<Vec<_>>()
-        );
-    }
-}
-
-#[test]
-fn file_path_rejects_plain_words() {
-    let rule = BuiltinRules::file_path();
-    for text in ["just a sentence", "no-slashes-here", "123.456"] {
-        let matches: Vec<_> = rule.find_all(text).collect();
-        assert!(
-            matches.is_empty(),
-            "file_path() should NOT match {:?}, got {:?}",
-            text,
-            matches.iter().map(|m| m.as_str()).collect::<Vec<_>>()
-        );
-    }
-}
-
-#[test]
-fn test_basic_word_boundaries() {
-    let text = "hello world_test foo";
-
-    // Middle of "hello"
-    let bounds = SmartSelection::basic_word_boundaries(text, 2);
-    assert_eq!(bounds, Some((0, 5)));
-
-    // Middle of "world_test"
-    let bounds = SmartSelection::basic_word_boundaries(text, 8);
-    assert_eq!(bounds, Some((6, 16)));
-
-    // On space
-    let bounds = SmartSelection::basic_word_boundaries(text, 5);
-    assert_eq!(bounds, None);
-}
-
-#[test]
-fn basic_word_boundaries_cjk() {
-    // "日本語" = 3 chars, each 3 bytes UTF-8 = 9 bytes total
-    let text = "日本語";
-    let bounds = SmartSelection::basic_word_boundaries(text, 0);
-    assert_eq!(bounds, Some((0, 9)));
-
-    // Position in middle of CJK sequence (byte 3 = start of "本")
-    let bounds = SmartSelection::basic_word_boundaries(text, 3);
-    assert_eq!(bounds, Some((0, 9)));
-}
-
-#[test]
-fn basic_word_boundaries_accented_latin() {
-    // "café" = 'c'(1) + 'a'(1) + 'f'(1) + 'é'(2) = 5 bytes
-    let text = "café";
-    let bounds = SmartSelection::basic_word_boundaries(text, 0);
-    assert_eq!(bounds, Some((0, 5)));
-
-    // Position on 'f' (byte 2)
-    let bounds = SmartSelection::basic_word_boundaries(text, 2);
-    assert_eq!(bounds, Some((0, 5)));
-
-    // Position on 'é' (byte 3, start of 2-byte char)
-    let bounds = SmartSelection::basic_word_boundaries(text, 3);
-    assert_eq!(bounds, Some((0, 5)));
-}
-
-#[test]
-fn basic_word_boundaries_decomposed_accented_latin() {
-    // "cafe\u{301}" = 'c' + 'a' + 'f' + 'e' + combining acute accent
-    let text = "cafe\u{301}";
-
-    // Position on base ASCII character.
-    let bounds = SmartSelection::basic_word_boundaries(text, 0);
-    assert_eq!(bounds, Some((0, text.len())));
-
-    // Position on combining mark start.
-    let bounds = SmartSelection::basic_word_boundaries(text, 4);
-    assert_eq!(bounds, Some((0, text.len())));
-
-    // Position in the middle of combining mark UTF-8 bytes snaps to mark start.
-    let bounds = SmartSelection::basic_word_boundaries(text, 5);
-    assert_eq!(bounds, Some((0, text.len())));
-}
-
-#[test]
-fn basic_word_boundaries_combining_mark_without_base() {
-    let text = "\u{0301}";
-    let bounds = SmartSelection::basic_word_boundaries(text, 0);
-    assert_eq!(bounds, None);
-}
-
-#[test]
-fn basic_word_boundaries_hebrew_with_niqqud() {
-    // "shalom" with niqqud combining marks.
-    let text = "שָׁלוֹם";
-    let bounds = SmartSelection::basic_word_boundaries(text, 0);
-    assert_eq!(bounds, Some((0, text.len())));
-
-    // Position on first niqqud mark (qamats).
-    let qamats = text
-        .find('\u{05B8}')
-        .expect("qamats present in test string");
-    let bounds = SmartSelection::basic_word_boundaries(text, qamats);
-    assert_eq!(bounds, Some((0, text.len())));
-}
-
-#[test]
-fn basic_word_boundaries_zero_width_space_splits_words() {
-    let text = "foo\u{200B}bar";
-
-    // Zero-width space should remain a boundary.
-    let zwsp = text.find('\u{200B}').expect("zwsp present in test string");
-    let bounds = SmartSelection::basic_word_boundaries(text, zwsp);
-    assert_eq!(bounds, None);
-
-    let bounds = SmartSelection::basic_word_boundaries(text, 0);
-    assert_eq!(bounds, Some((0, 3)));
-
-    let b_pos = text.find('b').expect("b present in test string");
-    let bounds = SmartSelection::basic_word_boundaries(text, b_pos);
-    assert_eq!(bounds, Some((b_pos, text.len())));
-}
-
-#[test]
-fn basic_word_boundaries_bidi_controls_split_words() {
-    for marker in [
-        '\u{061C}', // Arabic Letter Mark
-        '\u{200E}', // Left-to-Right Mark
-        '\u{200F}', // Right-to-Left Mark
-        '\u{202A}', // Left-to-Right Embedding
-        '\u{202E}', // Right-to-Left Override
-        '\u{2066}', // Left-to-Right Isolate
-        '\u{2069}', // Pop Directional Isolate
-    ] {
-        let text = format!("foo{marker}bar");
-
-        let marker_pos = text.find(marker).expect("marker present in test string");
-        let bounds = SmartSelection::basic_word_boundaries(&text, marker_pos);
         assert_eq!(
-            bounds, None,
-            "marker U+{:04X} should split words",
-            marker as u32
-        );
-
-        let bounds = SmartSelection::basic_word_boundaries(&text, 0);
-        assert_eq!(
-            bounds,
-            Some((0, 3)),
-            "marker U+{:04X} left segment",
-            marker as u32
-        );
-
-        let b_pos = text.find('b').expect("b present in test string");
-        let bounds = SmartSelection::basic_word_boundaries(&text, b_pos);
-        assert_eq!(
-            bounds,
-            Some((b_pos, text.len())),
-            "marker U+{:04X} right segment",
-            marker as u32
+            SmartSelection::basic_word_boundaries(text, pos),
+            want,
+            "{text:?} @ {pos}"
         );
     }
 }
@@ -543,100 +384,6 @@ fn a_prepended_mark_belongs_to_the_word_after_it() {
     }
 }
 
-#[test]
-fn basic_word_boundaries_cyrillic() {
-    // "Привет" = 6 chars, each 2 bytes UTF-8 = 12 bytes
-    let text = "Привет";
-    let bounds = SmartSelection::basic_word_boundaries(text, 0);
-    assert_eq!(bounds, Some((0, 12)));
-}
-
-#[test]
-fn basic_word_boundaries_mixed_unicode_and_ascii() {
-    // "hello 日本語 world"
-    let text = "hello 日本語 world";
-    // "hello" = bytes 0..5
-    let bounds = SmartSelection::basic_word_boundaries(text, 0);
-    assert_eq!(bounds, Some((0, 5)));
-
-    // space at byte 5 → None
-    let bounds = SmartSelection::basic_word_boundaries(text, 5);
-    assert_eq!(bounds, None);
-
-    // "日本語" starts at byte 6, each CJK char is 3 bytes → 6..15
-    let bounds = SmartSelection::basic_word_boundaries(text, 6);
-    assert_eq!(bounds, Some((6, 15)));
-
-    // "world" starts at byte 16 → 16..21
-    let bounds = SmartSelection::basic_word_boundaries(text, 16);
-    assert_eq!(bounds, Some((16, 21)));
-}
-
-#[test]
-fn basic_word_boundaries_mid_byte_position() {
-    // If byte_pos lands in the middle of a multi-byte char, snap to its start
-    // "é" is bytes [0xC3, 0xA9] — byte 1 is not a char boundary
-    let text = "é";
-    let bounds = SmartSelection::basic_word_boundaries(text, 1);
-    assert_eq!(bounds, Some((0, 2)));
-}
-
-#[test]
-fn test_column_to_byte_pos() {
-    let text = "hello";
-    assert_eq!(column_to_byte_pos(text, 0), 0);
-    assert_eq!(column_to_byte_pos(text, 2), 2);
-    assert_eq!(column_to_byte_pos(text, 5), 5);
-    assert_eq!(column_to_byte_pos(text, 10), 5); // past end
-
-    // With multibyte chars
-    let text = "helloworldZ"; // "wo" is "wo" in bytes
-    assert_eq!(column_to_byte_pos(text, 0), 0);
-    assert_eq!(column_to_byte_pos(text, 5), 5);
-}
-
-#[test]
-fn column_to_byte_pos_uses_display_columns_for_wide_chars() {
-    // "日" is 3 bytes UTF-8, 2 display columns
-    // "本" is 3 bytes UTF-8, 2 display columns
-    // "test" is 4 bytes, 4 display columns
-    let text = "日本test";
-    // char indices:    0="日"(bytes 0..3), 1="本"(bytes 3..6), 2='t'(6), 3='e'(7), ...
-    // display columns: 0-1="日", 2-3="本", 4='t', 5='e', 6='s', 7='t'
-
-    // Start of first wide grapheme.
-    assert_eq!(column_to_byte_pos(text, 0), 0);
-
-    // Second cell of first wide grapheme should still map to its start.
-    assert_eq!(column_to_byte_pos(text, 1), 0);
-
-    // Start of second wide grapheme.
-    assert_eq!(column_to_byte_pos(text, 2), 3);
-
-    // Inside second wide grapheme should map to its start.
-    assert_eq!(column_to_byte_pos(text, 3), 3);
-
-    // Start of ASCII suffix.
-    assert_eq!(column_to_byte_pos(text, 4), 6);
-}
-
-#[test]
-fn test_byte_span_to_columns_ascii() {
-    let text = "hello world";
-    assert_eq!(byte_span_to_columns(text, 0, 0), (0, 0));
-    assert_eq!(byte_span_to_columns(text, 0, 5), (0, 5));
-    assert_eq!(byte_span_to_columns(text, 6, 11), (6, 11));
-}
-
-#[test]
-fn test_byte_span_to_columns_cjk() {
-    let text = "日本test";
-    // "日" = 3 bytes, width 2; "本" = 3 bytes, width 2; "test" = 4 bytes, width 4
-    assert_eq!(byte_span_to_columns(text, 0, 3), (0, 2)); // "日"
-    assert_eq!(byte_span_to_columns(text, 3, 6), (2, 4)); // "本"
-    assert_eq!(byte_span_to_columns(text, 6, 10), (4, 8)); // "test"
-}
-
 /// Columns follow the grid's fold across cluster boundaries: Sinhala `ක්‍ය`
 /// is two UAX #29 clusters the grid draws in ONE cell, so `ය` alone is drawn
 /// in `ක`'s cell and `ක්‍යා` is two cells (`ක්‍ය`, `ා`): a double-click on the
@@ -700,42 +447,13 @@ fn test_word_boundaries_at_column_past_the_text_is_none() {
     assert_eq!(smart.word_boundaries_at_column("日本", 4), None);
 }
 
-#[test]
-fn test_word_boundaries_at_column_ascii_matches_byte() {
-    // For pure ASCII, column and byte positions are identical.
-    let text = "hello world";
-    let smart = SmartSelection::default();
-
-    let byte_bounds = smart.word_boundaries_at(text, 0);
-    let col_bounds = smart.word_boundaries_at_column(text, 0);
-    assert_eq!(
-        byte_bounds, col_bounds,
-        "ASCII: byte and column results should match"
-    );
-}
-
 // ---- Configurable word separators (xterm.js `wordSeparators`) --------------
-
-#[test]
-fn word_separators_default_is_class_based_and_unset_preserves_it() {
-    // No rules: the walk goes straight to the basic word fallback.
-    let mut smart = SmartSelection::new();
-    // Default: '-' is not a word char, so "foo-bar" splits at the hyphen.
-    assert_eq!(smart.word_separators(), None);
-    assert_eq!(smart.word_boundaries_at("foo-bar baz", 1), Some((0, 3)));
-    // Setting then CLEARING the separators restores the default exactly.
-    smart.set_word_separators(Some(" "));
-    smart.set_word_separators(None);
-    assert_eq!(smart.word_separators(), None);
-    assert_eq!(smart.word_boundaries_at("foo-bar baz", 1), Some((0, 3)));
-}
 
 #[test]
 fn word_separators_make_a_word_any_run_of_non_separators() {
     let mut smart = SmartSelection::new();
     // Space-only separators: the hyphenated token is ONE word now.
     smart.set_word_separators(Some(" "));
-    assert_eq!(smart.word_separators(), Some(" "));
     assert_eq!(smart.word_boundaries_at("foo-bar baz", 1), Some((0, 7)));
     // Clicking the hyphen itself lands inside the same word.
     assert_eq!(smart.word_boundaries_at("foo-bar baz", 3), Some((0, 7)));

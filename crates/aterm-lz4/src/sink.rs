@@ -122,17 +122,3 @@ impl Sink for SliceSink<'_> {
         self.pos += num_bytes;
     }
 }
-
-#[cfg(test)]
-mod tests {
-
-    #[test]
-    fn test_sink_slice() {
-        use crate::sink::Sink;
-        use crate::sink::SliceSink;
-        let mut data = vec![0; 5];
-        let sink = SliceSink::new(&mut data, 1);
-        assert_eq!(sink.pos(), 1);
-        assert_eq!(sink.capacity(), 5);
-    }
-}

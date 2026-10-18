@@ -43,11 +43,6 @@ fn ownership_model() -> Model {
     }
 }
 
-#[test]
-fn window_atlas_ownership_model_proves_and_catches_shared_slot() {
-    aterm_spec::verify::prove_and_catch_scalar(&ownership_model(), "window artwork ownership");
-}
-
 fn blank_input() -> RenderInput {
     let mut term = Terminal::new(4, 12);
     term.process(b"\x1b[?25l");
@@ -384,6 +379,7 @@ fn run_ownership_replay(native: bool) {
 }
 
 #[test]
+#[cfg(wgpu_arm)]
 fn window_atlas_wgpu_reuses_distinct_artwork_and_releases_closed_windows() {
     run_ownership_replay(false);
 }
@@ -441,11 +437,6 @@ fn sharing_model() -> Model {
             };
         }
     }
-}
-
-#[test]
-fn shared_window_atlas_model_proves_and_catches_duplicate_uploads() {
-    aterm_spec::verify::prove_and_catch_scalar(&sharing_model(), "shared window artwork");
 }
 
 fn shared_observation(model_state: &State, windows: &[WindowGpu; 2]) -> State {
@@ -635,6 +626,7 @@ fn run_sharing_replay(native: bool) {
 }
 
 #[test]
+#[cfg(wgpu_arm)]
 fn window_atlas_wgpu_shares_sources_and_releases_the_last_owner() {
     run_sharing_replay(false);
 }

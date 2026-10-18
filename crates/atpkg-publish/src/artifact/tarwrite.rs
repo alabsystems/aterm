@@ -280,7 +280,7 @@ fn mode_of(path: &Path) -> u32 {
 
 /// Every regular file's size, each name of a hard-link group counted.
 fn content(root: &Path) -> Result<u64> {
-    let files = atpkg::relocate::walk_files(root).map_err(Error::cannot_run)?;
+    let files = crate::artifact::relocate::walk_files(root).map_err(Error::cannot_run)?;
     let mut sum = 0u64;
     for rel in files {
         let p = root.join(rel);
@@ -427,7 +427,8 @@ fn encode(members: &[Member], asset: &Path, compressor: &OsStr) -> io::Result<u6
         )));
     }
     streamed?;
-    file.sync_all()?;
+    // Durable: the asset is uploaded and signed for every client after this.
+    aterm_durable::durable(&file)?;
     decodes_back(asset, n, sum)?;
     Ok(n)
 }

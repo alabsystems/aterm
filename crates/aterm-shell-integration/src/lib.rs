@@ -20,9 +20,9 @@
 //! | Shell | Mechanism | How |
 //! |-------|-----------|-----|
 //! | zsh   | ZDOTDIR override | Wrapper `.zshenv` sources user config then ours |
-//! | bash  | `--rcfile` | Wrapper rcfile sources profiles then ours |
+//! | bash  | `--rcfile` | Loader reads `~/.bashrc` (macOS: the login profiles too) then ours |
 //! | fish  | `XDG_DATA_DIRS` | Vendor conf.d auto-loading |
-//! | pwsh/powershell | `-NoExit -Command` | Argv override dot-sources our `.ps1` after profiles |
+//! | pwsh/powershell | `-NoExit -Command` | Argv override dot-sources our `.ps1` after profiles, then lays readline's chords over PSReadLine's Windows mode (`prepare_powershell`) |
 //! | wsl   | `WSLENV` + `wsl.exe --exec` | `/p` path-translates our dir, then bash's `--rcfile` runs INSIDE the distro |
 //! | cmd   | `PROMPT` | `$e` OSC 0 title + OSC 133 A/B + OSC 633 `Cwd=` woven around the user's prompt |
 //!
@@ -48,6 +48,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
+mod shell_args;
+pub use shell_args::{ArgsMerge, merge_shell_args, shell_args_bypass};
+
 /// Embedded shell integration scripts (compiled into the binary).
 ///
 /// This crate is the canonical owner of the shell script bodies (`aterm-core`
@@ -59,7 +62,7 @@ pub mod scripts {
     pub const BASH: &str = include_str!("scripts/aterm_shell_integration.bash");
     /// fish shell integration (OSC 7/133 + prompt override).
     pub const FISH: &str = include_str!("scripts/aterm_shell_integration.fish");
-    /// PowerShell / pwsh shell integration (OSC 7/133).
+    /// PowerShell / pwsh shell integration (OSC 7/133 + the readline key layer).
     pub const POWERSHELL: &str = include_str!("scripts/aterm_shell_integration.ps1");
 
     /// The comment that opens the BODY of the zsh, bash and fish scripts:
@@ -389,6 +392,40 @@ pub const fn has_rekey_hook(shell: ShellType) -> bool {
     matches!(shell, ShellType::Zsh | ShellType::Bash | ShellType::Fish)
 }
 
+/// THE WARM SPARE (docs/DESIGN-warm-spare-2026-10-16.md): the folder under the
+/// host's control dir that holds a spare shell's hold FIFO, reached as
+/// `<control dir>/spare/<sid>` (the host's link to the FIFO, which is named for
+/// its host's pid and start time). A shell finds it from the re-key path it is
+/// already handed (`<control dir>/rekey/<sid>`), so a spare's environment is
+/// byte for byte a cold tab's.
+pub const SPARE_DIR: &str = "spare";
+
+/// The 633 `P` key a spare signs once it waits at its PARKED hold, before any
+/// startup file: `633;P;AtermSpare=parked;id=<nonce>`.
+pub const SPARE_KEY: &str = "AtermSpare";
+
+/// The 633 `P` key that completes a shell's START record, signed once, at its
+/// first prompt hook after every startup file: `cold` for a shell nobody
+/// held, `spare` for a warm spare about to wait at its WARM hold.
+pub const START_KEY: &str = "AtermStart";
+
+/// The START record's rc folder: the final `${ZDOTDIR:-$HOME}` (zsh), or
+/// `$HOME` (bash), escaped as 633 `E` escapes a command line.
+pub const START_RC_KEY: &str = "AtermStartRc";
+
+/// The START record's flags: `pre:<n>,s:<n>,j:<n|->,r:<0|1>` — the prompt
+/// hooks that ran ahead of aterm's, pending `sched` events, jobs, and
+/// periodic hooks.
+pub const START_FLAGS_KEY: &str = "AtermStartFlags";
+
+/// The shells whose wrapper and integration carry the spare's holds. macOS
+/// only: the host's escape scan, which a WARM spare needs, reads XNU's
+/// process table.
+#[must_use]
+pub const fn has_spare_hold(shell: ShellType) -> bool {
+    cfg!(target_os = "macos") && matches!(shell, ShellType::Zsh | ShellType::Bash)
+}
+
 /// THE TYPED RE-KEY: what a line typed at a shell's prompt runs to
 /// take a new nonce from the one-use file `quoted_path` — a word the caller has
 /// already quoted for `shell` — and remove the file, for a shell spawned BEFORE
@@ -403,7 +440,7 @@ pub const fn has_rekey_hook(shell: ShellType) -> bool {
 /// `set -g` in fish) and `__aterm_id_suffix_str` (`;id=<nonce>`) — measured in
 /// the scripts of the builds that spawned the owner's degraded tabs (0.91 and
 /// the 2026-09-10 build; `git show v0.91.0:crates/aterm-shell-integration/src/scripts/…`),
-/// and pinned for this build's by `the_typed_rekey_sets_the_globals_the_marks_read`.
+/// and pinned for this build's by the live `a_live_shell_without_the_channel_takes_a_typed_rekey` test.
 /// The key never enters the typed text, argv (`read` is a builtin), the
 /// scrollback or history: only the path does. Nor a user's `set -x` trace: zsh
 /// and bash print it on the stderr the command runs with, so in zsh and bash
@@ -689,7 +726,7 @@ fn ensure_cached(
 ///
 /// The zsh and bash loaders, and so their bodies, are written as the shell runs
 /// them: without their comment lines ([`installed_zsh`], [`installed_bash`]).
-fn script_set() -> [(&'static str, std::borrow::Cow<'static, str>); 10] {
+fn script_set() -> [(&'static str, std::borrow::Cow<'static, str>); 11] {
     [
         (
             "aterm_shell_integration.zsh",
@@ -720,8 +757,10 @@ fn script_set() -> [(&'static str, std::borrow::Cow<'static, str>); 10] {
         ),
         // zsh: ZDOTDIR wrapper .zshenv
         ("zdotdir/.zshenv", std::borrow::Cow::Borrowed(ZSH_WRAPPER)),
-        // bash: rcfile wrapper
+        // bash: the login-style rcfile wrapper (macOS, Git Bash, WSL) …
         ("bash/rcfile", std::borrow::Cow::Borrowed(BASH_WRAPPER)),
+        // … and the loader that starts bash as bash would (every other Unix).
+        ("bash/bashrc", std::borrow::Cow::Borrowed(BASH_LOADER)),
         // fish: XDG vendor conf.d structure
         (
             "fish-xdg/fish/vendor_conf.d/aterm_shell_integration.fish",
@@ -1070,13 +1109,53 @@ fn ensure_scripts(base: &Path) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+/// THE PARKED HOLD, the first lines of both wrappers (zsh's `.zshenv`, bash's
+/// `--rcfile`), POSIX so one text serves both: a shell whose spare FIFO
+/// exists says so (`633;P;AtermSpare=parked`, signed with the nonce still in
+/// its environment) and waits for one line, before any startup file. `go`
+/// continues as a cold shell started now; `run` lets its startup files run
+/// hidden, to wait again at its first prompt hook (`__aterm_spare_hold`). The
+/// host holds the FIFO open read-write for the spare's life, so the open never
+/// blocks and a line written early waits in the pipe; the loop rides out a
+/// signal (bash's `read` from a FIFO with no writer was released by SIGWINCH),
+/// and a FIFO that is gone, or 50 failed reads, ends the shell. A cold shell
+/// pays one `[ -n ]`, two expansions and one `[ -p ]`, and is left with no new
+/// variable.
+macro_rules! spare_parked_hold {
+    () => {
+        "\
+# aterm warm spare (docs/DESIGN-warm-spare-2026-10-16.md): a spare waits here, before any startup file.
+if [ -n \"${ATERM_REKEY_PATH:-}\" ]; then
+  __aterm_spare_fifo=\"${ATERM_REKEY_PATH%/rekey/*}/spare/${ATERM_REKEY_PATH##*/}\"
+  if [ -p \"$__aterm_spare_fifo\" ]; then
+    printf '\\033]633;P;AtermSpare=parked;id=%s\\a' \"${ATERM_SHELL_NONCE:-}\" >/dev/tty 2>/dev/null
+    __aterm_spare_n=0
+    while :; do
+      if IFS= read -r __aterm_spare_go < \"$__aterm_spare_fifo\"; then
+        case $__aterm_spare_go in run) __aterm_spare_mode=warm; break ;; go) break ;; esac
+      else
+        __aterm_spare_n=$((__aterm_spare_n + 1))
+        { [ \"$__aterm_spare_n\" -lt 50 ] && [ -p \"$__aterm_spare_fifo\" ]; } || exit 0
+      fi
+    done 2>/dev/null
+    SECONDS=0
+  fi
+fi
+[ -n \"${__aterm_spare_mode:-}\" ] || unset __aterm_spare_fifo __aterm_spare_mode
+unset __aterm_spare_n __aterm_spare_go
+"
+    };
+}
+
 /// zsh wrapper .zshenv that restores ZDOTDIR and sources our integration.
 ///
 /// The wrapper reads `ATERM_ORIGINAL_ZDOTDIR` (set by [`prepare_zsh`]) to
 /// restore the user's original ZDOTDIR before sourcing their `.zshenv`.
 /// This is the same ZDOTDIR-override technique used by Kitty, Ghostty,
 /// and VS Code terminal integrations.
-const ZSH_WRAPPER: &str = "\
+const ZSH_WRAPPER: &str = concat!(
+    spare_parked_hold!(),
+    "\
 # aterm shell integration loader
 # Restore original ZDOTDIR before sourcing user config
 if [ -n \"$ATERM_ORIGINAL_ZDOTDIR\" ]; then
@@ -1090,17 +1169,27 @@ fi
 [ -f \"${ZDOTDIR:-$HOME}/.zshenv\" ] && source \"${ZDOTDIR:-$HOME}/.zshenv\"
 # Load aterm integration
 source \"$ATERM_SHELL_INTEGRATION_DIR/aterm_shell_integration.zsh\"
-";
+"
+);
 
-/// bash wrapper rcfile that sources standard profile chain then our integration.
+/// bash wrapper rcfile that sources standard profile chain then our integration:
+/// the loader on macOS, under Git Bash, and inside WSL ([`WSL_LAUNCH_SH`]), whose
+/// terminals start LOGIN shells. Every other Unix starts bash with
+/// [`BASH_LOADER`] instead ([`prepare_bash`]).
 ///
 /// `bash --rcfile` launches an interactive non-login shell which normally reads
 /// only `.bashrc`. We source the login profile chain (since terminal sessions
-/// conventionally behave like login shells) AND `.bashrc` (since many users keep
-/// aliases/functions/PATH additions there separately from `.bash_profile`).
+/// there conventionally behave like login shells) AND `.bashrc` (since many users
+/// keep aliases/functions/PATH additions there separately from `.bash_profile`).
 /// `.bashrc` is sourced last before integration to handle the common case where
-/// `.bash_profile` does NOT source `.bashrc`.
-const BASH_WRAPPER: &str = "\
+/// `.bash_profile` does NOT source `.bashrc`. (A `.bash_profile` that does source
+/// it runs it twice; macOS's bash has no system bashrc of its own, so nothing
+/// else repeats. Left as it is: the POSIX-mode start [`BASH_LOADER`] uses for a
+/// login shell is unproven on macOS's own bash 3.2, which Ghostty does not inject
+/// into either.)
+const BASH_WRAPPER: &str = concat!(
+    spare_parked_hold!(),
+    "\
 # aterm shell integration loader
 # Source standard profile chain (login-style)
 [ -f /etc/profile ] && . /etc/profile
@@ -1115,7 +1204,99 @@ fi
 [ -f \"$HOME/.bashrc\" ] && . \"$HOME/.bashrc\"
 # Load aterm integration
 . \"$ATERM_SHELL_INTEGRATION_DIR/aterm_shell_integration.bash\"
-";
+"
+);
+
+/// The bash loader on every Unix but macOS: bash's own startup, exactly once, then
+/// aterm's integration.
+///
+/// A terminal there starts an interactive NON-login shell (GNOME Terminal, Konsole,
+/// xterm, foot, kitty, Ghostty), and so does aterm: `bash --rcfile <this file>`
+/// ([`prepare_bash`]). bash has read its system bashrc before it reads an rcfile
+/// (`/etc/bash.bashrc` on Debian, Ubuntu and Arch, wherever bash was built with
+/// one, and nothing where it was not), so this file does what bash would do next:
+/// read `~/.bashrc` — or the file a `--rcfile`/`--init-file` in `shell_args`
+/// named, handed over as `ATERM_BASH_RCFILE`. Nothing else: the old login-style
+/// wrapper also read `/etc/profile` and `~/.profile` here, and on Ubuntu those
+/// read `/etc/bash.bashrc` and `~/.bashrc` again, so every tab ran both twice
+/// (the sudo hint printed twice, every PATH addition doubled, nvm and conda
+/// initialised twice).
+///
+/// A LOGIN shell (`shell_args = ["-l"]`) or `--norc` cannot be started that way:
+/// a login bash ignores `--rcfile`, and nothing stops a non-login one reading its
+/// system bashrc. aterm starts those with `--posix` and `ENV` naming this file
+/// (`ATERM_BASH_POSIX` set): in POSIX mode an interactive bash reads `$ENV` and
+/// nothing else, so this file puts bash back (`set +o posix`, the history file
+/// POSIX mode would have moved to `~/.sh_history`, the caller's own `ENV`) and
+/// reads what bash would have — for a login shell `/etc/profile` and the first of
+/// `~/.bash_profile`, `~/.bash_login`, `~/.profile` (unless `--noprofile`), for
+/// `--norc` nothing. The same start kitty and Ghostty use.
+///
+/// Like the wrappers it opens with [`spare_parked_hold!`]: a warm spare bash
+/// parks before any startup file on Linux as it does on macOS.
+const BASH_LOADER: &str = concat!(
+    spare_parked_hold!(),
+    "\
+# aterm shell integration loader: bash's own startup files, once, then aterm's.
+if [ -n \"${ATERM_BASH_POSIX:-}\" ]; then
+  # Started --posix with $ENV naming this file: bash read nothing else.
+  builtin unset ATERM_BASH_POSIX ENV
+  if [ -n \"${ATERM_BASH_ENV+set}\" ]; then
+    builtin export ENV=\"$ATERM_BASH_ENV\"
+    builtin unset ATERM_BASH_ENV
+  fi
+  builtin set +o posix
+  builtin shopt -u inherit_errexit 2>/dev/null
+  if [ -n \"${ATERM_BASH_HISTFILE:-}\" ]; then
+    builtin export -n HISTFILE
+    builtin unset ATERM_BASH_HISTFILE
+  fi
+  if builtin shopt -q login_shell && [ -z \"${ATERM_BASH_NOPROFILE:-}\" ]; then
+    [ -f /etc/profile ] && builtin source /etc/profile
+    if [ -f \"$HOME/.bash_profile\" ]; then
+      builtin source \"$HOME/.bash_profile\"
+    elif [ -f \"$HOME/.bash_login\" ]; then
+      builtin source \"$HOME/.bash_login\"
+    elif [ -f \"$HOME/.profile\" ]; then
+      builtin source \"$HOME/.profile\"
+    fi
+  fi
+  builtin unset ATERM_BASH_NOPROFILE
+elif [ -n \"${ATERM_BASH_RCFILE+set}\" ]; then
+  # --rcfile/--init-file in shell_args: that file in place of ~/.bashrc, a
+  # leading `~` or `~name` expanded as bash expands the one it is handed.
+  __aterm_rcfile=$ATERM_BASH_RCFILE
+  builtin unset ATERM_BASH_RCFILE
+  case $__aterm_rcfile in
+    \"~\") __aterm_rcfile=$HOME ;;
+    \"~/\"*) __aterm_rcfile=$HOME/${__aterm_rcfile#\"~/\"} ;;
+    \"~\"*)
+      __aterm_user=${__aterm_rcfile%%/*}
+      __aterm_user=${__aterm_user#\"~\"}
+      case $__aterm_user in
+        *[!A-Za-z0-9._-]*) ;;
+        *)
+          builtin eval \"__aterm_home=~$__aterm_user\"
+          if [ \"$__aterm_home\" != \"~$__aterm_user\" ]; then
+            __aterm_rcfile=$__aterm_home${__aterm_rcfile#\"~$__aterm_user\"}
+          fi
+          ;;
+      esac
+      builtin unset __aterm_user __aterm_home
+      ;;
+  esac
+  if [ -f \"$__aterm_rcfile\" ]; then
+    builtin source \"$__aterm_rcfile\"
+  fi
+  builtin unset __aterm_rcfile
+else
+  # bash has read its system bashrc already: ~/.bashrc is what it reads next.
+  [ -f \"$HOME/.bashrc\" ] && builtin source \"$HOME/.bashrc\"
+fi
+# Load aterm integration
+builtin source \"$ATERM_SHELL_INTEGRATION_DIR/aterm_shell_integration.bash\"
+"
+);
 
 /// Convert a path to the `String` value placed in a child-environment
 /// variable.
@@ -1196,8 +1377,17 @@ fn prepare_zsh(base: &Path) -> InjectionEnv {
     }
 }
 
+/// The bash loader this platform starts bash on: [`BASH_LOADER`] (`bash/bashrc`)
+/// on every Unix but macOS, whose terminals start non-login shells; elsewhere
+/// (macOS, Git Bash on Windows) the login-style [`BASH_WRAPPER`] (`bash/rcfile`).
+pub(crate) const BASH_LOADER_FILE: &str = if cfg!(all(unix, not(target_os = "macos"))) {
+    "bashrc"
+} else {
+    "rcfile"
+};
+
 fn prepare_bash(base: &Path) -> InjectionEnv {
-    let rcfile = base.join("bash").join("rcfile");
+    let rcfile = base.join("bash").join(BASH_LOADER_FILE);
     InjectionEnv {
         env_add: vec![(
             "ATERM_SHELL_INTEGRATION_DIR".to_string(),
@@ -1255,6 +1445,25 @@ fn prepare_fish(base: &Path) -> InjectionEnv {
 /// print a scary "unauthorized" error at every launch. The flag scopes ONLY to
 /// this aterm-spawned process and is valid in both 5.1 and pwsh 7. (No-op on
 /// non-Windows pwsh.)
+///
+/// Running after the profile is also what lets the script's key layer defer
+/// to the user: in an aterm tab (`ATERM_CHILD` or `ATERM_SESSION_ID`), with
+/// PSReadLine loaded and its edit mode still `Windows`, it binds readline's
+/// chords (Ctrl+A/E/B/F/K/U/W/P/N/D/T/Y/_, Alt+B/F/Backspace/Left/Right, and
+/// Alt+U/L/C where PSReadLine has them), each only where the chord is unbound
+/// or still holds its stock Windows-mode function and starts no bound two-key
+/// chord, so a key the profile bound to anything else keeps the profile's
+/// binding. Where PSReadLine has `AcceptSuggestion` (pwsh 7, not 5.1's
+/// PSReadLine 2.0.0), Ctrl+E pressed at the end of the line also accepts the
+/// inline suggestion, as end-of-line does under zsh-autosuggestions: from inside
+/// the line the first press moves to the end and a second accepts, so Ctrl+E then
+/// Enter runs what was typed. There `-Bound` lists it as
+/// `AcceptSuggestionAndEndOfLine`. A key the profile binds
+/// to its own stock function (Ctrl+A `SelectAll`, Ctrl+Y `Redo`) looks stock and
+/// is replaced;
+/// `$env:ATERM_DISABLE_READLINE_KEYS` set in the profile turns the whole layer
+/// off, and a profile that chose Emacs or Vi is left alone. The script's KEY
+/// BINDINGS block has the measurements behind it.
 fn prepare_powershell(base: &Path) -> InjectionEnv {
     InjectionEnv {
         env_add: vec![(
@@ -1512,63 +1721,6 @@ mod tests {
     include!("tests.rs");
     include!("tests_loader.rs");
     include!("tests_tty.rs");
-
-    /// Regression test for #5959/#5960: `autoload -Uz add-zsh-hook` must
-    /// appear before any `add-zsh-hook` call in the zsh script. Violating
-    /// this ordering causes zsh to exit immediately when ATERM_PROMPT_STYLE
-    /// is set to a non-"none" value.
-    #[test]
-    fn test_zsh_autoload_before_hook_usage() {
-        let script = scripts::ZSH;
-        let autoload_pos = script
-            .find("autoload -Uz add-zsh-hook")
-            .expect("zsh script must contain 'autoload -Uz add-zsh-hook'");
-
-        // Every `add-zsh-hook` call (outside comments) must come after autoload.
-        for (i, line) in script.lines().enumerate() {
-            let trimmed = line.trim();
-            if trimmed.starts_with('#') {
-                continue;
-            }
-            if trimmed.contains("add-zsh-hook") && !trimmed.contains("autoload") {
-                let byte_offset: usize = script.lines().take(i).map(|l| l.len() + 1).sum();
-                assert!(
-                    byte_offset > autoload_pos,
-                    "line {}: `add-zsh-hook` call appears before \
-                     `autoload -Uz add-zsh-hook` — this will crash zsh \
-                     when ATERM_PROMPT_STYLE is set. Line: {trimmed}",
-                    i + 1,
-                );
-            }
-        }
-    }
-
-    /// The zsh script must define `__aterm_precmd` and `__aterm_preexec`
-    /// before installing them as hooks.
-    #[test]
-    fn test_zsh_functions_defined_before_hooks() {
-        let script = scripts::ZSH;
-        let precmd_def = script
-            .find("__aterm_precmd()")
-            .expect("must define __aterm_precmd()");
-        let preexec_def = script
-            .find("__aterm_preexec()")
-            .expect("must define __aterm_preexec()");
-
-        let hook_precmd = script
-            .find("add-zsh-hook precmd __aterm_precmd")
-            .expect("must install precmd hook");
-        let hook_preexec = script
-            .find("add-zsh-hook preexec __aterm_preexec")
-            .expect("must install preexec hook");
-
-        assert!(
-            precmd_def < hook_precmd,
-            "__aterm_precmd() must be defined before add-zsh-hook installs it"
-        );
-        assert!(
-            preexec_def < hook_preexec,
-            "__aterm_preexec() must be defined before add-zsh-hook installs it"
-        );
-    }
+    include!("tests_spare.rs");
+    include!("tests_pwsh_keys.rs");
 }

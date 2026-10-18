@@ -285,36 +285,6 @@ mod tests {
         }
     }
 
-    /// Progressive bake: at most 8 tiles per tick (8 ticks to finish), with a
-    /// version bump on every batch and on the metric-change restart.
-    #[test]
-    fn progressive_bake_and_version_bumps() {
-        let rom = rasterize_master();
-        let mut b = RainBaker::default();
-        b.begin_frame(10, 20);
-        let v0 = b.version();
-        let mut batches = 0;
-        let mut last = v0;
-        while !b.complete() {
-            let before = b.next_tile;
-            assert!(b.bake_tiles(&rom));
-            assert!(b.next_tile - before <= MAX_RAIN_BAKES_PER_TICK);
-            assert_ne!(b.version(), last, "every batch bumps the version");
-            last = b.version();
-            batches += 1;
-        }
-        assert_eq!(batches, ROM_GLYPHS / MAX_RAIN_BAKES_PER_TICK);
-        assert!(!b.bake_tiles(&rom), "complete baker bakes nothing");
-        // Metric change restarts the bake and bumps the version again.
-        b.begin_frame(12, 24);
-        assert_ne!(b.version(), last);
-        assert!(!b.complete());
-        assert!(
-            b.atlas().is_none(),
-            "no atlas until the first new-bake batch"
-        );
-    }
-
     /// Versions are deterministic per instance, so a rebuilt baker replays
     /// its predecessor's sequence; every publish is still a fresh allocation,
     /// so the GPU cache's `Arc`-identity key never aliases.

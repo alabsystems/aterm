@@ -10,7 +10,6 @@ use crate::plan::StageId;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Check {
     Fmt,
-    Guards,
     Census,
     Lint,
     Test,
@@ -19,15 +18,17 @@ pub enum Check {
     Cells,
     WasmSmoke,
     WasmGlue,
+    Browser,
     Libc,
     Spec,
-    Smoke,
+    Checkers,
+    GpuOracle,
     Appkit,
     Export,
-    Trust,
     Measure,
     Sealed,
-    Codex,
+    CodexAlab,
+    Linux,
 }
 
 /// What a check runs over.
@@ -46,8 +47,6 @@ pub struct Spec {
     pub name: &'static str,
     /// The stages whose rows decide it.
     pub stages: &'static [StageId],
-    /// Stages it needs run first (prebuilds), pulled into the plan with it.
-    pub helpers: &'static [StageId],
     pub reach: Reach,
     /// What the machine must have for it to run rather than skip.
     pub needs: &'static str,
@@ -56,57 +55,43 @@ pub struct Spec {
 }
 
 /// Every check, in the order `list` shows them and a verdict names them.
-pub const CHECKS: [Spec; 19] = [
+pub const CHECKS: [Spec; 20] = [
     Spec {
         check: Check::Fmt,
         name: "fmt",
         stages: &[StageId::Formatting],
-        helpers: &[],
         reach: Reach::WholeTree,
         needs: "trustfmt",
         runs: "trustfmt --check, each .rs at its crate's edition (--fix rewrites)",
     },
     Spec {
-        check: Check::Guards,
-        name: "guards",
-        stages: &[StageId::Guards],
-        helpers: &[],
-        reach: Reach::WholeTree,
-        needs: "-",
-        runs: "aterm-census's source guards (the rules no type or lint can hold)",
-    },
-    Spec {
         check: Check::Census,
         name: "census",
         stages: &[StageId::Census],
-        helpers: &[],
         reach: Reach::WholeTree,
         needs: "-",
-        runs: "aterm-census's five L0 censuses",
+        runs: "aterm-census's source guards and its five L0 censuses",
     },
     Spec {
         check: Check::Lint,
         name: "lint",
         stages: &[StageId::Tippy],
-        helpers: &[],
         reach: Reach::Selection,
         needs: "targo-tippy",
-        runs: "targo-tippy <selection> --all-targets -- -D warnings",
+        runs: "targo-tippy <selection> --all-targets -- -D warnings (+ aterm-gpu's wgpu-oracle arm)",
     },
     Spec {
         check: Check::Test,
         name: "test",
-        stages: &[StageId::Test],
-        helpers: &[StageId::TestCompile],
+        stages: &[StageId::TestCompile, StageId::Test],
         reach: Reach::Selection,
         needs: "targo; python3.11+ and openssl 3 (aterm-update), node (aterm-verify's glue)",
-        runs: "targo test <selection> --tests, binaries in parallel",
+        runs: "targo test <selection> --tests (no examples), binaries in parallel",
     },
     Spec {
         check: Check::Doc,
         name: "doc",
         stages: &[StageId::Doctests],
-        helpers: &[],
         reach: Reach::Selection,
         needs: "targo, trustdoc",
         runs: "targo test --doc <selection>",
@@ -115,7 +100,6 @@ pub const CHECKS: [Spec; 19] = [
         check: Check::Forge,
         name: "forge",
         stages: &[StageId::Forge],
-        helpers: &[],
         reach: Reach::WholeTree,
         needs: "targo",
         runs: "aterm-forge check: the third-party surface policy",
@@ -124,7 +108,6 @@ pub const CHECKS: [Spec; 19] = [
         check: Check::Cells,
         name: "cells",
         stages: &[StageId::ForeignCells],
-        helpers: &[],
         reach: Reach::WholeTree,
         needs: "rustup stable + the foreign stds, clippy",
         runs: "the foreign cells (or each --cell), linted for their own triples (STOCK EXCEPTION)",
@@ -133,25 +116,30 @@ pub const CHECKS: [Spec; 19] = [
         check: Check::WasmSmoke,
         name: "wasm-smoke",
         stages: &[StageId::WasmSmoke],
-        helpers: &[],
         reach: Reach::WholeTree,
-        needs: "node, rustup stable + wasm32, the pinned wasm-bindgen",
+        needs: "node, rustup stable + wasm32",
         runs: "both web modules (dev) under node: their host boundary, then the CPU replay (STOCK EXCEPTION)",
     },
     Spec {
         check: Check::WasmGlue,
         name: "wasm-glue",
         stages: &[StageId::WasmGlue],
-        helpers: &[],
         reach: Reach::WholeTree,
-        needs: "node, rustup stable + wasm32",
-        runs: "`verify glue` on aterm-wasm-abi's toy: goldens, node, a planted bug (STOCK EXCEPTION)",
+        needs: "node, rustup stable + wasm32, wasm-bindgen 0.2.108 (the oracle)",
+        runs: "`verify glue` on aterm-wasm-abi's toy: goldens, node, a planted bug; the wasm-bindgen oracle (STOCK EXCEPTION)",
+    },
+    Spec {
+        check: Check::Browser,
+        name: "browser",
+        stages: &[StageId::BrowserLane],
+        reach: Reach::WholeTree,
+        needs: "a Chromium (`verify fetch-browser`), rustup stable + wasm32",
+        runs: "both web modules (dev) in headless Chromium: a WebGL2 boot, GPU vs CPU pixels, GPU vs the recorded wgpu-WebGL frames (STOCK EXCEPTION)",
     },
     Spec {
         check: Check::Libc,
         name: "libc",
         stages: &[StageId::LibcOracle],
-        helpers: &[],
         reach: Reach::WholeTree,
         needs: "targo",
         runs: "aterm-libc-oracle (this host's native ABI cell)",
@@ -159,53 +147,51 @@ pub const CHECKS: [Spec; 19] = [
     Spec {
         check: Check::Spec,
         name: "spec",
-        stages: &[StageId::SpecCheck, StageId::TyConformances],
-        helpers: &[],
+        stages: &[StageId::SpecCheck],
         reach: Reach::WholeTree,
-        needs: "ty, ay, trust-ir (aterm pkg install --default-set)",
-        runs: "spec-check (ty, ay, trust-ir over every registered model), the ty-only tests",
+        needs: "ty, ay (aterm pkg install --default-set)",
+        runs: "spec-check (ty over every registered model, ay over the proof bundles)",
     },
     Spec {
-        check: Check::Smoke,
-        name: "smoke",
-        stages: &[StageId::ControlSocketSmoke],
-        helpers: &[StageId::DriverBuilds],
+        check: Check::Checkers,
+        name: "checkers",
+        stages: &[StageId::CheckersCompile, StageId::SpecCheckers],
         reach: Reach::WholeTree,
-        needs: "targo, unix",
-        runs: "a headless aterm-gui over its control socket (alone)",
+        needs: "targo, ty",
+        runs: "targo test --workspace --features aterm-spec/checkers (own target dir; after test)",
+    },
+    Spec {
+        check: Check::GpuOracle,
+        name: "gpu-oracle",
+        stages: &[StageId::GpuOracleCompile, StageId::GpuOracle],
+        reach: Reach::WholeTree,
+        needs: "targo, a GPU wgpu can open",
+        runs: "targo test -p aterm-gpu --features wgpu-oracle (own target dir; after test; with test when aterm-gpu is selected)",
     },
     Spec {
         check: Check::Appkit,
         name: "appkit",
         stages: &[StageId::RedrawConformance, StageId::ObjcDrives],
-        helpers: &[StageId::TailDriverBuilds],
         reach: Reach::WholeTree,
         needs: "macOS, a free desktop",
-        runs: "the redraw harness and the objc drives (windows)",
+        runs: "the redraw harness and the objc drives, built in the main target (windows)",
     },
     Spec {
         check: Check::Export,
         name: "export",
         stages: &[StageId::Export],
-        helpers: &[],
         reach: Reach::WholeTree,
         needs: "network, ~/publication, gitleaks, rustup trust, HEAD pushed",
         runs: "ship check --export (the publication engine's export guards)",
     },
     Spec {
-        check: Check::Trust,
-        name: "trust",
-        stages: &[StageId::TrustAdvisory],
-        helpers: &[],
-        reach: Reach::Selection,
-        needs: "targo",
-        runs: "ship trust run -p <the selection's libraries>",
-    },
-    Spec {
         check: Check::Measure,
         name: "measure",
-        stages: &[StageId::MeasuringTests, StageId::GuiSmoke],
-        helpers: &[],
+        stages: &[
+            StageId::MeasurePrebuild,
+            StageId::MeasuringTests,
+            StageId::GuiSmoke,
+        ],
         reach: Reach::WholeTree,
         needs: "--app <APP>, a free desktop",
         runs: "the ignored paint/spin rows on <APP>, GUI pacing smoke (alone)",
@@ -214,26 +200,33 @@ pub const CHECKS: [Spec; 19] = [
         check: Check::Sealed,
         name: "sealed",
         stages: &[StageId::SealedLane],
-        helpers: &[],
         reach: Reach::WholeTree,
         needs: "targo",
         runs: "targo test -p aterm --features sealed (two_nodes_sealed, fabric_world)",
     },
     Spec {
-        check: Check::Codex,
-        name: "codex",
-        stages: &[StageId::CodexLiveUpgrade],
-        helpers: &[],
+        check: Check::CodexAlab,
+        name: "codex-alab",
+        stages: &[StageId::CodexAlabProof],
         reach: Reach::WholeTree,
-        needs: "an older managed Codex",
-        runs: "lab codex-upgrade (alone; by hand)",
+        needs: "a packaged codex-alab (--package, LAB_CODEX, or the managed codex)",
+        runs: "lab codex-alab-proof (alone; by hand): the native harness end to end on the real package",
+    },
+    Spec {
+        check: Check::Linux,
+        name: "linux",
+        stages: &[StageId::LinuxLane],
+        reach: Reach::WholeTree,
+        needs: "Apple silicon with Rosetta, lima (brew install lima), network for the first provision",
+        runs: "lab linux proof (alone; by hand): Linux tests on aarch64 and x86_64 (Rosetta), aterm-gui under \
+               Xvfb, weston, Mutter, Xwayland in a lima VM (STOCK EXCEPTION), and LW.4's recorded baseline \
+               replayed",
     },
 ];
 
 /// The bare command's set: fast, and scoped to what changed.
-pub const DEV: [Check; 6] = [
+pub const DEV: [Check; 5] = [
     Check::Fmt,
-    Check::Guards,
     Check::Census,
     Check::Lint,
     Check::Test,
@@ -241,18 +234,21 @@ pub const DEV: [Check; 6] = [
 ];
 
 /// What publication requires: the whole workspace, and a skip is not a pass.
-pub const RELEASE: [Check; 14] = [
+/// `cells` is not in it (owner ruling 2026-10-16): the release builds only the
+/// macOS bundle, so nothing it builds is for the foreign triples, and a
+/// Windows-only type error or a stable without a cross std stopped a macOS
+/// release. `verify cells` runs by hand.
+pub const RELEASE: [Check; 13] = [
     Check::Fmt,
     Check::Lint,
     Check::Test,
     Check::Doc,
-    Check::Guards,
     Check::Census,
     Check::Forge,
-    Check::Cells,
     Check::Libc,
     Check::Spec,
-    Check::Smoke,
+    Check::Checkers,
+    Check::GpuOracle,
     Check::Appkit,
     Check::Measure,
     Check::Sealed,
@@ -303,29 +299,44 @@ pub fn lookup(w: &str) -> Option<Word> {
     }
 }
 
-/// The stages a selection of checks plans: each check's own and its helpers,
-/// without repeats.
+/// The stages a selection of checks plans, each check's in order, without
+/// repeats.
 #[must_use]
 pub fn stages_of(checks: &[Check]) -> Vec<StageId> {
     let mut v: Vec<StageId> = Vec::new();
-    for c in checks {
-        for id in c.spec().helpers.iter().chain(c.spec().stages) {
-            if !v.contains(id) {
-                v.push(*id);
-            }
+    for id in checks.iter().flat_map(|c| c.spec().stages) {
+        if !v.contains(id) {
+            v.push(*id);
         }
     }
     v
 }
 
+/// The package whose tests and lint have a second arm behind a feature, and that
+/// feature: aterm-gpu's renderer against the wgpu oracle. The default build
+/// compiles none of the oracle's tests, so a selection that holds aterm-gpu
+/// tests and lints that arm too ([`with_pulled`], the lint's oracle pass).
+pub const ORACLE: (&str, &str) = ("aterm-gpu", "wgpu-oracle");
+
+/// `wanted`, plus the checks a selection that holds [`ORACLE`]'s package pulls
+/// in: `test` brings `gpu-oracle`, so the oracle's tests run wherever
+/// aterm-gpu's do, never only at release.
+#[must_use]
+pub fn with_pulled(wanted: &[Check], selects_oracle: bool) -> Vec<Check> {
+    let mut v = wanted.to_vec();
+    if selects_oracle && v.contains(&Check::Test) && !v.contains(&Check::GpuOracle) {
+        v.push(Check::GpuOracle);
+    }
+    v
+}
+
 /// The check a stage's rows count toward in this selection: the selected check
-/// that runs it, else the first selected check that needs it as a helper.
+/// that runs it.
 #[must_use]
 pub fn owner(id: StageId, checks: &[Check]) -> Option<Check> {
     checks
         .iter()
         .find(|c| c.spec().stages.contains(&id))
-        .or_else(|| checks.iter().find(|c| c.spec().helpers.contains(&id)))
         .copied()
 }
 
@@ -385,7 +396,8 @@ pub fn list_table() -> String {
         out.push('\n');
     }
     out.push_str(
-        "\ndev      fmt guards census lint test doc: the bare command, on the change cone\n\
+        "\ndev      fmt census lint test doc: the bare command, on the change cone;\n\
+         \x20        gpu-oracle too when the cone holds aterm-gpu\n\
          release  what `ship release` requires: --all implied, --app required, a skip is exit 3\n\
          perf     not a check: the performance lanes, `verify perf --list`\n",
     );
@@ -404,6 +416,7 @@ mod tests {
         assert_eq!(lookup("lint"), Some(Word::Check(Check::Lint)));
         assert_eq!(lookup("wasm-smoke"), Some(Word::Check(Check::WasmSmoke)));
         assert_eq!(lookup("wasm-glue"), Some(Word::Check(Check::WasmGlue)));
+        assert_eq!(lookup("browser"), Some(Word::Check(Check::Browser)));
         assert_eq!(lookup("contract-probe"), None);
         assert_eq!(lookup("tippy"), None);
         let mut names: Vec<&str> = CHECKS.iter().map(|s| s.name).collect();
@@ -417,37 +430,21 @@ mod tests {
     }
 
     #[test]
-    fn a_stage_counts_toward_the_check_that_runs_it_before_one_that_needs_it() {
+    fn a_selection_holding_aterm_gpu_runs_its_oracle_with_its_tests() {
         assert_eq!(
-            owner(StageId::TestCompile, &[Check::Test]),
-            Some(Check::Test)
+            with_pulled(&DEV, true),
+            [DEV.as_slice(), &[Check::GpuOracle]].concat()
+        );
+        assert_eq!(with_pulled(&DEV, false), DEV);
+        assert_eq!(
+            with_pulled(&[Check::Lint], true),
+            [Check::Lint],
+            "the lint's oracle arm is its own pass, not the oracle's tests"
         );
         assert_eq!(
-            owner(StageId::TailDriverBuilds, &[Check::Codex, Check::Appkit]),
-            Some(Check::Appkit)
+            with_pulled(&RELEASE, true),
+            RELEASE,
+            "release has it already"
         );
-        assert_eq!(owner(StageId::Test, &[Check::Lint]), None);
-        assert_eq!(
-            stages_of(&[Check::Test, Check::Smoke]),
-            [
-                StageId::TestCompile,
-                StageId::Test,
-                StageId::DriverBuilds,
-                StageId::ControlSocketSmoke
-            ]
-        );
-    }
-
-    /// A declared stage no check reaches is dead code in the CLI.
-    #[test]
-    fn every_declared_stage_belongs_to_some_check() {
-        let all: Vec<Check> = CHECKS.iter().map(|s| s.check).collect();
-        for s in crate::plan::declared(&crate::Scope::workspace()) {
-            assert!(
-                owner(s.id, &all).is_some(),
-                "{:?} belongs to no check",
-                s.id
-            );
-        }
     }
 }

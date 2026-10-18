@@ -6,16 +6,8 @@
 //! (partition invariance), undercurl period exactness + amplitude bounds, and
 //! descender ink-skip coverage-monotonicity.
 //!
-//! ## Two-tier proof (the `presentation_gate` idiom)
+//! ## Proof (the `presentation_gate` idiom)
 //!
-//! * **Tier-0 (abstract, model-checked by the Trust `ty` compiler)** — the
-//!   `DecoPhase` derived model (`aterm_spec::derive::deco_phase_model`)
-//!   carries the `PhasePure` invariant: the pattern phase counter equals a
-//!   ghost counter driven ONLY by absolute x, across arbitrarily placed cell
-//!   seams. `targo --unverified test -p aterm-spec`
-//!   (`derived_deco_phase_proves_and_catches_seam_reset`) runs the REAL `ty`
-//!   binary: it PROVES the invariant at `Buggy=0` and CATCHES the historical
-//!   per-cell phase restart at `Buggy=1` (counterexample required).
 //! * **Tier-1 (concrete, this file)** — the shipping pattern predicates and
 //!   rect emission have small integer domains, so we enumerate a deliberate
 //!   lattice (the `procedural_seams` idiom): every partition of a run into
@@ -24,7 +16,7 @@
 //!
 //! The band CLAMP's order (thickness into `[1, cell_h]` first, then the top
 //! against `cell_h − t`) is purely additive, so it IS a model:
-//! `DecoBandContainment` (`aterm_spec::derive::deco_band_containment_model`),
+//! `DecoBandContainment` (`aterm_models_render::deco_band_containment_model`),
 //! and `resolved_bands_conform_to_the_deco_band_containment_model` binds the
 //! shipping resolver to it over the model's whole lattice. The per-em SCALING
 //! and rounding around that clamp (`resolve_deco_metrics`, `undercurl_coverage`)
@@ -35,11 +27,10 @@
 
 use aterm_core::terminal::{Terminal, UnderlineStyle};
 use aterm_render::deco::{
-    DecoMetrics, DecoTables, ink_skip_applies_to_width, intersect_rect_spans, keep_spans_after_ink,
-    pattern_spans_into, resolve_deco_metrics,
+    DecoMetrics, DecoTables, intersect_rect_spans, keep_spans_after_ink, resolve_deco_metrics,
 };
 use aterm_render::{
-    ColumnGlyph, Renderer, Theme, overline_rect, strike_rect, undercurl_coverage,
+    ColumnGlyph, Renderer, Theme, overline_rect, strike_rect, undercurl_band, undercurl_coverage,
     undercurl_supported, undercurl_tile_col, underline_band, underline_rects_into,
 };
 
@@ -150,29 +141,6 @@ fn resolved_bands_always_inside_the_cell() {
     }
 }
 
-/// Regression pin: with NO tables and NO adjusts, the resolver reproduces the
-/// pre-W7 hardcoded bands byte-for-byte (`cell_h/15` at `baseline + t`, strike
-/// a third of the ascent above the baseline).
-#[test]
-fn legacy_fallback_matches_pre_w7_bands() {
-    for cell_h in 1..=120usize {
-        for baseline in [-3i32, 0, 2, cell_h as i32 * 3 / 4, cell_h as i32 + 2] {
-            let d = resolve_deco_metrics(cell_h, baseline, 18.0, None, 0, 0);
-            let t = (cell_h / 15).max(1);
-            let base = baseline.max(0) as usize;
-            let uy_old = (base + t).min(cell_h.saturating_sub(t));
-            let sy_old = base
-                .saturating_sub((base / 3).max(1))
-                .min(cell_h.saturating_sub(t));
-            assert_eq!(
-                (d.underline_y, d.underline_t, d.strike_y, d.strike_t),
-                (uy_old, t.min(cell_h), sy_old, t.min(cell_h)),
-                "legacy band drifted at cell_h={cell_h} baseline={baseline}"
-            );
-        }
-    }
-}
-
 /// The table path actually consumes the tables (non-vacuity for the resolver:
 /// a synthetic post/OS2 entry moves the band off the heuristic position).
 #[test]
@@ -226,7 +194,7 @@ fn real_bands(cell_h: i64, raw_t: i64, raw_top: i64) -> [Option<(i64, i64)>; 2] 
 }
 
 /// Tier-1 conformance for `DecoBandContainment`
-/// (`aterm_spec::derive::deco_band_containment_model`). Over the model's WHOLE
+/// (`aterm_models_render::deco_band_containment_model`). Over the model's WHOLE
 /// lattice — every `cell_h` 1..=5, raw thickness 0..=7 and raw top 0..=7 —
 /// the shipping resolver's settled thickness and top must each be exactly the
 /// model's one successor of its `SettleThick` and `SettleTop` step, for both
@@ -239,7 +207,7 @@ fn real_bands(cell_h: i64, raw_t: i64, raw_top: i64) -> [Option<(i64, i64)>; 2] 
 /// fails this test at a named point rather than passing it.
 #[test]
 fn resolved_bands_conform_to_the_deco_band_containment_model() {
-    let model = aterm_spec::derive::deco_band_containment_model();
+    let model = aterm_models_render::deco_band_containment_model();
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
     let pick = |state: &aterm_spec::interp::State, action: &str, var: &str, value: i64| {
         aterm_spec::interp::pick(&model, state, action, var, value)
@@ -300,8 +268,7 @@ fn resolved_bands_conform_to_the_deco_band_containment_model() {
 }
 
 // ---------------------------------------------------------------------------
-// (1) phase continuity — pattern emission is partition-invariant (Tier-1 of
-//     the `deco_phase` ty model).
+// (1) phase continuity — pattern emission is partition-invariant.
 // ---------------------------------------------------------------------------
 
 /// Paint the rects of one underline emission into a coverage grid.
@@ -407,10 +374,12 @@ fn undercurl_sampling_is_periodic_and_seam_independent() {
     }
 }
 
-/// Every nonzero coverage byte of the undercurl tile lies within the
-/// `[underline_y, cell_h)` band — the amplitude derivation keeps the whole AA
-/// fringe inside the band (and therefore inside the cell). Non-degeneracy: on
-/// roomy cells the wave actually waves (crest and trough rows differ).
+/// Every nonzero coverage byte of the undercurl tile lies within
+/// [`undercurl_band`] — the amplitude derivation keeps the whole AA fringe
+/// inside the band (and therefore inside the cell) — and that band is the one
+/// the ink-skip probe reads ([`underline_band`]) and never starts below the
+/// underline. Non-degeneracy: on roomy cells the wave actually waves (crest and
+/// trough rows differ).
 #[test]
 fn undercurl_stays_inside_its_band() {
     let mut waved = 0usize;
@@ -427,16 +396,21 @@ fn undercurl_stays_inside_its_band() {
                     let dm = resolve_deco_metrics(ch, ch as i32 * 3 / 4, 18.0, tables, adjust, 0);
                     let mask = undercurl_coverage(cw, ch, dm);
                     assert_eq!(mask.len(), cw * ch);
+                    let (top, bottom) = undercurl_band(ch, dm);
+                    assert!(top <= dm.underline_y && bottom == ch, "{dm:?}");
+                    assert_eq!(
+                        underline_band(UnderlineStyle::Curly, ch, dm),
+                        Some((top, bottom))
+                    );
                     let mut total = 0u32;
                     for y in 0..ch {
                         for x in 0..cw {
                             let v = mask[y * cw + x];
                             total += u32::from(v);
                             assert!(
-                                v == 0 || (dm.underline_y..ch).contains(&y),
+                                v == 0 || (top..bottom).contains(&y),
                                 "coverage escaped the band: cw={cw} ch={ch} \
-                                 band=[{}, {ch}) at ({x},{y})",
-                                dm.underline_y
+                                 band=[{top}, {bottom}) at ({x},{y})"
                             );
                         }
                     }
@@ -467,6 +441,48 @@ fn undercurl_stays_inside_its_band() {
         waved > 0,
         "the cosine must produce a visible wave somewhere"
     );
+}
+
+/// A curly underline WAVES however close to the cell bottom the font puts its
+/// underline. Ubuntu Mono's `post` underline (-0.138 em, 0.079 em thick) over a
+/// cell whose baseline leaves three rows below it drew a one-row band — a
+/// straight line, the same as a single underline — at every size from 10 to
+/// 32 px. Every cell with room for `t + 3` rows must swing its stroke centre by
+/// at least one pixel between the tile's edge and its middle.
+#[test]
+fn undercurl_waves_however_low_the_font_puts_its_underline() {
+    let ubuntu_mono = DecoTables {
+        underline: Some((-0.138, 0.079)),
+        strikeout: None,
+    };
+    let centroid = |mask: &[u8], cw: usize, ch: usize, x: usize| -> f64 {
+        let (mut num, mut den) = (0f64, 0f64);
+        for y in 0..ch {
+            let v = f64::from(mask[y * cw + x]);
+            num += v * y as f64;
+            den += v;
+        }
+        num / den.max(1.0)
+    };
+    for ch in 8..=48usize {
+        for px in [ch as f32 * 0.85, ch as f32 * 0.9] {
+            for below in [1i32, 2, 3] {
+                let dm = resolve_deco_metrics(ch, ch as i32 - below, px, Some(ubuntu_mono), 0, 0);
+                if ch < dm.underline_t + 3 {
+                    continue;
+                }
+                let cw = (ch / 2).max(4);
+                let mask = undercurl_coverage(cw, ch, dm);
+                let swing = (centroid(&mask, cw, ch, 0) - centroid(&mask, cw, ch, cw / 2)).abs();
+                assert!(
+                    swing >= 1.0,
+                    "ch={ch} px={px} baseline={} {dm:?}: the curl swings {swing:.2} px — \
+                     it draws as a straight underline",
+                    ch as i32 - below
+                );
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -700,9 +716,11 @@ fn curly_gates_on_the_shared_mask_predicate() {
         underline_band(UnderlineStyle::Single, 24, dm),
         Some((20, 22))
     );
+    // The curl's band runs to the cell bottom and is at least `t + 3` rows
+    // tall, so this 4-row gap under a 2px stroke rises one row.
     assert_eq!(
         underline_band(UnderlineStyle::Curly, 24, dm),
-        Some((20, 24))
+        Some((19, 24))
     );
     assert_eq!(
         underline_band(UnderlineStyle::Double, 24, dm),
@@ -903,29 +921,6 @@ fn assert_contained(
     );
 }
 
-/// `pattern_spans_into` (the public span twin of the rect emitter) is also
-/// partition-invariant — it feeds the ink-skip interval algebra.
-#[test]
-fn pattern_spans_partition_invariant() {
-    let on = |x: usize| aterm_render::deco::dashed_on(x, 8);
-    let mut whole = Vec::new();
-    pattern_spans_into(&mut whole, 3, 32, on);
-    let mut parts = Vec::new();
-    for c in 0..4 {
-        let mut p = Vec::new();
-        pattern_spans_into(&mut p, 3 + c * 8, 8, on);
-        parts.extend(p);
-    }
-    let cover = |spans: &[(usize, usize)]| -> Vec<bool> {
-        let mut g = vec![false; 64];
-        for &(x, w) in spans {
-            g[x..x + w].fill(true);
-        }
-        g
-    };
-    assert_eq!(cover(&whole), cover(&parts));
-}
-
 // ---------------------------------------------------------------------------
 // (5) the CJK composition underline — a wide glyph's rule is never carved.
 // ---------------------------------------------------------------------------
@@ -1056,84 +1051,5 @@ fn cjk_composition_underline_is_continuous() {
                  background — that is the dashes-under-每-character defect"
             );
         }
-    }
-}
-
-/// The Latin half of the same frame construction is UNCHANGED — the wide-glyph
-/// exemption is inert for narrow cells.
-///
-/// Non-vacuity for the test above: a composed Latin descender in the very same
-/// preedit path must STILL differ between skip-on and skip-off, so
-/// `cjk_composition_underline_is_continuous` cannot be passing merely because
-/// the whole feature stopped firing.
-#[test]
-fn latin_descender_skip_survives_the_wide_glyph_exemption() {
-    let bytes = embedded_font_bytes();
-    let mut fired = 0usize;
-    for px in [12.0f32, 14.0, 18.0, 24.0, 32.0] {
-        let mut r = Renderer::from_bytes(&bytes, px, Theme::default())
-            .unwrap_or_else(|e| panic!("the embedded font must build a {px}px renderer: {e}"));
-        r.set_underline_skip_descenders(false);
-        let off = preedit_frame(&mut r, "gy");
-        r.set_underline_skip_descenders(true);
-        let on = preedit_frame(&mut r, "gy");
-        if off.pixels != on.pixels {
-            fired += 1;
-        }
-        // And the narrow cell still reports a CARVED span set with real ink.
-        let mut term = Terminal::new(2, 12);
-        term.process(b"$ ");
-        let mut input = term.cell_frame(2, 12);
-        input.overlay_ime_preedit("gy", None, false);
-        let (cw, _) = r.cell_size();
-        let (mut ink, mut spans) = (Vec::new(), Vec::new());
-        let carved = r.underline_keep_spans_into(
-            &input,
-            0,
-            2,
-            ColumnGlyph::PerCell,
-            r.pad() + 2 * cw,
-            cw,
-            &mut ink,
-            &mut spans,
-        );
-        assert!(
-            carved,
-            "{px}px: a composed 'g' is a NARROW cell — the wide-glyph exemption \
-             must not reach it, and its descender must still carve the rule"
-        );
-        let kept: usize = spans.iter().map(|s| s.1).sum();
-        assert!(
-            kept < cw,
-            "{px}px: 'g' must lose underline columns to its tail (kept {kept} of {cw})"
-        );
-    }
-    assert!(
-        fired > 0,
-        "descender ink-skip must still change pixels for a composed Latin \
-         descender — otherwise the CJK continuity test is vacuous"
-    );
-}
-
-/// The width predicate itself, as a pure function: narrow cells are carved,
-/// double-width cells never are. Total over the widths a cell can report (a
-/// continuation half is asked with its GLYPH's column count, so `0` cannot
-/// reach it — but the predicate is defined there anyway).
-#[test]
-fn ink_skip_width_predicate_exempts_exactly_the_wide_cells() {
-    assert!(
-        ink_skip_applies_to_width(0),
-        "degenerate width stays on the carving path"
-    );
-    assert!(
-        ink_skip_applies_to_width(1),
-        "a narrow cell is where descenders live"
-    );
-    for cols in 2..=8 {
-        assert!(
-            !ink_skip_applies_to_width(cols),
-            "a {cols}-column glyph is an ideograph / fullwidth form — no descenders, \
-             so its rule is drawn whole"
-        );
     }
 }

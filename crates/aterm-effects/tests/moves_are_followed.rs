@@ -15,7 +15,7 @@
 //! * a frame that scrolls samples nothing, so a box redrawn under a scroll on every
 //!   frame is never seen standing;
 //! * a line the hand left moved two rows is followed only when that row is sampled
-//!   (`no_row_two_away_is_named` in `rainbow_kitty/mod.rs`);
+//!   (`a_waiting_key_s_arming_rows_have_slots_of_their_own` in `rainbow_kitty/mod.rs`);
 //! * a line the hand left is on its retract, and a band that followed its text
 //!   still retracts on its own clock;
 //! * a line under a near copy of itself that a move carries the copy onto reads as
@@ -2219,7 +2219,7 @@ fn num_of(id: &str, key: &str) -> u64 {
 /// A wrapped prompt in an inline box at 48 and 72 columns, moved `±1`/`±2` once or
 /// up to three times, 60–300 ms apart; one frame after each move no lit line is
 /// dark. Limit at 48 columns: a move up two rows lands a line the hand left on a row
-/// no band names (`no_row_two_away_is_named`).
+/// no band names (`a_waiting_key_s_arming_rows_have_slots_of_their_own`).
 #[test]
 fn a_multi_line_inline_box_pushed_by_streamed_rows_follows() {
     holds_but(
@@ -2279,7 +2279,7 @@ fn a_paste_then_a_wrap_on_the_next_frame_follows() {
 /// moved `±1`/`±2` once or twice, 60 or 150 ms apart. Limits:
 ///
 /// * a first move up two rows: the line the hand left lands on a row no band names
-///   (`no_row_two_away_is_named`);
+///   (`a_waiting_key_s_arming_rows_have_slots_of_their_own`);
 /// * a near copy: `tag it` under `log it` (`g it` at the same columns), and a move
 ///   carrying `log it` onto its row reads as rewritten in place (the six-line
 ///   prompt, and the seven-line one on a first move one row down);

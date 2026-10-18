@@ -1,0 +1,18 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab) · the stub's call `muse.bash {command: "touch probe.txt", description: "Create the probe file", sandbox_permissions: "require_escalated"}` (the one shell call that asks in the default on-request mode): the shell approval box, before any key · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+  Muse Code 1.4.10
+
+❯ toolstart
+
+◆ Calling tools (2s · esc to interrupt)
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+Would you like to run the following command?
+
+  $ touch probe.txt
+
+⟩ 1. Yes, proceed (y)
+  2. No, and tell Muse Code what to do differently (esc)
+Change approval defaults in /permissions
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  lab-stub · high · /private/tmp/at.lab0/proj · Auto-review

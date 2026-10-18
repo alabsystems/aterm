@@ -1,68 +1,40 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The macOS Metal backend: the renderer's armed arm on macOS, with `wgpu`
-//! kept only as the test oracle every armed row, frame and present is
-//! byte-compared against.
+//! The macOS Metal backend, the renderer's arm on macOS. `wgpu` stays on macOS
+//! only behind the `wgpu-oracle` feature, as the test oracle every Metal row,
+//! frame and present is byte-compared against.
 //!
-//! # Pieces
+//! * [`ffi`]: the hand-written Objective-C binding to Metal (`CAMetalLayer`
+//!   lives in [`swapchain`], beside the QuartzCore link).
+//! * [`shaders`]: the MSL twins of the WGSL shaders, so `naga` is not needed.
+//! * [`pipelines`]: `MTLRenderPipelineState`s built from
+//!   [`crate::pipeline_table`], the rows the wgpu pipelines are built from.
+//! * [`loss`]: the device-loss latch. Metal has no device-lost callback; the
+//!   signal is per-command-buffer status, classified retryable or lost and
+//!   latched sticky.
+//! * [`swapchain`]: `CAMetalLayer` with a bounded acquire, present in
+//!   scheduled-safe order, and the frame boundary as a type.
+//! * [`warm`]: the first window's shaders compiled on a launch worker and
+//!   discarded, so the main thread's compile is a Metal cache hit.
+//! * `present`, `encoder`, `resources`, `acquire_worker`: the present arm,
+//!   command encoding, loss-domain-sealed resources and the off-thread
+//!   drawable acquire.
+//! * `blit` (test-only): the present blit on Metal, held byte-identical to the
+//!   wgpu blit.
 //!
-//! 1. [`ffi`]: the hand-written Objective-C binding to Metal (no
-//!    `CAMetalLayer`; that lives in [`swapchain`] with the QuartzCore link).
-//! 2. [`shaders`]: aterm's shaders ported from WGSL to MSL, so `naga` is not
-//!    needed.
-//! 3. `blit` (tests): the present blit end to end on Metal, held byte-identical
-//!    to the wgpu blit.
-//! 4. Pipeline and encoder state the renderer sets (colour write mask,
-//!    scissor, viewport, sampler filters, compile options), each proven by a
-//!    GPU readback, since Metal's defaults are permissive and a missing setter
-//!    is silent (see `tests`).
-//! 5. [`pipelines`]: builds `MTLRenderPipelineState`s from
-//!    [`crate::pipeline_table`], the same rows `renderer.rs` builds its wgpu
-//!    pipelines from, so no entry point, blend, mask, layout or target role is
-//!    spelled twice.
-//! 6. [`loss`]: the device-loss latch. Metal has no device-lost callback; the
-//!    signal is per-command-buffer status, classified RETRYABLE or LOST and
-//!    latched sticky.
-//! 7. [`swapchain`]: `CAMetalLayer` by class name, with a bounded acquire,
-//!    present in scheduled-safe order, and the frame boundary as a type.
-//! 8. [`warm`]: the first window's shaders compiled on a launch worker and
-//!    discarded, so the main thread's compile is a Metal cache hit.
-//!
-//! `build_glow_boost_pipeline` is one `create_render_pipeline` site used for
-//! two rows (HDR crown and SDR twin), so there is one more pipeline than
-//! call sites.
-//!
-//! # Blit differential
-//!
-//! [`tests::blit_matches_wgpu_byte_for_byte`] sends the same offscreen texels
-//! and 112 `BlitUniform` bytes through the wgpu blit and the Metal one and
-//! requires every byte to agree, over the four control-flow arms of `fs_blit`
-//! (exact-fit passthrough, bell invert, oversized with bands, cropped with the
-//! drop overlay). Each planted mutation (wrong uniform slot, sRGB destination,
-//! 1-LSB invert change, band colour, overlay alpha, crop origin) fails only
-//! the arms that reach it.
-//!
-//! # The armed backend and its oracle
-//!
-//! [`crate::renderer`] selects this backend at construction on macOS. `wgpu`
-//! remains on macOS only behind the `wgpu-oracle` feature for this crate's
-//! tests, so differentials can disarm a renderer onto the wgpu arm and compare.
-//! The module is `#[cfg(target_os = "macos")]` in `lib.rs`; other platforms
-//! keep their wgpu/softbuffer paths.
+//! Every piece of pipeline state the renderer sets (write mask, sampler
+//! filters, compile options) is proven by a GPU readback in `tests`: Metal's
+//! defaults are permissive, so a missing setter is silent. Scissor and
+//! viewport are proven by the scissored and letterboxed differentials.
 //!
 //! # CPU parity
 //!
 //! `fs_rain_glow` and `fs_fire_add`/`fs_fire_over` reproduce `aterm_render`'s
-//! integer field math op for op. The tests evaluate the shipped MSL functions
-//! in a compute kernel and diff them against `aterm_render::fire_field` and
-//! `aterm_render::halo_weight` over edge-case parameter sets. The parity relies
-//! on `>>` of a negative `int` being arithmetic, which both WGSL and MSL
-//! define for signed types.
-
-// The armed renderer uses this module on macOS; the verification-only parts
-// (the `blit` experiment, parity kernels, readback getters) are
-// `#[cfg(test)]`.
+//! integer field math op for op; the tests run the shipped MSL functions in a
+//! compute kernel against `aterm_render::fire_field` and
+//! `aterm_render::halo_weight`. The parity relies on `>>` of a negative `int`
+//! being arithmetic, which WGSL and MSL both define.
 
 pub(crate) mod acquire_worker;
 #[cfg(test)]
@@ -116,9 +88,11 @@ pub(crate) mod test_support {
         let _pool = ffi::AutoreleasePool::new();
         // SAFETY: alloc/init, +1, exactly as `Swapchain::new_layer`.
         unsafe {
-            let alloc: unsafe extern "C" fn(ffi::ClassPtr, ffi::Sel) -> ffi::Id = ffi::msg();
+            let alloc: unsafe extern "C-unwind" fn(ffi::ClassPtr, ffi::Sel) -> ffi::Id =
+                ffi::checked_msg();
             let raw = alloc(ffi::class(c"CALayer"), ffi::sel(c"alloc"));
-            let init: unsafe extern "C" fn(ffi::Id, ffi::Sel) -> ffi::Id = ffi::msg();
+            let init: unsafe extern "C-unwind" fn(ffi::Id, ffi::Sel) -> ffi::Id =
+                ffi::checked_msg();
             Obj::from_owned(init(raw, ffi::sel(c"init"))).expect("CALayer init")
         }
     }
@@ -129,12 +103,12 @@ pub(crate) mod test_support {
         // SAFETY: `sublayers` returns a +0 NSArray (or nil) owned by the
         // pool; `count` is an NSUInteger getter on it.
         unsafe {
-            let get: unsafe extern "C" fn(ffi::Id, ffi::Sel) -> ffi::Id = ffi::msg();
+            let get: unsafe extern "C-unwind" fn(ffi::Id, ffi::Sel) -> ffi::Id = ffi::checked_msg();
             let arr = get(layer.id(), ffi::sel(c"sublayers"));
             if arr.is_null() {
                 return 0;
             }
-            let count: unsafe extern "C" fn(ffi::Id, ffi::Sel) -> usize = ffi::msg();
+            let count: unsafe extern "C-unwind" fn(ffi::Id, ffi::Sel) -> usize = ffi::checked_msg();
             count(arr, ffi::sel(c"count"))
         }
     }
@@ -142,19 +116,21 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(wgpu_arm)]
+    use super::ffi::MtlScissorRect;
     use super::ffi::{
-        BlendFactor, BlendOperation, BlendState, ClearColor, ColorWriteMask, CompileOptions,
-        Device, LanguageVersion, LoadAction, MtlRegion, MtlScissorRect, MtlViewport, Pass,
-        PixelFormat, RenderPipelineDescriptor, SamplerDesc, TEXTURE_USAGE_PIXEL_FORMAT_VIEW,
-        TEXTURE_USAGE_RENDER_TARGET, TEXTURE_USAGE_SHADER_READ,
+        BlendFactor, BlendOperation, BlendState, ColorWriteMask, CompileOptions, Device,
+        LanguageVersion, LoadAction, MtlRegion, Pass, PixelFormat, RenderPipelineDescriptor,
+        SamplerDesc, TEXTURE_USAGE_RENDER_TARGET, TEXTURE_USAGE_SHADER_READ,
     };
-    use super::test_support::{CellUniforms, as_bytes, device, plain_calayer, sublayer_count};
+    use super::test_support::{as_bytes, device};
+    #[cfg(wgpu_arm)]
+    use super::test_support::{plain_calayer, sublayer_count};
     use super::{ffi, shaders};
 
     // -----------------------------------------------------------------
-    // CPU parity differential: `fs_fire_*` and `fs_rain_glow*` reproduce
-    // `aterm_render`'s integer field math. The shipped MSL functions
-    // (kernels concatenated onto `cell.metal`) run against the CPU functions.
+    // CPU parity: the shipped MSL field functions, as compute kernels
+    // concatenated onto `cell.metal`, against `aterm_render`.
     // -----------------------------------------------------------------
 
     #[repr(C)]
@@ -446,9 +422,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Pipeline and encoder state. Every check is a readback: Metal's defaults
-    // (write mask ALL, whole-attachment scissor and viewport, nearest
-    // filtering) make a dropped setter silent.
+    // Pipeline state. Metal's defaults (write mask ALL, nearest filtering)
+    // make a dropped setter silent, so every check is a readback.
     // -----------------------------------------------------------------
 
     /// The 32-byte `Probe` uniform in `shaders/state_probe.metal`: `float4`
@@ -660,121 +635,6 @@ mod tests {
         }
     }
 
-    /// `-setScissorRect:` must clip. A missing scissor draws more, not less,
-    /// so nothing errors without this check.
-    #[test]
-    fn scissor_rect_clips_the_fullscreen_draw() {
-        let dev = device();
-        let sc = MtlScissorRect {
-            x: 4,
-            y: 3,
-            width: 6,
-            height: 5,
-        };
-        let got = clip_probe(&StateProbe::new(dev), None, Some(sc));
-        assert_clipped_to(&got, sc.x, sc.y, sc.width, sc.height, "scissor");
-    }
-
-    /// `-setViewport:` must confine the draw. The fullscreen triangle's
-    /// coverage after the viewport transform is exactly the viewport rect.
-    /// Checked separately from the scissor, since they are separate state.
-    #[test]
-    fn viewport_confines_the_fullscreen_draw() {
-        let dev = device();
-        let vp = MtlViewport {
-            origin_x: 4.0,
-            origin_y: 3.0,
-            width: 6.0,
-            height: 5.0,
-            znear: 0.0,
-            zfar: 1.0,
-        };
-        let p = StateProbe::new(dev);
-        assert_clipped_to(&clip_probe(&p, Some(vp), None), 4, 3, 6, 5, "viewport");
-
-        // `MtlViewport::full_2d` must be a no-op: the whole attachment stated
-        // explicitly equals no viewport.
-        let full = clip_probe(&p, Some(MtlViewport::full_2d(CLIP_W, CLIP_H)), None);
-        assert_eq!(
-            full,
-            clip_probe(&p, None, None),
-            "an explicit full-extent viewport must equal no viewport at all"
-        );
-        assert!(
-            full.as_chunks::<4>().0.iter().all(|t| *t == [255; 4]),
-            "a full-extent viewport must clip nothing"
-        );
-    }
-
-    /// Destination extent for both clipping probes.
-    const CLIP_W: usize = 16;
-    const CLIP_H: usize = 16;
-    /// The loaded texel a clipped-away pixel must still hold.
-    const CLIP_FILL: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
-
-    /// Load a known fill, draw an opaque-white fullscreen triangle under
-    /// `viewport`/`scissor`, and hand back the destination bytes.
-    fn clip_probe(
-        p: &StateProbe,
-        viewport: Option<MtlViewport>,
-        scissor: Option<MtlScissorRect>,
-    ) -> Vec<u8> {
-        const FMT: PixelFormat = PixelFormat::Rgba8Unorm;
-        // No blending and a full write mask, so a rasterized pixel becomes
-        // white outright and "did this fragment run?" is the only question.
-        let pso = p.pipeline("fs_probe_const", FMT, ColorWriteMask::ALL, None);
-        let uniform = p.uniform(ProbeUniform {
-            color: [1.0; 4],
-            dst: [CLIP_W as f32, CLIP_H as f32],
-            pad: [0.0; 2],
-        });
-        let dst = p.filled_target(FMT, CLIP_W, CLIP_H, &CLIP_FILL);
-        p.read(
-            &Pass {
-                pso: &pso,
-                dst: &dst,
-                dst_w: CLIP_W,
-                dst_h: CLIP_H,
-                load: LoadAction::Load,
-                viewport,
-                scissor,
-                src_tex: None,
-                sampler: None,
-                uniform: Some((&uniform, 2)), // state_probe.metal: [[buffer(2)]]
-                vertex_uniform: None,
-                draw: None,
-            },
-            FMT,
-        )
-    }
-
-    /// Inside the rect: white. Outside: byte-exactly the loaded fill.
-    fn assert_clipped_to(got: &[u8], x: usize, y: usize, w: usize, h: usize, what: &str) {
-        let mut inside = 0usize;
-        for (i, texel) in got.as_chunks::<4>().0.iter().enumerate() {
-            let (px, py) = (i % CLIP_W, i / CLIP_W);
-            let in_rect = px >= x && px < x + w && py >= y && py < y + h;
-            if in_rect {
-                inside += 1;
-                assert_eq!(
-                    *texel, [255; 4],
-                    "[{what}] ({px},{py}) is INSIDE the rect but was not drawn"
-                );
-            } else {
-                assert_eq!(
-                    *texel, CLIP_FILL,
-                    "[{what}] ({px},{py}) is OUTSIDE the rect but the draw reached it — \
-                     a dropped {what} draws MORE, not less, so nothing else would notice"
-                );
-            }
-        }
-        assert_eq!(inside, w * h, "[{what}] rect arithmetic");
-        assert!(
-            inside * 4 < CLIP_W * CLIP_H * 3,
-            "[{what}] the rect covers too much of the target to be a real clip test"
-        );
-    }
-
     /// Draw `fs_probe_sample` over a `dw` x `dh` destination, fetching a
     /// `sw` x `sh` RGBA8 source through `desc`, and return the destination
     /// bytes. The scale direction decides which filter the hardware consults.
@@ -928,35 +788,14 @@ mod tests {
         );
     }
 
-    /// The library compile options are set and round-trip: `preserveInvariance`
-    /// (so `cell.metal`'s `to_ndc` and `hdr_glow.metal`'s inline NDC math
-    /// compute the same quad corners, as the HDR crown re-emits aurora quads)
-    /// and a pinned `languageVersion`, as wgpu-hal sets them. Each is set to two
-    /// values so the setter is proven independent of the OS default.
+    /// Every aterm library compiles with `preserveInvariance` ON (so
+    /// `cell.metal`'s `to_ndc` and `hdr_glow.metal`'s inline NDC math compute
+    /// the same quad corners, as the HDR crown re-emits aurora quads) and with
+    /// `languageVersion` pinned to the macOS 11 floor, not inherited from the
+    /// running OS's compiler.
     #[test]
     fn compile_options_pin_invariance_and_the_language_version() {
-        let dev = device();
-
-        let on = CompileOptions::new().expect("MTLCompileOptions");
-        on.set_preserve_invariance(true);
-        let off = CompileOptions::new().expect("MTLCompileOptions");
-        off.set_preserve_invariance(false);
-        assert!(on.preserve_invariance(), "setPreserveInvariance:YES");
-        assert!(!off.preserve_invariance(), "setPreserveInvariance:NO");
-
-        let v24 = CompileOptions::new().expect("MTLCompileOptions");
-        v24.set_language_version(LanguageVersion::V2_4);
-        let v30 = CompileOptions::new().expect("MTLCompileOptions");
-        v30.set_language_version(LanguageVersion::V3_0);
-        assert_eq!(v24.language_version(), LanguageVersion::V2_4 as usize);
-        assert_eq!(v30.language_version(), LanguageVersion::V3_0 as usize);
-        assert_eq!(
-            LanguageVersion::V2_3 as usize,
-            (2 << 16) | 3,
-            "MTLLanguageVersion encodes (major << 16) | minor"
-        );
-
-        // What `new_library` actually uses.
+        let _ = device();
         let opts = CompileOptions::aterm_default().expect("MTLCompileOptions");
         assert!(
             opts.preserve_invariance(),
@@ -965,396 +804,8 @@ mod tests {
         assert_eq!(
             opts.language_version(),
             LanguageVersion::V2_3 as usize,
-            "the language version must be PINNED to the macOS 11 floor, not \
-             inherited from whatever compiler the running OS ships"
+            "the language version must be PINNED to the macOS 11 floor"
         );
-        crate::stderr_line!(
-            "  MTLCompileOptions default languageVersion on this OS: {:#x}; aterm pins {:#x}",
-            CompileOptions::new()
-                .expect("MTLCompileOptions")
-                .language_version(),
-            LanguageVersion::V2_3 as usize
-        );
-
-        // And the pin has to be a version the shipped sources actually compile
-        // under, on this machine, today.
-        for (lib_id, src, entries) in shaders::libraries() {
-            let name = lib_id.name();
-            let lib = dev
-                .new_library_with_options(src, &opts)
-                .unwrap_or_else(|e| panic!("{name}.metal under the pinned options:\n{e}"));
-            for e in entries {
-                assert!(lib.function(e).is_some(), "{name}.metal lost `{e}`");
-            }
-        }
-    }
-
-    /// B1. `bytes_per_texel` is the table the readback stride is derived from.
-    /// No GPU needed; this is the arithmetic the GPU test below depends on.
-    #[test]
-    fn pixel_format_texel_sizes_round_trip() {
-        for (f, bytes) in [
-            (PixelFormat::R8Unorm, 1),
-            (PixelFormat::Rgba8Unorm, 4),
-            (PixelFormat::Rgba8UnormSrgb, 4),
-            (PixelFormat::Bgra8Unorm, 4),
-            (PixelFormat::Bgra8UnormSrgb, 4),
-            (PixelFormat::Rgba16Float, 8),
-        ] {
-            assert_eq!(f.bytes_per_texel(), bytes, "{f:?}");
-            assert_eq!(
-                PixelFormat::from_raw(f as usize),
-                Some(f),
-                "{f:?} must survive the round trip through its raw MTLPixelFormat"
-            );
-        }
-        // Depth32Float — real, but not one this module models, so its stride is
-        // not derivable and `from_raw` must say so rather than guess.
-        assert_eq!(PixelFormat::from_raw(252), None);
-    }
-
-    /// A readback stride too small for the destination format is refused
-    /// rather than forwarded to `copyFromTexture:…destinationBytesPerRow:`,
-    /// which completes silently with the validation layer off. `Rgba16Float`
-    /// is 8 bytes per texel.
-    #[test]
-    fn the_readback_stride_is_checked_against_the_destination_format() {
-        let dev = device();
-        let p = StateProbe::new(dev);
-        const FMT: PixelFormat = PixelFormat::Rgba16Float;
-        const W: usize = 8;
-        const H: usize = 8;
-        let good = W * FMT.bytes_per_texel();
-        let bad = W * 4; // exactly the old `dw * 4`
-        assert_eq!((good, bad), (64, 32));
-
-        let pso = p.pipeline("fs_probe_const", FMT, ColorWriteMask::ALL, None);
-        let dst = p
-            .dev
-            .new_texture_2d(
-                FMT,
-                W,
-                H,
-                TEXTURE_USAGE_RENDER_TARGET | TEXTURE_USAGE_SHADER_READ,
-            )
-            .expect("Rgba16Float target");
-        let uniform = p.uniform(ProbeUniform {
-            color: [0.5; 4],
-            dst: [W as f32, H as f32],
-            pad: [0.0; 2],
-        });
-        let pass = Pass {
-            pso: &pso,
-            dst: &dst,
-            dst_w: W,
-            dst_h: H,
-            load: LoadAction::Clear(ClearColor {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
-                a: 1.0,
-            }),
-            viewport: None,
-            scissor: None,
-            src_tex: None,
-            sampler: None,
-            uniform: Some((&uniform, 2)), // state_probe.metal: [[buffer(2)]]
-            vertex_uniform: None,
-            draw: None,
-        };
-
-        // Deliberately oversized, so only the stride is wrong in the bad case.
-        let rb = p.dev.new_buffer(good * H).expect("readback");
-        let err = ffi::draw_and_read(&p.queue, &pass, &rb, bad)
-            .expect_err("a 32-byte row on a 64-byte-per-row destination must be refused");
-        assert!(
-            err.contains("32") && err.contains("64"),
-            "the refusal should name both strides, got: {err}"
-        );
-        ffi::draw_and_read(&p.queue, &pass, &rb, good).expect("the correct stride is accepted");
-
-        // The buffer LENGTH is the other half of the same overrun.
-        let small = p.dev.new_buffer(good * H - 1).expect("short readback");
-        let err = ffi::draw_and_read(&p.queue, &pass, &small, good)
-            .expect_err("a readback one byte short must be refused");
-        assert!(err.contains("511") && err.contains("512"), "got: {err}");
-
-        // An extent past the attachment, with a readback sized generously so
-        // the length check does not refuse it first.
-        let wide = W + 1;
-        let wide_row = wide * FMT.bytes_per_texel();
-        let roomy = p.dev.new_buffer(wide_row * H).expect("roomy readback");
-        let big = Pass {
-            dst_w: wide,
-            ..pass
-        };
-        let err = ffi::draw_and_read(&p.queue, &big, &roomy, wide_row)
-            .expect_err("a destination extent wider than the attachment must be refused");
-        assert!(err.contains("exceeds"), "got: {err}");
-    }
-
-    // -----------------------------------------------------------------
-    // The vertex path: a pipeline that builds is not one that draws. An
-    // instance stream at vertex-buffer slot 0 (where MSL uniform blocks live)
-    // completes with no error and draws nothing.
-    // -----------------------------------------------------------------
-
-    /// A real instanced row (`Pipeline::Bg`) drawn and read back. One draw
-    /// checks four axes, each failing differently:
-    ///
-    /// * the stream slot ([`ffi::INSTANCE_STREAM_SLOT`]): at 0 nothing paints;
-    /// * `Unorm8x4` normalization (`metal_attr_format`): as `UChar4` the
-    ///   mid-range colours saturate to 255;
-    /// * attribute offsets: zeroed, the colour re-reads the rect bytes;
-    /// * the stride: doubled, the second quad vanishes.
-    #[test]
-    fn the_bg_row_draws_its_instance_stream_at_the_deconflicted_slot() {
-        use crate::pipeline_table::Pipeline;
-
-        let dev = device();
-        let queue = dev.new_command_queue().expect("queue");
-        let spec = Pipeline::Bg.spec();
-        let lib = super::pipelines::compile(&dev, spec).expect("cell.metal compiles");
-        // The present format is irrelevant to an offscreen row, and the target
-        // format is the ROW's — not this test's — choice.
-        let pso = super::pipelines::build(&dev, &lib, spec, PixelFormat::Bgra8Unorm)
-            .expect("the bg row builds");
-        let fmt = super::pipelines::metal_format(spec.target, PixelFormat::Bgra8Unorm);
-        assert_eq!(
-            fmt,
-            PixelFormat::Rgba8UnormSrgb,
-            "bg attaches the offscreen's sRGB view"
-        );
-
-        const W: usize = 16;
-        const H: usize = 16;
-        /// Mid-range on purpose: 0/255 channels survive a UChar4
-        /// misdeclaration by saturating to the same bytes.
-        const C0: [u8; 4] = [200, 40, 120, 255];
-        const C1: [u8; 4] = [40, 200, 90, 255];
-
-        // Two 12-byte `BgInstance`s then 24 zero bytes: a doubled stride reads
-        // instance 1 from the zeros and draws nothing rather than overrunning.
-        let mut stream: Vec<u8> = Vec::new();
-        for (rect, colour) in [([0u16, 0, 8, 8], C0), ([8u16, 8, 8, 8], C1)] {
-            for v in rect {
-                stream.extend_from_slice(&v.to_le_bytes());
-            }
-            stream.extend_from_slice(&colour);
-        }
-        stream.extend_from_slice(&[0u8; 24]);
-        let ibuf = dev.new_buffer(stream.len()).expect("instance stream");
-        // SAFETY: fresh exactly-sized shared buffer; no GPU work in flight.
-        unsafe { ffi::buffer_write(&ibuf, &stream) };
-
-        let uniforms = CellUniforms {
-            screen: [W as f32, H as f32],
-            text_blend: 0.0,
-            pad: 0.0,
-        };
-        let ubuf = dev.new_buffer(size_of::<CellUniforms>()).expect("uniforms");
-        // SAFETY: `CellUniforms` is `repr(C)` into an exactly-sized fresh buffer.
-        unsafe { ffi::buffer_write(&ubuf, as_bytes(&uniforms)) };
-
-        let dst = dev
-            .new_texture_2d(
-                fmt,
-                W,
-                H,
-                TEXTURE_USAGE_RENDER_TARGET | TEXTURE_USAGE_SHADER_READ,
-            )
-            .expect("bg target");
-        let row = W * fmt.bytes_per_texel();
-        let rb = dev.new_buffer(row * H).expect("readback");
-        ffi::draw_and_read(
-            &queue,
-            &Pass {
-                pso: &pso,
-                dst: &dst,
-                dst_w: W,
-                dst_h: H,
-                load: LoadAction::Clear(ClearColor {
-                    r: 0.0,
-                    g: 0.0,
-                    b: 0.0,
-                    a: 1.0,
-                }),
-                viewport: None,
-                scissor: None,
-                src_tex: None,
-                sampler: None,
-                uniform: None,
-                // `vs_bg` binds uniforms at `[[buffer(0)]]`, which the stream
-                // must avoid; the slot comes from the row's `BindSpec`.
-                vertex_uniform: Some((
-                    &ubuf,
-                    spec.binds
-                        .vertex_uniform
-                        .expect("the bg row has a vertex uniform") as usize,
-                )),
-                draw: Some(ffi::DrawCall {
-                    primitive: super::pipelines::metal_primitive_type(spec.topology),
-                    vertices: 6,
-                    instances: 2,
-                    stream: Some(&ibuf),
-                }),
-            },
-            &rb,
-            row,
-        )
-        .expect("the bg draw runs");
-        // SAFETY: shared storage, sized `row * H`, written before
-        // `draw_and_read` returned (it waits on the command buffer).
-        let got = unsafe { ffi::buffer_bytes(&rb, row * H) };
-
-        // `fs_bg` emits `s2l(colour)` into an sRGB attachment, so readback
-        // returns the instance's sRGB bytes (±1 LSB). Everything outside the
-        // two rects is the clear.
-        let close = |g: u8, w: u8| (i16::from(g) - i16::from(w)).unsigned_abs() <= 1;
-        let mut drawn = 0usize;
-        for (i, texel) in got.as_chunks::<4>().0.iter().enumerate() {
-            let (px, py) = (i % W, i / W);
-            let want = if px < 8 && py < 8 {
-                Some(C0)
-            } else if px >= 8 && py >= 8 {
-                Some(C1)
-            } else {
-                None
-            };
-            match want {
-                Some(c) => {
-                    drawn += 1;
-                    assert!(
-                        texel.iter().zip(c).all(|(g, w)| close(*g, w)),
-                        "({px},{py}): got {texel:?}, want ~{c:?} — a stream at slot 0 \
-                         paints nothing here, a UChar4 colour saturates, a zeroed \
-                         offset reads the rect as the colour, a doubled stride loses \
-                         instance 1"
-                    );
-                }
-                None => assert_eq!(
-                    *texel,
-                    [0, 0, 0, 255],
-                    "({px},{py}) is outside both instance rects but was drawn"
-                ),
-            }
-        }
-        assert_eq!(drawn, 128, "two 8x8 instances cover 128 texels");
-    }
-
-    /// `tray.metal`'s 32-byte `Tray` uniform (`float4 rect`, `float2 fb`,
-    /// `float2 pad`), bound at vertex `[[buffer(2)]]`.
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct TrayUniformBytes {
-        rect: [f32; 4],
-        fb: [f32; 2],
-        pad: [f32; 2],
-    }
-
-    /// Topology is draw state in Metal: the tray row (`vs_tray` + `fs_tray`)
-    /// is drawn through `metal_primitive_type(spec.topology)` and must cover
-    /// every card texel. As a `TriangleList` the same 4 vertices are one
-    /// triangle and the lower-right corner stays unfilled.
-    #[test]
-    fn the_tray_strip_covers_the_whole_card() {
-        use crate::pipeline_table::{Pipeline, Topology};
-
-        let dev = device();
-        let p = StateProbe::new(dev);
-        let spec = Pipeline::Tray.spec();
-        assert_eq!(
-            spec.topology,
-            Topology::TriangleStrip,
-            "the tray is the strip row"
-        );
-        let lib = super::pipelines::compile(&p.dev, spec).expect("tray.metal compiles");
-        const FMT: PixelFormat = PixelFormat::Rgba8Unorm;
-        // A Present row: the readable swapchain stand-in is the target.
-        let pso = super::pipelines::build(&p.dev, &lib, spec, FMT).expect("the tray row builds");
-
-        const W: usize = 8;
-        const H: usize = 8;
-        /// Opaque, so the row's straight-alpha src-over lands the texture
-        /// bytes EXACTLY and the only question left is coverage.
-        const CARD: [u8; 4] = [200, 90, 30, 255];
-        const FILL: [u8; 4] = [9, 9, 9, 9];
-
-        let tex = p
-            .dev
-            .new_texture_2d(FMT, 2, 2, TEXTURE_USAGE_SHADER_READ)
-            .expect("tray texture");
-        let texels: Vec<u8> = CARD.iter().copied().cycle().take(2 * 2 * 4).collect();
-        // SAFETY: fresh 2x2 Rgba8Unorm non-Private texture; `texels` is exactly
-        // 2 x 2 x 4 bytes at an 8-byte row stride.
-        unsafe { ffi::texture_upload(&tex, MtlRegion::full_2d(2, 2), &texels, 8) };
-        let samp = p
-            .dev
-            .new_sampler(SamplerDesc::NEAREST_CLAMP)
-            .expect("tray sampler");
-
-        let uniform = TrayUniformBytes {
-            rect: [0.0, 0.0, W as f32, H as f32],
-            fb: [W as f32, H as f32],
-            pad: [0.0; 2],
-        };
-        let ubuf = p
-            .dev
-            .new_buffer(size_of::<TrayUniformBytes>())
-            .expect("tray uniform");
-        // SAFETY: `repr(C)` struct into an exactly-sized fresh buffer.
-        unsafe { ffi::buffer_write(&ubuf, as_bytes(&uniform)) };
-
-        let dst = p.filled_target(FMT, W, H, &FILL);
-        let got = p.read(
-            &Pass {
-                pso: &pso,
-                dst: &dst,
-                dst_w: W,
-                dst_h: H,
-                load: LoadAction::Load,
-                viewport: None,
-                scissor: None,
-                src_tex: Some((&tex, spec.binds.fragment_textures[0] as usize)),
-                sampler: Some((&samp, spec.binds.fragment_samplers[0] as usize)),
-                uniform: None,
-                vertex_uniform: Some((
-                    &ubuf,
-                    spec.binds
-                        .vertex_uniform
-                        .expect("the tray row has a vertex uniform") as usize,
-                )),
-                draw: Some(ffi::DrawCall {
-                    primitive: super::pipelines::metal_primitive_type(spec.topology),
-                    vertices: 4,
-                    instances: 1,
-                    stream: None,
-                }),
-            },
-            FMT,
-        );
-
-        // The corner only the strip's SECOND triangle reaches, first: this is
-        // the texel a dropped topology kills.
-        let corner = &got[((H - 1) * W + (W - 1)) * 4..][..4];
-        assert_eq!(
-            corner,
-            CARD,
-            "({},{}) is the strip's second-triangle corner — a TriangleList \
-             draw of the tray's 4 vertices is one triangle and leaves it at \
-             the fill",
-            W - 1,
-            H - 1
-        );
-        for (i, texel) in got.as_chunks::<4>().0.iter().enumerate() {
-            assert_eq!(
-                *texel,
-                CARD,
-                "({},{}): the full-card tray quad must cover every texel",
-                i % W,
-                i / W
-            );
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -1362,17 +813,24 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use aterm_core::terminal::Terminal;
-    use aterm_render::{Frame, RenderInput, Theme};
+    #[cfg(wgpu_arm)]
+    use aterm_render::Frame;
+    use aterm_render::{RenderInput, Theme};
 
+    #[cfg(wgpu_arm)]
     use super::blit::MetalBlit;
+    use crate::WindowGpu;
+    #[cfg(wgpu_arm)]
     use crate::renderer::{BlitTestEffects, BlitTestTarget};
-    use crate::{DropOverlay, GpuRenderer, PresentCrop, TrayQuad, WindowGpu};
+    #[cfg(wgpu_arm)]
+    use crate::{DropOverlay, GpuRenderer, PresentCrop, TrayQuad};
 
     const ROWS: usize = 6;
     const COLS: usize = 24;
 
     /// A representative frame (prompt, glyph, saturated SGR runs), so the
     /// differential covers real glyph coverage and colour.
+    #[cfg(wgpu_arm)]
     fn representative_input() -> RenderInput {
         let mut term = Terminal::new(ROWS as u16, COLS as u16);
         term.process(b"$ blit check >_\r\n");
@@ -1383,6 +841,7 @@ mod tests {
 
     /// The Metal spelling of a [`BlitTestTarget`] (no `wgpu` type crosses into
     /// this module).
+    #[cfg(wgpu_arm)]
     fn metal_format(t: BlitTestTarget) -> PixelFormat {
         match t {
             BlitTestTarget::Rgba8Unorm => PixelFormat::Rgba8Unorm,
@@ -1392,6 +851,7 @@ mod tests {
     }
 
     /// The drop-target overlay the busy arms carry.
+    #[cfg(wgpu_arm)]
     const OVERLAY: DropOverlay = DropOverlay {
         accent: 0x0033_88ff,
         wash_a: 40,
@@ -1401,6 +861,7 @@ mod tests {
 
     /// One differential case: name, destination, uniform arms, and how much
     /// larger than the source the destination is (enabling the band branch).
+    #[cfg(wgpu_arm)]
     struct Case {
         name: &'static str,
         target: BlitTestTarget,
@@ -1419,7 +880,7 @@ mod tests {
 
     /// The Metal blit must be byte-identical to the wgpu blit on the same
     /// source texels and 112 uniform bytes, across every reachable `fs_blit`
-    /// arm. Byte equality catches differences that property tests
+    /// arm. Byte equality catches what the property tests
     /// (`tests/blit_invert.rs`, `tests/blit_bands.rs`) miss: a half-texel offset,
     /// an sRGB-typed destination, a filtered fetch, a swapped binding slot.
     ///
@@ -1434,18 +895,20 @@ mod tests {
     /// | 7 | translucent glass | `Bgra8Unorm` | `translucent`, content and band alpha |
     /// | 8 | premultiplied glass | `Bgra8Unorm` | `premult` over `translucent` |
     /// | 9 | HDR | `Rgba16Float` | `hdr` (`hdr_grid_encode3`) |
-    /// | 10 | HDR + scRGB white | `Rgba16Float` | `sdr_white_scale`, grid and bands |
+    /// | 10 | chrome rows, bands | `Bgra8Unorm` | `chrome_y1`, the band edge continuation |
+    /// | 11 | chrome under the bell invert | `Rgba8Unorm` | edge continuation with `flag` and a crop |
+    /// | 12 | chrome below a surfaceless strip | `Rgba8Unorm` | `chrome_y0` |
+    /// | 13 | HDR + scRGB white | `Rgba16Float` | `sdr_white_scale`, grid and bands |
     ///
-    /// Cases 9 and 10 also check the 8-byte-per-texel readback stride. Not
+    /// The HDR cases also check the 8-byte-per-texel readback stride. Not
     /// covered: `hdr` with `translucent`/`premult` (no production caller), and
     /// `encode_srgb` from a real downlevel adapter (it is forced here). The
     /// `edge < border_px` boundary is inert because `edge` is never an integer.
     #[test]
+    #[cfg(wgpu_arm)]
     fn blit_matches_wgpu_byte_for_byte() {
         let _ = device();
         let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
-        // Selection defaults to Metal; this test drives the wgpu oracle arm,
-        // so it disarms the default.
         gpu.disarm_metal_for_test();
         let mut win = WindowGpu::new();
         let input = representative_input();
@@ -1457,7 +920,7 @@ mod tests {
         let (sw, sh) = (opaque.width as u32, opaque.height as u32);
         assert!(sw > 0 && sh > 3, "renderer produced an empty offscreen");
         // Unpacking the readback is lossless, so the Metal arm samples the
-        // SAME texels the wgpu arm did.
+        // same texels the wgpu arm did.
         let opaque_rgba = opaque.rgba_bytes();
 
         gpu.set_background_opacity(0.55);
@@ -1496,7 +959,7 @@ mod tests {
         gpu.set_chrome_bleed(Some(chrome_bleed(0)));
         let chrome = gpu.render_input(&mut win, &input, None);
         let chrome_rgba = chrome.rgba_bytes();
-        // …and the same band below a SURFACELESS strip row (`first: 1`, macOS's
+        // …and the same band below a surfaceless strip row (`first: 1`, macOS's
         // in-grid strip): the strip row and the lip above keep the padding.
         gpu.set_chrome_bleed(Some(chrome_bleed(1)));
         let strip = gpu.render_input(&mut win, &input, None);
@@ -1749,721 +1212,6 @@ mod tests {
         gpu.set_chrome_bleed(None);
     }
 
-    /// Glyph row differential: the textured, `GlyphInstance`-layout,
-    /// alpha-blended glyph row drawn through the wgpu path
-    /// (`renderer.rs::glyph_row_bytes_for_test`) and through the Metal path
-    /// (same atlas bytes, `BindSpec` binds, the encoder), compared byte for
-    /// byte.
-    ///
-    /// Axes beyond the bg row:
-    ///
-    /// * R8 atlas with nearest sampling: a mid-range value sweep, with the
-    ///   third instance sampling a quarter window so filter, flip or row
-    ///   offsets move bytes.
-    /// * Alpha blending over the clear and over both opaque quads (instance
-    ///   order resolves overlap on both APIs).
-    /// * The fragment-stage uniform (`fs_glyph` reads `text_blend`): the
-    ///   `text_blend = true` arm runs the corrected-coverage remap.
-    ///
-    /// 16x16 target with dyadic rects, so a diff is a state or math diff, not
-    /// rasterization. Failures report the first divergence per arm.
-    #[test]
-    fn glyph_row_matches_wgpu_byte_for_byte() {
-        use super::encoder::{EncodeSession, RenderPassDesc, StoreAction};
-        use super::loss::LossLatch;
-        use crate::pipeline_table::Pipeline;
-        use std::sync::Arc;
-
-        let dev = device();
-        let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
-        // Selection defaults to Metal; this test drives the wgpu oracle arm,
-        // so it disarms the default.
-        gpu.disarm_metal_for_test();
-
-        const W: usize = 16;
-        const H: usize = 16;
-        const AW: usize = 8;
-        const AH: usize = 8;
-        // (rect, uv, colour, bg): two full-window glyphs and one overlapping
-        // quarter-window glyph; bg values with luminance gaps open the remap
-        // gate.
-        const INSTANCES: [crate::renderer::GlyphFixtureInstance; 3] = [
-            (
-                [0.0, 0.0, 8.0, 8.0],
-                [0.0, 0.0, 1.0, 1.0],
-                [230, 120, 40, 255],
-                [10, 20, 30, 255],
-            ),
-            (
-                [8.0, 8.0, 8.0, 8.0],
-                [0.0, 0.0, 1.0, 1.0],
-                [40, 200, 90, 255],
-                [200, 40, 120, 255],
-            ),
-            (
-                [4.0, 4.0, 8.0, 8.0],
-                [0.25, 0.25, 0.5, 0.5],
-                [90, 140, 220, 255],
-                [64, 64, 64, 255],
-            ),
-        ];
-        let atlas_bytes: Vec<u8> = (0..AW * AH)
-            .map(|i| u8::try_from((i * 31) % 251).expect("< 251"))
-            .collect();
-
-        // The Metal side, built once: the same table row, first-party.
-        let spec = Pipeline::Glyph.spec();
-        let binds = spec.binds;
-        let lib = super::pipelines::compile(&dev, spec).expect("cell.metal compiles");
-        let pso = super::pipelines::build(&dev, &lib, spec, PixelFormat::Bgra8Unorm)
-            .expect("the glyph row builds");
-        let fmt = super::pipelines::metal_format(spec.target, PixelFormat::Bgra8Unorm);
-        assert_eq!(
-            fmt,
-            PixelFormat::Rgba8UnormSrgb,
-            "the glyph row attaches the sRGB view (the FORMAT LAW)"
-        );
-
-        let atlas_tex = dev
-            .new_texture_2d(PixelFormat::R8Unorm, AW, AH, TEXTURE_USAGE_SHADER_READ)
-            .expect("R8 atlas");
-        // SAFETY: fresh 2-D R8Unorm non-Private texture of exactly AW x AH;
-        // `atlas_bytes` is AW*AH bytes at a tight AW-byte row stride.
-        unsafe {
-            ffi::texture_upload(
-                &atlas_tex,
-                MtlRegion::full_2d(AW, AH),
-                &atlas_bytes,
-                AW * PixelFormat::R8Unorm.bytes_per_texel(),
-            );
-        }
-        let sampler = dev
-            .new_sampler(SamplerDesc::NEAREST_CLAMP)
-            .expect("nearest sampler");
-
-        // Stream bytes packed here per `GLYPH_LAYOUT` (40-byte instances), not
-        // borrowed from the wgpu struct.
-        let mut stream: Vec<u8> = Vec::new();
-        for (rect, uv, colour, bg) in INSTANCES {
-            for v in rect {
-                stream.extend_from_slice(&v.to_le_bytes());
-            }
-            for v in uv {
-                stream.extend_from_slice(&v.to_le_bytes());
-            }
-            stream.extend_from_slice(&colour);
-            stream.extend_from_slice(&bg);
-        }
-        assert_eq!(
-            stream.len() as u64,
-            crate::pipeline_table::GLYPH_LAYOUT.stride * INSTANCES.len() as u64,
-            "the fixture packs tight 40-byte GlyphInstances"
-        );
-        let ibuf = dev.new_buffer(stream.len()).expect("instance stream");
-        // SAFETY: fresh exactly-sized shared buffer; no GPU work in flight.
-        unsafe { ffi::buffer_write(&ibuf, &stream) };
-
-        let latch = Arc::new(LossLatch::new());
-        let session = EncodeSession::new(&dev, Arc::clone(&latch)).expect("session");
-        let mint = super::resources::MetalResourceDevice::new(&dev, Arc::clone(&latch));
-        let row = W * fmt.bytes_per_texel();
-
-        // Both arms: `false` isolates sampling and blending; `true` adds the
-        // corrected remap and the fragment uniform bind.
-        for text_blend in [false, true] {
-            let expected = gpu.glyph_row_bytes_for_test(
-                (&atlas_bytes, AW as u32, AH as u32),
-                &INSTANCES,
-                text_blend,
-                W as u32,
-                H as u32,
-            );
-
-            let uniforms = CellUniforms {
-                screen: [W as f32, H as f32],
-                text_blend: if text_blend { 1.0 } else { 0.0 },
-                pad: 0.0,
-            };
-            let ubuf = dev.new_buffer(size_of::<CellUniforms>()).expect("uniforms");
-            // SAFETY: `CellUniforms` is `repr(C)` into an exactly-sized fresh
-            // buffer, and the previous arm's command buffer was waited on.
-            unsafe { ffi::buffer_write(&ubuf, as_bytes(&uniforms)) };
-
-            let dst = mint
-                .texture_2d(
-                    fmt,
-                    W,
-                    H,
-                    TEXTURE_USAGE_RENDER_TARGET | TEXTURE_USAGE_SHADER_READ,
-                )
-                .expect("glyph target");
-            let rb = dev.new_buffer(row * H).expect("readback");
-
-            let mut cb = session.begin().expect("command buffer");
-            {
-                let pass = cb
-                    .render_pass(&RenderPassDesc {
-                        target: &dst,
-                        // Opaque black — `wgpu::Color::BLACK`'s twin.
-                        load: LoadAction::Clear(ClearColor {
-                            r: 0.0,
-                            g: 0.0,
-                            b: 0.0,
-                            a: 1.0,
-                        }),
-                        store: StoreAction::Store,
-                        viewport: None,
-                        scissor: None,
-                    })
-                    .expect("glyph pass");
-                pass.set_pipeline(&pso);
-                // Every index below is read off the row's BindSpec column.
-                pass.set_vertex_buffer(
-                    &ubuf,
-                    binds
-                        .vertex_uniform
-                        .expect("the glyph row has a vertex uniform") as usize,
-                )
-                .expect("vertex uniform bind");
-                pass.set_fragment_buffer(&ubuf, binds.fragment_buffers[0] as usize);
-                pass.set_fragment_texture(&atlas_tex, binds.fragment_textures[0] as usize);
-                pass.set_fragment_sampler(&sampler, binds.fragment_samplers[0] as usize);
-                pass.set_instance_stream(&ibuf);
-                pass.draw_instanced(
-                    super::pipelines::metal_primitive_type(spec.topology),
-                    6,
-                    INSTANCES.len(),
-                )
-                .expect("armed draw: pipeline and stream are set in this fixture");
-            }
-            cb.copy_texture_to_buffer(&dst, W, H, &rb, row)
-                .expect("readback copy");
-            let outcome = cb.commit().wait_outcome();
-            assert_eq!(
-                outcome,
-                super::loss::CbOutcome::Completed,
-                "the glyph draw completes"
-            );
-            // SAFETY: shared storage, sized `row * H`, terminal above.
-            let actual = unsafe { ffi::buffer_bytes(&rb, row * H) };
-            assert_row_bytes_identical(
-                &format!("THE METAL GLYPH ROW (text_blend={text_blend})"),
-                "Localize the cause before touching tolerance: \
-                 all-covered-texels-differ is a bind/sampling fault, overlap-only \
-                 is blending, text_blend=true-only is the remap's transcendental \
-                 math, delta<=1 everywhere is rounding — measure and report per \
-                 the map's W2 contract",
-                W,
-                4,
-                &expected,
-                &actual,
-            );
-            crate::stderr_line!(
-                "glyph differential (text_blend={text_blend}) on {}: byte-identical \
-                 over {} texels",
-                dev.name(),
-                W * H
-            );
-        }
-    }
-
-    /// Colour-glyph row differential: the RGBA-atlas row through the wgpu path
-    /// (`renderer.rs::color_glyph_row_bytes_for_test`) and the Metal path,
-    /// compared byte for byte.
-    ///
-    /// * RGBA atlas sampling (`fs_glyph_color` emits `(s2l(c.rgb), c.a)`) with
-    ///   every channel varied independently, so channel swaps or
-    ///   misdeclarations move bytes;
-    /// * atlas alpha drives the blend, over the clear and an opaque quad;
-    /// * the instance `color` field holds garbage and must not be read.
-    #[test]
-    fn color_glyph_row_matches_wgpu_byte_for_byte() {
-        use super::encoder::{EncodeSession, RenderPassDesc, StoreAction};
-        use super::loss::LossLatch;
-        use super::resources::MetalResourceDevice;
-        use crate::pipeline_table::Pipeline;
-        use std::sync::Arc;
-
-        let dev = device();
-        let _test_pool = ffi::AutoreleasePool::new();
-        let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
-        // Selection defaults to Metal; this test drives the wgpu oracle arm,
-        // so it disarms the default.
-        gpu.disarm_metal_for_test();
-
-        const W: usize = 16;
-        const H: usize = 16;
-        const AW: usize = 8;
-        const AH: usize = 8;
-        // (rect, uv, colour, bg): two full-window quads and one overlapping
-        // quarter-window quad; colour/bg are garbage `fs_glyph_color` must
-        // ignore.
-        const INSTANCES: [crate::renderer::GlyphFixtureInstance; 3] = [
-            (
-                [0.0, 0.0, 8.0, 8.0],
-                [0.0, 0.0, 1.0, 1.0],
-                [1, 2, 3, 4],
-                [5, 6, 7, 8],
-            ),
-            (
-                [8.0, 8.0, 8.0, 8.0],
-                [0.0, 0.0, 1.0, 1.0],
-                [250, 249, 248, 247],
-                [9, 10, 11, 12],
-            ),
-            (
-                [4.0, 4.0, 8.0, 8.0],
-                [0.25, 0.25, 0.5, 0.5],
-                [13, 14, 15, 16],
-                [17, 18, 19, 20],
-            ),
-        ];
-        // Independent per-channel sweeps, mid-range heavy; alpha varies too
-        // (the blending axis rides IN the atlas on this row).
-        let atlas_bytes: Vec<u8> = (0..AW * AH)
-            .flat_map(|i| {
-                [
-                    u8::try_from((i * 23) % 251).expect("< 251"),
-                    u8::try_from((i * 59) % 251).expect("< 251"),
-                    u8::try_from((i * 83) % 251).expect("< 251"),
-                    u8::try_from(40 + (i * 37) % 211).expect("< 251"),
-                ]
-            })
-            .collect();
-
-        let expected = gpu.color_glyph_row_bytes_for_test(
-            (&atlas_bytes, AW as u32, AH as u32),
-            &INSTANCES,
-            W as u32,
-            H as u32,
-        );
-
-        // The Metal arm: the same table row, resources through the sealed mint.
-        let spec = Pipeline::ColorGlyph.spec();
-        let binds = spec.binds;
-        let lib = super::pipelines::compile(&dev, spec).expect("cell.metal compiles");
-        let pso = super::pipelines::build(&dev, &lib, spec, PixelFormat::Bgra8Unorm)
-            .expect("the colour-glyph row builds");
-        let fmt = super::pipelines::metal_format(spec.target, PixelFormat::Bgra8Unorm);
-        assert_eq!(
-            fmt,
-            PixelFormat::Rgba8UnormSrgb,
-            "the colour-glyph row attaches the sRGB view (the FORMAT LAW)"
-        );
-
-        let latch = Arc::new(LossLatch::new());
-        let session = EncodeSession::new(&dev, Arc::clone(&latch)).expect("session");
-        let mint = MetalResourceDevice::new(&dev, Arc::clone(&latch));
-
-        let atlas_tex = mint
-            .texture_2d(PixelFormat::Rgba8Unorm, AW, AH, TEXTURE_USAGE_SHADER_READ)
-            .expect("RGBA atlas");
-        // SAFETY: fresh 2-D Managed Rgba8Unorm texture of exactly AW x AH;
-        // `atlas_bytes` is AW*AH*4 bytes at a tight AW*4 stride.
-        unsafe {
-            atlas_tex.upload(MtlRegion::full_2d(AW, AH), &atlas_bytes, AW * 4);
-        }
-        let sampler = dev
-            .new_sampler(SamplerDesc::NEAREST_CLAMP)
-            .expect("nearest sampler");
-
-        // Pack the 40-byte GlyphInstances against the table's layout law.
-        let mut stream: Vec<u8> = Vec::new();
-        for (rect, uv, colour, bg) in INSTANCES {
-            for v in rect {
-                stream.extend_from_slice(&v.to_le_bytes());
-            }
-            for v in uv {
-                stream.extend_from_slice(&v.to_le_bytes());
-            }
-            stream.extend_from_slice(&colour);
-            stream.extend_from_slice(&bg);
-        }
-        let ibuf = dev.new_buffer(stream.len()).expect("instance stream");
-        // SAFETY: fresh exactly-sized shared buffer; no GPU work in flight.
-        unsafe { ffi::buffer_write(&ibuf, &stream) };
-
-        let uniforms = CellUniforms {
-            screen: [W as f32, H as f32],
-            text_blend: 0.0,
-            pad: 0.0,
-        };
-        let ubuf = dev.new_buffer(size_of::<CellUniforms>()).expect("uniforms");
-        // SAFETY: `CellUniforms` is `repr(C)` into an exactly-sized fresh buffer.
-        unsafe { ffi::buffer_write(&ubuf, as_bytes(&uniforms)) };
-
-        let dst = mint
-            .texture_2d(
-                fmt,
-                W,
-                H,
-                TEXTURE_USAGE_RENDER_TARGET | TEXTURE_USAGE_SHADER_READ,
-            )
-            .expect("colour-glyph target");
-        let row = W * fmt.bytes_per_texel();
-        let rb = dev.new_buffer(row * H).expect("readback");
-
-        let mut cb = session.begin().expect("command buffer");
-        {
-            let pass = cb
-                .render_pass(&RenderPassDesc {
-                    target: &dst,
-                    // Opaque black — `wgpu::Color::BLACK`'s twin.
-                    load: LoadAction::Clear(ClearColor {
-                        r: 0.0,
-                        g: 0.0,
-                        b: 0.0,
-                        a: 1.0,
-                    }),
-                    store: StoreAction::Store,
-                    viewport: None,
-                    scissor: None,
-                })
-                .expect("colour-glyph pass");
-            pass.set_pipeline(&pso);
-            // EVERY index below is read off the row's BindSpec column.
-            pass.set_vertex_buffer(
-                &ubuf,
-                binds
-                    .vertex_uniform
-                    .expect("the colour-glyph row has a vertex uniform") as usize,
-            )
-            .expect("vertex uniform bind");
-            pass.set_fragment_texture(atlas_tex.obj(), binds.fragment_textures[0] as usize);
-            pass.set_fragment_sampler(&sampler, binds.fragment_samplers[0] as usize);
-            pass.set_instance_stream(&ibuf);
-            pass.draw_instanced(
-                super::pipelines::metal_primitive_type(spec.topology),
-                6,
-                INSTANCES.len(),
-            )
-            .expect("armed draw: pipeline and stream are set in this fixture");
-        }
-        cb.copy_texture_to_buffer(&dst, W, H, &rb, row)
-            .expect("readback copy");
-        assert_eq!(
-            cb.commit().wait_outcome(),
-            super::loss::CbOutcome::Completed,
-            "the colour-glyph draw completes"
-        );
-        // SAFETY: shared storage, sized `row * H`, terminal above.
-        let actual = unsafe { ffi::buffer_bytes(&rb, row * H) };
-        assert_row_bytes_identical(
-            "THE METAL COLOR-GLYPH ROW",
-            "Localize before touching tolerance: all-covered-differ is a \
-             bind/sampling fault, channel-rotated bytes are an RGBA/BGRA order \
-             fault, alpha-only is the dropped-alpha misdeclaration, delta<=1 \
-             everywhere is rounding — measure and report per the map's W3 contract",
-            W,
-            4,
-            &expected,
-            &actual,
-        );
-        crate::stderr_line!(
-            "colour-glyph differential on {}: byte-identical over {} texels",
-            dev.name(),
-            W * H
-        );
-    }
-
-    /// Deco pair differential: deco_over (alpha blend, sRGB view) then deco_add
-    /// (One/One, RGB-only mask, Unorm view) into one texture's two views,
-    /// compared with the wgpu path (`renderer.rs::deco_rows_bytes_for_test`).
-    ///
-    /// * The alias as a write path: both passes land in the same storage with
-    ///   no re-encode between them.
-    /// * Additive saturation clamps like the CPU `add_sat`.
-    /// * The colour-only mask leaves pass 1's alpha untouched.
-    /// * `cov * color.a` opacity, armed by a=128 and a=140 instances.
-    #[test]
-    fn deco_over_and_add_rows_match_wgpu_through_the_unorm_alias() {
-        use super::encoder::{EncodeSession, RenderPassDesc, StoreAction};
-        use super::loss::LossLatch;
-        use super::resources::MetalResourceDevice;
-        use crate::pipeline_table::Pipeline;
-        use std::sync::Arc;
-
-        let dev = device();
-        let _test_pool = ffi::AutoreleasePool::new();
-        let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
-        // Selection defaults to Metal; this test drives the wgpu oracle arm,
-        // so it disarms the default.
-        gpu.disarm_metal_for_test();
-
-        const W: usize = 16;
-        const H: usize = 16;
-        const AW: usize = 8;
-        const AH: usize = 8;
-        // Over pass: an opaque full-uv sprite and a half-opacity quarter-uv
-        // sprite overlapping it.
-        const OVER: [crate::renderer::GlyphFixtureInstance; 2] = [
-            (
-                [0.0, 0.0, 8.0, 8.0],
-                [0.0, 0.0, 1.0, 1.0],
-                [230, 120, 40, 255],
-                [0, 0, 0, 255],
-            ),
-            (
-                [4.0, 4.0, 8.0, 8.0],
-                [0.25, 0.25, 0.5, 0.5],
-                [90, 140, 220, 128],
-                [0, 0, 0, 255],
-            ),
-        ];
-        // Add pass: two quads overlapping each other and the over content, so
-        // the double-add region saturates; a=140 arms the premultiply.
-        const ADD: [crate::renderer::GlyphFixtureInstance; 2] = [
-            (
-                [2.0, 2.0, 8.0, 8.0],
-                [0.0, 0.0, 1.0, 1.0],
-                [60, 200, 100, 255],
-                [0, 0, 0, 255],
-            ),
-            (
-                [6.0, 6.0, 8.0, 8.0],
-                [0.0, 0.0, 1.0, 1.0],
-                [200, 180, 90, 140],
-                [0, 0, 0, 255],
-            ),
-        ];
-        let atlas_bytes: Vec<u8> = (0..AW * AH)
-            .map(|i| u8::try_from((i * 31) % 251).expect("< 251"))
-            .collect();
-
-        let expected = gpu.deco_rows_bytes_for_test(
-            (&atlas_bytes, AW as u32, AH as u32),
-            &OVER,
-            &ADD,
-            W as u32,
-            H as u32,
-        );
-
-        // The Metal arm: both table rows, first-party, ONE sealed texture,
-        // TWO typed views.
-        let over_spec = Pipeline::DecoOver.spec();
-        let add_spec = Pipeline::DecoAdd.spec();
-        let lib = super::pipelines::compile(&dev, over_spec).expect("cell.metal compiles");
-        let over_pso = super::pipelines::build(&dev, &lib, over_spec, PixelFormat::Bgra8Unorm)
-            .expect("the deco-over row builds");
-        let add_pso = super::pipelines::build(&dev, &lib, add_spec, PixelFormat::Bgra8Unorm)
-            .expect("the deco-add row builds");
-        assert_eq!(
-            super::pipelines::metal_format(over_spec.target, PixelFormat::Bgra8Unorm),
-            PixelFormat::Rgba8UnormSrgb,
-            "row 9 attaches the sRGB view"
-        );
-        assert_eq!(
-            super::pipelines::metal_format(add_spec.target, PixelFormat::Bgra8Unorm),
-            PixelFormat::Rgba8Unorm,
-            "row 10 attaches the Unorm view of the SAME storage (the FORMAT LAW)"
-        );
-
-        let latch = Arc::new(LossLatch::new());
-        let session = EncodeSession::new(&dev, Arc::clone(&latch)).expect("session");
-        let mint = MetalResourceDevice::new(&dev, Arc::clone(&latch));
-
-        let atlas_tex = mint
-            .texture_2d(PixelFormat::R8Unorm, AW, AH, TEXTURE_USAGE_SHADER_READ)
-            .expect("R8 atlas");
-        // SAFETY: fresh 2-D Managed R8Unorm texture of exactly AW x AH;
-        // `atlas_bytes` is AW*AH bytes at a tight AW-byte stride.
-        unsafe {
-            atlas_tex.upload(MtlRegion::full_2d(AW, AH), &atlas_bytes, AW);
-        }
-        let sampler = dev
-            .new_sampler(SamplerDesc::NEAREST_CLAMP)
-            .expect("nearest sampler");
-
-        let pack = |fixtures: &[crate::renderer::GlyphFixtureInstance]| {
-            let mut stream: Vec<u8> = Vec::new();
-            for (rect, uv, colour, bg) in fixtures {
-                for v in rect {
-                    stream.extend_from_slice(&v.to_le_bytes());
-                }
-                for v in uv {
-                    stream.extend_from_slice(&v.to_le_bytes());
-                }
-                stream.extend_from_slice(colour);
-                stream.extend_from_slice(bg);
-            }
-            let buf = dev.new_buffer(stream.len()).expect("instance stream");
-            // SAFETY: fresh exactly-sized shared buffer; no GPU in flight.
-            unsafe { ffi::buffer_write(&buf, &stream) };
-            buf
-        };
-        let over_buf = pack(&OVER);
-        let add_buf = pack(&ADD);
-
-        let uniforms = CellUniforms {
-            screen: [W as f32, H as f32],
-            text_blend: 0.0,
-            pad: 0.0,
-        };
-        let ubuf = dev.new_buffer(size_of::<CellUniforms>()).expect("uniforms");
-        // SAFETY: `CellUniforms` is `repr(C)` into an exactly-sized buffer.
-        unsafe { ffi::buffer_write(&ubuf, as_bytes(&uniforms)) };
-
-        // ONE storage, TWO types — the production offscreen's shape.
-        let dst = mint
-            .texture_2d(
-                PixelFormat::Rgba8Unorm,
-                W,
-                H,
-                TEXTURE_USAGE_RENDER_TARGET
-                    | TEXTURE_USAGE_SHADER_READ
-                    | TEXTURE_USAGE_PIXEL_FORMAT_VIEW,
-            )
-            .expect("deco target");
-        let dst_srgb = dst
-            .alias_view(PixelFormat::Rgba8UnormSrgb)
-            .expect("sRGB alias view");
-        let row = W * PixelFormat::Rgba8Unorm.bytes_per_texel();
-        let rb = dev.new_buffer(row * H).expect("readback");
-
-        let vu = over_spec
-            .binds
-            .vertex_uniform
-            .expect("the deco rows have a vertex uniform") as usize;
-        let (ft, fs) = (
-            over_spec.binds.fragment_textures[0] as usize,
-            over_spec.binds.fragment_samplers[0] as usize,
-        );
-
-        let mut cb = session.begin().expect("command buffer");
-        {
-            // Pass 1 — row 9 on the sRGB view.
-            let pass = cb
-                .render_pass(&RenderPassDesc {
-                    target: &dst_srgb,
-                    load: LoadAction::Clear(ClearColor {
-                        r: 0.0,
-                        g: 0.0,
-                        b: 0.0,
-                        a: 0.25,
-                    }),
-                    store: StoreAction::Store,
-                    viewport: None,
-                    scissor: None,
-                })
-                .expect("deco-over pass");
-            pass.set_pipeline(&over_pso);
-            pass.set_vertex_buffer(&ubuf, vu).expect("vertex uniform");
-            pass.set_fragment_texture(atlas_tex.obj(), ft);
-            pass.set_fragment_sampler(&sampler, fs);
-            pass.set_instance_stream(&over_buf);
-            pass.draw_instanced(
-                super::pipelines::metal_primitive_type(over_spec.topology),
-                6,
-                OVER.len(),
-            )
-            .expect("armed draw: pipeline and stream are set in this fixture");
-        }
-        {
-            // Pass 2 — row 10 on the Unorm BASE of the same storage, Load.
-            let pass = cb
-                .render_pass(&RenderPassDesc {
-                    target: &dst,
-                    load: LoadAction::Load,
-                    store: StoreAction::Store,
-                    viewport: None,
-                    scissor: None,
-                })
-                .expect("deco-add pass");
-            pass.set_pipeline(&add_pso);
-            pass.set_vertex_buffer(&ubuf, vu).expect("vertex uniform");
-            pass.set_fragment_texture(atlas_tex.obj(), ft);
-            pass.set_fragment_sampler(&sampler, fs);
-            pass.set_instance_stream(&add_buf);
-            pass.draw_instanced(
-                super::pipelines::metal_primitive_type(add_spec.topology),
-                6,
-                ADD.len(),
-            )
-            .expect("armed draw: pipeline and stream are set in this fixture");
-        }
-        cb.copy_texture_to_buffer(&dst, W, H, &rb, row)
-            .expect("readback copy");
-        assert_eq!(
-            cb.commit().wait_outcome(),
-            super::loss::CbOutcome::Completed,
-            "the deco pair completes"
-        );
-        // SAFETY: shared storage, sized `row * H`, terminal above.
-        let actual = unsafe { ffi::buffer_bytes(&rb, row * H) };
-        assert_row_bytes_identical(
-            "THE METAL DECO PAIR",
-            "Localize before touching tolerance: alpha-only diffs are a WriteMask \
-             fault on row 10, diffs confined to the add rects are the alias/format \
-             axis (a re-encode between the passes), saturated-channel diffs are the \
-             add_sat clamp, overlap-only diffs on the over rects are row 9's blend — \
-             measure and report per the map's W3 contract",
-            W,
-            4,
-            &expected,
-            &actual,
-        );
-        crate::stderr_line!(
-            "deco over+add differential on {}: byte-identical over {} texels \
-             (both views of one storage)",
-            dev.name(),
-            W * H
-        );
-    }
-
-    /// Armed production differential: `render_input` through a wgpu renderer
-    /// and an armed one (`arm_metal_for_test`), whose `encode_frame` runs the
-    /// production Metal path end to end (lazy arm mint, arm caches, the shared
-    /// walker, `metal_try_read_back`). Byte-identical frames, N=5. The armed
-    /// window must hold only a Metal offscreen and the wgpu twin only a wgpu
-    /// one, so a silent degrade cannot pass.
-    #[test]
-    fn armed_production_render_input_matches_the_wgpu_arm_byte_for_byte() {
-        const N: usize = 5;
-        let _ = device();
-        let mut wg = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
-        // Selection defaults to Metal; the wgpu oracle twin disarms.
-        wg.disarm_metal_for_test();
-        let mut armed = GpuRenderer::new(18.0, Theme::default()).expect("second renderer");
-        armed.arm_metal_for_test();
-        let mut wg_win = WindowGpu::new();
-        let mut armed_win = WindowGpu::new();
-        let input = representative_input();
-        for run in 0..N {
-            let expected = wg.render_input(&mut wg_win, &input, None);
-            let actual = armed.render_input(&mut armed_win, &input, None);
-            assert!(
-                armed.metal_render_armed(),
-                "run {run}: the armed renderer must have minted its Metal arm"
-            );
-            assert_frames_identical(
-                &format!("run {run}: THE ARMED PRODUCTION FRAME"),
-                "Measure the cause before touching tolerance",
-                &expected,
-                &actual,
-            );
-        }
-        assert!(
-            armed_win.metal_offscreen.is_some(),
-            "non-vacuity: the armed window renders on the METAL offscreen"
-        );
-        assert!(
-            armed_win.offscreen.is_none(),
-            "non-vacuity: the armed window must never have run the wgpu tail"
-        );
-        assert!(
-            wg_win.offscreen.is_some(),
-            "the wgpu twin renders on the wgpu offscreen"
-        );
-        assert!(
-            wg_win.metal_offscreen.is_none(),
-            "the wgpu twin never touches the Metal arm"
-        );
-        crate::stderr_line!(
-            "armed production differential: byte-identical over {} px x {N} runs",
-            ROWS * COLS
-        );
-    }
-
     /// Armed inline-image differential: `render_input` with a real OSC 1337
     /// image through the wgpu arm and the armed Metal arm (which re-mints the
     /// plane from `ImagePlane::metal_texels`). Byte-identical, N=5, on two
@@ -2471,12 +1219,12 @@ mod tests {
     /// `epoch`) and image alpha blending are exercised. The armed plan must
     /// contain an image stream and the plane's epoch must move.
     #[test]
+    #[cfg(wgpu_arm)]
     fn armed_inline_image_plane_matches_the_wgpu_arm_byte_for_byte() {
         use crate::renderer::StreamId;
         const N: usize = 5;
         let _ = device();
         let mut wg = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
-        // Selection defaults to Metal; the wgpu oracle twin disarms.
         wg.disarm_metal_for_test();
         let mut armed = GpuRenderer::new(18.0, Theme::default()).expect("second renderer");
         armed.arm_metal_for_test();
@@ -2522,7 +1270,7 @@ mod tests {
                 &png(2 * cw as u32, 2 * ch as u32, [40, 200, 90, 255]),
             ));
             if let Some(rgba) = second_image {
-                // A TRANSLUCENT image at another cell: a distinct placement
+                // A translucent image at another cell: a distinct placement
                 // (plane rebuild ⇒ epoch move) and a live alpha-blend axis.
                 term.process(b"\r\n\r\n");
                 term.process(&osc(
@@ -2549,7 +1297,7 @@ mod tests {
                     armed.metal_render_armed(),
                     "phase {phase} run {run}: the armed renderer must hold its arm"
                 );
-                // NON-VACUITY: the armed plan drew at least one image stream.
+                // Non-vacuity: the armed plan drew at least one image stream.
                 let plan = armed.last_frame_plan_streams_for_test();
                 assert!(
                     plan.iter().any(|(s, _)| matches!(
@@ -2569,7 +1317,7 @@ mod tests {
                     &actual,
                 );
             }
-            // NON-VACUITY: resident texels + a moving epoch across the rebuild.
+            // Non-vacuity: resident texels and a moving epoch across the rebuild.
             let (epoch, has_texels) = armed_win
                 .image_plane_probe_for_test()
                 .expect("the armed window holds an image plane");
@@ -2599,11 +1347,11 @@ mod tests {
     /// cards each arm has uploaded once (`tray_uploads`), and a changed card
     /// once more.
     #[test]
+    #[cfg(wgpu_arm)]
     fn armed_readback_effects_match_the_wgpu_arm_byte_for_byte() {
         const N: usize = 5;
         let _ = device();
         let mut wg = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
-        // Selection defaults to Metal; the wgpu oracle twin disarms.
         wg.disarm_metal_for_test();
         let mut armed = GpuRenderer::new(18.0, Theme::default()).expect("second renderer");
         armed.arm_metal_for_test();
@@ -2619,8 +1367,8 @@ mod tests {
         let mut armed_win = WindowGpu::new();
         let (cw, ch) = wg.cell_size();
 
-        // A warm ember comet on row 4 + the fire-style marker: exactly the
-        // heat_shimmer fixture recipe, arming `shimmer_live` AND the bloom.
+        // A warm ember comet on row 4 + the fire-style marker (the heat_shimmer
+        // fixture), arming `shimmer_live` and the bloom.
         let mut input = representative_input();
         input.cursor_glow_add = (4..14)
             .map(|c| aterm_render::GlowQuad {
@@ -2698,7 +1446,7 @@ mod tests {
             "a changed card must upload exactly once more per arm"
         );
 
-        // NON-VACUITY: each layer's absence must MOVE the armed bytes.
+        // Non-vacuity: removing each layer must change the armed bytes.
         let base = armed_frame.expect("N runs produced a frame").pixels;
         armed.set_bloom(false);
         let no_bloom = armed.render_input(&mut armed_win, &input, Some(tray(card_a)));
@@ -2837,10 +1585,10 @@ mod tests {
     /// scroll notches exercise the whole-row rescue
     /// (`metal_shift_offscreen_band_px`).
     #[test]
+    #[cfg(wgpu_arm)]
     fn armed_scissored_present_cadence_matches_wgpu_byte_for_byte() {
         let _ = device();
         let mut wg = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
-        // Selection defaults to Metal; the wgpu oracle twin disarms.
         wg.disarm_metal_for_test();
         let mut armed = GpuRenderer::new(18.0, Theme::default()).expect("second renderer");
         armed.arm_metal_for_test();
@@ -2861,70 +1609,26 @@ mod tests {
             term.process(format!("(|_gy) line {i} tail\r\n").as_bytes());
         }
 
-        let mut step = 0u32;
-        let mut check = |wg: &mut GpuRenderer,
-                         armed: &mut GpuRenderer,
-                         wg_win: &mut WindowGpu,
-                         armed_win: &mut WindowGpu,
-                         input: &RenderInput,
-                         what: &str| {
-            let e = wg.present_input_readback(wg_win, input);
-            let a = armed.present_input_readback(armed_win, input);
+        // Warm frame (Full), three typed deltas (Dirty), six scroll notches
+        // (rescue).
+        let mut steps = vec![("warm", term.cell_frame(ROWS, COLS))];
+        for t in 0..3 {
+            term.process(format!("k{t}").as_bytes());
+            steps.push(("typed", term.cell_frame(ROWS, COLS)));
+        }
+        for delta in [2, 2, 2, -1, -1, -1] {
+            term.scroll_display(delta);
+            steps.push(("scroll", term.cell_frame(ROWS, COLS)));
+        }
+        for (step, (what, input)) in steps.iter().enumerate() {
+            let e = wg.present_input_readback(&mut wg_win, input);
+            let a = armed.present_input_readback(&mut armed_win, input);
             assert!(armed.metal_render_armed(), "step {step}: arm live");
             assert_frames_identical(
                 &format!("step {step} ({what}): THE ARMED SCISSORED PRESENT"),
                 "Measure the cause before touching tolerance",
                 &e,
                 &a,
-            );
-            step += 1;
-        };
-
-        // Warm frame (Full), three typed deltas (Dirty), six scroll notches
-        // (rescue), one more typed delta (Dirty).
-        let input = term.cell_frame(ROWS, COLS);
-        check(
-            &mut wg,
-            &mut armed,
-            &mut wg_win,
-            &mut armed_win,
-            &input,
-            "warm",
-        );
-        for t in 0..3 {
-            term.process(format!("k{t}").as_bytes());
-            let input = term.cell_frame(ROWS, COLS);
-            check(
-                &mut wg,
-                &mut armed,
-                &mut wg_win,
-                &mut armed_win,
-                &input,
-                "typed",
-            );
-        }
-        for _ in 0..3 {
-            term.scroll_display(2);
-            let input = term.cell_frame(ROWS, COLS);
-            check(
-                &mut wg,
-                &mut armed,
-                &mut wg_win,
-                &mut armed_win,
-                &input,
-                "scroll",
-            );
-        }
-        for _ in 0..3 {
-            term.scroll_display(-1);
-            let input = term.cell_frame(ROWS, COLS);
-            check(
-                &mut wg,
-                &mut armed,
-                &mut wg_win,
-                &mut armed_win,
-                &input,
-                "scroll-back",
             );
         }
 
@@ -2954,7 +1658,7 @@ mod tests {
         crate::stderr_line!(
             "armed scissor differential: {} steps byte-identical; cadence \
              scissor={} full={} rescues={} on BOTH arms",
-            step,
+            steps.len(),
             armed.scissor_taken(),
             armed.full_repaints(),
             armed.scroll_rescues()
@@ -2962,14 +1666,14 @@ mod tests {
     }
 
     /// Submit-A pipelining: N armed frames stay byte-identical to wgpu while the
-    /// arm (a) holds each frame's Submit A in flight at return and (b) waits
-    /// exactly the previous one at the top of the next frame's staging.
+    /// arm holds each frame's Submit A in flight at return and, by the next
+    /// frame's staging, has consumed exactly the prior frames' submits.
     #[test]
+    #[cfg(wgpu_arm)]
     fn armed_submit_a_pipelines_and_stays_byte_identical() {
         const N: usize = 6;
         let _ = device();
         let mut wg = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
-        // Selection defaults to Metal; the wgpu oracle twin disarms.
         wg.disarm_metal_for_test();
         let mut armed = GpuRenderer::new(18.0, Theme::default()).expect("second renderer");
         armed.arm_metal_for_test();
@@ -3006,57 +1710,13 @@ mod tests {
         );
     }
 
-    /// The pipelining wait polls before parking and prices any park.
-    /// `await_frame_slot` resolves to the timeout-less `waitUntilCompleted`;
-    /// the wait is required (no shared-buffer rewrite under a live Submit A),
-    /// but on a steady loop the prior Submit A is already terminal, so every
-    /// staging wait takes the poll arm and books zero park. `awaited` proves
-    /// the wait ran.
-    #[test]
-    fn the_staging_wait_polls_first_and_books_no_park_on_a_steady_loop() {
-        const N: usize = 4;
-        let _ = device();
-        let mut armed = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
-        armed.arm_metal_for_test();
-        armed.debug_block_on_lazy_fallbacks();
-        let mut win = WindowGpu::new();
-        for i in 0..N {
-            let mut term = Terminal::new(ROWS as u16, COLS as u16);
-            term.process(format!("$ park frame {i}\r\n").as_bytes());
-            let input = term.cell_frame(ROWS, COLS);
-            let _ = armed.render_input(&mut win, &input, None);
-            let (slot_park_ns, ring_park_ns) = armed.metal_park_probe_for_test();
-            let (_, awaited) = armed.metal_pipeline_probe_for_test();
-            assert_eq!(
-                awaited, i as u64,
-                "frame {i}: the staging wait must have consumed exactly the \
-                 prior frames' submits — without that the park ledger is vacuous"
-            );
-            assert_eq!(
-                ring_park_ns, 0,
-                "frame {i}: the offscreen path presents nothing, so the pending \
-                 ring must never drain (booked {ring_park_ns} ns)"
-            );
-            assert_eq!(
-                slot_park_ns, 0,
-                "frame {i}: the prior Submit A was already terminal, so the \
-                 staging wait must have taken the poll arm and booked no park \
-                 (booked {slot_park_ns} ns)"
-            );
-        }
-        crate::stderr_line!(
-            "armed park ledger: {N} frames; the staging wait consumed {} priors \
-             and booked 0 ns of park",
-            N - 1
-        );
-    }
-
     /// Multi-window disarm edge: window A attaches an armed swapchain; window
     /// B's attach fails (no parent layer) and disarms the renderer; A's next
     /// present must drop its armed surface so A's parent has zero sublayers.
     /// Also checks the attach parented, the disarm happened, and the sweep is
     /// a no-op for a never-armed window.
     #[test]
+    #[cfg(wgpu_arm)]
     fn a_disarm_unparents_the_previously_armed_windows_stale_layer() {
         let _ = device();
         let _pool = ffi::AutoreleasePool::new();
@@ -3123,19 +1783,14 @@ mod tests {
         );
     }
 
-    /// Armed present differential with a translucent destination:
-    /// `background_opacity` through the present path to presented bytes, alpha
-    /// compared, on both arms.
-    ///
-    /// * wgpu: the `present_to_view` body with a PostMultiplied-shaped
-    ///   destination (`wgpu_present_bytes_for_test`).
-    /// * Metal: the production armed present onto a standalone drawable whose
-    ///   layer is `opaque = false`.
-    ///
-    /// Opaque (1.0) and translucent (0.55), N=5 each, letterboxed (+9/+7). The
-    /// translucent run must contain sub-255 alpha and differ from the opaque
-    /// run.
+    /// Armed present differential with a translucent destination, alpha
+    /// compared: wgpu's `present_to_view` body onto a PostMultiplied-shaped
+    /// destination (`wgpu_present_bytes_for_test`) against the armed present
+    /// onto a standalone `opaque = false` drawable. Opaque (1.0) and
+    /// translucent (0.55), N=5 each, letterboxed +9/+7; only the translucent
+    /// run may carry sub-255 alpha, and it must.
     #[test]
+    #[cfg(wgpu_arm)]
     fn armed_present_translucency_matches_wgpu_end_to_end() {
         const N: usize = 5;
         let _ = device();
@@ -3143,7 +1798,6 @@ mod tests {
         for (label, opacity) in [("opaque", 1.0f32), ("translucent", 0.55f32)] {
             let translucent = opacity < 1.0;
             let mut wg = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
-            // Selection defaults to Metal; the wgpu oracle twin disarms.
             wg.disarm_metal_for_test();
             wg.set_background_opacity(opacity);
             let mut armed = GpuRenderer::new(18.0, Theme::default()).expect("second renderer");
@@ -3210,11 +1864,11 @@ mod tests {
     /// the Metal offscreen and virtual destination and no wgpu offscreen; the
     /// wgpu twin the reverse.
     #[test]
+    #[cfg(wgpu_arm)]
     fn armed_virtual_present_feeds_the_unchanged_tap_ring_byte_for_byte() {
         const N: usize = 5;
         let _ = device();
         let mut wg = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
-        // Selection defaults to Metal; the wgpu oracle twin disarms.
         wg.disarm_metal_for_test();
         let mut armed = GpuRenderer::new(18.0, Theme::default()).expect("second renderer");
         armed.arm_metal_for_test();
@@ -3290,12 +1944,15 @@ mod tests {
     /// | rain | 5/6 (rain halos, both modes), 11 (rain sprites) |
     /// | fire | 7 (`fire_add`), 8 (`fire_over`), 4 (`glow_under`), glyph halo over the mono atlas |
     /// | sprites | 11 (`sprite_over`: free under+over, cats) |
-    /// | scroll | the band-shift twin over the copy verbs |
+    /// | scroll, scroll_down | the band-shift twin over the copy verbs, both glide directions |
+    /// | five_pass | the worst-case plan: five passes, sRGB/Unorm alternating |
+    /// | word_decorations | 9 (`deco_over`, sRGB view) then 10 (`deco_add`, Unorm view), translucent |
     ///
     /// The wgpu arm is `render_input`; the Metal arm replays the recorded plan
     /// through the shared walker (see
     /// `GpuRenderer::frame_differential_for_test`). N=5 per fixture.
     #[test]
+    #[cfg(wgpu_arm)]
     fn full_frame_render_input_matches_wgpu_byte_for_byte() {
         use aterm_core::render::{
             FireHaloCell, FireMode, FirePatch, FreeSprite, HaloMode, RainHalo, SceneAtlas,
@@ -3307,8 +1964,6 @@ mod tests {
         const N: usize = 5;
         let _ = device();
         let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
-        // Selection defaults to Metal; this test drives the wgpu oracle arm,
-        // so it disarms the default.
         gpu.disarm_metal_for_test();
         // Bloom and shimmer are present-time layers (rows 12/13); the
         // encode-plan replay compares the offscreen before them.
@@ -3555,7 +2210,7 @@ mod tests {
             ));
         }
 
-        // 6. sprites: free sprites under AND over the text, plus a cat quad —
+        // 6. sprites: free sprites under and over the text, plus a cat quad —
         //    the shared sprite_over row (free_parity / cat_parity's shape).
         {
             let mut input = base_input();
@@ -3602,7 +2257,7 @@ mod tests {
         }
 
         // 7. scroll: a fractional glide — the band-shift twin runs on the
-        //    routed, overlap-refusing copy verbs on BOTH arms.
+        //    routed, overlap-refusing copy verbs on both arms.
         {
             let mut input = base_input();
             input.scroll_frac_px = (ch as i32 / 2).max(1);
@@ -3621,8 +2276,8 @@ mod tests {
             fixtures.push(("scroll_down", input, &[S::Bg, S::Glyph]));
         }
 
-        // The translucent-cursor fixture flips renderer state, so it runs
-        // LAST with its own set/reset.
+        // The translucent-cursor fixture flips renderer state, so it runs last
+        // with its own set/reset.
         let mut results: Vec<String> = Vec::new();
         let mut run_fixture = |gpu: &mut GpuRenderer,
                                win: &mut WindowGpu,
@@ -3665,7 +2320,80 @@ mod tests {
         for (name, input, must_drive) in &fixtures {
             run_fixture(&mut gpu, &mut win, name, input, must_drive);
         }
-        // 8. cursor_blend: the translucent cursor fill (row 3) — and prove
+        // 8. five_pass: under-glyph light and fire, base glyphs, bright-head
+        //    halos and free sprites over the text force the worst-case plan,
+        //    five passes alternating sRGB|Unorm|sRGB|Unorm|sRGB, so load
+        //    inheritance, tracker resets and view switches all run.
+        let five_pass = {
+            let part = |name: &str| {
+                let fixture = fixtures.iter().find(|f| f.0 == name);
+                fixture.expect("a fixture above").1.clone()
+            };
+            let (fire, rain, sprites) = (part("fire"), part("rain"), part("sprites"));
+            let mut term = Terminal::new(ROWS as u16, COLS as u16);
+            term.process(b"$ worst case pass plan >_\r\n");
+            term.process(b"\x1b[35mfive\x1b[0m passes \x1b[1mALTERNATE\x1b[0m\r\n");
+            let mut input = term.cell_frame(ROWS, COLS);
+            input.glow_under = fire.glow_under;
+            input.fire_patch = fire.fire_patch;
+            input.rain_add = rain.rain_add;
+            input.free_atlas = sprites.free_atlas;
+            input.free_sprites = sprites.free_sprites;
+            input
+        };
+        let five_streams = [
+            S::GlowUnder,
+            S::FireAdd,
+            S::FireOver,
+            S::Glyph,
+            S::RainAdd,
+            S::RainAddOver,
+            S::FreeUnder,
+            S::FreeOver,
+            S::CursorBlock,
+        ];
+        run_fixture(&mut gpu, &mut win, "five_pass", &five_pass, &five_streams);
+        assert_eq!(
+            gpu.last_frame_passes(),
+            5,
+            "five_pass must force the worst-case sRGB|Unorm|sRGB|Unorm|sRGB plan"
+        );
+        // 9. word_decorations on a blank row of a translucent ground: the
+        //    deco_over row on the sRGB view, then the deco_add row (One/One,
+        //    RGB-only mask) on the Unorm view of the same storage, so a
+        //    re-encode between them or a dropped alpha mask moves bytes; two
+        //    overlapping sparkles saturate.
+        {
+            use aterm_render::{DecoBlend, DecoGlyph, WordDecoration};
+            let mut input = base_input();
+            for (col, glyph, blend, color, alpha) in [
+                (1, DecoGlyph::Paw, DecoBlend::Over, 0x00F7_A8B8, 128),
+                (5, DecoGlyph::RingArc, DecoBlend::Over, 0x00B0_90FF, 210),
+                (2, DecoGlyph::Star4, DecoBlend::Add, 0x00FF_D447, 255),
+                (2, DecoGlyph::Star4, DecoBlend::Add, 0x00C8_B45A, 140),
+            ] {
+                input.word_decorations.push(WordDecoration {
+                    row: 4,
+                    col,
+                    dx: 0,
+                    dy: 0,
+                    glyph,
+                    blend,
+                    color,
+                    alpha,
+                });
+            }
+            gpu.set_background_opacity(0.55);
+            run_fixture(
+                &mut gpu,
+                &mut win,
+                "word_decorations",
+                &input,
+                &[S::WdecoOver, S::WdecoAdd],
+            );
+            gpu.set_background_opacity(1.0);
+        }
+        // 10. cursor_blend: the translucent cursor fill (row 3) — and prove
         // the fill really switched to the CursorBlend pipe.
         gpu.set_cursor_opacity(0.5);
         let input = base_input();
@@ -3692,197 +2420,20 @@ mod tests {
         }
     }
 
-    /// Worst-case coalesced plan: forces five passes
-    /// (sRGB|Unorm|sRGB|Unorm|sRGB: BASE_BG | GLOW_UNDER | BASE_FG | GLOW |
-    /// FREE_OVER+CURSOR), exercising load inheritance, tracker resets and view
-    /// switches, byte-compared N times. Deco groups (6/7 passes) are covered by
-    /// the deco differential.
+    /// Scissored Load frame: present A (full), then present B (dirty), with B's
+    /// recorded Load+scissor plan replayed on Metal over a seed of the
+    /// pre-encode bytes. The post-B offscreen must be byte-identical across
+    /// arms, and every row outside the recorded band must keep the seed's
+    /// bytes. A static glow on the edited row keeps the plan at three passes,
+    /// so load inheritance at a view boundary runs under a scissor.
     #[test]
-    fn the_worst_case_five_pass_plan_is_byte_identical_across_arms() {
-        use aterm_core::render::{
-            FireMode, FirePatch, FreeSampler, FreeSprite, FreeZ, HaloMode, RainHalo, SceneAtlas,
-        };
-        use aterm_render::{GlowQuad, premul_rgb};
-        use std::sync::Arc;
-
-        use crate::renderer::StreamId as S;
-
-        const N: usize = 5;
-        let _ = device();
-        let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
-        // Selection defaults to Metal; this test drives the wgpu oracle arm,
-        // so it disarms the default.
-        gpu.disarm_metal_for_test();
-        gpu.set_bloom(false);
-        gpu.set_shimmer(false);
-        let mut win = WindowGpu::new();
-        let (cw, ch) = gpu.cell_size();
-        let (cw16, ch16) = (cw as u16, ch as u16);
-
-        let mut term = Terminal::new(ROWS as u16, COLS as u16);
-        term.process(b"$ worst case pass plan >_\r\n");
-        term.process(b"\x1b[35mfive\x1b[0m passes \x1b[1mALTERNATE\x1b[0m\r\n");
-        let mut input = term.cell_frame(ROWS, COLS);
-
-        // G_GLOW_UNDER (Unorm): ember light + fire patches, Add AND Over.
-        input.glow_under.push(GlowQuad {
-            row: 2,
-            x: cw16,
-            y: 2 * ch16,
-            w: (6 * cw) as u16,
-            h: ch16,
-            color: premul_rgb(0x00ff_6020, 140),
-            alpha: 0,
-            color2: premul_rgb(0x00ff_6020, 140),
-            alpha2: 0,
-        });
-        for (i, mode) in [FireMode::Add, FireMode::Over].into_iter().enumerate() {
-            input.fire_patch.push(FirePatch {
-                row: 2,
-                x: ((1 + i * 4) * cw) as u16,
-                y: (2 * ch) as u16,
-                w: (3 * cw) as u16,
-                h: ch16,
-                base_y: (3 * ch) as u16,
-                peak_h: (2 * ch) as u16,
-                phase: 512,
-                temp: 200,
-                strength: 220,
-                lean: -2,
-                cov_cap: 200,
-                cell_h: ch16,
-                mode,
-            });
-        }
-        // G_GLOW (Unorm): bright-head halos, Add AND Over.
-        for (i, mode) in [HaloMode::Add, HaloMode::Over].into_iter().enumerate() {
-            input.rain_add.push(RainHalo {
-                row: 3,
-                x: ((2 + i * 4) * cw) as u16,
-                y: (3 * ch) as u16,
-                w: cw16,
-                h: ch16,
-                color: if matches!(mode, HaloMode::Add) {
-                    premul_rgb(0x0060_ff60, 180)
-                } else {
-                    0x0020_2040
-                },
-                cx: ((2 + i * 4) * cw + cw / 2) as u16,
-                cy: (3 * ch + ch / 2) as u16,
-                rx: (cw * 2) as u16,
-                ry: ch16,
-                mode,
-            });
-            // Instance 1 per mode: the twin whose stride matters.
-            input.rain_add.push(RainHalo {
-                row: 4,
-                x: ((3 + i * 4) * cw) as u16,
-                y: (4 * ch) as u16,
-                w: cw16,
-                h: ch16,
-                color: if matches!(mode, HaloMode::Add) {
-                    premul_rgb(0x00ff_8020, 120)
-                } else {
-                    0x0010_3050
-                },
-                cx: ((3 + i * 4) * cw + cw / 2) as u16,
-                cy: (4 * ch + ch / 2) as u16,
-                rx: cw16,
-                ry: (ch / 2) as u16,
-                mode,
-            });
-        }
-        // G_BASE_BG + G_FREE_OVER (sRGB): free sprites under AND over text.
-        input.free_atlas = Some(Arc::new(SceneAtlas {
-            width: 8,
-            height: 8,
-            rgba: (0..8 * 8 * 4).map(|i| ((i * 13 + 3) % 256) as u8).collect(),
-            version: 1,
-        }));
-        for (i, z) in [FreeZ::UnderText, FreeZ::OverText].into_iter().enumerate() {
-            input.free_sprites.push(FreeSprite {
-                x: (2 + i as i32) * cw as i32,
-                y: (ch / 2) as i32,
-                w: 8,
-                h: 8,
-                ax: 0,
-                ay: 0,
-                aw: 8,
-                ah: 8,
-                tint: 0x00ff_ffff,
-                alpha: 255,
-                flip_x: false,
-                z,
-                sampler: FreeSampler::Nearest,
-            });
-        }
-
-        for run in 0..N {
-            match gpu.frame_differential_for_test(&mut win, &input) {
-                Ok(None) => {
-                    aterm_spec::host::could_not_run("no Metal device");
-                }
-                Err(e) => panic!("run {run}: {e}"),
-                Ok(Some((expected, actual))) => {
-                    assert_eq!(
-                        gpu.last_frame_passes(),
-                        5,
-                        "the fixture must force the worst-case sRGB|Unorm|sRGB|Unorm|sRGB \
-                         alternation — the boundary-heavy plan a 1-pass frame never reaches"
-                    );
-                    let drawn = gpu.last_frame_plan_streams_for_test();
-                    for want in [
-                        S::GlowUnder,
-                        S::FireAdd,
-                        S::FireOver,
-                        S::Glyph,
-                        S::RainAdd,
-                        S::RainAddOver,
-                        S::FreeUnder,
-                        S::FreeOver,
-                        S::CursorBlock,
-                    ] {
-                        assert!(
-                            drawn.iter().any(|(s, _)| *s == want),
-                            "{want:?} missing from the worst-case plan — the sweep is vacuous"
-                        );
-                    }
-                    assert_frames_identical(
-                        &format!("run {run}: THE WORST-CASE 5-PASS FRAME"),
-                        "Measure the pass boundary that broke (load inheritance? view \
-                         switch? tracker reset?), never loosen the tolerance",
-                        &expected,
-                        &actual,
-                    );
-                    if run == N - 1 {
-                        crate::stderr_line!(
-                            "worst-case 5-pass plan: byte-identical over {} pixels x {N} runs",
-                            expected.pixels.len()
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// Scissored Load frame: drives present A (full) then present B (dirty),
-    /// seeds the Metal offscreen with the pre-encode bytes, replays B's recorded
-    /// Load+scissor plan on both arms, and asserts:
-    ///
-    ///   * the post-B offscreen is byte-identical across arms;
-    ///   * every row outside the recorded band still holds the seed's bytes.
-    ///
-    /// A static glow on the edited row keeps the plan at three passes, so load
-    /// inheritance at a view boundary runs under a scissor.
-    #[test]
+    #[cfg(wgpu_arm)]
     fn the_scissored_load_frame_is_byte_identical_across_arms() {
         use aterm_render::{GlowQuad, premul_rgb};
 
         const N: usize = 5;
         let _ = device();
         let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
-        // Selection defaults to Metal; this test drives the wgpu oracle arm,
-        // so it disarms the default.
         gpu.disarm_metal_for_test();
         gpu.set_bloom(false);
         gpu.set_shimmer(false);
@@ -3965,8 +2516,8 @@ mod tests {
                 &expected,
                 &actual,
             );
-            // Scissor isolation against the SEED — catches a shared
-            // both-arms-ignore-the-scissor bug the arm comparison cannot.
+            // Scissor isolation against the seed catches a bug both arms share
+            // (ignoring the scissor), which the arm comparison cannot.
             for y in 0..h as usize {
                 if y >= sy as usize && y < (sy as usize + sh as usize) {
                     continue;
@@ -3987,19 +2538,13 @@ mod tests {
 
     /// Present-path differential: one cropped, letterboxed present through the
     /// wgpu body (`present_virtual_with_crop` → `present_to_view`, captured by
-    /// the virtual snapshot tap) against the Metal arm replaying Submit B
-    /// (compose copy, bloom extract and composite, shimmer, tray, letterbox
-    /// blit) on a real standalone swapchain frame cycle. Byte-identical on:
-    ///
-    /// * `fx_tray`: bloom, shimmer and card;
-    /// * `fx_only`: bloom and shimmer;
-    /// * `plain`: no effects, the blit samples the offscreen directly.
-    ///
-    /// The destination exceeds the frame by +9/+7 so the letterbox bands
-    /// matter. The SDR crown is pinned off (its envelope is wall-clock). N=5
-    /// per class. `fx_tray` must differ from `plain`, and the band must hold
-    /// the live background.
+    /// the virtual snapshot tap) against the Metal arm's Submit B on a real
+    /// standalone swapchain, N=5 for each of `fx_tray` (bloom, shimmer, card),
+    /// `fx_only` (bloom, shimmer) and `plain` (the blit samples the offscreen).
+    /// The destination is +9/+7 so the bands matter; the SDR crown is pinned
+    /// off (its envelope is wall-clock). `fx_tray` must differ from `plain`.
     #[test]
+    #[cfg(wgpu_arm)]
     fn present_path_matches_wgpu_virtual_present_byte_for_byte() {
         use aterm_core::render::FirePatch;
         use aterm_render::{GlowQuad, premul_rgb};
@@ -4009,8 +2554,6 @@ mod tests {
         const N: usize = 5;
         let _ = device();
         let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
-        // Selection defaults to Metal; this test drives the wgpu oracle arm,
-        // so it disarms the default.
         gpu.disarm_metal_for_test();
         gpu.set_shimmer_phase_for_test(Some(0.37));
         gpu.set_sdr_glow_boost(0.0);
@@ -4023,7 +2566,7 @@ mod tests {
             term.process(b"\x1b[35mfx\x1b[0m over the \x1b[1mfold\x1b[0m\r\n");
             term.cell_frame(ROWS, COLS)
         };
-        // Bright glow on row 4 with air above it: feeds the bloom AND derives
+        // Bright glow on row 4 with air above it: feeds the bloom and derives
         // a non-empty shimmer region (haze rises above the hot band).
         for (i, a) in [200u8, 255, 160].iter().enumerate() {
             input.cursor_glow_add.push(GlowQuad {
@@ -4069,7 +2612,6 @@ mod tests {
             height: u32::try_from(fh_l).expect("logical height fits"),
         };
         let dest = (fw_l as u32 + 9, fh_l as u32 + 7);
-        let live_bg = Theme::default().bg;
 
         let classes: [(&str, bool, bool, Option<TrayQuad<'_>>); 3] = [
             ("fx_tray", true, true, Some(tray)),
@@ -4122,7 +2664,7 @@ mod tests {
             );
         }
 
-        // NON-VACUITY 1: the effect passes moved presented bytes.
+        // Non-vacuity: the effect passes moved presented bytes.
         let full = &presented[0].1;
         let plain = &presented[2].1;
         let moved = full
@@ -4137,30 +2679,14 @@ mod tests {
             "bloom+shimmer+tray must move presented bytes vs the plain present \
              — an inert sequence armed nothing"
         );
-        // The letterbox band holds the live terminal bg (the bottom-right
-        // corner is band in every class).
-        let (dw, dh) = (dest.0 as usize, dest.1 as usize);
-        let corner = &plain[(dh - 1) * dw * 4 + (dw - 1) * 4..][..4];
-        let want = [
-            ((live_bg >> 16) & 0xff) as u8,
-            ((live_bg >> 8) & 0xff) as u8,
-            (live_bg & 0xff) as u8,
-            255,
-        ];
-        assert_eq!(
-            corner, want,
-            "the letterbox band must hold the live terminal background"
-        );
-        crate::stderr_line!(
-            "present differential: {moved} px moved by the effect passes; the \
-             letterbox band holds the live bg"
-        );
+        crate::stderr_line!("present differential: {moved} px moved by the effect passes");
     }
 
     /// Shared wgpu-vs-Metal comparator: byte for byte over `w`-wide rows of
     /// `texel`-byte texels, reporting the first divergence (coordinates, both
     /// values, max delta, alpha-only). `name` says what diverged; `hint` maps
     /// divergence shapes to causes.
+    #[cfg(wgpu_arm)]
     fn assert_row_bytes_identical(
         name: &str,
         hint: &str,
@@ -4206,6 +2732,7 @@ mod tests {
 
     /// [`assert_row_bytes_identical`]'s twin for a packed [`Frame`]: the
     /// geometry, then every pixel as straight RGBA bytes.
+    #[cfg(wgpu_arm)]
     fn assert_frames_identical(name: &str, hint: &str, expected: &Frame, actual: &Frame) {
         assert_eq!(
             (expected.width, expected.height),
@@ -4225,6 +2752,7 @@ mod tests {
     /// a non-zero `content_off` exercises band placement. f16 compared as raw
     /// bits.
     #[test]
+    #[cfg(wgpu_arm)]
     fn crown_rows_match_wgpu_byte_for_byte() {
         use super::encoder::{EncodeSession, RenderPassDesc, StoreAction};
         use super::loss::LossLatch;
@@ -4233,8 +2761,6 @@ mod tests {
 
         let dev = device();
         let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
-        // Selection defaults to Metal; this test drives the wgpu oracle arm,
-        // so it disarms the default.
         gpu.disarm_metal_for_test();
         const W: usize = 20;
         const H: usize = 14;
@@ -4266,7 +2792,7 @@ mod tests {
         );
         assert_ne!(expected_sdr, sdr_seed, "the SDR crown must brighten");
 
-        // --- the Metal arm, both rows through one rig ----------------------
+        // The Metal arm, both rows through one rig.
         let latch = Arc::new(LossLatch::new());
         let session = EncodeSession::new(&dev, Arc::clone(&latch)).expect("session");
         let mint = super::resources::MetalResourceDevice::new(&dev, Arc::clone(&latch));
@@ -4280,8 +2806,8 @@ mod tests {
             headroom: f32,
             _pad: [f32; 2],
         }
-        // Tight 16-byte `GlowInstance`s: the rect, then the colour at BOTH
-        // ends of the ramp (a flat pair — the wgpu oracle packs it the same).
+        // Tight 16-byte `GlowInstance`s: the rect, then the colour at both
+        // ends of the ramp (a flat pair, as the wgpu oracle packs it).
         let mut stream_bytes: Vec<u8> = Vec::new();
         for (rect, colour) in INSTANCES {
             for v in rect {

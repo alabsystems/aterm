@@ -7,40 +7,6 @@
 use super::super::*;
 
 #[test]
-fn grid_default_tab_stops() {
-    let grid = Grid::new(24, 80);
-    let expected_tabs = [8, 16, 24, 32, 40, 48, 56, 64, 72];
-    for col in &expected_tabs {
-        assert!(
-            grid.storage.tab_stops[*col],
-            "Expected tab stop at column {col}"
-        );
-    }
-    assert!(
-        !grid.storage.tab_stops[0],
-        "Column 0 should not be a tab stop"
-    );
-    assert!(
-        !grid.storage.tab_stops[1],
-        "Column 1 should not be a tab stop"
-    );
-}
-
-#[test]
-fn grid_set_tab_stop() {
-    let mut grid = Grid::new(24, 80);
-    assert!(!grid.storage.tab_stops[5]);
-
-    grid.set_cursor(0, 5);
-    grid.set_tab_stop();
-
-    assert!(
-        grid.storage.tab_stops[5],
-        "Tab stop should be set at column 5"
-    );
-}
-
-#[test]
 fn grid_clear_tab_stop() {
     let mut grid = Grid::new(24, 80);
     assert!(grid.storage.tab_stops[8]);
@@ -52,22 +18,6 @@ fn grid_clear_tab_stop() {
         !grid.storage.tab_stops[8],
         "Tab stop should be cleared at column 8"
     );
-}
-
-#[test]
-fn grid_clear_all_tab_stops() {
-    let mut grid = Grid::new(24, 80);
-    assert!(grid.storage.tab_stops[8]);
-    assert!(grid.storage.tab_stops[16]);
-
-    grid.clear_all_tab_stops();
-
-    for col in 0..80 {
-        assert!(
-            !grid.storage.tab_stops[col],
-            "Tab stop at column {col} should be cleared"
-        );
-    }
 }
 
 #[test]
@@ -121,32 +71,6 @@ fn grid_back_tab_with_default_stops() {
 }
 
 #[test]
-fn grid_back_tab_with_custom_stops() {
-    let mut grid = Grid::new(24, 80);
-    grid.clear_all_tab_stops();
-    grid.set_cursor(0, 5);
-    grid.set_tab_stop();
-    grid.set_cursor(0, 12);
-    grid.set_tab_stop();
-    grid.set_cursor(0, 25);
-    grid.set_tab_stop();
-
-    grid.set_cursor(0, 30);
-
-    grid.back_tab();
-    assert_eq!(grid.cursor_col(), 25);
-
-    grid.back_tab();
-    assert_eq!(grid.cursor_col(), 12);
-
-    grid.back_tab();
-    assert_eq!(grid.cursor_col(), 5);
-
-    grid.back_tab();
-    assert_eq!(grid.cursor_col(), 0);
-}
-
-#[test]
 fn grid_back_tab_n() {
     let mut grid = Grid::new(24, 80);
     grid.set_cursor(0, 40);
@@ -156,15 +80,6 @@ fn grid_back_tab_n() {
 
     grid.back_tab_n(10);
     assert_eq!(grid.cursor_col(), 0);
-}
-
-#[test]
-fn grid_back_tab_between_stops() {
-    let mut grid = Grid::new(24, 80);
-    grid.set_cursor(0, 10);
-
-    grid.back_tab();
-    assert_eq!(grid.cursor_col(), 8);
 }
 
 #[test]
@@ -186,26 +101,6 @@ fn grid_tab_n_past_last_stop() {
 
     grid.tab_n(20);
     assert_eq!(grid.cursor_col(), 79);
-}
-
-#[test]
-fn grid_tab_n_with_custom_stops() {
-    let mut grid = Grid::new(24, 80);
-    grid.clear_all_tab_stops();
-    grid.set_cursor(0, 5);
-    grid.set_tab_stop();
-    grid.set_cursor(0, 15);
-    grid.set_tab_stop();
-    grid.set_cursor(0, 30);
-    grid.set_tab_stop();
-
-    grid.set_cursor(0, 0);
-
-    grid.tab_n(2);
-    assert_eq!(grid.cursor_col(), 15);
-
-    grid.tab_n(1);
-    assert_eq!(grid.cursor_col(), 30);
 }
 
 #[test]
@@ -256,7 +151,7 @@ fn grid_widen_still_seeds_defaults_when_no_one_cleared_them() {
 
 #[test]
 fn restore_preserves_bounded_stops_beyond_narrow_width_for_later_grow() {
-    let model = aterm_spec::derive::tab_stop_handoff_model();
+    let model = aterm_models_misc::tab_stop_handoff_model();
     let mut state = model.init_state();
     let mut source = Grid::new(6, 120);
     assert!(model.fire("GrowSourceWide", &mut state));

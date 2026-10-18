@@ -8,7 +8,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
 //! Terminal grid model: `Grid`, `GridStorage`, `MaterializedRow`, cells, rows,
-//! styles, damage tracking and page storage.
+//! damage tracking and page storage.
 
 pub mod cell;
 pub(crate) mod cell_colors;
@@ -25,11 +25,9 @@ mod extra_collection_shifts;
 pub mod page;
 #[cfg(not(any(test, debug_assertions)))]
 pub(crate) mod page;
-pub mod pin;
 pub mod row;
 pub mod scroll_region;
 pub mod state;
-pub mod style;
 
 pub mod grid;
 
@@ -56,18 +54,14 @@ pub use damage::{
 pub use extra::is_combining_mark;
 pub use extra::{
     CellCoord, CellExtra, CellExtras, ImageData, ImageFormat, ImageRef, ImageScaling,
-    KittyPlacementTag, MAX_IMAGE_LAYERS, SourceRect, UniformExtras,
+    KittyPlacementTag, MAX_IMAGE_LAYERS, SourceRect, UniformExtras, underline_color_sgr,
 };
 pub use page::PageStore;
-pub use pin::GenerationTracker;
 pub use row::{LineSize, Row, RowFlags};
-pub use style::{Color, ColorType, ExtendedStyle, Style, StyleAttrs, StyleId, StyleTable};
 
 // Page-level constants and aliases other crates use.
 pub use page::PAGE_SIZE;
 pub use page::PageId;
-#[cfg(any(test, debug_assertions))]
-pub use pin::{Generation, Pin, PinnedRange};
 
 // Cursor, scroll region, and grid state types.
 pub use cursor::{Cursor, SavedCursor};

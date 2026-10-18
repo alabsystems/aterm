@@ -27,11 +27,7 @@
 //!   ([`aterm_phase::identify`] — the engine's turn-end policy acts on the
 //!   same reading), and the windows the vendor painted: Claude Code's `/usage`
 //!   panel ([`usage::usage_panel_windows`]), each reset placed by the
-//!   supervisor's own clock ([`limit::parse_reset`]), or Codex's `/status`
-//!   card ([`usage::codex_status_windows`]), each reset placed in the zone its
-//!   TUI draws in ([`limits_view`]); a Codex wall's reset is the one the
-//!   window's harness placed in that zone, where `status` publishes it
-//!   (`reset_at=`, [`limits_view_placed`]).
+//!   supervisor's own clock ([`limit::parse_reset`]).
 //! * `disk` measures, and removes only a named safelist class under
 //!   `disk.apply = true`: for build directories, an idle cargo profile's
 //!   `incremental/` under cargo's own locks ([`disk::target`]), and below the
@@ -69,9 +65,8 @@
 //!   it has been observed with two real accounts ([`ACCOUNTS_ROTATION`]).
 //! * `upgrade` is the one verb here that ACTS: it moves a live Claude Code
 //!   session onto a newer build in place, cooperatively
-//!   ([`super::upgrade_drive`]), and a live Codex, its shared daemon first and
-//!   then each TUI by a typed `/exit` and `codex resume`
-//!   ([`super::upgrade_codex`]). It restarts the agent process, never answers
+//!   ([`super::upgrade_drive`]); no Codex is moved live (a codex-alab
+//!   upgrades itself). It restarts the agent process, never answers
 //!   a box or continues a turn; the window's host takes the same steps on its
 //!   own tabs at each session's idle points, under aterm.toml's `[harness]
 //!   upgrade` switch. A hand-run sweep obeys `[harness] enabled` and each
@@ -79,8 +74,9 @@
 //!   ([`crate::supervise::SupervisorConfig::from_path`], the table's one
 //!   reader).
 //!
-//! The hook bridge (`hook`, `statusline`, `install`, `uninstall`) is retired
-//! ([`RETIRED`]) and answered before anything is parsed ([`main_entry`]).
+//! The hook bridge is retired: aterm installs nothing into an agent. Its
+//! `hook` and `statusline` verbs are answered before anything is parsed
+//! ([`main_entry`]).
 //! So is `tap`, the usage tap ([`super::tap`]): Claude Code's own status-line
 //! command on the relaunch lines aterm types under `[harness] usage_tap`,
 //! which writes a reading of its own and prints one line, whatever happens.
@@ -94,8 +90,7 @@
 //! * Every other subcommand exits 0 on success, 1 on a refusal it can
 //!   explain (`limits` with no session answering, an `upgrade` the master
 //!   switch stands down, an `accounts` roster that does not admit, a label
-//!   it cannot take), 2 on a usage error (the retired
-//!   `install`/`uninstall` among them) — and a one-shot `upgrade` whose sweep
+//!   it cannot take), 2 on a usage error — and a one-shot `upgrade` whose sweep
 //!   found another sweeper holding the lock exits 75, atpkg's `EX_TEMPFAIL`
 //!   for the same contention, because that one refusal means "try again
 //!   later".
@@ -133,10 +128,6 @@ use crate::supervise::{SupervisorConfig, approvals, limit};
 /// The harness name, which is also the state directory's name (design §1.3).
 pub const HARNESS: &str = "claude-harness";
 
-/// Why `hook`, `statusline`, `install` and `uninstall` are retired.
-pub const RETIRED: &str =
-    "aterm installs nothing into an agent; a starting window removes what an older build installed";
-
 /// How many rows `ledger` prints when the caller names no count.
 pub const LEDGER_DEFAULT_ROWS: usize = 20;
 
@@ -172,8 +163,9 @@ pub fn default_config_path() -> Option<PathBuf> {
 pub const USAGE: &str = "\
 aterm harness — read views of the Claude Code harness, and the live agent
 upgrade. The supervisor that acts on a session is the window's own host, by
-default, for every Claude Code, Codex and agy session (`aterm drive
-watch|supervise` runs the same engine from a terminal).
+default, for every Claude Code, agy, Muse Code and Gemini CLI session (`aterm
+drive watch|supervise` runs the same engine from a terminal). A vendor `codex`
+is shown, not supervised; codex-alab supervises itself, the window watching.
 
 USAGE:
     aterm harness usage [--json]                 this session's tokens per model, and its usage
@@ -201,9 +193,8 @@ USAGE:
     aterm harness upgrade [<sid>] [--dry-run] [--json]
                                                  move live Claude Code sessions onto a newer build
                                                  and the newest model of their own family (else
-                                                 up the model priority list), and
-                                                 live Codex sessions (their daemon first) onto the
-                                                 managed Codex
+                                                 up the model priority list); a Codex is never
+                                                 moved live
     aterm harness upgrade [<sid>] --status [--json]
                                                  each upgrade: how long behind, what it waits on
     aterm harness upgrade <sid> --now | --defer <dur> | --skip [--json]
@@ -215,10 +206,9 @@ USAGE:
     aterm harness tap                            the usage tap: Claude Code's status-line command
                                                  on aterm's relaunch lines (`[harness] usage_tap`)
 
-`hook`, `statusline`, `install` and `uninstall` are RETIRED: aterm installs nothing into
-an agent. `install`/`uninstall` refuse (exit 2); `hook` and `statusline` do nothing and
-exit 0, for a bridge an older build installed. A starting window removes what `install`
-wrote to ~/.claude/settings.json.
+`hook` and `statusline` are RETIRED: aterm installs nothing into an agent. They do
+nothing and exit 0, for a bridge an older build installed. A starting window removes
+what that build wrote to ~/.claude/settings.json.
 
 OPTIONS:
     --state <path>      the harness state directory: the disk journal, the upgrade records and ledger,
@@ -284,23 +274,23 @@ whose running total grew, on the model of the latest turn_context; a fork's copi
 prefix (the burst of its parent's lines it opens with) counts nothing. `in` is the
 uncached input; `cache read` is Codex's cached input. Where the shipped price table
 prices the model, `usd` is its list dollars (≈$, never a bill); a model it does not is
-unpriced (`usd` null). `acct codex`; its windows stay `?` (`aterm harness limits` reads
-Codex's /status card).
+unpriced (`usd` null). `acct codex`; its windows stay `?`.
 ";
 
 /// `aterm harness limits --help`.
 const HELP_LIMITS: &str = "\
 `limits` reads the session's screen once over the control socket (`text --json tail=40`)
 and prints the wall the last turn ended on (the kind the supervisor acts on, its words and
-its reset; a Codex's reset where the window's harness placed it, in the Codex's own zone, as
-`status` names it in `reset_at=`), read by the grammar of the program `status` names in front
-(Claude Code's or Codex's), any windows that program painted (Claude Code's /usage panel,
-Codex's /status card, whose `N% left` is printed as what is used and whose resets are placed
-in the Codex's own zone), and `credits=in-use` where Claude Code's own notice says usage
-credits carry the session (`-` otherwise; credits are work going on, never a wall). With no
-@<sid> it reads the session it runs in ($ATERM_PARENT_SESSION_ID); with neither it refuses
-(exit 2) rather than read whichever session the socket defaults to. No session answering is
-exit 1.
+its reset), read by the grammar of the program `status` names in front (Claude Code's,
+agy's or Muse Code's; Gemini CLI's, which runs as `node`, by its screen; a Codex's screen is
+not read, so a Codex tab has no wall here), any windows that program painted (Claude Code's
+/usage panel; agy paints none, Gemini CLI's /stats model is not read as one, and Muse Code's /usage and
+/status cards hold the session's tokens and no window), and `credits=in-use` where Claude
+Code's own notice says usage credits carry the session (`-` otherwise; credits are work going
+on, never a wall).
+With no @<sid> it reads the session it runs in ($ATERM_PARENT_SESSION_ID); with neither it
+refuses (exit 2) rather than read whichever session the socket defaults to. No session
+answering is exit 1.
 ";
 
 /// `aterm harness disk --help`.
@@ -321,8 +311,8 @@ Build directories are the ones you NAME on the line; named none, it SEARCHES for
 as the window's automatic cleanup does: this working directory and its worktree,
 $HOME's checkouts and their git worktrees two levels down (a `target -> target.noindex`
 link resolved), x.py's bootstrap build directories (`build/<host>/stage<N>-<kind>`, never
-a sysroot, stage0 or llvm), Claude Code's temp root (each session's scratchpad) and the cells
-cache — on this working directory's volume only, never into a mount point or (macOS)
+a sysroot, stage0 or llvm) and Claude Code's temp root (each session's scratchpad) — on
+this working directory's volume only, never into a mount point or (macOS)
 ~/Desktop, ~/Documents or ~/Downloads. Under the rows it lists the largest build
 directories it can NOT reclaim and what frees each. `cargo-targets` takes from each
 build directory
@@ -348,7 +338,7 @@ class only, each with its witness journalled here —
 LEAST RECENTLY USED FIRST: every idle profile's cache; then, WHOLE, the build directories
 whose owner is gone — an ended Claude Code session's scratch build (no running Claude
 Code names the session, nothing of it written for `disk.target_stale_days`, at least a
-day) or the cells cache of a removed checkout, each with a signed CACHEDIR.TAG and no
+day), each with a signed CACHEDIR.TAG and no
 build holding a lock, the owner checked again right before, and no running process with
 its working directory, executable or an open file there (`disk.dead_build_dirs`,
 default true; this verb's `--apply cargo-targets` takes them below the floor too); then,
@@ -610,7 +600,7 @@ LADDER's settle below — by SIGTERM and the relaunch line, and resumed with
 nothing typed after it (`done:resumed`): the tab's loop takes that point as if
 nothing had moved. Until then the tab only says the newer build is installed
 and that it moves over when idle, and that record always stands a look before
-the move (`wait:notice-shown`). A Codex goal is never paused for it. With
+the move (`wait:notice-shown`). With
 `[harness] upgrade_ask = true` it runs the COOPERATIVE flow instead, the rest
 of this paragraph: each sweep moves each session one step: when the
 agent is idle, its composer empty, no approval box up and nobody typing into the tab
@@ -665,14 +655,12 @@ than 20 minutes it asks for the natural idle point: the screen still 20 s and
 nobody who gave the tab input within
 `[harness] human_grace_s`. From 20 minutes a pause that only LOOKS quiet counts:
 two looks 20 s apart that read the screen idle with the same last words,
-however it repainted between them (a footer's clock, a goal's counter). From
+however it repainted between them (a footer's clock). From
 an hour a person holds it only by a keystroke in the last 20 s. From two
 hours it moves at the first such pause, its settle waived. No rung ever moves
 it over a draft, a box, a keystroke in the last 20 s, a hold, a usage limit or
 the login wall, or running work — the agent's turn or status, the shells under
-it, a turn of a Codex client's own in its daemon (`wait:daemon-turn`,
-`wait:goal`, `wait:daemon-busy` for one it cannot yet place in another
-session) — and an empty process tree, and under `upgrade_ask = true` the
+it — and an empty process tree, and under `upgrade_ask = true` the
 READY answer, still come before the restart. `--now` is the last rung at once,
 with the same floors.
 A SESSION IS MOVED ONLY WHILE THE
@@ -704,13 +692,11 @@ the carry-on at its first idle point. It also RELAUNCHES an agent that crashed
 someone's), on its conversation (`[harness] relaunch`). An agent the HARNESS'S
 OWN restart ended — its step returned with the relaunch still to type (someone
 at the returned prompt, a hold) — is never read as someone's exit, a limit's
-or a graceful one: the restart is carried at least every minute, Claude Code's
-and Codex's, whatever `[harness] relaunch` says, the line typed only once
+or a graceful one: the restart is carried at least every minute, whatever
+`[harness] relaunch` says, the line typed only once
 nobody types at the prompt and no hold stands — and a line once typed never
 typed again — until it lands or its 5 minutes run out, said on the tab either
-way. Claude Code's count from the agent's exit, however long it took to shut
-down; Codex's from its typed `/exit`, since a TUI still running a minute after
-its `/exit` is one the `/exit` did not take.
+way, counted from the agent's exit, however long it took to shut down.
 THE MODEL goes with it: a session behind the newest model of its OWN family that
 the managed build offers (`aterm harness upgrade models`) is moved onto it on the
 relaunch line (`--model`, session-only — never `/model`, which also saves the
@@ -719,8 +705,7 @@ family, up the priority list for a model nobody chose; never down, a launch
 alias like `opus` kept as it is — riding a build restart when there is one, else
 by itself once its prompt cache is cold, or at most an hour after the move came
 due. A turn that ended with the agent's own background work in flight (Claude's
-`Waiting for N dynamic workflow`, a shell it left running, a Codex background
-terminal) is a NATURAL BREAK: once it has stood 20 s the window types the notice
+`Waiting for N dynamic workflow`, a shell it left running) is a NATURAL BREAK: once it has stood 20 s the window types the notice
 there, and again only after a whole 30 minutes with that work still running,
 four notices at most before the round gives up (and two hours later a new round
 asks again, there too). The restart still waits for an idle point with nothing
@@ -755,126 +740,17 @@ step recorded them. A give-up or a new round, which the upgrade takes
 whatever the session shows, is said with what holds the point it waits for
 after `@` (`step=gave-up@box`, `step=would-rearm:unanswered@not-idle:busy`).
 
-AND CODEX, by the same step under the same lock and ledger — a hand-run
-sweep's, and in the window each Codex tab's own worker at its session's idle
-points (Codex 0.157 runs TWO processes: a shared app-server DAEMON per
-$CODEX_HOME that holds every conversation, and the TUI in the tab, a client of
-it). THE DAEMON FIRST: for ~/.codex (a hand-run sweep) and every home a live
-Codex TUI runs with, a daemon on an older
-build than the managed Codex is moved by the vendor's verb,
-`<managed codex> app-server daemon update --from-cli --yes`, run with the
-environment the daemon itself was started with: the managed build is copied
-in and PINNED, the updater goes, the daemon restarts, and every attached TUI
-reconnects (`• Reconnected. No input was resent.`). A daemon ON the managed
-build whose vendor updater is still armed (`packages/app-server-daemon/
-auto-update-version`, which re-runs chatgpt.com's installer outside atpkg)
-is PINNED the same
-way — it keeps its tab due for the pin alone, looked at for it at most once
-an hour (`wait:pin:<why>`, which owns no turn end and shows no row or tab
-mark). Only while NOTHING RUNS
-in it — every thread it holds idle and settled, attached to a tab or not (its
-locks reveal them), and no BACKGROUND TERMINAL a finished turn left running
-under it (a unified-exec command leads a session of its own under the
-daemon; the restart would end it) — no person is at a Codex tab on that home,
-none is held, the OWNER'S WORD on none keeps it (a `--skip` of this build or
-a `--defer` on a Codex tab holds the daemon that runs its conversation too;
-that tab's `--now` narrows its own attended guard to a keystroke in the last
-20 s here as well, as the ladder's last rung does), and every
-Codex attached to the daemon is one the pass sees — the window's step asks
-every Codex tab of its window, whichever tab's step reaches the daemon first
-(a TUI in another window or a pane was asked none of this): `wait:busy-thread`,
-`background-terminal`, `owner-held`, `unseen-client`, `held`, `attended`,
-`settling`. A daemon ahead of the managed Codex is never moved back
-(`wait:vendor-ahead`). THEN EACH TUI that is a tab's foreground job on an
-older build: a DAEMON-MODE client at an idle point (no turn running on
-screen, its input line's dim placeholder — `›` or 0.158.0's `»` — no box,
-quiet as its rung asks, nobody at the tab — the same gates, the same `--now`
-— and NO TURN OF ITS OWN RUNNING IN ITS DAEMON, since an `/exit` might stop
-it: Codex prints `Disconnected from this task. Any running work continues.`,
-and 0.158.0 can also print `… The current turn was stopped.`) is ended by a TYPED
-`/exit`. Its own conversation is the one the kernel names — every thread of
-its daemon hangs from that conversation's root (read from each thread's
-rollout: the subagents it spawned name it as their parent) and it is the
-daemon's only client — and a turn anywhere in it, a subagent's included,
-waits `wait:goal` while its footer says `Pursuing goal`, else
-`wait:daemon-turn`. UNDER `upgrade_ask = true` A GOAL IS PAUSED FOR THE
-MOVE: a goal starts its next turn within milliseconds of the last one's end,
-so from two hours behind (or `--now`), where its own turn is all that holds
-the move and no save-then-wait switch is open, aterm types `/goal pause` —
-Codex takes it while a turn runs, and it stops the NEXT turn, never the running
-one — waits for that last turn to end (`wait:goal-held`), moves the tab, and
-resumes the goal once: the box the relaunched Codex opens with, asking
-whether to resume its paused goal, answered with its first option, or `/goal
-resume` typed (an embedded session gets no carry-on then: the goal is it). A
-pause that never shows is followed, at a goal turn's head only (its rollout
-holds nothing of its own work), by one Esc. The record of it (`<aterm
-state>/drive/<tab>.goal-hold.json`, written before every key) resumes it once
-after a restart, never twice; a person resuming or changing the goal, or
-their hand on a pause not yet seen, takes it from aterm; every wait at a goal
-held paused is `wait:goal-held`, which keeps the supervisor's carry-on out; a
-move that does not come within an hour is given up and the goal resumed, said
-once — never into a thread fallen into a sandbox, where it stays paused
-(`wait:goal-sandboxed`, a row naming the relaunch); the relaunched Codex's box
-is the one the approval policy answers for it; a switch that opens over the
-pause resumes the goal at its reset; a resume not made in an hour and a half
-is a row with the one hand step (`/goal resume` in the tab), never while a
-switch holds the session or the paused goal's last turn runs. Another
-session's turn on the same
-daemon holds it only until its screen places it there — a ROOT running at
-two looks 20 s apart, while this screen's words stood still, which a turn of
-its own would have changed, with another Codex attached to the daemon —
-never while its footer says `Pursuing goal` (a goal's next turn runs under a
-screen whose words stand still); a subagent's turn, or a second root's with
-this TUI the daemon's only client, is never placed. Until then it waits
-`wait:daemon-busy`, never said as a goal to pause in this tab, nor presumed
-another session's. The `/exit`
-is fenced on the screen it was judged by, its Enter guarded on the
-composer's row, its
-daemon read once more first (a turn begun since the sweep's read waits
-`wait:changed`) — and
-relaunched at the returned prompt as `<managed codex> resume <the same flags>
-<thread>`, the thread read from the TUI's own exit hint (`Reconnect: codex
-resume <id>`: its command block's output, else the rows directly above the
-new prompt's FIRST row, so a prompt of two rows is no obstacle). Where the
-shell integration's marks do not reach aterm (`status integration=degraded`,
-as after an aterm update) the thread is the one the KERNEL names — the root
-of the daemon's one conversation, this TUI its one client — recorded before
-the `/exit`
-(a hint naming another stops the relaunch); where the kernel cannot name it
-either, the `/exit` waits `wait:no-shell-integration`, which after 30 minutes
-is a row saying so (`blocked:no-shell-integration`: quit Codex in its tab and
-resume it with the line it prints); the relaunch line also heals the shell's
-integration. Its work never stops, in the daemon, so nothing is announced and
-nothing continued. It waits for its daemon to be on the build it moves to, and says
-what the daemon waits on (`wait:daemon-first:<why>`). An EMBEDDED session
-(`--no-daemon`, or a launch Codex keeps out of the daemon; the kernel proves
-it by the `thread-writer-locks/<id>.lock` it holds) gets Claude's protocol —
-the notice, its READY answer in the rollout, nothing running under it, a
-background terminal included (`wait:background-terminal`: it would end with
-the TUI; one that outlives the READY a whole re-ask window is asked about
-again, and past the last ask the upgrade gives up, as Claude's) — then the
-same `/exit`, the relaunch through the one relaunch line
-Claude Code's restart types, and a carry-on line (the window hands the new
-TUI back to its supervisor, which types it at its next idle point). NO
-SIGNAL IS EVER SENT TO CODEX: SIGTERM leaves its tab in the alternate screen
-with kitty keyboard, mouse and bracketed paste on. What the lane types and
-does not submit (a guarded Enter that missed) is said on the ledger
-(`left-typed:<what>`) and left standing: never taken back, never read as a
-person's draft and never sent by the supervisor; a person clears it (the
-upgrade waits `wait:left-typed:unsent`); a `/exit` the TUI
-outlives is never waited on again (`wait:exit-not-taken`, then
-`failed:stale-exit`). A TUI that names no thread as it exits is not
-relaunched (`failed:no-resume-hint`: its conversation runs on in the daemon;
-`codex resume` in the tab takes it back). Its state is per TAB: `codex-<sid>`
-in `--status`, the ledger and the `upgrade=` column — a move that stopped
-after its `/exit` stays listed though no Codex holds it any more (in the
-window for a day).
+NO CODEX IS MOVED LIVE: a vendor `codex` is shown, never moved, and a
+codex-alab upgrades itself (its contract, §5). A Codex record left in flight
+by an older aterm's Codex lane is closed (`failed:codex-lane-retired`) and
+nothing is typed into its tab; `codex resume` there takes the conversation
+back.
 ";
 
 /// `aterm harness upgrade --status --help`: every field of a status line.
 const HELP_UPGRADE_STATUS: &str = "\
 `upgrade --status` READS the recorded upgrades and sweeps nothing: one line
-(and under it, indented, the move and what holds it) for each a live Claude Code or Codex still holds on a build older than its
+(and under it, indented, the move and what holds it) for each a live Claude Code still holds on a build older than its
 target, in that tab (a conversation that ended, or was moved onto the build by hand,
 leaves its file behind; it is not listed) — the tab, the conversation, from
 and to, the phase, `pending_for=`,
@@ -913,8 +789,8 @@ outside every aterm tab
 `overdue` (6 hours behind — four
 past the point where it moves at its first pause — whatever it waits on, unless the owner's `--now`
 came in the last 30 minutes; and at once, whatever its age and any `--now`, for
-a usage limit an hour past its end (the reset its transcript named, or for
-Codex the one its wall on the screen names — plus 10 minutes under the default
+a usage limit an hour past its end (the reset its transcript named — plus 10
+minutes under the default
 flow; a week after its wait began where no reset was named, never for a spend
 or credit cap) with its
 notice still the recorded wait: where the reset was named,
@@ -955,8 +831,7 @@ do and from what time the first pause is enough. It marks a tab
 the owner is needed NOW and the action is theirs alone: the agent the upgrade
 ended is not back (`agent-down`, and the command that resumes it), it came back
 and has reached no prompt in half an hour (`relaunch-stuck`), a shutdown it
-asked for has hung (`hung-exit`), or a Codex goal it paused was not resumed
-(`goal-paused`). Every other wait — the
+asked for has hung (`hung-exit`). Every other wait — the
 agent's own work, a person at the tab, a usage limit, a box the supervisor
 answers — is this status, the ledger, the wait log and the log of Settings ▸
 Messages; after a day of the agent's own work (and a whole round of notices
@@ -979,8 +854,8 @@ point. The word is on the TAB named: the same conversation resumed in another
 tab is asked afresh. `--now` stands the upgrade at the LADDER'S LAST RUNG at
 once: no quiet window, and a person at the tab holds it only by a keystroke
 in the last 20 s (its `status human_ms=`) — never waived, the word included —
-and nothing else (an idle status, an empty composer, no box, no hold, no turn
-in a Codex daemon and nothing running under the agent are still required —
+and nothing else (an idle status, an empty composer, no box, no hold and
+nothing running under the agent are still required —
 and, under `upgrade_ask = true`, the READY answer — and what is typed is still
 fenced on the screen it was judged by).
 Every word arms a NEW ROUND of the upgrade: under `upgrade_ask = true`, a
@@ -1064,13 +939,13 @@ pub struct Env {
     pub claude_pid: Option<u32>,
     /// The Codex thread this command runs under, when Codex named it:
     /// `CODEX_THREAD_ID`, which Codex sets for the commands its tools run
-    /// (a thread id, [`super::upgrade_codex::is_thread_id`]). aterm strips
+    /// (a thread id, [`super::codex_rollout::is_thread_id`]). aterm strips
     /// `CODEX_*` from the shells it spawns, so only Codex's own tools carry
     /// it.
     pub codex_thread: Option<String>,
     /// `CODEX_HOME` as this command's environment sets it, raw: the Codex
     /// home is it, else `$HOME/.codex`, and a relative one names none
-    /// ([`crate::supervise::codex_usage::codex_home`]).
+    /// ([`crate::harness::codex_rollout::codex_home`]).
     pub codex_home: Option<String>,
     /// Unix seconds. Read once, at the top of [`main_entry`].
     pub now: i64,
@@ -1085,9 +960,6 @@ pub struct Env {
     /// Claude Code's per-user temp root, where `disk` searches for the
     /// sessions' scratch builds ([`disk::discover::claude_tmp_root`]).
     pub claude_tmp: Option<PathBuf>,
-    /// The cells cache root, where `disk` searches too
-    /// ([`disk::discover::cells_root`]).
-    pub cells: Option<PathBuf>,
     /// The running Claude Codes and the directories the processes were
     /// started with ([`disk::discover::running_claude_census`]), read for
     /// `disk` alone ([`main_entry`]). `None`, not read: no session is called
@@ -1111,7 +983,7 @@ impl Env {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .filter(|h| h.is_absolute());
-        let aterm_state = crate::operator::default_state_root().ok();
+        let aterm_state = aterm_types::dirs::state_dir();
         let state = match std::env::var_os("ATERM_HARNESS_STATE") {
             Some(dir) if Path::new(&dir).is_absolute() => PathBuf::from(dir),
             Some(_) => return Err("ATERM_HARNESS_STATE must be absolute".to_string()),
@@ -1150,10 +1022,6 @@ impl Env {
         let claude_session = std::env::var("CLAUDE_CODE_SESSION_ID")
             .ok()
             .filter(|id| footer::is_session_id(id));
-        let xdg_cache = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from);
-        let cells = home
-            .as_deref()
-            .map(|h| disk::discover::cells_root(h, xdg_cache.as_deref()));
         Ok(Env {
             state,
             aterm_state,
@@ -1167,14 +1035,13 @@ impl Env {
             claude_pid,
             codex_thread: std::env::var("CODEX_THREAD_ID")
                 .ok()
-                .filter(|id| super::upgrade_codex::is_thread_id(id)),
+                .filter(|id| super::codex_rollout::is_thread_id(id)),
             codex_home: std::env::var("CODEX_HOME").ok(),
             now,
             sid: std::env::var("ATERM_PARENT_SESSION_ID").unwrap_or_default(),
             sock: None,
             config: default_config_path(),
             claude_tmp: Some(disk::discover::claude_tmp_root(disk::discover::own_uid())),
-            cells,
             claude_running: None,
         })
     }
@@ -1336,11 +1203,8 @@ pub enum OwnerAsk {
 /// One parsed invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cmd {
-    /// `hook`, `statusline`, `install` or `uninstall`: retired ([`RETIRED`]).
-    Retired {
-        /// The verb as typed.
-        verb: String,
-    },
+    /// `hook` or `statusline`: retired, a silent success ([`run_retired`]).
+    Retired,
     /// `tap`: the usage tap ([`super::tap::run`]). The front door runs a
     /// bare `tap` before anything is parsed ([`main_entry`]); this is the
     /// same verb reached past a flag.
@@ -1376,9 +1240,9 @@ pub enum Cmd {
         /// The JSON form (the rows verbatim, one object per line).
         json: bool,
     },
-    /// Move live Claude Code and Codex sessions onto the newer build in
-    /// place, resuming the same conversation in the same tab
-    /// ([`super::upgrade_drive`], [`super::upgrade_codex`]).
+    /// Move live Claude Code sessions onto the newer build in place,
+    /// resuming the same conversation in the same tab
+    /// ([`super::upgrade_drive`]).
     Upgrade {
         /// Only this tab (`s-<hex>`); empty means every session.
         sid: String,
@@ -1618,9 +1482,7 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
         }
     };
     let cmd = match verb {
-        verb @ ("hook" | "statusline" | "install" | "uninstall") => Cmd::Retired {
-            verb: verb.to_string(),
-        },
+        "hook" | "statusline" => Cmd::Retired,
         "tap" => {
             if rest.len() > 1 {
                 return Err(format!("tap takes no operand, not {:?}", &rest[1..]));
@@ -2243,25 +2105,25 @@ const USAGE_CODEX_ACCOUNT: &str = "codex";
 /// `aterm harness usage` from a Codex session's own tools: every served turn
 /// of the conversation the thread `CODEX_THREAD_ID` names belongs to — its
 /// TUI's own thread and the subagents spawned in it
-/// ([`crate::supervise::codex_usage::conversation_rollouts`]) — in the Codex
+/// ([`crate::harness::codex_rollout::conversation_rollouts`]) — in the Codex
 /// home this command's environment names, each turn once and nothing of a
 /// fork's copied prefix ([`super::spend::fold_conversation`]), with the list
 /// dollars of the shipped price table where it prices a model. Its windows
 /// stay unknown.
 fn run_codex_usage(env: &Env, thread: &str, json: bool, out: &mut dyn Write) -> ExitCode {
     use super::spend;
-    use crate::supervise::codex_usage;
+    use crate::harness::codex_rollout;
     // This command runs in the session's tool shell, whose folder need not
     // be the one the TUI started in: a relative CODEX_HOME places no home
     // here, and nothing is read.
-    let home = codex_usage::codex_home(
+    let home = codex_rollout::codex_home(
         env.codex_home.as_deref(),
         env.home.as_deref().and_then(Path::to_str),
         None,
     );
     let conversation = home
         .as_deref()
-        .map(|h| codex_usage::conversation_rollouts(h, thread));
+        .map(|h| codex_rollout::conversation_rollouts(h, thread));
     // The shipped table loads (its own test); one that did not would price
     // nothing, never guess.
     let prices = spend::PriceTable::from_toml(spend::PRICES_TOML).unwrap_or_default();
@@ -2296,7 +2158,9 @@ fn run_codex_usage(env: &Env, thread: &str, json: bool, out: &mut dyn Write) -> 
     };
     let unread =
         conversation.as_ref().map_or(0, |c| c.unread) + fold.as_ref().map_or(0, |f| f.unread);
-    let complete = fold.as_ref().is_some_and(|f| f.caught_up && unread == 0);
+    let complete = fold.as_ref().is_some_and(|f| {
+        f.caught_up && unread == 0 && f.unparsed == 0 && f.long == 0 && f.untimed == 0
+    });
     if json {
         // Schema 1: keys are only ever added, never changed.
         let mut extra = vec![("codex_thread", Value::from(thread.to_owned()))];
@@ -2312,6 +2176,9 @@ fn run_codex_usage(env: &Env, thread: &str, json: bool, out: &mut dyn Write) -> 
         if let Some(f) = &fold {
             extra.push(("turns", Value::from(f.turns)));
             extra.push(("copied", Value::from(f.copied)));
+            extra.push(("rows_unparsed", Value::from(f.unparsed)));
+            extra.push(("rows_oversized", Value::from(f.long)));
+            extra.push(("turns_untimed", Value::from(f.untimed)));
             extra.push(("complete", Value::from(complete)));
             extra.push((
                 "prices_as_of",
@@ -2402,6 +2269,13 @@ fn run_codex_usage(env: &Env, thread: &str, json: bool, out: &mut dyn Write) -> 
              these totals."
         ));
     }
+    if f.unparsed > 0 || f.long > 0 || f.untimed > 0 {
+        short.push_str(&format!(
+            " Skipped {} malformed rows, {} oversized rows and {} untimed turns: these totals \
+             are partial.",
+            f.unparsed, f.long, f.untimed
+        ));
+    }
     // `files` holds the TUI's thread's rollout first, where it was found,
     // then the subagents'.
     let folded = match c.files.first() {
@@ -2435,13 +2309,11 @@ fn run_codex_usage(env: &Env, thread: &str, json: bool, out: &mut dyn Write) -> 
 // ---------------------------------------------------------------------------
 
 /// What one screen read says about a limit: the wall the worker's last turn
-/// ended on, read by the tab's own reader ([`aterm_phase::identify`]: Claude
-/// Code's grammar or Codex's, the one the turn-end policy also decides on),
-/// and the windows the vendor painted: Claude Code's `/usage` panel
-/// ([`usage::usage_panel_windows`]), Codex's `/status` card
-/// ([`usage::codex_status_windows`]). Every reset is placed on the clock by
-/// the supervisor's grammar ([`limit::parse_reset`], [`limit::reset_at`];
-/// the card's by [`limit::parse_card_reset`]).
+/// ended on, read by the tab's own reader ([`aterm_phase::identify`]: the
+/// grammar the turn-end policy also decides on), and the windows the vendor
+/// painted: Claude Code's `/usage` panel ([`usage::usage_panel_windows`]).
+/// Every reset is placed on the clock by the supervisor's grammar
+/// ([`limit::parse_reset`], [`limit::reset_at`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct LimitsView {
     /// The wall, when the screen shows one.
@@ -2462,16 +2334,6 @@ pub struct LimitsView {
 /// read AT the instant placed for ([`limit::zone_offset_at`] in production), as
 /// the loop that waits for the reset reads it, so a reset across a
 /// daylight-saving change shows the time the supervisor will continue at.
-///
-/// A CODEX TAB's windows are its `/status` card's, and the card names no zone:
-/// codex-rs draws it with the TUI's own clock. `codex_offset_at` is that
-/// zone's offset at an instant (the `TZ` of the TUI's exec environment, else
-/// the machine's: [`super::upgrade_drive::codex_zone_offset_at`]), and a reset
-/// is placed in it as its wall's is (`upgrade_drive::codex_wall_reset`): a
-/// bare clock is the reading's own day, never tomorrow. Unlike a wall's words,
-/// which the daemon may write, the card is the TUI's own drawing, so its
-/// daemon's zone is not asked. `None` there (the TUI unread) places no reset,
-/// never one in this process's zone. Another tab never asks it.
 #[must_use]
 pub fn limits_view(
     reader: &dyn aterm_phase::ScreenReader,
@@ -2479,62 +2341,18 @@ pub fn limits_view(
     now: i64,
     local_offset_s: i64,
     zone_offset_at: &dyn Fn(&str, i64) -> Option<i64>,
-    codex_offset_at: &dyn Fn(i64) -> Option<i64>,
-) -> LimitsView {
-    limits_view_placed(
-        reader,
-        rows,
-        now,
-        local_offset_s,
-        zone_offset_at,
-        codex_offset_at,
-        None,
-    )
-}
-
-/// [`limits_view`], a CODEX tab's wall reset taken from `placed`: where the
-/// window's harness placed it (the tab's `status` `reset_at=`, unix seconds;
-/// `aterm-gui`'s `presence::reset_at_field`), in the Codex's own zone, as
-/// its loop and the tab's countdown place it — the zone the card's windows
-/// are placed in too ([`super::upgrade_drive::codex_zone_offset_at`]). A
-/// Codex prints its `try again at` time in its own process's zone, which a
-/// `TZ` its shell exported sets and this process never sees. `None` (an
-/// aterm that prints no such field, `reset_at=-`, or no harness placing
-/// it): the wall's words placed here, in this process's zone, as before.
-/// Claude Code's wall names its zone and is never taken from it.
-#[must_use]
-pub fn limits_view_placed(
-    reader: &dyn aterm_phase::ScreenReader,
-    rows: &[String],
-    now: i64,
-    local_offset_s: i64,
-    zone_offset_at: &dyn Fn(&str, i64) -> Option<i64>,
-    codex_offset_at: &dyn Fn(i64) -> Option<i64>,
-    placed: Option<i64>,
 ) -> LimitsView {
     let place = |text: &str| {
         limit::parse_reset(text)
             .map(|spec| limit::reset_at_with(&spec, now, local_offset_s, zone_offset_at))
     };
     let wall = reader.wall(rows);
-    // Only a Codex wall's reset is placed by its harness (`reset_at=`).
-    let codex = match reader.program() {
-        aterm_phase::Program::Codex => true,
-        aterm_phase::Program::Claude
-        | aterm_phase::Program::Agy
-        | aterm_phase::Program::Muse
-        | aterm_phase::Program::Generic => false,
-    };
     // The wall's reset is placed as the loop that waits for it places it: on
     // Claude Code's screen a session window's by the five-hour rule, any other
     // wall's bare clock as the first occurrence after the print the screen's
-    // done row gives; Codex's where its harness placed them, else where its
-    // words first fall. So `harness limits` says the time the supervisor will
-    // continue at.
+    // done row gives; any other program's where its words first fall. So
+    // `harness limits` says the time the supervisor will continue at.
     let resets_at = wall.as_ref().and_then(|w| {
-        if codex && let Some(at) = placed {
-            return Some(at);
-        }
         let spec = limit::parse_reset(w.reset.as_deref()?)?;
         if !crate::supervise::run::places_resets_on_print(reader.program()) {
             return Some(limit::reset_at_with(
@@ -2556,23 +2374,18 @@ pub fn limits_view_placed(
             zone_offset_at,
         ))
     });
-    // Each program's own surface: a Claude Code panel left on a Codex tab's
-    // screen is no window of this Codex's.
+    // Each program's own surface: a Claude Code panel left on another
+    // agent's screen is no window of that agent's.
     let windows = match reader.program() {
-        aterm_phase::Program::Codex => usage::codex_status_windows(rows)
-            .into_iter()
-            .map(|w| {
-                let at = w
-                    .reset_text
-                    .as_deref()
-                    .and_then(limit::parse_card_reset)
-                    .and_then(|spec| limit::reset_in_zone(&spec, now, 0, codex_offset_at));
-                (w, at)
-            })
-            .collect(),
-        // Neither draws a usage surface anyone measured: no window is read
-        // off their screens.
-        aterm_phase::Program::Agy | aterm_phase::Program::Muse => Vec::new(),
+        // No window is read off their screens: Codex is not supervised, agy
+        // draws no usage surface anyone measured, Muse Code's `/usage` and
+        // `/status` cards (measured on 1.4.10) hold the session's tokens, no
+        // limit's window, and Gemini CLI's `/stats model` was not measured as
+        // one.
+        aterm_phase::Program::Codex
+        | aterm_phase::Program::Agy
+        | aterm_phase::Program::Muse
+        | aterm_phase::Program::Gemini => Vec::new(),
         aterm_phase::Program::Claude | aterm_phase::Program::Generic => {
             usage::usage_panel_windows(rows)
                 .into_iter()
@@ -2592,6 +2405,7 @@ pub fn limits_view_placed(
             aterm_phase::Program::Codex
             | aterm_phase::Program::Agy
             | aterm_phase::Program::Muse
+            | aterm_phase::Program::Gemini
             | aterm_phase::Program::Generic => false,
         },
     }
@@ -2677,17 +2491,12 @@ pub fn limits_json(view: &LimitsView) -> String {
 
 /// `aterm harness limits` through `ctl`: the tab's `status`, then one screen
 /// read, one verdict. `local_offset_s` places a reset the notice names
-/// without a zone. `codex_zone` reads the zone a Codex tab's TUI prints in
-/// (`Some(None)`: no `TZ`, the machine's; `None`: unread), asked only where
-/// its `/status` card is on the screen, whose resets name none
-/// ([`limits_view`]).
-#[allow(clippy::too_many_arguments)]
+/// without a zone.
 fn run_limits_with<C: Ctl>(
     ctl: &mut C,
     env: &Env,
     sid: Option<&str>,
     local_offset_s: i64,
-    codex_zone: &dyn Fn(&mut Session<'_, C>) -> Option<Option<String>>,
     json: bool,
     out: &mut dyn Write,
     err: &mut dyn Write,
@@ -2707,39 +2516,20 @@ fn run_limits_with<C: Ctl>(
         .call(&[target.as_str(), "status"])
         .ok()
         .map(|r| r.stdout);
-    let field = |name: &str| {
-        status
-            .as_deref()
-            .and_then(|s| crate::supervise::screen::status_field(s, name))
-    };
-    let program = field("program").map(str::to_owned);
-    // Where the window's harness placed a Codex's wall reset (`reset_at=`,
-    // unix seconds); `-`, or an aterm that prints no such field, places none.
-    let placed = field("reset_at").and_then(|at| at.parse::<i64>().ok());
+    let program = status
+        .as_deref()
+        .and_then(|s| crate::supervise::screen::status_field(s, "program"))
+        .map(str::to_owned);
     let mut session = Session::new(ctl, Some(target.clone()));
     match session.read_screen() {
         Ok(screen) => {
             let reader = aterm_phase::identify(program.as_deref(), &screen.rows);
-            let zone = match reader.program() {
-                aterm_phase::Program::Codex
-                    if !usage::codex_status_windows(&screen.rows).is_empty() =>
-                {
-                    codex_zone(&mut session)
-                }
-                _ => None,
-            };
-            let codex_offset_at = |t: i64| {
-                zone.as_ref()
-                    .and_then(|tz| super::upgrade_drive::codex_zone_offset_at(tz.as_deref(), t))
-            };
-            let view = limits_view_placed(
+            let view = limits_view(
                 reader,
                 &screen.rows,
                 env.now,
                 local_offset_s,
                 &limit::zone_offset_at,
-                &codex_offset_at,
-                placed,
             );
             let text = if json {
                 limits_json(&view)
@@ -2776,22 +2566,7 @@ fn run_limits(
     let mut ctl = RelayCtl::new(endpoint, None);
     // A reset the notice names with no zone is the machine's local time, the
     // clock the vendor painted it in — the engine places it the same way.
-    // A Codex's card is in its TUI's own zone: the `TZ` of the exec
-    // environment of the tab's foreground process, bound to the tab
-    // (`Session::worker_env`), as its upgrade reads a Codex's zone.
-    run_limits_with(
-        &mut ctl,
-        env,
-        sid,
-        limit::tz_offset_s(),
-        &|session| {
-            let worker = session.worker_env().ok()?;
-            Some(worker.var("TZ").map(str::to_owned))
-        },
-        json,
-        out,
-        err,
-    )
+    run_limits_with(&mut ctl, env, sid, limit::tz_offset_s(), json, out, err)
 }
 
 // ---------------------------------------------------------------------------
@@ -2818,7 +2593,7 @@ fn default_store_dir(home: &Path) -> PathBuf {
 /// [`disk::scan`], which reads no environment of its own. With no build
 /// directory named on the line it SEARCHES ([`disk::discover::discover`]):
 /// this working directory and its worktree, `$HOME`'s checkouts and their
-/// worktrees, Claude Code's temp root and the cells cache.
+/// worktrees and Claude Code's temp root.
 fn disk_roots(env: &Env, targets: &[PathBuf]) -> disk::Roots {
     let home = env.home.clone();
     // Who may hold a session: the running Claude Codes
@@ -2850,7 +2625,6 @@ fn disk_roots(env: &Env, targets: &[PathBuf]) -> disk::Roots {
             claude_unread: claude_unread.clone(),
             agent_target_dirs: Vec::new(),
             claude_tmp: env.claude_tmp.clone(),
-            cells: env.cells.clone(),
             device: disk::discover::device_of(&env.cwd),
             mounts: disk::discover::mount_points(),
         };
@@ -2930,6 +2704,9 @@ pub struct DiskReading {
     /// say what the owner meant by a removal knob: then `config.apply` is
     /// `false` whatever the file sets it to, and a note says which value.
     pub off_by_fault: bool,
+    /// Which volume-scaled knobs the file writes: those are read as written,
+    /// never raised to the volume's share ([`disk::Config::on_volume`]).
+    pub written: disk::Written,
 }
 
 impl DiskReading {
@@ -2939,6 +2716,7 @@ impl DiskReading {
             floor_gib: Some(config.auto_free_gib),
             notes: Vec::new(),
             off_by_fault: false,
+            written: disk::Written::default(),
         }
     }
 
@@ -2950,6 +2728,7 @@ impl DiskReading {
             floor_gib: None,
             notes: vec![note],
             off_by_fault: true,
+            written: disk::Written::default(),
         }
     }
 
@@ -2968,6 +2747,20 @@ impl DiskReading {
             }
             .below_auto_floor(free)
         })
+    }
+
+    /// The knobs in force on a volume of `total` bytes: each the file does
+    /// not write raised to the volume's share ([`disk::Config::on_volume`]).
+    #[must_use]
+    pub fn on_volume(&self, total: Option<u64>) -> disk::Config {
+        self.config.on_volume(total, self.written)
+    }
+
+    /// The thresholds in force on a volume of `total` bytes
+    /// ([`disk::Config::thresholds_on`]).
+    #[must_use]
+    pub fn thresholds(&self, total: Option<u64>) -> disk::Thresholds {
+        self.config.thresholds_on(total, self.written)
     }
 }
 
@@ -3090,6 +2883,7 @@ fn disk_read(text: &str, faults: &mut Vec<DiskFault>) -> DiskReading {
         }
     };
     let mut cfg = d;
+    let mut written = disk::Written::default();
     let mut notes = Vec::new();
     let mut off = false;
     let mut floor_read = true;
@@ -3110,10 +2904,16 @@ fn disk_read(text: &str, faults: &mut Vec<DiskFault>) -> DiskReading {
                         match key {
                             "warn_free_gib" => {
                                 cfg.warn_free_gib = u64::try_from(*n).unwrap_or(d.warn_free_gib);
+                                // A negative warning reads as the default,
+                                // which scales with the volume as unwritten.
+                                written.warn_free_gib = *n >= 0;
                             }
                             "target_stale_days" if *n >= 0 => cfg.target_stale_days = *n,
                             "target_stale_days" => {}
-                            _ => cfg.auto_free_gib = u64::try_from(*n).unwrap_or(0),
+                            _ => {
+                                cfg.auto_free_gib = u64::try_from(*n).unwrap_or(0);
+                                written.auto_free_gib = true;
+                            }
                         }
                     }
                     _ if !disk::KEYS.contains(&key) => notes.push(format!(
@@ -3195,6 +2995,7 @@ fn disk_read(text: &str, faults: &mut Vec<DiskFault>) -> DiskReading {
         floor_gib: floor_read.then_some(cfg.auto_free_gib),
         notes,
         off_by_fault: off,
+        written,
     }
 }
 
@@ -3266,7 +3067,7 @@ pub struct DiskLook<'a> {
     /// Where to SEARCH for build directories below the floor
     /// ([`disk::discover::discover`]): the agents' working directories and
     /// their worktrees, `$HOME`'s checkouts, the agents' `CARGO_TARGET_DIR`,
-    /// Claude Code's temp root, the cells cache. Searched only below the
+    /// Claude Code's temp root. Searched only below the
     /// floor, and only what is on [`Self::volume`]'s volume is surveyed.
     pub discover: Option<&'a disk::discover::Roots>,
     /// Where transcripts live: nothing under it is ever removable.
@@ -3359,6 +3160,221 @@ pub fn disk_tick(
     DiskTick::Reclaimed(done, hogs)
 }
 
+/// What the reserve did on one look of the disk watch ([`disk_reserve_look`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReserveMove {
+    /// Nothing to do: there, or not wanted at this free figure.
+    Kept,
+    /// Written now, free space being well above the target.
+    Written,
+    /// Released at an emergency: its bytes unlinked.
+    Released(u64),
+    /// Something not ours in its place, or the file system refused: why.
+    Refused(String),
+}
+
+/// THE RESERVE'S MOVE on one look ([`disk::reserve`]): at
+/// [`disk::Level::Emergency`] the reserve at `reserve` is UNLINKED FIRST and
+/// then the `released` row is appended to `<state>/disk.jsonl` — the unlink
+/// needs no space, and the room it made is what lets that row and the pass's
+/// intent rows be written (at a true `ENOSPC` they could not be, and the
+/// write-ahead rule removed nothing: [`disk::Refusal::Unjournalled`]).
+/// Otherwise, with free space at least [`disk::reserve::RESERVE_BYTES`]
+/// above the pass's target, the reserve is written if it is not there, and
+/// that is journalled too. Below that, nothing is written: the reserve never
+/// takes space a pass would have to give back.
+pub fn disk_reserve_look(
+    state: &Path,
+    reserve: &Path,
+    level: disk::Level,
+    free: Option<u64>,
+    thresholds: &disk::Thresholds,
+    now: i64,
+) -> ReserveMove {
+    if level == disk::Level::Unknown {
+        return ReserveMove::Kept;
+    }
+    let moved = if level == disk::Level::Emergency {
+        match disk::reserve::release(reserve) {
+            Ok(Some(bytes)) => ReserveMove::Released(bytes),
+            Ok(None) => return ReserveMove::Kept,
+            Err(e) => ReserveMove::Refused(e.to_string()),
+        }
+    } else if free.is_some_and(|f| {
+        f >= thresholds
+            .target
+            .max(thresholds.floor)
+            .saturating_add(disk::reserve::RESERVE_BYTES)
+    }) {
+        match disk::reserve::ensure(reserve, disk::reserve::RESERVE_BYTES) {
+            Ok(true) => ReserveMove::Written,
+            Ok(false) => return ReserveMove::Kept,
+            Err(e) => ReserveMove::Refused(e.to_string()),
+        }
+    } else {
+        return ReserveMove::Kept;
+    };
+    let row = match &moved {
+        ReserveMove::Released(bytes) => disk::reserve_row(
+            now,
+            "released",
+            Some(*bytes),
+            &format!(
+                "the disk is full: the reserve {} was unlinked first, so this journal can be \
+                 written",
+                reserve.display()
+            ),
+        ),
+        ReserveMove::Written => disk::reserve_row(
+            now,
+            "written",
+            Some(disk::reserve::RESERVE_BYTES),
+            &format!("the reserve {} was written", reserve.display()),
+        ),
+        ReserveMove::Refused(why) => disk::reserve_row(now, "refused", None, why),
+        ReserveMove::Kept => return ReserveMove::Kept,
+    };
+    let path = state.join(DISK_LEDGER);
+    let mut sink = io::sink();
+    if std::fs::create_dir_all(state).is_ok() {
+        let mut journal = Journal::open(Some(&path), None, &mut sink);
+        journal.append_raw(&row, &mut sink);
+    }
+    moved
+}
+
+/// Journal a poke ([`disk::poke`]) into `<state>/disk.jsonl`: what saw the
+/// disk full, the free figure measured on it and where that stands.
+pub fn disk_poke_journal(
+    state: &Path,
+    cause: &disk::poke::Cause,
+    free: Option<u64>,
+    level: disk::Level,
+    now: i64,
+) {
+    let path = state.join(DISK_LEDGER);
+    let mut sink = io::sink();
+    if std::fs::create_dir_all(state).is_ok() {
+        let mut journal = Journal::open(Some(&path), None, &mut sink);
+        journal.append_raw(&disk::poke_row(now, cause, free, level), &mut sink);
+    }
+}
+
+/// What `aterm harness disk` says of the window's disk WATCH
+/// ([`disk_watch_status`]): one line, and the same as a JSON object (the
+/// `--json` form's second line, `kind: disk-watch`).
+pub struct DiskWatchStatus {
+    pub line: String,
+    pub json: Value,
+}
+
+/// The disk watch as it stands for the volume `volume`: the thresholds in
+/// force there ([`disk::Config::thresholds`], the knob or the volume's
+/// share), where the volume stands against them, the reserve
+/// ([`disk::reserve`] under `home`), and the last `poke` and `reserve` rows
+/// of the ledger at `ledger`.
+#[must_use]
+pub fn disk_watch_status(
+    ledger: &Path,
+    home: Option<&Path>,
+    volume: Option<&Path>,
+    config: disk::Config,
+    written: disk::Written,
+) -> DiskWatchStatus {
+    let stats = volume.and_then(atpkg::freespace::volume_stats);
+    let t = config.thresholds_on(stats.map(|s| s.total), written);
+    let level = t.level(stats.map(|s| s.free), stats.and_then(|s| s.files_free));
+    let reserve = home.map(disk::reserve::path_for);
+    let reserve_state = match reserve.as_deref().map(disk::reserve::state) {
+        None => "unknown".to_owned(),
+        Some(Ok(disk::reserve::State::Present(bytes))) => {
+            format!("present ({})", disk::human_bytes(bytes))
+        }
+        Some(Ok(disk::reserve::State::Absent)) => "absent".to_owned(),
+        Some(Err(e)) => format!("refused: {e}"),
+    };
+    let mut last_poke = Value::Null;
+    let mut last_reserve = Value::Null;
+    for line in std::fs::read_to_string(ledger)
+        .unwrap_or_default()
+        .lines()
+        .rev()
+        .take(DISK_LEDGER_KEEP_ROWS)
+    {
+        let Ok(row) = aterm_json::from_str::<Value>(line) else {
+            continue;
+        };
+        match row["kind"].as_str() {
+            Some("poke") if last_poke.is_null() => last_poke = row,
+            Some("reserve") if last_reserve.is_null() => last_reserve = row,
+            _ => {}
+        }
+        if !last_poke.is_null() && !last_reserve.is_null() {
+            break;
+        }
+    }
+    let human = |b: u64| disk::human_bytes(b);
+    let line = format!(
+        "watch: disk={} free={} of {} (warn {}, floor {}, back at {}, emergency {}){} reserve={}",
+        level.as_str(),
+        stats.map_or_else(|| "unknown".to_owned(), |s| human(s.free)),
+        stats.map_or_else(|| "unknown".to_owned(), |s| human(s.total)),
+        human(t.warn),
+        human(t.floor),
+        human(t.target),
+        human(t.emergency),
+        stats
+            .and_then(|s| s.files_free)
+            .map_or_else(String::new, |f| format!(" inodes_free={f}")),
+        reserve_state,
+    );
+    let mut o = Map::new();
+    o.insert("schema".to_owned(), Value::from(1u64));
+    o.insert("kind".to_owned(), Value::from("disk-watch".to_owned()));
+    o.insert("level".to_owned(), Value::from(level.as_str().to_owned()));
+    let num = |v: Option<u64>| v.map_or(Value::Null, Value::from);
+    o.insert("free_bytes".to_owned(), num(stats.map(|s| s.free)));
+    o.insert("total_bytes".to_owned(), num(stats.map(|s| s.total)));
+    o.insert(
+        "files_free".to_owned(),
+        num(stats.and_then(|s| s.files_free)),
+    );
+    o.insert("warn_bytes".to_owned(), Value::from(t.warn));
+    o.insert("floor_bytes".to_owned(), Value::from(t.floor));
+    o.insert("target_bytes".to_owned(), Value::from(t.target));
+    o.insert("emergency_bytes".to_owned(), Value::from(t.emergency));
+    o.insert("files_emergency".to_owned(), Value::from(t.files_emergency));
+    o.insert("reserve".to_owned(), Value::from(reserve_state));
+    o.insert(
+        "reserve_path".to_owned(),
+        reserve.map_or(Value::Null, |p| Value::from(p.display().to_string())),
+    );
+    o.insert("last_poke".to_owned(), last_poke);
+    o.insert("last_reserve".to_owned(), last_reserve);
+    DiskWatchStatus {
+        line,
+        json: Value::Object(o),
+    }
+}
+
+/// Journal one build directory of aterm's Rust build cache the pressure
+/// sweep (`atpkg::build_cache::reclaim_under_pressure`, the watch's pass
+/// with no session supervised) is about to remove (`removed` false: the
+/// write-ahead intent row) or removed, `bytes` in it, into
+/// `<state>/disk.jsonl`. Answers whether the row is on record: the sweep
+/// keeps a directory whose intent row is not ([`disk::Refusal::Unjournalled`]'s
+/// rule — nothing is removed without a record).
+pub fn disk_sweep_journal(state: &Path, path: &Path, bytes: u64, removed: bool, now: i64) -> bool {
+    let ledger = state.join(DISK_LEDGER);
+    let mut sink = io::sink();
+    if std::fs::create_dir_all(state).is_err() {
+        return false;
+    }
+    let mut journal = Journal::open(Some(&ledger), None, &mut sink);
+    let action = if removed { "removed" } else { "removing" };
+    journal.append_raw(&disk::sweep_row(now, path, action, bytes), &mut sink)
+}
+
 /// The `targets` on the same volume as `volume`, by `id_of` (a device id): the
 /// free figure the tick acts on is that volume's, and a build directory on an
 /// external disk or a second APFS volume frees nothing there. A path whose
@@ -3411,6 +3427,7 @@ fn run_disk(
         config,
         notes,
         off_by_fault,
+        written,
         ..
     } = disk_config(env);
     for note in &notes {
@@ -3456,8 +3473,20 @@ fn run_disk(
         )
     });
 
+    let watch = disk_watch_status(
+        &path,
+        env.home.as_deref(),
+        roots.volume.as_deref(),
+        config,
+        written,
+    );
     if json {
         let _ = writeln!(out, "{}", rep.to_json());
+        let _ = writeln!(
+            out,
+            "{}",
+            aterm_json::to_string(&watch.json).unwrap_or_default()
+        );
         if let Some(done) = &done {
             let mut o = Map::new();
             o.insert("schema".to_owned(), Value::from(1u64));
@@ -3536,6 +3565,7 @@ fn run_disk(
     }
 
     let _ = writeln!(out, "{}", rep.headline());
+    let _ = writeln!(out, "  {}", watch.line);
     for row in &rep.rows {
         let _ = writeln!(out, "  {}", row.line());
     }
@@ -3644,13 +3674,25 @@ fn run_disk(
 ///
 /// The file exists and cannot be read.
 pub fn tail_lines(path: &Path, max: usize) -> io::Result<Vec<String>> {
+    tail_lines_folding(path, max, &mut |ring, line| ring.push_back(line))
+}
+
+/// [`tail_lines`], each line added to the ring of the newest by `fold`,
+/// which may let it take the place of kept lines it makes redundant
+/// ([`bound_ledger_folding`]); the oldest go once the ring holds more than
+/// `max`.
+fn tail_lines_folding(
+    path: &Path,
+    max: usize,
+    fold: &mut dyn FnMut(&mut VecDeque<String>, String),
+) -> io::Result<Vec<String>> {
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
     };
     let keep = max.min(READ_MAX_ROWS);
-    let mut ring: VecDeque<String> = VecDeque::with_capacity(keep);
+    let mut ring: VecDeque<String> = VecDeque::with_capacity(keep.saturating_add(1));
     if keep == 0 {
         return Ok(Vec::new());
     }
@@ -3659,10 +3701,10 @@ pub fn tail_lines(path: &Path, max: usize) -> io::Result<Vec<String>> {
         if line.trim().is_empty() {
             continue;
         }
-        if ring.len() == keep {
+        fold(&mut ring, line);
+        while ring.len() > keep {
             ring.pop_front();
         }
-        ring.push_back(line);
     }
     Ok(ring.into_iter().collect())
 }
@@ -3676,6 +3718,25 @@ pub fn tail_lines(path: &Path, max: usize) -> io::Result<Vec<String>> {
 /// rows the other appended between its read and its rename; each run's own
 /// report row is appended after its cut.
 pub fn bound_ledger(path: &Path, max_bytes: u64, keep: usize) -> io::Result<bool> {
+    bound_ledger_folding(path, max_bytes, keep, &mut |ring, line| {
+        ring.push_back(line)
+    })
+}
+
+/// [`bound_ledger`], the rows the cut keeps folded by `fold` as they stream
+/// past ([`tail_lines_folding`]): a row may take the place of kept rows it
+/// makes redundant, so a run of them costs the cut no older row a reader
+/// still needs (`supervise::approvals::bound`).
+///
+/// # Errors
+///
+/// The file exists and cannot be read, or the cut cannot be written.
+pub fn bound_ledger_folding(
+    path: &Path,
+    max_bytes: u64,
+    keep: usize,
+    fold: &mut dyn FnMut(&mut VecDeque<String>, String),
+) -> io::Result<bool> {
     let len = match std::fs::metadata(path) {
         Ok(m) => m.len(),
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -3684,7 +3745,7 @@ pub fn bound_ledger(path: &Path, max_bytes: u64, keep: usize) -> io::Result<bool
     if len <= max_bytes {
         return Ok(false);
     }
-    let rows = tail_lines(path, keep)?;
+    let rows = tail_lines_folding(path, keep, fold)?;
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".tmp");
     let tmp = path.with_file_name(name);
@@ -3700,7 +3761,9 @@ pub fn bound_ledger(path: &Path, max_bytes: u64, keep: usize) -> io::Result<bool
         f.write_all(row.as_bytes())?;
         f.write_all(b"\n")?;
     }
-    crate::durable::sync_all(&f.into_inner().map_err(io::IntoInnerError::into_error)?)?;
+    // Ordered: the cut lands before the rename, so a reader sees the old ledger or
+    // the cut one; appends between the read and the rename can be lost anyway.
+    aterm_durable::ordered(&f.into_inner().map_err(io::IntoInnerError::into_error)?)?;
     std::fs::rename(&tmp, path)?;
     Ok(true)
 }
@@ -3973,6 +4036,8 @@ fn run_upgrade_models(
         usage_tap: None,
         instances: crate::harness::upgrade_drive::Instances::Machine,
         agents_off: Vec::new(),
+        land: false,
+        timings: super::Timings::for_build(),
     };
     match set {
         Some(list) => match super::upgrade_drive::set_models(&opts, list) {
@@ -4066,6 +4131,8 @@ fn upgrade_opts(
         // `[harness.<agent>] enabled = false`: the pass leaves that agent's
         // sessions alone, as the window's host does.
         agents_off: policy.off.clone(),
+        land: false,
+        timings: super::Timings::for_build(),
     })
 }
 
@@ -7262,44 +7329,31 @@ fn stats_text(
 // The retired verbs, and the router
 // ---------------------------------------------------------------------------
 
-/// The front door's answer to a retired verb, with stdin injected. See
-/// [`is_tombstone`]: from a pipe `hook`/`statusline` drain the payload to its
-/// end and say nothing; typed at a terminal they read nothing and say, on one
-/// stderr line, that they are retired. Both exit 0.
+/// The front door's answer to a retired verb, with stdin injected: from a
+/// pipe `hook`/`statusline` drain the payload to its end and say nothing;
+/// typed at a terminal they read nothing and say, on one stderr line, that
+/// they are retired. Both exit 0.
 fn answer_retired(
     verb: &str,
     stdin_is_tty: bool,
     stdin: &mut dyn io::Read,
     err: &mut dyn Write,
 ) -> ExitCode {
-    if is_tombstone(verb) {
-        if stdin_is_tty {
-            let _ = writeln!(err, "aterm harness {verb}: retired; it does nothing");
-        } else {
-            let _ = io::copy(stdin, &mut io::sink());
-        }
+    if stdin_is_tty {
+        let _ = writeln!(err, "aterm harness {verb}: retired; it does nothing");
+    } else {
+        let _ = io::copy(stdin, &mut io::sink());
     }
-    run_retired(verb, err)
+    run_retired()
 }
 
-/// `hook`/`statusline` (a silent success) or `install`/`uninstall` (the
-/// [`RETIRED`] refusal, exit 2). See [`Cmd::Retired`].
-fn run_retired(verb: &str, err: &mut dyn Write) -> ExitCode {
-    if is_tombstone(verb) {
-        return ExitCode::SUCCESS;
-    }
-    let _ = writeln!(err, "aterm harness {verb}: retired: {RETIRED}");
-    ExitCode::from(2)
-}
-
-/// The retired verbs something an older build installed may still run: the
-/// bridge script `install` wrote calls `harness hook` and `harness
-/// statusline` with the vendor's payload on stdin. They answer exit 0 with
-/// nothing on stdout, which every hook event reads as "no opinion" and the
-/// footer as an empty line, never the usage error (exit 2) that Claude Code
-/// reads as a block.
-fn is_tombstone(verb: &str) -> bool {
-    matches!(verb, "hook" | "statusline")
+/// `hook`/`statusline`: what an older build's bridge script still runs, with
+/// the vendor's payload on stdin. Exit 0 with nothing on stdout, which every
+/// hook event reads as "no opinion" and the footer as an empty line, never
+/// the usage error (exit 2) that Claude Code reads as a block. See
+/// [`Cmd::Retired`].
+fn run_retired() -> ExitCode {
+    ExitCode::SUCCESS
 }
 
 /// Route one parsed command. Injected writers so the tests drive this directly.
@@ -7309,7 +7363,7 @@ pub fn run(cmd: &Cmd, env: &Env, out: &mut dyn Write, err: &mut dyn Write) -> Ex
             let _ = out.write_all(help_page(*page).as_bytes());
             ExitCode::SUCCESS
         }
-        Cmd::Retired { verb } => run_retired(verb, err),
+        Cmd::Retired => run_retired(),
         Cmd::Tap => run_tap(out),
         Cmd::Usage { json } => run_usage(env, &LiveClaude, *json, out),
         Cmd::Limits { sid, json } => run_limits(env, sid.as_deref(), *json, out, err),
@@ -7349,8 +7403,7 @@ fn run_tap(out: &mut dyn Write) -> ExitCode {
 /// The retired verbs answer first, before any parsing and before the
 /// environment is read, so no argv or environment an old install runs them
 /// with can turn their answer into an error: `hook` and `statusline` drain
-/// stdin to its end and exit 0 printing nothing; `install` and `uninstall`
-/// refuse with [`RETIRED`], exit 2. See [`answer_retired`]. A bare `tap`
+/// stdin to its end and exit 0 printing nothing. See [`answer_retired`]. A bare `tap`
 /// answers there too ([`run_tap`]): Claude Code runs it after every reply,
 /// and nothing the environment says may turn its line into an error.
 pub fn main_entry(argv: Vec<OsString>) -> ExitCode {
@@ -7363,7 +7416,7 @@ pub fn main_entry(argv: Vec<OsString>) -> ExitCode {
         return run_tap(&mut io::stdout().lock());
     }
     if let Some(verb) = args.first().map(String::as_str)
-        && matches!(verb, "hook" | "statusline" | "install" | "uninstall")
+        && matches!(verb, "hook" | "statusline")
     {
         let stdin = io::stdin();
         let tty = stdin.is_terminal();

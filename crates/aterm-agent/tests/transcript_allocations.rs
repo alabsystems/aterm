@@ -7,8 +7,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use aterm_agent::harness::{footer, upgrade, upgrade_codex, upgrade_models, usage};
-use aterm_agent::supervise::codex_usage;
+use aterm_agent::harness::{footer, upgrade, upgrade_models, usage};
 
 static COUNTING: AtomicBool = AtomicBool::new(false);
 static BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -71,7 +70,6 @@ fn bounded<T>(name: &str, f: impl FnOnce() -> T) -> T {
 
 fn within<T>(name: &str, max_bytes: usize, max_calls: usize, f: impl FnOnce() -> T) -> T {
     let (result, bytes, calls) = measured(f);
-    eprintln!("transcript allocations: {name}: {bytes} bytes, {calls} allocations");
     assert!(bytes < max_bytes, "{name} allocated {bytes} bytes");
     assert!(calls < max_calls, "{name} made {calls} allocations");
     result
@@ -95,19 +93,6 @@ fn transcript_readers_keep_allocation_proportional_to_input() {
             r#"{{"type":"assistant","isSidechain":false,"timestamp":"2026-09-28T12:00:00Z","version":"2.1.283","cwd":"/work/project","effort":"xhigh","message":{{"id":"msg-1","model":"{model}","content":{content},"usage":{{"input_tokens":42,"output_tokens":7}}}}}}"#
         );
         assert!(row.len() < 256 * 1024, "footer fixture must be admitted");
-        let (full, full_bytes, full_calls) = measured(|| {
-            aterm_json::from_str::<aterm_json::Value>(&row).expect("full Value control")
-        });
-        eprintln!(
-            "transcript allocations: full Value: {full_bytes} bytes, {full_calls} allocations ({} input bytes)",
-            row.len()
-        );
-        assert_eq!(full["message"]["model"].as_str(), Some(model));
-        assert!(
-            full_bytes > content.len(),
-            "control must materialize content"
-        );
-
         let fold = bounded("usage", || {
             let mut fold = usage::TranscriptUsage::new();
             assert_eq!(fold.fold_line(&row), usage::Fold::Summed);
@@ -183,115 +168,5 @@ fn transcript_readers_keep_allocation_proportional_to_input() {
         assert!(!within("task scan", 32 * 1024, 128, || {
             upgrade::TaskScan::default().line(&row)
         }));
-    }
-    codex_metadata_does_not_materialize_payloads();
-    backward_context_reads_allocate_linearly();
-}
-
-/// Codex carries large instructions and world state in head/context rows; the
-/// head and sandbox decisions need their discriminants, never those payloads.
-fn codex_metadata_does_not_materialize_payloads() {
-    let padding = "agent instructions\\n日本語 ".repeat(16_384);
-    let row = format!(
-        r#"{{"type":"turn_context","timestamp":"2026-10-06T12:00:00Z","payload":{{"cwd":"/work/project","model":"gpt-6-astra","sandbox_policy":{{"type":"danger-full-access"}},"developer_instructions":"{padding}"}}}}"#
-    );
-    let (full, full_bytes, _) =
-        measured(|| aterm_json::from_str::<aterm_json::Value>(&row).expect("full Value control"));
-    assert!(full_bytes > padding.len());
-    assert_eq!(full["payload"]["model"].as_str(), Some("gpt-6-astra"));
-    eprintln!("transcript allocations: Codex full Value: {full_bytes} bytes");
-    assert!(bounded("Codex turn head", || upgrade_codex::head_part(
-        &row
-    )));
-    let context = bounded("Codex context", || {
-        codex_usage::rollout_turn_context(&row).expect("context")
-    });
-    assert_eq!(context.cwd, "/work/project");
-    assert_eq!(context.sandbox, "danger-full-access");
-    assert_eq!(context.model.as_deref(), Some("gpt-6-astra"));
-    // A tool result can quote event words; it must not become an event or a
-    // head, nor allocate its output while checking those words.
-    let decoy = format!(
-        r#"{{"type":"response_item","payload":{{"type":"function_call_output","output":"event_msg task_complete {padding}"}}}}"#
-    );
-    assert!(!bounded("Codex tool head", || upgrade_codex::head_part(
-        &decoy
-    )));
-    let mut cursor = std::io::Cursor::new(decoy.as_bytes());
-    // The reader's input buffer is expected; the payload's Value tree is not.
-    let state = within("Codex quoted turn event", 3 * decoy.len(), 100, || {
-        upgrade_codex::rollout_turn_back(&mut cursor, decoy.len() as u64, u64::MAX, u64::MAX)
-    });
-    assert_eq!(state, upgrade_codex::TurnState::Unknown);
-}
-
-/// The historical reader recopied the entire accumulated partial line at each
-/// backward step. Keep it as the allocation negative control, with the same
-/// real context parser, so the threshold rejects the original quadratic path.
-fn copied_context_read(path: &std::path::Path) -> Option<codex_usage::TurnContext> {
-    use std::io::{Read as _, Seek as _, SeekFrom};
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut end = file.metadata().ok()?.len();
-    let mut carry = Vec::new();
-    while end > 0 {
-        let start = end.saturating_sub(codex_usage::CONTEXT_CHUNK);
-        file.seek(SeekFrom::Start(start)).ok()?;
-        let mut buf = Vec::with_capacity(usize::try_from(end - start).ok()?);
-        (&mut file).take(end - start).read_to_end(&mut buf).ok()?;
-        buf.extend_from_slice(&carry);
-        let (head, whole) = if start > 0 {
-            match buf.iter().position(|&b| b == b'\n') {
-                Some(nl) => (buf[..nl].to_vec(), &buf[nl + 1..]),
-                None => (buf.clone(), &buf[buf.len()..]),
-            }
-        } else {
-            (Vec::new(), &buf[..])
-        };
-        if let Some(found) = codex_usage::rollout_turn_context(&String::from_utf8_lossy(whole)) {
-            return Some(found);
-        }
-        carry = head;
-        end = start;
-    }
-    None
-}
-
-fn backward_context_reads_allocate_linearly() {
-    let scratch = aterm_tempfile::Builder::new()
-        .prefix("codex-context-allocation-")
-        .tempdir()
-        .expect("scratch");
-    let path = scratch.path().join("rollout.jsonl");
-    let context = r#"{"type":"turn_context","payload":{"cwd":"/work/project","model":"gpt-6-astra","sandbox_policy":{"type":"danger-full-access"}}}"#;
-    let mut previous = 0;
-    for mib in [8, 16] {
-        let rollout = format!(
-            "{context}\n{{\"type\":\"response_item\",\"payload\":{{\"type\":\"function_call_output\",\"output\":\"{}\"}}}}\n",
-            "x".repeat(mib * 1024 * 1024)
-        );
-        std::fs::write(&path, &rollout).expect("write rollout");
-        let (found, bytes, calls) = measured(|| {
-            codex_usage::last_turn_context(&path, codex_usage::CONTEXT_REACH)
-                .expect("context behind tool output")
-        });
-        let (old, old_bytes, _) = measured(|| copied_context_read(&path).expect("old context"));
-        eprintln!(
-            "transcript allocations: Codex {mib}MiB backward read: {bytes} bytes, {calls} allocations; copied-carry control: {old_bytes} bytes"
-        );
-        assert_eq!(found, old);
-        assert_eq!(found.sandbox, "danger-full-access");
-        assert!(bytes < 3 * rollout.len(), "linear reader allocated {bytes}");
-        assert!(
-            old_bytes > 8 * rollout.len(),
-            "control must expose repeated copying"
-        );
-        if previous > 0 {
-            assert!(
-                bytes < 3 * previous,
-                "doubling input must not square allocation"
-            );
-        }
-        previous = bytes;
-        assert!(codex_usage::last_turn_context(&path, codex_usage::CONTEXT_CHUNK).is_none());
     }
 }

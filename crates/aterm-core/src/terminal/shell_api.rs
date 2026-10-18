@@ -55,8 +55,9 @@ impl Terminal {
 
     /// Monotonic count of commands the shell started (each OSC 133/633 C the
     /// A→B→C→D gate accepted, whether or not a block held it). No clear takes
-    /// one back: ED 3, Cmd-K ([`Self::clear_scrollback`]) and RIS drop blocks
-    /// (and RIS the D a running command would send), never a counted C, so
+    /// one back: RIS drops blocks (and the D a running command would send),
+    /// ED 3 and Cmd-K ([`Self::clear_scrollback`]) the blocks wholly in the
+    /// history they erase, never a counted C, so
     /// the C's since a reading, less the blocks still held that reached C
     /// since, are the commands whose blocks went unread. Survives `reset` and
     /// a checkpoint round trip.
@@ -75,6 +76,33 @@ impl Terminal {
             .integration_rev
             .as_ref()
             .and_then(|rev| std::str::from_utf8(rev).ok())
+    }
+
+    /// The shell's START record (`docs/DESIGN-warm-spare-2026-10-16.md` §4),
+    /// once: the first signed `633;P;AtermStart=` with the rc folder and flags
+    /// that preceded it, or `None` before it and after the take. Only the first
+    /// record a shell signs is ever kept.
+    pub fn take_start_mark(&mut self) -> Option<super::StartMark> {
+        self.shell.spare.mark.take()
+    }
+
+    /// Whether a signed `633;P;AtermSpare=parked` arrived since the last take:
+    /// a spare shell waits at its parked hold, before any startup file.
+    pub fn take_spare_parked(&mut self) -> bool {
+        std::mem::take(&mut self.shell.spare.parked)
+    }
+
+    /// Signed spare marks refused as malformed (`AtermSpare=`, `AtermStart*=`).
+    #[must_use]
+    pub fn spare_marks_refused(&self) -> u32 {
+        self.shell.spare.refused
+    }
+
+    /// Whether the shell has signed a prompt start (an accepted OSC 133/633 `A`)
+    /// since this engine began: a released spare has left every hold by then.
+    #[must_use]
+    pub fn shell_prompt_started(&self) -> bool {
+        self.shell.next_block_id > 0
     }
 
     /// Get the most recent completed command mark (exit code recorded),
@@ -157,11 +185,27 @@ impl Terminal {
     /// Calling this is also what makes the metric reportable: it is the only
     /// writer of the flag [`Self::host_cell_pixel_size`] reads, and the XTWINOPS
     /// pixel reports (CSI 14 t / 16 t) answer from that and stay silent until a
-    /// host has spoken. A host with real font metrics should call this as soon as
-    /// they exist and again whenever they change (font zoom, a DPI move).
+    /// host has spoken; a DEC 2048 in-band report says 0 pixels until then, and
+    /// a change of the measured box while 2048 is on queues a new one. A host
+    /// with real font metrics should call this as soon as they exist and again
+    /// whenever they change (font zoom, a DPI move).
     pub fn set_cell_pixel_size(&mut self, width: u16, height: u16) {
+        let before = self.iterm2.host_cell_px();
         self.iterm2.cell_px = (width, height);
         self.iterm2.cell_px_from_host = true;
+        // DEC 2048: a new cell box at the same rows/cols (the first measurement, a
+        // font zoom, a move to a display of another scale) changes the text area's
+        // pixels, which `resize` alone would never report. Only a change: hosts set
+        // the box on every layout pass.
+        let after = self.iterm2.host_cell_px();
+        if self.modes.in_band_size_reports && after != before {
+            super::state_accessors::push_in_band_size_report(
+                &mut self.transient.response_buffer,
+                self.grid.rows(),
+                self.grid.cols(),
+                after,
+            );
+        }
     }
 
     /// The cell pixel size used for inline-image footprint math (OSC 1337).
@@ -260,9 +304,10 @@ mod tests {
     }
 
     /// `started_command_seq` counts each C the A→B→C→D gate accepts, block or
-    /// no block, and nothing takes one back: ED 3, Cmd-K and RIS drop the
-    /// blocks (RIS also the running command's D, which `completed_command_seq`
-    /// then never counts), and a checkpoint round trip carries it.
+    /// no block, and nothing takes one back: RIS drops the blocks (and the
+    /// running command's D, which `completed_command_seq` then never counts),
+    /// ED 3 and Cmd-K the ones wholly in the history they erase (a running
+    /// `clear` keeps its own), and a checkpoint round trip carries it.
     /// NEGATIVE CONTROL: a C out of order (no B before it) is not a start.
     #[test]
     fn started_command_seq_counts_every_accepted_c_and_no_clear_takes_one() {

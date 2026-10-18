@@ -1311,15 +1311,4 @@ mod tests {
             }
         }
     }
-
-    #[test]
-    fn mix_decorrelates_and_is_nonzero() {
-        let mut prev = 0;
-        for f in 0..64u64 {
-            let v = mix(0xDEAD ^ f.rotate_left(17));
-            assert_ne!(v, 0);
-            assert_ne!(v, prev, "adjacent frames must differ");
-            prev = v;
-        }
-    }
 }

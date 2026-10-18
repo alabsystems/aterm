@@ -28,7 +28,7 @@ use std::ffi::{CStr, c_char, c_uint, c_void};
 /// ```
 ///
 /// Registering it as `"@"` would invite `NSInvocation`, forwarding and
-/// accessibility to retain it (`tests/adversary_w2c.rs`). `#[repr(transparent)]`,
+/// accessibility to retain it (`tests/declared_abi.rs`). `#[repr(transparent)]`,
 /// so it is FFI-safe and exactly the word the runtime passes.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -479,7 +479,7 @@ unsafe extern "C" {}
 /// The bound is what makes the `_stret` choice automatic — see
 /// [`returns_indirectly`].
 ///
-/// Fourteen arguments are sendable (`tests/adversary_w2c.rs`); fifteen do not
+/// Fourteen arguments are sendable (`tests/declared_abi.rs`); fifteen do not
 /// compile:
 ///
 /// ```compile_fail
@@ -1137,9 +1137,9 @@ impl Drop for Obj {
 /// a missing pool is a leak, not undefined behaviour — which is why the safe
 /// [`Obj::autorelease`] and [`crate::Retained::autorelease`] may call this.
 /// libobjc says so only under `OBJC_DEBUG_MISSING_POOLS=YES` (`MISSING POOLS:
-/// … autoreleased with no pool in place - just leaking`); `tests/adversary_w2c.rs`
-/// checks both. A Cocoa main thread always has a pool in the event loop;
-/// elsewhere use [`autoreleasepool`].
+/// … autoreleased with no pool in place - just leaking`); `tests/fatal_paths.rs`
+/// checks the silent leak. A Cocoa main thread always has a pool in the event
+/// loop; elsewhere use [`autoreleasepool`].
 ///
 /// # Safety
 /// `obj` must be a +1 reference the caller is handing over, or null.
@@ -1182,9 +1182,6 @@ pub unsafe fn autorelease(obj: Id) -> Id {
 /// let n = autoreleasepool(|_outer| autoreleasepool(|_inner| 7));
 /// assert_eq!(n, 7);
 /// ```
-///
-/// `tests/pools.rs` runs the first snippet unsafely in a child and asserts the
-/// `SIGABRT`.
 pub struct AutoreleasePool(*mut c_void);
 
 impl AutoreleasePool {
@@ -1222,8 +1219,7 @@ impl Drop for AutoreleasePool {
 /// innermost pool at the moment of the call, and inside a nested scope the
 /// caller can still name the outer one. So a pool reference may gate an
 /// operation but must never appear in a returned lifetime (see the
-/// counterexample in [`crate::weak`]'s module docs; `tests/weak.rs`'s
-/// `a_pool_parameter_never_mints_a_lifetime` enforces it). No bound on `R`
+/// counterexample in [`crate::weak`]'s module docs). No bound on `R`
 /// fixes that: a `Cell` in the outer scope can carry such a borrow out of a
 /// closure that returns `()`.
 #[inline]
@@ -1252,12 +1248,13 @@ pub fn ns_string(s: &str) -> Option<Obj> {
     // (`@32@0:8r^S16Q24`) consumes it and returns +1 or nil (`from_owned` maps
     // nil to `None`). It copies `units.len()` code units during the call only.
     unsafe {
-        let alloc: unsafe extern "C-unwind" fn(ClassPtr, Sel) -> Id = msg();
+        let alloc: unsafe extern "C-unwind" fn(ClassPtr, Sel) -> Id = crate::checked_msg();
         let raw = alloc(cls, crate::sel!(alloc));
         if raw.is_null() {
             return None;
         }
-        let init: unsafe extern "C-unwind" fn(Id, Sel, *const u16, usize) -> Id = msg();
+        let init: unsafe extern "C-unwind" fn(Id, Sel, *const u16, usize) -> Id =
+            crate::checked_msg();
         let obj = init(
             raw,
             crate::sel!(initWithCharacters:length:),
@@ -1290,13 +1287,14 @@ pub unsafe fn ns_string_to_rust(s: Id) -> String {
         // the whole string, so it is in bounds, and the buffer holds that many.
         // Its length is set only after the call has written them.
         unsafe {
-            let length: unsafe extern "C-unwind" fn(Id, Sel) -> usize = msg();
+            let length: unsafe extern "C-unwind" fn(Id, Sel) -> usize = crate::checked_msg();
             let n = length(s, crate::sel!(length));
             if n == 0 {
                 return String::new();
             }
             let mut units: Vec<u16> = Vec::with_capacity(n);
-            let get: unsafe extern "C-unwind" fn(Id, Sel, *mut u16, crate::NSRange) = msg();
+            let get: unsafe extern "C-unwind" fn(Id, Sel, *mut u16, crate::NSRange) =
+                crate::checked_msg();
             get(
                 s,
                 crate::sel!(getCharacters:range:),
@@ -1325,7 +1323,7 @@ pub unsafe fn ns_error_string(err: Id) -> String {
         // SAFETY: `err` is a live `NSError`. `localizedDescription` is
         // autoreleased and copied before the pool pops.
         unsafe {
-            let desc: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
+            let desc: unsafe extern "C-unwind" fn(Id, Sel) -> Id = crate::checked_msg();
             let d = desc(err, sel(c"localizedDescription"));
             if d.is_null() {
                 return "(no localizedDescription)".to_owned();

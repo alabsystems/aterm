@@ -26,9 +26,9 @@
 
 use crate::Rgb;
 use crate::scheme::{
-    APPEARANCE_VALUES, Appearance, ColorScheme, ForeignFormat, MAX_THEME_TEXT_CHARS,
-    MAX_USER_THEME_FILE_BYTES, THEME_KEYS, ThemeKey, parse_hex, parse_theme_str,
-    sniff_foreign_format,
+    APPEARANCE_VALUES, Appearance, ChromeColors, ColorScheme, ForeignFormat, MAX_THEME_TEXT_CHARS,
+    MAX_USER_THEME_FILE_BYTES, ParsedTheme, THEME_KEYS, ThemeKey, ThemeKeyGroup, parse_hex,
+    parse_theme_str, sniff_foreign_format,
 };
 
 /// The largest theme file an import reads, in bytes: the same bound the
@@ -303,14 +303,32 @@ pub fn to_native_conf(
     author: Option<&str>,
     header: &[&str],
 ) -> String {
-    write_native_conf(
-        scheme,
+    let theme = ParsedTheme::colours_only(
+        scheme.clone(),
         appearance_declared,
-        description,
-        author,
-        header,
-        false,
-    )
+        description.map(str::to_string),
+        author.map(str::to_string),
+    );
+    write_native_conf(&theme, header, false)
+}
+
+/// The native theme file for a whole parsed theme: colours, identity,
+/// `schema`, `bold_is_bright` and typography, in [`THEME_KEYS`] order, the
+/// typography under a header saying aterm.toml keys of the same name win.
+/// [`parse_theme_str`] reads it back to `theme` (with no skipped keys: a key
+/// this aterm does not know cannot be written) whenever its text fields were
+/// already safe.
+#[must_use]
+pub fn to_native_conf_package(theme: &ParsedTheme, header: &[&str]) -> String {
+    write_native_conf(theme, header, false)
+}
+
+/// [`to_native_conf_package`] for a person to edit, as
+/// [`to_native_conf_commented`] is: every key the theme leaves out, the
+/// typography keys too, is a commented-out example under its description.
+#[must_use]
+pub fn to_native_conf_package_commented(theme: &ParsedTheme, header: &[&str]) -> String {
+    write_native_conf(theme, header, true)
 }
 
 /// [`to_native_conf`] for a person to edit: the same keys and values, each
@@ -326,14 +344,13 @@ pub fn to_native_conf_commented(
     author: Option<&str>,
     header: &[&str],
 ) -> String {
-    write_native_conf(
-        scheme,
+    let theme = ParsedTheme::colours_only(
+        scheme.clone(),
         appearance_declared,
-        description,
-        author,
-        header,
-        true,
-    )
+        description.map(str::to_string),
+        author.map(str::to_string),
+    );
+    write_native_conf(&theme, header, true)
 }
 
 /// The ANSI colour names, slot `0..8` (`8..16` are their bright forms).
@@ -341,14 +358,12 @@ const ANSI_NAMES: [&str; 8] = [
     "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
 ];
 
-fn write_native_conf(
-    scheme: &ColorScheme,
-    appearance_declared: bool,
-    description: Option<&str>,
-    author: Option<&str>,
-    header: &[&str],
-    commented: bool,
-) -> String {
+fn write_native_conf(theme: &ParsedTheme, header: &[&str], commented: bool) -> String {
+    let scheme = &theme.scheme;
+    let appearance_declared = theme.appearance_declared;
+    let description = theme.description.as_deref();
+    let author = theme.author.as_deref();
+    let typography = &theme.typography;
     let mut out = String::new();
     for line in header {
         out.push('#');
@@ -367,10 +382,37 @@ fn write_native_conf(
         push_hex_colour(&mut text, colour);
         text
     };
+    let mut chrome_header = false;
+    let mut type_header = false;
     for spec in &THEME_KEYS {
+        if spec.group == ThemeKeyGroup::Typography
+            && !type_header
+            && (commented || !typography.is_empty())
+        {
+            type_header = true;
+            if !commented {
+                out.push_str("# Typography: aterm.toml keys of the same name win\n");
+            }
+        }
         if commented {
             if !out.is_empty() {
                 out.push('\n');
+            }
+            if spec.group == ThemeKeyGroup::Chrome && !chrome_header {
+                chrome_header = true;
+                out.push_str(
+                    "# Chrome (optional): colours for aterm's own tabs, seams and highlights.\n\n",
+                );
+            }
+            if spec.group == ThemeKeyGroup::Typography
+                && type_header
+                && spec.key == ThemeKey::FontFamily
+            {
+                out.push_str(
+                    "# Typography (optional): fonts by family name (never a file or a path) and type\n\
+                     # settings. aterm.toml keys of the same name win; a font not installed falls back\n\
+                     # to your font_family, else aterm's default.\n\n",
+                );
             }
             out.push_str("# ");
             out.push_str(spec.description);
@@ -417,6 +459,28 @@ fn write_native_conf(
             ThemeKey::Selection => scheme.selection.map(hex),
             ThemeKey::SelectionForeground => scheme.selection_fg.map(hex),
             ThemeKey::Palette => None,
+            ThemeKey::AccentColor
+            | ThemeKey::ActiveTabColor
+            | ThemeKey::BorderColor
+            | ThemeKey::SearchMatchColor => scheme.chrome.slot(spec.key).flatten().map(hex),
+            ThemeKey::Schema => theme.schema.map(|n| n.to_string()),
+            ThemeKey::PaletteGenerate => scheme.palette_generate.then(|| "true".to_string()),
+            ThemeKey::BoldIsBright => theme
+                .bold_is_bright
+                .map(|b| if b { "true" } else { "false" }.to_string()),
+            ThemeKey::FontFamily
+            | ThemeKey::FontFamilyBold
+            | ThemeKey::FontFamilyItalic
+            | ThemeKey::FontFamilyBoldItalic
+            | ThemeKey::FallbackFonts
+            | ThemeKey::SymbolFont
+            | ThemeKey::EmojiFont
+            | ThemeKey::LineHeight
+            | ThemeKey::Ligatures
+            | ThemeKey::FontFeatures
+            | ThemeKey::FontSyntheticStyle
+            | ThemeKey::FontWeight
+            | ThemeKey::FontSizeScale => typography.value_text(spec.key),
         };
         match value {
             Some(value) => {
@@ -555,6 +619,8 @@ enum Slot {
     Selection,
     SelectionForeground,
     Ansi(usize),
+    /// A chrome key ([`ThemeKey::AccentColor`] and its kin).
+    Chrome(ThemeKey),
 }
 
 /// The colour names of the 8 ANSI slots, as Alacritty and Windows Terminal
@@ -586,6 +652,8 @@ struct Draft {
     selection: Option<Rgb>,
     selection_fg: Option<Rgb>,
     ansi: [Option<Rgb>; 16],
+    chrome: ChromeColors,
+    palette_generate: bool,
     dropped: Vec<String>,
     dropped_unlisted: usize,
     notes: Vec<String>,
@@ -605,6 +673,8 @@ impl Draft {
             selection: None,
             selection_fg: None,
             ansi: [None; 16],
+            chrome: ChromeColors::default(),
+            palette_generate: false,
             dropped: Vec::new(),
             dropped_unlisted: 0,
             notes: Vec::new(),
@@ -619,6 +689,10 @@ impl Draft {
             Slot::Selection => &mut self.selection,
             Slot::SelectionForeground => &mut self.selection_fg,
             Slot::Ansi(index) => match self.ansi.get_mut(index) {
+                Some(target) => target,
+                None => return,
+            },
+            Slot::Chrome(key) => match self.chrome.slot_mut(key) {
                 Some(target) => target,
                 None => return,
             },
@@ -641,6 +715,15 @@ impl Draft {
                     "\"), so it was dropped",
                 ]));
             }
+        }
+    }
+
+    /// Set the theme's `palette_generate` from a `true`/`false` value, or
+    /// drop `key` when the value is neither.
+    fn flag_generate(&mut self, key: &str, value: &str) {
+        match crate::scheme_typography::parse_flag(value) {
+            Ok(flag) => self.palette_generate = flag,
+            Err(_) => self.drop_key(key),
         }
     }
 
@@ -716,6 +799,8 @@ impl Draft {
                 selection: self.selection,
                 selection_fg: self.selection_fg,
                 ansi,
+                chrome: self.chrome,
+                palette_generate: self.palette_generate,
             },
             appearance_declared: self.appearance.is_some(),
             description: self.description.as_deref().and_then(sanitize_text),
@@ -751,15 +836,36 @@ fn line_of(text: &str, offset: usize) -> usize {
 
 fn convert_native(text: &str) -> Result<ImportReport, ImportError> {
     match parse_theme_str(text) {
-        Ok(parsed) => Ok(ImportReport {
-            format: ImportFormat::Native,
-            scheme: parsed.scheme,
-            appearance_declared: parsed.appearance_declared,
-            description: parsed.description,
-            author: parsed.author,
-            dropped: Vec::new(),
-            notes: Vec::new(),
-        }),
+        Ok(parsed) => {
+            // An import carries colours and identity only; a native file's
+            // type settings, `bold_is_bright` and `schema` are named as
+            // dropped so nothing goes silently.
+            let mut dropped: Vec<String> = Vec::new();
+            if parsed.schema.is_some() {
+                dropped.push("schema".to_string());
+            }
+            if parsed.bold_is_bright.is_some() {
+                dropped.push("bold_is_bright".to_string());
+            }
+            dropped.extend(parsed.typography.keys().into_iter().map(str::to_string));
+            dropped.extend(parsed.skipped_keys.iter().cloned());
+            let mut notes = Vec::new();
+            if !dropped.is_empty() {
+                notes.push(
+                    "an import keeps colours only; copy the file into the themes folder to keep its other settings"
+                        .to_string(),
+                );
+            }
+            Ok(ImportReport {
+                format: ImportFormat::Native,
+                scheme: parsed.scheme,
+                appearance_declared: parsed.appearance_declared,
+                description: parsed.description,
+                author: parsed.author,
+                dropped,
+                notes,
+            })
+        }
         Err(crate::scheme::ThemeError::Parse { line, reason, .. }) => Err(ImportError::Malformed {
             format: ImportFormat::Native,
             line,
@@ -821,6 +927,9 @@ fn convert_kitty(text: &str) -> Result<ImportReport, ImportError> {
             // `none` keeps each cell's own colour, which is aterm's default too.
             "selection_foreground" if none => {}
             "selection_foreground" => draft.colour(Slot::SelectionForeground, key, value),
+            "active_tab_background" => {
+                draft.colour(Slot::Chrome(ThemeKey::ActiveTabColor), key, value);
+            }
             "include" | "globinclude" | "envinclude" | "geninclude" => {
                 draft.drop_key(key);
                 draft.note(INCLUDE_NOTE);
@@ -863,6 +972,8 @@ fn convert_ghostty(text: &str) -> Result<ImportReport, ImportError> {
             "cursor-color" => draft.colour(Slot::Cursor, key, value),
             "selection-background" => draft.colour(Slot::Selection, key, value),
             "selection-foreground" => draft.colour(Slot::SelectionForeground, key, value),
+            "split-divider-color" => draft.colour(Slot::Chrome(ThemeKey::BorderColor), key, value),
+            "palette-generate" => draft.flag_generate(key, value),
             "palette" => {
                 let Some((index, colour)) = value.split_once('=') else {
                     draft.drop_key(key);
@@ -1124,6 +1235,7 @@ fn alacritty_assign(draft: &mut Draft, path: &[String], value: Option<&str>) {
         ["colors", "cursor", "cursor"] => Slot::Cursor,
         ["colors", "selection", "background"] => Slot::Selection,
         ["colors", "selection", "text"] => Slot::SelectionForeground,
+        ["colors", "search", "matches", "background"] => Slot::Chrome(ThemeKey::SearchMatchColor),
         ["colors", group @ ("normal" | "bright"), name] => match ansi_name_index(name) {
             Some(index) if *group == "normal" => Slot::Ansi(index),
             Some(index) => Slot::Ansi(index.saturating_add(8)),
@@ -1943,7 +2055,6 @@ fn convert_base16(text: &str) -> Result<ImportReport, ImportError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheme::ParsedTheme;
 
     fn rgb(hex: u32) -> Rgb {
         Rgb::new((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
@@ -1969,6 +2080,8 @@ mod tests {
             selection: selection.map(rgb),
             selection_fg: selection_fg.map(rgb),
             ansi: ansi.map(rgb),
+            chrome: ChromeColors::default(),
+            palette_generate: false,
         }
     }
 
@@ -1986,12 +2099,12 @@ mod tests {
         let parsed = parse_theme_str(&text).unwrap_or_else(|e| panic!("{e}\n{text}"));
         assert_eq!(
             parsed,
-            ParsedTheme {
-                scheme: report.scheme.clone(),
-                description: report.description.clone(),
-                author: report.author.clone(),
-                appearance_declared: report.appearance_declared,
-            },
+            ParsedTheme::colours_only(
+                report.scheme.clone(),
+                report.appearance_declared,
+                report.description.clone(),
+                report.author.clone(),
+            ),
             "{text}"
         );
     }
@@ -2021,24 +2134,21 @@ mod tests {
     #[test]
     fn kitty_converts_structurally() {
         let report = convert(ImportFormat::Kitty, &kitty_sample(), None).unwrap();
-        assert_eq!(
-            report.scheme,
-            expected(
-                "Tokyo Night",
-                0xc0caf5,
-                0x1a1b26,
-                Some(0xc0caf5),
-                Some(0x283457),
-                None,
-                PALETTE
-            )
+        let mut want = expected(
+            "Tokyo Night",
+            0xc0caf5,
+            0x1a1b26,
+            Some(0xc0caf5),
+            Some(0x283457),
+            None,
+            PALETTE,
         );
+        // kitty's active tab background is aterm's `active_tab_color`.
+        want.chrome.active_tab = Some(rgb(0x7aa2f7));
+        assert_eq!(report.scheme, want);
         assert_eq!(report.author.as_deref(), Some("enkia"));
         assert_eq!(report.description.as_deref(), Some("A clean dark theme"));
-        assert_eq!(
-            report.dropped,
-            ["url_color", "active_tab_background", "color16", "include"]
-        );
+        assert_eq!(report.dropped, ["url_color", "color16", "include"]);
         assert!(report.notes.iter().any(|n| n.contains("not followed")));
         assert_round_trips(&report);
     }
@@ -2076,6 +2186,60 @@ mod tests {
             report.dropped,
             ["cursor-text", "palette 200", "config-file", "font-family"]
         );
+        assert_round_trips(&report);
+    }
+
+    /// Spec `scheme-palette-generate-key`: Ghostty's `palette-generate`
+    /// carries to the theme's `palette_generate`, is written back out and
+    /// reads again. NEGATIVE CONTROL: a value that is not `true`/`false` is
+    /// dropped, and the flag stays off.
+    #[test]
+    fn ghostty_import_carries_palette_generate() {
+        let base = "background = #1a1b26\nforeground = #c0caf5\n";
+        let on = convert(
+            ImportFormat::Ghostty,
+            &format!("{base}palette-generate = true\n"),
+            None,
+        )
+        .unwrap();
+        assert!(on.scheme.palette_generate);
+        assert!(on.dropped.is_empty(), "{:?}", on.dropped);
+        assert_round_trips(&on);
+        let bad = convert(
+            ImportFormat::Ghostty,
+            &format!("{base}palette-generate = maybe\n"),
+            None,
+        )
+        .unwrap();
+        assert!(!bad.scheme.palette_generate);
+        assert_eq!(bad.dropped, ["palette-generate"]);
+    }
+
+    /// THE CHROME KEYS IMPORT FROM THEIR FOREIGN NAMES: Ghostty's
+    /// `split-divider-color` is `border_color` and Alacritty's search-match
+    /// background is `search_match_color`, each written back out and read
+    /// again. NEGATIVE CONTROL: a neighbouring foreign chrome key aterm has no
+    /// key for (Ghostty's `cursor-text`, Alacritty's search-match foreground)
+    /// is still dropped.
+    #[test]
+    fn chrome_keys_import_from_their_foreign_names() {
+        let ghostty = "background = #1a1b26\n\
+                       foreground = #c0caf5\n\
+                       cursor-text = #1a1b26\n\
+                       split-divider-color = #3b4261\n";
+        let report = convert(ImportFormat::Ghostty, ghostty, None).unwrap();
+        assert_eq!(report.scheme.chrome.border, Some(rgb(0x3b4261)));
+        assert_eq!(report.dropped, ["cursor-text"]);
+        assert_round_trips(&report);
+        let alacritty = "[colors.primary]\n\
+                         background = \"#1a1b26\"\n\
+                         foreground = \"#c0caf5\"\n\
+                         [colors.search.matches]\n\
+                         foreground = \"#1a1b26\"\n\
+                         background = \"#3d4f2f\"\n";
+        let report = convert(ImportFormat::Alacritty, alacritty, None).unwrap();
+        assert_eq!(report.scheme.chrome.search_match, Some(rgb(0x3d4f2f)));
+        assert_eq!(report.dropped, ["colors.search.matches.foreground"]);
         assert_round_trips(&report);
     }
 

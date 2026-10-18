@@ -355,35 +355,43 @@ pub fn base_layout_key_for(physical: PhysicalKey) -> Option<char> {
     })
 }
 
+/// The US-QWERTY letter a chord on a non-Latin layout names: `Some('c')` for a
+/// Russian `ru` press whose layout key (`key_without_modifiers()`) is 'с' on the
+/// physical C key. [`aterm_types::keyboard::layout_letter_twin`] is the gate, and
+/// wherever it names a letter the PTY encoder's Ctrl byte names no other US key,
+/// so a shortcut matcher that asks this names the letter the encoder would have
+/// sent. On a US digit or symbol key, where this names none, the encoder's Ctrl
+/// byte still follows the US key.
+#[must_use]
+pub fn layout_letter_twin_for(logical: &WinitKey, physical: PhysicalKey) -> Option<char> {
+    let WinitKey::Character(s) = logical else {
+        return None;
+    };
+    let mut chars = s.chars();
+    let c = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+    aterm_types::keyboard::layout_letter_twin(c, base_layout_key_for(physical))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use winit::keyboard::SmolStr;
 
+    /// The old inline GUI match stopped at F12 and dropped the media keys.
     #[test]
-    fn maps_super_cmd_modifier() {
-        // The old inline GUI match dropped Super/Cmd entirely (K-2 bug).
-        assert_eq!(map_named_key(WinitNamed::Super), Some(NamedKey::SuperLeft));
-    }
-
-    #[test]
-    fn maps_function_keys_past_f12() {
-        // The old inline match stopped at F12.
-        assert_eq!(map_named_key(WinitNamed::F13), Some(NamedKey::F13));
-        assert_eq!(map_named_key(WinitNamed::F24), Some(NamedKey::F24));
-        assert_eq!(map_named_key(WinitNamed::F35), Some(NamedKey::F35));
-    }
-
-    #[test]
-    fn maps_media_keys() {
-        assert_eq!(
-            map_named_key(WinitNamed::MediaPlayPause),
-            Some(NamedKey::MediaPlayPause)
-        );
-        assert_eq!(
-            map_named_key(WinitNamed::AudioVolumeMute),
-            Some(NamedKey::AudioVolumeMute)
-        );
+    fn maps_function_keys_past_f12_and_media_keys() {
+        for (winit, want) in [
+            (WinitNamed::F13, NamedKey::F13),
+            (WinitNamed::F24, NamedKey::F24),
+            (WinitNamed::F35, NamedKey::F35),
+            (WinitNamed::MediaPlayPause, NamedKey::MediaPlayPause),
+            (WinitNamed::AudioVolumeMute, NamedKey::AudioVolumeMute),
+        ] {
+            assert_eq!(map_named_key(winit), Some(want), "{winit:?}");
+        }
     }
 
     fn ch(c: &str) -> WinitKey {
@@ -553,14 +561,9 @@ mod tests {
 
     #[test]
     fn character_logical_key_maps_through() {
-        let k = WinitKey::Character(SmolStr::new("a"));
-        assert_eq!(map_logical_key(&k), Some(Key::Character('a')));
-    }
-
-    #[test]
-    fn multi_codepoint_logical_key_is_not_a_single_key() {
-        let k = WinitKey::Character(SmolStr::new("ab"));
-        assert_eq!(map_logical_key(&k), None);
+        assert_eq!(map_logical_key(&ch("a")), Some(Key::Character('a')));
+        // A multi-codepoint logical key is not a single key.
+        assert_eq!(map_logical_key(&ch("ab")), None);
     }
 
     #[test]
@@ -581,43 +584,41 @@ mod tests {
         assert_eq!(base_layout_key_for(PhysicalKey::Code(KeyCode::F1)), None);
     }
 
-    /// THE REASON THIS CRATE EXISTS, as an always-on assertion rather than a
-    /// comment: `aterm-types` must not name `winit` anywhere in its manifest.
-    ///
-    /// It used to, as `winit = { workspace = true, optional = true }` behind a
-    /// `winit-keymap` feature whose comment promised non-GUI consumers would
-    /// never pull winit. Cargo unifies features across a workspace resolve, so
-    /// `cargo build --workspace` enabled it for everyone: `aterm-ctl`, which
-    /// declares only aterm-types + aterm-uds and no third-party dependency at
-    /// all, came out linking AppKit, Carbon, ApplicationServices, CoreGraphics,
-    /// CoreVideo, CoreFoundation, Foundation and libobjc — 7 framework load
-    /// commands dyld maps and initialises before the first instruction of
-    /// `main`, on a route that cannot call a symbol in any of them. Measured on
-    /// this tree with the same binary built both ways: 2.49 -> 1.15 ms per exec.
     #[test]
-    fn aterm_types_names_no_platform_dependency() {
-        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("crates/aterm-winit-keymap sits under crates/")
-            .join("aterm-types/Cargo.toml");
-        let text = std::fs::read_to_string(&manifest)
-            .unwrap_or_else(|e| panic!("read {}: {e}", manifest.display()));
-        // Comments explain the history and say the word; dependency lines and
-        // feature lines are what must not.
-        for (i, line) in text.lines().enumerate() {
-            let code = line.split('#').next().unwrap_or("");
-            assert!(
-                !code.contains("winit"),
-                "{}:{} names winit in code (not a comment): {line:?}\n\
-                 aterm-types is the platform-free vocabulary crate every consumer shares, \
-                 including binaries with no third-party dependencies at all. An optional \
-                 winit dep here does NOT stay off for them — Cargo unifies features across \
-                 the workspace resolve — it links AppKit into all of them. Put the platform \
-                 map in its own crate, the way this one is.",
-                manifest.display(),
-                i + 1
-            );
-        }
+    fn layout_letter_twin_names_the_us_letter_under_a_non_latin_letter() {
+        let ch = |s: &str| WinitKey::Character(SmolStr::new(s));
+        let key = |code| PhysicalKey::Code(code);
+        // Russian 'с' on C, Greek 'ψ' on C, Hebrew 'ב' on C.
+        assert_eq!(
+            layout_letter_twin_for(&ch("с"), key(KeyCode::KeyC)),
+            Some('c')
+        );
+        assert_eq!(
+            layout_letter_twin_for(&ch("ψ"), key(KeyCode::KeyC)),
+            Some('c')
+        );
+        assert_eq!(
+            layout_letter_twin_for(&ch("ב"), key(KeyCode::KeyC)),
+            Some('c')
+        );
+        // A Latin layout keeps its own letters (AZERTY 'a' sits on US Q).
+        assert_eq!(layout_letter_twin_for(&ch("a"), key(KeyCode::KeyQ)), None);
+        // A letter on a US digit or symbol key means what its layout says.
+        assert_eq!(layout_letter_twin_for(&ch("é"), key(KeyCode::Digit2)), None);
+        assert_eq!(layout_letter_twin_for(&ch("б"), key(KeyCode::Comma)), None);
+        // Not a letter, not a character, no physical key.
+        assert_eq!(layout_letter_twin_for(&ch("№"), key(KeyCode::Digit3)), None);
+        assert_eq!(
+            layout_letter_twin_for(&WinitKey::Named(WinitNamed::Enter), key(KeyCode::Enter)),
+            None
+        );
+        assert_eq!(
+            layout_letter_twin_for(
+                &ch("с"),
+                PhysicalKey::Unidentified(winit::keyboard::NativeKeyCode::Unidentified)
+            ),
+            None
+        );
     }
 
     /// A right-side modifier press is the engine's *Right key (kitty's

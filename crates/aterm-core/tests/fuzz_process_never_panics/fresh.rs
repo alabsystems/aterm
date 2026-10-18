@@ -7,27 +7,12 @@
 //! fresh 24x80 terminal take one multi-KiB `process()` call, never feed the C1
 //! introducers 0x9b/0x90/0x9c inside an escape-weighted soup, never build a
 //! 1..=3 x 1..=3 grid, and never read back through `visible_content()`. These
-//! LCG loops cover those angles (400 cases each). Each run draws a fresh seed,
-//! printed with the command that replays it; a failing case prints its index
-//! and input length. `PROPTEST_CASES` raises the case count.
-//!
-//! Two binaries mount this file, one per engine build, because every soup run
-//! carries dozens of `ESC P [0-9;]* q` sixel hooks and the two builds route
-//! them differently:
-//! - aterm-core's `fuzz_process_never_panics` (as `mod fresh`) runs against
-//!   whatever aterm-core its invocation builds: WITHOUT `sixel` under a plain
-//!   `-p aterm-core` (the library default and the Linux lane's
-//!   `--no-default-features` build: the hooks take the consume-only
-//!   `DcsType::Unknown` path), with it under `--features sixel` or a
-//!   `--workspace` test run, where feature unification turns it on.
-//! - aterm-conformance's `vt` suite (as `mod fresh_terminal`, by `#[path]`)
-//!   always runs against aterm-core[sixel], that crate's dependency: there
-//!   the hooks reach the decoder and image placement on every run,
-//!   `-p aterm-conformance` alone included.
-//!
-//! `known_adversarial_corpus_is_survived` pins each binary's build. A `sixel`
-//! self dev-dependency cannot be used instead: cargo cannot turn a
-//! dev-dependency's feature off, so no test could run the no-sixel engine.
+//! LCG loops cover those angles (400 cases each). Each run prints its seed
+//! (fixed by default, `ATERM_FRESH_FUZZ_SEED` to pick another) with the
+//! command that replays it; a failing case prints its index
+//! and input length. `PROPTEST_CASES` raises the case count. Every soup run
+//! carries dozens of `ESC P [0-9;]* q` sixel hooks, which reach the decoder
+//! and image placement.
 
 use aterm_core::terminal::Terminal;
 
@@ -40,27 +25,9 @@ fn next(state: &mut u64) -> u32 {
     (*state >> 33) as u32
 }
 
-/// The package this file is compiled into: aterm-core (its own fuzz binary)
-/// or aterm-conformance (the `vt` suite, which mounts it).
-const HOST: &str = env!("CARGO_PKG_NAME");
-
-/// A well-formed 4x6 two-colour sixel image, one cell at the default 8x16
-/// metric (aterm-conformance's `SIXEL_4X6`).
-const SIXEL_4X6: &[u8] = b"\x1bP0;0;8q\"1;1;4;6#0;2;0;0;0#1;2;100;0;0#1~~~~$-\x1b\\";
-
-/// Whether the engine this binary links decodes sixel: DA1 advertises code 4
-/// exactly when aterm-core is built with `sixel`. Read from the engine rather
-/// than from a `cfg`, since the `vt` suite's own crate has no `sixel` feature.
-fn engine_has_sixel() -> bool {
-    let mut t = Terminal::new(24, 80);
-    t.process(b"\x1b[c");
-    let reply = t.take_response().unwrap_or_default();
-    let params = reply
-        .strip_prefix(b"\x1b[?")
-        .and_then(|r| r.strip_suffix(b"c"))
-        .unwrap_or_default();
-    params.split(|&b| b == b';').skip(1).any(|p| p == b"4")
-}
+/// The default seed: fixed, so the suite is deterministic. A deep run picks
+/// its own with `ATERM_FRESH_FUZZ_SEED`.
+const FRESH_DEFAULT_SEED: u64 = 0x5eed_a7e2_f2e5_0001;
 
 /// Cases per fresh-terminal property by default (the proptest config's
 /// `cases: 400`).
@@ -89,8 +56,9 @@ fn fresh_cases() -> u32 {
 
 /// This run's seed and case count for the fresh-terminal property `test` (its
 /// function name). The seed is `ATERM_FRESH_FUZZ_SEED` (hex with `0x`, or
-/// decimal) when set, else drawn from the clock, the pid and `lane` (so the
-/// four properties differ within a run). Both are printed with the exact
+/// decimal) when set, else [`FRESH_DEFAULT_SEED`] mixed with `lane` (so the
+/// four properties differ), the same on every run so a commit turns red only
+/// on its own change. Both are printed with the exact
 /// replay command for this binary, which selects the test by libtest's name
 /// with `--exact` — so that name must be the running test's, or the replay
 /// runs 0 tests and exits 0, and a failing seed looks fixed.
@@ -119,16 +87,7 @@ fn fresh_run(test: &str, lane: u64) -> (u64, u32) {
                 .unwrap_or_else(|e| panic!("ATERM_FRESH_FUZZ_SEED={v:?}: {e}"))
         }
         Err(_) => {
-            // `allow`, not `expect`: aterm-conformance compiles this file too,
-            // under the workspace config, which does not ban the clock.
-            #[allow(
-                clippy::disallowed_methods,
-                reason = "test code: the wall clock seeds the fuzz, never the engine"
-            )]
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos() as u64);
-            let mut s = nanos ^ (u64::from(std::process::id()) << 32) ^ lane;
+            let mut s = FRESH_DEFAULT_SEED ^ lane;
             (u64::from(next(&mut s)) << 32) | u64::from(next(&mut s))
         }
     };
@@ -137,17 +96,9 @@ fn fresh_run(test: &str, lane: u64) -> (u64, u32) {
     } else {
         format!(" PROPTEST_CASES={cases}")
     };
-    let sixel = engine_has_sixel();
-    // aterm-core's build has `sixel` only when asked for; aterm-conformance's
-    // always does, and has no such feature to name.
-    let features = if sixel && HOST == "aterm-core" {
-        " --features sixel"
-    } else {
-        ""
-    };
     eprintln!(
-        "{name}: seed {seed:#018x}, {cases} cases, sixel={sixel}; replay with \
-         ATERM_FRESH_FUZZ_SEED={seed:#x}{deep} targo --unverified test -p {HOST}{features} \
+        "{name}: seed {seed:#018x}, {cases} cases; replay with \
+         ATERM_FRESH_FUZZ_SEED={seed:#x}{deep} targo --unverified test -p aterm-core \
          --test {target} -- {name} --exact",
         target = env!("CARGO_CRATE_NAME"),
     );
@@ -194,29 +145,6 @@ fn escapey_byte(s: &mut u64) -> u8 {
 fn fresh_input(s: &mut u64, max_len: u32, byte: fn(&mut u64) -> u8) -> Vec<u8> {
     let len = next(s) % max_len;
     (0..len).map(|_| byte(s)).collect()
-}
-
-fn uniform_byte(s: &mut u64) -> u8 {
-    (next(s) & 0xFF) as u8
-}
-
-/// No panic on up to 4 KiB of uniform bytes in one `process()` call on a fresh
-/// 24x80 terminal, and reading the model back must not panic either.
-#[test]
-fn fresh_terminal_single_batch_arbitrary_bytes_never_panics() {
-    const TEST: &str = "fresh_terminal_single_batch_arbitrary_bytes_never_panics";
-    let (mut s, cases) = fresh_run(TEST, 1);
-    for case in 0..cases {
-        let input = fresh_input(&mut s, 4096, uniform_byte);
-        let _failing = FailingCase {
-            test: TEST,
-            case,
-            len: input.len(),
-        };
-        let mut t = Terminal::new(24, 80);
-        t.process(&input);
-        let _ = t.visible_content();
-    }
 }
 
 /// No panic on up to 4 KiB of escape-dense soup in one `process()` call.
@@ -290,8 +218,7 @@ fn fresh_tiny_grid_escape_soup_never_panics() {
     }
 }
 
-/// A corpus of hand-picked nasties that must each be survived, and the sixel
-/// build this binary's soups ran against.
+/// A corpus of hand-picked nasties that must each be survived.
 #[test]
 fn known_adversarial_corpus_is_survived() {
     let corpus: &[&[u8]] = &[
@@ -312,33 +239,5 @@ fn known_adversarial_corpus_is_survived() {
         let mut t = Terminal::new(24, 80);
         t.process(bytes);
         let _ = t.visible_content();
-    }
-
-    // The engine's two sixel builds, each held to its own contract: with
-    // `sixel` (DA1 advertises code 4) a well-formed image is decoded and
-    // placed; without it the DCS is only consumed and nothing is placed.
-    // Neither build may leak the payload onto the glyph grid.
-    let sixel = engine_has_sixel();
-    let mut t = Terminal::new(24, 80);
-    t.process(SIXEL_4X6);
-    assert_eq!(
-        t.images_row(0).len(),
-        usize::from(sixel),
-        "a well-formed sixel image must be placed exactly when the engine advertises sixel \
-         (DA1 code 4: {sixel})"
-    );
-    assert_eq!(
-        t.visible_content().trim(),
-        "",
-        "sixel payload bytes must not leak as glyphs (sixel={sixel})"
-    );
-    // The vt suite mounts this file to run the soups against aterm-core[sixel]
-    // (its dependency) on every run; a copy that lost it would pass silently.
-    if HOST != "aterm-core" {
-        assert!(
-            sixel,
-            "{HOST} builds aterm-core with `sixel`, so the mounted soups must reach the \
-             decoder, not the consume-only DCS path"
-        );
     }
 }

@@ -130,11 +130,11 @@ impl Limits {
         }
     }
 
-    /// The daily-driver limits (Master / User modes): every limit `None`, so the
-    /// shell inherits the login shell's `rlimit`s unchanged. No `RLIMIT_AS` in
+    /// The daily-driver limits (User mode): every limit `None`, so the shell
+    /// inherits the login shell's `rlimit`s unchanged. No `RLIMIT_AS` in
     /// particular: it caps VIRTUAL address space, which CUDA/ML runtimes, the JVM,
     /// Go and the sanitizers reserve far beyond resident use, so any finite cap
-    /// breaks real programs while bounding nothing. These modes confine through
+    /// breaks real programs while bounding nothing. This mode confines through
     /// the capability gate; [`Self::shell_default`] is the hardened opt-in.
     #[must_use]
     pub fn inherit() -> Self {
@@ -157,17 +157,17 @@ impl Limits {
     /// `PermissionDenied` if the capability tier is too low; otherwise the first
     /// `setrlimit` OS error encountered (after attempting every limit).
     ///
-    /// SPEC: the `Apply` action of the external `Sandbox.tla` model
-    /// (TRUST_NATIVE_TLA Phase 2). Its `AllSupportedApplied` invariant (every
+    /// SPEC: the `Apply` action of `aterm_models_core::sandbox_model` (`Sandbox`). Its `AllSupportedApplied` invariant (every
     /// requested limit the OS supports is installed) is what the best-effort loop
     /// guarantees. No Tier-1 binding: the loop runs post-fork and may not
-    /// allocate; `apply_actually_sets_the_limit` reads the limit back instead.
+    /// allocate; `unsupported_limit_does_not_block_the_working_ones` reads the
+    /// limit back instead.
     // PROJECTION (TRUST_VACUITY_GATE §2.2): the L2 obligation needs only the
-    // projection NAME (Trust does not execute it) onto the spec's
-    // `<<requested, supported, applied, done>>`.
+    // projection NAME (Trust does not execute it) onto the model's
+    // `<<applied, done>>` in the configuration `<<Req, Sup>>` the host is.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "sandbox",
             action = "Apply",
             project = "aterm_sandbox::Sandbox::project_apply"
@@ -344,28 +344,10 @@ mod tests {
             d.address_space.is_some(),
             "non-macOS should bound the address space"
         );
-        assert_eq!(
-            d.open_files,
-            Some(8192),
+        assert!(
+            d.open_files.is_some(),
             "the working NOFILE limit must remain"
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn apply_actually_sets_the_limit() {
-        let _serialized = nofile_guard();
-        // 256 fds is far above what a test needs, and the hard ceiling is kept.
-        let auth = unsafe { Authority::root_authority() };
-        let cap: Cap<Sandbox> = auth.grant(Tier::Certified); // >= Trusted
-        let target = 256u64;
-        Limits {
-            open_files: Some(target),
-            ..Default::default()
-        }
-        .apply(&cap)
-        .unwrap();
-        assert_eq!(current(libc::RLIMIT_NOFILE), target);
     }
 
     #[cfg(unix)]

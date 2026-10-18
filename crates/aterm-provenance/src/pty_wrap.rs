@@ -23,10 +23,9 @@
 //!
 //! # Coverage
 //!
-//! The tests below (`wrap_slice_preserves_address_and_contents`,
-//! `wrap_scalar_reference_preserves_identity`, `wrap_str_preserves_bytes`)
-//! assert that the wrapped reference has the same address, length and bytes
-//! as the input reference (bit-identical).
+//! The tests below assert that `Provenance` adds no bytes to what it wraps,
+//! and that the wrapped reference has the same address, length and bytes as
+//! the input reference (bit-identical), sized and unsized.
 
 #![allow(
     unsafe_code,
@@ -67,15 +66,18 @@ pub const fn pty_wrap_ref<T: ?Sized>(value: &T) -> &Provenance<T, Pty> {
 #[cfg(test)]
 mod tests {
     use super::pty_wrap_ref;
+    use crate::{Provenance, Pty};
 
+    /// The reinterpret is sound only while `Provenance` is layout-identical
+    /// to what it wraps.
     #[test]
-    fn wrap_slice_preserves_address_and_contents() {
-        let bytes: &[u8] = b"hello";
-        let wrapped = pty_wrap_ref(bytes);
-        // The inner slice must point to the same memory and have the same len.
-        assert_eq!(wrapped.as_ref().as_ptr(), bytes.as_ptr());
-        assert_eq!(wrapped.as_ref().len(), bytes.len());
-        assert_eq!(wrapped.as_ref(), bytes);
+    fn provenance_adds_no_bytes() {
+        assert_eq!(core::mem::size_of::<Provenance<u8, Pty>>(), 1);
+        assert_eq!(core::mem::size_of::<Provenance<u32, Pty>>(), 4);
+        assert_eq!(
+            core::mem::size_of::<Provenance<&[u8], Pty>>(),
+            core::mem::size_of::<&[u8]>()
+        );
     }
 
     #[test]

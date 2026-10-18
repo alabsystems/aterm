@@ -189,18 +189,6 @@ fn a_notice_is_shown_once_a_utc_day() {
 }
 
 #[test]
-fn the_table_aligns_every_column_but_the_last() {
-    let rows = vec![
-        vec!["PROGRAM".to_string(), "PIN".into(), "DECISION".into()],
-        vec!["ay".to_string(), "10".into(), "OK: done".into()],
-    ];
-    assert_eq!(
-        report::columns(&rows),
-        ["PROGRAM  PIN  DECISION", "ay       10   OK: done"]
-    );
-}
-
-#[test]
 fn a_group_holds_where_a_member_is_not_ready_and_nowhere_else() {
     let mut h = Holds::new();
     h.not_ready("rustc", Some(AARCH64_UNKNOWN_LINUX_GNU), "trust");

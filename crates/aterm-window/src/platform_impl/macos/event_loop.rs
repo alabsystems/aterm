@@ -341,10 +341,12 @@ impl<T> AppKitEventLoop<T> {
             Some(ActivationPolicy::Accessory) => Some(NS_APPLICATION_ACTIVATION_POLICY_ACCESSORY),
             Some(ActivationPolicy::Prohibited) => Some(NS_APPLICATION_ACTIVATION_POLICY_PROHIBITED),
         };
+        let (sender, receiver) = wake_queue::channel();
         let delegate = ApplicationDelegate::new(
             mtm,
             activation_policy,
             attributes.activate_ignoring_other_apps,
+            receiver.armed(),
         );
 
         autoreleasepool(|_| {
@@ -369,7 +371,6 @@ impl<T> AppKitEventLoop<T> {
         // this line is gone.
         setup_control_flow_observers(mtm, Rc::downgrade(&panic_info));
 
-        let (sender, receiver) = wake_queue::channel();
         Ok(AppKitEventLoop {
             app,
             delegate: delegate.clone_retained(),
@@ -695,15 +696,18 @@ impl<T> EventLoopProxy<T> {
     }
 
     pub fn send_event(&self, event: T) -> Result<(), EventLoopClosed<T>> {
-        self.sender.send(event).map_err(EventLoopClosed)?;
         // LOCAL PATCH (aterm), 2026-10-16: the signal comes AFTER the push, and
         // a drain that found the queue's lock held relies on it
-        // (`wake_queue.rs`).
-        unsafe {
-            // let the main thread know there's a new event
-            CFRunLoopSourceSignal(self.source);
-            let rl = CFRunLoopGetMain();
-            CFRunLoopWakeUp(rl);
+        // (`wake_queue.rs`). 2026-10-17: only from the send that armed the
+        // wake; the sends behind it until the next take are drained by the
+        // turn that signal brings (`wake_queue.rs`, COALESCED WAKES).
+        if self.sender.send(event).map_err(EventLoopClosed)? {
+            unsafe {
+                // let the main thread know there's a new event
+                CFRunLoopSourceSignal(self.source);
+                let rl = CFRunLoopGetMain();
+                CFRunLoopWakeUp(rl);
+            }
         }
         Ok(())
     }

@@ -60,8 +60,7 @@ end
 # definedness (`set -q`). `set -q` is correct only for a variable this script
 # defines itself and always defines non-empty, or where both arms are
 # equivalent and the `set -q` arm additionally scrubs (`ATERM_SHELL_NONCE`,
-# whose note explains why). Pinned by
-# `test_fish_never_tests_definedness_of_an_aterm_variable`.
+# whose note explains why).
 #
 # ─── The multiplexer boundary (screen / tmux) ───
 #
@@ -172,7 +171,7 @@ if test -n "$ATERM_SHELL_INTEGRATION_INSTALLED"
                 # Captured into locals and interpolated QUOTED — never glued to
                 # a command substitution, this script's standing rule (a
                 # substitution printing nothing would take the whole argument
-                # with it; pinned by test_fish_never_glues_a_command_substitution).
+                # with it).
                 set -l __aterm_mux_dir "$__aterm_mux_root/aterm/mux-notice"
                 set -l __aterm_mux_key (string replace -ra '[^A-Za-z0-9._-]' _ -- "$__aterm_mux_id")
                 set -l __aterm_mux_stamp "$__aterm_mux_dir/$__aterm_mux-$__aterm_mux_key"
@@ -339,14 +338,11 @@ if not string match -qr '^[0-9a-f]{16}$' -- "$__aterm_body_rev"
     set -g __aterm_body_rev ""
 end
 
-# Package bin directory — once per shell: an upgrade in place already has it (and
-# the shell.d hooks below already ran; the LIVE block re-sources the atpkg hook
-# whenever it changes).
-if test "$__aterm_fresh_load" = 1; and test -d "$HOME/.aterm/bin"
-    set -gx PATH "$HOME/.aterm/bin" $PATH
-end
-
-# Source package shell hooks
+# Source package shell hooks — once per shell: an upgrade in place already ran
+# them (the LIVE block re-sources the atpkg hook whenever it changes).
+# No `~/.aterm/bin` goes on PATH: nothing creates or manages that folder, and an
+# entry there ahead of everything would let whatever lands in it shadow every
+# command in every session. atpkg's managed bin/ is APPENDED, by its own hook.
 if test "$__aterm_fresh_load" = 1; and test -d "$HOME/.aterm/shell.d"
     for f in $HOME/.aterm/shell.d/*.fish $HOME/.aterm/shell.d/*.sh
         if test -f "$f"
@@ -1218,7 +1214,7 @@ function __aterm_body_prompt
     # pair could not collapse the way `(hostname)` did — but the glued spelling
     # is the shape that has now cost this file three separate outages, and the
     # next editor who swaps in an external command should not be able to
-    # reintroduce it. Pinned by `test_fish_never_glues_a_command_substitution`.
+    # reintroduce it.
     if test -z "$ATERM_DISABLE_PROMPT_TITLES"
         set -l title "$PWD"
         if string match -q "$HOME/*" $PWD; or test "$PWD" = "$HOME"

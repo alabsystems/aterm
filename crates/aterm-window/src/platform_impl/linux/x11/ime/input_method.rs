@@ -4,6 +4,9 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/ime/input_method.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
+// Modified by the aterm project in 2026; see the repository NOTICE. (aterm-x11's XIM
+// declarations, where upstream used x11-dl's.)
+
 use std::ffi::{CStr, CString, IntoStringError};
 use std::os::raw::{c_char, c_ulong, c_ushort};
 use std::sync::{Arc, Mutex};
@@ -11,7 +14,7 @@ use std::{env, fmt, ptr};
 
 use super::super::atoms::*;
 use super::{ffi, util, XConnection, XError};
-use x11rb::protocol::xproto;
+use aterm_x11::proto::{atom, xproto};
 
 static GLOBAL_LOCK: Mutex<()> = Mutex::new(());
 
@@ -52,7 +55,7 @@ impl InputMethod {
         unsafe {
             if !(xconn.xlib.XGetIMValues)(
                 im,
-                ffi::XNQueryInputStyle_0.as_ptr() as *const _,
+                ffi::xn::QUERY_INPUT_STYLE.as_ptr() as *const _,
                 (&mut styles) as *mut _,
                 std::ptr::null_mut::<()>(),
             )
@@ -93,9 +96,11 @@ impl InputMethod {
     }
 }
 
-const XIM_PREEDIT_STYLE: XIMStyle = (ffi::XIMPreeditCallbacks | ffi::XIMStatusNothing) as XIMStyle;
-const XIM_NOTHING_STYLE: XIMStyle = (ffi::XIMPreeditNothing | ffi::XIMStatusNothing) as XIMStyle;
-const XIM_NONE_STYLE: XIMStyle = (ffi::XIMPreeditNone | ffi::XIMStatusNone) as XIMStyle;
+const XIM_PREEDIT_STYLE: XIMStyle =
+    ffi::xim_style::PREEDIT_CALLBACKS | ffi::xim_style::STATUS_NOTHING;
+const XIM_NOTHING_STYLE: XIMStyle =
+    ffi::xim_style::PREEDIT_NOTHING | ffi::xim_style::STATUS_NOTHING;
+const XIM_NONE_STYLE: XIMStyle = ffi::xim_style::PREEDIT_NONE | ffi::xim_style::STATUS_NONE;
 
 /// Style of the IME context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,11 +180,7 @@ unsafe fn get_xim_servers(xconn: &Arc<XConnection>) -> Result<Vec<String>, GetXi
     let root = unsafe { (xconn.xlib.XDefaultRootWindow)(xconn.display) };
 
     let mut atoms: Vec<ffi::Atom> = xconn
-        .get_property::<xproto::Atom>(
-            root as xproto::Window,
-            servers_atom,
-            xproto::Atom::from(xproto::AtomEnum::ATOM),
-        )
+        .get_property::<xproto::Atom>(root as xproto::Window, servers_atom, atom::ATOM)
         .map_err(GetXimServersError::GetPropertyError)?
         .into_iter()
         .map(|atom| atom as _)

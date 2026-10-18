@@ -3,6 +3,7 @@
 
 use super::*;
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::time::{Duration, SystemTime};
 
 /// A canonical scratch tree (`/var` is a link to `/private/var` on macOS, and `$PWD` is
@@ -756,6 +757,177 @@ fn reclaim_removes_only_what_nobody_builds_into() {
     std::os::unix::fs::symlink(&root, &linked_root).unwrap();
     assert!(reclaim(&linked_root, home, SystemTime::now()).is_empty());
     assert!(old.is_dir());
+}
+
+/// UNDER PRESSURE a gone workspace's build directory goes after ten minutes unwritten, not
+/// a day: the removed worktree's cache that filled the disk. NEGATIVE CONTROLS, each kept
+/// byte for byte: the same gone workspace written a minute ago, a live workspace's idle one,
+/// one gone with its parent (away, not removed), a `.cargo-build` link out of the cache, and
+/// the pressure-free sweep (a day's window) at the same instant.
+#[cfg(unix)]
+#[test]
+fn under_pressure_a_removed_workspaces_cache_goes_after_ten_minutes() {
+    let f = Fixture::new("build-cache-pressure");
+    let root = cache_root(&f.home);
+    std::fs::create_dir_all(&root).unwrap();
+    let home = Some(f.home.as_path());
+    let quarter_hour = Duration::from_secs(15 * 60);
+
+    let gone = f.root.join("home/wt-removed");
+    let gone_leaf = lay(&root, &gone, quarter_hour);
+    let just_built = f.root.join("home/wt-just-built");
+    let just_leaf = lay(&root, &just_built, Duration::from_secs(60));
+    let live = f.dir("home/live");
+    std::fs::write(live.join("Cargo.toml"), "[workspace]\n").unwrap();
+    let live_leaf = lay(&root, &live, 2 * DAY);
+    let away = f.root.join("home/away/ws");
+    let away_leaf = lay(&root, &away, quarter_hour);
+    let outside = f.dir("outside");
+    std::fs::write(outside.join("keep"), b"k").unwrap();
+    let linked_leaf = build_dir(&root, &f.root.join("home/linked"));
+    std::fs::create_dir_all(linked_leaf.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&outside, &linked_leaf).unwrap();
+
+    // Control: without pressure, the day's window keeps every one.
+    assert!(reclaim(&root, home, SystemTime::now()).is_empty());
+    assert!(gone_leaf.join("debug/deps/x").is_file());
+
+    // WRITE-AHEAD: a directory whose intent cannot be put on record is kept.
+    let mut asked = Vec::new();
+    assert!(
+        reclaim_under_pressure(&root, home, SystemTime::now(), &mut |p| {
+            asked.push(p.to_path_buf());
+            false
+        })
+        .is_empty()
+    );
+    assert_eq!(asked, vec![gone_leaf.clone()]);
+    assert!(gone_leaf.join("debug/deps/x").is_file(), "unrecorded, kept");
+
+    // Recorded, it goes — the record asked while it still stood.
+    let mut stood = Vec::new();
+    assert_eq!(
+        reclaim_under_pressure(&root, home, SystemTime::now(), &mut |p| {
+            stood.push(p.join("debug/deps/x").is_file());
+            true
+        }),
+        vec![gone_leaf.clone()]
+    );
+    assert_eq!(stood, vec![true]);
+    assert!(!gone_leaf.exists());
+    for kept in [&just_leaf, &live_leaf, &away_leaf] {
+        assert_eq!(
+            std::fs::read(kept.join("debug/deps/x")).unwrap(),
+            b"0123456789",
+            "{} kept",
+            kept.display()
+        );
+    }
+    assert!(
+        std::fs::symlink_metadata(&linked_leaf)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(std::fs::read(outside.join("keep")).unwrap(), b"k");
+}
+
+/// A crash can leave only the renamed stage. It still needs a fresh intent before
+/// pressure reclamation removes its bytes; a denied intent leaves those bytes intact.
+#[cfg(unix)]
+#[test]
+fn pressure_reclamation_records_an_orphaned_stage_before_removing_it() {
+    let f = Fixture::new("build-cache-orphan-intent");
+    let root = cache_root(&f.home);
+    let home = Some(f.home.as_path());
+
+    // Control: an ordinary, recorded leaf is sized while it stands and then removed.
+    let leaf = lay(
+        &root,
+        &f.root.join("home/removed"),
+        Duration::from_secs(15 * 60),
+    );
+    let mut recorded = Vec::new();
+    assert_eq!(
+        reclaim_under_pressure(&root, home, SystemTime::now(), &mut |p| {
+            recorded.push((
+                p.to_path_buf(),
+                std::fs::read(p.join("debug/deps/x")).unwrap(),
+            ));
+            true
+        }),
+        vec![leaf.clone()]
+    );
+    assert_eq!(recorded, vec![(leaf.clone(), b"0123456789".to_vec())]);
+    assert!(!leaf.exists());
+
+    let stage = build_dir(&root, &f.root.join("home/orphan")).with_file_name(DOOMED);
+    std::fs::create_dir_all(&stage).unwrap();
+    let payload = stage.join("retained");
+    std::fs::write(&payload, b"staged bytes need an intent").unwrap();
+    let mut denied = Vec::new();
+    assert!(
+        reclaim_under_pressure(&root, home, SystemTime::now(), &mut |p| {
+            denied.push(p.to_path_buf());
+            false
+        })
+        .is_empty()
+    );
+    assert_eq!(
+        std::fs::read(&payload).ok().as_deref(),
+        Some(b"staged bytes need an intent".as_slice()),
+        "a denied orphan-stage intent must preserve its bytes"
+    );
+    assert_eq!(denied, vec![stage.clone()]);
+
+    // The same stage can go once recorded, and the callback sees its original bytes.
+    let mut allowed = Vec::new();
+    let _ = reclaim_under_pressure(&root, home, SystemTime::now(), &mut |p| {
+        allowed.push((p.to_path_buf(), std::fs::read(p.join("retained")).unwrap()));
+        true
+    });
+    assert_eq!(
+        allowed,
+        vec![(stage.clone(), b"staged bytes need an intent".to_vec())]
+    );
+    assert!(!stage.exists());
+}
+
+/// An earlier stage must not be silently deleted to make room for a newly eligible
+/// leaf. Refusing that stage's intent keeps both generations available.
+#[cfg(unix)]
+#[test]
+fn pressure_reclamation_keeps_a_leaf_beside_an_unrecorded_stage() {
+    let f = Fixture::new("build-cache-beside-intent");
+    let root = cache_root(&f.home);
+    let home = Some(f.home.as_path());
+    let leaf = lay(
+        &root,
+        &f.root.join("home/removed"),
+        Duration::from_secs(15 * 60),
+    );
+    let stage = leaf.with_file_name(DOOMED);
+    std::fs::create_dir_all(&stage).unwrap();
+    let payload = stage.join("retained");
+    std::fs::write(&payload, b"the previous generation").unwrap();
+    let mut intents = Vec::new();
+    let removed = reclaim_under_pressure(&root, home, SystemTime::now(), &mut |p| {
+        intents.push(p.to_path_buf());
+        p != stage
+    });
+    assert_eq!(
+        (
+            std::fs::read(&payload).ok(),
+            std::fs::read(leaf.join("debug/deps/x")).ok()
+        ),
+        (
+            Some(b"the previous generation".to_vec()),
+            Some(b"0123456789".to_vec())
+        ),
+        "denying the old stage must not delete either generation"
+    );
+    assert!(removed.is_empty());
+    assert!(intents.contains(&stage));
 }
 
 /// Ages every entry of the tree at `dir` (`dir` too) by `ago`, never following a link.

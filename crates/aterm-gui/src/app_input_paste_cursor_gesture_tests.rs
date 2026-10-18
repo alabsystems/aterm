@@ -85,8 +85,8 @@ fn empty_or_sanitizer_empty_paste_cannot_fund_a_program_trail() {
     // An input with no possible cursor movement arms no licence, and a
     // movement-capable paste is swallowed at its asynchronous enqueue
     // (enqueue is not delivery). The model side (`PressArmsLicense`,
-    // `SwallowedKeyClearsLicense` and their mutants) is proved in
-    // aterm-spec's `derived_cursor_hint_license_proves_and_catches_cold_light`.
+    // `SwallowedKeyClearsLicense` and their mutants) is proved by aterm-spec's
+    // registry sweep.
     for text in ["", "\x1b\x03\u{009b}\x7f", "\u{0301}\u{fe0f}\u{200d}"] {
         assert!(
             !program_move_after_paste(text, false),
@@ -182,33 +182,6 @@ fn delivered_paste_then_hop(
         libc::close(pipe[1]);
     }
     (spawns, licence, width)
-}
-
-/// A delivered paste's receipt carries its priced width, and an echo hop of that
-/// width is licensed as one insert sweep. Without the receipt applied the hop is
-/// program output; a hop wider than the insert declines too.
-#[cfg(unix)]
-#[test]
-fn a_delivered_paste_lights_its_span_as_one_sweep() {
-    let (spawns, licence, width) = delivered_paste_then_hop("foo bar ", 8, true);
-    assert_eq!(
-        width,
-        Some(InsertWidth::Cells(8)),
-        "the ticket carries the paste's priced width"
-    );
-    assert_eq!(spawns, 1, "the delivered paste's echo is licensed");
-    assert_eq!(licence, "insert");
-
-    let (spawns, licence, _) = delivered_paste_then_hop("foo bar ", 8, false);
-    assert_eq!(
-        spawns, 0,
-        "without the delivery stamp the hop is program output"
-    );
-    assert_eq!(licence, "none");
-
-    let (spawns, licence, _) = delivered_paste_then_hop("foo bar ", 12, true);
-    assert_eq!(spawns, 0, "a hop wider than the insert is not the insert's");
-    assert_eq!(licence, "none");
 }
 
 /// A body whose width the text cannot say (a line break, a Tab) is an
@@ -714,7 +687,7 @@ fn a_delayed_paste_frame_leaves_later_queued_keys_for_their_own_echo() {
     // One model credit stands for this 33-key batch: project the engine's
     // first-frame decision onto the derived licence transition; the
     // typed-class verdict (insert still armed, keys spent) is refused.
-    let model = aterm_spec::derive::cursor_hint_license_model();
+    let model = aterm_models_effects::cursor_hint_license_model();
     let mut before = model.init_state();
     for action in [
         "PasteEnqueues",

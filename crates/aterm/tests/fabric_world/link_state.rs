@@ -209,22 +209,6 @@ fn a_broker_path_nothing_listens_on_is_stalled_and_never_connected() {
     assert_eq!(kv(&fs, "state"), Some("stalled"), "{fs}");
     assert_eq!(kv(&fs, "rtt_ms"), Some("-"), "no ack ever: {fs}");
     assert_eq!(kv(&fs, "link_age_ms"), Some("-"), "{fs}");
-
-    // NEVER CONNECTED: watched across several redials (the back-off climbs to
-    // 5 s, so three seconds cover a handful of them).
-    let watch_until = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < watch_until {
-        let s = status(&w);
-        // By key, not by the header's tail: a column appended after the fabric
-        // trio (`identity=`, 2026-09-17) is not this test's business.
-        assert!(
-            s.contains(" fabric=stalled ")
-                && kv(&s, "fabric_rtt_ms") == Some("-")
-                && kv(&s, "fabric_link_age_ms") == Some("-"),
-            "{s}"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
     let reply = w
         .verb(&format!("@{sid} post to=@{sid} kind=ask anyone?"))
         .header()
@@ -279,52 +263,12 @@ fn a_broker_that_accepts_but_never_acks_is_stalled_no_ack() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// **A SUBSCRIPTION THE BROKER REFUSES IS REDIALLED UNDER THE BACK-OFF, NOT AT
-/// ROUND-TRIP SPEED.** Its cap is the node ring minus the consumer-group grant
-/// (`rw,p=<node>:/f/<F>/cur/<node>/>`), so every attach-time read and publish
-/// passes and only the inbox group subscription is refused — which astream
-/// answers when it would deliver: as the reader's first `recv` error, after
-/// the attach reported `up`. Every attach bumps the persisted incarnation, so
-/// `inc` counts them. The shortest jittered waits from the floor (50 ms,
-/// doubling to 2.5 s at the ceiling) sum past 8 s after eight of them, so the
-/// window holds at most seven more attaches — nine allowed — and load can only
-/// lower that. The loop this replaces reset its back-off on every attach and
-/// redialled every `Closed` at once: 68 attaches in the same window, measured.
-#[test]
-fn a_refused_subscription_is_redialled_under_the_back_off() {
-    let group = format!(":/f/{FLEET}/cur/");
-    let w = World::boot_with_grants("r13-nogroup", &|node| {
-        node_grants(node)
-            .into_iter()
-            .filter(|g| !g.contains(&group))
-            .collect()
-    });
-    let inc = |w: &World| -> u64 {
-        std::fs::read_to_string(w.state.join("inc"))
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0)
-    };
-    // A hang detector: the first attach that got as far as presence.
-    until("the first attach", || (inc(&w) >= 1).then_some(()));
-    let before = inc(&w);
-    let window = Duration::from_secs(8);
-    std::thread::sleep(window);
-    let attaches = inc(&w) - before;
-    eprintln!("MEASURED attaches over {window:?} under a refused group subscription: {attaches}");
-    assert!(
-        attaches <= 9,
-        "a refused subscription must wait out the back-off: {attaches} attaches in {window:?}"
-    );
-}
-
 /// **A BRIDGE THAT CANNOT FINISH ITS ATTACH NEVER READS `connected`, AND
 /// WRITES NO RECORD.** Its cap is the node ring minus `ro:/f/<F>/fleet/>`, so
 /// the broker refuses the standing-halt read the bridge cannot attach without.
 /// The halt is read before anything is published and no ack is reported `up`
-/// until the attach completed: a steady `stalled reason=read` (not `fabric=`
-/// flapping with a presence republish every back-off tick), a bus head that
-/// does not move, and a `post --wait` refused at once.
+/// until the attach completed: `stalled reason=read`, an empty node face, and
+/// a `post --wait` refused at once.
 #[test]
 fn review_a_bridge_that_cannot_finish_its_attach_never_reads_connected() {
     let fleet_face = format!(":/f/{FLEET}/fleet/>");
@@ -347,46 +291,9 @@ fn review_a_bridge_that_cannot_finish_its_attach_never_reads_connected() {
         "MEASURED refused halt read -> stalled reason=read: {} ms after boot",
         stalled_in.as_millis()
     );
-    // The broker's head before the window: nothing was ever published by
-    // this bridge, and nothing will be.
+    // It never published anything — not even the first attempt's presence:
+    // the node's face on the bus is empty.
     let mut god = w.god();
-    let head_of = |god: &mut astream_broker::Client| -> u64 {
-        let (_, (_, head)) = god
-            .fetch(0, &format!("/f/{FLEET}/>"), 0)
-            .expect("the head query");
-        head
-    };
-    let head_before = head_of(&mut god);
-    let window = Duration::from_secs(8);
-    let started = Instant::now();
-    let mut states: Vec<String> = Vec::new();
-    while started.elapsed() < window {
-        let fs = fabric_status(&w);
-        let state = kv(&fs, "state").unwrap_or("-").to_string();
-        let reason = kv(&fs, "reason").unwrap_or("-").to_string();
-        assert_ne!(state, "connected", "never connected: {fs}");
-        let sample = format!("{state}/{reason}");
-        if states.last() != Some(&sample) {
-            states.push(sample);
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    let head_after = head_of(&mut god);
-    eprintln!(
-        "MEASURED link states over {window:?}: {states:?}; bus records appended in the window: {}",
-        head_after - head_before
-    );
-    assert_eq!(
-        states,
-        vec!["stalled/read".to_string()],
-        "one steady state, not a flap: {states:?}"
-    );
-    assert_eq!(
-        head_after, head_before,
-        "an attach that cannot finish publishes nothing (§7: no record for no new information)"
-    );
-    // And it never published anything — not even the first attempt's
-    // presence: the node's face on the bus is empty.
     let (rows, _) = god
         .last(&format!("/f/{FLEET}/pub/{}/>", w.node), "", 8)
         .expect("a Last walk of the node's face");

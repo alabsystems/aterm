@@ -12,7 +12,8 @@
 #![cfg(test)]
 
 use aterm_buffer::Seq;
-use aterm_spec::derive::{Model, native_editor_modal_model};
+use aterm_models_native::native_editor_modal_model;
+use aterm_spec::derive::Model;
 use aterm_spec::interp::{State, admits};
 
 use crate::conformance_support::assert_transition;
@@ -88,7 +89,7 @@ fn project(
 #[test]
 fn shipping_editor_mark_and_minibuffer_trace_conforms_with_negative_controls() {
     let model = native_editor_modal_model();
-    let mut store = DocumentStore::for_test();
+    let mut store = crate::test_document_store();
     let document = store.open("mem://editor-modal-conformance".into(), "abc".into());
     // The model's `Cap` is the length of the document this trace opens.
     let cap = model
@@ -224,7 +225,7 @@ fn shipping_editor_mark_and_minibuffer_trace_conforms_with_negative_controls() {
     // Bind the added goto lifecycle to genuine shipping code. A two-line
     // buffer makes the abstract zero-based target `1` equal the real byte of
     // line 2, so acceptance is checked as a transition rather than inferred.
-    let mut goto_store = DocumentStore::for_test();
+    let mut goto_store = crate::test_document_store();
     let goto_document = goto_store.open("mem://editor-goto-conformance".into(), "\nx".into());
     let mut goto_workspace = EditorWorkspace::new();
     let mut goto_view = goto_workspace

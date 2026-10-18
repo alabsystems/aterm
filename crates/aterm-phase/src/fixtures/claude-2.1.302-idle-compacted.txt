@@ -1,0 +1,14 @@
+# claude-code 2.1.302 · MEASURED 2026-10-16, `aterm ctl text` of the owner's tab 1 (136x57, aterm 0.105.0) an hour after a finished report; the composer as it is drawn idle
+
+  ATERM-TASK-DONE
+
+✻ Cooked for 47m 7s · done 7:06 PM
+  ⎿  Read ../.claude/projects/-Users-user00-aterm/memory/agy-muse-harness-status.md (37 lines)
+  ⎿  Skills restored (workflow-authoring)
+
+⏺ Compacted while idle, before the prompt cache expired · turn off with "idleCompaction": false in settings.json
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── session-1 ─
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)

@@ -105,8 +105,8 @@ pub(crate) enum Attention {
 /// (design 2026-09-22 §5.3(b)).
 use aterm_messages::GLASS_TITLE_CHARS;
 
-/// Classify `msg`, or say why it may not be on the glass: a measured level
-/// off the strain row is refused; a record is a record; a confirmation, an FYI and progress with no indicator are not
+/// Classify `msg`, or say why it may not be on the glass: a record is a
+/// record; a confirmation, an FYI and progress with no indicator are not
 /// allowed on the glass; a live row with its indicator — a fill or busy
 /// (ruling 139: the indicator is the meter's state, never the hold's) — is
 /// progress, and may carry a consequential capsule only when it stops that
@@ -119,11 +119,6 @@ use aterm_messages::GLASS_TITLE_CHARS;
 /// `: `) and does not end in a period.
 #[cfg(test)]
 pub(crate) fn attention(msg: &Message) -> Result<Attention, &'static str> {
-    // A measured LEVEL is Progress on the strain row alone (tag `system`,
-    // key `system.strain`); anywhere else it is refused (design ruling 208).
-    if let Some(fault) = aterm_messages::strain::level_fault(msg) {
-        return Err(fault);
-    }
     if msg.hold == Hold::LogOnly {
         return Ok(Attention::Record);
     }
@@ -257,7 +252,7 @@ pub(crate) enum ConfigFamily {
     /// Keys `aterm.toml` sets that this build does nothing with.
     IgnoredKeys,
     /// Retired and deprecated spellings (`[packages] auto_update` /
-    /// `seed_install`, `game_font`): keys aterm or atpkg still reads, or that a
+    /// `seed_install`): keys aterm or atpkg still reads, or that a
     /// newer key now decides. A RECORD, never a row: nothing is broken and
     /// nothing presses — the editor marks each one, and Settings ▸ Packages
     /// already explains an Off the retired `auto_update` holds. Kept apart from
@@ -268,7 +263,7 @@ pub(crate) enum ConfigFamily {
     RetiredKeys,
     /// Keys spelled right whose VALUE this build does not accept.
     UnacceptedValues,
-    /// `cursor_trail_style` and the Trail Pack manifests.
+    /// `cursor_trail_style`.
     CursorTrail,
     /// Font families, faces and variation requests that did not resolve.
     Fonts,
@@ -395,10 +390,9 @@ impl ConfigFamily {
             Self::UnacceptedValues if one => "Couldn't use a setting's value".to_string(),
             Self::UnacceptedValues => format!("Couldn't use {n} settings' values"),
             Self::CursorTrail if one => "Couldn't apply the cursor trail".to_string(),
-            // A count of the family's sentences, which are trail packs and the
-            // style alike — not "settings" — and short enough that a 60-column
-            // row keeps its `Open aterm.toml` beside `Value not accepted`'s
-            // (design ruling 217).
+            // A count of the family's sentences — not "settings" — and short
+            // enough that a 60-column row keeps its `Open aterm.toml` beside
+            // `Value not accepted`'s (design ruling 217).
             Self::CursorTrail => format!("{n} errors in cursor trail settings"),
             Self::Fonts if one => "Couldn't apply the font".to_string(),
             Self::Fonts => format!("Couldn't apply {n} fonts"),
@@ -715,8 +709,8 @@ fn config_family_message(family: ConfigFamily, sentences: &[String]) -> Message 
         used += 1;
     }
     // Each sentence in its PHYSICAL rows ([`diagnostic_lines`], fffef97a1),
-    // and the budget counted in rows, not sentences: one Trail Pack parse
-    // error is a sentence and a four-row caret diagram, and counting it as one
+    // and the budget counted in rows, not sentences: one TOML parse error is
+    // a sentence and a four-row caret diagram, and counting it as one
     // line would let `Message::line`'s cap silently drop the roll-up below —
     // the list that looks complete while it is not. A slot is kept for the
     // roll-up whenever a sentence could still follow; a single sentence longer
@@ -787,6 +781,12 @@ pub(crate) fn font_family_rejected(warning: &str) -> Message {
     config_family_message(ConfigFamily::Fonts, &[warning.to_string()]).key(KEY_FONT_FAMILY)
 }
 
+/// A font a theme names that is not installed here: the font row, never the
+/// config family's own verdict ([`KEY_FONT_FAMILY`]).
+pub(crate) fn theme_font_refused(warning: &str) -> Message {
+    config_family_message(ConfigFamily::Fonts, &[warning.to_string()])
+}
+
 /// The crash row's first line: plain words for what is there to look at —
 /// never the report's path (design ruling 74). Not painted: the title says
 /// what happened and `Open log` is the press (ruling 145).
@@ -839,9 +839,93 @@ pub(crate) fn killed_message(evidence: &crate::logging::KillEvidence) -> Message
         .key(KEY_CRASH)
 }
 
-/// What the keeper's recovery row says of the reattached screens.
+/// What the keeper's recovery row says of the reattached screens when none came back
+/// from a crash-restore region (no keeper journal, or every restore fell to the META rung).
 pub(crate) const KEEPER_SCREENS: &str = "each screen started blank and its program was asked to \
                                          redraw; the scrollback before the stop is not here";
+
+/// What the row says when every reattached screen came back exactly from its region
+/// (`crash_restore`), and every line of its scrollback with it (the history ring, imported
+/// below it after the restore drains): no program was asked to redraw, and nothing is
+/// missing.
+pub(crate) const KEEPER_SCREENS_EXACT: &str =
+    "each screen was restored exactly; the scrollback came back too";
+
+/// The row's screens line for a recovery whose crash restores landed as `restores`
+/// (`crash_restore::RungCounts`) and could not bring back `history_lost` lines of the
+/// restored screens' scrollback (the history joins' counts, `status history_lost=` per
+/// session): every screen restored exactly; every screen restored with `M` of them
+/// repainted (a loss counted, so its program was asked to redraw over it); some restored
+/// and the rest started blank (the META rung: no region, or a restore that failed), each
+/// counted, since "each screen was restored" would be false for the blank ones; or, with
+/// no screen from a region at all, [`KEEPER_SCREENS`]. Then the scrollback: back too, or
+/// the lines that did not come back counted, and a blank screen's said apart (it brought
+/// none).
+pub(crate) fn keeper_screens_line(
+    restores: crate::crash_restore::RungCounts,
+    history_lost: u64,
+) -> String {
+    let screens = restores.screens();
+    let redraws = restores.screen.saturating_add(restores.meta);
+    let asked = |n: u32| {
+        if n == 1 {
+            "its program was asked to redraw".to_string()
+        } else {
+            format!("{n} programs were asked to redraw")
+        }
+    };
+    let lines = |n: u64| {
+        if n == 1 {
+            "1 line".to_string()
+        } else {
+            format!("{n} lines")
+        }
+    };
+    let scrollback = match (restores.meta, history_lost) {
+        (0, 0) => "the scrollback came back too".to_string(),
+        (0, n) => format!("{} of the scrollback did not come back", lines(n)),
+        (_, 0) => "the blank ones' scrollback is not here".to_string(),
+        (_, n) => format!(
+            "the blank ones' scrollback is not here, and {} of the others' did not come back",
+            lines(n)
+        ),
+    };
+    if screens == 0 {
+        KEEPER_SCREENS.to_string()
+    } else if redraws == 0 && history_lost == 0 {
+        KEEPER_SCREENS_EXACT.to_string()
+    } else if redraws == 0 {
+        format!("each screen was restored exactly; {scrollback}")
+    } else if restores.meta == 0 {
+        format!(
+            "each screen was restored ({} repainted: {}); {scrollback}",
+            restores.screen,
+            asked(restores.screen)
+        )
+    } else {
+        let how = if restores.screen == 0 {
+            " exactly".to_string()
+        } else {
+            format!(" ({} repainted)", restores.screen)
+        };
+        format!(
+            "{} restored{how} and {} started blank ({}); {scrollback}",
+            counted_were(screens, "screen"),
+            restores.meta,
+            asked(redraws)
+        )
+    }
+}
+
+/// `n` and `word` as the subject of "was"/"were": `1 screen was`, `2 screens were`.
+fn counted_were(n: u32, word: &str) -> String {
+    let n = usize::try_from(n).unwrap_or(usize::MAX);
+    format!(
+        "{} {}",
+        counted(n, word),
+        if n == 1 { "was" } else { "were" }
+    )
+}
 
 /// THE PTY KEEPER'S RECOVERY ROW (P3, design §5.3 step 7): the last window
 /// crashed or was killed, and the keeper kept `n` of its sessions running;
@@ -849,11 +933,16 @@ pub(crate) const KEEPER_SCREENS: &str = "each screen started blank and its progr
 /// where that row's evidence is: the crash log, or the killed run's log.
 /// `End sessions` hangs every reattached shell up (Force Quit and jetsam look
 /// the same, decision 4); `refused` offers the admission turned down are
-/// counted. Each screen lands blank and its program is sent a size pulse: a
-/// program that ignores it stays blank until it next writes.
+/// counted. A screen the crash restore brought back exactly lands as it was;
+/// any other lands blank or with a loss counted, and its program is sent a size
+/// pulse: a program that ignores it stays as it landed until it next writes
+/// (`restores`, [`keeper_screens_line`]). A restored screen's scrollback comes back
+/// below it, and the lines that could not are counted (`history_lost`).
 pub(crate) fn keeper_recovered_message(
     n: usize,
     refused: usize,
+    restores: crate::crash_restore::RungCounts,
+    history_lost: u64,
     crash: Option<&crate::logging::CrashEvidence>,
     killed: Option<&crate::logging::KillEvidence>,
 ) -> Message {
@@ -864,7 +953,7 @@ pub(crate) fn keeper_recovered_message(
             counted(n, "session"),
             if n == 1 { "was" } else { "were" }
         ))
-        .line(KEEPER_SCREENS);
+        .line(keeper_screens_line(restores, history_lost));
     if refused > 0 {
         message = message.line(format!(
             "{} could not be reattached and {} ended",
@@ -972,23 +1061,36 @@ fn journal_loss_line(lost: &crate::crash_journal::Lost, tabs: usize) -> String {
 /// THE AGENTS THAT COME BACK, in a person's words (P6a, ruling 293): `aterm
 /// starts Claude again on its conversation in tab 2`, `… its conversations in
 /// tabs 1 and 3`, `… in 4 tabs`; `tab 2 of window 1` when the layout has more
-/// than one window. `resumed` is [`crate::crash_journal::Reopened::resumed`]'s,
-/// one entry per agent; empty for none. What aterm DOES, said as the launch
+/// than one window. `resumed` is
+/// [`crate::crash_journal::Reopened::resumed_agents`]'s, one entry per agent;
+/// empty for none. Worded by the agents (F1-R8-G4): `aterm starts Codex again
+/// on its thread …`, and `aterm starts the agents again on their
+/// conversations …` for both kinds. What aterm DOES, said as the launch
 /// starts it — never a promise of how it ends (day six, D33: `Claude resumes
 /// …` stood in the log beside the row that said it did not); a relaunch that
 /// does not take is said by its own row ([`restored_agents_not_resumed`]).
-fn journal_resumed_line(resumed: &[(u32, u32)], windows: usize) -> String {
+fn journal_resumed_line(
+    resumed: &[((u32, u32), aterm_agent::harness::upgrade::Agent)],
+    windows: usize,
+) -> String {
     const SHOWN: usize = 3;
     let mut places: Vec<(u32, u32)> = Vec::new();
-    for place in resumed {
+    for (place, _) in resumed {
         if !places.contains(place) {
             places.push(*place);
         }
     }
-    let conversations = if resumed.len() == 1 {
-        "its conversation"
-    } else {
-        "its conversations"
+    let kind = resumed
+        .first()
+        .map(|(_, agent)| *agent)
+        .filter(|agent| resumed.iter().all(|(_, other)| other == agent));
+    let (who, conversations) = match kind {
+        Some(agent) => {
+            let (_, what) = resume_words(agent);
+            let s = if resumed.len() == 1 { "" } else { "s" };
+            (agent_word(agent), format!("its {what}{s}"))
+        }
+        None => ("the agents", "their conversations".to_string()),
     };
     let one = |(window, tab): (u32, u32)| {
         if windows > 1 {
@@ -1019,7 +1121,7 @@ fn journal_resumed_line(resumed: &[(u32, u32)], windows: usize) -> String {
             one(*last)
         ),
     };
-    format!("aterm starts Claude again on {conversations} in {place}")
+    format!("aterm starts {who} again on {conversations} in {place}")
 }
 
 /// What the reopened layout brought back, and from how many journals: `2 tabs
@@ -1130,7 +1232,7 @@ fn journal_tag(class: crate::crash_journal::DeathClass) -> Tag {
 /// whether this launch's supervisor host relaunches the agents the layout
 /// carried ([`crate::harness_host::HostHandle::relaunches_restored`]). Each
 /// one it brings back on its conversation
-/// ([`crate::crash_journal::Reopened::resumed`]) is left out of what was
+/// ([`crate::crash_journal::Reopened::resumed_agents`]) is left out of what was
 /// lost and said as coming back (`aterm starts Claude again on its
 /// conversation in tab 2`): when nothing else ran, only scrollback was lost, and a kill is a
 /// record; when another program was lost, the warning names that one and its
@@ -1160,10 +1262,10 @@ pub(crate) fn journal_reopened_message(
     // `quit_windows` on screen, and a window is named whenever the screen has
     // more than one.
     let offset = u32::try_from(quit_windows).unwrap_or(u32::MAX);
-    let places: Vec<(u32, u32)> = reopened
-        .resumed(relaunching)
+    let places: Vec<((u32, u32), aterm_agent::harness::upgrade::Agent)> = reopened
+        .resumed_agents(relaunching)
         .into_iter()
-        .map(|(window, tab)| (window.saturating_add(offset), tab))
+        .map(|((window, tab), agent)| ((window.saturating_add(offset), tab), agent))
         .collect();
     let resumed = journal_resumed_line(&places, quit_windows.saturating_add(windows));
     let nothing_ran = lost.as_ref().is_some_and(|lost| lost.tabs == 0);
@@ -1390,81 +1492,194 @@ pub(crate) fn harness_without_socket(cause: &str, fix: Option<&str>) -> Message 
     .key(KEY_HARNESS_NO_SOCKET)
 }
 
-/// A restored tab's relaunch that was typed and whose agent started but did
-/// not pick its conversation up (day six, D31): it ended as it started
-/// (Claude's `No conversation found`), never registered it, or was still
-/// coming up when the host stopped waiting.
+/// A restored tab's relaunch that was typed and did not bring its agent's
+/// conversation back (day six, D31): a Claude that started and ended as it
+/// started (`No conversation found`), never registered it, or was still
+/// coming up when the host stopped waiting — and a Codex whose relaunched
+/// TUI never came up in the tab (its lane's `no-resume`, and its
+/// `wait:resume` while none is found), said as that ([`typed_relaunch_why`],
+/// F1-R9-G5), never as one that started.
 fn started_without_conversation(outcome: &aterm_agent::harness::relaunch::Outcome) -> bool {
     use aterm_agent::harness::relaunch::Outcome;
     matches!(outcome, Outcome::NotYet(step) if step == "failed:no-resume" || step == "wait:resume")
 }
 
-/// Why a restored tab's agent did not come back, in a person's words — never
-/// the relaunch's step word, which `aterm.log` keeps. An agent that started
-/// and did not pick its conversation up is said as that, never as a tab that
-/// was not ready (day six, D31: the tab was at its prompt, and Claude started
-/// there and refused).
-fn not_resumed_why(outcome: &aterm_agent::harness::relaunch::Outcome) -> &'static str {
+/// What became of `agent`'s typed relaunch that did not bring its
+/// conversation back ([`started_without_conversation`]), in a person's
+/// words: Claude Code started and did not pick it up; the relaunched Codex
+/// did not come up in the tab (F1-R9-G5: its lane's words mean that, and
+/// "Codex started in the tab" was false).
+fn typed_relaunch_why(agent: aterm_agent::harness::upgrade::Agent) -> String {
+    use aterm_agent::harness::upgrade::Agent;
+    match agent {
+        Agent::Claude => "Claude started but did not pick its conversation up".to_string(),
+        Agent::Codex => "the relaunched Codex did not come up in the tab".to_string(),
+        // Its lane's words mean that too: no Muse Code came up resuming the
+        // session in the tab.
+        Agent::Muse => "the relaunched Muse Code did not come up in the tab".to_string(),
+        // No lane yet (agy, Gemini CLI): never relaunched, so never here;
+        // said as itself, never as another agent.
+        Agent::Agy | Agent::Gemini => {
+            format!("no lane of aterm's relaunches {}", agent.product())
+        }
+    }
+}
+
+/// The command that brings `agent`'s conversation back in its tab, and what
+/// that agent calls a conversation: Claude Code's `claude --resume` and its
+/// conversation, Codex's `codex resume` and its thread (as
+/// [`restored_agent_held`] words them).
+fn resume_words(agent: aterm_agent::harness::upgrade::Agent) -> (&'static str, &'static str) {
+    match agent {
+        aterm_agent::harness::upgrade::Agent::Claude => ("claude --resume", "conversation"),
+        aterm_agent::harness::upgrade::Agent::Codex => ("codex resume", "thread"),
+        // Muse Code's own resume verb, and what it calls one: a session.
+        aterm_agent::harness::upgrade::Agent::Muse => ("muse resume", "session"),
+        // No lane yet (agy, Gemini CLI): no command is told, never Claude
+        // Code's.
+        aterm_agent::harness::upgrade::Agent::Agy
+        | aterm_agent::harness::upgrade::Agent::Gemini => {
+            ("its own resume command", "conversation")
+        }
+    }
+}
+
+/// Why a restored tab's agent (`agent`, Claude Code or Codex) did not come
+/// back, in a person's words — never the relaunch's step word, which
+/// `aterm.log` keeps. An agent that started and did not pick its
+/// conversation up is said as that, never as a tab that was not ready (day
+/// six, D31: the tab was at its prompt, and Claude started there and
+/// refused).
+fn not_resumed_why(
+    agent: aterm_agent::harness::upgrade::Agent,
+    outcome: &aterm_agent::harness::relaunch::Outcome,
+) -> String {
     use aterm_agent::harness::relaunch::Outcome;
+    let who = agent_word(agent);
+    let (_, what) = resume_words(agent);
     match outcome {
-        o if started_without_conversation(o) => {
-            "Claude started but did not pick its conversation up"
-        }
+        o if started_without_conversation(o) => typed_relaunch_why(agent),
         Outcome::NotYet(step) if step.starts_with("failed:relaunch:") => {
-            "its prompt refused the line that starts it"
+            "its prompt refused the line that starts it".to_string()
         }
-        Outcome::Cannot(why) if why == "shell-gone" => "its tab's shell had ended",
+        Outcome::Cannot(why) if why == "shell-gone" => "its tab's shell had ended".to_string(),
         Outcome::Left(why) if why == "not-exited" => {
-            "the Claude that ran there before is still running, outside the tab"
+            format!("the {who} that ran there before is still running, outside the tab")
         }
-        Outcome::Left(why) if why == "no-conversation" => "its conversation could not be found",
-        Outcome::NotYet(_) | Outcome::Busy => "its tab was not ready for it in time",
-        _ => "it could not be started there",
+        Outcome::Left(why) if why == "no-conversation" => {
+            format!("its {what} could not be found")
+        }
+        Outcome::NotYet(_) | Outcome::Busy => "its tab was not ready for it in time".to_string(),
+        _ => "it could not be started there".to_string(),
     }
 }
 
 /// P6a, RULING 293 — THE AGENTS THAT DID NOT COME BACK. The reopened layout's
-/// row ([`journal_reopened_message`]) told the person that aterm starts Claude
-/// again on its conversation in these tabs; the relaunch then could not
-/// bring it back in each `(place, outcome)` of `missed` (`place` as `in tab
-/// 2`). Said ONCE, by the supervisor host once it has tried every restored
-/// tab (`HostHandle::relaunch_restored`): a warning — the person resumes it by
-/// hand — with `Open log` on `log`, where each step is. THE REMEDY IS IN THE
-/// SENTENCE (day six, D32): `detail[0]`, the plain sentence Settings sets
-/// above the technical block, says what happened and what to type; the
-/// per-tab reasons and the log's path follow.
+/// row ([`journal_reopened_message`]) told the person that aterm starts the
+/// agent again on its conversation in these tabs; the relaunch then could not
+/// bring it back in each `(place, agent, outcome)` of `missed` (`place` as
+/// `in tab 2`, `agent` the one that ran there). Said by the supervisor host
+/// once it has tried every restored tab (`HostHandle::relaunch_restored`), each
+/// row naming every tab said so far this launch (its key supersedes the last):
+/// a warning — the person resumes it by hand — with `Open log` on `log`, where
+/// each step is. THE REMEDY IS IN THE SENTENCE (day six, D32): `detail[0]`, the
+/// plain sentence Settings sets above the technical block, says what happened
+/// and what to type; the per-tab reasons and the log's path follow. THE
+/// AGENT'S OWN WORDS (F1-R8-G4): a Codex is said as Codex, its remedy `codex
+/// resume` and its thread, as the held record words it
+/// ([`restored_agent_held`]); a row of both names each tab's command on its
+/// line. Until then every tab was a Claude told `claude --resume`. ONE LINE
+/// AN AGENT (F1-R9-G1): two panes of one tab's splits are two lines of the
+/// same place, and a row of more agents than places counts panes, not tabs.
 pub(crate) fn restored_agents_not_resumed(
-    missed: &[(String, aterm_agent::harness::relaunch::Outcome)],
+    missed: &[(
+        String,
+        aterm_agent::harness::upgrade::Agent,
+        aterm_agent::harness::relaunch::Outcome,
+    )],
     log: Option<&std::path::Path>,
 ) -> Message {
-    let (title, first) = match missed {
-        [(place, outcome)] => (
-            format!("Couldn't resume Claude {place}"),
-            if started_without_conversation(outcome) {
-                "Claude started in the tab but did not pick its conversation up after aterm \
-                 stopped: type claude --resume there to pick it up again"
-                    .to_string()
+    // The one agent every tab ran, where they all ran the same one.
+    let kind = missed
+        .first()
+        .map(|(_, agent, _)| *agent)
+        .filter(|agent| missed.iter().all(|(_, other, _)| other == agent));
+    // A PANE A LINE (F1-R9-G1): two agents of one tab's splits share its
+    // place, so a row of more agents than places counts the panes.
+    let places = {
+        let mut places: Vec<&str> = missed.iter().map(|(place, ..)| place.as_str()).collect();
+        places.sort_unstable();
+        places.dedup();
+        places.len()
+    };
+    let where_ = if places < missed.len() { "pane" } else { "tab" };
+    let (title, first, step) = match (missed, kind) {
+        ([(place, agent, outcome)], _) => {
+            let who = agent_word(*agent);
+            let (resume, what) = resume_words(*agent);
+            // Only a Claude that came up is said to have started: a Codex
+            // lane's same words mean its relaunched TUI never came up
+            // ([`typed_relaunch_why`], F1-R9-G5).
+            let started = match agent {
+                aterm_agent::harness::upgrade::Agent::Claude => true,
+                // Muse Code: as Codex's, its lane's words mean its relaunched
+                // TUI never came up. No lane yet (agy, Gemini CLI): never
+                // started.
+                aterm_agent::harness::upgrade::Agent::Codex
+                | aterm_agent::harness::upgrade::Agent::Muse
+                | aterm_agent::harness::upgrade::Agent::Agy
+                | aterm_agent::harness::upgrade::Agent::Gemini => false,
+            };
+            let first = if started_without_conversation(outcome) && started {
+                format!(
+                    "{who} started in the tab but did not pick its {what} up after aterm \
+                     stopped: type {resume} there to pick it up again"
+                )
             } else {
                 format!(
-                    "{}, so its conversation did not come back after aterm stopped: type claude \
-                     --resume there to pick it up again",
-                    not_resumed_why(outcome)
+                    "{}, so its {what} did not come back after aterm stopped: type {resume} \
+                     there to pick it up again",
+                    not_resumed_why(*agent, outcome)
                 )
-            },
-        ),
-        _ => (
-            format!("Couldn't resume Claude in {} tabs", missed.len()),
-            "their conversations did not come back after aterm stopped: type claude --resume in \
-             each tab to pick one up again"
-                .to_string(),
+            };
+            (
+                format!("Couldn't resume {who} {place}"),
+                first,
+                format!("Type {resume} in the tab"),
+            )
+        }
+        (_, Some(agent)) => {
+            let who = agent_word(agent);
+            let (resume, what) = resume_words(agent);
+            (
+                format!("Couldn't resume {who} in {} {where_}s", missed.len()),
+                format!(
+                    "their {what}s did not come back after aterm stopped: type {resume} in \
+                     each {where_} to pick one up again"
+                ),
+                format!("Type {resume} in each {where_}"),
+            )
+        }
+        (_, None) => (
+            format!("Couldn't resume the agents in {} {where_}s", missed.len()),
+            format!(
+                "their conversations did not come back after aterm stopped: type each \
+                 {where_}'s resume command there, as its line says, to pick one up again"
+            ),
+            format!("Type each {where_}'s resume command in it"),
         ),
     };
     let mut msg = Message::new(tags::HARNESS, Severity::Warn, title)
         .glyph(Glyph::or_fallback('\u{26a0}'))
         .line(first);
     if missed.len() > 1 {
-        for (place, outcome) in missed {
-            msg = msg.line(format!("{place}, {}", not_resumed_why(outcome)));
+        for (place, agent, outcome) in missed {
+            let why = not_resumed_why(*agent, outcome);
+            msg = msg.line(if kind.is_some() {
+                format!("{place}, {why}")
+            } else {
+                format!("{place}, {why}: type {} there", resume_words(*agent).0)
+            });
         }
     }
     if let Some(log) = log {
@@ -1474,20 +1689,33 @@ pub(crate) fn restored_agents_not_resumed(
             .action(Intent::OpenPath { path: log });
     }
     // Asked after the lines: the remedy sentence above stays `detail[0]`.
+    let (tried, reason) = match kind {
+        Some(agent) => {
+            let (_, what) = resume_words(agent);
+            (
+                format!("tried to start {} again on its {what}", agent_word(agent)),
+                format!("it did not pick the {what} up"),
+            )
+        }
+        None => (
+            "tried to start each agent again on its conversation".to_string(),
+            "they did not pick their conversations up".to_string(),
+        ),
+    };
     let ask = Ask::flash(
         Why::Spent {
-            tried: Reason::new("tried to start Claude again on its conversation"),
-            reason: Reason::new("it did not pick the conversation up"),
+            tried: Reason::new(tried),
+            reason: Reason::new(reason),
         },
-        Then::step(if missed.len() == 1 {
-            "Type claude --resume in the tab"
-        } else {
-            "Type claude --resume in each tab"
-        }),
+        Then::step(step),
         Span::Launch,
     );
     msg.no_excerpt().now(ask).key(KEY_RESTORED_AGENTS)
 }
+
+/// The supersede key of the record that says a restored tab's agent stays
+/// held ([`restored_agent_held`]), one per tab: `<this>.<sid>`.
+pub(crate) const KEY_RESTORED_HELD: &str = "harness.restored-held";
 
 /// R3 — `aterm.toml` did not load at launch. `notice` is
 /// `app_config::launch_config_notice`'s sentence (problem, path,
@@ -1879,35 +2107,31 @@ pub(crate) fn serious_mode_feedback(words: &str) -> Message {
 }
 
 /// The native config lane's heads, as terse titles (design §10.3, C22's
-/// map), and whether the head is the person's own gesture failing (Robi's
-/// dismissal). An unknown head is a failed settings change, its whole first
-/// row the excerpt.
-fn lane_title(head: &str) -> (&'static str, bool, bool) {
-    let known = |title, gesture| (title, gesture, true);
+/// map), and whether the head is known. An unknown head is a failed settings
+/// change, its whole first row the excerpt.
+fn lane_title(head: &str) -> (&'static str, bool) {
+    let known = |title| (title, true);
     if head.starts_with("Config observation was not valid TOML") {
-        known("Couldn't read your settings", false)
-    } else if head.starts_with("Robi was not dismissed") {
-        known("Couldn't dismiss Robi", true)
+        known("Couldn't read your settings")
     } else if head.starts_with("Config reconciliation failed") {
-        known("Couldn't save settings changes", false)
+        known("Couldn't save settings changes")
     } else if head.starts_with("Manual saved aterm.toml, but")
         || head.starts_with("Config was saved, but its exact disk generation")
     {
-        known("Couldn't apply saved settings", false)
+        known("Couldn't apply saved settings")
     } else if head.starts_with("Config publication could not be verified") {
-        known("Couldn't confirm settings saved", false)
+        known("Couldn't confirm settings saved")
     } else if head.starts_with("Config was NOT saved") {
-        known("Couldn't save a settings change", false)
+        known("Couldn't save a settings change")
     } else {
-        ("Couldn't change a setting", false, false)
+        ("Couldn't change a setting", false)
     }
 }
 
 /// R13 — the native config lane's own error (`Config observation was not
-/// valid TOML`, a pump that failed, a Robi dismissal the lane refused): a
-/// terse title by its head ([`lane_title`]), the cause's first physical row
-/// as `detail[0]`, and every later row — a `toml` parse error's caret
-/// diagram — behind Details.
+/// valid TOML`, a pump that failed): a terse title by its head
+/// ([`lane_title`]), the cause's first physical row as `detail[0]`, and every
+/// later row — a `toml` parse error's caret diagram — behind Details.
 ///
 /// A DIAGNOSTIC IS ONE PROBLEM, NOT ONE LINE (upstream e7dc1feee, ported onto
 /// the message model on the origin/main merge, 2026-09-23): the words are
@@ -1918,7 +2142,7 @@ pub(crate) fn config_lane_error(words: &str) -> Message {
     let mut rows = diagnostic_lines(words).into_iter();
     let first = rows.next().unwrap_or_default();
     let (head, cause) = split_sentence(&first);
-    let (title, gesture, known) = lane_title(head);
+    let (title, known) = lane_title(head);
     // What the band paints (ruling 306): the parser's finding in a person's
     // words for an invalid file, the cause for a known head — and nothing for
     // a head this build does not know, whose row (`Something new went wrong:
@@ -1956,13 +2180,11 @@ pub(crate) fn config_lane_error(words: &str) -> Message {
         .action(Intent::OpenConfigEditor { line: None })
         .key(KEY_CONFIG_LANE);
     let msg = if painted { msg } else { msg.no_excerpt() };
-    // The person's own edit did not take: a flash at the warning's 45 s, or
-    // the gesture's 12 s for Robi's dismissal (H10/H11), asked after the
-    // lines so they stay the detail. The reason is a fixed clause per head,
+    // The person's own edit did not take: a flash at the warning's 45 s,
+    // asked after the lines so they stay the detail. The reason is a fixed clause per head,
     // never the cause's words (`reload before retrying` is no reason).
     let why = match title {
         "Couldn't read your settings" => "aterm.toml is not valid TOML",
-        "Couldn't dismiss Robi" => "Robi's dismissal was not saved",
         "Couldn't save settings changes" => "your settings changes were not written",
         "Couldn't apply saved settings" => "your saved settings were not applied",
         "Couldn't confirm settings saved" => "your settings change could not be confirmed",
@@ -1975,7 +2197,7 @@ pub(crate) fn config_lane_error(words: &str) -> Message {
             Mover::open_config_editor(None),
             "Fix the setting in aterm.toml",
         ),
-        if gesture { Span::Gesture } else { Span::Warn },
+        Span::Warn,
     );
     msg.now(ask)
 }
@@ -2221,8 +2443,7 @@ pub(crate) struct LostTab {
 /// shell (a seamless update or a keeper crash recovery) came without its key,
 /// so command blocks and exit codes are dark there — until then said only by `status integration=degraded`
 /// and the log. ONE Standing WARN under [`KEY_INTEGRATION_LOST`] for every
-/// such tab, in the shape of an agent's one row for its stalled tabs
-/// ([`agent_upgrade_stalled_group`], ruling 374): the title counts them, the
+/// such tab (ruling 374): the title counts them, the
 /// first line names them by place (past [`INTEGRATION_TABS_NAMED`], an
 /// `and N more` line counts the rest), the next says what gives it back, and
 /// behind them, only where the remedies differ, the agent tabs by place
@@ -2674,6 +2895,28 @@ pub(crate) fn file_access_granted() -> Message {
     .key(KEY_FILE_ACCESS)
 }
 
+/// A CONSENT DIALOG THE CARD IS NOT ABOUT, AFTER THE FACT
+/// (`App::note_observed_prompts`): the sentinel saw macOS ask the owner about
+/// `what` (the music and media library, Photos, contacts, …; the words of
+/// [`crate::consent_observer::service_words`]) for a program of this aterm.
+/// The owner answers the dialog itself and nothing is left to do here, so it
+/// is a RECORD (Settings ▸ Messages and `messages.log`), never a row or an
+/// entry: it answers "which tab made macOS ask me that?". `tab` is the 1-based
+/// tab the asking program ran in, when ancestry placed it. Each dialog is its
+/// own record, keyed by service (`short`, a
+/// [`crate::consent_observer::short_service`] id from the same closed table).
+pub(crate) fn consent_dialog_record(short: &str, what: &str, tab: Option<usize>) -> Message {
+    let asker = tab.map_or_else(
+        || "a program in aterm".to_owned(),
+        |n| format!("a program in tab {n}"),
+    );
+    Message::new(tags::PRIVACY, Severity::Info, format!("Asked for {what}"))
+        .line(format!("macOS asked you, for {asker}"))
+        .line("System Settings ▸ Privacy & Security holds and changes the answer")
+        .record()
+        .key(format!("privacy.dialog.{}", short.to_ascii_lowercase()).as_str())
+}
+
 /// DEBUGGER ACCESS RECORDS (design §3.5, §3.8, in the R17 pattern): what a
 /// probe OBSERVED about macOS's debugger rule, never what an exit code said. A
 /// change is the owner's own act, so a RECORD (Settings ▸ Messages and
@@ -2842,7 +3085,7 @@ pub(crate) fn restored_agent_held(
     Some(
         message
             .record()
-            .key(format!("harness.restored-held.{sid}").as_str()),
+            .key(format!("{KEY_RESTORED_HELD}.{sid}").as_str()),
     )
 }
 
@@ -2873,16 +3116,20 @@ pub(crate) fn supervisor_note(sid: &str, place: &str, text: &str) -> Message {
 /// is asked of them — titled with the mode the session now runs under
 /// (`view`, its effective one), its first line led by the tab it is about
 /// and saying what that mode does, its second whether the mode is the
-/// session's own word (`own`) or the table's default it was handed back to.
-/// Keyed per session: the next one replaces it.
+/// session's own word (`own`) or the table's default it was handed back to,
+/// and, where the change dropped an armed timer (`cancelled`), a third that
+/// says so (`the 18:00 landing time is cancelled`, §10.2.1). Keyed per
+/// session: the next one replaces it.
 pub(crate) fn autopilot_set(
     sid: &str,
     place: &str,
     view: crate::autopilot::AutopilotView,
     own: bool,
+    cancelled: Option<crate::claude_lights::LandAtGlass>,
 ) -> Message {
     use crate::autopilot::AutopilotView;
-    let (title, what) = match view {
+    let agent_off;
+    let (title, what): (&str, &str) = match view {
         AutopilotView::Cruise => (
             "Autopilot set to cruise",
             "the harness keeps the work moving",
@@ -2900,18 +3147,154 @@ pub(crate) fn autopilot_set(
             "Autopilot set, harness off",
             "this aterm has no control socket, so nothing is supervised",
         ),
+        AutopilotView::AgentOff(agent) => {
+            agent_off = format!(
+                "{} in Settings, so the harness supervises nothing here",
+                crate::autopilot::agent_switch_off(agent)
+            );
+            ("Autopilot set, supervision off", agent_off.as_str())
+        }
     };
     let whose = if own {
         "this session's own setting"
     } else {
         "back to the default, [harness] autopilot"
     };
-    Message::new(tags::HARNESS, Severity::Info, title)
+    let message = Message::new(tags::HARNESS, Severity::Info, title)
         .line(atpkg::progress::sanitize_for_tty(
             &tab_led(place, what),
             aterm_messages::DETAIL_LINE_CAP,
         ))
-        .line(whose)
+        .line(whose);
+    match cancelled {
+        Some(at) => message.line(format!(
+            "the {} landing time is cancelled",
+            crate::autopilot_menu::when(at)
+        )),
+        None => message,
+    }
+    .record()
+    .key(format!("harness.autopilot.{sid}").as_str())
+}
+
+/// A TIMED CRUISE SET FROM THE WINDOW (the Autopilot menu, Settings ▸
+/// Harness: `App::set_session_autopilot_timed`;
+/// `docs/DESIGN-harness-autopilot-2026-10-15.md` §9.3): a `harness` RECORD,
+/// keyed per session like [`autopilot_set`], titled with the time it lands
+/// under the glass title rule (`Autopilot cruises until 18:00`; `… until Sat
+/// 16:00` where it falls on another day, §10.2.1), its line led by the tab
+/// and saying what happens at the time.
+pub(crate) fn autopilot_timer_set(
+    sid: &str,
+    place: &str,
+    until: crate::claude_lights::LandAtGlass,
+) -> Message {
+    Message::new(
+        tags::HARNESS,
+        Severity::Info,
+        format!(
+            "Autopilot cruises until {}",
+            crate::autopilot_menu::when(until)
+        ),
+    )
+    .line(atpkg::progress::sanitize_for_tty(
+        &tab_led(
+            place,
+            "the harness keeps the work moving, then wraps it up at that time",
+        ),
+        aterm_messages::DETAIL_LINE_CAP,
+    ))
+    .record()
+    .key(format!("harness.autopilot.{sid}").as_str())
+}
+
+/// What a timed Cruise's fire found the session doing (§10.2.3, item 8):
+/// what [`autopilot_timer_ended`]'s line says follows the word's turn to
+/// land — only work the harness carries is wrapped up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FireOver {
+    /// Work the harness carries: it wraps it up at its next point.
+    Work,
+    /// The agent had said it was finished, at this stamp where it was read.
+    Done(Option<crate::harness_glass::Stamp>),
+    /// A landing had ended the task, at this stamp where it was read.
+    Landed(Option<crate::harness_glass::Stamp>),
+    /// The master switch is off: nothing is supervised.
+    MasterOff,
+    /// This agent's own switch is off.
+    AgentOff(aterm_phase::Program),
+    /// No host: this aterm has no control socket.
+    Unhosted,
+    /// No agent runs in the tab (a shell, an editor).
+    NoAgent,
+}
+
+/// A TIMED CRUISE'S TIME CAME (§9.3.2, §9.3.7): the window's fire stored
+/// `land` (`App::expire_autopilot_timers`). A `harness` RECORD, never a row:
+/// nothing is asked of the person, and the chip already says it. Titled
+/// `Autopilot began landing` (the glass title rule, §10.2.1); its line says
+/// when the word turned and what that does to what the fire found (`over`):
+/// the work wrapped up, or nothing to land — a done or landed task (with its
+/// stamp, its weekday where it is not on `today`), the harness or the
+/// agent's switch off, no host, no agent in the tab. Where the time passed
+/// while aterm, or only the tab, was closed (a restore found it behind), its
+/// line says which instead. `clock` is the time it landed at (`None`: the
+/// zone could not be read). Keyed per session like [`autopilot_set`]: it
+/// replaces the record of the set.
+pub(crate) fn autopilot_timer_ended(
+    sid: &str,
+    place: &str,
+    clock: Option<&str>,
+    passed_while: Option<crate::autopilot_timers::ClosedOver>,
+    over: FireOver,
+    today: i64,
+) -> Message {
+    use crate::autopilot_timers::ClosedOver;
+    let time = clock.map_or_else(
+        || "landing time".to_string(),
+        |c| format!("{c} landing time"),
+    );
+    let what = match passed_while {
+        Some(ClosedOver::Aterm) => {
+            format!("the {time} passed while aterm was closed; land is on")
+        }
+        Some(ClosedOver::Tab) => format!("the {time} passed while the tab was closed; land is on"),
+        None => {
+            let turned = clock.map_or_else(
+                || "the word turned land".to_string(),
+                |c| format!("at {c} the word turned land"),
+            );
+            let at = |stamp: Option<crate::harness_glass::Stamp>| {
+                stamp.map_or_else(String::new, |s| format!(" at {}", s.words(Some(today))))
+            };
+            let then = match over {
+                FireOver::Work => {
+                    "the harness wraps the work up at its next point, then stops".to_string()
+                }
+                FireOver::Done(stamp) => format!("nothing to land, the task was done{}", at(stamp)),
+                FireOver::Landed(stamp) => format!("nothing to land, the task landed{}", at(stamp)),
+                FireOver::MasterOff => {
+                    "the harness is off in Settings, so nothing is landed".to_string()
+                }
+                FireOver::AgentOff(agent) => format!(
+                    "{}, so nothing is landed",
+                    crate::autopilot::agent_switch_off(agent)
+                ),
+                FireOver::Unhosted => {
+                    "this aterm has no control socket, so nothing is landed".to_string()
+                }
+                FireOver::NoAgent => {
+                    "no agent runs in the tab, so there is nothing to land".to_string()
+                }
+            };
+            format!("{turned}; {then}")
+        }
+    };
+    Message::new(tags::HARNESS, Severity::Info, "Autopilot began landing")
+        .line(atpkg::progress::sanitize_for_tty(
+            &tab_led(place, &what),
+            aterm_messages::DETAIL_LINE_CAP,
+        ))
         .record()
         .key(format!("harness.autopilot.{sid}").as_str())
 }
@@ -3009,11 +3392,10 @@ pub(crate) fn agent_upgrade_waiting(product: &str, waiting: &[&str]) -> Option<M
 /// has typed there for 20 seconds` (its Land rung,
 /// [`aterm_agent::harness::upgrade_drive::Row::lands_by`], on the person's
 /// clock; `from two hours behind` where the local clock's offset is
-/// unknown); where a floor stands — a draft, a dialog, a goal or a turn of
-/// this tab's in its Codex daemon, a turn in another session there, the
-/// shell integration — what it is and when it moves, never the pause in the
-/// person's typing (the review of 2026-09-28: it promised that of a goal
-/// that held the tab). A clock time, not a countdown: said once, it stays
+/// unknown); where a floor stands — a draft, a dialog, the agent's own work
+/// — what it is and when it moves, never the pause in the person's typing
+/// (the review of 2026-09-28: it promised that of a floor that held the
+/// tab). A clock time, not a countdown: said once, it stays
 /// true. Then the tab and the move. No tab mark and no warning: the upgrade
 /// is working (rulings 275 and 283, amended by ruling 380). `place` names the
 /// tab (`in tab 1`); the title drops it where it would break the title rule,
@@ -3055,8 +3437,7 @@ pub(crate) fn agent_upgrade_waiting_in(
 
 /// THE LIVE AGENT UPGRADE, STALLED: a ROW, because only the person can move it
 /// — it was refused, stopped the same way round after round, runs where
-/// typing into the tab cannot reach, waits on what no rung of the ladder
-/// passes (`blocked:*`), or has stood four hours on the ladder's last rung
+/// typing into the tab cannot reach, or has stood four hours on the ladder's last rung
 /// with no pause (`overdue`, six hours behind:
 /// [`aterm_agent::harness::upgrade_drive::Row::stall`]). One that will ask
 /// again on its own — still asking, or resting after a round that gave up or
@@ -3075,11 +3456,10 @@ pub(crate) fn agent_upgrade_waiting_in(
 /// THE REMEDY IS THE ONE THAT WORKS FOR THIS KIND OF STALL (review of
 /// 2026-09-25: it named `--now` for every kind, and `--now` moves only two).
 /// Overdue: it has stood on the ladder's last rung for hours, which `--now`
-/// is too (ruling 380), so what it waits on is named — a turn running (a
-/// goal that never pauses), the READY answer, a draft, a box, a hold, work
+/// is too (ruling 380), so what it waits on is named — a turn running, the
+/// READY answer, a draft, a box, a hold, work
 /// under the agent — and `--now` is offered only where it still moves it
-/// (its own text left typed, a full queue). Blocked (`blocked:*`): no rung
-/// passes it — quit it in its tab and resume it there. Gave up: `--now` asks it
+/// (its own text left typed, a full queue). Gave up: `--now` asks it
 /// again (at once, where its own next round is at a clock time). Held back in
 /// a pane: typing into the tab cannot reach it, so no word moves it — quit it
 /// in its pane and resume it there, or `--skip`. Refused or failed: the
@@ -3088,9 +3468,7 @@ pub(crate) fn agent_upgrade_waiting_in(
 /// agent it ended was seen gone, nothing runs to quit — `codex resume`, or
 /// `claude --resume <conversation>`, in the tab takes it back. Under way and
 /// not moving (`stuck:*`, 2026-09-27): no word moves it and nothing is
-/// forced — the row offers none and names `--status`. (None says "restart":
-/// the reporters' restart guard,
-/// `no_reporter_wording_prompts_a_restart`, reads every line.)
+/// forced — the row offers none and names `--status`. (None says "restart".)
 pub(crate) fn agent_upgrade_stalled(
     row: &aterm_agent::harness::upgrade_drive::Row,
     now: u64,
@@ -3099,66 +3477,6 @@ pub(crate) fn agent_upgrade_stalled(
     use aterm_agent::harness::upgrade_drive::Remedy;
     use aterm_messages::UpgradeWord;
     let clean = |s: &str| atpkg::progress::sanitize_for_tty(s, 64);
-    // A CODEX GOAL THE MOVE PAUSED AND HAS NOT RESUMED (the owner's decision
-    // of 2026-09-28: aterm pauses a goal only for a moment, and never leaves
-    // it paused): a row of its own, whatever became of the move, with the one
-    // hand step. No word of the upgrade's moves it. Worded as the wait it is
-    // — aterm still resumes it where it can — never as a failure, and never
-    // raised while aterm itself holds it as it should (`Row::with_goal`: a
-    // switch open, the paused goal's last turn running; the goal-pause review
-    // of 2026-09-28). One LEFT PAUSED ON PURPOSE — its thread fell into a
-    // sandbox — names the relaunch that brings it out.
-    let goal_row = row.stall(now);
-    if matches!(goal_row.as_deref(), Some("goal-paused" | "goal-sandboxed")) {
-        let tab = clean(&row.tab);
-        let (title, why, step) = if goal_row.as_deref() == Some("goal-sandboxed") {
-            (
-                "Codex goal left paused",
-                "aterm paused this tab's Codex goal to install the new Codex, and leaves it \
-                 paused: its thread fell into a sandbox, where it can neither commit nor push",
-                "quit Codex in the tab, resume the thread with its launch flags (codex resume \
-                 --dangerously-bypass-approvals-and-sandbox <thread>), then type /goal resume",
-            )
-        } else {
-            (
-                "Codex goal still paused",
-                "aterm paused this tab's Codex goal for a moment to install the new Codex, and \
-                 has not been able to resume it yet",
-                "type /goal resume in the tab to go on with the goal now",
-            )
-        };
-        let (reason, hand) = if goal_row.as_deref() == Some("goal-sandboxed") {
-            (
-                "its thread fell into a sandbox, where it cannot commit or push",
-                "Quit Codex in the tab and resume the thread with its launch flags",
-            )
-        } else {
-            (
-                "it could not resume the goal",
-                "Type /goal resume in the tab",
-            )
-        };
-        return Message::new(
-            tags::HARNESS,
-            Severity::Warn,
-            placed_title(title, place, ""),
-        )
-        .line(why)
-        .line(step)
-        .line(format!("{place} \u{00b7} {}", clean(&row.move_words())))
-        .line(String::new())
-        .line(format!(
-            "the same in any shell: `aterm harness upgrade {tab} --status`"
-        ))
-        .now(Ask::standing(
-            StandingWhy::Spent {
-                tried: Reason::new("paused this tab's Codex goal to install the new Codex"),
-                reason: Reason::new(reason),
-            },
-            Then::step(hand),
-        ))
-        .key(&agent_upgrade_key(&row.tab));
-    }
     // THE ONE ROW THAT STANDS (owner rules, 2026-09-28: "there needs to be
     // some clear reason why the user must be engaged and what the user should
     // do … don't continue to persist alerts to the user that are not
@@ -3266,42 +3584,6 @@ pub(crate) fn agent_upgrade_stalled(
         Some(Remedy::Now) | None => (
             format!("{now_word} tries it again at its next pause; {skip}"),
             "--now` or `--skip",
-        ),
-        // A TURN OF THIS TAB'S OWN running in its Codex daemon, hours past
-        // the ladder's last rung: a goal that never pauses (2026-09-28).
-        // Nothing ends that turn for the upgrade. Only where the kernel named
-        // the conversation as this tab's (`goal`, `daemon-turn`: its root's
-        // turn or a subagent's it spawned) is the owner told to pause
-        // anything here — never for a turn aterm could not place
-        // (`daemon-busy`: another tab's goal, or a subagent of this tab's own
-        // it could not name; the reviews of 2026-09-28).
-        // A goal still running hours past the Land rung. Under `upgrade_ask
-        // = true` (the ask flow: not `Row::quiet`) aterm pauses it there for
-        // a moment, so something kept the pause off (an open save-then-wait
-        // switch, a rest after a move that did not come, a person's hand);
-        // under the default quiet flow no pause is made, and the goal holds
-        // the move for as long as it runs.
-        Some(Remedy::Waits) if row.wait == "goal" || row.wait.starts_with("goal:") => (
-            if !row.quiet {
-                format!(
-                    "aterm pauses the goal for a moment to move it once nothing else holds the \
-                     tab, and resumes it after; pausing it in this tab moves it now; {skip}"
-                )
-            } else {
-                format!("it moves once the goal stops: `/goal pause` in this tab stops it; {skip}")
-            },
-            "--skip",
-        ),
-        Some(Remedy::Waits) if row.wait == "daemon-turn" => (
-            format!("it moves as soon as this tab's turn is over; {skip}"),
-            "--skip",
-        ),
-        Some(Remedy::Waits) if row.wait == "daemon-busy" => (
-            format!(
-                "it moves once that turn is over, or once aterm can tell it runs in another tab \
-                 (`codex agents` lists the sessions); {skip}"
-            ),
-            "--skip",
         ),
         // The agent's own work is never ended for it. The move comes once that
         // work ends, or once the agent stops it. After a notice, the agent is
@@ -3460,30 +3742,6 @@ pub(crate) fn agent_upgrade_stalled(
         // Never `the harness` (day five, D24): the upgrade asks again, at
         // the clock time its next round starts — the repeating stop's too
         // (D25), or now while its re-armed round is asking.
-        // A WAIT NO RUNG PASSES AND NO PAUSE ENDS (`blocked:*`, the owner's
-        // decision of 2026-09-28: a warning only where something is really
-        // broken): the one way it moves.
-        Some(Remedy::ByHand)
-            if row.stall(now).as_deref() == Some("blocked:no-shell-integration") =>
-        {
-            (
-                format!(
-                    "to move it now, quit Codex in its tab and resume it with the `codex resume` \
-                     line it prints; {skip}"
-                ),
-                "--skip",
-            )
-        }
-        Some(Remedy::ByHand)
-            if row
-                .stall(now)
-                .is_some_and(|stall| stall.starts_with("blocked:")) =>
-        {
-            (
-                format!("to move it now, quit it in its tab and resume it there; {skip}"),
-                "--skip",
-            )
-        }
         Some(Remedy::ByHand) => {
             let when = next_round_clock(row, now).map_or_else(
                 || {
@@ -3513,20 +3771,33 @@ pub(crate) fn agent_upgrade_stalled(
             )
         }
         Some(Remedy::ResumeInTab) => (
-            format!(
-                "it no longer runs in the tab and aterm will not bring it back: `{}` there \
-                 takes its conversation back, or {} keeps this row down",
-                match row.agent {
-                    aterm_agent::harness::upgrade::Agent::Codex => "codex resume".to_string(),
-                    // A Claude Code move stopped after its SIGTERM (S1 of the
-                    // in-flight review, 2026-09-27): its conversation, by id.
-                    aterm_agent::harness::upgrade::Agent::Claude if !row.session.is_empty() => {
-                        format!("claude --resume {}", clean(&row.session))
-                    }
-                    aterm_agent::harness::upgrade::Agent::Claude => "claude --resume".to_string(),
-                },
-                UpgradeWord::Skip.label()
-            ),
+            match match row.agent {
+                aterm_agent::harness::upgrade::Agent::Codex => Some("codex resume".to_string()),
+                // A Claude Code move stopped after its SIGTERM (S1 of the
+                // in-flight review, 2026-09-27): its conversation, by id.
+                aterm_agent::harness::upgrade::Agent::Claude if !row.session.is_empty() => {
+                    Some(format!("claude --resume {}", clean(&row.session)))
+                }
+                aterm_agent::harness::upgrade::Agent::Claude => Some("claude --resume".to_string()),
+                // Muse Code: no upgrade row of its exists (relaunch on exit
+                // only), so none is read here. No lane yet (agy, Gemini CLI):
+                // no row of theirs is read, and no command is told, never
+                // Claude Code's.
+                aterm_agent::harness::upgrade::Agent::Muse
+                | aterm_agent::harness::upgrade::Agent::Agy
+                | aterm_agent::harness::upgrade::Agent::Gemini => None,
+            } {
+                Some(command) => format!(
+                    "it no longer runs in the tab and aterm will not bring it back: `{command}` \
+                     there takes its conversation back, or {} keeps this row down",
+                    UpgradeWord::Skip.label()
+                ),
+                None => format!(
+                    "it no longer runs in the tab and aterm will not bring it back; {} keeps \
+                     this row down",
+                    UpgradeWord::Skip.label()
+                ),
+            },
             "--skip",
         ),
     };
@@ -3848,382 +4119,12 @@ pub(crate) fn agent_upgrade_key(tab: &str) -> String {
     )
 }
 
-/// The key AN AGENT'S ONE ROW for its stalled tabs is posted under
-/// ([`agent_upgrade_stalled_group`]): `harness.upgrades.claude`,
-/// `harness.upgrades.codex`. Never a tab's key: [`agent_upgrade_key_tab`] reads
-/// `None` for it, so the per-tab sweeps leave it alone.
-pub(crate) fn agent_upgrade_group_key(agent: aterm_agent::harness::upgrade::Agent) -> String {
-    format!("{KEY_AGENT_UPGRADE}s.{}", agent.program().name())
-}
-
-/// Whether `key` is an agent's one row for its stalled tabs
-/// ([`agent_upgrade_group_key`]).
-pub(crate) fn agent_upgrade_group_key_is(key: &str) -> bool {
-    key.strip_prefix(KEY_AGENT_UPGRADE)
-        .and_then(|rest| rest.strip_prefix("s."))
-        .and_then(aterm_agent::harness::upgrade::Agent::parse)
-        .is_some_and(|agent| agent_upgrade_group_key(agent) == key)
-}
-
-/// The STALLS an agent's one row named, read back from its detail's shell
-/// line ([`agent_upgrade_stalled_group`]: `… — tabs s-aaa, s-bbb (to
-/// 2.1.284)`, [`group_tabs_list`]) and the lines that carry its list on
-/// (`also — tabs …`): each tab (`s-<hex>`) and the build it was stalled on
-/// its way to — the build said after it on its line. What the window reads a
-/// row the owner saw through by, after a restart and in this process alike,
-/// so the same stalls are not posted again — and what keeps a tab in its
-/// agent's row across a restart. A tab with no build said after it on its
-/// line is read with none, which no stall matches. The list earlier builds
-/// wrote, each stall as its comparison key (`s-aaa@2.1.284`,
-/// [`agent_upgrade_group_member`]), reads back the same. Empty for a detail
-/// that names none. Every line's list is read (round 44: from six tabs the
-/// one line passed the line cap, and the sixth stall was clipped away).
-pub(crate) fn agent_upgrade_group_members(detail: &[String]) -> Vec<(String, String)> {
-    let mut stalls: Vec<(String, String)> = Vec::new();
-    for (_, tabs) in detail
-        .iter()
-        .filter_map(|line| line.rsplit_once(GROUP_TABS))
-    {
-        // The tabs named bare on this line so far: each takes the build said
-        // after it.
-        let mut bare = 0;
-        for t in tabs.split(", ").filter(|t| t.starts_with("s-")) {
-            if let Some((tab, to)) = t.split_once(" (to ") {
-                let to = to.strip_suffix(')').unwrap_or(to);
-                let from = stalls.len() - bare;
-                for stall in &mut stalls[from..] {
-                    stall.1 = to.to_string();
-                }
-                stalls.push((tab.to_string(), to.to_string()));
-                bare = 0;
-            } else if let Some((tab, to)) = t.split_once('@') {
-                stalls.push((tab.to_string(), to.to_string()));
-                bare = 0;
-            } else {
-                stalls.push((t.to_string(), String::new()));
-                bare += 1;
-            }
-        }
-    }
-    stalls
-}
-
-/// One stall of an agent's one row as the window COMPARES it
-/// ([`agent_upgrade_group_members`] read back, a row's stalls):
-/// `s-aaa@2.1.284`. Never shown: pasted into `aterm harness upgrade <tab>`
-/// it names no tab ([`group_tabs_list`] is what the row shows).
-pub(crate) fn agent_upgrade_group_member(tab: &str, to: &str) -> String {
-    format!(
-        "{}@{}",
-        atpkg::progress::sanitize_for_tty(tab, 64),
-        atpkg::progress::sanitize_for_tty(to, 32)
-    )
-}
-
-/// What opens the list of stalls on an agent's one row's last line.
-const GROUP_TABS: &str = " \u{2014} tabs ";
-
-/// A stall as an agent's one row lists it ([`group_tabs_list`]): the tab's
-/// id and the build it is stalled on its way to, each made safe to show.
-fn group_stall(row: &aterm_agent::harness::upgrade_drive::Row) -> (String, String) {
-    (
-        atpkg::progress::sanitize_for_tty(&row.tab, 64),
-        atpkg::progress::sanitize_for_tty(&row.to, 32),
-    )
-}
-
-/// Stalls as an agent's one row's shell line lists them: each tab's id as
-/// `aterm harness upgrade <tab>` takes it, and after the last of each run of
-/// tabs bound for one build, that build — `s-aaa, s-bbb (to 2.1.284)`. Until
-/// 2026-09-30 each was its comparison key, `s-aaa@2.1.284`, which pasted
-/// into the command beside it named no tab. A tab bound for no build is
-/// named bare, and must come after every tab that has one on its line
-/// ([`agent_upgrade_group_members`] gives a bare tab the next build said).
-fn group_tabs_list(stalls: &[(String, String)]) -> String {
-    let mut list = String::new();
-    for (i, (tab, to)) in stalls.iter().enumerate() {
-        if i > 0 {
-            list.push_str(", ");
-        }
-        list.push_str(tab);
-        let run_ends = stalls.get(i + 1).is_none_or(|(_, next)| next != to);
-        if run_ends && !to.is_empty() {
-            list.push_str(&format!(" (to {to})"));
-        }
-    }
-    list
-}
-
-/// How many of an agent's stalled tabs its one row names a line each: the
-/// rest are counted, and `--status` lists them (the detail holds
-/// `DETAIL_LINES_CAP` lines).
-const GROUP_TABS_NAMED: usize = 12;
-
-/// THE ONE ROW FOR AN AGENT'S STALLED TABS (2026-09-28, the owner: "also fix
-/// this stacking failures of claude upgrades!" — three stalled tabs were three
-/// rows, the band's whole height, each "Couldn't upgrade Claude yet" with its
-/// own buttons). `members`: each stalled tab's row and its place (`in window
-/// 2, tab 1`), any order.
-///
-/// ONE TAB reads as its own row does ([`agent_upgrade_stalled`]), under this
-/// key, its buttons the row's own word for that tab and its shell line naming
-/// the stall it stands for. SEVERAL: the title counts them, in the most
-/// serious of their words — one that could not be done over one that could
-/// not be done yet (`Couldn't upgrade Claude in 3 tabs`, `… in 3 tabs yet`;
-/// never `… upgrade waits in 3 tabs`, ruling 380); the first
-/// line names the tabs, most behind first (`window 2, tab 1 for 26 h · window
-/// 1, tab 2 for 7 h`), the second what the row's own buttons do, and behind
-/// them each tab's own words — its place and move, why it stands, what holds
-/// it — and the shell spelling with every stall, each tab's id and its target
-/// ([`agent_upgrade_group_members`] reads them back). Each button is the word
-/// for exactly the listed tabs that take it ([`Intent::AgentUpgradeTabs`]); a
-/// tab's own menu has its own words.
-pub(crate) fn agent_upgrade_stalled_group(
-    members: &[(&aterm_agent::harness::upgrade_drive::Row, String)],
-    now: u64,
-) -> Option<Message> {
-    use aterm_agent::harness::upgrade_drive::Remedy;
-    use aterm_messages::UpgradeWord;
-    let (first, _) = members.first()?;
-    let agent = first.agent;
-    let key = agent_upgrade_group_key(agent);
-    // ONE TAB LEFT reads as its own row, under the agent's key, with two
-    // differences a person never reads (the review of 2026-09-28): its
-    // buttons are the row's own word for that one tab (so a press answers
-    // THIS row, never a tab's record behind it), and its shell line ends with
-    // the stall it stands for (so the row is read back as the agent's after a
-    // restart, never posted again as the tab's own).
-    if let [(row, place)] = members {
-        let mut msg = agent_upgrade_stalled(row, now, place);
-        msg.key = Some(key);
-        msg.actions = msg
-            .actions
-            .iter()
-            .map(|intent| match intent {
-                Intent::AgentUpgrade { tab, to, word } => Intent::AgentUpgradeTabs {
-                    word: *word,
-                    moves: vec![(tab.clone(), to.clone())],
-                },
-                other => other.clone(),
-            })
-            .collect();
-        if let Some(shell) = msg.detail.last_mut() {
-            shell.push_str(GROUP_TABS);
-            shell.push_str(&group_tabs_list(&[group_stall(row)]));
-        }
-        return Some(msg);
-    }
-    let clean = |s: &str| atpkg::progress::sanitize_for_tty(s, 64);
-    let who = agent_word(agent);
-    let n = members.len();
-    let mut sorted: Vec<&(&aterm_agent::harness::upgrade_drive::Row, String)> =
-        members.iter().collect();
-    sorted.sort_by_key(|(row, place)| (row.behind_since, place.clone()));
-    // The most serious of their words: `yet` only where every tab's own row
-    // says it ([`agent_upgrade_stalled`]: a move `Upgrade now` takes, or one
-    // that waits) — a round that gave up (`AskAgain`) could not be done, and
-    // its tab's own row says so (round 44). (No remedy — no stall at all —
-    // never stands in the row; it reads as the mildest.)
-    let tier = |row: &aterm_agent::harness::upgrade_drive::Row| match row.remedy(now) {
-        Some(Remedy::Now) | None => 0,
-        Some(Remedy::Waits) => 1,
-        Some(Remedy::AskAgain | Remedy::InItsPane | Remedy::ByHand | Remedy::ResumeInTab) => 2,
-    };
-    let title = match sorted.iter().map(|(row, _)| tier(row)).max().unwrap_or(0) {
-        // Never `… upgrade waits in N tabs` (ruling 380, the owner's words
-        // of 2026-09-28: "What is this alert about 'Codex upgrade waits in
-        // tab 1'???"): a row stands only once the ladder's last rung has
-        // stood for hours, and then it could not be done yet — each tab's
-        // own row's words ([`agent_upgrade_stalled`]).
-        0 | 1 => format!("Couldn't upgrade {who} in {n} tabs yet"),
-        _ => format!("Couldn't upgrade {who} in {n} tabs"),
-    };
-    let bare = |place: &str| place.strip_prefix("in ").unwrap_or(place).to_string();
-    let named = sorted
-        .iter()
-        .map(|(row, place)| match row.behind_for(now) {
-            Some(b) => format!("{} for {b}", bare(place)),
-            None => bare(place),
-        })
-        .collect::<Vec<_>>()
-        .join(" \u{00b7} ");
-    // Each button, for exactly the listed tabs that take its word.
-    let takes = |word: UpgradeWord| -> Vec<(String, String)> {
-        sorted
-            .iter()
-            .filter(|(row, _)| agent_upgrade_words(row, now).contains(&word))
-            .map(|(row, _)| (row.tab.clone(), row.to.clone()))
-            .collect()
-    };
-    let words: Vec<(UpgradeWord, Vec<(String, String)>)> = UpgradeWord::ALL
-        .into_iter()
-        .map(|word| (word, takes(word)))
-        .filter(|(_, moves)| !moves.is_empty())
-        .take(2)
-        .collect();
-    // What those buttons do, in the row's own words (ruling 288). Some of
-    // the listed tabs, by count — two are `both`, never `all 2` (round 35,
-    // D4) — or one by its place.
-    let which = |tabs: &[&aterm_agent::harness::upgrade_drive::Row]| match tabs {
-        [row] => sorted
-            .iter()
-            .find(|(listed, _)| listed.tab == row.tab)
-            .map_or_else(|| "one".to_string(), |(_, place)| bare(place)),
-        _ if tabs.len() == n && n == 2 => "both".to_string(),
-        _ if tabs.len() == n => format!("all {n}"),
-        _ => format!("{} of them", tabs.len()),
-    };
-    let mut does: Vec<String> = Vec::new();
-    for (word, moves) in &words {
-        let taking: Vec<&aterm_agent::harness::upgrade_drive::Row> = sorted
-            .iter()
-            .map(|(row, _)| *row)
-            .filter(|row| moves.iter().any(|(tab, _)| *tab == row.tab))
-            .collect();
-        let k = taking.len();
-        // The tabs `Upgrade now` cannot move, in number.
-        let rest = match n - k {
-            0 => String::new(),
-            1 => "; the other one moves once what holds it ends".to_string(),
-            m => format!("; the other {m} move once what holds them ends"),
-        };
-        does.push(match word {
-            // At their next PAUSES, as each tab's own row says it (ruling
-            // 380: never "at its next turn end" — a goal-mode Codex's turns
-            // never end) — but a tab the word only asks once more is said so
-            // ([`upgrade_now_asks_again`]), as its own row and the answer to
-            // the press say it: `moves both at their next pauses` was false of it.
-            UpgradeWord::Now => {
-                let (asked, moved): (Vec<_>, Vec<_>) = taking
-                    .iter()
-                    .copied()
-                    .partition(|row| upgrade_now_asks_again(row));
-                let at = |k: usize| {
-                    if k == 1 {
-                        "its next pause"
-                    } else {
-                        "their next pauses"
-                    }
-                };
-                let did = if asked.is_empty() {
-                    format!("moves {} at {}", which(&moved), at(moved.len()))
-                } else if moved.is_empty() {
-                    format!("asks {} once more", which(&asked))
-                } else {
-                    format!(
-                        "moves {} at {} and asks {} once more",
-                        which(&moved),
-                        at(moved.len()),
-                        which(&asked)
-                    )
-                };
-                format!("{} {did}{rest}", word.label())
-            }
-            UpgradeWord::NotToday => {
-                format!(
-                    "{} puts {} off until tomorrow",
-                    word.label(),
-                    which(&taking)
-                )
-            }
-            UpgradeWord::Skip => {
-                format!("{} keeps {} where they are", word.label(), which(&taking))
-            }
-        });
-    }
-    does.push("for one tab alone, use its tab's menu".to_string());
-    // A RECORD: the tabs it would name are each their own record (a group row
-    // was the standing claim on the owner that nobody could act on, ruling 363),
-    // and nothing posts it any more (`no_tab_joins_an_agents_group_row`). Said
-    // on the constructor: nothing below touches the hold or the class.
-    let mut msg = Message::new(tags::HARNESS, Severity::Warn, title)
-        .record()
-        .line(atpkg::progress::sanitize_for_tty(&named, 160))
-        .line(does.join("; "));
-    for (row, place) in sorted.iter().take(GROUP_TABS_NAMED) {
-        let why = row
-            .stall_words(now)
-            .unwrap_or_else(|| "it is not moving".to_string())
-            .replace('`', "");
-        let held = row
-            .held_words(now)
-            .map_or_else(String::new, |w| format!("; held by {w}"));
-        msg = msg.line(atpkg::progress::sanitize_for_tty(
-            &format!(
-                "{} \u{00b7} {}: {why}{held}",
-                bare(place),
-                clean(&row.move_words())
-            ),
-            aterm_messages::DETAIL_LINE_CAP,
-        ));
-    }
-    if n > GROUP_TABS_NAMED {
-        msg = msg.line(format!(
-            "and {} more \u{2014} `aterm harness upgrade --status` lists them",
-            n - GROUP_TABS_NAMED
-        ));
-    }
-    // Every stall, each tab's id and its target, on as many lines as the
-    // line cap needs (round 44: one line clipped the sixth tab's away, and a
-    // row the owner put down came back after a restart). `--now` only for
-    // the tabs that take it, as the buttons (and each tab's own row) offer
-    // it: a row of tabs no word moves past their waits named it all the
-    // same, and one where only some take it offered it for every tab listed.
-    let now_tabs: Vec<String> = words
-        .iter()
-        .filter(|(word, _)| *word == UpgradeWord::Now)
-        .flat_map(|(_, moves)| {
-            moves
-                .iter()
-                .map(|(tab, _)| atpkg::progress::sanitize_for_tty(tab, 64))
-        })
-        .collect();
-    let shell = if now_tabs.len() == n {
-        "--now` or `--skip"
-    } else {
-        "--skip"
-    };
-    // Each build said once a line: the tabs bound for one build together
-    // (most behind first among them), and a tab bound for none last.
-    let mut stalls: Vec<(String, String)> =
-        sorted.iter().map(|(row, _)| group_stall(row)).collect();
-    stalls.sort_by_key(|(_, to)| (to.is_empty(), to.clone()));
-    let mut head =
-        format!("the same in any shell: `aterm harness upgrade <tab> {shell}`{GROUP_TABS}");
-    let mut on_line: Vec<(String, String)> = Vec::new();
-    for stall in stalls {
-        on_line.push(stall);
-        if on_line.len() > 1
-            && head.chars().count() + group_tabs_list(&on_line).chars().count()
-                > aterm_messages::DETAIL_LINE_CAP
-        {
-            let next = on_line.pop().expect("just pushed");
-            msg = msg.line(format!("{head}{}", group_tabs_list(&on_line)));
-            head = format!("also{GROUP_TABS}");
-            on_line = vec![next];
-        }
-    }
-    msg = msg.line(format!("{head}{}", group_tabs_list(&on_line)));
-    // Never with the list's marker: only the list is read back.
-    if !now_tabs.is_empty() && now_tabs.len() < n {
-        msg = msg.sentence(format!(
-            "`aterm harness upgrade <tab> --now` only for {}",
-            now_tabs.join(", ")
-        ));
-    }
-    for (word, moves) in words {
-        msg = msg.action(Intent::AgentUpgradeTabs { word, moves });
-    }
-    Some(msg.key(&key))
-}
-
 /// [`agent_upgrade_stalled`] where its tab is — and THE ROW THAT STANDS TAKES
 /// THE OWNER TO ITS TAB (ruling 440). An upgrade's interrupt
 /// ([`aterm_agent::harness::upgrade_drive::Row::interrupt`]: the agent it
-/// ended, a shutdown that hung, a relaunch that reached no prompt, a goal left
-/// paused) asks for a hand IN that tab, and with more than one window its
-/// words name a window (`in window 2, tab 1`) that no chrome but the
-/// connection map numbers. Where the tab was found it offers `Show tab N`
+/// ended, a shutdown that hung, a relaunch that reached no prompt) asks for
+/// a hand IN that tab, and with more than one window its words name a window
+/// (`in window 2, tab 1`) that no chrome but the connection map numbers. Where the tab was found it offers `Show tab N`
 /// ([`UpgradeSpot::nav`]), as the digest's lines do ([`upgrade_exceptions`]).
 /// Every other entry is a record or an answer, and keeps what
 /// [`agent_upgrade_stalled`] gives it.
@@ -4260,11 +4161,11 @@ type ExceptionGroup<'a> = Vec<(
 /// The kinds of digest need whose action is the same in every tab, so ONE entry
 /// names every tab that has it (the owner files it once, never a line per tab).
 /// Every other kind's action is done in one tab, and is that tab's entry.
-const PER_KIND: [&str; 3] = ["own-work", "typed-draft", "daemon-busy"];
+const PER_KIND: [&str; 2] = ["own-work", "typed-draft"];
 
 /// The digest kinds whose dismissal is the owner's own CHOICE (a launch they
 /// made, a terminal they run it in): a filing holds 30 days, not 7.
-const CHOICE_KINDS: [&str; 3] = ["no-terminal", "refused-launch", "no-integration"];
+const CHOICE_KINDS: [&str; 2] = ["no-terminal", "refused-launch"];
 
 /// THE UPGRADE'S PART OF THE EXCEPTIONS DIGEST (owner rules, 2026-09-28: "there
 /// needs to be some clear reason why the user must be engaged and what the user
@@ -4273,7 +4174,7 @@ const CHOICE_KINDS: [&str; 3] = ["no-terminal", "refused-launch", "no-integratio
 /// calls a `Digest` becomes an [`Entry`] of [`Family::Upgrade`], keyed by the
 /// KIND of the wait and — where the action is done in one tab — that tab:
 ///
-/// * `own-work`, `typed-draft`, `daemon-busy`: ONE entry per kind, naming every
+/// * `own-work`, `typed-draft`: ONE entry per kind, naming every
 ///   tab that has it (`Claude in 3 tabs is behind`); five tabs waiting on their
 ///   own work are one line, filed once.
 /// * the rest: one entry per tab (`harness.upgrade.<tab>.suspended`).
@@ -4389,7 +4290,6 @@ fn upgrade_exception_what(kind: &str, group: &ExceptionGroup<'_>) -> String {
             format!("A draft holds {who}, {bare}"),
         ],
         ("typed-draft", _) => vec![format!("Drafts hold {who} in {n} tabs")],
-        ("daemon-busy", _) => vec!["A Codex thread holds the daemon".to_string()],
         ("suspended", _) => vec![
             format!("{who} {place} is suspended"),
             format!("{who} is suspended, {bare}"),
@@ -4405,14 +4305,6 @@ fn upgrade_exception_what(kind: &str, group: &ExceptionGroup<'_>) -> String {
         ("repeating-stop", _) => vec![
             format!("The upgrade keeps stopping {place}"),
             format!("The upgrade keeps stopping, {bare}"),
-        ],
-        ("other-client", _) => vec![
-            format!("Another Codex holds Codex {place}"),
-            format!("Another Codex holds Codex, {bare}"),
-        ],
-        ("no-integration", _) => vec![
-            format!("Codex {place} lacks shell integration"),
-            format!("Codex lacks shell integration, {bare}"),
         ],
         _ => vec![format!("{who} {place} is behind")],
     };
@@ -4655,6 +4547,53 @@ pub(crate) fn disk_low_entry(free_gib: u64, floor_gib: u64, hogs: &[String]) -> 
     ))
 }
 
+/// The key of the session journal's paused line ([`session_journal_paused_entry`]).
+pub(crate) const SESSION_JOURNAL_PAUSED_KEY: &str = "disk.session-journal-paused";
+
+/// The session journal (`[session_log] journal`, phase 2B) is paused because
+/// `why` (the disk is full, or failed a write) and retries on its own: a fact
+/// for later, cleared at its first good write. No shell is touched; what
+/// sessions do meanwhile reads later as a counted gap.
+pub(crate) fn session_journal_paused_entry(why: &str) -> Entry {
+    Entry::new(
+        Family::Disk,
+        "",
+        "session-journal-paused",
+        "The session journal is paused",
+        Why::OnlyYou(Reason::new(
+            "only you can free space on the volume; until then what sessions do is counted, \
+             not written",
+        )),
+        Then::step("Free up space on the home volume"),
+    )
+    .severity(Severity::Warn)
+    .resurface(Resurface::WAIT)
+    .more(format!("It paused because {why}"))
+    .log_line(format!("session-journal paused: {why}"))
+}
+
+/// The session journal stopped for this run because `why` (its folder or a
+/// file refused, a filesystem without file locks, the disk failing, its
+/// writer's fault): sessions run on, and the next launch tries again.
+pub(crate) fn session_journal_stopped_entry(why: &str) -> Entry {
+    Entry::new(
+        Family::Disk,
+        "",
+        "session-journal-stopped",
+        "The session journal stopped",
+        Why::OnlyYou(Reason::new(
+            "sessions run on; log and brief answer for this run's sessions from memory",
+        )),
+        Then::step("Check the session-log folder in the logs folder"),
+    )
+    .severity(Severity::Warn)
+    .resurface(Resurface::WAIT)
+    .more(format!(
+        "It stopped because {why}; the next launch starts it again"
+    ))
+    .log_line(format!("session-journal stopped: {why}"))
+}
+
 /// The key of the low-disk line a volume short while cleanup is off by fault
 /// opens ([`disk_low_cleanup_off_entry`]). It is not [`DISK_LOW_KEY`]: this
 /// line also ends when the settings read again, and the window can tell an
@@ -4703,6 +4642,68 @@ pub(crate) fn disk_low_cleanup_off_entry(free_gib: u64, floor_gib: u64) -> Entry
     .log_line(format!(
         "disk-low-cleanup-off free_gib={free_gib} floor_gib={floor_gib}"
     ))
+}
+
+/// A FACT FOR LATER: a pass of the disk watch freed `bytes` below the floor
+/// (`went`: the largest of what went, biggest first; the first two shown).
+/// Nothing is asked now — the build caches it removed are rebuilt by the next
+/// build — but what was removed is the owner's to know, and `aterm harness
+/// disk` and the ledger say the rest.
+pub(crate) fn disk_freed_entry(bytes: u64, went: &[String]) -> Entry {
+    let freed = aterm_agent::harness::disk::human_bytes(bytes);
+    let mut entry = Entry::new(
+        Family::Disk,
+        "",
+        "freed",
+        "aterm freed disk space",
+        Why::Spent {
+            tried: Reason::new(format!("freed {freed} of rebuildable build caches")),
+            reason: Reason::new("the home volume ran short; the next build rebuilds them"),
+        },
+        Then::step("Read aterm harness disk for what went and what is left"),
+    )
+    .severity(Severity::Info)
+    .resurface(Resurface::WAIT);
+    for w in went.iter().take(2) {
+        entry = entry.more(format!("Went: {w}"));
+    }
+    entry.log_line(format!("disk-freed bytes={bytes} rows={}", went.len()))
+}
+
+/// The key of the disk-full alert ([`disk_full`]).
+pub(crate) const DISK_FULL_KEY: &str = "system.disk.full";
+
+/// THE DISK IS FULL AND ATERM CAN FREE NOTHING MORE SAFELY — the one disk
+/// alert on the glass: writes are failing or about to (agents' tool calls,
+/// their transcripts), aterm already took what it may (`freed` this
+/// episode), and only the owner can free the rest. One action changes the
+/// outcome, so it stands ([`Ask::standing`]) until the volume is out of its
+/// emergency. `hogs` say where the space is and what frees each.
+pub(crate) fn disk_full(
+    free: u64,
+    volume: &std::path::Path,
+    freed: u64,
+    hogs: &[String],
+    why: &str,
+) -> Message {
+    let human = aterm_agent::harness::disk::human_bytes;
+    Message::new(tags::SYSTEM, Severity::Error, "Disk full")
+        .line(format!(
+            "{} left on {}; aterm freed {} and can free nothing more safely",
+            human(free),
+            volume.display(),
+            human(freed)
+        ))
+        .line(why)
+        .lines(hogs.iter().take(3).map(|h| format!("Largest: {h}")))
+        .now(Ask::standing(
+            StandingWhy::Spent {
+                tried: Reason::new(format!("freed {} of rebuildable caches", human(freed))),
+                reason: Reason::new("nothing more on the volume is safe for aterm to remove"),
+            },
+            Then::step("Free up space on the home volume"),
+        ))
+        .key(DISK_FULL_KEY)
 }
 
 /// The key of the line that a `[disk]` setting aterm cannot read turned
@@ -4822,7 +4823,10 @@ pub(crate) fn devtools_entry(step: atpkg::devtools::Step) -> Entry {
         Step::ListedOn => entry.more(atpkg::devtools::HELPER_LISTED_ON).more(path),
     };
     entry
-        .more("It applies to the next program aterm starts.")
+        .more(
+            "Once it is on, aterm has macOS check it again: when aterm reads the switch on, or \
+             when you come back to aterm from the page. Programs started before that may still wait.",
+        )
         .log_line("devtools not-granted")
 }
 
@@ -5281,13 +5285,20 @@ pub(crate) fn render_unrepaired_key(sid: &str) -> String {
     digest_key(Family::Render, sid, "unrepaired")
 }
 
+/// The key of [`palette_refused_entry`], for its end: a config generation that
+/// allows palette sets again clears it (`App::apply_prepared_config_generation`).
+pub(crate) fn palette_refused_key() -> String {
+    digest_key(Family::Terminal, "", "palette-refused")
+}
+
 /// A program set palette colours (OSC 4, numeric OSC 21) and the owner's own
-/// `allow_palette_reconfigure = false` refused them (`terminal.palette-refused`,
+/// explicit `allow_palette_reconfigure = false` refused them (`terminal.palette-refused`,
 /// an EVENT of [`Family::Terminal`]): the commonest theming tools (base16-shell,
 /// pywal, `theme.sh`) then do nothing with no sign why. One line for every tab,
 /// raised at a session's first refusal, never on screen; the gate stays off
 /// until the owner turns it on, so a dismissal is their choice
-/// ([`Resurface::CHOICE`]).
+/// ([`Resurface::CHOICE`]), and turning it on ends the line. The action names
+/// the Settings row by that row's own label, so the two cannot drift.
 pub(crate) fn palette_refused_entry() -> Entry {
     Entry::new(
         Family::Terminal,
@@ -5300,12 +5311,18 @@ pub(crate) fn palette_refused_entry() -> Entry {
         },
         Then::press(
             Mover::open_settings(SettingsRoute::Security.path()),
-            "Turn on Allow programs to set indexed colors",
+            format!(
+                "Turn on {}",
+                crate::prefs::security_label(crate::prefs::EDIT_ALLOW_PALETTE_RECONFIGURE)
+            ),
         ),
     )
     .severity(Severity::Info)
     .resurface(Resurface::CHOICE)
-    .more("Theme tools such as base16-shell and pywal set colours this way (OSC 4).")
+    .more(
+        "You turned this off in aterm.toml. Theme tools such as base16-shell, pywal and \
+         theme.sh set colours this way (OSC 4).",
+    )
     .log_line("terminal palette-refused key=allow_palette_reconfigure")
 }
 
@@ -5323,11 +5340,13 @@ pub(crate) fn palette_refused_entry() -> Entry {
 ///   is the owner's and the same for each; the first tab's words speak, the
 ///   list of tabs is a detail.
 /// * a stall no reader names ([`ExceptionKind::Stalled`]), a dialog no reader
-///   names ([`ExceptionKind::Dialog`]) and a context no `/compact` lowers
-///   ([`ExceptionKind::Context`]): one entry per TAB
-///   (`harness.resume.<tab>.stalled`, `.dialog`, `.context`), because the
-///   action, typing into the tab, answering its dialog or going back a few
-///   messages in it, is done in that tab.
+///   names ([`ExceptionKind::Dialog`]), a context no `/compact` lowers
+///   ([`ExceptionKind::Context`]) and a request the API refuses the same way
+///   each time ([`ExceptionKind::Refused`]): one entry per TAB
+///   (`harness.resume.<tab>.stalled`, `.dialog`, `.context`, `.refused`),
+///   because the action, typing into the tab, answering its dialog, going
+///   back a few messages in it or changing what its request sends, is done
+///   in that tab.
 ///
 /// The words are the loop's (`why` and `action`, capped and checked by the
 /// engine's vocabulary at [`Entry::message`]). Returns the family's WHOLE answer
@@ -5345,7 +5364,10 @@ pub(crate) fn resume_exceptions(standing: &[(String, Exception, UpgradeSpot)]) -
         }
         if matches!(
             exception.kind,
-            ExceptionKind::Stalled | ExceptionKind::Dialog | ExceptionKind::Context
+            ExceptionKind::Stalled
+                | ExceptionKind::Dialog
+                | ExceptionKind::Context
+                | ExceptionKind::Refused
         ) {
             entries.push(resume_tab_entry(sid, exception, spot));
         } else {
@@ -5361,11 +5383,12 @@ pub(crate) fn resume_exceptions(standing: &[(String, Exception, UpgradeSpot)]) -
             ExceptionKind::GoalCleared => "Claude lost its goal",
             ExceptionKind::Futile => "Limit still holds Claude",
             // A login is `Now` (the loop's escalation, or the glass's ask); a
-            // stall, a dialog and a context are a tab's own.
+            // stall, a dialog, a context and a refused request are a tab's own.
             ExceptionKind::Login
             | ExceptionKind::Stalled
             | ExceptionKind::Dialog
-            | ExceptionKind::Context => continue,
+            | ExceptionKind::Context
+            | ExceptionKind::Refused => continue,
         };
         let what = if n == 1 {
             fitted_title(head, &first_spot.place)
@@ -5454,11 +5477,13 @@ pub(crate) fn resume_ask(sid: &str, spot: &UpgradeSpot, exception: &Exception) -
 
 /// A tab's OWN entry (`harness.resume.<tab>.<kind>`) for what the owner does IN
 /// that tab: a screen no reader names, stalled for hours (open the tab and
-/// type), a dialog no reader names, stood at for an hour (answer it), or a
-/// context no `/compact` lowers (go back a few messages in it).
+/// type), a dialog no reader names, stood at for an hour (answer it), a
+/// context no `/compact` lowers (go back a few messages in it), or a request
+/// the API refuses (the remedy its notice names: `/rewind`, `/model`, …).
 fn resume_tab_entry(sid: &str, exception: &Exception, spot: &UpgradeSpot) -> Entry {
     let (head, tail, severity, note) = match exception.kind {
         ExceptionKind::Context => ("Context", " cannot be compacted", Severity::Info, ""),
+        ExceptionKind::Refused => ("Claude's request", " is refused", Severity::Info, ""),
         ExceptionKind::Dialog => (
             "Dialog",
             " stops Claude",
@@ -5520,12 +5545,56 @@ pub(crate) fn stall_unread_record(sid: &str, place: &str, minutes: u64) -> Messa
     .key(&stall_record_key(sid))
 }
 
-/// The digest keys of a tab's relaunch lines: `[blocked, gone]`.
-pub(crate) fn relaunch_keys(sid: &str) -> [String; 2] {
+/// The digest keys of a tab's relaunch lines: `[blocked, gone, lost]` — the
+/// words of the agent's relaunch, which this process's host holds (its
+/// adoption sweep ends an earlier process's). What a restart did not bring
+/// back is a fact of its own beside them ([`relaunch_not_restored_key`]).
+pub(crate) fn relaunch_keys(sid: &str) -> [String; 3] {
     [
         digest_key(Family::Supervisor, sid, "not-back"),
         digest_key(Family::Supervisor, sid, "gone"),
+        digest_key(Family::Supervisor, sid, "lost"),
     ]
+}
+
+/// The digest key of [`relaunch_not_restored_entry`]:
+/// `harness.supervisor.<tab>.not-restored`.
+pub(crate) fn relaunch_not_restored_key(sid: &str) -> String {
+    digest_key(Family::Supervisor, sid, "not-restored")
+}
+
+/// SOMETHING A RESTART LOST (XREV-LC-2): the agent came back, Claude Code
+/// itself reported that something the session ran did not (an Artifact
+/// comment monitor, MEASURED 2026-10-15: the owner's comments went
+/// unanswered), and nothing was typed to restore it — the conversation's
+/// task was finished, or nobody had asked it anything
+/// (`relaunch::restore_look`'s `done:lost`). Only the owner knows whether it
+/// still matters: a line of the digest, in aterm's own words (the vendor's
+/// row is never quoted). `harness.supervisor.<tab>.not-restored`, its own
+/// key, never [`relaunch_keys`]' `lost` (an agent that cannot come back,
+/// LC-4): the agent's running again (`Ended`), its conversation held again
+/// (`Back`) and a newer word of the tab end nothing here — what it lost
+/// stays lost. It ends with its tab (the line shows the tab and asks a look
+/// at it), and a seamless successor keeps it: a fact, not a word the earlier
+/// process's host held.
+pub(crate) fn relaunch_not_restored_entry(sid: &str, spot: &UpgradeSpot) -> Entry {
+    let mut entry = Entry::new(
+        Family::Supervisor,
+        sid,
+        "not-restored",
+        &fitted_title("Something did not come back", &spot.place),
+        Why::OnlyYou(Reason::new(
+            "Claude Code said something this session ran in the background did not come back",
+        )),
+        Then::step("Look at the tab and restore what it relied on"),
+    )
+    .severity(Severity::Warn)
+    .resurface(Resurface::WAIT)
+    .log_line(format!("relaunch not-restored sid={sid}"));
+    if let Some(nav) = &spot.nav {
+        entry = entry.show(nav.clone());
+    }
+    entry
 }
 
 /// The record of a relaunch's word (`text`: what happened, in the words of the
@@ -5583,6 +5652,42 @@ pub(crate) fn relaunch_blocked_entry(
     entry
 }
 
+/// A relaunch that keeps failing with no command the tab's mark could name
+/// (LC-5 of ATERM-KI-1015-1: said at once, not after an hour): the owner
+/// starts the agent, or clears what holds it (`cause`, as
+/// [`relaunch_blocked_entry`] words it: a conversation open in another tab
+/// is closed there, never started here too). `harness.supervisor.<tab>.not-back`.
+pub(crate) fn relaunch_failing_entry(
+    sid: &str,
+    spot: &UpgradeSpot,
+    cause: Option<&str>,
+    restarted: bool,
+) -> Entry {
+    if let Some(cause) = cause {
+        return relaunch_blocked_entry(sid, spot, cause, restarted);
+    }
+    let lead = if restarted {
+        "aterm ended the agent and has not brought it back yet"
+    } else {
+        "the agent exited and its relaunch keeps failing"
+    };
+    let mut entry = Entry::new(
+        Family::Supervisor,
+        sid,
+        "not-back",
+        &fitted_title("Agent is not back", &spot.place),
+        Why::OnlyYou(Reason::new(format!("{lead}; aterm still tries"))),
+        Then::step("Start the agent in that tab and resume its conversation"),
+    )
+    .severity(Severity::Warn)
+    .resurface(Resurface::WAIT)
+    .log_line(format!("relaunch failing sid={sid} restarted={restarted}"));
+    if let Some(nav) = &spot.nav {
+        entry = entry.show(nav.clone());
+    }
+    entry
+}
+
 /// An agent aterm cannot bring back and cannot name the command for (a launch it
 /// will not repeat, no conversation known): the owner starts it again.
 /// `harness.supervisor.<tab>.gone`.
@@ -5608,6 +5713,51 @@ pub(crate) fn relaunch_gone_entry(
     .severity(Severity::Warn)
     .resurface(Resurface::WAIT)
     .log_line(format!("relaunch cannot sid={sid} reason={reason}"));
+    if let Some(nav) = &spot.nav {
+        entry = entry.show(nav.clone());
+    }
+    entry
+}
+
+/// An agent aterm cannot bring back whose CONVERSATION is known, said where
+/// the tab's mark does not say it (no command whole within the mark, or a
+/// person working in the tab on another conversation, ATERM-KI-1015-1 LC-4):
+/// the owner resumes it, by the command (its details) when there is one.
+/// `harness.supervisor.<tab>.lost`. Ends when that conversation is held
+/// again, in any tab, when a newer word of the tab takes its place, or when
+/// the tab closes (it names a command to run there, and shows it) — never
+/// when some program merely starts in the tab.
+pub(crate) fn relaunch_lost_entry(
+    sid: &str,
+    spot: &UpgradeSpot,
+    reason: &str,
+    restarted: bool,
+    command: Option<&str>,
+) -> Entry {
+    let lead = if restarted {
+        "aterm ended the agent and cannot bring it back"
+    } else {
+        "aterm cannot bring the agent back"
+    };
+    let then = if command.is_some() {
+        Then::step("Run the command below in that tab to resume its conversation")
+    } else {
+        Then::step("Start the agent in that tab and resume its conversation")
+    };
+    let mut entry = Entry::new(
+        Family::Supervisor,
+        sid,
+        "lost",
+        &fitted_title("Agent is gone", &spot.place),
+        Why::OnlyYou(Reason::new(format!("{lead}: {reason}"))),
+        then,
+    )
+    .severity(Severity::Warn)
+    .resurface(Resurface::WAIT)
+    .log_line(format!("relaunch lost sid={sid} reason={reason}"));
+    if let Some(command) = command {
+        entry = entry.more(command);
+    }
     if let Some(nav) = &spot.nav {
         entry = entry.show(nav.clone());
     }
@@ -5681,14 +5831,6 @@ pub(crate) fn sentence_lines(key: Option<&str>, detail: &[String]) -> usize {
         && let Some(at) = detail.iter().position(|l| strip_place(l).is_some())
     {
         return at.max(1);
-    }
-    // An agent's one row for its stalled tabs: its tabs, and what its buttons
-    // do — one tab's reads as that tab's own row.
-    if key.is_some_and(agent_upgrade_group_key_is) {
-        if let Some(at) = detail.iter().position(|l| strip_place(l).is_some()) {
-            return at.max(1);
-        }
-        return 2.min(detail.len()).max(1);
     }
     // The lost-integration row ([`integration_lost`]): the tabs and the loss,
     // then what gives it back; each tab's remedy and the session ids are its
@@ -5823,11 +5965,18 @@ pub(crate) enum StallEnd {
     Left,
 }
 
-/// The agent a row's words name: `Claude` or `Codex`.
+/// The agent a row's words name: `Claude` or `Codex`; Muse Code (whose
+/// relaunch rows are read) and an agent with no lane (agy, Gemini CLI, whose
+/// rows are never read) by its own name.
 fn agent_word(agent: aterm_agent::harness::upgrade::Agent) -> &'static str {
     match agent {
         aterm_agent::harness::upgrade::Agent::Claude => "Claude",
         aterm_agent::harness::upgrade::Agent::Codex => "Codex",
+        // Muse Code: its own name (`Muse Code`). No lane yet (agy, Gemini
+        // CLI): its own name.
+        aterm_agent::harness::upgrade::Agent::Muse
+        | aterm_agent::harness::upgrade::Agent::Agy
+        | aterm_agent::harness::upgrade::Agent::Gemini => agent.product(),
     }
 }
 
@@ -5864,13 +6013,6 @@ pub(crate) fn agent_upgrade_words(
         Phase::Pending | Phase::Announced { .. } | Phase::Failed(_)
     ) || row.tab.is_empty()
         || row.to.is_empty()
-        // A goal left paused is moved by `/goal resume` alone (or, fallen
-        // into a sandbox, a relaunch by hand): no word of the upgrade's is
-        // offered on its row.
-        || matches!(
-            row.stall(now).as_deref(),
-            Some("goal-paused" | "goal-sandboxed")
-        )
     {
         return Vec::new();
     }
@@ -5912,9 +6054,8 @@ pub(crate) fn agent_upgrade_words(
 /// queue (typed once more, ruling 307), or its round gave up (re-armed: the
 /// question typed again, and the move once the agent answers READY —
 /// `upgrade_drive::Ask::Now`). Each such tab's own row says so
-/// ([`agent_upgrade_stalled`]), and so must its agent's row
-/// ([`agent_upgrade_stalled_group`]) and the answers to a press
-/// ([`agent_upgrade_worded`], [`agent_upgrade_group_worded`]).
+/// ([`agent_upgrade_stalled`]), and so must the answer to a press
+/// ([`agent_upgrade_worded`]).
 ///
 /// Never a round that gave up under the QUIET flow (`Row::quiet`, round
 /// eight, #4): re-armed, it asks nothing — the quiet restart moves it at its
@@ -6000,176 +6141,6 @@ pub(crate) fn agent_upgrade_worded(
         .line(format!("{place} \u{00b7} {}", clean(&row.move_words())))
         .hold(Hold::LogOnly)
         .key(&agent_upgrade_key(&row.tab))
-}
-
-/// WHAT THE OWNER'S WORD ON AN AGENT'S ONE ROW ASKED
-/// ([`agent_upgrade_stalled_group`], [`Intent::AgentUpgradeTabs`]): the words
-/// the row is ANSWERED with, of the `n` tabs that took the word — `Claude
-/// waits until tomorrow in 3 tabs`, `Claude skips this build in 3 tabs`,
-/// `Claude moves in 3 tabs` — never a `✓`: a choice is not delivered work,
-/// and `Upgrade now` has moved nothing yet. What each tab's word did is that
-/// tab's own record ([`agent_upgrade_worded`]).
-///
-/// `asked`: how many of the `n` `Upgrade now` only asked once more
-/// ([`upgrade_now_asks_again`]: a question unread behind a full queue, a
-/// round given up) — said so, as each tab's own record says it, never `the
-/// wait for a quiet tab is waived` of a session already idle (ruling 307) nor
-/// `moves at its next pause` of a round that moves only once the agent
-/// agrees. `Upgrade now` moves the others at their next pauses, never "when
-/// idle": a goal-mode Codex's turns never end (ruling 380).
-pub(crate) fn agent_upgrade_group_worded(
-    agent: aterm_agent::harness::upgrade::Agent,
-    word: aterm_messages::UpgradeWord,
-    n: usize,
-    asked: usize,
-) -> Message {
-    use aterm_messages::UpgradeWord;
-    let who = agent_word(agent);
-    let in_tabs = |k: usize| {
-        if k == 1 {
-            "in 1 tab".to_string()
-        } else {
-            format!("in {k} tabs")
-        }
-    };
-    let each = |k: usize| if k == 1 { "it" } else { "each" };
-    let tabs = in_tabs(n);
-    let asked = asked.min(n);
-    let (title, then) = match word {
-        UpgradeWord::Now if asked == n => (
-            format!("{who} is asked again {tabs}"),
-            format!(
-                "the upgrade's question is typed once more; {} moves once {who} agrees",
-                each(n)
-            ),
-        ),
-        UpgradeWord::Now if asked > 0 => (
-            format!("{who} moves {}", in_tabs(n - asked)),
-            format!(
-                "{} moves at its next pause; in {asked} more the upgrade's question is typed \
-                 once more, and {} moves once {who} agrees",
-                each(n - asked),
-                each(asked)
-            ),
-        ),
-        UpgradeWord::Now => (
-            format!("{who} moves {tabs}"),
-            format!(
-                "the wait for a quiet tab is waived; {} moves at its next pause, never over \
-                 typing, a draft, a dialog or running work",
-                each(n)
-            ),
-        ),
-        UpgradeWord::NotToday => (
-            format!("{who} waits until tomorrow {tabs}"),
-            "the upgrade tries each again from this time tomorrow".to_string(),
-        ),
-        UpgradeWord::Skip => (
-            format!("{who} skips this build {tabs}"),
-            "each stays where it is until a newer build comes".to_string(),
-        ),
-    };
-    Message::new(tags::HARNESS, Severity::Info, title)
-        .line(then)
-        .record()
-        .key(&agent_upgrade_group_key(agent))
-}
-
-/// AN AGENT'S ONE ROW'S STALLS ENDED WHILE THE ROW WAS DOWN (the review of
-/// 2026-09-28; [`agent_upgrade_stall_over`] for one tab's row): the owner read
-/// or dismissed the row, and no tab it named stalls in it any more. The log's
-/// last word under the agent's key would stay the owner's read, and the same
-/// stalls coming back — the same tabs overdue again, days later — would be
-/// taken for the row already seen and never shown. This RECORD, under the
-/// row's own key, is their end: the same stalls back are news. `detail` is
-/// the row's: its title is kept as what it was, with the tabs it named.
-pub(crate) fn agent_upgrade_group_over(
-    agent: aterm_agent::harness::upgrade::Agent,
-    title: &str,
-    detail: &[String],
-) -> Message {
-    let who = agent_word(agent);
-    let n = agent_upgrade_group_members(detail).len().max(1);
-    let tabs = if n == 1 {
-        "in 1 tab".to_string()
-    } else {
-        format!("in {n} tabs")
-    };
-    let mut msg = Message::new(
-        tags::HARNESS,
-        Severity::Info,
-        format!("{who} upgrade wait ended {tabs}"),
-    )
-    .line(format!(
-        "was: {}",
-        atpkg::progress::sanitize_for_tty(title, 120)
-    ));
-    if let Some(first) = detail.first() {
-        msg = msg.line(first.clone());
-    }
-    msg.record().key(&agent_upgrade_group_key(agent))
-}
-
-/// The finished words of an agent's one row whose tabs all moved (the review
-/// of 2026-09-28; day five's D26 for one tab's row,
-/// [`agent_upgrade_went_through`]): `Claude upgraded in 3 tabs` — or, one tab,
-/// that tab's own words — the `✓` record's title in the log, never the row's
-/// `⚠ Couldn't upgrade …` beside the success records.
-pub(crate) fn agent_upgrade_group_went_through(
-    agent: aterm_agent::harness::upgrade::Agent,
-    n: usize,
-    place: Option<&str>,
-) -> String {
-    let who = agent_word(agent);
-    match (n, place) {
-        (1, Some(place)) => format!("{who} upgraded {place}"),
-        (1, None) => format!("{who} upgraded in 1 tab"),
-        _ => format!("{who} upgraded in {n} tabs"),
-    }
-}
-
-/// THE OWNER'S WORD ON AN AGENT'S ONE ROW, REFUSED FOR EVERY TAB IT WAS SENT
-/// FOR (the review of 2026-09-28): nothing was written for any of the `n`
-/// tabs, and why — the first tab's refusal (`why`), in the words one tab's
-/// row takes ([`agent_upgrade_word_refused`]; `to`, the build the row named,
-/// for a skip's title). The row pressed takes these words above its own and
-/// keeps its buttons, as one tab's row does; with no live row, one
-/// gesture-failure row for the press — never a row per tab stacked under it.
-pub(crate) fn agent_upgrade_group_word_refused(
-    agent: aterm_agent::harness::upgrade::Agent,
-    word: aterm_messages::UpgradeWord,
-    n: usize,
-    (to, why): (&str, &str),
-) -> Message {
-    let tabs = if n == 1 {
-        "in 1 tab".to_string()
-    } else {
-        format!("in {n} tabs")
-    };
-    let mut msg = agent_upgrade_word_refused(word, agent, ("", to), why, &tabs);
-    msg.key = Some(agent_upgrade_group_key(agent));
-    msg
-}
-
-/// The line an ANSWERED agent's row carries for the tabs its word was not
-/// written for (`n` of them), and why — the first refusal's remedy, in the
-/// words one tab's row takes ([`agent_upgrade_word_refused`]).
-pub(crate) fn agent_upgrade_group_word_refused_line(
-    agent: aterm_agent::harness::upgrade::Agent,
-    word: aterm_messages::UpgradeWord,
-    n: usize,
-    why: &str,
-) -> String {
-    let refused = agent_upgrade_group_word_refused(agent, word, n, ("", why));
-    let tabs = if n == 1 {
-        "1 tab".to_string()
-    } else {
-        format!("{n} tabs")
-    };
-    match refused.detail.first() {
-        Some(reason) => format!("not written for {tabs}: {reason}"),
-        None => format!("not written for {tabs}"),
-    }
 }
 
 /// THE OWNER'S WORD REFUSED (gap #21): nothing was written, and why — another
@@ -6483,7 +6454,7 @@ pub(crate) fn packages_verb_row(verb: PackagesVerb) -> Message {
         PackagesVerb::Remove => ('\u{2296}', Some(aterm_messages::Load::Disk)),
     };
     // The work's own load (ruling 246): a check or an install downloads, a
-    // removal deletes — their words show only while other work is slowed.
+    // removal deletes — their words never show.
     let primary = match verb {
         PackagesVerb::Check | PackagesVerb::Install => aterm_messages::Load::Network,
         PackagesVerb::Remove => aterm_messages::Load::Disk,
@@ -6568,7 +6539,7 @@ fn diagnostic_lines(words: &str) -> Vec<String> {
 }
 
 /// A feedback sentence's head and tail: the head before the first `: ` and
-/// the tail after it — `Robi was not dismissed: <error>` reads as the head
+/// the tail after it — `Config was NOT saved: <error>` reads as the head
 /// and the cause — or the whole sentence and nothing when it carries no
 /// colon (`Message::line` drops an empty line).
 fn split_sentence(words: &str) -> (&str, &str) {

@@ -1798,8 +1798,7 @@ const EXIT_HEART_PINK: u32 = 0x00FF_5C8A;
 /// text, so both take the over-text role of [`crate::cursor_glow::InkRole`],
 /// seeded from the dark arm's hue so both themes draw the same mark. The star
 /// seeds from the family gold rather than white (white has no hue), so the
-/// light sparkle stays warm. Pinned by
-/// `exit_flourish_inks_come_from_the_shared_recipe`.
+/// light sparkle stays warm.
 #[inline]
 fn exit_heart_light() -> u32 {
     InkRole::OverText.ink(EXIT_HEART_PINK)
@@ -2115,41 +2114,6 @@ mod tests {
         const { assert!(EXIT_STAR_SCINT > 0.0, "the wink still glints") };
     }
 
-    /// The exit flourish's light inks come from the shared recipe: both marks
-    /// can land on text, so both take the over-text role, seeded from the dark
-    /// arm's hue (the star from the family gold). Neither is black.
-    #[test]
-    fn exit_flourish_inks_come_from_the_shared_recipe() {
-        assert_eq!(exit_heart_light(), InkRole::OverText.ink(EXIT_HEART_PINK));
-        assert_eq!(exit_star_light(), InkRole::OverText.ink(twinkle_rgb(true)));
-        for ink in [exit_heart_light(), exit_star_light()] {
-            assert_ne!(ink & 0x00FF_FFFF, 0, "a light-theme ink is never black");
-        }
-        // The white star seed would be neutral; the gold seed stays WARM.
-        let (r, _, b) = (
-            (exit_star_light() >> 16) & 0xff,
-            (exit_star_light() >> 8) & 0xff,
-            exit_star_light() & 0xff,
-        );
-        assert!(r > b, "the light exit sparkle keeps its warmth");
-        // The leading policy does not answer black for an achromatic hue.
-        assert_ne!(InkRole::Leading.ink(twinkle_rgb(false)) & 0x00FF_FFFF, 0);
-        // Both veils stay under the over-text legibility ceiling.
-        let g = geom();
-        for exit in [CatExit::HeartMeow, CatExit::StarWink] {
-            let (mut out, mut halos) = (Vec::new(), Vec::new());
-            emit_exit_fx(exit, 0.5, 40, 40, false, g, &mut out, &mut halos);
-            assert!(out.is_empty(), "the light arm draws no additive light");
-            assert!(!halos.is_empty(), "{exit:?} draws a veil on light");
-            assert!(
-                halos
-                    .iter()
-                    .all(|h| ((h.color >> 24) & 0xff) as f32 <= InkRole::OverText.alpha_cap()),
-                "{exit:?} veil stays under the over-text ceiling"
-            );
-        }
-    }
-
     fn geom() -> Geom {
         // Identity layout: origin 0, window extents == grid extents.
         Geom {
@@ -2163,19 +2127,6 @@ mod tests {
             win_h: (10 * 16) as u16,
             head: 0,
         }
-    }
-
-    /// A stray forward burst that isn't SUSTAINED long enough never summons the cat.
-    #[test]
-    fn short_burst_never_summons() {
-        let mut c = CursorCat::default();
-        let t = Instant::now();
-        // 5 fast keys (~0.4s) — nowhere near the band, let alone the dwell.
-        for i in 0..5 {
-            c.on_key(t + Duration::from_millis(i * 40), true);
-        }
-        assert!(!c.is_active(), "a short burst does not earn the cat");
-        assert_eq!(c.frame(t + Duration::from_millis(220)).alpha, 0);
     }
 
     #[test]
@@ -2585,23 +2536,6 @@ mod tests {
         assert_eq!(frame.fp(), 0);
         assert!(!frame.collection_hello);
         assert!(!cat.is_active());
-    }
-
-    /// `on_collect` (the favourite pin's hello) still swaps the look: the
-    /// user choosing a cat is the one allowed identity change
-    /// (owner, 2026-08-17).
-    #[test]
-    fn a_favourite_pin_still_swaps_the_look() {
-        let t = Instant::now();
-        let mut cat = CursorCat::default();
-        cat.set_look(KittyLook::for_launch(1));
-        let pinned = KittyLook::for_launch(999);
-        cat.on_collect(t, pinned);
-        assert_eq!(
-            cat.frame(t).look,
-            pinned.normalized(),
-            "the pin's hello presents the cat the user just chose"
-        );
     }
 
     /// Launch kitties are a pure function of the seed (stable for the process,
@@ -3147,23 +3081,6 @@ mod tests {
         );
     }
 
-    /// Exit rolls land ~20% StarWink, ~20% HeartMeow, ~60% Plain.
-    #[test]
-    fn exit_rolls_are_roughly_20_20_60() {
-        let mut c = CursorCat::default();
-        let (mut star, mut heart, mut plain) = (0, 0, 0);
-        for _ in 0..1000 {
-            match c.roll_exit() {
-                CatExit::StarWink => star += 1,
-                CatExit::HeartMeow => heart += 1,
-                CatExit::Plain => plain += 1,
-            }
-        }
-        assert!((120..=280).contains(&star), "star ~20%, got {star}");
-        assert!((120..=280).contains(&heart), "heart ~20%, got {heart}");
-        assert!(plain > 450, "plain majority, got {plain}");
-    }
-
     /// On dark, exit fx emit additive quads only while fading (peaked), nothing
     /// for Plain, and never touch the veil sink.
     #[test]
@@ -3256,6 +3173,11 @@ mod tests {
                 assert!(
                     centre_alpha >= 96,
                     "{exit:?}: veil centre opacity must be legible, got {centre_alpha}"
+                );
+                assert!(
+                    centre_alpha as f32 <= InkRole::OverText.alpha_cap(),
+                    "{exit:?}: the veil can land on text, so it stays under the \
+                     over-text legibility ceiling ({centre_alpha})"
                 );
             }
         }

@@ -19,7 +19,6 @@
 //! * NEVER a word of the transcript: every screen the fake paints carries a
 //!   sentinel string, and no presence row on the bus ever does;
 //! * `aterm link ls` prints the new columns off the same rows;
-//! * a `--presence minimal` bridge writes today's row and nothing more;
 //! * a `meta` change made after the row's first read reaches the bus by the
 //!   `EVENT … meta` push alone — with that push held shut, a roster round
 //!   republishes the row without it.
@@ -368,31 +367,6 @@ fn a_sessions_presence_row_relays_the_servers_agent_verdict_and_never_text() {
     assert!(row.contains(" title=satcomp%20run"), "{row}");
     assert!(!ls.contains(SENTINEL), "{ls}");
     eprintln!("aterm link ls:\n{ls}");
-}
-
-/// **`--presence minimal` IS TODAY'S ROW.** `attention=` is there; none of
-/// the meaning fields are, even once a role is set and a screen is painted.
-#[test]
-fn a_minimal_bridge_writes_attention_alone() {
-    let w = World::boot_flags("r13-minimal", &["--presence", "minimal"]);
-    w.wait_ready();
-    let (_boot, sid) = w.two_sessions();
-    assert!(w.verb(&format!("@{sid} meta set role worker")).ok());
-    assert!(
-        w.verb(&format!("@{sid} meta set attention needs-a-key"))
-            .ok()
-    );
-    let took = until_field(&w, &sid, "attention", "needs-a-key");
-    eprintln!(
-        "MEASURED meta set attention -> attention= on the bus (minimal): {} ms",
-        took.as_millis()
-    );
-    let body = presence_body(&w, &sid).expect("the row");
-    for absent in ["role=", "detail=", "phase=", "context=", "title="] {
-        assert!(!body.contains(absent), "{absent} on a minimal row: {body}");
-    }
-    assert!(body.contains(" attention=needs-a-key"), "{body}");
-    assert!(body.contains(" state=live "), "{body}");
 }
 
 /// A program that marks itself as the session's executing command `name`

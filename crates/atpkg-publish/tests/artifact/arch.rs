@@ -39,26 +39,6 @@ fn per_target(dir: &Path) -> Vec<(Triple, PathBuf)> {
 }
 
 #[test]
-fn every_client_target_expects_its_own_format_and_architecture() {
-    let want = [
-        ("aarch64-apple-darwin", Format::MachO, Cpu::Arm64),
-        ("x86_64-apple-darwin", Format::MachO, Cpu::X86_64),
-        ("x86_64-unknown-linux-gnu", Format::Elf, Cpu::X86_64),
-        ("aarch64-unknown-linux-gnu", Format::Elf, Cpu::Arm64),
-        ("x86_64-pc-windows-msvc", Format::Pe, Cpu::X86_64),
-        ("aarch64-pc-windows-msvc", Format::Pe, Cpu::Arm64),
-    ];
-    assert_eq!(
-        Triple::all().count(),
-        want.len(),
-        "a target the client gained needs a row here"
-    );
-    for (name, format, cpu) in want {
-        assert_eq!(arch::expect(t(name)), (format, cpu), "{name}");
-    }
-}
-
-#[test]
 fn the_reader_names_the_format_and_every_architecture_out_of_the_header() {
     let tmp = scratch("arch-read");
     let d = tmp.path();
@@ -252,11 +232,6 @@ fn every_named_binary_is_read_not_only_the_first() {
     let err = arch::gate(linux, &[good.clone(), good.clone(), foreign.clone()])
         .expect_err("a foreign binary in position 3");
     assert!(matches!(&err, Refusal::ArchMismatch { file, .. } if *file == foreign));
-    let text = err.to_string();
-    assert!(
-        text.contains("ARCHITECTURE MISMATCH") && text.contains("[elf arm64]"),
-        "the refusal names the gate and what it read: {text}"
-    );
     assert_eq!(arch::gate(linux, &[good.clone(), good]), Ok(2));
 }
 

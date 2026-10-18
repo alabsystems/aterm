@@ -25,7 +25,7 @@ use super::rows::{self, Fetched};
 use super::state::{LaneState, Lock, names};
 use crate::api::{Baseline, Build, Delta, IndexRequest, Indexer, PackRequest, Packer, Signing};
 use crate::artifact::lineage_switch::{self, Switch};
-use crate::artifact::tarwrite;
+use crate::artifact::{pkgdoc, tarwrite, upload};
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
 use crate::host::{Replace, Slug};
@@ -270,6 +270,9 @@ impl Class {
         match def.map(|d| d.shape) {
             Some(Shape::Plain { .. }) => Self::Plain,
             Some(Shape::Bundle(_)) => Self::Bundle,
+            // A package row's program is an ALab-built agent program, vendor-direct (above)
+            // wherever ALab does not build it, and Linux is such a target.
+            Some(Shape::Package(_)) => Self::Vendor,
             None => Self::Unknown,
         }
     }
@@ -596,6 +599,8 @@ impl Run<'_> {
             .map_err(|e| Error::io(format!("mkdir {}", work.display()), &e))?;
         let slug = ctx.index_slug();
         let (n, head) = quad::fetch_head(ctx, &slug, &work.join("head"))?;
+        // Whatever this lane signs is verified under the generation this head elects.
+        crate::artifact::sign::elect_from_head(ctx, &head);
         self.state.check_index(n)?;
         self.tx.say(format!(
             "channel index head: atpkg-index-{n} (last processed: {})",
@@ -665,8 +670,8 @@ impl Run<'_> {
                     Fetched::Absent(why) | Fetched::Unreachable(why) | Fetched::Invalid(why) => {
                         p.unfetchable = Some(format!(
                             "cannot fetch {} from release {} on {sl}: {why}",
-                            rows::manifest_name(&name, build),
-                            rows::tag(&name, build)
+                            pkgdoc::manifest_name(&name, build),
+                            upload::tag(&name, build)
                         ));
                     }
                 }
@@ -887,6 +892,7 @@ impl Run<'_> {
                         delta: Delta::default(),
                         out: staged_dir.join("index-out"),
                         upload: true,
+                        pack_dir: None,
                     },
                 )
                 .map_err(|e| {
@@ -1371,7 +1377,7 @@ impl Run<'_> {
         let mut files = tarballs(&manifest, new, &staged_dir.join(name));
         files.push(staged.clone());
         files.push(staged.with_extension("toml.sig"));
-        let tag = rows::tag(name, build);
+        let tag = upload::tag(name, build);
         for (owner, slug) in self.owners(p) {
             let host = match owner {
                 Owner::Staging => &ctx.hosts.staging,
@@ -1441,7 +1447,7 @@ impl Run<'_> {
         let mut files = tarballs(&signed, &lacking, &staged_dir.join(name));
         files.push(staged.clone());
         files.push(sig);
-        let tag = rows::tag(name, build);
+        let tag = upload::tag(name, build);
         ctx.hosts
             .channel
             .upload(&slug, &tag, &files, Replace::Clobber)
@@ -1587,7 +1593,9 @@ fn ordered(pins: &BTreeMap<String, Build>) -> Vec<(String, Build)> {
 /// This lane's staged manifest for `name` `build`.
 #[must_use]
 pub fn staged_manifest(staged_dir: &Path, name: &str, build: Build) -> PathBuf {
-    staged_dir.join(name).join(rows::manifest_name(name, build))
+    staged_dir
+        .join(name)
+        .join(pkgdoc::manifest_name(name, build))
 }
 
 fn move_file(from: &Path, to: &Path) -> Result<()> {
@@ -1758,9 +1766,9 @@ impl Ready<'_> {
                 .filter_map(|t| manifest.as_ref()?.artifact_for(t.as_str()))
                 .map(|a| format!(" {}", dir.join(&a.asset).display()))
                 .collect();
-            let pkg = dir.join(rows::manifest_name(name, build));
-            let sig = dir.join(rows::signature_name(name, build));
-            let tag = rows::tag(name, build);
+            let pkg = dir.join(pkgdoc::manifest_name(name, build));
+            let sig = dir.join(pkgdoc::sig_name(name, build));
+            let tag = upload::tag(name, build);
             s.push_str(&format!(
                 "# --- {name}@{build} ({}) ---\n\
                  atpkg-publish sign {}\n\

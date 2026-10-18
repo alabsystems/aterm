@@ -77,11 +77,15 @@ impl<'a> HandOver<'a> {
 /// The Windows console flags are set all the same (`aterm_uds::spawn::set_flags`): the
 /// child shares the verb's console, and a caller with none gets a windowless one.
 #[must_use]
-#[expect(
-    clippy::disallowed_types,
-    reason = "a pass-through by exec: its caller's descriptors are the program's"
-)]
-pub fn shim_command(layout: &Layout, tool: &ToolName, args: &[String]) -> std::process::Command {
+pub fn shim_command(
+    layout: &Layout,
+    tool: &ToolName,
+    args: &[String],
+) -> aterm_uds::spawnfd::StdCommand {
+    #[expect(
+        clippy::disallowed_types,
+        reason = "a pass-through by exec: its caller's descriptors are the program's"
+    )]
     let mut command = std::process::Command::new(layout.shim(tool));
     aterm_uds::spawn::set_flags(&mut command, 0);
     command.args(args);

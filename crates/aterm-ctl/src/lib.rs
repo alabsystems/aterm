@@ -91,10 +91,10 @@
 //! encode, and the local server does (pct-encoded fields, `visible_char`'d
 //! cells, escaped JSON), but some bytes are another party's by design — a
 //! fabric peer's mail body (round fifteen, OUT-1: it retitled the reader's tab
-//! and drew a forged `trust=human` line over the header) — and through `dial`
-//! the server itself is a remote machine (OUT-3), whose status lines, rows and
-//! bodies are its own. Rulings 2026-10-10, per verb that writes a byte or
-//! Lines payload:
+//! and drew a forged `trust=human` line over the header) — and a forwarded
+//! `@<sid>` reaches another aterm (OUT-3), whose status lines, rows and bodies
+//! are its own. Rulings 2026-10-10, per verb that writes a byte or Lines
+//! payload:
 //!
 //! | verb (framing) | what the payload is | on a terminal |
 //! |---|---|---|
@@ -107,7 +107,7 @@
 //! | `blocks`, `timeline`, `history`, `sessions`, `who`, `exits`, `inbox`, `topic`, `trail`, `identities`, `family`, `edges`, `grants`, `flows`, `modes`, `resizes`, `turn`, `kitty`, `appstatus`, `messages`, `chrome`, `controls`, `panes`, `inspect`, `privacy`, `help`, `verbs` (Lines) | rows of pct-encoded or sanitized fields | rendered; the identity on an honest server's rows |
 //! | every `--json` form, `cast frames`, `cast drift`, `video frames` (Lines) | JSON (escaped by `aterm_codec::json`), path and verdict rows | rendered; the identity on an honest server's rows |
 //! | `image read`, `image --bytes` (Lines) | PNGs as base64 | rendered; base64 is ASCII, so the identity |
-//! | every Status verb, every `OK`/`ERR` line and refusal tail | the server's one line (a remote's through `dial`) | rendered: OUT-3 |
+//! | every Status verb, every `OK`/`ERR` line and refusal tail | the server's one line | rendered: OUT-3 |
 //! | `ls`, `sessions`, `windows`, `instances`, `conn`, `cast drift --file` (client-answered) | rows the client built from servers' fields | rendered; the identity on an honest server's fields |
 //!
 //! Binary meant for a file or a pipe (recordings, images, feeds, JSON) keeps
@@ -212,13 +212,8 @@ EXIT CODES:
          afresh): those exit 75 too, and so does a `turn`, which is never
          asked again — its text may already have been typed — and a `post`,
          which may already be queued and carried to the successor under its
-         id: re-post it only with the same `key=`, or after `outbox`. So
-         does a `dial` whose remote closes the connection before it
-         answers, or before a stream's sessions exit: dial again — but a
-         dialled `turn`, `post`, `await block`, `await consent` or bare
-         `await seq` may already have taken effect, or seen its change, on
-         the remote, so check there first, as above. Never 0: a pipeline
-         must not read an update as \"session over\".
+         id: re-post it only with the same `key=`, or after `outbox`.
+         Never 0: a pipeline must not read an update as \"session over\".
 
 OUTPUT:
     To a pipe or a file, stdout and stderr carry the server's bytes exactly
@@ -226,7 +221,7 @@ OUTPUT:
     character a terminal acts on or reorders text around (C0 but newline and
     tab, DEL, C1, the bidi controls, U+2028/U+2029) and every byte that is not
     UTF-8 prints as text (\\x1b, \\r, \\u{202e}, \\xff), so a body another
-    party wrote (`inbox get`, a `dial`ed remote's reply, a screen's text)
+    party wrote (`inbox get`, a screen's text)
     cannot retitle the tab, move the cursor or write the clipboard. Redirect
     (`> file`, `| cat`) for the bytes themselves.
 
@@ -251,8 +246,9 @@ SOCKET RESOLUTION:
     calling terminal (located via $ATERM_PARENT_SESSION_ID's
     <dir>/graph/<sid> entry, so a flagless call always drives YOUR
     terminal's instance even when a newer instance owns the symlink), else the per-user default <dir>/aterm.sock where <dir> is
-    $XDG_RUNTIME_DIR/aterm (when set) or ~/Library/Application Support/aterm
-    (every Unix). The default is a symlink the server atomically points at the
+    $XDG_RUNTIME_DIR/aterm (when set), else ~/Library/Application Support/aterm
+    on macOS and ${XDG_STATE_HOME:-~/.local/state}/aterm/run on other Unix.
+    The default is a symlink the server atomically points at the
     newest instance's aterm-<pid>.sock; when nothing accepts on it (that
     instance exited or crashed while an older one lives on) the flagless
     flow falls back to the newest <dir>/aterm-<pid>.sock that does, so it
@@ -266,7 +262,7 @@ SOCKET RESOLUTION:
     DISCOVERY (`ls`, `instances`, `windows`): the client enumerates <dir>/aterm-<pid>.sock
     (plus the <dir>/graph entries of instances bound with --control-sock)
     and dials each one with a 2 s deadline. When $XDG_RUNTIME_DIR is set,
-    ~/Library/Application Support/aterm is NOT consulted, so a missing
+    the per-user default is NOT consulted, so a missing
     $XDG_RUNTIME_DIR/aterm reports the environment, not an empty fleet. A
     stale socket (its pid exited without cleanup) is skipped silently while
     another instance answers, and named — with its cause — only in the
@@ -304,7 +300,8 @@ PUSH FRAMES (subscribe):
       EVENT <local> <kind> ...   a lifecycle digest line — `turn <id> submitted=
                                  status= dur_ms=`, `block-complete <id> exit=<code|->`,
                                  `meta`, `title`, `bell total=<n>`, `agent <word> rev=`
-                                 (the server's read of a claude/codex screen moved),
+                                 (the server's read of an agent's screen moved; a
+                                 Codex's is not read: `program_state=` is its own),
                                  `status phase= outcome=` (the classified status moved),
                                  `human` (a person's key, click or scroll), the fabric kinds
                                  (`inbox`, `inbox-seen`, `post`, `fetch`, `post-landed`,
@@ -343,7 +340,7 @@ VERBS (generated from the protocol verb table — always current, cannot drift):
 
 /// The full `--help` text: [`HELP_PROSE`] followed by the verb catalog
 /// generated from [`aterm_types::control_verbs::catalog_lines`]. Built with
-/// `push_str` (the strict Trust gate cannot lower inline `format_args!`).
+/// `push_str` (the Trust lane (`ship trust run`) cannot lower inline `format_args!`).
 fn help_text() -> String {
     let mut s = String::from(HELP_PROSE);
     for line in aterm_types::control_verbs::catalog_lines() {
@@ -436,7 +433,7 @@ CLIENT VERBS (answered by aterm-ctl itself, no server round-trip):
                   pane a flagless / @self call would drive the terminal RUNNING
                   screen or tmux — those calls are REFUSED here, naming the sid
                   and the explicit form to use. Verbs that address no session
-                  (version/sessions/who/whoami/grant/flows/dial-*/help) are NOT
+                  (version/sessions/who/whoami/grant/flows/help) are NOT
                   refused: they have no target to redirect. OSC 133 marks do not
                   cross the boundary either, so blocks/exit codes/cwd are ABSENT
                   (not empty) for the duration — said once per multiplexer on
@@ -489,7 +486,7 @@ fn emit_completions(shell: &str) -> io::Result<ExitCode> {
 }
 
 /// The error for `--completions <shell>` with an unrecognized shell name (a
-/// static message; the strict Trust gate cannot lower inline `format_args!`).
+/// static message; the Trust lane (`ship trust run`) cannot lower inline `format_args!`).
 fn unknown_shell_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
@@ -762,7 +759,7 @@ pub fn front_door_completions_entry(
         // `aterm --completions zsh | head`: the reader has what it wanted.
         Err(e) if is_stdout_closed(&e) => ExitCode::SUCCESS,
         Err(e) => {
-            // Manual `eprintln!("aterm: {e}")` (the strict Trust gate cannot lower
+            // Manual `eprintln!("aterm: {e}")` (the Trust lane (`ship trust run`) cannot lower
             // inline `format_args!`); a failed write is ignored while exiting.
             let stderr = io::stderr();
             let mut err = stderr.lock();
@@ -998,8 +995,8 @@ const SOCK_FILE: &str = control_socket::LATEST_SOCK_FILE;
 
 /// The per-user directory holding the control socket and token, from
 /// [`aterm_uds::control_socket_dir`] (shared with the server). Windows:
-/// `%TMP%\aterm`; Unix: `$XDG_RUNTIME_DIR/aterm`, else `~/Library/Application
-/// Support/aterm`.
+/// `%TMP%\aterm`; Unix: `$XDG_RUNTIME_DIR/aterm`, else the per-user default
+/// ([`aterm_uds::CONTROL_SOCKET_DIR_DEFAULT`]).
 fn socket_dir() -> Option<PathBuf> {
     aterm_uds::control_socket_dir()
 }
@@ -1054,8 +1051,8 @@ fn self_instance_sock_in(dir: &Path, self_sid: Option<&str>) -> Option<String> {
 ///
 /// # Errors
 ///
-/// No rendezvous directory can be resolved (`$XDG_RUNTIME_DIR` and `$HOME`
-/// both unset).
+/// No rendezvous directory can be resolved ([`DIR_ENV_UNSET`]: `$XDG_RUNTIME_DIR`
+/// and `$HOME` unset, and off macOS `$XDG_STATE_HOME` with them).
 pub fn resolve_sock_for(self_sid: Option<&str>) -> io::Result<String> {
     resolve_path(None, None, self_sid.map(str::to_string))
 }
@@ -1386,7 +1383,7 @@ const MUX_EXEMPT_VERBS: [&str; 4] = ["instances", "ls", "windows", "mux"];
 /// Read from the SHARED verb table rather than a second hand-kept list:
 /// `Target::Meta` is the table's own name for "self-scoped or fleet-wide; a
 /// selector is meaningless here" (`version`, `sessions`, `who`, `whoami`,
-/// `grant`, `flows`, `dial-*`, `help`, `verbs`, …). Refusing those inside a
+/// `grant`, `flows`, `help`, `verbs`, …). Refusing those inside a
 /// multiplexer protected nothing — there is no session to point at the wrong
 /// terminal — and the refusal's own advice made it worse: `aterm ctl @<sid>
 /// sessions` is answered `ERR denied: sessions takes no @<sid>` by the server,
@@ -1670,8 +1667,8 @@ fn run_mux_report(nesting: Option<&MuxNesting>) -> io::Result<ExitCode> {
         "OSC 133 marks are ABSENT, not empty: a pane's shell runs no aterm prompt hooks, and \
          screen/tmux\n    do not pass the marks through. Command blocks, exit codes and cwd \
          tracking stop until you leave.\n  * \
-         Verbs that address no session (version, sessions, who, whoami, grant, flows, dial-*, \
-         help) are\n    answered from in here; name a target (@<sid>, --pid, --sock) to drive a \
+         Verbs that address no session (version, sessions, who, whoami, grant, flows, help) \
+         are\n    answered from in here; name a target (@<sid>, --pid, --sock) to drive a \
          session.\n  * \
          Not really inside a multiplexer? ATERM_MUX=0 turns this check off.",
     );
@@ -2268,9 +2265,11 @@ enum DirOutcome {
 }
 
 /// The variables [`socket_dir`] resolves from, for the message that none is set
-/// (two on Unix, three on Windows).
-#[cfg(not(windows))]
+/// (two on macOS, three on Windows and every other Unix).
+#[cfg(target_os = "macos")]
 const DIR_ENV_UNSET: &str = "$XDG_RUNTIME_DIR and $HOME are both unset";
+#[cfg(all(unix, not(target_os = "macos")))]
+const DIR_ENV_UNSET: &str = "$XDG_RUNTIME_DIR, $XDG_STATE_HOME and $HOME are all unset";
 #[cfg(windows)]
 const DIR_ENV_UNSET: &str = "%TMP%, %TEMP% and %LOCALAPPDATA% are all unset";
 
@@ -2280,11 +2279,18 @@ const DIR_ENV_UNSET: &str = "%TMP%, %TEMP% and %LOCALAPPDATA% are all unset";
 #[cfg(not(windows))]
 fn missing_dir_reason() -> String {
     if env::var_os("XDG_RUNTIME_DIR").is_some() {
-        "resolved from $XDG_RUNTIME_DIR, which is set — so \
-         ~/Library/Application Support/aterm was NOT consulted"
-            .to_string()
-    } else {
+        // `push_str`, not `format!`: the strict Trust gate cannot lower inline
+        // `format_args!` (as `help_text`).
+        let mut why = String::from("resolved from $XDG_RUNTIME_DIR, which is set — so ");
+        why.push_str(aterm_uds::CONTROL_SOCKET_DIR_DEFAULT);
+        why.push_str(" was NOT consulted");
+        why
+    } else if cfg!(target_os = "macos") {
         "resolved from $HOME; no aterm instance has published a socket there".to_string()
+    } else {
+        "resolved from $XDG_STATE_HOME, else $HOME; no aterm instance has published a \
+         socket there"
+            .to_string()
     }
 }
 #[cfg(windows)]
@@ -2531,8 +2537,10 @@ fn orphan_kill<'a>(foreign: impl Iterator<Item = (u32, &'a ForeignFacts)>) -> Op
 /// difference),
 /// whether the binary it runs has been deleted under it (an app updated past a
 /// still-running copy), and how long it has run — so an orphan left by a test
-/// is named as one, not only by pid and socket. macOS reads all three;
-/// elsewhere they are unknown and nothing is said.
+/// is named as one, not only by pid and socket. macOS and Linux read all
+/// three (Linux's parent is `init` only without a subreaper, so an orphan under
+/// `systemd --user` is not named one); elsewhere they are unknown and nothing is
+/// said.
 ///
 /// A pid is not an identity: a SIGKILLed instance leaves its graph entry, and
 /// pids wrap here in about ten minutes, so the process at that pid now may be
@@ -2566,6 +2574,9 @@ enum ForeignFacts {
 struct ProcessReading {
     /// Its birth, read first.
     birth: aterm_uds::process::ProcessBirth,
+    /// How far that birth may trail the entry's write and still be its writer
+    /// ([`graph_hygiene::Birth`]).
+    slack: std::time::Duration,
     parent: Option<u32>,
     /// The executable the kernel names, with `try_exists` on it; `None` when
     /// the kernel named none.
@@ -2579,11 +2590,14 @@ impl ForeignFacts {
     /// Read the process at `pid` and judge it against its graph entry's last
     /// write `written` (`None` when no entry vouches for the target).
     fn read(pid: u32, written: Option<std::time::SystemTime>) -> Self {
-        use aterm_uds::process::{read_process_birth, read_process_parent, read_process_path};
+        use aterm_uds::process::{read_process_parent, read_process_path};
         let (Ok(p), Some(_)) = (i32::try_from(pid), written) else {
             return Self::Unknown;
         };
-        let Some(birth) = read_process_birth(p) else {
+        // One pairing for both birth reads, so the same process reads the same
+        // birth through it ([`graph_hygiene::Clocks`]).
+        let clocks = graph_hygiene::Clocks::default();
+        let Some(birth) = graph_hygiene::read_birth(p, &clocks) else {
             return Self::Unknown;
         };
         let parent = read_process_parent(p);
@@ -2592,10 +2606,11 @@ impl ForeignFacts {
             (path, exists)
         });
         let reading = ProcessReading {
-            birth,
+            birth: birth.at,
+            slack: birth.slack,
             parent,
             exe,
-            birth_after: read_process_birth(p),
+            birth_after: graph_hygiene::read_birth(p, &clocks).map(|b| b.at),
         };
         Self::judge(written, std::time::SystemTime::now(), reading)
     }
@@ -2618,7 +2633,7 @@ impl ForeignFacts {
         now: std::time::SystemTime,
         r: ProcessReading,
     ) -> Self {
-        match written.and_then(|w| graph_hygiene::is_entry_writer(r.birth, w)) {
+        match written.and_then(|w| graph_hygiene::is_entry_writer(r.birth, r.slack, w)) {
             Some(true) => {}
             Some(false) => return Self::Stale,
             None => return Self::Unknown,
@@ -2684,9 +2699,11 @@ impl ForeignFacts {
         };
         let mut said = Vec::new();
         if orphaned {
-            said.push(
-                "its parent is launchd (its launcher exited, or launchd started it)".to_string(),
-            );
+            said.push(if cfg!(target_vendor = "apple") {
+                "its parent is launchd (its launcher exited, or launchd started it)".to_string()
+            } else {
+                "its parent is init (its launcher exited)".to_string()
+            });
         }
         if binary_deleted {
             said.push("running a deleted binary".to_string());
@@ -3485,10 +3502,9 @@ fn dead_target_remedy_due(probes: &[(u32, String, Probe)]) -> bool {
 /// does for a pinned call.
 fn dominant_hint(probes: &[(u32, String, Probe)], scoped: Option<usize>) -> Option<String> {
     let hint = match dominant_cause(probes)? {
-        Cause::Denied => "the control socket is refused by this sandbox; aterm drives such a \
-                          session from outside and it takes no part in messaging — nothing \
-                          to configure"
-            .to_string(),
+        Cause::Denied => {
+            "the control socket is refused by this sandbox — nothing to configure".to_string()
+        }
         Cause::NoToken => "the token beside a socket must be readable by THIS user (it is \
                            mode 0600); another user's instance cannot be driven"
             .to_string(),
@@ -3792,18 +3808,6 @@ fn is_timeout_error(e: &io::Error) -> bool {
 /// Passed on unchanged: every other kind, an already [`Worded`] error, and any
 /// error when no deadline was set.
 fn no_reply_error(e: io::Error, path: &str, deadline: Option<std::time::Duration>) -> io::Error {
-    no_reply_error_from(e, path, true, deadline)
-}
-
-/// [`no_reply_error`] naming `who` (a socket path, or a `dial`'s remote and
-/// relay). `local` adds `connected; the server …`, which a `dial` cannot say
-/// (remote or relay went quiet, indistinguishably).
-fn no_reply_error_from(
-    e: io::Error,
-    who: &str,
-    local: bool,
-    deadline: Option<std::time::Duration>,
-) -> io::Error {
     let Some(deadline) = deadline else {
         return e;
     };
@@ -3813,20 +3817,16 @@ fn no_reply_error_from(
     let mut msg = String::new();
     if is_unanswered(&e) {
         msg.push_str("no reply from ");
-        msg.push_str(who);
+        msg.push_str(path);
         msg.push_str(" within ");
         msg.push_str(&deadline_words(deadline));
-        if local {
-            msg.push_str(" (connected; the server did not answer)");
-        }
+        msg.push_str(" (connected; the server did not answer)");
     } else {
         msg.push_str("reply from ");
-        msg.push_str(who);
+        msg.push_str(path);
         msg.push_str(" stopped part-way: nothing more within ");
         msg.push_str(&deadline_words(deadline));
-        if local {
-            msg.push_str(" (connected; the server began its answer, then went quiet)");
-        }
+        msg.push_str(" (connected; the server began its answer, then went quiet)");
     }
     msg.push_str(" — the request timed out");
     io::Error::new(e.kind(), Worded(io::Error::other(msg)))
@@ -3942,7 +3942,7 @@ pub fn main_entry_with(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> Exit
             if is_stdout_closed(&e) {
                 return ExitCode::SUCCESS;
             }
-            // Manual `eprintln!("aterm-ctl: {e}")` (the strict Trust gate cannot
+            // Manual `eprintln!("aterm-ctl: {e}")` (the Trust lane (`ship trust run`) cannot
             // lower inline `format_args!`); a failed write is ignored while
             // exiting.
             let _ = stderr_line(&e.to_string());
@@ -3992,8 +3992,7 @@ fn is_stdout_closed(e: &io::Error) -> bool {
 }
 
 /// A stdout writer whose broken pipe is [`StdoutClosed`]. Every stdout path
-/// writes through it (`every_stdout_writer_goes_through_the_sink`), so `|
-/// head` ends each the same way. A write that would block is [`Worded`], never
+/// writes through it, so `| head` ends each the same way. A write that would block is [`Worded`], never
 /// reported as the server's silence ([`no_reply_error`]).
 ///
 /// It is also where stdout is made TERMINAL-SAFE: built by [`StdoutSink::new`],
@@ -4082,23 +4081,6 @@ fn usage_error() -> io::Error {
     let mut msg = String::from("usage: ");
     msg.push_str(SYNOPSIS);
     io::Error::new(io::ErrorKind::InvalidInput, msg)
-}
-
-/// Whether `parts` is a `dial` request without a verb for the remote (`dial` or
-/// `dial <name>`). The remote never closes the relay on its own, so the client
-/// rejects it ([`dial_needs_verb_error`]) rather than block forever.
-fn dial_missing_verb(parts: &[String]) -> bool {
-    parts.first().map(String::as_str) == Some("dial") && parts.len() < 3
-}
-
-/// The error for a bare `dial <name>`: the remote is a persistent connection,
-/// so a one-shot read would never finish. Hand-composed (no inline
-/// `format_args!`); exits FAILURE, not 124.
-fn dial_needs_verb_error() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidInput,
-        "ERR dial: give a verb to run on the remote (dial <name> <verb...>)",
-    )
 }
 
 /// The discovery verbs this client answers; none takes an argument
@@ -4295,7 +4277,7 @@ fn print_framed_lines(reply: &str) -> io::Result<()> {
 /// `read_token_for`).
 #[allow(
     clippy::unnecessary_map_on_constructor,
-    reason = "OsString::into_string is passed as a fn-item to a combinator so the strict Trust gate keeps it an opaque cross-crate call instead of inlining std internals it cannot lower"
+    reason = "OsString::into_string is passed as a fn-item to a combinator so the Trust lane (`ship trust run`) keeps it an opaque cross-crate call instead of inlining std internals it cannot lower"
 )]
 fn utf8_args(argv: Vec<std::ffi::OsString>) -> io::Result<Vec<String>> {
     let mut args = Vec::new();
@@ -4482,13 +4464,6 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
             .is_some_and(|n| mux_degradation_note(n, &request_parts).is_some()),
     );
 
-    // `dial <name> <verb...>` runs one verb on a saved remote and reads back its
-    // framed reply. A bare `dial <name>` would block forever (the remote never
-    // closes), so it fails before anything is sent.
-    if dial_missing_verb(&request_parts) {
-        return Err(dial_needs_verb_error());
-    }
-
     let Some(verb) = forwarded_verb(&request_parts) else {
         return Err(usage_error());
     };
@@ -4536,17 +4511,6 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
     let (selector, rest) = split_selector(&request_parts);
     let verb_tok = rest.first().map(String::as_str);
     let verb_args = rest.get(1..).unwrap_or(&[]);
-    if verb_tok == Some("operator-propose-bin") {
-        if selector.is_some() || !verb_args.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "operator-propose-bin reads one JSON proposal from stdin and takes no selector or inline arguments",
-            ));
-        }
-        let payload = read_stdin_payload()?;
-        validate_operator_proposal_size(payload.len())?;
-        return feed_bin_exchange(&path, origin, "operator-propose-bin", &payload, deadline);
-    }
     if verb_tok == Some("feed-bin") {
         // The payload is stdin, not an inline argument; an inline token (e.g. a
         // bare length) has no client path and would only desync the frame.
@@ -4590,24 +4554,11 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
 
     // `cast drift` asks the server, and computes the report here (the `drift`
     // module) when the server predates the verb and this binary links the
-    // engine; `dial <name> [@<sid>] cast drift` too, all through the relay.
+    // engine.
     {
         let (selector, rest) = split_selector(&request_parts);
         if drift::is_cast_drift(rest) {
-            let route = drift::Route {
-                dial: None,
-                selector,
-            };
-            return drift::live(&path, origin, route, &rest[2..], deadline, &local);
-        }
-        if let Some((name, selector, rest)) = drift::split_dial(&request_parts)
-            && drift::is_cast_drift(rest)
-        {
-            let route = drift::Route {
-                dial: Some(name),
-                selector,
-            };
-            return drift::live(&path, origin, route, &rest[2..], deadline, &local);
+            return drift::live(&path, origin, selector, &rest[2..], deadline, &local);
         }
     }
     // `help <verb>` (and `<verb> --help`) asks the server, whose table is what it
@@ -4631,21 +4582,11 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
     let mut request = request_parts.join(" ");
     request.push('\n');
 
-    // For `dial <name> <verb...>` the reply is the remote's answer to
-    // `<verb...>`, so framing follows the forwarded sub-request, not the `dial
-    // <name> …` line sent to the local relay.
-    let frame_request = if request_parts.first().map(String::as_str) == Some("dial") {
-        request_parts[2..].join(" ")
-    } else {
-        request.clone()
-    };
-
     let outcome = exchange(
         &path,
         origin,
         &request,
         &verb,
-        &frame_request,
         deadline,
         timeout_explicit,
         &redial,
@@ -4730,7 +4671,7 @@ fn expand_self_selector(parts: &mut [String], self_sid: Option<String>) -> io::R
 }
 
 /// The error for `@self` / `@env` outside an aterm session (a static message;
-/// the strict Trust gate cannot lower inline `format_args!`).
+/// the Trust lane (`ship trust run`) cannot lower inline `format_args!`).
 fn self_selector_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
@@ -4790,17 +4731,6 @@ fn read_stdin_payload() -> io::Result<Vec<u8>> {
         return Err(oversized_feed_bin_error());
     }
     Ok(buf)
-}
-
-fn validate_operator_proposal_size(size: usize) -> io::Result<()> {
-    if size > aterm_types::control_verbs::MAX_OPERATOR_PROPOSAL_BYTES {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "operator proposal exceeds the 65536-byte limit",
-        ))
-    } else {
-        Ok(())
-    }
 }
 
 /// Whether a status line reports a timeout: a bare `OK timeout` (the
@@ -4882,14 +4812,9 @@ fn validate_request_parts(parts: &[String]) -> io::Result<()> {
 }
 
 /// The request from its verb on, skipping an optional proxy selector (`@<sid>` /
-/// `@.`) and the `dial <name> [@<sid>]` head as [`forwarded_verb`] does. Empty
-/// when there is no verb.
+/// `@.`) as [`forwarded_verb`] does. Empty when there is no verb.
 fn forwarded_request(parts: &[String]) -> &[String] {
     match parts.first() {
-        Some(d) if d == "dial" => match parts.get(2) {
-            Some(t) if t.starts_with('@') => parts.get(3..).unwrap_or(&[]),
-            _ => parts.get(2..).unwrap_or(&[]),
-        },
         Some(sel) if sel.starts_with('@') => &parts[1..],
         _ => parts,
     }
@@ -4956,14 +4881,6 @@ fn split_pattern_note(parts: &[String]) -> Option<String> {
 /// only for an empty request.
 fn forwarded_verb(parts: &[String]) -> Option<String> {
     match parts.first() {
-        // `dial <name> [@<sid>] <verb...>`: the reply is the remote's answer, so
-        // framing follows the forwarded verb, skipping an optional remote
-        // selector as the local `@sel` arm does. A bare `dial <name>` is
-        // rejected upstream.
-        Some(d) if d == "dial" => match parts.get(2) {
-            Some(t) if t.starts_with('@') => parts.get(3).cloned(),
-            other => other.cloned(),
-        },
         Some(sel) if sel.starts_with('@') => {
             Some(parts.get(1).cloned().unwrap_or_else(|| sel.clone()))
         }
@@ -4978,17 +4895,8 @@ fn forwarded_verb(parts: &[String]) -> Option<String> {
 /// Only an argument that is exactly `-h` or `--help` counts, and a request
 /// whose verb is already `help` is left alone, except `help --help` / `help -h`
 /// alone, which becomes `help help`. The verb is found with [`forwarded_verb`],
-/// so `@<sid>` and `dial <name> <verb>` are handled too.
+/// so `@<sid> <verb>` is handled too.
 fn help_request_rewrite(parts: &[String]) -> Option<Vec<String>> {
-    let is_help_token = |a: &str| a == "-h" || a == "--help";
-    // `dial --help` / `dial <name> --help` name no remote verb: they ask about
-    // `dial` itself (without this they end in dial's missing-verb refusal).
-    if parts.first().map(String::as_str) == Some("dial")
-        && forwarded_verb(parts).is_none_or(|v| is_help_token(&v))
-        && parts.iter().skip(1).any(|a| is_help_token(a))
-    {
-        return Some(vec![String::from("help"), String::from("dial")]);
-    }
     let verb = forwarded_verb(parts)?;
     if verb == "help" {
         let tail: Vec<&str> = parts
@@ -5105,8 +5013,10 @@ const MAX_BODY_BYTES: usize = 256 << 20; // 256 MiB
 /// a newline cannot grow the buffer without bound.
 ///
 /// Sized for the largest legitimate line: `screen` returns the whole styled
-/// frame as one JSON line (~4.5 MiB for a 240×96 grid), and `image read`
-/// returns base64 of the server's 4 MiB frame cap (~5.33 MiB).
+/// frame as one JSON line (about 239 bytes a cell, ~5.5 MB for a 240×96 grid;
+/// past this bound, near 35,000 cells, the server leaves out image payloads and
+/// then answers `ERR screen: frame too large`), and `image read` returns base64
+/// of the server's 4 MiB frame cap (~5.33 MiB).
 const MAX_LINE_BYTES: usize = aterm_types::control_verbs::MAX_CONTROL_REPLY_LINE_BYTES;
 
 /// Hard deadline on each socket read/write in [`exchange`]. Above the server's
@@ -5117,7 +5027,7 @@ const MAX_LINE_BYTES: usize = aterm_types::control_verbs::MAX_CONTROL_REPLY_LINE
 /// trickling peer hits [`MAX_LINE_BYTES`] instead.
 const EXCHANGE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(900);
 
-// The strict Trust gate fails closed on inline `format_args!` expansions and on
+// The Trust lane (`ship trust run`) fails closed on inline `format_args!` expansions and on
 // functions too big for its VC budget, so `exchange` is split into small
 // panic-free helpers and user-visible strings are built with
 // `push_str`/`write_all`.
@@ -5357,7 +5267,7 @@ fn drain_refusal_tail<R: Read>(reader: &mut BufReader<R>) -> io::Result<()> {
 
 /// [`drain_refusal_tail`] into `err`, each line rendered by
 /// [`aterm_codec::tty::safe`] when `terminal` (a refusal is the server's words,
-/// a remote's through `dial`). The seam the tests drive both branches through.
+/// or a forwarded host's). The seam the tests drive both branches through.
 fn drain_refusal_tail_into<R: Read>(
     reader: &mut BufReader<R>,
     err: &mut impl Write,
@@ -5871,7 +5781,7 @@ fn acknowledge_artifact_reply(
 /// Write `"aterm-ctl: <msg>\n"` to stderr (manual `eprintln!`). A broken stderr
 /// propagates the error instead of panicking. A write that would block is
 /// [`Worded`], as [`StdoutSink`]'s is. `msg` is often the server's own words
-/// (a status line, an `ERR`, a remote's through `dial`): rendered for a
+/// (a status line, an `ERR`): rendered for a
 /// terminal when stderr is one ([`stderr_prefixed`]).
 fn stderr_line(msg: &str) -> io::Result<()> {
     stderr_prefixed("aterm-ctl: ", msg).map_err(worded)
@@ -5910,7 +5820,7 @@ fn prefixed_line(prefix: &str, msg: &str, terminal: bool) -> Vec<u8> {
 /// so the strict gate treats it as an opaque call.
 #[allow(
     clippy::unnecessary_literal_unwrap,
-    reason = "io::stdout is passed as a fn-item to a combinator so the strict Trust gate keeps it an opaque cross-crate call instead of inlining std's startup-semantics internals it cannot lower"
+    reason = "io::stdout is passed as a fn-item to a combinator so the Trust lane (`ship trust run`) keeps it an opaque cross-crate call instead of inlining std's startup-semantics internals it cannot lower"
 )]
 fn stdout_handle() -> io::Stdout {
     None::<io::Stdout>.unwrap_or_else(io::stdout)
@@ -6063,10 +5973,6 @@ fn receive_guarded_artifact_reply(
 /// Connect to `path`, authenticate, send `request`, and print the response for
 /// `verb`.
 ///
-/// `frame_request` decides the response framing (`framing_of`): normally the
-/// same as `request`, but for `dial <name> <verb...>` the forwarded sub-request,
-/// since the reply is the remote's answer to it.
-///
 /// The server requires `AUTH <hex>\n` first on every connection; the token is
 /// read from beside the socket and sent transparently. The `AUTH` line gets no
 /// reply, so the first line read answers `request`.
@@ -6081,17 +5987,11 @@ fn receive_guarded_artifact_reply(
 /// ([`redial::relay_subscription`]). `origin` is how `path` was chosen
 /// ([`connect_error`]). `redial` is where a successor may answer after a
 /// self-update ([`redial`]).
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the request's framing inputs plus the two policies (deadline, redial) it runs under; \
-              a wrapper struct would relocate the list, not simplify it"
-)]
 fn exchange(
     path: &str,
     origin: TargetOrigin,
     request: &str,
     verb: &str,
-    frame_request: &str,
     deadline: Option<std::time::Duration>,
     timeout_explicit: bool,
     redial: &redial::Redial,
@@ -6101,48 +6001,28 @@ fn exchange(
     let path = &aterm_uds::latest::resolve(path);
     // The connect phase has its own shorter bound ([`ACCEPT_DEADLINE`],
     // [`converse_served`]); once served every operation is bounded by
-    // `deadline`. Behind a `dial` the local server only relays, so a deadline
-    // names both the remote's silence and the relay's.
-    let request_parts: Vec<&str> = request.split_whitespace().collect();
-    let remote = redial::dial_name(&request_parts);
+    // `deadline`.
     converse_served(path, origin, deadline, |stream| {
         exchange_on(
             stream,
             path,
             request,
             verb,
-            frame_request,
             deadline,
             timeout_explicit,
             redial,
         )
-        .map_err(|e| match remote {
-            Some(name) => no_reply_error_from(e, &remote_words(name, path), false, deadline),
-            None => e,
-        })
     })
     .map(|served| served.unwrap_or_else(std::convert::identity))
 }
 
-/// How a line names the remote a `dial <name>` reached, and the local relay
-/// at `path` it went through.
-fn remote_words(name: &str, path: &str) -> String {
-    format!("the remote '{}' (through {path})", name.escape_debug())
-}
-
 /// [`exchange`] once served: `stream` is the accepted, authenticated connection
 /// to `path`, its timeouts already `deadline`.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "exchange's own inputs, the connection in place of the origin; a wrapper \
-              struct would relocate the list, not simplify it"
-)]
 fn exchange_on(
     stream: CtlStream,
     path: &str,
     request: &str,
     verb: &str,
-    frame_request: &str,
     deadline: Option<std::time::Duration>,
     timeout_explicit: bool,
     redial: &redial::Redial,
@@ -6211,7 +6091,6 @@ fn exchange_on(
                 TargetOrigin::Pinned,
                 request,
                 verb,
-                frame_request,
                 left,
                 timeout_explicit,
                 &redial::Redial::none(),
@@ -6254,15 +6133,6 @@ fn exchange_on(
                  hosting the session went away under the forward to {sock}"
             ),
         ));
-    }
-    // A `dial` cut before its reply while the local server still serves: that
-    // server only relays, so the connection to the remote is what closed.
-    if hung_up
-        && let Some(note) = redial::remote_closed_note_for(&request_parts, false)
-        && redial::still_serving(path, server, listener)
-    {
-        stderr_line(&note)?;
-        return Ok(ExitCode::from(redial::EXIT_REPLACED));
     }
     if got? == 0 {
         return Err(io::Error::new(
@@ -6316,8 +6186,8 @@ fn exchange_on(
         );
     }
 
-    if bytes_payload(verb, frame_request) {
-        // `OK <nbytes>` + a byte body (cast/temporal/inbox get), streamed to stdout
+    if bytes_payload(verb, request) {
+        // `OK <nbytes>` + a byte body (cast/temporal/inbox get/outbox), streamed to stdout
         // through a bounded `take` copy: byte-exact to a pipe or a file, rendered
         // for a terminal by the sink (a peer's mail body is its sender's bytes).
         let nbytes = match byte_count(tail) {
@@ -6352,19 +6222,19 @@ fn exchange_on(
             return Ok(ExitCode::FAILURE);
         }
         drop(out);
-        acknowledge_artifact_reply(&stream, &mut reader, verb, frame_request)?;
+        acknowledge_artifact_reply(&stream, &mut reader, verb, request)?;
         return Ok(ExitCode::SUCCESS);
     }
 
     // A guarded response is consumed from the socket, acknowledged, and only
     // then copied to stdout, so a blocked stdout consumer cannot exhaust the
     // server's ACK window.
-    if aterm_types::control_verbs::artifact_reply_requires_ack(verb, frame_request) {
+    if aterm_types::control_verbs::artifact_reply_requires_ack(verb, request) {
         match receive_guarded_artifact_reply(
             &stream,
             &mut reader,
             verb,
-            frame_request,
+            request,
             status_line,
             tail,
         )? {
@@ -6387,7 +6257,7 @@ fn exchange_on(
         };
     }
 
-    if streams_payload(verb, frame_request) {
+    if streams_payload(verb, request) {
         let count: usize = match stream_count(tail) {
             Some(count) => count,
             None => return Err(malformed_header_error(status_line)),
@@ -6413,7 +6283,7 @@ fn exchange_on(
         // (`as_of=` and `ep=` are the next `since=` and `ep=`, `lost=`, `more=`)
         // `brief` (`sid=`, `as_of=`, `ep=`, `budget=`, `used=`), and `search`
         // (completeness qualifiers a caller must not infer from the hit rows).
-        if drift::is_drift_request(verb, frame_request) {
+        if drift::is_drift_request(verb, request) {
             // Every `cast drift` is dispatched to the `drift` module before any
             // exchange; this is a backstop. A server predating the verb answers
             // the bare cast (`OK <nbytes>` + body, no `verdict=`): read it off
@@ -6423,10 +6293,9 @@ fn exchange_on(
                     io::copy(&mut (&mut reader).take(n as u64), &mut io::sink())?;
                 }
                 return Err(io::Error::other(
-                    "the aterm this `dial` reached predates `cast drift` (it answered the bare \
-                     cast, not a report); ask it with a newer `aterm ctl` on its own machine, or \
-                     save its `cast` and `text` and run `aterm ctl cast drift --file <cast> \
-                     --screen <text>`",
+                    "the server predates `cast drift` (it answered the bare cast, not a \
+                     report); save its `cast` and `text` and run `aterm ctl cast drift --file \
+                     <cast> --screen <text>`",
                 ));
             }
             // `cast drift`'s header IS the verdict (`verdict=`, `culprit=`, …): it
@@ -6455,7 +6324,7 @@ fn exchange_on(
         print_stdout_line(status_line)?;
     }
 
-    acknowledge_artifact_reply(&stream, &mut reader, verb, frame_request)?;
+    acknowledge_artifact_reply(&stream, &mut reader, verb, request)?;
     if timed_out {
         Ok(ExitCode::from(EXIT_TIMEOUT))
     } else {

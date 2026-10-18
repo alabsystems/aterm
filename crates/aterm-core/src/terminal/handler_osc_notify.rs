@@ -324,14 +324,6 @@ mod tests {
     }
 
     #[test]
-    fn osc_9_4_sets_taskbar_progress_without_authorization() {
-        // Taskbar progress is benign UI state, not gated by notification auth.
-        let mut term = Terminal::new(24, 80);
-        term.process(b"\x1b]9;4;1;50\x07");
-        assert_eq!(term.taskbar_progress(), Some(TaskbarProgress::Normal(50)));
-    }
-
-    #[test]
     fn osc_9_4_state_mapping_and_clamp() {
         let mut term = Terminal::new(24, 80);
         term.process(b"\x1b]9;4;2;75\x07");

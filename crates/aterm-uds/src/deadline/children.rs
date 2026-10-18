@@ -11,7 +11,7 @@ use std::os::fd::{AsRawFd as _, OwnedFd, RawFd};
 use std::process::{ExitStatus, Output};
 use std::time::{Duration, Instant};
 
-use super::{DRAIN_GRACE, ExitWait, OUTPUT_KEEP, POLL_MAX, POLL_MIN, RunError};
+use super::{DRAIN_GRACE, ExitWait, OUTPUT_KEEP, POLL_MAX, POLL_MIN, RunError, reap_within};
 use crate::spawnfd::{Child, Command, Stdio};
 
 /// `struct pollfd`: the same layout on Darwin, the BSDs and Linux.
@@ -221,32 +221,6 @@ impl Run {
                 })
             }
             (Ok(_), None) => Err(RunError::TimedOut),
-        }
-    }
-}
-
-/// Reap a killed `child` by `by`, waiting on its exit as the kernel reports
-/// it. One the kernel has not let go by then is left: dropping its handle
-/// hands it to [`crate::reaper`].
-fn reap_within(child: &mut Child, exit: Option<&mut ExitWait>, by: Instant) {
-    let mut fallback;
-    let exit = match exit {
-        Some(exit) => exit,
-        None => {
-            fallback = ExitWait::new(child);
-            &mut fallback
-        }
-    };
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) | Err(_) => return,
-            Ok(None) => {
-                let left = by.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    return;
-                }
-                exit.wait(left);
-            }
         }
     }
 }

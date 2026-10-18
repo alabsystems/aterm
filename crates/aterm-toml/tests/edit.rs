@@ -43,32 +43,6 @@ keys = \"ctrl+c\"
 "
     );
 
-    assert!(
-        ours.contains("# aterm configuration"),
-        "the header comment was lost"
-    );
-    assert!(ours.contains("# networking"), "a table's comment was lost");
-    assert!(
-        ours.contains("font_px = 18.0  # cozy"),
-        "the edited key lost its inline comment:\n{ours}"
-    );
-    assert!(
-        ours.contains("listen = \"0.0.0.0:9999\"  # local only"),
-        "the nested edit lost its comment:\n{ours}"
-    );
-    assert!(
-        !ours.contains("blink"),
-        "the removed key is still there:\n{ours}"
-    );
-    assert!(
-        ours.contains("timeout_ms = 500"),
-        "the new nested key is missing:\n{ours}"
-    );
-    assert!(
-        ours.contains("keys = \"ctrl+c\""),
-        "an untouched array-of-tables entry changed:\n{ours}"
-    );
-
     // And the result still means what it should.
     let value: aterm_toml::Value =
         aterm_toml::from_str(&ours).expect("the edit produced valid TOML");

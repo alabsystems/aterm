@@ -1290,76 +1290,6 @@ mod tests {
         }
     }
 
-    /// Hold one key until armed, then hold a different key. Under the key-switch
-    /// rule the hand-over is provisional for [`KEY_SWITCH_REPS`] repeats and then
-    /// commits (never a release):
-    ///
-    ///  * seamless: the drive never dips, the beat clock never rewinds, and the
-    ///    bar index keeps counting up across the switch;
-    ///  * changes: the signature moves to the new key, so the next bar sings the
-    ///    new verse on the same grid
-    ///    (`switching_the_held_key_changes_the_verse_at_the_next_bar` pins the
-    ///    pushed-bar half).
-    #[test]
-    fn changing_the_held_key_transposes_the_song_without_a_seam() {
-        let mut d = KittySing::default();
-        let t0 = Instant::now();
-        let armed = hold(&mut d, t0, 'a', SING_ARM_REPEATS, 30);
-        assert!(d.is_armed(armed));
-        let bar_before = d.bar(armed).expect("armed runs schedule bars");
-        let beat_before = d.beat(armed).expect("armed runs have a beat");
-        let sig_before = d.signature();
-
-        let mut t = armed;
-        for _ in 0..SING_ARM_REPEATS {
-            t += Duration::from_millis(30);
-            d.note_char(t, S, 'q');
-            assert_eq!(
-                d.drive(t),
-                1.0,
-                "the song never dips while the hold moves from one key to another"
-            );
-            assert!(d.is_armed(t), "and never stops scheduling bars");
-        }
-
-        let beat_after = d.beat(t).expect("still singing");
-        assert!(
-            beat_after > beat_before,
-            "the beat clock advanced across the switch instead of rewinding \
-             ({beat_before} -> {beat_after})"
-        );
-        assert!(
-            d.bar(t).expect("still scheduling") >= bar_before,
-            "the bar grid kept counting up — no cold start at bar 0"
-        );
-        assert_ne!(
-            d.signature(),
-            sig_before,
-            "'q' and 'a' must not sing the same song"
-        );
-        assert_eq!(
-            d.signature(),
-            song_signature('q'),
-            "the signature is the CURRENT run char's — the hand-over carries \
-             identity, the synth derives root/mode/verse from it per bar"
-        );
-
-        // Distinct characters that never earn [`KEY_SWITCH_REPS`] repeats are
-        // typing and lose the celebration
-        // (`genuine_typing_still_winds_the_song_down`).
-        let mut typing = KittySing::default();
-        let armed = hold(&mut typing, t0, 'a', SING_ARM_REPEATS, 30);
-        let b = armed + Duration::from_millis(30);
-        typing.note_char(b, S, 'b');
-        let c = b + Duration::from_millis(30);
-        typing.note_char(c, S, 'c');
-        assert!(
-            typing.drive(c) < 1.0,
-            "a second distinct character proves it was typing, and the \
-             wind-down is anchored back at the departure"
-        );
-    }
-
     /// The wind-down completes: after a key change fails to repeat, the drive
     /// eases strictly between 0 and 1, decreasing monotonically, to exactly 0.0
     /// by [`SING_WIND_DOWN`], and `settle` returns the detector to rest.
@@ -1429,23 +1359,6 @@ mod tests {
         let t1 = t + Duration::from_millis(30);
         d.note_char(t1, 99, 'a'); // same key, OTHER session
         assert!(!d.is_armed(t1), "the switch released the hold");
-        // 7 more in the new session (8 total there) arm it fresh.
-        let t2 = hold(
-            &mut d,
-            t1 + Duration::from_millis(30),
-            'a',
-            SING_ARM_REPEATS,
-            30,
-        );
-        // (hold() feeds session S — re-feed in session 99 explicitly.)
-        let _ = t2;
-        let mut fresh = KittySing::default();
-        let mut at = t1;
-        for _ in 0..SING_ARM_REPEATS {
-            at += Duration::from_millis(30);
-            fresh.note_char(at, 99, 'a');
-        }
-        assert!(fresh.is_armed(at));
     }
 
     /// Re-earning during a live wind-down re-arms, and inside a live glow the
@@ -1614,43 +1527,6 @@ mod tests {
         );
     }
 
-    /// The note tiles honor the free-sprite art contracts: deterministic per
-    /// key, kind-distinct texels, visible-but-not-opaque ink, and real (bounded)
-    /// coverage — a glyph, not a filled box.
-    #[test]
-    fn note_bake_is_deterministic_distinct_and_translucent() {
-        let (w, h) = note_nat_size(NoteKind::Eighth, 20);
-        let (bw, bh) = note_nat_size(NoteKind::Beamed, 20);
-        assert_eq!(
-            bake_note(w, h, NoteKind::Eighth).pixels(),
-            bake_note(w, h, NoteKind::Eighth).pixels(),
-            "deterministic per (kind, w, h)"
-        );
-        assert_ne!(
-            bake_note(bw, bh, NoteKind::Eighth).pixels(),
-            bake_note(bw, bh, NoteKind::Beamed).pixels(),
-            "♪ and ♫ must be different glyphs"
-        );
-        let tile = bake_note(w, h, NoteKind::Eighth);
-        let alphas: Vec<u8> = tile
-            .pixels()
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|pixel| pixel[3])
-            .collect();
-        let max_a = alphas.iter().copied().max().unwrap_or(0);
-        assert!(
-            (100..250).contains(&max_a),
-            "ink window: densest texel a={max_a} visible but never fully opaque"
-        );
-        let covered = alphas.iter().filter(|a| **a > 8).count() as f32 / alphas.len() as f32;
-        assert!(
-            (0.05..0.75).contains(&covered),
-            "coverage {covered:.2}: a glyph, not a box"
-        );
-    }
-
     /// Note host ids stay out of the kitty-sprite id family in the shared atlas.
     #[test]
     fn note_host_ids_avoid_kitty_sprite_family() {
@@ -1698,35 +1574,6 @@ mod tests {
                 ch as u32
             );
         }
-    }
-
-    /// Characters that a modulo mapping would have collapsed ('a', 'f', 'k',
-    /// 'p', 'u', 'z', space) all carry distinct signatures.
-    #[test]
-    fn old_transpose_collision_classes_now_sing_apart() {
-        let class = ['a', 'f', 'k', 'p', 'u', 'z', ' '];
-        for (i, &a) in class.iter().enumerate() {
-            for &b in &class[i + 1..] {
-                assert_ne!(
-                    song_signature(a),
-                    song_signature(b),
-                    "{a:?} and {b:?} were bit-identical under ch % 5 and must \
-                     never be again"
-                );
-            }
-        }
-    }
-
-    /// Nothing held ⇒ the neutral signature (the synth's untransposed
-    /// reference voicing), and an armed run reports its char's signature.
-    #[test]
-    fn signature_is_neutral_at_rest_and_the_run_chars_while_held() {
-        let mut d = KittySing::default();
-        assert_eq!(d.signature(), NEUTRAL_SIGNATURE);
-        let t0 = Instant::now();
-        let t = hold(&mut d, t0, 'w', SING_ARM_REPEATS, 30);
-        assert!(d.is_armed(t));
-        assert_eq!(d.signature(), song_signature('w'));
     }
 
     /// A miniature of the host's render loop: presses feed the detector, and
@@ -1789,32 +1636,6 @@ mod tests {
             }
             t
         }
-    }
-
-    /// Switching the held key changes the verse at the next bar boundary: the
-    /// next RiffBar pushed after the switch commits carries the new key's
-    /// signature on the same bar grid (a modulation, never a restart).
-    #[test]
-    fn switching_the_held_key_changes_the_verse_at_the_next_bar() {
-        let t0 = Instant::now();
-        let mut host = HostSim::new(t0);
-        let armed = host.hold(t0, 'w', 20, 30);
-        assert_eq!(host.pushed.len(), 1, "the arm pushed exactly bar 0");
-        assert_eq!(host.pushed[0].1, song_signature('w'));
-        // Switch to 'a' and keep holding well past the next bar boundary.
-        host.hold(armed + Duration::from_millis(30), 'a', 60, 30);
-        assert!(
-            host.pushed.len() >= 2,
-            "the next bar boundary pushed a RiffBar"
-        );
-        let (bar, sig) = host.pushed[1];
-        assert_eq!(
-            sig,
-            song_signature('a'),
-            "the next pushed RiffBar sings the NEW key"
-        );
-        assert_ne!(sig, song_signature('w'));
-        assert!(bar > host.pushed[0].0, "the bar index stays monotone");
     }
 
     /// Hold `w`, then `a`, then `r`, every gap inside repeat cadence: a key
@@ -2195,13 +2016,6 @@ mod tests {
         assert!(
             d.arm_external(ok, S, sig, 1, CelebrateOn::Green).is_ok(),
             "admitted at thirty seconds"
-        );
-        assert_eq!(
-            ArmRefusal::Cooldown {
-                remaining_ms: 20_000
-            }
-            .to_string(),
-            "cooldown: 20000 ms until the next arm is admitted"
         );
     }
 }

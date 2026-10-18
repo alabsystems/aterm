@@ -25,8 +25,8 @@
 //!   workspace stops the census). Every `COST: UNBOUNDED` marker in it maps to
 //!   a registered sink, and every registered sink defined inside it is marked.
 //! * OB-9 entry-point roots: each wasm root crate yields at least one public
-//!   fn (every export, aterm-wasm-abi's `#[export]` or aterm-gpu-web's
-//!   `#[wasm_bindgen]`, is a `pub fn`, a sound over-approximation), so a
+//!   fn (every export, aterm-wasm-abi's `#[export]` in both modules, is a
+//!   `pub fn`, a sound over-approximation), so a
 //!   parse regression cannot empty the surface.
 //! * OB-10 no entry point synchronously reaches an unbounded sink, via the
 //!   engine `term` field (`self.term.resize(..)`) or a direct sink call.
@@ -79,7 +79,7 @@ pub const WASM_PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits 
       - LEXICAL, name-based: the same fn segmenter and `<ident>(` call matching
         as the main-loop census; no type information. ENTRY POINTS are the root
         crates' `pub fn`s — a sound over-approximation of the export set
-        (`#[export]` / `#[wasm_bindgen]`: every export is a pub fn).
+        (aterm-wasm-abi's `#[export]`: every export is a pub fn).
         Same-named fns merge.
       - THE TERMINAL HOP is the `term` naming discipline: a call
         `<...>.term.<m>(` / `term.<m>(` with `<m>` in the unbounded-method
@@ -349,7 +349,7 @@ pub fn run_wasm_census(root: &Path) -> CensusOutcome {
         }
     }
     // Entry points: fully-public fns (a sound over-approximation of the
-    // `#[export]` / `#[wasm_bindgen]` exports).
+    // `#[export]` exports).
     let mut roots: Vec<usize> = Vec::new();
     for (idx, f) in fns.iter().enumerate() {
         let def = f.body.first().map(String::as_str).unwrap_or("");

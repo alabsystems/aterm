@@ -1,0 +1,28 @@
+# claude-code 2.1.302 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (37x60, aterm 0.105.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a multi-select at 37 columns, the long-term text typed into its free-text row by hand, then `down` to `Submit`: the text drawn from column 8 (`[✔]Decide`, no space after the box), every row kept (ATERM-KI-1015-1 F2)
+─────────────────────────────────────
+←  ☒ Checks  ✔ Submit  →
+
+Which checks should run?
+
+  1. [ ] Unit tests (Recommended)
+         Fast
+  2. [ ] Lint
+         Style
+  3. [ ] Fuzz
+         Slow
+  4. [✔]Decide yourself: choose the
+        option that best serves long
+        term correctness and total
+        value even at the cost of
+        short term deliverables. Say
+        which you chose and why in
+        one line and continue without
+        asking again. (Answered by
+        the aterm harness by policy.
+        The user was not asked.)
+❯    Submit
+─────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate ·
+ctrl+g to edit in Vim · Esc to cancel

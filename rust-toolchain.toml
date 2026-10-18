@@ -6,8 +6,7 @@
 #
 # Stock Rust remains only where Trust lacks a capability: cross targets with no
 # Trust std (the x86_64-apple-darwin compat slice, `verify cells`, the wasm32
-# lanes, the Windows cfg build, the cross cells of
-# `aterm-libc-oracle regen`) and tools Trust does not ship (cargo-fuzz, miri).
+# lanes, the Windows cfg build, the cross cells of `aterm-libc-oracle regen`).
 # Each is labelled `STOCK EXCEPTION` where it runs:
 # `git grep -n 'STOCK EXCEPTION'`. The public snapshot keeps this pin
 # (2026-09-29: a public user installs aterm, and atpkg installs Trust).

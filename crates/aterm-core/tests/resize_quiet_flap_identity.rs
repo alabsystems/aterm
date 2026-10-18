@@ -34,6 +34,8 @@ const SAMPLES: &[&str] = &[
     "\x1b]8;;https://example.com/x\x07link text\x1b]8;;\x07 after",
     "\x1b[48;2;10;20;30mrgb bg\x1b[0m",
     "\x1b[38;2;200;100;50;48;2;1;2;3mrgb fg and bg\x1b[0m tail",
+    "\x1b[38;2;200;10;10;48;2;10;200;10m\u{4e2d}\u{6587}\x1b[0m cjk rgb",
+    "\x1b[4;58;5;196m\u{4e2d}\x1b[0m cjk underline colour",
     "",
 ];
 

@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-gui-timing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aterm-gui's one timing value: the production lengths of the waits a person never sees (the fabric's fence and notice waits, the harness host's cadences, its answers at the loop's turn ends and idle points), or their millisecond test values, chosen once per process."
+
+[features]
+# Read `ATERM_DEV_FAST_TIMERS` in an optimized build too (`aterm-gui/dev-seams`
+# forwards it). A debug build reads it anyway; a shipped build never does.
+dev-seams = ["aterm-types/dev-seams"]
+
+[dependencies]
+# `dev_seam!`: the one way a debug build reads a development environment seam.
+aterm-types = { workspace = true }
+
+[lints]
+workspace = true

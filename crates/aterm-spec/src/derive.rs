@@ -10,8 +10,8 @@
 //! model from the code itself is Trust's job (its D-11(e); design only in the
 //! Trust repo's `docs/design/2026-09-29-descriptor-protocols-as-compiler-errors.md`).
 //!
-//! The specs in `aterm-spec-models/specs/` are hand-written `.tla` files — they
-//! can drift from the code. This module is the alternative to them: a
+//! A hand-written `.tla` spec can drift from the code and from the executable
+//! semantics a test checks; this module is the alternative (aterm commits none): a
 //! [`Model`] is a first-class Rust value describing a bounded state machine
 //! (constants, variables, guarded actions, invariants) over a small
 //! expression language [`Expr`]. From that ONE source we generate BOTH:
@@ -41,30 +41,33 @@
 //! 1. **Model** it with `ty_model!` (operators `+ - > <= == && ||`, `if`/`else`;
 //!    name a single action `Step`/`Push`/`Emit`, never `Append`). Writing it
 //!    registers it (`xref::model_registry()`; a hand-built `Model` takes
-//!    `#[aterm_spec::model]`). Give each `invariant` a `Buggy` branch that
-//!    breaks it (`tests/non_vacuity.rs` sweeps every registered model); state
+//!    `#[aterm_spec::model]`). Write it in its domain's `aterm-models-<domain>`
+//!    crate. Give each `invariant` a `Buggy` branch that breaks it
+//!    (`aterm-models/tests/non_vacuity.rs` sweeps every registered model); state
 //!    the explored box as `bound`s, ranges over one variable each. A claim no
-//!    mutant breaks yet is `uncaught`: debt, counted by `spec-check models`.
+//!    mutant can break asserts nothing: give it a mutant, or delete it.
 //!    A configuration the real code also runs under (an owner's cap, a
 //!    handoff) is a `scenario`, swept beside the committed one.
 //!    `spec-check` (`aterm_spec::check`) holds the registry to `ty`.
-//! 2. **Tier 0**: `verify::prove_and_catch_scalar(&m, "label")` or
-//!    `verify::check_model_tiered(&m, "label")` in `tests/derived_*.rs`.
-//!    `Err(NotRun)` (a function-valued model outside a checker run) is never
-//!    a pass: `spec-check models` holds those under `ty`.
+//! 2. **Tier 0**: registering it is the Tier-0 check — `aterm-models/tests/non_vacuity.rs`
+//!    proves it in every configuration it declares and breaks each invariant
+//!    with a mutant, and `spec-check models` walks it with `ty`. `Err(NotRun)`
+//!    (a function-valued model outside a checker run) is never a pass:
+//!    `spec-check models` holds those under `ty`.
 //! 3. **Tier 1**: in the crate's `tests/conformance_*.rs`, drive the real code,
 //!    project its state onto the model and check real transitions against it,
 //!    with a negative control. Anchor the real fns with
-//!    `#[cfg_attr(any(test, feature = "spec-anchors"), aterm_spec::refines(…))]`.
+//!    `#[cfg_attr(any(test, debug_assertions), aterm_spec_anchor::refines(…))]`.
 //! 4. **Progress** (it lands, drains, answers): state a `derive::Liveness` with
-//!    named fairness, register it with `#[aterm_spec::liveness(its_model)]`, and
-//!    discharge it with `verify::liveness_proves_and_catches_tiered`; copy
+//!    named fairness and register it with `#[aterm_spec::liveness(its_model)]`,
+//!    which `aterm-models/tests/non_vacuity.rs` discharges (`verify::audit_liveness`); copy
 //!    `native_update_apply_ladder_liveness`.
 //!
-//! Models to copy: `ring_model`, `subscribe_model`, `cursor_model`
-//! (`derive/models_core.rs`); `kernel_model`, `snapshot_model`, `transact_model`
-//! (`derive/models_session.rs`); for a writer/reader pair,
-//! `NativeUpdateFailedMarkSuppression` (`derive/models_update.rs`), whose negative
+//! The models live in the `aterm-models-<domain>` crates. Models to copy:
+//! `ring_model`, `subscribe_model`, `cursor_model` (`aterm-models-core/src/models_core.rs`);
+//! `kernel_model`, `snapshot_model`, `transact_model`
+//! (`aterm-models-session/src/models_session.rs`); for a writer/reader pair,
+//! `NativeUpdateFailedMarkSuppression` (`aterm-models-update/src/models_update.rs`), whose negative
 //! control replays the bug it was written for.
 //!
 //! What each step's result means (every result says which tier it reached):
@@ -73,7 +76,7 @@
 //!   the generated spec exhaustively within its bounds. It proves a property *of
 //!   the model*, nothing about the code. Non-vacuity comes from a `Buggy` branch
 //!   per invariant that the checker must refute
-//!   (`crates/aterm-spec/tests/derived_ring_ty.rs` is the pattern).
+//!   (`crates/aterm-models/tests/non_vacuity.rs`).
 //! - **Tier 1 — conformance.** A crate's `tests/conformance_*.rs` drives the real
 //!   code, projects each reachable state onto the model's variables, and checks
 //!   every observed transition against the same model: through its own guards and
@@ -89,7 +92,7 @@
 //!
 //! `ty_model!` (`aterm-spec-macros`) is sugar over this module: a macro-written
 //! model produces the byte-identical spec of the equivalent hand-built [`Model`]
-//! (`crates/aterm-spec/tests/macro_ring.rs` pins this). Known limits: `Expr` is
+//! (`crates/aterm-spec/tests/macro_ty_model.rs` pins this). Known limits: `Expr` is
 //! scalar (bounded integers and booleans), so function- or array-valued state
 //! needs an `Expr` extension first; bounds are finite; and a single-action model
 //! must not name its action `Append`, which clashes with a `ty` Sequences builtin.
@@ -451,10 +454,6 @@ pub enum InvariantKind {
     /// break. It must be a range over one variable ([`Model::malformed_bounds`]),
     /// so a design claim cannot pass as one.
     Bound,
-    /// `uncaught`: a design claim no mutant breaks yet. It is proved and, at
-    /// Tier 1, checked on real states, but nothing shows it can fail;
-    /// `spec-check models` counts them so the debt stays in view.
-    Uncaught,
 }
 
 /// A named LIVENESS obligation over a derived [`Model`]: `[]<>goal` — on every
@@ -1189,454 +1188,6 @@ fn not_range_bounds(e: &Expr, consts: &[(&str, i64)]) -> Vec<String> {
     bad
 }
 
-// ---- The model catalog: the *_model() data constructors, split by family ----
-// The `pub use` re-exports keep every `crate::derive::*_model` path flat.
-#[cfg(feature = "anchors")]
-mod models_agent_verdict;
-#[cfg(feature = "anchors")]
-mod models_atpkg_contention_release;
-#[cfg(feature = "anchors")]
-mod models_atpkg_flip_quiet;
-#[cfg(feature = "anchors")]
-mod models_atpkg_full_pass;
-#[cfg(feature = "anchors")]
-mod models_atpkg_head_watch_hosts;
-#[cfg(feature = "anchors")]
-mod models_atpkg_index_probe;
-#[cfg(feature = "anchors")]
-mod models_atpkg_index_publish;
-#[cfg(feature = "anchors")]
-mod models_atpkg_pass_stamps;
-#[cfg(feature = "anchors")]
-mod models_atpkg_pending_wait;
-#[cfg(feature = "anchors")]
-mod models_atpkg_published_spacing;
-#[cfg(feature = "anchors")]
-mod models_atpkg_session_index;
-#[cfg(feature = "anchors")]
-mod models_atpkg_session_index_retry;
-#[cfg(feature = "anchors")]
-mod models_atpkg_vendor_pending;
-#[cfg(feature = "anchors")]
-mod models_broadcast_checkpoint;
-#[cfg(feature = "anchors")]
-mod models_broadcast_head;
-#[cfg(feature = "anchors")]
-mod models_chrome_regrow;
-#[cfg(feature = "anchors")]
-mod models_consent;
-#[cfg(feature = "anchors")]
-mod models_console_life;
-#[cfg(feature = "anchors")]
-mod models_control_bind_retry;
-#[cfg(feature = "anchors")]
-mod models_control_preparation;
-#[cfg(feature = "anchors")]
-mod models_core;
-#[cfg(feature = "anchors")]
-mod models_crash_journal;
-#[cfg(feature = "anchors")]
-mod models_desktop_alert_debt;
-#[cfg(feature = "anchors")]
-mod models_driver_geometry;
-#[cfg(feature = "anchors")]
-mod models_effects;
-#[cfg(feature = "anchors")]
-mod models_exceptions_digest;
-#[cfg(feature = "anchors")]
-mod models_exceptions_ends;
-#[cfg(feature = "anchors")]
-mod models_exceptions_once;
-#[cfg(feature = "anchors")]
-mod models_fabric_enable;
-#[cfg(feature = "anchors")]
-mod models_fabric_outbox_wake;
-#[cfg(feature = "anchors")]
-mod models_foreground_handback;
-#[cfg(feature = "anchors")]
-mod models_fx;
-#[cfg(feature = "anchors")]
-mod models_glyphs;
-#[cfg(feature = "anchors")]
-mod models_gui;
-#[cfg(feature = "anchors")]
-mod models_harness;
-#[cfg(feature = "anchors")]
-mod models_harness_goal;
-#[cfg(feature = "anchors")]
-mod models_harness_host;
-#[cfg(feature = "anchors")]
-mod models_harness_policy_writer;
-#[cfg(feature = "anchors")]
-mod models_harness_progress;
-#[cfg(feature = "anchors")]
-mod models_harness_state_collection;
-#[cfg(feature = "anchors")]
-mod models_input;
-#[cfg(feature = "anchors")]
-mod models_keeper;
-#[cfg(feature = "anchors")]
-mod models_lights;
-#[cfg(feature = "anchors")]
-mod models_main_stall_refusal;
-#[cfg(feature = "anchors")]
-mod models_misc;
-#[cfg(feature = "anchors")]
-mod models_native;
-#[cfg(feature = "anchors")]
-mod models_netprobe;
-#[cfg(feature = "anchors")]
-mod models_notify_follow;
-#[cfg(feature = "anchors")]
-mod models_operator;
-#[cfg(feature = "anchors")]
-mod models_output_retention;
-#[cfg(feature = "anchors")]
-mod models_paste_order;
-#[cfg(feature = "anchors")]
-mod models_pet_observation_admission;
-#[cfg(feature = "anchors")]
-mod models_program_queue;
-#[cfg(feature = "anchors")]
-mod models_program_resolution;
-#[cfg(feature = "anchors")]
-mod models_rainbow_composer_newline;
-#[cfg(feature = "anchors")]
-mod models_rainbow_continuity;
-#[cfg(feature = "anchors")]
-mod models_rainbow_short_wrap;
-#[cfg(feature = "anchors")]
-mod models_relaunch_prompt;
-#[cfg(feature = "anchors")]
-mod models_release;
-#[cfg(feature = "anchors")]
-mod models_release_publish_once;
-#[cfg(feature = "anchors")]
-mod models_render;
-#[cfg(feature = "anchors")]
-mod models_rendezvous_grant;
-#[cfg(feature = "anchors")]
-mod models_resize_render;
-#[cfg(feature = "anchors")]
-mod models_resize_row_reuse;
-#[cfg(feature = "anchors")]
-mod models_ribbon_follow;
-#[cfg(feature = "anchors")]
-mod models_ribbon_release_restoration;
-#[cfg(feature = "anchors")]
-mod models_ribbon_row_hold;
-#[cfg(feature = "anchors")]
-mod models_run_loop_waker;
-#[cfg(feature = "anchors")]
-mod models_same_caret_echo;
-#[cfg(feature = "anchors")]
-mod models_say_replay_budget;
-#[cfg(feature = "anchors")]
-mod models_screen_generation;
-#[cfg(feature = "anchors")]
-mod models_session;
-#[cfg(feature = "anchors")]
-mod models_session_log;
-#[cfg(feature = "anchors")]
-mod models_subscribe_announcement;
-#[cfg(feature = "anchors")]
-mod models_supervise;
-#[cfg(feature = "anchors")]
-mod models_supervise_accounts;
-#[cfg(feature = "anchors")]
-mod models_text_selection_lifecycle;
-#[cfg(feature = "anchors")]
-mod models_tricks;
-#[cfg(feature = "anchors")]
-mod models_trust_facts;
-#[cfg(feature = "anchors")]
-mod models_typed_rekey;
-#[cfg(feature = "anchors")]
-mod models_update;
-#[cfg(feature = "anchors")]
-mod models_update_activation_observation;
-#[cfg(feature = "anchors")]
-mod models_update_carried_health;
-#[cfg(feature = "anchors")]
-mod models_update_check_coordination;
-#[cfg(feature = "anchors")]
-mod models_update_editor_carry;
-#[cfg(feature = "anchors")]
-mod models_update_environment_repair;
-#[cfg(feature = "anchors")]
-mod models_update_history_carry;
-#[cfg(feature = "anchors")]
-mod models_update_launched_dial_wait;
-#[cfg(feature = "anchors")]
-mod models_update_parallel_attach;
-#[cfg(feature = "anchors")]
-mod models_update_parent_diet;
-#[cfg(feature = "anchors")]
-mod models_update_precommit_input;
-#[cfg(feature = "anchors")]
-mod models_update_retired_intent;
-#[cfg(feature = "anchors")]
-mod models_update_roster_freshness;
-#[cfg(feature = "anchors")]
-mod models_update_settings_draft_carry;
-#[cfg(feature = "anchors")]
-mod models_update_successor_warm;
-#[cfg(feature = "anchors")]
-mod models_update_trial_give_back;
-#[cfg(feature = "anchors")]
-mod models_update_web_cache;
-#[cfg(feature = "anchors")]
-mod models_update_window_show;
-
-#[cfg(feature = "anchors")]
-pub use models_agent_verdict::claude_idle_at_composer_model;
-#[cfg(feature = "anchors")]
-pub use models_atpkg_contention_release::atpkg_contention_release_park_model;
-#[cfg(feature = "anchors")]
-pub use models_atpkg_flip_quiet::atpkg_flip_quiet_model;
-#[cfg(feature = "anchors")]
-pub use models_atpkg_full_pass::atpkg_full_pass_rule_model;
-#[cfg(feature = "anchors")]
-pub use models_atpkg_head_watch_hosts::atpkg_head_watch_hosts_model;
-#[cfg(feature = "anchors")]
-pub use models_atpkg_index_probe::{
-    atpkg_index_pending_park_model, atpkg_index_probe_completion_cadence_model,
-    atpkg_index_probe_cooldown_model, atpkg_index_shared_handoff_model,
-    atpkg_index_successor_selection_model, atpkg_index_wake_highwater_model,
-};
-#[cfg(feature = "anchors")]
-pub use models_atpkg_index_publish::atpkg_index_publish_walk_model;
-#[cfg(feature = "anchors")]
-pub use models_atpkg_pass_stamps::atpkg_pass_stamps_model;
-#[cfg(feature = "anchors")]
-pub use models_atpkg_pending_wait::atpkg_pending_wait_model;
-#[cfg(feature = "anchors")]
-pub use models_atpkg_published_spacing::atpkg_published_spacing_model;
-#[cfg(feature = "anchors")]
-pub use models_atpkg_session_index::{
-    atpkg_session_index_eligibility_model, atpkg_session_index_handoff_model,
-};
-#[cfg(feature = "anchors")]
-pub use models_atpkg_session_index_retry::atpkg_session_index_retry_model;
-#[cfg(feature = "anchors")]
-pub use models_atpkg_vendor_pending::atpkg_vendor_pending_check_model;
-#[cfg(feature = "anchors")]
-pub use models_broadcast_checkpoint::broadcast_cursor_checkpoint_model;
-#[cfg(feature = "anchors")]
-pub use models_broadcast_head::broadcast_head_subscription_model;
-#[cfg(feature = "anchors")]
-pub use models_chrome_regrow::{chrome_regrow_floor_liveness, chrome_regrow_floor_model};
-#[cfg(feature = "anchors")]
-pub use models_consent::{debugger_access_change_liveness, debugger_access_change_model};
-#[cfg(feature = "anchors")]
-pub use models_console_life::*;
-#[cfg(feature = "anchors")]
-pub use models_control_bind_retry::native_update_handoff_bind_retry_model;
-#[cfg(feature = "anchors")]
-pub use models_control_preparation::native_update_control_preparation_model;
-#[cfg(feature = "anchors")]
-pub use models_core::*;
-#[cfg(feature = "anchors")]
-pub use models_crash_journal::crash_journal_claim_model;
-#[cfg(feature = "anchors")]
-pub use models_desktop_alert_debt::desktop_alert_debt_model;
-#[cfg(feature = "anchors")]
-pub use models_driver_geometry::{driver_geometry_liveness, driver_geometry_model};
-#[cfg(feature = "anchors")]
-pub use models_effects::*;
-#[cfg(feature = "anchors")]
-pub use models_exceptions_digest::exceptions_digest_model;
-#[cfg(feature = "anchors")]
-pub use models_exceptions_ends::{exceptions_digest_ends_liveness, exceptions_digest_ends_model};
-#[cfg(feature = "anchors")]
-pub use models_exceptions_once::exceptions_once_model;
-#[cfg(feature = "anchors")]
-pub use models_fabric_enable::*;
-#[cfg(feature = "anchors")]
-pub use models_fabric_outbox_wake::{
-    fabric_outbox_wake_model, fabric_reconnect_backoff_model, fabric_refill_retry_model,
-};
-#[cfg(feature = "anchors")]
-pub use models_foreground_handback::{
-    foreground_handback_model, foreground_handback_ownership_model,
-};
-#[cfg(feature = "anchors")]
-pub use models_fx::*;
-#[cfg(feature = "anchors")]
-pub use models_glyphs::*;
-#[cfg(feature = "anchors")]
-pub use models_gui::*;
-#[cfg(feature = "anchors")]
-pub use models_harness::*;
-#[cfg(feature = "anchors")]
-pub use models_harness_goal::*;
-#[cfg(feature = "anchors")]
-pub use models_harness_host::{
-    harness_codex_exit_witness_model, harness_commit_owed_model, harness_exit_record_model,
-    harness_handoff_claim_model, harness_leave_model, harness_relaunch_on_exit_model,
-    harness_restart_stamp_liveness, harness_restart_stamp_model, harness_restored_carry_model,
-    harness_restored_first_attempt_model, harness_upgrade_age_model, harness_upgrade_look_model,
-    harness_worker_lifecycle_model,
-};
-#[cfg(feature = "anchors")]
-pub use models_harness_policy_writer::{
-    harness_policy_one_writer_liveness, harness_policy_one_writer_model,
-};
-#[cfg(feature = "anchors")]
-pub use models_harness_progress::*;
-#[cfg(feature = "anchors")]
-pub use models_harness_state_collection::{
-    harness_upgrade_state_collection_liveness, harness_upgrade_state_collection_model,
-};
-#[cfg(feature = "anchors")]
-pub use models_input::input_unread_gate_model;
-#[cfg(feature = "anchors")]
-pub use models_keeper::{
-    keeper_death_judgement_model, keeper_relaunch_brake_model, pty_keeper_custody_model,
-};
-#[cfg(feature = "anchors")]
-pub use models_lights::*;
-#[cfg(feature = "anchors")]
-pub use models_main_stall_refusal::main_thread_stall_refusal_model;
-#[cfg(feature = "anchors")]
-pub use models_misc::*;
-#[cfg(feature = "anchors")]
-pub use models_native::*;
-#[cfg(feature = "anchors")]
-pub use models_netprobe::netprobe_shutdown_park_model;
-#[cfg(feature = "anchors")]
-pub use models_notify_follow::notify_follow_checkpoint_model;
-#[cfg(feature = "anchors")]
-pub use models_operator::*;
-#[cfg(feature = "anchors")]
-pub use models_output_retention::output_retention_model;
-#[cfg(feature = "anchors")]
-pub use models_paste_order::*;
-#[cfg(feature = "anchors")]
-pub use models_pet_observation_admission::*;
-#[cfg(feature = "anchors")]
-pub use models_program_queue::{
-    claude_footer_model_model, claude_footer_watch_model, program_resolver_queue_model,
-};
-#[cfg(feature = "anchors")]
-pub use models_program_resolution::program_resolution_retry_model;
-#[cfg(feature = "anchors")]
-pub use models_rainbow_composer_newline::rainbow_composer_newline_gate_model;
-#[cfg(feature = "anchors")]
-pub use models_rainbow_continuity::*;
-#[cfg(feature = "anchors")]
-pub use models_rainbow_short_wrap::rainbow_short_wrap_park_model;
-#[cfg(feature = "anchors")]
-pub use models_relaunch_prompt::{relaunch_prompt_read_liveness, relaunch_prompt_read_model};
-#[cfg(feature = "anchors")]
-pub use models_release::*;
-#[cfg(feature = "anchors")]
-pub use models_release_publish_once::release_publish_once_model;
-#[cfg(feature = "anchors")]
-pub use models_render::*;
-#[cfg(feature = "anchors")]
-pub use models_rendezvous_grant::native_update_rendezvous_grant_model;
-#[cfg(feature = "anchors")]
-pub use models_resize_render::{repaint_nudge_liveness, repaint_nudge_model, resize_render_model};
-#[cfg(feature = "anchors")]
-pub use models_resize_row_reuse::resize_row_reuse_model;
-#[cfg(feature = "anchors")]
-pub use models_ribbon_follow::*;
-#[cfg(feature = "anchors")]
-pub use models_ribbon_release_restoration::*;
-#[cfg(feature = "anchors")]
-pub use models_ribbon_row_hold::*;
-#[cfg(feature = "anchors")]
-pub use models_run_loop_waker::run_loop_waker_model;
-#[cfg(feature = "anchors")]
-pub use models_same_caret_echo::*;
-#[cfg(feature = "anchors")]
-pub use models_say_replay_budget::say_replay_budget_model;
-#[cfg(feature = "anchors")]
-pub use models_screen_generation::observation_screen_generation_model;
-#[cfg(feature = "anchors")]
-pub use models_session::*;
-#[cfg(feature = "anchors")]
-pub use models_session_log::{session_log_ring_model, turn_tracker_model};
-#[cfg(feature = "anchors")]
-pub use models_subscribe_announcement::subscribe_announcement_order_model;
-#[cfg(feature = "anchors")]
-pub use models_supervise::{
-    supervisor_box_ask_model, supervisor_break_offer_model, supervisor_claim_model,
-    supervisor_codex_rate_nudge_liveness, supervisor_codex_rate_nudge_model,
-    supervisor_decline_keys_model, supervisor_done_check_model, supervisor_focus_choice_model,
-    supervisor_host_turn_end_model, supervisor_model_switch_liveness,
-    supervisor_model_switch_model, supervisor_network_wall_model, supervisor_question_answer_model,
-    supervisor_question_text_model, supervisor_stall_remedy_model, supervisor_survey_press_model,
-    supervisor_turn_end_model, supervisor_usage_wall_liveness, supervisor_usage_wall_model,
-    upgrade_attended_turn_end_model, upgrade_refused_turn_end_model, upgrade_settle_turn_end_model,
-};
-#[cfg(feature = "anchors")]
-pub use models_supervise_accounts::{
-    supervisor_account_rotation_liveness, supervisor_account_rotation_model,
-    supervisor_limit_reset_claim_liveness, supervisor_limit_reset_confirmation_liveness,
-    supervisor_limit_reset_model, supervisor_usage_probe_liveness, supervisor_usage_probe_model,
-};
-#[cfg(feature = "anchors")]
-pub use models_text_selection_lifecycle::text_selection_lifecycle_model;
-#[cfg(feature = "anchors")]
-pub use models_tricks::{trick_flash_lifecycle_model, trick_listener_purity_model};
-#[cfg(feature = "anchors")]
-pub use models_trust_facts::trust_facts_reuse_model;
-#[cfg(feature = "anchors")]
-pub use models_typed_rekey::typed_rekey_model;
-#[cfg(feature = "anchors")]
-pub use models_update::*;
-#[cfg(feature = "anchors")]
-pub use models_update_activation_observation::native_update_activation_observation_model;
-#[cfg(feature = "anchors")]
-pub use models_update_carried_health::native_update_carried_health_model;
-#[cfg(feature = "anchors")]
-pub use models_update_check_coordination::{
-    native_update_boot_health_lock_model, native_update_check_join_model,
-    native_update_check_receipt_model, native_update_check_wait_model,
-    native_update_two_process_apply_model,
-};
-#[cfg(feature = "anchors")]
-pub use models_update_editor_carry::native_update_editor_carry_model;
-#[cfg(feature = "anchors")]
-pub use models_update_environment_repair::native_update_environment_repair_model;
-#[cfg(feature = "anchors")]
-pub use models_update_history_carry::native_update_history_carry_model;
-#[cfg(feature = "anchors")]
-pub use models_update_launched_dial_wait::{
-    native_update_launched_dial_wait_liveness, native_update_launched_dial_wait_model,
-};
-#[cfg(feature = "anchors")]
-pub use models_update_parallel_attach::{
-    native_update_successor_attach_liveness, native_update_successor_attach_model,
-};
-#[cfg(feature = "anchors")]
-pub use models_update_parent_diet::{
-    native_update_speculative_sidecar_liveness, native_update_speculative_sidecar_model,
-};
-#[cfg(feature = "anchors")]
-pub use models_update_precommit_input::native_update_precommit_input_model;
-#[cfg(feature = "anchors")]
-pub use models_update_retired_intent::{
-    native_update_failure_target_model, native_update_retired_intent_model,
-};
-#[cfg(feature = "anchors")]
-pub use models_update_roster_freshness::native_update_roster_freshness_model;
-#[cfg(feature = "anchors")]
-pub use models_update_settings_draft_carry::native_update_settings_draft_carry_model;
-#[cfg(feature = "anchors")]
-pub use models_update_successor_warm::{
-    native_update_successor_warm_before_claim_liveness,
-    native_update_successor_warm_before_claim_model,
-};
-#[cfg(feature = "anchors")]
-pub use models_update_trial_give_back::native_update_trial_give_back_model;
-#[cfg(feature = "anchors")]
-pub use models_update_web_cache::native_update_web_cache_model;
-#[cfg(feature = "anchors")]
-pub use models_update_window_show::native_update_window_show_model;
-
 /// Property-combinator generators: each returns a fully-formed, `Buggy`-gated
 /// [`Model`] (prove@Buggy=0, counterexample@Buggy=1) for a recurring property
 /// CLASS. A new property is a struct literal + a `#[model]` fn, not 50
@@ -2153,309 +1704,10 @@ pub mod props {
     }
 }
 
-/// GPU glyph atlas texture residency across shelf appends (`occupied_h' = occupied_h + 1`)
-/// and full repacks (`epoch' = epoch + 1`).
-///
-/// * At `Buggy = 0`, when `occupied_h > uploaded_h` within `tex_h`, syncing the
-///   atlas uploads the dirty row band `[uploaded_h .. occupied_h)` so
-///   `uploaded_h' = occupied_h` without re-minting the texture (`AtlasRowsSynchronized`
-///   holds at present). A dirty resident upload first waits for all outstanding
-///   frame readers; fresh textures and unchanged resident textures keep them.
-/// * At `Buggy = 1`, removing `map.len()` from the texture key without uploading
-///   the dirty row band skips the upload when `uploaded_h > 0`, leaving
-///   `uploaded_h < occupied_h` at present. The same branch omits the reader wait
-///   and records an upload conflict when a dirty resident texture has readers.
-#[must_use]
-#[cfg(feature = "anchors")]
-#[cfg_attr(trust_verify, trust::skip)]
-pub fn metal_atlas_residency_model() -> Model {
-    crate::ty_model! {
-        MetalAtlasResidency {
-            const MaxEpoch = 2;
-            const TexH = 3;
-            const MaxReaders = 3;
-            const Buggy = 0;
-
-            var epoch = 1;
-            var tex_h = 3;
-            var occupied_h = 1;
-            var uploaded_h = 1;
-            var presented = 0;
-            var readers = 0;
-            var upload_conflict = 0;
-
-            action AppendShelf when (occupied_h <= tex_h - 1) {
-                occupied_h = occupied_h + 1;
-                presented = 0;
-            }
-
-            action FullRepack when (epoch <= MaxEpoch - 1) {
-                epoch = epoch + 1;
-                occupied_h = 1;
-                uploaded_h = 0;
-                presented = 0;
-            }
-
-            action SubmitFrame when (presented == 1 && readers <= MaxReaders - 1) {
-                readers = readers + 1;
-            }
-
-            action GpuComplete when (readers > 0) {
-                readers = readers - 1;
-            }
-
-            action SyncAndPresent when (presented == 0) {
-                readers = if uploaded_h > 0 && occupied_h > uploaded_h {
-                    if Buggy == 1 { readers } else { 0 }
-                } else {
-                    readers
-                };
-                upload_conflict = if Buggy == 1
-                    && uploaded_h > 0 && occupied_h > uploaded_h && readers > 0
-                {
-                    1
-                } else {
-                    upload_conflict
-                };
-                uploaded_h = if uploaded_h == 0 {
-                    occupied_h
-                } else {
-                    if Buggy == 1 { uploaded_h } else { occupied_h }
-                };
-                presented = 1;
-            }
-
-            invariant AtlasRowsSynchronized:
-                presented == 0 || (uploaded_h == occupied_h && uploaded_h <= tex_h);
-
-            invariant NoAtlasUploadConflict:
-                upload_conflict == 0;
-        }
-    }
-}
-
-/// Three-slot GPU frame ring (`slot0_in_flight..slot2_in_flight`, `cursor` in `0..2`).
-///
-/// * At `Buggy = 0`, staging the next frame waits only if the target ring slot
-///   `cursor` is still in flight on the GPU, then marks `cursor` in flight and
-///   advances `cursor = (cursor + 1) % 3`, proving `NoOverwriteInFlight`.
-/// * At `Buggy = 1`, staging into `cursor` without awaiting that slot's prior
-///   GPU completion overwrites an in-flight buffer.
-#[must_use]
-#[cfg(feature = "anchors")]
-#[cfg_attr(trust_verify, trust::skip)]
-pub fn gpu_frame_ring_model() -> Model {
-    crate::ty_model! {
-        GpuFrameRing {
-            const Buggy = 0;
-
-            var slot0_in_flight = 0;
-            var slot1_in_flight = 0;
-            var slot2_in_flight = 0;
-            var cursor = 0;
-            var overwritten = 0;
-
-            action StageFrame when (
-                Buggy == 1
-                || (cursor == 0 && slot0_in_flight == 0)
-                || (cursor == 1 && slot1_in_flight == 0)
-                || (cursor == 2 && slot2_in_flight == 0)
-            ) {
-                overwritten = if (cursor == 0 && slot0_in_flight == 1)
-                    || (cursor == 1 && slot1_in_flight == 1)
-                    || (cursor == 2 && slot2_in_flight == 1)
-                {
-                    1
-                } else {
-                    overwritten
-                };
-                slot0_in_flight = if cursor == 0 { 1 } else { slot0_in_flight };
-                slot1_in_flight = if cursor == 1 { 1 } else { slot1_in_flight };
-                slot2_in_flight = if cursor == 2 { 1 } else { slot2_in_flight };
-                cursor = if cursor == 2 { 0 } else { cursor + 1 };
-            }
-
-            action GpuCompleteSlot0 when (slot0_in_flight == 1) {
-                slot0_in_flight = 0;
-            }
-
-            action GpuCompleteSlot1 when (slot1_in_flight == 1) {
-                slot1_in_flight = 0;
-            }
-
-            action GpuCompleteSlot2 when (slot2_in_flight == 1) {
-                slot2_in_flight = 0;
-            }
-
-            invariant NoOverwriteInFlight:
-                overwritten == 0;
-        }
-    }
-}
-
-/// Single-hold predictive echo reconciliation across `ExtractSnapshot`,
-/// `PtyEchoArrives`, `Reconcile`, and `PaintFrame`.
-///
-/// * At `Buggy = 0`, `Reconcile` reads from the already-extracted snapshot
-///   (`snap_echoed`), proving `NoBlankEchoFrame` (`snap_echoed == 1 || ghost_visible == 1`
-///   whenever a predicted char is in flight).
-/// * At `Buggy = 1`, `Reconcile` re-locks the session mutex and reads `live_echoed`
-///   after `PtyEchoArrives` interleaved between `ExtractSnapshot` (`snap_echoed == 0`)
-///   and `Reconcile` (`live_echoed == 1`), retiring the ghost (`ghost_visible = 0`)
-///   while `snap_echoed == 0` — catching the 1-frame blank-cell flicker.
-#[must_use]
-#[cfg(feature = "anchors")]
-#[cfg_attr(trust_verify, trust::skip)]
-pub fn single_hold_prediction_reconcile_model() -> Model {
-    crate::ty_model! {
-        SingleHoldPredictionReconcile {
-            const Buggy = 0;
-
-            var phase = 0;
-            var pred_in_flight = 1;
-            var live_echoed = 0;
-            var snap_echoed = 0;
-            var ghost_visible = 1;
-            var painted = 0;
-
-            action ExtractSnapshot when (phase == 0) {
-                snap_echoed = live_echoed;
-                phase = 1;
-            }
-
-            action PtyEchoArrives when (live_echoed == 0) {
-                live_echoed = 1;
-            }
-
-            action Reconcile when (phase == 1) {
-                ghost_visible = if Buggy == 1 {
-                    if live_echoed == 1 { 0 } else { 1 }
-                } else {
-                    if snap_echoed == 1 { 0 } else { 1 }
-                };
-                phase = 2;
-            }
-
-            action PaintFrame when (phase == 2) {
-                painted = 1;
-                phase = 3;
-            }
-
-            invariant NoBlankEchoFrame:
-                pred_in_flight == 0 || snap_echoed == 1 || ghost_visible == 1;
-        }
-    }
-}
-
-/// Local compaction around the spliced `mid` run in `Rle::split_range_*`.
-///
-/// Models a 3-slot neighborhood `(left_val, mid_val, right_val)` surrounded by
-/// compact outer neighbors `(outer_left_val != left_val, right_val != outer_right_val)`:
-/// * At `Buggy = 0`, `compact_around(mid)` merges `mid` with `left` if equal and
-///   with `right` if equal, establishing `NoAdjacentEqual` across the whole
-///   neighborhood in $O(1)$ without scanning the outer runs.
-/// * At `Buggy = 1`, omitting the right-neighbor check after a left merge leaves
-///   adjacent runs with identical values when `left_val == mid_val == right_val`
-///   (e.g. healing `[1, 2, 1]` by setting the middle run to `1`), caught by
-///   `NoAdjacentEqual`.
-#[must_use]
-#[cfg(feature = "anchors")]
-#[cfg_attr(trust_verify, trust::skip)]
-pub fn rle_local_compact_model() -> Model {
-    crate::ty_model! {
-        RleLocalCompactModel {
-            const Buggy = 0;
-
-            var left_val = 1;
-            var mid_val = 2;
-            var right_val = 1;
-            var merged_left = 0;
-            var merged_right = 0;
-            var compacted = 0;
-
-            action SpliceSameAsNeighbors when (compacted == 0 && mid_val > 1) {
-                mid_val = 1;
-            }
-
-            action SpliceDifferent when (compacted == 0 && mid_val == 2) {
-                mid_val = 3;
-            }
-
-            action CompactAroundMid when (compacted == 0) {
-                merged_left = if left_val == mid_val { 1 } else { 0 };
-                merged_right = if Buggy == 1 && left_val == mid_val {
-                    0
-                } else {
-                    if mid_val == right_val { 1 } else { 0 }
-                };
-                compacted = 1;
-            }
-
-            invariant NoAdjacentEqual:
-                compacted == 0
-                || ((left_val > mid_val || mid_val > left_val || merged_left == 1)
-                    && (mid_val > right_val || right_val > mid_val || merged_right == 1));
-        }
-    }
-}
-
-/// Printable ASCII pair fast path in `aterm_grapheme::find_first_cluster_end`.
-///
-/// Models a 2-character prefix `(c0_ascii, c1_ascii, c1_extend)`:
-/// * At `Buggy = 0`, the $O(1)$ fast path returns `cluster_end = 1` only when
-///   BOTH `c0_ascii == 1` and `c1_ascii == 1` (`c1_extend == 0`), falling back
-///   to the full UAX #29 scanner when `c1` is a non-ASCII combining mark
-///   (`c1_extend == 1`), proving `CombiningMarkNeverSplit`.
-/// * At `Buggy = 1`, returning `cluster_end = 1` after checking only `c0_ascii == 1`
-///   splits a base ASCII character from its following combining mark (`a\u{0301}`),
-///   caught by `CombiningMarkNeverSplit`.
-#[must_use]
-#[cfg(feature = "anchors")]
-#[cfg_attr(trust_verify, trust::skip)]
-pub fn ascii_grapheme_fast_path_model() -> Model {
-    crate::ty_model! {
-        AsciiGraphemeFastPath {
-            const Buggy = 0;
-
-            var c0_ascii = 1;
-            var c1_ascii = 1;
-            var c1_extend = 0;
-            var decided = 0;
-            var cluster_end = 0;
-
-            action SecondIsCombiningMark when (decided == 0 && c1_ascii == 1) {
-                c1_ascii = 0;
-                c1_extend = 1;
-            }
-
-            action SecondIsAscii when (decided == 0 && c1_ascii == 0) {
-                c1_ascii = 1;
-                c1_extend = 0;
-            }
-
-            action FindClusterEnd when (decided == 0) {
-                cluster_end = if Buggy == 1 {
-                    if c0_ascii == 1 { 1 } else { 2 }
-                } else {
-                    if c0_ascii == 1 && c1_ascii == 1 {
-                        1
-                    } else {
-                        if c1_extend == 1 { 2 } else { 1 }
-                    }
-                };
-                decided = 1;
-            }
-
-            invariant CombiningMarkNeverSplit:
-                decided == 0 || c1_extend == 0 || cluster_end == 2;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tla_check::TlaSpec;
+    use crate::test_models::{evict_full_model, ring_model, subscribe_model};
 
     /// A pin and a bound over the `Buggy` dial are refused as bounds, while an
     /// ordinary one- or two-sided range passes.
@@ -2490,27 +1742,6 @@ mod tests {
             Box::new(Expr::Gt(var(), int(0))),
             Box::new(Expr::Le(var(), Box::new(Expr::Sub(konst("Cap"), int(1))))),
         )));
-    }
-
-    /// Guard the brittle `.replace()` in `to_cfg_deadlock_with`: the deadlock cfg
-    /// flips CHECK_DEADLOCK to TRUE and the default cfg stays FALSE. If
-    /// `to_cfg_with`'s literal changes, this fails instead of silently no-op'ing.
-    #[test]
-    fn deadlock_cfg_flips_the_line() {
-        let m = forward_handshake_model();
-        let dl = m.to_cfg_deadlock_with(&[]);
-        assert!(
-            dl.contains("CHECK_DEADLOCK TRUE\n"),
-            "deadlock cfg must enable the check:\n{dl}"
-        );
-        assert!(
-            !dl.contains("CHECK_DEADLOCK FALSE"),
-            "deadlock cfg must not also disable it:\n{dl}"
-        );
-        assert!(
-            m.to_cfg().contains("CHECK_DEADLOCK FALSE\n"),
-            "default cfg path unchanged"
-        );
     }
 
     #[test]
@@ -2561,40 +1792,6 @@ mod tests {
     }
 
     #[test]
-    fn ring_generates_expected_tla() {
-        let tla = ring_model().to_tla();
-        // Spot-check the mechanical translation (<= => =<, if => IF/THEN/ELSE).
-        // The MODULE lines here and below pin the kernel family's derived twins
-        // by name (Evict.tla is `Ring`; Kernel, Subscribe, Snapshot, Transact).
-        assert!(tla.contains("---- MODULE Ring ----"), "{tla}");
-        assert!(tla.contains("CONSTANT MaxSeq, Cap, Buggy"), "{tla}");
-        assert!(tla.contains("VARIABLES seq, lo"), "{tla}");
-        assert!(tla.contains("Init == seq = 0 /\\ lo = 1"), "{tla}");
-        assert!(
-            tla.contains("Push == seq =< MaxSeq - 1 /\\ seq' = seq + 1 /\\ lo' = (IF seq + 1 - lo + 1 > Cap + Buggy THEN lo + 1 ELSE lo)"),
-            "{tla}"
-        );
-        assert!(tla.contains("Next == Push"), "{tla}");
-        assert!(tla.contains("Spec == Init /\\ [][Next]_vars"), "{tla}");
-        assert!(tla.contains("LenBounded == seq - lo + 1 =< Cap"), "{tla}");
-    }
-
-    #[test]
-    fn generated_tla_parses_and_exposes_its_defs() {
-        // The generated module round-trips through the TLA+ parser, and the
-        // action + invariant names are visible (cross-check generator <-> parser).
-        let tla = ring_model().to_tla();
-        let spec = TlaSpec::parse_str(&tla, "Ring.tla").expect("generated TLA+ must parse");
-        assert_eq!(spec.module_name, "Ring");
-        assert!(spec.actions.contains("Push"), "defs: {:?}", spec.actions);
-        assert!(
-            spec.actions.contains("LenBounded"),
-            "defs: {:?}",
-            spec.actions
-        );
-    }
-
-    #[test]
     fn transition_spec_opens_init_but_shares_the_action() {
         let m = ring_model();
         let tla = m.transition_spec();
@@ -2614,26 +1811,6 @@ mod tests {
     }
 
     #[test]
-    fn cursor_model_emits_unchanged_and_disjunctive_next() {
-        // The paths the ring never exercises: partial updates -> UNCHANGED, and
-        // two actions -> a disjunctive Next.
-        let tla = cursor_model().to_tla();
-        assert!(
-            tla.contains("Grow == seq =< MaxSeq - 1 /\\ seq' = seq + 1 /\\ UNCHANGED << cursor >>"),
-            "{tla}"
-        );
-        assert!(
-            tla.contains(
-                "Deliver == seq > cursor /\\ cursor' = (IF Buggy = 1 THEN seq + 1 ELSE seq) \
-                 /\\ UNCHANGED << seq >>"
-            ),
-            "{tla}"
-        );
-        assert!(tla.contains("Next == Grow \\/ Deliver"), "{tla}");
-        assert!(tla.contains("CursorBounded == cursor =< seq"), "{tla}");
-    }
-
-    #[test]
     fn subscribe_emits_parenthesized_disjunction_guard_and_eq() {
         let tla = subscribe_model().to_tla();
         assert!(tla.contains("---- MODULE Subscribe ----"), "{tla}");
@@ -2650,72 +1827,6 @@ mod tests {
             "{tla}"
         );
         assert!(tla.contains("NoSilentLoss == lost = 0"), "{tla}");
-    }
-
-    #[test]
-    fn action_enabled_reflects_guards() {
-        let m = subscribe_model(); // Buggy = 0
-        let behind: BTreeMap<&'static str, i64> =
-            [("seq", 5), ("lo", 3), ("cursor", 0), ("lost", 0)]
-                .into_iter()
-                .collect();
-        assert!(
-            m.action_enabled("PollGap", &behind),
-            "behind reader: PollGap enabled"
-        );
-        assert!(
-            !m.action_enabled("PollDeliver", &behind),
-            "behind reader: PollDeliver disabled"
-        );
-        let caught: BTreeMap<&'static str, i64> =
-            [("seq", 5), ("lo", 3), ("cursor", 5), ("lost", 0)]
-                .into_iter()
-                .collect();
-        assert!(
-            !m.action_enabled("PollGap", &caught),
-            "caught-up reader: PollGap disabled"
-        );
-        assert!(
-            m.action_enabled("PollDeliver", &caught),
-            "caught-up reader: PollDeliver enabled"
-        );
-    }
-
-    #[test]
-    fn transact_emits_conjunctive_guards() {
-        let tla = transact_model().to_tla();
-        assert!(tla.contains("---- MODULE Transact ----"), "{tla}");
-        assert!(
-            tla.contains(
-                "CommitClean == active = 1 /\\ seq = tbase /\\ seq =< MaxSeq - K /\\ \
-                 seq' = seq + K /\\ active' = 0 /\\ UNCHANGED << tbase, lost >>"
-            ),
-            "{tla}"
-        );
-        assert!(
-            tla.contains("Next == Write \\/ Begin \\/ CommitClean \\/ Abort \\/ BuggyCommit"),
-            "{tla}"
-        );
-        assert!(tla.contains("NoLostUpdate == lost = 0"), "{tla}");
-    }
-
-    #[test]
-    fn kernel_and_snapshot_generate_expected_tla() {
-        let k = kernel_model().to_tla();
-        assert!(k.contains("---- MODULE Kernel ----"), "{k}");
-        assert!(
-            k.contains("Emit == seq =< MaxSeq - 1 /\\ count' = count + 1 /\\ seq' = (IF Buggy = 1 THEN seq + 2 ELSE seq + 1)"),
-            "{k}"
-        );
-        assert!(k.contains("Next == Emit"), "{k}");
-        assert!(k.contains("SeqIsCount == seq = count"), "{k}");
-        let s = snapshot_model().to_tla();
-        assert!(s.contains("---- MODULE Snapshot ----"), "{s}");
-        assert!(
-            s.contains("Write == seq =< MaxSeq - 1 /\\ seq' = seq + 1 /\\ leaked' = (IF Buggy = 1 /\\ snapped = 1 THEN 1 ELSE leaked) /\\ UNCHANGED << snapped >>"),
-            "{s}"
-        );
-        assert!(s.contains("SnapshotIsolated == leaked = 0"), "{s}");
     }
 
     #[test]
@@ -2742,70 +1853,5 @@ mod tests {
             ),
             "quantified iff invariant: {tla}"
         );
-    }
-
-    #[test]
-    fn metal_atlas_residency_model_proves_and_catches_mutant() {
-        let m = metal_atlas_residency_model();
-        let states = crate::interp::prove_and_catch(&m);
-        assert!(states > 1, "must explore multiple states: {states}");
-        assert_eq!(
-            crate::interp::fired_actions(&m).len(),
-            m.actions.len(),
-            "all actions must fire at Buggy=0"
-        );
-        crate::verify::prove_and_catch_scalar(&m, "MetalAtlasResidency");
-    }
-
-    #[test]
-    fn gpu_frame_ring_model_proves_and_catches_mutant() {
-        let m = gpu_frame_ring_model();
-        let states = crate::interp::prove_and_catch(&m);
-        assert!(states > 1, "must explore multiple states: {states}");
-        assert_eq!(
-            crate::interp::fired_actions(&m).len(),
-            m.actions.len(),
-            "all actions must fire at Buggy=0"
-        );
-        crate::verify::prove_and_catch_scalar(&m, "GpuFrameRing");
-    }
-
-    #[test]
-    fn single_hold_prediction_reconcile_model_proves_and_catches_mutant() {
-        let m = single_hold_prediction_reconcile_model();
-        let states = crate::interp::prove_and_catch(&m);
-        assert!(states > 1, "must explore multiple states: {states}");
-        assert_eq!(
-            crate::interp::fired_actions(&m).len(),
-            m.actions.len(),
-            "all actions must fire at Buggy=0"
-        );
-        crate::verify::prove_and_catch_scalar(&m, "SingleHoldPredictionReconcile");
-    }
-
-    #[test]
-    fn rle_local_compact_model_proves_and_catches_mutant() {
-        let m = rle_local_compact_model();
-        let states = crate::interp::prove_and_catch(&m);
-        assert!(states > 1, "must explore multiple states: {states}");
-        assert_eq!(
-            crate::interp::fired_actions(&m).len(),
-            m.actions.len(),
-            "all actions must fire at Buggy=0"
-        );
-        crate::verify::prove_and_catch_scalar(&m, "RleLocalCompactModel");
-    }
-
-    #[test]
-    fn ascii_grapheme_fast_path_model_proves_and_catches_mutant() {
-        let m = ascii_grapheme_fast_path_model();
-        let states = crate::interp::prove_and_catch(&m);
-        assert!(states > 1, "must explore multiple states: {states}");
-        assert_eq!(
-            crate::interp::fired_actions(&m).len(),
-            m.actions.len(),
-            "all actions must fire at Buggy=0"
-        );
-        crate::verify::prove_and_catch_scalar(&m, "AsciiGraphemeFastPath");
     }
 }

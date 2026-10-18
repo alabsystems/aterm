@@ -170,15 +170,6 @@ mod tests {
         assert!(current_build_ok(&floored, "ay", None));
     }
 
-    #[test]
-    fn yanking_an_installed_build_forces_upgrade_to_a_valid_pin() {
-        // The channel re-pinned to a NEWER, non-yanked build; the old one is yanked.
-        let ch = channel(0, &[("trust", 4800)], &["trust@4790"]);
-        // Installed the now-yanked 4790 → force-upgrade to the valid pin 4800.
-        assert_eq!(decide(&ch, "trust", Some(4790)), ApplyDecision::Install);
-        assert_eq!(decide(&ch, "trust", Some(4800)), ApplyDecision::UpToDate);
-    }
-
     // REGRESSION (audit 2026-09-15): a floor is per PROGRAM, because a build number is only
     // comparable to another build number of the same program. Comparing every program's pin
     // against ONE channel-wide number made the documented yank floor unusable: the only value

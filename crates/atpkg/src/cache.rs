@@ -524,18 +524,19 @@ mod tests {
         fs::metadata(p).unwrap().permissions().mode() & 0o777
     }
 
-    /// A system-shaped layout, created nowhere: [`Layout::is_system_prefix`] skips a
-    /// component that does not exist yet, so a never-created path under root-owned `/opt`
-    /// reads as the system shape unprivileged too. `None` when no candidate is root-owned.
+    /// A system-shaped layout, created nowhere: a scratch path this thread's
+    /// [`Layout::is_system_prefix`] answers yes for ([`crate::store::system_shape`]), so the
+    /// test runs on every machine rather than only where a root-owned chain is found.
     #[cfg(unix)]
-    fn system_shaped_layout(label: &str) -> Option<Layout> {
-        ["/opt", "/usr/lib", "/var/lib", "/usr/local"]
-            .into_iter()
-            .map(|parent| Layout {
-                prefix: Path::new(parent)
-                    .join(format!("atpkg-cache-{label}-{}", std::process::id())),
-            })
-            .find(|layout| !layout.prefix.exists() && layout.is_system_prefix())
+    fn system_shaped_layout(label: &str) -> Layout {
+        let layout = Layout {
+            prefix: std::env::temp_dir().join(format!(
+                "atpkg-cache-{label}-{}-never-created",
+                std::process::id()
+            )),
+        };
+        crate::store::system_shape::force(&layout.prefix);
+        layout
     }
 
     /// Under a root-owned system prefix the cache parent (`layout.prefix` itself) comes out
@@ -544,9 +545,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_system_shaped_prefix_leaves_the_cache_parent_traversable() {
-        let Some(layout) = system_shaped_layout("sys") else {
-            return; // no root-owned chain here
-        };
+        let layout = system_shaped_layout("sys");
+        assert!(layout.is_system_prefix(), "the fixture is the system shape");
         let system_path = layout.prefix.clone();
         let (_scratch, p) = tmp("sys-parent");
         let parent = p.parent().unwrap().to_path_buf();

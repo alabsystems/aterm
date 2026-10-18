@@ -127,7 +127,7 @@ struct Settled {
 /// `pet_position_authority`'s streaming case with a shell-integration block left
 /// executing, so the console layer's output watcher answers; then output pauses
 /// with the caret parked, and the body is left until it stops moving.
-fn watch(presentable: bool, ink: bool, park: Park, trace: &mut Vec<String>) -> Settled {
+fn watch(presentable: bool, ink: bool, park: Park) -> Settled {
     let mut now = Instant::now();
     let mut scene = Scene::new(
         presentable,
@@ -146,19 +146,7 @@ fn watch(presentable: bool, ink: bool, park: Park, trace: &mut Vec<String>) -> S
         if i % 15 == 1 && (park == Park::LineStart || line < lines) {
             scene.term.process(b"\r\n");
         }
-        let f = scene.tick(now);
-        trace.push(format!(
-            "stream {i:3} col={:7.2} row={:6.2} caret={:?} alpha={} nf={} legacy={} handoff={} {} {:?}",
-            f.col,
-            f.row,
-            (scene.term.cursor().row, scene.term.cursor().col),
-            f.alpha,
-            scene.brain.needs_frames(),
-            scene.brain.console_legacy_motion_pending(),
-            scene.brain.console_resident_handoff_pending(),
-            scene.brain.console_reason(),
-            scene.brain.console_attention(),
-        ));
+        scene.tick(now);
     }
     let cursor = scene.term.cursor();
     let caret = (cursor.row, cursor.col);
@@ -169,17 +157,6 @@ fn watch(presentable: bool, ink: bool, park: Park, trace: &mut Vec<String>) -> S
         now += Duration::from_millis(16);
         frame = scene.tick(now);
         frames = i + 1;
-        trace.push(format!(
-            "parked {i:3} col={:7.2} row={:6.2} caret={caret:?} alpha={} nf={} legacy={} handoff={} {} {:?}",
-            frame.col,
-            frame.row,
-            frame.alpha,
-            scene.brain.needs_frames(),
-            scene.brain.console_legacy_motion_pending(),
-            scene.brain.console_resident_handoff_pending(),
-            scene.brain.console_reason(),
-            scene.brain.console_attention()
-        ));
         if scene.brain.needs_frames() {
             still = 0;
         } else {
@@ -232,10 +209,8 @@ fn the_resident_settles_where_the_escort_settles() {
     let mut failures = Vec::new();
     for ink in [false, true] {
         for park in [Park::LineStart, Park::LineEnd] {
-            let mut bare_trace = Vec::new();
-            let mut live_trace = Vec::new();
-            let bare = watch(false, ink, park, &mut bare_trace);
-            let live = watch(true, ink, park, &mut live_trace);
+            let bare = watch(false, ink, park);
+            let live = watch(true, ink, park);
             let tag = format!("ink={ink} park={park:?}");
             table.push(report(&format!("escort   {tag}"), &bare));
             table.push(report(&format!("resident {tag}"), &live));
@@ -274,15 +249,6 @@ fn the_resident_settles_where_the_escort_settles() {
                      (caret col {})",
                     live.frame.col, live.caret.1,
                 ));
-            }
-            if std::env::var_os("STANDOFF_TRACE").is_some() {
-                for line in bare_trace
-                    .iter()
-                    .map(|l| format!("bare {l}"))
-                    .chain(live_trace.iter().map(|l| format!("live {l}")))
-                {
-                    println!("    {line}");
-                }
             }
         }
     }

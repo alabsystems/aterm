@@ -8,7 +8,7 @@
 //! a second supervisor on the same session learns it is second.
 //!
 //! * Taken at the start of an unattended loop as a lease
-//!   (`ttl=`[`CLAIM_TTL_MS`]), renewed every [`CLAIM_RENEW`] by the loop's
+//!   (`ttl=`[`ttl_ms`]), renewed every [`CLAIM_RENEW`] by the loop's
 //!   next request ([`Session::renew_claim_if_due`]), so a dead loop's claim
 //!   lapses. A lease because the CLI may open a connection per request.
 //! * Released at the end (`meta unset supervisor`), only when held.
@@ -38,8 +38,11 @@ use super::*;
 /// behind another supervisor", not as a fault.
 pub const CLAIM_HELD: &str = "supervisor claim held by ";
 
-/// The claim's lease, ms: three renewals' worth.
-pub(super) const CLAIM_TTL_MS: u64 = 90_000;
+/// The claim's lease, ms, on the clock `t` ([`crate::harness::Timings::claim_ttl`]):
+/// the product's is 90 s, three renewals' worth.
+pub(super) fn ttl_ms(t: &crate::harness::Timings) -> u64 {
+    u64::try_from(t.claim_ttl.as_millis()).unwrap_or(u64::MAX)
+}
 /// How often the claim is renewed (and, behind another holder, tried). Public
 /// because the in-GUI host's adopted-claim grace after a seamless update is
 /// counted in these steps (aterm-gui `harness_host`).
@@ -147,7 +150,7 @@ pub(super) fn is_input(args: &[&str]) -> bool {
 
 /// The verbs a watching-only loop may not send: everything that types into
 /// the worker, and every attention write.
-fn is_write(args: &[&str]) -> bool {
+pub(crate) fn is_write(args: &[&str]) -> bool {
     let words: Vec<&str> = args
         .iter()
         .copied()
@@ -160,13 +163,20 @@ fn is_write(args: &[&str]) -> bool {
     )
 }
 
+/// The holder a loop no one named claims the session under:
+/// `aterm-supervise:<pid>`, this process's. Read where a setup is made
+/// ([`super::SessionSetup::new`], [`Session::set_supervisor_name`]`(None)`),
+/// never as the claim is taken, so a loop rebuilt from a tape's header
+/// claims under the recorded holder and does not read its own pid.
+pub(super) fn default_holder() -> String {
+    format!("aterm-supervise:{}", std::process::id())
+}
+
 impl<C: Ctl> Session<'_, C> {
     /// The name this loop claims the session under
-    /// ([`Self::set_supervisor_name`]).
+    /// ([`Self::set_supervisor_name`]; resolved in its setup).
     fn holder(&self) -> String {
-        self.supervisor_name
-            .clone()
-            .unwrap_or_else(|| format!("aterm-supervise:{}", std::process::id()))
+        self.setup.holder.clone()
     }
 
     /// One `meta set supervisor <holder> ttl=<ms>`, straight to the
@@ -174,9 +184,9 @@ impl<C: Ctl> Session<'_, C> {
     /// inside [`Self::call`]); `None` when it was not served.
     fn set_claim(&mut self) -> Option<CtlReply> {
         let holder = self.holder();
-        let ttl = format!("ttl={}", self.claim_ttl_ms);
+        let ttl = format!("ttl={}", self.setup.claim_ttl_ms);
         let mut args: Vec<&str> = Vec::with_capacity(5);
-        if let Some(sid) = &self.sid {
+        if let Some(sid) = &self.setup.sid {
             args.push(sid.as_str());
         }
         args.extend(["meta", "set", "supervisor", holder.as_str(), ttl.as_str()]);
@@ -189,7 +199,7 @@ impl<C: Ctl> Session<'_, C> {
     /// Where a `meta set supervisor` reply leaves the claim, and the line
     /// that says a change.
     fn claim_from(&mut self, r: &CtlReply) -> Option<String> {
-        let now = Instant::now();
+        let now = self.fx.mono();
         if r.ok() {
             // Taken quietly (`status supervisor=` says it); only a claim
             // won from behind another holder is news — a park's retake of
@@ -220,7 +230,7 @@ impl<C: Ctl> Session<'_, C> {
     /// tries again.
     pub(super) fn take_claim(&mut self, review: &mut dyn Review) {
         // Beside a proven self-claim: nothing is claimed, and it is said once.
-        if let Some(holder) = self.beside.clone() {
+        if let Some(holder) = self.setup.beside.clone() {
             let said = self.claim.known_holder() != Some(holder.as_str());
             self.claim = Claim::Beside {
                 holder: holder.clone(),
@@ -244,9 +254,11 @@ impl<C: Ctl> Session<'_, C> {
             }
             None => {
                 self.claim = Claim::Pending {
-                    tried: Instant::now()
-                        .checked_sub(self.claim_renew)
-                        .unwrap_or_else(Instant::now),
+                    tried: self
+                        .fx
+                        .mono()
+                        .checked_sub(self.setup.claim_renew)
+                        .unwrap_or_else(|| self.fx.mono()),
                 };
             }
         }
@@ -270,7 +282,7 @@ impl<C: Ctl> Session<'_, C> {
             | Claim::GivenBack { .. }
             | Claim::Beside { .. } => return,
         };
-        if last.is_some_and(|t| t.elapsed() < self.claim_renew) {
+        if last.is_some_and(|t| self.fx.since(t) < self.setup.claim_renew) {
             return;
         }
         match self.set_claim() {
@@ -284,7 +296,7 @@ impl<C: Ctl> Session<'_, C> {
             // answered: pending, asked again before the next request.
             None => {
                 self.claim = Claim::Pending {
-                    tried: Instant::now(),
+                    tried: self.fx.mono(),
                 };
             }
         }
@@ -332,7 +344,7 @@ impl<C: Ctl> Session<'_, C> {
     fn unset_claim(&mut self) {
         let mine = format!("holder={}", self.holder());
         let mut args: Vec<&str> = Vec::with_capacity(5);
-        if let Some(sid) = &self.sid {
+        if let Some(sid) = &self.setup.sid {
             args.push(sid.as_str());
         }
         args.extend(["meta", "unset", "supervisor", mine.as_str()]);

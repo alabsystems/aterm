@@ -164,8 +164,7 @@ pub fn stable_exe() -> Option<PathBuf> {
 /// resolves.
 #[must_use]
 pub fn rl_dir() -> Option<PathBuf> {
-    crate::operator::default_state_root()
-        .ok()
+    aterm_types::dirs::state_dir()
         .map(|root| rl_dir_in(&root.join("harness").join(super::cli::HARNESS)))
 }
 
@@ -176,7 +175,7 @@ pub fn rl_dir_in(state: &Path) -> PathBuf {
 }
 
 /// Whether `sid` is a tab id (`s-<hex>`): the only kind joined onto a path.
-fn is_tab_id(sid: &str) -> bool {
+pub(crate) fn is_tab_id(sid: &str) -> bool {
     sid.strip_prefix("s-").is_some_and(|hex| {
         (1..=64).contains(&hex.len()) && hex.bytes().all(|b| b.is_ascii_hexdigit())
     })

@@ -2,18 +2,16 @@
 // Copyright 2026 Andrew Yates
 
 //! Serde corpus (docs/AUDIT-third-party-2026-10-15.md, SP.3) for the
-//! sparkle-words custom fragment, Toy Packs and Trail Packs. Packs are
-//! third-party input and every pack table is `deny_unknown_fields`; the custom
-//! fragment is the opposite (container `default`, unknown keys ignored, an
-//! `untagged` ink). None of these models is `Serialize`, so an `Ok` is recorded
-//! as its `Debug`.
+//! sparkle-words custom fragment and Toy Packs. Packs are third-party input
+//! and every pack table is `deny_unknown_fields`; the custom fragment is the
+//! opposite (container `default`, unknown keys ignored, an `untagged` ink).
+//! None of these models is `Serialize`, so an `Ok` is recorded as its `Debug`.
 
 #[path = "../../aterm-json/test_support/serde_corpus.rs"]
 mod answers;
 
 use answers::Corpus;
 use aterm_effects::spec::{compile_toy_pack_toml, parse_custom_toml};
-use aterm_effects::trail_pack::compile_trail_pack_toml;
 
 /// `base` with each `(from, to)` applied; `from` must occur exactly once, so
 /// a mutation can never silently leave the document as it was.
@@ -355,107 +353,6 @@ fn toy_packs_answer_as_recorded() {
     ];
     for (id, edits) in cases {
         corpus.record(*id, read(&mutate(TOY_PACK, edits)));
-    }
-    corpus.finish();
-}
-
-const SYNTHWAVE: &str = include_str!("../assets/trail-packs/synthwave.toml");
-
-#[test]
-fn trail_packs_answer_as_recorded() {
-    let mut corpus = Corpus::new(env!("CARGO_MANIFEST_DIR"), "trail-pack");
-    let read = |doc: &str| compile_trail_pack_toml(doc).map(|pack| format!("{pack:?}"));
-    let synthwave = lf(SYNTHWAVE);
-    corpus.record("bundled/synthwave", read(&synthwave));
-    corpus.record(
-        "bundled/emberfall",
-        read(&lf(include_str!("../assets/trail-packs/emberfall.toml"))),
-    );
-    let layers_start = synthwave.find("[[beam.layers]]").expect("the beam layers");
-    let layers_end = synthwave.find("[ramp]").expect("the ramp table");
-    let layers = &synthwave[layers_start..layers_end];
-    let cases: &[(&str, &[(&str, &str)])] = &[
-        (
-            "unknown-key/root",
-            &[(
-                "name = \"Synthwave\"\n",
-                "name = \"Synthwave\"\nhomepage = \"x\"\n",
-            )],
-        ),
-        (
-            "unknown-key/beam",
-            &[(
-                "enabled = true\ncell_frac",
-                "enabled = true\nglow = 1\ncell_frac",
-            )],
-        ),
-        (
-            "unknown-key/envelope",
-            &[("hold_frac = 0.45 }", "hold_frac = 0.45, tail = 1 }")],
-        ),
-        (
-            "unknown-key/ring",
-            &[("life_ms = 320\n", "life_ms = 320\nwidth = 2\n")],
-        ),
-        ("missing-key/pack", &[("pack = 1 ", "")]),
-        (
-            "missing-key/layer-thickness",
-            &[("thickness_mul = 1.45\n", "")],
-        ),
-        (
-            "missing-key/defaulted-name",
-            &[("name = \"Synthwave\"\n", "")],
-        ),
-        (
-            "wrong-type/cell-frac-string",
-            &[("cell_frac = 0.16", "cell_frac = \"0.16\"")],
-        ),
-        (
-            "wrong-type/enabled-int",
-            &[("glow_add = true", "glow_add = 1")],
-        ),
-        (
-            "wrong-type/layers-table",
-            &[(
-                layers,
-                "[beam.layers.wide]\nthickness_mul = 2.0\ncoverage_mul = 0.14\nstride = 3\n\n",
-            )],
-        ),
-        (
-            "array-for-table/envelope",
-            &[(
-                "envelope = { kind = \"hold_cosine\", hold_frac = 0.45 }",
-                "envelope = [\"hold_cosine\", 0.45]",
-            )],
-        ),
-        (
-            "int/stride-u32-overflow",
-            &[("stride = 3", "stride = 4294967296")],
-        ),
-        ("int/life-negative", &[("life_ms = 320", "life_ms = -320")]),
-        ("int/pack-hex", &[("pack = 1 ", "pack = 0x1 ")]),
-        ("zero/pack-negative-int", &[("pack = 1 ", "pack = -0 ")]),
-        (
-            "zero/gravity-negative-float",
-            &[("gravity = -0.4", "gravity = -0.0")],
-        ),
-        (
-            "float/cell-frac-nan",
-            &[("cell_frac = 0.16", "cell_frac = nan")],
-        ),
-        (
-            "float/cell-frac-negative-nan",
-            &[("cell_frac = 0.16", "cell_frac = -nan")],
-        ),
-        ("float/sat-inf", &[("sat = 0.92", "sat = inf")]),
-        (
-            "float/thickness-int",
-            &[("thickness_mul = 2.0", "thickness_mul = 2")],
-        ),
-        ("float/vx-short", &[("vx = [-0.4, 0.4]", "vx = [-0.4]")]),
-    ];
-    for (id, edits) in cases {
-        corpus.record(*id, read(&mutate(&synthwave, edits)));
     }
     corpus.finish();
 }

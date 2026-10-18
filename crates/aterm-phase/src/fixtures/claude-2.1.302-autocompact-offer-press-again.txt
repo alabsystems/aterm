@@ -1,0 +1,20 @@
+# claude-code 2.1.302 · HAND-BUILT 2026-10-16 from the 2.1.302 render code (`dbe` in the permission frame `ka`: a full-width `─` top border, the title at column one, the dialog's own paddingX 2 and paddingY 1 inside the frame's paddingX 1, so its body, Select and footer three columns in; the vendor Select with `hideIndexes`, `❯` on the focused row, an unfocused label two columns further in; the footer `Q8e` under a marginTop-1 gap), not measured — no lab capture of this dialog exists yet · the offer while an exit is pending: the footer reads `Press Ctrl-C again to exit` (the vendor's `de.pending`), not answerable
+⏺ The suites pass: 412 tests, 0 failures. The branch is pushed.
+
+✻ Worked for 3m 12s
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ We recommend compacting earlier
+
+   Each message re-sends the whole conversation, so long conversations use up your plan's usage limits faster. With
+   your current settings, Claude Code autocompacts (replaces older messages with a summary) at 1m tokens (default via
+   auto setting). Compacting earlier can reduce usage, but it happens more often, and some details can be lost each
+   time.
+
+   Want to autocompact at 400k tokens instead? Your model doesn't change. Switch back any time with /autocompact.
+
+   ❯ Keep auto (1m tokens)
+     Autocompact at ‹ 400k › tokens
+
+   Press Ctrl-C again to exit
+

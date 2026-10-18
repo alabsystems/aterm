@@ -92,7 +92,6 @@ fn cfg(style: GlowStyle) -> GlowConfig {
         ring: true,
         beam: !matches!(style, GlowStyle::Water | GlowStyle::RainbowKitty),
         head_dx: 0.5,
-        pack: None,
     }
 }
 
@@ -393,36 +392,6 @@ fn mid_band(cols: &BTreeSet<u16>) -> usize {
     cols.iter().filter(|&&c| (18..=60).contains(&c)).count()
 }
 
-fn report(tag: &str, r: &Run) {
-    eprintln!("== {tag} ==");
-    eprintln!("  wrap move: {:?} -> {:?}", r.wrap_move.0, r.wrap_move.1);
-    if let (Some((pr, pc)), Some((cr, cc))) = (r.wrap_move.0, r.wrap_move.1) {
-        let dr = cr as i32 - pr as i32;
-        let dc = cc as i32 - pc as i32;
-        let shape_wrap = cr == pr.saturating_add(1) && cc <= 1 && (pc as usize) + 2 >= COLS;
-        // The typed hint is armed on every key here, so the hinted RE-ANCHOR
-        // (dr_abs == 1 && raw_dist > 2) collapses what the shape test misses.
-        let re_anchor = dr.abs() == 1 && dr.abs().max(dc.abs()) > 2;
-        eprintln!(
-            "  dr={dr} dc={dc} shape-wrap={shape_wrap} hinted-re-anchor={re_anchor} \
-             => typing={}",
-            shape_wrap || re_anchor || dr.abs().max(dc.abs()) <= 1,
-        );
-    }
-    for (row, cols) in r.rows.iter().enumerate() {
-        if !cols.is_empty() {
-            eprintln!(
-                "  row {row:2}: {:3} cols covered  [{:?}..{:?}]  (FirePatch cells: {})",
-                cols.len(),
-                cols.iter().next().unwrap(),
-                cols.iter().last().unwrap(),
-                r.rows_patches[row].len(),
-            );
-        }
-    }
-    eprintln!("  wrap-frame quads={}", r.quads_on_wrap_frame);
-}
-
 /// Fire: the Ink wrap ((19,77)->(20,4), visible to visible in one frame) pairs
 /// with the typed hint and re-anchors: no meteor, arrival strike or ember
 /// fountain along a 73-column vector. The landing row stays confined to the
@@ -431,8 +400,6 @@ fn report(tag: &str, r: &Run) {
 fn ink_wrap_fire_stays_confined_to_typed_cells() {
     let ink = run_ink(GlowStyle::Fire, WRAP_W + 5, false);
     let zsh = run_zsh(GlowStyle::Fire, 78 + 4);
-    report("INK fire", &ink);
-    report("ZSH fire (control)", &zsh);
 
     // The derived move is the Ink wrap shape (0-based): the caret leaves TEXT0's
     // last interior column for TEXT1 col 4, not (col<=1, from col>=cols-2), so
@@ -498,8 +465,6 @@ fn ink_wrap_fire_stays_confined_to_typed_cells() {
 fn ink_wrap_rainbow_keeps_the_ribbon_no_zoom() {
     let ink = run_ink(GlowStyle::RainbowKitty, WRAP_W + 5, false);
     let zsh = run_zsh(GlowStyle::RainbowKitty, 78 + 4);
-    report("INK nyan", &ink);
-    report("ZSH nyan (control)", &zsh);
     // Body coverage (`rows_body`): the zoom-bar tell is full-cell band/slab
     // geometry; star pluses streaming onto this row are filtered by `cover`.
     // Each key typed on the landing row births a fresh-ink pop whose birth halo
@@ -527,8 +492,6 @@ fn ink_wrap_rainbow_keeps_the_ribbon_no_zoom() {
 fn ink_wrap_laser_lays_no_full_vector_sweep() {
     let ink = run_ink(GlowStyle::Laser, WRAP_W + 5, false);
     let zsh = run_zsh(GlowStyle::Laser, 78 + 4);
-    report("INK laser", &ink);
-    report("ZSH laser (control)", &zsh);
     let landing = ink.rows[(TEXT1 - 1) as usize].len();
     let origin_row = ink.rows[(TEXT0 - 1) as usize].len();
     assert!(
@@ -554,7 +517,6 @@ fn ink_wrap_laser_lays_no_full_vector_sweep() {
 #[test]
 fn hidden_mid_repaint_frame_suppresses_the_spawn_entirely() {
     let ink = run_ink(GlowStyle::Fire, WRAP_W + 5, true);
-    report("INK fire, split burst", &ink);
     // Cursor-anchored art (crown bloom, the old line's flame skirt at cols
     // ~74..78) still shows, but the mid-band stays dark: no meteor spawned.
     let landing_mid = mid_band(&ink.rows[(TEXT1 - 1) as usize]);

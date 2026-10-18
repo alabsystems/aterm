@@ -6,8 +6,10 @@
 //! Cruise or Land, and the window's host holding the session's live
 //! supervisor claim — Claude Code's launch card wears an animated rainbow
 //! border, a pixel-art aterm kitty riding a rainbow trail with stars, and the
-//! line `✦ enhanced by aterm harness <version> · autopilot ∞ cruise` (Land:
-//! `· autopilot ⤓ land`, in a sunset). Off, the master switch off and a
+//! line `✦ enhanced by aterm harness <version> · autopilot ∞ cruise` (an armed
+//! timer's time after it, `∞ cruise ⤓18:00`; Land: `· autopilot ⤓ land`, in a
+//! sunset; a landing's end, `· autopilot ✓ landed` or `· autopilot ✓ done` —
+//! [`LineEnd`]). Off, the master switch off and a
 //! window with no host show the vendor's card bare. Owner, 2026-10-15: "I'd
 //! like for a rainbow border and a similar pixel art with an aterm kitty and
 //! fancy rainbows and star power to show off the power of the harness and a
@@ -21,7 +23,11 @@
 //!   (`aterm_phase::launch_card_scan`, never spelled here),
 //!   read at most once per rebuild of the pane's text (the footer's
 //!   `claude_footer::PaneTextCache::launch_card`) and kept across a rebuild
-//!   that changed no row the reading reads ([`CardReading::holds`]).
+//!   that changed no row the reading reads ([`CardReading::holds`]). A card
+//!   on the glass is HELD on a rebuild the reader cannot place it on while
+//!   its words stand at its place — the vendor's fullscreen entrance moves
+//!   the mascot, both arms up or a row low, beside words that never move —
+//!   and goes on the rebuild its banner leaves ([`read_card`]).
 //! * WHERE IT IS COMPOSED. In `App::splice_claude_footer`, the one place that
 //!   holds the pane's text rows, its rect and the strip offset for the frame
 //!   being presented, on every route — single, composed, heterogeneous and
@@ -44,11 +50,14 @@
 //!   the banner row two cells past the banner's end, if those cells are blank,
 //!   and the box keeps three rows; otherwise there is no line. A narrow pane
 //!   drops ` · autopilot …` first, then steps the version down
-//!   (`menu::VersionRung::Short`; a release has none), then the line. The
-//!   kitty rides right of the card's first two rows, after a trail of 8 to 20
+//!   (`menu::VersionRung::Short`; a release has none), then the line; an
+//!   armed timer's ` ⤓18:00` goes before ` · autopilot …` does. The kitty
+//!   rides right of the card's first two rows, after a trail of 8 to 20
 //!   cells, only where those cells are blank and leave four cells of stars
 //!   and the border inside the pane; otherwise the kitty and its trail go and
-//!   the border and the line stay.
+//!   the border and the line stay. Where the third row — the working
+//!   directory's — is blank too, from the trail's start to the margin's end,
+//!   the kitty stands three rows tall (§10.6), else two.
 //! * THE STREAMS. The border and the trail (the emitter's `under`) go to
 //!   `RenderInput::glow_under` — WINDOW-ABSOLUTE pixels, drawn beneath the
 //!   glyph ink; the kitty and the stars (`over`) to `RenderInput::nova_add` —
@@ -71,9 +80,12 @@
 //! * EPISODES, THEN STILLNESS. An episode (`harness_card::EPISODE_MS`) is armed
 //!   when a card is first decorated for a process (its group and its card's
 //!   build), when the session's Autopilot changes (into Cruise or Land), and
-//!   when the window regains focus ([`App::rearm_claude_cards`]). A card is
-//!   the session's, not the leaf's: a pane that moves in the plan (zoomed, a
-//!   sibling split or closed to its left) keeps its card and its episode.
+//!   when the window regains focus ([`App::rearm_claude_cards`]); the kitty
+//!   rides in on the first only, and once the card has been on the glass at
+//!   rest it plays every later one in its seat (`harness_card`'s `Ride`). A
+//!   card is the session's, not the leaf's: a pane that moves in the plan
+//!   (zoomed, a sibling split or closed to its left) keeps its card and its
+//!   episode.
 //!   While it plays, each frame is due a `FRAME_MS` after the last one drawn
 //!   — an instant no other wake can push on — and is judged on every wake
 //!   (`App::claude_cards_due`, beside the band's motion). After it the frame
@@ -122,7 +134,7 @@
 //!   steady-state tests); a card hidden mid-episode stops asking once its
 //!   episode wants nothing more ([`App::claude_cards_due`]).
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use aterm_core::render::{DecoBlend, DecoGlyph, GlowQuad, InkCell, RenderInput, WordDecoration};
@@ -132,7 +144,10 @@ use aterm_effects::harness_card::{
 };
 use aterm_phase::CardPlace;
 
+use aterm_agent::harness::acts::TaskFace;
+
 use crate::autopilot::AutopilotView;
+use crate::claude_lights::LandAtGlass;
 use crate::{App, WindowId};
 
 /// The trail's shortest run (cells): with less room the kitty and its trail
@@ -157,6 +172,42 @@ const STAR_INK_ALPHA: u8 = 230;
 pub(crate) struct CardRead {
     pub(crate) place: CardPlace,
     pub(crate) version: Box<str>,
+    /// The card's words at its place (`aterm_phase::launch_card_words`), its
+    /// three rows' joined by `\n`: what the next reading HOLDS the card by on
+    /// rows the reader does not place it on ([`read_card`]).
+    words: Box<str>,
+}
+
+impl CardRead {
+    /// The card's words, row by row.
+    fn words(&self) -> [&str; 3] {
+        let mut rows = self.words.splitn(3, '\n');
+        [(); 3].map(|()| rows.next().unwrap_or_default())
+    }
+}
+
+/// The card a pane's readings had, handed to the next reading of its rows
+/// ([`read_card`]).
+#[derive(Clone, Debug)]
+pub(crate) struct CardBefore {
+    pub(crate) card: Arc<CardRead>,
+    /// The card is the LAST reading's — the one on the glass — and the rows
+    /// it is handed to are the next rebuild's after that reading (or the
+    /// same rows again), so the reading of them may hold it. Else it is an
+    /// earlier reading's (the last had no card, or a rebuild no reading saw
+    /// changed rows since), which a reading only shares where it places the
+    /// same card again.
+    pub(crate) last: bool,
+}
+
+impl CardBefore {
+    /// This card, handed past a reading that did not have it.
+    pub(crate) fn earlier(self) -> Self {
+        Self {
+            last: false,
+            ..self
+        }
+    }
 }
 
 /// One reading of a pane's rows for the card ([`read_card`]): the card, and
@@ -195,24 +246,48 @@ impl CardReading {
 /// panic fence (`reader_guard`): no card when none is placed (narrow, cut,
 /// redesigned — the card goes bare, never wrong) or its banner's version
 /// does not parse, and nothing known when the reader panicked. A card equal
-/// to `before` — the last reading's, where it had one — IS `before`,
+/// to `before`'s — the last reading's, where it had one — IS that card,
 /// shared: a rebuild that moved the card nowhere allocates nothing for it.
-pub(crate) fn read_card(
-    session: u64,
-    rows: &[String],
-    before: Option<Arc<CardRead>>,
-) -> CardReading {
+///
+/// The last rebuild's card (`before`, [`CardBefore::last`]) is HELD on rows
+/// the reader places nothing on at or under it while its words stand at its
+/// place (`aterm_phase::launch_card_held`): the vendor's fullscreen entrance
+/// moves the mascot left of the words — a row low in its dust, both arms up
+/// — on frames the reader cannot place, and the card stays on the glass
+/// through them instead of blinking. The held reading's banner is the card's
+/// own row, so [`CardReading::holds`] keeps it while none of its rows
+/// changes and no newer banner draws under it, and reads again — holding or
+/// letting go — when one does: the card goes on the frame its words leave
+/// (scrolled, cleared, overwritten, the program's screen gone, the narrow
+/// layout) or a newer card shows under it. A pane whose grid moved (a
+/// resize, another pane region) starts from no reading, and holds nothing.
+pub(crate) fn read_card(session: u64, rows: &[String], before: Option<CardBefore>) -> CardReading {
     #[cfg(test)]
     crate::work_counts::card_read();
     crate::reader_guard::read_or_none(session, "harness card", rows, || {
-        let (banner, place) = aterm_phase::launch_card_scan(rows);
+        let scan = aterm_phase::launch_card_scan(rows);
+        if let Some(CardBefore { card, last: true }) = &before
+            && aterm_phase::launch_card_held(rows, scan, &card.place, card.words())
+        {
+            return CardReading {
+                banner: Some(Some(card.place.top)),
+                read: Some(Arc::clone(card)),
+            };
+        }
+        let (banner, place) = scan;
         let read = place.and_then(|place| {
             let version = aterm_phase::launch_card_version(rows, &place)?;
+            let words = aterm_phase::launch_card_words(rows, &place)?;
             Some(match before {
-                Some(was) if was.place == place && *was.version == *version => was,
+                Some(CardBefore { card: was, .. })
+                    if was.place == place && *was.version == *version && was.words() == words =>
+                {
+                    was
+                }
                 _ => Arc::new(CardRead {
                     place,
                     version: version.into(),
+                    words: words.join("\n").into(),
                 }),
             })
         });
@@ -259,6 +334,10 @@ pub(crate) struct CardLeaf {
     /// The session's effective Autopilot, wrapped or not: a change into
     /// Cruise or Land arms an episode.
     view: AutopilotView,
+    /// How the line ends ([`LineEnd`]): Land's task's end, or Cruise's armed
+    /// timer, filled for a Land or Cruise leaf with a card by
+    /// [`App::compose_claude_cards`].
+    end: LineEnd,
     /// The card to decorate — the pane cache's reading, shared — the
     /// process it belongs to (its group) and the number of the CURRENT
     /// rebuild of the pane's text, which names this frame's cells (the
@@ -350,6 +429,10 @@ struct LaidKey {
     blank: RenderCell,
     place: CardPlace,
     view: AutopilotView,
+    /// The words the line ends with: a face's move, or a timer's, lays the
+    /// line anew (its widest words that fit change, made here and nowhere
+    /// else, [`line_texts`]), and arms no episode (§9.4.1, §10.6).
+    end: LineEnd,
     px: Pixels,
     serious: bool,
     kitty: (u8, u8),
@@ -932,36 +1015,140 @@ fn pack_fill((r, g, b): (f32, f32, f32)) -> u32 {
     (channel(r) << 16) | (channel(g) << 8) | channel(b)
 }
 
-/// The line's words for `view` ([`make_line_texts`]), made once per view:
-/// the build is the process's, so they never change while it runs, and a
-/// frame formats nothing.
-fn line_texts(view: AutopilotView) -> &'static [String] {
-    static TEXTS: [OnceLock<Vec<String>>; 5] = [const { OnceLock::new() }; 5];
-    let slot = match view {
-        AutopilotView::Cruise => &TEXTS[0],
-        AutopilotView::Land => &TEXTS[1],
-        AutopilotView::Off => &TEXTS[2],
-        AutopilotView::MasterOff => &TEXTS[3],
-        AutopilotView::Unhosted => &TEXTS[4],
-    };
-    slot.get_or_init(|| make_line_texts(view))
+/// HOW A CARD'S LINE ENDS (`docs/DESIGN-harness-autopilot-2026-10-15.md`
+/// §9.4.1, §10.2.3 item 2): with the Autopilot's own words (`· autopilot ⤓
+/// land`), or, under Land or Cruise, with how the work ended — `· autopilot
+/// ✓ landed` (a landing ended it) or `· autopilot ✓ done` (the done check or
+/// the worker's own token ended it), the words the chip's own faces use. A
+/// landing spent, or a person's own exchange, keeps the mode's words: the
+/// card says the mode, the chip says it is quiet. Under Cruise an armed
+/// timer follows the mode (§10.6): `· autopilot ∞ cruise ⤓18:00`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) enum LineEnd {
+    /// The Autopilot's own words.
+    #[default]
+    Mode,
+    /// `✓ landed`.
+    Landed,
+    /// `✓ done`.
+    Done,
+    /// `∞ cruise ⤓18:00` — `⤓Sat 18:00` on another day: Cruise until the
+    /// armed timer's time (`ChipFace::CruiseUntil`), as the timer's index
+    /// gives it (`ChipGlass::land_at`) and the title writes it
+    /// (`autopilot_menu::when`).
+    CruiseUntil(LandAtGlass),
 }
 
-/// The line's words for `view`, widest first: with the Autopilot, without it,
-/// then on the short version rung (a release has none). The version is the
-/// running build's own signature (`menu::version_signature`), so one build
-/// reads the same here as in the menu bar.
-fn make_line_texts(view: AutopilotView) -> Vec<String> {
+impl LineEnd {
+    /// The end a line under `view` takes for the task's face `task` (`None`:
+    /// unknown): a face only where the harness carries the work (Land, and
+    /// Cruise since §10.2), and only its two ends.
+    #[must_use]
+    pub(crate) const fn of(view: AutopilotView, task: Option<TaskFace>) -> Self {
+        match (view, task) {
+            (AutopilotView::Land | AutopilotView::Cruise, Some(TaskFace::Landed)) => {
+                LineEnd::Landed
+            }
+            (AutopilotView::Land | AutopilotView::Cruise, Some(TaskFace::Done)) => LineEnd::Done,
+            _ => LineEnd::Mode,
+        }
+    }
+
+    /// This end under `view`, with the session's armed timer `land_at`
+    /// (`ChipGlass::land_at`; `None`: none armed): Cruise's own words gain
+    /// the timer's time ([`LineEnd::CruiseUntil`]); every other end, and every
+    /// other view, says what it says.
+    #[must_use]
+    pub(crate) const fn timed(self, view: AutopilotView, land_at: Option<LandAtGlass>) -> Self {
+        match (self, view, land_at) {
+            (LineEnd::Mode, AutopilotView::Cruise, Some(at)) => LineEnd::CruiseUntil(at),
+            _ => self,
+        }
+    }
+
+    /// The glyph and the word the line ends with under `view`: the chip's
+    /// own (the face table, `ChipFace`), so the card and the chip say a
+    /// landing's end alike (a timer's time follows them, [`make_line_texts`]).
+    const fn words(self, view: AutopilotView) -> (&'static str, &'static str) {
+        let face = match self {
+            LineEnd::Mode | LineEnd::CruiseUntil(_) => return (view.glyph(), view.wire()),
+            LineEnd::Landed => crate::claude_lights::ChipFace::Landed,
+            LineEnd::Done => crate::claude_lights::ChipFace::Done,
+        };
+        match face.word() {
+            Some(word) => (face.glyph(), word),
+            None => (view.glyph(), view.wire()),
+        }
+    }
+}
+
+/// The line's words for `view` and how it ends ([`make_line_texts`]), made
+/// once per pair: the build is the process's, so they never change while it
+/// runs, and a frame formats nothing — they are looked up only where the
+/// card is laid out, when its key moves or the cells its layout read do.
+fn line_texts(view: AutopilotView, end: LineEnd) -> &'static [String] {
+    static TEXTS: [OnceLock<Vec<String>>; 7] = [const { OnceLock::new() }; 7];
+    // A task's end is told where the harness carries the work (Land, and
+    // Cruise since §10.2): its words are the face's alone, whichever mode;
+    // an armed timer's time follows Cruise's own words (§10.6).
+    let end = match (view, end) {
+        (AutopilotView::Cruise, LineEnd::CruiseUntil(at)) => return timed_line_texts(at),
+        (AutopilotView::Land | AutopilotView::Cruise, _) => end,
+        _ => LineEnd::Mode,
+    };
+    let slot = match (view, end) {
+        (AutopilotView::Land | AutopilotView::Cruise, LineEnd::Landed) => &TEXTS[5],
+        (AutopilotView::Land | AutopilotView::Cruise, LineEnd::Done) => &TEXTS[6],
+        (AutopilotView::Cruise, _) => &TEXTS[0],
+        (AutopilotView::Land, LineEnd::Mode | LineEnd::CruiseUntil(_)) => &TEXTS[1],
+        (AutopilotView::Off, _) => &TEXTS[2],
+        // An agent's own switch off reads the master switch's words here.
+        (AutopilotView::MasterOff | AutopilotView::AgentOff(_), _) => &TEXTS[3],
+        (AutopilotView::Unhosted, _) => &TEXTS[4],
+    };
+    slot.get_or_init(|| make_line_texts(view, end))
+}
+
+/// The line's words under Cruise with a timer armed for `at`
+/// ([`LineEnd::CruiseUntil`]), made once per face a timer can wear — its
+/// clock and its day, at most 1440 × 8 of them, in practice the few times a
+/// person sets — and kept for the process like every other line's words
+/// ([`line_texts`]): a timer armed again for the same time takes the words
+/// already made.
+fn timed_line_texts(at: LandAtGlass) -> &'static [String] {
+    static MADE: Mutex<Vec<(LandAtGlass, &'static [String])>> = Mutex::new(Vec::new());
+    let mut made = MADE.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(&(_, texts)) = made.iter().find(|(face, _)| *face == at) {
+        return texts;
+    }
+    let texts: &'static [String] =
+        make_line_texts(AutopilotView::Cruise, LineEnd::CruiseUntil(at)).leak();
+    made.push((at, texts));
+    texts
+}
+
+/// The line's words for `view` ending `end`, widest first: with the
+/// Autopilot and an armed timer's time (`⤓18:00`, the chip's own mark), with
+/// the Autopilot, without it, then on the short version rung (a release has
+/// none). The version is the running build's own signature
+/// (`menu::version_signature`), so one build reads the same here as in the
+/// menu bar.
+fn make_line_texts(view: AutopilotView, end: LineEnd) -> Vec<String> {
+    use crate::claude_lights::ChipFace;
     use crate::menu::{VersionFacts, VersionRung, version_signature};
     let facts = VersionFacts::this_build();
-    let mut texts = Vec::with_capacity(3);
+    let mut texts = Vec::with_capacity(4);
     if let Some(full) = version_signature(facts, VersionRung::Full) {
         let head = format!("enhanced by aterm harness {full}");
-        texts.push(format!(
-            "{head} \u{b7} autopilot {} {}",
-            view.glyph(),
-            view.wire()
-        ));
+        let (glyph, word) = end.words(view);
+        let mode = format!("{head} \u{b7} autopilot {glyph} {word}");
+        if let LineEnd::CruiseUntil(at) = end {
+            let mark = ChipFace::CruiseUntil
+                .word()
+                .unwrap_or(AutopilotView::Land.glyph());
+            texts.push(format!("{mode} {mark}{}", crate::autopilot_menu::when(at)));
+        }
+        texts.push(mode);
         texts.push(head);
     }
     if let Some(short) = version_signature(facts, VersionRung::Short) {
@@ -1166,10 +1353,15 @@ struct Layout<'t> {
     /// The box's inner width, the column its right border is drawn in
     /// (`CardScene::cols`): never past the pane's last column.
     cols: usize,
-    /// The trail, `[start, end)`, on the card's first two rows.
+    /// The trail, `[start, end)`, beside the card's first rows.
     trail: Option<(usize, usize)>,
-    /// The kitty's left column on the card's first two rows.
+    /// The kitty's left column beside the card's first rows.
     kitty_col: Option<usize>,
+    /// How many of the card's rows the kitty stands on
+    /// (`CardScene::kitty_rows`, §10.6): three — the height of Claude's
+    /// mascot — where the card's third row, its working directory's, is
+    /// blank across the trail, the kitty and its margin; else two.
+    kitty_rows: usize,
     line: Option<LinePlace<'t>>,
 }
 
@@ -1280,12 +1472,29 @@ fn layout<'t>(
             }
         }
     }
+    // The tall kitty (§10.6): where the third row — the working directory's —
+    // is blank under the trail, the kitty and its margin, read once from the
+    // trail's start and no further than the margin's end, the kitty stands
+    // the card's three rows tall, its body (and the trail beside it) reaching
+    // into that row; a long path there keeps it two rows tall.
+    let kitty_rows = match kitty {
+        Some((start, kitty_col, _)) => {
+            let end = kitty_col + kc + KITTY_MARGIN;
+            if seen.blanks(cells, top + 2, start, end) == end - start {
+                3
+            } else {
+                2
+            }
+        }
+        None => 2,
+    };
     let cols = kitty.map_or(text_end, |(_, _, cols)| cols).min(max_border);
     Some(Layout {
         rows,
         cols,
         trail: kitty.map(|(start, kitty_col, _)| (start, kitty_col)),
         kitty_col: kitty.map(|(_, kitty_col, _)| kitty_col),
+        kitty_rows,
         line,
     })
 }
@@ -1367,6 +1576,7 @@ fn scene(
         ),
         trail: lay.trail.map(|(a, b)| (u16_of(a), u16_of(b))),
         kitty_col: lay.kitty_col.map(u16_of),
+        kitty_rows: u8::try_from(lay.kitty_rows).unwrap_or(2),
         palette: if view == AutopilotView::Land {
             CardPalette::Land
         } else {
@@ -1417,7 +1627,7 @@ fn lay_out(
         &cells,
         &read.place,
         kitty_width(key),
-        line_texts(key.view),
+        line_texts(key.view, key.end),
         seen,
     )?;
     let dark = dark_ground(key.blank);
@@ -1577,6 +1787,7 @@ pub(crate) fn card_leaf(
         pane,
         blank,
         view,
+        end: LineEnd::Mode,
         card,
     }
 }
@@ -1638,6 +1849,16 @@ impl App {
             .iter()
             .any(|leaf| leaf.card.is_some())
             .then(|| self.card_look(wid, focused));
+        // How each decorated Land or Cruise card's line ends: the task's
+        // face, or the armed timer's time, read off the glass the frame
+        // already reads (a map lookup or two a card, and none for a card
+        // under neither: §10.2.3, item 2; §10.6).
+        for leaf in leaves.iter_mut().filter(|leaf| {
+            leaf.card.is_some() && matches!(leaf.view, AutopilotView::Land | AutopilotView::Cruise)
+        }) {
+            let glass = self.chip_glass(leaf.session);
+            leaf.end = LineEnd::of(leaf.view, glass.task).timed(leaf.view, glass.land_at);
+        }
         let pool = &self.pool;
         let Some(ws) = self.windows.get_mut(&wid).map(Box::as_mut) else {
             return;
@@ -1703,6 +1924,7 @@ impl App {
                 blank: leaf.blank,
                 place: read.place,
                 view: leaf.view,
+                end: leaf.end,
                 px: look.px,
                 serious: look.serious,
                 kitty: look.kitty,
@@ -1898,7 +2120,7 @@ impl App {
             && !self
                 .serious_mode_policy()
                 .allows(crate::motion::SeriousEffect::HarnessCard);
-        let mut h = mix(u64::from(wrapped) | (view as u64) << 1 | u64::from(serious) << 8);
+        let mut h = mix(u64::from(wrapped) | view.code() << 1 | u64::from(serious) << 8);
         if wrapped
             && let Some(entry) = ws
                 .claude_card

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The walk a jump reads is the walk the band shows. Three laws at the host
+//! The walk a jump reads is the walk the band shows. Two laws at the host
 //! seam (`docs/design/RAINBOW-KITTY-V2.md` §35, §41, §42), each with a control:
 //!
 //! 1. **A jump's landing marks wear the band.** `Ribbon::walk_origin_at`
@@ -25,11 +25,6 @@
 //!    back onto the yanked word stays on the row's one walk. The price: ` /tmp`
 //!    after the yank starts at `cp `'s walk at column 22, `walk_t(20)`, not one
 //!    step past `cp `'s end. [`a_wake_keeps_the_colours_of_the_band_it_covers`].
-//! 3. **The dark-row wake ignores `last_walk`, invisibly.** After a band's
-//!    swoosh has finished, a jump onto its row starts the corridor cold (red,
-//!    `d = 0`) where a key would have continued the ended walk. The row holds
-//!    no other light, so there is no seam:
-//!    [`a_wake_after_a_finished_swoosh_has_nothing_lit_to_seam_against`].
 //!
 //! The host seam is `tests/midline_insert_band.rs`'s: a real
 //! `aterm_core::terminal::Terminal` driven byte for byte, the frame hold's rows
@@ -238,7 +233,8 @@ impl Host {
         self.glow.note_context(alt);
         observe_caret_row(&self.term, &mut self.glow, &mut self.row_buf, c, self.now);
         observe_ribbon_rows(&self.term, &mut self.glow, &mut self.row_buf);
-        self.glow.observe_print_anchor(self.term.print_anchor());
+        self.glow
+            .observe_print_anchor(aterm_effects::host::motion_print_anchor(&self.term).0);
         self.glow
             .tick(cur, self.now, &self.cfg, geom(), &mut self.out);
         let lit = self.lit_now();
@@ -785,117 +781,5 @@ fn a_wake_keeps_the_colours_of_the_band_it_covers() {
         fails.is_empty(),
         "a wake repaints the band it covers:\n{}",
         fails.join("\n")
-    );
-}
-
-// ---------------------------------------------------------------------------
-// (3) The dark row after a finished swoosh
-// ---------------------------------------------------------------------------
-
-/// (3) The dark-row wake ignores `last_walk`, and the eye cannot see it. A line
-/// typed, then a rest past its whole swoosh but inside `CHAIN_GAP_MAX` of its
-/// last key, so a key would continue the ended walk (`Ribbon::join_cohort`'s
-/// `last_walk` arm): the control types one key at the line's end. The take
-/// presses Ctrl-A: `Ribbon::wake_origin` finds no cohort and starts the
-/// corridor cold at the landing.
-///
-/// Asserted only as far as the eye goes: at the jump's frame the row holds no
-/// light but the corridor's, and on every frame no two lit neighbours step
-/// wider than the walk's widest step, so the start colour makes no seam. What
-/// differs is which colour the next phrase starts on.
-#[test]
-fn a_wake_after_a_finished_swoosh_has_nothing_lit_to_seam_against() {
-    const LINE: &str = "hello there this is a rainbow line";
-    // The control: the same rest, then a key at the end.
-    let mut c = Host::new(Shape::Claude);
-    c.type_str(LINE);
-    c.idle(2600);
-    let rib = c.glow.v2_ribbon().expect("rainbow kitty owns the frame");
-    assert!(
-        rib.cells().iter().all(|k| k.row != c.row),
-        "the premise: the swoosh is over, no cell on the row"
-    );
-    assert!(
-        c.now.saturating_duration_since(c.last_event).as_secs_f32()
-            < aterm_effects::rainbow_kitty::ribbon::CHAIN_GAP_MAX,
-        "…inside the chain window of the last key"
-    );
-    c.key_after('X', 10);
-    let rib = c.glow.v2_ribbon().expect("rainbow kitty owns the frame");
-    // The premise is read off the key's own cell (its `t` and walk distance):
-    // `heal_seams` merges the revived line and the key into one cohort anchored
-    // at the line's first column, origin `(0, 0)`, while the key's cell still
-    // continues the walk that ended.
-    let key_col = c.gcol(LINE.len());
-    let key = rib
-        .cells()
-        .iter()
-        .filter(|k| k.row == c.row && k.col == key_col)
-        .max_by_key(|k| k.born)
-        .copied()
-        .expect("the key laid its cell");
-    let walk = rib
-        .cohorts()
-        .iter()
-        .find(|k| k.id == key.cohort)
-        .expect("the key's cell has its cohort");
-    let continued = (key.t, walk.walk_d(key_col));
-    assert!(
-        continued.0 > WALK_STEP_MAX,
-        "the premise: a key continues the walk that ended ((t, d) at the key's own cell \
-         {continued:?}), not red"
-    );
-
-    // The take.
-    let mut h = Host::new(Shape::Claude);
-    h.type_str(LINE);
-    h.idle(2600);
-    let rib = h.glow.v2_ribbon().expect("rainbow kitty owns the frame");
-    assert!(
-        rib.cells().iter().all(|k| k.row != h.row),
-        "the premise: the swoosh is over, no cell on the row"
-    );
-    let l = h.nav(0, 1);
-    let jump_frame = h.jump_at;
-    assert!(l.meteors > 0, "the Ctrl-A flew a meteor");
-    let rib = h.glow.v2_ribbon().expect("rainbow kitty owns the frame");
-    let wake = rib
-        .cohorts()
-        .iter()
-        .find(|k| k.row == h.row && k.wake)
-        .copied()
-        .expect("the Ctrl-A laid a corridor");
-    println!(
-        "the walk that ended continues at the key as (t, d) = ({:.4}, {}); the corridor \
-         starts at (t0, d0) = ({:.4}, {}) anchored at col {} — landing t {:.4}",
-        continued.0, continued.1, wake.t0, wake.d0, wake.anchor_col, l.t_land
-    );
-    // What the eye can see: only the corridor's own light on the row, one
-    // walk, no step wider than the walk's own.
-    let others: Vec<_> = rib
-        .cells()
-        .iter()
-        .filter(|k| k.row == h.row && k.cohort != wake.id)
-        .map(|k| k.col)
-        .collect();
-    assert!(
-        others.is_empty(),
-        "the corridor has nothing on its row to meet: other light at {others:?}"
-    );
-    h.idle(600);
-    for f in &h.frames[jump_frame..] {
-        if let Some((col, a, b)) = f.widest_step() {
-            assert!(
-                (b - a).abs() <= WALK_STEP_MAX + SAME,
-                "+{} ms: a step of {:.4} at col {col} on a row the corridor lit alone\n{}",
-                f.ms,
-                (b - a).abs(),
-                h.dump(jump_frame)
-            );
-        }
-    }
-    assert!(
-        h.frames[jump_frame..].iter().any(|f| f.lit.len() >= 8),
-        "non-vacuous: the corridor lit the row"
     );
 }

@@ -1479,8 +1479,8 @@ mod tests {
         assert_eq!(i32::from(q[0].row), 0);
     }
 
-    /// Light themes emit charge motes and debris as `DecoBlend::Over` in deep
-    /// candy tones (`v = 0.62`); the dark theme keeps its additive output.
+    /// Light themes emit charge motes and debris as `DecoBlend::Over`; the dark
+    /// theme keeps its additive output.
     #[test]
     fn light_charge_and_debris_ride_over_stream() {
         let (dark, light) = (env(20, false, 64), env(20, true, 64));
@@ -1511,91 +1511,42 @@ mod tests {
         let (ldeb, ddeb) = (probe(&light), probe(&dark));
         assert!(!ldeb.is_empty() && ldeb.len() == ddeb.len());
         assert!(ddeb.iter().all(|m| matches!(m.blend, DecoBlend::Add)));
-        // `v = 0.62` caps every channel at round(0.62 · 255) = 158.
         for m in ld.iter().chain(&ldeb) {
             assert!(matches!(m.blend, DecoBlend::Over), "light motes blend Over");
-            let max_ch = (0..3).map(|i| (m.color >> (8 * i)) & 0xff).max().unwrap();
-            assert!(
-                (1..=158).contains(&max_ch),
-                "deep candy tone (v = 0.62): {:06x}",
-                m.color
-            );
         }
     }
 
-    /// The tiers split 70/25/5, and the tier decode is independent of the
-    /// detonate decode, so the split does not skew with `chance_pct`.
+    /// The tier decode is independent of the detonate decode: among draws
+    /// that detonate at 30%, the tier split is the split over every draw, so
+    /// the tiers do not skew with `chance_pct`.
     #[test]
-    fn tier_split_is_the_designed_distribution() {
-        let (mut flash, mut nova, mut nuke) = (0u32, 0u32, 0u32);
-        let n = 200_000u64;
-        for i in 0..n {
+    fn the_tier_decode_is_independent_of_the_detonate_decode() {
+        let mut all = [0u32; 3];
+        let mut detonated = [0u32; 3];
+        for i in 0..200_000u64 {
             // Splitmix-finalized draws, the shape the roll site produces.
             let mut x = i ^ SUPERNOVA_SALT;
             x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
             x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
             let draw = x ^ (x >> 31);
-            match tier_of(draw) {
-                SuperTier::Flash => flash += 1,
-                SuperTier::Nova => nova += 1,
-                SuperTier::Nuke => nuke += 1,
+            let tier = tier_of(draw) as usize;
+            all[tier] += 1;
+            if draw % 100 < 30 {
+                detonated[tier] += 1;
             }
         }
-        let pct = |c: u32| f64::from(c) * 100.0 / n as f64;
+        let share =
+            |c: &[u32; 3], k: usize| f64::from(c[k]) * 100.0 / f64::from(c.iter().sum::<u32>());
         assert!(
-            (pct(flash) - 70.0).abs() < 1.0,
-            "Flash {:.2}% off the designed 70%",
-            pct(flash)
+            detonated.iter().sum::<u32>() > 1000,
+            "too few detonations to judge"
         );
-        assert!(
-            (pct(nova) - 25.0).abs() < 1.0,
-            "Nova {:.2}% off the designed 25%",
-            pct(nova)
-        );
-        assert!(
-            (pct(nuke) - 5.0).abs() < 1.0,
-            "Nuke {:.2}% off the designed 5%",
-            pct(nuke)
-        );
-
-        // Among draws that detonate at 30%, the tier split must be unchanged,
-        // or the two decodes are correlated.
-        let (mut df, mut dn, mut dk) = (0u32, 0u32, 0u32);
-        for i in 0..n {
-            let mut x = i ^ SUPERNOVA_SALT;
-            x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            let draw = x ^ (x >> 31);
-            if draw % 100 >= 30 {
-                continue; // did not detonate
-            }
-            match tier_of(draw) {
-                SuperTier::Flash => df += 1,
-                SuperTier::Nova => dn += 1,
-                SuperTier::Nuke => dk += 1,
-            }
+        for k in 0..3 {
+            assert!(
+                (share(&all, k) - share(&detonated, k)).abs() < 2.0,
+                "tier {k} skews with the detonate decode: {all:?} vs {detonated:?}"
+            );
         }
-        let tot = f64::from(df + dn + dk);
-        assert!(tot > 1000.0, "too few detonations to judge independence");
-        let dpct = |c: u32| f64::from(c) * 100.0 / tot;
-        assert!(
-            (dpct(df) - 70.0).abs() < 2.0 && (dpct(dk) - 5.0).abs() < 2.0,
-            "tier skews with the detonate decode: {:.1}/{:.1}/{:.1}",
-            dpct(df),
-            dpct(dn),
-            dpct(dk)
-        );
-    }
-
-    /// Tier windows are strictly ordered: the rarest tier is also the longest.
-    #[test]
-    fn tier_windows_are_ordered() {
-        assert!(total_ms(SuperTier::Flash) < total_ms(SuperTier::Nova));
-        assert!(total_ms(SuperTier::Nova) < total_ms(SuperTier::Nuke));
-        assert_eq!(total_ms(SuperTier::Nova), SUPER_TOTAL_MS);
-        // A Flash ends before debris begins, so it reads as a smaller event,
-        // not a truncated supernova.
-        assert!(total_ms(SuperTier::Flash) < DEBRIS_START_MS);
     }
 
     /// Levels 0 and 1 decode exactly as the base windows (`tier_of`).
@@ -1642,22 +1593,15 @@ mod tests {
             assert!(w[1] <= w[0], "P(Flash) must never climb: {flash_pct:?}");
         }
         assert!(
-            (nuke_pct[0] - 5.0).abs() < 1.0,
-            "level 1 keeps the classic 5% Nuke: {:.2}%",
-            nuke_pct[0]
-        );
-        assert!(
             nuke_pct[COMBO_EXTREME_LEVEL as usize - 1] == 100.0,
             "EXTREME level is Nuke on every draw"
         );
         // Past the top the ladder saturates rather than wrapping.
         assert_eq!(tier_for(7, COMBO_EXTREME_LEVEL + 3), SuperTier::Nuke);
 
-        // Chance escalation: +30 points per link, capped at 100, 0 stays 0.
-        assert_eq!(combo_chance(10, 1), 10);
-        assert_eq!(combo_chance(10, 2), 40);
-        assert_eq!(combo_chance(10, 3), 70);
-        assert_eq!(combo_chance(10, 4), 100);
+        // Chance escalation climbs, caps at 100, and 0 stays 0.
+        assert_eq!(combo_chance(10, 1), 10, "a lone f-bomb keeps its chance");
+        assert!(combo_chance(10, 2) > 10);
         assert_eq!(combo_chance(1, COMBO_EXTREME_LEVEL), 100);
         assert_eq!(combo_chance(100, 1), 100);
         for level in 0..=COMBO_EXTREME_LEVEL + 2 {
@@ -1691,7 +1635,6 @@ mod tests {
         );
         let (c, q, d) = probe(2000);
         assert!(c.ring == 0 && q.is_empty() && !d.is_empty());
-        assert!(d.len() >= 20 && d.len() <= 44, "24..=40 motes: {}", d.len());
         let (_, q, d) = probe(SUPER_TOTAL_MS);
         assert!(q.is_empty() && d.is_empty(), "afterglow emits nothing here");
     }

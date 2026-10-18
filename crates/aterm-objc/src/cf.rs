@@ -11,9 +11,10 @@
 //! zero-sized type, so a `CFArrayRef` does not pass where a `CFStringRef` is
 //! wanted.
 //!
-//! `tests/cf_cg_sdk.rs` reads this file and `cg.rs` as source and has clang
-//! hold every alias, struct field, constant, static and prototype to the SDK
-//! headers, for `arm64` and `x86_64`.
+//! **The SDK is the authority.** `tests/cf_sdk.rs` reads this file as source
+//! and has clang hold every alias, struct field, constant, static and
+//! prototype to the headers, for `arm64` and `x86_64` (`aterm-cg`'s
+//! `tests/cg_sdk.rs` does the same for CoreGraphics, with the same probe).
 //!
 //! It replaces the `core-foundation` crates in the vendored winit fork
 //! (`docs/AUDIT-third-party-2026-10-15.md`, winit-core step 3). The run-loop
@@ -28,6 +29,9 @@ use std::ptr::NonNull;
 
 /// Zero-sized `#[repr(C)]` types that only ever sit behind a pointer
 /// CoreFoundation owns: never constructed here, `!Send`, `!Sync` and `!Unpin`.
+/// Exported for `aterm-cg`, whose CoreGraphics types have the same shape.
+#[doc(hidden)]
+#[macro_export]
 macro_rules! opaque {
     ($($name:ident),* $(,)?) => {$(
         #[repr(C)]
@@ -38,9 +42,6 @@ macro_rules! opaque {
         }
     )*};
 }
-#[cfg(feature = "cg")]
-pub(crate) use opaque;
-
 opaque! {
     __CFAllocator, __CFArray, __CFData, __CFDictionary, __CFString, __CFUUID,
     __CFRunLoop, __CFRunLoopObserver, __CFRunLoopSource,

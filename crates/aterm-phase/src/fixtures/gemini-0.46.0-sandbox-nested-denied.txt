@@ -1,0 +1,30 @@
+# gemini-cli 0.46.0 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Gemini CLI outside the lab's jail, against a local fake backend: launched by path with a scratch `HOME` whose settings select the API-key auth, a fake `GEMINI_API_KEY`, `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:<port>` and every proxy variable pointed at that backend, with its own macOS seatbelt on (`GEMINI_SANDBOX=sandbox-exec`, `SEATBELT_PROFILE=custom`: the project's `.gemini/sandbox-macos-custom.sb`, its permissive-open profile with outbound network denied but to loopback and `security.toolSandboxing` on as well) · a shell call allowed once: its per-tool `sandbox-exec` cannot apply inside the process's seatbelt, so the call (`touch /Users//Shared/…`) fails `sandbox-exec: sandbox_apply: Operation not permitted` (exit 71), drawn `✓`, no box offered
+
+ ▝▜▄     Gemini CLI v0.46.0
+   ▝▜▄
+  ▗▟▀    Authenticated with gemini-api-key /auth
+ ▝▀
+
+▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+ > sbwrite
+▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ ✓  Shell touch /Users//Shared/gemini-sandbox-probe.txt                                                                                    │
+│                                                                                                                                          │
+│ sandbox-exec: sandbox_apply: Operation not permitted                                                                                     │
+│                                                                                                                                          │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+✦ Done. run_shell_command returned {"output": "Output: sandbox-exec: sandbox_apply: Operation not permitted\nExit Code: 71\nProcess Group PGID:
+  52207"}
+
+
+                                                                                                                                ? for shortcuts
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Shift+Tab to accept edits
+▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+ >   Type your message or @path/to/file
+▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+ workspace (/directory)                                                  sandbox                                                         /model
+ ~/sb-tools                                                              current process                                                   Auto

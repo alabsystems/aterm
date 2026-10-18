@@ -99,8 +99,27 @@ pub const FIXTURE_FONT: &str = concat!(
 fn gpu_on(font: &str, px: f32, theme: Theme) -> aterm_gpu::GpuRenderer {
     let ctx = aterm_gpu::GpuContext::new()
         .unwrap_or_else(|e| aterm_spec::host::could_not_run(format!("no GPU: {e}")));
+    // On Linux the renderer draws, presents and reads back through the
+    // first-party GL arm (docs/AUDIT-third-party-2026-10-15.md GW.4), as on
+    // macOS through Metal: both are armed at construction.
     aterm_gpu::GpuRenderer::from_parts(ctx, cpu_on(font, px, theme), Some(font.into()), theme)
         .expect("the GPU renderer assembles on an acquired device")
+}
+
+/// Move `g` onto the wgpu oracle arm: on macOS and Linux a renderer draws on
+/// its first-party arm (Metal, GL), so a suite that reads the wgpu offscreen,
+/// drives wgpu-typed seams (blits, stand-in textures, taps, the allocator) or
+/// checks the WGSL that ships on Windows and wasm asks for the oracle. A no-op
+/// where wgpu is the renderer. Only a build carrying the oracle arm (the
+/// `--features wgpu-oracle` lane on macOS and Linux) has it.
+#[cfg(wgpu_arm)]
+pub fn disarm_for_oracle(g: &mut aterm_gpu::GpuRenderer) {
+    #[cfg(target_os = "macos")]
+    g.disarm_metal_for_oracle();
+    #[cfg(target_os = "linux")]
+    g.disarm_gl_for_oracle();
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let _ = g;
 }
 
 /// End the calling test as could-not-run unless this host ships a
@@ -139,17 +158,11 @@ pub fn gpu(px: f32, theme: Theme) -> aterm_gpu::GpuRenderer {
     gpu_on(FIXTURE_FONT, px, theme)
 }
 
-/// [`gpu`] on the wgpu oracle arm. On macOS a renderer presents through
-/// Metal, so a suite that reads the wgpu offscreen or drives wgpu-typed seams
-/// (blits, stand-in textures, taps, the allocator) asks for the oracle.
+/// [`gpu`] on the wgpu oracle arm ([`disarm_for_oracle`]).
+#[cfg(wgpu_arm)]
 pub fn wgpu_oracle(px: f32, theme: Theme) -> aterm_gpu::GpuRenderer {
-    let g = gpu(px, theme);
-    #[cfg(target_os = "macos")]
-    let g = {
-        let mut g = g;
-        g.disarm_metal_for_oracle();
-        g
-    };
+    let mut g = gpu(px, theme);
+    disarm_for_oracle(&mut g);
     g
 }
 
@@ -327,3 +340,57 @@ pub fn assert_byte_exact(
 /// waives.
 #[cfg(all(target_arch = "x86_64", target_os = "macos"))]
 const X86_64_MACOS_LSB: i32 = 1;
+
+/// The byte-exact comparisons of one CPU-vs-GPU parity test.
+///
+/// The byte-exact comparison holds only where the offscreen is sRGB
+/// ([`aterm_gpu::GpuRenderer::additive_is_byte_exact`]): on a downlevel adapter
+/// the additive and blended streams land in linear. Every other property a
+/// test checks (gate misses, non-vacuity, drained frames, sizes) holds on any
+/// adapter. So a test asks [`ByteExact::holds`] before each byte-exact
+/// assertion and runs everything else; on a downlevel adapter the comparisons
+/// it could not make are remembered, and when the test would otherwise pass it
+/// ends COULD NOT RUN naming them (when the gate drops), never a pass with a
+/// SKIP printed.
+#[derive(Debug, Default)]
+pub struct ByteExact {
+    deferred: std::cell::RefCell<Vec<String>>,
+}
+
+impl ByteExact {
+    /// Whether `gpu` composites byte-exact with the CPU, so the caller asserts
+    /// the comparison `what`. When it does not, `what` is deferred to the
+    /// COULD NOT RUN this gate ends the test with.
+    pub fn holds(&self, gpu: &aterm_gpu::GpuRenderer, what: &str) -> bool {
+        let exact = gpu.additive_is_byte_exact();
+        if !exact {
+            self.deferred.borrow_mut().push(what.to_owned());
+        }
+        exact
+    }
+}
+
+impl Drop for ByteExact {
+    fn drop(&mut self) {
+        let deferred = self.deferred.get_mut();
+        // A test already failing keeps its own failure.
+        if !deferred.is_empty() && !std::thread::panicking() {
+            aterm_spec::host::could_not_run(format!(
+                "{}: this adapter renders to a downlevel (non-sRGB) offscreen, where the add \
+                 lands in linear, so CPU==GPU cannot be byte-exact here; every other check passed",
+                deferred.join(", ")
+            ));
+        }
+    }
+}
+
+/// End the calling test COULD NOT RUN unless `gpu` composites byte-exact with
+/// the CPU (an sRGB offscreen); `what` names the comparison it cannot make.
+pub fn byte_exact_or_could_not_run(gpu: &aterm_gpu::GpuRenderer, what: &str) {
+    if !gpu.additive_is_byte_exact() {
+        aterm_spec::host::could_not_run(format!(
+            "{what}: this adapter renders to a downlevel (non-sRGB) offscreen, where the add \
+             lands in linear, so CPU==GPU cannot be byte-exact here"
+        ));
+    }
+}

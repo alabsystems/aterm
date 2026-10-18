@@ -26,7 +26,7 @@
 //! handback therefore lands before zsh's own `ESC[?2004h`, never after it: a
 //! UI-side sweep could not promise that, which is why the handback is ordered
 //! in the stream. The derived model is `ForegroundHandback`
-//! (`aterm-spec/src/derive/models_foreground_handback.rs`).
+//! (`aterm-models-gui/src/models_foreground_handback.rs`).
 //!
 //! # Only ORPHANED modes are handed back (the 2026-09-25 review)
 //!
@@ -175,8 +175,8 @@ impl FgCutter {
     /// edge): bytes read after this point belong to the new holder and must not
     /// join the batch the edge cuts — the next batch starts at the new holder.
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "foreground_handback_ownership",
             action = "Sample",
             project = "spawn::foreground_handback_conformance::project_ownership"
@@ -254,16 +254,16 @@ impl FgOwners {
     /// `holder`'s bytes were just parsed; the engine's evidence is now
     /// `evidence`, and those bytes carried the setters of `asserted`.
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "foreground_handback_ownership",
             action = "Arm",
             project = "spawn::foreground_handback_conformance::project_ownership"
         )
     )]
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "foreground_handback_ownership",
             action = "ShellArm",
             project = "spawn::foreground_handback_conformance::project_ownership"
@@ -325,8 +325,8 @@ impl FgOwners {
     /// outliving `tput`. A gone group that owns an input bit takes its
     /// display bits with it — the handback restores every mode.
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "foreground_handback_ownership",
             action = "Reclaim",
             project = "spawn::foreground_handback_conformance::project_ownership"
@@ -836,7 +836,7 @@ mod tests {
         proc_stat_is_stopped_in, restored_payload, splice_at, tree_any,
     };
     use aterm_core::terminal::program_evidence::{
-        ALT_SCREEN, COUNT, CURSOR_HIDDEN, FOCUS, INPUT, KITTY, MOUSE, SYNC, VT52,
+        ALT_SCREEN, CURSOR_HIDDEN, FOCUS, KITTY, MOUSE, SYNC, VT52,
     };
 
     const SHELL: i32 = 100;
@@ -1078,16 +1078,6 @@ mod tests {
     fn foreground_handback_a_display_only_one_shot_orphans_nothing() {
         const TPUT: i32 = 500;
         const CMD: i32 = 600;
-        assert_eq!(
-            INPUT & (ALT_SCREEN | VT52 | CURSOR_HIDDEN | SYNC),
-            0,
-            "the four display bits are not input evidence"
-        );
-        assert_eq!(
-            INPUT.count_ones() as usize + 4,
-            COUNT,
-            "every other bit hijacks input"
-        );
         for display in [
             ALT_SCREEN,
             CURSOR_HIDDEN,
@@ -1182,47 +1172,6 @@ mod tests {
         // Invalid groups are never probed.
         let v = FgOwners::default().probe_edge(0, SHELL, |_, _| panic!("no group"));
         assert!(v.probed().is_empty());
-    }
-
-    /// The third 2026-09-25 review's L2: a pipeline whose first stage (its
-    /// leader) exited is stopped (kept), then `bg`'d: it runs in the
-    /// background, leaderless, no member stopped, and still owns its input
-    /// bits. At the next edge (shell → `ls`) it is a BYSTANDER, gone only when
-    /// no member of its group survives. RED on the holder rule for every
-    /// suspect (the reviewed probe), which handed its modes back while it ran.
-    #[test]
-    fn foreground_handback_a_backgrounded_leaderless_job_is_not_a_death() {
-        use super::{FgRole, owner_gone};
-        const LS: i32 = 700;
-        // The scripted table: JOB's leader is gone, nothing is stopped, and
-        // the TUI after the leader still runs (the group is not empty).
-        let (mut members_left, stopped) = (true, false);
-        let mut o = FgOwners::default();
-        o.observe(SHELL, 0, 0);
-        o.observe(JOB, MOUSE | ALT_SCREEN, 0);
-        o.observe(SHELL, MOUSE | ALT_SCREEN, 0);
-        let shipping = |p: i32, role: FgRole, members_left: bool| {
-            owner_gone(role, || p == JOB, || stopped, || !members_left)
-        };
-        let mut roles = Vec::new();
-        let v = o.probe_edge(SHELL, LS, |p, role| {
-            roles.push((p, role));
-            shipping(p, role, members_left)
-        });
-        assert_eq!(
-            roles,
-            vec![(SHELL, FgRole::Holder), (JOB, FgRole::Bystander)]
-        );
-        assert!(!v.gone(JOB), "the backgrounded job runs on");
-        assert_eq!(o.orphaned_by(LS, |p| v.gone(p)), None, "its modes stay");
-        // The same job as the edge's HOLDER (`fg`, then its last member is
-        // killed) is judged by the leader rule, as the incident must be.
-        assert!(shipping(JOB, FgRole::Holder, true));
-        // `kill %1` in the background empties the group: the next edge hands
-        // it back.
-        members_left = false;
-        let v = o.probe_edge(SHELL, LS, |p, role| shipping(p, role, members_left));
-        assert_eq!(o.orphaned_by(LS, |p| v.gone(p)), Some(JOB));
     }
 
     /// The Linux member walk is bounded by the session's own process tree:

@@ -27,7 +27,7 @@
 //! * OB-15 aggregation: a claim with shard replicas names an `aggregator` whose
 //!   body reads every declared access path.
 //! * OB-16 liveness: files exist, owners resolve, the `machine` (if declared)
-//!   resolves in aterm-spec's derive catalog, prose fields are non-empty,
+//!   resolves in the derived-model catalog (`aterm-models-*`), prose fields are non-empty,
 //!   `chain[0].owner == root`, and every closed token is mentioned by the chain.
 //!
 //! None has a waiver channel: a violation is fixed, or the claim is re-argued.
@@ -123,11 +123,6 @@ const WEB_PIPELINE_SCOPE: &str = "The web page's pipeline runs in a DIFFERENT PR
     documented at aterm-wasm/src/effects_api.rs). It never shares a retina with a \
     native WindowState, so it is a second SCOPE, not a second enforcer inside one scope.";
 
-/// Why a demo binary's pipeline is its own scope.
-const DEMO_PIPELINE_SCOPE: &str = "A standalone example binary (not shipped) that drives \
-    one pipeline over its own offscreen surface: its own process and its own frames, \
-    never a native WindowState's retina — a second SCOPE, not a second enforcer.";
-
 const SCOPE_CLAIMS: &[ScopeClaim] = &[
     ScopeClaim {
         id: "flash-limiter",
@@ -170,27 +165,6 @@ const SCOPE_CLAIMS: &[ScopeClaim] = &[
                 decl: "pub(crate) effects: EffectsPipeline,",
                 kind: ReplicaKind::SeparateScope,
                 justification: WEB_PIPELINE_SCOPE,
-            },
-            Replica {
-                file: "crates/aterm-effects/examples/wasm_host_echo.rs",
-                owner: "Page",
-                decl: "p: EffectsPipeline,",
-                kind: ReplicaKind::SeparateScope,
-                justification: DEMO_PIPELINE_SCOPE,
-            },
-            Replica {
-                file: "crates/aterm-effects/examples/wasm_host_echo.rs",
-                owner: "boot",
-                decl: "EffectsPipeline::new()",
-                kind: ReplicaKind::SeparateScope,
-                justification: DEMO_PIPELINE_SCOPE,
-            },
-            Replica {
-                file: "crates/aterm-render/examples/cursor_magic_demo.rs",
-                owner: "render_literal_rain",
-                decl: "EffectsPipeline::new()",
-                kind: ReplicaKind::SeparateScope,
-                justification: DEMO_PIPELINE_SCOPE,
             },
             Replica {
                 file: "crates/aterm-gui/src/settings_preview.rs",
@@ -318,19 +292,37 @@ pub const SCOPE_PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits
 // Source primitives.
 
 /// Every file OB-16 resolves a claim's `machine` against: aterm-spec's
-/// `derive.rs` plus each `derive/*.rs` family module, enumerated so a split or
-/// merge cannot take a machine out of reach.
+/// `derive.rs` plus every model file of each `aterm-models-<domain>` crate,
+/// enumerated so a split, a merge or a move cannot take a machine out of reach.
 fn derive_model_sources(root: &Path) -> Vec<std::path::PathBuf> {
+    let rs_files = |dir: std::path::PathBuf| -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
     let mut paths = vec![root.join("crates/aterm-spec/src/derive.rs")];
-    if let Ok(entries) = std::fs::read_dir(root.join("crates/aterm-spec/src/derive")) {
-        let mut split: Vec<std::path::PathBuf> = entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
-            .collect();
-        split.sort();
-        paths.extend(split);
-    }
+    let mut models: Vec<std::path::PathBuf> = std::fs::read_dir(root.join("crates"))
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with("aterm-models-"))
+                })
+                .flat_map(|entry| rs_files(entry.path().join("src")))
+                .collect()
+        })
+        .unwrap_or_default();
+    models.sort();
+    paths.extend(models);
     paths
 }
 
@@ -614,8 +606,8 @@ fn check_liveness(root: &Path, claim: &ScopeClaim, v: &mut Vec<String>) {
             if !resolved {
                 v.push(format!(
                     "  ✗ FAIL [OB-16] claim `{}` names ty machine `{machine}`, which does \
-                     not resolve anywhere in aterm-spec's derived-model catalog \
-                     (crates/aterm-spec/src/derive.rs + derive/*.rs). The machine-checked \
+                     not resolve anywhere in the derived-model catalog \
+                     (crates/aterm-models-*/src/*.rs). The machine-checked \
                      half of this claim was deleted or renamed: restore it (the census \
                      proves the enforcer does not multiply; the MODEL proves that \
                      not-multiplying is the property that matters).",

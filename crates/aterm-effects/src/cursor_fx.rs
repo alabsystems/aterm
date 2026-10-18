@@ -314,15 +314,13 @@ pub fn project_block_fill(
 }
 
 /// What a host resolved from a trail-style spelling. The native app resolves it
-/// once per config generation against its alias table and Trail Pack catalog;
-/// a page parses a raw spelling with [`GlowSpelling::parse`].
+/// once per config generation against its alias table; a page parses a raw
+/// spelling with [`GlowSpelling::parse`].
 #[derive(Clone, Copy, Debug)]
 pub struct GlowSpelling {
-    /// The style, or `None` for the resolutions that genuinely mean "draw
-    /// nothing" (`off`, a `pack:` naming no loaded pack).
+    /// The style, or `None` for the resolution that genuinely means "draw
+    /// nothing" (`off`).
     pub style: Option<GlowStyle>,
-    /// The resolved Trail Pack when `style` is [`GlowStyle::Custom`].
-    pub pack: Option<crate::cursor_glow::TrailParams>,
     /// The additive beam ([`crate::cursor_glow::style_has_beam_of`]).
     pub beam: bool,
     /// The v0.43 full-height ribbon body (every spelling but `… underline`).
@@ -335,13 +333,12 @@ pub struct GlowSpelling {
 
 impl GlowSpelling {
     /// A page's reading of a raw spelling: [`GlowStyle::parse`] (an unknown
-    /// spelling reads as Lumen) and the spelling forks, with no pack catalog.
+    /// spelling reads as Lumen) and the spelling forks.
     #[must_use]
     pub fn parse(raw: &str) -> Self {
         let style = GlowStyle::parse(raw);
         Self {
             style: Some(style),
-            pack: None,
             beam: crate::cursor_glow::style_has_beam(raw),
             ribbon_tall: !GlowStyle::style_names_underline_ribbon(raw),
             ribbon_flat: GlowStyle::style_names_flat_ribbon(raw),
@@ -406,7 +403,7 @@ pub fn resolve_glow_config(
     use crate::cursor_glow::{
         BEAM_DEFAULT_COLOR, COMET_DEFAULT_COLOR, LASER_DEFAULT_COLOR, SPARKLE_DEFAULT_COLOR,
     };
-    // Off / missing-pack values carry a concrete enum because GlowConfig is
+    // Off values carry a concrete enum because GlowConfig is
     // POD; `enabled = false` is the sole engine gate.
     let glow_style = spelling.style.unwrap_or(GlowStyle::Lumen);
     let default_color = match glow_style {
@@ -442,7 +439,6 @@ pub fn resolve_glow_config(
         dark_theme,
         beam: spelling.beam,
         head_dx,
-        pack: spelling.pack,
         ribbon_tall: spelling.ribbon_tall,
         ribbon_flat: spelling.ribbon_flat,
         classic_mono: spelling.classic_mono,
@@ -816,8 +812,8 @@ impl CursorFx {
         let glow_fp = glow_fp ^ phaser_frame.fp.rotate_left(53);
         // Light-rod cursor, every style's shape-completion seam: a thin bar
         // becomes a rod of the style's light (keeping its DECSCUSR shape), and
-        // styles without a bespoke block body (lumen, sparkle, beam, trail
-        // packs) take the charged emitter block. `Classic` draws a plain caret.
+        // styles without a bespoke block body (lumen, sparkle, beam) take the
+        // charged emitter block. `Classic` draws a plain caret.
         let bar_shape = body_allowed
             && f.focused
             && matches!(
@@ -826,7 +822,7 @@ impl CursorFx {
             );
         let emitter_block = matches!(
             glow_cfg.style,
-            GlowStyle::Beam | GlowStyle::Lumen | GlowStyle::Sparkle | GlowStyle::Custom
+            GlowStyle::Beam | GlowStyle::Lumen | GlowStyle::Sparkle
         );
         // The rod's tint: the config colour where it already carries the style
         // identity, the signature shade where the style paints outside it.
@@ -1103,7 +1099,6 @@ mod tests {
             ring: true,
             beam: true,
             head_dx: 0.08,
-            pack: None,
         };
         let trail = TrailConfig {
             enabled: false,
@@ -1157,14 +1152,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn head_dx_noses_into_a_bar_and_centres_everything_else() {
-        assert_eq!(head_dx_for(CursorStyle::SteadyBar), 0.08);
-        assert_eq!(head_dx_for(CursorStyle::BlinkingBar), 0.08);
-        assert_eq!(head_dx_for(CursorStyle::SteadyBlock), 0.5);
-        assert_eq!(head_dx_for(CursorStyle::BlinkingUnderline), 0.5);
     }
 
     /// Automatic trail colours follow the live cursor, as a window and its

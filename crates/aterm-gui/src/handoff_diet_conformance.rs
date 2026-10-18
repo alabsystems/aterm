@@ -40,7 +40,8 @@ use std::io::Write as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::PathBuf;
 
-use aterm_spec::derive::{Model, native_update_speculative_sidecar_model};
+use aterm_models_update::native_update_speculative_sidecar_model;
+use aterm_spec::derive::Model;
 use aterm_spec::interp::{self, State};
 use aterm_spec::xref::StepEvidence;
 

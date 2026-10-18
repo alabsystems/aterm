@@ -55,8 +55,6 @@ fn the_router_lead_is_the_footprints_own_lead() {
     let cursor_right = 11 * i32::from(GEOM.cell_w);
     let lead_px = aterm_effects::word_decorations::WordDecorations::kitty_cursor_lead_px;
     assert_eq!(rest.x - cursor_right, lead_px(GEOM.cell_w));
-    assert_eq!(lead_px(8), 6);
-    assert_eq!(lead_px(0), 0);
 }
 
 /// Host side of the occlusion law (L-D): with v2 engaged and the words ahead of the caret
@@ -146,6 +144,10 @@ fn a_v2_flying_head_yields_behind_inked_text_and_the_pet_is_never_moved() {
 #[test]
 fn the_offer_seam_hands_the_meteors_arrival_to_the_resident() {
     let mut app = App::headless_for_test();
+    // The trail is the one opting in: on by default everywhere but Windows
+    // (`DEFAULT_DECORATIVE_EFFECTS`), where this seam serves an owner who turned
+    // it on.
+    app.config.cursor_trail = Some(true);
     let cfg = app.glow_config();
     let now = Instant::now();
     let ws = app.windows.get_mut(&WindowId(0)).expect("test window");

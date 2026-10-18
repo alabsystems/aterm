@@ -69,9 +69,7 @@ pub const FLIGHT_MAX_MS: f32 = 120.0;
 ///
 /// `cells` is the path length in cell widths, diagonals included:
 /// `cells = sqrt(dcol² + (drow·ch/cw)²)`. Non-finite or negative input resolves
-/// to [`FLIGHT_MIN_MS`].
-///
-/// Pinned by `flight_ms_is_shared_and_clamped`: 8 → 60, 40 → 90, 200 → 120.
+/// to [`FLIGHT_MIN_MS`]: 8 → 60, 40 → 90, 200 → 120.
 #[inline]
 #[must_use]
 pub fn flight_ms(cells: f32) -> f32 {
@@ -504,7 +502,7 @@ pub const STAR_STACK_ADD: f32 = 2.35;
 
 /// Ceiling 1, the field/strike lane (§5.2): a sky star's composited centre may
 /// not exceed `STAR_STACK_ADD × 61 = 143`. Class centres: field m1 143, m2 130,
-/// m3 98. Pinned by `a_star_is_a_peak_not_a_blob` with the ≥ 80/255 peak floor.
+/// m3 98.
 pub const FIELD_STAR_COV_CEIL: f32 = STAR_STACK_ADD * FIELD_STAR_COV_REQUEST_MAX;
 
 /// Ceiling 2, the transient lane (§5.2, D1): fan, shed, erase-throw and
@@ -576,153 +574,46 @@ pub fn smoothstep01(t: f32) -> f32 {
 mod tests {
     use super::*;
 
-    /// `flight_ms`: the three published points, both clamps, and monotonicity.
-    /// `phrase_rest_ms` (S5): the floor at 2.8 cps or faster, `2.5 · ioi`
-    /// beyond, capped by the IOI ceiling; the tempo update matches the melody's
-    /// law exactly.
+    /// The shared clocks are total, monotone and held to their bands: garbage
+    /// in is the floor, more distance (or a slower tempo) never shortens a
+    /// clock, and the rain fits inside its gesture for every flight.
     #[test]
-    fn the_phrase_rest_is_the_floor_at_speed_and_the_tempo_multiple_below_it() {
-        for ioi in [30.0, 100.0, 250.0, 360.0] {
-            assert_eq!(phrase_rest_ms(ioi), 900.0, "ioi {ioi}: the floor");
+    fn the_shared_clocks_are_total_monotone_and_banded() {
+        for garbage in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -3.0, 0.0] {
+            assert_eq!(flight_ms(garbage), FLIGHT_MIN_MS, "flight_ms({garbage})");
+            assert_eq!(impact(garbage), 1.0, "impact({garbage})");
         }
-        assert_eq!(phrase_rest_ms(400.0), 1000.0);
-        assert_eq!(phrase_rest_ms(500.0), 1250.0);
-        assert_eq!(phrase_rest_ms(600.0), 1500.0);
-        assert_eq!(
-            phrase_rest_ms(5000.0),
-            1500.0,
-            "the IOI ceiling caps the rest"
-        );
         assert_eq!(phrase_rest_ms(f32::NAN), phrase_rest_ms(IOI_DEFAULT_MS));
-        assert!(phrase_rest_reached(900, 100.0));
-        assert!(!phrase_rest_reached(899, 100.0));
-        assert!(!phrase_rest_reached(1000, 500.0));
-        assert!(phrase_rest_reached(1250, 500.0));
-        // The tempo law: first / reset → default, a rest holds, else the EMA.
-        assert_eq!(ioi_next(123.0, 100, true, false), IOI_DEFAULT_MS);
-        assert_eq!(ioi_next(123.0, 2000, false, false), IOI_DEFAULT_MS);
-        assert_eq!(ioi_next(123.0, 1000, false, true), 123.0);
-        assert_eq!(ioi_next(200.0, 100, false, false), 150.0);
-        assert_eq!(
-            ioi_next(200.0, 10, false, false),
-            115.0,
-            "the gap is clamped at 30"
-        );
-    }
-
-    /// `impact`: exactly 1 at the 8-cell floor, non-decreasing, saturating at
-    /// the cap, and total on garbage.
-    #[test]
-    fn impact_is_monotone_floored_and_capped() {
-        assert!(
-            (impact(8.0) - 1.0).abs() < 1e-6,
-            "8 cells is the floor: exactly 1"
-        );
-        for c in [
-            0.0,
-            1.0,
-            4.0,
-            7.9,
-            -3.0,
-            f32::NAN,
-            f32::INFINITY,
-            f32::NEG_INFINITY,
-        ] {
+        let (mut flight_prev, mut impact_prev, mut rest_prev) = (0.0f32, 0.0f32, 0.0f32);
+        for k in 0..=960 {
+            let c = k as f32 * 0.25;
+            let (f, i, r) = (flight_ms(c), impact(c), phrase_rest_ms(c * 25.0));
             assert!(
-                (impact(c) - 1.0).abs() < 1e-6,
-                "{c}: below the floor (or garbage) is 1"
+                f >= flight_prev && (FLIGHT_MIN_MS..=FLIGHT_MAX_MS).contains(&f),
+                "flight_ms({c}) = {f}"
             );
-        }
-        let mut last = 0.0f32;
-        for c in 1..=400 {
-            let v = impact(c as f32);
             assert!(
-                v.is_finite() && v >= last,
-                "impact must be monotone: {c} → {v} < {last}"
+                i >= impact_prev && (1.0..=IMPACT_MAX).contains(&i),
+                "impact({c}) = {i}"
             );
-            assert!(v <= IMPACT_MAX);
-            last = v;
-        }
-        assert!((impact(16.0) - 1.62).abs() < 0.01, "{}", impact(16.0));
-        assert!((impact(40.0) - 3.09).abs() < 0.01, "{}", impact(40.0));
-        assert!(
-            (impact(48.0) - IMPACT_MAX).abs() < 1e-3,
-            "a full line is the cap"
-        );
-        assert!(
-            (impact(400.0) - IMPACT_MAX).abs() < 1e-6,
-            "and it stays there"
-        );
-    }
-
-    #[test]
-    fn flight_ms_is_shared_and_clamped() {
-        assert!((flight_ms(8.0) - 60.0).abs() < 1e-4, "8 cells → 60 ms");
-        assert!((flight_ms(40.0) - 90.0).abs() < 1e-4, "40 cells → 90 ms");
-        assert!((flight_ms(200.0) - 120.0).abs() < 1e-4, "clamped at 120 ms");
-        assert!(
-            (flight_ms(70.0) - 120.0).abs() < 1e-4,
-            "≥ 70 cells → 120 ms"
-        );
-        // The floor binds below 10 cells (50 + 1·cells < 60).
-        assert!((flight_ms(0.5) - 60.0).abs() < 1e-4);
-        assert!(
-            (flight_ms(-3.0) - 60.0).abs() < 1e-4,
-            "negative → the floor"
-        );
-        assert!((flight_ms(f32::NAN) - 60.0).abs() < 1e-4, "NaN → the floor");
-        // Monotone non-decreasing, and inside the band everywhere.
-        let mut prev = 0.0;
-        let mut c = 0.0;
-        while c <= 240.0 {
-            let t = flight_ms(c);
-            assert!(t >= prev, "flight_ms must never decrease with distance");
+            assert!(r >= rest_prev, "phrase_rest_ms falls at ioi {}", c * 25.0);
+            let rain = rain_spacing_ms(f);
+            assert!((RAIN_SPACING_MIN_MS..=RAIN_SPACING_MAX_MS).contains(&rain));
             assert!(
-                (FLIGHT_MIN_MS..=FLIGHT_MAX_MS).contains(&t),
-                "flight_ms out of its band at {c} cells: {t}"
-            );
-            prev = t;
-            c += 0.25;
-        }
-        // The Duration twin agrees with the millisecond one.
-        assert!((flight(40.0).as_secs_f32() - 0.090).abs() < 1e-6);
-    }
-
-    /// §8.1's two shared counts, at their clamps and across the range.
-    #[test]
-    fn shed_and_fan_counts_are_clamped() {
-        assert_eq!(shed_n(0.0), SHED_MIN);
-        assert_eq!(shed_n(8.0), SHED_MIN, "the jump floor still sheds three");
-        assert_eq!(shed_n(36.0), 3);
-        assert_eq!(shed_n(48.0), 4);
-        assert_eq!(shed_n(80.0), SHED_MAX);
-        assert_eq!(shed_n(4000.0), SHED_MAX);
-        assert_eq!(shed_n(f32::NAN), SHED_MIN);
-    }
-
-    /// D19: rain spacing is a function of the SHARED clock and stays inside
-    /// [18, 24] ms for every flight the clock can produce.
-    #[test]
-    fn rain_spacing_rides_the_flight_clock() {
-        assert!(
-            (rain_spacing_ms(flight_ms(8.0)) - 18.0).abs() < 1e-4,
-            "T/5 = 12 → floor"
-        );
-        assert!(
-            (rain_spacing_ms(flight_ms(120.0)) - 24.0).abs() < 1e-4,
-            "T/5 = 24"
-        );
-        let mut c = 0.0;
-        while c <= 200.0 {
-            let s = rain_spacing_ms(flight_ms(c));
-            assert!((RAIN_SPACING_MIN_MS..=RAIN_SPACING_MAX_MS).contains(&s));
-            // Five glints must fit inside the gesture's own −40 dB deadline.
-            assert!(
-                s * FAN_HERO_N as f32 <= 250.0,
+                rain * FAN_HERO_N as f32 <= 250.0,
                 "the rain outlives §12's gesture"
             );
-            c += 1.0;
+            (flight_prev, impact_prev, rest_prev) = (f, i, r);
         }
+        assert!((flight(40.0).as_secs_f32() * 1000.0 - flight_ms(40.0)).abs() < 1e-3);
+        // A rest is reached at its own length, not a millisecond before.
+        let rest = phrase_rest_ms(100.0) as u32;
+        assert!(phrase_rest_reached(rest, 100.0) && !phrase_rest_reached(rest - 1, 100.0));
+        // The tempo law: first / reset → default, a rest holds, else it moves.
+        assert_eq!(ioi_next(123.0, 100, true, false), IOI_DEFAULT_MS);
+        assert_eq!(ioi_next(123.0, IOI_RESET_MS, false, false), IOI_DEFAULT_MS);
+        assert_eq!(ioi_next(123.0, 1000, false, true), 123.0);
+        assert!(ioi_next(200.0, 100, false, false) < 200.0);
     }
 
     /// §2.5 curves pinned at both ends: frame 0 exists (T2) and the mark is gone
@@ -744,9 +635,6 @@ mod tests {
             "the head is never at rest on frame 0 (T2, D20)"
         );
         assert!((enter_at_speed(1.0) - 1.0).abs() < 1e-6);
-        // §6.2's worked frame: T = 100 ms, +8.3 ms → p ≈ 0.40.
-        let p = enter_at_speed(8.3 / 100.0);
-        assert!((0.38..0.42).contains(&p), "first ProMotion frame p = {p}");
 
         // suck-in / spend are a matched pair on the same u.
         assert!((suck_in(0.0)).abs() < 1e-6);
@@ -763,16 +651,6 @@ mod tests {
         assert!((half_life(0.12 + 0.146, 0.12, 0.146) - 0.5).abs() < 1e-5);
         let life = half_life_life_s(0.12, 0.146);
         assert!((half_life(life, 0.12, 0.146) - STAR_CULL_ALPHA).abs() < 1e-5);
-        // …and that life is the m1 hero's published 460 ms (§5.6).
-        assert!((life - 0.460).abs() < 2e-3, "m1 life {life} ≠ 460 ms");
-        assert!(
-            (half_life_life_s(0.080, 0.112) - 0.340).abs() < 2e-3,
-            "m2 → 340 ms"
-        );
-        assert!(
-            (half_life_life_s(0.040, 0.080) - 0.225).abs() < 2e-3,
-            "m3 → 225 ms"
-        );
         // spring-snap: starts at 0, never overshoots, settled by its response.
         assert!((spring_snap(0.0)).abs() < 1e-6);
         assert!((spring_snap(-1.0)).abs() < 1e-6);

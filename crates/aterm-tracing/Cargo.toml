@@ -6,31 +6,23 @@
 # The directory keeps the `aterm-` prefix so it reads as ours, not vendored.
 name = "tracing"
 # Not `version.workspace = true`: a semver contract with the consumers
-# (softbuffer ^0.1.41, winit ^0.1.40, tiny-xlib ^0.1.37, zbus ^0.1.40).
+# (softbuffer ^0.1.41, winit ^0.1.40; zbus ^0.1.40 until A11Y.4, and
+# tiny-xlib ^0.1.37 until it left with softbuffer's Linux arm at LW.6).
 version = "0.1.44"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "First-party no-op `tracing` facade for aterm (replaces tracing + tracing-core + tracing-attributes; also pin-project-lite on mac/windows)"
 
-[dependencies]
-# Optional; off on mac, windows and wasm. Renamed so the implicit feature is
-# spelled `tracing-attributes`, as upstream's. On Linux and the BSDs aterm-gui
-# turns on `attributes` for zbus (which writes `#[instrument]` but takes
-# `tracing` with default features only).
-tracing-attributes = { package = "aterm-tracing-attributes", path = "../aterm-tracing-attributes", optional = true }
-
 [features]
-# Upstream's feature table. Only `default`, `std`, `attributes` and
-# `tracing-attributes` are reachable today; the rest are no-ops declared so a
-# transitive `tracing/log` request still resolves. `default` leaves out
-# `attributes` (upstream's has it): nothing outside the shim writes
-# `#[instrument]`, and the proc macro in the closure is what Trust's loader
-# refuses (PM-1, docs/PLAN-pm1-proc-macro-reach-2026-10-16.md). zbus does
-# write it and asks only for `default`, so aterm-gui's Linux/BSD target row
-# turns `attributes` on there.
+# Upstream's feature table, without `attributes`: `default` and `std` are
+# reachable; the rest are no-ops declared so a transitive `tracing/log` request
+# still resolves. No consumer writes `#[instrument]` since zbus, the one that did,
+# left the graph at A11Y.4, so `attributes` and its pass-through proc macro
+# (crates/aterm-tracing-attributes) were deleted at A11Y.6
+# (docs/AUDIT-third-party-2026-10-15.md, unit a11y): a crate that asks for it
+# again fails to resolve, loudly.
 default = ["std"]
-attributes = ["tracing-attributes"]
 # Ignored: the shim is `no_std` regardless.
 std = []
 async-await = []

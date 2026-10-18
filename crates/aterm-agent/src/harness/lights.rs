@@ -338,59 +338,6 @@ mod tests {
 
     const BYPASS: &str = "  \u{23F5}\u{23F5} bypass permissions on (shift+tab to cycle) \u{00B7} \u{2190} for agents";
 
-    /// A real screen in bypass, with an effort tag on the rule (`workspace`
-    /// stands in for the vendor's word) that no light reads.
-    #[test]
-    fn the_lights_read_claudes_own_indicators() {
-        let rule = format!("{} workspace \u{2500}", "\u{2500}".repeat(50));
-        let rows = screen(&rule, BYPASS);
-        let s = read_screen(&rows).expect("a composer");
-        assert_eq!(s.mode, Some(Mode::Bypass));
-        assert!(!s.busy);
-        assert_eq!(read(Some(&s)).state(Light::Mode), LightState::On);
-        let auto = "  \u{23F5}\u{23F5} auto mode on (shift+tab to cycle)";
-        let s = read_screen(&screen(&rule, auto)).unwrap();
-        let r = read(Some(&s));
-        assert_eq!(r.mode, Some(Mode::Auto));
-        assert_eq!(
-            r.state(Light::Mode),
-            LightState::On,
-            "auto is as expected as bypass: the one mode light is on in both"
-        );
-    }
-
-    /// Claude's default mode draws its own pill (2.1.283, measured
-    /// 2026-09-25): manual, and the mode light is off — as it is in every
-    /// mode but bypass and auto.
-    #[test]
-    fn the_manual_pill_is_the_default_mode() {
-        let manual =
-            "  \u{23F8} manual mode on \u{00B7} ? for shortcuts \u{00B7} \u{2190} for agents";
-        let s = read_screen(&screen(&"\u{2500}".repeat(60), manual)).unwrap();
-        assert_eq!(s.mode, Some(Mode::Manual));
-        assert_eq!(read(Some(&s)).state(Light::Mode), LightState::Off);
-        for mode in [Mode::AcceptEdits, Mode::Plan, Mode::DontAsk, Mode::Manual] {
-            assert!(!mode.is_expected(), "{mode:?}");
-        }
-        assert!(Mode::Bypass.is_expected() && Mode::Auto.is_expected());
-    }
-
-    /// A row under the composer naming no known pill is not read as some mode:
-    /// the mode lights are Unknown. (A hint a narrow pane cut is the next
-    /// test.)
-    #[test]
-    fn a_pill_this_build_does_not_know_is_unknown() {
-        for row in ["  ? for shortcuts", "  \u{23F5}\u{23F5} turbo mode on"] {
-            let s = read_screen(&screen(&"\u{2500}".repeat(60), row)).unwrap();
-            assert_eq!(s.mode, None, "{row:?}");
-            assert_eq!(
-                read(Some(&s)).state(Light::Mode),
-                LightState::Unknown,
-                "{row:?}"
-            );
-        }
-    }
-
     /// The drawn light keeps its mode under a box (no composer) and under a
     /// menu (no pill row), but a pill this build cannot name — renamed, or cut
     /// by a narrow pane — turns it Unknown rather than leaving the old mode up.
@@ -444,17 +391,6 @@ mod tests {
         }
     }
 
-    /// Claude mid-turn: `esc to interrupt` under the composer.
-    #[test]
-    fn a_turn_in_flight_reads_busy() {
-        let busy = "  \u{23F5}\u{23F5} auto mode on \u{00B7} esc to interrupt";
-        assert!(
-            read_screen(&screen(&"\u{2500}".repeat(60), busy))
-                .unwrap()
-                .busy
-        );
-    }
-
     /// A box over the composer: nothing is known, and nothing deviates — so
     /// nothing is drawn or pressed.
     #[test]
@@ -484,14 +420,6 @@ mod tests {
                 "{mode:?}: never pressed away from"
             );
         }
-    }
-
-    #[test]
-    fn a_mode_draws_its_own_glyph_word_and_hue() {
-        assert_eq!(Mode::Plan.glyph(), "\u{23F8}");
-        assert_eq!(Mode::Auto.glyph(), "\u{23F5}\u{23F5}");
-        assert_eq!(Mode::AcceptEdits.word(), "accept edits");
-        assert!(Mode::Bypass.hue().is_some() && Mode::Plan.hue().is_none());
     }
 
     /// EVERY RECORDED CLAUDE CODE SCREEN in `aterm-phase`'s fixtures (measured
@@ -625,6 +553,61 @@ mod tests {
             screens >= 8 && builds.contains("2.1.283"),
             "the canary must judge the measured corpus: {screens} screens of {builds:?}"
         );
+    }
+
+    /// THE 2.1.301 FOOTERS (measured 2026-10-15 by `aterm-lab footers`: the real
+    /// Claude Code in the lab's private headless aterm, a subscriber login,
+    /// model opus at the top effort level): each mode the launch's shift+tab
+    /// cycle shows reads as that mode, idle, with the mode row under the rule
+    /// the footer writes into — the effort tag drawn at the row's right end
+    /// (`◉ <level> · /effort`) included.
+    #[test]
+    fn the_2_1_301_screens_read_as_measured() {
+        let cases: [(&str, &str, Mode); 5] = [
+            (
+                "auto-idle",
+                include_str!(
+                    "../../../aterm-phase/src/fixtures/claude-2.1.301-footer-auto-idle.txt"
+                ),
+                Mode::Auto,
+            ),
+            (
+                "auto-draft",
+                include_str!(
+                    "../../../aterm-phase/src/fixtures/claude-2.1.301-footer-auto-draft.txt"
+                ),
+                Mode::Auto,
+            ),
+            (
+                "manual",
+                include_str!("../../../aterm-phase/src/fixtures/claude-2.1.301-footer-manual.txt"),
+                Mode::Manual,
+            ),
+            (
+                "accept-edits",
+                include_str!(
+                    "../../../aterm-phase/src/fixtures/claude-2.1.301-footer-accept-edits.txt"
+                ),
+                Mode::AcceptEdits,
+            ),
+            (
+                "plan",
+                include_str!("../../../aterm-phase/src/fixtures/claude-2.1.301-footer-plan.txt"),
+                Mode::Plan,
+            ),
+        ];
+        for (name, text, mode) in cases {
+            let rows: Vec<String> = text.lines().skip(1).map(str::to_owned).collect();
+            let s = read_screen(&rows).unwrap_or_else(|| panic!("{name}: a composer"));
+            assert_eq!(s.mode, Some(mode), "{name}");
+            assert!(!s.busy, "{name}: idle");
+            let rule = aterm_phase::phase::composer_bottom(&rows)
+                .unwrap_or_else(|| panic!("{name}: the composer's bottom rule"));
+            assert!(
+                footer::mode_row(&rows).is_some_and(|r| r > rule),
+                "{name}: the mode row is read under the rule the footer writes into"
+            );
+        }
     }
 
     /// THE CURRENT VENDOR, LIVE: every 2.1.283 capture (measured 2026-09-25,

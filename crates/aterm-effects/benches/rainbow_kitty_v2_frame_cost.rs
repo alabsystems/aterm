@@ -14,12 +14,19 @@
 //!     --bench rainbow_kitty_v2_frame_cost
 //! ```
 
+// The suite's per-thread counting allocator and shared support, mounted at
+// this binary's root where the harness reaches them (`crate::alloc_count`,
+// `crate::common`), as `effects_suite` mounts them.
+#[path = "../tests/alloc_count/mod.rs"]
+mod alloc_count;
+#[path = "../tests/common/mod.rs"]
+mod common;
 // The harness, mounted without its laws, which most of its helpers serve.
 #[allow(dead_code, unused_imports)]
 #[path = "../tests/rainbow_kitty_v2_frame_cost.rs"]
 mod frame_cost;
 
-use frame_cost::common::{BUDGET_SCALE_VAR, budget_scale, scaled_budget_us};
+use common::{BUDGET_SCALE_VAR, budget_scale, scaled_budget_us};
 use frame_cost::{
     Report, Scenario, engine_selected, measure_cell, print_header, print_idle, print_row, scenarios,
 };

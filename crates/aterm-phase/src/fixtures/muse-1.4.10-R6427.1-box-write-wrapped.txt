@@ -1,0 +1,51 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (60x50, aterm 0.105.0) running the real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab) · the stub's call `muse.write_file {path: ".agents/a-protected-note-with-a-rather-long-file-name-for-wrapping.md"}` in a 60-column tab: the file-access box, before any key — `write path:` alone on its row and the absolute path under it, indented two and broken at the row's edge; `└ last event 49s ago` under the status row · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+◆ Recap: ok
+
+❯ do the long work
+
+◆ Long work finished; the next step is the tests.
+
+◆ Worked for 2m 10s · 3:11 PM · 16/Oct
+
+❯ keep going
+
+◆ Hi! I am the local lab stub, not a model. (reply 29)
+
+❯ toolstart
+
+◆ Ran command · Create the long probe · ✓ · 3.2s · ctrl+o
+
+◆ Tool call done. Result: { "chunk_id": "exec-4-1",
+  "exit_code": 0, "terminal_status": "completed", "output":
+  "", "original_output_bytes": 0, "original_output_tokens":
+  0, "truncated": false }
+
+❯ toolstart
+
+◆ Ran command · Create the long probe · ✓ · 1m · ctrl+o
+
+◆ Tool call done. Result: { "chunk_id": "exec-5-1",
+  "exit_code": 0, "terminal_status": "completed", "output":
+  "two words here\n", "original_output_bytes": 15,
+  "original_output_tokens": 4, "truncated": false }
+
+◆ Worked for 1m 32s · 3:14 PM · 16/Oct
+
+❯ toolstart
+
+◈ Calling tools (49s · esc to interrupt)
+└ last event 49s ago
+
+── Voice input (⌥ + v to start) ────────────────────────────
+Would you like to allow this file access?
+
+  write path:
+  /private/tmp/at.lab0/proj/.agents/a-protected-note-with-a-
+  rather-long-file-name-for-wrapping.md
+
+⟩ 1. Yes, proceed (y)
+  2. No, and tell Muse Code what to do differently (esc)
+Change approval defaults in /permissions
+────────────────────────────────────────────────────────────
+  lab-stub · high · /private/tmp/at.lab0/proj · Auto-review

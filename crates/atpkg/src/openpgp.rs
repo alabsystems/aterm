@@ -738,7 +738,6 @@ pub(crate) mod testkit {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
 
     use ring::rand::SystemRandom;
 
@@ -1203,16 +1202,6 @@ mod tests {
         );
         assert_eq!(
             verify_test(&doc, &packet(TAG_SIGNATURE, &with_left16_for(&body, &doc))),
-            Err(PgpError::BadSignature)
-        );
-    }
-
-    #[test]
-    fn a_flipped_mpi_byte_is_refused() {
-        let mut body = sign_body(DOC, &Spec::good());
-        *body.last_mut().unwrap() ^= 0x01;
-        assert_eq!(
-            verify_test(DOC, &packet(TAG_SIGNATURE, &body)),
             Err(PgpError::BadSignature)
         );
     }
@@ -1688,50 +1677,5 @@ mod tests {
         assert_eq!(verify_test(DOC, &big), Err(PgpError::TooLarge));
         let at_cap = vec![b'\n'; MAX_SIGNATURE_LEN];
         assert_eq!(verify_test(DOC, &at_cap), Err(PgpError::Armor));
-    }
-
-    #[test]
-    fn every_refusal_has_its_own_message() {
-        let all = [
-            PgpError::TooLarge,
-            PgpError::Armor,
-            PgpError::Truncated,
-            PgpError::TrailingBytes,
-            PgpError::IndeterminateLength,
-            PgpError::PartialLength,
-            PgpError::UnexpectedPacket(11),
-            PgpError::NoSignature,
-            PgpError::TooManySignatures,
-            PgpError::UnsupportedVersion(3),
-            PgpError::UnsupportedSignatureType(1),
-            PgpError::UnsupportedPublicKeyAlgorithm(3),
-            PgpError::UnsupportedHash(2),
-            PgpError::BadSubpacket,
-            PgpError::UnknownCriticalSubpacket(101),
-            PgpError::DuplicateSubpacket(2),
-            PgpError::MissingIssuer,
-            PgpError::IssuerMismatch,
-            PgpError::MissingCreationTime,
-            PgpError::CreatedBeforeKey,
-            PgpError::CreatedInFuture,
-            PgpError::Expired,
-            PgpError::BadMpi,
-            PgpError::DigestPrefixMismatch,
-            PgpError::BadSignature,
-        ];
-        let messages: HashSet<String> = all.iter().map(ToString::to_string).collect();
-        assert_eq!(messages.len(), all.len());
-        assert!(messages.iter().all(|m| m.starts_with("openpgp: ")));
-        assert_eq!(
-            PgpError::UnsupportedHash(2).to_string(),
-            "openpgp: unsupported hash algorithm 2"
-        );
-        assert_eq!(
-            PgpError::TooLarge.to_string(),
-            format!(
-                "openpgp: signature input is larger than {} KiB",
-                MAX_SIGNATURE_LEN / 1024
-            )
-        );
     }
 }

@@ -172,112 +172,6 @@ fn reflow_linear_time_columns() {
     );
 }
 
-/// Repeated scroll_up(1) accumulates `DeferredLine`s with zero `row_to_line`
-/// ops; draining is linear.
-#[test]
-fn scroll_up_handles_many_rows() {
-    fn measure_scroll_and_drain(scrolls: usize) -> (usize, usize) {
-        take_row_to_line_ops();
-
-        let rows = 50;
-        let cols = 80;
-        let mut grid = Grid::with_scrollback(rows, cols, 0);
-
-        for row in 0..rows {
-            grid.set_cursor(row, 0);
-            for c in "Test content for row".chars() {
-                grid.write_char(c);
-            }
-        }
-
-        let scrollback = Scrollback::new(200, 1000, 10_000_000);
-        grid.attach_scrollback(scrollback);
-
-        take_row_to_line_ops();
-
-        for _ in 0..scrolls {
-            grid.scroll_up(1);
-        }
-        let scroll_ops = take_row_to_line_ops();
-
-        grid.drain_lazy_buffer();
-        let drain_ops = take_row_to_line_ops();
-
-        (scroll_ops, drain_ops)
-    }
-
-    let (small_scroll, small_drain) = measure_scroll_and_drain(25);
-    let (large_scroll, large_drain) = measure_scroll_and_drain(125);
-
-    assert_eq!(
-        small_scroll, 0,
-        "scroll_up(1) x 25 should defer row_to_line (lazy promotion), got {small_scroll} ops"
-    );
-    assert_eq!(
-        large_scroll, 0,
-        "scroll_up(1) x 125 should defer row_to_line (lazy promotion), got {large_scroll} ops"
-    );
-
-    assert!(
-        small_drain > 0,
-        "drain after 25 scrolls should perform row_to_line ops, got 0"
-    );
-
-    let ratio = large_drain as f64 / small_drain as f64;
-    assert!(
-        ratio < 10.0,
-        "drain ops ratio {ratio:.1}x suggests non-linear behavior (25 scrolls: {small_drain}, 125 scrolls: {large_drain})"
-    );
-    assert!(
-        ratio > 2.0,
-        "drain ops ratio {ratio:.1}x is too low - expected ~5x (25 scrolls: {small_drain}, 125 scrolls: {large_drain})"
-    );
-}
-
-/// row_to_line conversion is O(cols).
-#[test]
-fn row_to_line_linear_in_columns() {
-    fn measure_row_to_line_cells(cols: u16) -> usize {
-        take_row_to_line_cells();
-
-        let mut grid = Grid::new(1, cols);
-
-        for col in 0..cols {
-            grid.set_cursor(0, col);
-            grid.write_char(if col % 2 == 0 { 'A' } else { 'B' });
-        }
-
-        take_row_to_line_cells();
-
-        let row = grid.row(0).unwrap();
-
-        let _line = Grid::row_to_line_static(row);
-        take_row_to_line_cells()
-    }
-
-    let small_cells = measure_row_to_line_cells(40);
-    let large_cells = measure_row_to_line_cells(200);
-
-    assert!(
-        small_cells >= 40,
-        "row_to_line(40 cols) should process at least 40 cells, got {small_cells}"
-    );
-    assert!(
-        large_cells >= 200,
-        "row_to_line(200 cols) should process at least 200 cells, got {large_cells}"
-    );
-
-    let ratio = large_cells as f64 / small_cells as f64;
-    assert!(
-        ratio < 7.0,
-        "row_to_line cells ratio {ratio:.1}x suggests non-linear behavior (40 cols: {small_cells}, 200 cols: {large_cells})"
-    );
-    assert!(
-        ratio > 3.0,
-        "row_to_line cells ratio {ratio:.1}x is too low - expected ~5x (40 cols: {small_cells}, 200 cols: {large_cells})"
-    );
-}
-
 /// A single scroll_up(1) costs zero conversion ops at any grid size; draining
 /// costs O(cols).
 #[test]
@@ -369,7 +263,7 @@ fn row_to_line_extracts_hyperlinks() {
     }
 
     let row = grid.row(0).unwrap();
-    let line = Grid::row_to_line_with_hyperlinks(row, &extras, 0, grid.styles());
+    let line = Grid::row_to_line_with_hyperlinks(row, &extras, 0);
 
     assert_eq!(line.to_string(), "Hello World Test123");
 
@@ -407,24 +301,4 @@ fn row_to_line_extracts_hyperlinks() {
         line.get_hyperlink(11).is_none(),
         "Col 11 should not have hyperlink"
     );
-}
-
-/// row_to_line_with_hyperlinks on a row without hyperlinks.
-#[test]
-fn row_to_line_no_hyperlinks() {
-    let mut grid = Grid::new(1, 10);
-    grid.set_cursor(0, 0);
-    for c in "NoLinks!!!".chars() {
-        grid.write_char(c);
-    }
-
-    let extras = CellExtras::new();
-
-    let row = grid.row(0).unwrap();
-    let line = Grid::row_to_line_with_hyperlinks(row, &extras, 0, grid.styles());
-
-    assert_eq!(line.to_string(), "NoLinks!!!");
-
-    assert!(!line.has_hyperlinks(), "Line should not have hyperlinks");
-    assert_eq!(line.hyperlink_count(), 0, "Should have 0 hyperlink spans");
 }

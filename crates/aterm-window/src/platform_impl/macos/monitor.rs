@@ -22,8 +22,8 @@
 use std::collections::VecDeque;
 use std::fmt;
 
+use aterm_cg::{CGDirectDisplayID, CGDisplay, CGDisplayBounds, CGDisplayCopyDisplayMode};
 use aterm_objc::cf::CFUUID;
-use aterm_objc::cg::{CGDirectDisplayID, CGDisplay, CGDisplayBounds, CGDisplayCopyDisplayMode};
 use tracing::warn;
 
 // LOCAL PATCH (aterm): objc2's `Retained`/`AnyObject`, its `NSScreen` and
@@ -326,7 +326,7 @@ pub(crate) fn get_display_id(screen: Id) -> u32 {
 // geometry it now computes in is that file's. The two struct pairs are
 // `#[repr(C)]` over `f64` in the same order on every 64-bit Apple target, so
 // this is a re-typing and not a conversion. `CGDisplay::bounds()` answers
-// `aterm_objc::CGRect` too, now that `CGDisplay` is `aterm_objc::cg`'s.
+// `aterm_objc::CGRect` too, now that `CGDisplay` is `aterm_cg`'s.
 pub(crate) fn flip_window_screen_coordinates(frame: aterm_objc::CGRect) -> aterm_objc::CGPoint {
     // It is intentional that we use `CGMainDisplayID` (as opposed to
     // `NSScreen::mainScreen`), because that's what the screen coordinates

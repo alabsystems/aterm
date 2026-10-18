@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! TIER-1 CONFORMANCE, the WRITER half of the derived model `AtpkgIndexPublishWalk`
-//! (crates/aterm-spec/src/derive/models_atpkg_index_publish.rs). The reader half — the
+//! (crates/aterm-models-atpkg/src/models_atpkg_index_publish.rs). The reader half — the
 //! client's tag walk — stays in atpkg (`src/net/index_publish_conformance.rs`).
 //!
 //! Every decision a publisher holding a baseline faces in the model (its baseline number,
@@ -21,7 +21,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aterm_spec::derive::{Model, atpkg_index_publish_walk_model};
+use aterm_models_atpkg::atpkg_index_publish_walk_model;
+use aterm_spec::derive::Model;
 use aterm_spec::interp::{self, State};
 use atpkg_publish::api::{Baseline, IndexRequest};
 use atpkg_publish::channel::index::{parse_delta, publish_with};
@@ -95,6 +96,7 @@ impl Fixture {
                 delta: valid_until(until),
                 out: out.clone(),
                 upload: false,
+                pack_dir: None,
             };
             let mut log = Rig::log();
             publish_with(&rig.ctx, &req, &mut log)
@@ -210,6 +212,7 @@ impl Fixture {
                 .rig
                 .path(&format!("run-{ba}-{na}-{tags:?}").replace([' ', ',', '[', ']'], "")),
             upload: true,
+            pack_dir: None,
         };
         let mut log = Rig::log();
         let ok = publish_with(&ctx, &req, &mut log).is_ok();

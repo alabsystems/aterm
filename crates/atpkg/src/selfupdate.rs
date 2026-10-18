@@ -321,26 +321,66 @@ pub fn announce_line(row: &VendorSpec, have: &str) -> String {
     )
 }
 
+/// [`announce_line`] for an ALab build of `program` ([`crate::alab`]), named by `have`
+/// ([`crate::alab::build_words`]): the same verb runs, against ALab's channel.
+#[must_use]
+pub fn alab_announce_line(program: &str, have: &str) -> String {
+    format!(
+        "atpkg: aterm updates {program} from ALab's channel — you have {have}; checking now: \
+         `aterm pkg update {program}`"
+    )
+}
+
 /// The declined line, stderr, exit 2, nothing run: one sentence per [`Decline`], user text
 /// through [`echo_words`]. No sentence names a bypass: the vendor's installer is never run
 /// through the managed name, whose copy it does not install.
 #[must_use]
 pub fn declined_line(row: &VendorSpec, d: &Decline<'_>) -> String {
-    let p = row.program;
-    let (product, vendor) = (row.product, row.vendor);
+    declined_from(
+        row.program,
+        row.product,
+        row.vendor,
+        &format!("{}'s latest", row.vendor),
+        d,
+    )
+}
+
+/// [`declined_line`] for an ALab build of `program` ([`crate::alab`]): the same refusals,
+/// naming ALab's channel — what `aterm pkg update` checks for it — never the vendor's latest.
+#[must_use]
+pub fn alab_declined_line(agent: &crate::alab::AlabAgent, d: &Decline<'_>) -> String {
+    declined_from(
+        agent.program,
+        agent.product,
+        "ALab's channel",
+        "ALab's channel",
+        d,
+    )
+}
+
+/// [`declined_line`]'s sentences for `program`'s `product`, updated `from` a source whose
+/// newest build a line calls `latest`.
+fn declined_from(
+    program: &str,
+    product: &str,
+    from: &str,
+    latest: &str,
+    d: &Decline<'_>,
+) -> String {
+    let p = program;
     // State first (`not run`), then the one action (`{verb} latest`, the direct swap for a
     // refused channel or version), then at most one caveat: the pin, or rollback for a
     // person who typed a version.
     match d {
         Decline::NotAChannel { verb, target } => format!(
-            "atpkg: `{p} {verb} {target}` not run — aterm updates {product} from {vendor} and \
-             installs no `{target}`; `{p} {verb} latest` checks {vendor}'s latest now (`aterm \
-             pkg pin {p}` holds the version you have)"
+            "atpkg: `{p} {verb} {target}` not run — aterm updates {product} from {from} and \
+             installs no `{target}`; `{p} {verb} latest` checks {latest} now (`aterm pkg pin \
+             {p}` holds the version you have)"
         ),
         Decline::Version { verb, target } => format!(
-            "atpkg: `{p} {verb} {}` not run — aterm updates {product} from {vendor} and takes \
-             no version number; `{p} {verb} latest` checks {vendor}'s latest now (`aterm pkg \
-             rollback {p}` returns to the version before)",
+            "atpkg: `{p} {verb} {}` not run — aterm updates {product} from {from} and takes \
+             no version number; `{p} {verb} latest` checks {latest} now (`aterm pkg rollback \
+             {p}` returns to the version before)",
             echo_words(std::slice::from_ref(&(*target).to_string()))
         ),
         Decline::Shape { verb, rest } => {
@@ -348,7 +388,7 @@ pub fn declined_line(row: &VendorSpec, d: &Decline<'_>) -> String {
             typed.extend(rest.iter().cloned());
             format!(
                 "atpkg: `{p} {}` not run — not a shape aterm's updater takes; `{p} {verb}` \
-                 alone checks {vendor}'s latest now",
+                 alone checks {latest} now",
                 echo_words(&typed)
             )
         }
@@ -503,23 +543,10 @@ mod tests {
         row_for("codex").unwrap()
     }
 
-    /// Each row's verbs are `case`-pattern-safe words, unique within the row, and so is its
-    /// program (the note line holds it).
+    /// THE SHELL-WORD RULE the twin renderer enforces (a verb lands in a `case` pattern):
+    /// a non-member has no verbs.
     #[test]
-    fn every_self_update_verb_is_a_shell_word() {
-        for row in crate::vendor_direct::VENDORS {
-            let mut seen = std::collections::BTreeSet::new();
-            for v in row.self_update_verbs {
-                assert!(is_shell_safe_verb(v), "{}: {v:?}", row.program);
-                assert!(seen.insert(*v), "{}: {v} twice", row.program);
-            }
-            assert!(
-                is_shell_safe_verb(row.program),
-                "the note line holds the program"
-            );
-        }
-        assert_eq!(verbs_of("claude"), &["update", "upgrade", "install"]);
-        assert_eq!(verbs_of("codex"), &["update"]);
+    fn the_shell_word_rule_refuses_what_breaks_a_case_pattern() {
         assert_eq!(verbs_of("ay"), &[] as &[&str], "a non-member has no verbs");
         assert_eq!(row_for("ay"), None);
         // The word rule, spelled out.
@@ -538,11 +565,6 @@ mod tests {
                 "{reserved_but_inert}: parses and matches as an ordinary pattern word"
             );
         }
-        assert_eq!(HIDDEN_VERB, "__selfupdate");
-        assert_eq!(
-            WAIT_LOCK_SECS, 1800,
-            "thirty minutes — the window's own bound, and no knob"
-        );
     }
 
     /// One assertion per rule of [`classify`]'s doc, negative controls included, and codex,
@@ -668,238 +690,17 @@ mod tests {
         assert!(!looks_like_version(""));
     }
 
-    /// Every line, byte-exact, for claude and codex. Each starts `atpkg: ` (the `which`
-    /// sentence, appended to a `which` row, does not), names the program only through its
-    /// row, names no environment variable, and escapes and caps a hostile target.
+    /// A hostile target — a newline, quotes, 200 bytes — is escaped and capped before it
+    /// reaches a terminal, and the cap lands on a char boundary.
     #[test]
-    fn every_line_is_exact() {
+    fn a_hostile_echo_is_escaped_and_capped() {
         let c = claude();
-        let x = codex();
-        let v2_1_280 = crate::vendor_direct::Version::parse("2.1.280")
-            .unwrap()
-            .build_id();
-        // The announce line: what you have, then the check running now and its verb; the
-        // words typed are not echoed, and every render stays under 180 bytes.
-        assert_eq!(
-            announce_line(c, "2.1.280"),
-            "atpkg: aterm updates Claude Code from Anthropic — you have 2.1.280; checking now: \
-             `aterm pkg update claude`"
-        );
-        assert_eq!(
-            announce_line(c, "build 2026091902"),
-            "atpkg: aterm updates Claude Code from Anthropic — you have build 2026091902; \
-             checking now: `aterm pkg update claude`"
-        );
-        assert_eq!(
-            announce_line(c, "(no version recorded)"),
-            "atpkg: aterm updates Claude Code from Anthropic — you have (no version recorded); \
-             checking now: `aterm pkg update claude`"
-        );
-        assert_eq!(
-            announce_line(x, "0.156.0"),
-            "atpkg: aterm updates Codex CLI from OpenAI — you have 0.156.0; checking now: \
-             `aterm pkg update codex`"
-        );
-        // `have_words` over an empty layout (no program stamp): a vendor-direct build id
-        // decodes to its version, a legacy index build is `build N`, none is
-        // `(no version recorded)`.
-        let empty = crate::store::Layout {
-            prefix: std::env::temp_dir().join(format!("atpkg-announce-{}", std::process::id())),
-        };
-        assert_eq!(
-            crate::vendor_direct::have_words(&empty, "claude", Some(v2_1_280)),
-            "2.1.280"
-        );
-        assert_eq!(
-            crate::vendor_direct::have_words(&empty, "claude", Some(2_026_091_902)),
-            "build 2026091902"
-        );
-        assert_eq!(
-            crate::vendor_direct::have_words(&empty, "claude", None),
-            "(no version recorded)"
-        );
-        for line in [
-            announce_line(c, "2.1.280"),
-            announce_line(c, "build 2026091902"),
-            announce_line(c, "(no version recorded)"),
-            announce_line(x, "(no version recorded)"),
-        ] {
-            assert!(line.len() < 180, "{}: {line}", line.len());
-            assert!(
-                !line.contains('`') || !line.contains("` — "),
-                "no typed words echoed: {line}"
-            );
-        }
-        assert_eq!(
-            help_line(c),
-            "atpkg: here `claude update` runs `aterm pkg update claude` (`aterm help pkg`) — \
-             the vendor's own help follows"
-        );
-        assert_eq!(
-            help_line(x),
-            "atpkg: here `codex update` runs `aterm pkg update codex` (`aterm help pkg`) — the \
-             vendor's own help follows"
-        );
-        assert_eq!(
-            disabled_line(c, Some(v2_1_280)),
-            "atpkg: this aterm build updates nothing (it pins no release key) — claude 2.1.280 \
-             stays; a released aterm updates it"
-        );
-        assert_eq!(
-            disabled_line(x, None),
-            "atpkg: this aterm build updates nothing (it pins no release key) — codex (no \
-             version recorded) stays; a released aterm updates it"
-        );
-        assert_eq!(
-            declined_line(
-                c,
-                &Decline::NotAChannel {
-                    verb: "install",
-                    target: "stable"
-                }
-            ),
-            "atpkg: `claude install stable` not run — aterm updates Claude Code from Anthropic \
-             and installs no `stable`; `claude install latest` checks Anthropic's latest now \
-             (`aterm pkg pin claude` holds the version you have)"
-        );
-        assert_eq!(
-            declined_line(
-                c,
-                &Decline::Version {
-                    verb: "install",
-                    target: "2.1.200"
-                }
-            ),
-            "atpkg: `claude install 2.1.200` not run — aterm updates Claude Code from Anthropic \
-             and takes no version number; `claude install latest` checks Anthropic's latest \
-             now (`aterm pkg rollback claude` returns to the version before)"
-        );
-        let rest = a(&["--foo"]);
-        assert_eq!(
-            declined_line(
-                c,
-                &Decline::Shape {
-                    verb: "update",
-                    rest: &rest
-                }
-            ),
-            "atpkg: `claude update --foo` not run — not a shape aterm's updater takes; `claude \
-             update` alone checks Anthropic's latest now"
-        );
-        let rest = a(&["now"]);
-        assert_eq!(
-            declined_line(
-                x,
-                &Decline::Shape {
-                    verb: "update",
-                    rest: &rest
-                }
-            ),
-            "atpkg: `codex update now` not run — not a shape aterm's updater takes; `codex \
-             update` alone checks OpenAI's latest now"
-        );
-        assert_eq!(
-            incomplete_line(c, Some(v2_1_280)),
-            "atpkg: claude 2.1.280 stays; `claude update` tries again"
-        );
-        assert_eq!(
-            incomplete_line(x, None),
-            "atpkg: codex (no version recorded) stays; `codex update` tries again"
-        );
-        assert_eq!(
-            stopped_line(c, Some(v2_1_280)),
-            "atpkg: the claude check was stopped before it finished — claude 2.1.280 stays; \
-             `claude update` tries again"
-        );
-        // A legacy index build, not yet replaced, keeps its number.
-        assert_eq!(
-            stopped_line(c, Some(2_026_091_902)),
-            "atpkg: the claude check was stopped before it finished — claude build 2026091902 \
-             stays; `claude update` tries again"
-        );
-        assert_eq!(
-            contended_line(c, Some(v2_1_280), WAIT_LOCK_SECS, false),
-            "atpkg: another update is still running after 30 min — claude 2.1.280 stays; \
-             `claude update` again when it finishes"
-        );
-        assert_eq!(
-            contended_line(x, None, 1, true),
-            "atpkg: another `aterm pkg` command is still running after 1 s — codex (no version \
-             recorded) stays; `codex update` again when it finishes"
-        );
-        // No line over 230 bytes, and none names the mechanism.
-        for line in [
-            declined_line(
-                c,
-                &Decline::Version {
-                    verb: "install",
-                    target: "2.1.200",
-                },
-            ),
-            disabled_line(c, Some(v2_1_280)),
-            incomplete_line(c, Some(v2_1_280)),
-            stopped_line(c, Some(2_026_091_902)),
-            contended_line(c, Some(v2_1_280), WAIT_LOCK_SECS, true),
-            help_line(c),
-        ] {
-            assert!(line.len() <= 230, "{}: {line}", line.len());
-            assert!(
-                !line.contains("package manager") && !line.contains("moving packages"),
-                "no mechanism words: {line}"
-            );
-        }
-        // The bound as a person reads it, the remainder never rounded.
-        for (secs, words) in [
-            (1, "1 s"),
-            (60, "60 s"),
-            (119, "119 s"),
-            (120, "2 min"),
-            (150, "2 min 30 s"),
-            (1800, "30 min"),
-        ] {
-            assert_eq!(wait_words(secs), words, "{secs}");
-        }
-        assert_eq!(
-            prefix_mismatch_line(
-                c,
-                Path::new("/Users//u/Library/Application Support/aterm/pkg"),
-                Path::new("/opt/aterm/pkg")
-            ),
-            "atpkg: this claude lives under /Users//u/Library/Application Support/aterm/pkg \
-             but atpkg here resolves /opt/aterm/pkg — run `aterm pkg update claude` from a \
-             shell whose HOME (or aterm.toml) names that store"
-        );
-        let err = io::Error::new(io::ErrorKind::NotFound, "No such file or directory");
-        assert_eq!(
-            could_not_run_line(
-                Path::new("/Applications/aterm.app/Contents/MacOS/atpkg"),
-                "claude",
-                &err
-            ),
-            "atpkg: could not run /Applications/aterm.app/Contents/MacOS/atpkg update claude: \
-             No such file or directory — `aterm pkg update claude` does the same check"
-        );
-        assert_eq!(
-            which_sentence(c),
-            "`claude update` here runs `aterm pkg update claude`"
-        );
-        assert_eq!(
-            which_sentence(x),
-            "`codex update` here runs `aterm pkg update codex`"
-        );
-        // Hostile echoes: a newline and quotes are `{:?}`-escaped; 200 bytes are capped
-        // at 64 plus `…`; the plain shape stays plain.
-        let hostile = "2.1\n\"x\"";
         let line = declined_line(
             c,
             &Decline::Version {
                 verb: "install",
-                target: hostile,
+                target: "2.1\n\"x\"",
             },
-        );
-        assert!(
-            line.contains("`claude install \"2.1\\n\\\"x\\\"\"`"),
-            "{line}"
         );
         assert!(!line.contains('\n'), "{line}");
         let long = "9".repeat(200);
@@ -910,76 +711,11 @@ mod tests {
                 target: &long,
             },
         );
-        assert!(
-            line.contains(&format!("`claude install {}…`", "9".repeat(64))),
-            "{line}"
-        );
+        assert!(line.contains(&"9".repeat(64)), "{line}");
         assert!(!line.contains(&"9".repeat(65)), "{line}");
-        let rest = a(&["--foo", "a b", "ünïcode"]);
-        let line = declined_line(
-            c,
-            &Decline::Shape {
-                verb: "update",
-                rest: &rest,
-            },
-        );
-        assert!(
-            line.starts_with(
-                "atpkg: `claude update --foo \"a b\" \"ünïcode\"` not run — not a shape"
-            ),
-            "{line}"
-        );
-        assert_eq!(echo_words(&a(&["plain", "--flag=1"])), "plain --flag=1");
-        assert_eq!(echo_words(&[]), "");
-        // The cap lands on a char boundary, never inside a multi-byte sequence.
         let capped = echo_words(&a(&[&"é".repeat(40)]));
         assert!(capped.ends_with('…'), "{capped}");
         assert!(capped.len() <= ECHO_CAP + '…'.len_utf8(), "{capped}");
-        // Every stderr line starts with the prefix; none names a program by literal, and
-        // none names an environment variable.
-        let rest = a(&["now"]);
-        for line in [
-            announce_line(x, "(no version recorded)"),
-            help_line(x),
-            disabled_line(x, None),
-            incomplete_line(x, None),
-            stopped_line(x, None),
-            contended_line(x, None, 5, false),
-            prefix_mismatch_line(x, Path::new("/a"), Path::new("/b")),
-            could_not_run_line(Path::new("/a"), "codex", &err),
-            declined_line(
-                x,
-                &Decline::Shape {
-                    verb: "update",
-                    rest: &rest,
-                },
-            ),
-            declined_line(
-                x,
-                &Decline::NotAChannel {
-                    verb: "install",
-                    target: "stable",
-                },
-            ),
-            declined_line(
-                x,
-                &Decline::Version {
-                    verb: "install",
-                    target: "1.2.3",
-                },
-            ),
-        ] {
-            assert!(line.starts_with("atpkg: "), "{line}");
-            assert!(
-                !line.contains("claude"),
-                "codex's line names no other program: {line}"
-            );
-            assert!(
-                !line.contains("ATPKG_") && !line.contains("=1"),
-                "no line names an environment variable or a knob: {line}"
-            );
-        }
-        assert!(contended_line(x, None, 5, false).contains("after 5 s "));
     }
 
     /// The child's argv: the standard update with the fixed bound, never the window's

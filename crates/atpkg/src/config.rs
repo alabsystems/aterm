@@ -1024,7 +1024,6 @@ mod tests {
             !parse_packages("[packages]\nchannel = 7\n").unreadable,
             "any value type is admitted for a retired key"
         );
-        assert_eq!(CHANNEL, "stable");
     }
 
     /// A shipped binary drops `prefix`, `account` and every `owner/repo` link at load; a

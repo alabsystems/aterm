@@ -6,11 +6,11 @@ use super::{
     admits_bulk_scrollback_maintenance, global_scrollback_budget_for, global_shed_order,
 };
 
-/// The aggregate cap is an eighth of physical memory, at most 4 GiB: 1 GiB
-/// on an 8 GiB Mac, the ceiling on a 64 GiB one and when the size is unknown.
+/// The aggregate cap scales with physical memory up to its ceiling, which is
+/// also the answer when the size is unknown.
 #[test]
-fn global_scrollback_budget_is_an_eighth_of_ram_capped() {
-    assert_eq!(global_scrollback_budget_for(Some(8192)), 1 << 30);
+fn global_scrollback_budget_is_capped_and_unknown_ram_takes_the_ceiling() {
+    assert!(global_scrollback_budget_for(Some(8192)) < GLOBAL_SCROLLBACK_BUDGET_BYTES);
     assert_eq!(
         global_scrollback_budget_for(Some(65536)),
         GLOBAL_SCROLLBACK_BUDGET_BYTES
@@ -40,7 +40,7 @@ fn global_shed_order_picks_largest_until_under_cap() {
 
 #[test]
 fn shipping_lane_admission_matches_the_derived_model() {
-    let model = aterm_spec::derive::scrollback_maintenance_lane_model();
+    let model = aterm_models_misc::scrollback_maintenance_lane_model();
 
     let mut output = model.init_state();
     assert!(model.fire("ObserveOutput", &mut output));

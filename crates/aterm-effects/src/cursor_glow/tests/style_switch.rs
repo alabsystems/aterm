@@ -207,50 +207,6 @@ fn style_switch_drops_pending_sound_cues() {
     assert_eq!(cues[0].kind, SoundKind::Typed);
 }
 
-/// The non-fire crown is radial light: a hot run's crown lands as `RainHalo`s around the head
-/// (radii ≥ 1) for every non-fire style.
-#[test]
-fn non_fire_crown_is_radial_halos_not_squares() {
-    let g = geom();
-    let t0 = Instant::now();
-    for style in [
-        GlowStyle::Laser,
-        GlowStyle::Lumen,
-        GlowStyle::Sparkle,
-        GlowStyle::Water,
-        GlowStyle::Comet,
-        GlowStyle::Phaser,
-    ] {
-        let c = cfg(style, true);
-        let mut glow = CursorGlow::default();
-        let mut out = Vec::new();
-        let mut t = t0;
-        glow.tick(Some((3, 5)), t, &c, g, &mut out);
-        for i in 6..=12u16 {
-            t += Duration::from_millis(35);
-            glow.note_synthetic_typed(t, 1);
-            glow.tick(Some((3, i)), t, &c, g, &mut out);
-        }
-        assert!(
-            !glow.halos().is_empty(),
-            "{style:?}: the crown emits radial halos"
-        );
-        for h in glow.halos() {
-            assert!(
-                h.rx >= 1 && h.ry >= 1,
-                "{style:?}: halo radii floored: {h:?}"
-            );
-        }
-        let head_cx = (12 * g.cw + g.cw / 2) as i32;
-        assert!(
-            glow.halos()
-                .iter()
-                .any(|h| (h.cx as i32 - head_cx).abs() < 3 * g.cw as i32),
-            "{style:?}: a radial crown halo sits on the cursor head"
-        );
-    }
-}
-
 /// The pooled bolt-jag buffers carry nothing between strikes: the same seed produces the same
 /// polyline strike after strike.
 #[test]

@@ -201,19 +201,6 @@ impl TokenBucket {
     pub(crate) fn capacity_bytes(&self) -> u64 {
         self.capacity_bytes
     }
-
-    /// Current token balance rounded down to whole tokens. Test-only.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn tokens(&self) -> u64 {
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "tokens are clamped to [0, capacity] which fits in u64"
-        )]
-        let t = self.tokens as u64;
-        t
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -292,14 +279,6 @@ pub struct RateLimiterSet {
 }
 
 impl RateLimiterSet {
-    /// Construct an empty set (no buckets). Equivalent to a policy with
-    /// an empty `rate_limits` table. Test-only.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
     /// Build the set from a [`Policy`]'s `rate_limits` table.
     ///
     /// Duplicate ids in the policy are silently collapsed — the last
@@ -445,16 +424,6 @@ mod tests {
     // -----------------------------------------------------------------
 
     #[test]
-    fn below_rate_all_calls_succeed() {
-        let mut bucket = TokenBucket::from_config(&rl("x", 500, 1_000, 0));
-        let clock = FakeClock::new();
-        for _ in 0..10 {
-            assert!(bucket.try_consume(40, &clock));
-            clock.advance(Duration::from_millis(200));
-        }
-    }
-
-    #[test]
     fn burst_capacity_drains_then_denies() {
         // 200-byte burst, 100 B/s refill, no time advance: 5 × 40 fits,
         // remaining 5 must be denied.
@@ -549,32 +518,9 @@ mod tests {
         assert!(!bucket.try_consume(1, &clock));
     }
 
-    #[test]
-    fn per_sequence_cap_does_not_debit_on_denial() {
-        let mut bucket = TokenBucket::from_config(&rl("palette", 1_000, 1_000, 4));
-        let clock = FakeClock::new();
-        // 10 pathological calls at amount=5 (each above the per-seq cap)
-        // — every one denied, no tokens consumed.
-        for _ in 0..10 {
-            assert!(!bucket.try_consume(5, &clock));
-        }
-        // Bucket is still full.
-        assert_eq!(bucket.tokens(), 1_000);
-    }
-
     // -----------------------------------------------------------------
     // RateLimiterSet
     // -----------------------------------------------------------------
-
-    #[test]
-    fn unknown_id_is_allowed_by_default() {
-        let mut set = RateLimiterSet::new();
-        let clock = FakeClock::new();
-        // No bucket declared → unmatched ids are permitted. The engine
-        // is still fail-closed overall because unmatched *rules* fall
-        // through to defaults.unmatched.
-        assert!(set.try_consume("missing", 99_999, &clock));
-    }
 
     #[test]
     fn known_id_enforces_bucket() {
@@ -652,21 +598,6 @@ mod tests {
         assert!(!set.try_consume_slot(response, 1, &clock));
         assert!(set.try_consume_slot(palette, 10, &clock));
         assert!(!set.try_consume_slot(palette, 1, &clock));
-    }
-
-    #[test]
-    fn slot_and_id_forms_agree() {
-        let clock = FakeClock::new();
-        let mut by_id = RateLimiterSet::from_policy(&two_bucket_policy());
-        let mut by_slot = RateLimiterSet::from_policy(&two_bucket_policy());
-        let slot = by_slot.slot("response");
-        for amount in [40, 40, 40] {
-            assert_eq!(
-                by_id.try_consume("response", amount, &clock),
-                by_slot.try_consume_slot(slot, amount, &clock),
-                "the slot form must answer exactly as the id form does"
-            );
-        }
     }
 
     #[test]

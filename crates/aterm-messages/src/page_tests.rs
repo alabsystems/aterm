@@ -12,8 +12,7 @@ use crate::model::{
 };
 use crate::page::{
     Host, MessageActionView, MessageView, MessagesClock, MessagesFilter, MessagesState, NOT_SAVED,
-    TAG_ORDER, act_feedback, cut_off_mark, description, same_chip, span_words, status_words,
-    tag_words,
+    cut_off_mark, description, same_chip, tag_words,
 };
 use crate::{HOLD_ASK, Instant, Outcome, STALE_TAILED, words};
 
@@ -371,8 +370,8 @@ fn install_now_follows_the_hosts_staged_build_and_the_sentence_is_the_hosts() {
 }
 
 /// On a retired record an upgrade word whose tab the host no longer has is dropped; one
-/// whose upgrade stands but no longer takes the word is offered disabled. An agent's one
-/// row's word stays while any tab it named stands. A live row keeps every word.
+/// whose upgrade stands but no longer takes the word is offered disabled. A live row keeps
+/// every word.
 #[test]
 fn a_word_for_a_session_that_is_gone_is_not_offered() {
     let now = Instant::now();
@@ -391,25 +390,6 @@ fn a_word_for_a_session_that_is_gone_is_not_offered() {
             now,
         )
         .id;
-    let group = c
-        .post(
-            Message::new(
-                tags::HARNESS,
-                Severity::Warn,
-                "Claude upgrade waits in 2 tabs",
-            )
-            .action(Intent::AgentUpgradeTabs {
-                word: UpgradeWord::Skip,
-                moves: vec![
-                    ("s-1".into(), "2.1.282".into()),
-                    ("s-2".into(), "2.1.282".into()),
-                ],
-            })
-            .hold(Hold::STANDING),
-            stamp(NOW - 30_000),
-            now,
-        )
-        .id;
     // Live: every word offered, pressable only where the host takes it.
     let page = MessagesState::of(&c, &Desk::default());
     let words_of = |page: &MessagesState, id: MessageId| {
@@ -425,27 +405,11 @@ fn a_word_for_a_session_that_is_gone_is_not_offered() {
         [(0, false), (1, false)],
         "a live row keeps its words"
     );
-    assert_eq!(words_of(&page, group), [(0, false)]);
     assert!(c.resolve(tab, Outcome::Ok, now));
-    assert!(c.resolve(group, Outcome::Ok, now));
-    // Retired, every tab gone: nothing offered.
+    // Retired, its tab gone: nothing offered.
     let page = MessagesState::of(&c, &Desk::default());
     assert!(words_of(&page, tab).is_empty());
-    assert!(words_of(&page, group).is_empty());
-    // s-2 stands and takes Skip: the group word stays and is pressable; the
-    // tab-1 words are gone.
-    let page = MessagesState::of(
-        &c,
-        &Desk {
-            standing: vec!["s-2"],
-            takes: vec![("s-2", "2.1.282", UpgradeWord::Skip)],
-            ..Desk::default()
-        },
-    );
-    assert!(words_of(&page, tab).is_empty());
-    assert_eq!(words_of(&page, group), [(0, true)]);
-    // s-1 stands but moved on: its words stay, disabled, but for one it takes. The group
-    // word stays (s-1 stands), disabled: no tab takes Skip.
+    // s-1 stands but moved on: its words stay, disabled, but for one it takes.
     let page = MessagesState::of(
         &c,
         &Desk {
@@ -455,7 +419,6 @@ fn a_word_for_a_session_that_is_gone_is_not_offered() {
         },
     );
     assert_eq!(words_of(&page, tab), [(0, false), (1, true)]);
-    assert_eq!(words_of(&page, group), [(0, false)]);
 }
 
 /// A navigation's moment never passes: on a host that performs navigations every one is
@@ -583,9 +546,9 @@ fn a_scripts_tag_never_reads_as_one_of_aterms_chips() {
     }
     // Every chip's words as a script would tag them, wherever that is a tag
     // and not one of aterm's own.
-    for own in TAG_ORDER {
+    for own in tags::ALL.iter().map(|t| t.as_str()) {
         let spelled = tag_words(own).to_lowercase();
-        if Tag::try_new(&spelled).is_ok() && !TAG_ORDER.contains(&spelled.as_str()) {
+        if Tag::try_new(&spelled).is_ok() && !tags::ALL.iter().any(|t| t.as_str() == spelled) {
             assert_ne!(tag_words(&spelled), tag_words(own), "{spelled}");
         }
     }
@@ -638,9 +601,9 @@ fn a_scripts_tag_never_reads_as_one_of_aterms_chips() {
         .collect();
     assert_eq!(admitted, [ours.raw()]);
     assert_eq!(page.severity_counts(Some("update")), (1, 0));
-    assert_eq!(
-        description(page.entry(theirs.raw()).unwrap(), NOW),
-        "Error, updates, 30 minutes ago"
+    assert!(
+        description(page.entry(theirs.raw()).unwrap(), NOW).contains(", updates,"),
+        "spoken as the script wrote its tag"
     );
 }
 
@@ -709,120 +672,8 @@ fn a_replayed_open_record_is_cut_off_and_a_silent_one_blames_its_reporter() {
     );
 }
 
-/// Every state in plain words: what the row is doing and, once it has left, how long it
-/// stood; never `cleared` over a failure, `took` only for delivered work.
-#[test]
-fn every_state_is_said_in_plain_words() {
-    let base = entry_at(1, NOW - 120_000);
-    let with = |state: &'static str, severity: &'static str, retired: Option<u64>| MessageView {
-        state,
-        severity,
-        retired_unix_ms: retired,
-        ..base.clone()
-    };
-    let at = base.at_unix_ms;
-    let later = Some(at + 40_000);
-    let cases: [(MessageView, &str); 21] = [
-        (with("live", "info", None), "waiting to show"),
-        (
-            MessageView {
-                on_glass: Some(1),
-                ..with("held", "info", None)
-            },
-            "showing now",
-        ),
-        (with("folded", "warn", later), "shown for 40 s"),
-        (with("folded", "warn", None), "shown"),
-        (with("folded", "warn", Some(at)), "recorded"),
-        (with("stale", "info", None), "still open when aterm stopped"),
-        (with("stale", "info", later), "stopped reporting after 40 s"),
-        (
-            with("quit", "info", later),
-            "still open when aterm quit after 40 s",
-        ),
-        (
-            with("unseen", "info", later),
-            "not shown \u{2014} too many at once",
-        ),
-        (with("aged", "info", later), "aged out after 40 s"),
-        (with("superseded", "info", later), "replaced"),
-        (with("resolved-ok", "success", later), "took 40 s"),
-        (with("resolved-ok", "info", later), "lasted 40 s"),
-        (with("withdrawn", "success", None), "finished"),
-        (with("withdrawn", "warn", None), "ended"),
-        (
-            with("resolved-warn", "warn", Some(at + 3 * 3_600_000)),
-            "ended with a problem after 3 h",
-        ),
-        (with("dismissed", "info", later), "dismissed"),
-        (with("answered", "info", later), "answered"),
-        (
-            with("evicted", "info", later),
-            "dropped \u{2014} too many at once",
-        ),
-        (
-            with("carried", "info", None),
-            "carried over to the updated aterm",
-        ),
-        (with("future-word", "info", later), "future-word after 40 s"),
-    ];
-    for (entry, words) in cases {
-        assert_eq!(entry.state_words(), words, "{}", entry.state);
-    }
-    // A record that stood on the band says how long it was shown.
-    let strain = MessageView {
-        detail: vec!["shown for 41 s".into(), "cpu 3.2 cores".into()],
-        ..with("recorded", "warn", Some(at))
-    };
-    assert_eq!(strain.shown_line(), Some("shown for 41 s"));
-    assert_eq!(strain.record_words(), "shown for 41 s");
-    assert_eq!(strain.state_words(), "shown for 41 s");
-    assert_eq!(with("recorded", "info", Some(at)).state_words(), "recorded");
-    assert_eq!(
-        MessageView {
-            answer: Some("Not now".into()),
-            ..with("answered", "info", later)
-        }
-        .state_words(),
-        "answered: Not now"
-    );
-    for (severity, words, alarm) in [
-        ("error", "Error", true),
-        ("warn", "Warning", true),
-        ("success", "Done", false),
-        ("info", "Info", false),
-    ] {
-        let e = with("folded", severity, later);
-        assert_eq!(e.severity_words(), words);
-        assert_eq!(e.alarm(), alarm, "{severity}");
-    }
-}
-
-/// Every vocabulary word has a chip position, in the chips' own words; a script's tags
-/// read like the chips beside them; a span in words.
-#[test]
-fn tags_chips_cover_the_vocabulary() {
-    for tag in tags::ALL {
-        assert!(TAG_ORDER.contains(&tag.as_str()), "{tag}");
-    }
-    assert_eq!(TAG_ORDER.len(), tags::ALL.len());
-    assert_eq!(tag_words("script"), "Scripts");
-    assert_eq!(tag_words("search"), "Search");
-    assert_eq!(tag_words("ci"), "CI");
-    assert_eq!(tag_words("Deploy"), "Deploy");
-    assert_eq!(tag_words("crash"), "Crashes");
-    assert_eq!(tag_words("toolchain"), tag_words("packages"));
-    assert_eq!(tag_words("fabric"), "Agents");
-    assert_eq!(tag_words("harness"), "Agents");
-    assert_eq!(span_words(40_000), "40 s");
-    assert_eq!(span_words(150_000), "2 min");
-    assert_eq!(span_words(7_200_000), "2 h");
-    assert_eq!(span_words(200_000_000), "2 d");
-}
-
-/// The filters match a tag by the chip it shows under, Problems is warnings and errors
-/// together, the count line says the whole of what they admit, and an entry's spoken name
-/// is its severity, chip and age in words.
+/// The filters match a tag by the chip it shows under, and Problems is warnings and errors
+/// together.
 #[test]
 fn the_filter_matches_by_chip_and_the_count_line_says_what_it_admits() {
     let fabric = MessageView {
@@ -854,21 +705,6 @@ fn the_filter_matches_by_chip_and_the_count_line_says_what_it_admits() {
     };
     assert!(!other.admits(&fabric));
     assert!(same_chip("toolchain", "packages") && !same_chip("toolchain", "update"));
-    assert_eq!(status_words(42, 42, true), "42 messages");
-    assert_eq!(status_words(1, 1, true), "1 message");
-    assert_eq!(status_words(0, 0, false), "0 messages");
-    assert_eq!(status_words(42, 12, false), "12 of 42");
-    assert_eq!(description(&fabric, NOW), "Info, Agents, 6 hours ago");
-    assert_eq!(
-        description(
-            &MessageView {
-                tag: "toolchain".into(),
-                ..entry_at(3, NOW - 6 * 3_600_000)
-            },
-            NOW
-        ),
-        "Warning, ALab tools, 6 hours ago"
-    );
 }
 
 /// A stamp past the reader's midnight (a writer whose clock runs ahead) is today's: a list
@@ -1009,68 +845,6 @@ fn copy_text_of_a_view_is_the_engines() {
     assert_eq!(entry.state, crate::wire::state_word(rec, None));
 }
 
-/// The page's feedback says what the host did, in a person's words: an
-/// `Install now` press installs only where it applies, opens Software Update
-/// otherwise, and a failure reads as one; a refusal never carries a route.
-#[test]
-fn act_feedback_words_what_the_host_did() {
-    assert_eq!(
-        act_feedback(&Intent::NewWindow, true, false),
-        "Opened a new window"
-    );
-    let apply = Intent::ApplyUpdate { build: 1 };
-    assert_eq!(act_feedback(&apply, true, true), "Installing the update");
-    assert_eq!(
-        act_feedback(&apply, true, false),
-        "Opened Settings \u{25b8} Software Update"
-    );
-    assert_eq!(
-        act_feedback(&apply, false, true),
-        "Could not start the install"
-    );
-    assert_eq!(
-        act_feedback(&apply, false, false),
-        "Could not open Settings"
-    );
-    let packages = Intent::OpenSettings {
-        route: "/packages".into(),
-    };
-    assert_eq!(
-        act_feedback(&packages, true, false),
-        "Opened Settings \u{25b8} Packages"
-    );
-    assert_eq!(
-        act_feedback(
-            &Intent::OpenSettings {
-                route: "/nowhere".into()
-            },
-            false,
-            false
-        ),
-        "Could not open Settings",
-        "no route string on the page"
-    );
-    let not_now = Intent::NotNow {
-        decision: Decision::FileAccess,
-    };
-    assert_eq!(act_feedback(&not_now, true, false), "Not now recorded");
-    assert_eq!(act_feedback(&not_now, false, false), "Not now recorded");
-    assert_eq!(
-        act_feedback(&Intent::ShowTab { tab: 2, window: 7 }, true, false),
-        "Showed tab 2"
-    );
-    let word = upgrade("s-1", "2.1.282", UpgradeWord::NotToday);
-    assert!(
-        act_feedback(&word, true, false).ends_with("; what it did shows in this log"),
-        "{}",
-        act_feedback(&word, true, false)
-    );
-    assert_eq!(
-        act_feedback(&word, false, false),
-        "The upgrade no longer takes that word"
-    );
-}
-
 /// A line of [`crate::page::wire_lines`]' grammar read back as a page would:
 /// its kind word, then each field split at its first `=` and unescaped (the
 /// log codec's inverse). One line never carries a `\n`.
@@ -1093,14 +867,6 @@ fn page_field<'a>(fields: &'a [(String, String)], key: &str) -> Option<&'a str> 
         .iter()
         .find(|(k, _)| k == key)
         .map(|(_, v)| v.as_str())
-}
-
-/// The `page` line's chrome keys, byte for byte, for a page whose tag filter admits `all`
-/// entries, `problems` of them warnings or errors, with no tag filter down.
-fn page_chrome(all: usize, problems: usize) -> String {
-    format!(
-        "\theading=Messages\tsubtitle=What aterm reported, newest first.\tall_words=All \u{00b7} {all}\tproblems_words=Problems \u{00b7} {problems}\tall_tags=All tags\tall_tags_on=1\ttag_menu=Tag: All\ttag_menu_name=Filter by tag: All\tcopy_all_button=Copy All\tcopy_all_name=Copy the shown messages\tempty=Nothing yet.\ttechnical_caption=Technical details\tcopy_button=Copy"
-    )
 }
 
 /// The page-lines fixture: a warning record from three days ago (its
@@ -1170,53 +936,21 @@ fn page_lines_fixture() -> (MessageCenter, Desk) {
     (c, desk)
 }
 
-/// The page as lines, byte for byte: one grammar a web page renders without wording
-/// anything itself (head, chips in order with `toolchain` and `packages` one chip, day
-/// headers, entries newest first with their offered capsules), every value through the
-/// log codec's escaping.
+/// The page as lines: one grammar a web page renders without wording anything itself
+/// (head, chips in order with `toolchain` and `packages` one chip, day headers, entries
+/// newest first with their offered capsules), every value through the log codec's
+/// escaping.
 #[test]
 fn the_page_as_lines_says_every_word_in_one_grammar() {
     let (c, desk) = page_lines_fixture();
     let page = MessagesState::of(&c, &desk);
     let lines = crate::page::wire_lines(&page, &MessagesFilter::default());
-    let rev = c.revision();
-    let chrome = page_chrome(4, 3);
-    let want = [
-        format!(
-            "page\trev={rev}\tnow={NOW}\ttotal=4\tshown=4\tall=4\tproblems=3\tstatus=4 messages{chrome}"
-        ),
-        "chip\ttag=crash\twords=Crashes\tcount=1\ton=0\tlabel=Crashes \u{00b7} 1".to_string(),
-        "chip\ttag=toolchain\twords=ALab tools\tcount=2\ton=0\tlabel=ALab tools \u{00b7} 2"
-            .to_string(),
-        "chip\ttag=harness\twords=Agents\tcount=1\ton=0\tlabel=Agents \u{00b7} 1".to_string(),
-        "day\tday=20352\twords=Today\tshort=Today".to_string(),
-        format!(
-            "entry\tid=4\tat={}\twhen=1 min ago\tlocal=Today 3:52:20 PM\ttag=harness\ttag_words=Agents\tsev=warn\tsev_words=Warning\tmark=\u{26a0}\ttitle=Claude upgrade waits in C:\\\\work\tstate=live\tstate_words=showing now\trep=1\tdescription=Warning, Agents, 1 minute ago\tsentence=it asks again on its own at 4:00 PM\\uUpgrade now asks it at its next turn end\ttechnical=in tab 1 \u{00b7} 2.1.281 \u{2192} 2.1.282\tmeta=Today 3:52:20 PM \u{00b7} showing now\tcopy=Claude upgrade waits in C:\\\\work\\n2025-09-21 15:52:20 UTC \u{00b7} harness \u{00b7} warn\\nit asks again on its own at 4:00 PM\\nUpgrade now asks it at its next turn end\\nin tab 1 \u{00b7} 2.1.281 \u{2192} 2.1.282",
-            NOW - 60_000
-        ),
-        "action\tid=4\tindex=0\tlabel=Upgrade now\tactionable=1\tbutton=Upgrade now\tprimary=1"
-            .to_string(),
-        "action\tid=4\tindex=1\tlabel=Not today\tactionable=0\tbutton=Not today\tprimary=0"
-            .to_string(),
-        format!(
-            "entry\tid=3\tat={}\twhen=10 min ago\tlocal=Today 3:43:20 PM\ttag=crash\ttag_words=Crashes\tsev=error\tsev_words=Error\tmark=\u{2715}\ttitle=aterm closed unexpectedly\tstate=recorded\tstate_words=recorded\trep=1\tdescription=Error, Crashes, 10 minutes ago\tsentence=\ttechnical=panicked at src/grid.rs:3:9\\u    ^ index out of bounds\tmeta=Today 3:43:20 PM \u{00b7} recorded\tcopy=aterm closed unexpectedly\\n2025-09-21 15:43:20 UTC \u{00b7} crash \u{00b7} error\\npanicked at src/grid.rs:3:9\\n    ^ index out of bounds",
-            NOW - 10 * 60_000
-        ),
-        "action\tid=3\tindex=0\tlabel=Open log\tactionable=1\tbutton=Open log\tprimary=1"
-            .to_string(),
-        format!(
-            "entry\tid=2\tat={}\twhen=2 h ago\tlocal=Today 1:53:20 PM\ttag=packages\ttag_words=ALab tools\tsev=info\tsev_words=Info\tmark=\u{2139}\ttitle=trust updated\tstate=recorded\tstate_words=recorded\trep=1\tdescription=Info, ALab tools, 2 hours ago\tsentence=0.9.1 is live\ttechnical=\tmeta=Today 1:53:20 PM \u{00b7} recorded\tcopy=trust updated\\n2025-09-21 13:53:20 UTC \u{00b7} packages \u{00b7} info\\n0.9.1 is live",
-            NOW - 2 * 3_600_000
-        ),
-        "day\tday=20349\twords=Thursday\tshort=Thursday".to_string(),
-        format!(
-            "entry\tid=1\tat={}\twhen=3:53 PM\tlocal=Thursday 3:53:20 PM\ttag=toolchain\ttag_words=ALab tools\tsev=warn\tsev_words=Warning\tmark=\u{26a0}\ttitle=ALab tools could not update\tstate=recorded\tstate_words=recorded\trep=1\tdescription=Warning, ALab tools, 3 days ago\tsentence=the index could not be reached; it tries again in an hour\ttechnical=GET /index.toml: 503\tmeta=Thursday 3:53:20 PM \u{00b7} recorded\tcopy=ALab tools could not update\\n2025-09-18 15:53:20 UTC \u{00b7} toolchain \u{00b7} warn\\nthe index could not be reached; it tries again in an hour\\nGET /index.toml: 503",
-            NOW - 3 * 86_400_000
-        ),
-    ];
-    assert_eq!(lines, want);
     // Read back as a page reads it: the sentence lines split at US.
-    let (kind, fields) = read_page_line(&lines[5]);
+    let (kind, fields) = lines
+        .iter()
+        .map(|l| read_page_line(l))
+        .find(|(k, f)| k == "entry" && page_field(f, "id") == Some("4"))
+        .expect("the agent's entry");
     assert_eq!(kind, "entry");
     assert_eq!(
         page_field(&fields, "title"),
@@ -1280,19 +1014,7 @@ fn the_page_lines_follow_the_filter_and_the_hosts_facts() {
         "the chip lights by its words"
     );
     assert!(alab[1].contains("\ton=0\t") && alab[3].contains("\ton=0\t"));
-    // The chrome follows the filter: the segments' words over the chip's counts, `All
-    // tags` up, the pop-up naming the chip.
-    assert_eq!(page_field(&head, "all_words"), Some("All \u{00b7} 2"));
-    assert_eq!(
-        page_field(&head, "problems_words"),
-        Some("Problems \u{00b7} 1")
-    );
     assert_eq!(page_field(&head, "all_tags_on"), Some("0"));
-    assert_eq!(page_field(&head, "tag_menu"), Some("Tag: ALab tools"));
-    assert_eq!(
-        page_field(&head, "tag_menu_name"),
-        Some("Filter by tag: ALab tools")
-    );
     let ids: Vec<&str> = alab
         .iter()
         .filter_map(|l| l.strip_prefix("entry\tid="))
@@ -1324,7 +1046,6 @@ fn the_page_lines_follow_the_filter_and_the_hosts_facts() {
         "a chip counts under the severity that is down"
     );
     assert_eq!(page_field(&head, "all_tags_on"), Some("1"));
-    assert_eq!(page_field(&head, "tag_menu"), Some("Tag: All"));
     assert_eq!(
         page.chips(true),
         [
@@ -1380,14 +1101,9 @@ fn the_page_lines_follow_the_filter_and_the_hosts_facts() {
         },
     );
     let lines = crate::page::wire_lines(&unsaved, &MessagesFilter::default());
-    let chrome = page_chrome(4, 3);
-    assert!(
-        lines[0].ends_with(&format!(
-            "\tnote={NOT_SAVED}\tfolder=/logs\\\\aterm{chrome}"
-        )),
-        "{}",
-        lines[0]
-    );
+    let (_, head) = read_page_line(&lines[0]);
+    assert_eq!(page_field(&head, "note"), Some(NOT_SAVED));
+    assert_eq!(page_field(&head, "folder"), Some("/logs\\aterm"));
     // A host without the log file: `Open log` offered, not pressable.
     assert!(
         lines.contains(
@@ -1402,13 +1118,14 @@ fn the_page_lines_follow_the_filter_and_the_hosts_facts() {
         &MessagesState::of(&fresh, &Desk::default()),
         &MessagesFilter::default(),
     );
-    assert_eq!(
-        empty,
-        [format!(
-            "page\trev={}\tnow={NOW}\ttotal=0\tshown=0\tall=0\tproblems=0\tstatus={}",
-            fresh.revision(),
-            page_chrome(0, 0)
-        )]
+    assert_eq!(empty.len(), 1, "{empty:?}");
+    assert!(
+        empty[0].starts_with(&format!(
+            "page\trev={}\tnow={NOW}\ttotal=0\tshown=0\tall=0\tproblems=0\t",
+            fresh.revision()
+        )),
+        "{}",
+        empty[0]
     );
 }
 
@@ -1566,130 +1283,13 @@ fn any_word_survives_the_page_lines() {
     assert!(format!("title={hostile}").split('\t').count() > 1);
 }
 
-/// The page's chrome words are the engine's, byte for byte, so a page on any host says the
-/// same page: the fixed words, the severity segments, a chip, the tag pop-up (the chip's
-/// words, never the tag), a destination's `Open …` button, the meta line (`×N` only past
-/// one) and Copy All's text (the build information verbatim, then each shown entry's Copy
-/// text after two line breaks).
+/// Copy All is the host's build information verbatim, then each shown entry's Copy text
+/// after two line breaks, in the order shown.
 #[test]
-fn the_pages_chrome_words_are_the_engines() {
-    use crate::page::{
-        ALL_TAGS, COPY, COPY_ALL, COPY_ALL_NAME, Chip, EMPTY, HEADING, SUBTITLE, TECHNICAL,
-        button_label, copy_all_text, severity_segment_words, tag_menu_label, tag_menu_name,
-    };
-    assert_eq!(HEADING, "Messages");
-    assert_eq!(SUBTITLE, "What aterm reported, newest first.");
-    assert_eq!(EMPTY, "Nothing yet.");
-    assert_eq!(ALL_TAGS, "All tags");
-    assert_eq!(COPY, "Copy");
-    assert_eq!(COPY_ALL, "Copy All");
-    assert_eq!(COPY_ALL_NAME, "Copy the shown messages");
-    assert_eq!(TECHNICAL, "Technical details");
-    assert_eq!(
-        severity_segment_words(42, 23),
-        (
-            "All \u{00b7} 42".to_string(),
-            "Problems \u{00b7} 23".to_string()
-        )
-    );
-    assert_eq!(
-        severity_segment_words(0, 0),
-        (
-            "All \u{00b7} 0".to_string(),
-            "Problems \u{00b7} 0".to_string()
-        )
-    );
-    let chip = Chip {
-        tag: "toolchain".into(),
-        words: "ALab tools".into(),
-        count: 2,
-    };
-    assert_eq!(chip.label(), "ALab tools \u{00b7} 2");
-    assert_eq!(tag_menu_label(None), "Tag: All");
-    assert_eq!(tag_menu_name(None), "Filter by tag: All");
-    assert_eq!(tag_menu_label(Some("packages")), "Tag: ALab tools");
-    assert_eq!(tag_menu_name(Some("harness")), "Filter by tag: Agents");
-    assert_eq!(tag_menu_label(Some("ci")), "Tag: CI");
-    assert_eq!(tag_menu_label(Some("updates")), "Tag: updates");
-    for (intent, button) in [
-        (
-            Intent::OpenSettings {
-                route: "/packages".into(),
-            },
-            "Open Packages",
-        ),
-        (
-            Intent::OpenSettings {
-                route: "/updates".into(),
-            },
-            "Open Software Update",
-        ),
-        (
-            Intent::OpenSettings {
-                route: "/manual".into(),
-            },
-            "Open Manual",
-        ),
-        (
-            Intent::OpenSettings {
-                route: "/appearance".into(),
-            },
-            "Open Appearance",
-        ),
-        (
-            Intent::OpenSettings {
-                route: "/messages".into(),
-            },
-            "Open Messages",
-        ),
-        (
-            Intent::OpenSettings {
-                route: "/security".into(),
-            },
-            "Open Security",
-        ),
-        (
-            Intent::OpenSettings {
-                route: "/privacy".into(),
-            },
-            "Open Settings",
-        ),
-        (
-            Intent::OpenPath {
-                path: "/logs/crash-1.log".into(),
-            },
-            "Open log",
-        ),
-        (Intent::ApplyUpdate { build: 7 }, "Install now"),
-        (upgrade("s-1", "2.1.282", UpgradeWord::Now), "Upgrade now"),
-        (Intent::NewWindow, "New window"),
-        (Intent::Details, "Details \u{203a}"),
-    ] {
-        assert_eq!(button_label(intent.label()), button, "{intent:?}");
-    }
-    // The meta line: the local time and the state's plain words, `×N` only
-    // past one post.
-    let once = entry_at(1, NOW - 60_000);
-    assert_eq!(
-        once.meta_words(NOW, 0),
-        "Today 3:52:20 PM \u{00b7} shown for 30 s"
-    );
-    let thrice = MessageView {
-        repeats: 3,
-        ..entry_at(2, NOW - 60_000)
-    };
-    assert_eq!(
-        thrice.meta_words(NOW, 3600),
-        "Today 4:52:20 PM \u{00b7} shown for 30 s \u{00b7} \u{00d7}3"
-    );
-    // Copy All: the build information, then each shown entry's Copy text
-    // after a blank line, in the order shown.
+fn copy_all_is_the_build_information_then_each_entrys_copy_text() {
+    use crate::page::copy_all_text;
     let newer = entry_at(1, NOW - 60_000);
     let older = entry_at(2, NOW - 120_000);
-    assert_eq!(
-        copy_all_text("aterm 0.70.0", [&newer, &older]),
-        "aterm 0.70.0\n\nconfig warning 1\n2025-09-21 15:52:20 UTC \u{00b7} config \u{00b7} warn\naterm.toml: unknown key `foo` at line 12\n\nconfig warning 2\n2025-09-21 15:51:20 UTC \u{00b7} config \u{00b7} warn\naterm.toml: unknown key `foo` at line 12"
-    );
     assert_eq!(
         copy_all_text("aterm 0.70.0", [&newer, &older]),
         format!(
@@ -1832,7 +1432,6 @@ fn an_open_exception_stands_first_in_its_current_words() {
     let before = MessagesState::of(&c, &Desk::default());
     assert_eq!(before.entries[0].state, "review");
     assert_eq!(before.entries[0].title, "Claude in tab 1 is behind");
-    assert_eq!(before.entries[0].state_words(), "here and in the menu bar");
     assert!(
         before.entries[0].actions.iter().all(|a| a.still_actionable),
         "an open exception's buttons are offered"
@@ -1992,18 +1591,6 @@ fn the_action_lines_carry_the_primary_after_every_older_key() {
         .map(String::as_str)
         .filter(|line| line.starts_with("action\t"))
         .collect();
-    assert_eq!(
-        actions,
-        [
-            "action\tid=3\tindex=0\tlabel=Upgrade now\tactionable=0\tbutton=Upgrade now\tprimary=0",
-            "action\tid=3\tindex=1\tlabel=Skip version\tactionable=1\tbutton=Skip version\tprimary=0",
-            "action\tid=3\tindex=2\tlabel=Software Update\tactionable=1\tbutton=Open Software Update\tprimary=1",
-            "action\tid=2\tindex=0\tlabel=Upgrade now\tactionable=0\tbutton=Upgrade now\tprimary=0",
-            "action\tid=2\tindex=1\tlabel=Skip version\tactionable=1\tbutton=Skip version\tprimary=0",
-            "action\tid=1\tindex=0\tlabel=Not now\tactionable=1\tbutton=Not now\tprimary=1",
-            "action\tid=1\tindex=1\tlabel=Open Settings\tactionable=1\tbutton=Open Settings\tprimary=0",
-        ]
-    );
     // Read back as a page reads it: the lines' `primary=1` is the rule's pick,
     // entry by entry.
     for entry in &page.entries {

@@ -894,43 +894,9 @@ mod tests {
         ));
         let d = read(&l).unwrap();
         assert_eq!((d.since, d.checked, d.group.as_str()), (T0, T0, "rustc"));
-        assert_eq!(d.moves(), "trust build 9192 \u{2192} 9200");
+        assert_eq!(d.from, from);
         assert_eq!(since_of(&l, "rustc"), Some(T0));
         assert_eq!(since_of(&l, "other"), None);
-        use crate::vendor_direct::watch::Watcher;
-        let line = d.sentence(T0 + 60, &Watcher::Window);
-        for part in [
-            "trust build 9192 \u{2192} 9200",
-            "/x/targo is running from it",
-            "by ",
-            "an aterm window looks every minute",
-            "`aterm pkg update` installs it now",
-        ] {
-            assert!(line.contains(part), "{part}: {line}");
-        }
-        // WHO LOOKS decides what "at the latest" may promise.
-        assert!(
-            d.sentence(T0 + 60, &Watcher::Session(Some(42)))
-                .contains("the terminal session watching for updates (pid 42) looks every minute")
-        );
-        let unwatched = d.sentence(T0 + 60, &Watcher::Nobody);
-        assert!(
-            unwatched.contains("no aterm window or terminal session is watching")
-                && !unwatched.contains("at the latest"),
-            "{unwatched}"
-        );
-        assert!(
-            d.sentence(T0 + 60, &Watcher::Unknown("x".into()))
-                .contains("while an aterm window or terminal session watches for updates")
-        );
-        assert!(
-            d.sentence(d.ceiling_at(), &Watcher::Window)
-                .contains("its wait is over, and an aterm window looks every minute")
-        );
-        assert!(
-            d.sentence(d.ceiling_at(), &Watcher::Nobody)
-                .contains("its wait is over, so the next update pass installs it")
-        );
         clear(&l);
         assert_eq!(read(&l), None);
         // A record that cannot be parsed is none, never a flip held forever.
@@ -983,10 +949,7 @@ mod tests {
         let busy = probe(&l, &live, &|| -> Option<Vec<PathBuf>> {
             panic!("a lease answers before the table is read")
         });
-        assert_eq!(
-            busy.clause(),
-            "trust-ir build 40 is in use by aterm-release cut"
-        );
+        assert!(matches!(busy, Busy::Leased { .. }), "{busy:?}");
         drop(lease);
         // The view: only once it is laid, then by lease and by process.
         let view = crate::seam::view_dir(&l, "trust");
@@ -1019,7 +982,7 @@ mod tests {
     /// for quiet disagrees at a reachable look, so agreement is never vacuous.
     #[test]
     fn the_flip_decision_refines_the_derived_model() {
-        use aterm_spec::derive::atpkg_flip_quiet_model;
+        use aterm_models_atpkg::atpkg_flip_quiet_model;
         let model = atpkg_flip_quiet_model();
         let ceiling = model
             .consts

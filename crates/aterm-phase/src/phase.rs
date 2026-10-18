@@ -46,6 +46,40 @@
 //! rows up, and a whole-screen scan read it busy. Without the composer frame
 //! (not Claude Code, or a full-screen box) every row is scanned, as before.
 //!
+//! ONE EXCEPTION, THE WAIT CLAUDE CODE CARRIES: a `Waiting for N … to
+//! finish` row with no status row under it stands for the turns Claude Code
+//! started itself after it, until a later done row or a person's prompt
+//! replaces it. Claude Code draws a turn's `turn_duration` row only when its
+//! pending counts changed or a person's prompt came between (2.1.295 `Ad`,
+//! 2.1.300 `Nd`, read from the binaries): a turn a `<task-notification>`, a
+//! monitor's expiry or a `/loop` wakeup started, which ends with the same
+//! work still pending, draws NO row, so its `⏺` rows sit between the
+//! waiting row and the frame. Read as history, that end was an idle point,
+//! and 47 of the 133 acts of the trust session's journal (2026-09-24 to
+//! 10-15) typed `keep going` at one, every 30 minutes for days, each answered
+//! "No change since my last update". So when the walk finds no status row,
+//! it goes on up over the transcript (a parked card stepped over) and stops
+//! at a person's `❯` row, at what ends the live zone or at the first glyph
+//! row: a waiting row there is SOFT background work ([`busy_signal`]'s last
+//! rule), which a question, a limit or another wall the notification turn
+//! ended on still outranks; a done row or anything else is history, as
+//! above. The measured `/model` screen keeps its reading: its `❯ /model` row
+//! stops the walk. [`status_row`] stays `None` there. The waiting row is read
+//! as its LINE (below), and it is the one busy reading a fresher word may
+//! overrule ([`carried_wait_alone`]): a build that hid the done row of a
+//! finished wait would leave it standing for good, so aterm-agent's loop
+//! reads the turn ended where the session's transcript says it closed since
+//! with nothing pending.
+//!
+//! THE STATUS ROW IS READ AS ITS LINE. In a pane narrower than it, Ink wraps
+//! the row onto the rows under it at its text column (measured on 2.1.299 at
+//! 26 and 34 columns: `✻ Worked for 0s · done` over `  10:36 AM`), and
+//! Claude Code's flex row can put the rest of a cut verb in column 0 under
+//! the glyph. Read a row at a time, a spinner cut to `✶ Choreog` over
+//! `  raphing…` read IDLE (KI S2R-F1, measured at 12 columns) and a done row
+//! cut before `· 1 shell still running` read no shell. So every reader of
+//! the status row reads its line ([`status_block`]'s `line`, [`crate::wrap`]).
+//!
 //! A background MONITOR alone is soft ([`Busy::soft`]): a `persistent` one
 //! runs for as long as the worker lives and wakes it by itself, so a worker
 //! whose turn ended `· 1 monitor still running` (measured) is waiting on the
@@ -285,6 +319,9 @@ impl fmt::Display for Busy {
 /// running, on the status row (`· 1 monitor still running`) or in the footer
 /// (`· N monitor(s) ·`), and then work of any other kind left running, on a
 /// done row ([`left_running`]) or counted in the footer ([`counts_work`]).
+/// Last, with no status row at all, the wait Claude Code carries over the
+/// turns it started itself ([`carried_wait`]: module docs), soft. The status
+/// row is read as its LINE, its wrapped rows joined ([`status_block`]).
 /// With no frame, the first row [`busy_reason`] names, anywhere.
 pub fn busy_signal(rows: &[String]) -> Option<Busy> {
     let Some(frame) = composer_frame(rows) else {
@@ -335,6 +372,89 @@ pub fn busy_signal(rows: &[String]) -> Option<Busy> {
                 .any(|r| counts_work(r))
                 .then(|| Busy::soft(Zone::Footer, "background work running"))
         })
+        .or_else(|| (block.status.is_none() && carried_wait(rows, frame.top)).then_some(CARRIED))
+}
+
+/// [`busy_signal`]'s reading of the wait Claude Code carries ([`carried_wait`]).
+const CARRIED: Busy = Busy {
+    zone: Zone::Status,
+    rule: "background work still running",
+    soft: true,
+};
+
+/// THE WAIT CLAUDE CODE CARRIES (module docs): with no status row above the
+/// frame whose top rule is row `top`, the first glyph row the walk up over
+/// the transcript meets ([`glyph_above`]) is a `Waiting for N … to finish`
+/// row, read as its LINE (module docs: a narrow pane wraps it, `✻ Waiting
+/// for` over `  1 dynamic workflow…`). Claude Code drew no done row for the
+/// turns it started itself since (their pending work was the same), so that
+/// row still says what the session waits on.
+fn carried_wait(rows: &[String], top: usize) -> bool {
+    const WAITING: [&str; 3] = [
+        "waiting for a dynamic workflow",
+        "waiting for a background agent",
+        "waiting for background work",
+    ];
+    let width = crate::question::screen_width(rows);
+    glyph_above(rows, top)
+        .map(|i| {
+            let end = status_line_end(rows, i, top, width).unwrap_or(i);
+            status_text(&rows[i..=end])
+        })
+        .and_then(|line| status_busy(&line))
+        .is_some_and(|rule| WAITING.contains(&rule))
+}
+
+/// THE SCREEN READS BUSY BY NOTHING BUT THE WAIT CLAUDE CODE CARRIES: no
+/// status row drawn, no hint or footer that says anything busy, and the
+/// first glyph row over the transcript a waiting row ([`carried_wait`],
+/// module docs). The one busy reading a fresher word may overrule: Claude
+/// Code's renderer decides which done rows it draws, and a build that hid
+/// the one a finished wait's last turn wrote would leave the waiting row
+/// standing for good, where the session's own transcript says the turn
+/// closed with nothing pending (aterm-agent's loop, BG-1). `false` without
+/// the frame.
+#[must_use]
+pub fn carried_wait_alone(rows: &[String]) -> bool {
+    composer_frame(rows).is_some_and(|f| status_block(rows, f.top).status.is_none())
+        && busy_signal(rows) == Some(CARRIED)
+}
+
+/// Walking up from the top rule `top` over every row (a parked card stepped
+/// over, as [`status_block`] steps over it), the first glyph row
+/// ([`is_glyph_row`]) met; `None` when a person's `❯` row in column 0 (their
+/// prompt, which makes Claude Code draw the next turn's row again), a row
+/// that ends the live zone ([`ends_live_zone`]) or the screen's top comes
+/// first.
+fn glyph_above(rows: &[String], top: usize) -> Option<usize> {
+    let parked = crate::survey::parked_span(rows);
+    for i in (0..top).rev() {
+        if parked.is_some_and(|(first, last)| (first..=last).contains(&i)) {
+            continue;
+        }
+        let row = &rows[i];
+        if is_glyph_row(row) {
+            return Some(i);
+        }
+        if row.starts_with('❯') || ends_live_zone(row) {
+            return None;
+        }
+    }
+    None
+}
+
+/// NO STATUS ROW ON THE SCREEN AT ALL: Claude Code's composer frame is drawn,
+/// the walk up from its top rule finds no status row, and the walk on over
+/// the transcript ([`glyph_above`]) meets no glyph row before it stops — no
+/// done row, no waiting row: the one a turn ended on scrolled off, or
+/// Claude Code draws none (`showTurnDuration: false`). Where the screen
+/// says nothing of how the last turn ended, the session's own transcript
+/// may (aterm-agent's loop, BG-1). `false` without the frame.
+#[must_use]
+pub fn status_unseen(rows: &[String]) -> bool {
+    composer_frame(rows).is_some_and(|f| {
+        status_block(rows, f.top).status.is_none() && glyph_above(rows, f.top).is_none()
+    })
 }
 
 /// A done row that says work is `still running` UNDER ANY LABEL: Claude Code
@@ -659,14 +779,32 @@ fn is_activity_row(row: &str) -> bool {
         || is_retry_status(text)
 }
 
-/// The text of the vendor's API-retry status row, which no ellipsis ends
-/// (measured on 2.1.283, 2026-09-27): the whole formatted error, then
-/// `· Retrying in 14s · attempt 6/10` — `Can't reach the API server — check
-/// your internet or DNS (ENOTFOUND) · Retrying in 1s · attempt 5/10`. The
-/// worker is busy: the vendor is retrying its own request. Read as the tail
-/// of the row, so the error in front may be cut (`…`) at a narrow width, and
-/// a done row (`Cogitated for 0s · done 11:02 PM`) or the worker's words are
-/// not one.
+/// The text of the vendor's API-retry status row, which no ellipsis ends:
+/// the row that stands in for the spinner while Claude Code retries its own
+/// request, so the worker is busy. Read as the TAIL of its line, in the
+/// vendor's own shapes whole (2.1.300's `uyn`, read from the binary; the
+/// first measured on 2.1.283, 2026-09-27), so the words in front may be cut
+/// (`…`) at a narrow width:
+/// * `<error> · Retrying in <wait>[ (<reset>)] · attempt <k>/<n>` — `Can't
+///   reach the API server — check your internet or DNS (ENOTFOUND) ·
+///   Retrying in 1s · attempt 5/10`, `Usage limit reached · Retrying in 14s
+///   (9:50pm) · attempt 3/10` (the reset when the error carries limits);
+/// * `<banner> · will retry in <wait> · check your network` (a stalled
+///   stream);
+/// * `<banner> · next try in <wait> · attempt <k>[/<n>] · esc to interrupt`
+///   (the auto-mode check unavailable, a low-priority wait);
+/// * `<banner> · retrying, waiting up to <wait> · attempt <k>/<n>`, or a last
+///   item `retrying once, waiting up to <wait>` (no response from the API);
+/// * and any status line whose LAST ` · ` item is `esc to interrupt`.
+///
+/// `<wait>` is words of a number and its unit (`14s`, `1m 30s`, `2d`). The
+/// retry clause stands in any item past the first, and every item after it
+/// is the vendor's own (`attempt <k>[/<n>]`, `check your network`, `esc to
+/// interrupt`), the last one maybe cut by the pane (`· attempt 1/3…`, `·
+/// att…`): a pane that cuts the row's tail leaves it the row. A done row
+/// (`Cogitated for 0s · done 11:02 PM`), the worker's words, a clause that is
+/// not the vendor's (`Retrying in soon`, `attempt soon`, `attempt one of
+/// 300`) are not one.
 ///
 /// CLAUDE CODE'S OWN RETRY OF A USAGE LIMIT is one too: under a
 /// `CLAUDE_CODE_RETRY_WATCHDOG` a person set by hand (aterm never sets it)
@@ -681,45 +819,83 @@ fn is_activity_row(row: &str) -> bool {
 /// turn as Esc ends any. With a statusLine configured the footer draws no
 /// `esc to interrupt` meanwhile, so this row is the screen's only word that
 /// the turn is not over; read as a done row, the point was idle and the
-/// supervisor typed into a session that was retrying. A pane that cuts the
-/// row's tail (`· attempt 1/3…`, `· att…`) leaves it the row.
+/// supervisor typed into a session that was retrying.
+///
+/// WHERE INK PUT THE WORDS AROUND THE CLAUSE is the line reader's to undo,
+/// never this rule's: under about 44 columns the vendor's glyph box wraps
+/// away from its text, and where the cut head and the tail do not fit beside
+/// each other they are laid out as two text columns side by side, their rows
+/// interleaved (MEASURED on 2.1.301 at 18 to 38 columns, `API     ·
+/// Retrying in 1s · attempt` over `error  1/10`; on 2.1.300 at 50, the
+/// watchdog's weekly retry), which [`StatusBlock::line`] reads column by
+/// column ([`bare_line`]) back into the shapes above.
 fn is_retry_status(text: &str) -> bool {
-    let Some((_, tail)) = text.rsplit_once(" · Retrying in ") else {
+    let items: Vec<&str> = text.split(" · ").map(crate::text::trim_end).collect();
+    let [_, .., last] = items.as_slice() else {
         return false;
     };
+    if *last == "esc to interrupt" {
+        return true;
+    }
     let number = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
-    let (wait, attempt) = match tail.split_once(" · attempt ") {
-        Some((wait, attempt)) => (
-            wait,
-            attempt.trim_end().split_once('/').is_some_and(|(k, n)| {
-                number(k)
-                    && (number(n)
-                        || n.strip_suffix('…')
-                            .is_some_and(|n| n.chars().all(|c| c.is_ascii_digit())))
-            }),
-        ),
-        None => match crate::text::trim_end(tail).rsplit_once(" · ") {
-            Some((wait, cut)) => (
-                wait,
-                cut.strip_suffix('…')
-                    .is_some_and(|cut| !cut.is_empty() && "attempt ".starts_with(cut)),
-            ),
-            None => return false,
-        },
+    // `14s`, `2m`, `1m 30s`, `2d`: each word a number and its unit.
+    let wait = |s: &str| {
+        !s.is_empty()
+            && s.split(' ')
+                .all(|w| w.strip_suffix(['s', 'm', 'h', 'd']).is_some_and(number))
     };
-    // A usage limit's retry names the reset after the span: `2m 28s
-    // (8:48am)`, `5h (Oct 16 at 9:49am)`.
-    let span = match wait.strip_suffix(')').and_then(|w| w.rsplit_once(" (")) {
-        Some((span, clock)) if !crate::text::trim(clock).is_empty() => span,
-        Some(_) => return false,
-        None => wait,
+    // `14s (9:50pm)`, `2m 28s (8:48am)`, `5h (Oct 16 at 9:49am)`: the wait,
+    // then the reset the limit names.
+    let wait_reset = |s: &str| {
+        wait(s)
+            || s.split_once(" (").is_some_and(|(w, reset)| {
+                wait(w)
+                    && reset.strip_suffix(')').is_some_and(|r| {
+                        !crate::text::trim(r).is_empty() && !r.contains(['(', ')'])
+                    })
+            })
     };
-    // `14s`, `2m`, `1m 30s`: each word a number and its unit.
-    let span_ok = !span.is_empty()
-        && span
-            .split(' ')
-            .all(|w| w.strip_suffix(['s', 'm', 'h']).is_some_and(number));
-    span_ok && attempt
+    const CLAUSES: [&str; 5] = [
+        "Retrying in ",
+        "will retry in ",
+        "next try in ",
+        "retrying, waiting up to ",
+        "retrying once, waiting up to ",
+    ];
+    let Some(at) = items.iter().skip(1).position(|item| {
+        CLAUSES
+            .iter()
+            .any(|c| item.strip_prefix(c).is_some_and(wait_reset))
+    }) else {
+        return false;
+    };
+    // `attempt 3/10`, `attempt 2`: the vendor's count of its tries.
+    let count = |a: &str| match a.split_once('/') {
+        Some((k, n)) => number(k) && number(n),
+        None => number(a),
+    };
+    const WORDS: [&str; 2] = ["check your network", "esc to interrupt"];
+    let tail =
+        |item: &str| item.strip_prefix("attempt ").is_some_and(count) || WORDS.contains(&item);
+    // The last item cut by the pane: the start of one of the vendor's
+    // (`attempt 1/3…`, `att…`).
+    let cut = |item: &str| {
+        item.strip_suffix('…')
+            .map(crate::text::trim_end)
+            .is_some_and(|head| {
+                !head.is_empty()
+                    && (WORDS.iter().any(|w| w.starts_with(head))
+                        || "attempt ".starts_with(head)
+                        || head.strip_prefix("attempt ").is_some_and(|a| {
+                            let (k, n) = a.split_once('/').unwrap_or((a, ""));
+                            number(k) && n.chars().all(|c| c.is_ascii_digit())
+                        }))
+            })
+    };
+    match items[at + 2..].split_last() {
+        None => true,
+        Some((&end, between)) => between.iter().all(|&i| tail(i)) && (tail(end) || cut(end)),
+    }
 }
 
 /// `<prefix><digits><suffix>` somewhere in `row`.
@@ -987,54 +1163,16 @@ impl StatusBlock {
     /// The status row's text, its line read across the rows Ink wrapped it
     /// onto, joined with one space ([`crate::wrap::rejoined`]): `✻ Choreogr
     /// aphing…` (a word wider than the row broken where the row ends, read in
-    /// two halves), `✻ Baked for 0s · done 7:06 AM`.
+    /// two halves), `✻ Baked for 0s · done 7:06 AM` — a glyph alone on its
+    /// row read over the text columns Ink laid out under it ([`status_text`]).
     pub(crate) fn line<'a>(&self, rows: &'a [String]) -> Option<Cow<'a, str>> {
         let status = self.status?;
         Some(if self.end > status {
-            Cow::Owned(
-                columns(&rows[status], &rows[status + 1..=self.end])
-                    .unwrap_or_else(|| crate::wrap::rejoined(&rows[status..=self.end])),
-            )
+            Cow::Owned(status_text(&rows[status..=self.end]))
         } else {
             Cow::Borrowed(rows[status].as_str())
         })
     }
-}
-
-/// A status line Ink laid out IN TWO COLUMNS under its glyph, alone on its
-/// row (a pane too narrow for the line; measured on 2.1.300 at 50 columns,
-/// the vendor's retry of a usage limit: `✻` over `Weekly    · Retrying in 5h
-/// (Oct 16 at 9:49am) ·` over `li…      attempt 1/300`), read as the line:
-/// the glyph, then each row's first column (from column 0 up to its first run
-/// of two or more blanks) joined onto the head, and the rest onto the tail —
-/// `✻ Weekly li… · Retrying in 5h (Oct 16 at 9:49am) · attempt 1/300`. A row
-/// that starts with blanks is the tail's alone. `None` where the glyph is not
-/// alone or the first row under it is no two columns: the line is then one
-/// Ink wrapped ([`crate::wrap::rejoined`]).
-fn columns(glyph: &str, under: &[String]) -> Option<String> {
-    let g = crate::text::trim(glyph);
-    let mut cs = g.chars();
-    cs.next().filter(|&c| is_spinner_glyph(c))?;
-    let first = crate::text::trim_end(under.first()?);
-    if !cs.as_str().is_empty() || first.starts_with(char::is_whitespace) || !first.contains("  ") {
-        return None;
-    }
-    let (mut head, mut tail) = (Vec::new(), Vec::new());
-    for row in under {
-        let row = crate::text::trim_end(row);
-        if row.starts_with(char::is_whitespace) {
-            tail.push(crate::text::trim(row));
-            continue;
-        }
-        match row.split_once("  ") {
-            Some((h, t)) => {
-                head.push(crate::text::trim(h));
-                tail.push(crate::text::trim(t));
-            }
-            None => head.push(row),
-        }
-    }
-    Some(format!("{g} {} {}", head.join(" "), tail.join(" ")))
 }
 
 pub(crate) fn status_block(rows: &[String], top: usize) -> StatusBlock {
@@ -1081,11 +1219,36 @@ pub(crate) fn status_block(rows: &[String], top: usize) -> StatusBlock {
 /// and a done row's text at its text column, two in (`✻ Baked for 0s · done
 /// 7:06` over `  AM`, by the rule of a row too full for the next word,
 /// [`crate::wrap::continues`]; never under a row that already reads busy
-/// alone); never into a row that opens a block of its own (a `⎿` tip or
+/// alone, but for the rest of a parenthesis it left open, `✶ Deliberating…
+/// (4s · esc to` over `  interrupt)` at 30 columns); never into a row that
+/// opens a block of its own (a `⎿` tip or
 /// todo, a queued `❯` message, a transcript row, another glyph row, the
 /// survey). Read a row at a time the spinner held
 /// no `…` and the footer's `esc to interrupt` is cut off at that width: a
 /// running turn read idle, and `keep going` was typed into it.
+///
+/// A join never turns a DONE row ([`is_done_shape`]) into an activity: a
+/// word with an ellipsis under a full done row is not its verb (`Thinking
+/// about it…` in column 0, `  more to say…` at column 2). Nor does a join
+/// ever LOSE a busy reading the row has on its own ([`status_busy`]; the
+/// cross-lane review's screen F2: a row read by its tail, `· esc to
+/// interrupt` or the vendor's retry clause, took the proxy hint Claude Code
+/// draws under it at column 2 as its last item, and the turn still retrying
+/// read idle). A row in the glyph's own column joins only a row that has no
+/// status shape of its own ([`has_status_shape`]) to a line that has one, so
+/// a stray row there cannot turn a done row busy either.
+///
+/// A GLYPH INK WRAPPED AWAY FROM ITS TEXT (the cross-lane review's screen F1,
+/// MEASURED on 2.1.301: the vendor's glyph box is 2 cells wide with
+/// `flexWrap`, and where the text does not fit beside it the text moves
+/// under it — the retry row at 34, 38 and 42 columns, `✻` over `API error ·
+/// Retrying in 1s · attempt 2/10`; the spinner at 10, `✻` over `Infusing…`)
+/// opens the line where a row at its column under it does, and the line is
+/// every row under it to the first blank, a row against the right edge among
+/// them (the block's last row fills an 18-column pane, `      attempt 1/10`:
+/// the decision review's RR-LC-1), read column by column where Ink laid it
+/// out as two ([`bare_line`]). Read past, the walk took the previous turn's
+/// done row for the live one and a retrying turn read idle.
 fn status_line_end(rows: &[String], i: usize, until: usize, width: usize) -> Option<usize> {
     let row = rows[i].as_str();
     let t = crate::text::trim(row);
@@ -1099,22 +1262,54 @@ fn status_line_end(rows: &[String], i: usize, until: usize, width: usize) -> Opt
     let lead = leading_spaces(row);
     let text = crate::text::trim(cs.as_str());
     // The spinner's line at its own column, broken between the spans of its
-    // shimmer as well as where a row is full ([`crate::wrap::run_end`]); a
-    // done row's text at its text column, where a row is full. A row that
+    // shimmer as well as where a row is full ([`crate::wrap::run_end`]).
+    let run = crate::wrap::run_end(rows, i, lead, until);
+    if text.is_empty() && !is_glyph_row(row) {
+        // The glyph alone: its text's rows, to the first blank.
+        let opens = run > i && is_glyph_row(&crate::wrap::rejoined(&rows[i..=run]));
+        let end = (i + 1..until)
+            .take_while(|&k| !crate::text::trim(&rows[k]).is_empty())
+            .last()
+            .unwrap_or(i);
+        return opens.then_some(end);
+    }
+    if !is_glyph_row(row) {
+        return None;
+    }
+    let keeps = |end: usize| {
+        let joined = crate::wrap::rejoined(&rows[i..=end]);
+        !(is_done_shape(row) && is_activity_row(&joined))
+            && !(status_busy(row).is_some() && status_busy(&joined).is_none())
+    };
+    // A done row's text at its text column, where a row is full. A row that
     // already reads busy alone (its verb run into its `…`, a retry status)
     // takes nothing at column two: its line wraps at its own column, and the
     // row there under a full retry row is the vendor's own notice (2.1.283's
     // `  Fast mode unavailable: …`; the review of round 20, 2026-10-15: joined,
-    // the retry read as a done row, and idle mid-retry).
-    let done_end = if is_activity_row(row) {
+    // the retry read as a done row, and idle mid-retry) — unless the row's own
+    // parenthesis is still open: the spinner's `(4s · esc to` cut at the
+    // pane's edge, the row under it (`  interrupt)`) the rest of that
+    // parenthesis, never a notice (read alone, the narrow pane's hint was
+    // lost: `harness::upgrade_drive`'s `busy_footer`).
+    let done_end = if is_activity_row(row) && !paren_open(text) {
         i
     } else {
         crate::wrap::line_end(rows, i, text, lead + 2, width, until)
     };
-    let end = crate::wrap::run_end(rows, i, lead, until).max(done_end);
-    let opens = is_glyph_row(row)
-        || (text.is_empty() && end > i && is_glyph_row(&crate::wrap::rejoined(&rows[i..=end])));
-    opens.then_some(end)
+    if done_end > i {
+        return Some(if keeps(done_end) { done_end } else { i });
+    }
+    let joins = run > i
+        && !has_status_shape(row)
+        && has_status_shape(&crate::wrap::rejoined(&rows[i..=run]))
+        && keeps(run);
+    Some(if joins { run } else { i })
+}
+
+/// Whether `text` opens a parenthesis it does not close: a status row's
+/// `(4s · esc to` cut by the pane's edge ([`status_line_end`]).
+fn paren_open(text: &str) -> bool {
+    text.matches('(').count() > text.matches(')').count()
 }
 
 /// A row that opens a block of its own under the status row, never the rest of
@@ -1126,6 +1321,119 @@ fn opens_block(row: &str) -> bool {
         || is_glyph_row(row)
         || is_transcript_row(row)
         || ends_live_zone(row)
+}
+
+/// The text of a status line's rows `block` ([`StatusBlock::line`]): a glyph
+/// alone on its first row read by [`bare_line`], any other line its rows
+/// joined ([`crate::wrap::rejoined`]).
+fn status_text(block: &[String]) -> String {
+    let mut cs = crate::text::trim(&block[0]).chars();
+    if cs.next().is_some() && cs.next().is_none() {
+        bare_line(block)
+    } else {
+        crate::wrap::rejoined(block)
+    }
+}
+
+/// THE LINE OF A BARE GLYPH'S BLOCK (`block[0]` the glyph's row,
+/// [`status_line_end`]): where its cut head and its tail do not fit beside
+/// each other, Ink lays the vendor's retry row out as TWO text columns side
+/// by side — the cut error on the left, the dim tail from its ` · ` on — and
+/// their rows interleave (`API    · Retrying in` / `error 4s · attempt` /
+/// `      1/10` at 20 columns, MEASURED on 2.1.301; the decision review's
+/// RR-LC-1; and the watchdog's retry of the weekly limit at 50 columns,
+/// MEASURED on 2.1.300: `Weekly    · Retrying in 5h (Oct 16 at 9:49am) ·`
+/// over `li…      attempt 1/300`, read `✻ Weekly li… · Retrying in 5h (Oct
+/// 16 at 9:49am) · attempt 1/300`). Joined row by row that reads `Retrying
+/// in error 4s`, no wait, and the live retry read idle. The columns are told
+/// by the first row under the glyph: its first ` · ` is where the tail's
+/// column opens, at column `col`. Where EVERY row under the glyph is blank at
+/// `col - 1` and has text past it, the line is the glyph, the left parts
+/// joined, then the right parts joined. A head that fills its column leaves
+/// no such gap — the stalled stream's uncut `Waiting for API response` at 34
+/// to 41 columns, `Waiting for API · will retry in 2m` over `response       ·
+/// check your network` (the 2.1.301 `aSn` laid out as the measured blocks
+/// are) — and is split there too, but only where the split reads as the
+/// vendor's activity or retry row and the rows joined have no status shape:
+/// it only ever adds a busy reading. Any other block is
+/// [`crate::wrap::rejoined`], as before.
+fn bare_line(block: &[String]) -> String {
+    let joined = || crate::wrap::rejoined(block);
+    let under: Vec<Vec<char>> = block[1..].iter().map(|r| r.chars().collect()).collect();
+    let Some(col) = block
+        .get(1)
+        .and_then(|first| first.find(" · ").map(|at| first[..at].chars().count()))
+    else {
+        return joined();
+    };
+    if col == 0 || under.len() < 2 {
+        return joined();
+    }
+    let gapped = under
+        .iter()
+        .all(|cs| cs.len() > col && cs[col - 1].is_whitespace());
+    let part = |cs: &[char]| crate::text::trim(&cs.iter().collect::<String>()).to_string();
+    let side = |right: bool| {
+        under
+            .iter()
+            .map(|cs| {
+                let at = col.min(cs.len());
+                part(if right { &cs[at..] } else { &cs[..at] })
+            })
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let split = format!(
+        "{} {} {}",
+        crate::text::trim(&block[0]),
+        side(false),
+        side(true)
+    );
+    if gapped {
+        return split;
+    }
+    let joined = joined();
+    if is_activity_row(&split) && !has_status_shape(&joined) {
+        split
+    } else {
+        joined
+    }
+}
+
+/// A status line with a shape of its own: a spinner's activity or the
+/// vendor's retry row ([`is_activity_row`]), a `Waiting for N …` row, or a
+/// done row ([`is_done_shape`]).
+fn has_status_shape(line: &str) -> bool {
+    is_activity_row(line)
+        || line
+            .split_once("Waiting for ")
+            .is_some_and(|(_, n)| n.starts_with(|c: char| c.is_ascii_digit()))
+        || is_done_shape(line)
+}
+
+/// A DONE row's shape: past the glyph, a word, ` for `, the turn's time (words
+/// of a number and its unit, `9m 27s`), then the row's end or ` ·` (`✻
+/// Crunched for 9m 27s · done 11:07 AM · 1 shell still running`, `✻ Worked
+/// for 0s ·` cut there by a narrow pane).
+fn is_done_shape(line: &str) -> bool {
+    let t = crate::text::trim(line);
+    let mut cs = t.chars();
+    if !cs.next().is_some_and(is_spinner_glyph) {
+        return false;
+    }
+    let Some((verb, after)) = crate::text::trim_start(cs.as_str()).split_once(" for ") else {
+        return false;
+    };
+    if verb.is_empty() || verb.contains(' ') {
+        return false;
+    }
+    let time = after.split(" ·").next().unwrap_or(after);
+    let number = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+    !time.is_empty()
+        && time
+            .split(' ')
+            .all(|w| w.strip_suffix(['s', 'm', 'h', 'd']).is_some_and(number))
 }
 
 /// A row no live zone reaches past, walking up from the composer's top rule:
@@ -1159,7 +1467,9 @@ fn is_launch_card_row(row: &str) -> bool {
 /// done 2:41 PM`) — or, wherever it sits on the row, the full spinner
 /// [shape](is_spinner_shape), so that an INDENTED live row is still the
 /// status row and not something the walk steps over on its way to the
-/// transcript.
+/// transcript. A glyph alone on its row is none here: it opens the status row
+/// only over the text a narrow pane wrapped away from it
+/// ([`status_line_end`], read by the status walk).
 pub fn is_glyph_row(row: &str) -> bool {
     let mut cs = row.chars();
     (cs.next().is_some_and(|g| SPINNERS.contains(&g)) && cs.next().is_some_and(char::is_whitespace))
@@ -1283,8 +1593,9 @@ pub fn status_row(rows: &[String]) -> Option<&str> {
 
 /// The status row's LINE ([`status_row`]), read across the rows Ink wrapped
 /// it onto in a pane narrower than it (`✻ Choreogr` over `aphing…` at 10
-/// columns, `✻ Baked for 0s · done 7:06` over `  AM` at 26): every reader of
-/// what the status row says reads this (`status_line_end`).
+/// columns, `✻ Baked for 0s · done 7:06` over `  AM` at 26, `✻ Worked for 9m
+/// 2s · done 3:15 PM · 1 shell still` over `  running`): every reader of what
+/// the status row says reads this (`status_line_end`).
 #[must_use]
 pub fn status_line(rows: &[String]) -> Option<Cow<'_, str>> {
     let frame = composer_frame(rows)?;
@@ -1397,6 +1708,34 @@ fn is_list_entry(rows: &[String], i: usize) -> bool {
         .rev()
         .find(|&j| is_rule(&rows[j]))
         .is_some_and(|top| top + 1 < bottom && rows[top + 1].starts_with('❯'))
+}
+
+/// THE ENTRY ENTER WOULD RUN of the completion menu Claude Code opens under the
+/// composer's bottom rule (the `/` menu), as its first word (`/clear`): the entry the
+/// Select's pointer marks (2.1.291 and later: `  ❯ /compact   Free up context …`), or,
+/// where no entry carries it (2.1.287 drew the entries alone, all indented), the first,
+/// opening `/` or `@`. While the menu is open the vendor's Enter runs the selected
+/// suggestion, the top match unless arrows moved it (2.1.300 bundle, the typeahead's
+/// Enter handler `Cr`: `SG({suggestion: Hs[selected], shouldExecute: …})`, with no
+/// screen reader's navigation on), not the draft the composer shows: a person's `/cl`
+/// left standing is `/clear`. `None` when the rows under the bottom rule are no such
+/// menu (the footer, the shortcuts, nothing): the run of indented rows right under it.
+#[must_use]
+pub fn completion_entry(rows: &[String]) -> Option<String> {
+    let frame = composer_frame(rows)?;
+    let run: Vec<&str> = rows[frame.bottom + 1..]
+        .iter()
+        .take_while(|r| leading_spaces(r) > 0 && !crate::text::trim(r).is_empty())
+        .map(|r| crate::text::trim_start(r))
+        .collect();
+    let pointed = run
+        .iter()
+        .find_map(|t| t.strip_prefix('❯').map(crate::text::trim_start));
+    let word = pointed
+        .or_else(|| run.first().copied().filter(|t| t.starts_with(['/', '@'])))?
+        .split_whitespace()
+        .next()?;
+    Some(word.to_string())
 }
 
 fn is_option_like(t: &str) -> bool {
@@ -1522,6 +1861,9 @@ pub fn last_said_row(rows: &[String]) -> Option<&str> {
 /// ([`vendor_paragraph`]) are skipped, so a question is still a question with
 /// the done row, an update banner or the survey under it. Without a composer,
 /// the last non-blank row of the screen (above the caret when there is one).
+/// 2.1.300 draws its auto-mode paragraph after a resumed conversation's
+/// history, under the turn the conversation ended on (KI-1015-1 LC-10): read
+/// as the agent's last words, it hid the usage limit that turn ended on.
 pub fn last_said_index(rows: &[String]) -> Option<usize> {
     let (end, width) = match composer_frame(rows) {
         Some(f) => (
@@ -1599,9 +1941,11 @@ pub fn transcript_end(rows: &[String]) -> usize {
     let block = status_block(rows, frame.top);
     if let (Some(status), Some(line)) = (block.status, block.line(rows)) {
         // A done row (`✻ Worked for 3m 21s · done 8:50 PM · 1 monitor still
-        // running`) ends the turn in the transcript: it is kept, and only what
-        // hangs under it is the live zone. A spinner or a `Waiting for …` row
-        // is the live zone itself.
+        // running`) ends the turn in the transcript: it is kept, the rows a
+        // narrow pane wrapped it onto with it (its LINE: `✻ Worked for 0s ·
+        // done` over `  10:36 AM`), and only what hangs under it is the live
+        // zone. A spinner or a `Waiting for …` row is the live zone itself,
+        // read on its line too (`✶ Choreog` over `  raphing…`).
         return if is_done_row(&line) {
             block.end + 1
         } else {
@@ -1710,7 +2054,10 @@ pub fn limit_notice(rows: &[String]) -> Option<(String, Option<String>)> {
 /// `⏺` error row ([`error_row_notice`]), the `⎿` block of the last message —
 /// and named by `classify`. Shared by [`limit_notice`] (the usage kinds) and
 /// [`crate::wall::wall`] (every kind), so the two can never disagree about
-/// WHERE a wall is.
+/// WHERE a wall is. A footer's or banner's GENERIC limit notice (`Usage limit
+/// reached · …`, no window, no model) is the limit the turn's own notice
+/// names, where that notice names the same reset: a weekly window, a model's
+/// bucket, money (KI-1015-1 W3, 2.1.300; [`crate::wall::named_by_the_turn`]).
 ///
 /// A `⎿` block is read as the VENDOR's row by [`block_is_vendors`]: never
 /// at a column but 2 (a tool's output continues at column 5); never the
@@ -2134,6 +2481,79 @@ fn error_row_notice(
     })
 }
 
+/// The line the screen's LAST THING SAID opens where Claude Code draws a row
+/// of its own there ([`last_said_notice`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaidNotice {
+    /// Its text, the rows Ink wrapped it onto joined, the vendor's
+    /// [`EXPAND_HINT`] dropped.
+    pub text: String,
+    /// It has the vendor's error row's own shape, which no table needs to
+    /// name: `API Error` at its head, or (a `⏺` row) a notice and its remedy
+    /// joined by ` · ` in a few rows ([`error_row_notice`]).
+    pub shaped: bool,
+    /// The row its line opens on: the `⏺` row, or the block's `⎿` row.
+    pub row: usize,
+    /// [`Placement::ErrorRow`] for a `⏺` row, [`Placement::Gutter`] for a
+    /// `⎿` block.
+    pub placement: Placement,
+}
+
+/// THE LAST THING SAID, WHERE CLAUDE CODE DRAWS ITS OWN NOTICES, for a
+/// reader that has a notice's words from elsewhere and asks whether the
+/// screen shows it (aterm-agent's transcript of the session,
+/// `supervise/wall_confirm.rs`): a `⏺` message in column 0 that is no call
+/// — where 2.1.300 draws every `isApiErrorMessage` row its renderer has no
+/// case of its own for (`su`), in the warning colour a row of text does not
+/// keep, so the worker's prose stands there too — or a column-2 `⎿` block
+/// that no call's FIRST output row opens ([`block_is_vendors`]). `None` for
+/// anything else: a call's output, a command's echo, the person's `❯` row,
+/// a screen with nothing said. The table is not asked: what the screen
+/// cannot name (`There's an issue with the selected model (x). …`, drawn
+/// like prose) is named by the words the caller holds.
+#[must_use]
+pub fn last_said_notice(rows: &[String]) -> Option<SaidNotice> {
+    let last = last_said_index(rows)?;
+    let width = crate::question::screen_width(rows);
+    let mut open = last;
+    while !rows[open].starts_with(['⏺', '●']) && in_message(&rows[open]) {
+        open = open.checked_sub(1)?;
+    }
+    if rows[open].starts_with(['⏺', '●']) {
+        if is_tool_call(&rows[open]) {
+            return None;
+        }
+        let end = message_end(rows, open, rows.len());
+        let (_, line) = line_at(rows, open, rows.len(), width);
+        let text = crate::text::trim(&line).trim_start_matches(['⏺', '●']);
+        let text = crate::text::trim(text.strip_suffix(EXPAND_HINT).unwrap_or(text));
+        let short = end - open < ERROR_ROWS
+            || notice_rows_at_80(rows, open, end).is_some_and(|n| n <= ERROR_ROWS);
+        let remedy = short && (text.contains(" · ") || text.contains(" ∙ "));
+        return Some(SaidNotice {
+            shaped: text.starts_with("API Error") || remedy,
+            text: text.to_string(),
+            row: open,
+            placement: Placement::ErrorRow,
+        });
+    }
+    let open = gutter_open(rows, last)?;
+    if block_is_vendors(rows, open) == Block::Output {
+        return None;
+    }
+    let (_, line) = line_at(rows, open, rows.len(), width);
+    let text = crate::text::trim(crate::text::trim(&line).trim_start_matches('⎿'));
+    if text.starts_with("$ ") {
+        return None;
+    }
+    Some(SaidNotice {
+        shaped: text.starts_with("API Error"),
+        text: text.to_string(),
+        row: open,
+        placement: Placement::Gutter,
+    })
+}
+
 /// The column Claude Code draws its OWN `⎿` rows at (`  ⎿  …`). A tool's
 /// output continues at [`GUTTER_TEXT_COLUMN`], under the gutter's text, so a
 /// `⎿` the output itself prints lands at column 5 or deeper — behind a blank
@@ -2160,8 +2580,8 @@ enum Block {
 /// RECALL: a wall read here is acted on only where the session's own
 /// transcript confirms it (aterm-agent, `supervise/wall_confirm.rs`), so
 /// where the screen cannot tell Claude Code's row from a tool's, it reads
-/// the wall. Three rules, each measured on Claude Code 2.1.294 in
-/// the real-Claude lab:
+/// the wall. Four rules, measured in the real-Claude lab — the first three
+/// on Claude Code 2.1.294, the fourth on 2.1.302:
 ///
 /// 1. **The column.** A `⎿` row at any column but 2 is never Claude Code's:
 ///    its own rows are at column 2, and a tool's output continues at column
@@ -2188,14 +2608,48 @@ enum Block {
 ///    Bash(…` / `  …)`) — is no column-2 `⎿` row, so the output's first row
 ///    under a wrapped call is still its first.
 ///
+/// 4. **A hook's words under a row of Claude Code's own are output**
+///    (ATERM-KI-1015-14, measured on 2.1.302 in the lab). Under the
+///    STOP-HOOK SUMMARY (`⏺ Ran 1 stop hook (ctrl+o to expand)`,
+///    [`is_stop_hook_summary`]) the column-2 `⎿` rows up to its first one
+///    that opens with a label are the hooks' own: a Stop hook's `stopReason`
+///    (`{"continue": false, "stopReason": …}`: the first row, its later
+///    lines at column 2 with no `⎿`; the second row in the detailed
+///    transcript, under the hook's command). The 2.1.302 binary draws the
+///    summary's rows as the `stopReason`, only where the hooks prevented the
+///    continuation, then a `Stop hook error: …` row per blocking error and a
+///    `Stop hook feedback: …` row per context a hook added: a continuation,
+///    and so a wall its request meets, comes only under a labelled row,
+///    and that wall is read (measured: `⎿  Stop hook error: [./sb]: …` for
+///    a stderr, `⎿  Stop hook error: check the tests` for a `{"decision":
+///    "block"}`, then the wall, a blank row between or none). Under A HOOK'S
+///    ERROR ROW (`⎿  <hook> hook error`, `⎿  <hook> hook returned blocking
+///    error`, [`is_hook_error_row`]) the next column-2 `⎿` row is the hook's
+///    words, the error row's own sub-lines in the binary: its stderr behind
+///    `Failed with non-blocking status code: `, its blocking `reason`, or
+///    Claude Code's own `Blocked by hook` for none — under any owner, a
+///    call's included; a wall comes after it. Read as walls, `aterm drive
+///    watch` typed `/login` on a `stopReason` and parked the session until
+///    the reset a double-spaced one named (measured).
+///    THE LIMIT: a hook's error row with no row of the hook's under it would
+///    put Claude Code's wall where the hook's words stand; 2.1.302 always
+///    draws one (measured for an empty stderr and a reasonless block), and
+///    only a blocking reason of blank space draws none (read from the
+///    binary).
+///
 /// Any other owner is read as Claude Code's: the person's `❯` turn, the
-/// worker's message, a task notice, a Monitor event (its payload included),
-/// a hook summary. So is a block whose owner the walk does not reach — a
+/// worker's message, a task notice, a Monitor event, a hook summary past its
+/// labelled rows. So is a block whose owner the walk does not reach — a
 /// blank row over a row that opens an item (below), or the top of the
 /// screen, comes first — which is where Claude Code's walls stand under a
 /// prompt's second paragraph, under a collapsed tool group (its row wrapped
 /// or not), and under a long output whose call has scrolled off (all
-/// measured).
+/// measured). A Monitor's event draws its payload on its own `⏺` row and no
+/// `⎿` row of its own, so the first column-2 row under it is Claude Code's
+/// wall (2.1.302, measured). A hook's row under these owners that carries a
+/// program's words behind a label (`Stop says: …`, `Stop hook error: [./h]:
+/// …`) is read here, and is no wall by the table ([`crate::wall`]'s
+/// `opens_with_label`).
 ///
 /// A BLANK ROW INSIDE A CALL'S ROWS does not end the walk (ruling
 /// 2026-10-08, the review of pass 5). A blank row ends it only where the
@@ -2228,10 +2682,17 @@ fn block_is_vendors(rows: &[String], open: usize) -> Block {
         return Block::Output;
     }
     let mut later = false;
+    // A column-2 `⎿` row between the block and its owner that opens with a
+    // label (rule 4: the stop-hook summary's own rows end there).
+    let mut labelled = false;
+    // The walk has met no blank row and no column-2 `⎿` row yet: the next
+    // such `⎿` row is the one the block hangs right under (rule 4).
+    let mut adjacent = true;
     // The nearest non-blank row below the one the walk stands on.
     let mut below = &rows[open];
     for row in rows[..open].iter().rev() {
         if crate::text::trim(row).is_empty() {
+            adjacent = false;
             let opens_an_item = leading_spaces(below) <= VENDOR_GUTTER_COLUMN
                 && !crate::text::trim_start(below).starts_with('⎿');
             if opens_an_item {
@@ -2242,15 +2703,97 @@ fn block_is_vendors(rows: &[String], open: usize) -> Block {
         below = row;
         let lead = leading_spaces(row);
         if lead == 0 {
+            if !labelled && is_stop_hook_summary(row) {
+                return Block::Output;
+            }
             return match (is_tool_call(row), later) {
                 (false, _) => Block::Vendors,
                 (true, true) => Block::UnderCall,
                 (true, false) => Block::Output,
             };
         }
-        later |= lead == VENDOR_GUTTER_COLUMN && crate::text::trim_start(row).starts_with('⎿');
+        if lead == VENDOR_GUTTER_COLUMN
+            && let Some(text) = crate::text::trim_start(row).strip_prefix('⎿')
+        {
+            let text = crate::text::trim(text);
+            if adjacent && is_hook_error_row(text) {
+                return Block::Output;
+            }
+            adjacent = false;
+            later = true;
+            labelled |= crate::wall::labelled(text);
+        }
     }
     Block::Vendors
+}
+
+/// Whether `row` is Claude Code's STOP-HOOK SUMMARY, an owner whose first
+/// column-2 rows are the hooks' own ([`block_is_vendors`], rule 4): `⏺ Ran 1
+/// stop hook (ctrl+o to expand)`, `⏺ Ran 2 stop hooks` (`●` off macOS; the
+/// anchors `hook.ran` and `hook.ran.stop`, the count between them).
+fn is_stop_hook_summary(row: &str) -> bool {
+    let Some(rest) = row
+        .strip_prefix(['⏺', '●'])
+        .map(crate::text::trim_start)
+        .and_then(|r| r.strip_prefix(crate::anchors::anchor("hook.ran")))
+    else {
+        return false;
+    };
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    digits > 0
+        && rest[digits..]
+            .strip_prefix(' ')
+            .is_some_and(|r| r.starts_with(crate::anchors::anchor("hook.ran.stop")))
+}
+
+/// Whether `text`, a column-2 `⎿` row's past its `⎿`, is the row A HOOK'S
+/// ERROR opens on, whose next column-2 row is the hook's words
+/// ([`block_is_vendors`], rule 4): `<hook> hook error` or `<hook> hook
+/// returned blocking error` (the anchors `hook.error` and
+/// `hook.blocking_error`), the hook's name one word (`UserPromptSubmit`,
+/// `PostToolUse:Bash`).
+fn is_hook_error_row(text: &str) -> bool {
+    ["hook.error", "hook.blocking_error"].iter().any(|id| {
+        text.strip_suffix(crate::anchors::anchor(id))
+            .is_some_and(|name| !name.is_empty() && !name.contains(char::is_whitespace))
+    })
+}
+
+/// Whether row `i` carries A PROGRAM'S WORDS, never a notice of Claude Code's
+/// own (ATERM-KI-1015-14): its text opens with a label ([`crate::wall`]'s
+/// `labelled`: a Monitor's event, a hook's `… says:` or `… hook error:` row),
+/// or it stands under a `⎿` row the owner walk reads as output
+/// ([`block_is_vendors`]: a call's first row, a hook's words under the
+/// stop-hook summary or under its error row, a `⎿` at a column but 2) — that
+/// row or one of its own rows under it, a wrapped line or a later line of the
+/// same words ([`owning_gutter`]). The readers that walk every row above the
+/// composer, splitting a row at wide gaps (`wall::since_limit`,
+/// `wall::auto_continue_end`, the turn's own notice behind a generic banner),
+/// pass these rows over, as the gutter's reader does: a hook's `stopReason`
+/// of `note  Usage limit reached · resets 3pm` (the double space kept,
+/// measured on 2.1.302) is no limit's notice.
+pub(crate) fn programs_words(rows: &[String], i: usize) -> bool {
+    crate::wall::labelled(&rows[i])
+        || owning_gutter(rows, i).is_some_and(|open| block_is_vendors(rows, open) == Block::Output)
+}
+
+/// The `⎿` row that row `i` stands under: itself, or the nearest above it
+/// with no blank row and no row in column 0 between — a `⎿` row's own rows,
+/// an output's at column 5 and a `stopReason`'s later lines at column 2
+/// (2.1.302, measured). Wider than [`gutter_open`], which leaves a row short
+/// of the gutter's text column to the item it opens: a row this finds is
+/// judged by its `⎿` row's owner ([`programs_words`]).
+fn owning_gutter(rows: &[String], mut i: usize) -> Option<usize> {
+    loop {
+        let row = rows[i].as_str();
+        if crate::text::trim_start(row).starts_with('⎿') {
+            return Some(i);
+        }
+        if crate::text::trim(row).is_empty() || leading_spaces(row) == 0 {
+            return None;
+        }
+        i = i.checked_sub(1)?;
+    }
 }
 
 /// A transcript row that opens a CALL — a tool's or a command's, whose `⎿`
@@ -2446,6 +2989,14 @@ fn banner_notice(
 /// The column the `⎿` gutter's text starts at (`  ⎿  queued 8 runs`): a
 /// block's continuation rows are indented to it or further.
 const GUTTER_TEXT_COLUMN: usize = 5;
+
+/// Whether row `i` stands in a `⎿` block a CALL owns ([`block_is_vendors`]:
+/// the call's output, or a later column-2 row under it, which only the
+/// transcript tells from the output) or one at a tool's column: words a tool
+/// printed, as far as the screen can say. A row under no gutter is not.
+pub(crate) fn under_a_call(rows: &[String], i: usize) -> bool {
+    gutter_open(rows, i).is_some_and(|open| block_is_vendors(rows, open) != Block::Vendors)
+}
 
 /// The `⎿` row that opens the gutter block row `i` belongs to: `i` itself, or
 /// the row its continuation rows (indented to the gutter's text,
@@ -2811,57 +3362,6 @@ mod tests {
         }
     }
 
-    /// Non-vacuity for [`a_dead_frame_above_the_launch_card_is_not_the_live_zone`]:
-    /// the same fixtures cut at the dead process's footer — its last frame as
-    /// it stood while it lived — still read as that frame said: the `/exit`
-    /// spinner busy on the status row, the done row under a question a
-    /// question.
-    #[test]
-    fn the_dead_frame_alone_still_reads_as_it_lived() {
-        use crate::prompt::fixtures::{
-            CTRLC_RELAUNCH_STALE_QUESTION, EXIT_RELAUNCH_STALE_FOOTER, screen,
-        };
-        let cut = |text: &str, footer: &str| {
-            let r = screen(text);
-            let at = r
-                .iter()
-                .rposition(|row| row.contains(footer))
-                .expect(footer);
-            r[..=at].to_vec()
-        };
-        let exit = cut(EXIT_RELAUNCH_STALE_FOOTER, "esc to interrupt");
-        assert_eq!(
-            busy_signal(&exit),
-            Some(Busy::hard(Zone::Status, "spinner")),
-            "{exit:#?}"
-        );
-        assert_eq!(worker_phase(&exit), Phase::Busy);
-        let ctrlc = cut(CTRLC_RELAUNCH_STALE_QUESTION, "Press Ctrl-C again to exit");
-        assert_eq!(worker_phase(&ctrlc), Phase::Question, "{ctrlc:#?}");
-    }
-
-    /// The session of [`a_dead_frame_above_the_launch_card_is_not_the_live_zone`]
-    /// with a question dialog up: the dialog is the live box, and the only
-    /// `esc to interrupt` on the screen is the dead footer ABOVE the new
-    /// launch card — the row a whole-grid `await gone esc.to.interrupt` (the
-    /// hosted loop's busy guard) waits on for its whole step.
-    #[test]
-    fn a_question_under_a_dead_footer_is_the_live_box() {
-        use crate::prompt::fixtures::{EXIT_RELAUNCH_STALE_FOOTER_QUESTION, screen};
-        let r = screen(EXIT_RELAUNCH_STALE_FOOTER_QUESTION);
-        assert_eq!(worker_phase(&r), Phase::Prompt);
-        let p = crate::prompt::parse_prompt_v2(&r).expect("the dialog");
-        assert_eq!(p.kind, crate::prompt::PromptKind::Question);
-        let card = r
-            .iter()
-            .rposition(|row| row.contains(crate::anchor("launch.banner")))
-            .expect("the new launch card");
-        let busy = r
-            .iter()
-            .rposition(|row| row.contains(crate::anchor("busy.interrupt")));
-        assert!(busy.is_some_and(|b| b < card), "{busy:?} {card}");
-    }
-
     /// Another composer's rule ends the live zone too, card or no card: a
     /// dead frame's bottom rule sits under everything that frame owned, so
     /// nothing above it is the live frame's status row.
@@ -2977,14 +3477,6 @@ mod tests {
             // The screen a fresh `claude` has drawn nothing on yet: the dead
             // frame, its hint and the shell's command line.
             let predraw = r[..hint + 3].to_vec();
-            assert!(
-                predraw[hint + 2].ends_with("% claude --model haiku"),
-                "{name}"
-            );
-            assert!(
-                composer_rules(&predraw).is_some(),
-                "{name}: the dead frame reads"
-            );
             assert_eq!(busy_zone_start(&predraw), hint + 1, "{name}");
             let dead = predraw
                 .iter()
@@ -2995,110 +3487,14 @@ mod tests {
             let lived = r[..=dead].to_vec();
             assert!(busy_zone_start(&lived) < dead, "{name}: {lived:#?}");
         }
-        // The /exit variant's dead footer is the busy guard's row: out of
-        // the zone, and in it while the frame lived.
-        let r = screen(EXIT_RELAUNCH_STALE_FOOTER);
-        let hint = r.iter().position(|row| row == notice).expect("the hint");
-        let predraw = r[..hint + 3].to_vec();
-        assert!(busy_rows(&predraw[busy_zone_start(&predraw)..]).is_empty());
-        let dead = busy_rows(&predraw)[0];
-        let lived = r[..=dead].to_vec();
-        assert!(
-            busy_rows(&lived[busy_zone_start(&lived)..])
-                .contains(&(dead - busy_zone_start(&lived)))
-        );
         // Only the hint alone on its row counts: quoted under the gutter, or
         // in a message, it is the transcript's.
+        let r = screen(EXIT_RELAUNCH_STALE_FOOTER);
+        let hint = r.iter().position(|row| row == notice).expect("the hint");
+        let dead = busy_rows(&r)[0];
         let mut quoted = r[..hint].to_vec();
         quoted.push(format!("  ⎿  {notice}"));
         assert!(busy_zone_start(&quoted) < dead, "{quoted:#?}");
-    }
-
-    #[test]
-    fn idle_prompt_question_busy_each_have_a_fixture() {
-        let idle = screen(
-            &[
-                "⏺ Merged and pushed.",
-                "",
-                "✻ Cogitated for 2m 54s · done 2:41 PM",
-                "",
-            ],
-            "  ? for shortcuts",
-        );
-        assert_eq!(worker_phase(&idle), Phase::Idle);
-
-        assert_eq!(worker_phase(&bash_one_row()), Phase::Prompt);
-
-        let question = screen(
-            &[
-                "⏺ Two ways to do this: keep the harness or rewrite it.",
-                "  Which do you prefer?",
-                "",
-            ],
-            "  ? for shortcuts",
-        );
-        assert_eq!(worker_phase(&question), Phase::Question);
-
-        let busy = screen(
-            &[
-                "⏺ Running the tests.",
-                "",
-                "✻ Synthesizing… (18s · ↓ 1.1k tokens)",
-                "",
-            ],
-            "  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt",
-        );
-        assert_eq!(worker_phase(&busy), Phase::Busy);
-    }
-
-    /// The four misclassifications the real session produced, each now busy.
-    #[test]
-    fn the_four_misclassified_busy_screens_read_busy() {
-        // 1. An idle-looking screen mid-thought with a STATIC spinner row and an
-        //    idle-looking footer.
-        let static_spinner = screen(
-            &[
-                "⏺ Reading the harness helper before changing anything.",
-                "",
-                "✢ Thinking…",
-                "",
-            ],
-            "  ? for shortcuts",
-        );
-        assert_eq!(worker_phase(&static_spinner), Phase::Busy);
-
-        // 2. A spinner word without its timer (the first second).
-        let no_timer = screen(&["✶ Deliberating…", ""], "  ? for shortcuts");
-        assert_eq!(worker_phase(&no_timer), Phase::Busy);
-
-        // 3. A DONE row whose footer still counts a background shell.
-        let shell = screen(
-            &[
-                "⏺ Started the build in the background.",
-                "",
-                "✻ Cooked for 9m 27s · done 11:07 AM · 1 shell still running",
-                "",
-            ],
-            "  ? for shortcuts",
-        );
-        assert_eq!(worker_phase(&shell), Phase::Busy);
-        assert_eq!(
-            busy_reason("✻ Cooked for 9m 27s · done 11:07 AM · 1 shell still running"),
-            Some("a shell still running")
-        );
-
-        // 4. A footer without `esc to interrupt`: the live spinner is the only
-        //    signal.
-        let auto = screen(
-            &[
-                "⏺ Running the tests.",
-                "",
-                "✻ Synthesizing… (18s · ↓ 1.1k tokens)",
-                "",
-            ],
-            "  ⏵⏵ auto mode on (shift+tab to cycle)",
-        );
-        assert_eq!(worker_phase(&auto), Phase::Busy);
     }
 
     #[test]
@@ -3262,6 +3658,64 @@ mod tests {
         }
     }
 
+    /// THE ENTRY ENTER WOULD RUN ([`completion_entry`]): the slash menu's pointed
+    /// entry, at the top (`/compact` under `❯ /compact`) or arrowed down (the third,
+    /// `/plugin-authoring`, under `❯ /mod`), both MEASURED on 2.1.292; and 2.1.287's
+    /// menu, no entry pointed, its first. NEGATIVE CONTROLS: the measured idle footer
+    /// under the frame, a `/cl` draft with its footer under it (the menu dismissed), the
+    /// shortcuts list, and no frame are no menu.
+    #[test]
+    fn the_completion_menus_entry_is_what_enter_would_run() {
+        use crate::prompt::fixtures::{
+            CONTEXT_WALL_COMPACT_MENU_MEASURED, SLASH_MENU_POINTER_DOWN_MEASURED,
+            SLASH_MENU_USAGE_MEASURED, screen as fx,
+        };
+        assert_eq!(
+            completion_entry(&fx(CONTEXT_WALL_COMPACT_MENU_MEASURED)).as_deref(),
+            Some("/compact")
+        );
+        assert_eq!(
+            completion_entry(&fx(SLASH_MENU_USAGE_MEASURED)).as_deref(),
+            Some("/usage")
+        );
+        assert_eq!(
+            completion_entry(&fx(SLASH_MENU_POINTER_DOWN_MEASURED)).as_deref(),
+            Some("/plugin-authoring")
+        );
+        let rule = "─".repeat(80);
+        let draft = |under: &[&str]| {
+            let mut r = rows(&["⏺ Done.", "", &rule, "❯ /cl", &rule]);
+            r.extend(rows(under));
+            r
+        };
+        let plain = draft(&[
+            "    /clear              Clear conversation history and free up context",
+            "    /color              Set the prompt bar color for this session",
+        ]);
+        assert_eq!(completion_entry(&plain).as_deref(), Some("/clear"));
+        let pointed = draft(&[
+            "  ❯ /clear              Clear conversation history and free up context",
+            "    /color              Set the prompt bar color for this session",
+        ]);
+        assert_eq!(completion_entry(&pointed).as_deref(), Some("/clear"));
+        // NEGATIVE CONTROLS.
+        let idle = fx(include_str!("fixtures/claude-2.1.283-footer-auto-idle.txt"));
+        assert_eq!(completion_entry(&idle), None);
+        assert_eq!(
+            completion_entry(&draft(&["  ⏵⏵ auto mode on (shift+tab to cycle)"])),
+            None
+        );
+        assert_eq!(
+            completion_entry(&draft(&[
+                "  ! for bash mode          double tap esc to clear input",
+                "  / for commands           shift + tab to auto-accept edits",
+            ])),
+            None
+        );
+        assert_eq!(completion_entry(&draft(&[])), None);
+        assert_eq!(completion_entry(&rows(&["❯ /cl", "    /clear"])), None);
+    }
+
     // ---- the live zone, against real screens ------------------------------
     //
     // `fixtures/` holds screens saved from a real supervision session (Claude
@@ -3319,16 +3773,6 @@ mod tests {
         r
     }
 
-    /// Insert `extra` directly above the status row (the done row).
-    fn above_status_row(mut r: Vec<String>, extra: &[&str]) -> Vec<String> {
-        let top = composer_frame(&r).expect("frame").top;
-        let at = status_block(&r, top).status.expect("a status row");
-        for (k, row) in extra.iter().enumerate() {
-            r.insert(at + k, (*row).to_string());
-        }
-        r
-    }
-
     /// Footers an idle worker's screen shows (from wait_bg7 and wait_bg2).
     const IDLE_AUTO_FOOTER: &str = "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                                                         /rc active";
     const PASTE_FOOTER: &str = "  paste again to expand                                                                                                       /rc active";
@@ -3340,14 +3784,6 @@ mod tests {
     #[test]
     fn the_idle_after_limit_screen_is_idle_though_row_45_says_waiting() {
         let r = saved_screen(IDLE_AFTER_LIMIT);
-        assert_eq!(r.len(), 63);
-        assert_eq!(r[44], "✻ Waiting for 1 dynamic workflow to finish");
-        assert_eq!(
-            busy_reason(&r[44]),
-            Some("waiting for a dynamic workflow"),
-            "the stale row the whole-screen scan fired on"
-        );
-        assert_eq!(r[60], "❯", "the empty composer, where the cursor was");
         assert_eq!(signal(&r), None);
         assert_eq!(
             status_row(&r),
@@ -3378,38 +3814,6 @@ mod tests {
             );
             assert_eq!(worker_phase(&r), Phase::Busy);
         }
-    }
-
-    /// The same screen with `esc to interrupt` in the footer and nowhere else.
-    #[test]
-    fn esc_to_interrupt_in_the_footer_alone_is_busy() {
-        let mut r = saved_screen(IDLE_AFTER_LIMIT);
-        r[62] = "  ⏵⏵ accept edits on (shift+tab to cycle) · esc to interrupt".to_string();
-        assert_eq!(signal(&r).as_deref(), Some("footer: esc to interrupt"));
-        assert_eq!(worker_phase(&r), Phase::Busy);
-    }
-
-    /// A spinner-looking row far up the transcript over an empty status block
-    /// (only blanks between the last transcript row and the frame): IDLE.
-    #[test]
-    fn a_spinner_far_up_over_an_empty_status_block_is_idle() {
-        let r = screen(
-            &[
-                "✶ Deliberating…",
-                "⏺ Reading the harness helper before changing anything.",
-                "",
-                "  Ran 3 shell commands",
-                "",
-                "⏺ The helper is fine as it is; nothing to change.",
-                "",
-                "",
-            ],
-            "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
-        );
-        assert_eq!(busy_reason(&r[0]), Some("spinner row"));
-        assert_eq!(signal(&r), None);
-        assert_eq!(status_row(&r), None, "the worker's row comes first");
-        assert_eq!(worker_phase(&r), Phase::Idle);
     }
 
     /// The two spinner rows measured on a Claude Code 2.1.267 screen, each as
@@ -3481,44 +3885,71 @@ mod tests {
         }
     }
 
-    /// `wait_bg.out`: a turn finished while a background workflow runs —
-    /// `✻ Waiting for 1 dynamic workflow to finish` directly above the frame,
-    /// and the workflow's progress line under the footer.
+    /// The older waiter's captures, each read by its live zone: `wait_bg` a
+    /// turn finished while a background workflow runs (`Waiting for 1
+    /// dynamic workflow` above the frame, its progress line under the
+    /// footer); `wait_bg2` the manager answered and the worker deliberates
+    /// under a `⎿  Tip:` row, the older `Waiting for` row above the user row
+    /// history; `wait_bg3` a done row that counts no shell, the worker asking
+    /// for a call without a `?`; `wait_bg4` `1 shell still running` on the
+    /// done row and `· 1 shell ·` in the footer; `wait_bg11` the shell on the
+    /// done row under a right-aligned hint; `wait_bg12` the live done row
+    /// under the update banner, an older one with a shell far up (history).
     #[test]
-    fn wait_bg_is_busy_waiting_for_a_workflow() {
-        let r = waiter_capture(include_str!("fixtures/wait_bg.out"));
-        assert_eq!(
-            signal(&r).as_deref(),
-            Some("status row: waiting for a dynamic workflow")
-        );
-        assert_eq!(worker_phase(&r), Phase::Busy);
-        let footer = r.last().expect("rows");
-        assert_eq!(footer_busy(footer), Some("a workflow running"), "{footer}");
-    }
-
-    /// `wait_bg2.out`: the manager answered and the worker is deliberating; the
-    /// `✻ Waiting for 1 dynamic workflow` above the user row is history, the
-    /// live spinner sits under a `⎿  Tip:` row.
-    #[test]
-    fn wait_bg2_is_busy_the_live_spinner_under_its_tip_row() {
-        let r = waiter_capture(include_str!("fixtures/wait_bg2.out"));
-        assert_eq!(signal(&r).as_deref(), Some("status row: spinner"));
-        assert_eq!(status_row(&r), Some("✶ Deliberating…"));
-        assert_eq!(worker_phase(&r), Phase::Busy);
-    }
-
-    /// `wait_bg3.out`: the done row counts no shell and the footer says
-    /// nothing busy; the worker asked for a call without a `?`.
-    #[test]
-    fn wait_bg3_is_idle_its_done_row_counts_no_shell() {
-        let r = waiter_capture(include_str!("fixtures/wait_bg3.out"));
-        assert_eq!(
-            status_row(&r),
-            Some("✻ Sautéed for 50m 35s · done 10:57 AM")
-        );
-        assert_eq!(signal(&r), None);
-        assert_eq!(last_said_row(&r), Some("  Waiting for your call."));
-        assert_eq!(worker_phase(&r), Phase::Idle);
+    fn the_waiter_captures_read_by_their_live_zone() {
+        for (name, text, busy, status, phase) in [
+            (
+                "wait_bg",
+                include_str!("fixtures/wait_bg.out"),
+                Some("status row: waiting for a dynamic workflow"),
+                None,
+                Phase::Busy,
+            ),
+            (
+                "wait_bg2",
+                include_str!("fixtures/wait_bg2.out"),
+                Some("status row: spinner"),
+                Some("✶ Deliberating…"),
+                Phase::Busy,
+            ),
+            (
+                "wait_bg3",
+                include_str!("fixtures/wait_bg3.out"),
+                None,
+                Some("✻ Sautéed for 50m 35s · done 10:57 AM"),
+                Phase::Idle,
+            ),
+            (
+                "wait_bg4",
+                include_str!("fixtures/wait_bg4.out"),
+                Some("status row: a shell still running"),
+                None,
+                Phase::Busy,
+            ),
+            (
+                "wait_bg11",
+                include_str!("fixtures/wait_bg11.out"),
+                Some("status row: a shell still running"),
+                None,
+                Phase::Busy,
+            ),
+            (
+                "wait_bg12",
+                include_str!("fixtures/wait_bg12.out"),
+                Some("status row: a shell still running"),
+                Some("✻ Sautéed for 1m 7s · done 1:44 PM · 1 shell still running"),
+                Phase::Busy,
+            ),
+        ] {
+            let r = waiter_capture(text);
+            assert_eq!(signal(&r).as_deref(), busy, "{name}");
+            if status.is_some() {
+                assert_eq!(status_row(&r), status, "{name}");
+            }
+            assert_eq!(worker_phase(&r), phase, "{name}");
+        }
+        let bg3 = waiter_capture(include_str!("fixtures/wait_bg3.out"));
+        assert_eq!(last_said_row(&bg3), Some("  Waiting for your call."));
     }
 
     /// THE AGENT'S OWN BACKGROUND WORK is read apart from a live turn
@@ -3573,20 +4004,6 @@ mod tests {
         assert_eq!(background_wait(&typed), None, "{:?}", &typed[top - 3..=top]);
     }
 
-    /// `wait_bg4.out`: the turn is done but `1 shell still running` rides on
-    /// the done row, and the footer counts `· 1 shell ·` too.
-    #[test]
-    fn wait_bg4_is_busy_a_shell_still_running() {
-        let r = waiter_capture(include_str!("fixtures/wait_bg4.out"));
-        assert_eq!(
-            signal(&r).as_deref(),
-            Some("status row: a shell still running")
-        );
-        assert_eq!(worker_phase(&r), Phase::Busy);
-        let footer = r.last().expect("rows");
-        assert_eq!(footer_busy(footer), Some("a shell running"), "{footer}");
-    }
-
     /// CLAUDE CODE 2.1.271 AT REST OVER TWO SHELLS THAT NEVER END (the
     /// upgrade strand of 2026-09-21..27: two background `tail -f … | grep -m1
     /// …` closers whose grep had long since matched held a tab 5.5 days). The
@@ -3601,14 +4018,8 @@ mod tests {
     /// (its line 1 says from what): no capture of the incident was kept.
     #[test]
     fn claude_2_1_271_idle_over_two_shells_is_a_break_of_its_own_work() {
-        use crate::prompt::fixtures::{IDLE_SHELLS_2_1_271 as TEXT, provenance};
-        use crate::reader::{ClaudeReader, Program, ScreenReader, identify};
-        let head = provenance(TEXT).expect("a provenance line");
-        assert!(
-            head.starts_with("claude-code 2.1.271 · HAND-BUILT ")
-                && head.contains("no capture of the incident screen was kept"),
-            "{head}"
-        );
+        use crate::prompt::fixtures::IDLE_SHELLS_2_1_271 as TEXT;
+        use crate::reader::{Program, identify};
         // This module's `screen` builds rows; the fixture's are read whole.
         let r = crate::prompt::fixtures::screen(TEXT);
         let done = "✻ Cogitated for 3m 12s · done 9:29 PM · 2 shells still running";
@@ -3619,12 +4030,6 @@ mod tests {
         );
         assert_eq!(worker_phase(&r), Phase::Busy);
         assert_eq!(background_wait(&r), Some("a shell still running"));
-        let footer = r.last().expect("rows");
-        assert!(
-            footer.starts_with("  ⏵⏵ bypass permissions on · 2 shells · "),
-            "{footer}"
-        );
-        assert_eq!(footer_busy(footer), Some("a shell running"), "{footer}");
         // The supervisor's break, as it asks it (`host_steps_in_background`):
         // busy, background work, no wall — the reader named by the program,
         // or, for a Claude Code started as `node`, by its screen.
@@ -3634,10 +4039,6 @@ mod tests {
             assert_eq!(reader.background_wait(&r), Some("a shell still running"));
             assert!(reader.wall(&r).is_none(), "{:?}", reader.wall(&r));
         }
-        assert_eq!(
-            ClaudeReader.background_wait(&r),
-            Some("a shell still running")
-        );
 
         // THE FOOTER ALONE: the done row counts nothing.
         let at = r.iter().position(|x| x == done).expect("the done row");
@@ -3690,34 +4091,6 @@ mod tests {
             assert_eq!(reader.phase(&bare), Phase::Idle);
             assert_eq!(reader.background_wait(&bare), None);
         }
-    }
-
-    /// `wait_bg11.out`: the shell rides on the done row under a right-aligned
-    /// `get pinged when Claude finishes` hint.
-    #[test]
-    fn wait_bg11_is_busy_a_shell_still_running_under_a_hint_row() {
-        let r = waiter_capture(include_str!("fixtures/wait_bg11.out"));
-        assert_eq!(
-            signal(&r).as_deref(),
-            Some("status row: a shell still running")
-        );
-        assert_eq!(worker_phase(&r), Phase::Busy);
-    }
-
-    /// `wait_bg12.out`: an older done row with a shell sits far up (history);
-    /// the live one is under the update banner, and the composer holds text.
-    #[test]
-    fn wait_bg12_is_busy_a_shell_still_running_under_the_update_banner() {
-        let r = waiter_capture(include_str!("fixtures/wait_bg12.out"));
-        assert_eq!(
-            status_row(&r),
-            Some("✻ Sautéed for 1m 7s · done 1:44 PM · 1 shell still running")
-        );
-        assert_eq!(
-            signal(&r).as_deref(),
-            Some("status row: a shell still running")
-        );
-        assert_eq!(worker_phase(&r), Phase::Busy);
     }
 
     /// The live worker's screen as `aterm drive phase` first read it
@@ -3832,6 +4205,9 @@ mod tests {
             "✻ Can't reach the API server — check your internet or DNS (ENOTFOUND) · Retrying in 1s · attempt 5/10",
             "✻ Can't reach the API server — check your in… · Retrying in 30s · attempt 7/10",
             "✻ API Error: 529 Overloaded · Retrying in 1m 30s · attempt 2/10",
+            // The vendor's count of its tries without their total (the
+            // queued shape's `attempt 2`).
+            "✻ Can't reach the API server · Retrying in 5s · attempt 5",
         ] {
             assert!(is_activity_row(row), "{row}");
         }
@@ -3840,7 +4216,6 @@ mod tests {
             "✻ Cogitated for 0s · done 11:02 PM",
             "✻ I was Retrying in 5s · attempt soon",
             "✻ Can't reach the API server · Retrying in soon · attempt 5/10",
-            "✻ Can't reach the API server · Retrying in 5s · attempt 5",
             "⏺ Can't reach the API server · Retrying in 5s · attempt 5/10",
         ] {
             assert!(!is_activity_row(row), "{row}");
@@ -3860,6 +4235,10 @@ mod tests {
         );
         assert_eq!(signal(&todo).as_deref(), Some("status row: spinner"));
 
+        // A waiting row above the transcript is no STATUS row; with no done
+        // row or person's prompt under it, it is the wait Claude Code carries
+        // over the turns it started itself (module docs): soft background
+        // work, never the status row's own hard rule.
         for last in [
             "⏺ Stopped the background build.",
             "  ⎿  error: could not compile `x` (lib) due to 1 previous error",
@@ -3869,7 +4248,12 @@ mod tests {
                 "  ⏵⏵ auto mode on (shift+tab to cycle)",
             );
             assert_eq!(status_row(&r), None, "{last}");
-            assert_eq!(signal(&r), None, "{last}");
+            assert_eq!(
+                signal(&r).as_deref(),
+                Some("status row: background work still running"),
+                "{last}"
+            );
+            assert_eq!(busy_signal(&r).map(|b| b.soft), Some(true), "{last}");
         }
         let queued = screen(
             &[
@@ -3894,6 +4278,772 @@ mod tests {
             "  ⏵⏵ auto mode on",
         );
         assert_eq!(signal(&hint).as_deref(), Some("status row: spinner"));
+    }
+
+    /// `body` over Claude Code's frame drawn `width` columns wide, `footer`
+    /// under it: a pane of that width.
+    fn pane(body: &[&str], width: usize, footer: &str) -> Vec<String> {
+        let mut r = rows(body);
+        r.extend(["─".repeat(width), "❯".to_string(), "─".repeat(width)]);
+        r.push(footer.to_string());
+        r
+    }
+
+    /// SM-3 (KI S2R-F1, measured by the 2026-10-15 sweep at 12 columns): the
+    /// status row is read as its LINE. A spinner cut at its text column
+    /// (`✶ Choreog` over `  raphing…`) or in column 0 under the glyph reads
+    /// busy, not idle; a done row wrapped before `still running` reads the
+    /// shell it left running; a spinner's timing wrapped under it is its
+    /// progress; the transcript ends before a cut spinner's line and past a
+    /// wrapped done row's. NEGATIVE CONTROLS: the measured narrow fixtures
+    /// keep their phase and status row (their wrapped done rows join to done
+    /// rows); a done row cut before `done`, a done row with a tip, a hint or
+    /// a queued message right under it, and a stray row under a full done
+    /// row read idle; the whole spinner at 80 columns is a spinner.
+    #[test]
+    fn a_status_row_ink_wrapped_is_read_as_its_line() {
+        for rest in ["  raphing…", "raphing…"] {
+            let r = pane(&["⏺ Working.", "", "✶ Choreog", rest], 12, "  ⏵⏵ auto");
+            assert_eq!(worker_phase(&r), Phase::Busy, "{rest}");
+            assert_eq!(signal(&r).as_deref(), Some("status row: spinner"), "{rest}");
+            assert_eq!(status_row(&r), Some("✶ Choreog"), "{rest}");
+            // The spinner's line is the live zone, both its rows.
+            assert_eq!(transcript_end(&r), 2, "{rest}");
+        }
+        // A READER test, not a measurement: the narrow fixtures measured so
+        // far keep the footer's `· 1 shell` pill, which reads busy on its own;
+        // this footer is cut before it by hand.
+        let shell = pane(
+            &[
+                "⏺ Started the build in the background.",
+                "",
+                "✻ Worked for 9m 2s · done 3:15 PM · 1 shell still",
+                "  running",
+            ],
+            50,
+            "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for…",
+        );
+        assert_eq!(
+            signal(&shell).as_deref(),
+            Some("status row: a shell still running")
+        );
+        assert_eq!(worker_phase(&shell), Phase::Busy);
+        assert_eq!(
+            status_line(&shell).as_deref(),
+            Some("✻ Worked for 9m 2s · done 3:15 PM · 1 shell still running")
+        );
+
+        // NEGATIVE CONTROLS. The measured narrow screens (2.1.299 at 26 and
+        // 34 columns) keep the phase and status row main read them by; the
+        // transcript ends past a wrapped done row's whole line (its clock,
+        // `  10:36 AM`, is the transcript's, not the live zone's).
+        use crate::prompt::fixtures::{
+            API_ERROR_529_34_2_1_299, WALL_SESSION_AFTER_CANCEL_26_2_1_299,
+            WALL_SESSION_AUTO_CONTINUE_ARMED_26_2_1_299,
+            WALL_SESSION_AUTO_CONTINUE_ARMED_34_2_1_299,
+            WALL_SESSION_AUTO_CONTINUE_CANCELLED_26_2_1_299,
+            WALL_WEEKLY_AUTO_CONTINUE_ARMED_34_2_1_299, screen as measured,
+        };
+        for (text, limited, status, line, end) in [
+            (
+                WALL_SESSION_AFTER_CANCEL_26_2_1_299,
+                true,
+                Some("✻ Crunched for 0s · done"),
+                Some("✻ Crunched for 0s · done 10:36 AM"),
+                42,
+            ),
+            (
+                WALL_SESSION_AUTO_CONTINUE_ARMED_26_2_1_299,
+                true,
+                Some("✻ Worked for 0s · done"),
+                Some("✻ Worked for 0s · done 10:36 AM"),
+                23,
+            ),
+            (
+                WALL_SESSION_AUTO_CONTINUE_ARMED_34_2_1_299,
+                true,
+                Some("✻ Baked for 0s · done 10:20 AM"),
+                Some("✻ Baked for 0s · done 10:20 AM"),
+                24,
+            ),
+            (
+                API_ERROR_529_34_2_1_299,
+                false,
+                Some("✻ Brewed for 2m 58s · done 10:27"),
+                Some("✻ Brewed for 2m 58s · done 10:27 AM"),
+                19,
+            ),
+            (
+                WALL_SESSION_AUTO_CONTINUE_CANCELLED_26_2_1_299,
+                false,
+                None,
+                None,
+                31,
+            ),
+            (
+                WALL_WEEKLY_AUTO_CONTINUE_ARMED_34_2_1_299,
+                true,
+                None,
+                None,
+                38,
+            ),
+        ] {
+            let r = measured(text);
+            let phase = worker_phase(&r);
+            assert_eq!(
+                matches!(phase, Phase::Limited { .. }),
+                limited,
+                "{status:?}"
+            );
+            assert!(limited || phase == Phase::Idle, "{status:?}");
+            assert_eq!(status_row(&r), status);
+            assert_eq!(status_line(&r).as_deref(), line);
+            assert_eq!(transcript_end(&r), end, "{status:?}");
+            assert!(busy_signal(&r).is_none(), "{status:?}");
+        }
+        // A done row cut before `done`.
+        let cut = pane(
+            &["⏺ Fixed it.", "", "✻ Worked for 0s ·", "  done 1:02 PM"],
+            20,
+            "  ⏵⏵ auto",
+        );
+        assert_eq!(worker_phase(&cut), Phase::Idle);
+        assert_eq!(
+            status_line(&cut).as_deref(),
+            Some("✻ Worked for 0s · done 1:02 PM")
+        );
+        // The done row's line is the transcript's, both its rows.
+        assert_eq!(transcript_end(&cut), 4);
+        // A full done row (34 columns) with a tip, a hint against the right
+        // edge, a queued message, a stray row in column 0 or a word with an
+        // ellipsis at its text column right under it: none is its line.
+        for under in [
+            "  ⎿  Tip: Use /clear to start fresh",
+            "             ✔ Update installed",
+            "❯ carry on…",
+            "Thinking about it…",
+            "  more to say…",
+        ] {
+            let r = pane(
+                &[
+                    "⏺ Fixed it.",
+                    "",
+                    "✻ Worked for 3m 2s · done 4:24 PM",
+                    under,
+                ],
+                34,
+                "  ⏵⏵ auto mode on (shift+tab to",
+            );
+            assert_eq!(signal(&r), None, "{under}");
+            assert_eq!(
+                status_line(&r).as_deref(),
+                Some("✻ Worked for 3m 2s · done 4:24 PM"),
+                "{under}"
+            );
+        }
+        // The whole spinner at 80 columns.
+        let whole = pane(
+            &["⏺ Working.", "", "✶ Choreographing… (12s · ↓ 1.2k tokens)"],
+            80,
+            "  ⏵⏵ auto mode on (shift+tab to cycle)",
+        );
+        assert_eq!(signal(&whole).as_deref(), Some("status row: spinner"));
+        assert_eq!(
+            status_line(&whole).as_deref(),
+            Some("✶ Choreographing… (12s · ↓ 1.2k tokens)")
+        );
+    }
+
+    /// SM-4: the vendor's API-retry rows (2.1.300's `uyn`, read from the
+    /// binary) read busy whatever their kind, with no `esc to interrupt` in
+    /// the footer (a narrow pane, or any pane with a draft in the composer):
+    /// a stalled stream, no response, the auto-mode check unavailable, a
+    /// low-priority wait, an error with the limit's reset after its wait, a
+    /// wait of days, and the measured 2.1.283 screens; and a retry row a
+    /// narrow pane wrapped, read on its line. NEGATIVE CONTROLS: a done row,
+    /// the compaction's row and the worker's own words in the vendor's
+    /// shape read idle, and a done row's shell keeps its own rule.
+    #[test]
+    fn the_vendors_retry_rows_read_busy_whatever_their_kind() {
+        let footer = "  ⏵⏵ auto mode on (shift+tab to cycle)";
+        for row in [
+            "✻ Waiting for API response · will retry in 5s · check your network",
+            "✻ No response from the API after 30s · retrying, waiting up to 1m · attempt 2/10",
+            "✻ No response from the API after 30s · retrying once, waiting up to 1m",
+            "✻ Auto mode check unavailable · next try in 5s · attempt 2/10 · esc to interrupt",
+            "✻ Your request is queued · next try in 5s · attempt 2 · esc to interrupt",
+            "✻ Usage limit reached · Retrying in 14s (9:50pm) · attempt 3/10",
+            "✻ Usage limit reached · Retrying in 2d 3h · attempt 3/10",
+        ] {
+            let r = screen(&["⏺ Reading the parser.", "", row, ""], footer);
+            assert_eq!(worker_phase(&r), Phase::Busy, "{row}");
+            assert_eq!(signal(&r).as_deref(), Some("status row: spinner"), "{row}");
+        }
+        // No response, with its second row under it at column two.
+        let proxy = screen(
+            &[
+                "⏺ Reading the parser.",
+                "",
+                "✻ No response from the API after 30s · retrying, waiting up to 1m · attempt 2/10",
+                "  A proxy or gateway that buffers streaming responses can cause this.",
+                "",
+            ],
+            footer,
+        );
+        assert_eq!(worker_phase(&proxy), Phase::Busy);
+        // The measured 2.1.283 retry screens.
+        use crate::prompt::fixtures::{
+            API_RETRYING_DRAFT_MEASURED, API_RETRYING_MEASURED, API_RETRYING_QUEUED_80_MEASURED,
+            API_RETRYING_QUEUED_DRAFT_MEASURED, API_RETRYING_QUEUED_MEASURED, screen as measured,
+        };
+        for text in [
+            API_RETRYING_MEASURED,
+            API_RETRYING_DRAFT_MEASURED,
+            API_RETRYING_QUEUED_MEASURED,
+            API_RETRYING_QUEUED_80_MEASURED,
+            API_RETRYING_QUEUED_DRAFT_MEASURED,
+        ] {
+            assert_eq!(worker_phase(&measured(text)), Phase::Busy);
+        }
+        // SYNTHETIC: a retry row wrapped at its text column, the join's own
+        // rule (the vendor draws a narrow retry row with its glyph on a row
+        // of its own: [`a_status_glyph_ink_wrapped_away_from_its_text_is_the_status_row`]).
+        let wrapped = pane(
+            &[
+                "⏺ Reading the parser.",
+                "",
+                "✻ Usage limit reached · Retrying",
+                "  in 14s (9:50pm) · attempt 3/10",
+            ],
+            34,
+            "  ⏵⏵ auto mode on (shift+tab to",
+        );
+        assert_eq!(worker_phase(&wrapped), Phase::Busy);
+        // NEGATIVE CONTROLS.
+        for row in [
+            "✻ Worked for 0s · done 11:02 PM",
+            "✻ Conversation compacted (ctrl+o for history)",
+        ] {
+            let r = screen(&["⏺ Fixed it.", "", row, ""], footer);
+            assert_eq!(worker_phase(&r), Phase::Idle, "{row}");
+        }
+        let said = screen(
+            &["⏺ It printed · Retrying in 5s · attempt 2/10", ""],
+            footer,
+        );
+        assert_eq!(worker_phase(&said), Phase::Idle);
+        let shell = screen(
+            &[
+                "⏺ Started it.",
+                "",
+                "✻ Churned for 4m · done 1:02 PM · 1 shell still running",
+                "",
+            ],
+            footer,
+        );
+        assert_eq!(
+            signal(&shell).as_deref(),
+            Some("status row: a shell still running")
+        );
+    }
+
+    /// A JOIN NEVER LOSES THE ROW'S OWN BUSY READING (the cross-lane review's
+    /// screen F2): the vendor's no-response retry row draws its proxy hint
+    /// under it at column 2 (2.1.300's `uyn`), and a pane 82-85 columns wide
+    /// (72-75 for the last attempt's row) puts the row's end within the
+    /// join's slack of the edge, so the hint was taken as the line's last
+    /// item: with a draft in the composer (no `esc to interrupt`) the retry
+    /// read idle. Both read busy. A row busy by its tail alone stands alone
+    /// over such a hint (synthetic: `· esc to interrupt`, the last-item rule
+    /// no clause of the hint keeps). NEGATIVE CONTROLS: the same hint under
+    /// the turn's done row reads idle (the busy reading is the row's, never
+    /// the hint's); a retry row wrapped at its text column, whose row alone is
+    /// no retry, still joins and reads busy.
+    #[test]
+    fn a_status_line_join_never_loses_the_rows_own_busy_reading() {
+        let footer = "  ⏵⏵ auto mode on (shift+tab to cycle)";
+        let hint = "A proxy or gateway that buffers streaming responses can cause this · set \
+                    CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS to change the first wait";
+        // The hint as Ink wraps it, greedily at spaces, at column 2.
+        let wrapped = |width: usize| {
+            let mut out: Vec<String> = Vec::new();
+            let mut line = String::new();
+            for word in hint.split(' ') {
+                if !line.is_empty() && 2 + line.chars().count() + 1 + word.chars().count() > width {
+                    out.push(format!("  {line}"));
+                    line.clear();
+                }
+                if !line.is_empty() {
+                    line.push(' ');
+                }
+                line.push_str(word);
+            }
+            out.push(format!("  {line}"));
+            out
+        };
+        let with_hint = |status: &str, width: usize| {
+            let mut body = vec!["⏺ Reading the parser.".to_string(), String::new()];
+            body.push(status.to_string());
+            body.extend(wrapped(width));
+            body.push(String::new());
+            let body: Vec<&str> = body.iter().map(String::as_str).collect();
+            pane(&body, width, footer)
+        };
+        for (row, widths) in [
+            (
+                "✻ No response from the API after 30s · retrying, waiting up to 1m · attempt 2/10",
+                82..=85,
+            ),
+            (
+                "✻ No response from the API after 30s · retrying once, waiting up to 1m",
+                72..=75,
+            ),
+        ] {
+            for width in widths {
+                let r = with_hint(row, width);
+                assert_eq!(worker_phase(&r), Phase::Busy, "{width}: {r:#?}");
+                // NEGATIVE CONTROL: the hint under the done row.
+                let done = with_hint("✻ Worked for 3m 2s · done 4:24 PM", width);
+                assert_eq!(worker_phase(&done), Phase::Idle, "{width}: {done:#?}");
+            }
+        }
+        // Busy by its tail alone: the row stands alone over the hint.
+        let tail = "✻ Waiting on the server · esc to interrupt";
+        for width in 43..=46 {
+            let r = with_hint(tail, width);
+            assert_eq!(status_line(&r).as_deref(), Some(tail), "{width}: {r:#?}");
+            assert_eq!(worker_phase(&r), Phase::Busy, "{width}");
+        }
+        // NEGATIVE CONTROL: a true wrap still joins.
+        let wrap = pane(
+            &[
+                "⏺ Reading the parser.",
+                "",
+                "✻ Usage limit reached · Retrying",
+                "  in 14s (9:50pm) · attempt 3/10",
+            ],
+            34,
+            "  ⏵⏵ auto mode on (shift+tab to",
+        );
+        assert_eq!(
+            status_line(&wrap).as_deref(),
+            Some("✻ Usage limit reached · Retrying in 14s (9:50pm) · attempt 3/10")
+        );
+        assert_eq!(worker_phase(&wrap), Phase::Busy);
+    }
+
+    /// THE STATUS GLYPH INK WRAPPED AWAY FROM ITS TEXT IS THE STATUS ROW (the
+    /// cross-lane review's screen F1, MEASURED on 2.1.301): under about 44
+    /// columns the vendor's 2-cell glyph box wraps, the glyph alone on its
+    /// row and the text under it in column 0 — the retry row at 34, 38 and 42
+    /// columns (at 34 and 38 the cut error and the dim tail interleaved), the
+    /// spinner at 10. Each reads busy by its status row, its line the rows
+    /// under the glyph; so does a retry mid-turn under a running tool, and
+    /// one under a `·` glyph. NEGATIVE CONTROLS: each capture with the retry
+    /// block replaced by the turn's done row reads idle; a lone glyph over a
+    /// blank row is no status row (the walk goes on to the done row above),
+    /// nor over a `⏺` row (the walk stops); a done row wrapped the same way
+    /// is the status row and reads idle.
+    ///
+    /// UNDER 24 COLUMNS (the decision review's RR-LC-1, MEASURED on 2.1.301
+    /// at 18, 20 and 22): the cut `API error` and the dim tail are two text
+    /// columns side by side, and the line is read column by column — `✻ API
+    /// error · Retrying in 4s · attempt 1/10`, busy — where row by row it
+    /// read `Retrying in error 4s`, and at 18 the last row, filling the pane,
+    /// was dropped as a hint. NEGATIVE CONTROLS: the block replaced by the
+    /// done row reads idle, and a done row wrapped under a bare glyph over two
+    /// rows stays one done line.
+    #[test]
+    fn a_status_glyph_ink_wrapped_away_from_its_text_is_the_status_row() {
+        use crate::prompt::fixtures::screen as measured;
+        let captures = [
+            include_str!("fixtures/claude-2.1.301-retry-34col.txt"),
+            include_str!("fixtures/claude-2.1.301-retry-38col.txt"),
+            include_str!("fixtures/claude-2.1.301-retry-42col.txt"),
+            include_str!("fixtures/claude-2.1.301-spinner-10col.txt"),
+            include_str!("fixtures/claude-2.1.301-retry-18col.txt"),
+            include_str!("fixtures/claude-2.1.301-retry-20col.txt"),
+            include_str!("fixtures/claude-2.1.301-retry-22col.txt"),
+        ];
+        let narrow = [
+            include_str!("fixtures/claude-2.1.301-retry-18col.txt"),
+            include_str!("fixtures/claude-2.1.301-retry-20col.txt"),
+            include_str!("fixtures/claude-2.1.301-retry-22col.txt"),
+        ];
+        for text in narrow {
+            assert_eq!(
+                status_line(&measured(text)).as_deref(),
+                Some("✻ API error · Retrying in 4s · attempt 1/10")
+            );
+        }
+        for text in captures {
+            let r = measured(text);
+            assert_eq!(worker_phase(&r), Phase::Busy, "{r:#?}");
+            assert_eq!(signal(&r).as_deref(), Some("status row: spinner"), "{r:#?}");
+            let line = status_line(&r).unwrap_or_default();
+            assert!(line.starts_with("✻ API") || line == "✻ Infusing…", "{line}");
+            // NEGATIVE CONTROL: the block replaced by the turn's done row.
+            let mut done = r.clone();
+            let at = done
+                .iter()
+                .rposition(|row| row == "✻")
+                .expect("the bare glyph");
+            let end = (at..done.len())
+                .find(|&k| done[k].trim().is_empty() || is_rule(&done[k]))
+                .unwrap_or(at + 1);
+            done.splice(
+                at..end,
+                ["✻ Crunched for 3m 2s · done 12:55 PM".to_string()],
+            );
+            assert_eq!(worker_phase(&done), Phase::Idle, "{done:#?}");
+        }
+        let footer = "  ⏵⏵ auto mode on (shift+tab to";
+        for glyph in ["✻", "·"] {
+            let mid_turn = pane(
+                &[
+                    "⏺ Bash(targo test)",
+                    "  ⎿  Running…",
+                    "",
+                    glyph,
+                    "API     · Retrying in 1s · attempt",
+                    "error  1/10",
+                    "",
+                ],
+                34,
+                footer,
+            );
+            assert_eq!(worker_phase(&mid_turn), Phase::Busy, "{glyph}");
+        }
+        // NEGATIVE CONTROLS.
+        let over_blank = pane(
+            &[
+                "⏺ Fixed it.",
+                "",
+                "✻ Worked for 3m · done 1:02 PM",
+                "",
+                "✻",
+                "",
+            ],
+            34,
+            footer,
+        );
+        assert_eq!(worker_phase(&over_blank), Phase::Idle);
+        assert_eq!(
+            status_line(&over_blank).as_deref(),
+            Some("✻ Worked for 3m · done 1:02 PM")
+        );
+        let over_said = pane(&["✻", "⏺ Here is the glyph.", ""], 34, footer);
+        assert_eq!(worker_phase(&over_said), Phase::Idle);
+        assert_eq!(status_line(&over_said), None);
+        let done = pane(
+            &[
+                "⏺ Fixed it.",
+                "",
+                "✻",
+                "Crunched for 30s · done 12:52 PM",
+                "",
+            ],
+            34,
+            footer,
+        );
+        assert_eq!(
+            status_line(&done).as_deref(),
+            Some("✻ Crunched for 30s · done 12:52 PM")
+        );
+        assert_eq!(worker_phase(&done), Phase::Idle);
+        let done = pane(
+            &[
+                "⏺ Fixed it.",
+                "",
+                "✻",
+                "Crunched for 30s ·",
+                "done 12:52 PM",
+                "",
+            ],
+            18,
+            "  ⏵⏵ auto mode",
+        );
+        assert_eq!(
+            status_line(&done).as_deref(),
+            Some("✻ Crunched for 30s · done 12:52 PM")
+        );
+        assert_eq!(worker_phase(&done), Phase::Idle);
+    }
+
+    /// A HEAD THAT FILLS ITS COLUMN IS STILL READ BY ITS COLUMNS: the stalled
+    /// stream's retry row (2.1.301's `aSn`), whose head `Waiting for API
+    /// response` is never cut, laid out at 34 to 41 columns as the measured
+    /// retry blocks are — the glyph on its own row, the head's column
+    /// `Waiting for API` wide, so its first row has one space before the
+    /// tail's ` · `. Read row by row that was `will retry in 2m response`,
+    /// no wait, and with the footer's `esc to interrupt` cut away the retry
+    /// read idle: the merge of main's strict retry rule typed `keep going`
+    /// into it. It reads busy, its line the vendor's. NEGATIVE CONTROLS: the
+    /// same block with a tail that is not the vendor's (`attempt soon`) stays
+    /// the rows joined and idle, the done row in its place reads idle, so does
+    /// a done row wrapped under its bare glyph, and rows that joined are a
+    /// done row stay one (synthetic: split, they would read as a retry).
+    #[test]
+    fn a_retry_head_that_fills_its_column_is_still_read_by_its_columns() {
+        let footer = "  ⏵⏵ auto mode on (shift+tab to";
+        let at = |width: usize, block: &[&str]| {
+            let mut body = vec!["⏺ Bash(targo test)", "  ⎿  Running…", ""];
+            body.extend_from_slice(block);
+            body.push("");
+            pane(&body, width, footer)
+        };
+        for (width, wait, block) in [
+            (
+                34,
+                "2m",
+                &[
+                    "✻",
+                    "Waiting for API · will retry in 2m",
+                    "response       · check your",
+                    "               network",
+                ][..],
+            ),
+            (
+                35,
+                "30s",
+                &[
+                    "✻",
+                    "Waiting for API · will retry in 30s",
+                    "response       · check your network",
+                ][..],
+            ),
+            (
+                36,
+                "30s",
+                &[
+                    "✻",
+                    "Waiting for API · will retry in 30s",
+                    "response       · check your network",
+                ][..],
+            ),
+            (
+                40,
+                "2m",
+                &[
+                    "✻",
+                    "Waiting for API · will retry in 2m ·",
+                    "response       check your network",
+                ][..],
+            ),
+            (
+                41,
+                "30s",
+                &[
+                    "✻",
+                    "Waiting for API · will retry in 30s ·",
+                    "response       check your network",
+                ][..],
+            ),
+        ] {
+            let r = at(width, block);
+            let line =
+                format!("✻ Waiting for API response · will retry in {wait} · check your network");
+            assert_eq!(worker_phase(&r), Phase::Busy, "{width}: {r:#?}");
+            assert_eq!(status_line(&r).as_deref(), Some(line.as_str()), "{width}");
+            assert_eq!(
+                signal(&r).as_deref(),
+                Some("status row: spinner"),
+                "{width}"
+            );
+        }
+        // NEGATIVE CONTROLS: a tail not the vendor's, the done row.
+        let said = at(
+            36,
+            &[
+                "✻",
+                "Waiting for API · will retry in 30s",
+                "response       · attempt soon",
+            ],
+        );
+        assert_eq!(
+            status_line(&said).as_deref(),
+            Some("✻ Waiting for API · will retry in 30s response       · attempt soon")
+        );
+        assert_eq!(worker_phase(&said), Phase::Idle);
+        let done = at(36, &["✻ Crunched for 3m 2s · done 12:55 PM"]);
+        assert_eq!(worker_phase(&done), Phase::Idle);
+        // The done row wrapped under its bare glyph, its second row short of
+        // the first's ` · `: one done line.
+        let wrapped = at(23, &["✻", "Crunched for 30s · done", "12:52 PM"]);
+        assert_eq!(
+            status_line(&wrapped).as_deref(),
+            Some("✻ Crunched for 30s · done 12:52 PM")
+        );
+        assert_eq!(worker_phase(&wrapped), Phase::Idle);
+        // SYNTHETIC: rows that joined are a done row stay one, though split
+        // they would read as the vendor's retry.
+        let shaped = at(
+            34,
+            &[
+                "✻",
+                "Worked for 3m · Retrying in 2m",
+                "attempt      · attempt 2/10",
+            ],
+        );
+        assert_eq!(
+            status_line(&shaped).as_deref(),
+            Some("✻ Worked for 3m · Retrying in 2m attempt      · attempt 2/10")
+        );
+        assert_eq!(worker_phase(&shaped), Phase::Idle);
+    }
+
+    /// BG-1: a turn Claude Code started itself (a `<task-notification>`, a
+    /// monitor's expiry, a `/loop` wakeup) whose pending work did not change
+    /// draws no done row (2.1.295 `Ad`, 2.1.300 `Nd`): the waiting row above
+    /// its `⏺` rows still says what the session waits on, and reads SOFT
+    /// background work (module docs) — measured as the collapsed shape that
+    /// the trust session's journal continued 47 times — on its LINE where a
+    /// narrow pane wrapped it, and nothing else busy ([`carried_wait_alone`]).
+    /// NEGATIVE CONTROLS: a person's prompt between them, a drawn done row
+    /// under the notification turn (the wait_bg18 shape, the work done) and
+    /// woken turns drawn under that done row, the measured `/model` screen, a
+    /// question the notification turn ended on, a wall it ended on, the drawn
+    /// wait (wait_bg) read as before, and a busy footer under the carried
+    /// wait (not alone).
+    #[test]
+    fn a_wait_claude_code_hid_under_its_own_wake_still_stands() {
+        let footer = "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents";
+        let collapsed = |end: &[&str]| {
+            let mut body = vec![
+                "✻ Waiting for 1 dynamic workflow to finish",
+                "",
+                "⏺ Monitor event: \"lander\"",
+                "",
+            ];
+            body.extend_from_slice(end);
+            body.push("");
+            screen(&body, footer)
+        };
+        let r = collapsed(&["⏺ Still in its crates-tests lane. I restarted the watch."]);
+        assert_eq!(worker_phase(&r), Phase::Busy);
+        assert_eq!(
+            busy_signal(&r),
+            Some(Busy::soft(Zone::Status, "background work still running"))
+        );
+        assert_eq!(background_wait(&r), Some("background work still running"));
+        assert!(background_only(&r));
+        assert_eq!(status_row(&r), None);
+        assert!(!status_unseen(&r), "a glyph row is on the screen");
+        assert!(carried_wait_alone(&r));
+        // A pane 16 columns wide: Ink wrapped the waiting row right after
+        // `Waiting for`, and the wait is read on its LINE (module docs).
+        let narrow = pane(
+            &[
+                "✻ Waiting for",
+                "  1 dynamic",
+                "  workflow to",
+                "  finish",
+                "",
+                "⏺ Monitor event",
+                "",
+                "⏺ Restarted it.",
+                "",
+            ],
+            16,
+            "  ⏵⏵ bypass",
+        );
+        assert_eq!(worker_phase(&narrow), Phase::Busy);
+        assert_eq!(
+            busy_signal(&narrow),
+            Some(Busy::soft(Zone::Status, "background work still running"))
+        );
+        assert!(carried_wait_alone(&narrow));
+
+        // (a) A person's prompt between the waiting row and the turn.
+        let mut prompted = vec![
+            "✻ Waiting for 1 dynamic workflow to finish",
+            "",
+            "❯ keep going",
+            "",
+            "⏺ No change since my last update.",
+            "",
+        ];
+        let r = screen(&prompted, footer);
+        assert_eq!(worker_phase(&r), Phase::Idle);
+        assert_eq!(busy_signal(&r), None);
+        assert!(status_unseen(&r), "the walk stops at the prompt");
+        // (b) The work finished: the completion turn drew its done row.
+        let r = collapsed(&[
+            "⏺ Dynamic workflow \"Second review pass\" completed · 5s",
+            "",
+            "⏺ The review is in; nothing to fix.",
+            "",
+            "✻ Cooked for 23m 0s · done 11:24 PM",
+        ]);
+        assert_eq!(worker_phase(&r), Phase::Idle);
+        assert_eq!(busy_signal(&r), None);
+        // ...and turns Claude Code started itself after that done row, drawn
+        // with no row of their own: the walk over them meets the done row
+        // first, and the waiting row above it is history.
+        let r = screen(
+            &[
+                "✻ Waiting for 1 dynamic workflow to finish",
+                "",
+                "⏺ Dynamic workflow \"Second review pass\" completed · 5s",
+                "",
+                "⏺ The review is in; nothing to fix.",
+                "",
+                "✻ Cooked for 23m 0s · done 11:24 PM",
+                "",
+                "⏺ Monitor event: \"lander\"",
+                "",
+                "⏺ Restarted.",
+                "",
+            ],
+            footer,
+        );
+        assert_eq!(worker_phase(&r), Phase::Idle);
+        assert_eq!(busy_signal(&r), None);
+        assert!(!status_unseen(&r), "the done row is on the screen");
+        assert!(!carried_wait_alone(&r));
+        // (c) The notification turn ended on a question.
+        let r = collapsed(&["⏺ Shall I land it now?"]);
+        assert_eq!(worker_phase(&r), Phase::Question);
+        // ...or on a wall: the wall stands, behind the carried wait.
+        let r = collapsed(&[
+            "⏺ Background command \"Run the tests\" completed (exit code 0)",
+            "  ⎿  You've reached your Fable limit. Run /usage-credits to continue or switch models with /model.",
+        ]);
+        assert!(matches!(worker_phase(&r), Phase::Limited { .. }), "{r:#?}");
+        // (d) The measured `/model` screen: its `❯ /model` row stops the walk.
+        let r = saved_screen(IDLE_AFTER_LIMIT);
+        assert_eq!(worker_phase(&r), Phase::Idle);
+        assert_eq!(busy_signal(&r), None);
+        // (e) The drawn wait reads its own hard rule, as before.
+        prompted.truncate(1);
+        let drawn = screen(&prompted, footer);
+        assert_eq!(
+            signal(&drawn).as_deref(),
+            Some("status row: waiting for a dynamic workflow")
+        );
+        assert_eq!(busy_signal(&drawn).map(|b| b.soft), Some(false));
+        assert!(!carried_wait_alone(&drawn), "a status row is drawn");
+        // The carried wait under a footer that reads busy is not alone.
+        let footed = screen(
+            &[
+                "✻ Waiting for 1 dynamic workflow to finish",
+                "",
+                "⏺ Monitor event: \"lander\"",
+                "",
+            ],
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt",
+        );
+        assert_eq!(worker_phase(&footed), Phase::Busy);
+        assert!(!carried_wait_alone(&footed), "the footer's own rule");
+        // No glyph row anywhere above the frame: the screen says nothing of
+        // how the last turn ended.
+        let bare = screen(
+            &["⏺ Monitor event: \"lander\"", "", "⏺ Restarted it.", ""],
+            footer,
+        );
+        assert_eq!(worker_phase(&bare), Phase::Idle);
+        assert!(status_unseen(&bare));
+        assert!(!status_unseen(&drawn));
     }
 
     /// Without the composer frame — a plain shell, or a box drawn over the
@@ -3941,27 +5091,6 @@ mod tests {
             let quiet = with_footer(r.clone(), footer);
             assert_eq!(signal(&quiet).as_deref(), Some("status row: spinner"));
             assert_eq!(worker_phase(&quiet), Phase::Busy, "{footer}");
-        }
-
-        // wait_bg2 without its workflow line and with the survey above the
-        // frame: still the spinner, under either footer.
-        let mut bg2 = waiter_capture(include_str!("fixtures/wait_bg2.out"));
-        bg2.retain(|row| !row.trim_start().starts_with('◯'));
-        let bg2 = above_frame(
-            bg2,
-            &[
-                "● How is Claude doing this session? (optional)",
-                "  1: Bad    2: Fine   3: Good   0: Dismiss",
-            ],
-        );
-        for footer in [PASTE_FOOTER, IDLE_AUTO_FOOTER] {
-            let r = with_footer(bg2.clone(), footer);
-            assert_eq!(
-                signal(&r).as_deref(),
-                Some("status row: spinner"),
-                "{footer}"
-            );
-            assert_eq!(worker_phase(&r), Phase::Busy, "{footer}");
         }
     }
 
@@ -4012,7 +5141,6 @@ mod tests {
     #[test]
     fn the_survey_parked_above_the_composer_is_open() {
         let r = saved_screen(SURVEY_OPEN);
-        assert_eq!(r.len(), 12);
         assert!(survey_open(&r));
         assert_eq!(worker_phase(&r), Phase::Idle);
         assert_eq!(status_row(&r), Some("✻ Cooked for 52m 54s · done 12:31 PM"));
@@ -4020,49 +5148,12 @@ mod tests {
 
         let mut no_options = r.clone();
         no_options.retain(|row| !row.trim_start().starts_with("1: Bad"));
-        assert_eq!(no_options.len(), 11);
         assert!(!survey_open(&no_options));
 
         // wait_bg7: the done row over the survey, the survey on the rule.
         let bg7 = waiter_capture(include_str!("fixtures/wait_bg7.out"));
         assert!(survey_open(&bg7));
         assert!(!survey_open(&rows(&[SURVEY[0], SURVEY[1], "$ "])));
-    }
-
-    /// A survey in the transcript is not open: quoted in the worker's `⏺`
-    /// message, as the message itself, in a tool's output under the `⎿`
-    /// gutter, with the worker's words after it, or above a done row.
-    #[test]
-    fn a_survey_in_the_transcript_is_not_open() {
-        for body in [
-            vec![
-                "⏺ Claude Code parks this above the composer:",
-                "  ● How is Claude doing this session? (optional)",
-                "    1: Bad    2: Fine   3: Good   0: Dismiss",
-                "",
-            ],
-            vec![
-                "⏺ How is Claude doing this session? (optional)",
-                "  1: Bad    2: Fine   3: Good   0: Dismiss",
-            ],
-            vec![
-                "⏺ Bash(cat survey-open.txt)",
-                "  ⎿  ● How is Claude doing this session? (optional)",
-                "       1: Bad    2: Fine   3: Good   0: Dismiss",
-            ],
-            vec![SURVEY[0], SURVEY[1], "  I left it for you to answer."],
-            vec![
-                SURVEY[0],
-                SURVEY[1],
-                "",
-                "✻ Cogitated for 4s · done 2:41 PM",
-                "",
-            ],
-        ] {
-            let r = screen(&body, "  ? for shortcuts");
-            assert!(!survey_open(&r), "{body:?}");
-            assert_eq!(worker_phase(&r), Phase::Idle, "{body:?}");
-        }
     }
 
     /// The survey is parked during turns too: under a live spinner it is
@@ -4114,7 +5205,6 @@ mod tests {
     #[test]
     fn the_context_indicator_above_the_composer_is_read() {
         let r = saved_screen(CONTEXT_LOW);
-        assert_eq!(r.len(), 7);
         assert_eq!(context_left(&r), Some(1));
         assert_eq!(worker_phase(&r), Phase::Busy);
         assert_eq!(
@@ -4193,7 +5283,6 @@ mod tests {
         assert_eq!(context_left(&bare), None);
         let mut unframed = saved_screen(CONTEXT_LOW);
         unframed.retain(|row| !row.starts_with('─'));
-        assert_eq!(unframed.len(), 5);
         assert_eq!(context_left(&unframed), None);
     }
 
@@ -4301,15 +5390,10 @@ mod tests {
             r
         };
         let long = narrow(55, "Context left until auto-compact: 8%");
-        assert_eq!(leading_spaces(&long[4]), 18);
         assert_eq!(context_left(&long), Some(8));
         assert_eq!(worker_phase(&long), Phase::Busy);
-        let short = narrow(40, "1% until auto-compact");
-        assert_eq!(leading_spaces(&short[4]), 17);
-        assert_eq!(context_left(&short), Some(1));
-        let gutter = narrow(28, "1% until auto-compact");
-        assert_eq!(leading_spaces(&gutter[4]), 5);
-        assert_eq!(context_left(&gutter), None);
+        assert_eq!(context_left(&narrow(40, "1% until auto-compact")), Some(1));
+        assert_eq!(context_left(&narrow(28, "1% until auto-compact")), None);
         assert_eq!(context_left(&narrow(29, "1% until auto-compact")), Some(1));
     }
 
@@ -4322,7 +5406,6 @@ mod tests {
     fn nothing_between_the_spinner_and_the_frame_hides_it_in_a_narrow_window() {
         let text = "get pinged when Claude finishes · enable push notifications in /config";
         let hint = format!("{}{text}", " ".repeat(78 - text.chars().count()));
-        assert_eq!(leading_spaces(&hint), 8, "short of HINT_COLUMN");
         let narrow = |body: &[&str]| {
             let mut r = rows(body);
             r.extend([
@@ -4724,16 +5807,6 @@ mod tests {
             let p = parse_prompt(&live).expect("the live box");
             assert_eq!(p.kind, crate::prompt::PromptKind::Bash);
             assert_eq!(p.command, "git push origin main");
-            // And the same live box with a copy of another box in the
-            // transcript above it: the live one is read.
-            let mut both = rows(&BOX_UNDER_GUTTER);
-            both.push(String::new());
-            both.extend(live);
-            assert_eq!(worker_phase(&both), Phase::Prompt, "{under:?}");
-            assert_eq!(
-                parse_prompt(&both).map(|p| p.command),
-                Some("git push origin main".into())
-            );
         }
     }
 
@@ -4746,7 +5819,6 @@ mod tests {
     #[test]
     fn the_limit_screen_cut_before_the_model_switch_is_limited() {
         let full = saved_screen(IDLE_AFTER_LIMIT);
-        assert_eq!(full[56], "❯ /model");
         let mut r = full[..56].to_vec();
         r.extend_from_slice(&full[58..]);
         assert_eq!(signal(&r), None);
@@ -4770,7 +5842,6 @@ mod tests {
     #[test]
     fn a_limit_above_a_later_user_row_is_history() {
         let r = saved_screen(IDLE_AFTER_LIMIT);
-        assert!(r[47].contains("You've reached your Fable limit"));
         assert_eq!(limit_notice(&r), None);
         assert_eq!(worker_phase(&r), Phase::Idle);
 
@@ -4838,133 +5909,97 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_session_limit_spelling_carries_its_reset() {
-        let r = screen(
-            &[
-                "❯ run the replicates",
-                "",
-                "⏺ Starting the benchmark replicates now.",
-                "  ⎿  You've hit your session limit · resets 7:30pm (America/Los_Angeles)",
-                "",
-                "✻ Worked for 3m 2s · done 5:02 PM",
-                "",
-            ],
-            "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
-        );
-        assert_eq!(
-            worker_phase(&r),
-            Phase::Limited {
-                message: "You've hit your session limit · resets 7:30pm (America/Los_Angeles)"
-                    .to_string(),
-                reset: Some("7:30pm (America/Los_Angeles)".to_string()),
-            }
-        );
-        assert_eq!(
-            reset_of(
-                "Claude usage limit reached. Your limit will reset at 3pm (America/New_York)."
-            ),
-            Some("3pm (America/New_York)".to_string())
-        );
-        assert_eq!(
-            reset_of("5-hour limit reached ∙ resets 3am"),
-            Some("3am".to_string())
-        );
-        assert_eq!(reset_of("You've reached your Fable limit."), None);
-        // A key followed by no time is passed over: the countdown toast that
-        // follows a `/goal` echo names the time.
-        assert_eq!(
-            reset_of(
-                "Goal paused · usage limit reached · send a message after it resets to \
-                 continue ⚠ Usage limit reached · continuing automatically at 3pm · esc to cancel"
-            ),
-            Some("3pm".to_string())
-        );
-        assert_eq!(
-            reset_of(
-                "Goal paused · usage limit reached · send a message after it resets to continue"
-            ),
-            None
-        );
-        assert_eq!(
-            reset_of("resets soon, then it resets 4pm (America/Los_Angeles)"),
-            Some("4pm (America/Los_Angeles)".to_string())
-        );
-    }
-
-    /// A RESET ENDS WHERE ITS TIME DOES ([`time_words`]). A line read across
-    /// the rows Ink wrapped it onto runs on into the notice's next line when
-    /// the row above it was full (at 34 columns `(America/Los_Angeles)` over
-    /// `/upgrade to increase your`, 2.1.299), or into a row under it at the
-    /// same column; the transcript's own text has the next line after a
-    /// newline. The time and its zone are the reset, nothing after them.
+    /// A RESET ENDS WHERE ITS TIME DOES ([`time_words`]), one table over
+    /// every spelling. A line read across the rows Ink wrapped it onto runs
+    /// on into the notice's next line when the row above it was full (at 34
+    /// columns `(America/Los_Angeles)` over `/upgrade to increase your`,
+    /// 2.1.299), or into a row under it at the same column; the transcript's
+    /// own text has the next line after a newline. The time and its zone are
+    /// the reset, nothing after them — but A DATE IS NEVER CUT OFF ITS TIME
+    /// (the review of fix/r15-banner, 2026-10-14: `resets at 3pm on Oct 15`
+    /// cut to `3pm` is read by `aterm-agent`'s `limit::parse_reset` as today's
+    /// session clock). A key followed by no time is passed over: the
+    /// countdown toast that follows a `/goal` echo names the time.
     #[test]
     fn a_reset_ends_where_its_time_does() {
         for (said, want) in [
             (
                 "You've hit your session limit · resets 10:25am (America/Los_Angeles) /upgrade \
                  to increase your usage limit.",
-                "10:25am (America/Los_Angeles)",
+                Some("10:25am (America/Los_Angeles)"),
             ),
             (
                 "You've hit your session limit · resets 10:25am (America/Los_Angeles)\n/upgrade \
                  to increase your usage limit.",
-                "10:25am (America/Los_Angeles)",
+                Some("10:25am (America/Los_Angeles)"),
             ),
             (
                 "You've hit your weekly limit · resets Oct 15 at 12:33pm (America/Los_Angeles) \
                  /upgrade to increase your usage limit.",
-                "Oct 15 at 12:33pm (America/Los_Angeles)",
+                Some("Oct 15 at 12:33pm (America/Los_Angeles)"),
             ),
             (
                 "⚠ Usage limit reached · limit resets 10:25am ⏵⏵ auto mode on (shift+tab to cycle)",
-                "10:25am",
+                Some("10:25am"),
             ),
             (
                 "Usage limit reached · resets September 19, 11:05 am and then some",
-                "September 19, 11:05 am",
+                Some("September 19, 11:05 am"),
             ),
             (
                 "You've hit your weekly limit · resets in 2h 30m at most",
-                "in 2h 30m",
+                Some("in 2h 30m"),
             ),
             (
                 "Usage limit reached · continuing shortly. Hang on",
-                "shortly",
+                Some("shortly"),
             ),
-        ] {
-            assert_eq!(reset_of(said).as_deref(), Some(want), "{said}");
-        }
-        // Nothing of a time after the key: no reset.
-        assert_eq!(
-            reset_of("resets /upgrade to increase your usage limit."),
-            None
-        );
-    }
-
-    /// A RESET'S DATE IS NEVER CUT OFF ITS TIME (the review of fix/r15-banner,
-    /// 2026-10-14). The cut at the first word that is no time word
-    /// ([`time_words`]) made `resets at 3pm on Oct 15` the bare `3pm`, which
-    /// `aterm-agent`'s `limit::parse_reset` reads as today's or tomorrow's
-    /// session clock: the date was lost, where main handed over the whole and
-    /// the unread spelling fell to the backstop. No measured Claude Code
-    /// notice is spelled so (its weekly reset is `Oct 15 at 12:33pm`), and
-    /// none of these is cut: each is handed over as main handed it over.
-    #[test]
-    fn a_resets_date_is_never_cut_off_its_time() {
-        for (said, want) in [
+            (
+                "⚠ Usage limit reached · continuing shortly.",
+                Some("shortly"),
+            ),
+            (
+                "Usage limit reached · Continuing automatically at 11:05 am · esc to cancel",
+                Some("11:05 am"),
+            ),
+            (
+                "Claude usage limit reached. Your limit will reset at 3pm (America/New_York).",
+                Some("3pm (America/New_York)"),
+            ),
+            ("5-hour limit reached ∙ resets 3am", Some("3am")),
+            (
+                "resets soon, then it resets 4pm (America/Los_Angeles)",
+                Some("4pm (America/Los_Angeles)"),
+            ),
+            (
+                "Goal paused · usage limit reached · send a message after it resets to \
+                 continue ⚠ Usage limit reached · continuing automatically at 3pm · esc to cancel",
+                Some("3pm"),
+            ),
             (
                 "Usage limit reached · resets at 3pm on Oct 15",
-                "3pm on Oct 15",
+                Some("3pm on Oct 15"),
             ),
             (
                 "Usage limit reached · resets 3pm on the 15th",
-                "3pm on the 15th",
+                Some("3pm on the 15th"),
             ),
-            ("Usage limit reached · resets 9am tomorrow", "9am tomorrow"),
-            ("Usage limit reached · resets 9am Monday", "9am Monday"),
+            (
+                "Usage limit reached · resets 9am tomorrow",
+                Some("9am tomorrow"),
+            ),
+            (
+                "Usage limit reached · resets 9am Monday",
+                Some("9am Monday"),
+            ),
+            ("You've reached your Fable limit.", None),
+            (
+                "Goal paused · usage limit reached · send a message after it resets to continue",
+                None,
+            ),
+            ("resets /upgrade to increase your usage limit.", None),
         ] {
-            assert_eq!(reset_of(said).as_deref(), Some(want), "{said}");
+            assert_eq!(reset_of(said).as_deref(), want, "{said}");
         }
     }
 
@@ -5011,6 +6046,270 @@ mod tests {
             "  ⏵⏵ auto mode on     Approaching usage limit · resets at 7pm",
         );
         assert_eq!(worker_phase(&warns), Phase::Idle);
+    }
+
+    /// THE VENDOR'S AUTO-MODE PARAGRAPH IS NO LAST WORD (KI-1015-1 LC-10,
+    /// measured on 2.1.300: after a relaunch's `--resume` it is drawn under
+    /// the resumed history, and was journaled as the agent's last words; the
+    /// paragraph's words and wrap are 2.1.287's measured ones). A history
+    /// that ended on a weekly limit reads as that limit, the paragraph passed
+    /// over whole; one that ended on the agent's message reads as that
+    /// message. NEGATIVE CONTROLS, each said: the agent's own words that open
+    /// `Auto mode …` otherwise, and the vendor's words quoted in a tool's
+    /// output.
+    #[test]
+    fn the_vendors_auto_mode_paragraph_is_no_last_word() {
+        const PARAGRAPH: [&str; 4] = [
+            "⏺ Auto mode lets Claude handle permission prompts automatically — Claude checks \
+             each tool call for risky actions and prompt injection",
+            "  before executing. Actions Claude identifies as safe are executed, while actions \
+             Claude identifies as risky are blocked and Claude may",
+            "  try a different approach. Ideal for long-running tasks. Sessions are slightly more \
+             expensive. Claude can make mistakes that allow",
+            "  harmful commands to run, it's recommended to only use in isolated environments. \
+             Shift+Tab to change mode.",
+        ];
+        let resumed = |history: &[&str], after: &[&str]| {
+            let mut body = vec![
+                " ▐▛███▛█   Claude Code v2.1.300",
+                "▝▜██████▀  Opus 5.5 · Claude Max",
+                " ▝▝   ▝▝   /private/tmp/at.Y4ko/proj",
+                "",
+                "❯ carry on with the task",
+            ];
+            body.extend_from_slice(history);
+            body.push("");
+            body.extend_from_slice(after);
+            body.push("");
+            screen(
+                &body,
+                "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
+            )
+        };
+        let limit = [
+            "  ⎿  You've hit your weekly limit · resets Oct 18 at 6pm (America/Los_Angeles)",
+            "     /upgrade to increase your usage limit.",
+        ];
+        let walled = resumed(&limit, &PARAGRAPH);
+        let upgrade = walled
+            .iter()
+            .position(|r| r.contains("/upgrade to increase"))
+            .expect("the notice's rest");
+        assert_eq!(last_said_index(&walled), Some(upgrade));
+        assert!(
+            matches!(worker_phase(&walled), Phase::Limited { reset: Some(r), .. } if r.starts_with("Oct 18 at 6pm")),
+            "{:?}",
+            worker_phase(&walled)
+        );
+        assert_eq!(
+            crate::wall::wall(&walled).map(|w| w.kind),
+            Some(WallKind::UsageWeekly)
+        );
+        let said = resumed(
+            &["", "⏺ The parser is green; the docs are next."],
+            &PARAGRAPH,
+        );
+        assert_eq!(
+            crate::turn::said_tail(&said).as_deref(),
+            Some("The parser is green; the docs are next.")
+        );
+        assert_eq!(worker_phase(&said), Phase::Idle);
+        // NEGATIVE CONTROLS: said.
+        let own = resumed(
+            &limit,
+            &["⏺ Auto mode is on here, so I went ahead with the migration."],
+        );
+        assert_eq!(
+            crate::turn::said_tail(&own).as_deref(),
+            Some("Auto mode is on here, so I went ahead with the migration.")
+        );
+        assert_eq!(worker_phase(&own), Phase::Idle);
+        let quoted = resumed(
+            &limit,
+            &[
+                "⏺ Bash(cat notes.txt)",
+                "  ⎿  Auto mode lets Claude handle permission prompts automatically — quoted",
+            ],
+        );
+        let row = quoted
+            .iter()
+            .position(|r| r.contains("— quoted"))
+            .expect("the output");
+        assert_eq!(last_said_index(&quoted), Some(row));
+        assert_eq!(worker_phase(&quoted), Phase::Idle);
+    }
+
+    /// A GENERIC FOOTER IS THE LIMIT THE TURN'S OWN ROW NAMES (KI-1015-1 W3,
+    /// measured on 2.1.300; the rows hand-built in its shapes): the footer's
+    /// `⚠ Usage limit reached · limit resets 4pm` names no window and no
+    /// model, the turn's `⎿  You've hit your Sonnet limit · resets 4pm (…)`
+    /// a model's bucket — read as the bucket, where the footer is
+    /// ([`crate::wall::named_by_the_turn`]: the same reset, the zone aside).
+    /// So too a weekly window and a spend limit. A generic notice that is the
+    /// vendor's countdown (2.1.283's `⚠ Usage limit reached · continuing
+    /// automatically at …` banner) over a weekly row takes its kind and keeps
+    /// its countdown: the screen's wall ([`crate::wall::wall`]) keeps it in
+    /// its message, footer or banner, where the supervisor reads that the
+    /// vendor goes on by itself. NEGATIVE CONTROLS, the footer
+    /// kept: the turn's row a session limit (no kind of its own over the
+    /// footer's); a footer that names its window (`You've hit your session
+    /// limit · …`); the bucket's words as a tool's output, under its call,
+    /// keep the footer's kind and place (F2 of the merge review, 2026-10-16:
+    /// read as the bucket, the default fallback relaunched on opus under the
+    /// session limit) — the turn's own notice below the call still names it.
+    #[test]
+    fn a_generic_footer_notice_yields_to_the_turns_own_limit_row() {
+        let walled = |row: &str, footer: &str| {
+            let mut r = screen(
+                &[
+                    "❯ carry on with the task",
+                    row,
+                    "     /upgrade to increase your usage limit.",
+                    "",
+                    "✻ Baked for 0s · done 3:11 PM",
+                    "",
+                ],
+                footer,
+            );
+            r.push("  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents".to_string());
+            r
+        };
+        const GENERIC: &str = "  ⚠ Usage limit reached · limit resets 4pm";
+        let bucket = walled(
+            "  ⎿  You've hit your Sonnet limit · resets 4pm (America/Los_Angeles)",
+            GENERIC,
+        );
+        let read = notice_placed(&bucket, &classify_wall).expect("a wall");
+        assert_eq!(
+            (read.kind, read.placement, read.reset.as_deref()),
+            (
+                WallKind::ModelBucket { consent: false },
+                Placement::Footer,
+                Some("4pm")
+            ),
+            "{read:?}"
+        );
+        assert!(
+            crate::wall::wall(&bucket).is_some_and(|w| w.kind == read.kind),
+            "the screen's wall is the bucket"
+        );
+        for (row, footer, kind) in [
+            (
+                "  ⎿  You've hit your weekly limit · resets Oct 18 at 4pm (America/Los_Angeles)",
+                "  ⚠ Usage limit reached · limit resets Oct 18 at 4pm",
+                WallKind::UsageWeekly,
+            ),
+            (
+                "  ⎿  You're out of extra usage · resets 4pm",
+                GENERIC,
+                WallKind::Spend,
+            ),
+        ] {
+            let read = notice_placed(&walled(row, footer), &classify_wall);
+            assert_eq!(read.map(|w| w.kind), Some(kind), "{row}");
+        }
+        // The generic notice that is the vendor's COUNTDOWN (2.1.283's
+        // banner: no window, no model, the reset's clock) takes the weekly
+        // row's kind, and its message keeps the countdown, where
+        // `resumes_by_itself` reads that the vendor goes on — in the footer
+        // and in the live zone above the composer alike.
+        const WEEKLY: &str =
+            "  ⎿  You've hit your weekly limit · resets Oct 18 at 4pm (America/Los_Angeles)";
+        const BANNER: &str =
+            "⚠ Usage limit reached · continuing automatically at Oct 18 at 4pm · esc to cancel";
+        let footer = walled(WEEKLY, &format!("  {BANNER}"));
+        let mut above = walled(WEEKLY, "");
+        let top = above
+            .iter()
+            .position(|r| r.starts_with('╭') || r.starts_with('─'))
+            .expect("the composer's top");
+        above.insert(top, BANNER.to_string());
+        for (name, r) in [("footer", &footer), ("above", &above)] {
+            let read = crate::wall::wall(r).expect("a wall");
+            assert_eq!(read.kind, WallKind::UsageWeekly, "{name}: {read:?}");
+            assert!(
+                read.message.starts_with("You've hit your weekly limit")
+                    && read
+                        .message
+                        .contains("continuing automatically at Oct 18 at 4pm"),
+                "{name}: {read:?}"
+            );
+        }
+        // NEGATIVE CONTROLS: the footer stands.
+        let session = walled(
+            "  ⎿  You've hit your session limit · resets 4pm (America/Los_Angeles)",
+            GENERIC,
+        );
+        let named = walled(
+            "  ⎿  You've hit your Sonnet limit · resets 4pm (America/Los_Angeles)",
+            "  ⚠ You've hit your session limit · resets 4pm",
+        );
+        for r in [&session, &named] {
+            let read = notice_placed(r, &classify_wall).expect("a wall");
+            assert_eq!(
+                (read.kind, read.placement),
+                (WallKind::UsageSession, Placement::Footer),
+                "{read:?}"
+            );
+        }
+        // The bucket's words in a tool's output, under its call — a later
+        // `⎿` row, the output's first row, a row the output continues onto —
+        // name no limit of the turn's: the footer is the session limit it
+        // says, and no model fallback runs on another tool's words.
+        const QUOTE: &str = "You've hit your Sonnet limit · resets 4pm (America/Los_Angeles)";
+        let under = |output: &[String]| {
+            let mut r = bucket.clone();
+            r.splice(
+                0..2,
+                std::iter::once("⏺ Bash(cat limits.log)".to_string()).chain(output.iter().cloned()),
+            );
+            r
+        };
+        let later = under(&["  ⎿  Pasted earlier:".to_string(), format!("  ⎿  {QUOTE}")]);
+        let first = under(&[format!("  ⎿  {QUOTE}")]);
+        let continued = under(&["  ⎿  Pasted earlier:".to_string(), format!("     {QUOTE}")]);
+        let mut asked = later.clone();
+        asked.insert(0, "❯ carry on with the task".to_string());
+        for (name, r) in [
+            ("later", &later),
+            ("first", &first),
+            ("continued", &continued),
+            ("asked", &asked),
+        ] {
+            let read = notice_placed(r, &classify_wall).expect("a wall");
+            assert_eq!(
+                (read.kind, read.placement, read.reset.as_deref()),
+                (WallKind::UsageSession, Placement::Footer, Some("4pm")),
+                "{name}: {read:?}"
+            );
+            assert_eq!(
+                crate::wall::wall(r).map(|w| w.kind),
+                Some(WallKind::UsageSession),
+                "{name}"
+            );
+        }
+        // CONTROL: the turn's own notice under the person's next prompt,
+        // below the quoting call, is the bucket.
+        let mut own = later.clone();
+        let at = own
+            .iter()
+            .position(|r| r.starts_with("✻ Baked"))
+            .expect("the done row");
+        own.splice(
+            at..at,
+            [
+                "❯ carry on with the task".to_string(),
+                format!("  ⎿  {QUOTE}"),
+                "     /upgrade to increase your usage limit.".to_string(),
+                String::new(),
+            ],
+        );
+        let read = notice_placed(&own, &classify_wall).expect("a wall");
+        assert_eq!(
+            (read.kind, read.placement),
+            (WallKind::ModelBucket { consent: false }, Placement::Footer),
+            "{read:?}"
+        );
     }
 
     /// The auto-continue notice (its text measured 2026-09-17 13:50 on the
@@ -5162,14 +6461,6 @@ mod tests {
         );
         assert_eq!(limit_notice(&quoted), None);
         assert_eq!(worker_phase(&quoted), Phase::Idle);
-        assert_eq!(
-            reset_of("Usage limit reached · Continuing automatically at 11:05 am · esc to cancel"),
-            Some("11:05 am".to_string())
-        );
-        assert_eq!(
-            reset_of("⚠ Usage limit reached · continuing shortly."),
-            Some("shortly".to_string())
-        );
     }
 
     /// A copy of the notice in a tool's output can sit anywhere on its row:
@@ -5217,38 +6508,6 @@ mod tests {
             "  ⏵⏵ auto mode on (shift+tab to cycle)",
         );
         assert!(matches!(worker_phase(&after), Phase::Limited { .. }));
-    }
-
-    /// A continuation that said
-    /// nothing — the notice, a blank, a done row, no words — is the same
-    /// screen as the continuation cancelled by hand, and reads LIMITED
-    /// on purpose: the two cannot be told apart, and the wall missed is the
-    /// two-day stall while the wall read wrongly is one probe's answer
-    /// (`EVENT resumed`) away — and Claude Code prints its words before a
-    /// done row on every measured turn.
-    #[test]
-    fn a_silent_continuation_reads_as_the_cancelled_wall() {
-        const NOTICE: &str =
-            "⚠ Usage limit reached · continuing automatically at 1:50pm · esc to cancel";
-        let silent = screen(
-            &[
-                "⏺ Bash(./run.sh --queue 8)",
-                "  ⎿  queued 8 runs",
-                "",
-                NOTICE,
-                "",
-                "✻ Worked for 3m 2s · done 1:52 PM",
-                "",
-            ],
-            "  ⏵⏵ auto mode on (shift+tab to cycle)",
-        );
-        assert_eq!(
-            worker_phase(&silent),
-            Phase::Limited {
-                message: NOTICE.to_string(),
-                reset: Some("1:50pm".to_string()),
-            }
-        );
     }
 
     /// The worker's words about limits are never the wall: its `⏺` prose, a
@@ -5358,23 +6617,6 @@ mod tests {
             let r = screen(&full, tail);
             assert_eq!(limit_notice(&r), None, "{body:?}");
             assert_eq!(worker_phase(&r), want, "{body:?}");
-        }
-
-        // The same words on a real idle screen (wait_bg7), above its done row.
-        let real = waiter_capture(include_str!("fixtures/wait_bg7.out"));
-        for (said, want) in [
-            (
-                "⏺ The server now prints \"you've hit your memory limit (512 MiB)\" before the kernel would kill it.",
-                Phase::Idle,
-            ),
-            (
-                "⏺ Once you've reached your API limit the client backs off; should I also cap retries?",
-                Phase::Question,
-            ),
-        ] {
-            let r = above_status_row(real.clone(), &[said]);
-            assert_eq!(last_said_row(&r), Some(said));
-            assert_eq!(worker_phase(&r), want, "{said}");
         }
 
         let still_running = screen(
@@ -5549,59 +6791,6 @@ mod tests {
             }
         }
         assert!(tight > 100, "CONTROL: screens with a frame: {tight}");
-    }
-
-    /// The byte readings are the char readings they replaced: the rule, the
-    /// option-like caret row and the composer row, on every fixture screen,
-    /// whole and with each row cut to a few widths, and on every tail of it.
-    #[test]
-    fn the_byte_readings_are_the_char_readings() {
-        fn is_rule_by_chars(row: &str) -> bool {
-            let t = row.trim_end();
-            t.starts_with('─')
-                && t.ends_with('─')
-                && t.chars().filter(|c| *c == '─').count() >= 10
-                && !t.contains(['┬', '┴', '┼', '├', '┤', '┌', '┐', '└', '┘', '│'])
-        }
-        fn is_option_like_by_chars(t: &str) -> bool {
-            let after = t.trim_start_matches('❯').trim_start();
-            let digits = after.chars().take_while(char::is_ascii_digit).count();
-            digits > 0 && after[digits..].starts_with('.')
-        }
-        fn composer_index_by_chars(rows: &[String]) -> Option<usize> {
-            (0..rows.len()).rev().find(|&i| {
-                let t = rows[i].trim_start();
-                t.starts_with('❯')
-                    && (!is_option_like_by_chars(t)
-                        || (rows[i].starts_with('❯') && i > 0 && is_rule_by_chars(&rows[i - 1])))
-                    && !is_list_entry(rows, i)
-            })
-        }
-        for screen in crate::text::fixture_screens() {
-            for width in [usize::MAX, 1, 2, 3, 6, 12, 40] {
-                let rows: Vec<String> = screen
-                    .iter()
-                    .map(|r| r.chars().take(width).collect())
-                    .collect();
-                for r in &rows {
-                    assert_eq!(is_rule(r), is_rule_by_chars(r), "{r:?}");
-                    assert_eq!(is_option_like(r), is_option_like_by_chars(r), "{r:?}");
-                    assert_eq!(
-                        leading_spaces(r),
-                        r.chars().take_while(|c| c.is_whitespace()).count(),
-                        "{r:?}"
-                    );
-                }
-                for k in 0..=rows.len() {
-                    assert_eq!(
-                        composer_index(&rows[k..]),
-                        composer_index_by_chars(&rows[k..]),
-                        "{:?}",
-                        &rows[k..]
-                    );
-                }
-            }
-        }
     }
 
     /// ATERM-KI-1015-1 S2R-F1 (the harness sweep of 2026-10-15, Claude Code

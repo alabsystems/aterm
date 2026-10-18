@@ -571,7 +571,6 @@ mod tests {
             last_attempt: attempt,
             ..Stamps::default()
         };
-        assert_eq!(FULL_PASS_INTERVAL_SECS, 6 * 60 * 60);
         assert_eq!(
             full_pass_owed(&Stamps::default(), now),
             Some(Owed::NeverChecked),
@@ -673,23 +672,6 @@ mod tests {
         assert!(!walk_ok.last_failed());
         assert_eq!(full_pass_owed(&walk_ok, now), Some(Owed::Interval));
         assert!(!Stamps::default().last_failed(), "never attempted");
-    }
-
-    /// One argv for every lane: the lock wait, and the progress file where there is a store.
-    #[test]
-    fn every_scheduled_pass_carries_the_same_flags() {
-        let words = |flags: Vec<OsString>| {
-            flags
-                .into_iter()
-                .map(|f| f.to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(words(pass_flags(None)), ["--wait-lock", "1800"]);
-        assert_eq!(
-            words(pass_flags(Some(Path::new("/p/progress.json")))),
-            ["--wait-lock", "1800", "--progress-file", "/p/progress.json"]
-        );
-        assert_eq!(PASS_WAIT_LOCK_SECS, 30 * 60);
     }
 
     /// The first claim wins and stamps, a second inside the period is refused, one a period

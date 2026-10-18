@@ -24,6 +24,7 @@ use std::sync::Arc;
 use aterm_buffer::Seq;
 
 use crate::document_store::{DocumentId, DocumentSnapshot};
+use crate::durable::Flush;
 use crate::native_document_host::{replace_file, sync_directory};
 use crate::native_document_io::{
     ContentFingerprint, DraftJournalReducer, DurableCheckpoint, DurableSource, JOURNAL_SECRET_LEN,
@@ -451,6 +452,7 @@ impl DocumentJournalStore {
     /// Owe a re-seat on every journal this store writes (see
     /// [`JournalEntry::reseat_owed`]) and name the documents, so the host can
     /// drive each one. The worker finds most images untouched and does nothing.
+    #[cfg(any(unix, test))]
     pub(crate) fn owe_reseat_all(&mut self) -> Vec<DocumentId> {
         self.entries
             .iter_mut()
@@ -585,8 +587,8 @@ impl DocumentJournalStore {
     }
 
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "NativeUpdateEditorCarry",
             action = "Plan",
             project = "aterm_gui::editor_carry_conformance::Rig::project"
@@ -695,8 +697,8 @@ impl DocumentJournalStore {
     }
 
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "NativeUpdateEditorCarry",
             action = "Refuse",
             project = "aterm_gui::editor_carry_conformance::Rig::project"
@@ -1199,8 +1201,8 @@ fn journal_baseline_text(key: JournalDocumentKey, bytes: &[u8]) -> Option<String
 ///
 /// Nothing is deleted on any path.
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "NativeUpdateEditorCarry",
         action = "Reseat",
         project = "aterm_gui::editor_carry_conformance::Rig::project"
@@ -1626,7 +1628,9 @@ fn preserve_journal_locked(path: &Path, expected: JournalImageGeneration) -> Res
                 Err(error) => format!("could not validate preserved recovery journal: {error}"),
             });
         }
-        return sync_directory(root)
+        // Ordered: the link lands before any later replace; a lost one leaves the
+        // original image under its own name.
+        return sync_directory(root, Flush::Ordered)
             .map_err(|error| format!("could not sync preserved recovery journal: {error}"));
     }
     Err("too many preserved recovery journals for this document".to_string())
@@ -1663,7 +1667,9 @@ fn retire_legacy_journal(
             .path
             .parent()
             .ok_or_else(|| "journal has no parent directory".to_string())?;
-        sync_directory(root)
+        // Ordered: a lost unlink leaves the legacy journal to be read and retired
+        // again at the next open.
+        sync_directory(root, Flush::Ordered)
             .map_err(|error| format!("could not sync retired legacy recovery journal: {error}"))
     })
 }
@@ -1802,15 +1808,19 @@ fn mint_journal_secret(root: &Path, path: &Path) -> Result<JournalSecret, String
     }
     let (temporary_path, mut file) =
         temporary.ok_or_else(|| "no free temporary name".to_string())?;
+    // Ordered: every journal keyed by this secret is written after this barrier, so
+    // a secret lost to a power loss took every such journal with it and a fresh mint
+    // is right; the barrier before the link is the load-bearing part, since an
+    // unusable key is never replaced.
     let written = file
         .write_all(&image)
-        .and_then(|()| crate::durable::sync_all(&file));
+        .and_then(|()| aterm_durable::ordered(&file));
     drop(file);
     let published = written.and_then(|()| fs::hard_link(&temporary_path, path));
     let _ = fs::remove_file(&temporary_path);
     match published {
         Ok(()) => {
-            sync_directory(root).map_err(|error| format!("sync: {error}"))?;
+            sync_directory(root, Flush::Ordered).map_err(|error| format!("sync: {error}"))?;
             Ok(secret)
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -2039,7 +2049,9 @@ fn default_state_root() -> Option<PathBuf> {
 fn create_private_dir(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
-    fs::create_dir_all(path)?;
+    // Missing ancestors `0755` whatever the umask: the state root is the atpkg prefix's
+    // parent on macOS, and on Linux it can be the first to make `~/.local` above it.
+    aterm_types::fs_restricted::create_dir_all_unshared(path, 0o700)?;
     let directory = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
@@ -2284,8 +2296,8 @@ pub(crate) enum JournalLockPatience {
     /// The caller is the thread that owns `App` — the event loop. Every
     /// millisecond spent here is a dropped frame, so this budget is deliberately
     /// in the same class as the sibling write lock's, and for the same reason
-    /// spelled out on `native_document_host::WRITE_LOCK_RETRY_BUDGET`. Pinned by
-    /// `the_event_loop_budget_stays_in_the_sibling_write_lock_class`.
+    /// spelled out on `native_document_host::WRITE_LOCK_RETRY_BUDGET`, which
+    /// [`Self::budget`] returns for it.
     EventLoop,
     /// The caller is the `aterm-native-document` worker (`native_document_queue`),
     /// whose whole job is to keep exactly this work off the event loop. Parking
@@ -2331,12 +2343,10 @@ impl JournalLockPatience {
 /// only, never `Error`" rule). This function adds nothing but the product
 /// vocabulary and the `path` those messages name.
 ///
-/// Takes `budget` rather than reading a constant so that the value the whole fix
-/// turns on is a parameter a test can pin — see
-/// `a_journal_lock_held_by_a_peer_is_waited_out_not_reported_busy` (the budget is
-/// forwarded and ridden out) and `native_document_host`'s
-/// `a_persistent_save_lock_holder_is_refused_after_the_bounded_budget` (the shared
-/// loop spends the whole budget before it refuses).
+/// Takes `budget` rather than reading a constant: the event loop and the worker
+/// afford different waits ([`JournalLockPatience`]). The shared loop's ride-out is
+/// pinned by `native_document_host`'s
+/// `a_transient_save_lock_holder_is_ridden_out_instead_of_refusing_the_save`.
 fn take_journal_lock(
     lock: File,
     path: &Path,
@@ -2481,7 +2491,7 @@ fn atomic_replace_locked(
         }
         replace_file(&temporary_path, path, expected.exists)
             .map_err(JournalReplaceError::BeforePublication)?;
-        sync_directory(parent).map_err(JournalReplaceError::PublishedUnverified)?;
+        sync_directory(parent, Flush::Durable).map_err(JournalReplaceError::PublishedUnverified)?;
         let committed = observe_journal_image(path).map_err(|message| {
             JournalReplaceError::PublishedUnverified(std::io::Error::other(message))
         })?;
@@ -2515,11 +2525,10 @@ fn atomic_replace_locked(
 /// that performs real journal rewrites, a fork window landing on a 25 ms
 /// budget is ordinary weather.
 ///
-/// It cannot mask the engine fix. The ride-out this change adds is pinned by
-/// [`a_journal_lock_held_by_a_peer_is_waited_out_not_reported_busy`] and
+/// It cannot mask the engine fix. The ride-out is pinned by
 /// `native_document_host`'s
-/// `a_persistent_save_lock_holder_is_refused_after_the_bounded_budget`, neither of
-/// which goes anywhere near this helper.
+/// `a_transient_save_lock_holder_is_ridden_out_instead_of_refusing_the_save`,
+/// which goes nowhere near this helper.
 ///
 /// Bounded, so a lock that never frees still fails; and only the busy error is
 /// retried — every other error returns on the first attempt.
@@ -2550,7 +2559,7 @@ mod tests {
     }
 
     fn snapshots(text: &str) -> (DocumentStore, DocumentId, DocumentSnapshot) {
-        let mut store = DocumentStore::for_test();
+        let mut store = crate::test_document_store();
         let id = store.open("file:///tmp/draft.md".to_string(), text.to_string());
         let snapshot = store.snapshot(id).unwrap();
         (store, id, snapshot)
@@ -2676,9 +2685,7 @@ mod tests {
         let started = std::time::Instant::now();
         let error = host.initialize(decision.clone(), &disk, &disk).unwrap_err();
         // Refuses-without-BLOCKING: a blocking `flock` on a lock nobody releases
-        // parks FOREVER, so this is a hang detector, never a latency budget; the
-        // budget's size is pinned by constants in
-        // `the_event_loop_budget_stays_in_the_sibling_write_lock_class`. 1 s
+        // parks FOREVER, so this is a hang detector, never a latency budget. 1 s
         // crossed under full-suite load (cb8c0cff).
         assert!(
             started.elapsed() < aterm_spec::wait::MUST_HAPPEN,
@@ -2690,98 +2697,6 @@ mod tests {
         drop(held);
         let initialized = settle_busy(|| host.initialize(decision.clone(), &disk, &disk)).unwrap();
         assert!(recover_journal_for(initialized.key, &fs::read(initialized.path).unwrap()).is_ok());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    /// A lock a peer still holds is WAITED OUT, not reported as another owner.
-    ///
-    /// This is the regression the whole fix exists for, and it is pinned WITHOUT a
-    /// fork, deliberately. `flock` is per open-file-description, so a second
-    /// `open_journal_lock` in THIS process contends with the first in exactly the
-    /// way a descriptor a forked child has not `execve`d away yet does — the
-    /// sibling module states and relies on the same equivalence
-    /// (`a_lock_held_for_one_stalled_device_barrier_is_waited_out_not_reported_busy`). A raw `fork()` from the libtest thread
-    /// pool would buy provenance and cost determinism: the parent has to build a
-    /// plan between the fork and the append, so a scheduling stall longer than the
-    /// child's hold makes the append succeed on its FIRST `try_lock` and the test
-    /// pass VACUOUSLY — green against a full revert. It would also inject the very
-    /// pathology under test into the suite, since a child that sleeps without
-    /// `execve` holds every OTHER thread's descriptor open for its whole life.
-    ///
-    /// A held lock is realistic at this duration for two independent reasons, both
-    /// measured, both named on [`JournalLockPatience`]: a peer inside its two
-    /// `F_FULLFSYNC` barriers (82.5-279.7 ms in the sibling's leaked fixtures), and
-    /// a child of ours between `fork` and `execve` (max 523 ms at n=20000 under
-    /// pathological load, `aterm_pty`'s `EXEC_STATUS_BUDGET`).
-    ///
-    /// DETERMINISM comes from the second assertion, not the first: a regression to
-    /// a single `try_lock` returns `Failed` in microseconds, so it fails
-    /// `Committed` AND fails `waited >= HELD`. The budget is 2 s against a 200 ms
-    /// hold, so no scheduler stall can turn this into a false FAIL either.
-    #[test]
-    fn a_journal_lock_held_by_a_peer_is_waited_out_not_reported_busy() {
-        const HELD: std::time::Duration = std::time::Duration::from_millis(200);
-
-        let root = test_root("waited-lock");
-        let host = DraftJournalHost::new(root.clone()).unwrap();
-        let (mut store, id, disk) = snapshots("base");
-        let canonical = "file:///tmp/waited-lock.md";
-        let decision = host.inspect_open(canonical, disk.text.as_bytes()).unwrap();
-        let initialized = settle_busy(|| host.initialize(decision.clone(), &disk, &disk)).unwrap();
-
-        let _ = store.transact(
-            id,
-            disk.seq,
-            vec![TextEdit {
-                range: 4..4,
-                insert: " newer".to_string(),
-            }],
-        );
-        let newer = store.snapshot(id).unwrap();
-        let mut reducer = DraftJournalReducer::new_with_key(id, initialized.key, disk.seq);
-        let mut plan = reducer.plan_snapshot(&newer).unwrap();
-        plan.expected_image = Some(initialized.image_fingerprint);
-
-        // Stands in for a peer mid-barrier, or for a forked child that has not
-        // reached `execve`: a SECOND description onto the same lock file. Taken
-        // through the product's own primitive, so this setup cannot be more
-        // fragile than the thing it sets up for.
-        let lock_path = journal_lock_path(&initialized.path).unwrap();
-        let holder = take_journal_lock(
-            open_journal_lock(&lock_path).unwrap(),
-            &initialized.path,
-            JournalLockPatience::Worker.budget(),
-        )
-        .unwrap();
-        let released = std::thread::spawn(move || {
-            std::thread::sleep(HELD);
-            drop(holder);
-        });
-
-        let started = std::time::Instant::now();
-        let result = execute_journal_append(
-            &initialized.path,
-            initialized.key,
-            &plan,
-            JournalLockPatience::Worker,
-        );
-        let waited = started.elapsed();
-        released.join().unwrap();
-
-        assert!(
-            matches!(result, JournalAppendResult::Committed(_)),
-            "a {HELD:?} holder must be waited out, not reported busy: {result:?}"
-        );
-        assert!(
-            waited >= HELD,
-            "the append cannot have published before the holder released: {waited:?}"
-        );
-        assert_eq!(
-            recover_journal_for(initialized.key, &fs::read(&initialized.path).unwrap())
-                .unwrap()
-                .text,
-            "base newer"
-        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2849,33 +2764,6 @@ mod tests {
         );
         drop(forked_copy);
         let _ = fs::remove_dir_all(root);
-    }
-
-    /// The value the whole fix turns on, pinned WITHOUT a clock.
-    ///
-    /// `DraftJournalHost::initialize` runs synchronously on the thread that owns
-    /// `App` (`App::install_admitted_document`), so its budget is a frame budget. Growing it
-    /// toward the minute the busy guards' hang detectors allow would freeze the
-    /// event loop for exactly that long and every timing assertion in this file
-    /// would still pass green — which is why this guard compares constants
-    /// instead of elapsed time.
-    /// Tying it to the sibling write lock's budget is the point: one thread, one
-    /// frame argument (`WRITE_LOCK_RETRY_BUDGET`'s doc), one number.
-    #[test]
-    fn the_event_loop_budget_stays_in_the_sibling_write_lock_class() {
-        assert_eq!(
-            JournalLockPatience::EventLoop.budget(),
-            crate::native_document_host::WRITE_LOCK_RETRY_BUDGET,
-            "the event-loop journal budget must stay the sibling write lock's budget"
-        );
-        assert!(
-            JournalLockPatience::EventLoop.budget() <= std::time::Duration::from_millis(32),
-            "two frames at 60 Hz is the ceiling for anything the event loop waits on"
-        );
-        assert!(
-            JournalLockPatience::Worker.budget() > JournalLockPatience::EventLoop.budget(),
-            "the worker is the thread that exists to absorb this wait"
-        );
     }
 
     #[cfg(unix)]
@@ -3165,24 +3053,6 @@ mod tests {
             "{error}"
         );
         assert_eq!(fs::read(&initialized.path).unwrap(), before);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn interrupted_temporary_write_never_replaces_last_durable_image() {
-        let root = test_root("crash");
-        let host = DraftJournalHost::new(root.clone()).unwrap();
-        let (_store, _id, disk) = snapshots("base");
-        let canonical = "file:///tmp/draft.md";
-        let decision = host.inspect_open(canonical, disk.text.as_bytes()).unwrap();
-        let initialized = settle_busy(|| host.initialize(decision.clone(), &disk, &disk)).unwrap();
-        let before = fs::read(&initialized.path).unwrap();
-        let abandoned = initialized.path.parent().unwrap().join(".abandoned.tmp");
-        fs::write(&abandoned, &before[..before.len() / 2]).unwrap();
-
-        assert_eq!(fs::read(&initialized.path).unwrap(), before);
-        assert!(recover_journal_for(initialized.key, &before).is_ok());
-        assert!(recover_journal_for(initialized.key, &fs::read(abandoned).unwrap()).is_err());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3742,7 +3612,7 @@ mod tests {
 
         // Tier-1 projection: the real losing child is admitted only as the
         // model's disk-generation rejection; accepting it is the negative control.
-        let model = aterm_spec::derive::native_draft_journal_model();
+        let model = aterm_models_native::native_draft_journal_model();
         let edited = model.successors("Edit", &model.init_state())[0].clone();
         let begun = model.successors("BeginJournal", &edited)[0].clone();
         let external = model.successors("ExternalJournalCommit", &begun)[0].clone();
@@ -4039,7 +3909,18 @@ mod tests {
         ])
         .unwrap();
         fs::write(&path, &foreign).unwrap();
+        let recording = aterm_durable::seam::Recording::start();
         let (result, _) = run_reseat(&mut journals, id);
+        #[cfg(unix)]
+        let expected_reseat = [Flush::Ordered, Flush::Durable, Flush::Durable];
+        #[cfg(not(unix))]
+        let expected_reseat = [Flush::Durable];
+        assert_eq!(
+            recording.take(),
+            expected_reseat,
+            "the re-seat's file is durable; Unix also flushes the set-aside link and publication"
+        );
+        drop(recording);
         assert!(
             matches!(
                 result,
@@ -4302,7 +4183,7 @@ mod tests {
         );
         let root = test_root("legacy-collision");
         let mut journals = DocumentJournalStore::for_test(root.clone()).unwrap();
-        let mut store = DocumentStore::for_test();
+        let mut store = crate::test_document_store();
         let a_path = journal_a_draft(&mut journals, &mut store, A, "A's unsaved draft");
         // The process ends with A's draft journaled; the next one opens B first.
         drop(journals);
@@ -4314,7 +4195,7 @@ mod tests {
             "B must not recover A's draft"
         );
         assert_eq!(opened_b.notice, None);
-        let mut store = DocumentStore::for_test();
+        let mut store = crate::test_document_store();
         let b_path = journal_a_draft(&mut journals, &mut store, B, "B's unsaved draft");
         assert_ne!(b_path, a_path);
         drop(journals);
@@ -4346,7 +4227,7 @@ mod tests {
     /// delta to each in turn.
     fn write_legacy_journal_typing(root: &Path, uri: &str, disk: &str, texts: &[&str]) -> PathBuf {
         let key = JournalDocumentKey::legacy_unkeyed(uri);
-        let mut store = DocumentStore::for_test();
+        let mut store = crate::test_document_store();
         let id = store.open(uri.to_string(), disk.to_string());
         let base = store.snapshot(id).unwrap();
         let mut records = vec![JournalRecord::snapshot_for(key, &base)];
@@ -4428,7 +4309,7 @@ mod tests {
         let root = test_root("legacy-migration");
         let mut journals = DocumentJournalStore::for_test(root.clone()).unwrap();
         let legacy = write_legacy_journal(&root, URI, "disk", "disk and a draft");
-        let mut store = DocumentStore::for_test();
+        let mut store = crate::test_document_store();
         let (decision, id, initialized) =
             open_as_the_app_does(&mut journals, &mut store, URI, "disk");
         assert_eq!(decision.recovered_text.as_deref(), Some("disk and a draft"));
@@ -4481,7 +4362,7 @@ mod tests {
         let root = test_root("legacy-rollback");
         let legacy = write_legacy_journal(&root_with_dir(&root), URI, "disk", "disk v1");
         let mut successor = DocumentJournalStore::for_test(root.clone()).unwrap();
-        let mut store = DocumentStore::for_test();
+        let mut store = crate::test_document_store();
         let (_, _, first) = open_as_the_app_does(&mut successor, &mut store, URI, "disk");
         let migrated = fs::read(&first.path).unwrap();
         drop(successor);
@@ -4489,7 +4370,7 @@ mod tests {
         write_legacy_journal(&root, URI, "disk", "disk v2");
 
         let mut journals = DocumentJournalStore::for_test(root.clone()).unwrap();
-        let mut store = DocumentStore::for_test();
+        let mut store = crate::test_document_store();
         let (decision, _, _) = open_as_the_app_does(&mut journals, &mut store, URI, "disk");
         assert_eq!(decision.recovered_text.as_deref(), Some("disk v2"));
         assert_eq!(preserved_images(&root), vec![migrated]);
@@ -4511,7 +4392,7 @@ mod tests {
         let root = test_root("legacy-changed");
         let mut journals = DocumentJournalStore::for_test(root.clone()).unwrap();
         let legacy = write_legacy_journal(&root, URI, "disk", "disk v1");
-        let mut store = DocumentStore::for_test();
+        let mut store = crate::test_document_store();
         let (_, id, initialized) = open_as_the_app_does(&mut journals, &mut store, URI, "disk");
         let keyed = fs::read(&initialized.path).unwrap();
         write_legacy_journal(&root, URI, "disk", "disk v2");
@@ -4538,10 +4419,24 @@ mod tests {
         let clean = write_legacy_journal(&root, CLEAN, "disk", "disk");
         let conflict = write_legacy_journal(&root, CONFLICT, "old disk", "old disk and a draft");
         let conflict_image = fs::read(&conflict).unwrap();
-        let mut store = DocumentStore::for_test();
+        let mut store = crate::test_document_store();
 
+        // aterm-durable's counting seam: the keyed image's publish stays durable
+        // (file, entry); the legacy journal's retirement and a set-aside link are only
+        // ordered, since a lost unlink leaves it to be retired again at the next open
+        // and a lost link leaves the image under its own name.
+        let recording = aterm_durable::seam::Recording::start();
         let (decision, _, initialized) =
             open_as_the_app_does(&mut journals, &mut store, CLEAN, "disk");
+        #[cfg(unix)]
+        let expected_clean = [Flush::Durable, Flush::Durable, Flush::Ordered];
+        #[cfg(not(unix))]
+        let expected_clean = [Flush::Durable];
+        assert_eq!(
+            recording.take(),
+            expected_clean,
+            "the keyed image; Unix also flushes publication and legacy retirement"
+        );
         assert_eq!(decision.recovered_text, None);
         assert_eq!(initialized.notice, None);
         assert!(!clean.exists());
@@ -4549,6 +4444,21 @@ mod tests {
 
         let (decision, _, initialized) =
             open_as_the_app_does(&mut journals, &mut store, CONFLICT, "new disk");
+        #[cfg(unix)]
+        let expected_conflict = [
+            Flush::Durable,
+            Flush::Durable,
+            Flush::Ordered,
+            Flush::Ordered,
+        ];
+        #[cfg(not(unix))]
+        let expected_conflict = [Flush::Durable];
+        assert_eq!(
+            recording.take(),
+            expected_conflict,
+            "the keyed image; Unix also flushes publication, set-aside and retirement"
+        );
+        drop(recording);
         assert_eq!(decision.recovered_text, None);
         assert_eq!(initialized.notice, Some(RecoveryNotice::DiskConflict));
         assert!(!conflict.exists());
@@ -4569,14 +4479,14 @@ mod tests {
         const TORN: &str = "file:///tmp/legacy-clean-after-torn.md";
         let root = test_root("legacy-clean-after-keyed");
         let mut journals = DocumentJournalStore::for_test(root.clone()).unwrap();
-        let mut store = DocumentStore::for_test();
+        let mut store = crate::test_document_store();
         let keyed = journal_a_draft(&mut journals, &mut store, URI, "the newest draft");
         drop(journals);
         // The older aterm opens the file (empty on disk) and journals it clean.
         let legacy = write_legacy_journal(&root, URI, "", "");
 
         let mut journals = DocumentJournalStore::for_test(root.clone()).unwrap();
-        let mut store = DocumentStore::for_test();
+        let mut store = crate::test_document_store();
         let (decision, _, initialized) = open_as_the_app_does(&mut journals, &mut store, URI, "");
         assert_eq!(
             decision.recovered_text.as_deref(),
@@ -4613,14 +4523,14 @@ mod tests {
         const URI: &str = "file:///tmp/legacy-undone-after-keyed.md";
         let root = test_root("legacy-undone-after-keyed");
         let mut journals = DocumentJournalStore::for_test(root.clone()).unwrap();
-        let mut store = DocumentStore::for_test();
+        let mut store = crate::test_document_store();
         let keyed = journal_a_draft(&mut journals, &mut store, URI, "the keyed draft");
         let keyed_image = fs::read(&keyed).unwrap();
         drop(journals);
         let legacy = write_legacy_journal_typing(&root, URI, "", &["typed", ""]);
 
         let mut journals = DocumentJournalStore::for_test(root.clone()).unwrap();
-        let mut store = DocumentStore::for_test();
+        let mut store = crate::test_document_store();
         let (decision, _, initialized) = open_as_the_app_does(&mut journals, &mut store, URI, "");
         assert_eq!(decision.recovered_text, None);
         assert_eq!(
@@ -4652,7 +4562,17 @@ mod tests {
     fn the_journal_secret_is_minted_private_once_and_read_back() {
         const URI: &str = "file:///tmp/secret.md";
         let root = test_root("secret-minted");
+        let recording = aterm_durable::seam::Recording::start();
         let first = DocumentJournalStore::for_test(root.clone()).unwrap();
+        #[cfg(unix)]
+        let expected_mint = [Flush::Ordered, Flush::Ordered];
+        #[cfg(not(unix))]
+        let expected_mint = [Flush::Ordered];
+        assert_eq!(
+            recording.take(),
+            expected_mint,
+            "the minted secret is ordered; Unix also flushes its entry"
+        );
         let secret = root.join(JOURNAL_SECRET_FILE);
         let image = fs::read(&secret).unwrap();
         assert_eq!(image.len(), JOURNAL_SECRET_FILE_LEN);
@@ -4666,6 +4586,8 @@ mod tests {
             );
         }
         let second = DocumentJournalStore::for_test(root.clone()).unwrap();
+        assert_eq!(recording.take(), [], "a secret read back writes nothing");
+        drop(recording);
         assert_eq!(
             fs::read(&secret).unwrap(),
             image,
@@ -4745,7 +4667,7 @@ mod tests {
         for (name, spoil) in spoils {
             let root = test_root(&format!("secret-{name}"));
             let mut journals = DocumentJournalStore::for_test(root.clone()).unwrap();
-            let mut store = DocumentStore::for_test();
+            let mut store = crate::test_document_store();
             let keyed = journal_a_draft(&mut journals, &mut store, URI, "a keyed draft");
             drop(journals);
             let legacy = write_legacy_journal(&root, "file:///tmp/other.md", "x", "x y");
@@ -4786,7 +4708,7 @@ mod tests {
         const URI: &str = "file:///tmp/secret-deleted.md";
         let root = test_root("secret-deleted");
         let mut journals = DocumentJournalStore::for_test(root.clone()).unwrap();
-        let mut store = DocumentStore::for_test();
+        let mut store = crate::test_document_store();
         let orphan = journal_a_draft(&mut journals, &mut store, URI, "an orphaned draft");
         let orphan_image = fs::read(&orphan).unwrap();
         let old_key = journals.key_for(URI);

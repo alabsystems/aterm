@@ -329,17 +329,6 @@ fn probe(path: &Path) -> Result<Probe, String> {
     }
 }
 
-/// `host`'s claim on `layout`'s rendezvous as its first round leaves it — a window's
-/// shared hold, a session's seat between rounds — held until the value drops: for a test
-/// elsewhere in the crate that needs a watching host in place.
-#[cfg(test)]
-pub(crate) fn claimed(layout: &Layout, host: Host) -> Box<dyn std::any::Any + Send> {
-    let mut claim = HostClaim::new(host, layout);
-    assert_eq!(claim.admit().0, Admit::Yes, "{host:?} admitted");
-    claim.end_round();
-    Box::new(claim)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,7 +486,7 @@ mod tests {
     /// is refused the round the probe let it take.
     #[test]
     fn the_real_claims_refine_the_derived_model() {
-        use aterm_spec::derive::atpkg_head_watch_hosts_model;
+        use aterm_models_atpkg::atpkg_head_watch_hosts_model;
         let model = atpkg_head_watch_hosts_model();
         let mut paths: std::collections::BTreeMap<_, Vec<&'static str>> =
             std::collections::BTreeMap::new();

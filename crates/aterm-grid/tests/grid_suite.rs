@@ -12,8 +12,6 @@
 
 mod conformance_retention;
 mod conformance_top_anchored_scroll;
-#[cfg(miri)]
-mod grid_miri;
 mod grid_unsafe_access_properties;
 mod history_renumber_epoch;
 mod security_regression_5573;

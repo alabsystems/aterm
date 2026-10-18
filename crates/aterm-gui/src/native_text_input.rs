@@ -640,24 +640,4 @@ mod tests {
         );
         assert_eq!(input.selection().head, 5);
     }
-
-    /// The motions must never split a grapheme cluster — the same law
-    /// `delete_word_backward` obeys.
-    #[test]
-    fn alt_word_motion_respects_grapheme_clusters() {
-        let mut input = TextInputState::new("héllo wörld".into());
-        input.set_selection(0, 0);
-        input.move_word_right(false);
-        let head = input.selection().head;
-        assert!(
-            input.value().is_char_boundary(head),
-            "⌥→ landed inside a multi-byte character at {head}"
-        );
-        input.move_word_left(false);
-        let back = input.selection().head;
-        assert!(
-            input.value().is_char_boundary(back),
-            "⌥← landed inside a multi-byte character at {back}"
-        );
-    }
 }

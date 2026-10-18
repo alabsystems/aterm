@@ -22,8 +22,8 @@ impl TerminalHandler<'_> {
     /// VT510 differ. Screen content, the active screen, tab stops, the palette
     /// and the cwd are kept: clearing them is RIS's job.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "SoftReset",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
@@ -83,7 +83,8 @@ impl TerminalHandler<'_> {
 
         self.modes.sixel_display_mode = false;
 
-        self.modes.alternate_scroll = false;
+        // Alternate scroll is a host preference, like the cursor style: back to it.
+        self.modes.alternate_scroll = *self.host_alternate_scroll;
 
         self.modes.new_line_mode = false;
 
@@ -193,7 +194,7 @@ impl TerminalHandler<'_> {
     /// - 25: UDK status, `CSI ? 20 n` (unlocked)
     /// - 26: keyboard status, `CSI ? 27 ; 1 ; 0 ; 0 n` (North American, ready, no
     ///   LK201 options)
-    /// - 996: color scheme, `CSI ? 997 ; Ps n`
+    /// - 996: color scheme of the background on screen, `CSI ? 997 ; Ps n`
     pub(super) fn handle_decdsr(&mut self, cap: &ResponseCapability, params: &[u16]) {
         let param = params.first().copied().unwrap_or(0);
         match param {
@@ -227,16 +228,25 @@ impl TerminalHandler<'_> {
                 self.send_response(cap, b"\x1b[?27;1;0;0n");
             }
             996 => {
-                // DEC color-scheme query: report the current OS appearance as
-                // CSI ? 997 ; Ps n (Ps = 1 dark, 2 light). Apps use this to match
-                // their theme to the desktop. Push updates require DEC mode 2031.
+                // DEC color-scheme query: report the scheme of the background on
+                // screen as CSI ? 997 ; Ps n (Ps = 1 dark, 2 light): the host's
+                // baseline while the background is the configured one, else the
+                // polarity of the background a program set. Answered from the
+                // colours, not the announced latch, so an OSC 11 earlier in this
+                // batch is already reflected. Push updates require DEC mode 2031.
+                let scheme = self.color.reported_scheme().0;
                 let mut response = StackResponse::<16>::new();
-                let _ = write!(
-                    response,
-                    "\x1b[?997;{}n",
-                    self.modes.color_scheme.dsr_code()
-                );
+                let _ = write!(response, "\x1b[?997;{}n", scheme.dsr_code());
+                let queued_before = self.transient.response_buffer.len();
                 self.send_response(cap, response.as_bytes());
+                // The program has now been told: re-latch so the batch-end
+                // reconciliation sends no redundant push. A reply the cap, the
+                // policy or the rate limiter dropped told it nothing, so the
+                // latch stays and the batch-end push is tried, through the same
+                // policy and rate gates.
+                if self.transient.response_buffer.len() > queued_before {
+                    self.modes.color_scheme = scheme;
+                }
             }
             _ => {} // Unknown DECDSR parameter
         }
@@ -244,8 +254,8 @@ impl TerminalHandler<'_> {
 
     /// Handle DA1 (`CSI c`). The conformance level follows `modes.vt_level`
     /// (DECSCL), and the flags with it: 6 (selective erase) and 22 (ANSI color)
-    /// from VT220, 28 (rectangular editing) from VT420, and 4 (sixel) with the
-    /// `sixel` feature. The default VT420 answers `CSI ? 64 ; 6 ; 22 ; 28 c`.
+    /// from VT220, 28 (rectangular editing) from VT420, and 4 (sixel) from VT220.
+    /// The default VT420 answers `CSI ? 64 ; 6 ; 22 ; 28 ; 4 c`.
     pub(super) fn handle_primary_da(&mut self, cap: &ResponseCapability) {
         // VT100 has its own format: CSI ? 1 ; 2 c (with the Advanced Video
         // Option).
@@ -277,7 +287,6 @@ impl TerminalHandler<'_> {
             | aterm_types::VtLevel::VT330
             | aterm_types::VtLevel::VT340 => {
                 response.push_bytes(b";6;22");
-                #[cfg(feature = "sixel")]
                 response.push_bytes(b";4");
             }
             aterm_types::VtLevel::VT420
@@ -285,7 +294,6 @@ impl TerminalHandler<'_> {
             | aterm_types::VtLevel::VT520
             | aterm_types::VtLevel::VT525 => {
                 response.push_bytes(b";6;22;28");
-                #[cfg(feature = "sixel")]
                 response.push_bytes(b";4");
             }
         }
@@ -494,23 +502,36 @@ mod color_scheme_tests {
         term.set_color_scheme(Appearance::Dark);
         assert!(term.take_response().is_none(), "unchanged scheme = no push");
     }
-
-    #[test]
-    fn decrqm_reports_mode_2031_state() {
-        let mut term = Terminal::new(24, 80);
-        // Not set initially -> DECRQM reports reset (2).
-        term.process(b"\x1b[?2031$p");
-        assert_eq!(drain(&mut term), b"\x1b[?2031;2$y");
-        // Set -> DECRQM reports set (1).
-        term.process(b"\x1b[?2031h");
-        term.process(b"\x1b[?2031$p");
-        assert_eq!(drain(&mut term), b"\x1b[?2031;1$y");
-    }
 }
 
 #[cfg(test)]
 mod default_cursor_style_tests {
     use crate::terminal::{CursorStyle, Terminal};
+
+    #[test]
+    fn resets_return_alternate_scroll_to_the_hosts() {
+        // `reset`/`tput reset` send RIS then DECSTR; the wheel must keep scrolling
+        // less and man in that tab afterwards (DEC 1007 on, as the host set it).
+        for reset in [
+            &b"\x1bc"[..],
+            b"\x1b[!p",
+            b"\x1bc\x1b[!p\x1b[?3;4l\x1b[4l\x1b>",
+        ] {
+            let mut term = Terminal::new(24, 80);
+            term.set_host_alternate_scroll(true);
+            term.process(b"\x1b[?1007l");
+            term.process(reset);
+            assert!(term.modes().alternate_scroll, "{reset:?}");
+            assert!(
+                term.mode_mirror().alternate_scroll(),
+                "{reset:?}: the wheel's word"
+            );
+        }
+        let mut term = Terminal::new(24, 80);
+        term.set_host_alternate_scroll(true);
+        term.reset();
+        assert!(term.modes().alternate_scroll, "Terminal::reset");
+    }
 
     #[test]
     fn host_default_takes_effect_before_app_decscusr() {
@@ -530,16 +551,6 @@ mod default_cursor_style_tests {
         // A later host preference change must not override the app's live choice.
         term.set_default_cursor_style(CursorStyle::SteadyBar);
         assert_eq!(term.cursor_style(), CursorStyle::BlinkingUnderline);
-    }
-
-    #[test]
-    fn soft_reset_restores_host_default_not_blinking_block() {
-        let mut term = Terminal::new(24, 80);
-        term.set_default_cursor_style(CursorStyle::SteadyBar);
-        term.process(b"\x1b[3 q"); // app override
-        assert_eq!(term.cursor_style(), CursorStyle::BlinkingUnderline);
-        term.process(b"\x1b[!p"); // DECSTR soft reset
-        assert_eq!(term.cursor_style(), CursorStyle::SteadyBar);
     }
 
     #[test]

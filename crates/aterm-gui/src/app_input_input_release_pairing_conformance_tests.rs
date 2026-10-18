@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use aterm_spec::derive::input_release_pairing_model;
+use aterm_models_misc::input_release_pairing_model;
 use aterm_types::keyboard::{Key as TKey, Modifiers, NamedKey};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
@@ -790,56 +790,56 @@ pub(crate) fn run_conformance() {
 
 // The machine has 21 actions: twelve carry `#[refines]` anchors on their
 // `app_input.rs` seams, and these nine are explicit scope boundaries.
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "input_release_pairing",
     action = "TransferFocusWhileHeld",
     reason = "OS/winit environment transition: Tier-1 drives real App::on_focus(A,false) then \
               App::on_focus(B,true) and validates that physical ownership is unchanged; no \
               key-owner mutator implements the focus arrival itself."
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "input_release_pairing",
     action = "OpenOverlay",
     reason = "Orthogonal overlay environment step; cross-window physical-owner conformance \
               fixes overlays closed, while overlay_gate_pairing_tests drives the real open."
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "input_release_pairing",
     action = "CloseOverlay",
     reason = "Orthogonal overlay environment step; cross-window physical-owner conformance \
               fixes overlays closed, while overlay_gate_pairing_tests drives the real close."
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "input_release_pairing",
     action = "ConsumeOverlayPress",
     reason = "Controller/engine-key overlay ownership uses overlay_consumed_keys, not the \
               process-wide winit PhysicalKey owner map bound by this Tier-1 runner."
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "input_release_pairing",
     action = "RepeatOfConsumedPress",
     reason = "Repeat is a read-only peek of the retained physical owner; dedicated shipping \
               tests prove it neither removes the owner nor emits bytes."
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "input_release_pairing",
     action = "GateConsumesRepeatOfForwardedPress",
     reason = "Controller/engine-key repeats enter App::input without a winit PhysicalKey; \
               overlay_gate_pairing_tests drives the real pre-overlay press/open/repeat/release \
               seam. Physical repeats bypass current-content gates through route_physical_repeat."
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "input_release_pairing",
     action = "PhysicalFocusLoss",
     reason = "Terminal OS epoch where no matching key-up is delivered. A focus transfer that \
               does deliver key-up is the separately validated TransferFocusWhileHeld action."
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "input_release_pairing",
     action = "SettledRelease",
     reason = "Abstract terminal stutter after owner removal; no shipping state mutation exists."
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "input_release_pairing",
     action = "SettledFocusEpoch",
     reason = "Abstract terminal stutter after an OS-cancelled epoch; no shipping mutation exists."

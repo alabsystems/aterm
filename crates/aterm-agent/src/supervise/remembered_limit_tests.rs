@@ -43,7 +43,7 @@ fn fold(
 fn a_remembered_limit_uses_the_countdown_still_drawn_under_background_work() {
     use aterm_phase::prompt::fixtures::{RESUMED_NO_LIMIT_AT_ARMED_LIMIT_2_1_300, screen};
     for armed in [false, true] {
-        let mut m = Mock::new(true, vec![busy_screen()]);
+        let mut m = Mock::new(vec![busy_screen()]);
         let mut s = session(&mut m, None);
         s.set_clock(TEST_NOW, PDT);
         s.set_zone_lookup(test_zones);
@@ -91,7 +91,7 @@ fn a_remembered_bucket_obeys_the_newest_model_choice_under_background_work() {
         ("new-default", false),
     ] {
         let (dir, ledger) = ledger_at(&format!("remembered-model-{chosen}"));
-        let mut m = Mock::new(true, vec![busy_screen()]);
+        let mut m = Mock::new(vec![busy_screen()]);
         let mut s = session(&mut m, Some("@s-1".to_owned()));
         // The capture names Oct 17: put the test two days before its reset,
         // on Oct 15, rather than the older watch fixtures' September clock.

@@ -50,7 +50,8 @@ use aterm_agent::harness::upgrade_models::{
     ModelVerdict, ModelView, Priority, Settled,
 };
 use aterm_agent::harness::usage::rfc3339_utc;
-use aterm_spec::derive::{Model, harness_model_switch_model};
+use aterm_models_harness::harness_model_switch_model;
+use aterm_spec::derive::Model;
 use aterm_spec::interp;
 
 use super::{Vars, assert_forged_rejected, assert_transition};

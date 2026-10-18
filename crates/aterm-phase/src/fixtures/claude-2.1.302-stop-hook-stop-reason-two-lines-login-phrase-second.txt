@@ -1,0 +1,18 @@
+# claude-code 2.1.302 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a Stop hook (command ./sr) printing {"continue": false} with a two-line stopReason (note from the hook / Not logged in · Please run /login), the reply EMPTY: its first line on the column-2 ⎿ row under the hook summary, its second at column 2 with no ⎿
+ ▐▛███▛█   Claude Code v2.1.302
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ say nothing
+
+⏺ Ran 1 stop hook (ctrl+o to expand)
+  ⎿  note from the hook
+  Not logged in · Please run /login
+
+✻ Baked for 0s · done 10:37 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)

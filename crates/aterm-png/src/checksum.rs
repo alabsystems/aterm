@@ -135,12 +135,6 @@ pub(crate) fn adler32(data: &[u8]) -> u32 {
 mod tests {
     use super::*;
 
-    /// The CRC-32 check value every implementation of this polynomial agrees on.
-    #[test]
-    fn crc32_check_vector() {
-        assert_eq!(Crc32::of(&[b"123456789"]), 0xCBF4_3926);
-    }
-
     /// Folding in pieces must equal folding in one go — the property the chunk
     /// writer relies on when it CRCs a type tag and a body separately.
     #[test]

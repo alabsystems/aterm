@@ -24,10 +24,12 @@ use std::ops::Range;
 use super::rules::test_path;
 use super::{Bound, Finding, Rule, SourceFile, Tree, after_ws, has, hits, is_word};
 
-/// The crates whose code decides per agent.
+/// The crates whose code decides per agent (aterm-gui's with its split-out
+/// libraries, `crates/aterm-gui-*`).
 const AGENT_CRATES: &[&str] = &[
     "crates/aterm-agent/src/",
     "crates/aterm-gui/src/",
+    "crates/aterm-gui-",
     "crates/aterm-phase/src/",
 ];
 
@@ -387,10 +389,7 @@ mod tests {
             &[
                 ("crates/aterm-gui/src/harness_host.rs", src),
                 ("crates/aterm-gui/src/harness_host_tests.rs", gated),
-                (
-                    "crates/aterm-agent/src/harness/upgrade_codex_drive.rs",
-                    gated,
-                ),
+                ("crates/aterm-agent/src/harness/codex_alab_drive.rs", gated),
                 ("crates/aterm-gui/src/claude_lights.rs", gated),
                 ("crates/aterm-agent/tests/t.rs", gated),
                 ("crates/atpkg/src/vendors.rs", gated),

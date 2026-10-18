@@ -4,12 +4,14 @@
 //! `recv` returns exactly when the next delivery arrives, with no reliance on sleeps
 //! or wall-clock.
 
-use crate::logid::LogIdentity;
+use crate::logid::{Lineage, LogIdentity};
 use crate::proto::{
-    append_frame, decode_response, encode_request, foreign_protocol, read_frame, Request, Response,
-    CAP_EXPIRED_PREFIX, ERR_BAD_FILTER, ERR_BAD_SUBJECT, ERR_PROTOCOL, ERR_RECORD_REFUSED,
-    ERR_REFUSED, ERR_SUBJECT_BOUND, ERR_UNAUTHORIZED, PROTO_VERSION,
+    append_frame, append_publish_frame, decode_response, encode_request, foreign_protocol,
+    read_frame, Request, Response, CAP_EXPIRED_PREFIX, ERR_BAD_FILTER, ERR_BAD_SUBJECT,
+    ERR_PROTOCOL, ERR_RECORD_REFUSED, ERR_REFUSED, ERR_SUBJECT_BOUND, ERR_UNAUTHORIZED,
+    LOG_POISONED_PREFIX, PROTO_VERSION,
 };
+use crate::proto::{NonceExt, ServedInfo};
 use astream_wire::{Frame, FrameError};
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -18,6 +20,25 @@ use std::os::unix::net::UnixStream;
 #[cfg(unix)]
 use std::path::Path;
 use std::time::{Duration, Instant};
+
+#[cfg(clean_islands)]
+#[path = "client_island.rs"]
+mod client_island;
+#[cfg(not(clean_islands))]
+pub use crate::twins::client_walk_page_advance;
+#[cfg(clean_islands)]
+pub use client_island::client_walk_page_advance;
+
+contract_fn! {
+    /// Verified check that a `Last` walk page count lies within the liveness limit
+    /// (`pages <= max_pages`), linked via `clean-kernel-defeq` to `client_walk_within_limit_isl`.
+    #[must_use]
+    pub fn client_walk_within_limit(pages: usize, max_pages: usize) -> bool
+    clauses [ensures result == (pages <= max_pages)]
+    {
+        pages <= max_pages
+    }
+}
 
 /// One record as a client sees it: `(offset, subject, body)` — what a `Delivery`
 /// carries.
@@ -85,6 +106,124 @@ pub enum Walk {
     Stop,
 }
 
+/// Credit-windowed pipelined flow-control state machine, backed directly by the
+/// Clean-origin transition functions [`crate::proto::credit_horizon_monotone`],
+/// [`crate::proto::replica_ack_monotone`], [`crate::proto::committed_watermark`], and
+/// the `#[ensures]`-verified guard [`crate::proto::can_send_in_window`] from
+/// `Astream.Broker.TlaCreditFlowWindow`.
+///
+/// Maintains the machine-checked invariant `CreditWindowInv`:
+/// `acked_seq <= next_send && next_send <= credit_horizon`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreditWindow {
+    acked_seq: u64,
+    next_send: u64,
+    credit_horizon: u64,
+}
+
+impl CreditWindow {
+    /// Construct a fresh credit window starting at `(0, 0, initial_credit)` (`Init` in
+    /// `Astream.Broker.TlaCreditFlowWindow`).
+    #[must_use]
+    pub const fn new(initial_credit: u64) -> Self {
+        Self {
+            acked_seq: 0,
+            next_send: 0,
+            credit_horizon: initial_credit,
+        }
+    }
+
+    /// Monotone cumulative sequence acknowledged so far.
+    #[must_use]
+    pub const fn acked_seq(&self) -> u64 {
+        self.acked_seq
+    }
+
+    /// Next sequence index to be sent.
+    #[must_use]
+    pub const fn next_send(&self) -> u64 {
+        self.next_send
+    }
+
+    /// Current credit horizon (`next_send <= credit_horizon`).
+    #[must_use]
+    pub const fn credit_horizon(&self) -> u64 {
+        self.credit_horizon
+    }
+
+    /// Number of unacknowledged frames currently in flight (`next_send - acked_seq`).
+    #[must_use]
+    pub const fn in_flight(&self) -> u64 {
+        self.next_send.saturating_sub(self.acked_seq)
+    }
+
+    /// Whether a send is permitted under the current credit horizon
+    /// (`can_send_in_window(self.credit_horizon, self.next_send)`).
+    #[must_use]
+    pub fn can_send(&self) -> bool {
+        crate::proto::can_send_in_window(self.credit_horizon, self.next_send)
+    }
+
+    /// Attempt to consume one unit of send credit (`SendBatch` in
+    /// `Astream.Broker.TlaCreditFlowWindow`) via the 4-parameter Clean-origin
+    /// [`crate::proto::windowed_send_advance`] kernel. Returns `true` and advances
+    /// `next_send` by 1 if `self.can_send()` holds, or `false` if the credit window is full.
+    pub fn try_send(&mut self) -> bool {
+        if !self.can_send() {
+            return false;
+        }
+        let cand = self.next_send.saturating_add(1);
+        let next = crate::proto::windowed_send_advance(
+            self.next_send,
+            self.acked_seq,
+            self.credit_horizon,
+            cand,
+        );
+        if next > self.next_send {
+            self.next_send = next;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Advance `next_send` toward `cand_seq` clamped by `credit_horizon` via the
+    /// 4-parameter Clean-origin [`crate::proto::windowed_send_advance`] kernel.
+    pub fn advance_send_to(&mut self, cand_seq: u64) -> u64 {
+        self.next_send = crate::proto::windowed_send_advance(
+            self.next_send,
+            self.acked_seq,
+            self.credit_horizon,
+            cand_seq,
+        );
+        self.next_send
+    }
+
+    /// Record a cumulative acknowledgment up to `ack` (`AckStep` in
+    /// `Astream.Broker.TlaCreditFlowWindow`), clamped to `self.next_send` via
+    /// [`crate::proto::committed_watermark`] and advanced monotonically via
+    /// [`crate::proto::replica_ack_monotone`].
+    pub fn record_ack(&mut self, ack: u64) -> u64 {
+        let bounded = crate::proto::committed_watermark(self.next_send, ack);
+        self.acked_seq = crate::proto::replica_ack_monotone(self.acked_seq, bounded);
+        self.acked_seq
+    }
+
+    /// Advance the credit horizon monotonically (`GrantCreditStep` in
+    /// `Astream.Broker.TlaCreditFlowWindow`) via Clean-origin
+    /// [`crate::proto::credit_horizon_monotone`].
+    pub fn grant_credit(&mut self, new_horizon: u64) -> u64 {
+        self.credit_horizon =
+            crate::proto::credit_horizon_monotone(self.credit_horizon, new_horizon);
+        self.credit_horizon
+    }
+
+    /// Grant sliding-window credit so the horizon covers `acked_seq + window`.
+    pub fn grant_window(&mut self, window: u64) -> u64 {
+        self.grant_credit(self.acked_seq.saturating_add(window))
+    }
+}
+
 /// A connection to a broker over a byte stream. Three transports:
 ///
 /// - [`connect`](Client::connect) — a Unix socket, same machine, unsealed (the
@@ -119,11 +258,16 @@ pub struct Client<S = UnixStream> {
     lost: Option<String>,
     /// The log identity this connection's latest `Hello` answer carried.
     identity: Option<LogIdentity>,
+    /// The extension block beside it (the served tier, the lineage).
+    ext: NonceExt,
     /// When this client last wrote a request (or was made): what
     /// [`keepalive_if_idle`](Client::keepalive_if_idle) measures idleness from.
     sent_at: Instant,
     /// The broker answered a `Keepalive` as a verb it does not know.
     keepalive_unknown: bool,
+    /// The durable head the newest `Mark` this connection read carried
+    /// ([`seen_durable`](Client::seen_durable)).
+    durable: Option<u64>,
 }
 
 /// A connection to a broker over a byte stream. Windows twin: std has no
@@ -136,11 +280,16 @@ pub struct Client<S = TcpStream> {
     lost: Option<String>,
     /// The log identity this connection's latest `Hello` answer carried.
     identity: Option<LogIdentity>,
+    /// The extension block beside it (the served tier, the lineage).
+    ext: NonceExt,
     /// When this client last wrote a request (or was made): what
     /// [`keepalive_if_idle`](Client::keepalive_if_idle) measures idleness from.
     sent_at: Instant,
     /// The broker answered a `Keepalive` as a verb it does not know.
     keepalive_unknown: bool,
+    /// The durable head the newest `Mark` this connection read carried
+    /// ([`seen_durable`](Client::seen_durable)).
+    durable: Option<u64>,
 }
 
 #[cfg(unix)]
@@ -333,8 +482,10 @@ impl<S: Read + Write> Client<S> {
             stream,
             lost: None,
             identity: None,
+            ext: NonceExt::default(),
             sent_at: Instant::now(),
             keepalive_unknown: false,
+            durable: None,
         }
     }
 
@@ -359,9 +510,10 @@ impl<S: Read + Write> Client<S> {
     pub fn hello_identity(&mut self) -> io::Result<([u8; 32], Option<LogIdentity>)> {
         self.send(&Request::Hello)?;
         match self.read_response()? {
-            Response::Nonce { nonce, log } => match nonce.as_slice().try_into() {
+            Response::Nonce { nonce, log, ext } => match nonce.as_slice().try_into() {
                 Ok(nonce) => {
                     self.identity = log;
+                    self.ext = ext;
                     Ok((nonce, log))
                 }
                 Err(_) => Err(self.lose(io::Error::new(
@@ -399,6 +551,40 @@ impl<S: Read + Write> Client<S> {
     /// it change, when the replica adopts its leader's: ask again for the current one.
     pub fn seen_log_identity(&self) -> Option<LogIdentity> {
         self.identity
+    }
+
+    /// The [`Lineage`] the latest `Hello` answer carried beside the identity: where the
+    /// log's generations agree, so offsets kept under an earlier generation resume at
+    /// [`LogIdentity::continues`] instead of being forgotten. `None` before any
+    /// `Hello`, or from a broker that predates lineage (which says nothing either way:
+    /// forget, as before).
+    pub fn log_lineage(&self) -> Option<&Lineage> {
+        self.ext.lineage.as_ref()
+    }
+
+    /// The tier the broker serves, as the latest `Hello` answer told it
+    /// ([`ServedInfo`]) — read from the broker itself, so a status line never infers it
+    /// from how the broker was started. `None` before any `Hello`, or from a broker that
+    /// predates the extension block.
+    pub fn served_durability(&self) -> Option<ServedInfo> {
+        self.ext.durability
+    }
+
+    /// The broker's DURABLE head as the newest `Mark` this connection read told it —
+    /// every record below it is on stable media by a full flush. `None` before any
+    /// `Mark` (an `Attach`'s, a `Fetch`'s or a `Last` page's), or from a broker that
+    /// predates the field. To ask about an offset now, a `Fetch` head query (`max = 0`)
+    /// answers with a fresh `Mark`.
+    pub fn seen_durable(&self) -> Option<u64> {
+        self.durable
+    }
+
+    /// Keep what a `Mark` said about durability (an older broker's says nothing, which
+    /// leaves the last word standing).
+    fn saw_durable(&mut self, durable: Option<u64>) {
+        if durable.is_some() {
+            self.durable = durable;
+        }
     }
 
     /// Add a grant to this connection's keyring by presenting a PROOF the caller has
@@ -482,21 +668,24 @@ impl<S: Read + Write> Client<S> {
         let mut received = 0usize;
         let mut failure: Option<io::Error> = None;
         loop {
-            while failure.is_none() && sent < ring.len() && sent - received < Self::ATTACH_WINDOW {
+            while failure.is_none()
+                && sent < ring.len()
+                && sent.saturating_sub(received) < Self::ATTACH_WINDOW
+            {
                 let (grant, tag) = &ring[sent];
                 let proof = astream_cap::attach_proof(tag, &nonce, grant);
                 match self.send(&Request::Attach {
                     grant: grant.to_string(),
                     proof: proof.to_vec(),
                 }) {
-                    Ok(()) => sent += 1,
+                    Ok(()) => sent = sent.saturating_add(1),
                     Err(e) => failure = Some(e),
                 }
             }
             if received == sent {
                 break;
             }
-            received += 1;
+            received = received.saturating_add(1);
             match self.read_mark() {
                 Ok(m) => mark = Some(m),
                 Err(e) if broker_refusal(&e).is_some() => {
@@ -554,6 +743,25 @@ impl<S: Read + Write> Client<S> {
         self.recv_publish_ack()
     }
 
+    /// Durably retire `subject` from the broker's last-value index (`Last`) and
+    /// decrement `producer_id`'s distinct-subject count (`MAX_SUBJECTS_PER_PRODUCER`),
+    /// sending a [`crate::store::RETIRE_SUBJECT`] (`/a/retire`) request over the wire.
+    ///
+    /// Returns `(offset, already_absent)`: `already_absent` is `false` when `subject`
+    /// was in `Last` and a `/a/retire` record was appended at `offset`, or `true` when
+    /// `subject` was already absent (idempotent no-op). Refuses if `subject` is owned
+    /// in `Last` by a different producer or if the connection's capability keyring does
+    /// not grant read-write publish authority on `subject` for `producer_id`.
+    pub fn retire_subject(&mut self, producer_id: u64, subject: &str) -> io::Result<(u64, bool)> {
+        self.send_publish(
+            producer_id,
+            0,
+            crate::store::RETIRE_SUBJECT,
+            subject.as_bytes(),
+        )?;
+        self.recv_publish_ack()
+    }
+
     /// PIPELINED publish (send side): write a publish WITHOUT waiting for its ack, so a
     /// single connection can keep many in flight (they coalesce into one group-commit
     /// fsync at the broker). Pair each `send_publish` with a later
@@ -567,12 +775,12 @@ impl<S: Read + Write> Client<S> {
         subject: &str,
         body: &[u8],
     ) -> io::Result<()> {
-        self.send(&Request::Publish {
-            producer_id,
-            producer_seq,
-            subject: subject.to_string(),
-            body: body.to_vec(),
-        })
+        self.in_step()?;
+        let mut out = Vec::new();
+        append_publish_frame(&mut out, producer_id, producer_seq, subject, body)?;
+        self.stream.write_all(&out).map_err(|e| self.lose(e))?;
+        self.sent_at = Instant::now();
+        Ok(())
     }
 
     /// PIPELINED publish (receive side): read the next ack in order, returning
@@ -610,34 +818,76 @@ impl<S: Read + Write> Client<S> {
         bodies: &[&[u8]],
         window: usize,
     ) -> io::Result<Vec<(u64, bool)>> {
+        self.in_step()?;
         let window = window.clamp(1, Self::MAX_PIPELINE_WINDOW);
-        let mut acks = Vec::with_capacity(bodies.len());
-        let mut sent = 0usize;
-        let mut received = 0usize;
+        let mut credit = CreditWindow::new(window as u64);
+        let mut acks = Vec::new();
+        let mut tx = Vec::new();
         let mut failure: Option<io::Error> = None;
         loop {
-            // Top the in-flight window back up.
-            while failure.is_none() && sent < bodies.len() && sent - received < window {
-                match self.send_publish(producer_id, (sent + 1) as u64, subject, bodies[sent]) {
-                    Ok(()) => sent += 1,
+            // Top the in-flight window back up using the TLA+-verified `CreditWindow`
+            // (`Astream.Broker.TlaCreditFlowWindow`), coalescing all frames that fit
+            // into one `write_all` syscall so the broker's reader drains a whole batch
+            // into one group-commit fsync.
+            credit.grant_window(window as u64);
+            tx.clear();
+            let mut staged = credit;
+            let mut batch_count = 0usize;
+            while failure.is_none() && staged.can_send() {
+                let idx = staged.next_send() as usize;
+                let Some(&body) = bodies.get(idx) else {
+                    break;
+                };
+                match append_publish_frame(
+                    &mut tx,
+                    producer_id,
+                    (idx as u64).saturating_add(1),
+                    subject,
+                    body,
+                ) {
+                    Ok(()) => {
+                        let _ = staged.try_send();
+                        batch_count = batch_count.saturating_add(1);
+                    }
                     Err(e) => failure = Some(e),
                 }
             }
-            if received == sent {
+            if batch_count > 0 {
+                match self.stream.write_all(&tx) {
+                    Ok(()) => {
+                        self.sent_at = Instant::now();
+                        credit = staged;
+                    }
+                    Err(e) => {
+                        let e = self.lose(e);
+                        return Err(failure.unwrap_or(e));
+                    }
+                }
+            }
+            if credit.in_flight() == 0 {
                 break;
             }
-            // Then drain one response (keeps sends and receives interleaved, no
-            // deadlock). A transport failure ends the connection, so it ends this too.
-            let resp = match self.read_response() {
-                Ok(resp) => resp,
-                Err(e) => return Err(failure.unwrap_or(e)),
+            // Drain up to half the window (or all remaining if sending is done) before
+            // the next coalesced batch refill so each refill is a true batch.
+            let in_flight = credit.in_flight() as usize;
+            let drain_target = if failure.is_some() || (credit.next_send() as usize) == bodies.len()
+            {
+                in_flight
+            } else {
+                (in_flight / 2).max(1)
             };
-            received += 1;
-            match resp {
-                Response::PublishAck { offset, deduped } => acks.push((offset, deduped)),
-                other => {
-                    let e = self.reply_error(other);
-                    failure.get_or_insert(e);
+            for _ in 0..drain_target {
+                let resp = match self.read_response() {
+                    Ok(resp) => resp,
+                    Err(e) => return Err(failure.unwrap_or(e)),
+                };
+                credit.record_ack(credit.acked_seq().saturating_add(1));
+                match resp {
+                    Response::PublishAck { offset, deduped } => acks.push((offset, deduped)),
+                    other => {
+                        let e = self.reply_error(other);
+                        failure.get_or_insert(e);
+                    }
                 }
             }
         }
@@ -934,7 +1184,7 @@ impl<S: Read + Write> Client<S> {
                     break;
                 }
                 remaining -= 1;
-                taken += 1;
+                taken = taken.saturating_add(1);
                 last.clone_from(&row.1);
                 if on_row(row)? == Walk::Stop {
                     stopped = true;
@@ -1026,7 +1276,15 @@ impl<S: Read + Write> Client<S> {
                     subject,
                     body,
                 } => page.push((offset, subject, body)),
-                Response::Mark { next, head, resume } => return Ok((page, (next, head), resume)),
+                Response::Mark {
+                    next,
+                    head,
+                    resume,
+                    durable,
+                } => {
+                    self.saw_durable(durable);
+                    return Ok((page, (next, head), resume));
+                }
                 other => return Err(self.reply_error(other)),
             }
         }
@@ -1143,7 +1401,15 @@ impl<S: Read + Write> Client<S> {
     /// Read the `Mark` that acknowledges an `Attach` or a `Will`: its `(next, head)`.
     fn read_mark(&mut self) -> io::Result<(u64, u64)> {
         match self.read_response()? {
-            Response::Mark { next, head, .. } => Ok((next, head)),
+            Response::Mark {
+                next,
+                head,
+                durable,
+                ..
+            } => {
+                self.saw_durable(durable);
+                Ok((next, head))
+            }
             other => Err(self.reply_error(other)),
         }
     }
@@ -1190,6 +1456,7 @@ impl<S: Read + Write> Client<S> {
             stream: self.stream,
             rx: RecvBuf::default(),
             marked: false,
+            durable: self.durable,
         })
     }
 }
@@ -1315,7 +1582,7 @@ impl BrokerRefusal {
     /// another producer introduces the subject (an update spends nothing) or the
     /// producer's own count falls. Whether to wait for that is the PRODUCER's
     /// question, because only it knows who else writes the subject: a producer that
-    /// alone writes it — its own lanes — can retire the record for good, and one that
+    /// alone writes it — its own lanes — can drop the record for good, and one that
     /// shares it can hold the record. [`Client::subject_budget`] reads the count.
     ///
     /// `false` against a broker that predates the code, which sends [`ERR_REFUSED`]
@@ -1343,6 +1610,30 @@ impl BrokerRefusal {
     /// grant".
     pub fn is_expired(&self) -> bool {
         self.code == ERR_UNAUTHORIZED && self.msg.starts_with(CAP_EXPIRED_PREFIX)
+    }
+
+    /// Whether the refusal is a POISONED log's: [`ERR_REFUSED`] whose message starts
+    /// [`LOG_POISONED_PREFIX`]. The broker sends it for every write — publish, commit,
+    /// will, binding, flush — while its log refuses every mutation until it is reopened
+    /// ([`Broker::poisoned`](crate::Broker::poisoned)): a full flush failed with acked or
+    /// held records no full flush covers, or a rollback could not put the file back.
+    ///
+    /// NOT [`is_permanent`](Self::is_permanent): the same record lands once the log is
+    /// reopened. What it says is that nothing resent on THIS connection lands — the cure
+    /// is a new open, which only the broker's embedder makes (a supervised broker exits
+    /// and is started again), and the client sees it as the connection ending. A
+    /// producer that reports whether its broker is working should report this broker
+    /// as not, and wait for the reconnect, not retry into it.
+    ///
+    /// `false` is every other refusal, every other code-5 one included: a write that
+    /// failed and was rolled back (the next may land on the same connection), a quorum
+    /// not reached, a broker stopping. Against a broker that predates
+    /// [`LOG_POISONED_PREFIX`] this is `false` for every refusal: such a broker answered
+    /// the first op of a batch on a poisoned log `append failed: log poisoned (…)` and
+    /// every later one `batch aborted (prior append I/O error)` — the fail-safe reading,
+    /// under which a producer retries.
+    pub fn is_poisoned(&self) -> bool {
+        self.code == ERR_REFUSED && self.msg.starts_with(LOG_POISONED_PREFIX)
     }
 }
 
@@ -1404,7 +1695,7 @@ const IDLE_STOP_WAIT: Duration = Duration::from_millis(100);
 /// The records are already durable and the group's cursor has NOT moved, so a
 /// caller that dies here sees them again.
 pub fn take<S: Read + Write>(sub: &mut Subscription<S>, max: usize) -> io::Result<Vec<Record>> {
-    let mut out = Vec::with_capacity(max.min(64));
+    let mut out = Vec::new();
     while out.len() < max {
         let caught_up_before = sub.marked;
         let asked = Instant::now();
@@ -1512,10 +1803,12 @@ pub fn ack<S: Read + Write>(
     out_subject: &str,
     out_body: &[u8],
 ) -> io::Result<(u64, bool)> {
-    debug_assert!(
-        offset < ACK_SEQ_BASE,
-        "an ack's input offset must stay in the lower half of the sequence space"
-    );
+    if offset >= ACK_SEQ_BASE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "an ack's input offset must stay in the lower half of the sequence space",
+        ));
+    }
     client.process_and_produce(
         producer_id,
         ACK_SEQ_BASE | offset,
@@ -1534,6 +1827,9 @@ pub struct Subscription<S = UnixStream> {
     rx: RecvBuf,
     /// Whether a `Mark` has come down this stream yet (see [`take`]).
     marked: bool,
+    /// The durable head the newest `Mark` on this stream carried
+    /// ([`seen_durable`](Subscription::seen_durable)).
+    durable: Option<u64>,
 }
 
 /// A live delivery stream from the broker (Windows twin: TCP default, as above).
@@ -1544,6 +1840,9 @@ pub struct Subscription<S = TcpStream> {
     rx: RecvBuf,
     /// Whether a `Mark` has come down this stream yet (see [`take`]).
     marked: bool,
+    /// The durable head the newest `Mark` on this stream carried
+    /// ([`seen_durable`](Subscription::seen_durable)).
+    durable: Option<u64>,
 }
 
 #[cfg(unix)]
@@ -1590,7 +1889,20 @@ pub enum Event {
     },
     /// Resume from `next`; `head` is the subscriber-visible head the broker read
     /// with — the end of a bounded read, or a tail that is caught up or idle.
-    Mark { next: u64, head: u64 },
+    /// `durable` is the broker's durable head then: every record below it is on stable
+    /// media. `None` from a broker that predates the field, which serves Strict or
+    /// Relaxed, never Ordered: read its tier from `Hello`'s block
+    /// ([`Client::served_durability`]) — on Strict the durable head is `head`; on Relaxed
+    /// nothing acked since its open (or clean close) is durable, so `head` is not. A
+    /// broker older still sends no block, and may serve Relaxed without saying so: there
+    /// `head` is durable only for a reader that knows its broker strict. On a broker that
+    /// serves Ordered, a tail that asked for idle marks also gets a `Mark` when a full
+    /// flush makes records it was delivered durable.
+    Mark {
+        next: u64,
+        head: u64,
+        durable: Option<u64>,
+    },
 }
 
 /// Bytes a subscription asks its stream for per read, and the size its receive
@@ -1624,9 +1936,9 @@ impl RecvBuf {
     /// error discards it, since the stream cannot be resumed past one.
     fn next_frame(&mut self, stream: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
         loop {
-            match Frame::decode(&self.buf[self.start..self.end]) {
+            match Frame::decode(self.buf.get(self.start..self.end).unwrap_or(&[])) {
                 Ok(Some(d)) => {
-                    self.start += d.consumed;
+                    self.start = self.start.saturating_add(d.consumed);
                     if self.start == self.end {
                         self.reset();
                     }
@@ -1646,15 +1958,24 @@ impl RecvBuf {
                 // Full: slide the unfinished frame to the front, and grow only when it
                 // already fills the whole buffer.
                 self.buf.copy_within(self.start..self.end, 0);
-                self.end -= self.start;
+                self.end = self.end.saturating_sub(self.start);
                 self.start = 0;
                 if self.end == self.buf.len() {
-                    self.buf.resize(self.end + READ_CHUNK, 0);
+                    for _ in 0..8 {
+                        self.buf.extend_from_slice(&[0u8; 8192]);
+                    }
                 }
             }
-            match stream.read(&mut self.buf[self.end..]) {
+            let Some(dst) = self.buf.get_mut(self.end..) else {
+                self.reset();
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "receive buffer out of bounds",
+                ));
+            };
+            match stream.read(dst) {
                 Ok(0) => {
-                    let partial = self.end - self.start;
+                    let partial = self.end.saturating_sub(self.start);
                     self.reset();
                     // As `proto::read_frame`: only a close with NOTHING of the next
                     // frame read is a close; once any byte of it — a header byte
@@ -1668,7 +1989,7 @@ impl RecvBuf {
                         ))
                     };
                 }
-                Ok(n) => self.end += n,
+                Ok(n) => self.end = self.end.saturating_add(n),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => {
                     if !matches!(
@@ -1707,6 +2028,12 @@ impl<S: Read + Write> Subscription<S> {
     /// bytes taken from underneath it are gone from the stream it resumes.
     pub fn get_ref(&self) -> &S {
         &self.stream
+    }
+
+    /// The broker's durable head as the newest `Mark` on this stream told it (see
+    /// [`Event::Mark`]) — or the client's before it subscribed. `None` before any.
+    pub fn seen_durable(&self) -> Option<u64> {
+        self.durable
     }
 
     /// Block until the next matching delivery; `Ok(None)` if the broker closes.
@@ -1750,9 +2077,21 @@ impl<S: Read + Write> Subscription<S> {
                 subject,
                 body,
             })),
-            Response::Mark { next, head, .. } => {
+            Response::Mark {
+                next,
+                head,
+                durable,
+                ..
+            } => {
                 self.marked = true;
-                Ok(Some(Event::Mark { next, head }))
+                if durable.is_some() {
+                    self.durable = durable;
+                }
+                Ok(Some(Event::Mark {
+                    next,
+                    head,
+                    durable,
+                }))
             }
             other => Err(refused(other)),
         }
@@ -2297,6 +2636,7 @@ mod tests {
                 let reply = |r: &Response| Frame::new(encode_response(r)).encode().unwrap();
                 if self.answered == 0 && reqs == [Request::Hello] {
                     self.pending = reply(&Response::Nonce {
+                        ext: crate::proto::NonceExt::default(),
                         log: None,
                         nonce: self.nonce.to_vec(),
                     });
@@ -2306,6 +2646,7 @@ mod tests {
                             next: 3,
                             head: 3,
                             resume: String::new(),
+                            durable: None,
                         }));
                     }
                 } else {
@@ -2367,5 +2708,40 @@ mod tests {
         let e = RecvBuf::default().next_frame(&mut s).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
         assert_eq!(s.step, 1, "one read: the header's");
+    }
+
+    #[test]
+    fn credit_window_state_machine_preserves_invariant() {
+        let mut cw = super::CreditWindow::new(4);
+        assert_eq!(cw.acked_seq(), 0);
+        assert_eq!(cw.next_send(), 0);
+        assert_eq!(cw.credit_horizon(), 4);
+        assert!(cw.can_send());
+
+        for expected_next in 1..=4 {
+            assert!(cw.try_send());
+            assert_eq!(cw.next_send(), expected_next);
+            assert!(cw.acked_seq() <= cw.next_send() && cw.next_send() <= cw.credit_horizon());
+        }
+        // Window is now exhausted (`next_send == 4 == credit_horizon`).
+        assert!(!cw.can_send());
+        assert!(!cw.try_send());
+        assert_eq!(cw.in_flight(), 4);
+
+        // Acknowledge 2 frames; stale ack (1) does not regress; overshooting ack (99)
+        // is clamped to `next_send == 4`.
+        assert_eq!(cw.record_ack(2), 2);
+        assert_eq!(cw.record_ack(1), 2);
+        assert_eq!(cw.in_flight(), 2);
+
+        // Granting sliding-window credit of 4 moves horizon from 4 to `2 + 4 = 6`.
+        assert_eq!(cw.grant_window(4), 6);
+        // Stale credit grant (3 < 6) never regresses horizon.
+        assert_eq!(cw.grant_credit(3), 6);
+        assert!(cw.can_send());
+        assert!(cw.try_send());
+        assert_eq!(cw.next_send(), 5);
+        assert_eq!(cw.record_ack(99), 5);
+        assert_eq!(cw.in_flight(), 0);
     }
 }

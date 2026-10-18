@@ -124,6 +124,137 @@ fn ctrl_on_a_cyrillic_layout_writes_the_control_byte() {
     unsafe { libc::close(pipe) };
 }
 
+/// A chord on a non-US layout sends the layout's character through the shipping
+/// `on_key` (ATERM-KI-1015-9). German Ctrl+Shift+ß reads '?' without Ctrl, so it
+/// sends the DEL of '?', not the US position's Ctrl+_ (0x1f); German
+/// Option+Shift+2, as the window hands it over with Option as an Alt (text '"';
+/// the sync below is what the event loop runs as every callback ends), is
+/// ESC '"', not the US table's ESC '@'. Russian Ctrl+х, whose character has no
+/// control byte, takes the physical key's US '[' (ESC), as xterm, kitty and
+/// ghostty do.
+#[test]
+fn a_chord_on_a_non_us_layout_sends_the_layouts_character() {
+    let (mut app, pipe) = app_observing_pty();
+    let wid = WindowId(0);
+    app.sync_option_as_alt();
+    set_mods(&mut app, wid, ModifiersState::CONTROL);
+    app.on_key(
+        wid,
+        mac_press(KeyCode::BracketLeft, character("х"), "х", "х"),
+    );
+    assert_eq!(drain(pipe), [0x1b], "ru Ctrl+х");
+    set_mods(
+        &mut app,
+        wid,
+        ModifiersState::CONTROL | ModifiersState::SHIFT,
+    );
+    app.on_key(wid, mac_press(KeyCode::Minus, character("?"), "ß", "?"));
+    assert_eq!(drain(pipe), [0x7f], "de Ctrl+Shift+ß");
+    set_mods(&mut app, wid, ModifiersState::ALT | ModifiersState::SHIFT);
+    app.on_key(wid, mac_press(KeyCode::Digit2, character("\""), "2", "\""));
+    assert_eq!(drain(pipe), b"\x1b\"", "de Option+Shift+2");
+    unsafe { libc::close(pipe) };
+}
+
+/// ATERM-KI-1015-9 review: a chord under Caps Lock sends the bytes it sent
+/// before chords carried the layout's character. A chord's text that differs
+/// from what the unshifted key derives only by letter case is the lock's, and
+/// the chord keeps the key's own case, as kitty's legacy encoding drops the
+/// lock modifiers: Caps Lock + Alt+b is ESC b (not ESC B), Russian Caps Lock +
+/// Alt+и is ESC и, and Ctrl+c under modifyOtherKeys level 2 (vim's default)
+/// reports 'c' (99), not 'C' (67). The presses are shaped as Caps Lock makes
+/// them, with no lock state from the platform (the Linux backends report none).
+#[test]
+fn a_chord_under_caps_lock_keeps_the_keys_own_case() {
+    let (mut app, pipe) = app_observing_pty();
+    let wid = WindowId(0);
+    app.sync_option_as_alt();
+    set_mods(&mut app, wid, ModifiersState::ALT);
+    app.on_key(wid, mac_press(KeyCode::KeyB, character("B"), "b", "B"));
+    assert_eq!(drain(pipe), b"\x1bb", "Caps Lock + Alt+b");
+    app.on_key(wid, mac_press(KeyCode::KeyB, character("И"), "и", "И"));
+    assert_eq!(drain(pipe), "\x1bи".as_bytes(), "ru Caps Lock + Alt+и");
+    push_kitty(&app, wid, b"\x1b[>4;2m");
+    set_mods(&mut app, wid, ModifiersState::CONTROL);
+    app.on_key(wid, mac_press(KeyCode::KeyC, character("C"), "c", "C"));
+    assert_eq!(
+        drain(pipe),
+        b"\x1b[27;5;99~",
+        "Caps Lock + Ctrl+c, modifyOtherKeys 2"
+    );
+    unsafe { libc::close(pipe) };
+}
+
+/// ATERM-KI-1015-9 review: a chord's letter takes Shift's case, never the
+/// lock's, for every case pair a layout types. Turkish Q's dotless key (the
+/// US I key) types 'I' under Caps Lock, and its dotted key (the US ' key)
+/// 'İ'; neither pair round-trips through Unicode's default lowercase, so
+/// Caps Lock + Alt+ı went out as ESC I and Caps Lock + Alt+i as ESC İ.
+/// Russian Alt+Shift+и is Shift's capital, which the US table cannot derive
+/// for a non-Latin letter, so it went out as ESC и.
+#[test]
+fn a_chords_letter_takes_shifts_case_for_every_case_pair() {
+    let (mut app, pipe) = app_observing_pty();
+    let wid = WindowId(0);
+    app.sync_option_as_alt();
+    set_mods(&mut app, wid, ModifiersState::ALT);
+    app.on_key(wid, mac_press(KeyCode::KeyI, character("I"), "ı", "I"));
+    assert_eq!(drain(pipe), "\x1bı".as_bytes(), "tr Caps Lock + Alt+ı");
+    app.on_key(wid, mac_press(KeyCode::Quote, character("İ"), "i", "İ"));
+    assert_eq!(drain(pipe), b"\x1bi", "tr Caps Lock + Alt+i");
+    set_mods(&mut app, wid, ModifiersState::ALT | ModifiersState::SHIFT);
+    app.on_key(wid, mac_press(KeyCode::KeyB, character("И"), "и", "И"));
+    assert_eq!(drain(pipe), "\x1bИ".as_bytes(), "ru Alt+Shift+и");
+    app.on_key(wid, mac_press(KeyCode::KeyI, character("I"), "ı", "I"));
+    assert_eq!(drain(pipe), b"\x1bI", "tr Alt+Shift+ı");
+    app.on_key(wid, mac_press(KeyCode::Quote, character("İ"), "i", "İ"));
+    assert_eq!(drain(pipe), "\x1bİ".as_bytes(), "tr Alt+Shift+i");
+    app.on_key(wid, mac_press(KeyCode::KeyB, character("B"), "b", "B"));
+    assert_eq!(drain(pipe), b"\x1bB", "Alt+Shift+b");
+    unsafe { libc::close(pipe) };
+}
+
+/// A shortcut on a Russian layout is its US key's shortcut, as Ctrl's byte is
+/// its US key's byte: Ctrl+Shift+'а' (the F key) opens find instead of writing
+/// ^F, and inside the field Ctrl+'ф' (the A key) is ^A, the move to the start.
+/// The press is shaped as X11/Wayland build it: the base key is the active
+/// layout's level-0 keysym.
+#[test]
+fn a_shortcut_on_a_cyrillic_layout_is_its_us_keys_shortcut() {
+    let (mut app, pipe) = app_observing_pty();
+    let wid = WindowId(0);
+    app.keybindings = crate::keybinding::Keybindings::resolved(Some(
+        &[("ctrl+shift+f".to_string(), "find".to_string())]
+            .into_iter()
+            .collect(),
+    ));
+    set_mods(
+        &mut app,
+        wid,
+        ModifiersState::CONTROL | ModifiersState::SHIFT,
+    );
+    app.on_key(wid, mac_press(KeyCode::KeyF, character("А"), "а", ""));
+    assert!(
+        app.windows[&wid].search.is_some(),
+        "Ctrl+Shift+А opened find"
+    );
+    assert_eq!(drain(pipe), [0u8; 0], "and wrote no ^F to the shell");
+
+    set_mods(&mut app, wid, ModifiersState::empty());
+    for (code, c) in [(KeyCode::KeyL, "д"), (KeyCode::KeyF, "а")] {
+        app.on_key(wid, mac_press(code, character(c), c, c));
+    }
+    set_mods(&mut app, wid, ModifiersState::CONTROL);
+    app.on_key(wid, mac_press(KeyCode::KeyA, character("ф"), "ф", ""));
+    let search = app.windows[&wid].search.as_ref().expect("find open");
+    assert_eq!(
+        (search.query.as_str(), search.cursor),
+        ("да", 0),
+        "Ctrl+Ф moved to the start"
+    );
+    unsafe { libc::close(pipe) };
+}
+
 /// `option_as_meta = false` lets Option type the layout's characters, but winit
 /// gives the named keys a text too ("\x08", "\r", "\t", "\x1b"); they keep Option
 /// through the encoder, legacy and kitty. Only printable text takes the text

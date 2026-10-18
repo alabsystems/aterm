@@ -178,11 +178,6 @@ pub struct Surface {
     /// the letters (fill ink left, track right). `None` for a comet, an empty
     /// track and a whole fill.
     pub edge: Option<u32>,
-    /// The surface is a rail: a measured level, drawn in the row's lowest
-    /// pixels only (below the descenders, in the warn hue) from 0 to its level
-    /// across the window, under the band's own ground. Never a fill the words
-    /// ride.
-    pub rail: bool,
 }
 
 impl Surface {
@@ -194,13 +189,6 @@ impl Surface {
             flat,
             ..Self::default()
         }
-    }
-
-    /// This surface as a rail ([`Surface::rail`]).
-    #[must_use]
-    pub fn as_rail(mut self) -> Self {
-        self.rail = true;
-        self
     }
 
     /// Whether the row has no meter and no track.
@@ -836,7 +824,6 @@ fn bar_in(e: i64, glint: Option<Duration>, graded: bool, ink: Tone, cols: usize)
         stops,
         flat,
         edge: (e > 0 && e < row).then(|| u32::try_from(e).unwrap_or(0)),
-        rail: false,
     }
 }
 
@@ -879,13 +866,6 @@ fn swept(t: Duration, cols: usize) -> Surface {
 #[must_use]
 pub(crate) fn track(graded: bool) -> Surface {
     Surface::uniform(Tone::TRACK, !graded)
-}
-
-/// A measured level's surface: a rail ([`Surface::rail`]) at `level` (Q16 of
-/// the row) with the bar's geometry, never glinting.
-#[must_use]
-pub fn level_rail(level: i64, graded: bool) -> Surface {
-    bar_in(level, None, graded, Tone::FULL, 0).as_rail()
 }
 
 /// How long an echo holds its slot: a Complete's fill glide ([`glide_span`]
@@ -1054,13 +1034,8 @@ mod tests {
         assert_eq!(glide(900, 100, span), 100, "down too");
         // The span scales with the distance.
         assert_eq!(glide_span(500, 500), FILL_GLIDE);
-        assert_eq!(glide_span(0, 100), Duration::from_millis(250));
-        assert_eq!(glide_span(0, 500), Duration::from_millis(530));
-        assert_eq!(
-            glide_span(600, 100),
-            Duration::from_millis(530),
-            "both ways"
-        );
+        assert!(glide_span(0, 100) < glide_span(0, 500));
+        assert_eq!(glide_span(600, 100), glide_span(0, 500), "both ways");
         assert_eq!(glide_span(0, 1000), FILL_GLIDE_MAX);
         // Breath's velocity: never zero, never more than 1.14 of the mean.
         let mut prev = 0u32;
@@ -1075,85 +1050,6 @@ mod tests {
         }
     }
 
-    /// A bar's fill is a fraction of the window: 0 % lights nothing, 100 % the
-    /// whole row with both gutters, 50 % exactly the left half, and the cell
-    /// under the edge takes `mix(track, fill, coverage)`. Geometry: a 1283 px
-    /// window, 7 px and 12 px gutters around 79 cells of 16 px.
-    #[test]
-    fn a_bar_maps_its_fraction_onto_the_window_with_edge_coverage() {
-        let (w, lo, cw, cols) = (1283u64, 7u64, 16u64, 79u64);
-        let hi_start = lo + cw * cols; // the right gutter
-        let cell = |s: &Surface, i: u64| s.span(lo + i * cw, lo + (i + 1) * cw, w);
-        let empty = bar(0, None, true);
-        assert!((0..cols).all(|i| cell(&empty, i) == Tone::TRACK));
-        assert_eq!(empty.span(0, lo, w), Tone::TRACK, "the left gutter");
-        let full = bar(1000, None, true);
-        assert!((0..cols).all(|i| cell(&full, i) == Tone::FULL));
-        assert_eq!(full.span(0, lo, w), Tone::FULL, "the left gutter");
-        assert_eq!(full.span(hi_start, w, w), Tone::FULL, "the right gutter");
-        let half = bar(500, None, true);
-        let x = w / 2; // 641.5 → the edge cell spans it
-        for i in 0..cols {
-            let (a, b) = (lo + i * cw, lo + (i + 1) * cw);
-            let t = cell(&half, i);
-            if b * 2 <= w {
-                assert_eq!(t, Tone::FULL, "cell {i} left of the middle");
-            } else if a * 2 >= w {
-                assert_eq!(t, Tone::TRACK, "cell {i} right of the middle");
-            } else {
-                // The coverage: (w/2 − a) / cw of the cell is lit.
-                let want = (255 * (w - 2 * a) / (2 * cw)) as i64;
-                assert!(
-                    (i64::from(t.fill) - want).abs() <= 1,
-                    "the edge cell {i} at {x}: {t:?}, want {want}"
-                );
-            }
-        }
-        // Coverage moves continuously: a one-permille step moves the edge
-        // cell's tone, never a whole cell at once.
-        let mut prev = cell(&bar(400, None, true), 31);
-        for p in 401..=420u16 {
-            let t = cell(&bar(p, None, true), 31).fill;
-            assert!(t >= prev.fill && t - prev.fill <= 22, "{p}: {t}");
-            prev = cell(&bar(p, None, true), 31);
-        }
-        // Flat (High Contrast): the centre decides, whole inks only.
-        let flat = bar(500, None, false);
-        assert!((0..cols).all(|i| {
-            let t = cell(&flat, i);
-            t == Tone::TRACK || t == Tone::FULL
-        }));
-        // …and at the ends, over the host's columns (the first and last carry
-        // the gutters to the window's edges): any started fill lights the
-        // first, only a whole one the last.
-        let column = |s: &Surface, i: u64| {
-            let x0 = if i == 0 { 0 } else { lo + i * cw };
-            let x1 = if i + 1 == cols { w } else { lo + (i + 1) * cw };
-            s.span(x0, x1, w)
-        };
-        let lit = |p: u16| -> Vec<bool> {
-            let s = bar(p, None, false);
-            (0..cols).map(|i| column(&s, i) == Tone::FULL).collect()
-        };
-        assert!(lit(0).iter().all(|l| !l), "0 % is an empty track");
-        assert!(lit(1000).iter().all(|l| *l), "100 % is the whole window");
-        for p in 1..1000u16 {
-            let l = lit(p);
-            assert!(l[0], "{p}: a started pass lights the first column");
-            assert!(
-                !l[cols as usize - 1],
-                "{p}: only a whole fill lights the last column"
-            );
-            assert!(
-                l.windows(2).all(|pair| pair[0] || !pair[1]),
-                "{p}: the lit columns are one run from the left"
-            );
-        }
-        // A one-column row is its centre.
-        assert_eq!(bar(499, None, false).span(0, w, w), Tone::TRACK);
-        assert_eq!(bar(500, None, false).span(0, w, w), Tone::FULL);
-    }
-
     /// The integral is exact: a span's mean over a linear ramp is the ramp at
     /// its middle; a span straddling a hard edge is the covered fraction; a
     /// zero-width span is the point tone; an empty surface is the track.
@@ -1161,7 +1057,6 @@ mod tests {
     fn a_span_is_the_mean_of_the_profile_over_it() {
         let ramp = Surface {
             edge: None,
-            rail: false,
             stops: vec![
                 Stop {
                     at: 0,

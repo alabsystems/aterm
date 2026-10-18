@@ -323,6 +323,10 @@ fn run_reference(root: &Path, op: &Op, ids: &mut Identities) -> Outcome {
             Ok(f) => unit(f.set_permissions(std::fs::Permissions::from_mode(bits))),
             Err(e) => errno(&e),
         },
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the reference model's own directory flush; the test compares results, not tiers"
+        )]
         Op::FsyncDir => unit(reference_open(root, true).and_then(|f| f.sync_all())),
         Op::ReadDir => match std::fs::read_dir(root) {
             Ok(entries) => {

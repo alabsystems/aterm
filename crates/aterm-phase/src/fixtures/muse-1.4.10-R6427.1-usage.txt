@@ -1,0 +1,24 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab) · after one ended turn, `/usage` typed (the menu's first row) and Enter · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+  Muse Code 1.4.10
+
+❯ carry on with the task
+
+◆ Hi! I am the local lab stub, not a model. (reply 1)
+
+┌───────────────────────┐
+│  Session usage        │
+│                       │
+│    Input      33,400  │
+│    Cached          0  │
+│    Output         12  │
+│    Total      33,412  │
+│                       │
+│    Turns            1 │
+│    Subagents     none │
+└───────────────────────┘
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  lab-stub · high · /private/tmp/at.lab0/proj · Auto-review

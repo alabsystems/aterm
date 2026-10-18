@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 bind for `NovaPhase`'s `Step` (`aterm_spec::derive::nova_phase_model`)
+//! Tier-1 bind for `NovaPhase`'s `Step` (`aterm_models_effects::nova_phase_model`)
 //! over every duration the genome decodes: the real phase function and emitter,
 //! walked at 1 ms, each window boundary validated against the model.
 //!
@@ -20,7 +20,7 @@ use aterm_effects::genome::{nova_duration_ms, nova_features};
 use aterm_effects::nova::{
     self, EMBER_TAIL_MS, MAX_NOVA_QUADS_PER, NOVA_PALETTES, NovaEnv, NovaPhase,
 };
-use aterm_spec::derive::nova_phase_model;
+use aterm_models_effects::nova_phase_model;
 use aterm_spec::verify;
 
 type State = BTreeMap<&'static str, i64>;

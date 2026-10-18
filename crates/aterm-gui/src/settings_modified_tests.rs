@@ -400,6 +400,30 @@ fn a_changed_row_offers_reset_on_its_own_page() {
         [("cursor_blink", None)]
     );
     assert_eq!(lab.text(), "scrollback_lines = 5000\n");
+
+    // The theme's own pair, written (what Follow system writes over an unset
+    // theme): neither slot is off its side's default, so the Follow system
+    // row carries the theme's Reset, on its page and on Modified.
+    for route in [SettingsRoute::Appearance, SettingsRoute::Modified] {
+        let mut lab = Lab::new("theme = \"dark:Default,light:Default Light\"\n");
+        lab.state_mut().navigate(route);
+        let compiled = lab.compile(1_200.0, 1_400.0);
+        if route == SettingsRoute::Appearance {
+            let label = &compiled
+                .semantic(&UiKey::new("settings/label/theme-mode"))
+                .unwrap()
+                .label;
+            assert!(label.contains("Changed"), "{label}");
+        }
+        let reset = rect_of(&compiled, &format!("settings/reset/{}", prefs::EDIT_THEME));
+        let control = rect_of(&compiled, THEME_MODE_ACTION);
+        assert!(
+            reset.x >= control.x + control.width,
+            "{route:?}: Reset follows the switch"
+        );
+        lab.commit(&format!("settings/reset/{}", prefs::EDIT_THEME), None);
+        assert_eq!(lab.text(), "", "{route:?}");
+    }
 }
 
 /// Compact rows keep Reset on the trailing side as every other row: after
@@ -459,32 +483,6 @@ fn special_page_switches_offer_reset_while_written() {
     }
     lab.commit("settings/reset/update.auto_apply", None);
     assert_eq!(lab.text(), "[packages]\nauto_install = false\n");
-
-    // Messages' one switch too.
-    let key = prefs::EDIT_EXPLAIN_HEAVY_LOAD;
-    let mut lab = Lab::new(&format!("{key} = false\n"));
-    lab.state_mut().navigate(SettingsRoute::Messages);
-    for (width, height) in [(1_200.0, 820.0), (420.0, 820.0)] {
-        let compiled = lab.compile(width, height);
-        let label = &compiled
-            .semantic(&UiKey::new(format!("settings/label/{key}")))
-            .unwrap()
-            .label;
-        assert!(label.contains("Changed"), "{label}");
-        let reset = rect_of(&compiled, &format!("settings/reset/{key}"));
-        let control = rect_of(&compiled, &format!("settings/control/{key}"));
-        assert!(
-            reset.x >= control.x + control.width,
-            "{width}: Reset follows the switch"
-        );
-    }
-    lab.commit(&format!("settings/reset/{key}"), None);
-    assert_eq!(lab.text(), "");
-    assert!(
-        lab.compile(1_200.0, 820.0)
-            .semantic(&UiKey::new(format!("settings/reset/{key}")))
-            .is_none()
-    );
 }
 
 /// The old shared word-effects switch is its own row on Modified, so a
@@ -758,13 +756,44 @@ fn a_modified_theme_slot_names_its_default_as_a_theme() {
             assert!(
                 label.ends_with(&format!(
                     ": {}",
-                    crate::app_config::unset_theme_name(appearance)
+                    crate::app_config::default_pair_side(appearance)
                 )),
                 "{side}: {label}"
             );
             assert!(!label.contains("Default: Default"), "{side}: {label}");
         }
     }
+}
+
+/// A themes-folder theme goes by the name its card shows, not its file id,
+/// in the status and in Undo's words. Negative control: a built-in's id is
+/// its name (`undo_names_the_change_and_what_it_restored`).
+#[test]
+fn a_kept_folder_theme_is_named_by_its_display_name() {
+    let mut lab = Lab::new("theme = \"Dracula\"\n");
+    let parsed = aterm_types::scheme::parse_theme_str(
+        "name = Studio Type\nforeground = #e0e6f0\nbackground = #141821\n",
+    )
+    .expect("a theme");
+    let mut assets = (*lab.state().assets).clone();
+    assets.themes =
+        crate::app_config::ThemeCatalog::from_parsed([("studio-type".to_string(), parsed)]);
+    lab.state_mut().assets = std::sync::Arc::new(assets);
+    lab.commit(
+        &format!("settings/set/{}", prefs::EDIT_THEME),
+        Some(SemanticInput::Text("studio-type".to_string())),
+    );
+    assert_eq!(lab.text(), "theme = \"studio-type\"\n");
+    assert_eq!(
+        lab.state().feedback.as_deref(),
+        Some("Color theme set to Studio Type")
+    );
+    lab.undo().expect("Undo is offered");
+    lab.undo().expect("and Redo");
+    assert_eq!(
+        lab.state().feedback.as_deref(),
+        Some("Restored Color theme: Studio Type")
+    );
 }
 
 /// The status names the change, and Undo names what it put back — then
@@ -816,11 +845,11 @@ fn undo_names_the_change_and_what_it_restored() {
         lab.state().feedback.as_deref(),
         Some("Restored Color theme: Nord")
     );
-    // No theme at all follows the system too, and says so.
+    // No theme at all is Default, and says so.
     lab.commit(&format!("settings/reset/{}", prefs::EDIT_THEME), None);
     assert_eq!(
         lab.state().feedback.as_deref(),
-        Some("Color theme reset to Follow system")
+        Some("Color theme reset to Default")
     );
     lab.undo().expect("Undo is offered");
     // One theme on both sides is named once.
@@ -1140,7 +1169,7 @@ fn undo_names_the_old_value_when_the_snapshot_arrives_first() {
     assert_eq!(lab.text(), "");
     assert_eq!(
         lab.state().feedback.as_deref(),
-        Some("Color theme reset to Follow system")
+        Some("Color theme reset to Default")
     );
     lab.undo().expect("Undo is offered");
     assert_eq!(

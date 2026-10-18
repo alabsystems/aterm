@@ -174,7 +174,7 @@ fn commands(asset: &Asset) -> usize {
 }
 
 #[test]
-fn animal_heads_are_semantic_bounded_and_species_true() {
+fn animal_heads_are_semantic_bounded_species_true_and_legible() {
     for a in load_all() {
         let id = &a.id;
         assert_eq!(&a.stem, id, "{id}: file stem and id must match");
@@ -225,13 +225,6 @@ fn animal_heads_are_semantic_bounded_and_species_true() {
         );
         let cmds = commands(&a);
         assert!(cmds <= 240, "{id}: {cmds} path commands exceeds the budget");
-    }
-}
-
-#[test]
-fn animal_faces_survive_a_sixteen_pixel_bake() {
-    for a in load_all() {
-        let id = &a.id;
         let silhouette = coverage(&render_roles(&a, &["outline"], 16));
         assert!(
             silhouette >= 35.0,
@@ -310,17 +303,4 @@ fn lexicon_species_and_authored_roster_are_the_same_set() {
         missing_art.is_empty() && orphan_art.is_empty(),
         "lexicon tags without art: {missing_art:?}; authored heads no word can summon: {orphan_art:?}"
     );
-}
-
-/// Every authored head resolves through the compiled lookup the renderer uses (the source drift
-/// test is `cat_glyphs_codegen`'s `animal_glyphs_gen_matches_assets`).
-#[test]
-fn every_authored_head_resolves_through_the_compiled_lookup() {
-    for a in load_all() {
-        assert!(
-            aterm_effects::animal_glyphs_gen::animal_glyph_from_key(&a.id).is_some(),
-            "{}: not in the compiled roster — rerun gen_animal_glyphs",
-            a.id
-        );
-    }
 }

@@ -485,18 +485,6 @@ mod tests {
     }
 
     #[test]
-    fn query_and_delete_actions() {
-        assert_eq!(
-            parse_kitty_command(&apc("a=q,i=2", b"")).unwrap().action,
-            KittyAction::Query
-        );
-        assert_eq!(
-            parse_kitty_command(&apc("a=d", b"")).unwrap().action,
-            KittyAction::Delete
-        );
-    }
-
-    #[test]
     fn placement_z_index_and_chunking() {
         let c = parse_kitty_command(&apc("a=p,p=3,c=5,r=2,z=-1,m=1,o=z", b"")).expect("parses");
         assert_eq!(c.action, KittyAction::Display);

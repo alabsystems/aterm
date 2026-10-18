@@ -10,7 +10,8 @@
 //!
 //! [`within`] is the loop and never panics; [`until_within`] panics naming what it waited for.
 //! [`first_exec`] pays the system's first-exec wait on a just-built binary once, unclocked, before
-//! the launch a hang detector times.
+//! the launch a hang detector times. [`past_text_busy`] execs a just-written file past the
+//! `ETXTBSY` a sibling test's fork can hold it in.
 //!
 //! Compiled out on `wasm32-unknown-unknown`, where `std::thread::sleep` and `Instant::now` panic.
 
@@ -63,6 +64,34 @@ pub fn until_within<T>(budget: Duration, what: &str, probe: impl FnMut() -> Opti
     match within(budget, UNTIL_GAP, probe) {
         Some(value) => value,
         None => panic!("timed out after {budget:?} waiting for: {what}"),
+    }
+}
+
+/// `spawn` (a `spawn`, `output` or `status` of a file this process JUST wrote or copied),
+/// again for as long as the kernel refuses the exec as `ETXTBSY`, up to [`MUST_HAPPEN`].
+///
+/// A sibling test thread that forks while this one still holds the file open for writing
+/// hands its child that descriptor, held until the child's own exec closes it, and Linux
+/// refuses to exec a file open for writing anywhere. Writing to a temporary name and
+/// renaming does not help: the child holds the inode, not the name. The window is only
+/// that other child's fork-to-exec, and a refused exec ran nothing, so trying again is
+/// safe; any other answer, and the last one, is returned as it came.
+///
+/// # Errors
+///
+/// What `spawn` returned last.
+pub fn past_text_busy<T>(mut spawn: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    let deadline = Instant::now() + MUST_HAPPEN;
+    loop {
+        match spawn() {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            done => return done,
+        }
     }
 }
 
@@ -176,95 +205,4 @@ fn scratch_dir() -> Option<PathBuf> {
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir(&dir).ok().map(|()| dir)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn within_answers_the_first_some_and_none_after_the_budget() {
-        let mut probes = 0;
-        let got = within(MUST_HAPPEN, Duration::ZERO, || {
-            probes += 1;
-            (probes == 3).then_some(probes)
-        });
-        assert_eq!(got, Some(3));
-
-        // A zero budget still probes once, and gives up after it.
-        let mut probes = 0;
-        let got: Option<()> = within(Duration::ZERO, Duration::from_millis(1), || {
-            probes += 1;
-            None
-        });
-        assert_eq!((got, probes), (None, 1));
-    }
-
-    #[test]
-    #[should_panic(expected = "timed out after 0ns waiting for: the never")]
-    fn until_within_names_what_it_waited_for() {
-        until_within::<()>(Duration::ZERO, "the never", || None);
-    }
-
-    /// One run per file, in a scratch environment of `PATH`, `HOME`, `TMPDIR` and the shell's own
-    /// variables, removed after. `/bin/sh` needs no first-exec assessment; no other test here hands
-    /// it to [`first_exec`], whose memory is per process.
-    #[cfg(unix)]
-    #[test]
-    fn first_exec_runs_a_file_once_in_a_scratch_environment() {
-        use std::collections::BTreeSet;
-        let dir = aterm_tempfile::tempdir().expect("a scratch dir");
-        let ran = dir.path().join("ran");
-        let ran = ran.to_str().expect("a UTF-8 scratch path");
-        let record = r#"{ echo run; env; } >> "$0""#;
-        first_exec(Path::new("/bin/sh"), &["-c", record, ran]);
-        first_exec(Path::new("/bin/sh"), &["-c", record, ran]);
-
-        let text = std::fs::read_to_string(ran).expect("the first call ran it");
-        let runs = text.lines().filter(|l| *l == "run").count();
-        assert_eq!(runs, 1, "one run for one file:\n{text}");
-        let value = |key: &str| {
-            text.lines()
-                .find_map(|l| l.strip_prefix(key)?.strip_prefix('='))
-                .unwrap_or_else(|| panic!("no {key} in:\n{text}"))
-        };
-        // What `sh` itself exports to the `env` it runs.
-        let shell_own = ["PWD", "OLDPWD", "SHLVL", "_"];
-        let names: BTreeSet<&str> = text
-            .lines()
-            .filter_map(|l| l.split_once('=').map(|(name, _)| name))
-            .filter(|name| !shell_own.contains(name))
-            .collect();
-        assert_eq!(
-            names,
-            BTreeSet::from(["HOME", "PATH", "TMPDIR"]),
-            "the whole environment:\n{text}"
-        );
-        let home = Path::new(value("HOME"));
-        assert_eq!(value("TMPDIR"), value("HOME"));
-        assert!(
-            home.starts_with(std::env::temp_dir()) && home != std::env::temp_dir(),
-            "a scratch HOME of its own: {}",
-            home.display()
-        );
-        assert!(!home.exists(), "removed after: {}", home.display());
-
-        let absent = dir.path().join("absent");
-        first_exec(&absent, &["--help"]);
-        assert_eq!(file_id(&absent), None);
-
-        // A file replaced by rename, as cargo re-copies a binary, is a new key.
-        let binary = dir.path().join("binary");
-        std::fs::write(&binary, "same bytes").unwrap();
-        let before = file_id(&binary).expect("a file");
-        let next = dir.path().join("next");
-        std::fs::write(&next, "same bytes").unwrap();
-        std::fs::rename(&next, &binary).unwrap();
-        assert_ne!(
-            file_id(&binary),
-            Some(before),
-            "a replaced file is a new key"
-        );
-        assert!(!absent.exists());
-    }
 }

@@ -92,8 +92,9 @@ aterm-link — the aterm fabric bridge
   aterm-link ls    --fleet <F> --broker <ep> --cap-file <path>... [--attention]
   aterm-link notify --on <attention|ask:<person>|halt>,... --exec <cmd>
                     a command run when the fabric needs a human (`notify` for its usage)
-  aterm-link broker <socket> [log] [--secret-file <path>]
-                    the local bus itself (`broker` for its usage)
+  aterm-link broker <socket> [log] [--secret-file <path>] [--durability strict|ordered|relaxed]
+                    the local bus itself (`broker` for its usage); relaxed acks
+                    before the fsync, and a power loss can take what it acked
   aterm-link broker --tcp <host:port> --key-file <k> --secret-file <s> <log>
                     the bus on the SEALED TCP wire, always guarded (a `sealed` build)
   aterm-link broker --repair <log>
@@ -129,6 +130,11 @@ over the sealed wire, --tcp --key-file. A flag given on the command line wins.
                          releases their `post --wait-ack`. `--no-receipts` turns
                          it off for one run, `[fabric] receipts = false` for good;
                          off, a sender's `post --wait-ack` waits out its deadline.
+  --log <off|turns>      `serve` only, off by default: `turns` mirrors each
+                         session log's turns, runs, needs and the steps they
+                         rise from onto its session's `ev` face, deduplicated
+                         by readers (`aterm fabric brief` folds them). Without
+                         the flag, `[fabric] log` in aterm.toml.
   --attention            `ls` only: keep only rows carrying an `attention=`
 
 `ls` prints one line per node and per session: <node> <host> <sid> state= inc=
@@ -157,8 +163,25 @@ pub const SEALED_BUILD_MARK: &str = "sealed TCP transport compiled in";
 /// the `aterm-link` symlink both land here.
 #[must_use]
 pub fn dispatch(args: &[String]) -> ExitCode {
+    dispatch_with_inherited_lanes(args, || {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "inherited bridge lanes require explicit ownership admission at executable startup",
+        ))
+    })
+}
+
+/// Dispatch with the composing executable's one-shot lane admission. It is
+/// called only after parsing selects inherited `serve`, never for observer or
+/// other verbs. The provider transfers already-owned descriptors; this safe
+/// library never infers ownership from raw descriptor flags.
+#[must_use]
+pub fn dispatch_with_inherited_lanes(
+    args: &[String],
+    take_lanes: impl FnOnce() -> std::io::Result<crate::bridge::InheritedLanes>,
+) -> ExitCode {
     match args.first().map(String::as_str) {
-        Some("serve") => run(&args[1..], true),
+        Some("serve") => run(&args[1..], true, take_lanes),
         // THE READ-SIDE VERBS DEFAULT THEIR FLAGS from the rendezvous file
         // (`crate::enable`); `serve` does not, because aterm launches it with
         // every flag spelled out and a bridge that silently took a different
@@ -178,7 +201,11 @@ pub fn dispatch(args: &[String]) -> ExitCode {
                 );
                 return ExitCode::from(2);
             }
-            run(&crate::enable::with_rendezvous_defaults(&args[1..]), false)
+            run(
+                &crate::enable::with_rendezvous_defaults(&args[1..]),
+                false,
+                take_lanes,
+            )
         }
         Some("notify") => crate::notify::main(&args[1..]),
         Some("broker") => broker(&args[1..]),
@@ -187,10 +214,7 @@ pub fn dispatch(args: &[String]) -> ExitCode {
         // THE RETIRED `hook` VERB: a silent no-op, never a refusal ([`retired_hook`]).
         Some("hook") => retired_hook(),
         // Asked for: stdout, exit 0, like `aterm --help` and `broker -h`.
-        Some("-h" | "--help" | "help") => {
-            print!("{USAGE}");
-            ExitCode::SUCCESS
-        }
+        Some("-h" | "--help" | "help") => aterm_uds::stdout::answer_exit("aterm link", USAGE, 0),
         // Refused BY NAME (module doc).
         Some(other) => {
             eprintln!("aterm-link: unknown subcommand `{other}`");
@@ -229,7 +253,11 @@ fn retired_hook() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run(args: &[String], serve: bool) -> ExitCode {
+fn run(
+    args: &[String],
+    serve: bool,
+    take_lanes: impl FnOnce() -> std::io::Result<crate::bridge::InheritedLanes>,
+) -> ExitCode {
     // THE SEALED WIRE IN A BUILD WITHOUT IT is refused here, by name, before
     // `parse` reads the key file: `serve` would otherwise redial for ever. Not
     // in `parse`, which `aterm fabric` also reads a sealed host's
@@ -264,7 +292,17 @@ fn run(args: &[String], serve: bool) -> ExitCode {
         if !parsed.receipts_given {
             cfg.receipts = crate::fabric::receipts_from_config();
         }
-        match Bridge::new(cfg).and_then(Bridge::run) {
+        // And `[fabric] log`, the bus mirror's switch (session log phase 4):
+        // what the bridge publishes, never which broker it reaches.
+        if !parsed.log_given {
+            cfg.log = crate::fabric::log_from_config();
+        }
+        let bridge = if cfg.sock.is_some() && cfg.token.is_some() {
+            Bridge::new(cfg)
+        } else {
+            take_lanes().and_then(|lanes| Bridge::with_inherited_lanes(cfg, lanes))
+        };
+        match bridge.and_then(Bridge::run) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("aterm-link serve: {e}");
@@ -294,6 +332,9 @@ pub(crate) struct Parsed {
     /// Whether `--receipts`/`--no-receipts` was on the command line — else
     /// `serve` reads `[fabric] receipts` ([`crate::fabric::receipts_from_config`]).
     pub(crate) receipts_given: bool,
+    /// Whether `--log` was on the command line — else `serve` reads
+    /// `[fabric] log` ([`crate::fabric::log_from_config`]).
+    pub(crate) log_given: bool,
 }
 
 /// One printed column, made safe and made a single token.
@@ -423,6 +464,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
     let mut attention = false;
     let mut presence_given = false;
     let mut receipts_given = false;
+    let mut log_given = false;
     let mut cfg = Config {
         fleet: String::new(),
         broker: String::new(),
@@ -436,6 +478,8 @@ pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
         // ON, matching `receipts_from_config`'s absent-key answer and what
         // `aterm fabric on` writes.
         receipts: true,
+        // OFF, matching `log_from_config`'s absent-key answer (D4 is open).
+        log: crate::mirror::LogMode::Off,
     };
     let mut token_file: Option<String> = None;
     let mut tcp = false;
@@ -480,6 +524,12 @@ pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
             "--no-receipts" => {
                 cfg.receipts = false;
                 receipts_given = true;
+            }
+            "--log" => {
+                let v = value()?;
+                cfg.log = crate::mirror::LogMode::parse(&v)
+                    .ok_or_else(|| format!("--log {v}: `off` or `turns`"))?;
+                log_given = true;
             }
             "--sock" => cfg.sock = Some(value()?),
             "--token-file" => token_file = Some(value()?),
@@ -526,6 +576,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
         attention,
         presence_given,
         receipts_given,
+        log_given,
     })
 }
 
@@ -608,6 +659,22 @@ pub(crate) fn default_state_dir() -> String {
 /// The key and the secret are files, never arguments (an argv is world-readable
 /// in `ps`), and both must be mode 0600 ([`transport::check_private`]).
 ///
+/// `--durability strict|ordered|relaxed` is what an ack promises, on either
+/// listener and guarded or not ([`crate::durability`]): `strict`, the
+/// default, acks after the full flush; `relaxed` after the page-cache write,
+/// which survives a broker crash and not a power loss; `ordered` is accepted
+/// and served strict by this build. A broker of any tier but strict takes the
+/// stop signals: its CLEAN STOP — SIGTERM, SIGINT or SIGHUP, or its exit for
+/// a replaced build — drops its listeners, and astream flushes the log and
+/// records it `Closed`, so a reboot after it moves nothing. A relaxed run
+/// that never stopped cleanly moves the log's generation, with lineage, at the
+/// first open in another boot ([`astream_broker::LogIdentity`]), so every
+/// bridge and notifier resumes where the log continues instead of trusting an
+/// offset a power loss took. A strict broker keeps the signals' default action,
+/// as before. A bare argv runs the build's default and a named tier — strict
+/// included — is kept, so `aterm fabric` reads the tier off the process table
+/// and the tier SERVED off the broker's `Hello`.
+///
 /// IT EXITS WHEN ITS BUILD IS REPLACED. A supervised broker is a `KeepAlive`
 /// launchd job or a `Restart=always` unit, and an update swaps the file its
 /// argv names in place: without this the old broker serves until the next
@@ -623,9 +690,9 @@ fn broker(args: &[String]) -> ExitCode {
     // announcing readiness. An update during startup must remain observable.
     let watch = ExeWatch::capture();
     const USAGE: &str = "\
-usage: aterm link broker <socket> [log] [--secret-file <path>]
+usage: aterm link broker <socket> [log] [--secret-file <path>] [--durability <tier>]
        aterm link broker --tcp <host:port> --key-file <path> --secret-file <path>
-                         [--allow-remote] [--unix <socket>] <log>
+                         [--allow-remote] [--unix <socket>] [--durability <tier>] <log>
        aterm link broker --repair <log>
 
   <socket>         the Unix socket path the bridge's `--broker` names
@@ -650,6 +717,37 @@ usage: aterm link broker <socket> [log] [--secret-file <path>]
                    passes the root's bus.sock) — a peer that can reach the TCP
                    port can hold all 64 of its pre-authentication slots without
                    the key, and nothing on the socket waits on them
+  --durability <tier>
+                   what an ack promises: strict (the default), ordered or
+                   relaxed. strict acks once the batch is flushed in full (on
+                   macOS F_FULLFSYNC, a flush of the drive's own cache): a
+                   power loss loses nothing acked. relaxed acks once it is
+                   written to the page cache, without waiting for that flush:
+                   it survives a crash or restart of the broker, but NOT a
+                   power loss, kernel panic or hard reset, which can take any
+                   record acked since the broker last started or stopped
+                   cleanly. ordered is the tier a later build serves; this one
+                   accepts the word and serves it strict, never weaker. A
+                   broker of any tier but strict stops cleanly on SIGTERM
+                   (launchd at logout or shutdown, `aterm fabric off`), SIGINT
+                   or SIGHUP, and when it exits for a replaced build: the log
+                   is flushed and marked closed, so the next boot changes
+                   nothing. After a relaxed stop that never got that far (power
+                   loss, panic, reset, SIGKILL) the first open in another boot
+                   moves the log's GENERATION and records where the two agree:
+                   every bridge and notifier resumes where the log continues —
+                   nothing below that point re-read, nothing posted after the
+                   restart skipped — and only the records the loss took are
+                   gone. A kill -9 in the same boot costs nothing when the log
+                   is on the boot volume. Off it (a separate /home partition,
+                   an external disk), and on a host whose kernel names no
+                   boot, every relaxed stop without that clean close moves the
+                   generation, a kill -9 included. A bare argv runs the
+                   build's default; a named tier, strict included, is kept. A
+                   build older than this one refuses --durability ordered, so
+                   its broker never starts on a job that names it: before
+                   going back to one, run `aterm fabric off`, then `aterm
+                   fabric on` with that build
   --repair <log>   serve nothing: TRUNCATE <log> at its first CORRUPT record,
                    which the broker refuses to open, and print how many bytes
                    went. The records from that one on are lost — possibly
@@ -667,86 +765,25 @@ second `listening <socket>` line once that is bound too. It exits 0 within a min
 of its executable being replaced by another build, for its supervisor (launchd
 KeepAlive, systemd Restart=always) to start that one.
 ";
-    let mut tcp: Option<String> = None;
-    let mut key_file: Option<String> = None;
-    let mut secret_file: Option<String> = None;
-    let mut unix: Option<String> = None;
-    let mut allow_remote = false;
-    let mut repair = false;
-    let mut words: Vec<&str> = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        let flag = args[i].as_str();
-        let mut value = |name: &str| -> Result<String, ExitCode> {
-            i += 1;
-            args.get(i).cloned().ok_or_else(|| {
-                eprintln!("aterm link broker: {name} needs a value");
-                eprint!("{USAGE}");
-                ExitCode::from(2)
-            })
-        };
-        // A REPEATED flag is refused, never won last: `--secret-file good
-        // --secret-file empty` quietly guarding with the wrong secret is the
-        // shape `mint` already refuses.
-        let once = |slot: &Option<String>, name: &str| -> Result<(), ExitCode> {
-            if slot.is_some() {
-                eprintln!("aterm link broker: {name} given twice");
-                return Err(ExitCode::from(2));
-            }
-            Ok(())
-        };
-        match flag {
-            "-h" | "--help" => {
-                print!("{USAGE}");
-                return ExitCode::SUCCESS;
-            }
-            "--tcp" => {
-                if let Err(c) = once(&tcp, "--tcp") {
-                    return c;
-                }
-                match value("--tcp") {
-                    Ok(v) => tcp = Some(v),
-                    Err(c) => return c,
-                }
-            }
-            "--key-file" => {
-                if let Err(c) = once(&key_file, "--key-file") {
-                    return c;
-                }
-                match value("--key-file") {
-                    Ok(v) => key_file = Some(v),
-                    Err(c) => return c,
-                }
-            }
-            "--secret-file" => {
-                if let Err(c) = once(&secret_file, "--secret-file") {
-                    return c;
-                }
-                match value("--secret-file") {
-                    Ok(v) => secret_file = Some(v),
-                    Err(c) => return c,
-                }
-            }
-            "--unix" => {
-                if let Err(c) = once(&unix, "--unix") {
-                    return c;
-                }
-                match value("--unix") {
-                    Ok(v) => unix = Some(v),
-                    Err(c) => return c,
-                }
-            }
-            "--allow-remote" => allow_remote = true,
-            "--repair" => repair = true,
-            other if other.starts_with('-') => {
-                eprintln!("aterm link broker: unknown flag `{other}`");
-                eprint!("{USAGE}");
-                return ExitCode::from(2);
-            }
-            word => words.push(word),
+    let parsed = match crate::broker_args::BrokerArgs::parse(args) {
+        Ok(parsed) => parsed,
+        Err(crate::broker_args::ParseError::Help) => {
+            return aterm_uds::stdout::answer_exit("aterm link", USAGE, 0);
         }
-        i += 1;
-    }
+        Err(crate::broker_args::ParseError::Usage(error)) => {
+            eprintln!("aterm link broker: {error}");
+            eprint!("{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    let tcp = parsed.tcp.cloned();
+    let key_file = parsed.key_file.cloned();
+    let secret_file = parsed.secret_file.cloned();
+    let unix = parsed.unix.cloned();
+    let durability = parsed.durability.cloned();
+    let allow_remote = parsed.allow_remote;
+    let repair = parsed.repair;
+    let words: Vec<&str> = parsed.words.iter().map(|word| word.as_str()).collect();
     // THE REPAIR SERVES NOTHING: one local file, and no other flag of the
     // line means anything to it — refused rather than ignored.
     if repair {
@@ -754,6 +791,7 @@ KeepAlive, systemd Restart=always) to start that one.
             || key_file.is_some()
             || secret_file.is_some()
             || unix.is_some()
+            || durability.is_some()
             || allow_remote
         {
             eprintln!("aterm link broker: --repair takes <log> alone: it serves nothing");
@@ -781,6 +819,15 @@ KeepAlive, systemd Restart=always) to start that one.
         eprintln!("aterm link broker: {why}");
         eprint!("{USAGE}");
         ExitCode::from(2)
+    };
+    let durability = match durability
+        .as_deref()
+        .map(crate::durability::Durability::parse)
+        .transpose()
+    {
+        // A bare argv runs the build's default ([`crate::durability::resolve`]).
+        Ok(d) => crate::durability::resolve(d),
+        Err(e) => return usage_error(&e),
     };
     let (endpoint, log) = match &tcp {
         None => {
@@ -872,12 +919,44 @@ KeepAlive, systemd Restart=always) to start that one.
     // Whether THIS call creates the log, so a refused bind can remove the
     // empty file it would otherwise leave behind.
     let log_created_here = !std::path::Path::new(&log).exists();
-    let opened = match secret {
-        Some(secret) => astream_broker::Broker::open_guarded(&log, secret),
-        None => astream_broker::Broker::open(&log),
-    };
+    // THE TIER, AND THE BOOT IT IS OPENED IN ([`crate::durability::open`]): a
+    // legacy relaxed mark from another boot is read into astream's unclean
+    // verdict, under the log's lock, whatever this run's tier. The boot is
+    // astream's own reading, the one the bridge's incarnation lease trusts
+    // ([`crate::durability::this_boot`]).
+    let boot = crate::durability::this_boot();
+    // A BROKER OF ANY TIER BUT STRICT STOPS CLEANLY: from here the stop
+    // signals wake the loop below instead of killing the process, so its
+    // listeners are dropped and astream closes the log cleanly (a full flush,
+    // then `Closed` in its sidecar) before it exits. Taken BEFORE the open:
+    // astream's writer and acceptors are this process's first threads after
+    // main, and each inherits the mask. A strict broker's acks are on the
+    // disk already, and it keeps the default action, as before.
+    let stop = (durability != crate::durability::Durability::Strict)
+        .then(|| take_stop_signals(std::thread::current()))
+        .flatten();
+    let opened = crate::durability::open(std::path::Path::new(&log), secret, durability, boot);
     let broker = match opened {
-        Ok(b) => b,
+        Ok(opened) => {
+            use std::io::Write as _;
+            let mut err = std::io::stderr();
+            if let Some(why) = &opened.renewed {
+                let _ = writeln!(
+                    err,
+                    "aterm link broker: {log}: {} — its generation moves, and every bridge and \
+                     notifier resumes where it continues",
+                    why.describe()
+                );
+            }
+            if let Some(kept) = &opened.mark_kept {
+                let _ = writeln!(
+                    err,
+                    "aterm link broker: could not remove the legacy relaxed mark {kept}; the \
+                     log's generation moves once more after the next reboot"
+                );
+            }
+            opened.broker
+        }
         Err(e) => {
             eprintln!("aterm link broker: open {log}: {e}");
             // THE LAST LINE IS ATERM'S REMEDY, when the refusal has one: the
@@ -948,36 +1027,128 @@ KeepAlive, systemd Restart=always) to start that one.
             let _ = writeln!(out, "listening {sock}");
         }
         let _ = out.flush();
+        // The tier SERVED is the broker's own word (`Hello`'s tag 0x01, the
+        // same answer status and doctor read), never inferred from the flag:
+        // `ordered` says "served strict" in this build.
         let _ = writeln!(
             std::io::stderr(),
-            "aterm link broker: {transport} on {shown}{beside_note}{guard_note}"
+            "aterm link broker: {transport} on {shown}{beside_note}{guard_note}, durability {}: \
+             {}; log {}",
+            durability.name(),
+            crate::durability::describe_served(durability, Some(broker.served_durability())),
+            broker.log_identity()
         );
     }
-    // The broker serves on its own threads; this one watches the executable.
-    // `BrokerHandle` has no `join` — `asb serve` parks the same way — and
-    // dropping the handle shuts the broker down and unlinks the socket, which
-    // is how it EXITS when its build is replaced (the doc above).
+    // The broker serves on its own threads; this one watches the executable
+    // and, for any tier but strict, waits for a stop signal. `BrokerHandle` has
+    // no `join` — `asb serve` parks the same way — and dropping the handle
+    // shuts the broker down and unlinks the socket, which is how it EXITS when
+    // its build is replaced or it is stopped (the doc above). With neither to
+    // wait for it serves until killed, as before the watch.
     let keep = (handle, beside);
-    let Some(mut watch) = watch else {
-        // No executable to watch: serve until killed, as before the watch.
-        loop {
+    let mut watch = watch;
+    loop {
+        if watch.is_some() {
+            std::thread::park_timeout(EXE_WATCH);
+        } else {
             std::thread::park();
         }
-    };
-    loop {
-        std::thread::park_timeout(EXE_WATCH);
-        if watch.poll() {
-            use std::io::Write as _;
+        let why = if let Some(sig) = stop.as_ref().and_then(StopSignal::taken) {
+            format!("stopped by {sig}")
+        } else if let Some(w) = watch.as_mut() {
+            if !w.poll() {
+                continue;
+            }
+            format!(
+                "{} was replaced by another build; exiting so the supervisor starts that one",
+                w.path.display()
+            )
+        } else {
+            continue;
+        };
+        use std::io::Write as _;
+        let mut err = std::io::stderr();
+        let _ = writeln!(err, "aterm link broker: {why}");
+        // THE CLEAN CLOSE: dropping the last listener joins the writer —
+        // nothing acks after it — and astream then flushes the log in full and
+        // records it `Closed` before it releases the lock, so a reboot after
+        // this keeps the identity at any tier. astream says on stderr, just
+        // above this line, if that close failed (the run then stays `Open`,
+        // and the next open in another boot moves the generation once: the
+        // safe direction).
+        drop(keep);
+        if durability != crate::durability::Durability::Strict {
             let _ = writeln!(
-                std::io::stderr(),
-                "aterm link broker: {} was replaced by another build; exiting so the supervisor \
-                 starts that one",
-                watch.path.display()
+                err,
+                "aterm link broker: {log}: closed by astream's clean close — flushed in full and \
+                 marked closed, so a reboot keeps its identity, unless astream-broker said \
+                 otherwise just above"
             );
-            drop(keep);
-            return ExitCode::SUCCESS;
+        }
+        return ExitCode::SUCCESS;
+    }
+}
+
+/// The stop signals a broker of any tier but strict takes itself ([`take_stop_signals`]):
+/// the first one to arrive, once the loop asks.
+struct StopSignal(std::sync::Arc<std::sync::atomic::AtomicI32>);
+
+impl StopSignal {
+    /// The signal's name, once one has arrived.
+    fn taken(&self) -> Option<&'static str> {
+        match self.0.load(std::sync::atomic::Ordering::Acquire) {
+            0 => None,
+            sig => Some(signal_name(sig)),
         }
     }
+}
+
+/// `SIGTERM` for 15, as a broker's stderr says it.
+fn signal_name(sig: i32) -> &'static str {
+    #[cfg(unix)]
+    {
+        match sig {
+            libc::SIGTERM => "SIGTERM",
+            libc::SIGINT => "SIGINT",
+            libc::SIGHUP => "SIGHUP",
+            _ => "a signal",
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = sig;
+        "a signal"
+    }
+}
+
+/// TAKE THE STOP SIGNALS, so a broker of any tier but strict stops cleanly
+/// instead of dying with its run still `Open` in the log's sidecar: SIGTERM
+/// (launchd at logout or shutdown, `launchctl bootout` under `aterm fabric
+/// off`, `systemctl stop`), SIGINT (^C) and SIGHUP (its terminal went away).
+/// They are blocked in the calling thread — which must be the process's only
+/// one: every thread started after inherits the mask — and one thread of
+/// their own takes the first with `sigwait`, records it and unparks `main`,
+/// which drops the listeners, so astream closes the log cleanly
+/// ([`aterm_uds::process::take_stop_signals`]). `None` when that thread
+/// cannot start: the signals keep their default action, the run stays `Open`,
+/// and the next open in another boot moves the generation — the safe
+/// direction. A second signal while the broker closes is left pending, and a
+/// supervisor's escalation to SIGKILL still ends it.
+#[cfg(unix)]
+fn take_stop_signals(main: std::thread::Thread) -> Option<StopSignal> {
+    let taken = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
+    let flag = std::sync::Arc::clone(&taken);
+    aterm_uds::process::take_stop_signals("broker-stop", move |sig| {
+        flag.store(sig, std::sync::atomic::Ordering::Release);
+        main.unpark();
+    })
+    .then_some(StopSignal(taken))
+}
+
+/// No POSIX signals here: the broker serves until it is killed.
+#[cfg(not(unix))]
+fn take_stop_signals(_main: std::thread::Thread) -> Option<StopSignal> {
+    None
 }
 
 /// The words that OPEN aterm's remedy for a log astream refuses as CORRUPT —
@@ -1277,10 +1448,7 @@ Prints one `<grant> <tag-hex>` line — append it to the file `serve --cap-file`
                     }
                 }
             }
-            "-h" | "--help" => {
-                print!("{USAGE}");
-                return ExitCode::SUCCESS;
-            }
+            "-h" | "--help" => return aterm_uds::stdout::answer_exit("aterm link", USAGE, 0),
             other if grant.is_none() && !other.starts_with('-') => grant = Some(other),
             other => {
                 eprintln!("aterm link mint: unknown argument `{other}`");
@@ -1311,11 +1479,10 @@ Prints one `<grant> <tag-hex>` line — append it to the file `serve --cap-file`
             // `<grant> <tag-hex>` in astream's one cap-file format, which every
             // reader splits at the LAST whitespace, so a grant whose filter holds
             // a space still reads back.
-            println!(
-                "{}",
-                astream_cap::capfile::format_line(&cap.filter, &cap.tag)
-            );
-            ExitCode::SUCCESS
+            minted_cap_to(
+                &mut std::io::stdout().lock(),
+                &astream_cap::capfile::format_line(&cap.filter, &cap.tag),
+            )
         }
         Err(e) => {
             eprintln!("aterm link mint: {e}");
@@ -1324,9 +1491,81 @@ Prints one `<grant> <tag-hex>` line — append it to the file `serve --cap-file`
     }
 }
 
+/// Print a minted capability only through the checked complete-result writer.
+fn minted_cap_to(out: &mut dyn std::io::Write, line: &str) -> ExitCode {
+    match crate::join::write_capability_to(out, &format!("{line}\n")) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!(
+                "aterm link mint: the capability was not written whole ({error}); mint again"
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn minted_cap_output_requires_a_complete_write_and_flush() {
+        let line = astream_cap::capfile::format_line("n-synthetic:r:/f/test", &[42; 32]);
+        let mut ordinary = Vec::new();
+        assert_eq!(minted_cap_to(&mut ordinary, &line), ExitCode::SUCCESS);
+        assert_eq!(ordinary, format!("{line}\n").as_bytes());
+        struct Refuses {
+            bytes: Vec<u8>,
+            accept: usize,
+            kind: std::io::ErrorKind,
+            flush: bool,
+            zero: bool,
+        }
+        impl std::io::Write for Refuses {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.zero {
+                    return Ok(0);
+                }
+                let n = bytes
+                    .len()
+                    .min(self.accept.saturating_sub(self.bytes.len()));
+                if n == 0 {
+                    return Err(self.kind.into());
+                }
+                self.bytes.extend_from_slice(&bytes[..n]);
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                if self.flush {
+                    Err(self.kind.into())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let mut admitted = Vec::new();
+        for (accept, kind, flush, zero) in [
+            (0, std::io::ErrorKind::StorageFull, false, false),
+            (3, std::io::ErrorKind::StorageFull, false, false),
+            (0, std::io::ErrorKind::BrokenPipe, false, false),
+            (usize::MAX, std::io::ErrorKind::StorageFull, true, false),
+            (0, std::io::ErrorKind::WriteZero, false, true),
+        ] {
+            let mut out = Refuses {
+                bytes: Vec::new(),
+                accept,
+                kind,
+                flush,
+                zero,
+            };
+            admitted.push(minted_cap_to(&mut out, &line) == ExitCode::FAILURE);
+        }
+        assert_eq!(
+            admitted,
+            vec![true; 5],
+            "no partial, lost or unflushed capability result is success"
+        );
+    }
 
     fn argv(line: &str) -> Vec<String> {
         line.split(' ').map(str::to_string).collect()
@@ -1469,19 +1708,10 @@ mod tests {
         assert!(already_replaced.poll());
     }
 
-    /// **`ls` PRINTS §7's ROW, AND `--attention` IS §9.3's VIEW.** The columns
-    /// with no writer are asserted PRESENT and `-` ("unknown").
+    /// **`ls` PRINTS §7's ROW.** The columns with no writer are asserted
+    /// PRESENT and `-` ("unknown"), and no body moves an operator's cursor.
     #[test]
-    fn ls_prints_section_7s_columns_and_attention_is_a_flag_not_an_error() {
-        // §9.3's flag parses (`run` refuses it on `serve`).
-        let base = "--fleet f1 --broker /tmp/b.sock --state /tmp/s";
-        assert!(!parse(&argv(base)).expect("ok").attention);
-        assert!(
-            parse(&argv(&format!("{base} --attention")))
-                .expect("--attention is a flag, not an unknown one")
-                .attention
-        );
-
+    fn ls_prints_section_7s_columns_one_safe_token_each() {
         // §7'S ROW, IN §7'S ORDER, then the six documented additions.
         let (body, _) = crate::body::Body::decode(
             b"v=1 t=1 inc=4 epoch=ab12 gen=9:beef state=live hold=0 holder=h-andrew \

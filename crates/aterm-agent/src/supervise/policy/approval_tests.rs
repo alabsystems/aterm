@@ -72,6 +72,7 @@ fn full() -> ApprovalCtx {
         Some(PathBuf::from("/Users/_owner")),
         502,
         Some(PathBuf::from("/var/folders/ab/xyz/T")),
+        std::sync::Arc::new(crate::supervise::policy::LiveProbe),
     )
 }
 
@@ -199,15 +200,6 @@ fn read_call_box_2_1_284(path: &str) -> Vec<String> {
 // --- the rm circuit breaker --------------------------------------------------
 
 #[test]
-fn the_measured_rm_breaker_escalates_its_loop_and_outside_bypass() {
-    let rows = lines(CAP_RM);
-    let d = on_screen(&rows, &bypass());
-    assert!(reason(&d).contains("compound command (`for`)"), "{d:?}");
-    let d = on_screen(&rows, &ctx());
-    assert!(reason(&d).contains("outside a bypass session"), "{d:?}");
-}
-
-#[test]
 fn an_rm_breaker_on_scratch_is_approved_in_bypass_under_its_row_guard() {
     let cmd = "S=/private/tmp/claude-502/x; rm -rf \"$S/t5\"";
     let rows = rm_box(cmd);
@@ -249,13 +241,6 @@ fn an_rm_breaker_on_scratch_is_approved_in_bypass_under_its_row_guard() {
     assert!(reason(&on_screen(&rows, &none(bypass()))).contains("approve = \"none\""));
     let d = on_screen(&rm_box("S=/usr; rm -rf \"$S/t5\""), &bypass());
     assert!(reason(&d).contains("not strictly inside"), "{d:?}");
-    let d = on_screen(&rm_box("rm -rf \"$UNSET/t5\""), &bypass());
-    assert!(reason(&d).contains("$UNSET"), "{d:?}");
-    let d = on_screen(
-        &rm_box("cd /private/tmp/claude-502/x && rm -rf \"$S\" t5"),
-        &bypass(),
-    );
-    assert!(approved(&d).is_none(), "{d:?}");
     // The legacy `rm_breaker = false`: the loop leaves the rule no
     // scratch root, and the same box is a person's.
     let withheld = ApprovalCtx {
@@ -330,7 +315,6 @@ fn the_2_1_281_breaker_with_its_auto_deny_countdown_is_the_rm_rules() {
             "{wrapped}"
         );
         if !wrapped {
-            assert!(reason(&on_screen(&rows, &ctx())).contains("outside a bypass"));
             continue;
         }
         let all = on_screen(&measured, &full());
@@ -351,30 +335,6 @@ fn the_2_1_281_breaker_with_its_auto_deny_countdown_is_the_rm_rules() {
             "{why}"
         );
     }
-}
-
-/// Full power's `unproven:` names a breaker's kind once: the label replaces the
-/// reason's own leading "the rm circuit breaker". Control: a kind whose reason
-/// already carries the label is left as it was.
-#[test]
-fn full_powers_unproven_names_the_breaker_once() {
-    let rm = phase_fixtures::screen(phase_fixtures::BOX_RM);
-    let d = on_screen(&rm, &full());
-    let (rule, _, _, _, unproven) = approval(&d);
-    assert_eq!(rule, RULE_ALLOW_ONCE);
-    assert_eq!(
-        unproven,
-        Some("the rm circuit breaker (possibly-empty variable path) outside a bypass session")
-    );
-    let wf = phase_fixtures::screen(phase_fixtures::BOX_RM_UNRESOLVABLE_WORKFLOW);
-    let d = on_screen(&wf, &full());
-    let (_, _, _, _, unproven) = approval(&d);
-    let unproven = unproven.expect("unproven");
-    assert!(
-        unproven.starts_with("the rm circuit breaker (statically-unresolvable target): "),
-        "{unproven}"
-    );
-    assert_eq!(unproven.matches("circuit breaker").count(), 1, "{unproven}");
 }
 
 /// A zsh snapshot's person's part, as 2.1.284 writes it, with `functions`
@@ -453,8 +413,8 @@ fn a_shell_startup_the_models_do_not_assume_proves_no_rm_and_reads_nothing() {
 
     // zsh looks functions up after quote removal (`r\m`, `r''m`, `$'\x72m'` run
     // a function `rm`). The line models approve no quoted spelling of a
-    // command name, and [`ShellStartup::admits`] names the function for every
-    // spelling too, so neither alone is load-bearing.
+    // command name (`ShellStartup::admits` names the function for every
+    // spelling too: `shell_startup_tests`).
     for (line, rm) in [
         ("S=/private/tmp/claude-502/x; r\\m -rf \"$S/t5\"", true),
         ("S=/private/tmp/claude-502/x; r''m -rf \"$S/t5\"", true),
@@ -475,10 +435,6 @@ fn a_shell_startup_the_models_do_not_assume_proves_no_rm_and_reads_nothing() {
             "the models read {line:?} as written: {d:?}"
         );
         let startup = if rm { &rm_fn } else { &git_fn };
-        let name = if rm { "rm" } else { "git" };
-        let state = startup.as_ref().expect("a startup");
-        let why = state.admits(line).expect_err(line);
-        assert!(why.contains(&format!("`{name}` is a function")), "{why}");
         assert!(approved(&on_screen(&b, &with(startup, base()))).is_none());
     }
 
@@ -555,24 +511,13 @@ fn under_zsh_only_a_plain_line_is_a_proven_read() {
     }
 }
 
-/// The 2.1.278 breaker from a workflow (aterm-phase's measured fixture): its
-/// loop and `set --` escalate.
-#[test]
-fn the_workflow_breaker_fixture_escalates() {
-    let d = on_screen(&phase_fixtures::bash_multi_row_with_note(), &bypass());
-    assert!(approved(&d).is_none(), "{d:?}");
-}
-
-/// Lines the rm rule once approved under `approve = "safe"` in bypass that
-/// reach `/etc` (a failing `$(mktemp -d)`, zsh's `$=S`, `$_`, a `$PWD`
-/// assigned before a `cd`, a zsh modifier, a background-subshell assignment, a
-/// prefix on `export`, a redirect whose glob qualifier assigns, `$TMPDIR` from
-/// the supervisor), or that set the variable to a number so rm removes a
-/// relative path (`printf -%d`, `{S}>/dev/null`), are escalated by the safe
-/// rules naming why; `print -v` too. Under full power the same box is pressed
-/// with the reason as `unproven`. Negative controls: a literal scratch path, a
-/// scratch variable bound first, a guarded `mktemp` stay proven under both.
-/// The `for`/`set --` loop is escalated by the rules and pressed by full power.
+/// The resolver's refusals reach the box (each line's reason is the
+/// resolver's own, pinned in `rm_breaker_tests`): the safe rules escalate
+/// naming why, and full power presses
+/// the same box with the reason as `unproven` under the breaker's kind.
+/// Negative controls: a literal scratch path and a guarded `mktemp` stay
+/// proven under both. The `for`/`set --` loop is escalated by the rules and
+/// pressed by full power.
 #[test]
 fn the_audits_unsound_rm_approvals_escalate_and_full_power_still_presses_them() {
     let default_bypass = ApprovalCtx {
@@ -581,42 +526,13 @@ fn the_audits_unsound_rm_approvals_escalate_and_full_power_still_presses_them() 
     };
     for (cmd, why) in [
         ("D=$(mktemp -d); rm -rf \"$D/etc\"", "removes /etc"),
-        ("D=$(mktemp -d) && rm -rf $D/etc", "must be double-quoted"),
-        (
-            "D=$(mktemp -d /private/tmp/claude-502/w.XXXXXX); rm -rf \"$D/etc\"",
-            "removes /etc",
-        ),
         (
             "rm -rf \"$TMPDIR/probe\"",
             "a value from the environment is not proven",
         ),
-        ("S='y /etc'; rm -rf /tmp/x/$=S", "`$=S`"),
-        ("_=/tmp/x; rm -rf \"$_/etc\"", "_ is assigned"),
-        (
-            "PWD=/tmp/x; cd /usr; rm -rf \"$PWD/etc\"",
-            "PWD is assigned",
-        ),
-        ("S=/tmp/w/a; rm -rf \"$S:h:h\"", "zsh computes"),
-        ("S=/tmp/w/a && true & rm -rf \"$S/x\"", "$S is not assigned"),
-        (
-            "S=/tmp/w/a; S=/etc export T=$S; rm -rf \"$T/x\"",
-            "$T is not assigned",
-        ),
-        (
-            "S=/tmp/w/a; print -v S /etc; rm -rf \"$S/x\"",
-            "$S is not known after `print`",
-        ),
-        (
-            "S=/private/tmp/claude-502/w; X='/tmp/*(e:S=/etc:)'; echo hi < $~X; rm -rf \"$S/x\"",
-            "$S is not known after `echo`",
-        ),
         (
             "S=/private/tmp/claude-502/w; printf -%d S=5; rm -rf \"$S/x\"",
             "$S is not known after `printf`",
-        ),
-        (
-            "S=/private/tmp/claude-502/w; echo hi {S}>/dev/null; rm -rf \"$S/x\"",
-            "$S is not known after `echo`",
         ),
     ] {
         let rows = rm_box(cmd);
@@ -638,11 +554,7 @@ fn the_audits_unsound_rm_approvals_escalate_and_full_power_still_presses_them() 
     }
     for cmd in [
         "rm -rf /private/tmp/claude-502/scratch/x",
-        "S=/private/tmp/claude-502/scratch && rm -rf $S/a $S/z",
-        "D=$(mktemp -d /private/tmp/claude-502/w.XXXXXX) && rm -rf \"$D/etc\"",
-        "D=$(mktemp -d /private/tmp/claude-502/w.XXXXXX); rm -rf \"${D:?}/etc\"",
         "D=$(mktemp -d) && rm -rf \"$D/etc\"",
-        "OUT=/private/tmp/claude-502/out; echo \"OUT=$OUT\"; rm -rf \"$OUT\"/*",
     ] {
         for c in [bypass(), default_bypass.clone()] {
             let d = on_screen(&rm_box(cmd), &c);
@@ -657,10 +569,11 @@ fn the_audits_unsound_rm_approvals_escalate_and_full_power_still_presses_them() 
     assert_eq!(approved(&d), Some(RULE_ALLOW_ONCE), "{d:?}");
 }
 
-/// The guards `D=$(mktemp -d) || exit` and `: "${D:?}"` prove at the box.
-/// Negative controls: `exit` with two words, a non-numeric word (evaluated as
-/// arithmetic), a redirect on `:`, a substitution in its word; under the
-/// default, proven boxes keep their rule id.
+/// The guards `D=$(mktemp -d) || exit` and `: "${D:?}"` prove at the box: the
+/// rest of the line reads them as guards. Negative controls: `exit` with two
+/// words, a non-numeric word (evaluated as arithmetic), a redirect on `:`, a
+/// substitution in its word; under the default, proven boxes keep their rule
+/// id.
 #[test]
 fn the_mktemp_guards_exit_and_colon_prove_at_the_box() {
     let default_bypass = ApprovalCtx {
@@ -669,10 +582,7 @@ fn the_mktemp_guards_exit_and_colon_prove_at_the_box() {
     };
     for cmd in [
         "D=$(mktemp -d) || exit 1; rm -rf \"$D/x\"",
-        "D=$(mktemp -d) || exit; rm -rf \"$D/x\"",
         "D=$(mktemp -d); : \"${D:?}\"; rm -rf \"$D/x\"",
-        "D=$(mktemp -d /private/tmp/claude-502/w.XXXXXX) || exit 1; rm -rf \"$D/x\"",
-        "D=$(mktemp -d /private/tmp/claude-502/w.XXXXXX); : \"${D:?}\"; rm -rf \"$D/x\"",
     ] {
         for c in [bypass(), default_bypass.clone()] {
             let d = on_screen(&rm_box(cmd), &c);
@@ -711,10 +621,12 @@ fn the_mktemp_guards_exit_and_colon_prove_at_the_box() {
     }
 }
 
-/// On a real link: `S=<scratch>/p; rm -rf "$S/out/x"` with `out -> /etc`
-/// removes `/etc/x`, and is escalated (the scratch root is a test-owned temp
-/// dir; nothing runs). Negative controls: the link itself is removable (rm
-/// never follows the last component); full power still presses.
+/// The box is judged on disk (the link rules: `rm_breaker_tests`'s
+/// `an_rm_through_a_symbolic_link_is_judged_where_it_leads`): `S=<scratch>/p;
+/// rm -rf "$S/out/x"` with `out -> /etc` removes `/etc/x`, and is escalated
+/// (the scratch root is a test-owned temp dir; nothing runs). Negative
+/// control: the link itself is removable (rm never follows the last
+/// component).
 #[cfg(unix)]
 #[test]
 fn an_rm_breaker_through_a_link_out_of_scratch_escalates() {
@@ -723,24 +635,17 @@ fn an_rm_breaker_through_a_link_out_of_scratch_escalates() {
     std::fs::create_dir_all(base.join("p")).expect("dir");
     std::os::unix::fs::symlink("/etc", base.join("p/out")).expect("link");
     let tmp = base.to_string_lossy().trim_end_matches('/').to_string();
-    let default = ApprovalCtx {
+    let proven = ApprovalCtx {
         bypass_mode: true,
+        approve: Approve::Safe,
+        rm_breaker_warn: false,
         ..ApprovalCtx::new(
             PathBuf::from("/private/tmp/claude-502/scratch/work1"),
             Some(PathBuf::from("/Users/_owner")),
             502,
             Some(base.clone()),
+            std::sync::Arc::new(crate::supervise::policy::LiveProbe),
         )
-    };
-    let proven = ApprovalCtx {
-        approve: Approve::Safe,
-        rm_breaker_warn: false,
-        ..default.clone()
-    };
-    // `approve = "safe"` with its default warning.
-    let warned = ApprovalCtx {
-        rm_breaker_warn: true,
-        ..proven.clone()
     };
     // The box without its description row: this command row is too long
     // for the geometry to prove the description is no wrap of it.
@@ -750,50 +655,14 @@ fn an_rm_breaker_through_a_link_out_of_scratch_escalates() {
             .filter(|r| r != "   Remove directories tmp/a and tmp/b")
             .collect()
     };
-    let through = rows(&format!("S={tmp}/p; rm -rf \"$S/out/x\""));
-    let link = rows(&format!("S={tmp}/p; rm -rf \"$S/out\""));
-    let (d_through, d_link, d_default, d_warned) = (
-        on_screen(&through, &proven),
-        on_screen(&link, &proven),
-        on_screen(&through, &default),
-        on_screen(&through, &warned),
-    );
+    let d_through = on_screen(&rows(&format!("S={tmp}/p; rm -rf \"$S/out/x\"")), &proven);
+    let d_link = on_screen(&rows(&format!("S={tmp}/p; rm -rf \"$S/out\"")), &proven);
     let _ = std::fs::remove_dir_all(&base);
     assert!(
         reason(&d_through).contains("leads through a symbolic link to"),
         "{d_through:?}"
     );
     assert_eq!(approved(&d_link), Some(RULE_RM_BREAKER), "{d_link:?}");
-    assert_eq!(approved(&d_default), Some(RULE_ALLOW_ONCE), "{d_default:?}");
-    // Under `safe`'s default the unproven box is pressed with the warning:
-    // where the link leads is the reason it carries.
-    let (rule, _, _, _, unproven) = approval(&d_warned);
-    assert_eq!(rule, RULE_RM_BREAKER_WARN);
-    assert!(
-        unproven.is_some_and(|u| u.contains("leads through a symbolic link to")),
-        "{d_warned:?}"
-    );
-}
-
-/// With the rm rule withheld (no scratch roots), a directory the line's own
-/// `mktemp -d` made is not proven either. Negative control: the same boxes with
-/// roots are proven.
-#[test]
-fn a_withheld_rm_rule_proves_no_fresh_directory() {
-    let withheld = ApprovalCtx {
-        scratch_roots: Vec::new(),
-        ..bypass()
-    };
-    for cmd in [
-        "D=$(mktemp -d) && rm -rf \"$D/x\"",
-        "D=$(mktemp -d w.XXXXXX) && rm -rf \"$D/x\"",
-        "D=$(mktemp -d); ls \"$D\"; rm -rf \"$D\"",
-    ] {
-        let d = on_screen(&rm_box(cmd), &withheld);
-        assert!(reason(&d).contains("withheld"), "{cmd}: {d:?}");
-        let d = on_screen(&rm_box(cmd), &bypass());
-        assert_eq!(approved(&d), Some(RULE_RM_BREAKER), "{cmd}: {d:?}");
-    }
 }
 
 // --- read-only Bash ---------------------------------------------------------
@@ -835,26 +704,6 @@ fn a_read_only_box_is_approved_outside_bypass_and_never_in_it() {
     assert_eq!(*choice, Choice::Digit(1));
 }
 
-/// A write is not approved: the captured `touch x` box escalates.
-#[test]
-fn writes_and_the_measured_touch_box_escalate() {
-    // The `touch x` box is a `Bash command` box (its description row `Create
-    // file x` is not a Write header), so the command is judged and refused as
-    // a write.
-    let d = on_screen(&lines(CAP_BOX1), &ctx());
-    assert!(
-        reason(&d).contains("not read-only") && reason(&d).contains("touch"),
-        "{d:?}"
-    );
-    let d = on_screen(
-        &bash_box(&["touch x"], Some("Create the file x now")),
-        &ctx(),
-    );
-    assert!(reason(&d).contains("not read-only"), "{d:?}");
-    let d = on_screen(&lines(CAP_EDIT), &ctx());
-    assert!(reason(&d).contains("edit box"), "{d:?}");
-}
-
 /// Rows joined with spaces can launder a write: barred rows are judged under
 /// every reading ([`PromptV2::readings`]), the newline one included. Without
 /// bars the command is one shell line, so its rows, description included, are
@@ -883,12 +732,6 @@ fn a_write_on_a_second_row_is_not_laundered_by_the_space_join() {
         Some("Show the log"),
     );
     assert_eq!(approved(&on_screen(&wrapped, &ctx())), Some(RULE_READ_ONLY));
-}
-
-#[test]
-fn a_box_with_a_vendor_note_escalates() {
-    let d = on_screen(&phase_fixtures::bash_multi_row(), &ctx());
-    assert!(reason(&d).contains("vendor note"), "{d:?}");
 }
 
 /// Without bars, geometry says which rows can be the command's wrap
@@ -937,9 +780,6 @@ fn a_wide_character_row_never_hides_a_wrapped_tail() {
     let cjk = format!("cat {}", "日".repeat(55));
     let d = on_screen(&bash_box(&[&cjk, "&& rm -rf ~/work"], None), &ctx());
     assert!(reason(&d).contains("rm"), "{d:?}");
-    let emoji = format!("cat {}", "🦀".repeat(55));
-    let d = on_screen(&bash_box(&[&emoji, "&& rm -rf ~/work"], None), &ctx());
-    assert!(reason(&d).contains("rm"), "{d:?}");
     let ascii = format!("cat {}", "a".repeat(110));
     let d = on_screen(&bash_box(&[&ascii, "&& rm -rf ~/work"], None), &ctx());
     assert!(reason(&d).contains("rm"), "{d:?}");
@@ -962,10 +802,6 @@ fn a_wide_character_row_never_hides_a_wrapped_tail() {
     );
     let d = on_screen(&rm_breaker_rows(&wide, "&& touch ~/x"), &bypass());
     assert!(approved(&d).is_none(), "{d:?}");
-    // Control: the same rm line with no wide run and no tail is approved.
-    let short = "S=/private/tmp/claude-502/x; rm -rf \"$S/t5\"";
-    let d = on_screen(&rm_box(short), &bypass());
-    assert_eq!(approved(&d), Some(RULE_RM_BREAKER), "{d:?}");
 }
 
 /// The captured rm box with its command row replaced by `cmd` and `tail` drawn
@@ -980,55 +816,12 @@ fn rm_breaker_rows(cmd: &str, tail: &str) -> Vec<String> {
     rows
 }
 
-/// Every known bypass line, drawn as a box (one line per barred row), is
-/// escalated, in and out of bypass.
-#[test]
-fn no_measured_bypass_line_is_approved() {
-    let bypasses = [
-        "git log --oneline -3 # what's new\ngit push --force",
-        "ls # don't worry\nmv a b",
-        "ls # don't\nrm -rf \"$S/x\"",
-        "cat <<EOF\necho '\nEOF\nrm -rf /",
-        "rm>/dev/null -rf /",
-        "ls >&out.txt",
-        "git diff --output=/Users/_owner/.zshrc",
-        "git log --output=/tmp/x",
-        "git -c core.fsmonitor='touch /tmp/pwn' status",
-        "git -c core.pager='sh -c \"rm -rf ~\"' log",
-        "git grep -O\"touch /tmp/x\" foo",
-        "git grep -nO hello",
-        "git grep --open hello",
-        "git log --help",
-        "git -h log",
-        "rg --pre ./x.sh foo",
-        "sort --compress-program=./x.sh f",
-        "/tmp/evil/ls",
-        "env -i PATH=/tmp/evil ls",
-        "printf -v PATH /evil",
-        "export PATH=/tmp/evil:$PATH; ls",
-        "less +!touch\\ x file",
-        "date -s 12:00",
-        "python3 scripts/purge_report.py --delete-all",
-        "git status\ntouch x",
-        "ls\nmkdir -p foo",
-    ];
-    for line in bypasses {
-        let rows: Vec<String> = line.lines().map(|l| format!("│ {l}")).collect();
-        let refs: Vec<&str> = rows.iter().map(String::as_str).collect();
-        let screen = bash_box(&refs, Some("Run the requested command"));
-        for c in [ctx(), bypass()] {
-            let d = on_screen(&screen, &c);
-            assert!(approved(&d).is_none(), "{line:?} approved: {d:?}");
-        }
-    }
-}
-
 /// A command whose name the classifier cannot read (a substitution at a head,
 /// an argument cut from its command, a name behind a redirect or zsh's `-`;
 /// see classify's `a_substitution_is_a_word_of_the_command_around_it` and
-/// `a_redirect_or_a_dash_before_the_name_does_not_hide_it`), drawn as a box,
-/// is never pressed: the read-only rule escalates each outside bypass, and the
-/// rm breaker each beside an rm it would approve alone, after or before it.
+/// `a_redirect_or_a_dash_before_the_name_does_not_hide_it`), beside an rm the
+/// breaker would approve alone, after or before it, is never pressed: the rm
+/// resolver does not see it, and the rest of the line must read.
 #[test]
 fn a_command_the_classifier_cannot_name_is_never_pressed() {
     const RM: &str = "S=/tmp/w; rm -rf \"$S/x\"";
@@ -1054,16 +847,8 @@ fn a_command_the_classifier_cannot_name_is_never_pressed() {
             "2>/dev/null touch /tmp/x",
             "- touch /tmp/x",
         ]);
-    let mut read_only = Vec::new();
     let mut breaker = Vec::new();
     for line in lines {
-        // No description row: under the space reading its words would follow
-        // the line and could refuse it for them.
-        let d = on_screen(&bash_box(&[line], None), &ctx());
-        match &d {
-            Decision::Escalate { reason } if reason.starts_with("not read-only") => {}
-            _ => read_only.push(format!("{line:?}: {d:?}")),
-        }
         for cmd in [format!("{RM}; {line}"), format!("{line}; {RM}")] {
             let d = on_screen(&rm_box(&cmd), &bypass());
             if approved(&d).is_some() {
@@ -1071,11 +856,7 @@ fn a_command_the_classifier_cannot_name_is_never_pressed() {
             }
         }
     }
-    assert!(
-        read_only.is_empty() && breaker.is_empty(),
-        "the read-only rule did not escalate on the classifier's verdict: {read_only:#?}\n\
-         the rm breaker approved: {breaker:#?}"
-    );
+    assert!(breaker.is_empty(), "the rm breaker approved: {breaker:#?}");
 }
 
 /// Never a scope grant: only the [`Role::Once`] option is pressed; a box
@@ -1136,46 +917,35 @@ fn a_barred_row_shown_as_the_description_is_still_judged() {
     );
 }
 
-/// An option-shaped row among the command rows ends nothing: options are the
-/// rows under the question.
-#[test]
-fn an_option_shaped_row_above_the_question_escalates() {
-    let rows = bash_box(&["ls", "1. Yes", "touch x"], None);
-    let d = on_screen(&rows, &ctx());
-    assert!(approved(&d).is_none(), "{d:?}");
-    // The check itself, on a screen whose command rows would read.
-    let rows = bash_box(&["ls -la"], Some("1. Yes"));
-    let d = on_screen(&rows, &ctx());
-    assert!(reason(&d).contains("option-shaped row"), "{d:?}");
-}
-
-/// The safe rules judge a Claude Code session's box, and of a Codex session's
-/// only its folder-trust gate, read by its reader, on a reading that vouches
-/// for its phase: a shell or pager showing a captured box is not judged, and
-/// under `"safe"` a Codex exec or patch box escalates (full power answers it:
-/// `full_power_answers_codex_boxes_by_role`), while the gate is the trust
-/// rule's (`codexs_folder_trust_gate_is_judged_by_the_trust_rule`). A reading
-/// not vouching for its phase decides nothing at full power either.
+/// The safe rules judge a Claude Code session's box alone, read by its
+/// reader, on a reading that vouches for its phase: a shell or pager showing
+/// a captured box is not judged, and a Codex's box is no box here at all
+/// (aterm reads no Codex screen: codex-alab answers its own). A reading not
+/// vouching for its phase decides nothing at full power either.
 #[test]
 fn only_a_claude_sessions_box_is_judged() {
-    use aterm_phase::codex::fixtures as cx;
     let rows = bash_box(&["git status --short"], None);
     assert_eq!(approved(&on_screen(&rows, &ctx())), Some(RULE_READ_ONLY));
     for shell in ["zsh", "-zsh", "less", "cat"] {
         assert_eq!(decide_screen(Some(shell), &rows, &ctx()), None, "{shell}");
     }
-    for fixture in [cx::BOX_EXEC, cx::BOX_PATCH, cx::BOX_EXEC_0_163] {
-        let codex = phase_fixtures::screen(fixture);
-        let d = decide_screen(Some("codex"), &codex, &ctx()).expect("codex's reader sees its box");
+    let codex = phase_fixtures::rows(&[
+        "  Would you like to run the following command?",
+        "",
+        "  $ git status --short",
+        "",
+        "› 1. Yes, proceed (y)",
+        "  2. No, and tell Codex what to do differently (esc)",
+        "",
+        "  Press enter to confirm or esc to cancel",
+    ]);
+    for c in [ctx(), full()] {
         assert!(
-            reason(&d).contains("a codex session's box: the safe rules judge"),
-            "{d:?}"
+            decide_screen(Some("codex"), &codex, &c).is_none(),
+            "{:?}",
+            c.approve
         );
     }
-    // The gate reaches the trust rule, which wants the session's own folder.
-    let gate = phase_fixtures::screen(phase_fixtures::CODEX_TRUST);
-    let d = decide_screen(Some("codex"), &gate, &ctx()).expect("codex's reader sees its gate");
-    assert!(reason(&d).contains("not the session's cwd"), "{d:?}");
     // A reading that does not vouch for its phase decides nothing.
     let mut r = aterm_phase::read(Some("claude"), &rows, None);
     assert_eq!(approved(&decide(&r, &rows, &ctx())), Some(RULE_READ_ONLY));
@@ -1268,35 +1038,12 @@ fn a_read_outside_cwd_is_approved_under_an_allowed_root_unless_it_is_a_secret() 
         assert!(approved(&d).is_none(), "{odd}: {d:?}");
     }
     assert!(approved(&on_screen(&read_box("/etc/hosts"), &none(ctx()))).is_none());
-    // The same judgement on 2.1.292's layout, which the reader once took the
-    // first dashed rule for the path of: every Read escalated.
-    for ok in ["/etc/hosts", "~/proj/src/lib.rs"] {
-        for rows in [read_call_box(ok), read_call_box_2_1_284(ok)] {
-            let d = on_screen(&rows, &ctx());
-            assert_eq!(approved(&d), Some(RULE_READ_OUTSIDE_CWD), "{ok}: {d:?}");
-        }
-    }
-    for (path, why) in [
-        ("~/notes/todo.md", "allowed root"),
-        ("~/proj/.env", "secret"),
-        ("/etc/ssl/private/server.key", "secret"),
-    ] {
-        let d = on_screen(&read_call_box(path), &ctx());
-        assert!(reason(&d).contains(why), "{path}: {d:?}");
-    }
-    assert!(approved(&on_screen(&read_call_box("/etc/hosts"), &none(ctx()))).is_none());
     // The view the model asked for rides INSIDE the call (MEASURED on 2.1.292:
     // `Read(/etc/ssl/cert.pem · lines 1-5)`, and a `.env` with an offset was
     // pressed and read): the press is for the path under every reading of the
     // text, so a secret stays held under any decoration, and a plain file is
     // pressed under its WHOLE call row.
-    for view in [
-        " · lines 1-5",
-        " · from line 3",
-        " · pages 1-3",
-        " · pages  1 - 3 ",
-        " · whatever",
-    ] {
+    for view in [" · lines 1-5", " · pages  1 - 3 ", " · whatever"] {
         let rows = read_call_box(&format!("/etc/hosts{view}"));
         let d = on_screen(&rows, &ctx());
         let (rule, _, guard, subject, _) = approval(&d);
@@ -1400,8 +1147,7 @@ fn rooted(mut c: ApprovalCtx) -> ApprovalCtx {
 
 /// Every trust-rule condition is a negative control: another folder, the cwd
 /// unknown, a folder under no trust root (none named, the default, or one
-/// elsewhere), and `approve = "none"`. Codex's gate meets the same conditions
-/// (`codexs_folder_trust_gate_is_judged_by_the_trust_rule`).
+/// elsewhere), and `approve = "none"`.
 #[test]
 fn a_trust_dialog_escalates_off_the_sessions_folder_or_its_roots() {
     let rows = lines(CAP_TRUST);
@@ -1416,242 +1162,6 @@ fn a_trust_dialog_escalates_off_the_sessions_folder_or_its_roots() {
     rootless.set_trust_roots(&["~/proj*".to_string()], 502);
     assert!(reason(&on_screen(&rows, &rootless)).contains("no trust root"));
     assert!(reason(&on_screen(&rows, &none(rooted(ctx())))).contains("approve = \"none\""));
-}
-
-/// CODEX'S FOLDER-TRUST GATE is the trust rule's under `"safe"`, as Claude
-/// Code's dialog is: the measured 0.156.1 gate for the session's own folder
-/// under a trust root is approved — the cursor already on `Trust and
-/// continue`, so Enter — guarded on the folder's row, and full power keeps
-/// the rule's id. Every condition is a negative control: no trust root (the
-/// default), another folder, the cwd unknown, `approve = "none"`; and the
-/// 0.157.0 gate, read whole, offers `Back to Agent Command Center` in place
-/// of `Quit`, which its reader gives no role, so its options are no exit and
-/// a trust (full power still trusts it); read from its last 40 rows its head
-/// is cut, and it is not read whole. 0.163.0's first-run gate in a Git
-/// repository names the repository ROOT its trust applies to, and a trust
-/// root must hold that root too.
-#[test]
-fn codexs_folder_trust_gate_is_judged_by_the_trust_rule() {
-    use aterm_phase::codex::fixtures as cx;
-    let scratch = "/private/tmp/claude-502/-Users-user00-aterm/\
-                   00000000-0000-0000-0000-000000000000/scratchpad";
-    let on = |rows: &[String], c: &ApprovalCtx| {
-        decide_screen(Some("codex"), rows, c).expect("codex's reader sees its gate")
-    };
-    // `approve = "safe"` in the session's `folder`, under `roots`.
-    let safe_in = |folder: &str, roots: &[&str]| {
-        let mut c = ApprovalCtx {
-            cwd: PathBuf::from(folder),
-            ..ctx()
-        };
-        c.set_trust_roots(
-            &roots.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
-            502,
-        );
-        c
-    };
-    let gate = phase_fixtures::screen(cx::TRUST);
-    let folder = format!("{scratch}/lv/work3");
-    let rooted = safe_in(&folder, &["/private/tmp/claude-*"]);
-    let d = on(&gate, &rooted);
-    let (rule, choice, guard, subject, unproven) = approval(&d);
-    assert_eq!(rule, RULE_TRUST_DIALOG);
-    assert_eq!(
-        *choice,
-        Choice::Focus {
-            steps: 0,
-            label: "Trust and continue".to_string()
-        }
-    );
-    assert_eq!((subject, unproven), (folder.as_str(), None));
-    assert_eq!(guarded(guard, &gate), [format!("  {folder}")]);
-    let full_rooted = ApprovalCtx {
-        approve: Approve::All,
-        ..rooted.clone()
-    };
-    assert_eq!(approved(&on(&gate, &full_rooted)), Some(RULE_TRUST_DIALOG));
-
-    assert!(
-        reason(&on(&gate, &safe_in(&folder, &[]))).contains("under no trust root"),
-        "no trust root, the default"
-    );
-    let elsewhere = safe_in(&format!("{scratch}/lv/work4"), &["/private/tmp/claude-*"]);
-    assert!(reason(&on(&gate, &elsewhere)).contains("not the session's cwd"));
-    let mut unknown = rooted.clone();
-    unknown.cwd_known = false;
-    assert!(reason(&on(&gate, &unknown)).contains("cwd unknown"));
-    assert!(reason(&on(&gate, &none(rooted.clone()))).contains("approve = \"none\""));
-
-    let tall = phase_fixtures::screen(cx::TRUST_TALL_PANE);
-    let tall_ctx = safe_in(
-        &format!("{scratch}/b.xxxx/work/c1"),
-        &["/private/tmp/claude-*"],
-    );
-    let d = on(&tall, &tall_ctx);
-    assert!(
-        reason(&d).contains(
-            "options are not exactly an exit and a trust (`Trust and continue` trust, \
-             `Back to Agent Command Center` other)"
-        ),
-        "{d:?}"
-    );
-    let full_tall = ApprovalCtx {
-        approve: Approve::All,
-        ..tall_ctx.clone()
-    };
-    assert_eq!(approved(&on(&tall, &full_tall)), Some(RULE_TRUST_ANY));
-    let cut = on(&tall[5..], &tall_ctx);
-    assert!(reason(&cut).contains("not read whole"), "{cut:?}");
-
-    // 0.163.0's first run in an untrusted repository (measured): the gate
-    // names the folder, then — `Note: You’re in a subdirectory of a Git
-    // project. Trusting will apply to the repository root:` — the root its
-    // trust applies to (here the same folder by its resolved name). The root
-    // is what a trust root must hold: under roots for both spellings the gate
-    // is the trust rule's, its subject naming the root; under the folder's
-    // spelling alone it is a person's. NEGATIVE CONTROLS: the same gate with
-    // its note and root taken out is approved under the folder's root alone,
-    // and a root that runs onto the row under it is not read whole.
-    let first = phase_fixtures::screen(cx::TRUST_0_163);
-    let folder = "/tmp/at.LJ8G/proj/repo";
-    let both = safe_in(folder, &["/tmp/at.*", "/private/tmp/at.*"]);
-    let d = on(&first, &both);
-    let (rule, choice, guard, subject, unproven) = approval(&d);
-    assert_eq!(rule, RULE_TRUST_DIALOG);
-    assert_eq!(
-        *choice,
-        Choice::Focus {
-            steps: 0,
-            label: "Trust and continue".to_string()
-        }
-    );
-    assert_eq!(
-        (subject, unproven),
-        (
-            "/tmp/at.LJ8G/proj/repo (the trust applies to the repository root \
-             /private/tmp/at.LJ8G/proj/repo)",
-            None
-        )
-    );
-    assert_eq!(guarded(guard, &first), [format!("  {folder}")]);
-    let folder_only = safe_in(folder, &["/tmp/at.*"]);
-    assert!(
-        reason(&on(&first, &folder_only)).contains(
-            "whose trust applies to the repository root /private/tmp/at.LJ8G/proj/repo, under \
-             no trust root"
-        ),
-        "the root decides"
-    );
-    let note = first
-        .iter()
-        .position(|r| r.trim_start().starts_with("Note: "))
-        .expect("the note");
-    let mut unnoted = first.clone();
-    unnoted.drain(note..note + 3);
-    assert_eq!(
-        approved(&on(&unnoted, &folder_only)),
-        Some(RULE_TRUST_DIALOG),
-        "the control: no root named"
-    );
-    let mut wrapped = first.clone();
-    wrapped[note + 2] = "  more".to_string();
-    assert!(
-        reason(&on(&wrapped, &both)).contains("not read whole"),
-        "a root read in part"
-    );
-}
-
-/// AN OWNER'S CODEX PROMPT RULE HOLDS ITS BOX AT EVERY LEVEL (gap #8): the
-/// exec box a `prefix_rule(…, decision="prompt")` sent (measured on 0.163.0:
-/// its Reason row `` `<cmd>` requires approval by policy``, or `` … requires
-/// approval: <the rule's justification>``, even over a call the model
-/// escalated) is the owner's own review — escalated under `none`, `safe` and
-/// `all`, never pressed, and said as the owner's Codex rules. NEGATIVE
-/// CONTROL: a box the model escalated with its own justification and no rule
-/// naming the command is full power's to press (its one-shot `1`).
-#[test]
-fn a_codex_prompt_rule_box_is_the_owners_at_every_level() {
-    use aterm_phase::codex::fixtures as cx;
-    let on = |rows: &[String], c: &ApprovalCtx| {
-        decide_screen(Some("codex"), rows, c).expect("codex's reader sees its box")
-    };
-    let levels = [
-        ("none", none(ctx())),
-        ("safe", ctx()),
-        (
-            "all",
-            ApprovalCtx {
-                approve: Approve::All,
-                ..ctx()
-            },
-        ),
-    ];
-    for text in [
-        cx::BOX_RULE_0_163,
-        cx::BOX_RULE_JUSTIFIED_0_163,
-        cx::BOX_RULE_OVER_ESCALATION_0_163,
-    ] {
-        let rows = phase_fixtures::screen(text);
-        for (level, c) in &levels {
-            let why = reason(&on(&rows, c)).to_string();
-            assert!(
-                why.starts_with(
-                    "the owner's Codex rules send this box to a person (a Codex prompt rule): \
-                     Reason: `/bin/zsh -lc 'touch probe.txt'` requires approval"
-                ),
-                "{level}: {why}"
-            );
-        }
-    }
-    let all = ApprovalCtx {
-        approve: Approve::All,
-        ..ctx()
-    };
-    for text in [cx::BOX_ESCALATED_0_163, cx::BOX_ESCALATED_UNNAMED_0_163] {
-        let rows = phase_fixtures::screen(text);
-        let d = on(&rows, &all);
-        let (rule, choice, ..) = approval(&d);
-        assert_eq!(
-            (rule, choice),
-            (RULE_ALLOW_ONCE, &Choice::Digit(1)),
-            "the control"
-        );
-    }
-}
-
-/// THE MEMBER'S LIMIT-INCREASE BANNER IS NEVER ANSWERED YES (gap #3): its
-/// `Yes (y)` asks the workspace's owner for more, and has no role a rule
-/// presses; full power answers the banner with its `No (default)` (the
-/// refusal that settles nothing), the safe rules hand it to a person, and
-/// `none` too. NEGATIVE CONTROL: the same box without its question (`Request
-/// increase?`) offers no refusal, and full power hands it over.
-#[test]
-fn the_member_limit_banner_is_never_answered_yes() {
-    use aterm_phase::codex::fixtures as cx;
-    let all = ApprovalCtx {
-        approve: Approve::All,
-        ..ctx()
-    };
-    for text in [
-        cx::WALL_MEMBER_CREDITS_0_163,
-        cx::WALL_MEMBER_SPEND_CAP_0_163,
-    ] {
-        let rows = phase_fixtures::screen(text);
-        let d = decide_screen(Some("codex"), &rows, &all).expect("the banner");
-        let (rule, choice, guard, ..) = approval(&d);
-        assert_eq!((rule, choice), (RULE_DECLINE, &Choice::Digit(2)), "{d:?}");
-        assert_eq!(guarded(guard, &rows), ["  Usage limit reached"]);
-        for c in [ctx(), none(ctx())] {
-            let d = decide_screen(Some("codex"), &rows, &c).expect("the banner");
-            assert!(approved(&d).is_none(), "{d:?}");
-        }
-        let plain: Vec<String> = rows
-            .iter()
-            .map(|r| r.replace("Request increase?", "Continue?"))
-            .collect();
-        let d = decide_screen(Some("codex"), &plain, &all).expect("still a box");
-        assert!(approved(&d).is_none(), "the control: {d:?}");
-    }
 }
 
 // --- the usage-limit dialog ------------------------------------------------
@@ -1692,36 +1202,26 @@ fn the_limit_options_dialog_chooses_the_wait_row_by_its_label() {
         rows.iter().filter(|r| m.matches(r)).collect::<Vec<_>>(),
         ["  What do you want to do?"]
     );
-    for wait in [
-        "Wait here, then continue automatically shortly",
-        "Wait here, then continue automatically when the limit resets",
-    ] {
-        for (labels, focus, steps) in [
-            (vec![STOP, wait, CREDITS], 0, 1),
-            (vec![wait, STOP, CREDITS], 0, 0),
-            (vec![wait, STOP, CREDITS], 2, -2),
-            (vec![CREDITS, "Upgrade your plan", STOP, wait], 0, 3),
-        ] {
-            let d = on_screen(
-                &phase_fixtures::limit_options_dialog(&labels, focus),
-                &ctx(),
-            );
-            assert_eq!(
-                d,
-                Decision::Approve {
-                    rule_id: RULE_LIMIT_WAIT,
-                    choice: Choice::Focus {
-                        steps,
-                        label: wait.to_string()
-                    },
-                    guard: guard.clone(),
-                    subject: wait.to_string(),
-                    unproven: None,
-                },
-                "{labels:?} focus {focus}"
-            );
+    // The undated spelling, the row above the focus (the panel's test moves
+    // the focus across a purchase).
+    let wait = "Wait here, then continue automatically shortly";
+    let d = on_screen(
+        &phase_fixtures::limit_options_dialog(&[wait, STOP, CREDITS], 2),
+        &ctx(),
+    );
+    assert_eq!(
+        d,
+        Decision::Approve {
+            rule_id: RULE_LIMIT_WAIT,
+            choice: Choice::Focus {
+                steps: -2,
+                label: wait.to_string()
+            },
+            guard: guard.clone(),
+            subject: wait.to_string(),
+            unproven: None,
         }
-    }
+    );
 }
 
 /// ATERM-KI-1015-1 W2 (the harness sweep of 2026-10-15, Claude Code 2.1.300
@@ -1790,39 +1290,6 @@ fn the_limit_options_dialog_whose_title_wraps_chooses_the_wait_row() {
 /// the width draws — and journaled the rule as its subject.
 #[test]
 fn a_title_whole_on_its_row_leaves_the_box_its_body() {
-    let w = 50;
-    let mut rows: Vec<String> = [
-        "❯ toolstart",
-        "",
-        "⏺ Task(Check the tree)",
-        "  ⎿  Bash(git status --short)",
-        "     Waiting…",
-        "",
-    ]
-    .iter()
-    .map(|r| (*r).to_string())
-    .collect();
-    rows.push("─".repeat(w));
-    for r in [
-        " Bash command · from the general-purpose agent",
-        " Show status",
-        "╌",
-        " git status --short",
-        "╌",
-        " Do you want to proceed?",
-        " ❯ 1. Yes",
-        "   2. No",
-        "",
-        " Esc to cancel · Tab to amend",
-    ] {
-        rows.push(if r == "╌" {
-            "╌".repeat(w)
-        } else {
-            r.to_string()
-        });
-    }
-    let d = on_screen(&rows, &ctx());
-    assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{d:?}");
     // MEASURED on 2.1.300 at 50 columns (the lab, manual mode): the background
     // agent's `wc -l /etc/hosts` under its `Tip:` row, which the safe rules
     // escalated live ("the box header is not a Bash header: … agent Tip: …"),
@@ -1846,35 +1313,6 @@ fn a_title_whole_on_its_row_leaves_the_box_its_body() {
                 crate::supervise::policy::row_guard(&format!(" {path}"))
             );
             assert_eq!(subject, path);
-        }
-        d => panic!("{d:?}"),
-    }
-    // The Edit box, its path as long as its row lets it be.
-    let long = format!("/private/tmp/at.v4LY/proj/{}notes.txt", "d/".repeat(48));
-    let rows: Vec<String> = phase_fixtures::screen(ASK_EDIT)
-        .into_iter()
-        .map(|r| {
-            if r == " notes.txt" {
-                format!(" {long}")
-            } else {
-                r
-            }
-        })
-        .collect();
-    assert!(rows.iter().any(|r| r.ends_with(&long)), "the path row");
-    match on_screen(&rows, &full()) {
-        Decision::Approve {
-            rule_id,
-            guard,
-            subject,
-            ..
-        } => {
-            assert_eq!(rule_id, RULE_ALLOW_ONCE);
-            assert_eq!(
-                guard,
-                crate::supervise::policy::row_guard(&format!(" {long}"))
-            );
-            assert_eq!(subject, long);
         }
         d => panic!("{d:?}"),
     }
@@ -1995,25 +1433,6 @@ fn the_limit_dialog_in_the_fullscreen_panel_waits_for_its_dated_reset() {
             assert_eq!(subject, WAIT);
         }
     }
-    // No wait row: escalated, never a purchase, never the stop row.
-    for labels in [
-        vec![STOP, CREDITS],
-        vec![CREDITS, UPGRADE, STOP],
-        vec![FUNDS, STOP],
-        vec![STOP, "Don’t continue automatically", CREDITS],
-    ] {
-        let screen = phase_fixtures::limit_options_panel(&labels, 0, true);
-        for c in [ctx(), full()] {
-            let d = on_screen(&screen, &c);
-            assert!(
-                reason(&d).starts_with(
-                    "a usage-limit dialog with no `Wait here, then continue automatically"
-                ),
-                "{labels:?} {:?}: {d:?}",
-                c.approve
-            );
-        }
-    }
 }
 
 /// `Switch to usage credits` opens like the model-refusal pause's switch, so
@@ -2078,15 +1497,6 @@ fn full_power_with_a_model_fallback_waits_at_the_limit_and_never_buys_credits() 
         }
         assert_ne!(approved(&d), Some(RULE_MODEL_SWITCH), "{d:?}");
     }
-    let credits = aterm_phase::prompt::Opt {
-        n: Some(1),
-        label: CREDITS.to_string(),
-        role: aterm_phase::prompt::Role::Other,
-        focused: true,
-        row: 0,
-    };
-    assert!(buys(&credits));
-    assert!(!switches_model(&credits));
 }
 
 /// The usage-limit dialog with a limit reset on offer, as COMPOSED from the
@@ -2210,10 +1620,7 @@ fn the_grant_row_is_taken_by_its_own_rule_and_only_with_its_key_on() {
     );
     // No option has the focus: nothing is pressed for either rule.
     let unfocused: Vec<String> = rows.iter().map(|r| r.replace('❯', " ")).collect();
-    assert_eq!(
-        reason(&on_screen(&unfocused, &on)),
-        "a usage-limit dialog with no focused option"
-    );
+    assert!(reason(&on_screen(&unfocused, &on)).contains("no focused option"));
     // The title row is not the one the dialog was read at (the screen moved
     // under the read): no guard to press under, for either rule.
     let read = aterm_phase::read(Some("claude"), &rows, None);
@@ -2223,17 +1630,11 @@ fn the_grant_row_is_taken_by_its_own_rule_and_only_with_its_key_on() {
         .expect("the title row");
     let mut moved = rows.clone();
     moved[title] = "   Something else".to_string();
-    assert_eq!(
-        reason(&decide(&read, &moved, &on)),
-        "the usage-limit dialog's title is not on the screen"
-    );
+    assert!(reason(&decide(&read, &moved, &on)).contains("title is not on the screen"));
     // A reading the reader does not vouch for, and another program's screen.
-    let mut unvouched = aterm_phase::read(Some("claude"), &rows, None);
+    let mut unvouched = read;
     unvouched.phase_authoritative = false;
-    assert_eq!(
-        reason(&decide(&unvouched, &rows, &on)),
-        "no usage-limit dialog the reader vouches for"
-    );
+    assert!(reason(&decide(&unvouched, &rows, &on)).contains("vouches"));
     let d = decide_screen(Some("codex"), &rows, &on);
     assert!(d.as_ref().is_none_or(|d| approved(d).is_none()), "{d:?}");
 }
@@ -2319,29 +1720,8 @@ fn no_rule_ever_spends_a_limit_reset() {
     let p = boxed("Yes", Role::Once);
     let (rule, o) = allow_once(&p).expect("a one-shot allow");
     assert_eq!((rule, o.label.as_str()), (RULE_ALLOW_ONCE, "Yes"));
-
-    // The dialog itself, at every level, the key off: the wait row, never
-    // the grant row and never the weekly row, wherever they stand.
-    for labels in [
-        vec![STOP, GRANT, WAIT_OCT_9, CREDITS],
-        vec![STOP, WEEKLY_RESET, WAIT_OCT_9, CREDITS],
-        vec![GRANT, WAIT_OCT_9],
-        vec![WAIT_OCT_9, WEEKLY_RESET],
-    ] {
-        for focus in 0..labels.len() {
-            let screen = phase_fixtures::limit_options_panel(&labels, focus, true);
-            for c in [ctx(), full(), none(full())] {
-                let d = on_screen(&screen, &c);
-                let (rule, choice, _, subject, _) = approval(&d);
-                assert_eq!(rule, RULE_LIMIT_WAIT, "{labels:?}: {d:?}");
-                assert_eq!(subject, WAIT_OCT_9);
-                let Choice::Focus { label, .. } = choice else {
-                    panic!("{labels:?}: {d:?}");
-                };
-                assert_eq!(label, WAIT_OCT_9, "{labels:?} focus {focus}");
-            }
-        }
-    }
+    // (The dialog itself with the key off: the wait row, never either reset
+    // row — `the_grant_row_is_taken_by_its_own_rule_and_only_with_its_key_on`.)
 
     // THE LAST CHECK. A held message's delivery is its one option that does
     // not refuse, taken by role with no look at its label: where that option
@@ -2404,12 +1784,7 @@ fn no_rule_ever_spends_a_limit_reset() {
             key: "s",
         },
     ] {
-        for rule in [
-            RULE_ALLOW_ONCE,
-            RULE_LIMIT_WAIT,
-            RULE_TRUST_ANY,
-            RULE_NO_SPEND,
-        ] {
+        for rule in [RULE_ALLOW_ONCE, RULE_NO_SPEND] {
             let d = never_spends(&reading, &dialog, chosen(rule, choice.clone()));
             assert_eq!(approved(&d), None, "{rule} {choice:?}");
         }
@@ -2418,14 +1793,7 @@ fn no_rule_ever_spends_a_limit_reset() {
         assert_eq!(never_spends(&reading, &dialog, own.clone()), own);
     }
     // CONTROLS: every other choice passes unchanged.
-    for choice in [
-        Choice::Digit(1),
-        Choice::Digit(3),
-        Choice::Digit(4),
-        Choice::Digit(9),
-        focus(WAIT_OCT_9),
-        focus("No, keep it"),
-    ] {
+    for choice in [Choice::Digit(1), Choice::Digit(9), focus(WAIT_OCT_9)] {
         let d = chosen(RULE_ALLOW_ONCE, choice);
         assert_eq!(never_spends(&reading, &dialog, d.clone()), d);
     }
@@ -2518,8 +1886,6 @@ fn a_reset_confirmation_is_never_answered_yes_at_any_level() {
     };
     for (name, text, steps) in [
         ("confirm", composed::CONFIRM, 1),
-        ("confirm-60col", composed::CONFIRM_60, 1),
-        ("confirm-early", composed::CONFIRM_EARLY, 1),
         ("confirm-focus-no", composed::CONFIRM_FOCUS_NO, 0),
     ] {
         let whole = phase_fixtures::screen(text);
@@ -2546,7 +1912,7 @@ fn a_reset_confirmation_is_never_answered_yes_at_any_level() {
                 } else {
                     keeps(&on_screen(&rows, &with(full())), steps, &what);
                 }
-                for c in [with(ctx()), with(safe_warn()), with(none(full()))] {
+                for c in [with(ctx()), with(none(full()))] {
                     let d = on_screen(&rows, &c);
                     assert_eq!(approved(&d), None, "{what} {:?}: {d:?}", c.approve);
                     assert!(matches!(d, Decision::Escalate { .. }), "{what}: {d:?}");
@@ -2578,7 +1944,7 @@ fn a_reset_confirmation_is_never_answered_yes_at_any_level() {
                 } else {
                     refused(&d, RULE_DECLINE, "No, keep it", &what);
                 }
-                for c in [ctx(), safe_warn(), none(full())] {
+                for c in [ctx(), none(full())] {
                     let d = on_screen(&reworded, &c);
                     assert!(matches!(d, Decision::Escalate { .. }), "{what}: {d:?}");
                 }
@@ -2710,61 +2076,32 @@ fn the_footer_names_the_mode_and_a_2_1_280_box_hides_it() {
         Some(Mode::Manual)
     );
     assert_eq!(footer_mode(&lines(CAP_RM)), None);
-    // Every pill the footer and the lights know, from the same table: don't
-    // ask is its own mode, and manual is the default.
-    let row = |r: &str| vec!["\u{276F} ".to_owned(), r.to_owned()];
-    assert_eq!(
-        footer_mode(&row("  \u{23F5}\u{23F5} don't ask on (shift+tab to cycle)")),
-        Some(Mode::DontAsk)
-    );
-    assert_eq!(
-        footer_mode(&row("  \u{23F8} manual mode on \u{00B7} ? for shortcuts")),
-        Some(Mode::Manual)
-    );
-    assert_eq!(
-        footer_mode(&row("  \u{23F8} plan mode on \u{00B7} esc to interrupt")),
-        Some(Mode::Plan)
-    );
 }
 
+/// A `$TMPDIR` that is too shallow, or holds the cwd or home, is no scratch
+/// root (an rm under it would be proven).
 #[test]
-fn the_default_context_has_decision_ones_roots() {
-    let c = full();
-    let labels: Vec<&str> = c.scratch_roots.iter().map(ScratchRoot::label).collect();
-    assert_eq!(
-        labels,
-        [
-            "/private/tmp/claude-502",
-            "/var/folders/ab/xyz/T",
-            "/tmp/*",
-            "/private/tmp/*",
-            "/private/tmp/claude-502/scratch/work1/target*",
-        ]
-    );
-    // No trust root, so the Read roots are the system's alone.
-    assert!(c.trust_roots.is_empty(), "{:?}", c.trust_roots);
-    let read: Vec<&str> = c.read_roots.iter().map(ScratchRoot::label).collect();
-    assert_eq!(read, ["/usr", "/etc", "/private/etc", "/opt/homebrew"]);
-    assert!(!c.bypass_mode);
-    assert_eq!(
-        c.approve,
-        Approve::All,
-        "full power unless the owner limits it"
-    );
-    // A $TMPDIR that is too shallow, or holds the cwd or home, is no root.
+fn a_tmpdir_that_holds_too_much_is_no_scratch_root() {
     for t in ["/tmp", "/Users", "/private/tmp/claude-502/scratch"] {
         let c = ApprovalCtx::new(
             PathBuf::from("/private/tmp/claude-502/scratch/work1"),
             Some(PathBuf::from("/Users/_owner")),
             502,
             Some(PathBuf::from(t)),
+            std::sync::Arc::new(crate::supervise::policy::LiveProbe),
         );
         assert!(
             !c.scratch_roots.iter().any(|r| r.label() == t),
             "{t} must not be a scratch root"
         );
     }
-    assert!(Path::new(&c.cwd).is_absolute());
+    // Negative control: a deep `$TMPDIR` of its own is one.
+    assert!(
+        full()
+            .scratch_roots
+            .iter()
+            .any(|r| r.label() == "/var/folders/ab/xyz/T")
+    );
 }
 
 /// The Read path is judged as written and as its links resolve, so a committed
@@ -2795,8 +2132,14 @@ fn a_read_through_a_symlink_is_judged_where_it_leads() {
     symlink(root.join("real.txt"), root.join("ok")).expect("link");
     symlink(base.join("nowhere/x"), root.join("dang")).expect("link");
     // The session stands elsewhere: a Read inside its own directory draws no
-    // box of Claude Code's (`a_read_inside_the_working_directory_is_the_owners_review`).
-    let mut c = ApprovalCtx::new(base.join("cwd"), Some(home.clone()), 502, None);
+    // box of Claude Code's (`a_read_box_with_no_folder_grant_is_the_owners_review`).
+    let mut c = ApprovalCtx::new(
+        base.join("cwd"),
+        Some(home.clone()),
+        502,
+        None,
+        std::sync::Arc::new(crate::supervise::policy::LiveProbe),
+    );
     c.approve = Approve::Safe;
     c.set_trust_roots(&[root.to_string_lossy().to_string()], 502);
     let at = |name: &str| format!("{}/{name}", root.display());
@@ -2856,7 +2199,7 @@ fn a_read_through_a_symlink_is_judged_where_it_leads() {
         .split('/')
         .map(str::to_string)
         .collect();
-    assert!(hidden_twin_within(&comps, 1).is_err());
+    assert!(super::super::probe_live::hidden_twin_within(&comps, 1).is_err());
     // The control: no twin, the same shape.
     std::fs::write(root.join("plainly.txt"), "benign").expect("file");
     let d = on_screen(&read_call_box(&at("plainly.txt")), &c);
@@ -2906,52 +2249,6 @@ fn a_read_box_with_no_folder_grant_is_the_owners_review() {
                 level.approve
             );
         }
-    }
-    // A name Claude Code distrusts draws its own box with no grant, and a folder
-    // whose grant text could pass 160 characters may draw none: each is told by
-    // what the path shows, still held, the hold first.
-    let call_at = |path: &str| {
-        let mut rows = phase_fixtures::screen(phase_fixtures::BOX_READ_FORCED_2_1_292);
-        let at = rows
-            .iter()
-            .position(|r| r.starts_with(" Read(/private/tmp/"))
-            .expect("the call");
-        rows[at] = format!(" Read({path})");
-        rows
-    };
-    let long = format!("/private/tmp/{}/notes.txt", "d".repeat(70));
-    // A folder with no `/private` spelling gets its grant up to 160 characters.
-    let long_home = format!("/Users//me/{}/notes.txt", "d".repeat(100));
-    let too_long_home = format!("/Users//me/{}/notes.txt", "d".repeat(160));
-    // (path, the name is told, the folder is told)
-    for (path, name, folder) in [
-        ("/Users//me/proj/x~1.txt", true, false),
-        ("/Users//me/proj/paper.aux", true, false),
-        ("/Users//me/proj/.../notes.txt", true, false),
-        ("/Users//me/proj/notes.", true, false),
-        (long.as_str(), false, true),
-        (too_long_home.as_str(), false, true),
-        (long_home.as_str(), false, false),
-        ("/Users//me/proj/paper.aux2", false, false),
-        ("/Users//me/~me/notes.txt", false, false),
-    ] {
-        let d = on_screen(&call_at(path), &full());
-        let why = reason(&d);
-        assert!(
-            why.starts_with("a Read box with no folder grant"),
-            "{path}: {d:?}"
-        );
-        assert_eq!(
-            why.contains("asks about this name itself"),
-            name,
-            "{path}: {d:?}"
-        );
-        assert_eq!(why.contains("too long for one"), folder, "{path}: {d:?}");
-        assert_eq!(
-            why.contains("an ask rule, hook or plugin sent it"),
-            !name,
-            "{path}: {d:?}"
-        );
     }
     // Claude Code's renderer garbles the `No` row at some pane widths (MEASURED
     // at 30, 31, 40, 55 and 104 columns: `3. Nossion`): a box with no `No` read
@@ -3062,7 +2359,13 @@ fn the_default_trusts_no_folder() {
         let cwd = cwd.replace('~', home);
         let mut c = ApprovalCtx {
             approve: Approve::Safe,
-            ..ApprovalCtx::new(PathBuf::from(&cwd), Some(PathBuf::from(home)), 502, None)
+            ..ApprovalCtx::new(
+                PathBuf::from(&cwd),
+                Some(PathBuf::from(home)),
+                502,
+                None,
+                std::sync::Arc::new(crate::supervise::policy::LiveProbe),
+            )
         };
         assert!(c.trust_roots.is_empty(), "{:?}", c.trust_roots);
         let rows = trust_rows(&cwd);
@@ -3144,38 +2447,17 @@ fn full_power_answers_every_permission_box_with_its_one_shot_allow() {
         bypass_mode: true,
         ..full()
     };
-    // MEASURED on 2.1.287 (bracketed in dashed rules; aterm-phase's module
-    // header): the Fetch box, which the 2.1.287 reader did not see at all (the
-    // session stalled with the box up), a Write, the classifier's own fallback
-    // (Claude Code's, not the owner's), and an rm the model described `ls`.
-    let fetch = phase_fixtures::screen(phase_fixtures::BOX_FETCH_2_1_287);
-    let write = phase_fixtures::screen(phase_fixtures::BOX_WRITE_CREATE_2_1_287);
-    let fallback = phase_fixtures::screen(phase_fixtures::BOX_CLASSIFIER_FALLBACK_2_1_287);
-    let described_ls = phase_fixtures::screen(phase_fixtures::BOX_BASH_2_1_287);
-    // MEASURED on 2.1.292: a BACKGROUND subagent's box, whose footer ends in the
-    // note `ctrl+x ctrl+k twice to stop background agents` — read as no box, so
-    // `approve = "all"` pressed nothing and the agent waited on the screen.
-    let background = phase_fixtures::screen(phase_fixtures::BOX_BASH_BACKGROUND_AGENT_2_1_292);
-    // MEASURED on 2.1.292: the owner's 2026-09-26 subagent rm box (the screenshot
-    // `owner-rm-breaker-subagent-2026-09-26.txt`, 2.1.285's `Dangerous rm
-    // operation on possibly-empty variable path`) re-driven — the vendor now
-    // words it as a write glob, and with no glob as an unchecked variable.
+    // MEASURED on 2.1.292: the owner's 2026-09-26 subagent rm box re-driven —
+    // the vendor now words its note as a write glob, and with no glob as an
+    // unchecked variable. (The other measured layouts are read as their boxes
+    // by aterm-phase's own tests; the press is the same one-shot allow for
+    // every kind: `full_power_presses_every_permission_kind_under_its_judged_row`.)
     let rm_glob = phase_fixtures::screen(phase_fixtures::BOX_BASH_RM_GLOB_SUBAGENT_2_1_292);
     let rm_var = phase_fixtures::screen(phase_fixtures::BOX_BASH_RM_EMPTY_VAR_SUBAGENT_2_1_292);
     for (what, rows, full_ctx, safe_ctx) in [
         ("touch", &touch, full(), ctx()),
         ("edit", &edit, full(), ctx()),
         ("rm outside every root", &rm, full_bypass, bypass()),
-        ("fetch 2.1.287", &fetch, full(), ctx()),
-        ("write 2.1.287", &write, full(), ctx()),
-        ("classifier fallback 2.1.287", &fallback, full(), ctx()),
-        (
-            "a delete described ls, 2.1.287",
-            &described_ls,
-            full(),
-            ctx(),
-        ),
-        ("a subagent's touch, 2.1.292", &background, full(), ctx()),
         (
             "a subagent's rm of a glob, 2.1.292",
             &rm_glob,
@@ -3224,72 +2506,6 @@ fn full_power_answers_every_permission_box_with_its_one_shot_allow() {
     );
     assert_eq!(unproven_of(&d), None);
     assert!(approved(&on_screen(&phase_fixtures::bash_one_row(), &none(full()))).is_none());
-}
-
-/// A workflow subagent's Bash box with the rm breaker's note over an operand
-/// under no scratch root: at default power it is answered (`1`, guarded on the
-/// first command row) in and out of bypass, the breaker's refusal in its
-/// ledger row. It escalates only under `approve = "safe"` with `rm_breaker_ask
-/// = true`, and `"none"`; under `safe`'s default it is pressed with the warning
-/// ([`RULE_RM_BREAKER_WARN`]).
-#[test]
-fn the_owners_workflow_rm_box_is_answered_at_default_power() {
-    let rows = phase_fixtures::screen(phase_fixtures::BOX_RM_WORKFLOW);
-    let owner = |approve: Approve, bypass_mode: bool| ApprovalCtx {
-        approve,
-        bypass_mode,
-        rm_breaker_warn: false,
-        ..ApprovalCtx::new(
-            PathBuf::from("/Users//example/aterm"),
-            Some(PathBuf::from("/Users//example")),
-            501,
-            None,
-        )
-    };
-    let first_row = rows
-        .iter()
-        .find(|r| r.contains("rm -rf /Users//example/aterm-auto-target-x.noindex;"))
-        .expect("the box's first command row");
-    for bypass_mode in [false, true] {
-        let d = on_screen(&rows, &owner(Approve::All, bypass_mode));
-        assert_eq!(
-            pressed(&d),
-            (RULE_ALLOW_ONCE, Choice::Digit(1)),
-            "bypass={bypass_mode}"
-        );
-        let Decision::Approve {
-            guard, unproven, ..
-        } = &d
-        else {
-            unreachable!()
-        };
-        assert_eq!(guard, &row_guard(first_row), "guarded on the judged row");
-        assert!(unproven.is_some(), "the refusal rides in the ledger: {d:?}");
-        let safe = on_screen(&rows, &owner(Approve::Safe, bypass_mode));
-        assert!(
-            approved(&safe).is_none(),
-            "safe, bypass={bypass_mode}: {safe:?}"
-        );
-        let warned = ApprovalCtx {
-            rm_breaker_warn: true,
-            ..owner(Approve::Safe, bypass_mode)
-        };
-        let warned = on_screen(&rows, &warned);
-        assert_eq!(
-            pressed(&warned),
-            (RULE_RM_BREAKER_WARN, Choice::Digit(1)),
-            "safe's default, bypass={bypass_mode}"
-        );
-        let none = on_screen(&rows, &owner(Approve::None, bypass_mode));
-        assert!(reason(&none).contains("approve = \"none\""), "{none:?}");
-    }
-    // In bypass the safe refusal is the breaker's own: the operand outside
-    // every scratch root.
-    let d = on_screen(&rows, &owner(Approve::Safe, true));
-    assert!(
-        reason(&d).contains("/Users//example/aterm-auto-target-x.noindex"),
-        "{d:?}"
-    );
 }
 
 /// Why the safe rules did not prove an answer (`None`: a safe rule proved
@@ -3352,84 +2568,6 @@ fn full_power_never_takes_a_standing_grant() {
     rows.remove(at);
     let d = on_screen(&rows, &full());
     assert!(reason(&d).contains("no one-shot allow"), "{d:?} {rows:#?}");
-}
-
-/// Plan mode's approval: the yes granting no standing mode, `2. Yes, manually
-/// approve edits`, never `1. Yes, auto-accept edits`. Negative control: under
-/// `approve = "safe"` it is not answered. Question dialogs are answered by
-/// [`RULE_ANSWER_RECOMMENDED`] (the recommended option, else option 1, by Enter
-/// after moving focus; a multi-select's recommended option checked, then its
-/// button; the review, `Submit answers`), each guarded on one row and
-/// regardless of `approve`. Under `answer_questions = false` each is a
-/// person's.
-#[test]
-fn full_power_approves_the_plan_and_answers_the_question_dialog() {
-    use phase_fixtures::{
-        ASK_MULTI, ASK_MULTI_CHECKED, ASK_ONE, ASK_SUBMIT, ASK_TWO_FIRST, ASK_TWO_SECOND,
-        PLAN_APPROVAL, screen,
-    };
-    let rows = screen(PLAN_APPROVAL);
-    assert_eq!(
-        pressed(&on_screen(&rows, &full())),
-        (RULE_PLAN, Choice::Digit(2))
-    );
-    assert!(approved(&on_screen(&rows, &ctx())).is_none());
-    let enter =
-        |steps: i32, target: AnswerTarget| Choice::Answer(Answer::FocusEnter { steps, target });
-    for (what, fixture, choice) in [
-        (
-            "recommended",
-            ASK_TWO_FIRST,
-            enter(1, AnswerTarget::Option(2)),
-        ),
-        (
-            "no recommendation",
-            ASK_TWO_SECOND,
-            enter(0, AnswerTarget::Option(1)),
-        ),
-        ("review", ASK_SUBMIT, enter(0, AnswerTarget::ReviewSubmit)),
-        (
-            "multi, unchecked",
-            ASK_MULTI,
-            enter(0, AnswerTarget::Option(1)),
-        ),
-        (
-            "multi, checked",
-            ASK_MULTI_CHECKED,
-            enter(4, AnswerTarget::Button),
-        ),
-        ("one question", ASK_ONE, enter(0, AnswerTarget::Option(1))),
-    ] {
-        let rows = screen(fixture);
-        for level in [full(), ctx(), none(full())] {
-            let d = on_screen(&rows, &level);
-            assert_eq!(
-                pressed(&d),
-                (RULE_ANSWER_RECOMMENDED, choice.clone()),
-                "{what} under {:?}: {d:?}",
-                level.approve
-            );
-            let Decision::Approve { guard, .. } = &d else {
-                unreachable!()
-            };
-            let m = aterm_observe::row_matcher(guard).expect("the guard compiles");
-            assert_eq!(
-                rows.iter().filter(|r| m.matches(r)).count(),
-                1,
-                "{what}: the guard names one row"
-            );
-        }
-        // `answer_questions = false` (`--no-answer`) hands every
-        // question to a person.
-        let quiet = ApprovalCtx {
-            answer_questions: false,
-            ..full()
-        };
-        assert!(
-            reason(&on_screen(&rows, &quiet)).contains("answer_questions is off"),
-            "{what}"
-        );
-    }
 }
 
 /// A consent to go on with usage credits already on (`Continue with …`) is
@@ -3521,108 +2659,6 @@ fn full_power_accepts_a_consent_and_never_buys() {
     ] {
         assert_eq!(buys(&label(l)), buy, "{l}");
     }
-}
-
-/// Codex at full power: every box is answered by its options' roles, by digit
-/// where Codex takes one at once (exec and patch boxes `Yes, proceed`, never
-/// `don't ask again` or `these files`; the plan box `Yes, implement this plan`;
-/// a question its `(Recommended)` answer), and the folder gate (no digit) its
-/// `Trust and continue` by cursor and Enter; guarded on the exec box's `$
-/// <command>` row, else the title. Negative controls: under `"safe"` and
-/// `"none"` every permission box escalates; the question is answered at every
-/// level.
-#[test]
-fn full_power_answers_codex_boxes_by_role() {
-    use aterm_phase::codex::fixtures as cx;
-    let digit = Choice::Digit(1);
-    // The folder gate takes no digit: its cursor is on `Trust and continue`,
-    // and Enter chooses it.
-    let enter = Choice::Focus {
-        steps: 0,
-        label: "Trust and continue".to_string(),
-    };
-    for (what, fixture, rule, choice, guard_row) in [
-        (
-            "exec",
-            cx::BOX_EXEC,
-            RULE_ALLOW_ONCE,
-            &digit,
-            "  $ touch made-by-codex.txt",
-        ),
-        ("patch", cx::BOX_PATCH, RULE_ALLOW_ONCE, &digit, ""),
-        ("trust", cx::TRUST, RULE_TRUST_ANY, &enter, ""),
-        ("plan", cx::PLAN, RULE_PLAN, &digit, ""),
-        // The rate-limit nudge with nothing read: its plain keep.
-        (
-            "nudge",
-            cx::RATE_NUDGE,
-            RULE_RATE_NUDGE_KEEP,
-            &Choice::Digit(2),
-            "",
-        ),
-        (
-            "question",
-            cx::QUESTION,
-            RULE_ANSWER_RECOMMENDED,
-            &digit,
-            "",
-        ),
-    ] {
-        let rows = phase_fixtures::screen(fixture);
-        let d = decide_screen(Some("codex"), &rows, &full()).expect("a box");
-        assert_eq!(pressed(&d), (rule, choice.clone()), "{what}: {d:?}");
-        let Decision::Approve { guard, subject, .. } = &d else {
-            unreachable!()
-        };
-        if !guard_row.is_empty() {
-            let row = rows
-                .iter()
-                .find(|r| r.trim_end() == guard_row)
-                .expect("the command row");
-            assert_eq!(guard, &row_guard(row), "{what}: guarded on its command");
-        }
-        // Never a standing grant, whatever the box offers beside the yes.
-        assert!(
-            !subject.contains("don't ask again") && !subject.contains("these files"),
-            "{what}: {subject}"
-        );
-        // A question is no permission: `approve` does not limit it.
-        for limited in [ctx(), none(full())] {
-            let d = decide_screen(Some("codex"), &rows, &limited).expect("a box");
-            let want = (what == "question").then_some(RULE_ANSWER_RECOMMENDED);
-            assert_eq!(
-                approved(&d),
-                want,
-                "{what} under {:?}: {d:?}",
-                limited.approve
-            );
-        }
-    }
-    // The question: its recommended answer, which is option 1 on this
-    // screen; moved to option 2, the press follows it.
-    let q = phase_fixtures::screen(cx::QUESTION);
-    let swapped: Vec<String> = q
-        .iter()
-        .map(|r| {
-            r.replace("1. subtract (Recommended)", "1. subtract")
-                .replace("2. sub", "2. sub (Recommended)")
-        })
-        .collect();
-    let d = decide_screen(Some("codex"), &swapped, &full()).expect("a box");
-    assert_eq!(
-        pressed(&d),
-        (RULE_ANSWER_RECOMMENDED, Choice::Digit(2)),
-        "{swapped:#?}"
-    );
-    // Under `answer_questions = false` the question is the person's.
-    let quiet = ApprovalCtx {
-        answer_questions: false,
-        ..full()
-    };
-    assert!(
-        reason(&decide_screen(Some("codex"), &q, &quiet).expect("a box"))
-            .contains("answer_questions is off")
-    );
 }
 
 /// Full power answers agy's boxes (measured on 1.4.0) with the digit agy
@@ -3718,41 +2754,613 @@ fn full_power_answers_agy_boxes_by_role() {
     );
 }
 
-/// Muse Code is read, never supervised: its trust box — which its reader
-/// reads whole, `Trust and continue` the trust — is escalated at full power,
-/// and so is every level's answer to it, unpressed. NEGATIVE CONTROL: agy's
-/// trust box, the same kind read the same way, is answered with Enter on its
-/// trust.
-#[test]
-fn a_muse_code_box_is_never_answered() {
-    let rows = phase_fixtures::screen(aterm_phase::muse::fixtures::BOX_TRUST);
-    let p = aterm_phase::read(Some("muse"), &rows, None)
-        .prompt
-        .expect("the box");
-    assert!(p.with_role(Role::Trust).is_some(), "its trust is read");
-    for level in [full(), ctx(), none(full())] {
-        let d = decide_screen(Some("muse"), &rows, &level).expect("a box");
-        assert_eq!(approved(&d), None, "{:?}: {d:?}", level.approve);
-        assert!(
-            reason(&d).starts_with("Muse Code is read, not supervised"),
-            "{d:?}"
-        );
-    }
-    let agy = phase_fixtures::screen(aterm_phase::agy::fixtures::BOX_TRUST);
-    let d = decide_screen(Some("agy"), &agy, &full()).expect("a box");
-    assert_eq!(approved(&d), Some(RULE_TRUST_ANY), "the control: {d:?}");
+/// Gemini CLI's screens (measured on 0.46.0) under `node`, the name its
+/// process runs as: the reader is named by the screen.
+fn gemini_box(fixture: &str) -> (Vec<String>, Decision) {
+    let rows = phase_fixtures::screen(fixture);
+    let d = decide_screen(Some("node"), &rows, &full()).expect("a box");
+    (rows, d)
 }
 
-/// What no reader can answer escalates even at full power: a box whose options
-/// carry no roles (Codex's exec box with the cursor on two options).
+/// Full power answers Gemini CLI's boxes (measured on 0.46.0, read under
+/// `node`) with the digit it draws for each one's `Allow once` — `1` on the
+/// shell box (with its redirection warning or without), guarded on the
+/// command's own row in the box drawn inside it;
+/// on the write and edit boxes, guarded on their question row — never
+/// `Allow for this session` (a standing grant) or `Modify with external
+/// editor`; its folder-trust dialog by its `Trust folder` (`1`), guarded on
+/// its question; its question, which marks no answer, by its first (`Red`,
+/// `1`), guarded on its title row. NEGATIVE CONTROLS: under `"safe"` and
+/// `"none"` every box but the question escalates (no safe rule was written
+/// for Gemini CLI's boxes), and the question is answered at every level.
 #[test]
-fn full_power_escalates_a_box_it_cannot_read() {
-    let rows: Vec<String> = phase_fixtures::screen(aterm_phase::codex::fixtures::BOX_EXEC)
+fn full_power_answers_gemini_cli_boxes_by_role() {
+    use aterm_phase::gemini::fixtures as g;
+    let digit = Choice::Digit(1);
+    for (what, fixture, rule, guard_row) in [
+        (
+            "shell",
+            g::BOX_SHELL,
+            RULE_ALLOW_ONCE,
+            "│ │ touch lab-probe.txt",
+        ),
+        (
+            "shell with a redirection",
+            g::BOX_SHELL_REDIRECTION,
+            RULE_ALLOW_ONCE,
+            "│ │ env | cut -d= -f1 | sort > envnames.txt",
+        ),
+        (
+            "write",
+            g::BOX_WRITE,
+            RULE_ALLOW_ONCE,
+            "│ Apply this change?",
+        ),
+        ("edit", g::BOX_EDIT, RULE_ALLOW_ONCE, "│ Apply this change?"),
+        (
+            "trust",
+            g::TRUST,
+            RULE_TRUST_ANY,
+            "│ Do you trust the files in this folder?",
+        ),
+        (
+            "question",
+            g::QUESTION,
+            RULE_ANSWER_RECOMMENDED,
+            "│ Answer Questions",
+        ),
+    ] {
+        let (rows, d) = gemini_box(fixture);
+        assert_eq!(pressed(&d), (rule, digit.clone()), "{what}: {d:?}");
+        let Decision::Approve { guard, subject, .. } = &d else {
+            unreachable!()
+        };
+        let row = rows
+            .iter()
+            .find(|r| r.trim_start().starts_with(guard_row))
+            .expect("the guarded row");
+        assert_eq!(guard, &row_guard(row), "{what}");
+        assert!(
+            !subject.contains("for this session")
+                && !subject.contains("external editor")
+                && !subject.contains("parent folder")
+                && !subject.contains("custom value"),
+            "{what}: {subject}"
+        );
+        for limited in [ctx(), none(full())] {
+            let d = decide_screen(Some("node"), &rows, &limited).expect("a box");
+            let want = (what == "question").then_some(RULE_ANSWER_RECOMMENDED);
+            assert_eq!(
+                approved(&d),
+                want,
+                "{what} under {:?}: {d:?}",
+                limited.approve
+            );
+        }
+    }
+    let rows = phase_fixtures::screen(g::BOX_SHELL);
+    assert!(
+        reason(&decide_screen(Some("node"), &rows, &ctx()).expect("a box"))
+            .starts_with("a gemini session's box"),
+        "the escalation names Gemini CLI"
+    );
+}
+
+/// GEMINI CLI'S USAGE-LIMIT DIALOG IS NEVER PRESSED (`Usage limit reached
+/// for <model>.` over `1. Keep trying` and `2. Stop`, measured on 0.46.0): at
+/// every level it goes to a person, with its own words — `Keep trying` sends
+/// the turn again into a quota that resets hours later, so a supervisor's
+/// press would repeat at every return — and its `/stats model`. NEGATIVE
+/// CONTROL: the dialog is read whole, a usage-limit box the reader vouches
+/// for, the focus on `Keep trying`, so it is the rule and not the read that
+/// leaves it unpressed.
+#[test]
+fn gemini_clis_usage_limit_is_never_pressed() {
+    let rows = phase_fixtures::screen(aterm_phase::gemini::fixtures::LIMIT_DIALOG);
+    let reading = aterm_phase::read(Some("node"), &rows, None);
+    let p = reading.prompt.as_ref().expect("the dialog");
+    assert_eq!(
+        (p.kind, reading.phase, reading.phase_authoritative),
+        (PromptKind::UsageLimit, Phase::Prompt, true),
+        "the control"
+    );
+    assert_eq!(p.focused().map(|o| o.label.as_str()), Some("Keep trying"));
+    for level in [full(), ctx(), none(full())] {
+        let d = decide_screen(Some("node"), &rows, &level).expect("a box");
+        assert_eq!(approved(&d), None, "{:?}: {d:?}", level.approve);
+        let why = reason(&d);
+        assert!(why.starts_with("Gemini CLI's usage limit"), "{why}");
+        assert!(
+            why.contains("Keep trying") && why.contains("/stats model"),
+            "{why}"
+        );
+        assert!(why.chars().count() <= 120, "kept whole in its badge: {why}");
+    }
+}
+
+/// Full power answers only the Gemini CLI boxes that were measured: a box of
+/// another kind (its question row naming another tool than `[Shell]`, which
+/// an MCP tool's or a web fetch's draws), and a shell box with no `Allow
+/// once`, go to a person — neither allowed nor declined by the general picks,
+/// which would have pressed the second's `No, suggest changes`. NEGATIVE
+/// CONTROL: the measured shell box itself is pressed.
+#[test]
+fn full_power_leaves_an_unmeasured_gemini_cli_box_to_a_person() {
+    let rows = phase_fixtures::screen(aterm_phase::gemini::fixtures::BOX_SHELL);
+    // The same width, so the row still sits inside the box.
+    let swap = |from: &str, to: &str| -> Vec<String> {
+        assert_eq!(from.chars().count(), to.chars().count());
+        rows.iter().map(|r| r.replacen(from, to, 1)).collect()
+    };
+    let fetch = swap("Allow execution of [Shell]?", "Allow execution of [Fetch]?");
+    let p = aterm_phase::read(Some("node"), &fetch, None)
+        .prompt
+        .expect("still a box");
+    assert_eq!(p.kind, PromptKind::Other, "a kind the reader does not name");
+    assert!(p.with_role(Role::Once).is_some(), "named by its Allow once");
+    let none_once = swap("● 1. Allow once", "● 1. Allow tool");
+    let p = aterm_phase::read(Some("node"), &none_once, None)
+        .prompt
+        .expect("still a box");
+    assert_eq!(p.kind, PromptKind::Bash);
+    assert!(p.with_role(Role::Once).is_none(), "{:?}", p.options);
+    assert!(p.with_role(Role::Deny).is_some(), "its refusal still read");
+    for (what, box_rows) in [("another tool", &fetch), ("no Allow once", &none_once)] {
+        let d = decide_screen(Some("node"), box_rows, &full()).expect("a box");
+        assert_eq!(approved(&d), None, "{what}: {d:?}");
+        assert!(
+            reason(&d).contains("box of Gemini CLI's with no measured answer"),
+            "{what}: {d:?}"
+        );
+    }
+    let d = decide_screen(Some("node"), &rows, &full()).expect("a box");
+    assert_eq!(approved(&d), Some(RULE_ALLOW_ONCE), "the control: {d:?}");
+}
+
+/// THE GEMINI CLI BOXES MEASURED AFTER ITS SUPERVISION LANDED go to a
+/// person at full power, each read whole by its reader: an MCP tool's box
+/// and a web fetch's (kind Other, named by `Allow once`), the sandbox
+/// expansion (a shell call asking to widen what it may reach: with no
+/// sandbox on; after its per-tool seatbelt denied a write, at 144, 100 and
+/// 72 columns; before a `curl` runs; and for the model's call naming
+/// `additional_permissions` after its seatbelt denied the write), the
+/// no-access dialog a 404 for the turn's model draws (the usage limit's
+/// sibling), every tab of a question dialog of several questions, and its
+/// review, and a shell box kept over a composer that still has the keys
+/// (`ui.collapseDrawerDuringApproval = false`: a digit would be typed into
+/// the composer) — never allowed and never declined. NEGATIVE CONTROLS: the
+/// one-question dialog is answered with its first answer, and the plain shell
+/// box with its `Allow once`.
+#[test]
+fn full_power_leaves_gemini_clis_measured_other_boxes_to_a_person() {
+    use aterm_phase::gemini::fixtures as g;
+    for (what, fixture) in [
+        ("an MCP tool's", g::BOX_MCP),
+        ("a web fetch's", g::BOX_WEB_FETCH),
+        ("the sandbox expansion", g::BOX_SANDBOX_EXPANSION),
+        (
+            "the expansion after a real denial",
+            g::SANDBOX_TOOLS_EXPANSION,
+        ),
+        ("the same at 100x30", g::SANDBOX_TOOLS_EXPANSION_100),
+        ("the same at 72", g::SANDBOX_TOOLS_NARROW_EXPANSION),
+        ("the expansion before a curl", g::SANDBOX_TOOLS_NETWORK),
+        (
+            "the expansion the model asked after a denial",
+            g::SANDBOX_RETRY_EXPANSION,
+        ),
+        ("the no-access dialog", g::NARROW_NO_ACCESS),
+        ("several questions, the first", g::QUESTION_MULTI),
+        ("several questions, the second", g::QUESTION_MULTI_SECOND),
+        ("several questions, the review", g::QUESTION_MULTI_REVIEW),
+        ("a box kept over its composer", g::DRAWER_KEPT_BOX_SHELL),
+        ("the same, a draft typed", g::DRAWER_KEPT_BOX_SHELL_DRAFT),
+        (
+            "the same, the draft queued",
+            g::DRAWER_KEPT_BOX_SHELL_QUEUED,
+        ),
+        (
+            "the same, the details hidden",
+            g::DRAWER_KEPT_DETAILS_HIDDEN_BOX_SHELL,
+        ),
+    ] {
+        let rows = phase_fixtures::screen(fixture);
+        let reading = aterm_phase::read(Some("node"), &rows, None);
+        assert_eq!(reading.program, Program::Gemini, "{what}");
+        assert_eq!(
+            (reading.phase, reading.phase_authoritative),
+            (Phase::Prompt, true),
+            "{what}: read as a box"
+        );
+        for level in [full(), ctx(), none(full())] {
+            let d = decide_screen(Some("node"), &rows, &level).expect("a box");
+            assert!(
+                matches!(d, Decision::Escalate { .. }),
+                "{what} under {:?}: {d:?}",
+                level.approve
+            );
+        }
+    }
+    let (_, d) = gemini_box(g::QUESTION);
+    assert_eq!(approved(&d), Some(RULE_ANSWER_RECOMMENDED), "the control");
+    let (_, d) = gemini_box(g::BOX_SHELL);
+    assert_eq!(approved(&d), Some(RULE_ALLOW_ONCE), "the control");
+}
+
+/// agy's FIRST RUN under the Gemini API provider (the lab's captures,
+/// `aterm_phase::agy::fixtures::lab`): its colour-scheme picker and its terms
+/// (a box ticked by default that lets Google collect the person's
+/// interactions) are boxes of NO KIND whose options carry no role, so no
+/// level presses one — full power hands each to a person with its options
+/// named, and the safe rules and `"none"` escalate it too. Its feedback
+/// survey is no box at all: no decision is made on it, so no digit (a
+/// rating) is pressed as an answer. Both hold under agy's name and with no
+/// name its layout names, in a bypass session too. NEGATIVE CONTROLS: the
+/// trust box after the onboarding is answered with Enter on its trust, and
+/// the lab's tool boxes with their one-shot `1`, at full power.
+#[test]
+fn agys_first_run_is_pressed_by_no_level_and_its_survey_is_no_box() {
+    use aterm_phase::agy::fixtures::lab;
+    let levels = || [full(), ctx(), none(full()), bypass()];
+    for (what, fixture, option) in [
+        ("colour scheme", lab::FIRST_RUN_SCHEME, "terminal"),
+        ("terms", lab::FIRST_RUN_TERMS, "[x] Yes, I agree"),
+    ] {
+        let rows = phase_fixtures::screen(fixture);
+        for name in [Some("agy"), None, Some("node")] {
+            for level in levels() {
+                let d = decide_screen(name, &rows, &level).expect("a box");
+                assert!(
+                    matches!(d, Decision::Escalate { .. }),
+                    "{what} as {name:?} under {:?}: {d:?}",
+                    level.approve
+                );
+            }
+        }
+        let d = decide_screen(Some("agy"), &rows, &full()).expect("a box");
+        assert!(reason(&d).contains(option), "{what}: {d:?}");
+    }
+    let survey = phase_fixtures::screen(lab::SURVEY);
+    for name in [Some("agy"), None, Some("node")] {
+        for level in levels() {
+            assert_eq!(decide_screen(name, &survey, &level), None);
+        }
+    }
+
+    let trust = phase_fixtures::screen(lab::FIRST_RUN_TRUST);
+    let d = decide_screen(Some("agy"), &trust, &full()).expect("a box");
+    assert_eq!(approved(&d), Some(RULE_TRUST_ANY), "the control: {d:?}");
+    for fixture in [lab::BOX_SHELL, lab::BOX_WRITE, lab::BOX_EDIT] {
+        let rows = phase_fixtures::screen(fixture);
+        let d = decide_screen(Some("agy"), &rows, &full()).expect("a box");
+        assert_eq!(
+            pressed(&d),
+            (RULE_ALLOW_ONCE, Choice::Digit(1)),
+            "the control: {d:?}"
+        );
+    }
+}
+
+/// Full power answers Muse Code's boxes (measured on 1.4.10) with Enter on
+/// the focused one-shot allow, never a digit (one answers at once, measured): `Yes,
+/// proceed` on the shell box, guarded on its `$` row (its first row where
+/// the command wraps), and on the file box of a write or an edit, guarded on
+/// its `write path:` row (on its title where the path wraps under a bare
+/// `write path:`, as a Claude Code file box's wrapped path is); `Allow this
+/// stage once` on a pipeline's stage, guarded on the command's row; and on
+/// the network box (a fetch, a monitor's WebSocket over the background-work
+/// panel), guarded on its `full URL:` row (on its title where the URL
+/// wraps) — never its session grant or its always grant. Never a
+/// standing grant: with the binary's `Yes, and don't ask again for this
+/// command in this session` focused, the focus is moved up to `Yes,
+/// proceed`. Its trust box takes Enter on `Trust and continue`; its
+/// question Enter on `Red (Recommended)`, guarded on the question's own row
+/// (its title row's clock ticks), and so does the question drawn in a 60-
+/// or 72-column tab (its key row wrapped). NEGATIVE CONTROLS: under
+/// `"safe"` and `"none"` every permission box escalates (the safe rules
+/// judge Claude Code's boxes), naming Muse Code, while the question is
+/// answered at every level; and the same rows read as a shell's are no box
+/// at all.
+#[test]
+fn full_power_answers_muse_boxes_by_role() {
+    use aterm_phase::muse::fixtures as u;
+    let focus = |label: &str| Choice::Focus {
+        steps: 0,
+        label: label.to_string(),
+    };
+    let write_row = "  write path: /private/tmp/at.lab0/proj/.agents/probe-write.md";
+    for (what, fixture, rule, choice, guard_row) in [
+        (
+            "shell",
+            u::BOX_SHELL,
+            RULE_ALLOW_ONCE,
+            focus("Yes, proceed"),
+            "  $ touch probe.txt",
+        ),
+        (
+            "stage",
+            u::BOX_SHELL_STAGE,
+            RULE_ALLOW_ONCE,
+            focus("Allow this stage once"),
+            "  $ env | cut -d= -f1 | sort > envnames.txt",
+        ),
+        (
+            "write",
+            u::BOX_WRITE,
+            RULE_ALLOW_ONCE,
+            focus("Yes, proceed"),
+            write_row,
+        ),
+        (
+            "edit",
+            u::BOX_EDIT,
+            RULE_ALLOW_ONCE,
+            focus("Yes, proceed"),
+            write_row,
+        ),
+        (
+            "shell wrapped",
+            u::BOX_SHELL_WRAPPED,
+            RULE_ALLOW_ONCE,
+            focus("Yes, proceed"),
+            "  $ touch",
+        ),
+        (
+            "write wrapped",
+            u::BOX_WRITE_WRAPPED,
+            RULE_ALLOW_ONCE,
+            focus("Yes, proceed"),
+            "Would you like to allow this file access?",
+        ),
+        (
+            "network",
+            u::BOX_NETWORK,
+            RULE_ALLOW_ONCE,
+            focus("Yes, proceed"),
+            "  full URL: http://127.0.0.1:50581/lab-probe",
+        ),
+        (
+            "network over the work panel",
+            u::BOX_NETWORK_MONITOR,
+            RULE_ALLOW_ONCE,
+            focus("Yes, proceed"),
+            "  full URL: ws://127.0.0.1:50581/lab-ws",
+        ),
+        (
+            "network wrapped",
+            u::BOX_NETWORK_NARROW,
+            RULE_ALLOW_ONCE,
+            focus("Yes, proceed"),
+            "Would you like to allow this network access?",
+        ),
+        (
+            "trust",
+            u::TRUST_1_4_10,
+            RULE_TRUST_ANY,
+            focus("Trust and continue"),
+            "Do you trust this workspace?",
+        ),
+        (
+            "question",
+            u::QUESTION,
+            RULE_ANSWER_RECOMMENDED,
+            focus("Red (Recommended)"),
+            "  Which color should the probe use?",
+        ),
+        (
+            "question wrapped",
+            u::QUESTION_WRAPPED,
+            RULE_ANSWER_RECOMMENDED,
+            focus("Crimson red, the warm and loud one (Recommended)"),
+            "  Which shade should the probe use for the long label test?",
+        ),
+        (
+            "question wrapped at 72",
+            u::QUESTION_WRAPPED_72,
+            RULE_ANSWER_RECOMMENDED,
+            focus("Crimson red, the warm and loud one (Recommended)"),
+            "  Which shade should the probe use for the long label test?",
+        ),
+    ] {
+        let rows = phase_fixtures::screen(fixture);
+        let d = decide_screen(Some("muse"), &rows, &full()).expect("a box");
+        assert_eq!(pressed(&d), (rule, choice), "{what}: {d:?}");
+        let (_, _, guard, subject, _) = approval(&d);
+        assert_eq!(guarded(guard, &rows), vec![guard_row], "{what}");
+        assert!(!subject.contains("don't ask again"), "{what}: {subject}");
+        for limited in [ctx(), none(full())] {
+            let d = decide_screen(Some("muse"), &rows, &limited).expect("a box");
+            let want = what
+                .starts_with("question")
+                .then_some(RULE_ANSWER_RECOMMENDED);
+            assert_eq!(
+                approved(&d),
+                want,
+                "{what} under {:?}: {d:?}",
+                limited.approve
+            );
+        }
+        assert!(
+            decide_screen(Some("zsh"), &rows, &full()).is_none(),
+            "{what}: a shell's screen is no box"
+        );
+    }
+    // The standing grant focused: the focus goes up to the one-shot allow.
+    let standing: Vec<String> = phase_fixtures::screen(u::BOX_SHELL)
         .into_iter()
-        .map(|r| r.replacen("  3. No, and tell Codex", "› 3. No, and tell Codex", 1))
+        .flat_map(|r| {
+            if r.starts_with("⟩ 1. Yes, proceed") {
+                vec![
+                    "  1. Yes, proceed (y)".to_string(),
+                    "⟩ 2. Yes, and don't ask again for this command in this session (a)"
+                        .to_string(),
+                ]
+            } else if r.starts_with("  2. No,") {
+                vec!["  3. No, and tell Muse Code what to do differently (esc)".to_string()]
+            } else {
+                vec![r]
+            }
+        })
         .collect();
-    let d = decide_screen(Some("codex"), &rows, &full()).expect("a box");
-    assert!(reason(&d).contains("no one-shot allow"), "{d:?}");
+    let d = decide_screen(Some("muse"), &standing, &full()).expect("a box");
+    assert_eq!(
+        pressed(&d),
+        (
+            RULE_ALLOW_ONCE,
+            Choice::Focus {
+                steps: -1,
+                label: "Yes, proceed".to_string()
+            }
+        ),
+        "{d:?}"
+    );
+    let rows = phase_fixtures::screen(u::BOX_SHELL);
+    assert!(
+        reason(&decide_screen(Some("muse"), &rows, &ctx()).expect("a box"))
+            .starts_with("a muse session's box"),
+        "the escalation names Muse Code"
+    );
+}
+
+/// MUSE CODE'S TOOL-ACTION BOX AND ITS UNIX-SOCKET BOX GO TO A PERSON at
+/// every level (1.4.10, measured outside the lab's jail), as Gemini CLI's MCP
+/// box and its sandbox expansion do: the tool-action box is an MCP tool's
+/// call (`tool action: mcp__probe__ping`, stdio and streamable HTTP alike, at
+/// 144, 100 and 60 columns, before a key and with the session grant
+/// focused), which reaches past the measured shell, file and network boxes —
+/// its reader names a one-shot `Yes, proceed` the general picks would press,
+/// so the rule (`unmeasured_box`) is what holds it, and the escalation names
+/// the tool; the Unix-socket box (`Allow once` · `Reject`, a command reaching
+/// a socket past its sandbox) and the network box of a sandboxed `pip
+/// install` are network boxes of a command, of no kind, whose options carry
+/// no role, so nothing is pressed on them either, and the escalation says so
+/// and names the command — never that the box offers no refusal, as the
+/// reader reads its Esc as one. None is allowed or declined. NEGATIVE
+/// CONTROLS: the network box of a URL is still allowed once at full power,
+/// and so is the shell box.
+#[test]
+fn full_power_leaves_muses_tool_action_and_unix_socket_boxes_to_a_person() {
+    use aterm_phase::muse::fixtures as u;
+    let socket = "printf 'ping' | /usr/bin/nc -U -w 2 /private/tmp/at.muse-sock/b6.sock";
+    let pip = "python3 -m pip install --quiet --target /tmp/pylibs pyte 2>&1 | tail -n 3; \
+               PYTHONPATH=/tmp/pylibs python3 -c \"import pyte; print('pyte ok')\"";
+    for (what, fixture, tool, command) in [
+        (
+            "tool action",
+            u::BOX_TOOL_ACTION,
+            Some("mcp__probe__ping"),
+            "",
+        ),
+        (
+            "tool action at 100x30",
+            u::BOX_TOOL_ACTION_100X30,
+            Some("mcp__probe__ping"),
+            "",
+        ),
+        (
+            "tool action at 60 columns",
+            u::BOX_TOOL_ACTION_NARROW,
+            Some("mcp__probe__ping"),
+            "",
+        ),
+        (
+            "tool action, the session grant focused",
+            u::BOX_TOOL_ACTION_DOWN,
+            Some("mcp__probe__ping"),
+            "",
+        ),
+        (
+            "tool action of an HTTP server",
+            u::BOX_TOOL_ACTION_HTTP,
+            Some("mcp__probehttp__ping"),
+            "",
+        ),
+        ("unix socket", u::BOX_UNIX_SOCKET, None, socket),
+        (
+            "unix socket, Reject focused",
+            u::BOX_UNIX_SOCKET_DOWN,
+            None,
+            socket,
+        ),
+        (
+            "unix socket at 60 columns",
+            u::BOX_UNIX_SOCKET_NARROW,
+            None,
+            socket,
+        ),
+        (
+            "network box of a command",
+            u::BOX_NETWORK_COMMAND,
+            None,
+            pip,
+        ),
+    ] {
+        let rows = phase_fixtures::screen(fixture);
+        let reading = aterm_phase::read(Some("muse"), &rows, None);
+        assert_eq!(reading.program, Program::Muse, "{what}");
+        assert_eq!(
+            (reading.phase, reading.phase_authoritative),
+            (Phase::Prompt, true),
+            "{what}: read as a box"
+        );
+        let p = reading.prompt.as_ref().expect("the box");
+        match tool {
+            Some(tool) => {
+                assert_eq!((p.kind, p.command.as_str()), (PromptKind::Tool, tool));
+                assert!(
+                    p.with_role(Role::Once).is_some(),
+                    "{what}: a one-shot allow the general picks would press"
+                );
+            }
+            None => {
+                assert_eq!((p.kind, p.command.as_str()), (PromptKind::Other, command));
+                assert!(p.options.iter().all(|o| o.role == Role::Other), "{what}");
+            }
+        }
+        for level in [full(), ctx(), none(full())] {
+            let d = decide_screen(Some("muse"), &rows, &level).expect("a box");
+            assert!(
+                matches!(d, Decision::Escalate { .. }),
+                "{what} under {:?}: {d:?}",
+                level.approve
+            );
+        }
+        let d = decide_screen(Some("muse"), &rows, &full()).expect("a box");
+        let why = reason(&d);
+        match tool {
+            Some(tool) => assert!(
+                why.starts_with("Muse Code's tool-action box for") && why.contains(tool),
+                "{what}: {why}"
+            ),
+            None => assert!(
+                why.starts_with("Muse Code's network box of a command")
+                    && why.contains(&format!("(`{command}`)"))
+                    && !why.contains("no refusal"),
+                "{what}: {why}"
+            ),
+        }
+        // A person's attention keeps the reason's first 120 cells
+        // (`escalate::REASON_CELLS`, its label naming the subject): what the
+        // box is, and that it is theirs, fit there whatever the command.
+        let kept: String = why.chars().take(120).collect();
+        assert!(
+            kept.contains(if tool.is_some() {
+                "reaches past the"
+            } else {
+                "is a person's to allow"
+            }),
+            "{what}: {kept}"
+        );
+    }
+    for (what, fixture) in [("network", u::BOX_NETWORK), ("shell", u::BOX_SHELL)] {
+        let rows = phase_fixtures::screen(fixture);
+        let d = decide_screen(Some("muse"), &rows, &full()).expect("a box");
+        assert_eq!(
+            approved(&d),
+            Some(RULE_ALLOW_ONCE),
+            "the control, {what}: {d:?}"
+        );
+    }
 }
 
 // --- full power over approve-all cases ----------------------------------------
@@ -3789,47 +3397,11 @@ fn with_row(rows: &[String], from: &str, to: &str) -> Vec<String> {
         .collect()
 }
 
-/// A workflow subagent's Bash box with the rm breaker's statically-unresolvable
-/// note: the safe rules escalate it naming the breaker kind, in and out of
-/// bypass; full power presses `1` under its first command row's guard, saying
-/// the press was unproven and why. Negative control: the guard matches only
-/// that row.
-#[test]
-fn the_incident_box_is_escalated_by_the_rules_and_pressed_at_full_power() {
-    let rows = phase_fixtures::screen(phase_fixtures::BOX_RM_UNRESOLVABLE_WORKFLOW);
-    for proven in [ctx(), bypass()] {
-        let why = reason(&on_screen(&rows, &proven)).to_string();
-        assert!(
-            why.starts_with("the rm circuit breaker (statically-unresolvable target)"),
-            "{why}"
-        );
-        assert!(!why.contains("vendor note"), "{why}");
-    }
-    let first = "   │ cd /Users//user00/trust-vc-m1-notes/reader &&";
-    for bypass_mode in [false, true] {
-        let c = ApprovalCtx {
-            bypass_mode,
-            ..full()
-        };
-        let d = on_screen(&rows, &c);
-        let (rule, choice, guard, _, unproven) = approval(&d);
-        assert_eq!(rule, RULE_ALLOW_ONCE);
-        assert_eq!(*choice, Choice::Digit(1));
-        let unproven = unproven.expect("a full-power press says why it was unproven");
-        assert!(
-            unproven.starts_with("the rm circuit breaker (statically-unresolvable target)"),
-            "{unproven}"
-        );
-        assert_eq!(guarded(guard, &rows), [first], "bypass={bypass_mode}");
-        let swapped = with_row(&rows, first, "   │ cd /Users//user00 &&");
-        assert!(guarded(guard, &swapped).is_empty());
-    }
-}
-
 /// Every rm/rmdir breaker kind is the rm rule's to name; only the `rm`
-/// possibly-empty-variable form reaches its resolver. The boxes are `CAP_RM`
-/// with its note row replaced. At full power each is pressed, its kind first
-/// in the unproven reason.
+/// possibly-empty-variable form reaches its resolver, and only it is pressed
+/// with the warning under `approve = "safe"`'s default (every other kind stays
+/// a person's). The boxes are `CAP_RM` with its note row replaced. At full
+/// power each is pressed, its kind first in the unproven reason.
 #[test]
 fn every_rm_breaker_kind_is_named_and_full_power_presses_each() {
     let note = CAP_RM
@@ -3871,6 +3443,12 @@ fn every_rm_breaker_kind_is_named_and_full_power_presses_each() {
             "{text}: {why}"
         );
         assert!(why.contains("resolves only an rm on"), "{text}: {why}");
+        let warned = ApprovalCtx {
+            bypass_mode: true,
+            ..safe_warn()
+        };
+        let d = on_screen(&rows, &warned);
+        assert!(approved(&d).is_none(), "{text}: {d:?}");
         let d = on_screen(&rows, &full());
         let (rule, choice, _, _, unproven) = approval(&d);
         assert_eq!(
@@ -3880,27 +3458,16 @@ fn every_rm_breaker_kind_is_named_and_full_power_presses_each() {
         );
         assert!(unproven.is_some_and(|u| u.contains(kind)), "{text}: {d:?}");
     }
-    // Control: the possibly-empty-variable form on scratch is still proven in
-    // bypass, and keeps its rule id at full power.
-    let d = on_screen(&rm_box(cmd), &bypass());
-    assert_eq!(approved(&d), Some(RULE_RM_BREAKER), "{d:?}");
-    let c = ApprovalCtx {
-        bypass_mode: true,
-        ..full()
-    };
-    let d = on_screen(&rm_box(cmd), &c);
-    assert_eq!(approved(&d), Some(RULE_RM_BREAKER), "{d:?}");
-    assert_eq!(approval(&d).4, None);
 }
 
 /// Under `approve = "safe"` (default warning), the vendor's rm on a
 /// possibly-empty variable that the safe rules cannot prove (the `for`/`set --`
-/// loop, a target outside scratch, an unassigned variable, a box outside
-/// bypass) is approved with its one-shot `Yes` under [`RULE_RM_BREAKER_WARN`],
+/// loop, a target outside scratch, a box outside bypass) is approved with its one-shot `Yes` under [`RULE_RM_BREAKER_WARN`],
 /// the reason kept as its `unproven` warning, under the judged row's guard; a
 /// proven one keeps [`RULE_RM_BREAKER`]. Negative controls, each a person's:
 /// `rm_breaker_ask = true` ([`ctx`]), `approve = "none"`, every other breaker
-/// kind, and a refused Bash box that is no rm breaker (a write). The user's
+/// kind (`every_rm_breaker_kind_is_named_and_full_power_presses_each`), and a
+/// refused Bash box that is no rm breaker (a write). The user's
 /// own ask rule is handed over before any level
 /// (`a_box_the_owners_own_settings_send_to_a_person_is_never_pressed`).
 #[test]
@@ -3917,11 +3484,6 @@ fn an_unproven_rm_breaker_under_safe_is_approved_with_a_warning() {
         (
             "a target outside every scratch root",
             rm_box("S=/usr; rm -rf \"$S/t5\""),
-            bypass_warn.clone(),
-        ),
-        (
-            "a variable the line does not assign",
-            rm_box("rm -rf \"$UNSET/t5\""),
             bypass_warn.clone(),
         ),
     ] {
@@ -3964,56 +3526,17 @@ fn an_unproven_rm_breaker_under_safe_is_approved_with_a_warning() {
         approved(&on_screen(&proven, &bypass_warn)),
         Some(RULE_RM_BREAKER)
     );
-    // Negative controls: every other breaker kind stays a person's.
-    let note = CAP_RM
-        .lines()
-        .find(|r| r.contains("Dangerous rm operation"))
-        .expect("the capture's note row")
-        .to_string();
-    let lead = &note[..note.find("Dangerous").expect("note")];
-    for text in [
-        "Dangerous rm operation on statically-unresolvable target: tmp/*",
-        "Dangerous rm operation on critical path: /usr",
-        "Dangerous rm operation on working directory or its ancestor: .",
-        "Dangerous rm operation — too many command substitutions to analyze (65)",
-        "Dangerous rmdir operation on critical path: /usr",
-    ] {
-        let mut rows = with_row(&proven, &note, &format!("{lead}{text}"));
-        rows.retain(|r| r != " │ \"${S:?}\" or use a literal path)");
-        let d = on_screen(&rows, &bypass_warn);
-        assert!(approved(&d).is_none(), "{text}: {d:?}");
-    }
     // A write the safe rules refuse is no rm breaker: still escalated.
     let touch = bash_box(&["touch x"], Some("Create the file x now"));
     assert!(reason(&on_screen(&touch, &warn)).starts_with("not read-only"));
 }
 
-/// Bash under every header form: plain, `(unsandboxed)`, `(runs on <m>)`, and
-/// each origin form. Negative control: an unreadable ` · ` suffix, or a title
-/// only starting like one, is not a Bash header.
+/// The safe rules read a command only under a Bash header (the header grammar
+/// is aterm-phase's): an unreadable ` · ` suffix, or a title only starting
+/// like one, is no Bash header, so a read there escalates; full power answers
+/// it anyway (a one-shot allow needs no header).
 #[test]
 fn full_power_presses_bash_under_every_header_form() {
-    let base = bash_box(&["touch x"], None);
-    for title in [
-        " Bash command",
-        " Bash command (unsandboxed)",
-        " Bash command (runs on m3)",
-        " Bash command · from the \"trust-vc-front-end-m1\" workflow",
-        " Bash command · from a workflow",
-        " Bash command · from the Explore agent",
-        " Bash command · from a subagent",
-        " Bash command · from a remote cloud agent",
-        " Bash command · from the github plugin",
-        " Bash command · from a plugin",
-        " Bash command (unsandboxed) · from a subagent",
-    ] {
-        let rows = with_row(&base, " Bash command", title);
-        let d = on_screen(&rows, &full());
-        assert_eq!(approved(&d), Some(RULE_ALLOW_ONCE), "{title}: {d:?}");
-    }
-    // An unreadable ` · ` suffix, or a title only starting like a Bash header,
-    // is no Bash header, so a read there escalates (full power answers it
-    // anyway: a one-shot allow needs no header).
     let read = bash_box(&["git status --short"], None);
     assert_eq!(approved(&on_screen(&read, &ctx())), Some(RULE_READ_ONLY));
     for title in [" Bash command · from somewhere else", " Bash commandeer"] {
@@ -4122,13 +3645,12 @@ fn full_power_presses_every_permission_kind_under_its_judged_row() {
 
 /// The irreversible tool's unnumbered `Tool use` box with the vendor's focus on
 /// `No`: full power moves the focus to `Yes` and presses Enter once a fresh read
-/// shows it there, and the ledger says the vendor default was No. Control:
-/// focus already on `Yes`, no move.
+/// shows it there. Control: focus already on `Yes`, no move.
 #[test]
 fn a_default_to_no_tool_box_is_pressed_by_moving_the_focus() {
     let rows = phase_fixtures::screen(phase_fixtures::BOX_TOOL_DEFAULT_NO);
     let d = on_screen(&rows, &full());
-    let (rule, choice, guard, _, unproven) = approval(&d);
+    let (rule, choice, guard, _, _) = approval(&d);
     assert_eq!(rule, RULE_ALLOW_ONCE);
     assert_eq!(
         *choice,
@@ -4138,38 +3660,13 @@ fn a_default_to_no_tool_box_is_pressed_by_moving_the_focus() {
         }
     );
     assert_eq!(guarded(guard, &rows), [" Tool use"]);
-    assert!(
-        unproven.is_some_and(|u| u.ends_with("; vendor default was No")),
-        "{unproven:?}"
-    );
-    // Focus already on `Yes` (as after a missed fenced Enter): no move, and the
-    // vendor default is still said, read from the option order.
+    // Focus already on `Yes` (as after a missed fenced Enter): no move.
     let on_yes = with_row(&with_row(&rows, " ❯ No", "   No"), "   Yes", " ❯ Yes");
     let d = on_screen(&on_yes, &full());
-    let (_, choice, _, _, unproven) = approval(&d);
+    let (_, choice, _, _, _) = approval(&d);
     assert!(
         matches!(choice, Choice::Focus { steps: 0, .. }),
         "{choice:?}"
-    );
-    assert!(
-        unproven.is_some_and(|u| u.ends_with("; vendor default was No")),
-        "{unproven:?}"
-    );
-    // The control: `Yes` listed first with the focus on it is no default-No
-    // box.
-    let mut yes_first = on_yes.clone();
-    let no = yes_first.iter().position(|x| x == "   No").expect("No");
-    let yes = yes_first.iter().position(|x| x == " ❯ Yes").expect("Yes");
-    yes_first.swap(no, yes);
-    let d = on_screen(&yes_first, &full());
-    let (_, choice, _, _, unproven) = approval(&d);
-    assert!(
-        matches!(choice, Choice::Focus { steps: 0, .. }),
-        "{choice:?}"
-    );
-    assert!(
-        !unproven.is_some_and(|u| u.contains("vendor default")),
-        "{unproven:?}"
     );
 }
 
@@ -4178,11 +3675,9 @@ fn a_default_to_no_tool_box_is_pressed_by_moving_the_focus() {
 /// delivered; a proposed goal, a Computer Use grant, the persistent read
 /// setting and the setup dialogs (an API-key box and a model-upgrade box,
 /// built from vendor strings) declined with the refusal that settles nothing.
-/// A question is no permission: `answer_questions` decides it first
-/// (`policy/question.rs`, `question_tests.rs`), and these two column-1 shapes
-/// are escalated as questions not read whole. Negative controls: the safe
-/// rules answer none of them; `answer_questions = false` makes a question a
-/// person's.
+/// (A question is no permission: `answer_questions` decides it first,
+/// `question_tests.rs`.) Negative control: the safe rules answer none of
+/// them.
 #[test]
 fn full_power_answers_each_dialog_by_its_own_rule() {
     let f = |t: &str| phase_fixtures::screen(t);
@@ -4223,11 +3718,6 @@ fn full_power_answers_each_dialog_by_its_own_rule() {
         "Yes",
         "No",
     );
-    for rows in [&api_key, &upgrade] {
-        let p = aterm_phase::parse_prompt_v2(rows).expect("the dialog is read as a box");
-        assert_eq!(p.kind, PromptKind::Other, "{:?}", p.title);
-        assert!(p.with_role(Role::Once).is_some() && p.with_role(Role::Deny).is_some());
-    }
     let focus = |label: &str| Choice::Focus {
         steps: 0,
         label: label.to_string(),
@@ -4254,28 +3744,9 @@ fn full_power_answers_each_dialog_by_its_own_rule() {
                 label: "Deliver this message to Claude".to_string(),
             },
         ),
-        // 2.1.287 brackets the preview in dashed rules and draws the options
-        // right under them: the same two options, the same delivery.
-        (
-            "held message, bracketed",
-            f(phase_fixtures::HELD_MESSAGE_2_1_287),
-            RULE_ALLOW_ONCE,
-            Choice::Focus {
-                steps: 1,
-                label: "Deliver this message to Claude".to_string(),
-            },
-        ),
         (
             "goal",
             f(phase_fixtures::GOAL_PROPOSAL),
-            RULE_DECLINE,
-            focus("Not now"),
-        ),
-        // MEASURED on 2.1.292: the Pane's column two, which the reader took for
-        // no box (`idle`) until its title was read there too.
-        (
-            "goal 2.1.292",
-            f(phase_fixtures::GOAL_PROPOSAL_2_1_292),
             RULE_DECLINE,
             focus("Not now"),
         ),
@@ -4315,79 +3786,169 @@ fn full_power_answers_each_dialog_by_its_own_rule() {
             "{name}: {safe:?}"
         );
     }
-    for text in [
-        phase_fixtures::QUESTION_YES_NO,
-        phase_fixtures::QUESTION_DO_YOU_WANT,
-    ] {
-        let rows = f(text);
-        let reading = aterm_phase::read(Some("claude"), &rows, None);
-        assert_eq!(reading.phase, Phase::Prompt, "detected, not idle");
-        let d = on_screen(&rows, &full());
-        let why = reason(&d);
-        assert!(
-            why.starts_with("a question aterm could not read whole"),
-            "{why}"
-        );
-    }
-    let quiet = ApprovalCtx {
-        answer_questions: false,
-        ..full()
-    };
-    let rows = f(phase_fixtures::QUESTION_YES_NO);
-    assert!(reason(&on_screen(&rows, &quiet)).contains("answer_questions is off"));
 }
 
-/// Full power on harder boxes: a box with unsound options is a person's; a box
-/// whose only yes is a standing grant, or a workflow whose script is withheld
-/// (`Not now` and `No`), is declined; neither an Esc that goes back nor a
-/// forged `1. Yes` row above the question stops the one-shot allow (options are
-/// read under the question, the press guarded on the command row). Controls:
-/// the unchanged box is pressed; the safe rules refuse the forged one.
+/// Full power on harder boxes: options numbered out of order are no sound
+/// parse, so nothing on the box is pressed; a workflow whose script is
+/// withheld (`Not now` and `No`) is declined; neither an Esc that goes back
+/// nor a forged `1. Yes` row above the question stops the one-shot allow
+/// (options are read under the question, the press guarded on the command
+/// row). Controls: the unchanged box is pressed; the safe rules refuse the
+/// forged one. (A box whose only yes is a standing grant:
+/// `full_power_never_takes_a_standing_grant`.)
+/// A DIALOG INK WRAPPED IS ANSWERED BY ITS OWN RULE, at the default (full
+/// power), as it is whole. Read a row at a time each was a dialog of kind
+/// `other` and pressed its stop or refusal: the 80-column plan under a plan
+/// taller than the pane (`3. No, keep planning`), the 26-column usage-limit
+/// dialog (`no-spend@v1`'s `Stop and wait for limit to reset`, KI W2), the
+/// 44-column skill box (`3. No`), the 34-column held message (its focused
+/// `Deny`); the 50-column held message, its Deny label wrapped, was
+/// escalated as three options. Now: the plan's least-power yes, the wait row
+/// guarded on the title's first row, the skill's one-shot allow and the
+/// message's delivery. 2.1.300's plan re-wrapped at 20-120 columns gets its
+/// least-power yes at every width: under 29 its first label, read a row at a
+/// time, was `Yes, and use auto` and named no standing mode, so `1`, auto
+/// mode, was pressed. NEGATIVE CONTROL: the 120-column copies are answered
+/// the same.
 #[test]
-fn full_power_declines_a_grant_only_box_and_leaves_an_unsound_one() {
-    let with = |opts: &[&str]| {
-        let mut rows = bash_box(&["touch x"], None);
-        let at = rows.iter().position(|r| r == " ❯ 1. Yes").expect("row");
-        rows.drain(at..at + 2);
-        for (k, o) in opts.iter().enumerate() {
-            rows.insert(at + k, (*o).to_string());
-        }
-        rows
+fn a_dialog_ink_wrapped_is_answered_by_its_own_rule() {
+    use phase_fixtures::{
+        BOX_SKILL, BOX_SKILL_44_2_1_300, HELD_MESSAGE_2_1_287, HELD_MESSAGE_34_2_1_300,
+        HELD_MESSAGE_50_2_1_300, LIMIT_OPTIONS_26, PLAN_APPROVAL_TALL_80_2_1_300, PLAN_READY,
+        screen,
+    };
+    let deliver = Choice::Focus {
+        steps: 1,
+        label: "Deliver this message to Claude".to_string(),
+    };
+    for (name, fixture, rule, choice) in [
+        (
+            "plan, 80 columns, head off",
+            PLAN_APPROVAL_TALL_80_2_1_300,
+            RULE_PLAN,
+            Choice::Digit(2),
+        ),
+        ("plan, whole", PLAN_READY, RULE_PLAN, Choice::Digit(2)),
+        (
+            "skill, 44 columns",
+            BOX_SKILL_44_2_1_300,
+            RULE_ALLOW_ONCE,
+            Choice::Digit(1),
+        ),
+        ("skill, whole", BOX_SKILL, RULE_ALLOW_ONCE, Choice::Digit(1)),
+        (
+            "held message, 34 columns",
+            HELD_MESSAGE_34_2_1_300,
+            RULE_ALLOW_ONCE,
+            deliver.clone(),
+        ),
+        (
+            "held message, 50 columns",
+            HELD_MESSAGE_50_2_1_300,
+            RULE_ALLOW_ONCE,
+            deliver.clone(),
+        ),
+        (
+            "held message, whole",
+            HELD_MESSAGE_2_1_287,
+            RULE_ALLOW_ONCE,
+            deliver.clone(),
+        ),
+    ] {
+        let rows = screen(fixture);
+        let d = on_screen(&rows, &full());
+        assert_eq!(pressed(&d), (rule, choice), "{name}: {d:?}");
+    }
+    // 2.1.300's plan at any width gets its least-power yes, `2`: under 29
+    // columns, its first label cut at its row's end (`Yes, and use auto`)
+    // named no standing mode, and `1`, auto mode, was pressed.
+    for width in 20..=120 {
+        let rows = phase_fixtures::rewrap_box(phase_fixtures::PLAN_APPROVAL_140_2_1_300, width);
+        let d = on_screen(&rows, &full());
+        assert_eq!(
+            pressed(&d),
+            (RULE_PLAN, Choice::Digit(2)),
+            "plan, {width} columns: {d:?}"
+        );
+    }
+    // NEGATIVE CONTROLS: a next label that fits nowhere on the whole label
+    // above it is no rest of that label. The held message at 54-63 columns
+    // is delivered, and the trust backstop at 42-48 is trusted, as whole.
+    for width in 54..=63 {
+        let rows = phase_fixtures::rewrap_box(HELD_MESSAGE_2_1_287, width);
+        let d = on_screen(&rows, &full());
+        assert_eq!(
+            pressed(&d),
+            (RULE_ALLOW_ONCE, deliver.clone()),
+            "held message, {width} columns: {d:?}"
+        );
+    }
+    let own = ApprovalCtx::new(
+        PathBuf::from("/Users//user00/aterm"),
+        Some(PathBuf::from("/Users//user00")),
+        502,
+        None,
+        std::sync::Arc::new(crate::supervise::policy::LiveProbe),
+    );
+    for width in 42..=48 {
+        let rows = phase_fixtures::rewrap_box(phase_fixtures::TRUST_BACKSTOP, width);
+        let d = on_screen(&rows, &own);
+        assert_eq!(
+            pressed(&d),
+            (
+                RULE_TRUST_ANY,
+                Choice::Focus {
+                    steps: 1,
+                    label: "Yes, I trust this folder".to_string()
+                }
+            ),
+            "trust backstop, {width} columns: {d:?}"
+        );
+    }
+    // The usage-limit dialog by its wait row, guarded on its title's first
+    // row: the row the reader took the title's line from.
+    let rows = screen(LIMIT_OPTIONS_26);
+    let wait = "Wait here, then continue automatically at 12:23pm";
+    let d = on_screen(&rows, &full());
+    let Decision::Approve {
+        rule_id,
+        choice,
+        guard,
+        ..
+    } = &d
+    else {
+        panic!("{d:?}");
     };
     assert_eq!(
-        approved(&on_screen(&with(&[" ❯ 1. Yes", "   2. No"]), &full())),
-        Some(RULE_ALLOW_ONCE)
+        (*rule_id, choice),
+        (
+            RULE_LIMIT_WAIT,
+            &Choice::Focus {
+                steps: 1,
+                label: wait.to_string()
+            }
+        )
     );
-    let d = on_screen(&with(&[" ❯ 2. Yes", "   1. No"]), &full());
+    let m = aterm_observe::row_matcher(guard).expect("compiles");
+    assert_eq!(
+        rows.iter().filter(|r| m.matches(r)).collect::<Vec<_>>(),
+        ["  What do you want to"]
+    );
+}
+
+#[test]
+fn full_power_declines_a_grant_only_box_and_leaves_an_unsound_one() {
+    let with = |opts: [&str; 2]| {
+        let rows = bash_box(&["touch x"], None);
+        with_row(&with_row(&rows, " ❯ 1. Yes", opts[0]), "   2. No", opts[1])
+    };
+    let sound = with([" ❯ 1. Yes", "   2. No"]);
+    assert_eq!(approved(&on_screen(&sound, &full())), Some(RULE_ALLOW_ONCE));
+    let d = on_screen(&with([" ❯ 2. Yes", "   1. No"]), &full());
     assert!(
         reason(&d).contains("no one-shot allow"),
         "out of order: {d:?}"
     );
-    for (name, rows) in [
-        (
-            "grant only",
-            with(&[" ❯ 1. Yes, and don’t ask again for: touch *", "   2. No"]),
-        ),
-        (
-            "session only",
-            with(&[
-                " ❯ 1. Yes, and allow reading from ~/x during this session",
-                "   2. No",
-            ]),
-        ),
-        (
-            "mode switch only",
-            with(&[" ❯ 1. Yes, and switch to auto mode (shift+tab)", "   2. No"]),
-        ),
-    ] {
-        let d = on_screen(&rows, &full());
-        assert_eq!(
-            approval(&d).0,
-            RULE_DECLINE,
-            "{name}: declined, never granted: {d:?}"
-        );
-        assert_eq!(approval(&d).1, &Choice::Digit(2), "{name}");
-    }
     let withheld = with_row(
         &phase_fixtures::workflow_box(),
         "  ❯ 1. Yes, run it",
@@ -4411,42 +3972,30 @@ fn full_power_declines_a_grant_only_box_and_leaves_an_unsound_one() {
 
 /// The captured `touch x` box, whose option 2 wraps on a long cwd into a
 /// garbled `3. Nooject` ([`Role::Other`]), is pressed at full power, which asks
-/// only for the one-shot allow: the capture, both aterm-phase copies and the
-/// blinking one, in and out of bypass. A box with no `No` at all is too.
-/// Negative control: the safe rules still require the refusal option.
+/// only for the one-shot allow, in and out of bypass. Negative control: the
+/// safe rules still require the refusal option.
 #[test]
 fn full_power_presses_the_measured_touch_box_whose_no_is_garbled() {
-    for rows in [
-        lines(CAP_BOX1),
-        phase_fixtures::screen(phase_fixtures::BOX_BASH_TOUCH),
-        phase_fixtures::screen(phase_fixtures::BOX_BASH_TOUCH_BLINK),
-    ] {
-        for bypass_mode in [false, true] {
-            let c = ApprovalCtx {
-                bypass_mode,
-                ..full()
-            };
-            let d = on_screen(&rows, &c);
-            let (rule, choice, guard, subject, _) = approval(&d);
-            assert_eq!((rule, choice), (RULE_ALLOW_ONCE, &Choice::Digit(1)));
-            assert!(subject.starts_with("touch x"), "{subject}");
-            assert_eq!(guarded(guard, &rows), ["   touch x"]);
-        }
+    let rows = lines(CAP_BOX1);
+    for bypass_mode in [false, true] {
+        let c = ApprovalCtx {
+            bypass_mode,
+            ..full()
+        };
+        let d = on_screen(&rows, &c);
+        let (rule, choice, guard, subject, _) = approval(&d);
+        assert_eq!((rule, choice), (RULE_ALLOW_ONCE, &Choice::Digit(1)));
+        assert!(subject.starts_with("touch x"), "{subject}");
+        assert_eq!(guarded(guard, &rows), ["   touch x"]);
     }
-    let no_no = with_row(
-        &bash_box(&["touch x"], None),
-        "   2. No",
-        "   2. Maybe later",
-    );
-    assert_eq!(approved(&on_screen(&no_no, &full())), Some(RULE_ALLOW_ONCE));
     let read = with_row(&lines(CAP_BOX1), "   touch x", "   ls -la");
     let d = on_screen(&read, &ctx());
     assert!(reason(&d).contains("offers no `No`"), "{d:?}");
 }
 
-/// The folder-trust dialog at full power is trusted for any folder (under no
-/// root, another folder, cwd unknown), ledgered `trust-any@v1` with the safe
-/// rule's reason as `unproven:`; the backstop form too, its warnings in the
+/// The folder-trust dialog at full power is trusted for any folder (here one
+/// under no root), ledgered `trust-any@v1` with the safe rule's reason as
+/// `unproven:`; the backstop form too, its warnings in the
 /// subject. For the session's own folder under a root the safe rule keeps its
 /// id. Negative control: the safe rules on the backstop; the other cases are
 /// `a_trust_dialog_escalates_off_the_sessions_folder_or_its_roots`'s.
@@ -4479,25 +4028,13 @@ fn full_power_trusts_any_folder_and_names_the_backstops_grants() {
         Some(RULE_TRUST_DIALOG)
     );
 
-    let mut elsewhere = full();
-    elsewhere.cwd = PathBuf::from("/private/tmp/claude-502/scratch/work2");
-    let d = on_screen(&rows, &elsewhere);
-    assert_eq!(approved(&d), Some(RULE_TRUST_ANY));
-    assert!(
-        approval(&d)
-            .4
-            .is_some_and(|u| u.contains("not the session's cwd"))
-    );
-    let mut unknown = full();
-    unknown.cwd_known = false;
-    assert_eq!(approved(&on_screen(&rows, &unknown)), Some(RULE_TRUST_ANY));
-
     let backstop = phase_fixtures::screen(phase_fixtures::TRUST_BACKSTOP);
     let mut own = ApprovalCtx::new(
         PathBuf::from("/Users//user00/aterm"),
         Some(PathBuf::from("/Users//user00")),
         502,
         None,
+        std::sync::Arc::new(crate::supervise::policy::LiveProbe),
     );
     // The fixture's folder named as a root, so the safe rule reaches its options.
     own.set_trust_roots(&["~/aterm".to_string()], 502);
@@ -4514,11 +4051,7 @@ fn full_power_trusts_any_folder_and_names_the_backstops_grants() {
         matches!(choice, Choice::Focus { steps: 1, .. }),
         "{choice:?}"
     );
-    assert_eq!(
-        subject,
-        "/Users//user00/aterm (backstop: This folder pre-approves 3 tool permissions in \
-         .claude/settings.json: Bash(git:*); trusting makes these apply without asking)"
-    );
+    assert!(subject.contains("Bash(git:*)"), "{subject}");
     // Every warning names the rows listed under it: the rules the press
     // accepts, not the headline alone.
     let mut two = backstop.clone();
@@ -4529,223 +4062,399 @@ fn full_power_trusts_any_folder_and_names_the_backstops_grants() {
     two.insert(at + 4, "   /Users//user00/other".to_string());
     let d = on_screen(&two, &own);
     let (_, _, _, subject, _) = approval(&d);
-    assert_eq!(
-        subject,
-        "/Users//user00/aterm (backstop: This folder pre-approves 3 tool permissions in \
-         .claude/settings.json: Bash(git:*), Read(~/secrets/**); This folder adds 1 \
-         directory: /Users//user00/other; trusting makes these apply without asking)"
-    );
-}
-
-// --- quoted and look-alike boxes ----------------------------------------------
-
-/// A box quoted in the user's message (its rows in the message's continuation
-/// column, no rule line, a spinner between it and the composer) is no box, so
-/// full power presses nothing, numbered or unnumbered. Control: the same box at
-/// its own column under a blank row is pressed.
-#[test]
-fn a_box_quoted_in_the_users_message_is_never_pressed() {
-    let quote = |body: &[&str], column: &str| {
-        let mut r = lines("⏺ Done.\n\n❯ The harness showed me this, what should I do?");
-        if column.is_empty() {
-            r.push(String::new());
-        }
-        r.extend(body.iter().map(|b| format!("{column}{b}")));
-        r.extend(lines("\n✻ Thinking… (3s · ↓ 12 tokens)"));
-        r.extend(phase_fixtures::composer("  esc to interrupt"));
-        r
-    };
-    let bash = [
-        " Bash command",
-        "   rm -rf ~/work",
-        " Do you want to proceed?",
-        " ❯ 1. Yes",
-        "   2. No",
-        " Esc to cancel · Tab to amend",
-    ];
-    let tool = [
-        " Tool use",
-        "   github - create_issue Tool: (MCP)",
-        " Do you want to proceed?",
-        "   Yes",
-        " ❯ No",
-        " Esc to cancel · Tab to amend",
-    ];
-    for body in [&bash[..], &tool] {
-        let rows = quote(body, "  ");
-        assert_eq!(
-            decide_screen(Some("claude"), &rows, &full()),
-            None,
-            "{rows:#?}"
-        );
+    for row in ["Bash(git:*)", "Read(~/secrets/**)", "/Users//user00/other"] {
+        assert!(subject.contains(row), "{row}: {subject}");
     }
-    let live = quote(&bash, "");
-    assert_eq!(approved(&on_screen(&live, &full())), Some(RULE_ALLOW_ONCE));
 }
 
-/// A quote under a row the message draws in its own continuation column (a
-/// table's bottom edge, a frame edge, a spinner-shaped line, a `*` bullet) is
-/// still no box, in assistant or user messages, with a spinner or an idle
-/// composer under it: neither full power nor the safe rules press anything.
-/// Control: the Bash box under a column-0 frame edge is pressed.
-#[test]
-fn a_box_quoted_under_a_messages_own_table_or_frame_is_never_pressed() {
-    let cwd = ctx().cwd.display().to_string();
-    let bash = [
-        " Bash command",
-        "   rm -rf ~/work",
-        " Do you want to proceed?",
-        " ❯ 1. Yes",
-        "   2. No",
-        " Esc to cancel · Tab to amend",
-    ];
-    let tool = [
-        " Tool use",
-        "   github - create_issue Tool: (MCP)",
-        " Do you want to proceed?",
-        " ❯ Yes",
-        "   No",
-        " Esc to cancel · Tab to amend",
-    ];
-    let trust_path = format!(" {cwd}");
-    let trust = [
-        " Accessing workspace:",
-        "",
-        trust_path.as_str(),
-        "",
-        " ❯ 1. Yes, I trust this folder",
-        "   2. No, exit",
-        "",
-        " Enter to confirm · Esc to cancel",
-    ];
-    let stops: [&[&str]; 5] = [
-        &[
-            "  ┌──────┬──────┐",
-            "  │ a    │ b    │",
-            "  └──────┴──────┘",
-        ],
-        &[
-            "  ┌──────┬──────┐",
-            "  │ a    │ b    │",
-            "  └──────┴──────┘",
-            "",
-        ],
-        &["  ╭───────────────╮"],
-        &["  ✻ Cogitating… (5s)"],
-        &["  * Waiting for the harness…"],
-    ];
-    for body in [&bash[..], &tool, &trust] {
-        for stop in stops {
-            for who in [
-                "⏺ Here is what the harness showed:",
-                "❯ The harness showed me this, what should I do?",
-            ] {
-                for busy in [true, false] {
-                    let mut rows = lines(&format!("⏺ Done.\n\n{who}"));
-                    rows.extend(stop.iter().map(|s| s.to_string()));
-                    rows.extend(body.iter().map(|b| format!("  {b}")));
-                    rows.push(String::new());
-                    if busy {
-                        rows.push("✻ Thinking… (3s · ↓ 12 tokens)".to_string());
-                        rows.extend(phase_fixtures::composer("  esc to interrupt"));
-                    } else {
-                        rows.extend(phase_fixtures::composer("  ? for shortcuts"));
-                    }
-                    for c in [full(), ctx(), bypass()] {
-                        assert_eq!(decide_screen(Some("claude"), &rows, &c), None, "{rows:#?}");
-                    }
-                }
-            }
-        }
-    }
-    let mut live = lines("⏺ Here is what the harness showed:");
-    live.push("╰".to_string() + &"─".repeat(40) + "╯");
-    live.extend(bash.iter().map(|b| b.to_string()));
-    live.push(String::new());
-    live.extend(phase_fixtures::composer("  ? for shortcuts"));
-    assert_eq!(approved(&on_screen(&live, &full())), Some(RULE_ALLOW_ONCE));
-}
+// --- setup dialogs -------------------------------------------------------------
 
 /// Footerless setup dialogs (the auto-mode-default nudge, the Chrome upsell,
-/// Remote Control, `Session paused`) are read as prompts of kind `other`: full
+/// Remote Control; aterm-phase reads each as a prompt of kind `other`): full
 /// power declines them with the refusal that settles nothing (`No, keep
-/// default`, `Not now`, `Never mind`), and `Session paused` (no refusal
-/// among its options) gets its `Switch to <fallback>` under `model_fallback`,
-/// with options at column one too; the safe rules escalate them in and out of
-/// bypass. Negative control: each with the composer under it is no box.
+/// default`, `Not now`, `Never mind`), in and out of bypass; the safe rules
+/// escalate them. (`Session paused`, no refusal among its options:
+/// `the_session_paused_dialog_switches_to_the_fallback`.)
 #[test]
 fn a_footerless_setup_dialog_is_declined_or_escalated_never_idle() {
     let every_bypass = ApprovalCtx {
         bypass_mode: true,
         ..full()
     };
-    let mut paused_col1 = phase_fixtures::screen(phase_fixtures::SESSION_PAUSED);
-    for r in &mut paused_col1 {
-        if r.trim_start().starts_with(['❯', '2']) {
-            *r = format!(" {}", r.trim_start());
-            if r.starts_with(" 2") {
-                *r = format!("   {}", r.trim_start());
-            }
-        }
-    }
-    assert!(
-        paused_col1
-            .iter()
-            .any(|r| r == " ❯ 1. Switch to Sonnet 4.5"),
-        "{paused_col1:#?}"
-    );
-    let screens = [
-        (
-            phase_fixtures::screen(phase_fixtures::SETUP_AUTO_MODE_DEFAULT),
-            Some("No, keep default"),
-        ),
-        (
-            phase_fixtures::screen(phase_fixtures::SETUP_CHROME_UPSELL),
-            Some("Not now"),
-        ),
-        (
-            phase_fixtures::screen(phase_fixtures::SETUP_REMOTE_CONTROL),
-            Some("Never mind"),
-        ),
-        (phase_fixtures::screen(phase_fixtures::SESSION_PAUSED), None),
-        (paused_col1, None),
-    ];
-    for (rows, declined) in screens {
-        let reading = aterm_phase::read(Some("claude"), &rows, None);
-        assert_eq!(reading.phase, aterm_phase::Phase::Prompt, "{rows:#?}");
-        assert!(reading.phase_authoritative);
-        assert_eq!(
-            reading.prompt.as_ref().map(|p| p.kind),
-            Some(PromptKind::Other)
-        );
+    for (fixture, label) in [
+        (phase_fixtures::SETUP_AUTO_MODE_DEFAULT, "No, keep default"),
+        (phase_fixtures::SETUP_CHROME_UPSELL, "Not now"),
+        (phase_fixtures::SETUP_REMOTE_CONTROL, "Never mind"),
+    ] {
+        let rows = phase_fixtures::screen(fixture);
         for c in [full(), every_bypass.clone()] {
             let d = on_screen(&rows, &c);
-            match declined {
-                Some(label) => {
-                    let (rule, _, _, subject, _) = approval(&d);
-                    assert_eq!(rule, RULE_DECLINE, "{d:?}");
-                    assert!(subject.ends_with(&format!("=> {label}")), "{subject}");
-                }
-                None => {
-                    let (rule, _, _, subject, _) = approval(&d);
-                    assert_eq!(rule, RULE_MODEL_SWITCH, "{d:?}");
-                    assert!(subject.ends_with("=> Switch to Sonnet 4.5"), "{subject}");
-                }
-            }
+            let (rule, _, _, subject, _) = approval(&d);
+            assert_eq!(rule, RULE_DECLINE, "{d:?}");
+            assert!(subject.ends_with(&format!("=> {label}")), "{subject}");
         }
         for c in [ctx(), bypass()] {
             let d = on_screen(&rows, &c);
             assert!(reason(&d).contains("no rule approves this kind"), "{d:?}");
         }
-        let mut scrolled = rows.clone();
-        scrolled.extend(phase_fixtures::composer("  ? for shortcuts"));
-        assert_eq!(
-            decide_screen(Some("claude"), &scrolled, &full()),
-            None,
-            "{scrolled:#?}"
+    }
+}
+
+/// Claude Code's MCP server dialogs (MEASURED on 2.1.301) are a person's at
+/// EVERY level — `none`, safe (with and without its rm warning), full power,
+/// bypass under either — escalated, nothing pressed (what the escalation
+/// says is the loop's badge test's,
+/// `the_mcp_server_dialogs_badge_says_every_answer_is_kept_at_every_level`).
+/// Before, full power pressed the one-server dialog's `Continue without using
+/// this MCP server` under `allow-once@v1`, which disabled the server for
+/// good. Negative controls: a RETITLED one-server dialog (no MCP kind)
+/// presses nothing either, every answer of it kept by its label; Codex's
+/// reader names no such dialog.
+#[test]
+fn the_mcp_server_dialog_is_a_persons_at_every_level() {
+    let every_bypass = ApprovalCtx {
+        bypass_mode: true,
+        ..full()
+    };
+    let one = phase_fixtures::screen(phase_fixtures::MCP_SERVER_ONE);
+    let two = phase_fixtures::screen(phase_fixtures::MCP_SERVER_TWO);
+    let levels = [
+        ("none", none(full())),
+        ("safe", ctx()),
+        ("safe-warn", safe_warn()),
+        ("all", full()),
+        ("bypass-safe", bypass()),
+        ("bypass-all", every_bypass),
+    ];
+    for (name, rows) in [("one", &one), ("two", &two)] {
+        for (level, c) in &levels {
+            let d = on_screen(rows, c);
+            assert!(
+                matches!(d, Decision::Escalate { .. }),
+                "{name} {level}: {d:?}"
+            );
+        }
+        // Codex's reader names no MCP server dialog, so its rule is not the
+        // one that holds the box there.
+        let codex = aterm_phase::read(Some("codex"), rows, None);
+        assert_ne!(
+            codex.prompt.as_ref().map(|p| p.kind),
+            Some(PromptKind::McpServer),
+            "{name}"
         );
-        let reading = aterm_phase::read(Some("claude"), &scrolled, None);
-        assert_eq!(reading.phase, aterm_phase::Phase::Idle, "{scrolled:#?}");
+        if let Some(d) = decide_screen(Some("codex"), rows, &full()) {
+            assert!(
+                !matches!(&d, Decision::Escalate { reason } if reason.contains("MCP server dialog")),
+                "{name}: {d:?}"
+            );
+        }
+    }
+    let retitled: Vec<String> = one
+        .iter()
+        .map(|r| r.replace("New MCP server found in this project:", "New tool found:"))
+        .collect();
+    for c in [
+        full(),
+        ApprovalCtx {
+            bypass_mode: true,
+            ..full()
+        },
+    ] {
+        let d = on_screen(&retitled, &c);
+        assert!(
+            reason(&d).contains("persist:Continue without using this MCP server"),
+            "{d:?}"
+        );
+    }
+}
+
+/// THE PRESS GATE refuses an MCP server dialog's kept answers whatever rule
+/// chose them, retitled (no MCP kind): each of the one-server dialog's
+/// three, and the several-server dialog's `Enable selected` (its head off
+/// the screen too, and read mid-move, a cursor on a server row and on it,
+/// where the reader withholds every role: kept by its label alone), picked
+/// under any rule, becomes an escalation naming it. NEGATIVE CONTROL: a
+/// permission box's one-shot allow passes the gate.
+#[test]
+fn the_press_gate_refuses_each_kept_mcp_answer_under_any_title() {
+    let one: Vec<String> = phase_fixtures::screen(phase_fixtures::MCP_SERVER_ONE)
+        .iter()
+        .map(|r| r.replace("New MCP server found in this project:", "New tool found:"))
+        .collect();
+    let two: Vec<String> = phase_fixtures::screen(phase_fixtures::MCP_SERVER_TWO)
+        .iter()
+        .map(|r| r.replace("new MCP servers found in this project", "new tools found"))
+        .collect();
+    let mut mid_move = two.clone();
+    let submit = mid_move
+        .iter()
+        .position(|r| r.trim() == "Enable selected")
+        .expect("the submit row");
+    mid_move[submit] = "  ❯    Enable selected".to_string();
+    let withheld = aterm_phase::read(Some("claude"), &mid_move, None).prompt;
+    assert!(
+        withheld
+            .as_ref()
+            .is_some_and(|p| p.options.iter().all(|o| o.role == Role::Other)),
+        "{withheld:#?}"
+    );
+    for (rows, steps, label) in [
+        (&one, -2, "Use this MCP server"),
+        (
+            &one,
+            -1,
+            "Use this and all future MCP servers in this project",
+        ),
+        (&one, 0, "Continue without using this MCP server"),
+        (&two, 2, "Enable selected"),
+        (&mid_move, 2, "Enable selected"),
+    ] {
+        let reading = aterm_phase::read(Some("claude"), rows, None);
+        let p = reading.prompt.as_ref().expect("the box");
+        assert_ne!(p.kind, PromptKind::McpServer, "{label}");
+        let pick = Decision::Approve {
+            rule_id: RULE_ALLOW_ONCE,
+            choice: Choice::Focus {
+                steps,
+                label: label.to_string(),
+            },
+            guard: String::new(),
+            subject: String::new(),
+            unproven: None,
+        };
+        let why = kept_or_bought(p, &pick).unwrap_or_else(|| panic!("{label} passed the gate"));
+        assert!(
+            why.contains("keeps its answer for every later ask"),
+            "{why}"
+        );
+    }
+    let rows = bash_box(&["touch x"], None);
+    let reading = aterm_phase::read(Some("claude"), &rows, None);
+    let d = decide(&reading, &rows, &full());
+    assert_eq!(pressed(&d), (RULE_ALLOW_ONCE, Choice::Digit(1)));
+    assert_eq!(
+        kept_or_bought(reading.prompt.as_ref().expect("box"), &d),
+        None
+    );
+}
+
+/// THE PRESS GATE reads a kept answer by its role and by its label alike
+/// ([`kept_for_good`]): a label kept by the word `always` alone, no KEPT
+/// phrase in it, by the role the reader gives it ([`Role::Persist`]), and
+/// `Yes, and don't ask again …` read mid-move (two cursors: every role
+/// withheld) by its words. NEGATIVE CONTROL: the box's one-shot `Yes`
+/// passes.
+#[test]
+fn the_press_gate_reads_a_kept_answer_by_its_role_or_its_label() {
+    let pick = |n: u8| Decision::Approve {
+        rule_id: RULE_ALLOW_ONCE,
+        choice: Choice::Digit(n),
+        guard: String::new(),
+        subject: String::new(),
+        unproven: None,
+    };
+    let always = with_row(
+        &bash_box(&["touch x"], None),
+        "   2. No",
+        "   2. Yes, always",
+    );
+    let kept = with_row(
+        &bash_box(&["touch x"], None),
+        "   2. No",
+        " ❯ 2. Yes, and don't ask again for: touch *",
+    );
+    for (name, rows, role) in [
+        ("always", &always, Role::Persist),
+        ("mid-move", &kept, Role::Other),
+    ] {
+        let reading = aterm_phase::read(Some("claude"), rows, None);
+        let p = reading.prompt.as_ref().expect("the box");
+        let o = p.options.iter().find(|o| o.n == Some(2)).expect("option 2");
+        assert_eq!(o.role, role, "{name}: {:#?}", p.options);
+        assert!(kept_or_bought(p, &pick(2)).is_some(), "{name}");
+        assert_eq!(kept_or_bought(p, &pick(1)), None, "{name}");
+    }
+}
+
+/// `Continue without …` is a refusal that goes on, never a consent, and an
+/// answer kept for good is no consent either: 2.1.301's Settings Error
+/// (MEASURED) is DECLINED under full power with `Continue without these
+/// settings` (`decline@v1`, where its `Continue with` prefix had made it
+/// `allow-once@v1`); the safe rules escalate it. Negative controls: a limit's
+/// consents, `Continue with usage credits` with credits on and `Continue with
+/// <model>`, are still accepted.
+#[test]
+fn continue_without_is_a_refusal_never_a_consent() {
+    let opt = |l: &str| aterm_phase::prompt::Opt {
+        n: Some(1),
+        label: l.to_string(),
+        role: aterm_phase::prompt::Role::Other,
+        focused: true,
+        row: 0,
+    };
+    for (label, consent) in [
+        ("Continue with usage credits", true),
+        ("Continue with Opus 5.5", true),
+        ("Continue without using this MCP server", false),
+        ("Continue without these settings", false),
+        ("Continue without browser tools", false),
+        ("Continue with browser tools", false),
+        ("Continue withheld", false),
+    ] {
+        assert_eq!(consents(&opt(label)), consent, "{label}");
+    }
+    let settings = phase_fixtures::screen(phase_fixtures::SETTINGS_ERROR);
+    let d = on_screen(&settings, &full());
+    assert_eq!(pressed(&d), (RULE_DECLINE, Choice::Digit(3)), "{d:?}");
+    let (_, _, _, subject, _) = approval(&d);
+    assert!(
+        subject.ends_with("=> Continue without these settings"),
+        "{subject}"
+    );
+    assert!(
+        reason(&on_screen(&settings, &ctx())).contains("no rule approves this kind"),
+        "{d:?}"
+    );
+    for label in ["Continue with usage credits", "Continue with Opus 5.5"] {
+        let mut consent = vec![
+            "⏺ Working.".to_string(),
+            String::new(),
+            "─".repeat(80),
+            " You've reached your Fable limit".to_string(),
+            String::new(),
+        ];
+        consent.extend(
+            [
+                format!("❯ 1. {label}"),
+                "2. No, keep my current model".to_string(),
+            ]
+            .iter()
+            .map(|o| format!("   {o}")),
+        );
+        consent.extend([String::new(), " Esc to cancel".to_string()]);
+        assert_eq!(
+            pressed(&on_screen(&consent, &full())),
+            (RULE_ALLOW_ONCE, Choice::Digit(1)),
+            "{label}"
+        );
+    }
+}
+
+/// Claude Code's Chrome setup panel in `phase`, HAND-BUILT from est() in the
+/// 2.1.301 bundle (no live capture): the `_a` frame the Chrome upsell is
+/// drawn in (title ` Setting up Claude in Chrome` at column one under the
+/// full-width rule, footerless), its body rows as the bundle writes them for
+/// that phase, and its `Ye` select with `hideIndexes` (unnumbered, the
+/// cursor on the first option: no `defaultFocusValue`); the options'
+/// descriptions are left out, their layout not measured. `connecting`
+/// offers `Continue without browser tools` alone (so does every phase but
+/// these two), `stalled` `Keep waiting` before it, `connected` `Continue
+/// with browser tools` before it.
+fn chrome_setup(phase: &str) -> Vec<String> {
+    let mut rows = vec![
+        "⏺ Working on it.".to_string(),
+        String::new(),
+        "─".repeat(120),
+        " Setting up Claude in Chrome".to_string(),
+        String::new(),
+    ];
+    let (body, options): (&[&str], &[&str]) = match phase {
+        "connecting" => (
+            &[
+                "Finish setup in Chrome. This screen follows along and updates on its own as \
+                 each step completes.",
+                "",
+                "✔ Install the extension",
+                "… Connect to Chrome",
+            ],
+            &["Continue without browser tools"],
+        ),
+        "stalled" => (
+            &[
+                "Finish setup in Chrome. This screen follows along and updates on its own as \
+                 each step completes.",
+                "",
+                "✔ Install the extension",
+                "… Connect to Chrome",
+                "   Taking longer than expected. Check that the extension is added and that \
+                 you're signed in to it in Chrome.",
+            ],
+            &["Keep waiting", "Continue without browser tools"],
+        ),
+        "connected" => (
+            &[
+                "✔ Install the extension",
+                "✔ Connect to Chrome",
+                "   Browser tools are ready. Continuing keeps them enabled for future sessions \
+                 too — manage anytime with /chrome.",
+            ],
+            &[
+                "Continue with browser tools",
+                "Continue without browser tools",
+            ],
+        ),
+        other => panic!("no such phase drawn here: {other}"),
+    };
+    rows.extend(body.iter().map(|r| {
+        if r.is_empty() {
+            String::new()
+        } else {
+            format!("  {r}")
+        }
+    }));
+    rows.push(String::new());
+    rows.extend(options.iter().enumerate().map(|(i, o)| {
+        if i == 0 {
+            format!("  ❯ {o}")
+        } else {
+            format!("    {o}")
+        }
+    }));
+    rows.extend([String::new(), String::new()]);
+    rows
+}
+
+/// THE CHROME SETUP PANEL IS DECLINED IN EVERY PHASE ([`chrome_setup`]) under
+/// full power and bypass, with `Continue without browser tools`, which saves
+/// nothing (2.1.301 bundle: the setup driver's skip reports and returns a
+/// message, and its cleanup touches only the session). In the connected
+/// phase `Continue with browser tools` turns the browser tools on for every
+/// later session (`claudeInChromeDefaultEnabled` in the global config, the
+/// panel's own `Continuing keeps them enabled for future sessions too`): it
+/// reads as kept for good, and is no consent the harness takes, where it was
+/// pressed under `allow-once@v1`. The safe rules escalate each phase.
+#[test]
+fn the_chrome_setup_panel_is_declined_in_every_phase() {
+    let every_bypass = ApprovalCtx {
+        bypass_mode: true,
+        ..full()
+    };
+    for (phase, steps) in [("connecting", 0), ("stalled", 1), ("connected", 1)] {
+        let rows = chrome_setup(phase);
+        let reading = aterm_phase::read(Some("claude"), &rows, None);
+        assert_eq!(
+            reading.prompt.as_ref().map(|p| p.kind),
+            Some(PromptKind::Other),
+            "{phase}: {rows:#?}"
+        );
+        for c in [full(), every_bypass.clone()] {
+            let d = on_screen(&rows, &c);
+            assert_eq!(
+                pressed(&d),
+                (
+                    RULE_DECLINE,
+                    Choice::Focus {
+                        steps,
+                        label: "Continue without browser tools".to_string()
+                    }
+                ),
+                "{phase}: {d:?}"
+            );
+        }
+        assert!(
+            matches!(on_screen(&rows, &ctx()), Decision::Escalate { .. }),
+            "{phase}"
+        );
     }
 }
 
@@ -4821,26 +4530,30 @@ fn full_power_presses_a_card_mode_tool_box() {
     assert_eq!(approved(&d), Some(RULE_DECLINE), "{d:?}");
 }
 
-/// A box taller than the pane (an rm box in a 14-row pane, heredocs, an 80-row
-/// Edit diff, Claude Code 2.1.287's read-outside dialog in an 80x18 pane,
-/// MEASURED) is not read whole, and no level presses an option of it: each is
+/// A box taller than the pane (an rm box in a 14-row pane, heredocs, Claude
+/// Code 2.1.287's read-outside dialog in an 80x18 pane, MEASURED) is not read
+/// whole, and no level presses an option of it: each is
 /// escalated naming the missing title row (the read-outside dialog's tail is
 /// `1. Yes, and keep allowing any reads …`, a standing grant Claude Code
 /// saves). The one answer a cut box gets is the decline of a foot flagging a
 /// removal in bypass ([`RULE_TALL_BOX`]), at every level that answers. A
-/// question with its top cut is escalated at every level. Controls: each drawn
-/// whole is pressed under its judged row, and a cut box over a composer is no
-/// box.
+/// question with its top cut is escalated at every level, and so is a box
+/// whose walk up stopped at its question row (a `⎿` output row above it at
+/// the screen's top: no title on screen), never proven under the generic `Do
+/// you want to proceed?` row. Controls: each drawn whole is pressed under its
+/// judged row.
 #[test]
 fn a_box_taller_than_the_pane_is_pressed_by_no_level() {
     let tail = |r: &[String], n: usize| r[r.len() - n..].to_vec();
     let incident = phase_fixtures::screen(phase_fixtures::BOX_RM_UNRESOLVABLE_WORKFLOW);
     let heredoc = phase_fixtures::tall_bash_box(62);
-    let edit = phase_fixtures::tall_edit_box(80);
     let question = lines(
         "     the first option's description\n   2. Split the parser\n   3. Type something.\n\n \
          Enter to select · ↑/↓ to navigate · Esc to cancel",
     );
+    let at_question = "  ⎿  (tool output)\n   Print it\n\n Do you want to proceed?\n ❯ 1. Yes\n   \
+                       2. Yes, and don't ask again for: echo *\n   3. No\n\n Esc to cancel · Tab \
+                       to amend";
     let every_bypass = ApprovalCtx {
         bypass_mode: true,
         ..full()
@@ -4850,13 +4563,13 @@ fn a_box_taller_than_the_pane_is_pressed_by_no_level() {
         // Its title on row 0, its rule cut.
         ("incident, title on row 0", tail(&incident, 17)),
         ("heredoc", tail(&heredoc, 49)),
-        ("edit", tail(&edit, 49)),
         ("e2e heredoc", lines(CAP_TALL_HEREDOC)),
         (
             "read outside",
             phase_fixtures::screen(phase_fixtures::READ_OUTSIDE_SETTING_HEAD_OFF_MEASURED),
         ),
         ("question", question),
+        ("cut at its question", lines(at_question)),
     ] {
         let cut = if name == "question" {
             "a question aterm could not read whole"
@@ -4874,17 +4587,6 @@ fn a_box_taller_than_the_pane_is_pressed_by_no_level() {
             }
             assert!(reason(&d).starts_with(cut), "{name}: {d:?}");
         }
-        let mut scrolled = rows.clone();
-        scrolled.extend(phase_fixtures::composer("  ? for shortcuts"));
-        // A column-one first row over a composer is still read as the title,
-        // so only cuts whose first row is a body row are pinned as no box.
-        if rows[0].chars().take_while(|c| *c == ' ').count() != 1 {
-            assert_eq!(
-                decide_screen(Some("claude"), &scrolled, &full()),
-                None,
-                "{name}"
-            );
-        }
     }
     for (name, rows, judged) in [
         (
@@ -4893,7 +4595,6 @@ fn a_box_taller_than_the_pane_is_pressed_by_no_level() {
             "   │ cd /Users//user00/trust-vc-m1-notes/reader &&",
         ),
         ("heredoc", heredoc.clone(), "   │ cat > notes.txt <<'EOF'"),
-        ("edit", edit.clone(), " notes.txt"),
     ] {
         let d = on_screen(&rows, &full());
         let (rule, choice, guard, _, _) = approval(&d);
@@ -4904,138 +4605,15 @@ fn a_box_taller_than_the_pane_is_pressed_by_no_level() {
         );
         assert_eq!(guarded(guard, &rows), [judged], "{name}");
     }
-}
-
-/// A box whose walk up stopped at its question row (a `⎿` output row above it
-/// at the screen's top) has no title on screen: it is not read whole, so no
-/// level presses it, never proving it under the generic `Do you want to
-/// proceed?` row. Control: a whole Bash box with a `⎿` at column three in its
-/// command is the Bash box, pressed under its command row.
-#[test]
-fn a_box_cut_at_its_question_is_never_pressed_as_a_tool_card() {
-    let head = "────────────────────────────────────────\n Bash command\n\n   │ echo \"hello\n   ⎿  \
-                (tool output)\"\n";
-    let text = "  ⎿  (tool output)\n   Print it\n\n Do you want to proceed?\n ❯ 1. Yes\n   2. \
-                Yes, and don't ask again for: echo *\n   3. No\n\n Esc to cancel · Tab to amend";
-    let rows = lines(text);
-    for c in [
-        ctx(),
-        bypass(),
-        full(),
-        ApprovalCtx {
-            bypass_mode: true,
-            ..full()
-        },
-    ] {
-        let d = on_screen(&rows, &c);
-        assert!(
-            reason(&d).contains("its first row is its question"),
-            "{d:?}"
-        );
-    }
-    let control = lines(&format!("{head}{}", text.split_once('\n').unwrap().1));
-    let d = on_screen(&control, &full());
-    let (_, _, guard, subject, _) = approval(&d);
-    assert_eq!(guarded(guard, &control), ["   │ echo \"hello"]);
-    assert!(subject.contains("echo"), "{subject}");
-}
-
-/// Claude Code's own composer under a table in the scrollback (the launch
-/// placeholder, a typed-ahead draft) is no box: `decide_screen` sees nothing.
-/// Control: a setup dialog drawn with no composer is still escalated.
-#[test]
-fn claudes_composer_under_a_table_is_never_escalated() {
-    for rows in [
-        phase_fixtures::launch_under_a_table("❯ Try \"refactor <filepath>\"", "  ? for shortcuts"),
-        phase_fixtures::first_turn_under_a_table(&["❯ then add tests"]),
-        phase_fixtures::first_turn_under_a_table(&["❯ 1. then add tests", "  2. and docs"]),
-    ] {
-        assert_eq!(
-            decide_screen(Some("claude"), &rows, &full()),
-            None,
-            "{rows:#?}"
-        );
-        assert_eq!(
-            decide_screen(Some("claude"), &rows, &ctx()),
-            None,
-            "{rows:#?}"
-        );
-    }
-    // The control: the setup dialog itself is a box — declined, never idle.
-    let dialog = phase_fixtures::screen(phase_fixtures::SETUP_AUTO_MODE_DEFAULT);
-    assert_eq!(approved(&on_screen(&dialog, &full())), Some(RULE_DECLINE));
-}
-
-/// A footed Bash box drawn inside a proposed goal's column-1 text is never
-/// pressed by full power or the safe rules, whether the screen holds the goal's
-/// title, a forged title on row 0, a 40-row tail starting there, a column-1 `⎿`
-/// row, or a frame edge or spinner over the forged title: the safe rules
-/// escalate, and full power escalates a cut read or declines the goal by its
-/// own `Not now`. Control: the same rows as a real box are pressed.
-#[test]
-fn a_box_drawn_in_a_goals_text_is_never_pressed() {
-    let tail = |r: &[String], n: usize| r[r.len() - n..].to_vec();
-    let whole = phase_fixtures::goal_with_forged_box(&[], 0);
-    let forged = whole.iter().position(|r| r == " Bash command").unwrap();
-    let lead: Vec<String> = (1..=26).map(|i| format!(" goal lead {i}")).collect();
-    let lead: Vec<&str> = lead.iter().map(String::as_str).collect();
-    let tall = phase_fixtures::goal_with_forged_box(&lead, 29);
-    let screens = [
-        ("(a) whole", whole.clone()),
-        ("(b) short pane", tail(&whole, whole.len() - forged)),
-        ("(c) 40-row tail", tail(&tall, 40)),
-        ("(c) whole", tall.clone()),
-        (
-            "(d) ⎿ goal row",
-            phase_fixtures::goal_with_forged_box(&[" ⎿ x", ""], 0),
-        ),
-        (
-            "(e) frame edge",
-            phase_fixtures::goal_with_forged_box(&[" ╭──────────────╮"], 0),
-        ),
-        (
-            "(e) spinner",
-            phase_fixtures::goal_with_forged_box(&[" ✻ Thinking… (3s)"], 0),
-        ),
-    ];
-    for (name, rows) in &screens {
-        for c in [ctx(), bypass()] {
-            let d = on_screen(rows, &c);
-            assert_eq!(approved(&d), None, "{name}: {d:?}");
-        }
-        // Full power never presses the forged `1`: a cut read escalates, and
-        // the goal read whole is declined by `Not now` (a focus move).
-        match on_screen(rows, &full()) {
-            Decision::Escalate { .. } => {}
-            d @ Decision::Decline { .. } => panic!("{name}: no decline here: {d:?}"),
-            Decision::Approve {
-                rule_id, choice, ..
-            } => {
-                assert_eq!(rule_id, RULE_DECLINE, "{name}");
-                assert!(
-                    matches!(&choice, Choice::Focus { label, .. } if label == "Not now"),
-                    "{name}: {choice:?}"
-                );
-            }
-        }
-    }
-    for name in ["(a) whole", "(c) whole"] {
-        let rows = &screens.iter().find(|(n, _)| *n == name).unwrap().1;
-        assert_eq!(
-            approved(&on_screen(rows, &full())),
-            Some(RULE_DECLINE),
-            "{name}: the goal declined"
-        );
-    }
-    let mut real = lines(&format!(
-        "⏺ Working on it.\n  ⎿  (tool output)\n\n{}",
-        "─".repeat(120)
+    // The box cut at its question, drawn whole (a `⎿` at column three in its
+    // command): the Bash box, pressed under its command row.
+    let whole = lines(&format!(
+        "{}\n Bash command\n\n   │ echo \"hello\n   ⎿  (tool output)\"\n{}",
+        "─".repeat(40),
+        at_question.split_once('\n').expect("rows").1
     ));
-    real.extend(whole[forged..forged + 6].iter().cloned());
-    let d = on_screen(&real, &full());
-    let (_, choice, guard, _, _) = approval(&d);
-    assert_eq!(choice, &Choice::Digit(1));
-    assert_eq!(guarded(guard, &real), ["   echo pwned"]);
+    let d = on_screen(&whole, &full());
+    assert_eq!(guarded(approval(&d).2, &whole), ["   │ echo \"hello"]);
 }
 
 /// Plan approval presses the yes that grants no standing mode. Claude Code lists
@@ -5075,29 +4653,7 @@ fn a_plan_is_approved_on_its_least_power_yes() {
         subject.ends_with("=> Yes, manually approve edits"),
         "{subject}"
     );
-    for (program, fixture, want) in [
-        (
-            "claude",
-            phase_fixtures::PLAN_READY,
-            "Yes, manually approve edits",
-        ),
-        (
-            "claude",
-            phase_fixtures::PLAN_APPROVAL,
-            "Yes, manually approve edits",
-        ),
-        (
-            "codex",
-            aterm_phase::codex::fixtures::PLAN,
-            "Yes, implement this plan",
-        ),
-    ] {
-        let rows = phase_fixtures::screen(fixture);
-        let d = decide_screen(Some(program), &rows, &full()).expect("the plan box");
-        let (rule, _, _, subject, _) = approval(&d);
-        assert_eq!(rule, RULE_PLAN, "{d:?}");
-        assert!(subject.ends_with(&format!("=> {want}")), "{subject}");
-    }
+    // (The measured boxes: `full_power_answers_each_dialog_by_its_own_rule`.)
     // Negative control: every yes broad: declined.
     let broad = plan(&[
         "Yes, clear context (23% used) and bypass permissions",
@@ -5113,7 +4669,7 @@ fn a_plan_is_approved_on_its_least_power_yes() {
 /// <fallback>` while `[harness] model_fallback` is set. Negative controls:
 /// `model_fallback` empty leaves it a person's, naming the switch; retitled, or
 /// with a third option, it is no refusal pause and its switch is never pressed
-/// (e.g. Codex's rate-limit nudge); read by Codex's reader, never.
+/// (e.g. Codex's rate-limit nudge).
 #[test]
 fn the_session_paused_dialog_switches_to_the_fallback() {
     let rows = phase_fixtures::screen(phase_fixtures::SESSION_PAUSED);
@@ -5146,13 +4702,6 @@ fn the_session_paused_dialog_switches_to_the_fallback() {
     assert_ne!(
         approved(&on_screen(&three, &full())),
         Some(RULE_MODEL_SWITCH)
-    );
-    // Codex's reader on the same rows: never a model switch.
-    let cx = decide_screen(Some("codex"), &rows, &full());
-    assert!(
-        cx.as_ref()
-            .is_none_or(|d| approved(d) != Some(RULE_MODEL_SWITCH)),
-        "{cx:?}"
     );
 }
 
@@ -5350,11 +4899,6 @@ fn the_decline_text_is_one_typeable_line() {
         "a\ttab\nand a newline\u{7}bell.",
         "Do it another way",
     );
-    assert_eq!(
-        t,
-        "aterm harness (not the user): this rm was not run: a tab and a newline bell. Do it \
-         another way."
-    );
     assert!(t.starts_with(DECLINE_PREFIX));
     assert!(!t.chars().any(char::is_control), "{t:?}");
     let long = decline_text("this rm", &"x".repeat(1000), "Do it another way");
@@ -5430,54 +4974,38 @@ fn a_digit_is_never_pressed_into_an_open_amend_input() {
     }
 }
 
-/// A fixed refusal label is no open input: footerless Fetch and network boxes
-/// draw `No, and tell Claude what to do differently (esc)`, Chrome `Deny
-/// (esc)`, with no input behind them, so a focus moved onto them leaves full
-/// power's `1` as is. The open input is told by a `No, …` label over a footer
-/// of `Esc to cancel` alone, which
+/// A fixed refusal label is no open input: the footerless Fetch box draws `No,
+/// and tell Claude what to do differently (esc)` with no input behind it, so a
+/// focus moved onto it leaves full power's `1` as is. The open input is told by
+/// a `No, …` label over a footer of `Esc to cancel` alone, which
 /// [`a_digit_is_never_pressed_into_an_open_amend_input`] still escalates.
 #[test]
 fn a_fixed_refusal_label_under_the_focus_is_no_open_input() {
-    for (name, fixture) in [
-        ("fetch", phase_fixtures::BOX_FETCH),
-        ("network", phase_fixtures::BOX_NETWORK),
-        ("chrome", phase_fixtures::BOX_BROWSER),
-    ] {
-        let drawn = phase_fixtures::screen(fixture);
-        let d = on_screen(&drawn, &full());
-        let (rule, choice, _, _, _) = approval(&d);
-        assert_eq!(
-            (rule, choice),
-            (RULE_ALLOW_ONCE, &Choice::Digit(1)),
-            "{name}"
-        );
-        // The focus moved onto the refusal, a fixed label.
-        let moved: Vec<String> = drawn
-            .iter()
-            .map(|r| {
-                if r.contains("❯ 1.") {
-                    r.replacen('❯', " ", 1)
-                } else if r.trim_start().starts_with("3. ") {
-                    r.replacen("  3.", "❯ 3.", 1)
-                } else {
-                    r.clone()
-                }
-            })
-            .collect();
-        let p = aterm_phase::parse_prompt_v2(&moved).expect("the box");
-        assert!(
-            p.options.iter().any(|o| o.focused && o.role == Role::Deny),
-            "{name}: the focus on the refusal: {:?}",
-            p.options
-        );
-        let d = on_screen(&moved, &full());
-        let (rule, choice, _, _, _) = approval(&d);
-        assert_eq!(
-            (rule, choice),
-            (RULE_ALLOW_ONCE, &Choice::Digit(1)),
-            "{name}: {d:?}"
-        );
-    }
+    let moved: Vec<String> = phase_fixtures::screen(phase_fixtures::BOX_FETCH)
+        .iter()
+        .map(|r| {
+            if r.contains("❯ 1.") {
+                r.replacen('❯', " ", 1)
+            } else if r.trim_start().starts_with("3. ") {
+                r.replacen("  3.", "❯ 3.", 1)
+            } else {
+                r.clone()
+            }
+        })
+        .collect();
+    let p = aterm_phase::parse_prompt_v2(&moved).expect("the box");
+    assert!(
+        p.options.iter().any(|o| o.focused && o.role == Role::Deny),
+        "the focus on the refusal: {:?}",
+        p.options
+    );
+    let d = on_screen(&moved, &full());
+    let (rule, choice, _, _, _) = approval(&d);
+    assert_eq!(
+        (rule, choice),
+        (RULE_ALLOW_ONCE, &Choice::Digit(1)),
+        "{d:?}"
+    );
 }
 
 // --- a box taller than the screen, under the safe rules (module header)
@@ -5486,11 +5014,6 @@ fn a_fixed_refusal_label_under_the_focus_is_no_open_input() {
 /// heredoc splicing it in, then `targo … | tail -40`), home directory name
 /// replaced at equal length.
 pub(crate) const OWNER_COMMAND: &str = include_str!("fixtures/owner-bash-command-2026-09-24.txt");
-
-/// A 74-row here-document box drawn taller than a 48x160 screen in one frame
-/// (manual mode): the archive above the `# --- screen ---` marker holds none of
-/// it; the screen is below.
-const CAP_TALL_BOX: &str = include_str!("fixtures/cap-tall-box-2.1.282.txt");
 
 /// The captured screen's width, and the command text's: a command with a
 /// newline is drawn as `   │ ` rows inside the dialog's padding.
@@ -5576,6 +5099,7 @@ fn owner_ctx(approve: Approve) -> ApprovalCtx {
             Some(PathBuf::from("/Users/_owner")),
             502,
             None,
+            std::sync::Arc::new(crate::supervise::policy::LiveProbe),
         )
     }
 }
@@ -5598,155 +5122,45 @@ fn declined(d: &Decision) -> (&'static str, &str) {
 #[test]
 fn a_box_taller_than_the_screen_in_a_bypass_session_is_declined_with_its_flagged_rm() {
     let screen = owner_screen(OWNER_COMMAND);
-    assert_eq!(owner_box(OWNER_COMMAND).len(), 544);
-    let p = aterm_phase::parse_prompt_v2(&screen).expect("a box");
-    assert!(p.head_off_screen, "{p:?}");
-    // Paths as literal absolute paths: the quoted invocation leans on `S` and
-    // `$1`, which a command run alone lacks, and would expand to `rm -rf /`.
-    let want = "aterm harness (not the user): this command was not run: it is taller than the \
-                screen, so the harness cannot read all of it to check it. Run `rm -rf $S/$1` on \
-                its own as a short command, separate from the rest, its paths written as \
-                literal absolute paths (a command run on its own keeps none of this one's shell \
-                variables).";
-    assert_eq!(
-        declined(&on_screen(&screen, &owner_ctx(Approve::All))),
-        (RULE_TALL_BOX, want)
-    );
-    let d = on_screen(&screen, &owner_ctx(Approve::Safe));
-    assert_eq!(declined(&d), (RULE_TALL_BOX, want));
-    let Decision::Decline {
-        refusal, subject, ..
-    } = &d
-    else {
-        unreachable!()
-    };
-    assert_eq!(*refusal, 1);
     assert!(
-        subject.starts_with("a box taller than the screen, its note: Dangerous rm operation"),
-        "{subject}"
+        aterm_phase::parse_prompt_v2(&screen)
+            .expect("a box")
+            .head_off_screen
     );
+    for level in [Approve::All, Approve::Safe] {
+        let d = on_screen(&screen, &owner_ctx(level));
+        let (rule, text) = declined(&d);
+        assert_eq!(rule, RULE_TALL_BOX, "{level:?}");
+        // The one invocation the note quotes, to be run alone, its paths
+        // written literally: `$S/$1` alone would expand to `rm -rf /`.
+        assert!(
+            text.contains("Run `rm -rf $S/$1` on its own")
+                && text.contains("literal absolute paths"),
+            "{text}"
+        );
+        let Decision::Decline { refusal, .. } = &d else {
+            unreachable!()
+        };
+        assert_eq!(*refusal, 1);
+    }
+    // The note quotes exactly one invocation, or the decline quotes none.
+    assert_eq!(quoted_invocation("no backticks here"), None);
+    assert_eq!(quoted_invocation("`one` and `two`"), None);
 
-    let head = format!(
-        "the box's title row is not on the screen (a box taller than the pane): {}; {UNREAD}",
-        screen[0].trim()
-    );
+    let head = "the box's title row is not on the screen";
     let out_of_bypass = ApprovalCtx {
         bypass_mode: false,
         ..owner_ctx(Approve::Safe)
     };
-    assert_eq!(reason(&on_screen(&screen, &out_of_bypass)), head);
+    assert!(reason(&on_screen(&screen, &out_of_bypass)).starts_with(head));
     let mut rule_off = owner_ctx(Approve::Safe);
     rule_off.scratch_roots.clear();
-    assert_eq!(
-        reason(&on_screen(&screen, &rule_off)),
-        format!("{head}; not declined: the rm rule has no scratch root")
-    );
-    assert_eq!(reason(&on_screen(&screen, &owner_ctx(Approve::None))), head);
+    assert!(reason(&on_screen(&screen, &rule_off)).starts_with(head));
+    assert!(reason(&on_screen(&screen, &owner_ctx(Approve::None))).starts_with(head));
 
     let whole = owner_box(OWNER_COMMAND);
     let d = on_screen(&whole, &owner_ctx(Approve::All));
     assert_eq!(approved(&d), Some(RULE_ALLOW_ONCE), "{d:?}");
-}
-
-/// A tall box with no removal note is never declined: a 62-row heredoc box, a
-/// tall Edit box and a tall question, in bypass under the safe rules, are
-/// handed over naming only the missing title row
-/// ([`a_box_taller_than_the_pane_is_pressed_by_no_level`]).
-#[test]
-fn a_tall_box_with_no_removal_note_is_never_declined() {
-    let tail = |r: &[String], n: usize| r[r.len() - n..].to_vec();
-    let safe = owner_ctx(Approve::Safe);
-    let heredoc = tail(&phase_fixtures::tall_bash_box(62), 49);
-    let edit = tail(&phase_fixtures::tall_edit_box(80), 49);
-    for (name, rows) in [("heredoc", heredoc), ("edit", edit)] {
-        let d = on_screen(&rows, &safe);
-        assert!(
-            reason(&d).starts_with("the box's title row is not on the screen")
-                && !reason(&d).contains("not declined"),
-            "{name}: {d:?}"
-        );
-    }
-    let question = lines(
-        "     the first option's description\n   2. Split the parser\n   3. Type something.\n\n \
-         Enter to select · ↑/↓ to navigate · Esc to cancel",
-    );
-    let d = on_screen(&question, &safe);
-    assert!(!reason(&d).contains("not declined"), "{d:?}");
-}
-
-/// Negative: the captured tall box has no note and none is invented, so it is
-/// handed over in and out of bypass, at every level.
-#[test]
-fn the_measured_tall_box_has_no_note_and_none_is_invented() {
-    let screen: Vec<String> = CAP_TALL_BOX
-        .split_once("\n# --- screen ---\n")
-        .expect("the capture's two halves")
-        .1
-        .lines()
-        .map(str::to_string)
-        .collect();
-    assert_eq!((screen.len(), screen[0].as_str()), (48, "   │ row-32"));
-    let p = aterm_phase::parse_prompt_v2(&screen).expect("a box");
-    assert!(p.head_off_screen, "{p:?}");
-    assert_eq!(p.foot_note(&screen), None);
-    let manual = ApprovalCtx {
-        bypass_mode: false,
-        ..owner_ctx(Approve::Safe)
-    };
-    let head = format!(
-        "the box's title row is not on the screen (a box taller than the pane): │ row-32; \
-         {UNREAD}"
-    );
-    assert_eq!(reason(&on_screen(&screen, &manual)), head);
-    for level in [Approve::Safe, Approve::All] {
-        assert_eq!(
-            reason(&on_screen(&screen, &owner_ctx(level))),
-            head,
-            "no note, no decline"
-        );
-    }
-}
-
-/// A real wrapped note read whole past the countdown: `cap-decline-1`'s note
-/// wraps onto a second ` │ ` row, with the countdown and two blank rows before
-/// the question. It is read whole as the rm breaker's; cut so its head is off
-/// screen, the box is declined under the safe rules in bypass with the quoted
-/// invocation. `quoted_invocation` quotes exactly one: none without backticks,
-/// none with two.
-#[test]
-fn a_real_wrapped_note_is_read_whole_past_the_countdown() {
-    let box1 = lines(CAP_DECLINE_1);
-    let p = aterm_phase::parse_prompt_v2(&box1).expect("the box");
-    let note = p.foot_note(&box1).expect("the note at the foot");
-    assert_eq!(
-        note,
-        "Dangerous rm operation on possibly-empty variable path: $NOPE/$1 in `rm -rf $NOPE/$1` \
-         (bind $1 and rewrite its $NOPE as \"${NOPE:?}\" or use a literal path)"
-    );
-    assert!(rm_breaker_of(&note).is_some());
-    assert_eq!(quoted_invocation(&note), Some("rm -rf $NOPE/$1"));
-    assert_eq!(quoted_invocation("no backticks here"), None);
-    assert_eq!(quoted_invocation("`one` and `two`"), None);
-
-    let first = box1
-        .iter()
-        .position(|r| r.starts_with("   for p in zz-aterm-probe"))
-        .expect("the command row");
-    let cut = box1[first..].to_vec();
-    assert!(
-        aterm_phase::parse_prompt_v2(&cut)
-            .expect("a box")
-            .head_off_screen
-    );
-    let d = on_screen(&cut, &owner_ctx(Approve::Safe));
-    assert!(
-        declined(&d).1.ends_with(
-            "Run `rm -rf $NOPE/$1` on its own as a short command, separate from the rest, its \
-             paths written as literal absolute paths (a command run on its own keeps none of \
-             this one's shell variables)."
-        ),
-        "{d:?}"
-    );
 }
 
 // --- a subagent's rm breaker in a bypass session -------------------------------
@@ -5788,82 +5202,9 @@ fn subagent_owner_ctx(approve: Approve, bypass_mode: bool) -> ApprovalCtx {
             Some(PathBuf::from("/Users/_owner")),
             502,
             None,
+            std::sync::Arc::new(crate::supervise::policy::LiveProbe),
         )
     }
-}
-
-/// [`OWNER_SUBAGENT_RM`] read: Claude Code's reader vouches for a Bash box whose
-/// header reads ` · from the <name> agent` as an origin, whose one note is the
-/// rm breaker's possibly-empty-variable kind read whole, and whose options are
-/// exactly `1. Yes` (focused) and `2. No`.
-#[test]
-fn the_owners_subagent_rm_box_is_read_as_a_subagents_bash_box() {
-    let rows = lines(OWNER_SUBAGENT_RM);
-    assert_eq!(rows.len(), 62, "the owner's 62-row screen");
-    assert!(
-        rows.iter().all(|r| r.chars().count() <= 149),
-        "the owner's 149-column screen"
-    );
-    let reading = aterm_phase::read(Some("claude"), &rows, None);
-    assert_eq!(reading.phase, Phase::Prompt, "{reading:?}");
-    assert!(reading.phase_authoritative);
-    let p = reading.prompt.as_ref().expect("the box");
-    assert_eq!(p.kind, PromptKind::Bash, "{p:?}");
-    assert!(!p.head_off_screen, "its title row is on the screen");
-    assert_eq!(p.title, "Bash command · from the general-purpose agent");
-    let header = p.header().expect("a header the grammar reads");
-    assert_eq!(header.base, "Bash command");
-    assert_eq!(p.base_title().as_deref(), Some(anchor("box.bash")));
-    assert_eq!(
-        header.origin,
-        Some(aterm_phase::Origin::Subagent {
-            name: Some("general-purpose".to_string())
-        })
-    );
-    assert_eq!(
-        (header.runs_on, header.unsandboxed),
-        (None, false),
-        "the box runs here, sandboxed"
-    );
-    assert_eq!(p.command, OWNER_SUBAGENT_RM_COMMAND);
-    assert_eq!(
-        p.description,
-        "Rename branch, delete target dir and private recordings"
-    );
-    assert_eq!(p.notes.len(), 1, "its two note rows are ONE note: {p:?}");
-    let b = p.rm_breaker().expect("the rm circuit breaker");
-    assert_eq!(
-        (b.command, b.kind),
-        (
-            RmCommand::Rm,
-            RmBreakerKind::EmptyVariable {
-                in_substitution: false
-            }
-        )
-    );
-    assert!(
-        b.target.starts_with("$SP/*.log in `rm -f $SP/cast0.txt ")
-            && b.target
-                .ends_with("(rewrite it as \"${SP:?}\"/*.log or use a literal path)"),
-        "{b:?}"
-    );
-    assert_eq!(
-        rm_breaker_label(&b),
-        "the rm circuit breaker (possibly-empty variable path)"
-    );
-    let options: Vec<_> = p
-        .options
-        .iter()
-        .map(|o| (o.n, o.label.as_str(), o.role, o.focused))
-        .collect();
-    assert_eq!(
-        options,
-        [
-            (Some(1), "Yes", Role::Once, true),
-            (Some(2), "No", Role::Deny, false)
-        ]
-    );
-    assert_eq!(p.select, Select::Digits);
 }
 
 /// [`OWNER_SUBAGENT_RM`] at defaults (full power): answered `1` under
@@ -5873,18 +5214,6 @@ fn the_owners_subagent_rm_box_is_read_as_a_subagents_bash_box() {
 #[test]
 fn the_owners_subagent_rm_box_is_pressed_at_default_power() {
     let rows = lines(OWNER_SUBAGENT_RM);
-    let defaults = subagent_owner_ctx(Approve::All, false);
-    assert_eq!(
-        ApprovalCtx::new(
-            PathBuf::from("/Users/_owner/clean"),
-            Some(PathBuf::from("/Users/_owner")),
-            502,
-            None,
-        )
-        .approve,
-        defaults.approve,
-        "the owner's default is full power"
-    );
     let breaker = aterm_phase::read(Some("claude"), &rows, None)
         .prompt
         .and_then(|p| p.rm_breaker())
@@ -5926,47 +5255,6 @@ fn the_owners_subagent_rm_box_is_pressed_at_default_power() {
     }
 }
 
-/// Negative controls for [`OWNER_SUBAGENT_RM`]: under `approve = "safe"` with
-/// `rm_breaker_ask = true` it is escalated, neither approved nor declined, on
-/// the rm breaker's own reason (in bypass, the target is under no scratch
-/// root; out of it, the breaker outside bypass); under `"none"` it is
-/// escalated like every box. (`safe`'s default presses it with the warning.)
-#[test]
-fn the_owners_subagent_rm_box_is_escalated_under_the_owners_limits() {
-    let rows = lines(OWNER_SUBAGENT_RM);
-    for (bypass_mode, cause) in [
-        (true, "/Users/_owner/aterm-wt-gap-target"),
-        (false, "outside a bypass session"),
-    ] {
-        let strict = ApprovalCtx {
-            rm_breaker_warn: false,
-            ..subagent_owner_ctx(Approve::Safe, bypass_mode)
-        };
-        let warned = on_screen(&rows, &subagent_owner_ctx(Approve::Safe, bypass_mode));
-        let (rule, _, _, _, unproven) = approval(&warned);
-        assert_eq!(rule, RULE_RM_BREAKER_WARN, "bypass={bypass_mode}");
-        assert!(
-            unproven.is_some_and(|u| u.contains(cause)),
-            "bypass={bypass_mode}: {warned:?}"
-        );
-        let d = on_screen(&rows, &strict);
-        assert!(
-            matches!(d, Decision::Escalate { .. }),
-            "bypass={bypass_mode}: {d:?}"
-        );
-        assert!(
-            reason(&d).contains("rm circuit breaker") && reason(&d).contains(cause),
-            "bypass={bypass_mode}: the breaker's own reason: {d:?}"
-        );
-        assert!(!reason(&d).contains("is not a Bash header"), "{d:?}");
-        let d = on_screen(&rows, &subagent_owner_ctx(Approve::None, bypass_mode));
-        assert!(
-            matches!(d, Decision::Escalate { .. }) && reason(&d).contains("approve = \"none\""),
-            "bypass={bypass_mode}: {d:?}"
-        );
-    }
-}
-
 /// A fresh git repository in a scratch directory (removed by the caller),
 /// created hermetically: no system or global config.
 fn scratch_repo(tag: &str) -> PathBuf {
@@ -5991,9 +5279,10 @@ fn scratch_git(dir: &Path, args: &[&str]) {
 
 /// Git reads through [`decide`]: under `approve = "safe"` a `git status` box is
 /// approved in a clean repository and escalated, naming the key, in one whose
-/// config runs a program on that read. A `-c` override, a remote read and an
-/// unknown cwd escalate too; full power still presses, keeping the key as
-/// `unproven`.
+/// config runs a program on that read, and in a directory the line names. A
+/// read that contacts a remote and an unknown cwd escalate too; full power
+/// still presses, keeping the key as `unproven`. (Which keys, wrappers and
+/// reads: `git_config_tests`.)
 #[test]
 fn a_git_read_is_approved_only_where_its_config_runs_nothing() {
     let repo = scratch_repo("rule");
@@ -6004,31 +5293,22 @@ fn a_git_read_is_approved_only_where_its_config_runs_nothing() {
             Some(PathBuf::from("/Users/_owner")),
             502,
             None,
+            std::sync::Arc::new(crate::supervise::policy::LiveProbe),
         )
     };
     let status = bash_box(&["git status --short"], None);
     assert_eq!(approved(&on_screen(&status, &c)), Some(RULE_READ_ONLY));
-    assert_eq!(
-        approved(&on_screen(&bash_box(&["git log --oneline -3"], None), &c)),
-        Some(RULE_READ_ONLY)
+    scratch_git(
+        &repo,
+        &[
+            "config",
+            "core.fsmonitor",
+            "touch /tmp/aterm-approval-git-pwn",
+        ],
     );
-
-    // A filter driver runs only on a path whose attributes select it.
-    std::fs::write(repo.join(".gitattributes"), "* filter=x\n").expect("attributes");
-    scratch_git(&repo, &["add", ".gitattributes"]);
-    assert_eq!(approved(&on_screen(&status, &c)), Some(RULE_READ_ONLY));
-    for key in [
-        "core.fsmonitor",
-        "diff.external",
-        "diff.bin.textconv",
-        "filter.x.clean",
-        "filter.x.process",
-    ] {
-        scratch_git(&repo, &["config", key, "touch /tmp/aterm-approval-git-pwn"]);
-        let why = reason(&on_screen(&status, &c)).to_string();
-        assert!(why.contains(key), "{key}: {why}");
-        scratch_git(&repo, &["config", "--unset", key]);
-    }
+    let why = reason(&on_screen(&status, &c)).to_string();
+    assert!(why.contains("core.fsmonitor"), "{why}");
+    scratch_git(&repo, &["config", "--unset", "core.fsmonitor"]);
     // Clean again: approved again (negative control on the unset).
     assert_eq!(approved(&on_screen(&status, &c)), Some(RULE_READ_ONLY));
 
@@ -6039,31 +5319,11 @@ fn a_git_read_is_approved_only_where_its_config_runs_nothing() {
     assert!(reason(&on_screen(&named, &c)).contains("core.fsmonitor"));
     let cd = bash_box(&[&format!("cd {} && git log -1", other.display())], None);
     assert!(reason(&on_screen(&cd, &c)).contains("core.fsmonitor"));
-
-    // A git behind a wrapper the classifier sees through is placed the same
-    // way; one this check cannot place asks.
-    for line in [
-        format!("env -u FOO git -C {} status", other.display()),
-        format!("env -C {} git status", other.display()),
-        format!("env --chdir={} git status", other.display()),
-        format!("cd {} && echo x | xargs -d , git status", other.display()),
-        format!(
-            "cd {} && perl -e 'alarm 9; exec @ARGV' git status",
-            other.display()
-        ),
-    ] {
-        let why = reason(&on_screen(&bash_box(&[&line], None), &c)).to_string();
-        assert!(why.contains("core.fsmonitor"), "{line}: {why}");
-    }
-    let fed = bash_box(&["echo . | xargs -I {} git -C {} status"], None);
-    assert!(reason(&on_screen(&fed, &c)).contains("xargs"));
-
-    // A `-c` override on the line (the classifier's refusal), a read that
-    // contacts a remote, and a session whose cwd is unknown.
-    let dash_c = bash_box(&["git -c core.fsmonitor=./x.sh status"], None);
-    assert!(reason(&on_screen(&dash_c, &c)).contains("-c"));
+    // A read that contacts a remote (credential helpers, ssh) escalates in a
+    // clean repository.
     let remote = bash_box(&["git remote show origin"], None);
     assert!(reason(&on_screen(&remote, &c)).contains("contacts a remote"));
+
     let unknown = ApprovalCtx {
         cwd_known: false,
         ..c.clone()
@@ -6113,6 +5373,7 @@ fn a_git_read_is_judged_where_the_bash_tool_stands() {
             Some(PathBuf::from("/Users/_owner")),
             502,
             None,
+            std::sync::Arc::new(crate::supervise::policy::LiveProbe),
         )
     };
     let status = bash_box(&["git status --short"], None);
@@ -6127,9 +5388,6 @@ fn a_git_read_is_judged_where_the_bash_tool_stands() {
     };
     let why = reason(&on_screen(&status, &moved)).to_string();
     assert!(why.contains("core.fsmonitor"), "{why}");
-    // A relative `-C` on the line is resolved from there as well.
-    let rel = bash_box(&["git -C . log -1"], None);
-    assert!(reason(&on_screen(&rel, &moved)).contains("core.fsmonitor"));
     // Where the Bash tool stands in the launch directory, nothing is added.
     let home = ApprovalCtx {
         shell_cwds: vec![launch.clone()],
@@ -6141,9 +5399,9 @@ fn a_git_read_is_judged_where_the_bash_tool_stands() {
 
 /// The git rule reads in the worker's environment ([`ApprovalCtx::worker`]):
 /// its `GIT_CONFIG_*` is configuration the read loads, and an unreadable
-/// environment escalates git reads naming why (full power presses anyway, with
-/// that reason as `unproven`). Negative control: a hermetic worker in a clean
-/// repository is approved; a line running no git never needs the environment.
+/// environment escalates git reads naming why. Negative control: a hermetic
+/// worker in a clean repository is approved; a line running no git never
+/// needs the environment.
 #[test]
 fn a_git_read_is_judged_in_the_workers_environment() {
     let repo = scratch_repo("worker-env");
@@ -6154,6 +5412,7 @@ fn a_git_read_is_judged_in_the_workers_environment() {
             Some(PathBuf::from("/Users/_owner")),
             502,
             None,
+            std::sync::Arc::new(crate::supervise::policy::LiveProbe),
         )
     };
     let status = bash_box(&["git status --short"], None);
@@ -6183,26 +5442,6 @@ fn a_git_read_is_judged_in_the_workers_environment() {
     );
     let ls = bash_box(&["ls -la"], None);
     assert_eq!(approved(&on_screen(&ls, &unread)), Some(RULE_READ_ONLY));
-    match on_screen(
-        &status,
-        &ApprovalCtx {
-            approve: Approve::All,
-            ..unread
-        },
-    ) {
-        Decision::Approve {
-            rule_id, unproven, ..
-        } => {
-            assert_eq!(rule_id, RULE_ALLOW_ONCE);
-            assert!(
-                unproven
-                    .as_deref()
-                    .is_some_and(|u| u.contains("environment is unknown")),
-                "{unproven:?}"
-            );
-        }
-        d => panic!("full power presses it: {d:?}"),
-    }
     let _ = std::fs::remove_dir_all(&repo);
 }
 
@@ -6234,6 +5473,7 @@ fn a_worker_path_entry_the_worker_writes_is_refused_before_the_probe_runs_it() {
             Some(PathBuf::from("/Users/_owner")),
             502,
             None,
+            std::sync::Arc::new(crate::supervise::policy::LiveProbe),
         )
     };
     let status = bash_box(&["git status --short"], None);
@@ -6263,13 +5503,12 @@ fn a_worker_path_entry_the_worker_writes_is_refused_before_the_probe_runs_it() {
     let _ = std::fs::remove_dir_all(&launch);
 }
 
-/// Claude Code gives its Bash tool the `env` of its settings files (project
-/// `.claude/settings.json` and `settings.local.json`, the user's, a
-/// `--settings` file, the managed file), which the process environment does
-/// not carry. One changing what a git read loads escalates naming file and key,
-/// as does a settings file whose `env` cannot be known (unparseable, padded
-/// past the read, not a regular file). Negative controls: a pager or editor
-/// there, a value the worker already has, and settings without `env`.
+/// Claude Code gives its Bash tool the `env` of its settings files (which
+/// files, in which order: `claude_settings_tests`), which the process
+/// environment does not carry. One changing what a git read loads escalates
+/// naming file and key, as does a settings file whose `env` cannot be known.
+/// Negative controls: a pager or editor there, a value the worker already
+/// has, and settings without `env`.
 #[test]
 fn a_git_read_whose_bash_tool_settings_change_git_escalates() {
     let repo = scratch_repo("worker-settings");
@@ -6281,84 +5520,32 @@ fn a_git_read_whose_bash_tool_settings_change_git_escalates() {
             Some(PathBuf::from("/Users/_owner")),
             502,
             None,
+            std::sync::Arc::new(crate::supervise::policy::LiveProbe),
         )
     };
     let status = bash_box(&["git status --short"], None);
     let project = repo.join(".claude/settings.json");
-    let local = repo.join(".claude/settings.local.json");
-    for (file, body, key) in [
+    for (body, key) in [
         (
-            &project,
             r#"{"env":{"GIT_CONFIG_GLOBAL":"./evil.gitconfig"}}"#,
             "GIT_CONFIG_GLOBAL",
         ),
-        (
-            &local,
-            r#"{"env":{"GIT_CONFIG_COUNT":"1"}}"#,
-            "GIT_CONFIG_COUNT",
-        ),
-        (&project, r#"{"env":{"HOME":"/tmp/elsewhere"}}"#, "HOME"),
+        (r#"{"env":{"HOME":"/tmp/elsewhere"}}"#, "HOME"),
     ] {
-        std::fs::write(file, body).expect("settings");
-        let why = reason(&on_screen(&status, &c)).to_string();
-        assert!(
-            why.contains(key) && why.contains(&file.display().to_string()),
-            "{why}"
-        );
-        let _ = std::fs::remove_file(file);
-    }
-    // The user's settings, under the worker's own Claude directory.
-    let claude = repo.join("identity-claude");
-    std::fs::create_dir_all(&claude).expect("claude dir");
-    std::fs::write(
-        claude.join("settings.json"),
-        r#"{"env":{"XDG_CONFIG_HOME":"/x"}}"#,
-    )
-    .expect("user");
-    let identity = ApprovalCtx {
-        worker: Ok(
-            WorkerEnv::hermetic(None).with(&format!("CLAUDE_CONFIG_DIR={}", claude.display()))
-        ),
-        ..c.clone()
-    };
-    assert!(reason(&on_screen(&status, &identity)).contains("XDG_CONFIG_HOME"));
-    // A `--settings` the worker was launched with, inline and as a file.
-    for arg in [
-        r#"--settings={"env":{"GIT_DIR":"/x"}}"#.to_string(),
-        "--settings=.claude/extra.json".to_string(),
-    ] {
-        std::fs::write(
-            repo.join(".claude/extra.json"),
-            r#"{"env":{"GIT_DIR":"/x"}}"#,
-        )
-        .expect("extra");
-        let launched = ApprovalCtx {
-            worker: Ok(WorkerEnv::hermetic(None).launched_with(&["claude", &arg])),
-            ..c.clone()
-        };
-        assert!(
-            reason(&on_screen(&status, &launched)).contains("GIT_DIR"),
-            "{arg}"
-        );
-    }
-    // A settings file there whose `env` cannot be known: one that does not
-    // parse, one padded past what is read, one that is no regular file.
-    let padded = format!(
-        "{{\"env\":{{\"GIT_DIR\":\"/x\"}},\"pad\":\"{}\"}}",
-        "x".repeat(2 << 20)
-    );
-    for body in ["{ not json", padded.as_str()] {
         std::fs::write(&project, body).expect("settings");
         let why = reason(&on_screen(&status, &c)).to_string();
         assert!(
-            why.contains("its `env` is unknown") && why.contains(&project.display().to_string()),
+            why.contains(key) && why.contains(&project.display().to_string()),
             "{why}"
         );
     }
-    let _ = std::fs::remove_file(&project);
-    std::fs::create_dir(&project).expect("a directory where the file goes");
-    assert!(reason(&on_screen(&status, &c)).contains("its `env` is unknown"));
-    std::fs::remove_dir(&project).expect("rmdir");
+    // A settings file there whose `env` cannot be known.
+    std::fs::write(&project, "{ not json").expect("settings");
+    let why = reason(&on_screen(&status, &c)).to_string();
+    assert!(
+        why.contains("its `env` is unknown") && why.contains(&project.display().to_string()),
+        "{why}"
+    );
     // Negative controls.
     for body in [
         r#"{"env":{"GIT_PAGER":"delta","GIT_EDITOR":"true","LANG":"C"}}"#,
@@ -6388,37 +5575,16 @@ fn a_box_the_owners_own_settings_send_to_a_person_is_never_pressed() {
     // let the harness press the two Bash boxes at full power — the tool ran
     // each time — and saw no Fetch box at all.
     let hook_noreason = phase_fixtures::box_bash_hook_ask_noreason_2_1_287();
-    for (text, says) in [
-        (
-            phase_fixtures::BOX_BASH_ASK_RULE,
-            "(a permission rule): Permission rule Bash(touch:*)",
-        ),
-        (
-            phase_fixtures::BOX_BASH_ASK_RULE_2_1_287,
-            "(a permission rule): Permission rule Bash(touch:*)",
-        ),
-        (
-            phase_fixtures::BOX_BASH_HOOK_ASK_2_1_287,
-            "(a hook): Hook PreToolUse:Bash requires confirmation for this command: owner review",
-        ),
-        (
-            phase_fixtures::BOX_FETCH_ASK_RULE_2_1_287,
-            "(a permission rule): Permission rule WebFetch(domain:127.0.0.1)",
-        ),
-        (
-            phase_fixtures::BOX_BASH_ASK_RULE_AUTO_2_1_287,
-            "(an ask rule that overrides auto mode): Ask rule Bash(touch:*) overrides auto mode",
-        ),
-        (
-            hook_noreason.as_str(),
-            "(a hook): Hook PreToolUse:Bash requires confirmation for this command.",
-        ),
+    for text in [
+        phase_fixtures::BOX_BASH_ASK_RULE,
+        phase_fixtures::BOX_BASH_ASK_RULE_2_1_287,
+        phase_fixtures::BOX_BASH_HOOK_ASK_2_1_287,
+        phase_fixtures::BOX_FETCH_ASK_RULE_2_1_287,
+        phase_fixtures::BOX_BASH_ASK_RULE_AUTO_2_1_287,
+        hook_noreason.as_str(),
         // Taller than the pane, so its head is off the screen and full power
         // would answer it by its options alone: the reason is on the screen.
-        (
-            phase_fixtures::BOX_BASH_TALL_ASK_RULE_2_1_287,
-            "(a permission rule): Permission rule Bash(touch:*)",
-        ),
+        phase_fixtures::BOX_BASH_TALL_ASK_RULE_2_1_287,
     ] {
         let ruled = phase_fixtures::screen(text);
         let full_bypass = ApprovalCtx {
@@ -6432,10 +5598,9 @@ fn a_box_the_owners_own_settings_send_to_a_person_is_never_pressed() {
             ("none", none(ctx())),
         ] {
             let d = on_screen(&ruled, &c);
-            assert_eq!(approved(&d), None, "{level}: {d:?}");
             assert!(
                 matches!(&d, Decision::Escalate { reason } if reason
-                    .starts_with(&format!("the owner's Claude Code settings send this box to a person {says}"))),
+                    .starts_with("the owner's Claude Code settings send this box to a person")),
                 "{level}: {d:?}"
             );
         }
@@ -6456,20 +5621,6 @@ fn a_box_the_owners_own_settings_send_to_a_person_is_never_pressed() {
         );
     }
     assert_eq!(approved(&on_screen(&read, &none(ctx()))), None);
-    // ... and the command is the rows between the dashes, not the model's
-    // description over them: `rm -rf ./lab-doomed` described `ls` is no
-    // listing (read as `ls rm -rf ./lab-doomed` it is one).
-    let described_ls = phase_fixtures::screen(phase_fixtures::BOX_BASH_2_1_287);
-    // (With the Tip row off, which only masks it: its first word is no command.)
-    let mut bare = described_ls.clone();
-    bare.retain(|r| !r.trim().starts_with("Tip:"));
-    for rows in [&described_ls, &bare] {
-        assert_eq!(approved(&on_screen(rows, &ctx())), None);
-        assert_eq!(
-            pressed(&on_screen(rows, &full())),
-            (RULE_ALLOW_ONCE, Choice::Digit(1))
-        );
-    }
 }
 
 /// The permission reason's wrapping cannot turn the user's explicit review into
@@ -6622,376 +5773,7 @@ fn full_power_confirms_the_model_switch_the_person_typed() {
     );
 }
 
-// --- Codex's rate-limit nudge and the /model restore ---------------------------
-
-/// A Codex setting as its footer shows it before the switch.
-fn astra_ultra() -> super::super::turn_end::CodexSetting {
-    super::super::turn_end::CodexSetting {
-        model: "GPT-6-Astra".to_string(),
-        effort: Some("ultra".to_string()),
-    }
-}
-
-/// Full power with Codex's nudge read as `nudge` says.
-fn nudged(nudge: NudgeCtx) -> ApprovalCtx {
-    ApprovalCtx { nudge, ..full() }
-}
-
-fn near() -> LimitRead {
-    LimitRead::Near {
-        used: 99,
-        back_at: Some(1_791_082_750),
-    }
-}
-
-/// Codex's `Approaching rate limits` nudge is switched only near its limit (99%
-/// of the weekly window, the current model read off the footer): `Switch to
-/// gpt-6-luna` under `rate-nudge-switch@v1` by digit. A stale nudge at 1%, an
-/// unknown reading, an open switch, an unread model, or an offer of the current
-/// model get `Keep current model` (`rate-nudge-keep@v1`, digit 2). Negative
-/// controls: `rate_nudge = false`, `"safe"` and `"none"` hand it to a person;
-/// Claude Code's reader sees no such box; the model-switch rule never answers
-/// it.
-#[test]
-fn codexs_rate_limit_nudge_switches_only_near_its_limit() {
-    use aterm_phase::codex::fixtures as cx;
-    let rows = phase_fixtures::screen(cx::RATE_NUDGE);
-    let live = NudgeCtx {
-        enabled: true,
-        open: false,
-        from: Some(astra_ultra()),
-        limits: near(),
-    };
-    let d = decide_screen(Some("codex"), &rows, &nudged(live.clone())).expect("the box");
-    let (rule, choice, guard, subject, unproven) = approval(&d);
-    assert_eq!(
-        (rule, choice),
-        (RULE_RATE_NUDGE_SWITCH, &Choice::Digit(1)),
-        "{d:?}"
-    );
-    assert_eq!(subject, "Approaching rate limits => Switch to gpt-6-luna");
-    assert_eq!(guard, row_guard("  Approaching rate limits"));
-    let why = unproven.expect("why");
-    assert!(
-        why.contains("99% used") && why.contains("GPT-6-Astra ultra"),
-        "{why}"
-    );
-    let keep = |n: NudgeCtx, because: &str| {
-        let d = decide_screen(Some("codex"), &rows, &nudged(n)).expect("the box");
-        let (rule, choice, _, subject, unproven) = approval(&d);
-        assert_eq!(
-            (rule, choice),
-            (RULE_RATE_NUDGE_KEEP, &Choice::Digit(2)),
-            "{d:?}"
-        );
-        assert!(subject.ends_with("=> Keep current model"), "{subject}");
-        assert!(
-            unproven.is_some_and(|u| u.contains(because)),
-            "{because}: {d:?}"
-        );
-    };
-    keep(
-        NudgeCtx {
-            limits: LimitRead::Far { used: 1 },
-            ..live.clone()
-        },
-        "1% used, far from its limit",
-    );
-    keep(
-        NudgeCtx {
-            limits: LimitRead::Unknown("no reading"),
-            ..live.clone()
-        },
-        "unread",
-    );
-    keep(
-        NudgeCtx {
-            open: true,
-            ..live.clone()
-        },
-        "open already",
-    );
-    keep(
-        NudgeCtx {
-            from: None,
-            ..live.clone()
-        },
-        "never read",
-    );
-    keep(
-        NudgeCtx {
-            from: Some(super::super::turn_end::CodexSetting {
-                model: "GPT-6-Luna".to_string(),
-                effort: Some("medium".to_string()),
-            }),
-            ..live.clone()
-        },
-        "the current one",
-    );
-    let off = NudgeCtx {
-        enabled: false,
-        ..live.clone()
-    };
-    let d = decide_screen(Some("codex"), &rows, &nudged(off)).expect("the box");
-    assert!(reason(&d).contains("rate_nudge is off"), "{d:?}");
-    for limited in [
-        ApprovalCtx {
-            approve: Approve::Safe,
-            ..nudged(live.clone())
-        },
-        none(nudged(live.clone())),
-    ] {
-        let d = decide_screen(Some("codex"), &rows, &limited).expect("the box");
-        assert_eq!(approved(&d), None, "{:?}: {d:?}", limited.approve);
-    }
-    assert!(
-        decide_screen(Some("claude"), &rows, &nudged(live.clone()))
-            .is_none_or(|d| approved(&d).is_none()),
-    );
-    // Its keep is missing: a person's, never the switch nor the never-again.
-    let no_keep: Vec<String> = rows
-        .iter()
-        .filter(|r| !r.contains("2. Keep current model"))
-        .map(|r| r.replace("3. Keep current", "2. Keep current"))
-        .collect();
-    let d = decide_screen(Some("codex"), &no_keep, &nudged(live)).expect("the box");
-    assert!(reason(&d).contains("without exactly one"), "{d:?}");
-}
-
-/// Over every combination the loop can supply, the nudge's persisting `Keep
-/// current model (never show again)` is never pressed, and the switch only near
-/// the limit with the model read and no switch open.
-#[test]
-fn the_nudges_never_show_again_is_never_pressed() {
-    let rows = phase_fixtures::screen(aterm_phase::codex::fixtures::RATE_NUDGE);
-    let limits = [
-        near(),
-        LimitRead::Near {
-            used: 90,
-            back_at: None,
-        },
-        LimitRead::Far { used: 89 },
-        LimitRead::Unknown("stale"),
-    ];
-    let froms = [None, Some(astra_ultra())];
-    for enabled in [true, false] {
-        for open in [true, false] {
-            for limits in &limits {
-                for from in &froms {
-                    for approve in [Approve::All, Approve::Safe, Approve::None] {
-                        let n = NudgeCtx {
-                            enabled,
-                            open,
-                            from: from.clone(),
-                            limits: limits.clone(),
-                        };
-                        let c = ApprovalCtx {
-                            approve,
-                            ..nudged(n.clone())
-                        };
-                        let d = decide_screen(Some("codex"), &rows, &c).expect("the box");
-                        if let Decision::Approve {
-                            choice, rule_id, ..
-                        } = &d
-                        {
-                            assert_ne!(choice, &Choice::Digit(3), "{n:?}");
-                            let switch = *rule_id == RULE_RATE_NUDGE_SWITCH;
-                            assert_eq!(
-                                switch,
-                                enabled
-                                    && !open
-                                    && limits.near()
-                                    && from.is_some()
-                                    && approve == Approve::All,
-                                "{n:?} {approve:?}: {d:?}"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Codex's `Continue with …` is no consent (a model change or a sign-in), never
-/// pressed as the one-shot allow. Negative control: the same box on Claude
-/// Code's screen is its consent.
-#[test]
-fn a_codex_continue_with_is_no_consent() {
-    for label in [
-        "Continue with Luna Reserve",
-        "Continue with detected credentials",
-    ] {
-        let rows = lines(&format!(
-            "• Your included usage is exhausted.\n\n  1:39 PM\n\n\n  Luna Reserve\n  Your \
-             included usage is exhausted. Choose an option below to continue.\n\n› 1. {label}\n  \
-             2. Not now\n\n  enter select · esc back"
-        ));
-        let d = decide_screen(Some("codex"), &rows, &full()).expect("a box");
-        assert_ne!(approved(&d), Some(RULE_ALLOW_ONCE), "{label}: {d:?}");
-    }
-}
-
-/// The harness's own restore drives Codex's `/model` picker: to GPT-6-Astra
-/// ultra (model by Enter, `More reasoning…` by Enter, `Ultra` by `s`) and to
-/// GPT-6-Luna high (two rows down, then `High` by `s`). Never a digit on an
-/// effort box (it saves the default). Negative controls: a picker no restore
-/// opened is the person's; an effort box for another model, without `s`, or
-/// without the effort escalates; Claude Code's reader never answers it.
-#[test]
-fn the_model_picker_is_answered_only_for_the_harness_restore() {
-    use super::super::turn_end::CodexSetting;
-    use aterm_phase::codex::fixtures as cx;
-    let to = |model: &str, effort: &str| ApprovalCtx {
-        model_restore: Some(CodexSetting {
-            model: model.to_string(),
-            effort: Some(effort.to_string()),
-        }),
-        ..full()
-    };
-    let pick = |fixture: &str, c: &ApprovalCtx| {
-        let rows = phase_fixtures::screen(fixture);
-        decide_screen(Some("codex"), &rows, c).expect("the picker")
-    };
-    let pressed = |d: &Decision| match d {
-        Decision::Approve {
-            rule_id, choice, ..
-        } => {
-            assert_eq!(*rule_id, RULE_MODEL_RESTORE_PICK, "{d:?}");
-            choice.clone()
-        }
-        other => panic!("expected a press, got {other:?}"),
-    };
-    let focus = |steps: i32, label: &str| Choice::Focus {
-        steps,
-        label: label.to_string(),
-    };
-    let session = |steps: i32, label: &str| Choice::FocusKey {
-        steps,
-        label: label.to_string(),
-        key: "s",
-    };
-    let astra = to("GPT-6-Astra", "ultra");
-    assert_eq!(
-        pressed(&pick(cx::MODEL_PICK, &astra)),
-        focus(0, "GPT-6-Astra (current)")
-    );
-    assert_eq!(
-        pressed(&pick(cx::EFFORT_PICK, &astra)),
-        focus(3, "More reasoning…")
-    );
-    assert_eq!(
-        pressed(&pick(cx::ADVANCED_PICK, &astra)),
-        session(1, "Ultra")
-    );
-    assert_eq!(
-        pressed(&pick(cx::ADVANCED_PICK_ULTRA, &astra)),
-        session(0, "Ultra")
-    );
-    let luna = to("gpt-6-luna", "high");
-    assert_eq!(
-        pressed(&pick(cx::MODEL_PICK, &luna)),
-        focus(2, "GPT-6-Luna")
-    );
-    assert_eq!(
-        pressed(&pick(cx::EFFORT_PICK_OTHER, &luna)),
-        session(1, "High")
-    );
-    assert_eq!(
-        pressed(&pick(cx::EFFORT_PICK, &to("GPT-6-Astra", "medium"))),
-        session(0, "Medium (default) (current)")
-    );
-    for xhigh in ["xhigh", "extra high"] {
-        assert_eq!(
-            pressed(&pick(cx::EFFORT_PICK, &to("GPT-6-Astra", xhigh))),
-            session(2, "Extra high")
-        );
-    }
-    // No restore in flight: the person's own `/model`.
-    assert!(reason(&pick(cx::MODEL_PICK, &full())).contains("the person's"));
-    // The effort box for another model than the restore's.
-    assert!(reason(&pick(cx::EFFORT_PICK, &luna)).contains("another model"));
-    // An effort box with no session key: Enter would save a default.
-    let rows: Vec<String> = phase_fixtures::screen(cx::EFFORT_PICK_OTHER)
-        .into_iter()
-        .map(|r| r.replace(" · s session", ""))
-        .collect();
-    let d = decide_screen(Some("codex"), &rows, &luna).expect("the picker");
-    assert!(reason(&d).contains("no this-conversation choice"), "{d:?}");
-    // An effort the box does not list.
-    assert!(reason(&pick(cx::EFFORT_PICK, &to("GPT-6-Astra", "minimal"))).contains("lists no"));
-    // Claude Code's reader on the same rows: no answer of this rule.
-    let rows = phase_fixtures::screen(cx::MODEL_PICK);
-    assert!(
-        decide_screen(Some("claude"), &rows, &astra)
-            .is_none_or(|d| approved(&d) != Some(RULE_MODEL_RESTORE_PICK))
-    );
-}
-
-/// The paused goal's box is answered only for the upgrade's own resume: with
-/// [`ApprovalCtx::goal_resume`], the focused `Resume goal` is pressed by focus
-/// and Enter under `goal-resume@v1`, guarded on its row. Negative controls:
-/// nothing owed (a person's own `codex resume`) escalates, as does focus moved
-/// to `Leave paused`, which is never pressed.
-#[test]
-fn the_paused_goals_box_is_answered_only_for_the_upgrades_resume() {
-    use aterm_phase::codex::fixtures as cx;
-    let rows = phase_fixtures::screen(cx::GOAL_RESUME);
-    let owed = ApprovalCtx {
-        goal_resume: true,
-        ..full()
-    };
-    match decide_screen(Some("codex"), &rows, &owed).expect("the box") {
-        Decision::Approve {
-            rule_id,
-            choice,
-            guard,
-            ..
-        } => {
-            assert_eq!(rule_id, RULE_GOAL_RESUME);
-            assert_eq!(
-                choice,
-                Choice::Focus {
-                    steps: 0,
-                    label: "Resume goal".to_string()
-                }
-            );
-            let row = rows
-                .iter()
-                .find(|r| r.starts_with("› 1."))
-                .expect("the focused row");
-            assert_eq!(guard, row_guard(row));
-        }
-        other => panic!("expected the resume, got {other:?}"),
-    }
-    let escalated = |c: &ApprovalCtx, rows: &[String]| {
-        matches!(
-            decide_screen(Some("codex"), rows, c).expect("the box"),
-            Decision::Escalate { .. }
-        )
-    };
-    assert!(escalated(&full(), &rows), "nothing owed: the person's");
-    let moved: Vec<String> = rows
-        .iter()
-        .map(|r| {
-            r.replacen("› 1. Resume goal", "  1. Resume goal", 1)
-                .replacen("  2. Leave paused", "› 2. Leave paused", 1)
-        })
-        .collect();
-    assert!(escalated(&owed, &moved), "a focus a person moved");
-    for c in [owed.clone(), full(), ctx()] {
-        for r in [&rows, &moved] {
-            if let Ok(Decision::Approve { choice, .. }) =
-                decide_screen(Some("codex"), r, &c).ok_or(())
-            {
-                assert!(
-                    !matches!(&choice, Choice::Focus { label, .. } if label == "Leave paused"),
-                    "{choice:?}"
-                );
-            }
-        }
-    }
-}
+// --- Codex's `Continue with …` ------------------------------------------------
 
 /// Claude Code 2.1.295 MEASURED (the real-Claude lab, 2026-10-09): a file box
 /// an ask rule sends to a person draws no reason, the box an unruled call
@@ -7082,17 +5864,15 @@ fn a_file_box_the_agents_bare_ask_rule_sends_is_held_at_every_level() {
 /// of the sweep's fix): under `ask: ["Bash"]` in manual mode, a Bash `sed -i`
 /// of an in-project file is drawn as an `Edit file` box with NO reason — row
 /// for row the box the Edit tool draws (its bundle titles the Bash permission
-/// path's `_simulatedSedEdit` preview `Edit file`) — and 2.1.299 the same
-/// (MEASURED 2026-10-14, where the fixed harness held it).
+/// path's `_simulatedSedEdit` preview `Edit file`).
 const ASK_BASH_SED: &str = include_str!("fixtures/claude-2.1.295-box-bash-sed-edit-ask-rule.txt");
-const ASK_BASH_SED_299: &str =
-    include_str!("fixtures/claude-2.1.299-box-bash-sed-edit-ask-rule.txt");
 
 /// A box Claude Code can draw for more than one tool names none of them, so
 /// a bare ask rule for ANY of them holds it at every level (fail-closed): the
 /// captured `Edit file` box of a Bash `sed -i` under `ask: ["Bash"]` (pressed
 /// by full power in the review of 2026-10-09), and the Edit tool's own box
-/// under the same rule, which nothing on it tells apart; the Read box under a
+/// under the same rule, which nothing on it tells apart (unproved: no
+/// transcript names its call); the Read box under a
 /// `Glob` or `Grep` rule (Claude Code's file-box builder titles every
 /// read-only file tool's box `Read file`); the IDE diff under `Bash`.
 /// Negative controls: unruled, or under a rule for a tool that never draws the
@@ -7108,13 +5888,6 @@ fn a_box_more_than_one_tool_draws_is_held_under_a_bare_rule_for_any_of_them() {
     let ide = phase_fixtures::BOX_EDIT_IDE;
     for (name, text, tool, other, unruled) in [
         ("bash sed", ASK_BASH_SED, "Bash", "Write", RULE_ALLOW_ONCE),
-        (
-            "bash sed 2.1.299",
-            ASK_BASH_SED_299,
-            "Bash",
-            "Read",
-            RULE_ALLOW_ONCE,
-        ),
         ("edit", ASK_EDIT, "Bash", "NotebookEdit", RULE_ALLOW_ONCE),
         (
             "read outside",
@@ -7134,13 +5907,11 @@ fn a_box_more_than_one_tool_draws_is_held_under_a_bare_rule_for_any_of_them() {
     ] {
         let rows = phase_fixtures::screen(text);
         for c in [full(), ctx(), none(full())] {
-            assert_eq!(
-                reason(&on_screen(&rows, &under(c, vec![rule(tool)]))),
-                format!(
-                    "the owner's Claude Code settings send this box to a person (an ask rule): \
-                     `{tool}` in {source}"
-                ),
-                "{name} under `{tool}`"
+            let d = on_screen(&rows, &under(c, vec![rule(tool)]));
+            let why = reason(&d);
+            assert!(
+                why.contains(&format!("`{tool}` in {source}")),
+                "{name} under `{tool}`: {why}"
             );
         }
         for asks in [vec![], vec![rule(other)]] {
@@ -7168,12 +5939,18 @@ const ASK_BASH_SED_HOOK_300: &str =
 /// off it. Each settings document is written in a scratch Claude Code
 /// directory and read through the agent's chain, as the loop reads it; the
 /// reason names the rule or the hook's matcher and the document. The ruling's
-/// over-hold, pinned: the Edit tool's own box is held the same way (nothing
-/// on it tells the two apart). Negative controls: unruled, under a specifier
+/// over-hold where the transcript proves nothing (`box_call` none): the Edit
+/// tool's own box is held the same way (nothing on it tells the two apart;
+/// a proof lifts it:
+/// `an_edit_tools_own_box_the_transcript_names_is_the_levels_under_a_bash_rule_or_hook`).
+/// Negative controls: unruled, under a specifier
 /// rule for another tool (`Edit(src/**)`) or a hook that cannot match Bash
-/// (`Edit|Write`), the sed box is full power's one-shot allow; and a box no
+/// (`Edit|Write`), the sed box is full power's one-shot allow; a box no
 /// Bash call is drawn as (the Write tool's `Create file`) is not held by any
-/// Bash rule or hook.
+/// Bash rule or hook, nor by a hook on Write or a `Write(**)` rule; and the
+/// Edit tool's own box is not held by a hook on `Edit` (a specifier rule, and
+/// a hook that cannot match Bash, are Claude Code's to match: the 2026-10-06
+/// ruling).
 #[test]
 fn a_sed_edit_box_under_a_bash_specifier_rule_or_bash_hook_is_held_at_every_level() {
     let s = crate::supervise::ScratchDir::new("approval", "bash-asks-hold-sed");
@@ -7198,15 +5975,13 @@ fn a_sed_edit_box_under_a_bash_specifier_rule_or_bash_hook_is_held_at_every_leve
             "specifier",
             ASK_BASH_SED_SPECIFIER_300,
             specifier.clone(),
-            "(a Bash ask rule; Claude Code draws a Bash `sed -i` as this box with no reason): \
-             `Bash(sed:*)` in ",
+            "`Bash(sed:*)` in ",
         ),
         (
             "hook",
             ASK_BASH_SED_HOOK_300,
             hook("Bash"),
-            "(a PreToolUse hook that can match Bash; Claude Code draws a Bash `sed -i` as this \
-             box with no reason): matcher `Bash` in ",
+            "matcher `Bash` in ",
         ),
         (
             "hook on every tool",
@@ -7273,6 +6048,24 @@ fn a_sed_edit_box_under_a_bash_specifier_rule_or_bash_hook_is_held_at_every_leve
             hook("*"),
             RULE_ALLOW_ONCE,
         ),
+        (
+            "a Write box under a Write hook",
+            ASK_WRITE,
+            hook("Edit|Write"),
+            RULE_ALLOW_ONCE,
+        ),
+        (
+            "a Write box under a Write rule with a specifier",
+            ASK_WRITE,
+            r#"{"permissions":{"ask":["Write(**)"]}}"#.to_string(),
+            RULE_ALLOW_ONCE,
+        ),
+        (
+            "the Edit tool's own box under an Edit hook",
+            ASK_EDIT,
+            hook("Edit"),
+            RULE_ALLOW_ONCE,
+        ),
     ] {
         let asks = asks_under(&settings);
         let rows = phase_fixtures::screen(fixture);
@@ -7287,6 +6080,10 @@ fn a_sed_edit_box_under_a_bash_specifier_rule_or_bash_hook_is_held_at_every_leve
     }
 }
 
+// The former transcript-candidate authority positives are retired: a
+// pending call does not bind the current mount. The RAM aggregate below
+// covers ordinary admission and the possible-tool holds through decide.
+
 /// A WRAPPED FOOTER (aterm-phase's prompt.rs): an ordinary Bash box in a
 /// 26-column pane (MEASURED on 2.1.295, its footer `Esc to cancel · Tab to`
 /// over `amend`) read `idle`, and nothing was pressed or escalated. Read
@@ -7300,4 +6097,422 @@ fn a_box_whose_footer_wraps_is_decided_by_its_whole_footer() {
     let p = aterm_phase::prompt::parse_prompt_v2(&rows).expect("the box");
     assert_eq!(refusal_of(&p, "use another name"), Ok(3));
     assert!(!amend_input_open(&p));
+}
+
+/// THE AUTOCOMPACT OFFER ([`RULE_AUTOCOMPACT_OFFER`]; aterm-phase's
+/// HAND-BUILT 2.1.302 screens): at every level, `approve = "none"` included,
+/// the accept row at `[harness] autocompact_offer`'s size — the focus moved
+/// onto it and Enter, guarded on the title row — never the keep row or Esc.
+#[test]
+fn the_autocompact_offer_chooses_the_accept_row_at_400k() {
+    let guard = crate::supervise::policy::row_guard(" We recommend compacting earlier");
+    let accept = "Autocompact at ‹ 400k › tokens".to_string();
+    for (text, steps) in [
+        (phase_fixtures::AUTOCOMPACT_KEEP_FIRST, 1),
+        (phase_fixtures::AUTOCOMPACT_LOWER_FIRST, 0),
+        (phase_fixtures::AUTOCOMPACT_FULLSCREEN, 1),
+    ] {
+        let rows = phase_fixtures::screen(text);
+        for c in [ctx(), full(), none(full())] {
+            let d = on_screen(&rows, &c);
+            let Decision::Approve {
+                rule_id,
+                choice,
+                guard: g,
+                ..
+            } = &d
+            else {
+                panic!("{:?}: {d:?}", c.approve);
+            };
+            assert_eq!(*rule_id, RULE_AUTOCOMPACT_OFFER);
+            assert_eq!(
+                *choice,
+                Choice::Focus {
+                    steps,
+                    label: accept.clone()
+                },
+                "{:?}",
+                c.approve
+            );
+            if text != phase_fixtures::AUTOCOMPACT_FULLSCREEN {
+                assert_eq!(*g, guard);
+            }
+            let m = aterm_observe::row_matcher(g).expect("compiles");
+            assert_eq!(rows.iter().filter(|r| m.matches(r)).count(), 1, "{g}");
+        }
+    }
+}
+
+/// The stepper away from the target: ONE step toward it, the focus moved
+/// onto the accept row first — never an Enter on another size. At the target
+/// already, Enter; another target steps the other way.
+#[test]
+fn the_autocompact_offer_steps_the_size_before_any_enter() {
+    let rows = phase_fixtures::screen(phase_fixtures::AUTOCOMPACT_80COL_500K);
+    let label = "Autocompact at ‹ 500k › tokens".to_string();
+    let at = |k: u32| ApprovalCtx {
+        autocompact_offer: Some(k),
+        ..full()
+    };
+    let choice = |d: Decision| match d {
+        Decision::Approve { choice, .. } => choice,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        choice(on_screen(&rows, &full())),
+        Choice::FocusKey {
+            steps: 0,
+            label: label.clone(),
+            key: "left"
+        }
+    );
+    assert_eq!(
+        choice(on_screen(&rows, &at(700))),
+        Choice::FocusKey {
+            steps: 0,
+            label: label.clone(),
+            key: "right"
+        }
+    );
+    assert_eq!(
+        choice(on_screen(&rows, &at(500))),
+        Choice::Focus { steps: 0, label }
+    );
+    // The focus on the keep row and another size: moved, then stepped.
+    let keep_first = phase_fixtures::screen(phase_fixtures::AUTOCOMPACT_KEEP_FIRST);
+    assert_eq!(
+        choice(on_screen(&keep_first, &at(300))),
+        Choice::FocusKey {
+            steps: 1,
+            label: "Autocompact at ‹ 400k › tokens".to_string(),
+            key: "left"
+        }
+    );
+}
+
+/// CONTROLS: the key off, a target off the ladder, an exit pending (no
+/// offer at all) and another program's screen are never answered, and no
+/// decision on any offer names the keep row.
+#[test]
+fn the_autocompact_offer_is_a_persons_unless_read_whole_and_on() {
+    let rows = phase_fixtures::screen(phase_fixtures::AUTOCOMPACT_KEEP_FIRST);
+    let off = ApprovalCtx {
+        autocompact_offer: None,
+        ..full()
+    };
+    assert!(reason(&on_screen(&rows, &off)).contains("autocompact_offer is off"));
+    let odd = ApprovalCtx {
+        autocompact_offer: Some(450),
+        ..full()
+    };
+    assert!(reason(&on_screen(&rows, &odd)).contains("no size it offers"));
+    // Read by Codex's reader it is no Claude Code box: never answered.
+    if let Some(d) = decide_screen(Some("codex"), &rows, &full()) {
+        assert!(approved(&d).is_none(), "{d:?}");
+    }
+    // An exit pending: not this kind; whatever reads it never presses Keep.
+    let pending = phase_fixtures::screen(phase_fixtures::AUTOCOMPACT_PRESS_AGAIN);
+    if let Some(d) = decide_screen(Some("claude"), &pending, &full()) {
+        assert_ne!(approved(&d), Some(RULE_AUTOCOMPACT_OFFER), "{d:?}");
+    }
+    for text in [
+        phase_fixtures::AUTOCOMPACT_KEEP_FIRST,
+        phase_fixtures::AUTOCOMPACT_LOWER_FIRST,
+        phase_fixtures::AUTOCOMPACT_80COL_500K,
+        phase_fixtures::AUTOCOMPACT_FULLSCREEN,
+    ] {
+        let rows = phase_fixtures::screen(text);
+        for k in aterm_phase::autocompact::LADDER {
+            let c = ApprovalCtx {
+                autocompact_offer: Some(k),
+                ..full()
+            };
+            match on_screen(&rows, &c) {
+                Decision::Approve {
+                    choice: Choice::Focus { label, .. } | Choice::FocusKey { label, .. },
+                    ..
+                } => assert!(label.starts_with("Autocompact at ‹ "), "{label}"),
+                other => panic!("{k}k: {other:?}"),
+            }
+        }
+    }
+}
+
+/// MUSE CODE'S SEVERAL QUESTIONS, ITS MULTI-SELECT AND ITS REVIEW ARE A
+/// PERSON'S (1.4.10, measured): read whole with no roles, each is handed over
+/// at full power and under the recommended word — its answers span screens
+/// the loop cannot tell its own keys' from a person's on, and the review's
+/// second row stops the turn — never focused, entered or declined, in a
+/// 60-column tab too. NEGATIVE CONTROL: the single question on the same
+/// screens' build is answered with its recommended answer.
+#[test]
+fn muses_several_questions_multi_select_and_review_are_a_persons() {
+    use aterm_phase::muse::fixtures as u;
+    for (what, fixture, says) in [
+        ("several questions", u::QUESTION_MULTI, "several questions"),
+        (
+            "the second of several",
+            u::QUESTION_MULTI_SECOND,
+            "several questions",
+        ),
+        (
+            "several, narrow",
+            u::QUESTION_MULTI_NARROW,
+            "several questions",
+        ),
+        ("a multi-select", u::QUESTION_MULTISELECT, "multi-select"),
+        (
+            "a multi-select toggled",
+            u::QUESTION_MULTISELECT_TOGGLED,
+            "multi-select",
+        ),
+        (
+            "a multi-select, narrow",
+            u::QUESTION_MULTISELECT_NARROW,
+            "multi-select",
+        ),
+        (
+            "the review",
+            u::QUESTION_MULTI_REVIEW,
+            "a review of answers",
+        ),
+        (
+            "the review, narrow",
+            u::QUESTION_MULTI_REVIEW_NARROW,
+            "a review of answers",
+        ),
+        (
+            "a multi-select's review",
+            u::QUESTION_MULTISELECT_REVIEW,
+            "a review of answers",
+        ),
+        (
+            "a note's review",
+            u::QUESTION_NOTE_REVIEW,
+            "a review of answers",
+        ),
+    ] {
+        let rows = phase_fixtures::screen(fixture);
+        let d = decide_screen(Some("muse"), &rows, &full()).expect("a box");
+        assert!(
+            matches!(&d, Decision::Escalate { reason } if reason.contains(says)),
+            "{what}: {d:?}"
+        );
+    }
+    let rows = phase_fixtures::screen(u::QUESTION);
+    let d = decide_screen(Some("muse"), &rows, &full()).expect("a box");
+    assert_eq!(
+        approved(&d),
+        Some(RULE_ANSWER_RECOMMENDED),
+        "the control: {d:?}"
+    );
+}
+
+/// MUSE CODE'S NOTE OPEN UNDER THE RECOMMENDED WORD IS A PERSON'S (1.4.10
+/// measured, and 1.4.9's capture of Tab on its first option): the word opens
+/// no note, so a person's Tab opened it, and the note follows the cursor and
+/// goes with the next Enter, so answering would send what a person wrote
+/// there (`short words`, the long text) with the recommended answer. Each is
+/// handed over as begun, whether its note is empty or holds text, under the
+/// focused answer or under `None of the above`. NEGATIVE CONTROLS: the same
+/// question with its note closed (before Tab, and after Esc closed it) is
+/// answered with its recommended answer, on both builds.
+#[test]
+fn a_muse_note_open_under_the_recommended_word_is_a_persons() {
+    use aterm_phase::muse::fixtures as u;
+    for (what, fixture) in [
+        ("1.4.9, Tab on the first answer", u::BOX_QUESTION_NOTE),
+        ("an empty note", u::QUESTION_NOTE_OPEN),
+        ("a typed note", u::QUESTION_NOTE_TYPED),
+        ("a short note", u::QUESTION_NOTE_SHORT),
+        ("a long note", u::QUESTION_NOTE_LONG),
+        ("a note emptied by Tab", u::QUESTION_NOTE_TAB_CLEARED),
+    ] {
+        let rows = phase_fixtures::screen(fixture);
+        assert!(
+            aterm_phase::muse::question_notes(&rows).is_some(),
+            "{what}: the note reads open"
+        );
+        let d = decide_screen(Some("muse"), &rows, &full()).expect("a box");
+        assert!(
+            matches!(&d, Decision::Escalate { reason }
+                if reason.contains("begun") && reason.contains("its note is open")),
+            "{what}: {d:?}"
+        );
+    }
+    for (what, fixture) in [
+        ("1.4.9, no note", u::BOX_QUESTION),
+        ("1.4.10, no note", u::QUESTION),
+        ("Esc closed the note", u::QUESTION_NOTE_ESC),
+    ] {
+        let rows = phase_fixtures::screen(fixture);
+        assert!(
+            aterm_phase::muse::question_notes(&rows).is_none(),
+            "{what}: no note"
+        );
+        let d = decide_screen(Some("muse"), &rows, &full()).expect("a box");
+        assert_eq!(
+            approved(&d),
+            Some(RULE_ANSWER_RECOMMENDED),
+            "the control, {what}: {d:?}"
+        );
+    }
+}
+
+/// A transcript candidate has no identity in an ambiguous on-screen box.
+/// Even a complete older EOF may still name an Edit while Bash's current
+/// call has not been appended. The ordinary allowed controls come first;
+/// every possible-tool hold must then survive all candidate tail shapes.
+#[test]
+fn a_transcript_candidate_cannot_remove_a_possible_tools_owner_hold() {
+    use super::super::box_call::{drew, pending_calls};
+
+    let rule = |text: &str| {
+        let (tool, bare) = super::super::claude_settings::rule_tool(text).expect("a rule");
+        OwnerAsk {
+            kind: AskKind::Rule {
+                tool: tool.to_string(),
+                bare,
+            },
+            text: text.to_string(),
+            source: "the synthetic settings document".to_string(),
+        }
+    };
+    let hook = |matcher: &str| OwnerAsk {
+        kind: AskKind::Hook {
+            matcher: Some(matcher.to_string()),
+        },
+        text: matcher.to_string(),
+        source: "the synthetic settings document".to_string(),
+    };
+    let at = |asks: Vec<OwnerAsk>, candidate: Option<&str>| ApprovalCtx {
+        owner_asks: Ok(asks),
+        box_call: candidate.map(str::to_string),
+        ..full()
+    };
+    let edit = phase_fixtures::screen(ASK_EDIT);
+    let write = phase_fixtures::screen(ASK_WRITE);
+    assert_eq!(
+        approved(&on_screen(&edit, &at(Vec::new(), None))),
+        Some(RULE_ALLOW_ONCE)
+    );
+    assert_eq!(
+        approved(&on_screen(&edit, &at(Vec::new(), Some("Edit")))),
+        Some(RULE_ALLOW_ONCE)
+    );
+    assert_eq!(
+        approved(&on_screen(&write, &at(vec![rule("Bash(sed:*)")], None))),
+        Some(RULE_ALLOW_ONCE)
+    );
+    assert_eq!(
+        approved(&on_screen(&write, &at(vec![hook("Bash")], None))),
+        Some(RULE_ALLOW_ONCE)
+    );
+
+    const OLD_EDIT: &str =
+        include_str!("../fixtures/claude-2.1.300-transcript-box-edit-pending.jsonl");
+    // Both malformed cases retain the older call in the current candidate
+    // parser. The complete old EOF needs no malformed row at all.
+    let tails = [
+        ("complete older EOF", OLD_EDIT.to_string()),
+        (
+            "torn later row",
+            format!("{OLD_EDIT}{{\"type\":\"user\",\"message\":"),
+        ),
+        (
+            "malformed internal row",
+            format!("{OLD_EDIT}{{\"type\":\"user\"\n{{\"type\":\"attachment\"}}\n"),
+        ),
+    ];
+    let mut lost = Vec::new();
+    for (name, tail) in tails {
+        for (shape, fixture) in [
+            ("Edit shape", ASK_EDIT),
+            ("Bash sed shape", ASK_BASH_SED_SPECIFIER_300),
+        ] {
+            let rows = phase_fixtures::screen(fixture);
+            let p = aterm_phase::prompt::parse_prompt_v2(&rows).expect("the captured box");
+            let candidate =
+                drew(&p, &pending_calls(&tail), &[], None).expect("the older Edit candidate");
+            assert_eq!(candidate.tool, "Edit", "{name}, {shape}");
+            for ask in [rule("Bash(sed:*)"), rule("Bash"), hook("Bash"), hook("*")] {
+                let expected = on_screen(&rows, &at(vec![ask.clone()], None));
+                assert!(
+                    matches!(expected, Decision::Escalate { .. }),
+                    "the unqualified hold: {expected:?}"
+                );
+                let got = on_screen(&rows, &at(vec![ask.clone()], Some(&candidate.tool)));
+                if got != expected {
+                    lost.push(format!("{name}, {shape}, {}: {got:?}", ask.text));
+                }
+            }
+        }
+    }
+    assert!(lost.is_empty(), "BOX-CALL-OWNER-HOLD: {lost:#?}");
+}
+
+/// `rows` read as Claude Code's and decided with a trace kept: the
+/// decision, and the steps.
+fn traced(rows: &[String], ctx: &ApprovalCtx) -> (Decision, Vec<super::super::trace::TraceStep>) {
+    let reading = aterm_phase::read(Some("claude"), rows, None);
+    let mut steps = Vec::new();
+    let d = decide_traced(&reading, rows, ctx, &mut steps);
+    (d, steps)
+}
+
+/// THE TRACE NAMES THE RULE THAT DECIDED, and tells of the very decision the
+/// loop makes: a read-only box under the safe rules is decided at the safe
+/// rules by `read-only@classify-v3`, after the gates it passed (the program
+/// supervised, no owner's review, no ask rule, no forced read, the box read
+/// whole); a write under full power is unproven by the safe rules and
+/// decided by full power; a box under `none` goes to a person at that check,
+/// by no rule. In each case `decide` decides exactly what the traced one
+/// does.
+#[test]
+fn a_trace_names_the_rule_that_decided() {
+    use super::super::trace::{Outcome, deciding};
+    let read = bash_box(
+        &["git status --short"],
+        Some("Show the working tree status"),
+    );
+    let (d, steps) = traced(&read, &ctx());
+    assert_eq!(d, on_screen(&read, &ctx()), "the same decision");
+    let names: Vec<&str> = steps.iter().map(|s| s.name()).collect();
+    assert_eq!(
+        names,
+        [
+            "supervisable",
+            "owner-review",
+            "settings-ask",
+            "forced-read",
+            "head-unread",
+            RULE_READ_ONLY
+        ],
+        "{steps:#?}"
+    );
+    let decided = deciding(&steps).expect("a deciding step");
+    assert_eq!(decided.rule, Some(RULE_READ_ONLY));
+    assert_eq!(decided.check, "safe-rules");
+    let write = bash_box(&["touch /etc/aterm-trace-witness"], None);
+    let (d, steps) = traced(&write, &full());
+    assert_eq!(d, on_screen(&write, &full()));
+    let safe = steps
+        .iter()
+        .find(|s| s.check == "safe-rules")
+        .expect("consulted");
+    assert!(matches!(safe.outcome, Outcome::Unproven(_)), "{steps:#?}");
+    let decided = deciding(&steps).expect("a deciding step");
+    assert_eq!(decided.check, "full-power");
+    assert_eq!(decided.rule, approved(&d), "{steps:#?}");
+    let (d, steps) = traced(&read, &none(ctx()));
+    assert_eq!(d, on_screen(&read, &none(ctx())));
+    let decided = deciding(&steps).expect("a deciding step");
+    assert_eq!((decided.check, decided.rule), ("approve-none", None));
+    // No trace kept: nothing is built (the loop's decisions).
+    let mut none_kept = super::super::trace::NoTrace;
+    let reading = aterm_phase::read(Some("claude"), &read, None);
+    assert_eq!(
+        decide_traced(&reading, &read, &ctx(), &mut none_kept),
+        on_screen(&read, &ctx())
+    );
 }

@@ -130,10 +130,11 @@ pub struct ChainPolicy {
     /// Microsoft's own glyphs. Those faces
     /// now decline such a point inside their tier's probe
     /// (`FOREIGN_PRIVATE_USE_FACES` in the crate root), which leaves this
-    /// order, and every proof below, unchanged. The bundled Windows primary,
-    /// Cascadia Mono PL, declines its own private-use points the same way,
-    /// inside the PRIMARY probe (`bundled::yields_private_use`): to this module
-    /// that is only a primary that does not cover them.
+    /// order, and every proof below, unchanged. The bundled Cascadia Mono PL
+    /// declines its own private-use points the same way, inside the PRIMARY
+    /// probe (`bundled::yields_private_use`), and the Windows default, Iosevka
+    /// Term Semibold, its two-column characters (`bundled::yields_wide_characters`):
+    /// to this module each is only a primary that does not cover them.
     pub prefers_symbol: bool,
 }
 
@@ -395,42 +396,6 @@ impl ChainProbe for BitProbe {
             Tier::Fallback => self.pending & 1 == 1,
             Tier::Symbol => (self.pending >> 1) & 1 == 1,
             _ => false,
-        }
-    }
-}
-
-/// The runtime tier's two decision maps, abstracted to one cell each (P3's
-/// second half). `record` is the resolver side, `parts_for` the rasterizer side.
-/// The pre-fix `parts_for` read only [`Self::decisions`]; a decision recorded on
-/// the embedded lane was then unrecoverable and the glyph drew `.notdef` under a
-/// `RuntimeFallback` key.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct DecisionCells {
-    /// `Some(face)` = a cached decision; the inner `None` = a cached MISS.
-    pub decisions: Option<Option<u8>>,
-    pub embedded_decisions: Option<Option<u8>>,
-}
-
-impl DecisionCells {
-    /// Record one lane's decision (the memoizing tail of `resolve` /
-    /// `resolve_embedded_only`).
-    pub fn record(&mut self, lane: RuntimeLane, face: Option<u8>) {
-        match lane {
-            RuntimeLane::Decisions => self.decisions = Some(face),
-            RuntimeLane::EmbeddedDecisions => self.embedded_decisions = Some(face),
-        }
-    }
-
-    /// `RuntimeFallback::parts_for`: recover the face index for a key, lane-AGNOSTIC.
-    #[must_use]
-    pub const fn parts_for(&self) -> Option<u8> {
-        match self.decisions {
-            Some(Some(i)) => Some(i),
-            Some(None) => None,
-            None => match self.embedded_decisions {
-                Some(Some(i)) => Some(i),
-                _ => None,
-            },
         }
     }
 }

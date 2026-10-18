@@ -1,112 +1,67 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//! THE EVENT DRIVER: every `NSEvent`-taking row of the ported `WinitView`, and
-//! the `NSApplication` `sendEvent:` override, entered with a REAL `NSEvent` of
-//! every type AppKit can deliver to it — the v0.72.0 mouse-move abort, turned
-//! into a `verify appkit` check.
+//! The event driver: every `NSEvent`-taking row of the ported `WinitView`, and the
+//! `NSApplication` `sendEvent:` override, entered with a real `NSEvent` of every
+//! type AppKit can deliver to it.
 //!
-//! # The defect this exists to close
+//! It hunts a trampoline sending an accessor the event's type does not answer.
+//! AppKit raises `NSInternalInconsistencyException` ("Invalid message sent to
+//! event") for a key-only accessor such as `-keyCode` on a mouse event, and that
+//! foreign exception cannot unwind through a Rust frame.
 //!
-//! v0.72.0 aborted on the first pointer movement over a focused window (two
-//! crash reports on 2026-09-02, both `EXC_CRASH (SIGABRT)` on the main thread
-//! under `_routeMouseMovedEvent`). Symbolicated with the release dSYM: the
-//! trampoline for `mouseMoved:` called `mouse_motion` -> `update_modifiers`,
-//! which sent `-[NSEvent keyCode]` to a `MouseMoved` event. AppKit answers a
-//! key-only accessor on a mouse event with `NSInternalInconsistencyException`
-//! ("Invalid message sent to event"); the exception unwound into the
-//! trampoline's `catch_unwind`, Rust cannot catch a foreign exception, and
-//! `__rust_foreign_exception` aborted the process.
+//! # What it drives
 //!
-//! Three gates already drive `view.rs` — the live-class audit (its SHAPE),
-//! the IME drive (the `NSTextInputClient` state machine) and the window drive
-//! (`window_delegate.rs`) — and none of them sends a MOUSE event through a
-//! mouse IMP. The class was audited, composed through and resized, and still
-//! aborted on the first `mouseMoved:` AppKit delivered. This file is the
-//! missing row: it builds the event AppKit would build and enters the IMP
-//! AppKit would enter.
-//!
-//! # What it drives, and how
-//!
-//! A real `NSWindow` and a real `WinitView` through winit's public API, as the
-//! siblings do. Then, for every event-taking row the class registers, one
-//! `NSEvent` per type AppKit can deliver to that row — built by AppKit's own
+//! A real `NSWindow` and `WinitView` through winit's public API. For each
+//! event-taking row, one `NSEvent` per type the row can receive, built by AppKit's
 //! factories (`+mouseEventWithType:…`, `+keyEventWithType:…`,
-//! `+enterExitEventWithType:…`, `+otherEventWithType:…`) and, where the type
-//! has one, by CoreGraphics (`CGEventCreateMouseEvent`,
+//! `+enterExitEventWithType:…`, `+otherEventWithType:…`) and, where the type has
+//! one, by CoreGraphics wrapped with `+eventWithCGEvent:` (`CGEventCreateMouseEvent`,
 //! `CGEventCreateScrollWheelEvent2`, `CGEventCreateKeyboardEvent`, and a bare
-//! `CGEventCreate` retyped with `CGEventSetType` for the gesture family)
-//! wrapped by `+eventWithCGEvent:`. Real hardware events are CG-backed; the
-//! events AppKit synthesises itself are not; both shapes are sent. The IMP is
-//! entered through `objc_msgSend`, the entry AppKit uses. A last stage sends
-//! the same shapes through `-[NSApplication sendEvent:]`, which is `app.rs`'s
-//! override and the routing AppKit does behind it.
+//! `CGEventCreate` retyped with `CGEventSetType`). Hardware events are CG-backed and
+//! AppKit's synthesised ones are not, so both shapes are sent, through
+//! `objc_msgSend` as AppKit enters an IMP.
 //!
-//! What is asserted is SURVIVAL plus the relations winit's API promises: a
-//! `mouseMoved:` inside the view frame yields `CursorMoved`; a `mouseDown:`
-//! and `mouseUp:` yield `MouseInput`; a `scrollWheel:` yields `MouseWheel`;
-//! `mouseEntered:`/`mouseExited:` yield `CursorEntered`/`CursorLeft`; a
-//! `keyDown:` yields `KeyboardInput`. There is no stored golden and no mirror:
-//! the events come from AppKit's factories and the validity of each accessor
-//! from AppKit itself.
+//! A last stage sends each kind of event through `-[NSApplication sendEvent:]`
+//! (`app.rs`'s override), the gesture family included: the view has no magnify,
+//! smart-magnify, rotate or pressure rows, so `Gesture` (29), `Magnify` (30) and
+//! `Rotate` (18), retyped bare `CGEvent`s (`docs/measured/nsevent-accessors/`), are
+//! sent only there, and AppKit passes them up the responder chain past the view.
+//!
+//! It asserts survival plus winit's promised relations: `mouseMoved:` inside the
+//! view yields `CursorMoved`, `mouseDown:`/`mouseUp:` `MouseInput`, `scrollWheel:`
+//! `MouseWheel`, `mouseEntered:`/`mouseExited:` `CursorEntered`/`CursorLeft`, and
+//! `keyDown:` `KeyboardInput`.
 //!
 //! # The two controls
 //!
-//! A drive that survives proves nothing unless the defect it hunts is one it
-//! can see, and since exception CONTAINMENT landed in `aterm_objc` the
-//! trampoline's policy has TWO halves, so the first stage re-executes this
-//! binary as two children:
+//! The first stage re-executes this binary as two children, one per half of the
+//! trampoline's policy:
 //!
-//! * **The exception control.** The child declares a class with
-//!   [`aterm_objc::declare_class!`] whose `poke:` sends `-keyCode` to a
-//!   `MouseMoved` event — the v0.72.0 send, inside the same trampoline — and
-//!   the parent requires it to be CONTAINED: exit `0`, one line on the child's
-//!   stderr naming `poke:` and `NSInternalInconsistencyException` (the
-//!   containment report, from `aterm_objc::exception`'s default sink), and a
-//!   LATER send on the same object answering. Before containment this child
-//!   was required to abort; a child that aborts now, or survives without the
-//!   named line, is a finding.
-//! * **The panic control.** The same class's `panicInside` panics in Rust.
-//!   `@catch (id)` must not swallow a Rust panic, so the parent requires the
-//!   pre-containment abort, unchanged: exit `3` through the signal trap below
-//!   (or a raw `SIGABRT` if the trap could not convert it) and
-//!   `abort_on_unwind`'s exact message on stderr.
+//! * **Exception control.** A [`aterm_objc::declare_class!`] class whose `poke:`
+//!   sends `-keyCode` to a `MouseMoved` event must be contained: exit `0`, one
+//!   stderr line naming `poke:` and `NSInternalInconsistencyException`
+//!   (`aterm_objc::exception`'s default sink), and a later send on the same object
+//!   answering.
+//! * **Panic control.** `panicInside` panics in Rust, which `@catch (id)` must not
+//!   swallow: the child must abort, as exit `3` through the signal trap (or a raw
+//!   `SIGABRT`), with `abort_on_unwind`'s message on stderr.
 //!
-//! Both are the shapes the design was measured on
-//! (`docs/measured/2026-09-03-delivery-and-objc-exception-containment.md`).
-//!
-//! # The gesture family
-//!
-//! The view's magnify, smart-magnify, rotate and pressure rows are gone:
-//! nothing in aterm handled the events they queued. The `Gesture` (29),
-//! `Magnify` (30) and `Rotate` (18) shapes are still built, by retyping a bare
-//! `CGEvent` (measured on macOS 26.6.2 — `docs/measured/nsevent-accessors/`),
-//! and sent through `-[NSApplication sendEvent:]`, where AppKit now routes them
-//! up the responder chain past the view. Every shape this file builds is driven.
-//!
-//! # The exit contract, which `aterm_verify::stages::OBJC_DRIVES` reads
+//! # Exit contract (read by `aterm_verify::stages::OBJC_DRIVES`)
 //!
 //! | code | meaning |
 //! |---|---|
 //! | 0 | every row survived every event it can receive, the relations held, the exception control was contained and the panic control aborted |
-//! | 1 | a relation failed, a row was silently not driven, or a control answered the wrong way (the exception control aborted or was not named; the panic control survived) |
-//! | 2 | NOT RUN — no event loop, no window, no view, or a control could not be spawned. NEVER a pass. |
-//! | 3 | THE FINDING THIS FILE EXISTS FOR: a row ABORTED on an event it can receive |
-//! | killed by a signal | the same finding, when the trap below could not turn it into `3` |
+//! | 1 | a relation failed, an event could not be built, or a control answered the wrong way (the exception control aborted or was not named; the panic control survived) |
+//! | 2 | not run: no event loop, no window, no view, or a control could not be spawned. Never a pass. |
+//! | 3 | the finding: a row aborted on an event it can receive |
+//! | killed by a signal | the same finding, when the trap could not turn it into `3` |
 //!
-//! # Why an abort comes out as exit 3 and not as a crash dialog
-//!
-//! The abort that `abort_on_unwind` and `__rust_foreign_exception` perform is
-//! `SIGABRT`, and an uncaught `SIGABRT` is what makes macOS write a
-//! DiagnosticReport and show "quit unexpectedly" — once per `verify appkit` run for the
-//! panic control child alone, and once more for every real finding. So the driver
-//! installs its own handler for the fatal signals before it drives anything:
-//! the handler writes one line naming the row being driven (kept in a static
-//! buffer the main thread fills before every send, read with
-//! async-signal-safe calls only) and `_exit`s with `3`. The abort still
-//! happens — the trampoline still reaches `abort()` — but the process leaves
-//! through `_exit`, which the crash reporter does not see. `verify appkit`
-//! reads the exit as a FAILURE, not as could-not-run — the opposite of its
-//! siblings, and deliberately: for this driver the abort IS the answer.
+//! An uncaught abort makes macOS write a DiagnosticReport and show "quit
+//! unexpectedly", so before driving anything the driver traps the fatal signals: the
+//! handler writes the row being driven (a static buffer the main thread fills before
+//! each send, read with async-signal-safe calls) and `_exit`s with `3`, which the
+//! crash reporter does not see. `verify appkit` reads `3` as a failure, not
+//! could-not-run: for this driver the abort is the finding.
 #![allow(clippy::disallowed_types, reason = "an example driver, never shipped")]
 
 #[cfg(target_os = "macos")]
@@ -141,7 +96,8 @@ mod macos {
     use std::time::{Duration, Instant};
 
     use aterm_objc::{
-        Bool, CGPoint, CGRect, Id, MainThread, Sel, autoreleasepool, class, msg, ns_string, sel,
+        Bool, CGPoint, CGRect, Id, MainThread, Sel, autoreleasepool, checked_msg, class, ns_string,
+        sel,
     };
     use winit::application::ApplicationHandler;
     use winit::event::{ElementState, WindowEvent};
@@ -227,11 +183,9 @@ mod macos {
             }
         }
 
-        /// Install the handler for every signal an abort or a fault raises.
-        /// Name the row that never returned and leave with the abort code.
-        /// Called from the hang watchdog thread, not a signal handler, but
-        /// it uses the same raw writes so it works whatever state the main
-        /// thread is stuck in.
+        /// Name the row that never returned and leave with the abort code. Called
+        /// from the hang watchdog thread, not a signal handler, but with the same raw
+        /// writes, so it works whatever state the stuck main thread is in.
         pub fn report_hang_and_exit() -> ! {
             const HEAD: &[u8] =
                 b"\nobjc-event-drive: HUNG (row never returned within the budget) while driving: ";
@@ -247,6 +201,7 @@ mod macos {
             }
         }
 
+        /// Install `on_fatal` for every signal an abort or a fault raises.
         pub fn install() {
             for sig in [SIGABRT, SIGSEGV, SIGBUS, SIGILL, SIGTRAP] {
                 // SAFETY: `signal(2)` with a plain C handler; BSD semantics
@@ -261,9 +216,9 @@ mod macos {
     /// Set in the environment of the re-executed child that runs a control:
     /// [`CONTROL_EXCEPTION`] or [`CONTROL_PANIC`].
     pub const CONTROL_ENV: &str = "ATERM_OBJC_EVENT_DRIVE_CONTROL";
-    /// The exception control: the v0.72.0 send, which must be CONTAINED.
+    /// The exception control: a wrong-type send, which must be contained.
     const CONTROL_EXCEPTION: &str = "exception";
-    /// The panic control: a Rust panic, which must still ABORT.
+    /// The panic control: a Rust panic, which must still abort.
     const CONTROL_PANIC: &str = "panic";
 
     /// Long enough for macOS to launch its `NSApplication`, hand back a window
@@ -348,8 +303,8 @@ mod macos {
 
     // ------------------------------------------------------------- factories
     //
-    // AppKit's own constructors, entered as typed `objc_msgSend` casts exactly
-    // as the sibling drivers enter theirs. Every result is autoreleased.
+    // AppKit's own constructors as typed `objc_msgSend` casts; every result is
+    // autoreleased.
 
     /// `+[NSEvent mouseEventWithType:location:modifierFlags:timestamp:
     /// windowNumber:context:eventNumber:clickCount:pressure:]`.
@@ -374,7 +329,7 @@ mod macos {
                 isize,
                 isize,
                 f32,
-            ) -> Id = msg();
+            ) -> Id = checked_msg();
             f(
                 class(c"NSEvent").as_id(),
                 sel!(
@@ -414,7 +369,7 @@ mod macos {
                 isize,
                 isize,
                 *mut c_void,
-            ) -> Id = msg();
+            ) -> Id = checked_msg();
             f(
                 class(c"NSEvent").as_id(),
                 sel!(
@@ -457,7 +412,7 @@ mod macos {
                 Id,
                 Bool,
                 u16,
-            ) -> Id = msg();
+            ) -> Id = checked_msg();
             f(
                 class(c"NSEvent").as_id(),
                 sel!(
@@ -499,7 +454,7 @@ mod macos {
                 i16,
                 isize,
                 isize,
-            ) -> Id = msg();
+            ) -> Id = checked_msg();
             f(
                 class(c"NSEvent").as_id(),
                 sel!(otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:subtype:data1:data2:),
@@ -529,24 +484,19 @@ mod macos {
         // autoreleased and retains the CGEvent, so releasing ours is the
         // documented balance.
         unsafe {
-            let f: unsafe extern "C-unwind" fn(Id, Sel, *mut c_void) -> Id = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, *mut c_void) -> Id = checked_msg();
             let ev = f(class(c"NSEvent").as_id(), sel!(eventWithCGEvent:), cg);
             CFRelease(cg);
             ev
         }
     }
 
-    /// A CG-backed mouse event of the given type at the WINDOW point `loc`.
+    /// A CG-backed mouse event of the given type at the window point `loc`.
     ///
-    /// CoreGraphics locations are global with a top-left origin; AppKit flips
-    /// them to its bottom-left screen coordinates, and for an event with no
-    /// window `-locationInWindow` answers exactly that screen point (MEASURED:
-    /// CG (10,10) reads back as (10,1107) on this 1117-point display). With the
-    /// window pinned to the screen origin in `resumed`, the window point
-    /// `(x, y)` is therefore the CG point `(x, height - y)`. The first
-    /// exact-count run measured 1 of 2 CursorMoved before this flip: the CG
-    /// shape landed a screen height away and took `mouse_motion`'s
-    /// out-of-frame early return.
+    /// CoreGraphics locations are global with a top-left origin; AppKit flips them to
+    /// bottom-left screen coordinates, and for a windowless event `-locationInWindow`
+    /// answers that screen point. With the window pinned to the screen origin
+    /// (`resumed`), window point `(x, y)` is CG point `(x, height - y)`.
     ///
     /// # Safety
     /// `kind` must be a CG mouse type.
@@ -595,8 +545,8 @@ mod macos {
         }
     }
 
-    /// A bare `CGEvent` retyped — how the gesture family is built here. Nil
-    /// when `+eventWithCGEvent:` refuses the type; the caller says so.
+    /// A bare `CGEvent` retyped: the gesture family and the CG enter/exit shapes.
+    /// Nil when `+eventWithCGEvent:` refuses the type; the caller says so.
     unsafe fn cg_typed(kind: usize) -> Id {
         // SAFETY: as `cg_mouse`.
         unsafe {
@@ -615,7 +565,7 @@ mod macos {
     unsafe fn send_v_id(target: Id, s: Sel, arg: Id) {
         // SAFETY: the caller pins the prototype.
         unsafe {
-            let f: unsafe extern "C-unwind" fn(Id, Sel, Id) = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
             f(target, s, arg);
         }
     }
@@ -627,7 +577,7 @@ mod macos {
     unsafe fn send_b_id(target: Id, s: Sel, arg: Id) -> Bool {
         // SAFETY: the caller pins the prototype.
         unsafe {
-            let f: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Bool = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Bool = checked_msg();
             f(target, s, arg)
         }
     }
@@ -639,7 +589,7 @@ mod macos {
     unsafe fn send_id(target: Id, s: Sel) -> Id {
         // SAFETY: the caller pins the prototype.
         unsafe {
-            let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             f(target, s)
         }
     }
@@ -651,7 +601,7 @@ mod macos {
     unsafe fn send_isize(target: Id, s: Sel) -> isize {
         // SAFETY: the caller pins the prototype.
         unsafe {
-            let f: unsafe extern "C-unwind" fn(Id, Sel) -> isize = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> isize = checked_msg();
             f(target, s)
         }
     }
@@ -660,7 +610,7 @@ mod macos {
     unsafe fn event_type(ev: Id) -> usize {
         // SAFETY: `-type` is `Q@:` and valid for every event.
         unsafe {
-            let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = checked_msg();
             f(ev, sel!(type))
         }
     }
@@ -668,12 +618,10 @@ mod macos {
     // --------------------------------------------------------------- control
 
     aterm_objc::declare_class! {
-        /// The controls' class: `poke:` makes the v0.72.0 send — a key-only
-        /// accessor on whatever event arrived — inside the same
-        /// `declare_class!` trampoline the ported view's rows run under;
-        /// `panicInside` panics in Rust under that same trampoline; `alive`
-        /// is the later send that proves the object and the runtime are still
-        /// usable after a containment.
+        /// The controls' class: `poke:` sends a key-only accessor to whatever event
+        /// arrived, inside the same `declare_class!` trampoline the view's rows run
+        /// under; `panicInside` panics in Rust there; `alive` is the later send that
+        /// proves the object and runtime survive a containment.
         struct EventDriveControl: NSObject {
             const NAME: &str = "ATermObjcEventDriveControl";
             type Ivars = ();
@@ -683,7 +631,7 @@ mod macos {
                 // SAFETY: `-keyCode` is `S@:`; whether the receiver ACCEPTS it
                 // is the whole question, and AppKit answers by raising.
                 let code: u16 = unsafe {
-                    let f: unsafe extern "C-unwind" fn(Id, Sel) -> u16 = msg();
+                    let f: unsafe extern "C-unwind" fn(Id, Sel) -> u16 = checked_msg();
                     f(event, sel!(keyCode))
                 };
                 println!("control: -keyCode on a MouseMoved event answered {code}");
@@ -701,13 +649,10 @@ mod macos {
         }
     }
 
-    /// The child half of the controls, chosen by [`CONTROL_ENV`]'s value.
-    ///
-    /// The exception control makes the v0.72.0 send and then a second send on
-    /// the same object; it reports both on stdout and exits `0`, with the
-    /// containment line on stderr from `aterm_objc`'s default sink. The panic
-    /// control panics inside the trampoline; the parent expects never to read
-    /// its report, because the process must have died by `SIGABRT` first.
+    /// The child half of the controls, chosen by [`CONTROL_ENV`]'s value. The
+    /// exception control makes the wrong-type send, then a second send on the same
+    /// object, reports both on stdout and exits `0` (the containment line is on
+    /// stderr). The panic control's report is never read: the process must abort first.
     pub fn control_child() -> i32 {
         let mode = std::env::var(CONTROL_ENV).unwrap_or_default();
         trap::install();
@@ -869,7 +814,7 @@ mod macos {
         pending: Option<Deferred>,
         /// Rows actually entered with an event.
         driven: usize,
-        /// Rows this file could not drive, each with the measured reason.
+        /// Rows this file could not drive, each with the reason.
         not_driven: Vec<String>,
     }
 
@@ -900,9 +845,8 @@ mod macos {
             events.iter().filter(|e| e.as_str() == name).count()
         }
 
-        /// Enter one row with one event and log the survival. `None` for the
-        /// event means the shape could not be built, which is logged as NOT
-        /// DRIVEN and counted against the run.
+        /// Enter one row with one event and log the survival. A nil event means the
+        /// shape could not be built, which is logged as NOT DRIVEN and fails the run.
         fn drive(&mut self, view: Id, row: Sel, row_name: &str, event: Id, shape: &str) {
             if event.is_null() {
                 let why = format!("{row_name} <- {shape}: the event could not be built");
@@ -958,21 +902,17 @@ mod macos {
                     return;
                 }
             }
-            // A CG-backed event has no window, so `-locationInWindow` answers
-            // SCREEN coordinates, which `mouse_motion` then converts as if they
-            // were window coordinates. Pin the window's frame to the screen
-            // origin so the two coordinate systems coincide over the content
-            // view and the CG shape lands in-frame exactly like the factory
-            // shape does (the first exact-count run measured 1 of 2 CursorMoved
-            // before this: the CG send fell outside the view and took
-            // `mouse_motion`'s early return).
+            // A CG-backed event has no window, so `-locationInWindow` answers screen
+            // coordinates, which `mouse_motion` treats as window ones. Pinning the
+            // window to the screen origin makes the two coincide over the view, so the
+            // CG shape lands in-frame like the factory shape.
             if let Some(view) = self.view() {
                 // SAFETY: `-window` is `@@:` on NSView; `-setFrameOrigin:` is
                 // `v@:{CGPoint=dd}` on NSWindow.
                 unsafe {
                     let win = send_id(view, sel!(window));
                     if !win.is_null() {
-                        let f: unsafe extern "C-unwind" fn(Id, Sel, CGPoint) = msg();
+                        let f: unsafe extern "C-unwind" fn(Id, Sel, CGPoint) = checked_msg();
                         f(win, sel!(setFrameOrigin:), CGPoint { x: 0.0, y: 0.0 });
                     }
                 }
@@ -1138,11 +1078,9 @@ mod macos {
                     );
                 }
                 ControlOutcome::Exited(Some(code), out, err) if code == ABORTED => {
-                    // Exit 3 alone is not enough: the trap converts ANY fatal
-                    // signal after `set_row`, so a child that faulted in class
-                    // registration or in the event factory would also answer
-                    // 3. The trap's line names the signal and the row; require
-                    // the v0.72.0 shape exactly.
+                    // The trap turns any fatal signal after `set_row` into 3, a fault in
+                    // class registration or the factory included, so require the trap's
+                    // line to name signal 6 and the control row.
                     let last = out.trim().lines().last().unwrap_or("").to_owned();
                     self.report.expect(
                         "the panic control aborted (SIGABRT) inside the trampoline",
@@ -1180,7 +1118,7 @@ mod macos {
             }
         }
 
-        /// THE ROW THAT KILLED v0.72.0, first and on its own.
+        /// `mouseMoved:`, first and on its own.
         fn stage_mouse_moved(&mut self, view: Id, win: isize) {
             println!("\n=== 2. mouseMoved: — the v0.72.0 row ===");
             let _ = self.drain();
@@ -1490,12 +1428,9 @@ mod macos {
                 up,
                 "FlagsChanged/factory release",
             );
-            // THE SECOND WRONG-TYPE SEND (fixed after v0.72.0): `cancelOperation:`
-            // reads `-[NSApplication currentEvent]`, which is whatever the run
-            // loop last dequeued — here, as when AppKit sends it through the
-            // responder chain from a Touch Bar or an accessibility action,
-            // NOT a key event and possibly nil. The row must return, not
-            // assert on nil or send a key-only accessor to it.
+            // `cancelOperation:` reads `-[NSApplication currentEvent]`, whatever the run
+            // loop last dequeued: as from a Touch Bar or accessibility action, not a key
+            // event and possibly nil. The row must return, not send a key-only accessor.
             trap::set_row("cancelOperation: <- (currentEvent as the run loop left it)");
             // SAFETY: `cancelOperation:` is registered `v@:@`; its argument
             // is the sender, which the row ignores.
@@ -1540,7 +1475,7 @@ mod macos {
                 return;
             };
             // SAFETY: each type into the factory that accepts it; nil from a
-            // refusing factory is reported as NOT DRIVEN by `send`.
+            // refusing factory is reported as NOT DRIVEN below.
             let shapes: Vec<(&str, Id)> = unsafe {
                 vec![
                     ("MouseMoved/factory", mouse_event(MOUSE_MOVED, p, win, 0)),
@@ -1623,12 +1558,10 @@ mod macos {
         }
     }
 
-    /// Drive the loop until every stage has run, then report.
-    /// A row that never returns — a deadlock inside a trampoline, a modal
-    /// tracking loop entered from a button row — would otherwise sit inside
-    /// `about_to_wait` forever: `BUDGET` is only consulted between pumps. This
-    /// thread turns that into the same finding as an abort: it names the row
-    /// through the trap's buffer and leaves with exit 3.
+    /// A row that never returns (a deadlock in a trampoline, a modal tracking loop
+    /// entered from a button row) would sit inside `about_to_wait` forever, since
+    /// `BUDGET` is consulted only between pumps; this thread names the row through the
+    /// trap's buffer and exits 3.
     fn arm_hang_watchdog() {
         std::thread::Builder::new()
             .name("objc-event-drive-hang".into())
@@ -1691,9 +1624,8 @@ mod macos {
         for why in &driver.not_driven {
             println!("  NOT DRIVEN: {why}");
         }
-        // Every shape this file builds was constructible when it was written;
-        // one that no longer is is a change in AppKit this file must be
-        // re-read for.
+        // Every shape this file builds is expected to be constructible; one that
+        // is not means AppKit changed and this file must be re-read.
         if !driver.not_driven.is_empty() {
             driver.report.fail(format!(
                 "{} entries were not driven; every row is expected to be",

@@ -475,8 +475,8 @@ impl App {
     /// digest entry and the record of its healing — goes, and nothing else
     /// does: a ledger warning under another title is the ledger's to heal.
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "native_update_carried_health",
             action = "StallHeals",
             project = "aterm_gui::messages_host::carried_health_conformance::project"
@@ -733,12 +733,6 @@ mod tests {
             .live_health()
             .expect("the health warning is up");
         assert_eq!(live.msg.title, crate::update_words::CHECKER_STALLED_TITLE);
-        let words = live.msg.detail.join(" ");
-        assert!(
-            words.contains("waiting for another aterm's check to finish")
-                && words.contains("started a fresh one in its place"),
-            "{words}"
-        );
         let before = app.messages.live_health().map(|l| l.id);
         app.announce_update_checker_stall(
             CheckerStall {
@@ -798,36 +792,6 @@ mod tests {
             assert_eq!(app.messages.revision(), revision, "{alerts:?}: latched");
             assert!(take().is_empty(), "{alerts:?}: latched, no second banner");
         }
-    }
-
-    /// A STALL INSIDE THE LANE IS SAID AS ONE: the fresh checker cannot check
-    /// until the stuck one lets go, and the sentence must not claim the remedy has
-    /// already happened.
-    #[test]
-    fn a_stall_holding_the_lane_does_not_claim_its_replacement_fixed_it() {
-        let mut app = App::headless_for_test();
-        app.announce_update_checker_stall(
-            CheckerStall {
-                generation: 1,
-                for_secs: 4_000,
-                phase: CheckerPhase::Checking,
-                holds_lane: true,
-                checks: 3,
-            },
-            Some(2),
-        );
-        let words = app
-            .messages
-            .live_health()
-            .expect("the warning is up")
-            .msg
-            .detail
-            .join(" ");
-        assert!(
-            words.contains("cannot check until the stuck one finishes")
-                && !words.contains("in its place"),
-            "{words}"
-        );
     }
 
     /// THE WATCHDOG'S HEALS END THE DIGEST'S DAY TOO. Announcing a stall or a

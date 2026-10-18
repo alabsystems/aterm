@@ -201,7 +201,7 @@ pub enum BlockFillOwner {
     /// [`crate::cursor_droplet`] — the `water` style's liquid block.
     Droplet,
     /// [`crate::cursor_beam`] — the emitter block the styles with no bespoke
-    /// body wear (`beam`, `lumen`, `sparkle`, trail packs).
+    /// body wear (`beam`, `lumen`, `sparkle`).
     BeamRod,
     /// The typing-momentum glow's warm tint (`crate::cursor_momentum`), lowest
     /// precedence: it paints only a caret no style body is painting.
@@ -607,21 +607,6 @@ impl CursorGlow {
     #[must_use]
     pub fn v2_status(&self) -> Option<rk::Status> {
         self.v2.engaged().then(|| self.v2.status())
-    }
-
-    /// Arm or disarm Rainbow Kitty v2's hole tripwire (`rainbow_kitty/holes.rs`), a
-    /// development trace: the host that arms it (`aterm-gui`, under the
-    /// `ATERM_TRACE_TRAIL_HOLES` seam) drains [`Self::drain_trail_holes`] every frame.
-    /// Idempotent; the engine senses only while v2 is engaged.
-    pub fn trace_trail_holes(&mut self, on: bool) {
-        self.v2.trace_holes(on);
-    }
-
-    /// The hole tripwire's records since the last drain, oldest first (each one or
-    /// more lines, the first starting `== trail hole`); empty unless
-    /// [`Self::trace_trail_holes`] armed it.
-    pub fn drain_trail_holes(&mut self) -> impl Iterator<Item = String> + '_ {
-        self.v2.drain_hole_records()
     }
 
     /// Whether the key seam is open: would a keypress on this engine's window

@@ -1,0 +1,19 @@
+# claude-code 2.1.300 · HAND-BUILT 2026-10-15 (no live capture yet): 2.1.300's inline plan approval in a 140-column pane, the geometry claude-2.1.300-plan-approval-60col.txt re-wraps (`rewrap_box`): `Ready to code?` and the plan under the first rule, the question under the second, the three numbered options (no descriptions: `· shift+tab to approve with this feedback` is the third label's own) and the `ctrl+g to edit in Vim · <plan>` hint, nothing wrapped
+⏺ Working on it.
+  ⎿  (tool output)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Ready to code?
+
+ Here is Claude's plan:
+
+   1. Do the thing
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Claude has written up a plan and is ready to execute. Would you like to proceed?
+
+ ❯ 1. Yes, and use auto mode
+   2. Yes, manually approve edits
+   3. No, keep planning · shift+tab to approve with this feedback
+
+ ctrl+g to edit in Vim · ~/.claude/plans/staged-sniffing-newell.md

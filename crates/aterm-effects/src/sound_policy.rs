@@ -170,29 +170,19 @@ pub fn fold_window_audibility(
 mod sing_riff_gain_tests {
     use super::sing_riff_gain;
 
-    /// The riff's own switch is independent of the trail-sound master: with
-    /// the master on, the window focused and the volume up (asserted as a
-    /// precondition so the `None` cases cannot pass vacuously), flipping
-    /// `trail_sound_riff` off is the single change that silences the song.
+    /// The riff's own switch is independent of the trail-sound master, and
+    /// every other term of the trail-sound law still applies to the riff, so
+    /// the switch is not a bypass. Each `None` case flips exactly one term away
+    /// from the singing precondition, asserted first so they cannot pass
+    /// vacuously.
     #[test]
-    fn the_riff_switch_alone_silences_the_song_under_shipped_defaults() {
+    fn the_riff_switch_silences_the_song_and_stays_under_focus_master_and_volume() {
         assert_eq!(
             sing_riff_gain(true, true, true, 0.4),
             Some(0.4),
             "precondition: the shipped default posture must actually sing",
         );
-        assert_eq!(
-            sing_riff_gain(true, true, false, 0.4),
-            None,
-            "trail_sound_riff = false must silence the riff on its own",
-        );
-    }
-
-    /// Every other term of the trail-sound law still applies to the riff, so
-    /// the switch is not a bypass. Each case flips exactly one term away from
-    /// the singing precondition.
-    #[test]
-    fn the_riff_stays_subordinate_to_focus_master_and_volume() {
+        assert_eq!(sing_riff_gain(true, true, false, 0.4), None, "riff switch");
         assert_eq!(sing_riff_gain(false, true, true, 0.4), None, "raw focus");
         assert_eq!(sing_riff_gain(true, false, true, 0.4), None, "trail_sounds");
         assert_eq!(sing_riff_gain(true, true, true, 0.0), None, "volume");
@@ -334,10 +324,10 @@ pub fn drain_trail_sound_cues(
 /// `trail_sound_volume`. Per-class and master sparkle gates need no
 /// re-check: the engine records cues only for words it decorates.
 ///
-/// The bonk is a synth voice, so the master gates it as the Sound box's
-/// footnote (`prefs::group_footnote`, "Sound") promises; the terminal bell
-/// (`lib.rs::on_bell`) is the one stated exception. The focus, master and
-/// volume terms delegate to [`trail_sound_gain`], as [`sing_riff_gain`] does.
+/// The bonk is a synth voice, so the master gates it as the Sound rows' shared
+/// note (`prefs::SOUND_NOTE`) promises; the terminal bell (`lib.rs::on_bell`)
+/// is the one stated exception. The focus, master and volume terms delegate
+/// to [`trail_sound_gain`], as [`sing_riff_gain`] does.
 pub fn bonk_sound_gain(
     raw_focused: bool,
     trail_sounds: bool,
@@ -455,8 +445,8 @@ mod bonk_gain_tests {
             None,
             "raw focus"
         );
-        // The master switch gates the bonk, as `prefs::group_footnote`
-        // ("Sound") promises; the bonk knob stays on so nothing else mutes it.
+        // The master switch gates the bonk, as `prefs::SOUND_NOTE` promises;
+        // the bonk knob stays on so nothing else mutes it.
         assert_eq!(
             bonk_sound_gain(true, false, true, false, 0.4),
             None,

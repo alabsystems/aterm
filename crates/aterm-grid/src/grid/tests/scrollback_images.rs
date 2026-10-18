@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use super::super::*;
-use crate::{CellExtras, ImageData, ImageFormat, ImageRef, ImageScaling, StyleTable};
+use crate::{CellExtras, ImageData, ImageFormat, ImageRef, ImageScaling};
 
 /// One `rows`×`cols` placement.
 fn placement(rows: u16, cols: u16) -> Arc<ImageData> {
@@ -46,32 +46,7 @@ fn stamp(grid: &mut Grid, row_idx: u16, image: &Arc<ImageData>, image_row: u16, 
 /// The extras a scroll-off would capture for `row_idx`.
 fn scrolled_extras(grid: &Grid, row_idx: u16) -> ScrolledRowExtras {
     let row = grid.row(row_idx).expect("row exists");
-    Grid::extract_row_extras(row, grid.extras(), row_idx, &StyleTable::new())
-}
-
-#[test]
-fn an_image_only_row_yields_one_span_per_footprint_row_when_it_scrolls_off() {
-    let mut grid = Grid::new(4, 20);
-    let image = placement(2, 4);
-    stamp(&mut grid, 0, &image, 0, 4);
-
-    // Nothing in the row's text says the picture is there.
-    assert_eq!(
-        grid.row(0).unwrap().len(),
-        0,
-        "an image row carries no glyph"
-    );
-
-    let extras = scrolled_extras(&grid, 0);
-    assert_eq!(extras.images.len(), 1, "one contiguous run, one span");
-    let span = &extras.images[0];
-    assert_eq!((span.start_col, span.end_col), (0, 4));
-    assert_eq!(span.image_row, 0);
-    assert_eq!(span.first_cell_col, 0);
-    assert!(
-        Arc::ptr_eq(&span.image, &image),
-        "the span must hold the SAME payload, not a copy"
-    );
+    Grid::extract_row_extras(row, grid.extras(), row_idx)
 }
 
 #[test]

@@ -31,10 +31,6 @@ pub mod animal_baker;
 pub mod animal_glyphs_gen {
     include!("animal_glyphs_gen.rs");
 }
-/// Test-only: exact-bit pins asserted on every target but x86_64 macOS, where
-/// they are reported instead.
-#[cfg(test)]
-mod arm64_pin;
 pub mod cat_baker;
 /// The cat-art codegen (docs/cat-art-v4-design.md §1): turns the semantic glyph
 /// asset TOMLs into the checked-in [`cat_glyphs_gen`] const drawlists.
@@ -55,7 +51,7 @@ pub mod companion;
 /// kitty), one [`companion_look::LookPolicy`] per window.
 pub mod companion_look;
 /// The companions a window keeps beside its resident pet: the flying head,
-/// the sing-along, the typed-word detectors, the typed dog and Robi
+/// the sing-along, the typed-word detectors and the typed dog
 /// ([`companions::Companions`]).
 pub mod companions;
 /// The dog roster's bake path: one authored breed head to an exact-size RGBA
@@ -110,7 +106,6 @@ pub mod kitty_sing;
 /// Log sighting, a curse winces the companion, and `dog` past the typed-a-lot
 /// gate pops a visiting dog — fed from the host's key path, never the screen.
 pub mod kitty_summon;
-pub mod matrix_overlay;
 pub mod matrix_rain;
 /// Motion policy: the single accessibility gate for decorative animation,
 /// resolving `motion`, the OS Reduce Motion flag and focus to an amplitude.
@@ -134,28 +129,17 @@ pub mod pet_world;
 pub mod pet_glyphs_gen {
     include!("pet_glyphs_gen.rs");
 }
+pub mod cursor_momentum;
 pub mod pane;
 pub mod pipeline;
 /// Rainbow kitty, the `rainbow kitty` cursor theme with pixels and sound as one
 /// design (`docs/design/RAINBOW-KITTY-V2.md`). [`rainbow_kitty::Engine`] is what
 /// `CursorGlow` delegates to at its seam points; other styles are unaffected.
 pub mod rainbow_kitty;
-/// Robi, the chrome-walking helper robot: walks the prompt line, climbs a
-/// ladder, swings the tab bar, does jumping jacks and hands out tips.
-pub mod robi;
-/// The Robi roster's bake path: one robot pose to an exact-size RGBA tile,
-/// handed to the shared cat atlas through `CatBaker::host_tile`.
-pub mod robi_baker;
 /// Sound-cue policy: the gain laws (focus, music master, volume, per-cue
 /// switches) and the drains that turn engine cues into synth events. The sink
 /// is the host's.
 pub mod sound_policy;
-/// `@generated` Robi drawlists; regenerate with `targo --unverified run -p aterm-effects
-/// --example gen_robi_glyphs` (drift test `robi_glyphs_gen_matches_assets`).
-pub mod robi_glyphs_gen {
-    include!("robi_glyphs_gen.rs");
-}
-pub mod cursor_momentum;
 pub mod spec;
 /// The rainbow family's colour law (`docs/design/RAINBOW-TRAIL-ONE-STORY.md` §2):
 /// a monotone C¹ hue curve through seven named stops at one relative luminance,
@@ -170,11 +154,6 @@ pub mod tone;
 /// The tone-of-typing tracker: the typed-line window and the throttled
 /// classifier cache whose verdict rides the trail's sound events.
 pub mod tone_infer;
-/// Trail Packs — user-generated cursor trails compiled from bounded, fail-closed
-/// TOML into the `Copy` [`trail_pack::TrailParams`] the cursor-glow engine's
-/// custom interpreter drives (`docs/trail-packs.md`). The strict
-/// contribution twin of the sparkle [`spec`] Toy Pack lane.
-pub mod trail_pack;
 pub mod trail_sound;
 pub mod trail_sweep;
 /// Kitty-command word flash: the word just typed to the pet turns rainbow for
@@ -186,3 +165,12 @@ mod trick_flash;
 pub mod typed_tricks;
 pub mod typing_momentum;
 pub mod word_decorations;
+
+// These conformances need the implementation's cfg(test) model anchors in
+// the same binary. Keep them unit modules instead of flipping library features.
+#[cfg(test)]
+#[path = "../tests/conformance_trick_flash.rs"]
+mod conformance_trick_flash;
+#[cfg(test)]
+#[path = "../tests/conformance_trick_listener.rs"]
+mod conformance_trick_listener;

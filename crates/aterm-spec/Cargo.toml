@@ -14,11 +14,16 @@ description = "TLA+ specification coverage tracking for aterm verification"
 autotests = false
 
 [dependencies]
-# The authoring macros (`ty_model!`, `#[refines]`, ...), a proc macro. Behind
+# The authoring macros (`ty_model!`, `#[model]`, `#[liveness]`), a proc macro. Behind
 # `anchors` so `-p aterm-spec`'s lib closure holds no proc macro and Trust's
 # loader admits it (PM-1, docs/PLAN-pm1-proc-macro-reach-2026-10-16.md); the
 # workspace row turns `anchors` on, so every consumer keeps them.
 aterm-spec-macros = { workspace = true, optional = true }
+# The anchor half (the registry, the anchor records, the entered-anchor record),
+# re-exported as `aterm_spec::{registry, xref}` so there is one registry. A path
+# row, not the workspace one (which turns the anchor macros on): here they
+# follow `anchors`.
+aterm-spec-anchor = { path = "../aterm-spec-anchor" }
 # The `ty` co-process protocol (`verify::ty_trace_verdict`'s `--cases` pool and
 # the `ty capabilities --json` probe) is one JSON object per line; first-party,
 # serde its only dependency (docs/design/TY-TRACE-CASES-AND-FAIL-CLOSED-2026-10-01.md §9.10).
@@ -40,12 +45,11 @@ libc.workspace = true
 # A feature, not an environment variable: nothing a process inherits changes a
 # plain run's verdict.
 checkers = []
-# Re-export the authoring macros and build the `ty_model!`-written model catalog
-# (`derive::*_model`) on them. On through the workspace row.
-anchors = ["dep:aterm-spec-macros"]
+# Re-export the authoring and anchor macros. On through the workspace row.
+anchors = ["dep:aterm-spec-macros", "aterm-spec-anchor/macros"]
 
 [dev-dependencies]
-# The tests use the macros and the catalog.
+# The tests use the macros.
 aterm-spec = { path = ".", features = ["anchors"] }
 # Scratch HOME/prefix trees removed on drop.
 aterm-tempfile.workspace = true
@@ -53,22 +57,8 @@ aterm-tempfile.workspace = true
 [lints]
 workspace = true
 
-# The checker run (`aterm_spec::check`): the obligations only `ty`, `ay` and
-# `trust-ir` discharge, run on purpose. Dev-only; nothing ships it.
-[[bin]]
-name = "spec-check"
-path = "src/bin/spec-check.rs"
-test = false
-required-features = ["anchors"]
-
 # ---- integration tests (autotests = false above) ----------------------------
 
 [[test]]
 name = "spec_suite"
 path = "tests/spec_suite.rs"
-
-# Its own binary: the registry it sweeps is exactly the models aterm-spec
-# defines, without the fixtures the suite's files write.
-[[test]]
-name = "non_vacuity"
-path = "tests/non_vacuity.rs"

@@ -471,23 +471,32 @@ fn trailer(st: &SessionState, now: u64) -> (Vec<String>, Vec<String>) {
         })
         .collect();
     let mut claims = Vec::new();
-    if let Some(v) = &st.verdict
-        && let Some(w) = v.word
-    {
-        claims.push(format!(
-            "claim verdict {w} by={} {} ago [?]",
-            v.by.word(),
-            ago(v.t)
-        ));
+    // The newest proven verdict (the harness's), the newest trusted one
+    // (the owner class, `ctl` among it) when it is another, then the newest
+    // of any author when that is yet another: no `ctl` client — the agent
+    // the harness judges is one — and no other author displaces the
+    // harness's verdict here (phase 3A ruling R13; `fold::shown_verdicts`).
+    for v in crate::fold::shown_verdicts(st) {
+        if let Some(w) = v.word {
+            claims.push(format!(
+                "claim verdict {w} by={}{} {} ago [?]",
+                v.by.word(),
+                claim_refs(v),
+                ago(v.t)
+            ));
+        }
     }
-    if let Some(l) = &st.label
-        && l.until.is_some_and(|u| u > now)
+    // A label only from the harness, else the owner class (§7.3, D6;
+    // `fold::shown_label`, the clause's own rule): another author's stays in
+    // the ring and in `log`, never put in front of a reader here.
+    if let Some(l) = crate::fold::shown_label(st, now)
         && let Some(text) = &l.text
     {
         claims.push(format!(
-            "claim label {} by={} {} ago [?]",
+            "claim label {} by={}{} {} ago [?]",
             pct::encode(text),
             l.by.word(),
+            claim_refs(l),
             ago(l.t)
         ));
     }
@@ -500,6 +509,20 @@ fn trailer(st: &SessionState, now: u64) -> (Vec<String>, Vec<String>) {
         ));
     }
     (needs, claims)
+}
+
+/// A claim's ` as=<pct>` (the name its author declared, never `by=`) and
+/// ` re=<id>`, each when it has one.
+fn claim_refs(c: &crate::fold::Claim) -> String {
+    let mut s = String::new();
+    if let Some(a) = &c.as_name {
+        s.push_str(" as=");
+        pct::encode_into(&mut s, a);
+    }
+    if let Some(re) = &c.re {
+        let _ = write!(s, " re={re}");
+    }
+    s
 }
 
 /// The `gap` line for the gap a read crossed.
@@ -743,6 +766,13 @@ impl crate::log::Log {
     #[must_use]
     pub fn brief(&self, sid: &str, budget: usize, now_wall: u64) -> Brief {
         let read = self.read(Cursor::new(self.ep(), 0), usize::MAX);
-        brief(sid, read.recs, read.gap, self.state(), budget, now_wall)
+        brief(
+            sid,
+            read.recs,
+            read.gap,
+            self.reader_state(),
+            budget,
+            now_wall,
+        )
     }
 }

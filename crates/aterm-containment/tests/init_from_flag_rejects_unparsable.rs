@@ -16,9 +16,9 @@ fn init_from_flag_rejects_unparsable_values() {
         module_path!(),
         "init_from_flag_rejects_unparsable_values",
         || {
-            for value in ["", "3", "ESCALATE_TO_ROOT"] {
+            for value in ["", "2", "ESCALATE_TO_ROOT"] {
                 let result =
-                    aterm_containment::init_mode_from_flag(Some(value), ContainmentMode::Master);
+                    aterm_containment::init_mode_from_flag(Some(value), ContainmentMode::User);
                 assert!(result.is_err(), "{value:?} must be rejected");
                 assert_eq!(
                     aterm_containment::try_current_mode(),

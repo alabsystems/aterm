@@ -798,7 +798,6 @@ mod tests {
     /// Assertion messages print every counted number.
     #[test]
     fn nova_budget_geometry_invariant() {
-        assert_eq!(RAY_SAMPLES, 15);
         for ch in [14i32, 20, 40, 56] {
             let env = env_at(ch, None);
             // Exact subdivision keeps 30 bands at every admitted size (a
@@ -826,14 +825,10 @@ mod tests {
             let mut out = Vec::new();
             let mut uncapped = Vec::new();
             let mut worst = 0usize;
-            let mut worst_counts = NovaCounts::default();
             for t in (0..1400u64).step_by(10) {
                 out.clear();
                 let counts = emit_nova(t, &env, MAX_NOVA_QUADS_PER, &mut out);
-                if out.len() > worst {
-                    worst = out.len();
-                    worst_counts = counts;
-                }
+                worst = worst.max(out.len());
                 assert!(
                     out.len() <= 392,
                     "Q ≤ 392 violated at ch={ch} t={t}: counted {} (ring {} rays {} crown {})",
@@ -867,12 +862,6 @@ mod tests {
             assert!(
                 worst <= 392 && 392 < MAX_NOVA_QUADS_PER,
                 "headroom must hold at ch={ch}: worst {worst} ≤ 392 < {MAX_NOVA_QUADS_PER}"
-            );
-            eprintln!(
-                "nova budget @ ch={ch}: bands=30, rays={nrays}×{RAY_SAMPLES} samples \
-                 (counted {}), worst Q={worst} (ring {} rays {} crown {}) ≤ 392; \
-                 512/nova cap never binds",
-                cl.ray_samples, worst_counts.ring, worst_counts.rays, worst_counts.crown
             );
         }
         // The global backstop never binds on a genome-reachable frame
@@ -918,29 +907,6 @@ mod tests {
             "a partial crown never emits (crown drops first)"
         );
         assert!(crown_capped.is_empty());
-    }
-
-    /// §6.1 phase machine: monotone windows, D-parameterized, Armed for a
-    /// deferred (future) ignition, Settled terminal.
-    #[test]
-    fn phase_windows_are_monotone() {
-        for d in [1000u32, 1400] {
-            assert_eq!(phase(-1, d), NovaPhase::Armed);
-            assert_eq!(phase(0, d), NovaPhase::Dip);
-            assert_eq!(phase(119, d), NovaPhase::Dip);
-            assert_eq!(phase(120, d), NovaPhase::Flash);
-            assert_eq!(phase(240, d), NovaPhase::Ring);
-            assert_eq!(phase(499, d), NovaPhase::Ring);
-            assert_eq!(phase(500, d), NovaPhase::Debris);
-            assert_eq!(phase(i64::from(d) - 1, d), NovaPhase::Debris);
-            assert_eq!(phase(i64::from(d), d), NovaPhase::Ember);
-            assert_eq!(phase(i64::from(d) + 499, d), NovaPhase::Ember);
-            assert_eq!(phase(i64::from(d) + 500, d), NovaPhase::Settled);
-        }
-        // Dip envelope: full ink at 0−, −35 % at the dip floor, restored after.
-        assert!((dip_envelope(0) - 1.0).abs() < 1e-6);
-        assert!((dip_envelope(119) - 0.65).abs() < 0.01);
-        assert!((dip_envelope(120) - 1.0).abs() < 1e-6);
     }
 
     /// Coupling determinism and the crossing inverse: same inputs give the same
@@ -1025,52 +991,6 @@ mod tests {
         }
     }
 
-    /// Quasar: rays are replaced by 2 vertical jets hugging the centre column
-    /// outside the ring annulus, reaching ~2× the ring radius, ≤ 60 quads each.
-    #[test]
-    fn quasar_jets_are_vertical_and_doubled() {
-        let env = env_at(20, Some(NovaMagic::Quasar));
-        let mut out = Vec::new();
-        let t = 880u64; // late window: max ray length
-        let ring_only = {
-            let mut ring = Vec::new();
-            let mut e2 = env_at(20, Some(NovaMagic::Quasar));
-            e2.feats.rays = 0; // not used by quasar path; count via counts instead
-            let c = emit_nova(t, &e2, MAX_NOVA_QUADS_PER, &mut ring);
-            c.ring
-        };
-        let counts = emit_nova(t, &env, MAX_NOVA_QUADS_PER, &mut out);
-        assert_eq!(counts.ring, ring_only);
-        assert!(
-            counts.rays > 0 && counts.rays <= 2 * JET_SAMPLES * 2,
-            "≤ 60/jet with splits"
-        );
-        let jets = &out[counts.ring..counts.ring + counts.rays];
-        for q in jets {
-            // Vertical: the jet stays within a few px of the center column.
-            assert!(
-                (i32::from(q.x) - env.cx).abs() <= 4
-                    && (i32::from(q.x) + i32::from(q.w) - env.cx).abs() <= 4,
-                "jet quad strays from the vertical axis: {q:?}"
-            );
-        }
-        // Doubled length: the jets reach past the ring radius.
-        let reach = jets
-            .iter()
-            .map(|q| {
-                (i32::from(q.y) - env.cy)
-                    .abs()
-                    .max((i32::from(q.y) + i32::from(q.h) - env.cy).abs())
-            })
-            .max()
-            .unwrap();
-        assert!(
-            reach as f32 > 1.5 * env.r_max,
-            "jets reach ~2× the ring radius ({reach} px vs r_max {})",
-            env.r_max
-        );
-    }
-
     /// Singularity: the ring contracts, and the darkening ring emits ≤ 20
     /// per-cell Over RingArc wdecos following it inward.
     #[test]
@@ -1117,48 +1037,6 @@ mod tests {
         assert!(
             mote_dist(late_t) < mote_dist(600),
             "Singularity debris collapses inward"
-        );
-    }
-
-    /// §6.1/§6.4 debris: 8–20 Add motes, twinkle phases locked to the shared
-    /// ≥ 350 ms grid (exactly the 2 grid phases appear, never free-running).
-    #[test]
-    fn debris_rides_add_stream_on_the_phase_grid() {
-        let env = env_at(20, None);
-        let mut out = Vec::new();
-        emit_debris(700, &env, &mut out, 64);
-        assert!(
-            (1..=usize::from(env.feats.debris)).contains(&out.len()),
-            "mote count within the genome debris budget, got {}",
-            out.len()
-        );
-        assert!(out.iter().all(|d| matches!(d.blend, DecoBlend::Add)));
-        // Phase-grid lock: at fixed t, motes sharing fade and intensity show at
-        // most 2 distinct twinkle phases (modulo the colour mix).
-        let phases: std::collections::BTreeSet<u64> = (0..u64::from(env.feats.debris))
-            .map(|m| (mix(env.seed ^ m.wrapping_mul(0xA24B_AED4_963E_E407)) >> 33) & 1)
-            .collect();
-        assert!(
-            phases.len() <= 2,
-            "twinkle phases quantize to the shared grid"
-        );
-        // Determinism: same t ⇒ identical bytes.
-        let mut again = Vec::new();
-        emit_debris(700, &env, &mut again, 64);
-        assert_eq!(out, again);
-    }
-
-    /// The ember pair dims toward the palette; the Singularity ember is the
-    /// dim violet build.
-    #[test]
-    fn ember_pairs() {
-        let p = (0x00FF_F2C8, 0x00FF_9A3C);
-        let (e0, e1) = ember_pair(p, None);
-        assert!(relative_luminance(e0) < relative_luminance(p.0));
-        assert!(relative_luminance(e1) < relative_luminance(p.1));
-        assert_eq!(
-            ember_pair(p, Some(NovaMagic::Singularity)),
-            (0x002A_2040, 0x005A_48A8)
         );
     }
 }

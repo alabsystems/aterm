@@ -148,6 +148,10 @@ pub enum Hand {
     DrivenLease {
         /// The lease's holder name.
         holder: String,
+        /// The kernel's pid of the process that took the lease (the peer of
+        /// the connection the acquire came on), `None` where the host could
+        /// not attest one. The name is the taker's own spelling; this is not.
+        pid: Option<u32>,
     },
     /// This session drives another: its own open `turn` on a peer whose
     /// lease names it; `sid` is the peer's short form.
@@ -171,20 +175,32 @@ impl Hand {
                 id,
                 holder: Some(h),
             } => format!("turn:{id}:{}", V::pct_encode(h)),
-            Self::DrivenLease { holder } => format!("lease:{}", V::pct_encode(holder)),
+            Self::DrivenLease { holder, .. } => format!("lease:{}", V::pct_encode(holder)),
             Self::Driving { sid } => format!("driving:{}", V::pct_encode(sid)),
+        }
+    }
+
+    /// The `status hand_pid=` token: the kernel-attested pid of a drive
+    /// lease's taker ([`Self::DrivenLease`]), `-` for anything else (no hand,
+    /// a `turn`, a lease whose taker no kernel named).
+    #[must_use]
+    pub fn pid_wire(&self) -> String {
+        match self {
+            Self::DrivenLease { pid: Some(pid), .. } => pid.to_string(),
+            _ => "-".to_string(),
         }
     }
 }
 
 /// Whether `hand` is this process's own harness: a drive lease under the
-/// holder name its supervisor loops claim sessions by
-/// ([`Host::is_aterms_holder`]). Another instance's harness, a manager
-/// session or an `aterm drive` is somebody else's hand, a fact the window
+/// holder name its supervisor loops claim sessions by, TAKEN BY this process
+/// as the kernel attests it ([`Host::is_aterms_holder`]). Another instance's
+/// harness, a manager session, an `aterm drive`, or a client that spelled
+/// aterm's holder name itself is somebody else's hand, a fact the window
 /// shows.
 #[must_use]
 pub(crate) fn is_aterms_hand<V: Host>(hand: &Hand) -> bool {
-    matches!(hand, Hand::DrivenLease { holder } if V::is_aterms_holder(holder))
+    matches!(hand, Hand::DrivenLease { holder, pid } if V::is_aterms_holder(holder, *pid))
 }
 
 /// The standing halt, as the row prints it.
@@ -344,6 +360,23 @@ pub struct Facts<V: Host> {
     /// Read every refresh: a claim that arrives or lapses moves it without a
     /// new agent reading.
     pub wall_answer: WallAnswer,
+    /// How many times the program in front has reported its own turn ending
+    /// (OSC 7501 `working` → `done`|`idle`, the host's gate counting what it
+    /// honoured). Each new one is a story point ([`StoryVerb::ProgramDone`]):
+    /// the tab's dot says a background codex finished. Display only; nothing
+    /// decides on it.
+    pub program_turn_ends: u64,
+    /// The session is in front of a window the person has focused, so a turn
+    /// end it reports ([`Self::program_turn_ends`]) happens in plain sight: it
+    /// joins the story without being news. Raising the row for it would
+    /// re-grid the program as its turn ends and again at the next key.
+    pub program_turn_watched: bool,
+    /// How many turns the program in front has begun by its own report (OSC
+    /// 7501 `working` after no turn in progress, as the host's gate showed
+    /// it). What tells one driven turn's two ends apart from two turns: a
+    /// [`Self::program_turn_ends`] and a ledger settle ([`Self::turn`]) read
+    /// at the same count are the same turn, whichever refresh reads which.
+    pub program_turn_starts: u64,
 }
 
 impl<V: Host> Default for Facts<V> {
@@ -366,8 +399,35 @@ impl<V: Host> Default for Facts<V> {
             turn: None,
             input_stall: None,
             wall_answer: WallAnswer::Nobody,
+            program_turn_ends: 0,
+            program_turn_watched: false,
+            program_turn_starts: 0,
         }
     }
+}
+
+/// Which of a driven turn's two ends was told ([`Slot::absorb`]): the
+/// ledger's settle, or the program's own report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TurnEnd {
+    Settle,
+    Done,
+}
+
+/// The one turn end told and not yet paired ([`Slot::absorb`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ToldEnd {
+    /// Which end it was.
+    end: TurnEnd,
+    /// The program's turn-start count it was read at
+    /// ([`Facts::program_turn_starts`]).
+    starts: u64,
+    /// When it was told: a program end told before the ledger turn it would
+    /// pair with had opened is an earlier turn's, never this one's.
+    at: Instant,
+    /// The story point it was told as, and whether that point was news.
+    seq: u64,
+    news: bool,
 }
 
 /// What a story point says happened.
@@ -375,6 +435,11 @@ impl<V: Host> Default for Facts<V> {
 pub enum StoryVerb {
     /// A turn settled.
     Turn,
+    /// The program in front reported its own turn ended (OSC 7501 `working`
+    /// → `done`|`idle`): counted with the turns, and never told beside the
+    /// ledger settle of the same turn, whichever refresh reads which first
+    /// ([`Facts::program_turn_starts`]).
+    ProgramDone,
     /// A turn whose settle deadline passed (`status=timeout` on the ledger):
     /// counted with the turns, and said — a busy worker with a timed-out turn
     /// never reads `◇ quiet`.
@@ -459,6 +524,7 @@ impl StoryVerb {
             // solid twin of the quiet summary's `◇`.
             Self::Chose => ('\u{25c6}', "chose"),
             Self::Turn
+            | Self::ProgramDone
             | Self::TurnTimedOut
             | Self::Mail
             | Self::Hold
@@ -484,6 +550,7 @@ impl StoryVerb {
             | Self::Exit
             | Self::Warned
             | Self::Turn
+            | Self::ProgramDone
             | Self::TurnTimedOut
             | Self::Mail
             | Self::Hold
@@ -555,6 +622,14 @@ pub struct Slot<V: Host> {
     pub input_stall: Option<V::Stall>,
     /// [`Facts::wall_answer`].
     pub wall_answer: WallAnswer,
+    /// [`Facts::program_turn_ends`], as the last refresh read it.
+    pub program_turn_ends: u64,
+    /// The one turn end told and not yet paired: a ledger settle told as
+    /// [`StoryVerb::Turn`] (`Settle`) or a program turn end told as
+    /// [`StoryVerb::ProgramDone`] (`Done`), with the program's turn-start
+    /// count it was read at ([`Facts::program_turn_starts`]). The other end of
+    /// the same turn, read at the same count, is that turn already told.
+    told_end: Option<ToldEnd>,
     /// When the last turn settled (the start of the Success tone's glow).
     pub settled_at: Option<Instant>,
     /// When a stop (hold or limit) began, for the story's stop duration.
@@ -612,6 +687,8 @@ impl<V: Host> Slot<V> {
             turn: None,
             input_stall: None,
             wall_answer: WallAnswer::Nobody,
+            program_turn_ends: 0,
+            told_end: None,
             settled_at: None,
             stop_began: None,
             baselined: false,
@@ -654,9 +731,17 @@ impl<V: Host> Slot<V> {
     }
 
     fn note(&mut self, verb: StoryVerb, now: Instant) {
+        let _ = self.note_as(verb, now, true);
+    }
+
+    /// Note a point; `news` false keeps it out of the news a level reads (the
+    /// person saw it happen), as aterm's own points are. Returns whether the
+    /// point is news.
+    fn note_as(&mut self, verb: StoryVerb, now: Instant, news: bool) -> bool {
         self.story_seq += 1;
         let aterm = self.noting_aterm || self.aterm_hand;
-        if !aterm {
+        let news = !aterm && news;
+        if news {
             self.news_seq = self.story_seq;
         }
         if self.story.len() >= STORY_CAP {
@@ -668,6 +753,27 @@ impl<V: Host> Slot<V> {
             verb,
             aterm,
         });
+        news
+    }
+
+    /// The second end of a told turn, `news` the news it would have carried
+    /// told alone: the turn is one story point either way, and news when
+    /// either end would have been, whichever was read first. A point already
+    /// news stays it; a retained non-owned point told quietly becomes news at its
+    /// own place. An owned point stays omitted, and a retired point cannot carry news.
+    fn pair_end(&mut self, told: ToldEnd, news: bool) {
+        self.told_end = None;
+        let aterm = self.noting_aterm || self.aterm_hand;
+        if news
+            && !aterm
+            && !told.news
+            && self
+                .story
+                .iter()
+                .any(|point| point.seq == told.seq && !point.aterm)
+        {
+            self.news_seq = self.news_seq.max(told.seq);
+        }
     }
 
     /// Fold one refresh's facts in. Returns whether anything the view reads
@@ -796,6 +902,19 @@ impl<V: Host> Slot<V> {
             self.input_stall = facts.input_stall;
             changed = true;
         }
+        // ONE DRIVEN TURN, TOLD ONCE. A driven codex turn ends twice: the
+        // ledger's settle (`turn`) and the program's own report (OSC 7501
+        // `working` → `done`, `program_turn_ends`), read by different sweeps in
+        // either order. The two pair when no turn of the program's began
+        // between them (the same `program_turn_starts`) and, read program end
+        // first, when that end was told no earlier than the ledger turn opened
+        // (its settle less its `dur_ms`): an end left from the person's own
+        // turn is not a driven turn's that the program never worked on. The
+        // second is that turn already told, and makes it news if it would have
+        // been (`pair_end`), so the order of the reads changes neither the
+        // count nor the level. Only a SETTLE pairs: a timed-out or hung-up
+        // turn is its own story. Each end pairs at most once.
+        let starts = facts.program_turn_starts;
         if self.turn != facts.turn {
             // A carried record settled in a previous process: the baseline,
             // not news (see [`TurnFact::carried`]).
@@ -804,13 +923,59 @@ impl<V: Host> Slot<V> {
                 && self.turn.is_none_or(|old| old.id < t.id)
             {
                 if t.settled {
-                    self.note(StoryVerb::Turn, now);
                     self.settled_at = Some(now);
+                    let opened = now.checked_sub(std::time::Duration::from_millis(t.dur_ms));
+                    match self.told_end {
+                        Some(told)
+                            if told.end == TurnEnd::Done
+                                && told.starts == starts
+                                && opened.is_none_or(|opened| told.at >= opened) =>
+                        {
+                            // The program's own end already told this turn.
+                            self.pair_end(told, true);
+                        }
+                        _ => {
+                            let news = self.note_as(StoryVerb::Turn, now, true);
+                            self.told_end = Some(ToldEnd {
+                                end: TurnEnd::Settle,
+                                starts,
+                                at: now,
+                                seq: self.story_seq,
+                                news,
+                            });
+                        }
+                    }
                 } else {
                     self.note(StoryVerb::TurnTimedOut, now);
                 }
             }
             self.turn = facts.turn;
+            changed = true;
+        }
+        // The program's own turn end (OSC 7501): a story point, so a tab the
+        // person is not looking at gets its dot. Adopted silently at the
+        // baseline, and not told beside the ledger settle of the same turn.
+        if facts.program_turn_ends != self.program_turn_ends {
+            if facts.program_turn_ends > self.program_turn_ends && self.baselined {
+                let news = !facts.program_turn_watched;
+                match self.told_end {
+                    Some(told) if told.end == TurnEnd::Settle && told.starts == starts => {
+                        // The ledger's settle already told this turn.
+                        self.pair_end(told, news);
+                    }
+                    _ => {
+                        let news = self.note_as(StoryVerb::ProgramDone, now, news);
+                        self.told_end = Some(ToldEnd {
+                            end: TurnEnd::Done,
+                            starts,
+                            at: now,
+                            seq: self.story_seq,
+                            news,
+                        });
+                    }
+                }
+            }
+            self.program_turn_ends = facts.program_turn_ends;
             changed = true;
         }
         self.baselined = true;

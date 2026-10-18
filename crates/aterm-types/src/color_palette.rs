@@ -338,251 +338,76 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_color_ansi_range() {
-        // Index 0 = black
-        assert_eq!(ColorPalette::default_color(0), Rgb::new(0, 0, 0));
-        // Index 7 = white
-        assert_eq!(ColorPalette::default_color(7), Rgb::new(229, 229, 229));
-    }
-
-    #[test]
-    fn default_color_bright_range() {
-        // Index 8 = bright black (gray)
-        assert_eq!(ColorPalette::default_color(8), Rgb::new(138, 143, 153));
-        // Index 15 = bright white
-        assert_eq!(ColorPalette::default_color(15), Rgb::new(255, 255, 255));
-    }
-
-    #[test]
-    fn default_color_cube_boundaries() {
-        // Index 16 = first cube entry: r=0, g=0, b=0 → (0, 0, 0)
-        assert_eq!(ColorPalette::default_color(16), Rgb::new(0, 0, 0));
-        // Index 231 = last cube entry: r=5, g=5, b=5 → (255, 255, 255)
-        assert_eq!(ColorPalette::default_color(231), Rgb::new(255, 255, 255));
-        // Index 196 = r=5, g=0, b=0 → pure bright red
-        // idx=180, r=180/36=5, g=0, b=0 → (255, 0, 0)
-        assert_eq!(ColorPalette::default_color(196), Rgb::new(255, 0, 0));
-    }
-
-    #[test]
-    fn default_color_grayscale_boundaries() {
-        // Index 232 = first grayscale: 8 + 10*(0) = 8
-        assert_eq!(ColorPalette::default_color(232), Rgb::new(8, 8, 8));
-        // Index 255 = last grayscale: 8 + 10*(23) = 238
-        assert_eq!(ColorPalette::default_color(255), Rgb::new(238, 238, 238));
-    }
-
-    #[test]
-    fn palette_new_has_no_overrides() {
-        let p = ColorPalette::new();
-        assert_eq!(p.overrides_count(), 0);
-    }
-
-    #[test]
-    fn palette_get_returns_default_without_override() {
-        let p = ColorPalette::new();
-        assert_eq!(p.get(0), ColorPalette::default_color(0));
-        assert_eq!(p.get(255), ColorPalette::default_color(255));
-    }
-
-    #[test]
-    fn palette_set_and_get() {
-        let mut p = ColorPalette::new();
-        let custom = Rgb::new(1, 2, 3);
-        p.set(42, custom);
-        assert_eq!(p.get(42), custom);
-        assert_eq!(p.overrides_count(), 1);
-    }
-
-    #[test]
-    fn palette_set_to_default_removes_override() {
-        let mut p = ColorPalette::new();
-        let custom = Rgb::new(1, 2, 3);
-        p.set(42, custom);
-        assert_eq!(p.overrides_count(), 1);
-        // Setting back to default removes the override
-        p.set(42, ColorPalette::default_color(42));
-        assert_eq!(p.overrides_count(), 0);
-        assert_eq!(p.get(42), ColorPalette::default_color(42));
-    }
-
-    #[test]
-    fn palette_set_update_existing_override() {
-        let mut p = ColorPalette::new();
-        p.set(10, Rgb::new(1, 1, 1));
-        p.set(10, Rgb::new(2, 2, 2));
-        assert_eq!(p.get(10), Rgb::new(2, 2, 2));
-        assert_eq!(p.overrides_count(), 1);
-    }
-
-    #[test]
-    fn palette_reset_color() {
-        let mut p = ColorPalette::new();
-        p.set(5, Rgb::new(99, 99, 99));
-        p.reset_color(5);
-        assert_eq!(p.overrides_count(), 0);
-        assert_eq!(p.get(5), ColorPalette::default_color(5));
-    }
-
-    #[test]
-    fn palette_reset_color_noop_when_no_override() {
-        let mut p = ColorPalette::new();
-        p.reset_color(5);
-        assert_eq!(p.overrides_count(), 0);
-    }
-
-    #[test]
-    fn palette_reset_clears_all() {
-        let mut p = ColorPalette::new();
-        // Use a color that doesn't match any default
-        let custom = Rgb::new(1, 2, 3);
-        for i in 0..16 {
-            p.set(i, custom);
+    fn default_colors_are_the_xterm_256_table() {
+        for (index, rgb) in [
+            (0, Rgb::new(0, 0, 0)),
+            (7, Rgb::new(229, 229, 229)),
+            // Bright black (gray).
+            (8, Rgb::new(138, 143, 153)),
+            (15, Rgb::new(255, 255, 255)),
+            // The 6x6x6 cube: first, last, and r=5 g=0 b=0.
+            (16, Rgb::new(0, 0, 0)),
+            (231, Rgb::new(255, 255, 255)),
+            (196, Rgb::new(255, 0, 0)),
+            // The grayscale ramp: 8 + 10 * n.
+            (232, Rgb::new(8, 8, 8)),
+            (255, Rgb::new(238, 238, 238)),
+        ] {
+            assert_eq!(ColorPalette::default_color(index), rgb, "index {index}");
         }
-        assert_eq!(p.overrides_count(), 16);
-        p.reset();
-        assert_eq!(p.overrides_count(), 0);
     }
 
     #[test]
-    fn parse_rgb_colon_format() {
-        let c = ColorPalette::parse_color_spec("rgb:ff/00/80").unwrap();
-        assert_eq!(c, Rgb::new(255, 0, 128));
+    fn parse_color_spec_reads_every_xparsecolor_form() {
+        for (spec, rgb) in [
+            ("rgb:ff/00/80", Rgb::new(255, 0, 128)),
+            // A single hex digit scales by 17 (0xF -> 0xFF).
+            ("rgb:f/0/8", Rgb::new(255, 0, 136)),
+            ("#f08", Rgb::new(255, 0, 136)),
+            ("#ff0080", Rgb::new(255, 0, 128)),
+            // Wider groups keep their high byte.
+            ("#fff000888", Rgb::new(255, 0, 136)),
+            ("#ffff00008080", Rgb::new(255, 0, 128)),
+            ("rgbi:1.0/0.5/0.0", Rgb::new(255, 128, 0)),
+            ("rgbi:0.0/0.0/0.0", Rgb::new(0, 0, 0)),
+            ("rgbi:1.0/1.0/1.0", Rgb::new(255, 255, 255)),
+            ("rgbi:1/0/0", Rgb::new(255, 0, 0)),
+            // Out-of-range intensities clamp; fractions round half up.
+            ("rgbi:2.0/1.5/1.0", Rgb::new(255, 255, 255)),
+            ("rgbi:-0.5/-1.0/0.0", Rgb::new(0, 0, 0)),
+            ("rgbi:0.333/0.667/0.5", Rgb::new(85, 170, 128)),
+        ] {
+            assert_eq!(ColorPalette::parse_color_spec(spec), Some(rgb), "{spec}");
+        }
     }
 
     #[test]
-    fn parse_rgb_colon_single_digit() {
-        // Single hex digit: scaled by *17 (0xF → 0xFF)
-        let c = ColorPalette::parse_color_spec("rgb:f/0/8").unwrap();
-        assert_eq!(c, Rgb::new(255, 0, 136));
+    fn parse_color_spec_refuses_malformed_specs() {
+        for spec in [
+            "",
+            "#",
+            "#ff",
+            "#ffff",
+            "rgb:",
+            "rgb:ff/00",
+            "rgb:gg/00/00",
+            "notacolor",
+            "rgbi:",
+            "rgbi:1.0/0.5",
+            "rgbi:abc/0.0/0.0",
+            "rgbi:1.0/0.5/0.0/0.5",
+            // Multi-byte UTF-8 whose byte length matches #RRGGBB / #RGB must
+            // be refused, not panic on byte-index slicing.
+            "#你好",
+            "#你",
+        ] {
+            assert_eq!(ColorPalette::parse_color_spec(spec), None, "{spec:?}");
+        }
     }
 
     #[test]
-    fn parse_hash_3_digits() {
-        // #RGB: each digit * 17
-        let c = ColorPalette::parse_color_spec("#f08").unwrap();
-        assert_eq!(c, Rgb::new(255, 0, 136));
-    }
-
-    #[test]
-    fn parse_hash_6_digits() {
-        let c = ColorPalette::parse_color_spec("#ff0080").unwrap();
-        assert_eq!(c, Rgb::new(255, 0, 128));
-    }
-
-    #[test]
-    fn parse_hash_9_digits() {
-        // #RRRGGGBBB: take high byte of each 3-digit group
-        let c = ColorPalette::parse_color_spec("#fff000888").unwrap();
-        assert_eq!(c, Rgb::new(255, 0, 136));
-    }
-
-    #[test]
-    fn parse_hash_12_digits() {
-        // #RRRRGGGGBBBB: take high byte of each 4-digit group
-        let c = ColorPalette::parse_color_spec("#ffff00008080").unwrap();
-        assert_eq!(c, Rgb::new(255, 0, 128));
-    }
-
-    #[test]
-    fn parse_rgbi_basic() {
-        // rgbi:1.0/0.5/0.0 → orange (255, 128, 0)
-        let c = ColorPalette::parse_color_spec("rgbi:1.0/0.5/0.0").unwrap();
-        assert_eq!(c, Rgb::new(255, 128, 0));
-    }
-
-    #[test]
-    fn parse_rgbi_black_and_white() {
-        let black = ColorPalette::parse_color_spec("rgbi:0.0/0.0/0.0").unwrap();
-        assert_eq!(black, Rgb::new(0, 0, 0));
-
-        let white = ColorPalette::parse_color_spec("rgbi:1.0/1.0/1.0").unwrap();
-        assert_eq!(white, Rgb::new(255, 255, 255));
-    }
-
-    #[test]
-    fn parse_rgbi_clamps_out_of_range() {
-        // Values > 1.0 are clamped to 1.0
-        let c = ColorPalette::parse_color_spec("rgbi:2.0/1.5/1.0").unwrap();
-        assert_eq!(c, Rgb::new(255, 255, 255));
-
-        // Values < 0.0 are clamped to 0.0
-        let c = ColorPalette::parse_color_spec("rgbi:-0.5/-1.0/0.0").unwrap();
-        assert_eq!(c, Rgb::new(0, 0, 0));
-    }
-
-    #[test]
-    fn parse_rgbi_fractional_precision() {
-        // 0.333... → (0.333 * 255 + 0.5) = 85.415 → 85
-        let c = ColorPalette::parse_color_spec("rgbi:0.333/0.667/0.5").unwrap();
-        assert_eq!(c.r, 85); // 0.333 * 255 + 0.5 = 85.415
-        assert_eq!(c.g, 170); // 0.667 * 255 + 0.5 = 170.585
-        assert_eq!(c.b, 128); // 0.5 * 255 + 0.5 = 128.25
-    }
-
-    #[test]
-    fn parse_rgbi_integer_values() {
-        // Integer notation (no decimal point) should also work
-        let c = ColorPalette::parse_color_spec("rgbi:1/0/0").unwrap();
-        assert_eq!(c, Rgb::new(255, 0, 0));
-    }
-
-    #[test]
-    fn parse_rgbi_invalid_formats() {
-        // Missing components
-        assert!(ColorPalette::parse_color_spec("rgbi:").is_none());
-        assert!(ColorPalette::parse_color_spec("rgbi:1.0/0.5").is_none());
-        // Not a number
-        assert!(ColorPalette::parse_color_spec("rgbi:abc/0.0/0.0").is_none());
-        // Too many components
-        assert!(ColorPalette::parse_color_spec("rgbi:1.0/0.5/0.0/0.5").is_none());
-    }
-
-    #[test]
-    fn parse_invalid_formats() {
-        assert!(ColorPalette::parse_color_spec("").is_none());
-        assert!(ColorPalette::parse_color_spec("#").is_none());
-        assert!(ColorPalette::parse_color_spec("#ff").is_none());
-        assert!(ColorPalette::parse_color_spec("#ffff").is_none());
-        assert!(ColorPalette::parse_color_spec("rgb:").is_none());
-        assert!(ColorPalette::parse_color_spec("rgb:ff/00").is_none());
-        assert!(ColorPalette::parse_color_spec("rgb:gg/00/00").is_none());
-        assert!(ColorPalette::parse_color_spec("notacolor").is_none());
-    }
-
-    #[test]
-    fn parse_color_spec_rejects_multibyte_utf8() {
-        // 6 bytes: the #RRGGBB length, but not ASCII. Must return None, not panic.
-        assert!(ColorPalette::parse_color_spec("#你好").is_none());
-        // Single CJK char is 3 bytes — matches #RGB length.
-        assert!(ColorPalette::parse_color_spec("#你").is_none());
-    }
-
-    #[test]
-    fn parse_named_color_extended() {
-        // Test a selection of the full X11 color list
-        assert_eq!(
-            ColorPalette::parse_color_spec("coral"),
-            Some(Rgb::new(255, 127, 80))
-        );
-        assert_eq!(
-            ColorPalette::parse_color_spec("navy"),
-            Some(Rgb::new(0, 0, 128))
-        );
-        assert_eq!(
-            ColorPalette::parse_color_spec("teal"),
-            Some(Rgb::new(0, 128, 128))
-        );
-        assert_eq!(
-            ColorPalette::parse_color_spec("rebeccapurple"),
-            Some(Rgb::new(102, 51, 153))
-        );
-    }
-
-    #[test]
-    fn parse_named_color_css_basic() {
-        // The 16 basic CSS colors (plus fuchsia/aqua aliases)
-        let basics = [
+    fn parse_named_color_reads_x11_and_css_names() {
+        for (name, rgb) in [
             ("black", Rgb::new(0, 0, 0)),
             ("silver", Rgb::new(192, 192, 192)),
             ("gray", Rgb::new(128, 128, 128)),
@@ -599,35 +424,24 @@ mod tests {
             ("blue", Rgb::new(0, 0, 255)),
             ("teal", Rgb::new(0, 128, 128)),
             ("aqua", Rgb::new(0, 255, 255)),
-        ];
-        for (name, expected) in &basics {
-            assert_eq!(
-                ColorPalette::parse_color_spec(name),
-                Some(*expected),
-                "failed for color name: {name}"
-            );
+            ("coral", Rgb::new(255, 127, 80)),
+            ("rebeccapurple", Rgb::new(102, 51, 153)),
+        ] {
+            assert_eq!(ColorPalette::parse_color_spec(name), Some(rgb), "{name}");
         }
     }
 
+    /// The OSC 4/10/11 reply spelling, and parse(format(c)) == c.
     #[test]
-    fn format_color_spec_black() {
+    fn format_color_spec_is_the_16_bit_spelling_and_round_trips() {
         assert_eq!(
             ColorPalette::format_color_spec(Rgb::new(0, 0, 0)),
             "rgb:0000/0000/0000"
         );
-    }
-
-    #[test]
-    fn format_color_spec_white() {
         assert_eq!(
             ColorPalette::format_color_spec(Rgb::new(255, 255, 255)),
             "rgb:ffff/ffff/ffff"
         );
-    }
-
-    #[test]
-    fn format_color_spec_roundtrip() {
-        // parse(format(color)) should give back the original color
         for r in [0u8, 1, 127, 128, 255] {
             for g in [0u8, 1, 127, 128, 255] {
                 for b in [0u8, 1, 127, 128, 255] {
@@ -647,7 +461,8 @@ mod tests {
     /// removing a middle entry, where `swap_remove` moves another override into its slot.
     #[test]
     fn palette_cache_agrees_with_overrides_after_mutations() {
-        fn assert_coherent(p: &ColorPalette, what: &str) {
+        fn assert_coherent(p: &ColorPalette, what: &str, overrides: usize) {
+            assert_eq!(p.overrides_count(), overrides, "{what}: override count");
             for i in 0..=255u8 {
                 let expected = p
                     .overrides()
@@ -659,31 +474,31 @@ mod tests {
         }
 
         let mut p = ColorPalette::new();
-        assert_coherent(&p, "fresh");
+        assert_coherent(&p, "fresh", 0);
 
         for i in [0u8, 7, 15, 42, 200, 255] {
             p.set(i, Rgb::new(i ^ 0x5A, i.wrapping_add(9), 3));
         }
-        assert_coherent(&p, "after sets");
+        assert_coherent(&p, "after sets", 6);
 
         // Update in place (existing override, not a new push).
         p.set(7, Rgb::new(1, 1, 1));
-        assert_coherent(&p, "after in-place update");
+        assert_eq!(p.get(7), Rgb::new(1, 1, 1));
+        assert_coherent(&p, "after in-place update", 6);
 
         // Remove a MIDDLE entry — `swap_remove` relocates the last override.
         p.reset_color(15);
-        assert_coherent(&p, "after reset_color of a middle entry");
+        assert_coherent(&p, "after reset_color of a middle entry", 5);
 
         // Set-to-default is the other removal path.
         p.set(42, ColorPalette::default_color(42));
-        assert_coherent(&p, "after set-to-default");
+        assert_coherent(&p, "after set-to-default", 4);
 
         // Resetting an index that was never overridden must be a no-op.
         p.reset_color(101);
-        assert_coherent(&p, "after reset_color of a non-override");
+        assert_coherent(&p, "after reset_color of a non-override", 4);
 
         p.reset();
-        assert_eq!(p.overrides_count(), 0);
-        assert_coherent(&p, "after reset");
+        assert_coherent(&p, "after reset", 0);
     }
 }

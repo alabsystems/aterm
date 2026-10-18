@@ -1,0 +1,138 @@
+# claude-code 2.1.302 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (Wx60, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a multi-select's free-text row holding the long-term text, typed by hand at 200 columns, then `down` to `Submit`, the pane resized to each width W from 270 to 300 columns (`aterm ctl resize 60 W`, then `up` and `down`): each frame's rows from the free-text row to the divider under `Submit`, under a `## W columns` line — across the width from which the row (its number, checkbox and the text's widest row) no longer overflows the pane, where the text goes from two rows to one (ATERM-KI-1015-1 F2, round 21's review)
+## 270 columns
+  4. [✔] Decide yourself: choose the option that best serves long term correctness and total value even at the cost of short term deliverables. Say which you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user
+         was not asked.)
+❯    Submit
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 271 columns
+  4. [✔] Decide yourself: choose the option that best serves long term correctness and total value even at the cost of short term deliverables. Say which you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user
+         was not asked.)
+❯    Submit
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 272 columns
+  4. [✔] Decide yourself: choose the option that best serves long term correctness and total value even at the cost of short term deliverables. Say which you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user
+         was not asked.)
+❯    Submit
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 273 columns
+  4. [✔] Decide yourself: choose the option that best serves long term correctness and total value even at the cost of short term deliverables. Say which you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was
+         not asked.)
+❯    Submit
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 274 columns
+  4. [✔] Decide yourself: choose the option that best serves long term correctness and total value even at the cost of short term deliverables. Say which you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was
+         not asked.)
+❯    Submit
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 275 columns
+  4. [✔] Decide yourself: choose the option that best serves long term correctness and total value even at the cost of short term deliverables. Say which you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was
+         not asked.)
+❯    Submit
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 276 columns
+  4. [✔] Decide yourself: choose the option that best serves long term correctness and total value even at the cost of short term deliverables. Say which you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was
+         not asked.)
+❯    Submit
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 277 columns
+  4. [✔] Decide yourself: choose the option that best serves long term correctness and total value even at the cost of short term deliverables. Say which you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not
+         asked.)
+❯    Submit
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 278 columns
+  4. [✔] Decide yourself: choose the option that best serves long term correctness and total value even at the cost of short term deliverables. Say which you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not
+         asked.)
+❯    Submit
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 279 columns
+  4. [✔] Decide yourself: choose the option that best serves long term correctness and total value even at the cost of short term deliverables. Say which you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not
+         asked.)
+❯    Submit
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 280 columns
+  4. [✔] Decide yourself: choose the option that best serves long term correctness and total value even at the cost of short term deliverables. Say which you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not
+         asked.)
+❯    Submit
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 281 columns
+  4. [✔] Decide yourself: choose the option that best serves long term correctness and total value even at the cost of short term deliverables. Say which you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not
+         asked.)
+❯    Submit
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 282 columns
+  4. [✔] Decide yourself: choose the option that best serves long term correctness and total value even at the cost of short term deliverables. Say which you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not
+         asked.)
+❯    Submit
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 283 columns
+  4. [✔] Decide yourself: choose the option that best serves long term correctness and total value even at the cost of short term deliverables. Say which you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not
+❯    Submitked.)
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 284 columns
+  4. [✔] Decide yourself: choose the option that best serves long term correctness and total value even at the cost of short term deliverables. Say which you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not
+❯    Submitked.)
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 285 columns
+  4. [✔] Decide yourself: choose the option that best serves long term correctness and total value even at the cost of short term deliverables. Say which you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 286 columns
+  4. [✔] Decide yourself: choose the option that best serves long term correctness and total value even at the cost of short term deliverables. Say which you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 287 columns
+  4. [✔] Decide yourself: choose the option that best serves long term correctness and total value even at the cost of short term deliverables. Say which you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 288 columns
+  4. [✔] Decide yourself: choose the option that best serves long term correctness and total value even at the cost of short term deliverables. Say which you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 289 columns
+  4. [✔] Decide yourself: choose the option that best serves long term correctness and total value even at the cost of short term deliverables. Say which you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 290 columns
+  4. [✔] Decide yourself: choose the option that best serves long term correctness and total value even at the cost of short term deliverables. Say which you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 291 columns
+  4. [✔] Decide yourself: choose the option that best serves long term correctness and total value even at the cost of short term deliverables. Say which you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 292 columns
+  4. [✔] Decide yourself: choose the option that best serves long term correctness and total value even at the cost of short term deliverables. Say which you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 293 columns
+  4. [✔] Decide yourself: choose the option that best serves long term correctness and total value even at the cost of short term deliverables. Say which you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 294 columns
+  4. [✔] Decide yourself: choose the option that best serves long term correctness and total value even at the cost of short term deliverables. Say which you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 295 columns
+  4. [✔] Decide yourself: choose the option that best serves long term correctness and total value even at the cost of short term deliverables. Say which you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 296 columns
+  4. [✔] Decide yourself: choose the option that best serves long term correctness and total value even at the cost of short term deliverables. Say which you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 297 columns
+  4. [✔] Decide yourself: choose the option that best serves long term correctness and total value even at the cost of short term deliverables. Say which you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 298 columns
+  4. [✔] Decide yourself: choose the option that best serves long term correctness and total value even at the cost of short term deliverables. Say which you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 299 columns
+  4. [✔] Decide yourself: choose the option that best serves long term correctness and total value even at the cost of short term deliverables. Say which you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 300 columns
+  4. [✔] Decide yourself: choose the option that best serves long term correctness and total value even at the cost of short term deliverables. Say which you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────

@@ -74,8 +74,8 @@ use crate::Layout;
 use crate::seam::Depth;
 
 /// `<prefix>/compat`, where exec roots live: outside `store/`, since nothing may be laid
-/// inside the content-addressed store.
-pub const COMPAT_DIR: &str = "compat";
+/// inside the content-addressed store (`aterm_toolchain::layout`, which the lease reads).
+pub use aterm_toolchain::layout::COMPAT_DIR;
 
 /// `<prefix>/compat`.
 #[must_use]
@@ -1179,6 +1179,11 @@ mod tests {
     use crate::store::ToolName;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
+    /// What `atpkg run` and the `clippy` reroute exec for `tool` ([`crate::ops::managed`]).
+    fn exec_path(layout: &Layout, tool: &str) -> Option<PathBuf> {
+        crate::ops::managed(layout, tool).map(|copy| copy.target)
+    }
+
     /// A private temp prefix. Nothing here reads `$HOME`, the real prefix or `~/.rustup`.
     struct Fx {
         root: aterm_tempfile::TempDir,
@@ -2080,7 +2085,7 @@ mod tests {
         // With no root standing, `exec_path` is `which` for every name.
         for n in names {
             assert_eq!(
-                crate::ops::exec_path(&fx.layout, n),
+                exec_path(&fx.layout, n),
                 crate::ops::which(&fx.layout, n),
                 "{n}"
             );
@@ -2123,7 +2128,7 @@ mod tests {
                 }
                 other => other,
             };
-            assert_eq!(crate::ops::exec_path(&fx.layout, n), expected, "{n}");
+            assert_eq!(exec_path(&fx.layout, n), expected, "{n}");
         }
     }
 
@@ -2156,7 +2161,13 @@ mod tests {
             assert!(root.is_dir(), "{}", not_a_build.display());
         }
 
+        let recording = aterm_durable::seam::Recording::start();
         crate::store::discard_build(&build);
+        assert_eq!(
+            recording.take().first(),
+            Some(&aterm_durable::Flush::Durable),
+            "the marker's removal stays durable ahead of the tree's"
+        );
         assert!(std::fs::symlink_metadata(&build).is_err(), "the tree went");
         assert!(
             std::fs::symlink_metadata(&root).is_err(),
@@ -2364,29 +2375,23 @@ mod tests {
         std::fs::write(ny.join("ny"), b"ny").unwrap();
         fx.plain_shim("ny", &ny.join("ny"), &none);
 
-        assert_eq!(
-            crate::ops::exec_path(&fx.layout, "tippy"),
-            Some(fx.tool(8595, "tippy"))
-        );
+        assert_eq!(exec_path(&fx.layout, "tippy"), Some(fx.tool(8595, "tippy")));
         ensure_root(&fx.layout, &build, Depth::Shallow).unwrap();
         let routed = root_dir(&fx.layout, 8595).join("bin").join("tippy");
-        assert_eq!(
-            crate::ops::exec_path(&fx.layout, "tippy"),
-            Some(routed.clone())
-        );
+        assert_eq!(exec_path(&fx.layout, "tippy"), Some(routed.clone()));
         assert_eq!(
             crate::ops::which(&fx.layout, "tippy"),
             Some(fx.tool(8595, "tippy")),
             "which keeps answering the store"
         );
-        assert_eq!(crate::ops::exec_path(&fx.layout, "ny"), Some(ny.join("ny")));
-        assert_eq!(crate::ops::exec_path(&fx.layout, "absent"), None);
-        assert_eq!(crate::ops::exec_path(&fx.layout, "../tippy"), None);
+        assert_eq!(exec_path(&fx.layout, "ny"), Some(ny.join("ny")));
+        assert_eq!(exec_path(&fx.layout, "absent"), None);
+        assert_eq!(exec_path(&fx.layout, "../tippy"), None);
 
         let root = root_dir(&fx.layout, 8595);
         std::fs::remove_file(root_marker(&root)).unwrap();
         assert_eq!(
-            crate::ops::exec_path(&fx.layout, "tippy"),
+            exec_path(&fx.layout, "tippy"),
             Some(fx.tool(8595, "tippy")),
             "an unmarked root is never exec'd"
         );
@@ -2394,7 +2399,7 @@ mod tests {
         std::fs::remove_file(&routed).unwrap();
         std::fs::write(&routed, b"not the store's tippy").unwrap();
         assert_eq!(
-            crate::ops::exec_path(&fx.layout, "tippy"),
+            exec_path(&fx.layout, "tippy"),
             Some(fx.tool(8595, "tippy")),
             "other bytes in the root are never exec'd"
         );

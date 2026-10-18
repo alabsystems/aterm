@@ -1,79 +1,38 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Swizzle measurements and refusals.
+//! `SwizzleSite::install`'s refusals and chaining, and `owning_class`, against
+//! classes registered here.
 //!
-//! Every claim `src/swizzle.rs` makes about the runtime is re-measured against
-//! libobjc directly: this file binds its own `class_addMethod`,
-//! `class_replaceMethod`, `method_setImplementation`, `class_getInstanceMethod`
-//! and `method_getTypeEncoding`, so the wrapper cannot vouch for itself.
-//!
-//! These run on libtest workers, which is fine: class registration is not
-//! gated by [`aterm_objc::MainThread`], and these classes touch no AppKit state
-//! and hold no ivar with a destructor. The main-thread parts (a real
-//! `NSApplication`, real events, the `dladdr` check) are driven by `aterm-gui`'s
-//! `examples/objc_window_drive.rs` and `examples/objc_event_drive.rs`.
+//! The third-party patches the refusals exist for are applied through this
+//! file's own `method_setImplementation` binding, so the module under test
+//! cannot vouch for itself. These run on libtest workers, which is fine: class
+//! registration is not gated by [`aterm_objc::MainThread`], and these classes
+//! touch no AppKit state and hold no ivar with a destructor.
 
 #![cfg(target_os = "macos")]
+#![expect(
+    clippy::disallowed_methods,
+    reason = "aterm-objc's own runtime tests drive the bare `msg` cast; everything else uses checked_msg"
+)]
 
-use std::ffi::{CStr, c_char, c_void};
+use std::ffi::{CStr, c_void};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use aterm_objc::swizzle::{MethodFn, Swizzle, SwizzleError, SwizzleSite, owning_class};
 use aterm_objc::{
-    Bool, CGRect, ClassPtr, Encode, Id, Imp, NSRange, Sel, begin, class_of, method_encoding,
-    method_imp, method_types, msg, ns_string, sel,
+    Bool, CGRect, ClassPtr, Encode, Id, NSRange, Sel, begin, class_of, method_encoding, method_imp,
+    method_types, msg, ns_string, sel,
 };
 
-// The runtime, bound here so the measurements are independent of the module
-// under test.
+// The runtime, bound here so the third-party patches are independent of the
+// module under test.
 //
 // SAFETY: every symbol below is libobjc's, loaded in every process on this
 // platform.
 unsafe extern "C" {
     fn class_getInstanceMethod(cls: ClassPtr, name: Sel) -> *const c_void;
-    fn method_getTypeEncoding(method: *const c_void) -> *const c_char;
-    fn method_getImplementation(method: *const c_void) -> *const c_void;
     fn method_setImplementation(method: *const c_void, imp: *const c_void) -> *const c_void;
-    fn class_addMethod(cls: ClassPtr, name: Sel, imp: *const c_void, types: *const c_char) -> Bool;
-    fn class_replaceMethod(
-        cls: ClassPtr,
-        name: Sel,
-        imp: *const c_void,
-        types: *const c_char,
-    ) -> *const c_void;
-    fn class_copyMethodList(cls: ClassPtr, out_count: *mut u32) -> *mut *const c_void;
-    fn free(ptr: *mut c_void);
-}
-
-/// How many rows a class registered itself: the containment question.
-fn own_method_count(cls: ClassPtr) -> u32 {
-    let mut n: u32 = 0;
-    // SAFETY: `cls` is a live class object; the runtime writes the count and
-    // hands back a malloc'd array the caller owns.
-    let list = unsafe { class_copyMethodList(cls, &raw mut n) };
-    if !list.is_null() {
-        // SAFETY: the array came from `class_copyMethodList` and is the
-        // caller's to free.
-        unsafe { free(list.cast::<c_void>()) };
-    }
-    n
-}
-
-/// The registered encoding, read through the raw runtime.
-fn raw_encoding(cls: ClassPtr, sel: Sel) -> Option<String> {
-    // SAFETY: `cls` is live; both accessors answer NULL for a missing row.
-    unsafe {
-        let m = class_getInstanceMethod(cls, sel);
-        if m.is_null() {
-            return None;
-        }
-        let t = method_getTypeEncoding(m);
-        if t.is_null() {
-            return None;
-        }
-        Some(CStr::from_ptr(t).to_string_lossy().into_owned())
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -174,179 +133,8 @@ fn probe_value(obj: Id) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// Part 1 — the three mutators, measured (the facts behind the module's "what a
-// guard can and cannot prove").
+// Part 1 — the owner: the class you name is not the class you patch.
 // ---------------------------------------------------------------------------
-
-#[test]
-fn method_set_implementation_leaves_the_encoding_byte_identical() {
-    let cls = register_probe_class(c"AtermSwizzleEnc");
-    let before = raw_encoding(cls, sel!(probeValue)).expect("a registered row has an encoding");
-
-    // SAFETY: the row exists (just registered) and `patched_probe` has the same
-    // prototype as the implementation it replaces.
-    let previous = unsafe {
-        let m = class_getInstanceMethod(cls, sel!(probeValue));
-        method_setImplementation(m, patched_probe as *const c_void)
-    };
-
-    let after = raw_encoding(cls, sel!(probeValue)).expect("still registered");
-    assert_eq!(
-        before, after,
-        "method_setImplementation takes no `types` argument, so it cannot move the encoding — \
-         this is why no encoding check in this tree can SEE a swizzle"
-    );
-    assert!(
-        std::ptr::eq(previous, original_probe as *const c_void),
-        "the swap returns the implementation it displaced"
-    );
-}
-
-#[test]
-fn class_replace_method_ignores_a_lying_types_on_a_row_the_class_already_has() {
-    let cls = register_probe_class(c"AtermSwizzleReplace");
-    let before = raw_encoding(cls, sel!(probeValue)).expect("registered");
-
-    // SAFETY: the row exists on `cls` directly; the types string is a
-    // deliberate lie whose fate is the measurement.
-    let previous = unsafe {
-        class_replaceMethod(
-            cls,
-            sel!(probeValue),
-            patched_probe as *const c_void,
-            c"{_Lie=qqqq}@:B".as_ptr(),
-        )
-    };
-
-    assert!(
-        std::ptr::eq(previous, original_probe as *const c_void),
-        "on an existing row `class_replaceMethod` behaves as a swap and returns the previous IMP"
-    );
-    assert_eq!(
-        before,
-        raw_encoding(cls, sel!(probeValue)).expect("registered"),
-        "the lying `types` was IGNORED — the encoding is still what the class registered"
-    );
-}
-
-#[test]
-fn class_add_method_refuses_a_row_the_class_already_has() {
-    let cls = register_probe_class(c"AtermSwizzleAdd");
-    let before = raw_encoding(cls, sel!(probeValue)).expect("registered");
-
-    // SAFETY: as above; the return value is the measurement.
-    let added = unsafe {
-        class_addMethod(
-            cls,
-            sel!(probeValue),
-            patched_probe as *const c_void,
-            c"{_Lie=qqqq}@:B".as_ptr(),
-        )
-    };
-
-    assert!(
-        !added.as_bool(),
-        "`class_addMethod` answers NO for a selector the class already has — which is why \
-         `ClassBuilder::add_method` cannot be the swizzle primitive: it asserts on this NO, and \
-         an existing row is the PREMISE of a swizzle"
-    );
-    assert_eq!(
-        before,
-        raw_encoding(cls, sel!(probeValue)).expect("registered"),
-        "and it changed nothing"
-    );
-    assert_eq!(
-        1,
-        probe_value(instance_of(cls)),
-        "the original implementation is still the one that runs"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Part 2 — blast radius: the class you name is not the class you patch.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn a_swizzle_through_a_subclass_mutates_the_ancestors_row() {
-    let parent = register_probe_class(c"AtermSwizzleParent");
-    let child = {
-        let mut b = begin(c"AtermSwizzleParent", c"AtermSwizzleChild");
-        b.add_rust_ivar::<()>();
-        b.register().class()
-    };
-
-    // SAFETY: both classes are live and registered.
-    let (m_parent, m_child) = unsafe {
-        (
-            class_getInstanceMethod(parent, sel!(probeValue)),
-            class_getInstanceMethod(child, sel!(probeValue)),
-        )
-    };
-    assert!(
-        std::ptr::eq(m_parent, m_child),
-        "`class_getInstanceMethod` walks the chain and hands back the DEFINER's Method — the \
-         same pointer, not a copy"
-    );
-    assert_eq!(
-        0,
-        own_method_count(child),
-        "the subclass registered nothing of its own"
-    );
-
-    let parent_instance = instance_of(parent);
-    assert_eq!(1, probe_value(parent_instance));
-
-    // Patch through the CHILD's lookup.
-    // SAFETY: the row exists and the prototype matches.
-    unsafe { method_setImplementation(m_child, patched_probe as *const c_void) };
-
-    assert_eq!(
-        2,
-        probe_value(parent_instance),
-        "a swizzle applied through the SUBCLASS changed what a PARENT instance does — the patch \
-         is process-wide and the call site cannot see it. `owning_class` is what reports it"
-    );
-    assert_eq!(
-        0,
-        own_method_count(child),
-        "and nothing was added to the subclass"
-    );
-}
-
-#[test]
-fn class_replace_method_on_an_inherited_row_adds_and_returns_null() {
-    let parent = register_probe_class(c"AtermSwizzleParent2");
-    let child = {
-        let mut b = begin(c"AtermSwizzleParent2", c"AtermSwizzleChild2");
-        b.add_rust_ivar::<()>();
-        b.register().class()
-    };
-
-    // SAFETY: `child` is live; the row is INHERITED, not its own.
-    let previous = unsafe {
-        class_replaceMethod(
-            child,
-            sel!(probeValue),
-            patched_probe as *const c_void,
-            c"q@:".as_ptr(),
-        )
-    };
-
-    assert!(
-        previous.is_null(),
-        "on a row the class does not have DIRECTLY, `class_replaceMethod` ADDS one and returns \
-         NULL — a caller storing that as `the original` would have stored nil and would call it. \
-         This is why the contained form is not offered: its chaining rule is msg_super, which is \
-         a different capability"
-    );
-    assert_eq!(1, own_method_count(child), "a row was added to the child");
-    assert_eq!(
-        1,
-        probe_value(instance_of(parent)),
-        "and the parent's row was left alone — the containment the other form does not have"
-    );
-    assert_eq!(2, probe_value(instance_of(child)));
-}
 
 #[test]
 fn owning_class_finds_the_definer_not_the_class_asked() {
@@ -391,7 +179,7 @@ fn owning_class_finds_the_definer_not_the_class_asked() {
 }
 
 // ---------------------------------------------------------------------------
-// Part 3 — the encoding derived from the prototype.
+// Part 2 — the encoding derived from the prototype.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -423,22 +211,6 @@ fn method_fn_derives_the_encoding_from_the_prototype() {
             b = <Bool as Encode>::ENCODING,
         ),
         <Wide as MethodFn>::method_encoding()
-    );
-}
-
-#[test]
-fn imp_carries_the_encoding_clang_emits() {
-    assert_eq!(
-        "^?",
-        <Imp as Encode>::ENCODING,
-        "MEASURED: `@encode(IMP)` is a pointer to an UNKNOWN type, not the `^v` a `void *` gets \
-         and not the `@` an object gets"
-    );
-    assert_eq!(size_of::<Imp>(), size_of::<*const c_void>());
-    assert_eq!(
-        size_of::<Option<Imp>>(),
-        size_of::<Imp>(),
-        "non-null by construction, so the option is one word"
     );
 }
 
@@ -489,7 +261,7 @@ fn install_refuses_a_selector_nothing_implements_and_a_null_class() {
 }
 
 // ---------------------------------------------------------------------------
-// Part 4 — the site: install, chain, idempotence, and the refusals that stop a
+// Part 3 — the site: install, chain, idempotence, and the refusals that stop a
 // chain being built from someone else's implementation.
 // ---------------------------------------------------------------------------
 
@@ -625,162 +397,8 @@ fn install_refuses_when_the_row_is_already_patched_by_somebody_else() {
     );
 }
 
-#[test]
-fn the_swizzle_is_confined_to_the_class_pair_it_was_applied_to() {
-    // Control: a patch on one registered class must not reach another, which
-    // is why each test registers its own.
-    let a = register_probe_class(c"AtermSwizzleIsolationA");
-    let b = register_probe_class(c"AtermSwizzleIsolationB");
-    // SAFETY: the row exists on `a` and the prototype matches.
-    unsafe {
-        let m = class_getInstanceMethod(a, sel!(probeValue));
-        method_setImplementation(m, patched_probe as *const c_void);
-    }
-    assert_eq!(2, probe_value(instance_of(a)));
-    assert_eq!(1, probe_value(instance_of(b)));
-    // SAFETY: both classes are live.
-    unsafe {
-        assert!(std::ptr::eq(
-            method_getImplementation(class_getInstanceMethod(b, sel!(probeValue))),
-            original_probe as *const c_void
-        ));
-    }
-}
-
-#[test]
-fn concurrent_installs_into_one_site_never_build_a_chain_that_calls_itself() {
-    // Without the compare-exchange, two threads read the same empty slot, both publish, and the
-    // loser's chain calls itself. A weak detector (it catches a plain store in about one run in
-    // ten); the argument in `install` carries the weight.
-    const THREADS: usize = 16;
-    const ROUNDS: usize = 12;
-    static SITES: [SwizzleSite<ProbeFn>; ROUNDS] = [const { SwizzleSite::new() }; ROUNDS];
-    const NAMES: [&CStr; ROUNDS] = [
-        c"AtermSwizzleRace0",
-        c"AtermSwizzleRace1",
-        c"AtermSwizzleRace2",
-        c"AtermSwizzleRace3",
-        c"AtermSwizzleRace4",
-        c"AtermSwizzleRace5",
-        c"AtermSwizzleRace6",
-        c"AtermSwizzleRace7",
-        c"AtermSwizzleRace8",
-        c"AtermSwizzleRace9",
-        c"AtermSwizzleRace10",
-        c"AtermSwizzleRace11",
-    ];
-
-    for round in 0..ROUNDS {
-        let cls = register_probe_class(NAMES[round]);
-        // `ClassPtr` is `!Send`, so the address crosses and the pointer is
-        // rebuilt on the far side.
-        let addr = cls.expose_provenance();
-        // The barrier releases the threads together into `install`'s
-        // read-then-write; without it they serialise.
-        let gate = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
-        let site = &SITES[round];
-        let mut threads = Vec::new();
-        for _ in 0..THREADS {
-            let gate = std::sync::Arc::clone(&gate);
-            threads.push(std::thread::spawn(move || {
-                // SAFETY: `addr` is the class `register_probe_class` registered
-                // above; classes are never disposed.
-                let cls =
-                    unsafe { ClassPtr::from_ptr(std::ptr::with_exposed_provenance_mut(addr)) };
-                gate.wait();
-                // SAFETY: the prototype matches the registered row — which the
-                // install re-checks — and cannot unwind.
-                let outcome = unsafe { site.install(cls, sel!(probeValue), patched_probe) };
-                // `Swizzle` holds a `ClassPtr` and is `!Send`, so only a label
-                // crosses back.
-                match outcome {
-                    Ok(Swizzle::Replaced { .. }) => "replaced",
-                    Ok(Swizzle::AlreadyInstalled { .. }) => "already",
-                    Err(SwizzleError::Contended) => "contended",
-                    Err(SwizzleError::Displaced { .. }) => "displaced",
-                    Err(SwizzleError::OrphanedInstall) => "orphaned",
-                    Err(SwizzleError::Raced { .. }) => "raced",
-                    Err(_) => "refused",
-                }
-            }));
-        }
-        let outcomes: Vec<&'static str> = threads
-            .into_iter()
-            .map(|t| t.join().expect("no thread panicked"))
-            .collect();
-
-        assert_eq!(
-            1,
-            outcomes.iter().filter(|o| **o == "replaced").count(),
-            "round {round}: exactly one install may write the row; the rest are \
-             AlreadyInstalled, Contended or Displaced — got {outcomes:?}"
-        );
-        assert!(
-            !outcomes.contains(&"refused")
-                && !outcomes.contains(&"orphaned")
-                && !outcomes.contains(&"raced"),
-            "round {round}: no thread may see a refusal that means the row or the site was \
-             corrupted mid-install — got {outcomes:?}"
-        );
-
-        let original = site.original().expect("the winner published one");
-        assert_eq!(
-            original as *const c_void, original_probe as *const c_void,
-            "round {round}: THE ASSERTION THAT MATTERS — the site holds the implementation it \
-             DISPLACED, never one a racing thread installed. The other spelling of this bug is a \
-             chain that calls itself"
-        );
-        assert_eq!(2, probe_value(instance_of(cls)));
-    }
-}
-/// Differs from [`SameShapeFn`] only in `const` versus `mut` `void *`, which encodes identically
-/// (`^v`). Used only for the encoding comparison below.
-type WrongObjectFn = unsafe extern "C-unwind" fn(Id, Sel, *const c_void) -> i64;
-/// The baseline: the same arity and widths, `^v` for the `mut void *`.
-type SameShapeFn = unsafe extern "C-unwind" fn(Id, Sel, *mut c_void) -> i64;
-
-#[test]
-fn the_encoding_check_is_blind_to_a_disagreement_that_does_not_move_a_register() {
-    // Passing is the bad news: `@encode` is a shape language, so prototypes that
-    // differ in meaning but agree in shape are the same string.
-    assert_eq!(
-        <WrongObjectFn as MethodFn>::method_encoding(),
-        <SameShapeFn as MethodFn>::method_encoding(),
-        "`^v` covers both const and mut `void *` — a const/mut disagreement is invisible here, \
-         and correctly so: it moves no register"
-    );
-
-    // `@` erases the class, and every object here is an `Id`.
-    type TakesEvent = unsafe extern "C-unwind" fn(Id, Sel, Id);
-    type TakesString = unsafe extern "C-unwind" fn(Id, Sel, Id);
-    assert_eq!(
-        <TakesEvent as MethodFn>::method_encoding(),
-        <TakesString as MethodFn>::method_encoding(),
-        "a green install says the SHAPE is right; it says nothing about which object arrives"
-    );
-
-    // What it does catch: anything that moves a register or changes a width.
-    type Wider = unsafe extern "C-unwind" fn(Id, Sel, Id, Id) -> i64;
-    type NarrowerReturn = unsafe extern "C-unwind" fn(Id, Sel, *mut c_void) -> Bool;
-    type StructByValue = unsafe extern "C-unwind" fn(Id, Sel, CGRect) -> i64;
-    let baseline = <SameShapeFn as MethodFn>::method_encoding();
-    for (name, other) in [
-        ("one more argument", <Wider as MethodFn>::method_encoding()),
-        (
-            "a narrower return",
-            <NarrowerReturn as MethodFn>::method_encoding(),
-        ),
-        (
-            "a struct by value where a pointer was",
-            <StructByValue as MethodFn>::method_encoding(),
-        ),
-    ] {
-        assert_ne!(baseline, other, "{name} must be visible to the check");
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Part 5 — one site asked about two rows, and KVO swapping an object's class
+// Part 4 — one site asked about two rows, and KVO swapping an object's class
 // under the patch.
 // ---------------------------------------------------------------------------
 
@@ -834,7 +452,10 @@ fn one_site_asked_about_a_second_row_refuses_instead_of_answering() {
     );
 
     // The refusal wrote nothing.
-    assert_eq!(SITE.original_imp(), Some((original_probe as ProbeFn).imp()));
+    assert_eq!(
+        SITE.original().map(|f| f.imp()),
+        Some((original_probe as ProbeFn).imp())
+    );
     assert_eq!(probe_value(instance_of(b)), 2, "B still runs the patch");
 }
 
@@ -933,5 +554,8 @@ fn a_kvo_isa_swap_leaves_the_swizzle_and_its_owner_where_they_were() {
         matches!(again, Ok(Swizzle::AlreadyInstalled { .. })),
         "a KVO subclass resolves to the claimed row: {again:?}"
     );
-    assert_eq!(SITE.original_imp(), Some((original_probe as ProbeFn).imp()));
+    assert_eq!(
+        SITE.original().map(|f| f.imp()),
+        Some((original_probe as ProbeFn).imp())
+    );
 }

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use aterm_effects::cursor_glow::Geom;
 use aterm_effects::rainbow_kitty::ribbon::{Ribbon, SWOOSH_TOTAL_S};
 use aterm_effects::rainbow_kitty::{Config, Ctx, Event, TypedClass};
-use aterm_spec::derive::ribbon_row_hold_model;
+use aterm_models_effects::ribbon_row_hold_model;
 
 fn config() -> Config {
     Config {

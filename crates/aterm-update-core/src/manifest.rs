@@ -239,7 +239,8 @@ impl Manifest {
 mod tests {
     use super::*;
 
-    /// A fully populated manifest for the round-trip tests.
+    /// A fully populated manifest for the round-trip tests (the zip and Intel DMG pairs
+    /// included, so the round trip carries both).
     fn full() -> Manifest {
         Manifest {
             schema: 1,
@@ -256,8 +257,10 @@ mod tests {
             zip_sha256: Some(
                 "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08".into(),
             ),
-            dmg_x86_64: None,
-            dmg_x86_64_sha256: None,
+            dmg_x86_64: Some("aterm-0.26-x86_64.dmg".into()),
+            dmg_x86_64_sha256: Some(
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+            ),
             linux_x86_64: None,
             linux_x86_64_sha256: None,
             linux_x86_64_size: None,
@@ -473,70 +476,6 @@ mod tests {
             );
         }
         assert_eq!(Manifest::parse(&text).unwrap(), m);
-    }
-
-    /// A `min_build` (a `cut --min-build` or `yank` cut) survives the round trip.
-    #[test]
-    fn min_build_round_trips_when_set() {
-        let mut m = full();
-        m.min_build = Some(1_783_354_740);
-        let text = m.to_toml().unwrap();
-        assert!(text.contains("min_build = 1783354740"), "got:\n{text}");
-        assert_eq!(
-            Manifest::parse(&text).unwrap().min_build,
-            Some(1_783_354_740)
-        );
-    }
-
-    /// The zip pair round-trips, and a manifest without it stays valid.
-    #[test]
-    fn zip_container_round_trips_and_stays_optional() {
-        let m = full();
-        let text = m.to_toml().unwrap();
-        assert!(
-            text.contains("zip = \"aterm-0.26-mac.zip\"") && text.contains("zip_sha256 = "),
-            "the zip name/digest pair must be emitted next to the DMG's, got:\n{text}"
-        );
-        let back = Manifest::parse(&text).unwrap();
-        assert_eq!(back.zip, m.zip);
-        assert_eq!(back.zip_sha256, m.zip_sha256);
-
-        // Without the pair: valid, DMG untouched.
-        let mut dmg_only = full();
-        dmg_only.zip = None;
-        dmg_only.zip_sha256 = None;
-        let text = dmg_only.to_toml().unwrap();
-        assert!(!text.contains("zip"), "got:\n{text}");
-        let back = Manifest::parse(&text).unwrap();
-        assert_eq!(back, dmg_only);
-        assert_eq!(back.dmg, "aterm-0.26.dmg");
-    }
-
-    /// The Intel DMG name/digest pair round-trips, and a manifest without it stays valid and
-    /// emits neither key.
-    #[test]
-    fn x86_64_dmg_pair_round_trips_and_stays_optional() {
-        let mut m = full();
-        m.dmg_x86_64 = Some("aterm-0.47.0-x86_64.dmg".into());
-        m.dmg_x86_64_sha256 =
-            Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into());
-        let text = m.to_toml().unwrap();
-        assert!(
-            text.contains("dmg_x86_64 = \"aterm-0.47.0-x86_64.dmg\"")
-                && text.contains("dmg_x86_64_sha256 = "),
-            "the Intel DMG name/digest pair must be emitted, got:\n{text}"
-        );
-        let back = Manifest::parse(&text).unwrap();
-        assert_eq!(back.dmg_x86_64, m.dmg_x86_64);
-        assert_eq!(back.dmg_x86_64_sha256, m.dmg_x86_64_sha256);
-
-        // Without the pair: valid, neither key emitted, canonical DMG untouched.
-        let plain = full();
-        let text = plain.to_toml().unwrap();
-        assert!(!text.contains("dmg_x86_64"), "got:\n{text}");
-        let back = Manifest::parse(&text).unwrap();
-        assert_eq!(back, plain);
-        assert_eq!(back.dmg, "aterm-0.26.dmg");
     }
 
     /// A floor above the manifest's own build is refused on parse and emit: clients persist

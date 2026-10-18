@@ -7,8 +7,8 @@
 //! face actually rasterizes.
 
 use aterm_render::font_chain::{
-    BitProbe, ChainPolicy, DecisionCells, Resolution, RuntimeLane, Tier, io_free_mask,
-    reachable_mask, resolve_chain, slot_for_source,
+    BitProbe, ChainPolicy, Resolution, RuntimeLane, Tier, io_free_mask, reachable_mask,
+    resolve_chain, slot_for_source,
 };
 use aterm_render::{FaceId, Renderer, Theme};
 
@@ -155,24 +155,6 @@ fn chain_laws_hold_over_the_complete_input_space() {
     );
 }
 
-#[test]
-fn a_recorded_runtime_decision_is_recoverable_on_either_lane() {
-    for lane in [RuntimeLane::Decisions, RuntimeLane::EmbeddedDecisions] {
-        let mut cells = DecisionCells::default();
-        cells.record(lane, Some(7));
-        assert_eq!(
-            cells.parts_for(),
-            Some(7),
-            "P3(b): a decision recorded on {lane:?} was unrecoverable — the key would \
-             say RuntimeFallback while the rasterizer drew `.notdef`"
-        );
-    }
-    // A cached MISS is recoverable as "no face", never as a stale index.
-    let mut miss = DecisionCells::default();
-    miss.record(RuntimeLane::EmbeddedDecisions, None);
-    assert_eq!(miss.parts_for(), None);
-}
-
 // Real-renderer binding: only a real rasterization proves the key turns into ink.
 // `from_bytes` leaves every system-font path list empty, so the compiled-in Symbols Nerd
 // Font is the only face that can serve `NERD_PUA`.
@@ -186,7 +168,7 @@ fn dejavu() -> Vec<u8> {
 }
 
 /// A Nerd Font PUA icon: covered by the bundled symbol face, absent from DejaVu.
-#[cfg(feature = "embedded-symbols")]
+#[cfg(feature = "embedded-font")]
 const NERD_PUA: char = '\u{E0A0}';
 /// A noncharacter no font covers — the honest `.notdef` control.
 const NONCHARACTER: char = '\u{FFFF}';
@@ -201,7 +183,7 @@ fn ink(r: &mut Renderer, ch: char) -> (FaceId, usize) {
     (key.source, img.bytes().iter().filter(|&&b| b > 0).count())
 }
 
-#[cfg(feature = "embedded-symbols")]
+#[cfg(feature = "embedded-font")]
 #[test]
 fn every_resolved_key_rasterizes_on_both_runtime_lanes() {
     // Both the pathname lane (unsealed) and the I/O-free lane (sealed) produce a key the

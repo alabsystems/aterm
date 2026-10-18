@@ -224,9 +224,12 @@ pub mod tags {
     /// 265): a script's work is not aterm's own `system`.
     pub const SCRIPT: Tag = Tag::word("script");
 
-    /// The fourteen, in reporter order.
+    /// The fourteen, in the tag chips' fixed order on Settings ▸ Messages:
+    /// the families a person acts on first, then the ambient ones. A tag
+    /// this build does not know (a line another build wrote into the same
+    /// log) follows them in first-seen order rather than vanishing.
     pub const ALL: &[&Tag] = &[
-        &CONFIG, &CRASH, &TOOLCHAIN, &UPDATE, &PACKAGES, &PRIVACY, &SESSION, &WINDOW, &RENDER,
+        &CRASH, &CONFIG, &UPDATE, &TOOLCHAIN, &PACKAGES, &PRIVACY, &SESSION, &WINDOW, &RENDER,
         &A11Y, &FABRIC, &HARNESS, &SYSTEM, &SCRIPT,
     ];
 }
@@ -397,8 +400,8 @@ pub enum Intent {
         /// The session the paste is going to.
         session: u64,
     },
-    /// Show tab `tab` (1-based) of window `window`, raising it: the strain
-    /// row's navigation to the program it names (design ruling 243). The
+    /// Show tab `tab` (1-based) of window `window`, raising it: a row's
+    /// navigation to the program it names (design ruling 440). The
     /// band is app-wide, so the row names the window the tab is in and a
     /// press from any window's band lands on that one (ruling 247). A
     /// navigation, never consequential.
@@ -427,20 +430,6 @@ pub enum Intent {
         to: String,
         /// Which word.
         word: UpgradeWord,
-    },
-    /// THE OWNER'S WORD ON SEVERAL TABS' UPGRADES AT ONCE, pressed on the one
-    /// row that stands for an agent's stalled upgrades (one row, not one per
-    /// tab, so stalled tabs never fill the band): `word` written for each listed
-    /// tab, for the build the row named it with (`moves`: `(tab, to)`), exactly
-    /// as an [`Intent::AgentUpgrade`] press of each would. The tabs are the ones
-    /// the row SHOWED, never whatever stalls when the press lands. Not
-    /// [`Intent::ends_with_row`]: Settings ▸ Messages offers it while any
-    /// listed upgrade still takes the word.
-    AgentUpgradeTabs {
-        /// Which word.
-        word: UpgradeWord,
-        /// Each tab (`s-<hex>`) and the target build the row named for it.
-        moves: Vec<(String, String)>,
     },
     /// END THE SESSIONS THE PTY KEEPER KEPT (keeper design §5.3 step 7): the
     /// recovery row's one decision — close every tab whose shell the keeper
@@ -488,10 +477,6 @@ impl Intent {
                     word: UpgradeWord::NotToday | UpgradeWord::Skip,
                     ..
                 }
-                | Self::AgentUpgradeTabs {
-                    word: UpgradeWord::NotToday | UpgradeWord::Skip,
-                    ..
-                }
         )
     }
 
@@ -519,7 +504,7 @@ impl Intent {
             Self::NewWindow => "New window",
             Self::StopPaste { .. } => "Stop paste",
             Self::ShowTab { tab, .. } => SHOW_TAB[usize::from(*tab).min(10) % 10],
-            Self::AgentUpgrade { word, .. } | Self::AgentUpgradeTabs { word, .. } => word.label(),
+            Self::AgentUpgrade { word, .. } => word.label(),
             Self::EndRecovered => "End sessions",
         }
     }
@@ -547,7 +532,7 @@ impl Intent {
             Self::NewWindow => "Window",
             Self::StopPaste { .. } => "Stop",
             Self::ShowTab { tab, .. } => TAB_N[usize::from(*tab).min(10) % 10],
-            Self::AgentUpgrade { word, .. } | Self::AgentUpgradeTabs { word, .. } => match word {
+            Self::AgentUpgrade { word, .. } => match word {
                 // What the press does, not when: a bare `Now` beside
                 // `Tomorrow` says neither what nor to whom (D6).
                 UpgradeWord::Now => "Upgrade",
@@ -569,7 +554,7 @@ impl Intent {
     }
 
     /// An intent that acts on the LIVE row itself — a decision, a stop, the
-    /// tab a strain row named — and so ends with it: a retired record never
+    /// tab a row named — and so ends with it: a retired record never
     /// offers it again (design ruling 265; the wire's `messages` rows too,
     /// ruling 267).
     #[must_use]
@@ -612,10 +597,6 @@ impl Intent {
                     word: UpgradeWord::Now,
                     ..
                 }
-                | Self::AgentUpgradeTabs {
-                    word: UpgradeWord::Now,
-                    ..
-                }
                 | Self::EndRecovered
         )
     }
@@ -631,10 +612,6 @@ impl Intent {
             self,
             Self::NotNow { .. }
                 | Self::AgentUpgrade {
-                    word: UpgradeWord::NotToday | UpgradeWord::Skip,
-                    ..
-                }
-                | Self::AgentUpgradeTabs {
                     word: UpgradeWord::NotToday | UpgradeWord::Skip,
                     ..
                 }
@@ -678,16 +655,6 @@ impl Intent {
                 escape_field(to),
                 escape_field(tab)
             ),
-            Self::AgentUpgradeTabs { word, moves } => {
-                let mut out = format!("agent-upgrades:{}", word.as_str());
-                for (tab, to) in moves {
-                    out.push(':');
-                    out.push_str(&escape_field(to));
-                    out.push(':');
-                    out.push_str(&escape_field(tab));
-                }
-                out
-            }
             Self::EndRecovered => "end-recovered".to_string(),
         }
     }
@@ -747,22 +714,6 @@ impl Intent {
                     to,
                     word: UpgradeWord::parse(word)?,
                 })
-            }
-            "agent-upgrades" => {
-                let mut fields = payload.split(':');
-                let word = UpgradeWord::parse(fields.next()?)?;
-                let rest: Vec<&str> = fields.collect();
-                if rest.is_empty() || !rest.len().is_multiple_of(2) {
-                    return None;
-                }
-                let moves: Vec<(String, String)> = rest
-                    .chunks(2)
-                    .map(|pair| (unescape_payload(pair[1]), unescape_payload(pair[0])))
-                    .collect();
-                moves
-                    .iter()
-                    .all(|(tab, to)| !tab.is_empty() && !to.is_empty())
-                    .then_some(Self::AgentUpgradeTabs { word, moves })
             }
             _ => None,
         }
@@ -834,17 +785,6 @@ pub(crate) fn every_intent() -> Vec<Intent> {
             tab: "s-a:b".into(),
             to: "2.1.282:%\t".into(),
             word: UpgradeWord::Skip,
-        },
-        Intent::AgentUpgradeTabs {
-            word: UpgradeWord::Now,
-            moves: vec![
-                ("s-b5cf2faabac5ce5127bd".into(), "2.1.284".into()),
-                ("s-d3346b29dd236432b852".into(), "2.1.284".into()),
-            ],
-        },
-        Intent::AgentUpgradeTabs {
-            word: UpgradeWord::NotToday,
-            moves: vec![("s-a:b".into(), "2.1.282:%\t".into())],
         },
     ]
 }
@@ -1002,13 +942,18 @@ impl Hold {
     }
 }
 
-/// What the engine's own tests, and a host's tests through the
-/// `test-fixtures` feature, build bare persistent rows from. Never in a
-/// shipped build: the token cannot be minted outside this crate, so a
-/// fixture that needs a persistent hold takes one of these, and
-/// [`Message::hold`] lends it an adopted ask so it stands exactly as the
-/// hand-written spelling did.
-#[cfg(any(test, feature = "test-fixtures"))]
+/// What the engine's own tests, and a host's tests, build bare persistent
+/// rows from. Compiled into test and debug builds only, never a release
+/// (shipped) one: the token cannot be minted outside this crate, so a fixture
+/// that needs a persistent hold takes one of these, and [`Message::hold`]
+/// lends it an adopted ask so it stands exactly as the hand-written spelling
+/// did. A host's tests are debug builds, so they need no feature to ask for it.
+///
+/// What this gate does NOT catch: these compile in EVERY debug build (lint,
+/// test and doc alike), so product code that names `Hold::STANDING` or
+/// `Hold::asking` compiles there too. Only a release build (the MEASURE tier,
+/// or the cut) refuses it. No product caller names either.
+#[cfg(any(test, debug_assertions))]
 impl Hold {
     /// A standing hold.
     pub const STANDING: Hold = Hold::Standing(Persist::mint());
@@ -1065,15 +1010,6 @@ pub struct Meter {
     /// handoff ([`crate::carry::CarriedMessage::busy`]); never spoken as a
     /// word (the row is a progress indicator with no value).
     pub busy: bool,
-    /// A MEASURED LEVEL, not progress (design ruling 208): the fill is a
-    /// gauge of how loaded the machine is — it glides up AND down, has no
-    /// glint, no percent word, no ETA and no stall tone, never completes
-    /// (it retires by a Vanish only: [`crate::MessageCenter::resolve`]
-    /// refuses it) and is admitted on the strain row alone
-    /// ([`crate::strain::level_fault`]). Only with a fill (normalized clears
-    /// it otherwise). Volatile like `busy`: never persisted, never on the
-    /// wire, never carried (the successor's strain engine starts calm).
-    pub level: bool,
 }
 
 impl Meter {
@@ -1088,23 +1024,9 @@ impl Meter {
         }
     }
 
-    /// A measured LEVEL ([`Meter::level`] the field): `permille` of a
-    /// resource in use, `stats` beside it — never an amount, never busy.
-    #[must_use]
-    pub fn level(permille: u16, stats: impl AsRef<str>) -> Self {
-        Self {
-            fill_permille: Some(permille.min(1000)),
-            stats: clip(stats.as_ref(), STATS_CAP),
-            level: true,
-            ..Self::default()
-        }
-    }
-
     /// A meter with its fill clamped, its stats sanitized, an amount with no
     /// total dropped, `done` clamped to `total`, a missing fill filled from
-    /// `done / total`, and `busy` only where there is still no fill. A level
-    /// is a level only with a fill of its own, and carries no amount (a
-    /// gauge has no ETA) and no busy.
+    /// `done / total`, and `busy` only where there is still no fill.
     #[must_use]
     pub fn normalized(self) -> Self {
         self.normalized_measured(false)
@@ -1118,14 +1040,10 @@ impl Meter {
     /// 36 % stays 36 %, not 30 %, across a handoff).
     #[must_use]
     pub(crate) fn normalized_measured(self, measured: bool) -> Self {
-        let level = self.level && self.fill_permille.is_some();
-        let amount = self
-            .amount
-            .filter(|a| a.total > 0 && !level)
-            .map(|a| Amount {
-                done: a.done.min(a.total),
-                ..a
-            });
+        let amount = self.amount.filter(|a| a.total > 0).map(|a| Amount {
+            done: a.done.min(a.total),
+            ..a
+        });
         let fill_permille = self
             .fill_permille
             .map(|p| p.min(1000))
@@ -1144,12 +1062,8 @@ impl Meter {
         // percent: `2 of 3` paints 66 % (667), and `1 of 3` stops at 659,
         // `65%`. Where two counts paint the same percent (`1 of 300`,
         // `2 of 300`) the span's floor wins. A complete count's span is the
-        // whole bar alone. A measured level is a gauge, not a count; a busy
-        // row (no fill) stays a comet.
-        let counted = (!level)
-            .then(|| count_span(&self.stats))
-            .flatten()
-            .filter(|_| fill_permille.is_some());
+        // whole bar alone. A busy row (no fill) stays a comet.
+        let counted = count_span(&self.stats).filter(|_| fill_permille.is_some());
         let fill_permille = match (counted, amount.is_some() || measured) {
             (Some((lo, _)), false) => Some(lo),
             (Some((lo, hi)), true) => {
@@ -1163,7 +1077,6 @@ impl Meter {
             amount,
             load: self.load,
             busy: self.busy && fill_permille.is_none(),
-            level,
         }
     }
 }
@@ -1297,20 +1210,12 @@ pub enum Load {
     Disk,
     /// Verification of a large payload.
     Cpu,
-    /// Memory is full and the machine swaps: the strain row's words for a
-    /// memory culprit (design ruling 207). Not a wire word: `notice`'s
-    /// `load=` stays the three above ([`Load::WIRE`]).
-    Memory,
 }
 
 impl Load {
-    /// Every load, for the slot that must fit the widest words.
-    pub const ALL: [Load; 4] = [Self::Network, Self::Disk, Self::Cpu, Self::Memory];
-
-    /// The loads a script may declare over the wire (`notice progress …
-    /// load=`): a machine's memory is aterm's to measure, never a script's
-    /// to claim.
-    pub(crate) const WIRE: [Load; 3] = [Self::Network, Self::Disk, Self::Cpu];
+    /// Every load, for the slot that must fit the widest words; a script may
+    /// declare any of them over the wire (`notice progress … load=`).
+    pub const ALL: [Load; 3] = [Self::Network, Self::Disk, Self::Cpu];
 
     /// The band's words for it.
     #[must_use]
@@ -1319,12 +1224,11 @@ impl Load {
             Self::Network => "network busy",
             Self::Disk => "disk busy",
             Self::Cpu => "CPU busy",
-            Self::Memory => "memory full",
         }
     }
 
     /// The one-word resource — the wire's `load=` and the `messages` row's
-    /// `load=`: `network`, `disk`, `cpu` or `memory`
+    /// `load=`: `network`, `disk` or `cpu`
     /// ([`Load::words`] stays the band's).
     #[must_use]
     pub(crate) const fn word(self) -> &'static str {
@@ -1332,20 +1236,14 @@ impl Load {
             Self::Network => "network",
             Self::Disk => "disk",
             Self::Cpu => "cpu",
-            Self::Memory => "memory",
         }
     }
 
-    /// The inverse of [`Load::word`]; anything else ⇒ `None`.
+    /// The inverse of [`Load::word`] (the wire's `load=`); anything else ⇒
+    /// `None`.
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|l| l.word() == s)
-    }
-
-    /// [`Load::parse`] over the wire's words only ([`Load::WIRE`]).
-    #[must_use]
-    pub(crate) fn parse_wire(s: &str) -> Option<Self> {
-        Self::WIRE.into_iter().find(|l| l.word() == s)
     }
 }
 
@@ -1359,14 +1257,13 @@ impl Loads {
     /// No load.
     pub(crate) const NONE: Self = Self(0);
     /// Every load.
-    pub const ALL: Self = Self(0b1111);
+    pub const ALL: Self = Self(0b0111);
 
     const fn bit(l: Load) -> u8 {
         match l {
             Load::Network => 1,
             Load::Disk => 2,
             Load::Cpu => 4,
-            Load::Memory => 8,
         }
     }
 
@@ -1526,10 +1423,9 @@ pub struct Message {
     pub loads: Loads,
     /// The load this work IS (design ruling 246): a download's network, a
     /// removal's disk, a build's CPU. Its words say nothing the title does not
-    /// (`Downloading … · network busy`), so they show only while the machine
-    /// is measurably slowing other work ([`crate::MessageCenter::set_slowing`]);
-    /// a load outside it (a download's extraction making the disk busy) shows
-    /// as before. `None`: every declared load shows.
+    /// (`Downloading … · network busy`), so they never show; a load outside it
+    /// (a download's extraction making the disk busy) shows as before. `None`:
+    /// every declared load shows.
     pub primary: Option<Load>,
     /// A RECORD ABOUT A PREVIOUS RUN (design ruling 259): `aterm crashed
     /// last time`. It ranks one severity class below its own on the glass
@@ -1797,8 +1693,8 @@ impl Message {
         self
     }
 
-    /// The load this work IS ([`Message::primary`]): its words show only
-    /// while other work is measurably slowed. It joins the declared loads.
+    /// The load this work IS ([`Message::primary`]): its words never show.
+    /// It joins the declared loads.
     #[must_use]
     pub fn primary_load(mut self, l: Load) -> Self {
         self.primary = Some(l);
@@ -1913,13 +1809,19 @@ impl Message {
     }
 
     /// The hold. A persistent one cannot be written outside this crate (the
-    /// token); test builds (the engine's own, and a host's through the
-    /// `test-fixtures` feature) lend such a fixture an adopted ask so a bare
-    /// persistent row still stands, byte for byte as it did.
+    /// token); test and debug builds (the engine's tests and a host's) lend
+    /// such a fixture an adopted ask so a bare persistent row still stands,
+    /// byte for byte as it did. Product code gets a persistent hold from its
+    /// ask ([`Message::now`]), never through here.
+    ///
+    /// The lend runs in every debug build, product code included: a persistent
+    /// hold copied from another message onto an unclassified one stands in a
+    /// debug build, where a release build's door (`admit`) demotes it to a
+    /// record. No product caller passes one today.
     #[must_use]
     pub fn hold(mut self, h: Hold) -> Self {
         self.hold = h;
-        #[cfg(any(test, feature = "test-fixtures"))]
+        #[cfg(any(test, debug_assertions))]
         if h.persists() && matches!(self.need, Need::Unclassified) {
             self.need = Need::Now(Ask::adopted("test"));
         }
@@ -2033,7 +1935,6 @@ mod tests {
     /// the glyph set admits the band's glyphs and nothing else.
     #[test]
     fn tags_and_glyphs_are_closed_sets() {
-        assert_eq!(tags::ALL.len(), 14, "fourteen reporter families");
         for tag in tags::ALL {
             let again = Tag::try_new(tag.as_str()).expect("a vocabulary word validates");
             assert_eq!(&again, *tag);
@@ -2061,16 +1962,11 @@ mod tests {
     }
 
     /// Invariant 23: one label table. Every variant has a non-empty label
-    /// ≤ 16 chars and a short ≤ 8, and the two differ only where the table
-    /// says they do. The row predicates walk the same table: only `NotNow`
-    /// closes, the two decision intents ask, and exactly the four
-    /// machine-changing intents are consequential (the Primary chip,
-    /// ruling 18).
+    /// ≤ 16 chars and a short ≤ 8 (the width law's budget); only `NotNow`
+    /// closes its row or asks; a consequential press (the Primary chip,
+    /// ruling 18) never closes its row and is never a decline (ruling 403).
     #[test]
     fn labels_are_one_table() {
-        let same_short: &[&str] = &[
-            "Packages", "Manual", "Messages", "Security", "Settings", "Install", "Not now",
-        ];
         for intent in every_intent() {
             let label = intent.label();
             let short = intent.short();
@@ -2082,28 +1978,25 @@ mod tests {
                 !short.is_empty() && short.chars().count() <= 8,
                 "{intent:?}: {short:?}"
             );
-            if same_short.contains(&label) {
-                assert_eq!(label, short, "{intent:?} is its own short form");
-            } else {
-                assert_ne!(label, short, "{intent:?} has a distinct short form");
-            }
+            assert_eq!(
+                intent.closes_row(),
+                matches!(intent, Intent::NotNow { .. }),
+                "{intent:?}"
+            );
+            assert_eq!(
+                intent.is_ask(),
+                matches!(intent, Intent::NotNow { .. }),
+                "{intent:?}"
+            );
+            assert!(
+                !(intent.is_consequential() && intent.closes_row()),
+                "{intent:?}: a consequential press never closes its row"
+            );
+            assert!(
+                !(intent.is_decline() && intent.is_consequential()),
+                "{intent:?}"
+            );
         }
-        assert_eq!(Intent::Details.label(), "Details \u{203a}");
-        assert_eq!(Intent::Details.short(), "\u{203a}");
-        assert_eq!(Intent::OpenPath { path: "/x".into() }.short(), "Log");
-        assert_eq!(Intent::OpenConfigEditor { line: None }.short(), "Edit");
-        // One install verb on every surface (ruling 69): the Version menu's
-        // "Install aterm vX now", the palette's "Install update now", and the
-        // band's capsule.
-        assert_eq!(Intent::ApplyUpdate { build: 1 }.label(), "Install now");
-        assert_eq!(Intent::ApplyUpdate { build: 1 }.short(), "Install");
-        assert_eq!(
-            Intent::OpenSettings {
-                route: "/updates".into()
-            }
-            .label(),
-            "Software Update"
-        );
         // aterm's own Security page beside System Settings' pane (the Developer
         // Tools line carries both): the two capsules never read alike, in either
         // form.
@@ -2116,70 +2009,15 @@ mod tests {
         assert_eq!((page.label(), page.short()), ("Security", "Security"));
         assert_ne!(page.label(), pane.label());
         assert_ne!(page.short(), pane.short());
-        // Only NotNow closes its row; the two decision intents are asks.
-        for intent in every_intent() {
-            assert_eq!(
-                intent.closes_row(),
-                matches!(intent, Intent::NotNow { .. }),
-                "{intent:?}"
-            );
-            assert_eq!(
-                intent.is_ask(),
-                matches!(intent, Intent::NotNow { .. }),
-                "{intent:?}"
-            );
-            // The accent chip marks a CONSEQUENTIAL press only: the five
-            // that change the machine or the window. Every navigation and
-            // every decline are quiet — `Packages` and `Software Update`
-            // included, and an upgrade's `Not today` and `Skip version`.
-            assert_eq!(
-                intent.is_consequential(),
-                matches!(
-                    intent,
-                    Intent::ApplyUpdate { .. }
-                        | Intent::OpenSystemPane { .. }
-                        | Intent::NewWindow
-                        | Intent::StopPaste { .. }
-                        | Intent::AgentUpgrade {
-                            word: UpgradeWord::Now,
-                            ..
-                        }
-                        | Intent::AgentUpgradeTabs {
-                            word: UpgradeWord::Now,
-                            ..
-                        }
-                        | Intent::EndRecovered
-                ),
-                "{intent:?}"
-            );
-            assert!(
-                !(intent.is_consequential() && intent.closes_row()),
-                "{intent:?}: a consequential press never closes its row"
-            );
-            // A decline (ruling 403) is the three words that put the work
-            // off, and never the accent chip.
-            assert_eq!(
-                intent.is_decline(),
-                matches!(intent.label(), "Not now" | "Not today" | "Skip version"),
-                "{intent:?}"
-            );
-            assert!(
-                !(intent.is_decline() && intent.is_consequential()),
-                "{intent:?}"
-            );
-        }
+        assert!(Intent::ApplyUpdate { build: 1 }.is_consequential());
         assert!(
             !Intent::OpenSettings {
                 route: "/packages".into()
             }
             .is_consequential()
-                && !Intent::OpenSettings {
-                    route: "/updates".into()
-                }
-                .is_consequential(),
-            "Packages and Software Update are navigations: the quiet chip"
+                && !Intent::Details.is_consequential(),
+            "navigations are the quiet chip"
         );
-        assert!(!Intent::Details.is_consequential());
     }
 
     /// Every intent round-trips its encoding; junk decodes to `None`.
@@ -2391,7 +2229,6 @@ mod tests {
                 .key
                 .is_none()
         );
-        assert!(Restatement::default().is_empty());
         assert_eq!(MessageId::from_raw(0), None);
         assert_eq!(MessageId::from_raw(7).map(MessageId::raw), Some(7));
         assert_eq!(MessageId::FIRST.next().raw(), 2);

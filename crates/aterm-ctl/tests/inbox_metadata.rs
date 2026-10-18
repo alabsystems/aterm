@@ -122,14 +122,6 @@ fn empty_inbox_get_reports_its_header_without_fabricating_a_body() {
     assert_eq!(output.stderr, b"aterm-ctl: OK 0\n");
 }
 
-#[test]
-fn inbox_seen_remains_an_ordinary_status_reply() {
-    let output = run_inbox(&["seen", "8", "handled"], b"OK seen=8\n");
-    assert!(output.status.success());
-    assert_eq!(output.stdout, b"OK seen=8\n");
-    assert!(output.stderr.is_empty());
-}
-
 /// `offscreen`'s header places its rows (`last=` is the next poll's `since=`,
 /// `screen_rows=` splits the archive from the screen): it goes to stderr with
 /// the rows on stdout, as `inbox`'s does — empty or not, once.

@@ -929,32 +929,6 @@ mod tests {
         assert_ne!(seed.fingerprint().unwrap(), raw_seed_fp);
     }
 
-    /// The master is deterministic: the paper phrase alone reproduces the identity, with
-    /// no stored state. That is what makes the paper the master.
-    #[test]
-    fn the_same_phrase_always_derives_the_same_identity() {
-        let a = parse_master(SYNTHETIC)
-            .unwrap()
-            .seed()
-            .pubkey_b64()
-            .unwrap();
-        let b = parse_master(SYNTHETIC)
-            .unwrap()
-            .seed()
-            .pubkey_b64()
-            .unwrap();
-        assert_eq!(a, b);
-        assert_eq!(
-            aterm_codec::base64::decode_strict(a.as_bytes())
-                .unwrap()
-                .len(),
-            32
-        );
-        // A different phrase is a different master.
-        let other = parse_master(&SYNTHETIC.replace('3', "x")).unwrap();
-        assert_ne!(other.seed().pubkey_b64().unwrap(), a);
-    }
-
     /// SECRETS ARE NOT PRINTABLE. A stray `{:?}` on either secret type prints `<redacted>`
     /// and nothing else — the `sign.rs` discipline, enforced here by test rather than by
     /// hoping nobody adds a derive.

@@ -8,7 +8,6 @@ use crate::grid::Grid;
 use crate::parser::Parser;
 use crate::scrollback::Scrollback;
 
-#[cfg(feature = "sixel")]
 use super::grouped_state::SixelState;
 use super::grouped_state::{
     BiDiGroupState, ClipboardState, ColorState, CursorSaveState, DcsState, Iterm2State, MarksState,
@@ -56,6 +55,7 @@ impl Terminal {
             last_bell_time: None,
             bell_total: 0,
             default_cursor_style: aterm_types::CursorStyle::default(),
+            host_alternate_scroll: false,
             notifications: NotificationState::new(),
             clipboard: ClipboardState::new(),
             iterm2: Iterm2State::new(),
@@ -75,7 +75,6 @@ impl Terminal {
             kitty_keyboard: KittyKeyboardState::new(),
             xterm_keyboard: XtermKeyboardState::new(),
             mode_mirror: std::sync::Arc::default(),
-            #[cfg(feature = "sixel")]
             sixel: SixelState::new(),
             window_callback: None,
             text_selection: crate::selection::TextSelection::new(),
@@ -87,7 +86,6 @@ impl Terminal {
             last_selection_taker: None,
             reader_gestures: 0,
             secure_keyboard_entry: false,
-            vi: crate::vi_mode::ViMode::new(),
             sync_timeout_duration: std::time::Duration::from_secs(1),
             clipboard_auth: super::clipboard_auth::ClipboardAuth::new(),
             shell_integration_auth: super::shell_integration_auth::ShellIntegrationAuth::new(),

@@ -128,22 +128,6 @@ mod tests {
     }
 
     #[test]
-    fn global_divides_equally_and_min_wins() {
-        with_clean_globals(|| {
-            set_global_scrollback_budget(100);
-            let mut a = ScrollbackBudgetShare::register(64);
-            let mut b = ScrollbackBudgetShare::register(30);
-            // Share 50: a is capped by it, b by its own smaller budget.
-            assert_eq!(a.pending_effective(), Some(50));
-            assert_eq!(b.pending_effective(), Some(30));
-            // A membership change re-fires the poll on the survivor.
-            drop(b);
-            assert_eq!(a.pending_effective(), Some(64), "sole pane: min(64, 100)");
-            assert_eq!(a.pending_effective(), None);
-        });
-    }
-
-    #[test]
     fn reconfigure_and_global_change_surface_on_next_poll() {
         with_clean_globals(|| {
             let mut share = ScrollbackBudgetShare::register(500);

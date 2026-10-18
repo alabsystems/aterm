@@ -56,66 +56,13 @@ fn screen(t: &Terminal) -> Vec<String> {
     (0..usize::from(ROWS)).map(|r| row(t, r)).collect()
 }
 
-#[test]
-fn a_split_sgr_across_the_handoff_applies() {
-    let mut successor = handed_over(b"\x1b[38;5;19", b"6mX");
-    assert_eq!(row(&successor, 0), "X", "the tail finished the SGR");
-    let mut reference = never_handed_over(b"\x1b[38;5;19", b"6mX");
-    let (got, want) = (frame(&mut successor), frame(&mut reference));
-    assert_eq!(got.cells[0][0].ch, 'X');
-    assert_eq!(
-        got.cells[0][0].fg, want.cells[0][0].fg,
-        "X has the palette-196 foreground"
-    );
-    assert_eq!(want.cells[0][0].fg, [0xff, 0x00, 0x00], "xterm palette 196");
-}
-
-#[test]
-fn a_split_utf8_across_the_handoff_is_one_glyph() {
-    // 漢 is E6 BC A2 and 😀 is F0 9F 98 80: split after each glyph's first
-    // and second bytes.
-    for (head, tail) in [
-        (&b"a\xe6"[..], &b"\xbc\xa2b"[..]),
-        (&b"a\xe6\xbc"[..], &b"\xa2b"[..]),
-        (&b"a\xf0\x9f"[..], &b"\x98\x80b"[..]),
-        (&b"a\xc3"[..], &b"\xa9b"[..]),
-    ] {
-        let successor = handed_over(head, tail);
-        assert_eq!(
-            row(&successor, 0),
-            row(&never_handed_over(head, tail), 0),
-            "{head:?} | {tail:?}"
-        );
-        assert!(
-            !row(&successor, 0).contains('\u{FFFD}'),
-            "{head:?} | {tail:?}: no replacement character"
-        );
-    }
-}
-
-#[test]
-fn an_unterminated_osc_title_completes_after_the_handoff() {
-    for (head, tail) in [
-        (&b"$ \x1b]0;vim ma"[..], &b"in.rs\x07"[..]),
-        (&b"$ \x1b]2;vim main.rs"[..], &b"\x1b\\"[..]),
-        (&b"$ \x1b]"[..], &b"0;vim main.rs\x07"[..]),
-        (&b"$ \x1b"[..], &b"]0;vim main.rs\x07"[..]),
-    ] {
-        let successor = handed_over(head, tail);
-        assert_eq!(successor.title(), "vim main.rs", "{head:?} | {tail:?}");
-        assert_eq!(row(&successor, 0), "$", "{head:?}: nothing printed as text");
-    }
-}
-
 /// A DCS string split in its header is read after the handoff as it would have been: the
 /// header rides as itself, so split at every byte up to the final byte, through either
 /// restore door, the successor replies exactly as one engine fed the whole stream does
 /// (a DECRQSS or XTGETTCAP query is answered) and draws the same screen, cursor included.
 ///
 /// The third stream is a sixel header holding an 8-bit ST, which the engine drops (C1
-/// controls are off). With aterm-core's `sixel` feature (on in any build that links
-/// aterm-gui, so in `targo test --workspace`) the reference draws the image on row 0 and
-/// `after` below it; without it the string is consumed and `after` is row 0. Either way
+/// controls are off): the reference draws the image on row 0 and `after` below it, and
 /// the payload is never text.
 #[test]
 fn a_dcs_string_split_in_its_header_is_read_as_it_would_have_been() {
@@ -132,9 +79,6 @@ fn a_dcs_string_split_in_its_header_is_read_as_it_would_have_been() {
             want.iter().any(|r| r == "after") && !want.concat().contains('#'),
             "{stream:?}: `after` on a line of its own, the payload never text: {want:?}"
         );
-        if !cfg!(feature = "sixel") {
-            assert_eq!(row(&reference, 0), "after", "{stream:?}");
-        }
         let final_byte = stream
             .iter()
             .position(|&b| b == b'q')

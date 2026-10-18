@@ -106,8 +106,9 @@ struct VisibilityHold {
     /// Whether the hidden state was entered by fiat (a selection, or a
     /// placement search that came back empty) rather than by perception. Those
     /// yield at once, and are not charged the dwell on the way back either,
-    /// since the dwell discounts perception wobble. Pinned by
-    /// `full_selection_still_protects_the_console_and_explains_the_hidden_body`.
+    /// since the dwell discounts perception wobble. Pinned by the
+    /// `ProtectAll`/`Release` steps of
+    /// `real_cursor_home_placement_conforms_and_rejects_the_historical_hidden_body`.
     by_fiat: bool,
 }
 
@@ -489,6 +490,15 @@ impl PetBrain {
     #[must_use]
     pub fn console_input_seq(&self) -> u64 {
         self.console.seq
+    }
+
+    /// The console world the last observation read, as the pet judges a
+    /// seat by it (`None` before any): what a host proves its exclusions
+    /// against — a cell the host painted chrome on reads
+    /// [`crate::pet_world::PetCell::Protected`] here or the pet may sit on it.
+    #[must_use]
+    pub fn console_world(&self) -> Option<&PetWorld> {
+        self.console.world.as_deref()
     }
 
     #[must_use]

@@ -388,7 +388,7 @@ fn assert_capture_return_conforms(
     deadline: bool,
     still_live: &'static str,
 ) {
-    let model = aterm_spec::derive::harness_capture_worker_lifecycle_model();
+    let model = aterm_models_harness::harness_capture_worker_lifecycle_model();
     let mut state = model.init_state();
     state.insert("child_reaped", i64::from(observed.child_reaped));
     state.insert("reader_done", i64::from(observed.reader_done));

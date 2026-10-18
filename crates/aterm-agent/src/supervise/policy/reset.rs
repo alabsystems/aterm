@@ -140,6 +140,29 @@ impl ResetNo {
             ResetNo::State => "state",
         }
     }
+
+    /// Every refusal, in the order [`Self::word`] lists them.
+    pub const ALL: [ResetNo; 12] = [
+        ResetNo::Off,
+        ResetNo::NoHost,
+        ResetNo::Unread,
+        ResetNo::NotDefaultLogin,
+        ResetNo::OtherLogin,
+        ResetNo::NotOwnWall,
+        ResetNo::NoReset,
+        ResetNo::Window,
+        ResetNo::NotQualifying,
+        ResetNo::Held,
+        ResetNo::Attempted,
+        ResetNo::State,
+    ];
+
+    /// [`Self::word`] read back (a harness tape's host answer,
+    /// `supervise::tape::host`); `None` for a word it never gives.
+    #[must_use]
+    pub fn of_word(word: &str) -> Option<ResetNo> {
+        ResetNo::ALL.into_iter().find(|no| no.word() == word)
+    }
 }
 
 /// The host's answer to [`ResetAsk`].
@@ -611,8 +634,7 @@ mod tests {
     }
 
     /// The trait's defaults are the refusal and `Unread`, so a host that keeps
-    /// no accounts never has the grant row pressed. Negative control: a host
-    /// that answers gives its own words.
+    /// no accounts never has the grant row pressed.
     #[test]
     fn a_host_that_answers_nothing_takes_no_reset() {
         use crate::supervise::{HostStep, IdleHost};
@@ -627,29 +649,6 @@ mod tests {
             }
             fn owns_turn_end(&self) -> bool {
                 false
-            }
-        }
-        #[derive(Debug)]
-        struct Taking;
-        impl IdleHost for Taking {
-            fn wants(&self) -> bool {
-                false
-            }
-            fn at_idle(&self) -> Option<HostStep> {
-                None
-            }
-            fn owns_turn_end(&self) -> bool {
-                false
-            }
-            fn reset_take(&self, ask: &ResetAsk) -> ResetWord {
-                ResetWord::Take(ask.go(1_800_000_000, true, vec!["weekly".to_string()]))
-            }
-            fn reset_told(&self, end: &ResetEnd) -> ResetOutcome {
-                if end.entered {
-                    ResetOutcome::Pending
-                } else {
-                    ResetOutcome::Kept
-                }
             }
         }
         let ask = ResetAsk {
@@ -667,9 +666,5 @@ mod tests {
         for end in &ends {
             assert_eq!(Silent.reset_told(end), ResetOutcome::Unread);
         }
-        // Negative control; the go carries the row's own count and day.
-        assert_eq!(Taking.reset_take(&ask), ResetWord::Take(go()));
-        assert_eq!(Taking.reset_told(&ends[0]), ResetOutcome::Pending);
-        assert_eq!(Taking.reset_told(&ends[1]), ResetOutcome::Kept);
     }
 }

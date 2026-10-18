@@ -6,7 +6,7 @@
 // `EffectsPipeline` cat survives the GPU present path. `free_parity.rs` holds the cross-backend
 // laws.
 //
-// No GPU or no font: the tests no-op.
+// No GPU or no font: COULD NOT RUN.
 
 use crate::common;
 use std::sync::Arc;

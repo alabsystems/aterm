@@ -3,14 +3,16 @@
 
 //! The whole script, run as a person runs it: the whole-file execution guard
 //! (a truncated `curl … | bash` runs nothing), install-mode `--dry-run`'s
-//! zero-mutation plan, the toolset stand-down, and `--uninstall`'s ownership.
+//! zero-mutation plan, the toolset stand-down, and `--uninstall`'s hand-off to
+//! the installed aterm's own sweep (`aterm pkg self-uninstall`, whose ownership
+//! rules are atpkg's tests now).
 //! Every run has a scratch HOME and TMPDIR and a PATH of the stubs it names;
 //! the network is a logger or a stub that serves one release.
 
 use std::path::Path;
 
 use crate::support::{
-    Home, Lib, Run, SYSTEM_PATH, Scratch, bash, hermetic, install_sh, installer, q, read, run, s,
+    Home, Run, SYSTEM_PATH, Scratch, bash, hermetic, install_sh, installer, q, read, run, s,
     symlink, tree, write,
 };
 
@@ -270,8 +272,9 @@ fn a_dry_run_prints_the_plan_and_changes_nothing() {
         assert!(plan.contains(&fact), "the plan names {fact:?}: {plan}");
     }
     assert!(
-        !plan.contains("marker-fenced block"),
-        "no toolset hook, no rc edit: {plan}"
+        plan.contains("`aterm pkg shell-setup --path --dry-run` names the file")
+            && plan.contains("--no-path"),
+        "the PATH edit is the installed aterm's, named with its opt-out: {plan}"
     );
     let pointer: Vec<&String> = dry
         .requests
@@ -313,71 +316,204 @@ fn a_dry_run_prints_the_plan_and_changes_nothing() {
         "{plan}"
     );
     assert_eq!(tree(&foreign.home), before);
-
-    // With the toolset hook already laid, the plan discloses the rc edit it
-    // would make — and still writes nothing.
-    let hooked = scratch.home("dry-hook");
-    write(&hooked.home.join(".aterm/shell.d/00-atpkg.zsh"), "");
-    let before = tree(&hooked.home);
-    let dry = dry_run(&scratch, &hooked, &["--dry-run", "--no-toolchain"]);
-    let plan = dry.run.all();
-    assert_eq!(dry.run.code(), 0, "{plan}");
-    assert!(
-        plan.contains(&format!(
-            "marker-fenced block to {}/.zshrc",
-            s(&hooked.home)
-        )) && plan.contains("--no-path"),
-        "{plan}"
-    );
-    assert_eq!(tree(&hooked.home), before);
-    assert_eq!(tree(&hooked.tmp), Vec::<String>::new());
 }
 
-/// The PATH block's marker pair and the store's argv0 aliases, as the
-/// installer defines them.
-fn installer_constants(scratch: &Scratch) -> (String, String, Vec<String>) {
-    let mut lib = Lib::new();
-    let call = lib.call(
-        ":",
-        &[
-            "ATERM_PATH_BLOCK_START_MARKER",
-            "ATERM_PATH_BLOCK_END_MARKER",
-            "STORE_ALIASES",
-        ],
-    );
-    let recs = lib.run(scratch);
-    let rec = &recs[call];
-    (
-        rec.var("ATERM_PATH_BLOCK_START_MARKER").to_string(),
-        rec.var("ATERM_PATH_BLOCK_END_MARKER").to_string(),
-        rec.var("STORE_ALIASES")
-            .split_whitespace()
-            .map(str::to_string)
-            .collect(),
-    )
-}
+/// The public channel's download host with ONE release, `v9.9.9`, that
+/// publishes no Linux executable: the latest pointer, and a 404 for either
+/// architecture's raw binary. Only alabsystems/aterm is served — any other
+/// repository, URL or request shape fails the run.
+const PUBLIC_NO_LINUX_STUB: &str = r#"#!/bin/sh
+head=0 follow=0 fmt="" url=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+	-I) head=1 ;;
+	-fsSIL) head=1; follow=1 ;;
+	-fsSL) follow=1 ;;
+	-w) fmt="$2"; shift ;;
+	--proto | --proto-redir | --connect-timeout | --max-time | --max-filesize | --retry | -o) shift ;;
+	-*) ;;
+	*) url="$1" ;;
+	esac
+	shift
+done
+echo "$head$follow $url" >>"${STUB_LOG:?}"
+BASE="https://github.com/alabsystems/aterm/releases"
+case "$head$follow $url" in
+"10 $BASE/latest/download/aterm-appcast.toml")
+	printf '%s' "$fmt" | sed "s#%{http_code}#302#; s#%{redirect_url}#$BASE/download/v9.9.9/aterm-appcast.toml#" ;;
+"10 $BASE/download/v9.9.9/aterm-9.9.9-linux-aarch64" | "10 $BASE/download/v9.9.9/aterm-9.9.9-linux-x86_64")
+	printf '%s' "$fmt" | sed "s#%{http_code}#404#" ;;
+*) echo "curl stub: unexpected request: $head$follow $url" >&2; exit 64 ;;
+esac
+"#;
 
-/// `--uninstall --dry-run` decides about what it owns — a planted managed
-/// PATH block — and leaves the profile byte for byte.
+/// `uname` of an aarch64 Linux machine.
+const AARCH64_UNAME: &str = "#!/bin/sh\ncase \"$1\" in -m) echo aarch64 ;; *) echo Linux ;; esac\n";
+
+/// `curl … | bash` on an aarch64 Linux machine, as alab.systems hands it out:
+/// with no checkout and no ATERM_REPO_SLUG the script installs from the public
+/// channel (alabsystems/aterm). When the latest release publishes no Linux
+/// executable for the machine, both halves say so in Linux's terms — the one
+/// release inspected publishes none (no `--version` it cannot back), and a
+/// source build needs Trust, which publishes no Linux build, and then a clone
+/// of aterm whose own tools/install.sh builds it — never an aterm.app, a clone
+/// offered before Trust (it cannot build), or a tarball; a real run then says
+/// nothing was installed.
 #[test]
-fn an_uninstall_dry_run_plans_and_changes_nothing() {
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the Linux lane's pre-flight needs Python's memfd_create and coreutils timeout"
+)]
+fn a_piped_linux_run_installs_from_the_public_channel_and_says_what_it_lacks() {
     let scratch = Scratch::new();
-    let (start, end, _) = installer_constants(&scratch);
+    let shim = scratch.mkdir("piped-linux");
+    scratch.stand_in("piped-linux/curl", PUBLIC_NO_LINUX_STUB);
+    scratch.stand_in("piped-linux/gh", NO_GH);
+    scratch.stand_in("piped-linux/uname", AARCH64_UNAME);
+    let script = install_sh();
+    let piped = |name: &str, args: &str| {
+        let home = scratch.home(name);
+        let log = scratch.join(&format!("{name}/requests.log"));
+        write(&log, "");
+        let mut cmd = aterm_uds::spawnfd::command("/bin/sh");
+        cmd.arg("-c")
+            .arg(format!(
+                "exec {} -s -- {args} <{}",
+                q(s(&bash())),
+                q(s(&script))
+            ))
+            .env_clear();
+        let path = format!("{}:{SYSTEM_PATH}", s(&shim));
+        for (key, value) in hermetic(&home, &[("PATH", &path), ("STUB_LOG", s(&log))]) {
+            cmd.env(key, value);
+        }
+        let ran = run(&mut cmd);
+        let requests: Vec<String> = read(&log).lines().map(str::to_string).collect();
+        (ran, requests)
+    };
+    let app_skip = "the latest release v9.9.9 publishes no Linux aarch64 executable \
+                    (aterm-9.9.9-linux-aarch64) — nothing to install on this machine yet";
+    let cargo_skip = "building from source needs a checkout (a piped script has none) and \
+                      the Trust toolchain, which has no published build for Linux \
+                      (https://github.com/alabsystems/trust builds from source); once Trust \
+                      is built and linked (rustup toolchain link trust <prefix>): git clone \
+                      https://github.com/alabsystems/aterm && cd aterm && tools/install.sh";
+    for (name, args) in [("plan", "--dry-run"), ("real", "")] {
+        let (ran, requests) = piped(name, args);
+        let out = ran.all();
+        assert_eq!(
+            requests.first().map(String::as_str),
+            Some(
+                "10 https://github.com/alabsystems/aterm/releases/latest/download/aterm-appcast.toml"
+            ),
+            "{name}: the public channel's latest pointer first: {requests:?}\n{out}"
+        );
+        for request in &requests {
+            assert!(
+                request.starts_with("10 https://github.com/alabsystems/aterm/releases/"),
+                "{name}: only HEADs of the public channel's download host: {request}"
+            );
+        }
+        assert!(out.contains(app_skip), "{name}: {out}");
+        assert!(out.contains(cargo_skip), "{name}: {out}");
+        // The clone is named only as the step after Trust, never on its own.
+        let elsewhere = out.replace(cargo_skip, "");
+        assert!(
+            !elsewhere.contains("git clone"),
+            "{name}: a clone offered apart from Trust: {out}"
+        );
+        for wrong in ["aterm.app", "--version", "tarball", "curl stub:"] {
+            assert!(!out.contains(wrong), "{name}: says {wrong:?}: {out}");
+        }
+        if name == "plan" {
+            assert_eq!(ran.code(), 0, "{out}");
+        } else {
+            assert_eq!(ran.code(), 1, "{out}");
+            assert!(
+                out.contains(
+                    "SKIPPED the CLI (aterm): this run installed no released aterm (see the \
+                     app line)"
+                ),
+                "{out}"
+            );
+            assert!(out.contains("install.sh: nothing was installed"), "{out}");
+        }
+    }
+}
+
+/// `--uninstall` is the installed aterm's own sweep: install.sh hands it the
+/// run's overrides (the scope, the bin and store dirs, `--dry-run`) and runs
+/// nothing of its own — here a store-placed stand-in that answers as aterm and
+/// knows the verb, and logs what it was asked.
+#[test]
+fn uninstall_runs_the_installed_aterms_own_sweep() {
+    let scratch = Scratch::new();
     let home = scratch.home("u");
-    let rc = home.home.join(".zshrc");
-    let profile = format!("{start}\nexport PATH=\"$HOME/.local/bin:$PATH\"\n{end}\n");
-    write(&rc, &profile);
-    let run = installer(&install_sh(), &home, &[], &["--uninstall", "--dry-run"]);
+    let store = scratch.mkdir("u/store");
+    let log = scratch.join("u/calls.log");
+    scratch.stand_in(
+        "u/store/aterm",
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then echo \"aterm 0.0.0\"; exit 0; fi\n\
+         echo \"$*\" >>\"${STUB_LOG:?}\"\nexit 0\n",
+    );
+    let apps = s(&home.home.join("Applications")).to_string();
+    let run = installer(
+        &install_sh(),
+        &home,
+        &[("ATERM_STORE_DIR", s(&store)), ("STUB_LOG", s(&log))],
+        &["--uninstall", "--dry-run"],
+    );
     assert_eq!(run.code(), 0, "{}", run.all());
+    let calls = read(&log);
     assert!(
-        run.stdout
-            .contains(&format!("would remove PATH block: {}", s(&rc))),
+        calls.starts_with(
+            "pkg help self-uninstall
+"
+        ),
+        "{calls}"
+    );
+    assert!(
+        calls.contains(&format!(
+            "pkg self-uninstall --dry-run --install-dir {apps} --store-dir {}",
+            s(&store)
+        )),
+        "{calls}"
+    );
+}
+
+/// With no runnable aterm there is nothing to sweep with: `--uninstall`
+/// refuses, changes nothing, and lists what install.sh placed that is there —
+/// never a foreign `aterm`, which it does not run.
+#[test]
+fn uninstall_without_an_aterm_refuses_and_lists_what_is_there() {
+    let scratch = Scratch::new();
+    let home = scratch.home("none");
+    let rc = home.home.join(".zshrc");
+    let profile =
+        "# >>> aterm ALab toolset (managed by install.sh) >>>\nx\n# <<< aterm ALab toolset <<<\n";
+    write(&rc, profile);
+    // A foreign `aterm` on PATH (the X11 terminal's name): not ours, never run.
+    let ran = scratch.join("none/foreign-ran");
+    let foreign = home.home.join(".local/bin/aterm");
+    write(
+        &foreign,
+        format!("#!/bin/sh\necho \"aterm 1.0\"\ntouch {}\n", q(s(&ran))),
+    );
+    crate::support::chmod(&foreign, 0o755);
+    let before = tree(&home.home);
+    let run = installer(&install_sh(), &home, &[], &["--uninstall"]);
+    assert_eq!(run.code(), 1, "{}", run.all());
+    assert!(run.all().contains("nothing was removed"), "{}", run.all());
+    assert!(
+        run.all()
+            .contains(&format!("{}: the marker-fenced aterm block", s(&rc))),
         "{}",
         run.all()
     );
-    assert!(run.stdout.contains("1 item(s)"), "{}", run.all());
+    assert!(run.all().contains(s(&foreign)), "{}", run.all());
+    assert!(!ran.exists(), "a foreign aterm is never run");
     assert_eq!(read(&rc), profile);
-    assert_eq!(tree(&home.home), [".zshrc"]);
+    assert_eq!(tree(&home.home), before);
 }
 
 /// A toolchain-only run that stands aside for another atpkg run (`pkg seed`
@@ -415,131 +551,6 @@ fn a_toolset_stand_down_is_not_a_failure() {
         assert!(!run.all().contains(claim), "{claim:?}: {}", run.all());
     }
     assert_eq!(run.code(), 0, "{}", run.all());
-}
-
-/// An aterm bundle whose atpkg sweeps as `uninstall --all` does (records the
-/// decline when none is there) and logs that it ran.
-fn aterm_bundle(scratch: &Scratch, app: &str, swept: Option<&Path>) {
-    write(
-        &scratch.join(&format!("{app}/Contents/Info.plist")),
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\n<key>CFBundleIdentifier</key><string>com.aterm.aterm</string></dict></plist>\n",
-    );
-    if let Some(log) = swept {
-        scratch.exe(
-            &format!("{app}/Contents/MacOS/atpkg"),
-            &format!(
-                "#!/bin/sh\necho swept >>{}\np=\"$HOME/Library/Application Support/aterm/pkg\"\nmkdir -p \"$p\" && {{ [ -f \"$p/declined\" ] || echo declined >\"$p/declined\"; }}\n",
-                q(s(log))
-            ),
-        );
-    }
-}
-
-/// `--uninstall` removes from ATERM_STORE_DIR only what the store lanes place
-/// there — the aterm binary, its argv0 aliases, the updater's dir, a staging
-/// leftover — and keeps a bundle whose toolchain sweep failed, since the remedy
-/// it prints runs that bundle's atpkg.
-#[test]
-fn uninstall_removes_only_what_it_placed() {
-    let scratch = Scratch::new();
-    let (_, _, aliases) = installer_constants(&scratch);
-    assert!(!aliases.is_empty());
-    let store = scratch.mkdir("own/store");
-    scratch.mkdir("own/store/.aterm-update");
-    scratch.exe("own/store/backup.sh", "#!/bin/sh\necho backup\n");
-    scratch.stand_in("own/store/aterm", "#!/bin/sh\necho \"aterm 0.0.0\"\n");
-    scratch.write("own/store/.aterm-install.Ab12Cd", "");
-    for alias in &aliases {
-        symlink("aterm", &store.join(alias));
-    }
-    // The store's `aterm` is probed under the installer's production bound; run
-    // it once first, as the install that placed it did, so the system's
-    // first-exec code assessment is not what the bound measures.
-    run(aterm_uds::spawnfd::command(store.join("aterm")).arg("--version"));
-    aterm_bundle(&scratch, "own/apps/aterm.app", None);
-    let atpkg = scratch.exe(
-        "own/apps/aterm.app/Contents/MacOS/atpkg",
-        "#!/bin/sh\nexit 75\n",
-    );
-    let home = scratch.home("own");
-    let run = installer(
-        &install_sh(),
-        &home,
-        &[
-            ("ATERM_INSTALL_DIR", s(&scratch.join("own/apps"))),
-            ("ATERM_STORE_DIR", s(&store)),
-        ],
-        &["--uninstall"],
-    );
-    let left: Vec<String> = std::fs::read_dir(&store)
-        .expect("the store dir")
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
-    assert_eq!(left, ["backup.sh"], "{}", run.all());
-    assert!(
-        atpkg.exists(),
-        "the bundle whose sweep failed is kept: {}",
-        run.all()
-    );
-    assert_eq!(run.code(), 1, "{}", run.all());
-}
-
-/// A scoped `--uninstall` (ATERM_INSTALL_DIR) removes the bundle it scopes and
-/// leaves what another aterm.app on the account uses — the toolchain store,
-/// the PATH links, the PATH block, the man pages. Once the scoped copy is the
-/// only aterm, its sweep runs, and the decline that sweep records goes with it.
-#[test]
-#[cfg_attr(
-    not(target_os = "macos"),
-    ignore = "bundles are read with `defaults`, which only macOS has"
-)]
-fn a_scoped_uninstall_leaves_what_another_aterm_uses() {
-    let scratch = Scratch::new();
-    let (start, end, _) = installer_constants(&scratch);
-    let scoped = scratch.home("scoped");
-    let home = scoped.home.clone();
-    let swept = scratch.join("scoped/swept.log");
-    let man = scratch.write("scoped/home/.local/share/man/man1/aterm.1", "");
-    let rc = scratch.write(
-        "scoped/home/.zshrc",
-        format!("{start}\nexport PATH=\"$PATH:$HOME/.local/bin\"\n{end}\n"),
-    );
-    aterm_bundle(&scratch, "scoped/home/Applications/aterm.app", Some(&swept));
-    let links = scratch.mkdir("scoped/home/.local/bin");
-    for tool in ["aterm", "atpkg"] {
-        symlink(
-            home.join(format!("Applications/aterm.app/Contents/MacOS/{tool}")),
-            &links.join(tool),
-        );
-    }
-    aterm_bundle(&scratch, "scoped/home/aterm.app", Some(&swept));
-    let env = [("ATERM_INSTALL_DIR", s(&home))];
-    let run = installer(&install_sh(), &scoped, &env, &["--uninstall"]);
-    assert_eq!(run.code(), 0, "{}", run.all());
-    assert!(
-        !swept.exists(),
-        "the other aterm's store was not swept: {}",
-        run.all()
-    );
-    assert!(links.join("aterm").is_symlink() && links.join("atpkg").is_symlink());
-    assert!(man.exists());
-    assert_eq!(read(&rc).lines().filter(|l| *l == start).count(), 1);
-    assert!(!home.join("aterm.app").exists());
-
-    std::fs::remove_dir_all(home.join("Applications")).expect("rm");
-    aterm_bundle(&scratch, "scoped/home/aterm.app", Some(&swept));
-    let run = installer(&install_sh(), &scoped, &env, &["--uninstall"]);
-    assert_eq!(run.code(), 0, "{}", run.all());
-    assert!(swept.exists(), "the only aterm's sweep ran");
-    assert!(
-        !home
-            .join("Library/Application Support/aterm/pkg/declined")
-            .exists(),
-        "the decline its sweep recorded goes with it"
-    );
-    assert!(!links.join("aterm").is_symlink() && !links.join("atpkg").is_symlink());
-    assert!(!home.join("aterm.app").exists());
 }
 
 /// A store that overlaps a PATH directory is refused before anything is

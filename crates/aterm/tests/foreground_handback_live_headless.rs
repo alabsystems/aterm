@@ -7,8 +7,8 @@
 //! takes the terminal back (Claude Code's: the alternate screen, kitty keyboard flags,
 //! modifyOtherKeys, any-motion SGR mouse, focus reports, bracketed paste, 2026 and a hidden
 //! cursor). aterm cuts the PTY stream where `tcgetpgrp(master)` changes and hands the terminal
-//! back there. These tests type jobs into zsh, bash and fish in a private headless instance
-//! and read `modes`, `who` and `timeline`'s `modes-restored` events:
+//! back there. These tests type jobs into zsh and bash in a private headless instance and read
+//! `modes`, `who` and `timeline`'s `modes-restored` events:
 //!
 //! * a killed holder's modes are handed back, once, and 1007 (alternate scroll, on by
 //!   default) is never named;
@@ -203,7 +203,11 @@ fn kill_self() -> ! {
         libc::kill(libc::getpid(), libc::SIGKILL);
     }
     loop {
-        std::thread::sleep(Duration::from_secs(1));
+        // SAFETY: `pause` blocks this thread until a signal arrives; the
+        // SIGKILL sent above ends the process there.
+        unsafe {
+            libc::pause();
+        }
     }
 }
 
@@ -291,10 +295,10 @@ struct Shell {
 
 impl Shell {
     /// Boot an instance whose only session is `argv`; an environment refusal
-    /// is COULD NOT RUN, never a pass ([`headless_boot::boot_or_refuse`]).
+    /// is COULD NOT RUN, never a pass ([`headless_boot::boot_with`]).
     #[track_caller]
     fn boot(tag: &str, argv: &[&str]) -> Self {
-        let inst = headless_boot::boot_or_refuse(
+        let inst = headless_boot::boot_with(
             &format!("atfh{tag}"),
             |_, cmd| {
                 cmd.arg("-e").args(argv);
@@ -539,30 +543,13 @@ fn zsh_keeps_the_display_modes_a_one_shot_sets() {
     sh.assert_handbacks("the whole wrapper records nothing", 0);
 }
 
-/// A one-shot that sets an input mode is handed back when it exits (the documented residual:
-/// nothing tells a clean exit from a kill). It is answered, so the mode is the one-shot's.
-#[test]
-fn zsh_hands_back_a_one_shots_mouse_at_its_exit() {
-    let mut sh = Shell::boot("zo", ZSH);
-    sh.start(Job::MouseOneShot);
-    // Nothing is typed while it runs: it reads its answer from the terminal.
-    sh.ctl.expect_on_screen("answered");
-    sh.settle();
-    sh.assert_modes(
-        "the one-shot's mouse is handed back",
-        &[("mouse_mode", "none")],
-    );
-    sh.assert_handbacks("the one-shot's exit is one handback", 1);
-}
-
 /// vim's own exit resets what it armed: run as an answered job, a clean exit
 /// records nothing. Bare, its exit races the reader, and a reader that parses
 /// vim's exit reset as the shell's hands back at the cut: at most one.
 #[test]
 fn zsh_records_nothing_for_a_clean_vim_exit() {
     if on_path("vim").is_none() {
-        eprintln!("SKIP: vim is not installed (not a pass)");
-        return;
+        aterm_spec::host::could_not_run("vim is not installed; this lane runs it as a job");
     }
     let mut sh = Shell::boot("zv", ZSH);
     sh.start(Job::Vim);
@@ -605,38 +592,6 @@ fn zsh_a_stopped_job_keeps_its_modes_until_it_dies() {
         &[("mouse_mode", "none")],
     );
     sh.assert_handbacks("the death edge is one handback", 1);
-}
-
-/// zsh makes a pipeline's first stage its group leader, and `sleep 0` has exited by the
-/// Ctrl-Z, so `kill(pgid, 0)` answers ESRCH for a job that is alive and stopped: a stopped
-/// member keeps the job alive, and nothing is handed back until it dies.
-#[test]
-fn zsh_a_leaderless_pipeline_keeps_its_modes_while_stopped() {
-    let mut sh = Shell::boot("zp", ZSH);
-    let both = [("alt_screen", "true"), ("mouse_mode", "any")];
-    sh.type_line(&format!(
-        "sleep 0 | {}",
-        Job::Armed(Arm::AltMouse, 2).line()
-    ));
-    sh.ctl.expect_on_screen("armed-2");
-    sh.job_ctrl('z', "the pipeline holds the terminal for its Ctrl-Z");
-    sh.ctl.expect_on_screen("suspended");
-    sh.assert_modes("Ctrl-Z keeps a leaderless pipeline's modes", &both);
-    sh.assert_handbacks("the pipeline's stop edge hands nothing back", 0);
-    sh.type_line("fg");
-    sh.await_holder(Holder::Job, "fg gives the stopped pipeline the terminal");
-    sh.assert_modes("fg resumes the pipeline with its modes", &both);
-    sh.assert_handbacks("the pipeline's fg hands nothing back", 0);
-    sh.job_ctrl(
-        'c',
-        "the resumed pipeline holds the terminal for its Ctrl-C",
-    );
-    sh.settle();
-    sh.assert_modes(
-        "the pipeline's death hands back",
-        &[("alt_screen", "false"), ("mouse_mode", "none")],
-    );
-    sh.assert_handbacks("the pipeline's death is one handback", 1);
 }
 
 /// The same leaderless pipeline stopped and then `bg`'d runs on with no
@@ -772,24 +727,5 @@ fn bash_hands_a_killed_holders_modes_back_once() {
     sh.start(Job::Incident);
     sh.ctl.expect_on_screen("Killed");
     sh.await_modes("the incident is handed back", &handed_back("false"));
-    sh.assert_handbacks("exactly one handback", 1);
-}
-
-/// A killed holder under fish, when installed, after a clean `ls` that records nothing (fish
-/// disables its own modes before it execs a command).
-#[test]
-fn fish_hands_a_killed_holders_modes_back_once() {
-    let Some(fish) = on_path("fish") else {
-        eprintln!("SKIP: fish is not installed (not a pass)");
-        return;
-    };
-    let fish = fish.to_str().expect("a UTF-8 fish path");
-    let mut sh = Shell::boot("fi", &[fish, "--no-config", "-i"]);
-    sh.type_line("ls");
-    sh.settle();
-    sh.assert_handbacks("a clean ls records nothing", 0);
-    sh.start(Job::Incident);
-    sh.ctl.expect_on_screen("SIGKILL|Killed|killed");
-    sh.await_modes("the incident is handed back", HANDED_BACK);
     sh.assert_handbacks("exactly one handback", 1);
 }

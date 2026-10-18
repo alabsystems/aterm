@@ -1,70 +1,47 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE IME DRIVER: `crates/aterm-window`'s ported `WinitView` composing for real,
+//! The IME driver: `crates/aterm-window`'s ported `WinitView` composing for real,
 //! through the `NSTextInputClient` IMPs `aterm_objc::declare_class!` registered.
 //!
-//! # Why this exists beside the auditor
+//! `objc_live_class_audit` checks that the class is shaped right; this checks that
+//! it behaves right. An input method is a state machine over six rows
+//! (`setMarkedText:`, `hasMarkedText`, `markedRange`, `insertText:`, `unmarkText`,
+//! `doCommandBySelector:`), and a port that registers all six correctly can still
+//! drop an event, mis-clamp a cursor range or break the UTF-16-to-UTF-8 conversion.
+//! `firstRectForCharacterRange:actualRange:` is the dangerous encoding: Foundation
+//! lays out the call's frame from the registered string, and a wrong one does not
+//! raise but puts the candidate window at a garbage rectangle, so its answer is
+//! checked.
 //!
-//! `crates/aterm-gui/examples/objc_live_class_audit.rs` asks whether the class
-//! is SHAPED right: every registered encoding against the runtime's own
-//! authority, plus a handful of live sends. It cannot ask whether the class
-//! BEHAVES right, and for `view.rs` that is the question that matters. W3's
-//! port moved 43 methods, eleven of them the whole `NSTextInputClient` surface,
-//! and an input method is a state machine over six of them — `setMarkedText:`,
-//! `hasMarkedText`, `markedRange`, `insertText:`, `unmarkText`,
-//! `doCommandBySelector:`. A port that registers all six correctly and drops an
-//! event, mis-clamps a cursor range or breaks the UTF-16-to-UTF-8 conversion
-//! passes every shape check in the tree.
-//!
-//! It is also where the ONE genuinely dangerous encoding lives.
-//! `firstRectForCharacterRange:actualRange:` is how an input method asks where
-//! to put its candidate window, and Foundation computes that call's frame layout
-//! from the string `class_addMethod` was handed. A wrong encoding there does not
-//! raise — it puts the candidate window at a garbage rectangle. So this file
-//! drives that row against a cursor area it set itself and checks the ANSWER,
-//! not just the shape.
-//!
-//! # What it drives, and how
-//!
-//! Directly, through `objc_msgSend` into the registered IMPs — the same entry
-//! AppKit's input method uses — with a real `NSWindow`, a real `WinitView` and
-//! the real winit event loop collecting what comes out the other side. Every
-//! expectation is on the `WindowEvent::Ime` sequence winit's own API promises,
-//! so this is a test of the BACKEND CONTRACT and not of the port's internals.
-//!
-//! Six stages, each independent, each reporting its own findings:
+//! The rows are entered through `objc_msgSend`, as AppKit's input method enters
+//! them, on a real `NSWindow` and `WinitView`, and every expectation is on the
+//! `WindowEvent::Ime` sequence winit promises (the backend contract, not the port's
+//! internals). Stages:
 //!
 //! 1. A whole composition in ASCII: enable, preedit, commit.
-//! 2. The same in CJK, because the cursor range crosses the UTF-16-to-UTF-8
-//!    conversion that a naive port gets wrong for every non-ASCII input method.
-//! 3. The `NSAttributedString` branch of `setMarkedText:`, which is the OTHER
-//!    half of a runtime type test the port had to carry across the seam
-//!    (`-isKindOfClass:` on an argument declared `@`).
-//! 4. THE CLAMP: a selected range past the end of the string, which is what
-//!    macOS's own Pinyin input method sends (alacritty#8791), and a range that
-//!    OVERFLOWS `usize`, which objc2's `NSRange::end()` answers by panicking.
-//! 5. `doCommandBySelector:` and `unmarkText` — the two rows that leave preedit
-//!    without committing, including the `Committed`-state early return that
-//!    stops a Korean IME double-sending its last key.
+//! 2. The same in CJK, across the UTF-16-to-UTF-8 cursor conversion.
+//! 3. The `NSAttributedString` branch of `setMarkedText:` (`-isKindOfClass:` on an
+//!    argument declared `@`).
+//! 4. The clamp: a selected range past the end of the string (macOS's Pinyin input
+//!    method, alacritty#8791) and one that overflows `usize`.
+//! 5. `doCommandBySelector:` and `unmarkText`, the two rows that leave preedit
+//!    without committing.
 //! 6. The candidate-window rectangle, against a cursor area this file sets.
+//! 7. A real `NSEvent` through `keyDown:` (the dead-key path). Whether the input
+//!    source produces marked text depends on the machine's keyboard layout, so the
+//!    stage reports, and fails only on an outcome wrong under every layout.
+//! 8. The same Option+E with Option as Alt (`WindowExtMacOS::set_option_as_alt`,
+//!    which aterm sets in Meta mode while the terminal takes the window's typing):
+//!    no dead key, no preedit, and a key event whose text is the bare `e`
+//!    (ATERM-KI-1015-9).
+//! 9. The non-key mouse paths through `update_modifiers`.
 //!
-//! # Dead keys
+//! # Exit codes (read by `aterm_verify::stages::OBJC_DRIVES`)
 //!
-//! Stage 7 synthesises a real `NSEvent` and sends `keyDown:`, which is the path
-//! `interpretKeyEvents:` takes into the system input method. Whether the
-//! installed input source produces marked text for it is NOT under this file's
-//! control — it depends on the keyboard layout of the machine running
-//! `verify appkit` — so that stage REPORTS what happened and only fails on an
-//! outcome that is wrong under every layout (an abort, or preedit arriving
-//! while IME is disabled). See the note on [`macos::Driver::stage_dead_key`].
-//!
-//! # Exit codes — the ladder gates on these, not on the prose
-//!
-//! * `0` — every stage that could run, ran, and agreed.
-//! * `1` — a finding.
-//! * `2` — NOT RUN: no event loop (headless, no window server), no view, or no
-//!   input context. Never a pass.
+//! * `0`: every stage that could run, ran, and agreed.
+//! * `1`: a finding.
+//! * `2`: not run (no event loop, no view, or no input context). Never a pass.
 
 /// Every stage agreed.
 #[cfg(target_os = "macos")]
@@ -72,7 +49,7 @@ const PASS: i32 = 0;
 /// At least one finding. See the transcript.
 #[cfg(target_os = "macos")]
 const FAIL: i32 = 1;
-/// The drive could not execute here. NOT a pass.
+/// The drive could not execute here. Not a pass.
 const NOT_RUN: i32 = 2;
 
 #[cfg(not(target_os = "macos"))]
@@ -93,10 +70,11 @@ fn main() -> std::process::ExitCode {
 mod macos {
     use std::time::{Duration, Instant};
 
-    use aterm_objc::{Bool, CGRect, Id, NSRange, Obj, Sel, class, msg, ns_string, sel};
+    use aterm_objc::{Bool, CGRect, Id, NSRange, Obj, Sel, checked_msg, class, ns_string, sel};
     use winit::application::ApplicationHandler;
     use winit::event::{Ime, WindowEvent};
     use winit::event_loop::ActiveEventLoop;
+    use winit::platform::macos::{OptionAsAlt, WindowExtMacOS as _};
     use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
     use winit::window::{Window, WindowId};
 
@@ -119,10 +97,8 @@ mod macos {
 
     // ------------------------------------------------------------------ sends
     //
-    // Each of these is one registered row, entered exactly as AppKit's input
-    // method enters it: a typed `objc_msgSend` cast to the selector's own
-    // prototype. They are the reason this file is evidence about the PORT and
-    // not about a Rust helper that happens to sit beside it.
+    // Each is one registered row, entered as AppKit's input method enters it: a
+    // typed `objc_msgSend` cast to the selector's own prototype.
 
     /// `-setMarkedText:selectedRange:replacementRange:`.
     ///
@@ -134,7 +110,7 @@ mod macos {
         // SAFETY: the row is registered `v@:@{_NSRange=QQ}{_NSRange=QQ}`, which
         // the auditor checks against `NSTextInputClient`'s own description.
         unsafe {
-            let f: unsafe extern "C-unwind" fn(Id, Sel, Id, NSRange, NSRange) = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, Id, NSRange, NSRange) = checked_msg();
             f(
                 view,
                 sel!(setMarkedText:selectedRange:replacementRange:),
@@ -152,7 +128,7 @@ mod macos {
     unsafe fn insert_text(view: Id, string: Id, replacement: NSRange) {
         // SAFETY: the row is registered `v@:@{_NSRange=QQ}`.
         unsafe {
-            let f: unsafe extern "C-unwind" fn(Id, Sel, Id, NSRange) = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, Id, NSRange) = checked_msg();
             f(
                 view,
                 sel!(insertText:replacementRange:),
@@ -169,7 +145,7 @@ mod macos {
     unsafe fn has_marked_text(view: Id) -> bool {
         // SAFETY: the row is registered `B@:`.
         unsafe {
-            let f: unsafe extern "C-unwind" fn(Id, Sel) -> Bool = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> Bool = checked_msg();
             f(view, sel!(hasMarkedText)).as_bool()
         }
     }
@@ -181,7 +157,7 @@ mod macos {
     unsafe fn marked_range(view: Id) -> NSRange {
         // SAFETY: the row is registered `{_NSRange=QQ}@:`.
         unsafe {
-            let f: unsafe extern "C-unwind" fn(Id, Sel) -> NSRange = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> NSRange = checked_msg();
             f(view, sel!(markedRange))
         }
     }
@@ -193,7 +169,7 @@ mod macos {
     unsafe fn send_void(view: Id, s: Sel) {
         // SAFETY: the caller pins `s` as a `v@:` row on a live receiver.
         unsafe {
-            let f: unsafe extern "C-unwind" fn(Id, Sel) = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) = checked_msg();
             f(view, s);
         }
     }
@@ -207,8 +183,58 @@ mod macos {
         // argument — the encoding that would silently become `v@:@` if a port
         // typed the argument as an object.
         unsafe {
-            let f: unsafe extern "C-unwind" fn(Id, Sel, Sel) = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, Sel) = checked_msg();
             f(view, sel!(doCommandBySelector:), command);
+        }
+    }
+
+    /// An Option+E key-down `NSEvent` as AppKit builds it on the U.S. layout:
+    /// `keyCode` 14 (`E` on ANSI), `NSEventModifierFlagOption`, `characters` the
+    /// acute dead key's `´`, `charactersIgnoringModifiers` `e`. `None` if a string or
+    /// the event could not be built.
+    fn option_e_key_down() -> Option<Obj> {
+        let (Some(chars), Some(bare)) = (ns_string("´"), ns_string("e")) else {
+            return None;
+        };
+        const NS_KEY_DOWN: usize = 10;
+        const NS_ALTERNATE: usize = 1 << 19;
+        // SAFETY: `+[NSEvent keyEventWithType:location:modifierFlags:timestamp:
+        // windowNumber:context:characters:charactersIgnoringModifiers:isARepeat:
+        // keyCode:]`, twelve parameters counting the class and `_cmd`, inside
+        // `MsgFn`'s sixteen; a nil `context:` is documented. The result is
+        // autoreleased, and `Obj::retain` takes the +1 the caller holds.
+        unsafe {
+            let f: unsafe extern "C-unwind" fn(
+                Id,
+                Sel,
+                usize,
+                aterm_objc::CGPoint,
+                usize,
+                f64,
+                isize,
+                Id,
+                Id,
+                Id,
+                Bool,
+                u16,
+            ) -> Id = checked_msg();
+            let event = f(
+                class(c"NSEvent").as_id(),
+                sel!(
+                    keyEventWithType:location:modifierFlags:timestamp:windowNumber:context:characters:charactersIgnoringModifiers:isARepeat:keyCode:
+                ),
+                NS_KEY_DOWN,
+                aterm_objc::CGPoint { x: 0.0, y: 0.0 },
+                NS_ALTERNATE,
+                0.0,
+                0,
+                Id::NIL,
+                chars.id(),
+                bare.id(),
+                Bool::NO,
+                14,
+            );
+            Obj::retain(event)
         }
     }
 
@@ -224,7 +250,8 @@ mod macos {
         // the auditor has already made Foundation agree that its return is 32
         // bytes.
         unsafe {
-            let f: unsafe extern "C-unwind" fn(Id, Sel, NSRange, *mut NSRange) -> CGRect = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, NSRange, *mut NSRange) -> CGRect =
+                checked_msg();
             f(
                 view,
                 sel!(firstRectForCharacterRange:actualRange:),
@@ -243,9 +270,9 @@ mod macos {
         // `inner` is a live `NSString` borrowed for the length of the call and
         // copied by the initialiser.
         unsafe {
-            let alloc: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
+            let alloc: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             let raw = alloc(class(c"NSAttributedString").as_id(), sel!(alloc));
-            let init: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Id = msg();
+            let init: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Id = checked_msg();
             Obj::from_owned(init(raw, sel!(initWithString:), inner.id()))
         }
     }
@@ -279,7 +306,7 @@ mod macos {
     /// Expectations a stage writes down to be checked one pump later.
     ///
     /// `FnOnce` rather than a plain `fn`, because each stage closes over what it
-    /// drove; boxed because the seven stages have seven different closures.
+    /// drove; boxed because each stage has its own closure.
     type Deferred = Box<dyn FnOnce(&mut Driver)>;
 
     struct Driver {
@@ -287,8 +314,10 @@ mod macos {
         report: Report,
         /// Every `Ime` event winit has delivered since the last drain.
         ime: Vec<Ime>,
-        /// The non-IME window events stage 8 needs, as short names.
+        /// The non-IME window events stage 9 needs, as short names.
         mouse: Vec<&'static str>,
+        /// The text of every key press winit has delivered since stage 8 cleared it.
+        keys: Vec<Option<String>>,
         done: bool,
         stage: usize,
         /// Expectations a stage queued for AFTER the next pump, because the
@@ -349,7 +378,11 @@ mod macos {
         fn window_event(&mut self, _el: &ActiveEventLoop, _id: WindowId, e: WindowEvent) {
             match e {
                 WindowEvent::Ime(ime) => self.ime.push(ime),
-                // Stage 8's evidence that its synthetic events really reached
+                // Stage 8's evidence that Option+E reached the app as a key.
+                WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() => {
+                    self.keys.push(event.text.as_ref().map(|t| t.to_string()));
+                }
+                // Stage 9's evidence that its synthetic events really reached
                 // `view.rs`'s mouse path, and were not dropped by
                 // `mouse_motion`'s outside-the-client-area early return.
                 WindowEvent::CursorMoved { .. } => self.mouse.push("CursorMoved"),
@@ -362,24 +395,15 @@ mod macos {
             if self.done {
                 return;
             }
-            // One stage per wait, so every stage's events are delivered by the
-            // pump before the next stage runs. Driving all six in one callback
-            // would compare each stage's expectations against the PREVIOUS
-            // stage's queue, which is the shape of test that passes by
-            // accident.
+            // One stage per wait, alternating drive and check: a stage's `Ime` events
+            // are queued by the send and delivered by the next pump, so its
+            // expectations run one `about_to_wait` later, against its own events only.
             let Some(view) = self.view() else {
                 self.report.blocked = Some("the window has no AppKit view".to_owned());
                 self.done = true;
                 el.exit();
                 return;
             };
-            // ALTERNATE, drive then check. A stage's `Ime` events are queued
-            // by the send and delivered by the NEXT pump, so the expectations
-            // it wrote are run one `about_to_wait` later, against a queue that
-            // holds its events and nobody else's. Doing both in one callback —
-            // which this file did first — compares each stage's expectations
-            // against the FOLLOWING stage's events, and reports the mismatch
-            // under the wrong heading.
             if let Some(check) = self.pending.take() {
                 check(self);
                 return;
@@ -398,7 +422,8 @@ mod macos {
                 5 => self.stage_leave_preedit(view),
                 6 => self.stage_candidate_rect(view),
                 7 => self.stage_dead_key(view),
-                8 => self.stage_mouse_paths(view),
+                8 => self.stage_option_as_alt(view),
+                9 => self.stage_mouse_paths(view),
                 _ => {
                     self.done = true;
                     el.exit();
@@ -408,7 +433,7 @@ mod macos {
     }
 
     impl Driver {
-        /// STAGE 1 — a whole composition in ASCII.
+        /// Stage 1: a whole composition in ASCII.
         fn stage_ascii(&mut self, view: Id) {
             println!("\n=== 1. A COMPOSITION, ASCII ===");
             let _ = self.drain();
@@ -473,14 +498,9 @@ mod macos {
             }));
         }
 
-        /// STAGE 2 — the same, in CJK.
-        ///
-        /// This is the stage a naive port fails. `selectedRange:` counts UTF-16
-        /// code units and winit's `Ime::Preedit` promises UTF-8 BYTE offsets, so
-        /// the body converts with `-substringToIndex:`. Every character here is
-        /// three UTF-8 bytes and one UTF-16 unit, so a port that forwarded the
-        /// range unconverted would answer 2 where 6 is correct — and would be
-        /// green for every ASCII test ever written.
+        /// Stage 2: the same, in CJK. `selectedRange:` counts UTF-16 code units and
+        /// `Ime::Preedit` promises UTF-8 byte offsets; each character here is one unit
+        /// and three bytes, so an unconverted range answers 2 where 6 is correct.
         fn stage_cjk(&mut self, view: Id) {
             println!("\n=== 2. A COMPOSITION, CJK (the UTF-16 -> UTF-8 conversion) ===");
             let _ = self.drain();
@@ -522,13 +542,10 @@ mod macos {
             }));
         }
 
-        /// STAGE 3 — the `NSAttributedString` branch.
-        ///
-        /// `setMarkedText:`'s first argument is declared `@`, and the body
-        /// decides what it actually is with `-isKindOfClass:`. Both halves are
-        /// live code — Japanese and Korean input methods send attributed
-        /// strings with underline attributes — and only one of them is on the
-        /// path every other stage takes.
+        /// Stage 3: the `NSAttributedString` branch. `setMarkedText:`'s first
+        /// argument is declared `@` and the body tests its class with
+        /// `-isKindOfClass:`; Japanese and Korean input methods send attributed
+        /// strings, a path no other stage takes.
         fn stage_attributed(&mut self, view: Id) {
             println!("\n=== 3. setMarkedText: WITH AN NSAttributedString ===");
             let _ = self.drain();
@@ -575,22 +592,14 @@ mod macos {
             }));
         }
 
-        /// STAGE 4 — THE CLAMP, both halves.
+        /// Stage 4: the clamp, both halves.
         ///
-        /// macOS's own Pinyin input method sends `selectedRange:` indices past
-        /// the end of the string it is marking (alacritty#8791); unclamped,
-        /// `-substringToIndex:` raises `NSRangeException` out of an
-        /// Objective-C frame. Upstream clamps with `.min(len)`.
-        ///
-        /// The second half is a divergence this port introduced ON PURPOSE and
-        /// is the reason this stage exists. Upstream computes the end of the
-        /// selection with objc2's `NSRange::end()`, which is
-        /// `checked_add(..).expect("NSRange too large")` — a PANIC, in release
-        /// too, and a panic inside a trampoline is an abort. `aterm_objc`'s
-        /// `NSRange` is a two-field POD with no range algebra, so the port
-        /// spells the addition out, and spells it `saturating_add`: an input
-        /// method that sends a location and length that overflow `usize` now
-        /// clamps to the string's length instead of killing the process.
+        /// macOS's Pinyin input method sends `selectedRange:` indices past the end of
+        /// the marked string (alacritty#8791); unclamped, `-substringToIndex:` raises
+        /// `NSRangeException`. The port computes the selection end with
+        /// `saturating_add`, so a location and length that overflow `usize` clamp to
+        /// the string's length; upstream's objc2 `NSRange::end()` panics there, and a
+        /// panic inside a trampoline aborts.
         fn stage_clamp(&mut self, view: Id) {
             println!("\n=== 4. OUT-OF-BOUNDS AND OVERFLOWING SELECTED RANGES ===");
             let _ = self.drain();
@@ -641,7 +650,7 @@ mod macos {
             }));
         }
 
-        /// STAGE 5 — leaving preedit without committing.
+        /// Stage 5: leaving preedit without committing.
         fn stage_leave_preedit(&mut self, view: Id) {
             println!("\n=== 5. doCommandBySelector: AND unmarkText ===");
             let _ = self.drain();
@@ -674,12 +683,11 @@ mod macos {
                 format!("hasMarkedText={after_command}"),
             );
 
-            // `unmarkText` sends `-discardMarkedText` to the view's input
-            // context and would panic if there were none, which is a real
-            // outcome on a machine with no window server rather than a defect.
+            // `unmarkText` sends `-discardMarkedText` to the view's input context and
+            // would panic with none: a real outcome with no window server, not a defect.
             // SAFETY: `-inputContext` is `@@:` on `NSResponder`; `view` is live.
             let ctx: Id = unsafe {
-                let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
+                let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
                 f(view, sel!(inputContext))
             };
             if ctx.is_null() {
@@ -715,12 +723,9 @@ mod macos {
             }));
         }
 
-        /// STAGE 6 — the candidate-window rectangle.
-        ///
-        /// The row whose encoding is the dangerous one, checked by its ANSWER.
-        /// The cursor area is set through winit's public API, so the expectation
-        /// is the contract an application relies on and not the port's
-        /// arithmetic.
+        /// Stage 6: the candidate-window rectangle, the row whose encoding is
+        /// dangerous, checked by its answer against a cursor area set through
+        /// winit's public API.
         fn stage_candidate_rect(&mut self, view: Id) {
             println!("\n=== 6. THE CANDIDATE-WINDOW RECTANGLE ===");
             let Some(w) = self.window.as_ref() else {
@@ -747,12 +752,10 @@ mod macos {
                 "    firstRectForCharacterRange: = origin ({}, {}) size {}x{} (scale {scale})",
                 rect.origin.x, rect.origin.y, rect.size.width, rect.size.height
             );
-            // The SIZE is the one part that survives every coordinate
-            // conversion unchanged: `convertRect:toView:` and
-            // `convertRectToScreen:` translate, and on a 1x or 2x display
-            // neither scales a view-space size. The ORIGIN is in screen
-            // coordinates and depends on where the window server put the
-            // window, so it is reported rather than asserted.
+            // Only the size survives every coordinate conversion unchanged
+            // (`convertRect:toView:` and `convertRectToScreen:` translate, and neither
+            // scales a view-space size at 1x or 2x); the screen origin depends on
+            // where the window server put the window, so it is reported, not asserted.
             self.report.expect(
                 "the candidate rect carries the size set through set_ime_cursor_area",
                 (rect.size.width - 10.0).abs() < 0.5 && (rect.size.height - 20.0).abs() < 0.5,
@@ -767,10 +770,9 @@ mod macos {
                 format!("({}, {})", rect.origin.x, rect.origin.y),
             );
 
-            // And the out-parameter, which is the argument a hidden result
-            // pointer would displace: give it a real slot and require the row
-            // to leave it exactly as it found it (the fork ignores it, as
-            // upstream does).
+            // The out-parameter, the argument a hidden result pointer would displace:
+            // give it a real slot and require the row to leave it untouched (the fork
+            // ignores it, as upstream does).
             let mut actual = NSRange {
                 location: 0xDEAD,
                 length: 0xBEEF,
@@ -800,91 +802,38 @@ mod macos {
             );
         }
 
-        /// STAGE 7 — a real `NSEvent` through `keyDown:`.
+        /// Stage 7: a real `NSEvent` through `keyDown:`, the only path into
+        /// `-interpretKeyEvents:` and so the system input method (where a dead key
+        /// becomes marked text). What the input method does depends on the machine's
+        /// keyboard layout, so the outcome is reported; only an outcome wrong under
+        /// every layout is a finding (preedit while the view believes IME is
+        /// disabled; an abort takes the process).
         ///
-        /// This is the only path that enters `-interpretKeyEvents:`, which is
-        /// how a keystroke reaches the system input method and how a DEAD KEY
-        /// becomes marked text. What that input method does with the event
-        /// depends on the keyboard layout installed on the machine running this
-        /// gate, which is not under this file's control — so the outcome is
-        /// REPORTED, and only an outcome that is wrong under every layout is a
-        /// finding: an abort (which would take the process, not this stage), or
-        /// preedit arriving while the view believes IME is disabled.
-        ///
-        /// `keyCode` 14 is `E` on ANSI, which with Option held is the acute
-        /// accent dead key on the U.S. layout.
+        /// `keyCode` 14 is `E` on ANSI: with Option, the acute dead key on the U.S.
+        /// layout.
         fn stage_dead_key(&mut self, view: Id) {
             println!("\n=== 7. A REAL KEY EVENT (dead-key path) ===");
             let _ = self.drain();
-            // Leave any composition first, so what arrives is attributable.
-            // SAFETY: `view` is live; the input context was checked in stage 5,
-            // and `unmarkText` on a view with none is the only failure mode,
-            // guarded here the same way.
+            // SAFETY: `-inputContext` is `@@:` on `NSResponder`; `view` is live.
             let ctx: Id = unsafe {
-                let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
+                let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
                 f(view, sel!(inputContext))
             };
             if ctx.is_null() {
                 println!("    SKIPPED: no NSTextInputContext, so interpretKeyEvents: goes nowhere");
                 return;
             }
-            let (Some(chars), Some(bare)) = (ns_string("´"), ns_string("e")) else {
+            let Some(event) = option_e_key_down() else {
                 self.report
-                    .fail("could not build the event's strings".to_owned());
+                    .fail("+[NSEvent keyEventWithType:…] could not be built".to_owned());
                 return;
             };
-            const NS_KEY_DOWN: usize = 10;
-            const NS_ALTERNATE: usize = 1 << 19;
-            // SAFETY: this is
-            // `+[NSEvent keyEventWithType:location:modifierFlags:timestamp:
-            //   windowNumber:context:characters:charactersIgnoringModifiers:
-            //   isARepeat:keyCode:]`, twelve parameters counting the class and
-            // `_cmd` — inside `MsgFn`'s sixteen. A nil `context:` is documented
-            // and is what AppKit itself passes on modern macOS. The result is
-            // autoreleased.
-            let event: Id = unsafe {
-                let f: unsafe extern "C-unwind" fn(
-                    Id,
-                    Sel,
-                    usize,
-                    aterm_objc::CGPoint,
-                    usize,
-                    f64,
-                    isize,
-                    Id,
-                    Id,
-                    Id,
-                    Bool,
-                    u16,
-                ) -> Id = msg();
-                f(
-                    class(c"NSEvent").as_id(),
-                    sel!(
-                        keyEventWithType:location:modifierFlags:timestamp:windowNumber:context:characters:charactersIgnoringModifiers:isARepeat:keyCode:
-                    ),
-                    NS_KEY_DOWN,
-                    aterm_objc::CGPoint { x: 0.0, y: 0.0 },
-                    NS_ALTERNATE,
-                    0.0,
-                    0,
-                    Id::NIL,
-                    chars.id(),
-                    bare.id(),
-                    Bool::NO,
-                    14,
-                )
-            };
-            if event.is_null() {
-                self.report
-                    .fail("+[NSEvent keyEventWithType:…] answered nil".to_owned());
-                return;
-            }
             println!("    built an Option+E NSEvent (keyCode 14, NSEventModifierFlagOption)");
             // SAFETY: `keyDown:` is registered `v@:@` and `event` is the live
-            // autoreleased `NSEvent` just built — exactly what AppKit delivers.
+            // `NSEvent` just built — exactly what AppKit delivers.
             unsafe {
-                let f: unsafe extern "C-unwind" fn(Id, Sel, Id) = msg();
-                f(view, sel!(keyDown:), event);
+                let f: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
+                f(view, sel!(keyDown:), event.id());
             }
             println!(
                 "    keyDown: returned without aborting — the trampoline and its panic \
@@ -914,49 +863,87 @@ mod macos {
             }));
         }
 
-        /// STAGE 8 — THE MOUSE PATHS THROUGH `update_modifiers`, which is not an
-        /// IME question and is here because this is `view.rs`'s driver.
+        /// Stage 8: Option as Alt, which aterm sets in Meta mode (config
+        /// `option_as_meta`, the default) on a window whose typing reaches the
+        /// terminal (`App::sync_option_as_alt`). `keyDown:` hands `-interpretKeyEvents:`
+        /// the event rebuilt with its `-charactersIgnoringModifiers` (`replace_event`
+        /// in `view.rs`), so the same Option+E as stage 7 starts no dead key under any
+        /// layout: no marked text, no preedit, and the key event's text is the bare
+        /// `e` the encoder sends after ESC. Stage 7's composition (if the layout made
+        /// one) is discarded first.
+        fn stage_option_as_alt(&mut self, view: Id) {
+            println!("\n=== 8. OPTION AS ALT: Option+E is no dead key ===");
+            // SAFETY: `view` is live; `unmarkText` discards stage 7's composition in
+            // the view and its input context.
+            unsafe { send_void(view, sel!(unmarkText)) };
+            let Some(window) = self.window.as_ref() else {
+                self.report.fail("the window is gone".to_owned());
+                return;
+            };
+            window.set_option_as_alt(OptionAsAlt::Both);
+            self.report.expect(
+                "the window keeps the Option-as-Alt setting",
+                window.option_as_alt() == OptionAsAlt::Both,
+                format!("{:?}", window.option_as_alt()),
+            );
+            let _ = self.drain();
+            self.keys.clear();
+            let Some(event) = option_e_key_down() else {
+                self.report
+                    .fail("+[NSEvent keyEventWithType:…] could not be built".to_owned());
+                return;
+            };
+            // SAFETY: `keyDown:` is registered `v@:@` and `event` is the live
+            // `NSEvent` just built — exactly what AppKit delivers.
+            unsafe {
+                let f: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
+                f(view, sel!(keyDown:), event.id());
+            }
+            // SAFETY: `view` is live.
+            let marked = unsafe { has_marked_text(view) };
+            self.report.expect(
+                "Option as Alt leaves no marked text after Option+E",
+                !marked,
+                format!("hasMarkedText = {marked}"),
+            );
+            self.pending = Some(Box::new(|d: &mut Driver| {
+                let got = d.drain();
+                let keys = std::mem::take(&mut d.keys);
+                println!("    events: {}; key texts: {keys:?}", show_all(&got));
+                d.report.expect(
+                    "no preedit arrives for Option+E with Option as Alt",
+                    !got.iter()
+                        .any(|e| matches!(e, Ime::Preedit(s, _) if !s.is_empty())),
+                    show_all(&got),
+                );
+                d.report.expect(
+                    "Option+E arrives as a key press whose text is the bare e",
+                    keys == [Some("e".to_owned())],
+                    format!("{keys:?}"),
+                );
+                if let Some(window) = d.window.as_ref() {
+                    window.set_option_as_alt(OptionAsAlt::None);
+                }
+            }));
+        }
+
+        /// Stage 9: the mouse paths through `update_modifiers`. Not an IME question,
+        /// but this is `view.rs`'s driver.
         ///
-        /// # The defect this exists for, which aborted the process
+        /// `update_modifiers` may send `-[NSEvent keyCode]` only for a key event:
+        /// `mouse_motion` (from `mouseMoved:`, `mouseDragged:`, `mouseDown:`,
+        /// `mouseUp:`, `scrollWheel:`), `mouse_click`, `scroll_wheel` and
+        /// `cancel_operation` hand it non-key events, for which `-keyCode` raises
+        /// `NSInternalInconsistencyException`, and a foreign exception inside an IMP
+        /// ends the process. The prototype is right, so no census sees a wrong send,
+        /// and the other drivers reach the mouse path only when the physical cursor
+        /// sits over their window; this stage enters the IMPs itself.
         ///
-        /// `update_modifiers` sends `-[NSEvent keyCode]`. Seven of its eight
-        /// callers pass `is_flags_changed_event = false`, and FOUR of those hand it
-        /// a NON-KEY event: `mouse_motion` (reached from `mouseMoved:`,
-        /// `mouseDragged:`, `mouseDown:`, `mouseUp:`, `scrollWheel:`),
-        /// `mouse_click`, `scroll_wheel` and `cancel_operation`.
-        ///
-        /// `-[NSEvent keyCode]` RAISES for every one of those types — measured with
-        /// clang on this box: `LeftMouseDown`, `MouseMoved`, `RightMouseDown` and
-        /// `LeftMouseDragged` all answer `NSInternalInconsistencyException`,
-        /// "Invalid message sent to event". An Objective-C exception thrown inside
-        /// a registered IMP cannot be caught by the `catch_unwind` the class macro
-        /// wraps the body in, so the process ABORTS: *"fatal runtime error: Rust
-        /// cannot catch foreign exceptions"*.
-        ///
-        /// The `objc2` line the port replaced short-circuited —
-        /// `if is_flags_changed_event && unsafe { ns_event.keyCode() } != 0` — and
-        /// the port hoisted the send into a `let` above the `if`, which reads like
-        /// a pure tidy-up and is not.
-        ///
-        /// # Why no instrument had it
-        ///
-        /// The PROTOTYPE IS RIGHT (`S16@0:8`, `send_u16`), so a census agrees with
-        /// it. libtest cannot host AppKit. And the existing drivers reach the
-        /// mouse path only when the PHYSICAL cursor happens to sit over the drive
-        /// window — `objc_toolbar_drive` passed once and then aborted 6 times out
-        /// of 6 an hour later, on identical code. A stage that ENTERS the IMPs
-        /// itself does not depend on where anybody's mouse is.
-        ///
-        /// # Non-vacuity
-        ///
-        /// `mouse_motion` returns EARLY when the point is outside the client area
-        /// and no button is down — before it reaches `update_modifiers` — so a
-        /// stage that only checked "we are still alive" could pass without ever
-        /// touching the line. The deferred check therefore requires winit to have
-        /// delivered `CursorMoved` and `MouseInput`, which only happens on the far
-        /// side of that return.
+        /// `mouse_motion` returns early outside the client area with no button down,
+        /// before `update_modifiers`, so the deferred check requires `CursorMoved` and
+        /// `MouseInput`, which arrive only past that return.
         fn stage_mouse_paths(&mut self, view: Id) {
-            println!("\n=== 8. THE MOUSE PATHS: a non-key event through update_modifiers ===");
+            println!("\n=== 9. THE MOUSE PATHS: a non-key event through update_modifiers ===");
             self.mouse.clear();
             // A point in WINDOW base coordinates that lands inside a 480x320
             // content view, so `mouse_motion` does not take its early return.
@@ -987,7 +974,7 @@ mod macos {
                         isize,
                         f32,
                     )
-                        -> Id = msg();
+                        -> Id = checked_msg();
                     f(
                         class(c"NSEvent").as_id(),
                         sel!(
@@ -1011,15 +998,12 @@ mod macos {
                     continue;
                 }
                 built += 1;
-                // ENTERED AT THE IMP, exactly as AppKit enters it. If
-                // `update_modifiers` sends `-keyCode` to this event, AppKit raises
-                // and THIS PROCESS DIES HERE — there is no softer failure to
-                // report, which is why the stage's own survival is the first
-                // assertion.
+                // Entered at the IMP as AppKit enters it: if `update_modifiers` sends
+                // `-keyCode` to this event, AppKit raises and the process dies here.
                 // SAFETY: every one of these rows is registered `v@:@`, checked by
                 // `objc_live_class_audit`.
                 unsafe {
-                    let f: unsafe extern "C-unwind" fn(Id, Sel, Id) = msg();
+                    let f: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
                     f(view, imp, event);
                 }
             }
@@ -1063,6 +1047,7 @@ mod macos {
             report: Report::default(),
             ime: Vec::new(),
             mouse: Vec::new(),
+            keys: Vec::new(),
             done: false,
             stage: 0,
             pending: None,

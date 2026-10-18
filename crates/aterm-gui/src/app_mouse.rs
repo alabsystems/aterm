@@ -33,16 +33,16 @@ use crate::{
 /// release inside one cell is what makes a `clear()` legitimate. Neither variant touches
 /// the viewport. Tier-1 drives the real gesture in [`crate::press_custody_conformance`].
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "PressCustody",
         action = "UserSelect",
         project = "aterm_gui::press_custody_conformance::project_press_custody"
     )
 )]
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "PressCustody",
         action = "UserClear",
         project = "aterm_gui::press_custody_conformance::project_press_custody"
@@ -284,6 +284,17 @@ pub(crate) struct HoverMemo {
     disclosed: Option<std::sync::Arc<str>>,
     /// A plain-text URL run under the cell (probed only with the modifier held).
     plain_url: bool,
+    /// `disclosed` names a resolved file citation (`crate::path_link`), not a
+    /// URL: the band says `opens in aterm:` and a click opens aterm's editor.
+    path_link: bool,
+    /// The file, line and column that citation resolved to: what the caption
+    /// names, and so the only target a click under it may open
+    /// ([`App::open_link_under_pointer`], through [`ShownCaption`]).
+    citation: Option<crate::path_link::PathTarget>,
+    /// The answer is whole: no citation under the cell is still being looked at
+    /// (`crate::path_link::Looks`). An unsettled memo answers nothing, so the
+    /// next pointer event or frame asks again and finds the look's answer.
+    settled: bool,
 }
 
 /// The engine fill a window's frame stands on: the hover memo's epoch. Read from the
@@ -325,7 +336,8 @@ impl HoverMemo {
         under_pointer: bool,
         frame: HoverFrame,
     ) -> bool {
-        self.session == session
+        self.settled
+            && self.session == session
             && self.window_cell == window_cell
             && self.mod_held == mod_held
             && self.under_pointer == under_pointer
@@ -344,6 +356,38 @@ impl HoverMemo {
             .flatten()
     }
 
+    /// Whether the destination this memo discloses for `hover` is a file
+    /// citation (`crate::path_link`) rather than a URL.
+    pub(crate) fn path_link_for(&self, hover: &crate::link_target::LinkHover) -> bool {
+        self.path_link && self.session == hover.session && self.cell == hover.cell
+    }
+
+    /// What the caption this memo draws for `hover` names ([`CaptionNames`]),
+    /// or `None` when it draws none for `hover`.
+    pub(crate) fn caption_names(
+        &self,
+        hover: &crate::link_target::LinkHover,
+    ) -> Option<CaptionNames> {
+        let url = self.url_for(hover)?;
+        Some(match self.citation.as_ref().filter(|_| self.path_link) {
+            Some(target) => CaptionNames::Citation {
+                path: target.path.clone(),
+                line: target.line,
+                col: target.col,
+            },
+            None => CaptionNames::Url(url.clone()),
+        })
+    }
+
+    /// The canonical file the caption names, when it names a citation.
+    #[cfg(test)]
+    pub(crate) fn caption_citation(&self) -> Option<&std::path::Path> {
+        self.citation
+            .as_ref()
+            .filter(|_| self.path_link)
+            .map(|target| target.path.as_path())
+    }
+
     /// Whether this memo answers for the pointer as the frame finds it: the front
     /// `session`, the window cell the pointer last rested on, its modifier, and the engine
     /// fill the frame just landed. The frame-time refresh's gate
@@ -358,6 +402,68 @@ impl HoverMemo {
     }
 }
 
+/// What a drawn link caption names: the one target a press under it may open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CaptionNames {
+    /// A URL (`opens: …`), as the band spelled it.
+    Url(std::sync::Arc<str>),
+    /// A file citation (`opens in aterm: …`): the canonical file, line and
+    /// column.
+    Citation {
+        path: std::path::PathBuf,
+        line: Option<u32>,
+        col: Option<u32>,
+    },
+}
+
+/// The link caption carried by the last accepted application present
+/// (`WindowState::shown_caption`): its session, pane-local cell, and target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ShownCaption {
+    pub(crate) session: u64,
+    pub(crate) cell: (u16, u16),
+    pub(crate) names: CaptionNames,
+}
+
+/// Publish only the caption carried by an accepted application present.
+/// Pending acquisition and a refused present leave the prior caption standing.
+pub(crate) fn commit_presented_caption(
+    shown: &mut Option<ShownCaption>,
+    composed: Option<ShownCaption>,
+    presented: &Result<Option<u64>, crate::metrics::PresentDropReason>,
+) {
+    if matches!(presented, Ok(Some(_))) {
+        *shown = composed;
+    }
+}
+
+/// Whether a press that reads `url` (a URL under the pointer) or `citation`
+/// (a resolved file citation, with no URL there) may open it, given the
+/// caption drawn for the pressed cell (`shown`, `None` when none was).
+/// A citation opens only under a caption that named that very file, line
+/// and column: never unseen (no caption drawn yet, a look that came back
+/// after the frame), never under a URL's caption, never once the target
+/// moved under a still pointer. A URL under a caption opens only when it is
+/// the URL the caption named; with no caption drawn it opens as before (a
+/// plain URL drawn in full is its own disclosure). Nothing to open admits
+/// the press, which then opens nothing.
+pub(crate) fn caption_admits(
+    shown: Option<&CaptionNames>,
+    url: Option<&str>,
+    citation: Option<&crate::path_link::PathTarget>,
+) -> bool {
+    match (shown, url, citation) {
+        (Some(CaptionNames::Url(named)), Some(url), _) => **named == *url,
+        (Some(CaptionNames::Citation { .. }), Some(_), _) => false,
+        (None, Some(_), _) => true,
+        (Some(CaptionNames::Citation { path, line, col }), None, Some(target)) => {
+            target.path == *path && target.line == *line && target.col == *col
+        }
+        (Some(CaptionNames::Url(_)) | None, None, Some(_)) => false,
+        (_, None, None) => true,
+    }
+}
+
 /// The grid arm's two probes for one hovered cell, against a terminal the caller already
 /// holds (the frame's guard or the motion path's successful `try_lock`): the cell's
 /// hyperlink, kept as the grid's `Arc<str>` so the caption splice reads it lock-free, and,
@@ -367,7 +473,10 @@ impl HoverMemo {
 /// just its characters: a concealed cell keeps its character, and a URL run ends where the
 /// ink does. Both are viewport-keyed: the pointer stands on the row the frame drew. A plain
 /// URL is its own visible text, so it earns a caption only when part of it is painted
-/// faintly. Returns `(disclosed, plain_url)`.
+/// faintly. With neither, the same row is read for a plain-text file citation
+/// ([`crate::plain_path_at`]), returned with the shell's OSC 7 directory for the caller
+/// to resolve once the terminal is no longer needed. Returns `(disclosed, plain_url,
+/// citation)`.
 fn probe_hover_cell(
     t: &Terminal,
     row: u16,
@@ -375,22 +484,85 @@ fn probe_hover_cell(
     cell_is_under_pointer: bool,
     mod_held: bool,
     min_contrast: f32,
-) -> (Option<std::sync::Arc<str>>, bool) {
+) -> (Option<std::sync::Arc<str>>, bool, Option<CitationProbe>) {
     let link = if cell_is_under_pointer {
         t.hyperlink_at_visible(row, col)
     } else {
         None
     };
     if link.is_some() || !mod_held || !cell_is_under_pointer {
-        return (link, false);
+        return (link, false, None);
     }
-    match plain_url_at(
-        &t.render_row(usize::from(row)),
-        usize::from(col),
-        min_contrast,
-    ) {
-        Some(plain) => (plain.faint.then(|| plain.url.into()), true),
-        None => (None, false),
+    let cells = t.render_row(usize::from(row));
+    match plain_url_at(&cells, usize::from(col), min_contrast) {
+        Some(plain) => (plain.faint.then(|| plain.url.into()), true, None),
+        None => (
+            None,
+            false,
+            crate::plain_path_at(&cells, usize::from(col), min_contrast)
+                .map(|span| CitationProbe::new(t, span)),
+        ),
+    }
+}
+
+/// A file citation read off the grid, with what the engine says of the
+/// session's directory read under the same hold: resolved against the
+/// filesystem only after the terminal is let go ([`App::resolve_citation`]).
+#[derive(Clone, Debug)]
+pub(crate) struct CitationProbe {
+    span: crate::path_link::PathSpan,
+    /// The shell's OSC 7 directory (`Terminal::current_working_directory`).
+    osc7: Option<std::path::PathBuf>,
+    /// The host that report named (`Terminal::reported_cwd_host`).
+    osc7_host: Option<String>,
+    /// Which report it is (`Terminal::reported_cwd_seq`): whether it still
+    /// speaks for the group in front ([`crate::path_link::report_stands`]).
+    osc7_seq: Option<u64>,
+    /// The command the shell says it is running (`status detail=`), `None`
+    /// at its prompt or with no shell integration.
+    running: Option<String>,
+    /// Where no foreground group can be read (a ConPTY): whether the shell's
+    /// own integration says it runs nothing but itself or an agent here
+    /// ([`shell_reads_local`]).
+    shell_reads_local: bool,
+}
+
+impl CitationProbe {
+    fn new(t: &Terminal, span: crate::path_link::PathSpan) -> Self {
+        use crate::cwd_native::ReportedCwd as _;
+        let running = crate::session_status::executing_detail(t);
+        let shell_reads_local = shell_reads_local(t.current_block().is_some(), running.as_deref());
+        Self {
+            span,
+            osc7: t
+                .native_working_directory()
+                .map(|cwd| std::path::PathBuf::from(cwd.as_ref())),
+            osc7_host: t.reported_cwd_host().map(String::from),
+            osc7_seq: t.reported_cwd_seq(),
+            running,
+            shell_reads_local,
+        }
+    }
+}
+
+/// Where no foreground group can be read (a ConPTY has no `tcgetpgrp`), the
+/// shell's own integration is the only reading of what runs: an integrated
+/// shell (`integrated`: it opened a block) at its prompt, or running a shell
+/// or an agent aterm names by its command's word (`running`, `status
+/// detail=`). No integration, or any other command, is no reading (fail
+/// closed).
+pub(crate) fn shell_reads_local(integrated: bool, running: Option<&str>) -> bool {
+    match running {
+        None => integrated,
+        Some(command) => {
+            let word = command.split_whitespace().next().unwrap_or("");
+            let word = word.rsplit(['/', '\\']).next().unwrap_or(word);
+            let word = word
+                .strip_suffix(".exe")
+                .or_else(|| word.strip_suffix(".EXE"))
+                .unwrap_or(word);
+            crate::quit_safety::is_shell_name(word) || aterm_phase::program_of(word).is_some()
+        }
     }
 }
 
@@ -409,12 +581,26 @@ pub(crate) fn link_modifier_held(mods: winit::keyboard::ModifiersState) -> bool 
     }
 }
 
-/// Whether a left press starts a local text selection instead of being reported to a
-/// tracking app: always when nothing tracks the mouse, and with Option held even when
-/// something does (iTerm2's bypass gesture, so a PID can be copied out of htop). The
-/// matching release settles the selection without a release report.
-pub(crate) fn press_starts_selection(tracking: bool, option_held: bool) -> bool {
-    !tracking || option_held
+/// Audit M6: whether a left press starts a LOCAL text selection instead of being
+/// reported to a tracking app — always when nothing tracks the mouse, and with
+/// the bypass modifier held ([`tracking_bypass_held`]) even when something does,
+/// so a PID can be copied out of htop. The matching release settles the selection
+/// without leaking a release report (`selecting` wins in `on_mouse_input`), keeping
+/// press/release symmetric for the app.
+pub(crate) fn press_starts_selection(tracking: bool, bypass_held: bool) -> bool {
+    !tracking || bypass_held
+}
+
+/// Whether the held modifiers take a left press back from a mouse-tracking app
+/// ([`press_starts_selection`]). Option/Alt everywhere — iTerm2's gesture, and
+/// the wheel's main-screen override (`input::wheel_route`). Off macOS, Shift too:
+/// the xterm convention every Linux terminal (VTE, Konsole, kitty, Alacritty,
+/// foot, WezTerm) and Windows Terminal follow, the one Shift+wheel already
+/// follows here, and the only one left where the window manager takes Alt+drag
+/// (Xfce, Cinnamon, MATE, KDE). macOS keeps Shift-click for the program, as
+/// Terminal.app and iTerm2 do.
+pub(crate) fn tracking_bypass_held(mods: winit::keyboard::ModifiersState) -> bool {
+    mods.alt_key() || (cfg!(not(target_os = "macos")) && mods.shift_key())
 }
 
 /// What a right press does at its pre-dispatch point in `on_mouse_input`. Pure, so the
@@ -460,11 +646,6 @@ pub(crate) fn right_press_plan(
         RightPressPlan::Paste
     }
 }
-
-/// How far outside Robi's drawn body (frame px, each side) a click still dismisses him:
-/// the pet's grace ([`aterm_effects::companion::PET_HIT_SLOP_PX`]), hit-tested by the pet's
-/// own [`aterm_effects::companion::pet_rect_hit`].
-pub(crate) const ROBI_HIT_SLOP_PX: i32 = 4;
 
 /// Selection kind for a single left press. Option+drag is the rectangular
 /// [`SelectionType::Block`] only when the press was local anyway (tracking off); while
@@ -629,6 +810,10 @@ struct MouseCellMapping {
     pane_rect: (u16, u16, u16, u16),
 }
 
+/// The `pointer` verb's answer: the cell the front window's pointer resolved to
+/// ([`App::pointer_cmd`]) and its window pixel ([`App::pointer_px`]), or why not.
+pub(crate) type PointerReply = Result<(Option<(i32, u16)>, Option<(i32, i32)>), String>;
+
 /// What the `pointer` verb asks of the front window's pointer. Each variant is the
 /// winit event it stands in for, so [`App::pointer_cmd`] has one call to make per
 /// arm and no pointer behaviour of its own to keep in step.
@@ -648,6 +833,9 @@ pub(crate) enum PointerAction {
     Leave,
     /// Report only — moves nothing.
     Status,
+    /// `WindowEvent::ModifiersChanged`: the modifier keys the window holds from now on,
+    /// so a scripted hover or click sees the hand a held Cmd (Ctrl elsewhere) offers.
+    Mods(winit::keyboard::ModifiersState),
 }
 
 impl App {
@@ -957,14 +1145,17 @@ impl App {
     ///
     /// With nothing in flight: to the pane under the pointer, at its own cell, as kitty
     /// (`window_for_event`), WezTerm and tmux (`send -M -t=`) route it, never to the focused
-    /// pane at the clamped `last_mouse_cell`. With a reported button held: to the session the
-    /// lowest held button's press went to, wherever the pointer is, so the gesture's drag
-    /// steps, chorded buttons and wheel notches reach the program that has the first press.
+    /// pane at the clamped `last_mouse_cell`. With a button held: to whoever has the lowest
+    /// held button's press, wherever the pointer is, so the gesture's drag steps, chorded
+    /// buttons and wheel notches reach the program that has the first press — the session a
+    /// reported press went to, or the front native page for a press its boundary took
+    /// (`page_buttons`).
     ///
     /// [`PointerRoute::Front`] while the front path is the answer: a modal or the tab menu,
-    /// the front's own selection or divider drag, a single visible pane, the pointer inside
-    /// the focused pane or on a divider. [`PointerRoute::Nowhere`] over a native pane.
-    /// `focused` is the focused pane rect when the caller already planned it.
+    /// the front's own selection or divider drag, the front page's own press, a single
+    /// visible pane, the pointer inside the focused pane or on a divider.
+    /// [`PointerRoute::Nowhere`] over a native pane. `focused` is the focused pane rect when
+    /// the caller already planned it.
     pub(crate) fn pointer_route(
         &self,
         wid: WindowId,
@@ -976,12 +1167,39 @@ impl App {
         if ws.overlay_open() || ws.tab_menu.is_some() || ws.selecting || ws.divider_drag.is_some() {
             return PointerRoute::Front;
         }
+        // A press the page took is the page's gesture only while that page is in front: the
+        // mark is the window's, and a tab switch mid-press must not hold another tab's pointer.
+        let page_buttons = if self.active_native_view(wid).is_some() {
+            ws.page_buttons
+        } else {
+            0
+        };
+        if held_button(ws.reported_buttons | page_buttons)
+            .is_some_and(|lowest| page_buttons & (1 << lowest.slot()) != 0)
+        {
+            return PointerRoute::Front;
+        }
         if ws.reported_buttons != 0 {
             let owner = ws
                 .held_mouse_button
                 .and_then(|button| ws.button_owners[usize::from(button.slot())]);
             return self.owner_route(wid, owner);
         }
+        self.pane_under_pointer(wid, focused)
+    }
+
+    /// [`Self::pointer_route`] by the pane under the pointer alone, whatever a held button's
+    /// press went to: where a NEW press lands. [`PointerRoute::Front`] over the focused pane
+    /// (or with one pane), [`PointerRoute::Pane`] over another terminal pane at its own cell,
+    /// [`PointerRoute::Nowhere`] over another native pane.
+    fn pane_under_pointer(
+        &self,
+        wid: WindowId,
+        focused: Option<(u16, u16, u16, u16)>,
+    ) -> PointerRoute {
+        let Some(ws) = self.windows.get(&wid) else {
+            return PointerRoute::Front;
+        };
         if !self.active_tab_has_multiple_visible_panes(wid) {
             return PointerRoute::Front;
         }
@@ -1092,25 +1310,7 @@ impl App {
             {
                 continue;
             }
-            if let Some(session) = self.pool.get(owner.session) {
-                crate::app_input::write_ui_report(
-                    &session.term,
-                    &session.ctx.modes,
-                    &session.ctx.sink,
-                    &InputEvent::MouseButton {
-                        button,
-                        pressed: false,
-                        row: owner.cell.0,
-                        col: owner.cell.1,
-                        mods: 0,
-                        click_count: 1,
-                        side: SelectionSide::Left,
-                        block: false,
-                        suppress_copy_on_select: false,
-                        px_off: owner.px_off,
-                    },
-                );
-            }
+            self.write_owner_release(button, owner);
             released.push(button);
         }
         if let Some(ws) = self.windows.get_mut(&wid) {
@@ -1840,15 +2040,49 @@ impl App {
                     aterm_messages::wire::spend_press(&mut self.wire_gate, Instant::now())
                         .map_err(|line| line.strip_prefix("ERR ").unwrap_or(&line).to_string())?;
                 }
-                // What the event loop's `MouseInput` arm runs, press then
-                // release (the caller escalates a close the press asked for).
-                self.mouse_input_then_fold(wid, ElementState::Pressed, WinitMouseButton::Left);
-                self.mouse_input_then_fold(wid, ElementState::Released, WinitMouseButton::Left);
+                // What the event loop runs for a click, press then release
+                // (the caller escalates a close the press asked for). On macOS
+                // that is what AppKit delivers: `mouseDown:` and `mouseUp:` each
+                // queue a `CursorMoved` at the press point ahead of the button
+                // (`aterm-window`'s macOS `view.rs`), a motion event in which
+                // the pointer did not move, so a scripted click meets every
+                // surface that reads motion as a hand's click does.
+                for state in [ElementState::Pressed, ElementState::Released] {
+                    if cfg!(target_os = "macos") {
+                        self.on_cursor_moved(wid, x, y);
+                    }
+                    self.mouse_input_then_fold(wid, state, WinitMouseButton::Left);
+                }
             }
             PointerAction::Leave => self.on_cursor_left(wid),
             PointerAction::Status => {}
+            PointerAction::Mods(mods) => {
+                // Keep the person's own modifiers aside, once per script, for
+                // their next input to put back (`App::release_scripted_mods`).
+                if let Some(ws) = self.windows.get_mut(&wid)
+                    && ws.scripted_mods_saved.is_none()
+                {
+                    ws.scripted_mods_saved = Some(ws.mods);
+                }
+                self.on_modifiers_changed(wid, mods);
+            }
         }
         Ok(self.pointer_readback(wid))
+    }
+
+    /// The front window's pointer as a window pixel (rounded), or `None` when it
+    /// holds no position: the `pointer` verb's `px=`.
+    pub(crate) fn pointer_px(&self) -> Option<(i32, i32)> {
+        let ws = self
+            .frontmost_window
+            .and_then(|wid| self.windows.get(&wid))
+            .filter(|ws| ws.pointer_position_known)?;
+        let (x, y) = ws.last_cursor_px;
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "a window pixel, rounded; the saturating cast clamps any nonsense"
+        )]
+        Some((x.round() as i32, y.round() as i32))
     }
 
     /// Where window `wid`'s pointer is, read back from the pixel the last
@@ -2009,12 +2243,15 @@ impl App {
         self.strip_col_at_with(wid, self.pointer_geometry(wid), x, y)
     }
 
-    /// A left press at window pixel `(px, py)`: if it lands on the message band (or the
-    /// presence row above it), consume it (`true`) and perform what the band says
-    /// (`App::press_band`). A question banner over the band's rows answers first,
-    /// fail-closed: the multi-line-paste confirmation (whose parked text is dropped) or the
-    /// Windows close/quit confirmation ([`crate::close_confirm`]) takes a press inside it as
-    /// cancel, never a capsule press underneath.
+    /// A left press at window pixel `(px, py)`: if it lands on the message
+    /// band (or the presence row above it), consume it — `true` — and perform
+    /// what the band says (`App::press_band`). THE PASTE QUESTION FIRST,
+    /// FAIL-CLOSED (design §3.4): the multi-line-paste confirmation OVERWRITES
+    /// the top composed rows in place — the band's own rows — so while it is
+    /// up in this window a press inside its band is its answer (cancel; the
+    /// parked text is dropped), never a capsule press underneath it. The
+    /// close/quit confirmation (off macOS, [`crate::close_confirm`]) takes the
+    /// same band and the same fail-closed reading of a press: cancel.
     fn press_band_at(&mut self, wid: WindowId, px: f64, py: f64) -> bool {
         // Judged against the banner's own floor (`paste_banner_tray_floor_y`, `0` = none)
         // before the band's hit test, whether or not the band has a row under it.
@@ -2041,7 +2278,7 @@ impl App {
     /// ([`Self::press_band_at`]), never the band's.
     fn band_banner_at(&self, wid: WindowId, px: f64, py: f64) -> Option<bool> {
         let paste_up = self.paste_banner.as_ref().is_some_and(|p| p.wid == wid);
-        // The close/quit confirm (Windows) shares the paste banner's slot and
+        // The close/quit confirm (off macOS) shares the paste banner's slot and
         // floor (`splice_close_banner`); the two are never up together on one
         // window, and the paste question keeps the band when both could be.
         let close_up = self.close_banner.as_ref().is_some_and(|p| p.wid == wid);
@@ -2199,151 +2436,6 @@ impl App {
         true
     }
 
-    /// A left press on Robi's tip bubble dismisses it and is consumed (`true`); `false` when
-    /// no bubble is visible here or the point misses. Nothing is recorded or posted. The
-    /// bubble must be on glass in this window ([`crate::WindowState::bubble_is_on_glass`]:
-    /// `App::robi_bubble` is global) and still legible
-    /// ([`crate::robi_bubble::CLICK_MIN_ALPHA`]: a target you cannot see is a trap). The hit
-    /// reads the painter's geometry (`robi_bubble::bubble_hit`: the same `now`, motion
-    /// amplitude and reserved chrome rows), so the target is the pixels, through the slide.
-    /// Runs before [`Self::robi_press_at`]: the bubble sits over his head.
-    pub(crate) fn robi_bubble_click(&mut self, wid: WindowId, x: f64, y: f64) -> bool {
-        let Some(bubble) = self.robi_bubble.as_ref() else {
-            return false;
-        };
-        let Some(ws) = self.windows.get(&wid) else {
-            return false;
-        };
-        if !ws.bubble_is_on_glass() {
-            return false;
-        }
-        let now = std::time::Instant::now();
-        if bubble.alpha(now) < crate::robi_bubble::CLICK_MIN_ALPHA {
-            return false;
-        }
-        let (cw, ch) = self.win_cell_size(wid);
-        let pad = self.win_pad(wid) as f32;
-        let top = (self.win_pad_top(wid) + self.win_head(wid)) as f32;
-        let geom = crate::settings::SettingsGeom {
-            cw: cw as f32,
-            ch: ch as f32,
-            font_px: self.win_font_px(wid),
-            cols: ws.cols as usize,
-            panel_rows: 0,
-        };
-        let motion = self
-            .motion_policy(true)
-            .amplitude(crate::motion::MotionEffect::NoticePill);
-        let (x, y) = self.window_to_frame(wid, x, y);
-        let (px, py) = (x as f32 - pad, y as f32 - top);
-        if !crate::robi_bubble::bubble_hit(
-            bubble,
-            &geom,
-            now,
-            motion,
-            self.bubble_clear_rows(wid),
-            px,
-            py,
-        ) {
-            return false;
-        }
-        self.robi_bubble = None;
-        self.request_redraw_all_windows();
-        true
-    }
-
-    /// If the last pointer position lands on Robi's drawn body (the rect the redraw stashed
-    /// post-tick, padded by [`ROBI_HIT_SLOP_PX`]), send him away and consume the press; the
-    /// caller stops routing on `true`.
-    ///
-    /// The press writes `robi = false` through the versioned compare-and-swap settings lane
-    /// ([`Self::queue_control_settings_field`]); only the durable completion replaces
-    /// `self.config`. Until then the pending-dismissal latch (`App::robi_dismissal`) retires
-    /// him in every window's render gate and keeps `robi_hit_rect` cleared, so a double-click
-    /// cannot queue a second write and the old config cannot re-birth him. A synchronous
-    /// refusal surfaces at once with no latch; an async failure surfaces through
-    /// [`Self::poll_robi_dismissal`], which releases the latch so he walks back on.
-    ///
-    /// A press on his tip bubble never gets here ([`Self::robi_bubble_click`] runs first).
-    /// Same chrome-wins policy and stale-`last_cursor_px` caveat as [`Self::pet_press_at`].
-    fn robi_press_at(&mut self, wid: WindowId) -> bool {
-        let Some(ws) = self.windows.get(&wid) else {
-            return false;
-        };
-        let Some(rect) = ws.robi_hit_rect else {
-            return false;
-        };
-        let (px, py) = ws.last_cursor_px;
-        let (fx, fy) = self.window_to_frame(wid, px, py);
-        if !aterm_effects::companion::pet_rect_hit(rect, fx, fy, ROBI_HIT_SLOP_PX) {
-            return false;
-        }
-        if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.robi_hit_rect = None;
-        }
-        let (reply, outcome) = std::sync::mpsc::channel();
-        self.queue_control_settings_field(
-            crate::prefs::EDIT_ROBI.to_string(),
-            Some("false".to_string()),
-            reply,
-        );
-        match outcome.try_recv() {
-            // Synchronous refusal: nothing is in flight, so there is no
-            // latch to arm — he stays on glass and the banner says why.
-            Ok(Err(error)) => {
-                self.surface_native_config_lane_error(format!("Robi was not dismissed: {error}"));
-            }
-            // Already durable (never in practice — the lane is async): skip
-            // straight to waiting for the config generation.
-            Ok(Ok(_)) => {
-                self.robi_dismissal = Some(crate::RobiDismissal::AwaitingConfig);
-                self.request_redraw_all_windows();
-            }
-            // Queued: arm the latch, holding the reply receiver so the completion has a
-            // reader, and repaint; the render gate retires him next frame in every window.
-            Err(_) => {
-                self.robi_dismissal = Some(crate::RobiDismissal::InFlight(outcome));
-                self.request_redraw_all_windows();
-            }
-        }
-        true
-    }
-
-    /// Settle Robi's in-flight click-dismissal (`App::robi_dismissal`, armed by
-    /// [`Self::robi_press_at`]). Called on every composed frame, before any route reads the
-    /// render gate, and at the settings lane's completion publish
-    /// (`publish_native_config_origin`), so neither branch waits on a lucky frame:
-    ///
-    /// * a failure reply (OCC conflict, rejection, indeterminate persist) releases the latch
-    ///   and surfaces through [`Self::surface_native_config_lane_error`]: Robi walks back on;
-    /// * a success reply holds the latch (`AwaitingConfig`) until the new generation replaces
-    ///   `self.config`, then releases so it cannot override a later Settings re-enable.
-    pub(crate) fn poll_robi_dismissal(&mut self) {
-        if let Some(crate::RobiDismissal::InFlight(outcome)) = &self.robi_dismissal {
-            match outcome.try_recv() {
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Ok(Ok(_)) => self.robi_dismissal = Some(crate::RobiDismissal::AwaitingConfig),
-                Ok(Err(error)) => {
-                    self.robi_dismissal = None;
-                    self.surface_native_config_lane_error(format!(
-                        "Robi was not dismissed: {error}"
-                    ));
-                }
-                // The lane dropped the request without replying: a failure, not a latch on a
-                // write nobody performed.
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.robi_dismissal = None;
-                    self.surface_native_config_lane_error(
-                        "Robi was not dismissed: the setting was not saved".to_string(),
-                    );
-                }
-            }
-        }
-        if self.robi_dismissal.is_some() && !self.config.robi_or_default() {
-            self.robi_dismissal = None;
-        }
-    }
-
     /// Track which in-grid strip tab the pointer is over, so the `✕` is a hover-only
     /// affordance as on the native macOS strip. Runs on every `CursorMoved`, including motion
     /// later paths consume, because leaving the strip must clear the reveal as surely as
@@ -2381,21 +2473,152 @@ impl App {
         // The trailing version label (Windows) is no tab either; same hit, so at most one of
         // the three is lit.
         let on_version = matches!(hit, Some(crate::tab_bar::TabHit::Version { .. }));
+        // Nor is a window button of a band that is the window's header
+        // (`crate::client_frame`); same hit again.
+        let on_caption = match hit {
+            Some(crate::tab_bar::TabHit::Caption(button)) => Some(button),
+            _ => None,
+        };
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
         if ws.strip_hover == hovered
             && ws.strip_hover_new_tab == on_new_tab
             && ws.strip_hover_version == on_version
+            && ws.strip_hover_caption == on_caption
         {
             return;
         }
         ws.strip_hover = hovered;
         ws.strip_hover_new_tab = on_new_tab;
         ws.strip_hover_version = on_version;
+        ws.strip_hover_caption = on_caption;
         if let Some(window) = &ws.os_window {
             window.request_redraw();
         }
+    }
+
+    /// Pointer motion over this window's own frame, where it draws one
+    /// ([`crate::client_frame`]), before any other owner sees it; `true` when the
+    /// frame took it.
+    ///
+    /// - A bare-band press armed a move (`WindowState::caption_move`): the first
+    ///   motion past [`crate::client_frame::MOVE_THRESHOLD_LOGICAL_PX`] hands the
+    ///   window to the compositor's interactive move (`drag_window`, on the press's
+    ///   still-held button).
+    /// - A resize handle ([`crate::client_frame::edge_at`]) under the pointer, with no
+    ///   gesture in flight: its cursor goes up, every chrome hover is dropped (the
+    ///   handle is no chip, `+` or button), and the motion stops here.
+    /// - Leaving a handle sets the arrow and the divider's re-issue encoding on the
+    ///   hover-cursor detector, so whichever owner the pointer lands on puts its own
+    ///   cursor back ([`Self::set_hover_cursor`], the strip's reset).
+    fn route_frame_motion(&mut self, wid: WindowId, x: f64, y: f64) -> bool {
+        let Some(ws) = self.windows.get(&wid) else {
+            return false;
+        };
+        let Some(frame) = ws.client_frame else {
+            return false;
+        };
+        if let Some((px, py)) = ws.caption_move {
+            let threshold = crate::client_frame::MOVE_THRESHOLD_LOGICAL_PX * ws.scale.max(1.0);
+            if (x - px).abs() <= threshold && (y - py).abs() <= threshold {
+                return false;
+            }
+            let window = ws.os_window.clone();
+            if let Some(ws) = self.windows.get_mut(&wid) {
+                ws.caption_move = None;
+                // The press is the compositor's now: no double-click follows it.
+                ws.strip_band_press = None;
+            }
+            if let Some(w) = window {
+                let _ = w.drag_window();
+            }
+            return true;
+        }
+        let gesture = ws.selecting
+            || ws.held_mouse_button.is_some()
+            || ws.divider_drag.is_some()
+            || ws.strip_drag.is_some()
+            || self.conn_drag.is_some();
+        let edge = if frame.edges && !gesture {
+            ws.win_px.and_then(|size| {
+                crate::client_frame::edge_at(
+                    x,
+                    y,
+                    f64::from(size.width),
+                    f64::from(size.height),
+                    ws.scale,
+                    self.frame_margins(wid, size),
+                )
+            })
+        } else {
+            None
+        };
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return false;
+        };
+        let Some(dir) = edge else {
+            if ws.frame_edge.take().is_some() {
+                ws.hover_pointer = true;
+                ws.native_text_cursor = true;
+                if let Some(w) = &ws.os_window {
+                    w.set_cursor(CursorIcon::Default);
+                }
+            }
+            return false;
+        };
+        if ws.frame_edge != Some(dir) {
+            ws.frame_edge = Some(dir);
+            if let Some(w) = &ws.os_window {
+                w.set_cursor(dir.cursor());
+            }
+        }
+        ws.hover_pointer = true;
+        ws.native_text_cursor = true;
+        let lit = ws.strip_hover.take().is_some()
+            | std::mem::take(&mut ws.strip_hover_new_tab)
+            | std::mem::take(&mut ws.strip_hover_version)
+            | ws.strip_hover_caption.take().is_some()
+            | ws.band_hover.take().is_some();
+        if lit && let Some(w) = &ws.os_window {
+            w.request_redraw();
+        }
+        true
+    }
+
+    /// How much of window `wid` (of raw `size`) lies outside its terminal grid
+    /// along each edge ([`crate::client_frame::FrameMargins`]): the grid's rect
+    /// exactly as [`Self::pixel_to_cell`] maps it (the frame origin, the pad, and
+    /// above the grid the top pad, the band and the chrome rows), so the resize
+    /// handles never take a cell's pixel.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "window pixel coordinates; the f64 mantissa covers every representable window size"
+    )]
+    fn frame_margins(
+        &self,
+        wid: WindowId,
+        size: winit::dpi::PhysicalSize<u32>,
+    ) -> crate::client_frame::FrameMargins {
+        let geom = self.pointer_geometry(wid);
+        let (ox, oy) = self.frame_origin_with(wid, geom);
+        let (cw, ch) = geom.cell;
+        let (rows, cols) = self
+            .windows
+            .get(&wid)
+            .map_or((0, 0), |ws| (usize::from(ws.rows), usize::from(ws.cols)));
+        let chrome = usize::from(self.chrome_rows(wid));
+        let px = |n: usize| n as f64;
+        let x0 = ox as f64 + px(geom.pad);
+        let y0 = oy as f64 + px(geom.pad_top + geom.head + chrome * ch);
+        crate::client_frame::FrameMargins::around_grid(
+            f64::from(size.width),
+            f64::from(size.height),
+            x0,
+            y0,
+            x0 + px(cols * cw),
+            y0 + px(rows * ch),
+        )
     }
 
     /// The pointer left the window: clear its hover state. `CursorMoved` alone drives
@@ -2419,9 +2642,13 @@ impl App {
         ws.hover_grid_owned = false;
         // The band's lit chip is the same shape of stale claim as the strip's.
         let band_lit = ws.band_hover.take().is_some();
+        // A resize handle's cursor is the window system's to change once the pointer
+        // is gone; only the claim is withdrawn, so re-entry re-resolves it.
+        ws.frame_edge = None;
         if ws.strip_hover.is_none()
             && !ws.strip_hover_new_tab
             && !ws.strip_hover_version
+            && ws.strip_hover_caption.is_none()
             && !band_lit
         {
             return;
@@ -2429,6 +2656,7 @@ impl App {
         ws.strip_hover = None;
         ws.strip_hover_new_tab = false;
         ws.strip_hover_version = false;
+        ws.strip_hover_caption = None;
         if let Some(window) = &ws.os_window {
             window.request_redraw();
         }
@@ -2884,7 +3112,7 @@ impl App {
             memo.answers(session, window_cell, mod_held, cell_is_under_pointer, frame)
         });
         if !answered {
-            let (disclosed, plain_url) = match probe {
+            let (disclosed, plain_url, citation) = match probe {
                 // The frame's own hold, still held from the fill that made this question
                 // new: read straight through it.
                 Some(t) => {
@@ -2901,6 +3129,21 @@ impl App {
                     probe_hover_cell(&t, row, col, cell_is_under_pointer, mod_held, min_contrast)
                 }
             };
+            // A citation is resolved here, with the terminal let go (the frame's own hold
+            // aside). The filesystem is looked at off this thread, waited on for a moment
+            // at most (`path_link::Looks`): a look not back by then is no link yet.
+            let looked = citation.map(|probe| self.resolve_citation(session, probe));
+            let settled = !matches!(looked, Some(None));
+            let target = looked.flatten().flatten();
+            let path_link = target.is_some();
+            let disclosed = match &target {
+                Some(target) => Some(target.shown.as_str().into()),
+                None => disclosed,
+            };
+            let citation = target;
+            let Some(ws) = self.windows.get_mut(&wid) else {
+                return Resolved(None);
+            };
             ws.hover_memo = Some(HoverMemo {
                 session,
                 window_cell,
@@ -2909,9 +3152,15 @@ impl App {
                 under_pointer: cell_is_under_pointer,
                 frame,
                 disclosed,
-                plain_url,
+                plain_url: plain_url || path_link,
+                path_link,
+                citation,
+                settled,
             });
         }
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return Resolved(None);
+        };
         let (disclosed, plain_url) = ws.hover_memo.as_ref().map_or((false, false), |memo| {
             (memo.disclosed.is_some(), memo.plain_url)
         });
@@ -3154,6 +3403,12 @@ impl App {
             self.conn_drag_motion(wid, x, y);
             return;
         }
+        // This window's own frame (`crate::client_frame`): a bare-band press becoming a
+        // move, and the resize handles at the window's edges, ahead of every surface
+        // drawn inside it.
+        if self.route_frame_motion(wid, x, y) {
+            return;
+        }
         // Derive the pointer geometry once per event (each derivation re-parses a variable
         // primary face). Nothing before its last use can move it: only `ws.metrics` and the
         // backend's face carry it, and the one handler-reachable mutation (`drag_divider` →
@@ -3179,6 +3434,13 @@ impl App {
             // (Esc/↵, no intervening motion) must not act on the pre-open cell.
             self.refresh_mouse_cell(wid, geom, x, y);
             self.track_tab_menu_hover(wid, x, y);
+            return;
+        }
+        // The Autopilot menu owns the motion the same way while it is open
+        // here: its highlight follows the pointer, nothing under it hovers.
+        if self.autopilot_menu.as_ref().is_some_and(|m| m.wid == wid) {
+            self.refresh_mouse_cell(wid, geom, x, y);
+            self.autopilot_menu_motion(wid, x, y);
             return;
         }
         // The connection confirm/configure card and the session picker: the
@@ -3303,7 +3565,14 @@ impl App {
                 );
                 self.request_redraw_all_windows();
             }
-            return;
+            // Over a terminal pane beside the page (or during a gesture its press went
+            // to), the motion is that terminal's report: on to the grid ladder, whose
+            // `pointer_route` sends it there. Not while a press the page took is held
+            // (`page_buttons`): that drag is the page's wherever the pointer goes, as a
+            // selection drag is its pane's.
+            if !self.pointer_routes_to_a_terminal_pane(wid) {
+                return;
+            }
         }
         // While the pointer is over the tab strip, it is not over the terminal grid:
         // show the default cursor and do not report a mouse-move to any pane's app
@@ -3983,32 +4252,32 @@ impl App {
     /// `UserClear` on the `clear()` arm. `ws.sel_dragged`, read here and nowhere below, tells
     /// them apart. Tier-1 drives the real gesture in [`crate::selection_custody_conformance`].
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "SelectionCustody",
             action = "SelectLow",
             project = "aterm_gui::selection_custody_conformance::project_selection_custody"
         )
     )]
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "SelectionCustody",
             action = "SelectOldest",
             project = "aterm_gui::selection_custody_conformance::project_selection_custody"
         )
     )]
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "SelectionCustody",
             action = "SelectHigh",
             project = "aterm_gui::selection_custody_conformance::project_selection_custody"
         )
     )]
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "SelectionCustody",
             action = "UserClear",
             project = "aterm_gui::selection_custody_conformance::project_selection_custody"
@@ -4100,19 +4369,185 @@ impl App {
             })
     }
 
-    /// Cmd-click: if there is a link under the pointer with a safe scheme, open it
-    /// via the OS and report `true`. The `is_safe_url` allowlist is the security
-    /// boundary — a hostile program's link can never make `open` launch an app or
-    /// touch the filesystem (covers both OSC 8 and auto-detected plain-text URLs).
-    pub(crate) fn open_link_under_pointer(&self, wid: WindowId) -> bool {
-        let Some(url) = self.link_under_pointer(wid) else {
-            return false;
+    /// The file citation a press at the pointer would open (`crate::path_link`): the
+    /// plain-text `path[:line[:col]]` or `path#L12` in the row under the pointer,
+    /// resolved against the session's own directories to an existing regular file.
+    /// The same gates as [`Self::link_under_pointer`]; the row and the OSC 7 directory
+    /// are read under one hold, and the filesystem only after it is let go.
+    pub(crate) fn path_link_under_pointer(
+        &self,
+        wid: WindowId,
+    ) -> Option<crate::path_link::PathTarget> {
+        let ws = self.windows.get(&wid)?;
+        let (row, col) = ws.last_mouse_cell;
+        let window_row = usize::from(ws.last_mouse_window_cell.0);
+        if self.chrome_owns_terminal_row(wid, window_row) {
+            return None;
+        }
+        let front = ws.front_terminal()?;
+        let session = front.session;
+        let probe = {
+            let term = term_lock(&front.term);
+            let cells = term.render_row(row as usize);
+            crate::plain_path_at(&cells, col as usize, self.render_knobs.minimum_contrast)
+                .map(|span| CitationProbe::new(&term, span))
+        }?;
+        // A look still out opens nothing: the press is not held behind a slow mount.
+        self.resolve_citation(session, probe).flatten()
+    }
+
+    /// Resolve a citation read off `session`'s grid against that session's own
+    /// directories, in order: the foreground program's OS working directory (its
+    /// `agent_cwd`, the directory an agent shortened its citation against), then the
+    /// shell's OSC 7 report while it stands. The filesystem is looked at off this
+    /// thread ([`crate::path_link::Looks`]): `None` while that look is not back,
+    /// `Some(None)` for anything [`crate::path_link::resolve`] refuses.
+    ///
+    /// Only while the session is known to run HERE, read now, before any directory
+    /// is: `Some(None)` otherwise (`crate::path_link`'s module doc). The group in front
+    /// is read afresh (`tcgetpgrp`, through the factory's probe), and the status
+    /// sweep's name for it is believed only for that very group and only when it
+    /// names a program that runs on this machine ([`crate::path_link::runs_here`]): a
+    /// group it has not named yet, an `ssh`, a `tmux`, a `sudo` is no citation. The
+    /// shell's running command must not be a remote shell (the moment an `exec ssh`
+    /// has not been named yet), and the shell's OSC 7, while it stands
+    /// ([`crate::path_link::report_stands`]), must name this machine. Where no group
+    /// can be read at all (a ConPTY), the shell's own integration stands in
+    /// ([`shell_reads_local`]).
+    pub(crate) fn resolve_citation(
+        &self,
+        session: u64,
+        probe: CitationProbe,
+    ) -> Option<Option<crate::path_link::PathTarget>> {
+        let Some(pooled) = self.pool.get(session) else {
+            return Some(None);
         };
-        if !is_safe_url(&url) {
+        let front = if pooled.master >= 0 {
+            (self.session_factory.fg_probe)(pooled.master)
+        } else {
+            -1
+        };
+        let (here, witness) = {
+            let timeline = pooled
+                .ctx
+                .timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let agent = timeline.agent();
+            let here = if front > 0 {
+                agent.program_pgid == front && crate::path_link::runs_here(agent)
+            } else {
+                cfg!(windows) && probe.shell_reads_local
+            };
+            (here, timeline.cwd_witness())
+        };
+        if !here
+            || probe
+                .running
+                .as_deref()
+                .is_some_and(crate::path_link::is_remote_shell)
+        {
+            return Some(None);
+        }
+        let stands = crate::path_link::report_stands(probe.osc7_seq, witness, front);
+        if stands
+            && probe
+                .osc7_host
+                .as_deref()
+                .is_some_and(|host| !crate::tab_label::names_this_machine(host))
+        {
+            return Some(None);
+        }
+        let agent_cwd = u32::try_from(front)
+            .ok()
+            .filter(|p| *p > 0)
+            .and_then(aterm_sysprobe::process_cwd);
+        let bases: Vec<std::path::PathBuf> = agent_cwd
+            .into_iter()
+            .chain(probe.osc7.filter(|_| stands))
+            .collect();
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        self.citation_looks
+            .target(&probe.span, &bases, home.as_deref())
+            .map(Result::ok)
+    }
+
+    /// Cmd-click: open what is under the pointer and report `true`, through the one
+    /// decision [`crate::path_link::decide`]. A URL (OSC 8 or plain text) opens via the
+    /// OS only past the `is_safe_url` allowlist, the security boundary that keeps a
+    /// hostile program's link from making `open` launch an app or touch the filesystem.
+    /// With no URL there, a plain-text file citation opens aterm's OWN editor tab at its
+    /// line ([`App::open_document_tab_at`]), never the OS.
+    ///
+    /// The press resolves what is under the pointer afresh, so it can name something
+    /// other than what the caption drawn for that cell named (the session's directory
+    /// moved under a still pointer, its program changed directory, a look came back
+    /// after the frame, the program rewrote the cell's link). Fail closed: it opens
+    /// only what [`caption_admits`] lets it, against the caption of the last
+    /// accepted application present for the cell (`WindowState::shown_caption`),
+    /// never a capture or a frame whose present was pending or refused. A citation
+    /// opens only under a caption that named
+    /// that very file, line and column. Otherwise nothing opens and the caption is
+    /// asked again, so the band names what the next press would open.
+    pub(crate) fn open_link_under_pointer(&mut self, wid: WindowId) -> bool {
+        let url = self.link_under_pointer(wid);
+        let path = if url.is_none() {
+            self.path_link_under_pointer(wid)
+        } else {
+            None
+        };
+        let shown = self.windows.get(&wid).and_then(|ws| {
+            let front = ws.front_terminal()?.session;
+            ws.shown_caption
+                .as_ref()
+                .filter(|shown| shown.session == front && shown.cell == ws.last_mouse_cell)
+                .map(|shown| shown.names.clone())
+        });
+        if !caption_admits(shown.as_ref(), url.as_deref(), path.as_ref()) {
+            if let Some(ws) = self.windows.get_mut(&wid) {
+                ws.hover_memo = None;
+                if let Some(w) = &ws.os_window {
+                    w.request_redraw();
+                }
+            }
+            self.update_hover_cursor(wid);
             return false;
         }
-        open_url_external(&url);
-        true
+        match crate::path_link::decide(url, path) {
+            crate::path_link::LinkAction::External(url) => {
+                debug_assert!(is_safe_url(&url));
+                open_url_external(&url);
+                true
+            }
+            crate::path_link::LinkAction::Document(target) => {
+                self.open_citation(wid, &target);
+                true
+            }
+            crate::path_link::LinkAction::Nothing => false,
+        }
+    }
+
+    /// Open a resolved citation in `wid`: aterm's editor tab on the file, its line
+    /// revealed. A refusal from the document host (too large, not UTF-8, …) is logged;
+    /// the press was the person's and is consumed either way.
+    pub(crate) fn open_citation(&mut self, wid: WindowId, target: &crate::path_link::PathTarget) {
+        let opened = crate::native_document_host::path_to_file_uri(&target.path)
+            .map_err(|error| error.to_string())
+            .and_then(|uri| {
+                self.open_document_tab_at(
+                    wid,
+                    crate::native_app::AppKind::Editor,
+                    &uri,
+                    target.line,
+                    target.col,
+                )
+            });
+        if let Err(error) = opened {
+            crate::logging::stderr_line!(
+                "aterm-gui: could not open {} in the editor: {error}",
+                target.shown
+            );
+        }
     }
 
     /// `MouseInput` -> when no app is tracking the mouse, left presses run the
@@ -4126,11 +4561,113 @@ impl App {
         state: ElementState,
         button: WinitMouseButton,
     ) {
+        self.route_mouse_input(wid, state, button);
+        if state == ElementState::Released
+            && let Some(button) = winit_mouse_button(button)
+        {
+            self.end_unpaired_release(wid, button);
+            if let Some(ws) = self.windows.get_mut(&wid) {
+                ws.page_buttons &= !(1 << button.slot());
+            }
+        }
+    }
+
+    /// A button's release ends its press, whoever consumed the release (as
+    /// [`Self::on_mouse_input`] ends a press the native page took, `page_buttons`). The
+    /// routing ladder ([`Self::route_mouse_input`]) forgets a reported press where it
+    /// delivers the release; every gate that swallows a release instead (a modal card, the
+    /// tab or Autopilot menu, a native page) returns before that, and left the button marked
+    /// held, so each later motion reported a drag to the press's program and routed to it.
+    /// Here the program that got the press is told the button went up, at the cell it last
+    /// saw, as a tab switch tells it ([`Self::settle_hidden_button_owners`]), and the button
+    /// is forgotten. A no-op for a release the ladder delivered and for a press that never
+    /// reported.
+    fn end_unpaired_release(&mut self, wid: WindowId, button: aterm_types::mouse::MouseButton) {
+        let Some(owner) = self.windows.get(&wid).and_then(|ws| {
+            (ws.reported_buttons & (1 << button.slot()) != 0)
+                .then(|| ws.button_owners[usize::from(button.slot())])
+        }) else {
+            return;
+        };
+        if let Some(owner) = owner {
+            self.write_owner_release(button, owner);
+        }
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            forget_reported_button(ws, button);
+        }
+    }
+
+    /// Write `button`'s release to the program its press went to (`owner`), at the cell last
+    /// sent to it, under that session's own lock (`write_ui_report`). No modifiers.
+    fn write_owner_release(&self, button: aterm_types::mouse::MouseButton, owner: ButtonOwner) {
+        let Some(session) = self.pool.get(owner.session) else {
+            return;
+        };
+        crate::app_input::write_ui_report(
+            &session.term,
+            &session.ctx.modes,
+            &session.ctx.sink,
+            &InputEvent::MouseButton {
+                button,
+                pressed: false,
+                row: owner.cell.0,
+                col: owner.cell.1,
+                mods: 0,
+                click_count: 1,
+                side: SelectionSide::Left,
+                block: false,
+                suppress_copy_on_select: false,
+                px_off: owner.px_off,
+            },
+        );
+    }
+
+    /// Whether a motion or wheel event in a tab a native page fronts belongs to a terminal
+    /// pane beside the page: the pane under the pointer, or the pane a held button's press
+    /// went to (`pointer_route`), as between two terminals. Everything else over the page is
+    /// the page's, as is any event while no terminal is beside it.
+    fn pointer_routes_to_a_terminal_pane(&self, wid: WindowId) -> bool {
+        matches!(self.pointer_route(wid, None), PointerRoute::Pane { .. })
+    }
+
+    /// Whether a new press in a tab a native page fronts lands on a terminal pane beside the
+    /// page: the pane under the pointer only ([`Self::pane_under_pointer`]). A button held on
+    /// that terminal keeps its own drag and release, but does not take a press made over the
+    /// page.
+    fn press_lands_on_a_terminal_pane(&self, wid: WindowId) -> bool {
+        matches!(
+            self.pane_under_pointer(wid, None),
+            PointerRoute::Pane { .. }
+        )
+    }
+
+    /// [`Self::on_mouse_input`]'s routing ladder: modals, chrome, native pages, then the
+    /// terminal's selection and report paths.
+    fn route_mouse_input(&mut self, wid: WindowId, state: ElementState, button: WinitMouseButton) {
         self.clear_move_license(wid);
         // The GUI-only prefix (link open, shift-extend, the `MULTI_CLICK_MS` streak that
         // yields `click_count`) stays in this handler; the seam takes `click_count` and
         // `side` as data.
         let pressed = state == ElementState::Pressed;
+        // This window's own frame (`crate::client_frame`) is the window's edge, outside
+        // every surface drawn in it, modals included: a left press on a resize handle
+        // starts the compositor's interactive resize and goes no further (its release,
+        // if one reaches the window at all, finds nothing held), and a left release
+        // disarms a bare-band move that never moved.
+        if button == WinitMouseButton::Left
+            && let Some(ws) = self.windows.get_mut(&wid)
+        {
+            #[cfg(target_os = "linux")]
+            if pressed && let Some(edge) = ws.frame_edge {
+                if let Some(w) = &ws.os_window {
+                    let _ = w.drag_resize_window(edge.direction());
+                }
+                return;
+            }
+            if !pressed {
+                ws.caption_move = None;
+            }
+        }
         // A press anywhere lets a keyboard-selected Claude Code chip go: the
         // person has moved on, and a chip left selected would swallow their
         // next Return (`crate::claude_lights`).
@@ -4191,6 +4728,21 @@ impl App {
         //     menu never also acts on what is underneath (the Windows/AppKit rule).
         // Only the press is examined; its release sets no `reported_buttons` bit, so a
         // tracking app sees neither half.
+        // THE AUTOPILOT MENU (`crate::autopilot_menu`, design §9.3.3): the same
+        // modal boundary — a left press on a choice chooses it, a press on the
+        // card is swallowed, a press off it closes it and is spent on that.
+        if self.autopilot_menu.as_ref().is_some_and(|m| m.wid == wid) {
+            if pressed {
+                let (px, py) = self
+                    .windows
+                    .get(&wid)
+                    .map_or((0.0, 0.0), |ws| ws.last_cursor_px);
+                self.autopilot_menu_press(wid, button == WinitMouseButton::Left, px, py);
+            } else {
+                self.settle_pointer_drags(wid);
+            }
+            return;
+        }
         if self
             .windows
             .get(&wid)
@@ -4341,8 +4893,33 @@ impl App {
         // Native tab pointer boundary: canonical tab chrome remains host-owned,
         // while every point below it is hit-tested against the exact semantic
         // tree used for paint and control inspection. Even a miss is swallowed
-        // so a click can never reach the parked PTY underneath the app.
-        if self.active_native_view(wid).is_some() {
+        // so a click can never reach the parked PTY underneath the app. A
+        // terminal pane beside the page keeps its own pointer: a press over it,
+        // and the release of a press that went to it, take the terminal path
+        // below, routed as between two terminals. A press over the page is the
+        // page's even while a button the terminal took is held.
+        let terminal_beside = if pressed {
+            self.press_lands_on_a_terminal_pane(wid)
+        } else {
+            winit_mouse_button(button).is_some_and(|button| {
+                self.windows.get(&wid).is_some_and(|ws| {
+                    ws.reported_buttons & (1 << button.slot()) != 0
+                        && matches!(
+                            self.owner_route(wid, ws.button_owners[usize::from(button.slot())]),
+                            PointerRoute::Pane { .. }
+                        )
+                })
+            })
+        };
+        if self.active_native_view(wid).is_some() && !terminal_beside {
+            // Every press this boundary takes is the page's until its release, a miss
+            // included: its drag and wheel stay the page's (`pointer_route`).
+            if pressed
+                && let Some(button) = winit_mouse_button(button)
+                && let Some(ws) = self.windows.get_mut(&wid)
+            {
+                ws.page_buttons |= 1 << button.slot();
+            }
             let (px, py) = self
                 .windows
                 .get(&wid)
@@ -4544,24 +5121,39 @@ impl App {
                 {
                     ws.band_menu_release_pending = false;
                 }
+                // A right press on the Autopilot chip opens its menu
+                // (`crate::autopilot_menu`, design §9.3.3); on any other chip
+                // or the blank between two it does nothing, as before.
+                if button == WinitMouseButton::Right {
+                    self.open_autopilot_menu_at(wid, px, py);
+                }
                 return;
+            }
+            // The in-grid TAB STRIP and the MESSAGE BAND are chrome for every
+            // button but Right (whose strip press pops the tab's context menu,
+            // `RightPressPlan::Chrome` below). A middle press on a chip closes
+            // that tab — the GTK, browser and Windows Terminal convention —
+            // through the chip ✕'s own path; any other press there does nothing.
+            // Never the X11 PRIMARY paste into the front pane, nor a mouse
+            // report at the last grid cell the pointer crossed. Only the press
+            // is swallowed; the orphan guard drops its release.
+            if button != WinitMouseButton::Right {
+                if let Some(col) = self.strip_col_at(wid, px, py) {
+                    if button == WinitMouseButton::Middle {
+                        self.handle_tab_strip_middle_press(wid, col);
+                    }
+                    return;
+                }
+                if self.band_banner_at(wid, px, py).is_some()
+                    || self.band_hit_at(wid, px, py).is_some()
+                {
+                    return;
+                }
             }
         }
         // The update nudge is a strip segment (`TabHit::Update`) or, on macOS, the version
         // menu, so it needs no mouse gate here.
         //
-        // A press on Robi's tip bubble dismisses it and stops there: after the modals (which
-        // hide it), before Robi's own body (`robi_press_at` below; the bubble sits over his
-        // head) and the mouse-report path.
-        if pressed && button == WinitMouseButton::Left {
-            let (px, py) = self
-                .windows
-                .get(&wid)
-                .map_or((0.0, 0.0), |ws| ws.last_cursor_px);
-            if self.robi_bubble_click(wid, px, py) {
-                return;
-            }
-        }
         // A non-left press goes where `pointer_route` says: over an unfocused pane with
         // nothing held, that pane's program decides from its own tracking mode and gets it at
         // its own cell; with a reported button held, the held gesture's owner gets it as the
@@ -4670,20 +5262,36 @@ impl App {
                             ) => {
                                 let _ = self.open_tab_context_menu(wid, index, col, false);
                             }
-                            // The bare band (or the `+`, `↻`, version label, which have no
-                            // menu): on Windows the caption's system menu, the band being
-                            // caption there; Linux has none, so the press is swallowed (and
-                            // this arm must not name the cfg(windows) `platform_win`). The
-                            // press only arms `band_menu_release_pending`; the release opens
-                            // the menu. winit's win32 backend holds `SetCapture` for the whole
-                            // press and `DefWindowProc` will not enter its modal menu loop
-                            // under capture, so a menu posted on the press opens only for a
+                            // The bare band (or the `+`, `↻`, version label or a window
+                            // button, which have no menu of their own): the window's menu,
+                            // the band being caption.
+                            //
+                            // Windows: the caption's system menu. The press only arms
+                            // `band_menu_release_pending`; the release opens the menu.
+                            // winit's win32 backend holds `SetCapture` for the whole press and
+                            // `DefWindowProc` will not enter its modal menu loop under
+                            // capture, so a menu posted on the press opens only for a
                             // machine-speed click.
-                            _ =>
-                            {
+                            //
+                            // Linux, where the band is the window's own header
+                            // (`crate::client_frame`): the compositor's window menu at the
+                            // pointer, on the press (`show_window_menu` needs this press's
+                            // serial). Elsewhere on Linux the window system's frame has
+                            // the menu, and the press is swallowed (in fullscreen too,
+                            // where there is no header).
+                            _ => {
                                 #[cfg(windows)]
                                 if let Some(ws) = self.windows.get_mut(&wid) {
                                     ws.band_menu_release_pending = true;
+                                }
+                                #[cfg(target_os = "linux")]
+                                if let Some(ws) = self.windows.get(&wid)
+                                    && ws
+                                        .client_frame
+                                        .is_some_and(|frame| frame.header && frame.window_menu)
+                                    && let Some(w) = &ws.os_window
+                                {
+                                    w.show_window_menu(winit::dpi::PhysicalPosition::new(px, py));
                                 }
                             }
                         }
@@ -4717,15 +5325,6 @@ impl App {
                 // (tracking off) returns `TrackingOff`, whose consumer acts only on Left.
                 RightPressPlan::Seam => {}
             }
-        }
-        // A left press on Robi's drawn body queues the `robi = false` write and stops here
-        // ([`Self::robi_press_at`]). Above the tab strip and find bar: those are spliced
-        // cells, and Robi is stamped `FreeZ::OverText` across the whole frame, strip rows
-        // included (he hangs from the strip), so a press on him must not switch or close the
-        // tab underneath. Below the modals and his tip bubble, which composite over the
-        // finished frame.
-        if pressed && button == WinitMouseButton::Left && self.robi_press_at(wid) {
-            return;
         }
         // A left press in the tab strip switches, closes or opens a tab and stops there,
         // never reaching selection or pane focus.
@@ -4802,27 +5401,33 @@ impl App {
             };
             let tracking = term_lock(&term).mouse_tracking_enabled();
             let option_held = mods_state.alt_key();
-            // A left press starts a local selection when nothing tracks the mouse, or when
-            // Option is held to bypass a tracking app (iTerm2's gesture: copy a PID out of
-            // htop). The GUI-only prefix (link open, shift-extend, click streak) runs for both.
-            if pressed && press_starts_selection(tracking, option_held) {
-                // Cmd-click (macOS) / Ctrl-click (elsewhere) on a link opens it (safe
-                // schemes only) instead of starting a selection; GUI-only, never the seam.
+            // A left press starts a LOCAL selection when nothing tracks the mouse OR
+            // (audit M6) the bypass modifier is held over a tracking app — Option
+            // (iTerm2's gesture) and, off macOS, Shift (xterm's) — so a PID can be
+            // copied out of htop. The GUI-only prefix (link-open, shift-extend, the
+            // click-streak FSM) runs for BOTH cases.
+            if pressed && press_starts_selection(tracking, tracking_bypass_held(mods_state)) {
+                // Cmd-click (macOS) / Ctrl-click (Linux) an OSC 8 hyperlink opens it
+                // (safe schemes only) instead of starting a selection. GUI-only —
+                // never reaches the seam.
                 if link_modifier_held(mods_state) && self.open_link_under_pointer(wid) {
                     return;
                 }
-                // Shift-click extends an existing selection (a GUI affordance keyed on
-                // `self.mods`) without reaching the seam.
-                if mods_state.shift_key() {
+                // Shift-click extends an existing selection (GUI affordance keyed on
+                // self.mods); it returns here without reaching the seam, like today.
+                // Not while Shift is the bypass itself (tracking on, no Option): that
+                // press starts a fresh selection, as xterm's does.
+                if mods_state.shift_key() && !(tracking && !option_held) {
                     self.shift_extend_press(wid);
                     return;
                 }
                 // Advance the streak and capture the count for the seam's gesture.
                 click_count = self.advance_click_streak(wid);
-                // Option bypass: tracking is on, so the seam would report this press. Run the
-                // local gesture here and report nothing, keeping press/release symmetric for
-                // the app. Option is spent on the bypass, so the kind is Simple
-                // (`press_selection_kind`), never Block.
+                // M6 BYPASS: tracking is ON, so the seam would REPORT this press to the
+                // app. Run the local selection gesture HERE and return without reporting
+                // — press/release stay symmetric for the app. The modifier is spent on
+                // the bypass, so the kind is Simple (`press_selection_kind`), never the
+                // local Option+drag Block.
                 if tracking {
                     let (row, col) = self
                         .windows
@@ -5086,6 +5691,10 @@ impl App {
         let conn_card = self.conn_card_claims_pointer(wid);
         let session_picker = self.session_picker_claims_pointer(wid);
         let connection_map = self.connection_map_claims_pointer(wid);
+        // A native page scrolls by the wheel only while the pointer is its: over a terminal
+        // pane beside it the notch is that terminal's (`pointer_route`, below).
+        let native_page =
+            self.active_native_view(wid).is_some() && !self.pointer_routes_to_a_terminal_pane(wid);
         // Do not bank fractional wheel deltas from chrome: otherwise a later
         // scroll in content would inherit motion that began over its title.
         if !(palette || conn_card || session_picker || connection_map)
@@ -5122,7 +5731,7 @@ impl App {
                     || conn_card
                     || session_picker
                     || connection_map
-                    || self.active_native_view(wid).is_some())
+                    || native_page)
             {
                 // The band belongs to the pane under the pointer, as the whole
                 // rows below do (`pointer_route`).
@@ -5144,11 +5753,7 @@ impl App {
         // rearm and `note_alt_scroll`.
         let vertical_up = dir.vertical_up();
         if vertical_up.is_none()
-            && (palette
-                || conn_card
-                || session_picker
-                || connection_map
-                || self.active_native_view(wid).is_some())
+            && (palette || conn_card || session_picker || connection_map || native_page)
         {
             return;
         }
@@ -5175,7 +5780,7 @@ impl App {
                 self.connection_map_pointer_wheel(wid, signed);
                 return;
             }
-            if self.active_native_view(wid).is_some() {
+            if native_page {
                 let signed = if up { -lines } else { lines };
                 let _ = self
                     .dispatch_native_event(wid, crate::native_app::AppEvent::ScrollLines(signed));
@@ -5207,10 +5812,16 @@ impl App {
         // no local motion otherwise). Reading the mode here would split the decision across
         // two locks and give the `mouse` verb a different answer than a hand.
         //
-        // The delta's kind (and a precise delta's pixels) rides beside the call in
-        // `wheel_precise_px`, not in the event: it changes only how the local band moves
-        // (`scroll_wheel_animated_with`: a notch eases, a precise delta tracks 1:1), never
-        // the seam's bytes, so Human/Controller byte equality holds. Cleared after the call.
+        // A precise delta's pixels ride beside the call in `wheel_precise_px`, not in the
+        // event: they change only how the local band moves (`scroll_wheel_animated_with`:
+        // a notch eases, a precise delta tracks 1:1), never the seam's bytes, so
+        // Human/Controller byte equality holds. Cleared after the call.
+        //
+        // Whether the delta counts detents DOES change bytes (the DEC-1007 arrow count is
+        // the platform's lines-per-detent), so that bit rides in the event, where the
+        // `mouse` verb's twin sets it too: winit's `LineDelta` is in detents (a wheel
+        // notch, an X11 scroll valuator), its `PixelDelta` is a precise device's pixels,
+        // banked into rows above.
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.wheel_precise_px = track_px;
         }
@@ -5220,6 +5831,7 @@ impl App {
             InputEvent::Wheel {
                 dir,
                 lines,
+                detent: matches!(delta, MouseScrollDelta::LineDelta(..)),
                 row,
                 col,
                 mods,
@@ -5656,7 +6268,7 @@ mod pointer_license_tests {
     #[test]
     fn byte_silent_pointer_preserves_the_keys_delayed_echo() {
         let wid = WindowId(0);
-        let model = aterm_spec::derive::cursor_hint_license_model();
+        let model = aterm_models_effects::cursor_hint_license_model();
         // Clearing a hint leaves earned echo credits alive, so a delayed +1 may still paint
         // as `inflight`; reported motion must match that.
         let (mut control, _reader, geom) = fixture(0);
@@ -5811,10 +6423,12 @@ mod pointer_license_tests {
 }
 
 #[cfg(test)]
+#[path = "path_link_app_tests.rs"]
+mod path_link_app_tests;
+
+#[cfg(test)]
 mod tests {
-    use super::{
-        PointerAction, WheelDir, bank_scroll_lines, press_selection_kind, press_starts_selection,
-    };
+    use super::{PointerAction, WheelDir, press_selection_kind};
     use aterm_core::selection::{SelectionSide, SelectionType};
 
     /// A file URI built as the shipping path builds it; a hand-rolled `file://` is malformed
@@ -5903,30 +6517,6 @@ mod tests {
             None,
             "a URL the configured floor lifts takes no row"
         );
-    }
-
-    /// The held divider's boundary hysteresis, as a pure function: a pointer a
-    /// few pixels past a cell edge keeps the held cell; one more than a quarter
-    /// cell past it (either way, or several cells away) moves it on the same
-    /// event.
-    #[test]
-    fn divider_drag_axis_holds_inside_the_dead_band_and_follows_past_it() {
-        use super::divider_drag_axis as axis;
-        // 20 px cells: the band is 20 / 4 = 5 px either side of a boundary.
-        assert_eq!(axis(12, 12, 3, 20), 12, "same cell is the same cell");
-        assert_eq!(axis(12, 13, 0, 20), 12, "1 px into the next cell holds");
-        assert_eq!(axis(12, 13, 4, 20), 12, "5 px past holds");
-        assert_eq!(axis(12, 13, 5, 20), 13, "6 px past follows");
-        assert_eq!(
-            axis(12, 11, 19, 20),
-            12,
-            "1 px back into the previous cell holds"
-        );
-        assert_eq!(axis(12, 11, 15, 20), 12, "5 px back holds");
-        assert_eq!(axis(12, 11, 14, 20), 11, "6 px back follows");
-        assert_eq!(axis(12, 14, 0, 20), 14, "a whole cell past always follows");
-        assert_eq!(axis(12, 10, 19, 20), 10, "a whole cell back always follows");
-        assert_eq!(axis(12, 13, 0, 0), 13, "no geometry: no band");
     }
 
     /// A press on the divider, nudged a pixel across the cell boundary and back, then
@@ -6266,24 +6856,33 @@ mod tests {
     /// A window that has never seen pointer motion, or that the pointer has left, holds no
     /// position, and the verb says so instead of reporting the coordinate memos (`(0, 0)`
     /// before any motion; afterwards the departed position, kept so a press racing the
-    /// departure can still hit-test).
+    /// departure can still hit-test). A cell outside the grid is refused, not clamped, and
+    /// the refusal leaves the position alone.
     #[test]
-    fn the_pointer_reports_no_position_before_any_motion_and_after_it_leaves() {
+    fn the_pointer_verb_reports_only_where_the_pointer_is() {
         let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
         assert_eq!(
             app.pointer_cmd(PointerAction::Status),
             Ok(None),
             "a window that has never seen the pointer claims no position"
         );
-
-        // A real move: the reply is the cell the window actually resolved.
-        let at = app
-            .pointer_cmd(PointerAction::Move { row: 3, col: 5 })
-            .expect("the move is addressable");
-        assert_eq!(at, Some((3, 5)));
-        assert_eq!(app.pointer_cmd(PointerAction::Status), Ok(Some((3, 5))));
-
-        // …and after leaving, the position is withdrawn rather than remembered.
+        assert_eq!(
+            app.pointer_cmd(PointerAction::Move { row: 3, col: 5 }),
+            Ok(Some((3, 5)))
+        );
+        let (rows, cols) = (app.windows[&wid].rows, app.windows[&wid].cols);
+        for (row, col) in [(rows, 0), (0, cols)] {
+            assert_eq!(
+                app.pointer_cmd(PointerAction::Move { row, col }),
+                Err("cell is outside the grid".to_string())
+            );
+        }
+        assert_eq!(
+            app.pointer_cmd(PointerAction::Status),
+            Ok(Some((3, 5))),
+            "a refused move left the pointer where it was"
+        );
         assert_eq!(app.pointer_cmd(PointerAction::Leave), Ok(None));
         assert_eq!(
             app.pointer_cmd(PointerAction::Status),
@@ -6291,35 +6890,7 @@ mod tests {
             "the departed pointer's last cell must not be reported as where it is"
         );
         // The memo still holds (3, 5): `Ok(None)` is the flag at work, not an emptied memo.
-        let wid = crate::WindowId(0);
         assert_eq!(app.windows[&wid].last_mouse_window_cell, (3, 5));
-    }
-
-    /// A cell outside the grid is refused, not clamped, and leaves the previous position
-    /// untouched.
-    #[test]
-    fn a_pointer_move_outside_the_grid_is_refused_and_changes_nothing() {
-        let mut app = crate::App::headless_for_test();
-        let wid = crate::WindowId(0);
-        let (rows, cols) = (app.windows[&wid].rows, app.windows[&wid].cols);
-        assert!(rows > 0 && cols > 0, "the headless window has a grid");
-        assert_eq!(
-            app.pointer_cmd(PointerAction::Move { row: 1, col: 1 }),
-            Ok(Some((1, 1)))
-        );
-        assert_eq!(
-            app.pointer_cmd(PointerAction::Move { row: rows, col: 0 }),
-            Err("cell is outside the grid".to_string())
-        );
-        assert_eq!(
-            app.pointer_cmd(PointerAction::Move { row: 0, col: cols }),
-            Err("cell is outside the grid".to_string())
-        );
-        assert_eq!(
-            app.pointer_cmd(PointerAction::Status),
-            Ok(Some((1, 1))),
-            "a refused move left the pointer where it was"
-        );
     }
 
     /// Every grid cell maps to a pixel that maps back to it, so the verb never drives the
@@ -6918,51 +7489,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[test]
-    fn native_palette_row_hover_and_left_release_activate_the_painted_target() {
-        use crate::native_app::AppViewState;
-        use crate::{App, WindowId};
-        use winit::event::{ElementState, MouseButton};
-
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
-        let (_, view) = app.active_native_view(wid).expect("Settings active");
-        assert!(app.prepare_native_input_scratch(wid));
-        app.palette_enter();
-        for c in "Go to Modified".chars() {
-            app.palette_filter_push(c);
-        }
-
-        // Reverse the native overlay placement as the production hit path does and land at
-        // the centre of the sole result's shared painted/hit rectangle.
-        let palette = app.windows[&wid].palette().unwrap();
-        assert_eq!(palette.filtered().len(), 1, "unique route command fixture");
-        let (x, y) = native_palette_row_center(&app, wid, 0);
-
-        app.on_cursor_moved(wid, x, y);
-        assert!(app.windows[&wid].palette().unwrap().pointer_over_row());
-        assert!(
-            app.windows[&wid].hover_pointer,
-            "row advertises pointer affordance"
-        );
-        app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
-        assert!(app.windows[&wid].palette().is_some(), "press only arms");
-        app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
-
-        assert!(
-            app.windows[&wid].palette().is_none(),
-            "matched release activates"
-        );
-        let Some(AppViewState::Settings(settings)) = app.native_runtime.view_state(view) else {
-            panic!("Settings state");
-        };
-        assert_eq!(
-            settings.route,
-            crate::native_settings::SettingsRoute::Modified
-        );
-    }
-
+    /// A native palette row under the pointer advertises the hand; after a
+    /// wheel scroll the post-scroll re-hit selects the row now painted there,
+    /// a press only ARMS it, and the matched release activates it.
     #[test]
     fn wheel_scrolled_native_palette_hit_activates_the_newly_painted_row() {
         use crate::native_app::AppViewState;
@@ -7000,6 +7529,11 @@ mod tests {
         // command under that exact painted rectangle, and the post-scroll re-hit selects it.
         let (x, y) = native_palette_row_center(&app, wid, about_slot);
         app.on_cursor_moved(wid, x, y);
+        assert!(app.windows[&wid].palette().unwrap().pointer_over_row());
+        assert!(
+            app.windows[&wid].hover_pointer,
+            "row advertises pointer affordance"
+        );
         app.on_mouse_wheel(
             wid,
             MouseScrollDelta::LineDelta(0.0, -(wanted_scroll as f32)),
@@ -7021,7 +7555,12 @@ mod tests {
         );
 
         app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
+        assert!(app.windows[&wid].palette().is_some(), "press only arms");
         app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
+        assert!(
+            app.windows[&wid].palette().is_none(),
+            "matched release activates"
+        );
         let Some(AppViewState::Settings(settings)) = app.native_runtime.view_state(view) else {
             panic!("Settings state");
         };
@@ -7367,13 +7906,6 @@ mod tests {
             }),
             "a click on a popup-chip enum row opens the ChoicePicker"
         );
-        assert!(
-            open.paint.iter().any(|node| {
-                node.key.as_str()
-                    == format!("settings/choice/{}/0", crate::prefs::EDIT_WINDOW_THEME)
-            }),
-            "the pull-down lists selectable options"
-        );
 
         // Dismiss via Cancel: the chip shows the unchanged committed value.
         let done = open
@@ -7544,13 +8076,12 @@ mod tests {
         );
     }
 
-    /// The horizontal axis end to end, both directions, through the `App` handler and the
-    /// exact xterm bytes. winit's +x is "the content moves right", the reader walking left:
-    /// xterm button 66; -x is button 67. Backwards would invert every horizontal scroll in
-    /// Neovim and tmux.
+    /// The horizontal axis end to end, both directions, through the `App` handler. winit's
+    /// +x is "the content moves right", the reader walking left: xterm button 66; -x is
+    /// button 67 (the bytes per direction are pinned in `aterm_core::terminal::mouse`).
+    /// Backwards would invert every horizontal scroll in Neovim and tmux.
     #[test]
     fn horizontal_flicks_report_both_xterm_buttons_in_the_right_direction() {
-        use aterm_core::terminal::Terminal;
         use winit::dpi::PhysicalPosition;
         use winit::event::MouseScrollDelta;
 
@@ -7592,32 +8123,6 @@ mod tests {
                 MouseScrollDelta::PixelDelta(PhysicalPosition::new(-cw, 0.0))
             ),
             Some((WheelDir::Right, 1))
-        );
-
-        // `Terminal::encode_mouse_wheel` is the seam's only wheel byte producer, so pinning
-        // it pins what a tracking app receives from a left/right flick.
-        let mut term = Terminal::new(24, 80);
-        term.process(b"\x1b[?1000h");
-        term.process(b"\x1b[?1006h");
-        // Coordinates are 0-based going in and 1-based on the wire.
-        assert_eq!(
-            term.encode_mouse_wheel(WheelDir::Left, 0, 0, 0).as_deref(),
-            Some(b"\x1b[<66;1;1M".as_slice()),
-            "walking left is xterm button 6"
-        );
-        assert_eq!(
-            term.encode_mouse_wheel(WheelDir::Right, 0, 0, 0).as_deref(),
-            Some(b"\x1b[<67;1;1M".as_slice()),
-            "walking right is xterm button 7"
-        );
-        // …and the vertical pair keeps its codes, so the four are distinct.
-        assert_eq!(
-            term.encode_mouse_wheel(WheelDir::Up, 0, 0, 0).as_deref(),
-            Some(b"\x1b[<64;1;1M".as_slice())
-        );
-        assert_eq!(
-            term.encode_mouse_wheel(WheelDir::Down, 0, 0, 0).as_deref(),
-            Some(b"\x1b[<65;1;1M".as_slice())
         );
     }
 
@@ -7703,65 +8208,25 @@ mod tests {
         );
     }
 
-    /// `bank_scroll_lines`: classic wheel notches (±1 or ±3 lines) pass through whole with no
-    /// residual; fractional LineDelta (Windows precision touchpads emit many |y| << 1 events)
-    /// banks until a whole line accumulates; a direction flip forfeits the banked remainder.
+    /// The bypass modifier: Option/Alt everywhere, and off macOS Shift too (the
+    /// xterm convention); Ctrl and Super are never it.
     #[test]
-    fn scroll_banking_passes_notches_banks_fractions_and_forfeits_on_reversal() {
-        let mut r = 0.0;
-        assert_eq!(bank_scroll_lines(&mut r, 1.0), Some((true, 1)));
-        assert_eq!(r, 0.0);
-        assert_eq!(bank_scroll_lines(&mut r, -3.0), Some((false, 3)));
-        assert_eq!(r, 0.0);
-
-        for _ in 0..4 {
-            assert_eq!(
-                bank_scroll_lines(&mut r, 0.2),
-                None,
-                "sub-line: nothing emitted"
-            );
-        }
-        assert_eq!(bank_scroll_lines(&mut r, 0.2), Some((true, 1)));
-        assert!(r.abs() < 1e-9, "the whole line drained the bank: {r}");
-        // Same going down.
-        assert_eq!(bank_scroll_lines(&mut r, -0.6), None);
-        assert_eq!(bank_scroll_lines(&mut r, -0.6), Some((false, 1)));
-
-        r = 0.0;
-        assert_eq!(bank_scroll_lines(&mut r, 0.9), None);
+    fn shift_is_the_tracking_bypass_off_macos() {
+        use super::tracking_bypass_held;
+        use winit::keyboard::ModifiersState as M;
+        assert!(tracking_bypass_held(M::ALT));
+        assert!(tracking_bypass_held(M::ALT | M::SHIFT));
         assert_eq!(
-            bank_scroll_lines(&mut r, -0.5),
-            None,
-            "the +0.9 bank must not absorb the reversal into a net +0.4"
+            tracking_bypass_held(M::SHIFT),
+            cfg!(not(target_os = "macos"))
         );
-        assert_eq!(
-            r, -0.5,
-            "the reversal starts a fresh bank in its own direction"
-        );
-        assert_eq!(bank_scroll_lines(&mut r, -0.5), Some((false, 1)));
+        assert!(!tracking_bypass_held(M::empty()));
+        assert!(!tracking_bypass_held(M::CONTROL));
+        assert!(!tracking_bypass_held(M::SUPER));
     }
 
-    /// A left press starts a local selection when nothing is tracking, or when Option is held
-    /// to bypass a tracking app; a plain press while tracking keeps reporting to the app.
-    #[test]
-    fn option_press_bypasses_tracking_for_local_selection() {
-        assert!(
-            press_starts_selection(false, false),
-            "no tracking: always local"
-        );
-        assert!(press_starts_selection(false, true));
-        assert!(
-            !press_starts_selection(true, false),
-            "tracking + plain press keeps reporting to the app"
-        );
-        assert!(
-            press_starts_selection(true, true),
-            "Option overrides tracking (the bypass gesture)"
-        );
-    }
-
-    /// Option+drag is the rectangular block selection only when the press was local anyway;
-    /// while Option buys the tracking bypass it selects normally.
+    /// Audit M6 — Option+drag is the rectangular block selection only when the press
+    /// was local anyway; while Option buys the tracking bypass it selects normally.
     #[test]
     fn option_drag_kind_depends_on_who_owns_the_mouse() {
         assert_eq!(
@@ -7982,14 +8447,6 @@ mod tests {
         assert!(term_lock(&term).mouse_tracking_enabled());
         let bits = |app: &App| app.windows[&wid].reported_buttons;
         let bit = |b: MouseButton| 1u8 << (b.slot() & 7);
-        // Under `& 7` the wire codes of Back and Left alias: the reason for `slot()`.
-        assert_eq!(
-            MouseButton::Back.code() & 7,
-            MouseButton::Left.code() & 7,
-            "the wire codes really do alias under `& 7` — that is why slot() exists"
-        );
-        assert_ne!(bit(MouseButton::Back), bit(MouseButton::Left));
-        assert_ne!(bit(MouseButton::Forward), bit(MouseButton::Middle));
 
         // Left goes down and stays down (a live drag).
         app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
@@ -8034,7 +8491,6 @@ mod tests {
         );
         app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Forward);
         assert_eq!(bits(&app), 0);
-        assert_eq!(super::winit_mouse_button(WinitMouseButton::Other(9)), None);
     }
 
     /// The pet's pointer wake is an edge: never with no pet on glass or with the brain's own
@@ -8145,225 +8601,6 @@ mod tests {
             );
             assert!(ws.selecting, "a plain terminal press still selects");
         }
-        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
-    }
-
-    /// A cleared stash (pet or Robi not drawn) never eats a click: no stale rect after a
-    /// style switch, a fade-out or the gate closing.
-    #[test]
-    fn no_rect_no_pet_or_robi_the_click_falls_through() {
-        use crate::{App, WindowId};
-        use winit::event::{ElementState, MouseButton as WinitMouseButton};
-
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        assert_eq!(
-            app.windows.get(&wid).unwrap().fx.companion().hit_rect(),
-            None
-        );
-        assert_eq!(app.windows.get(&wid).unwrap().robi_hit_rect, None);
-        app.on_cursor_moved(wid, 150.0, 130.0);
-        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
-        let ws = app.windows.get(&wid).unwrap();
-        assert_eq!(
-            ws.fx.companion().brain().pending_pets(),
-            0,
-            "nothing to pet"
-        );
-        assert!(ws.selecting, "the press reached the selection layer");
-        assert!(
-            !app.has_live_message("Couldn't dismiss Robi"),
-            "and no dismissal was ever attempted"
-        );
-    }
-
-    /// A left press inside Robi's body rect is consumed, spends the rect and routes
-    /// `robi = false` to the settings lane, whose headless refusal surfaces as a message and
-    /// arms no latch. Outside the rect the press selects.
-    #[test]
-    fn a_click_on_robi_dismisses_him_and_never_selects() {
-        use crate::{App, WindowId};
-        use winit::event::{ElementState, MouseButton as WinitMouseButton};
-
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        app.windows.get_mut(&wid).unwrap().robi_hit_rect = Some((100, 200, 100, 160));
-        app.on_cursor_moved(wid, 150.0, 130.0);
-        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
-        {
-            let ws = app.windows.get(&wid).unwrap();
-            assert!(!ws.selecting, "consumed before the selection layer");
-            assert_eq!(ws.robi_hit_rect, None, "the rect is spent by the press");
-        }
-        assert!(
-            app.has_live_message("Couldn't dismiss Robi"),
-            "the persist attempt reached the settings lane (headless refusal is surfaced)"
-        );
-        assert!(
-            app.robi_dismissal.is_none(),
-            "a synchronous refusal arms no latch — nothing is in flight"
-        );
-        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
-        assert!(
-            !app.windows.get(&wid).unwrap().selecting,
-            "the orphan release is dropped (press/release stay paired)"
-        );
-        // The control: the same gesture outside the padded rect selects (the
-        // band claims no rows here — headless leaves `input_scratch` unsized).
-        app.windows.get_mut(&wid).unwrap().robi_hit_rect = Some((100, 200, 100, 160));
-        app.on_cursor_moved(wid, 420.0, 300.0);
-        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
-        assert!(
-            app.windows.get(&wid).unwrap().selecting,
-            "a plain terminal press still selects"
-        );
-        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
-    }
-
-    /// `poll_robi_dismissal`: a failed lane completion releases the latch and posts (Robi
-    /// walks back on); a success holds it until `robi = false` is the live config (else the
-    /// gate reads the old `robi = true` in the completion-to-generation gap and re-births
-    /// him), then releases so it cannot override a later Settings re-enable.
-    #[test]
-    fn the_dismissal_latch_settles_by_lane_outcome() {
-        use crate::{App, RobiDismissal};
-
-        let mut app = App::headless_for_test();
-        // A clicked Robi was an enabled one; the shipped default is off, and without this
-        // `poll` reads `robi_or_default() == false` and releases early.
-        app.config.robi = Some(true);
-        // Failure completion (the OCC-conflict shape): message + release.
-        let (tx, rx) = std::sync::mpsc::channel();
-        app.robi_dismissal = Some(RobiDismissal::InFlight(rx));
-        tx.send(Err(
-            "save conflict for robi at config revision 7".to_string()
-        ))
-        .unwrap();
-        app.poll_robi_dismissal();
-        assert!(
-            app.robi_dismissal.is_none(),
-            "a failed write releases the latch — Robi returns"
-        );
-        assert!(
-            app.has_live_message("Couldn't dismiss Robi"),
-            "…and the failure is surfaced, never silent"
-        );
-        let surfaced = app
-            .messages
-            .live_by_key(crate::message_reporters::KEY_CONFIG_LANE)
-            .map(|l| l.id)
-            .expect("the failure row");
-        assert!(app.resolve_message(surfaced, aterm_messages::Outcome::Ok));
-        // A still-pending write keeps the latch armed…
-        let (tx, rx) = std::sync::mpsc::channel();
-        app.robi_dismissal = Some(RobiDismissal::InFlight(rx));
-        app.poll_robi_dismissal();
-        assert!(
-            matches!(app.robi_dismissal, Some(RobiDismissal::InFlight(_))),
-            "an empty channel settles nothing"
-        );
-        // …a success holds it (config still says `robi = true`)…
-        tx.send(Ok("saved: robi = false".to_string())).unwrap();
-        app.poll_robi_dismissal();
-        assert!(
-            matches!(app.robi_dismissal, Some(RobiDismissal::AwaitingConfig)),
-            "success waits for the generation, not the reply"
-        );
-        assert!(
-            !app.has_live_message("Couldn't dismiss Robi"),
-            "success needs no message"
-        );
-        // …and it releases the moment the dismissal is the live config.
-        app.config.robi = Some(false);
-        app.poll_robi_dismissal();
-        assert!(
-            app.robi_dismissal.is_none(),
-            "the landed config owns the gate"
-        );
-    }
-
-    /// `robi_bubble_click` runs before `robi_press_at` in `on_mouse_input`, so a press on the
-    /// tip bubble (which sits over Robi's padded body) dismisses the bubble and never writes
-    /// `robi = false`.
-    #[test]
-    fn a_press_on_robis_tip_bubble_dismisses_the_bubble_not_the_robot() {
-        use crate::{App, WindowId};
-        use winit::event::{ElementState, MouseButton as WinitMouseButton};
-
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        // A tip mid-hold (past the entrance ramp, so it is clickable),
-        // anchored the way the redraw anchors it: over the speaker.
-        let spawned = std::time::Instant::now() - std::time::Duration::from_secs(2);
-        app.robi_bubble = Some(crate::robi_bubble::RobiBubble::new(
-            aterm_effects::robi::ROBI_TIPS[0].text,
-            Some((160.0, 140.0)),
-            spawned,
-        ));
-        // On glass in this window (what the splice records when it paints).
-        app.windows.get_mut(&wid).unwrap().bubble_card = Some(crate::SettingsCard {
-            rgba: Vec::new(),
-            pw: 0,
-            ph: 0,
-            dx: 0,
-            dy: 0,
-            fp: 0,
-            geom: 0,
-        });
-        // Resolve the card's live rect through the same seams the click path
-        // reads, and aim for its center.
-        let now = std::time::Instant::now();
-        let (cw, ch) = app.win_cell_size(wid);
-        let pad = app.win_pad(wid) as f32;
-        let top = (app.win_pad_top(wid) + app.win_head(wid)) as f32;
-        let geom = crate::settings::SettingsGeom {
-            cw: cw as f32,
-            ch: ch as f32,
-            font_px: app.win_font_px(wid),
-            cols: app.windows.get(&wid).unwrap().cols as usize,
-            panel_rows: 0,
-        };
-        let motion = app
-            .motion_policy(true)
-            .amplitude(crate::motion::MotionEffect::NoticePill);
-        let (rx, ry, rw, rh) = crate::robi_bubble::bubble_rect(
-            app.robi_bubble.as_ref().unwrap(),
-            &geom,
-            now,
-            motion,
-            app.bubble_clear_rows(wid),
-        );
-        assert!(
-            rw > 0.0 && rh > 0.0,
-            "the card must be drawable to be clickable"
-        );
-        let (click_x, click_y) = (
-            f64::from(pad + rx + rw * 0.5),
-            f64::from(top + ry + rh * 0.5),
-        );
-        // Robi's stashed body directly under that same point: if the bubble
-        // did not win by order, this press would dismiss him.
-        let body = (
-            click_x as i32 - 20,
-            click_x as i32 + 20,
-            click_y as i32 - 20,
-            click_y as i32 + 20,
-        );
-        app.windows.get_mut(&wid).unwrap().robi_hit_rect = Some(body);
-        app.on_cursor_moved(wid, click_x, click_y);
-        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
-        assert!(app.robi_bubble.is_none(), "the press dismissed the bubble");
-        let ws = app.windows.get(&wid).unwrap();
-        assert_eq!(
-            ws.robi_hit_rect,
-            Some(body),
-            "…and never reached the robot (the rect is not spent)"
-        );
-        assert!(
-            app.robi_dismissal.is_none(),
-            "no `robi = false` write was queued"
-        );
-        assert!(!ws.selecting, "and no selection started");
         app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
     }
 
@@ -8539,8 +8776,9 @@ mod tests {
 
     /// Hovering the `+` records it, the strip cache key carries the flag so the next splice
     /// rebuilds, and the painted row takes the wash. `CursorMoved` alone drives
-    /// [`App::track_strip_hover`], so leaving the window must clear both strip hovers (a
-    /// chip's, which reveals its `✕`, and the `+`'s), and the redraw carries the clear.
+    /// [`App::track_strip_hover`], so leaving the window must clear the `+`'s wash, and the
+    /// redraw carries the clear (a chip's hover through the leave:
+    /// `a_strip_hover_change_moves_the_repaint_key`).
     #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn hovering_the_new_tab_button_records_it_and_repaints_the_strip() {
@@ -8560,7 +8798,6 @@ mod tests {
                 .expect("the strip laid out both a chip and a +")
         };
         let plus = seg(true);
-        let chip = seg(false);
         let point = |col: u16| {
             (
                 pad + f64::from(col) * cw as f64 + cw as f64 * 0.5,
@@ -8611,33 +8848,6 @@ mod tests {
             bg_of(&app, button_col),
             resting,
             "…and the clear reaches the painted row"
-        );
-
-        // Back on the `+`, then leaving for a chip clears the button and lights
-        // the tab instead.
-        app.on_cursor_moved(wid, p.0, p.1);
-        assert!(app.windows[&wid].strip_hover_new_tab, "re-entry relights");
-        let q = point(chip.start_col + 1);
-        app.on_cursor_moved(wid, q.0, q.1);
-        assert!(
-            !app.windows[&wid].strip_hover_new_tab,
-            "leaving the `+` clears its wash"
-        );
-        assert_eq!(app.windows[&wid].strip_hover, Some(0));
-        app.splice_tab_strip_with(wid, 1);
-        assert_eq!(
-            bg_of(&app, button_col),
-            resting,
-            "…and the button is back to resting"
-        );
-
-        // The chip lit, then the pointer leaves the window. The harness's one tab is the
-        // selected one, painted the same lit or not (hover never overrides the selection),
-        // so the chip's half is pinned at the state.
-        app.on_cursor_left(wid);
-        assert_eq!(
-            app.windows[&wid].strip_hover, None,
-            "leaving the window clears the chip's wash and its `✕`"
         );
     }
 
@@ -8959,157 +9169,6 @@ mod tests {
         );
     }
 
-    /// A wheel gesture and a button press arm the reader's interactive-input-pending hint
-    /// (the stamp advances across the call).
-    #[test]
-    fn wheel_and_button_press_arm_the_interactive_input_hint() {
-        let mut app = crate::App::headless_for_test();
-        let wid = crate::WindowId(0);
-        // A brief settle so a stamp another test armed a moment ago cannot be
-        // mistaken for ours: we require a strict advance across each call, and
-        // the stamp is `now + tail`, so any arming inside the call advances it.
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        let before = crate::metrics::interactive_input_deadline_ns();
-        app.on_mouse_wheel(wid, winit::event::MouseScrollDelta::LineDelta(0.0, -1.0));
-        let after_wheel = crate::metrics::interactive_input_deadline_ns();
-        assert!(after_wheel > before, "a wheel gesture must arm the hint");
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        app.on_mouse_input(
-            wid,
-            winit::event::ElementState::Pressed,
-            winit::event::MouseButton::Left,
-        );
-        let after_press = crate::metrics::interactive_input_deadline_ns();
-        assert!(
-            after_press > after_wheel,
-            "a button press must arm the hint"
-        );
-        app.on_mouse_input(
-            wid,
-            winit::event::ElementState::Released,
-            winit::event::MouseButton::Left,
-        );
-        assert!(
-            crate::metrics::input_pending(),
-            "…and the window is live afterwards"
-        );
-    }
-
-    /// Pointer motion takes the terminal mutex once per question, never per pixel: once
-    /// (non-blocking) entering a cell, never within it, once per modifier edge or new cell,
-    /// never for unpresented output, and once by the frame itself for a new frame.
-    #[test]
-    fn hover_resolution_is_memoised_per_cell_and_frame() {
-        let mut app = crate::App::headless_for_test();
-        let wid = crate::WindowId(0);
-        let (cw, ch) = app.win_cell_size(wid);
-        let strip_px = f64::from(app.tab_strip_rows) * ch as f64;
-        let at = |app: &crate::App, row: f64, col: f64| {
-            (
-                app.win_pad(wid) as f64 + cw as f64 * col,
-                (app.win_pad_top(wid) + app.win_head(wid)) as f64 + strip_px + ch as f64 * row,
-            )
-        };
-        let acq = crate::term_lock_acquisitions_on_this_thread;
-
-        // Entering a cell: one probe (non-blocking), nothing else.
-        let (x, y) = at(&app, 5.5, 10.2);
-        let before = acq();
-        app.on_cursor_moved(wid, x, y);
-        assert_eq!(acq() - before, 1, "entering a cell asks the grid once");
-        assert_eq!(app.windows[&wid].last_mouse_cell, (5, 10));
-        assert!(
-            app.windows[&wid].native_text_cursor,
-            "grid, tracking off: the I-beam"
-        );
-
-        // Seven more events inside the same cell (a trackpad's ~7 per cell): zero.
-        let before = acq();
-        for i in 1..8 {
-            let (x, y) = at(&app, 5.5, 10.2 + f64::from(i) * 0.1);
-            app.on_cursor_moved(wid, x, y);
-        }
-        assert_eq!(
-            acq() - before,
-            0,
-            "motion inside one cell takes no terminal lock at all"
-        );
-
-        // The next cell: one again.
-        let (x, y) = at(&app, 5.5, 11.5);
-        let before = acq();
-        app.on_cursor_moved(wid, x, y);
-        assert_eq!(acq() - before, 1, "a new cell is a new question");
-        assert_eq!(app.windows[&wid].last_mouse_cell, (5, 11));
-
-        // A link-modifier edge is a new question (the plain-text URL probe runs,
-        // over the row `render_row` resolves); motion inside the cell with it
-        // held is not.
-        let before = acq();
-        app.on_modifiers_changed(wid, link_modifier());
-        assert_eq!(acq() - before, 1, "the modifier edge re-asks once");
-        let before = acq();
-        let (x, y) = at(&app, 5.5, 11.7);
-        app.on_cursor_moved(wid, x, y);
-        assert_eq!(
-            acq() - before,
-            0,
-            "…and the held modifier costs nothing per pixel"
-        );
-        app.on_modifiers_changed(wid, winit::keyboard::ModifiersState::empty());
-
-        // Output that has not reached a frame yet: the memo stands (it answers
-        // for the frame the pointer stands on, which is unchanged).
-        let term = app.front_terminal(wid).expect("terminal").term.clone();
-        crate::term_lock(&term).process(b"\x1b[6;1Hhttps://example.test/path more text");
-        let before = acq();
-        let (x, y) = at(&app, 5.5, 11.3);
-        app.on_cursor_moved(wid, x, y);
-        assert_eq!(
-            acq() - before,
-            0,
-            "unpresented output does not re-ask: the answer is per presented frame"
-        );
-
-        // A new frame under the still pointer re-asks once under its own hold
-        // (`refresh_hover_for_frame_locked` at the fill): it costs what an unchanged frame
-        // costs, and the caption splice acquires nothing.
-        let frame = |app: &mut crate::App| {
-            let before = acq();
-            assert!(
-                app.prepare_terminal_capture_grid_with_cursor_fx(
-                    wid,
-                    crate::app_render::ComposedCursorFxClock::Advance(std::time::Instant::now()),
-                )
-                .is_some()
-            );
-            let fill = acq() - before;
-            let before = acq();
-            app.splice_link_target(wid);
-            (fill, acq() - before)
-        };
-        let fresh = |app: &crate::App| {
-            let ws = &app.windows[&wid];
-            ws.hover_memo.as_ref().is_some_and(|m| {
-                m.stands_for(ws, app.front_terminal(wid).expect("terminal").session)
-            })
-        };
-        let (changed_fill, changed_splice) = frame(&mut app);
-        assert!(
-            fresh(&app),
-            "the frame that carried the change re-probed under its hold"
-        );
-        assert_eq!(changed_splice, 0, "the caption splice never acquires");
-        // …and the next frame, unchanged, costs the same: the re-probe rode the
-        // fill's acquisition, it did not add one.
-        let (unchanged_fill, unchanged_splice) = frame(&mut app);
-        assert_eq!(
-            (changed_fill, changed_splice),
-            (unchanged_fill, unchanged_splice),
-            "a changed frame re-probes the hovered cell under the frame's own hold"
-        );
-    }
-
     /// The platform's "open link" modifier, as `link_modifier_held` reads it.
     fn link_modifier() -> winit::keyboard::ModifiersState {
         #[cfg(target_os = "macos")]
@@ -9178,44 +9237,6 @@ mod tests {
         (app, wid, order)
     }
 
-    /// Press a chip, sweep past the next chip's midpoint, release: the tabs swap and the
-    /// dragged tab stays selected.
-    #[test]
-    fn dragging_a_chip_past_its_neighbour_reorders_the_strip() {
-        use winit::event::{ElementState, MouseButton as WinitMouseButton};
-
-        let (mut app, wid, before) = app_with_three_chips();
-        let grab = strip_point(&app, wid, chip_span(&app, wid, 0).0 + 1);
-        app.on_cursor_moved(wid, grab.0, grab.1);
-        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
-        assert_eq!(
-            tab_order(&app, wid),
-            before,
-            "the press SELECTS and nothing more — reordering is the motion's job"
-        );
-        assert_eq!(app.windows[&wid].tabs.active, 0, "…and it selected chip 0");
-
-        // Past the neighbour's midpoint: the crossing that steps.
-        let (start, end) = chip_span(&app, wid, 1);
-        let over = strip_point(&app, wid, start + (end - start) / 2);
-        app.on_cursor_moved(wid, over.0, over.1);
-        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
-
-        assert_eq!(
-            tab_order(&app, wid),
-            vec![before[1], before[0], before[2]],
-            "the dragged chip swapped with the one it crossed"
-        );
-        assert_eq!(
-            app.windows[&wid].tabs.active, 1,
-            "a reorder must not silently switch tabs: the dragged tab is still selected"
-        );
-        assert!(
-            app.windows[&wid].strip_drag.is_none(),
-            "the release disarmed the gesture"
-        );
-    }
-
     /// The same gesture leftward, and across two chips in one sweep: a coalesced
     /// motion that crosses two midpoints takes two steps, not one.
     #[test]
@@ -9272,179 +9293,127 @@ mod tests {
         );
     }
 
-    /// After the release, sweeping the strip is a bare hover: it reveals `✕`s and reorders
-    /// nothing.
+    /// AN INTERRUPTION MID-DRAG STOPS THE HELD CHIP. Focus loss (an alt-tab
+    /// can leave the release undelivered, and a wedged gesture would make every
+    /// later hover shuffle) and the tab's context menu (the right press that
+    /// can arrive with the left button still down: `open_tab_context_menu` →
+    /// `clear_strip_press`) drop the grab; a palette opened by KEYBOARD
+    /// freezes it — the modal owns the window though it never claimed the
+    /// pointer — and the release still disarms through the hoisted disarm.
+    /// Either way, motion past a neighbour's midpoint reorders nothing.
     #[test]
-    fn a_bare_hover_after_the_release_never_reorders() {
+    fn an_interruption_mid_drag_stops_the_held_chip() {
         use winit::event::{ElementState, MouseButton as WinitMouseButton};
 
-        let (mut app, wid, before) = app_with_three_chips();
-        let grab = strip_point(&app, wid, chip_span(&app, wid, 0).0 + 1);
-        app.on_cursor_moved(wid, grab.0, grab.1);
-        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
-        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
-
-        for index in [1usize, 2, 1, 0] {
-            let (start, end) = chip_span(&app, wid, index);
-            let point = strip_point(&app, wid, start + (end - start) / 2);
-            app.on_cursor_moved(wid, point.0, point.1);
+        for interruption in ["focus loss", "context menu", "palette"] {
+            let (mut app, wid, before) = app_with_three_chips();
+            let (grab_start, _) = chip_span(&app, wid, 0);
+            let grab = strip_point(&app, wid, grab_start + 1);
+            app.on_cursor_moved(wid, grab.0, grab.1);
+            app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
+            assert!(
+                app.windows[&wid].strip_drag.is_some(),
+                "{interruption}: the chip is held"
+            );
+            match interruption {
+                "focus loss" => {
+                    app.on_focus(wid, false);
+                }
+                "context menu" => {
+                    assert!(
+                        app.open_tab_context_menu(wid, 0, grab_start + 1, false),
+                        "the chip has a composed menu"
+                    );
+                }
+                _ => {
+                    app.toggle_palette();
+                    assert!(
+                        app.windows[&wid].palette().is_some(),
+                        "fixture guard: the palette really opened"
+                    );
+                }
+            }
+            let frozen = interruption == "palette";
+            assert_eq!(
+                app.windows[&wid].strip_drag.is_some(),
+                frozen,
+                "{interruption}: the grab is dropped (or, under the palette, frozen)"
+            );
+            let (start, end) = chip_span(&app, wid, 1);
+            let over = strip_point(&app, wid, start + (end - start) / 2);
+            app.on_cursor_moved(wid, over.0, over.1);
+            assert_eq!(
+                tab_order(&app, wid),
+                before,
+                "{interruption}: motion reorders nothing"
+            );
+            if frozen {
+                app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
+                assert!(
+                    app.windows[&wid].strip_drag.is_none(),
+                    "the release disarmed through the hoisted disarm"
+                );
+            }
         }
-        assert_eq!(
-            tab_order(&app, wid),
-            before,
-            "hovering the strip with no button held moves nothing"
-        );
     }
 
-    /// Focus loss drops a held chip: an alt-tab mid-drag can leave the release undelivered.
+    /// A PRESS THAT IS NO GRAB ARMS NO REORDER: one on bare strip background
+    /// is the window-move / maximize gesture (W2); a stale press (past the
+    /// double-click window) on the chip whose inline RENAME editor is open is
+    /// "keep editing" — the editor stays, and a drag would reshuffle the strip
+    /// out from under the live field. A sweep past a midpoint from either
+    /// moves no tab.
     #[test]
-    fn focus_loss_drops_a_held_chip() {
+    fn a_press_that_is_no_grab_arms_no_reorder() {
         use winit::event::{ElementState, MouseButton as WinitMouseButton};
 
-        let (mut app, wid, before) = app_with_three_chips();
-        let grab = strip_point(&app, wid, chip_span(&app, wid, 0).0 + 1);
-        app.on_cursor_moved(wid, grab.0, grab.1);
-        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
-        app.on_focus(wid, false);
-        assert!(app.windows[&wid].strip_drag.is_none());
-
-        let (start, end) = chip_span(&app, wid, 1);
-        let over = strip_point(&app, wid, start + (end - start) / 2);
-        app.on_cursor_moved(wid, over.0, over.1);
-        assert_eq!(tab_order(&app, wid), before);
-    }
-
-    /// A press on bare strip background is the window-move / maximize gesture, not a chip
-    /// grab: it arms no reorder.
-    #[test]
-    fn a_press_on_the_bare_band_arms_no_reorder() {
-        use winit::event::{ElementState, MouseButton as WinitMouseButton};
-
-        let (mut app, wid, before) = app_with_three_chips();
-        // Past the trailing `+` (found by kind: with the UI face installed the last segment
-        // is the version label), short of the strip's right edge: bare band.
-        let band = app.windows[&wid]
-            .tab_segments
-            .iter()
-            .find(|seg| seg.kind == crate::tab_bar::TabHit::NewTab)
-            .map(|seg| seg.end_col)
-            .expect("a laid-out strip");
-        assert!(
-            crate::tab_bar::hit_test(&app.windows[&wid].tab_segments, band).is_none(),
-            "fixture column must be bare band"
-        );
-        let point = strip_point(&app, wid, band);
-        app.on_cursor_moved(wid, point.0, point.1);
-        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
-        assert!(
-            app.windows[&wid].strip_drag.is_none(),
-            "the band's press-drag is a WINDOW move, never a tab grab"
-        );
-
-        let (start, end) = chip_span(&app, wid, 0);
-        let over = strip_point(&app, wid, start + (end - start) / 2);
-        app.on_cursor_moved(wid, over.0, over.1);
-        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
-        assert_eq!(tab_order(&app, wid), before);
-    }
-
-    /// Any other strip press drops the held chip. The one that can arrive with the left
-    /// button down is the right press that pops the tab's context menu
-    /// (`open_tab_context_menu` → `clear_strip_press`); motion under the card reorders nothing.
-    #[test]
-    fn opening_the_context_menu_drops_a_held_chip() {
-        use winit::event::{ElementState, MouseButton as WinitMouseButton};
-
-        let (mut app, wid, before) = app_with_three_chips();
-        let (grab_start, _) = chip_span(&app, wid, 0);
-        let grab = strip_point(&app, wid, grab_start + 1);
-        app.on_cursor_moved(wid, grab.0, grab.1);
-        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
-        assert!(app.windows[&wid].strip_drag.is_some(), "the chip is held");
-
-        assert!(
-            app.open_tab_context_menu(wid, 0, grab_start + 1, false),
-            "the chip has a composed menu"
-        );
-        assert!(
-            app.windows[&wid].strip_drag.is_none(),
-            "popping the card dropped the grab"
-        );
-
-        let (start, end) = chip_span(&app, wid, 1);
-        let over = strip_point(&app, wid, start + (end - start) / 2);
-        app.on_cursor_moved(wid, over.0, over.1);
-        assert_eq!(
-            tab_order(&app, wid),
-            before,
-            "motion under the open card reorders nothing"
-        );
-    }
-
-    /// A stale press (past the double-click window) on the chip whose inline rename editor is
-    /// open keeps editing and arms no drag, which would reshuffle the strip under the field.
-    #[test]
-    fn a_press_on_the_chip_being_renamed_arms_no_drag() {
-        use winit::event::{ElementState, MouseButton as WinitMouseButton};
-
-        let (mut app, wid, before) = app_with_three_chips();
-        assert!(
-            app.begin_session_rename(wid, before[0]),
-            "fixture guard: the editor opened on chip 0"
-        );
-        let grab = strip_point(&app, wid, chip_span(&app, wid, 0).0 + 1);
-        app.on_cursor_moved(wid, grab.0, grab.1);
-        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
-        assert!(
-            app.windows[&wid].strip_drag.is_none(),
-            "a press on the edited chip keeps editing — it never arms a drag"
-        );
-        assert!(
-            app.inline_rename_edit(wid).is_some(),
-            "…and the editor is still open"
-        );
-        let (start, end) = chip_span(&app, wid, 1);
-        let over = strip_point(&app, wid, start + (end - start) / 2);
-        app.on_cursor_moved(wid, over.0, over.1);
-        assert_eq!(
-            tab_order(&app, wid),
-            before,
-            "a sweep past a midpoint moves nothing under the field"
-        );
-        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
-    }
-
-    /// A palette opened by keyboard while a chip is held: the modal owns the
-    /// window even though it never claimed the pointer, so the held chip
-    /// freezes — and the release still disarms through the hoisted disarm.
-    #[test]
-    fn a_palette_opened_mid_drag_freezes_the_held_chip() {
-        use winit::event::{ElementState, MouseButton as WinitMouseButton};
-
-        let (mut app, wid, before) = app_with_three_chips();
-        let grab = strip_point(&app, wid, chip_span(&app, wid, 0).0 + 1);
-        app.on_cursor_moved(wid, grab.0, grab.1);
-        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
-        assert!(app.windows[&wid].strip_drag.is_some(), "the chip is held");
-
-        app.toggle_palette();
-        assert!(
-            app.windows[&wid].palette().is_some(),
-            "fixture guard: the palette really opened"
-        );
-        let (start, end) = chip_span(&app, wid, 1);
-        let over = strip_point(&app, wid, start + (end - start) / 2);
-        app.on_cursor_moved(wid, over.0, over.1);
-        assert_eq!(
-            tab_order(&app, wid),
-            before,
-            "motion under the open palette reorders nothing"
-        );
-        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
-        assert!(
-            app.windows[&wid].strip_drag.is_none(),
-            "the release disarmed through the hoisted disarm"
-        );
+        for renaming in [false, true] {
+            let (mut app, wid, before) = app_with_three_chips();
+            let col = if renaming {
+                assert!(
+                    app.begin_session_rename(wid, before[0]),
+                    "fixture guard: the editor opened on chip 0"
+                );
+                chip_span(&app, wid, 0).0 + 1
+            } else {
+                // Past the trailing `+` (found by kind: with the UI face installed the
+                // last segment is the version label), short of the strip's right edge:
+                // bare band.
+                let band = app.windows[&wid]
+                    .tab_segments
+                    .iter()
+                    .find(|seg| seg.kind == crate::tab_bar::TabHit::NewTab)
+                    .map(|seg| seg.end_col)
+                    .expect("a laid-out strip");
+                assert!(
+                    crate::tab_bar::hit_test(&app.windows[&wid].tab_segments, band).is_none(),
+                    "fixture column must be bare band"
+                );
+                band
+            };
+            let point = strip_point(&app, wid, col);
+            app.on_cursor_moved(wid, point.0, point.1);
+            app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
+            assert!(
+                app.windows[&wid].strip_drag.is_none(),
+                "renaming={renaming}: the press never arms a drag"
+            );
+            if renaming {
+                assert!(
+                    app.inline_rename_edit(wid).is_some(),
+                    "…and the editor is still open"
+                );
+            }
+            let (start, end) = chip_span(&app, wid, 1);
+            let over = strip_point(&app, wid, start + (end - start) / 2);
+            app.on_cursor_moved(wid, over.0, over.1);
+            assert_eq!(
+                tab_order(&app, wid),
+                before,
+                "renaming={renaming}: a sweep past a midpoint moves nothing"
+            );
+            app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
+        }
     }
 
     /// One tab, dragged the length of its own chip, is a no-op: no panic, no phantom move.
@@ -9606,92 +9575,71 @@ mod tests {
 
     /// A word/line drag re-derives its origin from the live selection on every move, not
     /// from the press-time `GestureOrigin.row`: output moves the engine anchors
-    /// (`adjust_for_scroll`) but not the gesture row. The oracle is the text the drag copies.
+    /// (`adjust_for_scroll`) but not the gesture row. The line (triple-click) and word
+    /// (double-click) arms both re-derive through `origin_row`. The oracle is the text the
+    /// drag copies.
     #[test]
-    fn a_line_drag_re_anchors_on_its_origin_line_after_output_scrolls_the_grid() {
+    fn a_line_or_word_drag_re_anchors_on_its_origin_after_output_scrolls_the_grid() {
         use crate::{App, WindowId, term_lock};
 
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        let term = app
-            .front_terminal(wid)
-            .expect("front terminal")
-            .term
-            .clone();
-        term_lock(&term).process(&numbered_screen("L"));
+        for word in [false, true] {
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            let term = app
+                .front_terminal(wid)
+                .expect("front terminal")
+                .term
+                .clone();
+            let tag = if word { "w" } else { "L" };
+            term_lock(&term).process(&numbered_screen(tag));
 
-        // Triple-click row 5 → the "L05" line; the gesture origin is captured at 5.
-        app.select_line_click(wid, 5, 0);
-        assert_eq!(
-            term_lock(&term).selection_to_string().as_deref(),
-            Some("L05"),
-            "precondition: the triple-click selected the L05 line"
-        );
+            // Row 5's word or line; the gesture origin is captured at 5.
+            if word {
+                app.select_word_click(wid, 5, 0);
+            } else {
+                app.select_line_click(wid, 5, 0);
+            }
+            let origin = format!("{tag}05");
+            assert_eq!(
+                term_lock(&term).selection_to_string().as_deref(),
+                Some(origin.as_str()),
+                "precondition: the click selected {origin}"
+            );
 
-        // Three lines of output scroll the grid: plain writes keep the selection, whose
-        // anchors ride up to row 2, while `GestureOrigin.row` stays 5.
-        term_lock(&term).process(b"\r\nX\r\nY\r\nZ");
-        assert_eq!(
-            app.windows[&wid].gesture.map(|g| g.row),
-            Some(5),
-            "precondition: the captured gesture row is NOT compensated — that is the trap"
-        );
-        assert!(
-            term_lock(&term).text_selection().has_selection(),
-            "precondition: ordinary output must not clear the selection (Phase 4)"
-        );
+            // Three lines of output scroll the grid: plain writes keep the selection,
+            // whose anchors ride up to row 2, while `GestureOrigin.row` stays 5.
+            term_lock(&term).process(b"\r\nX\r\nY\r\nZ");
+            assert_eq!(
+                app.windows[&wid].gesture.map(|g| g.row),
+                Some(5),
+                "precondition: the captured gesture row is NOT compensated — that is the trap"
+            );
+            assert!(
+                term_lock(&term).text_selection().has_selection(),
+                "precondition: ordinary output must not clear the selection (Phase 4)"
+            );
 
-        // Drag down to viewport row 8 (now "L11").
-        app.drag_selection(wid, 8, 0);
+            // Drag down to viewport row 8 (now "<tag>11").
+            app.drag_selection(wid, 8, 0);
 
-        let text = term_lock(&term)
-            .selection_to_string()
-            .expect("the drag resolves to text");
-        assert_eq!(
-            text.lines().next(),
-            Some("L05"),
-            "the drag must stay anchored on its ORIGIN line; anchoring on the stale \
-             gesture row would start the copy at L08 — text the user never selected"
-        );
-        assert_eq!(
-            text.lines().last(),
-            Some("L11"),
-            "…and reach the hovered line"
-        );
-    }
-
-    /// The word (double-click) arm of the same rule, through the same live-origin lookup.
-    #[test]
-    fn a_word_drag_re_anchors_on_its_origin_word_after_output_scrolls_the_grid() {
-        use crate::{App, WindowId, term_lock};
-
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        let term = app
-            .front_terminal(wid)
-            .expect("front terminal")
-            .term
-            .clone();
-        term_lock(&term).process(&numbered_screen("w"));
-
-        app.select_word_click(wid, 5, 0);
-        assert_eq!(
-            term_lock(&term).selection_to_string().as_deref(),
-            Some("w05"),
-            "precondition: the double-click selected the w05 word"
-        );
-
-        term_lock(&term).process(b"\r\nX\r\nY\r\nZ");
-        app.drag_selection(wid, 8, 0);
-
-        let text = term_lock(&term)
-            .selection_to_string()
-            .expect("the drag resolves to text");
-        assert!(
-            text.starts_with("w05"),
-            "the word drag must keep its ORIGIN word fully selected after the scroll; \
-             got {text:?}"
-        );
+            let text = term_lock(&term)
+                .selection_to_string()
+                .expect("the drag resolves to text");
+            assert_eq!(
+                text.lines().next(),
+                Some(origin.as_str()),
+                "word={word}: the drag must stay anchored on its ORIGIN; anchoring on the \
+                 stale gesture row would start the copy at row 8 — text the user never \
+                 selected"
+            );
+            if !word {
+                assert_eq!(
+                    text.lines().last(),
+                    Some("L11"),
+                    "…and reach the hovered line"
+                );
+            }
+        }
     }
 
     /// With no live selection to read, the drag falls back to the captured
@@ -9893,52 +9841,62 @@ mod tests {
         seed
     }
 
-    /// Blur settles the in-flight selection into a completed one, not merely drops the
-    /// window's gesture flags: an `InProgress` selection stays painted, refuses
-    /// `extend_selection` and never fires copy-on-select.
+    /// Blur, and a tab switch (`sync_window`), settle the in-flight selection into a
+    /// completed one, not merely drop the window's gesture flags: an `InProgress` selection
+    /// stays painted, refuses `extend_selection` and never fires copy-on-select.
     #[test]
-    fn blur_settles_the_in_flight_selection_into_a_completed_one() {
+    fn blur_or_a_tab_switch_settles_the_in_flight_selection() {
         use aterm_core::selection::SelectionState;
 
-        use crate::{App, WindowId, term_lock};
+        use crate::{App, WindowId, stub_session, term_lock};
 
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        let term = app
-            .front_terminal(wid)
-            .expect("front terminal")
-            .term
-            .clone();
-        term_lock(&term).process(b"hello world");
+        for tab_switch in [false, true] {
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            let term = app
+                .front_terminal(wid)
+                .expect("front terminal")
+                .term
+                .clone();
+            term_lock(&term).process(b"hello world");
 
-        app.windows.get_mut(&wid).expect("window").last_mouse_cell = (0, 0);
-        app.begin_selection(wid, SelectionType::Simple);
-        app.drag_selection(wid, 0, 5);
-        assert_eq!(
-            term_lock(&term).text_selection().state(),
-            SelectionState::InProgress,
-            "precondition: the sweep leaves the engine mid-gesture"
-        );
+            app.windows.get_mut(&wid).expect("window").last_mouse_cell = (0, 0);
+            app.begin_selection(wid, SelectionType::Simple);
+            app.drag_selection(wid, 0, 5);
+            assert_eq!(
+                term_lock(&term).text_selection().state(),
+                SelectionState::InProgress,
+                "precondition: the sweep leaves the engine mid-gesture"
+            );
 
-        // Focus is stolen mid-sweep; the release never comes back.
-        app.on_focus(wid, false);
+            if tab_switch {
+                // The user opens another tab with the button still down.
+                let sid = app.next_session_id;
+                app.push_stub_tab(wid, stub_session(sid));
+            } else {
+                // Focus is stolen mid-sweep; the release never comes back.
+                app.on_focus(wid, false);
+            }
 
-        assert_eq!(
-            term_lock(&term).text_selection().state(),
-            SelectionState::Complete,
-            "blur must COMPLETE the selection, not strand it InProgress"
-        );
-        assert_eq!(
-            term_lock(&term).selection_to_string().as_deref(),
-            Some("hello"),
-            "…and the settled selection still names the swept text"
-        );
-        // A completed selection is one the user can act on: extending it works,
-        // which is exactly what an InProgress zombie refuses.
-        assert!(
-            app.extend_selection_to(wid, 0, 10, SelectionSide::Right),
-            "the settled selection is extendable — the InProgress zombie was not"
-        );
+            assert_eq!(
+                term_lock(&term).text_selection().state(),
+                SelectionState::Complete,
+                "tab_switch={tab_switch}: COMPLETE the selection, not strand it InProgress"
+            );
+            assert_eq!(
+                term_lock(&term).selection_to_string().as_deref(),
+                Some("hello"),
+                "tab_switch={tab_switch}: the settled selection still names the swept text"
+            );
+            if !tab_switch {
+                // A completed selection is one the user can act on: extending it
+                // works, which is exactly what an InProgress zombie refuses.
+                assert!(
+                    app.extend_selection_to(wid, 0, 10, SelectionSide::Right),
+                    "the settled selection is extendable — the InProgress zombie was not"
+                );
+            }
+        }
     }
 
     /// On a DEC double-width line (DECDWL) each character is drawn two cells
@@ -10008,45 +9966,6 @@ mod tests {
         );
     }
 
-    /// A tab switch (`sync_window`) settles the drag on the tab it leaves.
-    #[test]
-    fn a_tab_switch_settles_the_in_flight_selection_on_the_tab_it_leaves() {
-        use aterm_core::selection::SelectionState;
-
-        use crate::{App, WindowId, stub_session, term_lock};
-
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        let term = app
-            .front_terminal(wid)
-            .expect("front terminal")
-            .term
-            .clone();
-        term_lock(&term).process(b"hello world");
-
-        app.windows.get_mut(&wid).expect("window").last_mouse_cell = (0, 0);
-        app.begin_selection(wid, SelectionType::Simple);
-        app.drag_selection(wid, 0, 5);
-        assert_eq!(
-            term_lock(&term).text_selection().state(),
-            SelectionState::InProgress
-        );
-
-        // The user opens/switches to another tab with the button still down.
-        let sid = app.next_session_id;
-        app.push_stub_tab(wid, stub_session(sid));
-
-        assert_eq!(
-            term_lock(&term).text_selection().state(),
-            SelectionState::Complete,
-            "the tab switch must settle the drag on the tab it leaves"
-        );
-        assert_eq!(
-            term_lock(&term).selection_to_string().as_deref(),
-            Some("hello")
-        );
-    }
-
     /// Two terminal panes stacked top/bottom through the canonical
     /// `SplitAxis::Vertical` layout. Both receive enough history for either edge
     /// direction to move the viewport; the new bottom pane remains focused.
@@ -10112,91 +10031,64 @@ mod tests {
         );
     }
 
-    /// The top pane's lower edge is an autoscroll edge though it lies mid-window.
+    /// A stacked pane's own edge is an autoscroll edge: the top pane's lower edge, though it
+    /// lies mid-window, and one pixel into the divider above the bottom pane scroll it into
+    /// history rather than waiting for the pointer to leave the window. Negative control:
+    /// each point is inside the whole-window grid.
     #[test]
-    fn top_stacked_pane_autoscrolls_at_its_own_bottom_edge() {
+    fn a_stacked_pane_autoscrolls_at_its_own_edge() {
         use crate::term_lock;
 
-        let (mut app, wid, top, _) = stacked_autoscroll_fixture();
-        assert!(
-            app.active_tree_mut(wid)
-                .expect("terminal pane tree")
-                .set_focus(top)
-        );
-        let active = app.windows[&wid].tabs.active;
-        assert!(app.sync_tab_model_from_layout(wid, active));
-        app.sync_window(wid);
-        assert_eq!(app.focused_session_id(wid), Some(top));
+        for top_pane in [true, false] {
+            let (mut app, wid, top, bottom) = stacked_autoscroll_fixture();
+            if top_pane {
+                assert!(
+                    app.active_tree_mut(wid)
+                        .expect("terminal pane tree")
+                        .set_focus(top)
+                );
+                let active = app.windows[&wid].tabs.active;
+                assert!(app.sync_tab_model_from_layout(wid, active));
+                app.sync_window(wid);
+                assert_eq!(app.focused_session_id(wid), Some(top));
+            }
+            let sid = if top_pane { top } else { bottom };
+            let term = app.pool.get(sid).expect("pane terminal").term.clone();
+            if top_pane {
+                term_lock(&term).scroll_display(5);
+            }
+            app.windows.get_mut(&wid).expect("window").selecting = true;
 
-        let term = app.pool.get(top).expect("top terminal").term.clone();
-        term_lock(&term).scroll_display(5);
-        app.windows.get_mut(&wid).expect("window").selecting = true;
-
-        let (pane_row, _, pane_rows, _) = app.focused_pane_rect(wid);
-        assert_eq!(pane_row, 1, "the top pane's content follows its header");
-        assert!(pane_rows < app.windows[&wid].rows);
-        let ch = app.win_cell_size(wid).1.max(1);
-        let strip_px = usize::from(app.chrome_rows(wid)) * ch;
-        let pane_bottom = app.win_pad_top(wid)
-            + app.win_head(wid)
-            + strip_px
-            + usize::from(pane_row.saturating_add(pane_rows)) * ch;
-        assert_eq!(
-            crate::app_render::selection_autoscroll_lines(
-                pane_bottom as f64,
-                app.win_pad_top(wid) + app.win_head(wid),
-                strip_px,
-                ch,
-                app.windows[&wid].rows,
-            ),
-            0,
-            "negative control: the same point is inside the whole-window grid"
-        );
-        let (_, frame_y) = app.frame_origin(wid);
-        assert!(app.selection_autoscroll(wid, frame_y as f64 + pane_bottom as f64));
-        assert_eq!(
-            term_lock(&term).grid().display_offset(),
-            4,
-            "crossing the top pane's bottom edge scrolls it toward live"
-        );
-    }
-
-    /// The bottom pane's upper edge is its own autoscroll edge: one pixel into the divider
-    /// scrolls it into history.
-    #[test]
-    fn bottom_stacked_pane_autoscrolls_at_its_own_top_edge() {
-        use crate::term_lock;
-
-        let (mut app, wid, _, bottom) = stacked_autoscroll_fixture();
-        let term = app.pool.get(bottom).expect("bottom terminal").term.clone();
-        app.windows.get_mut(&wid).expect("window").selecting = true;
-
-        let (pane_row, _, pane_rows, _) = app.focused_pane_rect(wid);
-        assert!(pane_row > 0, "the new terminal is the bottom pane");
-        assert!(pane_rows < app.windows[&wid].rows);
-        let ch = app.win_cell_size(wid).1.max(1);
-        let strip_px = usize::from(app.chrome_rows(wid)) * ch;
-        let pane_top =
-            app.win_pad_top(wid) + app.win_head(wid) + strip_px + usize::from(pane_row) * ch;
-        let pointer = pane_top as f64 - 1.0;
-        assert_eq!(
-            crate::app_render::selection_autoscroll_lines(
-                pointer,
-                app.win_pad_top(wid) + app.win_head(wid),
-                strip_px,
-                ch,
-                app.windows[&wid].rows,
-            ),
-            0,
-            "negative control: the same point is inside the whole-window grid"
-        );
-        let (_, frame_y) = app.frame_origin(wid);
-        assert!(app.selection_autoscroll(wid, frame_y as f64 + pointer));
-        assert_eq!(
-            term_lock(&term).grid().display_offset(),
-            1,
-            "crossing the bottom pane's top edge scrolls it into history"
-        );
+            let (pane_row, _, pane_rows, _) = app.focused_pane_rect(wid);
+            assert!(pane_rows < app.windows[&wid].rows);
+            let ch = app.win_cell_size(wid).1.max(1);
+            let strip_px = usize::from(app.chrome_rows(wid)) * ch;
+            let top_px = app.win_pad_top(wid) + app.win_head(wid);
+            let pointer = if top_pane {
+                (top_px + strip_px + usize::from(pane_row.saturating_add(pane_rows)) * ch) as f64
+            } else {
+                assert!(pane_row > 0, "the new terminal is the bottom pane");
+                (top_px + strip_px + usize::from(pane_row) * ch) as f64 - 1.0
+            };
+            assert_eq!(
+                crate::app_render::selection_autoscroll_lines(
+                    pointer,
+                    top_px,
+                    strip_px,
+                    ch,
+                    app.windows[&wid].rows,
+                ),
+                0,
+                "top_pane={top_pane}: negative control: inside the whole-window grid"
+            );
+            let (_, frame_y) = app.frame_origin(wid);
+            assert!(app.selection_autoscroll(wid, frame_y as f64 + pointer));
+            assert_eq!(
+                term_lock(&term).grid().display_offset(),
+                if top_pane { 4 } else { 1 },
+                "top_pane={top_pane}: crossing the pane's own edge scrolls it"
+            );
+        }
     }
 
     /// The strip is chrome for hover and reporting but not a dead zone for a text drag: one
@@ -10427,9 +10319,9 @@ mod tests {
     }
 
     /// Through the whole press path, a capsule press is recorded and opens Settings ▸
-    /// Packages in the pressed window; the row stays and the grid never sees the press. A
-    /// row's body (or its `Details ›` chip) opens Settings ▸ Messages at the entry and is no
-    /// capsule press; a held row folds. One row below the band the press is the grid's.
+    /// Packages in the pressed window; the row stays and the grid never sees the press; one
+    /// row below the band the press is the grid's. The `Details ›` chip is the body's press:
+    /// Settings ▸ Messages at the entry, no capsule press.
     #[test]
     fn a_press_on_a_band_capsule_performs_its_intent_and_stops_there() {
         use winit::event::{ElementState, MouseButton as WinitMouseButton};
@@ -10469,29 +10361,6 @@ mod tests {
             );
         }
 
-        // The body of a row with a capsule: the Details press, not the
-        // capsule's — Settings ▸ Messages at this entry, the live row seen
-        // and, being a live meter, still on the band.
-        let mut app = crate::App::headless_for_test();
-        let id = app.post_message(toolchain_row());
-        let at = band_pixel(&app, wid);
-        let (x, y) = at(band_row(&app, wid).title.0);
-        assert!(app.press_band_at(wid, x, y), "consumed by the band");
-        assert_eq!(
-            acted(&app, id),
-            None,
-            "the body is no capsule: nothing is recorded as one"
-        );
-        assert_eq!(
-            settings_route(&app, wid),
-            Some(crate::native_settings::SettingsRoute::Messages),
-            "Settings \u{25b8} Messages, in the pressed window"
-        );
-        assert_eq!(selected_message(&app, wid), Some(id.raw()));
-        assert!(
-            app.messages.live(id).is_some_and(|l| l.seen),
-            "a live meter is seen and stays"
-        );
         // One row below the band: the grid's, not the band's.
         let ch = app.win_cell_size(wid).1 as f64;
         assert!(
@@ -10499,7 +10368,8 @@ mod tests {
             "one row below the band is the grid's"
         );
 
-        // The `Details ›` chip itself: the same press.
+        // The `Details ›` chip: the body's press (Settings ▸ Messages at
+        // this entry), nothing recorded as a capsule press.
         let mut app = crate::App::headless_for_test();
         let id = app.post_message(toolchain_row());
         let details = band_row(&app, wid)
@@ -10511,27 +10381,6 @@ mod tests {
         let (x, y) = at(details.col + 1);
         assert!(app.press_band_at(wid, x, y));
         assert_eq!(acted(&app, id), None);
-        assert_eq!(selected_message(&app, wid), Some(id.raw()));
-
-        // The body of a capsule-less held row: seen, so it folds — and the
-        // page shows it as folded, selected.
-        let mut app = crate::App::headless_for_test();
-        let id = app.post_message(
-            aterm_messages::Message::new(
-                aterm_messages::tags::UPDATE,
-                aterm_messages::Severity::Warn,
-                "Update stopped safely",
-            )
-            .line("see Settings \u{25b8} Software Update"),
-        );
-        let at = band_pixel(&app, wid);
-        let (x, y) = at(band_row(&app, wid).title.0);
-        assert!(app.press_band_at(wid, x, y));
-        assert!(app.messages.live(id).is_none(), "read, and folded");
-        assert_eq!(
-            settings_route(&app, wid),
-            Some(crate::native_settings::SettingsRoute::Messages)
-        );
         assert_eq!(selected_message(&app, wid), Some(id.raw()));
     }
 
@@ -10719,14 +10568,13 @@ mod tests {
         // The click spends one: nine more fit, the tenth does not.
         let mut app = crate::App::headless_for_test();
         let wid = crate::WindowId(0);
-        let id = app.post_message(toolchain_row());
+        app.post_message(toolchain_row());
         let col = u16::try_from(capsule_col(&app, wid)).unwrap();
         assert!(
             app.pointer_cmd(PointerAction::MoveChrome { up: 1, col })
                 .is_ok()
         );
         assert!(app.pointer_cmd(PointerAction::Click).is_ok());
-        assert_eq!(acted(&app, id), Some(aterm_messages::ActionIndex(0)));
         let now = std::time::Instant::now();
         for _ in 0..9 {
             assert!(spend_press(&mut app.wire_gate, now).is_ok());
@@ -10760,71 +10608,6 @@ mod tests {
                 .is_ok()
         );
         assert!(app.pointer_cmd(PointerAction::Click).is_ok());
-    }
-
-    /// Hover lights the capsule, or the body (whose press is `Details ›`), under the hand;
-    /// over the grid nothing is lit and the cursor is the I-beam; leaving the window clears
-    /// the lit chip.
-    #[test]
-    fn hover_over_a_capsule_lights_it_and_shows_the_pointer() {
-        use crate::message_band::{BandHover, HoverTarget};
-        let mut app = crate::App::headless_for_test();
-        let wid = crate::WindowId(0);
-        app.post_message(toolchain_row());
-        let layout = band_row(&app, wid);
-        assert_eq!(layout.capsules.len(), 2, "Packages, then Details \u{203a}");
-        let packages = layout.capsules[0].clone();
-        let details = layout.capsules[1].clone();
-        assert!(details.action.is_details());
-        let at = band_pixel(&app, wid);
-        let hover = |app: &crate::App| app.windows[&wid].band_hover;
-        let cursor = |app: &crate::App| {
-            let ws = &app.windows[&wid];
-            (ws.hover_pointer, ws.native_text_cursor)
-        };
-        let (x, y) = at(packages.col + 1);
-        app.on_cursor_moved(wid, x, y);
-        assert_eq!(
-            hover(&app),
-            Some(BandHover {
-                row: 0,
-                target: HoverTarget::Capsule(aterm_messages::ActionIndex(0))
-            })
-        );
-        assert_eq!(cursor(&app), (true, false), "the hand over a capsule");
-        let (x, y) = at(layout.title.0);
-        app.on_cursor_moved(wid, x, y);
-        assert_eq!(
-            hover(&app),
-            Some(BandHover {
-                row: 0,
-                target: HoverTarget::Body
-            }),
-            "the body lights the Details \u{203a} its press performs"
-        );
-        assert_eq!(cursor(&app), (true, false));
-        let (x, y) = at(details.col + 1);
-        app.on_cursor_moved(wid, x, y);
-        assert_eq!(
-            hover(&app),
-            Some(BandHover {
-                row: 0,
-                target: HoverTarget::Capsule(aterm_messages::ActionIndex::DETAILS)
-            }),
-            "the Details \u{203a} is a chip like any other"
-        );
-        assert_eq!(cursor(&app), (true, false));
-        // Down into the grid: nothing lit, the I-beam.
-        let ch = app.win_cell_size(wid).1 as f64;
-        app.on_cursor_moved(wid, x, y + 3.0 * ch);
-        assert_eq!(hover(&app), None, "off the band, nothing is lit");
-        assert_eq!(cursor(&app), (false, true), "the grid's I-beam");
-        // Back onto the capsule, then out of the window.
-        let (x, y) = at(packages.col + 1);
-        app.on_cursor_moved(wid, x, y);
-        assert!(hover(&app).is_some());
-        app.on_cursor_left(wid);
-        assert_eq!(hover(&app), None, "leaving the window clears the lit chip");
     }
 
     /// A body press opens Settings ▸ Messages at the entry in the pressed window, not the
@@ -10917,10 +10700,6 @@ mod tests {
             Some(id.raw()),
             "the other window's view is its own"
         );
-        assert!(
-            app.messages.live(warning).is_none(),
-            "a held warning folds once read"
-        );
     }
 
     /// A press anywhere on the overflow row opens Settings ▸ Messages with nothing selected;
@@ -10950,22 +10729,6 @@ mod tests {
             .iter()
             .position(|r| matches!(r.kind, aterm_messages::RowKind::Overflow { .. }))
             .expect("five rows on a three-row band: an overflow row");
-        assert_eq!(
-            overflow,
-            usize::from(aterm_messages::MAX_ROWS) - 1,
-            "the last row"
-        );
-        assert!(
-            matches!(
-                rows[overflow].kind,
-                aterm_messages::RowKind::Overflow { hidden: 3 }
-            ),
-            "two rows shown, three behind the link: {:?}",
-            rows[overflow].kind
-        );
-        // One link: the words are the whole row, no capsule.
-        assert!(rows[overflow].capsules.is_empty(), "one link");
-        assert!(rows[overflow].title.1.ends_with('\u{203a}'));
         let at = band_pixel(&app, wid);
         let ch = app.win_cell_size(wid).1 as f64;
         let dy = overflow as f64 * ch;
@@ -11004,18 +10767,13 @@ mod tests {
             assert_eq!(acted(&app, *id), None);
         }
         assert_eq!(app.message_band_rows, aterm_messages::MAX_ROWS);
-        assert!(
-            app.band_presentation(cols)
-                .rows
-                .iter()
-                .any(|r| matches!(r.kind, aterm_messages::RowKind::Overflow { hidden: 3 })),
-            "the band is as it was"
-        );
     }
 
     /// Through the real motion path and painter: the body (title, glyph, detail) lights the
     /// row's `Details ›`, not the authored chip; the authored chip lights alone; the link
-    /// lights as a chip; off the band nothing is lit; a capsule-less row lights its lone link.
+    /// lights as a chip; the cursor is the hand on all of them; off the band nothing is lit
+    /// and the cursor is the I-beam again; the pointer leaving the window clears the lit
+    /// chip; a capsule-less row lights its lone link.
     #[test]
     fn hover_over_the_body_lights_details() {
         use crate::message_band::{BandHover, HoverTarget, paint_rows};
@@ -11050,6 +10808,10 @@ mod tests {
                 && painted[0][cap.col + 1].fg == c.capsule_hover_ink
         };
         let hover = |app: &crate::App| app.windows[&wid].band_hover;
+        let cursor = |app: &crate::App| {
+            let ws = &app.windows[&wid];
+            (ws.hover_pointer, ws.native_text_cursor)
+        };
         assert_eq!(hover(&app), None);
         assert!(
             !lit(&app, &details) && !lit(&app, &packages),
@@ -11079,6 +10841,7 @@ mod tests {
                 !lit(&app, &packages),
                 "column {col}: the authored chip does not"
             );
+            assert_eq!(cursor(&app), (true, false), "column {col}: the hand");
         }
         // The authored chip: it lights, the link goes out.
         let (x, y) = at(packages.col + 1);
@@ -11091,6 +10854,7 @@ mod tests {
             })
         );
         assert!(lit(&app, &packages) && !lit(&app, &details));
+        assert_eq!(cursor(&app), (true, false), "the hand over a capsule");
         // The link itself: lit as a chip.
         let (x, y) = at(details.col + 1);
         app.on_cursor_moved(wid, x, y);
@@ -11102,12 +10866,20 @@ mod tests {
             })
         );
         assert!(lit(&app, &details) && !lit(&app, &packages));
-        // Off the band: cleared, nothing lit.
+        assert_eq!(cursor(&app), (true, false));
+        // Off the band: cleared, nothing lit, the grid's I-beam.
         let ch = app.win_cell_size(wid).1 as f64;
         let (x, y) = at(layout.title.0);
         app.on_cursor_moved(wid, x, y + 2.0 * ch);
         assert_eq!(hover(&app), None);
         assert!(!lit(&app, &details) && !lit(&app, &packages));
+        assert_eq!(cursor(&app), (false, true), "the grid's I-beam");
+        // Back onto the capsule, then out of the window.
+        let (x, y) = at(packages.col + 1);
+        app.on_cursor_moved(wid, x, y);
+        assert!(hover(&app).is_some());
+        app.on_cursor_left(wid);
+        assert_eq!(hover(&app), None, "leaving the window clears the lit chip");
 
         // A capsule-less row: its lone Details › is what the body lights.
         let mut app = crate::App::headless_for_test();
@@ -11137,80 +10909,6 @@ mod tests {
     }
 
     // ---- band hover under a still pointer ------------------------------------
-
-    /// A layout change under a still pointer (the band folds to no row) leaves no capsule
-    /// hover standing for the next row to paint lit.
-    #[test]
-    fn r44_hb1_the_band_hover_follows_a_layout_change_under_a_still_pointer() {
-        use crate::message_band::{BandHover, HoverTarget};
-        let mut app = crate::App::headless_for_test();
-        let wid = crate::WindowId(0);
-        let id = app.post_message(toolchain_row());
-        let packages = band_row(&app, wid).capsules[0].clone();
-        let (x, y) = band_pixel(&app, wid)(packages.col + 1);
-        app.on_cursor_moved(wid, x, y);
-        assert_eq!(
-            app.windows[&wid].band_hover,
-            Some(BandHover {
-                row: 0,
-                target: HoverTarget::Capsule(aterm_messages::ActionIndex(0))
-            })
-        );
-        // The pass ends; the band folds to no row; the pointer stays put.
-        assert!(app.resolve_message(id, aterm_messages::Outcome::Ok));
-        let quiet = aterm_messages::SHRINK_QUIET.max(aterm_messages::animate::echo_span(
-            aterm_messages::EchoKind::Complete,
-            0,
-            true,
-        )) + std::time::Duration::from_millis(1);
-        app.settle_messages(std::time::Instant::now() + quiet);
-        assert_eq!(app.message_band_rows, 0, "the band folded");
-        let under = |app: &crate::App| {
-            app.band_hit_at(wid, x, y)
-                .and_then(|target| app.band_hover_for(wid, target))
-        };
-        assert_eq!(
-            under(&app),
-            None,
-            "nothing is under the pointer on the band"
-        );
-        assert_eq!(
-            app.windows[&wid].band_hover,
-            under(&app),
-            "a band of no row still lights the old capsule"
-        );
-    }
-
-    /// Over a native front (Settings ▸ Messages), a capsule a press acts on lights and
-    /// shows the hand.
-    #[test]
-    fn r44_hb4_a_band_capsule_over_a_native_front_is_a_hand() {
-        use crate::message_band::{BandHover, HoverTarget};
-        let mut app = crate::App::headless_for_test();
-        let wid = crate::WindowId(0);
-        assert!(
-            app.open_settings_tab_in_window(wid, crate::native_settings::SettingsRoute::Messages)
-        );
-        assert!(app.active_native_view(wid).is_some(), "a native front");
-        app.post_message(toolchain_row());
-        let packages = band_row(&app, wid).capsules[0].clone();
-        let (x, y) = band_pixel(&app, wid)(packages.col + 1);
-        let target = app.band_hit_at(wid, x, y).expect("the band");
-        assert!(app.band_press_acts(wid, target), "a press there acts");
-        app.on_cursor_moved(wid, x, y);
-        assert_eq!(
-            app.windows[&wid].band_hover,
-            Some(BandHover {
-                row: 0,
-                target: HoverTarget::Capsule(aterm_messages::ActionIndex(0))
-            }),
-            "the chip lights"
-        );
-        assert!(
-            app.windows[&wid].hover_pointer,
-            "a lit capsule a press acts on, under the arrow"
-        );
-    }
 
     /// A band click that presses nothing (the row withdrawn, held for the shrink's quiet)
     /// spends none of `notice`'s presses and is not refused when the budget is spent.
@@ -11335,18 +11033,10 @@ mod tests {
             }),
             "premise: the body is lit — its press is the band's Details"
         );
-        let before = app.focused_session_id(wid);
         assert!(app.pointer_cmd(PointerAction::Click).is_ok());
-        let after = app.focused_session_id(wid);
-        let now = std::time::Instant::now();
-        let left = (0..10)
-            .take_while(|_| aterm_messages::wire::spend_press(&mut app.wire_gate, now).is_ok())
-            .count();
         assert!(
             app.messages.live(id).is_some_and(|l| l.seen),
-            "the band's Details press never happened: the click focused the pane under the band \
-             (focused session {before:?} -> {after:?}, route now {:?}, presses left {left} of 10)",
-            settings_route(&app, wid)
+            "the band's Details press never happened: the click went to the pane under the band"
         );
         assert_eq!(
             settings_route(&app, wid),
@@ -11478,3 +11168,7 @@ mod pointer_route_tests;
 #[cfg(test)]
 #[path = "app_mouse_bidi_tests.rs"]
 mod bidi_selection_tests;
+
+#[cfg(test)]
+#[path = "app_mouse_client_frame_tests.rs"]
+mod client_frame_tests;

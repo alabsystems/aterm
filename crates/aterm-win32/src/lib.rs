@@ -13,7 +13,7 @@
 //! `windows-sys` 0.61, at upstream's module paths, with no dependency.
 //!
 //! `crates/aterm-windows-sys` (package `windows-sys` 0.61.2, a
-//! `[patch.crates-io]` row) re-exports [`core`] and [`Win32`], so the four
+//! `[patch.crates-io]` row) re-exports [`core`] and [`Win32`], so the three
 //! packages that name `windows_sys` on the Windows cells compile against this
 //! crate unchanged:
 //!
@@ -21,7 +21,6 @@
 //! winit 0.30.13 (crates/aterm-window)   the Windows backend
 //! softbuffer 0.4.8                      its GDI backend
 //! aterm-http                            the crypt32 certificate verifier
-//! aterm-net                             WSAPoll
 //! ```
 //!
 //! # The harvest
@@ -30,10 +29,10 @@
 //! resolves every `windows_sys` path and `use` tree in them against the
 //! registry crate's module tree, then adds every declaration a kept
 //! declaration names, until nothing new is reached. The result is the
-//! CLOSURE: about 850 of upstream's 168,401 names, each copied as
+//! CLOSURE: about 840 of upstream's 168,401 names, each copied as
 //! upstream writes it, in upstream's order, under upstream's path. A consumer
 //! that starts naming a declaration outside it fails to compile on the
-//! Windows cells (`xtask gate cells`) until `gen` is rerun, and the driver's
+//! Windows cells (`targo --unverified verify cells`) until `gen` is rerun, and the driver's
 //! `check` (by hand, like the oracle) fails whenever the sources and this
 //! crate disagree.
 //!

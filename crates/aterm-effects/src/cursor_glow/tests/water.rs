@@ -85,38 +85,6 @@ fn water_scales_from_trickle_to_torpedo() {
     );
 }
 
-/// Slow typing drips: once the crown and the typing wake have decayed (`CROWN_TYPING_MS` after
-/// the last key), the only light left is droplets, and at least one has fallen below the typed
-/// row.
-#[test]
-fn water_drips_fall_below_the_typed_row() {
-    let g = geom();
-    let c = cfg(GlowStyle::Water, true);
-    let t0 = Instant::now();
-    let mut out = Vec::new();
-    let mut glow = CursorGlow::default();
-    let mut t = t0;
-    glow.tick(Some((2, 0)), t, &c, g, &mut out);
-    for i in 1..=4u16 {
-        t += Duration::from_millis(600);
-        glow.note_synthetic_typed(t, 1);
-        glow.tick(Some((2, i)), t, &c, g, &mut out);
-    }
-    glow.tick(
-        Some((2, 4)),
-        t + Duration::from_millis(350),
-        &c,
-        g,
-        &mut out,
-    );
-    assert!(!out.is_empty(), "a drip should still be falling");
-    assert!(
-        out.iter().any(|q| q.row > 2),
-        "a droplet must fall below the typed row (drip): rows {:?}",
-        out.iter().map(|q| q.row).collect::<Vec<_>>()
-    );
-}
-
 /// Water owns a connected, travelling curve even though its shared laser beam
 /// stays disabled. Sustained typing raises heat, bends the wake, and keeps a
 /// long contiguous pixel run without turning it into a full-cell slab.

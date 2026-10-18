@@ -106,7 +106,7 @@ fn a_siblings_pass_in_flight_or_a_moment_old_holds_every_scheduled_pass() {
 
 #[test]
 fn published_45_runs_after_sibling_checked_44_but_same_or_failed_attempts_still_space() {
-    let model = aterm_spec::derive::atpkg_published_spacing_model();
+    let model = aterm_models_atpkg::atpkg_published_spacing_model();
     let mut modeled = model.init_state();
     for action in ["EndOldOk", "Publish45", "DecideGui"] {
         assert!(model.fire(action, &mut modeled), "{action}: {modeled:?}");

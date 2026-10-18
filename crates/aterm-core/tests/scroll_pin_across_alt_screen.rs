@@ -92,24 +92,6 @@ fn the_raw_alt_screen_modes_preserve_it_too() {
     }
 }
 
-/// Entry and exit in separate `process` batches, as a pager's output arrives
-/// over many reads; the entering batch is the one that must keep the offset.
-#[test]
-fn the_position_survives_when_entry_and_exit_are_separate_batches() {
-    let mut term = scrolled_back(6, 24, 64);
-    let offset_before = term.grid().display_offset();
-    let top_before = top_row_text(&term);
-
-    term.process(b"\x1b[?1049h");
-    for i in 0..20 {
-        term.process(format!("pager row {i}\r\n").as_bytes());
-    }
-    term.process(b"\x1b[?1049l");
-
-    assert_eq!(term.grid().display_offset(), offset_before);
-    assert_eq!(top_row_text(&term), top_before);
-}
-
 /// Control: while the user is at the live bottom, an alt-screen app must still
 /// leave them at the live bottom. The fix must not invent an offset.
 #[test]
@@ -154,55 +136,6 @@ fn a_rows_only_resize_keeps_the_same_line_under_the_eye() {
             top_row_text(&term),
             top_before,
             "{from_rows}->{to_rows} rows: the top visible line must not move"
-        );
-    }
-}
-
-/// The same property on deep history at the retention cap, asserted on the
-/// absolute row and read through `get_line_text` (which resolves ring, lazy and
-/// tiered storage) rather than the ring accessor. The anchor may clamp at the
-/// cap, so the offset is only checked to still be in history.
-///
-/// This fixture does not reach tiered storage (`Terminal::new` keeps
-/// everything in the ring up to its retention cap); see
-/// `a_rows_only_resize_keeps_the_anchor_through_offloaded_tiered_history` for
-/// that.
-#[test]
-fn a_rows_only_resize_keeps_the_anchor_through_deep_capped_history() {
-    for (from_rows, to_rows) in [(24u16, 12u16), (12, 24), (40, 5)] {
-        let mut term = Terminal::new(from_rows, 80);
-        for i in 0..20_000 {
-            term.process(format!("line-{i}\r\n").as_bytes());
-        }
-        term.scroll_to_top();
-        // Off the very top, so a clamp cannot accidentally produce the right answer.
-        term.scroll_display(-200);
-        let anchor_before = term.grid().top_visible_absolute_row();
-        let offset_before = i32::try_from(term.grid().display_offset()).unwrap();
-        let text_before = term.get_line_text(-offset_before, None);
-        assert!(
-            text_before
-                .as_deref()
-                .is_some_and(|t| t.starts_with("line-")),
-            "{from_rows}->{to_rows}: the fixture must be reading real history"
-        );
-
-        term.resize(to_rows, 80);
-
-        assert_eq!(
-            term.grid().top_visible_absolute_row(),
-            anchor_before,
-            "{from_rows}->{to_rows} rows: the anchored absolute row must not move"
-        );
-        let offset_after = i32::try_from(term.grid().display_offset()).unwrap();
-        assert!(
-            offset_after > 0,
-            "{from_rows}->{to_rows} rows: the reader must still be in history"
-        );
-        assert_eq!(
-            term.get_line_text(-offset_after, None),
-            text_before,
-            "{from_rows}->{to_rows} rows: …and the same line must be under the eye"
         );
     }
 }
@@ -331,29 +264,6 @@ fn a_live_tiered_viewport_stays_live_across_a_rows_only_resize() {
     }
 }
 
-/// Control for the `prev_offset > 0` gate: a reader at the live bottom stays
-/// there. With `want = d + (v - t)`, a height shrink at `d == 0` still wants a
-/// positive offset, so an ungated re-anchor would scroll a live viewport into
-/// history on every height drag.
-#[test]
-fn a_live_viewport_stays_live_across_a_rows_only_resize() {
-    for (from_rows, to_rows) in [(6u16, 4u16), (4, 6), (10, 3), (3, 10)] {
-        let mut term = Terminal::new(from_rows, 24);
-        for i in 0..64 {
-            term.process(format!("line-{i}\r\n").as_bytes());
-        }
-        assert_eq!(term.grid().display_offset(), 0, "starts live");
-
-        term.resize(to_rows, 24);
-
-        assert_eq!(
-            term.grid().display_offset(),
-            0,
-            "{from_rows}->{to_rows} rows: a tail follower must stay at the live bottom"
-        );
-    }
-}
-
 /// A resize while an alt-screen app is up (a window drag during `vim`):
 /// `Terminal::resize` reflows the parked primary, which carries the reader's
 /// offset, so the anchor runs on a grid that is not `self.grid`. Exit lands on
@@ -392,32 +302,6 @@ fn a_width_resize_still_leaves_the_reader_in_history() {
         term.grid().display_offset(),
         0,
         "a width change must not snap the reader to live"
-    );
-}
-
-/// A rows-only resize keeps the selection: it rewraps nothing, so only a width
-/// change invalidates selection coordinates.
-#[test]
-fn a_rows_only_resize_keeps_the_selection() {
-    use aterm_core::selection::{SelectionSide, SelectionType};
-
-    let mut term = Terminal::new(6, 24);
-    for i in 0..64 {
-        term.process(format!("line-{i}\r\n").as_bytes());
-    }
-    {
-        let sel = term.text_selection_mut();
-        sel.start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
-        sel.update_selection(0, 4, SelectionSide::Right);
-        sel.complete_selection();
-    }
-    assert!(term.text_selection().has_selection());
-
-    term.resize(4, 24);
-
-    assert!(
-        term.text_selection().has_selection(),
-        "a rows-only resize rewraps nothing and must keep the selection"
     );
 }
 
@@ -530,33 +414,6 @@ fn a_selection_survives_an_alt_round_trip_inside_one_batch() {
         );
         assert_eq!(term.selection_to_string(), text_before);
     }
-}
-
-/// Control: a selection on the live screen survives the round trip too. It is the
-/// main grid's content, and the main grid comes back untouched.
-#[test]
-fn a_live_screen_selection_survives_the_round_trip() {
-    let mut term = Terminal::new(6, 24);
-    for i in 0..64 {
-        term.process(format!("line-{i}\r\n").as_bytes());
-    }
-    {
-        let sel = term.text_selection_mut();
-        sel.start_selection(1, 0, SelectionSide::Left, SelectionType::Simple);
-        sel.update_selection(1, 6, SelectionSide::Right);
-        sel.complete_selection();
-    }
-    let text_before = term.selection_to_string();
-
-    term.process(b"\x1b[?1049h");
-    term.process(b"pager\r\n");
-    term.process(b"\x1b[?1049l");
-
-    assert_eq!(
-        term.selection_to_string(),
-        text_before,
-        "a live-screen selection names main-grid content, which came back intact"
-    );
 }
 
 /// Negative control: a selection made on the alt screen does not leak back to

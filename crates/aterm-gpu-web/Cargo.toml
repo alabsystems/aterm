@@ -2,16 +2,14 @@
 name = "aterm-gpu-web"
 version.workspace = true
 edition = "2021"
-description = "wasm-bindgen binding: the aterm engine drawn by aterm-gpu (WebGL2) onto a <canvas>. The GPU sibling of aterm-wasm (the CPU path)."
+description = "The browser binding of the aterm engine drawn by aterm-gpu (WebGL2) onto a <canvas>, exported through aterm-wasm-abi. The GPU sibling of aterm-wasm (the CPU path)."
 license = "MIT"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# default-features = false drops the engine's disk-tier cold scrollback (libc
-# mmap), which cannot target wasm32; a renderer needs only the RAM/LZ4 tiers.
-aterm-core = { path = "../aterm-core", default-features = false, features = ["sixel"] }
+aterm-core = { path = "../aterm-core", default-features = false }
 aterm-render = { path = "../aterm-render", default-features = false }
 # The cursor-wake and sparkle-words engines the native app runs.
 aterm-effects = { path = "../aterm-effects" }
@@ -27,40 +25,29 @@ aterm-gpu = { path = "../aterm-gpu" }
 aterm-types = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-# The panic hook: `console.error` with the JS stack, in console_error_panic_hook's
-# format, through the console src/host.rs binds (docs/AUDIT-third-party-2026-10-15.md,
-# WP.3). No dependency of its own.
-aterm-wasm-abi = { workspace = true }
-# No wgpu row: the GPU backend is aterm-gpu's business. `init` and
-# `init_offscreen` reach it through `aterm_gpu::web` (`GpuContext::for_canvas`,
-# `CanvasTarget`, `GpuRenderer::configure_canvas_surface`), whose signatures
-# name no backend type (docs/AUDIT-third-party-2026-10-15.md, GW.3), so the
-# WebGL2 backend under them can change without touching this crate.
-
-# wgpu 29 (under aterm-gpu) requires wasm-bindgen >= 0.2.108. Pinned exact so
-# the generated glue matches the wasm-bindgen CLI (`--target web` refuses a
-# mismatch); the CLI binds only this module (aterm-wasm binds with `verify glue`).
-wasm-bindgen = "=0.2.108"
-# Required though nothing names it: `#[wasm_bindgen] pub async fn` (`init`,
-# `init_offscreen`) expands to `wasm_bindgen_futures::future_to_promise`.
-# Default features off: `std` adds only futures-util, used solely by the
-# catch_unwind `future_to_promise` variant (panic = "unwind"); the ungated
-# variant has a looser bound. Saves 5 packages / 36,126 lines in the shipped
-# wasm. wasm-bindgen keeps `std` through its row here, and js-sys/web-sys
-# through wgpu-hal's (`default`).
-wasm-bindgen-futures = { version = "0.4", default-features = false }
-# No web-sys row: `init` and `init_offscreen` name HtmlCanvasElement and
-# OffscreenCanvas as `aterm_gpu::web::…`, aterm-gpu's re-export of the
-# `wgpu::web_sys` types wgpu's `webgl` feature carries with exactly those two
-# enabled (wgpu 29 lib.rs:186-187, Cargo.toml's wasm32 web-sys row), so aterm
-# claims no web-sys edge of its own (docs/AUDIT-third-party-2026-10-15.md,
-# wasm-platform WP.2).
+# The host boundary, with no dependency of its own: `#[export]` marks what JS
+# sees and `verify glue` writes the glue (no wasm-bindgen:
+# docs/AUDIT-third-party-2026-10-15.md, wasm-platform WP.8, as WP.7 did for
+# aterm-wasm); the panic hook reports `console.error` with the JS stack, in
+# console_error_panic_hook's format, through the `aterm_host` imports
+# src/host.rs names (WP.3). No GPU backend row: aterm-gpu's GL arm draws on
+# WebGL2 through its own `aterm_gl` imports, and `init` and `init_offscreen`
+# reach it through `aterm_gpu::web` (`GpuContext::for_canvas`,
+# `CanvasTarget`, `GpuRenderer::configure_canvas_surface`), whose canvas
+# types are aterm-wasm-abi JS objects. No wasm-bindgen, web-sys, js-sys or
+# wgpu in this module's graph.
+aterm-wasm-abi = { workspace = true, features = ["export"] }
 # No getrandom row: nothing here needs entropy, and aterm's own manifests were
 # its only parents on this cell, so a defensive row alone shipped it
 # (deny.toml bans it outside ring; `forge check` [OB-18]).
 
 # No [profile.release]: profiles apply only at the workspace root. A wasm size
 # build (opt-level = "z") is chosen by the build tool's --profile.
+
+[dev-dependencies]
+# TEST-ONLY: `aterm_spec::host::could_not_run`, so a test the host cannot run
+# (no system font, no GPU) ends COULD NOT RUN, never a silent pass.
+aterm-spec = { workspace = true }
 
 [lints]
 workspace = true

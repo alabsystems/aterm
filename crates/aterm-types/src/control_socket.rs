@@ -432,57 +432,27 @@ mod tests {
     }
 
     #[test]
-    fn directive_disables_on_off_values() {
-        assert_eq!(socket_directive(Some("0"), None), SocketDirective::Disabled);
-        assert_eq!(
-            socket_directive(Some("off"), None),
-            SocketDirective::Disabled
-        );
-        assert_eq!(
-            socket_directive(Some("OFF"), None),
-            SocketDirective::Disabled
-        );
-        assert_eq!(socket_directive(None, Some("1")), SocketDirective::Disabled);
-        assert_eq!(
-            socket_directive(None, Some("yes")),
-            SocketDirective::Disabled
-        );
-        // The kill switch wins even over an explicit path.
-        assert_eq!(
-            socket_directive(Some("/tmp/a.sock"), Some("1")),
-            SocketDirective::Disabled
-        );
-    }
-
-    #[test]
-    fn directive_defaults_to_per_instance() {
-        assert_eq!(socket_directive(None, None), SocketDirective::PerInstance);
-        assert_eq!(
-            socket_directive(Some(""), None),
-            SocketDirective::PerInstance
-        );
-        // A non-disabling kill-switch value does not disable.
-        assert_eq!(
-            socket_directive(None, Some("0")),
-            SocketDirective::PerInstance
-        );
-        assert_eq!(
-            socket_directive(None, Some("")),
-            SocketDirective::PerInstance
-        );
-    }
-
-    #[test]
-    fn directive_passes_explicit_path_through() {
-        assert_eq!(
-            socket_directive(Some("/tmp/a.sock"), None),
-            SocketDirective::Explicit("/tmp/a.sock".to_string())
-        );
-        // `off` is only a keyword for the value itself, not for paths.
-        assert_eq!(
-            socket_directive(Some("/tmp/off"), None),
-            SocketDirective::Explicit("/tmp/off".to_string())
-        );
+    fn socket_directive_reads_the_path_and_the_kill_switch() {
+        let explicit = |p: &str| SocketDirective::Explicit(p.to_string());
+        for (path, kill, want) in [
+            (Some("0"), None, SocketDirective::Disabled),
+            (Some("off"), None, SocketDirective::Disabled),
+            (Some("OFF"), None, SocketDirective::Disabled),
+            (None, Some("1"), SocketDirective::Disabled),
+            (None, Some("yes"), SocketDirective::Disabled),
+            // The kill switch wins even over an explicit path.
+            (Some("/tmp/a.sock"), Some("1"), SocketDirective::Disabled),
+            (None, None, SocketDirective::PerInstance),
+            (Some(""), None, SocketDirective::PerInstance),
+            // A non-disabling kill-switch value does not disable.
+            (None, Some("0"), SocketDirective::PerInstance),
+            (None, Some(""), SocketDirective::PerInstance),
+            (Some("/tmp/a.sock"), None, explicit("/tmp/a.sock")),
+            // `off` is only a keyword for the value itself, not for paths.
+            (Some("/tmp/off"), None, explicit("/tmp/off")),
+        ] {
+            assert_eq!(socket_directive(path, kill), want, "{path:?} {kill:?}");
+        }
     }
 
     #[test]

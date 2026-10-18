@@ -1,27 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The shaping half of the font oracle: what `rustybuzz` answers for a face,
-//! written as text. `tests/font_oracle.rs` replays these answers against the
-//! committed corpus; the same file is included by `#[path]` from
-//! `tests/font_oracle/recorder`, a crate outside the workspace, which links the
-//! registry crates WITHOUT aterm's `[patch.crates-io]` facades and checks they
-//! answer alike.
+//! The shaping half of the font oracle on rustybuzz: what `rustybuzz` answers
+//! for a face, written as text. Only `tests/font_oracle/recorder` includes it
+//! (by `#[path]`), a crate outside the workspace that links the registry
+//! crates without aterm's `[patch.crates-io]` facades, so this file names only
+//! `std`, `rustybuzz` and the std-only `corpus.rs` (the corpus line format, the
+//! digest and the face table).
 //!
-//! So this file names only `std` and `rustybuzz`, and every input a line needs
-//! (face, collection index, variation instance, features, text) is written
-//! into the line itself, where a replay can parse it back.
-//!
-//! The reader half (`reader.rs`) moved out at TF.5 of
-//! docs/AUDIT-third-party-2026-10-15.md, when aterm-font replaced ttf-parser
-//! in the renderer: it is written once for both readers. Since `aterm-font`
-//! replaced the shaper (TF.6), its adapter (`shaper.rs`) produces the same
-//! strings and is held to the same lines in the workspace; an answer it
-//! changes on purpose is an accepted delta pinned by its own test. This file
-//! is the recorder's alone now.
-//!
-//! The corpus format, the digest and the face table live in `corpus.rs`,
-//! which names only `std` and which `aterm-font`'s replay includes too.
+//! In the workspace, `tests/font_oracle.rs` answers the same `shape` lines
+//! with aterm-font's shaper (`shaper.rs`), which writes its answer as `shape`
+//! does here; a line it answers differently must be one of the accepted deltas
+//! `shaping_answers_hold` names.
 
 use std::fmt::Write as _;
 
@@ -29,12 +19,13 @@ use std::fmt::Write as _;
 pub(crate) mod corpus;
 pub(crate) use corpus::*;
 
-/// Shape `text` the way `ligature_shaping::RowShaper::shape_buffer` does: a
-/// fresh buffer, `guess_segment_properties`, a plan built from the guessed
-/// direction, script (absent when unknown) and language, then
+/// Shape `text` with rustybuzz as `ligature_shaping::RowShaper::shape_buffer`
+/// shapes with aterm-font: a fresh buffer, `guess_segment_properties`, a plan
+/// built from the guessed direction, script (absent when unknown) and language
+/// (rustybuzz guesses none, and aterm-font's plan takes none), then
 /// `shape_with_plan`. Variation coordinates are set only when there are any,
-/// as the primary-face path does; `Renderer::shape_cluster`'s
-/// `rustybuzz::shape(&face, &[], ..)` is the same with no features.
+/// as the primary-face path does; the non-macOS `shape_colour_cluster`'s
+/// `shape(&face, &[], ..)` is the same with no features.
 ///
 /// The answer is `<direction> <script> |` and one `gid:cluster:x_advance`
 /// token per output glyph, with `,y_advance` when it is non-zero and

@@ -131,9 +131,8 @@ impl HotTier {
 
     /// Saturating for the same strict-gate reason as [`push`](Self::push).
     ///
-    /// Callers are the test suite and `DiskBackedScrollback`'s debug-build
-    /// invariant check (`disk-tier`), hence the cfg.
-    #[cfg(any(test, all(debug_assertions, feature = "disk-tier")))]
+    /// Test-only: the invariant recomputation that calls it is.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn recompute_memory_used(&self) -> usize {
         let base = std::mem::size_of::<Self>();
@@ -146,7 +145,7 @@ impl HotTier {
 
     /// See [`recompute_memory_used`](Self::recompute_memory_used) for the
     /// cfg and saturating-fold rationale.
-    #[cfg(any(test, all(debug_assertions, feature = "disk-tier")))]
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn recompute_budgeted_bytes(&self) -> usize {
         let mut lines_mem = 0usize;

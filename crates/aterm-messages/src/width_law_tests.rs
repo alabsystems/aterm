@@ -160,7 +160,6 @@ fn forced_short_time_words_take_the_short_slot_and_spend_nothing() {
         meter: Some((Some(500), "74 MB")),
         busy: false,
         animated: true,
-        level: false,
         eta: true,
         load: None,
         load_slot: Loads::NONE,
@@ -304,20 +303,13 @@ fn narrowing_holds(excerpt: &dyn Fn(usize) -> Option<String>) {
     }
 }
 
-/// The agent's one overdue row for several tabs (`tab 1 for 7 h · tab 3 for
+/// A row whose excerpt names each tab and how long (`tab 1 for 7 h · tab 3 for
 /// 2 h`) has no `: `; its first ` · ` piece is a whole statement too and
 /// stands where the floor would drop the excerpt. Controls: the cut through
 /// the second piece at 103, dropped at 90, a first piece under twelve cells
 /// not offered, and narrowing monotone.
 #[test]
 fn a_first_piece_stands_where_the_floor_would_drop_the_excerpt() {
-    let tabs = |word| Intent::AgentUpgradeTabs {
-        word,
-        moves: vec![
-            ("s-1".into(), "2.1.283".into()),
-            ("s-3".into(), "2.1.283".into()),
-        ],
-    };
     let row = |why: &str| {
         Message::new(
             tags::HARNESS,
@@ -325,8 +317,8 @@ fn a_first_piece_stands_where_the_floor_would_drop_the_excerpt() {
             "Couldn't upgrade Claude in 2 tabs yet",
         )
         .line(why)
-        .action(tabs(UpgradeWord::Now))
-        .action(tabs(UpgradeWord::NotToday))
+        .action(upgrade(UpgradeWord::Now))
+        .action(upgrade(UpgradeWord::NotToday))
         .hold(Hold::STANDING)
     };
     let excerpt = |why: &str, cols: usize| {
@@ -381,13 +373,6 @@ fn a_cut_that_adds_no_word_to_the_lead_is_the_lead() {
     let wider = one(why, 104).expect("the cut");
     assert!(wider.starts_with("behind for 26 h: its"), "{wider}");
     narrowing_holds(&|cols| one(why, cols));
-    let tabs = |word| Intent::AgentUpgradeTabs {
-        word,
-        moves: vec![
-            ("s-1".into(), "2.1.283".into()),
-            ("s-3".into(), "2.1.283".into()),
-        ],
-    };
     let two = |why: &str, cols: usize| {
         let msg = Message::new(
             tags::HARNESS,
@@ -395,8 +380,8 @@ fn a_cut_that_adds_no_word_to_the_lead_is_the_lead() {
             "Couldn't upgrade Claude in 2 tabs yet",
         )
         .line(why)
-        .action(tabs(UpgradeWord::Now))
-        .action(tabs(UpgradeWord::NotToday))
+        .action(upgrade(UpgradeWord::Now))
+        .action(upgrade(UpgradeWord::NotToday))
         .hold(Hold::STANDING);
         band(vec![msg], cols).rows[0]
             .detail

@@ -129,6 +129,7 @@ pub type PageId = usize;
 pub struct PageSlice<T> {
     ptr: NonNull<T>,
     len: u16,
+    #[cfg(any(test, debug_assertions))]
     page_id: PageId,
     #[cfg(test)]
     offset: Offset<T>,
@@ -143,6 +144,7 @@ impl<T> PageSlice<T> {
     }
 
     /// Page ID for this slice.
+    #[cfg(any(test, debug_assertions))]
     #[must_use]
     pub const fn page_id(&self) -> PageId {
         self.page_id

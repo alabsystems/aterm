@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! atpkg's integration files as modules of one test binary: the pure pins (the pack
-//! surface, the tar oracle, …) and the process-edge checks that run the real `atpkg`
-//! binary over a scratch store of their own. Each file keeps its path and its own
-//! `#[test]`s.
+//! atpkg's integration files as modules of ONE test binary: the pure pins (the tar
+//! oracle, the shell-integration hook golden) and the process-edge checks that run the
+//! real `atpkg` binary over a scratch store of their own. Each file keeps its path — every
+//! citation of `crates/atpkg/tests/<file>.rs` still resolves — and its own `#[test]`s.
 //!
 //! No file below sets or removes an environment variable (a child gets its environment on
 //! its own command), installs a hook or an allocator, re-executes itself, changes
@@ -33,6 +33,5 @@ mod run_is_the_managed_name;
 mod seed_disabled;
 mod settings_action_completion;
 mod shell_integration_hook_pin;
-mod spec_coherence;
 mod tar_corpus;
 mod vendor_pending_conformance;

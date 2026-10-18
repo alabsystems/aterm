@@ -6,7 +6,7 @@
 // `targo --unverified` lane), because an island carries its own authority.
 //
 // This is a theorem about the model below, not about the Rust. The code-bound half is the
-// derived twin `aterm_spec::derive::native_update_seamless_handoff_ownership_model`, whose
+// derived twin `aterm_models_update::native_update_seamless_handoff_ownership_model`, whose
 // bind (`ownership_conformance` in app_update_handoff.rs) drives the real Commit admission
 // over its bounded input space and checks the model admits exactly what the code decides.
 //
@@ -34,8 +34,8 @@ clean {
       | rolledBack : Phase
       | lost : Phase
 
-    -- warm is the successor's warm prologue (warm successor P2): config,
-    -- fonts, the backend worker and the first window's Metal shader warm
+    -- warm is the warm prologue of the successor (warm successor P2): config,
+    -- fonts, the backend worker and the Metal shader warm of the first window
     -- (which fills the per-user compiler cache), run BEFORE its dial while
     -- the outgoing process still owns and reads every session.
     inductive Event where

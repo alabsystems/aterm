@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 bind for `ActiveHandle` (`aterm_spec::derive::active_handle_model`):
+//! Tier-1 bind for `ActiveHandle` (`aterm_models_gui::active_handle_model`):
 //! the process-wide control `ActiveHandle` always names the front window's
 //! active tab's focused pane.
 //!
 //! A headless `App` is driven through the seams that move that session (tab
 //! append/switch/cycle/move, split, pane focus and collapse, tab close, a
 //! background pane EOF, window open/close, background tab churn), and each step
-//! projects the real state onto the model's `<<truth, handle, next>>`. The three
-//! seams that spawn a PTY are driven from their post-spawn half
-//! (`install_new_tab`, `install_split_pane`, `install_window_state_with_parent`;
-//! the first two wrap what a tab or split spawned off the loop lands through)
-//! with a stub session; that half moves the front and re-points the handle.
+//! projects the real state onto the model's `<<truth, handle, next>>`. The seams
+//! that spawn a PTY are driven from their post-spawn half (`install_new_tab`,
+//! `install_split_pane`, `insert_logical_window`; the first two wrap what a tab or
+//! split spawned off the loop lands through) with a stub session; that half
+//! moves the front and re-points the handle.
 //!
 //! Projection:
 //!
@@ -29,7 +29,7 @@
 
 use std::collections::BTreeMap;
 
-use aterm_spec::derive::active_handle_model;
+use aterm_models_gui::active_handle_model;
 use aterm_spec::{interp, verify};
 
 use crate::{App, WindowId, stub_session};

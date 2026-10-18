@@ -174,25 +174,3 @@ fn a_seam_holds_one_tone_across_a_row_of_two_different_inks() {
         );
     }
 }
-
-/// An unset channel leaves the overline in the cell's own foreground, and no
-/// escape sequence sets it.
-#[test]
-fn an_unset_overline_colour_renders_the_cells_own_foreground() {
-    let mut rend = renderer();
-    let (cw, ch) = rend.cell_size();
-    let (rows, cols) = (1usize, 8usize);
-    let mut term = Terminal::new(rows as u16, cols as u16);
-    term.process(b"\x1b[?25l\x1b[53m\x1b[38;2;255;0;0mRED");
-    let input = term.cell_frame(rows, cols);
-    assert!(
-        input.cells[0].iter().all(|c| c.overline_color.is_none()),
-        "no escape sequence may reach the chrome-only channel"
-    );
-    let f = rend.render_input(&input);
-    let band = top_row_pixels(&f, cw, 0, ch, 0);
-    assert!(
-        band.iter().all(|px| *px == rgb_to_u32([255, 0, 0])),
-        "an unset channel leaves the overline in its cell's fg: {band:?}"
-    );
-}

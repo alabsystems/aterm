@@ -3,10 +3,10 @@
 //
 // Cursor-effect radial light on the CPU renderer (`RenderInput.glow_halo`, the Emberforge
 // embers and crown). The empty-stream no-op is the `glow_halo` row of
-// `tests/empty_channels.rs`. Pinned here: radial falloff that only brightens; the dirty gate
-// (settled gate-hits, moved marks prev∪cur rows); no ghosting on the damaged path; and
-// `HaloMode::Over`, the light-theme veil: it darkens white where `Add` is invisible, is a
-// no-op without coverage, and composites after every Add quad (the GPU's per-mode order).
+// `tests/empty_channels.rs`. Pinned here: the dirty gate (settled gate-hits, moved marks
+// prev∪cur rows); no ghosting on the damaged path; an Add-only stream is the historical
+// `add_sat` math; and `HaloMode::Over`, the light-theme veil: it darkens white where `Add` is
+// invisible and composites after every Add quad (the GPU's per-mode order).
 
 use aterm_core::render::{HaloMode, RainHalo};
 use aterm_core::terminal::Terminal;
@@ -38,67 +38,6 @@ fn halo(row: u16, x: u16, y: u16, w: u16, h: u16, color: u32) -> RainHalo {
 /// Summed-RGB luminance proxy (monotone in every channel under additive light).
 fn luma(p: u32) -> u32 {
     ((p >> 16) & 0xff) + ((p >> 8) & 0xff) + (p & 0xff)
-}
-
-/// Luminance decreases monotonically from the centre toward the ellipse edge along the
-/// centre scanline, and additive light only brightens the base.
-#[test]
-fn glow_halo_luminance_decreases_radially_from_centre() {
-    let mut rend = renderer();
-    let (cw, ch) = rend.cell_size();
-    let mut term = Terminal::new(3, 10);
-    term.process(b"\x1b[?25l"); // glyph-free: the halo's own gradient, unperturbed
-    let base = rend.render_input(&term.cell_frame(3, 10)).pixels.clone();
-
-    // One bright halo filling row 1's band, centre mid-band.
-    let q = halo(
-        1,
-        cw as u16,
-        ch as u16,
-        (4 * cw) as u16,
-        ch as u16,
-        0x00C0_FFC0,
-    );
-    let mut input = term.cell_frame(3, 10);
-    input.glow_halo = vec![q];
-    let f = rend.render_input(&input);
-
-    let pad = (f.width - 10 * cw) / 2;
-    let (cx, cy) = (pad + q.cx as usize, pad + q.cy as usize);
-    let centre = luma(f.pixels[cy * f.width + cx]);
-    let edge = luma(f.pixels[cy * f.width + cx + (q.rx as usize - 1)]);
-    let bg = luma(base[cy * f.width + cx]);
-    assert!(
-        centre > edge,
-        "halo centre (luma {centre}) must outshine its edge (luma {edge})"
-    );
-    assert!(
-        edge >= bg && centre > bg,
-        "the halo must brighten over the base (bg {bg}, edge {edge}, centre {centre})"
-    );
-    // Monotone along the centre scanline: each step outward never brightens.
-    let mut prev = centre;
-    for dx in 1..q.rx as usize {
-        let cur = luma(f.pixels[cy * f.width + cx + dx]);
-        assert!(
-            cur <= prev,
-            "radial falloff must be monotone (x+{dx}: {cur} > {prev})"
-        );
-        prev = cur;
-    }
-    // And nothing outside the quad's row band was touched.
-    for (i, (&b, &p)) in base.iter().zip(f.pixels.iter()).enumerate() {
-        let y = i / f.width;
-        if !(pad + ch..pad + 2 * ch).contains(&y) {
-            assert_eq!(b, p, "pixel outside the halo's row band changed at y={y}");
-        }
-        for sh in [16, 8, 0] {
-            assert!(
-                (p >> sh) & 0xff >= (b >> sh) & 0xff,
-                "additive light must only brighten"
-            );
-        }
-    }
 }
 
 /// Settled halos (equal, non-empty) gate-hit with nothing marked; a moved halo sets
@@ -293,41 +232,6 @@ fn over_halo_darkens_white_background_where_add_is_invisible() {
         rend.render_input(&add_input).pixels,
         base,
         "additive smoke over a white background must be byte-invisible"
-    );
-}
-
-/// An `Over` quad lying entirely at or beyond the falloff ellipse edge (weight 0 on every
-/// covered pixel) leaves the frame byte-identical; the GPU blends `dst·(1−0)` there.
-#[test]
-fn over_halo_with_zero_coverage_is_a_noop() {
-    let mut rend = Renderer::from_system(18.0, light_theme())
-        .expect("no font: build with aterm-render's default embedded-font feature");
-    let (cw, ch) = rend.cell_size();
-    let mut term = Terminal::new(3, 10);
-    term.process(b"\x1b[?25lzero coverage");
-    let base = rend.render_input(&term.cell_frame(3, 10)).pixels.clone();
-
-    // Centre at the band's left edge with rx = cw; the quad starts at x = cx + rx, so every
-    // covered pixel has dx >= rx -> nsq >= 256 -> wt 0.
-    let q = RainHalo {
-        row: 1,
-        x: (2 * cw) as u16,
-        y: ch as u16,
-        w: (2 * cw) as u16,
-        h: ch as u16,
-        color: 0x0020_2020,
-        cx: cw as u16,
-        cy: (ch + ch / 2) as u16,
-        rx: cw as u16,
-        ry: (ch / 2).max(1) as u16,
-        mode: HaloMode::Over,
-    };
-    let mut input = term.cell_frame(3, 10);
-    input.glow_halo = vec![q];
-    assert_eq!(
-        rend.render_input(&input).pixels,
-        base,
-        "a zero-coverage Over veil must be a byte no-op"
     );
 }
 

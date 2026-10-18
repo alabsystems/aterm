@@ -71,7 +71,10 @@ const NOT_RUN: i32 = 2;
 /// `devtools_helper` is library-private.
 #[must_use]
 pub fn run_devtools_helper_drive(snapshots: Option<&Path>) -> i32 {
-    run(snapshots)
+    // The drive is a windowed process of its own: it makes the application
+    // object and builds AppKit views, so it mints the proof a windowed launch
+    // carries and hands it to the body that sends `+sharedApplication`.
+    run(crate::platform::Windowed::launch(), snapshots)
 }
 
 use std::ffi::{CStr, c_char, c_void};
@@ -87,7 +90,7 @@ use aterm_objc::{CGPoint, CGRect, CGSize, ClassType as _, Id, Obj, class, sel};
 use crate::appkit::{self, MainThread, consts};
 use crate::devtools_helper::live::{self, Preview};
 use crate::devtools_helper::{
-    Block, Content, DROP_CONFIRM_WITHIN, Origin, PANEL_W, Panel, PanelEvent, Reading, Show,
+    Block, Content, DROP_CONFIRM_WITHIN, Origin, PANEL_W, Page, Panel, PanelEvent, Reading, Show,
 };
 
 unsafe extern "C" {
@@ -120,9 +123,10 @@ impl Findings {
     }
 }
 
-/// The body. Named `run` for aterm-census's `shared-application` sites: the one function
-/// here that makes the application object, and only with the Prohibited policy.
-fn run(out: Option<&Path>) -> i32 {
+/// The body: the one function here that makes the application object, holding the
+/// windowed launch's proof (aterm-census's `shared-application` rule), and only with
+/// the Prohibited policy.
+fn run(_windowed: crate::platform::Windowed, out: Option<&Path>) -> i32 {
     let Some(mtm) = MainThread::new() else {
         println!("{ME}: NOT RUN — not on the process main thread");
         return NOT_RUN;
@@ -185,6 +189,7 @@ fn shown_after(
 ) -> Panel {
     Panel::new(
         Show {
+            page: Page::DeveloperTools,
             origin: Origin::Digest,
             reading: Reading {
                 grant: DevToolGrant::NotGranted,
@@ -298,6 +303,32 @@ fn scenarios() -> Vec<(&'static str, Content)> {
         t0,
     );
     out.push(("done", done.content()));
+    // The Full Disk Access page's panel (owner ask 2026-10-16): no list read, so no
+    // listed, unread or unconfirmed states.
+    let fda = |bundle: bool| {
+        Panel::new(
+            Show {
+                page: Page::FullDiskAccess,
+                origin: Origin::Automatic,
+                reading: Reading::UNREAD,
+                listed: None,
+                bundle: bundle.then(|| PathBuf::from(TILE_BUNDLE)),
+                skips: false,
+            },
+            t0,
+        )
+    };
+    out.push(("fda-explain", fda(true).content()));
+    out.push(("fda-words-only", fda(false).content()));
+    let mut fda_failed = fda(true);
+    let _ = fda_failed.on(PanelEvent::DragEnded { accepted: false }, t0);
+    out.push(("fda-drop-not-taken", fda_failed.content()));
+    let mut fda_dropped = fda(true);
+    let _ = fda_dropped.on(PanelEvent::DragEnded { accepted: true }, t0);
+    out.push(("fda-dropped", fda_dropped.content()));
+    let mut fda_done = fda(true);
+    let _ = fda_done.granted(t0);
+    out.push(("fda-done", fda_done.content()));
     out
 }
 
@@ -558,8 +589,8 @@ fn panel_window(mtm: MainThread, findings: &mut Findings) {
         findings.check(delegate == preview.target.as_id(), || {
             "the panel's delegate is not its target".to_string()
         });
-        // The tile's open hand comes from one hover area active always (cursor
-        // rects work only in the key window, which the panel never is).
+        // The tile lights up from one hover area active always (cursor rects
+        // work only in the key window, which the panel never is).
         match preview.tile.as_ref() {
             Some(tile) => {
                 let areas = appkit::send_id(tile.as_id(), sel!(trackingAreas));
@@ -578,6 +609,15 @@ fn panel_window(mtm: MainThread, findings: &mut Findings) {
                     count == 1 && options == consts::NS_TRACKING_HOVER_IN_VISIBLE_RECT,
                     || format!("the tile has {count} tracking area(s), options {options:#x}"),
                 );
+                // What that area drives: the pointer coming over the live tile
+                // lights it, and leaving puts it out.
+                appkit::send_v_id(tile.as_id(), sel!(mouseEntered:), Id::NIL);
+                let entered = tile.hovered();
+                appkit::send_v_id(tile.as_id(), sel!(mouseExited:), Id::NIL);
+                let exited = tile.hovered();
+                findings.check(entered && !exited, || {
+                    format!("the tile reads lit={entered} over it and lit={exited} after")
+                });
             }
             None => findings.check(false, || "the explain panel built no tile".to_string()),
         }

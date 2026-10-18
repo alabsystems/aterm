@@ -83,23 +83,3 @@ fn every_script_resolves_to_a_face_that_really_contains_it() {
         missing.join("\n  ")
     );
 }
-
-/// The documented limit: complex-script shaping runs only on the primary face.
-/// This pins where the limit is, so fallback shaping, when it lands, fails
-/// this test and the matrix is updated deliberately.
-#[test]
-fn complex_script_shaping_is_primary_face_only() {
-    let mut r = aterm_render::Renderer::from_system(28.0, aterm_render::Theme::default())
-        .expect("no font: build with aterm-render's default embedded-font feature");
-    r.debug_block_on_lazy_fallbacks();
-    // A programming monospace primary has no Arabic, so every Arabic run
-    // resolves off-primary, which is why it is not shaped.
-    let off_primary = "السلام".chars().all(|ch| {
-        r.debug_fallback_pick_path(ch).is_some() || r.debug_runtime_fallback(ch).is_some()
-    });
-    assert!(
-        off_primary,
-        "Arabic reached the PRIMARY face — if the primary now covers Arabic, the \
-         shaping story changes and this matrix needs revisiting"
-    );
-}

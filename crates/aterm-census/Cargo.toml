@@ -21,8 +21,7 @@ path = "src/main.rs"
 # None: pure std, so the censuses run offline and build in seconds.
 
 [dev-dependencies]
-# None: tests use only std (synthetic trees under a temp dir, and the
-# live_tree_* tests over this checkout).
+# None: tests use only std (synthetic sources and trees under a temp dir).
 
 [lints]
 workspace = true

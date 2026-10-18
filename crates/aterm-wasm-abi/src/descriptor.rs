@@ -40,8 +40,9 @@ pub const MAGIC: [u8; 4] = *b"atab";
 /// any change to the layout above, to a [`tag`], to a type's lowering
 /// ([`Ty::param_words`], [`Ty::ret_word`]) or to the return slot
 /// (`crate::mem`). Version 2: a throw is left in the return slot, not
-/// thrown through an `aterm_abi.throw` import.
-pub const VERSION: u8 = 2;
+/// thrown through an `aterm_abi.throw` import. Version 3: a JS object
+/// parameter ([`tag::JS_OBJECT`], [`crate::js`]).
+pub const VERSION: u8 = 3;
 
 /// Bytes before a record's body: [`MAGIC`], [`VERSION`] and the body length.
 pub const HEADER_LEN: usize = 9;
@@ -118,6 +119,9 @@ pub mod tag {
     pub const RESULT: u8 = 0x21;
     /// An exported class; payload: name length u8, then the name.
     pub const CLASS: u8 = 0x30;
+    /// A JS object the host hands in ([`crate::js`]), as a parameter only;
+    /// payload: the TypeScript type's name length u8, then the name.
+    pub const JS_OBJECT: u8 = 0x31;
 }
 
 /// A type's description, built at compile time: a tag and its payload in a
@@ -176,13 +180,24 @@ impl TypeDesc {
     /// An exported class named `name`.
     #[must_use]
     pub const fn class(name: &str) -> Self {
+        Self::named(tag::CLASS, name)
+    }
+
+    /// A JS object whose TypeScript type is `ts` ([`crate::js`]).
+    #[must_use]
+    pub const fn js_object(ts: &str) -> Self {
+        Self::named(tag::JS_OBJECT, ts)
+    }
+
+    /// `tag` followed by the length of `name`, then `name`.
+    const fn named(tag: u8, name: &str) -> Self {
         let name = name.as_bytes();
         assert!(
             name.len() + 2 <= Self::CAP,
             "aterm-wasm-abi: class name too long"
         );
         let mut bytes = [0; Self::CAP];
-        bytes[0] = tag::CLASS;
+        bytes[0] = tag;
         bytes[1] = name.len() as u8;
         let mut i = 0;
         while i < name.len() {
@@ -351,6 +366,8 @@ pub enum Ty {
     Result(Box<Ty>, Box<Ty>),
     /// An exported class.
     Class(String),
+    /// A JS object of the named TypeScript type ([`crate::js`]).
+    JsObject(String),
 }
 
 /// A wasm value type, as the module's type section spells a signature.
@@ -430,6 +447,8 @@ impl Ty {
         match self {
             Ty::Str | Ty::String => Some([ValType::I32, ValType::I32]),
             Ty::Slice(e) | Ty::Vec(e) if e.is_element() => Some([ValType::I32, ValType::I32]),
+            // The object's index in the glue's table; the second word is 0.
+            Ty::JsObject(_) => Some([ValType::I32, ValType::I32]),
             Ty::Option(inner) => match &**inner {
                 t if t.is_scalar() => Some([ValType::I32, t.scalar_word()?]),
                 Ty::Str | Ty::String => Some([ValType::I32, ValType::I32]),
@@ -502,7 +521,7 @@ impl fmt::Display for Ty {
             Ty::Vec(e) => write!(f, "Vec<{e}>"),
             Ty::Option(t) => write!(f, "Option<{t}>"),
             Ty::Result(t, e) => write!(f, "Result<{t}, {e}>"),
-            Ty::Class(c) => f.write_str(c),
+            Ty::Class(c) | Ty::JsObject(c) => f.write_str(c),
         }
     }
 }
@@ -710,6 +729,14 @@ impl Reader<'_> {
         String::from_utf8(s.to_vec()).map_err(|_| "a string is not UTF-8".to_string())
     }
 
+    /// A name of up to 255 bytes after its length byte; `what` names it in
+    /// an error.
+    fn name(&mut self, what: &str) -> Result<String, String> {
+        let n = self.u8()?;
+        let name = self.take(usize::from(n))?;
+        String::from_utf8(name.to_vec()).map_err(|_| format!("{what} is not UTF-8"))
+    }
+
     /// A type nested `depth` deep. A real description is at most
     /// [`TypeDesc::CAP`] bytes, so nesting deeper than that is refused
     /// before it can exhaust the stack.
@@ -744,14 +771,8 @@ impl Reader<'_> {
                 let ok = self.ty(d)?;
                 Ty::Result(Box::new(ok), Box::new(self.ty(d)?))
             }
-            tag::CLASS => {
-                let n = self.u8()?;
-                let name = self.take(usize::from(n))?;
-                Ty::Class(
-                    String::from_utf8(name.to_vec())
-                        .map_err(|_| "a class name is not UTF-8".to_string())?,
-                )
-            }
+            tag::CLASS => Ty::Class(self.name("a class name")?),
+            tag::JS_OBJECT => Ty::JsObject(self.name("a JS type name")?),
             other => return Err(format!("unknown type tag {other:#04x}")),
         })
     }
@@ -920,6 +941,15 @@ mod tests {
             None
         );
         assert_eq!(Ty::Class("C".into()).param_words(), None);
+        assert_eq!(
+            Ty::JsObject("HTMLCanvasElement".into()).param_words(),
+            Some([I32, I32])
+        );
+        assert_eq!(Ty::JsObject("HTMLCanvasElement".into()).ret_word(), None);
+        assert_eq!(
+            decode_ty(TypeDesc::js_object("OffscreenCanvas").as_bytes()),
+            Ok(Ty::JsObject("OffscreenCanvas".into()))
+        );
         assert_eq!(Ty::Unit.ret_word(), Some(None));
         assert_eq!(Ty::Str.ret_word(), None);
         let res = |ok: Ty| Ty::Result(Box::new(ok), Box::new(Ty::String));

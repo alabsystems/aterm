@@ -1,0 +1,940 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! The GL arm's presents (Linux, docs/AUDIT-third-party-2026-10-15.md GW.4),
+//! the twin of the armed Metal present (`metal_encode_submit_b` and
+//! `metal/present.rs`): after the frame's encode, compose the present copy,
+//! the bloom halo, the heat shimmer, the sub-row band shift with its apron,
+//! the settings card, then the letterbox blit and the SDR crown into a
+//! destination texture, in the order and with the uniforms, gates and
+//! scissors the other arms use.
+//!
+//! The destination is the window surface's stand-in
+//! (`gl::surface::GlWindowSurface`, posted by a flipped blit and a swap), the
+//! headless window's virtual target (`WindowGpu::gl_virtual_off`), or a
+//! throwaway for the readback helpers. GL runs commands in issue order and
+//! orders a buffer or texture write after the draws already issued that read
+//! it, so every resource here is resident and rewritten in place: no ring, no
+//! completion probe. The taps read the destination back as soon as it is
+//! drawn.
+
+use super::*;
+use crate::device_layer::TexelFormat;
+use crate::gl::encoder::GlFrame;
+use crate::gl::resources::{GlBuffer, GlBufferRole, GlTexture};
+#[cfg(not(wgpu_arm))]
+use gl_arm::gl_arm_note;
+use gl_arm::{GlArmLive, offscreen_format};
+
+/// The present's resident uniform blocks and glow streams on one device,
+/// rewritten every present.
+pub(crate) struct GlPresentBufs {
+    blit: GlBuffer,
+    bloom_cell: GlBuffer,
+    bloom: GlBuffer,
+    shimmer: GlBuffer,
+    tray: GlBuffer,
+    crown: GlBuffer,
+    /// The bloom extract's instances (`bloom_glow_scratch[extract_first..]`).
+    extract: Option<(GlBuffer, usize)>,
+    /// The crown's instances (`bloom_glow_scratch[..count]`).
+    crown_stream: Option<(GlBuffer, usize)>,
+}
+
+impl GlPresentBufs {
+    fn new(live: &GlArmLive) -> Result<Self, String> {
+        let u = |size: usize| live.dev.buffer(GlBufferRole::Uniform, size);
+        Ok(Self {
+            blit: u(std::mem::size_of::<BlitUniform>())?,
+            bloom_cell: u(std::mem::size_of::<Uniforms>())?,
+            bloom: u(std::mem::size_of::<BloomUniform>())?,
+            shimmer: u(std::mem::size_of::<ShimmerUniform>())?,
+            tray: u(std::mem::size_of::<TrayUniform>())?,
+            crown: u(std::mem::size_of::<HdrGlowUniform>())?,
+            extract: None,
+            crown_stream: None,
+        })
+    }
+}
+
+/// Write `bytes` into an instance stream, growing it geometrically.
+fn upload_glow(
+    live: &GlArmLive,
+    slot: &mut Option<(GlBuffer, usize)>,
+    bytes: &[u8],
+) -> Result<(), String> {
+    if slot.as_ref().is_none_or(|(_, cap)| *cap < bytes.len()) {
+        let cap = bytes.len().next_power_of_two().max(256);
+        *slot = Some((live.dev.buffer(GlBufferRole::Instance, cap)?, cap));
+    }
+    let (buf, _) = slot.as_ref().expect("sized above");
+    live.dev.write_buffer(buf, bytes)
+}
+
+/// A resident window texture in the offscreen's format at `(w, h)` on the
+/// arm's device, re-minted when absent, resized, or from another device.
+fn ensure_offscreen_family(
+    live: &GlArmLive,
+    slot: &mut Option<GlTexture>,
+    (w, h): (u32, u32),
+) -> Result<bool, String> {
+    let fits = slot
+        .as_ref()
+        .is_some_and(|t| t.on(&live.dev) && (t.width, t.height) == (w, h));
+    if fits {
+        return Ok(false);
+    }
+    *slot = None;
+    let (format, alias) = offscreen_format(&live.dev);
+    *slot = Some(live.dev.texture_2d(format, w, h, alias)?);
+    Ok(true)
+}
+
+/// Where a GL present draws.
+#[derive(Clone, Copy)]
+pub(crate) enum GlDest<'a> {
+    /// A caller-held texture (the window stand-in, a throwaway).
+    Texture(&'a GlTexture),
+    /// The window's resident virtual target (`WindowGpu::gl_virtual_off`).
+    Virtual,
+}
+
+impl GpuRenderer {
+    /// The GL present body after the frame's encode: compose, effects, card,
+    /// blit and crown into `dest` at its size, then the taps' copies. Returns
+    /// whether the present copy was composed (the readback helper samples it).
+    /// `Err` names the failure; the trackers stay conservative.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the present tuple every arm carries; one transcript of the shared order"
+    )]
+    pub(crate) fn gl_compose_present(
+        &mut self,
+        win: &mut WindowGpu,
+        input: &RenderInput,
+        invert: bool,
+        overlay: Option<DropOverlay>,
+        tray: Option<TrayQuad<'_>>,
+        source_crop: Option<PresentCrop>,
+        (fw, fh): (u32, u32),
+        dest: GlDest<'_>,
+        translucent: bool,
+    ) -> Result<bool, String> {
+        let virtual_dims = win.gl_virtual_off.as_ref().map(|t| (t.width, t.height));
+        let (dw, dh) = match &dest {
+            GlDest::Texture(t) => (t.width, t.height),
+            GlDest::Virtual => virtual_dims.ok_or("the virtual target is absent")?,
+        };
+        // ---- Phase A: derivations off `self` and `win` --------------------
+        let PresentUniforms {
+            live_bg,
+            mut want,
+            run_hdr_glow,
+            run_sdr_glow,
+            crown_scissor,
+            crown,
+        } = self.present_uniforms(
+            win,
+            input,
+            invert,
+            overlay,
+            source_crop,
+            (fw, fh),
+            (dw, dh),
+            false,
+            translucent,
+            false,
+        );
+        let live = self.gl_arm.as_ref().ok_or("the GL arm is not minted")?;
+        // The blit samples the frame raw where the device keeps both views
+        // (the native plan), else decoded, which it re-encodes: the arm's own
+        // caps decide, whatever the context reported.
+        let raw = live.dev.caps().srgb_views;
+        want.encode_srgb = if raw { 0.0 } else { 1.0 };
+        let want_bloom = self.enable_bloom && !input.cursor_glow_add.is_empty();
+        let want_crown = run_hdr_glow || run_sdr_glow;
+        let bloom_glow = (want_bloom || want_crown).then(|| self.build_bloom_glow(input));
+        let bloom_state = bloom_glow.filter(|(count, _, _)| want_bloom && *count > 0);
+        let crown_count = if want_crown {
+            bloom_glow.map_or(0, |(n, _, _)| n)
+        } else {
+            0
+        };
+        let text_blend =
+            u32::from(self.cpu.text_blending() == aterm_render::TextBlending::LinearCorrected);
+        let shimmer_region = if self.shimmer_live(input) {
+            self.shimmer_region(input, fw, fh)
+        } else {
+            None
+        };
+        let shimmer_phase = self.shimmer_phase();
+        let (cell_w, cell_h) = self.cpu.cell_size();
+        let (band_y0, band_y1) = aterm_render::scroll_translate::grid_band_px(
+            self.cpu.grid_top(),
+            cell_h,
+            input.grid_top_row,
+            input.grid_bot_row,
+            fh as usize,
+        );
+        let band_shift = band_shift_ops(band_y0, band_y1, i64::from(input.scroll_frac_px));
+        let band_fx: Option<[u32; 4]> = band_shift.map(|_| [0, band_y0 as u32, fw, band_y1 as u32]);
+        let tray_fx: Option<[u32; 4]> = tray.as_ref().map(|t| {
+            [
+                t.dx.min(fw),
+                t.dy.min(fh),
+                t.dx.saturating_add(t.pw).min(fw),
+                t.dy.saturating_add(t.ph).min(fh),
+            ]
+        });
+        let apron_strip = match band_shift {
+            Some(_) => self.apron_strip_plan(win, input, fh as usize),
+            None => None,
+        };
+        let use_present_off = bloom_state.is_some()
+            || shimmer_region.is_some()
+            || tray.is_some()
+            || band_shift.is_some();
+
+        // ---- Phase B: residency ------------------------------------------
+        let live = self.gl_arm.as_mut().ok_or("the GL arm is not minted")?;
+        for row in [Pipeline::Blit, Pipeline::SdrGlow] {
+            live.ensure_pipeline(row)?;
+        }
+        if bloom_state.is_some() {
+            live.ensure_pipeline(Pipeline::GlowAdd)?;
+            live.ensure_pipeline(Pipeline::Bloom)?;
+        }
+        if shimmer_region.is_some() {
+            live.ensure_pipeline(Pipeline::Shimmer)?;
+        }
+        if tray.is_some() {
+            live.ensure_pipeline(Pipeline::Tray)?;
+        }
+        if run_hdr_glow {
+            // No f16 destination exists on GL; the gate keeps this off.
+            return Err("an EDR crown on a GL destination".to_owned());
+        }
+        if live.present.is_none() {
+            live.present = Some(GlPresentBufs::new(live)?);
+        }
+        let off_dims = win
+            .gl_offscreen
+            .as_ref()
+            .filter(|o| o.tex.on(&live.dev))
+            .map(|o| (o.w, o.h))
+            .ok_or("the armed frame's GL offscreen is absent")?;
+        debug_assert_eq!(off_dims, (fw, fh), "the present composes the encoded frame");
+        if use_present_off && ensure_offscreen_family(live, &mut win.gl_present_off, (fw, fh))? {
+            // A fresh copy holds undefined texels: copy the whole frame.
+            win.offscreen_dirty_since_sync = None;
+            win.present_offscreen_fx = None;
+        }
+        let (bw, bh) = ((fw / BLOOM_DOWNSCALE).max(1), (fh / BLOOM_DOWNSCALE).max(1));
+        if bloom_state.is_some() {
+            ensure_offscreen_family(live, &mut win.gl_bloom_half, (bw, bh))?;
+        }
+        if shimmer_region.is_some() {
+            ensure_offscreen_family(live, &mut win.gl_shimmer_scratch, (fw, fh))?;
+        }
+        if band_shift.is_some() {
+            ensure_offscreen_family(live, &mut win.gl_shift_scratch, (fw, fh))?;
+        }
+        let apron = match apron_strip {
+            Some(strip) => {
+                let fresh =
+                    ensure_offscreen_family(live, &mut win.gl_apron_tex, (strip.w, strip.cell_h))?;
+                if fresh || win.gl_apron_gen != win.apron_rgba_gen {
+                    let tex = win.gl_apron_tex.as_ref().expect("ensured above");
+                    live.dev.upload_rows(
+                        tex,
+                        0,
+                        strip.cell_h,
+                        &win.apron_rgba,
+                        strip.w * 4,
+                        strip.w,
+                    )?;
+                    win.gl_apron_gen = win.apron_rgba_gen;
+                }
+                Some(strip)
+            }
+            None => None,
+        };
+        if let Some(t) = tray.as_ref() {
+            let unchanged = win.gl_tray_card.as_ref().is_some_and(|c| {
+                c.tex.on(&live.dev) && c.w == t.pw && c.h == t.ph && c.pixels.as_slice() == t.rgba
+            });
+            if !unchanged {
+                let tex = live
+                    .dev
+                    .texture_2d(TexelFormat::Rgba8Unorm, t.pw, t.ph, None)?;
+                live.dev
+                    .upload_rows(&tex, 0, t.ph, t.rgba, t.pw * 4, t.pw)?;
+                self.tray_uploads += 1;
+                let mut pixels = win.gl_tray_card.take().map_or_else(Vec::new, |c| c.pixels);
+                pixels.clear();
+                pixels.extend_from_slice(t.rgba);
+                win.gl_tray_card = Some(gl_arm::GlTrayCard {
+                    tex,
+                    w: t.pw,
+                    h: t.ph,
+                    pixels,
+                });
+            }
+        }
+        // Uniforms and streams.
+        let mut bufs = live.present.take().expect("minted above");
+        let staged = (|| -> Result<(), String> {
+            live.dev
+                .write_buffer(&bufs.blit, aterm_bits::bytes_of(&want))?;
+            if let Some((count, _, extract_first)) = bloom_state {
+                let insts = &self.bloom_glow_scratch[extract_first as usize..][..count as usize];
+                upload_glow(live, &mut bufs.extract, aterm_bits::cast_slice(insts))?;
+                live.dev.write_buffer(
+                    &bufs.bloom_cell,
+                    aterm_bits::bytes_of(&Uniforms {
+                        screen: [fw as f32, fh as f32],
+                        text_blend: text_blend as f32,
+                        _pad: 0.0,
+                    }),
+                )?;
+                live.dev.write_buffer(
+                    &bufs.bloom,
+                    aterm_bits::bytes_of(&BloomUniform {
+                        texel: [1.0 / bw as f32, 1.0 / bh as f32],
+                        strength: self.bloom_strength,
+                        radius: self.bloom_radius,
+                        chroma_radius: bloom_chroma_radius(self.bloom_radius),
+                        _pad: [0.0; 3],
+                    }),
+                )?;
+            }
+            if let Some(region) = shimmer_region.as_ref() {
+                let mut heat = [[0f32; 4]; SHIMMER_BANDS / 4];
+                for (i, v) in region.heat.iter().enumerate() {
+                    heat[i / 4][i % 4] = *v;
+                }
+                live.dev.write_buffer(
+                    &bufs.shimmer,
+                    aterm_bits::bytes_of(&ShimmerUniform {
+                        frame: [fw as f32, fh as f32],
+                        region_min: [region.x0 as f32, region.y0 as f32],
+                        region_max: [region.x1 as f32, region.y1 as f32],
+                        hot_top: region.hot_top,
+                        rise: region.rise,
+                        amp: (cell_h as f32 / 18.0).clamp(0.75, SHIMMER_AMP_PX),
+                        period: (cell_h as f32).max(4.0),
+                        phase: shimmer_phase,
+                        band_x0: region.band_x0,
+                        band_w: region.band_w,
+                        rolloff: (cell_w as f32).max(1.0),
+                        _pad: [0.0; 2],
+                        heat,
+                    }),
+                )?;
+            }
+            if let Some(t) = tray.as_ref() {
+                live.dev.write_buffer(
+                    &bufs.tray,
+                    aterm_bits::bytes_of(&TrayUniform {
+                        rect: [t.dx as f32, t.dy as f32, t.pw as f32, t.ph as f32],
+                        fb: [fw as f32, fh as f32],
+                        _pad: [0.0, 0.0],
+                    }),
+                )?;
+            }
+            if let Some(hu) = crown.filter(|_| crown_count > 0) {
+                live.dev
+                    .write_buffer(&bufs.crown, aterm_bits::bytes_of(&hu))?;
+                let insts = &self.bloom_glow_scratch[..crown_count as usize];
+                upload_glow(live, &mut bufs.crown_stream, aterm_bits::cast_slice(insts))?;
+            }
+            Ok(())
+        })();
+        live.present = Some(bufs);
+        staged?;
+
+        // The bloom composite scissor (`encode_bloom_halo`'s spelling).
+        let bloom_scissor = bloom_state.and_then(|(_, bbox, _)| {
+            let clip = input.fx_clip.map(|(cx0, cy0, cx1, cy1)| {
+                [
+                    u32::from(cx0),
+                    u32::from(cy0),
+                    u32::from(cx1),
+                    u32::from(cy1),
+                ]
+            });
+            let scissor = if let Some([x0, y0, x1, y1]) = bbox {
+                let d =
+                    ((2.0 * self.bloom_radius + 1.0) * BLOOM_DOWNSCALE as f32).ceil() as u32 + 1;
+                Some([
+                    x0.saturating_sub(d),
+                    y0.saturating_sub(d),
+                    (x1 + d).min(fw),
+                    (y1 + d).min(fh),
+                ])
+            } else {
+                clip.map(|_| [0, 0, fw, fh])
+            };
+            match (scissor, clip) {
+                (Some([sx0, sy0, sx1, sy1]), Some([cx0, cy0, cx1, cy1])) => Some([
+                    sx0.max(cx0),
+                    sy0.max(cy0),
+                    sx1.min(cx1).min(fw),
+                    sy1.min(cy1).min(fh),
+                ]),
+                (s, None) => s,
+                (None, Some(_)) => unreachable!("clip-only case handled above"),
+            }
+            .filter(|[sx0, sy0, sx1, sy1]| sx1 > sx0 && sy1 > sy0)
+        });
+        let copy_rect = present_copy_rect(
+            win.offscreen_dirty_since_sync,
+            win.present_offscreen_fx,
+            (fw, fh),
+        );
+
+        // ---- Phase C: the encode -----------------------------------------
+        let live = self.gl_arm.as_ref().expect("checked above");
+        let bufs = live.present.as_ref().expect("restored above");
+        let pipe = |row: Pipeline| {
+            live.pipeline(row)
+                .unwrap_or_else(|| panic!("gl present: {row:?} ensured above"))
+        };
+        let nearest = live.nearest();
+        let linear = live.linear();
+        let off = &win.gl_offscreen.as_ref().expect("checked above").tex;
+        let present_off = use_present_off.then(|| win.gl_present_off.as_ref().expect("ensured"));
+        let composed = present_off.unwrap_or(off);
+        let dest_tex = match dest {
+            GlDest::Texture(t) => t,
+            GlDest::Virtual => win.gl_virtual_off.as_ref().expect("dims read above"),
+        };
+        let mut frame = GlFrame::begin(&live.dev)?;
+        // 1. Compose: the clean offscreen's stale rect onto the present copy.
+        if let Some(copy) = present_off {
+            let [x0, y0, x1, y1] = copy_rect;
+            if x1 > x0 && y1 > y0 {
+                frame.copy_rect(off, (x0, y0), copy, (x0, y0), x1 - x0, y1 - y0)?;
+            }
+        }
+        // 2. Bloom: extract into the cleared half target, then the screen
+        //    composite over the copy.
+        if let Some((count, _, _)) = bloom_state {
+            let half = win.gl_bloom_half.as_ref().expect("ensured above");
+            let (stream, _) = bufs.extract.as_ref().expect("uploaded above");
+            {
+                let mut pass = frame.begin_pass(
+                    half,
+                    false,
+                    crate::device_layer::FrameLoad::Clear(crate::device_layer::ClearColor4 {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 0.0,
+                    }),
+                    None,
+                    (
+                        &bufs.bloom_cell,
+                        Pipeline::GlowAdd
+                            .spec()
+                            .binds
+                            .vertex_uniform
+                            .expect("row 4 has a vertex uniform"),
+                    ),
+                )?;
+                pass.set_pipeline(pipe(Pipeline::GlowAdd));
+                pass.set_stream(stream);
+                pass.draw(6, count)?;
+            }
+            let binds = Pipeline::Bloom.spec().binds;
+            let mut pass = frame.begin_pass(
+                composed,
+                false,
+                crate::device_layer::FrameLoad::Load,
+                bloom_scissor.map(|[x0, y0, x1, y1]| (x0, y0, x1 - x0, y1 - y0)),
+                (&bufs.bloom, binds.fragment_buffers[0]),
+            )?;
+            pass.set_pipeline(pipe(Pipeline::Bloom));
+            pass.bind_texture(half, linear, binds.fragment_textures[0], raw);
+            pass.draw(3, 1)?;
+        }
+        // 3. Shimmer: stage the sample rect, then the scissored refract.
+        if let Some(region) = shimmer_region.as_ref() {
+            let scratch = win.gl_shimmer_scratch.as_ref().expect("ensured above");
+            let m = SHIMMER_COPY_MARGIN;
+            let [sx0, sy0, sx1, sy1] = [
+                region.x0.saturating_sub(m),
+                region.y0.saturating_sub(m),
+                region.x1.saturating_add(m).min(fw),
+                region.y1.saturating_add(m).min(fh),
+            ];
+            frame.copy_rect(
+                composed,
+                (sx0, sy0),
+                scratch,
+                (sx0, sy0),
+                sx1 - sx0,
+                sy1 - sy0,
+            )?;
+            let binds = Pipeline::Shimmer.spec().binds;
+            let mut pass = frame.begin_pass(
+                composed,
+                false,
+                crate::device_layer::FrameLoad::Load,
+                Some((
+                    region.x0,
+                    region.y0,
+                    region.x1 - region.x0,
+                    region.y1 - region.y0,
+                )),
+                (&bufs.shimmer, binds.fragment_buffers[0]),
+            )?;
+            pass.set_pipeline(pipe(Pipeline::Shimmer));
+            pass.bind_texture(scratch, linear, binds.fragment_textures[0], raw);
+            pass.draw(3, 1)?;
+        }
+        // 3b. The sub-row band shift over the copy, never the offscreen.
+        if let Some(shift) = band_shift {
+            let copy = present_off.ok_or("the band shift needs the present copy")?;
+            let scratch = win.gl_shift_scratch.as_ref().expect("ensured above");
+            frame.copy_rect(copy, (0, shift.src_y), scratch, (0, 0), fw, shift.moved)?;
+            frame.copy_rect(scratch, (0, 0), copy, (0, shift.dst_y), fw, shift.moved)?;
+        }
+        // 3c. The incoming row over the exposed strip.
+        if let Some(strip) = apron {
+            let copy = present_off.ok_or("the apron strip needs the present copy")?;
+            let tex = win.gl_apron_tex.as_ref().expect("ensured above");
+            let w = fw.min(tex.width);
+            let rows = strip
+                .rows
+                .min(tex.height)
+                .min(fh.saturating_sub(strip.dst_y));
+            if w > 0 && rows > 0 {
+                frame.copy_rect(tex, (0, 0), copy, (0, strip.dst_y), w, rows)?;
+            }
+        }
+        // 4. The card over the finished copy.
+        if tray.is_some() {
+            let card = win.gl_tray_card.as_ref().expect("ensured above");
+            let binds = Pipeline::Tray.spec().binds;
+            let mut pass = frame.begin_pass(
+                composed,
+                false,
+                crate::device_layer::FrameLoad::Load,
+                None,
+                (&bufs.tray, binds.vertex_uniform.expect("row 17 binds at 2")),
+            )?;
+            pass.set_pipeline(pipe(Pipeline::Tray));
+            pass.bind_texture(&card.tex, linear, binds.fragment_textures[0], false);
+            pass.draw(4, 1)?;
+        }
+        // 5. The blit pass: clear to the live background, the letterbox blit
+        //    over the whole destination, then the crown in the same pass.
+        {
+            let binds = Pipeline::Blit.spec().binds;
+            let clear = crate::device_layer::ClearColor4 {
+                r: f64::from((live_bg >> 16) & 0xff) / 255.0,
+                g: f64::from((live_bg >> 8) & 0xff) / 255.0,
+                b: f64::from(live_bg & 0xff) / 255.0,
+                a: 1.0,
+            };
+            let mut pass = frame.begin_pass(
+                dest_tex,
+                false,
+                crate::device_layer::FrameLoad::Clear(clear),
+                None,
+                (&bufs.blit, binds.fragment_buffers[0]),
+            )?;
+            pass.set_pipeline(pipe(Pipeline::Blit));
+            pass.bind_texture(composed, nearest, binds.fragment_textures[0], raw);
+            pass.draw(3, 1)?;
+            if run_sdr_glow
+                && crown_count > 0
+                && let Some(scissor) = crown_scissor
+                && let Some((stream, _)) = bufs.crown_stream.as_ref()
+            {
+                let crown_binds = Pipeline::SdrGlow.spec().binds;
+                pass.bind_uniform(
+                    &bufs.crown,
+                    crown_binds
+                        .vertex_uniform
+                        .expect("the crown rows bind a vertex uniform"),
+                );
+                pass.set_scissor(Some(scissor));
+                pass.set_pipeline(pipe(Pipeline::SdrGlow));
+                pass.set_stream(stream);
+                pass.draw(6, crown_count)?;
+            }
+        }
+        frame.submit()?;
+        // Bookkeeping after the encode: the copy now differs from the
+        // offscreen only where this present wrote over it.
+        if use_present_off {
+            let mut fx: Option<[u32; 4]> = Some([0, 0, 0, 0]);
+            fx = union_rect_opt(fx, bloom_scissor, (fw, fh));
+            if let Some(region) = shimmer_region.as_ref() {
+                fx = union_rect_opt(
+                    fx,
+                    Some([region.x0, region.y0, region.x1, region.y1]),
+                    (fw, fh),
+                );
+            }
+            for footprint in [band_fx, tray_fx].into_iter().flatten() {
+                fx = union_rect_opt(fx, Some(footprint), (fw, fh));
+            }
+            win.offscreen_dirty_since_sync = Some([0, 0, 0, 0]);
+            win.present_offscreen_fx = fx;
+        }
+        // The taps read the drawn destination back now.
+        if win.video.is_some() || win.presented_snapshot.is_some() {
+            let capture_color_space = win.capture_color_space();
+            let capture_sdr_white_scale = win.sdr_white_scale();
+            let dest_tex = match dest {
+                GlDest::Texture(t) => t,
+                GlDest::Virtual => win.gl_virtual_off.as_ref().expect("dims read above"),
+            };
+            let pixels =
+                live.dev
+                    .read_rgba8(dest_tex, dw, dh, crate::padded_bytes_per_row(dw as usize))?;
+            if let Some(tap) = win.video.as_mut() {
+                tap.gl_enqueue_frame(
+                    (dw, dh),
+                    &pixels,
+                    capture_color_space,
+                    capture_sdr_white_scale,
+                );
+            }
+            if let Some(tap) = win.presented_snapshot.as_mut() {
+                tap.gl_enqueue_frame(
+                    (dw, dh),
+                    &pixels,
+                    capture_color_space,
+                    capture_sdr_white_scale,
+                );
+            }
+        }
+        Ok(use_present_off)
+    }
+
+    /// The armed headless present: encode on GL, compose into the resident
+    /// virtual target at the destination size (opaque, as every arm's virtual
+    /// present is). Its bytes are what the tap ring and
+    /// `virtual_presented_snapshot_current` read.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the shared virtual-present seam's tuple"
+    )]
+    pub(crate) fn gl_present_virtual_with_crop(
+        &mut self,
+        win: &mut WindowGpu,
+        input: &RenderInput,
+        invert: bool,
+        overlay: Option<DropOverlay>,
+        tray: Option<TrayQuad<'_>>,
+        source_crop: Option<PresentCrop>,
+        effects_transport_shift_y: i32,
+        destination: (u32, u32),
+    ) -> Result<(), String> {
+        let source_crop = self
+            .resident_present_crop(input, source_crop)
+            .map_err(|()| "virtual present crop outside the resident frame")?;
+        let w = self.clamp_fb_dim(destination.0.max(1));
+        let h = self.clamp_fb_dim(destination.1.max(1));
+        let work_started = aterm_time::Instant::now();
+        let (fw, fh) = self.encode_present_frame(win, input);
+        if !self.last_frame_arm_gl {
+            return Err("the frame did not draw on the GL arm".to_owned());
+        }
+        win.resident_input_effects_transport_shift_y = effects_transport_shift_y;
+        if tray.is_none() {
+            win.gl_tray_card = None;
+        }
+        let live = self.gl_arm.as_ref().ok_or("the GL arm is not live")?;
+        let fits = win
+            .gl_virtual_off
+            .as_ref()
+            .is_some_and(|t| t.on(&live.dev) && (t.width, t.height) == (w, h));
+        if !fits {
+            win.gl_virtual_off = None;
+            win.gl_virtual_off = Some(live.dev.texture_2d(TexelFormat::Rgba8Unorm, w, h, None)?);
+            win.virtual_presented_input_epoch = 0;
+        }
+        self.gl_compose_present(
+            win,
+            input,
+            invert,
+            overlay,
+            tray,
+            source_crop,
+            (fw, fh),
+            GlDest::Virtual,
+            false,
+        )?;
+        win.virtual_presented_input_epoch = win.resident_input_epoch;
+        win.last_present_work_ns =
+            u64::try_from(work_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.gl_maybe_inject_loss();
+        Ok(())
+    }
+
+    /// The injected-loss drill's fire site (`gl_inject_loss_after`): counts
+    /// successful GL presents, and at zero arms the device so its next
+    /// `eglMakeCurrent` fails as a lost context's does. Announces itself on
+    /// stderr.
+    pub(crate) fn gl_maybe_inject_loss(&mut self) {
+        let Some(n) = self.gl_inject_loss_after.as_mut() else {
+            return;
+        };
+        if *n > 1 {
+            *n -= 1;
+            return;
+        }
+        self.gl_inject_loss_after = None;
+        let Some(live) = self.gl_arm.as_ref() else {
+            return;
+        };
+        live.dev.shared().inject_context_loss();
+        crate::stderr_line!(
+            "aterm-gpu: ATERM_GL_INJECT_LOSS fired; the GL device's next eglMakeCurrent \
+             reports EGL_CONTEXT_LOST (drill lever)"
+        );
+    }
+
+    /// Fire the injected-loss drill after `n` more successful GL presents, as
+    /// `ATERM_GL_INJECT_LOSS=<n>` does at construct. The oracle lane's loss
+    /// test (`gl_replay_tests`) drives it.
+    #[cfg(all(test, wgpu_arm))]
+    pub(crate) fn gl_inject_loss_after_for_test(&mut self, n: u64) {
+        self.gl_inject_loss_after = Some(n).filter(|n| *n > 0);
+    }
+
+    /// The armed present helper's readback (`present_input_readback`): a plain
+    /// frame reads the offscreen; an effect frame composes into a throwaway
+    /// destination and reads the present copy the blit sampled.
+    pub(crate) fn gl_present_readback(
+        &mut self,
+        win: &mut WindowGpu,
+        input: &RenderInput,
+        (w, h): (u32, u32),
+    ) -> Result<Frame, String> {
+        let effect_frame =
+            (self.enable_bloom && !input.cursor_glow_add.is_empty()) || self.shimmer_live(input);
+        if !effect_frame {
+            return self.gl_read_back_offscreen(win, w, h);
+        }
+        let live = self.gl_arm.as_ref().ok_or("the GL arm is not live")?;
+        let scratch = live.dev.texture_2d(TexelFormat::Rgba8Unorm, w, h, None)?;
+        let composed = self.gl_compose_present(
+            win,
+            input,
+            false,
+            None,
+            None,
+            None,
+            (w, h),
+            GlDest::Texture(&scratch),
+            false,
+        )?;
+        let live = self.gl_arm.as_ref().ok_or("the GL arm is not live")?;
+        let tex = if composed {
+            win.gl_present_off.as_ref().ok_or("no present copy")?
+        } else {
+            &win.gl_offscreen.as_ref().ok_or("no GL offscreen")?.tex
+        };
+        crate::device_layer::gl_try_read_back(&live.dev, tex, w, h)
+    }
+
+    /// The resident virtual destination's bytes, for
+    /// `virtual_presented_snapshot_current` (the caller checked the epoch).
+    pub(crate) fn gl_virtual_snapshot(
+        &self,
+        win: &WindowGpu,
+        t_us: u64,
+    ) -> Result<crate::video_tap::CapturedFrame, String> {
+        let live = self.gl_arm.as_ref().ok_or("the GL arm is not live")?;
+        let tex = win
+            .gl_virtual_off
+            .as_ref()
+            .filter(|t| t.on(&live.dev))
+            .ok_or("presented snapshot: no virtual destination has been presented")?;
+        let (w, h) = (tex.width, tex.height);
+        let rgba = live.dev.read_rgba8(tex, w, h, w as usize * 4)?;
+        Ok(crate::video_tap::CapturedFrame {
+            seq: 1,
+            t_us,
+            w,
+            h,
+            rgba,
+        })
+    }
+}
+
+/// The shipped Linux build's window presents: the GL arm owns the window's
+/// EGL surface (a build that also carries wgpu, Linux's `--features
+/// wgpu-oracle` lane, attaches windows on wgpu).
+#[cfg(not(wgpu_arm))]
+impl GpuRenderer {
+    /// Attach `target`'s window: the arm on the window system's display (minted
+    /// there, or minted again there if a headless frame came first), and an
+    /// EGL window surface at `width` x `height` (clamped like every
+    /// framebuffer). `Err` sends the frontend to the CPU renderer.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn gl_create_window_surface<W: WindowTarget>(
+        &mut self,
+        target: W,
+        width: u32,
+        height: u32,
+    ) -> Result<GpuSurface, String> {
+        use crate::gl::device::WindowSystem;
+        use crate::gl::surface::{GlWindowSurface, NativeWindow};
+        use aterm_types::native_window::NativeWindow as Handles;
+        if !self.gl_armed {
+            return Err(self.gl_start_error());
+        }
+        let (ws, native) = match target.native_window() {
+            Some(Handles::Xlib {
+                display,
+                screen,
+                window,
+                visual,
+            }) => (
+                WindowSystem::X11 {
+                    display: display.as_ptr() as usize,
+                    screen,
+                },
+                NativeWindow::X11 {
+                    window: u64::from(window),
+                    visual: (visual != 0).then_some(visual),
+                },
+            ),
+            Some(Handles::Wayland { display, surface }) => (
+                WindowSystem::Wayland {
+                    display: display.as_ptr() as usize,
+                },
+                NativeWindow::Wayland {
+                    surface: surface.as_ptr(),
+                },
+            ),
+            None => return Err("the window has no X11 or Wayland handles".to_owned()),
+        };
+        if self.gl_window_system.is_some_and(|have| have != ws) {
+            return Err("a second window system in one process".to_owned());
+        }
+        self.gl_window_system = Some(ws);
+        if !self.gl_arm_ready() {
+            return Err(self.gl_start_error());
+        }
+        let width = self.clamp_fb_dim(width.max(1));
+        let height = self.clamp_fb_dim(height.max(1));
+        let live = self.gl_arm.as_ref().expect("gl_arm_ready above");
+        let gs = GlWindowSurface::create(&live.dev, native, width, height, Box::new(target))?;
+        if crate::verbose() {
+            crate::stderr_line!(
+                "aterm-gpu: GL window surface, swap interval {}",
+                u32::from(gs.synced())
+            );
+        }
+        Ok(GpuSurface {
+            acquire_id: next_surface_acquire_id(),
+            neutral: NeutralSurfaceConfig {
+                width,
+                height,
+                format: TexelFormat::Rgba8Unorm,
+            },
+            supports_f16: false,
+            // Opaque presents only, as wgpu's Vulkan surfaces were on Linux
+            // (no post-multiplied composite there).
+            post_mult: false,
+            // The stand-in reads back, so the taps always have a source.
+            copyable: true,
+            gl: Some(gs),
+        })
+    }
+
+    /// The window present: encode on GL, compose into the surface's stand-in,
+    /// post it (`GlWindowSurface::present`: the flipped blit and the swap,
+    /// timed as the acquire wait, since a synchronized swap is where a GL
+    /// present waits for the display).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the shared swapchain seam's established tuple"
+    )]
+    pub(crate) fn gl_present_input_with_crop(
+        &mut self,
+        win: &mut WindowGpu,
+        surf: &mut GpuSurface,
+        input: &RenderInput,
+        invert: bool,
+        overlay: Option<DropOverlay>,
+        tray: Option<TrayQuad<'_>>,
+        source_crop: Option<PresentCrop>,
+        effects_transport_shift_y: i32,
+    ) -> Result<(), SurfacePresentFailure> {
+        let source_crop = self
+            .resident_present_crop(input, source_crop)
+            .map_err(|()| SurfacePresentFailure::Validation)?;
+        let Some(gs) = surf.gl.as_mut() else {
+            gl_arm_note("armed present refused: the window has no GL surface (re-attach it)");
+            return Err(SurfacePresentFailure::Validation);
+        };
+        if !self.gl_arm_ready() {
+            gl_arm_note("armed present refused: the GL arm is not live");
+            return Err(SurfacePresentFailure::Validation);
+        }
+        // The retained desire (`resize_surface`) is the surface's size.
+        gs.resize(surf.neutral.width, surf.neutral.height);
+        let work_started = aterm_time::Instant::now();
+        let (fw, fh) = self.encode_present_frame(win, input);
+        if !self.last_frame_arm_gl {
+            gl_arm_note("armed present dropped: the frame did not draw on the GL arm");
+            return Err(SurfacePresentFailure::Validation);
+        }
+        win.resident_input_effects_transport_shift_y = effects_transport_shift_y;
+        if tray.is_none() {
+            win.gl_tray_card = None;
+        }
+        // Translucency follows the opacity knob where the surface composites
+        // non-opaque content (`post_mult`, false on every GL surface today).
+        let translucent = self.cpu.background_opacity() < 1.0 && surf.post_mult;
+        let composed = (|| -> Result<(), String> {
+            let live = self.gl_arm.as_ref().ok_or("the GL arm is not live")?;
+            let standin = gs.standin(&live.dev)?;
+            self.gl_compose_present(
+                win,
+                input,
+                invert,
+                overlay,
+                tray,
+                source_crop,
+                (fw, fh),
+                GlDest::Texture(standin),
+                translucent,
+            )
+            .map(|_| ())
+        })();
+        if let Err(e) = composed {
+            gl_arm_note(&format!("armed present dropped: the compose failed ({e})"));
+            return Err(SurfacePresentFailure::Validation);
+        }
+        win.last_present_work_ns =
+            u64::try_from(work_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let live = self.gl_arm.as_ref().expect("checked above");
+        let posted = win.measure_surface_acquire(|| gs.present(&live.dev));
+        posted.map_err(|e| {
+            gl_arm_note(&format!("armed present: the post failed ({e})"));
+            SurfacePresentFailure::Validation
+        })?;
+        self.gl_maybe_inject_loss();
+        Ok(())
+    }
+
+    /// The error a caller returns when the arm cannot start: the mint
+    /// failure's cause when there was one.
+    pub(crate) fn gl_start_error(&self) -> String {
+        match &self.gl_mint_error {
+            Some(e) => format!("the GL renderer could not start: {e}"),
+            None => "the GL renderer could not start".to_owned(),
+        }
+    }
+}

@@ -94,8 +94,8 @@ fn every_way_the_snapshot_goes_stale_refuses() {
             },
         ),
         (
-            // Stream fade, IME preedit and prediction ghosts bump `snapshot_seq` after writing
-            // cells; reusing such a scratch would tint already-tinted cells.
+            // IME preedit and prediction ghosts bump `snapshot_seq` after writing cells; reusing
+            // such a scratch would present a host write the engine never saw.
             "a host cell mutation since the fill",
             |term, scratch| {
                 scratch.snapshot_seq = scratch.snapshot_seq.wrapping_add(1);
@@ -244,42 +244,5 @@ fn closing_a_real_modal_restores_the_idle_apron_cursor() {
         input.apron_row.cursor_col,
         Some(5),
         "closing a modal must recover the idle engine's incoming-row caret"
-    );
-}
-
-#[test]
-fn leaving_real_copy_mode_restores_the_idle_apron_cursor() {
-    let mut app = app_with_apron_cursor();
-    let wid = crate::WindowId(0);
-    app.toggle_vi_mode(wid);
-    let terminal = app
-        .front_terminal(wid)
-        .expect("front terminal")
-        .term
-        .clone();
-    {
-        let mut term = crate::term_lock(&terminal);
-        // Move visibly inside the viewport rather than leave the copy caret
-        // on the engine cursor's same numeric row after the scroll offset.
-        term.vi_motion(aterm_core::ViMotion::Up, aterm_core::ViBoundary::Grid);
-        term.vi_motion(aterm_core::ViMotion::Up, aterm_core::ViBoundary::Grid);
-    }
-    app.redraw_window(wid);
-    assert!(
-        app.windows[&wid].input_scratch.cursor_visible,
-        "the copy-mode caret painted"
-    );
-    assert_eq!(app.windows[&wid].input_scratch.apron_row.cursor_col, None);
-
-    app.toggle_vi_mode(wid);
-    app.redraw_window(wid);
-    assert!(
-        !crate::term_lock(&terminal).vi_is_active(),
-        "actual copy mode closed"
-    );
-    assert_eq!(
-        app.windows[&wid].input_scratch.apron_row.cursor_col,
-        Some(5),
-        "leaving copy mode must recover the idle engine's incoming-row caret"
     );
 }

@@ -69,8 +69,8 @@
 //! view and the reporters' sentence count
 //! ([`crate::message_reporters::sentence_lines`]). It re-exports the
 //! engine's `MessagesState`, `MessageView` and `tag_words` under the names
-//! they had here (ruling 385), and for its tests `MessageActionView` and
-//! `TAG_ORDER`; publishing the projection to Settings and
+//! they had here (ruling 385), and for its tests `MessageActionView`;
+//! publishing the projection to Settings and
 //! performing a page's press stay here, and the page's layout is
 //! `native_settings`'.
 
@@ -110,7 +110,7 @@ pub(crate) const MESSAGES_FLUSH_EXIT_WAIT: std::time::Duration =
 // the Settings page and its tests read on; the host answers the page's seam
 // ([`PageDesk`]).
 #[cfg(test)]
-pub(crate) use aterm_messages::page::{MessageActionView, TAG_ORDER};
+pub(crate) use aterm_messages::page::MessageActionView;
 pub(crate) use aterm_messages::page::{MessageView, MessagesState, tag_words};
 
 /// THE PAGE'S HOST SEAM on this host ([`page::Host`], design ruling 382):
@@ -210,13 +210,6 @@ pub(crate) struct HealthBannerVoice(());
 #[cfg(test)]
 thread_local! {
     static PTY_RESIZES_FOR_MESSAGES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-thread_local! {
-    /// The repaints `notice` asked for at once (`Paint::Now`) ON THIS THREAD —
-    /// the flood test's count (design ruling 170).
-    static WIRE_SYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -405,35 +398,32 @@ fn open_path_external(path: &str) -> bool {
     let Some(target) = admissible_log_path(path, &log_dir) else {
         return false;
     };
-    std::thread::Builder::new()
-        .name("aterm-open-path".into())
-        .spawn(move || {
-            // Nobody is blocked on the editor coming up: below the keystroke
-            // path, like every other one-shot spawn (`crate::qos`).
-            crate::qos::set_self(crate::qos::Role::Background);
-            #[cfg(target_os = "macos")]
-            let status = aterm_uds::spawnfd::command("/usr/bin/open")
-                .arg("-t")
-                .arg(&target)
-                .status();
-            #[cfg(target_os = "linux")]
-            let status = aterm_uds::spawnfd::command("xdg-open")
-                .arg(&target)
-                .status();
-            #[cfg(windows)]
-            let status = aterm_uds::spawnfd::command("notepad.exe")
-                .arg(&target)
-                .status();
-            #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-            let status: std::io::Result<std::process::ExitStatus> =
-                Err(std::io::Error::other("no opener on this platform"));
-            match status {
-                Ok(s) if s.success() => {}
-                Ok(s) => aterm_log::warn!("open {}: exited {s}", target.display()),
-                Err(error) => aterm_log::warn!("open {}: {error}", target.display()),
-            }
-        })
-        .is_ok()
+    crate::qos::spawn_lane_thread("aterm-open-path", crate::qos::Role::Background, move || {
+        // Nobody is blocked on the editor coming up: below the keystroke
+        // path, like every other one-shot spawn (`crate::qos`).
+        #[cfg(target_os = "macos")]
+        let status = aterm_uds::spawnfd::command("/usr/bin/open")
+            .arg("-t")
+            .arg(&target)
+            .status();
+        #[cfg(target_os = "linux")]
+        let status = aterm_uds::spawnfd::command("xdg-open")
+            .arg(&target)
+            .status();
+        #[cfg(windows)]
+        let status = aterm_uds::spawnfd::command("notepad.exe")
+            .arg(&target)
+            .status();
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+        let status: std::io::Result<std::process::ExitStatus> =
+            Err(std::io::Error::other("no opener on this platform"));
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(s) => aterm_log::warn!("open {}: exited {s}", target.display()),
+            Err(error) => aterm_log::warn!("open {}: {error}", target.display()),
+        }
+    })
+    .is_ok()
 }
 
 impl App {
@@ -707,7 +697,13 @@ impl App {
     /// The post itself, logged, with no settle: the callers above sync once
     /// for what they posted.
     fn post_unsynced(&mut self, msg: Message, stamp: WallStamp) -> MessageId {
-        let posted = self.messages.post(msg, stamp, Instant::now());
+        self.post_unsynced_at(msg, stamp, Instant::now())
+    }
+
+    /// [`Self::post_unsynced`] at the caller's instant: a post the settle makes
+    /// on its own clock ([`Self::show_owed_rows`]).
+    fn post_unsynced_at(&mut self, msg: Message, stamp: WallStamp, now: Instant) -> MessageId {
+        let posted = self.messages.post(msg, stamp, now);
         if let Some(live) = self.messages.live(posted.id) {
             aterm_log::info!("message {} {}: {}", posted.id, live.msg.tag, live.msg.title);
         }
@@ -828,10 +824,6 @@ impl App {
     /// afford and the rows its geometry reserves, re-grids between the two
     /// halves, and hands the drained lines to its writer.
     pub(crate) fn settle_messages(&mut self, now: Instant) -> bool {
-        // A strain row about to go stale is its episode's end, not a silence
-        // of its own (ruling 441 (u)): the episode folds first, and its row
-        // becomes the record.
-        self.strain_end_before_stale(now);
         // The digest's own clock (an entry a reporter stopped naming ends, an
         // aged one files itself): read here, on the loop's own sweep, so an
         // entry cannot outlive its cause because no second look came.
@@ -841,6 +833,9 @@ impl App {
         // ... and the facts that mend themselves, once one has outlasted its
         // horizon (a supervisor stopping for an hour, updates failing for a day).
         self.ripen_exceptions(now);
+        // A row said while no band was on screen, shown now that one is — before
+        // the commit, which reveals it.
+        self.show_owed_rows(now);
         let commit = self.band_commit(now);
         let step = drive::settle_and_commit(&mut self.messages, commit);
         let committed = self.regrid_message_band(step.regrid, now);
@@ -917,8 +912,8 @@ impl App {
 
     /// THE SEAMLESS PARENT'S ROWS THAT DID NOT CROSS (ruling 441 (d)): at
     /// Commit, before its last [`Self::flush_messages_log_within`], every live
-    /// row the park's carry did not take (an unrevealed row, the strain level,
-    /// a row posted since the park) retires as ended with this process
+    /// row the park's carry did not take (an unrevealed row, a row posted
+    /// since the park) retires as ended with this process
     /// ([`aterm_messages::MessageCenter::close_uncarried`]). Left open, the
     /// successor replayed each from the file as cut off by a crash (`still
     /// open when aterm stopped`, ruling 267), beside its reporter's re-post
@@ -1050,24 +1045,24 @@ impl App {
     /// source's fall re-grids a window back inside the settle (ruling 414,
     /// proposed).
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "ChromeRegrowFloor",
             action = "BandRise",
             project = "aterm_gui::chrome_regrow_conformance::project"
         )
     )]
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "ChromeRegrowFloor",
             action = "BandFall",
             project = "aterm_gui::chrome_regrow_conformance::project"
         )
     )]
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "ChromeRegrowFloor",
             action = "BandTaken",
             project = "aterm_gui::chrome_regrow_conformance::project"
@@ -1298,6 +1293,10 @@ impl App {
                 let route = crate::menu::privacy_settings_path_words(pane);
                 self.restate_message(id, route_words(opened, route));
                 if pane == crate::menu::PrivacyPane::FullDiskAccess {
+                    if opened {
+                        // aterm's panel, with its icon to drag, joins the page.
+                        self.fda_page_opened_by_owner(crate::devtools_helper::Origin::Digest);
+                    }
                     self.note_macos_access_settings_opened(now);
                 }
                 opened
@@ -1335,7 +1334,7 @@ impl App {
             // `End sessions` on the PTY keeper's recovery row: every shell
             // this launch reattached is hung up (`keeper_link`).
             Intent::EndRecovered => self.end_recovered_sessions() > 0,
-            // The strain row's navigation (rulings 243 and 247): the tab the
+            // A row's navigation to a tab (rulings 247 and 440): the tab the
             // title names, in the window it is in — the band is app-wide, so
             // the press may come from another window's band — raised.
             Intent::ShowTab { tab, window } => self.show_tab(WindowId(window), tab),
@@ -1350,19 +1349,13 @@ impl App {
             Intent::AgentUpgrade { tab, to, word } => {
                 self.upgrade_view
                     .offers(&tab, &to, word, crate::upgrade_host::now_s())
-                    && self.send_upgrade_word(crate::upgrade_host::WordAsk { tab, to, word })
-            }
-            // THE OWNER'S WORD ON AN AGENT'S ONE ROW (2026-09-28): the word
-            // for each tab the row named that still takes it, and the row
-            // answered once (`upgrade_host`).
-            Intent::AgentUpgradeTabs { word, moves } => {
-                self.send_upgrade_group_word(id, word, &moves)
+                    && self.send_upgrade_word(crate::upgrade_host::WordAsk::new(tab, to, word))
             }
         }
     }
 
-    /// `Show tab N` (rulings 243 and 247): tab `tab` (1-based) of window
-    /// `wid` — the window the strain row named, whichever window's band the
+    /// `Show tab N` (rulings 247 and 440): tab `tab` (1-based) of window
+    /// `wid` — the window the row named, whichever window's band the
     /// press came from — selected and its window raised (the
     /// [`Self::focus_session_window`] shape, de-miniaturize included).
     /// `false` when that window or that tab is gone.
@@ -1421,6 +1414,7 @@ impl App {
     /// [`Self::open_messages_entry`] from outside any window (a "To look at"
     /// line in the menu-bar item): the frontmost window, else the first.
     /// `false` when there is none to open it in.
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn open_messages_entry_anywhere(&mut self, id: u64) -> bool {
         let wid = self
             .frontmost_window
@@ -1586,8 +1580,6 @@ impl App {
             self.digest_moved();
         }
         if applied.paint == wire::Paint::Now {
-            #[cfg(test)]
-            WIRE_SYNCS.with(|c| c.set(c.get() + 1));
             self.sync_messages();
         }
         if applied.note {
@@ -2343,22 +2335,31 @@ impl App {
     /// so the words can take the family grammar and a warning an older build
     /// raised in its own words still heals.
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "native_update_carried_health",
             action = "Recover",
             project = "aterm_gui::messages_host::carried_health_conformance::project"
         )
     )]
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "native_update_carried_health",
             action = "Announce",
             project = "aterm_gui::messages_host::carried_health_conformance::project"
         )
     )]
     pub(crate) fn note_update_health(&mut self, title: &str, body: &str) -> bool {
+        // The Linux lane's wait for a start is no health warning of any kind.
+        if title == aterm_update::INSTALL_AWAITS_START_TITLE {
+            self.note_install_awaits_start(body);
+            return false;
+        }
+        if title == aterm_update::INSTALL_WAIT_OVER_TITLE {
+            self.end_install_awaits_start(body);
+            return false;
+        }
         if title == aterm_update::HEALTH_RECOVERED_TITLE {
             aterm_log::info!("update-health: {title}: {body}");
             let proof = HealthProof::healed_by_ledger(body);
@@ -2420,9 +2421,123 @@ impl App {
         // (`update.health.<kind>`); a failure of the same kind that has gone on
         // for a day is one dismissable line of the digest, under its own key
         // (`update.review.<kind>`).
-        self.post_message(msg);
+        self.post_message(msg.clone());
+        self.owe_unless_seen(msg);
         self.claim_update_health_entry(kind, body);
         true
+    }
+
+    /// AN INSTALLED LINUX EXECUTABLE WAITS FOR THE NEXT ATERM A PERSON STARTS
+    /// (`aterm_update::INSTALL_AWAITS_START_TITLE`; the review of
+    /// ATERM-KI-1015-2, U21) — a notice, never the install half's warning. The
+    /// install worked, and on Linux no lane starts an installed executable
+    /// inside a running aterm, so this wait is how every automatic install there
+    /// ends: "Couldn't install updates", and a day later "Updates are not
+    /// installing", were false. It latches no kind, claims no digest line and
+    /// owes no banner (the caller's `false`); it holds its 45 s and folds into
+    /// the record, and is shown once a band can show it
+    /// ([`Self::owe_unless_seen`]).
+    fn note_install_awaits_start(&mut self, body: &str) {
+        aterm_log::info!(
+            "update: {}: {body}",
+            aterm_update::INSTALL_AWAITS_START_TITLE
+        );
+        let msg = update_words::install_awaits_start(body);
+        self.post_message(msg.clone());
+        self.owe_unless_seen(msg);
+    }
+
+    /// The wait is over (`aterm_update::INSTALL_WAIT_OVER_TITLE`, `version` the
+    /// installed one): its notice leaves the band, withdrawn — what ended it, a
+    /// start or a rollback, is said by its own producer — and is owed no more.
+    fn end_install_awaits_start(&mut self, version: &str) {
+        aterm_log::info!(
+            "update: {}: {version}",
+            aterm_update::INSTALL_WAIT_OVER_TITLE
+        );
+        self.forget_owed(update_words::KEY_AWAITS_START);
+        if let Some(id) = self
+            .messages
+            .live_by_key(update_words::KEY_AWAITS_START)
+            .map(|l| l.id)
+        {
+            self.withdraw_message(id);
+        }
+    }
+
+    /// A ROW NOBODY COULD SEE IS OWED TO THE FIRST WINDOW THAT CAN SHOW IT
+    /// (ATERM-KI-1015-2, U37). Said while no window's band is on screen
+    /// ([`band_on_screen`]: every window minimized or covered, or none open),
+    /// the row held its 45 s and folded unseen — and an update-health warning's
+    /// latch kept its kind from being said again for the rest of the launch: a
+    /// stuck update was told to nobody. So the row is owed, by its key, in the
+    /// words it was said in, and the settle shows it once a band is on screen
+    /// ([`Self::show_owed_rows`]). A row owed already takes the new words. A
+    /// row with no key has nothing to be owed by.
+    fn owe_unless_seen(&mut self, msg: Message) {
+        let Some(key) = msg.key.clone() else {
+            return;
+        };
+        if let Some(owed) = self.rows_owed.iter_mut().find(|owed| owed.key == key) {
+            owed.msg = msg;
+        } else if !self.any_band_on_screen() {
+            self.rows_owed.push(OwedRow { key, msg });
+        }
+    }
+
+    /// The row owed under `key` ([`Self::owe_unless_seen`]), if any, takes
+    /// `msg`'s words: a re-wording owes nothing new.
+    fn reword_owed(&mut self, key: &str, msg: &Message) {
+        if let Some(owed) = self.rows_owed.iter_mut().find(|owed| owed.key == key) {
+            owed.msg = msg.clone();
+        }
+    }
+
+    /// Nothing is owed under `key` any more: what the row said was answered.
+    fn forget_owed(&mut self, key: &str) {
+        self.rows_owed.retain(|owed| owed.key != key);
+    }
+
+    /// Whether any window's band is on screen ([`band_on_screen`]).
+    fn any_band_on_screen(&self) -> bool {
+        self.windows.values().any(|ws| band_on_screen(ws))
+    }
+
+    /// The owed rows ([`Self::owe_unless_seen`]), shown at `now` once a band
+    /// is on screen: a row still live under the key takes its hold again from
+    /// here, so it is seen for the whole of it; one that folded unseen is
+    /// posted again in the words it is owed in. What answered a row since — an
+    /// update-health warning healed, the Linux wait over — forgot it
+    /// ([`Self::forget_owed`]). Asks nothing of the windows while nothing is
+    /// owed, so an idle settle stays free.
+    fn show_owed_rows(&mut self, now: Instant) {
+        if self.rows_owed.is_empty() || !self.any_band_on_screen() {
+            return;
+        }
+        for owed in std::mem::take(&mut self.rows_owed) {
+            let live: Vec<MessageId> = self
+                .messages
+                .live_rows()
+                .filter(|l| l.msg.key.as_deref() == Some(owed.key.as_str()))
+                .map(|l| l.id)
+                .collect();
+            if live.is_empty() {
+                aterm_log::info!(
+                    "message: said while no window was on screen, shown now: {}",
+                    owed.msg.title
+                );
+                self.post_unsynced_at(owed.msg, wall_stamp_now(), now);
+            } else {
+                let hold = Restatement {
+                    hold: Some(owed.msg.hold),
+                    ..Restatement::default()
+                };
+                for id in live {
+                    self.messages.restate(id, hold.clone(), now);
+                }
+                self.note_message_rule();
+            }
+        }
     }
 
     /// The digest line a failing `kind` owes once it has gone on for a day
@@ -2459,6 +2574,7 @@ impl App {
         for id in self.live_update_health(|live| live == kind) {
             restated |= self.restate_message(id, words.clone());
         }
+        self.reword_owed(kind.key(), &msg);
         self.remember_update_health_said(HealthSaid::of(kind, &msg, body));
         if !restated {
             self.record_message(msg);
@@ -2569,6 +2685,8 @@ impl App {
         answered: impl Fn(update_words::HealthKind) -> bool,
     ) {
         self.update_health_latched.retain(|kind| !answered(*kind));
+        self.rows_owed
+            .retain(|owed| !update_words::HealthKind::of_key(&owed.key).is_some_and(&answered));
         for id in self.live_update_health(&answered) {
             self.resolve_message(id, Outcome::Warn);
         }
@@ -3037,6 +3155,10 @@ impl App {
                 title: said.title.clone(),
                 line: said.line.clone(),
                 body: said.body.clone(),
+                owed: self
+                    .rows_owed
+                    .iter()
+                    .any(|owed| owed.key == said.kind.key()),
             })
             .collect()
     }
@@ -3175,6 +3297,7 @@ impl App {
             self.update_health_said.retain(|said| said.kind != kind);
             self.update_health_latched
                 .retain(|latched| *latched != kind);
+            self.forget_owed(kind.key());
             self.except_clear(&update_words::update_health_entry(kind, "").key());
             for id in self.live_update_health(|live| live == kind) {
                 self.messages.resolve(id, Outcome::Warn, now);
@@ -3197,8 +3320,8 @@ impl App {
     /// here: the row count is the carried one until Commit, and nothing paints
     /// yet. `finishing` is the running build's version.
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "native_update_carried_health",
             action = "Seed",
             project = "aterm_gui::messages_host::carried_health_conformance::project"
@@ -3359,21 +3482,39 @@ impl App {
     /// here records its healing against the parent's words — the landing for
     /// an install warning ([`Self::post_update_landed`]) — and each the landing
     /// does not answer is taken up by its producer here
-    /// ([`Self::take_up_carried_update_health`]). A kind this build does not
-    /// know is skipped, never guessed.
+    /// ([`Self::take_up_carried_update_health`]) and, when the parent said it
+    /// while no band was on screen (`CarriedHealthSaid::owed`), owed to this
+    /// process's windows. An install warning is only remembered: the landing
+    /// answers it, so it is neither taken up nor owed. A kind this build does
+    /// not know is skipped, never guessed.
     pub(crate) fn take_up_carried_health_said(
         &mut self,
         said: &[crate::session_store::CarriedHealthSaid],
     ) {
         for said in said {
             if let Some(kind) = update_words::HealthKind::of_key(&said.kind) {
+                let words = if said.body.is_empty() {
+                    &said.line
+                } else {
+                    &said.body
+                };
+                // A kind the landing answers (an install warning) is neither taken up
+                // nor owed: this process is an update's landing, and shown before it
+                // — on the cold lane's first settles, before the first present lands
+                // it; on a seamless lane under the freeze — the row would put a failure
+                // on the band that the landing is about to answer, and leave a second
+                // record of it beside the healing (the second review of U37).
                 if !HealthProof::Landed.answers(kind) {
-                    let words = if said.body.is_empty() {
-                        &said.line
-                    } else {
-                        &said.body
-                    };
                     self.take_up_carried_update_health(kind, &said.title, words);
+                    // Said while nobody could see it, and taken up here unsaid: still
+                    // owed, now to this process's windows (the review of U37).
+                    if said.owed {
+                        self.forget_owed(kind.key());
+                        self.rows_owed.push(OwedRow {
+                            key: kind.key().to_string(),
+                            msg: update_words::health_warning(kind, &said.title, words),
+                        });
+                    }
                 }
                 self.remember_update_health_said(HealthSaid {
                     kind,
@@ -3448,6 +3589,14 @@ impl App {
     }
 }
 
+/// A row said while no window's band was on screen ([`App::owe_unless_seen`]):
+/// the key it is owed by, and the words it is shown in once a band is.
+#[derive(Clone, Debug)]
+pub(crate) struct OwedRow {
+    key: String,
+    msg: Message,
+}
+
 /// What an update-health warning said ([`App::remember_update_health_said`]):
 /// its kind, the title and first line its record of healing is written
 /// against, and the sentence it was raised with, which its "To look at" line
@@ -3517,49 +3666,49 @@ pub(crate) mod carried_health_conformance;
 /// each waived with where it is bound instead.
 #[cfg(test)]
 mod carried_health_waivers {
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_carried_health",
         action = "LedgerHeals",
         reason = "The environment: a check of this process's or a sibling's clears the shared \
                   ledger's streak. The updater's half is aterm-update's persistent_notice_tests."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_carried_health",
         action = "LedgerFails",
         reason = "The environment: the shared ledger's check streak fails again."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_carried_health",
         action = "CheckCompletes",
         reason = "The environment: this process's checker thread completes a check, which the \
                   watchdog reads off the heartbeat; the conformance moves the beat's count."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_carried_health",
         action = "SeedRemembersOnly",
         reason = "The Buggy=1 mutant: the seed before finding 206, a carried warning kept with \
                   no healer; the negative control replays it on the real seed's remember-only \
                   branch (a title naming no ledger class)."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_carried_health",
         action = "SeedStallRemembersOnly",
         reason = "The Buggy=1 mutant: a carried stall kept with the watchdog unarmed; \
                   replayed on the real successor by the negative control."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_carried_health",
         action = "RecoverHealsStall",
         reason = "The Buggy=1 mutant: the ledger's healing read as `Checked`, which answers the \
                   stall; replayed on the real successor by the negative control."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_carried_health",
         action = "SeedForgetsEntry",
         reason = "The Buggy=1 mutant: the parent's pending digest claim lost at the handoff; \
                   replayed on the real successor by the negative control."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_carried_health",
         action = "StallHealKeepsEntry",
         reason = "The Buggy=1 mutant: the stall's heal before this change, its digest claim \

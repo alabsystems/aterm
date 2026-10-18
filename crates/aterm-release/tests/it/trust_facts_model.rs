@@ -5,7 +5,7 @@
 //! the one judge that reads them (FACTS, NOT VERDICTS, 2026-09-29; NO FLOOR EXCUSES,
 //! 2026-09-30), bound to the code that ships.
 //!
-//! The model (`aterm_spec::derive::trust_facts_reuse_model`) states the laws: a
+//! The model (`aterm_models_release::trust_facts_reuse_model`) states the laws: a
 //! VERIFIED answer is judged from facts measured on this tree (floors aside) with this
 //! prover, against these floors, every one held; a change to the floors alone finds the
 //! facts again; reused facts never verify a floor lowered without a new reason, or
@@ -13,7 +13,8 @@
 //! its own key. This file drives the REAL key (`trust_facts::tree_sans_floors`,
 //! `facts_key`, `prover_identity` over two prover directories whose trustc names the
 //! same commit), the REAL filing (`file_record`), the REAL re-measure fold
-//! (`remeasured`) and the REAL reader (`trust_report`, over `facts_for` and `judge`)
+//! (`remeasured`) and the REAL reader (`ship trust judge`, `trust_facts::run_cmd`, over
+//! `facts_for`, `judge` and `lowered_since_measured`)
 //! against real git and a real receipt store, projects every observed state onto the
 //! model's variables — the source, the floor, its prover column and its reason from the
 //! commit, the record, what it measured and the floor row of the commit it was measured
@@ -30,15 +31,15 @@
 //! the model refuses what each answers.
 
 use crate::trust_facts::{
-    self, Crate, Decision, Facts, Measured, Prover, RATCHET, TrustReport, Update, facts_for,
-    testing,
+    self, Crate, Decision, Facts, Measured, Prover, RATCHET, TrustCmd, Update, facts_for, testing,
 };
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use aterm_spec::derive::{Model, trust_facts_reuse_model};
+use aterm_models_release::trust_facts_reuse_model;
+use aterm_spec::derive::Model;
 use aterm_spec::interp::State;
 
 use crate::ledger::testing::Git;
@@ -433,16 +434,21 @@ impl Harness {
         }
     }
 
-    /// THE REAL READER on HEAD, as the transition it makes.
+    /// THE REAL READER on HEAD, as the transition it makes: `ship trust judge`,
+    /// which judges the facts filed under HEAD's key against the working floors
+    /// (HEAD's: the harness commits every write) and holds them to the up-only
+    /// rule against the floors the facts were measured with. Exit 0 is VERIFIED.
     fn assembled(&self) -> State {
         let head = self.head();
-        let report = trust_facts::trust_report(
-            &self.cli(),
-            &crate::gates::Stores::own(self.store()),
-            self.prover(),
-            &head,
-        )
-        .unwrap();
+        let judged = trust_facts::run_cmd(
+            &self.work,
+            TrustCmd::Judge {
+                commit: head.clone(),
+                prover: Some(self.prover().bin.clone()),
+                update: false,
+                reason: None,
+            },
+        );
         let found = facts_for(&self.cli(), &self.store(), self.prover(), &head).unwrap();
         let (found, used) = match found {
             Ok((facts, _)) => {
@@ -451,10 +457,7 @@ impl Harness {
             }
             Err(_) => (0, (0, 0, 0)),
         };
-        let verdict = match report {
-            TrustReport::Verified { .. } => 1,
-            TrustReport::Unverified { .. } => 2,
-        };
+        let verdict = if judged == 0 { 1 } else { 2 };
         self.with(&[
             ("asked", 1),
             ("found", found),

@@ -13,7 +13,9 @@
 //! Headless starts arm as `other`: only the installed app's `app` markers are reported as
 //! "killed" (unit-tested in `crash_signal::marker_tests` and `logging::tests`), so harness
 //! SIGKILLs like step 2 never reach the owner. Isolation is `support/launch_isolation.rs`'s;
-//! an instance that cannot start fails the test (`support/headless_boot.rs` `await_ready`).
+//! an instance that cannot start fails the test (`support/headless_boot.rs` `await_ready`, on
+//! the instance's own `--ready-fd` word), and an environment refusal named there (scratch, log,
+//! spawn, a refused bind) is COULD NOT RUN.
 
 #![cfg(unix)]
 #![allow(
@@ -60,7 +62,7 @@ impl Drop for Instance {
     }
 }
 
-fn world() -> Option<World> {
+fn world() -> World {
     let name = format!("atcm-{}", std::process::id());
     for base in [std::env::temp_dir(), PathBuf::from("/tmp")] {
         let root = base.join(&name);
@@ -68,11 +70,11 @@ fn world() -> Option<World> {
             continue;
         }
         if launch_isolation::prepare(&root).is_ok() {
-            return Some(World(root));
+            return World(root);
         }
         let _ = std::fs::remove_dir_all(&root);
     }
-    None
+    aterm_spec::host::could_not_run("no scratch base with a socket path short enough for sun_path")
 }
 
 /// The log dir `aterm_types::dirs::logs_dir` resolves under the scratch world.
@@ -84,17 +86,14 @@ fn logs_dir(root: &Path) -> PathBuf {
     }
 }
 
-/// Boot one headless instance on its own socket in `root`. `None` is a skip (a log or spawn
-/// refusal); an instance that exits or never listens panics (`headless_boot::await_ready`).
-fn boot(root: &Path, tag: &str) -> Option<Instance> {
+/// Boot one headless instance on its own socket in `root`. A log or spawn refusal is COULD NOT
+/// RUN; an instance that exits or never listens panics (`headless_boot::await_ready`).
+fn boot(root: &Path, tag: &str) -> Instance {
     let sock = root.join(format!("run/aterm/{tag}.sock"));
     let log_path = root.join(format!("{tag}.log"));
     let (out, err) = match std::fs::File::create(&log_path).and_then(|f| Ok((f.try_clone()?, f))) {
         Ok(pair) => pair,
-        Err(e) => {
-            eprintln!("SKIP: cannot open the instance log ({e})");
-            return None;
-        }
+        Err(e) => aterm_spec::host::could_not_run(format!("cannot open the instance log ({e})")),
     };
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
     launch_isolation::apply(&mut cmd, root);
@@ -105,21 +104,24 @@ fn boot(root: &Path, tag: &str) -> Option<Instance> {
         .stdout(out)
         .stderr(err);
     let lifeline = launch_isolation::lifeline(&mut cmd, root);
+    let mut ready = headless_boot::arm_ready(&mut cmd, root);
     let child = match cmd.spawn() {
         Ok(child) => child,
-        Err(e) => {
-            eprintln!("SKIP: cannot launch aterm --headless ({e})");
-            return None;
-        }
+        Err(e) => aterm_spec::host::could_not_run(format!("cannot launch aterm --headless ({e})")),
     };
     let mut instance = Instance {
         child,
         _lifeline: lifeline,
         sock,
     };
-    let sock = instance.sock.clone();
-    headless_boot::await_ready(&mut instance, |i| &mut i.child, &sock, &log_path, |_| true)
-        .then_some(instance)
+    headless_boot::await_ready(
+        &mut instance,
+        |i| &mut i.child,
+        &mut ready,
+        &log_path,
+        |_| true,
+    );
+    instance
 }
 
 /// The markers in the log dir armed by `pid`.
@@ -172,15 +174,10 @@ fn wait_until(what: &str, mut pred: impl FnMut() -> bool) {
 
 #[test]
 fn another_start_never_unlinks_a_live_marker_and_a_clean_exit_removes_its_own() {
-    let Some(world) = world() else {
-        eprintln!("SKIP: no scratch base with a short enough socket path");
-        return;
-    };
+    let world = world();
     let root = world.0.clone();
 
-    let Some(mut a) = boot(&root, "a") else {
-        return;
-    };
+    let mut a = boot(&root, "a");
     let a_pid = a.child.id();
     let a_marker = markers_of(&root, a_pid);
     assert_eq!(a_marker.len(), 1, "A armed one marker: {a_marker:?}");
@@ -190,9 +187,7 @@ fn another_start_never_unlinks_a_live_marker_and_a_clean_exit_removes_its_own() 
     );
 
     // 1. B's start sweeps the dir: A's live marker survives it.
-    let Some(mut b) = boot(&root, "b") else {
-        return;
-    };
+    let mut b = boot(&root, "b");
     let b_pid = b.child.id();
     assert_eq!(markers_of(&root, b_pid).len(), 1);
     assert_eq!(
@@ -209,7 +204,7 @@ fn another_start_never_unlinks_a_live_marker_and_a_clean_exit_removes_its_own() 
         1,
         "a SIGKILL runs no exit path"
     );
-    let Some(_c) = boot(&root, "c") else { return };
+    let _c = boot(&root, "c");
     assert!(
         markers_of(&root, b_pid).is_empty(),
         "C's sweep removed dead, not-news B's corpse"

@@ -33,7 +33,7 @@
 //! * the fabric-lost advisory — the bridge-loss sweep, on the fabric thread
 //!   (`fabric::bridge_lost`);
 //! * the restored agents that did not come back — the harness host's resume
-//!   attempts (`harness_host::say_restored_missed`).
+//!   attempts (`harness_host::say_restored`).
 //!
 //! A `Mutex<Vec<_>>` behind an `AtomicBool`, so the drain — which runs on
 //! EVERY park — is one atomic load (`Acquire`, pairing with the producer's
@@ -101,6 +101,17 @@ pub(crate) fn take_queued() -> Vec<InboxMessage> {
         .lock()
         .map(|mut q| std::mem::take(&mut *q))
         .unwrap_or_default()
+}
+
+/// THE INBOX ITSELF, HELD (tests only): a thread that queues a message
+/// meanwhile waits in [`queue_message`] until the guard drops — how a test
+/// holds a row's sayer in the middle of its say. Taken after
+/// [`lane_test_guard`], and dropped before anything that may panic.
+#[cfg(test)]
+pub(crate) fn hold_for_test() -> std::sync::MutexGuard<'static, Vec<InboxMessage>> {
+    INBOX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// SERIALIZE the lane across tests. The inbox is process-global by design (its

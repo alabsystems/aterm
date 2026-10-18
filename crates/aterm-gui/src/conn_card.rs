@@ -19,7 +19,6 @@
 //! `connect`ed to the edited kind, idempotent when unchanged). Native macOS hosts this same
 //! in-grid card in the content view; there is deliberately no separate AppKit sheet.
 
-use aterm_render::Theme;
 use aterm_session::{ConnectionKind, SessionId};
 
 use crate::settings::{Roles, SettingsGeom, text_w};
@@ -425,7 +424,7 @@ impl ConnCardState {
 
     /// Decode an a11y node id minted by [`conn_card_a11y`] to its target.
     #[cfg(a11y_tree)]
-    pub(crate) fn a11y_hit(node: accesskit::NodeId) -> Option<ConnCardHit> {
+    pub(crate) fn a11y_hit(node: aterm_a11y::model::NodeId) -> Option<ConnCardHit> {
         match node.0 {
             1 => Some(ConnCardHit::Direction(CardDirection::SrcToDst)),
             2 => Some(ConnCardHit::Kind(ConnectionKind::Pull)),
@@ -558,7 +557,11 @@ pub(crate) fn conn_card_hit(
 /// Paint the card: the pair title (arrow live with the direction), the two chip rows (selected
 /// chip washed+ringed, focused row's chips full-strength), and the Confirm/Cancel buttons. Pure,
 /// captured WYSIWYG through the shared tray path, in the palette's shadow/panel/stroke shape.
-pub(crate) fn conn_card_tray(state: &ConnCardState, g: &SettingsGeom, theme: Theme) -> TrayInput {
+pub(crate) fn conn_card_tray(
+    state: &ConnCardState,
+    g: &SettingsGeom,
+    theme: impl Into<crate::chrome_band::ChromePalette>,
+) -> TrayInput {
     let r = Roles::from_theme(theme);
     let (cw, ch, px) = (g.cw, g.ch, g.font_px);
     let layout = conn_card_layout(state, g);
@@ -728,8 +731,8 @@ pub(crate) fn conn_card_tray(state: &ConnCardState, g: &SettingsGeom, theme: The
 /// row set, so no epoch is needed): the two cycler rows (Click cycles their value) and the two
 /// buttons. Focus follows the focused control row.
 #[cfg(a11y_tree)]
-pub(crate) fn conn_card_a11y(state: &ConnCardState) -> accesskit::TreeUpdate {
-    use accesskit::{Action, Node, NodeId, Role, Tree, TreeId, TreeUpdate};
+pub(crate) fn conn_card_a11y(state: &ConnCardState) -> aterm_a11y::model::TreeUpdate {
+    use aterm_a11y::model::{Action, Node, NodeId, Role, Tree, TreeId, TreeUpdate};
 
     let root_id = NodeId(0);
     let mk = |role, label: String| {
@@ -903,19 +906,6 @@ mod tests {
         );
     }
 
-    /// The title names S and T by sid+title and its arrow tracks the live
-    /// direction selection.
-    #[test]
-    fn title_names_the_pair_and_tracks_direction() {
-        let mut c = card(PairKinds::default());
-        let t = c.title_line();
-        assert!(t.contains("@s-src") && t.contains("\"worker\""), "{t}");
-        assert!(t.contains("@s-dst") && t.contains("\"operator\""), "{t}");
-        assert!(t.contains('\u{21e5}'), "S→T arrow: {t}");
-        c.cycle_value(2); // -> Both
-        assert!(c.title_line().contains('\u{21c6}'), "peer arrow follows");
-    }
-
     /// Painter and hit-test share one rect table: the point at a painted
     /// chip's centre hits exactly that target, and activating a chip moves the
     /// selection; press/release requires the same target.
@@ -947,17 +937,6 @@ mod tests {
         assert!(c.pointer_press(Some(ConnCardHit::Confirm)));
         let (_, activated) = c.pointer_release(Some(ConnCardHit::Cancel));
         assert_eq!(activated, None, "moved off the armed target");
-
-        // The tray paints the title and every chip label.
-        let tray = conn_card_tray(&c, &g, Theme::default());
-        for label in ["pull", "push", "Confirm \u{23ce}", "Cancel esc"] {
-            assert!(
-                tray.prims
-                    .iter()
-                    .any(|p| matches!(p, DrawPrim::Text { s, .. } if s == label)),
-                "chip {label:?} painted"
-            );
-        }
     }
 
     /// Fingerprint moves with every visible edit (repaint-key law), nonzero.

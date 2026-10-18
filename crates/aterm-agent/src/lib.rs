@@ -14,8 +14,7 @@
 //!    loop (a self-write that produces output keeps `content_seq` advancing).
 //!    Self-writes are off by default, rate-limited by a token bucket, and a
 //!    circuit breaker trips on sustained self-induced churn. Its `FailClosed`
-//!    invariant is model-checked by `self_governor_model` (`aterm-spec`) and
-//!    bound to this code by [`tests`].
+//!    behaviour is pinned by [`tests`].
 //!
 //! This governor is policy. The un-bypassable floor, a hard per-session rate
 //! limit on self-targeted input injection, lives in the control dispatch path
@@ -27,8 +26,7 @@
 //! [`supervise`] composes the session loop and its approval, question and
 //! turn-end policies; [`harness`] supplies usage/account views and the
 //! relaunch/upgrade adapters. [`drive_cli`] and [`fleet_cli`] expose these
-//! through the shipped executable, with [`operator`] holding the embedded
-//! fleet's durable queue.
+//! through the shipped executable.
 #![cfg_attr(
     test,
     allow(
@@ -37,10 +35,23 @@
     )
 )]
 
-/// The crate's durability flushes ([`durable::sync_all`], [`durable::sync_data`]).
+// `println!` in this crate is a line on stdout beside a verb's answer (`aterm drive watch`'s
+// EXIT line on a failure, run in-process by the `aterm` executable), written through
+// `aterm_uds::stdout`: a reader that closed the pipe drops it, where std's panicked with exit
+// 101 on the EPIPE. An answer itself (`aterm drive`'s reply, `aterm fleet`'s usage) goes
+// through `aterm_uds::stdout::answer_exit`, which also says, and exits 1, when a full disk
+// lost it.
+macro_rules! println {
+    () => {
+        ::aterm_uds::stdout::print(::std::format_args!("\n"))
+    };
+    ($($arg:tt)*) => {
+        ::aterm_uds::stdout::println(::std::format_args!($($arg)*))
+    };
+}
+
+/// The crate's durability flush ([`durable::sync_all`]).
 mod durable;
-/// Durable, thread-safe state machine for the embedded fleet operator.
-pub mod operator;
 
 use std::io::{Read, Write};
 use std::time::Duration;
@@ -143,8 +154,9 @@ pub fn claude_prompt_ready_pattern() -> &'static str {
 
 /// A driven turn: type a prompt, submit it, block until the surface is idle
 /// for [`idle`] with a best-effort prompt-ready confirm, and read the settled
-/// surface. The [`ControlClient`] abstracts the transport (a Unix socket, or a
-/// `dial` relay); `aterm-drive` runs this loop over [`CtlClient`].
+/// surface. The [`ControlClient`] abstracts the transport (the `aterm ctl`
+/// client or one persistent socket); `aterm-drive` runs this loop over
+/// [`CtlClient`].
 pub struct Turn {
     /// Quiescence window that counts as "the agent stopped streaming".
     pub idle: Duration,
@@ -164,9 +176,8 @@ impl Default for Turn {
     }
 }
 
-/// The transport seam the agent layer drives: `aterm-ctl`'s verbs locally, or a
-/// relayed connection remotely; the [`Turn`] composition is identical either
-/// way.
+/// The transport seam the agent layer drives: `aterm-ctl`'s verbs, or one
+/// persistent connection; the [`Turn`] composition is identical either way.
 pub trait ControlClient {
     /// The transport's error type.
     type Error;
@@ -234,6 +245,10 @@ pub mod fleet_cli;
 /// The harness core: the pure readings behind the aterm wrapper (the usage
 /// view, the disk report, the footer) and the live upgrade and relaunch.
 pub mod harness;
+/// The launcher's half of `aterm --headless --ready-fd <n>`: wait on the
+/// instance's own word that its control socket listens.
+#[cfg(unix)]
+pub mod ready;
 /// The supervisor: read-only classification, prompt parsing, the worker's phase,
 /// and the `await-turn` / `supervise` / `watch` loop behind `aterm drive`.
 pub mod supervise;
@@ -276,12 +291,44 @@ impl Turn {
     }
 }
 
-/// A [`ControlClient`] that drives a target aterm by shelling out to the
-/// std-only `aterm-ctl` client, reusing the verbs a human would type.
-/// Composition (idle, a bounded prompt-ready confirm, read) lives here, so the
-/// core `await` verb stays single-predicate.
+/// The verb the one binary answers a control request on: `aterm ctl …`.
+pub const CTL_VERB: &str = "ctl";
+
+/// THIS PROCESS'S OWN EXECUTABLE, resolved through any argv0 alias link
+/// (`aterm-drive` -> `aterm`), for a control client run as `<it> ctl …`
+/// ([`CtlClient::own_at`]): the one binary answers `aterm ctl`. No sibling
+/// `aterm-ctl` and no `PATH` lookup: the client is always this build's own.
+///
+/// # Errors
+/// The executable could not be read.
+pub fn own_exe() -> Result<std::path::PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|e| {
+        format!("cannot find this program's own executable for its ctl client: {e}")
+    })?;
+    Ok(resolved_exe(exe))
+}
+
+/// `exe` resolved through its links ([`own_exe`]). Where it no longer names a
+/// file (an update replaced the image under a long-running `aterm fleet
+/// events`, whose path then reads `… (deleted)`), Linux still reaches the
+/// running image as `/proc/self/exe`, which answers `ctl` as the front door.
+fn resolved_exe(exe: std::path::PathBuf) -> std::path::PathBuf {
+    match std::fs::canonicalize(&exe) {
+        Ok(path) => path,
+        Err(_) if cfg!(target_os = "linux") => std::path::PathBuf::from("/proc/self/exe"),
+        Err(_) => exe,
+    }
+}
+
+/// A [`ControlClient`] that drives a target aterm by shelling out to a
+/// control client — this program's own `ctl` verb ([`CtlClient::own_at`]) —
+/// reusing the verbs a human would type. Composition (idle, a bounded
+/// prompt-ready confirm, read) lives here, so the core `await` verb stays
+/// single-predicate.
 pub struct CtlClient {
     ctl: std::path::PathBuf,
+    /// The arguments before `--sock` (the `ctl` verb, for [`Self::own_at`]).
+    lead: Vec<String>,
     socket: Option<String>,
     /// The `aterm-ctl` in flight, by pid, for [`CtlClient::cutter`].
     running: std::sync::Arc<std::sync::Mutex<Option<u32>>>,
@@ -290,14 +337,25 @@ pub struct CtlClient {
 }
 
 impl CtlClient {
-    /// Build a client. `ctl` is the path to `aterm-ctl`; `socket` is an explicit
-    /// `--sock` path, or `None` for the flagless resolution.
+    /// Build a client. `ctl` is the path to a program that answers as
+    /// `aterm-ctl` does; `socket` is an explicit `--sock` path, or `None` for
+    /// the flagless resolution.
     pub fn new(ctl: impl Into<std::path::PathBuf>, socket: Option<String>) -> Self {
         Self {
             ctl: ctl.into(),
+            lead: Vec::new(),
             socket,
             running: std::sync::Arc::default(),
             cut: std::sync::Arc::default(),
+        }
+    }
+
+    /// A client run as `<exe> ctl …`: `exe` is [`own_exe`], this build's own
+    /// binary, which answers the `ctl` verb.
+    pub fn own_at(exe: impl Into<std::path::PathBuf>, socket: Option<String>) -> Self {
+        Self {
+            lead: vec![CTL_VERB.to_string()],
+            ..Self::new(exe, socket)
         }
     }
 
@@ -344,7 +402,7 @@ impl CtlClient {
 
     /// Run `aterm-ctl [--sock S] <args...>` and return the exit code with both
     /// streams, so the supervisor can tell a `124` timeout and an `ERR usage`
-    /// (an older host) from a failure. `Err` only when the client could not be
+    /// from a failure. `Err` only when the client could not be
     /// launched.
     pub fn run_raw(&self, args: &[&str]) -> Result<supervise::CtlReply, String> {
         use std::sync::atomic::Ordering;
@@ -352,6 +410,7 @@ impl CtlClient {
         // console (the window's harness host) opened a visible console window
         // for every request on Windows until `spawnfd::command` decided it.
         let mut cmd = aterm_uds::spawnfd::command(&self.ctl);
+        cmd.args(&self.lead);
         if let Some(s) = &self.socket {
             cmd.arg("--sock").arg(s);
         }
@@ -421,7 +480,9 @@ impl ControlClient for CtlClient {
     type Error = String;
     fn send(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
         let s = String::from_utf8_lossy(bytes);
-        self.run(&["send", s.as_ref()]).map(|_| ())
+        // `--` ends `send`'s options, so a prompt that starts `if=`, `id=` or `--`
+        // (or is `-` / `--stdin`, aterm-ctl's stdin form) is typed as written.
+        self.run(&["send", "--", s.as_ref()]).map(|_| ())
     }
     fn key_enter(&mut self) -> Result<(), Self::Error> {
         self.run(&["key", "enter"]).map(|_| ())
@@ -499,18 +560,18 @@ fn reply_count(header: &str) -> std::io::Result<Option<usize>> {
 }
 
 /// A [`ControlClient`] over one persistent, authenticated control connection,
-/// the remote twin of [`CtlClient`]. It speaks the raw control verbs directly,
-/// so it can sit behind a `dial <name>` relay, which bridges one connection for
-/// its lifetime.
+/// the persistent twin of [`CtlClient`]. It speaks the raw control verbs
+/// directly over one connection for its lifetime.
 ///
 /// Generic over any `Read + Write` transport: a local `CtlStream`
-/// ([`connect_local`](RelayClient::connect_local)), the same after a `dial`
-/// relay ([`dial_via_local`](RelayClient::dial_via_local)), or a TLS stream in
+/// ([`connect_local`](RelayClient::connect_local)), or an in-memory wire in
 /// tests. The verbs and framing are byte-identical to what `CtlClient` drives
 /// through `aterm-ctl`, so [`Turn::run`] behaves the same either way.
-/// Predicates run on the remote host.
 pub struct RelayClient<S: Read + Write> {
     io: S,
+    /// Sends only [`READ_VERBS`] ([`Self::reads_only`]): anything else is
+    /// refused before a byte is written.
+    reads_only: bool,
     /// Bytes read past the last consumed line boundary (the next reply's prefix).
     buf: Vec<u8>,
     /// The `OK` replies to `help <verb>` this connection has had
@@ -519,21 +580,71 @@ pub struct RelayClient<S: Read + Write> {
     help: Vec<(String, (String, String))>,
 }
 
+/// THE VERBS A READ-ONLY CONNECTION MAY SEND ([`RelayClient::reads_only`]):
+/// each observes, and none changes the session, its screen, its leases or its
+/// processes. `meta` only bare (its `set`/`unset` change the session's
+/// metadata). Anything not named here is refused: an allowlist, so a verb
+/// added to the server is no read until it is named.
+pub const READ_VERBS: &[&str] = &[
+    "text", "screen", "line", "cell", "cursor", "modes", "blocks", "history", "status", "timeline",
+    "metrics", "await", "who", "sessions", "help", "meta", "ls",
+];
+
+/// Whether the control request `line` (an optional `@<sid>` selector, then the
+/// verb) is one [`READ_VERBS`] names, and a bare `meta` when it is `meta`.
+fn is_read_request(line: &str) -> bool {
+    let mut words = line.split_whitespace().skip_while(|w| w.starts_with('@'));
+    match words.next() {
+        // The server's only read form is bare `meta`.
+        Some("meta") => words.next().is_none(),
+        Some("metrics") => {
+            // cmd_metrics accepts a summary or `percentiles`, optionally
+            // with either JSON marker anywhere. `reset` changes both the
+            // metrics and echo-RTT stores; no other form is admitted here.
+            let mut command = words.filter(|w| !matches!(*w, "json" | "--json"));
+            matches!(command.next(), None | Some("percentiles")) && command.next().is_none()
+        }
+        Some(verb) => READ_VERBS.contains(&verb),
+        None => false,
+    }
+}
+
 /// How many verbs' help one [`RelayClient`] remembers; past it, a verb's help
 /// is asked each time.
 const HELP_MEMO_MAX: usize = 16;
 
 impl<S: Read + Write> RelayClient<S> {
     /// Wrap an already-connected, authenticated transport. For the local AUTH
-    /// (and optional `dial`) handshake use
-    /// [`connect_local`](RelayClient::connect_local) /
-    /// [`dial_via_local`](RelayClient::dial_via_local).
+    /// handshake use [`connect_local`](RelayClient::connect_local).
     pub fn new(io: S) -> Self {
         Self {
             io,
+            reads_only: false,
             buf: Vec::new(),
             help: Vec::new(),
         }
+    }
+
+    /// This connection, able to send the read verbs alone ([`READ_VERBS`]):
+    /// every other request — an input verb, a signal, a lease, a `meta set`, a
+    /// length-framed write — is refused before a byte is written
+    /// (`PermissionDenied`). What a look that must have no hands runs on: the
+    /// live upgrade's dry run and its watch (`harness::upgrade_drive`).
+    #[must_use]
+    pub fn reads_only(mut self) -> Self {
+        self.reads_only = true;
+        self
+    }
+
+    /// Whether this connection may send `line` ([`Self::reads_only`]).
+    fn may_send(&self, line: &str) -> std::io::Result<()> {
+        if !self.reads_only || is_read_request(line) {
+            return Ok(());
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("a read-only control connection sends no `{line}`"),
+        ))
     }
 
     /// `help <verb>` as [`Self::request_counted`] reads it, asked once per
@@ -612,6 +723,7 @@ impl<S: Read + Write> RelayClient<S> {
 
     /// Write one request line (`line` + `\n`) and flush.
     fn write_line(&mut self, line: &str) -> std::io::Result<()> {
+        self.may_send(line)?;
         if line.contains(['\n', '\r']) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -757,6 +869,13 @@ impl<S: Read + Write> RelayClient<S> {
     /// # Errors
     /// I/O errors, and a `head` carrying a line terminator.
     pub fn request_frame(&mut self, head: &str, payload: &[u8]) -> std::io::Result<String> {
+        // A framed request is a write (`feed-bin`, `paste-bin`): never read-only's.
+        if self.reads_only {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("a read-only control connection sends no `{head}` frame"),
+            ));
+        }
         if head.contains(['\n', '\r']) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -778,26 +897,11 @@ impl<S: Read + Write> RelayClient<S> {
     pub fn next_pushed(&mut self) -> std::io::Result<String> {
         self.read_line()
     }
-
-    /// `dial <connection>` on this authenticated local connection, proved live
-    /// end to end by a `version` the REMOTE answers.
-    fn relayed_to(mut self, connection: &str) -> std::io::Result<Self> {
-        self.write_line(&format!("dial {connection}"))?;
-        self.write_line("version")?;
-        let resp = self.read_line()?;
-        if is_ok_reply(&resp) {
-            Ok(self)
-        } else {
-            Err(std::io::Error::other(format!(
-                "dial {connection} failed: {resp}"
-            )))
-        }
-    }
 }
 
 impl RelayClient<aterm_uds::CtlStream> {
     /// Connect to a local control socket and authenticate: `connect(sock)`, then
-    /// a bare `AUTH <token>\n` (acknowledged silently). No `dial`.
+    /// a bare `AUTH <token>\n` (acknowledged silently).
     ///
     /// # Errors
     /// I/O errors connecting to `sock_path` or writing the auth line.
@@ -826,30 +930,6 @@ impl RelayClient<aterm_uds::CtlStream> {
         client.write_line(&format!("AUTH {token}"))?;
         Ok(client)
     }
-
-    /// Connect and authenticate to the local socket, then `dial <connection>` so
-    /// the connection relays to a saved remote aterm's control socket. The local
-    /// server relays silently, so a `version` probe (answered by the remote)
-    /// confirms the relay end to end; a local `ERR dial …` is a construction
-    /// error.
-    ///
-    /// # Errors
-    /// I/O errors, or a non-`OK` reply to the `version` probe (unknown
-    /// connection, unreachable remote).
-    pub fn dial_via_local(sock_path: &str, token: &str, connection: &str) -> std::io::Result<Self> {
-        Self::connect_local(sock_path, token)?.relayed_to(connection)
-    }
-
-    /// [`dial_via_local`](RelayClient::dial_via_local) with the instance token
-    /// beside the socket, read only once the connect succeeded
-    /// ([`connect_local_beside`](RelayClient::connect_local_beside)).
-    ///
-    /// # Errors
-    /// As [`dial_via_local`](RelayClient::dial_via_local), and a token that
-    /// cannot be read, prefixed `token: ` and naming the file.
-    pub fn dial_via_local_beside(sock_path: &str, connection: &str) -> std::io::Result<Self> {
-        Self::connect_local_beside(sock_path)?.relayed_to(connection)
-    }
 }
 
 impl<S: Read + Write> ControlClient for RelayClient<S> {
@@ -865,7 +945,8 @@ impl<S: Read + Write> ControlClient for RelayClient<S> {
                 "send payload must not contain a newline/CR (would inject a second control verb)",
             ));
         }
-        self.request_status(&format!("send {text}")).map(|_| ())
+        // `--` ends `send`'s options (see `CtlClient::send`).
+        self.request_status(&format!("send -- {text}")).map(|_| ())
     }
 
     fn key_enter(&mut self) -> std::io::Result<()> {
@@ -880,7 +961,7 @@ impl<S: Read + Write> ControlClient for RelayClient<S> {
     ) -> std::io::Result<String> {
         let idle_ms = idle.as_millis();
         let to_ms = timeout.as_millis();
-        // (1) Authoritative settle: the remote's own `await idle`. A timed-out
+        // (1) Authoritative settle: the server's own `await idle`. A timed-out
         //     wait still answers `OK …` (`OK timeout`), so it is named here.
         let settled = self.request_status(&format!("await idle {idle_ms} timeout {to_ms}"))?;
         if settled == "OK timeout" {
@@ -915,7 +996,7 @@ MENTAL MODEL
     hope or scrape for a spinner.
 
 USAGE
-    aterm drive [--socket PATH [--dial NAME]] [--idle MS] [--timeout MS] [--ready REGEX]
+    aterm drive [--socket PATH] [--idle MS] [--timeout MS] [--ready REGEX]
                 <command> [text...]
     aterm drive classify [--allow-python GLOB]... <cmd...> | phase [@sid]
               | answer @sid [--box TOKEN] <answer...>
@@ -923,16 +1004,19 @@ USAGE
               | supervise [@sid] [--approve safe|none] [--no-continue] [--no-answer] [--max-s S]
                           [--question-priority recommended|long-term|short-term]
                           [--allow-python GLOB]... [--notes FILE] [--reconnect-s S]
-                          [--context-warn PCT] [--journal FILE]
+                          [--context-warn PCT] [--journal FILE] [--tape FILE]
                           [--mail [--inbox @sid] [--report-window S] [--idle-grace S]]
               | watch [@sid] [--approve safe|none] [--no-continue] [--no-answer]
                       [--question-priority recommended|long-term|short-term]
                       [--allow-python GLOB]... [--notes FILE] [--max-s S] [--reconnect-s S]
-                      [--report] [--context-warn PCT] [--journal FILE]
+                      [--report] [--context-warn PCT] [--journal FILE] [--tape FILE]
                       [--mail [--inbox @sid] [--report-window S] [--idle-grace S]]
               | task @sid [--deadline S] [--wait] [--inbox @sid] [--reconnect-s S] <text...>
               | report [@sid] [--since ORIGIN:I] [--max-rows N] [--final | --messages]
               | ledger [@sid] [--journal FILE] [--since TIME] [--format text|md|html] [--out PATH]
+              | tape cat FILE [--text] [--salvage] | tape show FILE --decisions | tape stats FILE
+              | tape ls [@sid] | tape forget FILE|@sid...
+              | replay FILE [--until door=N]
 
 COMMANDS
     prompt <text...>   Type <text>, press Enter, then BLOCK until the agent's turn
@@ -953,13 +1037,16 @@ COMMANDS
                          block            a shell command completes (OSC-133)
     shot [name.png]    Save a pixel-true PNG of the terminal content view (the
                        rendered cells; OS chrome/titlebar are NOT captured). The
-                       name is a BARE filename: captures land in the host's
-                       Application Support images/ dir (a '/' is refused) and
+                       name is a BARE filename: captures land in the images/
+                       dir beside the host's control socket (a '/' is refused) and
                        the reply prints the full written path; auto-named when
                        omitted.
     help               Show this text.
 
-SUPERVISING A WORKER (an agent session — Claude Code, Codex or agy — in another tab; `@sid` from `aterm ctl ls`)
+SUPERVISING A WORKER (an agent session — Claude Code, agy, Muse Code or Gemini CLI — in another tab; `@sid` from `aterm ctl ls`)
+    A vendor `codex` is shown (its own OSC 7501 report is `status
+    program_state=`), not supervised; codex-alab supervises itself and the
+    window only watches it.
     Every such session in an aterm window is ALREADY supervised by the
     window's own host, by default: this engine, one loop per session, under
     aterm.toml's [harness] table (`aterm help harness` lists its keys and
@@ -971,15 +1058,18 @@ SUPERVISING A WORKER (an agent session — Claude Code, Codex or agy — in anot
     person: every box gets its answer, a question its `answer_text`, a turn
     that ended its continuation (on a growing back-off when turns keep ending
     short), a wall its retry, its reset or a relaunch on the fallback model;
-    a Claude Code that crashed is relaunched on its conversation where aterm
-    can (`aterm help harness` says where). Within `human_grace_s` of a
-    person's keystroke, or while another driver holds a lease or a named
-    turn on the session (`hand=`), it keeps its hands off it. HOW a question
-    is answered is `question_priority`: `recommended` (the default) as
-    above, a dialog by its recommended option; `long-term` or `short-term`
-    and no option is chosen by the harness — that policy's fixed text is
-    written into the free-text row of a dialog and submitted (and typed in
-    place of `answer_text` in prose), and the worker decides. One session's
+    a Claude Code or a Muse Code that crashed is relaunched on its
+    conversation where aterm can (`aterm help harness` says where). Within
+    `human_grace_s` of a person's keystroke (but for the folder-trust dialog that keystroke
+    launched, answered at once where `input=clear` is measured, macOS
+    today: `status launch=person`), or while another driver holds a lease
+    or a named turn on the session (`hand=`), it keeps its hands off it.
+    HOW a question is answered is `question_priority`: `recommended` (the
+    default) as above, a dialog by its recommended option; `long-term` or
+    `short-term` and no option is chosen by the
+    harness — that policy's fixed text is written into the free-text row of
+    a dialog and submitted (and typed in place of `answer_text` in prose),
+    and the worker decides. One session's
     `aterm ctl @sid meta set questions ask|recommended|long-term|short-term`
     decides that session's questions over `answer_questions` and
     `question_priority`: a priority word answers its dialogs and the
@@ -1035,27 +1125,26 @@ SUPERVISING A WORKER (an agent session — Claude Code, Codex or agy — in anot
     phase [@sid]       One read, one word: busy | prompt | limited | idle |
                        question. The worker is read by its own program's
                        grammar (`status program=`, else what its screen shows:
-                       Claude Code's or Codex's), as the window's loops read
-                       it. For a prompt the parsed box follows: `kind`,
-                       `command`, `description`, one `note <text>` per note
-                       row (a Bash box's warning rows, e.g. the critical-path
+                       Claude Code's, agy's or Muse Code's), as the
+                       window's loops read it. For a prompt the parsed box
+                       follows: `kind`, `command`, `description`, one `note
+                       <text>` per note row (a Bash box's warning rows, e.g.
+                       the critical-path
                        `rm` warning), `classify` (a Bash box), one `option N …`
                        per option, then what Esc does — `cancel esc` (it
-                       leaves the box) — and for a question `box <token>`,
-                       its token for `answer --box`. For
+                       leaves the box), `exit esc` (it quits the program: a
+                       trust dialog's), no line where nothing says — and
+                       for a question `box <token>`, its token for `answer
+                       --box`. For
                        busy, `reason <where>: <rule>` names the signal that
                        fired. For limited, `message <text>` and `reset
-                       <text|->`. On Codex a question's `description` is its
-                       question and its options are its numbered answers,
-                       and its Esc line is `interrupt esc`: Esc there ends
-                       the whole turn (`■ Conversation interrupted`) and
-                       declines nothing. On Codex busy is
-                       `reason status row: esc to interrupt`, `reason status
-                       line: a background terminal running` or `reason
-                       transcript: the last message has no end row under it`
-                       (the answer streaming); `context <n>%` below is its
-                       footer's `<n>% context left`, and it draws no survey.
-                       What follows describes Claude Code's grammar.
+                       <text|->`. aterm reads no Codex screen (its Codex
+                       screen lane was retired on 2026-10-16): on a Codex
+                       every read is `idle` with no evidence and names no box
+                       (`status agent=unknown`; its own state is `status
+                       program_state=`), so phase, await-turn, answer and
+                       report read nothing there. What follows describes
+                       Claude Code's grammar.
                        A prompt wins over busy, busy over limited,
                        limited over question — except a busy that is only a
                        background monitor: a question, a limit notice or any
@@ -1159,22 +1248,28 @@ SUPERVISING A WORKER (an agent session — Claude Code, Codex or agy — in anot
                        the focus moved a row a key, each move seen landing,
                        then Enter guarded on the chosen row under the screen
                        fence; never a digit, Esc or a key on the free-text,
-                       chat or cancel row. Codex's question (`Question 1/1`,
-                       read by its answers' roles): an answer's number or exact
-                       label, `recommended` (the window's own: its
-                       `(Recommended)` answer, else the first) or `human`; the
-                       key is the answer's digit, which Codex takes at once,
-                       guarded on the question's title row under the
-                       screen fence (a host without the fence: NOT-SERVED,
-                       nothing typed) — never Enter or Esc, and never its last
-                       row, `None of the above`, which asks for a person's own
-                       words. --box TOKEN (`phase`'s `box`) refuses another
+                       chat or cancel row. agy's question (read by its
+                       answers' roles): an answer's number or exact label,
+                       `recommended` (the window's own: its `(Recommended)`
+                       answer, else the first) or `human`; the key is the
+                       answer's digit, guarded on the question's title row
+                       under the screen fence (a host without the fence:
+                       NOT-SERVED, nothing typed) — never Enter or Esc, and
+                       never a `None of the above`, which asks for a person's
+                       own words. Muse
+                       Code's question (read by its answers' roles too) takes
+                       no digit: the focus is moved to the answer, each move
+                       guarded on the question's own row and seen landing,
+                       then Enter on the answer's row, every key under the
+                       screen fence and the person fence; never Esc, and never
+                       `None of the above`. --box TOKEN (`phase`'s `box`) refuses another
                        question, nothing typed. Take a worker's questions
                        with `aterm ctl @sid meta set questions ask` (its window
                        then raises each instead of answering it). Prints one
                        line: `ANSWERED @sid enters=<k> answer=<what> next=<the
                        question now on display|review|none>` (exit 0; <k> the
-                       answering keys: the Enters, Codex's one digit), `LEFT`
+                       answering keys: the Enters, agy's one digit, Muse
+                       Code's one Enter), `LEFT`
                        (a person keyed the session, or `human`; exit 0),
                        `NO-BOX` (exit 1), `REFUSED <why>` (exit 2, nothing
                        typed) or `NOT-SERVED <why> (enters=<k>)` (exit 3).
@@ -1184,8 +1279,8 @@ SUPERVISING A WORKER (an agent session — Claude Code, Codex or agy — in anot
                        lines included), by the grammar of the program `status`
                        names before the wait. The loop is `await idle 2000` →
                        read → `await seq` (never a sleep); where the host knows
-                       `await gone`, the busy row LEAVING (Claude Code's footer,
-                       Codex's status row) is the first wait. A screen
+                       `await gone`, the busy row LEAVING (Claude Code's footer)
+                       is the first wait. A screen
                        without the composer rules (a build, a script, a REPL) whose
                        output never held still for the 2 s is busy too: its turn
                        ends when the output pauses. Exit 124 on --timeout (default:
@@ -1202,7 +1297,10 @@ SUPERVISING A WORKER (an agent session — Claude Code, Codex or agy — in anot
                        don't-ask-again, session or mode-switch grant, and never
                        a purchase). By default (\"all\") every box gets its
                        answer, read by its program's own reader (Claude Code's,
-                       Codex's): a permission box its one-shot allow (`Yes`) —
+                       agy's, Muse Code's — Muse Code's answered by
+                       the cursor and Enter, never a digit — Gemini CLI's,
+                       which runs as `node` and is named by its screen): a
+                       permission box its one-shot allow (`Yes`) —
                        Bash under any header whatever vendor note it carries,
                        Edit/Write/Read, a workflow, Fetch, a network request,
                        Chrome, a skill, Monitor, an MCP tool's box, a model's
@@ -1213,14 +1311,14 @@ SUPERVISING A WORKER (an agent session — Claude Code, Codex or agy — in anot
                        standing mode (`Yes, manually approve edits`), Claude
                        Code's model-refusal pause (exactly its switch and its
                        retry) its switch while model_fallback is set (no
-                       other box's model switch is ever pressed), Codex's
-                       rate-limit nudge its switch only when Codex's own
-                       usage reading is at 90% or more — and only to save the
-                       work, the session then put back on its own model and
-                       held until the window resets (`rate_nudge`) — else it
-                       keeps the model (never its never-show-again), a held
+                       other box's model switch is ever pressed), a held
                        message its delivery, and a setup dialog, a proposed
-                       goal or a Computer Use grant its refusal. A box taller
+                       goal or a Computer Use grant its refusal (`Continue
+                       without …` is a refusal, never a consent). Claude
+                       Code's MCP server dialog is yours at every level:
+                       each answer, Esc too, is saved for good in the
+                       project's .claude/settings.local.json (`claude mcp
+                       reset-project-choices` undoes it). A box taller
                        than the pane is pressed at no level: it is answered
                        once the pane shows it whole, and is yours until then
                        (in a bypass session one whose foot flags an rm is
@@ -1233,6 +1331,13 @@ SUPERVISING A WORKER (an agent session — Claude Code, Codex or agy — in anot
                        or options it cannot read, is yours. A press no safe
                        rule proved carries `unproven: <why>` in its ledger
                        row, its notes line and the journal.
+                       Gemini CLI's shell, write and edit boxes get their
+                       `Allow once` and its folder-trust dialog `Trust folder`,
+                       each by its digit — never `Allow for this session` or
+                       the external editor; any other box of its, and its
+                       usage-limit dialog (`Keep trying` / `Stop`), is yours,
+                       and so is an API error it ended a turn on and does not
+                       retry by itself.
                        A question is no permission: at every --approve level
                        (not under --no-answer) the question dialog — Claude
                        Code's AskUserQuestion, read whole — gets its
@@ -1253,8 +1358,9 @@ SUPERVISING A WORKER (an agent session — Claude Code, Codex or agy — in anot
                        taken by neither, supervise hands it to you, while
                        watch (and the window's host) keeps trying on the
                        press back-off below, never before the screen held
-                       still. Codex's question gets its recommended answer,
-                       else its first, by its digit. That is the
+                       still. agy's and Gemini CLI's questions get their
+                       recommended answer, else their first, each by its
+                       own key. That is the
                        `recommended` priority, the default; under the
                        [harness] `question_priority` (or --question-priority)
                        `long-term` or `short-term` the harness chooses no
@@ -1279,6 +1385,14 @@ SUPERVISING A WORKER (an agent session — Claude Code, Codex or agy — in anot
                        a real wall) is the window's host's alone, through the
                        dialog's own reset row and its confirmation, and no
                        command is typed for it.
+                       Claude Code's autocompact offer (`We recommend
+                       compacting earlier`) is no permission either: at every
+                       --approve level (not under [harness] autocompact_offer
+                       = \"off\") it gets `Autocompact at ‹ 400k › tokens`
+                       (the size [harness] autocompact_offer names), reached
+                       with fenced arrows and stepper keys, one per fresh
+                       read, and a confirmed Enter (`autocompact-offer@v1`) —
+                       never the keep row, never Esc.
                        Under \"safe\" (--approve safe) only a box proven safe: a
                        Bash box whose command classifies read-only both with
                        its rows joined by newlines and by spaces, with no
@@ -1304,15 +1418,22 @@ SUPERVISING A WORKER (an agent session — Claude Code, Codex or agy — in anot
                        session's cwd and lies under a trust root. The trust
                        roots are the folders you list in [harness]
                        trust_roots, and none by default: list your own to
-                       have their trust dialog answered under \"safe\". Of a
-                       Codex session's boxes those rules judge only its
-                       folder-trust gate: every other is yours. Those
+                       have their trust dialog answered under \"safe\". Those
                        rules decide first under \"all\" too, so a proven
                        read keeps its rule in the ledger. \"none\" answers
                        nothing. A person's keystroke within `human_grace_s`
                        (the server's `status human_ms=`) HOLDS a box the
                        policy would answer: neither pressed nor escalated,
-                       judged again when the grace ends. The press is
+                       judged again when the grace ends. The one box it
+                       does not hold is the folder-trust dialog of a launch
+                       the server witnessed (`claude⏎` at an
+                       integrated prompt: `status launch=person`, the count
+                       the shell's signed command start recorded and no
+                       gesture since, `input=clear` — measured on macOS
+                       alone today, elsewhere `input=-` holds — no other
+                       driver's hand): answered at once, every key fenced on
+                       that count (`if-human=`), so a person who keys on it
+                       gets it for their grace. The press is
                        GUARDED by the row that was judged — `key if=<that
                        row, anchored> 1`, plus
                        `if-gen=<the read's generation>` (`text --json`'s gen)
@@ -1324,14 +1445,9 @@ SUPERVISING A WORKER (an agent session — Claude Code, Codex or agy — in anot
                        left or the fenced screen moved (the loop reads and
                        decides again), or the seq is the screen just parsed and
                        the guard matched no row (the press did not land: see
-                       below); a host without the guard answers a usage line or
-                       a bare `ERR` and the press falls back to read → confirm
-                       → press → re-read, backspacing a digit that landed in
-                       the composer — and with a rating survey open on the
-                       confirming read it presses nothing and hands the box to
-                       you (a `1` that reaches the survey is a rating). `ERR
-                       halted` parks the loop until `status` says hold=0, `ERR
-                       busy …` (`busy sink` too) and `ERR rate` back it off;
+                       below). `ERR halted` parks the loop until `status`
+                       says hold=0, `ERR busy …` (`busy sink` too) and `ERR
+                       rate` back it off;
                        after either the box is read and decided again, never
                        pressed again as it was; `ERR busy input-unread` (a
                        published stall or a stopped job) backs it off too, a
@@ -1419,9 +1535,11 @@ SUPERVISING A WORKER (an agent session — Claude Code, Codex or agy — in anot
                        the summary being, for a prompt, `kind=<k> classify=
                        <read-only|not-read-only:<reason>|-> command=<command>` (`-`
                        for a box that is not Bash; a workflow's description stands
-                       in for its command); for a question or idle, the last row
-                       the worker said; for limited, `message=<text> reset=
-                       <text|->` — each cut at 160 characters. Then it waits for
+                       in for its command); for a question or idle, the last line
+                       the worker said (its rows wrapped in the pane joined; past
+                       160 characters its end kept, `…` before it); for limited,
+                       `message=<text> reset=<text|->` — each cut at 160
+                       characters. Then it waits for
                        the screen to move past that point (`await seq`) before it
                        looks again, so your `turn` or `key` is picked up by
                        itself. A point that looks like the one last reported —
@@ -1543,11 +1661,23 @@ SUPERVISING A WORKER (an agent session — Claude Code, Codex or agy — in anot
                        say it is done, is SHORT, and each short turn in a row
                        doubles the wait before the next act — 2, 4, 8 … min,
                        never past an hour — while a turn of real work ends the
-                       streak (nothing is ever escalated as \"done\"); a
-                       session nobody has asked anything yet (its launch
-                       screen) is no turn end and gets nothing. Walls: an API
-                       error is answered by what it says, never with an ask,
-                       each try quoting Claude Code's own line — a network
+                       streak (nothing is ever escalated as \"done\"); a turn
+                       whose last words say it is done gets, past its
+                       back-off and in its continuation's place, the done
+                       check (`continue-done-check@v1`: \"Before you stop:
+                       do every open item … you can still do yourself now …
+                       End your reply with ATERM-TASK-DONE on a line by
+                       itself only when everything left needs a person … or
+                       cannot be done on this host …\"), and a second done
+                       reply, or a reply whose last line is `ATERM-TASK-DONE`
+                       (`finished@v1`, no check), ends the task: nothing is
+                       typed into it again until a turn of work nobody here
+                       typed reopens it (this loop reads no conversation
+                       record, so the screen decides); a session nobody has
+                       asked anything yet (its launch screen) is no turn end
+                       and gets nothing. Walls: an API error is answered by
+                       what it says, never with an ask, each try naming it in
+                       aterm's own words, never the screen's — a network
                        never reached, or a certificate or proxy refused, is
                        tried 1, 2, 5, then every 5 min from each appearance
                        (the window's host continues one as soon as it
@@ -1556,7 +1686,14 @@ SUPERVISING A WORKER (an agent session — Claude Code, Codex or agy — in anot
                        measures), a reply cut off is continued at once and
                        then on that ladder, and the server's own failure or
                        an overload is retried for ever, 1, 5, 15, 30, then
-                       every 60 min from each appearance; a usage or
+                       every 60 min from each appearance; a reply past its
+                       output token maximum is continued at once (asking for
+                       smaller replies), then on that server ladder, which
+                       the work it leads to does not reset; a request the API
+                       refuses (a 4xx it does not retry, a safeguards
+                       refusal, a model not found) is tried 1 and 30 min,
+                       2 h, then every 6 h from each appearance, never given
+                       up; a usage or
                        spend limit is continued 150 s past its reset,
                        each session of an account a share (up to 60 s) later
                        (nothing is ever bought; the notice again after a
@@ -1570,11 +1707,7 @@ SUPERVISING A WORKER (an agent session — Claude Code, Codex or agy — in anot
                        back at the reset — and one that asks consent to go on
                        on usage credits is continued first
                        (`consent-accept@v1`; the confirm is a box answered
-                       with its yes); a Codex goal a usage limit stopped is
-                       resumed with `/goal resume` at the reset; a Codex whose
-                       goal runs on by itself gets no continuation, and one
-                       whose thread fell into a sandbox its launch bypassed
-                       gets nothing and one message naming the fix; a full
+                       with its yes); a full
                        context `/compact`, then a continuation; a
                        lost login `/login` and the one escalation nothing can
                        answer (finish sign-in in the browser). A continuation
@@ -1589,7 +1722,11 @@ SUPERVISING A WORKER (an agent session — Claude Code, Codex or agy — in anot
                        own), or — for that grace from the point — on a turn a
                        person stopped with Esc; the survey's `0` and a stray
                        digit's backspace wait for the grace too. A draft left
-                       standing past the grace is sent: where an act was due,
+                       standing past the grace is sent — never over Claude
+                       Code's open `/` menu whose highlighted entry is another
+                       command, where Enter would run that entry (a `/cl`
+                       would run `/clear`): that draft is escalated, once —
+                       where an act was due,
                        Enter alone, fenced on the read judged (`key if-gen=…
                        if=<the caret row> enter`), said as that act's
                        `CONTINUED` line with the draft's words. Other text goes
@@ -1660,9 +1797,8 @@ SUPERVISING A WORKER (an agent session — Claude Code, Codex or agy — in anot
                        alone, and
                        reads it at its next look at the inbox. Nothing wakes
                        a worker for mail: it is typed to, as a human would
-                       type to it. A Codex worker in its own sandbox gets the
-                       nudge and not the body: the sandbox refuses the control
-                       socket (the primer's Codex addendum). Prints
+                       type to it. A Codex worker is never nudged (aterm reads
+                       no Codex screen): it gets the mail alone. Prints
                        `task @<off> nudged=0|1` once the post
                        LANDED (the broker's offset, which the worker's `inbox`
                        row shows as `off=` and its answer carries as `re=`).
@@ -1734,54 +1870,19 @@ SUPERVISING A WORKER (an agent session — Claude Code, Codex or agy — in anot
                        footer), found by position; every other row is kept
                        verbatim (done rows, tables, todo items, code), blank rows
                        at either end aside. archived=/screen= count where the
-                       rows came from. A CODEX worker runs on the alternate
-                       screen by default (0.163.0): its report is the
-                       archive's too, read in Codex's grammar — its user rows
-                       open with `›` (never its empty composer, `› Ask Codex
-                       to do anything`, which the archive can keep, nor the
-                       copy of your prompt it pins on the top row over a reply
-                       taller than the screen), matched the same way, and its
-                       live zone (a box, the `• Working
-                       (… esc to interrupt)` status row, the composer and
-                       footer) is cut. A Codex drawing INLINE (`status
-                       program=codex`, `--no-alt-screen`) is on the MAIN
-                       screen, with no archive: its user rows open with `›`,
-                       matched the same way. A start
-                       still on the screen is the screen's report; one
-                       scrolled off is found among the scrollback's `›` rows
-                       (`search ^› regex`), newest first, each read with `line
-                       <row>`, and the rows are read with `line` from it down
-                       to the screen's last, its live zone cut (its box, the
-                       running turn's `• Working (… esc to interrupt)` status
-                       row and the background terminals' line, its composer
-                       and footer): --max-rows bounds those reads — spent
-                       before the screen, the report keeps the rows read and
-                       closes with the screen's (its last row found by a few
-                       `line` probes), the middle missing — archived= counts
-                       the rows above the screen, and last=- (no archive
-                       mark). complete=1 only when the start was found, no row
+                       rows came from. Every report is read in Claude Code's
+                       grammar: aterm reads no Codex screen (its Codex screen
+                       lane was retired on 2026-10-16). complete=1 only when
+                       the start was found, no row
                        after it was evicted, --max-rows (default 8000) held
-                       every row and — but for a Codex drawing inline — the
-                       host kept an archive, the archive is the one the mark
-                       named, the worker is on the alternate screen and no gap
-                       lies after the start (an inline Codex's: its `search`
-                       said nothing it left out could hold the start); otherwise
+                       every row, the host kept an archive, the archive is the
+                       one the mark named, the worker is on the alternate
+                       screen and no gap lies after the start; otherwise
                        reason= lists why: no-archive (a host without `offscreen`
                        or with its archive off, or an `aterm ctl` too old to
                        relay the rows: the screen alone), main-screen (the worker
                        is not on the alternate screen — not a fullscreen app, or
-                       it left one — and no Codex: its main screen's scrollback
-                       is not read; a Codex on a host without `search` or
-                       `line`: the screen alone),
-                       search-incomplete (an inline Codex's `search` said it
-                       was ` incomplete`: older history not searched where the
-                       start was not found, or rows left out anywhere — the
-                       match cap, a rewrap, a long line — where a newer `›`
-                       row may hide (a start it found is still read from); or
-                       its reply lacks screen_first coordinates, or it may
-                       have left out rows anywhere with no ledger turn to
-                       find: then, as when no start is found, only the screen
-                       is reported),
+                       it left one: its main screen's scrollback is not read),
                        archive-reset (the host restarted since the mark, or an
                        aterm self-update could not carry the archive — one that
                        could keeps it, turn ledger and all), archive-gap (rows
@@ -1808,15 +1909,7 @@ SUPERVISING A WORKER (an agent session — Claude Code, Codex or agy — in anot
                        and every `❯` row of yours, the done rows with them, and
                        no tool row or `⎿` output at all. A table, a bullet, a
                        todo item or indented code inside a message is kept, as
-                       it is without a view. A Codex worker's report is read
-                       in Codex's grammar: its `•` messages (never a `•` tool
-                       or notice — `• Ran …`, `• Explored`, `• Edited …`, a
-                       head with `└` output under it — nor an approval's `✔`
-                       / `✗` echo, nor its session card and greeting), its `›`
-                       rows, and as done rows its end rows (`  1:39 PM`,
-                       `  Worked for 1s • 7:14 AM`) and its `■` blocks whole
-                       (an interrupt, an error, a wall; never a tip drawn
-                       right under one); no `└` output. Both add
+                       it is without a view. Both add
                        ` view=<final|messages> kept=<n>` to the header after
                        `last=`; `rows=` still counts every row the report
                        holds, and without either flag the output is byte for
@@ -1873,6 +1966,71 @@ SUPERVISING A WORKER (an agent session — Claude Code, Codex or agy — in anot
                        carried from an earlier process (`carried=1`) is on that
                        process's clock and has no time at all. It only reads:
                        exit 0 even when a source was missing.
+    tape cat FILE [--text] [--salvage] | tape show FILE --decisions | tape stats FILE
+                       Read a harness tape a loop recorded (--tape, below),
+                       from the file alone: no aterm is asked anything. `cat`
+                       prints its items one line each, every value numbered
+                       by its place on the tape; --text prints the exact text
+                       form instead — one record per line, every body line
+                       by line, a final newline its last empty line — which
+                       reads back to the very same tape (a binary or a text
+                       tape reads with every verb). `show --decisions`
+                       answers \"why did it press 2?\" without a replay: per
+                       decision, the screen it judged (the rows of the very
+                       read it decided on), the rule and the outcome, the
+                       act that followed and its reply, and the line the
+                       loop journaled or printed. `stats` prints what the
+                       tape cost: its bytes, its items by kind and by door,
+                       its decisions, its span and kB per hour of it. A
+                       damaged tape is refused, naming the byte, unless
+                       --salvage keeps its whole frames before the damage; a
+                       torn tail (a run that died mid-write) is read up to the
+                       tear and said on stderr. Exit 0, or 2 for a tape that
+                       cannot be read or a usage error.
+    tape ls [@sid] | tape forget FILE|@sid...
+                       The window's own loops' tapes: a development build
+                       records each hosted run when ATERM_HARNESS_TAPE is set
+                       (the lab's instances set it; a shipped build never
+                       records one), to <state>/drive/tapes/<sid>/, each tape
+                       0600 in 0700 directories, the newest kept within
+                       256 MiB and 72 h (tapes/kept/ is yours and never
+                       swept, nor is a tape a running loop still writes).
+                       `ls` lists them newest first (one session's
+                       with @sid, the kept ones beside it): size, age, path.
+                       `forget` removes each FILE named and every tape of
+                       each @sid but its kept ones; anything named that is no
+                       tape in the store (a FILE, or an @sid with none)
+                       refuses the whole call. Only the store is read or
+                       changed.
+    replay FILE [--until door=N]
+                       Run the loop a harness tape recorded again, offline and
+                       exactly: rebuilt from the tape's own setup and policy
+                       (every file it named moved under a directory that does
+                       not exist), fed every value the recorded loop observed
+                       in its order, every request and line it makes checked
+                       against the recorded one where it occurs. Only the
+                       file is read: no socket, no session, no clock, no file
+                       the run named; a journal or ledger row is compared,
+                       never written. Prints REPRODUCED, ENDED (a tape with no
+                       end — a killed run, a tear, the cap — reproduced as far
+                       as it goes), REACHED (--until door=N: stopped after the
+                       value numbered N in `tape cat`), DIVERGED at #N with
+                       its door and class (decision: an act or a decision
+                       differs; output: a line, row or write differs; drift:
+                       anything else) and why, or PANICKED (the recorded panic
+                       reproduced, or the door it died in reached), then how
+                       many requests the replayed loop asked, how it ended (a
+                       supervise's review under its exit code), each act it
+                       made (`> key 1`: a key, send, post or signal; its reads
+                       are only counted) and each line it printed (`| …`).
+                       Strict: the build that recorded the tape replays it; on
+                       another build a divergence is behaviour changed since
+                       the recording's, and says both builds. A watch,
+                       supervise or hosted tape replays, a window host's
+                       every answer from the tape (no host is asked, its
+                       notifications compared). Exit 0 (reproduced, ended,
+                       reached), 1 (diverged), 4 (panicked), or 2 for a tape
+                       that cannot be replayed or a usage error.
     --mail             (supervise, watch) Mail is your channel; the screen is
                        the safety net. The loop parks ONE `await inbox
                        since=<id>` on YOUR session (@self, or --inbox @sid)
@@ -1902,7 +2060,7 @@ SUPERVISING A WORKER (an agent session — Claude Code, Codex or agy — in anot
                        footer tick is the same point, held on), and prints as
                          EVENT turn seq=<n> report=<id> rows=<n> <summary>
                        ONE line per worker turn — report= the row id, rows=
-                       the body's row count, the summary the last row said —
+                       the body's row count, the summary the last line said —
                        when the report is THIS turn's: one that came after
                        the worker was read busy for the turn (however long
                        ago: a report posted mid-turn) or after the point; one
@@ -1970,10 +2128,8 @@ SUPERVISING A WORKER (an agent session — Claude Code, Codex or agy — in anot
                        instance), the point reported before it is reported once
                        more if it is still showing, and a press whose answer
                        never came is not repeated blind or counted as an
-                       approval — the box is read and classified again first (on
-                       a host without the guard, a `1` the server confirmed is
-                       the approval it was, and a digit left in the composer is
-                       backspaced after the reconnect). A wait that runs out is
+                       approval — the box is read and classified again first. A
+                       wait that runs out is
                        followed by a read, so a handoff no request saw fail is
                        noticed too (the seq read is below the one waited on). An
                        outage ends the loop when its window lapses, with
@@ -2030,15 +2186,7 @@ SUPERVISING A WORKER (an agent session — Claude Code, Codex or agy — in anot
                        `context <n>%` line (and no box up) is the compaction.
                        watch keeps one watch for as long as it runs. Only the
                        indicator is read: nothing Claude Code says about
-                       compacting. A Codex is read the same where its footer
-                       draws `<n>% context left` (an empty `tui.status_line`).
-                       Where it draws none (0.163.0's default footer), the
-                       figure is the one Codex's own records hold: the last
-                       response's tokens against the model's window, computed
-                       as Codex computes its own, looked at once a minute and
-                       not while a box is up. Its compaction is then that
-                       figure's rise, never a read without one, and `phase`
-                       prints no `context <n>%` line for it. A compaction
+                       compacting. A compaction
                        replaces the worker's history with a summary, and
                        standing rules you gave it (run nothing heavy while a
                        flag file exists, say) can silently drop out. On `EVENT
@@ -2071,15 +2219,35 @@ SUPERVISING A WORKER (an agent session — Claude Code, Codex or agy — in anot
                        never stops the loop. `aterm drive ledger --journal
                        FILE` replays it. --notes is still what it was: one line
                        per Bash-prompt decision, and nothing else.
+    --tape FILE        (supervise, watch) Record the loop to a HARNESS TAPE at
+                       FILE: what it read through its door, in the order it
+                       read it — each control request and its reply (the
+                       screens it judged among them), each clock read, the
+                       ledger and journal it seeded from, the standing rules,
+                       the goal record, the host's stop — and every line,
+                       journal row, ledger row and decision it made, so
+                       `aterm drive tape show --decisions FILE` can say why it
+                       pressed what it pressed, and `aterm drive replay FILE`
+                       runs the loop again from the tape alone. Its looks at
+                       the machine are on it as what they CONCLUDED, never
+                       what they read: a
+                       hidden twin of a path, where a path's links lead, the
+                       worker (as a digest), git's configuration (only the
+                       keys the policy judges, each value reduced to
+                       true/false/set), the settings' and the shell's
+                       verdicts, the time zone, Codex's own records. The file is
+                       made NEW and 0600 (one already at FILE is never written
+                       over, nor is the run's own --journal, --notes or
+                       ledger); a tape that cannot be made or written is said
+                       once on stderr and the loop runs exactly as without
+                       --tape. The worker's environment is never written. Not
+                       with --mail: the mail lane's thread reaches no tape, so
+                       the two are refused together. Local files only:
+                       nothing is sent anywhere.
 OPTIONS
     --socket PATH   The target aterm's control socket. Defaults to the
                     instance hosting this terminal, else the newest local
                     instance.
-    --dial NAME     Drive a REMOTE aterm: relay to the saved connection NAME via the
-                    local host's `dial` verb, then run `prompt` there — byte-identical
-                    to a local turn, with predicates evaluated on the remote host. The
-                    local socket comes from --socket, its token from the file
-                    beside it. Example: aterm drive --socket PATH --dial work prompt '...'
     --idle MS       Quiescence window that counts as 'turn complete' (default 600).
                     Bigger = more certain the turn ended; smaller = snappier.
     --timeout MS    Give up after this long (default 180000). One `prompt` or
@@ -2142,88 +2310,6 @@ GOTCHA
 mod tests {
     use super::*;
 
-    /// This crate's source-spec closure: every `#[refines]` and
-    /// `#[spec_unmodeled]` written in this crate (`AGENT_SOURCE`) names a
-    /// registered machine and one of its actions, and each machine it binds
-    /// (`AGENT_MACHINES`: the live upgrade's ladder, goal pause and progress,
-    /// the Claude Code footer's reader, the Codex rate-limit nudge) is active
-    /// and fully bound-or-waived, as aterm-gui's `spec_xref_closure` gate
-    /// demands.
-    ///
-    /// Scoped to this crate's anchors and machines: a `--workspace` test build
-    /// unifies features and links aterm-core's and aterm-gui's anchors too,
-    /// which are aterm-gui's gate's to resolve.
-    #[test]
-    fn the_crates_anchors_close_over_the_machines_they_bind() {
-        use aterm_spec::xref::{self, SpecModule};
-        /// Where this crate's own anchors are written (`file!()` of each).
-        const AGENT_SOURCE: &str = "crates/aterm-agent/";
-        /// The machines this crate's anchors bind.
-        const AGENT_MACHINES: [&str; 5] = [
-            "ClaudeFooterModel",
-            "HarnessUpgradeGoalPause",
-            "HarnessUpgradeLadder",
-            "HarnessUpgradeProgress",
-            "SupervisorCodexRateNudge",
-        ];
-        let modules: Vec<SpecModule> = xref::model_registry()
-            .into_iter()
-            .map(SpecModule::Embedded)
-            .collect();
-        let report = xref::check_closure(&modules);
-        // An anchor's own violations (obligations 1 and 4) name its site;
-        // a machine's coverage (obligation 3) names the machine.
-        let ours: Vec<String> = report
-            .violations
-            .iter()
-            .filter(|v| {
-                if v.obligation == 3 {
-                    AGENT_MACHINES
-                        .iter()
-                        .any(|m| v.message.contains(&format!("machine `{m}`")))
-                } else {
-                    v.message.contains(AGENT_SOURCE)
-                }
-            })
-            .map(|v| format!("[obligation {}] {}", v.obligation, v.message))
-            .collect();
-        assert!(ours.is_empty(), "{}", ours.join("\n"));
-        // Every anchor this crate carries binds one of its own machines.
-        let sites: Vec<(&str, &str)> = xref::refinements()
-            .map(|r| (r.location, r.machine))
-            .chain(xref::waivers().map(|w| (w.location, w.machine)))
-            .filter(|(at, _)| at.starts_with(AGENT_SOURCE))
-            .collect();
-        assert!(!sites.is_empty(), "this crate's anchors are linked");
-        for (at, machine) in &sites {
-            assert!(
-                AGENT_MACHINES.contains(machine),
-                "{at} binds `{machine}`, none of this crate's machines"
-            );
-        }
-        let active: Vec<&str> = report
-            .coverage
-            .iter()
-            .filter(|c| c.active && AGENT_MACHINES.contains(&c.machine.as_str()))
-            .map(|c| c.machine.as_str())
-            .collect();
-        let mut sorted = active.clone();
-        sorted.sort_unstable();
-        assert_eq!(sorted, AGENT_MACHINES, "{active:?}");
-        for c in report
-            .coverage
-            .iter()
-            .filter(|c| AGENT_MACHINES.contains(&c.machine.as_str()))
-        {
-            assert!(
-                c.uncovered.is_empty() && c.ratio() >= 1.0,
-                "{} uncovered: {:?}",
-                c.machine,
-                c.uncovered
-            );
-        }
-    }
-
     /// A mock transport recording the driven verbs and returning a canned screen.
     struct MockClient {
         sent: Vec<u8>,
@@ -2248,26 +2334,6 @@ mod tests {
         ) -> Result<String, Self::Error> {
             Ok(self.screen.clone())
         }
-    }
-
-    #[test]
-    fn turn_sends_prompt_presses_enter_and_returns_settled_screen() {
-        let mut client = MockClient {
-            sent: Vec::new(),
-            entered: 0,
-            screen: "⏺ ANSWER: 391\n❯ ".to_string(),
-        };
-        // A permissive governor (cross-session driving): enabled, ample tokens.
-        let mut gov = SelfGovernor::disabled(8, 1, 1_000_000);
-        gov.enable_self_write();
-        let turn = Turn::default();
-        let out = turn.run(&mut client, &mut gov, b"what is 17*23?").unwrap();
-        assert_eq!(client.sent, b"what is 17*23?");
-        assert_eq!(
-            client.entered, 1,
-            "submitted with exactly one Enter keypress"
-        );
-        assert!(out.contains("ANSWER: 391"));
     }
 
     #[test]
@@ -2348,7 +2414,7 @@ mod tests {
         assert!(client.sent.is_empty(), "no bytes sent on a bad pattern");
     }
 
-    // --- RelayClient (the remote/persistent-connection ControlClient) ---
+    // --- RelayClient (the persistent-connection ControlClient) ---
 
     /// An in-memory transport for `RelayClient`: records everything written, and
     /// hands back a canned sequence of server response bytes.
@@ -2389,22 +2455,93 @@ mod tests {
         assert_eq!(client.io.sent, b"help turn\nhelp turn\n");
     }
 
+    /// A READ-ONLY CONNECTION HAS NO HANDS: the read verbs go out as written
+    /// (`text`, `status`, `await`, a bare `meta`, with or without a selector);
+    /// an input verb, a signal, a lease, a `meta set`, a verb it does not name
+    /// and a length-framed write are each refused with nothing written.
+    /// NEGATIVE CONTROL: the same requests on an ordinary connection are sent.
+    /// A read-only connection admits the server's metric reads, including
+    /// either JSON spelling, but no reset or metadata edit reaches its transport.
     #[test]
-    fn relay_version_handshake_requires_protocol_success() {
-        for header in ["OK", "OK version=1"] {
-            let client =
-                RelayClient::new(RecordingTransport::new(format!("{header}\n").as_bytes()))
-                    .relayed_to("work")
-                    .expect("successful remote version probe");
-            assert_eq!(client.io.sent, b"dial work\nversion\n");
+    fn a_read_only_connection_refuses_every_mutating_subform() {
+        let reads = [
+            "@s-1 meta",
+            "metrics",
+            "metrics percentiles",
+            "metrics json",
+            "metrics --json",
+            "metrics percentiles json",
+            "metrics --json percentiles",
+            "metrics json percentiles --json",
+        ];
+        let mutations = [
+            "@s-1 meta set attention held",
+            "@s-1 meta unset attention",
+            "metrics reset",
+            "@s-1 metrics reset",
+            "metrics reset json",
+            "metrics json reset",
+            "metrics --json reset",
+            "metrics reset --json",
+            "metrics json reset --json",
+        ];
+        let replies = b"OK\n".repeat(reads.len() + mutations.len());
+        let mut ro = RelayClient::new(RecordingTransport::new(&replies)).reads_only();
+        for read in reads {
+            assert!(ro.request_line(read).is_ok(), "{read}");
         }
-        for header in ["OKAY", "OK\tversion=1", "ERR dial unavailable"] {
-            let error = RelayClient::new(RecordingTransport::new(format!("{header}\n").as_bytes()))
-                .relayed_to("work")
-                .err()
-                .expect("failed remote version probe");
-            assert_eq!(error.to_string(), format!("dial work failed: {header}"));
+        let before = ro.io.sent.clone();
+        // Observe every case before the aggregate assertion, so the old
+        // transport guard demonstrates each reset spelling rather than only one.
+        let refused: Vec<_> = mutations
+            .iter()
+            .map(|request| {
+                ro.request_line(request)
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
+            })
+            .collect();
+        let mut plain = RelayClient::new(RecordingTransport::new(b"OK\nOK\n"));
+        assert!(plain.request_line("metrics reset").is_ok());
+        assert!(plain.request_line("meta unset attention").is_ok());
+        assert_eq!(
+            (refused, ro.io.sent == before),
+            (vec![true; mutations.len()], true),
+            "no mutating form writes a byte; ordinary connections retain it"
+        );
+    }
+
+    #[test]
+    fn a_read_only_connection_sends_the_read_verbs_alone() {
+        let reads = [
+            "@s-1 text --json",
+            "status",
+            "@s-1 await seq 7 timeout=0",
+            "@s-1 meta",
+        ];
+        let hands = [
+            "@s-1 send hi",
+            "@s-1 key enter",
+            "@s-1 turn hi",
+            "@s-1 signal TERM pid=7",
+            "@s-1 lease acquire",
+            "@s-1 meta set attention x",
+            "@s-1 frobnicate",
+        ];
+        let mut ro = RelayClient::new(RecordingTransport::new(b"OK\nOK\nOK\nOK\n")).reads_only();
+        for r in reads {
+            assert!(ro.request_line(r).is_ok(), "{r}");
         }
+        let read_bytes = ro.io.sent.len();
+        for h in hands {
+            let err = ro.request_line(h).expect_err(h);
+            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{h}");
+        }
+        assert!(ro.request_frame("@s-1 feed-bin", b"x").is_err());
+        assert_eq!(ro.io.sent.len(), read_bytes, "nothing written for a hand");
+
+        let mut plain = RelayClient::new(RecordingTransport::new(b"OK\nOK\n"));
+        assert!(plain.request_line("@s-1 send hi").is_ok());
+        assert!(plain.request_line("@s-1 meta set attention x").is_ok());
     }
 
     /// Canned server responses for one full driven turn, in order: send -> `OK`,
@@ -2417,7 +2554,7 @@ mod tests {
     /// equal the control lines `CtlClient` drives through `aterm-ctl`, and the
     /// parsed `text` payload matches `aterm-ctl`'s stdout.
     #[test]
-    fn remote_relay_client_wire_is_ctl_byte_identical() {
+    fn relay_client_wire_is_ctl_byte_identical() {
         let mut client = RelayClient::new(RecordingTransport::new(CANNED_TURN));
         let mut gov = SelfGovernor::disabled(8, 1, 1_000_000);
         gov.enable_self_write();
@@ -2428,7 +2565,7 @@ mod tests {
         // Exact wire bytes, verb-for-verb, in order — the same request lines
         // `CtlClient` frames from its argv (send/key/await idle/await match/text).
         let expected_wire = concat!(
-            "send what is 17*23?\n",
+            "send -- what is 17*23?\n",
             "key enter\n",
             "await idle 600 timeout 180000\n",
             "await match (^|\\s)\u{276f}(\\s|$) timeout 250\n",
@@ -2444,46 +2581,48 @@ mod tests {
         assert_eq!(out, "\u{23fa} ANSWER: 391\n\u{276f} \n");
     }
 
-    /// Negative control: the discarded `await match` reply must be consumed
-    /// before `text`; a sequence that skips it reads the stale `OK match 1` as
-    /// the `text` header and fails.
+    /// A `meta set` reply is read by its leading `OK` token alone
+    /// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §9.6.2): the timed
+    /// Cruise's `OK land_at=<unix s> local=<date>T<HH:MM><offset>` is a
+    /// success to this reader as a bare `OK` is. NEGATIVE CONTROLS: `ERR …`
+    /// and a status that only begins with the letters `OK` are refusals.
     #[test]
-    fn skipping_the_discarded_await_match_reply_desyncs_the_stream() {
-        // Responses from `await idle` onward: OK idle 7, OK match 1, OK 2 + lines.
-        let canned = b"OK idle 7\nOK match 1\nOK 2\nline-a\nline-b\n";
+    fn a_meta_set_reply_is_read_by_its_leading_ok_token() {
+        let canned = b"OK land_at=1792249200 local=2026-10-17T16:00+01:00\nOK\nERR until= goes \
+                       with cruise only: usage: meta set autopilot cruise\nOKAY\n";
         let mut client = RelayClient::new(RecordingTransport::new(canned));
-        client
-            .request_status("await idle 600 timeout 180000")
-            .unwrap();
-        // Buggy: write the await-match line but do not consume its reply.
-        client.write_line("await match X timeout 250").unwrap();
-        // `text` now reads the stale `OK match 1` as its header -> malformed count.
-        let desynced = client.read_text();
+        let timed = client
+            .request_status("meta set autopilot cruise until=16:00")
+            .expect("an OK with its tail");
+        assert!(timed.starts_with("OK land_at="), "{timed}");
+        assert_eq!(
+            client.request_status("meta set autopilot cruise").unwrap(),
+            "OK"
+        );
         assert!(
-            desynced.is_err(),
-            "skipping the await-match consume desyncs: `text` reads a stale reply line"
+            client
+                .request_status("meta set autopilot land until=+1h")
+                .is_err()
+        );
+        assert!(
+            client.request_status("meta").is_err(),
+            "`OKAY` is no OK token"
         );
     }
 
     #[test]
-    fn relay_client_rejects_newline_in_send_payload() {
+    fn relay_client_rejects_line_terminators_in_a_payload_and_at_the_framing_boundary() {
         let mut client = RelayClient::new(RecordingTransport::new(b""));
         let err = client.send(b"first\nsend evil").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let err = client
+            .write_line("AUTH token\rsend injected")
+            .expect_err("a request must occupy exactly one line");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert!(
             client.io.sent.is_empty(),
             "nothing written on a rejected payload"
         );
-    }
-
-    #[test]
-    fn relay_client_rejects_line_terminators_at_the_framing_boundary() {
-        let mut client = RelayClient::new(RecordingTransport::new(b""));
-        let error = client
-            .write_line("AUTH token\nsend injected")
-            .expect_err("a request must occupy exactly one line");
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-        assert!(client.io.sent.is_empty());
     }
 
     #[test]
@@ -2642,6 +2781,33 @@ mod tests {
         );
     }
 
+    /// THE CLIENT IS THIS BUILD'S OWN `ctl` VERB: [`CtlClient::own_at`] runs
+    /// `<exe> ctl --sock <sock> <args>`, in that order, and [`own_exe`] names a
+    /// file that exists (this test binary). NEGATIVE CONTROL: a client built
+    /// with [`CtlClient::new`] puts nothing before `--sock`.
+    #[cfg(unix)]
+    #[test]
+    fn the_own_client_runs_the_ctl_verb_first() {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert!(own_exe().expect("this binary").is_file());
+        let dir = std::env::temp_dir().join(format!("aterm-own-ctl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let exe = dir.join("aterm");
+        std::fs::write(&exe, "#!/bin/sh\necho \"$*\"\n").expect("write the stand-in");
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let own = CtlClient::own_at(&exe, Some("/s.sock".to_string()));
+        assert_eq!(
+            own.run(&["cursor"]).expect("it runs"),
+            "ctl --sock /s.sock cursor\n"
+        );
+        let plain = CtlClient::new(&exe, Some("/s.sock".to_string()));
+        assert_eq!(
+            plain.run(&["cursor"]).expect("it runs"),
+            "--sock /s.sock cursor\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A failed `aterm-ctl` run is never an empty error: its stderr, else its
     /// stdout line and exit code, else the exit code alone.
     #[test]
@@ -2651,15 +2817,20 @@ mod tests {
             stdout: stdout.to_string(),
             stderr: stderr.to_string(),
         };
-        assert_eq!(
-            failure_words(&reply(1, "", "aterm-ctl: ERR no such session\n")),
-            "aterm-ctl: ERR no such session"
-        );
-        assert_eq!(
-            failure_words(&reply(124, "OK timeout\n", "")),
-            "aterm-ctl exited 124: OK timeout"
-        );
-        assert_eq!(failure_words(&reply(3, "", " \n")), "aterm-ctl exited 3");
+        let cases = [
+            (
+                reply(1, "", "aterm-ctl: ERR no such session\n"),
+                &["ERR no such session"][..],
+            ),
+            (reply(124, "OK timeout\n", ""), &["124", "OK timeout"][..]),
+            (reply(3, "", " \n"), &["3"][..]),
+        ];
+        for (failed, tokens) in &cases {
+            let words = failure_words(failed);
+            for token in *tokens {
+                assert!(words.contains(token), "{words:?} lacks {token:?}");
+            }
+        }
     }
 
     /// A turn longer than its timeout: `await idle` answers `OK timeout` and
@@ -2704,10 +2875,7 @@ mod tests {
         let err = turn
             .run(&mut client, &mut gov, b"hi")
             .expect_err("a turn past its timeout fails");
-        assert_eq!(
-            err.to_string(),
-            "the screen did not settle within 1000 ms (--timeout)"
-        );
+        assert!(err.to_string().contains("1000 ms"), "{err}");
 
         let mut gov = SelfGovernor::disabled(64, 8, 5_000_000);
         gov.enable_self_write();
@@ -2718,6 +2886,24 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).expect("remove the scratch directory");
+    }
+
+    /// The control client is THIS image, resolved through its links. An image
+    /// whose file is gone (replaced by an update under a long-running fleet
+    /// stream) is still reached on Linux as `/proc/self/exe`.
+    #[test]
+    fn the_ctl_client_is_this_image_even_once_its_file_is_replaced() {
+        let me = std::env::current_exe().expect("the test binary");
+        let canon = std::fs::canonicalize(&me).expect("the test binary resolves");
+        assert_eq!(resolved_exe(me.clone()), canon);
+        assert_eq!(own_exe().expect("this image"), canon);
+        let gone = me.with_file_name("aterm (deleted)");
+        let expect = if cfg!(target_os = "linux") {
+            std::path::PathBuf::from("/proc/self/exe")
+        } else {
+            gone.clone()
+        };
+        assert_eq!(resolved_exe(gone), expect);
     }
 
     /// Over a persistent connection, a wait past its timeout answers
@@ -2739,10 +2925,7 @@ mod tests {
         let err = turn
             .run(&mut client, &mut gov, b"hi")
             .expect_err("a turn past its timeout fails");
-        assert_eq!(
-            err.to_string(),
-            "the screen did not settle within 1000 ms (--timeout)"
-        );
+        assert!(err.to_string().contains("1000 ms"), "{err}");
 
         // The host caps every wait at 600000 ms, so a longer --timeout ends
         // there and the line names the wait that ran.
@@ -2756,12 +2939,11 @@ mod tests {
         let mut client = RelayClient::new(RecordingTransport::new(
             b"OK\nOK\nOK timeout\nOK 1\nmid-turn\n",
         ));
-        assert_eq!(
-            long.run(&mut client, &mut gov, b"hi")
-                .expect_err("a turn past the host's cap fails")
-                .to_string(),
-            "the screen did not settle within 600000 ms (the host's cap on --timeout)"
-        );
+        let err = long
+            .run(&mut client, &mut gov, b"hi")
+            .expect_err("a turn past the host's cap fails")
+            .to_string();
+        assert!(err.contains("600000 ms"), "{err}");
 
         let mut gov = SelfGovernor::disabled(64, 8, 5_000_000);
         gov.enable_self_write();

@@ -20,37 +20,76 @@
 //! ⣾  Generating...                        the SPINNER row, while a turn runs
 //! └ Tip: To disable tips, …                 and sometimes a tip under it
 //! ──────────────────────────────────────   the COMPOSER: a full-width rule,
-//! >                                         the caret and NO placeholder (the
-//! ──────────────────────────────────────    cursor parks at column 2), a rule
-//! ? for shortcuts  Gemini 4 Argon · medium  and the FOOTER
+//! >                                         the caret and, empty, nothing
+//! ──────────────────────────────────────    (the cursor parks at column 2), a
+//! ? for shortcuts  Gemini 4 Argon · medium  rule and the FOOTER
 //! ```
+//!
+//! **THE EMPTY COMPOSER** draws no placeholder (measured) — but while a
+//! permission mode is on (shift+tab cycles them) it draws the mode's hint
+//! after its caret: `Plan mode: research & plan only (shift+tab to cycle)`,
+//! and accept-edits', auto's and best-of-N's (its binary's four; UNMEASURED
+//! on the screen), cut with `...` in a narrow pane. A hint is no draft
+//! ([`composer_draft`]). A draft's blank line is a blank row of the frame.
+//! A notice card (` ┃ Meet Gemini 4 Argon` … ` ┃ esc to dismiss`, its bar in
+//! column 1) may sit over the top rule: no words of the agent.
 //!
 //! **THE FOOTER'S LEFT SIDE** says what the composer is doing:
 //! `? for shortcuts` when it is empty and idle, nothing while a draft is
-//! held, `press ctrl+c again to exit` after one ctrl+c, and `esc to cancel`
-//! while a turn runs — AND while a menu or a box is open, so `esc to cancel`
-//! alone is no running turn. The composer STAYS OPEN while a turn runs (the
-//! cursor at its column 2): what says a turn runs is the spinner row right
-//! above it. No row marks a turn's end; the spinner gone and the footer back
-//! to `? for shortcuts` is the end ([`phase`]). `/` opens the command menu
-//! UNDER the bottom rule, its key row over the footer's `esc to cancel`.
+//! held (the right side alone: the model, with its effort or without, or
+//! `(initializing...)`), `press ctrl+c again to exit` after one ctrl+c (at
+//! the empty composer or over a held draft, which stays) or `press ctrl+d
+//! again to exit` after one ctrl+d at the empty composer, and `esc to
+//! cancel` while a turn runs — AND while a menu or a box is open, so
+//! `esc to cancel` alone is no running turn — or `Press ↑ to edit queued
+//! messages` while one runs with messages queued behind it (UNMEASURED).
+//! The composer STAYS OPEN while a turn runs (the cursor at its column 2):
+//! what says a turn runs is the spinner row in the turn's rows above it. No
+//! row marks a turn's end; the spinner gone and the footer back to `? for
+//! shortcuts` is the end ([`phase`]). `/` opens the command menu UNDER the
+//! bottom rule, its key row over the footer's `esc to cancel`.
+//!
+//! **AN EXIT PENDING** (`press ctrl+c again to exit`, `press ctrl+d again to
+//! exit`) leaves agy one key from gone: that key again ends it, its resume
+//! line printed under its last frame. Measured in the lab on 1.4.0
+//! (2026-10-17, [`fixtures::lab::EXIT_CONFIRM_CTRL_D`],
+//! [`fixtures::lab::CTRL_C_DRAFT`]): neither hint times out (each still
+//! stood 45 s on), a typed character takes it away (the character a draft),
+//! one ctrl+c over a held draft arms it too and keeps the draft (the second
+//! exits and drops it), and a ctrl+d on a draft deletes forward and asks
+//! nothing. So it is no idle point, draft or none: [`phase`] reads it idle
+//! NOT as evidence, as it reads the survey, and nothing is typed into an agy
+//! about to exit — someone is leaving it, and their second press landing
+//! before the typed text would hand that text to the shell.
 //!
 //! **THE BOXES** replace the composer, the cursor hidden: a bold title over a
 //! full rule, the body, a question row, numbered options (`> 1. …` focused,
 //! `  2. …`), a blank row and a key row (`  ↑/↓ Navigate · …`) over the
 //! footer's `esc to cancel`. A digit picks its option at once (measured on 1
 //! to 4). A long option WRAPS with its tail at column 0 of the next row
-//! ([`fixtures::BOX_EXEC_WRAPPED`]):
+//! ([`fixtures::BOX_EXEC_WRAPPED`]); a narrow pane wraps the key row onto
+//! column-2 rows of its own (`  ↑/↓ Navigate · tab Amend` over `  f full
+//! diff`; UNMEASURED):
 //!
 //! | title | options |
 //! |---|---|
 //! | `Command` | `Yes, run command` · `Yes, and always allow in this conversation for commands that start with '<p>'` · `Yes, and always allow for commands that start with '<p>' (Persist to settings.json)` · `No, cancel` |
 //! | `Create file` | `Yes, allow creation` · outside the workspace `Yes, and always allow non-workspace access` (it persists) · `No, deny creation` |
 //! | `Pending edit` | `Yes, accept this change` · `No, reject this change` |
-//! | `Question` | the model's answers, none marked recommended, then `Write-in...` |
+//! | `Question` | the model's answers — the one it recommends opening `(Recommended)` — then `Write-in...` |
+//!
+//! The pending edit's Esc does nothing (agy 1.4.0's binary): after one, agy
+//! says `Esc disabled during file edits — press 1 to accept or 2 to reject.`
+//! under the key row (UNMEASURED). The question's mark is the model's own,
+//! as agy's tool tells it to write it (its binary; UNMEASURED on the
+//! screen); a question whose options are a multi-select's checkboxes (`[ ]
+//! Red`, `[x] Red`: a digit only toggles one), or hold the person's own kept
+//! answer (`✓ …`), or do not end on `Write-in...`, is answered by no digit
+//! and carries no role ([`prompt`]).
 //!
 //! The TRUST box agy draws in a folder it has not seen is unnumbered (`> Yes,
-//! I trust this folder` / `  No, exit`), chosen by the cursor and Enter.
+//! I trust this folder` / `  No, exit`), chosen by the cursor and Enter. Its
+//! Esc, drawn nowhere, quits agy ([`esc`], measured in the lab).
 //!
 //! **SIGNED OUT** agy draws `You are currently not signed in.` over `Select
 //! login method:` and `> 1. Google OAuth`, whose Enter opens a browser on the
@@ -60,17 +99,79 @@
 //!
 //! **A TURN ENDS** on the reply, on `  ⎿  Interrupted · What should
 //! Antigravity CLI do instead?` (Esc in the turn, or a box refused:
-//! [`interrupted`]), or on `⚠ <message>` over `Error ID: <id>` when it failed.
-//! No wall kind fits that failure — the one measured, `failed to construct
-//! executor: plan model not specified`, came of a dead proxy and names none —
-//! so it is an ended turn with no wall. agy's usage and quota walls are
-//! UNMEASURED and not read.
+//! [`interrupted`]), or on `⚠ <message>` over `Error ID: <id>` when it failed
+//! (the id's `-<n>` grows with the conversation's model calls, retries among
+//! them: `-1` on a first turn, `-3` after a 503's two retries). A failure the
+//! Gemini API answered
+//! prints the SDK's error whole — `⚠ agent executor error: generating and
+//! executing: Error 401, Message: …, Status: UNAUTHENTICATED, Details: […]`,
+//! wrapped at column 0 — and is a WALL by its status ([`wall`], measured in
+//! the lab against a local Gemini API stub, [`fixtures::lab`]): 401, and a
+//! 400 whose ErrorInfo reason is `API_KEY_INVALID`, the login (`Auth`); a 429
+//! saying `You exceeded your current quota` a quota no retry lifts soon
+//! (`Spend`, as Codex's `quota exceeded` is; read [`Phase::Limited`]) —
+//! but a per-minute one (its QuotaFailure's `quotaId` names `PerMinute`, and
+//! no other names `PerDay` or `Daily`, which Google's own client reads as
+//! the day's) a rate that lifts by itself, an API error 429; a 503 saying
+//! `overloaded` an overload; any other status an API error by its code.
+//! agy retries a 503, a
+//! 504, a 429 with no RetryInfo and a 429 whose RetryInfo is short, eight
+//! times under its spinner (no retry row draws), and a 500, a 400, a 403 and
+//! a 404 not at all (measured in the lab: a 403 `PERMISSION_DENIED` with and
+//! without its `SERVICE_DISABLED` reason, a 404 `NOT_FOUND` model, a 400
+//! `FAILED_PRECONDITION`, a 504 `DEADLINE_EXCEEDED`, a bare 429
+//! `RESOURCE_EXHAUSTED`, a per-minute 429 whose RetryInfo was 47 s — not
+//! retried — and a per-day one of 41397 s: [`fixtures::lab`]). A 429's
+//! RetryInfo prints whole (`map[@type:type.googleapis.com/google.rpc.RetryInfo
+//! retryDelay:41397.204181s]`), the delay the API asks before a retry,
+//! counted from its answer: the wall's reset is that delay as a span (`in
+//! 41398s`), placed from the read — never earlier than the API's own time,
+//! since the answer came before the screen showed it. A failure with no
+//! status — the one measured signed in, `failed to construct executor: plan
+//! model not specified`, came of a dead proxy — fits no wall kind and is an
+//! ended turn with no wall.
+//!
+//! Three failures agy words itself are walls too (its binary's words,
+//! UNMEASURED on the screen): `Our servers are experiencing high traffic …`
+//! (`WallKind::Overloaded`), `You have exhausted your quota on this model.`
+//! (`WallKind::UsageSession`, no reset named) and `Your AI credits balance is
+//! too low to continue.` (`WallKind::Spend`), the last two read as
+//! `Phase::Limited`.
+//!
+//! **A SUBAGENT'S ALERT** in the turn's rows (`<agent> needs approval for
+//! <tool>`, `<agent> has a question`; its binary's words, UNMEASURED) says a
+//! subagent waits on a person, who answers it in the subagent's own view: a
+//! prompt with no option ([`prompt`]), which no policy can press.
+//!
+//! **THE SURVEY.** Unasked, and only sometimes (under an error turn of a
+//! session some turns old, never under a first), agy replaces its composer
+//! with ` How's the CLI experience so far? Help us improve:` over ` [1] Good
+//! [2] Fine  [3] Bad  [0] Skip`, both at column 1, the footer under them. A
+//! digit is a RATING, the person's; `0` skips it. It is no box and no composer
+//! ([`survey`]): nothing is typed while it is up (a digit typed for a turn
+//! would rate), and the supervisor dismisses it with `0` as it dismisses
+//! Claude Code's rating cards, guarded on its options row.
+//!
+//! **FIRST RUN** with the Gemini API provider seeded (no sign-in): `Choose
+//! your color scheme:` (eight schemes beside a preview, a `[Next]` button),
+//! then `Terms of Service & Data Use` (a box ticked by default that lets
+//! Google collect the person's interactions, `[Previous]` and `[Done]`), then
+//! the trust box. The first two are BOXES OF NO KIND ([`PromptKind::Other`],
+//! every option [`Role::Other`]): no policy presses one — the colour is the
+//! person's taste, and the terms their consent.
+//!
+//! **UNDER AN API KEY** (the lab) the screens are the signed-in ones row for
+//! row — the trust box, the composer, the boxes, the interrupt, the menu, the
+//! resume line — but for the logo's second row (`Gemini API key` where the
+//! account is), the model's name, and the spinner's word, which is the
+//! model's thought (`⣽  tick 2...`) while it thinks.
 
-use crate::anchors::anchor_text;
+use crate::anchors::{anchor_text, guard_regex};
 use crate::phase::{Phase, leading_spaces, plain_rule_width};
 use crate::prompt::{Cancel, CancelEffect, Opt, PromptKind, PromptV2, Role, Select};
+use crate::survey::{SurveyBlock, SurveyKind};
 use crate::text::blank;
-use crate::wall::Wall;
+use crate::wall::{ApiCause, Placement, Wall, WallKind};
 
 /// The spinner's frames: braille patterns (`⣾`, `⣷`, `⡿`, … measured), the
 /// blank one aside.
@@ -113,6 +214,23 @@ fn is_key_row(row: &str) -> bool {
         && crate::text::trim_start(row).starts_with(const { anchor_text("agy.keys.navigate") })
 }
 
+/// The key row whose rows end at `at` (module header: a narrow pane wraps
+/// it, `  ↑/↓ Navigate · tab Amend` over `  f full diff`): in the unbroken
+/// run of column-2 rows up from `at`, none of them an option, the one that
+/// opens `↑/↓ Navigate`.
+fn key_row_ending(rows: &[String], at: usize) -> Option<usize> {
+    (0..=at)
+        .rev()
+        .take_while(|&i| leading_spaces(&rows[i]) == 2 && numbered(&rows[i]).is_none())
+        .find(|&i| is_key_row(&rows[i]))
+}
+
+/// agy's word under the pending edit's key row after an Esc (module header):
+/// `Esc disabled during file edits — press 1 to accept or 2 to reject.`
+fn is_esc_disabled_row(row: &str) -> bool {
+    crate::text::trim_start(row).starts_with(const { anchor_text("agy.edit.esc_disabled") })
+}
+
 /// A row of the `/` command menu (`> /add-dir   Add a directory …`, `  /agents
 /// …`, `   ↓ 41 more`, and `↑ N more` over the rows once it scrolled).
 fn is_menu_row(row: &str) -> bool {
@@ -126,36 +244,65 @@ fn is_menu_row(row: &str) -> bool {
 enum Footer {
     /// `? for shortcuts`: the composer empty and idle.
     Shortcuts,
-    /// Nothing on the left, the model on the right: a draft is held.
+    /// Nothing on the left, the model (or `(initializing...)`) on the right:
+    /// a draft is held.
     Blank,
-    /// `esc to cancel`: a turn runs, or a menu or a box is open.
+    /// `esc to cancel`: a turn runs, or a menu or a box is open. `Press ↑ to
+    /// edit queued messages`: a turn runs with messages queued behind it.
     Cancel,
-    /// `press ctrl+c again to exit`: one ctrl+c pressed at an idle composer.
+    /// `press ctrl+c again to exit`, `press ctrl+d again to exit`: one
+    /// ctrl+c pressed at the idle composer (empty, or over a held draft,
+    /// which stays) or one ctrl+d at the empty idle composer, the same key
+    /// again ending agy (module header).
     ExitPending,
     /// Words this grammar has not measured.
     Other,
 }
 
-const FOOTERS: [(&str, Footer); 3] = [
+const FOOTERS: [(&str, Footer); 2] = [
     (anchor_text("agy.footer.idle"), Footer::Shortcuts),
     (anchor_text("agy.footer.cancel"), Footer::Cancel),
-    (anchor_text("agy.footer.exit"), Footer::ExitPending),
 ];
 
 fn footer_of(row: &str) -> Footer {
     if leading_spaces(row) > 2 {
-        // The right side alone: `Gemini 4 Argon · medium`.
-        return if crate::text::contains(row, " · ") {
-            Footer::Blank
-        } else {
-            Footer::Other
-        };
+        // The right side alone: `Gemini 4 Argon · medium`, a model with no
+        // effort badge, `(initializing...)`.
+        return Footer::Blank;
     }
     let t = crate::text::trim(row);
+    if is_queued_hint(t) {
+        return Footer::Cancel;
+    }
+    if is_exit_hint(t) {
+        return Footer::ExitPending;
+    }
     FOOTERS
         .iter()
         .find(|(text, _)| t.starts_with(text))
         .map_or(Footer::Other, |&(_, f)| f)
+}
+
+/// `Press ↑ to edit queued messages`: the footer's left side while a turn
+/// runs with messages queued behind it, its key filled in at run time.
+fn is_queued_hint(t: &str) -> bool {
+    t.strip_prefix("Press ")
+        .and_then(|rest| rest.split_once(' '))
+        .is_some_and(|(_, hint)| hint.starts_with(const { anchor_text("agy.footer.queued") }))
+}
+
+/// `press ctrl+c again to exit`, `press ctrl+d again to exit`: the footer's
+/// left side while an exit is pending (the binary's `press %s again to
+/// exit`), its key one word filled in at run time and the model's name on
+/// the right after a gap.
+fn is_exit_hint(t: &str) -> bool {
+    t.strip_prefix("press ")
+        .and_then(|rest| rest.split_once(' '))
+        .and_then(|(key, hint)| {
+            hint.strip_prefix(const { anchor_text("agy.footer.exit_again") })
+                .map(|tail| (key, tail))
+        })
+        .is_some_and(|(key, tail)| !key.is_empty() && (tail.is_empty() || tail.starts_with(' ')))
 }
 
 /// The composer, read whole.
@@ -173,10 +320,11 @@ struct Frame {
 
 /// The composer ([`Frame`]): the last caret row in column 0 between two
 /// plain rules of one width (the transcript's separators are 60 columns, the
-/// composer's the pane's), the rows between them its draft, and under it the
-/// footer as the last row drawn — or the command menu, its key row and then
-/// the footer. A screen agy left keeps its last frame with its resume line
-/// and the shell's prompt under it, and has none.
+/// composer's the pane's), the rows between them its draft — a blank line of
+/// it a blank row — and under it the footer as the last row drawn — or the
+/// command menu, its key row and then the footer. A screen agy left keeps
+/// its last frame with its resume line and the shell's prompt under it, and
+/// has none.
 fn frame(rows: &[String]) -> Option<Frame> {
     (1..rows.len())
         .rev()
@@ -187,9 +335,11 @@ fn frame(rows: &[String]) -> Option<Frame> {
 fn frame_at(rows: &[String], caret: usize) -> Option<Frame> {
     let top = caret.checked_sub(1)?;
     let width = plain_rule_width(&rows[top])?;
-    // A wrapped draft's rows are indented under the caret's text.
+    // A wrapped draft's rows are indented under the caret's text, and its
+    // blank lines are blank rows: the bottom rule is the first row drawn
+    // under the caret left of that indent.
     let bottom =
-        (caret + 1..rows.len()).find(|&i| blank(&rows[i]) || leading_spaces(&rows[i]) < 2)?;
+        (caret + 1..rows.len()).find(|&i| !blank(&rows[i]) && leading_spaces(&rows[i]) < 2)?;
     if plain_rule_width(&rows[bottom]) != Some(width) {
         return None;
     }
@@ -226,19 +376,44 @@ pub fn composer(rows: &[String]) -> Option<usize> {
 
 fn draft(rows: &[String], f: Frame) -> Vec<String> {
     let caret = rows[f.caret].strip_prefix('>').unwrap_or(&rows[f.caret]);
-    std::iter::once(crate::text::trim(caret))
+    let lines: Vec<String> = std::iter::once(crate::text::trim(caret))
         .chain(
             rows[f.caret + 1..f.bottom]
                 .iter()
                 .map(|r| crate::text::trim(r)),
         )
         .map(str::to_string)
-        .collect()
+        .collect();
+    match lines.as_slice() {
+        [one] if is_mode_hint(one) => vec![String::new()],
+        _ => lines,
+    }
+}
+
+/// agy's permission modes' hints (module header), drawn in the EMPTY
+/// composer while a mode is on.
+const MODE_HINTS: [&str; 4] = [
+    anchor_text("agy.mode.hint.accept_edits"),
+    anchor_text("agy.mode.hint.auto"),
+    anchor_text("agy.mode.hint.plan"),
+    anchor_text("agy.mode.hint.best_of_n"),
+];
+
+/// Whether the caret row's `text` is a mode's hint: whole, or cut with `...`
+/// at the pane's edge while the cut still holds its ` mode: `.
+fn is_mode_hint(text: &str) -> bool {
+    MODE_HINTS.iter().any(|hint| {
+        text == *hint
+            || text
+                .strip_suffix("...")
+                .is_some_and(|cut| hint.starts_with(cut) && cut.contains(" mode: "))
+    })
 }
 
 /// The composer's text as `(caret row, lines)`: the caret row's text first
-/// (its `>` stripped — empty when nothing is typed: agy draws no
-/// placeholder), then each row its draft wrapped onto.
+/// (its `>` stripped — empty when nothing is typed, and when all it shows is
+/// a permission mode's hint: agy draws no other placeholder), then each row
+/// its draft wrapped onto, a blank line of it empty.
 #[must_use]
 pub fn composer_draft(rows: &[String]) -> Option<(usize, Vec<String>)> {
     let f = frame(rows)?;
@@ -250,13 +425,30 @@ fn last_user(rows: &[String], top: usize) -> Option<usize> {
     (1..top).rev().find(|&i| is_user_row(rows, i))
 }
 
-/// Whether a turn runs: the spinner row right above the composer's top rule,
-/// or above the `└ Tip:` rows under it.
+/// Whether a turn runs: a spinner row among the turn's rows above the
+/// composer's top rule (under the last message, or from the top with it
+/// scrolled away) — right above the rule, above the `└ Tip:` rows under it,
+/// or above any other row drawn there.
 fn spinning(rows: &[String], top: usize) -> bool {
-    (0..top)
-        .rev()
-        .find(|&i| !crate::text::trim_start(&rows[i]).starts_with('└'))
-        .is_some_and(|i| is_spinner_row(&rows[i]))
+    let from = last_user(rows, top).map_or(0, |u| u + 1);
+    rows[from..top].iter().any(|r| is_spinner_row(r))
+}
+
+/// A subagent's alert (module header) among the turn's rows above the
+/// composer's top rule: `<agent> needs approval for <tool>`, `<agent> has a
+/// question`.
+fn alert(rows: &[String], top: usize) -> Option<usize> {
+    const ALERTS: [&str; 2] = [
+        anchor_text("agy.subagent.approval"),
+        anchor_text("agy.subagent.question"),
+    ];
+    let from = last_user(rows, top).map_or(0, |u| u + 1);
+    // agy's own rows only: its reply's rows sit two columns in, and a reply
+    // that says someone `has a question` is no alert.
+    (from..top).rev().find(|&i| {
+        let t = crate::text::trim(&rows[i]);
+        leading_spaces(&rows[i]) < 2 && ALERTS.iter().any(|a| crate::text::contains(t, a))
+    })
 }
 
 /// agy's logo row naming its build: `Antigravity CLI 1.4.0`.
@@ -269,36 +461,56 @@ fn is_banner_row(row: &str) -> bool {
     })
 }
 
-/// The phase, and whether it is evidence (module header): the spinner over
-/// the composer is busy; the composer with `? for shortcuts` (or with a
-/// draft and nothing on the footer's left, or `press ctrl+c again to exit`)
-/// is idle — a question when the reply's last words end in `?`; a box is a
-/// prompt; the sign-in wall is idle on its wall. `esc to cancel` with no
-/// spinner and no menu is busy NOT authoritatively (a turn that has not
-/// drawn its spinner yet, or an overlay this grammar has not measured), and
-/// with the command menu open nothing is evidence: the menu takes the
-/// footer's place. A screen with no composer, box or wall is `idle` NOT
+/// The phase, and whether it is evidence (module header): a subagent's
+/// alert in the turn is a prompt, its spinner running or not; the spinner in
+/// the turn over the composer is busy; the composer with `? for shortcuts`
+/// (or with a draft and nothing on the footer's left) is idle — limited when
+/// the turn ended on a quota, rate, usage or spend wall
+/// ([`WallKind::reads_limited`]), a question when the reply's last words end
+/// in `?`; a box, and a first run's onboarding screen, is a prompt; the
+/// sign-in wall is idle on its wall. An exit pending (`press ctrl+c again to
+/// exit`, `press ctrl+d again to exit`) is idle NOT authoritatively: agy is
+/// one key from gone, and nothing is typed into it (module header). `esc to
+/// cancel` (or the queued messages' hint) with no spinner and no menu is
+/// busy NOT authoritatively (a turn that has not drawn its spinner yet, or
+/// an overlay this grammar has not measured), and with the command menu open
+/// nothing is evidence: the menu takes the footer's place. A screen with no
+/// composer, box or wall — the survey's among them — is `idle` NOT
 /// authoritatively.
 #[must_use]
 pub fn phase(rows: &[String]) -> (Phase, bool) {
     let Some(f) = frame(rows) else {
-        if agy_box(rows).is_some() {
+        if agy_box(rows).is_some() || onboarding(rows).is_some() {
             return (Phase::Prompt, true);
         }
         return (Phase::Idle, signed_out(rows).is_some());
     };
+    // A subagent waiting on a person holds the turn, however long its
+    // spinner runs.
+    if alert(rows, f.top).is_some() {
+        return (Phase::Prompt, true);
+    }
     if spinning(rows, f.top) {
         return (Phase::Busy, true);
     }
     let footer = f.footer.map_or(Footer::Blank, |r| footer_of(&rows[r]));
     let idle = match footer {
-        Footer::Shortcuts | Footer::ExitPending => true,
+        Footer::Shortcuts => true,
         Footer::Blank => draft(rows, f).iter().any(|l| !l.is_empty()),
         Footer::Cancel if !f.menu => return (Phase::Busy, false),
-        Footer::Cancel | Footer::Other => false,
+        Footer::Cancel | Footer::ExitPending | Footer::Other => false,
     };
     if !idle || f.menu {
         return (Phase::Idle, false);
+    }
+    if let Some(w) = failed_turn(rows, f).filter(|w| w.kind.reads_limited()) {
+        return (
+            Phase::Limited {
+                message: w.message,
+                reset: w.reset,
+            },
+            true,
+        );
     }
     let asks = said_tail(rows).is_some_and(|t| crate::turn::asks(&t));
     (if asks { Phase::Question } else { Phase::Idle }, true)
@@ -319,11 +531,17 @@ fn is_reply_row(row: &str) -> bool {
     leading_spaces(row) >= 2 && !crate::text::trim_start(row).starts_with(['⎿', '└']) && !blank(row)
 }
 
+/// A row of the notice card agy draws over the composer (module header:
+/// ` ┃ Meet Gemini 4 Argon` … ` ┃ esc to dismiss`): its bar in column 1.
+fn is_card_row(row: &str) -> bool {
+    leading_spaces(row) == 1 && crate::text::trim_start(row).starts_with('┃')
+}
+
 /// The agent's last words: the reply under the last message, one line per
 /// row, its indent stripped — the visible rows from the top when the
-/// message scrolled away. `None` while a turn runs, before any message, and
-/// when the turn ended on agy's own rows (an interrupt, an error, a tool
-/// row and its output).
+/// message scrolled away — under any notice card over the composer. `None`
+/// while a turn runs, before any message, and when the turn ended on agy's
+/// own rows (an interrupt, an error, a tool row and its output).
 #[must_use]
 pub fn said_tail(rows: &[String]) -> Option<String> {
     let f = frame(rows)?;
@@ -338,7 +556,9 @@ pub fn said_tail(rows: &[String]) -> Option<String> {
     let from = user.map_or(0, |u| {
         (u + 1..f.top).find(|&i| blank(&rows[i])).unwrap_or(f.top)
     });
-    let last = (from..f.top).rev().find(|&i| !blank(&rows[i]))?;
+    let last = (from..f.top)
+        .rev()
+        .find(|&i| !blank(&rows[i]) && !is_card_row(&rows[i]))?;
     if !is_reply_row(&rows[last]) {
         return None;
     }
@@ -400,21 +620,221 @@ fn signed_out(rows: &[String]) -> Option<usize> {
     (method && frame(rows).is_none()).then_some(at)
 }
 
-/// The wall on the screen: agy signed out (`WallKind::Auth`; module header).
-/// A person's browser lifts it; its login menu is never read.
+/// The wall on the screen (module header): agy signed out (`WallKind::Auth`;
+/// a person's browser lifts it, and its login menu is never read), or the
+/// Gemini API's failure the last turn ended on (`failed_turn`).
 #[must_use]
 pub fn wall(rows: &[String]) -> Option<Wall> {
-    signed_out(rows).map(|row| Wall::sign_in(rows, row))
+    signed_out(rows)
+        .map(|row| Wall::sign_in(rows, row))
+        .or_else(|| frame(rows).and_then(|f| failed_turn(rows, f)))
+}
+
+/// A failed turn's `⚠` block as `(its head row, its Error ID row)`: the last
+/// thing above the composer, under the last message — its head `⚠ ` in column
+/// 0, the rows it wrapped onto in column 0 under it, then `Error ID: <id>`.
+/// `None` when anything else ended the turn (a reply under the error, a newer
+/// message).
+fn error_block(rows: &[String], f: Frame) -> Option<(usize, usize)> {
+    let from = last_user(rows, f.top).map_or(0, |u| u + 1);
+    let id = (from..f.top).rev().find(|&i| !blank(&rows[i]))?;
+    if !rows[id].starts_with(const { anchor_text("agy.error.id") }) {
+        return None;
+    }
+    (from..id)
+        .rev()
+        .take_while(|&i| !blank(&rows[i]) && leading_spaces(&rows[i]) == 0)
+        .find(|&i| rows[i].starts_with("⚠ "))
+        .map(|head| (head, id))
+}
+
+/// The status the Gemini API answered, where agy printed the genai SDK's
+/// error (`Error %d, Message: %s, Status: %s, Details: %v`, a format string
+/// of the 1.4.0 binary): `… Error 401, Message: …` → 401.
+fn api_status(message: &str) -> Option<u16> {
+    message.match_indices("Error ").find_map(|(at, w)| {
+        let rest = &message[at + w.len()..];
+        let code = rest.get(..3)?;
+        if !code.bytes().all(|b| b.is_ascii_digit()) || !rest[3..].starts_with(", Message: ") {
+            return None;
+        }
+        code.parse().ok()
+    })
+}
+
+/// The Gemini API's own words in a failed turn's block that name its kind
+/// beyond the status (module header), read lowercased. They are the
+/// SERVER's — Google's documented error body, which agy prints whole, and
+/// which the lab's stub answers in — never agy's: no canary can find them in
+/// its binary.
+const API_KEY_INVALID: &str = "api_key_invalid";
+const QUOTA_EXCEEDED: &str = "exceeded your current quota";
+const OVERLOADED: &str = "overloaded";
+
+/// The failures agy words itself that are walls (module header), by the
+/// words their message opens with.
+const OWN_WALLS: [(&str, WallKind); 3] = [
+    (anchor_text("agy.wall.overloaded"), WallKind::Overloaded),
+    (anchor_text("agy.wall.quota"), WallKind::UsageSession),
+    (anchor_text("agy.wall.credits"), WallKind::Spend),
+];
+
+/// `message` with every blank taken out: the SDK's error wraps at column 0
+/// mid-token (`gemini-3.1-pro- preview` once its rows are joined), so a
+/// token is read off this.
+fn squeezed(message: &str) -> String {
+    message.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// A 429's QuotaFailure names a per-minute quota (`quotaId:Generate
+/// RequestsPerMinutePerProjectPerModel-FreeTier`) and no per-day one: a rate
+/// window that lifts within a minute, not a spent quota. A violation of a
+/// per-day quota (`PerDay`, `Daily`) beside it makes the answer the day's,
+/// as Google's own client reads it (Gemini CLI 0.46.0's
+/// `classifyGoogleError` returns its terminal quota error for such a
+/// violation before any other test). Each id is read off the squeezed
+/// message up to the next key (the SDK prints a map's keys in order:
+/// `quotaId` before `quotaMetric`) or the map's end.
+fn per_minute_quota(message: &str) -> bool {
+    let s = squeezed(message);
+    let ids: Vec<&str> = s
+        .match_indices("quotaId:")
+        .map(|(at, w)| {
+            let rest = &s[at + w.len()..];
+            let end = rest
+                .find("quota")
+                .into_iter()
+                .chain(rest.find(']'))
+                .min()
+                .unwrap_or(rest.len());
+            &rest[..end]
+        })
+        .collect();
+    ids.iter().any(|id| id.contains("PerMinute"))
+        && !ids
+            .iter()
+            .any(|id| id.contains("PerDay") || id.contains("Daily"))
+}
+
+/// The wall a failed turn's message is (module header): one agy words
+/// itself ([`OWN_WALLS`]), else by the status the API answered; `None` with
+/// neither in it.
+fn failure_kind(message: &str) -> Option<WallKind> {
+    if let Some(&(_, kind)) = OWN_WALLS
+        .iter()
+        .find(|(words, _)| message.starts_with(words))
+    {
+        return Some(kind);
+    }
+    let code = api_status(message)?;
+    let lower = message.to_lowercase();
+    Some(match code {
+        401 => WallKind::Auth,
+        400 if lower.contains(API_KEY_INVALID) => WallKind::Auth,
+        429 if lower.contains(QUOTA_EXCEEDED) && !per_minute_quota(message) => WallKind::Spend,
+        503 if lower.contains(OVERLOADED) => WallKind::Overloaded,
+        code => WallKind::ApiError {
+            code: Some(code),
+            // agy's own rule, measured: a 503, a 504 and a 429 are retried
+            // under its spinner; a 500, a 400, a 401, a 403 and a 404 are not.
+            retryable: matches!(code, 429 | 503 | 504),
+            cause: ApiCause::Server,
+        },
+    })
+}
+
+/// The delay a 429's RetryInfo asks for (`retryDelay:41397.204181s`, read
+/// off the squeezed message) as a span from now, whole seconds rounded up:
+/// `in 41398s`. `None` with no RetryInfo, or one this does not read.
+fn retry_delay(message: &str) -> Option<String> {
+    let s = squeezed(message);
+    let (at, w) = s.match_indices("retryDelay:").last()?;
+    let rest = &s[at + w.len()..];
+    let whole: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    let after = &rest[whole.len()..];
+    let frac: String = after
+        .strip_prefix('.')
+        .map(|f| f.chars().take_while(char::is_ascii_digit).collect())
+        .unwrap_or_default();
+    let unit = &after[if frac.is_empty() { 0 } else { frac.len() + 1 }..];
+    if whole.is_empty() || !unit.starts_with('s') {
+        return None;
+    }
+    let secs: u64 = whole.parse().ok()?;
+    let up = u64::from(frac.bytes().any(|b| b != b'0'));
+    Some(format!("in {}s", secs.checked_add(up)?))
+}
+
+/// The wall the last turn ended on when the Gemini API failed it
+/// ([`error_block`], [`failure_kind`]): its message the block's rows joined,
+/// the `⚠` and the `Error ID:` row left out — the vendor's row under the last
+/// thing said, so [`Placement::Banner`]. Its reset is a 429's RetryInfo
+/// delay as a span ([`retry_delay`], module header).
+fn failed_turn(rows: &[String], f: Frame) -> Option<Wall> {
+    let (head, id) = error_block(rows, f)?;
+    let message = rows[head..id]
+        .iter()
+        .map(|r| crate::text::trim(r.strip_prefix("⚠ ").unwrap_or(r)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(Wall {
+        kind: failure_kind(&message)?,
+        reset: retry_delay(&message),
+        message,
+        row: head,
+        placement: Placement::Banner,
+        under_call: false,
+    })
+}
+
+/// The feedback survey (module header), as a rating card
+/// ([`SurveyBlock`]): no composer drawn, and as the last rows drawn — the
+/// footer under them or not — the question row and the options row, both at
+/// column 1, the options opening `[1] ` and ending on `[0] Skip`. The `0`
+/// that skips it is guarded on the options row as the screen shows it (its
+/// question carries an ASCII `'`, which the manager's single-quoted command
+/// cannot): a copy quoted in a reply or a message sits at another column and
+/// matches no guard.
+#[must_use]
+pub fn survey(rows: &[String]) -> Option<SurveyBlock> {
+    if frame(rows).is_some() {
+        return None;
+    }
+    let mut options = rows.iter().rposition(|r| !blank(r))?;
+    if footer_of(&rows[options]) != Footer::Other {
+        options = (0..options).rev().find(|&i| !blank(&rows[i]))?;
+    }
+    let head = options.checked_sub(1)?;
+    let row = crate::text::trim_end(&rows[options]);
+    let said = crate::text::trim(row);
+    let card = leading_spaces(row) == 1
+        && said.starts_with("[1] ")
+        && said.ends_with(const { anchor_text("agy.survey.skip") })
+        && leading_spaces(&rows[head]) == 1
+        && crate::text::trim(&rows[head]) == const { anchor_text("agy.survey.question") };
+    card.then(|| SurveyBlock {
+        kind: SurveyKind::Session,
+        head,
+        options,
+        guard: format!("^{}", guard_regex(row)),
+        dismissable: true,
+    })
 }
 
 /// Whether `rows` are agy's by their layout alone, for a session whose
 /// program name says nothing: its composer over a footer it draws, one of
-/// its boxes, or its sign-in wall.
+/// its boxes, a first run's onboarding screen, its survey, or its sign-in
+/// wall.
 pub(crate) fn is_agy_screen(rows: &[String]) -> bool {
     frame(rows).is_some_and(|f| {
-        f.footer
-            .is_some_and(|r| footer_of(&rows[r]) != Footer::Other)
+        f.footer.is_some_and(|r| match footer_of(&rows[r]) {
+            Footer::Other => false,
+            Footer::Blank => crate::text::contains(&rows[r], " · "),
+            Footer::Shortcuts | Footer::Cancel | Footer::ExitPending => true,
+        })
     }) || agy_box(rows).is_some()
+        || onboarding(rows).is_some()
+        || survey(rows).is_some()
         || signed_out(rows).is_some()
 }
 
@@ -433,7 +853,11 @@ pub(crate) struct AgyBox {
     /// Its first option row and its last row of options (a wrapped tail).
     first: usize,
     last: usize,
+    /// Its key row, and the last row the key row wrapped onto.
     keys: usize,
+    keys_end: usize,
+    /// The footer's row under it; `None` with the key row the last drawn.
+    footer: Option<usize>,
 }
 
 /// `> 1. Yes, run command` / `  2. …` → `(1, "Yes, run command", focused)`.
@@ -451,30 +875,48 @@ fn unnumbered(row: &str) -> Option<(&str, bool)> {
         .then(|| (crate::text::trim(rest), focused))
 }
 
-/// The box on `rows` (module header): no composer, its key row the last row
-/// drawn or over the footer's `esc to cancel` (or the model alone), its
-/// options the block of rows above it with one of them focused in column 0.
+/// The key row a box or a screen of choices ends on: the last row drawn, or
+/// the row over the footer's `esc to cancel` (or the model alone).
+fn key_row(rows: &[String]) -> Option<usize> {
+    let end = rows.iter().rposition(|r| !blank(r))?;
+    if is_key_row(&rows[end]) {
+        return Some(end);
+    }
+    if !matches!(footer_of(&rows[end]), Footer::Cancel | Footer::Blank) {
+        return None;
+    }
+    let k = (0..end).rev().find(|&i| !blank(&rows[i]))?;
+    is_key_row(&rows[k]).then_some(k)
+}
+
+/// The box on `rows` (module header): no composer, its key row — and the
+/// rows it wrapped onto — the last drawn or over the footer's `esc to
+/// cancel` (or the right side alone), the pending edit's word after an Esc
+/// under it or not, its options the block of rows above it with one of them
+/// focused in column 0.
 pub(crate) fn agy_box(rows: &[String]) -> Option<AgyBox> {
     let end = rows.iter().rposition(|r| !blank(r))?;
-    let keys = if is_key_row(&rows[end]) {
-        end
-    } else {
-        if !matches!(footer_of(&rows[end]), Footer::Cancel | Footer::Blank) {
-            return None;
-        }
-        let k = (0..end).rev().find(|&i| !blank(&rows[i]))?;
-        if !is_key_row(&rows[k]) {
-            return None;
-        }
-        k
-    };
+    let footer = matches!(footer_of(&rows[end]), Footer::Cancel | Footer::Blank).then_some(end);
+    let keys_end = (0..=end)
+        .rev()
+        .find(|&i| !blank(&rows[i]) && Some(i) != footer && !is_esc_disabled_row(&rows[i]))?;
+    let keys = key_row_ending(rows, keys_end)?;
     let last = (0..keys).rev().find(|&i| !blank(&rows[i]))?;
     let mut top = last;
     while top > 0 && !blank(&rows[top - 1]) {
         top -= 1;
     }
     let block = top..=last;
-    let first = match block.clone().find(|&i| numbered(&rows[i]).is_some()) {
+    // A label that holds a multi-line command wraps onto rows of its own,
+    // blank ones among them (measured: `2. Yes, and always allow … for
+    // commands that start with 'python3 -c '` over the script's lines): the
+    // options run from their `1.` row down, found above the blanks, never past
+    // the rule under the box's title.
+    let one = (0..=last)
+        .rev()
+        .take_while(|&i| plain_rule_width(&rows[i]).is_none())
+        .find(|&i| numbered(&rows[i]).is_some_and(|(n, _, _)| n == 1));
+    let first = match one.or_else(|| block.clone().find(|&i| numbered(&rows[i]).is_some())) {
         Some(first) => first,
         // Unnumbered (the trust box): every row of the block an option.
         None if block.clone().all(|i| unnumbered(&rows[i]).is_some()) => top,
@@ -503,6 +945,8 @@ pub(crate) fn agy_box(rows: &[String]) -> Option<AgyBox> {
         first,
         last,
         keys,
+        keys_end,
+        footer,
     })
 }
 
@@ -529,7 +973,13 @@ const ONCE: [&str; 3] = [
 fn approval_role(label: &str) -> Role {
     if ONCE.contains(&label) {
         Role::Once
-    } else if label.starts_with(const { anchor_text("agy.box.session") }) {
+    } else if label.contains(const { anchor_text("agy.box.persisted") }) {
+        // agy's own suffix on every answer it saves to settings.json, grant or
+        // refusal (its binary's labels), whatever the words before it say.
+        Role::Persist
+    } else if label.starts_with(const { anchor_text("agy.box.session") })
+        || label.contains(const { anchor_text("agy.box.conversation") })
+    {
         Role::Session
     } else if label.starts_with(const { anchor_text("agy.box.persist") })
         || label == const { anchor_text("agy.create.persist") }
@@ -593,20 +1043,73 @@ fn cancel_of(keys: &str, footer: Option<&str>) -> Option<Cancel> {
         })
 }
 
+/// Whether a question's `options` are answered by one digit (module header):
+/// none of them a multi-select's checkbox (`[ ] Red`, `[x] Red`: a digit
+/// only toggles it) or the person's own kept answer (`✓ …`), and the last of
+/// them agy's `Write-in...`.
+fn one_digit_answers(options: &[Opt]) -> bool {
+    const MARKS: [&str; 3] = [
+        anchor_text("agy.question.unchecked"),
+        anchor_text("agy.question.checked"),
+        anchor_text("agy.question.written"),
+    ];
+    options
+        .iter()
+        .all(|o| !MARKS.iter().any(|m| o.label.starts_with(m)))
+        && options
+            .last()
+            .is_some_and(|o| o.label == const { anchor_text("agy.question.write_in") })
+}
+
 /// The box on `rows`, read whole ([`PromptV2`]): its title and kind, the
 /// command box's command (the rows under `Requesting permission for:`), a
 /// file box's path (its first body row, less its `+1 -1` counts) and reason,
 /// the trust box's folder, the question's text, the options with their
 /// roles — wrapped tails joined back, every role [`Role::Other`] unless the
 /// options run `1.`, `2.`, … (or are the trust box's two) with the cursor on
-/// exactly one — chosen by digit (the trust box by the cursor and Enter),
-/// and the Esc offered. A box whose title is off the rows read is named by
-/// nothing ([`PromptKind::Other`], [`PromptV2::head_off_screen`]), its
-/// options' roles the approval boxes' only where one of their one-shot
-/// allows is among them.
+/// exactly one, and for a question unless one digit answers it — chosen by
+/// digit (the trust box by the cursor and Enter), the key row (its wrapped
+/// rows joined), and the Esc offered: none on the pending edit, whose Esc
+/// agy disabled. A box whose title is off the rows read is named by nothing
+/// ([`PromptKind::Other`], [`PromptV2::head_off_screen`]), its options' roles
+/// the approval boxes' only where one of their one-shot allows is among
+/// them. With no box up, a first run's onboarding screen is one of no kind
+/// (`onboarding`), and a subagent's alert over the composer is a prompt
+/// named by nothing, its row the title and NO option: its answer is the
+/// person's, given in the subagent's own view.
 #[must_use]
 pub fn prompt(rows: &[String]) -> Option<PromptV2> {
-    let b = agy_box(rows)?;
+    match agy_box(rows) {
+        Some(b) => Some(box_prompt(rows, b)),
+        None => onboarding(rows).or_else(|| alert_prompt(rows)),
+    }
+}
+
+/// WHAT ESC DOES on `p`, a box [`prompt`] read: the Esc it names
+/// ([`PromptV2::cancel`]), else what agy's Esc does on the boxes that name
+/// none, MEASURED in the lab on 1.4.0 (2026-10-16): on the trust box it
+/// quits agy (back at the shell within two seconds; left alone, the box
+/// stood); on the terms screen it goes back to the colour scheme, as its
+/// `[Previous]` button does. `None` on any other: Esc on the colour scheme
+/// changes nothing.
+#[must_use]
+pub fn esc(p: &PromptV2) -> Option<CancelEffect> {
+    if let Some(c) = &p.cancel {
+        return Some(c.effect);
+    }
+    let previous = const { anchor_text("agy.onboarding.previous") };
+    match p.kind {
+        PromptKind::Trust => Some(CancelEffect::Exit),
+        PromptKind::Other => p
+            .options
+            .iter()
+            .any(|o| o.label == previous)
+            .then_some(CancelEffect::Back),
+        _ => None,
+    }
+}
+
+fn box_prompt(rows: &[String], b: AgyBox) -> PromptV2 {
     let kind = match (b.trust, b.title) {
         (Some(_), _) => PromptKind::Trust,
         (None, Some(t)) => kind_of(&rows[t]),
@@ -634,7 +1137,7 @@ pub fn prompt(rows: &[String]) -> Option<PromptV2> {
                 focused,
                 row: i,
             });
-        } else if let Some(o) = options.last_mut() {
+        } else if let Some(o) = options.last_mut().filter(|_| !blank(row)) {
             // A wrapped label's tail, at column 0 under it.
             o.label = format!("{} {}", o.label, crate::text::trim(row));
         }
@@ -646,7 +1149,8 @@ pub fn prompt(rows: &[String]) -> Option<PromptV2> {
     let focus = options.iter().filter(|o| o.focused).count();
     let named =
         kind != PromptKind::Other || options.iter().any(|o| ONCE.contains(&o.label.as_str()));
-    if ordered && focus == 1 && named {
+    let answered_by_digit = kind != PromptKind::Question || one_digit_answers(&options);
+    if ordered && focus == 1 && named && answered_by_digit {
         for o in &mut options {
             o.role = role_of(kind, &o.label);
         }
@@ -710,12 +1214,13 @@ pub fn prompt(rows: &[String]) -> Option<PromptV2> {
         PromptKind::Bash => command_rows.join(" "),
         _ => path.clone().unwrap_or_default(),
     };
-    let footer = rows
+    let keys = rows[b.keys..=b.keys_end]
         .iter()
-        .rposition(|r| !blank(r))
-        .filter(|&f| f > b.keys)
-        .map(|f| rows[f].as_str());
-    Some(PromptV2 {
+        .map(|r| crate::text::trim(r))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let footer = b.footer.map(|f| rows[f].as_str());
+    PromptV2 {
         kind,
         title: crate::text::trim(&rows[title_row]).to_string(),
         command_rows,
@@ -732,11 +1237,46 @@ pub fn prompt(rows: &[String]) -> Option<PromptV2> {
         } else {
             Select::Digits
         },
-        cancel: cancel_of(&rows[b.keys], footer),
+        // The pending edit's Esc does nothing (module header).
+        cancel: if kind == PromptKind::Edit {
+            None
+        } else {
+            cancel_of(&keys, footer)
+        },
         question,
-        span: (title_row, b.keys),
-        footer: Some(crate::text::trim(&rows[b.keys]).to_string()),
+        span: (title_row, b.keys_end),
+        footer: Some(keys),
         head_off_screen,
+        question_dialog: None,
+        reason_rows: Vec::new(),
+    }
+}
+
+/// A subagent's alert over the composer as a prompt ([`prompt`]): named by
+/// nothing, its row the title, NO option — never a box with its head off the
+/// screen: the whole of it is on the screen, and it offers nothing here to
+/// press.
+fn alert_prompt(rows: &[String]) -> Option<PromptV2> {
+    let f = frame(rows)?;
+    let row = alert(rows, f.top)?;
+    Some(PromptV2 {
+        kind: PromptKind::Other,
+        title: crate::text::trim(&rows[row]).to_string(),
+        command_rows: Vec::new(),
+        description_rows: 0,
+        gutter: false,
+        command: String::new(),
+        description: String::new(),
+        notes: Vec::new(),
+        auto_deny: None,
+        path: None,
+        options: Vec::new(),
+        select: Select::Digits,
+        cancel: None,
+        question: None,
+        span: (row, row),
+        footer: None,
+        head_off_screen: false,
         question_dialog: None,
         reason_rows: Vec::new(),
     })
@@ -748,6 +1288,102 @@ fn question_text(row: &str) -> Option<&str> {
     let (count, text) = rest.split_once(": ")?;
     let (a, b) = count.split_once('/')?;
     (a.parse::<u8>().is_ok() && b.parse::<u8>().is_ok()).then_some(text)
+}
+
+/// The first run's onboarding headings (module header), each at column 0:
+/// the colour scheme's (its preview box drawn on the same row) and the
+/// terms'.
+const ONBOARDING: [&str; 2] = [
+    anchor_text("agy.onboarding.scheme"),
+    anchor_text("agy.onboarding.terms"),
+];
+
+/// A first run's onboarding screen (module header), read whole as a box of
+/// NO KIND: no composer, its key row ([`key_row`]) and above it one of the
+/// [`ONBOARDING`] headings. Its options are every row left of the preview
+/// box (`│`) that is a choice — `> ` at column 2 the focused one, a label at
+/// column 4 another, the rows a long one wrapped onto at column 6 or more
+/// joined to it, and each `[Button]` of a row of them — every one
+/// [`Role::Other`], unnumbered, chosen by the cursor and Enter. Nothing on
+/// it names a role, so no policy presses any of it: the person's taste and
+/// the person's consent.
+fn onboarding(rows: &[String]) -> Option<PromptV2> {
+    if frame(rows).is_some() {
+        return None;
+    }
+    let keys = key_row(rows)?;
+    let (head, title) = (0..keys).rev().find_map(|i| {
+        let row = crate::text::trim_end(&rows[i]);
+        ONBOARDING
+            .iter()
+            .find(|h| {
+                row.starts_with(**h) && (row.len() == h.len() || row[h.len()..].starts_with(' '))
+            })
+            .map(|h| (i, *h))
+    })?;
+    let mut options: Vec<Opt> = Vec::new();
+    let mut wraps = false;
+    for (i, row) in rows.iter().enumerate().take(keys).skip(head + 1) {
+        let left = crate::text::trim_end(row.split(['│', '╭', '╰']).next().unwrap_or(row));
+        let text = crate::text::trim(left);
+        let mut push = |label: &str, focused: bool| {
+            options.push(Opt {
+                n: None,
+                label: label.to_string(),
+                role: Role::Other,
+                focused,
+                row: i,
+            });
+        };
+        match leading_spaces(left) {
+            _ if text.is_empty() => wraps = false,
+            4 if text.starts_with('[') => {
+                for button in text
+                    .split("  ")
+                    .map(crate::text::trim)
+                    .filter(|b| !b.is_empty())
+                {
+                    push(button, false);
+                }
+                wraps = false;
+            }
+            2 if text.starts_with("> ") => {
+                push(crate::text::trim(&text[2..]), true);
+                wraps = true;
+            }
+            4 => {
+                push(text.split("  ").next().unwrap_or(text), false);
+                wraps = true;
+            }
+            n if n >= 6 && wraps => {
+                if let Some(o) = options.last_mut() {
+                    o.label = format!("{} {text}", o.label);
+                }
+            }
+            _ => wraps = false,
+        }
+    }
+    Some(PromptV2 {
+        kind: PromptKind::Other,
+        title: title.to_string(),
+        command_rows: Vec::new(),
+        description_rows: 0,
+        gutter: false,
+        command: String::new(),
+        description: String::new(),
+        notes: Vec::new(),
+        auto_deny: None,
+        path: None,
+        options,
+        select: Select::ArrowsEnter,
+        cancel: None,
+        question: Some(head),
+        span: (head, keys),
+        footer: Some(crate::text::trim(&rows[keys]).to_string()),
+        head_off_screen: false,
+        question_dialog: None,
+        reason_rows: Vec::new(),
+    })
 }
 
 /// agy's screens, measured, for this crate's tests and a dependent crate's
@@ -792,6 +1428,10 @@ pub mod fixtures {
     pub const BOX_EDIT: &str = include_str!("fixtures/agy-1.4.0-box-pending-edit.txt");
     /// agy's ask-the-user tool.
     pub const QUESTION: &str = include_str!("fixtures/agy-1.4.0-question.txt");
+    /// The shell-command box for a multi-line script: options 2 and 3 quote
+    /// the command's prefix over rows of their own, a blank one among them.
+    pub const BOX_EXEC_MULTILINE: &str =
+        include_str!("fixtures/agy-1.4.0-box-exec-multiline-options.txt");
     /// After `No, cancel` on the shell box, at 100 columns.
     pub const CANCELLED: &str = include_str!("fixtures/agy-1.4.0-cancelled-100x30.txt");
     /// After `No, deny creation` on the file box.
@@ -800,12 +1440,104 @@ pub mod fixtures {
     pub const REJECTED: &str = include_str!("fixtures/agy-1.4.0-rejected-interrupted.txt");
     /// `/` typed: the command menu under the composer.
     pub const SLASH_MENU: &str = include_str!("fixtures/agy-1.4.0-slash-menu.txt");
-    /// One ctrl+c at an idle composer.
+    /// One ctrl+c at the empty idle composer: an exit pending (one over a
+    /// held draft arms it too: [`lab::CTRL_C_DRAFT`]).
     pub const EXIT_CONFIRM: &str = include_str!("fixtures/agy-1.4.0-exit-confirm.txt");
     /// After the second ctrl+c: the resume line, then the shell.
     pub const EXITED: &str = include_str!("fixtures/agy-1.4.0-exited-resume.txt");
     /// Signed out: the login-method menu drawn instead of a composer.
     pub const SIGNED_OUT: &str = include_str!("fixtures/agy-1.4.0-wall-signed-out.txt");
+
+    /// The same agy driven by `aterm-lab` (`lab agy-captures`) at 144×50,
+    /// under a scratch HOME whose settings name the Gemini API provider, a
+    /// fake key and a local stub of the Gemini API, its Google hosts
+    /// black-holed — each file's line 1 says what the stub answered.
+    pub mod lab {
+        /// First run, no onboarding seed: the colour-scheme picker.
+        pub const FIRST_RUN_SCHEME: &str =
+            include_str!("fixtures/agy-1.4.0-lab-first-run-color-scheme.txt");
+        /// After one Enter on it: the terms and data use, ticked by default.
+        pub const FIRST_RUN_TERMS: &str =
+            include_str!("fixtures/agy-1.4.0-lab-first-run-terms.txt");
+        /// No trust seed: the folder-trust box.
+        pub const FIRST_RUN_TRUST: &str =
+            include_str!("fixtures/agy-1.4.0-lab-first-run-trust.txt");
+        /// A fresh session, every first-run screen seeded away.
+        pub const IDLE: &str = include_str!("fixtures/agy-1.4.0-lab-idle.txt");
+        /// A typed, unsent draft.
+        pub const DRAFT: &str = include_str!("fixtures/agy-1.4.0-lab-draft.txt");
+        /// Thinking: the spinner's word is the thought.
+        pub const BUSY_THINKING: &str = include_str!("fixtures/agy-1.4.0-lab-busy-thinking.txt");
+        /// Streaming the reply.
+        pub const BUSY_STREAMING: &str = include_str!("fixtures/agy-1.4.0-lab-busy-streaming.txt");
+        /// The end of a turn.
+        pub const END_OF_TURN: &str = include_str!("fixtures/agy-1.4.0-lab-end-of-turn.txt");
+        /// The pane at 50 columns: a reply of two paragraphs, the second
+        /// wrapped over three rows at column two, two cells short of the
+        /// pane's edge, its last `or 2)?`.
+        pub const REPLY_WRAPPED_50: &str =
+            include_str!("fixtures/agy-1.4.0-lab-reply-wrapped-50col.txt");
+        /// A turn stopped with Esc.
+        pub const INTERRUPTED: &str = include_str!("fixtures/agy-1.4.0-lab-interrupted.txt");
+        /// `/` typed: the command menu.
+        pub const SLASH_MENU: &str = include_str!("fixtures/agy-1.4.0-lab-slash-menu.txt");
+        /// The shell tool's box.
+        pub const BOX_SHELL: &str = include_str!("fixtures/agy-1.4.0-lab-box-shell.txt");
+        /// The write tool's box (a new file in the workspace).
+        pub const BOX_WRITE: &str = include_str!("fixtures/agy-1.4.0-lab-box-write.txt");
+        /// The edit tool's box.
+        pub const BOX_EDIT: &str = include_str!("fixtures/agy-1.4.0-lab-box-edit.txt");
+        /// The question tool.
+        pub const QUESTION: &str = include_str!("fixtures/agy-1.4.0-lab-question.txt");
+        /// The question answered with Enter, the turn ended.
+        pub const QUESTION_ANSWERED: &str =
+            include_str!("fixtures/agy-1.4.0-lab-question-answered.txt");
+        /// The feedback survey, drawn unasked in the composer's place.
+        pub const SURVEY: &str = include_str!("fixtures/agy-1.4.0-lab-survey.txt");
+        /// `/quit` sent: the resume line, then the lab's shell.
+        pub const EXIT: &str = include_str!("fixtures/agy-1.4.0-lab-exit.txt");
+        /// One ctrl+d at the empty composer: an exit pending, its hint
+        /// still standing a minute on.
+        pub const EXIT_CONFIRM_CTRL_D: &str =
+            include_str!("fixtures/agy-1.4.0-lab-exit-confirm-ctrl-d.txt");
+        /// One ctrl+c over a held draft (`x`): an exit pending, the draft
+        /// kept in the composer.
+        pub const CTRL_C_DRAFT: &str = include_str!("fixtures/agy-1.4.0-lab-ctrl-c-draft.txt");
+        /// A 429 RESOURCE_EXHAUSTED per-day quota, not retried.
+        pub const ERROR_429: &str = include_str!("fixtures/agy-1.4.0-lab-error-429-per-day.txt");
+        /// A 401 UNAUTHENTICATED.
+        pub const ERROR_401: &str = include_str!("fixtures/agy-1.4.0-lab-error-401.txt");
+        /// A 400 INVALID_ARGUMENT, reason API_KEY_INVALID.
+        pub const ERROR_400_KEY: &str = include_str!("fixtures/agy-1.4.0-lab-error-400-key.txt");
+        /// A 503 UNAVAILABLE mid-retry: the spinner, no retry row.
+        pub const RETRY_503: &str = include_str!("fixtures/agy-1.4.0-lab-retry-503.txt");
+        /// The 503 once its retries ran out.
+        pub const ERROR_503: &str = include_str!("fixtures/agy-1.4.0-lab-error-503.txt");
+        /// A 500 INTERNAL, shown at once (not retried).
+        pub const ERROR_500: &str = include_str!("fixtures/agy-1.4.0-lab-error-500.txt");
+        /// A 403 PERMISSION_DENIED, reason SERVICE_DISABLED: not retried.
+        pub const ERROR_403_DISABLED: &str =
+            include_str!("fixtures/agy-1.4.0-lab-error-perm403.txt");
+        /// A 403 PERMISSION_DENIED with no details: not retried.
+        pub const ERROR_403: &str = include_str!("fixtures/agy-1.4.0-lab-error-denied403.txt");
+        /// A 404 NOT_FOUND for the model: not retried.
+        pub const ERROR_404: &str = include_str!("fixtures/agy-1.4.0-lab-error-notfound404.txt");
+        /// A 400 FAILED_PRECONDITION (the location): not retried.
+        pub const ERROR_400_LOCATION: &str =
+            include_str!("fixtures/agy-1.4.0-lab-error-location400.txt");
+        /// A 504 DEADLINE_EXCEEDED once its eight retries ran out.
+        pub const ERROR_504: &str = include_str!("fixtures/agy-1.4.0-lab-error-timeout504.txt");
+        /// A bare 429 RESOURCE_EXHAUSTED (no RetryInfo) once its eight
+        /// retries ran out.
+        pub const ERROR_429_BARE: &str =
+            include_str!("fixtures/agy-1.4.0-lab-error-exhausted429.txt");
+        /// A per-minute 429, RetryInfo 47.218363629s: not retried.
+        pub const ERROR_429_PER_MINUTE: &str =
+            include_str!("fixtures/agy-1.4.0-lab-error-minute429.txt");
+        /// A per-day 429, RetryInfo 41397.204181s: not retried.
+        pub const ERROR_429_LONG: &str =
+            include_str!("fixtures/agy-1.4.0-lab-error-day429long.txt");
+    }
 }
 
 #[cfg(test)]

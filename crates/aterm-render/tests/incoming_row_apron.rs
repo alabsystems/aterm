@@ -185,29 +185,6 @@ fn cached_gate_hit_frame_still_paints_the_strip() {
     assert_eq!(wc.presented_pixels(), wc.frame_pixels());
 }
 
-/// A down-bounce (negative residual) owes no apron: the frame is a plain band translate of
-/// the untranslated frame.
-#[test]
-fn down_bounce_keeps_the_placeholder() {
-    let mut r = renderer();
-    let (_cw, ch) = r.cell_size();
-    let grid_top = r.grid_top();
-    let frac = -((ch / 2).max(1) as i32);
-    let mut t = seeded_term();
-    t.scroll_display(3);
-    let flat = r.render_input(&partitioned(&mut t, 0));
-    let bounce = r.render_input(&partitioned(&mut t, frac));
-    let mut expect = flat.pixels.clone();
-    aterm_render::scroll_translate::translate_grid_band_in_place(
-        &mut expect,
-        flat.width,
-        grid_top + ch,
-        grid_top + ROWS * ch,
-        i64::from(frac),
-    );
-    assert_eq!(bounce.pixels, expect, "a bounce is the bare translate");
-}
-
 /// Scrolling past the bottom of the live screen (`display_offset == 0`,
 /// `scroll_frac_px > 0`, `apron_row.present == false`) must paint a blank
 /// frame-background apron into the bottom `frac` scanlines rather than leaving

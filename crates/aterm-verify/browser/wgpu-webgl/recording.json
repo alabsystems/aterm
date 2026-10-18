@@ -1,0 +1,18 @@
+{
+  "module": "aterm-gpu-web",
+  "browser": "HeadlessChrome/155.0.8059.84",
+  "adapter": "ANGLE (Apple, ANGLE Metal Renderer: Apple M4 Pro, Unspecified Version) (Gl)",
+  "frames": [
+    {"height":126,"name":"parity-0","sha256":"a0ae1f1c79ebf68f84cc651d4d94dd1bc7bbf7cf1756d299dc04cf93a63bbe38","width":132},
+    {"height":126,"name":"parity-1","sha256":"ef74855a801ca4d2a97ea70817b1796ebc695c4d77fa7e400e516851b47e6c7e","width":132},
+    {"height":126,"name":"parity-2","sha256":"b7bf62cf78f6db462a6d472fbb7f6ce44ddf150626800a1fe2f1f9342306860f","width":132},
+    {"height":126,"name":"parity-3","sha256":"2f6904a14edc5ff08a6980b6ff3e779c2bf1087ba781aa3d9cd7c29aabed4a11","width":132},
+    {"height":168,"name":"diff-0","sha256":"96b4167be951797e7a8e5571c8cbd9f53f2125237d1f23d0d9005617d49f3c04","width":440},
+    {"height":168,"name":"diff-1","sha256":"7e2225c78c7db8b4de136534a46083ce45705a3ccfa3864bccea5046be6a5313","width":440},
+    {"height":168,"name":"diff-2","sha256":"796e8aee822942a8793dee9c8ae8e7f6e881e2657b15d8b065c099f7d7edfdd4","width":440},
+    {"height":168,"name":"diff-3","sha256":"c194d9d16315ee6d09a1a44ec2286d160531f2404006aa3aa85c13fdcba1ce76","width":440},
+    {"height":168,"name":"diff-4","sha256":"8fd880cbbc448f5bf7d96afd1deea591e414f1644a4e4142b6a3c5e5c68366c3","width":440},
+    {"height":168,"name":"diff-5","sha256":"d10b87276d77195600078c74dcbd177ecbbffcd3a8679be5fd3de5418f344fcf","width":440},
+    {"height":168,"name":"diff-6","sha256":"164a2a07b053717d5f965113bae8a3e1333fcc03e18fd2d120a615cdf8c9a25d","width":440}
+  ]
+}

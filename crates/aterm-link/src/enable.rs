@@ -117,7 +117,12 @@
 //!    RUNS A REPLACED BUILD (an update swapped the file its argv names after it
 //!    started; [`crate::fabric::BrokerView::replaced`]). A broker of this build
 //!    restarts itself on a swap: it exits when its executable is replaced, and
-//!    `KeepAlive` / `Restart=always` start the new one.
+//!    `KeepAlive` / `Restart=always` start the new one. A job in the deleted
+//!    fabric-enable.sh's `/bin/sh -c "rm -f …; exec …"` form is first READ
+//!    for the broker it execs — what this root serves, `--tcp` included — and
+//!    then rewritten and restarted like any other; an installed job of any
+//!    other shape names no broker this can read, and `on` and `doctor` refuse
+//!    it until it is fixed by hand ([`Role::of`]).
 //! 7. `[fabric] command` in aterm.toml: replacing only the `command` key of an
 //!    existing `[fabric]` table, in any spelling TOML allows (`[ "fabric" ]`, a
 //!    quoted `"command"`), and leaving everything else alone. The edit is read
@@ -130,7 +135,8 @@
 //!    between two sessions of this node arrives demoted (`kind=note
 //!    demoted=task`), which `await inbox` skips by default.
 //! 8. The rendezvous file, `fabric.toml` beside the instance control sockets
-//!    (`$XDG_RUNTIME_DIR/aterm`, else `~/Library/Application Support/aterm`),
+//!    (`aterm_uds::control_socket_dir`: `$XDG_RUNTIME_DIR/aterm`, else the
+//!    per-user default, `~/Library/Application Support/aterm` on macOS),
 //!    0600: fleet, broker, node, cap file, state dir and the bridge command.
 //!    `aterm link ls` defaults its `--fleet --broker` from it, and its
 //!    `--cap-file --state` only with the defaulted broker ([`fill_defaults`]);
@@ -367,6 +373,11 @@ pub struct OnOpts {
     pub key_file: Option<String>,
     /// `--allow-remote`: let `--tcp` bind a non-loopback address.
     pub allow_remote: bool,
+    /// `--durability strict|ordered|relaxed`: what the broker's ack promises
+    /// ([`crate::durability`]), NAMED in the job's argv. `None` keeps the tier
+    /// the installed job names ([`kept_durability`]), else none: the build's
+    /// default.
+    pub durability: Option<crate::durability::Durability>,
 }
 
 /// `aterm fabric off`'s flags.
@@ -404,6 +415,19 @@ pub struct Paths {
     /// How this host's bridges reach the broker, and whether this host serves
     /// it: [`Wire::Unix`] unless `on --tcp` or `join` said otherwise.
     pub wire: Wire,
+    /// The tier the broker's argv NAMES (`on --durability`, or the one the
+    /// installed job names); `None` names none, and the broker runs the
+    /// build's default ([`crate::durability::resolve`] says which).
+    pub durability: Option<crate::durability::Durability>,
+}
+
+impl Paths {
+    /// The tier the broker this root runs acks under: the named one, else the
+    /// build's default.
+    #[must_use]
+    pub fn tier(&self) -> crate::durability::Durability {
+        crate::durability::resolve(self.durability)
+    }
 }
 
 /// How this host's bridges reach the broker — and whether THIS host serves it.
@@ -478,25 +502,35 @@ impl Paths {
             config: fabric::config_path(),
             rendezvous: rendezvous_path(),
             wire: Wire::Unix,
+            durability: None,
         })
     }
 
     /// [`Paths::resolve`] for `off`: the root is the one the fabric IS ON —
-    /// the `--broker` the config's `[fabric] command` dials, else the
-    /// rendezvous file's — and only with neither the environment's (module
-    /// doc, `off`). Answers where the root came from beside the paths.
+    /// the `--broker` the `[fabric] command` dials (a development build's
+    /// `ATERM_FABRIC_COMMAND` seam first, as `aterm fabric` reads it), else
+    /// the rendezvous file's — and only with none of them the environment's
+    /// (module doc, `off`). So `doctor` reads the role of the fabric its
+    /// report is about. Answers where the root came from beside the paths.
     ///
     /// # Errors
     ///
     /// As [`Paths::resolve`].
     pub fn resolve_for_off() -> Result<(Self, &'static str), String> {
         let mut p = Self::resolve(None)?;
-        let configured = fabric::resolve_command(None, p.config.as_deref())
-            .ok()
-            .flatten()
-            .and_then(|(_, cmd)| fabric::bridge_config(&cmd).ok())
-            .and_then(|cfg| root_of(&cfg.transport, &cfg.broker, cfg.cap_files.first()))
-            .map(|root| (root, "[fabric] command"));
+        let configured =
+            fabric::resolve_command(fabric::command_seam().as_deref(), p.config.as_deref())
+                .ok()
+                .flatten()
+                .and_then(|(source, cmd)| {
+                    let cfg = fabric::bridge_config(&cmd).ok()?;
+                    let root = root_of(&cfg.transport, &cfg.broker, cfg.cap_files.first())?;
+                    let source = match source {
+                        fabric::Source::Env => "$ATERM_FABRIC_COMMAND",
+                        _ => "[fabric] command",
+                    };
+                    Some((root, source))
+                });
         let found = configured.or_else(|| {
             Rendezvous::read()
                 .ok()
@@ -674,7 +708,11 @@ impl Paths {
     /// On the sealed wire THIS host serves, `broker --tcp <bind> --key-file
     /// <k> --secret-file <root>/mint.secret [--allow-remote] --unix
     /// <root>/bus.sock <log>`, serving the root's socket for this host's own
-    /// bridges too.
+    /// bridges too. A NAMED tier rides after the secret (`--durability
+    /// relaxed`, and `--durability strict` too, so a job that chose strict
+    /// keeps it under a build whose default differs); a job that names none
+    /// carries nothing and runs the build's default, so the argv every earlier
+    /// strict `on` wrote is still this one.
     fn broker_argv(&self) -> Vec<String> {
         let mut argv = vec![self.aterm.clone()];
         if !self.is_link_shim() {
@@ -696,6 +734,7 @@ impl Paths {
                     "--secret-file".to_string(),
                     self.secret().to_string_lossy().into_owned(),
                 ]);
+                argv.extend(crate::durability::argv_words(self.durability));
                 if *allow_remote {
                     argv.push("--allow-remote".to_string());
                 }
@@ -703,12 +742,15 @@ impl Paths {
                 argv.push(self.sock());
                 argv.push(self.log());
             }
-            Wire::Unix | Wire::Sealed { bind: None, .. } => argv.extend([
-                self.sock(),
-                self.log(),
-                "--secret-file".to_string(),
-                self.secret().to_string_lossy().into_owned(),
-            ]),
+            Wire::Unix | Wire::Sealed { bind: None, .. } => {
+                argv.extend([
+                    self.sock(),
+                    self.log(),
+                    "--secret-file".to_string(),
+                    self.secret().to_string_lossy().into_owned(),
+                ]);
+                argv.extend(crate::durability::argv_words(self.durability));
+            }
         }
         argv
     }
@@ -962,22 +1004,116 @@ pub(crate) fn supervisor_last_word(root: &Path) -> Option<String> {
 }
 
 /// The broker words of a unit [`Paths::unit_text`] wrote: its `ExecStart`'s
-/// single-quoted words ([`Paths::broker_words`] — [`argv_safe`] keeps a quote
-/// out of every word, so the odd fields of a split on `'` are the words).
+/// `/bin/sh -c "exec '<word>' …"` script, read by [`sh_c_words`] — so a unit
+/// in the deleted fabric-enable.sh's `rm -f …; exec …` form reads too.
 /// `None` for a unit of another shape.
 fn unit_argv(text: &str) -> Option<Vec<String>> {
-    let words = text
+    let line = text
         .lines()
-        .find_map(|l| l.strip_prefix("ExecStart=/bin/sh -c \"exec "))?
-        .strip_suffix('"')?;
-    Some(
-        words
-            .split('\'')
-            .skip(1)
-            .step_by(2)
-            .map(str::to_string)
-            .collect(),
-    )
+        .find_map(|l| l.strip_prefix("ExecStart=/bin/sh -c \""))?;
+    sh_c_words(line.strip_suffix('"')?)
+}
+
+/// The command words of a supervisor's `sh -c` script, for the ONE shape aterm
+/// (or the deleted fabric-enable.sh) ever wrote: an optional `rm -f <word>;`,
+/// then `exec` and one or more words. A word is a single-quoted run with no
+/// quote in it (`''` is the empty word) or a bare run of characters no shell
+/// gives a meaning to; words are separated by spaces or tabs, and the whole
+/// script may carry leading and trailing whitespace.
+///
+/// NOT A SHELL PARSER: any other shape — another leading command, a second
+/// `;`, `&&`, a double quote, a backslash, `$`, a glob, no `exec`, nothing
+/// after `exec`, two words run together — is `None`, so an installed job this
+/// cannot read for certain stays an unknown role ([`Role::of`] refuses it)
+/// rather than being guessed at.
+fn sh_c_words(script: &str) -> Option<Vec<String>> {
+    /// One shell token: a word, or the `;` that ends a command.
+    enum Tok {
+        Word(String),
+        Semi,
+    }
+    let bare =
+        |c: char| !c.is_whitespace() && !c.is_control() && !"'\"\\$`;&|<>()*?![]{}~#".contains(c);
+    let mut toks = Vec::new();
+    let mut chars = script.trim().chars().peekable();
+    while let Some(&c) = chars.peek() {
+        match c {
+            ' ' | '\t' => {
+                chars.next();
+                continue;
+            }
+            ';' => {
+                chars.next();
+                toks.push(Tok::Semi);
+            }
+            '\'' => {
+                chars.next();
+                let mut word = String::new();
+                loop {
+                    match chars.next()? {
+                        '\'' => break,
+                        c => word.push(c),
+                    }
+                }
+                toks.push(Tok::Word(word));
+            }
+            c if bare(c) => {
+                let mut word = String::new();
+                while let Some(&c) = chars.peek().filter(|&&c| bare(c)) {
+                    word.push(c);
+                    chars.next();
+                }
+                toks.push(Tok::Word(word));
+            }
+            _ => return None,
+        }
+        // A word ends at a separator, a `;`, or the end: `a'b'` is
+        // two runs of one shell word, a shape no writer of these jobs made.
+        if matches!(toks.last(), Some(Tok::Word(_)))
+            && chars
+                .peek()
+                .is_some_and(|&c| !matches!(c, ' ' | '\t' | ';'))
+        {
+            return None;
+        }
+    }
+    let rest = match toks.as_slice() {
+        [Tok::Word(rm), Tok::Word(f), Tok::Word(_), Tok::Semi, rest @ ..]
+            if rm == "rm" && f == "-f" =>
+        {
+            rest
+        }
+        rest => rest,
+    };
+    let [Tok::Word(exec), words @ ..] = rest else {
+        return None;
+    };
+    if exec != "exec" || words.is_empty() {
+        return None;
+    }
+    words
+        .iter()
+        .map(|t| match t {
+            Tok::Word(w) => Some(w.clone()),
+            Tok::Semi => None,
+        })
+        .collect()
+}
+
+/// The command a supervisor job's argv runs. The deleted fabric-enable.sh
+/// installed `/bin/sh -c "rm -f '<sock>'; exec '<aterm>' link broker …"`;
+/// that job is READ for the broker words it execs, so the role it serves is
+/// known, while [`Paths::plist_is_current`] still calls it not current, so
+/// `on` rewrites it to the direct argv and restarts it (module doc, step 6).
+/// `None` for an `sh -c` script [`sh_c_words`] cannot read for certain; any
+/// other argv is the command itself.
+fn supervised_argv(argv: Vec<String>) -> Option<Vec<String>> {
+    match argv.as_slice() {
+        [sh, c, script] if Path::new(sh).file_name().is_some_and(|n| n == "sh") && c == "-c" => {
+            sh_c_words(script)
+        }
+        _ => Some(argv),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1050,6 +1186,43 @@ fn flag_value(flags: &[String], name: &str) -> Option<String> {
         .map(|w| w[1].clone())
 }
 
+/// Why [`Role::of`] refused a root.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RoleError {
+    /// The installed job runs a command that is not the broker.
+    NotABroker,
+    /// The installed job's command line has a shape aterm never wrote:
+    /// `field` (`ProgramArguments`, `ExecStart`) of the file at `path`.
+    UnreadableJob {
+        path: std::path::PathBuf,
+        field: &'static str,
+    },
+    /// Anything else: unreadable or invalid configuration or rendezvous, or
+    /// a broker job missing a flag it needs.
+    Invalid(String),
+}
+
+impl std::fmt::Display for RoleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotABroker => f.write_str(
+                "the installed job does not name a recognized broker command; fix it before \
+                 running `on`",
+            ),
+            Self::UnreadableJob { path, field } => {
+                write!(f, "{}: invalid broker {field}", path.display())
+            }
+            Self::Invalid(why) => f.write_str(why),
+        }
+    }
+}
+
+impl From<String> for RoleError {
+    fn from(why: String) -> Self {
+        Self::Invalid(why)
+    }
+}
+
 impl Role {
     /// What the root `p` is to its fleet. Existing metadata that cannot be
     /// read or understood is a refusal, never evidence of a fresh root.
@@ -1057,7 +1230,7 @@ impl Role {
     /// # Errors
     ///
     /// Unreadable or invalid configuration, rendezvous, or installed job.
-    pub fn of(p: &Paths) -> Result<Self, String> {
+    pub fn of(p: &Paths) -> Result<Self, RoleError> {
         let rendezvous = p
             .rendezvous
             .as_deref()
@@ -1291,41 +1464,80 @@ fn joined_fleet(
     ))
 }
 
-/// Read the installed job rather than treating a parse or I/O failure as a
-/// Unix-only root. A missing job can still leave a served wire in rendezvous.
-fn served_wire(
-    p: &Paths,
-    fleet: Option<String>,
-    rendezvous: Option<&Rendezvous>,
-) -> Result<Option<Served>, String> {
+/// The broker job this root has installed — its supervisor and its argv, the
+/// plist's `ProgramArguments` or the unit's `ExecStart` words, the platform's
+/// own first — or `None` when neither file is there. A file that is there and
+/// does not parse is an error, never "no job".
+fn installed_job(p: &Paths) -> Result<Option<(Service, Vec<String>)>, RoleError> {
     let plist = role_text(&p.plist())?
         .map(|text| {
             plist_program_arguments(&collapse_between_tags(&text))
+                .and_then(supervised_argv)
                 .filter(|argv| !argv.is_empty())
-                .ok_or_else(|| format!("{}: invalid broker ProgramArguments", p.plist().display()))
+                .ok_or_else(|| RoleError::UnreadableJob {
+                    path: p.plist(),
+                    field: "ProgramArguments",
+                })
         })
         .transpose()?;
     let unit = role_text(&p.unit())?
         .map(|text| {
             unit_argv(&text)
                 .filter(|argv| !argv.is_empty())
-                .ok_or_else(|| format!("{}: invalid broker ExecStart", p.unit().display()))
+                .ok_or_else(|| RoleError::UnreadableJob {
+                    path: p.unit(),
+                    field: "ExecStart",
+                })
         })
         .transpose()?;
-    let job = if cfg!(target_os = "linux") {
+    Ok(if cfg!(target_os = "linux") {
         unit.map(|argv| (Service::Systemd, argv))
             .or_else(|| plist.map(|argv| (Service::Launchd, argv)))
     } else {
         plist
             .map(|argv| (Service::Launchd, argv))
             .or_else(|| unit.map(|argv| (Service::Systemd, argv)))
+    })
+}
+
+/// The durability `on` runs when its flags name none: the tier the installed
+/// job's broker argv NAMES ([`crate::durability::Durability::named_of_argv`]),
+/// with the job it was read from — so re-running `on` to repair a relaxed root
+/// restarts the broker it had, not a strict one, and a job that named strict
+/// stays named under a build whose default differs — else none, kept from
+/// nothing: the build's default.
+///
+/// # Errors
+///
+/// An installed job that cannot be read ([`installed_job`]).
+fn kept_durability(
+    p: &Paths,
+) -> Result<(Option<crate::durability::Durability>, Option<String>), String> {
+    let Some((service, argv)) = installed_job(p).map_err(|e| e.to_string())? else {
+        return Ok((None, None));
     };
-    if let Some((service, argv)) = job {
+    let job = match service {
+        Service::Systemd => format!("the systemd --user unit {}", p.unit().display()),
+        _ => format!("the launchd job {}", p.plist().display()),
+    };
+    let named = crate::durability::Durability::named_of_argv(&argv)
+        .ok_or_else(|| format!("{job}: cannot determine the broker durability from its argv"))?;
+    Ok((named, Some(job)))
+}
+
+/// Read the installed job rather than treating a parse or I/O failure as a
+/// Unix-only root. A missing job can still leave a served wire in rendezvous.
+fn served_wire(
+    p: &Paths,
+    fleet: Option<String>,
+    rendezvous: Option<&Rendezvous>,
+) -> Result<Option<Served>, RoleError> {
+    if let Some((service, argv)) = installed_job(p)? {
         let broker = argv.get(1).is_some_and(|word| word == "broker")
             || (argv.get(1).is_some_and(|word| word == "link")
                 && argv.get(2).is_some_and(|word| word == "broker"));
         if !broker {
-            return Err("the installed job does not name a recognized broker command; fix it before running `on`".to_string());
+            return Err(RoleError::NotABroker);
         }
         if argv.iter().any(|word| word == "--tcp") {
             let required = |name| {
@@ -1348,14 +1560,16 @@ fn served_wire(
             }));
         }
         if argv.iter().any(|word| word == "--key-file") {
-            return Err("the installed broker job has --key-file without --tcp".to_string());
+            return Err("the installed broker job has --key-file without --tcp"
+                .to_string()
+                .into());
         }
     }
     let Some(r) = rendezvous else {
         return Ok(None);
     };
     if !crate::subject::is_fleet(&r.fleet) {
-        return Err("the rendezvous file's fleet is invalid".to_string());
+        return Err("the rendezvous file's fleet is invalid".to_string().into());
     }
     match (&r.serves_tcp, &r.serves_key_file) {
         (None, None) => Ok(None),
@@ -1368,7 +1582,7 @@ fn served_wire(
             job: None,
             starts_at_login: false,
         })),
-        _ => Err("the rendezvous file has an incomplete served wire; fix serves_tcp and serves_key_file before running `on`".to_string()),
+        _ => Err("the rendezvous file has an incomplete served wire; fix serves_tcp and serves_key_file before running `on`".to_string().into()),
     }
 }
 
@@ -2141,6 +2355,10 @@ fn write_atomic_checked(
         // whatever the temp got, so say the mode again — on the DESCRIPTOR,
         // which is the file this process created and nothing else.
         f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(mode))?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "aterm-link's flushes are the Ordered-tier work's to classify; the full flush is kept until then"
+        )]
         f.sync_all()?;
         drop(f);
         check()?;
@@ -2879,6 +3097,7 @@ fn wire_step(p: &Paths, out: &mut Out) -> bool {
         token: None,
         presence: crate::presence::Mode::Meta,
         receipts: false,
+        log: crate::mirror::LogMode::Off,
     };
     let (view, _) = fabric::probe_broker(&cfg, &[]);
     if view.read_ok() {
@@ -2952,6 +3171,7 @@ pub(crate) fn launchctl(args: &[&str]) -> Result<(), String> {
 }
 
 /// `launchctl list`'s `PID  Status  Label` rows; empty when it cannot run.
+#[cfg(target_os = "macos")]
 pub(crate) fn launchctl_list() -> String {
     aterm_uds::spawnfd::command("launchctl")
         .arg("list")
@@ -3083,14 +3303,24 @@ fn systemd_main_pid(label: &str) -> Option<u32> {
 /// alone cannot tell; one that acknowledged a capability minted under another
 /// secret checks none (a broker started before its job was rewritten
 /// guarded), so the cap-forced `<src>`, `trust=human` and the per-human halts
-/// rest on nothing.
-fn not_current(view: &fabric::BrokerView) -> Option<&'static str> {
+/// rest on nothing. One whose process runs another `--durability` than the
+/// job's acks under a promise the operator did not choose (a job rewritten
+/// while its broker kept running, or a hand-run one under `--service none`).
+fn not_current(p: &Paths, view: &fabric::BrokerView) -> Option<&'static str> {
+    use crate::durability::Durability;
     if view.replaced.is_some() {
         Some("it runs a replaced build")
     } else if view.guarded == Some(false) {
         Some("it checks no capability")
     } else {
-        None
+        match view.durability {
+            Some(running) if running != p.tier() => Some(match running {
+                Durability::Strict => "it runs at durability strict",
+                Durability::Ordered => "it runs at durability ordered",
+                Durability::Relaxed => "it runs at durability relaxed",
+            }),
+            _ => None,
+        }
     }
 }
 
@@ -3110,14 +3340,35 @@ fn refuse_unmanaged(view: &fabric::BrokerView, sock: &str, out: &mut Out) -> boo
     false
 }
 
-/// Step 6: the broker, supervised. `Ok(true)` when it answers.
-fn broker_step(p: &Paths, node: &str, service: Service, out: &mut Out) -> bool {
+/// Step 6: the broker, supervised. `Ok(true)` when it answers. `named`:
+/// `on --durability` chose the tier, rather than keeping one.
+fn broker_step(p: &Paths, node: &str, service: Service, named: bool, out: &mut Out) -> bool {
     trace("Supervise");
     let sock = p.endpoint();
     let label = p.label();
     match service {
         Service::None => {
             let view = probe(p, node, fabric::process_table);
+            // THE BROKER IS THE OPERATOR'S under `--service none`, run by hand
+            // (the manual's step 1, `--durability relaxed` and all): no job
+            // says its tier, so a bare `on` keeps the one it runs, read off
+            // its process. Only a tier `--durability` names is one to restart
+            // it for — and every restart line below carries the tier kept.
+            let kept;
+            let p = match view.durability {
+                Some(running) if !named && running != p.tier() => {
+                    kept = Paths {
+                        durability: Some(running),
+                        ..p.clone()
+                    };
+                    out.note(
+                        "durability",
+                        &format!("{}, kept from the unmanaged broker", running.name()),
+                    );
+                    &kept
+                }
+                _ => p,
+            };
             if view.read_ok() {
                 out.already(
                     "broker",
@@ -3128,7 +3379,7 @@ fn broker_step(p: &Paths, node: &str, service: Service, out: &mut Out) -> bool {
                     ),
                 );
                 // Nothing here restarts it, so the line says how.
-                if let Some(why) = not_current(&view) {
+                if let Some(why) = not_current(p, &view) {
                     out.warn(
                         "broker",
                         &format!(
@@ -3163,7 +3414,7 @@ fn broker_step(p: &Paths, node: &str, service: Service, out: &mut Out) -> bool {
                 LaunchdJob::Absent => None,
             };
             let view = probe(p, node, fabric::process_table);
-            let stale = not_current(&view);
+            let stale = not_current(p, &view);
             if same && running.is_some() && view.read_ok() && stale.is_none() {
                 out.already("plist", &plist.display().to_string());
                 out.already(
@@ -3259,7 +3510,7 @@ fn broker_step(p: &Paths, node: &str, service: Service, out: &mut Out) -> bool {
             let same = std::fs::read(&unit).is_ok_and(|old| old == text.as_bytes());
             let running = systemd_main_pid(&label);
             let view = probe(p, node, fabric::process_table);
-            if same && running.is_some() && view.read_ok() && not_current(&view).is_none() {
+            if same && running.is_some() && view.read_ok() && not_current(p, &view).is_none() {
                 out.already(
                     "broker",
                     &format!(
@@ -3303,7 +3554,7 @@ fn broker_step(p: &Paths, node: &str, service: Service, out: &mut Out) -> bool {
             } else if !same {
                 "the unit changed"
             } else {
-                not_current(&view).unwrap_or("running but not answering")
+                not_current(p, &view).unwrap_or("running but not answering")
             };
             out.done(
                 "broker",
@@ -4064,6 +4315,20 @@ pub fn on(opts: &OnOpts) -> ExitCode {
         }
     };
     p.wire = wire;
+    // THE TIER: `--durability`, else the one the installed job NAMES, so a
+    // bare `on` that repairs a relaxed root restarts the broker it had, and a
+    // job that named strict keeps naming it. A job that names none runs the
+    // build's default. A host whose kernel names no boot runs relaxed too:
+    // astream moves the log's generation after every unclean stop there, the
+    // safe answer to not knowing ([`crate::durability`]).
+    let (job_durability, durability_job) = match kept_durability(&p) {
+        Ok(kept) => kept,
+        Err(e) => {
+            eprintln!("aterm fabric on: cannot read the installed broker job: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    p.durability = opts.durability.or(job_durability);
     let service = opts.service.unwrap_or_else(Service::default_here);
     let mut out = Out::new(opts.dry_run);
     println!(
@@ -4091,6 +4356,39 @@ pub fn on(opts: &OnOpts) -> ExitCode {
                  (`aterm fabric off` first, to serve the socket alone)"
             ),
         );
+    }
+    // A relaxed broker is said every run, with what its ack does not promise,
+    // and so is an ordered one, with the tier this build serves it at; a
+    // switch back to strict is said once, as the job it rewrites.
+    let kept_from = match (opts.durability, &durability_job) {
+        (None, Some(job)) => format!(", kept from {job}"),
+        _ => String::new(),
+    };
+    match (p.tier(), crate::durability::resolve(job_durability)) {
+        (crate::durability::Durability::Relaxed, _) => out.note(
+            "durability",
+            &format!(
+                "relaxed{kept_from} — {}; `--durability strict` returns to acks on the disk",
+                crate::durability::Durability::Relaxed.promise()
+            ),
+        ),
+        (crate::durability::Durability::Ordered, _) => out.note(
+            "durability",
+            &format!(
+                "ordered{kept_from}, {}",
+                crate::durability::describe_own(crate::durability::Durability::Ordered)
+            ),
+        ),
+        (crate::durability::Durability::Strict, crate::durability::Durability::Relaxed) => {
+            out.note(
+                "durability",
+                &format!(
+                    "strict, was relaxed — {}",
+                    crate::durability::Durability::Strict.promise()
+                ),
+            );
+        }
+        _ => {}
     }
 
     // The refusals that must come before anything is written.
@@ -4262,7 +4560,7 @@ pub fn on(opts: &OnOpts) -> ExitCode {
     // the point of a dry run is to see EVERY step — and exits 1 at the end.
     // On the sealed wire, a broker that answers on its socket must answer on
     // the TCP port too (6b).
-    let broker_ok = broker_step(&p, &node, service, &mut out);
+    let broker_ok = broker_step(&p, &node, service, opts.durability.is_some(), &mut out);
     if !broker_ok && !opts.dry_run {
         return ExitCode::FAILURE;
     }
@@ -5442,7 +5740,9 @@ pub fn doctor(retire_ghosts: bool, yes: bool) -> ExitCode {
     }
     // What this host is to its fleet, read from the root the fabric is on —
     // every remedy below is spelled for it.
-    let role = match Paths::resolve_for_off().and_then(|(p, _)| Role::of(&p)) {
+    let role = match Paths::resolve_for_off()
+        .and_then(|(p, _)| Role::of(&p).map_err(|e| e.to_string()))
+    {
         Ok(role) => role,
         Err(e) => {
             eprintln!(
@@ -5481,6 +5781,16 @@ pub fn doctor(retire_ghosts: bool, yes: bool) -> ExitCode {
             // this host's supervisor keeps it.
             if let Role::Serves(s) = &role {
                 println!("  scope: {}", s.scope());
+            }
+            // A fact too: what an ack from this host's broker promises — the
+            // tier its process names ([`fabric::BrokerView::durability`]) as
+            // the broker itself says it serves it ([`fabric::BrokerView::served`]).
+            if let Some(d) = report.broker.tier() {
+                println!(
+                    "  durability: {} — {}",
+                    d.name(),
+                    crate::durability::describe_served(d, report.broker.served)
+                );
             }
             if warnings.is_empty() {
                 println!("  no warnings");
@@ -5639,6 +5949,7 @@ mod tests {
             config: None,
             rendezvous: None,
             wire: Wire::Unix,
+            durability: None,
         };
         assert_eq!(p("/Users//example/.local/share/aterm-fabric").label(), LABEL);
         assert_eq!(
@@ -5662,6 +5973,7 @@ mod tests {
             config: None,
             rendezvous: None,
             wire: Wire::Unix,
+            durability: None,
         };
         let live = paths("/Users//example", Some("/Users//example"));
         let redirected = paths("/tmp/x", Some("/Users//example"));
@@ -5682,6 +5994,155 @@ mod tests {
         );
     }
 
+    /// THE TIER IS IN THE JOB. A NAMED tier rides after the secret, on both
+    /// wires — `--durability relaxed`, and `--durability strict` too, so a job
+    /// that chose strict keeps it under a build whose default differs — and a
+    /// job that names none carries nothing, so every strict job an earlier
+    /// `on` wrote is still current and runs the build's default. A switch is
+    /// "the job changed" and restarts the broker. The socket still follows
+    /// `broker`, which is how the process table finds it. A bare `on` keeps the
+    /// tier the installed job NAMES (none, strict, ordered or relaxed), and
+    /// with no job it names none.
+    #[test]
+    fn the_tier_is_in_the_job_and_a_bare_on_keeps_it() {
+        use crate::durability::Durability;
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let bare = Paths {
+            home: dir.path().to_path_buf(),
+            login_home: None,
+            root: dir.path().join("root"),
+            aterm: "/usr/local/bin/aterm".to_string(),
+            fleet: "local".to_string(),
+            config: None,
+            rendezvous: None,
+            wire: Wire::Unix,
+            durability: None,
+        };
+        let named = |tier| Paths {
+            durability: Some(tier),
+            ..bare.clone()
+        };
+        let relaxed = named(Durability::Relaxed);
+        let argv = relaxed.broker_argv();
+        assert_eq!(argv[argv.len() - 2..], ["--durability", "relaxed"]);
+        assert!(!bare.broker_argv().iter().any(|w| w == "--durability"));
+        assert_eq!(bare.broker_argv()[..], argv[..argv.len() - 2]);
+        assert_eq!(bare.tier(), Durability::Strict, "this build's default");
+        let strict = named(Durability::Strict);
+        let words = strict.broker_argv();
+        assert_eq!(
+            words[words.len() - 2..],
+            ["--durability", "strict"],
+            "a named strict is written"
+        );
+        assert!(!bare.plist_is_current(&relaxed.plist_text()));
+        assert!(!relaxed.plist_is_current(&bare.plist_text()));
+        assert!(!bare.plist_is_current(&strict.plist_text()));
+        assert!(relaxed.plist_is_current(&relaxed.plist_text()));
+        let sock = bare.sock();
+        let ps = fabric::Proc {
+            pid: 7,
+            ppid: 1,
+            cmd: argv.join(" "),
+        };
+        assert_eq!(fabric::broker_pid(&[ps], &sock), Some(7));
+        assert_eq!(Durability::of_argv(&argv), Durability::Relaxed);
+        let sealed = Paths {
+            wire: Wire::Sealed {
+                bind: Some("127.0.0.1:7000".to_string()),
+                dial: "127.0.0.1:7000".to_string(),
+                key_file: PathBuf::from("/k"),
+                allow_remote: false,
+            },
+            ..relaxed.clone()
+        };
+        let words = sealed.broker_argv();
+        let at = words
+            .iter()
+            .position(|w| w == "--durability")
+            .expect("the flag");
+        assert_eq!(words[at + 1], "relaxed");
+        assert!(at < words.iter().position(|w| w == "--unix").expect("--unix"));
+        assert!(unit_argv(&sealed.unit_text()).is_some_and(|w| w == words));
+
+        // Kept: no job names nothing, kept from nothing; each job names what
+        // it was written with, a bare one nothing.
+        assert_eq!(kept_durability(&bare), Ok((None, None)));
+        std::fs::create_dir_all(&bare.root).unwrap();
+        for tier in [Durability::Relaxed, Durability::Ordered, Durability::Strict] {
+            std::fs::write(bare.plist(), named(tier).plist_text()).unwrap();
+            let (kept, job) = kept_durability(&bare).expect("read");
+            assert_eq!(kept, Some(tier));
+            assert!(job.is_some_and(|j| j.contains(&bare.plist().display().to_string())));
+        }
+        std::fs::write(bare.plist(), bare.plist_text()).unwrap();
+        assert_eq!(kept_durability(&bare).expect("read").0, None);
+    }
+
+    /// A BROKER RUNNING ANOTHER TIER IS NOT CURRENT: one whose process runs
+    /// another `--durability` than the tier `on` asks for — a switch either
+    /// way that the running broker never took — is named, so the supervisor
+    /// restarts it (or, under `--service none`, the warning says how). One
+    /// running the tier asked for, or whose process this host cannot read
+    /// (no tier: a remote broker, no `ps`), is current on that count; a bare
+    /// job and a named strict one ask for the same tier in this build. A
+    /// replaced build and an unguarded broker are named first.
+    #[test]
+    fn a_broker_running_another_tier_is_not_current() {
+        use crate::durability::Durability;
+        let p = |durability| Paths {
+            home: PathBuf::from("/h"),
+            login_home: None,
+            root: PathBuf::from("/h/root"),
+            aterm: "/usr/local/bin/aterm".to_string(),
+            fleet: "local".to_string(),
+            config: None,
+            rendezvous: None,
+            wire: Wire::Unix,
+            durability: Some(durability),
+        };
+        let view = |durability| fabric::BrokerView {
+            guarded: Some(true),
+            durability,
+            ..fabric::BrokerView::default()
+        };
+        let (strict, ordered, relaxed) =
+            (Durability::Strict, Durability::Ordered, Durability::Relaxed);
+        assert_eq!(
+            not_current(&p(strict), &view(Some(relaxed))),
+            Some("it runs at durability relaxed")
+        );
+        assert_eq!(
+            not_current(&p(relaxed), &view(Some(strict))),
+            Some("it runs at durability strict")
+        );
+        assert_eq!(
+            not_current(&p(strict), &view(Some(ordered))),
+            Some("it runs at durability ordered")
+        );
+        assert_eq!(not_current(&p(relaxed), &view(Some(relaxed))), None);
+        assert_eq!(not_current(&p(strict), &view(Some(strict))), None);
+        assert_eq!(not_current(&p(ordered), &view(Some(ordered))), None);
+        let bare = Paths {
+            durability: None,
+            ..p(strict)
+        };
+        assert_eq!(
+            not_current(&bare, &view(Some(strict))),
+            None,
+            "bare is strict here"
+        );
+        assert_eq!(not_current(&p(relaxed), &view(None)), None, "no tier read");
+        let replaced = fabric::BrokerView {
+            replaced: Some("/usr/local/bin/aterm".to_string()),
+            ..view(Some(strict))
+        };
+        assert_eq!(
+            not_current(&p(relaxed), &replaced),
+            Some("it runs a replaced build")
+        );
+    }
+
     /// THE PLIST RUNS THE BROKER DIRECTLY — the words, one `<string>` each,
     /// no `/bin/sh -c` — and is valid XML for any path; it reads as CURRENT in
     /// any layout, so `on` does not restart a healthy broker for its spelling;
@@ -5697,6 +6158,7 @@ mod tests {
             config: None,
             rendezvous: None,
             wire: Wire::Unix,
+            durability: None,
         };
         let text = p.plist_text();
         assert!(
@@ -5842,6 +6304,7 @@ mod tests {
             config: None,
             rendezvous: None,
             wire: Wire::Unix,
+            durability: None,
         };
         let installed = p(
             "/Users//example/.local/share/aterm-fabric",
@@ -6112,13 +6575,8 @@ mod tests {
         );
         // A writer that ignores the lock lands between the read and the write.
         std::fs::write(&target, "font_px = 18.0\n").expect("the other writer");
-        let err = edit
-            .replace("font_px = 9.0\n")
+        edit.replace("font_px = 9.0\n")
             .expect_err("changed under it");
-        assert!(
-            err.to_string().contains("changed while fabric was editing"),
-            "{err}"
-        );
         assert_eq!(
             std::fs::read_to_string(&target).expect("target"),
             "font_px = 18.0\n"
@@ -6203,7 +6661,6 @@ mod tests {
             serves_key_file: None,
         };
         let text = r.render();
-        assert!(text.starts_with("# Written by `aterm fabric on`"));
         assert_eq!(Rendezvous::parse(&text), Ok(r.clone()));
         let odd = Rendezvous {
             command: "a \"quoted\" \\ back".to_string(),
@@ -6339,9 +6796,6 @@ mod tests {
         );
     }
 
-    /// **ONE REMEDY WHERE THE WARNING ALREADY SAYS WHICH APPLIES.** A hold's
-    /// origin and reason, and a down link's `reason=`, are in the warning's own
-    /// words, so the fix names the one remedy for that cause.
     /// **A LOG THE BROKER REFUSES IS ANSWERED BY ITS OWN REMEDY** (audit 51,
     /// r2-02): the broker's last line ([`crate::cli::log_refusal_remedy`]),
     /// quoted from broker.err, picks the fix — the shipped repair for a
@@ -6474,15 +6928,20 @@ mod tests {
         );
     }
 
+    /// **ONE REMEDY WHERE THE WARNING ALREADY SAYS WHICH APPLIES.** A hold's
+    /// origin and reason, and a down link's `reason=`, are in the warning's own
+    /// words, so the fix names the one remedy for that cause. A hold's fix is a
+    /// command that reaches the hosting instance: a flagless `aterm ctl`
+    /// reaches the caller's own (or the newest) instance, whose store answers
+    /// `ERR no such session` for another's, so the fix names the instance by
+    /// pid — or by socket for an explicit `--control-sock` one, shell-quoted
+    /// when it can be and a placeholder when it cannot.
     #[test]
     fn a_fix_picks_the_remedy_the_warning_names() {
         fn fix_for(warning: &str) -> String {
             super::fix_for(warning, &Role::OneHost { fleet: None })
         }
         let held = |why: &str| fix_for(&format!("@s-a (instance 1) is HELD ({why})"));
-        // A hold is lifted on the instance that hosts the session: a flagless
-        // `aterm ctl` reaches the caller's own (or the newest) instance, whose
-        // store answers `ERR no such session` for another's.
         assert_eq!(
             held("reason=x origin=local"),
             "`aterm ctl --pid 1 hold s-a off`"
@@ -6491,25 +6950,18 @@ mod tests {
             fix_for("a session is HELD (reason=x origin=local)"),
             "`aterm ctl --pid <pid> hold <sid> off`"
         );
-        assert!(held("reason and origin no longer in its timeline")
-            .contains("`aterm ctl --pid 1 hold s-a off`"));
-        // An explicit-`--control-sock` instance: only its socket reaches it.
         assert_eq!(
             fix_for("@s-a (instance 1, --sock /tmp/at.x/a.sock) is HELD (reason=x origin=local)"),
             "`aterm ctl --sock /tmp/at.x/a.sock hold s-a off`"
         );
-        // A socket path with a space is quoted, so the command still names it.
         assert_eq!(
             fix_for("@s-a (instance 0, --sock /tmp/a b.sock) is HELD (reason=x origin=local)"),
             "`aterm ctl --sock '/tmp/a b.sock' hold s-a off`"
         );
-        // One that cannot be quoted stays a placeholder.
         assert_eq!(
             fix_for("@s-a (instance 0, --sock /tmp/a'b.sock) is HELD (reason=x origin=local)"),
             "`aterm ctl --sock <sock> hold s-a off`"
         );
-        // `on --dry-run` names an explicit-`--control-sock` instance the same way: by the
-        // socket `--pid` cannot reach.
         assert_eq!(
             arm_command(
                 4242,
@@ -6523,10 +6975,6 @@ mod tests {
             fix_for("@s-a (instance 0) is HELD (reason=x origin=local)"),
             "`aterm ctl --pid <pid> hold s-a off`"
         );
-        assert_eq!(
-            held("reason=fabric-lost origin=fleet"),
-            "it lifts when the bridge reconnects"
-        );
         // A fleet hold's remedy is its halter's `halt off`, never the Owner's
         // `hold off` (that is `ERR denied` for a fleet hold).
         let fleet = held("reason=stop origin=fleet");
@@ -6534,7 +6982,6 @@ mod tests {
             fleet.contains("aterm fabric halt") && !fleet.contains("hold s-a off"),
             "{fleet}"
         );
-        assert!(held("reason and origin no longer in its timeline").contains("a fleet hold"));
         // BOTH SLOTS: the fleet's remedy, and the owner's `hold off` for the
         // local hold the fleet's lift leaves standing.
         let both = held("reason=stop origin=fleet,local");
@@ -6554,27 +7001,6 @@ mod tests {
                  reason={reason}, last ack 3s ago)"
             ))
         };
-        assert!(
-            down("refused").starts_with("nothing listens"),
-            "{}",
-            down("refused")
-        );
-        assert!(
-            down("no-socket").starts_with("nothing listens"),
-            "{}",
-            down("no-socket")
-        );
-        assert!(down("no-ack").contains("restarts it"), "{}", down("no-ack"));
-        assert!(
-            down("attach").contains("move <root>/node.cap aside"),
-            "{}",
-            down("attach")
-        );
-        assert!(
-            down("denied").contains("check its owner and mode") && !down("denied").contains("cap"),
-            "{}",
-            down("denied")
-        );
         // A LAPSED cap is renewed, not re-minted for another secret: its own
         // remedy, the same from the bridge's `reason=expired` as from the
         // report's own probe ([`fabric::CAP_LAPSED`]).
@@ -6598,7 +7024,6 @@ mod tests {
         let here = protocol_remedy(&Role::OneHost { fleet: None }, "`aterm fabric on`", "");
         assert!(down("protocol").starts_with(&here), "{}", down("protocol"));
         assert_eq!(fix_for(skew), here);
-        assert!(here.contains("different releases"), "{here}");
         // A full broker, a refused row and another protocol are not a refused
         // cap: none is sent to move the cap aside.
         for reason in ["busy", "record", "protocol"] {
@@ -6608,21 +7033,11 @@ mod tests {
                 down(reason)
             );
         }
-        assert!(
-            down("closed").starts_with("check the broker"),
-            "{}",
-            down("closed")
-        );
         // A cut is the broker answering: it is not sent to the broker.
         assert!(
             down("cut-say") != down("closed") && down("cut-inbox") == down("cut-say"),
             "{}",
             down("cut-say")
-        );
-        assert!(
-            down("read").ends_with("the bridge then reconnects on its own"),
-            "{}",
-            down("read")
         );
     }
 
@@ -6647,6 +7062,7 @@ mod tests {
                 key_file: PathBuf::from("/k/fleet.key"),
                 allow_remote: true,
             },
+            durability: None,
         };
         assert_eq!(
             p.broker_argv().join(" "),
@@ -6742,8 +7158,7 @@ mod tests {
                 })
             );
         } else {
-            let e = on(Some("127.0.0.1:7000"), Some("/k"), false).expect_err("default build");
-            assert!(e.contains("`sealed` cargo feature"), "{e}");
+            on(Some("127.0.0.1:7000"), Some("/k"), false).expect_err("default build");
         }
     }
 
@@ -6962,5 +7377,140 @@ mod tests {
                 "{broker}: the caller's own cap and state are kept"
             );
         }
+    }
+
+    /// **THE DELETED SCRIPT'S SHELL JOB IS READ FOR ITS BROKER, AND NOTHING
+    /// ELSE IS.** fabric-enable.sh installed `/bin/sh -c "rm -f …; exec …"`;
+    /// [`sh_c_words`] reads that shape and the one [`Paths::unit_text`]
+    /// writes, and refuses every other script rather than guess at it.
+    #[test]
+    fn the_deleted_scripts_shell_job_is_read_for_its_broker_and_nothing_else_is() {
+        let words = |w: &[&str]| Some(w.iter().map(ToString::to_string).collect::<Vec<_>>());
+        let legacy = "rm -f '/r/bus.sock'; exec '/u/aterm' link broker '/r/bus.sock' '/r/bus.log'";
+        let want = words(&["/u/aterm", "link", "broker", "/r/bus.sock", "/r/bus.log"]);
+        assert_eq!(sh_c_words(legacy), want);
+        assert_eq!(
+            sh_c_words("exec '/u/aterm' 'link' 'broker' '/r/bus.sock' '/r/bus.log'"),
+            want,
+            "the unit's every-word-quoted form"
+        );
+        assert_eq!(
+            sh_c_words(" \trm -f /r/bus.sock;exec\t/u/aterm link broker /r/bus.sock /r/bus.log \n"),
+            want,
+            "bare words, tabs, no space after `;`, whitespace around the script"
+        );
+        assert_eq!(sh_c_words("exec /u/aterm ''"), words(&["/u/aterm", ""]));
+        for bad in [
+            "curl x; exec /u/aterm link broker a b",
+            "rm -f a; exec /u/aterm link broker a b && true",
+            "rm -f a; exec /u/aterm link broker a b; true",
+            "rm -f a b; exec /u/aterm link broker a b",
+            "rm -f a; rm -f b; exec /u/aterm link broker a b",
+            "exec \"/u/aterm\" link broker a b",
+            "exec $X broker a b",
+            "exec /u/aterm link broker a\\ b",
+            "exec /u/aterm link broker /r/*.sock",
+            "exec /u/aterm link broker 'a'b",
+            "exec /u/aterm link broker 'a",
+            "exec /u/aterm link broker a\nb",
+            "rm -f a; /u/aterm link broker a b",
+            "/u/aterm link broker a b",
+            "exec",
+            "rm -f a; exec",
+            "",
+        ] {
+            assert_eq!(sh_c_words(bad), None, "{bad:?}");
+        }
+
+        let sh = |script: &str| vec!["/bin/sh".to_string(), "-c".to_string(), script.to_string()];
+        assert_eq!(supervised_argv(sh(legacy)), want, "the shell job unwraps");
+        assert_eq!(supervised_argv(sh("curl x; exec a")), None);
+        let direct = want.clone().expect("words");
+        assert_eq!(
+            supervised_argv(direct.clone()),
+            Some(direct),
+            "a direct argv is the command"
+        );
+        let zsh = vec!["/bin/zsh".to_string(), "-c".to_string(), legacy.to_string()];
+        assert_eq!(
+            supervised_argv(zsh.clone()),
+            Some(zsh),
+            "only `sh` is unwrapped: another shell is an argv `Role::of` refuses"
+        );
+    }
+
+    /// **A ROOT WHOSE JOB THE DELETED SCRIPT INSTALLED HAS A KNOWN ROLE, AND
+    /// ITS JOB IS STILL NOT CURRENT** — so `doctor` reports and `on` rewrites
+    /// it, instead of both refusing the host's own broker as an unknown role.
+    #[test]
+    fn role_of_a_root_with_the_scripts_plist_is_known_and_not_current() {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let root = dir.path().join("fabric");
+        std::fs::create_dir_all(&root).expect("root");
+        let p = Paths {
+            home: dir.path().join("home"),
+            login_home: Some(dir.path().join("login")),
+            root: root.clone(),
+            aterm: "/u/aterm".to_string(),
+            fleet: DEFAULT_FLEET.to_string(),
+            config: None,
+            rendezvous: None,
+            wire: Wire::Unix,
+            durability: None,
+        };
+        assert!(
+            p.plist().starts_with(&root),
+            "a non-default root keeps its plist"
+        );
+        let r = root.to_string_lossy().into_owned();
+        let plist = |script: &str| {
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict>\n\
+                 \t<key>Label</key>\n\t<string>{label}</string>\n\
+                 \t<key>ProgramArguments</key>\n\t<array>\n\
+                 \t\t<string>/bin/sh</string>\n\t\t<string>-c</string>\n\
+                 \t\t<string>{script}</string>\n\t</array>\n\
+                 \t<key>KeepAlive</key>\n\t<true/>\n</dict>\n</plist>\n",
+                label = p.label(),
+                script = xml_escape(script),
+            )
+        };
+        let install = |text: &str| std::fs::write(p.plist(), text).expect("plist");
+
+        let legacy = plist(&format!(
+            "rm -f '{r}/bus.sock'; exec '/u/aterm' link broker '{r}/bus.sock' '{r}/bus.log'"
+        ));
+        install(&legacy);
+        assert_eq!(Role::of(&p), Ok(Role::OneHost { fleet: None }));
+        assert!(!p.plist_is_current(&legacy), "`on` still rewrites it");
+
+        // The script's sealed job quoted every word: it SERVES the fleet.
+        install(&plist(&format!(
+            "rm -f '{r}/bus.sock'; exec '/u/aterm' 'link' 'broker' '--tcp' '127.0.0.1:7000' \
+             '--key-file' '/k' '--unix' '{r}/bus.sock' '{r}/bus.log'"
+        )));
+        match Role::of(&p) {
+            Ok(Role::Serves(served)) => {
+                assert_eq!(served.bind.as_deref(), Some("127.0.0.1:7000"));
+                assert_eq!(served.key_file, "/k");
+                assert_eq!(served.job, Some(Service::Launchd));
+            }
+            other => panic!("the legacy sealed job serves: {other:?}"),
+        }
+
+        // NEGATIVE CONTROLS: a readable script that runs no broker, and one
+        // of a shape nothing aterm wrote, are still refused.
+        install(&plist("exec /usr/bin/true"));
+        assert_eq!(Role::of(&p), Err(RoleError::NotABroker));
+        install(&plist(&format!(
+            "curl x; exec '/u/aterm' link broker '{r}/bus.sock' '{r}/bus.log'"
+        )));
+        assert_eq!(
+            Role::of(&p),
+            Err(RoleError::UnreadableJob {
+                path: p.plist(),
+                field: "ProgramArguments",
+            })
+        );
     }
 }

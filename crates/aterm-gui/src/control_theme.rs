@@ -125,6 +125,18 @@ pub(crate) enum ThemeCtlOp {
     Revert,
     /// `theme commit`: write the preview's name to `aterm.toml`.
     Commit,
+    /// `theme palette [session]`: the 256 palette rows the instance (or, with
+    /// `session`, the aimed session) draws.
+    Palette { session: bool },
+    /// `theme session [status]`: the aimed session's own theme and what it
+    /// draws.
+    SessionStatus,
+    /// `theme session set <selector>`: give the aimed session a theme of its
+    /// own.
+    SessionSet { selector: String },
+    /// `theme session clear`: the aimed session draws the instance's theme
+    /// again.
+    SessionClear,
 }
 
 fn hex(c: Rgb) -> String {
@@ -142,13 +154,45 @@ fn side_word(appearance: Appearance) -> &'static str {
     }
 }
 
+/// The `theme palette` rows of one resolution: 256 lines
+/// `slot index=<n> rgb=#rrggbb origin=theme|config|default|generated|xterm`,
+/// what the engine is configured with (a program's OSC 4 is not in them).
+pub(crate) fn theme_palette_rows(colors: &crate::resolved_colors::ResolvedColors) -> Vec<String> {
+    let palette = colors.custom_palette().unwrap_or_default();
+    (0..=255u8)
+        .map(|index| {
+            format!(
+                "slot index={index} rgb={} origin={}",
+                hex(palette.get(index)),
+                colors.extended_origin(index).word()
+            )
+        })
+        .collect()
+}
+
+/// Who set a chrome colour, as `theme` reports it: `theme`, `config`, or
+/// `default` (nobody: the chrome derives it).
+fn origin_word(origin: crate::resolved_colors::ColorOrigin) -> &'static str {
+    use crate::resolved_colors::ColorOrigin;
+    match origin {
+        ColorOrigin::Theme => "theme",
+        ColorOrigin::Config => "config",
+        ColorOrigin::Default => "default",
+    }
+}
+
 impl App {
     /// Run one `theme` operation and answer `reply`. Every form answers at
     /// once except `commit`, whose reply the settings lane sends when the
     /// durable write completes.
+    ///
+    /// `session` is the session a session-scoped form acts on: the request's
+    /// own (or `@<sid>`'s) on the session path, `None` on the app path, which
+    /// takes the front window's front terminal.
     pub(crate) fn theme_control(
         &mut self,
         op: ThemeCtlOp,
+        session: Option<u64>,
         now: Instant,
         reply: std::sync::mpsc::Sender<Result<String, String>>,
     ) {
@@ -158,8 +202,64 @@ impl App {
             ThemeCtlOp::Preview { id, ttl } => self.preview_theme(&id, ttl, now),
             ThemeCtlOp::Revert => Ok(self.revert_theme_preview(now)),
             ThemeCtlOp::Commit => return self.commit_theme_preview(reply),
+            ThemeCtlOp::Palette { session: false } => {
+                Ok(theme_palette_rows(&self.installed_colors).join("\n"))
+            }
+            ThemeCtlOp::Palette { session: true } => self
+                .theme_session_target(session)
+                .map(|sid| theme_palette_rows(&self.resolved_colors_for_session(sid)).join("\n")),
+            ThemeCtlOp::SessionStatus => self
+                .theme_session_target(session)
+                .map(|sid| self.session_theme_status_line(sid)),
+            ThemeCtlOp::SessionSet { selector } => self
+                .theme_session_target(session)
+                .and_then(|sid| self.set_session_theme_checked(sid, &selector)),
+            ThemeCtlOp::SessionClear => self.theme_session_target(session).map(|sid| {
+                if self.pool.theme(sid).is_some() {
+                    self.set_session_theme(sid, None);
+                }
+                self.session_theme_status_line(sid)
+            }),
         };
         let _ = reply.send(answer);
+    }
+
+    /// The session a session-scoped `theme` form acts on: `session` when the
+    /// request names one, else the front window's front terminal.
+    fn theme_session_target(&self, session: Option<u64>) -> Result<u64, String> {
+        match session {
+            Some(sid) if self.pool.get(sid).is_some() => Ok(sid),
+            Some(sid) => Err(format!("no such session {sid}")),
+            None => {
+                let wid = self
+                    .frontmost_window
+                    .ok_or_else(|| "no focused window".to_string())?;
+                self.front_terminal(wid)
+                    .map(|t| t.session)
+                    .ok_or_else(|| "front content is not a terminal".to_string())
+            }
+        }
+    }
+
+    /// `theme session set`: refused, changing nothing, as a preview is when
+    /// the selector has grammar issues or a side would draw Default for want
+    /// of a theme; else the session's own theme, installed.
+    pub(crate) fn set_session_theme_checked(
+        &mut self,
+        sid: u64,
+        selector: &str,
+    ) -> Result<String, String> {
+        if let Some(why) = self.theme_preview_unavailable(selector) {
+            return Err(format!("theme session {selector:?}: {why}"));
+        }
+        self.set_session_theme(
+            sid,
+            Some(crate::session_theme::SessionTheme {
+                selector: selector.to_string(),
+                origin: crate::session_theme::SessionThemeOrigin::Ctl,
+            }),
+        );
+        Ok(self.session_theme_status_line(sid))
     }
 
     /// The `theme` status line: the installed resolution and where it came
@@ -214,10 +314,58 @@ impl App {
             .map(|c| hex(*c))
             .collect::<Vec<_>>()
             .join(",");
+        // The chrome tokens as the header draws its accent and the grid its
+        // divider and find highlight.
+        let header = self
+            .chrome_palette(crate::app_render::ChromeSurface::Header)
+            .tokens();
+        let grid = self.chrome_palette(crate::app_render::ChromeSurface::Grid);
+        let grid_tokens = grid.tokens();
+        let bytes_hex = |c: [u8; 3]| hex(aterm_types::Rgb::new(c[0], c[1], c[2]));
+        let chrome = format!(
+            "accent={} accent_source={} accent_from={} border={} border_from={} \
+             search_match={} search_match_from={} active_tab={} active_tab_from={}",
+            bytes_hex(header.accent),
+            header.accent_source.label(),
+            origin_word(colors.provenance.chrome.accent),
+            bytes_hex(grid_tokens.seam_on(crate::settings::u32_rgb(grid.theme.bg))),
+            origin_word(colors.provenance.chrome.border),
+            bytes_hex(grid_tokens.search_match(crate::settings::u32_rgb(grid.theme.selection))),
+            origin_word(colors.provenance.chrome.search_match),
+            opt_hex(scheme.chrome.active_tab),
+            origin_word(colors.provenance.chrome.active_tab),
+        );
+        // The theme's type settings this window applies (the keys no config
+        // key or flag beat), the ones that were beaten and by whom, and the
+        // text size scale in force (config or theme).
+        let quoted_or_dash = |items: Vec<String>| {
+            if items.is_empty() {
+                "-".to_string()
+            } else {
+                format!("{:?}", items.join(","))
+            }
+        };
+        let typography_fields = format!(
+            "typography={} typography_keys={} typography_shadowed={} font_size_scale={}",
+            self.typography
+                .applied
+                .summary()
+                .map_or_else(|| "-".to_string(), |summary| format!("{summary:?}")),
+            quoted_or_dash(
+                self.typography
+                    .applied_keys()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect()
+            ),
+            quoted_or_dash(self.typography.shadowed_words()),
+            aterm_types::scheme_typography::milli_text(self.font_size_scale_milli),
+        );
         format!(
             "id={:?} label={label:?} configured={configured} side={} source={source} \
              reported={} miss={miss} os_appearance={} {preview} fg={} bg={} cursor={} \
-             selection={} selection_fg={} palette={palette}",
+             selection={} selection_fg={} {chrome} {typography_fields} generate={} \
+             generate_from={} pinned={} palette={palette}",
             colors.id,
             side_word(colors.side),
             side_word(colors.reported),
@@ -227,6 +375,9 @@ impl App {
             opt_hex(scheme.cursor),
             opt_hex(scheme.selection),
             opt_hex(scheme.selection_fg),
+            if colors.palette_generate { "on" } else { "off" },
+            origin_word(colors.palette_generate_origin),
+            self.pinned_session_count(),
         )
     }
 

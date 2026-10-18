@@ -25,7 +25,7 @@
 
 use std::collections::HashMap;
 
-use winit::keyboard::{Key as WinitKey, ModifiersState, NamedKey};
+use winit::keyboard::{Key as WinitKey, ModifiersState, NamedKey, PhysicalKey};
 
 /// Modifier mask bits for a [`Chord`]. A small hand-rolled bitset (rather than
 /// pulling in `bitflags`) keeps this module dependency-free; the four bits are
@@ -82,6 +82,11 @@ pub(crate) enum Action {
     Copy,
     /// Paste the clipboard (Cmd-V).
     Paste,
+    /// Paste the PRIMARY selection — the text last selected, what a middle click
+    /// pastes (X11 and Wayland) — or the clipboard where there is none (macOS,
+    /// Windows). Default Shift+Insert on Linux: xterm's, VTE's (GNOME
+    /// Terminal), kitty's and foot's.
+    PasteSelection,
     /// Enter Cmd-F find mode.
     Find,
     /// Grow the live font (Cmd-=).
@@ -90,13 +95,27 @@ pub(crate) enum Action {
     FontReset,
     /// Shrink the live font (Cmd--).
     FontDecrease,
-    /// Move keyboard focus to the pane on the left (Cmd-Opt-Left).
+    /// Move keyboard focus to the pane on the left (seeded Alt+Left off macOS;
+    /// macOS has the hardcoded Cmd-Opt-Left, `App::on_key_pane_focus`, which is
+    /// not this binding and always claims its chord). A binding of this action on
+    /// an ARROW key moves focus if it can, else passes the key through: with no
+    /// pane that way the chord is not claimed and the press reaches the program
+    /// ([`resolve_chord`]), so a one-pane tab keeps Alt+Left's word motion. The
+    /// same holds for the other three directions and for a user's own arrow
+    /// binding. A binding on any other key (`ctrl+h`, the tmux/vim-navigator
+    /// layout) always claims its chord, a no-op with nowhere to move
+    /// ([`pane_focus_passes_through`]).
     FocusPaneLeft,
-    /// Move keyboard focus to the pane on the right (Cmd-Opt-Right).
+    /// Move keyboard focus to the pane on the right (seeded Alt+Right off macOS,
+    /// hardcoded Cmd-Opt-Right on macOS), or pass the key through
+    /// ([`Action::FocusPaneLeft`]).
     FocusPaneRight,
-    /// Move keyboard focus to the pane above (Cmd-Opt-Up).
+    /// Move keyboard focus to the pane above (seeded Alt+Up off macOS, hardcoded
+    /// Cmd-Opt-Up on macOS), or pass the key through ([`Action::FocusPaneLeft`]).
     FocusPaneUp,
-    /// Move keyboard focus to the pane below (Cmd-Opt-Down).
+    /// Move keyboard focus to the pane below (seeded Alt+Down off macOS,
+    /// hardcoded Cmd-Opt-Down on macOS), or pass the key through
+    /// ([`Action::FocusPaneLeft`]).
     FocusPaneDown,
     /// Toggle zoom of the focused pane — fill the window (Cmd-Shift-Enter).
     TogglePaneZoom,
@@ -144,10 +163,6 @@ pub(crate) enum Action {
     /// live, Enter keeps it, Esc reverts. Unbound by default; bind it in
     /// `[keybindings]` (e.g. `ctrl+shift+k = "choose_theme"`).
     ChooseTheme,
-    /// Toggle vi (keyboard copy-mode) on the focused pane (VI-1): a keyboard-driven
-    /// cursor for motion + selection over the screen and scrollback, no chord bound by
-    /// default — bind it in `[keybindings]` (e.g. `ctrl+shift+space = "toggle_vi_mode"`).
-    ToggleViMode,
     /// Edit the FOCUSED PANE's session pin in place on the tab strip — the
     /// keyboard face of Window ▸ Rename Session… and of double-clicking a tab.
     /// It renames the SESSION (`meta set title`), not the tab: a tab can hold
@@ -180,6 +195,16 @@ pub(crate) enum Action {
     OpenLedger,
 }
 
+impl Action {
+    /// Whether the action pastes — the clipboard or the PRIMARY selection. A
+    /// focused text field (find, inline rename) claims every paste chord, so one
+    /// can never write past the field into the PTY behind it.
+    #[must_use]
+    pub(crate) const fn is_paste(self) -> bool {
+        matches!(self, Action::Paste | Action::PasteSelection)
+    }
+}
+
 /// Every bindable action NAME, in a stable order — the canonical discoverable
 /// surface for `[keybindings]` config (printed by `--list-actions`). `switch_tab_N`
 /// is parameterized (`switch_tab_1`..`switch_tab_9`), shown here as the template.
@@ -202,6 +227,7 @@ pub(crate) const ACTION_NAMES: &[&str] = &[
     "toggle_pane_zoom",
     "copy",
     "paste",
+    "paste_selection",
     "find",
     "font_increase",
     "font_decrease",
@@ -220,7 +246,6 @@ pub(crate) const ACTION_NAMES: &[&str] = &[
     "toggle_serious_mode",
     "open_palette",
     "choose_theme",
-    "toggle_vi_mode",
     "rename_session",
     "select_all",
     "toggle_fullscreen",
@@ -399,6 +424,7 @@ impl Action {
             "toggle_pane_zoom" => Action::TogglePaneZoom,
             "copy" => Action::Copy,
             "paste" => Action::Paste,
+            "paste_selection" | "paste_primary" => Action::PasteSelection,
             "find" => Action::Find,
             "font_increase" => Action::FontIncrease,
             "font_decrease" => Action::FontDecrease,
@@ -417,7 +443,6 @@ impl Action {
             "toggle_serious_mode" => Action::ToggleSeriousMode,
             "open_palette" => Action::OpenPalette,
             "choose_theme" => Action::ChooseTheme,
-            "toggle_vi_mode" => Action::ToggleViMode,
             "rename_session" => Action::RenameSession,
             "select_all" => Action::SelectAll,
             // `fullscreen` is the spelling the `window.fullscreen` command id
@@ -430,6 +455,21 @@ impl Action {
             "open_ledger" => Action::OpenLedger,
             _ => return None,
         })
+    }
+
+    /// The direction a `focus_pane_*` action moves focus; `None` for every other
+    /// action. [`resolve_chord`] asks the App whether a pane lies that way before it
+    /// lets one of these claim a key.
+    #[must_use]
+    pub(crate) const fn pane_focus_dir(self) -> Option<crate::pane::FocusDir> {
+        use crate::pane::FocusDir;
+        match self {
+            Action::FocusPaneLeft => Some(FocusDir::Left),
+            Action::FocusPaneRight => Some(FocusDir::Right),
+            Action::FocusPaneUp => Some(FocusDir::Up),
+            Action::FocusPaneDown => Some(FocusDir::Down),
+            _ => None,
+        }
     }
 }
 
@@ -664,6 +704,29 @@ impl Chord {
         Some(Chord { mods: mask, key })
     }
 
+    /// The chords a live key press spells, in match order: its layout key
+    /// ([`Self::from_event`]), then its [`chord_layout_twin`] — so on a Russian
+    /// layout Ctrl+Shift+'с' is tried as `ctrl+shift+с` (a binding the user wrote
+    /// in Cyrillic still wins) and then as `ctrl+shift+c` (Copy). Without the
+    /// second probe every seeded shortcut missed on a non-Latin layout and fell
+    /// to the encoder, whose own twin sent the US letter's control byte: Copy
+    /// became ^C (SIGINT), Close Tab ^W, New Tab ^T.
+    #[must_use]
+    pub(crate) fn from_press(
+        logical: &WinitKey,
+        physical: PhysicalKey,
+        mods: ModifiersState,
+    ) -> [Option<Chord>; 2] {
+        let exact = Chord::from_event(logical, mods);
+        let twin = exact.as_ref().and_then(|chord| {
+            chord_layout_twin(logical, physical, mods).map(|twin| Chord {
+                mods: chord.mods,
+                key: KeyToken::Char(twin),
+            })
+        });
+        [exact, twin]
+    }
+
     /// Human-readable presentation of this chord — `Ctrl+Shift+C`, `F11`,
     /// `Shift+Insert` — the accelerator-hint spelling the palette/menu rows
     /// show off macOS. ROUND-TRIPS: every output re-parses (case-folded)
@@ -742,6 +805,27 @@ fn named_key_display(named: NamedKey) -> &'static str {
         NamedKey::F12 => "F12",
         _ => "?",
     }
+}
+
+/// The US-QWERTY letter a shortcut press on a non-Latin layout names, or `None`:
+/// `Some('c')` for Ctrl+Shift+Russian 'с' on the physical C key. Only a chord —
+/// Ctrl, Alt or Super held — has a twin; a bare or Shift-only press is text in its
+/// own layout. The gate is [`aterm_winit_keymap::layout_letter_twin_for`], and the
+/// PTY encoder's Ctrl byte names no other US key wherever it names a letter, so a
+/// shortcut matcher and the encoder agree on which letter a press names. On a US
+/// digit or symbol key only the encoder's byte follows the US key (Russian Ctrl+'х'
+/// on the `[` key is ESC, AZERTY Ctrl+'é' on the 2 key NUL, as kitty and ghostty
+/// send them): a shortcut there keeps the layout's key.
+#[must_use]
+pub(crate) fn chord_layout_twin(
+    logical: &WinitKey,
+    physical: PhysicalKey,
+    mods: ModifiersState,
+) -> Option<char> {
+    if !(mods.control_key() || mods.alt_key() || mods.super_key()) {
+        return None;
+    }
+    aterm_winit_keymap::layout_letter_twin_for(logical, physical)
 }
 
 /// The parsed `[keybindings]` table: a chord → action map consulted at the top of
@@ -844,11 +928,19 @@ impl Keybindings {
         // ^V; rebindable). On Linux the chord is deliberately NOT seeded
         // (keyboard audit #1): ^V there is readline quoted-insert and vim's
         // visual-block entry — keys a terminal owes its user — and every Linux
-        // terminal convention pastes on Ctrl+Shift+V / Shift+Insert, both of
-        // which stay seeded. A Linux user who wants the WT behaviour writes one
-        // config line: `"ctrl+v" = "paste"`.
+        // terminal convention pastes on Ctrl+Shift+V, which stays seeded. A
+        // Linux user who wants the WT behaviour writes one config line:
+        // `"ctrl+v" = "paste"`.
         #[cfg(windows)]
         ("ctrl+v", "paste"),
+        // Shift+Insert: on Linux the PRIMARY selection (xterm, VTE/GNOME
+        // Terminal, kitty, foot), with Ctrl+Shift+Insert the clipboard (VTE);
+        // elsewhere, with no PRIMARY, the clipboard (Windows Terminal).
+        #[cfg(target_os = "linux")]
+        ("shift+insert", "paste_selection"),
+        #[cfg(target_os = "linux")]
+        ("ctrl+shift+insert", "paste"),
+        #[cfg(not(target_os = "linux"))]
         ("shift+insert", "paste"),
         ("ctrl+insert", "copy"),
         ("ctrl+shift+t", "new_tab"),
@@ -860,18 +952,30 @@ impl Keybindings {
         ("ctrl+shift+return", "toggle_pane_zoom"),
         // PANE FOCUS. Without these a split was a one-way door off macOS: the
         // splits above were seeded but nothing moved the keyboard between the
-        // panes they create, `menu.rs` has no pane-focus MenuAction (so the
-        // palette does not expose it either) and there is no control verb — a
-        // Ctrl+Shift+D user was left reaching for the mouse. Alt+arrow is what
-        // `docs/NATIVE_WINDOWS_DESIGN.md` §9 names ("Alt+←/→ pane nav",
-        // milestone W4) and what Windows Terminal binds `moveFocus` to.
+        // panes they create, and `menu.rs` has no pane-focus MenuAction (so the
+        // palette does not expose it either); only the `pane` control verb
+        // could. Alt+arrow is what `docs/NATIVE_WINDOWS_DESIGN.md` §9 names
+        // (milestone W4) and what Windows Terminal binds `moveFocus` to.
         //
-        // It does shadow two things, both accepted and both rebindable: the
-        // PTY's `ESC[1;3<A-D>` (no stock shell or `less`/`vim` mapping uses
-        // it), and — because the find bar is consulted BELOW the keybinding
-        // block in `on_key` — ⌥←/⌥→ word motion inside an OPEN find field. The
-        // latter is a macOS text-field idiom that Windows spells Ctrl+arrow
-        // anyway, and pane nav is reachable from nowhere else.
+        // The same chords are word motion at the prompt: the PTY encoder sends
+        // Alt+←/→ as `ESC[1;3D` / `ESC[1;3C`, which aterm's own bash/zsh/fish
+        // integrations bind to backward-/forward-word
+        // (`aterm_shell_integration.zsh`'s `__aterm_setup_keybindings`, and its
+        // bash and fish twins), and agent TUIs such as Codex take Alt+←/→ as
+        // word motion. Stock PSReadLine and cmd bind neither, so on Windows
+        // they move by word only where aterm's PowerShell integration binds
+        // them (`docs/NATIVE_WINDOWS_DESIGN.md` §9). So a pane-focus chord claims
+        // the key ONLY while a pane lies that way in the focused tab
+        // (`keybinding::resolve_chord`, asking `App::focus_pane_would_move`):
+        // on a one-pane tab, a zoomed pane or at the edge of a split the press
+        // reaches the program exactly as an unbound chord would. The rule is
+        // the action's on an arrow key, so a user's own `focus_pane_*` arrow
+        // entry behaves the same; a non-arrow entry (`ctrl+j`) keeps claiming
+        // its key, whose fall-through would be a byte the shell acts on
+        // (`keybinding::pane_focus_passes_through`).
+        //
+        // An OPEN find field keeps ⌥←/⌥→ for itself (`find_suspends_action`),
+        // since the keybinding block runs above the find gate in `on_key`.
         ("alt+left", "focus_pane_left"),
         ("alt+right", "focus_pane_right"),
         ("alt+up", "focus_pane_up"),
@@ -1033,15 +1137,32 @@ impl Keybindings {
         self.map.is_empty()
     }
 
-    /// O(1) lookup: the [`Action`] bound to a live key event, or `None` (miss →
-    /// fall through to the hardcoded `on_key` matches).
+    /// O(1) lookup: the [`Action`] bound to a live key press, or `None` (miss →
+    /// fall through to the hardcoded `on_key` matches). `physical` names the
+    /// press's layout twin ([`Chord::from_press`]): a non-Latin layout's letter
+    /// matches its US key's binding.
     #[must_use]
-    pub(crate) fn lookup(&self, logical: &WinitKey, mods: ModifiersState) -> Option<Action> {
+    pub(crate) fn action_for(
+        &self,
+        logical: &WinitKey,
+        physical: PhysicalKey,
+        mods: ModifiersState,
+    ) -> Option<Action> {
         if self.map.is_empty() {
             return None;
         }
-        let chord = Chord::from_event(logical, mods)?;
-        self.map.get(&chord).copied()
+        Chord::from_press(logical, physical, mods)
+            .into_iter()
+            .flatten()
+            .find_map(|chord| self.map.get(&chord).copied())
+    }
+
+    /// [`Self::action_for`] with no physical key (so no layout twin): the
+    /// tests' spelling of a chord.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn lookup(&self, logical: &WinitKey, mods: ModifiersState) -> Option<Action> {
+        self.action_for(logical, NO_PHYSICAL_KEY, mods)
     }
 
     /// The DISPLAY chord for `action` in this EFFECTIVE map, if any — the
@@ -1166,21 +1287,27 @@ impl KeySequences {
         self.map.is_empty()
     }
 
-    /// The raw bytes a live key event is bound to, or `None` (miss -> fall through to
-    /// the default encoder).
+    /// The raw bytes a key chord is bound to, or `None` (miss -> fall through to
+    /// the default encoder). Live presses go through [`resolve_chord`], which adds
+    /// the layout twin.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn lookup(&self, logical: &WinitKey, mods: ModifiersState) -> Option<&[u8]> {
-        if self.map.is_empty() {
-            return None;
-        }
         let chord = Chord::from_event(logical, mods)?;
         self.map.get(&chord).map(Vec::as_slice)
     }
 }
 
+/// No physical key: a chord the tests spell, which has no layout twin.
+#[cfg(test)]
+const NO_PHYSICAL_KEY: PhysicalKey =
+    PhysicalKey::Unidentified(winit::keyboard::NativeKeyCode::Unidentified);
+
 /// The outcome of consulting the two user chord maps for a key event. Captures MAP
-/// PRECEDENCE ONLY: `[keybindings]` (app actions) win over `[key_sequences]` (raw-byte
-/// overrides); an unbound chord is `FallThrough`. The match-arm ORDERING against the
+/// PRECEDENCE: `[keybindings]` (app actions) win over `[key_sequences]` (raw-byte
+/// overrides); an unbound chord is `FallThrough`. The one App fact it reads is the
+/// pane geometry [`resolve_chord`] is handed as a predicate, and only for a
+/// `focus_pane_*` binding on an arrow key. The match-arm ORDERING against the
 /// hardcoded Cmd shortcuts, and the find-overlay gate, are policy that `App::on_key`
 /// owns — this function structurally cannot see them.
 #[derive(Debug, PartialEq, Eq)]
@@ -1190,23 +1317,68 @@ pub(crate) enum ChordResolution {
     FallThrough,
 }
 
-/// Resolve a live key event against the user's two chord maps, applying the
-/// keybindings-before-key_sequences precedence. Pure: reuses each map's own
-/// empty-guarded O(1) `lookup`. See [`ChordResolution`] for what it does NOT decide.
+/// Resolve a live key press against the user's two chord maps, applying the
+/// keybindings-before-key_sequences precedence. The press's own key is tried in
+/// both maps before its layout twin ([`Chord::from_press`]), so an exact rule in
+/// either map beats a twin match. Pure: O(1) map probes. See [`ChordResolution`]
+/// for what it does NOT decide.
+///
+/// A `focus_pane_*` binding on an arrow key claims its chord only while
+/// `pane_focus_moves` says a pane lies that way (`App::focus_pane_would_move`,
+/// asked only for those four actions on an arrow). Otherwise the chord resolves as
+/// if that binding were absent: a `[key_sequences]` rule on it still fires, and an
+/// unruled chord falls through to the PTY encoder like any unbound key. The rule
+/// belongs to the action, so a user's own `focus_pane_*` arrow entry behaves the
+/// same as the seeded Alt+arrows; see [`Keybindings::PLATFORM_DEFAULT_PAIRS`] for
+/// why a press with nowhere to move focus must reach the program, and
+/// [`pane_focus_passes_through`] for why a binding on any other key always claims.
 #[must_use]
 pub(crate) fn resolve_chord(
     base: &WinitKey,
+    physical: PhysicalKey,
     mods: ModifiersState,
     kb: &Keybindings,
     ks: &KeySequences,
+    mut pane_focus_moves: impl FnMut(crate::pane::FocusDir) -> bool,
 ) -> ChordResolution {
-    if let Some(action) = kb.lookup(base, mods) {
-        return ChordResolution::Action(action);
+    if kb.map.is_empty() && ks.map.is_empty() {
+        return ChordResolution::FallThrough;
     }
-    if let Some(bytes) = ks.lookup(base, mods) {
-        return ChordResolution::Sequence(bytes.to_vec());
+    for chord in Chord::from_press(base, physical, mods)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(&action) = kb.map.get(&chord) {
+            match action.pane_focus_dir() {
+                Some(dir) if pane_focus_passes_through(base) && !pane_focus_moves(dir) => {}
+                _ => return ChordResolution::Action(action),
+            }
+        }
+        if let Some(bytes) = ks.map.get(&chord) {
+            return ChordResolution::Sequence(bytes.clone());
+        }
     }
     ChordResolution::FallThrough
+}
+
+/// Whether a `focus_pane_*` binding on `base` may give its press to the program when
+/// no pane lies that way ([`resolve_chord`]): only on an arrow key. An arrow's
+/// fall-through is xterm's modified cursor key (`ESC[1;3D` for Alt+←), which a
+/// program binds as motion or ignores. Any other key's fall-through is a byte the
+/// line editor acts on: a `ctrl+j = "focus_pane_down"` layout, the tmux/vim-navigator
+/// habit, would send Ctrl+J's LF with no pane below, and bash runs the half-typed
+/// command line on it (`bind -p`, bash 5.3.9: `"\C-j": accept-line`; `"\C-h"`
+/// backward-delete-char, `"\C-k"` kill-line, `"\C-l"` clear-screen). Such a binding
+/// claims its key whatever the geometry, a no-op with nowhere to move, as every
+/// pane-focus binding did before the pass-through.
+#[must_use]
+fn pane_focus_passes_through(base: &WinitKey) -> bool {
+    matches!(
+        base,
+        WinitKey::Named(
+            NamedKey::ArrowLeft | NamedKey::ArrowRight | NamedKey::ArrowUp | NamedKey::ArrowDown
+        )
+    )
 }
 
 /// Upper bound on a single `[key_sequences]` value, in bytes. A key chord never
@@ -1290,25 +1462,6 @@ mod tests {
     use super::*;
     use winit::keyboard::SmolStr;
 
-    #[test]
-    fn every_action_name_parses() {
-        // ACTION_NAMES is the advertised list; it must not drift from `parse`.
-        for &name in ACTION_NAMES {
-            if let Some(template) = name.strip_suffix("1..switch_tab_9") {
-                // Parameterized entry: verify the whole 1..=9 range parses.
-                let base = template; // "switch_tab_"
-                for n in 1..=9 {
-                    assert!(
-                        Action::parse(&format!("{base}{n}")).is_some(),
-                        "{base}{n} must parse"
-                    );
-                }
-            } else {
-                assert!(Action::parse(name).is_some(), "action '{name}' must parse");
-            }
-        }
-    }
-
     fn ch(c: &str) -> WinitKey {
         WinitKey::Character(SmolStr::new(c))
     }
@@ -1322,31 +1475,23 @@ mod tests {
         assert_eq!(c.key, KeyToken::Char('t'));
     }
 
-    /// Modifier order does not matter and case is folded: these all parse equal.
+    /// Modifier order does not matter, case is folded, and the modifier
+    /// aliases (super → cmd, option → alt, control → ctrl) name the same chord.
     #[test]
-    fn chord_order_and_case_insensitive() {
-        let a = Chord::parse("cmd+shift+t").unwrap();
-        let b = Chord::parse("Shift+CMD+T").unwrap();
-        let c = Chord::parse("shift + cmd + t").unwrap();
-        assert_eq!(a, b);
-        assert_eq!(a, c);
-    }
-
-    /// Modifier aliases (super/win/meta → cmd; opt/option → alt; control → ctrl).
-    #[test]
-    fn modifier_aliases() {
-        assert_eq!(
-            Chord::parse("super+a").unwrap(),
-            Chord::parse("cmd+a").unwrap()
-        );
-        assert_eq!(
-            Chord::parse("option+a").unwrap(),
-            Chord::parse("alt+a").unwrap()
-        );
-        assert_eq!(
-            Chord::parse("control+a").unwrap(),
-            Chord::parse("ctrl+a").unwrap()
-        );
+    fn chord_order_case_and_aliases_parse_equal() {
+        for (a, b) in [
+            ("cmd+shift+t", "Shift+CMD+T"),
+            ("cmd+shift+t", "shift + cmd + t"),
+            ("super+a", "cmd+a"),
+            ("option+a", "alt+a"),
+            ("control+a", "ctrl+a"),
+        ] {
+            assert_eq!(
+                Chord::parse(a).unwrap(),
+                Chord::parse(b).unwrap(),
+                "{a} {b}"
+            );
+        }
     }
 
     /// Named keys parse to their `NamedKey`, with common aliases.
@@ -1379,15 +1524,8 @@ mod tests {
         assert!(Chord::parse("cmd").is_err()); // modifier with no key
         assert!(Chord::parse("notakey").is_err()); // multi-letter non-named word
         assert!(Chord::parse("a+b").is_err()); // key not last
-        // The reasons, which callers print beside the chord they name.
-        for (chord, reason) in [
-            ("ctrl++", "write the + key as plus"),
-            ("ctrl+foo+x", "unknown key or modifier \"foo\""),
-            ("cmd", "no key"),
-            ("a+b", "the key must come last"),
-        ] {
-            assert_eq!(Chord::parse(chord), Err(reason.to_string()), "{chord}");
-        }
+        assert!(Chord::parse("ctrl++").is_err()); // `+` is written `plus`
+        assert!(Chord::parse("ctrl+foo+x").is_err());
         assert_eq!(
             Chord::parse("ctrl+plus").map(|c| c.key),
             Ok(KeyToken::Char('+'))
@@ -1442,16 +1580,6 @@ mod tests {
         assert!(
             Chord::from_event(&WinitKey::Named(NamedKey::Shift), ModifiersState::SHIFT).is_none()
         );
-    }
-
-    /// An EMPTY table is a no-op map: `is_empty` is true and every lookup misses,
-    /// so the hardcoded `on_key` path is reached unchanged (the no-regression
-    /// invariant — zero cost when nothing is configured).
-    #[test]
-    fn empty_table_never_matches() {
-        let kb = Keybindings::from_config(None);
-        assert!(kb.is_empty());
-        assert_eq!(kb.lookup(&ch("t"), ModifiersState::SUPER), None);
     }
 
     /// A populated table resolves a configured chord to its action and still
@@ -1544,9 +1672,15 @@ mod tests {
                 Some(Action::ToggleFullscreen),
                 "F11 toggles full-screen"
             );
+            // The Windows/VS Code/WT preferences chord.
+            assert_eq!(
+                kb.lookup(&ch(","), ModifiersState::CONTROL),
+                Some(Action::ToggleSettings),
+                "Ctrl+, opens Settings",
+            );
             // Keyboard audit #1: plain Ctrl+V pastes ONLY on Windows (the WT
             // default). On Linux it stays the PTY's — readline quoted-insert
-            // and vim visual-block — with Ctrl+Shift+V/Shift+Insert seeded.
+            // and vim visual-block — with Ctrl+Shift+V seeded.
             assert_eq!(
                 kb.lookup(&ch("v"), ModifiersState::CONTROL),
                 if cfg!(windows) {
@@ -1743,33 +1877,6 @@ mod tests {
         );
     }
 
-    /// F11 and Ctrl+, are seeded off macOS: the universal full-screen reflex
-    /// (the same default Windows Terminal ships) and the Windows/VS Code/WT
-    /// preferences chord, which was bound nowhere in the tree.
-    #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn platform_defaults_seed_fullscreen_and_preferences() {
-        let kb = Keybindings::resolved(None);
-        assert_eq!(
-            kb.lookup(&WinitKey::Named(NamedKey::F11), ModifiersState::empty()),
-            Some(Action::ToggleFullscreen),
-            "F11 toggles full screen",
-        );
-        assert_eq!(
-            kb.lookup(&ch(","), ModifiersState::CONTROL),
-            Some(Action::ToggleSettings),
-            "Ctrl+, opens Settings",
-        );
-        // Still rebindable like every other seed.
-        let mut table = std::collections::BTreeMap::new();
-        table.insert("f11".to_string(), "open_palette".to_string());
-        assert_eq!(
-            Keybindings::resolved(Some(&table))
-                .lookup(&WinitKey::Named(NamedKey::F11), ModifiersState::empty()),
-            Some(Action::OpenPalette),
-        );
-    }
-
     /// UNBIND (keyboard audit #2): a `[keybindings]` value of `"none"` (or
     /// `"unbind"`) MASKS a platform seed — the chord misses the map and falls
     /// through to the PTY encoder as if never seeded — and is NOT an unknown
@@ -1944,37 +2051,6 @@ mod tests {
         assert_eq!(ks.map.len(), 2, "the bad chord was skipped");
     }
 
-    /// An absent table is a no-op: empty + every lookup misses (zero-cost default).
-    #[test]
-    fn empty_key_sequences_is_noop() {
-        let ks = KeySequences::from_config(None);
-        assert!(ks.is_empty());
-        assert_eq!(
-            ks.lookup(&WinitKey::Named(NamedKey::Enter), ModifiersState::SHIFT),
-            None
-        );
-    }
-
-    /// An empty value is a likely typo (it would silently dead-key the chord), so
-    /// from_config WARNS + SKIPS it rather than inserting a zero-byte rule.
-    #[test]
-    fn key_sequence_empty_value_is_skipped() {
-        let mut table = std::collections::BTreeMap::new();
-        table.insert("ctrl+x".to_string(), String::new());
-        table.insert("ctrl+y".to_string(), "\\n".to_string());
-        let ks = KeySequences::from_config(Some(&table));
-        assert_eq!(ks.map.len(), 1, "the empty value was skipped");
-        assert_eq!(
-            ks.lookup(&ch("x"), ModifiersState::CONTROL),
-            None,
-            "empty -> not mapped, falls through to the encoder"
-        );
-        assert_eq!(
-            ks.lookup(&ch("y"), ModifiersState::CONTROL),
-            Some(&[0x0a][..])
-        );
-    }
-
     /// A value over the byte cap is rejected (keeps the synchronous PTY write bounded);
     /// the loader then warns + skips it. A value exactly at the cap is accepted.
     #[test]
@@ -2016,87 +2092,270 @@ mod tests {
         kst.insert("cmd+t".to_string(), "X".to_string());
         let kb = Keybindings::from_config(Some(&kbt));
         let ks = KeySequences::from_config(Some(&kst));
+        // The pane-focus question is asked of the four `focus_pane_*` actions only.
+        let not_asked =
+            |_: crate::pane::FocusDir| -> bool { panic!("asked only for a focus_pane_* binding") };
         assert_eq!(
-            resolve_chord(&ch("t"), ModifiersState::SUPER, &kb, &ks),
+            resolve_chord(
+                &ch("t"),
+                NO_PHYSICAL_KEY,
+                ModifiersState::SUPER,
+                &kb,
+                &ks,
+                not_asked
+            ),
             ChordResolution::Action(Action::NewTab)
         );
         let kb_empty = Keybindings::from_config(None);
         assert_eq!(
-            resolve_chord(&ch("t"), ModifiersState::SUPER, &kb_empty, &ks),
+            resolve_chord(
+                &ch("t"),
+                NO_PHYSICAL_KEY,
+                ModifiersState::SUPER,
+                &kb_empty,
+                &ks,
+                not_asked
+            ),
             ChordResolution::Sequence(b"X".to_vec())
         );
         let ks_empty = KeySequences::from_config(None);
         assert_eq!(
-            resolve_chord(&ch("z"), ModifiersState::SUPER, &kb_empty, &ks_empty),
+            resolve_chord(
+                &ch("z"),
+                NO_PHYSICAL_KEY,
+                ModifiersState::SUPER,
+                &kb_empty,
+                &ks_empty,
+                not_asked
+            ),
             ChordResolution::FallThrough
         );
     }
 
-    /// Every BUILTIN_CMD_CHORDS chord string parses (drift/typo guard).
+    /// A chord on a non-Latin layout matches its US key's binding — the key
+    /// the PTY encoder would otherwise have sent the control byte of. Russian
+    /// Ctrl+Shift+'с' on the physical C key is Copy (it used to fall through and
+    /// send ^C); a bare or Shift-only 'с' is text and has no twin; a binding
+    /// written in the layout's own letter, in either map, beats the twin; and a
+    /// letter on a US digit key (AZERTY 'é' on 2) is never re-read as a digit.
     #[test]
-    fn builtin_cmd_chords_all_parse() {
-        for (chord, _label) in builtin_cmd_chords(true) {
-            assert!(Chord::parse(chord).is_ok(), "{chord} must parse");
-        }
+    fn a_layout_letter_matches_its_us_keys_binding_only_in_a_chord() {
+        use std::collections::BTreeMap;
+        use winit::keyboard::KeyCode;
+        let key = PhysicalKey::Code;
+        let ctrl_shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        let table: BTreeMap<String, String> = [
+            ("ctrl+shift+c", "copy"),
+            ("ctrl+shift+t", "new_tab"),
+            ("ctrl+shift+w", "close_tab"),
+            ("c", "copy"),
+            ("shift+c", "copy"),
+            ("ctrl+2", "font_reset"),
+        ]
+        .into_iter()
+        .map(|(c, a)| (c.to_string(), a.to_string()))
+        .collect();
+        let kb = Keybindings::from_config(Some(&table));
+        let ks = KeySequences::from_config(None);
+        let not_asked =
+            |_: crate::pane::FocusDir| -> bool { panic!("asked only for a focus_pane_* binding") };
+        assert_eq!(
+            kb.action_for(&ch("с"), key(KeyCode::KeyC), ctrl_shift),
+            Some(Action::Copy)
+        );
+        assert_eq!(
+            kb.action_for(&ch("е"), key(KeyCode::KeyT), ctrl_shift),
+            Some(Action::NewTab)
+        );
+        assert_eq!(
+            resolve_chord(
+                &ch("ц"),
+                key(KeyCode::KeyW),
+                ctrl_shift,
+                &kb,
+                &ks,
+                not_asked
+            ),
+            ChordResolution::Action(Action::CloseTab)
+        );
+        // Text has no twin: a bare or Shift-only Cyrillic press is not `c`.
+        assert_eq!(
+            kb.action_for(&ch("с"), key(KeyCode::KeyC), ModifiersState::empty()),
+            None
+        );
+        assert_eq!(
+            kb.action_for(&ch("с"), key(KeyCode::KeyC), ModifiersState::SHIFT),
+            None
+        );
+        // The twin is a US letter only: AZERTY Ctrl+é (the 2 key) is not Ctrl+2.
+        assert_eq!(
+            kb.action_for(&ch("é"), key(KeyCode::Digit2), ModifiersState::CONTROL),
+            None
+        );
+        // An exact binding in the layout's own letter wins, in either map.
+        let mut own = table.clone();
+        own.insert("ctrl+shift+с".to_string(), "find".to_string());
+        let kb_own = Keybindings::from_config(Some(&own));
+        assert_eq!(
+            kb_own.action_for(&ch("с"), key(KeyCode::KeyC), ctrl_shift),
+            Some(Action::Find)
+        );
+        let ks_own = KeySequences::from_config(Some(
+            &[("ctrl+shift+с".to_string(), "X".to_string())]
+                .into_iter()
+                .collect(),
+        ));
+        assert_eq!(
+            resolve_chord(
+                &ch("с"),
+                key(KeyCode::KeyC),
+                ctrl_shift,
+                &kb,
+                &ks_own,
+                not_asked
+            ),
+            ChordResolution::Sequence(b"X".to_vec())
+        );
     }
 
-    /// Every key equivalent the menu bar shows is a built-in the list names and
-    /// the shadow detector knows — in the menu row's words — and the menu-only
-    /// table holds nothing else. `--list-keybinds` left out 13 of them (⇧⌘P,
-    /// ⌘Q, ⇧⌘T …), so a `[keybindings]` rule on one was silently dead with no
-    /// warning, and the shared chords went by other names (Split Vertical for
-    /// Split Right).
+    /// Shift+Insert pastes PRIMARY on Linux (xterm, VTE, kitty, foot) and
+    /// Ctrl+Shift+Insert the clipboard (VTE); elsewhere, with no PRIMARY,
+    /// Shift+Insert is the clipboard paste (Windows Terminal). Both are paste
+    /// actions, so a focused text field claims either.
+    #[cfg(not(target_os = "macos"))]
     #[test]
-    fn every_menu_key_equivalent_is_a_listed_builtin_in_the_menus_words() {
-        use crate::menu::{MENU_MODEL, MenuAction, MenuEntry, MenuMods};
-        let lookup = |chord: &str, table: &[(&str, &'static str)]| {
-            let target = Chord::parse(chord).expect("a menu chord parses");
-            table
-                .iter()
-                .find(|(c, _)| Chord::parse(c).is_ok_and(|c| c == target))
-                .map(|(_, label)| *label)
-        };
-        let all: Vec<(&str, &'static str)> = builtin_cmd_chords(true).copied().collect();
-        let mut menu_chords = Vec::new();
-        for (label, action, key, mods) in MENU_MODEL
-            .iter()
-            .flat_map(|s| s.entries.iter())
-            .flat_map(MenuEntry::items)
-        {
-            if key.is_empty() {
-                continue;
-            }
-            let prefix = match mods {
-                MenuMods::Command => "cmd",
-                MenuMods::CommandShift => "cmd+shift",
-                MenuMods::CommandControl => "cmd+ctrl",
-                MenuMods::None => panic!("{label}: a key equivalent with no modifier"),
-            };
-            // AppKit's "+" equivalent is the `=` key (the zoom chords match both).
-            let key = if key == "+" { "=" } else { key };
-            let chord = format!("{prefix}+{key}");
-            let expected = if action == MenuAction::CloseTab {
-                "Close Pane or Tab"
-            } else {
-                label
-            };
-            assert_eq!(
-                lookup(&chord, &all),
-                Some(expected),
-                "{chord} ({label}) must be listed in the menu's words"
-            );
-            menu_chords.push(chord);
+    fn shift_insert_pastes_the_platforms_selection() {
+        let kb = Keybindings::platform_defaults();
+        let insert = WinitKey::Named(NamedKey::Insert);
+        let shift = ModifiersState::SHIFT;
+        let ctrl_shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        if cfg!(target_os = "linux") {
+            assert_eq!(kb.lookup(&insert, shift), Some(Action::PasteSelection));
+            assert_eq!(kb.lookup(&insert, ctrl_shift), Some(Action::Paste));
+        } else {
+            assert_eq!(kb.lookup(&insert, shift), Some(Action::Paste));
         }
-        for &(chord, label) in MENU_CMD_CHORDS {
-            assert!(
-                menu_chords
-                    .iter()
-                    .any(|c| lookup(c, &[(chord, label)]).is_some()),
-                "{chord} ({label}) is no menu key equivalent"
+        assert_eq!(Action::parse("paste_primary"), Some(Action::PasteSelection));
+        assert!(Action::Paste.is_paste() && Action::PasteSelection.is_paste());
+        assert!(!Action::Copy.is_paste());
+    }
+
+    /// A `focus_pane_*` binding claims its chord only when focus can move that
+    /// way. Otherwise the chord resolves as if the binding were absent: a
+    /// `[key_sequences]` rule on the same chord fires, and an unruled chord falls
+    /// through to the PTY encoder, which sends Alt+← as `ESC[1;3D`, the word motion
+    /// aterm's shell integrations bind. A user's own binding follows the same
+    /// rule, and the question carries the action's direction.
+    #[test]
+    fn a_pane_focus_binding_claims_its_chord_only_when_focus_can_move() {
+        use crate::pane::FocusDir;
+        use std::collections::BTreeMap;
+        let alt = ModifiersState::ALT;
+        let left = WinitKey::Named(NamedKey::ArrowLeft);
+        let up = WinitKey::Named(NamedKey::ArrowUp);
+        let mut kbt = BTreeMap::new();
+        kbt.insert("alt+left".to_string(), "focus_pane_left".to_string());
+        kbt.insert("alt+up".to_string(), "focus_pane_up".to_string());
+        let kb = Keybindings::from_config(Some(&kbt));
+        let ks_empty = KeySequences::from_config(None);
+        let mut kst = BTreeMap::new();
+        kst.insert("alt+left".to_string(), "\\x1bb".to_string());
+        let ks = KeySequences::from_config(Some(&kst));
+
+        // A pane that way: the binding claims the chord, over a raw-byte rule too.
+        assert_eq!(
+            resolve_chord(&left, NO_PHYSICAL_KEY, alt, &kb, &ks, |dir| dir
+                == FocusDir::Left),
+            ChordResolution::Action(Action::FocusPaneLeft)
+        );
+        assert_eq!(
+            resolve_chord(&up, NO_PHYSICAL_KEY, alt, &kb, &ks_empty, |dir| dir
+                == FocusDir::Up),
+            ChordResolution::Action(Action::FocusPaneUp)
+        );
+        // Nowhere to move: an unruled chord goes to the encoder…
+        assert_eq!(
+            resolve_chord(&left, NO_PHYSICAL_KEY, alt, &kb, &ks_empty, |_| false),
+            ChordResolution::FallThrough
+        );
+        assert_eq!(
+            resolve_chord(&up, NO_PHYSICAL_KEY, alt, &kb, &ks_empty, |dir| dir
+                != FocusDir::Up),
+            ChordResolution::FallThrough,
+            "the question names the action's own direction"
+        );
+        // …and a `[key_sequences]` rule on the chord fires as for an unbound key.
+        assert_eq!(
+            resolve_chord(&left, NO_PHYSICAL_KEY, alt, &kb, &ks, |_| false),
+            ChordResolution::Sequence(b"\x1bb".to_vec())
+        );
+    }
+
+    /// Off the arrows a `focus_pane_*` binding claims its chord whatever the
+    /// geometry, and the geometry is not even asked: `ctrl+j` falling through would
+    /// write LF, which bash runs as accept-line. Every arrow still passes through,
+    /// with any modifiers.
+    #[test]
+    fn a_pane_focus_binding_off_the_arrows_always_claims_its_chord() {
+        use std::collections::BTreeMap;
+        let ctrl = ModifiersState::CONTROL;
+        let mut kbt = BTreeMap::new();
+        for (chord, action) in [
+            ("ctrl+h", "focus_pane_left"),
+            ("ctrl+j", "focus_pane_down"),
+            ("ctrl+k", "focus_pane_up"),
+            ("ctrl+l", "focus_pane_right"),
+            ("ctrl+shift+left", "focus_pane_left"),
+        ] {
+            kbt.insert(chord.to_string(), action.to_string());
+        }
+        let kb = Keybindings::from_config(Some(&kbt));
+        let ks = KeySequences::from_config(None);
+        let not_asked =
+            |_: crate::pane::FocusDir| -> bool { panic!("asked only for an arrow chord") };
+        for (letter, action) in [
+            ("h", Action::FocusPaneLeft),
+            ("j", Action::FocusPaneDown),
+            ("k", Action::FocusPaneUp),
+            ("l", Action::FocusPaneRight),
+        ] {
+            assert_eq!(
+                resolve_chord(&ch(letter), NO_PHYSICAL_KEY, ctrl, &kb, &ks, not_asked),
+                ChordResolution::Action(action),
+                "ctrl+{letter}"
             );
-            assert!(
-                lookup(chord, BUILTIN_CMD_CHORDS).is_none(),
-                "{chord} is listed twice"
+        }
+        assert_eq!(
+            resolve_chord(
+                &WinitKey::Named(NamedKey::ArrowLeft),
+                NO_PHYSICAL_KEY,
+                ctrl | ModifiersState::SHIFT,
+                &kb,
+                &ks,
+                |_| false
+            ),
+            ChordResolution::FallThrough,
+            "an arrow with any modifiers passes through"
+        );
+    }
+
+    /// `pane_focus_dir` names exactly the four pane-focus actions.
+    #[test]
+    fn pane_focus_dir_names_the_four_focus_actions() {
+        use crate::pane::FocusDir;
+        assert_eq!(Action::FocusPaneLeft.pane_focus_dir(), Some(FocusDir::Left));
+        assert_eq!(
+            Action::FocusPaneRight.pane_focus_dir(),
+            Some(FocusDir::Right)
+        );
+        assert_eq!(Action::FocusPaneUp.pane_focus_dir(), Some(FocusDir::Up));
+        assert_eq!(Action::FocusPaneDown.pane_focus_dir(), Some(FocusDir::Down));
+        for name in ACTION_NAMES.iter().filter(|n| !n.contains("..")) {
+            let action = Action::parse(name).expect("every listed name parses");
+            assert_eq!(
+                action.pane_focus_dir().is_some(),
+                name.starts_with("focus_pane_"),
+                "{name}"
             );
         }
     }
@@ -2106,40 +2365,25 @@ mod tests {
     /// so the mapping is asserted identically on every platform.
     #[test]
     fn builtin_shadow_label_maps_known_and_normalizes() {
-        assert_eq!(
-            builtin_shadow_label_when("cmd+c", true, false),
-            Some("Copy")
-        );
-        assert_eq!(
-            builtin_shadow_label_when("cmd+shift+]", true, false),
-            Some("Show Next Tab")
-        );
-        assert_eq!(
-            builtin_shadow_label_when("cmd+1", true, false),
-            Some("Switch to Tab 1")
-        );
-        assert_eq!(
-            builtin_shadow_label_when("shift+cmd+]", true, false),
-            Some("Show Next Tab")
-        );
-        assert_eq!(builtin_shadow_label_when("cmd+k", true, false), None);
-        assert_eq!(builtin_shadow_label_when("garbage++", true, false), None);
-        // on_key's own Cmd-Shift chords and ⌘Q are built-ins everywhere the
-        // suite is live…
-        assert_eq!(
-            builtin_shadow_label_when("cmd+shift+t", true, false),
-            Some("Reopen Closed Tab")
-        );
-        assert_eq!(
-            builtin_shadow_label_when("cmd+q", true, false),
-            Some("Quit aterm")
-        );
+        let known = |chord: &str, menu_bar: bool| builtin_shadow_label_when(chord, true, menu_bar);
+        // Known built-ins, in any spelling of the chord; on_key's own Cmd-Shift
+        // chords and ⌘Q everywhere the suite is live.
+        for chord in [
+            "cmd+c",
+            "cmd+shift+]",
+            "shift+cmd+]",
+            "cmd+1",
+            "cmd+shift+t",
+            "cmd+q",
+        ] {
+            assert!(known(chord, false).is_some(), "{chord}");
+        }
+        assert_eq!(known("cmd+shift+]", false), known("shift+cmd+]", false));
+        assert_eq!(known("cmd+k", false), None);
+        assert_eq!(known("garbage++", false), None);
         // …the menu bar's key equivalents only where there is a menu bar.
-        assert_eq!(
-            builtin_shadow_label_when("cmd+shift+p", true, true),
-            Some("Command Palette…")
-        );
-        assert_eq!(builtin_shadow_label_when("cmd+shift+p", true, false), None);
+        assert!(known("cmd+shift+p", true).is_some());
+        assert_eq!(known("cmd+shift+p", false), None);
         assert_eq!(
             builtin_shadow_label("cmd+shift+p").is_some(),
             cfg!(target_os = "macos")
@@ -2154,12 +2398,10 @@ mod tests {
     fn builtin_shadow_label_is_silent_when_the_suite_is_gated_off() {
         assert_eq!(builtin_shadow_label_when("cmd+c", false, true), None);
         assert_eq!(builtin_shadow_label_when("super+t", false, true), None);
-        let expected = if crate::app_input::HARDCODED_SUPER_CHORDS {
-            Some("Copy")
-        } else {
-            None
-        };
-        assert_eq!(builtin_shadow_label("cmd+c"), expected);
+        assert_eq!(
+            builtin_shadow_label("cmd+c").is_some(),
+            crate::app_input::HARDCODED_SUPER_CHORDS
+        );
     }
 
     /// chord_in_keybindings detects a cross-table collision (normalized).

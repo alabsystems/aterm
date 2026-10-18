@@ -233,7 +233,7 @@ macro_rules! __aterm_objc_count {
 /// }
 /// ```
 ///
-/// Fourteen arguments compile, register and send (`tests/adversary_w2c.rs`).
+/// Fourteen arguments compile, register and send (`tests/declared_abi.rs`).
 /// Matched arities of one, two and three arguments:
 ///
 /// ```
@@ -536,7 +536,7 @@ macro_rules! declare_class {
                     let __alloc: unsafe extern "C-unwind" fn(
                         $crate::ClassPtr,
                         $crate::Sel,
-                    ) -> $crate::Id = $crate::msg();
+                    ) -> $crate::Id = $crate::checked_msg();
                     let __raw = __alloc(__meta.class(), $crate::sel!(alloc));
                     if __raw.is_null() {
                         return $crate::Id::NIL;
@@ -572,7 +572,7 @@ macro_rules! declare_class {
                     let __init: unsafe extern "C-unwind" fn(
                         $crate::Id,
                         $crate::Sel,
-                    ) -> $crate::Id = $crate::msg();
+                    ) -> $crate::Id = $crate::checked_msg();
                     let __obj = __init(__raw, $crate::sel!(init));
                     $crate::Retained::from_owned(__obj)
                 }

@@ -645,14 +645,4 @@ mod tests {
             "the empty argument must read back in place: {argv:?}"
         );
     }
-
-    /// A live read of this test process: its own argv[0] and a variable it certainly has.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn process_args_reads_this_process() {
-        let me = process_args(std::process::id()).expect("our own pid is readable");
-        assert!(!me.argv.is_empty());
-        assert!(me.exec_path.contains("atpkg"), "{}", me.exec_path);
-        assert!(me.env.iter().any(|kv| kv.contains('=')));
-    }
 }

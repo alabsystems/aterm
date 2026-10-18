@@ -6,8 +6,9 @@
 // the JS value wasm-bindgen gives the same Rust type, compared type-exactly
 // (BigInt, undefined, typed arrays, -0, thrown strings vs Errors). Run on
 // the glue wasm-bindgen 0.2.108 writes for a #[wasm_bindgen] twin of the
-// toy, every check holds but the two marked STRICTER (`another class`, and
-// the misuse throws).
+// toy (the check's oracle row, crates/aterm-verify/src/wasm_glue/oracle.rs),
+// every check holds but the two marked STRICTER (`another class`, and the
+// misuse throws).
 //
 //   node --expose-gc drive.mjs <dir>
 //

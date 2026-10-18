@@ -117,8 +117,9 @@ impl App {
                 .iter()
                 .any(|leaf| leaf.header.is_some() && leaf.view == entry.view)
         });
-        let theme = self.chrome_palette_theme();
-        let colors = chrome_band::band_colors(theme);
+        let palette = self.chrome_palette(crate::app_render::ChromeSurface::Header);
+        let theme = palette.theme;
+        let colors = chrome_band::band_colors(palette);
         let (cw, ch) = self.win_cell_size(wid);
         let font_epoch = tray_raster::strip_band_font_epoch();
         let mut fingerprint = std::collections::hash_map::DefaultHasher::new();

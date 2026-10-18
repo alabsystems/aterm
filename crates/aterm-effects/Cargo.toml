@@ -7,26 +7,15 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "aterm visual-effects engines: the host-agnostic cursor aurora/comet-trail and sparkle-words (animated ink, peeking cat, supernova) state machines that the native GUI and the web embedders share."
-# The integration tests are ONE suite binary plus four isolates, declared as
-# `[[test]]` targets at the end of this file. With autotests off, a `tests/*.rs`
-# that is neither a `mod` of tests/effects_suite.rs nor its own `[[test]]` is
-# silently never compiled.
+# The integration tests are ONE suite binary, declared as the `[[test]]` target
+# at the end of this file. The two trick conformances are unit modules mounted
+# by src/lib.rs so they share the cfg(test) build that emits the
+# implementation's model anchors. With autotests off, every other `tests/*.rs`
+# that is not a `mod` of tests/effects_suite.rs is silently never compiled.
 autotests = false
 
-[features]
-# Compile the kitty-command anchors (`#[refines]` on the listener and the flash,
-# machines `TrickListenerPurity` and `TrickFlashLifecycle`) into the LIBRARY.
-# OFF by default: the shipped build carries no `aterm-spec` and no probe. The
-# unit-test build expands them through `cfg(test)`, the integration tests
-# through the dev edge on this crate below.
-spec-anchors = ["dep:aterm-spec"]
-
 [dependencies]
-# Library dependency only under `spec-anchors`.
-aterm-spec = { workspace = true, optional = true }
 # Engine snapshot types (Terminal for the rescan, RenderCell, selection view).
-# default-features = false keeps the closure wasm32-clean (no disk-tier libc mmap);
-# the GUI's `bidi` feature unions in via the workspace build without affecting us.
 aterm-core = { path = "../aterm-core", default-features = false }
 # Explicit terminal progress facts; already part of the core dependency graph.
 aterm-types = { workspace = true }
@@ -51,6 +40,9 @@ aterm-scene = { workspace = true }
 # The state machines stay clockless (the host injects `now`), but wasm hosts
 # need a constructible Instant to synthesize one from an advance(dt) stream.
 aterm-time = { workspace = true }
+# The anchor attributes' registry (std-only): `#[cfg_attr(any(test, debug_assertions),
+# aterm_spec_anchor::refines(…))]` expands in every test and debug build; release strips it.
+aterm-spec-anchor = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 # Native config-referenced visual feeds are opened O_NONBLOCK/O_NOFOLLOW on
@@ -58,14 +50,13 @@ aterm-time = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
-# The ty models the sparkle tests run (identity episodes, flash limiter).
+# Models and cfg(test) anchors for the effect state machines.
 aterm-spec = { workspace = true }
-# The integration tests link the library with its anchors on, so a Tier-1 bind
-# in `tests/` sees its machine's anchors. A dev edge: a build of the library
-# never follows it.
-aterm-effects = { path = ".", features = ["spec-anchors"] }
-# Atlas PNG dumps for visual iteration (`ATERM_CAT_ART_DUMP_DIR` in
-# tests/cat_art_quality.rs).
+# Atlas PNG dumps for the art gallery examples.
+# The models its tests drive (a model edit rebuilds only their tests).
+aterm-models-effects = { workspace = true }
+aterm-models-misc = { workspace = true }
+aterm-models-render = { workspace = true }
 aterm-png = { workspace = true }
 
 [lints]
@@ -73,29 +64,14 @@ workspace = true
 
 # ---- integration tests (autotests = false above) ----------------------------
 
-# Every tests/*.rs not listed below is a `mod` of this suite: one link and one
-# process instead of one per file, the files unchanged at their paths.
+# Apart from the unit-mounted trick conformances, every tests/*.rs is a `mod`
+# of this suite: one link and one process instead of one per file, the files
+# unchanged at their paths. The exact-allocation pins share it through the
+# suite's per-thread counting allocator (tests/alloc_count), so none needs a
+# binary of its own.
 [[test]]
 name = "effects_suite"
 path = "tests/effects_suite.rs"
-
-# ISOLATES — each installs a `#[global_allocator]` and asserts exact allocation
-# counts, which a concurrent module in a shared process would falsify.
-[[test]]
-name = "rainbow_kitty_v2_frame_cost"
-path = "tests/rainbow_kitty_v2_frame_cost.rs"
-
-[[test]]
-name = "trick_flash_alloc"
-path = "tests/trick_flash_alloc.rs"
-
-[[test]]
-name = "typed_tricks_alloc"
-path = "tests/typed_tricks_alloc.rs"
-
-[[test]]
-name = "word_reflow_identity"
-path = "tests/word_reflow_identity.rs"
 
 # ---- release perf gates: `targo --unverified bench -p aterm-effects` ----------
 # Wall-clock budgets measured in the bench profile; their deterministic halves

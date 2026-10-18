@@ -7,7 +7,8 @@
 
 use crate::publish;
 
-use aterm_spec::derive::{Model, release_journal_prefix_model};
+use aterm_models_release::release_journal_prefix_model;
+use aterm_spec::derive::Model;
 
 fn journal(done: Vec<String>) -> publish::Journal {
     let release_id = done.iter().any(|step| step == "publish").then_some(55);

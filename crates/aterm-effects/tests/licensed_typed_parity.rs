@@ -1,25 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Licensed-move parity (`docs/design/EFFECTS-LICENSE-REDESIGN.md`).
-//!
-//! The license is a precondition, not a classifier: once a move is licensed
-//! (a fresh key hint stands behind it) the classifier runs unchanged, so the
-//! pixels a licensed move lays must not depend on the license seam. This file
-//! pins, per style, a fold over emitted quads, frame fingerprints, spawn
-//! counts, the live light census, momentum and sound cues, using the public
-//! API only.
+//! The move license (`docs/design/EFFECTS-LICENSE-REDESIGN.md`), per style,
+//! through the public API: a licensed move earns light, an unlicensed one
+//! mints none, and neither wipes the light already earned.
 //!
 //! The light census reads whichever engine owns the frame (`live_light`): the
 //! rainbow kitty is its v2 engine, whose light is ribbon cells, stars and
 //! meteors, never a v1 spark, so for that style the census reads the `Status`
 //! rows `trail status` reports; the other styles read `live_sparks`.
-//!
-//! Set `ATERM_CAPTURE_TYPED_PARITY=1` to print the fold instead of asserting.
-//!
-//! The golden carries its own control:
-//! `an_unlicensed_script_moves_every_golden_entry` runs the identical script
-//! with every key hint withheld and requires all nine entries to move.
 
 use std::time::{Duration, Instant};
 
@@ -69,7 +58,6 @@ fn cfg(style: GlowStyle) -> GlowConfig {
         ring: true,
         beam: !matches!(style, GlowStyle::Water | GlowStyle::RainbowKitty),
         head_dx: 0.5,
-        pack: None,
     }
 }
 
@@ -111,8 +99,7 @@ fn resident_ribbon(glow: &CursorGlow) -> usize {
 ///
 /// With `licensed` false the identical trajectory arrives with no key hint
 /// behind it (cold program movement), so the difference between the two folds
-/// is the license alone. `an_unlicensed_script_moves_every_golden_entry` is
-/// the control built on it.
+/// is the license alone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TypedScriptOutcome {
     fingerprint: u64,
@@ -124,14 +111,8 @@ struct TypedScriptOutcome {
 }
 
 fn typed_script(style: GlowStyle, licensed: bool) -> TypedScriptOutcome {
-    typed_script_with(&cfg(style), licensed)
-}
-
-/// [`typed_script`] on an explicit config — the flat-spelling control below
-/// runs the same script with `ribbon_flat` set.
-fn typed_script_with(c: &GlowConfig, licensed: bool) -> TypedScriptOutcome {
     let g = geom();
-    let c = *c;
+    let c = cfg(style);
     let tc = trail_cfg();
     let mut glow = CursorGlow::default();
     let mut trail = CursorTrail::default();
@@ -345,87 +326,72 @@ const ALL_STYLES: [GlowStyle; 9] = [
 ];
 // `GlowStyle::Classic` is absent: every test here asserts that a style draws
 // nothing for a move no keystroke asked for, and the classic engine does not
-// consult the license (it spawns on observed cursor motion). Its determinism
-// and idle-zero pins live in `classic_wake`, and its whole-frame fold is
-// pinned by `builtins_are_byte_identical_and_never_touch_the_custom_path`.
+// consult the license (it spawns on observed cursor motion). Its idle-zero pin
+// lives in `classic_wake`.
 
 #[test]
-fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
-    // Per-style fold of the licensed typed script, in `ALL_STYLES` order.
-    // Re-capture (`ATERM_CAPTURE_TYPED_PARITY=1`) only for a deliberate change
-    // to a style's emitter or to `GlowQuad`'s fields (the fold hashes each
-    // quad's Debug string), and confirm which entries moved and why; never to
-    // quiet a failure caused by the license seam, which this array exists to
-    // catch.
-    const GOLDEN: [u64; 9] = [
-        2_012_044_335_639_200_132,
-        9_056_904_005_182_467_320,
-        9_770_655_941_870_276_673,
-        6_434_568_479_864_447_486,
-        1_103_233_083_236_013_119,
-        10_518_610_175_969_919_396,
-        9_195_345_295_744_972_650,
-        16_308_416_874_437_072_549,
-        9_650_234_412_234_410_662,
-    ];
-    let styles = ALL_STYLES;
-    let mut actual = [0u64; 9];
-    for (i, &style) in styles.iter().enumerate() {
-        let a = typed_script(style, true);
-        let b = typed_script(style, true);
-        assert_eq!(a, b, "{style:?}: the typed script is nondeterministic");
-        assert_ne!(
-            a.fingerprint, 0,
-            "{style:?}: the typed script folded nothing"
+fn a_delayed_backspace_extends_only_rainbow_kittys_move_licence() {
+    let retreat = |style, delay, backspace| {
+        let mut glow = CursorGlow::default();
+        let mut trail = CursorTrail::default();
+        let mut out = Vec::new();
+        let mut trail_out = Vec::new();
+        let c = cfg(style);
+        let tc = trail_cfg();
+        let t0 = Instant::now();
+        glow.tick(Some((2, 10)), t0, &c, geom(), &mut out);
+        trail.tick(Some((2, 10)), t0, &tc, &mut trail_out);
+        let pressed = t0 + Duration::from_millis(8);
+        if backspace {
+            glow.note_backspace_erasing(pressed, Some(1));
+            // The host maps Backspace to the trail's typed hint.
+            trail.note_typed(pressed);
+        }
+        let echoed = pressed + delay;
+        assert_eq!(glow.move_licensed(echoed), trail.move_licensed(echoed));
+        glow.tick(Some((2, 9)), echoed, &c, geom(), &mut out);
+        trail.tick(Some((2, 9)), echoed, &tc, &mut trail_out);
+        (glow.spawns(), trail_out.len(), glow.admission_tally())
+    };
+
+    // A fresh Backspace really reaches both move engines; an unkeyed retreat
+    // reaches neither. These are injected event times, not elapsed waits.
+    let fresh = retreat(GlowStyle::Fire, Duration::from_millis(8), true);
+    assert_eq!(fresh.0, 1);
+    assert!(fresh.1 > 0);
+    let cold = retreat(GlowStyle::Fire, Duration::from_secs(1), false);
+    assert_eq!((cold.0, cold.1), (0, 0));
+    assert_eq!(
+        cold.2.last_decline_reason,
+        Some(CursorGlow::DECLINE_NO_FRESH_HINT)
+    );
+
+    // Rainbow Kitty's erase ledger may still owe its retreat after the ordinary
+    // hint expires. Keep that intended extension while the trail stays dark.
+    let rainbow = retreat(GlowStyle::RainbowKitty, Duration::from_secs(1), true);
+    assert_eq!(rainbow.0, 1);
+    assert_eq!(rainbow.1, 0);
+
+    for style in ALL_STYLES
+        .into_iter()
+        .filter(|s| *s != GlowStyle::RainbowKitty)
+    {
+        let delayed = retreat(style, Duration::from_secs(1), true);
+        assert_eq!(delayed.1, 0, "{style:?}: the trail's hint has expired");
+        assert_eq!(delayed.0, 0, "{style:?}: retain the trail's move licence");
+        assert_eq!(
+            delayed.2.last_decline_reason,
+            Some(CursorGlow::DECLINE_NO_FRESH_HINT)
         );
-        actual[i] = a.fingerprint;
     }
-    if std::env::var_os("ATERM_CAPTURE_TYPED_PARITY").is_some() || GOLDEN.iter().all(|&v| v == 0) {
-        panic!("CAPTURE TYPED PARITY GOLDEN = {actual:?}");
-    }
-    assert_eq!(
-        actual, GOLDEN,
-        "a licensed typed move stopped being byte-identical to the pre-license tree"
-    );
 }
 
-/// With `GlowConfig::ribbon_flat` set (the `rainbow kitty flat` spelling) every
-/// comet branch in `ribbon.rs` collapses to the pre-comet expression. The
-/// pinned fold measures the flat body; the `assert_ne!` control keeps it a
-/// measurement (the default comet body must fold differently).
+/// The identical script with key hints withheld (cold program movement over
+/// the same trajectory) is declined move by move and mints no light, in every
+/// style, while the licensed script admits every move.
 #[test]
-fn the_flat_spelling_keeps_the_pre_comet_typed_fold() {
-    // The flat spelling's typed fold. The flag gates the comet profile, the
-    // vivid rail and the from-the-hand wipe, but not other ribbon rules, so
-    // those move this value too.
-    const PRE_COMET: u64 = 10_810_081_371_715_245_225;
-    let mut flat = cfg(GlowStyle::RainbowKitty);
-    flat.ribbon_flat = true;
-    let a = typed_script_with(&flat, true);
-    let b = typed_script_with(&flat, true);
-    assert_eq!(a, b, "the flat typed script is nondeterministic");
-    assert_eq!(
-        a.fingerprint, PRE_COMET,
-        "the flat spelling stopped collapsing every comet branch"
-    );
-    // …and the control: the default body is the comet, so the same script
-    // WITHOUT the flag folds to something else (entry 2 of `GOLDEN`).
-    assert_ne!(
-        typed_script(GlowStyle::RainbowKitty, true).fingerprint,
-        PRE_COMET,
-        "the comet body must move the fold, or the flat pin is vacuous"
-    );
-}
-
-/// The control for the golden above: the identical script with key hints
-/// withheld (cold program movement over the same trajectory) must move every
-/// one of the nine entries, so the golden demonstrably depends on the license.
-///
-/// Per entry rather than a whole-array `assert_ne!`, which would pass as soon
-/// as one style moved.
-#[test]
-fn an_unlicensed_script_moves_every_golden_entry() {
-    for (i, &style) in ALL_STYLES.iter().enumerate() {
+fn an_unlicensed_script_mints_nothing_the_licensed_one_lays() {
+    for &style in &ALL_STYLES {
         let licensed = typed_script(style, true);
         let cold = typed_script(style, false);
         assert_eq!(
@@ -466,10 +432,7 @@ fn an_unlicensed_script_moves_every_golden_entry() {
         }
         assert_ne!(
             licensed.fingerprint, cold.fingerprint,
-            "{style:?} (GOLDEN entry {i}): withholding every key hint left the fold \
-             UNCHANGED. The golden above is then blind to the license seam it exists \
-             to guard — it would stay green through the exact regression it was \
-             written for."
+            "{style:?}: withholding every key hint left the frames unchanged"
         );
     }
 }

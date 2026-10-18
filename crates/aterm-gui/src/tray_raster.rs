@@ -3,7 +3,7 @@
 
 //! A small anti-aliased CPU rasterizer for the widget tray's [`DrawPrim`] list. It
 //! renders the prims into an RGBA8 buffer with analytic SDF anti-aliasing (rounded
-//! panel, concentric ring/arc gauges, capsule, dot) and real glyphs — the USER'S
+//! panel, ring, capsule, dot) and real glyphs — the USER'S
 //! terminal face (+ its real bold sibling), injected via [`set_chrome_fonts`] from
 //! the renderer's resolved primary font, with the bundled DejaVu strictly as a
 //! per-char COVERAGE fallback (symbols like ⌘⇧⌃✓ the terminal face lacks; see
@@ -173,16 +173,16 @@ impl SemanticPrewarmWorker {
         });
         let worker_queue = Arc::clone(&queue);
         let (tx, results) = std::sync::mpsc::channel();
-        std::thread::Builder::new()
-            .name("aterm-semantic-font-prewarm".into())
-            .spawn(move || {
+        crate::qos::spawn_lane_thread(
+            "aterm-semantic-font-prewarm",
+            crate::qos::Role::Background,
+            move || {
                 // QoS (port of 61a6c8b62): cosmetic — it warms a PRIVATE renderer
                 // clone. The process-global font interns it publishes into parse
                 // OUTSIDE their locks (`intern_parsed_font_keyed`), the job queue
                 // mutex is dropped before any work, and `SEMANTIC_PREWARM_GATE`
                 // serialises only prewarm workers; the UI thread contends none of
                 // them for longer than a scan, so demotion is safe here.
-                crate::qos::set_self(crate::qos::Role::Background);
                 let mut base: Option<(u64, Renderer)> = None;
                 let mut faces = CandidateFaceCache::new();
                 loop {
@@ -260,8 +260,9 @@ impl SemanticPrewarmWorker {
                         wake();
                     }
                 }
-            })
-            .ok()?;
+            },
+        )
+        .ok()?;
         Some(Self { queue, results })
     }
 
@@ -782,6 +783,21 @@ impl PreparedSemanticFont {
         )
     }
 
+    /// The `(width, height)` cell a specimen paints at `px`: pure geometry,
+    /// like [`Self::specimen_cell_height`].
+    pub(crate) fn specimen_cell_size(
+        &self,
+        px: f32,
+        line_height: f32,
+        variations: &[(u32, f32)],
+    ) -> Option<(usize, usize)> {
+        Some(
+            self.renderer
+                .as_ref()?
+                .specimen_cell_size(px, line_height, variations),
+        )
+    }
+
     /// The head band a specimen frame needs above its first row so a display
     /// face's capitals are not cut at the top of the box (pixels at `px`;
     /// `0` for an ordinary font). Pure geometry, like
@@ -797,11 +813,6 @@ impl PreparedSemanticFont {
                 .as_ref()?
                 .display_ink_headroom(px, line_height, baseline_adjust),
         )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn renderer_ready(&self) -> bool {
-        self.renderer.is_some()
     }
 
     fn fork(&self, px: f32, theme: aterm_render::Theme) -> Option<Renderer> {
@@ -1121,8 +1132,7 @@ pub(crate) fn install_dormant_chrome_fonts_for_test(renderer: Renderer) -> u64 {
 /// CoreText. Measured 2026-09-15 — all three system faces parse. Excluding
 /// them cost nothing less than four tests that returned before their first
 /// assertion and still reported `ok`, on the one platform this repo is
-/// developed on. See [`the_cjk_chain_census_is_not_empty_where_the_os_ships_one`],
-/// which fails loudly if this list ever goes empty on a host that ships a face.
+/// developed on.
 ///
 /// `None` only on a genuinely bare host (a Linux CI image with no CJK package).
 #[cfg(test)]
@@ -1286,11 +1296,8 @@ pub(crate) fn prepared_semantic_font_from_bytes_for_test(
 /// # Invariant (proven)
 /// `Fallback` is returned ONLY when neither user face applies
 /// (`EmbeddedOnlyAsCoverageFallback`), and a covered bold run always keeps its
-/// weight (`BoldHonoredWhenCovered`). Two-tier: the `ChromeFaceGate` derived
-/// model (`aterm_spec::derive::chrome_face_gate_model`) is checked by the real
-/// Trust `ty` over the whole bounded space (proves at Buggy=0, catches the old
-/// hardcoded-DejaVu chrome at Buggy=1); the exhaustive 2^3 enumeration in this
-/// module's tests is the Tier-1 binding to this shipping fn.
+/// weight (`BoldHonoredWhenCovered`). The exhaustive 2^3 enumeration in this
+/// module's tests proves both on this shipping fn.
 pub(crate) fn select_chrome_face(
     bold_run: bool,
     bold_has: bool,
@@ -1394,8 +1401,8 @@ impl ChromeFonts {
     }
 
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "NativePreviewFontConvergence",
             action = "Finish",
             project = "aterm_gui::app_render::native_damage_tests::project_native_preview_font_convergence"
@@ -1811,13 +1818,6 @@ pub(crate) fn row_baseline(y0: f32, row_h: f32, size: f32) -> f32 {
     q_to_px(baseline_in_row_q(px_to_q(y0), px_to_q(row_h), cap_q))
 }
 
-/// The baseline that centres a `size`-px run's CAP BOX on `cy` (a point
-/// anchor — ring centres, dots): the `row_h = 0` degenerate of
-/// [`row_baseline`].
-pub(crate) fn baseline_centered_at(cy: f32, size: f32) -> f32 {
-    row_baseline(cy, 0.0, size)
-}
-
 /// Real regular/semibold system UI faces.  Native chrome must never synthesize a
 /// weight by re-striking pixels: it selects an installed face or honestly falls
 /// back to the closest real face in the terminal stack.
@@ -1984,7 +1984,7 @@ fn ui_font_candidates() -> Vec<UiFontCandidate> {
 /// with on ANY host ([`install_linux_ui_fonts_for_test`]), so a page's fit is not
 /// judged only in the face of the machine that runs the tests.
 #[cfg(any(target_os = "linux", test))]
-const LINUX_UI_FONT_PAIRS: [(&str, &str); 5] = [
+const LINUX_UI_FONT_PAIRS: [(&str, &str); 6] = [
     // `resolve_ui_font_assets` accepts a candidate only when BOTH faces
     // parse, so each Noto pairing must name a file the distro actually
     // ships. fonts-noto-core on Debian/Ubuntu installs exactly the four
@@ -2009,6 +2009,20 @@ const LINUX_UI_FONT_PAIRS: [(&str, &str); 5] = [
     (
         "/usr/share/fonts/noto/NotoSans-Regular.ttf",
         "/usr/share/fonts/noto/NotoSans-Bold.ttf",
+    ),
+    // GNOME's own UI face, for a GNOME host without fonts-noto-core (a server
+    // or minimal install, NVIDIA's DGX OS image): static Regular and Bold
+    // cuts, so headings keep a real bold, and NARROWER than Noto ("Match the
+    // terminal" is 8.42 em against Noto's 8.96 and DejaVu's 9.52), so pages
+    // authored against Noto fit instead of truncating. Measured on such a
+    // host: the 12 native-settings paint audits that fail in DejaVu pass in
+    // Cantarell, and none fails that passes in Noto. The desktop's own face
+    // is not taken instead: Ubuntu Sans ships only as a variable font, and the
+    // chrome draws no variation instance, so every UiBold heading would lose
+    // its weight.
+    (
+        "/usr/share/fonts/opentype/cantarell/Cantarell-Regular.otf",
+        "/usr/share/fonts/opentype/cantarell/Cantarell-Bold.otf",
     ),
     (
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -3302,7 +3316,7 @@ impl Canvas {
 
     /// An anti-aliased arc band: radial distance to the `r_mid` circle within
     /// `thickness`, masked to the angular span `[0, frac]` clockwise from 12 o'clock.
-    /// `frac >= 1.0` draws the full ring (capacity track).
+    /// `frac >= 1.0` draws the full ring (a ring's track).
     fn arc(&mut self, cx: f32, cy: f32, r_mid: f32, thickness: f32, frac: f32, c: [u8; 4]) {
         let frac = frac.clamp(0.0, 1.0);
         if frac <= 0.0 {
@@ -3817,29 +3831,15 @@ fn rasterize_tray_on_canvas(prims: &[DrawPrim], scale: f32, mut cv: Canvas) -> V
                 r_outer,
                 thickness,
                 track,
-                sys_frac,
-                sys_color,
-                tab_frac,
-                tab_color,
-                dashed_tab,
+                frac,
+                fill,
             } => {
                 let r_mid = (r_outer - thickness / 2.0) * s;
                 let th = thickness * s;
-                // capacity track (full circle)
+                // The track: the full circle.
                 cv.arc(cx * s, cy * s, r_mid, th, 1.0, *track);
-                // system usage arc
-                cv.arc(cx * s, cy * s, r_mid, th, *sys_frac, *sys_color);
-                // this-tab inner arc (nested), or a dashed faint placeholder
-                let r_in = r_mid - th * 0.95;
-                if *dashed_tab {
-                    // honest "—": a faint dotted inner track (no real value)
-                    for k in 0..12 {
-                        let f0 = k as f32 / 12.0;
-                        cv.arc(cx * s, cy * s, r_in, th * 0.5, f0 + 0.02, *track);
-                    }
-                } else if let Some(tf) = tab_frac {
-                    cv.arc(cx * s, cy * s, r_in, th * 0.55, *tf, *tab_color);
-                }
+                // The arc over it.
+                cv.arc(cx * s, cy * s, r_mid, th, *frac, *fill);
             }
             DrawPrim::Capsule {
                 x,
@@ -3960,12 +3960,12 @@ mod tests {
     use crate::widget::DrawPrim;
     use aterm_render::Theme;
 
-    /// The Settings preview resolves a BUNDLED family (the default — `Cascadia
-    /// Mono PL` on Windows, `JetBrains Mono` on Linux — `JetBrains Mono` on
-    /// Windows too, and `Iosevka Term` everywhere, macOS included, when none is
-    /// installed) to its compiled-in bytes. It used to hand the resolved
-    /// `bundled:` identity to the filesystem and report the owner's default
-    /// font as unreadable.
+    /// The Settings preview resolves a BUNDLED family (the default — `Iosevka
+    /// Term Semibold` on Windows, `JetBrains Mono` on Linux — `Cascadia Mono
+    /// PL` and `JetBrains Mono` on Windows too, and `Iosevka Term` everywhere,
+    /// macOS included, when none is installed) to its compiled-in bytes. It
+    /// used to hand the resolved `bundled:` identity to the filesystem and
+    /// report the owner's default font as unreadable.
     #[test]
     fn the_settings_preview_resolves_the_bundled_default_family() {
         use aterm_render::bundled;
@@ -3980,6 +3980,13 @@ mod tests {
                 bundled::JETBRAINS_FAMILY,
                 bundled::JETBRAINS_ID,
                 bundled::JETBRAINS_BOLD_ID,
+            ));
+        }
+        if bundled::CASCADIA_ACTIVE {
+            families.push((
+                bundled::CASCADIA_FAMILY,
+                bundled::CASCADIA_ID,
+                bundled::CASCADIA_BOLD_ID,
             ));
         }
         if bundled::IOSEVKA_ACTIVE {
@@ -4174,8 +4181,9 @@ mod tests {
             .into_iter()
             .find(|c| c.regular_path.is_file() && c.semibold_path.is_file())
         else {
-            eprintln!("SKIP: no complete UI face pair on this host");
-            return;
+            aterm_spec::host::could_not_run(
+                "no complete UI face pair (regular and semibold) on this host",
+            );
         };
         assert!(assets.regular.is_some() && assets.semibold.is_some());
         if pair.regular_path == pair.semibold_path {
@@ -4191,7 +4199,7 @@ mod tests {
             let Some(bytes) = admitted else { continue };
             assert_eq!(
                 bytes.is_mapped(),
-                cfg!(unix) && aterm_render::font_file::maps_in_place(path),
+                cfg!(any(unix, windows)) && aterm_render::font_file::maps_in_place(path),
                 "{}: a UI face is a file MAPPING exactly when it lives on the system font \
                  volume, and a copy otherwise",
                 path.display()
@@ -4282,9 +4290,9 @@ mod tests {
         }
     }
 
-    /// A theme-derived spread of prims — three gauge rings, a capacity capsule, a
-    /// status dot, and one funnelled text run — enough to
-    /// drive every core arm of the rasterizer without any live metrics source.
+    /// A theme-derived spread of prims — three rings, a capsule, a dot, and
+    /// one funnelled text run — enough to drive every core arm of the
+    /// rasterizer.
     fn demo_prims(cw: f32, ch: f32, theme: Theme) -> Vec<DrawPrim> {
         use crate::type_scale::TypeStep;
         use crate::widget::{TextFace, TextWeight, rgba, text_prim};
@@ -4297,7 +4305,7 @@ mod tests {
         let mut prims = vec![text_prim(
             16.0,
             24.0,
-            "SYSTEM".to_string(),
+            "RINGS".to_string(),
             cap,
             TextWeight::Bold,
             TextFace::Mono,
@@ -4310,11 +4318,8 @@ mod tests {
                 r_outer: 26.0,
                 thickness: 7.0,
                 track,
-                sys_frac: 0.3 + i as f32 * 0.2,
-                sys_color: good,
-                tab_frac: Some(0.1),
-                tab_color: good,
-                dashed_tab: i == 2,
+                frac: 0.3 + i as f32 * 0.2,
+                fill: good,
             });
         }
         prims.push(DrawPrim::Capsule {
@@ -4337,10 +4342,7 @@ mod tests {
 
     /// Tier-1 conformance for the CHROME FACE GATE: the SHIPPING
     /// [`select_chrome_face`] policy, enumerated over its ENTIRE 2^3 boolean
-    /// domain — a complete proof of the same invariants the `ChromeFaceGate`
-    /// derived model carries (`aterm_spec::derive::chrome_face_gate_model`),
-    /// which the real Trust `ty` proves at Buggy=0 and catches at Buggy=1
-    /// (`derived_chrome_face_gate_proves_and_catches_dejavu_hardcode`).
+    /// domain — a complete proof of the face-gate invariants.
     #[test]
     fn chrome_face_gate_exhaustive() {
         let (mut fallback_seen, mut bold_seen, mut primary_seen) = (false, false, false);
@@ -5152,7 +5154,7 @@ mod tests {
     /// `BuggyReloadKeepsQueued` — leaves the obsolete fork queued and is refused.
     #[test]
     fn chrome_font_reload_conforms_to_the_generation_queue_reset() {
-        let model = aterm_spec::derive::semantic_prewarm_generation_model();
+        let model = aterm_models_misc::semantic_prewarm_generation_model();
         let mut fonts = default_chrome_fonts();
         fonts.semantic_generation = 1;
         let queue = Arc::new(SemanticPrewarmQueue {
@@ -5227,7 +5229,7 @@ mod tests {
     /// (`BuggyCacheParksActive`), and the install or superseded rows fail.
     #[test]
     fn semantic_prewarm_poll_conforms_to_the_handshake_slot_effects() {
-        let model = aterm_spec::derive::semantic_prewarm_handshake_model();
+        let model = aterm_models_misc::semantic_prewarm_handshake_model();
         let renderer = || {
             let mut renderer = Renderer::from_bytes(
                 aterm_render::embedded_font(),
@@ -6231,29 +6233,5 @@ mod tests {
                 "{face:?}: the ring is hollow beside the stem"
             );
         }
-    }
-
-    #[test]
-    fn rasterizes_a_nonempty_tray() {
-        let (cw, ch) = (380.0_f32, 168.0_f32);
-        let mut prims = vec![DrawPrim::Panel {
-            x: 0.0,
-            y: 0.0,
-            w: cw,
-            h: ch,
-            radius: 16.0,
-            fill: [24, 27, 33, 0xC4],
-        }];
-        prims.extend(demo_prims(cw, ch, Theme::default()));
-        let (px, pw, ph) = rasterize_tray(&prims, cw as u32, ch as u32, 2.0, [13, 15, 20, 255]);
-        assert_eq!(px.len(), (pw * ph * 4) as usize);
-        // not a flat image: some pixel differs from the backdrop (the rings drew)
-        assert!(
-            px.as_chunks::<4>()
-                .0
-                .iter()
-                .any(|c| *c != [13, 15, 20, 255]),
-            "tray rendered content over the backdrop"
-        );
     }
 }

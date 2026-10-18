@@ -43,7 +43,7 @@ const PHASES: [&str; 10] = [
 
 #[test]
 fn a_headless_boot_reaches_every_preparation_cut_in_order() {
-    let inst = headless_boot::boot_or_refuse("aterm-startup-prepare", |_, _| {}, |_| true);
+    let inst = headless_boot::boot_with("aterm-startup-prepare", |_, _| {}, |_| true);
     // `metrics` is answered on the control thread, which listens before winit
     // runs; `panes` is answered by the event loop, which runs only once ready
     // for winit is stamped. So after `panes`, every cut a boot reaches is in.

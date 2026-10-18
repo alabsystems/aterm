@@ -3,6 +3,10 @@
 
 # aterm-winit-keymap: spec recovery from its 15 unit tests
 
+> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 5 tests it
+> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
+> were taken before.
+
 > Status 2026-10-16: the 7 specs below are the crate's migration worklist. Each is proved through
 > Trust/Clean about the compiled Rust function, then the tests it subsumes are deleted. Nothing has been
 > proved or deleted yet.
@@ -52,8 +56,8 @@ row and is listed once here rather than in each row).
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking gaps
-named-key-table	table-property	map_named_key	∀ n:WN: map_named_key(n) = T_named(n). Corollaries: (a) injective on its Some-domain; (b) no result is a *Right modifier or a Numpad* key; (c) ∀ m∈MODS: map_named_key(m) = Some(Left(m)).	maps_super_cmd_modifier, maps_function_keys_past_f12, maps_media_keys	EASY once stateable: ~70-arm match on a foreign #[non_exhaustive] fieldless enum with a wildcard arm into Option<enum>; no loops, no heap. The clause quantifies over (or enumerates) a foreign enum's variants.	1, 3, 5, 12
-logical-key-contract	contract	map_logical_key, map_named_key	∀ k:WK: k = Character(s) ⇒ result = single(s).map(Key::Character); k = Named(n) ⇒ result = T_named(n).map(Key::Named) (cites named-key-table); k = Dead(_) ∨ Unidentified(_) ⇒ result = None. In particular ∀ m∈MODS: map_logical_key(Named(m)) = Some(Key::Named(Left(m))).	character_logical_key_maps_through, multi_codepoint_logical_key_is_not_a_single_key	MEDIUM: match on an enum carrying SmolStr; two str::chars().next() calls need a UTF-8 decode model of a str/SmolStr carrier; `?` on Option; composes with map_named_key through its ensures.	1, 3, 4, 12
+named-key-table	table-property	map_named_key	∀ n:WN: map_named_key(n) = T_named(n). Corollaries: (a) injective on its Some-domain; (b) no result is a *Right modifier or a Numpad* key; (c) ∀ m∈MODS: map_named_key(m) = Some(Left(m)).	-	EASY once stateable: ~70-arm match on a foreign #[non_exhaustive] fieldless enum with a wildcard arm into Option<enum>; no loops, no heap. The clause quantifies over (or enumerates) a foreign enum's variants.	1, 3, 5, 12
+logical-key-contract	contract	map_logical_key, map_named_key	∀ k:WK: k = Character(s) ⇒ result = single(s).map(Key::Character); k = Named(n) ⇒ result = T_named(n).map(Key::Named) (cites named-key-table); k = Dead(_) ∨ Unidentified(_) ⇒ result = None. In particular ∀ m∈MODS: map_logical_key(Named(m)) = Some(Key::Named(Left(m))).	character_logical_key_maps_through	MEDIUM: match on an enum carrying SmolStr; two str::chars().next() calls need a UTF-8 decode model of a str/SmolStr carrier; `?` on Option; composes with map_named_key through its ensures.	1, 3, 4, 12
 numpad-location-gate	contract	map_numpad_key	∀ p:PK, k:WK, loc:Loc with loc ≠ Numpad: map_numpad_key(p,k,loc) = None. Only the location decides that a key is off the keypad; neither the scancode (e.g. Code(Numpad5)) nor the logical key matters.	standard_location_is_untouched	TRIVIAL once a foreign enum and a &WK reference parameter are carriers: one early return on enum inequality.	1, 12
 numpad-key-table	contract	map_numpad_key, map_logical_key	∀ p:PK, k:WK, loc = Numpad: (1) k = Character(s): single(s) = None ⇒ None; single(s) = Some(c) ⇒ T_kp_char(c).map(Key::Named), whatever p is (a Character never reaches the centre-key rescue). (2) k = Named(n) ∧ T_kp_named(n) = Some(t) ⇒ Some(Named(t)). (3) Otherwise (Named with no keypad twin, Dead, Unidentified): Some(Named(NumpadBegin)) iff p = Code(KC::Numpad5) ∧ map_logical_key(k) = None, else None. Corollary: every Some result is Key::Named(x) with x a Numpad* key; p affects the result only through clause (3).	numpad_location_promotes_digit_to_numpad_key, numpad_enter_is_not_main_enter, numlock_off_navigation_gets_numpad_twin, keypad_identity_is_the_glyph_not_the_scancode, keypad_key_without_keypad_identity_takes_the_logical_route	MEDIUM: nested match on a SmolStr-carrying enum, char-literal match, a match guard that calls map_logical_key (composition through its ensures), str::chars iteration, early returns, PhysicalKey equality including the NativeKeyCode payload.	1, 3, 4, 12
 sided-modifier-contract	contract	sided_modifier	∀ key:Key, loc:Loc: loc ≠ Right ⇒ sided_modifier(key,loc) = key. loc = Right: key = Named(Left(m)) for m∈MODS ⇒ Named(Right(m)); otherwise key. Corollaries: idempotent at each location; with logical-key-contract, sided_modifier(map_logical_key(Named(m)).unwrap(), Right) = Named(Right(m)).	a_right_side_modifier_press_maps_to_its_right_variant	EASY: Key by value (non-Copy enum holding char and NamedKey), a match with a binding fall-through arm, equality on a foreign KeyLocation.	1, 3, 12
@@ -93,11 +97,7 @@ No spec is blocked by gap 0 alone: every row needs gap 1 (foreign enum carriers)
 
 ```tsv
 file	test	primary	also
-src/lib.rs	maps_super_cmd_modifier	named-key-table	logical-key-contract
-src/lib.rs	maps_function_keys_past_f12	named-key-table	
-src/lib.rs	maps_media_keys	named-key-table	
 src/lib.rs	character_logical_key_maps_through	logical-key-contract	
-src/lib.rs	multi_codepoint_logical_key_is_not_a_single_key	logical-key-contract	
 src/lib.rs	standard_location_is_untouched	numpad-location-gate	
 src/lib.rs	numpad_location_promotes_digit_to_numpad_key	numpad-key-table	
 src/lib.rs	numpad_enter_is_not_main_enter	numpad-key-table	
@@ -107,7 +107,6 @@ src/lib.rs	keypad_key_without_keypad_identity_takes_the_logical_route	numpad-key
 src/lib.rs	a_right_side_modifier_press_maps_to_its_right_variant	sided-modifier-contract	logical-key-contract
 src/lib.rs	a_sided_modifier_has_its_other_side_as_twin	physical-twin-involution	
 src/lib.rs	base_layout_key_is_us_qwerty	base-layout-key-table	
-src/lib.rs	aterm_types_names_no_platform_dependency	(none; §4)	
 ```
 
 ## 3. Coverage
@@ -120,9 +119,9 @@ src/lib.rs	aterm_types_names_no_platform_dependency	(none; §4)
 
 ## 4. Tests that are not spec samples
 
-| test | why | action |
-|---|---|---|
-| aterm_types_names_no_platform_dependency | Reads `crates/aterm-types/Cargo.toml` through `std::fs` and checks that no non-comment line contains `winit`. This is a rule about the dependency graph, not a property of any function in this crate, so no Trust clause can state it. | **delete**, after porting it to an `aterm-census` guard (`verify guards`), preferably as a resolved-graph check (aterm-types has no path to winit in `cargo metadata`), which is stronger than a substring match. |
+> Status 2026-10-17: none left. The one test here, which read `crates/aterm-types/Cargo.toml` and
+> checked that no non-comment line names `winit`, is deleted as source scraping; no `aterm-census`
+> guard took its place.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
@@ -140,10 +139,10 @@ src/lib.rs	aterm_types_names_no_platform_dependency	(none; §4)
    forced by the platform, but a right-side Meta or Hyper release cannot have its twin's held state
    checked through `physical_modifier_twin`. The doc comment states this only implicitly ("Control, Alt
    and Super likewise"); `physical-twin-involution` makes it explicit.
-3. **History-named regression samples** (`maps_super_cmd_modifier`, `maps_function_keys_past_f12`,
-   `maps_media_keys`). Their names and comments pin prose about removed code ("stopped at F12",
-   "dropped Super/Cmd"). The real property is the whole `T_named` table; delete them together once
-   `named-key-table` is proved rather than porting them one by one.
+3. **A history-named regression sample** (`maps_function_keys_past_f12_and_media_keys`). Its name
+   and comment pin prose about removed code ("stopped at F12 and dropped the media keys"). The real
+   property is the whole `T_named` table; delete it once `named-key-table` is proved rather than
+   porting it.
 
 ## 6. Proof order (easiest high-value first)
 

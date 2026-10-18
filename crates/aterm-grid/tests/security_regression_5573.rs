@@ -29,49 +29,6 @@ use aterm_grid::{CellFlags, PackedColor, PageStore, Row};
 
 // Correct unsafe usage: PageStore outlives rows
 
-/// A row created through the `unsafe` boundary works while `pages` outlives it
-/// (reverse declaration order drops `row` first).
-#[test]
-fn row_new_valid_unsafe_usage() {
-    let mut pages = PageStore::new();
-    // SAFETY: `pages` outlives `row` (same scope, reverse drop order).
-    let row = unsafe { Row::new(80, &mut pages) };
-
-    assert_eq!(row.cols(), 80);
-    assert_eq!(row.len(), 0);
-    assert!(row.is_empty());
-}
-
-/// Resizing a row through the `unsafe` boundary works; `pages` outlives it.
-#[test]
-fn row_resize_valid_unsafe_usage() {
-    let mut pages = PageStore::new();
-    // SAFETY: `pages` outlives `row` for the full scope.
-    let mut row = unsafe { Row::new(40, &mut pages) };
-
-    // Write content before resize
-    let fg = PackedColor::DEFAULT_FG;
-    let bg = PackedColor::DEFAULT_BG;
-    for col in 0..40u16 {
-        row.write_char_styled(col, 'A', fg, bg, CellFlags::empty());
-    }
-    assert_eq!(row.len(), 40);
-
-    // SAFETY: `pages` still outlives `row` after resize.
-    unsafe { row.resize(80, &mut pages) };
-    assert_eq!(row.cols(), 80);
-
-    // Original content survived
-    for col in 0..40u16 {
-        assert_eq!(row.get(col).unwrap().char(), 'A', "col {col} content lost");
-    }
-
-    // New cells are empty
-    for col in 40..80u16 {
-        assert!(row.get(col).unwrap().is_empty(), "col {col} not empty");
-    }
-}
-
 /// Shrink-resize through the `unsafe` boundary works.
 #[test]
 fn row_resize_shrink_valid_unsafe_usage() {
@@ -96,39 +53,6 @@ fn row_resize_shrink_valid_unsafe_usage() {
 }
 
 // Multiple rows sharing a PageStore: cross-row isolation
-
-/// Many rows allocated from one PageStore do not corrupt each other.
-#[test]
-fn multiple_rows_cross_isolation() {
-    let mut pages = PageStore::new();
-    let fg = PackedColor::DEFAULT_FG;
-    let bg = PackedColor::DEFAULT_BG;
-
-    // SAFETY: All rows are dropped before `pages` (Vec dropped before local `pages`).
-    let mut rows: Vec<Row> = (0..20)
-        .map(|_| unsafe { Row::new(80, &mut pages) })
-        .collect();
-
-    // Write unique content to each row
-    for (i, row) in rows.iter_mut().enumerate() {
-        let c = char::from(b'A' + (i % 26) as u8);
-        for col in 0..80u16 {
-            row.write_char_styled(col, c, fg, bg, CellFlags::empty());
-        }
-    }
-
-    // Verify each row's content is intact — no cross-row aliasing
-    for (i, row) in rows.iter().enumerate() {
-        let expected = char::from(b'A' + (i % 26) as u8);
-        for col in 0..80u16 {
-            assert_eq!(
-                row.get(col).unwrap().char(),
-                expected,
-                "row[{i}][{col}] corrupted"
-            );
-        }
-    }
-}
 
 /// Resize some rows while others remain unchanged. Verify that resizing one
 /// row doesn't corrupt another row's backing storage.

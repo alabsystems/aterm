@@ -13,39 +13,30 @@
 //! `wl_data_device` handling at all, so `WindowEvent::DroppedFile` (and the
 //! hover events) never fired on a native-Wayland session and a dropped file was
 //! silently ignored. This module — added by aterm to its copy of winit (vendored
-//! under `vendor/winit` until it became `crates/aterm-window`) — fills that gap
-//! using sctk's `data_device_manager`.
+//! under `vendor/winit` until it became `crates/aterm-window`) — fills that gap,
+//! over sctk's `data_device_manager` until LW.7 and over first-party
+//! `aterm_wayland::selection`'s device since
+//! (docs/AUDIT-third-party-2026-10-15.md, LW.7).
 //!
 //! Flow: a `wl_data_device` is created for every seat. When a drag enters one of
 //! our surfaces we accept the `text/uri-list` mime type and the `Copy` action
 //! (required, or the compositor cancels the source). On drop we `receive` the
-//! offer's pipe and stream it through winit's calloop event loop, accumulating
+//! offer's pipe and stream it through the event loop's poll, accumulating
 //! the bytes until EOF; then we percent-decode + parse the `file://` URIs (the
 //! same rules as the X11 backend's `dnd.rs`) and push one
 //! `WindowEvent::DroppedFile` per path for the target window — so downstream code
 //! sees the identical event sequence it already gets on X11/macOS.
 //!
-//! Scope: only the RECEIVING side, and only `DroppedFile` is emitted — that is
-//! the event downstream apps act on. The `HoveredFile`/`HoveredFileCancelled`
-//! previews are not emitted on Wayland (there is no consumer that renders a hover
-//! affordance, and emitting them would require a speculative pre-drop pipe read).
-//! winit never offers a drag *source*, so the `DataSourceHandler` impl below is
-//! inert and exists only to satisfy `delegate_data_device!`'s trait bounds.
+//! Scope: only the RECEIVING side: `DroppedFile` per path, with an empty-path
+//! `HoveredFile` when a file drag enters and `HoveredFileCancelled` when it
+//! leaves or drops. winit never offers a drag *source*.
 
-use std::fs;
-use std::io::Read;
+use std::io::{ErrorKind, PipeReader, Read};
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 
-use calloop::PostAction;
-use sctk::data_device_manager::data_device::{DataDevice, DataDeviceHandler};
-use sctk::data_device_manager::data_offer::{DataOfferHandler, DragOffer};
-use sctk::data_device_manager::data_source::DataSourceHandler;
-use sctk::data_device_manager::WritePipe;
-use sctk::reexports::client::protocol::wl_data_device::WlDataDevice;
-use sctk::reexports::client::protocol::wl_data_device_manager::DndAction;
-use sctk::reexports::client::protocol::wl_data_source::WlDataSource;
-use sctk::reexports::client::protocol::wl_surface::WlSurface;
-use sctk::reexports::client::{Connection, QueueHandle};
+use aterm_wayland::protocols::wayland::wl_data_device_manager::dnd_action;
+use aterm_wayland::selection::{DragEvent, Dropped};
 
 use crate::event::WindowEvent;
 use crate::platform_impl::common::percent::{percent_decode_utf8, uri_list_entries};
@@ -62,65 +53,79 @@ const URI_LIST: &str = "text/uri-list";
 /// than any real multi-file selection of paths and bounds the accumulation.
 const MAX_URI_LIST_BYTES: usize = 1 << 20;
 
-/// An in-flight read of a dropped offer's `text/uri-list` pipe. The calloop event
-/// loop appends the offer's bytes to `data` each time the pipe is readable, until
-/// EOF; then [`WinitState`] parses them into paths and emits one `DroppedFile`
-/// per path for `window_id`.
+/// An in-flight read of a dropped offer's `text/uri-list` pipe. The event loop
+/// polls the pipe with the display and appends its bytes to `data` each time it
+/// is readable, until EOF; then [`WinitState`] parses them into paths and emits
+/// one `DroppedFile` per path for `window_id`.
 pub struct DndPipe {
-    /// Identity captured by the read callback so it can find its own entry in
-    /// `WinitState::dnd_pipes` (calloop does not echo a source's token back into
-    /// its callback, so we can't key on the token from inside it).
-    id: u64,
-    /// The window the drop landed on, resolved from the offer's surface.
+    /// The window the drop landed on, resolved from the drag's surface.
     window_id: WindowId,
     /// Bytes read from the offer pipe so far.
     data: Vec<u8>,
-    /// The drop offer, kept alive so it can be `finish`ed + `destroy`ed on EOF
-    /// (the Wayland protocol requires the destination to finish a dropped offer).
-    offer: DragOffer,
+    /// The pipe's read end, non-blocking.
+    pipe: PipeReader,
+    /// The drop offer, kept alive so it can be `finish`ed on EOF (the Wayland
+    /// protocol requires the destination to finish a dropped offer); it is
+    /// destroyed when it drops.
+    offer: Dropped,
 }
 
-impl WinitState {
-    /// The [`DataDevice`] bound on whichever seat owns `wl_data_device`, if any.
-    fn data_device_for(&self, wl_data_device: &WlDataDevice) -> Option<&DataDevice> {
-        self.seats
-            .values()
-            .filter_map(|seat| seat.data_device.as_ref())
-            .find(|dd| dd.inner() == wl_data_device)
+impl DndPipe {
+    /// The descriptor the loop polls.
+    pub(crate) fn fd(&self) -> RawFd {
+        self.pipe.as_raw_fd()
     }
 }
 
-impl DataDeviceHandler for WinitState {
-    fn enter(
+/// What one read of a drop pipe came to.
+enum PipeRead {
+    /// More may come.
+    Open,
+    /// The source closed its end: the bytes are whole.
+    Eof,
+    /// The read failed, or the payload passed its cap: give the drop up.
+    Failed,
+}
+
+impl WinitState {
+    /// One drag-and-drop event of `seat`'s data device, where the inbox has it.
+    pub(crate) fn drag_event(&mut self, seat: u32, event: DragEvent) {
+        match event {
+            DragEvent::Enter { surface, offer, .. } => self.dnd_enter(seat, surface, offer),
+            DragEvent::Leave => self.dnd_leave(),
+            // The accept + action set on `enter` persists for the drag; per-motion
+            // updates are unnecessary for file drops.
+            DragEvent::Motion { .. } => {},
+            DragEvent::Drop => self.dnd_drop(seat),
+        }
+    }
+
+    fn dnd_enter(
         &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        wl_data_device: &WlDataDevice,
-        _x: f64,
-        _y: f64,
-        surface: &WlSurface,
+        seat: u32,
+        surface: Option<aterm_wayland::proxy::Proxy>,
+        offer: Option<aterm_wayland::selection::OfferInfo>,
     ) {
-        // Take an OWNED `DragOffer` (it clones the `wl_data_offer` proxy) so the
-        // borrow of `self.seats` is released before we touch `self.windows`.
-        let offer = self.data_device_for(wl_data_device).and_then(|dd| dd.data().drag_offer());
         let Some(offer) = offer else {
             // No offer means a source-less / internal drag — nothing to accept.
             return;
         };
 
         // Only engage when the drag is over a surface that is one of our windows.
-        let window_id = wayland::make_wid(surface);
+        let Some(window_id) = surface.map(wayland::make_wid) else { return };
         if !self.windows.get_mut().contains_key(&window_id) {
             return;
         }
+        let Some(device) = self.seats.get(&seat).and_then(|s| s.data_device.as_ref()) else {
+            return;
+        };
 
         // Accept the drop IFF the source offers files. Accepting a mime type and a
         // DnD action is REQUIRED for the compositor to deliver the drop at all;
         // rejecting (None) tells the source we are not a valid target.
-        let offers_files = offer.with_mime_types(|mimes| mimes.iter().any(|m| m == URI_LIST));
+        let offers_files = offer.mime_types.iter().any(|m| m == URI_LIST);
         if offers_files {
-            offer.accept_mime_type(offer.serial, Some(URI_LIST.to_string()));
-            offer.set_actions(DndAction::Copy, DndAction::Copy);
+            device.accept_drag(Some(c"text/uri-list"), dnd_action::COPY, dnd_action::COPY);
             // Emit the `HoveredFile` edge so downstream can light a drop-target
             // highlight, matching the X11/AppKit backends. Wayland reveals the file
             // paths only on the actual drop, so the path here is EMPTY — it is the
@@ -130,214 +135,132 @@ impl DataDeviceHandler for WinitState {
             self.dnd_hover_window = Some(window_id);
             self.events_sink.push_window_event(WindowEvent::HoveredFile(PathBuf::new()), window_id);
         } else {
-            offer.accept_mime_type(offer.serial, None);
+            device.reject_drag();
         }
     }
 
-    fn leave(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _wl_data_device: &WlDataDevice,
-    ) {
+    fn dnd_leave(&mut self) {
         // A file drag left WITHOUT dropping: cancel the drop-target highlight on the
         // window we lit up on `enter` (the Wayland `leave` carries no surface, hence
-        // the remembered id). sctk destroys the un-dropped offer on our behalf.
+        // the remembered id). aterm-wayland's device destroys the un-dropped offer.
         if let Some(window_id) = self.dnd_hover_window.take() {
             self.events_sink.push_window_event(WindowEvent::HoveredFileCancelled, window_id);
         }
     }
 
-    fn motion(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _wl_data_device: &WlDataDevice,
-        _x: f64,
-        _y: f64,
-    ) {
-        // The accept + action set on `enter` persists for the drag; per-motion
-        // updates are unnecessary for file drops.
-    }
-
-    fn selection(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _wl_data_device: &WlDataDevice,
-    ) {
-        // A clipboard selection offer — winit exposes no clipboard API, so ignore.
-    }
-
-    fn drop_performed(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        wl_data_device: &WlDataDevice,
-    ) {
+    fn dnd_drop(&mut self, seat: u32) {
         // The drag was released: end the drop-target highlight NOW (the gesture is
         // over) regardless of whether the data read below succeeds, so the highlight
         // can never get stuck on. The dropped path(s) arrive separately as
         // `DroppedFile` once the pipe read completes.
-        if let Some(window_id) = self.dnd_hover_window.take() {
+        let window_id = self.dnd_hover_window.take();
+        if let Some(window_id) = window_id {
             self.events_sink.push_window_event(WindowEvent::HoveredFileCancelled, window_id);
         }
 
-        let offer = self.data_device_for(wl_data_device).and_then(|dd| dd.data().drag_offer());
+        let offer = self
+            .seats
+            .get(&seat)
+            .and_then(|s| s.data_device.as_ref())
+            .and_then(|device| device.take_dropped());
         let Some(offer) = offer else {
             return;
         };
-        let window_id = wayland::make_wid(&offer.surface);
 
-        let offers_files = offer.with_mime_types(|mimes| mimes.iter().any(|m| m == URI_LIST));
-        if !offers_files {
-            // Not a file drop. We rejected this offer on `enter` (NULL mime, no
-            // action), so calling `finish()` here would raise the FATAL
-            // `invalid_finish` protocol error (finish requires a non-NULL accepted
-            // mime + a selected action) and the compositor would disconnect us —
-            // crashing the whole process on a common non-file drag (a text
-            // selection, a browser link). Just `destroy()` the offer.
-            offer.destroy();
+        let offers_files = offer.info().mime_types.iter().any(|m| m == URI_LIST);
+        let window_id = match window_id {
+            Some(window_id) if offers_files => window_id,
+            // Not a file drop (or one over no window of ours). We rejected this
+            // offer on `enter` (NULL mime, no action), so finishing it here would
+            // raise the FATAL `invalid_finish` protocol error (finish requires a
+            // non-NULL accepted mime + a selected action) and the compositor would
+            // disconnect us — crashing the whole process on a common non-file drag
+            // (a text selection, a browser link). Just destroy the offer (it drops).
+            _ => return,
+        };
+
+        // Request the file list. `receive` is always permitted after a drop.
+        let pipe = match offer.receive(c"text/uri-list") {
+            Ok(pipe) => pipe,
+            // Couldn't open the transfer pipe; release the offer unfinished (the sctk
+            // example did too on this error path), so `invalid_finish` is never risked
+            // if no action was negotiated.
+            Err(_) => return,
+        };
+        if let Err(_error) = set_nonblocking(&pipe) {
+            tracing::warn!("wayland: a drop's pipe stays blocking: {_error}");
             return;
         }
 
-        // Request the file list. `receive` is always permitted after a drop.
-        let read_pipe = match offer.receive(URI_LIST.to_string()) {
-            Ok(pipe) => pipe,
-            Err(_) => {
-                // Couldn't open the transfer pipe; release the offer. Skip
-                // `finish()` (the sctk example does too on this error path) so we
-                // never risk `invalid_finish` if no action was negotiated.
-                offer.destroy();
-                return;
-            },
-        };
-
         // Stream the pipe through the event loop (non-blocking): one read per
-        // readiness, accumulating into the entry found by `id`, until EOF.
-        let id = self.dnd_next_id;
-        self.dnd_next_id = self.dnd_next_id.wrapping_add(1);
-        self.dnd_pipes.push(DndPipe { id, window_id, data: Vec::new(), offer });
+        // readiness, accumulating into the entry, until EOF.
+        self.dnd_pipes.push(DndPipe { window_id, data: Vec::new(), pipe, offer });
+    }
 
-        let _ = self.loop_handle.insert_source(read_pipe, move |_event, file, state| {
-            let Some(idx) = state.dnd_pipes.iter().position(|p| p.id == id) else {
-                return PostAction::Remove;
-            };
-
-            // SAFETY: calloop's `NoIoDrop` only forbids CLOSING the wrapped fd;
-            // reading through `&mut File` is sound (sctk's own example does this).
-            let file: &mut fs::File = unsafe { file.get_mut() };
-            let mut buf = [0u8; 4096];
-            match file.read(&mut buf) {
+    /// Read every drop pipe the loop polled readable (`ready` names their descriptors), and
+    /// finish the drops whose source is done.
+    pub(crate) fn read_dnd_pipes(&mut self, ready: &[RawFd]) {
+        let mut i = 0;
+        while i < self.dnd_pipes.len() {
+            if !ready.contains(&self.dnd_pipes[i].fd()) {
+                i += 1;
+                continue;
+            }
+            match read_some(&mut self.dnd_pipes[i]) {
+                PipeRead::Open => i += 1,
                 // EOF: the source closed its end. Parse + emit, then finish the offer.
-                Ok(0) => {
-                    let pipe = state.dnd_pipes.remove(idx);
+                PipeRead::Eof => {
+                    let pipe = self.dnd_pipes.remove(i);
                     for path in parse_uri_list(&pipe.data) {
-                        state
-                            .events_sink
+                        self.events_sink
                             .push_window_event(WindowEvent::DroppedFile(path), pipe.window_id);
                     }
                     pipe.offer.finish();
-                    pipe.offer.destroy();
-                    PostAction::Remove
                 },
-                Ok(n) => {
-                    let entry = &mut state.dnd_pipes[idx];
-                    // Bound the accumulation against a runaway source.
-                    if entry.data.len() + n > MAX_URI_LIST_BYTES {
-                        let pipe = state.dnd_pipes.remove(idx);
-                        pipe.offer.finish();
-                        pipe.offer.destroy();
-                        return PostAction::Remove;
-                    }
-                    entry.data.extend_from_slice(&buf[..n]);
-                    PostAction::Continue
-                },
-                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => PostAction::Continue,
-                Err(_) => {
-                    let pipe = state.dnd_pipes.remove(idx);
+                PipeRead::Failed => {
+                    let pipe = self.dnd_pipes.remove(i);
                     pipe.offer.finish();
-                    pipe.offer.destroy();
-                    PostAction::Remove
                 },
             }
-        });
+        }
     }
 }
 
-impl DataOfferHandler for WinitState {
-    fn source_actions(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _offer: &mut DragOffer,
-        _actions: DndAction,
-    ) {
-        // We always request `Copy` (set on `enter`), so nothing to renegotiate.
-    }
-
-    fn selected_action(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _offer: &mut DragOffer,
-        _actions: DndAction,
-    ) {
-    }
-}
-
-// winit never creates a drag-and-drop or clipboard SOURCE on Wayland, so none of
-// these are ever invoked; they exist only to satisfy the trait bounds of
-// `delegate_data_device!` (which dispatches `wl_data_source` to this handler).
-impl DataSourceHandler for WinitState {
-    fn accept_mime(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _source: &WlDataSource,
-        _mime: Option<String>,
-    ) {
-    }
-
-    fn send_request(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        source: &WlDataSource,
-        _mime: String,
-        fd: WritePipe,
-    ) {
-        // The clipboard's copy-paste source (see `clipboard.rs`); winit starts no
-        // drags, so no other source of ours exists.
-        let _ = self.clipboard_send_request(source, fd);
-    }
-
-    fn cancelled(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, source: &WlDataSource) {
-        let _ = self.clipboard_cancelled(source);
-    }
-
-    fn dnd_dropped(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _source: &WlDataSource) {
-    }
-
-    fn dnd_finished(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _source: &WlDataSource,
-    ) {
-    }
-
-    fn action(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _source: &WlDataSource,
-        _action: DndAction,
-    ) {
+/// One read of a drop's pipe (the loop polled it readable), bounded by the payload cap.
+fn read_some(pipe: &mut DndPipe) -> PipeRead {
+    let mut buf = [0u8; 4096];
+    match pipe.pipe.read(&mut buf) {
+        Ok(0) => PipeRead::Eof,
+        Ok(n) => {
+            // Bound the accumulation against a runaway source.
+            if pipe.data.len() + n > MAX_URI_LIST_BYTES {
+                return PipeRead::Failed;
+            }
+            pipe.data.extend_from_slice(&buf[..n]);
+            PipeRead::Open
+        },
+        Err(ref e) if matches!(e.kind(), ErrorKind::Interrupted | ErrorKind::WouldBlock) => {
+            PipeRead::Open
+        },
+        Err(_) => PipeRead::Failed,
     }
 }
 
-sctk::delegate_data_device!(WinitState);
+/// Make a pipe end non-blocking, so a drained readiness or a stalled peer cannot
+/// block the loop or a clipboard worker in a pipe read or write.
+pub(crate) fn set_nonblocking(pipe: &impl AsRawFd) -> std::io::Result<()> {
+    let fd = pipe.as_raw_fd();
+    // SAFETY: fcntl(2) on a descriptor the pipe owns; F_GETFL takes no argument.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: as above; F_SETFL takes the new flags.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
 
 /// Parse a `text/uri-list` payload into local filesystem paths, mirroring the X11
 /// backend (`dnd.rs::parse_data`): frame raw entries before decoding, accept

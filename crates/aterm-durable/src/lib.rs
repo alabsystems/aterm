@@ -1,0 +1,541 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! `aterm-durable` — the two ways aterm finishes a write, in one place.
+//!
+//! A write that must outlive more than a process death ends with a flush, and there
+//! are two. They are named by what a power loss leaves; a kernel panic, a forced
+//! power-off and a watchdog reset count as one here, since no Apple document says the
+//! drive's volatile cache survives them.
+//!
+//! * [`durable`]: the data is on stable media when the call returns. Apple:
+//!   `fcntl(F_FULLFSYNC)` (std's [`File::sync_all`]), which drains the device's whole
+//!   queue. Measured on one Mac (Apple SSD, APFS, under other agents' builds): p50
+//!   4.3 ms in steps of about 4.2 ms, and while it runs every other writer on the
+//!   volume waits behind it (a neighbour's 64-byte page-cache write went to p95
+//!   4-5 ms). Elsewhere the platform full flush. Stable-on-return is the supported
+//!   filesystem/device contract, not an independent check of the hardware. A site
+//!   needs it when something outside this device's write order depends on the data
+//!   having reached the media: a reply or ack that promises it is saved, a network
+//!   send or other irreversible effect that assumes it, a promise made to the person,
+//!   or a write whose loss the next boot's recovery would neither notice nor repair.
+//! * [`ordered`]: flush the named descriptor, then order that I/O and any other I/O
+//!   already flushed with `fsync` on the same device before later I/O. Nothing is
+//!   promised durable on return, and unflushed other descriptors are not covered.
+//!   Apple: `fcntl(F_BARRIERFSYNC)` (astream-sys's `barrier_sync`), measured p50
+//!   0.13-0.6 ms beside the same load, with a neighbour tax an order of magnitude
+//!   smaller. A site may use this for "A persists before B" on one device only
+//!   after flushing every descriptor that phase A depends on, including directory
+//!   publications. The barrier does not order writes within a phase, make a batch
+//!   atomic, or prove that a reader accepts only a valid prefix. Each caller must
+//!   establish those invariants and tolerate older state; its comment names that
+//!   recovery. A returned flush error or an intentionally ignored directory error
+//!   supplies no such ordering guarantee.
+//!
+//! A directory flush after a create, rename or unlink is the same choice, because
+//! the entry is metadata on the same device ([`durable_dir`], [`ordered_dir`]).
+//!
+//! THE BARRIER IS DEVICE-WIDE AND ONLY DEVICE-WIDE. fcntl(2): "The barrier applies to
+//! I/O that have been flushed with fsync(2) on the same device before. These
+//! operations are guaranteed to be persisted before any other I/O that would follow
+//! the barrier." It can therefore cover other descriptors on the volume only when
+//! their I/O was flushed before the barrier. It promises nothing about another
+//! volume: where the writes that must come
+//! after live on a different device, [`Flush::ordered_if_same_device`] answers
+//! [`Flush::Durable`]. Under that same storage contract, a successful full flush
+//! also persists the earlier, already-flushed I/O on its device.
+//!
+//! Off Apple targets there is no ordering-only flush (Linux's `fdatasync` flushes the
+//! drive cache too), so [`ordered`] is the same `fsync(2)` as [`durable`]: never
+//! weaker than asked, and byte-for-byte the flush those platforms took before.
+//!
+//! ## Test and debug builds
+//!
+//! [`seam::Recording`] records which of the two each operation on this thread asked
+//! for, so a test asserts the tier a site chose with no timing. It records and changes
+//! nothing else: [`ordered`] issues the real `F_BARRIERFSYNC` in every build, test,
+//! debug, `opt-test` and release alike, so a debug instance (`lab instance`) or the
+//! `opt-test` perf lane measures the flush that ships. That costs a test run little:
+//! measured on the crash journal's conformance test, the heaviest user, 3.8-7.5 s
+//! against 2.2-4.2 s with a plain `fsync(2)` in its place (load 27-47). What a crate's
+//! own unit tests may swap is the DURABLE flush ([`seam::durable_fsync`]), whose
+//! `F_FULLFSYNC` costs a step of about 4.2 ms and stalls the whole volume.
+
+use std::fs::File;
+use std::io;
+use std::path::Path;
+
+/// Which flush finished a write. See the [crate docs](crate) for what each leaves
+/// after a power loss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Flush {
+    /// On stable media when the flush returns ([`durable`]).
+    Durable,
+    /// Flush this descriptor and order the flushed I/O ahead of later writes on
+    /// its device, with no general stable-on-return promise ([`ordered`]).
+    Ordered,
+}
+
+impl Flush {
+    /// Finish a write to `file` with this flush.
+    ///
+    /// # Errors
+    /// The flush's own error.
+    pub fn file(self, file: &File) -> io::Result<()> {
+        match self {
+            Self::Durable => durable(file),
+            Self::Ordered => ordered(file),
+        }
+    }
+
+    /// Finish a directory-entry change in `dir` with this flush.
+    ///
+    /// # Errors
+    /// The directory could not be opened, or the flush's own error.
+    pub fn dir(self, dir: &Path) -> io::Result<()> {
+        self.file(&File::open(dir)?)
+    }
+
+    /// [`Flush::Ordered`] when `written` and `later` are on one device, else
+    /// [`Flush::Durable`]. `written` is what this flush finishes; `later` is where the
+    /// writes that must not persist before it land. A barrier orders only its own
+    /// device's I/O, so a later write on another volume could reach its media first;
+    /// a path that cannot be read answers [`Flush::Durable`], the safe direction.
+    #[must_use]
+    pub fn ordered_if_same_device(written: &Path, later: &Path) -> Self {
+        if same_device(written, later) {
+            Self::Ordered
+        } else {
+            Self::Durable
+        }
+    }
+}
+
+/// Make everything written to `file` DURABLE: on stable media when this returns. Apple:
+/// `fcntl(F_FULLFSYNC)`; elsewhere `fsync(2)`.
+///
+/// # Errors
+/// The flush's own error.
+pub fn durable(file: &File) -> io::Result<()> {
+    #[cfg(any(test, debug_assertions))]
+    seam::note(Flush::Durable);
+    primitive::full(file)
+}
+
+/// [`durable`] for `file`'s data and the metadata a read of it needs (its size), not
+/// its timestamps: std's [`File::sync_data`]. Apple: the same `fcntl(F_FULLFSYNC)`;
+/// Linux: `fdatasync(2)`, which a log append that changes no other metadata pays less
+/// for.
+///
+/// # Errors
+/// The flush's own error.
+pub fn durable_data(file: &File) -> io::Result<()> {
+    #[cfg(any(test, debug_assertions))]
+    seam::note(Flush::Durable);
+    primitive::full_data(file)
+}
+
+/// ORDER everything written to `file`, and everything else this process or another
+/// flushed on its device, ahead of every write issued after this call. Nothing is
+/// promised durable on return. Apple: `fcntl(F_BARRIERFSYNC)`; a volume that refuses
+/// the barrier (a network home, FAT, some FUSE volumes) gets [`durable`]'s full flush
+/// instead, which orders by persisting. Elsewhere `fsync(2)`, as [`durable`].
+///
+/// # Errors
+/// The flush's own error (the full flush's, when the barrier was refused).
+pub fn ordered(file: &File) -> io::Result<()> {
+    #[cfg(any(test, debug_assertions))]
+    seam::note(Flush::Ordered);
+    primitive::barrier(file)
+}
+
+/// [`durable`] for the directory `dir`: what makes a create, rename or unlink in it
+/// durable.
+///
+/// # Errors
+/// The directory could not be opened, or the flush's own error.
+pub fn durable_dir(dir: &Path) -> io::Result<()> {
+    durable(&File::open(dir)?)
+}
+
+/// [`ordered`] for the directory `dir`: a create, rename or unlink in it reaches the
+/// media before any write issued after this call.
+///
+/// # Errors
+/// The directory could not be opened, or the flush's own error.
+pub fn ordered_dir(dir: &Path) -> io::Result<()> {
+    ordered(&File::open(dir)?)
+}
+
+#[cfg(unix)]
+fn same_device(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn same_device(_a: &Path, _b: &Path) -> bool {
+    // Off unix `ordered` is the full flush anyway, so the answer changes nothing.
+    false
+}
+
+/// The flushes themselves, unrecorded. Public so this crate's tests, and a reviewer,
+/// can reach each one by name; product code finishes a write with [`durable`] or
+/// [`ordered`].
+pub mod primitive {
+    use std::fs::File;
+    use std::io;
+
+    /// The full flush: [`File::sync_all`], which is `fcntl(F_FULLFSYNC)` on Apple
+    /// targets and `fsync(2)` elsewhere.
+    ///
+    /// # Errors
+    /// The flush's own error.
+    pub fn full(file: &File) -> io::Result<()> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the workspace's one full flush: aterm_durable::durable"
+        )]
+        file.sync_all()
+    }
+
+    /// The full flush of the data and the size: [`File::sync_data`], the same
+    /// `fcntl(F_FULLFSYNC)` on Apple targets and `fdatasync(2)` on Linux.
+    ///
+    /// # Errors
+    /// The flush's own error.
+    pub fn full_data(file: &File) -> io::Result<()> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the workspace's one full data flush: aterm_durable::durable_data"
+        )]
+        file.sync_data()
+    }
+
+    /// The ordering flush: `fcntl(F_BARRIERFSYNC)` on Apple targets, the full flush
+    /// where the volume refuses the barrier or the platform has none.
+    ///
+    /// # Errors
+    /// The flush's own error (the full flush's, when the barrier was refused).
+    pub fn barrier(file: &File) -> io::Result<()> {
+        #[cfg(target_vendor = "apple")]
+        {
+            barrier_or_full(file, astream_sys::barrier_sync)
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            full(file)
+        }
+    }
+
+    /// `barrier`, answered by the full flush when it fails. astream-sys's contract: a
+    /// filesystem or device that cannot honour the barrier answers an error, which
+    /// promises no ordering. The full flush orders by persisting, and it reports a
+    /// real I/O error (`EIO`, `ENOSPC`) the barrier hit just as well. Apple's
+    /// alone outside the tests: elsewhere `barrier` is the full flush.
+    #[cfg(any(target_vendor = "apple", test))]
+    pub(crate) fn barrier_or_full(
+        file: &File,
+        barrier: impl FnOnce(&File) -> io::Result<()>,
+    ) -> io::Result<()> {
+        match barrier(file) {
+            Ok(()) => Ok(()),
+            Err(_refused) => full(file),
+        }
+    }
+
+    /// A plain `fsync(2)`, retried on `EINTR` as std retries its `F_FULLFSYNC`: the
+    /// data handed to the drive, which by its own man page promises neither
+    /// durability nor order against a power loss. A crate's own unit tests take it in
+    /// place of the full flush ([`seam::durable_fsync`](crate::seam::durable_fsync));
+    /// nothing takes it in place of the barrier (see the [crate docs](crate)).
+    ///
+    /// # Errors
+    /// The flush's own error.
+    #[cfg(unix)]
+    pub fn fsync(file: &File) -> io::Result<()> {
+        use std::os::fd::AsRawFd as _;
+        // SAFETY: `fsync(2)` takes a descriptor by value and dereferences no pointer;
+        // for a descriptor that is not open it fails with `EBADF`.
+        unsafe extern "C" {
+            safe fn fsync(fd: std::ffi::c_int) -> std::ffi::c_int;
+        }
+        loop {
+            if fsync(file.as_raw_fd()) == 0 {
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+}
+
+/// THE COUNTING SEAM (test and debug builds): which flush each operation asked for,
+/// recorded per thread while a [`Recording`] lives, so a test asserts the tier a site
+/// chose without timing anything. A thread with no recording pays one thread-local
+/// read per flush; a release build compiles none of this.
+#[cfg(any(test, debug_assertions))]
+pub mod seam {
+    use super::Flush;
+    use std::cell::RefCell;
+    #[cfg(unix)]
+    use std::fs::File;
+    #[cfg(unix)]
+    use std::io;
+
+    thread_local! {
+        static LOG: RefCell<Option<Vec<Flush>>> = const { RefCell::new(None) };
+    }
+
+    /// A recording of every flush this thread asks for through this crate, from
+    /// [`Recording::start`] until it drops. A recording started inside another hides
+    /// the outer one until it drops, and the outer one then resumes without the
+    /// inner's flushes. The guard must stay on its creating thread, so it is neither
+    /// `Send` nor `Sync`.
+    #[must_use = "the recording stops when it drops"]
+    pub struct Recording {
+        outer: Option<Vec<Flush>>,
+        // The LOG slot belongs to the creating thread. The marker allocates nothing.
+        _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+
+    impl Recording {
+        /// Start recording this thread's flushes.
+        pub fn start() -> Self {
+            let outer = LOG.with(|log| log.replace(Some(Vec::new())));
+            Self {
+                outer,
+                _thread: std::marker::PhantomData,
+            }
+        }
+
+        /// The flushes recorded since the start or the last take, oldest first, and
+        /// an empty log behind them.
+        #[must_use]
+        pub fn take(&self) -> Vec<Flush> {
+            LOG.with(|log| {
+                log.borrow_mut()
+                    .as_mut()
+                    .map(std::mem::take)
+                    .unwrap_or_default()
+            })
+        }
+    }
+
+    impl Drop for Recording {
+        fn drop(&mut self) {
+            let outer = self.outer.take();
+            LOG.with(|log| *log.borrow_mut() = outer);
+        }
+    }
+
+    pub(crate) fn note(flush: Flush) {
+        LOG.with(|log| {
+            if let Some(flushes) = log.borrow_mut().as_mut() {
+                flushes.push(flush);
+            }
+        });
+    }
+
+    /// [`durable`](super::durable) as a crate's own unit tests take it on Apple
+    /// targets: recorded as [`Flush::Durable`], then a plain `fsync(2)` instead of
+    /// `F_FULLFSYNC`. The crates whose `durable` modules keep that test arm (each
+    /// measured what the drive-cache flush cost its suite and its neighbours) call
+    /// this, so the seam sees their durable sites too.
+    ///
+    /// # Errors
+    /// The flush's own error.
+    #[cfg(unix)]
+    pub fn durable_fsync(file: &File) -> io::Result<()> {
+        note(Flush::Durable);
+        super::primitive::fsync(file)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Flush, durable, durable_data, ordered, primitive, seam};
+    #[cfg(unix)]
+    use super::{durable_dir, ordered_dir};
+    use std::io::Write as _;
+
+    fn scratch() -> aterm_tempfile::TempDir {
+        aterm_tempfile::Builder::new()
+            .prefix("aterm-durable-")
+            .tempdir()
+            .expect("a scratch directory")
+    }
+
+    #[test]
+    fn the_seam_names_the_flush_each_operation_asked_for() {
+        let dir = scratch();
+        let mut file = std::fs::File::create(dir.path().join("f")).unwrap();
+        file.write_all(b"bytes").unwrap();
+        let recording = seam::Recording::start();
+        ordered(&file).unwrap();
+        durable(&file).unwrap();
+        #[cfg(unix)]
+        {
+            ordered_dir(dir.path()).unwrap();
+            durable_dir(dir.path()).unwrap();
+        }
+        Flush::Ordered.file(&file).unwrap();
+        #[cfg(unix)]
+        Flush::Durable.dir(dir.path()).unwrap();
+        durable_data(&file).unwrap();
+        #[cfg(unix)]
+        let expected = [
+            Flush::Ordered,
+            Flush::Durable,
+            Flush::Ordered,
+            Flush::Durable,
+            Flush::Ordered,
+            Flush::Durable,
+            Flush::Durable,
+        ];
+        #[cfg(not(unix))]
+        let expected = [
+            Flush::Ordered,
+            Flush::Durable,
+            Flush::Ordered,
+            Flush::Durable,
+        ];
+        assert_eq!(recording.take(), expected);
+        assert_eq!(recording.take(), [], "a take empties the log");
+    }
+
+    #[test]
+    fn nothing_is_recorded_without_a_recording_and_an_inner_one_hides_the_outer() {
+        let dir = scratch();
+        let file = std::fs::File::create(dir.path().join("f")).unwrap();
+        ordered(&file).unwrap();
+        let outer = seam::Recording::start();
+        assert_eq!(
+            outer.take(),
+            [],
+            "the flush before the start is not recorded"
+        );
+        durable(&file).unwrap();
+        {
+            let inner = seam::Recording::start();
+            ordered(&file).unwrap();
+            assert_eq!(inner.take(), [Flush::Ordered]);
+        }
+        ordered(&file).unwrap();
+        assert_eq!(outer.take(), [Flush::Durable, Flush::Ordered]);
+    }
+
+    #[test]
+    fn another_threads_flushes_are_not_this_threads() {
+        let dir = scratch();
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"x").unwrap();
+        let recording = seam::Recording::start();
+        std::thread::spawn(move || {
+            durable(&std::fs::File::open(&path).unwrap()).unwrap();
+        })
+        .join()
+        .unwrap();
+        assert_eq!(recording.take(), []);
+    }
+
+    /// The real primitives on a regular file, and on Unix also on a directory of
+    /// the test volume: the barrier and the full flush.
+    #[test]
+    fn the_real_barrier_and_full_flush_take_a_file_and_a_directory() {
+        let dir = scratch();
+        let mut file = std::fs::File::create(dir.path().join("f")).unwrap();
+        file.write_all(b"ordered").unwrap();
+        primitive::barrier(&file).expect("the barrier on a regular file");
+        primitive::full(&file).expect("the full flush on a regular file");
+        #[cfg(unix)]
+        {
+            let handle = std::fs::File::open(dir.path()).unwrap();
+            primitive::barrier(&handle).expect("the barrier on a directory");
+            primitive::full(&handle).expect("the full flush on a directory");
+        }
+    }
+
+    /// The barrier itself, with no fallback behind it, on a regular file and on a directory
+    /// of the test volume (Apple). [`primitive::barrier`] answers a refused barrier with the
+    /// full flush, so its own test passes either way; this one says whether the volume
+    /// takes `F_BARRIERFSYNC` at all, for the directory entries most ordered sites flush.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn this_volume_takes_the_barrier_on_a_file_and_a_directory() {
+        let dir = scratch();
+        let mut file = std::fs::File::create(dir.path().join("f")).unwrap();
+        file.write_all(b"ordered").unwrap();
+        if let Err(error) = astream_sys::barrier_sync(&file) {
+            panic!("this volume refused F_BARRIERFSYNC on a regular file: {error}");
+        }
+        let handle = std::fs::File::open(dir.path()).unwrap();
+        if let Err(error) = astream_sys::barrier_sync(&handle) {
+            panic!(
+                "this volume refused F_BARRIERFSYNC on a directory, so every ordered \
+                 directory flush here is a full one: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_barrier_is_answered_by_the_full_flush() {
+        let dir = scratch();
+        let file = std::fs::File::create(dir.path().join("f")).unwrap();
+        let mut asked = false;
+        primitive::barrier_or_full(&file, |_| {
+            asked = true;
+            Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+        })
+        .expect("the full flush answers a refused barrier");
+        assert!(asked, "the barrier is asked first");
+        let mut calls = 0;
+        primitive::barrier_or_full(&file, |_| {
+            calls += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn a_later_write_on_the_same_device_is_ordered_and_an_unreadable_one_is_durable() {
+        let dir = scratch();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::create_dir(&b).unwrap();
+        #[cfg(unix)]
+        let same_device = Flush::Ordered;
+        #[cfg(not(unix))]
+        let same_device = Flush::Durable;
+        assert_eq!(Flush::ordered_if_same_device(&a, &b), same_device);
+        #[cfg(unix)]
+        assert_eq!(
+            Flush::ordered_if_same_device(&a, dir.path()),
+            Flush::Ordered
+        );
+        assert_eq!(
+            Flush::ordered_if_same_device(&a, &dir.path().join("absent")),
+            Flush::Durable,
+            "a path that cannot be read is another device for all this knows"
+        );
+    }
+
+    /// Two volumes, where this host has them: `/dev` is its own filesystem on Apple
+    /// and Linux, so a write there is never ordered by a barrier on the temp volume.
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    #[test]
+    fn a_later_write_on_another_device_is_durable() {
+        let dir = scratch();
+        assert_eq!(
+            Flush::ordered_if_same_device(dir.path(), std::path::Path::new("/dev")),
+            Flush::Durable
+        );
+    }
+}

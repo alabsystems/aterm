@@ -1,0 +1,20 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-16, `aterm ctl text --json` of a private headless aterm 140x45 (aterm 0.105.0 b4ea2ef5a, the harness on), the person's own muse (Meta's installer: `~/.local/bin/muse` execs `muse-bin-1.4.10-R6427.1`), signed in, model muse-wonder-full-1.0 at xhigh, Auto-review, while it worked a real task (dogfood: reviewing aterm's muse reader) · rows from its last tool row down (the transcript above cut) · the NETWORK box a sandboxed `pip install` raised: the status row `◈ Calling tools (6m 49s · esc to interrupt)` above the composer's labelled rule, `Would you like to allow this network access?` (bold ccd3db), `  requested by:` (676c74), the command as `  $ …` with its wrapped tail four columns in, then `⟩ 1. Yes, proceed (y)`, `  2. Yes, don't ask again this session (p)  pypi.org:443 (https)` and `  3. Always allow this network destination  pypi.org:443 (https)` (the destination 8a9098 after a double blank), `  4. No, and tell Muse Code what to do differently (esc)`, a blank row, `Change approval defaults in /permissions`, the bottom rule and the footer; the harness, before it read this box, escalated it as a box whose head it could not name; a person's `1` allowed it once (pip asks again per connection) · cursor=2,15 (hidden) · the home path redacted at equal length
+◆ Ran 6 commands · Check pty capture options · Capture own live screen · +4 ✓ · 3.2s · ctrl+o
+
+◈ Calling tools (6m 49s · esc to interrupt)
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────
+Would you like to allow this network access?
+
+  requested by:
+  $ python3 -m pip install --quiet --target /tmp/pylibs pyte 2>&1 | tail -n 3; PYTHONPATH=/tmp/pylibs python3 -c "import pyte; print('pyte
+    ok')"
+
+⟩ 1. Yes, proceed (y)
+  2. Yes, don't ask again this session (p)  pypi.org:443 (https)
+  3. Always allow this network destination  pypi.org:443 (https)
+  4. No, and tell Muse Code what to do differently (esc)
+
+Change approval defaults in /permissions
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  muse-wonder-full-1.0 · xhigh · ~/Developer/aterm-dogfood · Auto-review

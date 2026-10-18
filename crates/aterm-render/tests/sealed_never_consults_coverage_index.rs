@@ -12,7 +12,8 @@
 //!
 //! The test drives a sealed system generation through one code point per
 //! fallback lane, rasterizing each, then reads the process-global counters. It
-//! is its own test binary so no sibling's unsealed renderer moves them.
+//! runs in its own process (`common/alone.rs`: the suite binary re-run on this
+//! one test) so no sibling's unsealed renderer moves them.
 
 use aterm_render::{Renderer, Theme};
 
@@ -30,6 +31,12 @@ const PROBES: &[char] = &[
 
 #[test]
 fn a_sealed_system_generation_never_builds_or_queries_the_coverage_index() {
+    if !crate::alone::in_own_process(
+        module_path!(),
+        "a_sealed_system_generation_never_builds_or_queries_the_coverage_index",
+    ) {
+        return;
+    }
     let mut r = Renderer::from_system(18.0, Theme::default())
         .expect("no font: build with aterm-render's default embedded-font feature");
     assert!(

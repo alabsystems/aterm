@@ -4,17 +4,17 @@
 //! [`Command`]'s tests: every stdio mode, `std`'s rules for programs,
 //! arguments, environments and directories (table-driven against
 //! `std::process::Command` itself), the inheritance guarantee, signals, the
-//! child handle, `exec` — and, ignored unless asked for, the benchmark of what
-//! a spawn costs a process shaped like the window. The ones that must own the
-//! process (its signal dispositions, its stderr, its address space, an `exec`)
+//! child handle and `exec`. The ones that must own the process (its signal
+//! dispositions, its stderr, an `exec`)
 //! run in a STAGED child: a fresh exec of this test binary
 //! ([`super::tests::run_staged`]).
 
-use super::tests::{
-    STAGE_ENV, host_holds, park, raise_soft_limit, run_staged, unflagged_at_or_above,
-};
 #[cfg(target_vendor = "apple")]
-use super::tests::{flags, run_staged_with};
+use super::tests::flags;
+use super::tests::{
+    STAGE_ENV, STD_SPAWN_MUTE, host_holds, park, raise_soft_limit, run_staged, translator,
+    unflagged_at_or_above,
+};
 use super::*;
 use std::io::{Read, Write};
 #[cfg(target_vendor = "apple")]
@@ -485,7 +485,10 @@ fn outcome(run: io::Result<std::process::Output>) -> Outcome {
 /// directory named like the program), relative programs and working
 /// directories, scripts with no `#!`, and every failure: missing, not
 /// executable, a directory, `ENOTDIR` on the way, an empty name, a missing
-/// working directory, a NUL anywhere.
+/// working directory, a NUL anywhere. Under Rosetta a row `std` answers with
+/// a child that exited 127, silent, where ours failed, is `std`'s
+/// `posix_spawn` that could not report its failure ([`STD_SPAWN_MUTE`]): it is
+/// said not run, never compared, and the table's own answers below still hold.
 #[test]
 fn programs_arguments_environments_and_directories_match_std() {
     let scratch = Scratch::new("parity");
@@ -651,14 +654,35 @@ fn programs_arguments_environments_and_directories_match_std() {
     // `execvp`, which does. (Read from glibc, not run: no Linux host here.)
     let std_answers_two_ways =
         |what: &str| !cfg!(target_vendor = "apple") && what == "a script with no #! line";
+    let translator = translator();
+    let std_mute = |ours: &Outcome, theirs: &Outcome| {
+        translator.is_some()
+            && ours.is_err()
+            && *theirs == Ok((Some(127), String::new(), String::new()))
+    };
     let mut kinds = Vec::new();
+    let mut mute = Vec::new();
     for row in &cases {
         let theirs = outcome(configured!(std::process::Command::new, row).output());
         let ours = outcome(configured!(command, row).output());
-        if !std_answers_two_ways(row.what) {
+        if std_mute(&ours, &theirs) {
+            mute.push(row.what);
+        } else if !std_answers_two_ways(row.what) {
             assert_eq!(ours, theirs, "{}: ours, then std's", row.what);
         }
         kinds.push((row.what, ours));
+    }
+    if let Some(translator) = &translator
+        && !mute.is_empty()
+    {
+        println!(
+            "NOT RUN under {translator}: spawnfd::command_tests::\
+             programs_arguments_environments_and_directories_match_std: std's answer to {} \
+             of {} rows ({}): {STD_SPAWN_MUTE}",
+            mute.len(),
+            cases.len(),
+            mute.join("; ")
+        );
     }
     lock(0o755);
     // NON-VACUITY: the table reaches every answer it claims to compare.
@@ -1081,9 +1105,13 @@ fn staged_signals() {
     assert_eq!(unsafe { kill(pid, SIGTERM) }, 0, "SIGTERM our child");
     let ended = ours.wait().expect("wait");
     println!("STAGED masks ours={ours_mask:?} std={theirs_mask:?} ended={ended:?}");
+    // The probe lists a mask by signal number: SIGUSR1 is 30 on Darwin and
+    // 10 on Linux, either side of SIGTERM's 15.
+    let mut blocked = [SIGUSR1, SIGTERM];
+    blocked.sort_unstable();
     assert_eq!(
         theirs_mask,
-        format!("{SIGTERM},{SIGUSR1}"),
+        format!("{},{}", blocked[0], blocked[1]),
         "CONTROL: a std child starts with the spawning thread's mask, so the probe can see one"
     );
     assert_eq!(ours_mask, "", "the child started with a signal blocked");
@@ -1315,6 +1343,172 @@ fn a_child_leads_the_group_or_the_session_it_was_given() {
 }
 
 // ---------------------------------------------------------------------------
+// Responsibility: a disclaimed child
+// ---------------------------------------------------------------------------
+
+/// `responsibility_get_pid_responsible_for_pid(pid)`: the process macOS
+/// charges `pid`'s TCC and syspolicyd questions to. Libquarantine's SPI (no
+/// SDK header), resolved here per call as aterm-containment's consent probe
+/// resolves it.
+#[cfg(target_vendor = "apple")]
+fn responsible_for(pid: u32) -> i32 {
+    use core::ffi::{c_char, c_void};
+    unsafe extern "C" {
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    }
+    /// `pid_t f(pid_t)`.
+    type Responsible = unsafe extern "C" fn(i32) -> i32;
+    /// `RTLD_DEFAULT`, as `<dlfcn.h>` defines it on Darwin.
+    const RTLD_DEFAULT: *mut c_void = (-2_isize) as *mut c_void;
+    // SAFETY: a NUL-terminated C string literal; `RTLD_DEFAULT` is dlfcn.h's
+    // pseudo-handle for a global search.
+    let found = unsafe {
+        dlsym(
+            RTLD_DEFAULT,
+            c"responsibility_get_pid_responsible_for_pid".as_ptr(),
+        )
+    };
+    assert!(
+        !found.is_null(),
+        "libSystem exports responsibility_get_pid_responsible_for_pid"
+    );
+    // SAFETY: dyld resolved the name to the libquarantine function whose C
+    // prototype is `pid_t f(pid_t)`, exactly `Responsible`.
+    let responsible = unsafe { std::mem::transmute::<*mut c_void, Responsible>(found) };
+    // SAFETY: one plain integer argument.
+    unsafe { responsible(i32::try_from(pid).expect("pid")) }
+}
+
+/// **A DISCLAIMED CHILD IS ITS OWN RESPONSIBLE PROCESS.** This test binary,
+/// started through [`command`] with [`Command::disclaim_responsibility`], is a
+/// STAGE that asks macOS who is responsible for whom: itself (its own pid);
+/// a PLAIN `/bin/sleep` it starts (the stage's pid — the negative control,
+/// true only if the stage really was disclaimed); and a DISCLAIMED
+/// `/bin/sleep` it starts (that child's own pid, where its plain sibling
+/// answered the stage's). The stage's answer about itself proves little
+/// alone: MEASURED 2026-10-16, a process no ancestor was made responsible
+/// for (a shell under aterm, its children) answers its own pid. The plain
+/// child is the proof — run undisclaimed (the stage variable set by hand),
+/// that child answered its own pid and the CONTROL assertion failed.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_disclaimed_child_is_its_own_responsible_process() {
+    const NAME: &str = "spawnfd::command_tests::a_disclaimed_child_is_its_own_responsible_process";
+    const STAGE: &str = "disclaim";
+    if std::env::var(STAGE_ENV).as_deref() == Ok(STAGE) {
+        let me = std::process::id();
+        let of_me = responsible_for(me);
+        let mut plain = command("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn a plain child");
+        let mut disclaimed = command("/bin/sleep")
+            .arg("60")
+            .disclaim_responsibility(true)
+            .spawn()
+            .expect("spawn a disclaimed child");
+        let (of_plain, of_disclaimed) = (
+            responsible_for(plain.id()),
+            responsible_for(disclaimed.id()),
+        );
+        let pid = |child: &Child| i32::try_from(child.id()).expect("pid");
+        let (plain_pid, disclaimed_pid) = (pid(&plain), pid(&disclaimed));
+        for child in [&mut plain, &mut disclaimed] {
+            child.kill().expect("kill");
+            child.wait().expect("wait");
+        }
+        let me = i32::try_from(me).expect("pid");
+        println!(
+            "STAGED disclaim stage={me}:{of_me} plain={plain_pid}:{of_plain} \
+             disclaimed={disclaimed_pid}:{of_disclaimed}"
+        );
+        assert_eq!(
+            of_me, me,
+            "the stage, spawned disclaimed, is its own responsible process"
+        );
+        assert_eq!(
+            of_plain, me,
+            "CONTROL: a plain child is charged to its disclaimed parent"
+        );
+        assert_eq!(
+            of_disclaimed, disclaimed_pid,
+            "a disclaimed child is its own responsible process"
+        );
+        println!("STAGED disclaim ok");
+        return;
+    }
+    let out = command(std::env::current_exe().expect("the test binary"))
+        .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+        .env(STAGE_ENV, STAGE)
+        .disclaim_responsibility(true)
+        .output()
+        .expect("start this test binary disclaimed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("STAGED disclaim ok"),
+        "stage {STAGE}: {:?}\nstdout: {stdout}\nstderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// **A DISCLAIM THE OS CANNOT HONOUR STARTS NOTHING.** Asked to disclaim
+/// through an SPI no image exports (the stand-in for a macOS without it, and
+/// for every other OS), `spawn`, `output` and `status` each answer
+/// `Unsupported` and the child — a shell that would leave a marker — never
+/// runs. The control: the same command without the disclaim leaves it.
+#[test]
+fn a_disclaim_the_os_cannot_honour_starts_nothing() {
+    const ABSENT: &core::ffi::CStr = c"responsibility_spawnattrs_setdisclaim_absent";
+    let scratch = Scratch::new("disclaim-absent");
+    let marker = scratch.join("started");
+    let script = format!("touch '{}'", marker.display());
+    let refused = |error: io::Error, how: &str| {
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported, "{how}: {error}");
+        #[cfg(target_vendor = "apple")]
+        assert!(
+            error.to_string().contains(ABSENT.to_str().expect("utf-8")),
+            "{how}: the refusal names the missing symbol: {error}"
+        );
+    };
+    let mut cmd = command("/bin/sh");
+    cmd.args(["-c", &script]).disclaim_through(ABSENT);
+    refused(cmd.spawn().expect_err("spawn disclaimed"), "spawn");
+    refused(cmd.output().expect_err("output disclaimed"), "output");
+    refused(cmd.status().expect_err("status disclaimed"), "status");
+    assert!(
+        !marker.exists(),
+        "a disclaim the OS could not apply started the child"
+    );
+    let control = command("/bin/sh")
+        .args(["-c", &script])
+        .status()
+        .expect("CONTROL: the same command undisclaimed");
+    assert!(control.success(), "CONTROL: {control:?}");
+    assert!(
+        marker.exists(),
+        "CONTROL: the undisclaimed child left the marker"
+    );
+}
+
+/// **A DISCLAIM IS DARWIN'S.** Elsewhere `spawn`, `output` and `status` answer
+/// `Unsupported` and start nothing (`exec`: the staged test below).
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn a_disclaim_is_unsupported_off_darwin() {
+    let mut cmd = command("/bin/true");
+    cmd.disclaim_responsibility(true);
+    for (how, error) in [
+        ("spawn", cmd.spawn().map(drop)),
+        ("output", cmd.output().map(drop)),
+        ("status", cmd.status().map(drop)),
+    ] {
+        let error = error.expect_err(how);
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported, "{how}: {error}");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // exec
 // ---------------------------------------------------------------------------
 
@@ -1357,6 +1551,27 @@ fn a_command_exec_replaces_this_process_holding_nothing() {
     assert!(out.contains("STAGED exec ok"), "{out}");
 }
 
+/// **AN `exec` THAT MUST DISCLAIM IS REFUSED.** `POSIX_SPAWN_SETEXEC` with the
+/// disclaim attribute is unmeasured, so [`Command::exec`] beside
+/// [`Command::disclaim_responsibility`] answers `Unsupported` before trying —
+/// on every OS. Staged, so a regression replaces the stage (whose new image
+/// says so and fails), never this test process.
+#[test]
+fn an_exec_that_must_disclaim_is_refused() {
+    const NAME: &str = "spawnfd::command_tests::an_exec_that_must_disclaim_is_refused";
+    if std::env::var(STAGE_ENV).is_ok() {
+        let err = command("/bin/sh")
+            .args(["-c", "echo 'STAGED exec-disclaim replaced'; exit 3"])
+            .disclaim_responsibility(true)
+            .exec();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported, "{err}");
+        println!("STAGED exec-disclaim refused");
+        return;
+    }
+    let out = run_staged(NAME, "exec-disclaim");
+    assert!(out.contains("STAGED exec-disclaim refused"), "{out}");
+}
+
 /// **AN `exec` HANDS OVER A CLOSE-ON-EXEC SOURCE AS `spawn` DOES.** Darwin's
 /// `POSIX_SPAWN_SETEXEC` closes this process's close-on-exec descriptors
 /// before it runs the file actions, so a `dup2` or an inherit FROM one answers
@@ -1392,213 +1607,4 @@ fn an_exec_hands_over_a_close_on_exec_source() {
     let _ = run_staged(NAME, path.to_str().expect("utf-8 scratch path"));
     let wrote = std::fs::read_to_string(&path).expect("the new image's stdout");
     assert_eq!(wrote, "wrote\nstderr-open\n");
-}
-
-// ---------------------------------------------------------------------------
-// The benchmark: what a spawn costs a process shaped like the window
-// ---------------------------------------------------------------------------
-
-/// The window's shape, measured: 6 585 VM regions and about 400 MB resident.
-/// The stage maps `BENCH_CHUNKS` chunks of `BENCH_CHUNK` bytes and makes every
-/// other one inaccessible, so each is a region of its own; the writable half is
-/// touched resident.
-#[cfg(target_vendor = "apple")]
-const BENCH_CHUNK: usize = 128 * 1024;
-#[cfg(target_vendor = "apple")]
-const BENCH_CHUNKS: usize = 6_400;
-/// Spawns timed per lane, and rewrites timed after a spawn.
-#[cfg(target_vendor = "apple")]
-const BENCH_SPAWNS: usize = 40;
-#[cfg(target_vendor = "apple")]
-const BENCH_REWRITES: usize = 9;
-
-/// How many VM regions this process has (`PROC_PIDREGIONINFO`, walked).
-#[cfg(target_vendor = "apple")]
-fn region_count() -> usize {
-    unsafe extern "C" {
-        fn proc_pidinfo(
-            pid: i32,
-            flavor: i32,
-            arg: u64,
-            buffer: *mut core::ffi::c_void,
-            size: i32,
-        ) -> i32;
-        fn getpid() -> i32;
-    }
-    const PROC_PIDREGIONINFO: i32 = 7;
-    // `struct proc_regioninfo`: 96 bytes, `pri_address` at 80, `pri_size` at 88.
-    let mut info = [0u8; 96];
-    let (mut at, mut count) = (0u64, 0usize);
-    loop {
-        // SAFETY: `info` is 96 writable bytes, the size passed.
-        let got = unsafe {
-            proc_pidinfo(
-                getpid(),
-                PROC_PIDREGIONINFO,
-                at,
-                info.as_mut_ptr().cast(),
-                96,
-            )
-        };
-        if got != 96 {
-            return count;
-        }
-        let word = |o: usize| u64::from_ne_bytes(info[o..o + 8].try_into().expect("8 bytes"));
-        count += 1;
-        at = word(80) + word(88);
-    }
-}
-
-/// The p50 and p90 of `samples`, in milliseconds.
-#[cfg(target_vendor = "apple")]
-fn percentiles(mut samples: Vec<Duration>) -> (f64, f64) {
-    samples.sort_unstable();
-    let at = |q: usize| samples[(samples.len() - 1) * q / 100].as_secs_f64() * 1e3;
-    (at(50), at(90))
-}
-
-#[cfg(target_vendor = "apple")]
-fn staged_bench() {
-    unsafe extern "C" {
-        fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
-        fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32;
-        fn getpagesize() -> i32;
-    }
-    const PROT_NONE: i32 = 0;
-    const PROT_READ_WRITE: i32 = 1 | 2;
-    const MAP_PRIVATE_ANON: i32 = 0x0002 | 0x1000;
-    let len = BENCH_CHUNK * BENCH_CHUNKS;
-    // SAFETY: an anonymous private mapping this function alone uses and never
-    // unmaps (the staged process exits with it).
-    let base = unsafe {
-        mmap(
-            std::ptr::null_mut(),
-            len,
-            PROT_READ_WRITE,
-            MAP_PRIVATE_ANON,
-            -1,
-            0,
-        )
-    };
-    assert!(!base.is_null() && base as isize != -1, "mmap");
-    let page = usize::try_from(unsafe { getpagesize() }).expect("a page size");
-    let writable: Vec<*mut u8> = (0..BENCH_CHUNKS)
-        .step_by(2)
-        // SAFETY: every chunk start lies inside the mapping.
-        .map(|i| unsafe { base.add(i * BENCH_CHUNK) })
-        .collect();
-    for i in (1..BENCH_CHUNKS).step_by(2) {
-        // SAFETY: a chunk of the mapping; made inaccessible, splitting it off.
-        assert_eq!(
-            unsafe { mprotect(base.add(i * BENCH_CHUNK), BENCH_CHUNK, PROT_NONE) },
-            0,
-            "mprotect"
-        );
-    }
-    let rewrite = || {
-        let started = Instant::now();
-        for &chunk in &writable {
-            for offset in (0..BENCH_CHUNK).step_by(page) {
-                // SAFETY: inside a writable chunk of the mapping.
-                unsafe { chunk.add(offset).write_volatile(1) };
-            }
-        }
-        started.elapsed()
-    };
-    rewrite();
-    let regions = region_count();
-    let resident_mb = writable.len() * BENCH_CHUNK / (1024 * 1024);
-    println!("STAGED bench regions={regions} resident={resident_mb}MB page={page}");
-    let baseline = percentiles((0..BENCH_REWRITES).map(|_| rewrite()).collect());
-    println!(
-        "STAGED bench rewrite with no spawn: p50 {:.2} ms p90 {:.2} ms",
-        baseline.0, baseline.1
-    );
-    type Spawn = Box<dyn Fn() -> Box<dyn FnOnce()>>;
-    let lanes: [(&str, Spawn); 3] = [
-        (
-            "std Command, no hook (posix_spawn baseline)",
-            Box::new(|| {
-                let mut child = std::process::Command::new("/usr/bin/true")
-                    .spawn()
-                    .expect("spawn");
-                Box::new(move || {
-                    child.wait().expect("wait");
-                })
-            }),
-        ),
-        (
-            "std Command + InheritNothing (fork + strip)",
-            Box::new(|| {
-                let mut child = std::process::Command::new("/usr/bin/true")
-                    .inherit_nothing()
-                    .spawn()
-                    .expect("spawn");
-                Box::new(move || {
-                    child.wait().expect("wait");
-                })
-            }),
-        ),
-        (
-            "spawnfd::command (posix_spawn + CLOEXEC_DEFAULT)",
-            Box::new(|| {
-                let mut child = command("/usr/bin/true").spawn().expect("spawn");
-                Box::new(move || {
-                    child.wait().expect("wait");
-                })
-            }),
-        ),
-    ];
-    for (name, spawn) in &lanes {
-        let spawns = percentiles(
-            (0..BENCH_SPAWNS)
-                .map(|_| {
-                    let started = Instant::now();
-                    let reap = spawn();
-                    let took = started.elapsed();
-                    reap();
-                    took
-                })
-                .collect(),
-        );
-        let bills = percentiles(
-            (0..BENCH_REWRITES)
-                .map(|_| {
-                    spawn()();
-                    rewrite()
-                })
-                .collect(),
-        );
-        println!(
-            "STAGED bench {name}: spawn() p50 {:.3} ms p90 {:.3} ms; \
-             rewrite after it p50 {:.2} ms p90 {:.2} ms",
-            spawns.0, spawns.1, bills.0, bills.1
-        );
-    }
-    println!("STAGED bench ok");
-}
-
-/// **THE BENCHMARK** (ignored; not a gate): in a staged process shaped like the
-/// window — about 6 400 VM regions, 400 MB resident — the `spawn()` call and
-/// the parent's bill after it (rewriting its resident memory once, the
-/// copy-on-write faults a fork leaves) for a plain `std` spawn (the
-/// `posix_spawn` baseline), a forked `std` + strip, and [`command`]. Run it by
-/// hand:
-///
-/// ```text
-/// targo --unverified test -p aterm-uds --lib -- --ignored --nocapture \
-///   spawnfd::command_tests::bench_what_a_spawn_costs_a_window_sized_process
-/// ```
-#[cfg(target_vendor = "apple")]
-#[test]
-#[ignore = "a benchmark, run by hand: it maps 800 MB and prints its numbers"]
-fn bench_what_a_spawn_costs_a_window_sized_process() {
-    const NAME: &str = "spawnfd::command_tests::bench_what_a_spawn_costs_a_window_sized_process";
-    if std::env::var(STAGE_ENV).is_ok() {
-        staged_bench();
-        return;
-    }
-    let out = run_staged_with(NAME, "bench", &["--include-ignored"]);
-    print!("{out}");
-    assert!(out.contains("STAGED bench ok"), "{out}");
 }

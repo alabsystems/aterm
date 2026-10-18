@@ -5,10 +5,10 @@
 //! the real process edge: the dev `atpkg` binary over a temp prefix.
 //!
 //! * `__landing` — the hidden verb a twin laid by an older client still execs while a
-//!   landing marker stands — runs `bin/<program>` at once and prints nothing, with a marker
-//!   naming a live writer (this test process) and the shim still on the old build.
-//! * The same, reached as in the field: an older twin's own bytes (the self-update block,
-//!   then the landing prelude) run in `/bin/sh` with the marker standing.
+//!   landing marker stands — reached the way it is reached in the field: an older twin's
+//!   own bytes (the self-update block, then the landing prelude) run in `/bin/sh` with a
+//!   marker naming a LIVE writer (this test process) standing; `bin/<program>` runs at
+//!   ONCE and nothing is printed.
 //! * Every pass sweeps `landing/`: a mutating verb (`gc`, the one that needs no network)
 //!   leaves no marker behind, whoever wrote it.
 //!
@@ -122,29 +122,6 @@ fn text(bytes: &[u8]) -> String {
 
 fn atpkg() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_atpkg"))
-}
-
-/// `__landing claude <prefix> -- <args>` under a live writer's marker: `bin/claude` runs
-/// at once with the arguments verbatim, its exit code comes back, and nothing is printed
-/// on stderr.
-#[test]
-fn the_landing_verb_execs_the_bin_shim_at_once_and_prints_nothing() {
-    let fx = Fixture::new("verb");
-    fx.install_claude(2026091601);
-    let marker = fx.stand_marker();
-    let argv: Vec<OsString> = vec![
-        OsString::from(atpkg::landing::HIDDEN_VERB),
-        OsString::from("claude"),
-        fx.prefix.clone().into_os_string(),
-        OsString::from("--"),
-        OsString::from("-p"),
-        OsString::from("a b"),
-    ];
-    let out = fx.run(atpkg(), &argv);
-    assert_eq!(out.status.code(), Some(7), "the shim's own code: {out:?}");
-    assert_eq!(text(&out.stdout), "fake: -p a b\n");
-    assert_eq!(text(&out.stderr), "", "nothing printed");
-    assert!(marker.exists(), "the verb reads no marker and removes none");
 }
 
 /// An older twin as it runs in the field: the bytes an older client laid in

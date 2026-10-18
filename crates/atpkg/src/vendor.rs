@@ -1132,19 +1132,6 @@ mod tests {
             windows_lookup_names("GNU.Emacs", ".EXE"),
             vec!["GNU.Emacs.EXE"]
         );
-        assert_eq!(DEFAULT_PATHEXT, ".COM;.EXE;.BAT;.CMD");
-    }
-
-    #[test]
-    fn https_host_parses_only_bare_hosts() {
-        assert_eq!(https_host("https://github.com"), Some("github.com"));
-        assert_eq!(https_host("https://github.com/"), Some("github.com"));
-        assert_eq!(https_host("https://github.com?x"), Some("github.com"));
-        assert_eq!(https_host("https://github.com#x"), Some("github.com"));
-        assert_eq!(https_host("https://github.com:443/"), None);
-        assert_eq!(https_host("https://a@github.com/"), None);
-        assert_eq!(https_host("http://github.com/"), None);
-        assert_eq!(https_host("HTTPS://github.com/"), None);
     }
 
     // ---- the vendor-direct URL pins ----

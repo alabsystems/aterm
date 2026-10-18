@@ -77,13 +77,12 @@ impl From<bool> for ReflowMode {
 /// policy makes none of them and, on a width change, severs the row-0
 /// fragment from its head (`sever_top_row_continuation`).
 ///
-/// Absolute row keys: a grow's bottom append and a shrink's trailing-blank
-/// trim move `absolute_row_counter` with their rows under BOTH policies
+/// Absolute row keys: under both policies a grow's bottom append and a shrink's
+/// trailing-blank trim move `absolute_row_counter` with their rows
 /// (`keep_keys_across_bottom_rows`), so every retained row keeps its key.
-/// Holding the counter fixed instead slides every key by the height delta,
-/// which moves every OSC 133 mark, output block and annotation off its row
-/// (a 24→40 grow read a prompt mark 16 rows off), and with no history to
-/// evict `oldest_absolute_row()` saturates at 0, so the slide goes unseen.
+/// Holding the counter fixed would slide every key (OSC 133 marks, output
+/// blocks, annotations) by the height delta, unseen when there is no history
+/// for `oldest_absolute_row()` to move by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum ResizePolicy {
@@ -92,23 +91,19 @@ pub enum ResizePolicy {
     /// (boundary-continuation lift + deficit fill).
     #[default]
     Native,
-    /// conhost repaints the viewport after every resize, row-0-anchored, from
-    /// its own buffer (the measurements above): a rows-grow appends fresh
-    /// blank rows at the BOTTOM and reveals nothing; a width change rewraps
-    /// the viewport in place and the off-screen history separately, with no
-    /// continuation lift and no deficit fill, a continuation at row 0 becomes
-    /// a line of its own, and the cursor's row keeps every cell through the
-    /// cursor's, so the cursor keeps its offset in its line where Native
-    /// clamps it to the last glyph. A rows-only shrink keeps the Native shape
-    /// (trim trailing blanks, top-demote, bottom-push corner), which leaves
-    /// the viewport conhost paints; a shrink that rewraps demotes that same
-    /// count from the rewrapped rows, where Native pushes only what brings the
-    /// cursor on screen. The grow's append and the shrink's trim move
-    /// `absolute_row_counter` with their rows, as under Native (above).
+    /// conhost repaints the viewport after every resize (above): a rows-grow
+    /// appends blank rows at the bottom and reveals nothing; a width change
+    /// rewraps the viewport and the off-screen history separately, with no
+    /// continuation lift and no deficit fill; a continuation at row 0 becomes a
+    /// line of its own; and the cursor's row keeps every cell through the
+    /// cursor's, so the cursor keeps its offset in its line where Native clamps
+    /// it to the last glyph. A rows-only shrink keeps the Native shape; a shrink
+    /// that rewraps demotes that same count from the rewrapped rows, where
+    /// Native pushes only what brings the cursor on screen.
     ConPty,
 }
 
-/// Rows a rows-only resize added at, or dropped from, the BOTTOM of the
+/// Rows a rows-only resize added at, or dropped from, the bottom of the
 /// buffer: what `Grid::keep_keys_across_bottom_rows` moves the counter by.
 #[derive(Clone, Copy)]
 enum BottomRows {
@@ -126,11 +121,10 @@ struct ReflowResult {
     saved: Option<(usize, u16)>,
 }
 
-/// The cursors a width rewrap carries to their new cells, the way a reference
-/// terminal carries them (kitty `rewrap`'s `CursorTrack`s, Ghostty's tracked
-/// pins): index [`LIVE`] is the live cursor, [`SAVED`] the saved one (DECSC,
-/// and the 1049 slot the host lends the grid for the resize). Each is a source
-/// `(row, col)` before the rewrap and the `(row, col)` its cell lands on after.
+/// The cursors a width rewrap carries to their new cells (as kitty's
+/// `CursorTrack`s and Ghostty's tracked pins do): [`LIVE`] is the live cursor,
+/// [`SAVED`] the saved one (DECSC, or the 1049 slot the host lends). Each is a
+/// source `(row, col)` before the rewrap and the `(row, col)` its cell lands on.
 struct RewrapCursors {
     src: [Option<(usize, u16)>; 2],
     dst: [Option<(usize, u16)>; 2],
@@ -186,35 +180,28 @@ impl RewrapCursors {
 }
 
 /// May the rewrap merge consume `row` as a soft-wrap continuation of the
-/// preceding row? Only a single-width continuation merges: a DECDWL/DECDHL row
-/// carries a per-row `line_size` and must resize in place
-/// (`resize_double_width_row_in_place`); merging would strip the attribute,
-/// since the output chunk inherits only the first source row's line_size.
+/// preceding row? Not a DECDWL/DECDHL row: the merged chunk inherits only the
+/// first source row's `line_size`, so it resizes in place instead.
 fn is_mergeable_continuation(row: &Row) -> bool {
     row.is_wrapped() && row.line_size() == LineSize::SingleWidth
 }
 
 /// How many cells of the cursor's row a ConPTY rewrap copies: its content and
-/// every cell through the cursor's, blank or not. conhost's Reflow copies the
-/// cursor's row through `max(MeasureRight, cursor.x + 1)`, so a cursor parked
-/// past the row's last glyph keeps its offset in the logical line, and when
-/// the cells before it end on a row boundary the cursor's cell starts a row of
-/// its own; on a row with no text a cursor past the new width moves down with
-/// its cells. (pwsh's prompt ends in `CSI 1 C`, parking the cursor one column
-/// past its last glyph.) Clamping to the last glyph instead would count one
-/// row fewer than conhost demotes and let its row-0 repaint overwrite a line.
+/// every cell through the cursor's, blank or not, as conhost's Reflow copies
+/// through `max(MeasureRight, cursor.x + 1)`. A cursor parked past the last
+/// glyph (pwsh's prompt ends in `CSI 1 C`) keeps its offset in the line, so
+/// when the cells before it end on a row boundary its cell starts a row of its
+/// own. Clamping to the last glyph would count one row fewer than conhost
+/// demotes and let its row-0 repaint overwrite a line.
 fn cursor_row_copy_len(row: &Row, cursor_col: u16) -> usize {
     usize::from(row.len())
         .max(usize::from(cursor_col) + 1)
         .min(row.as_slice().len())
 }
 
-/// Resize a DECDWL/DECDHL row in place (truncate or pad) without reflow.
-///
-/// Double-width and double-height lines are logically half-width: each
-/// character occupies two physical columns, so reflowing would split the
-/// logical line. Copy cells up to `min(content_len, new_cols)` and pad the
-/// remainder.
+/// Resize a DECDWL/DECDHL row in place (truncate or pad) without reflow:
+/// each character occupies two physical columns, so reflowing would split the
+/// logical line.
 #[allow(clippy::too_many_arguments)]
 fn resize_double_width_row_in_place(
     row: &Row,
@@ -230,9 +217,8 @@ fn resize_double_width_row_in_place(
     // SAFETY: `new_row` is appended to `new_rows` and returned alongside
     // `new_pages` in the same reflow result.
     let mut new_row = unsafe { Row::new(new_cols, new_pages) };
-    // Set line_size BEFORE copying cells. set_line_size(DoubleWidth) clears
-    // cells from cols/2 onward, so it must precede copy_cells_to_row which
-    // will overwrite those cleared positions with the actual content.
+    // Set line_size before copying cells: set_line_size(DoubleWidth) clears
+    // cells from cols/2 onward, which copy_cells_to_row then overwrites.
     new_row.set_line_size(row.line_size());
     if row.is_wrapped() {
         new_row.set_wrapped(true);
@@ -278,11 +264,10 @@ impl Grid {
     }
 
     /// Resize the grid with explicit reflow mode.
-    // COST: UNBOUNDED(scrollback-width-reflow) — the width branch calls
-    // `take_scrollback_lines` + `reflow_scrollback_lines` synchronously. A
-    // main-thread reach under the `term` lock can freeze the UI (see
-    // `aterm-census --mainloop`). `Grid::resize` / `Terminal::resize` forward
-    // here; the offloaded path detaches history first.
+    // COST: UNBOUNDED(scrollback-width-reflow) — the width branch rewraps the
+    // whole scrollback synchronously; on the main thread under the `term` lock
+    // that can freeze the UI (`aterm-census --mainloop`). The offloaded path
+    // detaches history first.
     pub fn resize_with_reflow_mode(
         &mut self,
         new_rows: u16,
@@ -304,10 +289,9 @@ impl Grid {
         self.resize_with_reflow_mode_and_policy(new_rows, new_cols, ReflowMode::Enabled, policy);
     }
 
-    /// [`Grid::resize_no_reflow`] under an explicit [`ResizePolicy`]. The alt
-    /// screen never rewraps, but a rows-grow on it still has a seam policy: an
-    /// alt grid can hold ring history (a TUI that scrolled a region), and conhost
-    /// repaints the alt viewport exactly as it repaints the main one.
+    /// [`Grid::resize_no_reflow`] under an explicit [`ResizePolicy`]: an alt grid
+    /// never rewraps but can hold ring history (a TUI that scrolled a region),
+    /// and conhost repaints the alt viewport as it does the main one.
     pub fn resize_no_reflow_with_policy(
         &mut self,
         new_rows: u16,
@@ -318,22 +302,18 @@ impl Grid {
     }
 
     /// Lend this grid the host's saved cursor (DECSC, or the 1049 slot) for the
-    /// resize that follows, so the grid carries it to its text like its own
-    /// cursor: through a width rewrap (to the cell its text lands on), the
-    /// rewrap's push of top rows into history, a rows-grow reveal, a rows-shrink
-    /// top-demote, the boundary-continuation lift and the deficit fill, the
-    /// offloaded re-attach's fill included. Take it back with
-    /// [`Self::take_lent_saved_cursor`] once the resize (or re-attach) returns.
+    /// resize that follows, so the grid carries it with its text like its own
+    /// cursor: through a width rewrap, the push of top rows into history, a
+    /// rows-grow reveal, a rows-shrink top-demote, the boundary-continuation
+    /// lift and the deficit fill (the offloaded re-attach's included). Take it
+    /// back with [`Self::take_lent_saved_cursor`] once the resize (or re-attach)
+    /// returns.
     ///
-    /// The slot is the host's: the terminal keeps one per screen (xterm
-    /// `sc[0]`/`sc[1]`), so it lends each grid the one that belongs to it.
-    /// Every reference terminal moves it with its text: xterm
-    /// (`AdjustSavedCursor`), Alacritty (`grow_lines`), kitty (`screen_resize`
-    /// tracks both saved cursors through `rewrap`), Ghostty (`Screen.resize`
-    /// reflows the saved cursor's pin) and WezTerm. Left behind, a full-screen
-    /// app's exit (1049) restored the cursor onto earlier output. A slot past
-    /// the grid names no text and is left where it is; DECRC and the 1049 exit
-    /// clamp what they read.
+    /// The terminal keeps one slot per screen (xterm `sc[0]`/`sc[1]`) and lends
+    /// each grid its own; xterm, kitty and Ghostty all move it with the text.
+    /// Left behind, a full-screen app's 1049 exit would restore the cursor onto
+    /// earlier output. A slot past the grid names no text and is left where it
+    /// is; DECRC and the 1049 exit clamp what they read.
     pub fn lend_saved_cursor(&mut self, saved: Option<super::Cursor>) {
         self.storage.saved_cursor = crate::SavedCursor {
             cursor: saved.unwrap_or_default(),
@@ -360,15 +340,12 @@ impl Grid {
     ) {
         let reflow = matches!(reflow_mode, ReflowMode::Enabled);
         let conpty = policy == ResizePolicy::ConPty;
-        // Ingress clamp (§5.8): bound the allocation a hostile resize can request.
+        // Ingress clamp: bound the allocation a hostile resize can request.
         let new_rows = new_rows.clamp(1, MAX_GRID_ROWS);
         let new_cols = new_cols.clamp(1, MAX_GRID_COLS);
         let old_cols = self.storage.cols;
-        // The alt-screen resize undo (`resize_undo`): keep the stash only if
-        // nothing touched the screen since the resize that sealed it, and open
-        // one for a rows-only shrink of a grid that keeps no history. Runs
-        // before anything moves the cursor or resets margins, which the stash
-        // compares and keeps.
+        // First, before anything moves the cursor or margins: the resize undo
+        // compares and keeps them.
         self.admit_resize_undo(new_rows, new_cols, policy);
         // This resize's row accounting starts empty: each arm of
         // `adjust_row_count` stores its own count below, and nothing an earlier
@@ -378,10 +355,8 @@ impl Grid {
             ..crate::ResizeShape::default()
         };
 
-        // Reflow operates on the live grid + scrollback split at display_offset
-        // 0, but remember the reader's scrollback position to restore at the
-        // end: a window resize or font zoom must not yank a scrolled-back
-        // reader to the live bottom.
+        // Reflow runs at display_offset 0; the reader's position is restored at
+        // the end, so a resize or font zoom does not yank them to the live bottom.
         let prev_offset = self.storage.display_offset;
         // The absolute row under the eye, captured before the offset is
         // cleared. Only while scrolled back: at offset 0 a height shrink would
@@ -390,13 +365,12 @@ impl Grid {
         let prev_anchor = (prev_offset > 0).then(|| self.top_visible_absolute_row());
         self.storage.display_offset = 0;
 
-        // Bottom anchoring: remember the viewport's trailing blank rows before
-        // the resize. A width-grow unwraps content into fewer rows; the deficit
-        // fill at the end pulls history back until the band returns to this
-        // count, keeping the prompt anchored to its content. Rows-only resizes
-        // skip it (the grow reveal keeps absolute numbering, which the fill's
-        // renumbering would break). ConPTY has no fill: conhost paints freed
-        // rows `CSI K`, so a re-seated line would be duplicated.
+        // Bottom anchoring: remember the viewport's trailing blank rows, which
+        // the deficit fill at the end restores after a width-grow unwraps
+        // content into fewer rows. Not on rows-only resizes (the fill's
+        // renumbering would break the reveal's absolute numbering), and not
+        // under ConPTY (conhost paints freed rows `CSI K`; a re-seated line
+        // would be duplicated).
         let pre_trailing_blanks = (new_cols != old_cols && reflow && !conpty)
             .then(|| self.trailing_blank_rows_below_cursor());
 
@@ -407,16 +381,11 @@ impl Grid {
         let reflowed_scrollback = if new_cols != old_cols && reflow {
             let mut old = self.take_scrollback_lines();
             // Lift the viewport's leading soft-wrap continuation rows (the tail
-            // of a logical line whose head is the last history line) into the
-            // history rewrap, so the straddling line rewraps as one unit; the
-            // deficit fill below pulls the rewrapped tail back.
-            //
-            // Not under ConPTY: conhost repaints that continuation at row 0 as a
-            // standalone fragment and never rejoins it, so lifting it would
-            // duplicate it. The history rewrap ends at the head, as conhost's
-            // scrollback does, and the fragment stops being a continuation
-            // (`sever_top_row_continuation`) after the take above has read the
-            // head at its full filled width.
+            // of a line whose head is the last history line) into the history
+            // rewrap, so the straddling line rewraps as one unit; the deficit
+            // fill below pulls the tail back. ConPTY instead severs the fragment
+            // (see `sever_top_row_continuation`), after the take above read the
+            // head at its full width.
             if conpty {
                 self.sever_top_row_continuation();
             } else {
@@ -434,11 +403,9 @@ impl Grid {
             None
         };
 
-        // Ring extras and lazy buffer are invalidated by a ring-buffer rebuild,
-        // but a rows-only resize never rebuilds the ring on any grid shape
-        // (history is reclassified in place, see `adjust_row_count_rows_only`),
-        // so its history extras must survive. Keeping the side table is what
-        // lets a tiered grid take the in-place path.
+        // A rows-only resize reclassifies history in place on every grid shape
+        // (`adjust_row_count_rows_only`), so its history extras and staged rows
+        // survive; only a width change clears and drains them.
         let rows_only = new_cols == old_cols;
         if !rows_only {
             self.storage.ring_extras.clear();
@@ -450,10 +417,8 @@ impl Grid {
         // tells the two apart by this count.
         let staged_before_reflow = self.storage.lazy_buffer.len();
 
-        // The drain just recycled old-width cell bodies; their capacities are
-        // sized for `old_cols`, so across a width change they are dead memory or
-        // a guaranteed realloc. Contents are always cleared and refilled, so
-        // this is only a footprint guard; the pool refills within one batch.
+        // The drain recycled cell bodies sized for `old_cols`: across a width
+        // change they are dead memory or a guaranteed realloc.
         if new_cols != old_cols {
             self.storage.lazy_buffer.clear_pool();
         }
@@ -478,24 +443,19 @@ impl Grid {
             if new_cols < old_cols {
                 self.storage.extras.retain_cols_below(new_cols);
                 // `Row::resize` blanks a wide head the cut leaves without its
-                // continuation, and the head's entry (a cluster, a mark, a link)
-                // goes with it, as every operation that blanks a cell drops
-                // what the cell no longer claims (ruling 2026-10-11, r15
-                // chunking review: the alternate-screen resize fuzzer found
-                // a non-BMP emoji's entry left under the blank).
+                // continuation; the head's entry (a cluster, a mark, a link)
+                // goes with it, as for every blanked cell.
                 for row in 0..self.storage.visible_rows {
                     self.drop_unclaimed_extras(row, new_cols - 1..new_cols);
                 }
             }
         }
 
-        // The column-reflow path rebuilds CellExtras and migrates each cell's
-        // ring-stored non-BMP codepoint into it. The rows-only and no-reflow
-        // paths keep the existing extras and drop both rings in
-        // `invalidate_rings` below, which would turn on-screen non-BMP cells
-        // into U+FFFD; so harvest those codepoints into the HashMap first, at
-        // pre-`adjust_row_count` positions so they ride the same row shift as
-        // combining marks.
+        // The column-reflow path migrates ring-stored non-BMP codepoints into
+        // its fresh CellExtras. The other paths keep the extras and drop both
+        // rings in `invalidate_rings` below, which would turn on-screen non-BMP
+        // cells into U+FFFD: harvest them into the map first, at
+        // pre-`adjust_row_count` positions so they ride the row shift.
         if !(new_cols != old_cols && reflow) {
             self.migrate_complex_ring_to_extras();
             self.migrate_rgb_ring_to_extras();
@@ -511,29 +471,22 @@ impl Grid {
         }
         // Discard CellExtras entries for rows removed by adjust_row_count.
         self.storage.extras.retain_rows_below(new_rows);
-        // Invalidate ring buffers — their stride/visible_rows are stale after
-        // any dimension change. They will be lazily re-created on next write
-        // with the correct dimensions. The reflow-enabled path already creates
-        // a fresh CellExtras, but no-reflow and row-only resize paths do not.
+        // The rings' stride and row count are stale after any dimension change;
+        // they are re-created on the next write.
         self.storage.extras.invalidate_rings();
         self.storage.resize_viewport_state(new_rows, new_cols);
         // A rows-grow that revealed history relabelled the newest ring lines as
-        // the top of the viewport, so every pre-resize viewport row (the
-        // cursor's included) moved `revealed` rows down. The cursor follows, or
-        // an inline TUI's post-SIGWINCH repaint (and CPR answers) anchors wrong.
-        // The column-reflow path tracks its own cursor (`reflow_columns`);
-        // `resize_viewport_state` already clamped, so the shift re-clamps
-        // against the same bound.
+        // the top of the viewport, so every pre-resize viewport row moved
+        // `revealed` rows down; the cursor follows, or an inline TUI's
+        // post-SIGWINCH repaint and CPR answers anchor wrong. The column-reflow
+        // path tracks its own cursor (`reflow_columns`).
         if revealed > 0 && !(new_cols != old_cols && reflow) {
-            // Publish the same shift for the selection, which
-            // `Terminal::finalize_resize` compensates (it lives on the
-            // Terminal). Same guard as the cursor's.
+            // The selection lives on the Terminal: `Terminal::finalize_resize`
+            // applies this shift.
             self.storage.last_resize_row_shift = row_u16(revealed);
             let bound = new_rows.saturating_sub(1);
-            // Live extras follow their rows down too, or a hyperlink/RGB/
-            // combining entry re-attaches to whatever the reveal placed at its
-            // old key. (The rings were invalidated above; this shifts only the
-            // HashMap.)
+            // Live extras follow their rows down too (the rings were
+            // invalidated above; this shifts only the map).
             self.storage
                 .extras
                 .shift_region_down_by(0, bound, row_u16(revealed));
@@ -546,9 +499,7 @@ impl Grid {
             let col = self.storage.clamp_col_for_row(row, self.storage.cursor.col);
             self.storage.set_cursor_position(row, col);
             // The saved cursor moves with its row and is not clamped (DECRC
-            // and the 1049 exit clamp what they read): a slot a shrink left
-            // past the grid, on the blank row it trimmed, stays below the
-            // content it followed, and a later grow restores it there.
+            // and the 1049 exit clamp what they read).
             if self.storage.saved_cursor.valid {
                 self.storage.saved_cursor.cursor.row = self
                     .storage
@@ -570,60 +521,36 @@ impl Grid {
         if let Some(lines) = reflowed_scrollback {
             self.restore_reflowed_scrollback(lines, new_cols, staged_before_reflow);
         }
-        // Bottom-anchor the viewport: a width-grow unwrapped content into fewer
-        // rows, leaving blank rows under the cursor. Pull the newest history
-        // back until the trailing-blank band matches its pre-resize count,
-        // which also rejoins the boundary-straddling line lifted above. Runs at
-        // display_offset 0; on the offloaded path the history is with the
-        // worker, so the fill runs at re-attach instead (`pending_fill_target`).
+        // Bottom-anchor the viewport: pull the newest history back until the
+        // trailing-blank band matches its pre-resize count, rejoining the line
+        // lifted above. The offloaded path holds the history on its worker, so
+        // it fills at re-attach instead (`pending_fill_target`).
         if let Some(target) = pre_trailing_blanks {
             self.fill_viewport_deficit_from_history(target);
         }
-        // Restore the pre-resize reading position. `display_offset` counts from
-        // the LIVE BOTTOM, so replaying it under a different `visible_rows`
-        // slides the content by the row delta — on every height drag, font zoom
-        // and divider drag. A rows-only resize rewraps nothing: a shrink trims
-        // blanks and demotes TOP rows (plus the bottom-push corner, see
-        // `adjust_row_count_rows_only`), a grow appends blanks and, scrolled
-        // back, pulls nothing (the deficit fill is gated to `prev_offset == 0`),
-        // and the bottom append/trim move `absolute_row_counter` with their rows
-        // (`keep_keys_across_bottom_rows`). So an archived line keeps its
-        // absolute number and the anchor is exact. A WIDTH reflow renumbers rows
-        // wholesale, so the clamped offset is the best answer there — staying in
-        // history beats snapping the reader to the live bottom. The anchor can
-        // still clamp on a rows shrink at the retention cap. `Damage::Full`
-        // below subsumes the primitive's targeted damage.
-        //
-        // On the OFFLOADED width path this `min()` is not final: the job holds
-        // all three history layers, so `scrollback_lines()` counts only what the
-        // visible rewrap pushed back and the clamp usually lands at 0.
-        // Re-attach restores from `prev_offset`, and tells this clamp apart from
-        // a reader who chose the live bottom because this is a bare store
-        // assignment, invisible to `reader_live_bottom_gen` (only the reader's
-        // own scroll primitives advance it). The anchor arm is equally
-        // invisible: `display_offset = 0` ran above, so the re-anchor can only
-        // raise the offset.
+        // Restore the reading position. `display_offset` counts from the live
+        // bottom, so replaying it under a different `visible_rows` would slide
+        // the content by the row delta on every height drag. A rows-only resize
+        // keeps every archived line's absolute number, so the anchor is exact;
+        // a width reflow renumbers rows, so the clamped offset is the best
+        // answer there (staying in history beats snapping to the live bottom).
+        // On the offloaded width path this clamp usually lands at 0 and
+        // re-attach restores from `prev_offset`; a bare store assignment does
+        // not advance `reader_live_bottom_gen`, so re-attach can tell it from a
+        // reader who chose the live bottom.
         match prev_anchor {
             Some(anchor) if new_cols == old_cols => self.scroll_to_absolute_row(anchor),
             _ => self.storage.display_offset = prev_offset.min(self.storage.scrollback_lines()),
         }
         self.storage.pages.shrink_to_fit();
         self.storage.damage = Damage::Full;
-        // Reflow rewraps line content, so bump the content generation (it sets
-        // `Damage::Full` directly rather than via a `mark_content_*` wrapper) so
-        // a cached search index and change polls invalidate.
+        // Set directly, not via a `mark_content_*` wrapper: bump the generation
+        // so a cached search index and change polls invalidate.
         self.storage.content_gen += 1;
-        // A width rewrap renumbers rows wholesale: the same logical lines occupy
-        // a different number of rows, so absolute row N names different text.
-        // Bump the epoch for every width reflow, including a narrowing with an
-        // empty scrollback, where the splice sites
-        // (`prepend_ring_scrollback_lines`, the deficit pullback,
-        // `note_bottom_end_renumbered`) all early-return. Neither
-        // `absolute_row_revision` nor `content_gen` expresses that keys moved,
-        // and absolute-row-keyed caches (e.g. the find overlay's highlight
-        // tint) would otherwise replay stale positions. The epoch is a "did it
-        // move" counter, so a double bump is harmless; a missed one gives
-        // silently wrong results.
+        // A width rewrap renumbers rows wholesale: bump the epoch on every width
+        // reflow, a narrowing with empty scrollback included (where the splice
+        // sites all early-return). Absolute-row-keyed caches (the find overlay's
+        // tint) read it; a double bump is harmless, a missed one silently wrong.
         if new_cols != old_cols && reflow {
             self.storage.history_renumber_epoch =
                 self.storage.history_renumber_epoch.saturating_add(1);
@@ -640,19 +567,15 @@ impl Grid {
     /// ConPTY width change: make the viewport's top row a line of its own
     /// instead of the continuation of the newest history line.
     ///
-    /// conhost repaints such a row as a standalone fragment and never rejoins
-    /// it with its head (see [`ResizePolicy`]). The flag also has a cost:
-    /// `take_ring_scrollback_lines` reads a history row whose successor is a
-    /// continuation at its full width, since autowrap filled it. That holds only
-    /// at the width it was filled at; left set across a widen, a later width
-    /// change would read trailing blanks as content and grow blank history
-    /// lines.
+    /// conhost never rejoins such a row with its head (see [`ResizePolicy`]).
+    /// Left set, the flag would also mislead `take_ring_scrollback_lines`, which
+    /// reads a row whose successor is a continuation at its full width: true
+    /// only at the width autowrap filled it at, so after a widen a later width
+    /// change would read trailing blanks as content.
     ///
     /// Addresses row 0 in content coordinates (`ring_head` + history count),
-    /// independent of `display_offset`. Called only from the ConPTY width
-    /// branch of `resize_with_reflow_mode_and_policy`, right after
-    /// `take_scrollback_lines`, so the head was read at its full width; the
-    /// offloaded path reaches it through its inner resize.
+    /// independent of `display_offset`. Called right after
+    /// `take_scrollback_lines` has read the head at its full width.
     fn sever_top_row_continuation(&mut self) {
         let len = self.storage.rows.len();
         if len == 0 || self.storage.visible_rows == 0 {
@@ -703,19 +626,16 @@ impl Grid {
         }
     }
 
-    /// Copy every VISIBLE cell's ring-stored 24-bit fg/bg into the persistent
+    /// Copy every visible cell's ring-stored 24-bit fg/bg into the persistent
     /// extras map, so a resize that does not rebuild the extras by column reflow
-    /// (a same-size or rows-only resize, and EVERY alternate-screen resize) does
-    /// not strip on-screen truecolor when `invalidate_rings` drops the RGB ring.
+    /// (same-size, rows-only, and every alternate-screen resize) keeps on-screen
+    /// truecolor when `invalidate_rings` drops the RGB ring.
     ///
     /// The ring is created lazily by the first ring-stored RGB write after each
-    /// `invalidate_rings`, so a screen with no truecolor written since the last
-    /// resize (and every SECOND resize of a quiet flap) has no ring and nothing
-    /// to harvest: the early-out returns before any cell is read. Otherwise one
-    /// row lookup per row picks the flagged cells (fg/bg overflow, no style id),
-    /// and the writes follow once the row borrow ends. Runs at the
-    /// pre-`adjust_row_count` positions, so the entries ride the same row shift
-    /// as combining marks and links.
+    /// `invalidate_rings`, so with no truecolor since the last resize (the
+    /// second resize of a quiet flap) the early-out returns before reading a
+    /// cell. Runs at the pre-`adjust_row_count` positions, so the entries ride
+    /// the same row shift as combining marks and links.
     fn migrate_rgb_ring_to_extras(&mut self) {
         if !self.storage.extras.has_rgb_ring() {
             return;
@@ -728,9 +648,7 @@ impl Grid {
             flagged.clear();
             if let Some(rw) = self.row(row) {
                 for col in 0..cols {
-                    if let Some(cell) = rw.get(col)
-                        && !cell.uses_style_id()
-                    {
+                    if let Some(cell) = rw.get(col) {
                         let (fg, bg) = (cell.fg_needs_overflow(), cell.bg_needs_overflow());
                         if fg || bg {
                             flagged.push((col, fg, bg));
@@ -762,17 +680,14 @@ impl Grid {
     }
 
     /// Trim (front then back) or grow the row buffer to match `target_rows`.
+    /// Rows a shrink drains are staged into the lazy buffer when a store keeps
+    /// them (`stages_evicted_rows`).
     ///
-    /// When the visible row count decreases, excess front rows (scrollback)
-    /// are pushed to the lazy buffer as `DeferredLine`s before being drained,
-    /// preserving scrollback across height decreases.
-    ///
-    /// Returns how many history lines the viewport revealed on a rows-grow:
-    /// ring-held lines directly above the old viewport that the caller's
-    /// `visible_rows` update relabels as the top of the screen. The caller owes
-    /// the cursor a downward shift by that count, and owes the returned
-    /// `(viewport row, extras)` pairs re-injection into the live map after that
-    /// shift (see `adjust_row_count_rows_only`).
+    /// Returns how many history lines a rows-grow revealed: ring-held lines
+    /// directly above the old viewport that the caller's `visible_rows` update
+    /// relabels as the top of the screen. The caller owes the cursor a downward
+    /// shift by that count, then re-injects the returned `(viewport row,
+    /// extras)` pairs into the live map (see `adjust_row_count_rows_only`).
     fn adjust_row_count(
         &mut self,
         target_rows: u16,
@@ -782,24 +697,19 @@ impl Grid {
         let target = target_rows as usize;
         let old_visible = usize::from(self.storage.visible_rows);
 
-        // A rows-only resize must not shed ring history to fit the viewport on
-        // any grid shape: reclassify viewport rows against ring history in
-        // place. `scrollback_lines()` counts a retained line the same in ring,
-        // lazy buffer or store, so migrating the ring into the store would
-        // express nothing more. Width changes keep the migration below (their
-        // ring history rides take_scrollback_lines / restore).
-        //
-        // `self.storage.cols` is still the pre-resize width here:
-        // `resize_viewport_state` installs `new_cols` only after this returns.
+        // A rows-only resize must not shed ring history to fit the viewport:
+        // reclassify viewport rows against ring history in place. Width
+        // changes keep the migration below (their ring history rides
+        // `take_scrollback_lines` / restore). `self.storage.cols` is still the
+        // pre-resize width here.
         if new_cols == self.storage.cols {
             return self.adjust_row_count_rows_only(target, new_cols, policy);
         }
 
         if self.storage.rows.len() > target {
-            // Bounded-cost counter, rows-only half (see
-            // `tests/reflow/rows_only_cost_bound.rs`). Unreachable while the
-            // early return above stands; a regression routing rows-only work
-            // through the whole-ring migration shows a history-sized number.
+            // Bounded-cost counter (`tests/reflow/rows_only_cost_bound.rs`):
+            // zero while the early return above stands; a rows-only resize
+            // routed through this whole-ring migration would count history.
             #[cfg(any(test, debug_assertions))]
             if new_cols == self.storage.cols {
                 super::count_rows_only_resize_migrated_rows(self.storage.rows.len() - target);
@@ -817,11 +727,9 @@ impl Grid {
             // history rows between tiers (`ResizeShape::pushed`).
             self.storage.last_resize_shape.pushed = row_u16(from_back);
             if from_front > 0 {
-                // Push front rows to lazy scrollback before draining, when a
-                // store that retains lines is attached (as in scroll.rs; without
-                // one drain_lazy_buffer would discard them, after they outlived
-                // the ring rows later scrolls drop), or while the store is
-                // detached for an off-thread reflow (flushed on re-attach).
+                // Stage front rows when a retaining store is attached (without
+                // one `drain_lazy_buffer` would discard them) or detached for an
+                // off-thread reflow (flushed on re-attach).
                 if self.storage.stages_evicted_rows() {
                     let drained_rows: Vec<Row> = self.storage.rows.drain(..from_front).collect();
                     for row in drained_rows {
@@ -829,12 +737,8 @@ impl Grid {
                         // scroll_up. `u16::MAX` as row_idx keeps HashMap-keyed
                         // lookups from attributing visible-row extras to them;
                         // ring lookups use the cell's own index.
-                        let extracted = Self::extract_row_extras(
-                            &row,
-                            &self.storage.extras,
-                            u16::MAX,
-                            self.styles(),
-                        );
+                        let extracted =
+                            Self::extract_row_extras(&row, &self.storage.extras, u16::MAX);
                         self.storage.lazy_buffer.push_row(&row, extracted);
                         // SAFETY: these rows came from storage.rows, and staging
                         // copied their content before returning their allocations.
@@ -859,12 +763,8 @@ impl Grid {
                     let drained_rows: Vec<Row> = self.storage.rows.drain(start..).collect();
                     for (i, row) in drained_rows.into_iter().enumerate() {
                         let external_row = row_u16(start + i - remaining_scrollback);
-                        let extracted = Self::extract_row_extras(
-                            &row,
-                            &self.storage.extras,
-                            external_row,
-                            self.styles(),
-                        );
+                        let extracted =
+                            Self::extract_row_extras(&row, &self.storage.extras, external_row);
                         self.storage.lazy_buffer.push_row(&row, extracted);
                         // SAFETY: the removed row belongs to storage.pages;
                         // the lazy buffer owns its content before this transfer.
@@ -909,41 +809,26 @@ impl Grid {
 
     /// Rows-only [`adjust_row_count`](Self::adjust_row_count), for every grid
     /// shape: reclassify viewport rows against ring history in place, never
-    /// shedding retention to fit the viewport. The retention cap is enforced
-    /// like `scroll_up`'s at-capacity reuse, so surviving lines keep their
-    /// absolute-row identity.
-    ///
-    /// Legal on a tiered grid because a rows-only resize changes no line's
-    /// width or wrap topology, only where the live/history boundary falls in
-    /// the same ring. Removed rows return their cell slices to the same
-    /// PageStore, keeping allocation at the retained-row high-water mark.
-    ///
-    /// Cost: O(|Δrows|), independent of ring depth. At most `visible - target`
-    /// rows leave the ring (past the shrunken cap), and on a tiered grid they
-    /// are staged into the lazy buffer like `scroll_up`'s eviction.
-    ///
-    /// Returns the revealed-history count plus the revealed rows' extracted
-    /// extras for caller-side re-injection (see [`Self::adjust_row_count`]).
+    /// shedding retention to fit the viewport (a rows-only resize changes no
+    /// line's width or wrap topology, only where the live/history boundary
+    /// falls). The retention cap is enforced like `scroll_up`'s at-capacity
+    /// reuse, so surviving lines keep their absolute-row identity. O(|Δrows|),
+    /// independent of ring depth. Returns the revealed-history count plus the
+    /// revealed rows' extras for the caller to re-inject.
     ///
     /// Anchoring, so that shrink+grow is an identity:
     ///
-    /// * Shrink first trims trailing blank rows below the cursor (no fake
-    ///   history), then demotes top rows into the ring (a pure relabel, the
-    ///   inverse of the grow reveal), and only when the cursor sits too high
-    ///   for that pushes the remaining bottom rows into history (content kept,
-    ///   reading order imperfect in that corner).
+    /// * Shrink trims trailing blank rows below the cursor, then demotes top
+    ///   rows into the ring (the inverse of the grow reveal), and only when the
+    ///   cursor sits too high for that pushes the remaining bottom rows into
+    ///   history (content kept, reading order imperfect in that corner).
     /// * Grow reveals newest history at the top (absolute numbering intact, so
-    ///   a scrolled-back reader's anchor stays exact) and hands the revealed
-    ///   rows' `ring_extras` back for re-injection.
+    ///   a scrolled-back reader's anchor stays exact).
     ///
-    /// The identity holds through the ring only while retention can hold the
-    /// demoted rows (`max_scrollback >= demote`). The alternate screen has
-    /// `max_scrollback = 0`, so step 4's cap evicts every demoted row; there
-    /// the resize undo (`grid::resize_undo`) keeps them, and a grow with
-    /// nothing drawn since hands them back (demoted rows via the reveal, pushed
-    /// rows via the bottom append). Once anything is drawn the undo is gone,
-    /// the grow appends blanks, and the flap shifts the screen up by the
-    /// demote count. Each arm's count is recorded in [`crate::ResizeShape`].
+    /// Through the ring the identity holds only while retention can hold the
+    /// demoted rows; with `max_scrollback = 0` (the alternate screen) the
+    /// resize undo (`grid::resize_undo`) keeps them until anything is drawn.
+    /// Each arm's count is recorded in [`crate::ResizeShape`].
     fn adjust_row_count_rows_only(
         &mut self,
         target: usize,
@@ -961,13 +846,11 @@ impl Grid {
             let shrink = visible - target;
             self.storage.linearize_ring();
 
-            // 1) TRIM: trailing blank rows below the cursor are not content;
-            // archiving them would create blank history that a later grow
-            // reveals above real content. Drop them.
+            // 1) Trim: trailing blank rows below the cursor are not content;
+            // archived, a later grow would reveal them above real content.
             let trim = shrink.min(self.trailing_blank_rows_below_cursor());
             self.storage.last_resize_shape.trimmed = row_u16(trim);
-            // A trimmed row is blank, so the undo keeps only its place: the
-            // grow that hands it back appends a blank row, as it always has.
+            // A trimmed row is blank: the undo keeps only its place.
             if let Some(undo) = self.storage.resize_undo.as_mut() {
                 undo.entries
                     .extend(std::iter::repeat_with(|| UndoRow::Trimmed).take(trim));
@@ -977,16 +860,14 @@ impl Grid {
                 self.storage.recycle_rows(keep..self.storage.rows.len());
                 self.storage.total_lines = keep;
                 // Their extras keys land >= `target` after the demote shift
-                // below and are swept by the caller's `retain_rows_below`.
-                // Under either policy the counter drops with the rows, so
-                // `oldest_absolute_row()` (`counter − retained_total`) stays put
-                // and every surviving row keeps its key
-                // (`keep_keys_across_bottom_rows`).
+                // and are swept by the caller's `retain_rows_below`. The
+                // counter drops with the rows, so every surviving row keeps its
+                // key.
                 self.keep_keys_across_bottom_rows(BottomRows::Trimmed(trim));
             }
             let remaining = shrink - trim;
 
-            // 2) TOP-DEMOTE: the top `demote` viewport rows become the newest
+            // 2) Top-demote: the top `demote` viewport rows become the newest
             // history, a pure relabel (they already sit directly above the
             // surviving viewport in the linearized ring). Capped at the cursor
             // row so the cursor's line stays visible.
@@ -1006,7 +887,6 @@ impl Grid {
                         &self.storage.rows[hist + i],
                         &self.storage.extras,
                         row_u16(i),
-                        self.styles(),
                     );
                     self.storage.push_ring_extras(extracted);
                 }
@@ -1030,15 +910,12 @@ impl Grid {
             let bottom_push = remaining - demote;
             self.storage.last_resize_shape.demoted = row_u16(demote);
             self.storage.last_resize_shape.pushed = row_u16(bottom_push);
-            // Selection handling depends on which shape ran. A pure top-demote
-            // moves every row by exactly `demote`, so the selection is
-            // remappable (`TextSelection::adjust_for_rows_shrink`); hosts caching
-            // grid coordinates still re-translate (`invalidate_host_coordinates`).
-            // The bottom-push corner rotates bottom rows below existing history,
-            // a non-monotonic map, so there the selection is invalidated.
-            //
-            // `last_resize_row_shift` carries `demote`, not `visible - target`:
-            // the trim moves nothing.
+            // A pure top-demote moves every row by exactly `demote`, so the
+            // selection is remappable (`TextSelection::adjust_for_rows_shrink`)
+            // and only host-cached coordinates re-translate. The bottom-push
+            // corner rotates bottom rows below existing history, a
+            // non-monotonic map, so it invalidates the selection. The trim
+            // moves nothing, so the shift is `demote`.
             self.storage.last_resize_row_shift = row_u16(demote);
             if bottom_push > 0 {
                 self.force_selection_invalidation();
@@ -1046,15 +923,13 @@ impl Grid {
                 self.invalidate_host_coordinates();
             }
 
-            // 3) BOTTOM-PUSH CORNER: the cursor sits too near the top (a full,
-            // non-blank screen with the cursor high, typical of a TUI). Push the
-            // bottom rows as newest history: nothing is lost, and the demote
-            // above has kept the cursor's line on screen.
+            // 3) Bottom-push corner: the cursor sits too near the top (a full
+            // screen with the cursor high, typical of a TUI). Push the bottom
+            // rows as newest history; the demote kept the cursor's line.
             if bottom_push > 0 {
                 let hist_after_demote = hist + demote;
-                // Extras of the pushed rows, keyed by their CURRENT visible
-                // rows (post-demote-shift): the pushed rows are the bottom
-                // `bottom_push` of the surviving viewport.
+                // The pushed rows are the bottom `bottom_push` of the surviving
+                // viewport; their extras are keyed by post-demote visible row.
                 let surviving = visible - trim - demote;
                 while self.storage.ring_extras.len() < hist_after_demote {
                     self.storage.ring_extras.push_back(None);
@@ -1064,29 +939,25 @@ impl Grid {
                         &self.storage.rows[hist_after_demote + i],
                         &self.storage.extras,
                         row_u16(i),
-                        self.styles(),
                     );
                     self.storage.push_ring_extras(extracted);
                 }
                 self.storage.rows[hist_after_demote..].rotate_left(target);
             }
 
-            // 4) RETENTION CAP: evict the oldest past a full ring, like
+            // 4) Retention cap: evict the oldest past a full ring, like
             // scroll_up's at-capacity eviction. Bounded by the height delta
-            // (`total_lines <= visible + max_scrollback` on entry). Removed row
-            // bodies return to the arena after their content is preserved.
+            // (`total_lines <= visible + max_scrollback` on entry).
             let excess =
                 (self.storage.total_lines - target).saturating_sub(self.storage.max_scrollback);
             if excess > 0 {
-                // Bounded-cost counter, rows-only half: must stay O(height
-                // delta), never O(history) (`tests/reflow/rows_only_cost_bound.rs`).
+                // Bounded-cost counter: O(height delta), never O(history).
                 #[cfg(any(test, debug_assertions))]
                 super::count_rows_only_resize_migrated_rows(excess);
-                // A tiered store (or one detached for an off-thread reflow)
-                // keeps retention past the ring, so evicted rows are staged into
-                // the lazy buffer (extras moved via `push_row_boxed`), as in
-                // `scroll_up`. Without a store the ring cap is the retention
-                // limit and they drop.
+                // A tiered store (attached or detached for an off-thread
+                // reflow) keeps retention past the ring, so evicted rows are
+                // staged into the lazy buffer, as in `scroll_up`. Without one
+                // the ring cap is the retention limit.
                 if self.storage.stages_evicted_rows() {
                     for i in 0..excess {
                         let extras = self.storage.ring_extras.pop_front().flatten();
@@ -1135,15 +1006,12 @@ impl Grid {
             }
         } else if target > visible {
             if policy == ResizePolicy::ConPty {
-                // CONPTY GROW: append the whole delta as fresh blank rows at
-                // the BOTTOM and reveal nothing. conhost repaints the viewport
-                // row-0-anchored and paints the grown rows `CSI K` (measured
-                // 24→40 and 16→30 — see `ResizePolicy`), so a line the Native
-                // reveal moved into the viewport would be painted over and,
-                // gone from the ring history, lost. Appending keeps history,
-                // viewport and cursor row where conhost keeps them;
-                // `ring_extras` are untouched because no row changes tier, and
-                // the counter moves with the appended rows, so no key slides.
+                // ConPTY grow: append the whole delta as blank rows at the
+                // bottom and reveal nothing. conhost paints the grown rows
+                // `CSI K` (see `ResizePolicy`), so a line the Native reveal
+                // moved into the viewport would be painted over and lost. No
+                // row changes tier, so `ring_extras` are untouched; the counter
+                // moves with the appended rows, so no key slides.
                 self.storage.linearize_ring();
                 let rows_to_add = target - visible;
                 let rows = &mut self.storage.rows;
@@ -1158,15 +1026,14 @@ impl Grid {
                 self.keep_keys_across_bottom_rows(BottomRows::Appended(rows_to_add));
                 return (0, Vec::new());
             }
-            // GROW: reveal up to (target - visible) newest history lines by pure
-            // reclassification: they already sit directly above the viewport, so
-            // the caller's visible_rows update relabels them with absolute
+            // Grow: reveal up to (target - visible) newest history lines by pure
+            // reclassification: they already sit directly above the viewport,
+            // so the caller's visible_rows update relabels them with absolute
             // numbering intact. Their `ring_extras` go back to the caller for
-            // re-injection after it shifts the old viewport's extras down by
-            // `revealed`; injected here, they would ride that shift.
-            // Resize undo (`resize_undo`): hand back, newest first, the rows the
-            // shrink(s) took. Demoted rows go back above the viewport as history
-            // for the reveal below; pushed rows and trimmed blanks come back
+            // re-injection after it shifts the old viewport's extras down;
+            // injected here, they would ride that shift. First the resize undo
+            // hands back, newest first, the rows the shrinks took: demoted rows
+            // above the viewport for the reveal, pushed rows and trimmed blanks
             // top-first for the bottom append.
             let restored_bottom = self.take_undo_rows(target - visible, new_cols);
             let hist = self.storage.total_lines - visible;
@@ -1187,9 +1054,7 @@ impl Grid {
             }
             // Pushed rows come back at the bottom, where the shrink took them,
             // with extras at their final rows (injected by the caller after its
-            // reveal shift). Trimmed blanks come back in place among them
-            // (top-first pop order): a trim stacked above a push stays above it
-            // (`take_undo_rows`).
+            // reveal shift); trimmed blanks come back in place among them.
             let mut blanks_restored = 0;
             if !restored_bottom.is_empty() {
                 // Appended in order after the viewport, as the blank append
@@ -1220,12 +1085,10 @@ impl Grid {
                 self.storage.total_lines += n;
                 self.storage.last_resize_shape.restored_bottom = row_u16(pushed);
                 self.storage.last_resize_shape.appended = row_u16(blanks_restored);
-                // A trimmed blank comes back as the trim took it: the counter
-                // rises with it (the trim lowered it), so no key moves. A
-                // PUSHED row comes back under a fixed counter — the shrink's
-                // eviction raised `oldest_absolute_row()` by it and this lowers
-                // it again, the exact inverse — which renumbers the rows the
-                // push renumbered (`note_bottom_end_renumbered`).
+                // A trimmed blank comes back with the counter rising (the trim
+                // lowered it), so no key moves. A pushed row comes back under a
+                // fixed counter, the inverse of the shrink's eviction, which
+                // renumbers the rows the push renumbered.
                 self.keep_keys_across_bottom_rows(BottomRows::Appended(blanks_restored));
                 if pushed > 0 {
                     self.note_bottom_end_renumbered();
@@ -1255,52 +1118,37 @@ impl Grid {
         (0, Vec::new())
     }
 
-    /// Record that a rows-only resize RENUMBERED retained rows: the one arm
-    /// left that changes the retained-line total under a fixed counter is the
-    /// resize undo handing a PUSHED row back to the bottom of a grid that keeps
-    /// no history (the alternate screen), the exact inverse of the shrink whose
-    /// eviction pushed it.
+    /// Record that a rows-only resize renumbered retained rows: the resize undo
+    /// handing a pushed row back to the bottom of a grid that keeps no history
+    /// changes the retained total under a fixed counter, the exact inverse of
+    /// the shrink whose eviction pushed it.
     ///
-    /// `oldest_absolute_row()` is `absolute_row_counter − visible_rows −
-    /// scrollback_lines()`, i.e. `counter − retained_total`. Moving rows ACROSS
-    /// the live/history boundary (the grow-side reveal, the shrink-side
-    /// top-demote) keeps `retained_total` fixed and is the pure relabel the
-    /// resize docs describe. The shrink's trailing-blank TRIM and the grow's
-    /// blank APPEND move the counter with their rows
-    /// ([`Self::keep_keys_across_bottom_rows`]) under both policies, so they
-    /// renumber nothing.
-    ///
-    /// That is the definition of the epoch this bumps: a wholesale history
-    /// renumbering invisible to the `(content_gen, absolute_row_revision,
-    /// geometry)` key set. Without it, absolute-row-keyed caches carried
-    /// pre-shift keys forward. Same reasoning and the same fix as the Kitty
-    /// unscroll (`scroll_unscroll.rs`) and the scrollback rewrap
-    /// (`scrollback_reflow.rs`): a spurious rebuild is harmless, a missed one
-    /// is silently wrong results.
+    /// `oldest_absolute_row()` is `counter − retained_total`. Moving rows across
+    /// the live/history boundary (reveal, top-demote) keeps the total fixed; the
+    /// trim and the blank append move the counter with their rows
+    /// ([`Self::keep_keys_across_bottom_rows`]). The epoch flags a renumbering
+    /// the `(content_gen, absolute_row_revision, geometry)` keys cannot see, as
+    /// in the Kitty unscroll and the scrollback rewrap.
     fn note_bottom_end_renumbered(&mut self) {
         self.storage.history_renumber_epoch = self.storage.history_renumber_epoch.saturating_add(1);
     }
 
-    /// Move `absolute_row_counter` WITH the rows a rows-only resize appended
-    /// at or trimmed from the bottom, so `oldest_absolute_row()` (`counter −
-    /// retained_total`) stays put and every retained row keeps its key — under
-    /// BOTH policies. Nothing is renumbered, so the epoch does
-    /// not move and absolute-row-keyed caches refresh instead of rebuilding,
-    /// and the counter never falls below the retained total, so
-    /// `oldest_absolute_row()` never saturates and always names the same row
-    /// `visible_to_absolute` does: a shell's OSC 133 marks are recorded by one
-    /// and read back (`line`, `blocks`, `blocktext`) by the other.
+    /// Move `absolute_row_counter` with the rows a rows-only resize appended at
+    /// or trimmed from the bottom, under both policies, so `oldest_absolute_row()`
+    /// (`counter − retained_total`) stays put and every retained row keeps its
+    /// key. Nothing is renumbered, so the epoch does not move, and the counter
+    /// never falls below the retained total, so `oldest_absolute_row()` always
+    /// names the same row `visible_to_absolute` does: a shell's OSC 133 marks
+    /// are recorded by one and read back by the other.
     ///
     /// Appended rows take fresh keys above every key in use. Trimmed rows were
     /// blank rows below the cursor, and their keys go to the rows that next
-    /// appear there, as conhost's own buffer does. Those keys named live rows
-    /// only (no mark sits below the cursor), and the history-row memo in
-    /// `visible_row_view` keys on `content_gen`, which every resize bumps, so
-    /// a reused key cannot hit a stale memo entry.
+    /// appear there, as in conhost's buffer. Those keys named live rows only,
+    /// and the history-row memo in `visible_row_view` keys on `content_gen`,
+    /// which every resize bumps, so a reused key cannot hit a stale entry.
     ///
     /// A reader aim held across an off-thread reflow reads the counter's rise
-    /// as lines scrolled into history, so its `at_counter` moves by the same
-    /// amount.
+    /// as lines scrolled into history, so its `at_counter` moves with it.
     fn keep_keys_across_bottom_rows(&mut self, rows: BottomRows) {
         let moved = |counter: u64| match rows {
             BottomRows::Appended(n) => counter.saturating_add(n as u64),
@@ -1317,11 +1165,10 @@ impl Grid {
 
     /// The inverse of [`Self::extract_row_extras`]: re-attach a revealed ring
     /// row's extracted extras to its viewport row in the live map. Demote and
-    /// reveal are pure relabels, so the cells' `is_complex`/RGB-overflow
-    /// markers still point here; the side-table entries need reseating, and the
-    /// cells whose links, clusters and marks come back claim them again
-    /// (`cell_extra_mut` sets HAS_EXTRAS): the row may have lost the bit on its
-    /// way into history, and an unclaimed mark is neither drawn nor copied.
+    /// reveal are pure relabels, so the cells' `is_complex`/RGB-overflow markers
+    /// still point here. The cells claim their entries again (`cell_extra_mut`
+    /// sets HAS_EXTRAS): the row may have lost the bit on its way into history,
+    /// and an unclaimed mark is neither drawn nor copied.
     fn inject_scrolled_extras(&mut self, row_idx: u16, e: &ScrolledRowExtras) {
         for span in &e.hyperlinks {
             for col in span.start_col..span.end_col {
@@ -1357,6 +1204,50 @@ impl Grid {
                 .get_or_create(CellCoord::new(row_idx, *col))
                 .set_bg_rgb(Some(*rgb));
         }
+        // The two channels the extractor carries without a per-column map, as the
+        // history readers restore them (`restore_image_spans`,
+        // `mirror_wide_spacer_extras`): the image spans, and the spacers' inherited
+        // values. An image goes through the map's own entry point, which re-arms the
+        // scroll-off image scan (an ED 2 while the row was in history disarmed it).
+        let cols = self.storage.cols;
+        let mut budget = usize::from(cols) * crate::extra::MAX_IMAGE_LAYERS;
+        'images: for span in &e.images {
+            for col in span.start_col..span.end_col.min(cols) {
+                if budget == 0 {
+                    break 'images;
+                }
+                if let Some(layer) = super::scroll_materialize::span_layer_at(span, col) {
+                    let _ = self.storage.cell_extra_mut(row_idx, col);
+                    self.storage
+                        .extras
+                        .stack_image(CellCoord::new(row_idx, col), layer);
+                }
+                budget -= 1;
+            }
+        }
+        let spacers: Vec<u16> = self
+            .storage
+            .row_at_screen(row_idx)
+            .map(|row| {
+                let cells = row.as_slice();
+                (1..cells.len())
+                    .filter(|&i| super::scroll_convert::is_spacer(cells, i))
+                    .filter_map(|i| u16::try_from(i).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for spacer in spacers {
+            let lead = CellCoord::new(row_idx, spacer - 1);
+            let Some(values) = self
+                .storage
+                .extras
+                .get(lead)
+                .and_then(super::scroll_materialize::SpacerValues::of)
+            else {
+                continue;
+            };
+            values.fill(self.storage.cell_extra_mut(row_idx, spacer));
+        }
     }
 
     /// Reflow lines when column count changes.
@@ -1386,21 +1277,12 @@ impl Grid {
 
     /// Pad or truncate to target row count and update grid state after reflow.
     ///
-    /// When shrinking columns produces more rows than `target_rows`, excess top
-    /// rows are pushed to scrollback (lazy buffer) before truncation,
-    /// preserving cursor content.
-    ///
-    /// Old grid data is dropped before padding rows are allocated, lowering
-    /// peak memory during resize.
-    ///
-    /// Under [`ResizePolicy::ConPty`] the count pushed is the one conhost
-    /// demotes (see [`Self::conpty_reflow_demote`]), not the Native minimum
-    /// that only brings the cursor on screen.
-    ///
-    /// The lazy buffer is only where the pushed rows wait: they are the newest
-    /// history, and `restore_reflowed_scrollback`, which every width reflow
-    /// runs after this, gives them their seat (a store that retains lines, or
-    /// the ring under its cap) once the older history is back.
+    /// When the rewrap produced more rows than `target_rows`, excess top rows
+    /// are staged in the lazy buffer: Native pushes only what brings the
+    /// cursor on screen, ConPTY what conhost demotes
+    /// ([`Self::conpty_reflow_demote`]). They are the newest history, and
+    /// `restore_reflowed_scrollback`, which every width reflow runs after this,
+    /// seats them once the older history is back.
     fn finalize_reflow(
         &mut self,
         target_rows: u16,
@@ -1410,9 +1292,6 @@ impl Grid {
     ) {
         let target_rows = usize::from(target_rows);
 
-        // Push excess top rows to scrollback. Native pushes only the minimum
-        // that brings an overflowing cursor into view; ConPTY pushes what
-        // conhost demotes.
         let push_count = if policy == ResizePolicy::ConPty {
             Self::conpty_reflow_demote(&result, target_rows)
         } else if result.rows.len() > target_rows && result.cursor_row >= target_rows {
@@ -1427,8 +1306,7 @@ impl Grid {
             let drained_rows: Vec<Row> = result.rows.drain(..push_count).collect();
             for (i, row) in drained_rows.into_iter().enumerate() {
                 let row_idx = u16::try_from(i).unwrap_or(u16::MAX);
-                let extracted =
-                    Self::extract_row_extras(&row, &result.extras, row_idx, self.styles());
+                let extracted = Self::extract_row_extras(&row, &result.extras, row_idx);
                 self.storage.lazy_buffer.push_row(&row, extracted);
                 // SAFETY: reflow built these rows in result.pages, not the old
                 // storage.pages. The lazy buffer now owns the preserved data.
@@ -1499,17 +1377,14 @@ impl Grid {
     /// How many top rows of a rewrapped viewport conhost demotes to its
     /// scrollback when a ConPTY width change leaves more rows than fit: the
     /// rows carrying content (through the cursor's row and the last non-blank
-    /// row, so blank rows under the cursor are dropped) minus the target
-    /// height, at most the rows above the cursor. This is the rows-only
-    /// shrink's trim + top-demote applied to the rewrapped rows.
+    /// row) minus the target height, at most the rows above the cursor; the
+    /// rows-only shrink's trim + top-demote applied to the rewrapped rows.
     ///
     /// The Native count (only what brings the cursor on screen) loses a line
-    /// under conhost whenever a non-blank row sits below the cursor (e.g.
-    /// PSReadLine's `>>`): conhost's row-0 repaint overwrites the row Native
-    /// left at the top.
-    ///
-    /// The count relies on `result.cursor_row` keeping the cursor's row
-    /// through the cursor's cell (`cursor_row_copy_len`).
+    /// under conhost whenever a non-blank row sits below the cursor (PSReadLine's
+    /// `>>`): conhost's row-0 repaint overwrites the row Native left at the top.
+    /// Relies on `result.cursor_row` keeping the cursor's row through the
+    /// cursor's cell (`cursor_row_copy_len`).
     fn conpty_reflow_demote(result: &ReflowResult, target_rows: usize) -> usize {
         let content_rows = result
             .rows
@@ -1524,16 +1399,11 @@ impl Grid {
 
     /// Rewrap the visible rows to a new column count, in either direction.
     ///
-    /// Soft-wrapped continuation runs are merged into their logical line first
-    /// and then re-chunked at the new width, for a shrink as well as a grow,
-    /// so rows come out canonical (`24,24,…`, not ragged `24,6,24,6,…`).
-    ///
-    /// Reads rows directly from the ring buffer instead of cloning the grid; a
-    /// reusable merge buffer handles continuation concatenation without
-    /// per-line allocations.
-    ///
-    /// The live cursor and the saved one ride the rewrap to the cells their
-    /// text lands on (`RewrapCursors`).
+    /// Soft-wrapped continuation runs are merged into their logical line and
+    /// re-chunked at the new width, so rows come out canonical (`24,24,…`, not
+    /// ragged `24,6,24,6,…`). Rows are read in place from the ring through one
+    /// reusable merge buffer. The live and saved cursors ride the rewrap to the
+    /// cells their text lands on (`RewrapCursors`).
     fn reflow_rewrap_columns(
         &mut self,
         target_rows: u16,
@@ -1811,9 +1681,9 @@ impl Grid {
             }
         }
 
-        // ConPTY: a cursor on the line's LAST row keeps every cell through its
-        // own (`cursor_row_copy_len`). On an earlier row the autowrap pad above
-        // already reaches past the cursor, so only the last row can need it.
+        // ConPTY: a cursor on the line's last row keeps every cell through its
+        // own (`cursor_row_copy_len`); on an earlier row the autowrap pad
+        // already reaches past the cursor.
         if keep_cursor_cell
             && cursor_row == row_idx
             && let Some(row) = self.row(row_u16(row_idx))
@@ -1847,8 +1717,7 @@ impl Grid {
             let first_idx = new_rows.len();
             let mut points = RewrapCursors::points(offsets);
             let mut extras_ctx = ExtrasCopyCtx {
-                // MERGE path: cells span several source rows, so the explicit
-                // (reused) coord table is required — not pure row arithmetic.
+                // Cells span several source rows: index the coord table.
                 source: if old_extras.is_some() {
                     ExtrasSource::Coords(merge_coords.as_slice())
                 } else {
@@ -1883,76 +1752,23 @@ impl Grid {
 mod tests {
     use super::*;
 
-    // =========================================================================
-    // ReflowMode conversion
-    // =========================================================================
-
-    #[test]
-    fn reflow_mode_from_true() {
-        assert_eq!(ReflowMode::from(true), ReflowMode::Enabled);
-    }
-
-    #[test]
-    fn reflow_mode_from_false() {
-        assert_eq!(ReflowMode::from(false), ReflowMode::Disabled);
-    }
-
-    // =========================================================================
-    // Resize dimension bounds (§5.8 ingress clamp)
-    // =========================================================================
+    // Resize dimension bounds (the ingress clamp).
 
     #[test]
     fn resize_clamps_oversize_dimensions() {
-        let mut grid = Grid::new(5, 10);
-        grid.resize(u16::MAX, u16::MAX);
-        assert_eq!(grid.rows(), MAX_GRID_ROWS);
-        assert_eq!(grid.cols(), MAX_GRID_COLS);
-        grid.assert_invariants();
-    }
-
-    #[test]
-    fn resize_no_reflow_clamps_oversize_dimensions() {
-        let mut grid = Grid::new(5, 10);
-        grid.resize_no_reflow(u16::MAX, u16::MAX);
-        assert_eq!(grid.rows(), MAX_GRID_ROWS);
-        assert_eq!(grid.cols(), MAX_GRID_COLS);
-        grid.assert_invariants();
-    }
-
-    // =========================================================================
-    // Grid-level reflow: narrower -> wider -> same width
-    // =========================================================================
-
-    #[test]
-    fn reflow_same_width_is_identity() {
-        let mut grid = Grid::new(5, 10);
-        for c in "ABCDEFGHIJ".chars() {
-            grid.write_char(c);
+        for reflow in [true, false] {
+            let mut grid = Grid::new(5, 10);
+            if reflow {
+                grid.resize(u16::MAX, u16::MAX);
+            } else {
+                grid.resize_no_reflow(u16::MAX, u16::MAX);
+            }
+            assert_eq!((grid.rows(), grid.cols()), (MAX_GRID_ROWS, MAX_GRID_COLS));
+            grid.assert_invariants();
         }
-        grid.set_cursor(0, 5);
-
-        // Resize to same width: no reflow should occur.
-        grid.resize(5, 10);
-
-        assert_eq!(grid.row(0).unwrap().to_string(), "ABCDEFGHIJ");
-        assert_eq!(grid.cursor_col(), 5);
-        assert_eq!(grid.cursor_row(), 0);
-        grid.assert_invariants();
     }
 
-    #[test]
-    fn reflow_shrink_single_char_line() {
-        let mut grid = Grid::new(3, 10);
-        grid.write_char('X');
-        grid.set_cursor(0, 0);
-
-        grid.resize(3, 5);
-
-        assert_eq!(grid.row(0).unwrap().to_string(), "X");
-        assert_eq!(grid.cursor_row(), 0);
-        assert_eq!(grid.cursor_col(), 0);
-        grid.assert_invariants();
-    }
+    // Grid-level reflow: narrower -> wider -> same width.
 
     #[test]
     fn reflow_shrink_to_1_column() {
@@ -1964,115 +1780,13 @@ mod tests {
 
         grid.resize(5, 1);
 
-        // Each character should end up on its own row.
         assert_eq!(grid.row(0).unwrap().to_string(), "A");
         assert_eq!(grid.row(1).unwrap().to_string(), "B");
         assert_eq!(grid.row(2).unwrap().to_string(), "C");
         assert_eq!(grid.row(3).unwrap().to_string(), "D");
-        // Rows 1-3 should be wrapped continuations.
         assert!(grid.row(1).unwrap().is_wrapped());
         assert!(grid.row(2).unwrap().is_wrapped());
         assert!(grid.row(3).unwrap().is_wrapped());
-        grid.assert_invariants();
-    }
-
-    #[test]
-    fn reflow_grow_from_1_column() {
-        let mut grid = Grid::new(5, 4);
-        for c in "ABCD".chars() {
-            grid.write_char(c);
-        }
-
-        // Shrink to 1 col then grow back.
-        grid.resize(5, 1);
-        grid.resize(5, 4);
-
-        assert_eq!(grid.row(0).unwrap().to_string(), "ABCD");
-        grid.assert_invariants();
-    }
-
-    #[test]
-    fn reflow_shrink_multiple_lines() {
-        let mut grid = Grid::new(5, 10);
-        // Line 0: "ABCDEFGHIJ"
-        for c in "ABCDEFGHIJ".chars() {
-            grid.write_char(c);
-        }
-        grid.line_feed();
-        grid.carriage_return();
-        // Line 1: "12345"
-        for c in "12345".chars() {
-            grid.write_char(c);
-        }
-
-        grid.resize(5, 5);
-
-        // Line 0 splits into 2 rows, Line 1 fits in 1 row.
-        assert_eq!(grid.row(0).unwrap().to_string(), "ABCDE");
-        assert_eq!(grid.row(1).unwrap().to_string(), "FGHIJ");
-        assert_eq!(grid.row(2).unwrap().to_string(), "12345");
-        assert!(grid.row(1).unwrap().is_wrapped());
-        assert!(!grid.row(2).unwrap().is_wrapped());
-        grid.assert_invariants();
-    }
-
-    #[test]
-    fn reflow_grow_merges_only_soft_wrapped() {
-        let mut grid = Grid::new(5, 5);
-        // Write "ABCDE" on row 0.
-        for c in "ABCDE".chars() {
-            grid.write_char(c);
-        }
-        // Hard line break.
-        grid.line_feed();
-        grid.carriage_return();
-        // Write "12345" on row 1.
-        for c in "12345".chars() {
-            grid.write_char(c);
-        }
-
-        // Neither row is wrapped (hard breaks). Growing should NOT merge them.
-        grid.resize(5, 20);
-
-        assert_eq!(grid.row(0).unwrap().to_string(), "ABCDE");
-        assert_eq!(grid.row(1).unwrap().to_string(), "12345");
-        grid.assert_invariants();
-    }
-
-    #[test]
-    fn reflow_cursor_tracking_through_shrink_grow_roundtrip() {
-        let mut grid = Grid::new(5, 10);
-        for c in "ABCDEFGHIJ".chars() {
-            grid.write_char(c);
-        }
-        grid.set_cursor(0, 7); // on 'H'
-
-        grid.resize(5, 5);
-        // After shrink: "ABCDE" on row 0, "FGHIJ" on row 1.
-        // Cursor was at logical offset 7 -> row 1, col 2.
-        assert_eq!(grid.cursor_row(), 1);
-        assert_eq!(grid.cursor_col(), 2);
-
-        grid.resize(5, 10);
-        // After grow: "ABCDEFGHIJ" on row 0.
-        // Cursor should map back to row 0, col 7.
-        assert_eq!(grid.cursor_row(), 0);
-        assert_eq!(grid.cursor_col(), 7);
-        grid.assert_invariants();
-    }
-
-    #[test]
-    fn reflow_disabled_does_not_wrap() {
-        let mut grid = Grid::new(5, 10);
-        for c in "ABCDEFGHIJ".chars() {
-            grid.write_char(c);
-        }
-
-        grid.resize_with_reflow_mode(5, 5, ReflowMode::Disabled);
-
-        // Content truncated, not wrapped.
-        assert_eq!(grid.row(0).unwrap().to_string(), "ABCDE");
-        assert!(grid.row(1).unwrap().is_empty());
         grid.assert_invariants();
     }
 
@@ -2091,18 +1805,14 @@ mod tests {
             }
         }
 
-        // Growing with reflow disabled should NOT unwrap.
         grid.resize_with_reflow_mode(5, 20, ReflowMode::Disabled);
 
-        // Rows should remain separate (no merge).
         assert_eq!(grid.row(0).unwrap().to_string(), "ABCDE");
         assert_eq!(grid.row(1).unwrap().to_string(), "FGHIJ");
         grid.assert_invariants();
     }
 
-    // =========================================================================
-    // ResizePolicy::ConPty: the seam accounting conhost's repaint requires
-    // =========================================================================
+    // ResizePolicy::ConPty: the seam accounting conhost's repaint requires.
 
     /// Ten `L<i>` lines on a 4-row grid with history: `L0..L6` in the ring
     /// history, `L7 L8 L9 <blank>` on screen, cursor on the blank row.
@@ -2120,11 +1830,9 @@ mod tests {
         grid
     }
 
-    /// A ConPTY rows-grow appends the whole delta as blank rows at the bottom:
-    /// the ring history is untouched, the old viewport rows stay at rows 0..,
-    /// the cursor row is unchanged, no row shift is published for the
-    /// selection — and the counter moved with the appended rows, so every
-    /// retained row kept its absolute key and nothing was renumbered.
+    /// A ConPTY rows-grow appends blank rows at the bottom: history, viewport
+    /// rows and cursor row stay put, no row shift is published, and the counter
+    /// moves with the appended rows, so no key moves and nothing is renumbered.
     #[test]
     fn conpty_rows_grow_appends_blanks_and_reveals_nothing() {
         let mut grid = ten_lines_in_four_rows();
@@ -2226,9 +1934,8 @@ mod tests {
         grid.assert_invariants();
     }
 
-    /// The contrast that makes the test above two-sided: the Native grow on
-    /// the same grid REVEALS the four newest history lines at the top — the
-    /// move conhost's repaint then paints over.
+    /// Contrast: the Native grow on the same grid reveals the four newest
+    /// history lines at the top, the move conhost's repaint paints over.
     #[test]
     fn native_rows_grow_still_reveals_history() {
         let mut grid = ten_lines_in_four_rows();
@@ -2278,10 +1985,8 @@ mod tests {
     }
 
     /// A ConPTY widen neither lifts the boundary continuation into the history
-    /// rewrap nor fills the viewport from history: the tail stays at row 0 as
-    /// the standalone fragment conhost repaints there, the head stays the one
-    /// history line (conhost's scrollback keeps it unmerged too), and the rows
-    /// below are untouched.
+    /// rewrap nor fills the viewport from history: the tail stays at row 0 as a
+    /// standalone fragment and the head stays the one history line.
     #[test]
     fn conpty_widen_skips_the_boundary_lift_and_the_deficit_fill() {
         let mut grid = boundary_straddling_line();
@@ -2304,9 +2009,8 @@ mod tests {
     }
 
     /// A ConPTY width round trip leaves the history exactly as it was: the
-    /// head re-enters every later rewrap at the 10 chars it holds, not at the
-    /// 20-col width its ring row was rebuilt to. Fails with the sever removed:
-    /// the still-flagged fragment makes the next take read the head's 10
+    /// head re-enters every later rewrap at the 10 chars it holds. Without the
+    /// sever, the still-flagged fragment makes the next take read the head's
     /// trailing blanks as content, and 20→10 adds a blank history line.
     #[test]
     fn conpty_width_round_trip_keeps_the_history_line_count() {
@@ -2366,9 +2070,8 @@ mod tests {
     }
 
     /// `rows` rows labelled `R0`, `R1`, … (every row non-blank), cursor parked on
-    /// `cursor_row`, ring retention `max_scrollback` — 0 is the alternate
-    /// screen's shape (`Grid::with_scrollback(rows, cols, 0)` in the DEC 47/1049
-    /// handlers).
+    /// `cursor_row`, ring retention `max_scrollback` (0 is the alternate
+    /// screen's shape).
     fn labelled_screen(rows: u16, cursor_row: u16, max_scrollback: usize) -> Grid {
         let mut grid = Grid::with_scrollback(rows, 10, max_scrollback);
         for r in 0..rows {
@@ -2381,13 +2084,9 @@ mod tests {
         grid
     }
 
-    /// `ResizeShape` names each arm a resize ran, with its count: TRIM below the
-    /// cursor, TOP-DEMOTE, the BOTTOM-PUSH corner, the grow's REVEAL and blank
-    /// APPEND, and the width rewrap. The retention-0 rows are the alternate
-    /// screen's flap: the shrink's demote is evicted from the ring but kept by
-    /// the resize undo, so the grow hands it back (`restored_top`) and the flap
-    /// is an identity; with a write between the halves the undo is gone, the
-    /// grow can only append, and the screen stays shifted up by the demote count.
+    /// `ResizeShape` names each arm a resize ran, with its count: trim,
+    /// top-demote, bottom-push, the grow's reveal and blank append, and the
+    /// width rewrap; with retention 0, the resize undo's stash and hand-back.
     #[test]
     fn last_resize_shape_in_the_trim_demote_and_bottom_push_regimes() {
         use crate::ResizeShape;
@@ -2400,7 +2099,7 @@ mod tests {
             ..ResizeShape::default()
         };
 
-        // TRIM: two content rows, cursor on the second, four blank rows below.
+        // Trim: two content rows, cursor on the second, four blank rows below.
         let mut grid = labelled_screen(2, 1, 100);
         grid.resize(6, 10);
         assert_eq!(grid.take_last_resize_shape(), shape(0, 0, 0, 0, 4));
@@ -2411,7 +2110,7 @@ mod tests {
         assert_eq!(grid.take_last_resize_row_shift(), 0, "a trim moves nothing");
         assert_eq!(grid.row(0).unwrap().to_string(), "R0");
 
-        // TRIM, then DEMOTE for the rest: one blank row below the cursor.
+        // Trim, then demote for the rest: one blank row below the cursor.
         let mut grid = labelled_screen(6, 5, 100);
         grid.erase_line();
         grid.set_cursor(4, 0);
@@ -2420,7 +2119,7 @@ mod tests {
         assert_eq!(grid.row(0).unwrap().to_string(), "R2");
         assert_eq!(grid.cursor_row(), 2);
 
-        // DEMOTE on a retaining grid, and the grow REVEALS it back: identity.
+        // Demote on a retaining grid, and the grow reveals it back: identity.
         let mut grid = labelled_screen(6, 4, 100);
         grid.resize(4, 10);
         assert_eq!(grid.take_last_resize_shape(), shape(0, 2, 0, 0, 0));
@@ -2436,7 +2135,7 @@ mod tests {
         assert_eq!(grid.row(5).unwrap().to_string(), "R5");
         assert_eq!(grid.cursor_row(), 4);
 
-        // The same flap with NO retention: the demote is evicted from the ring
+        // The same flap with no retention: the demote is evicted from the ring
         // but kept by the resize undo, and the grow hands it back.
         let mut grid = labelled_screen(6, 4, 0);
         grid.resize(4, 10);
@@ -2475,7 +2174,7 @@ mod tests {
         assert!(grid.row(5).unwrap().is_empty());
         assert_eq!(grid.cursor_row(), 2);
 
-        // BOTTOM-PUSH corner: a full screen with the cursor on row 0.
+        // Bottom-push corner: a full screen with the cursor on row 0.
         let mut grid = labelled_screen(6, 0, 100);
         grid.resize(4, 10);
         assert_eq!(grid.take_last_resize_shape(), shape(0, 0, 2, 0, 0));

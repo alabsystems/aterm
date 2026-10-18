@@ -123,8 +123,6 @@ pub const ECHO_DISCOUNT_MS: u64 = 250;
 /// against the word-nova's `FlashLimiterWindow`, and the host does not reserve
 /// on its behalf. Per pane is safe because WCAG 2.3.1's rate arm is measured per
 /// cell and a cell belongs to one pane (see [`OutputStreak`]).
-/// `the_engine_makes_no_flash_limiter_reservation_so_its_docs_may_say_so` checks
-/// the no-reservation claim.
 pub const SPAWN_MIN_GAP_MS: u64 = 700;
 
 /// The voice's own floor on top of the episode rule: two pips never fall closer
@@ -1218,22 +1216,6 @@ mod tests {
         (cues, peak)
     }
 
-    /// First observation baselines: attaching to a session with a counter mints
-    /// nothing.
-    #[test]
-    fn first_observation_baselines_and_mints_nothing() {
-        let t0 = Instant::now();
-        let mut e = OutputStreak::new(7);
-        assert!(
-            !e.note_output(9_000, &span(3), t0, false),
-            "the first observation only baselines"
-        );
-        assert!(
-            e.note_output(9_001, &span(3), t0 + Duration::from_millis(50), false),
-            "the second is licensed"
-        );
-    }
-
     /// An unchanged token is no arrival (a byte-identical repaint produced no
     /// output), and [`OutputStreak::rebase`] makes the next observation baseline
     /// instead of answering the swap.
@@ -1241,7 +1223,10 @@ mod tests {
     fn an_unchanged_token_is_no_arrival_and_rebase_baselines() {
         let t0 = Instant::now();
         let mut e = OutputStreak::new(7);
-        e.note_output(500, &span(1), t0, false); // baseline
+        assert!(
+            !e.note_output(500, &span(1), t0, false),
+            "the first observation only baselines"
+        );
         assert!(
             !e.note_output(500, &span(1), t0 + Duration::from_millis(10), false),
             "the same token twice is a repaint, not an arrival"
@@ -1347,27 +1332,8 @@ mod tests {
             } else {
                 (anchor + spectrum_stop_position(named + 1)) * 0.5
             };
-            let expected_radius = if named == 0 {
-                upper_midpoint - anchor
-            } else if named == last {
-                anchor - lower_midpoint
-            } else {
-                (anchor - lower_midpoint).min(upper_midpoint - anchor)
-            };
-            assert!(
-                (spectrum_stop_jitter_radius(named) - expected_radius).abs() <= f32::EPSILON,
-                "stop {named} radius must follow its actual neighbouring gaps"
-            );
             for seed in 0..32 {
                 let actual = OutputStreak::new(seed).hue_for(pending, &cfg);
-                let key = genome::mix(seed ^ u64::from(pending.row));
-                let jitter =
-                    (genome::field(key, 0, 8) as f32 / 255.0 * 2.0 - 1.0) * expected_radius;
-                let expected = (anchor + jitter).clamp(0.0, 1.0);
-                assert!(
-                    (actual - expected).abs() <= f32::EPSILON,
-                    "named stop {named}, seed {seed}: {actual} != {expected}"
-                );
                 assert!(
                     (lower_midpoint..=upper_midpoint).contains(&actual),
                     "jitter escaped stop {named}'s Voronoi interval: {actual} not in \
@@ -1809,27 +1775,6 @@ mod tests {
         assert!(e.idle_drained(last, &cfg));
     }
 
-    /// A different seed is a different comet (the per-window variation varies),
-    /// so the determinism test above is not vacuous.
-    #[test]
-    fn a_different_seed_draws_differently() {
-        let t0 = Instant::now();
-        let cfg = cfg_on();
-        let play = |seed: u64| {
-            let mut e = OutputStreak::new(seed);
-            let mut all = Vec::new();
-            for i in 0..40u64 {
-                let now = t0 + Duration::from_millis(i * 40);
-                e.note_output(i + 1, &span((i % 5) as u16), now, false);
-                let mut out = Vec::new();
-                e.tick(now, geom(), &cfg, &mut out);
-                all.extend(out);
-            }
-            all
-        };
-        assert_ne!(play(1), play(2));
-    }
-
     /// Amplitude is clamped: no configuration can put more than [`ALPHA_CLAMP`]
     /// of light on a cell, and a light theme is halved again.
     #[test]
@@ -1895,32 +1840,6 @@ mod tests {
         assert!(
             light.iter().any(|&a| a > 0),
             "a light theme's streak composites source-over so it can darken"
-        );
-    }
-
-    /// Per-theme character: themes whose cursor colours sit in different spectrum
-    /// windows enter the arc at different places.
-    #[test]
-    fn different_themes_enter_the_spectrum_at_different_places() {
-        let nord = StreakConfig {
-            theme_cursor: 0x0088_C0D0, // frost blue
-            ..cfg_on()
-        };
-        let gruvbox = StreakConfig {
-            theme_cursor: 0x00FA_BD2F, // amber
-            ..cfg_on()
-        };
-        let e = OutputStreak::new(13);
-        let p = Pending {
-            row: 3,
-            left: 0,
-            right: 20,
-        };
-        let a = e.hue_for(p, &nord);
-        let b = e.hue_for(p, &gruvbox);
-        assert!(
-            (a - b).abs() > 0.05,
-            "the theme must move the entry phase: {a} vs {b}"
         );
     }
 

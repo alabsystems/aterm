@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **aterm-phase** — what an agent worker (Claude Code, Codex, agy, Muse Code)
-//! is doing RIGHT NOW, from one screen read, as pure functions over the
+//! **aterm-phase** — what an agent worker (Claude Code, agy, Muse Code,
+//! Gemini CLI) is doing RIGHT NOW, from one screen read, as pure functions over the
 //! screen's rows.
 //!
 //! * [`phase::worker_phase`] — busy | prompt | limited | idle | question, read
 //!   from the LIVE ZONE around the composer (the status row above its top
 //!   rule, the hints under it, the footer under its bottom rule), never from
-//!   the transcript above it;
+//!   the transcript above it but for the one row Claude Code carries there
+//!   (a `Waiting for N … to finish` over the turns it started itself:
+//!   [`phase`]'s module docs);
 //! * [`phase::context_left`] — the `<n>% until auto-compact` indicator, when
 //!   Claude Code shows it;
 //! * [`phase::survey_open`], [`survey::survey_block`], [`phase::transcript_end`],
@@ -35,15 +37,17 @@
 //!   own suggestion, an armed `/goal`, the worker's last words — and the
 //!   launch card: what it names ([`turn::launch_card`]) and where it sits
 //!   ([`turn::launch_card_place`], for the harness card drawn around it, with
-//!   the build it names: [`turn::launch_card_version`]);
+//!   the build it names: [`turn::launch_card_version`], and its words, by
+//!   which the card is held through the vendor's entrance:
+//!   [`turn::launch_card_held`]);
 //! * [`reader::identify`] / [`reader::read`] — the reader for the session's
-//!   PROGRAM (Claude Code, Codex, agy, Muse Code, anything else), and one
+//!   PROGRAM (Claude Code, Codex, agy, Muse Code, Gemini CLI, anything else), and one
 //!   screen read whole; [`reader::Program::supervisable`] — the programs the
-//!   supervisor hosts;
-//! * [`codex`] — Codex's grammar, measured on codex 0.156.1 and on later
-//!   builds through 0.163.0 (the builds its fixtures name);
+//!   supervisor hosts. Codex is named, never read: aterm's Codex screen lane
+//!   was retired on 2026-10-16 ([`reader::CodexReader`]);
 //! * [`agy`] — agy's (Google's Antigravity CLI), measured on 1.4.0;
-//! * [`muse`] — Muse Code's, measured on 1.4.9-R6297.1;
+//! * [`muse`] — Muse Code's, measured on 1.4.9-R6297.1 and 1.4.10-R6427.1;
+//! * [`gemini`] — Gemini CLI's (Google's), measured on 0.46.0;
 //! * [`panel`] — Claude Code's Settings panel (`/usage`'s dialog): whether
 //!   it is what the screen shows, by which renderer, and what a row under
 //!   its header says of the Usage tab;
@@ -77,8 +81,10 @@
 
 pub mod agy;
 pub mod anchors;
-pub mod codex;
+pub mod autocompact;
 pub mod credits;
+pub mod disk_full;
+pub mod gemini;
 pub mod muse;
 pub mod panel;
 pub mod phase;
@@ -93,6 +99,7 @@ pub mod wall;
 mod wrap;
 
 pub use anchors::{ANCHORS, anchor, anchor_text};
+pub use autocompact::{Offer, OfferFocus};
 pub use panel::{
     PanelRenderer, SettingsPanel, panel_tail, settings_panel, usage_tab_mark, usage_unsettled,
 };
@@ -109,9 +116,9 @@ pub use question::{
     Recommended,
 };
 pub use reader::{
-    AgyReader, BLANK_GAP, ClaudeReader, CodexReader, GenericReader, MuseReader, Program, Reading,
-    ScreenReader, identify, live_zone_reaches_above, live_zone_start, may_host_agent, program_of,
-    read, read_at,
+    AgyReader, BLANK_GAP, ClaudeReader, CodexReader, GeminiReader, GenericReader, MuseReader,
+    Program, Reading, ScreenReader, identify, live_zone_reaches_above, live_zone_start,
+    may_host_agent, program_of, read, read_at,
 };
 pub use reset::{
     ConfirmRead, ResetConfirm, ResetLine, ResetPending, ResetRow, reset_confirm, reset_limit_name,
@@ -120,11 +127,12 @@ pub use reset::{
 pub use survey::{SurveyBlock, SurveyKind, survey_block};
 pub use turn::{
     CardPlace, LaunchCard, continuation_suggestion, goal_active, idle_compacted, interrupted,
-    launch_card, launch_card_place, launch_card_scan, launch_card_unmoved, launch_card_version,
-    said_tail,
+    launch_card, launch_card_held, launch_card_place, launch_card_scan, launch_card_unmoved,
+    launch_card_version, launch_card_words, said_tail,
 };
 pub use wall::{
     ApiCause, AutoContinue, Placement, SinceLimit, Wall, WallKind, auto_continue_end,
-    classify_wall, left_wall, login_expires_in, login_restored, memory_banner_head, since_limit,
-    wall,
+    auto_continue_toast, classify_wall, left_wall, login_expires_in, login_restored,
+    memory_banner_head, since_limit, wall,
 };
+pub use wrap::line_start;

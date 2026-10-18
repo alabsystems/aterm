@@ -15,6 +15,8 @@ aterm-core = { workspace = true }
 aterm-grid = { workspace = true }
 # The zstd decode harness (the `zstd` lane): atpkg's `.tar.zst` decoder.
 aterm-zstd = { workspace = true }
+# The crash-restore harness (the `crash-restore` lane): the journal's writer and recovery.
+aterm-restore = { workspace = true }
 
 [lints]
 workspace = true

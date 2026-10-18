@@ -53,10 +53,3 @@ pub const ALIAS_TABLE: &[AliasEntry] = &[
 pub fn lookup(alias: &str) -> Option<&'static AliasEntry> {
     ALIAS_TABLE.iter().find(|e| e.alias == alias)
 }
-
-/// Number of aliases in the table. Test-only.
-#[cfg(test)]
-#[must_use]
-pub(crate) const fn count() -> usize {
-    ALIAS_TABLE.len()
-}

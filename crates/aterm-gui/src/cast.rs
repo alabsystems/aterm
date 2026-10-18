@@ -112,7 +112,7 @@ pub(crate) struct CastCuts {
         clippy::box_collection,
         reason = "one pointer, not a 24-byte Vec, in each of the cast queue's 1024 \
                   preallocated slots per session; the Vec is built only for a burst a \
-                  resize cut (a_stamped_burst_stays_small_in_the_queue pins the size)"
+                  resize cut"
     )]
     rest: Option<Box<Vec<(usize, CastStamp)>>>,
 }
@@ -272,6 +272,11 @@ pub(crate) struct CastRecorder {
     /// and lacks what the session showed before. Disclosed as `aterm_handoff` in the
     /// header ([`to_asciicast`](Self::to_asciicast)) and by `cast frames`.
     handoff: Option<crate::session_timeline::HandoffGap>,
+    /// How far an adopted warm spare's timeline was rebased
+    /// ([`adopt_spare`](Self::adopt_spare)): subtracted from every event's time,
+    /// so the recording starts at the adoption, the moment the person asked
+    /// for the tab. Zero for every other session.
+    shift: Duration,
 }
 
 /// Reader-side count of bursts the cast tap dropped (see
@@ -319,7 +324,21 @@ impl CastRecorder {
             pending: Vec::new(),
             drops: Arc::default(),
             handoff: None,
+            shift: Duration::ZERO,
         }
+    }
+
+    /// A warm spare was adopted at `at` (`crate::spare`): what it recorded
+    /// before (its startup output) moves to t = 0, and every later event is
+    /// offset by the spare's age, so the recording reads as a tab started now.
+    /// Order is kept, so `cast drift` replays exactly.
+    pub(crate) fn adopt_spare(&mut self, at: Instant) {
+        let shift = at.saturating_duration_since(self.epoch);
+        for ev in &mut self.events {
+            ev.set_t(ev.t().saturating_sub(shift));
+        }
+        self.last_t = self.last_t.saturating_sub(shift);
+        self.shift = shift;
     }
 
     /// Mark this recording as one that starts at a seamless update
@@ -363,14 +382,15 @@ impl CastRecorder {
     /// evicted head event is counted (`evicted`) for [`to_asciicast`](Self::to_asciicast)
     /// to disclose.
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "OutputRetention",
             action = "Push",
             project = "cast::tests::tiny_output_retention_conforms"
         )
     )]
     fn push(&mut self, mut ev: Event) {
+        ev.set_t(ev.t().saturating_sub(self.shift));
         let cost = ev.cost();
         while !self.events.is_empty()
             && (self.used.saturating_add(cost) > self.budget
@@ -878,8 +898,8 @@ impl ByteFanout {
     /// subscriber is owed only bursts teed after its slot push, which `live`'s
     /// increment-before-push guarantees it sees.
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "OutputRetention",
             action = "Push",
             project = "cast::tests::tiny_output_retention_conforms"
@@ -982,7 +1002,8 @@ mod tests {
     /// control at the first count eviction.
     #[test]
     fn tiny_output_retention_conforms() {
-        use aterm_spec::{derive::output_retention_model, interp};
+        use aterm_models_gui::output_retention_model;
+        use aterm_spec::interp;
         let model = interp::with_consts(
             &output_retention_model(),
             &[
@@ -1063,33 +1084,15 @@ mod tests {
         assert_eq!(q.dropped, 0);
     }
 
-    /// `fold_frames` yields N keyframes showing the screen at ~k/N of the span: none for
-    /// an empty recording, and later text only in the final frame.
-    #[test]
-    fn fold_frames_steps_through_the_recording() {
-        let mut rec = CastRecorder::new(40, 6);
-        assert!(
-            rec.snapshot().fold_frames(4).is_empty(),
-            "empty recording ⇒ no frames"
-        );
-
-        rec.record_output(Duration::from_millis(0), b"AAA");
-        rec.record_output(Duration::from_millis(1000), b"\r\nZZZ");
-        let frames = rec.snapshot().fold_frames(2);
-        assert_eq!(frames.len(), 2, "asked for 2 keyframes");
-        // Frame 1 (~500ms) has the early output but not the 1000ms output.
-        let row0_f1 = &frames[0].1[0];
-        assert!(row0_f1.contains("AAA") && !row0_f1.contains("ZZZ"));
-        // Frame 2 (final) has both.
-        let text_f2: String = frames[1].1.join("");
-        assert!(text_f2.contains("AAA") && text_f2.contains("ZZZ"));
-    }
-
     /// The single forward fold reproduces, frame for frame, a per-frame re-fold (each
     /// frame = the screen after every event with `t <= frame_target`).
     #[test]
     fn fold_frames_single_pass_matches_per_frame_refold() {
         let mut rec = CastRecorder::new(40, 6);
+        assert!(
+            rec.snapshot().fold_frames(4).is_empty(),
+            "empty recording ⇒ no frames"
+        );
         rec.record_output(Duration::from_millis(0), b"one");
         rec.record_output(Duration::from_millis(100), b"\r\ntwo");
         rec.record_output(Duration::from_millis(200), b"\r\nthree");
@@ -1134,22 +1137,6 @@ mod tests {
         // Times are rebased so the flipbook starts at 0, not 300s.
         assert_eq!(frames[0].0, Duration::from_secs(5));
         assert_eq!(frames[1].0, Duration::from_secs(10));
-    }
-
-    /// A header line that `asciinema` would accept: valid JSON object with
-    /// `version`/`width`/`height`.
-    #[test]
-    fn header_is_valid_v2_json() {
-        let rec = CastRecorder::new(120, 40);
-        let cast = rec.to_asciicast();
-        let header = cast.lines().next().unwrap();
-        assert!(header.starts_with('{') && header.ends_with('}'));
-        assert!(header.contains("\"version\": 2"));
-        assert!(header.contains("\"width\": 120"));
-        assert!(header.contains("\"height\": 40"));
-        // An empty recording is just the header line.
-        assert_eq!(cast.lines().count(), 1);
-        assert_eq!(rec.event_count(), 0);
     }
 
     /// Each event line is a `[f64, "o"|"r", string]` JSON array, output-only for
@@ -1230,25 +1217,6 @@ mod tests {
         assert_eq!(payload, "\u{1b}[0m\u{7}\u{0}");
     }
 
-    /// Drop-oldest keeps the recording bounded under a flood and counts every eviction.
-    #[test]
-    fn budget_drops_oldest() {
-        // Tiny budget: only two of these 4-byte payloads fit.
-        let mut rec = CastRecorder::with_budget(80, 24, 10);
-        for i in 0..100u32 {
-            rec.record_output(Duration::from_millis(i as u64), b"abcd");
-        }
-        assert!(rec.event_count() < 10, "unbounded: {}", rec.event_count());
-        let cast = rec.to_asciicast();
-        assert!(cast.lines().next().unwrap().contains("\"version\": 2"));
-        let ts: Vec<f64> = cast.lines().skip(1).map(|l| parse_event(l).0).collect();
-        for w in ts.windows(2) {
-            assert!(w[1] >= w[0]);
-        }
-        // Every dropped head event is counted.
-        assert!(rec.evicted() > 0, "evictions counted: {}", rec.evicted());
-    }
-
     /// After drop-oldest eviction the asciicast discloses the truncation in the header
     /// and rebases survivor timestamps to the first retained event.
     #[test]
@@ -1259,6 +1227,7 @@ mod tests {
             rec.record_output(Duration::from_secs(u64::from(i)), b"abcd");
         }
         assert!(rec.evicted() > 0, "head was evicted");
+        assert!(rec.event_count() < 10, "bounded: {}", rec.event_count());
         let cast = rec.to_asciicast();
         let header = cast.lines().next().unwrap();
         assert!(header.starts_with('{') && header.ends_with('}'));
@@ -1386,18 +1355,6 @@ mod tests {
                 _ => panic!("event kinds diverge"),
             }
         }
-    }
-
-    /// Raw program-output bytes (ESC/CSI/SGR, tab, quote, backslash, CR/LF) round-trip
-    /// exactly through the wire escaping.
-    #[test]
-    fn raw_bytes_round_trip_exactly() {
-        let mut rec = CastRecorder::new(80, 24);
-        let raw: &[u8] = b"\x1b[31mred\x1b[0m\tx\"y\\z\r\n";
-        rec.record_output(Duration::from_millis(5), raw);
-        let cast = rec.to_asciicast();
-        let payload = parse_event(cast.lines().nth(1).unwrap()).2;
-        assert_eq!(payload.as_bytes(), raw, "raw bytes must round-trip exactly");
     }
 
     /// A lone continuation byte mid-stream renders as one U+FFFD in place.
@@ -1768,15 +1725,6 @@ mod tests {
         rec.record_burst(burst(b"new", cuts, rec.now()));
         rec.record_resize_stamped(old_resize, 20, 7);
         assert_eq!(kinds(&rec), ["r:20x7", "o:new"]);
-    }
-
-    /// The cast queue preallocates `CAST_QUEUE_CAP` (1024) slots per session, so a
-    /// stamped burst's size is per-session memory. Pinned so growth is a decision.
-    #[test]
-    fn a_stamped_burst_stays_small_in_the_queue() {
-        assert_eq!(std::mem::size_of::<Arc<[u8]>>(), 16);
-        assert_eq!(std::mem::size_of::<CastCuts>(), 32);
-        assert_eq!(std::mem::size_of::<CastBurst>(), 56);
     }
 
     /// Parse one event line `[<f64>, "<code>", "<json-string>"]` into

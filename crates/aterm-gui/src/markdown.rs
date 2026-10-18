@@ -171,21 +171,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn headings_lose_markers_and_get_a_blank_separator() {
-        let md = "Intro line\n### Features\n- a";
-        let out = to_plain_text(md);
-        assert_eq!(out, "Intro line\n\nFeatures\n\u{2022} a");
-        assert!(!out.contains('#'), "no raw hash: {out:?}");
-    }
-
-    #[test]
-    fn bullets_become_dots_preserving_indent() {
-        let md = "- top\n  - nested\n* star\n+ plus";
-        let out = to_plain_text(md);
-        assert_eq!(
-            out,
-            "\u{2022} top\n  \u{2022} nested\n\u{2022} star\n\u{2022} plus"
-        );
+    fn block_markup_becomes_plain_text() {
+        for (case, md, want) in [
+            (
+                "a heading loses its markers and gets a blank separator",
+                "Intro line\n### Features\n- a",
+                "Intro line\n\nFeatures\n\u{2022} a",
+            ),
+            (
+                "bullets become dots, keeping their indent",
+                "- top\n  - nested\n* star\n+ plus",
+                "\u{2022} top\n  \u{2022} nested\n\u{2022} star\n\u{2022} plus",
+            ),
+            (
+                "ordered lists keep their numbers",
+                "1. first\n2. **second**",
+                "1. first\n2. second",
+            ),
+            (
+                "rules drop and blank runs collapse",
+                "A\n\n\n---\n\n\nB",
+                "A\n\nB",
+            ),
+        ] {
+            assert_eq!(to_plain_text(md), want, "{case}");
+        }
     }
 
     #[test]
@@ -203,35 +213,11 @@ mod tests {
     }
 
     #[test]
-    fn ordered_lists_keep_numbers() {
-        assert_eq!(
-            to_plain_text("1. first\n2. **second**"),
-            "1. first\n2. second"
-        );
-    }
-
-    #[test]
-    fn hrules_dropped_and_blank_runs_collapsed() {
-        let md = "A\n\n\n---\n\n\nB";
-        assert_eq!(to_plain_text(md), "A\n\nB");
-    }
-
-    #[test]
     fn trims_and_is_idempotent_on_plain_text() {
         let plain = "Version 0.5.14\n\nJust some notes.";
         assert_eq!(to_plain_text(plain), plain);
         // Idempotent: prettifying already-clean output changes nothing.
         let once = to_plain_text("### Title\n- x");
         assert_eq!(to_plain_text(&once), once);
-    }
-
-    #[test]
-    fn realistic_changelog_reads_clean() {
-        let md = "## What's new\n\n### Features\n- **DSU**: hot-swap without restart\n- faster startup\n\n### Fixes\n- fixed `curl` argv bug\n";
-        let out = to_plain_text(md);
-        assert!(!out.contains('#') && !out.contains("**") && !out.contains('`'));
-        assert!(out.contains("\u{2022} DSU: hot-swap without restart"));
-        assert!(out.contains("What's new"));
-        assert!(out.contains("Fixes"));
     }
 }

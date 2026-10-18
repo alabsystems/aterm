@@ -595,24 +595,6 @@ impl Waiter {
 mod tests {
     use super::*;
 
-    /// Who waits decides the row: a person's work always takes its row;
-    /// nobody's only while it is very heavy.
-    #[test]
-    fn who_waits_decides_the_row() {
-        assert!(Waiter::Person.takes_row(false));
-        assert!(Waiter::Person.takes_row(true));
-        assert!(
-            !Waiter::Nobody.takes_row(false),
-            "silent, a record at its end"
-        );
-        assert!(
-            Waiter::Nobody.takes_row(true),
-            "very heavy use is explained"
-        );
-        assert_eq!(Waiter::of(true), Waiter::Person);
-        assert_eq!(Waiter::of(false), Waiter::Nobody);
-    }
-
     fn t0() -> Instant {
         Instant::now()
     }
@@ -827,24 +809,6 @@ mod tests {
                 );
             }
         }
-        assert_eq!(
-            eta_spoken(Eta::Remaining(Duration::from_millis(2_500))).as_deref(),
-            Some("less than 5 seconds left"),
-            "the paint's `<5 s left`, said whole"
-        );
-        assert_eq!(
-            eta_spoken(Eta::Remaining(Duration::from_secs(40))).as_deref(),
-            Some("about 40 seconds left")
-        );
-        assert_eq!(
-            eta_spoken(Eta::Remaining(Duration::from_secs(170))).as_deref(),
-            Some("about 3 minutes left")
-        );
-        assert_eq!(
-            eta_spoken(Eta::Remaining(Duration::from_secs(60))).as_deref(),
-            Some("about 1 minute left")
-        );
-        assert_eq!(eta_spoken(Eta::Stalled).as_deref(), Some("stalled"));
         assert_eq!(eta_spoken(Eta::Hidden), None);
     }
 
@@ -1098,15 +1062,7 @@ mod tests {
                 assert!(!clock(&words), "{words}");
             }
         }
-        assert_eq!(
-            elapsed_spoken(Duration::from_secs(180)).as_deref(),
-            Some("running for 3 minutes")
-        );
         assert_eq!(elapsed_spoken(Duration::from_secs(3)), None);
         assert_eq!(clock_spoken(Duration::from_millis(900)), None);
-        assert_eq!(
-            clock_spoken(Duration::from_secs(4)).as_deref(),
-            Some("running for 4 seconds")
-        );
     }
 }

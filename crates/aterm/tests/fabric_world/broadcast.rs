@@ -12,16 +12,14 @@
 
 use crate::harness;
 
-use aterm_spec::{
-    derive::{broadcast_cursor_checkpoint_model, broadcast_head_subscription_model},
-    interp,
-};
+use aterm_models_session::{broadcast_cursor_checkpoint_model, broadcast_head_subscription_model};
+use aterm_spec::interp;
 use harness::{FLEET, World, say_records, topic_rows, until};
 
 /// Add a topic and wait for the bridge to hold it — the set lives in aterm and
 /// the bridge learns it from the push (or its one read of a new session), so
 /// "added" and "in effect" are two moments.
-pub(crate) fn subscribe(w: &World, sid: &str, spec: &str) {
+fn subscribe(w: &World, sid: &str, spec: &str) {
     let reply = w.verb(&format!("@{sid} topic add {spec}"));
     assert!(reply.ok(), "topic add {spec}: {}", reply.header());
     let topic = spec.split_whitespace().next().expect("a topic word");
@@ -34,7 +32,7 @@ pub(crate) fn subscribe(w: &World, sid: &str, spec: &str) {
 }
 
 /// The cursor the bridge persisted for `sid`'s `topic`: where its next read starts.
-pub(crate) fn persisted_topic_cursor(w: &World, sid: &str, topic: &str) -> Option<u64> {
+fn persisted_topic_cursor(w: &World, sid: &str, topic: &str) -> Option<u64> {
     let body = std::fs::read_to_string(w.state.join(format!("topics/{sid}"))).ok()?;
     body.lines().find_map(|line| {
         let (name, cursor) = line.split_once(' ')?;

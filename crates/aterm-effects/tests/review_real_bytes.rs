@@ -352,7 +352,8 @@ impl ReplayHost {
         self.glow.note_context(self.term.is_alternate_screen());
         observe_caret_row(&self.term, &mut self.glow, &mut self.row_buf, c, self.now);
         observe_ribbon_rows(&self.term, &mut self.glow, &mut self.row_buf);
-        self.glow.observe_print_anchor(self.term.print_anchor());
+        self.glow
+            .observe_print_anchor(aterm_effects::host::motion_print_anchor(&self.term).0);
         self.fp = self
             .glow
             .tick(cur, self.now, &self.cfg, self.g, &mut self.out);
@@ -525,37 +526,21 @@ fn assert_take_holds(take: &Take) {
     );
 }
 
-/// The insert take: the line typed, ⌥← into it, `INTO ` inserted, ⌥→ back.
+/// Every take at every read size, each presented whole and in 1024- and
+/// 512-byte reads: no interior hole while typing, nothing drawn at rest.
+///
+/// * Claude Code's bytes: the insert take (the line typed, ⌥← into it,
+///   `INTO ` inserted, ⌥→ back); the End take (the insert, then End back to
+///   the end of the line); the scrub take (three word hops each way inside
+///   the typed line); the popup take (an `@`-mention popup open under the
+///   composer while typing); the plain-arrow insert.
+/// * Codex's bytes: braille particles painted into the composer's blank cells
+///   on every ~150 ms frame inside `?2026`, with SYNC-1 holding the present
+///   while a bracket is open. The band under the typed line, the backward
+///   edit and the forward hops stays one run.
 #[test]
-fn claude_code_s_insert_take_holds_whole_and_torn_at_every_read_size() {
-    assert_take_holds(&TAKES[0]);
-}
-
-/// The End take: the insert, then End back to the end of the line.
-#[test]
-fn claude_code_s_end_take_holds_whole_and_torn_at_every_read_size() {
-    assert_take_holds(&TAKES[1]);
-}
-
-/// The scrub take: three word hops each way inside the typed line.
-#[test]
-fn claude_code_s_scrub_take_holds_whole_and_torn_at_every_read_size() {
-    assert_take_holds(&TAKES[2]);
-}
-
-/// The popup take: an `@`-mention popup open under the composer while
-/// typing.
-#[test]
-fn claude_code_s_popup_take_holds_whole_and_torn_at_every_read_size() {
-    assert_take_holds(&TAKES[3]);
-}
-
-/// Codex's particle take: braille particles painted into the composer's blank
-/// cells on every ~150 ms frame inside `?2026`, with SYNC-1 holding the
-/// present while a bracket is open.
-#[test]
-fn codex_s_particle_take_holds_whole_and_torn_at_every_read_size() {
-    assert_take_holds(&TAKES[4]);
+fn every_take_holds_whole_and_torn_at_every_read_size() {
+    crate::common::par_map(&TAKES, assert_take_holds);
 }
 
 /// The plain-arrow insert take: ← (one `CUP` per press) back into the line and
@@ -566,7 +551,6 @@ fn codex_s_particle_take_holds_whole_and_torn_at_every_read_size() {
 #[test]
 fn claude_code_s_arrow_insert_keeps_the_pushed_tail_lit_at_every_read_size() {
     let take = &TAKES[5];
-    assert_take_holds(take);
     for chunking in [Chunking::Whole, Chunking::Reads(1024), Chunking::Reads(512)] {
         let r = replay(take, chunking);
         let (ms, text, lit) = r.last_row.expect("the composer row was censused");
@@ -692,7 +676,7 @@ impl Composer {
         self.glow.note_context(self.term.is_alternate_screen());
         observe_caret_row(&self.term, &mut self.glow, &mut self.row_buf, c, now);
         observe_ribbon_rows(&self.term, &mut self.glow, &mut self.row_buf);
-        let anchor = self.term.print_anchor();
+        let (anchor, _) = aterm_effects::host::motion_print_anchor(&self.term);
         self.glow.observe_print_anchor(anchor);
         self.glow.tick(cur, now, &self.cfg, self.g, &mut self.out);
         self.frames += 1;

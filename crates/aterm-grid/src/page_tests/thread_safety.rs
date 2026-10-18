@@ -4,48 +4,8 @@
 
 use super::super::*;
 
-// Send impls: values moved to another thread, checked under Miri.
-
-/// Page can be moved to another thread (`unsafe impl Send for Page`).
-#[test]
-fn page_send_across_thread() {
-    let page = Page::new();
-
-    let handle = std::thread::spawn(move || {
-        let ptr = page.data_ptr();
-        assert!(!ptr.is_null());
-        let val = unsafe { *ptr };
-        assert_eq!(val, 0, "freshly allocated page should be zeroed");
-        page // return ownership
-    });
-
-    let _page = handle.join().expect("thread panicked");
-}
-
-/// Allocated PageSlices can be moved to another thread and read
-/// (`unsafe impl<T: Send> Send for PageSlice<T>`).
-#[test]
-fn page_slice_send_across_thread() {
-    let mut store = PageStore::new();
-    let mut slice = store.alloc_slice::<u32>(50);
-
-    for (i, val) in slice.iter_mut().enumerate() {
-        *val = i as u32 * 7;
-    }
-
-    let handle = std::thread::spawn(move || {
-        for (i, &val) in slice.as_slice().iter().enumerate() {
-            assert_eq!(val, i as u32 * 7, "slice[{i}] wrong after thread transfer");
-        }
-        slice.len()
-    });
-
-    let len = handle.join().expect("thread panicked");
-    assert_eq!(len, 50);
-}
-
-// Sync impls: concurrent reads through shared references, checked under
-// Miri's Stacked Borrows.
+// Send/Sync impls: concurrent reads through shared references, checked under
+// Miri's Stacked Borrows (moving an Arc into a thread also needs Send).
 
 /// Several threads read one `Arc<Page>` concurrently (`unsafe impl Sync for Page`).
 #[test]

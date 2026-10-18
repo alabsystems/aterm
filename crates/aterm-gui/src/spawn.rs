@@ -49,6 +49,11 @@ pub(crate) enum ShellIntegrationOutcome {
     UnknownShell(String),
     /// The loader cache could not be written (the `std::io::Error` text).
     WriteFailed(String),
+    /// Config `shell_args` ask for a start no integration can stand in for (a
+    /// command, a script, POSIX mode, …): the shell runs them as given, without
+    /// integration. The sentence says which argument and why
+    /// (`aterm_shell_integration::ArgsMerge::Bypass`).
+    ArgsBypass(String),
 }
 
 /// Last-write-wins record of the most recent preparation attempt. One slot is
@@ -236,12 +241,23 @@ type ShellIntegrationSetup = (
 /// The shell this tab will actually spawn, as the integration layer sees it.
 ///
 /// Detected from the selected shell (config `shell` / `--shell`) so a
-/// non-default shell gets its own integration script; `detect_current()` sees
-/// only the platform default (PowerShell on Windows).
+/// non-default shell gets its own integration script. On Unix that is the
+/// program the spawn itself resolves ([`aterm_pty::select_shell_with_origin`]):
+/// with `$SHELL` unset it is the account's login shell, which must get bash's
+/// integration when it is bash, and never bash's `--rcfile` when it is not.
+/// Elsewhere `detect_current()` sees the platform default (PowerShell on
+/// Windows).
 pub(crate) fn detect_spawn_shell(
     shell_hint: Option<&str>,
 ) -> aterm_core::shell_integration::ShellType {
     use aterm_core::shell_integration as si;
+    #[cfg(unix)]
+    {
+        let (program, _) =
+            aterm_pty::select_shell_with_origin(shell_hint.map(std::ffi::OsStr::new));
+        si::ShellType::detect(&program.to_string_lossy())
+    }
+    #[cfg(not(unix))]
     match shell_hint.filter(|s| !s.is_empty()) {
         Some(h) => si::ShellType::detect(h),
         None => si::ShellType::detect_current(),
@@ -268,12 +284,18 @@ fn tab_shell_env(exec: bool, shell_override: Option<&str>) -> Option<(String, St
 }
 
 /// Prepare OSC 133/633 shell integration for the spawned shell: env additions,
-/// an optional argv override (bash's `--rcfile`), and the raw capability nonce
+/// an optional argv override (bash's `--rcfile`, carrying config `shell_args`
+/// — `aterm_shell_integration::merge_shell_args`), and the raw capability nonce
 /// for `Terminal::authorize_shell_integration`, so only this shell's marks are
-/// trusted. `None` for an unknown shell or on I/O error; the shell still spawns
-/// without command-block tracking, and the outcome is recorded
-/// ([`ShellIntegrationOutcome`]). Runs in the parent, before spawn.
-fn prepare_shell_integration(shell_hint: Option<&str>) -> Option<ShellIntegrationSetup> {
+/// trusted. `None` for an unknown shell, on I/O error, or for `shell_args` no
+/// integrated start can honour; the shell still spawns without command-block
+/// tracking (with those args, through the spawn's own `shell_args`), and the
+/// outcome is recorded ([`ShellIntegrationOutcome`]). Runs in the parent, before
+/// spawn.
+fn prepare_shell_integration(
+    shell_hint: Option<&str>,
+    shell_args: Option<&[String]>,
+) -> Option<ShellIntegrationSetup> {
     use aterm_core::shell_integration as si;
     let shell = detect_spawn_shell(shell_hint);
     let mut injection = match si::prepare(shell) {
@@ -281,11 +303,7 @@ fn prepare_shell_integration(shell_hint: Option<&str>) -> Option<ShellIntegratio
         Ok(None) => {
             // Name the shell the way the USER selected it, so the diagnosis
             // reads as their own configuration and not our detection guts.
-            let name = shell_hint
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .or_else(|| std::env::var("SHELL").ok())
-                .unwrap_or_else(|| "the default shell".to_string());
+            let name = selected_shell_name(shell_hint);
             // Said once per shell name per process; every tab still records it.
             let outcome = ShellIntegrationOutcome::UnknownShell(name.clone());
             if record_shell_integration_outcome(outcome) {
@@ -309,6 +327,19 @@ fn prepare_shell_integration(shell_hint: Option<&str>) -> Option<ShellIntegratio
             return None;
         }
     };
+    if let si::ArgsMerge::Bypass(why) =
+        si::merge_shell_args(shell, &mut injection, shell_args.unwrap_or_default())
+    {
+        // Said once per sentence per process; every tab still records it.
+        if record_shell_integration_outcome(ShellIntegrationOutcome::ArgsBypass(why.clone())) {
+            aterm_log::warn!(
+                "shell integration is off: {why} — command blocks, cwd tracking and the ALab \
+                 tools' PATH hook (shell.d) will not work in this shell; `aterm --diagnose` \
+                 shows the runtime state"
+            );
+        }
+        return None;
+    }
     record_shell_integration_outcome(ShellIntegrationOutcome::Prepared);
     let nonce = si::generate_nonce();
     si::augment_with_nonce(&mut injection, nonce.hex());
@@ -345,22 +376,174 @@ fn records_shell_start(adopted: bool, exec_command: Option<&[std::ffi::OsString]
     !adopted && exec_command.is_none_or(<[std::ffi::OsString]>::is_empty)
 }
 
+/// The shell a fresh spawn runs, named for a diagnosis: as the person selected
+/// it (config `shell` / `--shell`), else the program the spawn resolves
+/// (`$SHELL`, else the account's login shell on Unix).
+pub(crate) fn selected_shell_name(shell_hint: Option<&str>) -> String {
+    if let Some(hint) = shell_hint.filter(|s| !s.is_empty()) {
+        return hint.to_string();
+    }
+    #[cfg(unix)]
+    {
+        aterm_pty::select_shell_with_origin(None)
+            .0
+            .to_string_lossy()
+            .into_owned()
+    }
+    #[cfg(not(unix))]
+    std::env::var("SHELL").unwrap_or_else(|_| "the default shell".to_string())
+}
+
 /// The name of the interactive shell a fresh spawn runs, resolved the way the
-/// spawn resolves it: config `shell` / `--shell`, else `$SHELL`, else
-/// `/bin/sh` (Windows: its own default chain, `aterm_pty::select_shell_with_origin`).
-fn interactive_shell_name(shell_override: Option<&str>) -> String {
-    #[cfg(windows)]
+/// spawn resolves it: config `shell` / `--shell`, else `$SHELL`, else the
+/// account's login shell (`aterm_pty::select_shell_with_origin`, the same
+/// resolution on every platform's own terms; Windows: its default chain).
+pub(crate) fn interactive_shell_name(shell_override: Option<&str>) -> String {
     let program = aterm_pty::select_shell_with_origin(shell_override.map(std::ffi::OsStr::new)).0;
-    #[cfg(not(windows))]
-    let program: std::ffi::OsString = match shell_override.filter(|s| !s.is_empty()) {
-        Some(s) => s.into(),
-        None => std::env::var_os("SHELL")
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "/bin/sh".into()),
-    };
     std::path::Path::new(&program)
         .file_name()
         .map_or_else(|| "shell".to_string(), |n| n.to_string_lossy().into_owned())
+}
+
+/// A shell started in place of one that cannot start ([`substitute_shell`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ShellSubstitute {
+    /// The program started instead, handed to the spawn as its `shell_override`.
+    pub(crate) program: String,
+    /// The line the pane shows above the substitute's first prompt.
+    pub(crate) notice: String,
+    /// `SHELL` for the child when the broken shell came from `$SHELL`, which
+    /// the child would otherwise inherit.
+    pub(crate) shell_env: Option<(String, String)>,
+}
+
+/// The substitute for a fresh interactive shell that cannot start: the shell
+/// the spawn would select ([`aterm_pty::select_shell_with_origin`]) is checked
+/// before the spawn ([`aterm_pty::shell_cannot_start`]: missing, a folder, not
+/// executable, a bare name on no `PATH` entry), and when it cannot run, the
+/// account's login shell, else `/bin/sh`, starts instead
+/// ([`aterm_pty::fallback_shell`]) — VTE's and Terminal.app's answer to a broken
+/// login shell. The config's `shell_args` were written for the shell that cannot
+/// start, so the substitute runs without them (`bash` refuses fish's
+/// `--no-config` and exits at once), and the line says so when there were any.
+/// `None` when the shell can start, when nothing else can either (the spawn then
+/// fails as it always did), and on Windows, whose seam selects from a chain of
+/// its own.
+#[cfg(unix)]
+fn substitute_shell(
+    shell_override: Option<&str>,
+    shell_args: Option<&[String]>,
+) -> Option<ShellSubstitute> {
+    let (program, origin) =
+        aterm_pty::select_shell_with_origin(shell_override.map(std::ffi::OsStr::new));
+    let why = aterm_pty::shell_cannot_start(&program, origin)?;
+    let (instead, by) = aterm_pty::fallback_shell(&program)?;
+    let instead = instead.into_string().ok()?;
+    let which = match by {
+        aterm_pty::ShellOrigin::Passwd => "your login shell",
+        _ => "the system shell",
+    };
+    let without = if shell_args.is_some_and(|args| !args.is_empty()) {
+        ", without `shell_args`"
+    } else {
+        ""
+    };
+    let substitute = ShellSubstitute {
+        notice: format!("[aterm: {why}; started {instead}, {which}, instead{without}]"),
+        shell_env: (origin == aterm_pty::ShellOrigin::Env)
+            .then(|| ("SHELL".to_string(), instead.clone())),
+        program: instead,
+    };
+    crate::logging::stderr_line!("aterm-gui: {}", substitute.notice);
+    Some(substitute)
+}
+
+/// The shell a fresh session starts and the config `shell_args` it is given: a
+/// substitute's program alone (see [`substitute_shell`]), else the configured
+/// shell and its args.
+fn shell_to_start<'a>(
+    substitute: Option<&'a ShellSubstitute>,
+    shell_override: Option<&'a str>,
+    shell_args: Option<&'a [String]>,
+) -> (Option<&'a str>, Option<&'a [String]>) {
+    match substitute {
+        Some(sub) => (Some(sub.program.as_str()), None),
+        None => (shell_override, shell_args),
+    }
+}
+
+#[cfg(not(unix))]
+fn substitute_shell(
+    _shell_override: Option<&str>,
+    _shell_args: Option<&[String]>,
+) -> Option<ShellSubstitute> {
+    None
+}
+
+/// Write `sub`'s line into a fresh session's engine, on a line of its own. The
+/// line names a program from the config or `$SHELL`, so its control characters
+/// are dropped: it is text to read, never a sequence for the terminal.
+fn say_substitute(term: &Mutex<Terminal>, sub: &ShellSubstitute) {
+    let mut line: String = sub.notice.chars().filter(|c| !c.is_control()).collect();
+    line.push_str("\r\n");
+    term_lock(term).process(line.as_bytes());
+}
+
+#[cfg(all(test, unix))]
+mod substitute_shell_tests {
+    use super::{shell_to_start, substitute_shell};
+
+    /// A shell that can start is not replaced; one that cannot is, by a program
+    /// that can, and the line names the broken one, where it was set, and the
+    /// substitute. (A bare `--shell bash` is no broken shell: it is looked up.)
+    #[test]
+    fn only_a_shell_that_cannot_start_is_replaced_and_the_pane_says_so() {
+        assert_eq!(substitute_shell(Some("/bin/sh"), None), None);
+        assert_eq!(substitute_shell(Some("sh"), None), None, "found on PATH");
+        let sub = substitute_shell(Some("/nonexistent/aterm-test-zsh"), Some(&[]))
+            .expect("a missing shell is replaced");
+        assert!(
+            aterm_pty::shell_cannot_start(
+                std::ffi::OsStr::new(&sub.program),
+                aterm_pty::ShellOrigin::Override
+            )
+            .is_none(),
+            "the substitute can start: {sub:?}"
+        );
+        let said = "[aterm: `/nonexistent/aterm-test-zsh` does not exist (set by --shell or \
+                    `shell` in aterm.toml); started ";
+        assert!(
+            sub.notice.starts_with(said)
+                && sub.notice.contains(&format!("started {}, ", sub.program))
+                && sub.notice.ends_with(" instead]"),
+            "{sub:?}"
+        );
+        assert_eq!(sub.shell_env, None, "$SHELL was not what broke");
+    }
+
+    /// The broken shell's `shell_args` stay with it: the substitute starts
+    /// without them, and the line says so. (`shell = "/nonexistent/fish"` with
+    /// `shell_args = ["--no-config"]` started bash with `--no-config`, which
+    /// printed its usage and exited, leaving no working shell.)
+    #[test]
+    fn a_substitute_starts_without_the_broken_shells_args() {
+        let args = ["--no-config".to_string()];
+        let broken = Some("/nonexistent/aterm-test-fish");
+        let sub = substitute_shell(broken, Some(&args)).expect("a missing shell is replaced");
+        assert!(
+            sub.notice.ends_with(" instead, without `shell_args`]"),
+            "{sub:?}"
+        );
+        assert_eq!(
+            shell_to_start(Some(&sub), broken, Some(&args)),
+            (Some(sub.program.as_str()), None)
+        );
+        // A shell that can start keeps its own args.
+        assert_eq!(
+            shell_to_start(None, Some("/bin/sh"), Some(&args)),
+            (Some("/bin/sh"), Some(&args[..]))
+        );
+    }
 }
 
 #[cfg(test)]
@@ -383,29 +566,6 @@ mod records_shell_start_tests {
     }
 }
 
-#[cfg(all(test, not(windows)))]
-mod interactive_shell_name_tests {
-    use super::interactive_shell_name;
-
-    /// The name in `[fish ended at start: …]` is the program's basename, as a
-    /// person would say it — never a path, never the login `-fish` spelling.
-    #[test]
-    fn names_the_program_the_spawn_runs() {
-        assert_eq!(
-            interactive_shell_name(Some("/opt/homebrew/bin/fish")),
-            "fish"
-        );
-        assert_eq!(interactive_shell_name(Some("zsh")), "zsh");
-        let default = interactive_shell_name(None);
-        assert!(!default.is_empty() && !default.contains('/'), "{default:?}");
-        assert_eq!(
-            interactive_shell_name(Some("")),
-            default,
-            "an empty override is no override, as at the spawn"
-        );
-    }
-}
-
 /// Everything `spawn_session` needs to stand up a new tab's shell session,
 /// captured once at startup. The spawn/sandbox caps are the single root
 /// authority minted in `main`, held by clone (cloning a `Cap` does not re-mint).
@@ -425,8 +585,9 @@ pub(crate) struct SessionFactory {
     /// as the OS's argv gave it ([`crate::cli::Cli::exec_command`]).
     pub(crate) exec_command: Option<Vec<std::ffi::OsString>>,
     /// Config `shell` / `--shell`: the interactive shell every tab spawns
-    /// (discovery-resolved — `"bash"` finds Git Bash off-PATH, absolute paths
-    /// verbatim). `None` → the platform default. See `aterm_pty` shell selection.
+    /// (Windows: discovery-resolved — `"bash"` finds Git Bash off-PATH; Unix: a
+    /// bare name looked up on PATH; absolute paths verbatim). `None` → the
+    /// platform default. See `aterm_pty` shell selection.
     pub(crate) shell_override: Option<String>,
     /// Config `shell_args`: extra argv passed to `shell_override` (e.g. `-l -i`).
     pub(crate) shell_args: Option<Vec<String>>,
@@ -439,13 +600,11 @@ pub(crate) struct SessionFactory {
     pub(crate) sandbox_wrap: Option<String>,
     /// Engine config (scrollback/cursor/theme/palette) applied to each tab's
     /// `Terminal`, byte-identical to the single-session path.
+    /// Its `color_scheme` is the palette's appearance
+    /// (`ResolvedColors::reported`), so a tab spawned later reports the scheme
+    /// its palette reads as (DEC 2031 / DSR `CSI ?996n`) from the same
+    /// `apply_config` that lands its colours.
     pub(crate) terminal_config: Option<aterm_core::config::TerminalConfig>,
-    /// The appearance of the palette on screen (`ResolvedColors::reported`), set
-    /// on every new session's engine at construction (`Terminal::set_color_scheme`)
-    /// so a tab spawned later reports the scheme its palette reads as to apps
-    /// (DEC 2031 / DSR `CSI ?996n`). Seeded from the startup resolution and kept
-    /// current by `App::install_colors`.
-    pub(crate) appearance: aterm_types::Appearance,
     /// Whether to inject OSC 133/633 shell integration. Each tab gets a fresh
     /// CSPRNG nonce, authorized and required on its own engine, so one tab's
     /// output cannot forge another's marks. False when `-e` runs a command or
@@ -509,6 +668,78 @@ pub(crate) struct SessionFactory {
     /// the reader gate opens. `None` otherwise: the adoption is final and writes
     /// at once.
     pub(crate) rekey_deferred: Option<Arc<crate::shell_rekey::Deferred>>,
+    /// A warm spare's spawn (`crate::spare`), set only on the `aterm-spare`
+    /// thread's factory copy, like [`Self::reader_after_install`]: the shell is
+    /// spawned with its hold FIFO, its host effects only taint it, its reader
+    /// attaches live through the spare's own post (which swallows every wake
+    /// until adoption), and the primer and the keeper wait for the adoption.
+    pub(crate) spare: Option<crate::spare::SpareSpawn>,
+}
+
+impl SessionFactory {
+    /// What a spare spawned by this factory shares with a cold tab spawned by
+    /// it now (`crate::spare`'s gate G4): every field that shapes the shell or
+    /// its session, and the process environment. Not the colours (a parked
+    /// spare catches up at landing; a warm one is checked apart). Exhaustive
+    /// destructuring: a new field does not compile until it is classified here.
+    pub(crate) fn spawn_fingerprint(&self) -> u64 {
+        use std::hash::{Hash as _, Hasher as _};
+        let Self {
+            spawn_cap: _,
+            sandbox_cap: _,
+            env_add,
+            exec_command,
+            shell_override,
+            shell_args,
+            cwd,
+            sandbox_wrap,
+            terminal_config: _,
+            integrate,
+            lat_epoch: _,
+            loop_idle: _,
+            notify_tx: _,
+            allow_kitty_file_transfer,
+            temporal_recording,
+            defer_adopted_readers: _,
+            reader_after_install: _,
+            fg_probe: _,
+            fg_gone: _,
+            rekey_deferred: _,
+            spare: _,
+        } = self;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        "aterm-spawn-fingerprint-v1".hash(&mut h);
+        env_add.hash(&mut h);
+        exec_command.hash(&mut h);
+        shell_override.hash(&mut h);
+        shell_args.hash(&mut h);
+        cwd.hash(&mut h);
+        sandbox_wrap.hash(&mut h);
+        integrate.hash(&mut h);
+        temporal_recording.hash(&mut h);
+        allow_kitty_file_transfer.hash(&mut h);
+        aterm_containment::mode_or_containment()
+            .level()
+            .hash(&mut h);
+        daily_driver_limits().open_files.hash(&mut h);
+        // The process environment every shell inherits (the control dir a
+        // shell is told derives from it: `$XDG_RUNTIME_DIR`, else `$HOME`).
+        // It is fixed once `main`'s prologue is done (a `set_var` beside
+        // another thread is a data race, so nothing moves it while a spare can
+        // exist): hashed once, at first use, so no tick or Cmd-T on the main
+        // thread walks it, sorts it or stats a folder for it.
+        static LAUNCH_ENV: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        LAUNCH_ENV
+            .get_or_init(|| {
+                let mut env = std::collections::hash_map::DefaultHasher::new();
+                let mut vars: Vec<_> = std::env::vars_os().collect();
+                vars.sort();
+                vars.hash(&mut env);
+                env.finish()
+            })
+            .hash(&mut h);
+        h.finish()
+    }
 }
 
 /// The commit latch a new session holds: the incoming overlap handoff's Commit
@@ -739,7 +970,7 @@ pub(crate) fn provision_child_recursion_env() -> (Vec<(String, String)>, ChildPr
 /// With no private socket dir, or when the file cannot be written, nothing is
 /// appended: the child installs no parent edges and the outer's `@child`
 /// forward answers `ERR auth` (fail-closed). The tokens never enter the
-/// inheritable environment (`aterm_spec::derive::capability_secrecy_model`). A
+/// inheritable environment (`aterm_models_effects::capability_secrecy_model`). A
 /// dir that refuses the file is logged.
 fn append_edge_token_channel(
     env: &mut Vec<(String, String)>,
@@ -859,7 +1090,7 @@ fn register_injected_parent_edges(ctx: &SessionCtx) {
 /// A PTY master handed across a seamless re-exec and not yet adopted. It owns
 /// the descriptor: dropped un-adopted it closes it, so a handed-off master is
 /// always either adopted ([`HandedMaster::into_sink`]) or closed
-/// (`aterm_spec::derive::fd_handoff_no_leak_model`). An open un-adopted master
+/// (`aterm_models_session::fd_handoff_no_leak_model`). An open un-adopted master
 /// would be a readerless PTY whose shell blocks once the buffer fills.
 ///
 /// A number below 3 is never closed: no handoff names one, and `-1` is the
@@ -1045,11 +1276,11 @@ pub(crate) struct Adopted {
     /// The record's newest timeline id (round seven, finding 50): the adopted
     /// timeline counts on above it ([`mark_handoff_gap`]). `0`: none carried.
     pub timeline_id: u64,
-    /// The session log's epoch and node-id counters the record carried
-    /// (`SessionRecord::log_ids`): the adopted log continues them
-    /// ([`mark_handoff_gap`]). `None`: none carried (an older producer, a
-    /// keeper's shell), and the log starts at its first epoch.
-    pub log_carry: Option<crate::session_log::LogCarry>,
+    /// The session log's epoch, node-id counters and seq count the record
+    /// carried (`SessionRecord::log_ids`, `SessionRecord::log_seq`): the
+    /// adopted log continues them ([`mark_handoff_gap`]). Default: none
+    /// carried (an older producer, a keeper's shell).
+    pub log: crate::session_log::LogAdopt,
     /// The pair the crash journal image this window takes over at its Commit
     /// keys this shell by, when the outgoing process held an image that was not
     /// its own (`SessionRecord::journal_key`, round seven's leftover I2b).
@@ -1074,7 +1305,7 @@ pub(crate) fn mark_handoff_gap(
     temporal: &std::sync::Mutex<crate::temporal::TemporalRecorder>,
     from_build: Option<u64>,
     timeline_id: u64,
-    log: Option<crate::session_log::LogCarry>,
+    log: crate::session_log::LogAdopt,
     keeper: bool,
 ) {
     let gap = crate::session_timeline::HandoffGap { from_build };
@@ -1268,6 +1499,44 @@ pub(crate) fn hydrate_adopted_engine(
     }
 }
 
+/// The session log an adopted session continues: the counts its manifest
+/// record carried (`Adopted::log`: epoch, node ids, seq, the keeper's epoch)
+/// with the carried log's lines, which ride the control sidecar and are taken
+/// off it here (`handoff_carry::ControlCarry::take_log`), before the rest of
+/// the sidecar goes to the engine. No sidecar, or one without the member: no
+/// lines, and the log starts over after its handoff gap.
+pub(crate) fn adopted_log(
+    log: &crate::session_log::LogAdopt,
+    control: Option<&mut crate::handoff_carry::ControlCarry>,
+) -> crate::session_log::LogAdopt {
+    let (lines, mirror) = control.map_or((None, None), |c| (c.take_log(), c.take_log_mirror()));
+    crate::session_log::LogAdopt {
+        lines,
+        mirror,
+        ..log.clone()
+    }
+}
+
+/// THE ADOPTED LOG MEETS ITS ENGINE: after [`hydrate_adopted_engine`] and
+/// before the reader starts, the engine's next block id and C count, read
+/// under its lock, then handed to the session log under the timeline's (one
+/// lock at a time), whose carried block cursor must fit them
+/// (`session_log::SessionLog::fit_engine`): a screen that did not cross
+/// leaves an engine whose block ids start over.
+pub(crate) fn fit_adopted_log(
+    term: &Mutex<Terminal>,
+    timeline: &std::sync::Mutex<crate::session_timeline::SessionTimeline>,
+) {
+    let (next_block, started) = {
+        let engine = term_lock(term);
+        (engine.next_block_id(), engine.started_command_seq())
+    };
+    timeline
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .slog_fit_engine(next_block, started);
+}
+
 /// Install an adopted session's carried archive ([`hydrate_adopted_engine`]),
 /// and say so when it carried rows that were refused (`AltArchive::import`:
 /// an archive switched off here, or indices no archive reaches), so a
@@ -1374,7 +1643,7 @@ pub(crate) fn apply_pty_keyboard_posture(term: &Mutex<Terminal>, master: i32) {
     term_lock(term).set_console_host_posture(policy);
 }
 
-/// The `rlimit` set a daily-driver (`user`/`master`) shell is spawned with:
+/// The `rlimit` set a daily-driver (`user`) shell is spawned with:
 /// the launcher's, unchanged — except the soft descriptor limit, when this
 /// process raised its own to claim a launched handoff's grant (round six of
 /// the update audit, item 39, review round two) or to park its sessions for an
@@ -1437,16 +1706,30 @@ pub(crate) fn spawn_session(
     // (its PTY master fd, pid and identity) instead of forking a fresh one.
     mut adopt: Option<Adopted>,
 ) -> std::io::Result<Session> {
+    // A warm spare (`crate::spare`): nobody asked for this shell yet.
+    let spare = factory.spare.as_ref();
     // The coding-agent primer rides every FRESH spawn (an adopted shell is
     // already running; whatever agent it hosts was primed when it was first
-    // spawned): throttled and detached, so it costs this spawn nothing.
-    if adopt.is_none() {
+    // spawned): throttled and detached, so it costs this spawn nothing. A
+    // spare's runs at its adoption.
+    if adopt.is_none() && spare.is_none() {
         prime_agents_if_due();
+    }
+    // The name the machine has now is the one this shell's `$HOST` will hold:
+    // a citation's OSC 7 host is judged against it however the network renames
+    // the machine later (`tab_label::names_this_machine`). One syscall.
+    if adopt.is_none() {
+        crate::tab_label::note_this_machine_name();
     }
     // A recovered master's release obligation, held to the registration at
     // the end: any failure on the way drops it, which releases the keeper's
     // copy (`keeper_link::Claim`).
-    let keeper_claim = adopt.as_mut().and_then(|adopted| adopted.keeper.take());
+    let mut keeper_claim = adopt.as_mut().and_then(|adopted| adopted.keeper.take());
+    // What the crash restore brought back for a recovered master (its rung and
+    // losses), recorded on the session for `status restore=` once it exists.
+    let restore_report = keeper_claim
+        .as_mut()
+        .and_then(crate::keeper_link::Claim::take_restore);
     // A shell the keeper kept has no parked twin: no outgoing process resumes
     // it, and no Commit will come for it (a launch that took the keeper's
     // offers is no update's candidate; a degraded one boots as a plain window).
@@ -1484,9 +1767,11 @@ pub(crate) fn spawn_session(
         .map(|adopted| adopted.fabric.clone())
         .unwrap_or_default();
     let adopt_timeline_id: u64 = adopt.as_ref().map_or(0, |adopted| adopted.timeline_id);
-    // …and the session log's epoch and node-id counters.
-    let adopt_log_carry: Option<crate::session_log::LogCarry> =
-        adopt.as_ref().and_then(|adopted| adopted.log_carry);
+    // …and the session log's epoch, node-id counters and seq count.
+    let adopt_log: crate::session_log::LogAdopt = adopt
+        .as_ref()
+        .map(|adopted| adopted.log.clone())
+        .unwrap_or_default();
     // …and the build that handed it across, for the handoff gap.
     let adopt_from_build: Option<u64> = adopt.as_ref().and_then(|adopted| adopted.outgoing_build);
     // …and the title the park captured (or the record names), for a
@@ -1508,6 +1793,25 @@ pub(crate) fn spawn_session(
         Some(adopted) => adopted.identity.clone(),
         None => identity.map(str::to_owned),
     };
+    // A fresh interactive shell that cannot start — a `$SHELL` or `shell` naming
+    // nothing this user can run — is replaced by the account's login shell, else
+    // `/bin/sh`, and the pane says so ([`substitute_shell`]): a launch from the
+    // desktop menu otherwise ended with no window and the reason only in the
+    // journal. Decided before the integration, which is prepared for the shell
+    // that will run — and run without the `shell_args` the broken one was given.
+    let substitute = records_shell_start(adopt.is_some(), factory.exec_command.as_deref())
+        .then(|| {
+            substitute_shell(
+                factory.shell_override.as_deref(),
+                factory.shell_args.as_deref(),
+            )
+        })
+        .flatten();
+    let (shell_override, shell_args) = shell_to_start(
+        substitute.as_ref(),
+        factory.shell_override.as_deref(),
+        factory.shell_args.as_deref(),
+    );
     // Per-tab shell integration: a FRESH nonce per session. Reusing a nonce
     // across tabs would let tab A's (untrusted) output emit tab B's authorized
     // OSC 133/633 marks; a distinct nonce per engine prevents that cross-tab
@@ -1519,7 +1823,7 @@ pub(crate) fn spawn_session(
         // first spawn). No fresh nonce, no env, no argv override on this path.
         (Vec::new(), None, None)
     } else if factory.integrate {
-        match prepare_shell_integration(factory.shell_override.as_deref()) {
+        match prepare_shell_integration(shell_override, shell_args) {
             Some((si_env, argv_override, nonce, shell)) => {
                 integrated_shell = Some(shell);
                 let mut env = factory.env_add.clone();
@@ -1542,6 +1846,12 @@ pub(crate) fn spawn_session(
     } else {
         (factory.env_add.clone(), None, None)
     };
+
+    // A substitute for a broken `$SHELL` is the shell the child's programs are
+    // told to start too (`vim`'s `:shell`, `make`).
+    if let Some(pair) = substitute.as_ref().and_then(|sub| sub.shell_env.clone()) {
+        env_add.push(pair);
+    }
 
     // Recursion provisioning: the root session adopts its fabric identity from
     // the injected env (so an outer aterm's preminted edges name us); other tabs
@@ -1579,6 +1889,20 @@ pub(crate) fn spawn_session(
         ));
         rekey_channel = true;
     }
+    // A spare holds only where its shell can: an integrated zsh/bash told its
+    // re-key path, from which it derives the FIFO's. The FIFO exists before the
+    // fork (dropped, on any failure below, it is unlinked).
+    let spare_fifo = match spare {
+        Some(_)
+            if !(integrated_shell.is_some_and(aterm_core::shell_integration::has_spare_hold)
+                && offers_rekey
+                && rekey_path.is_some()) =>
+        {
+            return Err(std::io::Error::other("this shell cannot wait as a spare"));
+        }
+        Some(_) => Some(crate::spare::SpareFifo::make(&self_id)?),
+        None => None,
+    };
     // The body pointer (`shell_body`): a fresh integrated zsh/bash/fish is told
     // where a newer body would be named (`<control dir>/integration/<sid>`) and
     // its loader checks it at every prompt. No private control dir: no pointer.
@@ -1678,7 +2002,7 @@ pub(crate) fn spawn_session(
                 )
             }
             None => {
-                // Daily-driver modes (User, the default, and Master) inherit the
+                // The daily-driver mode (User, the default) inherits the
                 // launching shell's limits so programs reserving large address
                 // spaces are not constrained (`aterm_sandbox::Limits::inherit`);
                 // Safety gets the soft caps, a guardrail its rc can raise, and
@@ -1687,7 +2011,7 @@ pub(crate) fn spawn_session(
                 let limits = {
                     use aterm_containment::ContainmentMode as Cm;
                     match aterm_containment::mode_or_containment() {
-                        Cm::Master | Cm::User => daily_driver_limits(),
+                        Cm::User => daily_driver_limits(),
                         Cm::Safety => aterm_sandbox::Limits::shell_default(),
                         // Fail-safe to contained for an unrecognized mode.
                         _ => aterm_sandbox::Limits::contained(),
@@ -1697,6 +2021,11 @@ pub(crate) fn spawn_session(
                 // reported once the shell is up.
                 let start =
                     crate::spawn_folder::start_folder(cwd_override.or(factory.cwd.as_deref()));
+                // A spare whose folder would fall back is no spare: nothing is
+                // said for a shell nobody asked for.
+                if spare.is_some() && start.fell_back.is_some() {
+                    return Err(std::io::Error::other("the spare's folder would fall back"));
+                }
                 // Capture the child pid (`spawn_shell_with_pid`) so `Session::drop` can HANG
                 // UP the session (SIGHUP) before closing the master — the non-blocking
                 // teardown that keeps the UI thread off the tty lock (see `Session::drop`).
@@ -1706,8 +2035,8 @@ pub(crate) fn spawn_session(
                     &factory.spawn_cap,
                     &factory.sandbox_cap,
                     &env_add,
-                    factory.shell_override.as_deref(),
-                    factory.shell_args.as_deref(),
+                    shell_override,
+                    shell_args,
                     argv_override.as_deref(),
                     factory.exec_command.as_deref(),
                     start.cwd.as_deref(),
@@ -1720,6 +2049,12 @@ pub(crate) fn spawn_session(
                 // Recursion provisioning (the `PROXIES` entry and edge-token file)
                 // happened before this fallible spawn; on failure `child_proxy`
                 // drops on the `?` and retires both, so failed spawns leak nothing.
+                // A fall back to the Windows console host (aterm.toml `conpty`) is
+                // handed to the log once, whether or not this spawn succeeded; never
+                // anything off Windows.
+                if let Some(note) = aterm_pty::take_console_host_fallback() {
+                    aterm_log::warn!("console host: {note}");
+                }
                 let aterm_pty::SpawnedShell { master, pid } = spawned?;
                 start.say();
                 // SAFETY: `master` is this session's forkpty master, freshly returned
@@ -1739,7 +2074,7 @@ pub(crate) fn spawn_session(
     // Its driven input is read before anything could write a key to it.
     let shell_start = shell_started_at.map(|at| ShellStart {
         at,
-        name: interactive_shell_name(factory.shell_override.as_deref()),
+        name: interactive_shell_name(shell_override),
         input: sink.driven_input(),
     });
     // Per-session asciicast v2 recorder, sized from this session's initial grid.
@@ -1759,11 +2094,16 @@ pub(crate) fn spawn_session(
         rows,
         cols,
         factory.terminal_config.as_ref(),
-        factory.appearance,
         cell_px,
     )));
     // …and hand its lock-free input-mode mirror to the session context: the seam
     // reads it per key press instead of taking the terminal mutex.
+
+    // The substitute's line goes in before the reader starts, so it stands above
+    // the shell's first prompt.
+    if let Some(sub) = &substitute {
+        say_substitute(&term, sub);
+    }
 
     // Per-session fabric identity (day-one single local session: a fresh id+nonce).
     let ctx = Arc::new(SessionCtx {
@@ -1771,7 +2111,7 @@ pub(crate) fn spawn_session(
         output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
         modes: crate::mode_mirror_of(&term),
         ui_waiting: Arc::default(),
-        edges: std::sync::Mutex::new(EdgeTable::new()),
+        edges: std::sync::Arc::new(std::sync::Mutex::new(EdgeTable::new())),
         turn_lease: std::sync::Mutex::new(None),
         self_id,
         nonce: self_nonce,
@@ -1791,13 +2131,26 @@ pub(crate) fn spawn_session(
             crate::session_timeline::SessionTimeline::default(),
         )),
         fabric: std::sync::Arc::default(),
+        idem: Default::default(),
         rewrap_gauge: std::sync::Arc::default(),
         human_input: Default::default(),
+        launch: Default::default(),
         generation_look: Default::default(),
         reset_lane: Default::default(),
+        crash_journal: Default::default(),
         update_parked: Default::default(),
         fenced_writes: Default::default(),
+        // A spare's is its link's, which its reader and the main thread share.
+        witness: spare.map_or_else(Arc::default, |s| Arc::clone(&s.link.witness)),
     });
+    // The shell this session runs, for the spare's gate (its start record is
+    // judged against it); a spare also holds its FIFO from here.
+    if !adopted && integrated_shell.is_some() {
+        ctx.witness.note_shell(pid);
+    }
+    if let Some(fifo) = spare_fifo {
+        ctx.witness.hold_fifo(fifo);
+    }
     // ROOT session only: record the edges the OUTER aterm preminted for us (from
     // our injected env), so it holds the read/write/signal authority it granted.
     if id == 0 {
@@ -1806,6 +2159,9 @@ pub(crate) fn spawn_session(
     // THE HANDOFF GAP (round five, item 17): an adopted session's recorders
     // start here, empty, and say so — first, before the fabric and claim
     // seeds below write their rows.
+    // The carried session log rides the control sidecar: taken off it here,
+    // before the engine is hydrated with the rest (none for a fresh spawn).
+    let adopt_log = adopted_log(&adopt_log, adopt_control.as_mut());
     if adopted {
         mark_handoff_gap(
             &ctx.timeline,
@@ -1813,7 +2169,7 @@ pub(crate) fn spawn_session(
             &ctx.temporal,
             adopt_from_build,
             adopt_timeline_id,
-            adopt_log_carry,
+            adopt_log,
             recovered,
         );
     }
@@ -1870,6 +2226,10 @@ pub(crate) fn spawn_session(
         // is replayed: input past this point means the person took the session
         // back, and the viewport restore stands aside for them.
         adopt_history.watch_input(&ctx.output_echo);
+        // The adopted log's block cursor against the engine it now reads.
+        if adopted {
+            fit_adopted_log(&term, &ctx.timeline);
+        }
     }
     // THE RENDER DEBT (R08): the rows the outgoing engine owed this session's
     // alternate screen, on the restored engine, and the ledger's first look at
@@ -1921,13 +2281,13 @@ pub(crate) fn spawn_session(
     }
 
     // What aterm, unsandboxed, does at this tab's program's request: decided
-    // once, from the mode its shell runs under ([`host_reach`]).
-    let reach = host_reach(aterm_containment::mode_or_containment());
-    configure_clipboard(&term, reach);
-    configure_notifications(&term, reach, &factory.notify_tx, id);
-    // Kitty file/shm transfer mediums — only when the user opted in (default off).
-    if factory.allow_kitty_file_transfer {
-        configure_kitty_file_transfer(&term, reach);
+    // once, from the mode its shell runs under ([`host_reach`]). A spare's
+    // program reaches nothing: its requests only taint it until its adoption
+    // arms the same wiring ([`arm_host_reach`]).
+    let reach = session_host_reach();
+    match spare {
+        Some(s) => crate::spare::wire_spare_taint(&term, &s.link),
+        None => arm_host_reach(&term, reach, factory, proxy, id, window, &ctx.witness),
     }
 
     // POL-1: this tab's OWN `standard`-profile policy engine, installed BEFORE its
@@ -1936,12 +2296,49 @@ pub(crate) fn spawn_session(
         aterm_policy::profiles::standard(),
     ));
 
-    configure_bell(&term, proxy, id, window);
     configure_palette_refusal(&term);
-    // XTWINOPS host transport (Linux): the engine gates on `allow_window_ops`
-    // in-core; without this callback an authorized `CSI 9;1t` was a no-op.
-    #[cfg(target_os = "linux")]
-    configure_window_ops(&term, proxy, id, window);
+
+    // THE CRASH-RESTORE JOURNAL (`crate::crash_restore`, on wherever the keeper link
+    // is and its keeper takes companions): the session's region, laid out, with its
+    // FIRST keyframe of the engine exactly as this spawn left it (fresh, or hydrated
+    // from an adoption) — after every setup above, before the reader starts and
+    // before the registration below tells the keeper the region exists. A region
+    // that cannot be made leaves the session without one, which `status` says.
+    match crate::keeper_link::journal_refusal() {
+        #[cfg(unix)]
+        None => match crate::crash_restore::SessionJournal::create(
+            id,
+            ctx.self_id.as_str(),
+            &term,
+            master,
+            factory.terminal_config.as_ref(),
+            Arc::clone(&ctx.reset_lane),
+        ) {
+            Ok(journal) => {
+                // Its history ring goes to the window's journal worker. An adopted
+                // session's export waits for its history import (an update's sidecar
+                // after Commit, a crash restore's ring after the recovery's restore
+                // drain), which puts older lines below the carried ones: exporting
+                // first would leave them out of this window's ring.
+                journal.start_export(&term, adopted);
+                ctx.crash_journal.install(journal);
+            }
+            Err(why) => {
+                aterm_log::warn!(
+                    "crash restore: session {id} runs without a journal ({why}); a crash \
+                     restores it blank"
+                );
+                ctx.crash_journal.turn_off(why);
+            }
+        },
+        #[cfg(not(unix))]
+        None => {}
+        Some(why) => ctx.crash_journal.turn_off(why.to_string()),
+    }
+    // What a keeper recovery restored for this session, for `status restore=`.
+    if let Some(report) = restore_report {
+        ctx.crash_journal.note_restored(report);
+    }
 
     // Wake coalescing: at most one `Wake::Output` in flight per session. The
     // reader arms it on a clear-to-armed edge; the handler clears it before the
@@ -1972,7 +2369,6 @@ pub(crate) fn spawn_session(
         pty_closed_at: Arc::default(),
         id,
         term,
-        vi_active: Arc::new(AtomicBool::new(false)),
         adopt_pulse_hold: Arc::new(AtomicBool::new(false)),
         master,
         pid,
@@ -2014,8 +2410,13 @@ pub(crate) fn spawn_session(
         // The history carry, imported at Commit (`crate::handoff_history`);
         // `None` for a fresh shell.
         handoff_history: adopted.then_some(adopt_history),
-        // A master of its own, fresh or adopted: counted in the PTY census.
-        _pty_census: crate::metrics::PtyCensus::counted(),
+        // A master of its own, fresh or adopted: counted in the PTY census. A
+        // spare's is counted apart until its adoption swaps it.
+        _pty_census: if spare.is_some() {
+            crate::metrics::PtyCensus::spare()
+        } else {
+            crate::metrics::PtyCensus::counted()
+        },
         // The incoming handoff's Commit (round seven, item 20): until it, the
         // parked predecessor owns an adopted shell, and dropping this session
         // must not signal it.
@@ -2036,7 +2437,14 @@ pub(crate) fn spawn_session(
     // spawned off the event loop, whose reader starts parked until the tab is
     // installed (`SessionFactory::reader_after_install`).
     if !(adopted && factory.defer_adopted_readers && !recovered) && !factory.reader_after_install {
-        attach_reader(&mut session, window, proxy, factory).map_err(std::io::Error::other)?;
+        match spare {
+            // A spare's reader runs live (its rc's queries are answered), and
+            // posts through the spare's link, which swallows every wake until
+            // the adoption.
+            Some(s) => attach_reader_with_post(&mut session, window, s.link.post(), factory),
+            None => attach_reader(&mut session, window, proxy, factory),
+        }
+        .map_err(std::io::Error::other)?;
     }
 
     // An adopted alt-screen TUI restores as stale pixels it does not know to
@@ -2078,7 +2486,11 @@ pub(crate) fn spawn_session(
     // adopted, is registered with a close-on-exec duplicate — held until the
     // Commit in an update's candidate (`keeper_link::register`). One relaxed
     // load when the keeper is off.
-    crate::keeper_link::register(&session, keeper_claim);
+    // A spare registers at its adoption: a crash before it must not let the
+    // keeper restore a shell nobody asked for as a tab.
+    if spare.is_none() {
+        crate::keeper_link::register(&session, keeper_claim);
+    }
 
     Ok(session)
 }
@@ -2175,14 +2587,15 @@ fn pulse_adopted_pty(
             restore.run();
             return;
         }
-        let spawned = std::thread::Builder::new()
-            .name("aterm-adopt-pulse".into())
-            .spawn(move || {
+        let spawned = crate::qos::spawn_lane_thread(
+            "aterm-adopt-pulse",
+            crate::qos::Role::Responsive,
+            move || {
                 // It takes the engine lock the UI thread contends: the floor.
-                crate::qos::set_self(crate::qos::Role::Responsive);
                 std::thread::sleep(ADOPTION_PULSE_HOLD);
                 restore.run();
-            });
+            },
+        );
         if let Err(error) = spawned {
             // No thread: end the pulse now rather than leave the program at
             // `rows-1`. It may not repaint, but it is never left mis-sized.
@@ -2330,131 +2743,15 @@ pub(crate) fn seed_adopted_render_debt(
 /// left alone: its line editor redrawing over an exact screen is only churn.
 /// Named so the rule is tested without a PTY.
 #[cfg(any(unix, test))]
-fn adoption_needs_size_pulse(
+pub(crate) fn adoption_needs_size_pulse(
     checkpoint: Option<&aterm_core::terminal::TerminalCheckpoint>,
     repaint: bool,
 ) -> bool {
     repaint || checkpoint.is_some_and(|cp| cp.modes.alternate_screen)
 }
 
-/// `spawn_session`'s source text, for the tests that pin what its body wires.
-#[cfg(test)]
-fn spawn_session_body() -> &'static str {
-    let src = include_str!("spawn.rs");
-    let start = src
-        .find("pub(crate) fn spawn_session(")
-        .expect("spawn_session is defined here");
-    let body = &src[start..];
-    &body[..body.find("\n}\n").expect("the body ends")]
-}
-
 #[cfg(test)]
 mod adoption_wiring_tests {
-    /// AUDIT #7 FINDING 48 — a FRESH spawn starts where
-    /// `spawn_folder::start_folder` decided: the folder asked for (the
-    /// override, else `-d`) goes through it, its `cwd` is what the PTY is
-    /// handed, and the fall-back is said only once the shell is up (a failed
-    /// spawn notes nothing). Checked by reading the source, as the pins below
-    /// are: `spawn_folder`'s tests drive the decision and the queue, and
-    /// without this the PTY could be handed the folder asked for while every
-    /// one of them stayed green.
-    #[test]
-    fn spawn_session_hands_the_pty_the_start_folder_and_says_it_after_the_spawn() {
-        let body = crate::spawn::spawn_session_body();
-        let decided = body
-            .find("crate::spawn_folder::start_folder(cwd_override.or(factory.cwd.as_deref()))")
-            .expect("the start folder is decided from the override, else -d");
-        let pty = body
-            .find("aterm_pty::spawn_shell_with_pid_cell_px(")
-            .expect("the fresh spawn");
-        let args = &body[pty..pty + body[pty..].find(");").expect("the call ends")];
-        assert!(
-            args.contains("start.cwd.as_deref(),"),
-            "the PTY gets it: {args}"
-        );
-        assert!(
-            !args.contains("cwd_override"),
-            "not the folder asked for: {args}"
-        );
-        let spawned = body.find("= spawned?;").expect("the spawn's result");
-        let said = body.find("start.say();").expect("the fall-back is said");
-        assert!(
-            decided < pty && pty < spawned && spawned < said,
-            "in that order"
-        );
-        assert_eq!(body.matches("start.say()").count(), 1, "said once");
-    }
-
-    /// `spawn_session` puts back EVERY adopted engine through
-    /// `hydrate_adopted_engine` — the seam the re-key tests drive
-    /// (`shell_rekey::tests`) — handing it the session's re-key channel, and
-    /// restores or authorizes nothing on the side. Checked by reading the
-    /// source, because a unit test cannot build the event-loop proxy
-    /// `spawn_session` needs (the same source-wiring-guard idiom as
-    /// `every_non_boot_spawn_site_hands_over_a_real_cell_box`): without it,
-    /// deleting the call, or dropping the channel from it, would leave every
-    /// re-key test green while no adopted shell is re-keyed.
-    #[test]
-    fn spawn_session_hydrates_every_adopted_engine_through_the_one_seam() {
-        let body = crate::spawn::spawn_session_body();
-        let calls: Vec<&str> = body
-            .match_indices("hydrate_adopted_engine(")
-            .map(|(at, _)| &body[at..(at + 400).min(body.len())])
-            .collect();
-        assert_eq!(calls.len(), 1, "one call, for every adopted engine");
-        let args = &calls[0][..calls[0].find(");").expect("the call ends")];
-        for arg in [
-            "adopt_checkpoint",
-            "adopt_control",
-            "rekey_path",
-            "rekey_deferred",
-            "id",
-            "adopt_history",
-        ] {
-            assert!(args.contains(arg), "the call hands over `{arg}`: {args}");
-        }
-        for inline in [
-            "restore_checkpoint(",
-            "authorize_adopted_shell_nonce(",
-            "hold_adopted_shell_nonce_requirement(",
-            "shell_rekey::hand_over(",
-        ] {
-            assert!(
-                !body.contains(inline),
-                "`{inline}` belongs to hydrate_adopted_engine, not beside it"
-            );
-        }
-    }
-
-    /// THE COMMIT LATCH IS WIRED WHERE THE SESSION IS BUILT (round seven, item
-    /// 20): `spawn_session` sets `Session::handoff_commit` from
-    /// `adopted_handoff_commit` over the factory's `rekey_deferred`, with the
-    /// session's own `adopted` and `recovered` — once, in the struct it
-    /// returns. The helper's decision and the drop it protects are driven by
-    /// `session_teardown_identity_tests::a_session_built_through_the_spawn_s_latch_keeps_only_an_uncommitted_adopted_shell`;
-    /// this pins the one line that connects them, which a unit test cannot
-    /// reach (`spawn_session` needs an event-loop proxy). Without it, setting
-    /// the field to `None` reopened the finding with every test green.
-    #[test]
-    fn spawn_session_hands_an_adopted_session_the_handoff_s_commit_latch() {
-        let body = crate::spawn::spawn_session_body();
-        let wire = "handoff_commit: adopted_handoff_commit(adopted, recovered, factory.rekey_deferred.as_ref()),";
-        assert_eq!(body.matches("handoff_commit:").count(), 1, "one field init");
-        assert_eq!(
-            body.matches(wire).count(),
-            1,
-            "wired through the helper: {wire}"
-        );
-        // The two conditions are the session's own facts, bound once, above.
-        let recovered = body
-            .find("let recovered = keeper_claim.is_some();")
-            .expect("recovered: a shell the PTY keeper kept");
-        let adopted = body
-            .find("let adopted = adopt.is_some();")
-            .expect("adopted: a shell handed over by the handoff");
-        let wired = body.find(wire).expect("wired");
-        assert!(recovered < wired && adopted < wired);
-    }
 
     /// THE HANDOFF GAP (round five, item 17): the timeline, the cast and the
     /// temporal recorder of an adopted session start empty in this process —
@@ -2478,7 +2775,15 @@ mod adoption_wiring_tests {
             let timeline = StdMutex::new(crate::session_timeline::SessionTimeline::default());
             let cast = StdMutex::new(crate::cast::CastRecorder::new(80, 24));
             let temporal = StdMutex::new(crate::temporal::TemporalRecorder::new());
-            super::mark_handoff_gap(&timeline, &cast, &temporal, from_build, 0, None, false);
+            super::mark_handoff_gap(
+                &timeline,
+                &cast,
+                &temporal,
+                from_build,
+                0,
+                Default::default(),
+                false,
+            );
             // …and a row recorded after it (the fabric seed, the registration).
             timeline
                 .lock()
@@ -2509,135 +2814,6 @@ mod adoption_wiring_tests {
         }
         assert!(!fresh_cast.contains("aterm_handoff"), "{fresh_cast}");
         assert_eq!(fresh_temporal, "", "a fresh recorder's status is unchanged");
-
-        // The seam is called by `spawn_session`, for an adopted session only,
-        // before the fabric seed writes the first other row.
-        let body = crate::spawn::spawn_session_body();
-        let calls: Vec<usize> = body
-            .match_indices("mark_handoff_gap(")
-            .map(|(at, _)| at)
-            .collect();
-        assert_eq!(calls.len(), 1, "one mark, for every adopted session");
-        let call = &body[calls[0]..];
-        let args = &call[..call.find(");").expect("the call ends")];
-        for arg in [
-            "ctx.timeline",
-            "ctx.cast",
-            "ctx.temporal",
-            "adopt_from_build",
-            "adopt_timeline_id",
-        ] {
-            assert!(args.contains(arg), "the call hands over `{arg}`: {args}");
-        }
-        let guard = &body[..calls[0]];
-        assert!(
-            guard.trim_end().ends_with("if adopted {"),
-            "only an adopted session is marked"
-        );
-        let fabric_at = body.find("seed_adopted_fabric(").expect("the fabric seed");
-        assert!(calls[0] < fabric_at, "the handoff row is the first row");
-    }
-
-    /// `spawn_session` puts back EVERY adopted session's fabric — its topic
-    /// opt-ins and its standing HALT — through `seed_adopted_fabric`, the seam
-    /// `session_store`'s and `seamless`'s hold tests drive, and
-    /// seeds nothing on the side. Pinned by source like the hydrate seam
-    /// above: without it, deleting the call would leave every hold test green
-    /// while each seamless update lifted every halt again (the round-four
-    /// plan, item 3). And it runs inside `spawn_session`, which returns before
-    /// its caller registers the session — no control verb can reach an
-    /// adopted session before its halt is back.
-    #[test]
-    fn spawn_session_seeds_every_adopted_fabric_through_the_one_seam() {
-        let body = crate::spawn::spawn_session_body();
-        let calls: Vec<&str> = body
-            .match_indices("seed_adopted_fabric(")
-            .map(|(at, _)| &body[at..(at + 200).min(body.len())])
-            .collect();
-        assert_eq!(calls.len(), 1, "one seed, for every adopted session");
-        let args = &calls[0][..calls[0].find(");").expect("the call ends")];
-        for arg in [
-            "ctx.fabric",
-            "ctx.timeline",
-            "adopt_topics",
-            "adopt_holds",
-            "adopt_fabric",
-        ] {
-            assert!(args.contains(arg), "the call hands over `{arg}`: {args}");
-        }
-        for inline in [
-            "set_topics(",
-            "seed_holds(",
-            "parse_holds(",
-            "parse_hold(",
-            "register_session(",
-        ] {
-            assert!(
-                !body.contains(inline),
-                "`{inline}` does not belong in spawn_session beside the seed"
-            );
-        }
-        // …and the record's title (item 8a), through its one seam, AFTER the
-        // hydrate that decides whether the checkpoint carried a title.
-        let title_at = body
-            .find("seed_adopted_title(&term, adopt_checkpoint.as_ref(), &adopt_title)")
-            .expect("spawn_session seeds the record's title through its one seam");
-        let hydrate_at = body
-            .find("hydrate_adopted_engine(")
-            .expect("the hydrate call");
-        assert!(hydrate_at < title_at, "the title seed follows the hydrate");
-        // …and another supervisor's lease and the keyed escalations (item 9),
-        // through the seam `session_store`'s carry test and its Tier-1 bind
-        // drive, onto this session's own meta — deleting it would leave both
-        // green while every update dropped the claims again.
-        let claims: Vec<&str> = body
-            .match_indices("seed_carried_claims(")
-            .map(|(at, _)| &body[at..(at + 200).min(body.len())])
-            .collect();
-        assert_eq!(claims.len(), 1, "one claim seed, for every adopted session");
-        let args = &claims[0][..claims[0].find(");").expect("the call ends")];
-        for arg in [
-            "ctx.meta",
-            "ctx.timeline",
-            "adopt_supervisor",
-            "adopt_attention",
-        ] {
-            assert!(args.contains(arg), "the call hands over `{arg}`: {args}");
-        }
-    }
-
-    /// THE BODY POINTER OF AN ADOPTED SHELL (2026-09-26) is written by the one
-    /// spawn seam, for an adopted shell with a loader, naming the revision the
-    /// carry brought (so a shell already on this build's body is left alone) and
-    /// through the overlap handoff's Commit queue; and a FRESH shell is offered
-    /// the pointer only when it is a zsh/bash/fish under integration. Pinned by
-    /// source, as the hydrate seam above is: every `shell_body` test would stay
-    /// green with the call deleted, while no adopted shell ever moved.
-    #[test]
-    fn spawn_session_points_every_adopted_loader_shell_at_this_builds_body() {
-        let body = crate::spawn::spawn_session_body();
-        let calls: Vec<&str> = body
-            .match_indices("crate::shell_body::hand_over(")
-            .map(|(at, _)| &body[at..(at + 200).min(body.len())])
-            .collect();
-        assert_eq!(calls.len(), 1, "one pointer write, at adoption");
-        for arg in ["path", "id", "carried_rev", "rekey_deferred"] {
-            assert!(
-                calls[0].contains(arg),
-                "the call hands over `{arg}`: {}",
-                calls[0]
-            );
-        }
-        let guard = &body[..body.find("crate::shell_body::hand_over(").expect("called")];
-        let guard = &guard[guard.rfind("if adopted").expect("guarded by the adoption")..];
-        assert!(
-            guard.contains("body_loader"),
-            "only a shell with a loader: {guard}"
-        );
-        assert!(
-            body.contains("has_body_loader") && body.contains("crate::shell_body::POINTER_VAR"),
-            "a fresh zsh/bash/fish is offered the pointer"
-        );
     }
 }
 
@@ -2708,13 +2884,7 @@ mod pty_keyboard_posture_tests {
         .union(KeyboardMode::REPORT_ASSOCIATED_TEXT);
 
     fn live_engine() -> Mutex<Terminal> {
-        Mutex::new(new_live_terminal(
-            24,
-            80,
-            None,
-            aterm_types::Appearance::Dark,
-            None,
-        ))
+        Mutex::new(new_live_terminal(24, 80, None, None))
     }
 
     /// What an application sees when it probes and then pushes, as the live
@@ -2829,26 +2999,6 @@ mod pty_keyboard_posture_tests {
                 .contains(KeyboardMode::WIN32_INPUT)
         );
     }
-
-    /// `spawn_session` applies the posture to EVERY session it builds, once,
-    /// after the hydrate (a restored checkpoint replaces the engine's modes,
-    /// capability bit included) and before the reader can parse a byte.
-    /// Checked by reading the source — a unit test cannot build the event-loop
-    /// proxy `spawn_session` needs — the idiom of
-    /// `spawn_session_hydrates_every_adopted_engine_through_the_one_seam`:
-    /// without it, deleting the call would leave both tests above green while
-    /// no live session got the posture.
-    #[test]
-    fn spawn_session_applies_the_posture_between_hydrate_and_reader() {
-        let body = crate::spawn::spawn_session_body();
-        let call = "apply_pty_keyboard_posture(&term, master);";
-        assert_eq!(body.matches(call).count(), 1, "one call, for every session");
-        let at = body.find(call).expect("called");
-        let hydrate = body.find("hydrate_adopted_engine(").expect("hydrates");
-        let reader = body.find("attach_reader(").expect("attaches its reader");
-        assert!(hydrate < at, "the posture follows the hydrate");
-        assert!(at < reader, "the posture precedes the reader");
-    }
 }
 
 #[cfg(test)]
@@ -2946,10 +3096,6 @@ mod adoption_pulse_tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
-        assert!(
-            pulsed.elapsed() >= super::ADOPTION_PULSE_HOLD,
-            "the transient size was held, not taken back at once"
-        );
         // The flag is lowered under the engine lock right after the write the
         // loop saw; take that lock so the read is ordered after it.
         drop(term.lock().expect("engine"));
@@ -3072,34 +3218,6 @@ mod adoption_pulse_tests {
         // SAFETY: `slave` is open; `ws` is a valid out-param for TIOCGWINSZ.
         assert_eq!(unsafe { libc::ioctl(slave, libc::TIOCGWINSZ, &mut ws) }, 0);
         (ws.ws_row, ws.ws_col, ws.ws_xpixel, ws.ws_ypixel)
-    }
-
-    /// And `spawn_session` pulses through it: no `(rows, cols)` of the spawn
-    /// reaches the adopted master's winsize.
-    #[test]
-    fn spawn_session_pulses_the_adopted_pty_at_the_engines_grid() {
-        let body = crate::spawn::spawn_session_body();
-        // Compared with whitespace removed: the formatter decides the wrapping.
-        let compact: String = body.split_whitespace().collect();
-        assert_eq!(
-            compact
-                .matches(concat!(
-                    "pulse_adopted_pty(master,&session.term,",
-                    "&session.adopt_pulse_hold,cell_px,hold,);"
-                ))
-                .count(),
-            1,
-            "the pulse reads the engine's grid and raises the session's hold"
-        );
-        assert!(
-            compact
-                .contains("lethold=ifadopt_repaint{PulseHold::Held}else{PulseHold::BackToBack};"),
-            "only a repaint adoption holds its pulse"
-        );
-        assert!(
-            !body.contains("aterm_pty::resize_with_cell_px("),
-            "no winsize write from the spawn's own (rows, cols)"
-        );
     }
 }
 
@@ -3236,10 +3354,7 @@ mod shell_integration_warn_tests {
 
 #[cfg(test)]
 mod agent_prime_tests {
-    use super::{
-        AGENT_PRIME_INTERVAL, AgentPrimeOutcome, agent_prime_permitted, due, run_agent_prime,
-    };
-    use std::time::{Duration, Instant};
+    use super::{AgentPrimeOutcome, agent_prime_permitted, run_agent_prime};
 
     /// A headless instance never primes, and neither does a unit test; a
     /// windowed, non-test process does (the negative control: the gate is
@@ -3252,28 +3367,6 @@ mod agent_prime_tests {
         assert!(
             agent_prime_permitted(false, false),
             "a windowed aterm primes"
-        );
-    }
-
-    /// The throttle: the first spawn is due, a burst inside the window is not,
-    /// the window's edge is inclusive, and a clock step backwards is harmless.
-    #[test]
-    fn due_when_never_ran_or_once_the_interval_has_passed() {
-        let t0 = Instant::now();
-        assert!(due(None, t0), "nothing ran yet");
-        assert!(!due(Some(t0), t0), "same instant");
-        assert!(!due(
-            Some(t0),
-            t0 + AGENT_PRIME_INTERVAL - Duration::from_millis(1)
-        ));
-        assert!(
-            due(Some(t0), t0 + AGENT_PRIME_INTERVAL),
-            "edge is inclusive"
-        );
-        assert!(due(Some(t0), t0 + AGENT_PRIME_INTERVAL * 5));
-        assert!(
-            !due(Some(t0 + Duration::from_secs(1)), t0),
-            "a clock that went backwards is not due, never a panic"
         );
     }
 
@@ -3324,34 +3417,6 @@ mod agent_prime_tests {
             !dev_home.path().join(".codex/AGENTS.md").exists(),
             "nothing is written from a non-release bundle"
         );
-    }
-}
-
-#[cfg(test)]
-mod shell_integration_guard_tests {
-    use super::SHELL_INTEGRATION_LOADED_GUARD;
-
-    /// The spawn env overrides the inherited [`SHELL_INTEGRATION_LOADED_GUARD`]
-    /// with an empty value, which defuses the loader guard only if the shipped
-    /// scripts use exactly this name and test it with a non-empty check
-    /// (`[[ -n "${…:-}" ]]`, safe under `set -u`). Pins both.
-    #[test]
-    fn nested_launch_guard_name_matches_the_shipped_scripts() {
-        use aterm_core::shell_integration::scripts;
-        let guard_test = format!("[[ -n \"${{{SHELL_INTEGRATION_LOADED_GUARD}:-}}\" ]]");
-        for (shell, script) in [("zsh", scripts::ZSH), ("bash", scripts::BASH)] {
-            assert!(
-                script.contains(SHELL_INTEGRATION_LOADED_GUARD),
-                "{shell}: the loader guard variable was renamed — update \
-                 SHELL_INTEGRATION_LOADED_GUARD and the lib.rs spawn scrub"
-            );
-            assert!(
-                script.contains(&guard_test),
-                "{shell}: the loader guard is no longer a `[[ -n … ]]` check, \
-                 so an empty-string override would not defuse it — rework the \
-                 nested-launch scrub"
-            );
-        }
     }
 }
 
@@ -3424,22 +3489,6 @@ mod child_identity_env_tests {
         );
     }
 
-    /// The two provisioning halves must not overlap: recursion carries adoption
-    /// identity (child sid + nonce) and must not emit the parent id, or a shell
-    /// session would receive a duplicate key in `env_add`.
-    #[test]
-    fn recursion_env_no_longer_emits_parent_id() {
-        let (env, _prov) = provision_child_recursion_env();
-        let k = keys(&env);
-        assert!(k.contains(&ENV_SESSION_ID), "adoption sid must remain");
-        assert!(k.contains(&ENV_LAUNCH_NONCE), "adoption nonce must remain");
-        assert!(
-            !k.contains(&ENV_PARENT_SESSION_ID),
-            "parent id moved to provision_child_identity_env; emitting it here too \
-             would duplicate the key for shell sessions"
-        );
-    }
-
     /// The CONTROLLER-spawn observation hint is the origin sid and NOTHING
     /// else (identity only, no token — design §1.4#3), and it is deny-listed
     /// so an inherited copy never survives a hop (one-hop like the rest of the
@@ -3478,7 +3527,7 @@ mod child_identity_env_tests {
 }
 
 /// Tier-1 conformance of the real recursion provisioning to
-/// `aterm_spec::derive::capability_secrecy_model` (`CapabilitySecrecy`): a
+/// `aterm_models_effects::capability_secrecy_model` (`CapabilitySecrecy`): a
 /// child's edge-token secrets are published through a 0600 file, never the
 /// inherited environment.
 ///
@@ -3502,7 +3551,7 @@ mod capability_secrecy_conformance {
 
     #[test]
     fn edge_secret_provisioning_conforms_to_capability_secrecy() {
-        let model = aterm_spec::derive::capability_secrecy_model();
+        let model = aterm_models_effects::capability_secrecy_model();
         let buggy = aterm_spec::interp::with_buggy(&model, 1);
         let label = "CapabilitySecrecy(provision_child_proxy)";
         let dir = std::env::temp_dir().join(format!("aterm-f1-{}", std::process::id()));
@@ -3578,20 +3627,16 @@ mod deferred_reader_gate_tests {
         let stop = Arc::new(AtomicBool::new(false));
         let waiter_stop = stop.clone();
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        // The negative below is meaningful only once the waiter is provably
-        // parked; a short `recv_timeout` alone would pass vacuously on a loaded box.
-        let parked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let waiter_parked = parked.clone();
         let join = std::thread::spawn(move || {
-            waiter_parked.store(true, std::sync::atomic::Ordering::SeqCst);
             let _ = tx.send(waiter.wait_until_released(&waiter_stop));
         });
-        while !parked.load(std::sync::atomic::Ordering::SeqCst) {
+        // The negative below is meaningful only once the waiter is provably
+        // parked on the closed gate: a FACT the gate counts, not a window.
+        while gate.parked() == 0 {
             std::thread::yield_now();
         }
         assert!(
-            rx.recv_timeout(std::time::Duration::from_millis(20))
-                .is_err(),
+            rx.try_recv().is_err(),
             "closed gate must prevent pre-Commit activation"
         );
         gate.release();
@@ -3624,6 +3669,24 @@ pub(crate) fn attach_reader(
     factory: &SessionFactory,
 ) -> Result<(), String> {
     let result = attach_reader_inner(session, window, post_to(proxy), factory, None);
+    if let Err(error) = &result {
+        aterm_log::error!(
+            "could not attach PTY reader for session {}: {error}",
+            session.id
+        );
+    }
+    result
+}
+
+/// [`attach_reader`] with the reader's posts going to `post` (a warm spare's
+/// link, `crate::spare::SpareLink::post`): live, no start gate.
+pub(crate) fn attach_reader_with_post(
+    session: &mut Session,
+    window: WindowId,
+    post: WakePost,
+    factory: &SessionFactory,
+) -> Result<(), String> {
+    let result = attach_reader_inner(session, window, post, factory, None);
     if let Err(error) = &result {
         aterm_log::error!(
             "could not attach PTY reader for session {}: {error}",
@@ -3674,10 +3737,10 @@ fn reset_reader_latches(session: &Session) {
 /// bind (`dsu_quiescence_conformance`) uses its own sink. An `Arc` because the
 /// attach also hands a clone to the sink's input hook, which posts
 /// `Wake::InputWatch` from whichever thread wrote (`input_stall::watch_input`).
-type WakePost = Arc<dyn Fn(Wake) -> bool + Send + Sync>;
+pub(crate) type WakePost = Arc<dyn Fn(Wake) -> bool + Send + Sync>;
 
 /// The shipping [`WakePost`]: the event loop's proxy.
-fn post_to(proxy: &EventLoopProxy<Wake>) -> WakePost {
+pub(crate) fn post_to(proxy: &EventLoopProxy<Wake>) -> WakePost {
     let proxy = proxy.clone();
     Arc::new(move |wake| proxy.send_event(wake).is_ok())
 }
@@ -3809,7 +3872,12 @@ fn attach_reader_inner(
             holder: session.fg_holder.clone(),
         },
         timeline: session.ctx.timeline.clone(),
+        person: session.ctx.human_input.clone(),
+        launch: session.ctx.launch.clone(),
         reset_lane: session.ctx.reset_lane.clone(),
+        witness: session.ctx.witness.clone(),
+        #[cfg(unix)]
+        journal: session.ctx.crash_journal.get().cloned(),
     });
     // ConPTY has no foreground process group: the Windows reader takes no probe
     // and keeps no holder.
@@ -4192,7 +4260,6 @@ pub(crate) fn new_live_terminal(
     rows: u16,
     cols: u16,
     cfg: Option<&aterm_core::config::TerminalConfig>,
-    appearance: aterm_types::Appearance,
     cell_px: Option<(u16, u16)>,
 ) -> Terminal {
     // Attach a tiered scrollback store (hot / warm-LZ4 / cold-LZ4, bounded by
@@ -4215,11 +4282,6 @@ pub(crate) fn new_live_terminal(
     } else {
         t.set_scrollback_line_limit(Some(aterm_core::scrollback::DEFAULT_LINE_LIMIT));
     }
-    // Set the reported scheme (the palette's appearance, `factory.appearance`)
-    // at construction so a tab spawned later reports it (DEC 2031 / DSR
-    // `CSI ?996n`). A new session has no DEC 2031 subscriber yet, so no report
-    // is queued; the live push is owned by `App::install_colors`.
-    t.set_color_scheme(appearance);
     // CELL-PX-1: the real font metrics of the window this session is born into, so
     // the very FIRST DEC 1016 report and the very FIRST OSC 1337 image on a
     // never-resized tab are already correct (see this function's docs). Clamped to
@@ -4472,7 +4534,7 @@ fn route_osc52_query(
 /// request, decided once, at spawn, by [`host_reach`] from the containment
 /// mode its shell runs under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HostReach {
+pub(crate) enum HostReach {
     /// The platform. OSC 52 set and clear (and the OSC 1337 copies, which take
     /// the same authority) are authorized, and a query is answered when
     /// `allow_osc52_query` authorizes it. OSC 9/99/777 reach the desktop
@@ -4527,7 +4589,7 @@ enum HostReach {
 fn host_reach(mode: aterm_containment::ContainmentMode) -> HostReach {
     use aterm_containment::ContainmentMode as Cm;
     match mode {
-        Cm::Master | Cm::User | Cm::Safety => HostReach::Platform,
+        Cm::User | Cm::Safety => HostReach::Platform,
         _ => HostReach::Refused,
     }
 }
@@ -4539,8 +4601,58 @@ fn host_reach(mode: aterm_containment::ContainmentMode) -> HostReach {
 /// configured. Each tab gets its own authorization and callback, so a
 /// background tab's yank reaches the platform. Targets are routed by
 /// [`route_osc52_write`] and queries by [`route_osc52_query`].
-fn configure_clipboard(term: &Arc<Mutex<Terminal>>, reach: HostReach) {
-    install_clipboard(term, reach, deliver_clip_write);
+fn configure_clipboard(
+    term: &Arc<Mutex<Terminal>>,
+    reach: HostReach,
+    witness: &Arc<crate::spare::Witness>,
+) {
+    let witness = Arc::clone(witness);
+    install_clipboard(term, reach, move |write| {
+        witness.host_effects.fetch_add(1, Ordering::Relaxed);
+        deliver_clip_write(write);
+    });
+}
+
+/// What this process's sessions reach on their programs' behalf
+/// ([`host_reach`] for the containment mode they run under).
+pub(crate) fn session_host_reach() -> HostReach {
+    host_reach(aterm_containment::mode_or_containment())
+}
+
+/// A session's host wiring (design `docs/DESIGN-warm-spare-2026-10-16.md`
+/// §5.2): the clipboard, notifications, Kitty's file mediums, the bell and
+/// (Linux) window operations, each counting what it delivers in `witness`.
+/// Made once at spawn for every session but a spare, and at a spare's
+/// adoption, so a cold tab and an adopted one end with identical wiring. The
+/// configured OSC 52 query is granted again here: a spare had it revoked.
+pub(crate) fn arm_host_reach(
+    term: &Arc<Mutex<Terminal>>,
+    reach: HostReach,
+    factory: &SessionFactory,
+    proxy: &EventLoopProxy<Wake>,
+    id: u64,
+    window: WindowId,
+    witness: &Arc<crate::spare::Witness>,
+) {
+    configure_clipboard(term, reach, witness);
+    if reach == HostReach::Platform
+        && factory
+            .terminal_config
+            .as_ref()
+            .is_some_and(|c| c.allow_osc52_query)
+    {
+        term_lock(term).authorize_clipboard_access(ClipboardAccess::Query);
+    }
+    configure_notifications(term, reach, &factory.notify_tx, id, witness);
+    // Kitty file/shm transfer mediums — only when the user opted in (default off).
+    if factory.allow_kitty_file_transfer {
+        configure_kitty_file_transfer(term, reach);
+    }
+    configure_bell(term, proxy, id, window, witness);
+    // XTWINOPS host transport (Linux): the engine gates on `allow_window_ops`
+    // in-core; without this callback an authorized `CSI 9;1t` was a no-op.
+    #[cfg(target_os = "linux")]
+    configure_window_ops(term, proxy, id, window);
 }
 
 /// The platform write behind [`configure_clipboard`]'s worker thread.
@@ -4640,6 +4752,7 @@ fn configure_notifications(
     reach: HostReach,
     notify_tx: &std::sync::mpsc::SyncSender<notify::NotifyMsg>,
     id: u64,
+    witness: &Arc<crate::spare::Witness>,
 ) {
     if reach == HostReach::Refused {
         return;
@@ -4651,7 +4764,9 @@ fn configure_notifications(
     // the opt-out intact.
     // OSC 9 / 777: a bare body string, no title.
     let tx = notify_tx.clone();
+    let w = Arc::clone(witness);
     t.set_notification_callback(move |body| {
+        w.host_effects.fetch_add(1, Ordering::Relaxed);
         // try_send (never send): on a full BOUNDED queue this DROPS the message
         // instead of blocking the reader thread — bounding queue memory under a flood.
         let _ = tx.try_send(notify::NotifyMsg::program(id, None, body.to_string()));
@@ -4660,10 +4775,12 @@ fn configure_notifications(
     // (close/update control frames with no content) rather than popping a
     // blank toast.
     let tx = notify_tx.clone();
+    let w = Arc::clone(witness);
     t.set_advanced_notification_callback(move |n| {
         if !n.has_content() {
             return;
         }
+        w.host_effects.fetch_add(1, Ordering::Relaxed);
         // try_send (never send): drop on a full BOUNDED queue rather than block.
         let _ = tx.try_send(notify::NotifyMsg::program(
             id,
@@ -4701,9 +4818,12 @@ fn configure_bell(
     proxy: &EventLoopProxy<Wake>,
     id: u64,
     window: WindowId,
+    witness: &Arc<crate::spare::Witness>,
 ) {
     let proxy = proxy.clone();
+    let witness = Arc::clone(witness);
     term_lock(term).set_bell_callback(move || {
+        witness.host_effects.fetch_add(1, Ordering::Relaxed);
         let _ = proxy.send_event(Wake::Bell {
             session: id,
             window,
@@ -5060,13 +5180,13 @@ fn spawn_cast_writer(
 ) -> Result<std::sync::mpsc::SyncSender<crate::cast::CastBurst>, String> {
     let (cast_tx, cast_rx) =
         std::sync::mpsc::sync_channel::<crate::cast::CastBurst>(CAST_QUEUE_CAP);
-    std::thread::Builder::new()
-        .name("aterm-cast-writer".into())
-        .spawn(move || {
+    crate::qos::spawn_lane_thread(
+        "aterm-cast-writer",
+        crate::qos::Role::Responsive,
+        move || {
             // Holds the `cast` recorder mutex per burst, the same mutex the main
             // thread takes on every resize pass (`record_resize`), so qos.rs's
             // floor rule requires `Responsive`.
-            crate::qos::set_self(crate::qos::Role::Responsive);
             while let Ok(burst) = cast_rx.recv() {
                 let mut rec = cast.lock().unwrap_or_else(|p| p.into_inner());
                 // Hand the reader's SHARED burst straight through: the common
@@ -5075,8 +5195,9 @@ fn spawn_cast_writer(
                 // burst a resize cut copies its pieces.
                 rec.record_burst(burst);
             }
-        })
-        .map_err(|error| format!("spawn cast writer: {error}"))?;
+        },
+    )
+    .map_err(|error| format!("spawn cast writer: {error}"))?;
     Ok(cast_tx)
 }
 
@@ -5096,21 +5217,22 @@ fn spawn_temporal_writer(
 > {
     let (temporal_tx, temporal_rx) =
         std::sync::mpsc::sync_channel::<crate::temporal::TemporalMsg>(TEMPORAL_QUEUE_CAP);
-    let join = std::thread::Builder::new()
-        .name("aterm-temporal-writer".into())
-        .spawn(move || {
+    let join = crate::qos::spawn_lane_thread(
+        "aterm-temporal-writer",
+        crate::qos::Role::Responsive,
+        move || {
             // The main thread waits on this worker (`park_reader` spins on
             // `is_finished()` under the handoff deadline), and control lanes take
             // the `temporal` mutex it holds per burst, so it runs `Responsive`.
-            crate::qos::set_self(crate::qos::Role::Responsive);
             while let Ok(msg) = temporal_rx.recv() {
                 temporal
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .apply(msg);
             }
-        })
-        .map_err(|error| format!("spawn temporal writer: {error}"))?;
+        },
+    )
+    .map_err(|error| format!("spawn temporal writer: {error}"))?;
     // The join handle lets `park_reader` drain this writer before a re-attach
     // spawns a fresh one into the same recorder, so events never reorder across
     // attaches. The `recv` loop ends once every sender drops (the reader's, at
@@ -5296,13 +5418,43 @@ mod reply_writer_lifetime_tests {
     use aterm_spec::wait::MUST_HAPPEN;
 
     /// A master-owning sink over one end of a socketpair; the peer sees what it
-    /// writes and EOF when the sink's `OwnedFd` closes.
+    /// writes and EOF when the sink's `OwnedFd` closes. The sink's end is
+    /// `O_NONBLOCK`, as a session's master is, so a frame larger than the
+    /// socket's buffers spills its tail instead of parking the writer.
     fn sink_and_peer() -> (Arc<SinkWriter>, UnixStream) {
         let (peer, writer) = UnixStream::pair().expect("socketpair");
         peer.set_read_timeout(Some(MUST_HAPPEN))
             .expect("read timeout");
+        writer.set_nonblocking(true).expect("O_NONBLOCK");
         let owned: std::os::fd::OwnedFd = writer.into();
-        (Arc::new(SinkWriter::new_owned(owned)), peer)
+        let sink = SinkWriter::new_owned(owned);
+        sink.note_master_nonblocking(true);
+        (Arc::new(sink), peer)
+    }
+
+    /// Larger than any socketpair's buffers, under the spill's cap.
+    const SPILL_FRAME: usize = 1 << 20;
+
+    /// The writer carrying the sink's arranger duty is ALIVE, as a fact: a
+    /// frame larger than the socket's buffers spills its tail, and a spill's
+    /// drainer is arranged only by a poke to that writer
+    /// (`install_spill_arranger`). Every byte reaching the peer is that writer
+    /// serving the sink; a dead one strands the tail, and the read gives up at
+    /// [`MUST_HAPPEN`].
+    fn spill_is_delivered(sink: &SinkWriter, peer: &mut UnixStream) {
+        let frame: Vec<u8> = (0..=250u8).cycle().take(SPILL_FRAME).collect();
+        let receipt = sink
+            .write_frame_interactive_with_receipt(&frame)
+            .expect("the frame is accepted, its tail spilled");
+        assert_eq!(receipt.accepted(), frame.len(), "the whole frame is taken");
+        assert!(
+            sink.spilled_bytes() > 0,
+            "the frame must spill, or the arranger is never asked"
+        );
+        let mut got = vec![0u8; frame.len()];
+        peer.read_exact(&mut got)
+            .expect("every spilled byte is delivered");
+        assert!(got == frame, "the spill is delivered in order");
     }
 
     fn wait_finished(join: &std::thread::JoinHandle<()>, what: &str) {
@@ -5344,31 +5496,6 @@ mod reply_writer_lifetime_tests {
     }
 
     #[test]
-    fn the_last_external_sink_clone_closes_the_master_and_ends_the_writer() {
-        let (sink, mut peer) = sink_and_peer();
-        let weak = Arc::downgrade(&sink);
-        let (reply_tx, join) = spawn_reply_writer(sink.clone()).expect("spawn");
-        assert!(reply_tx.submit(Arc::from(&b"ok"[..])), "queued");
-        let mut buf = [0u8; 2];
-        peer.read_exact(&mut buf).expect("the reply is written");
-        assert_eq!(&buf, b"ok");
-        // The reader exiting at EOF (its sender) and the session tearing down
-        // (the ctx / mirror clones) — the MEM-L2 close path.
-        drop(reply_tx);
-        drop(sink);
-        wait_finished(&join, "the reply writer");
-        assert_eq!(
-            weak.strong_count(),
-            0,
-            "no strong clone may survive the session"
-        );
-        let n = peer
-            .read(&mut buf)
-            .expect("EOF, not a read timeout: the master fd must have closed");
-        assert_eq!(n, 0, "EOF");
-    }
-
-    #[test]
     fn a_reattached_writer_ends_with_its_reader_and_the_first_with_the_sink() {
         let (sink, mut peer) = sink_and_peer();
         let (first_tx, first_join) = spawn_reply_writer(sink.clone()).expect("spawn");
@@ -5378,11 +5505,7 @@ mod reply_writer_lifetime_tests {
         // The re-attach's writer holds nothing but its reader's sender: gone now.
         wait_finished(&second_join, "the re-attached reply writer");
         // The first carries the arranger duty for as long as the sink lives…
-        std::thread::sleep(Duration::from_millis(20));
-        assert!(
-            !first_join.is_finished(),
-            "the arranger-bearing writer must serve the live sink"
-        );
+        spill_is_delivered(&sink, &mut peer);
         // ...and no longer, so the master still closes with the session.
         drop(sink);
         wait_finished(&first_join, "the first reply writer");
@@ -5400,9 +5523,7 @@ mod reply_writer_lifetime_tests {
     fn a_failed_spawn_leaves_the_arranger_slot_to_the_retried_attach() {
         let (sink, mut peer) = sink_and_peer();
         super::REPLY_WRITER_SPAWN_FAULT.with(|f| f.set(true));
-        let err =
-            spawn_reply_writer(sink.clone()).expect_err("the injected spawn failure surfaces");
-        assert!(err.contains("spawn reply writer"), "{err}");
+        spawn_reply_writer(sink.clone()).expect_err("the injected spawn failure surfaces");
         assert!(
             !super::take_injected_reply_writer_spawn_fault(),
             "the fault is one-shot: consumed by the failed attempt"
@@ -5415,12 +5536,9 @@ mod reply_writer_lifetime_tests {
             .expect("the retry's writer writes");
         assert_eq!(&buf, b"ok");
         drop(retry_tx);
-        std::thread::sleep(Duration::from_millis(50));
-        assert!(
-            !retry_join.is_finished(),
-            "the retried attach's writer must carry the arranger duty: a failed spawn \
-             may not leave its dead sender in the slot"
-        );
+        // The retried attach's writer carries the arranger duty: a failed spawn
+        // may not leave its dead sender in the slot.
+        spill_is_delivered(&sink, &mut peer);
         drop(sink);
         wait_finished(&retry_join, "the retried reply writer");
         let n = peer
@@ -5448,7 +5566,8 @@ const COMPRESS_BUDGET: usize = 256;
 /// amortization window, so it never thrashes the lock on the last few lines.
 const COMPRESS_LOW_WATER: usize = 256;
 /// Signals arriving within this window of each other mean the reader is
-/// mid-flood; the worker defers promotion until the stream goes quiet.
+/// mid-flood; the worker defers promotion until the stream goes quiet, unless
+/// pressure relief is due before the memory cap cuts the staged history.
 const COMPRESS_QUIET_WINDOW: std::time::Duration = std::time::Duration::from_millis(50);
 /// Mid-flood, promote at most ONE bounded batch this often — forward progress
 /// on the backlog without measurably contending the flood's term-lock holds.
@@ -5467,18 +5586,19 @@ fn spawn_compress_worker(
     ui_waiting: Arc<std::sync::atomic::AtomicU32>,
 ) -> Option<std::sync::mpsc::SyncSender<()>> {
     let (tx, rx) = std::sync::mpsc::sync_channel::<()>(COMPRESS_SIGNAL_CAP);
-    std::thread::Builder::new()
-        .name("aterm-scrollback-compress".into())
-        .spawn(move || {
+    crate::qos::spawn_lane_thread(
+        "aterm-scrollback-compress",
+        crate::qos::Role::Responsive,
+        move || {
             // Background work that takes the `term` mutex the UI thread takes
             // on the keystroke path; being descheduled while holding it stalls
             // every waiter. `Responsive` (user-initiated) shortens that window
             // without outranking the UI thread.
-            crate::qos::set_self(crate::qos::Role::Responsive);
             while rx.recv().is_ok() {
                 // Flood gate: back-to-back signals mean the reader is mid-flood,
                 // and promotion batches would contend the term lock with the PTY
-                // drain. Wait for signals to go quiet, with one batch per
+                // drain. Relieve memory-bound pressure, otherwise wait for signals
+                // to go quiet, with one batch per
                 // `COMPRESS_TRICKLE_INTERVAL` so a perpetual flood still progresses.
                 // Memory stays bounded: past the staging cap the reader drops its
                 // oldest staged lines (marked in history). The trickle is skipped
@@ -5486,7 +5606,9 @@ fn spawn_compress_worker(
                 // the last one, so a flood leaves one marker, not one per batch
                 // (`Grid::trickle_lazy_bounded`).
                 let mut last_trickle = std::time::Instant::now();
+                relieve_flood_pressure(&term, &ui_waiting);
                 while let Ok(()) = rx.recv_timeout(COMPRESS_QUIET_WINDOW) {
+                    relieve_flood_pressure(&term, &ui_waiting);
                     if last_trickle.elapsed() >= COMPRESS_TRICKLE_INTERVAL {
                         term_lock(&term).trickle_lazy_bounded(COMPRESS_BUDGET);
                         last_trickle = std::time::Instant::now();
@@ -5516,9 +5638,165 @@ fn spawn_compress_worker(
                     std::thread::yield_now();
                 }
             }
-        })
-        .ok()
-        .map(|_| tx)
+        },
+    )
+    .ok()
+    .map(|_| tx)
+}
+
+/// Promote a memory-bound flood before the reader reaches its cut, in the
+/// same bounded lock holds and UI handoffs as the quiet drain. Count the
+/// excess only after the previous count was promoted, avoiding a full scan
+/// for each batch. The cut-aware drain rechecks every batch: a reader that
+/// opened a cut across a yield must not have its marker promoted here.
+fn relieve_flood_pressure(term: &Mutex<Terminal>, ui_waiting: &std::sync::atomic::AtomicU32) {
+    let mut owed = 0;
+    loop {
+        let promoted = {
+            let mut t = term_lock(term);
+            if owed == 0 {
+                owed = t.main_grid().flood_promotion_due();
+                if owed == 0 {
+                    return;
+                }
+            }
+            let before = t.lazy_backlog_len();
+            before.saturating_sub(t.drain_lazy_pressure_bounded(owed.min(COMPRESS_BUDGET)))
+        };
+        if promoted == 0 {
+            return;
+        }
+        owed = owed.saturating_sub(promoted);
+        crate::yield_to_ui_waiter(ui_waiting);
+        std::thread::yield_now();
+    }
+}
+
+#[cfg(test)]
+mod flood_pressure_relief_tests {
+    use super::relieve_flood_pressure;
+    use aterm_core::scrollback::Scrollback;
+    use aterm_core::terminal::Terminal;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicU32;
+
+    fn flooded(n: usize) -> Terminal {
+        let mut t = Terminal::with_scrollback(24, 253, 8, Scrollback::new(64, 512, 8_000_000));
+        t.set_compress_offload_active(true);
+        let mut buf = Vec::with_capacity(n * 256);
+        for i in 0..n {
+            let row = format!("L{i} ");
+            buf.extend_from_slice(row.as_bytes());
+            buf.resize(buf.len() + 253 - row.len(), b'p');
+            buf.extend_from_slice(b"\r\n");
+        }
+        t.process(&buf);
+        t
+    }
+
+    #[test]
+    fn relief_promotes_the_backlog_back_under_the_mark_and_loses_nothing() {
+        let term = Mutex::new(flooded(15_000));
+        let before = {
+            let t = term.lock().unwrap();
+            assert!(t.main_grid().flood_promotion_due() > 0, "precondition");
+            t.lazy_backlog_len()
+        };
+        relieve_flood_pressure(&term, &AtomicU32::new(0));
+        let t = term.lock().unwrap();
+        assert_eq!(t.main_grid().flood_promotion_due(), 0, "under the mark");
+        assert!(t.lazy_backlog_len() < before, "the backlog was promoted");
+        assert_eq!(t.scrollback_truncated_lines(), 0, "nothing lost");
+    }
+
+    #[test]
+    fn a_partial_pressure_batch_keeps_the_half_floor() {
+        let term = Mutex::new(flooded(10_100));
+        {
+            let t = term.lock().unwrap();
+            let due = t.main_grid().flood_promotion_due();
+            assert!(due > 0 && due < super::COMPRESS_BUDGET, "a partial batch");
+            assert_eq!(t.lazy_backlog_len() - due, 10_000, "the half floor");
+        }
+        relieve_flood_pressure(&term, &AtomicU32::new(0));
+        let t = term.lock().unwrap();
+        assert_eq!(t.lazy_backlog_len(), 10_000, "no batch overshoot");
+        assert_eq!(t.scrollback_truncated_lines(), 0);
+    }
+
+    #[test]
+    fn a_history_clear_and_refill_rechecks_the_pressure_floor() {
+        let mut t = flooded(15_000);
+        let owed = t.main_grid().flood_promotion_due();
+        assert!(owed > super::COMPRESS_BUDGET, "several batches are owed");
+        let before = t.lazy_backlog_len();
+        assert_eq!(
+            t.drain_lazy_pressure_bounded(super::COMPRESS_BUDGET),
+            before - super::COMPRESS_BUDGET
+        );
+        let owed = owed - super::COMPRESS_BUDGET;
+
+        // The reader can erase and refill history while the worker yields.
+        t.process(b"\x1b[3J");
+        assert_eq!(t.lazy_backlog_len(), 0, "ED3 erased the staged history");
+        t.process(&b"after clear\r\n".repeat(128));
+        let refilled = t.lazy_backlog_len();
+        assert!(refilled > 0 && refilled < 10_000, "a new small backlog");
+        assert_eq!(t.main_grid().flood_promotion_due(), 0);
+        assert_eq!(
+            t.drain_lazy_pressure_bounded(owed.min(super::COMPRESS_BUDGET)),
+            refilled,
+            "the old owed count cannot drain the new backlog below the floor"
+        );
+        assert_eq!(t.scrollback_truncated_lines(), 0);
+    }
+
+    #[test]
+    fn relief_works_the_saved_primary_under_an_alt_screen() {
+        let mut t = flooded(15_000);
+        t.process(b"\x1b[?1049h");
+        let before = t.lazy_backlog_len();
+        assert!(t.main_grid().flood_promotion_due() > 0, "precondition");
+        let term = Mutex::new(t);
+        relieve_flood_pressure(&term, &AtomicU32::new(0));
+        let t = term.lock().unwrap();
+        assert_eq!(t.main_grid().flood_promotion_due(), 0);
+        assert!(t.lazy_backlog_len() < before);
+    }
+
+    #[test]
+    fn under_the_mark_relief_takes_nothing() {
+        let term = Mutex::new(flooded(5_000));
+        let before = term.lock().unwrap().lazy_backlog_len();
+        assert!(before > 0, "precondition: a staged backlog");
+        relieve_flood_pressure(&term, &AtomicU32::new(0));
+        assert_eq!(term.lock().unwrap().lazy_backlog_len(), before);
+    }
+
+    #[test]
+    fn a_log_flood_the_line_limit_holds_is_left_to_the_flood_gate() {
+        const BUDGET: usize = 100_000_000;
+        let mut t = Terminal::with_scrollback(24, 80, 8, Scrollback::new(64, 512, BUDGET));
+        t.set_compress_offload_active(true);
+        let mut buf = Vec::with_capacity(100_000 * 82);
+        for i in 0..100_000 {
+            let row = format!("L{i} ");
+            buf.extend_from_slice(row.as_bytes());
+            buf.resize(buf.len() + 80 - row.len(), b'p');
+            buf.extend_from_slice(b"\r\n");
+        }
+        t.process(&buf);
+        let before = t.lazy_backlog_len();
+        assert!(
+            before * 80 * 8 > BUDGET / 2,
+            "precondition: {before} staged rows are past half the headroom"
+        );
+        let term = Mutex::new(t);
+        relieve_flood_pressure(&term, &AtomicU32::new(0));
+        let t = term.lock().unwrap();
+        assert_eq!(t.lazy_backlog_len(), before, "relief took nothing");
+        assert_eq!(t.scrollback_truncated_lines(), 0, "and nothing was cut");
+    }
 }
 
 /// Buffers circulating between the gather and parse stages (unix): 4 × 64 KiB,
@@ -5653,6 +5931,12 @@ pub(crate) enum GatherMsg {
     /// The parse stage runs it between two batches, as it runs a foreground
     /// handback at a cut.
     Reset(crate::manual_reset::ManualReset),
+    /// A host path changed the engine with no output to follow (a resize, a
+    /// config or cell-size change): bring the session's crash-restore journal up
+    /// to date now (`crash_restore::SessionJournal::on_nudge`). Sent through the
+    /// session's [`crate::manual_reset::ResetLane`] (`nudge`); a reader with no
+    /// journal ignores it.
+    Journal,
 }
 
 /// The gather stage of the split PTY pipeline: a thread that only drains the
@@ -5696,14 +5980,18 @@ fn spawn_pty_gather(
     // exit path, so the channel ends with this thread and the parse stage's
     // `recv()` returns.
     lane_guard: crate::manual_reset::LaneGuard,
+    // The session's crash-restore journal: after every read, before the batch
+    // is sent, the running count of bytes read is stored in its region, so a
+    // restore counts what was read and never processed.
+    journal: Option<Arc<crate::crash_restore::SessionJournal>>,
 ) -> Result<(), String> {
-    std::thread::Builder::new()
-        .name(format!("aterm-pty-gather-{id}"))
-        .spawn(move || {
+    // macOS: default QoS parks this thread on E-cores, whose wakeup latency
+    // dwarfs the PTY producer/consumer cadence.
+    crate::qos::spawn_lane_thread(
+        format!("aterm-pty-gather-{id}"),
+        crate::qos::Role::Responsive,
+        move || {
             let _lane_guard = lane_guard;
-            // macOS: default QoS parks this thread on E-cores, whose wakeup
-            // latency dwarfs the PTY producer/consumer cadence.
-            crate::qos::set_self(crate::qos::Role::Responsive);
             // Deferred start (overlap park): no master read before release. On a
             // stop-abort the parse stage still gets its terminal message.
             if let Some(gate) = &start_gate
@@ -5859,6 +6147,12 @@ fn spawn_pty_gather(
                         // reader's fetch_sub can never precede this add
                         // (usize underflow would seal the cutoff open).
                         parse_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // The journal's read count, after the read and before the
+                        // send: a crash between the two counts these bytes lost
+                        // rather than restore a screen that silently lacks them.
+                        if let Some(journal) = &journal {
+                            journal.gathered(filled);
+                        }
                         if filled_tx
                             .send(GatherMsg::Data(buf, filled, edge, holder))
                             .is_err()
@@ -5877,9 +6171,10 @@ fn spawn_pty_gather(
             }
             // The gather owns the wake pipe's READ end on unix — close it on exit.
             aterm_pty::close_fd(wake_rd);
-        })
-        .map(|_| ())
-        .map_err(|error| format!("spawn PTY gather: {error}"))
+        },
+    )
+    .map(|_| ())
+    .map_err(|error| format!("spawn PTY gather: {error}"))
 }
 
 /// The foreground handback's share of a reader's wiring
@@ -5989,11 +6284,25 @@ struct PtyReaderWiring {
     /// The session's event timeline — the reader records `modes-restored` on
     /// it after a foreground handback, with no other lock held.
     timeline: Arc<std::sync::Mutex<crate::session_timeline::SessionTimeline>>,
+    /// The session's person count and launch witness: in the hold whose slice
+    /// started a command, the parse stage records where the count stood
+    /// (`crate::launch_witness`).
+    person: Arc<crate::human_input::HumanInputStamp>,
+    launch: Arc<crate::launch_witness::LaunchWitness>,
     /// The session's manual-reset lane (`crate::manual_reset`): the unix
     /// reader opens it with a clone of its gather→parse sender and closes it
     /// when either stage ends. Windows has no parse channel and leaves it
     /// closed, so a reset there runs directly under the term lock.
     reset_lane: Arc<crate::manual_reset::ResetLane>,
+    /// What the warm spare's gate reads of this session (`SessionCtx::witness`):
+    /// the parse stage records a signed parked mark and start record after each
+    /// chunk, and closes a spare's FIFO at its first prompt.
+    witness: Arc<crate::spare::Witness>,
+    /// The session's crash-restore journal (`crate::crash_restore`), when it has
+    /// one: the gather stores its read count, the parse stage records every
+    /// hold's bytes and resizes and writes the keyframes its policy calls for.
+    #[cfg(unix)]
+    journal: Option<Arc<crate::crash_restore::SessionJournal>>,
 }
 
 /// PTY reader thread for one session: read, feed this engine, and wake the UI
@@ -6034,10 +6343,15 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
         #[cfg(unix)]
         fg,
         timeline,
+        person,
+        launch,
         reset_lane,
+        witness,
+        #[cfg(unix)]
+        journal,
     } = w;
     #[cfg(not(unix))]
-    let _ = &reset_lane;
+    let _ = (&reset_lane, &witness);
     // The parse stage's liveness probe (the orphan half of the foreground
     // handback). ConPTY has no foreground group, so off unix nothing is gone.
     #[cfg(unix)]
@@ -6074,15 +6388,31 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
         // while some sink clone lives. A `Weak`, upgraded around each probe,
         // so the parse stage never delays the close.
         let probe_sink = Arc::downgrade(&sink);
-        let (activity, stop, in_flight) = (
+        let (activity, stop, in_flight, gather_journal) = (
             latest_output_activity_ns.clone(),
             stop.clone(),
             parse_in_flight.clone(),
+            journal.clone(),
         );
         let start_gather = move || {
             spawn_pty_gather(
-                master, wake_rd, shell_exit, id, lat_epoch, activity, stop, start_gate, read_buf,
-                free_rx, filled_tx, in_flight, sink, fg.probe, fg.holder, lane_guard,
+                master,
+                wake_rd,
+                shell_exit,
+                id,
+                lat_epoch,
+                activity,
+                stop,
+                start_gate,
+                read_buf,
+                free_rx,
+                filled_tx,
+                in_flight,
+                sink,
+                fg.probe,
+                fg.holder,
+                lane_guard,
+                gather_journal,
             )
         };
         (
@@ -6097,12 +6427,12 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
     // ConPTY has no foreground group: no edge, so no probe reaches the master.
     #[cfg(not(unix))]
     let probe_sink = std::sync::Weak::<SinkWriter>::new();
-    let parse = std::thread::Builder::new()
-        .name(format!("aterm-pty-reader-{id}"))
-        .spawn(move || {
+    let parse = crate::qos::spawn_lane_thread(
+        format!("aterm-pty-reader-{id}"),
+        crate::qos::Role::Responsive,
+        move || {
             // macOS: default QoS parks this thread on E-cores, whose wakeup
             // latency dwarfs the PTY cadence and costs drain throughput.
-            crate::qos::set_self(crate::qos::Role::Responsive);
             // Windows keeps the single-thread read+parse loop (ConPTY has no
             // ~1 KiB read cap, so the gather split buys nothing there); the gate
             // and buffer live with whichever thread reads the master.
@@ -6195,6 +6525,9 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                 let mut backlog = 0usize;
                 // The foreground handback this batch ran, if any (see the slice loop).
                 let mut handback: Option<aterm_core::terminal::ForegroundHandback> = None;
+                // A command start this batch parsed whose screen is still to be
+                // read, after the lock (`crate::launch_witness`).
+                let mut launch_unread: Option<crate::launch_witness::Unread> = None;
                 // The manual reset this call ran, if any, with its bytes.
                 let mut manual_run: Option<(
                     crate::manual_reset::ManualReset,
@@ -6210,6 +6543,11 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                 // clock read. A buffer is allocated only for a burst a resize cut.
                 let mut cuts = crate::cast::CastCuts::default();
                 let mut emitted = 0usize;
+                // A crash-restore keyframe a hold captured (`crate::crash_restore`):
+                // encoded and copied into its slot once that hold's lock is released,
+                // before the next hold appends to the tail.
+                #[cfg(unix)]
+                let mut journal_keyframe: Option<crate::crash_restore::Captured> = None;
                 let response = {
                     let bytes = buf;
                     // The manual reset, before any byte of `buf` and under one
@@ -6222,6 +6560,12 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                         let spine_pre = temporal_tx
                             .as_ref()
                             .map(|_| crate::temporal::SpinePre::take(&t));
+                        // The crash-restore journal's reading before the reset, in
+                        // the same hold: the reset's bytes go on its tail where they
+                        // go on the spine, and a keyframe it makes due is captured at
+                        // the hold's end and written once the lock is released.
+                        #[cfg(unix)]
+                        let mut journal_pre = journal.as_ref().map(|j| j.pre(&t));
                         let (report, reset_bytes) = crate::manual_reset::apply(&mut t);
                         emitted += reset_bytes.len();
                         // Its assertions are taken here, as the automatic
@@ -6233,7 +6577,18 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                         {
                             spine_mark.record(tx, pre, &t, &reset_bytes);
                         }
+                        #[cfg(unix)]
+                        if let (Some(j), Some(pre)) = (&journal, journal_pre.as_mut()) {
+                            j.record(&t, pre, &reset_bytes, true);
+                            journal_keyframe = j.decide(&t, pre);
+                        }
                         manual_run = Some((req, report, reset_bytes));
+                    }
+                    // The reset's keyframe, if it made one due: written with the lock
+                    // released and before the first slice appends anything.
+                    #[cfg(unix)]
+                    if let (Some(j), Some(captured)) = (&journal, journal_keyframe.take()) {
+                        j.write(captured);
                     }
                     // Slice the burst so the term lock is released between chunks,
                     // choosing the width per hold:
@@ -6314,6 +6669,11 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                             let spine_pre = temporal_tx
                                 .as_ref()
                                 .map(|_| crate::temporal::SpinePre::take(&t));
+                            // The crash-restore journal's reading before this chunk:
+                            // the handback's bytes and the chunk's ride its tail where
+                            // they ride the spine, in this same hold.
+                            #[cfg(unix)]
+                            let mut journal_pre = journal.as_ref().map(|j| j.pre(&t));
                             // The foreground handback, exactly at the cut: after every
                             // byte the old holder wrote, before any the new holder wrote.
                             // The synthesized bytes go on the spine (geometry first)
@@ -6353,10 +6713,27 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                                     if let (Some(tx), Some(pre)) = (&temporal_tx, spine_pre) {
                                         spine_mark.record(tx, pre, &t, &h.bytes);
                                     }
+                                    #[cfg(unix)]
+                                    if let (Some(j), Some(pre)) = (&journal, journal_pre.as_mut()) {
+                                        j.record(&t, pre, &h.bytes, true);
+                                    }
                                     handback = Some(h);
                                 }
                             }
-                            t.process(&bytes[off..end]);
+                            // THE LAUNCH MARK, in this same hold: a slice that
+                            // starts a command records the person count as it
+                            // stands now, before any frame can show a byte of
+                            // the slice (`crate::launch_witness`, "The proof").
+                            if let Some(unread) = launch.process(&mut t, &bytes[off..end], &person)
+                            {
+                                launch_unread = Some(unread);
+                            }
+                            // The warm spare's marks, read under this hold
+                            // (`crate::spare::witness_after_process`).
+                            #[cfg(unix)]
+                            crate::spare::witness_after_process(&witness, &mut t, master, || {
+                                probe_sink.upgrade().map(|sink| sink.driven_input())
+                            });
                             prefetch.held(&t);
                             emitted += end - off;
                             // A mode this slice armed again belongs to its holder too
@@ -6389,6 +6766,19 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                             {
                                 spine_mark.record(tx, pre, &t, &bytes[off..end]);
                             }
+                            // The chunk on the crash-restore journal's tail, after
+                            // `process` (a chunk that panics the parser never reaches
+                            // it), then the keyframe policy's decision at the hold's end.
+                            #[cfg(unix)]
+                            if let (Some(j), Some(pre)) = (&journal, journal_pre.as_mut()) {
+                                j.record(&t, pre, &bytes[off..end], false);
+                                journal_keyframe = j.decide(&t, pre);
+                            }
+                        }
+                        // The keyframe the hold captured, with its lock released.
+                        #[cfg(unix)]
+                        if let (Some(j), Some(captured)) = (&journal, journal_keyframe.take()) {
+                            j.write(captured);
                         }
                         drop(fetched);
                         off = end;
@@ -6482,6 +6872,13 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                          loop slept (posted after its last turn, none since, older than {} ms)",
                         WAKE_LATCH_EXPIRY_NS / 1_000_000
                     );
+                }
+                // The launch mark's screen, read with the term lock released and
+                // after the replies and the wake: no pixel depends on it. The copy
+                // and the count were taken in the mark's hold; until this read the
+                // mark says `pending`, which no supervisor answers under.
+                if let Some(unread) = launch_unread {
+                    launch.read_screen(unread);
                 }
                 // Cast and byte-fanout taps: program output only; `take_response()`
                 // replies are the terminal's own bytes and are not `"o"` events. One
@@ -6586,10 +6983,29 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
             // Unix parse loop: batches from the gather stage. Data batches have
             // left the kernel queue, so they are always processed; the gather
             // enforces stop before its next read, and the channel always ends with
-            // Eof/Wake or close, so `recv()` needs no timeout.
+            // Eof/Wake or close, so `recv()` needs no timeout for that.
+            //
+            // The one timeout is the crash-restore journal's, and only while its
+            // session has tail past its keyframe (`SessionJournal::dirty`): after
+            // K1's quiet the burst is keyframed (`on_quiet`), and the restore of an
+            // idle session replays nothing. A clean session (or one with no journal)
+            // blocks as before and wakes zero times while idle.
             #[cfg(unix)]
             loop {
-                match filled_rx.recv() {
+                let next = match journal.as_ref().filter(|j| j.dirty()) {
+                    Some(j) => match filled_rx.recv_timeout(crate::crash_restore::QUIET) {
+                        Ok(msg) => Ok(msg),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            j.on_quiet(&term);
+                            continue;
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            Err(std::sync::mpsc::RecvError)
+                        }
+                    },
+                    None => filled_rx.recv(),
+                };
+                match next {
                     Ok(GatherMsg::Started) => {
                         let _ = post(Wake::Ready {
                             session: id,
@@ -6630,6 +7046,13 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                         pending_reset.set(Some(req));
                         ingest(&[], None, 0);
                     }
+                    // A host resize or settings change with no output to follow:
+                    // the journal records it now (`crate::crash_restore`).
+                    Ok(GatherMsg::Journal) => {
+                        if let Some(j) = &journal {
+                            j.on_nudge(&term);
+                        }
+                    }
                 }
             }
             // This stage takes no more resets: close the lane now rather than
@@ -6642,8 +7065,9 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
             // for the `-1` sentinel. On unix the GATHER owns + closes it.
             #[cfg(windows)]
             aterm_pty::close_fd(wake_rd);
-        })
-        .map_err(|error| format!("spawn PTY reader: {error}"))?;
+        },
+    )
+    .map_err(|error| format!("spawn PTY reader: {error}"))?;
     #[cfg(unix)]
     start_gather()?;
     Ok(parse)
@@ -6667,32 +7091,6 @@ fn ingest_chunk_width(pending: impl FnOnce() -> bool, remaining: usize) -> usize
         PROCESS_CHUNK
     } else {
         IDLE_CHUNK.min(remaining)
-    }
-}
-
-#[cfg(test)]
-mod ingest_chunk_tests {
-    use super::ingest_chunk_width;
-
-    /// The interactivity contract: a pending keystroke caps every hold at the
-    /// fine slice; an idle input path takes a WIDER but still BOUNDED hold (so a
-    /// key arriving mid-burst waits at most one capped process, not a whole
-    /// 64 KiB batch); the tail slice never overruns what is left.
-    #[test]
-    fn chunk_width_fine_when_pending_capped_when_idle() {
-        assert_eq!(ingest_chunk_width(|| true, 64 * 1024), 8 * 1024);
-        assert_eq!(ingest_chunk_width(|| true, 3 * 1024), 3 * 1024); // tail < chunk
-        assert_eq!(ingest_chunk_width(|| false, 64 * 1024), 16 * 1024);
-        assert_eq!(ingest_chunk_width(|| false, 12 * 1024), 12 * 1024); // tail < cap
-        assert_eq!(ingest_chunk_width(|| false, 1), 1);
-        // The idle hold is always at least as wide as the pending one — the
-        // interactivity signal must never make the reader slower.
-        assert!(ingest_chunk_width(|| false, 64 * 1024) >= ingest_chunk_width(|| true, 64 * 1024));
-        // Degenerate zero-remainder never yields a zero-progress loop upstream:
-        // the reader's loop condition (`off < bytes.len()`) is what prevents a
-        // zero-width call; document the pure fn's behavior anyway.
-        assert_eq!(ingest_chunk_width(|| true, 0), 0);
-        assert_eq!(ingest_chunk_width(|| false, 0), 0);
     }
 }
 
@@ -6834,6 +7232,17 @@ pub(crate) fn wake_stranded(word: u64, idle_since_ns: u64, now_ns: u64) -> bool 
 /// to heal ([`OutputWakeWatch::pass`]); a stranded one is re-posted here (by CAS,
 /// not counted as a heal) while output streams. A wake stranded on the last
 /// chunk of a burst waits for the loop's next unrelated turn.
+/// [`gated_output_wake`] for a test of a post that refuses (a warm spare's,
+/// `crate::spare::SpareLink::decide`).
+#[cfg(test)]
+pub(crate) fn gated_output_wake_for_test(
+    flag: &AtomicU64,
+    now_ns: u64,
+    send: impl FnOnce() -> bool,
+) -> WakeGate {
+    gated_output_wake(flag, now_ns, 0, send, || now_ns)
+}
+
 fn gated_output_wake(
     flag: &AtomicU64,
     now_ns: u64,
@@ -7249,10 +7658,10 @@ pub(crate) fn atpkg_child_path_once() -> &'static str {
 /// The PATH the co-located atpkg children run with. A Finder-launched app
 /// inherits launchd's minimal PATH, so `atpkg seed`/`atpkg update` could not see
 /// foreign copies like `~/.local/bin/claude` and would disagree with a terminal.
-/// The children get the login shell's PATH: one `$SHELL -l -i -c 'printf %s
-/// "$PATH"'` (zsh/bash/fish; `/bin/zsh` otherwise), bounded by
-/// [`LOGIN_PATH_BUDGET`], falling back to the process PATH plus `~/.local/bin`
-/// and `/opt/homebrew/bin` when the shell does not answer.
+/// The children get the login shell's PATH: one `<shell> -l -i -c 'printf %s
+/// "$PATH"'` ([`path_probe_shell`]), bounded by [`LOGIN_PATH_BUDGET`], falling
+/// back to the process PATH plus `~/.local/bin` (and `/opt/homebrew/bin` on
+/// macOS) when the shell does not answer.
 pub(crate) fn atpkg_child_path() -> String {
     login_shell_path().unwrap_or_else(|| {
         // The managed dirs the shell hook would place (`agents/` first, `bin/`
@@ -7275,10 +7684,12 @@ pub(crate) fn atpkg_child_path() -> String {
 
 /// How long [`atpkg_child_path`] waits for the login shell before falling back: an
 /// rc file that blocks (a `read`, an `ssh-add` prompt) must not stall provisioning.
+#[cfg(not(windows))]
 const LOGIN_PATH_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long [`login_shell_path`] keeps collecting after the shell has answered: the
 /// PATH line is already in the pipe then, so this only covers the reader's hop.
+#[cfg(any(not(windows), test))]
 const LOGIN_PATH_GRACE: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// The user's login-shell `PATH`, or `None` when the shell did not answer in time /
@@ -7292,23 +7703,44 @@ const LOGIN_PATH_GRACE: std::time::Duration = std::time::Duration::from_millis(5
 /// visible console window for its whole rc chain (the 2026-09-30 sweep;
 /// `aterm_uds::spawn` has the measurement).
 fn login_shell_path() -> Option<String> {
-    if cfg!(windows) {
-        return None;
+    #[cfg(windows)]
+    {
+        None
     }
-    let shell = std::env::var("SHELL")
-        .ok()
-        .filter(|s| {
-            matches!(
-                std::path::Path::new(s).file_name().and_then(|n| n.to_str()),
-                Some("zsh" | "bash" | "fish")
-            )
-        })
-        .unwrap_or_else(|| "/bin/zsh".to_string());
-    login_shell_path_with(
-        &shell,
-        &["-l", "-i", "-c", "printf '%s\\n' \"$PATH\""],
-        LOGIN_PATH_BUDGET,
-    )
+    #[cfg(not(windows))]
+    {
+        let (shell, _) = aterm_pty::select_shell_with_origin(None);
+        let shell = path_probe_shell(&shell.to_string_lossy(), cfg!(target_os = "macos"));
+        login_shell_path_with(
+            &shell,
+            &["-l", "-i", "-c", "printf '%s\\n' \"$PATH\""],
+            LOGIN_PATH_BUDGET,
+        )
+    }
+}
+
+/// The shell [`login_shell_path`] asks for its `PATH`, from the account's shell
+/// (`$SHELL`, else the password database's — the spawn's own resolution): that
+/// shell when its `-l -i -c` reads the person's login files and runs a POSIX
+/// `printf` — zsh, bash, fish, and off macOS the `sh` family (dash is Debian's
+/// and Ubuntu's `/bin/sh`) — else a default that does: `/bin/zsh` on macOS,
+/// whose login rc (`~/.zprofile`) is where Homebrew's shellenv lives, and
+/// `/bin/sh` elsewhere, which reads `/etc/profile` and `~/.profile` (zsh is no
+/// default there and often absent; tcsh refuses `-l` beside other flags, and
+/// nu, xonsh or elvish speak no POSIX).
+#[cfg(not(windows))]
+fn path_probe_shell(account_shell: &str, macos: bool) -> String {
+    let name = std::path::Path::new(account_shell)
+        .file_name()
+        .and_then(|n| n.to_str());
+    let posix_family = matches!(name, Some("sh" | "dash" | "ksh" | "mksh"));
+    if matches!(name, Some("zsh" | "bash" | "fish")) || (!macos && posix_family) {
+        account_shell.to_string()
+    } else if macos {
+        "/bin/zsh".to_string()
+    } else {
+        "/bin/sh".to_string()
+    }
 }
 
 // How many times THIS thread has entered [`login_shell_path_with`]. The Windows
@@ -7322,6 +7754,7 @@ thread_local! {
 
 /// [`login_shell_path`]'s body over an explicit program, argv and budget, so the
 /// budget is testable against a plain `/bin/sh`.
+#[cfg(any(not(windows), test))]
 fn login_shell_path_with(
     program: &str,
     args: &[&str],
@@ -7445,6 +7878,7 @@ fn login_shell_path_with(
 /// The PATH line out of a login shell's output: the LAST non-empty line that starts
 /// with `/` (rc-file banners print before it; a PATH may contain spaces — the managed
 /// store lives under `Application Support`). Pure, so the shape is testable.
+#[cfg(any(not(windows), test))]
 pub(crate) fn pick_login_path(output: &str) -> Option<String> {
     output
         .lines()
@@ -7455,9 +7889,9 @@ pub(crate) fn pick_login_path(output: &str) -> Option<String> {
 }
 
 /// The fallback child PATH: the process PATH (launchd's four dirs, for a Finder
-/// launch) plus the two places a foreign `claude`/`codex` measurably lives —
-/// `~/.local/bin` (Anthropic's native installer) and `/opt/homebrew/bin` (casks) —
-/// and `/usr/local/bin`, each appended once. Pure.
+/// launch) plus the places a foreign `claude`/`codex` measurably lives —
+/// `~/.local/bin` (Anthropic's native installer), on macOS `/opt/homebrew/bin`
+/// (casks), and on Unix `/usr/local/bin` — each appended once. Pure.
 pub(crate) fn fallback_child_path(
     process_path: Option<&str>,
     home: Option<&std::path::Path>,
@@ -7472,8 +7906,12 @@ pub(crate) fn fallback_child_path(
     if let Some(home) = home {
         extra.push(home.join(".local/bin").to_string_lossy().into_owned());
     }
-    extra.push("/opt/homebrew/bin".to_string());
-    extra.push("/usr/local/bin".to_string());
+    if cfg!(target_os = "macos") {
+        extra.push("/opt/homebrew/bin".to_string());
+    }
+    if cfg!(unix) {
+        extra.push("/usr/local/bin".to_string());
+    }
     for dir in extra {
         if !entries.contains(&dir) {
             entries.push(dir);
@@ -7506,51 +7944,131 @@ mod reroute_path_env_tests {
 
     const AGENTS: &str = "/Users//u/Library/Application Support/aterm/pkg/agents";
 
-    /// The agents dir rides beside the reroute dir at the front, ahead of the
-    /// bundle dir and every inherited entry (including `~/.local/bin` and
-    /// `/opt/homebrew/bin`), and is moved, not duplicated, when already present.
+    /// The PATH a tab's shell is handed: the reroute dir first, the agents dir
+    /// beside it, then the bundle dir, then the inherited PATH (`bin/` behind it:
+    /// `the_bin_dir_is_appended_once_behind_the_inherited_path`). Each injected
+    /// dir is MOVED to its place, never duplicated (a nested aterm inherits a
+    /// PATH listing the reroute dir behind `~/.cargo/bin`); the bundle dir is
+    /// never stacked when already reachable; an empty entry ("here") is the
+    /// user's and survives; nothing to inject is no pair at all; and
+    /// reapplying the seam to its own answer changes nothing.
     #[test]
-    fn the_agents_dir_is_front_inserted_beside_the_reroute_dir() {
-        let inherited = path(&[
-            "/Users//u/.local/bin",
-            "/opt/homebrew/bin",
-            "/usr/bin",
-            AGENTS,
-        ]);
-        let (_, value) = reroute_path_env(
-            Some(REROUTE),
-            Some(AGENTS),
-            Some(BUNDLE),
-            Some(&inherited),
-            None,
-        )
-        .expect("injects");
-        assert_eq!(
-            value,
-            path(&[
-                REROUTE,
-                AGENTS,
-                BUNDLE,
-                "/Users//u/.local/bin",
-                "/opt/homebrew/bin",
-                "/usr/bin"
-            ]),
-            "reroute, agents, bundle, then the user's PATH with the agents dir moved"
+    fn the_injected_dirs_lead_the_inherited_path_once_each() {
+        /// What it is, `[reroute, agents, bundle]`, the inherited PATH, the PATH handed.
+        type Case = (
+            &'static str,
+            [Option<&'static str>; 3],
+            Option<String>,
+            Option<String>,
         );
-        assert_eq!(
-            value.matches(AGENTS).count(),
-            1,
-            "moved to the front, never duplicated"
-        );
-        // Without a reroute dir the agents dir alone is still an injection…
-        let (_, value) =
-            reroute_path_env(None, Some(AGENTS), None, Some("/usr/bin"), None).expect("injects");
-        assert_eq!(value, path(&[AGENTS, "/usr/bin"]));
-        // …and with neither, nothing changes.
-        assert_eq!(
-            reroute_path_env(None, None, None, Some("/usr/bin"), None),
-            None
-        );
+        let cases: [Case; 12] = [
+            (
+                "agents beside the reroute dir, moved out of the user's PATH",
+                [Some(REROUTE), Some(AGENTS), Some(BUNDLE)],
+                Some(path(&[
+                    "/Users//u/.local/bin",
+                    "/opt/homebrew/bin",
+                    "/usr/bin",
+                    AGENTS,
+                ])),
+                Some(path(&[
+                    REROUTE,
+                    AGENTS,
+                    BUNDLE,
+                    "/Users//u/.local/bin",
+                    "/opt/homebrew/bin",
+                    "/usr/bin",
+                ])),
+            ),
+            (
+                "the agents dir alone",
+                [None, Some(AGENTS), None],
+                Some("/usr/bin".to_string()),
+                Some(path(&[AGENTS, "/usr/bin"])),
+            ),
+            (
+                "reroute, bundle, inherited",
+                [Some(REROUTE), None, Some(BUNDLE)],
+                Some(path(&["/usr/bin", "/bin"])),
+                Some(path(&[REROUTE, BUNDLE, "/usr/bin", "/bin"])),
+            ),
+            (
+                "a later reroute dir moves to the front",
+                [Some(REROUTE), None, None],
+                Some(path(&[
+                    "/opt/homebrew/bin",
+                    "/Users//u/.cargo/bin",
+                    REROUTE,
+                    "/usr/bin",
+                    REROUTE,
+                ])),
+                Some(path(&[
+                    REROUTE,
+                    "/opt/homebrew/bin",
+                    "/Users//u/.cargo/bin",
+                    "/usr/bin",
+                ])),
+            ),
+            (
+                "a reachable bundle dir is not stacked",
+                [Some(REROUTE), None, Some(BUNDLE)],
+                Some(path(&[BUNDLE, "/usr/bin"])),
+                Some(path(&[REROUTE, BUNDLE, "/usr/bin"])),
+            ),
+            (
+                "the bundle dir alone",
+                [None, None, Some(BUNDLE)],
+                Some("/usr/bin".to_string()),
+                Some(path(&[BUNDLE, "/usr/bin"])),
+            ),
+            (
+                "the bundle dir alone, already reachable",
+                [None, None, Some(BUNDLE)],
+                Some(path(&[BUNDLE, "/usr/bin"])),
+                None,
+            ),
+            (
+                "no inherited PATH",
+                [Some(REROUTE), None, Some(BUNDLE)],
+                None,
+                Some(path(&[REROUTE, BUNDLE])),
+            ),
+            (
+                "an empty inherited PATH",
+                [Some(REROUTE), None, None],
+                Some(String::new()),
+                Some(REROUTE.to_string()),
+            ),
+            (
+                "an empty entry survives",
+                [Some(REROUTE), None, None],
+                Some(path(&["/usr/bin", "", "/bin"])),
+                Some(path(&[REROUTE, "/usr/bin", "", "/bin"])),
+            ),
+            (
+                "nothing to inject",
+                [None, None, None],
+                Some("/usr/bin".to_string()),
+                None,
+            ),
+            ("nothing at all", [None, None, None], None, None),
+        ];
+        for (what, [reroute, agents, bundle], inherited, want) in cases {
+            let got = reroute_path_env(reroute, agents, bundle, inherited.as_deref(), None);
+            assert!(
+                got.as_ref().is_none_or(|(key, _)| key == "PATH"),
+                "{what}: {got:?}"
+            );
+            let got = got.map(|(_, value)| value);
+            assert_eq!(got, want, "{what}");
+            if let Some(value) = got {
+                assert!(
+                    reroute_path_env(reroute, agents, bundle, Some(&value), None)
+                        .is_none_or(|(_, again)| again == value),
+                    "{what}: idempotent under nesting"
+                );
+            }
+        }
     }
 
     /// The spawn seam creates the agents dir rather than waiting for it: a fresh
@@ -7596,21 +8114,6 @@ mod reroute_path_env_tests {
             let md = std::fs::symlink_metadata(layout.agents_dir()).expect("left alone");
             assert_eq!(md.file_type().is_symlink(), plant, "{tag} left as it was");
         }
-        // And it is what the seam front-inserts, ahead of the foreign homes.
-        // (Unix-only: the fixture PATH and the `:` join are a Unix login
-        // shell's; Windows joins with `;`.)
-        #[cfg(unix)]
-        {
-            let (_, value) = reroute_path_env(
-                None,
-                Some(&dir),
-                None,
-                Some("/Users//u/.local/bin:/opt/homebrew/bin"),
-                None,
-            )
-            .expect("injects");
-            assert!(value.starts_with(&format!("{dir}:")), "{value}");
-        }
     }
 
     /// The atpkg children's PATH: the login shell's answer is the last `/…:…` line
@@ -7632,27 +8135,40 @@ mod reroute_path_env_tests {
         assert_eq!(pick_login_path("nothing here\n"), None);
         assert_eq!(pick_login_path(""), None);
         let home = Path::new("/Users//u");
+        // Homebrew's prefix is a macOS place: nowhere else does the fallback name it.
+        let brew: &[&str] = if cfg!(target_os = "macos") {
+            &["/opt/homebrew/bin"]
+        } else {
+            &[]
+        };
+        let with = |head: &[&str], tail: &[&str]| -> String {
+            let mut all: Vec<&str> = head.to_vec();
+            all.extend_from_slice(brew);
+            all.extend_from_slice(tail);
+            path(&all)
+        };
         assert_eq!(
             fallback_child_path(Some("/usr/bin:/bin:/usr/sbin:/sbin"), Some(home), None),
-            path(&[
-                "/usr/bin",
-                "/bin",
-                "/usr/sbin",
-                "/sbin",
-                "/Users//u/.local/bin",
-                "/opt/homebrew/bin",
-                "/usr/local/bin"
-            ]),
+            with(
+                &[
+                    "/usr/bin",
+                    "/bin",
+                    "/usr/sbin",
+                    "/sbin",
+                    "/Users//u/.local/bin"
+                ],
+                &["/usr/local/bin"]
+            ),
             "launchd's four, then the foreign homes"
         );
         assert_eq!(
-            fallback_child_path(Some("/opt/homebrew/bin:/usr/bin"), None, None),
-            path(&["/opt/homebrew/bin", "/usr/bin", "/usr/local/bin"]),
+            fallback_child_path(Some("/usr/local/bin:/usr/bin"), None, None),
+            with(&["/usr/local/bin", "/usr/bin"], &[]),
             "already-present dirs are not repeated; no home, no ~/.local/bin"
         );
         assert_eq!(
             fallback_child_path(None, Some(home), None),
-            path(&["/Users//u/.local/bin", "/opt/homebrew/bin", "/usr/local/bin"])
+            with(&["/Users//u/.local/bin"], &["/usr/local/bin"])
         );
         // The managed dirs ride as the shell hook places them: agents/ first
         // (moved, never duplicated), bin/ last once.
@@ -7664,17 +8180,38 @@ mod reroute_path_env_tests {
                 Some(home),
                 Some((agents, bin))
             ),
-            path(&[
-                agents,
-                "/usr/bin",
-                "/bin",
-                "/Users//u/.local/bin",
-                "/opt/homebrew/bin",
-                "/usr/local/bin",
-                bin
-            ]),
+            with(
+                &[agents, "/usr/bin", "/bin", "/Users//u/.local/bin"],
+                &["/usr/local/bin", bin]
+            ),
             "agents/ moved to the front, bin/ appended"
         );
+    }
+
+    /// The shell the atpkg children's `PATH` is read from: the account's when its
+    /// `-l -i -c` reads the login files and speaks POSIX `printf`, else
+    /// `/bin/zsh` on macOS and `/bin/sh` elsewhere — never a `/bin/zsh` a Linux
+    /// box does not have, and never tcsh or nu.
+    #[cfg(unix)]
+    #[test]
+    fn the_path_probe_asks_the_accounts_shell_or_the_platforms_default() {
+        use super::path_probe_shell;
+        for shell in ["/bin/bash", "/usr/bin/zsh", "/usr/bin/fish"] {
+            assert_eq!(path_probe_shell(shell, true), shell);
+            assert_eq!(path_probe_shell(shell, false), shell);
+        }
+        for shell in ["/usr/bin/dash", "/bin/sh", "/bin/mksh"] {
+            assert_eq!(
+                path_probe_shell(shell, false),
+                shell,
+                "the sh family off macOS"
+            );
+            assert_eq!(path_probe_shell(shell, true), "/bin/zsh");
+        }
+        for shell in ["/bin/tcsh", "/usr/bin/nu", "", "xonsh"] {
+            assert_eq!(path_probe_shell(shell, false), "/bin/sh", "{shell:?}");
+            assert_eq!(path_probe_shell(shell, true), "/bin/zsh", "{shell:?}");
+        }
     }
 
     /// NO LOGIN SHELL IS ASKED ON WINDOWS (2026-09-30). The window has no
@@ -7906,102 +8443,6 @@ mod reroute_path_env_tests {
         drop(master);
     }
 
-    /// The reroute dir lands FIRST, ahead of the bundle dir and the inherited PATH.
-    #[test]
-    fn reroute_dir_is_first_then_bundle_then_inherited() {
-        let got = reroute_path_env(
-            Some(REROUTE),
-            None,
-            Some(BUNDLE),
-            Some(&path(&["/usr/bin", "/bin"])),
-            None,
-        );
-        assert_eq!(
-            got,
-            Some((
-                "PATH".to_string(),
-                path(&[REROUTE, BUNDLE, "/usr/bin", "/bin"])
-            ))
-        );
-    }
-
-    /// Move-to-front, not skip-if-present: a nested aterm inherits a PATH listing
-    /// the reroute dir later (behind `~/.cargo/bin`); it must come out first,
-    /// exactly once, and reapplying the seam changes nothing.
-    #[test]
-    fn a_later_occurrence_moves_to_the_front_without_duplicates() {
-        let inherited = path(&[
-            "/opt/homebrew/bin",
-            "/Users//u/.cargo/bin",
-            REROUTE,
-            "/usr/bin",
-            REROUTE,
-        ]);
-        let (_, value) =
-            reroute_path_env(Some(REROUTE), None, None, Some(&inherited), None).expect("injects");
-        assert_eq!(
-            value,
-            path(&[
-                REROUTE,
-                "/opt/homebrew/bin",
-                "/Users//u/.cargo/bin",
-                "/usr/bin"
-            ])
-        );
-        assert_eq!(value.matches(REROUTE).count(), 1);
-        let (_, again) =
-            reroute_path_env(Some(REROUTE), None, None, Some(&value), None).expect("injects");
-        assert_eq!(again, value, "idempotent under nesting");
-    }
-
-    /// The bundle dir composes behind the reroute dir and is never stacked when it
-    /// is already reachable; without a reroute dir (Windows, `--no-reroute`) the pair
-    /// is the old bundle-only contract, byte for byte.
-    #[test]
-    fn bundle_dir_composes_once() {
-        let already = path(&[BUNDLE, "/usr/bin"]);
-        let (_, value) = reroute_path_env(Some(REROUTE), None, Some(BUNDLE), Some(&already), None)
-            .expect("injects");
-        assert_eq!(value, path(&[REROUTE, BUNDLE, "/usr/bin"]));
-        assert_eq!(
-            reroute_path_env(None, None, Some(BUNDLE), Some("/usr/bin"), None),
-            Some(("PATH".to_string(), path(&[BUNDLE, "/usr/bin"])))
-        );
-        assert_eq!(
-            reroute_path_env(None, None, Some(BUNDLE), Some(&already), None),
-            None
-        );
-    }
-
-    /// No inherited PATH at all (odd launchd edge) or an empty one: the injected dirs
-    /// alone, no dangling separator; nothing to inject ⇒ no pair; an empty entry
-    /// ("here") inside the inherited PATH is the user's and survives.
-    #[test]
-    fn empty_or_absent_inherited_path_and_nothing_to_inject() {
-        assert_eq!(
-            reroute_path_env(Some(REROUTE), None, Some(BUNDLE), None, None).map(|p| p.1),
-            Some(path(&[REROUTE, BUNDLE]))
-        );
-        assert_eq!(
-            reroute_path_env(Some(REROUTE), None, None, Some(""), None).map(|p| p.1),
-            Some(REROUTE.to_string())
-        );
-        assert_eq!(
-            reroute_path_env(None, None, None, Some("/usr/bin"), None),
-            None
-        );
-        assert_eq!(reroute_path_env(None, None, None, None, None), None);
-        let (_, value) = reroute_path_env(
-            Some(REROUTE),
-            None,
-            None,
-            Some(&path(&["/usr/bin", "", "/bin"])),
-            None,
-        )
-        .expect("injects");
-        assert_eq!(value, path(&[REROUTE, "/usr/bin", "", "/bin"]));
-    }
-
     /// `bin/` goes LAST, once: appended behind every inherited entry (a system copy of
     /// a name wins), never stacked on a PATH that already holds it — the hook sourced
     /// later skips it by the same test — while reroute and agents stay in front. It is
@@ -8086,7 +8527,8 @@ mod reroute_path_env_tests {
 #[cfg(test)]
 mod clipboard_coalesce_tests {
     use aterm_core::terminal::ClipboardSelection as Sel;
-    use aterm_spec::derive::{Model, clipboard_mailbox_model};
+    use aterm_models_gui::clipboard_mailbox_model;
+    use aterm_spec::derive::Model;
 
     use super::{
         ClipMailboxReceiver, ClipWrite, QuerySource, clip_mailbox, route_osc52_query,
@@ -8152,64 +8594,58 @@ mod clipboard_coalesce_tests {
         assert!(model.check_invariant("OneLatestPendingWrite", state));
     }
 
-    /// `'c'` (and the empty default) keep their established clipboard routing,
-    /// with PRIMARY untouched; `"cp"` sets both.
+    /// Where an OSC 52 Set writes and its query reads, per target: `'c'` and
+    /// the empty xterm default are the clipboard; `"cp"` sets both and keeps
+    /// the established clipboard priority for its one response; `'p'` is
+    /// PRIMARY on X11, where a Set and its query meet in the same slot. Off
+    /// X11 there IS no PRIMARY: `'p'` folds into the clipboard on both sides
+    /// of the round trip (what every macOS/Windows OSC 52 client relies on),
+    /// and `"cp"` collapses to ONE clipboard write, not two.
     #[test]
-    fn clipboard_and_default_targets_route_to_the_clipboard() {
-        let w = route_osc52_write(&[Sel::Clipboard], "x", true);
-        assert_eq!((w.clipboard.as_deref(), w.primary), (Some("x"), None));
-        let w = route_osc52_write(&[], "x", true);
-        assert_eq!(
-            (w.clipboard.as_deref(), w.primary),
-            (Some("x"), None),
-            "an empty selection list is the xterm clipboard default"
-        );
-        let w = route_osc52_write(&[Sel::Clipboard, Sel::Primary], "x", true);
-        assert_eq!(w.clipboard.as_deref(), Some("x"));
-        assert_eq!(w.primary.as_deref(), Some("x"));
-    }
-
-    /// Off X11 there IS no PRIMARY: `'p'` falls back to the clipboard (the
-    /// behaviour every macOS/Windows OSC 52 client has always relied on), and a
-    /// `"cp"` set collapses to ONE clipboard write, not two.
-    #[test]
-    fn primary_falls_back_to_the_clipboard_where_primary_does_not_exist() {
-        let w = route_osc52_write(&[Sel::Primary], "y", false);
-        assert_eq!((w.clipboard.as_deref(), w.primary), (Some("y"), None));
-        let w = route_osc52_write(&[Sel::Clipboard, Sel::Primary], "y", false);
-        assert_eq!((w.clipboard.as_deref(), w.primary), (Some("y"), None));
-    }
-
-    /// `'p'` Sets write PRIMARY, so a `'p'` query reads PRIMARY, while `'c'` and
-    /// the empty xterm default read the clipboard: set-then-query coherence.
-    #[test]
-    fn query_reads_the_slot_its_set_wrote_per_target() {
-        // 'p' on X11: Set writes ONLY primary; the query reads Primary.
-        let w = route_osc52_write(&[Sel::Primary], "yank", true);
-        assert_eq!((w.clipboard, w.primary.as_deref()), (None, Some("yank")));
-        assert_eq!(
-            route_osc52_query(&[Sel::Primary], true),
-            QuerySource::Primary
-        );
-        // 'c' and the empty default: Set writes the clipboard; so reads the query.
-        assert_eq!(
-            route_osc52_query(&[Sel::Clipboard], true),
-            QuerySource::Clipboard
-        );
-        assert_eq!(route_osc52_query(&[], true), QuerySource::Clipboard);
-        // "cp": Set wrote BOTH slots, the one response keeps the established
-        // CLIPBOARD priority — still a slot the same Set stored.
-        assert_eq!(
-            route_osc52_query(&[Sel::Clipboard, Sel::Primary], true),
-            QuerySource::Clipboard
-        );
-        // Off X11 'p' folds into the clipboard on BOTH sides of the round-trip.
-        let w = route_osc52_write(&[Sel::Primary], "y", false);
-        assert_eq!((w.clipboard.as_deref(), w.primary), (Some("y"), None));
-        assert_eq!(
-            route_osc52_query(&[Sel::Primary], false),
-            QuerySource::Clipboard
-        );
+    fn osc52_writes_and_reads_the_slot_its_target_names() {
+        type Slots<'a> = (Option<&'a str>, Option<&'a str>);
+        let cases: [(&[Sel], bool, Slots, QuerySource); 6] = [
+            (
+                &[Sel::Clipboard],
+                true,
+                (Some("x"), None),
+                QuerySource::Clipboard,
+            ),
+            (&[], true, (Some("x"), None), QuerySource::Clipboard),
+            (
+                &[Sel::Clipboard, Sel::Primary],
+                true,
+                (Some("x"), Some("x")),
+                QuerySource::Clipboard,
+            ),
+            (
+                &[Sel::Primary],
+                true,
+                (None, Some("x")),
+                QuerySource::Primary,
+            ),
+            (
+                &[Sel::Primary],
+                false,
+                (Some("x"), None),
+                QuerySource::Clipboard,
+            ),
+            (
+                &[Sel::Clipboard, Sel::Primary],
+                false,
+                (Some("x"), None),
+                QuerySource::Clipboard,
+            ),
+        ];
+        for (sels, x11, slots, source) in cases {
+            let w = route_osc52_write(sels, "x", x11);
+            assert_eq!(
+                (w.clipboard.as_deref(), w.primary.as_deref()),
+                slots,
+                "{sels:?} x11={x11}"
+            );
+            assert_eq!(route_osc52_query(sels, x11), source, "{sels:?} x11={x11}");
+        }
     }
 
     /// End-to-end on the stubbed slots (Linux): with DIFFERENT text stored in
@@ -8244,16 +8680,6 @@ mod clipboard_coalesce_tests {
             (Some("only"), None)
         );
         assert!(rx.recv().is_none());
-    }
-
-    /// Mixed selection writes share one immutable payload allocation instead
-    /// of copying a potentially large OSC 52 body once per destination.
-    #[test]
-    fn mixed_target_write_shares_its_payload() {
-        let write = route_osc52_write(&[Sel::Clipboard, Sel::Primary], "shared", true);
-        let clipboard = write.clipboard.expect("clipboard payload");
-        let primary = write.primary.expect("primary payload");
-        assert!(std::sync::Arc::ptr_eq(&clipboard, &primary));
     }
 
     /// Tier-1: drive the real constant-memory mailbox through the derived model's
@@ -8338,7 +8764,6 @@ mod host_reach_tests {
             24,
             80,
             Some(&query_allowed()),
-            aterm_types::Appearance::Dark,
             None,
         )));
         let (tx, rx) = channel();
@@ -8401,7 +8826,7 @@ mod host_reach_tests {
     #[test]
     fn a_contained_session_reaches_no_clipboard() {
         let answer = b"\x1b]52;c;b3duZXItc2VjcmV0\x07".to_vec();
-        for mode in [Cm::User, Cm::Master, Cm::Safety] {
+        for mode in [Cm::User, Cm::Safety] {
             let (term, writes) = session(mode);
             term_lock(&term).process(SET);
             let write = writes
@@ -8470,16 +8895,15 @@ mod host_reach_tests {
     /// what makes the refusal mean something.
     #[test]
     fn a_contained_session_posts_no_notification() {
-        for mode in [Cm::User, Cm::Master, Cm::Safety, Cm::Containment] {
+        for mode in [Cm::User, Cm::Safety, Cm::Containment] {
             let term = Arc::new(Mutex::new(new_live_terminal(
                 24,
                 80,
                 Some(&notifications_allowed()),
-                aterm_types::Appearance::Dark,
                 None,
             )));
             let (tx, notices) = sync_channel(8);
-            configure_notifications(&term, host_reach(mode), &tx, 1);
+            configure_notifications(&term, host_reach(mode), &tx, 1, &Arc::default());
             term_lock(&term).apply_policy_engine(aterm_policy::engine::PolicyEngine::new(
                 aterm_policy::profiles::standard(),
             ));
@@ -8535,13 +8959,11 @@ mod output_wake_coalesce_tests {
 
     /// The arm is two-phase: while `send` runs the word is the bare arm stamp
     /// (unsent), and after it returns the post-send stamp with
-    /// [`WAKE_LATCH_SENT`]. An armed latch coalesces however old while a turn
-    /// runs and once an `about_to_wait` has passed the post: the reader never
-    /// duplicates a wake that may be queued.
+    /// [`WAKE_LATCH_SENT`]. (That an armed latch then coalesces however old is
+    /// `latch_conforms_to_damage_to_present_model`'s.)
     #[test]
-    fn the_arm_is_stamped_after_the_post_and_a_queued_wake_is_never_resent() {
+    fn the_arm_is_stamped_after_the_post() {
         let flag = AtomicU64::new(0);
-        let (tx, rx) = std::sync::mpsc::channel::<()>();
         let mut during = 0;
         gated_output_wake(
             &flag,
@@ -8549,31 +8971,11 @@ mod output_wake_coalesce_tests {
             0,
             || {
                 during = flag.load(Ordering::Relaxed);
-                tx.send(()).is_ok()
+                true
             },
             || 11 * MS,
         );
         assert_eq!(during, 10 * MS, "unsent while the post is in progress");
-        assert_eq!(flag.load(Ordering::Relaxed), (11 * MS) | WAKE_LATCH_SENT);
-        // A turn is running (idle stamp 0), or the loop went idle AFTER the
-        // post (an `about_to_wait` saw it): never re-sent, whatever the age.
-        for idle_since in [0, 11 * MS, 12 * MS] {
-            for age in [1, WAKE_LATCH_EXPIRY_NS + 1, 10 * WAKE_LATCH_EXPIRY_NS] {
-                let gate = gated_output_wake(
-                    &flag,
-                    11 * MS + age,
-                    idle_since,
-                    || tx.send(()).is_ok(),
-                    || u64::MAX,
-                );
-                assert_eq!(gate, WakeGate::Coalesced, "idle {idle_since} age {age}");
-            }
-        }
-        assert_eq!(
-            rx.try_iter().count(),
-            1,
-            "one wake per arm, whatever its age"
-        );
         assert_eq!(flag.load(Ordering::Relaxed), (11 * MS) | WAKE_LATCH_SENT);
     }
 
@@ -8646,7 +9048,7 @@ mod output_wake_coalesce_tests {
     }
 
     /// Tier-1 conformance, reader half: at every state of
-    /// `aterm_spec::derive::damage_to_present_model()` reachable under `Buggy = 0`,
+    /// `aterm_models_core::damage_to_present_model()` reachable under `Buggy = 0`,
     /// the real [`gated_output_wake`], fed the projected latch word and loop idle
     /// stamp, posts iff `DamageFresh` is enabled, re-posts iff `DamageRepost` is,
     /// re-stamps the latch to the model successor's word, and otherwise coalesces.
@@ -8656,7 +9058,7 @@ mod output_wake_coalesce_tests {
     /// that never re-sends disagrees on a wake stranded with its loop wake-up.
     #[test]
     fn latch_conforms_to_damage_to_present_model() {
-        let m = aterm_spec::derive::damage_to_present_model();
+        let m = aterm_models_core::damage_to_present_model();
         const {
             assert!(K * EXPIRY_TICKS < WAKE_LATCH_EXPIRY_NS);
             assert!(K * (EXPIRY_TICKS + 1) - 1 > WAKE_LATCH_EXPIRY_NS);
@@ -8733,7 +9135,7 @@ mod output_wake_coalesce_tests {
     /// where the model folds a future one.
     #[test]
     fn watchdog_conforms_to_damage_to_present_model() {
-        let m = aterm_spec::derive::damage_to_present_model();
+        let m = aterm_models_core::damage_to_present_model();
         let (mut judged, mut idle_judged) = (0_u32, 0_u32);
         let (mut false_heal_caught, mut past_recheck_caught) = (false, false);
         for st in reachable(&m) {
@@ -8962,79 +9364,6 @@ mod output_wake_coalesce_tests {
         assert_eq!(rx.try_iter().count(), 1);
     }
 
-    /// A wake lost together with its loop wake-up while the loop slept: no pass
-    /// saw it and no recheck exists. While output streams, the reader re-posts it
-    /// at the first chunk past the expiry (not a heal), exactly once; the loop
-    /// turns and the handler clears.
-    #[test]
-    fn a_wake_stranded_with_its_loop_wake_up_is_reposted_while_output_streams() {
-        let latch = AtomicU64::new(0);
-        let loop_idle = LoopIdle::default();
-        let mut watch = OutputWakeWatch::default();
-        let t0 = 1_000 * MS;
-        // The last turn saw a clear latch: no recheck, and the loop sleeps.
-        assert_eq!(watch.pass(t0, [(4, &latch)]).recheck_ns, None);
-        loop_idle.went_idle(t0);
-        // Output 500 ms later posts a wake that is lost with its wake-up.
-        let mut sends = 0;
-        let sent = t0 + 500 * MS;
-        let gate = gated_output_wake(
-            &latch,
-            sent,
-            loop_idle.since_ns(),
-            || {
-                sends += 1;
-                true
-            },
-            || sent,
-        );
-        assert_eq!(gate, WakeGate::Posted);
-        // Chunks keep arriving; the loop never turns.
-        let chunk = |at: u64, sends: &mut u32| {
-            let now = t0 + at * MS;
-            gated_output_wake(
-                &latch,
-                now,
-                loop_idle.since_ns(),
-                || {
-                    *sends += 1;
-                    true
-                },
-                || now,
-            )
-        };
-        for at in [550, 600] {
-            assert_eq!(
-                chunk(at, &mut sends),
-                WakeGate::Coalesced,
-                "{at} ms: within the expiry"
-            );
-        }
-        assert_eq!(
-            chunk(610, &mut sends),
-            WakeGate::Reposted,
-            "the first chunk past the expiry re-posts"
-        );
-        assert_eq!(
-            latch.load(Ordering::Relaxed),
-            (t0 + 610 * MS) | WAKE_LATCH_SENT,
-            "re-stamped: a re-post starts a new expiry"
-        );
-        for at in [650, 700] {
-            assert_eq!(chunk(at, &mut sends), WakeGate::Coalesced, "{at} ms");
-        }
-        assert_eq!(sends, 2, "one post, one re-post");
-        // Were the re-post lost too, the next chunk past ITS expiry re-posts
-        // again: at most one event per expiry per session.
-        assert_eq!(chunk(711, &mut sends), WakeGate::Reposted);
-        assert_eq!(sends, 3);
-        // The loop turns: nothing was proven lost, nothing is healed.
-        loop_idle.turn_began();
-        latch.store(0, Ordering::Relaxed);
-        let pass = watch.pass(t0 + 712 * MS, [(4, &latch)]);
-        assert_eq!(pass.healed, 0, "a re-post is not a heal");
-    }
-
     /// An unsent arm (between arm and post) is never presumed lost or stranded,
     /// however old: its post is still coming. It rechecks after one expiry while
     /// young and after its own age once older, so a stalled post never becomes a
@@ -9114,28 +9443,11 @@ mod kitty_transfer_tests {
         v
     }
 
-    /// A fresh live session defaults DEC 1007 (alternate scroll) on, and an app
-    /// can still turn it off with ?1007l.
-    #[test]
-    fn alternate_scroll_defaults_on_for_a_live_session() {
-        let t = new_live_terminal(10, 40, None, aterm_types::Appearance::Dark, None);
-        assert!(
-            t.modes().alternate_scroll,
-            "DEC 1007 must default ON for a live session"
-        );
-        let mut t2 = new_live_terminal(10, 40, None, aterm_types::Appearance::Dark, None);
-        t2.process(b"\x1b[?1007l");
-        assert!(
-            !t2.modes().alternate_scroll,
-            "an app can still turn alternate scroll off"
-        );
-    }
-
     /// The foreground handback restores 1007 to the host's on default, so it
     /// never turns wheel scrolling in `less`, `man` or `git log` off.
     #[test]
     fn alternate_scroll_survives_a_foreground_handback() {
-        let mut t = new_live_terminal(10, 40, None, aterm_types::Appearance::Dark, None);
+        let mut t = new_live_terminal(10, 40, None, None);
         t.process(b"\x1b[?25l");
         let h = t
             .foreground_handback()
@@ -9157,47 +9469,34 @@ mod kitty_transfer_tests {
     /// process (the id is the process, not the session), and stable across calls.
     #[test]
     fn live_session_archive_carries_the_process_origin() {
-        let a = new_live_terminal(10, 40, None, aterm_types::Appearance::Dark, None);
-        let b = new_live_terminal(12, 50, None, aterm_types::Appearance::Dark, None);
+        let a = new_live_terminal(10, 40, None, None);
+        let b = new_live_terminal(12, 50, None, None);
         let origin = alt_archive_origin();
         assert_ne!(origin, 0, "an origin of 0 is the unset value");
         assert_eq!(origin, alt_archive_origin(), "fixed for the process");
         assert_eq!(a.alt_archive().origin(), origin);
         assert_eq!(b.alt_archive().origin(), origin);
-        assert_eq!(
-            aterm_core::terminal::Terminal::new(2, 2)
-                .alt_archive()
-                .origin(),
-            0,
-            "a bare engine has no host to name its origin"
-        );
     }
 
     /// SCROLL-1 — a fresh live session attaches a tiered scrollback STORE (not the bare
     /// 10k ring), and the resolved total `scrollback_limit` actually drives ring + store
     /// — the setting that was a silent no-op while `grid.scrollback` stayed `None`.
-    /// Covers the default (100k), a finite cap, and `0` ⇒ unlimited (line limit `None`).
+    /// Covers a finite cap and `0` ⇒ unlimited (line limit `None`).
     #[test]
     fn live_session_attaches_tiered_scrollback_driven_by_config() {
         use aterm_core::config::TerminalConfig;
-        // No config: the store is present and the unified ring + store total is
-        // the advertised default (`aterm_scrollback::DEFAULT_LINE_LIMIT`).
-        let t = new_live_terminal(10, 40, None, aterm_types::Appearance::Dark, None);
+        // No config: the store is present.
+        let t = new_live_terminal(10, 40, None, None);
         assert!(
             t.scrollback().is_some(),
             "SCROLL-1: a live session must attach a tiered scrollback store"
-        );
-        assert_eq!(
-            t.grid().scrollback_line_limit(),
-            Some(100_000),
-            "the default ring + store total honors the 100k line limit"
         );
         // A finite config limit reaches the store (was a no-op with scrollback = None).
         let tc = TerminalConfig {
             scrollback_limit: Some(5_000),
             ..TerminalConfig::default()
         };
-        let t = new_live_terminal(10, 40, Some(&tc), aterm_types::Appearance::Dark, None);
+        let t = new_live_terminal(10, 40, Some(&tc), None);
         assert_eq!(
             t.grid().scrollback_line_limit(),
             Some(5_000),
@@ -9209,7 +9508,7 @@ mod kitty_transfer_tests {
             scrollback_limit: None,
             ..TerminalConfig::default()
         };
-        let t = new_live_terminal(10, 40, Some(&tc), aterm_types::Appearance::Dark, None);
+        let t = new_live_terminal(10, 40, Some(&tc), None);
         // Store still attached (so the `None` below is "unlimited", not "no store" —
         // `scrollback_line_limit()` collapses both to `None`).
         assert!(
@@ -9223,37 +9522,29 @@ mod kitty_transfer_tests {
         );
     }
 
-    /// With the store attached, history past the 10k grid ring is retained (it
-    /// tiers into the store): the total scrollback exceeds 10k lines.
-    #[test]
-    fn live_session_retains_scrollback_past_the_10k_ring() {
-        let mut t = new_live_terminal(10, 40, None, aterm_types::Appearance::Dark, None);
-        // ~12k line feeds ⇒ ~12k scrolls, far past the 10k ring. Content-free is fine —
-        // we count retained lines, not their bytes; the default 100k limit won't evict.
-        t.process(&vec![b'\n'; 12_000]);
-        let retained = t.grid().scrollback_lines();
-        assert!(
-            retained > 10_000,
-            "SCROLL-1: history past the 10k ring must be retained (got {retained}), not dropped"
-        );
-    }
-
-    /// BROKEN-2 — a session built while the OS is LIGHT reports the LIGHT scheme from
-    /// the start (engine `color_scheme()` + the DSR `CSI ?996n` reply), instead of the
-    /// engine's `Dark` default. This is the tab/split-spawned-after-attach case the
+    /// BROKEN-2 — a session built from a config whose `color_scheme` is LIGHT (a
+    /// light palette) reports the LIGHT scheme from the start (engine
+    /// `color_scheme()` + the DSR `CSI ?996n` reply), instead of the engine's
+    /// `Dark` default. This is the tab/split-spawned-after-attach case the
     /// finding reported: the pixels were light but the engine reported dark.
     #[test]
     fn live_session_adopts_the_os_color_scheme_at_construction() {
         use aterm_types::Appearance;
-        // Dark (the engine default) — unchanged baseline.
-        let dark = new_live_terminal(10, 40, None, Appearance::Dark, None);
-        assert_eq!(dark.color_scheme(), Appearance::Dark);
-        // Light desktop: the fresh engine must REPORT light, not the dark default.
-        let mut light = new_live_terminal(10, 40, None, Appearance::Light, None);
+        // NEG: no config keeps the engine default, dark.
+        let mut dark = new_live_terminal(10, 40, None, None);
+        dark.process(b"\x1b[?996n");
+        assert_eq!(dark.take_response().as_deref(), Some(&b"\x1b[?997;1n"[..]));
+        // A light palette: the fresh engine must REPORT light, not the dark
+        // default, from the config it is built with.
+        let tc = aterm_core::config::TerminalConfig {
+            color_scheme: Some(Appearance::Light),
+            ..aterm_core::config::TerminalConfig::default()
+        };
+        let mut light = new_live_terminal(10, 40, Some(&tc), None);
         assert_eq!(
             light.color_scheme(),
             Appearance::Light,
-            "BROKEN-2: a tab spawned on a light desktop must report light"
+            "BROKEN-2: a tab spawned under a light palette must report light"
         );
         // And the DSR `CSI ?996n` query answers light (Ps=2), agreeing with the pixels.
         light.process(b"\x1b[?996n");
@@ -9269,28 +9560,6 @@ mod kitty_transfer_tests {
         term_lock(&term).set_cell_pixel_size(10, 20);
         configure_kitty_file_transfer(&term, HostReach::Platform);
         term
-    }
-
-    #[test]
-    fn file_medium_reads_a_real_file_and_places_the_image() {
-        let dir = std::env::temp_dir().join(format!("aterm-kft-f-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("img.rgba");
-        std::fs::File::create(&path)
-            .unwrap()
-            .write_all(&vec![0u8; 10 * 20 * 4]) // one 10x20 RGBA cell
-            .unwrap();
-
-        let term = term_with_resolver();
-        let seq = apc("a=T,f=32,s=10,v=20,t=f", path.to_str().unwrap().as_bytes());
-        crate::host_io_prefetch::feed_as_reader(&term, &seq);
-        let placed = !term_lock(&term).cell_frame(24, 80).images[0].is_empty();
-
-        let _ = std::fs::remove_dir_all(&dir);
-        assert!(
-            placed,
-            "t=f must read the real file via the resolver and place the image"
-        );
     }
 
     /// A Kitty file medium is never read inside `process()`, which runs under
@@ -9585,7 +9854,7 @@ mod kitty_transfer_tests {
         let marked = scratch.0.join("tty-graphics-protocol");
         std::fs::create_dir_all(&marked).unwrap();
         let missing = scratch.0.join("absent.rgba");
-        for mode in [Cm::User, Cm::Master, Cm::Safety, Cm::Containment] {
+        for mode in [Cm::User, Cm::Safety, Cm::Containment] {
             let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
             term_lock(&term).set_cell_pixel_size(10, 20);
             configure_kitty_file_transfer(&term, host_reach(mode));
@@ -9630,63 +9899,6 @@ mod kitty_transfer_tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         assert!(!placed, "an over-cap file must be rejected (fail closed)");
-    }
-}
-
-#[cfg(test)]
-mod ring_budget_tests {
-    use super::{
-        LIVE_SCROLLBACK_RING_BYTES, LIVE_SCROLLBACK_RING_LINES_MAX, LIVE_SCROLLBACK_RING_LINES_MIN,
-        live_scrollback_ring_lines,
-    };
-
-    /// The sizing formula's estimate, not a measurement of allocated memory.
-    fn estimated_bytes_at(cols: u16) -> usize {
-        live_scrollback_ring_lines(cols)
-            * (usize::from(cols) * std::mem::size_of::<aterm_core::grid::Cell>() + 45)
-    }
-
-    /// The initial capacity scales with width under the sizing estimate, with
-    /// explicit min/max line clamps. This checks that policy's arithmetic;
-    /// it does not assert an allocation bound across resizes or restoration.
-    #[test]
-    fn the_scrollback_ring_targets_estimated_bytes_at_initial_width() {
-        for cols in [80u16, 120, 200, 400, 1000] {
-            let lines = live_scrollback_ring_lines(cols);
-            assert!(
-                (LIVE_SCROLLBACK_RING_LINES_MIN..=LIVE_SCROLLBACK_RING_LINES_MAX).contains(&lines),
-                "{cols} cols: {lines} lines is outside the ring's own bounds"
-            );
-            // Wherever the floor is not what bound it, the estimate fits.
-            if lines > LIVE_SCROLLBACK_RING_LINES_MIN {
-                assert!(
-                    estimated_bytes_at(cols) <= LIVE_SCROLLBACK_RING_BYTES,
-                    "{cols} cols: estimated {} B over the {LIVE_SCROLLBACK_RING_BYTES} B target",
-                    estimated_bytes_at(cols)
-                );
-            }
-        }
-        assert_eq!(
-            live_scrollback_ring_lines(4096),
-            LIVE_SCROLLBACK_RING_LINES_MIN
-        );
-        assert!(
-            estimated_bytes_at(4096) > LIVE_SCROLLBACK_RING_BYTES,
-            "the intentional floor must not be misreported as a hard byte limit"
-        );
-        // A wider window gets a SHALLOWER ring. That is the whole point.
-        assert!(
-            live_scrollback_ring_lines(80) > live_scrollback_ring_lines(400),
-            "a narrow window keeps the deeper ring"
-        );
-        // And what it replaced — a flat 10,000 lines at 200 columns — was 16.5 MB
-        // against this ring's 4.0 MiB, a factor of 3.9.
-        let flat_10k = 10_000 * (200 * std::mem::size_of::<aterm_core::grid::Cell>() + 45);
-        assert!(
-            flat_10k > 3 * estimated_bytes_at(200),
-            "the 200-column ring should be a fraction of the flat 10k it replaced: {flat_10k} B vs {} B",
-            estimated_bytes_at(200)
-        );
     }
 }
 
@@ -9746,110 +9958,6 @@ mod adoption_render_debt_tests {
         guard.evaluate_resizes(probe, after + 1);
         let view = guard.resize_nudge_view().expect("at risk, agent, untried");
         assert_eq!((view.shift, view.pushed), (-1, 0));
-    }
-
-    /// The first full clear (the program repainting, on the pulse or on its own)
-    /// resets the debt as ever, and the epoch closes healed: nothing is left for
-    /// the nudge.
-    #[test]
-    fn a_seeded_debt_is_reset_by_the_first_full_clear() {
-        let term = restored();
-        let tl = timeline();
-        seed_adopted_render_debt(&term, &tl, (-1, 0));
-        term.lock().unwrap().process(b"\x1b[2J\x1b[1;1Hrepainted");
-        assert_eq!(term.lock().unwrap().render_debt(), (0, 0));
-        let probe = {
-            let t = term.lock().unwrap();
-            crate::resize_ledger::EngineProbe::sample(&t)
-        };
-        let mut guard = tl.lock().unwrap();
-        guard.set_agent_reader_for_test(true);
-        guard.evaluate_resizes(probe, crate::turn_ledger::now_ms() + 60_000);
-        assert!(guard.resize_nudge_view().is_none());
-        assert!(guard.resizes().epochs().current().is_none(), "closed");
-    }
-
-    /// A predecessor that owed nothing (or one from before the field) hands
-    /// over no debt: `spawn_session` never calls the seed, and a program on the
-    /// alternate screen is exactly as before - no epoch, no nudge - whatever
-    /// its class.
-    #[test]
-    fn a_record_without_the_key_arms_nothing_for_any_program() {
-        for agent in [true, false] {
-            let term = restored();
-            let tl = timeline();
-            let probe = {
-                let t = term.lock().unwrap();
-                crate::resize_ledger::EngineProbe::sample(&t)
-            };
-            let mut guard = tl.lock().unwrap();
-            guard.set_agent_reader_for_test(agent);
-            guard.evaluate_resizes(probe, crate::turn_ledger::now_ms() + 60_000);
-            assert!(
-                guard.resizes().epochs().current().is_none(),
-                "agent={agent}"
-            );
-            assert!(guard.resize_nudge_view().is_none(), "agent={agent}");
-        }
-    }
-
-    /// The seed refuses the main screen: the debt is about the alternate
-    /// screen's rows.
-    #[test]
-    fn a_debt_seeded_onto_the_main_screen_is_ignored() {
-        let term = Arc::new(Mutex::new(Terminal::new(12, 20)));
-        let tl = timeline();
-        seed_adopted_render_debt(&term, &tl, (-1, 0));
-        assert_eq!(term.lock().unwrap().render_debt(), (0, 0));
-        assert!(tl.lock().unwrap().resizes().epochs().current().is_none());
-    }
-
-    /// The seed sits after the hydrate (a restored checkpoint replaces the
-    /// engine's modes and would zero it) and before the reader can parse a
-    /// byte; the size pulse and its rule are untouched. Read from the source,
-    /// the idiom of the pins above.
-    #[test]
-    fn the_seed_follows_the_hydrate_precedes_the_reader_and_leaves_the_pulse_alone() {
-        let body = crate::spawn::spawn_session_body();
-        let call = "seed_adopted_render_debt(&term, &ctx.timeline, debt);";
-        assert_eq!(body.matches(call).count(), 1, "one seed");
-        let seed = body.find(call).expect("called");
-        let hydrate = body.find("hydrate_adopted_engine(").expect("hydrates");
-        let pulse = body
-            .find("adoption_needs_size_pulse(adopt_checkpoint.as_ref(), adopt_repaint)")
-            .expect("the pulse rule is unchanged");
-        let reader = body.find("attach_reader(").expect("attaches its reader");
-        assert!(hydrate < seed, "the seed follows the hydrate");
-        assert!(seed < reader, "the seed precedes the reader");
-        assert!(hydrate < pulse, "the pulse still runs, after the hydrate");
-        // The call is `pulse_adopted_pty(` (a hold-carrying signature since the
-        // adoption pulse is held for a repaint adoption); comments name it in
-        // backticks with no open parenthesis.
-        assert_eq!(
-            body.matches("pulse_adopted_pty(").count(),
-            1,
-            "the pulse is still one call, after the hydrate"
-        );
-        assert!(
-            hydrate < body.find("pulse_adopted_pty(").unwrap(),
-            "the pulse call follows the hydrate"
-        );
-        let src = include_str!("spawn.rs");
-        let pulse_fn = src
-            .find("fn pulse_adopted_pty_with(")
-            .expect("the pulse is its own function");
-        let pulse_fn = &src[pulse_fn..];
-        let pulse_fn = &pulse_fn[..pulse_fn.find("\n}\n").expect("its body ends")];
-        let down = pulse_fn
-            .find("aterm_pty::resize_with_cell_px(master, transient, cols, cell_px);")
-            .expect("it writes rows - 1");
-        let up = pulse_fn
-            .find("aterm_pty::resize_with_cell_px(master, transient, cols, cell_px);\n            aterm_pty::resize_with_cell_px(master, rows, cols, cell_px);")
-            .expect("then rows, back to back");
-        assert!(
-            down <= up,
-            "and it is still the back-to-back rows-1 -> rows pair"
-        );
     }
 }
 

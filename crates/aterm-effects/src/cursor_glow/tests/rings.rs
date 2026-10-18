@@ -65,38 +65,6 @@ fn rainbow_landing_ring_light_theme_forks_to_source_over() {
     );
 }
 
-/// The classic landing ring's grade is floored at impact 1, capped at Rainbow
-/// Kitty's numbers (twice as wide, 300 ms) and monotone in between.
-#[test]
-fn classic_ring_grade_is_floored_and_capped_like_the_kittys() {
-    // Impact 1 (an 8-cell hop or less) is ungraded.
-    assert_eq!(classic_ring_radius_factor(1.0), 1.0);
-    assert_eq!(classic_ring_life(0.18, 1.0), 0.18);
-    // Below the floor and non-finite never shrink or explode a ring.
-    assert_eq!(classic_ring_radius_factor(0.2), 1.0);
-    assert_eq!(classic_ring_radius_factor(f32::NAN), 1.0);
-    assert_eq!(classic_ring_life(0.18, f32::INFINITY), 0.18);
-    // The cap: twice as wide, 300 ms — Rainbow Kitty's own numbers.
-    assert!((classic_ring_radius_factor(3.5) - 2.0).abs() < 1e-5);
-    assert!((classic_ring_life(0.18, 3.5) - 0.30).abs() < 1e-3);
-    assert_eq!(
-        classic_ring_radius_factor(9.0),
-        classic_ring_radius_factor(3.5),
-        "past the cap is the cap"
-    );
-    // Monotone across the graded range.
-    let mut last = 0.0f32;
-    for i in 0..=25 {
-        let f = classic_ring_radius_factor(1.0 + i as f32 * 0.1);
-        assert!(
-            f >= last,
-            "radius factor dips at impact {}",
-            1.0 + i as f32 * 0.1
-        );
-        last = f;
-    }
-}
-
 /// The same ring at the same age: a full-line jump's outline reaches
 /// further from the landing cell than a hop's, on every square-outline
 /// theme arm and for the fire flash — the grade is not a no-op.

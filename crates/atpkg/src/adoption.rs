@@ -55,14 +55,23 @@ pub fn adoption_consented(layout: &Layout, cfg: &PackagesConfig) -> bool {
 /// recorded a success — a store a pass already served that still holds no ALab program (an
 /// architecture no build covers, programs removed on purpose) has nothing coming. With
 /// [`adoption_consented`], the window's update is owed at once: the first-run row it holds
-/// ahead of that update (`aterm-gui`'s `first_run_ahead`) and the promise its seed makes the
-/// pending stubs ([`crate::progress::promise_pass`]) both rest on it.
+/// ahead of that update (`aterm-gui`'s `first_run_ahead`, which asks this) and the promise its
+/// seed makes the pending stubs ([`crate::progress::promise_pass`]) both rest on it.
 #[must_use]
 pub fn first_install_ahead(layout: &Layout) -> bool {
+    holds_no_alab_program(layout)
+        && crate::status::read(layout).is_none_or(|status| status.last_success_at.is_empty())
+}
+
+/// Whether `layout` holds no ALab program: none is active but the agent programs, which land
+/// on their own lane ([`crate::vendor_direct::is_vendor`]) — [`first_install_ahead`]'s first
+/// half, and the window's whole first-run test for the toolchain bar it shows (`aterm-gui`'s
+/// `pass_is_first_run`).
+#[must_use]
+pub fn holds_no_alab_program(layout: &Layout) -> bool {
     !crate::active_builds(layout)
         .keys()
         .any(|program| !crate::vendor_direct::is_vendor(program))
-        && crate::status::read(layout).is_none_or(|status| status.last_success_at.is_empty())
 }
 
 /// The managed `bin/` a session's PATH carries from its first byte, APPENDED (the hook's own

@@ -16,10 +16,8 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use aterm_json::Value;
-use serde::Serialize;
-
 use crate::trust::Trust;
+use aterm_json::Value;
 
 /// The conformance crate every build selects.
 const CONFORMANCE: &str = "libc-conformance";
@@ -34,7 +32,7 @@ pub const AMBIENT: [&str; 5] = [
 ];
 
 /// One compiler error, as data.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Diagnostic {
     /// The error code (`E0308`), when the error has one.
     pub code: Option<String>,
@@ -44,10 +42,8 @@ pub struct Diagnostic {
     /// Every span's source lines.
     pub snippets: Vec<String>,
     /// Where each span points, for a reader that needs the line.
-    #[serde(skip)]
     pub spans: Vec<Span>,
     /// The compiler's own rendering, for a person.
-    #[serde(skip)]
     pub rendered: String,
 }
 
@@ -129,7 +125,7 @@ impl Diagnostic {
 }
 
 /// A test libtest reported failed.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FailedTest {
     /// The full test path (`cell_mac::runtime::behaviour_fd_set`).
     pub name: String,
@@ -546,14 +542,5 @@ mod tests {
             Some(LockedFailure::Refused)
         );
         assert_eq!(Outcome::parse(true, Some(0), "", "").locked_failure(), None);
-    }
-
-    #[test]
-    fn the_detail_prefers_errors_then_tests_then_stderr() {
-        let errors = Outcome::parse(false, Some(101), ERROR, "noise");
-        assert!(errors.detail().starts_with("error[E0624]"));
-        let stderr = Outcome::parse(false, Some(101), "", "a\nb\nerror: linker failed");
-        assert_eq!(stderr.detail(), "a\nb\nerror: linker failed");
-        assert_eq!(tail("1\n2\n3", 2), "2\n3");
     }
 }

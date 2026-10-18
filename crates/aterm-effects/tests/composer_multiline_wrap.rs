@@ -13,9 +13,8 @@
 //! cohort and restart the colours.
 //!
 //! The bytes are Claude Code 2.1.282's at 91×53, captured in an isolated aterm and under a
-//! Python pty (run `run1`): its two wrap chunks are quoted below verbatim, and the first law
-//! proves this file's writers reproduce them byte for byte. The DEC 2026 bracket is the
-//! window's own.
+//! Python pty (run `run1`): its two wrap chunks are quoted below verbatim. The DEC 2026 bracket
+//! is the window's own.
 //!
 //! Every law runs at the host seam (`trail_host::Core`, the frame hold) on a 16.7 ms train,
 //! keys at the capture's 80 ms.
@@ -357,44 +356,6 @@ fn typed_to_the_second_wrap(line2: &str) -> Host {
     h
 }
 
-/// The writers are the capture: `first_wrap_bytes` and `second_wrap_bytes`
-/// rebuild `run1`'s two wrap chunks byte for byte from the two lines alone,
-/// sparse write included, so other text gets the shape Claude Code writes.
-#[test]
-fn the_writers_reproduce_the_captured_wrap_chunks_byte_for_byte() {
-    assert_eq!(
-        String::from_utf8(first_wrap_bytes(&rule(), LINE1, LINE1, "k")).expect("utf-8"),
-        captured_first_wrap()
-    );
-    assert_eq!(captured_first_wrap().len(), 458, "run1 key 87 is 458 bytes");
-    assert_eq!(
-        String::from_utf8(second_wrap_bytes(LINE1, LINE2, "")).expect("utf-8"),
-        captured_second_wrap()
-    );
-    assert_eq!(
-        captured_second_wrap().len(),
-        578,
-        "run1 key 174 is 578 bytes"
-    );
-    // The Space that wraps a full line (the pty capture's key 87, with the
-    // window's bracket added): the continuation row is cut whole from its
-    // first column.
-    let full =
-        "the quick brown fox jumps over lazy dogs the quick brown fox jumps over lazy dogs abcde";
-    assert_eq!(
-        String::from_utf8(first_wrap_bytes(&rule(), full, full, "")).expect("utf-8"),
-        format!(
-            "\x1b[?2026h\x1b[?25l\x1b[H\r\x1b[48B\x1b[38;2;136;136;136m{}\r\x1b[1B\x1b[39m\u{276f}\u{a0}{full}\x1b[K\r\x1b[1B\x1b[K\x1b[53;1H\x1b[51;3H\x1b[?25h\x1b[?2026l",
-            "\u{2500}".repeat(91)
-        )
-    );
-    assert_eq!(
-        shared_letters(LINE2, LINE1),
-        vec![28, 30, 31, 47, 79],
-        "the premise: five letters of the second line match the first at their column"
-    );
-}
-
 /// The second wrapped line follows its text a row up: after the Space that
 /// wraps it, its band stands under its glyphs on row 49 (every cell, none
 /// retired) and is still lit past `RETIRE_MELT_S`; the caret's continuation
@@ -662,9 +623,9 @@ fn a_second_wrap_that_writes_other_text_a_row_up_follows_nothing() {
 /// What the limit must not become: the first line re-laid a row higher is identical text
 /// arriving two rows up, and a twin one row away does not stop the search two rows away
 /// (`a_twin_testifies_only_about_its_own_row`). The band stays off the first line because
-/// nothing samples its row at that wrap (`no_row_two_away_is_named`); stopping the search at a
-/// whole text one row away would melt a line under an identical command pushed down two rows
-/// (`tests/moves_are_followed.rs`).
+/// nothing samples its row at that wrap (`a_waiting_key_s_arming_rows_have_slots_of_their_own`);
+/// stopping the search at a whole text one row away would melt a line under an identical command
+/// pushed down two rows (`tests/moves_are_followed.rs`).
 #[test]
 fn the_limit_a_line_identical_to_the_one_above_it_or_one_column_off_melts_instead_of_following() {
     let step1 =

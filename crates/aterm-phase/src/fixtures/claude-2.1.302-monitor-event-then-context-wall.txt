@@ -1,0 +1,26 @@
+# claude-code 2.1.302 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a Monitor's event ('build step 3 done'), the request after it too long: Claude Code's own context wall, the first column-2 gutter row under the event's row
+ ▐▛███▛█   Claude Code v2.1.302
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ /clear
+
+❯ toolstart
+
+⏺ Monitor(build watch)
+  ⎿  Monitor started · task b9egqdk40 · timeout 1800s
+
+⏺ Tool call done.
+
+✻ Sautéed for 0s · done 7:11 PM · 2 monitors still running
+
+⏺ Monitor event: build step 3 done · build watch
+  ⎿  Context limit reached · /compact or /clear to continue
+
+✻ Worked for 0s · done 7:12 PM · 2 monitors still running
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · 2 monitors · ↓ to manage

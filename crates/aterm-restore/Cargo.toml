@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-restore"
+# Integration tests are declared below, not discovered: with autotests off a
+# `tests/*.rs` file listed nowhere never compiles.
+autotests = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "aterm crash restore, headless: the per-session journal region's layout, its records (raw tail, keyframes, LZ4 history chunks) and single-writer commit-word protocols, the keyframe policy, and the panic-free recovery that rebuilds a dead window's exact screen in a scratch engine. No file, thread, socket or clock: the host hands it a store and the time."
+
+[lints]
+workspace = true
+
+[dependencies]
+# The engine the journal checkpoints and the recovery replays into, with the
+# serde seam on: a keyframe's scalars are a `CheckpointMeta` (the screen
+# carry's own wire form), its grids the binary Line codec.
+aterm-core = { workspace = true, features = ["serde"] }
+# The keyframe meta's JSON, and the untyped `Value` the reader checks the
+# required keys on before it deserializes anything.
+aterm-json = { workspace = true }
+# Keyframe bodies and history chunks are LZ4 blocks with a size prefix the
+# reader bounds before it allocates.
+aterm-lz4 = { workspace = true }
+# astream's step record (a dense, versioned, CRC-framed opaque record) and its
+# pure torn-or-fault classifier: every keyframe and history chunk in a region
+# is one. Zero dependencies, and already in the shipped graph through
+# astream-broker, so the restore pulls no astream engine or VT fold in.
+astream-wire = { path = "../../vendor/astream/crates/astream-wire" }
+# The anchor attributes' registry (std-only): `#[cfg_attr(any(test, debug_assertions),
+# aterm_spec_anchor::refines(…))]` expands in every test and debug build; release strips it.
+aterm-spec-anchor = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# The shared mapping a window's region is (`aterm_uds::shm::Region`): this crate
+# implements its store traits over it (`store.rs`) and names nothing else of
+# aterm-uds, so it stays an engine crate with no `unsafe`, file, socket or fd
+# of its own. aterm-uds is already in every Unix binary that links this crate.
+aterm-uds = { workspace = true }
+
+[dev-dependencies]
+# Tier-0 lives in aterm-models-session; Tier-1 (`src/conformance_region_tests.rs`) binds
+# the writer and `recover` to `CrashRestoreJournal` through `#[refines]` anchors.
+aterm-spec = { workspace = true }
+aterm-models-session = { workspace = true }
+# The engine conformance test drives the host's colour-scheme setter (`aterm_types::Appearance`).
+aterm-types = { workspace = true }
+
+[[test]]
+name = "engine_conformance"
+path = "tests/engine_conformance.rs"
+
+# Real shared-memory mapping is a held kernel fixture, separate from the unsafe-free engine.
+[[test]]
+name = "shared_region"
+path = "tests/shared_region.rs"

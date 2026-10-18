@@ -41,6 +41,11 @@ aterm-census = { workspace = true }
 aterm-forge = { path = "../aterm-forge" }
 # cargo's `--message-format=json` (`cells`) and the perf lanes' reports.
 aterm-json = { workspace = true }
+# `browser`: the pixels its pages hand back over DevTools are base64.
+aterm-codec = { workspace = true }
+# `browser`: the recorded-frame differential's frames are RGBA8 PNGs
+# (`src/browser/recorded.rs`).
+aterm-png = { workspace = true }
 # `perf`: the box fingerprint (FNV-1a), the arena pins (SHA-256, the typed
 # manifest through serde's derive) and the children the arena lanes launch.
 aterm-hash = { workspace = true }
@@ -54,6 +59,10 @@ aterm-wasm-abi = { workspace = true }
 
 # Scratch output captures (and test directories) removed on drop.
 aterm-tempfile = { workspace = true }
+# THE toolchain resolution, rustup's finder, the build-cache rule plain `targo`
+# follows (so the main lane's children share its cache) and the toolchain lease
+# a run holds: one std-only source with atpkg.
+aterm-toolchain = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 # The arena lanes' interrupt guard: block SIGINT/SIGTERM/SIGHUP, take them on

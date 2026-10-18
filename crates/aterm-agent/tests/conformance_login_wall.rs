@@ -46,8 +46,9 @@ use aterm_agent::supervise::policy::turn_end::{
     TurnEndState, decide_turn_end,
 };
 use aterm_json::Value;
+use aterm_models_harness::harness_login_wall_model;
 use aterm_phase::prompt::fixtures::{LOGIN_EXPIRED, screen};
-use aterm_spec::derive::{Model, harness_login_wall_model};
+use aterm_spec::derive::Model;
 
 type S = BTreeMap<&'static str, i64>;
 
@@ -629,7 +630,6 @@ fn real_renewal_is_clean() -> bool {
         sock: None,
         config: Some(root.join("aterm.toml")),
         claude_tmp: None,
-        cells: None,
         claude_running: None,
     };
     let host = Recording::default();

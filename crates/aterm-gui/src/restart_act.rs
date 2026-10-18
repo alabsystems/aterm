@@ -1,116 +1,86 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE EXPLICIT RESTART: `aterm ctl @<sid> restart [pid=<n>] [if-stalled]
-//! [quiet=<s>]` — "restart this agent in place" (design decided
-//! 2026-10-08; the model is `aterm-spec`'s `HarnessRestartStamp`).
+//! Explicit in-place restart: `aterm ctl @<sid> restart [pid=<n>]
+//! [if-stalled] [quiet=<s>]`. The durable record and exit lookup are
+//! [`aterm_agent::harness::restart_stamp`]; the design and conformance model is
+//! `aterm-spec::derive::harness_restart_stamp_model` (`HarnessRestartStamp`).
 //!
-//! WHY. Until it, the stall's remedy was a bare `signal term`, and whether
-//! the exit that followed was the remedy's (relaunch it on its conversation)
-//! or a person's (leave it) was INFERRED — the server's record of a signal
-//! sent while a stall was published (round fourteen's `RemedySent`), kept in
-//! the instance's memory and spent by a new stall episode. Four review rounds
-//! each found an interleaving it read wrong. Every other in-place restart of
-//! the harness (the live upgrade's, the memory, model and account restarts)
-//! writes its record BEFORE its signal and is recognised by lookup; the stall
-//! remedy was the one whose record came after its exit. This act is the
-//! restart with its record first, for the stall's remedy and for a person.
+//! 1. Read the tab's foreground group leader and kernel start. `pid=`, when
+//!    supplied, must name that leader.
+//! 2. Before writing or signalling, require the host's snapshot to name that
+//!    process and a relaunchable lane plan or validated self-claim copy
+//!    ([`unavailable`]). A Claude Code's plan must carry the Claude home its
+//!    records are in (`relaunch::carries_restart` for the user's home, the
+//!    plan's own `refused:home` rule): an agent whose relaunch would refuse its home is
+//!    refused here rather than ended and left at its shell (ATERM-KI-1015-1
+//!    LC-3; one under another `HOME` is relaunched with it since LC-4). The
+//!    session must have this host's or a proven self-claim's supervision, with
+//!    no hold, driver lease or named turn. `if-stalled` requires a running
+//!    stall for the leader; `quiet=` refuses recent human input.
+//! 3. Serialize requests through [`ACTING`]. Write one atomic stamp per tab before
+//!    any discard or signal, without a sweep lock, or join a standing stamp for
+//!    the same process. A joined stamp keeps its cause and is renewed only after
+//!    a successful `SIGTERM` ([`renew`]).
+//! 4. Re-read the leader and its start before each discard and signal ([`leads`]).
+//!    If it moved, send nothing and take back only a stamp this act wrote
+//!    ([`take_back`]); a joined stamp may already account for a prior signal.
+//! 5. Discard unread input and send `SIGTERM`, replying at once with
+//!    `OK restarting pid <n> cause=<stall|asked>`. The request does not wait through
+//!    the grace period ([`Stamped::signal`]).
+//! 6. Keep one escalation watch per process ([`watch`]). A deaf survivor is killed
+//!    after [`GRACE`]; any survivor after [`DEADLINE`]. A process away from the
+//!    foreground is watched until it leads again, while its stamp still stands.
+//! 7. Before each escalation discard or `SIGKILL`, recheck for another supervisor,
+//!    hold, driver lease or named turn ([`another_hand`]). Wait while that hand
+//!    stands, and stop without signalling if the stamp expires. Never kill in the
+//!    stamp's last [`KILL_READ_MARGIN`], leaving its exit reader time to find it.
+//! 8. Re-read the tab's on-disk stamp and host snapshot on every escalation look
+//!    ([`kill`]). A replaced or taken stamp ends the watch; a missing host snapshot
+//!    postpones the kill until the host can read the resulting exit.
 //!
-//! THE ACT, in one request on the control thread:
+//! The stamp survives an instance handoff: the successor's [`carry`] finishes a
+//! surviving act after [`DEADLINE`], subject to the same identity, hand and expiry
+//! checks. The exit reader finds the stamp by lookup; the relaunch that files its
+//! record consumes it. An asked exit under a hold, lease or turn is carried until
+//! that hand lifts; another supervisor's claim leaves the exit to that supervisor.
 //!
-//! 1. The tab's foreground group leader (`tcgetpgrp` on the master; `pid=`
-//!    must name it) and its kernel start, in the spelling the harness's
-//!    snapshot names an agent by (`restart_stamp::kernel_start`), so the two
-//!    compare exactly on every unix.
-//! 2. FENCES, all before anything is written or sent ([`unavailable`]): the
-//!    host's published snapshot names that very process and its relaunch
-//!    would bring it back (`relaunch::carries_restart`: a Claude Code
-//!    `relaunch::resumes_on_exit` plans; a Codex whose thread is settled —
-//!    held, back on it or fresh, or named — never a daemon client whose
-//!    thread the host could not name, whose relaunch would read it again at
-//!    exit and refuses on any failure of that read); the
-//!    session's live supervisor claim is this host's; no other driver's lease
-//!    or named turn holds the tab. Else `ERR restart unavailable: <why>`.
-//!    `if-stalled`: a running stall is published for this leader, else
-//!    `ERR not-stalled`; `quiet=<s>`: a person's input within `s` seconds
-//!    refuses it, `ERR busy person human_ms=<ms>`. `[harness] relaunch =
-//!    false` does not refuse a person's explicit restart (ruling 2026-10-08).
-//! 3. THE STAMP, atomically, before any discard or signal, with no sweep
-//!    lock ([`restart_stamp::write`]): one per tab, replacing any earlier —
-//!    unless a stamp naming this very process already stands
-//!    ([`restart_stamp::standing`]): an act on it is in flight, and this
-//!    one JOINS it, writing nothing before its signal (review of
-//!    3eaa8f83c) — and, its `SIGTERM` sent, the stamp's time renewed from
-//!    that signal, its cause kept ([`renew`], ruling 18). One act at a
-//!    time in an instance ([`ACTING`]), so two never both write.
-//! 4. Immediately before each discard and each signal, the leader and its
-//!    start are read again ([`leads`]); moved, nothing is sent and the
-//!    stamp THIS ACT WROTE is taken back (`OK restart gone pid <n>`): an
-//!    act that ended nothing marks no exit as its own — and takes back no
-//!    stamp it joined, whose act did signal ([`take_back`]).
-//! 5. The discard and `killpg(SIGTERM)`, answered at once (`OK restarting
-//!    pid <n> cause=<stall|asked>`): the lane is not held through the grace.
-//! 6. THE ESCALATION ([`escalate`]): the act always ends the program it
-//!    stamped. A named thread waits on the leader's exit; still running
-//!    after [`GRACE`] with its stall still published and nothing read since
-//!    the drop (DEAF), or after [`DEADLINE`] in any case, it is discarded
-//!    and `killpg(SIGKILL)`ed — step 4 first. One that does not lead its tab
-//!    then (a job stopped from elsewhere, its shell in front) is watched
-//!    until it leads again and ended then ([`kill`]), for as long as its
-//!    stamp stands: once the stamp is stale no reader takes its exit for the
-//!    act's. Ruling 2026-10-08: the KILL is the explicit restart's contract;
-//!    the AUTOMATIC remedy still runs only under `[harness] stall_term =
-//!    true` (default false: a stall stays a warning). ONE WATCH PER PROCESS
-//!    ([`watch`], ruling 19 of 2026-10-09): an act on a process a watch
-//!    already ends — one it joined, or a carrier's — starts no thread of its
-//!    own; it gives that watch its stamp's time.
-//! 7. THE KILL WAITS OUT ANOTHER HAND (ruling 11, review of 1a733ed60): a
-//!    hold, another driver's lease or named turn, or another supervisor's
-//!    claim that lands AFTER the act started ([`another_hand`]) is read again
-//!    right before each discard and each `killpg(SIGKILL)`, so that the
-//!    exit's reader reads the act's end with no such hand on the tab — under
-//!    a hold, a lease or a turn it carries an asked exit until the hand
-//!    lifts (ruling 20 of 2026-10-14), under a claim it leaves it to that
-//!    supervisor (ruling 17) — and while it stands nothing is sent and
-//!    the program is watched as one away from its tab is. Once the hand
-//!    clears the act finishes, and its exit is relaunched by the stamp; a
-//!    hand that outlasts the stamp lets the program go, as ruling 8 does.
-//!    And no `SIGKILL` is ever sent once the stamp no longer stands (ruling
-//!    12), nor in its last [`KILL_READ_MARGIN`], when its exit would be read
-//!    after the stamp went stale (ruling 16): neither by the act's watch nor
-//!    by a carrier.
-//! 8. THE KILL LEAVES ITS READER WHAT IT READS BY (rulings 21 and 22 of
-//!    2026-10-14): the exit's reader takes it for the act's by the tab's
-//!    stamp ON DISK and by the host's snapshot of the agent, so a watch reads
-//!    both again on every look ([`kill`]). One whose tab's stamp no longer
-//!    names its program — another act's replaced it (one per tab), or it was
-//!    taken — lets it go in that look ([`Watch::left`]); one whose host holds
-//!    no snapshot of the program (a successor that has not read the agent
-//!    since its Commit) holds its `SIGKILL` back until it does.
-//!
-//! A seamless update's Commit inside the grace ends the act's thread with
-//! the outgoing instance; the stamp is on disk, and the successor's CARRIER
-//! ([`carry`]) finishes the `KILL` once the stamp is past [`DEADLINE`] — of
-//! a stamp that still stands, never of a stale one.
-//!
-//! THE EXIT is read by lookup: whichever of the host's workers reads it
-//! finds the stamp naming the process (`harness_host`'s `Acts::asked`), and
-//! the relaunch that files its record consumes it.
+//! `[harness] relaunch = false` does not refuse an explicit restart. Automatic
+//! stall termination still requires `[harness] stall_term = true` (default false).
 
 #![cfg_attr(not(unix), allow(dead_code))]
 
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::Weak;
 use std::time::{Duration, Instant};
 
-use aterm_agent::harness::restart_stamp::{self, Cause, Stamp};
+#[cfg(any(unix, test))]
+use aterm_agent::harness::restart_stamp::Cause;
+use aterm_agent::harness::restart_stamp::{self, Stamp};
 
 use crate::SessionCtx;
 
 /// How long after its `SIGTERM` a DEAF program (its stall still published,
 /// nothing read since the drop) is given before the act's `SIGKILL`: the
 /// grace after which the stall's attention already names `signal kill`
-/// ([`crate::input_stall::RESTART_GRACE`]).
+/// ([`crate::input_stall::RESTART_GRACE`]). Waited through the one timing
+/// value ([`grace`]).
 pub(crate) const GRACE: Duration = crate::input_stall::RESTART_GRACE;
+
+/// The least a test value of [`GRACE`] may be. The grace decides which signal
+/// ends a program only when the stall marks it DEAF ([`escalate`]): one with
+/// no stall published is given [`DEADLINE`], never scaled, whatever the grace,
+/// and its wait ends at its exit. No test restarts a program that is marked
+/// deaf and hears its `SIGTERM`, so no verdict rides this floor; it keeps a
+/// live instance's test value of the grace a second, not five milliseconds.
+const GRACE_TEST_FLOOR: Duration = Duration::from_secs(1);
+
+/// The grace the act waits: [`GRACE`] in a shipped build, its floored test
+/// value on the test timing value (`aterm_gui_timing`).
+fn grace() -> Duration {
+    aterm_gui_timing::current().of_at_least(GRACE, GRACE_TEST_FLOOR)
+}
 
 /// The act's deadline in any case: a program that still leads its tab this
 /// long after the `SIGTERM` — one that heard it and is slow, or one that
@@ -187,17 +157,42 @@ pub(crate) fn unavailable(
         return Some("not-the-hosts-agent");
     };
     // A self-supervised agent comes back on the line aterm's copy of its own
-    // record validated (the crash rule, §4), never on the lane's plan.
+    // record validated (the crash rule, §4), never on the lane's plan. Any
+    // other on the relaunch's own predicate, for the home the tab's shell
+    // has: an agent its relaunch would refuse (another `HOME`) is not ended
+    // for it.
     let relaunchable = match crate::self_claim::copy_of_tab(ctx.self_id.as_str())
         .filter(|copy| copy.pid == snap.pid && copy.start == snap.start)
     {
         Some(copy) => copy.resume.is_ok(),
-        None => aterm_agent::harness::relaunch::carries_restart(&snap),
+        None => {
+            lane_relaunches(&snap)
+                && aterm_primer::home_dir().is_some_and(|home| {
+                    aterm_agent::harness::relaunch::carries_restart(&home, &snap)
+                })
+        }
     };
     if !relaunchable {
         return Some("not-relaunchable");
     }
     crate::input_stall::host_hand_refusal(ctx, now_us)
+}
+
+/// Whether `snap`'s agent comes back with no copy of its own record: by its
+/// lane's relaunch — Claude Code's. A Codex never does (the Codex screen
+/// lane's retirement, 2026-10-16): aterm supervises no Codex, and codex-alab
+/// comes back only on the line aterm's copy of its record validated, so with
+/// no such copy the act would end what nothing brings back
+/// (`not-relaunchable`). Nor a Muse Code: its lane relaunches a crash, but
+/// what the act's SIGTERM does to one in the middle of a turn is unmeasured
+/// (`relaunch::carries_restart`). An exhaustive `match` (the agent-gate
+/// guard).
+fn lane_relaunches(snap: &aterm_agent::harness::relaunch::Snapshot) -> bool {
+    match &snap.run {
+        aterm_agent::harness::relaunch::AgentRun::Claude => true,
+        aterm_agent::harness::relaunch::AgentRun::Codex(_)
+        | aterm_agent::harness::relaunch::AgentRun::Muse(_) => false,
+    }
 }
 
 /// Where the explicit restart would be carried ([`offered`]): the process it
@@ -207,59 +202,53 @@ pub(crate) struct Offer {
     /// The process the act names (`restart pid=<n> if-stalled`): the host's
     /// snapshot's, the stall's leader where the watch read one.
     pub(crate) pid: u32,
-    /// The relaunch on its CONVERSATION is promised
-    /// ([`aterm_agent::harness::relaunch::resumes_on_exit`]): the words add
-    /// "aterm relaunches it on its conversation"
-    /// ([`aterm_agent::harness::resume::AfterRestart::Relaunch`]). Never a
-    /// Codex's, whose thread comes back only where it has a rollout by then:
-    /// its words name the act alone
-    /// ([`aterm_agent::harness::resume::AfterRestart::Act`]).
+    /// Whether the offer promises relaunch on the conversation: a validated
+    /// self-claim resume line with a shell, or a lane plan satisfying
+    /// [`aterm_agent::harness::relaunch::resumes_on_exit`]. The words then use
+    /// [`aterm_agent::harness::resume::AfterRestart::Relaunch`]; otherwise they
+    /// name the act alone ([`aterm_agent::harness::resume::AfterRestart::Act`]).
     pub(crate) promised: bool,
 }
 
-/// THE ONE PREDICATE EVERY STALL WORD CHOOSES BY: where the explicit restart
-/// would be carried in `ctx`'s session, the process it names (`restart
-/// pid=<n> if-stalled`) and whether its relaunch on the conversation is
-/// promised ([`Offer`]); `None` where the act would be refused or end
-/// another program — the host's published snapshot names a process whose
-/// end its relaunch brings back
-/// ([`aterm_agent::harness::relaunch::carries_restart`]; the stall's
-/// `leader`, when the watch read one), the program in front of the tab is
-/// that snapshot's agent (a Claude Code's, or a Codex's), and the host's
-/// hand is the one on the session
-/// ([`crate::input_stall::host_hand_refusal`]). `[harness] relaunch = false`
-/// is not read: it does not refuse a person's explicit restart (ruling 1,
-/// 2026-10-08), whose exit is relaunched under it too.
+/// The shared restart offer for stall refusals, attention entries, menus,
+/// bands and supervisor mail. The published snapshot must name the stall's
+/// leader (when supplied), its agent must be in front, its lane plan or
+/// self-claim copy must be relaunchable, and the host's hand must be admitted
+/// ([`crate::input_stall::host_hand_refusal`]). No process I/O here: the act
+/// itself re-reads the leader and its start before signalling.
 ///
-/// Where it offers one, a stall's words name the act — the refusal of a
-/// write into the frozen program (asked live), the server's attention entry,
-/// the menu row and the band (the publication's [`InputStallFact::act`],
-/// asked as the stall is published and again at each of the watch's probes
-/// of it), and the supervisor's frozen mail and warning (the host's
-/// [`aterm_agent::supervise::IdleHost::restart_offered`]) — and say "aterm
-/// relaunches it on its conversation" only where [`Offer::promised`];
-/// elsewhere `signal term` (`signal kill` for a survivor) and the tab's own
-/// resume line, since a bare signal's exit reads as the agent's own.
+/// The words promise a conversation only where [`Offer::promised`]. Without an
+/// offer they name `signal term` (`signal kill` for a survivor) and the tab's
+/// resume line. `[harness] relaunch` does not refuse an explicit restart.
 ///
-/// WHY ONE (2026-10-08): the refusals chose by this predicate while the
-/// attention row, the menu row, the frozen mail and the warning read
-/// `[harness] relaunch`, so under `relaunch = false` one tab named two
-/// remedies. No process is read: the act itself re-reads the leader and its
-/// start. Leaf locks only (the published snapshots, then the session's
-/// timeline, `meta`, fabric state and lease, each released before the
-/// next): the caller holds none of them.
-///
-/// [`InputStallFact::act`]: crate::input_stall::InputStallFact::act
+/// Takes only leaf locks for the published snapshot, self-claim copy, timeline,
+/// meta, fabric and lease, each released before the next. The caller holds none.
 pub(crate) fn offered(ctx: &SessionCtx, leader: Option<i32>, now_us: u64) -> Option<Offer> {
     let snap = crate::harness_host::published_snapshot(ctx.self_id.as_str())?;
     let pid = i32::try_from(snap.pid).ok()?;
     let agent = snap.agent().program();
-    let in_front = || {
-        let tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-        crate::harness_host::agent_of(tl.agent()) == Some(agent)
+    // The agent in front as the host admits it ([`crate::harness_host::admitted`]):
+    // a self-claimed codex-alab is, a vendor `codex` never.
+    let in_front = || crate::harness_host::admitted(ctx) == Some(agent);
+    // A self-supervised agent comes back on the line aterm's copy of its own
+    // record validated; any other on the relaunch's own predicate, for the
+    // home the tab's shell has (LC-3: an agent its relaunch would refuse,
+    // under another `HOME`, is not offered the act).
+    let home = aterm_primer::home_dir()?;
+    let (relaunchable, promised) = match crate::self_claim::copy_of_tab(ctx.self_id.as_str())
+        .filter(|copy| copy.pid == snap.pid && copy.start == snap.start)
+    {
+        Some(copy) => {
+            let ok = copy.resume.is_ok();
+            (ok, ok && snap.shell != 0)
+        }
+        None => (
+            lane_relaunches(&snap) && aterm_agent::harness::relaunch::carries_restart(&home, &snap),
+            lane_relaunches(&snap) && aterm_agent::harness::relaunch::resumes_on_exit(&home, &snap),
+        ),
     };
     if leader.is_some_and(|leader| leader != pid)
-        || !aterm_agent::harness::relaunch::carries_restart(&snap)
+        || !relaunchable
         || !in_front()
         || crate::input_stall::host_hand_refusal(ctx, now_us).is_some()
     {
@@ -267,7 +256,7 @@ pub(crate) fn offered(ctx: &SessionCtx, leader: Option<i32>, now_us: u64) -> Opt
     }
     Some(Offer {
         pid: snap.pid,
-        promised: aterm_agent::harness::relaunch::resumes_on_exit(&snap),
+        promised,
     })
 }
 
@@ -307,8 +296,8 @@ pub(crate) fn restart_in(
 /// sent); `Ok` is the stamped act, which [`Stamped::signal`] sends.
 #[cfg(unix)]
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "HarnessRestartStamp",
         action = "Stamp",
         project = "harness_host::tests::project_restart_stamp"
@@ -515,8 +504,8 @@ pub(crate) fn restart(master: i32, rest: &str, ctx: &Arc<SessionCtx>) -> String 
 /// no exit as its own — and never one it joined: that act did signal, and
 /// its exit is read by that stamp. Its word, for the log.
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "HarnessRestartStamp",
         action = "SendsNothing",
         project = "harness_host::tests::project_restart_stamp"
@@ -563,8 +552,8 @@ pub(crate) fn leads(master: i32, pgrp: i32, start: &str) -> bool {
 /// program left unread dropped first, the watch woken after.
 #[cfg(unix)]
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "HarnessRestartStamp",
         action = "Term",
         project = "harness_host::tests::project_restart_stamp"
@@ -656,7 +645,7 @@ pub(crate) fn watch(state: &std::path::Path, pgrp: i32, stamp: &Stamp) -> Option
 /// A watch listed BESIDE any already running on the same process: the
 /// escalation's own tests, which run one with clocks of their own beside an
 /// act's.
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) fn watch_beside(state: &std::path::Path, pgrp: i32, stamp: &Stamp) -> Watch {
     let until = stands_until(stamp);
     with_watches(|listed| Watch::listed_in(listed, state, pgrp, stamp, until))
@@ -670,7 +659,7 @@ pub(crate) fn watches(pgrp: i32) -> usize {
 }
 
 /// Whether an escalation (or a carrier) watches `pgrp` now.
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) fn escalating(pgrp: i32) -> bool {
     watches(pgrp) > 0
 }
@@ -818,7 +807,7 @@ static HELD_OFF: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
 
 /// Whether the watch on `pgrp` is waiting out another hand on its tab, or
 /// its host's read of it, now.
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) fn held_off(pgrp: i32) -> bool {
     HELD_OFF
         .lock()
@@ -903,7 +892,18 @@ pub(crate) fn another_hand(ctx: &SessionCtx, now_us: u64) -> bool {
 
 /// How often a watch looks again at a stamped program that does not lead
 /// its tab ([`kill`]: a job stopped from elsewhere, its shell in front).
+/// Waited through the one timing value ([`look_again`]).
 pub(crate) const LOOK_AGAIN: Duration = Duration::from_secs(1);
+
+/// The least a test value of [`LOOK_AGAIN`] may be: each look reads the
+/// tab's stamp from disk and the pty's foreground group.
+const LOOK_AGAIN_TEST_FLOOR: Duration = Duration::from_millis(20);
+
+/// The cadence a watch looks again at: [`LOOK_AGAIN`] in a shipped build,
+/// its floored test value on the test timing value (`aterm_gui_timing`).
+pub(crate) fn look_again() -> Duration {
+    aterm_gui_timing::current().of_at_least(LOOK_AGAIN, LOOK_AGAIN_TEST_FLOOR)
+}
 
 /// THE HOST HOLDS WHAT THE EXIT'S READER READS THE PROGRAM BY (ruling 22 of
 /// 2026-10-14): its published snapshot of tab `tab`'s agent names the process
@@ -960,7 +960,7 @@ fn spawn_escalation(ctx: Weak<SessionCtx>, state: &std::path::Path, pgrp: i32, s
     let spawned = std::thread::Builder::new()
         .name(format!("aterm-restart-{pgrp}"))
         .spawn(move || {
-            let said = escalate(&ctx, &watch, GRACE, DEADLINE);
+            let said = escalate(&ctx, &watch, grace(), DEADLINE);
             aterm_log::info!("restart: pid {pgrp} (cause={}): {said}", cause.word());
         });
     if let Err(e) = spawned {
@@ -979,8 +979,8 @@ fn spawn_escalation(ctx: Weak<SessionCtx>, state: &std::path::Path, pgrp: i32, s
 /// log.
 #[cfg(unix)]
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "HarnessRestartStamp",
         action = "EscalationSeesExit",
         project = "harness_host::tests::project_restart_stamp"
@@ -1079,8 +1079,8 @@ impl Withheld {
 /// unlisted in that same look ([`Watch::left`]). Its word, for the log.
 #[cfg(unix)]
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "HarnessRestartStamp",
         action = "Escalate",
         project = "harness_host::tests::project_restart_stamp"
@@ -1154,7 +1154,7 @@ fn kill(ctx: &Weak<SessionCtx>, watch: &Watch) -> &'static str {
                 return "its tab's stamp names it no more (another act's replaced it); nothing sent";
             }
         };
-        if aterm_agent::harness::upgrade_wake::wait_exit(pid, left.min(LOOK_AGAIN)) {
+        if aterm_agent::harness::upgrade_wake::wait_exit(pid, left.min(look_again())) {
             return why.ended();
         }
     }
@@ -1182,8 +1182,8 @@ fn kill(ctx: &Weak<SessionCtx>, watch: &Watch) -> &'static str {
 /// started, or the one already on it.
 #[cfg(unix)]
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "HarnessRestartStamp",
         action = "CarrierFinishes",
         project = "harness_host::tests::project_restart_stamp"
@@ -1311,6 +1311,7 @@ mod tests {
             expires_us,
             conn: None,
             hard: true,
+            holder_pid: None,
         };
         let driver = fresh(0).self_id.clone();
         let mut n = 1;
@@ -1391,6 +1392,150 @@ mod tests {
             &|ctx| leased(ctx, drive(&crate::harness_host::holder(), now + 60_000_000)),
             false,
             "this host's own lease",
+        );
+    }
+
+    /// LC-3 OF ATERM-KI-1015-1 — THE ACT IS OFFERED ONLY WHERE ITS RELAUNCH
+    /// WOULD CARRY IT: an agent whose records are in a directory no relaunch
+    /// line can name (no `CLAUDE_CONFIG_DIR`, records under another `HOME`
+    /// in no `.claude`) is one the relaunch refuses (`refused:home`), so the
+    /// act is `not-relaunchable` — nothing written, nothing sent — where it
+    /// answered `OK` and `SIGTERM`ed an agent it then left at its shell
+    /// (measured on the base in the real-Claude lab, 2026-10-15). CONTROLS:
+    /// the same snapshot under the user's own home, and one under another
+    /// `HOME` whose records are its `.claude` — the line carries that `HOME`
+    /// since LC-4 (`upgrade_drive::home_carried`) — are offered the act, under
+    /// the host's claim (nothing else refuses them: the review of the harness
+    /// landing's eighth merge, a control that held for any other refusal).
+    #[test]
+    fn the_act_is_not_offered_for_an_agent_its_relaunch_refuses() {
+        let now = crate::metrics::now_us();
+        let other = aterm_tempfile::TempDir::new().expect("another home");
+        let snap =
+            |claude_dir: Option<std::path::PathBuf>| aterm_agent::harness::relaunch::Snapshot {
+                tab: String::new(),
+                pid: 0x3fff_ff01,
+                start: "t".to_string(),
+                shell: 1,
+                program: std::path::PathBuf::from("/opt/claude"),
+                argv: vec!["/opt/claude".to_string()],
+                session: Some("0badf00d-1111-2222-3333-444455556666".to_string()),
+                cwd: "/".to_string(),
+                version: Some("2.1.300".to_string()),
+                run: aterm_agent::harness::relaunch::AgentRun::Claude,
+                dialect: Some(aterm_agent::harness::upgrade::Dialect::Zsh),
+                login: None,
+                stored_login: false,
+                home: None,
+                claude_dir,
+            };
+        let refusal = |n: u64, claude_dir: Option<std::path::PathBuf>| {
+            let ctx = crate::session_store::test_handle_on(7600 + n, -1).ctx;
+            assert_eq!(
+                crate::session_timeline::claim_supervisor(
+                    &ctx,
+                    &crate::harness_host::holder(),
+                    None,
+                    None,
+                    now
+                ),
+                Ok(true),
+                "the host's claim"
+            );
+            let snap = aterm_agent::harness::relaunch::Snapshot {
+                tab: ctx.self_id.as_str().to_string(),
+                ..snap(claude_dir)
+            };
+            crate::harness_host::publish_snapshot_for_test(ctx.self_id.as_str(), Some(&snap));
+            let why = unavailable(&ctx, 0x3fff_ff01, "t", now);
+            crate::harness_host::publish_snapshot_for_test(ctx.self_id.as_str(), None);
+            why
+        };
+        assert_eq!(
+            refusal(1, Some(other.path().join("records"))),
+            Some("not-relaunchable"),
+            "its relaunch refuses it: the act is not offered"
+        );
+        assert_eq!(refusal(2, None), None, "CONTROL: the user's own home");
+        assert_eq!(
+            refusal(3, Some(other.path().join(".claude"))),
+            None,
+            "CONTROL: another HOME's .claude, which its line carries"
+        );
+    }
+
+    /// A CODEX IS RESTARTED ONLY ON A LINE ITS COPY VALIDATED (the Codex
+    /// screen lane's retirement, 2026-10-16): aterm supervises no Codex, so
+    /// with no copy of codex-alab's own record naming that very process the
+    /// act would end what nothing brings back — `not-relaunchable`, nothing
+    /// written, nothing sent — though the lane's own predicate would carry
+    /// it (asserted: the refusal is the new rule's, not the lane's). CONTROL:
+    /// the same snapshot with a copy of that process whose line validated is
+    /// not refused for that; a copy of ANOTHER process is no copy.
+    #[test]
+    fn a_codex_with_no_validated_copy_is_not_offered_the_act() {
+        let now = crate::metrics::now_us();
+        let home = aterm_primer::home_dir().expect("a home");
+        let pid = 0x3fff_ff11;
+        let refusal = |n: u64, copy: Option<u32>| {
+            let ctx = crate::session_store::test_handle_on(7700 + n, -1).ctx;
+            let sid = ctx.self_id.as_str().to_string();
+            let snap = aterm_agent::harness::relaunch::Snapshot {
+                tab: sid.clone(),
+                pid,
+                start: "t".to_string(),
+                shell: 1,
+                program: std::path::PathBuf::from("/opt/codex/bin/codex"),
+                argv: vec!["/opt/codex/bin/codex".to_string()],
+                session: Some("0badf00d-1111-2222-3333-444455556666".to_string()),
+                cwd: "/".to_string(),
+                version: None,
+                run: aterm_agent::harness::relaunch::AgentRun::Codex(
+                    aterm_agent::harness::relaunch::CodexRun {
+                        home: home.join(".codex"),
+                        home_env: None,
+                        self_claimed: None,
+                    },
+                ),
+                dialect: Some(aterm_agent::harness::upgrade::Dialect::Zsh),
+                login: None,
+                stored_login: false,
+                home: None,
+                claude_dir: None,
+            };
+            assert!(
+                !aterm_agent::harness::relaunch::carries_restart(&home, &snap),
+                "no line rides the snapshot: the relaunch's own predicate carries nothing"
+            );
+            let copy = copy.map(|of| aterm_agent::harness::self_claimed::Copy {
+                pid: of,
+                start: "t".to_string(),
+                home: home.join(".codex"),
+                seen: aterm_agent::harness::self_claimed::Seen::Removed,
+                resume: Ok(aterm_agent::harness::self_claimed::Resume {
+                    argv: vec!["/opt/codex/bin/codex".to_string()],
+                    session: "0badf00d-1111-2222-3333-444455556666".to_string(),
+                    codex_home: None,
+                    cwd: None,
+                }),
+            });
+            crate::self_claim::set_copy_for_test(&sid, copy);
+            crate::harness_host::publish_snapshot_for_test(&sid, Some(&snap));
+            let why = unavailable(&ctx, i32::try_from(pid).unwrap(), "t", now);
+            crate::harness_host::publish_snapshot_for_test(&sid, None);
+            crate::self_claim::set_copy_for_test(&sid, None);
+            why
+        };
+        assert_eq!(refusal(1, None), Some("not-relaunchable"), "no copy");
+        assert_eq!(
+            refusal(2, Some(pid + 1)),
+            Some("not-relaunchable"),
+            "a copy of another process"
+        );
+        assert_ne!(
+            refusal(3, Some(pid)),
+            Some("not-relaunchable"),
+            "CONTROL: the copy of that very process validated its line"
         );
     }
 

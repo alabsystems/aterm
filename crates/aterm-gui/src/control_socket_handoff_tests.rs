@@ -4,9 +4,10 @@
 //! The real bind/token writer, coupled to the same gate the Commit waiter opens.
 
 use super::*;
-use aterm_spec::derive::{
-    Model, native_update_control_socket_handoff_model, native_update_handoff_bind_retry_model,
+use aterm_models_update::{
+    native_update_control_socket_handoff_model, native_update_handoff_bind_retry_model,
 };
+use aterm_spec::derive::Model;
 use aterm_spec::wait::{MUST_HAPPEN, until_within};
 use std::collections::BTreeMap;
 use std::sync::atomic::AtomicUsize;
@@ -41,7 +42,7 @@ fn step(model: &Model, state: &mut BTreeMap<&'static str, i64>, action: &'static
 
 #[test]
 fn incoming_control_preparation_requires_both_real_service_lanes() {
-    let model = aterm_spec::derive::native_update_control_preparation_model();
+    let model = aterm_models_update::native_update_control_preparation_model();
     for rpc in [0, 1, CONTROL_WORKERS] {
         for subscriptions in [0, 1, CONTROL_SUBSCRIPTION_WORKERS] {
             let preparation = ControlPreparation::default();

@@ -3,8 +3,14 @@
 
 # aterm-agent: spec recovery from its 2840 unit tests
 
+> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 590 tests
+> it deleted and 17 specs whose functions it deleted are gone (among them `acc-merge-join`, whose
+> `merge_observations` had no caller, and `drive-dial-guard` and `relay-turn-transparency`, which left
+> with `--dial` and `aterm-net`). The §3 gap histogram and the §6 lists count the 623 specs left. Counts elsewhere
+> in this file were taken before.
+
 > Status 2026-10-16: this is the crate's migration worklist. Nothing has been proved or deleted yet.
-> Each of the 631 specs in §1 is proved through Trust/Clean about the compiled Rust function, then the
+> Each of the 635 specs in §1 is proved through Trust/Clean about the compiled Rust function, then the
 > tests it subsumes are deleted. The 80 chunk-6 groups in §1b still need their statements recovered,
 > and the 82 tests in the six files listed in §3 were never read. The checks in §4 sample no spec.
 
@@ -14,13 +20,13 @@ said 2712 tests. A `#[test]` count over the crate today finds 2840: the nine chu
 (several manifest counts were short by the stand-in bodies and late tests they found), and six files that
 landed after the chunks were cut were not read (§3).
 
-Result: **631 specs**, retiring **2359 tests** as their primary spec. **80 chunk-6 groups**
+Result: **635 specs**, retiring **2359 tests** as their primary spec. **80 chunk-6 groups**
 (statements pending) hold **363 more**. **36 tests are not spec samples, or must be fixed first** (§4).
 
 ## 0. Notation used in the statements
 
 - Paths in §2 are relative to `crates/aterm-agent`; function names are module-qualified under its `src`
-  (`harness::…`, `supervise::…`, `drive_cli::…`, `fleet_cli::…`, `operator::…`, or the crate root).
+  (`harness::…`, `supervise::…`, `drive_cli::…`, `fleet_cli::…`, or the crate root).
 - `⊓`, `⊕`, `⊖`: the meet of two policies, saturating `+`, saturating `−`. `sat(x)`: saturating `i64`.
 - **Ctl world W**: any implementation of the `Ctl` / `ControlClient` trait, a reply function from the request
   history to `Result<CtlReply,String>`. The scripted `Mock`, `Still`, `ResetWorld`, `PanelWorld` and stand-in
@@ -73,12 +79,11 @@ drive-top-parse-help-routing	contract	drive_cli::{parse,resolve_ready,run}	Globa
 drive-classify-verb	contract	drive_cli::{classify_verb,python_allow,run}	classify_verb Errs "classify needs a shell command line" iff the joined rest is blank; else Reply{"read-only",0} if classify_command_with(cmd, python_allow(sub)).read_only, else {"not-read-only <reason>",1}; touches no host.	1,3,4	0/0
 drive-phase-reply	contract	drive_cli::phase_reply, supervise::render_phase_and_survey, Session::{phase_now,await_phase,program_reader}	phase_reply(turn, reader, allow) = Reply{render_phase_and_survey(turn, reader, allow), 124 if timed_out else 0}: the phase line, then `survey 0` iff reader.survey_block is open (`survey withheld (<why>)` for a card the loop would not press), then `context {n}%` iff reader.context is Some. The turn and every line are read by the worker's own program's reader: `phase` reads through phase_now (program_reader: `status program=`, else the screen; then turn_of), `await-turn` through await_phase (the program named before the wait, so the first wait is for that program's busy guard).	1,3,7	2/3
 drive-endpoint-route	contract	drive_cli::{resolve_configured_local_endpoint_with,local_prompt_route}	flag ∈ {None,"","0","off"} ⇒ Ok(None) without calling read; otherwise read is called once with token_path_for_sock(sock): Ok ⇒ Ok(Some(sock)), Err(e) ⇒ Err naming the path and e. local_prompt_route(Ok(Some(s))) = Persistent{s}; otherwise ShellDiscovery.	1,3,13	4/4
-drive-prompt-turn-protocol	refinement	drive_cli::{run_persistent_local_prompt,prompt_turn,run_relay_prompt_turn}, RelayClient::connect_local_beside	A persistent prompt turn writes exactly [AUTH tok, send T, key enter, await idle I timeout D, text] on one connection (no preflight), tok read beside the socket after connecting; returns the `text` body. A resolved endpoint with no listener is Err "cannot connect to the aterm at" (never a discovery retarget).	1,8,11,13	3/3
+drive-prompt-turn-protocol	refinement	drive_cli::{run_persistent_local_prompt,prompt_turn,run_relay_prompt_turn}, RelayClient::connect_local_beside	A persistent prompt turn writes exactly [AUTH tok, send -- T, key enter, await idle I timeout D, text] on one connection (no preflight), tok read beside the socket after connecting; returns the `text` body. A resolved endpoint with no listener is Err "cannot connect to the aterm at" (never a discovery retarget).	1,8,11,13	3/3
 drive-prompt-cut-is-75	contract	drive_cli::{run_relay_prompt_turn,connection_broke,run}, Unfinished::into_reply	An I/O error connection_broke accepts during a turn ⇒ Err(Cut) naming the peer and "never retry it blind (exit 75)", and run maps Cut to code 75; a server ERR line ⇒ Err(Failed(line)), not Cut.	1,8,11	2/2
-drive-dial-guard	contract	drive_cli::run	dial=Some ∧ cmd[0] ∉ {help,classify,prompt} ⇒ Err("--dial drives only `prompt`; …") with no connection, ledger read or ctl call.	1,3,8	1/1
 drive-preloop-exit-journal	contract	drive_cli::{journal_arg,watch_sid_arg,watch_exit_line,main_entry}, Journal::{open,record}, read_journal	journal_arg = the word after the first --journal; watch_sid_arg = the first '@' word of cmd[1..]; watch_exit_line = Some("EXIT "+exit_reason(err line 1)) iff cmd[0]=watch. Round trip: the recorded line reads back as one record {kind exit, sid without '@', line}, file mode 0600.	1,3,7,8	1/1
 drive-journal-sid	contract	drive_cli::{journal_sid,ledger_verb}	journal_sid(p)=Some(x) iff the journal reads and its records name exactly one sid x; ledger_verb with no sid and no journal sid Errs "ledger needs the worker:" before any ctl call.	1,7,8	1/1
-drive-sibling-ctl	contract	drive_cli::sibling_ctl	sibling_ctl(exe) = Some(canonicalize(exe).parent()/aterm-ctl) iff that is a regular file; never a file beside the unresolved link.	8	1/1
+drive-own-ctl	contract	own_exe, CtlClient::{own_at,new,run}	own_exe() = canonicalize(current_exe()) (current_exe() itself where it cannot be canonicalized); CtlClient::own_at(exe, sock).run(args) execs exe with argv ["ctl", "--sock", sock] ++ args; CtlClient::new(exe, sock) puts nothing before --sock.	8	1/1
 fleet-dispatch-argv	contract	fleet_cli::dispatch_argv	Split line into an optional leading '@' selector, verb and rest at the first spaces; result = (selector without '@' or "-", [sel]? ++ [verb|≠""] ++ [rest|≠""]), rest a byte-for-byte suffix of line.	1,3	3/3
 fleet-dispatch-lines	refinement	fleet_cli::{dispatch_lines,write_dispatch_record,dispatch_io_error,batch_error_record}	For each non-blank non-'#' line in order, run is called with its argv and exactly one result record (ok=false, code=None, stderr "dispatch failed: e" on a launch error) is written and flushed. The first unreadable line writes one batch_error_record and returns Err naming input_line and dispatched; the first failed write returns Err with no further run; else Ok(∧ successes), Ok(true) for an empty batch.	1,3,7,8,11,13	5/5
 fleet-records-format	contract	fleet_cli::{event_record,result_record,err_record,json_escape}	result_record is the exact JSON object {subject,sid,ok,reply,exit_code|null,stdout,stderr}; every string in these records is json_escape'd and round-trips, including event addressing fields supplied by a subscription peer.	1,3,12	3/3
@@ -87,10 +92,9 @@ fleet-federated-sid	contract	fleet_cli::resolve_federated_sid	Returns channels[l
 fleet-line-bound	contract	fleet_cli::read_federated_line	Reads at most MAX_FEDERATED_LINE_BYTES+1 bytes; Ok(n ≤ MAX) when the line fits, else Err(InvalidData); line grows by ≤ MAX+1.	1,2,8,11	1/1
 fleet-sessions-from	contract	fleet_cli::sessions_from, FleetSession::sid	sessions_from(rows) = [(pid, sid) | row with Some(sid)] in order; sid is the second whitespace column of the row.	1,3,7,12	1/1
 fleet-list-diagnostics-automaton	invariant	fleet_cli::ListDiagnostics::observe	Mealy machine on failing: Option<(reason,n)>: Ok after failing says recovered once; Err increments n for the same reason (else n=1) and speaks iff n=1 ∨ n mod LIST_REPEAT_EVERY=0, as "nothing to federate" for an empty fleet else "cannot list the fleet", always naming the reason; a healthy loop is silent.	1,2,3	3/3
-fleet-operator-args	contract	fleet_cli::operator_ctl_args	propose with no args ↦ [operator-propose-bin], with args ↦ Err; any other c ↦ [operator, c] ++ args.	1	1/1
 fleet-stream-child-cleanup	contract	fleet_cli::{terminate_stream_child,stream_targets}	terminate_stream_child SIGKILLs a live child and returns only once it is reaped; stream_targets returns false at stdout EOF/rejection and kills and reaps the child, never waiting on it.	8,13	2/2
 align-capture-bounded	contract	harness::align::{capture_bounded,capture_bounded_impl,kill_capture_child,read_capture_pipe}	A child that exits and closes stdout before the deadline gives Ok{first min(cap,|out|) bytes, code}; otherwise Err naming the deadline within a bounded grace, its whole process group killed; an escaped descendant holding stdout cannot delay the return.	8,13	4/4
-align-capture-lifecycle-refines-model	refinement	harness::align::capture_bounded_impl, aterm_spec::derive::harness_capture_worker_lifecycle_model	Every return is a Return step of the model: child reaped and reader thread joined (never detached), also when an escaped descendant holds stdout.	8,10,13	1/1
+align-capture-lifecycle-refines-model	refinement	harness::align::capture_bounded_impl, aterm_models_harness::harness_capture_worker_lifecycle_model	Every return is a Return step of the model: child reaped and reader thread joined (never detached), also when an escaped descendant holds stdout.	8,10,13	1/1
 acc-label-grammar	table-property	accounts::{admissible_label,label_refusal}, Store::login_dir	admissible_label(l) ⇔ label_refusal(l)=None ⇔ 1 ≤ |l| ≤ LABEL_MAX ∧ l[0] ∈ [a-z0-9] ∧ l ⊆ [a-z0-9._-] ∧ l ≠ "help"; login_dir(l)=Some(dir/logins/l) iff admissible.	1,7	2/2
 acc-roster-admission	contract	accounts::{Roster::parse,row_of,row_refusal,Roster::row}	Roster::parse(text)=Ok(R) ⇔ TOML whose only key is `account`, ≤ MAX_ACCOUNTS rows with only known keys, admissible distinct labels, class ∈ {dedicated,shared}, dir absent or an absolute ≤ DIR_MAX path without control/U+2028, distinct dirs, at most one dirless row; R.rows in file order, dir verbatim. Otherwise Err starting "accounts.toml" naming the first offending row and reason. Empty text ⇒ default.	1,3,5,7,12	1/1
 acc-roster-file-read	contract	accounts::{Roster::load,roster_text,several_listed}	load: missing ⇒ default; a readable UTF-8 file ≤ MAX_ROSTER_BYTES ⇒ parse; else Err naming the path. roster_text never admits. several_listed ⇔ the roster loads with ≥ 2 rows.	1,8	2/2
@@ -125,7 +129,6 @@ acc-rotation-breaker	contract	accounts::{rotations_spent,breaker_until,recent}	r
 acc-pin-unpin	contract	accounts::{pin,unpin,note_auth}	pin refuses an absent/unenrolled/signed-out row by name (state unchanged), else clears its walls and makes it active, proven and pinned; unpin emits Unpin iff pinned; a SignedOut on the pinned account ends the pin.	1,2,3	0/1
 acc-note-observations	contract	accounts::{note_sample,note_offer,note_auth,note_session,State::sessions_on}	Each note_* records only newer admissible observations (a stamp ahead does not shadow), with its own event rule; note_session emits Move on an account change; ran_at survives forget_session; sessions_on is sorted.	1,2,3	1/1
 acc-note-reading-max	contract	accounts::{note_reading,tap_merge,tap_window}	Per window: take the read when the held is void or the read's reset is later; same reset ⇒ max pct; earlier ⇒ keep. Written iff a window changed or the heartbeat elapsed.	1,2,3	1/1
-acc-merge-join	invariant	accounts::{merge_observations,newer}	merge changes only observation fields of listed labels, newest by (at,by), caps from's stamps, never restores a cleared wall, evicts only unlisted records; machine-local fields stay; commutative and idempotent on observations; emits only Unpin "wall".	1,2,3,5,7,11	2/2
 acc-reset-claim	contract	accounts::{claim_reset,reset_in_flight}	claim_reset: Attempted for blank input; a claim in flight answers Mine (same sid,pid,start) or Held{until}; otherwise Taken when the wall is newer or the old reset came; writes no ledger row.	1,2,3	1/1
 acc-reset-outcome	contract	accounts::{reset_outcome,reset_reason,ResetDone::word}	reset_outcome only on an open matching claim: records done and one event; Used/Lifted clear the account's walls, Kept/Failed change none; reset_reason is the head before ` · `, cut to WORD_MAX on a char boundary, control chars folded.	1,2,3,7	1/1
 acc-reset-allowed	contract	accounts::{reset_allowed,Roster::own}	reset_allowed: not-listed, not-default, active-other, other-login checked in order, else Ok; Roster::own() = [main, dedicated, no dir].	1,3,7	1/1
@@ -135,7 +138,7 @@ acc-store-load-save	contract	accounts::Store::{at,load,save,ensure,touch_wake,tr
 acc-store-lock	contract	accounts::Store::{acquire,try_acquire,acquire_within,transact_within}, record_wall, record_gone	The lock excludes across handles and processes and frees on drop; acquire_within tries a bounded ladder; a transaction that cannot lock returns LOCK_HELD without reading or writing.	8,13	2/2
 acc-ledger-file	contract	accounts::Store::{append,tail}	append([]) creates nothing; rows append as lines (0600) and the file is cut to its newest LEDGER_KEEP_ROWS past LEDGER_MAX_BYTES; tail(n) = the last n parsing rows in order.	1,7,8	1/1
 acc-process-login-of-env	contract	accounts::ProcessLogin::{of_env,of_exec_env,stored}, names_another_login	of_env: login = the first non-empty LOGIN_ENV; default_home ⇔ no non-empty HOME_ENV; stored_login ⇔ no credential/profile/route name set non-empty and LOGIN_ENV not given twice differently; names matched exactly. of_exec_env(empty)=None, else of_env split at '='; of_exec_env(None).stored() = false.	1,3,7,11	3/3
-acc-process-login-only-weakens	invariant	accounts::ProcessLogin::{with_route_default,with_profile_store,with_settings,me}	Each builder changes only stored_login and never grants it; with_settings clears it for any unreadable/unparsable source, apiKeyHelper, or an env block setting a credential/profile/route/login/home name.	1,3,12	1/1
+acc-process-login-only-weakens	invariant	accounts::ProcessLogin::{with_profile_store,with_settings,me}	Each builder changes only stored_login and never grants it; with_settings clears it for any unreadable/unparsable source, apiKeyHelper, or an env block setting a credential/profile/route/login/home name.	1,3,12	1/1
 acc-profile-configs-dir	contract	accounts::{profile_configs_dir,profile_configured}	ANTHROPIC_CONFIG_DIR/configs, else XDG_CONFIG_HOME/anthropic/configs, else HOME/.config/anthropic/configs, else None; profile_configured ⇔ unlistable-but-present or a *.json entry.	1,8	0/0
 acc-judged-and-footer-label	contract	accounts::{judged_label,footer_label}	judged_label = me(R).account iff default home ∧ stored login; footer_label = judged_label iff ≥ 2 rows.	1,3	2/2
 acc-roster-beside	contract	accounts::{roster_beside,default_roster_path}	roster_beside(c) = parent(c)/accounts.toml when c has a file name, None for / and "".	1,8	1/1
@@ -222,24 +225,22 @@ lights-mode-pill-table	table-property	lights::Mode::{of_indicator,glyph,word,hue
 truncate-bytes	contract	harness::truncate_bytes	Returns s[..e] with e the largest char boundary ≤ max (s itself when short); never panics or grows.	1,3,7	1/1
 one-line-shortcut-equivalence	equivalence	harness::{one_line,is_one_line_already}, supervise::limit::one_line	one_line(t,max) = limit::one_line(truncate_bytes(t,max)).trim(): the shortcut returns t only where the fold would; every break/control incl. U+2028/9 becomes a space.	1,3,7	1/1
 lanes-table	table-property	harness::lanes::lanes, Program::supervisable	relaunch = upgrade = supervisable(p); restart_in_place ⇔ p = Claude.	3,12	2/2
-goal-hold-record-roundtrip	round-trip	goal_hold::{path,path_beside,read,write}, Hold::{to_json,from_json,say,said}	path = root/drive/<sid>.goal-hold.json; write;read = identity; from_json(to_json(h)) = h; say returns true once per word.	1,2,8	1/1
-goal-hold-one-owner	invariant	goal_hold::{claim,sync_switch,held_by_upgrade}, Hold::owes	At most one owner holds an open hold: claim refuses another owner's open hold unchanged; sync_switch writes/releases only the switch hold; held_by_upgrade ⇔ an open Upgrade hold.	1,2,8	1/1
-goal-hold-box-is-upgrades	contract	goal_hold::box_is_upgrades	⇔ an open Upgrade hold with a relaunch, BOX_THEIRS not said, and leads(relaunched).	1,8,13	1/1
 netstate-leases-bounded	invariant	netwatch::NetState::{ask,waiting}	ask keeps only waiters younger than NET_LEASE plus the asker and begins no probe; waiters ≤ distinct recent askers.	1,2,5	1/1
 netstate-schedule	contract	netwatch::NetState::{next_probe,begin,finish}	next_probe = None with nobody waiting or a probe in flight, now with no fresh measure, else m.at + (DOWN_CADENCE[downs-1] after a Down, STEADY_CADENCE otherwise); begin refuses a second flight; finish counts downs.	2,3,5	1/1
 netstate-reach-freshness	contract	netwatch::NetState::{reach,fresh,finish}	reach = Unknown for an overrun flight, else the last measure while fresh on both clocks (small wall steps back tolerated), else Unknown; since kept across the same fresh outcome.	2,3,5	2/2
 netwatch-route-of	contract	netwatch::{route_of,names_a_route,settings_route}	Default ⇔ the env is known, names no route (ROUTE_KEYS or prefixes with non-blank value) and every settings source is missing or quiet; else Custom(first reason).	1,3,7	1/1
 netwatch-settings-of	contract	netwatch::settings_of, claude_settings::parse	None iff not an object or a non-object env; else env pairs in order (strings, null as "", others as JSON), api_key_helper, status_line, hooks_off as stated.	1,3,12	2/2
-relaunch-held-wait-table	table-property	relaunch::{held_wait,ends_at_once}	held_wait(CAUSE_HOST) = 7 s > ENDED_AT_ONCE; HELD_WAIT for exit/""/fresh; ends_at_once("") ∧ ends_at_once(fresh).	3	1/1
+relaunch-held-wait-table	table-property	relaunch::{held_wait,ends_at_once}, Timings	t = Timings::PRODUCTION: held_wait(t, CAUSE_HOST) = t.restored_held = 7 s > t.ended_at_once; held_wait(t, c) = t.held = 90 s for c ∈ {exit, "", fresh}; ends_at_once("") ∧ ends_at_once(fresh).	3	1/1
+harness-timings-orders	table-property	harness::timings::{Timings::PRODUCTION,Timings::FAST,FAST_SEAM}	∀ t ∈ {PRODUCTION, FAST}: t.restored_held > t.ended_at_once, t.shell_look < t.ended_at_once, t.restored_held < t.held. Every FAST bound ≤ its PRODUCTION bound except claim_ttl, where FAST.claim_ttl > MUST_HAPPEN (a lease never lapses inside the wait for its release). FAST_SEAM is a name the child-environment deny list holds.	3	1/1
 relaunch-program-identity	contract	relaunch::launched	Some(program) iff the process runs Claude itself: a claude image, or an interpreter whose absolute argv[1] script is Claude; wrappers, relative scripts and unknown images give None.	1,3,7	1/1
-relaunch-on-exit-refines-model	refinement	relaunch::Relaunches::{exited,attempted,pending,running,counts,forgive,restarted}, on_exit, outcome	Driving the real Relaunches with the HarnessRelaunchOnExit actions keeps project(state) = model state and every invariant: owned exits never relaunched, limits said, back-off 1/10/60/600 s forgiven after a healthy run, misses said once.	2,3,5,10	5/5
-relaunch-ended-at-once-shell-look	contract	relaunch::{ended_at_once,shell_look,line_over,first_idle}	The relaunched agent reads as ended iff its line was seen to run (shell not holding the terminal, or line_over of its block) and every later look over ENDED_AT_ONCE found the shell holding the tab.	2,3,5,7	1/1
+relaunch-on-exit-refines-model	refinement	relaunch::Relaunches::{exited,exited_as,attempted,decide,pending,running,ask,conversation_runs,asks,failing,crash,counts,forgive,restarted}, on_exit, outcome	Driving the real Relaunches with the HarnessRelaunchOnExit actions keeps project(state) = model state and every invariant: owned exits never relaunched, limits said, back-off 1/10/60/600 s forgiven after a healthy run and climbed only by a crash's attempts (NoCrashNoStreak), misses said once, a word asking for a conversation standing until it runs (AskStandsForItsConversation), a failing relaunch's word ending with its trying (TriesOnlyWhileDue; running() while it keeps failing = PersonReturns then PersonRuns).	2,3,5,10	5/5
+relaunch-ended-at-once-shell-look	contract	relaunch::{ShellBack::{after,due,saw},line_over,first_idle}	ShellBack::after(block, t) looks every t.shell_look; it reads the relaunched agent as ended iff its line was seen to run (the shell not holding the terminal, or line_over of its block) and every later look over t.ended_at_once found the shell holding the tab.	2,3,5,7	1/1
 relaunch-one-shot	contract	upgrade::one_shot	⇔ some -p/--print stands at a flag position (before `--`, not a preceding flag's value).	1,3,7	1/1
-relaunch-promise-iff-plan	equivalence	relaunch::{resumes_on_exit,carries_restart,plan,line_for,required_env}, upgrade::rewrite_argv	resumes_on_exit(s) ⇔ plan(s) yields a line (registered conversation, argv rewritable, not one-shot, known dialect, line_for Ok with the home and login); likewise carries_restart for the Codex lane.	1,3,4,7	4/4
+relaunch-promise-iff-plan	equivalence	relaunch::{resumes_on_exit,carries_restart,exit_line,plan,line_for,required_env}, upgrade::rewrite_argv, upgrade_drive::home_carried	resumes_on_exit(h,s) ⇔ plan(s) yields a line for a user whose home is h (registered conversation, argv rewritable, not one-shot, known dialect, the Claude home its line starts it under is the one its records are in, line_for Ok with the home and login); carries_restart(h,s) = resumes_on_exit(h,s) for Claude Code; for a Codex, the snapshot carries a copy-validated line (self_claimed_line).	1,3,4,7	2/2
 relaunch-snapshot-follow	contract	relaunch::{follow,foreground}	follow moves session/version/cwd to Claude's record iff it names the same pid, start and a session id, returning whether it moved; foreground reads the published foreground group.	1,2,8,12	1/1
-relaunch-target-build	contract	relaunch::relaunch_target	The newest installed build newer than the running version the move may take, while upgrade is on and the version reads; else the program it ran.	1,3,7	1/1
-relaunch-resumed-prompt-one-line	contract	relaunch::{resumed_prompt,resumed_prompt_as}	One line (no break/control), starting with the continuation head, ending with keep going, naming the cause class.	1,3	1/1
-relaunch-exit-record-look	contract	relaunch::{exit_record,look_at_exit,look_at_codex_exit}, ExitRecord::{crashed,word}	Claude: absent at the first look ⇒ Removed; gone before the settle ⇒ Removed; present through the settle ⇒ Crashed (not earlier); nothing decided before EXIT_GONE while running. Codex: the shell's word decides; no word ⇒ Unread after EXIT_GONE, never Removed.	3,5,7,13	2/2
+relaunch-target-build	contract	relaunch::relaunch_target, upgrade_build_start::proved	The newest installed build newer than the running version the move may take, while upgrade is on, the version reads and held(t) is false (the owner's word, a failed start, or a build no probe has proved to start); else the program it ran.	1,3,7	1/1
+relaunch-resumed-prompt-one-line	contract	relaunch::resumed_prompt	One line (no break/control), starting with the continuation head, ending with keep going, naming the cause class.	1,3	1/1
+relaunch-exit-record-look	contract	relaunch::{exit_record,look_at_exit}, ExitRecord::{crashed,word}	Claude: absent at the first look ⇒ Removed; gone before the settle ⇒ Removed; present through the settle ⇒ Crashed (not earlier); nothing decided before EXIT_GONE while running. No Codex end is read here (a codex-alab's is its copy's).	3,5,7,13	1/1
 relaunch-permission-mode	contract	relaunch::{permission_mode_of,with_permission_mode,mode_flag,line_for}	permission_mode_of = the newest known mode row; with_permission_mode replaces every --permission-mode with the named mode (bypass kept only for a bypass launch); mode_flag(Manual)=default; the line carries the mode past many-valued flags and `--`.	1,3,7	4/4
 relaunch-quiet-outcome	contract	relaunch::{quiet_outcome,outcome_line}	quiet_outcome names the build and the models and never `unconfirmed`; the ask flow's outcome_line with no model says `unconfirmed`.	1,3	1/1
 relaunch-line-env-quoting	round-trip	relaunch::{login_line,line_for,line_tapped,with_tap,login_env,required_env}, upgrade::relaunch_line_env	For zsh/bash/fish, the shell's parse of login_line yields exactly the required assignments in order (values verbatim, empty kept as '') ahead of the switch and argv (tap before --resume); Err(line) iff a value has a control char or fish has a cd with env; R=[] is the golden line; with_tap never adds a second --resume.	1,3,5,7	4/4
@@ -272,50 +273,29 @@ tap-silence-machine	contract	tap::Silence::{step,silent,untapped}	Silent at most
 tap-sweep	contract	tap::sweep	Removes exactly dead processes' files, over-age files and stale temps; keeps live files and foreign names.	1,7,8	1/1
 tap-gate	contract	tap::gate	Some(tap) ⇔ the conjunction of every guard (switch, nameable path, stored login, no own home/profile, no foreign --settings, no --bare, argv rewritable, a quiet readable settings chain); each guard alone negated gives None.	1,3,4	1/1
 tap-row-safe	contract	tap::line_of, aterm_phase::read, footer::{mode_row,live_repl_row}	With the tap's line in its row, the phase reads idle with no wall and the footer readers find the same rows; the line has no vendor guarded string.	1,3,5,12	1/1
-transcript-projection-refines-full-parse	equivalence	transcript::{usage,metadata,command,conversation,codex_metadata}	Each projection P(text) = project(full parse, SHAPE_P) and Errs exactly when the full parse does (discarded fields fully validated).	1,3,5,7,12	3/3
+transcript-projection-refines-full-parse	equivalence	transcript::{usage,metadata,command,conversation}	Each projection P(text) = project(full parse, SHAPE_P) and Errs exactly when the full parse does (discarded fields fully validated).	1,3,5,7,12	3/3
 transcript-conversation-quota	contract	transcript::conversation	conversation keeps quotaLimits {status, resetsAt, rateLimitType}, each wrong shape Null alone; other projections keep none.	1,3,12	1/1
 catalog-parse-window	contract	upgrade_catalog::parse_window, Baked::{latest,model}	None iff no `models:[` marker; else the parseable models with derived efforts and native_1m; model ignores `[…]`; latest is a model id or None.	1,3,7	2/2
 catalog-build-facts-roundtrip	round-trip	upgrade_catalog::{render_facts,parse_facts}	parse_facts(render_facts(b)) = b; parse_facts("{}") = default.	1,3,12	1/1
 catalog-scan-chunk-invariance	equivalence	upgrade_catalog::scan_build	scan_build = (parse of the first marker window, the most frequent VERSION literal), independent of chunk boundaries.	1,5,7,8	1/1
 catalog-twin-binary	contract	upgrade_catalog::twin_binary	Some(P) iff the last `exec '<P>' "$@"` line has P absolute.	1,3,7	1/1
-codex-package-version	contract	upgrade_codex::{parse_package,package_version}	parse_package ⇔ layoutVersion 1, a release version and a relative entrypoint without ..; package_version reads the nearest manifest naming exe, never executing it.	1,7,8,12	2/2
-codex-rewrite-argv	contract	upgrade_codex::rewrite_argv	Ok(prog ++ kept flags verbatim ++ [resume, t]); Err(UnknownFlag) for the first unknown flag; Err(NotResumable) for exec/app-server/--remote/--worktree.	1,3,7	2/2
-codex-is-tui-argv	contract	upgrade_codex::is_tui_argv	⇔ the first non-flag word is absent, resume, fork or a prompt, not app-server/exec/agents.	1,3,7	1/1
-codex-thread-ids	contract	upgrade_codex::{is_thread_id,lock_thread,is_rollout_of,resumed_thread,thread_created_ms,rollout_cwd}	is_thread_id ⇔ the hyphenated UUID shape; lock_thread, is_rollout_of, resumed_thread, thread_created_ms (UUIDv7 48-bit ms) and rollout_cwd as their grammars say.	1,3,7	2/2
-codex-exit-hint	contract	upgrade_codex::{hint_above_prompt,parse_exit_hint}	Some(t) iff a `codex resume <t>` hint stands in the TUI's own last words between its command row and the prompt; never an older exit's hint.	1,3,7	3/3
-codex-background-terminals	contract	upgrade_codex::{terminals_under,daemon_clients_in,terminals_on_screen}	terminals_under = descendants leading their own session; daemon_clients_in = the socket's peers; terminals_on_screen > 0 iff the status line says so.	1,5,7	3/3
-codex-turn-back-chunk-invariance	equivalence	upgrade_codex::{back,rollout_turn_back,head_back,TurnBack::feed}	back(B,c,bound) = the state of the last real turn event wholly within bound of the end, independent of chunk size, Unknown past the bound, Head only for opening items; long lines joined once.	1,2,5,7,8	5/5
-codex-rollout-ready	contract	upgrade_codex::{rollout_has_ready,prepare_prompt}	⇔ the agent's last message after the latest notice is READY ++ marker.	1,3,7	1/1
-codex-composer-reader	contract	aterm_phase::codex::{composer_row,composer_is_empty,composer_draft,box_on_screen,busy_on_screen}	composer_row finds the input line by › or »; empty ⇔ only the dim placeholder; a box over it is a box, never an empty composer.	1,3,12	2/2
-codex-next-step-gate	contract	upgrade_codex::{next_step,requested_step,step}	/exit only at an idle point with nothing under it, per the embedded/quiet/daemon-client rules; a break takes the first notice only; a stopped round rests RETRY_S then re-arms unless skipped.	1,3,10	5/5
-codex-daemon-step-refines-model	refinement	upgrade_codex::daemon_step	Update is enabled in HarnessCodexDaemonUpdate ⇔ daemon_step = Update: the daemon moves only while every served thread is idle.	3,10	2/2
-codex-daemon-files	contract	upgrade_codex::{parse_daemon_pid,parse_update_answer}	Each parses exactly its measured format; anything else None.	1,3	1/1
-codex-notice-text	contract	upgrade_codex::{prepare_prompt,continue_prompt}, upgrade::{with_running,running_clause}	The notice opens with its head, ends with the closing sentence, places the running clause before it, never asks to cancel, fits cx::PASTE_SHOWN_MAX and still names the oldest command.	1,3,7	3/3
-codex-spawn-tree-and-placement	contract	upgrade_codex::{session_lineage,tree_root,own_thread,daemon_turn,goal_on_screen}	session_lineage classifies the first line; tree_root names the one root of a loop-free tree served to one client; daemon_turn places a running thread only in the named conversation (or by the quiet rule with no goal); goal_on_screen reads only under the input line.	1,3,5,7	4/4
-codex-goal-pause	refinement	upgrade_codex::goal_step, goal_look, Hold	The edges HarnessUpgradeGoalPause leaves to code: wait through the take window, Esc only at a turn head, give up past PAUSE_GIVE_UP_S, resume at the bound with ≤ MAX_RESUMES retries, nothing under an open switch hold, at every pane width.	1,3,10,12	2/2
-codex-wall-reset	contract	upgrade_codex::{wall_reset_at,wall_reset_text,keep_wall_reset}, limit::*	The reset is parsed and placed in the zone the Codex printed in; non-limit walls name none; keep_wall_reset keeps the first placement per words and clears with no wall.	1,3,5,13	3/3
-codex-wall-visit	contract	upgrade_codex_drive::visit, drive::{watch_at,watch_in}, Row::{limit_ends_at,limit_passed}	At a wall the visit types nothing and waits limited, recording the first placed reset; limit_ends_at = reset + grace or the week bound; spend walls are the owner's hold; under quiet a wall a grace past its reset is an idle point; the dry read writes nothing.	1,2,8,10	5/5
-codex-limited-fact	contract	upgrade::limited, aterm_phase::codex::wall	limited ⇔ the last block is a usage-limit wall, with or without a reset; not for other walls or a gone block.	1,3,12	2/2
-codex-visit-exit-gate	invariant	upgrade_codex_drive::visit, upgrade_codex::{next_step,daemon_step,quiet_step}, upgrade::gate_restart	The visit sends /exit only if at its last look the screen is idle and not limited, no background terminal runs, every daemon thread of this conversation is idle and placed, nothing began since the sweep, the ladder admits the person's recency, shell marks or the kernel name the thread, and asked rounds have READY; otherwise it waits with a named word. It never signals a Codex.	1,2,4,7,8,10,13	23/23
-codex-typed-under-hand	other	upgrade_codex_drive::visit, upgrade::type_guarded	Every typed line of the Codex lane sits inside the lane's own hard lease, fenced on the judged read; a held tab types nothing; a missed guard or untaken Enter is said once, recorded and left standing, never taken back.	1,2,8,10	4/4
-codex-relaunch-own-thread	contract	upgrade_codex_drive::visit, upgrade_codex::{hint_above_prompt,daemon_client_thread}	The relaunch resumes exactly the thread the exiting TUI named (its hint, its argv, or the one thread its daemon began for it); with no such thread nothing is typed; a waited relaunch keeps its first thread.	1,2,8,10	5/5
-codex-candidate-and-due	contract	upgrade_codex_drive::{due,candidates,visit}	A candidate is a tab whose foreground is a Codex TUI of this home; due ⇔ behind the managed build or its daemon behind/updater armed (pin looks bounded); a daemon reached from one tab asks every tab it serves.	1,4,8	6/6
-codex-owner-word	contract	upgrade_codex_drive::visit, relaunch::relaunch_target, St::{retarget,own_prior}	Skip and unexpired Defer hold the tab and its daemon; Now hurries and waives only this tab's attended guard; a crashed Codex relaunches on its own program while held, the record handed to the new TUI.	1,2,8,10	5/5
-codex-round-lifecycle	refinement	upgrade_codex_drive::visit, St::{notices,noticed_at,last_stop,retarget}, relaunch::carry_on	Codex rounds follow the Claude lane's round machine: one ask per notice, re-ask/give up/rest/re-arm, continuation after a given-up or retargeted quiet move, at most one continuation, unreadable screens blocked after BLOCKED_AFTER_S.	1,2,8,10	7/7
-codex-restart-record-closure	contract	relaunch::{after_exit,landed,codex_landed_gone,restarted,ended_by_restart,stale_exit_line}, St::resumed_pid	The record names the relaunched TUI; after it is gone a leaving Codex is its own; a hand-started Codex closes the restart as resumed elsewhere; outlived exits are never waited on; a stale exit's line names the wait in a person's words.	1,2,8,10	6/6
-codex-exit-witness-refines-model	refinement	relaunch::{look_at_exit,look_at_codex_exit,exit_record,after_exit}	The real exit read over a stand-in tab keeps what HarnessCodexExitWitness keeps (crash, no crash, no word) and acts as the model; a crash is relaunched on its thread and told why.	1,2,8,10	3/3
-codex-prune-refines-model	refinement	upgrade::{prune,prune_states}	prune removes exactly HarnessUpgradeStateCollection's collected records (closed tabs' settled records ≥ 1 week old), never a live tab's or an in-flight restart's; the registry vouches only for a root of its own kind.	1,7,8,10	2/2
-codex-daemon-verb-environment	contract	upgrade_codex_drive::run_daemon_update, aterm_uds::spawnfd::command	The vendor's daemon-update verb is spawned with only fds 0-2 and its own managed environment, and is the only mover of the daemon.	8	2/2
+codex-package-version	contract	codex_alab::{parse_package,package_version,package_entrypoint,alab_bytes}	parse_package ⇔ layoutVersion 1, a release version and a relative entrypoint without ..; package_version reads the nearest manifest naming exe, never executing it.	1,7,8,12	2/2
+codex-rewrite-argv	contract	codex_alab::rewrite_argv	Ok(prog ++ kept flags verbatim ++ [resume, t]); Err(UnknownFlag) for the first unknown flag; Err(NotResumable) for exec/app-server/--remote/--worktree.	1,3,7	2/2
+codex-is-tui-argv	contract	codex_alab::is_tui_argv	⇔ the first non-flag word is absent, resume, fork or a prompt, not app-server/exec/agents.	1,3,7	1/1
+codex-thread-ids	contract	codex_rollout::{is_thread_id,is_rollout_of,thread_created_ms}, codex_alab::{lock_thread,resumed_thread}	is_thread_id ⇔ the hyphenated UUID shape; lock_thread, is_rollout_of, resumed_thread and thread_created_ms (UUIDv7 48-bit ms) as their grammars say.	1,3,7	2/2
+codex-restart-record-closure	contract	relaunch::{landed,restarted,ended_by_restart,stale_exit_line}, St::resumed_pid	The record names the relaunched TUI; no Codex exit is read as the harness's own restart; outlived exits are never waited on; a stale exit's line names the wait in a person's words.	1,2,8,10	5/5
+muse-exit-witness-refines-model	refinement	relaunch::{look_at_muse_exit,exit_record,after_exit}, upgrade_drive::muse::{look_at_exit,after_exit_onto}	The real Muse Code exit read over a stand-in tab keeps what HarnessMuseExitWitness keeps (crash, clean end, refused start, no word) and acts as the model: a crash of a witnessed session is relaunched on it (its block's word, else its session log's), its own exit, someone's SIGINT/SIGTERM and a told refusal are left, and nothing is relaunched without the session its process held.	1,2,8,10	1/1
+codex-prune-refines-model	refinement	upgrade_drive::codex_alab_drive::prune, upgrade_drive::{registry_life,prune_states}	prune removes exactly HarnessUpgradeStateCollection's collected records (closed tabs' settled records ≥ 1 week old), never a live tab's or an in-flight restart's; the registry vouches only for a root of its own kind.	1,7,8,10	2/2
 screen-reply-parse	contract	upgrade_drive::{parse_screen,is_generation}	None iff not JSON or no `rows` array; rows as strings; first/seq default 0; cursor relative to first (None above it); generation only when ScreenGen parses; human Unknown/Never/Ago(n).	1,3,5,12	1/1
 busy-footer-live-zone	contract	upgrade_drive::busy_footer, aterm_phase::busy_zone_start	busy_footer ⇔ `esc to interrupt` occurs in rows[busy_zone_start..], below the newest composer frame; a dead or quoted footer above never counts.	1,3,7,12	2/2
 held-by-status	contract	upgrade_drive::{held_by_status,our_hand}, relaunch::{hand_on_tab,driver_hand,held_by_someone,person_present}	held ⇔ not OK ∨ hold=1 ∨ a hand other than ours ∨ unread input ∨ human_ms < grace·1000; grace 0 holds nobody by keystroke; our lease holds nothing.	1,3,5,7	2/2
 host-roster-parse	contract	upgrade_drive::{parse_host_roster,roster_rows,unique_tab_for_group}	None unless OK with every line `<u64> s-<id>` and distinct ids; fgpgid positive or None; unique_tab_for_group = the one tab with that group, else None.	1,3,5,7	1/1
 roster-aside-union	contract	upgrade_drive::{roster_aside,aside_of,is_host_holder}	roster_aside = {claimed by another supervisor, autopilot off} from the real columns (decoded), None on ERR or no answer; aside_of = union of Some answers.	1,5,7,8,13	2/2
-codex-due-short-circuit	contract	upgrade_drive::due_after_codex	Some(d) ⇒ d with no Claude scan; None ⇒ one full Claude roster scan.	4,8	1/1
+codex-due-short-circuit	contract	upgrade_drive::{due_after_lanes,lane_due}	The first lane past Claude Code's, in upgrade::Agent::others() order, answering Some(d) ⇒ d with no Claude scan; None from every one (agy, Muse Code and Gemini CLI, with no upgrade lane, always None) ⇒ one full Claude roster scan.	4,8	1/1
 due-never-drops-unread	refinement	upgrade_drive::{due_among,no_record,due,Targets::read_with,cached_version_with}	Each due_among verdict is an action HarnessUpgradeLook enables (NeverDropped): No only when every read answered; timeouts and foreign-group records are Unread; a missing record waits RECORD_WINDOW_S; an own restart in flight is Yes.	1,4,5,8,10,12,13	6/6
 version-cache-backoff	contract	upgrade_drive::cached_version_with	Clean answers are cached per file key with no probe; a timeout reads Unread and is retried at t0+VERSION_RETRY_FIRST·2^k, never before; a changed key is probed at once.	1,2,5,8,13	1/1
 bounded-child-probe	contract	upgrade_drive::version_within, upgrade_build_start::{probe_within,probe}	Returns within the bound plus a constant; a hung child or held pipe is TimedOut with its group killed; probe runs `--help` and starts ⇔ exit 0.	8,13,17	2/2
-state-record-roundtrip	round-trip	upgrade_drive::St::{to_json,from_json}	from_json(to_json(st)) = st for Claude/Codex records in every phase; an unknown phase or agent word is None; omitted fields read their defaults (relaunched_at from the phase's at). Files from older writers, or with fields this build ignores, parse with defaults.	1,3,5,6,7	4/4
+state-record-roundtrip	round-trip	upgrade_drive::St::{to_json,from_json}	from_json(to_json(st)) = st for Claude/Codex records in every phase; an unknown phase or agent word is None, and so is the word of an agent with no lane (agy, muse, gemini: read as that agent, passed by); omitted fields read their defaults (relaunched_at from the phase's at). Files from older writers, or with fields this build ignores, parse with defaults.	1,3,5,6,7	4/4
 background-walk	contract	upgrade_drive::{background,background_procs,background_or_unreadable}, upgrade::gate_restart	background_procs = BACKGROUND-named proper descendants (bounded walk), except the agent's own keep-awake child (its descendants still walked); an empty table reads UNREADABLE_TABLE; any background holds the gate.	1,3,4,5,7	3/3
 etime-and-command-head	contract	upgrade_drive::{parse_etime,command_head}	parse_etime = [d-][h:]m:s in seconds, None for 1 or >3 fields or non-numbers; command_head unwraps `&& eval '…' < /dev/null` and the quote escapes.	1,3,5,7	1/1
 ancestry-guard	contract	upgrade_drive::is_our_ancestor	⇔ pid is in the first 64 links of our ppid chain; no sweep signals itself or an ancestor.	1,3,7,8	1/1
@@ -330,7 +310,7 @@ tail-window-bounded	contract	upgrade_drive::{tail_window,tail_to_end,since,named
 step-word-classification	table-property	upgrade_drive::{Report::is_act,Report::line,after,unknown_step,moved,typed}	is_act ⇔ not current/wait:/skip:/busy:/would-; after maps each taught family to the host's next move; untaught words are looked at again; moved/typed per the step.	1,3,5	4/4
 turn-end-ownership	contract	upgrade_drive::{owns_turn_ends,owns_turn_ends_as,bounded_wait_as,after_attended}	Owns turn ends for announced:*, a READY settling/draining within its bound, and wait:attended within grace + ATTENDED_OWNED_S; never for holds, owed releases or final words; the quiet flow owns nothing for its own work.	1,3,5	4/4
 release-is-next	contract	upgrade_drive::{release_is_next,owed_word}	release_is_next for the upgrade's own give-up/void/stop and gate-free waits, false for every gate wait; owed_word turns an owed final word into wait:release:<why>.	1,3,5	1/1
-pick-tab-word	contract	upgrade_drive::pick	The tab's own report over its daemon's (a current client defers to the daemon); else the first act, else the first wait.	1,3,7	1/1
+pick-tab-word	contract	upgrade_drive::pick	The tab's own report over another tab's (a current tab defers to the other's word); else the first act, else the first wait.	1,3,7	1/1
 announce-preflight	contract	upgrade_drive::announce, relaunch::line_for	A refused plan types no notice, fails the round once (refused:<why>); a wait plan waits; dry runs change nothing; an Ok plan types the notice once and records the marker.	1,2,4,8	1/1
 drain-void	contract	upgrade_drive::{drain_expired,answered}, upgrade::{next_step,gate_release}	A READY a box holds past DRAIN_S is voided: markers forgotten, release owed (Claude only), drain-expired:<why> ledgered once; the next ask waits REASK_S and the box's going.	1,2,4,8	1/1
 sweep-lock-exclusive	contract	upgrade_drive::{sweep_lock,SweepLock::drop,sweep}	While held a second sweep is busy:another-sweep (not an act); dropping releases it even with descriptor copies alive.	8,13	2/2
@@ -367,8 +347,7 @@ continuation-words-and-mode	contract	relaunch::{resumed_prompt,carry_on_from}, u
 presence-settle-ladder-gates	contract	upgrade_drive::{visit,look,ladder_look}, upgrade::{attended_by,next_step}	An attended tab (human_ms < 10 min, no stamp fails closed) is said once and never typed into or signalled without --now; the settle is the server's idle verdict age; the ladder's rungs admit as stated; a lagging status waits one look; a break types the notice once.	1,4,5,8	7/7
 ready-consent	contract	upgrade_drive::{answered,heard,visit}	A READY counts only as the current marker on its own line in the current round; a hold ends the notice; an unrecorded READY holds the point; a person's later message supersedes it and the point asks again.	1,8	2/2
 wait-log-ledger-and-prune-bounds	contract	upgrade_drive::{St::note_wait,ledger_append,prune_states,Report}, upgrade::Agent::parse	The wait log gains a row only on a change or an act, bounded to WAITS_KEPT; the ledger is cut past 1 MiB with the newest row last; prune_states removes only week-old settled records of dead conversations; an unknown agent's record is left byte-identical.	1,7,8	6/6
-goal-pause-refinement	refinement	upgrade_codex_drive::{goal_step,goal_owed,daemon_turn,goal_hold_past_bound,goal_rest_until}, St::rung_at	Refines HarnessUpgradeGoalPause: pause at Land after claiming, hold while the turn runs, answer the relaunch's box once, never resume twice or over a person, Esc only at a turn head, nothing under an open switch or inside a bypassed sandbox.	1,2,4,8,10,12	12/12
-ladder-refinement	refinement	upgrade_codex_drive::{rung,codex_daemon_turn}, upgrade_drive::{ladder_look,ladder_projection,St::still}	Refines HarnessUpgradeLadder: Move exactly where a look types /exit, Pin where the daemon rule pins; the still run counts looks at the same words QUIET_S apart.	1,7,10,12	5/5
+ladder-refinement	refinement	upgrade::{rung,gate}, upgrade_drive::{ladder_look,look_facts,ladder_projection,St::still}	Refines HarnessUpgradeLadder: Move exactly where Claude Code's quiet flow restarts, over every state the model reaches, each Buggy member caught alone; the still run counts looks at the same words QUIET_S apart.	1,7,10,12	2/2
 login-wall-reader	contract	upgrade::{login_wall,transcript_login_state}, upgrade_drive::notice_answered_by_wall	Walled from an authentication_failed row until `Login successful` (either form) or an answered turn; other synthetic rows and subagent rows never set or lift it; a notice reached the model iff its answer is not the wall's.	1,3,5,7	3/3
 login-wall-spends-nothing	contract	upgrade::{next_step,rearmed}, St::notices, upgrade_drive::visit	At the login wall every gate waits `login` and no clock runs; a notice the wall answered spent no ask and is retyped as the same ask; rearmed recovers 0.93.0 records; St::notices counts each typed ask once.	1,2,5,8	8/8
 model-family-version	contract	upgrade_models::{family_version,base_id}, upgrade::is_model_id	Some((f,(a,b))) iff base_id(id) = claude-<f>-<a>[-<b>] plus date parts of ≥ 6 chars, f a lowercase word, 1 or 2 short numeric parts (b=0 when absent); else None.	1,3,7	1/1
@@ -416,6 +395,7 @@ upgrade-refines-never-strands-model	refinement	upgrade::next_step, upgrade_drive
 release-ownership	contract	upgrade_drive::St::{release,notice_pid,stop,forget}, upgrade::{release_is_next,round_markers}	A release is owed only to the notice's own process; a restart past its signal owes none; the owner's hold releases the asked agent and forgets the markers; round_markers are exactly the round's notices' markers.	1,2,3	3/3
 limit-queue-refines-model	refinement	upgrade::{notice_scan,transcript_limit_until,requested_step}, upgrade_drive::queue_facts	Every rendering of harness_upgrade_limit_queue_model is read and stepped as the model does (Retype, Announce, GiveUp, Elapse, NowAsks); a week-long no-reset limit gets copies at 0,0,2,4,8,16 h then daily.	1,3,5,7,10	2/2
 visit-shell-refines-pure-reducer	refinement	upgrade_drive::{visit_with_claim,watch::watch_with,release_visit,St::{save,load}}	The effectful visit's step, typed lines and saved St equal the pure composition of readers, reducer and record transitions; at most one notice or release per visit; no signal unless Terminate; watches type nothing.	1,2,3,4,8,13	28/28
+upgrade-dry-run-no-hands	contract	harness::upgrade_drive::{connect,connect_at,connect_reads,roster_connection}	connect_at(opts, sock) is reads_only (relay-read-only-connection) iff opts.dry_run; connect_reads and roster_connection are reads_only whatever opts says. Every control connection the harness pass makes is one of these, so a dry run — the CLI's --dry-run and the window's watch — sends READ_VERBS requests alone.	8	1/1
 progress-stamp-single-writer	invariant	upgrade_drive::{St::progress_at,progress_key,note_step,refused,refused_at}, restore	progress_at moves iff progress_key moves on every transition; restore keeps the prior stamp; a self-refused notice counts refused without moving the key.	1,2,3,5	2/2
 deadline-totality	contract	upgrade_drive::watch::{due_by,watch_at}, St::from_json	Every record owed a step has a due_by and a watch_at (legacy shapes included); only finished moves and pre-restart rounds a --skip holds have neither.	1,3,5	2/2
 watch-refines-progress-look	refinement	upgrade_drive::watch::{watch_with,look_word}, upgrade::held_point, upgrade_status::progress_projection	watch_with moves the record exactly as HarnessUpgradeProgress's Watch, with zero input requests.	1,3,8,10	1/1
@@ -429,7 +409,7 @@ own-work-news	contract	upgrade_status::{Row::attention,Row::behind_since,Row::re
 aterms-own-fault	contract	upgrade_status::{Row::attention,refused_notice,unwatched,Need::upgrade_cannot_run,fence_fails_under_now}	Unclassified waits, self-refused notices, unwatched records and failing builds are one Fault line each (build-fails keyed by build), never a Digest or mark; upgrade_cannot_run is one bounded sentence with one action.	1,3,5	5/5
 stall-mark-and-remedy	contract	upgrade_status::{Row::stall,remedy,moving,word_in_force,will_ask_again,repeating_stop,person_seen}, now_moves_past	stall = Some only for an upgrade that will not move on its own (held-back, repeating stops, stuck restarts, ended agents); overdue waits mark nothing; --now quiets a stall for NOW_QUIETS_S; remedy is Now exactly where --now moves the wait; a person is named only while seen.	1,3,5	14/14
 wait-class-total-and-stable	table-property	upgrade_status::{wait_class,Row::cause,Row::overdue_cause,claude_wait_words}	Every wait word either lane records has a class (only unknown words are Unclassified) and Claude words fit 64 chars; one stall keeps its class through the notice path's passing words.	1,3	5/5
-row-of-record	contract	upgrade_status::{Row::of,column,move_words,next_round_in,failed_after_exit,with_goal}, St::{notice_gone,request_for}	Row::of projects the record: the one-token column, move words, restarting/done around confirm_by, next_round, failed-after-exit rows standing with no holder, gone-notice words holding nothing, moved_at, goal rows, Codex rows like Claude's.	1,3	11/11
+row-of-record	contract	upgrade_status::{Row::of,column,move_words,next_round_in,failed_after_exit}, St::{notice_gone,request_for}	Row::of projects the record: the one-token column, move words, restarting/done around confirm_by, next_round, failed-after-exit rows standing with no holder, gone-notice words holding nothing, moved_at, Codex records' rows like Claude's.	1,3	11/11
 status-line-and-json-fields	contract	upgrade_status::{Row::line,to_json,waiting_line,word}	Row::line is fixed-order key=word fields (watch fields last, refused= only when non-zero); word(s) is s when a safe ≤64-byte token else its filtered prefix or -; to_json carries the same facts, holders bounded to five.	1,3,7	7/7
 need-and-mark-text-bounds	contract	upgrade_status::{Need,cut,Row::more_lines,stall_reason,stall_words,refusal_sentence,refused_stopped}	Needs fit NEED_WHY_MAX/NEED_THEN_MAX with one action; an interrupt mark ≤ 200 bytes never cuts the resume id; digest fingerprints are (kind,tab); refusal and stopped words are the line's own cause.	1,3,7	7/7
 resume-command-inverts-relaunch-line	round-trip	upgrade_status::{resume_command,launch_of,export_of,program_at,resume_login}, upgrade::relaunch_line_env	resume_command(relaunch_line_env(dialect,…,F ++ --resume sid), sid) = `claude F --resume sid` with no assignments, for every dialect and option; resume_login names the chosen login.	1,3,5,7	3/3
@@ -460,32 +440,22 @@ usage-panel-windows	contract	usage::{usage_panel_windows,panel_title,panel_key_s
 usage-panel-read-phase	contract	usage::usage_panel_read, aterm_observe::row_matcher	Classifies Inline, NotUsage, Fold, Unsettled or Settled (whole tab, both windows, hint last, nothing unsettled); the header guard matches only the header row.	1,3,7,12	9/9
 usage-panel-sample	contract	usage::panel_sample	Some iff both windows were read; figures are their pcts; resets placed in the panel's zone, None past their window's bound (figure kept).	1,3,7,12	3/3
 governor-token-bucket	invariant	SelfGovernor::{disabled,enable_self_write,allow_self_write,note_self_output,tick,tripped,reset}	tokens ≤ capacity is preserved; allow_self_write = enabled ∧ ¬tripped ∧ tokens>0, spending one; churn saturates and the breaker latches until reset; tick refills saturating and never panics.	1,2,3	3/3
+ready-fd-signal	contract	ready::{Ready::open,Ready::hand,Ready::wait}	open leaves no name in its directory and both FIFO ends close-on-exec; hand clears close-on-exec on exactly the write end's number in the child. wait(bound) = Ready iff one byte is read, Closed iff end-of-file with nothing written (every write end closed), TimedOut iff neither within bound; a wait that timed out may be made again, and once one answered Ready or Closed every later wait answers Closed.	8,13	1/1
 turn-run-protocol	contract	Turn::run, row_matcher, ControlClient::{send,key_enter,await_idle_and_ready}	A bad pattern is BadPattern with no transport use; a governed turn is Governed with none; otherwise exactly send, key_enter, await (each after the earlier Ok), one token spent.	1,2,4,11,12	3/3
 relay-wire-equals-ctl	equivalence	RelayClient::{send,key_enter,await_idle_and_ready,read_text}, CtlClient::await_idle_and_ready, unsettled	RelayClient's wire bytes equal CtlClient's request lines for the same Turn; the `await match` reply is consumed; an unsettled await (OK timeout / exit 124) is Err(unsettled), never settled.	1,2,7,8,11	3/3
+relay-read-only-connection	contract	RelayClient::{reads_only,may_send,request_line,request_frame}, is_read_request, READ_VERBS	A connection made reads_only() writes request line l iff is_read_request(l): the first word of l after its @-selectors ∈ READ_VERBS, and for `meta` no `set`/`unset` follows. Every other request line, and every length-framed write, returns Err(PermissionDenied) with nothing written. A connection never made reads_only writes every request.	1,8	1/1
 relay-framing-one-line	contract	RelayClient::{write_line,send,request_frame}	A line or head with CR/LF is InvalidInput with nothing written; otherwise exactly line+LF, or head SP len LF payload.	1,2,8,11	3/3
 relay-read-bounds	contract	RelayClient::{read_line,read_body_lines,request_bytes}	read_line enforces MAX_LINE_BYTES however reads chunk; read_body_lines checks the count and one aggregate allowance, consuming nothing past a failure; request_bytes reads exactly its count.	1,2,5,7,8	2/2
 reply-count-grammar	contract	reply_count, RelayClient::{request_counted,read_text}	Ok(Some(n)) for `OK n…` with n fitting usize, InvalidData for an overflowing digit token, Ok(None) otherwise; read_text refuses a header without a count.	1,3,5,7	2/2
-relay-reply-classification	contract	RelayClient::{read_reply,request_status,help_counted,relayed_to}, is_ok_reply, control_verbs::host_gone	A first line that is host_gone is UnexpectedEof naming the pid; otherwise verbatim. Success is exactly OK or OK SP …, including memoized help and the relay version probe; body lines are never classified.	1,3,12	2/2
+relay-reply-classification	contract	RelayClient::{read_reply,request_status,help_counted}, is_ok_reply, control_verbs::host_gone	A first line that is host_gone is UnexpectedEof naming the pid; otherwise verbatim. Success is exactly OK or OK SP …, including memoized help; body lines are never classified.	1,3,12	2/2
 ctl-failure-words	contract	failure_words, unsettled	failure_words is the trimmed stderr, else `aterm-ctl exited {code}[: stdout]`, never empty; unsettled names min(ms, cap) and which bound applied.	1,3	1/1
-queue-refines-wal-model	refinement	QueueState::apply, WalRecord::apply, commit_record, DurableQueue::*	Every API call either Errs leaving the projection unchanged or commits one record whose apply is a QueueModel step; apply refuses records whose precondition fails; one durable outcome per event; tokens authorise only their delivery.	1,2,3,7,10	8/8
-queue-enqueue-coalesce-capacity	contract	DurableQueue::{enqueue,manage_sid,unmanage_sid_at}, NewEvent::validate	Unmanaged ⇒ no record; same generation coalesces to the stronger condition (a strengthened delivery is requeued); new ids increase; QueueFull at capacity; evidence validated by SHA-256 and never persisted; unmanage resolves, frees capacity and forgets idempotency.	1,2,3,7,8,12	6/6
-queue-fair-claim-and-extension	contract	DurableQueue::{claim_at,extend_at,reclaim_expired_at}	Claims round-robin over sids, oldest first; extensions capped cumulatively; expiry requeues with a redelivery count, converting once to Escalation at the cap and InDoubt after; a new epoch counts each delivery once.	1,2,3,7	3/3
-queue-clock-monotone	contract	AuthorityClock::now_ms	now_ms = the running max of the source's samples.	2,3,13	1/1
-queue-recovery-is-replay	refinement	DurableQueue::open, recover_checkpoint, compact_live, decode_header, partial_header_plausible	open = fold apply over the newest valid checkpoint and later frames (covered frames skipped); only a torn final frame is repaired; other corruption fails closed; orphaned in-flight actions recover InDoubt; compaction bounds terminal history.	1,3,7,8	4/4
-queue-codec-round-trip	round-trip	encode_frame, decode_header, encode_checkpoint_payload, checkpoint decode, seal	Frames and checkpoints decode to what was encoded; unknown kinds refuse; a legacy v1 checkpoint decodes with gate Healthy, overridden by the marker.	1,3,7	3/3
-queue-fleet-fault-latch	contract	DurableQueue::{latch_fault_at,begin_fault_clear_at,complete_fault_clear_at,fleet_gate}, ensure_fault_marker, read_fault_marker, latch_fault_marker_without_live	The marker is written before the WAL and keeps the first reason (unreadable ⇒ DurabilityUncertain); it survives WAL failures; while faulted every work call refuses; a clear needs fresh baselines and no InDoubt, committing before removing the marker.	1,2,7,8,10	5/5
-queue-poison-fail-closed	invariant	DurableQueue::*, commit_record	After any commit I/O error every call returns WalPoisoned and commits nothing.	2,8,13	1/1
-queue-manage-with-baseline-atomic	contract	DurableQueue::manage_with_baseline, WalRecord::ManageWithBaseline	Admits the sid and enqueues the baseline in one record (only for Changed/ApprovalRequired/SessionExited): after any crash both or neither.	1,2,8	2/2
-queue-lock-and-epoch-fence	contract	DurableQueue::{open,open_next_epoch}, ProcessLock	A second open is LockContended; an older epoch is EpochRegression; dropping the last handle releases the lock despite descriptor copies.	8	2/2
-queue-fs-hardening	contract	DurableQueue::open, fleet_state_dir_in, ensure_fault_marker	dir 0700, files 0600, no symlinked dir; fleet_state_dir_in makes root/operator/profile 0700 and touches nothing on an unwritable root.	8	3/3
-queue-concurrency	invariant	DurableQueue::{clone,enqueue,latch_fault_marker_without_live}	Cloned handles are linearizable; the marker latch never takes the live mutex.	8,13	2/2
 answer-plan-contract	contract	answer::{plan,plan_by_role,option_named,names_no_option,policy_refusal}, QuestionPriority::parse, recommended_set, answer_question	A dialog read whole (Claude Code's): human ⇒ Human; recommended ⇒ the decider's keys; a single-select answer names one option by number or label, else Err; a multi-select toggles what differs then presses the button (refusing a dirty free-text row); review takes `submit`. A question read by its answers' roles (no dialog: Codex's) ⇒ plan_by_role: human ⇒ Human; no Answer-role option ⇒ Err; recommended ⇒ the decider's Digit(n, guard) or Err; `<n>` or an option's exact label (case folded) naming an Answer-role option ⇒ Digit(n, row_guard(the title row)); the last row (`None of the above`, Role::Other) ⇒ Err (a person's own words); a head off the rows read ⇒ Err; anything else ⇒ names_no_option's Err (a text priority's refusal names `meta set questions <word>`).	1,3,5,7,12	6/6
 answer-box-token	contract	question_box_token, role_box_token, prompt_box_token, token_of	question_box_token = 8 lowercase hex chars of a folded FNV-1a of (form, headers, question); role_box_token = the same over (title, description, option labels); prompt_box_token(p) = the dialog's question_box_token, else role_box_token for a Question with an Answer-role option, else None; deterministic in exactly those inputs (distinctness is not claimed).	1,3,7,12	2/2
 ledger-row-json	round-trip	approvals::{Row::to_json,json_str,cut,sha256_hex}	to_json is the fixed-key object; cmd_sha256 hashes the whole command; command cut on a char boundary to COMMAND_BYTES; fields parse back.	1,3,5,7,12	1/1
-ledger-readers-are-row-projections	contract	approvals::{typed_at,typed_at_rule,typed_texts,probe_owed,reset_owed}	Each reader is the stated projection of the session's rows; json_str escaping makes forged fields impossible for every row content.	1,3,5,7,8	5/5
+ledger-readers-are-row-projections	contract	approvals::{typed_at,typed_texts,probe_owed,reset_owed}	Each reader is the stated projection of the session's rows; json_str escaping makes forged fields impossible for every row content.	1,3,5,7,8	4/4
 ledger-paths-and-bound	contract	approvals::{ledger_under,path_under,journal_beside,bound}, Ledger::write	ledger_under = st/drive/<sanitised sid or self>.jsonl; journal_beside appends .journal.jsonl; bound keeps the last KEEP_ROWS past MAX_BYTES; write appends one line.	1,3,7,8	2/2
-blocks-partition	contract	blocks::{blocks,head_kind,claude_head_kind,is_tool_head,is_group_row,is_prose_row,gutter}, phase::is_tool_call, aterm_phase::codex::transcript_head	blocks(rows, program) partitions rows into contiguous blocks at heads read by program's grammar: Codex's (aterm_phase::codex::transcript_head: User/Said/Tool/Status/End as User/Message/Tool/Status/Done; an empty composer is Status; a card, boxed or the boxless session card's title over its folder, is Tool), any other program Claude Code's; prose continuations never start a block; every phase tool call is a Tool head (Claude Code's grammar).	1,3,5,7,12	3/4
-blocks-views	contract	blocks::{view_rows,without_gutter,trimmed,done_rows}, aterm_phase::codex::end_block_rows, report::Report::render_view	view_rows(rows, view, program): All = rows; Messages = user, message and done blocks with their gutter output dropped (`⎿`, rows indented ≥5 under it; Codex: `└`, rows indented ≥4) (a subsequence); a done block's rows are its done row, a Codex `■` block's rows up to end_block_rows (the first blank row, block or caret row, tip row or background-terminal line: the rows Codex's reader reads a wall from); Final = the last message block (head possibly scrolled off) and the first done block after it. render_view adds view= and kept= to the header and reads the rows by Report::program.	1,3,5,7	8/9
+blocks-partition	contract	blocks::{blocks,head_kind,is_tool_head,is_group_row,is_prose_row,GUTTER}, phase::is_tool_call	blocks(rows) partitions rows into contiguous blocks at heads read by Claude Code's grammar, for every program's report (aterm reads no Codex screen since its screen lane's retirement, 2026-10-16); prose continuations never start a block; every phase tool call is a Tool head.	1,3,5,7,12	3/4
+blocks-views	contract	blocks::{view_rows,without_gutter,trimmed}, report::Report::render_view	view_rows(rows, view): All = rows; Messages = user, message and done blocks with their gutter output dropped (`⎿`, rows indented ≥5 under it) (a subsequence); a done block's rows are its done row; Final = the last message block (head possibly scrolled off) and the first done block after it. render_view adds view= and kept= to the header.	1,3,5,7	8/9
 claim-verb-classes	contract	claim::{is_input,is_write,busy_holder}	is_input ⇔ the verb is key/send/turn/paste/feed-bin; is_write adds post and meta set/unset attention; busy_holder decodes supervisor=.	1,3,5	2/2
 classify-sound	refinement	classify_command, classify_command_with, and its scanners	read_only ⇒ under a Clean model of zsh/bash every program run is a read in ReadSet (or an allowed python3 script), no redirect writes, no assignment binds an evaluated parameter, no expansion evaluates unspelled text, nesting bounded.	1,3,5,7,10,14	40/40
 classify-precise-on-read-grammar	contract	classify_command, classify_command_with	Every line of the read grammar G (lists and compounds of ReadSet heads with literal words, operand-position expansions, read-only redirects and substitutions in G) is read_only: the classifier is not trivially false.	1,3,5,7,10,14	1/1
@@ -500,11 +470,6 @@ prelex	contract	prelex	Removes word-opening comments and quoted-heredoc bodies, 
 sed-script-and-alarm-idiom	contract	sed_script_writes, is_alarm_body, strip_alarm_idiom	sed_script_writes = None ⇔ the script parses fully with no w/W/e command or flag; is_alarm_body ⇔ `alarm N; exec @ARGV`; strip_alarm_idiom removes exactly that wrapper.	1,3,5,7	1/1
 numeric-format	contract	numeric_format	⇔ the \u/\U-decoded format has a numeric conversion or * width/precision; malformed escapes are conservatively numeric.	1,3,5,7	0/0
 zsh-hazard-tables	table-property	assignment_hazard, ZSH_RUNS_A_VALUE, ZSH_TIED, ZSH_ARITHMETIC_VARS, HAZARD_VARS	Every listed name assigned a path is a hazard; tied arrays are judged as their scalar (table membership against real zsh is a bench measurement).	1,3,5	0/0
-codex-read-limits	contract	codex_usage::{read_limits,LimitRead::near,rollout_rate_limits}	Unknown with no reading or a stale one; else Near{highest, latest reset of near windows} if a live window is ≥ NEAR_PERCENT, else Far; rollout_rate_limits = the last codex token_count reading.	1,3,5,7,12	1/1
-codex-sandbox-fall	contract	codex_usage::{launch_bypasses,sandbox_fell,same_dir,rollout_turn_context}	launch_bypasses by its flag spellings; sandbox_fell = the newest same-directory turn's sandbox when every such turn runs sandboxed under a bypassed launch.	1,3,5,7	1/1
-codex-own-thread	contract	codex_usage::{own_thread,codex_home,model_since}	own_thread = the one held writer lock under the canonical home, else the resume argument; codex_home refuses a relative CODEX_HOME; model_since keeps a model only for a turn since the switch opened.	1,3,5,8	3/3
-codex-look	contract	codex_usage::{look,look_within,last_turn_context,tail_of,rollouts_by_write}	Limits from the newest rollouts; a held thread's own rollout alone decides sandbox and model (read backward across chunks); otherwise recent rollouts; a context past reach decides nothing.	1,3,7,8	3/3
-bounded-child-output	contract	codex_usage::output_within	Some((success,stdout)) if the child exits within the bound, else its group is killed and None within bound + ε.	8,13	1/1
 config-power-lattice	invariant	SupervisorConfig::{default,limit,limits,set,default_shown}, KEYS	≤ is a partial order with default on top (except opt-in keys at bottom); limit(default,k) ≤ default and changes only k; enabling is visible; default_shown is None only for rules_file and non-keys.	1,2,3,5	2/2
 config-reader-never-grants	contract	SupervisorConfig::{from_aterm_toml,set}	from_aterm_toml(text) ≤ default except the root-table opt-ins; an unreadable value keeps the default with one note; any off spelling is the limit; unknown keys change nothing; answer_questions=false wins in either order.	1,2,3,5,7,12	10/10
 config-misplaced-only-limits	contract	SupervisorConfig::from_aterm_toml (misplaced pass)	Result = root reading ⊓ the limits of every misplaced harness.<k> (grants contribute ⊤), independent of order, each noted with its path.	1,2,3,5,7,12	2/2
@@ -525,7 +490,7 @@ ledger-clock-words	contract	span, stamp, zone	span in s / m ss / h mm; stamp in 
 ledger-render-escapes	contract	render_md, render (Html)	Markdown escapes | in cells; HTML is one self-contained, well-formed page with worker text escaped and `</script>` only where it belongs.	1,3,5,7	2/2
 limit-zone-and-reset-grammar	contract	limit::{parse_zone,parse_reset,parse_clock,resumes_by_itself,one_line}	parse_zone = ±HHMM seconds; parse_reset accepts the span, clock and date shapes with zones and refuses out-of-range parts; resumes_by_itself by its phrases; one_line joins words.	1,3,5,7	8/8
 limit-reset-placement	refinement	limit::{reset_at,civil,days_from_civil}	reset_at equals the reference placement (spans from now, dated in the nearest year, bare clocks today unless passed beyond SAME_DAY); civil and days_from_civil are inverse bijections.	1,3,5,7,13	3/3
-limit-wall-placement	contract	limit::{reset_in_zone,reset_at_with,place_reset,place_reset_with,within_a_session_window,offset_at,zone_offset_s}, Session::{reset_unix_for,reset_unix}	reset_in_zone finds the wall-clock instant after now in that zone's offset at that instant (DST-correct); place_reset puts a weekly/spend wall's bare clock after its print, a session wall's within 5 h of the print, else the session rule; an undated cancelled limit is clamped to a session window; zone lookups refuse non-zone names.	1,3,5,7,8,13	7/7
+limit-wall-placement	contract	limit::{reset_in_zone,reset_at_with,place_reset,place_reset_with,within_a_session_window,offset_at,zone_offset_at}, Session::{reset_unix_for,reset_unix}	reset_in_zone finds the wall-clock instant after now in that zone's offset at that instant (DST-correct); place_reset puts a weekly/spend wall's bare clock after its print, a session wall's within 5 h of the print, else the session rule; an undated cancelled limit is clamped to a session window; zone lookups refuse non-zone names.	1,3,5,7,8,13	7/7
 mail-row-and-principal	round-trip	mail::{MailRow::parse,line,is_report_from,is_from_session,newest_id,body_rows}	parse reads exactly the msg row grammar; line prints the MAIL line; is_from_session matches whole principals; body_rows skips the report stamp line.	1,3,5,7	2/2
 mail-task-protocol	refinement	mail::{task_with_clock,composer_guard,worker_phase,secs}	Baseline before the post; exactly one post (never re-posted); a guarded nudge only to an idle worker; the wait accepts only the worker's reply to the offset with a monotone watermark rebased after handoffs; total timeouts = the bound; outages ridden out; escaped output.	1,2,4,7,10,13	13/13
 mail-lane-exactly-once	refinement	mail lane (first delivery / resync)	Across handoffs every worker report is delivered exactly once by its bus offset, re-armed from the successor's newest id.	1,2,7,10,13	4/4
@@ -533,24 +498,24 @@ memory-ceiling-formula	contract	memory::MemoryCeiling::ceiling_mib	Off ⇒ None;
 memory-judgement	contract	memory::{AgentMemory::strain,dominant,judge,MemoryOver::acts,episode_over,MemoryOver::verdict}	strain at Critical or Warn-with-swap; dominant = largest and ≥ 1/5 of use; judge Some iff past the ceiling; acts ⇔ strain ∧ dominant; the episode ends an eighth under; verdict depends only on (strain, dominant, restarts).	1,2,3,4	5/5
 memory-ceiling-order	contract	memory::MemoryCeiling::no_more_than	A partial order with Off at the bottom, higher Gib limiting, Auto incomparable to Gib.	1,3	1/1
 memory-fact-banner	contract	memory::{MemoryOver::fact,warning,gb}, aterm_phase::memory_banner_head	fact survives memory_banner_head unchanged; gb has one decimal; the warning's last clause depends only on the verdict.	1,3,12	1/1
-approval-never-spends	invariant	policy::approval::{decide,never_spends,kept_or_bought,buys,spends,confirms_reset,keeps_reset,allow_once}	No decision presses an option that buys or spends, except the limit-reset grant row under its own key; a reset confirmation is never answered yes; a Codex `Continue with` is no consent.	1,3,4,5,7,12	4/4
-approval-one-shot-only	invariant	policy::approval::{decide,once_choice,Role,decide_box}	Every press is the one-shot allow, the specific option a named rule picks, or a decline's No; never a standing grant; a grant-only box is declined; a role-less box escalates.	1,3,5,7,12	10/10
+approval-never-spends	invariant	policy::approval::{decide,never_spends,kept_or_bought,buys,spends,confirms_reset,keeps_reset,allow_once}	No decision presses an option that buys or spends, except the limit-reset grant row under its own key; a reset confirmation is never answered yes; a Codex `Continue with` is no consent.	1,3,4,5,7,12	4/5
+approval-one-shot-only	invariant	policy::approval::{decide,once_choice,Role,decide_box,kept_or_bought,kept_for_good}	Every press is the one-shot allow, the specific option a named rule picks, or a decline's No; never a standing grant (an option kept for good by its role, Persist, or its label, settles_later or a whole-label kept_answer - every option of an MCP server dialog, and under any title, its roles read or withheld, the one-server dialog's three answers, the several-server dialog's `Enable selected` and the Chrome setup's `Continue with browser tools` - is refused by the press gate whatever rule picked it); a grant-only box is declined; a role-less box escalates. The standing answers given are the folder-trust dialog's and the autocompact offer's (its own rule, by the owner's direction).	1,3,5,7,12	12/14
 approval-level-monotone	contract	policy::approval::{decide,decide_safe,decide_box,rm_breaker_warn}	None escalates every permission box; whatever Safe approves All presses the same way (unproven presses marked); Safe approves an unproven rm breaker with a warning unless rm_breaker_ask; non-default shells and remote boxes are never proven.	1,2,3,4,5,12	8/8
 approval-safe-bash-sound	contract	policy::approval::{bash,read_only_every_reading,plain_under_zsh,shell_models_hold,git_reads_clear}, classify_command_with	Safe approves a Bash box only out of bypass, with no vendor note, local, default shell, every reading read-only, plain under zsh, and every git read clear.	1,3,4,5,7,12	9/9
 approval-rm-breaker-sound	contract	rm_breaker::resolve, resolvable_breaker, classify_except_rm, is_mktemp_guard, decide (rm arm)	RULE_RM_BREAKER approves only in bypass with cwd known and scratch roots, every operand resolving (through links) strictly inside a scratch root or a guarded mktemp dir, the rest of the line read-only, and no rebinding hazard; anything else escalates under Safe.	1,3,4,5,7,8,10	8/8
 approval-read-rule	contract	policy::approval::{read_box,read_readings,default_secrets,vendor_distrusts,forced_read}	A Read box is approved iff it offers its folder grant and every reading (as written and canonical) is under a read root and no secret rule.	1,3,5,7,8	3/3
-approval-trust-dialog	contract	decide (trust arm), RULE_TRUST_DIALOG, RULE_TRUST_ANY	Safe trusts only Claude's dialog or Codex's folder-trust gate, for the session's own folder under a trust root (none by default), its options exactly an exit and a trust; full power trusts any folder, unproven.	1,3,4,12	4/4
+approval-trust-dialog	contract	decide (trust arm), RULE_TRUST_DIALOG, RULE_TRUST_ANY	Safe trusts only Claude's dialog (aterm answers no Codex box), for the session's own folder under a trust root (none by default), its options exactly an exit and a trust; full power trusts any folder, unproven.	1,3,4,12	4/5
 approval-roots	contract	roots_from_config, own_claude_tmp, ScratchRoot::{holds,label}, ApprovalCtx::new, abs_components	roots_from_config expands ~ and a final-component glob, maps claude-* to this uid's own, drops unsafe specs; holds = component prefix; ApprovalCtx::new builds the default roots.	1,3,5,7	3/3
 approval-whole-read	invariant	head_unread, tall_box, quoted_invocation, decide	A box not read whole is never pressed, except the tall-box decline for a single quoted removal in bypass; quoted_invocation needs exactly one backtick pair.	1,3,4,5,12	6/6
-approval-not-a-box	invariant	decide_screen, draws_claude_boxes, draws_codex_dialogs, aterm_phase::read	Only a box the program's reader vouches for as a live prompt is judged; quoted, goal-text, pager-shown or footerless setup boxes press nothing; Safe judges only Claude's boxes and Codex's folder-trust gate.	1,3,4,12	6/6
+approval-not-a-box	invariant	decide_screen, draws_claude_boxes, aterm_phase::read	Only a box the program's reader vouches for as a live prompt is judged; quoted, goal-text, pager-shown or footerless setup boxes press nothing; Safe judges only Claude's boxes; no Codex box is judged.	1,3,4,12	6/6
 approval-owner-review-held	invariant	settings_ask, unvoiced_tools, forced_read, decide	Every level escalates a box the owner's ask rule or hook reaches (by any tool that can draw it), unreadable settings, or a Read box with no folder grant.	1,3,5,7,8,12	6/6
 approval-guarded-press	invariant	decide, row_of, file_path_row, focus_steps, decline_step	Every press carries a guard matching exactly one row of its screen; focus presses move then Enter after a confirming read; each decline state gets one guarded keystroke.	1,3,5,7,12	2/2
 approval-amend-input	contract	amend_input_open, offers_amend, refusal_of, decline	No digit into an open amend input (escalate); fixed refusal labels are no input; decline only with `Tab to amend` and sound options and an empty input.	1,3,5,12	3/3
 approval-decline-text	contract	decline_text, squashed	DECLINE_PREFIX + what + ` was not run: ` + cut160(squashed(why)) + `. ` + fix + `.`: no control char, fix never cut.	1,3,7	1/1
 approval-command-readings	contract	command_readings, box_width, wrap_margin, cells_are_chars, no_option_above_the_question, PromptV2::readings	Every possible joining of the command rows is judged; a row with room left cannot have wrapped; non-ASCII rows are never measured; barred descriptions and wrapped titles/footers are read whole.	1,3,5,7,12	8/8
 approval-limit-dialog	contract	decide (limit arm), RULE_LIMIT_WAIT, RULE_LIMIT_RESET	The usage-limit dialog takes the grant row (limit_reset on) or else the wait row by its label at every level; with neither it escalates; stop/spend/upgrade rows never chosen.	1,3,5,12	4/4
-approval-dialog-rules	contract	decide (plan, question, consent, setup, session-paused, model-confirm, model-picker, goal-resume, codex arms)	Each dialog is decided only by its own rule (least-power plan yes, questions by answer_questions, fallback switch, model confirms with the standard subtitle, Codex picker only for an owed restore, goal resume only when owed); Safe and None hand them over.	1,3,4,5,12	7/7
-approval-rate-nudge	contract	decide (codex rate nudge arm)	At full power with rate_nudge, `Switch to` iff near the limit, the model read, no switch open and a different model offered; else `Keep current model`; never the never-show-again row.	1,3,4,12	2/2
+approval-autocompact-offer	contract	decide (autocompact arm), autocompact_offer, RULE_AUTOCOMPACT_OFFER	Claude Code's autocompact offer, read whole by an authoritative Claude reader, is decided first at every level: with autocompact_offer = Some(k) on the ladder, Focus onto the accept row (Enter) iff its size = k, else FocusKey one stepper key toward k; never the keep row, Esc or a printable key; off, unread or off-ladder escalates.	1,3,5,12	3/3
+approval-dialog-rules	contract	decide (plan, question, consent, setup, session-paused, model-confirm, model-picker, goal-resume, mcp-server, codex arms), consents, mcp_server_held	Each dialog is decided only by its own rule (least-power plan yes, questions by answer_questions, fallback switch, model confirms with the standard subtitle, Codex picker only for an owed restore, goal resume only when owed); a consent is `Continue with` as a whole word and never an answer kept for good, and `Continue without …` is a refusal (a setup dialog's decline@v1), never a consent: the Chrome setup panel is declined with `Continue without browser tools` in every phase, its connected phase's `Continue with browser tools` (kept for good) never taken; Claude Code's MCP server dialog is escalated at every level (none, safe, all, bypass) with the reason that every answer, Esc included, is saved for good in the project's .claude/settings.local.json and that `claude mcp reset-project-choices` undoes it, both kept in the loop's badge at none, safe and all, and nothing is pressed; Safe and None hand them over.	1,3,4,5,12	12/12
 approval-footer-mode	table-property	footer_mode	The footer's pill names its mode (manual by default); None when the box replaced the footer.	1,3,5	1/1
 approval-breaker-naming	contract	rm_breaker_label, name_the_breaker	name_the_breaker puts the breaker's distinct label once at the head (idempotent).	1,3	1/1
 approval-git-read	contract	git_reads_clear, worker_writes, git_config::*, claude_settings env reader	Safe approves a git read only where the config git would load in the worker's environment, for every Bash-tool directory, runs no program, with no -c or remote, a readable environment and a git not in a worker-written directory.	1,3,5,7,8	5/5
@@ -559,15 +524,15 @@ report-parse-history	contract	report::{parse_history,parse_turn_line,newest_turn
 report-parse-offscreen	contract	report::{parse_offscreen,header}	The header comes from stderr's OK line (aterm ctl framing) else stdout's first line; the payload count must match; screen_rows splits archived from screen; fields default as stated; both framings parse equal.	1,3,5,7,13	3/3
 report-join	contract	report::join, ScreenReader::transcript_end	join(off, reader) = archived rows ++ the screen's rows to reader.transcript_end (Claude Code's: phase::transcript_end; the ledger joins by Claude Code's) not re-shown from the archive (a re-shown row the read missed is kept), with archived/first/upto.	1,3,5,7,12,13	3/3
 transcript-end-positional	contract	aterm_phase::phase::transcript_end	The index of a busy status row, else just past the last transcript row above an idle composer (skipping hints, tips, surveys and blanks; code and done rows are transcript), else past the last non-blank row; never inside the composer.	1,3,5,7,12	5/5
-report-find-start	contract	report::{find_start,is_user_row,user_text,paste_like,paste_fits}	is_user_row ⇔ `❯` + whitespace; find_start(rows, marker, text, caret) reads user rows as `caret` + whitespace (`❯`; a Codex worker's `›`), never Codex's empty composer (`› Ask Codex to do anything`, aterm_phase::codex::is_empty_composer); Since ⇒ 0; UserRow ⇒ the last user row; Ledger ⇒ the last user row matching the first MARKER_CHARS of the text, else for a paste the last `[Pasted text` row only if paste_fits.	1,3,5,7	5/5
-report-finish-assess	contract	report::{finish,assess,screen_only,unsearched,search_screen_first}	finish(program, …) trims blank ends, splits archived/screen and records the grammar the rows are read back in (the archive path's archive_reader program, the main-screen path's reader's, Program::Claude for the screen-only path); assess yields the reason set (NoArchive, MainScreen, ArchiveReset, ArchiveGap, MaxRows, MarkerNotFound) and a recheck index exactly as stated; unsearched(search reply) = Older for the depth cap alone (a bare ` incomplete` under 100000, ` older` alone, aterm-ctl's SEARCH_DEPTH_NOTE; a client's parenthesised note after the causes, ` (search: no results)`, and the header's `screen_first=` are no cause), Anywhere for any other cause, note or qualifier (capped, changed, rewrapping, long-line, a bare ` incomplete` at 100000, one this reader does not know), else Nothing; search_screen_first(reply) = the header's one well-formed `screen_first=<row>` (stderr's `aterm-ctl: OK …`, or a raw client's first stdout line), else None; main-screen searches that may omit newer hits add SearchIncomplete; complete ⇔ no reasons.	1,3,5,7	4/6
-report-render	contract	report::Report::{header,render,render_view}, Marker::name, Reason::name	header and render have the fixed shapes (reasons in Reason order, search-incomplete among them); render_view(All) = render(); other views add view= and kept= and render view_rows(rows, view, program).	1,3,5,7	0/3
-report-gather-protocol	refinement	report::Session::{report,gather_report,archive_reader,main_screen_reader,main_screen_report,main_tail,main_bottom,caret_rows,main_block,main_row,ledger_turn,offscreen_snapshot,gap_after,full_screen}, report::{drop_pinned_prompt,search_screen_first,MainSearch}, without_verb, ScreenReader::transcript_end	Requests history 8 (unless since), then offscreen since=/tail=. A worker off the alternate screen (or on a host without offscreen) whose program is Codex (named_reader: `status` once) gets main_screen_report: the screen's report, complete, when the start is on it; else `search ^› regex` (Unavailable ⇒ main-screen,marker-not-found; a reply whose header carries no one well-formed screen_first — an older host or client — ⇒ the screen alone, search-incomplete,marker-not-found, before any `line`; with no ledger turn's text, a search that may have left out rows anywhere cannot name the newest user row ⇒ the same) and `line` reads of each user row above the screen — the hits below screen_first, placed by that coordinate and never by a count of the screen's physical caret rows — newest first, as far as the match needs, then `line` down to Past, max_rows bounding the reads; spent before the bottom, main_bottom finds the screen's last row by doubling then halving `line` probes and main_tail keeps the rows read and the screen's (max-rows only when rows lie between); the live zone is cut by reader.transcript_end; SearchIncomplete when the search left out rows that could hold the start (unsearched: Older or Anywhere with the start not found, Anywhere with it found); these `line` reads each sample the live terminal separately, so complete=1 establishes no atomic multi-row snapshot; an evicted row is ArchiveGap. An archive read (the alternate screen) is read by archive_reader's grammar — Codex's when the session's reads, the screen (identify) or, for a screen naming no program, `status` name Codex (0.163.0 runs on the alternate screen by default); Claude Code's otherwise — its caret, its transcript_end in join, and its program for the views; for Codex, screen row 0 kept at the join's seam leaves the join when it is a user row whose text is the newest archived user row's (drop_pinned_prompt: the prompt 0.163.0 pins over a reply whose own row scrolled into the archive). Otherwise an old host falls back to one text read; a one-row gap recheck only when assess asks; the result is finish(join, find_start, assess ∪ gap); any unserved verb is Err naming it.	1,2,4,8,11	10/11
+report-find-start	contract	report::{find_start,is_user_row,user_text,paste_like,paste_fits}	is_user_row ⇔ `❯` + whitespace; find_start(rows, marker, text, caret) reads user rows as `caret` + whitespace (`❯`); Since ⇒ 0; UserRow ⇒ the last user row; Ledger ⇒ the last user row matching the first MARKER_CHARS of the text, else for a paste the last `[Pasted text` row only if paste_fits.	1,3,5,7	5/5
+report-finish-assess	contract	report::{finish,assess,screen_only}	finish(…) trims blank ends and splits archived/screen; assess yields the reason set (NoArchive, MainScreen, ArchiveReset, ArchiveGap, MaxRows, MarkerNotFound) and a recheck index exactly as stated; complete ⇔ no reasons.	1,3,5,7	4/6
+report-render	contract	report::Report::{header,render,render_view}, Marker::name, Reason::name	header and render have the fixed shapes (reasons in Reason order); render_view(All) = render(); other views add view= and kept= and render view_rows(rows, view).	1,3,5,7	0/3
+report-gather-protocol	refinement	report::Session::{report,gather_report,ledger_turn,offscreen_snapshot,gap_after,full_screen}, without_verb, ScreenReader::transcript_end	Requests history 8 (unless since), then offscreen since=/tail=. An archive read is joined by Claude Code's grammar for every program (its caret and its transcript_end; aterm reads no Codex screen since its screen lane's retirement, 2026-10-16: the Codex main-screen report, the pinned-prompt drop and the missing-reply-head reason went with it); a worker off the alternate screen is MainScreen. Otherwise an old host falls back to one text read; a one-row gap recheck only when assess asks.	1,2,4,8,11	10/11
 reset-step-refines-model	refinement	reset_loop::Session::{reset_take,reset_run,reset_confirmation,reset_end,reset_take_up,reset_passed,reset_gate}	For every composed reset world and key setting the run refines supervisor_limit_reset_model (reset_violations = []); typing the reset command is never enabled; every named mutant is refused.	1,2,3,4,7,8,10,11,13	3/3
-reset-keys-safety	invariant	reset_loop::Session::{reset_take,reset_run,reset_confirmation}, policy::reset::confirm_verdict, row_guard	No send or turn; only arrows/Enter on the dialog, Enter on the confirmation, Esc on the confirmation or Checking; every key fenced on the judged read; the confirmation's Enter only on the go, the settle and no person, at most RESET_ENTERS; no Enter after an Esc; skipped keys re-judged.	1,2,5,7,8,10,11	13/13
+reset-keys-safety	invariant	reset_loop::Session::{reset_take,reset_run,reset_confirmation,reset_shows}, policy::reset::confirm_verdict, policy::approval::kept_for_good, row_guard	No send or turn; only arrows/Enter on the dialog, Enter on the confirmation, Esc on the confirmation or Checking, never on a box that keeps nothing of the confirmation and offers an answer kept for good by its role (Persist) or its label (settles_later, kept_answer), nor on one whose head is off the screen with no Esc read (an MCP server dialog: read as one, every answer Persist; retitled, cut or read mid-move with its roles withheld, by its kept answers' labels, the one-server dialog's three and the several-server dialog's `Enable selected`; drawn only down to its server rows, by its unread head and Esc); every key fenced on the judged read; the confirmation's Enter only on the go, the settle and no person, at most RESET_ENTERS; no Enter after an Esc; skipped keys re-judged.	1,2,5,7,8,10,11	14/14
 reset-host-dialogue	contract	reset_loop::Session::{reset_take,reset_end}, IdleHost::{reset_take,reset_told,inform}	The host's reset_take is asked once per mount and again before the Enter (not while held); Again repeats up to RESET_AGAIN_MAX; each taken step is told its end exactly once; inform at most once; no badge.	1,2,4,7,8,10,11,13	11/11
 reset-books	contract	reset_loop::Session::{reset_take,reset_confirmation,reset_end}, approvals::Row::to_json	A step writes approved (taken), at most one yes or declined row, then exactly one ended row; journal RESET lines per stage; a told end with no turn running owes exactly one continuation.	1,2,8,10,11	7/7
-reset-successor-escape-only	invariant	reset_loop::Session::{reset_take_up,reset_run,reset_end}, approvals::reset_owed	With an open reset row and no go, every box met gets only Escapes after one person's grace, never an Enter or a reset_take; key off or stale ⇒ nothing asked or continued; an attended loop never takes a step up.	1,2,5,8,10,11	9/9
+reset-successor-escape-only	invariant	reset_loop::Session::{reset_take_up,reset_run,reset_end}, approvals::reset_owed	With an open reset row and no go, every box the step takes (reset_shows: never one with nothing of the confirmation and an answer kept for good, or its head off the screen and no Esc read) gets only Escapes after one person's grace, never an Enter or a reset_take, and any other box is the approval policy's; key off or stale ⇒ nothing asked or continued; an attended loop never takes a step up.	1,2,5,8,10,11	9/9
 reset-gates-equivalence	equivalence	reset_loop::Session::{reset_gate,reset_passed}, policy::approval::decide	With any gate shut the requests equal those of a loop without the reset rule (one SKIPPED line); every gate open gives the same three keys at every level; the grant row's approval is ledgered under its own label.	1,2,5,8,10,11	3/3
 reset-place	contract	reset_loop::Session::{reset_place,reset_day_start}, limit::{parse_reset,reset_at_with,days_from_civil}	reset_place is defined only for a dated clock and places it in the year nearest the named year (or now), in the held notice's zone or by the local offset at that instant.	1,2,3,5,7,13	1/1
 box-key-normal-form	contract	run::{point_key,box_key,before_the_echo,file_request_key}, approval_loop::box_rows	box_key is kind, form, option numbers, normalised box text and the letters above the echo; redraws, rewraps, focus moves and countdowns do not change it; another command, diff, title or target does.	1,3,5,7,11,12	2/2
@@ -578,7 +543,7 @@ question-text-safety	invariant	Session::press_text, question memory, approval_lo
 question-priority-resolution	contract	policy::question (effective priority, falls_back), Session::{question_word,press_text}	The session word overrides the global priority; unknown words hand over; a word changed after the first key hands over; under a text priority unfenceable hosts, previews and tabs too short fall back to the recommended option (latched).	1,2,3,5,8,10,11	10/10
 told-choice	contract	Session::{tell_choice,supervise_to,run_hosted}	CHOSE and its journal, notes and story lines go together exactly once iff the loop's policy keyed every answer with no person after its first key and no hold, at the first busy read after the last key (or the settled composer), before a stop.	1,2,5,8,10,11	5/5
 question-answer-refines-model	refinement	Session::{supervise_to,press_question}, policy::question::{answer_question,target_focus}, approval_loop::reask_pause	Under recommended every key refines supervisor_question_answer_model: fenced, guarded arrows seen landing, then Enter; never a digit or send; persons waited out without escalation; unfenced hosts hand over; untaken keys retried once (back-off unattended); third returns wait reask_pause; drafts untouched.	1,2,4,7,8,10,11,12	22/22
-controller-answer	contract	Session::{answer,answer_digit,program_reader,press_one_guarded}, policy::question::target_focus, run::Fence	The question is read by the worker's own program's reader (program_reader). On a dialog read whole (Claude Code's), `answer t` moves the focus by guarded, fenced arrows to t's option and presses Enter; never a digit or over a person's text; recommended on a multi-select ticks then Next. On a question read by its answers' roles (Codex's), one digit under the title row's guard, fenced on the screen generation and never without it (press_one_guarded with Fence::Required: no `key if=`, no `if-gen=` in `help key`, no generation on the read, or the fenced key turned away by a usage line or a bare ERR ⇒ NOT-SERVED with nothing typed), never the last row's digit; a person within the grace ⇒ LEFT. Refusals before any key; human types nothing; another box token ⇒ REFUSED.	1,2,4,7,8,11	6/6
+controller-answer	contract	Session::{answer,answer_digit,answer_focus,program_reader,press_one_guarded}, policy::question::target_focus, run::Fence	The question is read by the worker's own program's reader (program_reader). On a dialog read whole (Claude Code's), `answer t` moves the focus by guarded, fenced arrows to t's option and presses Enter; never a digit or over a person's text; recommended on a multi-select ticks then Next. On a question read by its answers' roles (Codex's), one digit under the title row's guard, fenced on the screen generation and never without it (press_one_guarded with Fence::Required: no `key if=`, no `if-gen=` in `help key`, no generation on the read, or the fenced key turned away by a usage line or a bare ERR ⇒ NOT-SERVED with nothing typed), never the last row's digit; a person within the grace ⇒ LEFT. Muse Code’s role-read single-select question uses guarded cursor moves, each seen landing, then Enter on the selected answer’s own row; every key requires the screen-generation fence and the initial read’s person-count fence, retained across generation retries. A missing initial person count or any read’s Unknown quiet stamp ⇒ NOT-SERVED before that attempt writes a key; Never or Ago at least the grace permits the attempt. A skipped generation replans the same question token at most three attempts (each may send several arrows before Enter). Admission refusals precede input; a later refusal may follow focus moves; human types nothing; another box token ⇒ REFUSED.	1,2,4,7,8,11	8/8
 press-fence-and-guard	invariant	Session::press_one_guarded, run::Fence, policy::row_guard, aterm_observe::row_matcher	A guarded digit uses `key [if-gen] if=row_guard(row) k` with the gen fence learned once per session. Fence::WhereKnown (the window's own box press) retains the legacy downgrade after unknown syntax (the row guard alone, then the confirmed fallback, never unguarded while the survey is open); Fence::Required presses nothing without the fence: no `key if=`, no `if-gen=`, no generation on the read, or the fenced key turned away (a usage line, a bare ERR) ⇒ Unconfirmed, no retry, the fence never dropped. Changed skips re-decide (handing over after 5); a person's skip yields.	1,2,5,7,8,11,12	3/3
 hold-and-refusal-parking	contract	Session::{press,park_on_hold,box_back_off}	ERR halted parks on status/inbox holds until hold=0 then re-decides from a fresh read; busy and rate refusals back off; none ends the loop or escalates.	1,2,7,8,11	3/3
 loop-applies-decision	refinement	Session::{supervise_to,approval_ctx}, policy::approval::decide, config::from_aterm_toml, footer_mode, ApprovalCtx::set_trust_roots	For each settled box the loop builds ApprovalCtx from the config, cwd (OSC7 else agent_cwd) and footer mode, and writes exactly decide's keys (APPROVED) or escalates with its reason.	1,2,4,8,9,10,11	12/12
@@ -591,20 +556,21 @@ attention-ownership	invariant	Session::{reconcile_attention,escalate,clear_atten
 survey-press-refines-model	refinement	Session::{dismiss_survey,survey_press,survey_backspace}	Every 0 and backspace is enabled in supervisor_survey_press_model at the server's state (survey_press_violations = []): no press before the settle, under a hand, over a draft or box; backspace only past landing; each mutant forbidden.	1,2,7,8,10,11,13	9/9
 focus-choice-refines-model	refinement	Session::{press_focused,supervise_to}	Focus choices refine supervisor_focus_choice_model (NeverEnterOffTheChosenOption): fenced arrows, re-read, Enter only on a confirmed focus; never a digit or Esc on the trust dialog.	1,2,7,8,10,11	4/4
 limit-dialog-wait-row	contract	policy::approval::decide (limit-wait@v1), Session::press_focused	Under limit_wait the usage-limit dialog's wait row is chosen by a confirmed focus move and fenced Enter at any level; without one it escalates.	1,2,4,8,10,11	4/4
+autocompact-offer-loop	contract	policy::approval::decide (autocompact-offer@v1), Session::{auto_read,box_young,press_focused}	The offer is judged only after it has shown max(box_settle, AUTOCOMPACT_SETTLE); every arrow, step and Enter is Fenced(w, J) with if-human=n(J); Enter only on a fresh read showing the focus on the accept row at the target size; ERR halted parks; approve=none does not withhold it; autocompact_offer off badges it under its kind with nothing pressed.	1,2,4,8,10,11	4/4
 tail-reread-equivalence	equivalence	Session::screen, run::{tail_misses_the_live_rows,drawn_above_tail}	Decisions on `text --json tail=40` equal those on the whole screen cut to its live zone for every cut and cursor; a box cut by the pane itself is never pressed.	1,2,5,7,8,10,11,12	9/9
 press-landing-and-retry	contract	Session::{press,box_back_off}, ladder::doubling	A press has landed iff a later read shows the box gone or the worker busy; unattended full power re-presses on the doubling back-off (badged once); Safe hands over after one; default-No ticking boxes get one fenced Enter; full power has no repeat cap.	1,2,7,8,10,11	5/5
 reader-by-program	contract	Session::{program,reader}, aterm_phase::identify	The box is read by the program status names (else identify); a non-agent never gets a press.	1,8,11,12	2/2
 claim-refines-model	refinement	Session::{claim,renew_claim,release_claim}, SuperviseOpts::yield_when_held	Unattended loops refine supervisor_claim_model (NoPressUnderAnothersClaim): a renewed lease before every press, watching only behind another's claim, the hosted loop yielding, a claimless host supervised as before.	1,2,7,8,10,11	5/5
 decline-keys-refines-model	refinement	Session::press_decline, policy::decline_text, decline_box, PromptV2::foot_note	press_decline writes down, tab, the reason, enter, one fenced guarded key per fresh read, refining supervisor_decline_keys_model; stale, unconfirmed, swapped or person-held boxes stop it as stated; nothing is resent.	1,2,7,8,10,11	12/12
 host-turn-end-protocol	refinement	Session::host_step, IdleHost::{at_idle,turn_ran,usage_tap,taskless}, HostStep::{typed,repeat}, TurnEndState	Continuations refine supervisor_host_turn_end_model: a released turn end is continued once; the host's step is taken in place; turn_ran only after a busy read; a host-typed turn is not the worker's; taskless sessions get nothing; limit episodes are told.	1,2,4,8,10,11,13	10/10
-idle-point-classification	contract	Session::idle_point, IdleHost::{at_background,withheld}, codex::END_ROW_MARKS, run::background_settle	An idle point is a composer up with no wall and none of the listed exclusions (login reply, background break before its settle, half-drawn REPLs); withheld points are said once by guard; relaunched Codex end rows are idle; breaks after own acts follow supervisor_break_offer_model.	1,2,5,8,10,11,12	5/5
-limit-notice-reset-placement	contract	IdleHost::limit_until, Session::reset_unix_for, upgrade_drive::codex_wall_reset, limit::{parse_reset,reset_at_with}	A limit notice is an idle point once reset + grace passes (episode or transcript reset); a no-reset limit is never spent by an earlier notice; bare clocks are placed on the transcript's or done row's day; Codex resets in the printing process's zone.	1,2,3,5,8,11	4/4
+idle-point-classification	contract	Session::idle_point, IdleHost::{at_background,withheld}, run::background_settle	An idle point is a composer up with no wall and none of the listed exclusions (login reply, background break before its settle, half-drawn REPLs); withheld points are said once by guard; breaks after own acts follow supervisor_break_offer_model.	1,2,5,8,10,11,12	5/5
+limit-notice-reset-placement	contract	IdleHost::limit_until, Session::reset_unix_for, limit::{parse_reset,reset_at_with}	A limit notice is an idle point once reset + grace passes (episode or transcript reset); a no-reset limit is never spent by an earlier notice; bare clocks are placed on the transcript's or done row's day.	1,2,3,5,8,11	4/4
 exception-lifecycle	contract	Session::exception, IdleHost::exception	A no-reset spend limit is journaled once as an exception and told once; cleared at the first live turn (background work alone does not); `later` raises nothing.	1,2,8,11	2/2
 memory-ceiling-decision	table-property	Session::memory_point, IdleHost::{restart,warn}	The memory action is a total function of (footprint vs ceiling, Mac state, largest, host answer, banner): restart, warning once, escalation or continue; a change of state decides the standing point again; refused restarts keep the person's row until a later adopted one.	1,2,4,8,10,11	11/11
 model-bucket-and-fallback-timing	contract	Session::model_bucket, IdleHost::relaunch, TurnEndTiming::{restart_backoff,reset_jitter}	Bucket fallbacks and returns are host relaunches (never /model) with the decision's verdict kept; a deferred fallback is retried on the last backoff or at the reset + grace + jitter, the continuation first; a deferred return never holds the point; a successor waits out its predecessor's back-off.	1,2,4,7,8,11	8/8
 usage-probe-refines-model	refinement	turn_end_loop::Session::{usage_probe,probe_gate}	Every /usage, Escape and sample is enabled in supervisor_usage_probe_model (usage_probe_violations = []), each mutant caught; the gate reads the point as decided.	1,2,7,8,10,11	2/2
 human-input-stamp	contract	screen::HumanInput::{of_status,within,ago,quiet_since}	of_status reads human_ms= on the first OK line: `-` Never, a u64 Ago, else Unknown; within/ago/quiet_since are the stated comparisons (None for Unknown).	1,3,5,7	1/1
-parse-text-json	contract	screen::parse_text_json, ScreenGen::parse	Ok iff (after an optional OK 1) the body is a JSON object with an all-string `rows` array; fields default and saturate as stated; unknown keys ignored; the server's writer round-trips.	1,3,5,7,12	4/4
+parse-text-json	contract	screen::parse_text_json, ScreenGen::parse	Ok iff (after an optional OK 1) the body is a JSON object with an all-string `rows` array; fields default and saturate as stated; unknown keys ignored; `launch` is read only as a whole `person` witness (id, seq, word), else none; the server's writer round-trips.	1,3,5,7,12	5/5
 json-reader-grammar	contract	screen::{Json::parse,parse_value,parse_string,hex4,…,Json::{get,as_str,as_u64,as_array}}	Json::parse accepts exactly RFC 8259 (numbers as lexemes, surrogate pairs combined, invalid code points U+FFFD) and never panics; get returns the first key; the accessors project.	1,3,5,7,14	1/1
 screen-cursor-index	contract	screen::Screen::cursor_index	Some(cursor_row - first) iff it lies in rows, else None.	1,2	1/1
 stall-status-read	contract	stall::{worker_stall,publishes_input}, escalate::status_field	worker_stall = Some iff input= is stalled or stopped, with bytes, wait and rss parsed; publishes_input ⇔ an input= field.	1,3,7	1/1
@@ -623,10 +589,10 @@ approval-line-cells	contract	run::{approval_line,cut_cells}, breaks_a_line, char
 typed-draft	contract	run::{typed_draft,typed_draft_in,stray_digit}, ScreenReader::composer	A draft is any later composer line, or a non-empty first line unless it is the homed placeholder on the caret row; stray_digit ⇔ no prompt and the composer holds exactly the digit.	1,3,7,11,12	1/1
 busy-up	contract	Session::busy_up, row_matcher, RowMatch::clears	busy_up ⇔ some row is not cleared by the guard's matcher (an exhausted scan counts as up); false for an invalid guard; cached consistently.	1,2,12,13	1/1
 context-watch	invariant	Session::watch_context, aterm_phase::context_left	A machine Armed → Warned at ≤ context_warn (one EVENT context) → Armed on a 30-point rise or a framed screen without the indicator (one EVENT compacted); warn 0 says nothing; the indicator is read only right-aligned on the composer's top rule.	1,2,3,7,12,13	8/8
-render-phase-grammar	contract	run::{render_phase,render_phase_and_survey,phase_prompt,esc_line,render_prompt,busy_rule,event_line,event_line_as,survey_event_line}	render_phase(turn, reader, allow) prints the phase word then its fields in reader's grammar: busy reason (Claude Code's busy_signal; Codex's background-terminal line, status row or a last message with no end row); limit message/reset; prompt kind/command/description/notes/classify/options (Claude Code's parse_prompt, any other reader's PromptV2), then the Esc line — `cancel esc`, or `interrupt esc` where the box's footer says Esc interrupts (Codex's question) — then a question's box token; survey and context lines follow (reader.survey_block, reader.context); event lines summarise the worker's words, never a survey's.	1,3,7,12	8/8
+render-phase-grammar	contract	run::{render_phase,render_phase_and_survey,phase_prompt,esc_line,render_prompt,busy_rule,event_line,event_line_as,survey_event_line}	render_phase(turn, reader, allow) prints the phase word then its fields in reader's grammar: busy reason (Claude Code's busy_signal; Codex's background-terminal line, status row or a last message with no end row); limit message/reset; prompt kind/command/description/notes/classify/options (Claude Code's parse_prompt, any other reader's PromptV2), then the Esc line (reader.esc) — `cancel esc`, `exit esc` where Esc quits the program (a trust dialog's: Claude Code's, Codex's, Muse Code's, and Gemini CLI's and agy's undrawn ones), or `interrupt esc` where the box's footer says Esc interrupts (Codex's question), no line where nothing says — then a question's box token; survey and context lines follow (reader.survey_block, reader.context); event lines summarise the worker's words, never a survey's.	1,3,7,12	8/8
 await-turn-wait-protocol	contract	Session::{await_turn,await_turn_to,await_turn_from,wait_for_next,screen}, live_rows, caps	The first wait is a capped `await gone`; capabilities are learned once; reads are tail=40 (whole when the cursor is above); busy waits are scoped to the live zone; frameless screens are never idle until an idle await latches; timeouts are steps; only served non-timeout errors Err.	1,2,3,4,5,7,8,11,12	10/10
 budget-bound	invariant	Session::{watch,supervise_with,await_turn_to,drive,ride_out}	No write and no EVENT after start + max; the run ends TIMEOUT (code 124) with only the badge unset after it; confirmed approvals stand.	2,4,7,8,11	3/3
-approval-press-safety	invariant	Session::{drive,press_guarded,press_fallback,approve_or_hand}, approval_loop, prompt::parse_prompt, classify	A 1 is written only if the policy approves (status, meta, help key first); the guarded press counts only on an OK not skipped; the fallback press confirms first and never over a survey; after a press the box must be seen gone; one command at most twice between review points.	1,2,3,4,5,7,8,11,12	12/12
+approval-press-safety	invariant	Session::{drive,press_guarded,approve_or_hand}, approval_loop, prompt::parse_prompt, classify	A 1 is written only if the policy approves (status, meta, help key first), and only as `key if-human=<n> if-gen=<g> if=<row>` on a read carrying the person count, a quiet stamp and the generation (no unguarded fallback); the guarded press counts only on an OK not skipped; after a press the box must be seen gone; one command at most twice between review points.	1,2,3,4,5,7,8,11,12	8/8
 stray-digit-cleanup	invariant	Session::{clear_stray,survey}, run::{stray_digit,typed_draft_in}	A stray 1 or 0 of ours is backspaced exactly once with one note when no person or hand is on the session, never counted; a refused backspace stays owed until taken.	1,2,3,7,8,11	2/2
 survey-press-gate	invariant	Session::{survey,dismiss_survey}, survey_block, SurveyBlock::withheld, run::survey_open	A guarded 0 only with dismissal on, a non-withheld card, a guard-capable host, no box and no person or hand; one per appearance from busy reads, the idle look retrying on its ladder; DISMISSED iff a later read shows the card gone with no 0 left.	1,2,3,5,7,8,11,12	14/14
 survey-guard-unique	contract	aterm_phase::survey_block, run::survey_open, row_matcher	Every card kind's guard matches exactly its question row and no copy (quoted, EVENT line, help text).	1,3,5,7,12	2/2
@@ -646,19 +612,22 @@ limit-episode	invariant	turn_end_loop::*, Session::look, limit::*, composer_guar
 host-look-wake	invariant	Session::wait_for_next, IdleHost::{wants_at,wants,at_idle}	Idle waits never outlast the host's wants_at; past it the loop steps the host; the run's writes equal those with no host.	2,7,8,11,13	2/2
 stall-hold	invariant	stall::Session::{note_status,stall_in_hand,stall_before_wait,withhold_badge,stall_probe,hold_for_stall,thaw,stall_step,stall_look}	While a stall is in hand no write or new badge goes; holding it withdraws our badge, mails one frozen notice (fabric connected) and journals FROZEN once; thawing journals THAWED and decides the point again; input-unread warnings read status before the next act.	1,2,4,7,8,11,13	13/13
 stall-probe-cost	invariant	stall::Session::{stall_step,withhold_badge,note_status}, Caps::input	On a host that never measures input the requests are those without stall handling plus at most one status per connection; unknown measuring probes once after a wait runs out.	1,2,5,7,8,11	3/3
-stall-remedy-refines-model	refinement	stall::Session::{stall_remedy,warn_stall,stall_signal_term,after_restart}	Under stall_term the restart request is sent iff supervisor_stall_remedy_model enables Term (once per episode, never under another's hand); otherwise one STALL-WARNED and inform; refusals decide as stated; never signal kill.	2,4,7,8,10,11	4/4
+stall-remedy-refines-model	refinement	stall::Session::{stall_remedy,warn_stall,stall_signal_term,after_restart}, stall::refusal_lifts, beside::Session::beside_self_claim	Under stall_term the restart request is sent iff supervisor_stall_remedy_model enables Term (once per episode, never under another's hand, beside a proven self-claim on the stall alone, the agent's record never read for its rest); otherwise one STALL-WARNED and inform, under the same gate; refusals decide as stated (restart unavailable: halted|driver-lease|driver-turn uncounted); never signal kill.	2,4,7,8,10,11	4/4
+beside-memory-remedy	contract	beside::Session::beside_memory_remedy, run::Session::memory_edge, harness::self_claimed::{idle_point,read_idle}	Beside a proven self-claim the loop decides no point at a memory measure: a measure that MemoryOver::acts, with relaunch on, a host that relaunches, unattended, no stall in hand and IdleHost::beside_idle true at this step and at the step before it on the same screen seq (the idle point stood), sends exactly `restart pid=<leader> quiet=<grace>` once per agent process; anything else sends nothing and asks again at the next step; a refusal for another hand (busy, halted, restart unavailable: halted|driver-lease|driver-turn) is uncounted; a measure no longer acted on ends the count. idle_point = status idle ∧ draftEmpty true ∧ no exit; read_idle is false unless the identity is live before and after the read and the record names that pid.	2,4,7	3/3
+beside-remedies-under-hold	contract	beside::Session::beside_memory_remedy, stall::Session::stall_remedy	Beside a proven self-claim under a hold the loop claims and types nothing; the stall's explicit restart (on the stall alone) and the memory ceiling's (at the record's rest) are asked, a refusal the next read may lift (ERR halted, restart unavailable: driver-lease|driver-turn) is uncounted and asked again, one it cannot (restart unavailable: not-relaunchable) is counted once.	2,4,7	1/1
+self-claimed-relaunch-route	contract	relaunch::{after_host_ended,after_exit_as,self_claimed_line}, upgrade_drive::self_claimed_relaunch	A Codex snapshot that carries a self-claimed validated line (CodexRun::self_claimed) is relaunched by the crash rule's relaunch on that line, its witness ledger read (a handled witness is ended:handled), on the exit's cause, except an exit of its own (ExitCause::Exit), which is the Codex lane's as is one with no line (an orderly end is never typed back).	2,4	1/1
 composer-guard	contract	turn_end_loop::{composer_guard,capped_rules}, policy::row_guard, row_matcher	composer_guard(c,t) matches the last row of every word wrap of `c t` (and an NBSP caret); for long texts every matched row starts with the caret or two spaces, never a shell's row; capped_rules cuts at a space to RULES_CAP plus `…`.	1,3,5,7	2/2
 refusal-news-episode	contract	lifecycle::{refusal_key,Session::refusal_news}, Session::{call,park_on_hold}	refusal_key drops measure tokens and keeps holders; refusal_news is false only for the same key within REFUSAL_QUIET; a taken write or a lifted hold ends the episode, so one REFUSED/HALTED line per episode while every retry is sent.	1,2,3,5,8	4/4
 resume-jitter	contract	turn_end_loop::resume_jitter, Session::turn_end_reading	resume_jitter is a pure FNV-1a of (sid, reset) mod span, < span (0 for span 0); the reading uses it only for a reset-lifted wall with a session id.	1,3,7	1/1
-clock-unix-roundtrip	round-trip	turn_end_loop::nearest_s, Session::{instant_of,instant_of_ms,unix_of,unix_ms_of,stamp_in,carried_model_switch,carried_wind,wall_reset_at}	At any clock phase unix_of(instant_of(u)) = u and stamps read back as their second; ledger times carried by the switch and wind-down rows read back exactly; a wall's reset is cached as unix seconds and follows wall-clock jumps.	1,3,8	3/3
+clock-unix-roundtrip	round-trip	turn_end_loop::nearest_s, Session::{instant_of,instant_of_ms,unix_of,unix_ms_of,stamp_in,carried_model_switch,wall_reset_at}	At any clock phase unix_of(instant_of(u)) = u and stamps read back as their second; ledger times carried by the switch and wind-down rows read back exactly; a wall's reset is cached as unix seconds and follows wall-clock jumps.	1,3,8	3/3
 transcript-ends-on	contract	wall_confirm::{transcript_ends_on,row_of,user_entry,local_command,command_notice,opens_the_conversation}	transcript_ends_on = the last conversation entry in file order, skipping sidechain, meta, compaction, local-command and torn rows; notices are Notice entries; a parentless first prompt after a notice does not end it.	1,3,7	3/3
 transcript-confirms-class	contract	wall_confirm::{confirms,class,error_class}, classify_wall	confirms(k,e) ⇔ e's last entry is a notice whose class (by the wall table, else the error word) equals k's; tool output confirms nothing.	1,3	3/3
 transcript-lagging	contract	wall_confirm::{TranscriptEnd::lagging,transcript_ends_on}	lagging ⇔ no turn_duration closed the last turn and its last entry is the prompt, a tool call, a tool result or nothing.	1,3	1/1
-wall-confirm-gate	contract	wall_confirm::Session::{confirm_wall,under_call_on_screen}, Session::turn_end_reading, LAG_TRIES	A Claude wall is acted on iff the transcript confirms its class (re-read while lagging), or with no transcript iff no tool call is over it on the tail and on a whole-grid read of the same wall; a refused wall's act is not taken, journaled once per episode; decision reads re-ask the transcript, books reads reuse it.	1,2,3,5,7,8,11	14/14
+wall-confirm-gate	contract	wall_confirm::Session::{confirm_wall,under_call_on_screen}, Session::turn_end_reading, LAG_TRIES	A Claude wall is acted on iff the transcript confirms its class (re-read while lagging), or with no transcript iff no tool call is over it on the tail and on a whole-grid read of the same wall; a refused wall's act is not taken, journaled once per episode; decision reads re-ask the transcript, books reads reuse it.	1,2,3,5,7,8,11	16/16
 turn-end-decision	contract	policy::turn_end::decide_turn_end, TurnEndState::{observe,acted}, Session::turn_end_reading, upgrade::transcript_tasked, QuestionPriority::prose_rule_id	At an idle turn end: ATERM-TASK-DONE ⇒ nothing, except that under Cruise a report a read saw run (not a person's exchange, not stopped with Esc) whose own words name open work without a blocker (open_work) ⇒ the open-items challenge (continue-open-items@v1), once a job, after which the token or a done reply ends the task; a person's short exchange ⇒ left; idle compaction after nothing to type ⇒ nothing; a done report ⇒ the done check, DONE ⇒ done; a question ⇒ the session word's text (one bare meta first) or an escalation; otherwise keep going under continue@v1, at most once per point.	1,2,3,5,7,8,10,11	12/12
 typing-budget	contract	TurnEndState budget seeding, approvals::Row::to_json	The hourly budget starts at N minus this session's typed acts in the last hour from the ledger (account moves excluded); 0 escalates; N=0 is no cap.	1,3,7,8	2/2
 act-write-protocol	contract	Session::{turn_end_execute,press_fenced,call}, REACTION_WAIT, composer_guard	A typed act is a fenced send then an Enter on a read showing exactly the text (Codex waits for the echo to settle), else one guarded turn after a fresh status; suggestions accepted by right + fenced enter; then await seq REACTION_WAIT; a reply inside the settle is a short yield; a stop refuses further waits and writes; shells are never written.	1,2,3,5,7,8,11	8/8
-never-type-over-a-person	invariant	Session::{turn_end_execute,human_grace,status,press_focused}, decide_turn_end draft/person arms, composer reading	Every write is judged on a read with no keystroke within the grace, no other driver's hand, an empty or placeholder composer (or a draft standing the whole grace, submitted by a fenced Enter), and a non-shell program; a missed guard is no act and leftover text escalates. Folder-trust arrows and Enter also carry the judged read's person count; a person's intervening key yields. A newer verdict publication or first client sight proves no exemption from the grace. A person's key after an accepted arrow can still land on the moved focus.	1,2,3,5,7,8,11	9/9
+never-type-over-a-person	invariant	Session::{turn_end_execute,human_grace,status,press_focused,launch_call}, approval_loop::LaunchStatus::of, screen::parse_text_json, decide_turn_end draft/person arms, composer reading	Every write is judged on a read with no keystroke within the grace, no other driver's hand, an empty or placeholder composer (or a draft standing the whole grace, submitted by a fenced Enter), and a non-shell program; a missed guard is no act and leftover text escalates. Folder-trust arrows and Enter also carry the judged read's person count; a person's intervening key yields. One exception, THE LAUNCH (`Session::launch_call`): a box of kind Trust that trust-dialog@v1 or trust-any@v1 approves by `Choice::Focus` is pressed within the grace iff no other driver's hand is on the session, the Autopilot word read in that pass is not off, the judged read J carries `human_seq` n and `"launch"` {why=person, seq=n} whose word is the program of J's reader, the decision's status says `launch=person launch_seq=n`, `program=` that agent and `input=clear` (pending|typeahead ⇒ decided again on a fresh read after a bounded wait; missing, `-`, stalled, stopped ⇒ held), and that witness id has answered no other box; `LAUNCH seq= id= word=` is journaled; every key carries `if-human=n(J)` and a person's skip yields. A newer verdict publication or first client sight proves no exemption from the grace. A person's key after an accepted arrow can still land on the moved focus.	1,2,3,5,7,8,11	14/15
 refused-write-retried	other	Session::{park_on_hold,back_off,press_fenced,probe_left_enter}	Liveness: a refused act is parked or backed off and re-sent exactly once more after the refusal stops; never dropped silently.	1,2,3,7,8,13	2/2
 api-wall-acts	contract	decide_turn_end (api-retry/api-back/context-compact), TurnEndTiming, Session::{wait_for_next,reach_edge}, IdleHost::reach	529 waits its rung then retries once; a full context compacts then continues, the third failure one context exception until lowered; a network wall asks the reach once per point and types api-back once Up, ladder again when Unknown.	1,2,3,5,7,8,10,11	6/6
 wait-told	contract	Session::{tell_wait,due_at}, Due::unix_ms, IdleHost::plan	The host is told a wall's next try once as unix seconds and again only when that second moves; cleared when the try is typed; the take-check wait is never a plan.	1,2,3,8,11	3/3
@@ -670,7 +639,6 @@ sleep-wake-settle	contract	slept_through, Session::{watch_sleep,woke,settle_wake
 stall-ladder	contract	stall rungs, Session::stall_rungs, IdleHost::{exception,record}	An unnamed stuck screen (busy on background alone under a resting title, or an unchanged idle dialog) climbs STUCK, STALLED + record, EXCEPTION once each at T, 3T, 6T; nothing typed; the end withdraws both and re-tells a standing point.	1,2,3,7,8,11	3/3
 stop-and-handover	contract	Session::{stop,call,hand_over}, escalate::adopt_badge	A handover stop leaves the badge for the next loop to adopt with one set; a final stop clears it; a stop mid-probe writes nothing more and leaves the panel owed.	1,2,8,13	2/2
 model-switch-carry	contract	approvals::open_model_switch, Session::carried_model_switch, TurnEndState::restarted, decide_turn_end (model bucket)	An open model switch is read back from the ledger unless undone or closed by a later made account move, due only past its reset; the Tier-1 bind continues, falls back and returns exactly where supervisor_model_switch_model does.	1,2,3,7,8,10	4/4
-codex-wind-down	refinement	decide_screen (rate nudge, /model picker), decide_turn_end, TurnEndState::goal_stop, Session::{open_wind,note_codex_screen}, approvals::{open_wind_down,wind_switch_words}, goal_hold	The rate-nudge wind-down refines supervisor_codex_rate_nudge_model state for state: switch near the limit with intent/owed rows, stop goal turns unless a person's hand or the upgrade holds them, save once on the cheaper model, restore with /model, hold until reset; every edge is a ledger row read back identically by a restarted loop.	1,2,3,5,7,8,10,11	28/28
 account-move-execution	contract	decide_turn_end (account_point), IdleHost::account, Session::restart_agent, relaunch::carried_quietly	An advised move is only the host's relaunch (typed ledger row), never typed text; wait:changed holds at a wall but defers ahead of one; refused:line is waited out; a move at a wall closes the old episode and resumes; the owner's clearing types one resume.	1,2,3,7,8,10,11	5/5
 account-advice-asks	contract	Session::{account_round,account_edge,wait_for_next}, IdleHost::{account,account_stamp}, TurnEndState::seed_account_moves	Advice is asked once per decision after the point is folded; a standing advice wait is decided again once per stamp move (not the stamp at the ask or at start); a short-wait answer cuts the wall's wait; accounts and logins off ⇒ nothing asked.	1,2,3,7,8,11	8/8
 login-lifecycle-accounts	contract	Session::account_round, IdleHost::login_superseded, exception_for, accounts renew/login	With a rostered login and no account left a lost login never types /login: the owner is told now, the sign-in or renewal is news that decides the point again and relaunches; a superseded login is not renewed again; old told moves seed a wait.	1,2,3,7,8,11	6/6
@@ -691,8 +659,6 @@ usage-tap-refines-HarnessUsageTap	refinement	tap::{gate,Silence::step,Silence::u
 upgrade-model-ladder-refines-model	refinement	upgrade_models::model_moves_now	model_moves_now moves exactly where harness_model_ladder_model's VisitMoves is enabled; the cold-only rule is caught.	3,10	2/2
 upgrade-model-priority-refines-model	refinement	upgrade_models::{Priority::{admit,render,parse},target,list_target,ingest}	The priority writers and reader are harness_model_priority_model's; ingest admits only what the model's writer admits; pre-fix writer and head reader caught.	1,3,7,10	3/3
 upgrade-model-switch-refines-model	refinement	upgrade_models::{model_read_step,live_model_at,ModelRecord::*,model_due,ride_bar,model_to,line_model}	From every reachable state of harness_model_switch_model the read step and record operations produce the model's transition; flipped decisions and pre-fix shapes are refused.	1,3,7,10,13	3/3
-operator-refines-models	refinement	operator::DurableQueue::{open,open_next_epoch,claim_at,ack,latch_fault_at}, ensure_fault_marker, WAL replay	Every DurableQueue transition projects onto a step of the operator delivery, WAL actuator, fleet fault and leadership models; a failed marker write commits no fault; locks and epochs fence takeovers.	1,2,7,8,10,13	6/6
-relay-turn-transparency	equivalence	RelayClient, Turn::run, aterm_net::drive::{dial_and_relay_pinned,accept_and_relay}, aterm_net::tls	A Turn over pinned TLS relay returns the same screen and request lines as over a local stream; the relay forwards only for a granted capability.	1,8,9,13	1/1
 footer-window-allocation	other	footer::{facts_for_entry_at,TailCache,rows_back}	Walking an n-byte transcript back allocates exactly ceil(n/TAIL_BYTES) fixed-size window buffers.	1,7,8	1/1
 approval-full-power-presses-every-bash-box	contract	policy::decide_screen, ApprovalCtx, Approve	Every captured 2.1.280 Bash permission box is approved by its one-shot 1 at full power, with Safe's rule when Safe approves and allow-once otherwise.	1,3,5,7	1/1
 ```
@@ -728,7 +694,7 @@ snapshot-parse	3
 startup-admits	4
 names-word	1
 startup-read	2
-question-recommended-decision	14
+question-recommended-decision	15
 question-target-invariant	1
 question-destructive-refusal	4
 decide-routes-questions	4
@@ -772,9 +738,6 @@ te-login-wall	4
 te-memory-wall	1
 te-upgrade-ownership	4
 te-act-take-window	4
-te-switch-never-continues	3
-te-switch-person-hand	8
-te-switch-progression	23
 te-account-move	14
 te-probe-transparent	1
 te-probe-gate	1
@@ -797,38 +760,24 @@ src/drive_cli.rs	a_prompt_cut_by_its_servers_exit_is_75_never_a_retryable_1	driv
 src/drive_cli.rs	a_verb_followed_by_help_asks_for_help_and_never_acts	drive-top-parse-help-routing	
 src/drive_cli.rs	a_watch_that_dies_before_its_loop_still_journals_its_exit	drive-preloop-exit-journal	
 src/drive_cli.rs	absent_or_disabled_endpoint_preserves_shell_discovery_fallback	drive-endpoint-route	
-src/drive_cli.rs	await_turn_parses_sid_and_timeout	drive-flag-values	
 src/drive_cli.rs	classify_parses_the_command_and_exits_on_the_verdict	drive-parse-sub-positionals	
-src/drive_cli.rs	configured_endpoint_uses_one_persistent_route	drive-endpoint-route	
 src/drive_cli.rs	configured_prompt_uses_one_connection_and_no_cursor_preflight	drive-prompt-turn-protocol	
 src/drive_cli.rs	context_warn_is_watchs_and_supervises_a_percentage	drive-flag-values	
-src/drive_cli.rs	dial_is_refused_for_ledger_like_every_other_non_prompt_verb	drive-dial-guard	
-src/drive_cli.rs	flag_endpoint_resolves_the_per_socket_token_file	drive-endpoint-route	
 src/drive_cli.rs	mail_flags_are_the_loops_and_need_the_worker	drive-flag-ownership	
 src/drive_cli.rs	phase_and_await_turn_end_with_the_context_left	drive-phase-reply	
-src/drive_cli.rs	phase_parses_an_optional_sid_and_nothing_else	drive-parse-sub-positionals	
 src/drive_cli.rs	question_priority_is_watchs_and_supervises_and_answers_nothing_the_policy_does_not	drive-flag-ownership	
 src/drive_cli.rs	ready_flag_parses_and_requires_a_value	drive-top-parse-help-routing	
-src/drive_cli.rs	ready_pattern_is_the_flag_else_the_default	drive-top-parse-help-routing	
 src/drive_cli.rs	report_parses_since_and_max_rows	drive-flag-values	
 src/drive_cli.rs	resolved_but_unreachable_endpoint_surfaces_connect_error_without_retargeting	drive-prompt-turn-protocol	
-src/drive_cli.rs	supervise_parses_every_flag_and_repeats_allow_python	drive-flag-values	
 src/drive_cli.rs	task_parses_the_worker_its_flags_and_the_text	drive-flag-values	
-src/drive_cli.rs	the_ctl_sibling_is_read_beside_the_resolved_binary	drive-sibling-ctl	
 src/drive_cli.rs	the_ledger_takes_its_worker_from_the_journal_when_none_is_named	drive-journal-sid	
 src/drive_cli.rs	the_loops_flags_only_limit_the_policy	drive-flag-ownership	
-src/drive_cli.rs	the_manager_is_the_inbox_else_this_terminals_session	drive-flag-ownership	
 src/drive_cli.rs	the_round_11_flags_belong_to_their_verbs	drive-flag-ownership	
-src/drive_cli.rs	token_path_uses_the_shared_convention_not_a_stem_swap	§4	
-src/drive_cli.rs	unresolved_token_preserves_shell_diagnostics_while_dial_still_gets_the_error	drive-endpoint-route	
 src/drive_cli.rs	watch_parses_supervises_flags_into_the_same_options	drive-flag-ownership	
 src/fleet_cli.rs	a_failed_listing_is_reported_and_never_read_as_an_empty_fleet	fleet-list-diagnostics-automaton	
 src/fleet_cli.rs	a_live_listing_maps_to_the_same_pid_and_sid_columns_as_the_ls_parse	fleet-sessions-from	
 src/fleet_cli.rs	a_recovered_listing_says_so_once_and_a_healthy_loop_stays_silent	fleet-list-diagnostics-automaton	
 src/fleet_cli.rs	a_repeated_failure_speaks_once_per_distinct_reason_then_periodically	fleet-list-diagnostics-automaton	
-src/fleet_cli.rs	dispatch_argv_keeps_payload_as_one_verbatim_arg	fleet-dispatch-argv	
-src/fleet_cli.rs	dispatch_argv_verb_only_and_bare_selector	fleet-dispatch-argv	
-src/fleet_cli.rs	dispatch_argv_without_selector_runs_verb_self_scoped	fleet-dispatch-argv	
 src/fleet_cli.rs	dispatch_broken_output_reports_possible_effects_without_retrying	fleet-dispatch-lines	
 src/fleet_cli.rs	dispatch_input_failure_is_not_silently_a_successful_empty_batch	fleet-dispatch-lines	
 src/fleet_cli.rs	dispatch_invalid_input_reports_the_executed_prefix_and_stops	fleet-dispatch-lines	
@@ -837,12 +786,8 @@ src/fleet_cli.rs	dispatch_reports_child_failure_and_still_processes_the_remainin
 src/fleet_cli.rs	event_record_is_astream_addressed_and_valid_json_shape	fleet-records-format	
 src/fleet_cli.rs	exited_channels_do_not_accumulate_for_the_stream_lifetime	fleet-federated-sid	
 src/fleet_cli.rs	federated_line_reader_caps_accumulation	fleet-line-bound	
-src/fleet_cli.rs	federation_queue_is_bounded_and_backpressures_at_capacity	§4	
-src/fleet_cli.rs	json_escape_handles_control_and_specials	fleet-json-escape	
-src/fleet_cli.rs	operator_commands_build_exact_text_or_binary_control_frames	fleet-operator-args	
 src/fleet_cli.rs	rejected_stream_child_is_killed_and_reaped_promptly	fleet-stream-child-cleanup	
 src/fleet_cli.rs	result_record_preserves_turn_screen_verdict_and_exit_status	fleet-records-format	
-src/fleet_cli.rs	result_record_reports_ok_and_escapes	fleet-records-format	
 src/fleet_cli.rs	subscriber_that_closes_stdout_is_terminated_promptly	fleet-stream-child-cleanup	
 src/harness/accounts_tests.rs	a_candidate_struck_past_an_unanswered_account_leaves_that_account_as_it_was	acc-strike-undo-exact	
 src/harness/accounts_tests.rs	a_dir_is_used_verbatim_and_two_spellings_of_one_place_are_two_logins	acc-append-row-roundtrip	
@@ -852,15 +797,10 @@ src/harness/accounts_tests.rs	a_label_is_judged_only_for_a_stored_login_in_the_d
 src/harness/accounts_tests.rs	a_ledger_row_round_trips_as_one_bounded_line	acc-event-line-roundtrip	
 src/harness/accounts_tests.rs	a_line_that_is_not_a_row_of_this_ledger_is_no_event	acc-event-line-roundtrip	
 src/harness/accounts_tests.rs	a_lost_login_signed_back_in_is_where_the_session_is_relaunched	acc-advise-rule3-wall	
-src/harness/accounts_tests.rs	a_low_active_account_is_not_followed_and_is_rotated_past_for_a_fresh_one	acc-advise-rule2-follow-and-canary	
-src/harness/accounts_tests.rs	a_merge_evicts_nothing_of_ours_restores_no_cleared_wall_and_ends_a_pin_on_a_wall	acc-merge-join	
-src/harness/accounts_tests.rs	a_process_is_matched_to_its_row_by_its_own_login_variable	acc-row-for-login-exact	
 src/harness/accounts_tests.rs	a_process_login_is_read_from_its_own_environment_and_nothing_else	acc-process-login-of-env	
-src/harness/accounts_tests.rs	a_refused_relaunch_is_its_own_sessions_word_and_takes_the_rotation_back_exactly	acc-strike-undo-exact	
 src/harness/accounts_tests.rs	a_reset_is_allowed_only_on_the_machines_own_login_with_no_other_login_on_record	acc-reset-allowed	
 src/harness/accounts_tests.rs	a_reset_more_than_eight_days_past_its_row_is_recorded_as_naming_none	acc-note-wall-episode	
 src/harness/accounts_tests.rs	a_reset_used_or_a_limit_lifted_ends_the_walls_and_kept_or_failed_changes_none	acc-reset-outcome	
-src/harness/accounts_tests.rs	a_resume_commits_nothing_and_every_rotation_beside_it_still_commits	acc-advice-commits	
 src/harness/accounts_tests.rs	a_roster_admits_whole_in_file_order_and_a_missing_file_is_the_empty_roster	acc-roster-admission	
 src/harness/accounts_tests.rs	a_row_wakes_waiting_tabs_only_when_an_account_is_usable_sooner	acc-wakes-table	
 src/harness/accounts_tests.rs	a_session_row_older_than_thirty_days_is_dropped_when_the_state_is_saved	acc-drop-stale-sessions	
@@ -878,7 +818,6 @@ src/harness/accounts_tests.rs	a_wall_is_recorded_for_the_process_login_whatever_
 src/harness/accounts_tests.rs	a_wall_row_older_than_the_process_is_the_previous_accounts_and_is_recorded_for_nobody	acc-record-wall-decision	
 src/harness/accounts_tests.rs	a_wall_stands_until_its_instant_and_not_a_second_longer	acc-wall-stands-until	
 src/harness/accounts_tests.rs	a_wall_the_owner_cleared_is_not_put_back_by_its_row_and_ends_no_pin	acc-note-wall-episode	
-src/harness/accounts_tests.rs	advise_past_probe_is_advise_with_the_probes_arm_skipped	acc-advise-past-probe	
 src/harness/accounts_tests.rs	an_exec_environment_that_reads_empty_names_no_login	acc-process-login-of-env	
 src/harness/accounts_tests.rs	append_row_writes_only_what_the_next_read_admits	acc-append-row-roundtrip	
 src/harness/accounts_tests.rs	at_a_wall_the_session_is_limited_whether_or_not_its_wall_is_recorded_yet	acc-advise-rule3-wall	
@@ -887,16 +826,11 @@ src/harness/accounts_tests.rs	enrolled_is_the_rows_in_whose_login_directory_a_lo
 src/harness/accounts_tests.rs	every_malformed_roster_is_refused_whole_and_names_the_row_and_the_reason	acc-label-grammar	
 src/harness/accounts_tests.rs	every_non_candidate_has_its_reason_by_name	acc-words-table	
 src/harness/accounts_tests.rs	every_rotation_the_advice_gives_commits_once_the_wall_is_recorded	acc-advice-commits	
-src/harness/accounts_tests.rs	every_word_reads_back_and_nothing_else_is_a_word	acc-words-table	
 src/harness/accounts_tests.rs	low_is_a_running_window_at_its_threshold_however_near_its_reset	acc-sample-windows	
 src/harness/accounts_tests.rs	no_account_is_probed_within_ninety_seconds_of_any_accounts_claim	acc-probe-claim-spacing	
-src/harness/accounts_tests.rs	observations_merge_by_newest_and_machine_local_facts_never_do	acc-merge-join	
 src/harness/accounts_tests.rs	one_wall_is_one_observation_until_it_is_found_standing_again	acc-note-wall-episode	
 src/harness/accounts_tests.rs	rule_1_stays_for_a_session_the_roster_does_not_govern	acc-advise-rule1-guards	
-src/harness/accounts_tests.rs	rule_2_follows_an_active_account_that_is_proven_and_fresh_or_pinned	acc-advise-rule2-follow-and-canary	
-src/harness/accounts_tests.rs	rule_3_at_a_wall_moves_to_the_next_candidate_or_waits_for_the_roster	acc-advise-rule3-wall	
 src/harness/accounts_tests.rs	rule_4_leaves_a_limited_account_and_not_one_whose_low_window_is_about_to_reset	acc-advise-rule4-early	
-src/harness/accounts_tests.rs	rule_4_moves_ahead_of_the_wall_only_from_a_low_account_to_a_fresh_one	acc-advise-rule4-early	
 src/harness/accounts_tests.rs	rule_4_probes_when_the_sample_is_due_and_only_then	acc-advise-rule4-early	
 src/harness/accounts_tests.rs	samples_offers_auth_and_sessions_are_recorded_newest_first	acc-note-observations	
 src/harness/accounts_tests.rs	several_accounts_are_listed_only_by_a_roster_that_admits_two	acc-roster-file-read	
@@ -904,12 +838,10 @@ src/harness/accounts_tests.rs	the_canarys_hold_lasts_ten_minutes_then_the_next_s
 src/harness/accounts_tests.rs	the_compare_and_set_refuses_by_name_and_changes_nothing	acc-begin-rotation-cas	
 src/harness/accounts_tests.rs	the_condition_table_in_its_order	acc-condition-table	
 src/harness/accounts_tests.rs	the_footer_names_an_account_only_where_two_are_listed	acc-judged-and-footer-label	
-src/harness/accounts_tests.rs	the_hosts_route_and_the_roster_meet_the_process_login_in_one_place	acc-advise-rule1-guards	
 src/harness/accounts_tests.rs	the_ledger_appends_whole_rows_and_is_cut_to_its_newest	acc-ledger-file	
 src/harness/accounts_tests.rs	the_lock_excludes_a_second_holder_and_is_free_the_moment_it_drops	acc-store-lock	
 src/harness/accounts_tests.rs	the_machine_rotates_at_most_twice_the_roster_size_an_hour	acc-rotation-breaker	
 src/harness/accounts_tests.rs	the_owners_clearing_resumes_a_session_at_the_wall_it_lifted	acc-advise-resume	
-src/harness/accounts_tests.rs	the_owners_pin_turns_the_early_move_off_and_everyone_follows	acc-advise-rule2-follow-and-canary	acc-pin-unpin
 src/harness/accounts_tests.rs	the_probe_interval_is_half_the_time_to_the_threshold_clamped	acc-probe-interval	
 src/harness/accounts_tests.rs	the_recorder_keeps_what_is_on_record_and_ends_a_pin_at_its_wall	acc-record-wall-decision	
 src/harness/accounts_tests.rs	the_recorder_reads_a_row_of_any_shape_into_a_wall_the_state_can_hold	acc-record-wall-decision	
@@ -919,8 +851,6 @@ src/harness/accounts_tests.rs	the_recorder_refuses_a_state_that_is_not_ours_and_
 src/harness/accounts_tests.rs	the_recorder_says_refused_where_its_directory_cannot_be_made	acc-store-load-save	
 src/harness/accounts_tests.rs	the_recorder_waits_for_the_lock_a_bounded_time_and_says_it_is_held	acc-store-lock	
 src/harness/accounts_tests.rs	the_roster_is_beside_the_config_by_one_rule	acc-roster-beside	
-src/harness/accounts_tests.rs	the_roster_text_is_read_bounded_and_is_not_an_admission	acc-roster-file-read	
-src/harness/accounts_tests.rs	the_session_that_chose_an_unproven_account_is_not_moved_on_before_it_answers	acc-strike-undo-exact	
 src/harness/accounts_tests.rs	the_signed_out_labels_are_the_enrolled_ones_in_roster_order	acc-signed-out-list	
 src/harness/accounts_tests.rs	the_state_round_trips_through_json_with_sorted_keys_and_null_for_unknown	acc-state-json-roundtrip	
 src/harness/accounts_tests.rs	the_store_keeps_the_state_private_and_reads_back_what_it_wrote	acc-label-grammar	
@@ -929,7 +859,6 @@ src/harness/accounts_tests.rs	the_unproven_active_account_is_not_probed	acc-advi
 src/harness/accounts_tests.rs	the_vendors_profile_source_is_not_a_stored_login	acc-process-login-only-weakens	
 src/harness/accounts_tests.rs	the_wait_is_for_the_earliest_instant_and_prefers_a_dedicated_one_minutes_later	acc-next-usable-opening-hold	
 src/harness/accounts_tests.rs	the_wake_marker_is_a_new_file_at_every_touch	acc-store-load-save	
-src/harness/accounts_tests.rs	two_sessions_at_one_wall_make_one_rotation_and_the_loser_follows_only_a_proven_account	acc-begin-rotation-cas	
 src/harness/accounts_tests.rs	under_another_accounts_fresh_claim_the_leave_check_answers	acc-advise-rule4-early	
 src/harness/accounts_tests.rs	unknown_keys_are_tolerated_and_a_file_this_build_must_not_guess_at_is_refused	acc-state-unread-classification	
 src/harness/align_tests.rs	a_child_that_closes_stdout_then_hangs_cannot_survive_the_deadline	align-capture-bounded	
@@ -945,7 +874,6 @@ src/harness/cli_tests.rs	a_dry_run_line_says_how_long_behind_and_how_long_waitin
 src/harness/cli_tests.rs	a_failed_flow_runs_nothing_and_records_only_a_first_login_signed_out	cli-accounts-login-table	
 src/harness/cli_tests.rs	a_floor_the_file_does_not_say_never_reads_as_space_back	cli-disk-config-fail-closed	
 src/harness/cli_tests.rs	a_flow_that_ends_signed_out_is_recorded_so_and_exits_1	cli-accounts-login-table	
-src/harness/cli_tests.rs	a_give_up_row_in_the_ledger_view_names_what_held_it	cli-upgrade-lines	
 src/harness/cli_tests.rs	a_hand_run_upgrade_stands_down_while_the_master_switch_is_off	cli-upgrade-sweep-gates	
 src/harness/cli_tests.rs	a_hand_run_upgrade_that_could_not_sweep_does_not_exit_zero	cli-upgrade-sweep-gates	
 src/harness/cli_tests.rs	a_kill_switch_written_below_another_header_still_reads_off	cli-harness-switch-misplaced-off	
@@ -953,13 +881,10 @@ src/harness/cli_tests.rs	a_ledger_tail_keeps_only_the_newest_rows	cli-ledger-ver
 src/harness/cli_tests.rs	a_login_is_recorded_over_a_word_stamped_ahead_of_the_clock	cli-accounts-login-table	
 src/harness/cli_tests.rs	a_login_nobody_could_ask_afterwards_is_not_started	cli-accounts-login-table	
 src/harness/cli_tests.rs	a_login_that_could_not_be_asked_is_said_and_never_recorded	cli-accounts-login-table	
-src/harness/cli_tests.rs	a_login_whose_answer_cannot_be_recorded_says_so_and_exits_1	cli-accounts-login-table	
 src/harness/cli_tests.rs	a_refused_roster_is_said_by_name_and_nothing_acts_on_it	cli-accounts-report	
-src/harness/cli_tests.rs	a_refused_upgrade_names_the_restarts_it_leaves_in_flight	cli-upgrade-sweep-gates	
 src/harness/cli_tests.rs	a_row_whose_login_directory_is_empty_is_listed_and_not_enrolled	cli-accounts-report	
 src/harness/cli_tests.rs	a_state_file_of_another_schema_is_refused_by_every_write_and_left_as_it_is	cli-accounts-schema-refusal	
 src/harness/cli_tests.rs	a_tab_another_supervisor_claims_reads_so_unless_a_switch_is_off	cli-upgrade-owner-status	
-src/harness/cli_tests.rs	a_target_noindex_twin_survives_the_tick_and_its_link_resolves	cli-disk-tick	
 src/harness/cli_tests.rs	a_tick_cut_short_mid_removal_leaves_the_intent_in_the_journal	cli-disk-write-ahead-journal	
 src/harness/cli_tests.rs	accounts_with_no_roster_shows_this_logins_tap_reading	cli-accounts-report	
 src/harness/cli_tests.rs	add_refuses_a_listed_or_inadmissible_label_by_name_and_writes_nothing	cli-accounts-add	
@@ -967,20 +892,15 @@ src/harness/cli_tests.rs	add_to_an_inline_roster_says_so_and_prints_the_row_to_a
 src/harness/cli_tests.rs	add_writes_a_symlinked_roster_through_the_link	cli-accounts-add	
 src/harness/cli_tests.rs	an_add_to_a_roster_with_rows_lists_no_login_of_its_own	cli-accounts-add	
 src/harness/cli_tests.rs	an_owners_word_kept_out_by_a_sweep_exits_75_and_writes_nothing	cli-upgrade-sweep-gates	
-src/harness/cli_tests.rs	an_owners_word_names_the_switch_that_keeps_the_window_off	cli-upgrade-owner-status	
 src/harness/cli_tests.rs	an_unreadable_aterm_toml_grants_no_removal_and_the_verb_says_so	cli-disk-config-fail-closed	
 src/harness/cli_tests.rs	an_unwatched_upgrade_says_so_and_a_switch_off_says_why	cli-upgrade-owner-status	
 src/harness/cli_tests.rs	every_spelling_the_window_parser_reads_reads_the_same_knobs	cli-disk-config-fail-closed	
-src/harness/cli_tests.rs	help_is_scoped_to_the_verb_named	§4	
 src/harness/cli_tests.rs	limits_reads_the_sessions_screen_once_and_names_its_wall	cli-limits-read-once	
 src/harness/cli_tests.rs	limits_with_no_session_to_read_refuses_and_reads_nothing	cli-limits-read-once	
 src/harness/cli_tests.rs	login_at_a_terminal_asks_that_one_login_and_records_that_it_works	cli-accounts-login-table	
 src/harness/cli_tests.rs	login_keeps_no_byte_of_the_vendors_output	cli-login-secrecy	
 src/harness/cli_tests.rs	login_prints_the_line_and_runs_it_only_at_a_terminal	cli-accounts-login-table	
 src/harness/cli_tests.rs	only_the_measured_volumes_targets_are_candidates	cli-disk-tick	
-src/harness/cli_tests.rs	removal_off_by_a_fault_never_advises_the_switch_already_set	cli-disk-config-fail-closed	
-src/harness/cli_tests.rs	tap_parses_as_the_tap_and_its_help_page	cli-grammar	
-src/harness/cli_tests.rs	the_accounts_ledger_is_read_through_the_ledger_verb	cli-ledger-verb	
 src/harness/cli_tests.rs	the_auth_runner_runs_the_program_it_is_given_under_the_login	cli-login-runners	
 src/harness/cli_tests.rs	the_check_after_a_sign_in_needs_user_or_logname	cli-auth-check-env	
 src/harness/cli_tests.rs	the_default_window_reclaims_a_profile_idle_two_days_and_keeps_one_built_today	cli-disk-tick	
@@ -989,31 +909,21 @@ src/harness/cli_tests.rs	the_disk_knobs_are_read_from_aterm_toml	cli-disk-config
 src/harness/cli_tests.rs	the_disk_report_names_nothing_removable_by_default_and_is_journalled	cli-disk-write-ahead-journal	
 src/harness/cli_tests.rs	the_disk_tick_leaves_a_target_on_another_volume_alone	cli-disk-tick	
 src/harness/cli_tests.rs	the_disk_tick_reclaims_stale_targets_below_the_floor_and_nothing_above	cli-disk-tick	
-src/harness/cli_tests.rs	the_disk_tick_under_pressure_takes_the_oldest_profile_and_stops_when_free	disk-pressure-pass	
 src/harness/cli_tests.rs	the_first_add_lists_this_machines_own_login_then_the_new_row	cli-accounts-add	
 src/harness/cli_tests.rs	the_grammar_parses_what_the_help_text_advertises	cli-grammar	
 src/harness/cli_tests.rs	the_grammar_refuses_what_it_does_not_know	cli-grammar	
 src/harness/cli_tests.rs	the_json_report_has_every_key_and_null_for_what_nobody_read	cli-accounts-report	
 src/harness/cli_tests.rs	the_ledger_verb_reads_the_supervisors_approval_ledger	cli-ledger-verb	
-src/harness/cli_tests.rs	the_login_runner_waits_for_the_program_it_is_given_under_the_home	cli-login-runners	
+src/harness/cli_tests.rs	the_login_flow_runs_under_the_home_it_is_given	cli-login-runners	
 src/harness/cli_tests.rs	the_memory_banner_is_its_own_wall_and_no_limit	cli-limits-view	
 src/harness/cli_tests.rs	the_owner_reads_the_recorded_upgrades_and_says_their_word	cli-upgrade-owner-status	
-src/harness/cli_tests.rs	the_owners_upgrade_grammar_parses_and_refuses_what_it_cannot_mean	cli-grammar	
-src/harness/cli_tests.rs	the_report_names_the_flag_and_the_switch_a_removal_needs	cli-disk-verb-report	
-src/harness/cli_tests.rs	the_report_rows_carry_condition_sessions_and_the_reasons	cli-accounts-report	
 src/harness/cli_tests.rs	the_retired_hook_verbs_drain_a_pipe_and_never_wait_on_a_terminal	cli-retired-verbs	
-src/harness/cli_tests.rs	the_retired_verbs_refuse_or_answer_silently_and_write_nothing	cli-retired-verbs	
-src/harness/cli_tests.rs	the_roster_lives_beside_the_config_file_and_the_store_under_the_state	cli-accounts-report	
-src/harness/cli_tests.rs	the_row_with_no_dir_is_signed_in_in_the_default_home	cli-accounts-login-table	
 src/harness/cli_tests.rs	the_tick_removes_nothing_whose_intent_it_cannot_journal	cli-disk-write-ahead-journal	
 src/harness/cli_tests.rs	the_verb_applies_cargo_targets_with_the_same_unit	cli-disk-verb-report	
 src/harness/cli_tests.rs	the_verb_json_carries_what_each_row_went_kept_and_why	cli-disk-verb-report	
 src/harness/cli_tests.rs	the_verb_removes_nothing_whose_intent_it_cannot_journal	cli-disk-write-ahead-journal	
-src/harness/cli_tests.rs	the_verb_says_what_it_would_take_under_pressure_in_order	cli-disk-verb-report	
-src/harness/cli_tests.rs	the_view_places_a_dated_reset_across_a_dst_change_with_the_offset_there	cli-limits-view	
 src/harness/cli_tests.rs	the_view_places_a_weekly_walls_bare_clock_after_its_print	cli-limits-view	
 src/harness/cli_tests.rs	the_worst_give_up_row_fits_its_cut_whole	cli-upgrade-lines	
-src/harness/cli_tests.rs	usage_folds_the_newest_transcript_and_says_what_that_costs	cli-usage-transcript-pick	
 src/harness/cli_tests.rs	usage_folds_the_session_claude_code_names_not_the_newest	cli-usage-transcript-pick	
 src/harness/cli_tests.rs	usage_names_the_account_its_claude_code_runs_under	cli-usage-account-attribution	
 src/harness/cli_tests.rs	usage_shows_the_tap_reading_of_its_own_process	cli-usage-account-attribution	
@@ -1090,13 +1000,11 @@ src/harness/disk_tests.rs	an_unresolvable_live_symlink_blocks_every_version_row_
 src/harness/disk_tests.rs	below_the_floor_the_stale_target_goes_and_nothing_else_does	disk-apply-guards	
 src/harness/disk_tests.rs	dir_bytes_counts_a_tree_and_does_not_follow_a_symlink	disk-tree-nofollow	
 src/harness/disk_tests.rs	free_space_warns_only_on_a_figure_it_actually_has	disk-free-warn	
-src/harness/disk_tests.rs	human_bytes_is_coarse_on_purpose_and_exact_under_a_kib	disk-human-bytes	
 src/harness/disk_tests.rs	nothing_under_the_transcripts_root_is_ever_removed_even_when_it_is_on_the_report	disk-apply-guards	
 src/harness/disk_tests.rs	remove_tree_refuses_a_symlink	disk-tree-nofollow	
 src/harness/disk_tests.rs	report_only_is_the_default_and_apply_without_a_class_does_nothing	disk-apply-guards	
 src/harness/disk_tests.rs	scan_reads_the_versions_dir_and_resolves_the_live_link	disk-report-classification	
 src/harness/disk_tests.rs	the_df_reading_is_anchored_on_capacity_and_never_on_a_field_count	disk-parse-df	
-src/harness/disk_tests.rs	the_idle_window_defaults_to_one_day	§4	
 src/harness/disk_tests.rs	the_innermost_build_directory_decides_a_nested_profile_in_the_idle_pass	disk-target-dedupe-nested	
 src/harness/disk_tests.rs	the_purge_row_is_surfaced_and_never_run_from_here	disk-report-classification	
 src/harness/disk_tests.rs	the_report_json_carries_every_row_with_its_witness	disk-report-json-headline	
@@ -1105,54 +1013,41 @@ src/harness/footer_tests.rs	a_branchs_copied_memory_mode_row_is_not_its_own	foot
 src/harness/footer_tests.rs	a_clear_keeps_the_model_the_process_chose	footer-process-session-switch-model	
 src/harness/footer_tests.rs	a_command_pairs_only_with_the_result_directly_under_it	footer-tail-fold-refines-model	
 src/harness/footer_tests.rs	a_conversation_born_before_the_switch_is_resumed	footer-process-session-switch-model	
-src/harness/footer_tests.rs	a_fast_result_names_the_model_only_when_it_moved_it	footer-tail-fold-refines-model	
 src/harness/footer_tests.rs	a_fifo_is_not_read	open-regular-nonblocking	
 src/harness/footer_tests.rs	a_fold_still_behind_shows_no_wall_it_has_not_caught_up_to	footer-fold-is-one-session	
-src/harness/footer_tests.rs	a_fresh_read_finds_the_cwd_above_a_huge_row	footer-tail-cache-equals-fresh-read	
 src/harness/footer_tests.rs	a_head_names_its_branch_or_a_short_commit	footer-branch-of-head	
 src/harness/footer_tests.rs	a_kept_model_leaves_the_facts_as_they_were	footer-tail-fold-refines-model	
-src/harness/footer_tests.rs	a_known_pill_opens_a_mode_row	footer-mode-row-recognizer	
 src/harness/footer_tests.rs	a_launch_card_fills_only_open_facts	footer-card-fill	
 src/harness/footer_tests.rs	a_launch_pins_the_model_by_flag_or_environment	footer-launch-facts	
 src/harness/footer_tests.rs	a_launch_resume_pins_the_model_from_the_start	footer-process-session-switch-model	
-src/harness/footer_tests.rs	a_lights_reason_never_takes_a_limit_walls_room	footer-fit-rule-ladder	
 src/harness/footer_tests.rs	a_long_path_keeps_its_last_directory	footer-home-and-elide-path	
 src/harness/footer_tests.rs	a_model_command_row_pins_whatever_its_result_says	footer-chose-model-since	
 src/harness/footer_tests.rs	a_model_result_display_is_the_vendors_name	footer-model-name	
 src/harness/footer_tests.rs	a_narrow_pane_cuts_the_hint_between_words_and_the_row_is_still_the_mode_row	footer-mode-row-recognizer	
-src/harness/footer_tests.rs	a_narrow_panes_gaps_and_cut_items_leave_the_row_the_mode_row	footer-mode-row-recognizer	
 src/harness/footer_tests.rs	a_narrow_rule_gives_way_title_first_and_the_model_last	footer-fit-rule-ladder	
 src/harness/footer_tests.rs	a_new_conversation_or_process_never_shows_the_last_ones_usage	footer-fold-is-one-session	
-src/harness/footer_tests.rs	a_predecessors_choice_is_not_this_process	footer-tail-floor-attribution	
 src/harness/footer_tests.rs	a_reason_and_the_upgrade_note_take_the_accounts_room	footer-fit-rule-ladder	
 src/harness/footer_tests.rs	a_registry_entry_must_name_the_pid_it_is_filed_under	footer-session-entry-parse	
 src/harness/footer_tests.rs	a_renamed_pill_still_opens_with_a_pill_glyph	footer-mode-row-recognizer	
 src/harness/footer_tests.rs	a_response_a_subagent_was_served_since_takes_the_wall_down	footer-fold-is-one-session	
-src/harness/footer_tests.rs	a_restore_pins_the_model_for_every_later_resume	footer-process-session-switch-model	
 src/harness/footer_tests.rs	a_resume_carries_the_model_only_where_the_process_pinned_it	footer-process-session-switch-model	
 src/harness/footer_tests.rs	a_resume_into_a_conversation_begun_since_the_start_pins_it	footer-process-session-switch-model	
 src/harness/footer_tests.rs	a_resume_to_another_session_never_pairs_its_model_with_the_old_usage	footer-fold-is-one-session	
-src/harness/footer_tests.rs	a_resumed_process_never_shows_its_predecessors_model	footer-tail-floor-attribution	
 src/harness/footer_tests.rs	a_reused_pid_is_refused_by_its_start_time	footer-session-entry-parse	
-src/harness/footer_tests.rs	a_row_without_a_pill_is_no_mode_row	footer-mode-row-recognizer	
 src/harness/footer_tests.rs	a_switch_from_the_launch_model_names_no_effort_until_one_is_read	footer-process-session-switch-model	
 src/harness/footer_tests.rs	a_switch_that_names_no_effort_keeps_it_only_for_the_same_model	footer-tail-fold-refines-model	
 src/harness/footer_tests.rs	a_torn_read_of_another_processs_file_shows_nothing	footer-fold-is-one-session	
 src/harness/footer_tests.rs	a_torn_read_of_the_same_session_keeps_its_fold	footer-fold-is-one-session	
 src/harness/footer_tests.rs	a_worktree_pointing_into_a_provider_domain_is_absent	footer-git-head-resolution	
-src/harness/footer_tests.rs	after_clear_a_torn_read_never_shows_the_last_conversations_usage	footer-fold-is-one-session	
 src/harness/footer_tests.rs	an_answer_past_the_tail_window_is_carried_for_the_same_process	footer-tail-cache-equals-fresh-read	
 src/harness/footer_tests.rs	an_effort_result_names_the_effort_at_once	footer-tail-fold-refines-model	
 src/harness/footer_tests.rs	an_oversized_newest_answer_is_never_passed_over	footer-tail-cache-equals-fresh-read	
 src/harness/footer_tests.rs	an_unreadable_model_choice_voids_model_and_effort	footer-tail-fold-refines-model	
 src/harness/footer_tests.rs	an_unstamped_row_is_not_attributed	footer-tail-floor-attribution	
-src/harness/footer_tests.rs	cached_tail_does_not_freeze_live_repository_facts	footer-path-branch-follow	
 src/harness/footer_tests.rs	every_recorded_screen_has_a_rule_the_footer_can_write	§4	
 src/harness/footer_tests.rs	facts_floor_at_the_kernel_else_the_registry_start	footer-floor-of	
 src/harness/footer_tests.rs	git_head_follows_a_worktree_file_and_climbs_to_the_top	footer-git-head-resolution	
-src/harness/footer_tests.rs	launch_facts_take_only_a_real_id	footer-launch-facts	
 src/harness/footer_tests.rs	model_ids_read_as_the_vendor_spells_them	footer-model-display	
-src/harness/footer_tests.rs	nothing_else_is_a_mode_row	footer-mode-row-recognizer	
 src/harness/footer_tests.rs	one_footer_read_looks_its_transcript_up_once	footer-fold-is-one-session	
 src/harness/footer_tests.rs	only_an_eperm_refusal_reads_as_denied	footer-git-head-resolution	
 src/harness/footer_tests.rs	read_git_head_opens_nothing_under_a_file_provider_domain	footer-git-head-resolution	
@@ -1164,37 +1059,23 @@ src/harness/footer_tests.rs	the_account_stands_after_the_model_and_before_the_pa
 src/harness/footer_tests.rs	the_claude_dir_is_the_processs_own	claude-dir-of	
 src/harness/footer_tests.rs	the_facts_are_set_as_a_line_of_type	footer-set-facts-typesetting	
 src/harness/footer_tests.rs	the_folded_facts_are_this_sessions_transcript	footer-fold-is-one-session	
-src/harness/footer_tests.rs	the_footer_is_three_marks_in_order_and_skips_what_it_lacks	footer-segments-order	
 src/harness/footer_tests.rs	the_last_cwd_is_the_newest_main_thread_rows	footer-last-cwd	
 src/harness/footer_tests.rs	the_launch_card_is_read_only_under_a_live_repl	footer-card-fill	
 src/harness/footer_tests.rs	the_limit_wall_is_read_from_the_transcripts_row	footer-fold-is-one-session	
 src/harness/footer_tests.rs	the_mode_row_is_found_under_the_composer_and_nowhere_else	footer-mode-row-recognizer	
-src/harness/footer_tests.rs	the_owners_model_choice_names_the_model_at_once	footer-tail-fold-refines-model	
 src/harness/footer_tests.rs	the_path_and_branch_follow_the_bash_tools_directory	footer-path-branch-follow	
 src/harness/footer_tests.rs	the_path_shows_home_as_a_tilde	footer-home-and-elide-path	
 src/harness/footer_tests.rs	the_rule_run_is_the_widest_plain_run	footer-rule-run	
 src/harness/footer_tests.rs	the_slug_matches_claude_codes_project_directories	footer-project-slug	
 src/harness/footer_tests.rs	the_tail_takes_the_newest_main_thread_model_and_effort	footer-tail-fold-refines-model	
-src/harness/footer_tests.rs	the_upgrade_note_leads_and_gives_way_as_a_reason_does	footer-fit-rule-ladder	
-src/harness/footer_tests.rs	the_wall_leads_and_the_usage_comes_last	footer-segments-order	
-src/harness/goal_hold.rs	a_hold_reads_back_whole_beside_the_loops_ledger	goal-hold-record-roundtrip	
-src/harness/goal_hold.rs	one_owner_holds_a_goal_at_a_time	goal-hold-one-owner	
-src/harness/goal_hold.rs	the_box_is_the_upgrades_only_on_its_own_relaunch	goal-hold-box-is-upgrades	
-src/harness/lanes.rs	a_program_the_supervisor_does_not_host_has_no_lanes	lanes-table	
-src/harness/lanes.rs	each_supervised_agent_has_the_lanes_the_host_runs	lanes-table	
 src/harness/lights.rs	a_drawn_pill_this_build_cannot_name_replaces_the_mode_shown	lights-state-and-fold	
-src/harness/lights.rs	a_mode_draws_its_own_glyph_word_and_hue	lights-mode-pill-table	
 src/harness/lights.rs	a_narrow_panes_cut_hint_still_names_the_mode	lights-read-screen	
-src/harness/lights.rs	a_pill_this_build_does_not_know_is_unknown	lights-read-screen	
-src/harness/lights.rs	a_turn_in_flight_reads_busy	lights-read-screen	
 src/harness/lights.rs	each_toggle_is_claudes_own_input	lights-state-and-fold	
 src/harness/lights.rs	every_captured_footer_screen_of_every_build_is_read	§4	
 src/harness/lights.rs	every_recorded_screen_reads_definitely_or_not_at_all	§4	
 src/harness/lights.rs	no_composer_no_lights_and_no_drive	lights-read-screen	
 src/harness/lights.rs	the_2_1_283_screens_read_as_measured	lights-read-screen	
-src/harness/lights.rs	the_lights_read_claudes_own_indicators	lights-read-screen	
-src/harness/lights.rs	the_manual_pill_is_the_default_mode	lights-state-and-fold	
-src/harness/mod.rs	a_fake_instance_stops_when_its_request_log_is_dropped	§4	
+src/harness/lights.rs	the_2_1_301_screens_read_as_measured	lights-read-screen	
 src/harness/mod.rs	one_line_folds_what_a_hand_rolled_control_sweep_misses	one-line-shortcut-equivalence	
 src/harness/mod.rs	truncate_bytes_never_splits_a_character_and_never_grows_a_string	truncate-bytes	
 src/harness/netwatch.rs	a_stale_measure_reads_unknown_on_either_clock	netstate-reach-freshness	
@@ -1204,27 +1085,21 @@ src/harness/netwatch.rs	one_reader_takes_a_settings_files_env_block_and_its_api_
 src/harness/netwatch.rs	since_is_the_runs_start_and_an_overrun_is_unknown	netstate-reach-freshness	
 src/harness/netwatch.rs	the_route_is_the_default_only_without_a_base_url_provider_socket_or_proxy	netwatch-route-of	
 src/harness/netwatch.rs	the_schedule_probes_at_once_then_15_30_60_while_someone_waits_and_parks_when_nobody_does	netstate-schedule	
-src/harness/relaunch_tests.rs	a_codex_exit_is_decided_on_its_shells_word	relaunch-exit-record-look	
 src/harness/relaunch_tests.rs	a_cold_relaunch_carries_the_proven_active_account_and_nothing_else	relaunch-cold-login	
-src/harness/relaunch_tests.rs	a_cold_restore_yields_between_session_checks_but_live_relaunch_keeps_its_wait	relaunch-held-wait-table	
 src/harness/relaunch_tests.rs	a_label_is_a_login_only_through_the_roster	relaunch-account-login	
-src/harness/relaunch_tests.rs	a_line_that_cannot_hold_the_login_is_refused_never_typed_without_it	relaunch-line-drop-order	
 src/harness/relaunch_tests.rs	a_login_directory_is_typed_literally_or_the_line_is_refused	relaunch-line-env-quoting	
 src/harness/relaunch_tests.rs	a_one_shot_run_is_read_wherever_its_flag_stands	relaunch-one-shot	
 src/harness/relaunch_tests.rs	a_pill_names_its_mode_flag	relaunch-permission-mode	
-src/harness/relaunch_tests.rs	a_quiet_restarts_outcome_names_the_model_it_ran_never_unconfirmed	relaunch-quiet-outcome	
 src/harness/relaunch_tests.rs	a_relaunch_moves_to_a_newer_build_only_while_the_upgrade_is_on	relaunch-target-build	
 src/harness/relaunch_tests.rs	a_relaunch_resumes_the_mode_the_conversation_ran_in	relaunch-permission-mode	
 src/harness/relaunch_tests.rs	a_shell_that_has_the_tab_back_reads_as_ended_only_once_its_line_ran	relaunch-ended-at-once-shell-look	
 src/harness/relaunch_tests.rs	a_snapshot_follows_its_own_process_and_nothing_else	relaunch-snapshot-follow	
 src/harness/relaunch_tests.rs	a_step_is_relaunched_left_not_yet_or_never	relaunch-on-exit-refines-model	
-src/harness/relaunch_tests.rs	a_stored_login_is_read_off_the_exec_environment	acc-process-login-of-env	
 src/harness/relaunch_tests.rs	an_account_move_over_another_restart_in_flight_is_not_tried	relaunch-carried-word	
 src/harness/relaunch_tests.rs	an_account_moves_record_is_a_relaunch_that_ended_its_own_agent	relaunch-cause-classes	
 src/harness/relaunch_tests.rs	an_exit_is_promised_a_relaunch_only_where_the_line_can_hold_its_login	relaunch-promise-iff-plan	
 src/harness/relaunch_tests.rs	an_exit_is_relaunched_only_where_the_relaunch_would_plan_it	relaunch-promise-iff-plan	
 src/harness/relaunch_tests.rs	an_exit_is_relaunched_unless_someone_owns_it_or_it_is_limited	relaunch-on-exit-refines-model	
-src/harness/relaunch_tests.rs	another_actor_on_the_lock_is_never_a_miss	relaunch-on-exit-refines-model	
 src/harness/relaunch_tests.rs	the_back_off_grows_caps_and_forgives_a_healthy_run	relaunch-on-exit-refines-model	
 src/harness/relaunch_tests.rs	the_conversations_last_permission_mode_is_read_from_its_transcript	relaunch-permission-mode	
 src/harness/relaunch_tests.rs	the_look_at_an_exit_waits_out_its_own_removal_and_no_longer	relaunch-exit-record-look	
@@ -1241,7 +1116,6 @@ src/harness/restart_stamp_tests.rs	taking_a_stamp_takes_only_the_one_meant	resta
 src/harness/restart_stamp_tests.rs	the_act_reads_a_start_in_the_snapshots_own_spelling	kernel-start-spelling	
 src/harness/restart_stamp_tests.rs	the_lookup_names_its_exit_and_sweeps_what_is_over	restart-stamp-lookup-prune	
 src/harness/restart_stamp_tests.rs	the_prune_removes_only_a_stale_stamp	restart-stamp-lookup-prune	
-src/harness/restart_stamp_tests.rs	the_relaunch_that_files_an_asked_exit_takes_its_stamp_and_says_why	relaunch-cause-classes	
 src/harness/restart_stamp_tests.rs	the_stamp_standing_for_a_process_is_the_one_its_exit_is_read_by	restart-stamp-lookup-prune	
 src/harness/resume_tests.rs	a_named_resume_line_is_kept_whole_bare_or_not_at_all	resume-never-cut	
 src/harness/resume_tests.rs	the_line_carries_the_launch_flags_as_the_relaunch_does	resume-command-flags	
@@ -1249,14 +1123,12 @@ src/harness/resume_tests.rs	two_records_in_one_directory_each_pid_resumes_its_ow
 src/harness/session_usage_tests.rs	a_budget_bounds_one_read_and_the_next_carries_on	usage-incremental-fold-equals-one-pass	
 src/harness/session_usage_tests.rs	a_fifo_is_not_folded	open-regular-nonblocking	
 src/harness/session_usage_tests.rs	a_file_rewritten_in_place_is_caught_by_the_boundary_byte	usage-incremental-fold-equals-one-pass	
-src/harness/session_usage_tests.rs	a_file_that_cannot_be_followed_is_counted_as_unread	usage-session-aggregate	
 src/harness/session_usage_tests.rs	a_finished_subagent_keeps_its_totals_and_grows_on	usage-session-aggregate	
 src/harness/session_usage_tests.rs	a_line_that_is_not_utf8_is_counted_unparsed	usage-incremental-fold-equals-one-pass	
 src/harness/session_usage_tests.rs	a_missing_transcript_is_not_caught_up	usage-session-aggregate	
 src/harness/session_usage_tests.rs	a_quiet_file_behind_is_not_released	usage-session-aggregate	
 src/harness/session_usage_tests.rs	a_quiet_subagent_keeps_only_its_totals	usage-session-aggregate	
 src/harness/session_usage_tests.rs	a_released_file_changed_but_appended_is_unread	usage-session-aggregate	
-src/harness/session_usage_tests.rs	a_repeated_id_counts_once_across_reads	usage-incremental-fold-equals-one-pass	
 src/harness/session_usage_tests.rs	a_reread_reads_only_the_appended_bytes	usage-read-cost	
 src/harness/session_usage_tests.rs	a_reset_in_the_next_year_is_placed	usage-wall-of	
 src/harness/session_usage_tests.rs	a_response_served_since_takes_the_wall_down	usage-wall-of	
@@ -1267,7 +1139,6 @@ src/harness/session_usage_tests.rs	a_session_sums_its_subagent_transcripts_and_n
 src/harness/session_usage_tests.rs	a_span_is_said_as_the_local_clock	usage-wall-of	
 src/harness/session_usage_tests.rs	a_spent_budget_opens_no_more_files	usage-session-aggregate	
 src/harness/session_usage_tests.rs	a_subagent_behind_keeps_the_session_from_catching_up	usage-session-aggregate	
-src/harness/session_usage_tests.rs	a_torn_last_line_waits_for_its_newline	usage-incremental-fold-equals-one-pass	
 src/harness/session_usage_tests.rs	a_truncated_file_starts_the_fold_over	usage-incremental-fold-equals-one-pass	
 src/harness/session_usage_tests.rs	a_walk_cut_short_is_said_on_the_glass	usage-session-aggregate	
 src/harness/session_usage_tests.rs	a_wall_across_a_dst_jump_stands_its_real_time	usage-wall-of	
@@ -1298,130 +1169,25 @@ src/harness/tap_tests.rs	the_tap_value_is_exact_and_only_it_is_ours	tap-value-ou
 src/harness/tap_tests.rs	the_taps_row_reads_idle_and_keeps_the_mode_row_for_every_reader	tap-row-safe	
 src/harness/tap_tests.rs	the_verb_never_writes_a_secret_it_was_handed	tap-noninterference	
 src/harness/tap_tests.rs	the_verb_writes_its_reading_and_always_prints_one_line_and_exits_zero	tap-verb-total	
+src/harness/timings.rs	the_fast_clock_keeps_the_production_orders_and_its_seam_is_never_inherited	harness-timings-orders	
 src/harness/transcript.rs	discarded_fields_are_still_fully_validated	transcript-projection-refines-full-parse	
 src/harness/transcript.rs	projections_match_full_values_including_vendor_type_drift_and_duplicates	transcript-projection-refines-full-parse	
-src/harness/transcript.rs	the_conversation_keeps_a_limit_rows_status_reset_and_limit_type	transcript-conversation-quota	
 src/harness/transcript_corpus_tests.rs	transcript_projections_answer_as_recorded	transcript-projection-refines-full-parse	
 src/harness/upgrade_catalog.rs	a_hostile_value_is_not_a_model	catalog-parse-window	
 src/harness/upgrade_catalog.rs	build_facts_round_trip_through_the_disk_cache	catalog-build-facts-roundtrip	
 src/harness/upgrade_catalog.rs	the_280_literal_parses	catalog-parse-window	
 src/harness/upgrade_catalog.rs	the_scan_finds_a_marker_across_a_chunk_boundary	catalog-scan-chunk-invariance	
 src/harness/upgrade_catalog.rs	the_twin_names_its_binary_on_its_last_exec_line	catalog-twin-binary	
-src/harness/upgrade_codex_drive_tests.rs	a_background_terminal_that_outlives_the_answer_is_asked_again_then_given_up	codex-round-lifecycle	
-src/harness/upgrade_codex_drive_tests.rs	a_background_terminal_under_an_embedded_session_holds_its_exit_ready_or_not	codex-visit-exit-gate	
-src/harness/upgrade_codex_drive_tests.rs	a_background_terminal_under_the_daemon_holds_it_where_it_is	codex-visit-exit-gate	
-src/harness/upgrade_codex_drive_tests.rs	a_background_terminals_break_takes_the_notice_and_ends_nothing	codex-visit-exit-gate	
-src/harness/upgrade_codex_drive_tests.rs	a_busy_or_settling_thread_holds_the_daemon_where_it_is	codex-visit-exit-gate	
-src/harness/upgrade_codex_drive_tests.rs	a_codex_at_its_usage_wall_is_never_asked_or_re_asked_and_its_clocks_hold	codex-visit-exit-gate	
-src/harness/upgrade_codex_drive_tests.rs	a_codex_at_its_usage_wall_is_not_exited_whether_it_was_asked_or_not	codex-visit-exit-gate	
-src/harness/upgrade_codex_drive_tests.rs	a_codex_attached_to_the_daemon_that_the_sweep_does_not_list_holds_it	codex-visit-exit-gate	
-src/harness/upgrade_codex_drive_tests.rs	a_codex_daemon_behind_or_on_the_vendors_updater_is_due_and_the_pin_alone_boundedly	codex-candidate-and-due	
-src/harness/upgrade_codex_drive_tests.rs	a_codex_notice_naming_a_long_command_is_guarded_on_its_closing_word	codex-notice-text	
-src/harness/upgrade_codex_drive_tests.rs	a_codex_notice_naming_many_long_commands_stays_under_the_paste_placeholder	codex-notice-text	
-src/harness/upgrade_codex_drive_tests.rs	a_codex_of_another_home_is_never_this_sweeps	codex-candidate-and-due	
-src/harness/upgrade_codex_drive_tests.rs	a_codex_restart_holds_the_tab_from_its_last_look_to_the_relaunched_tui	codex-typed-under-hand	
-src/harness/upgrade_codex_drive_tests.rs	a_codex_round_that_gave_up_rests_then_a_new_one_asks_again	codex-round-lifecycle	
-src/harness/upgrade_codex_drive_tests.rs	a_codex_stale_exit_names_the_wait_that_held_its_line	codex-restart-record-closure	
-src/harness/upgrade_codex_drive_tests.rs	a_crashed_codex_is_relaunched_off_the_build_its_owner_holds	codex-owner-word	
-src/harness/upgrade_codex_drive_tests.rs	a_crashed_codex_is_relaunched_on_its_thread_and_told_why	codex-exit-witness-refines-model	
-src/harness/upgrade_codex_drive_tests.rs	a_crashed_codex_relaunched_off_a_held_build_is_still_held_at_its_next_visit	codex-owner-word	
-src/harness/upgrade_codex_drive_tests.rs	a_current_codex_in_the_tab_ends_a_move_that_failed_after_its_exit	codex-restart-record-closure	
-src/harness/upgrade_codex_drive_tests.rs	a_daemon_client_is_exited_by_a_typed_exit_and_resumed_on_the_managed_twin	codex-relaunch-own-thread	
-src/harness/upgrade_codex_drive_tests.rs	a_daemon_client_is_not_exited_where_no_marks_tell_its_hint_from_the_prompt	codex-visit-exit-gate	
-src/harness/upgrade_codex_drive_tests.rs	a_daemon_client_waits_for_its_daemon_and_for_every_quiet_gate	codex-visit-exit-gate	
-src/harness/upgrade_codex_drive_tests.rs	a_daemon_clients_thread_is_the_one_its_daemon_began_for_it	codex-relaunch-own-thread	
-src/harness/upgrade_codex_drive_tests.rs	a_daemon_reached_from_one_tabs_step_asks_every_codex_tab_it_serves	codex-candidate-and-due	
-src/harness/upgrade_codex_drive_tests.rs	a_goal_on_this_screen_places_no_other_sessions_turn	codex-visit-exit-gate	
-src/harness/upgrade_codex_drive_tests.rs	a_hand_resumed_codex_closes_a_restart_as_resumed_elsewhere	codex-restart-record-closure	
-src/harness/upgrade_codex_drive_tests.rs	a_missed_guard_on_exit_is_said_and_left_standing	codex-typed-under-hand	
-src/harness/upgrade_codex_drive_tests.rs	a_quiet_codex_move_after_a_given_up_round_a_newer_build_retargets_types_its_continuation	codex-round-lifecycle	
-src/harness/upgrade_codex_drive_tests.rs	a_quiet_codex_move_after_a_given_up_round_types_its_continuation	codex-round-lifecycle	
-src/harness/upgrade_codex_drive_tests.rs	a_registry_vouches_only_for_a_state_root_of_its_own_kind	codex-prune-refines-model	
-src/harness/upgrade_codex_drive_tests.rs	a_relaunch_that_waited_keeps_the_thread_its_first_attempt_read	codex-relaunch-own-thread	
-src/harness/upgrade_codex_drive_tests.rs	a_relaunched_codex_that_replays_the_wall_is_carried_on_once_and_never_stacked	codex-round-lifecycle	
-src/harness/upgrade_codex_drive_tests.rs	a_relaunched_codex_the_restart_found_is_yours_once_gone_adopted_or_not	codex-restart-record-closure	
-src/harness/upgrade_codex_drive_tests.rs	a_served_tabs_status_line_backs_the_kernels_count_at_the_daemon	codex-visit-exit-gate	
-src/harness/upgrade_codex_drive_tests.rs	a_tui_that_names_no_thread_is_never_relaunched_into_another	codex-relaunch-own-thread	
-src/harness/upgrade_codex_drive_tests.rs	a_turn_begun_since_the_sweeps_read_holds_the_exit	codex-visit-exit-gate	
-src/harness/upgrade_codex_drive_tests.rs	a_two_row_prompt_after_a_wiped_block_list_still_reads_the_tuis_own_hint	codex-relaunch-own-thread	
-src/harness/upgrade_codex_drive_tests.rs	an_embedded_conversation_is_asked_first_and_moved_only_on_its_ready_answer	codex-visit-exit-gate	
-src/harness/upgrade_codex_drive_tests.rs	an_enter_that_did_not_submit_the_notice_is_said_and_left_standing	codex-typed-under-hand	
-src/harness/upgrade_codex_drive_tests.rs	an_exit_the_tui_outlived_is_never_waited_on_again	codex-restart-record-closure	
-src/harness/upgrade_codex_drive_tests.rs	an_idle_conversation_behind_a_line_longer_than_the_tail_moves	codex-visit-exit-gate	
-src/harness/upgrade_codex_drive_tests.rs	an_unreadable_screen_is_recorded_and_blocks_after_half_an_hour	codex-round-lifecycle	
-src/harness/upgrade_codex_drive_tests.rs	another_sessions_turn_holds_an_idle_client_only_until_its_screen_places_it	codex-visit-exit-gate	
-src/harness/upgrade_codex_drive_tests.rs	at_a_break_a_daemon_mode_client_waits_background_and_its_daemon_is_only_read	codex-visit-exit-gate	
-src/harness/upgrade_codex_drive_tests.rs	due_distinguishes_a_current_codex_from_an_unknown_or_claude_foreground	codex-candidate-and-due	
-src/harness/upgrade_codex_drive_tests.rs	each_codex_notice_counts_one_ask_on_the_record	codex-round-lifecycle	
-src/harness/upgrade_codex_drive_tests.rs	only_a_tabs_foreground_codex_is_a_candidate	codex-candidate-and-due	
-src/harness/upgrade_codex_drive_tests.rs	the_codex_exit_is_read_off_its_command_block	codex-exit-witness-refines-model	
-src/harness/upgrade_codex_drive_tests.rs	the_codex_notice_and_the_continuation_are_typed_under_the_harnesss_hand	codex-typed-under-hand	
-src/harness/upgrade_codex_drive_tests.rs	the_daemon_is_moved_and_pinned_by_the_vendors_verb_with_its_own_environment	codex-daemon-verb-environment	
-src/harness/upgrade_codex_drive_tests.rs	the_daemon_update_verb_inherits_nothing_but_its_stdio	codex-daemon-verb-environment	
-src/harness/upgrade_codex_drive_tests.rs	the_owners_now_on_a_daemon_mode_tab_waives_its_own_attended_guard_at_the_daemon	codex-owner-word	
-src/harness/upgrade_codex_drive_tests.rs	the_owners_skip_or_defer_on_a_codex_tab_holds_its_daemon_too	codex-owner-word	
-src/harness/upgrade_codex_drive_tests.rs	the_owners_word_holds_or_hurries_a_codex_upgrade	codex-owner-word	
-src/harness/upgrade_codex_drive_tests.rs	the_prune_collects_a_closed_tabs_settled_codex_record_and_nothing_else	codex-prune-refines-model	
-src/harness/upgrade_codex_drive_tests.rs	the_real_visit_lets_a_person_near_the_tab_go_by_at_keys_only	codex-visit-exit-gate	
-src/harness/upgrade_codex_drive_tests.rs	the_real_visit_moves_at_settled_on_a_repaint_and_waits_at_prefer	codex-visit-exit-gate	
-src/harness/upgrade_codex_drive_tests.rs	the_real_visit_waits_a_keystroke_out_at_land	codex-visit-exit-gate	
-src/harness/upgrade_codex_drive_tests.rs	the_restart_is_carried_only_for_a_codex_whose_thread_is_settled	relaunch-promise-iff-plan	
-src/harness/upgrade_codex_drive_tests.rs	the_restart_is_carried_only_where_the_codex_lanes_plan_writes_its_line	relaunch-promise-iff-plan	
-src/harness/upgrade_codex_drive_tests.rs	the_tabs_own_subagents_hold_it_and_the_kernel_names_their_root	codex-visit-exit-gate	
-src/harness/upgrade_codex_drive_tests.rs	the_usage_wall_of_a_real_codex_reads_limited_on_every_screen_it_was_measured_on	codex-limited-fact	
-src/harness/upgrade_codex_drive_tests.rs	the_usage_wall_of_an_earlier_codex_reads_limited_with_and_without_a_reset	codex-limited-fact	
-src/harness/upgrade_codex_drive_tests.rs	the_window_hands_a_relaunched_codex_back_and_carries_it_on_at_its_next_idle_point	codex-restart-record-closure	
-src/harness/upgrade_codex_drive_tests.rs	tier1_the_real_codex_exit_read_conforms_to_the_model	codex-exit-witness-refines-model	
-src/harness/upgrade_codex_drive_tests.rs	what_the_daemon_waits_on_reaches_its_clients_row_and_words	codex-candidate-and-due	
-src/harness/upgrade_codex_drive_tests.rs	what_the_lane_never_places_holds_the_tab_where_the_kernel_names_nothing	codex-visit-exit-gate	
-src/harness/upgrade_codex_drive_tests.rs	without_shell_integration_the_kernel_names_the_thread_or_the_exit_waits	codex-visit-exit-gate	
-src/harness/upgrade_codex_drive_tests.rs	work_still_running_under_an_embedded_session_is_waited_for_ready_or_not	codex-visit-exit-gate	
-src/harness/upgrade_codex_limit_tests.rs	a_codex_spend_wall_is_the_owners_hold_never_a_limit_that_passed	codex-wall-visit	
-src/harness/upgrade_codex_limit_tests.rs	a_codex_wall_a_grace_past_its_named_reset_is_moved_as_any_idle_point	codex-wall-visit	
-src/harness/upgrade_codex_limit_tests.rs	a_codex_wall_records_the_reset_it_names_and_is_told_there_not_a_week_on	codex-wall-visit	
-src/harness/upgrade_codex_limit_tests.rs	a_codex_walls_bare_reset_is_kept_as_first_placed_across_midnight	codex-wall-reset	
-src/harness/upgrade_codex_limit_tests.rs	a_codex_walls_reset_is_read_by_the_supervisors_grammar	codex-wall-reset	
-src/harness/upgrade_codex_limit_tests.rs	a_codex_walls_reset_is_read_in_the_zone_the_codex_printed_it_in	codex-wall-reset	
-src/harness/upgrade_codex_limit_tests.rs	the_visit_and_the_watch_keep_a_walls_first_placement	codex-wall-visit	
-src/harness/upgrade_codex_limit_tests.rs	the_watch_records_a_codex_walls_named_reset_with_no_hands	codex-wall-visit	
-src/harness/upgrade_codex_tests.rs	a_background_terminal_is_a_session_leader_under_codex_and_a_helper_is_not	codex-background-terminals	
-src/harness/upgrade_codex_tests.rs	a_box_replaces_the_composer_and_is_read_as_one	codex-composer-reader	
-src/harness/upgrade_codex_tests.rs	a_break_of_background_work_notices_an_embedded_session_and_exits_nothing	codex-next-step-gate	
-src/harness/upgrade_codex_tests.rs	a_daemon_client_exits_at_an_idle_point_once_its_daemon_went_first	codex-next-step-gate	
-src/harness/upgrade_codex_tests.rs	a_goal_on_the_screen_keeps_every_running_thread_unplaced	codex-spawn-tree-and-placement	
-src/harness/upgrade_codex_tests.rs	a_goal_turns_head_is_told_from_its_work	codex-turn-back-chunk-invariance	
-src/harness/upgrade_codex_tests.rs	a_line_longer_than_many_chunks_is_carried_once	codex-turn-back-chunk-invariance	
-src/harness/upgrade_codex_tests.rs	a_narrow_pane_never_drops_the_resume_aterm_owes	codex-goal-pause	
-src/harness/upgrade_codex_tests.rs	a_quiet_embedded_conversation_exits_at_an_idle_point_with_nothing_asked	codex-next-step-gate	
-src/harness/upgrade_codex_tests.rs	a_rollouts_first_line_names_its_spawn_tree	codex-spawn-tree-and-placement	
-src/harness/upgrade_codex_tests.rs	a_stopped_codex_round_rests_then_rearms	codex-next-step-gate	
-src/harness/upgrade_codex_tests.rs	a_thread_id_is_a_hyphenated_uuid_and_nothing_else	codex-thread-ids	
-src/harness/upgrade_codex_tests.rs	a_tui_that_printed_nothing_is_never_relaunched_into_an_older_exits_thread	codex-exit-hint	
-src/harness/upgrade_codex_tests.rs	a_turn_event_is_read_back_wherever_the_chunks_cut_it	codex-turn-back-chunk-invariance	
-src/harness/upgrade_codex_tests.rs	a_turn_of_the_tabs_own_conversation_holds_it_subagents_included	codex-spawn-tree-and-placement	
-src/harness/upgrade_codex_tests.rs	a_version_is_read_from_the_package_that_names_the_binary_never_by_running_it	codex-package-version	
-src/harness/upgrade_codex_tests.rs	an_embedded_conversation_is_asked_first_and_exits_only_on_ready	codex-next-step-gate	
-src/harness/upgrade_codex_tests.rs	an_idle_turn_behind_a_line_longer_than_the_tail_reads_idle	codex-turn-back-chunk-invariance	
-src/harness/upgrade_codex_tests.rs	an_unknown_or_unresumable_launch_is_refused_not_guessed	codex-rewrite-argv	
-src/harness/upgrade_codex_tests.rs	codexs_status_line_says_when_a_background_terminal_runs	codex-background-terminals	
-src/harness/upgrade_codex_tests.rs	only_an_interactive_tui_is_a_tui_never_the_daemon_or_its_updater	codex-is-tui-argv	
-src/harness/upgrade_codex_tests.rs	past_the_bound_the_turn_stays_unknown	codex-turn-back-chunk-invariance	
-src/harness/upgrade_codex_tests.rs	ready_is_the_agents_last_word_after_the_latest_notice	codex-rollout-ready	
-src/harness/upgrade_codex_tests.rs	the_composer_is_read_by_codexs_caret_and_its_dim_placeholder	codex-composer-reader	
-src/harness/upgrade_codex_tests.rs	the_daemon_moves_onto_the_managed_build_only_while_every_thread_is_idle	codex-daemon-step-refines-model	
-src/harness/upgrade_codex_tests.rs	the_daemons_clients_are_its_sockets_peers	codex-background-terminals	
-src/harness/upgrade_codex_tests.rs	the_daemons_files_and_answers_are_read_as_measured	codex-daemon-files	
-src/harness/upgrade_codex_tests.rs	the_exit_hint_is_the_tuis_own_last_words	codex-exit-hint	
-src/harness/upgrade_codex_tests.rs	the_goal_pause_waits_retries_gives_up_and_resumes_at_its_bound	codex-goal-pause	
-src/harness/upgrade_codex_tests.rs	the_hint_is_read_above_the_prompts_first_row_past_the_tuis_own_tally	codex-exit-hint	
-src/harness/upgrade_codex_tests.rs	the_kernel_names_the_root_of_the_one_conversation_on_the_daemon	codex-spawn-tree-and-placement	
-src/harness/upgrade_codex_tests.rs	the_measured_manifest_parses_and_a_changed_layout_refuses	codex-package-version	
-src/harness/upgrade_codex_tests.rs	the_notice_opens_with_its_head_and_never_asks_to_cancel	codex-notice-text	
-src/harness/upgrade_codex_tests.rs	the_real_daemon_rule_is_the_derived_machine	codex-daemon-step-refines-model	
-src/harness/upgrade_codex_tests.rs	the_relaunch_on_exit_reads_a_thread_its_instant_and_its_directory	codex-thread-ids	
-src/harness/upgrade_codex_tests.rs	the_rewrite_resumes_the_thread_with_every_kept_flag	codex-rewrite-argv	
+src/harness/codex_alab_drive_tests.rs	a_registry_vouches_only_for_a_state_root_of_its_own_kind	codex-prune-refines-model	
+src/harness/codex_alab_drive_tests.rs	the_prune_collects_a_closed_tabs_settled_codex_record_and_nothing_else	codex-prune-refines-model	
+src/harness/codex_alab_tests.rs	a_thread_id_is_a_hyphenated_uuid_and_nothing_else	codex-thread-ids	
+src/harness/codex_alab_tests.rs	a_version_is_read_from_the_package_that_names_the_binary_never_by_running_it	codex-package-version	
+src/harness/codex_alab_tests.rs	an_unknown_or_unresumable_launch_is_refused_not_guessed	codex-rewrite-argv	
+src/harness/codex_alab_tests.rs	only_an_interactive_tui_is_a_tui_never_the_daemon_or_its_updater	codex-is-tui-argv	
+src/harness/codex_alab_tests.rs	the_measured_manifest_parses_and_a_changed_layout_refuses	codex-package-version	
+src/harness/codex_alab_tests.rs	the_relaunch_on_exit_reads_a_thread_and_its_instant	codex-thread-ids	
+src/harness/codex_alab_tests.rs	the_rewrite_resumes_the_thread_with_every_kept_flag	codex-rewrite-argv	
 src/harness/upgrade_drive_tests.rs	a_barred_ride_is_dropped_once_and_the_round_goes_on_without_it	model-ask-ledger	
-src/harness/upgrade_drive_tests.rs	a_bash_prompt_is_typed_the_relaunch_line_never_pasted	relaunch-line-dialect-and-rekey	
 src/harness/upgrade_drive_tests.rs	a_bash_prompt_with_typing_after_its_mark_is_never_typed_at	relaunch-prompt-read	
 src/harness/upgrade_drive_tests.rs	a_break_of_background_work_takes_a_notice_and_ends_nothing	presence-settle-ladder-gates	
 src/harness/upgrade_drive_tests.rs	a_build_that_failed_to_start_for_any_conversation_moves_no_agent_onto_it	failed-start-gate	
@@ -1439,40 +1205,30 @@ src/harness/upgrade_drive_tests.rs	a_conversation_with_no_task_is_carried_on_wit
 src/harness/upgrade_drive_tests.rs	a_crash_read_at_its_exit_is_relaunched_whatever_removes_its_record_later	exit-record-refinement	
 src/harness/upgrade_drive_tests.rs	a_crashed_native_sessions_riding_model_is_the_native_builds	model-evidence-scope	
 src/harness/upgrade_drive_tests.rs	a_dead_or_foreign_sibling_leaves_the_roster_whole	session-roster-integrity	
-src/harness/upgrade_drive_tests.rs	a_dead_owners_leftover_session_file_does_not_strand_the_restart	in-flight-orphan-pass	
 src/harness/upgrade_drive_tests.rs	a_declining_agent_is_asked_a_bounded_number_of_times_a_day	stop-rest-ladder	
 src/harness/upgrade_drive_tests.rs	a_displaced_grid_never_makes_a_placeholder_a_draft	composer-empty-caret-dim	
 src/harness/upgrade_drive_tests.rs	a_draft_begun_before_the_signal_vetoes_it	last-look-before-signal	
 src/harness/upgrade_drive_tests.rs	a_drain_a_person_holds_past_its_bound_voids_the_answer_and_asks_again	drain-void	
-src/harness/upgrade_drive_tests.rs	a_dropped_sweep_lock_is_free_while_a_copy_of_its_descriptor_lives	sweep-lock-exclusive	
+src/harness/upgrade_drive_tests.rs	a_dry_runs_connection_reads_and_has_no_hands	upgrade-dry-run-no-hands	relay-read-only-connection
 src/harness/upgrade_drive_tests.rs	a_due_model_rides_a_restart_made_for_another_reason	model-ask-ledger	
 src/harness/upgrade_drive_tests.rs	a_failed_model_on_the_launch_line_is_dropped_by_a_relaunch_asking_none	relaunch-line-construction	
 src/harness/upgrade_drive_tests.rs	a_failed_start_is_noted_against_its_build_once_by_the_one_writer	failed-start-gate	
-src/harness/upgrade_drive_tests.rs	a_failure_whose_relaunch_came_up_after_all_is_taken_back_from_its_build	failed-start-gate	
-src/harness/upgrade_drive_tests.rs	a_fallback_after_a_model_chosen_by_hand_goes_back_to_that_model	model-way-back	
 src/harness/upgrade_drive_tests.rs	a_footer_quoted_in_the_transcript_is_no_turn_running	busy-footer-live-zone	
 src/harness/upgrade_drive_tests.rs	a_fresh_restart_types_nothing_plans_no_resume_and_keeps_every_last_look	task-detection-and-fresh-restart	
-src/harness/upgrade_drive_tests.rs	a_fresh_start_is_the_same_launch_without_the_resume	relaunch-line-construction	
 src/harness/upgrade_drive_tests.rs	a_give_up_at_a_break_types_the_release_it_owes	release-owed-is-paid-once	
 src/harness/upgrade_drive_tests.rs	a_gone_notice_leaves_a_new_round_pending_in_the_holders_tab	notice-owner-refinement	
 src/harness/upgrade_drive_tests.rs	a_gone_notices_row_promises_no_ask_to_a_holder_already_current	notice-owner-refinement	
 src/harness/upgrade_drive_tests.rs	a_hand_resume_keeps_the_stop_of_the_build_that_failed_to_start_for_it	failed-start-gate	
-src/harness/upgrade_drive_tests.rs	a_homed_draft_is_never_read_as_the_placeholder	composer-empty-caret-dim	
 src/harness/upgrade_drive_tests.rs	a_hung_exit_past_its_bound_is_noted_once_and_nothing_is_forced	in-flight-orphan-pass	
 src/harness/upgrade_drive_tests.rs	a_hung_exit_with_no_session_file_is_noted_once_by_the_orphan_pass	in-flight-orphan-pass	
-src/harness/upgrade_drive_tests.rs	a_job_read_lets_through_only_its_shells_foreground_job	job-classification	
-src/harness/upgrade_drive_tests.rs	a_kept_model_flag_is_the_reason_a_launch_with_one_changed_model	model-ask-ledger	
 src/harness/upgrade_drive_tests.rs	a_key_or_a_prompt_after_the_first_look_stops_the_restart_before_its_signal	last-look-before-signal	
 src/harness/upgrade_drive_tests.rs	a_labelled_top_rule_is_the_input_box_the_notice_fences_on	typed-turn-fence	
-src/harness/upgrade_drive_tests.rs	a_late_ready_onto_a_build_that_fails_to_start_is_released	release-owed-is-paid-once	
 src/harness/upgrade_drive_tests.rs	a_launch_is_waited_on_for_its_record_only_within_its_window	due-never-drops-unread	
 src/harness/upgrade_drive_tests.rs	a_launch_noted_once_its_record_is_there_is_behind_from_the_attach	age-is-one-process	
 src/harness/upgrade_drive_tests.rs	a_launch_that_cannot_be_carried_is_refused_before_the_agent_is_asked_to_wind_down	announce-preflight	
 src/harness/upgrade_drive_tests.rs	a_listed_model_replaces_every_launch_model_spelling	relaunch-line-construction	
 src/harness/upgrade_drive_tests.rs	a_live_relaunch_on_exit_keeps_its_wait_when_its_shell_has_the_tab	relaunch-ended-verdict	
 src/harness/upgrade_drive_tests.rs	a_mark_that_names_another_row_is_no_persons_typing	relaunch-prompt-read	
-src/harness/upgrade_drive_tests.rs	a_memory_restart_carries_a_model_chosen_by_hand_not_the_launchs	model-way-back	
-src/harness/upgrade_drive_tests.rs	a_model_chosen_by_hand_after_a_fallback_is_not_undone_by_the_way_back	model-way-back	
 src/harness/upgrade_drive_tests.rs	a_native_session_is_judged_by_the_native_builds_own_offer	model-evidence-scope	
 src/harness/upgrade_drive_tests.rs	a_new_upgrade_waits_for_the_last_restarts_model	model-ask-ledger	
 src/harness/upgrade_drive_tests.rs	a_newer_build_landing_in_a_rest_keeps_the_process_s_history	retarget-arms	
@@ -1482,13 +1238,11 @@ src/harness/upgrade_drive_tests.rs	a_notice_the_host_stopped_stands_unsent_and_i
 src/harness/upgrade_drive_tests.rs	a_notice_whose_process_is_gone_is_asked_afresh_of_the_live_holder	notice-owner-refinement	
 src/harness/upgrade_drive_tests.rs	a_parent_that_cannot_be_read_is_no_verdict_on_the_relaunch	relaunch-by-parent	
 src/harness/upgrade_drive_tests.rs	a_pass_reads_every_claude_home_its_tabs_agents_run_under	claude-home-resolution	
-src/harness/upgrade_drive_tests.rs	a_pending_round_owing_a_release_types_it_while_its_build_fails_to_start	release-owed-is-paid-once	
 src/harness/upgrade_drive_tests.rs	a_pending_round_that_owes_its_agent_a_release_is_carried_on_not_quiet	release-owed-is-paid-once	
 src/harness/upgrade_drive_tests.rs	a_person_at_the_tab_owns_the_turn_end_for_their_grace	turn-end-ownership	
 src/harness/upgrade_drive_tests.rs	a_pressed_notice_leaves_an_open_survey_to_the_person	pressed-text-delivery	
 src/harness/upgrade_drive_tests.rs	a_pressed_notices_enter_is_guarded_on_its_own_last_row	pressed-text-delivery	
 src/harness/upgrade_drive_tests.rs	a_pressed_notices_turn_budget_covers_its_keys_and_its_digits	pressed-text-delivery	
-src/harness/upgrade_drive_tests.rs	a_prompt_no_mark_attests_is_never_typed_on_the_stamp_alone	relaunch-prompt-read	
 src/harness/upgrade_drive_tests.rs	a_quiet_pending_round_types_the_release_it_owes_where_work_holds_its_restart	release-owed-is-paid-once	
 src/harness/upgrade_drive_tests.rs	a_quiet_restart_is_carried_on_with_nothing	quiet-flow	
 src/harness/upgrade_drive_tests.rs	a_quiet_round_an_older_build_announced_gives_up_and_releases_its_agent	release-owed-is-paid-once	
@@ -1497,22 +1251,17 @@ src/harness/upgrade_drive_tests.rs	a_quiet_wait_on_the_agents_work_owns_no_turn_
 src/harness/upgrade_drive_tests.rs	a_ready_answer_is_heard_at_its_turn_end_and_a_superseded_one_is_asked_again	ready-consent	
 src/harness/upgrade_drive_tests.rs	a_ready_answer_is_read_when_the_tail_window_starts_inside_a_character	tail-window-bounded	
 src/harness/upgrade_drive_tests.rs	a_ready_answer_the_owners_hold_superseded_is_never_signalled_after_it	ready-consent	
-src/harness/upgrade_drive_tests.rs	a_ready_for_a_build_that_failed_to_start_stops_the_round_and_releases_its_agent	release-owed-is-paid-once	
-src/harness/upgrade_drive_tests.rs	a_real_visit_waits_on_a_build_that_failed_to_start_and_says_it_once	failed-start-gate	
 src/harness/upgrade_drive_tests.rs	a_record_names_its_agent_or_is_no_record	state-record-roundtrip	
 src/harness/upgrade_drive_tests.rs	a_record_of_an_unknown_agent_is_passed_by_and_left_as_it_lies	wait-log-ledger-and-prune-bounds	
-src/harness/upgrade_drive_tests.rs	a_record_whose_process_could_not_be_read_is_unread_never_not_due	due-never-drops-unread	
 src/harness/upgrade_drive_tests.rs	a_refusal_with_a_model_due_is_said_once_not_every_pass	model-ask-ledger	
 src/harness/upgrade_drive_tests.rs	a_refused_signal_takes_back_the_model_it_asked	model-ask-ledger	
 src/harness/upgrade_drive_tests.rs	a_relative_claude_home_is_followed_by_the_relaunch_and_the_restart_in_place	claude-home-resolution	
 src/harness/upgrade_drive_tests.rs	a_relative_claude_home_the_line_would_move_is_refused	claude-home-resolution	
-src/harness/upgrade_drive_tests.rs	a_relaunch_after_aterm_ended_types_why_it_was_relaunched	continuation-words-and-mode	
 src/harness/upgrade_drive_tests.rs	a_relaunch_handed_to_its_loop_ends_at_adoption_and_is_owed_to_its_tab	relaunch-adoption	
 src/harness/upgrade_drive_tests.rs	a_relaunch_in_flight_finds_its_process_under_the_home_its_line_carried	claude-home-resolution	
 src/harness/upgrade_drive_tests.rs	a_relaunch_line_waits_on_a_live_owner_under_its_agents_own_home	no-act-without-ownership-proofs	
 src/harness/upgrade_drive_tests.rs	a_relaunch_on_exit_needs_an_exit_and_a_conversation_on_record	exit-record-refinement	
 src/harness/upgrade_drive_tests.rs	a_relaunch_stopped_no_resume_whose_agent_came_up_is_carried_on	relaunch-adoption	
-src/harness/upgrade_drive_tests.rs	a_relaunch_that_ended_as_it_started_is_said_at_once	relaunch-ended-verdict	
 src/harness/upgrade_drive_tests.rs	a_relaunch_that_never_carries_on_is_noted_once_past_its_bound	in-flight-orphan-pass	
 src/harness/upgrade_drive_tests.rs	a_relaunch_typed_at_bash_takes_the_key_its_live_shell_names	relaunch-line-dialect-and-rekey	
 src/harness/upgrade_drive_tests.rs	a_relaunch_whose_parent_cannot_be_read_is_waited_for_never_failed	relaunch-adoption	
@@ -1537,10 +1286,8 @@ src/harness/upgrade_drive_tests.rs	a_restart_says_the_model_before_and_confirms_
 src/harness/upgrade_drive_tests.rs	a_restart_that_stops_keeps_the_owners_skip_of_the_build_it_held_off	owner-word-survives-restart	
 src/harness/upgrade_drive_tests.rs	a_restart_whose_agent_is_not_reaped_yet_says_when_it_ended	in-flight-orphan-pass	
 src/harness/upgrade_drive_tests.rs	a_restart_whose_agent_the_orphan_pass_sees_gone_says_when	in-flight-orphan-pass	
-src/harness/upgrade_drive_tests.rs	a_restart_whose_agent_the_relaunch_sees_gone_says_when	in-flight-orphan-pass	
 src/harness/upgrade_drive_tests.rs	a_restart_without_a_mark_is_unconfirmed_at_once	model-ask-ledger	
 src/harness/upgrade_drive_tests.rs	a_restarts_line_is_judged_by_the_block_it_was_typed_into	relaunch-ended-verdict	
-src/harness/upgrade_drive_tests.rs	a_restored_relaunch_still_starting_or_unread_is_waited_on_not_failed	relaunch-ended-verdict	
 src/harness/upgrade_drive_tests.rs	a_resumed_session_that_has_not_answered_is_unconfirmed	model-ask-ledger	
 src/harness/upgrade_drive_tests.rs	a_retarget_is_told_by_the_arm_that_made_it	retarget-arms	
 src/harness/upgrade_drive_tests.rs	a_reused_state_names_the_build_the_sweep_would_start_now	retarget-arms	
@@ -1548,12 +1295,8 @@ src/harness/upgrade_drive_tests.rs	a_roster_reads_every_home_whole_or_not_at_all
 src/harness/upgrade_drive_tests.rs	a_screen_reply_is_read_with_the_cursor_made_relative_to_its_rows	screen-reply-parse	
 src/harness/upgrade_drive_tests.rs	a_second_fallback_from_a_launch_with_no_model_goes_back_to_no_model	model-way-back	
 src/harness/upgrade_drive_tests.rs	a_second_sweeper_does_nothing_while_the_first_holds_the_lock	sweep-lock-exclusive	
-src/harness/upgrade_drive_tests.rs	a_session_behind_is_minted_pending_at_attach_and_its_step_keeps_the_age	age-is-one-process	
 src/harness/upgrade_drive_tests.rs	a_session_upgraded_before_is_behind_anew_when_a_newer_build_lands	age-is-one-process	
-src/harness/upgrade_drive_tests.rs	a_skipped_turn_typed_nothing	pressed-text-delivery	
-src/harness/upgrade_drive_tests.rs	a_stale_exit_names_the_wait_that_held_its_line	in-flight-orphan-pass	
 src/harness/upgrade_drive_tests.rs	a_state_main_wrote_reads_with_the_owners_fields_at_their_defaults	state-record-roundtrip	
-src/harness/upgrade_drive_tests.rs	a_step_that_typed_or_ended_the_agent_moved_the_session	step-word-classification	
 src/harness/upgrade_drive_tests.rs	a_stop_that_repeats_rests_longer_and_never_for_good	stop-rest-ladder	
 src/harness/upgrade_drive_tests.rs	a_stopped_rounds_retarget_keeps_what_says_its_tui_was_told_to_wind_down	retarget-arms	
 src/harness/upgrade_drive_tests.rs	a_stopped_upgrade_retargeted_keeps_its_clock_word_and_streak	retarget-arms	
@@ -1563,32 +1306,25 @@ src/harness/upgrade_drive_tests.rs	a_terminal_is_the_tabs_only_when_aterm_opened
 src/harness/upgrade_drive_tests.rs	a_timed_out_version_probe_is_retried_on_a_back_off	version-cache-backoff	
 src/harness/upgrade_drive_tests.rs	a_transcript_append_cannot_grow_a_tail_read_past_its_budget	tail-window-bounded	
 src/harness/upgrade_drive_tests.rs	a_turn_begun_since_the_look_takes_no_notice_and_no_release_under_the_rows_fence	last-look-before-signal	
-src/harness/upgrade_drive_tests.rs	a_typed_turn_returns_once_its_submit_is_taken_not_after_the_answer	typed-turn-fence	
 src/harness/upgrade_drive_tests.rs	a_version_probe_is_bounded_whole	bounded-child-probe	
-src/harness/upgrade_drive_tests.rs	a_visit_that_waits_records_what_it_read	wait-log-ledger-and-prune-bounds	
 src/harness/upgrade_drive_tests.rs	a_visits_own_retarget_is_said_once_in_the_ledger	retarget-arms	
 src/harness/upgrade_drive_tests.rs	a_yield_that_times_out_never_fails_the_relaunch	relaunch-prompt-read	
 src/harness/upgrade_drive_tests.rs	after_a_step_the_host_parks_waits_longer_stops_or_says_it_is_broken	step-word-classification	
 src/harness/upgrade_drive_tests.rs	an_account_move_types_the_rosters_login_and_a_label_nobody_lists_is_refused	restart-carries-login-and-tap	
-src/harness/upgrade_drive_tests.rs	an_adoption_is_said_once_in_the_words_of_its_move	relaunch-adoption	
 src/harness/upgrade_drive_tests.rs	an_age_belongs_to_one_process	age-is-one-process	
 src/harness/upgrade_drive_tests.rs	an_agent_no_job_control_shell_started_is_refused_before_anything_is_typed	no-act-without-ownership-proofs	
 src/harness/upgrade_drive_tests.rs	an_agent_on_a_pty_the_tab_does_not_own_is_never_driven_through_the_tab	no-act-without-ownership-proofs	
 src/harness/upgrade_drive_tests.rs	an_agent_under_an_empty_claude_home_is_judged_by_the_profile_claude_code_keeps_for_it	model-evidence-scope	
-src/harness/upgrade_drive_tests.rs	an_agent_under_an_empty_claude_home_is_read_where_claude_code_files_it	claude-home-resolution	
 src/harness/upgrade_drive_tests.rs	an_agent_under_another_claude_home_is_judged_by_its_homes_model_files	model-evidence-scope	
 src/harness/upgrade_drive_tests.rs	an_agent_under_another_claude_home_is_relaunched_off_its_own_records	claude-home-resolution	
-src/harness/upgrade_drive_tests.rs	an_agent_under_another_claude_home_moves_to_the_model_its_home_announces	model-evidence-scope	
 src/harness/upgrade_drive_tests.rs	an_agent_whose_host_ended_is_relaunched_in_its_reopened_tab	exit-record-refinement	
 src/harness/upgrade_drive_tests.rs	an_agent_whose_records_a_worktree_split_waits_and_is_asked_nothing	claude-home-resolution	
 src/harness/upgrade_drive_tests.rs	an_agents_own_home_keeps_its_records_and_its_profile	claude-home-resolution	
 src/harness/upgrade_drive_tests.rs	an_announced_round_carrying_a_model_is_looked_at_with_the_build_current	due-never-drops-unread	
-src/harness/upgrade_drive_tests.rs	an_announced_round_whose_build_fails_to_start_releases_its_agent	release-owed-is-paid-once	
 src/harness/upgrade_drive_tests.rs	an_announcement_is_planned_in_the_mode_the_pill_shows	continuation-words-and-mode	
 src/harness/upgrade_drive_tests.rs	an_ask_that_ran_is_never_recorded_failed_when_a_person_moves_off_it	model-ask-ledger	
 src/harness/upgrade_drive_tests.rs	an_attended_ready_session_is_never_signalled_without_the_owners_now	presence-settle-ladder-gates	
 src/harness/upgrade_drive_tests.rs	an_attended_tab_has_a_person_at_it_and_is_said_once	presence-settle-ladder-gates	
-src/harness/upgrade_drive_tests.rs	an_exit_relaunch_carries_a_model_chosen_by_hand_not_the_launchs	model-way-back	
 src/harness/upgrade_drive_tests.rs	an_exit_relaunch_saves_the_fallback_origin_it_decides	model-way-back	
 src/harness/upgrade_drive_tests.rs	an_exit_relaunch_types_back_the_login_the_agent_ran_under	restart-carries-login-and-tap	
 src/harness/upgrade_drive_tests.rs	an_exit_relaunch_with_no_record_carries_no_choice_older_than_the_process	model-way-back	
@@ -1607,32 +1343,25 @@ src/harness/upgrade_drive_tests.rs	an_upgrade_relaunch_that_ended_as_it_started_
 src/harness/upgrade_drive_tests.rs	an_upgrade_restart_makes_the_hand_choice_it_carries_the_fallbacks_origin	model-way-back	
 src/harness/upgrade_drive_tests.rs	an_upgrade_restarts_a_conversation_with_no_task_afresh_and_announces_to_one_with_a_task	task-detection-and-fresh-restart	
 src/harness/upgrade_drive_tests.rs	an_upgrade_resumes_in_the_mode_the_pill_shows_not_the_transcripts_older_one	continuation-words-and-mode	
-src/harness/upgrade_drive_tests.rs	an_upgrade_the_owner_holds_owns_no_turn_end	turn-end-ownership	
 src/harness/upgrade_drive_tests.rs	an_upgrades_record_names_the_claude_home_its_agent_runs_under	claude-home-resolution	
 src/harness/upgrade_drive_tests.rs	another_homes_announcement_grows_only_its_own_agents_list	model-evidence-scope	
 src/harness/upgrade_drive_tests.rs	aterms_own_words_are_read_never_taken_back	left-typed-never-erased	
-src/harness/upgrade_drive_tests.rs	background_work_is_the_shells_under_the_agent_at_any_depth	background-walk	
 src/harness/upgrade_drive_tests.rs	carry_on_is_held_for_a_person_at_the_keys	no-act-without-ownership-proofs	
 src/harness/upgrade_drive_tests.rs	carry_on_rechecks_tab_ownership_at_the_turn	no-act-without-ownership-proofs	
 src/harness/upgrade_drive_tests.rs	closing_a_reached_pending_record_keeps_the_owners_defer	forget-settled-pending	
-src/harness/upgrade_drive_tests.rs	codex_due_answers_do_not_scan_claude_sessions	codex-due-short-circuit	
 src/harness/upgrade_drive_tests.rs	continuation_poll_confirms_an_empty_tail_with_the_full_screen	composer-empty-caret-dim	
 src/harness/upgrade_drive_tests.rs	continuation_poll_falls_back_on_an_unreadable_or_inconclusive_tail	composer-empty-caret-dim	
-src/harness/upgrade_drive_tests.rs	continuation_poll_uses_only_the_tail_while_a_draft_remains	composer-empty-caret-dim	
 src/harness/upgrade_drive_tests.rs	current_claude_skips_process_inspection_but_new_and_in_flight_do_not	host-candidates-read-order	
 src/harness/upgrade_drive_tests.rs	due_is_this_tabs_upgrade_or_restart_and_nothing_unread	due-never-drops-unread	
 src/harness/upgrade_drive_tests.rs	every_look_at_the_job_stands_between_a_ctrl_z_and_the_act	no-act-without-ownership-proofs	
 src/harness/upgrade_drive_tests.rs	every_phase_survives_the_state_file	state-record-roundtrip	
 src/harness/upgrade_drive_tests.rs	every_reader_finds_a_relative_homes_records_where_its_agent_filed_them	claude-home-resolution	
-src/harness/upgrade_drive_tests.rs	every_step_word_is_taught_and_an_untaught_one_is_looked_at_again	step-word-classification	
 src/harness/upgrade_drive_tests.rs	host_filters_foreign_groups_before_expensive_process_reads	host-candidates-read-order	
 src/harness/upgrade_drive_tests.rs	malformed_or_unreadable_sibling_vetoes_a_valid_owner	session-roster-integrity	
-src/harness/upgrade_drive_tests.rs	multiple_candidates_share_one_preliminary_session_scan	host-candidates-read-order	
 src/harness/upgrade_drive_tests.rs	only_a_restart_that_ended_its_agent_dates_a_persons_keys	relaunch-prompt-read	
 src/harness/upgrade_drive_tests.rs	only_its_shells_foreground_job_is_ever_announced_to_or_ended	job-classification	
 src/harness/upgrade_drive_tests.rs	only_the_agents_own_words_are_pressed_where_the_host_takes_cap	pressed-text-delivery	
 src/harness/upgrade_drive_tests.rs	only_the_relaunch_itself_is_adopted_and_told_it_was_upgraded	relaunch-adoption	
-src/harness/upgrade_drive_tests.rs	only_what_a_sweep_did_is_an_act	step-word-classification	
 src/harness/upgrade_drive_tests.rs	park_when_asked	§4	
 src/harness/upgrade_drive_tests.rs	ready_from_tab_a_never_announces_or_terminates_tab_b	notice-owner-refinement	
 src/harness/upgrade_drive_tests.rs	relaunch_rechecks_shell_tab_after_the_session_scan	no-act-without-ownership-proofs	
@@ -1647,7 +1376,6 @@ src/harness/upgrade_drive_tests.rs	the_aside_of_every_instance_is_one	roster-asi
 src/harness/upgrade_drive_tests.rs	the_carry_of_a_restart_already_adopted_answers_without_waiting	relaunch-adoption	
 src/harness/upgrade_drive_tests.rs	the_carry_of_a_restart_whose_adopted_agent_is_gone_closes_it	relaunch-adoption	
 src/harness/upgrade_drive_tests.rs	the_carry_of_an_exit_whose_move_landed_meanwhile_says_nothing	carry-restart-outcome	
-src/harness/upgrade_drive_tests.rs	the_carry_of_an_upgrade_stopped_after_its_exit_leaves_the_ask_to_its_row	carry-restart-outcome	
 src/harness/upgrade_drive_tests.rs	the_claude_notice_fences_on_its_input_box_where_the_host_takes_if_rows	typed-turn-fence	
 src/harness/upgrade_drive_tests.rs	the_clis_sweep_finds_an_agent_under_another_claude_home_no_visit_recorded	claude-home-resolution	
 src/harness/upgrade_drive_tests.rs	the_clis_sweep_judges_an_empty_homes_agent_a_window_recorded_by_its_login	model-evidence-scope	
@@ -1659,7 +1387,6 @@ src/harness/upgrade_drive_tests.rs	the_end_of_the_agents_work_re_arms_and_asks_i
 src/harness/upgrade_drive_tests.rs	the_end_of_the_work_asks_no_sooner_than_its_floor_and_no_more_than_its_budget	stop-rest-ladder	
 src/harness/upgrade_drive_tests.rs	the_fence_judges_the_composer_row_not_the_cursors_row	typed-turn-fence	
 src/harness/upgrade_drive_tests.rs	the_fenced_notice_asks_nothing_between_its_read_and_its_turn	typed-turn-fence	
-src/harness/upgrade_drive_tests.rs	the_gate_reads_the_live_footer_not_a_dead_processs	busy-footer-live-zone	
 src/harness/upgrade_drive_tests.rs	the_hand_is_kept_through_every_wait_under_it	hand-lease-bracket	
 src/harness/upgrade_drive_tests.rs	the_harness_own_hand_holds_nothing_against_it_and_unread_input_holds_the_tab	held-by-status	
 src/harness/upgrade_drive_tests.rs	the_homes_model_caches_are_not_read_under_several_logins	model-evidence-scope	
@@ -1668,10 +1395,8 @@ src/harness/upgrade_drive_tests.rs	the_hosts_looks_read_the_record_under_the_age
 src/harness/upgrade_drive_tests.rs	the_kernel_reads_whether_a_shell_has_its_tab_back	relaunch-ended-verdict	
 src/harness/upgrade_drive_tests.rs	the_live_upgrade_finds_an_agent_under_another_claude_home	claude-home-resolution	
 src/harness/upgrade_drive_tests.rs	the_loops_words_in_another_conversation_are_no_turn_of_this_one	task-detection-and-fresh-restart	
-src/harness/upgrade_drive_tests.rs	the_model_rule_reads_the_agents_settings_chain_not_its_homes_file_alone	model-evidence-scope	
 src/harness/upgrade_drive_tests.rs	the_model_rule_takes_each_key_from_the_highest_document_that_sets_it	model-evidence-scope	
 src/harness/upgrade_drive_tests.rs	the_notice_is_fenced_on_the_generation_it_was_judged_on	typed-turn-fence	
-src/harness/upgrade_drive_tests.rs	the_notice_is_pressed_where_the_host_takes_cap_and_pasted_where_it_does_not	pressed-text-delivery	
 src/harness/upgrade_drive_tests.rs	the_notice_is_typed_under_the_harnesss_hand_and_a_refused_fence_is_retried	hand-lease-bracket	
 src/harness/upgrade_drive_tests.rs	the_notice_names_what_runs_under_the_agent_by_its_command	etime-and-command-head	
 src/harness/upgrade_drive_tests.rs	the_orphan_pass_leaves_a_restart_relaunched_since_its_list_was_read	in-flight-orphan-pass	
@@ -1679,7 +1404,6 @@ src/harness/upgrade_drive_tests.rs	the_owners_now_never_signals_a_turn_begun_sin
 src/harness/upgrade_drive_tests.rs	the_owners_now_probes_a_blind_build_again	failed-start-gate	
 src/harness/upgrade_drive_tests.rs	the_owners_now_restarts_a_quiet_session_whose_status_only_lags	quiet-flow	
 src/harness/upgrade_drive_tests.rs	the_owners_word_waives_nothing_in_a_tab_it_did_not_name	owner-word-survives-restart	
-src/harness/upgrade_drive_tests.rs	the_planned_relaunch_line_carries_the_claude_home	relaunch-line-construction	
 src/harness/upgrade_drive_tests.rs	the_planned_relaunch_line_carries_the_usage_tap_only_where_its_gate_holds	relaunch-line-construction	
 src/harness/upgrade_drive_tests.rs	the_pre_filter_never_restarts_a_native_sessions_warm_wait	model-evidence-scope	
 src/harness/upgrade_drive_tests.rs	the_real_age_conforms_to_the_age_model	age-is-one-process	
@@ -1704,7 +1428,6 @@ src/harness/upgrade_drive_tests.rs	the_settle_is_measured_from_the_agents_verdic
 src/harness/upgrade_drive_tests.rs	the_shells_own_block_says_whether_the_line_ran	relaunch-ended-verdict	
 src/harness/upgrade_drive_tests.rs	the_standing_wall_is_read_from_the_named_transcripts_bounded_tail	tail-window-bounded	
 src/harness/upgrade_drive_tests.rs	the_start_probe_runs_the_build_with_its_help_flag_bounded	bounded-child-probe	
-src/harness/upgrade_drive_tests.rs	the_survey_export_never_refuses_a_launch	relaunch-line-construction	
 src/harness/upgrade_drive_tests.rs	the_sweep_that_types_the_continuation_does_not_wait_for_the_answer	model-ask-ledger	
 src/harness/upgrade_drive_tests.rs	the_transcript_is_found_under_the_live_processs_own_config_dir	claude-home-resolution	
 src/harness/upgrade_drive_tests.rs	the_transcript_that_confirms_a_wall_is_found_from_the_process	claude-home-resolution	
@@ -1718,34 +1441,17 @@ src/harness/upgrade_drive_tests.rs	the_walls_tail_is_the_transcript_its_agent_wr
 src/harness/upgrade_drive_tests.rs	the_way_back_from_a_fallback_returns_to_the_launched_model_across_a_memory_restart	model-way-back	
 src/harness/upgrade_drive_tests.rs	the_way_back_prefers_the_persons_model_over_the_notices_alias	model-way-back	
 src/harness/upgrade_drive_tests.rs	the_window_hosts_limit_and_wall_readers_read_the_agents_own_claude_home	claude-home-resolution	
-src/harness/upgrade_drive_tests.rs	the_windows_step_answers_with_the_tabs_own_word_before_its_daemons	pick-tab-word	
+src/harness/upgrade_drive_tests.rs	the_windows_step_answers_with_the_tabs_own_word_before_another_tabs	pick-tab-word	
 src/harness/upgrade_drive_tests.rs	typeahead_before_the_first_read_is_never_the_mark	relaunch-prompt-read	
 src/harness/upgrade_drive_tests.rs	typing_that_wraps_at_the_bottom_of_the_screen_is_still_typing	relaunch-prompt-read	
 src/harness/upgrade_drive_tests.rs	what_holds_the_move_is_kept_by_its_start	age-is-one-process	
 src/harness/upgrade_drive_tests.rs	what_the_tabs_own_supervisor_typed_is_no_task	task-detection-and-fresh-restart	
 src/harness/upgrade_drive_tests.rs	whether_a_conversation_has_a_task_is_read_on_from_where_the_last_read_ended	task-detection-and-fresh-restart	
 src/harness/upgrade_drive_tests.rs	who_roster_exposes_a_unique_foreground_group_without_a_window_hop	host-roster-parse	
-src/harness/upgrade_goal_drive_tests.rs	a_goal_is_never_resumed_without_its_move_inside_a_sandbox	goal-pause-refinement	
-src/harness/upgrade_goal_drive_tests.rs	a_goal_resume_left_unsent_is_a_persons_hold_never_a_silent_stall	goal-pause-refinement	
-src/harness/upgrade_goal_drive_tests.rs	a_person_resuming_the_paused_goal_takes_it_from_aterm	goal-pause-refinement	
-src/harness/upgrade_goal_drive_tests.rs	a_resume_made_before_a_restart_is_never_made_twice	goal-pause-refinement	
-src/harness/upgrade_goal_drive_tests.rs	an_embedded_goal_is_paused_at_land_moved_and_resumed_once	goal-pause-refinement	
-src/harness/upgrade_goal_drive_tests.rs	an_open_save_then_wait_switch_keeps_the_pause_off	goal-pause-refinement	
-src/harness/upgrade_goal_drive_tests.rs	the_esc_is_pressed_only_at_a_goal_turns_head	goal-pause-refinement	
-src/harness/upgrade_goal_drive_tests.rs	the_relaunchs_box_is_answered_though_its_startup_frame_comes_first	goal-pause-refinement	
-src/harness/upgrade_goal_drive_tests.rs	the_relaunchs_box_standing_at_a_later_look_is_answered	goal-pause-refinement	
-src/harness/upgrade_goal_tests.rs	a_paused_goal_behind_its_daemon_keeps_its_turn_ends	goal-pause-refinement	
-src/harness/upgrade_goal_tests.rs	the_goal_mode_incident_now_moves_at_land_and_resumes_the_goal	goal-pause-refinement	
-src/harness/upgrade_goal_tests.rs	the_real_goal_pause_is_the_derived_machine	goal-pause-refinement	
-src/harness/upgrade_ladder_tests.rs	a_second_thread_on_the_daemon_never_lets_the_goal_be_ended	ladder-refinement	
-src/harness/upgrade_ladder_tests.rs	the_incident_replayed_moves_at_the_first_pause_its_goal_gave	ladder-refinement	
-src/harness/upgrade_ladder_tests.rs	the_owners_shape_holds_while_a_subagent_of_its_own_conversation_runs	ladder-refinement	
-src/harness/upgrade_ladder_tests.rs	the_real_ladder_is_the_derived_machine	ladder-refinement	
-src/harness/upgrade_ladder_tests.rs	the_still_run_counts_looks_at_the_same_words_and_not_repaints	ladder-refinement	
-src/harness/upgrade_login_wall_tests.rs	a_break_of_background_work_spends_nothing_at_the_login_wall	login-wall-spends-nothing	
+src/harness/upgrade_ladder_claude_tests.rs	the_real_ladder_is_the_derived_machine_on_the_claude_lane	ladder-refinement	
+src/harness/upgrade_ladder_claude_tests.rs	the_still_run_counts_claude_looks_at_the_same_words_and_not_repaints	ladder-refinement	
 src/harness/upgrade_login_wall_tests.rs	a_give_up_taken_back_counts_no_ask_twice	login-wall-spends-nothing	
 src/harness/upgrade_login_wall_tests.rs	a_notice_answered_only_by_the_wall_never_reached_the_model	login-wall-reader	
-src/harness/upgrade_login_wall_tests.rs	a_notice_the_wall_answered_spent_no_ask	login-wall-spends-nothing	
 src/harness/upgrade_login_wall_tests.rs	a_ready_to_the_current_marker_restarts_under_every_gate	login-wall-spends-nothing	
 src/harness/upgrade_login_wall_tests.rs	a_session_at_the_login_wall_is_never_asked_and_no_clock_runs	login-wall-spends-nothing	
 src/harness/upgrade_login_wall_tests.rs	the_clock_is_held_through_the_login_wall	login-wall-spends-nothing	
@@ -1753,32 +1459,23 @@ src/harness/upgrade_login_wall_tests.rs	the_incident_is_waited_out_and_its_last_
 src/harness/upgrade_login_wall_tests.rs	the_login_as_2_1_283_writes_it_lifts_the_wall	login-wall-reader	
 src/harness/upgrade_login_wall_tests.rs	the_login_wall_is_read_from_the_screen_and_the_transcript	login-wall-reader	
 src/harness/upgrade_login_wall_tests.rs	the_state_0_93_0_left_is_read_and_recovered	login-wall-spends-nothing	
-src/harness/upgrade_models.rs	a_carried_model_is_judged_even_with_nothing_on_offer	model-read-step-reads-tail-iff-pending	
 src/harness/upgrade_models.rs	a_marked_settings_file_keeps_its_allowlist_and_default	user-model-settings-parse	
 src/harness/upgrade_models.rs	a_model_chosen_by_hand_is_carried_only_where_it_is_not_the_launchs	hand-chosen-model	
 src/harness/upgrade_models.rs	a_model_command_older_than_the_process_is_no_hand_choice	hand-chosen-model	
 src/harness/upgrade_models.rs	a_model_record_round_trips_and_refuses_garbage	model-record-roundtrip	
-src/harness/upgrade_models.rs	a_new_opus_is_inserted_above_the_family_best_only_when_the_build_knows_it	priority-admit-monotone	
-src/harness/upgrade_models.rs	a_notices_model_rides_only_while_the_rules_laws_hold	ride-bar	
 src/harness/upgrade_models.rs	a_pick_of_what_the_launch_alias_names_is_no_hand_choice	hand-chosen-model	
-src/harness/upgrade_models.rs	a_pin_moves_within_its_family_once_and_a_move_back_by_hand_stands	model-due-rule	
 src/harness/upgrade_models.rs	a_quoted_model_result_is_text_not_a_choice	live-model-reader	
 src/harness/upgrade_models.rs	a_record_without_the_due_clock_parses_as_nothing_due	model-record-roundtrip	
 src/harness/upgrade_models.rs	a_resumed_process_runs_its_launch_model_until_it_answers	live-model-at-launch-until-answer	
-src/harness/upgrade_models.rs	an_ask_taken_back_never_settles_as_failed	settle-ask-takeback	
 src/harness/upgrade_models.rs	availability_follows_the_served_catalog_and_the_deny_lists	model-availability-decision	
 src/harness/upgrade_models.rs	claude_json_yields_only_model_facts	claude-json-model-facts-only	
 src/harness/upgrade_models.rs	family_versions	model-family-version	
-src/harness/upgrade_models.rs	recommendations_that_must_not_be_admitted	priority-admit-monotone	
 src/harness/upgrade_models.rs	the_allowlist_limits_the_target_and_the_settings_parse_fail_closed	offered-set-and-list-target	
-src/harness/upgrade_models.rs	the_lists_step_reads_the_same_offered_set_as_the_familys	offered-set-and-list-target	
 src/harness/upgrade_models.rs	the_live_model_is_a_later_model_command_else_the_last_answer	live-model-reader	
-src/harness/upgrade_models.rs	the_model_ladder_always_lands	model-ladder-monotone-bounded	
 src/harness/upgrade_models.rs	the_model_rule_moves_within_the_family_first	model-due-rule	
 src/harness/upgrade_models.rs	the_reason_a_move_is_said_with_is_read_from_the_two_ids	move-why-from-ids	
 src/harness/upgrade_models.rs	the_resolver_moves_to_the_newest_of_the_same_family_and_nowhere_else	family-successor-newest-strictly-newer	
 src/harness/upgrade_models.rs	the_seed_round_trips_and_a_malformed_file_is_refused	priority-list-roundtrip	
-src/harness/upgrade_models.rs	the_settle_step_never_fails_an_ask_that_ran	settle-ask-takeback	
 src/harness/upgrade_models.rs	utc_stamps_and_the_last_answer	utc-and-lstart-parse	
 src/harness/upgrade_models.rs	what_is_offered_is_what_the_installed_build_knows_and_the_person_allows	offered-set-and-list-target	
 src/harness/upgrade_models.rs	with_nothing_newer_in_its_family_the_list_moves_only_a_model_nobody_chose	model-due-rule	
@@ -1787,78 +1484,44 @@ src/harness/upgrade_progress_tests.rs	the_real_quiet_view_is_the_derived_machine
 src/harness/upgrade_progress_tests.rs	the_real_reducer_is_the_derived_machine	reducer-refines-progress-machine	
 src/harness/upgrade_progress_tests.rs	the_real_view_is_the_derived_machine	classifier-refines-progress-machine	
 src/harness/upgrade_progress_tests.rs	the_refused_notices_tell_is_an_instant_the_view_names	next-change-complete	
-src/harness/upgrade_queued_tests.rs	a_declined_last_ask_rests_and_is_asked_again	visit-shell-refines-pure-reducer	
-src/harness/upgrade_queued_tests.rs	a_full_queue_rests_and_the_owners_word_types_one_more	visit-shell-refines-pure-reducer	
 src/harness/upgrade_queued_tests.rs	a_limit_notice_a_grace_past_its_named_reset_is_moved_as_any_idle_point	visit-shell-refines-pure-reducer	
 src/harness/upgrade_queued_tests.rs	a_limit_row_naming_no_reset_leaves_the_view_no_reset	visit-shell-refines-pure-reducer	
-src/harness/upgrade_queued_tests.rs	a_limit_that_lasts_for_days_adds_a_handful_of_copies_then_one_a_day	limit-queue-refines-model	
 src/harness/upgrade_queued_tests.rs	a_notice_queued_behind_the_limit_is_never_asked_again_behind_it	visit-shell-refines-pure-reducer	
-src/harness/upgrade_queued_tests.rs	a_pending_upgrade_waits_behind_another_rounds_queued_notice	visit-shell-refines-pure-reducer	
-src/harness/upgrade_queued_tests.rs	a_queued_notice_is_typed_again_at_most_requeue_max_times	visit-shell-refines-pure-reducer	
-src/harness/upgrade_queued_tests.rs	a_queued_notice_whose_limit_is_over_is_typed_again_as_the_same_ask	visit-shell-refines-pure-reducer	
-src/harness/upgrade_queued_tests.rs	a_session_whose_last_word_is_the_limit_is_not_asked_until_its_reset	visit-shell-refines-pure-reducer	
 src/harness/upgrade_queued_tests.rs	the_give_up_0_93_0_spent_behind_the_limit_rests_then_waits_out_the_limit	visit-shell-refines-pure-reducer	
 src/harness/upgrade_queued_tests.rs	the_real_queue_conforms_to_the_limit_queue_model	limit-queue-refines-model	
-src/harness/upgrade_stall_tests.rs	a_direction_before_the_ready_never_drops_the_release_its_void_owes	visit-shell-refines-pure-reducer	
 src/harness/upgrade_stall_tests.rs	a_direction_since_the_last_answer_is_a_turn_typed_by_someone_else	ready-answer-reader	
 src/harness/upgrade_stall_tests.rs	a_dropped_release_leaves_no_owed_wait_behind	visit-shell-refines-pure-reducer	
 src/harness/upgrade_stall_tests.rs	a_gave_up_record_restarts_on_a_late_ready_or_releases_its_agent	visit-shell-refines-pure-reducer	
 src/harness/upgrade_stall_tests.rs	a_give_up_spends_the_owners_now	visit-shell-refines-pure-reducer	
-src/harness/upgrade_stall_tests.rs	a_late_ready_held_past_the_drain_is_voided_and_its_agent_released	visit-shell-refines-pure-reducer	
 src/harness/upgrade_stall_tests.rs	a_late_ready_whose_restart_waits_keeps_its_gates_word	visit-shell-refines-pure-reducer	
 src/harness/upgrade_stall_tests.rs	a_limit_episode_holds_the_upgrades_clocks_for_the_window	upgrade-clocks	
 src/harness/upgrade_stall_tests.rs	a_limited_tab_is_never_typed_into_and_never_given_up_on	visit-shell-refines-pure-reducer	
 src/harness/upgrade_stall_tests.rs	a_ready_agent_under_a_stale_status_is_never_signalled_and_is_asked_again	visit-shell-refines-pure-reducer	
 src/harness/upgrade_stall_tests.rs	a_release_follows_only_the_process_the_notice_reached	release-ownership	
 src/harness/upgrade_stall_tests.rs	a_release_is_dropped_where_it_is_no_longer_the_upgrades	visit-shell-refines-pure-reducer	
-src/harness/upgrade_stall_tests.rs	a_restart_refused_after_ready_releases_the_agent_it_asked	visit-shell-refines-pure-reducer	
 src/harness/upgrade_stall_tests.rs	a_stop_is_stamped_and_a_rearm_is_a_new_round	stop-rest-ladder	
 src/harness/upgrade_stall_tests.rs	a_stopped_round_rests_then_a_new_one_asks_again_naming_what_runs	visit-shell-refines-pure-reducer	
 src/harness/upgrade_stall_tests.rs	a_void_begins_the_rest_again_by_the_ladder_of_its_stop	stop-rest-ladder	
-src/harness/upgrade_stall_tests.rs	a_void_never_shortens_the_rest_a_repeated_stop_earned	stop-rest-ladder	
 src/harness/upgrade_stall_tests.rs	a_voided_ready_owes_one_release_typed_once	visit-shell-refines-pure-reducer	
 src/harness/upgrade_stall_tests.rs	the_incident_replays_to_a_restart_never_a_stall	release-ownership	
-src/harness/upgrade_stall_tests.rs	the_incident_schedule_conforms_and_the_pre_fix_run_is_caught	upgrade-refines-never-strands-model	
-src/harness/upgrade_stall_tests.rs	the_longest_silence_is_the_window_a_rest_a_drain_and_a_rest	stop-rest-ladder	
 src/harness/upgrade_stall_tests.rs	the_owners_hold_releases_the_agent_and_forgets_its_answers	release-ownership	
-src/harness/upgrade_stall_tests.rs	the_owners_stall_schedule_conforms_and_the_terminal_run_is_caught	upgrade-refines-never-strands-model	
 src/harness/upgrade_stall_tests.rs	the_real_upgrade_conforms_to_the_never_strands_model	upgrade-refines-never-strands-model	
 src/harness/upgrade_status_tests.rs	a_build_that_fails_to_start_is_one_fault_per_build	aterms-own-fault	
 src/harness/upgrade_status_tests.rs	a_carried_on_restart_reads_restarting_while_its_model_is_waited_for	row-of-record	
-src/harness/upgrade_status_tests.rs	a_carried_upgrade_mark_is_lowered_by_the_successors_first_look	view-host-protocol	
-src/harness/upgrade_status_tests.rs	a_claude_move_that_failed_after_its_exit_stands_with_no_holder	row-of-record	
 src/harness/upgrade_status_tests.rs	a_claude_stall_never_prints_its_wait_word	wait-class-total-and-stable	
-src/harness/upgrade_status_tests.rs	a_claude_wait_on_its_own_work_is_worded_for_the_owner	wait-class-total-and-stable	
-src/harness/upgrade_status_tests.rs	a_codex_daemon_thread_is_news_after_a_day	own-work-news	
-src/harness/upgrade_status_tests.rs	a_codex_goal_left_paused_is_an_interrupt_whatever_the_owners_word_says	interrupt-only-for-an-ended-agent	
-src/harness/upgrade_status_tests.rs	a_codex_lanes_own_words_left_unsent_are_a_person_to_clear	need-and-mark-text-bounds	
-src/harness/upgrade_status_tests.rs	a_codex_move_in_flight_refuses_the_owners_word_in_its_own_terms	owner-word-ask	
-src/harness/upgrade_status_tests.rs	a_codex_move_that_failed_after_its_exit_stands_with_no_holder	row-of-record	
 src/harness/upgrade_status_tests.rs	a_codex_upgrade_is_listed_held_and_hurried_like_claudes	row-of-record	
-src/harness/upgrade_status_tests.rs	a_codex_wait_on_its_daemon_is_worded_for_the_owner	stall-mark-and-remedy	
 src/harness/upgrade_status_tests.rs	a_day_behind_is_news_whatever_the_rounds_do	own-work-news	
 src/harness/upgrade_status_tests.rs	a_digest_line_is_keyed_by_kind_and_tab_and_says_no_restart	need-and-mark-text-bounds	
 src/harness/upgrade_status_tests.rs	a_finished_moves_row_carries_its_relaunch_instant	row-of-record	
-src/harness/upgrade_status_tests.rs	a_first_look_lowers_a_mark_an_earlier_process_raised	view-host-protocol	
-src/harness/upgrade_status_tests.rs	a_give_up_rests_unmarked_and_now_re_arms_it_at_once	stall-mark-and-remedy	
-src/harness/upgrade_status_tests.rs	a_goal_the_move_paused_is_said_and_one_left_paused_is_a_row	row-of-record	
-src/harness/upgrade_status_tests.rs	a_held_back_agent_without_an_owner_name_reads_as_a_sentence	§4	
 src/harness/upgrade_status_tests.rs	a_host_that_has_just_begun_or_resumed_watching_flags_nothing_unwatched	unwatched-predicate	
 src/harness/upgrade_status_tests.rs	a_lagging_status_under_the_quiet_flow_is_no_comfort_and_now_moves_it	stall-mark-and-remedy	
 src/harness/upgrade_status_tests.rs	a_limit_whose_named_reset_has_passed_is_told	attention-horizons	
-src/harness/upgrade_status_tests.rs	a_limit_whose_reset_no_look_read_is_told_once_any_limit_has_ended	next-change-complete	
-src/harness/upgrade_status_tests.rs	a_line_refusal_says_the_line_not_the_flags	need-and-mark-text-bounds	
 src/harness/upgrade_status_tests.rs	a_move_the_person_holds_is_noted_for_their_footer	person-hold-footer-note	
 src/harness/upgrade_status_tests.rs	a_notice_aterm_could_not_type_is_told_as_aterms_own	aterms-own-fault	
-src/harness/upgrade_status_tests.rs	a_notice_stopped_part_way_names_the_part_left_in_the_prompt	need-and-mark-text-bounds	
-src/harness/upgrade_status_tests.rs	a_person_at_the_tab_is_named_only_while_a_look_has_seen_them	stall-mark-and-remedy	
 src/harness/upgrade_status_tests.rs	a_person_held_announced_upgrade_is_a_record_never_a_mark	attention-horizons	
 src/harness/upgrade_status_tests.rs	a_quiet_give_up_its_own_work_held_is_a_wait_the_owners_now_does_not_move	stall-mark-and-remedy	
-src/harness/upgrade_status_tests.rs	a_quiet_give_up_the_owners_now_does_move_keeps_upgrade_now	stall-mark-and-remedy	
-src/harness/upgrade_status_tests.rs	a_quiet_move_at_a_spent_limit_has_its_chance_before_the_tell	next-change-complete	
 src/harness/upgrade_status_tests.rs	a_quiet_wait_turns_a_fault_line_at_its_own_horizon	attention-horizons	
 src/harness/upgrade_status_tests.rs	a_rearmed_round_forgets_when_the_old_restarts_agent_was_seen_gone	row-of-record	
-src/harness/upgrade_status_tests.rs	a_rearmed_round_its_agents_own_work_holds_is_a_record	own-work-news	
 src/harness/upgrade_status_tests.rs	a_rearmed_rounds_first_looks_are_still_its_rest	own-work-news	
 src/harness/upgrade_status_tests.rs	a_record_an_older_build_wrote_is_aged_from_its_minting_until_a_visit_settles_it	own-work-news	
 src/harness/upgrade_status_tests.rs	a_record_nothing_has_checked_reads_unwatched_past_the_wake_grace	unwatched-predicate	
@@ -1867,10 +1530,8 @@ src/harness/upgrade_status_tests.rs	a_record_with_no_recorded_tab_reads_the_clai
 src/harness/upgrade_status_tests.rs	a_refusal_a_person_or_a_peer_caused_is_not_blamed_on_aterm	attention-horizons	
 src/harness/upgrade_status_tests.rs	a_relaunched_agent_that_reaches_no_prompt_is_a_log_line_then_an_interrupt	attention-horizons	
 src/harness/upgrade_status_tests.rs	a_relaunchs_record_is_no_upgrade_of_the_tab	row-vetting	
-src/harness/upgrade_status_tests.rs	a_release_still_owed_is_shown_and_worded	status-line-and-json-fields	
 src/harness/upgrade_status_tests.rs	a_restart_under_way_past_its_bound_reads_stuck_and_says_what_it_waits_on	stall-mark-and-remedy	
 src/harness/upgrade_status_tests.rs	a_resume_by_hand_says_which_login_it_runs_under	resume-command-inverts-relaunch-line	
-src/harness/upgrade_status_tests.rs	a_row_names_the_move_a_model_restart_included	row-of-record	
 src/harness/upgrade_status_tests.rs	a_row_read_off_a_live_status_names_its_tab_for_the_host_to_follow	view-host-protocol	
 src/harness/upgrade_status_tests.rs	a_row_served_late_is_judged_with_the_awake_clock_as_it_stands	unwatched-predicate	
 src/harness/upgrade_status_tests.rs	a_row_stands_only_while_its_conversation_is_live_and_behind_in_its_tab	row-vetting	
@@ -1878,7 +1539,6 @@ src/harness/upgrade_status_tests.rs	a_row_that_crosses_a_horizon_is_a_changed_ro
 src/harness/upgrade_status_tests.rs	a_session_asked_again_and_again_is_news	own-work-news	
 src/harness/upgrade_status_tests.rs	a_stall_whose_words_carry_no_age_never_wakes_for_it	next-change-complete	
 src/harness/upgrade_status_tests.rs	a_state_file_from_either_older_writer_is_read_with_its_missing_fields_at_default	state-record-roundtrip	
-src/harness/upgrade_status_tests.rs	a_state_whose_session_is_current_or_gone_shows_nothing	row-vetting	
 src/harness/upgrade_status_tests.rs	a_state_with_no_recorded_tab_stands_in_the_tab_its_holder_is_in	row-vetting	
 src/harness/upgrade_status_tests.rs	a_stop_that_asks_again_marks_nothing_and_one_that_repeats_carries_its_stall	stall-mark-and-remedy	
 src/harness/upgrade_status_tests.rs	a_stopped_refusal_is_typed_for_the_window_and_a_sentence_for_the_shell	need-and-mark-text-bounds	
@@ -1893,11 +1553,7 @@ src/harness/upgrade_status_tests.rs	a_word_for_a_target_that_moved_on_lands_on_n
 src/harness/upgrade_status_tests.rs	a_word_on_a_gave_up_upgrade_forgets_its_answers	owner-word-ask	
 src/harness/upgrade_status_tests.rs	an_announced_round_under_the_quiet_flow_reads_overdue_at_six_hours	stall-mark-and-remedy	
 src/harness/upgrade_status_tests.rs	an_ask_writes_the_owners_word_under_the_lock_and_refuses_what_it_cannot_hold	owner-word-ask	
-src/harness/upgrade_status_tests.rs	an_overdue_codex_mark_classes_the_ladders_and_goal_pauses_words	wait-class-total-and-stable	
-src/harness/upgrade_status_tests.rs	an_overdue_move_holds_its_class_through_the_notice_paths_passing_words	wait-class-total-and-stable	
 src/harness/upgrade_status_tests.rs	an_overdue_move_names_its_cause_by_class	wait-class-total-and-stable	
-src/harness/upgrade_status_tests.rs	an_overdue_tab_is_never_marked	stall-mark-and-remedy	
-src/harness/upgrade_status_tests.rs	an_owners_now_ends_an_overdue_stall_and_its_remedy_is_the_waits	stall-mark-and-remedy	
 src/harness/upgrade_status_tests.rs	an_owners_now_quiets_an_overdue_stall_only_for_a_bounded_time	stall-mark-and-remedy	
 src/harness/upgrade_status_tests.rs	an_owners_word_that_lands_wakes_the_window	owner-word-ask	
 src/harness/upgrade_status_tests.rs	an_unreached_row_reads_claudes_live_status_never_over_a_recorded_word	row-vetting	
@@ -1905,7 +1561,6 @@ src/harness/upgrade_status_tests.rs	an_unwatched_record_is_told_as_aterms_own_fa
 src/harness/upgrade_status_tests.rs	an_upgrade_that_cannot_run_is_one_owner_sentence	aterms-own-fault	
 src/harness/upgrade_status_tests.rs	aterms_own_fault_is_one_log_line_never_a_digest_line_or_a_mark	aterms-own-fault	
 src/harness/upgrade_status_tests.rs	each_kind_of_stall_names_the_remedy_that_moves_it	stall-mark-and-remedy	
-src/harness/upgrade_status_tests.rs	every_interrupt_is_a_stall_the_host_posts	interrupt-only-for-an-ended-agent	
 src/harness/upgrade_status_tests.rs	every_owners_word_arms_a_new_round	owner-word-ask	
 src/harness/upgrade_status_tests.rs	every_wait_has_a_horizon_and_none_interrupts_by_age	attention-horizons	
 src/harness/upgrade_status_tests.rs	looks_at_the_same_work_do_not_change_the_row	own-work-news	
@@ -1915,7 +1570,6 @@ src/harness/upgrade_status_tests.rs	only_an_agent_the_upgrade_ended_interrupts	i
 src/harness/upgrade_status_tests.rs	only_an_upgrade_that_will_not_move_on_its_own_is_stalled	stall-mark-and-remedy	
 src/harness/upgrade_status_tests.rs	records_that_cannot_be_read_whole_hand_the_window_nothing	view-host-protocol	
 src/harness/upgrade_status_tests.rs	status_rows_come_from_the_state_files_and_filter_by_tab	row-vetting	
-src/harness/upgrade_status_tests.rs	status_says_the_watchs_fields_last	status-line-and-json-fields	
 src/harness/upgrade_status_tests.rs	status_says_what_holds_the_move_and_what_the_owner_is_told	status-line-and-json-fields	
 src/harness/upgrade_status_tests.rs	the_agents_own_work_is_news_only_after_a_day_and_a_round	own-work-news	
 src/harness/upgrade_status_tests.rs	the_agents_own_work_is_the_rounds_not_the_last_looks	own-work-news	
@@ -1923,13 +1577,11 @@ src/harness/upgrade_status_tests.rs	the_ask_count_survives_a_retarget_and_the_st
 src/harness/upgrade_status_tests.rs	the_awake_clock_is_the_machines_last_wake_or_boot	awake-clock-probe	
 src/harness/upgrade_status_tests.rs	the_column_names_the_state_the_target_the_reason_and_the_age	row-of-record	
 src/harness/upgrade_status_tests.rs	the_host_sends_its_tabs_rows_only_when_they_change	view-host-protocol	
-src/harness/upgrade_status_tests.rs	the_interrupt_mark_never_cuts_the_action	need-and-mark-text-bounds	
 src/harness/upgrade_status_tests.rs	the_interrupts_action_follows_its_reason_and_keeps_the_launchs_flags	resume-command-inverts-relaunch-line	
 src/harness/upgrade_status_tests.rs	the_manual_resume_keeps_its_flags_under_every_line_the_harness_builds	resume-command-inverts-relaunch-line	
 src/harness/upgrade_status_tests.rs	the_own_work_line_does_not_move_with_the_holder_count	own-work-news	
 src/harness/upgrade_status_tests.rs	the_own_work_line_names_the_goal_the_programs_and_the_break	need-and-mark-text-bounds	
 src/harness/upgrade_status_tests.rs	the_owner_is_told_which_processes_hold_the_move	status-line-and-json-fields	
-src/harness/upgrade_status_tests.rs	the_row_a_word_prints_reads_the_claim_on_its_tab	aside-precedence	
 src/harness/upgrade_status_tests.rs	the_status_json_says_how_loud_the_owner_is_told_and_why	status-line-and-json-fields	
 src/harness/upgrade_status_tests.rs	the_status_line_says_the_rung	status-line-and-json-fields	
 src/harness/upgrade_status_tests.rs	the_view_marks_a_record_nothing_checks_at_an_instant_it_names	unwatched-predicate	
@@ -1937,58 +1589,37 @@ src/harness/upgrade_status_tests.rs	the_view_names_a_records_watch_and_lists_it_
 src/harness/upgrade_status_tests.rs	the_view_names_the_instant_a_person_stops_being_named	next-change-complete	
 src/harness/upgrade_status_tests.rs	the_view_names_the_instant_it_next_changes	next-change-complete	
 src/harness/upgrade_status_tests.rs	what_time_alone_changes_is_a_changed_row_at_a_named_instant	next-change-complete	
-src/harness/upgrade_tests.rs	a_box_one_sweep_catches_is_not_a_persons_hold	next-step-safety	
-src/harness/upgrade_tests.rs	a_break_of_background_work_takes_only_notices_and_ends_nothing	next-step-safety	
-src/harness/upgrade_tests.rs	a_break_passes_every_step_but_the_end	next-step-safety	
 src/harness/upgrade_tests.rs	a_conversation_has_a_task_from_someone_elses_first_prompt	transcript-tasked	
 src/harness/upgrade_tests.rs	a_conversation_with_no_task_is_restarted_afresh_never_announced_to	next-step-safety	
 src/harness/upgrade_tests.rs	a_deferral_holds_until_it_runs_out_and_a_skip_holds_only_its_version	next-step-safety	
-src/harness/upgrade_tests.rs	a_deferral_is_shown_as_the_time_it_has_left	owner-words-roundtrip	
 src/harness/upgrade_tests.rs	a_direction_after_the_ready_ends_it	ready-answer-reader	
-src/harness/upgrade_tests.rs	a_family_move_is_said_as_the_newest_of_its_family_and_a_miss_as_not_taken	model-outcome-reader	
-src/harness/upgrade_tests.rs	a_full_queues_rest_doubles_per_copy_unread_up_to_a_day	notice-fate-and-queue	
 src/harness/upgrade_tests.rs	a_hold_stands_only_while_it_is_sampled	upgrade-clocks	
-src/harness/upgrade_tests.rs	a_late_ready_answer_gets_its_own_reask_interval	next-step-safety	
-src/harness/upgrade_tests.rs	a_limited_session_is_never_asked_and_its_clock_is_held	next-step-safety	
 src/harness/upgrade_tests.rs	a_line_the_tty_could_cut_is_refused	relaunch-line-shape-quote-bound	
-src/harness/upgrade_tests.rs	a_model_move_says_what_ran_before_and_what_runs_now	harness-prompts-shape	
-src/harness/upgrade_tests.rs	a_model_restart_says_the_model_and_keeps_the_announce_head	harness-prompts-shape	
 src/harness/upgrade_tests.rs	a_notice_the_limit_answered_is_queued_until_the_model_takes_it	notice-fate-and-queue	
 src/harness/upgrade_tests.rs	a_now_request_waives_settling_and_never_the_draft_or_the_ready_answer	next-step-safety	
 src/harness/upgrade_tests.rs	a_pasted_notice_is_the_notice_and_a_pasted_message_a_direction	ready-answer-reader	
-src/harness/upgrade_tests.rs	a_person_at_a_busy_tab_waits_attended	next-step-safety	
 src/harness/upgrade_tests.rs	a_provider_arn_is_a_model_id	model-outcome-reader	
 src/harness/upgrade_tests.rs	a_quiet_round_an_older_build_announced_still_ends_and_owes_its_release	quiet-step-contract	
 src/harness/upgrade_tests.rs	a_quiet_round_is_not_held_for_ever_by_a_status_its_idle_screen_contradicts	quiet-step-contract	
 src/harness/upgrade_tests.rs	a_quiet_upgrade_restarts_only_a_genuinely_idle_session_and_types_nothing	quiet-step-contract	
-src/harness/upgrade_tests.rs	a_ready_answer_a_person_holds_past_the_drain_bound_is_void	next-step-safety	
 src/harness/upgrade_tests.rs	a_ready_answer_counts_only_while_it_is_the_agents_last_word	ready-answer-reader	
 src/harness/upgrade_tests.rs	a_ready_answer_is_the_marker_on_a_line_of_its_own	ready-answer-reader	
 src/harness/upgrade_tests.rs	a_ready_before_the_latest_notice_is_no_answer_to_it	ready-answer-reader	
 src/harness/upgrade_tests.rs	a_ready_on_the_screen_holds_the_point_until_its_row_is_written	next-step-safety	
-src/harness/upgrade_tests.rs	a_ready_the_gate_holds_past_the_drain_is_void_in_either_phase	next-step-safety	
 src/harness/upgrade_tests.rs	a_session_is_attended_by_its_own_person_stamp	upgrade-clocks	
 src/harness/upgrade_tests.rs	a_skip_stays_skipped_and_a_deferral_lets_a_stopped_round_go	next-step-safety	
-src/harness/upgrade_tests.rs	a_span_reads_as_its_two_largest_units	owner-words-roundtrip	
 src/harness/upgrade_tests.rs	a_standing_wall_with_no_limit_type_takes_it_from_its_text_and_hostile_rows_cost_one_key	standing-quota-wall	
-src/harness/upgrade_tests.rs	a_stopped_upgrade_takes_its_idle_points_step_at_a_break	next-step-safety	
 src/harness/upgrade_tests.rs	a_superseded_ready_is_asked_again_at_the_next_point	next-step-safety	
-src/harness/upgrade_tests.rs	a_value_is_consumed_exactly_as_claudes_parser_consumes_it	rewrite-argv-refines-commander	
 src/harness/upgrade_tests.rs	an_attended_tab_is_neither_typed_into_nor_signalled_without_the_owners_now	next-step-safety	
 src/harness/upgrade_tests.rs	an_empty_composer_is_blank_or_a_placeholder_and_nothing_else	composer-empty	
-src/harness/upgrade_tests.rs	an_untasked_session_is_restarted_only_after_the_owner_is_told	quiet-step-contract	
-src/harness/upgrade_tests.rs	an_upgrade_that_gave_up_asking_honours_a_late_ready	next-step-safety	
 src/harness/upgrade_tests.rs	claudes_status_is_read_against_its_idle_screen_and_the_work_under_it	next-step-safety	
 src/harness/upgrade_tests.rs	every_short_argv_resumes_with_exactly_the_values_claude_parsed	rewrite-argv-refines-commander	
 src/harness/upgrade_tests.rs	every_stopped_round_rests_then_rearms	next-step-safety	
 src/harness/upgrade_tests.rs	only_a_box_and_a_draft_are_a_persons_hold	next-step-safety	
 src/harness/upgrade_tests.rs	the_agent_word_round_trips_and_an_unknown_word_is_no_agent	owner-words-roundtrip	
-src/harness/upgrade_tests.rs	the_continuation_says_what_the_session_ran_before_the_restart	harness-prompts-shape	
 src/harness/upgrade_tests.rs	the_copies_of_a_queued_notice_are_counted_until_the_model_takes_one	notice-fate-and-queue	
 src/harness/upgrade_tests.rs	the_dialogs_result_line_is_read_under_its_own_command_and_only_since_the_claim	reset-dialog-line	
-src/harness/upgrade_tests.rs	the_end_of_the_agents_own_work_is_the_upgrades_point	reducer-refines-work-end-model	
 src/harness/upgrade_tests.rs	the_incidents_ready_is_heard_once_written_and_superseded_by_the_keep_going	ready-answer-reader	
-src/harness/upgrade_tests.rs	the_ladder_climbs_by_how_long_the_session_has_been_behind	upgrade-clocks	
 src/harness/upgrade_tests.rs	the_ladder_relaxes_the_settle_and_the_person_near_and_never_a_floor	next-step-safety	
 src/harness/upgrade_tests.rs	the_last_words_print_ignores_the_live_zone_and_follows_the_words	upgrade-clocks	
 src/harness/upgrade_tests.rs	the_launch_model_is_the_model_flag_the_rewrite_keeps	launch-model-and-resume-by-the-rewrites-parse	
@@ -2000,9 +1631,6 @@ src/harness/upgrade_tests.rs	the_model_is_the_last_assistant_turns_and_the_first
 src/harness/upgrade_tests.rs	the_notice_keeps_a_pipeline_a_long_path_would_push_out	running-clause-held-list	
 src/harness/upgrade_tests.rs	the_notice_lists_what_runs_under_the_agent_in_one_line	running-clause-held-list	
 src/harness/upgrade_tests.rs	the_notice_names_the_oldest_processes_first	running-clause-held-list	
-src/harness/upgrade_tests.rs	the_outcome_blames_a_kept_model_flag_not_the_default	model-outcome-reader	
-src/harness/upgrade_tests.rs	the_outcome_names_the_model_after_and_a_change_from_before	model-outcome-reader	
-src/harness/upgrade_tests.rs	the_owners_stall_never_waits_for_ever	next-step-safety	
 src/harness/upgrade_tests.rs	the_ready_answer_is_an_assistant_line_never_the_announcement	ready-answer-reader	
 src/harness/upgrade_tests.rs	the_reducer_takes_the_step_the_drain_model_allows	reducer-refines-drain-bound-model	
 src/harness/upgrade_tests.rs	the_relaunch_line_heals_a_frozen_shell_and_quotes_every_word	relaunch-line-shape-quote-bound	
@@ -2023,7 +1651,6 @@ src/harness/upgrade_wake.rs	a_fallback_tick_tells_a_side_listener_only_when_its_
 src/harness/upgrade_wake.rs	a_proc_stat_line_names_an_exited_process_by_its_state	proc-stat-exited	
 src/harness/upgrade_wake.rs	a_repointed_native_link_wakes_the_host_and_its_neighbours_do_not	activation-wake	
 src/harness/upgrade_wake.rs	a_side_mark_tells_its_listener_and_ends_no_wait	activation-wake	
-src/harness/upgrade_wake.rs	a_thing_has_moved_only_when_it_is_another_than_last_seen	moved-rule	
 src/harness/upgrade_wake.rs	a_zombie_has_exited	wait-exit	
 src/harness/upgrade_wake.rs	an_existing_prefix_gets_its_notice_dir_and_no_recheck	activation-wake	
 src/harness/upgrade_wake.rs	an_exit_is_seen_as_it_happens	wait-exit	
@@ -2043,7 +1670,6 @@ src/harness/upgrade_watch_tests.rs	the_real_watch_is_the_derived_look	watch-refi
 src/harness/upgrade_watch_tests.rs	the_watch_keeps_an_announced_round_whose_model_rides_the_restart_in_place	retarget-in-place	
 src/harness/upgrade_watch_tests.rs	the_watch_keeps_no_reset_for_a_limit_row_that_names_none	visit-shell-refines-pure-reducer	
 src/harness/upgrade_watch_tests.rs	the_watch_reads_the_limit_at_the_second_it_is_given	visit-shell-refines-pure-reducer	
-src/harness/upgrade_watch_tests.rs	the_watch_retargets_a_pending_round_and_says_it_stays_pending	retarget-in-place	
 src/harness/upgrade_watch_tests.rs	the_watch_retargets_and_holds_tab_ones_record_off_any_point_with_no_hands	visit-shell-refines-pure-reducer	
 src/harness/usage.rs	a_limit_notice_row_is_kept_with_its_time	limit-notice-rows	
 src/harness/usage.rs	a_loading_or_failed_panel_is_unsettled	usage-panel-read-phase	
@@ -2054,14 +1680,12 @@ src/harness/usage.rs	a_settings_panel_on_another_tab_is_not_the_usage_tab	usage-
 src/harness/usage.rs	a_settled_panels_sample_places_each_reset_in_the_panels_zone	usage-panel-sample	
 src/harness/usage.rs	a_streamed_subagent_message_counts_its_final_output_once	transcript-fold-max-merge	
 src/harness/usage.rs	a_synthetic_row_never_names_the_sessions_model	last-model	
-src/harness/usage.rs	a_tap_reading_fills_the_windows_of_the_hud_and_the_json	hud-line	
 src/harness/usage.rs	a_whole_panel_missing_the_session_or_the_week_is_unsettled	usage-panel-read-phase	
 src/harness/usage.rs	a_whole_panel_with_nothing_unsettled_on_it_is_settled	usage-panel-read-phase	
 src/harness/usage.rs	a_window_that_was_not_read_gives_no_figure_and_none_gives_no_sample	usage-panel-sample	
 src/harness/usage.rs	an_enrich_error_under_the_windows_is_unsettled	usage-panel-read-phase	
 src/harness/usage.rs	hud_line_flattens_control_characters_in_labels_and_model_ids	hud-line	
 src/harness/usage.rs	hud_line_is_capped_at_1024_bytes_on_a_char_boundary	hud-line	
-src/harness/usage.rs	hud_line_names_the_model_and_says_the_windows_are_unknown	hud-line	
 src/harness/usage.rs	model_short_names_the_family	hud-line	
 src/harness/usage.rs	numbers_are_read_as_integer_or_float_and_junk_is_absent	json-number-readers	
 src/harness/usage.rs	panel_reader_never_guesses_a_measured_key_for_an_unmeasured_title	usage-panel-windows	
@@ -2070,7 +1694,6 @@ src/harness/usage.rs	panel_reader_takes_both_measured_layouts_and_the_fable_wind
 src/harness/usage.rs	panel_reader_takes_the_copied_text_form	usage-panel-windows	
 src/harness/usage.rs	projected_usage_preserves_the_live_limit_wall_and_its_lift	limit-notice-rows	
 src/harness/usage.rs	rfc3339_utc_matches_known_instants	rfc3339-utc-civil	
-src/harness/usage.rs	spend_from_transcript_carries_tokens	transcript-fold-max-merge	
 src/harness/usage.rs	the_account_model_is_the_newest_main_chain_row_of_its_transcript	last-model	
 src/harness/usage.rs	the_byte_prefilter_never_drops_a_row_the_parser_would_have_summed	transcript-fold-classification	
 src/harness/usage.rs	the_header_guard_matches_the_measured_header_and_no_copy_of_it	usage-panel-read-phase	
@@ -2091,9 +1714,9 @@ src/harness/usage.rs	transcript_seen_set_is_bounded_and_the_bound_is_what_it_say
 src/harness/usage.rs	transcript_sidechain_row_is_summed_and_counted	transcript-fold-max-merge	
 src/harness/usage.rs	transcript_very_long_line_is_skipped_and_counted	transcript-fold-classification	
 src/harness/usage.rs	usage_json_is_schema_1_and_round_trips_through_the_parser	usage-json-schema-1	
-src/harness/usage.rs	usage_json_of_an_empty_view_is_still_schema_1	usage-json-schema-1	
 src/harness/usage.rs	view_shown_is_the_first_active_account_else_the_first	usage-view-shown	
 src/harness/usage.rs	working_time_is_the_union_of_the_main_chains_turns	working-time-union	
+src/lib.rs	a_read_only_connection_sends_the_read_verbs_alone	relay-read-only-connection	
 src/lib.rs	a_relay_turn_that_does_not_settle_names_the_timeout	relay-wire-equals-ctl	
 src/lib.rs	a_silent_ctl_failure_still_says_something	ctl-failure-words	
 src/lib.rs	a_turn_that_does_not_settle_names_the_timeout	relay-wire-equals-ctl	
@@ -2105,61 +1728,15 @@ src/lib.rs	relay_client_frames_a_payload_byte_for_byte	relay-framing-one-line
 src/lib.rs	relay_client_maps_err_reply_to_error	relay-reply-classification	
 src/lib.rs	relay_client_reads_the_host_gone_line_as_the_connection_closing	relay-reply-classification	
 src/lib.rs	relay_client_refuses_overflowing_counts_instead_of_reading_them_as_status	reply-count-grammar	
-src/lib.rs	relay_client_rejects_line_terminators_at_the_framing_boundary	relay-framing-one-line	
-src/lib.rs	relay_client_rejects_newline_in_send_payload	relay-framing-one-line	
-src/lib.rs	remote_relay_client_wire_is_ctl_byte_identical	relay-wire-equals-ctl	
 src/lib.rs	run_rejects_a_bad_ready_pattern_before_touching_the_transport	turn-run-protocol	
-src/lib.rs	skipping_the_discarded_await_match_reply_desyncs_the_stream	reply-count-grammar	
-src/lib.rs	the_crates_anchors_close_over_the_machines_they_bind	§4	
+src/lib.rs	the_own_client_runs_the_ctl_verb_first	drive-own-ctl	
 src/lib.rs	tick_saturates_when_capacity_plus_refill_overflows_u32	governor-token-bucket	
 src/lib.rs	turn_is_governed_when_self_write_disabled	turn-run-protocol	
-src/lib.rs	turn_sends_prompt_presses_enter_and_returns_settled_screen	turn-run-protocol	
-src/operator.rs	a_dropped_queue_releases_its_lock_against_an_inherited_descriptor	queue-lock-and-epoch-fence	
-src/operator.rs	a_poisoned_handle_cannot_mark_a_landed_result_in_doubt	queue-recovery-is-replay	
-src/operator.rs	complete_fault_clear_refuses_an_in_doubt_action	queue-refines-wal-model	
-src/operator.rs	mark_in_doubt_refuses_a_finished_action	queue-refines-wal-model	
-src/operator.rs	operator_ack_is_idempotent_and_conflict_becomes_in_doubt	queue-refines-wal-model	
-src/operator.rs	operator_action_intent_result_is_durable_and_orphan_never_requeues	queue-refines-wal-model	
-src/operator.rs	operator_allowlist_is_empty_durable_and_revokes_claims	queue-enqueue-coalesce-capacity	
-src/operator.rs	operator_checkpoint_crash_windows_are_replay_safe_and_corruption_fails_closed	queue-recovery-is-replay	
-src/operator.rs	operator_checkpoint_preserves_allowlist_fairness_and_unresolved_states	queue-codec-round-trip	
-src/operator.rs	operator_checkpoint_rollover_reopens_and_bounds_terminal_history	queue-recovery-is-replay	
-src/operator.rs	operator_checkpoint_v2_and_legacy_v1_marker_recovery_preserve_faults	queue-codec-round-trip	
-src/operator.rs	operator_claim_is_per_sid_fair_and_extension_is_capped	queue-fair-claim-and-extension	
-src/operator.rs	operator_cloned_handles_serialize_concurrent_enqueues	queue-concurrency	
-src/operator.rs	operator_complete_record_before_marker_removal_reopens_blocked	queue-fleet-fault-latch	
-src/operator.rs	operator_corrupt_or_preexisting_fault_marker_is_never_narrowed	queue-fleet-fault-latch	
-src/operator.rs	operator_durable_fault_gates_work_and_clear_requires_fresh_baselines	queue-fleet-fault-latch	
-src/operator.rs	operator_enqueue_coalesces_strongest_condition_and_bounds_capacity	queue-enqueue-coalesce-capacity	
-src/operator.rs	operator_event_evidence_is_validated_but_never_persisted	queue-enqueue-coalesce-capacity	
-src/operator.rs	operator_fault_marker_bypasses_held_live_mutex	queue-concurrency	
-src/operator.rs	operator_fault_marker_survives_a_wal_latch_failure	queue-fleet-fault-latch	
-src/operator.rs	operator_final_action_permit_is_exact_and_never_parks	queue-refines-wal-model	
-src/operator.rs	operator_manage_baseline_keeps_approval_and_exit_through_immediate_ack	queue-manage-with-baseline-atomic	
-src/operator.rs	operator_manage_with_baseline_is_atomic_across_failure_and_reopen	queue-manage-with-baseline-atomic	
-src/operator.rs	operator_old_resolved_claim_cannot_regress_after_takeover	queue-refines-wal-model	
-src/operator.rs	operator_poison_refuses_reads_and_noop_paths	queue-poison-fail-closed	
-src/operator.rs	operator_poisoned_enqueue_still_latches_independent_fault_marker	queue-fleet-fault-latch	
-src/operator.rs	operator_private_directory_and_files_are_hardened	queue-fs-hardening	
-src/operator.rs	operator_process_lock_and_epoch_fence_fail_closed	queue-lock-and-epoch-fence	
-src/operator.rs	operator_production_clock_clamps_rollback_and_honors_forward_progress	queue-clock-monotone	
-src/operator.rs	operator_redelivery_cap_converts_once_then_escalation_expiry_is_in_doubt	queue-fair-claim-and-extension	
-src/operator.rs	operator_stale_ack_cannot_resolve_a_redelivery	queue-refines-wal-model	
-src/operator.rs	operator_state_dir_on_an_unusable_root_errors_without_touching_it	queue-fs-hardening	
-src/operator.rs	operator_state_scope_stops_at_its_own_subtree	queue-fs-hardening	
-src/operator.rs	operator_strengthening_a_delivered_event_revokes_its_claim	queue-enqueue-coalesce-capacity	
-src/operator.rs	operator_takeover_requeues_claims_to_cap_then_fences_escalation	queue-fair-claim-and-extension	
-src/operator.rs	operator_unmanage_cycles_release_capacity_without_tokenless_doubt	queue-enqueue-coalesce-capacity	
-src/operator.rs	operator_unmanage_retires_generation_idempotency_for_fresh_baseline	queue-enqueue-coalesce-capacity	
-src/operator.rs	operator_wal_kind_bound_covers_fault_protocol_and_rejects_unknown	queue-codec-round-trip	
-src/operator.rs	operator_wal_recovers_and_repairs_only_a_partial_final_frame	queue-recovery-is-replay	
-src/operator.rs	resolve_refuses_an_in_flight_action	queue-refines-wal-model	
-src/supervise/answer.rs	a_codex_question_has_a_box_token_and_another_box_none	answer-box-token	
-src/supervise/answer.rs	a_codex_question_is_answered_by_an_answers_digit_under_its_title_row	answer-plan-contract	
+src/ready.rs	the_byte_is_ready_a_bare_close_is_closed_and_a_held_end_is_a_hang	ready-fd-signal	
+src/supervise/answer.rs	a_roles_question_has_a_box_token_and_another_box_none	answer-box-token	
 src/supervise/answer.rs	a_multi_select_toggles_what_differs_then_presses_the_button	answer-plan-contract	
 src/supervise/answer.rs	a_priority_word_that_labels_an_option_answers_that_option	answer-plan-contract	
 src/supervise/answer.rs	a_single_select_answer_names_one_option_or_is_refused	answer-plan-contract	
-src/supervise/answer.rs	a_text_priority_is_refused_naming_the_session_word_that_asks_the_window	answer-plan-contract	
 src/supervise/answer.rs	recommended_on_a_multi_select_plans_the_whole_tab	answer-plan-contract	
 src/supervise/answer.rs	the_box_token_names_one_screen	answer-box-token	
 src/supervise/approvals.rs	a_reset_row_taken_and_not_ended_is_owed_and_says_whether_it_was_entered	ledger-readers-are-row-projections	
@@ -2168,10 +1745,7 @@ src/supervise/approvals.rs	the_journal_sits_beside_the_ledger_and_both_are_bound
 src/supervise/approvals.rs	the_ledger_lives_under_the_state_root_by_sid_and_appends	ledger-paths-and-bound	
 src/supervise/approvals.rs	the_probes_rows_are_no_typed_act_and_say_whether_a_panel_is_owed	ledger-readers-are-row-projections	
 src/supervise/approvals.rs	typed_at_reads_the_sessions_typed_rows_only	ledger-readers-are-row-projections	
-src/supervise/approvals.rs	typed_at_rule_reads_only_that_rule	ledger-readers-are-row-projections	
 src/supervise/approvals.rs	typed_texts_are_what_the_sessions_loop_typed	ledger-readers-are-row-projections	
-src/supervise/blocks.rs	a_codex_session_card_is_no_message	blocks-views	blocks-partition
-src/supervise/blocks.rs	a_codex_walls_block_keeps_its_own_rows_and_no_tip	blocks-views	
 src/supervise/blocks.rs	a_messages_rows_stay_in_its_block	blocks-partition	
 src/supervise/blocks.rs	each_head_opens_its_kind_of_block	blocks-partition	
 src/supervise/blocks.rs	the_calls_the_phase_reader_reads_open_tool_blocks	blocks-partition	
@@ -2202,8 +1776,6 @@ src/supervise/classify_tests.rs	a_tied_array_is_assigned_as_its_scalar	classify-
 src/supervise/classify_tests.rs	a_unicode_escape_in_a_printf_format_may_be_a_conversion	classify-sound	
 src/supervise/classify_tests.rs	a_word_after_a_closing_brace_is_a_command	classify-sound	
 src/supervise/classify_tests.rs	a_wrapper_cannot_launder_the_program_it_runs	classify-sound	
-src/supervise/classify_tests.rs	a_zsh_probe_killed_by_its_alarm_is_a_timeout	§4	
-src/supervise/classify_tests.rs	a_zsh_walk_judges_every_name_once	§4	
 src/supervise/classify_tests.rs	an_awk_or_sed_program_from_a_parameter_is_not_read	classify-sound	
 src/supervise/classify_tests.rs	an_expansion_in_an_option_slot_is_refused_quoted_or_not	classify-sound	
 src/supervise/classify_tests.rs	an_extended_glob_word_may_become_a_flag_or_a_name	classify-sound	
@@ -2212,7 +1784,6 @@ src/supervise/classify_tests.rs	aterm_forms_are_judged_by_their_full_subform	cla
 src/supervise/classify_tests.rs	awk_programs_and_sed_scripts_are_read_not_dropped	classify-sound	
 src/supervise/classify_tests.rs	comments_heredocs_and_quoting_that_only_read_stay_reads	classify-precise-on-read-grammar	
 src/supervise/classify_tests.rs	danger_tokens_anywhere_fail_the_line	classify-sound	
-src/supervise/classify_tests.rs	every_zsh_parameter_that_runs_a_value_is_measured	§4	
 src/supervise/classify_tests.rs	git_branch_creation_and_remote_set_branches_are_writes	classify-sound	
 src/supervise/classify_tests.rs	git_grep_pager_spellings_and_git_help_are_not_read_only	classify-sound	
 src/supervise/classify_tests.rs	git_reads_of_a_chosen_repository_or_through_its_drivers_are_refused	classify-sound	
@@ -2220,7 +1791,6 @@ src/supervise/classify_tests.rs	glob_matches_like_fnmatch	glob-match-fnmatch
 src/supervise/classify_tests.rs	output_file_flags_of_the_read_tools_are_writes	classify-sound	
 src/supervise/classify_tests.rs	program_words_resolve_quotes_and_split_where_the_segments_do	program-words	
 src/supervise/classify_tests.rs	quotes_hide_redirect_glyphs_but_not_substitutions	classify-sound	
-src/supervise/classify_tests.rs	reasons_name_the_deciding_rule	§4	
 src/supervise/classify_tests.rs	sed_capital_i_edits_in_place	classify-sound	
 src/supervise/classify_tests.rs	segment_heads_must_be_known_reads	classify-sound	
 src/supervise/classify_tests.rs	split_segments_sees_every_separator	split-segments	
@@ -2230,22 +1800,10 @@ src/supervise/classify_tests.rs	the_alarm_idiom_is_a_wrapper_not_a_program	class
 src/supervise/classify_tests.rs	the_alarm_idiom_is_exactly_alarm_then_exec	sed-script-and-alarm-idiom	
 src/supervise/classify_tests.rs	the_measured_bypasses_are_not_read_only	classify-sound	
 src/supervise/classify_tests.rs	the_python_allowlist_is_opt_in	python-allowlist	
-src/supervise/classify_tests.rs	the_read_shims_skip_only_a_program_zsh_runs_unchanged	§4	
 src/supervise/classify_tests.rs	the_session_corpus_classifies_as_the_manager_did	classify-sound	
 src/supervise/classify_tests.rs	the_write_forms_of_system_reads_are_refused	classify-sound	
 src/supervise/classify_tests.rs	zsh_arithmetic_that_can_run_a_command_is_not_a_read	classify-sound	
-src/supervise/classify_tests.rs	zsh_arithmetic_vars_are_the_measured_ones	§4	
-src/supervise/classify_tests.rs	zsh_parameters_it_runs_are_the_measured_ones	§4	
-src/supervise/classify_tests.rs	zsh_tied_arrays_are_the_measured_ones	§4	
-src/supervise/codex_usage.rs	a_bypassed_launch_whose_turns_run_sandboxed_has_fallen	codex-sandbox-fall	
-src/supervise/codex_usage.rs	a_child_past_its_bound_is_killed_and_reads_nothing	bounded-child-output	
-src/supervise/codex_usage.rs	a_held_sessions_own_thread_decides_never_a_neighbour	codex-look	
-src/supervise/codex_usage.rs	a_look_reads_the_newest_rollouts	codex-look	
-src/supervise/codex_usage.rs	a_turn_context_far_from_the_end_is_found_and_decides	codex-look	
-src/supervise/codex_usage.rs	the_incidents_readings_read_near_then_far	codex-read-limits	
-src/supervise/codex_usage.rs	the_own_threads_lock_is_found_through_a_linked_home	codex-own-thread	
-src/supervise/codex_usage.rs	the_sessions_own_thread_is_its_lock_else_its_resume	codex-own-thread	
-src/supervise/codex_usage.rs	the_threads_model_counts_only_for_a_turn_since_the_switch_opened	codex-own-thread	
+src/supervise/config.rs	the_autocompact_offer_key_reads_a_size_or_off	config-power-lattice	
 src/supervise/config.rs	a_disk_knob_under_harness_is_the_disk_readers_not_an_unknown_key	config-retired-and-agent-keys	
 src/supervise/config.rs	a_file_that_is_not_toml_is_read_inside_its_harness_section	config-line-reader-agrees	
 src/supervise/config.rs	a_file_that_is_not_toml_reads_an_agent_table_too	config-line-reader-agrees	
@@ -2263,9 +1821,7 @@ src/supervise/config.rs	autopilot_reads_its_three_words_and_only_limits	config-r
 src/supervise/config.rs	each_key_of_an_agent_table_is_said_on_its_own	config-line-reader-agrees	
 src/supervise/config.rs	every_spelling_toml_reads_is_the_key	config-reader-never-grants	
 src/supervise/config.rs	from_path_reads_the_file_and_a_missing_one_is_the_defaults	config-from-path-and-hosted	
-src/supervise/config.rs	hosted_opts_follow_the_policy	config-from-path-and-hosted	
 src/supervise/config.rs	limit_reset_ships_off_and_only_the_root_table_turns_it_on	config-reader-never-grants	
-src/supervise/config.rs	no_harness_key_is_an_agents_name	config-retired-and-agent-keys	
 src/supervise/config.rs	only_enabled_is_per_agent	config-retired-and-agent-keys	
 src/supervise/config.rs	question_priority_takes_its_three_words_and_a_refused_one_changes_nothing	config-reader-never-grants	
 src/supervise/config.rs	texts_are_the_keys_and_read_back_as_the_policy	config-texts-round-trip	
@@ -2281,11 +1837,9 @@ src/supervise/escalate.rs	every_rm_breaker_kind_is_badged_rm_breaker	escalate-ki
 src/supervise/escalate.rs	the_attention_names_the_kind_the_subject_and_the_reason	escalate-attention-text	
 src/supervise/escalate.rs	the_memory_escalation_names_its_conversation_whole_or_not_at_all	escalate-attention-text	
 src/supervise/journal.rs	a_record_round_trips_through_its_json	journal-line-grammar-and-json	
-src/supervise/journal.rs	an_exception_line_is_its_own_kind	journal-line-grammar-and-json	
 src/supervise/journal.rs	each_printed_line_is_read_into_its_fields	journal-line-grammar-and-json	
 src/supervise/ladder.rs	a_doubling_back_off_doubles_to_its_cap	doubling-backoff	
 src/supervise/ladder.rs	a_ladder_clamps_to_its_last_step	ladder-clamp	
-src/supervise/ledger_html.rs	the_legend_names_every_shape_the_script_draws	ledger-html-assets	
 src/supervise/ledger_tests.rs	a_history_record_is_read_whole	ledger-gather	
 src/supervise/ledger_tests.rs	a_ledger_an_update_could_not_carry_is_not_blamed_on_the_person	ledger-gather	
 src/supervise/ledger_tests.rs	a_malformed_since_is_refused_not_a_panic	ledger-since	
@@ -2293,16 +1847,12 @@ src/supervise/ledger_tests.rs	a_missing_source_is_named_and_the_rest_prints	ledg
 src/supervise/ledger_tests.rs	a_reply_the_archive_lost_says_so	ledger-gather	
 src/supervise/ledger_tests.rs	a_report_renders_its_view	blocks-views	
 src/supervise/ledger_tests.rs	a_turn_whose_row_is_missing_is_named_in_the_span_that_holds_it	ledger-gather	
-src/supervise/ledger_tests.rs	an_unreadable_journal_is_not_counted_as_zero	ledger-gather	
 src/supervise/ledger_tests.rs	since_drops_what_came_before_it	ledger-since	
 src/supervise/ledger_tests.rs	since_takes_ms_or_a_time_word	ledger-since	
-src/supervise/ledger_tests.rs	the_clock_prints_what_a_human_reads	ledger-clock-words	
 src/supervise/ledger_tests.rs	the_html_form_is_one_self_contained_page	ledger-render-escapes	
 src/supervise/ledger_tests.rs	the_ledger_joins_the_four_sources	ledger-gather	
 src/supervise/ledger_tests.rs	the_md_form_is_tables	ledger-render-escapes	
-src/supervise/ledger_tests.rs	the_text_form_reads_as_one_timeline	§4	
 src/supervise/ledger_tests.rs	without_a_clock_no_working_time_is_claimed	ledger-gather	
-src/supervise/ledger_tests.rs	without_a_clock_the_times_are_marked_and_no_latency_is_claimed	ledger-gather	
 src/supervise/limit.rs	a_bare_time_is_todays_or_tomorrows_and_midnight_is_12am	limit-zone-and-reset-grammar	
 src/supervise/limit.rs	a_dated_reset_across_a_dst_change_is_placed_with_the_offset_there	limit-wall-placement	
 src/supervise/limit.rs	a_dated_time_is_placed_in_its_zone	limit-reset-placement	
@@ -2312,10 +1862,8 @@ src/supervise/limit.rs	a_reset_across_a_dst_jump_is_placed_in_real_time	limit-wa
 src/supervise/limit.rs	a_reset_that_names_its_year_parses	limit-zone-and-reset-grammar	
 src/supervise/limit.rs	a_rules_file_becomes_one_line	limit-zone-and-reset-grammar	
 src/supervise/limit.rs	a_walls_bare_clock_is_the_first_occurrence_after_its_print	limit-wall-placement	
-src/supervise/limit.rs	a_zone_is_a_sign_and_four_digits	limit-zone-and-reset-grammar	
 src/supervise/limit.rs	a_zones_offset_is_read_at_the_instant	limit-wall-placement	
 src/supervise/limit.rs	both_spellings_parse_with_the_zone	limit-zone-and-reset-grammar	
-src/supervise/limit.rs	reset_at_places_as_it_always_did	limit-reset-placement	
 src/supervise/limit.rs	the_auto_continue_shapes_are_a_time_today_or_tomorrow_or_a_minute	limit-zone-and-reset-grammar	
 src/supervise/limit.rs	the_local_zone_is_read_from_date	limit-zone-and-reset-grammar	
 src/supervise/mail.rs	a_busy_worker_is_not_nudged	mail-task-protocol	
@@ -2342,25 +1890,17 @@ src/supervise/memory.rs	a_measure_past_the_ceiling_warns_and_acts_only_in_troubl
 src/supervise/memory.rs	a_warning_episode_ends_an_eighth_under_the_ceiling	memory-judgement	
 src/supervise/memory.rs	the_automatic_ceiling_moves_with_the_available_memory	memory-ceiling-formula	
 src/supervise/memory.rs	the_dominant_consumer_is_the_largest_and_a_fifth_of_the_memory_in_use	memory-judgement	
-src/supervise/memory.rs	the_fact_and_the_warning_name_the_measure_the_machine_and_the_remedy	memory-fact-banner	
 src/supervise/memory.rs	the_key_reads_auto_off_and_gibibytes	mode-word-parsers	
 src/supervise/memory.rs	the_machine_is_in_trouble_at_critical_or_at_warn_while_it_swaps	memory-judgement	
 src/supervise/memory.rs	the_verdict_moves_with_trouble_rank_and_restart_not_with_the_numbers	memory-judgement	
-src/supervise/mod.rs	two_callers_of_one_tag_never_share_a_scratch_path	§4	
 src/supervise/policy/approval_tests.rs	a_barred_row_shown_as_the_description_is_still_judged	approval-command-readings	
-src/supervise/policy/approval_tests.rs	a_box_cut_at_its_question_is_never_pressed_as_a_tool_card	approval-whole-read	
-src/supervise/policy/approval_tests.rs	a_box_drawn_in_a_goals_text_is_never_pressed	approval-not-a-box	
 src/supervise/policy/approval_tests.rs	a_box_more_than_one_tool_draws_is_held_under_a_bare_rule_for_any_of_them	approval-owner-review-held	
-src/supervise/policy/approval_tests.rs	a_box_quoted_in_the_users_message_is_never_pressed	approval-not-a-box	
-src/supervise/policy/approval_tests.rs	a_box_quoted_under_a_messages_own_table_or_frame_is_never_pressed	approval-not-a-box	
 src/supervise/policy/approval_tests.rs	a_box_taller_than_the_pane_is_pressed_by_no_level	approval-whole-read	
 src/supervise/policy/approval_tests.rs	a_box_taller_than_the_screen_in_a_bypass_session_is_declined_with_its_flagged_rm	approval-whole-read	
 src/supervise/policy/approval_tests.rs	a_box_that_offers_no_way_to_give_a_reason_is_never_declined	approval-amend-input	
 src/supervise/policy/approval_tests.rs	a_box_that_runs_on_another_machine_is_not_proven_by_local_checks	approval-safe-bash-sound	
 src/supervise/policy/approval_tests.rs	a_box_the_owners_own_settings_send_to_a_person_is_never_pressed	approval-owner-review-held	
 src/supervise/policy/approval_tests.rs	a_box_whose_footer_wraps_is_decided_by_its_whole_footer	approval-command-readings	
-src/supervise/policy/approval_tests.rs	a_box_with_a_vendor_note_escalates	approval-safe-bash-sound	
-src/supervise/policy/approval_tests.rs	a_codex_continue_with_is_no_consent	approval-dialog-rules	
 src/supervise/policy/approval_tests.rs	a_command_the_classifier_cannot_name_is_never_pressed	approval-safe-bash-sound	
 src/supervise/policy/approval_tests.rs	a_default_to_no_tool_box_is_pressed_by_moving_the_focus	approval-guarded-press	
 src/supervise/policy/approval_tests.rs	a_digit_is_never_pressed_into_an_open_amend_input	approval-amend-input	
@@ -2371,40 +1911,31 @@ src/supervise/policy/approval_tests.rs	a_git_read_is_approved_only_where_its_con
 src/supervise/policy/approval_tests.rs	a_git_read_is_judged_in_the_workers_environment	approval-git-read	
 src/supervise/policy/approval_tests.rs	a_git_read_is_judged_where_the_bash_tool_stands	approval-git-read	
 src/supervise/policy/approval_tests.rs	a_git_read_whose_bash_tool_settings_change_git_escalates	approval-git-read	
-src/supervise/policy/approval_tests.rs	a_kinds_reason_takes_its_article	§4	
 src/supervise/policy/approval_tests.rs	a_plan_is_approved_on_its_least_power_yes	approval-one-shot-only	
 src/supervise/policy/approval_tests.rs	a_read_box_with_no_folder_grant_is_the_owners_review	approval-owner-review-held	
 src/supervise/policy/approval_tests.rs	a_read_only_box_is_approved_outside_bypass_and_never_in_it	approval-safe-bash-sound	
 src/supervise/policy/approval_tests.rs	a_read_outside_cwd_is_approved_under_an_allowed_root_unless_it_is_a_secret	approval-read-rule	
 src/supervise/policy/approval_tests.rs	a_read_through_a_symlink_is_judged_where_it_leads	approval-read-rule	
-src/supervise/policy/approval_tests.rs	a_real_wrapped_note_is_read_whole_past_the_countdown	approval-whole-read	
 src/supervise/policy/approval_tests.rs	a_reset_confirmation_is_never_answered_yes_at_any_level	approval-never-spends	
 src/supervise/policy/approval_tests.rs	a_row_that_cannot_be_a_wrap_ends_the_command	approval-command-readings	
 src/supervise/policy/approval_tests.rs	a_sed_edit_box_under_a_bash_specifier_rule_or_bash_hook_is_held_at_every_level	approval-owner-review-held	
 src/supervise/policy/approval_tests.rs	a_shell_startup_the_models_do_not_assume_proves_no_rm_and_reads_nothing	approval-safe-bash-sound	
-src/supervise/policy/approval_tests.rs	a_tall_box_with_no_removal_note_is_never_declined	approval-whole-read	
 src/supervise/policy/approval_tests.rs	a_title_whole_on_its_row_leaves_the_box_its_body	approval-command-readings	
 src/supervise/policy/approval_tests.rs	a_trust_dialog_escalates_off_the_sessions_folder_or_its_roots	approval-trust-dialog	
 src/supervise/policy/approval_tests.rs	a_wide_character_row_never_hides_a_wrapped_tail	approval-command-readings	
-src/supervise/policy/approval_tests.rs	a_withheld_rm_rule_proves_no_fresh_directory	approval-rm-breaker-sound	
 src/supervise/policy/approval_tests.rs	a_worker_path_entry_the_worker_writes_is_refused_before_the_probe_runs_it	approval-git-read	
 src/supervise/policy/approval_tests.rs	a_wrapped_non_shell_owner_review_is_never_pressed	approval-owner-review-held	
 src/supervise/policy/approval_tests.rs	a_write_on_a_second_row_is_not_laundered_by_the_space_join	approval-safe-bash-sound	
-src/supervise/policy/approval_tests.rs	an_option_shaped_row_above_the_question_escalates	approval-command-readings	
 src/supervise/policy/approval_tests.rs	an_rm_breaker_on_scratch_is_approved_in_bypass_under_its_row_guard	approval-rm-breaker-sound	
 src/supervise/policy/approval_tests.rs	an_rm_breaker_through_a_link_out_of_scratch_escalates	approval-rm-breaker-sound	
 src/supervise/policy/approval_tests.rs	an_unproven_rm_breaker_under_safe_is_approved_with_a_warning	approval-level-monotone	
-src/supervise/policy/approval_tests.rs	claudes_composer_under_a_table_is_never_escalated	approval-not-a-box	
-src/supervise/policy/approval_tests.rs	codexs_rate_limit_nudge_switches_only_near_its_limit	approval-rate-nudge	
+src/supervise/policy/approval_tests.rs	continue_without_is_a_refusal_never_a_consent	approval-dialog-rules	approval-never-spends
 src/supervise/policy/approval_tests.rs	every_rm_breaker_kind_is_named_and_full_power_presses_each	approval-level-monotone	
 src/supervise/policy/approval_tests.rs	full_power_accepts_a_consent_and_never_buys	approval-never-spends	
-src/supervise/policy/approval_tests.rs	full_power_answers_codex_boxes_by_role	approval-one-shot-only	
 src/supervise/policy/approval_tests.rs	full_power_answers_each_dialog_by_its_own_rule	approval-dialog-rules	
 src/supervise/policy/approval_tests.rs	full_power_answers_every_permission_box_with_its_one_shot_allow	approval-one-shot-only	
-src/supervise/policy/approval_tests.rs	full_power_approves_the_plan_and_answers_the_question_dialog	approval-dialog-rules	
 src/supervise/policy/approval_tests.rs	full_power_confirms_the_model_switch_the_person_typed	approval-dialog-rules	
 src/supervise/policy/approval_tests.rs	full_power_declines_a_grant_only_box_and_leaves_an_unsound_one	approval-one-shot-only	
-src/supervise/policy/approval_tests.rs	full_power_escalates_a_box_it_cannot_read	approval-one-shot-only	
 src/supervise/policy/approval_tests.rs	full_power_never_takes_a_standing_grant	approval-one-shot-only	
 src/supervise/policy/approval_tests.rs	full_power_presses_a_card_mode_tool_box	approval-one-shot-only	
 src/supervise/policy/approval_tests.rs	full_power_presses_bash_under_every_header_form	approval-one-shot-only	
@@ -2412,43 +1943,36 @@ src/supervise/policy/approval_tests.rs	full_power_presses_every_permission_kind_
 src/supervise/policy/approval_tests.rs	full_power_presses_the_measured_touch_box_whose_no_is_garbled	approval-level-monotone	
 src/supervise/policy/approval_tests.rs	full_power_trusts_any_folder_and_names_the_backstops_grants	approval-trust-dialog	
 src/supervise/policy/approval_tests.rs	full_power_with_a_model_fallback_waits_at_the_limit_and_never_buys_credits	approval-never-spends	
-src/supervise/policy/approval_tests.rs	full_powers_unproven_names_the_breaker_once	approval-breaker-naming	
-src/supervise/policy/approval_tests.rs	no_measured_bypass_line_is_approved	approval-safe-bash-sound	
 src/supervise/policy/approval_tests.rs	no_rule_ever_spends_a_limit_reset	approval-never-spends	
 src/supervise/policy/approval_tests.rs	only_a_claude_sessions_box_is_judged	approval-not-a-box	
 src/supervise/policy/approval_tests.rs	only_the_one_shot_allow_is_ever_pressed	approval-one-shot-only	
 src/supervise/policy/approval_tests.rs	the_2_1_281_breaker_with_its_auto_deny_countdown_is_the_rm_rules	approval-rm-breaker-sound	
 src/supervise/policy/approval_tests.rs	the_audits_unsound_rm_approvals_escalate_and_full_power_still_presses_them	approval-level-monotone	
+src/supervise/policy/approval_tests.rs	the_chrome_setup_panel_is_declined_in_every_phase	approval-dialog-rules	approval-one-shot-only
 src/supervise/policy/approval_tests.rs	the_claude_tmp_root_is_the_uids_own	approval-roots	
 src/supervise/policy/approval_tests.rs	the_decline_text_is_one_typeable_line	approval-decline-text	
-src/supervise/policy/approval_tests.rs	the_default_context_has_decision_ones_roots	approval-roots	
 src/supervise/policy/approval_tests.rs	the_default_trusts_no_folder	approval-trust-dialog	
 src/supervise/policy/approval_tests.rs	the_footer_names_the_mode_and_a_2_1_280_box_hides_it	approval-footer-mode	
 src/supervise/policy/approval_tests.rs	the_grant_row_is_taken_by_its_own_rule_and_only_with_its_key_on	approval-limit-dialog	
-src/supervise/policy/approval_tests.rs	the_incident_box_is_escalated_by_the_rules_and_pressed_at_full_power	approval-level-monotone	
+src/supervise/policy/approval_tests.rs	the_autocompact_offer_chooses_the_accept_row_at_400k	approval-autocompact-offer	
+src/supervise/policy/approval_tests.rs	the_autocompact_offer_steps_the_size_before_any_enter	approval-autocompact-offer	
+src/supervise/policy/approval_tests.rs	the_autocompact_offer_is_a_persons_unless_read_whole_and_on	approval-autocompact-offer	
 src/supervise/policy/approval_tests.rs	the_limit_dialog_in_the_fullscreen_panel_waits_for_its_dated_reset	approval-limit-dialog	
 src/supervise/policy/approval_tests.rs	the_limit_options_dialog_chooses_the_wait_row_by_its_label	approval-limit-dialog	
 src/supervise/policy/approval_tests.rs	the_limit_options_dialog_whose_title_wraps_chooses_the_wait_row	approval-command-readings	
 src/supervise/policy/approval_tests.rs	the_limit_options_dialog_without_a_wait_row_is_escalated	approval-limit-dialog	
 src/supervise/policy/approval_tests.rs	the_measured_decline_takes_one_guarded_keystroke_per_state	approval-guarded-press	
-src/supervise/policy/approval_tests.rs	the_measured_rm_breaker_escalates_its_loop_and_outside_bypass	approval-rm-breaker-sound	
-src/supervise/policy/approval_tests.rs	the_measured_tall_box_has_no_note_and_none_is_invented	approval-whole-read	
 src/supervise/policy/approval_tests.rs	the_measured_trust_dialog_is_answered_for_the_sessions_folder_under_a_trust_root	approval-trust-dialog	
 src/supervise/policy/approval_tests.rs	the_mktemp_guards_exit_and_colon_prove_at_the_box	approval-rm-breaker-sound	
-src/supervise/policy/approval_tests.rs	the_model_picker_is_answered_only_for_the_harness_restore	approval-dialog-rules	
-src/supervise/policy/approval_tests.rs	the_nudges_never_show_again_is_never_pressed	approval-rate-nudge	
-src/supervise/policy/approval_tests.rs	the_owners_subagent_rm_box_is_escalated_under_the_owners_limits	approval-level-monotone	
 src/supervise/policy/approval_tests.rs	the_owners_subagent_rm_box_is_pressed_at_default_power	approval-level-monotone	
-src/supervise/policy/approval_tests.rs	the_owners_subagent_rm_box_is_read_as_a_subagents_bash_box	approval-command-readings	
-src/supervise/policy/approval_tests.rs	the_owners_workflow_rm_box_is_answered_at_default_power	approval-level-monotone	
-src/supervise/policy/approval_tests.rs	the_paused_goals_box_is_answered_only_for_the_upgrades_resume	approval-dialog-rules	
+src/supervise/policy/approval_tests.rs	the_mcp_server_dialog_is_a_persons_at_every_level	approval-dialog-rules	approval-one-shot-only
+src/supervise/policy/approval_tests.rs	the_press_gate_reads_a_kept_answer_by_its_role_or_its_label	approval-one-shot-only	
+src/supervise/policy/approval_tests.rs	the_press_gate_refuses_each_kept_mcp_answer_under_any_title	approval-one-shot-only	
 src/supervise/policy/approval_tests.rs	the_rest_of_an_rm_breaker_line_must_read	approval-rm-breaker-sound	
 src/supervise/policy/approval_tests.rs	the_session_paused_dialog_switches_to_the_fallback	approval-dialog-rules	
-src/supervise/policy/approval_tests.rs	the_workflow_breaker_fixture_escalates	approval-rm-breaker-sound	
 src/supervise/policy/approval_tests.rs	trust_roots_are_read_from_the_config_spelling	approval-roots	
 src/supervise/policy/approval_tests.rs	under_zsh_only_a_plain_line_is_a_proven_read	approval-safe-bash-sound	
 src/supervise/policy/approval_tests.rs	with_no_trust_root_only_the_system_roots_are_read	approval-read-rule	
-src/supervise/policy/approval_tests.rs	writes_and_the_measured_touch_box_escalate	approval-safe-bash-sound	
 src/supervise/policy/claude_settings_tests.rs	a_hook_matcher_matches_bash_as_claude_code_matches_it	hook-matcher	
 src/supervise/policy/claude_settings_tests.rs	a_linked_worktree_reads_the_main_worktrees_local_settings	settings-chain-order	
 src/supervise/policy/claude_settings_tests.rs	a_managed_preference_domain_is_a_document_this_reader_cannot_see	managed-preferences	
@@ -2472,7 +1996,6 @@ src/supervise/policy/exception_tests.rs	a_lost_login_after_its_login_is_an_excep
 src/supervise/policy/exception_tests.rs	a_spend_wall_with_no_reset_says_so_once_and_the_action_is_the_strings	exception-for-table	
 src/supervise/policy/exception_tests.rs	a_wait_is_never_an_exception	exception-for-table	
 src/supervise/policy/exception_tests.rs	a_wall_that_answers_three_tries_an_hour_past_its_reset_is_futile	exception-for-table	
-src/supervise/policy/exception_tests.rs	the_exception_texts_fit_the_digests_caps_and_lint	exception-text-lint	
 src/supervise/policy/git_config_tests.rs	a_clean_repository_loads_nothing_that_runs	git-view-refines-git	
 src/supervise/policy/git_config_tests.rs	a_directory_that_does_not_exist_is_read_at_its_nearest_ancestor	git-view-refines-git	
 src/supervise/policy/git_config_tests.rs	a_directory_this_check_cannot_resolve_is_refused	git-reads-placement	
@@ -2511,12 +2034,11 @@ src/supervise/policy/outlook_tests.rs	every_wall_kind_has_an_outlook	outlook-tab
 src/supervise/policy/question_tests.rs	a_cut_question_is_escalated	decide-routes-questions	
 src/supervise/policy/question_tests.rs	a_persons_text_hands_the_question_over	question-recommended-decision	
 src/supervise/policy/question_tests.rs	a_refusal_is_no_and_never_a_word_that_starts_with_it	question-destructive-refusal	
-src/supervise/policy/question_tests.rs	a_wrapped_recommended_label_is_chosen_and_said	question-recommended-decision	
+src/supervise/policy/question_tests.rs	a_vendor_answer_is_kept_only_as_a_whole_label	question-recommended-decision	
 src/supervise/policy/question_tests.rs	an_unmarked_destructive_question_is_answered_by_its_refusal_or_is_the_persons	question-destructive-refusal	
 src/supervise/policy/question_tests.rs	an_unread_question_is_escalated	question-recommended-decision	
 src/supervise/policy/question_tests.rs	answer_questions_is_independent_of_approve	decide-routes-questions	
 src/supervise/policy/question_tests.rs	answer_questions_off_hands_every_question_over	decide-routes-questions	
-src/supervise/policy/question_tests.rs	codexs_unmarked_destructive_question_is_answered_by_its_refusal	question-destructive-refusal	
 src/supervise/policy/question_tests.rs	focus_on_the_chat_row_is_moved_up	question-recommended-decision	
 src/supervise/policy/question_tests.rs	focus_on_the_free_text_row_is_moved_up_never_answered	question-recommended-decision	
 src/supervise/policy/question_tests.rs	multiselect_toggles_each_recommended_then_advances	question-recommended-decision	
@@ -2529,19 +2051,15 @@ src/supervise/policy/question_tests.rs	the_incidents_unmarked_publish_question_i
 src/supervise/policy/question_tests.rs	the_preview_form_is_focused_then_entered	question-recommended-decision	
 src/supervise/policy/question_tests.rs	the_recommended_option_wins_over_the_focus	question-recommended-decision	
 src/supervise/policy/question_tests.rs	the_review_tab_submits	question-recommended-decision	
-src/supervise/policy/question_tests.rs	the_step_cap_is_the_furthest_measured_move_plus_one	question-recommended-decision	
 src/supervise/policy/question_tests.rs	tier1_the_question_decider_chooses_only_what_the_model_enables	question-decider-refines-model	
 src/supervise/policy/question_text_tests.rs	a_multi_select_is_typed_then_submitted_by_its_button_never_in_the_field	choose-text-table	
 src/supervise/policy/question_text_tests.rs	a_multi_select_text_its_dialog_would_draw_over_is_never_typed	choose-text-table	
 src/supervise/policy/question_text_tests.rs	a_multi_select_text_keeps_its_rows_only_where_the_reflow_cannot_drop_one	fit-and-reflow	
-src/supervise/policy/question_text_tests.rs	a_question_read_by_its_roles_falls_back_said_as_every_fallback_is	choose-text-table	
 src/supervise/policy/question_text_tests.rs	a_single_select_is_typed_then_entered_and_anything_else_is_the_persons	choose-text-table	
 src/supervise/policy/question_text_tests.rs	a_tab_the_text_cannot_go_to_is_answered_with_its_recommended_option_and_says_so	choose-text-table	
 src/supervise/policy/question_text_tests.rs	decide_answers_by_the_contexts_priority	decide-routes-questions	
 src/supervise/policy/question_text_tests.rs	the_fit_estimate_is_at_or_above_the_measured_wraps	fit-and-reflow	
 src/supervise/policy/question_text_tests.rs	the_policy_texts_keep_their_rules	policy-text-rules	
-src/supervise/policy/question_text_tests.rs	the_recommended_decisions_are_byte_identical_to_mains	recommended-path-independent	
-src/supervise/policy/question_text_tests.rs	the_shipped_help_spells_the_session_words_the_parser_accepts	§4	
 src/supervise/policy/question_text_tests.rs	tier1_text_mode_decider_chooses_only_what_the_model_enables	question-decider-refines-model	
 src/supervise/policy/reset.rs	a_host_that_answers_nothing_takes_no_reset	reset-go-and-host-defaults	
 src/supervise/policy/reset.rs	a_short_wall_is_reset_only_where_the_offer_expires_within_a_day	confirm-verdict	
@@ -2549,12 +2067,10 @@ src/supervise/policy/reset.rs	enter_only_at_the_exact_confirmation_of_the_row_ta
 src/supervise/policy/rm_breaker_tests.rs	a_brace_expanded_word_moves_the_words_the_rule_reads	rm-resolver-sound	
 src/supervise/policy/rm_breaker_tests.rs	a_builtin_that_changes_how_words_read_is_not_followed	rm-resolver-sound	
 src/supervise/policy/rm_breaker_tests.rs	a_command_that_can_assign_what_it_names_is_no_plain_consumer	rm-shell-tables-match-shells	
-src/supervise/policy/rm_breaker_tests.rs	a_conditional_export_and_a_pipe_prove_nothing	rm-resolver-sound	
 src/supervise/policy/rm_breaker_tests.rs	a_conditional_or_scoped_assignment_is_unknown	rm-resolver-sound	
 src/supervise/policy/rm_breaker_tests.rs	a_cwd_through_a_users_link_keeps_its_target_root	rm-on-disk	
 src/supervise/policy/rm_breaker_tests.rs	a_dash_format_with_no_numeric_conversion_reads_no_arithmetic	rm-resolver-complete-fragment	
 src/supervise/policy/rm_breaker_tests.rs	a_directory_the_line_just_made_is_proven_wherever_it_is	rm-resolver-complete-fragment	
-src/supervise/policy/rm_breaker_tests.rs	a_forgotten_variable_names_the_command_that_forgot_it	rm-resolver-complete-fragment	
 src/supervise/policy/rm_breaker_tests.rs	a_globbed_word_moves_the_words_the_rule_reads	rm-resolver-sound	
 src/supervise/policy/rm_breaker_tests.rs	a_mktemp_that_fails_leaves_its_variable_empty	rm-resolver-sound	
 src/supervise/policy/rm_breaker_tests.rs	a_name_the_shell_maintains_is_not_the_lines	rm-resolver-sound	
@@ -2563,7 +2079,6 @@ src/supervise/policy/rm_breaker_tests.rs	a_path_word_with_an_arithmetic_operator
 src/supervise/policy/rm_breaker_tests.rs	a_plain_commands_words_name_nothing	rm-resolver-complete-fragment	
 src/supervise/policy/rm_breaker_tests.rs	a_printf_format_is_read_after_its_unicode_escapes	rm-resolver-sound	
 src/supervise/policy/rm_breaker_tests.rs	a_printf_format_with_no_numeric_conversion_reads_no_arithmetic	rm-resolver-complete-fragment	
-src/supervise/policy/rm_breaker_tests.rs	a_quoted_fresh_directory_alone_is_proven_whatever_else_reads_it	rm-resolver-complete-fragment	
 src/supervise/policy/rm_breaker_tests.rs	a_quoted_substitution_under_another_command_forgets	rm-resolver-sound	
 src/supervise/policy/rm_breaker_tests.rs	a_quoted_test_operand_names_nothing	rm-resolver-complete-fragment	
 src/supervise/policy/rm_breaker_tests.rs	a_quoted_word_printf_reads_as_data_names_nothing	rm-resolver-complete-fragment	
@@ -2585,11 +2100,7 @@ src/supervise/policy/rm_breaker_tests.rs	an_unknown_word_forgets_only_where_it_c
 src/supervise/policy/rm_breaker_tests.rs	every_name_whose_assignment_does_not_read_back_is_kept	rm-shell-tables-match-shells	
 src/supervise/policy/rm_breaker_tests.rs	every_zsh_modifier_letter_is_not_text	rm-resolver-sound	
 src/supervise/policy/rm_breaker_tests.rs	literal_chains_resolve_and_every_operand_is_judged	rm-resolver-complete-fragment	
-src/supervise/policy/rm_breaker_tests.rs	mktemp_is_proven_by_its_template_or_as_a_fresh_directory	rm-resolver-complete-fragment	
-src/supervise/policy/rm_breaker_tests.rs	nothing_is_proven_with_no_scratch_root	rm-no-roots-no-proof	
 src/supervise/policy/rm_breaker_tests.rs	scratch_root_patterns	scratch-root-patterns	
-src/supervise/policy/rm_breaker_tests.rs	the_audits_measured_approvals_escalate	rm-resolver-sound	
-src/supervise/policy/rm_breaker_tests.rs	the_synthesis_cases	rm-resolver-complete-fragment	
 src/supervise/policy/rm_breaker_tests.rs	what_the_resolver_will_not_follow	rm-resolver-sound	
 src/supervise/policy/rm_breaker_tests.rs	where_an_operand_may_point	rm-resolver-sound	
 src/supervise/policy/rm_breaker_tests.rs	zsh_expansions_are_not_text	rm-resolver-sound	
@@ -2603,47 +2114,24 @@ src/supervise/policy/shell_startup_tests.rs	an_alias_fails_only_a_line_that_may_
 src/supervise/policy/shell_startup_tests.rs	an_option_the_models_do_not_assume_fails_every_line_naming_it	snapshot-parse	
 src/supervise/policy/shell_startup_tests.rs	every_snapshot_of_the_tools_shell_is_judged_and_none_is_unknown	startup-read	
 src/supervise/policy/shell_startup_tests.rs	what_runs_before_every_command_besides_the_snapshot_is_read	startup-read	
-src/supervise/policy/turn_end_tests.rs	a_529_backs_off_then_continues_exactly_once_per_step_for_ever	te-api-wall-ladder	
 src/supervise/policy/turn_end_tests.rs	a_bucket_no_relaunch_moved_off_is_waited_on_when_its_countdown_ends	te-model-bucket	
-src/supervise/policy/turn_end_tests.rs	a_bucket_that_names_no_reset_is_never_returned_to	te-model-bucket	
 src/supervise/policy/turn_end_tests.rs	a_bucket_waited_on_is_taken_up_by_the_loop_that_follows	te-model-bucket	
-src/supervise/policy/turn_end_tests.rs	a_carried_on_switchs_turn_is_a_persons_with_a_keystroke_since_its_row	te-switch-person-hand	
-src/supervise/policy/turn_end_tests.rs	a_carried_on_turns_hand_is_bounded_to_the_turn_in_flight	te-switch-person-hand	
 src/supervise/policy/turn_end_tests.rs	a_carry_ends_where_the_task_passes_to_a_person	te-person-exchange	
 src/supervise/policy/turn_end_tests.rs	a_certificate_or_proxy_refusal_is_retried_never_asked	te-api-wall-ladder	
 src/supervise/policy/turn_end_tests.rs	a_check_in_on_a_carried_task_stays_on_the_ladder	te-person-exchange	
 src/supervise/policy/turn_end_tests.rs	a_choice_asked_in_prose_is_answered	te-answer-policy	
-src/supervise/policy/turn_end_tests.rs	a_codex_goal_the_wall_stopped_is_resumed_with_goal_resume	te-switch-progression	
-src/supervise/policy/turn_end_tests.rs	a_codex_lost_login_types_nothing_and_escalates_with_its_sign_in	te-login-wall	
-src/supervise/policy/turn_end_tests.rs	a_codex_wall_is_quoted_as_codex	te-wall-text-untrusted	
 src/supervise/policy/turn_end_tests.rs	a_compaction_that_runs_long_and_fails_does_not_start_the_ladder_over	te-context-compact	
-src/supervise/policy/turn_end_tests.rs	a_context_wall_behind_a_shell_is_compacted_on_its_ladder_and_never_in_a_loop	te-context-compact	
-src/supervise/policy/turn_end_tests.rs	a_continuation_is_judged_only_once_the_worker_took_it	te-act-take-window	
-src/supervise/policy/turn_end_tests.rs	a_continuation_left_unanswered_is_acted_again_on_the_back_off	te-act-take-window	
-src/supervise/policy/turn_end_tests.rs	a_continuation_never_seen_busy_is_judged_at_its_deadline_not_latched	te-act-take-window	
 src/supervise/policy/turn_end_tests.rs	a_countdown_the_vendor_dropped_is_placed_as_a_cancelled_one	te-left-notice	
 src/supervise/policy/turn_end_tests.rs	a_countdowns_record_in_a_resumed_history_is_no_countdown	te-left-notice	
-src/supervise/policy/turn_end_tests.rs	a_cut_off_reply_is_continued_at_once_then_on_the_short_ladder	te-api-wall-ladder	
 src/supervise/policy/turn_end_tests.rs	a_destructive_act_anywhere_in_a_choice_is_named	te-classify-said	
 src/supervise/policy/turn_end_tests.rs	a_destructive_question_in_any_shape_is_answered_never_continued	te-answer-policy	
 src/supervise/policy/turn_end_tests.rs	a_done_check_answered_with_progress_is_continued	te-done-check-finished	
-src/supervise/policy/turn_end_tests.rs	a_done_report_gets_the_done_check_and_a_second_ends_the_task	te-done-check-finished	
 src/supervise/policy/turn_end_tests.rs	a_done_report_under_land_gets_the_instruction_not_the_check	te-land-policy	
-src/supervise/policy/turn_end_tests.rs	a_done_task_never_strands_an_open_switch	te-switch-progression	
-src/supervise/policy/turn_end_tests.rs	a_draft_left_at_a_usage_wall_is_submitted_after_the_reset	te-draft-handling	
-src/supervise/policy/turn_end_tests.rs	a_draft_left_standing_is_submitted_where_the_policy_would_act	te-draft-handling	
 src/supervise/policy/turn_end_tests.rs	a_fable_limit_relaunches_on_opus_and_back_at_its_reset_never_by_model	te-model-bucket	
 src/supervise/policy/turn_end_tests.rs	a_finished_report_naming_open_work_is_challenged_once_a_job	te-done-check-finished	
 src/supervise/policy/turn_end_tests.rs	a_finished_task_opens_again_and_a_walled_token_is_no_finish	te-done-check-finished	
 src/supervise/policy/turn_end_tests.rs	a_first_point_no_read_saw_busy_is_never_left_to_a_person	te-person-exchange	
-src/supervise/policy/turn_end_tests.rs	a_fresh_session_is_no_turn_end_and_starts_no_streak	te-taskless-no-act	
 src/supervise/policy/turn_end_tests.rs	a_full_context_is_compacted_then_continued_and_compacted_again_on_the_ladder	te-context-compact	
-src/supervise/policy/turn_end_tests.rs	a_goal_escaping_its_stop_is_stopped_again_then_told	te-switch-progression	
-src/supervise/policy/turn_end_tests.rs	a_goal_still_pursued_is_paused_up_to_its_stops_then_left	te-switch-progression	
-src/supervise/policy/turn_end_tests.rs	a_goal_the_upgrade_paused_is_resumed_at_the_switchs_reset	te-switch-progression	
-src/supervise/policy/turn_end_tests.rs	a_harness_turn_answered_with_real_work_ends_the_streak	te-short-streak-backoff	
-src/supervise/policy/turn_end_tests.rs	a_hold_ends_at_its_bound_or_when_the_window_reads_far	te-switch-progression	
-src/supervise/policy/turn_end_tests.rs	a_hold_whose_reset_is_unread_counts_a_sleep_on_its_bound	te-sleep-adjust	
 src/supervise/policy/turn_end_tests.rs	a_hot_loop_of_one_wall_rule_is_held_to_twelve_an_hour	te-wall-breaker	
 src/supervise/policy/turn_end_tests.rs	a_land_acts_reply_is_landed_however_long_it_worked	te-land-policy	
 src/supervise/policy/turn_end_tests.rs	a_land_reply_without_done_gets_at_most_two_nudges_then_nothing	te-land-policy	
@@ -2660,10 +2148,8 @@ src/supervise/policy/turn_end_tests.rs	a_lost_login_is_its_logins_own_end_only_w
 src/supervise/policy/turn_end_tests.rs	a_lost_login_is_waited_at_only_where_a_move_could_be_made	te-login-after-move	
 src/supervise/policy/turn_end_tests.rs	a_lost_login_no_point_decided_is_decided_as_the_wall_it_left	te-login-wall	
 src/supervise/policy/turn_end_tests.rs	a_lost_login_right_after_a_move_is_answered_by_the_next_account	te-login-after-move	
-src/supervise/policy/turn_end_tests.rs	a_lost_login_types_login_then_escalates_and_a_spend_wall_waits_its_reset	te-login-wall	
 src/supervise/policy/turn_end_tests.rs	a_lost_login_whose_row_left_is_told_where_it_is_asked_about	te-login-after-move	
 src/supervise/policy/turn_end_tests.rs	a_lost_login_with_no_account_to_wait_for_asks_for_its_sign_in_now	te-login-after-move	
-src/supervise/policy/turn_end_tests.rs	a_measured_outage_types_nothing_until_the_hold_and_a_reachable_api_at_once	te-api-wall-ladder	
 src/supervise/policy/turn_end_tests.rs	a_memory_wall_restarts_the_agent_and_never_types	te-memory-wall	
 src/supervise/policy/turn_end_tests.rs	a_model_bucket_is_accepted_under_consent_never_under_a_box_and_waits_out_a_second	te-model-bucket	
 src/supervise/policy/turn_end_tests.rs	a_model_bucket_moves_account_first_and_the_fallback_is_its_otherwise	te-account-move	
@@ -2678,18 +2164,12 @@ src/supervise/policy/turn_end_tests.rs	a_persons_declined_question_is_held_for_t
 src/supervise/policy/turn_end_tests.rs	a_persons_exchange_on_a_wall_gets_its_retry_and_stays_theirs	te-person-exchange	
 src/supervise/policy/turn_end_tests.rs	a_persons_exchange_on_a_wall_keeps_its_work_across_an_off_park	te-person-exchange	
 src/supervise/policy/turn_end_tests.rs	a_persons_exchange_retried_on_a_wall_and_unseen_after_an_off_park_is_never_left	te-person-exchange	
-src/supervise/policy/turn_end_tests.rs	a_persons_hand_releases_the_switch	te-switch-person-hand	
 src/supervise/policy/turn_end_tests.rs	a_persons_interrupt_holds_the_turn_for_the_grace	te-person-grace	
 src/supervise/policy/turn_end_tests.rs	a_persons_keystroke_holds_every_act_for_the_grace	te-person-grace	
-src/supervise/policy/turn_end_tests.rs	a_persons_model_during_the_hold_releases_it	te-switch-person-hand	
 src/supervise/policy/turn_end_tests.rs	a_persons_own_exchange_is_left_to_them_whatever_it_says	te-person-exchange	
 src/supervise/policy/turn_end_tests.rs	a_persons_own_exchange_is_theirs_under_every_autopilot	te-person-exchange	
-src/supervise/policy/turn_end_tests.rs	a_persons_own_turn_is_never_stopped	te-switch-person-hand	
-src/supervise/policy/turn_end_tests.rs	a_persons_turn_at_a_limit_whose_notice_left_ends_its_wait	te-left-notice	
-src/supervise/policy/turn_end_tests.rs	a_picker_a_person_reopens_is_theirs	te-switch-person-hand	
 src/supervise/policy/turn_end_tests.rs	a_plain_turn_end_moves_ahead_of_the_wall_around_its_own_act	te-account-move	
 src/supervise/policy/turn_end_tests.rs	a_point_the_upgrade_owns_is_never_continued_at_the_grace_lapse	te-upgrade-ownership	
-src/supervise/policy/turn_end_tests.rs	a_press_only_intended_waits_for_the_footer	te-switch-progression	
 src/supervise/policy/turn_end_tests.rs	a_prompt_not_answered_yet_leaves_a_left_limits_wait_standing	te-left-notice	
 src/supervise/policy/turn_end_tests.rs	a_question_in_prose_is_answered_by_the_priority_word	te-answer-policy	
 src/supervise/policy/turn_end_tests.rs	a_question_under_land_gets_the_land_answer	te-land-policy	
@@ -2700,20 +2180,13 @@ src/supervise/policy/turn_end_tests.rs	a_renewable_login_is_never_signed_in_wher
 src/supervise/policy/turn_end_tests.rs	a_renewable_login_s_end_is_waited_at_asks_its_renewal_and_follows_it	te-renewable-login	
 src/supervise/policy/turn_end_tests.rs	a_report_ending_in_finished_ends_the_task_at_once	te-done-check-finished	
 src/supervise/policy/turn_end_tests.rs	a_report_or_a_question_only_the_person_can_answer_is_no_choice	te-classify-said	
-src/supervise/policy/turn_end_tests.rs	a_restart_between_the_esc_and_its_point_keeps_the_switch	te-switch-person-hand	
-src/supervise/policy/turn_end_tests.rs	a_restart_during_the_wind_down_keeps_the_hold	te-switch-progression	
 src/supervise/policy/turn_end_tests.rs	a_restarted_loop_keeps_the_usage_act_it_already_made	te-usage-limit-wait	
-src/supervise/policy/turn_end_tests.rs	a_restore_that_does_not_verify_is_handed_over_with_its_steps	te-switch-progression	
 src/supervise/policy/turn_end_tests.rs	a_resume_advised_for_the_resets_own_clearing_types_nothing_more	te-limit-reset-continuation	
-src/supervise/policy/turn_end_tests.rs	a_resume_answered_at_once_by_the_wall_backs_off_instead_of_latching	te-act-take-window	
 src/supervise/policy/turn_end_tests.rs	a_resumed_conversations_older_vendor_continuation_ends_no_wait	te-left-notice	
 src/supervise/policy/turn_end_tests.rs	a_retry_that_led_to_real_work_ends_the_episode	te-api-wall-ladder	
-src/supervise/policy/turn_end_tests.rs	a_retry_the_wall_answers_inside_its_take_window_is_met_not_taken	te-left-notice	
 src/supervise/policy/turn_end_tests.rs	a_seeded_resume_is_owed_while_the_notice_it_left_stands_unserved	te-move-answer-and-resume	
-src/supervise/policy/turn_end_tests.rs	a_seeded_switch_carries_on	te-switch-progression	
 src/supervise/policy/turn_end_tests.rs	a_session_held_at_its_wall_waits_for_whatever_comes_first	te-account-move	
 src/supervise/policy/turn_end_tests.rs	a_session_makes_at_most_four_account_moves_an_hour	te-account-move	
-src/supervise/policy/turn_end_tests.rs	a_session_only_the_harness_has_typed_into_gets_no_act	te-taskless-no-act	
 src/supervise/policy/turn_end_tests.rs	a_sleep_is_time_on_the_policys_pauses_and_resets_and_not_on_the_workers_clock	te-sleep-adjust	
 src/supervise/policy/turn_end_tests.rs	a_sleep_never_reopens_the_hot_loop_breakers	te-sleep-adjust	
 src/supervise/policy/turn_end_tests.rs	a_sonnet_bucket_under_the_generic_banner_relaunches_on_the_fallback	te-model-bucket	
@@ -2724,18 +2197,12 @@ src/supervise/policy/turn_end_tests.rs	a_spent_landing_leaves_a_persons_minutes_
 src/supervise/policy/turn_end_tests.rs	a_stop_that_names_a_destructive_act_is_answered_reversibly	te-answer-policy	
 src/supervise/policy/turn_end_tests.rs	a_superseded_login_follows_the_renewed_one_at_an_idle_turn_end	te-renewable-login	
 src/supervise/policy/turn_end_tests.rs	a_superseded_logins_held_follow_is_waited_for_and_asks_nothing	te-renewable-login	
-src/supervise/policy/turn_end_tests.rs	a_switch_standing_still_is_said_once	te-switch-progression	
-src/supervise/policy/turn_end_tests.rs	a_switch_whose_footer_never_shows_the_cheaper_model_is_released	te-switch-progression	
 src/supervise/policy/turn_end_tests.rs	a_told_move_is_held_by_a_later_loop_whatever_its_age	te-move-answer-and-resume	
 src/supervise/policy/turn_end_tests.rs	a_told_move_is_told_served_where_the_worker_works_past_it	te-move-answer-and-resume	
 src/supervise/policy/turn_end_tests.rs	a_told_moves_first_point_after_a_relaunch_is_its_start_up	te-move-answer-and-resume	
-src/supervise/policy/turn_end_tests.rs	a_turn_end_after_real_work_is_continued_at_once_and_a_short_one_after_its_back_off	te-continue-at-idle	
 src/supervise/policy/turn_end_tests.rs	a_turn_of_someone_elses_keeps_the_land_episode	te-land-policy	
 src/supervise/policy/turn_end_tests.rs	a_turn_that_ran_since_the_move_pays_the_resume_whatever_it_ended_on	te-move-answer-and-resume	
-src/supervise/policy/turn_end_tests.rs	a_turn_under_another_limits_notice_or_unanswered_ends_no_wait	te-left-notice	
 src/supervise/policy/turn_end_tests.rs	a_typed_act_or_work_seen_since_pays_the_resets_continuation	te-limit-reset-continuation	
-src/supervise/policy/turn_end_tests.rs	a_usage_reset_gets_the_continuation_not_a_probe	te-usage-limit-wait	
-src/supervise/policy/turn_end_tests.rs	a_usage_wall_at_the_wind_down_holds_to_its_reset	te-switch-progression	
 src/supervise/policy/turn_end_tests.rs	a_usage_wall_with_an_account_to_move_to_is_a_relaunch_under_it	te-account-move	
 src/supervise/policy/turn_end_tests.rs	a_waited_lost_login_whose_row_leaves_is_still_decided_as_that_wall	te-login-after-move	
 src/supervise/policy/turn_end_tests.rs	a_wall_inside_a_land_act_or_the_done_check_keeps_the_act_it_cut	te-land-policy	
@@ -2745,23 +2212,16 @@ src/supervise/policy/turn_end_tests.rs	a_wall_past_its_reset_is_probed_before_th
 src/supervise/policy/turn_end_tests.rs	a_wall_read_before_its_point_is_tracked_and_the_act_judged_as_before	te-left-notice	
 src/supervise/policy/turn_end_tests.rs	a_wall_split_job_is_landed_and_a_split_exchange_is_left_under_land	te-land-policy	
 src/supervise/policy/turn_end_tests.rs	a_walls_act_never_types_the_screens_words	te-wall-text-untrusted	
-src/supervise/policy/turn_end_tests.rs	a_written_budget_stops_at_six_an_hour_and_the_default_has_none	te-continue-budget	
 src/supervise/policy/turn_end_tests.rs	advice_to_resume_types_the_walls_continuation_once_a_clearing	te-account-move	
 src/supervise/policy/turn_end_tests.rs	advice_to_wait_cuts_the_walls_wait_short_and_never_lengthens_it	te-account-move	
 src/supervise/policy/turn_end_tests.rs	after_an_off_park_a_persons_turn_is_judged_by_the_exchange_bound	te-person-exchange	
 src/supervise/policy/turn_end_tests.rs	an_account_move_is_asked_ahead_of_the_models_return	te-account-move	
-src/supervise/policy/turn_end_tests.rs	an_api_error_in_the_wind_down_is_retried_not_judged	te-switch-progression	
 src/supervise/policy/turn_end_tests.rs	an_api_error_is_retried_on_the_ladder_and_retries_off_escalate	te-api-wall-ladder	
-src/supervise/policy/turn_end_tests.rs	an_intended_press_says_no_draft_note_and_rows_say_intent	te-switch-progression	
 src/supervise/policy/turn_end_tests.rs	an_irreversible_decision_never_gets_the_owners_answer_text	te-answer-policy	
 src/supervise/policy/turn_end_tests.rs	an_off_park_ends_the_carry_so_a_persons_greeting_after_it_is_theirs	te-person-exchange	
-src/supervise/policy/turn_end_tests.rs	an_open_switch_never_continues_answers_or_sends_a_draft	te-switch-never-continues	
-src/supervise/policy/turn_end_tests.rs	an_unreachable_wall_is_retried_on_the_short_ladder_while_its_reach_is_unknown	te-api-wall-ladder	
-src/supervise/policy/turn_end_tests.rs	an_unsaved_wind_down_is_said_and_the_switch_goes_on	te-switch-progression	
 src/supervise/policy/turn_end_tests.rs	at_a_limit_whose_notice_left_the_screen_the_roster_is_asked_as_at_the_wall	te-account-move	
 src/supervise/policy/turn_end_tests.rs	aterms_own_words_left_in_the_prompt_are_never_sent_as_a_draft	te-draft-handling	
 src/supervise/policy/turn_end_tests.rs	autopilot_off_decides_nothing_where_cruise_acts	te-autopilot-off	
-src/supervise/policy/turn_end_tests.rs	codexs_pursued_goal_and_a_fallen_sandbox_get_no_continuation	te-switch-never-continues	
 src/supervise/policy/turn_end_tests.rs	continue_off_limits_the_land_instruction_but_not_its_answer	te-land-policy	
 src/supervise/policy/turn_end_tests.rs	destructive_words_match_their_inflections	te-destructive-word	
 src/supervise/policy/turn_end_tests.rs	each_end_of_a_limit_reset_owes_one_continuation	te-limit-reset-continuation	
@@ -2771,63 +2231,32 @@ src/supervise/policy/turn_end_tests.rs	leaving_land_for_an_off_park_types_the_in
 src/supervise/policy/turn_end_tests.rs	leaving_land_forgets_the_episode_and_a_done_task_stays_done	te-land-policy	
 src/supervise/policy/turn_end_tests.rs	no_account_is_asked_about_while_the_resets_continuation_is_owed	te-limit-reset-continuation	
 src/supervise/policy/turn_end_tests.rs	nothing_is_typed_under_a_box_a_survey_a_draft_or_a_non_agent_screen	te-continue-at-idle	
-src/supervise/policy/turn_end_tests.rs	nothing_of_the_switch_is_typed_into_a_fallen_sandbox	te-switch-never-continues	
 src/supervise/policy/turn_end_tests.rs	only_a_retrys_wait_is_the_next_try	te-retry-wait-flag	
 src/supervise/policy/turn_end_tests.rs	only_the_check_itself_can_end_the_task	te-done-check-finished	
 src/supervise/policy/turn_end_tests.rs	open_work_reads_heads_and_status_words_and_never_a_negation	te-done-check-finished	
-src/supervise/policy/turn_end_tests.rs	short_turns_back_off_doubling_to_an_hour_and_real_work_resets_it	te-short-streak-backoff	
 src/supervise/policy/turn_end_tests.rs	someone_elses_turn_opens_a_done_task_again	te-done-check-finished	
-src/supervise/policy/turn_end_tests.rs	someone_elses_turn_that_ends_on_a_wall_is_walled_not_done	te-done-check-finished	
-src/supervise/policy/turn_end_tests.rs	the_2026_09_27_outage_is_held_then_continued_once_the_api_is_back	te-api-wall-ladder	
-src/supervise/policy/turn_end_tests.rs	the_account_restarts_words	§4	
 src/supervise/policy/turn_end_tests.rs	the_accounts_news_ends_a_latch_at_a_wall_and_ahead_of_one	te-account-move	
 src/supervise/policy/turn_end_tests.rs	the_allow_list_takes_close_variants_and_nothing_else	te-suggestion-allowed	
 src/supervise/policy/turn_end_tests.rs	the_continuation_a_walls_act_owes_is_paid_where_the_upgrade_owns_the_point	te-upgrade-ownership	
 src/supervise/policy/turn_end_tests.rs	the_decider_reads_a_probe_as_its_otherwise_at_every_account_fixture	te-probe-transparent	
 src/supervise/policy/turn_end_tests.rs	the_done_check_is_a_continuation_the_owner_can_limit	te-done-check-finished	
-src/supervise/policy/turn_end_tests.rs	the_done_row_measures_the_turn_and_the_bucket_names_its_model	te-screen-parsers	
-src/supervise/policy/turn_end_tests.rs	the_evening_session_wall_of_tab_1_is_waited_out_and_continued	te-usage-limit-wait	
 src/supervise/policy/turn_end_tests.rs	the_first_turn_after_a_move_says_whether_the_account_serves	te-move-answer-and-resume	
-src/supervise/policy/turn_end_tests.rs	the_fixture_screens_read_and_decide	te-continue-at-idle	
-src/supervise/policy/turn_end_tests.rs	the_harness_own_turns_are_no_short_turns_of_the_workers	te-short-streak-backoff	
-src/supervise/policy/turn_end_tests.rs	the_hold_begins_with_one_record_and_the_own_esc_is_spent_by_the_next_act	te-switch-progression	
-src/supervise/policy/turn_end_tests.rs	the_holds_end_keeps_resume_limits_and_continue_policy	te-switch-progression	
 src/supervise/policy/turn_end_tests.rs	the_host_is_asked_only_where_its_advice_could_decide	te-account-point	
-src/supervise/policy/turn_end_tests.rs	the_incident_replayed_saves_restores_holds_and_resumes	te-switch-progression	
 src/supervise/policy/turn_end_tests.rs	the_land_texts_are_the_designs_and_carry_the_rules	te-land-policy	
 src/supervise/policy/turn_end_tests.rs	the_limit_a_cancel_left_answers_a_persons_turn_asked_since_the_last_look	te-left-notice	
 src/supervise/policy/turn_end_tests.rs	the_limit_a_cancel_left_answers_the_act_it_was_not_typed_over	te-left-notice	
-src/supervise/policy/turn_end_tests.rs	the_login_expired_row_types_login_once_and_holds_until_the_login_is_back	te-login-wall	
-src/supervise/policy/turn_end_tests.rs	the_measured_weekly_wall_is_waited_out_and_continued_past_its_reset_and_its_grace	te-usage-limit-wait	
-src/supervise/policy/turn_end_tests.rs	the_owed_footer_gate_is_bounded_and_a_persons_model_releases_it	te-switch-progression	
-src/supervise/policy/turn_end_tests.rs	the_owed_footer_gate_reads_the_threads_rollout_and_bounds_a_footer_with_no_model	te-switch-progression	
-src/supervise/policy/turn_end_tests.rs	the_policys_own_hold_is_named	te-switch-progression	
 src/supervise/policy/turn_end_tests.rs	the_probes_gate_is_true_at_a_plain_idle_point_and_false_with_any_condition_flipped	te-probe-gate	
 src/supervise/policy/turn_end_tests.rs	the_reset_jitter_is_added_to_the_grace	te-usage-limit-wait	
-src/supervise/policy/turn_end_tests.rs	the_reset_that_has_come_is_tried_before_the_fallback_is_asked_again	te-model-bucket	
 src/supervise/policy/turn_end_tests.rs	the_resets_continuation_keeps_resume_limits_and_a_persons_grace	te-limit-reset-continuation	
 src/supervise/policy/turn_end_tests.rs	the_rules_ride_in_the_continuation	te-continue-at-idle	
-src/supervise/policy/turn_end_tests.rs	the_running_turn_is_measured_from_the_box_and_floored_at_the_switch	te-switch-person-hand	
-src/supervise/policy/turn_end_tests.rs	the_save_turn_is_bounded_then_judged_and_restored	te-switch-progression	
 src/supervise/policy/turn_end_tests.rs	the_sign_in_asked_stands_while_the_row_is_off_the_screen	te-login-after-move	
 src/supervise/policy/turn_end_tests.rs	the_token_ends_the_task_where_the_challenge_is_not_the_policys	te-done-check-finished	
-src/supervise/policy/turn_end_tests.rs	the_upgrade_owns_a_point_only_by_its_hosts_word	te-upgrade-ownership	
 src/supervise/policy/turn_end_tests.rs	the_vendor_firing_its_countdown_is_waited_for_never_doubled	te-usage-limit-wait	
 src/supervise/policy/turn_end_tests.rs	the_vendors_continuation_of_a_bucket_ends_its_wait_under_its_own_notice	te-model-bucket	
 src/supervise/policy/turn_end_tests.rs	the_workers_suggestion_is_accepted_once	te-continue-at-idle	
 src/supervise/policy/turn_end_tests.rs	whats_next_after_finished_work_is_a_done_report	te-done-check-finished	
 src/supervise/policy/turn_end_tests.rs	with_resume_limits_off_a_limit_whose_notice_left_gets_nothing	te-left-notice	
 src/supervise/policy/turn_end_tests.rs	wrapped_stops_sign_off_asks_and_destructive_offers_are_not_continued	te-classify-said	
-src/supervise/report_tests.rs	a_busy_codex_workers_report_ends_above_its_status_row	report-gather-protocol	
-src/supervise/report_tests.rs	a_codex_draft_on_the_alternate_screen_is_named_by_status	report-gather-protocol	
-src/supervise/report_tests.rs	a_codex_prompt_pinned_over_its_reply_is_no_start	report-gather-protocol	
-src/supervise/report_tests.rs	a_codex_report_cut_by_max_rows_keeps_the_turns_end	report-gather-protocol	
-src/supervise/report_tests.rs	a_codex_report_names_what_it_could_not_read	report-gather-protocol	report-finish-assess
-src/supervise/report_tests.rs	a_codex_report_says_where_the_search_was_incomplete	report-gather-protocol	report-finish-assess
-src/supervise/report_tests.rs	a_codex_reports_views_keep_what_it_said	blocks-views	report-render
-src/supervise/report_tests.rs	a_codex_turn_on_its_screen_is_the_screens_report	report-gather-protocol	
-src/supervise/report_tests.rs	a_codex_turn_that_scrolled_off_is_read_back_from_the_scrollback	report-gather-protocol	
-src/supervise/report_tests.rs	a_codex_worker_on_the_alternate_screen_is_read_in_its_own_grammar	report-gather-protocol	blocks-views
 src/supervise/report_tests.rs	a_cut_page_and_the_main_screen_are_incomplete	report-finish-assess	
 src/supervise/report_tests.rs	a_final_view_of_a_headless_message_keeps_its_words_and_its_done_row	blocks-views	report-render
 src/supervise/report_tests.rs	a_gap_after_the_mark_counts_only_after_the_start	report-finish-assess	
@@ -2837,12 +2266,9 @@ src/supervise/report_tests.rs	a_message_that_starts_with_a_number_is_found	repor
 src/supervise/report_tests.rs	a_numbered_draft_in_the_composer_is_not_the_start	transcript-end-positional	
 src/supervise/report_tests.rs	a_paste_row_that_does_not_fit_the_turn_is_not_the_start	report-find-start	
 src/supervise/report_tests.rs	a_queued_message_under_the_status_row_is_not_a_marker	report-find-start	
-src/supervise/report_tests.rs	a_search_with_no_hits_says_what_it_left_out_by_its_causes_alone	report-finish-assess	
-src/supervise/report_tests.rs	a_tall_codex_reply_opens_at_the_users_row_never_an_archived_composer	report-find-start	report-gather-protocol
 src/supervise/report_tests.rs	a_turn_that_scrolled_off_is_joined_back_from_its_user_row	report-join	
 src/supervise/report_tests.rs	a_wrapped_user_block_on_the_screen_is_the_start	transcript-end-positional	
 src/supervise/report_tests.rs	an_archive_that_is_off_is_no_archive	report-parse-offscreen	
-src/supervise/report_tests.rs	an_aterm_ctl_that_frames_offscreen_as_status_falls_back	report-parse-offscreen	
 src/supervise/report_tests.rs	an_old_host_reports_from_the_screen_alone	report-parse-offscreen	
 src/supervise/report_tests.rs	another_origin_is_an_archive_reset	report-finish-assess	
 src/supervise/report_tests.rs	indented_code_above_an_idle_composer_survives	transcript-end-positional	
@@ -2854,106 +2280,62 @@ src/supervise/report_tests.rs	the_readers_match_the_wire	report-mark-roundtrip
 src/supervise/report_tests.rs	the_transcript_ends_at_the_live_zone	transcript-end-positional	
 src/supervise/report_tests.rs	the_views_keep_the_worker_words_and_drop_the_tool_rows	blocks-views	report-render
 src/supervise/reset_loop_tests.rs	a_claim_that_is_no_longer_the_sessions_keeps_the_reset	reset-host-dialogue	
-src/supervise/reset_loop_tests.rs	a_claim_whose_dialog_left_is_told_kept	reset-host-dialogue	
-src/supervise/reset_loop_tests.rs	a_confirmation_no_box_reads_under_is_escaped_on_its_title	reset-keys-safety	
 src/supervise/reset_loop_tests.rs	a_confirmation_with_the_focus_on_no_is_escaped_never_arrowed	reset-keys-safety	
 src/supervise/reset_loop_tests.rs	a_deadline_is_placed_in_the_wall_notices_zone_where_the_loop_holds_one	reset-place	
-src/supervise/reset_loop_tests.rs	a_dropped_enter_is_written_again_three_times_at_most_and_then_escaped	reset-keys-safety	
 src/supervise/reset_loop_tests.rs	a_gate_of_the_loops_shut_passes_the_reset_over_before_the_host_is_asked	reset-gates-equivalence	
-src/supervise/reset_loop_tests.rs	a_halted_session_is_asked_no_claim	reset-host-dialogue	
-src/supervise/reset_loop_tests.rs	a_host_that_cannot_say_at_the_enter_is_asked_again	reset-host-dialogue	
-src/supervise/reset_loop_tests.rs	a_host_that_cannot_say_yet_is_asked_five_times_more_and_then_passed_over	reset-host-dialogue	
 src/supervise/reset_loop_tests.rs	a_key_off_successor_escapes_a_reworded_consent_and_never_takes_its_yes	reset-successor-escape-only	
 src/supervise/reset_loop_tests.rs	a_key_off_successor_escapes_checking_past_its_bound_and_ends_untold	reset-successor-escape-only	
-src/supervise/reset_loop_tests.rs	a_key_off_successor_leaves_no_record_of_a_screen_it_cannot_read	reset-successor-escape-only	
 src/supervise/reset_loop_tests.rs	a_key_off_successor_waits_out_resetting_and_owes_nothing	reset-successor-escape-only	
 src/supervise/reset_loop_tests.rs	a_key_off_successors_escape_that_does_not_take_is_tried_again_and_recorded_once	reset-successor-escape-only	
-src/supervise/reset_loop_tests.rs	a_pending_line_first_seen_late_has_its_whole_bound	reset-host-dialogue	
 src/supervise/reset_loop_tests.rs	a_pending_line_is_never_keyed_but_checking_past_its_bound	reset-keys-safety	
-src/supervise/reset_loop_tests.rs	a_pending_line_that_repaints_is_still_the_steps_to_read	reset-keys-safety	
 src/supervise/reset_loop_tests.rs	a_person_holds_every_key_of_the_reset	reset-keys-safety	
 src/supervise/reset_loop_tests.rs	a_person_keying_before_the_rows_first_key_holds_the_row	reset-keys-safety	
-src/supervise/reset_loop_tests.rs	a_press_that_never_lands_is_passed_over_and_never_badged	reset-host-dialogue	
 src/supervise/reset_loop_tests.rs	a_row_older_than_a_step_can_be_is_escaped_and_ended_untold	reset-successor-escape-only	
 src/supervise/reset_loop_tests.rs	a_row_press_with_no_answer_is_closed_and_never_entered	reset-books	
-src/supervise/reset_loop_tests.rs	a_row_that_opens_nothing_is_kept_and_the_wait_row_is_pressed	reset-step-refines-model	
-src/supervise/reset_loop_tests.rs	a_rows_own_answer_is_a_failure_and_no_key_follows_it	reset-books	
-src/supervise/reset_loop_tests.rs	a_second_mount_at_the_same_wall_is_the_wait_rows	reset-step-refines-model	
 src/supervise/reset_loop_tests.rs	a_stop_in_any_wait_of_the_step_ends_it_with_nothing_written_after	stop-semantics	
 src/supervise/reset_loop_tests.rs	a_successor_escapes_a_box_with_nothing_of_the_confirmation_left	reset-successor-escape-only	
 src/supervise/reset_loop_tests.rs	a_successor_escapes_the_confirmation_and_never_enters_it	reset-successor-escape-only	
-src/supervise/reset_loop_tests.rs	a_turn_already_running_when_the_step_ends_pays_its_continuation	reset-books	
-src/supervise/reset_loop_tests.rs	an_arrow_whose_answer_never_came_takes_no_row	reset-books	
 src/supervise/reset_loop_tests.rs	an_attended_loop_takes_no_step_up	reset-successor-escape-only	
-src/supervise/reset_loop_tests.rs	an_enter_the_screen_keeps_moving_under_is_given_up	reset-keys-safety	
-src/supervise/reset_loop_tests.rs	an_enter_the_server_turns_away_is_judged_again	reset-keys-safety	
 src/supervise/reset_loop_tests.rs	an_enter_whose_answer_never_came_is_on_the_books	reset-books	
-src/supervise/reset_loop_tests.rs	an_escape_that_does_not_take_is_tried_again_and_told_once	reset-host-dialogue	
-src/supervise/reset_loop_tests.rs	an_outage_after_the_enter_still_tells_the_outcome_once	reset-host-dialogue	
-src/supervise/reset_loop_tests.rs	an_unread_screen_after_the_enter_is_waited_the_claims_bound	reset-host-dialogue	
 src/supervise/reset_loop_tests.rs	no_enter_follows_an_escape_whatever_the_confirmation_then_reads	reset-keys-safety	
-src/supervise/reset_loop_tests.rs	no_key_reaches_the_confirmation_before_it_has_stood_the_settle	reset-keys-safety	
 src/supervise/reset_loop_tests.rs	the_box_the_row_opened_is_the_steps_whatever_it_is_reworded_to	reset-keys-safety	
 src/supervise/reset_loop_tests.rs	the_early_use_confirmation_is_escaped_and_one_continuation_is_owed	reset-books	
 src/supervise/reset_loop_tests.rs	the_enter_is_judged_on_the_wall_as_the_host_reads_it_then	reset-keys-safety	
-src/supervise/reset_loop_tests.rs	the_host_is_asked_again_for_the_line_and_then_one_last_time	reset-host-dialogue	
-src/supervise/reset_loop_tests.rs	the_reset_holds_at_every_approve_level_and_with_limit_wait_off	reset-gates-equivalence	
-src/supervise/reset_loop_tests.rs	the_rows_approval_is_not_counted_against_the_wait_row	reset-gates-equivalence	
+src/supervise/reset_loop_tests.rs	the_step_never_escapes_an_mcp_server_dialog	reset-keys-safety	
 src/supervise/reset_loop_tests.rs	the_whole_path_is_three_keys_and_the_hosts_no_is_todays_wait_row	reset-books	
 src/supervise/run_box_key_tests.rs	a_box_asked_again_after_work_waits_the_settle_again	box-settle	
-src/supervise/run_box_key_tests.rs	a_box_redrawn_through_a_writing_frame_is_asked_once	box-ask-refines-model	
-src/supervise/run_box_key_tests.rs	a_box_someone_is_answering_is_asked_once	box-ask-refines-model	
-src/supervise/run_box_key_tests.rs	a_redrawn_box_is_asked_once	box-ask-refines-model	
 src/supervise/run_box_key_tests.rs	a_redrawn_box_under_the_settle_is_asked_once_after_the_settle	box-settle	
 src/supervise/run_box_key_tests.rs	a_retried_long_command_is_asked_again	box-ask-refines-model	
-src/supervise/run_box_key_tests.rs	a_ticking_countdown_is_asked_once	box-ask-refines-model	
 src/supervise/run_box_key_tests.rs	the_box_key_changes_for_another_box	box-key-normal-form	
 src/supervise/run_box_key_tests.rs	the_box_key_holds_across_a_redraw_a_rewrap_a_reflow_a_focus_move_and_a_ticking_countdown	box-key-normal-form	
 src/supervise/run_box_key_tests.rs	the_box_key_is_the_readers	box-ask-refines-model	
 src/supervise/run_box_key_tests.rs	tier1_the_box_is_asked_once_per_request	box-ask-refines-model	
-src/supervise/run_box_key_tests.rs	two_bash_boxes_with_different_commands_are_two_asks	box-ask-refines-model	
-src/supervise/run_box_key_tests.rs	two_edit_boxes_on_one_path_are_two_asks	box-ask-refines-model	
 src/supervise/run_engine_tests.rs	a_bare_clock_time_is_placed_on_the_day_the_transcript_names	limit-notice-reset-placement	
 src/supervise/run_engine_tests.rs	a_bash_box_is_judged_under_the_workers_shell_startup	worker-env-binding	
-src/supervise/run_engine_tests.rs	a_box_cut_by_the_tail_is_read_again_whole	tail-reread-equivalence	
-src/supervise/run_engine_tests.rs	a_box_drawn_above_the_tail_after_the_idle_point_wakes_the_loop_only_through_the_verdict	wake-protocol	
 src/supervise/run_engine_tests.rs	a_box_is_pressed_only_once_it_has_shown_the_settle	box-settle	
 src/supervise/run_engine_tests.rs	a_box_on_a_shell_is_never_pressed	reader-by-program	
 src/supervise/run_engine_tests.rs	a_box_swapped_between_the_read_and_the_press_is_not_pressed	press-fence-and-guard	
 src/supervise/run_engine_tests.rs	a_box_taller_than_the_screen_is_declined_in_the_loop_and_nobody_is_asked	decline-keys-refines-model	
 src/supervise/run_engine_tests.rs	a_break_after_the_loops_own_taken_act_is_offered_to_the_host	idle-point-classification	
-src/supervise/run_engine_tests.rs	a_break_of_the_agents_background_work_is_offered_to_the_host_once_it_stood	idle-point-classification	
-src/supervise/run_engine_tests.rs	a_breaker_on_an_environment_variable_is_escalated_proven_and_pressed_by_default	loop-applies-decision	
 src/supervise/run_engine_tests.rs	a_check_the_supervisor_did_not_make_hands_the_multiselect_over	question-answer-refines-model	
 src/supervise/run_engine_tests.rs	a_choice_is_told_at_the_first_busy_read_and_before_a_stop	told-choice	
-src/supervise/run_engine_tests.rs	a_choice_is_told_when_the_reply_ends_before_any_busy_read	told-choice	
-src/supervise/run_engine_tests.rs	a_codex_box_cut_by_the_tail_is_read_again_whole	tail-reread-equivalence	
-src/supervise/run_engine_tests.rs	a_codex_wall_is_read_by_the_loop_in_the_zone_the_codex_printed_it_in	limit-notice-reset-placement	
-src/supervise/run_engine_tests.rs	a_column_one_question_box_is_escalated_and_a_limit_hands_it_over	loop-applies-decision	
 src/supervise/run_engine_tests.rs	a_controllers_answer_moves_the_focus_and_presses_enter_on_its_choice	controller-answer	
-src/supervise/run_engine_tests.rs	a_controllers_answer_to_a_codex_question_is_never_pressed_unfenced	controller-answer	
-src/supervise/run_engine_tests.rs	a_controllers_answer_to_a_codex_question_is_not_pressed_when_the_fence_is_turned_away	controller-answer	
-src/supervise/run_engine_tests.rs	a_controllers_answer_to_a_codex_question_presses_its_digit_under_the_title_row	controller-answer	
+src/supervise/run_engine_tests.rs	a_controllers_answer_to_a_muse_question_moves_the_focus_and_presses_enter	controller-answer
+src/supervise/run_engine_tests.rs	a_controllers_answer_to_a_muse_question_outlasts_its_ticking_head	controller-answer
 src/supervise/run_engine_tests.rs	a_controllers_recommended_on_a_multi_select_answers_the_whole_tab	controller-answer	
 src/supervise/run_engine_tests.rs	a_decline_goes_no_further_once_a_readable_box_with_the_same_note_stands_there	decline-keys-refines-model	
-src/supervise/run_engine_tests.rs	a_decline_goes_no_further_once_another_tall_box_stands_there	decline-keys-refines-model	
 src/supervise/run_engine_tests.rs	a_decline_is_one_fenced_guarded_keystroke_per_fresh_read	decline-keys-refines-model	
-src/supervise/run_engine_tests.rs	a_decline_keystroke_not_drawn_yet_is_never_written_again	decline-keys-refines-model	
 src/supervise/run_engine_tests.rs	a_decline_keystroke_on_a_stale_screen_is_refused_and_nothing_follows_it	decline-keys-refines-model	
 src/supervise/run_engine_tests.rs	a_decline_keystroke_the_box_never_draws_is_handed_over_and_never_resent	decline-keys-refines-model	
 src/supervise/run_engine_tests.rs	a_decline_keystroke_whose_answer_never_came_is_never_written_again	decline-keys-refines-model	
 src/supervise/run_engine_tests.rs	a_decline_the_screen_does_not_confirm_is_never_entered	decline-keys-refines-model	
 src/supervise/run_engine_tests.rs	a_deferred_fallback_is_retried_at_the_reset_the_grace_and_the_sessions_share	model-bucket-and-fallback-timing	
 src/supervise/run_engine_tests.rs	a_dialog_a_person_keyed_after_the_loop_is_not_told_as_its_choice	told-choice	
-src/supervise/run_engine_tests.rs	a_dialog_above_the_tail_of_a_fresh_pane_is_read_whole_and_answered	tail-reread-equivalence	
 src/supervise/run_engine_tests.rs	a_dialog_held_by_the_policy_is_answered_when_handed_back	question-priority-resolution	
-src/supervise/run_engine_tests.rs	a_dialog_that_did_not_take_the_key_is_keyed_again_once_then_handed_over	question-answer-refines-model	
 src/supervise/run_engine_tests.rs	a_dialog_the_policy_held_to_its_end_is_not_told_as_its_choice	told-choice	
 src/supervise/run_engine_tests.rs	a_fallback_the_host_keeps_deferring_gives_way_to_the_continuation_at_the_reset	model-bucket-and-fallback-timing	
 src/supervise/run_engine_tests.rs	a_fenced_press_on_a_moved_screen_is_decided_again_from_a_fresh_read	press-fence-and-guard	
 src/supervise/run_engine_tests.rs	a_file_box_the_agents_own_ask_rule_sends_is_held_in_the_loop	loop-applies-decision	
-src/supervise/run_engine_tests.rs	a_focus_move_the_dialog_dropped_is_made_again_from_a_fresh_read	focus-choice-refines-model	
-src/supervise/run_engine_tests.rs	a_footerless_box_cut_by_the_tail_is_read_again_whole	tail-reread-equivalence	
 src/supervise/run_engine_tests.rs	a_four_tab_question_is_answered_tab_by_tab_and_submitted	question-answer-refines-model	
 src/supervise/run_engine_tests.rs	a_git_box_is_judged_in_the_workers_own_environment	worker-env-binding	
 src/supervise/run_engine_tests.rs	a_git_box_reads_the_transcripts_under_the_workers_claude_config_dir	worker-env-binding	
@@ -2962,13 +2344,19 @@ src/supervise/run_engine_tests.rs	a_host_without_the_claim_is_supervised_as_befo
 src/supervise/run_engine_tests.rs	a_hosted_loop_behind_another_claim_ends_and_presses_nothing	claim-refines-model	
 src/supervise/run_engine_tests.rs	a_hosted_loop_ledgers_where_its_host_says_and_nowhere_else	ledger-one-row-per-decision	
 src/supervise/run_engine_tests.rs	a_hosts_same_wait_said_again_at_one_point_is_journaled_once	host-turn-end-protocol	
+src/supervise/run_engine_tests.rs	a_launch_answers_no_box_but_its_trust_dialog	never-type-over-a-person	
+src/supervise/run_engine_tests.rs	a_launch_answers_one_dialog_under_autopilot_and_yields_to_the_person	never-type-over-a-person	
+src/supervise/run_engine_tests.rs	a_launch_missing_any_premise_keeps_the_persons_grace	never-type-over-a-person	
+src/supervise/run_engine_tests.rs	a_launch_the_server_witnesses_is_answered_within_the_grace	never-type-over-a-person	
+src/supervise/run_engine_tests.rs	a_launch_answers_the_trust_dialog_and_hands_the_mcp_dialog_to_a_person	approval-dialog-rules	approval-trust-dialog
 src/supervise/run_engine_tests.rs	a_limit_episode_is_told_to_the_host_and_waited_out_over_its_turn_ends	host-turn-end-protocol	
 src/supervise/run_engine_tests.rs	a_limit_notice_left_past_its_reset_and_its_grace_is_an_idle_point	limit-notice-reset-placement	
-src/supervise/run_engine_tests.rs	a_limit_options_dialog_without_a_wait_row_goes_to_the_owner	limit-dialog-wait-row	
+src/supervise/run_engine_tests.rs	a_hold_on_the_autocompact_offer_parks_and_sends_nothing_more	autocompact-offer-loop	
+src/supervise/run_engine_tests.rs	the_autocompact_offer_is_answered_at_400k_without_the_owner	autocompact-offer-loop	
+src/supervise/run_engine_tests.rs	the_autocompact_offer_steps_to_400k_before_its_enter_and_off_is_the_owners	autocompact-offer-loop	
+src/supervise/run_engine_tests.rs	the_autocompact_offer_waits_its_own_settle_before_any_key	autocompact-offer-loop	
 src/supervise/run_engine_tests.rs	a_live_limit_naming_no_reset_is_never_spent_by_an_earlier_notices_reset	limit-notice-reset-placement	
-src/supervise/run_engine_tests.rs	a_live_question_box_is_answered_under_the_default	question-answer-refines-model	
 src/supervise/run_engine_tests.rs	a_loop_addressing_its_session_binds_the_worker_by_that_id	session-group	
-src/supervise/run_engine_tests.rs	a_measure_acted_on_behind_a_limit_is_escalated_where_no_host_restarts	memory-ceiling-decision	
 src/supervise/run_engine_tests.rs	a_measure_acted_on_restarts_an_agent_idle_behind_a_wall	memory-ceiling-decision	
 src/supervise/run_engine_tests.rs	a_measure_past_the_ceiling_warns_and_restarts_only_when_the_mac_is_in_trouble	memory-ceiling-decision	
 src/supervise/run_engine_tests.rs	a_memory_banner_is_the_hosts_restart_and_escalated_only_when_it_cannot_be	memory-ceiling-decision	
@@ -2977,7 +2365,6 @@ src/supervise/run_engine_tests.rs	a_model_bucket_is_relaunched_on_the_fallback_a
 src/supervise/run_engine_tests.rs	a_model_buckets_relaunch_keeps_its_way_back_when_the_transcript_moves_on	model-bucket-and-fallback-timing	
 src/supervise/run_engine_tests.rs	a_model_buckets_relaunch_not_made_keeps_the_decisions_verdict	model-bucket-and-fallback-timing	
 src/supervise/run_engine_tests.rs	a_model_fallback_the_host_keeps_deferring_is_asked_again_and_nothing_is_typed_blind	model-bucket-and-fallback-timing	
-src/supervise/run_engine_tests.rs	a_person_at_the_tall_box_is_waited_for_and_then_it_is_declined	decline-keys-refines-model	
 src/supervise/run_engine_tests.rs	a_person_keying_the_session_gets_the_decline_s_box	decline-keys-refines-model	
 src/supervise/run_engine_tests.rs	a_person_the_server_sees_at_the_write_gets_the_question_first	question-answer-refines-model	
 src/supervise/run_engine_tests.rs	a_person_typing_in_the_free_text_row_gets_the_question	question-answer-refines-model	
@@ -2989,45 +2376,36 @@ src/supervise/run_engine_tests.rs	a_point_read_before_the_agent_drew_itself_is_w
 src/supervise/run_engine_tests.rs	a_press_that_did_not_land_is_tried_again_at_full_power	press-landing-and-retry	
 src/supervise/run_engine_tests.rs	a_question_asked_a_third_time_is_answered_again_after_a_pause	question-answer-refines-model	
 src/supervise/run_engine_tests.rs	a_question_drawn_over_a_draft_is_answered_and_the_draft_left_alone	question-answer-refines-model	
-src/supervise/run_engine_tests.rs	a_question_escalates_and_mail_goes_only_over_a_connected_fabric	attention-ownership	
 src/supervise/run_engine_tests.rs	a_question_key_is_sent_again_only_after_the_screen_held_still_and_counted_when_written	question-answer-refines-model	
 src/supervise/run_engine_tests.rs	a_question_key_refused_busy_input_unread_is_backed_off_then_answered	hold-and-refusal-parking	
 src/supervise/run_engine_tests.rs	a_question_on_a_host_without_the_generation_fence_is_handed_over	question-answer-refines-model	
-src/supervise/run_engine_tests.rs	a_question_waits_for_a_persons_quiet_and_is_never_escalated_for_it	question-answer-refines-model	
-src/supervise/run_engine_tests.rs	a_question_whose_footer_wraps_is_answered	question-answer-refines-model	
 src/supervise/run_engine_tests.rs	a_rating_card_above_the_tail_is_dismissed	survey-press-refines-model	
 src/supervise/run_engine_tests.rs	a_read_box_under_a_ticking_screen_is_approved_within_one_wake	wake-protocol	
 src/supervise/run_engine_tests.rs	a_refused_memory_restart_keeps_the_persons_row_until_the_host_is_asked_again	memory-ceiling-decision	
-src/supervise/run_engine_tests.rs	a_refused_memory_restart_says_the_persons_restart_on_a_host_that_restarts	memory-ceiling-decision	
 src/supervise/run_engine_tests.rs	a_refused_restart_at_the_memory_banner_keeps_the_persons_row_when_the_measure_comes_back	memory-ceiling-decision	
-src/supervise/run_engine_tests.rs	a_relaunched_codex_0_159_is_the_hosts_next_idle_point_for_its_carry_on	idle-point-classification	
 src/supervise/run_engine_tests.rs	a_restart_that_typed_its_carry_on_typed_a_harness_turn	host-turn-end-protocol	
 src/supervise/run_engine_tests.rs	a_restarted_loop_at_a_wall_its_predecessor_continued_past_waits_out_the_back_off	model-bucket-and-fallback-timing	
-src/supervise/run_engine_tests.rs	a_resumed_codex_daemon_client_is_the_hosts_idle_point	reader-by-program	
 src/supervise/run_engine_tests.rs	a_retired_key_takes_its_safe_rule_away_in_the_loop	loop-applies-decision	
 src/supervise/run_engine_tests.rs	a_return_to_the_bucket_model_the_host_defers_never_holds_the_continuation	model-bucket-and-fallback-timing	
 src/supervise/run_engine_tests.rs	a_session_its_host_says_nobody_asked_anything_gets_nothing_typed	host-turn-end-protocol	
 src/supervise/run_engine_tests.rs	a_session_naming_no_mode_gets_the_verdict_wait_back_at_its_first_busy_read	loop-applies-decision	
 src/supervise/run_engine_tests.rs	a_stale_attention_is_reconciled_at_the_start	attention-ownership	
 src/supervise/run_engine_tests.rs	a_stop_between_the_look_and_the_press_writes_nothing	stop-semantics	
-src/supervise/run_engine_tests.rs	a_stop_in_a_turns_wait_ends_the_turn_spent_before_its_next_wait	stop-semantics	
 src/supervise/run_engine_tests.rs	a_stop_in_any_wait_ends_the_hosted_run_before_another_begins	stop-semantics	
 src/supervise/run_engine_tests.rs	a_survey_that_left_under_typed_text_is_not_said_dismissed	survey-press-refines-model	
-src/supervise/run_engine_tests.rs	a_tail_that_cuts_the_prompt_boxs_top_rule_is_read_in_the_live_zone	tail-reread-equivalence	
 src/supervise/run_engine_tests.rs	a_taken_box_redrawn_before_it_leaves_is_pressed_once	press-landing-and-retry	
-src/supervise/run_engine_tests.rs	a_ticking_countdown_is_not_the_box_leaving	press-landing-and-retry	
 src/supervise/run_engine_tests.rs	a_ticking_default_no_box_whose_enter_is_not_taken_is_pressed_once	press-landing-and-retry	
 src/supervise/run_engine_tests.rs	a_trust_dialog_under_a_shell_with_no_osc7_is_decided_by_the_agents_own_folder	loop-applies-decision	
 src/supervise/run_engine_tests.rs	a_turn_end_the_host_let_go_is_decided_again	host-turn-end-protocol	
 src/supervise/run_engine_tests.rs	a_turn_the_host_typed_is_no_short_turn_of_the_workers	host-turn-end-protocol	
 src/supervise/run_engine_tests.rs	a_turn_the_host_typed_never_holds_the_hosts_next_step	host-turn-end-protocol	
 src/supervise/run_engine_tests.rs	a_watch_claims_the_session_renews_and_releases_it	claim-refines-model	
+src/supervise/run_engine_tests.rs	an_attended_look_answers_a_launch_on_its_own_reads	never-type-over-a-person	
 src/supervise/run_engine_tests.rs	an_escalated_box_a_person_answered_is_cleared_while_the_worker_stays_busy	attention-ownership	
 src/supervise/run_engine_tests.rs	an_exception_is_journaled_once_and_cleared_when_the_worker_works	exception-lifecycle	
 src/supervise/run_engine_tests.rs	an_exception_stands_while_its_wall_is_out_of_view_and_ends_when_the_agent_works	exception-lifecycle	
 src/supervise/run_engine_tests.rs	an_idle_point_read_before_the_footer_waits_for_the_footer_frame	wake-protocol	
 src/supervise/run_engine_tests.rs	an_inline_repl_above_the_tail_is_the_hosts_idle_point	tail-reread-equivalence	
-src/supervise/run_engine_tests.rs	an_rm_breaker_box_above_the_tail_of_a_fresh_pane_is_pressed	tail-reread-equivalence	
 src/supervise/run_engine_tests.rs	behind_another_supervisors_claim_the_loop_only_watches	claim-refines-model	
 src/supervise/run_engine_tests.rs	each_live_row_rule_alone_reads_the_fresh_panes_dialog_whole	tail-reread-equivalence	
 src/supervise/run_engine_tests.rs	err_halted_parks_until_the_hold_lifts_and_the_loop_goes_on	hold-and-refusal-parking	
@@ -3035,29 +2413,19 @@ src/supervise/run_engine_tests.rs	every_cut_of_the_tail_across_a_fresh_panes_box
 src/supervise/run_engine_tests.rs	every_decision_is_a_ledger_row	ledger-one-row-per-decision	
 src/supervise/run_engine_tests.rs	full_power_ledgers_the_decisions_subject	ledger-one-row-per-decision	
 src/supervise/run_engine_tests.rs	full_power_presses_the_same_box_every_time_it_comes_back	press-landing-and-retry	
-src/supervise/run_engine_tests.rs	full_power_trusts_the_folder_whatever_the_roots	loop-applies-decision	
-src/supervise/run_engine_tests.rs	multiselect_is_toggled_then_advanced	question-answer-refines-model	
 src/supervise/run_engine_tests.rs	park_as_worker	§4	
 src/supervise/run_engine_tests.rs	run_hosted_runs_until_it_is_stopped_and_clears_its_badge	stop-semantics	
-src/supervise/run_engine_tests.rs	the_2_1_281_question_dialog_is_answered_by_enter_at_every_level	question-answer-refines-model	
-src/supervise/run_engine_tests.rs	the_frame_after_the_footer_left_gets_the_short_settle_first	wake-protocol	
 src/supervise/run_engine_tests.rs	the_free_text_row_is_left_by_arrows_then_enter_never_a_digit	question-answer-refines-model	
 src/supervise/run_engine_tests.rs	the_host_is_told_a_turn_ran_only_when_one_did	host-turn-end-protocol	
 src/supervise/run_engine_tests.rs	the_host_reads_its_usage_tap_at_each_decided_idle_turn_end	host-turn-end-protocol	
 src/supervise/run_engine_tests.rs	the_host_takes_no_step_at_the_login_wall_and_steps_once_it_is_back	idle-point-classification	
 src/supervise/run_engine_tests.rs	the_hosts_default_presses_a_write_and_ledgers_it_unproven	loop-applies-decision	
 src/supervise/run_engine_tests.rs	the_hosts_step_is_taken_at_the_idle_point_and_the_loop_runs_on	host-turn-end-protocol	
-src/supervise/run_engine_tests.rs	the_hosts_trust_roots_decide_the_trust_dialog	loop-applies-decision	
-src/supervise/run_engine_tests.rs	the_idle_wait_wakes_on_the_servers_verdict_not_on_every_repaint	§4	
-src/supervise/run_engine_tests.rs	the_limit_dialog_in_the_fullscreen_panel_waits_for_its_dated_reset	limit-dialog-wait-row	
 src/supervise/run_engine_tests.rs	the_limit_options_dialog_waits_for_the_reset_by_itself	limit-dialog-wait-row	
-src/supervise/run_engine_tests.rs	the_limit_wait_is_chosen_under_approve_none_too	limit-dialog-wait-row	
 src/supervise/run_engine_tests.rs	the_loop_says_which_guard_withheld_the_point_the_host_asked_for	idle-point-classification	
+src/supervise/run_engine_tests.rs	the_mcp_server_dialogs_badge_says_every_answer_is_kept_at_every_level	approval-dialog-rules	
 src/supervise/run_engine_tests.rs	the_owners_subagent_rm_box_is_pressed_once_by_the_hosts_default	loop-applies-decision	
-src/supervise/run_engine_tests.rs	the_owners_workflow_rm_box_is_pressed_at_default_power	loop-applies-decision	
 src/supervise/run_engine_tests.rs	the_probes_gate_reads_a_refused_wall_as_it_was_decided	usage-probe-refines-model	
-src/supervise/run_engine_tests.rs	the_question_environment_names_the_machines_actions	§4	
-src/supervise/run_engine_tests.rs	the_recommended_path_types_nothing_and_asks_no_help_send	question-answer-refines-model	
 src/supervise/run_engine_tests.rs	the_rm_breaker_is_approved_under_a_scratch_root_and_escalated_otherwise	loop-applies-decision	
 src/supervise/run_engine_tests.rs	the_same_box_back_after_its_declines_is_declined_again_after_a_pause	doubling-backoff	
 src/supervise/run_engine_tests.rs	the_sessions_foreground_group_is_read_off_the_roster	session-group	
@@ -3069,7 +2437,6 @@ src/supervise/run_engine_tests.rs	tier1_a_decline_keystroke_goes_only_where_the_
 src/supervise/run_engine_tests.rs	tier1_a_downward_move_and_a_multiselect_go_only_where_the_model_allows	question-answer-refines-model	
 src/supervise/run_engine_tests.rs	tier1_a_question_key_goes_only_where_the_model_allows	question-answer-refines-model	
 src/supervise/run_engine_tests.rs	tier1_enter_goes_only_on_a_confirmed_focus	focus-choice-refines-model	
-src/supervise/run_engine_tests.rs	tier1_the_cards_0_backspaced_under_its_debounce_is_forbidden	survey-press-refines-model	
 src/supervise/run_engine_tests.rs	tier1_the_cards_0_goes_only_where_the_model_allows	survey-press-refines-model	
 src/supervise/run_engine_tests.rs	tier1_the_cards_0_never_goes_over_a_draft_or_a_box	survey-press-refines-model	
 src/supervise/run_engine_tests.rs	tier1_the_cards_0_tells_a_homed_draft_from_the_dim_suggestion	survey-press-refines-model	
@@ -3087,17 +2454,14 @@ src/supervise/run_question_text_tests.rs	a_checked_option_hands_a_multi_select_o
 src/supervise/run_question_text_tests.rs	a_controllers_option_over_text_in_the_field_is_pressed_and_a_multi_selects_is_refused_first	controller-answer	
 src/supervise/run_question_text_tests.rs	a_fallback_begun_on_a_tight_pane_is_finished_when_the_pane_grows	question-priority-resolution	
 src/supervise/run_question_text_tests.rs	a_fresh_supervisor_over_a_typed_field_hands_it_over_without_a_key	question-text-safety	
-src/supervise/run_question_text_tests.rs	a_lone_multi_select_is_typed_moved_off_and_submitted_by_its_button	question-text-safety	
 src/supervise/run_question_text_tests.rs	a_lone_single_select_is_answered_by_the_long_term_text	question-text-safety	
 src/supervise/run_question_text_tests.rs	a_multi_select_text_that_reads_back_unticked_is_handed_over_at_once	question-text-safety	
-src/supervise/run_question_text_tests.rs	a_person_the_server_sees_at_the_send_gets_the_question_first_then_one_text	question-text-safety	
 src/supervise/run_question_text_tests.rs	a_persons_input_after_the_text_leaves_the_enter_but_not_the_told_choice	told-choice	
 src/supervise/run_question_text_tests.rs	a_persons_key_between_the_read_and_the_send_skips_the_policy_text	question-text-refines-model	
 src/supervise/run_question_text_tests.rs	a_persons_text_in_the_field_is_theirs_under_a_text_priority	question-text-safety	
 src/supervise/run_question_text_tests.rs	a_preview_under_long_term_is_answered_with_its_recommended_option_and_told_so	question-priority-resolution	
 src/supervise/run_question_text_tests.rs	a_question_asked_a_third_time_under_a_text_word_waits_its_pause_before_its_text	question-text-safety	
 src/supervise/run_question_text_tests.rs	a_question_asked_again_after_its_dialog_went_is_written_afresh	question-text-safety	
-src/supervise/run_question_text_tests.rs	a_tab_too_short_for_the_text_falls_back_to_its_recommended_option	question-priority-resolution	
 src/supervise/run_question_text_tests.rs	a_text_in_doubt_is_remembered_and_never_written_again_one_not_written_is_not	question-text-safety	
 src/supervise/run_question_text_tests.rs	a_text_that_disappears_after_it_read_back_is_handed_over_never_rewritten	question-text-safety	
 src/supervise/run_question_text_tests.rs	a_text_that_reads_back_short_twice_is_handed_over_never_written_again	question-text-safety	
@@ -3106,7 +2470,6 @@ src/supervise/run_question_text_tests.rs	a_window_that_cannot_fence_a_typed_answ
 src/supervise/run_question_text_tests.rs	a_word_changed_after_the_first_key_hands_the_dialog_over	question-priority-resolution	
 src/supervise/run_question_text_tests.rs	an_enter_never_goes_after_the_field_changed_under_the_moves	question-text-safety	
 src/supervise/run_question_text_tests.rs	an_unknown_session_word_hands_the_dialog_over_under_a_text_global	question-priority-resolution	
-src/supervise/run_question_text_tests.rs	the_enter_on_a_read_back_text_costs_status_meta_and_the_key	question-text-safety	
 src/supervise/run_question_text_tests.rs	the_fit_is_measured_against_the_pane_not_the_tail_read	question-priority-resolution	
 src/supervise/run_question_text_tests.rs	the_loops_own_text_unticked_on_a_multi_select_is_handed_over	question-text-safety	
 src/supervise/run_question_text_tests.rs	the_sessions_short_term_word_answers_over_a_global_recommended	question-priority-resolution	
@@ -3114,9 +2477,6 @@ src/supervise/run_question_text_tests.rs	tier1_a_tab_that_falls_back_goes_only_w
 src/supervise/run_question_text_tests.rs	tier1_the_policy_text_goes_only_where_the_model_allows	question-text-refines-model	
 src/supervise/run_question_text_tests.rs	two_questions_and_their_review_are_answered_by_text_then_submitted	question-text-safety	
 src/supervise/run_tests.rs	a_0_that_landed_in_the_composer_is_backspaced_not_dismissed	stray-digit-cleanup	
-src/supervise/run_tests.rs	a_0_that_stands_past_the_debounce_under_the_open_card_is_backspaced	survey-zero-timing	
-src/supervise/run_tests.rs	a_0_the_card_has_not_taken_yet_is_not_backspaced_inside_its_debounce	survey-zero-timing	
-src/supervise/run_tests.rs	a_bare_err_to_the_guard_falls_back_and_a_stray_digit_is_not_an_approval	approval-press-safety	
 src/supervise/run_tests.rs	a_box_ask_never_waits_and_a_queued_post_is_journaled_as_queued	escalation-badge	
 src/supervise/run_tests.rs	a_box_the_loop_does_not_approve_is_escalated_once_and_cleared_when_it_goes	escalation-badge	
 src/supervise/run_tests.rs	a_box_under_a_dead_footer_is_read_again_at_once	await-turn-wait-protocol	
@@ -3131,10 +2491,8 @@ src/supervise/run_tests.rs	a_count_that_started_over_with_no_request_failing_is_
 src/supervise/run_tests.rs	a_dead_footer_above_the_live_zone_holds_no_wait	await-turn-wait-protocol	
 src/supervise/run_tests.rs	a_draft_in_the_composer_holds_the_continuation	limit-episode	
 src/supervise/run_tests.rs	a_draft_of_more_than_one_row_is_typed	typed-draft	
-src/supervise/run_tests.rs	a_fallback_press_under_a_lost_connection_is_noted_as_far_as_it_is_known	approval-press-safety	
 src/supervise/run_tests.rs	a_frameless_screen_still_changing_is_busy_until_it_settles	await-turn-wait-protocol	
 src/supervise/run_tests.rs	a_guard_that_matches_no_row_of_the_parsed_box_is_handed_over	approval-press-safety	
-src/supervise/run_tests.rs	a_hard_ctl_error_surfaces	outage-ride-out	
 src/supervise/run_tests.rs	a_headerless_box_under_a_tall_transcript_is_named_by_its_own_first_row	escalation-badge	
 src/supervise/run_tests.rs	a_journal_that_fails_is_said_once_and_stops_nothing	journal-mirrors-output	
 src/supervise/run_tests.rs	a_jump_of_30_points_is_a_compaction_and_a_box_is_not	context-watch	
@@ -3142,33 +2500,25 @@ src/supervise/run_tests.rs	a_lane_that_cannot_start_says_so_once_and_the_loop_go
 src/supervise/run_tests.rs	a_late_vendor_timer_takes_the_0_inside_the_landing_time_and_is_never_backspaced	§4	
 src/supervise/run_tests.rs	a_later_outage_is_a_new_one_with_its_own_window	outage-ride-out	
 src/supervise/run_tests.rs	a_limit_escalates_once_and_extends_the_budget_once	limit-episode	
-src/supervise/run_tests.rs	a_live_footer_in_the_zone_still_holds_the_wait	await-turn-wait-protocol	
 src/supervise/run_tests.rs	a_look_the_host_scheduled_ends_the_idle_wait_step_at_its_instant	host-look-wake	
 src/supervise/run_tests.rs	a_loop_that_sees_no_survey_tells_the_host_once	survey-host-told	
 src/supervise/run_tests.rs	a_mid_turn_report_older_than_the_window_is_still_its_turns	mail-report-fold	
 src/supervise/run_tests.rs	a_narrowed_pane_is_not_a_compaction	context-watch	
 src/supervise/run_tests.rs	a_new_point_that_looks_like_the_last_one_is_still_reported	review-point-once	
-src/supervise/run_tests.rs	a_passed_reset_extends_nothing_and_the_lines_are_as_before	limit-extend	
 src/supervise/run_tests.rs	a_persons_grace_holds_the_0_on_busy_reads_and_says_so_once	survey-press-gate	
-src/supervise/run_tests.rs	a_persons_grace_holds_the_surveys_0_and_a_stray_digits_backspace	survey-press-gate	
 src/supervise/run_tests.rs	a_point_is_new_when_its_transcript_moved_whatever_the_loop_saw	review-point-once	
 src/supervise/run_tests.rs	a_press_in_flight_is_decided_again_from_a_fresh_read	approval-press-safety	
 src/supervise/run_tests.rs	a_prompt_after_an_idle_is_seen_within_a_hold_step	mail-report-fold	
 src/supervise/run_tests.rs	a_question_turns_report_is_not_the_next_turns	mail-report-fold	
-src/supervise/run_tests.rs	a_quoted_indicator_never_fires	context-watch	
-src/supervise/run_tests.rs	a_quoted_indicator_over_a_box_never_fires	context-watch	
 src/supervise/run_tests.rs	a_read_that_keeps_coming_back_is_approved_twice_then_handed_over	approval-press-safety	
-src/supervise/run_tests.rs	a_reconnect_line_is_cut_at_160_characters	line-clip-and-exit-reason	
 src/supervise/run_tests.rs	a_refusal_naming_a_tighter_cap_is_sent_again_cut_to_it	escalation-badge	
 src/supervise/run_tests.rs	a_refused_backspace_keeps_the_0_owed_until_the_server_takes_it	§4	
-src/supervise/run_tests.rs	a_refused_backspace_of_a_stray_1_is_tried_again	stray-digit-cleanup	
 src/supervise/run_tests.rs	a_refused_escalation_is_journaled_and_the_loop_goes_on	escalation-badge	
 src/supervise/run_tests.rs	a_report_that_came_first_folds_into_the_idle_that_follows	mail-report-fold	
 src/supervise/run_tests.rs	a_report_that_fails_still_reports_the_point	watch-report	
 src/supervise/run_tests.rs	a_reported_point_journals_its_report_and_its_turn	journal-mirrors-output	
 src/supervise/run_tests.rs	a_request_not_served_is_told_from_a_server_answer	ctl-reply-lost	
 src/supervise/run_tests.rs	a_reset_further_off_than_a_week_extends_nothing	limit-extend	
-src/supervise/run_tests.rs	a_reset_notice_is_not_closed_by_a_busy_read_alone	limit-episode	
 src/supervise/run_tests.rs	a_retry_that_hits_the_wall_again_is_the_same_episode_and_mails_once	limit-episode	
 src/supervise/run_tests.rs	a_screen_without_a_composer_gets_no_continuation	limit-episode	
 src/supervise/run_tests.rs	a_second_report_of_a_turn_is_not_the_next_turns	mail-report-fold	
@@ -3177,17 +2527,12 @@ src/supervise/run_tests.rs	a_skipped_guard_is_not_an_approval	approval-press-saf
 src/supervise/run_tests.rs	a_skipped_survey_press_says_nothing	survey-press-gate	
 src/supervise/run_tests.rs	a_span_is_read_once_and_the_continuations_back_off_ten_then_thirty	§4	
 src/supervise/run_tests.rs	a_span_the_grid_no_longer_has_is_read_again	await-turn-wait-protocol	
-src/supervise/run_tests.rs	a_spent_budget_is_timeout_124	budget-bound	
 src/supervise/run_tests.rs	a_standing_approval_attention_survives_the_episode_close	escalation-badge	
 src/supervise/run_tests.rs	a_survey_back_after_a_busy_spell_is_a_new_appearance	survey-report-once	
-src/supervise/run_tests.rs	a_survey_on_a_host_without_the_guard_is_said_not_pressed	survey-press-gate	
-src/supervise/run_tests.rs	a_survey_over_a_busy_worker_is_dismissed_at_the_first_busy_read	survey-press-gate	
-src/supervise/run_tests.rs	a_survey_still_open_after_its_0_is_handed_over_not_dismissed	survey-press-gate	
 src/supervise/run_tests.rs	a_survey_waits_while_a_box_is_up	survey-press-gate	
 src/supervise/run_tests.rs	a_survey_whose_0_did_not_take_is_tried_again_until_it_goes	survey-press-gate	
 src/supervise/run_tests.rs	a_tail_whose_live_zone_starts_at_its_first_row_is_still_scoped	await-turn-wait-protocol	
 src/supervise/run_tests.rs	a_withheld_card_first_read_busy_is_told_at_the_idle_look_and_ended_when_it_goes	survey-host-told	
-src/supervise/run_tests.rs	a_withheld_cards_report_ends_when_the_card_does	survey-host-told	
 src/supervise/run_tests.rs	a_worked_point_closes_the_episode_and_types_nothing	limit-episode	
 src/supervise/run_tests.rs	after_an_outage_the_point_is_reported_again_and_waited_past_on_the_new_seq	review-point-once	
 src/supervise/run_tests.rs	an_answered_box_loses_its_badge_at_the_first_busy_read	escalation-badge	
@@ -3195,31 +2540,18 @@ src/supervise/run_tests.rs	an_auto_continue_notice_closes_at_the_first_busy_read
 src/supervise/run_tests.rs	an_auto_continue_notice_is_never_continued_even_past_its_time	limit-episode	
 src/supervise/run_tests.rs	an_await_timeout_is_a_step_not_an_error	await-turn-wait-protocol	
 src/supervise/run_tests.rs	an_event_summary_is_what_the_worker_said_not_the_survey	render-phase-grammar	
-src/supervise/run_tests.rs	an_idle_with_no_report_is_said_once_the_grace_is_spent	mail-report-fold	
 src/supervise/run_tests.rs	an_outage_that_keeps_coming_back_is_one_window	outage-ride-out	
 src/supervise/run_tests.rs	an_unknown_card_without_the_vendors_mark_is_said_and_never_pressed	survey-press-gate	
 src/supervise/run_tests.rs	at_the_reset_one_continuation_goes_with_the_rules_and_the_answer_closes_the_episode	limit-episode	
 src/supervise/run_tests.rs	await_turn_and_supervise_ride_it_out_with_the_lines_on_stderr	outage-ride-out	
 src/supervise/run_tests.rs	await_turn_on_the_per_request_client_rides_out_exit_75	outage-ride-out	
-src/supervise/run_tests.rs	await_turn_probes_once_and_falls_back_on_an_older_host	await-turn-wait-protocol	
-src/supervise/run_tests.rs	await_turn_rides_out_a_wait_the_update_cut_with_exit_75	outage-ride-out	
-src/supervise/run_tests.rs	await_turn_uses_gone_then_idle_seq_on_a_modern_host	await-turn-wait-protocol	
 src/supervise/run_tests.rs	context_warn_0_says_neither_line	context-watch	
 src/supervise/run_tests.rs	dismiss_surveys_presses_one_guarded_0	survey-press-gate	
-src/supervise/run_tests.rs	drive_await_turn_names_a_codex_workers_program_before_the_wait	drive-phase-reply	
-src/supervise/run_tests.rs	drive_phase_reads_a_codex_worker_by_its_own_grammar	render-phase-grammar	drive-phase-reply
-src/supervise/run_tests.rs	drive_phase_says_esc_interrupts_a_codex_questions_turn	render-phase-grammar	
 src/supervise/run_tests.rs	every_kind_is_dismissed_over_a_workflow_wait_on_the_busy_read	survey-press-gate	
-src/supervise/run_tests.rs	every_survey_kind_is_dismissed_with_a_guard_on_its_own_question_row	survey-guard-unique	
 src/supervise/run_tests.rs	exit_75_is_a_request_not_served	ctl-reply-lost	
 src/supervise/run_tests.rs	guard_errors_are_retried_or_surfaced_never_approved	approval-press-safety	
-src/supervise/run_tests.rs	no_card_turns_a_workflow_wait_idle_in_the_loop	parked-card-keeps-busy	
 src/supervise/run_tests.rs	no_such_session_is_final_outside_an_outage_and_not_yet_inside_one	outage-ride-out	
 src/supervise/run_tests.rs	nothing_happens_after_the_budget	budget-bound	
-src/supervise/run_tests.rs	phase_does_not_name_a_key_for_a_card_the_loop_withholds	render-phase-grammar	
-src/supervise/run_tests.rs	phase_ends_with_the_context_left	render-phase-grammar	
-src/supervise/run_tests.rs	phase_names_the_key_that_dismisses_an_open_survey	render-phase-grammar	
-src/supervise/run_tests.rs	render_phase_names_the_busy_rule_and_the_limit	render-phase-grammar	
 src/supervise/run_tests.rs	render_prompt_prints_the_notes_after_the_description_and_before_classify	render-phase-grammar	
 src/supervise/run_tests.rs	reply_readers_match_the_wire	ctl-reply-readers	
 src/supervise/run_tests.rs	resume_never_continues_what_the_policy_limited	limit-episode	
@@ -3229,16 +2561,10 @@ src/supervise/run_tests.rs	supervise_hands_a_limit_notice_over_like_idle	supervi
 src/supervise/run_tests.rs	supervise_journals_what_watch_would_have_printed	journal-mirrors-output	
 src/supervise/run_tests.rs	supervise_mail_holds_the_idle_and_names_the_report	mail-report-fold	
 src/supervise/run_tests.rs	supervise_mails_result_does_not_wait_for_the_lanes_parked_step	mail-report-fold	
-src/supervise/run_tests.rs	supervise_reads_no_report	supervise-result-and-log-split	
-src/supervise/run_tests.rs	supervise_says_the_context_lines_on_stderr	supervise-result-and-log-split	
 src/supervise/run_tests.rs	supervise_watches_one_run	context-watch	
 src/supervise/run_tests.rs	the_approval_line_is_sanitized_and_cut_by_cells	approval-line-cells	
 src/supervise/run_tests.rs	the_context_watch_is_inclusive_and_needs_the_frame	context-watch	
 src/supervise/run_tests.rs	the_drafts_card_is_never_pressed_or_called_a_survey	survey-press-gate	
-src/supervise/run_tests.rs	the_fallback_press_approves_a_box_that_is_still_up	approval-press-safety	
-src/supervise/run_tests.rs	the_fallback_press_withholds_its_1_while_the_survey_is_open	approval-press-safety	
-src/supervise/run_tests.rs	the_first_0_waits_out_the_vendors_mount_settle	survey-zero-timing	
-src/supervise/run_tests.rs	the_first_wait_before_any_read_is_capped	await-turn-wait-protocol	
 src/supervise/run_tests.rs	the_notice_again_after_a_continuation_is_the_same_episode_and_backs_off	limit-episode	
 src/supervise/run_tests.rs	the_same_box_after_the_worker_worked_is_a_new_ask	escalation-badge	
 src/supervise/run_tests.rs	the_same_box_is_never_pressed_twice_on_an_unchanged_screen	approval-press-safety	
@@ -3249,32 +2575,26 @@ src/supervise/run_tests.rs	under_approve_none_every_prompt_is_handed_over	approv
 src/supervise/run_tests.rs	watch_journals_every_line_it_prints	journal-mirrors-output	
 src/supervise/run_tests.rs	watch_lines_are_cut_at_160_characters	line-clip-and-exit-reason	
 src/supervise/run_tests.rs	watch_mail_folds_the_workers_report_into_its_turn	mail-report-fold	
-src/supervise/run_tests.rs	watch_prints_one_line_per_decision_and_keeps_watching	review-point-once	
 src/supervise/run_tests.rs	watch_report_counts_the_report_into_the_events_that_end_on_words	watch-report	
 src/supervise/run_tests.rs	watch_report_on_an_old_host_reads_the_screen_alone	watch-report	
 src/supervise/run_tests.rs	watch_rides_out_a_lost_connection_to_the_next_event	outage-ride-out	
 src/supervise/run_tests.rs	watch_says_a_descent_once_and_the_compaction_once	context-watch	
 src/supervise/run_tests.rs	watch_says_a_survey_once_when_it_appears	survey-report-once	
-src/supervise/run_tests.rs	watch_summarises_each_kind_of_review_point	review-point-once	
 src/supervise/run_tests.rs	watch_tells_the_window_its_story_through_the_teller_and_prints_the_same_lines	story-teller-lane	
 src/supervise/run_tests.rs	without_mail_every_line_is_as_before	mail-report-fold	
 src/supervise/screen.rs	a_status_stamp_reads_as_the_one_person_fact	human-input-stamp	
 src/supervise/screen.rs	a_tail_reads_first_row_places_the_cursor	screen-cursor-index	
 src/supervise/screen.rs	json_reader_handles_the_value_vocabulary	json-reader-grammar	
+src/supervise/screen.rs	only_a_whole_person_launch_witness_is_read	parse-text-json	never-type-over-a-person
 src/supervise/screen.rs	parses_the_servers_text_json_shape	parse-text-json	
 src/supervise/screen.rs	rejects_what_is_not_a_screen	parse-text-json	
 src/supervise/screen.rs	the_persons_stamp_is_read_and_its_absence_is_unknown	parse-text-json	
 src/supervise/screen.rs	the_screen_generation_is_read_and_a_malformed_one_is_none	parse-text-json	
 src/supervise/stall.rs	a_stalled_or_stopped_input_is_a_stall_and_every_other_word_is_not	stall-status-read	
-src/supervise/stall.rs	a_wait_reads_as_the_band_reads_one	wait-text-format	
-src/supervise/stall.rs	the_frozen_mail_names_the_wait_the_backlog_the_size_and_the_remedy	frozen-text	
 src/supervise/stall_tests.rs	a_continuation_over_a_worker_already_stalled_types_nothing	stall-hold	
 src/supervise/stall_tests.rs	a_continuation_warned_input_unread_reads_status_at_the_next_look	stall-hold	
 src/supervise/stall_tests.rs	a_frozen_worker_is_held_its_badge_withdrawn_and_the_manager_told_once	stall-hold	
 src/supervise/stall_tests.rs	a_frozen_worker_with_no_fabric_is_told_to_no_one_by_mail	stall-hold	
-src/supervise/stall_tests.rs	a_host_that_does_not_measure_input_sees_the_requests_it_always_saw	stall-probe-cost	
-src/supervise/stall_tests.rs	a_press_refused_input_unread_reads_status_before_it_presses_again	stall-hold	
-src/supervise/stall_tests.rs	a_press_warned_input_unread_reads_status_before_it_presses_again	stall-hold	
 src/supervise/stall_tests.rs	a_stall_the_escalations_own_read_reports_withholds_the_ask_and_holds_at_once	stall-hold	
 src/supervise/stall_tests.rs	a_thawed_worker_has_its_point_decided_again	stall-hold	
 src/supervise/stall_tests.rs	a_wait_that_never_read_status_probes_and_holds	stall-probe-cost	
@@ -3282,7 +2602,6 @@ src/supervise/stall_tests.rs	a_warning_is_read_off_the_first_line_the_server_wro
 src/supervise/stall_tests.rs	a_worker_already_stalled_when_the_loop_looks_is_neither_pressed_nor_badged	stall-hold	
 src/supervise/stall_tests.rs	a_worker_frozen_past_the_bound_is_ended_for_its_relaunch	stall-remedy-refines-model	
 src/supervise/stall_tests.rs	a_worker_frozen_past_the_bound_is_warned_about_and_left_running	stall-remedy-refines-model	
-src/supervise/stall_tests.rs	a_worker_stalled_from_the_start_has_its_point_decided_once_it_reads_again	stall-hold	
 src/supervise/stall_tests.rs	the_frozen_mail_names_the_workers_own_conversation_or_the_hosts_relaunch	§4	
 src/supervise/stall_tests.rs	the_host_is_told_the_stall_it_holds_and_that_it_lifted	stall-hold	
 src/supervise/stall_tests.rs	the_remedy_is_the_servers_restart_and_its_refusals_decide	stall-remedy-refines-model	
@@ -3300,28 +2619,13 @@ src/supervise/turn_end_loop_tests.rs	a_529_waits_its_backoff_then_continues_exac
 src/supervise/turn_end_loop_tests.rs	a_back_off_the_mac_slept_through_is_over_once_the_wake_settles	sleep-wake-settle	
 src/supervise/turn_end_loop_tests.rs	a_bare_clock_reset_is_placed_for_the_wall_it_belongs_to	limit-wall-placement	
 src/supervise/turn_end_loop_tests.rs	a_bucket_whose_countdown_ended_is_waited_on_across_a_loop_restart	left-limit-tracking	
-src/supervise/turn_end_loop_tests.rs	a_carried_on_holds_escaped_goal_is_stopped_past_an_old_keystroke	codex-wind-down	
-src/supervise/turn_end_loop_tests.rs	a_cell_the_server_does_not_answer_is_the_placeholder_only_on_the_caret_row	never-type-over-a-person	
 src/supervise/turn_end_loop_tests.rs	a_claimed_probe_types_usage_samples_the_settled_panel_and_closes_it	usage-probe-gates	
 src/supervise/turn_end_loop_tests.rs	a_clear_at_an_armed_limit_closes_the_ledgers_wall_and_says_why	left-limit-tracking	
 src/supervise/turn_end_loop_tests.rs	a_clearing_the_loop_before_answered_is_not_answered_again	account-ledger-readback	
-src/supervise/turn_end_loop_tests.rs	a_codex_0_158_input_line_is_typed_into_under_its_own_mark	act-write-protocol	
-src/supervise/turn_end_loop_tests.rs	a_codex_hold_is_read_back_and_types_nothing	codex-wind-down	
-src/supervise/turn_end_loop_tests.rs	a_codex_nudge_near_its_limit_saves_the_work_restores_and_holds	codex-wind-down	
-src/supervise/turn_end_loop_tests.rs	a_codex_session_is_supervised_end_to_end	act-write-protocol	
-src/supervise/turn_end_loop_tests.rs	a_codex_walls_words_keep_their_first_placement	usage-wall-wait	
-src/supervise/turn_end_loop_tests.rs	a_codex_whose_goal_is_pursued_is_never_continued	codex-wind-down	
 src/supervise/turn_end_loop_tests.rs	a_context_no_compact_lowers_is_one_exception_across_the_rungs_until_it_is_lowered	api-wall-acts	
 src/supervise/turn_end_loop_tests.rs	a_continuation_a_refusal_turned_away_is_typed_once_it_can_be	refused-write-retried	
-src/supervise/turn_end_loop_tests.rs	a_dated_weekly_wall_is_continued_once_and_only_after_its_reset	usage-wall-wait	
-src/supervise/turn_end_loop_tests.rs	a_default_prose_answer_is_mains_requests_and_one_meta	turn-end-decision	
 src/supervise/turn_end_loop_tests.rs	a_dialog_no_reader_names_climbs_to_a_record_and_a_line_and_its_end_withdraws_both	stall-ladder	
 src/supervise/turn_end_loop_tests.rs	a_done_report_is_checked_once_and_a_done_reply_ends_the_task	turn-end-decision	
-src/supervise/turn_end_loop_tests.rs	a_down_measure_lost_mid_wait_puts_the_outage_back_on_the_ladder	api-wall-acts	
-src/supervise/turn_end_loop_tests.rs	a_draft_a_shell_and_a_missed_guard_type_nothing	never-type-over-a-person	
-src/supervise/turn_end_loop_tests.rs	a_draft_homed_to_column_2_is_never_typed_over	never-type-over-a-person	
-src/supervise/turn_end_loop_tests.rs	a_draft_left_standing_is_submitted_once_the_grace_has_passed	never-type-over-a-person	
-src/supervise/turn_end_loop_tests.rs	a_due_probe_at_the_wake_waits_for_the_settle	usage-probe-gates	
 src/supervise/turn_end_loop_tests.rs	a_due_probe_that_is_not_run_says_which_gate_shut_once_a_point	usage-probe-gates	
 src/supervise/turn_end_loop_tests.rs	a_due_the_sleep_fell_short_of_falls_at_its_wall_time	sleep-wake-settle	
 src/supervise/turn_end_loop_tests.rs	a_fable_limit_with_no_host_to_relaunch_is_waited_out_never_by_model	usage-wall-wait	
@@ -3330,93 +2634,58 @@ src/supervise/turn_end_loop_tests.rs	a_fenced_press_a_hold_turned_away_is_presse
 src/supervise/turn_end_loop_tests.rs	a_finished_report_naming_open_work_is_challenged_once_then_ends	turn-end-decision	
 src/supervise/turn_end_loop_tests.rs	a_finished_task_opened_again_is_asked_about_at_the_limit_its_turn_ends_on	account-advice-asks	
 src/supervise/turn_end_loop_tests.rs	a_folded_panel_is_no_sample_and_its_grid_size_is_not_probed_again	usage-probe-panel-close	
-src/supervise/turn_end_loop_tests.rs	a_full_context_is_compacted_then_continued	api-wall-acts	
-src/supervise/turn_end_loop_tests.rs	a_goal_the_upgrade_holds_is_never_stopped_or_paused_by_the_switch	codex-wind-down	
 src/supervise/turn_end_loop_tests.rs	a_half_erased_panel_after_the_escape_gets_no_second_escape	usage-probe-panel-close	
 src/supervise/turn_end_loop_tests.rs	a_handed_over_idle_escalation_survives_the_restart	stop-and-handover	
 src/supervise/turn_end_loop_tests.rs	a_held_box_is_answered_once_the_persons_grace_has_passed	never-type-over-a-person	
-src/supervise/turn_end_loop_tests.rs	a_hidden_wall_acted_on_since_it_was_written_seeds_nothing	left-limit-tracking	
-src/supervise/turn_end_loop_tests.rs	a_hidden_wall_ended_since_it_was_written_seeds_nothing	left-limit-tracking	
-src/supervise/turn_end_loop_tests.rs	a_hidden_wall_past_its_horizon_is_history	left-limit-tracking	
 src/supervise/turn_end_loop_tests.rs	a_host_that_answers_a_short_wait_is_asked_again_when_it_runs_out	account-advice-asks	
-src/supervise/turn_end_loop_tests.rs	a_limit_cancelled_before_any_read_after_the_own_act_is_waited_on_to_its_reset	left-limit-tracking	
-src/supervise/turn_end_loop_tests.rs	a_limit_met_inside_the_own_acts_take_window_is_waited_on_when_its_notice_leaves	left-limit-tracking	
 src/supervise/turn_end_loop_tests.rs	a_limit_whose_notice_left_is_waited_on_across_a_loop_restart	left-limit-tracking	
-src/supervise/turn_end_loop_tests.rs	a_long_continuations_guard_matches_its_last_row_at_every_width	composer-guard	
 src/supervise/turn_end_loop_tests.rs	a_long_texts_guard_never_matches_a_shells_row	composer-guard	
 src/supervise/turn_end_loop_tests.rs	a_loop_started_on_an_old_told_move_waits_at_its_lost_login	login-lifecycle-accounts	
 src/supervise/turn_end_loop_tests.rs	a_loop_stopped_mid_probe_presses_nothing_and_the_next_loop_closes_the_panel	stop-and-handover	
 src/supervise/turn_end_loop_tests.rs	a_loop_that_starts_after_another_keeps_its_bound_and_its_latch	account-ledger-readback	
-src/supervise/turn_end_loop_tests.rs	a_loop_that_starts_on_a_hidden_wall_its_predecessor_waited_on_waits_on	left-limit-tracking	
 src/supervise/turn_end_loop_tests.rs	a_loop_that_takes_up_a_move_made_at_a_wall_carries_it_on_past_the_notice	account-ledger-readback	
 src/supervise/turn_end_loop_tests.rs	a_loop_watching_behind_another_claim_asks_no_escape_of_an_owed_panel	usage-probe-gates	
 src/supervise/turn_end_loop_tests.rs	a_lost_login_left_inside_the_own_acts_window_types_login_and_tells_the_owner	login-wall-acts	
 src/supervise/turn_end_loop_tests.rs	a_lost_login_no_read_saw_busy_is_struck_before_the_host_is_asked	account-move-answer	
 src/supervise/turn_end_loop_tests.rs	a_lost_login_types_login_and_its_badge_goes_when_the_worker_works	login-wall-acts	
 src/supervise/turn_end_loop_tests.rs	a_lost_login_with_no_account_left_asks_its_sign_in_until_the_move_back	login-lifecycle-accounts	
-src/supervise/turn_end_loop_tests.rs	a_mac_that_slept_through_the_wait_decides_the_point_again_after_a_settle	sleep-wake-settle	
 src/supervise/turn_end_loop_tests.rs	a_model_switch_is_read_back_by_a_loop_that_starts_after_it	model-switch-carry	
 src/supervise/turn_end_loop_tests.rs	a_move_ahead_of_a_wall_types_nothing_and_its_point_is_decided_as_with_no_move	account-move-execution	
 src/supervise/turn_end_loop_tests.rs	a_move_ahead_the_host_defers_never_holds_the_continuation	account-move-execution	
 src/supervise/turn_end_loop_tests.rs	a_move_made_at_a_wall_is_carried_on_past_the_limit_it_left	account-move-execution	
 src/supervise/turn_end_loop_tests.rs	a_move_seeded_from_the_ledger_is_answered_once_across_loops	account-ledger-readback	
-src/supervise/turn_end_loop_tests.rs	a_note_said_while_the_press_is_only_intended_keeps_it_intended	codex-wind-down	
-src/supervise/turn_end_loop_tests.rs	a_nudge_switch_that_did_not_land_opens_nothing	codex-wind-down	
 src/supervise/turn_end_loop_tests.rs	a_one_login_machine_waits_asks_renew_and_relaunches_after_it	login-lifecycle-accounts	
 src/supervise/turn_end_loop_tests.rs	a_panel_closed_under_the_read_is_no_new_point_and_the_probes_go_on	usage-probe-panel-close	
-src/supervise/turn_end_loop_tests.rs	a_panel_that_does_not_take_its_escape_is_tried_on_the_ladder_and_told_once	usage-probe-panel-close	
 src/supervise/turn_end_loop_tests.rs	a_panel_that_never_opens_gets_no_escape	usage-probe-panel-close	
 src/supervise/turn_end_loop_tests.rs	a_panel_that_never_settles_is_closed_with_no_sample	usage-probe-panel-close	
 src/supervise/turn_end_loop_tests.rs	a_panel_with_a_turn_running_under_it_gets_no_escape_and_no_sample	usage-probe-panel-close	
-src/supervise/turn_end_loop_tests.rs	a_person_at_the_session_is_never_typed_under_or_sampled_over	usage-probe-gates	
-src/supervise/turn_end_loop_tests.rs	a_person_typing_at_the_reset_holds_the_wall_act	never-type-over-a-person	
-src/supervise/turn_end_loop_tests.rs	a_persons_greeting_is_left_to_them	turn-end-decision	
-src/supervise/turn_end_loop_tests.rs	a_persons_hand_seen_in_a_turn_is_latched_until_its_point	codex-wind-down	
 src/supervise/turn_end_loop_tests.rs	a_persons_keystroke_holds_the_loop_for_the_grace	never-type-over-a-person	
 src/supervise/turn_end_loop_tests.rs	a_persons_question_answered_at_length_is_left_to_them	turn-end-decision	
-src/supervise/turn_end_loop_tests.rs	a_persons_turn_past_the_grace_is_never_stopped	codex-wind-down	
-src/supervise/turn_end_loop_tests.rs	a_persons_turn_the_limit_answers_cancelled_before_any_read_is_waited_on_to_its_reset	left-limit-tracking	
 src/supervise/turn_end_loop_tests.rs	a_point_after_a_sleep_a_request_saw_is_held_only_until_the_wakes_settle	sleep-wake-settle	
 src/supervise/turn_end_loop_tests.rs	a_point_decided_again_says_not_new	usage-probe-gates	
-src/supervise/turn_end_loop_tests.rs	a_point_that_changed_across_the_probe_is_not_acted_on	usage-probe-gates	
 src/supervise/turn_end_loop_tests.rs	a_probe_books_no_act_and_moves_none_of_the_policys_memory	usage-probe-memory-neutral	
 src/supervise/turn_end_loop_tests.rs	a_question_in_prose_is_answered_by_the_sessions_priority_word	turn-end-decision	
-src/supervise/turn_end_loop_tests.rs	a_refusal_that_persists_is_journaled_once_and_again_when_it_changes	refusal-news-episode	
-src/supervise/turn_end_loop_tests.rs	a_refusal_whose_counters_move_is_journaled_once	refusal-news-episode	
 src/supervise/turn_end_loop_tests.rs	a_refusals_episode_ends_at_a_taken_write_and_at_a_lifted_hold	refusal-news-episode	
 src/supervise/turn_end_loop_tests.rs	a_refusals_episode_is_its_holder_and_ends_after_a_quiet_spell	refusal-news-episode	
 src/supervise/turn_end_loop_tests.rs	a_refused_escape_is_sent_again_and_never_a_second_usage	usage-probe-panel-close	
 src/supervise/turn_end_loop_tests.rs	a_renewal_made_while_its_escalation_stands_decides_the_point_again	login-lifecycle-accounts	
 src/supervise/turn_end_loop_tests.rs	a_renewed_login_nothing_relaunches_the_tab_onto_is_never_renewed_again	login-lifecycle-accounts	
-src/supervise/turn_end_loop_tests.rs	a_reply_inside_the_settle_is_judged_at_its_deadline_not_latched	act-write-protocol	
 src/supervise/turn_end_loop_tests.rs	a_reprinted_wall_is_not_sent_to_tomorrow_at_once	usage-wall-wait	
-src/supervise/turn_end_loop_tests.rs	a_reset_cached_as_unix_follows_the_wall_clock	clock-unix-roundtrip	
 src/supervise/turn_end_loop_tests.rs	a_reset_the_sleep_carried_past_waits_for_the_settle_though_a_repaint_wakes_the_loop	sleep-wake-settle	
-src/supervise/turn_end_loop_tests.rs	a_reset_whose_notice_left_is_not_held_late_by_a_sleep	sleep-wake-settle	
 src/supervise/turn_end_loop_tests.rs	a_resume_at_an_armed_bucket_types_nothing_into_it	left-limit-tracking	
 src/supervise/turn_end_loop_tests.rs	a_resume_at_an_armed_limit_types_nothing_into_it	left-limit-tracking	
 src/supervise/turn_end_loop_tests.rs	a_resume_at_an_armed_limit_waits_on_it_as_a_cancelled_one	left-limit-tracking	
 src/supervise/turn_end_loop_tests.rs	a_resume_the_limit_answers_inside_its_window_is_waited_on_to_the_new_reset	left-limit-tracking	
 src/supervise/turn_end_loop_tests.rs	a_sample_that_shows_the_account_low_moves_the_session_at_the_same_point	usage-probe-gates	
 src/supervise/turn_end_loop_tests.rs	a_session_limit_whose_reset_has_passed_is_continued	usage-wall-wait	
-src/supervise/turn_end_loop_tests.rs	a_sessions_ask_holds_its_dialogs_never_a_question_in_prose	turn-end-decision	
 src/supervise/turn_end_loop_tests.rs	a_sessions_jitter_is_stable_bounded_and_spread	resume-jitter	
-src/supervise/turn_end_loop_tests.rs	a_sleep_between_two_calls_of_the_wait_is_seen_by_the_second_whatever_point_shows	sleep-wake-settle	
 src/supervise/turn_end_loop_tests.rs	a_sleep_between_two_steps_of_the_wait_is_seen_by_the_wait_itself	sleep-wake-settle	
 src/supervise/turn_end_loop_tests.rs	a_stall_kept_up_climbs_to_a_record_and_then_an_exception_and_its_end_withdraws_both	stall-ladder	
 src/supervise/turn_end_loop_tests.rs	a_stall_that_ends_tells_the_host_the_point_that_stood_under_it	stall-ladder	
-src/supervise/turn_end_loop_tests.rs	a_stood_still_note_at_a_break_decides_nothing_again	codex-wind-down	
-src/supervise/turn_end_loop_tests.rs	a_stop_in_a_continuations_settle_ends_the_run_before_its_next_wait	act-write-protocol	
-src/supervise/turn_end_loop_tests.rs	a_stop_phrase_is_answered_with_the_answer_text	turn-end-decision	
 src/supervise/turn_end_loop_tests.rs	a_successor_closes_only_a_panel_the_ledger_says_the_harness_opened	usage-probe-panel-close	
 src/supervise/turn_end_loop_tests.rs	a_suggestion_on_a_grid_drawn_one_row_high_is_not_a_draft_at_a_wall	never-type-over-a-person	
-src/supervise/turn_end_loop_tests.rs	a_switch_carried_on_keeps_its_seconds_at_any_phase_of_the_clock	clock-unix-roundtrip	
-src/supervise/turn_end_loop_tests.rs	a_switch_standing_still_under_a_background_terminal_is_said	codex-wind-down	
-src/supervise/turn_end_loop_tests.rs	a_switch_under_a_background_terminal_goes_on_however_the_turn_ended	codex-wind-down	
-src/supervise/turn_end_loop_tests.rs	a_told_move_the_worker_works_past_is_told_served	account-move-answer	
 src/supervise/turn_end_loop_tests.rs	a_torn_read_after_the_accept_key_is_read_again	act-write-protocol	
 src/supervise/turn_end_loop_tests.rs	a_turn_end_after_work_is_continued_once_and_a_stop_phrase_escalates	turn-end-decision	
-src/supervise/turn_end_loop_tests.rs	a_turn_running_while_the_switch_is_owed_is_stopped_on_its_busy_read	codex-wind-down	
 src/supervise/turn_end_loop_tests.rs	a_turn_served_under_the_remembered_walls_notice_is_no_background_work	left-limit-tracking	
 src/supervise/turn_end_loop_tests.rs	a_unix_second_reads_back_and_stamps_as_itself_at_any_phase_of_the_clock	clock-unix-roundtrip	
 src/supervise/turn_end_loop_tests.rs	a_usage_resume_typed_into_the_account_a_session_left_is_not_taken_up	account-ledger-readback	
@@ -3425,68 +2694,48 @@ src/supervise/turn_end_loop_tests.rs	a_wait_inside_the_wakes_settle_steps_to_its
 src/supervise/turn_end_loop_tests.rs	a_wait_is_told_at_its_wall_second_and_again_only_when_that_second_moves	wait-told	
 src/supervise/turn_end_loop_tests.rs	a_wait_on_the_hosts_advice_is_decided_again_when_its_stamp_moves	account-advice-asks	
 src/supervise/turn_end_loop_tests.rs	a_wall_read_inside_the_own_acts_window_is_placed_on_its_print	usage-wall-wait	
-src/supervise/turn_end_loop_tests.rs	a_wall_that_answered_an_act_is_not_dated_by_an_older_turns_done_row	usage-wall-wait	
 src/supervise/turn_end_loop_tests.rs	a_wall_with_an_account_to_move_to_is_the_hosts_relaunch	account-move-execution	
 src/supervise/turn_end_loop_tests.rs	a_weekly_wall_hit_in_the_evening_that_resets_in_the_morning_is_waited_for	usage-wall-wait	
 src/supervise/turn_end_loop_tests.rs	a_weekly_wall_still_standing_after_a_typed_line_is_never_typed_into_again_before_its_reset	usage-wall-wait	
-src/supervise/turn_end_loop_tests.rs	a_weekly_wall_that_answers_the_loops_own_continuation_is_waited_out_to_its_reset	usage-wall-wait	
-src/supervise/turn_end_loop_tests.rs	a_worker_that_reports_finished_is_left_alone	turn-end-decision	
 src/supervise/turn_end_loop_tests.rs	an_account_move_made_closes_the_model_switch_for_the_loop_after_it	model-switch-carry	
 src/supervise/turn_end_loop_tests.rs	an_account_move_made_is_no_typed_act_of_the_budgets	typing-budget	
 src/supervise/turn_end_loop_tests.rs	an_edge_at_the_wake_types_nothing_before_the_settle	sleep-wake-settle	
 src/supervise/turn_end_loop_tests.rs	an_enter_of_the_text_left_typed_that_does_not_take_is_written_again	usage-probe-left-typed	
-src/supervise/turn_end_loop_tests.rs	an_enter_of_the_text_left_typed_that_the_server_turns_away_is_written_again	usage-probe-left-typed	
 src/supervise/turn_end_loop_tests.rs	an_idle_screen_or_a_question_ends_the_wall_memory	left-limit-tracking	
-src/supervise/turn_end_loop_tests.rs	an_intended_press_leaves_the_nudge_to_be_decided_again	codex-wind-down	
-src/supervise/turn_end_loop_tests.rs	an_intended_press_with_a_draft_stays_intended	codex-wind-down	
-src/supervise/turn_end_loop_tests.rs	an_off_loop_leaves_the_switch_standing_on_its_busy_reads	codex-wind-down	
 src/supervise/turn_end_loop_tests.rs	an_off_session_has_the_harnesss_usage_panel_closed_before_the_park	usage-probe-panel-close	
 src/supervise/turn_end_loop_tests.rs	an_off_session_with_a_stall_suspected_parks_and_leaves_the_panel_owed	usage-probe-panel-close	
 src/supervise/turn_end_loop_tests.rs	an_off_sessions_one_close_promises_no_second_escape_and_waits_on_no_hold	usage-probe-panel-close	
 src/supervise/turn_end_loop_tests.rs	an_off_sessions_refused_escape_is_its_one_close	usage-probe-panel-close	
-src/supervise/turn_end_loop_tests.rs	an_offer_is_continued_and_a_question_is_escalated	turn-end-decision	
 src/supervise/turn_end_loop_tests.rs	an_older_cancelled_limit_resumed_inside_the_acts_window_is_no_days_wait	left-limit-tracking	
 src/supervise/turn_end_loop_tests.rs	an_ordinary_or_escalated_point_never_asks_for_the_reach_again	api-wall-acts	
 src/supervise/turn_end_loop_tests.rs	an_outage_in_the_read_leaves_the_panel_owed_and_the_same_loop_closes_it	usage-probe-panel-close	
 src/supervise/turn_end_loop_tests.rs	an_owed_panels_repaint_is_never_the_worker_working	usage-probe-panel-close	
 src/supervise/turn_end_loop_tests.rs	an_undated_cancelled_limit_is_placed_within_a_session_window	limit-wall-placement	
+src/supervise/turn_end_loop_tests.rs	an_unknown_composer_is_never_typed_over_or_submitted	never-type-over-a-person	
 src/supervise/turn_end_loop_tests.rs	an_up_measure_mid_wait_continues_the_outage_within_one_step	api-wall-acts	
 src/supervise/turn_end_loop_tests.rs	another_drivers_hand_holds_the_loop	never-type-over-a-person	
-src/supervise/turn_end_loop_tests.rs	another_panel_ends_the_loops_probes_and_one_that_leaves_gets_no_escape	usage-probe-panel-close	
 src/supervise/turn_end_loop_tests.rs	claude_codes_idle_compaction_is_no_turn	turn-end-decision	
-src/supervise/turn_end_loop_tests.rs	frames_between_the_pickers_boxes_type_one_model	codex-wind-down	
 src/supervise/turn_end_loop_tests.rs	news_of_the_accounts_clears_a_latch_and_no_news_asks_nothing	account-advice-asks	
 src/supervise/turn_end_loop_tests.rs	news_of_the_accounts_ends_a_sessions_wait_at_its_limit	account-advice-asks	
 src/supervise/turn_end_loop_tests.rs	one_placed_reset_stamps_as_its_own_second_across_a_turning_second	§4	
-src/supervise/turn_end_loop_tests.rs	only_the_upgrades_relaunch_has_its_goal_box_answered	codex-wind-down	
 src/supervise/turn_end_loop_tests.rs	the_act_check_is_told_to_the_host_as_no_plan	wait-told	
 src/supervise/turn_end_loop_tests.rs	the_budget_is_stretched_to_the_reset_the_wait_holds_for	usage-wall-wait	
-src/supervise/turn_end_loop_tests.rs	the_goal_note_stays_up_while_the_goal_runs	codex-wind-down	
-src/supervise/turn_end_loop_tests.rs	the_goal_turn_under_the_box_is_stopped_whoever_began_the_covered_turn	codex-wind-down	
 src/supervise/turn_end_loop_tests.rs	the_host_is_asked_for_its_advice_once_a_decision	account-advice-asks	
 src/supervise/turn_end_loop_tests.rs	the_host_is_asked_on_the_folded_point_where_a_latch_has_ended	account-advice-asks	
 src/supervise/turn_end_loop_tests.rs	the_host_is_told_once_what_answered_the_move	account-move-answer	
 src/supervise/turn_end_loop_tests.rs	the_hosts_background_step_at_the_wake_waits_for_the_settle	sleep-wake-settle	
-src/supervise/turn_end_loop_tests.rs	the_hosts_background_step_waits_for_an_open_switch	codex-wind-down	
 src/supervise/turn_end_loop_tests.rs	the_hosts_step_at_the_wake_waits_for_the_settle	sleep-wake-settle	
-src/supervise/turn_end_loop_tests.rs	the_inline_renderer_is_never_probed	usage-probe-gates	
 src/supervise/turn_end_loop_tests.rs	the_ledger_reads_a_sessions_account_moves_back	account-ledger-readback	
 src/supervise/turn_end_loop_tests.rs	the_login_expired_row_is_told_once_and_the_login_back_is_continued	login-wall-acts	
 src/supervise/turn_end_loop_tests.rs	the_loop_reads_the_wall_of_a_tall_panes_short_transcript	live-zone-read	
 src/supervise/turn_end_loop_tests.rs	the_loop_says_once_why_a_due_probe_was_not_run	usage-probe-gates	
-src/supervise/turn_end_loop_tests.rs	the_measured_weekly_wall_of_tab_1_is_waited_out_until_its_reset_and_grace_have_passed	usage-wall-wait	
 src/supervise/turn_end_loop_tests.rs	the_no_break_space_composer_takes_the_fenced_continuation	act-write-protocol	
-src/supervise/turn_end_loop_tests.rs	the_owed_footer_gate_reads_the_thread_since_the_press	codex-wind-down	
 src/supervise/turn_end_loop_tests.rs	the_owners_clearing_continues_a_session_at_its_wall_once	account-move-execution	
 src/supervise/turn_end_loop_tests.rs	the_plan_is_cleared_when_the_try_is_typed_not_at_the_next_point	wait-told	
 src/supervise/turn_end_loop_tests.rs	the_point_read_again_after_an_account_relaunch_tells_nothing	account-move-answer	
-src/supervise/turn_end_loop_tests.rs	the_policys_own_hold_is_named_at_a_break	codex-wind-down	
 src/supervise/turn_end_loop_tests.rs	the_probe_is_not_typed_again_over_its_own_text_left_typed	usage-probe-left-typed	
 src/supervise/turn_end_loop_tests.rs	the_renewal_edge_keeps_what_the_decision_read	login-lifecycle-accounts	
-src/supervise/turn_end_loop_tests.rs	the_save_turn_past_its_bound_is_stopped_judged_and_restored	codex-wind-down	
-src/supervise/turn_end_loop_tests.rs	the_saves_bound_stands_under_the_upgrades_goal_hold	codex-wind-down	
 src/supervise/turn_end_loop_tests.rs	the_stamp_a_loop_first_reads_is_no_news_to_its_latch	account-ledger-readback	
-src/supervise/turn_end_loop_tests.rs	the_switchs_opening_closes_the_boxs_span	codex-wind-down	
 src/supervise/turn_end_loop_tests.rs	the_typing_budget_counts_an_earlier_loops_acts_from_the_ledger	typing-budget	
 src/supervise/turn_end_loop_tests.rs	the_wait_on_a_left_limit_wakes_on_a_persons_short_turn	left-limit-tracking	
 src/supervise/turn_end_loop_tests.rs	the_wait_places_a_reset_across_a_dst_change_with_the_offset_there	limit-wall-placement	
@@ -3515,6 +2764,8 @@ src/supervise/wall_confirm_loop_tests.rs	a_whole_read_that_fails_or_reads_anothe
 src/supervise/wall_confirm_loop_tests.rs	an_act_over_a_cancelled_limit_answered_by_the_same_reset_is_read_from_the_transcript	left-limit-tracking	
 src/supervise/wall_confirm_loop_tests.rs	the_books_read_after_an_act_asks_the_transcript_nothing	wall-confirm-gate	
 src/supervise/wall_confirm_loop_tests.rs	the_seam_spares_the_banner_and_a_codex_and_reads_a_refused_limit_on_its_frame	wall-confirm-gate	
+src/supervise/wall_confirm_loop_tests.rs	with_no_transcript_a_hooks_words_under_its_own_rows_are_not_acted_on	wall-confirm-gate	
+src/supervise/wall_confirm_loop_tests.rs	with_no_transcript_a_programs_words_behind_a_vendor_label_are_not_acted_on	wall-confirm-gate	
 src/supervise/wall_confirm_loop_tests.rs	with_no_transcript_a_wall_under_a_tools_call_is_not_acted_on	wall-confirm-gate	
 src/supervise/wall_confirm_tests.rs	a_local_commands_rows_are_no_turn_and_no_notice	transcript-ends-on	
 src/supervise/wall_confirm_tests.rs	a_notice_the_table_does_not_name_is_classed_by_its_error_word	transcript-confirms-class	
@@ -3526,12 +2777,6 @@ src/supervise/wall_confirm_tests.rs	the_files_order_decides_but_for_the_conversa
 tests/conformance_footer_model.rs	the_bind_catches_each_old_reader	footer-model-refines-ClaudeFooterModel	
 tests/conformance_footer_model.rs	the_footer_names_the_running_model_from_every_state_within_five_actions	footer-model-refines-ClaudeFooterModel	
 tests/conformance_login_wall.rs	the_real_code_conforms_to_the_login_wall_model	login-wall-refines-HarnessLoginWall	
-tests/conformance_operator.rs	operator_event_delivery_real_claim_cas_matches_model	operator-refines-models	
-tests/conformance_operator.rs	operator_event_delivery_real_redelivery_cap_matches_model	operator-refines-models	
-tests/conformance_operator.rs	operator_fleet_fault_failed_marker_write_commits_no_fault	operator-refines-models	
-tests/conformance_operator.rs	operator_fleet_fault_real_gate_and_human_clear_match_model	operator-refines-models	
-tests/conformance_operator.rs	operator_leadership_real_lock_and_epoch_fence_match_model	operator-refines-models	
-tests/conformance_operator.rs	operator_wal_core_orphan_recovery_and_human_reconciliation_match_model	operator-refines-models	
 tests/conformance_upgrade_models/ladder.rs	the_incidents_cold_only_rule_is_caught_by_the_bind	upgrade-model-ladder-refines-model	
 tests/conformance_upgrade_models/ladder.rs	the_real_ladder_is_the_models_ladder_at_every_reachable_state	upgrade-model-ladder-refines-model	
 tests/conformance_upgrade_models/priority.rs	upgrade_priority_binds_catch_a_pre_fix_writer_and_a_head_reader	upgrade-model-priority-refines-model	
@@ -3542,38 +2787,25 @@ tests/conformance_upgrade_models/switch.rs	upgrade_model_switch_is_the_models_on
 tests/conformance_upgrade_models/switch.rs	upgrade_model_switch_refuses_the_opposite_decision	upgrade-model-switch-refines-model	
 tests/conformance_usage_tap.rs	the_real_tap_takes_the_models_steps_on_every_reachable_state	usage-tap-refines-HarnessUsageTap	
 tests/footer_window_allocations.rs	each_window_the_footer_walks_back_is_allocated_once	footer-window-allocation	
-tests/remote_turn_loopback_tls.rs	remote_turn_over_loopback_tls	relay-turn-transparency	
 tests/supervise_conformance_account_rotation.rs	a_canary_that_never_answers_is_replaced_by_the_next_session_after_its_hold	account-rotation-refines-model	
 tests/supervise_conformance_account_rotation.rs	a_real_history_from_an_empty_state_stays_in_step_with_the_model	account-rotation-refines-model	
 tests/supervise_conformance_account_rotation.rs	a_strike_goes_back_to_an_account_that_never_served_as_unproven	account-rotation-refines-model	
 tests/supervise_conformance_account_rotation.rs	six_rotations_in_an_hour_are_the_bound_and_the_seventh_wall_is_waited_out	account-rotation-refines-model	
 tests/supervise_conformance_account_rotation.rs	the_defects_and_todays_rule_disagree_with_the_real_code	account-rotation-refines-model	
 tests/supervise_conformance_account_rotation.rs	the_first_turn_under_the_new_login_is_the_models_served_or_its_strike	account-rotation-refines-model	
-tests/supervise_conformance_account_rotation.rs	the_models_laws_are_read_at_every_state_that_shares_a_projection	account-rotation-refines-model	
 tests/supervise_conformance_account_rotation.rs	the_sessions_own_bounds_part_from_the_model_only_toward_todays_rule	account-rotation-refines-model	
 tests/supervise_conformance_account_rotation.rs	tier1_the_real_advice_and_transactions_are_the_models_at_every_reachable_state	account-rotation-refines-model	
-tests/supervise_conformance_codex_rate_nudge.rs	the_buggy_branches_and_a_forgetful_restart_are_not_the_real_deciders	codex-wind-down	
-tests/supervise_conformance_codex_rate_nudge.rs	tier1_the_real_deciders_switch_stop_save_restore_and_hold_exactly_where_the_model_does	codex-wind-down	
 tests/supervise_conformance_done_check.rs	tier1_the_real_decider_checks_a_done_report_and_leaves_a_done_task	turn-end-refines-SupervisorDoneCheck	
 tests/supervise_conformance_model_switch.rs	the_guessed_return_and_the_old_half_hour_disagree_with_the_real_code	model-switch-carry	
 tests/supervise_conformance_model_switch.rs	tier1_the_real_decider_switches_and_returns_exactly_where_the_model_allows	model-switch-carry	
 tests/supervise_conformance_network_wall.rs	the_buggy_model_disagrees_with_the_real_decider	turn-end-refines-SupervisorNetworkWall	
 tests/supervise_conformance_network_wall.rs	tier1_the_real_decider_types_into_a_network_wall_exactly_where_the_model_allows	turn-end-refines-SupervisorNetworkWall	
 tests/supervise_conformance_turn_end.rs	tier1_the_real_decider_types_exactly_where_the_model_allows	turn-end-refines-SupervisorTurnEnd	
-tests/supervise_conformance_usage_wall.rs	the_loop_blind_to_a_persons_turn_waits_over_it	turn-end-refines-SupervisorUsageWall	
-tests/supervise_conformance_usage_wall.rs	the_loop_blind_to_the_cancel_under_the_acts_answer_waits_on_nothing	turn-end-refines-SupervisorUsageWall	
-tests/supervise_conformance_usage_wall.rs	the_loop_that_folds_a_wall_only_at_a_point_waits_on_nothing_in_the_window	turn-end-refines-SupervisorUsageWall	
-tests/supervise_conformance_usage_wall.rs	the_loop_that_reads_a_cancel_only_as_its_own_acts_answer_misses_a_person_and_waits_a_day	turn-end-refines-SupervisorUsageWall	
-tests/supervise_conformance_usage_wall.rs	the_loop_that_reads_a_retrys_answer_as_its_taking_forgets_the_wall	turn-end-refines-SupervisorUsageWall	
-tests/supervise_conformance_usage_wall.rs	the_loop_that_reads_no_print_in_an_untaken_act_types_into_a_standing_wall	turn-end-refines-SupervisorUsageWall	
 tests/supervise_conformance_usage_wall.rs	the_loop_that_ties_no_continuation_to_its_limit_ends_the_wait_on_a_resume_at_an_armed_wall	turn-end-refines-SupervisorUsageWall	
-tests/supervise_conformance_usage_wall.rs	the_loop_that_ties_no_turn_to_its_limit_ends_the_wait_on_a_resumed_conversation	turn-end-refines-SupervisorUsageWall	
-tests/supervise_conformance_usage_wall.rs	the_masked_reader_and_the_buggy_model_disagree_with_the_real_code	turn-end-refines-SupervisorUsageWall	
 tests/supervise_conformance_usage_wall.rs	tier1_a_limit_met_inside_the_own_acts_take_window_is_tracked_where_the_model_says	turn-end-refines-SupervisorUsageWall	
 tests/supervise_conformance_usage_wall.rs	tier1_the_real_reader_and_decider_continue_a_usage_wall_exactly_where_the_model_allows	turn-end-refines-SupervisorUsageWall	
 tests/transcript_allocations.rs	transcript_readers_keep_allocation_proportional_to_input	§4	
 tests/vendor_corpus.rs	every_captured_permission_request_is_pressed_at_full_power	approval-full-power-presses-every-bash-box	
-tests/vendor_corpus.rs	the_corpus_is_not_empty_and_covers_the_events_that_decide	§4	
 tests/vendor_corpus.rs	the_painted_usage_panel_yields_its_windows	usage-panel-windows	
 ```
 
@@ -3587,16 +2819,16 @@ tests/vendor_corpus.rs	the_painted_usage_panel_yields_its_windows	usage-panel-wi
   - `src/supervise/autopilot_loop_tests.rs` (28)
   - `src/supervise/remembered_limit_tests.rs` (2)
   These six files need their own recovery pass before the crate's tests can all be retired.
-- Of the 2758 read: 2359 map to one of the 631 specs as primary; 363 map to the 80 pending chunk-6
+- Of the 2758 read: 2359 map to one of the 635 specs as primary; 363 map to the 80 pending chunk-6
   groups (§1b); 36 are in §4 (becomes-spec-after-fix: 4, delete: 15, move-to-bench: 14, re-check: 3).
-- The largest collapses (primary tests): `classify-sound` (40), `visit-shell-refines-pure-reducer` (28), `codex-wind-down` (28), `claude-home-resolution` (26), `left-limit-tracking` (25), `next-step-safety` (24), `codex-visit-exit-gate` (23), `question-answer-refines-model` (22).
+- The largest collapses (primary tests): `classify-sound` (40), `visit-shell-refines-pure-reducer` (28), `claude-home-resolution` (26), `left-limit-tracking` (25), `next-step-safety` (24), `codex-visit-exit-gate` (23), `question-answer-refines-model` (22).
 - Many loop-level specs (`no-act-without-ownership-proofs`, `visit-shell-refines-pure-reducer`,
   `codex-visit-exit-gate`, the reset and turn-end loop specs) retire dozens of end-to-end tests each, but only once
   their pure kernels below them are proved and gap 8 (effects) and gap 10 (model→code refinement) close.
 - Specs with an empty test count (for example `drive-supervise-opts-only-limit`, `prelex`, `numeric-format`)
   are implied by tests another spec retires; they are lemmas of those specs.
 
-### Gap histogram (audit §7 row → number of the 631 specs it blocks)
+### Gap histogram (audit §7 row → number of the 623 specs it blocks)
 
 Gap 0 (the 2026-09-17 seal) blocks every row. Specs blocked by gap 0 alone: `disk-age-days`, `model-ladder-monotone-bounded`.
 
@@ -3622,19 +2854,19 @@ Measured 2026-10-16 on seal `150efe4a`: gap 0 is closed, but neither of those tw
 
 | gap | specs blocked |
 |---|---|
-| 1 | 573 |
-| 2 | 205 |
-| 3 | 413 |
-| 4 | 91 |
+| 1 | 564 |
+| 2 | 200 |
+| 3 | 407 |
+| 4 | 95 |
 | 5 | 201 |
 | 6 | 3 |
-| 7 | 335 |
-| 8 | 261 |
-| 9 | 2 |
-| 10 | 89 |
+| 7 | 329 |
+| 8 | 254 |
+| 9 | 1 |
+| 10 | 87 |
 | 11 | 97 |
 | 12 | 108 |
-| 13 | 87 |
+| 13 | 83 |
 | 14 | 4 |
 | 16 | 1 |
 | 17 | 1 |
@@ -3645,72 +2877,43 @@ The chunk-6 groups are not in the histogram: their gaps were not delivered.
 
 Status 2026-10-16: deleted `federation_queue_is_bounded_and_backpressures_at_capacity`, `token_path_uses_the_shared_convention_not_a_stem_swap`, `a_fake_instance_stops_when_its_request_log_is_dropped`, `two_callers_of_one_tag_never_share_a_scratch_path`, `a_kinds_reason_takes_its_article` and `one_placed_reset_stamps_as_its_own_second_across_a_turning_second`; the other rows stand.
 
+Status 2026-10-17: the rows of those six are gone, and so is the **move-to-bench** row of `the_idle_wait_wakes_on_the_servers_verdict_not_on_every_repaint`, which the audit deleted as a timing-window test. The other rows stand.
+
 | test | why | action |
 |---|---|---|
-| `src/fleet_cli.rs::federation_queue_is_bounded_and_backpressures_at_capacity` | Samples std's sync_channel capacity through a one-line wrapper; no aterm property. | **delete** |
 | `src/harness/align_tests.rs::escaped_holder_stage` | Not a test: the fixture stage the escape test re-executes as its child. | **delete (move to a dev-only bin stage until align-capture-lifecycle-refines-model is certified)** |
-| `src/drive_cli.rs::token_path_uses_the_shared_convention_not_a_stem_swap` | Re-derives aterm_uds::token_path_for_sock from its own definition; a spec of aterm-uds. | **delete** |
-| `src/harness/cli_tests.rs::help_is_scoped_to_the_verb_named` | Prose pinning of the help constants; routing is cli-grammar. | **delete** |
-| `src/harness/disk_tests.rs::the_idle_window_defaults_to_one_day` | Pins DEFAULT_TARGET_STALE_DAYS; the comparison is disk-age-days. | **delete** |
-| `src/harness/mod.rs::a_fake_instance_stops_when_its_request_log_is_dropped` | Tests cfg(test) fake_instance support code with no production caller. | **delete** |
 | `src/harness/lights.rs::every_recorded_screen_reads_definitely_or_not_at_all` | Drift canary over a vendor fixture directory, not a universal property. | **move-to-bench** |
 | `src/harness/lights.rs::every_captured_footer_screen_of_every_build_is_read` | Vendor-build drift canary over claude-<v>-footer-*.txt. | **move-to-bench** |
 | `src/harness/footer_tests.rs::every_recorded_screen_has_a_rule_the_footer_can_write` | Corpus check over aterm-phase's fixtures; the general halves are footer-rule-run and footer-fit-rule-ladder. | **move-to-bench** |
 | `src/harness/upgrade_drive_tests.rs::park_when_asked` | Not a test: the parked stand-in agent's body, re-executed under PARK_ENV. | **move-to-bench** |
-| `src/harness/upgrade_status_tests.rs::a_held_back_agent_without_an_owner_name_reads_as_a_sentence` | Prose pinning of stall_reason sentences; covered by need-and-mark-text-bounds. | **delete** |
-| `src/lib.rs::the_crates_anchors_close_over_the_machines_they_bind` | Registry-closure meta-check over the spec-xref anchors; no production property. | **move-to-bench** |
-| `src/supervise/mod.rs::two_callers_of_one_tag_never_share_a_scratch_path` | Tests cfg(test) scratch-path support code. | **delete** |
-| `src/supervise/classify_tests.rs::a_zsh_walk_judges_every_name_once` | Tests cfg(test) zsh measurement helpers. | **delete** |
-| `src/supervise/classify_tests.rs::a_zsh_probe_killed_by_its_alarm_is_a_timeout` | Tests the cfg(test) zsh hang-detector runner, partly by timing. | **delete** |
-| `src/supervise/classify_tests.rs::zsh_arithmetic_vars_are_the_measured_ones` | Measures vendor zsh against a table (external oracle). | **move-to-bench** |
-| `src/supervise/classify_tests.rs::zsh_tied_arrays_are_the_measured_ones` | Measures vendor zsh against ZSH_TIED. | **move-to-bench** |
-| `src/supervise/classify_tests.rs::zsh_parameters_it_runs_are_the_measured_ones` | Sampled measurement of vendor zsh. | **move-to-bench** |
-| `src/supervise/classify_tests.rs::every_zsh_parameter_that_runs_a_value_is_measured` | #[ignore] full measurement of vendor zsh. | **move-to-bench** |
-| `src/supervise/classify_tests.rs::the_read_shims_skip_only_a_program_zsh_runs_unchanged` | Validates a test-only zsh snippet used by the bench. | **move-to-bench** |
-| `src/supervise/classify_tests.rs::reasons_name_the_deciding_rule` | Prose pinning of Verdict.reason; the safety property is read_only. | **delete** |
-| `src/supervise/ledger_tests.rs::the_text_form_reads_as_one_timeline` | Pins the exact text rendering. | **delete** |
-| `src/supervise/policy/approval_tests.rs::a_kinds_reason_takes_its_article` | Pins one sentence's article. | **delete** |
 | `src/supervise/policy/claude_settings_tests.rs::provider_home_stage` | Chunk 6 grouping marked it non-spec (a fixture stage); reason not delivered. | **re-check (chunk 6)** |
-| `src/supervise/policy/question_text_tests.rs::the_shipped_help_spells_the_session_words_the_parser_accepts` | Chunk 6 grouping marked it non-spec; reason not delivered. | **re-check (chunk 6)** |
-| `src/supervise/policy/turn_end_tests.rs::the_account_restarts_words` | Chunk 6 grouping marked it non-spec; reason not delivered. | **re-check (chunk 6)** |
 | `src/supervise/run_engine_tests.rs::park_as_worker` | Not a test: the StandIn subprocess body. | **move-to-bench** |
-| `src/supervise/run_engine_tests.rs::the_question_environment_names_the_machines_actions` | Consistency check of the test-only QUESTION_ENV against model action names. | **delete** |
-| `src/supervise/run_engine_tests.rs::the_idle_wait_wakes_on_the_servers_verdict_not_on_every_repaint` | Cost-ratio test; its structural claim is in wake-protocol. | **move-to-bench** |
 | `src/supervise/stall_tests.rs::the_frozen_mail_names_the_workers_own_conversation_or_the_hosts_relaunch` | Samples frozen-text but pins an unrunnable mail (`restart it: restart if-stalled`) when the loop has no sid. | **becomes-spec-after-fix** |
 | `src/supervise/run_tests.rs::a_span_is_read_once_and_the_continuations_back_off_ten_then_thirty` | Samples limit-episode but carries a 500 ms real-clock latency budget. | **becomes-spec-after-fix** |
 | `src/supervise/run_tests.rs::a_late_vendor_timer_takes_the_0_inside_the_landing_time_and_is_never_backspaced` | Outcome depends on real-time scale; restate on a clock model (survey-zero-timing). | **becomes-spec-after-fix** |
 | `src/supervise/run_tests.rs::a_refused_backspace_keeps_the_0_owed_until_the_server_takes_it` | Its busy-sink row is vacuous (OR'ed assertion); fix the row, then stray-digit-cleanup covers it. | **becomes-spec-after-fix** |
-| `src/supervise/turn_end_loop_tests.rs::one_placed_reset_stamps_as_its_own_second_across_a_turning_second` | Timing-dependent twin of a deterministic phase test. | **delete** |
-| `tests/vendor_corpus.rs::the_corpus_is_not_empty_and_covers_the_events_that_decide` | Checks the fixtures, not code. | **move-to-bench** |
 | `tests/transcript_allocations.rs::transcript_readers_keep_allocation_proportional_to_input` | Allocation-budget benchmark. | **move-to-bench** |
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
 1. Fixed 2026-10-16: `event_record`/`err_record` escape addressing fields as well as bodies; `federated_addresses_cannot_break_ndjson` covers peer-provided channel identities.
 2. `src/drive_cli.rs::a_listener_replaced_after_the_route_is_picked_is_sent_its_own_token`: the assert message names the token the route was picked by, but the asserted value is the successor's token.
-3. `src/drive_cli.rs::the_manager_is_the_inbox_else_this_terminals_session`: its second half computes the expected value from the same ATERM_PARENT_SESSION_ID the code reads (a tautology about the runner's environment).
 4. `src/drive_cli.rs::the_round_11_flags_belong_to_their_verbs`: the name is a review-round label, not a property; rename on migration.
 5. `src/harness/accounts_tests.rs::the_signed_out_labels_are_the_enrolled_ones_in_roster_order`: signed_out also excludes rows with an email; no test samples that clause.
 6. Several cli and disk tests date fixtures against the real wall clock (`now_after_write`, `idle_now`), contrary to the module docs' clock-independence claim.
 7. `src/harness/disk_target_tests.rs::a_lock_is_released_while_a_child_forked_under_it_has_yet_to_exec` spawns with a bare `std::process::Command` + `pre_exec`, bypassing `aterm_uds::spawnfd::command`; check it carries the sanctioned-use expect.
 8. `src/harness/footer_tests.rs::the_tail_takes_the_newest_main_thread_model_and_effort`: scan() decides effort from any non-sidechain row with an `effort` key, contradicting TailFacts::effort's doc; the fixture cannot tell which is intended.
-9. `src/harness/relaunch_tests.rs::a_cold_restore_yields_between_session_checks_but_live_relaunch_keeps_its_wait`: the name claims lock yielding; the body only pins held_wait constants (mislabelled).
 10. `src/harness/transcript_corpus_tests.rs::transcript_projections_answer_as_recorded`: its Err halves pin aterm_json's Display text (prose pinning).
 11. `src/harness/footer_tests.rs::tail_cache_reuses_only_one_process_and_one_unchanged_file` sleeps 20 ms with no effect on what is asserted; drop the sleep.
-12. `src/harness/upgrade_codex_tests.rs::the_notice_opens_with_its_head_and_never_asks_to_cancel` mostly pins the notice's prose; only the length bound and closing-word guard are a property.
 13. Chunk 3's manifest said 332 tests; the files hold 333 `#[test]` (305+9+3+5+11). The extra is `park_when_asked`, a stand-in process body.
 14. `src/harness/upgrade_drive_tests.rs::who_roster_exposes_a_unique_foreground_group_without_a_window_hop`: parse_host_roster never checks the `OK <n>` count against the rows.
-15. `src/harness/upgrade_drive_tests.rs::every_step_word_is_taught_and_an_untaught_one_is_looked_at_again` is the registry-plus-policing-test shape AGENTS.md rules out; the spec belongs on an enum of step families.
 16. `src/harness/upgrade_drive_tests.rs::the_notice_names_what_runs_under_the_agent_by_its_command` mixes the pure parse_etime/command_head contracts, the background walk and pinned gave_up_words prose.
 17. Many end-to-end upgrade_drive tests pin ledger prose as well as step words (e.g. a_drain_a_person_holds_past_its_bound_voids_the_answer_and_asks_again, a_visits_own_retarget_is_said_once_in_the_ledger); the spec is the step word and the row count.
 18. Tests calling `seed_builds` read the developer machine's installed Claude Code via atpkg, so their result varies by machine.
-19. `src/harness/upgrade_drive_tests.rs::a_typed_turn_returns_once_its_submit_is_taken_not_after_the_answer` compares wall-clock time against a two-minute stand-in; the spec is the request's idle=1 timeout=TURN_WAIT fields.
 20. `src/harness/upgrade_drive_tests.rs::the_real_classifier_conforms_to_the_upgrade_look_model`: the aterm-gui half of the bind fakes `due` from the model's `readable` bit, so the classifier rests on this test alone.
-21. `src/harness/upgrade_drive_tests.rs::a_restart_whose_agent_the_relaunch_sees_gone_says_when` only checks exited_at != 0, not that it is the seen-exit time or that nothing was typed.
 22. `src/harness/upgrade_drive_tests.rs::a_declining_agent_is_asked_a_bounded_number_of_times_a_day` claims a mutation-checked negative control that the test does not contain.
 23. `src/harness/upgrade_wake.rs::marker_wakes_a_parked_host_and_unrelated_writes_do_not`: its negative controls are timing-dependent (50 ms sleeps, 150 ms recv_timeout), against AGENTS.md's one-minute hang-detector rule.
 24. `src/harness/upgrade_wake.rs::{the_trigger_ends_a_parked_wait_at_once,first_install_rechecks_a_missing_path_after_a_lost_ancestor_notification,an_exit_is_seen_as_it_happens}` tell a push from the fallback by elapsed-time ratios.
-25. `src/harness/upgrade_models.rs::the_model_ladder_always_lands` asserts a tautology about a test-local closure (`old_rule`); only the truth table and monotonicity sweep sample the code.
 26. `src/harness/upgrade_tests.rs::a_line_the_tty_could_cut_is_refused` asserts two definitional equalities (MAX_LINE and HOST).
 27. `src/harness/upgrade_tests.rs::every_short_argv_resumes_with_exactly_the_values_claude_parsed`: the oracle is a test-only transcription of Commander 2.1.281; it must become the Clean reference model and nothing ties it to the shipping bundle.
 28. `src/harness/upgrade_status_tests.rs::a_token_word_reads_as_the_cut_reads_it`: the oracle is a copy of word()'s own slow path.
@@ -3718,40 +2921,32 @@ Status 2026-10-16: deleted `federation_queue_is_bounded_and_backpressures_at_cap
 30. `src/harness/upgrade_status_tests.rs::the_awake_clock_is_the_machines_last_wake_or_boot` reads the live machine and partly tests a cfg(test) seam.
 31. The `baked` fixture in upgrade_models.rs sets native_1m for every model, so model_of_display's [1m]-append branch is never sampled.
 32. `src/harness/upgrade_queued_tests.rs` fixture `limit_row` uses max(1791046800, now+86400), so the exercised case changes once the real date passes the recorded reset.
-33. `src/supervise/codex_usage.rs::the_incidents_readings_read_near_then_far`: the comments say a passed reset reads far, but the asserted case is Unknown because the reading is stale; the reset-passed branch is only the separate just_reset struct.
-34. `src/supervise/answer.rs::the_box_token_names_one_screen` asserts pairwise distinctness of a 32-bit folded hash, which is not a universal property; the spec claims only determinism.
-35. `src/supervise/config.rs::a_value_it_cannot_read_keeps_its_default_and_only_an_off_limits`: `"off"` for continue_per_hour and human_grace_s changes nothing, contradicting the doc's 'an off is still the limit'; state the numeric-key exemption or fix the code.
-36. `src/lib.rs::skipping_the_discarded_await_match_reply_desyncs_the_stream` calls private functions in a deliberately buggy order; it samples only reply-count-grammar.
-37. `src/supervise/limit.rs::the_local_zone_is_read_from_date` depends on the runner's zone and duplicates the parse_zone table.
-38. `src/supervise/ledger_tests.rs::without_a_clock_*` (two tests) are near-duplicates over the same branch.
-39. `src/supervise/policy/approval_tests.rs::the_measured_tall_box_has_no_note_and_none_is_invented` largely duplicates a_tall_box_with_no_removal_note_is_never_declined.
-40. `src/supervise/approvals.rs::a_row_carries_the_hash_of_the_whole_command_and_a_cut_copy` includes a sha256("abc") known-vector check of the sha2 dependency.
-41. `src/supervise/ledger_html.rs` and the HTML ledger test rely on cfg(test) checkers (is_self_contained, well_formed); the spec they imply is checked only by test code.
-42. Chunk 6 (`src/supervise/policy/*`, 366 tests: turn_end_tests 212, rm_breaker_tests 47, git_config_tests 27, question_tests 23, claude_settings_tests 16, question_text_tests 12, shell_startup_tests 10, exception_tests 8, guard.rs 6, reset.rs 3, outlook_tests 2) returned no specs. Its 80 test groups are listed as `pending` rows; their statements, functions and gaps must be recovered again.
-43. `src/supervise/reset_loop_tests.rs` (whole file): every screen is composed from the 2.1.287 bundle's text; nothing has been seen live, so the reset specs pin a reading of the bundle.
-44. Many reset_loop tests name a 'NEGATIVE CONTROL (seen by mutation)' that is not executed (e.g. the_rows_approval_is_not_counted_against_the_wait_row, a_pending_line_that_repaints_is_still_the_steps_to_read, a_halted_session_is_asked_no_claim); each mutant must be checked against the spec explicitly.
-45. `src/supervise/reset_loop_tests.rs::a_deadline_is_placed_in_the_wall_notices_zone_where_the_loop_holds_one`: without a lookup, a January date gets September's PDT offset (16:30Z instead of 17:30Z); documented as intended but wrong about wall-clock reality.
-46. `src/supervise/run_question_text_tests.rs::the_enter_on_a_read_back_text_costs_status_meta_and_the_key` is named and printed as a latency test but pins an exact request sequence.
-47. `src/supervise/run_engine_tests.rs::a_read_box_under_a_ticking_screen_is_approved_within_one_wake` claims latency but asserts an exact ten-request trace.
-48. Several run_box_key tests replay scripts the tier1 bind already walks; they add only badge/escalated/cleared counts.
-49. The reset successor tests assert ≥ 1 s real-time graces; not flaky, but tie the spec to real sleeps instead of an injected clock.
-50. `src/supervise/run_engine_tests.rs::a_question_asked_a_third_time_is_answered_again_after_a_pause` mixes a loop scenario with a pure reask_pause check that belongs on doubling-backoff.
-51. `src/supervise/stall.rs::frozen_mail_text` with sid=None names `restart [pid=N ]if-stalled` without `aterm ctl`, an unrunnable command; the warning text uses `<sid>` instead.
-52. `src/supervise/stall.rs::rss_text` computes `(mb*10+512)/1024` on a server-supplied u64: it overflows for huge mb; a no-panic spec fails until it saturates or widens.
-53. `src/supervise/run_tests.rs::guard_errors_are_retried_or_surfaced_never_approved`: `(2..=4).contains(&presses)` under a 1.2 s budget is timing-dependent; so are the survey settle/landing tests.
-54. `src/supervise/run_tests.rs::a_box_the_loop_does_not_approve_is_escalated_once_and_cleared_when_it_goes` says the badge is read before unset; a_standing_approval_attention_survives_the_episode_close asserts nothing is read first; the first doc looks stale.
-55. `src/supervise/stall_tests.rs::a_host_that_does_not_measure_input_sees_the_requests_it_always_saw` pins the full trace (citing an unnamed 'FIX 3'); the spec is weaker (≤ one extra status).
-56. `src/supervise/transport.rs::the_interrupter_ends_a_parked_request` builds its socket dir from temp_dir()+pid instead of the crate's ScratchDir and leaks it on failure.
-57. Chunk 9's manifest said 270 tests; its 22 files hold 278 (`tests/agent_suite.rs` holds none: its one match is in a //! comment).
-58. `src/supervise/turn_end_loop_tests.rs::a_sessions_jitter_is_stable_bounded_and_spread`: the 'spread over ≥ 8 seconds' assertions sample FNV dispersion, not the function's spec.
-59. `src/supervise/turn_end_loop_tests.rs::a_default_prose_answer_is_mains_requests_and_one_meta` pins a literal request list; the spec is one bare meta before the status.
-60. `src/supervise/turn_end_loop_tests.rs::{the_inline_renderer_is_never_probed,a_draft_a_shell_and_a_missed_guard_type_nothing}` have no negative control of their own, contrary to the file header.
-61. Many turn_end_loop tests assert exact journal/badge strings; that prose goes when the spec replaces them.
-62. `tests/transcript_allocations.rs`: named proportional, mostly asserts absolute caps.
-63. `tests/remote_turn_loopback_tls.rs` claims byte identity with a local turn but checks only the returned screen.
-64. `tests/conformance_footer_model.rs` walks only states within 5 actions of the start; the spec is over all of them.
-65. Conformance negative-control tests (Buggy knobs, old-reader reconstructions) stay under their refinement spec as its mutation control, not as specs.
-66. `src/supervise/turn_end_loop_tests.rs::tier1_the_real_loop_remembers_a_hidden_wall_exactly_where_the_model_does` is a Tier-1 bind living in the unit-test file instead of tests/.
+33. `src/supervise/answer.rs::the_box_token_names_one_screen` asserts pairwise distinctness of a 32-bit folded hash, which is not a universal property; the spec claims only determinism.
+34. `src/supervise/config.rs::a_value_it_cannot_read_keeps_its_default_and_only_an_off_limits`: `"off"` for continue_per_hour and human_grace_s changes nothing, contradicting the doc's 'an off is still the limit'; state the numeric-key exemption or fix the code.
+36. `src/supervise/limit.rs::the_local_zone_is_read_from_date` depends on the runner's zone and duplicates the parse_zone table.
+37. `src/supervise/ledger_tests.rs::without_a_clock_*` (two tests) are near-duplicates over the same branch.
+39. `src/supervise/approvals.rs::a_row_carries_the_hash_of_the_whole_command_and_a_cut_copy` includes a sha256("abc") known-vector check of the sha2 dependency.
+40. `src/supervise/ledger_html.rs` and the HTML ledger test rely on cfg(test) checkers (is_self_contained, well_formed); the spec they imply is checked only by test code.
+41. Chunk 6 (`src/supervise/policy/*`, 366 tests: turn_end_tests 212, rm_breaker_tests 47, git_config_tests 27, question_tests 23, claude_settings_tests 16, question_text_tests 12, shell_startup_tests 10, exception_tests 8, guard.rs 6, reset.rs 3, outlook_tests 2) returned no specs. Its 80 test groups are listed as `pending` rows; their statements, functions and gaps must be recovered again.
+42. `src/supervise/reset_loop_tests.rs` (whole file): every screen is composed from the 2.1.287 bundle's text; nothing has been seen live, so the reset specs pin a reading of the bundle.
+43. Many reset_loop tests name a 'NEGATIVE CONTROL (seen by mutation)' that is not executed; each mutant must be checked against the spec explicitly.
+44. `src/supervise/reset_loop_tests.rs::a_deadline_is_placed_in_the_wall_notices_zone_where_the_loop_holds_one`: without a lookup, a January date gets September's PDT offset (16:30Z instead of 17:30Z); documented as intended but wrong about wall-clock reality.
+46. `src/supervise/run_engine_tests.rs::a_read_box_under_a_ticking_screen_is_approved_within_one_wake` claims latency but asserts an exact ten-request trace.
+47. Several run_box_key tests replay scripts the tier1 bind already walks; they add only badge/escalated/cleared counts.
+48. The reset successor tests assert ≥ 1 s real-time graces; not flaky, but tie the spec to real sleeps instead of an injected clock.
+49. `src/supervise/run_engine_tests.rs::a_question_asked_a_third_time_is_answered_again_after_a_pause` mixes a loop scenario with a pure reask_pause check that belongs on doubling-backoff.
+50. `src/supervise/stall.rs::frozen_mail_text` with sid=None names `restart [pid=N ]if-stalled` without `aterm ctl`, an unrunnable command; the warning text uses `<sid>` instead.
+51. `src/supervise/stall.rs::rss_text` computes `(mb*10+512)/1024` on a server-supplied u64: it overflows for huge mb; a no-panic spec fails until it saturates or widens.
+52. `src/supervise/run_tests.rs::guard_errors_are_retried_or_surfaced_never_approved`: `(2..=4).contains(&presses)` under a 1.2 s budget is timing-dependent; so are the survey settle/landing tests.
+53. `src/supervise/run_tests.rs::a_box_the_loop_does_not_approve_is_escalated_once_and_cleared_when_it_goes` says the badge is read before unset; a_standing_approval_attention_survives_the_episode_close asserts nothing is read first; the first doc looks stale.
+55. `src/supervise/transport.rs::the_interrupter_ends_a_parked_request` builds its socket dir from temp_dir()+pid instead of the crate's ScratchDir and leaks it on failure.
+56. Chunk 9's manifest said 270 tests; its 22 files hold 278 (`tests/agent_suite.rs` holds none: its one match is in a //! comment).
+57. `src/supervise/turn_end_loop_tests.rs::a_sessions_jitter_is_stable_bounded_and_spread`: the 'spread over ≥ 8 seconds' assertions sample FNV dispersion, not the function's spec.
+60. Many turn_end_loop tests assert exact journal/badge strings; that prose goes when the spec replaces them.
+61. `tests/transcript_allocations.rs`: named proportional, mostly asserts absolute caps.
+63. `tests/conformance_footer_model.rs` walks only states within 5 actions of the start; the spec is over all of them.
+64. Conformance negative-control tests (Buggy knobs, old-reader reconstructions) stay under their refinement spec as its mutation control, not as specs.
+65. `src/supervise/turn_end_loop_tests.rs::tier1_the_real_loop_remembers_a_hidden_wall_exactly_where_the_model_does` is a Tier-1 bind living in the unit-test file instead of tests/.
 
 ## 6. Proof order (easiest high-value first)
 
@@ -3769,7 +2964,7 @@ Status 2026-10-16: deleted `federation_queue_is_bounded_and_backpressures_at_cap
    `footer-floor-of`, `relaunch-held-wait-table`. Saturating `i64`/`u64` arithmetic with small array indexes;
    together they decide when an account is limited, low or due a probe, which the advice specs rest on.
 4. **Finite tables decidable by evaluation (gap 1)**: `acc-words-table`, `acc-wakes-table`, `disk-class-table`,
-   `disk-free-warn`, `fleet-operator-args`. Each is an enum ↔ word table; once enum/`&str` carriers land
+   `disk-free-warn`. Each is an enum ↔ word table; once enum/`&str` carriers land
    (gap 1) they are discharged by enumeration.
 5. **Small state machines (gaps 2, 3)**: `lights-state-and-fold`, `tap-freshness`, `netstate-schedule`,
    `netstate-reach-freshness`, `tap-silence-machine`. `&mut self` on small structs with `Instant`/`u64`
@@ -3778,7 +2973,7 @@ Status 2026-10-16: deleted `federation_queue_is_bounded_and_backpressures_at_cap
    `memory-ceiling-formula`, `memory-ceiling-order`, `acc-condition-table`, `acc-advise-rule1-guards`,
    `step-word-classification`, `held-by-status`. Short pure functions over strings and enums, each the lemma
    under many end-to-end tests.
-7. **Then the refinements whose models already exist (gaps 3, 10)**: `codex-daemon-step-refines-model`,
+7. **Then the refinements whose models already exist (gaps 3, 10)**:
    `upgrade-model-ladder-refines-model`, `reducer-refines-drain-bound-model`, `reducer-refines-work-end-model`.
    Pure reducers bound to `ty_model!` machines; the conformance tests are already the projection.
 
@@ -3788,59 +2983,59 @@ the turn-end, rm-breaker and git-read specs in §1 and are likely high value.
 ### 6.3 Everything else, by blocking-gap set (fewest first)
 
 - **0 only** (2): `disk-age-days`, `model-ladder-monotone-bounded`
-- **1** (5): `fleet-operator-args`, `acc-words-table`, `acc-wakes-table`, `disk-free-warn`, `disk-class-table`
-- **3** (5): `acc-wall-stands-until`, `acc-sample-windows`, `acc-probe-interval`, `footer-floor-of`, `relaunch-held-wait-table`
-- **8** (7): `drive-sibling-ctl`, `open-regular-nonblocking`, `kernel-start-spelling`, `codex-daemon-verb-environment`, `awake-clock-probe`, `queue-lock-and-epoch-fence`, `queue-fs-hardening`
+- **1** (4): `acc-words-table`, `acc-wakes-table`, `disk-free-warn`, `disk-class-table`
+- **3** (6): `acc-wall-stands-until`, `acc-sample-windows`, `acc-probe-interval`, `footer-floor-of`, `relaunch-held-wait-table`, `harness-timings-orders`
+- **8** (7): `drive-own-ctl`, `open-regular-nonblocking`, `kernel-start-spelling`, `awake-clock-probe`, `queue-lock-and-epoch-fence`, `queue-fs-hardening`, `upgrade-dry-run-no-hands`
 - **1,2** (4): `fleet-federated-sid`, `acc-probe-claim-spacing`, `acc-canary-hold-take`, `screen-cursor-index`
-- **1,3** (37): `drive-supervise-opts-only-limit`, `fleet-dispatch-argv`, `acc-condition-table`, `acc-advise-rule1-guards`, `acc-advise-resume`, `acc-judged-and-footer-label`, `cli-parse-defer`, `disk-human-bytes`, `relaunch-resumed-prompt-one-line`, `relaunch-quiet-outcome`, `relaunch-account-login`, `relaunch-cause-classes`, `relaunch-carried-word`, `usage-tokens-short`, `codex-daemon-files`, `move-why-from-ids`, `ride-bar`, `live-model-at-launch-until-answer`, `session-file-parse`, `quiet-step-contract`, `harness-prompts-shape`, `owner-words-roundtrip`, `wait-class-total-and-stable`, `row-of-record`, `person-hold-footer-note`, `proc-stat-exited`, `json-number-readers`, `usage-view-shown`, `ctl-failure-words`, `ladder-clamp`, `doubling-backoff`, `ledger-clock-words`, `memory-ceiling-formula`, `memory-ceiling-order`, `approval-breaker-naming`, `transcript-confirms-class`, `transcript-lagging`
+- **1,3** (36): `drive-supervise-opts-only-limit`, `fleet-dispatch-argv`, `acc-condition-table`, `acc-advise-rule1-guards`, `acc-advise-resume`, `acc-judged-and-footer-label`, `cli-parse-defer`, `disk-human-bytes`, `relaunch-resumed-prompt-one-line`, `relaunch-quiet-outcome`, `relaunch-account-login`, `relaunch-cause-classes`, `relaunch-carried-word`, `usage-tokens-short`, `move-why-from-ids`, `ride-bar`, `live-model-at-launch-until-answer`, `session-file-parse`, `quiet-step-contract`, `harness-prompts-shape`, `owner-words-roundtrip`, `wait-class-total-and-stable`, `row-of-record`, `person-hold-footer-note`, `proc-stat-exited`, `json-number-readers`, `usage-view-shown`, `ctl-failure-words`, `ladder-clamp`, `doubling-backoff`, `ledger-clock-words`, `memory-ceiling-formula`, `memory-ceiling-order`, `approval-breaker-naming`, `transcript-confirms-class`, `transcript-lagging`
 - **1,4** (1): `continuation-words-and-mode`
 - **1,5** (1): `ledger-html-assets`
 - **1,7** (2): `acc-label-grammar`, `acc-row-for-login-exact`
-- **1,8** (14): `acc-roster-file-read`, `acc-enrolled`, `acc-store-load-save`, `acc-profile-configs-dir`, `acc-roster-beside`, `cli-upgrade-sweep-gates`, `restart-stamp-file`, `restart-stamp-lookup-prune`, `restart-stamp-consume`, `tap-verb-total`, `tap-read-own`, `forget-settled-pending`, `ready-consent`, `config-from-path-and-hosted`
+- **1,8** (15): `acc-roster-file-read`, `acc-enrolled`, `acc-store-load-save`, `acc-profile-configs-dir`, `acc-roster-beside`, `cli-upgrade-sweep-gates`, `restart-stamp-file`, `restart-stamp-lookup-prune`, `restart-stamp-consume`, `tap-verb-total`, `tap-read-own`, `forget-settled-pending`, `ready-consent`, `config-from-path-and-hosted`, `relay-read-only-connection`
 - **2,3** (2): `lights-state-and-fold`, `tap-freshness`
+- **2,4** (1): `self-claimed-relaunch-route`
 - **2,11** (1): `moved-rule`
 - **3,7** (1): `lights-mode-pill-table`
 - **3,8** (2): `job-classification`, `relaunch-by-parent`
-- **3,10** (2): `codex-daemon-step-refines-model`, `upgrade-model-ladder-refines-model`
+- **3,10** (1): `upgrade-model-ladder-refines-model`
 - **3,12** (1): `lanes-table`
-- **4,8** (1): `codex-due-short-circuit`
 - **7,8** (2): `disk-tree-nofollow`, `disk-target-reclaim-only-incremental`
-- **8,13** (13): `fleet-stream-child-cleanup`, `align-capture-bounded`, `acc-store-lock`, `cli-login-runners`, `disk-target-reclaim-locking`, `disk-target-reclaim-lru-whole`, `disk-whole-guards-at-removal`, `restart-stamp-take-if`, `sweep-lock-exclusive`, `wait-exit`, `queue-concurrency`, `bounded-child-output`, `relay-interrupter`
+- **8,13** (13): `fleet-stream-child-cleanup`, `align-capture-bounded`, `acc-store-lock`, `cli-login-runners`, `disk-target-reclaim-locking`, `disk-target-reclaim-lru-whole`, `disk-whole-guards-at-removal`, `restart-stamp-take-if`, `sweep-lock-exclusive`, `wait-exit`, `bounded-child-output`, `relay-interrupter`, `ready-fd-signal`
 - **1,2,3** (12): `fleet-list-diagnostics-automaton`, `acc-note-wall-episode`, `acc-pin-unpin`, `acc-note-observations`, `acc-note-reading-max`, `acc-reset-claim`, `settle-ask-takeback`, `release-ownership`, `retarget-in-place`, `served-at`, `last-model`, `governor-token-bucket`
 - **1,2,5** (2): `netstate-leases-bounded`, `session-roster-cache`
-- **1,2,8** (9): `acc-record-gone`, `acc-drop-stale-sessions`, `footer-path-branch-follow`, `goal-hold-record-roundtrip`, `goal-hold-one-owner`, `usage-read-cost`, `left-typed-never-erased`, `queue-manage-with-baseline-atomic`, `usage-probe-memory-neutral`
+- **1,2,8** (7): `acc-record-gone`, `acc-drop-stale-sessions`, `footer-path-branch-follow`, `usage-read-cost`, `left-typed-never-erased`, `queue-manage-with-baseline-atomic`, `usage-probe-memory-neutral`
 - **1,3,4** (4): `drive-classify-verb`, `acc-advise-rule2-follow-and-canary`, `acc-advise-rule4-early`, `tap-gate`
 - **1,3,5** (16): `relaunch-cold-login`, `step-word-classification`, `turn-end-ownership`, `release-is-next`, `model-due-rule`, `next-step-safety`, `deadline-totality`, `attention-horizons`, `interrupt-only-for-an-ended-agent`, `aterms-own-fault`, `stall-mark-and-remedy`, `claim-verb-classes`, `zsh-hazard-tables`, `config-retired-and-agent-keys`, `mode-word-parsers`, `approval-footer-mode`
 - **1,3,6** (1): `wait-text-format`
-- **1,3,7** (70): `drive-parse-sub-positionals`, `drive-top-parse-help-routing`, `drive-phase-reply`, `acc-stamp-cap`, `acc-signed-out-list`, `acc-next-usable-opening-hold`, `acc-rotation-breaker`, `acc-reset-allowed`, `cli-grammar`, `cli-upgrade-lines`, `disk-report-json-headline`, `disk-parse-df`, `footer-model-display`, `footer-model-name`, `footer-project-slug`, `footer-branch-of-head`, `footer-home-and-elide-path`, `footer-segments-order`, `footer-set-facts-typesetting`, `truncate-bytes`, `one-line-shortcut-equivalence`, `netwatch-route-of`, `relaunch-program-identity`, `relaunch-one-shot`, `relaunch-target-build`, `relaunch-permission-mode`, `relaunch-line-drop-order`, `tap-value-ours`, `catalog-parse-window`, `catalog-twin-binary`, `codex-rewrite-argv`, `codex-is-tui-argv`, `codex-thread-ids`, `codex-exit-hint`, `codex-rollout-ready`, `codex-notice-text`, `pick-tab-word`, `model-family-version`, `model-availability-decision`, `claude-json-model-facts-only`, `live-model-reader`, `family-successor-newest-strictly-newer`, `offered-set-and-list-target`, `model-record-roundtrip`, `hand-chosen-model`, `user-model-settings-parse`, `version-order`, `choose-target-newest-managed-tie`, `launch-model-and-resume-by-the-rewrites-parse`, `running-clause-held-list`, `composer-empty`, `upgrade-clocks`, `model-outcome-reader`, `transcript-tasked`, `notice-fate-and-queue`, `reset-dialog-line`, `status-line-and-json-fields`, `need-and-mark-text-bounds`, `working-time-union`, `limit-notice-rows`, `hud-line`, `usage-json-schema-1`, `queue-codec-round-trip`, `strip-quotes-shape`, `approval-decline-text`, `stall-status-read`, `line-clip-and-exit-reason`, `story-of`, `resume-jitter`, `transcript-ends-on`
+- **1,3,7** (67): `drive-parse-sub-positionals`, `drive-top-parse-help-routing`, `drive-phase-reply`, `acc-stamp-cap`, `acc-signed-out-list`, `acc-next-usable-opening-hold`, `acc-rotation-breaker`, `acc-reset-allowed`, `cli-grammar`, `cli-upgrade-lines`, `disk-report-json-headline`, `disk-parse-df`, `footer-model-display`, `footer-model-name`, `footer-project-slug`, `footer-branch-of-head`, `footer-home-and-elide-path`, `footer-segments-order`, `footer-set-facts-typesetting`, `truncate-bytes`, `one-line-shortcut-equivalence`, `netwatch-route-of`, `relaunch-program-identity`, `relaunch-one-shot`, `relaunch-target-build`, `relaunch-permission-mode`, `relaunch-line-drop-order`, `tap-value-ours`, `catalog-parse-window`, `catalog-twin-binary`, `codex-rewrite-argv`, `codex-is-tui-argv`, `codex-thread-ids`, `pick-tab-word`, `model-family-version`, `model-availability-decision`, `claude-json-model-facts-only`, `live-model-reader`, `family-successor-newest-strictly-newer`, `offered-set-and-list-target`, `model-record-roundtrip`, `hand-chosen-model`, `user-model-settings-parse`, `version-order`, `choose-target-newest-managed-tie`, `launch-model-and-resume-by-the-rewrites-parse`, `running-clause-held-list`, `composer-empty`, `upgrade-clocks`, `model-outcome-reader`, `transcript-tasked`, `notice-fate-and-queue`, `reset-dialog-line`, `status-line-and-json-fields`, `need-and-mark-text-bounds`, `working-time-union`, `limit-notice-rows`, `hud-line`, `usage-json-schema-1`, `queue-codec-round-trip`, `strip-quotes-shape`, `approval-decline-text`, `stall-status-read`, `line-clip-and-exit-reason`, `story-of`, `resume-jitter`, `transcript-ends-on`
 - **1,3,8** (4): `drive-task-report-opts`, `drive-dial-guard`, `row-vetting`, `clock-unix-roundtrip`
-- **1,3,10** (1): `codex-next-step-gate`
-- **1,3,12** (14): `fleet-records-format`, `acc-state-unread-classification`, `acc-process-login-only-weakens`, `footer-lstart-utc`, `footer-card-fill`, `lights-read-screen`, `netwatch-settings-of`, `transcript-conversation-quota`, `catalog-build-facts-roundtrip`, `codex-composer-reader`, `codex-limited-fact`, `screen-limit-recogniser`, `relay-reply-classification`, `memory-fact-banner`
+- **1,3,12** (12): `fleet-records-format`, `acc-state-unread-classification`, `acc-process-login-only-weakens`, `footer-lstart-utc`, `footer-card-fill`, `lights-read-screen`, `netwatch-settings-of`, `transcript-conversation-quota`, `catalog-build-facts-roundtrip`, `screen-limit-recogniser`, `relay-reply-classification`, `memory-fact-banner`
 - **1,3,13** (4): `drive-endpoint-route`, `cli-auth-check-env`, `claude-dir-of`, `resume-never-cut`
 - **1,4,5** (1): `model-way-back`
-- **1,4,8** (11): `cli-usage-account-attribution`, `cli-disk-verb-report`, `cli-accounts-add`, `cli-login-secrecy`, `cli-accounts-use`, `cli-accounts-schema-refusal`, `codex-candidate-and-due`, `relaunch-line-dialect-and-rekey`, `carry-restart-outcome`, `restart-carries-login-and-tap`, `quiet-flow`
+- **1,4,8** (10): `cli-usage-account-attribution`, `cli-disk-verb-report`, `cli-accounts-add`, `cli-login-secrecy`, `cli-accounts-use`, `cli-accounts-schema-refusal`, `relaunch-line-dialect-and-rekey`, `carry-restart-outcome`, `restart-carries-login-and-tap`, `quiet-flow`
 - **1,4,11** (1): `cli-limits-read-once`
-- **1,5,7** (2): `footer-rule-run`, `codex-background-terminals`
+- **1,5,7** (1): `footer-rule-run`
 - **1,7,8** (14): `drive-journal-sid`, `acc-ledger-file`, `cli-usage-transcript-pick`, `cli-ledger-verb`, `disk-discover-roots`, `disk-discover-xpy-rule`, `disk-discover-budget-and-confinement`, `footer-rows-back-window-invariance`, `footer-git-head-resolution`, `footer-shell-cwds`, `tap-sweep`, `session-roster-integrity`, `wait-log-ledger-and-prune-bounds`, `footer-window-allocation`
 - **1,7,12** (2): `fleet-json-escape`, `cli-harness-switch-misplaced-off`
 - **1,8,11** (2): `drive-prompt-cut-is-75`, `cli-retired-verbs`
-- **1,8,13** (5): `cli-disk-write-ahead-journal`, `cli-upgrade-owner-status`, `disk-session-gone`, `goal-hold-box-is-upgrades`, `relaunch-ended-verdict`
+- **1,8,13** (4): `cli-disk-write-ahead-journal`, `cli-upgrade-owner-status`, `disk-session-gone`, `relaunch-ended-verdict`
 - **1,8,16** (1): `tap-noninterference`
 - **2,3,5** (3): `netstate-schedule`, `netstate-reach-freshness`, `tap-silence-machine`
-- **2,3,13** (2): `unwatched-predicate`, `queue-clock-monotone`
-- **2,8,13** (2): `queue-poison-fail-closed`, `relay-connection`
+- **2,3,13** (1): `unwatched-predicate`
+- **2,4,7** (2): `beside-memory-remedy`, `beside-remedies-under-hold`
+- **2,8,13** (1): `relay-connection`
 - **3,5,12** (1): `rfc3339-utc-civil`
 - **8,10,13** (1): `align-capture-lifecycle-refines-model`
 - **8,13,17** (1): `bounded-child-probe`
 - **1,2,3,4** (3): `acc-begin-rotation-cas`, `acc-strike-undo-exact`, `memory-judgement`
 - **1,2,3,5** (4): `owner-word-survives-restart`, `progress-stamp-single-writer`, `own-work-news`, `config-power-lattice`
-- **1,2,3,7** (4): `acc-reset-outcome`, `transcript-fold-bounds`, `queue-fair-claim-and-extension`, `ctl-reply-readers`
+- **1,2,3,7** (3): `acc-reset-outcome`, `transcript-fold-bounds`, `ctl-reply-readers`
 - **1,2,3,8** (2): `aside-precedence`, `owner-word-ask`
 - **1,2,4,8** (4): `announce-preflight`, `drain-void`, `failed-start-gate`, `model-ask-ledger`
 - **1,2,5,8** (1): `login-wall-spends-nothing`
 - **1,2,7,8** (2): `usage-moved`, `task-detection-and-fresh-restart`
 - **1,2,7,11** (1): `supervise-result-and-log-split`
-- **1,2,8,10** (7): `codex-wall-visit`, `codex-typed-under-hand`, `codex-relaunch-own-thread`, `codex-owner-word`, `codex-round-lifecycle`, `codex-restart-record-closure`, `codex-exit-witness-refines-model`
+- **1,2,8,10** (1): `codex-restart-record-closure`
 - **1,2,8,11** (3): `fleet-line-bound`, `relay-framing-one-line`, `exception-lifecycle`
 - **1,2,8,12** (1): `relaunch-snapshot-follow`
 - **1,2,8,13** (4): `hand-lease-bracket`, `in-flight-orphan-pass`, `activation-wake`, `stop-and-handover`
@@ -3848,21 +3043,19 @@ the turn-end, rm-breaker and git-read specs in §1 and are likely high value.
 - **1,3,4,5** (1): `acc-advise-past-probe`
 - **1,3,4,7** (3): `relaunch-promise-iff-plan`, `resume-command-flags`, `frozen-text`
 - **1,3,4,8** (1): `pressed-text-delivery`
-- **1,3,4,12** (3): `approval-trust-dialog`, `approval-not-a-box`, `approval-rate-nudge`
+- **1,3,4,12** (2): `approval-trust-dialog`, `approval-not-a-box`
 - **1,3,5,6** (1): `retarget-arms`
-- **1,3,5,7** (40): `drive-flag-ownership`, `footer-launch-facts`, `relaunch-line-env-quoting`, `usage-text-and-model-naming`, `codex-spawn-tree-and-placement`, `held-by-status`, `host-roster-parse`, `etime-and-command-head`, `terminal-owner`, `login-wall-reader`, `priority-list-roundtrip`, `ready-answer-reader`, `next-change-complete`, `resume-command-inverts-relaunch-line`, `reply-count-grammar`, `blocks-views`, `glob-match-fnmatch`, `python-allowlist`, `split-segments`, `program-words`, `prelex`, `sed-script-and-alarm-idiom`, `numeric-format`, `codex-sandbox-fall`, `config-line-reader-agrees`, `journal-line-grammar-and-json`, `ledger-since`, `ledger-render-escapes`, `limit-zone-and-reset-grammar`, `mail-row-and-principal`, `approval-roots`, `report-mark-roundtrip`, `report-find-start`, `report-finish-assess`, `report-render`, `session-group`, `human-input-stamp`, `reply-wait`, `composer-guard`, `approval-full-power-presses-every-bash-box`
-- **1,3,5,8** (1): `codex-own-thread`
+- **1,3,5,7** (38): `drive-flag-ownership`, `footer-launch-facts`, `relaunch-line-env-quoting`, `usage-text-and-model-naming`, `held-by-status`, `host-roster-parse`, `etime-and-command-head`, `terminal-owner`, `login-wall-reader`, `priority-list-roundtrip`, `ready-answer-reader`, `next-change-complete`, `resume-command-inverts-relaunch-line`, `reply-count-grammar`, `blocks-views`, `glob-match-fnmatch`, `python-allowlist`, `split-segments`, `program-words`, `prelex`, `sed-script-and-alarm-idiom`, `numeric-format`, `config-line-reader-agrees`, `journal-line-grammar-and-json`, `ledger-since`, `ledger-render-escapes`, `limit-zone-and-reset-grammar`, `mail-row-and-principal`, `approval-roots`, `report-mark-roundtrip`, `report-find-start`, `report-finish-assess`, `report-render`, `session-group`, `human-input-stamp`, `reply-wait`, `composer-guard`, `approval-full-power-presses-every-bash-box`
 - **1,3,5,10** (4): `reducer-refines-drain-bound-model`, `reducer-refines-work-end-model`, `reducer-refines-progress-machine`, `classifier-refines-progress-machine`
 - **1,3,5,12** (6): `footer-session-entry-parse`, `tap-row-safe`, `screen-reply-parse`, `escalate-kind-and-subject`, `approval-amend-input`, `approval-limit-dialog`
-- **1,3,5,13** (2): `usage-wall-of`, `codex-wall-reset`
-- **1,3,7,8** (9): `drive-preloop-exit-journal`, `disk-report-classification`, `disk-target-assess-witness`, `disk-hogs`, `ancestry-guard`, `queue-recovery-is-replay`, `ledger-paths-and-bound`, `codex-look`, `typing-budget`
+- **1,3,5,13** (1): `usage-wall-of`
+- **1,3,7,8** (8): `drive-preloop-exit-journal`, `disk-report-classification`, `disk-target-assess-witness`, `disk-hogs`, `ancestry-guard`, `queue-recovery-is-replay`, `ledger-paths-and-bound`, `typing-budget`
 - **1,3,7,10** (1): `upgrade-model-priority-refines-model`
 - **1,3,7,11** (2): `acc-process-login-of-env`, `standing-quota-wall`
 - **1,3,7,12** (10): `fleet-sessions-from`, `cli-disk-config-fail-closed`, `footer-last-cwd`, `busy-footer-live-zone`, `utc-and-lstart-parse`, `usage-panel-read-phase`, `usage-panel-sample`, `answer-box-token`, `approval-line-cells`, `render-phase-grammar`
 - **1,3,7,13** (1): `usage-panel-windows`
 - **1,3,8,10** (1): `watch-refines-progress-look`
 - **1,3,8,13** (1): `cli-disk-tick`
-- **1,3,10,12** (1): `codex-goal-pause`
 - **1,4,5,8** (1): `presence-settle-ladder-gates`
 - **1,4,7,8** (1): `cli-accounts-report`
 - **1,4,8,11** (1): `cli-accounts-login-table`
@@ -3871,7 +3064,6 @@ the turn-end, rm-breaker and git-read specs in §1 and are likely high value.
 - **1,7,8,10** (1): `codex-prune-refines-model`
 - **1,7,8,12** (1): `codex-package-version`
 - **1,7,10,12** (1): `ladder-refinement`
-- **1,8,9,13** (1): `relay-turn-transparency`
 - **1,8,10,12** (1): `exit-record-refinement`
 - **1,8,11,12** (2): `ledger-one-row-per-decision`, `reader-by-program`
 - **1,8,11,13** (1): `drive-prompt-turn-protocol`
@@ -3884,17 +3076,16 @@ the turn-end, rm-breaker and git-read specs in §1 and are likely high value.
 - **1,2,3,5,8** (2): `composer-empty-caret-dim`, `refusal-news-episode`
 - **1,2,3,5,10** (1): `upgrade-refines-never-strands-model`
 - **1,2,3,7,8** (1): `account-ledger-readback`
-- **1,2,3,7,10** (5): `queue-refines-wal-model`, `turn-end-refines-SupervisorTurnEnd`, `turn-end-refines-SupervisorDoneCheck`, `turn-end-refines-SupervisorNetworkWall`, `turn-end-refines-SupervisorUsageWall`
+- **1,2,3,7,10** (4): `turn-end-refines-SupervisorTurnEnd`, `turn-end-refines-SupervisorDoneCheck`, `turn-end-refines-SupervisorNetworkWall`, `turn-end-refines-SupervisorUsageWall`
 - **1,2,3,8,11** (2): `wait-told`, `sleep-wake-settle`
 - **1,2,3,8,13** (1): `view-host-protocol`
 - **1,2,4,7,11** (1): `story-teller-lane`
 - **1,2,4,8,11** (2): `relaunch-adoption`, `report-gather-protocol`
 - **1,2,4,8,13** (1): `last-look-before-signal`
 - **1,2,4,11,12** (1): `turn-run-protocol`
-- **1,2,5,7,8** (5): `footer-tail-cache-equals-fresh-read`, `usage-incremental-fold-equals-one-pass`, `usage-session-aggregate`, `codex-turn-back-chunk-invariance`, `relay-read-bounds`
+- **1,2,5,7,8** (4): `footer-tail-cache-equals-fresh-read`, `usage-incremental-fold-equals-one-pass`, `usage-session-aggregate`, `relay-read-bounds`
 - **1,2,5,8,13** (1): `version-cache-backoff`
 - **1,2,5,10,12** (1): `age-is-one-process`
-- **1,2,7,8,10** (1): `queue-fleet-fault-latch`
 - **1,2,7,8,11** (3): `relay-wire-equals-ctl`, `hold-and-refusal-parking`, `journal-mirrors-output`
 - **1,2,7,10,13** (1): `mail-lane-exactly-once`
 - **1,2,7,11,12** (1): `survey-report-once`
@@ -3906,7 +3097,7 @@ the turn-end, rm-breaker and git-read specs in §1 and are likely high value.
 - **1,3,5,6,7** (1): `state-record-roundtrip`
 - **1,3,5,7,8** (3): `ledger-readers-are-row-projections`, `approval-read-rule`, `approval-git-read`
 - **1,3,5,7,10** (2): `limit-queue-refines-model`, `classify-except-rm`
-- **1,3,5,7,12** (21): `acc-roster-admission`, `acc-state-json-roundtrip`, `acc-event-line-roundtrip`, `footer-tail-floor-attribution`, `footer-mode-row-recognizer`, `transcript-projection-refines-full-parse`, `relaunch-line-shape-quote-bound`, `answer-plan-contract`, `ledger-row-json`, `blocks-partition`, `codex-read-limits`, `escalate-attention-text`, `approval-one-shot-only`, `approval-guarded-press`, `approval-command-readings`, `report-parse-history`, `transcript-end-positional`, `parse-text-json`, `ctl-reply-lost`, `survey-guard-unique`, `parked-card-keeps-busy`
+- **1,3,5,7,12** (20): `acc-roster-admission`, `acc-state-json-roundtrip`, `acc-event-line-roundtrip`, `footer-tail-floor-attribution`, `footer-mode-row-recognizer`, `transcript-projection-refines-full-parse`, `relaunch-line-shape-quote-bound`, `answer-plan-contract`, `ledger-row-json`, `blocks-partition`, `escalate-attention-text`, `approval-one-shot-only`, `approval-guarded-press`, `approval-command-readings`, `report-parse-history`, `transcript-end-positional`, `parse-text-json`, `ctl-reply-lost`, `survey-guard-unique`, `parked-card-keeps-busy`
 - **1,3,5,7,13** (5): `drive-flag-values`, `acc-candidates-order`, `plain-zsh-line-grammar`, `limit-reset-placement`, `report-parse-offscreen`
 - **1,3,5,7,14** (2): `rewrite-argv-refines-commander`, `json-reader-grammar`
 - **1,3,7,8,10** (2): `footer-model-refines-ClaudeFooterModel`, `usage-tap-refines-HarnessUsageTap`
@@ -3924,13 +3115,11 @@ the turn-end, rm-breaker and git-read specs in §1 and are likely high value.
 - **1,2,3,4,5,10** (1): `acc-advice-commits`
 - **1,2,3,4,5,12** (1): `approval-level-monotone`
 - **1,2,3,4,8,13** (1): `visit-shell-refines-pure-reducer`
-- **1,2,3,5,7,11** (1): `acc-merge-join`
 - **1,2,3,5,7,12** (2): `config-reader-never-grants`, `config-misplaced-only-limits`
 - **1,2,3,5,7,13** (2): `priority-admit-monotone`, `reset-place`
 - **1,2,3,5,8,11** (1): `limit-notice-reset-placement`
 - **1,2,3,7,8,10** (2): `model-switch-carry`, `login-wall-refines-HarnessLoginWall`
 - **1,2,3,7,8,11** (6): `stray-digit-cleanup`, `watch-report`, `stall-ladder`, `account-advice-asks`, `login-lifecycle-accounts`, `account-move-answer`
-- **1,2,3,7,8,12** (1): `queue-enqueue-coalesce-capacity`
 - **1,2,3,7,8,13** (1): `refused-write-retried`
 - **1,2,3,7,12,13** (1): `context-watch`
 - **1,2,4,5,8,13** (1): `release-owed-is-paid-once`
@@ -3938,13 +3127,12 @@ the turn-end, rm-breaker and git-read specs in §1 and are likely high value.
 - **1,2,4,7,8,13** (2): `no-act-without-ownership-proofs`, `ledger-gather`
 - **1,2,4,7,10,13** (1): `mail-task-protocol`
 - **1,2,4,8,10,11** (2): `limit-dialog-wait-row`, `memory-ceiling-decision`
-- **1,2,4,8,10,12** (2): `notice-owner-refinement`, `goal-pause-refinement`
+- **1,2,4,8,10,12** (1): `notice-owner-refinement`
 - **1,2,5,7,8,10** (1): `footer-process-session-switch-model`
 - **1,2,5,7,8,11** (1): `stall-probe-cost`
 - **1,2,5,7,8,13** (1): `footer-fold-is-one-session`
 - **1,2,5,8,10,11** (3): `reset-successor-escape-only`, `reset-gates-equivalence`, `told-choice`
 - **1,2,7,8,10,11** (6): `wake-protocol`, `focus-choice-refines-model`, `press-landing-and-retry`, `claim-refines-model`, `decline-keys-refines-model`, `usage-probe-refines-model`
-- **1,2,7,8,10,13** (1): `operator-refines-models`
 - **1,2,7,8,11,13** (1): `mail-report-fold`
 - **1,3,4,5,7,8** (1): `relaunch-line-construction`
 - **1,3,4,5,7,12** (2): `approval-never-spends`, `approval-safe-bash-sound`
@@ -3966,7 +3154,6 @@ the turn-end, rm-breaker and git-read specs in §1 and are likely high value.
 - **1,2,3,7,8,10,11** (1): `account-move-execution`
 - **1,2,3,7,8,11,13** (1): `usage-probe-panel-close`
 - **1,2,4,7,8,10,12** (1): `relaunch-prompt-read`
-- **1,2,4,7,8,10,13** (1): `codex-visit-exit-gate`
 - **1,2,4,7,8,11,13** (2): `outage-ride-out`, `stall-hold`
 - **1,2,4,8,9,10,11** (1): `loop-applies-decision`
 - **1,2,4,8,10,11,13** (1): `host-turn-end-protocol`
@@ -3977,7 +3164,7 @@ the turn-end, rm-breaker and git-read specs in §1 and are likely high value.
 - **1,3,4,5,7,8,10** (1): `approval-rm-breaker-sound`
 - **1,4,5,8,10,12,13** (1): `due-never-drops-unread`
 - **1,2,3,4,7,8,11,12** (1): `escalation-badge`
-- **1,2,3,5,7,8,10,11** (4): `turn-end-decision`, `api-wall-acts`, `left-limit-tracking`, `codex-wind-down`
+- **1,2,3,5,7,8,10,11** (3): `turn-end-decision`, `api-wall-acts`, `left-limit-tracking`
 - **1,2,3,5,7,8,10,13** (1): `usage-wall-wait`
 - **1,2,3,5,7,8,11,12** (2): `survey-press-gate`, `review-point-once`
 - **1,2,4,7,8,10,11,12** (3): `box-ask-refines-model`, `question-text-refines-model`, `question-answer-refines-model`

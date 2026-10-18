@@ -63,9 +63,7 @@ use std::sync::Mutex;
 
 use aterm_core::selection::SelectionSide;
 use aterm_core::terminal::{ModeMirror, Terminal};
-use aterm_session::sink::{
-    AcceptedOrder, BulkMeter, InputEpoch, SinkWriter, WriteReceipt, WriteReceiptError,
-};
+use aterm_session::sink::{AcceptedOrder, BulkMeter, SinkWriter, WriteReceipt, WriteReceiptError};
 use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey, encode_key_with_event};
 use aterm_types::mouse::MouseButton;
 
@@ -140,8 +138,8 @@ pub(crate) enum InputEvent {
         /// `false`, so their copy-on-select is unaffected. It is a POLICY flag
         /// carried on the event (the same shape as `block`), NOT a `Source`
         /// branch — and it is a clipboard SIDE-EFFECT, never a PTY byte:
-        /// `seam_egress` ignores it entirely, so the `bytes_human_eq_controller`
-        /// byte-equality invariant is untouched.
+        /// `seam_egress` ignores it entirely, so the human/controller byte-equality
+        /// invariant is untouched.
         suppress_copy_on_select: bool,
         /// Sub-cell pixel offset INSIDE the (`row`,`col`) cell, for DEC 1016
         /// SGR-pixel mouse mode (the genuine winit cursor x/y minus the cell
@@ -164,9 +162,10 @@ pub(crate) enum InputEvent {
         px_off: PixelOffset,
     },
     /// A wheel notch / trackpad flick of `lines` lines (kills e: one report per
-    /// line when tracking is on, else the viewport scrolls `lines`). `lines` is
-    /// clamped to `>= 1` in the seam so a non-positive count can never produce a
-    /// silent human/controller asymmetry.
+    /// line when tracking is on, else the viewport scrolls `lines`, a detent's
+    /// worth of them per detent: see `detent`). `lines` is clamped to `>= 1` in the
+    /// seam so a non-positive count can never produce a silent human/controller
+    /// asymmetry.
     ///
     /// `dir` is the FOUR-way axis (audit I7), not the old `dir_up: bool`. The
     /// bool could not express a tilt wheel or a horizontal trackpad swipe at
@@ -179,6 +178,13 @@ pub(crate) enum InputEvent {
     Wheel {
         dir: aterm_types::mouse::WheelDir,
         lines: i32,
+        /// Whether `lines` counts wheel DETENTS (winit's `LineDelta`: a notch, an X11
+        /// scroll-valuator step, the `mouse` verb) rather than rows a precise device
+        /// already measured (a `PixelDelta` banked by the cell height). Only a detent
+        /// is worth the platform's lines-per-detent ([`wheel_platform_lines`]) on the
+        /// two surfaces aterm scrolls itself; a precise row is one row. It never
+        /// changes the tracking reports, which stay one per `lines`.
+        detent: bool,
         row: u16,
         col: u16,
         mods: u8,
@@ -330,7 +336,7 @@ impl PixelOffset {
 ///
 /// This is DATA on the event, never a [`Source`] branch: `seam_egress` reads the
 /// same field for a human paste and a controller one, so identical events still
-/// produce identical bytes and the `bytes_human_eq_controller` invariant is
+/// produce identical bytes and the human/controller byte-equality invariant is
 /// untouched.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PasteFraming {
@@ -463,17 +469,10 @@ pub(crate) enum InputOutcome {
 pub(crate) enum Delivery {
     /// Every intended byte reached the PTY (or there were none to write).
     Full,
-    /// Every intended byte reached the PTY through an epoch-conditional write.
-    /// Carry this token into the next guarded step; reading the epoch afterward
-    /// would be racy because it could accidentally adopt a foreign attempt.
-    FullAt { epoch: InputEpoch },
     /// A short or failed PTY write — the bytes did not (fully) land.
     Failed,
     /// The immediate actuator path accepted zero bytes and queued nothing.
     BusyZero,
-    /// A foreign input attempt invalidated the guarded epoch; zero bytes from
-    /// this event were accepted and nothing was queued.
-    ConflictZero,
     /// The immediate actuator path handed this prefix to the kernel and queued
     /// no tail.  The mutation is in-doubt and must not be retried.
     PartialInDoubt { accepted: usize },
@@ -482,7 +481,7 @@ pub(crate) enum Delivery {
 impl Delivery {
     #[must_use]
     pub(crate) const fn is_full(self) -> bool {
-        matches!(self, Self::Full | Self::FullAt { .. })
+        matches!(self, Self::Full)
     }
 }
 
@@ -691,10 +690,7 @@ impl EgressReceipt {
     /// that a queued key can echo or request a fast present.
     #[must_use]
     pub(crate) const fn fully_accepted_nonempty(self) -> bool {
-        matches!(
-            self.egress,
-            Egress::Reported(Delivery::Full | Delivery::FullAt { .. })
-        ) && self.accepted_order.is_some()
+        matches!(self.egress, Egress::Reported(Delivery::Full)) && self.accepted_order.is_some()
     }
 }
 
@@ -746,16 +742,26 @@ pub(crate) fn report_coords(t: &Terminal, col: u16, row: u16, px_off: PixelOffse
 /// makes the ceiling structural instead of a property of one caller.
 pub(crate) const MAX_WHEEL_BURST: i32 = 512;
 
-/// How far a wheel gesture of `notch_lines` DETENTS travels, in lines, once the
-/// platform's lines-per-detent is applied. `page_rows` is the viewport height, used
-/// only for the "One screen at a time" setting.
+/// How far a wheel gesture of `lines` travels, in lines: when `detent` is set
+/// ([`InputEvent::Wheel::detent`]) `lines` counts DETENTS and the platform's
+/// lines-per-detent is applied; otherwise they are rows a precise device already
+/// measured, final on every platform. `page_rows` is the viewport height, which
+/// sizes Windows' "One screen at a time" and the free desktops' detent.
 ///
-/// WINDOWS ONLY (identity elsewhere). winit's Win32 backend reports exactly ±1.0
-/// `LineDelta` per detent, but on Windows a detent is not one line: it is
-/// `SPI_GETWHEELSCROLLLINES` lines — default **3**, the Mouse-settings slider, the
-/// distance every other window on the desktop travels. macOS and X11 need no such
-/// term: AppKit folds the user's scroll speed into `scrollingDeltaY` before winit
-/// sees it, and X11's button-4/5 ARE one line by convention.
+/// A detent, per platform:
+/// - WINDOWS: `SPI_GETWHEELSCROLLLINES` lines — default **3**, the Mouse-settings
+///   slider, the distance every other window on the desktop travels. winit's Win32
+///   backend reports exactly ±1.0 `LineDelta` per detent.
+/// - LINUX and the BSDs (X11, Wayland): VTE's `ceil(rows / 10)` lines, at least one
+///   — **3** at 24 rows, what GNOME Terminal and every VTE terminal scroll. Neither
+///   protocol carries a lines-per-detent setting: X11's button 4/5 and a scroll
+///   valuator's increment, and Wayland's `axis_discrete`, all reach winit as ±1.0
+///   `LineDelta` a detent, and the toolkit picks the distance. An X11 touchpad's
+///   smooth-scroll valuator arrives in the same detent units (fractional
+///   `LineDelta`), and VTE scales it by the same factor; a Wayland touchpad arrives
+///   as `PixelDelta`, which is not a detent and tracks the finger 1:1.
+/// - macOS: the identity. AppKit folds the user's scroll speed into
+///   `scrollingDeltaY` before winit sees it.
 ///
 /// THE TWO CALLERS ARE THE TWO SURFACES THE USER SCROLLS WITHOUT AN APP'S HELP:
 /// the local scrollback viewport (`App::input_wheel`), and the alternate-scroll
@@ -764,8 +770,17 @@ pub(crate) const MAX_WHEEL_BURST: i32 = 512;
 /// the app receives real wheel reports and applies its own notch->lines conversion
 /// (vim's `mousescroll`, default 3), so scaling would compound to nine lines a
 /// notch.
+pub(crate) fn wheel_platform_lines(lines: i32, page_rows: u16, detent: bool) -> i32 {
+    if detent {
+        wheel_detent_lines(lines, page_rows)
+    } else {
+        lines
+    }
+}
+
+/// [`wheel_platform_lines`] for a detent, on Windows: the live Mouse setting.
 #[cfg(windows)]
-pub(crate) fn wheel_platform_lines(notch_lines: i32, page_rows: u16) -> i32 {
+fn wheel_detent_lines(notch_lines: i32, page_rows: u16) -> i32 {
     wheel_scaled_lines(
         notch_lines,
         crate::platform_win::wheel_notch_scroll(),
@@ -773,11 +788,28 @@ pub(crate) fn wheel_platform_lines(notch_lines: i32, page_rows: u16) -> i32 {
     )
 }
 
-/// The non-Windows twin of [`wheel_platform_lines`]: the platform already delivered
+/// [`wheel_platform_lines`] for a detent, on the free desktops: VTE's distance
+/// ([`vte_lines_per_detent`]).
+#[cfg(all(unix, not(target_os = "macos")))]
+fn wheel_detent_lines(notch_lines: i32, page_rows: u16) -> i32 {
+    notch_lines.saturating_mul(vte_lines_per_detent(page_rows))
+}
+
+/// [`wheel_platform_lines`] for a detent, on macOS: the platform already delivered
 /// the user's scroll speed in the delta, so the gesture's line count is final.
-#[cfg(not(windows))]
-pub(crate) fn wheel_platform_lines(notch_lines: i32, _page_rows: u16) -> i32 {
+#[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
+fn wheel_detent_lines(notch_lines: i32, _page_rows: u16) -> i32 {
     notch_lines
+}
+
+/// The lines one wheel detent scrolls in a VTE terminal (GNOME Terminal, Tilix,
+/// Terminator, …) showing `page_rows` rows: `ceil(page_rows / 10)`, at least one.
+/// VTE's `Terminal::widget_mouse_scroll` takes it from the vertical adjustment's
+/// page increment, which is the row count; one detent is 3 lines at 24 rows, 5 at
+/// 50, and 1 below 11.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn vte_lines_per_detent(page_rows: u16) -> i32 {
+    i32::from(page_rows.div_ceil(10)).max(1)
 }
 
 /// Where ONE wheel event goes — the seam's routing decision, factored out of
@@ -898,9 +930,9 @@ pub(crate) fn wheel_route_mirrored(mirror: &ModeMirror, mods: u8) -> WheelRoute 
     )
 }
 
-/// The pure arithmetic of [`wheel_platform_lines`], split out so the multiply can be
-/// tested without a live `SystemParametersInfoW` (whose answer belongs to whoever's
-/// machine runs the suite, and so can never be asserted).
+/// The pure arithmetic of Windows' [`wheel_detent_lines`], split out so the multiply
+/// can be tested without a live `SystemParametersInfoW` (whose answer belongs to
+/// whoever's machine runs the suite, and so can never be asserted).
 ///
 /// [`WheelNotch::Page`] is the slider's "One screen at a time" position: a detent is
 /// then a PAGE, sized as the viewport so a wheel and PgUp/PgDn cannot disagree about
@@ -923,8 +955,8 @@ fn wheel_scaled_lines(
 /// How [`seam_egress_receipt`] hands the encoded bytes to the [`SinkWriter`] — a TRANSPORT
 /// knob keyed on the CALLING THREAD, never on who produced the event (cf.
 /// `echo_to_window` and the `resize` arm, which key on WHERE the event came from,
-/// not on [`Source`]). It NEVER changes WHICH bytes are produced, so the Tier-1
-/// `bytes_human_eq_controller` byte-equality invariant holds for either variant.
+/// not on [`Source`]). It NEVER changes WHICH bytes are produced, so the
+/// human/controller byte-equality invariant holds for either variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EgressMode {
     /// The UI event-loop thread, and a control socket lane writing into a session
@@ -1050,9 +1082,7 @@ pub(crate) fn seam_egress(
 /// CRITICAL (the indistinguishability invariant): this function takes NO
 /// [`Source`] — it is STRUCTURALLY impossible for it to branch on who produced
 /// the event, so a Human and a Controller feeding the SAME `InputEvent` get
-/// byte-identical output. The Tier-1 `bytes_human_eq_controller` test proves it,
-/// and the `Buggy` mutant (which DOES take a source flag) proves the test has
-/// teeth. [`EgressMode`] is a TRANSPORT knob (keyed on the calling thread, not the
+/// byte-identical output. [`EgressMode`] is a TRANSPORT knob (keyed on the calling thread, not the
 /// source) and never touches the produced bytes, so the invariant is preserved.
 ///
 /// Only the byte-producing arms are handled here; the viewport/gesture/clipboard/
@@ -1294,6 +1324,7 @@ fn seam_egress_inner(
         InputEvent::Wheel {
             dir,
             lines,
+            detent,
             row,
             col,
             mods,
@@ -1372,11 +1403,13 @@ fn seam_egress_inner(
                     //
                     // The COUNT is the platform's lines-per-detent, not one: this is a
                     // pager with no wheel of its own, so aterm owes it the same
-                    // distance the local viewport gets (`SPI_GETWHEELSCROLLLINES`,
-                    // default 3, on Windows — identity elsewhere). xterm and Windows
-                    // Terminal both send N arrows here. Unlike the tracking arm above
-                    // there is nothing downstream to multiply again: `less` moves one
-                    // line per ArrowDown, full stop. Bounded by [`MAX_WHEEL_BURST`] for
+                    // distance the local viewport gets (`wheel_platform_lines`:
+                    // `SPI_GETWHEELSCROLLLINES`, default 3, on Windows; VTE's
+                    // ceil(rows/10) on Linux; the identity on macOS and for a precise
+                    // row). xterm, VTE and Windows Terminal all send N arrows here.
+                    // Unlike the tracking arm above there is nothing downstream to
+                    // multiply again: `less` moves one line per ArrowDown, full
+                    // stop. Bounded by [`MAX_WHEEL_BURST`] for
                     // the reason the `mouse` verb is: "One screen at a time"
                     // (WHEEL_PAGESCROLL) times a large flick would otherwise let one
                     // event flood the PTY.
@@ -1407,7 +1440,8 @@ fn seam_egress_inner(
                     } else {
                         WheelPlan::Write {
                             bytes,
-                            repeat: wheel_platform_lines(lines, t.rows()).clamp(0, MAX_WHEEL_BURST),
+                            repeat: wheel_platform_lines(lines, t.rows(), *detent)
+                                .clamp(0, MAX_WHEEL_BURST),
                         }
                     }
                 } else {
@@ -2159,28 +2193,6 @@ mod tests {
         );
     }
 
-    /// Compile-time witness: every `InputEvent` variant is enumerated here with NO
-    /// wildcard arm, so adding a variant breaks THIS match and forces the author to also
-    /// add a representative to the `events` matrix in `bytes_human_eq_controller` (a
-    /// hand-maintained Vec with no such structural guard). Never called — it exists to
-    /// fail to COMPILE if a variant is added, not to run. KeySequence is the variant
-    /// this guard would have caught.
-    fn _convergence_matrix_is_exhaustive(ev: &InputEvent) {
-        match ev {
-            InputEvent::Key { .. }
-            | InputEvent::Text(_)
-            | InputEvent::KeySequence(_)
-            | InputEvent::MouseButton { .. }
-            | InputEvent::MouseMove { .. }
-            | InputEvent::Wheel { .. }
-            | InputEvent::ScrollView(_)
-            | InputEvent::Paste(..)
-            | InputEvent::Resize { .. }
-            | InputEvent::ResizeWindowPx { .. }
-            | InputEvent::Focus(_) => {}
-        }
-    }
-
     /// A `Terminal` with the given mode-enabling sequences fed in (DECCKM, Kitty,
     /// the mouse modes, focus reporting, bracketed paste).
     fn term_with(seqs: &[&[u8]]) -> Arc<Mutex<Terminal>> {
@@ -2248,6 +2260,7 @@ mod tests {
         InputEvent::Wheel {
             dir,
             lines,
+            detent: true,
             row: 0,
             col: 0,
             mods: 0,
@@ -2255,16 +2268,12 @@ mod tests {
         }
     }
 
-    /// A wheel event carrying mouse modifier bits (see `App::mouse_modifiers`).
-    fn wheel_mods(dir: WheelDir, lines: i32, mods: u8) -> InputEvent {
-        InputEvent::Wheel {
-            dir,
-            lines,
-            row: 0,
-            col: 0,
-            mods,
-            px_off: PixelOffset::CELL_ORIGIN,
-        }
+    /// `arrow` once per line `notches` wheel detents owe a pager on [`term_with`]'s
+    /// 24 rows ([`wheel_platform_lines`]): one on macOS, VTE's three on Linux.
+    #[cfg(unix)]
+    fn detent_arrows(arrow: &[u8], notches: i32) -> Vec<u8> {
+        let lines = wheel_platform_lines(notches, 24, true);
+        arrow.repeat(usize::try_from(lines).expect("a non-negative count"))
     }
 
     /// Drive ONE event through [`seam_egress`] and return the [`Egress`] verdict
@@ -2283,13 +2292,12 @@ mod tests {
 
     /// SELECTION CUSTODY Phase 2 — the LOCAL-SCROLL OVERRIDE, on EVERY platform.
     ///
-    /// The two `Egress`-level tests below say the same thing through the real seam
-    /// (and now do so on every platform — see [`CaptureSink`]). This one goes
-    /// through [`wheel_route_for`] — the engine reads plus the policy table, no
+    /// Through [`wheel_route_for`] — the engine reads plus the policy table, no
     /// sink at all — so the override the design calls load-bearing ("without this,
     /// Phase 4 is unreachable under any mouse-owning TUI") stays pinned even for a
-    /// target with no PTY of any kind, and fails at the policy table rather than at
-    /// a byte string when it regresses.
+    /// target with no PTY of any kind. With Option held the wheel scrolls this
+    /// terminal over a tracking app on the MAIN screen; the alt screen (zero
+    /// scrollback) keeps its report and its DEC-1007 arrows.
     #[test]
     fn the_option_wheel_override_routes_locally_on_every_platform() {
         use aterm_types::mouse::{ALT_MASK, SHIFT_MASK};
@@ -2338,6 +2346,13 @@ mod tests {
         let plain = term_with(&[]);
         assert_eq!(route(&plain, 0), WheelRoute::Viewport);
         assert_eq!(route(&plain, ALT_MASK), WheelRoute::Viewport);
+
+        // Alternate scroll applies only on the ALT screen, and only while the app
+        // leaves DEC 1007 on: otherwise the wheel is the local viewport's.
+        let main_1007 = term_with(&[b"\x1b[?1007h"]);
+        assert_eq!(route(&main_1007, 0), WheelRoute::Viewport);
+        let alt_1007_off = term_with(&[b"\x1b[?1049h", b"\x1b[?1007l"]);
+        assert_eq!(route(&alt_1007_off, 0), WheelRoute::Viewport);
     }
 
     /// The LOCK-FREE route is the locked one, for every combination of the
@@ -2385,78 +2400,15 @@ mod tests {
         );
     }
 
-    /// SELECTION CUSTODY Phase 2 — the LOCAL-SCROLL OVERRIDE.
-    ///
-    /// A program that grabs the mouse takes the wheel absolutely, so while it runs
-    /// the user cannot reach their own scrollback at all. With Option held the wheel
-    /// scrolls this terminal instead — the wheel half of the gesture
-    /// `press_starts_selection` already gives selection under tracking.
-    #[test]
-    fn option_wheel_scrolls_locally_under_mouse_tracking() {
-        use aterm_types::mouse::ALT_MASK;
-        // Main screen, app grabbing the mouse (SGR tracking).
-        let term = term_with(&[b"\x1b[?1000h", b"\x1b[?1006h"]);
-        // Control: without the override the app owns the wheel.
-        assert!(
-            matches!(
-                egress_of(&term, &wheel(WheelDir::Up, 1)),
-                Egress::Reported(_)
-            ),
-            "a tracking app still gets the plain wheel"
-        );
-        // With Option held the local viewport scrolls instead.
-        assert!(
-            matches!(
-                egress_of(&term, &wheel_mods(WheelDir::Up, 1, ALT_MASK)),
-                Egress::TrackingOff { .. }
-            ),
-            "Option+wheel must reach the local scrollback"
-        );
-    }
-
-    /// …and it is scoped to the MAIN screen. The alt screen is built with zero
-    /// scrollback, so an override there would reach nothing WHILE costing the
-    /// alternate-scroll arrows that are how `less`/`man`/`git log` scroll.
-    ///
-    /// STILL `#[cfg(unix)]`, and not for want of a harness (the byte capture is
-    /// cross-platform now — see [`CaptureSink`]): the assertion is `== b"\x1b[A"`,
-    /// ONE arrow for one line, which is true only where `wheel_platform_lines` is
-    /// the identity. On Windows the same gesture is worth `SPI_GETWHEELSCROLLLINES`
-    /// arrows — a number that belongs to whoever's machine runs the suite and so
-    /// can never be asserted. The Windows side of that multiply has its own test,
-    /// `wheel_scale_is_the_platform_distance_not_one_line`, and the ROUTE half of
-    /// this test (Option must not steal a tracking app's report) is pinned on every
-    /// platform by `the_option_wheel_override_routes_locally_on_every_platform`.
-    #[cfg(unix)]
-    #[test]
-    fn the_local_scroll_override_leaves_the_alt_screen_alone() {
-        use aterm_types::mouse::ALT_MASK;
-        // Alt screen + DEC 1007: Option must NOT steal the arrows.
-        let alt_scroll = term_with(&[b"\x1b[?1007h", b"\x1b[?1049h"]);
-        assert_eq!(
-            egress_bytes(&alt_scroll, &wheel_mods(WheelDir::Up, 1, ALT_MASK)),
-            b"\x1b[A",
-            "alternate scroll still converts the wheel to an arrow"
-        );
-        // Alt screen + a tracking app: Option must NOT steal the report either.
-        let tracking = term_with(&[b"\x1b[?1049h", b"\x1b[?1000h", b"\x1b[?1006h"]);
-        assert!(
-            matches!(
-                egress_of(&tracking, &wheel_mods(WheelDir::Up, 1, ALT_MASK)),
-                Egress::Reported(_)
-            ),
-            "a mouse-owning alt-screen app keeps the wheel"
-        );
-    }
-
     /// Audit M5 — alternate scroll (DEC 1007): on the ALT screen with 1007 set and
-    /// no mouse tracking, a wheel becomes arrow-key PRESSES (one per line), encoded
-    /// through the LIVE keyboard mode (SS3 under DECCKM), and the local viewport is
-    /// left alone (`Egress::Reported`, not `TrackingOff`).
+    /// no mouse tracking, a wheel becomes arrow-key PRESSES (a detent's worth per
+    /// notch, [`detent_arrows`]), encoded through the LIVE keyboard mode (SS3 under
+    /// DECCKM), and the local viewport is left alone (`Egress::Reported`, not
+    /// `TrackingOff`).
     ///
-    /// STILL `#[cfg(unix)]`: every assertion here counts ARROWS (`2` lines → two
-    /// `ESC[A`), and Windows multiplies that count by the live
-    /// `SPI_GETWHEELSCROLLLINES` — an unassertable machine setting. See
+    /// STILL `#[cfg(unix)]`: every assertion here counts ARROWS, and Windows
+    /// multiplies that count by the live `SPI_GETWHEELSCROLLLINES` — an
+    /// unassertable machine setting. See
     /// `wheel_scale_is_the_platform_distance_not_one_line` for the Windows half.
     #[cfg(unix)]
     #[test]
@@ -2464,13 +2416,19 @@ mod tests {
         let term = term_with(&[b"\x1b[?1007h", b"\x1b[?1049h"]);
         assert_eq!(
             egress_bytes(&term, &wheel(WheelDir::Up, 2)),
-            b"\x1b[A\x1b[A"
+            detent_arrows(b"\x1b[A", 2)
         );
-        assert_eq!(egress_bytes(&term, &wheel(WheelDir::Down, 1)), b"\x1b[B");
+        assert_eq!(
+            egress_bytes(&term, &wheel(WheelDir::Down, 1)),
+            detent_arrows(b"\x1b[B", 1)
+        );
         // DECCKM (?1h): arrows switch to the SS3 form, proving the bytes come from
         // the live keyboard mode, not a hardcoded CSI.
         term.lock().unwrap().process(b"\x1b[?1h");
-        assert_eq!(egress_bytes(&term, &wheel(WheelDir::Up, 1)), b"\x1bOA");
+        assert_eq!(
+            egress_bytes(&term, &wheel(WheelDir::Up, 1)),
+            detent_arrows(b"\x1bOA", 1)
+        );
         // The wheel is consumed as a key report: the viewport must NOT scroll.
         assert!(matches!(
             egress_of(&term, &wheel(WheelDir::Up, 1)),
@@ -2494,6 +2452,7 @@ mod tests {
         let shifted = InputEvent::Wheel {
             dir: WheelDir::Up,
             lines: 2,
+            detent: true,
             row: 0,
             col: 0,
             mods: aterm_types::mouse::SHIFT_MASK,
@@ -2565,22 +2524,6 @@ mod tests {
         ));
     }
 
-    /// Alternate scroll applies only on the ALT screen: on the main screen the wheel
-    /// falls back to local scrollback (`Egress::TrackingOff`), no arrows synthesized.
-    #[test]
-    fn alternate_scroll_only_on_the_alt_screen() {
-        let term = term_with(&[b"\x1b[?1007h"]);
-        assert!(matches!(
-            egress_of(&term, &wheel(WheelDir::Up, 1)),
-            Egress::TrackingOff {
-                wheel_lines: 1,
-                wheel_up: true,
-                ..
-            }
-        ));
-        assert!(egress_bytes(&term, &wheel(WheelDir::Up, 1)).is_empty());
-    }
-
     /// Audit I7, THE WHOLE POINT, and cross-platform (no `cfg(unix)` — it asserts
     /// the ROUTE, which needs no pipe): a horizontal wheel is REPORTED while an app
     /// tracks the mouse, and produces ZERO local motion when nothing does.
@@ -2650,6 +2593,7 @@ mod tests {
             let shifted = InputEvent::Wheel {
                 dir,
                 lines: 2,
+                detent: true,
                 row: 0,
                 col: 0,
                 mods: aterm_types::mouse::SHIFT_MASK,
@@ -2691,18 +2635,6 @@ mod tests {
                 ..
             }
         ));
-    }
-
-    /// An app can turn alternate scroll OFF (?1007l): the wheel then falls back to
-    /// the local scrollback viewport even on the alt screen.
-    #[test]
-    fn alt_screen_with_1007_off_falls_back_to_viewport() {
-        let term = term_with(&[b"\x1b[?1049h", b"\x1b[?1007l"]);
-        assert!(matches!(
-            egress_of(&term, &wheel(WheelDir::Up, 1)),
-            Egress::TrackingOff { .. }
-        ));
-        assert!(egress_bytes(&term, &wheel(WheelDir::Up, 1)).is_empty());
     }
 
     /// The report burst is bounded at BOTH ends, for every source. A tracking app
@@ -2775,6 +2707,89 @@ mod tests {
             wheel_scaled_lines(i32::MAX, WheelNotch::Lines(u32::MAX), 24),
             i32::MAX
         );
+    }
+
+    /// THE WHEEL MULTIPLY ITSELF (Linux and the BSDs, X11 and Wayland). Neither
+    /// protocol has a lines-per-detent setting, so the desktop's distance is the
+    /// one its terminal scrolls: VTE's `ceil(rows / 10)`, at least one. A wheel that
+    /// moves one line a notch makes long scrollback three times slower to reach
+    /// than in GNOME Terminal at the usual 24 rows.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn a_free_desktop_wheel_detent_is_vtes_distance() {
+        // The 80x24 default: three lines, VTE's adjustment 377 -> 374 per notch.
+        assert_eq!(vte_lines_per_detent(24), 3);
+        assert_eq!(wheel_platform_lines(1, 24, true), 3);
+        assert_eq!(wheel_platform_lines(4, 24, true), 12);
+        // The ceiling, at its edges, and the floor of one for a short grid (and a
+        // degenerate zero-row one, which must still move).
+        assert_eq!(vte_lines_per_detent(20), 2);
+        assert_eq!(vte_lines_per_detent(21), 3);
+        assert_eq!(vte_lines_per_detent(50), 5);
+        assert_eq!(vte_lines_per_detent(10), 1);
+        assert_eq!(vte_lines_per_detent(1), 1);
+        assert_eq!(vte_lines_per_detent(0), 1);
+        assert_eq!(vte_lines_per_detent(u16::MAX), 6554);
+        // Absurd counts saturate instead of wrapping into a negative scroll.
+        assert_eq!(wheel_platform_lines(i32::MAX, 24, true), i32::MAX);
+    }
+
+    /// A precise device's row is a row on EVERY platform: a `PixelDelta` banked by
+    /// the cell height already measured the finger's travel, so no lines-per-detent
+    /// (VTE's, or Windows' live setting, which this never reads) multiplies it.
+    #[test]
+    fn a_precise_wheel_row_is_never_multiplied() {
+        for rows in [0, 1, 24, 50, u16::MAX] {
+            for lines in [0, 1, 2, 7, MAX_WHEEL_BURST] {
+                assert_eq!(wheel_platform_lines(lines, rows, false), lines);
+            }
+        }
+    }
+
+    /// The seam's two wheel surfaces on a free desktop, at the byte level: a pager
+    /// under DEC 1007 gets a detent's three arrows at 24 rows (a precise row gets
+    /// one), while a mouse-tracking app still gets exactly ONE report per notch, the
+    /// app applying its own notch->lines conversion. The viewport fallback carries
+    /// the notch count, unscaled, for `App::input_wheel` to scale.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn a_free_desktop_detent_is_three_pager_arrows_but_one_tracking_report() {
+        let precise = |dir| InputEvent::Wheel {
+            dir,
+            lines: 1,
+            detent: false,
+            row: 0,
+            col: 0,
+            mods: 0,
+            px_off: PixelOffset::CELL_ORIGIN,
+        };
+        let pager = term_with(&[b"\x1b[?1007h", b"\x1b[?1049h"]);
+        assert_eq!(
+            egress_bytes(&pager, &wheel(WheelDir::Down, 1)),
+            b"\x1b[B\x1b[B\x1b[B"
+        );
+        assert_eq!(
+            egress_bytes(&pager, &wheel(WheelDir::Up, 2)),
+            b"\x1b[A".repeat(6)
+        );
+        assert_eq!(egress_bytes(&pager, &precise(WheelDir::Down)), b"\x1b[B");
+        let tracking = term_with(&[b"\x1b[?1000h", b"\x1b[?1006h"]);
+        assert_eq!(
+            egress_bytes(&tracking, &wheel(WheelDir::Down, 1)),
+            b"\x1b[<65;1;1M"
+        );
+        assert_eq!(
+            egress_bytes(&tracking, &wheel(WheelDir::Up, 2)),
+            b"\x1b[<64;1;1M".repeat(2)
+        );
+        assert!(matches!(
+            egress_of(&term_with(&[]), &wheel(WheelDir::Up, 1)),
+            Egress::TrackingOff {
+                wheel_lines: 1,
+                wheel_up: true,
+                ..
+            }
+        ));
     }
 
     /// THE Tier-1 indistinguishability invariant (A.7), part 2 — BUILDER EQUALITY.
@@ -2883,49 +2898,13 @@ mod tests {
         let human_wheel = InputEvent::Wheel {
             dir: WheelDir::Up,
             lines: 1,
+            detent: true,
             row: 2,
             col: 4,
             mods: 0,
             px_off: PixelOffset::CELL_ORIGIN,
         };
         assert_eq!(human_wheel, ctrl_wheel, "wheel builder mismatch");
-    }
-
-    /// The wheel-line clamp guards the human/controller asymmetry the critique
-    /// flagged: a non-positive `lines` must NOT silently emit zero reports while a
-    /// positive one emits N. With tracking ON, `lines: 0` and `lines: -3` both
-    /// behave as exactly ONE report (the clamp to >= 1), identical to `lines: 1`.
-    #[test]
-    fn wheel_lines_clamped_to_one() {
-        let term = term_with(&[b"\x1b[?1000h", b"\x1b[?1006h"]); // Normal + SGR tracking
-        let one = egress_bytes(
-            &term,
-            &InputEvent::Wheel {
-                dir: WheelDir::Up,
-                lines: 1,
-                row: 2,
-                col: 4,
-                mods: 0,
-                px_off: PixelOffset::CELL_ORIGIN,
-            },
-        );
-        for bad in [0, -1, -3] {
-            let got = egress_bytes(
-                &term,
-                &InputEvent::Wheel {
-                    dir: WheelDir::Up,
-                    lines: bad,
-                    row: 2,
-                    col: 4,
-                    mods: 0,
-                    px_off: PixelOffset::CELL_ORIGIN,
-                },
-            );
-            assert_eq!(
-                got, one,
-                "wheel lines={bad} must clamp to exactly one report"
-            );
-        }
     }
 
     /// DEC 1016 (SGR-PIXEL) mouse mode reports a GENUINE PIXEL coordinate, not the
@@ -2961,35 +2940,6 @@ mod tests {
         // (col+1, row+1) — proving the pixel math is gated on 1016, not always on.
         let term_cell = term_with(&[b"\x1b[?1000h", b"\x1b[?1006h"]);
         assert_eq!(egress_bytes(&term_cell, &press), b"\x1b[<0;4;3M");
-    }
-
-    /// A 1016 report with the cell-origin offset (`CELL_ORIGIN`, the value a
-    /// Controller sends) lands on the cell's top-left pixel: col=3,row=2 → pixel
-    /// (30, 40) → `ESC [ < 0 ; 31 ; 41 M`. So a controller-driven 1016 press is
-    /// still pixel-correct (the cell origin), and the sub-cell offset is purely
-    /// additive on top.
-    #[test]
-    fn sgr_pixel_1016_cell_origin_is_top_left_pixel() {
-        let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
-        {
-            let mut t = term.lock().unwrap();
-            t.set_cell_pixel_size(10, 20);
-            t.process(b"\x1b[?1000h");
-            t.process(b"\x1b[?1016h");
-        }
-        let press = InputEvent::MouseButton {
-            button: MouseButton::Left,
-            pressed: true,
-            row: 2,
-            col: 3,
-            mods: 0,
-            click_count: 1,
-            side: SelectionSide::Left,
-            block: false,
-            suppress_copy_on_select: false,
-            px_off: PixelOffset::CELL_ORIGIN,
-        };
-        assert_eq!(egress_bytes(&term, &press), b"\x1b[<0;31;41M");
     }
 
     /// Jump-to-prompt must navigate by PROMPTS, not by finished commands.

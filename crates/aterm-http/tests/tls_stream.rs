@@ -8,10 +8,10 @@
 //! arrived, so one `Stream::read` is many socket reads. A timeout and a guard
 //! applied once before that loop bound one of those reads; a peer that sends
 //! the record a byte at a time restarts the clock with every byte and is never
-//! asked about authority again. These tests drive a REAL TLS session (the
-//! handshake completes, against a pinned certificate) and then dribble one
-//! record, so what they exercise is the established stream the response is
-//! read through, not the handshake `loopback.rs` already covers.
+//! asked about authority again. Most of these tests drive a REAL TLS session
+//! (the handshake completes, against a pinned certificate) and then dribble
+//! one record, so what they exercise is the established stream; one dribbles
+//! the handshake itself, the deadline the harness network probe relies on.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -27,10 +27,10 @@ use rustls::{DigitallySignedStruct, SignatureScheme};
 /// A wait for something that must happen is a hang detector, never a latency budget.
 const HANG_DETECTOR: Duration = Duration::from_secs(60);
 
-/// aterm-net's loopback credentials: a self-signed certificate and its key,
-/// public test data (`crates/aterm-net/src/testdata/README.md`).
-const CERT: &[u8] = include_bytes!("../../aterm-net/src/testdata/cert.der");
-const KEY: &[u8] = include_bytes!("../../aterm-net/src/testdata/key.pkcs8.der");
+/// Loopback credentials: a self-signed certificate and its key, public test
+/// data (`testdata/README.md`).
+const CERT: &[u8] = include_bytes!("testdata/loopback-cert.der");
+const KEY: &[u8] = include_bytes!("testdata/loopback-key.pkcs8.der");
 
 /// Accepts exactly [`CERT`] (the handshake signature is still checked), so the
 /// session these tests run over is a real one without a CA in the picture.
@@ -188,7 +188,7 @@ fn read_from_dribbler(
     let mut stream = Stream::start_tls(
         tcp,
         client_config(),
-        "aterm-net-test",
+        "loopback.test",
         guard,
         Deadline::after(deadline),
     )
@@ -199,6 +199,60 @@ fn read_from_dribbler(
         let _ = outcome_tx.send(stream.read(&mut buf));
     });
     (dribbling, outcome)
+}
+
+/// A peer that completes the TCP connect, claims a 16 KiB handshake record,
+/// and then emits one byte at a time, `step` apart, for up to five minutes. It
+/// never speaks TLS; the point is only that bytes keep ARRIVING. It stops at
+/// the first byte the closed client refuses.
+fn dribbling_handshake_peer(step: Duration) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let Ok((mut tcp, _)) = listener.accept() else {
+            return;
+        };
+        // A handshake record header claiming 16384 bytes of body, so rustls
+        // stays in `read_tls` waiting for a flight that never completes.
+        if tcp.write_all(&[0x16, 0x03, 0x03, 0x40, 0x00]).is_err() {
+            return;
+        }
+        let steps = Duration::from_secs(300).as_millis() / step.as_millis().max(1);
+        for _ in 0..steps {
+            if tcp.write_all(&[0x00]).is_err() || tcp.flush().is_err() {
+                return;
+            }
+            std::thread::sleep(step);
+        }
+    });
+    port
+}
+
+#[test]
+fn a_dribbled_handshake_cannot_outlive_the_global_deadline() {
+    // The deadline has to be enforced INSIDE the handshake, not just before
+    // it: `complete_io` loops on `read_tls`, so a per-syscall timeout applied
+    // once at the top bounds one read while every dribbled byte restarts the
+    // clock. This peer dribbles for ~5 minutes against a 1 s budget; the
+    // minute below is the hang detector.
+    let port = dribbling_handshake_peer(Duration::from_millis(100));
+    let tcp = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let (outcome_tx, outcome) = mpsc::channel();
+    std::thread::spawn(move || {
+        let started = Stream::start_tls(
+            tcp,
+            client_config(),
+            "loopback.test",
+            Arc::new(aterm_http::AlwaysAuthorized),
+            Deadline::after(Duration::from_secs(1)),
+        );
+        let _ = outcome_tx.send(started.map(drop));
+    });
+    let result = outcome.recv_timeout(HANG_DETECTOR).unwrap_or_else(|_| {
+        panic!("a TLS handshake was still waiting on a dribbling peer {HANG_DETECTOR:?} into a 1 s deadline")
+    });
+    let error = result.expect_err("a handshake that never finishes must hit the deadline");
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "{error}");
 }
 
 #[test]

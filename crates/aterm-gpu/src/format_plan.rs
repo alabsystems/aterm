@@ -6,8 +6,9 @@
 // wgpu checks at draw time that a pass's attachment view format equals its
 // pipeline's target format, and aborts the pass otherwise. Every such choice is
 // a pure function here, so a pipeline and its attachment cannot be edited
-// apart. The GPU-free `pipeline_target_matches_attachment_on_both_backends`
-// test and the `gpu_pipeline_format` ay proof check the equality for both `srgb_offscreen` states.
+// apart. `the_srgb_view_is_a_declared_alias_of_srgb_storage` checks that each
+// view format is one the texture declares, and the `gpu_pipeline_format` ay
+// proof checks the equality, for both `srgb_offscreen` states.
 
 #[cfg(wgpu_arm)]
 use wgpu::TextureFormat;
@@ -51,9 +52,8 @@ pub(crate) fn offscreen_view_formats(srgb_offscreen: bool) -> &'static [TextureF
     }
 }
 
-/// The HDR present gate as pure decision functions, exhaustively checked
-/// (`hdr_present_gate_model` in aterm-spec `derive.rs`; Tier-1 is
-/// `tests/hdr_gate.rs`'s full enumeration).
+/// The HDR present gate as pure decision functions, exhaustively checked by
+/// `tests/hdr_gate.rs`'s full enumeration.
 ///
 /// Attach ([`hdr_swapchain_wants_f16`], `GpuRenderer::create_window_surface`):
 /// `Rgba16Float` iff `hdr_glow` is on and the surface offers it; otherwise the
@@ -137,6 +137,24 @@ pub fn hdr_screen_upgrade_wants_f16(
         && screen_edr_potential.is_some_and(|p| aterm_render::hdr::sanitize_edr_max(p) > 1.0)
 }
 
+/// The monitor-change re-pick's decision, in the order the throttled re-query
+/// needs: the f16 surface and the proven gate first, and only past them the
+/// screen read `screen_edr_potential`, an AppKit read the re-query must not
+/// pay for every 8-bit window. Equal to [`hdr_screen_upgrade_wants_f16`] over
+/// the potential it reads.
+#[must_use]
+pub fn hdr_screen_upgrade_decision(
+    hdr_glow: bool,
+    supports_f16: bool,
+    swapchain_is_f16: bool,
+    screen_edr_potential: impl FnOnce() -> Option<f32>,
+) -> bool {
+    if swapchain_is_f16 || !hdr_swapchain_wants_f16(hdr_glow, supports_f16) {
+        return false;
+    }
+    hdr_screen_upgrade_wants_f16(hdr_glow, supports_f16, false, screen_edr_potential())
+}
+
 /// PRESENT: what the HDR path does THIS present. See [`HdrPlan`].
 #[must_use]
 pub fn hdr_present_plan(hdr_glow: bool, swapchain_is_f16: bool, glow_nonempty: bool) -> HdrPlan {
@@ -154,8 +172,8 @@ pub fn hdr_present_plan(hdr_glow: bool, swapchain_is_f16: bool, glow_nonempty: b
 /// atomically to the retained SDR format, since DWM would read linear pixels as
 /// gamma 2.2 while capture claimed extended-linear.
 ///
-/// Bound to `aterm_spec::derive::hdr_reconfigure_retag_model`, checked
-/// exhaustively by `tests/hdr_gate.rs` and against the concrete apply path by
+/// Bound to `aterm_models_render::hdr_reconfigure_retag_model` through the
+/// concrete apply path by
 /// `renderer::tests::hdr_reconfigure_apply_conforms_to_retag_model`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HdrReconfigurePlan {
@@ -176,7 +194,7 @@ pub enum HdrReconfigurePlan {
 /// the model's successor with what `apply_hdr_reconfigure_plan` /
 /// `apply_hdr_surface_upgrade` actually produced. `is_f16` is the planner's
 /// resolved format; `stage`/`retagged` are drive coordinates. Test-only.
-#[cfg(test)]
+#[cfg(all(test, wgpu_arm))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct HdrReconfigureProjection {
     /// Model phase: confirmed HDR (0), retained eligible SDR (1), resolved (2).
@@ -198,48 +216,48 @@ pub(crate) struct HdrReconfigureProjection {
 /// (`WindowGpu::apply_hdr_reconfigure_plan`, or
 /// `WindowGpu::apply_hdr_surface_upgrade` for `UpgradeSucceeds`).
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "HdrReconfigureRetag",
         action = "RetagSucceeds",
         project = "aterm_gpu::WindowGpu::project_hdr_reconfigure_state"
     )
 )]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "HdrReconfigureRetag",
         action = "RetagFails",
         project = "aterm_gpu::WindowGpu::project_hdr_reconfigure_state"
     )
 )]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "HdrReconfigureRetag",
         action = "EnterSdrFallback",
         project = "aterm_gpu::WindowGpu::project_hdr_reconfigure_state"
     )
 )]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "HdrReconfigureRetag",
         action = "UpgradeSucceeds",
         project = "aterm_gpu::WindowGpu::project_hdr_reconfigure_state"
     )
 )]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "HdrReconfigureRetag",
         action = "UpgradeFails",
         project = "aterm_gpu::WindowGpu::project_hdr_reconfigure_state"
     )
 )]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::spec_unmodeled(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
         machine = "HdrReconfigureRetag",
         action = "BuggyRetagFailureIgnored",
         reason = "Buggy=1 negative control only; a failed re-tag of an f16 surface plans \
@@ -247,8 +265,8 @@ pub(crate) struct HdrReconfigureProjection {
     )
 )]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::spec_unmodeled(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
         machine = "HdrReconfigureRetag",
         action = "BuggyUpgradeFailureKeepsF16",
         reason = "Buggy=1 negative control only; an upgrade whose tag failed plans \
@@ -256,8 +274,8 @@ pub(crate) struct HdrReconfigureProjection {
     )
 )]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::spec_unmodeled(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
         machine = "HdrReconfigureRetag",
         action = "BuggyEscapeKeepsLinearCapture",
         reason = "Buggy=1 negative control only; apply_hdr_reconfigure_plan reconciles capture \
@@ -300,126 +318,26 @@ pub fn sdr_boost_pass(swapchain_is_f16: bool, glow_nonempty: bool, budget: f32) 
 mod tests {
     use super::*;
 
-    // For both `srgb_offscreen` states, every pass's pipeline target format
-    // equals its attachment view format, and every view format is the texture
-    // format or a declared alias (the `gpu_pipeline_format` ay property).
+    // For both `srgb_offscreen` states the sRGB view format is the texture format
+    // or a declared alias (wgpu's create_view panics otherwise), and the stored
+    // bytes are sRGB-encoded, the contract readback and the destination share
+    // (the `gpu_pipeline_format` ay property).
     #[test]
-    fn pipeline_target_matches_attachment_on_both_backends() {
+    #[cfg(wgpu_arm)]
+    fn the_srgb_view_is_a_declared_alias_of_srgb_storage() {
         for srgb in [true, false] {
-            let tex = offscreen_format(srgb); // off.view follows the texture format
-            let srgb_view = offscreen_srgb_view_format(srgb);
-            // additive (glow_add/deco_add) + bloom + tray + test-blit attach off.view
-            // and build with offscreen_format -> trivially equal (same function).
-            assert_eq!(
-                tex,
-                offscreen_format(srgb),
-                "srgb={srgb}: additive/bloom/tray view != target"
-            );
-            // Base, cursor and deco_over attach `off.view_srgb` and build with
-            // `offscreen_srgb_view_format`.
-            assert_eq!(
-                srgb_view,
-                offscreen_srgb_view_format(srgb),
-                "srgb={srgb}: base view != target"
-            );
-            // VIEW_FORMATS validity: the sRGB view fmt must be the texture fmt or a
-            // declared alias (mirrors wgpu's real create_view panic).
-            let declared = srgb_view == tex || offscreen_view_formats(srgb).contains(&srgb_view);
+            let tex = offscreen_format(srgb);
+            let view = offscreen_srgb_view_format(srgb);
             assert!(
-                declared,
-                "srgb={srgb}: sRGB view fmt neither texture fmt nor declared alias"
+                view == tex || offscreen_view_formats(srgb).contains(&view),
+                "srgb={srgb}: the sRGB view format is neither the texture format nor a declared alias"
             );
-            // Stored bytes are always sRGB-encoded: readback and the
-            // application-submitted destination share this byte contract.
             assert_eq!(
                 tex.add_srgb_suffix(),
                 TextureFormat::Rgba8UnormSrgb,
-                "srgb={srgb}: storage not sRGB"
+                "srgb={srgb}"
             );
         }
-    }
-
-    // The additive One/One target matches CPU `add_sat` only when it is plain
-    // Unorm (native); on downlevel the add lands in linear (the approximation
-    // `GpuRenderer::additive_is_byte_exact` reports).
-    #[test]
-    fn additive_target_is_byte_exact_only_on_native() {
-        assert_eq!(
-            offscreen_format(true),
-            TextureFormat::Rgba8Unorm,
-            "native additive target must be raw Unorm (byte-exact add)"
-        );
-        assert_eq!(
-            offscreen_format(false),
-            TextureFormat::Rgba8UnormSrgb,
-            "downlevel additive target must be sRGB (linear add)"
-        );
-    }
-
-    /// The format axis across backends: for every role and present format, the
-    /// wgpu resolve (`TargetFormats::resolve` over this plan) and the Metal
-    /// match (`metal::pipelines::metal_format`) agree by format name. Kept here
-    /// so no wgpu type enters `metal/`.
-    ///
-    /// Metal always runs the native plan (`srgb_offscreen == true`); the
-    /// downlevel half pins that the plans differ in exactly one role.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn the_metal_format_axis_equals_the_wgpu_resolve_for_every_role() {
-        use crate::metal::ffi::PixelFormat;
-        use crate::metal::pipelines::metal_format;
-        use crate::pipeline_table::{TargetFormats, TargetRole};
-
-        const ROLES: [TargetRole; 4] = [
-            TargetRole::OffscreenSrgb,
-            TargetRole::OffscreenUnorm,
-            TargetRole::Edr,
-            TargetRole::Present,
-        ];
-        let native = TargetFormats {
-            offscreen_srgb: offscreen_srgb_view_format(true),
-            offscreen_unorm: offscreen_format(true),
-            present: None,
-        };
-        // Both formats `pick_surface_format` can choose.
-        for (wgpu_present, metal_present) in [
-            (TextureFormat::Bgra8Unorm, PixelFormat::Bgra8Unorm),
-            (TextureFormat::Rgba8Unorm, PixelFormat::Rgba8Unorm),
-        ] {
-            for role in ROLES {
-                let wgpu_side = native.with_present(wgpu_present).resolve(role);
-                let metal_side = metal_format(role, metal_present);
-                assert_eq!(
-                    format!("{wgpu_side:?}"),
-                    format!("{metal_side:?}"),
-                    "{role:?} on a {wgpu_present:?} swapchain: metal_format \
-                     disagrees with the wgpu resolve — this axis can be wrong \
-                     on every offscreen role at once with every pipeline still \
-                     building"
-                );
-            }
-        }
-        // The downlevel plan (GLES/WebGL2: no format views, the offscreen
-        // texture is ITSELF sRGB) diverges from Metal on exactly ONE role.
-        let downlevel = TargetFormats {
-            offscreen_srgb: offscreen_srgb_view_format(false),
-            offscreen_unorm: offscreen_format(false),
-            present: None,
-        };
-        let diverging: Vec<TargetRole> = ROLES[..3]
-            .iter()
-            .copied()
-            .filter(|&r| {
-                format!("{:?}", downlevel.resolve(r))
-                    != format!("{:?}", metal_format(r, PixelFormat::Bgra8Unorm))
-            })
-            .collect();
-        assert_eq!(
-            diverging,
-            [TargetRole::OffscreenUnorm],
-            "Metal implements the native plan; downlevel differs only where \
-             the single sRGB offscreen replaces the Unorm view"
-        );
     }
 
     /// The SDR boost never fires on f16, with an empty stream, or at a

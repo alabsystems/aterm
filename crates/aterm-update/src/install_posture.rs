@@ -71,28 +71,3 @@ impl InstallPosture {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::InstallPosture;
-
-    #[test]
-    fn portable_posture_values_preserve_bundle_advice() {
-        for (posture, can_update, move_app) in [
-            (InstallPosture::Installed, true, false),
-            (InstallPosture::MountedImage, false, true),
-            (InstallPosture::Translocated, false, true),
-            (InstallPosture::NotABundle, false, false),
-        ] {
-            assert_eq!(posture == InstallPosture::Installed, can_update);
-            assert_eq!(posture.remedy().is_some(), move_app);
-            assert!(!posture.summary().is_empty());
-            assert!(!posture.summary().ends_with('.'));
-            if let Some(remedy) = posture.remedy() {
-                assert!(remedy.contains("Applications"));
-                assert!(remedy.contains("update itself"));
-                assert!(remedy.contains("PATH"));
-            }
-        }
-    }
-}

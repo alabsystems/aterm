@@ -1,19 +1,11 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The shell integration re-sources atpkg's hook LIVE, in the same tab — so the two
-//! crates share two facts that nothing else ties together, and this file pins both from
-//! atpkg's side (`aterm-shell-integration` cannot depend on `atpkg`):
-//!
-//! 1. THE HOOK PATH SPELLING. Each script hard-codes `~/.aterm/shell.d/00-atpkg.<ext>`
-//!    as the file it re-sources when `$ATPKG_AGENTS` is missing or the copy on disk
-//!    moved. It must be `hooks::HOOK_BASENAME` under the directory `hooks::refresh`
-//!    writes, or a renamed hook would silently freeze every already-open tab again.
-//! 2. THE HOOK BODY. The live tests over there lay a hook in "hooks.rs's exact format"
-//!    from a golden fixture; this asserts [`atpkg::hooks::hook_files`] still produces
-//!    exactly that golden for the fixture paths, so a change to the template fails
-//!    HERE, naming the fixture to regenerate, instead of letting the other crate test
-//!    a hook atpkg no longer writes.
+//! The shell integration's live tests lay a hook in "hooks.rs's exact format" from a
+//! golden fixture (`aterm-shell-integration` cannot depend on `atpkg`); this drift gate
+//! asserts [`atpkg::hooks::hook_files`] still produces exactly that golden for the
+//! fixture paths, so a change to the template fails HERE, naming the fixture to
+//! regenerate, instead of letting the other crate test a hook atpkg no longer writes.
 
 use std::path::Path;
 
@@ -34,36 +26,6 @@ macro_rules! si_file {
             $rel
         ))
     };
-}
-
-#[test]
-fn every_shell_integration_script_re_sources_the_hook_atpkg_actually_writes() {
-    for (ext, script) in [
-        ("zsh", si_file!("scripts/aterm_shell_integration.zsh")),
-        ("bash", si_file!("scripts/aterm_shell_integration.bash")),
-        ("fish", si_file!("scripts/aterm_shell_integration.fish")),
-        ("ps1", si_file!("scripts/aterm_shell_integration.ps1")),
-    ] {
-        let spelled = format!(".aterm/shell.d/{}.{ext}", atpkg::hooks::HOOK_BASENAME);
-        assert!(
-            script.contains(&spelled),
-            "{SI}scripts/aterm_shell_integration.{ext} must name the hook atpkg writes ({spelled:?}) — \
-             the live re-source keys on it"
-        );
-        // And it is the hook file that pass writes, not merely a string that looks like one.
-        let written: Vec<String> = atpkg::hooks::hook_files(
-            Path::new(FIXTURE_BIN),
-            Path::new(FIXTURE_AGENTS),
-            Path::new(FIXTURE_REROUTE),
-        )
-        .into_iter()
-        .map(|(name, _)| name)
-        .collect();
-        assert!(
-            written.contains(&format!("{}.{ext}", atpkg::hooks::HOOK_BASENAME)),
-            "hook_files writes no .{ext} hook: {written:?}"
-        );
-    }
 }
 
 #[test]

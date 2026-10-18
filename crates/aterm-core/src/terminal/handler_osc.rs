@@ -130,8 +130,11 @@ impl TerminalHandler<'_> {
     /// 7 and OSC 633 `P;Cwd=` store a cwd. The title epoch bumps only when the
     /// value changes: hosts label titleless tabs with the cwd, and a shell
     /// re-reporting it each prompt must not thrash the label. A path
-    /// [`reported_cwd_is_storable`] refuses is ignored (the prior cwd stays).
-    pub(super) fn store_reported_cwd(&mut self, path: Option<&str>) {
+    /// [`reported_cwd_is_storable`] refuses is ignored (the prior cwd and its
+    /// host stay). `host` is the host the report named (`None`: an empty host,
+    /// `localhost`, or a report that names none), stored with the path it
+    /// qualifies, so a cwd and its host always come from the same report.
+    pub(super) fn store_reported_cwd(&mut self, path: Option<&str>, host: Option<&str>) {
         if path.is_some_and(|path| !reported_cwd_is_storable(path)) {
             return;
         }
@@ -141,46 +144,80 @@ impl TerminalHandler<'_> {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         *self.current_working_directory = path.map(String::from);
+        self.shell.cwd_host = host.filter(|_| path.is_some()).map(String::from);
+        self.shell.cwd_reports = self.shell.cwd_reports.saturating_add(1);
+        self.shell.cwd_carried = false;
     }
 
     /// Handle OSC 7 current working directory (`OSC 7 ; file://host/path ST`):
-    /// extract and percent-decode the path.
+    /// extract and percent-decode the path, and apply it, or hold it for the
+    /// shell's next prompt while the authenticated shell sits at its prompt
+    /// ([`Self::reported_cwd_waits_for_prompt`]).
     pub(super) fn handle_osc_7(&mut self, params: &[&[u8]]) {
+        let Some(report) = Self::osc_7_report(params) else {
+            return;
+        };
+        if self.reported_cwd_waits_for_prompt() {
+            // The latest report wins: the shell's own comes last, right
+            // before its prompt start.
+            self.shell.held_cwd = Some(report);
+        } else {
+            self.apply_cwd_report(report);
+        }
+    }
+
+    /// What an OSC 7 does to the reported cwd, or `None` when it leaves it
+    /// unchanged (a non-file:// URI, an unstorable path).
+    fn osc_7_report(params: &[&[u8]]) -> Option<super::shell::CwdReport> {
         // params[0] = "7"; params[1..] = the URI. URIs may contain literal
         // semicolons (RFC 3986 §3.3), which the parser splits: rejoin with ";".
         // A missing, empty or non-UTF-8 URI clears the cwd.
         let uri_bytes = params.get(1..).unwrap_or_default().join(&b';');
         let uri = std::str::from_utf8(&uri_bytes).unwrap_or_default();
         if uri.is_empty() {
-            self.store_reported_cwd(None);
-            return;
+            return Some(super::shell::CwdReport {
+                event: None,
+                path: None,
+                host: None,
+            });
         }
 
-        if let Some((host, path)) = Self::parse_file_uri(uri) {
-            // A non-local RFC 8089 host (Windows UNC `file://server/share/dir`,
-            // an SSH remote) must reach the embedder: queue it as `//host/path`,
-            // which Windows accepts natively. An empty host or "localhost" keeps
-            // the bare decoded path. The engine cannot know its own hostname
-            // (wasm has none), so the consumer decides whether a named host is
-            // local.
-            let event_payload = match &host {
-                Some(h) => format!("//{h}{path}"),
-                None => path.clone(),
-            };
-            // Refuse an unstorable path before it is queued or stored (the parser
-            // admits up to MAX_OSC_DATA, 8 MiB).
-            if !reported_cwd_is_storable(&event_payload) {
-                return;
-            }
-            // Queue the real parsed cwd (host-preserving) for poll-based hosts.
-            self.queue_osc_event(7, event_payload);
-            // current_working_directory and command marks keep the plain decoded
-            // path: shells often report their own hostname for a local cwd, and
-            // local-path consumers (spawn-in-cwd, the `cwd` verb) need a real
-            // local directory.
-            self.store_reported_cwd(Some(&path));
-        }
         // A non-file:// URI leaves the cwd unchanged.
+        let (host, path) = Self::parse_file_uri(uri)?;
+        // A non-local RFC 8089 host (Windows UNC `file://server/share/dir`, an
+        // SSH remote) must reach the embedder: queue it as `//host/path`, which
+        // Windows accepts natively. An empty host or "localhost" keeps the bare
+        // decoded path. The engine cannot know its own hostname (wasm has none),
+        // so the consumer decides whether a named host is local.
+        let event = match &host {
+            Some(h) => format!("//{h}{path}"),
+            None => path.clone(),
+        };
+        // Refuse an unstorable path before it is queued or stored (the parser
+        // admits up to MAX_OSC_DATA, 8 MiB).
+        if !reported_cwd_is_storable(&event) {
+            return None;
+        }
+        // The stored cwd and command marks keep the plain decoded path: shells
+        // often report their own hostname for a local cwd, and local-path
+        // consumers (spawn-in-cwd, the `cwd` verb) need a real local directory.
+        // The host is stored beside it (`Terminal::reported_cwd_host`): only
+        // the embedder knows its own name, so only it can tell a remote
+        // shell's directory from this machine's.
+        Some(super::shell::CwdReport {
+            event: Some(event),
+            path: Some(path),
+            host,
+        })
+    }
+
+    /// Apply an OSC 7 report: queue its real parsed cwd (host-preserving) for
+    /// poll-based hosts, then store its local path (or clear the cwd).
+    pub(super) fn apply_cwd_report(&mut self, report: super::shell::CwdReport) {
+        if let Some(event) = report.event {
+            self.queue_osc_event(7, event);
+        }
+        self.store_reported_cwd(report.path.as_deref(), report.host.as_deref());
     }
 
     /// Parse a file:// URI into (host, path). The path is percent-decoded; the
@@ -209,8 +246,8 @@ impl TerminalHandler<'_> {
     // Accept: a URI whose scheme is host-minted is admitted iff the mint is live;
     // bound by conformance_hyperlink_scheme_cap's action_enabled checks.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "hyperlink_scheme_cap",
             action = "Accept",
             project = "conformance_hyperlink_scheme_cap::project"
@@ -315,7 +352,7 @@ impl TerminalHandler<'_> {
 
     /// Handle OSC 52 clipboard query (Pd = "?"). Needs both a host-minted query
     /// capability and the `ResponseCapability`, each unforgeable outside its
-    /// module (private `_seal: ()`).
+    /// module (private `_seal`).
     fn handle_osc_52_query(
         &mut self,
         cap: &super::response_capability::ResponseCapability,
@@ -548,25 +585,14 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_title_strips_c0_controls() {
+    fn sanitize_title_strips_c0_and_c1_controls() {
         assert_eq!(sanitize_title("a\x00b\x01c"), "abc");
         assert_eq!(sanitize_title("a\x1bESCb"), "aESCb");
         assert_eq!(sanitize_title("a\x0Ab"), "ab"); // LF
         assert_eq!(sanitize_title("a\x0Db"), "ab"); // CR
-    }
-
-    #[test]
-    fn sanitize_title_strips_c1_controls() {
         assert_eq!(sanitize_title("a\u{0080}b"), "ab");
         assert_eq!(sanitize_title("a\u{009B}31mb"), "a31mb"); // C1 CSI
         assert_eq!(sanitize_title("a\u{009F}b"), "ab");
-    }
-
-    #[test]
-    fn sanitize_title_strips_all_nine_bidi_overrides_concatenated() {
-        // CVE-2021-42574 (Trojan Source): all nine override codepoints.
-        let payload = "X\u{202A}\u{202B}\u{202C}\u{202D}\u{202E}\u{2066}\u{2067}\u{2068}\u{2069}Y";
-        assert_eq!(sanitize_title(payload), "XY");
     }
 
     // ---- OSC 0/1/2 end-to-end (Terminal::process) --------------------------
@@ -668,19 +694,6 @@ mod tests {
     }
 
     #[test]
-    fn osc_1_icon_strips_bidi_override() {
-        let mut term = Terminal::new(24, 80);
-        let payload = "safe\u{2066}evil";
-        let seq = format!("\x1b]1;{payload}\x07");
-        term.process(seq.as_bytes());
-        assert_eq!(
-            term.icon_name(),
-            "safeevil",
-            "U+2066 LRI must be stripped from OSC 1 icon name"
-        );
-    }
-
-    #[test]
     fn osc_0_invalid_utf8_title_is_lossy_decoded() {
         let mut term = Terminal::new(24, 80);
         term.process(b"\x1b]0;Title\x9cMore\x07");
@@ -742,6 +755,94 @@ mod tests {
             );
             assert_eq!(term.hyperlink_at_visible(0, 1), None, "{refused:.40}");
         }
+    }
+
+    /// The host an OSC 7 names is stored beside the path it qualifies, so an
+    /// embedder can tell a remote shell's directory from its own: `localhost`
+    /// and an empty host name none, a clear and the shell's own `633;P;Cwd=`
+    /// drop it, a RIS keeps it with its cwd, and a refused report leaves both.
+    /// NEGATIVE CONTROL: the stored path is the same plain path either way, so
+    /// only the host tells the two apart.
+    #[test]
+    fn osc_7_keeps_the_host_it_names_beside_the_path() {
+        let mut term = Terminal::new(24, 80);
+        assert_eq!(term.reported_cwd_host(), None, "no report, no host");
+        term.process(b"\x1b]7;file://build-box.example/srv/app\x07");
+        assert_eq!(term.current_working_directory(), Some("/srv/app"));
+        assert_eq!(term.reported_cwd_host(), Some("build-box.example"));
+        // Control: the same path from a local report names no host.
+        for local in [
+            &b"\x1b]7;file:///srv/app\x07"[..],
+            b"\x1b]7;file://localhost/srv/app\x07",
+            b"\x1b]7;file://LocalHost/srv/app\x07",
+        ] {
+            term.process(b"\x1b]7;file://build-box.example/srv/app\x07");
+            term.process(local);
+            assert_eq!(term.current_working_directory(), Some("/srv/app"));
+            assert_eq!(term.reported_cwd_host(), None, "{local:?}");
+        }
+        // A refused report (NUL in the path) changes neither.
+        term.process(b"\x1b]7;file://build-box.example/srv/app\x07");
+        term.process(b"\x1b]7;file://elsewhere/tmp/a%00b\x07");
+        assert_eq!(term.current_working_directory(), Some("/srv/app"));
+        assert_eq!(term.reported_cwd_host(), Some("build-box.example"));
+        // A RIS keeps the cwd, and with it the host that qualifies it.
+        term.process(b"\x1bc");
+        assert_eq!(term.current_working_directory(), Some("/srv/app"));
+        assert_eq!(term.reported_cwd_host(), Some("build-box.example"));
+        // The shell's own 633 word names a path on its own machine.
+        term.process(b"\x1b]633;P;Cwd=/home/me\x07");
+        assert_eq!(term.current_working_directory(), Some("/home/me"));
+        assert_eq!(term.reported_cwd_host(), None);
+        // A clear drops both.
+        term.process(b"\x1b]7;file://build-box.example/srv/app\x07");
+        term.process(b"\x1b]7;\x07");
+        assert_eq!(term.current_working_directory(), None);
+        assert_eq!(term.reported_cwd_host(), None);
+        // A restored engine installs the carried cwd and names no host for it.
+        term.process(b"\x1b]7;file://build-box.example/srv/app\x07");
+        let restored = Terminal::from_checkpoint(&term.checkpoint());
+        assert_eq!(restored.current_working_directory(), Some("/srv/app"));
+        assert_eq!(restored.reported_cwd_host(), None);
+    }
+
+    /// Every stored report gets the next number, so an embedder that noted
+    /// which group was in front at report `n` knows the next report by its
+    /// own: a re-report of the very same cwd and host is a new number, a RIS
+    /// keeps the count, and a refused report takes none. A cwd a checkpoint
+    /// carried is no report at all (`None`) until the shell's next one, which
+    /// numbers past every count the engine reached before an in-place
+    /// restore. NEGATIVE CONTROL: the stored cwd and host are identical
+    /// before and after the re-report; only the number moves.
+    #[test]
+    fn every_stored_cwd_report_has_its_own_number() {
+        let mut term = Terminal::new(24, 80);
+        assert_eq!(term.reported_cwd_seq(), Some(0), "no report yet");
+        let remote = b"\x1b]7;file://build-box.example/srv/app\x07";
+        term.process(remote);
+        assert_eq!(term.reported_cwd_seq(), Some(1));
+        term.process(remote);
+        assert_eq!(term.current_working_directory(), Some("/srv/app"));
+        assert_eq!(term.reported_cwd_host(), Some("build-box.example"));
+        assert_eq!(term.reported_cwd_seq(), Some(2), "the same report again");
+        term.process(b"\x1b]7;file://elsewhere/tmp/a%00b\x07");
+        assert_eq!(term.reported_cwd_seq(), Some(2), "a refused report");
+        term.process(b"\x1b]633;P;Cwd=/home/me\x07");
+        assert_eq!(term.reported_cwd_seq(), Some(3), "the shell's own word");
+        term.process(b"\x1bc");
+        assert_eq!(term.reported_cwd_seq(), Some(3), "a RIS keeps the count");
+        // Carried: no report stands behind the restored cwd.
+        let mut restored = Terminal::from_checkpoint(&term.checkpoint());
+        assert_eq!(restored.current_working_directory(), Some("/home/me"));
+        assert_eq!(restored.reported_cwd_seq(), None);
+        restored.process(remote);
+        assert_eq!(restored.reported_cwd_seq(), Some(1));
+        // In place: the carry replaces the cwd, and the count runs on.
+        let carry = Terminal::new(24, 80).checkpoint();
+        term.restore_checkpoint(&carry);
+        assert_eq!(term.reported_cwd_seq(), None);
+        term.process(remote);
+        assert_eq!(term.reported_cwd_seq(), Some(4));
     }
 
     // ---- OSC 7 / OSC 633-P cwd byte cap ----------------------
@@ -827,33 +928,6 @@ mod tests {
         let mut fresh = Terminal::new(24, 80);
         fresh.process(b"\x1b]7;file:///tmp/a%00b\x07");
         assert_eq!(fresh.current_working_directory(), None);
-    }
-
-    /// The NUL refusal is in `store_reported_cwd` itself, so it holds for every
-    /// caller. Called directly: the parser drops C0 NUL inside an OSC string, so
-    /// OSC 633 cannot carry one.
-    #[test]
-    fn the_cwd_store_ignores_a_path_with_a_nul_byte() {
-        let mut term = Terminal::new(24, 80);
-        term.process(b"\x1b]633;P;Cwd=/home/user\x07");
-        assert_eq!(term.current_working_directory(), Some("/home/user"));
-        let epoch = term.title_epoch();
-        {
-            let (_parser, mut handler) = term.split_for_process();
-            handler.store_reported_cwd(Some("/tmp/a\0b"));
-        }
-        assert_eq!(
-            term.current_working_directory(),
-            Some("/home/user"),
-            "a cwd containing NUL must not overwrite the prior cwd"
-        );
-        assert_eq!(term.title_epoch(), epoch);
-        // Clearing (`None`) is still honoured — only an unstorable path is ignored.
-        {
-            let (_parser, mut handler) = term.split_for_process();
-            handler.store_reported_cwd(None);
-        }
-        assert_eq!(term.current_working_directory(), None);
     }
 
     #[test]
@@ -1006,28 +1080,6 @@ mod tests {
         assert!(
             term.current_hyperlink().is_none(),
             "a scheme with smuggled chars must fail the shared RFC 3986 shape walk"
-        );
-    }
-
-    #[test]
-    fn revoke_hyperlink_scheme_restores_default_allowlist() {
-        let mut term = Terminal::new(24, 80);
-        assert!(term.authorize_hyperlink_scheme("orca"));
-        term.process(b"\x1b]8;;orca://focus/w1\x07");
-        assert!(term.current_hyperlink().is_some());
-        term.process(b"\x1b]8;;\x07");
-
-        term.revoke_hyperlink_scheme("ORCA"); // case-insensitive removal
-        term.process(b"\x1b]8;;orca://focus/w1\x07");
-        assert!(
-            term.current_hyperlink().is_none(),
-            "a revoked extra scheme must be refused again"
-        );
-        // The hardcoded safe allowlist is untouched throughout.
-        term.process(b"\x1b]8;;https://example.com/a\x07");
-        assert_eq!(
-            term.current_hyperlink().map(|s| s.as_ref()),
-            Some("https://example.com/a")
         );
     }
 

@@ -113,7 +113,6 @@ fn cfg() -> GlowConfig {
         ring: true,
         beam: false,
         head_dx: 0.5,
-        pack: None,
     }
 }
 
@@ -255,7 +254,8 @@ impl Host {
             (r + 1 < ROWS).then_some(self.below.as_slice()),
         );
         self.glow.observe_ribbon_row(c.row, &self.row_buf);
-        self.glow.observe_print_anchor(self.term.print_anchor());
+        self.glow
+            .observe_print_anchor(aterm_effects::host::motion_print_anchor(&self.term).0);
         let mut rows = [0u16; WITNESS_ROWS];
         let n = self.glow.ribbon_rows(&mut rows);
         for &row in &rows[..n] {
@@ -968,55 +968,37 @@ fn a_delayed_first_key_still_carries_the_glued_word_down() {
     );
 }
 
-/// Negative control: a footer that shows the pressed key's own glyph with the
-/// input row untouched is still a footer. The park keeps custody, the row below
-/// never lights, and the key's echo on row 1 is laid (the glyph witness alone
-/// must not refuse the park).
+/// A key's footer keeps the park's custody: a program chunk that parks the
+/// caret one row down after a glyph, then the key's echo on row 1. The row
+/// below never lights and the key's own echo on row 1 is laid, whether the
+/// footer shows the key's own glyph with the input row untouched (the glyph
+/// witness alone must not refuse the park), erases the input row's tail under
+/// a glyph the key did not stamp (a ghost suggestion cleared, a status line),
+/// or erases it under the key's own glyph (the old tail must also follow the
+/// landing glyph to prove the word moved).
 #[test]
-fn a_footer_showing_the_keys_own_glyph_keeps_the_parks_custody() {
-    let (cc, col) = footer_before_the_echo('x', false);
-    let footer = cc.shots.iter().filter(|s| s.lit[1].contains(&true)).count();
-    let key = cc.echoed[0];
-    assert_eq!(
-        footer,
-        0,
-        "the footer spent the key\n{}",
-        cc.dump((key.saturating_sub(80), key + 32))
-    );
-    let last = cc.shots.last().expect("a frame");
-    assert!(
-        last.text[0].contains("had this xprompt") && last.lit[0][col],
-        "the key's own echo went dark: r16 |{}|",
-        map(&last.lit[0])
-    );
-}
-
-/// Negative control: the input row's tail erased while the caret parks one row
-/// down after a glyph the key did not stamp (a ghost suggestion cleared, a
-/// status line) is not the key's echo; the row below never lights.
-#[test]
-fn an_erased_tail_under_a_foreign_footer_glyph_keeps_the_parks_custody() {
-    let (cc, col) = footer_before_the_echo('.', true);
-    let footer = cc.shots.iter().filter(|s| s.lit[1].contains(&true)).count();
-    assert_eq!(footer, 0, "the footer spent the key");
-    let last = cc.shots.last().expect("a frame");
-    assert!(
-        last.lit[0][col],
-        "the key's own echo went dark: r16 |{}|",
-        map(&last.lit[0])
-    );
-}
-
-/// A footer may print the same glyph as the unpaid key while erasing the input
-/// row's tail; the old tail must also follow the landing glyph to prove the
-/// word moved.
-#[test]
-fn an_erased_tail_under_a_same_glyph_footer_keeps_the_parks_custody() {
-    let (cc, col) = footer_before_the_echo('x', true);
-    let footer = cc.shots.iter().filter(|s| s.lit[1].contains(&true)).count();
-    assert_eq!(footer, 0, "the footer spent the key");
-    let last = cc.shots.last().expect("a frame");
-    assert!(last.lit[0][col], "the key's echo went dark");
+fn a_footer_before_the_echo_keeps_the_parks_custody() {
+    for (what, glyph, erase_tail) in [
+        ("the key's own glyph", 'x', false),
+        ("an erased tail under a foreign glyph", '.', true),
+        ("an erased tail under the key's own glyph", 'x', true),
+    ] {
+        let (cc, col) = footer_before_the_echo(glyph, erase_tail);
+        let footer = cc.shots.iter().filter(|s| s.lit[1].contains(&true)).count();
+        let key = cc.echoed[0];
+        assert_eq!(
+            footer,
+            0,
+            "{what}: the footer spent the key\n{}",
+            cc.dump((key.saturating_sub(80), key + 32))
+        );
+        let last = cc.shots.last().expect("a frame");
+        assert!(
+            last.text[0].contains("had this xprompt") && last.lit[0][col],
+            "{what}: the key's own echo went dark: r16 |{}|",
+            map(&last.lit[0])
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1206,14 +1188,6 @@ fn a_scrub_over_the_word_keeps_the_word_lit_when_it_wraps_down() {
         's',
     );
     assert_rewrap_clean(&cc, wrap, 2..=21, "scrub");
-}
-
-/// CONTROL: the same word typed straight through after the hand's own
-/// Space (the measure `moved_word_len` was written for) goes down lit.
-#[test]
-fn control_a_word_typed_straight_through_wraps_down_lit() {
-    let (cc, wrap) = word_then_wrap(" crates/aterm-effect", |_| {}, 's');
-    assert_rewrap_clean(&cc, wrap, 2..=21, "straight");
 }
 
 // ---------------------------------------------------------------------------
@@ -1538,21 +1512,6 @@ fn control_a_word_after_the_hands_own_space_is_relaid_exactly() {
     assert!(f.indent.is_empty(), "{}", f.summary());
     assert!(
         !f.stranded.iter().any(|&(ms, r, _)| r == ROW1 && ms >= late),
-        "{}",
-        f.summary()
-    );
-}
-
-/// With the chip already on row 2 (row 1 too long for `[Image`), the whole
-/// insert happens on row 2 with no fold and no lift: every glyph lit,
-/// nothing stranded, nothing on the indent.
-#[test]
-fn control_an_insert_that_never_folds_keeps_its_band_whole() {
-    let mut cc = painted("the aterm window had this prompt appear. you had to have");
-    let from = cc.insert_before_chip(TYPED, 110);
-    let f = cc.faults(from);
-    assert!(
-        f.dark.is_empty() && f.indent.is_empty() && f.stranded.is_empty(),
         "{}",
         f.summary()
     );

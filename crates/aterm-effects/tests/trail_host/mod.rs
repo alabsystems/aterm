@@ -128,12 +128,6 @@ pub struct Law {
 }
 
 impl Law {
-    pub fn check(&mut self, cond: bool, what: impl FnOnce() -> String) {
-        if !cond {
-            self.fails.push(what());
-        }
-    }
-
     pub fn eq<T: PartialEq + std::fmt::Debug>(&mut self, got: T, want: T, what: &str) {
         if got != want {
             self.fails
@@ -248,7 +242,6 @@ pub fn cfg(theme: Theme) -> GlowConfig {
         ring: true,
         beam: false,
         head_dx: 0.5,
-        pack: None,
     }
 }
 

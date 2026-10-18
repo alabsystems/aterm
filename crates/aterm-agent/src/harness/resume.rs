@@ -6,21 +6,23 @@
 //! Never `claude --continue`, which resumes the directory's newest conversation, a sibling tab's
 //! when several Claude Codes share a directory.
 //!
-//! [`command`] carries flags as the relaunch does; [`codex_command`] makes a Codex's line,
-//! `codex resume <kept flags> <thread>`, behind `CODEX_HOME=<value>` where the TUI was started
-//! with one; [`of_entry`] guards against pid reuse; [`shorter`] steps either line down to fit a
-//! budget, never cutting it (a cut id names no conversation, or another's) and never dropping a
-//! Codex line's home.
+//! [`command`] carries flags as the relaunch does; [`of_entry`] guards against pid reuse;
+//! [`shorter`] steps the line down to fit a budget, never cutting it (a cut id names no
+//! conversation, or another's). No Codex line is made here (the Codex screen lane's retirement,
+//! 2026-10-16): codex-alab comes back on the line aterm's copy of its own record validated, and
+//! a vendor `codex` is shown, never supervised.
 //!
 //! The command names its program as a person types it, whatever path the process ran from. It
 //! does not `cd`: `--resume` finds a conversation under the directory it was started in, the tab's
 //! shell's directory for every launch made from that shell. It does not carry the login a
-//! relaunch chose ([`SHELL_LOGIN_CLAUSE`]).
+//! relaunch chose ([`SHELL_LOGIN_CLAUSE`]). It DOES carry the Claude home its agent ran under,
+//! where that is not the tab's shell's ([`with_env`], [`home_env`]; ATERM-KI-1015-1 LC-4): a home
+//! not carried resumes nothing — the shell's own finds no transcript of it, or meets the first-run
+//! screen — and every shorter form keeps it ([`shorter`]).
 
 use std::path::Path;
 
 use super::upgrade::{self, ArgvRefusal, Dialect};
-use super::upgrade_codex;
 
 /// What follows a frozen agent's restart, as a remedy says it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -37,8 +39,8 @@ pub enum AfterRestart {
     /// relaunch would come ([`super::relaunch::resumes_on_exit`]).
     Relaunch,
     /// The host carries the explicit restart ([`restart_command`]) and brings back what it ends
-    /// ([`super::relaunch::carries_restart`]), but cannot promise how: a Codex resumes its thread
-    /// where that has a rollout by then, else starts afresh. The remedy names only the restart.
+    /// ([`super::relaunch::carries_restart`]), but cannot promise how: a codex-alab whose
+    /// validated line has no shell to type it at yet. The remedy names only the restart.
     Act,
 }
 
@@ -114,45 +116,18 @@ pub fn never_cut(text: &str, render: impl Fn(&str) -> String) -> String {
 
 /// The resume line `text` names after [`THEN_RESUME_WITH`], and the byte range of the whole clause
 /// (the marker and the line): the line runs from the marker to the end of the first
-/// `--resume <id>` after it, the pair [`command`] always ends with, or for a Codex's line
-/// (`codex resume …`, or `CODEX_HOME=… codex resume …`) to its thread ([`codex_line_end`]).
+/// `--resume <id>` after it, the pair [`command`] always ends with.
 fn named_line(text: &str) -> Option<(std::ops::Range<usize>, &str)> {
     const FLAG: &str = " --resume ";
     let at = text.find(THEN_RESUME_WITH)?;
     let start = at + THEN_RESUME_WITH.len();
     let rest = &text[start..];
-    let end = if rest.starts_with(CODEX_RESUME) || rest.starts_with(CODEX_HOME_WORD) {
-        codex_line_end(rest)?
-    } else {
-        rest.match_indices(FLAG).find_map(|(i, _)| {
-            let id_at = i + FLAG.len();
-            let id = rest.get(id_at..id_at + 36)?;
-            upgrade::is_session_id(id).then_some(id_at + 36)
-        })?
-    };
+    let end = rest.match_indices(FLAG).find_map(|(i, _)| {
+        let id_at = i + FLAG.len();
+        let id = rest.get(id_at..id_at + 36)?;
+        upgrade::is_session_id(id).then_some(id_at + 36)
+    })?;
     Some((at..start + end, &rest[..end]))
-}
-
-/// What a Codex's resume line starts with ([`codex_command`]), behind the
-/// home it carries, if any ([`CODEX_HOME_WORD`]).
-const CODEX_RESUME: &str = "codex resume ";
-
-/// What a Codex's resume line that carries its home starts with ([`home_word`]).
-const CODEX_HOME_WORD: &str = "CODEX_HOME=";
-
-/// The end of the Codex line `rest` starts with: the longest prefix that ends in a thread id and
-/// reads back as exactly such a line ([`codex_parts`]). The longest, so a flag value that is a
-/// thread id does not end the line early; no longer prefix reads back, since the thread would
-/// become a positional the rewrite drops.
-fn codex_line_end(rest: &str) -> Option<usize> {
-    const ID: usize = 36;
-    (ID..=rest.len())
-        .rev()
-        .filter(|&end| {
-            rest.get(end - ID..end)
-                .is_some_and(upgrade_codex::is_thread_id)
-        })
-        .find(|&end| codex_parts(&rest[..end]).is_some())
 }
 
 /// The line a person runs to resume `session_id` with the flags `argv` (`argv[0]` first) was
@@ -176,49 +151,6 @@ pub fn command(argv: &[String], session_id: &str) -> Option<String> {
     typed("claude", &flags)
 }
 
-/// The line a person runs to resume a Codex on its thread `thread` with the flags `argv`
-/// (`argv[0]` first) was launched with: `codex resume <kept flags> <thread>`, carried as
-/// [`upgrade_codex::rewrite_argv`] carries them and quoted as [`command`] quotes. `None` for a
-/// thread that is not one, a control character in a carried word or the home, or a launch the
-/// rewrite refuses (an unknown flag, `--worktree`, `--remote`). Whether the thread is the
-/// process's alone is the caller's to know: a read that cannot tell it from another client's
-/// names none.
-///
-/// `home`: the `CODEX_HOME` the TUI's exec environment set, verbatim
-/// (`relaunch::CodexRun::home_env`), carried in front (`CODEX_HOME=<value> codex resume …`) as
-/// the relaunch line carries it ([`upgrade_codex::line_env`]): without it `codex resume` looks
-/// under `~/.codex`, where that thread is not, so no shorter form drops it. `None`: the TUI
-/// had none.
-#[must_use]
-pub fn codex_command(argv: &[String], thread: &str, home: Option<&str>) -> Option<String> {
-    if !upgrade_codex::is_thread_id(thread) {
-        return None;
-    }
-    let line = typed(
-        "codex",
-        &upgrade_codex::rewrite_argv(argv, Some(thread)).ok()?,
-    )?;
-    Some(match home {
-        Some(home) => format!("{} {line}", home_word(home)?),
-        None => line,
-    })
-}
-
-/// `CODEX_HOME=<value>` as a shell reads an assignment: the value quoted
-/// where it needs it, never the name (a quoted `NAME=` is a command, not
-/// an assignment); `None` for a control character, which no line carries.
-fn home_word(home: &str) -> Option<String> {
-    if home.chars().any(char::is_control) {
-        return None;
-    }
-    let value = if needs_quotes(home) {
-        upgrade::quote(Dialect::Zsh, home)
-    } else {
-        home.to_string()
-    };
-    Some(format!("{}={value}", upgrade_codex::HOME_ENV))
-}
-
 /// `program` and `words`, as a person types them: each word quoted where a
 /// shell would read it otherwise ([`needs_quotes`]); `None` for a word with
 /// a control character, which no line carries.
@@ -238,48 +170,6 @@ fn typed(program: &str, words: &[String]) -> Option<String> {
     Some(line)
 }
 
-/// A Codex resume line's carried argv (`codex` and its flags, as [`codex_command`] takes them),
-/// its thread and the `CODEX_HOME` it carries. `None` for any text that is not exactly such a
-/// line: its words, read back as [`upgrade::quote`] wrote them, must make the same line again.
-fn codex_parts(line: &str) -> Option<CodexParts> {
-    let words = super::upgrade_drive::last_command(line);
-    let (home, words) = match words.split_first() {
-        Some((first, rest)) => match first.split_once('=') {
-            Some((upgrade_codex::HOME_ENV, value)) => (Some(value.to_string()), rest),
-            _ => (None, words.as_slice()),
-        },
-        None => return None,
-    };
-    let [codex, resume, flags @ .., thread] = words else {
-        return None;
-    };
-    if codex != "codex" || resume != "resume" {
-        return None;
-    }
-    let argv: Vec<String> = std::iter::once(codex.clone())
-        .chain(flags.iter().cloned())
-        .collect();
-    (codex_command(&argv, thread, home.as_deref()).as_deref() == Some(line)).then(|| CodexParts {
-        argv,
-        thread: thread.clone(),
-        home,
-    })
-}
-
-/// What [`codex_parts`] reads back from a Codex's line.
-struct CodexParts {
-    argv: Vec<String>,
-    thread: String,
-    home: Option<String>,
-}
-
-impl CodexParts {
-    /// The line's bare form: `codex resume <thread>`, its home kept.
-    fn bare(&self) -> Option<String> {
-        codex_command(&["codex".to_string()], &self.thread, self.home.as_deref())
-    }
-}
-
 /// `claude --resume <session_id>`: the conversation alone, no carried flag.
 /// `None` for an id that is not one.
 #[must_use]
@@ -287,47 +177,135 @@ pub fn bare(session_id: &str) -> Option<String> {
     upgrade::is_session_id(session_id).then(|| format!("claude --resume {session_id}"))
 }
 
-/// The bare form of a line [`command`] made, [`bare`] of the id after its last `--resume`, or of
-/// one [`codex_command`] made, `codex resume <thread>` behind the `CODEX_HOME` the line carries,
-/// which it never drops. `None` for any other text.
+/// `line` ([`command`]) with `env` in front of it: `NAME=value ` words, each
+/// value plain where it is `[A-Za-z0-9_./-]` and quoted otherwise, as the
+/// relaunch line writes them (`upgrade::relaunch_line_env`). What a told
+/// line carries is the Claude home its agent ran under ([`home_env`]) —
+/// never the login (see [`SHELL_LOGIN_CLAUSE`]): landing on the shell's
+/// login resumes the conversation, but a home not carried resumes nothing.
+/// `None` for a name that is not `[A-Z0-9_]+`, or a value with a control
+/// character.
 #[must_use]
-pub fn bare_of(line: &str) -> Option<String> {
-    if let Some(parts) = codex_parts(line) {
-        return parts.bare();
+pub fn with_env(env: &[(&str, &str)], line: &str) -> Option<String> {
+    let mut out = String::new();
+    for (name, value) in env {
+        if !env_name(name) || value.chars().any(char::is_control) {
+            return None;
+        }
+        let plain = !value.is_empty()
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'/' | b'-'));
+        out.push_str(name);
+        out.push('=');
+        if plain {
+            out.push_str(value);
+        } else {
+            out.push_str(&upgrade::quote(Dialect::Zsh, value));
+        }
+        out.push(' ');
     }
-    let (_, id) = line.rsplit_once(" --resume ")?;
-    bare(id)
+    out.push_str(line);
+    Some(out)
 }
 
-/// The permission-mode form of a line [`command`] or [`codex_command`] made: the line with only the
-/// flags that set its permission mode ([`upgrade::permission_argv`]; for a Codex, its approval and
-/// sandbox flags, [`upgrade_codex::permission_argv`]). `None` for any other text and for a launch
+/// THE CLAUDE HOME A TOLD LINE CARRIES for a process whose exec environment
+/// named `config` (its raw `CLAUDE_CONFIG_DIR`, set, empty or not) and whose
+/// records are in `claude_dir`, for a user whose home is `user_home`: the
+/// `CLAUDE_CONFIG_DIR` as it was given; and, with none, the `HOME` that
+/// holds its records' `.claude` where that is not the user's
+/// ([`super::upgrade_drive::homedir_holding`], the relaunch line's own rule,
+/// [`super::upgrade_drive::home_carried`]). Nothing for an agent under the
+/// user's own home: its line is the one it always was.
+#[must_use]
+pub fn home_env(
+    user_home: &Path,
+    config: Option<&str>,
+    claude_dir: Option<&Path>,
+) -> Vec<(&'static str, String)> {
+    if let Some(config) = config {
+        return vec![(super::accounts::HOME_ENV, config.to_string())];
+    }
+    claude_dir
+        .filter(|dir| !super::upgrade_drive::same_dir(dir, &user_home.join(".claude")))
+        .and_then(super::upgrade_drive::homedir_holding)
+        .map(|homedir| ("HOME", homedir))
+        .into_iter()
+        .collect()
+}
+
+/// Whether `name` can be an environment variable's in a line: `[A-Z0-9_]+`.
+fn env_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// A told line split at its program: the `NAME=value ` words [`with_env`]
+/// put in front of it, and the command from `claude` on.
+fn split_env(line: &str) -> (&str, &str) {
+    let mut at = 0;
+    while let Some(len) = env_word_len(&line[at..]) {
+        at += len;
+    }
+    line.split_at(at)
+}
+
+/// The length of the `NAME=value ` word `rest` begins with, its space
+/// included — a value read as [`with_env`] quotes it — or `None` where it
+/// begins with no such word.
+fn env_word_len(rest: &str) -> Option<usize> {
+    let eq = rest.find('=')?;
+    if !env_name(&rest[..eq]) {
+        return None;
+    }
+    let mut quoted = false;
+    let mut chars = rest[eq + 1..].char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\'' => quoted = !quoted,
+            '\\' if !quoted => {
+                chars.next();
+            }
+            ' ' if !quoted => return Some(eq + 1 + i + 1),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The bare form of a line [`command`] made, [`bare`] of the id after its last `--resume`, the
+/// Claude home in front of it kept ([`with_env`]). `None` for any other text.
+#[must_use]
+pub fn bare_of(line: &str) -> Option<String> {
+    let (env, line) = split_env(line);
+    let (_, id) = line.rsplit_once(" --resume ")?;
+    bare(id).map(|bare| format!("{env}{bare}"))
+}
+
+/// The permission-mode form of a line [`command`] made: the line with only the flags that set its
+/// permission mode ([`upgrade::permission_argv`]). `None` for any other text and for a launch
 /// that set no permission mode. The words are read back as [`upgrade::quote`] wrote them, so a
 /// value that only looks like a permission flag is none.
 #[must_use]
 pub fn mode_of(line: &str) -> Option<String> {
-    if let Some(parts) = codex_parts(line) {
-        let bare = parts.bare();
-        return codex_command(
-            &upgrade_codex::permission_argv(&parts.argv),
-            &parts.thread,
-            parts.home.as_deref(),
-        )
-        .filter(|mode| Some(mode) != bare.as_ref());
-    }
+    let (env, line) = split_env(line);
     let (_, id) = line.rsplit_once(" --resume ")?;
     let words = super::upgrade_drive::last_command(line);
     if words.first().map(String::as_str) != Some("claude") {
         return None;
     }
-    command(&upgrade::permission_argv(&words), id).filter(|mode| bare(id).as_ref() != Some(mode))
+    command(&upgrade::permission_argv(&words), id)
+        .filter(|mode| bare(id).as_ref() != Some(mode))
+        .map(|mode| format!("{env}{mode}"))
 }
 
-/// The shorter forms of a line [`command`] or [`codex_command`] made, in the order a surface whose
+/// The shorter forms of a line [`command`] made, in the order a surface whose
 /// budget cannot hold it steps down through them: its permission mode alone ([`mode_of`]), then the
-/// conversation alone ([`bare_of`]), each only where shorter than the one before; none for any
-/// other text. The permission mode goes last: the bare line brings a session back in another
-/// permission mode.
+/// conversation alone ([`bare_of`]), each only where shorter than the one before and each keeping
+/// the home in front of the line ([`with_env`], a Codex's `CODEX_HOME`); none for any other text.
+/// The permission mode goes last: the bare line brings a session back in another permission mode.
 #[must_use]
 pub fn shorter(line: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -372,6 +350,7 @@ fn program_argv(argv: &[String]) -> &[String] {
                     aterm_phase::Program::Codex
                     | aterm_phase::Program::Agy
                     | aterm_phase::Program::Muse
+                    | aterm_phase::Program::Gemini
                     | aterm_phase::Program::Generic => false,
                 })
     });

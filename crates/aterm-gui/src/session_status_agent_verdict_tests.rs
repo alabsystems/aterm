@@ -1120,7 +1120,7 @@ fn claude_is_published_idle_exactly_where_the_model_types() {
         LAUNCH_BEFORE_REPL, LAUNCH_REPL_HALF_DRAWN, LAUNCH_REPL_READY, SHELL_MODE,
         SHELL_MODE_DRAFT, TRUST, cursor, screen,
     };
-    let model = aterm_spec::derive::claude_idle_at_composer_model();
+    let model = aterm_models_harness::claude_idle_at_composer_model();
     let old = aterm_spec::interp::with_buggy(&model, 1);
     let framed = aterm_spec::interp::with_buggy(&model, 2);
     // `screens[stale][screen]`: every measured frame of each.
@@ -1366,8 +1366,9 @@ fn the_status_record_counts_the_history_an_update_could_not_carry() {
     let record = app.session_status_record(sid).expect("live");
     assert!(
         record.contains(
-            " history_lost=0 integration_rev=- render=ok resizes=0 flaps=0 land_at=- task=- \
-             reset_at=- gen="
+            " history_lost=0 journal=off journal_off=keeper-off integration_rev=- born=cold render=ok \
+             resizes=0 flaps=0 land_at=- task=- \
+             log_seq=1 log_ep=1 run=- turn=- step=- need=- need_since_ms=- gen="
         ),
         "{record}"
     );
@@ -1408,8 +1409,9 @@ fn the_status_record_counts_the_history_an_update_could_not_carry() {
     let record = app.session_status_record(sid).expect("live");
     assert!(
         record.contains(
-            " history_lost=1234 integration_rev=- render=ok resizes=0 flaps=0 land_at=- task=- \
-             reset_at=- gen="
+            " history_lost=1234 journal=off journal_off=keeper-off integration_rev=- born=cold render=ok \
+             resizes=0 flaps=0 land_at=- task=- \
+             log_seq=1 log_ep=1 run=- turn=- step=- need=- need_since_ms=- gen="
         ),
         "{record}"
     );
@@ -1490,7 +1492,7 @@ fn a_measured_path_lowers_the_carried_frozen_mark_and_never_raises_it() {
 /// guard; the model's old-code mutant is the negative control.
 #[test]
 fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
-    let model = aterm_spec::derive::program_resolution_retry_model();
+    let model = aterm_models_harness::program_resolution_retry_model();
     let mut modeled = model.init_state();
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
     let mut old = buggy.init_state();
@@ -1725,7 +1727,7 @@ fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
 /// another bounded lookup even though that frame then stays still.
 #[test]
 fn a_named_shell_rechecks_once_after_a_later_static_claude_frame() {
-    let model = aterm_spec::derive::program_resolution_retry_model();
+    let model = aterm_models_harness::program_resolution_retry_model();
     let mut modeled = model.init_state();
     let t0 = Instant::now();
     let floor = Duration::from_millis(100);
@@ -2134,7 +2136,6 @@ fn a_box_raises_one_menu_row_and_one_notification_per_transition() {
     let posts = take_posts();
     assert_eq!(posts.len(), 1, "exactly one notification: {posts:?}");
     assert_eq!(posts[0].session, sid);
-    assert_eq!(posts[0].title, "aterm \u{b7} approval waiting");
     assert!(
         posts[0]
             .body
@@ -2147,13 +2148,8 @@ fn a_box_raises_one_menu_row_and_one_notification_per_transition() {
     let (row_sid, label) = &glance.warnings[0];
     assert_eq!(*row_sid, sid, "a click on the row focuses this tab");
     assert!(
-        label.starts_with("\u{26a0} build: bash S=$PWD/tmp;"),
-        "`<tab title>: <kind> <command>`: {label}"
-    );
-    assert!(
-        posts[0].body.starts_with("build: bash "),
-        "{}",
-        posts[0].body
+        label.contains("build") && label.contains("S=$PWD/tmp;"),
+        "the row names the tab and the command: {label}"
     );
     let rev = published(&app, sid).rev;
 

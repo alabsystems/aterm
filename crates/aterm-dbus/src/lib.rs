@@ -45,8 +45,10 @@
 //! limit. `tests/mutations.rs` holds that over seeded damage to every
 //! recording, and `fuzz/` (a STOCK EXCEPTION cargo-fuzz lane) without a seed.
 //!
-//! Nothing in aterm consumes this crate yet: the AT-SPI publisher (A11Y.4)
-//! moves onto it once the Linux AT-SPI lane can check it end to end.
+//! Its first consumer is the Linux desktop-notification delivery
+//! (aterm-gui's `notify`: `org.freedesktop.Notifications.Notify` on the
+//! session bus). The AT-SPI publisher (A11Y.4) moves onto it once the Linux
+//! AT-SPI lane can check it end to end.
 
 #![deny(unsafe_code)]
 

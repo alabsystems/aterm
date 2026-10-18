@@ -73,32 +73,13 @@ fn open_pty_pair() -> (i32, i32) {
 /// terminal it is — a spawned tab's shape. Answers `(master, pid)`.
 /// Not waited here: the pid stays reserved until the test's `Session`
 /// drops, whose hang-up and reaper own it, exactly as a spawned tab's.
-fn spawn_leader(argv: &[&str]) -> (i32, i32) {
-    spawn_leader_on(open_pty_pair(), argv)
-}
-
-/// [`spawn_leader`] onto the pair `(master, slave)` the caller opened; the
-/// slave is consumed. Answers `(master, pid)`.
-fn spawn_leader_on(pair: (i32, i32), argv: &[&str]) -> (i32, i32) {
-    spawn_leader_inheriting(pair, argv, None)
-}
-
-/// [`spawn_leader_on`], with `inherit` — a close-on-exec descriptor of the
-/// caller's — made inheritable in the forked child ALONE, so the leader
-/// holds it across its exec while no other test's child, forked from this
-/// process meanwhile, ever finds it inheritable (`openpty(3)`'s shape,
-/// confined to the one child that is its subject).
 #[allow(clippy::zombie_processes)]
-fn spawn_leader_inheriting(
-    (master, slave): (i32, i32),
-    argv: &[&str],
-    inherit: Option<i32>,
-) -> (i32, i32) {
-    // SAFETY: `slave` is an open fd the caller handed over; owned here.
+fn spawn_leader(argv: &[&str]) -> (i32, i32) {
+    let (master, slave) = open_pty_pair();
+    // SAFETY: `slave` is an open fd the pair handed over; owned here.
     let slave = unsafe { OwnedFd::from_raw_fd(slave) };
-    // std's Command on purpose: the leader needs `pre_exec` (setsid + TIOCSCTTY) and may inherit `inherit`.
-    // The strip first: the leader holds its terminal, `inherit` (made inheritable by the hook
-    // below, after the strip) and nothing else of this process.
+    // std's Command on purpose: the leader needs `pre_exec` (setsid + TIOCSCTTY).
+    // The strip first: the leader holds its terminal and nothing else of this process.
     let mut cmd = std::process::Command::new(argv[0]);
     cmd.inherit_nothing()
         .args(&argv[1..])
@@ -109,18 +90,12 @@ fn spawn_leader_inheriting(
         .stdin(slave.try_clone().expect("dup slave"))
         .stdout(slave.try_clone().expect("dup slave"))
         .stderr(slave);
-    // SAFETY: `setsid`, `ioctl` and `fcntl` are async-signal-safe; the
-    // closure runs in the forked child after its stdio is the slave.
+    // SAFETY: `setsid` and `ioctl` are async-signal-safe; the closure runs
+    // in the forked child after its stdio is the slave.
     unsafe {
-        cmd.pre_exec(move || {
+        cmd.pre_exec(|| {
             if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
                 return Err(std::io::Error::last_os_error());
-            }
-            if let Some(fd) = inherit {
-                let flags = libc::fcntl(fd, libc::F_GETFD);
-                if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
             }
             Ok(())
         });
@@ -192,174 +167,6 @@ fn kill_all(pids: &[i32], masters: &[i32]) {
     }
 }
 
-/// `fd`'s device (`st_rdev`): what [`aterm_uds::holders`] finds a
-/// descriptor by in another process's table.
-#[cfg(target_os = "macos")]
-fn rdev_of(fd: i32) -> u64 {
-    use std::os::unix::fs::MetadataExt as _;
-    // SAFETY: `fd` is open across this call, which only duplicates it.
-    let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
-    std::fs::File::from(fd.try_clone_to_owned().expect("dup"))
-        .metadata()
-        .expect("fstat")
-        .rdev()
-}
-
-/// A leader this test leaves reaped, never stuck in its exit: unless it
-/// was reaped already, dropping it kills it (`SIGKILL`) and flushes the
-/// output its exit's drain would wait on through this test's own copy of
-/// its slave (`tcflush(TCOFLUSH)`, what released the measured
-/// stragglers) until it is reaped, for at most a hang detector's minute.
-#[cfg(target_os = "macos")]
-struct Leader {
-    pid: i32,
-    slave: OwnedFd,
-    reaped: bool,
-}
-
-#[cfg(target_os = "macos")]
-impl Leader {
-    /// Whether the leader exits by itself within `budget`, reaped here.
-    fn exits_within(&mut self, budget: Duration) -> bool {
-        let pid = self.pid;
-        self.reaped = aterm_spec::wait::within(budget, Duration::from_millis(20), || {
-            let mut status = 0;
-            // SAFETY: a non-blocking reap of this test's own child.
-            (unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } == pid).then_some(())
-        })
-        .is_some();
-        self.reaped
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl Drop for Leader {
-    fn drop(&mut self) {
-        use std::os::fd::AsRawFd as _;
-        if self.reaped {
-            return;
-        }
-        // SAFETY: `pid` is this test's own unreaped child, so its number
-        // cannot have been reused.
-        unsafe { libc::kill(self.pid, libc::SIGKILL) };
-        let (pid, slave) = (self.pid, self.slave.as_raw_fd());
-        self.reaped = aterm_spec::wait::within(
-            aterm_spec::wait::MUST_HAPPEN,
-            Duration::from_millis(20),
-            || {
-                let mut status = 0;
-                // SAFETY: a flush of this test's own open slave, then a
-                // non-blocking reap of its own child.
-                unsafe {
-                    libc::tcflush(slave, libc::TCOFLUSH);
-                    (libc::waitpid(pid, &mut status, libc::WNOHANG) != 0).then_some(())
-                }
-            },
-        )
-        .is_some();
-    }
-}
-
-/// THE LEADER HOLDS ITS TERMINAL, NEVER ITS MASTER (2026-09-30). The
-/// helper's pair is close-on-exec from birth, so the `sh -i` spawned onto
-/// it holds its slave and no copy of its master — read off the child's
-/// own descriptor table, by device — and the test's master is the only
-/// one: closing it hangs the terminal up, and the shell, whose prompt
-/// nobody read, exits and is reaped within the hang detector's minute.
-///
-/// NEGATIVE CONTROL: the same spawn with the master inheritable — the
-/// shape `openpty(3)` gave, which the helper replaced — leaves the leader
-/// holding its own master: the copy that kept the measured stragglers in
-/// `?E`. The control's pair is close-on-exec from birth too, its master
-/// made inheritable only in the leader's forked child: a raw `openpty`
-/// pair, inheritable in the whole process while the control ran, went
-/// into every child another test spawned meanwhile, which then held both
-/// ends of it (the review of 2026-09-30) — and the control's `SIGKILL`
-/// of its session leader revokes that slave, so a table holding it reads
-/// `ENOENT` there (measured 2026-10-01) and its scan answers "unknown".
-/// That leader is a `sleep` with nothing queued, and it is killed and
-/// its slave's output flushed before either end is closed, so the
-/// control cannot strand a process of its own.
-///
-/// ALONE ([`crate::test_alone`]; it failed once in 12 loaded runs of the
-/// shared lib-test process). Its subject is process-wide: closing the
-/// test's master hangs the terminal up only once no other copy is open,
-/// and in the shared process every child a sibling test forks holds a
-/// copy until it execs; the leaders' tables are read whole, and inherit
-/// whatever a sibling left inheritable at their fork. Measured the same
-/// day at a load of ~110 on 18 cores, 450 tries each: the close-to-exit
-/// wait was at most 36–40 ms alone and 0.34–1.65 s in the shared
-/// process.
-#[cfg(target_os = "macos")]
-#[test]
-fn a_spawned_leader_holds_its_terminal_and_never_its_master() {
-    if !crate::test_alone::alone() {
-        return;
-    }
-    use aterm_uds::holders::process_holds_rdev;
-    // This test's own close-on-exec copy of a slave, for the release.
-    let keep = |slave: i32| {
-        // SAFETY: `slave` is open across this call, which only duplicates it.
-        unsafe { std::os::fd::BorrowedFd::borrow_raw(slave) }
-            .try_clone_to_owned()
-            .expect("dup slave")
-    };
-    let id = |pid: i32| u32::try_from(pid).expect("pid");
-
-    let (master, slave) = open_pty_pair();
-    let (master_rdev, slave_rdev) = (rdev_of(master), rdev_of(slave));
-    assert_ne!(
-        master_rdev, slave_rdev,
-        "PRECONDITION: the two ends are two devices"
-    );
-    let kept = keep(slave);
-    let (master, pid) = spawn_leader_on((master, slave), &["/bin/sh", "-i"]);
-    let mut leader = Leader {
-        pid,
-        slave: kept,
-        reaped: false,
-    };
-    assert_eq!(
-        process_holds_rdev(id(pid), slave_rdev),
-        Some(true),
-        "PRECONDITION: the scan reads the leader's table, and the leader is on its terminal"
-    );
-    assert_eq!(
-        process_holds_rdev(id(pid), master_rdev),
-        Some(false),
-        "the leader holds no copy of its own master"
-    );
-    aterm_pty::close_fd(master);
-    assert!(
-        leader.exits_within(aterm_spec::wait::MUST_HAPPEN),
-        "with the test's master the only one, closing it hangs the terminal up \
-         and the leader exits"
-    );
-    drop(leader);
-
-    let (control_master, control_slave) = open_pty_pair();
-    let control_master_rdev = rdev_of(control_master);
-    let kept = keep(control_slave);
-    let (control_master, control_pid) = spawn_leader_inheriting(
-        (control_master, control_slave),
-        &["/bin/sleep", "30"],
-        Some(control_master),
-    );
-    let leaked = process_holds_rdev(id(control_pid), control_master_rdev);
-    drop(Leader {
-        pid: control_pid,
-        slave: kept,
-        reaped: false,
-    });
-    aterm_pty::close_fd(control_master);
-    assert_eq!(
-        leaked,
-        Some(true),
-        "NEGATIVE CONTROL: a master the leader can inherit, as openpty(3)'s was, \
-         is held by the leader spawned onto it"
-    );
-}
-
 /// R3 — the capture over REAL sessions, in its window and tab places
 /// (the ones `Reopened::lost` counts): tab 0 is a stub with no process
 /// (skipped), tab 1 a shell at its prompt (NEGATIVE CONTROL: no entry),
@@ -411,8 +218,9 @@ fn the_journal_names_the_tabs_whose_programs_a_death_would_take() {
         version: None,
         home: None,
         login: None,
-        codex: None,
+        run: None,
         cause: None,
+        tab: None,
     };
     manifest.fill_agents(&|id| (id == 2).then(|| hosted.clone()));
     let programs = app.crash_journal_programs(&manifest);
@@ -579,7 +387,7 @@ fn a_held_panes_folder_that_is_not_here_is_not_asked_for_or_counted() {
         session: None,
         cwd: remote.clone(),
         version: None,
-        codex: None,
+        run: aterm_agent::harness::relaunch::AgentRun::Claude,
         dialect: None,
         login: None,
         home: None,

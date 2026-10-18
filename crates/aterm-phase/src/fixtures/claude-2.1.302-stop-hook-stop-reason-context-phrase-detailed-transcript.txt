@@ -1,0 +1,18 @@
+# claude-code 2.1.302 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the same Stop hook's stopReason (Context limit reached · /compact or /clear to continue) in the detailed transcript (ctrl+o): the hook's command (./sr) the first column-2 row under the summary, the stopReason the second, no composer
+ ▐▛███▛█   Claude Code v2.1.302
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ /clear
+
+❯ say nothing
+
+⏺ Ran 1 stop hook
+  ⎿  ./sr
+  ⎿  Context limit reached · /compact or /clear to continue
+
+✻ Sautéed for 0s · done 10:29 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Showing detailed transcript · ctrl+o to toggle · ctrl+e to show all                                                                   verbose

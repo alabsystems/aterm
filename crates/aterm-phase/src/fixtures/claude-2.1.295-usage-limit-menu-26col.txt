@@ -1,0 +1,17 @@
+# claude-code 2.1.295 · HAND-BUILT 2026-10-15 from the MEASURED claude-2.1.295-usage-limit-menu-34col.txt, its rows re-wrapped as Ink wraps them at 26 columns (KI W2, the sweep of 2026-10-15): the title `What do you want to` over `do?` at column 2, the labels at column 7 in 18 cells, the footer `Enter to confirm · Esc` over `to cancel` · read on main as kind `other`, whose `Stop and wait for limit to reset` full power pressed (`no-spend@v1`)
+❯ /rate-limit-options
+
+──────────────────────────
+  What do you want to
+  do?
+
+  ❯ 1. Stop and wait for
+       limit to reset
+    2. Wait here, then
+       continue
+       automatically at
+       12:23pm
+    3. Upgrade your plan
+
+  Enter to confirm · Esc
+  to cancel

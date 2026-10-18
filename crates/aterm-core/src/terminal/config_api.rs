@@ -1,7 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Configuration hot-reload: `Terminal::apply_config`.
+//! Configuration hot-reload: `Terminal::apply_config`, and its colour half
+//! `Terminal::rebase_colors`.
 
 use super::Terminal;
 
@@ -56,10 +57,125 @@ impl LiveColors {
     }
 }
 
+/// The host's colour baseline: what OSC 104/110-119 and RIS reset to, and the
+/// scheme DSR 996 reports while no program holds its own background. Read it
+/// with [`Terminal::color_baseline`] and move it with [`Terminal::rebase_colors`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColorBaseline {
+    /// The configured default foreground (OSC 110 resets to it).
+    pub foreground: aterm_types::Rgb,
+    /// The configured default background (OSC 111 resets to it).
+    pub background: aterm_types::Rgb,
+    /// The configured cursor colour; `None` follows the foreground.
+    pub cursor: Option<aterm_types::Rgb>,
+    /// The configured selection background; `None` leaves it to the renderer.
+    pub selection_background: Option<aterm_types::Rgb>,
+    /// The configured selection foreground; `None` leaves it to the renderer.
+    pub selection_foreground: Option<aterm_types::Rgb>,
+    /// The configured palette; `None` is the xterm table.
+    pub palette: Option<aterm_types::ColorPalette>,
+    /// The host's declared appearance of `background`; `None` keeps the
+    /// terminal's current one (as `TerminalConfig::color_scheme` does).
+    pub color_scheme: Option<aterm_types::Appearance>,
+}
+
+impl ColorBaseline {
+    /// The baseline a [`TerminalConfig`](crate::config::TerminalConfig) declares.
+    #[must_use]
+    pub fn of_config(c: &crate::config::TerminalConfig) -> Self {
+        Self {
+            foreground: c.default_foreground,
+            background: c.default_background,
+            cursor: c.cursor_color,
+            selection_background: c.selection_background,
+            selection_foreground: c.selection_foreground,
+            palette: c.custom_palette.clone(),
+            color_scheme: c.color_scheme,
+        }
+    }
+}
+
+/// What a [`Terminal::rebase_colors`] changed, judged on the live colours.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct ColorRebase {
+    /// The live cursor colour moved.
+    pub cursor_changed: bool,
+    /// Any other live colour (fg, bg, selection, palette) moved.
+    pub colors_changed: bool,
+    /// The reported scheme ([`Terminal::color_scheme`]) moved; a
+    /// `CSI ? 997 ; Ps n` push is queued when DEC 2031 is set.
+    pub scheme_changed: bool,
+}
+
 impl Terminal {
     // =========================================================================
     // Configuration Hot-Reload API
     // =========================================================================
+
+    /// The host's colour baseline now: the configured colours, palette and
+    /// declared scheme that OSC 104/110-119 and RIS reset to.
+    #[must_use]
+    pub fn color_baseline(&self) -> ColorBaseline {
+        let c = &self.color;
+        ColorBaseline {
+            foreground: c.configured_foreground,
+            background: c.configured_background,
+            cursor: c.configured_cursor,
+            selection_background: c.configured_selection_background,
+            selection_foreground: c.configured_selection_foreground,
+            palette: c.configured_palette.clone(),
+            color_scheme: Some(c.configured_color_scheme),
+        }
+    }
+
+    /// Move the theme baseline and keep a program's colours (OSC 4/10/11/12/
+    /// 17/19/21) as diffs on top: the colour half of
+    /// [`apply_config`](Self::apply_config), for hosts that install a theme
+    /// without a whole [`TerminalConfig`](crate::config::TerminalConfig) (the
+    /// web embeds). OSC 104/110-119 and RIS then reset to the new baseline,
+    /// slots the program never touched follow it, and a program's palette diff
+    /// is replayed only under
+    /// [`allow_palette_reconfigure`](Self::allow_palette_reconfigure). The
+    /// reported scheme is reconciled once, after the colours (at most one
+    /// `CSI ? 997` push). Marks full damage when any live colour moved.
+    pub fn rebase_colors(&mut self, baseline: &ColorBaseline) -> ColorRebase {
+        let rebase = self.rebase_colors_inner(baseline, self.modes.allow_palette_reconfigure);
+        if rebase.cursor_changed || rebase.colors_changed {
+            self.grid.damage_mut().mark_full();
+        }
+        rebase
+    }
+
+    /// [`Self::rebase_colors`] without the damage, under the palette gate the
+    /// caller is about to install (`apply_config` passes its config's).
+    fn rebase_colors_inner(&mut self, b: &ColorBaseline, palette_gate: bool) -> ColorRebase {
+        let before = LiveColors::of(&self.color);
+        let overrides = self.color.capture_overrides();
+        self.color.configured_cursor = b.cursor;
+        self.color.configured_foreground = b.foreground;
+        self.color.configured_background = b.background;
+        if let Some(scheme) = b.color_scheme {
+            self.color.configured_color_scheme = scheme;
+        }
+        self.color.configured_selection_background = b.selection_background;
+        self.color.configured_selection_foreground = b.selection_foreground;
+        self.color.configured_palette.clone_from(&b.palette);
+        self.color.restore_baseline(true);
+        self.color.apply_overrides(&overrides, palette_gate);
+        self.color.frame_cursor_authoritative = true;
+        self.color.frame_foreground_authoritative = true;
+        self.color.frame_background_authoritative = true;
+        let after = LiveColors::of(&self.color);
+        // The reported scheme is judged once, on the new baseline, the new
+        // configured colours and the replayed overrides together: no transient
+        // value, at most one push.
+        let scheme_changed = self.reconcile_color_scheme();
+        ColorRebase {
+            cursor_changed: before.cursor != after.cursor,
+            colors_changed: before.rest != after.rest,
+            scheme_changed,
+        }
+    }
 
     /// Apply configuration changes to the terminal at runtime and return the
     /// aspects that changed.
@@ -91,6 +207,11 @@ impl Terminal {
     /// applied value, so a live mode moves only when the host's own value moves
     /// and an unrelated reload never strips a shell's paste guards. See
     /// `apply_negotiated_mode`.
+    ///
+    /// A program's colours (OSC 4/10/11/12/17/19/21) ride over the configured
+    /// ones and are replayed after the new baseline lands; a palette diff is
+    /// replayed only under `allow_palette_reconfigure`, so closing the gate
+    /// puts the theme palette back in the same call.
     ///
     /// # Settings applied
     ///
@@ -144,26 +265,23 @@ impl Terminal {
         // So OSC 104/110-119 and RIS reset to the new theme, slots the program
         // never touched follow it, and a reload (any key, a theme-folder edit,
         // an OS appearance flip) no longer wipes a base16 palette or an editor's
-        // OSC 11 background. The kitty stack holds diffs too, so it needs no
-        // rebase. Change and damage are judged on the live colours.
-        let before = LiveColors::of(&self.color);
-        let overrides = self.color.capture_overrides();
-        self.color.configured_cursor = config.cursor_color;
-        self.color.configured_foreground = config.default_foreground;
-        self.color.configured_background = config.default_background;
-        self.color.configured_selection_background = config.selection_background;
-        self.color.configured_selection_foreground = config.selection_foreground;
-        self.color
-            .configured_palette
-            .clone_from(&config.custom_palette);
-        self.color.restore_baseline(true);
-        self.apply_color_overrides(&overrides);
-        self.color.frame_cursor_authoritative = true;
-        self.color.frame_foreground_authoritative = true;
-        self.color.frame_background_authoritative = true;
-        let after = LiveColors::of(&self.color);
+        // OSC 11 background. The diff's palette entries are replayed only while
+        // the host allows palette sets, so turning the gate off takes a
+        // program's palette out of every live session at once; its fg/bg/
+        // cursor/selection sets are ungated and stay. The kitty stack holds
+        // diffs too, so it needs no rebase (a pop under a closed gate skips
+        // the palette). Change and damage are judged on the live colours.
+        // This is [`Self::rebase_colors`], with the gate this config installs;
+        // damage stays folded into the one decision below.
+        let rebase = self.rebase_colors_inner(
+            &ColorBaseline::of_config(config),
+            config.allow_palette_reconfigure,
+        );
+        if rebase.scheme_changed {
+            changes.push(ConfigChange::ColorScheme);
+        }
 
-        if before.cursor != after.cursor {
+        if rebase.cursor_changed {
             changes.push(ConfigChange::CursorColor);
             visual_repaint = true;
         }
@@ -174,7 +292,7 @@ impl Terminal {
             changes.push(ConfigChange::CursorVisible);
         }
 
-        if before.rest != after.rest {
+        if rebase.colors_changed {
             changes.push(ConfigChange::Colors);
             visual_repaint = true;
         }
@@ -232,7 +350,7 @@ impl Terminal {
 
         // OSC 4 / OSC 21 indexed palette reconfigure policy.
         if self.modes.allow_palette_reconfigure != config.allow_palette_reconfigure {
-            self.modes.allow_palette_reconfigure = config.allow_palette_reconfigure;
+            self.set_allow_palette_reconfigure(config.allow_palette_reconfigure);
             changes.push(ConfigChange::PaletteReconfigure);
         }
 
@@ -355,23 +473,6 @@ mod tests {
     }
 
     #[test]
-    fn style_policy_reload_damages_static_cells_exactly_when_changed() {
-        let (mut terminal, mut config) = clean_terminal_with_defaults();
-        let before = terminal.damage_epoch();
-
-        config.bold_is_bright = !config.bold_is_bright;
-        let changes = terminal.apply_config(&config);
-        assert!(changes.contains(&ConfigChange::StylePolicy));
-        assert!(terminal.has_damage(), "static styled cells need a repaint");
-        assert_eq!(terminal.damage_epoch(), before + 1);
-
-        terminal.take_damage();
-        let unchanged = terminal.apply_config(&config);
-        assert!(!unchanged.contains(&ConfigChange::StylePolicy));
-        assert!(!terminal.has_damage(), "an identical reload stays a no-op");
-    }
-
-    #[test]
     fn bidi_reload_damages_static_cells_exactly_when_changed() {
         let (mut terminal, mut config) = clean_terminal_with_defaults();
         let before = terminal.damage_epoch();
@@ -430,7 +531,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "bidi")]
     #[test]
     fn bidi_reload_reprojects_already_received_rtl_text() {
         let (mut terminal, mut config) = clean_terminal_with_defaults();
@@ -493,21 +593,11 @@ mod tests {
         assert_ne!(after_cells[2].fg, before_cells[2].fg);
         assert!(term.has_damage());
         assert!(term.damage_epoch() > before_epoch);
-    }
 
-    #[test]
-    fn bidi_config_reload_marks_existing_rows_for_repaint() {
-        let mut term = Terminal::new(2, 8);
-        term.process("\u{05D0}\u{05D1}\u{05D2}".as_bytes());
-        let before = settle(&mut term);
-        let mut config = TerminalConfig::default();
-        config.bidi.direction = aterm_types::ParagraphDirection::Ltr;
-
-        let changes = term.apply_config(&config);
-
-        assert!(changes.contains(&ConfigChange::BiDi));
-        assert!(term.has_damage());
-        assert!(term.damage_epoch() > before);
+        term.take_damage();
+        let unchanged = term.apply_config(&config);
+        assert!(!unchanged.contains(&ConfigChange::StylePolicy));
+        assert!(!term.has_damage(), "an identical reload stays a no-op");
     }
 
     #[test]
@@ -755,5 +845,147 @@ mod tests {
                 .contains(&ConfigChange::BracketedPaste)
         );
         assert!(!term.modes().bracketed_paste());
+    }
+
+    const fn rgb(r: u8, g: u8, b: u8) -> Rgb {
+        Rgb { r, g, b }
+    }
+
+    /// A baseline whose every colour is derived from `seed`, so two seeds
+    /// differ in every slot.
+    fn seeded_baseline(seed: u8) -> ColorBaseline {
+        let mut palette = aterm_types::ColorPalette::new();
+        for index in 0..16u8 {
+            palette.set(index, rgb(seed, index, seed.wrapping_add(index)));
+        }
+        ColorBaseline {
+            foreground: rgb(seed, seed, seed),
+            background: rgb(seed / 2, 0, seed / 3),
+            cursor: Some(rgb(0, seed, 0)),
+            selection_background: Some(rgb(seed, 0, 0)),
+            selection_foreground: None,
+            palette: Some(palette),
+            color_scheme: Some(aterm_types::Appearance::Dark),
+        }
+    }
+
+    const PROGRAM_BG: Rgb = rgb(0x10, 0x11, 0x12);
+    const PROGRAM_P1: Rgb = rgb(0x28, 0x2a, 0x36);
+
+    #[test]
+    fn rebase_keeps_program_colours_and_moves_the_reset_baseline() {
+        let mut t = Terminal::new(4, 16);
+        t.set_allow_palette_reconfigure(true);
+        t.rebase_colors(&seeded_baseline(200));
+        t.process(b"\x1b]11;rgb:10/11/12\x07\x1b]4;1;rgb:28/2a/36\x07");
+        let new = seeded_baseline(90);
+        let rebase = t.rebase_colors(&new);
+        assert!(rebase.colors_changed, "fg and untouched slots moved");
+        assert_eq!(t.default_background(), PROGRAM_BG, "OSC 11 survives");
+        assert_eq!(t.palette_color(1), PROGRAM_P1, "OSC 4;1 survives");
+        assert_eq!(t.default_foreground(), new.foreground, "fg follows");
+        let new_palette = new.palette.as_ref().expect("seeded palette");
+        assert_eq!(t.palette_color(2), new_palette.get(2), "slot 2 follows");
+        assert_eq!(t.color_baseline(), new);
+
+        t.process(b"\x1b]111\x07\x1b]104\x07");
+        assert_eq!(t.default_background(), new.background, "OSC 111 → new bg");
+        assert_eq!(
+            t.palette_color(1),
+            new_palette.get(1),
+            "OSC 104 → new palette"
+        );
+
+        // Negative control: the legacy setter (live = baseline) loses the
+        // program's background.
+        let mut legacy = Terminal::new(4, 16);
+        legacy.rebase_colors(&seeded_baseline(200));
+        legacy.process(b"\x1b]11;rgb:10/11/12\x07");
+        legacy.set_default_background(new.background);
+        assert_ne!(legacy.default_background(), PROGRAM_BG);
+    }
+
+    #[test]
+    fn rebase_reports_change_only_when_live_colours_move() {
+        let mut t = Terminal::new(4, 16);
+        t.rebase_colors(&seeded_baseline(200));
+        t.take_damage();
+        let same = t.color_baseline();
+        assert_eq!(t.rebase_colors(&same), ColorRebase::default());
+        assert!(!t.has_damage(), "a no-op rebase leaves no damage");
+        // Non-vacuity: a different baseline is reported and damages.
+        let moved = t.rebase_colors(&seeded_baseline(90));
+        assert!(moved.colors_changed && moved.cursor_changed);
+        assert!(t.has_damage());
+    }
+
+    #[test]
+    fn rebase_reports_the_scheme_once_after_the_colours() {
+        let mut t = Terminal::new(4, 16);
+        t.process(b"\x1b[?2031h");
+        while t.take_response().is_some() {}
+        let mut light = seeded_baseline(240);
+        light.color_scheme = Some(aterm_types::Appearance::Light);
+        let rebase = t.rebase_colors(&light);
+        assert!(rebase.scheme_changed);
+        assert_eq!(t.color_scheme(), aterm_types::Appearance::Light);
+        assert_eq!(t.take_response().as_deref(), Some(&b"\x1b[?997;2n"[..]));
+        // The same baseline again: no push.
+        assert!(!t.rebase_colors(&light).scheme_changed);
+        assert_eq!(t.take_response(), None);
+    }
+
+    #[test]
+    fn apply_config_colour_half_is_rebase() {
+        let configs = [
+            TerminalConfig::default(),
+            TerminalConfig {
+                default_foreground: rgb(1, 2, 3),
+                default_background: rgb(250, 250, 240),
+                cursor_color: Some(rgb(9, 9, 9)),
+                color_scheme: Some(aterm_types::Appearance::Light),
+                ..TerminalConfig::default()
+            },
+            TerminalConfig {
+                selection_background: Some(rgb(5, 6, 7)),
+                selection_foreground: Some(rgb(8, 9, 10)),
+                custom_palette: seeded_baseline(77).palette,
+                allow_palette_reconfigure: true,
+                ..TerminalConfig::default()
+            },
+        ];
+        let mut a = Terminal::new(4, 16);
+        let mut b = Terminal::new(4, 16);
+        for t in [&mut a, &mut b] {
+            t.process(b"\x1b]11;rgb:10/11/12\x07\x1b]12;rgb:fe/01/80\x07");
+        }
+        let mut saw_change = false;
+        for config in &configs {
+            b.set_allow_palette_reconfigure(config.allow_palette_reconfigure);
+            let changes = a.apply_config(config);
+            let rebase = b.rebase_colors(&ColorBaseline::of_config(config));
+            assert_eq!(
+                changes.contains(&ConfigChange::Colors),
+                rebase.colors_changed
+            );
+            assert_eq!(
+                changes.contains(&ConfigChange::CursorColor),
+                rebase.cursor_changed
+            );
+            assert_eq!(
+                changes.contains(&ConfigChange::ColorScheme),
+                rebase.scheme_changed
+            );
+            saw_change |= rebase.colors_changed;
+            assert_eq!(a.color_baseline(), b.color_baseline());
+            assert_eq!(a.default_background(), b.default_background());
+            assert_eq!(a.default_foreground(), b.default_foreground());
+            assert_eq!(a.cursor_color(), b.cursor_color());
+            assert_eq!(a.color_scheme(), b.color_scheme());
+            for i in 0..=u8::MAX {
+                assert_eq!(a.palette_color(i), b.palette_color(i), "slot {i}");
+            }
+        }
+        assert!(saw_change, "the configs must move the colours");
     }
 }

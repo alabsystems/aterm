@@ -11,7 +11,8 @@ use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::Terminal;
 use aterm_effects::kitty_pet::{PetAttention, PetBrain, PetInputKind, PetSense};
 use aterm_effects::pet_world::{PetPane, PetWorldFacts};
-use aterm_spec::derive::{Model, console_life_episode_model};
+use aterm_models_effects::console_life_episode_model;
+use aterm_spec::derive::Model;
 use aterm_spec::verify;
 
 type State = BTreeMap<&'static str, i64>;

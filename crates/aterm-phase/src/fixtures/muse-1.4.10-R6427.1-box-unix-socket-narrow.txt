@@ -1,0 +1,43 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (60x50, aterm 0.105.0) running the real Muse Code outside the lab's jail, against a local fake backend: launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a scripted stand-in for Meta's model API, which the proxy variables also pointed at and which refused every request for another host; an lsof sampler over the process tree saw no endpoint but loopback), so Muse Code's own managed sandbox applied · the stand-in's call `muse.bash {command: "printf 'ping' | /usr/bin/nc -U -w 2 /private/tmp/at.muse-sock/b6.sock", unix_socket_paths: ["/private/tmp/at.muse-sock/b6.sock"]}` (a Unix socket a local listener held; the default `proxy-only` sandbox network): the Unix-socket box in a 60-column tab, before any key: the command wrapped between words, its tail indented four
+
+  Muse Code 1.4.10
+
+❯ use the probe
+
+◆ I will call mcp__probe__ping.
+
+◆ ping(hi) · probe · ✓ · 2.1s · ctrl+o
+
+◆ Done. Tool result: probe ping ran
+
+❯ use the probe once more
+
+◆ I will call mcp__probe__ping.
+
+◆ Used tool operation — denied · ctrl+o
+└ approval aborted
+  The user rejected this action. Don't retry it unless they
+  ask.
+
+◆ Done. Tool result: tool denied: approval aborted The user
+  rejected this action. Don't retry it unless they ask.
+
+❯ scenario:sock
+
+◆ I will talk to the socket.
+
+◇ Calling tools (1s · esc to interrupt)
+
+── Voice input (⌥ + v to start) ────────────────────────────
+Would you like to allow this network access?
+
+  requested by:
+  $ printf 'ping' | /usr/bin/nc -U -w 2
+    /private/tmp/at.muse-sock/b6.sock
+
+⟩ 1. Allow once (y)
+  2. Reject (esc)
+
+Change approval defaults in /permissions
+────────────────────────────────────────────────────────────
+  fake-model · high · ~/proj · Auto-review

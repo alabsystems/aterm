@@ -14,7 +14,7 @@ use aterm_messages::{
     Duration, Instant, Message, MessageCenter, MessageId, MessageLog, Outcome, PostOutcome,
     Severity, WallStamp, tags,
 };
-use aterm_spec::derive::exceptions_digest_model;
+use aterm_models_session::exceptions_digest_model;
 
 const DAY_MS: u64 = 86_400_000;
 

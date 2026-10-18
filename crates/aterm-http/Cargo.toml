@@ -12,7 +12,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "First-party HTTP/1.1 client for aterm"
+description = "Deadline-bounded TLS stream verified against the OS trust store, for aterm"
 
 [dependencies]
 # `aterm_uds::deadline`: the process's one deadline gate for calls that wait on
@@ -20,7 +20,7 @@ description = "First-party HTTP/1.1 client for aterm"
 # checks so a wedge any of them finds refuses all of them at once. A
 # dependency-free leaf the one binary links already.
 aterm-uds = { workspace = true }
-# TLS 1.3/1.2 with the `ring` provider — the same pin aterm-net ships.
+# TLS 1.3/1.2 with the `ring` provider.
 rustls = { workspace = true }
 # Base64 for PEM certificate-bundle decoding (`src/pem.rs`).
 aterm-codec = { workspace = true }
@@ -42,6 +42,11 @@ windows-sys = { version = "0.61", default-features = false, features = [
   "Win32_Foundation",
   "Win32_Security_Cryptography",
 ] }
+
+# `aterm_spec::host::could_not_run`: a test this host has no trust store for
+# ends COULD NOT RUN, never a silent pass.
+[dev-dependencies]
+aterm-spec = { workspace = true }
 
 [lints]
 workspace = true

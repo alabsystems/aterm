@@ -380,7 +380,7 @@ fn node_ids_continue_across_a_handoff() {
     }
     let ids = old.id_counters();
     assert_eq!((ids.run, ids.turn, ids.step), (1, 3, 3));
-    let mut new = Log::after_handoff(2, Limits::SESSION, ids, at(100));
+    let mut new = Log::after_handoff(2, Limits::SESSION, ids, 1, at(100));
     let run2 = open(&mut new, Kind::Agent, None, 101).expect("run");
     let t = open(&mut new, Kind::Turn, Some(run2), 102).expect("turn");
     let p = open(&mut new, Kind::Approval, Some(t), 103).expect("step");

@@ -3,7 +3,7 @@
 //
 //! Conformance: the real `poll()` obeys the derived no-silent-loss discipline.
 //!
-//! `aterm_spec::derive::subscribe_model()`: a reader behind the live ring window
+//! `aterm_models_core::subscribe_model()`: a reader behind the live ring window
 //! must get a `Gap`, never events delivered as if nothing was lost (the
 //! `PollGap` guard `lo > cursor + 1`). The test drives the real
 //! `Surface::subscribe`/`poll`, projects onto `<<seq, lo, cursor, lost>>`, and
@@ -12,7 +12,7 @@
 
 use crate::support::{read_cap, write_cap};
 use aterm_buffer::{Edit, SubUpdate, Surface};
-use aterm_spec::derive::subscribe_model;
+use aterm_models_core::subscribe_model;
 use std::collections::BTreeMap;
 
 /// The real ring cap (`aterm_buffer::MAX_LOG_EVENTS`); a cursor falls behind

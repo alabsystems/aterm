@@ -1,165 +1,114 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! START A CHILD THAT INHERITS EXACTLY WHAT IT IS HANDED — two descriptors at
-//! fixed numbers plus its stdio, or its stdio alone ([`command`]), and nothing
-//! else; on Darwin without a fork — and, for the spawns that must still fork,
-//! the strip that keeps everything else out.
+//! Start a child that inherits exactly what it is handed (two descriptors at fixed numbers
+//! plus its stdio, or its stdio alone, [`command`]), on Darwin without a fork, and, for the
+//! spawns that must still fork, the strip that keeps everything else out.
 //!
-//! ## The two lanes
+//! ## The lanes
 //!
-//! aterm launches its `aterm-link serve` child holding the far ends of two
-//! `socketpair(AF_UNIX)`s at **fds 3 and 4** (DESIGN-aterm-fabric.md §11.2). The
-//! authority of that child is the DESCRIPTOR and nothing else — no token file
-//! exists to steal, and the only way to be the bridge is to be the process aterm
-//! spawned. `std::process::Command` can place an inherited descriptor at 0, 1 or
-//! 2 and nowhere else, so [`spawn_with_two_fds`] takes a [`LaneCommand`] and
-//! returns a [`LaneChild`] of its own.
+//! aterm launches its `aterm-link serve` bridge holding the far ends of two
+//! `socketpair(AF_UNIX)`s at fds 3 and 4. The bridge's authority is the descriptor and nothing
+//! else: no token file exists to steal, and the only way to be the bridge is to be the process
+//! aterm spawned. `std::process::Command` can place an inherited descriptor only at 0, 1 or 2,
+//! so [`spawn_with_two_fds`] takes a [`LaneCommand`] and returns a [`LaneChild`] of its own.
 //!
-//! ## Why not a `Command` that forks and strips
+//! A `Command` whose `pre_exec` marks every number from 3 up to a ceiling close-on-exec and
+//! then `dup2`s the lanes into place fails three ways:
 //!
-//! A `Command` whose `pre_exec` closure marks every number from 3 up to a
-//! ceiling close-on-exec and then `dup2`s the lanes into place fails three
-//! ways (the descriptor-protocol model, `trust-platform`, validated against
-//! this Mac's kernel):
-//!
-//! 1. A CEILING CAPPED AT 65 536 MISSES DESCRIPTORS: Darwin allocates them up to
-//!    `kern.maxfilesperproc` (92 160 measured) whenever the soft
-//!    `RLIMIT_NOFILE` is higher — a shell's is 1 048 576 here, and aterm-gui
-//!    raises its own. Every unflagged descriptor at 65 536..92 159 reaches the
-//!    bridge, a process that lives as long as the window.
-//! 2. A CEILING READ IN THE PARENT, before the fork, races: another thread that
-//!    raises the limit and opens an unflagged descriptor above the old ceiling
-//!    in that window hands it to the child.
-//! 3. A `pre_exec` CLOSURE THAT `dup2`s ONTO 3 AND 4 CAN CLOBBER `std`'s OWN
-//!    EXEC-STATUS PIPE, which `std` opens at the lowest free numbers just before
-//!    its fork. With its write end replaced, a failed `exec` reads as EOF in the
-//!    parent — `Ok(child)` for a child that already died — and the error bytes
-//!    go down the lane instead.
+//! 1. A ceiling capped at 65 536 misses descriptors: Darwin allocates up to
+//!    `kern.maxfilesperproc` (92 160 here) whenever the soft `RLIMIT_NOFILE` is higher, and
+//!    every unflagged descriptor above the ceiling reaches the bridge.
+//! 2. A ceiling read in the parent before the fork races another thread that raises the limit
+//!    and opens an unflagged descriptor above the old ceiling.
+//! 3. `dup2` onto 3 and 4 can clobber std's own exec-status pipe, which std opens at the lowest
+//!    free numbers just before its fork: a failed `exec` then reads as `Ok(child)` for a child
+//!    that already died, and the error bytes go down the lane.
 //!
 //! ## Darwin: `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`
 //!
-//! The kernel marks every descriptor close-on-exec inside the spawn except the
-//! ones a file action names, so nothing can be added to the child and there is
-//! no strip, no ceiling and no window. MEASURED facts this rests on (the model
-//! work of 2026-09-30, Darwin 25):
+//! The kernel marks every descriptor close-on-exec inside the spawn except those a file action
+//! names: no strip, no ceiling, no window. Darwin's behaviour this rests on:
 //!
-//! * only a descriptor that a file action names AND that is not close-on-exec
-//!   at the exec survives;
-//! * `adddup2(fd, fd)` keeps `FD_CLOEXEC` — so a source already sitting on its
-//!   target would arrive CLOSED — and `addinherit_np(fd)` clears it;
-//! * libc refuses a file action naming any number >= 10 240 (`OPEN_MAX`) with
-//!   `EBADF` at add time;
-//! * the table copy is not atomic, but a concurrent change can only DROP a slot
-//!   from the child, never add one.
+//! * only a descriptor a file action names and that is not close-on-exec at the exec survives;
+//! * `adddup2(fd, fd)` keeps `FD_CLOEXEC` (a source already on its target would arrive
+//!   closed), and `addinherit_np(fd)` clears it;
+//! * libc refuses a file action naming any number >= 10 240 (`OPEN_MAX`) with `EBADF`;
+//! * the table copy is not atomic, but a concurrent change can only drop a slot from the
+//!   child, never add one.
 //!
-//! So every source below 5 or at 10 240 and up is first moved, in the parent, to
-//! a fresh `F_DUPFD_CLOEXEC` copy at 5 or above ([`off_the_targets`]): no
-//! `dup2` is then a self-copy, none clobbers a source a later action reads, and
-//! every number a file action names is one libc accepts. The copies are
-//! close-on-exec from birth, so a concurrent `fork` elsewhere inherits none —
-//! bar an EXEC's: `POSIX_SPAWN_SETEXEC` closes close-on-exec descriptors before
-//! its file actions run, so an exec takes a flagged source from an unflagged
-//! copy, held for the instant before this process is replaced. Call `exec`
-//! from a process no other thread is spawning in.
+//! So every source below 5 or at 10 240 and up is first moved, in the parent, to a fresh
+//! `F_DUPFD_CLOEXEC` copy at 5 or above ([`off_the_targets`]). The copies are close-on-exec
+//! from birth, so a concurrent `fork` elsewhere inherits none, bar an exec's:
+//! `POSIX_SPAWN_SETEXEC` closes close-on-exec descriptors before its file actions run, so an
+//! exec takes a flagged source from an unflagged copy held for that instant. Call `exec` from a
+//! process no other thread is spawning in.
 //!
 //! ## Linux: our own fork, `close_range`
 //!
-//! Linux has no `CLOEXEC_DEFAULT`, so the child is forked here — not through
-//! `Command`, whose exec-status pipe is the clobbering hazard above. Our own
-//! status pipe's write end sits at 5 or above like every source, the child runs
-//! [`InheritStrip::apply`] (`close_range(3, ~0, CLOSE_RANGE_CLOEXEC)`, one
-//! async-signal-safe syscall, with no ceiling at all) and then places stdio and
-//! the lanes with `dup2`. Everything it calls between `fork` and `execve` is
-//! async-signal-safe and every byte it reads was prepared before the fork.
+//! Linux has no `CLOEXEC_DEFAULT`, so the child is forked here, not through `Command` (the
+//! third hazard). Our own status pipe's write end sits at 5 or above like every source; the
+//! child runs [`InheritStrip::apply`] and then places stdio and the lanes with `dup2`.
+//! Everything it calls between `fork` and `execve` is async-signal-safe, on memory prepared
+//! before the fork.
 //!
 //! ## [`spawn`]: the same, with no lanes
 //!
-//! A long-lived helper this process starts and reads (`/usr/bin/log stream`)
-//! would hold, through a plain `Command` on a std without SP-1, every
-//! descriptor this process had open without close-on-exec at the spawn —
-//! including, for its whole life, a bridge lane caught between `socketpair` and
-//! its `F_SETFD`. [`spawn`] is the lane spawn with no lanes, and strips on any
-//! std.
+//! It serves a long-lived helper this process starts and reads (`/usr/bin/log stream`), which a
+//! plain `Command` on upstream std would hand every unflagged descriptor for its whole life.
 //!
 //! ## [`InheritStrip`]: for the spawns that must still fork
 //!
-//! A PTY child needs `setrlimit` (the session sandbox) and a controlling
-//! terminal (`TIOCSCTTY`, via `login_tty`), neither of which `posix_spawn` can
-//! express: even with `POSIX_SPAWN_SETSID`, a slave opened by a file action
-//! does not become the child's terminal (measured; aterm-pty's fork gives the
-//! numbers). So it forks and strips; so does a `std` command that must run a
-//! `pre_exec` hook anyway (the seamless successor's lanes,
-//! [`InheritNothing`]). The strip LISTS the
-//! child's own table (`PROC_PIDLISTFDS` on Darwin, `close_range` or
-//! `/proc/self/fd` on Linux) and marks what it finds; where a listing fails or
-//! is cut short it probes every number up to [`descriptor_bound`], the kernel's
-//! per-process maximum — not the soft limit, which no longer bounds anything
-//! here, and read before the fork, where no thread of an unprivileged process
-//! can raise it. Preparing it also passes libnotify's once-gate
-//! ([`pass_libnotify_gate`]), so no fork that strips can lose its child to
-//! libSystem's own fork handler finding that gate half taken.
+//! A PTY child needs `setrlimit` and a controlling terminal (`login_tty`), neither of which
+//! `posix_spawn` can express (even with `POSIX_SPAWN_SETSID`, a slave opened by a file action
+//! does not become the child's terminal), so it forks and strips; so does a std command that
+//! must run a `pre_exec` hook anyway ([`InheritNothing`]). The strip lists the child's own table
+//! (`PROC_PIDLISTFDS` on Darwin, `close_range` or `/proc/self/fd` on Linux) and marks what it
+//! finds; where a listing fails or is cut short it probes every number up to
+//! [`descriptor_bound`], a limit no unprivileged thread can raise, so reading it before the
+//! fork does not race as a soft-limit ceiling does. Preparing it also passes libnotify's
+//! once-gate ([`pass_libnotify_gate`]), so no stripping fork loses its child in `fork()`.
 //!
-//! ## [`command`]: every other child, `std::process::Command`'s shape, no fork
+//! ## [`command`]: every other child, std's `Command` shape, no fork
 //!
-//! The window starts short-lived helpers too — `osascript`, `open`, `sysctl`,
-//! `lsof`, `codesign`, an atpkg pass behind `taskpolicy` — and on a std
-//! without SP-1 (upstream's) a plain `Command` hands each of them every
-//! descriptor this process holds without close-on-exec at that instant.
-//! MEASURED 2026-10-01 (the pair race in this module's tests): a plain
-//! `Command` racing another thread's `UnixStream::pair()` (Darwin has no
-//! `SOCK_CLOEXEC`, so each end is unflagged until its `F_SETFD`) carried a pair
-//! end into 17-27 of 200 children, and [`command`] into 0 of 400. (That test's
-//! control is a raw leaky spawn, `test_support`: Trust's std hands a `Command`
-//! child nothing above stdio since SP-1.) It is the one way product code
-//! starts a child, and it strips on any std (the workspace clippy.toml bans
-//! `std::process::Command`; each reviewed exception carries its `#[expect]`).
+//! The window starts short-lived helpers too (`osascript`, `open`, `sysctl`, `lsof`,
+//! `codesign`, an atpkg pass behind `taskpolicy`), and on upstream std a plain `Command` hands
+//! each every descriptor this process holds without close-on-exec at that instant: racing
+//! another thread's `UnixStream::pair()` (Darwin has no `SOCK_CLOEXEC`), a plain `Command`
+//! carried a pair end into 17-27 of 200 children, [`command`] into 0 of 400. It is the one way
+//! product code starts a child (the workspace clippy.toml bans `std::process::Command`; each
+//! reviewed exception carries its `#[expect]`).
 //!
-//! [`command`] returns this module's [`Command`] — `std`'s shape and `std`'s
-//! rules ([`no_fork`]'s docs list the few places it differs) — which on Darwin
-//! is the lane spawn above: ONE `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`,
-//! its stdio placed by file actions (a pipe's far end, a handed descriptor,
-//! `/dev/null`, or this process's own slot by `addinherit_np`), its working
-//! directory by `addchdir_np`, its process group, session and default signal
-//! dispositions by spawn attributes, `exec` by `POSIX_SPAWN_SETEXEC`; the
-//! `PATH` search is `posix_spawnp`'s, walked here so it reads the child's
-//! `PATH`. Nothing runs between a fork and an exec, because there is no fork:
-//! this process is never copied, so it holds nothing open in a copy (a `flock`
-//! released only by closing its file stays released) and pays no bill after.
-//! Off Darwin it starts through `std::process::Command` with [`InheritNothing`]
-//! installed first — a fork, with `close_range` in the child on Linux.
+//! [`command`] returns this module's [`Command`] (std's shape and rules; [`no_fork`]'s docs
+//! list where it differs), which on Darwin is the lane spawn above: one `posix_spawn` with
+//! `POSIX_SPAWN_CLOEXEC_DEFAULT`, stdio placed by file actions, the working directory by
+//! `addchdir_np`, process group, session and signal defaults by spawn attributes, `exec` by
+//! `POSIX_SPAWN_SETEXEC`, and the `PATH` search walked here so it reads the child's `PATH`.
+//! A child asked to be its own responsible process ([`Command::disclaim_responsibility`]) gets
+//! one more attribute through the private SPI [`DISCLAIM_SPI`], resolved at that spawn, and is
+//! never started without it. With no fork this process is never copied, so it holds nothing
+//! open in a copy (a `flock` released by closing its file stays released) and pays no bill
+//! after. Off Darwin it starts through std's `Command` with [`InheritNothing`] installed first,
+//! and refuses a disclaim.
 //!
-//! WHY NOT `std`'s `Command` WITH A HOOK: any `pre_exec`
-//! hook takes `Command` off `posix_spawn` onto `fork`. MEASURED 2026-10-01
-//! (`command_tests::bench_what_a_spawn_costs_a_window_sized_process`, a
-//! process shaped like the window: 6 462 VM regions, 400 MB resident — the
-//! window measured 6 585), `/usr/bin/true`, p50: the `spawn()` call took
-//! 0.13 ms for `std` with no hook, 2.81 ms forked with the strip, and 0.15 ms
-//! through [`command`]. The fork also leaves a bill AFTER `spawn` returns: it
-//! write-protects every resident writable page of this process, so the next
-//! write to each takes a fault on whichever thread writes it — rewriting those
-//! 400 MB once took 22.9 ms after the forked spawn, against 0.40 ms after
-//! `std`'s `posix_spawn` and 0.37 ms after [`command`] (0.26 ms with no spawn
-//! at all). The review of 2026-10-01 measured the same 21–23 ms, and a
-//! user-interactive thread writing 256 pages every 0.5 ms through a storm of
-//! forked spawns going from p50 0.006 ms to 0.44 ms per pass: a dropped frame
-//! per spawn.
+//! Not std's `Command` with a hook: any `pre_exec` hook moves std off `posix_spawn` onto
+//! `fork`. In a window-sized process (about 6 500 VM regions, 400 MB resident;
+//! `benches/spawn_cost.rs`, run by `targo --unverified bench -p aterm-uds --bench spawn_cost`)
+//! the `spawn()` call took 0.13 ms for std with no hook, 2.81 ms forked with the strip and
+//! 0.15 ms through [`command`]. The fork also write-protects every resident writable page, so
+//! the next write to each takes a fault: rewriting those 400 MB took 22.9 ms after a forked
+//! spawn against 0.4 ms after [`command`], a dropped frame per spawn.
 //!
-//! ## [`transparent`]: the pass-throughs, which hand on EVERYTHING
+//! ## [`transparent`]: the pass-throughs, which hand on everything
 //!
-//! A few verbs stand in for a program their caller ran and wait for it
-//! (`aterm pkg lease -- <cmd>`, `aterm ship`): the caller's descriptors — a
-//! make jobserver's pipe named in `MAKEFLAGS`, a `3>file` redirect, a number
-//! handed down in the environment — belong to that program, so its child must
-//! hold this process's WHOLE table. A `std::process::Command` no longer
-//! promises that: since Trust's SP-1 (trust 6eb03c9a18) its child holds fds
-//! 0-2 and only what `CommandExt::inherit_fd` names, and that and
-//! `inherit_all_fds` are unstable (`trust_process_inherit_fds`), SP-1 std only.
-//! [`transparent`] passes the table through whatever std this binary links: on
-//! Darwin one `posix_spawn` WITHOUT `POSIX_SPAWN_CLOEXEC_DEFAULT`, elsewhere a
-//! fork with no strip, the stdio slots untouched — upstream std's own spawn.
-//! A pass-through that `exec`s needs none of this: an exec keeps the table on
-//! every std (SP-1 leaves `CommandExt::exec` as it was).
+//! A few verbs stand in for a program their caller ran and wait for it (`aterm pkg lease --
+//! <cmd>`, `aterm ship`): the caller's descriptors (a make jobserver's pipe named in
+//! `MAKEFLAGS`, a `3>file` redirect) belong to that program, so its child must hold this
+//! process's whole table. Trust's std (SP-1) hands a `Command` child only fds 0-2 and what the
+//! unstable `CommandExt::inherit_fd` names, so [`transparent`] passes the table through
+//! whatever std this binary links: on Darwin one `posix_spawn` without
+//! `POSIX_SPAWN_CLOEXEC_DEFAULT`, elsewhere a fork with no strip, the stdio slots untouched. A
+//! pass-through that `exec`s needs none of this: an exec keeps the table on every std.
 
 #![cfg(unix)]
 
@@ -194,11 +143,110 @@ pub const BRIDGE_PUSH_FD: RawFd = 4;
 // an empty descriptor and never speaks, so they are pinned at compile time.
 const _: () = assert!(BRIDGE_VERB_FD == 3 && BRIDGE_PUSH_FD == 4);
 
+/// The composing executable's startup admission of the bridge's two inherited lanes,
+/// [`BRIDGE_VERB_FD`] then [`BRIDGE_PUSH_FD`], each by [`adopt_inherited_socket`].
+///
+/// Only the `aterm` executable's `aterm link` route calls it, once, before that
+/// process opens or closes a descriptor or starts a thread: there the lanes are the
+/// launcher's, unclaimed, and a hand-started process may have neither, which is a
+/// checked refusal. Socket type and descriptor flags do not establish custody; the
+/// launcher's protocol does, and this call is the one place the process takes it:
+/// a second call in the same process is refused untouched, so no Rust code here can
+/// come to own either lane twice.
+///
+/// It is a safe entry so the `aterm` package carries no `unsafe` block, which its
+/// release build (`targo trust build -p aterm`) charges as a refutation whatever
+/// its SAFETY comment says.
+///
+/// # Errors
+///
+/// A second call, or [`adopt_inherited_socket`]'s, for whichever lane it refused
+/// first.
+pub fn adopt_startup_bridge_lanes() -> io::Result<(OwnedFd, OwnedFd)> {
+    static TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if TAKEN.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "the bridge's inherited lanes were already taken by this process",
+        ));
+    }
+    // SAFETY: on the GUI route these are the launcher's unclaimed lanes;
+    // a hand-started process may have neither, which is a checked refusal.
+    // This startup route takes each eligible descriptor once (`TAKEN`) before
+    // bridge threads; neither has another Rust owner or concurrent
+    // close/replacement.
+    let verb = unsafe { adopt_inherited_socket(BRIDGE_VERB_FD) }?;
+    // SAFETY: the same startup ownership admission for the distinct push lane.
+    let push = unsafe { adopt_inherited_socket(BRIDGE_PUSH_FD) }?;
+    Ok((verb, push))
+}
+
+/// Adopt an inherited socket as a close-on-exec copy, closing the original
+/// number after duplication. Socket/type/flag diagnostics do not establish
+/// exclusive ownership: the composing executable admits that at startup.
+///
+/// # Safety
+///
+/// The descriptor number must not be closed or replaced by another thread or
+/// callback during this call. If it names a socket eligible for adoption, no
+/// other owner may hold it: its ownership must have been given up to this call.
+/// An absent or ineligible descriptor is allowed and is refused untouched.
+/// The checks below are diagnostics, not proof of exclusive/stable ownership.
+/// A refusal before the ownership take leaves `fd` open;
+/// once taken, it is closed even if duplication fails.
+///
+/// # Errors
+///
+/// A closed number, a non-socket, a socket marked close-on-exec, or a failed
+/// duplicate. In the first three cases the number is left untouched.
+/// Close-on-exec rejects the usual accidentally presented local descriptor;
+/// a cleared flag alone does not prove inheritance or lack of another owner.
+pub unsafe fn adopt_inherited_socket(fd: RawFd) -> io::Result<OwnedFd> {
+    use std::os::unix::fs::FileTypeExt as _;
+    let meta = std::fs::metadata(format!("/dev/fd/{fd}")).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::NotConnected,
+            format!("descriptor {fd} is not open ({e})"),
+        )
+    })?;
+    if !meta.file_type().is_socket() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("descriptor {fd} is not a socket"),
+        ));
+    }
+    // SAFETY: `F_GETFD` reads one descriptor's flags and touches no memory.
+    let flags = unsafe { fcntl(fd, F_GETFD) };
+    if flags < 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            format!(
+                "descriptor {fd} is not open ({})",
+                io::Error::last_os_error()
+            ),
+        ));
+    }
+    if flags & FD_CLOEXEC != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "descriptor {fd} is close-on-exec: this process opened it, so it is not an \
+                 inherited one to adopt"
+            ),
+        ));
+    }
+    // SAFETY: the caller admitted exclusive, stable ownership; the checks
+    // above only diagnose type/flags. This is the number's one owner, dropped
+    // immediately after its close-on-exec copy is made.
+    let inherited = unsafe { OwnedFd::from_raw_fd(fd) };
+    inherited.try_clone()
+}
+
 /// The lowest number a source may sit on when the spawn places it: above every
 /// target (stdio 0..=2 and the two lanes).
 const FIRST_FREE: RawFd = BRIDGE_PUSH_FD + 1;
 
-/// The first number a `posix_spawn` file action may NOT name: Darwin's libc
+/// The first number a `posix_spawn` file action may not name: Darwin's libc
 /// answers `EBADF` at add time for any descriptor at `OPEN_MAX` (10 240) or
 /// above. (Linux forks here and has no such limit.)
 #[cfg(target_vendor = "apple")]
@@ -234,16 +282,13 @@ pub enum ChildStdio {
 /// The program [`spawn`] and [`spawn_with_two_fds`] start: its argv, its
 /// environment and its stdio. The lanes are the spawn's own arguments.
 ///
-/// It is started the way `execvp` starts a program. A bare program name (no
-/// `/`) is searched on the `PATH` the CHILD will hold — the one in
-/// [`LaneCommand::env_exactly`]'s set when that names one, else this
-/// process's: the first candidate that starts wins (Darwin walks them with
-/// `posix_spawn` as `posix_spawnp` does; Linux takes the first regular file
-/// this process may execute, `access(X_OK)`, before its fork), one it may not
-/// run is passed over (and reported, `EACCES`, only when nothing later
-/// matches), and an unset `PATH` is `/usr/bin:/bin`. A file the kernel will
-/// not exec as an image (`ENOEXEC`: a script with no `#!` line) is run by
-/// `/bin/sh`, as `execvp` and `posix_spawnp` run it.
+/// It is started the way `execvp` starts a program. A bare name (no `/`) is searched on the
+/// `PATH` the child will hold ([`LaneCommand::env_exactly`]'s, else this process's): the first
+/// candidate that starts wins (Darwin walks them with `posix_spawn` as `posix_spawnp` does;
+/// Linux takes the first regular file this process may execute, before its fork), one it may
+/// not run is passed over (and reported, `EACCES`, only when nothing later matches), and an
+/// unset `PATH` is `/usr/bin:/bin`. An `ENOEXEC` file (a script with no `#!`) is run by
+/// `/bin/sh`.
 #[derive(Debug)]
 pub struct LaneCommand {
     program: OsString,
@@ -286,13 +331,11 @@ impl LaneCommand {
         self
     }
 
-    /// The child's WHOLE environment — `env_clear` and `envs` in one call:
-    /// nothing of this process's environment is added to it. Without this call
+    /// The child's whole environment (`env_clear` and `envs` in one call). Without this call
     /// the child gets this process's environment as it stands at the spawn.
     ///
-    /// A key named twice is set once, to its LAST value, as `envs` does: a
-    /// block carrying both would have the child's `getenv` read the first while
-    /// the `PATH` search here read another.
+    /// A key named twice is set once, to its last value, as `envs` does: a block carrying both
+    /// would have the child's `getenv` read the first while the `PATH` search here read another.
     pub fn env_exactly<I, K, V>(&mut self, vars: I) -> &mut Self
     where
         I: IntoIterator<Item = (K, V)>,
@@ -333,14 +376,11 @@ impl LaneCommand {
 /// A child [`spawn_with_two_fds`] started: `std::process::Child`'s process
 /// half, by pid.
 ///
-/// It REAPS EXACTLY ONCE. The first `wait`/`try_wait` that collects the exit
-/// keeps the status, and every later call answers from it without asking the
-/// kernel again — a second `waitpid` could name a recycled pid. Until then the
-/// pid is ours alone (an unreaped child keeps it, zombie or not), so
-/// [`LaneChild::kill`] signals only our own child, and after the reap it
-/// signals nothing. Dropping an unreaped handle collects a child that has
-/// already exited and hands a running one to [`crate::reaper`], so no zombie
-/// is left behind either way (`std` leaves a running one unreaped).
+/// It reaps exactly once: the first `wait`/`try_wait` that collects the exit keeps the status,
+/// and later calls answer from it (a second `waitpid` could name a recycled pid). Until then
+/// the pid is ours alone, so [`LaneChild::kill`] signals only our own child, and after the
+/// reap nothing. Dropping an unreaped handle collects an exited child and hands a running one
+/// to [`crate::reaper`], so no zombie is left either way (std leaves a running one unreaped).
 #[derive(Debug)]
 pub struct LaneChild {
     pid: i32,
@@ -427,14 +467,12 @@ impl Drop for LaneChild {
     }
 }
 
-/// SPAWN `cmd` with `first` and `second` inherited at [`BRIDGE_VERB_FD`] and
-/// [`BRIDGE_PUSH_FD`] — and nothing else above stdio.
+/// Spawn `cmd` with `first` and `second` inherited at [`BRIDGE_VERB_FD`] and
+/// [`BRIDGE_PUSH_FD`], and nothing else above stdio.
 ///
-/// Every descriptor handed in (the lanes, and a [`ChildStdio::Fd`]) is closed in
-/// THIS process when the call returns, on the success and the failure path
-/// alike — closing the parent's copies is what lets it see the child's EOF when
-/// the bridge dies; a caller that kept one open would hold the far end forever
-/// and the fail-closed halt would never fire.
+/// Every descriptor handed in (the lanes, and a [`ChildStdio::Fd`]) is closed in this process
+/// when the call returns, on success and failure alike: closing the parent's copies is what
+/// lets it see the child's EOF when the bridge dies, so the fail-closed halt fires.
 ///
 /// # Errors
 /// `InvalidInput` for a NUL in the program, an argument or the environment;
@@ -451,14 +489,10 @@ pub fn spawn_with_two_fds(
     launch(cmd, &lanes)
 }
 
-/// SPAWN `cmd` holding its stdio and NOTHING ELSE — no descriptor of this
-/// process above stdio reaches it, whatever this process holds without
-/// close-on-exec (Metal's shader-cache files; another thread's `socketpair` or
-/// `pipe` caught between its creation and its `F_SETFD`). [`spawn_with_two_fds`]
-/// with no lanes: the same exact inheritance, the same `exec` semantics, the
-/// same handle — for a long-lived helper this process starts and reads, which
-/// a plain `Command` on a std without SP-1 would hand every such descriptor for
-/// its whole life.
+/// Spawn `cmd` holding its stdio and nothing else: no descriptor of this process above stdio
+/// reaches it, whatever this process holds without close-on-exec (Metal's shader-cache files;
+/// another thread's `socketpair` or `pipe` caught before its `F_SETFD`). [`spawn_with_two_fds`]
+/// with no lanes, for a long-lived helper this process starts and reads.
 ///
 /// # Errors
 /// As [`spawn_with_two_fds`].
@@ -538,22 +572,26 @@ struct Placement<'a> {
     pgroup: Option<i32>,
     /// `setsid()` in the child.
     setsid: bool,
-    /// Replace THIS process instead of starting a child (`exec`).
+    /// Replace this process instead of starting a child (`exec`).
     replace: bool,
-    /// Where `posix_spawnp` and `execvp` part: a `PATH` entry too long to join
-    /// to a bare name ENDS the search with `ENAMETOOLONG` (`posix_spawnp`)
-    /// instead of being passed over (`execvp`). `std` takes `posix_spawnp`
-    /// exactly when the child's `PATH` is this process's own, so [`Command`]
-    /// sets it then; the lane spawns keep `execvp`'s walk.
+    /// Where `posix_spawnp` and `execvp` part: a `PATH` entry too long to join to a bare name
+    /// ends the search with `ENAMETOOLONG` (`posix_spawnp`) instead of being passed over
+    /// (`execvp`). std takes `posix_spawnp` exactly when the child's `PATH` is this process's
+    /// own, so [`Command`] sets it then; the lane spawns keep `execvp`'s walk.
     long_entry_ends: bool,
-    /// THE TRANSPARENT SPAWN ([`transparent`]): the child inherits this
-    /// process's whole table as it stands — no `POSIX_SPAWN_CLOEXEC_DEFAULT`
-    /// on Darwin, no strip off it — an inherited stdio slot is left exactly
-    /// as this process holds it, and the spawning thread's signal mask is
-    /// kept: `std`'s own spawn before SP-1, where every other spawn here
-    /// differs on purpose. `SIGPIPE` still goes back to its default, as
-    /// `std` resets it.
+    /// The transparent spawn ([`transparent`]): the child inherits this process's whole table
+    /// as it stands (no `POSIX_SPAWN_CLOEXEC_DEFAULT` on Darwin, no strip off it), an
+    /// inherited stdio slot is left exactly as this process holds it, and the spawning
+    /// thread's signal mask is kept, as upstream std spawns. `SIGPIPE` still goes back to its
+    /// default.
     inherit_all: bool,
+    /// THE CHILD IS ITS OWN RESPONSIBLE PROCESS: the name of the SPI that
+    /// disclaims it on the spawn's attributes ([`DISCLAIM_SPI`]; a test names
+    /// one that does not exist), resolved at the spawn. Darwin only, and
+    /// fail-closed: a name that does not resolve, or a setter that refuses,
+    /// fails the spawn before `posix_spawn`, so it never becomes a child
+    /// started undisclaimed. [`Command`] alone sets it.
+    disclaim: Option<&'a std::ffi::CStr>,
 }
 
 impl Default for Placement<'_> {
@@ -568,9 +606,27 @@ impl Default for Placement<'_> {
             replace: false,
             long_entry_ends: false,
             inherit_all: false,
+            disclaim: None,
         }
     }
 }
+
+/// `int responsibility_spawnattrs_setdisclaim(posix_spawnattr_t *attr, int
+/// disclaim)`: Darwin's private SPI (libquarantine, in libSystem; no SDK
+/// header declares it) that marks a spawn so the kernel makes the child its
+/// OWN responsible process instead of charging it to this process's. TCC and
+/// syspolicyd then ask their questions — a Developer Tools verdict, a privacy
+/// grant — about the child's code identity, evaluated afresh. MEASURED
+/// 2026-10-16 on this Mac: it resolves through `RTLD_DEFAULT`, answers 0, and
+/// the child comes back as its own responsible process
+/// (`responsibility_get_pid_responsible_for_pid`); a plain child of such a
+/// process is charged to it. In a VM the same day, a process checked before
+/// aterm was added to Privacy & Security ▸ Developer Tools kept a stale "not a
+/// developer tool" verdict, and a fresh responsible process with aterm's
+/// identity cleared it — the reason [`Command::disclaim_responsibility`]
+/// exists. Named here on every OS so the refusal elsewhere is the same code
+/// path's.
+const DISCLAIM_SPI: &std::ffi::CStr = c"responsibility_spawnattrs_setdisclaim";
 
 /// `fd`, or — when it sits on a target number (0..=4), or at a number a file
 /// action may not name — a fresh `F_DUPFD_CLOEXEC` copy at [`FIRST_FREE`] or
@@ -578,7 +634,7 @@ impl Default for Placement<'_> {
 ///
 /// One rule instead of a case per collision: a source on its own target would
 /// be a `dup2(fd, fd)`, which keeps close-on-exec (the lane arrives closed); a
-/// source on ANOTHER target is clobbered by that target's placement before its
+/// source on another target is clobbered by that target's placement before its
 /// own is read; and Darwin's libc refuses a file action at 10 240 or above.
 /// Above every target and below the limit, none of the three can happen.
 ///
@@ -591,15 +647,13 @@ fn off_the_targets(fd: OwnedFd) -> io::Result<OwnedFd> {
     placeable_copy(fd.as_raw_fd())
 }
 
-/// `fd` — a descriptor THIS process keeps across the spawn (its end of a
-/// child's pipe) — or, when it sits on a stdio number (0..=2), a fresh copy
-/// off them ([`placeable_copy`]), the original closed.
+/// `fd` (a descriptor this process keeps across the spawn: its end of a child's pipe) or,
+/// when it sits on a stdio number, a fresh copy off them ([`placeable_copy`]), the original
+/// closed.
 ///
-/// `io::pipe()` takes the lowest free numbers, so in a process that has closed
-/// its stdin, stdout or stderr our own end lands on that number. Left there it
-/// reads, to a later `Inherit` slot, as this process's own stdio: the spawn
-/// hands it to the child (`addinherit_np`), and a child given the write end of
-/// its own stdin never sees that stdin end (review of 2026-10-01). Off 0..=2,
+/// `io::pipe()` takes the lowest free numbers, so in a process that has closed a stdio slot our
+/// own end lands there, and a later `Inherit` slot would hand it to the child as this
+/// process's stdio (a child given the write end of its own stdin never sees EOF). Off 0..=2,
 /// the closed slot reads as closed and the child gets `/dev/null` there.
 #[cfg(target_vendor = "apple")]
 fn off_stdio(fd: OwnedFd) -> io::Result<OwnedFd> {
@@ -763,8 +817,7 @@ mod platform {
     type Attr = *mut c_void;
     type Actions = *mut c_void;
 
-    // <sys/spawn.h>, read from the SDK 2026-09-30 (SETPGROUP, SETEXEC and
-    // SETSID 2026-10-01).
+    // <sys/spawn.h>.
     const POSIX_SPAWN_SETPGROUP: i16 = 0x0002;
     const POSIX_SPAWN_SETSIGDEF: i16 = 0x0004;
     const POSIX_SPAWN_SETSIGMASK: i16 = 0x0008;
@@ -786,8 +839,16 @@ mod platform {
     const ETXTBSY: i32 = 26;
     const ELOOP: i32 = 62;
     const ENAMETOOLONG: i32 = 63;
+    /// `RTLD_DEFAULT`, as `<dlfcn.h>` defines it on Darwin: search every
+    /// image loaded, in load order.
+    const RTLD_DEFAULT: *mut c_void = (-2_isize) as *mut c_void;
+
+    /// [`super::DISCLAIM_SPI`]'s C prototype, `int f(posix_spawnattr_t *,
+    /// int)` — a `posix_spawnattr_t` being Darwin's opaque pointer, [`Attr`].
+    type SetDisclaim = unsafe extern "C" fn(*mut Attr, i32) -> i32;
 
     unsafe extern "C" {
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
         fn posix_spawnattr_init(attr: *mut Attr) -> i32;
         fn posix_spawnattr_destroy(attr: *mut Attr) -> i32;
         fn posix_spawnattr_setflags(attr: *mut Attr, flags: i16) -> i32;
@@ -881,28 +942,57 @@ mod platform {
         }
     }
 
-    /// `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`: the child holds stdio
-    /// and the lanes and nothing else. Every source is already at 5..10 240
-    /// (`off_the_targets`), so the actions below never self-copy, never clobber
-    /// a source a later action reads, and never name a number libc refuses.
-    /// The signal mask is emptied and `SIGPIPE` is reset to its default — the
-    /// disposition `Command` resets; `std` now leaves the mask as the spawning
-    /// thread's, which in the window blocks `SIGUSR1`, so a child here never
-    /// starts with a signal blocked. The working directory, the process group
-    /// and the session are the spawn's own attributes; `replace` turns the
-    /// spawn into an `exec` of THIS process (`POSIX_SPAWN_SETEXEC`), which
-    /// returns only on failure.
+    /// The disclaim setter `symbol` names ([`super::DISCLAIM_SPI`]), looked
+    /// up in every loaded image — at each spawn that asks for it, never
+    /// cached: a lazy static on a path the window's main thread reaches is
+    /// what this repo keeps out (the 0.65/0.66 freeze), and a lookup costs
+    /// microseconds beside the spawn.
+    ///
+    /// # Errors
+    /// `Unsupported`, naming the symbol, when no loaded image exports it: the
+    /// caller then starts nothing.
+    fn disclaimer(symbol: &CStr) -> io::Result<SetDisclaim> {
+        // SAFETY: `symbol` is a NUL-terminated C string that outlives the
+        // call; `RTLD_DEFAULT` is dlfcn.h's pseudo-handle for a global search.
+        let found = unsafe { dlsym(RTLD_DEFAULT, symbol.as_ptr()) };
+        if found.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "this macOS exports no {}: a child asked to be its own responsible \
+                     process is not started without it",
+                    symbol.to_string_lossy()
+                ),
+            ));
+        }
+        // SAFETY: dyld resolved the name to a function, and the one this
+        // module names, `responsibility_spawnattrs_setdisclaim`, has the C
+        // prototype `int f(posix_spawnattr_t *, int)` — exactly `SetDisclaim`
+        // (a test names a symbol that resolves to nothing, never another
+        // function).
+        Ok(unsafe { std::mem::transmute::<*mut c_void, SetDisclaim>(found) })
+    }
+
+    /// `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`: the child holds stdio and the lanes and
+    /// nothing else. Every source is already at 5..10 240 (`off_the_targets`), so the actions
+    /// never self-copy, clobber a source a later action reads, or name a number libc refuses.
+    /// The signal mask is emptied (std leaves the spawning thread's, which in the window blocks
+    /// `SIGUSR1`) and `SIGPIPE` reset to its default. `replace` turns the spawn into an `exec`
+    /// of this process (`POSIX_SPAWN_SETEXEC`), which returns only on failure.
     ///
     /// `inherit_all` ([`super::transparent`]) is the one spawn without
-    /// `POSIX_SPAWN_CLOEXEC_DEFAULT`: the kernel then hands the child every
-    /// descriptor this process holds without close-on-exec, an inherited
-    /// stdio slot is named by no file action (it reaches the child exactly as
-    /// it is here, as `std`'s `Command` hands it), and the spawning thread's
-    /// signal mask is kept (`std` keeps it). `SIGPIPE` still goes back to its
-    /// default, as `std` resets it.
+    /// `POSIX_SPAWN_CLOEXEC_DEFAULT`: the child gets every descriptor this process holds without
+    /// close-on-exec, an inherited stdio slot is named by no file action, and the spawning
+    /// thread's signal mask is kept, as std does. `SIGPIPE` still goes back to its default.
+    ///
+    /// `disclaim` makes the child its own responsible process: the setter is resolved before the
+    /// attribute object exists and called on it beside the other attributes, and either failing
+    /// returns before any `posix_spawn`, so a disclaim the OS cannot apply never becomes a child
+    /// started undisclaimed.
     pub(super) fn spawn(image: &Image, place: &Placement<'_>) -> io::Result<i32> {
         let argv = Image::pointers(&image.argv);
         let envp = Image::pointers(&image.envp);
+        let disclaim = place.disclaim.map(disclaimer).transpose()?;
         let mut objects = Objects::new()?;
         let empty: u32 = 0;
         let pipe_only: u32 = SIGPIPE_BIT;
@@ -920,7 +1010,9 @@ mod platform {
             flags |= POSIX_SPAWN_SETEXEC;
         }
         // SAFETY: each call takes an object `Objects::new` initialised and a
-        // live local or C string; none retains a pointer past the call.
+        // live local or C string; none retains a pointer past the call. The
+        // disclaim setter is the SPI `disclaimer` resolved, called with its
+        // own prototype on that same attribute object.
         unsafe {
             check(posix_spawnattr_setflags(&mut objects.attr, flags))?;
             if !place.inherit_all {
@@ -929,6 +1021,9 @@ mod platform {
             check(posix_spawnattr_setsigdefault(&mut objects.attr, &pipe_only))?;
             if let Some(pgroup) = place.pgroup {
                 check(posix_spawnattr_setpgroup(&mut objects.attr, pgroup))?;
+            }
+            if let Some(set_disclaim) = disclaim {
+                check(set_disclaim(&mut objects.attr, 1))?;
             }
             for (target, slot) in (0..).zip(place.stdio) {
                 let null_mode = if target == 0 { O_RDONLY } else { O_WRONLY };
@@ -976,30 +1071,22 @@ mod platform {
         spawnp(image, place, &objects, &argv, &envp)
     }
 
-    /// `posix_spawnp(3)` and `execvp(3)`, as this Mac answers them (MEASURED
-    /// 2026-10-01 with both, the same answers): a program holding a `/` is
-    /// tried once, and its error is the answer as the kernel gave it
-    /// (`ENOTDIR` for a file on the way, `EACCES` for an unsearchable
-    /// directory). A bare name is tried in every entry of the `PATH` the CHILD
-    /// will hold (an empty entry is the current directory; no `PATH` is
-    /// `/usr/bin:/bin`): `ENOENT`, `ENOTDIR`, `ELOOP` and `ENAMETOOLONG` move
-    /// on, a candidate that exists but is refused `EACCES` (a file it may not
-    /// run, a directory) moves on and is the answer only if nothing later
-    /// starts, and any other answer is final; nothing found is `ENOENT`. Either
-    /// way `ENOEXEC` hands the file to `/bin/sh`. The two part at an entry too
-    /// long to join to the name (`PATH_MAX`): `execvp` passes it over,
-    /// `posix_spawnp` ends there with `ENAMETOOLONG` — the walk
-    /// `Placement::long_entry_ends` picks, as `std` would.
+    /// `posix_spawnp(3)` and `execvp(3)`, as Darwin answers them: a program holding a `/` is
+    /// tried once, and its error is the answer as the kernel gave it. A bare name is tried in
+    /// every entry of the `PATH` the child will hold (an empty entry is the current directory;
+    /// no `PATH` is `/usr/bin:/bin`): `ENOENT`, `ENOTDIR`, `ELOOP` and `ENAMETOOLONG` move on, a
+    /// candidate that exists but is refused `EACCES` moves on and is the answer only if nothing
+    /// later starts, and any other answer is final; nothing found is `ENOENT`. Either way
+    /// `ENOEXEC` hands the file to `/bin/sh`. The two part at an entry too long to join to the
+    /// name (`PATH_MAX`): `execvp` passes it over, `posix_spawnp` ends with `ENAMETOOLONG`, the
+    /// walk `Placement::long_entry_ends` picks.
     ///
-    /// Two deliberate differences, neither visible to a caller: a candidate
-    /// that does not exist is passed over HERE (a `stat`, the check
-    /// `posix_spawnp` itself makes after a failure) instead of costing a
-    /// spawn attempt; and with a working directory set, a relative candidate
-    /// is joined to it first ([`rebase`]) — so it names the file the child
-    /// would, and Darwin's `addchdir_np` never sees a relative image (with
-    /// one, `posix_spawn` starts the program and still answers `ENOENT`:
-    /// `std`'s note, which sends `Command` to `fork` for that case). A `#!`
-    /// script reached that way sees the joined path as `$0`.
+    /// Two differences, neither visible to a caller: a candidate that does not exist is passed
+    /// over here (a `stat`) instead of costing a spawn attempt; and with a working directory
+    /// set, a relative candidate is joined to it first ([`rebase`]), so it names the file the
+    /// child would and `addchdir_np` never sees a relative image (with one, `posix_spawn`
+    /// starts the program and still answers `ENOENT`). A `#!` script reached that way sees the
+    /// joined path as `$0`.
     fn spawnp(
         image: &Image,
         place: &Placement<'_>,
@@ -1034,10 +1121,8 @@ mod platform {
         let mut eacces = false;
         for dir in search.split(|&b| b == b':') {
             let dir: &[u8] = if dir.is_empty() { b"." } else { dir };
-            // Too long for the libc's `PATH_MAX` buffer: `execvp` passes the
-            // entry over, `posix_spawnp` stops there with `ENAMETOOLONG`
-            // (MEASURED 2026-10-01 on `/usr/bin:/bin`: from a 1 015-byte
-            // name on, `posix_spawnp` answers 63 and `execvp` 2).
+            // Too long for the libc's `PATH_MAX` buffer: `execvp` passes the entry over,
+            // `posix_spawnp` stops there with `ENAMETOOLONG`.
             if dir.len() + program.len() + 2 > PATH_MAX {
                 if place.long_entry_ends {
                     return Err(io::Error::from_raw_os_error(ENAMETOOLONG));
@@ -1127,20 +1212,15 @@ mod platform {
         fn _exit(code: i32) -> !;
     }
 
-    /// Fork, strip, place, exec — the child calling only async-signal-safe
-    /// functions on memory prepared here. Its exec status comes back on a
-    /// close-on-exec pipe of OUR making, whose write end sits at 5 or above
-    /// like every source, so no placement can clobber it: EOF is a started
-    /// child, four bytes are the errno it died of before `execve` took.
+    /// Fork, strip, place, exec, the child calling only async-signal-safe functions on memory
+    /// prepared here. Its exec status comes back on a close-on-exec pipe of our making, whose
+    /// write end sits at 5 or above like every source, so no placement can clobber it: EOF is a
+    /// started child, four bytes are the errno it died of before `execve` took.
     ///
-    /// It places stdio and lanes only: `Command`, the one spawn that sets a
-    /// working directory, a process group, a session, an `exec` or
-    /// `posix_spawnp`'s walk, starts through `std` here (`spawnfd_command.rs`).
-    ///
-    /// `inherit_all` ([`super::transparent`]) forks with NO strip: the child
-    /// keeps every descriptor this process holds without close-on-exec, an
-    /// inherited stdio slot is left as it is, and the signal mask is the
-    /// forking thread's — `std`'s own fork, less `std`.
+    /// It places stdio and lanes only: `Command`, the one spawn that sets a working directory,
+    /// a process group, a session, an `exec` or `posix_spawnp`'s walk, starts through std here
+    /// (`spawnfd_command.rs`), and a disclaim (Darwin's responsibility SPI) is refused, starting
+    /// nothing. `inherit_all` ([`super::transparent`]) forks with no strip.
     pub(super) fn spawn(image: &Image, place: &Placement<'_>) -> io::Result<i32> {
         if place.cwd.is_some()
             || place.base.is_some()
@@ -1148,6 +1228,7 @@ mod platform {
             || place.setsid
             || place.replace
             || place.long_entry_ends
+            || place.disclaim.is_some()
         {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -1254,13 +1335,11 @@ mod platform {
         script: &'a [*const c_char],
     }
 
-    /// THE FORKED CHILD. Async-signal-safe calls only (`close_range`/`fcntl`,
-    /// `dup2`, `sigprocmask`, `signal`, `execve`, `write`, `_exit`), on memory
-    /// the parent prepared; it allocates nothing and never returns. An image
-    /// the kernel answers `ENOEXEC` for is handed to `/bin/sh`, as `execvp`
-    /// hands it. With no `strip` (the transparent spawn) it marks nothing,
-    /// leaves an inherited stdio slot and the signal mask as they are, and
-    /// still resets `SIGPIPE`.
+    /// The forked child. Async-signal-safe calls only (`close_range`/`fcntl`, `dup2`,
+    /// `sigprocmask`, `signal`, `execve`, `write`, `_exit`), on memory the parent prepared; it
+    /// allocates nothing and never returns. An `ENOEXEC` image is handed to `/bin/sh`, as
+    /// `execvp` hands it. With no `strip` (the transparent spawn) it marks nothing, leaves an
+    /// inherited stdio slot and the signal mask as they are, and still resets `SIGPIPE`.
     ///
     /// # Safety
     /// Only between `fork` and `exec`, with `sources[..placed]` at 5 or above
@@ -1338,11 +1417,10 @@ mod platform {
     }
 }
 
-/// THE STRIP, for a spawn that must fork (a PTY child: `setrlimit` and a
-/// controlling terminal are not `posix_spawn` file actions). [`Self::prepare`]
-/// in the parent, before the fork; [`Self::apply`] in the child, between the
-/// fork and the exec: every descriptor above stdio is then close-on-exec, and
-/// what the child places with `dup2` afterwards is not.
+/// The strip, for a spawn that must fork (a PTY child: `setrlimit` and a controlling terminal
+/// are not `posix_spawn` file actions). [`Self::prepare`] in the parent, before the fork;
+/// [`Self::apply`] in the child, between the fork and the exec: every descriptor above stdio
+/// is then close-on-exec, and what the child places with `dup2` afterwards is not.
 ///
 /// Marking rather than closing is deliberate: a status pipe the child reports
 /// a failure on is already close-on-exec and must stay open until the exec.
@@ -1352,10 +1430,9 @@ pub struct InheritStrip {
 }
 
 impl InheritStrip {
-    /// Read [`descriptor_bound`] — in the parent, before the fork — and pass
-    /// libnotify's once-gate ([`pass_libnotify_gate`]), so no fork that strips
-    /// (aterm-pty's spawn, [`InheritNothing`], the update hand-off's fork lane)
-    /// can catch that gate half taken and lose its child inside `fork()`.
+    /// Read [`descriptor_bound`] in the parent, before the fork, and pass libnotify's
+    /// once-gate ([`pass_libnotify_gate`]), so no fork that strips (aterm-pty's spawn,
+    /// [`InheritNothing`], the update hand-off's fork lane) loses its child inside `fork()`.
     #[must_use]
     pub fn prepare() -> Self {
         pass_libnotify_gate();
@@ -1370,38 +1447,26 @@ impl InheritStrip {
         self.bound
     }
 
-    /// MARK EVERY DESCRIPTOR FROM 3 UP CLOSE-ON-EXEC. Call it in a forked
-    /// child before its `exec` (or right before an `exec` that replaces this
-    /// process); anywhere else it would strip descriptors the process means to
-    /// pass on.
+    /// Mark every descriptor from 3 up close-on-exec. Call it in a forked child before its
+    /// `exec` (or right before an `exec` that replaces this process); anywhere else it would
+    /// strip descriptors the process means to pass on.
     ///
-    /// The descriptors are LISTED, not probed, wherever the kernel can list
-    /// them — the child's own table, which nothing else can change while it
-    /// runs:
+    /// The descriptors are listed, not probed, wherever the kernel can list the child's own
+    /// table, which nothing else can change while it runs:
     ///
-    /// * Linux: `close_range(3, ~0, CLOSE_RANGE_CLOEXEC)` (5.11+), else the
-    ///   numbers `/proc/self/fd` lists (read with `getdents64` into a stack
-    ///   buffer).
-    /// * Darwin: the numbers `proc_pidinfo(PROC_PIDLISTFDS)` lists, into a
-    ///   stack buffer of [`darwin_strip::SLOTS`] entries — ascending, so a
-    ///   full buffer vouches for every number up to its last entry and the
-    ///   loop below covers only the rest, up to the END OF THE TABLE (the
-    ///   size a listing with no buffer answers: no open number reaches past
-    ///   it, and a forked child's table ends just past its highest number).
-    ///   MEASURED 2026-10-01, fork + strip + exec of `/usr/bin/true` on this
-    ///   Mac: 1.18–1.26 ms against 1.18 ms with no strip at all; the loop to
-    ///   `kern.maxfilesperproc` (92 160 `fcntl`s) cost 9.3 ms against
-    ///   1.25 ms — ~8 ms on every shell spawn — and looping over the rest of
-    ///   a full listing to the bound cost a spawn with 2 100 descriptors open
-    ///   10–13 ms against 2.3 ms with 2 000, and 0.9–1.0 ms for either once
-    ///   the loop stopped at the table's end.
+    /// * Linux: `close_range(3, ~0, CLOSE_RANGE_CLOEXEC)` (5.11+), else the numbers
+    ///   `/proc/self/fd` lists (read with `getdents64` into a stack buffer).
+    /// * Darwin: the numbers `proc_pidinfo(PROC_PIDLISTFDS)` lists into a stack buffer of
+    ///   [`darwin_strip::SLOTS`] entries. They come ascending, so a full buffer vouches for every
+    ///   number up to its last entry and the loop covers only the rest, up to the end of the
+    ///   table. A loop to `kern.maxfilesperproc` would cost about 8 ms on every shell spawn;
+    ///   the listing costs next to nothing.
     ///
-    /// The last resort, where the listing fails or is cut short: one
-    /// `fcntl(F_SETFD)` per number left (below the bound, or the table's
-    /// end); an unused number is a harmless `EBADF`.
+    /// The last resort, where the listing fails or is cut short: one `fcntl(F_SETFD)` per
+    /// number left; an unused number is a harmless `EBADF`.
     ///
-    /// ASYNC-SIGNAL-SAFE by construction: raw syscalls and integer arithmetic,
-    /// no allocation, no lock, no `static`, no error formatting.
+    /// Async-signal-safe by construction: raw syscalls and integer arithmetic, no allocation,
+    /// no lock, no `static`, no error formatting.
     pub fn apply(self) {
         #[cfg(target_os = "linux")]
         if linux_strip::close_range_cloexec() || linux_strip::proc_self_fd() {
@@ -1421,39 +1486,45 @@ impl InheritStrip {
     }
 }
 
-/// A `std::process::Command` whose child inherits NOTHING of this process above
-/// stdio: [`InheritStrip`] in a `pre_exec` hook — for a spawn that must fork
-/// anyway (the module docs say what that costs and why stdio survives it).
-/// Product code that needs no code between the fork and the exec uses
-/// [`command`], which does not fork at all on Darwin.
+/// A `std::process::Command` whose child inherits nothing of this process above stdio:
+/// [`InheritStrip`] in a `pre_exec` hook, for a spawn that must fork anyway. Code that needs
+/// nothing between the fork and the exec uses [`command`], which does not fork on Darwin.
 pub trait InheritNothing {
-    /// Install the strip. Hooks run in the order they were added, so install
-    /// it before any hook that hands a descriptor over, or that hook's work is
-    /// undone.
+    /// Install the strip. Hooks run in the order they were added, so install it before any
+    /// hook that hands a descriptor over, or that hook's work is undone.
     ///
-    /// With `exec` (which replaces THIS process) the strip marks this
-    /// process's own table, as [`InheritStrip::apply`] allows right before
-    /// such an `exec` — and a FAILED exec does not undo it: the process that
-    /// survives holds every descriptor close-on-exec, so nothing it later
-    /// spawns or execs inherits one unless it clears that flag again. Use it
-    /// with `exec` only where the error path hands nothing on (the shipped
-    /// `exec` sites are the reviewed raw ones, none through here).
+    /// With `exec` (which replaces this process) the strip marks this process's own table, and
+    /// a failed exec does not undo it: the surviving process holds every descriptor
+    /// close-on-exec, so nothing it later spawns inherits one. Use it with `exec` only where
+    /// the error path hands nothing on.
     fn inherit_nothing(&mut self) -> &mut Self;
 }
 
+/// `std`'s own `Command`, under the one name a reviewed raw site TAKES it by.
+///
+/// The workspace bans `std::process::Command` (clippy.toml: one child
+/// constructor), and this alias is that ban's one standing excuse. A fn that
+/// only receives a command someone else built (a setter, an `exec`, a trait
+/// impl) names it `StdCommand` and carries no `#[expect]` of its own, so no
+/// fn-wide excuse also admits a raw `std::process::Command::new` in its body:
+/// that construction is still linted, and the statement that does it carries
+/// its own `#[expect]`. Clippy does not see through an alias, so
+/// `StdCommand::new` would build a child unlinted: it is never spelled outside
+/// this crate (the `aterm-census` guard).
 #[expect(
     clippy::disallowed_types,
-    reason = "the strip a reviewed raw std Command (a PTY child's pre_exec) installs"
+    reason = "the one name a reviewed raw std Command is taken by; constructing one stays linted at its own statement"
 )]
-impl InheritNothing for std::process::Command {
+pub type StdCommand = std::process::Command;
+
+impl InheritNothing for StdCommand {
     fn inherit_nothing(&mut self) -> &mut Self {
         use std::os::unix::process::CommandExt as _;
         // The bound is read here, before any fork, where no thread can raise it.
         let strip = InheritStrip::prepare();
-        // SAFETY: the hook runs between fork and exec (or right before an exec
-        // of this process) and calls only `InheritStrip::apply` — raw syscalls
-        // over integers, async-signal-safe: no allocation, no lock. `strip` is a
-        // plain integer copied into the closure.
+        // SAFETY: the hook runs between fork and exec (or right before an exec of this
+        // process) and calls only `InheritStrip::apply`: raw syscalls over integers, no
+        // allocation, no lock. `strip` is a plain integer copied into the closure.
         unsafe {
             self.pre_exec(move || {
                 strip.apply();
@@ -1467,13 +1538,11 @@ impl InheritNothing for std::process::Command {
 mod no_fork;
 pub use no_fork::{Child, Command, Rusage, Stdio};
 
-/// A [`Command`] for `program`: its child holds its stdio and nothing else, and
-/// on Darwin it is started without a fork — THE way product code starts a
-/// child (the workspace clippy.toml bans `std::process::Command`).
-/// `std::process::Command`'s shape:
-/// arguments, environment, working directory, stdio, process group,
-/// `spawn`/`output`/`status`/`exec`; [`no_fork`]'s docs list the few places it
-/// differs, `pre_exec` the one it lacks.
+/// A [`Command`] for `program`: its child holds its stdio and nothing else, and on Darwin it
+/// starts without a fork. The way product code starts a child (the workspace clippy.toml bans
+/// `std::process::Command`). std's shape: arguments, environment, working directory, stdio,
+/// process group, `spawn`/`output`/`status`/`exec`; [`no_fork`]'s docs list where it differs,
+/// `pre_exec` the one thing it lacks and [`Command::disclaim_responsibility`] the one it adds.
 #[must_use]
 pub fn command(program: impl AsRef<OsStr>) -> Command {
     Command::new(program)
@@ -1523,13 +1592,11 @@ mod darwin_strip {
         ) -> i32;
     }
 
-    /// Mark every descriptor from 3 up that this process's table lists, and
-    /// return the numbers the listing does NOT vouch for: none when it listed
-    /// the whole table; from one past its last entry (the kernel lists in
-    /// ascending order, so every open number below that was listed) to
-    /// [`table_end`] when it filled the buffer; `3..bound` when it failed.
-    /// `proc_pidinfo` is the `proc_info` system call and nothing more —
-    /// async-signal-safe.
+    /// Mark every descriptor from 3 up that this process's table lists, and return the numbers
+    /// the listing does not vouch for: none when it listed the whole table; from one past its
+    /// last entry (the kernel lists in ascending order) to [`table_end`] when it filled the
+    /// buffer; `3..bound` when it failed. `proc_pidinfo` is the `proc_info` system call and
+    /// nothing more: async-signal-safe.
     pub(super) fn mark_listed(bound: RawFd) -> core::ops::Range<RawFd> {
         let mut listed = [FdInfo { fd: -1, _kind: 0 }; SLOTS];
         // SAFETY: `listed` is `LISTING_BYTES` writable bytes of `proc_fdinfo`
@@ -1569,13 +1636,11 @@ mod darwin_strip {
         }
     }
 
-    /// One past the highest number this process's table can hold open, at
-    /// most `bound`: a listing with no buffer answers the table's size in
-    /// `proc_fdinfo` slots (its allocated length plus 20 of slack — MEASURED
-    /// 2026-10-01: one descriptor at 5 000 among four answered 6 420), and no
-    /// open number reaches past it. A forked child's table ends just past its
-    /// highest number (2 170 slots for 2 103), whatever its parent's grew to.
-    /// `bound` when it cannot answer.
+    /// One past the highest number this process's table can hold open, at most `bound`: a
+    /// listing with no buffer answers the table's size in `proc_fdinfo` slots (its allocated
+    /// length plus 20 of slack), and no open number reaches past it. A forked child's table
+    /// ends just past its highest number, whatever its parent's grew to. `bound` when it cannot
+    /// answer.
     fn table_end(bound: RawFd) -> RawFd {
         // SAFETY: a null buffer of size 0 asks for the size alone; nothing is
         // written. `getpid` takes nothing.
@@ -1588,19 +1653,16 @@ mod darwin_strip {
     }
 }
 
-/// ONE MORE THAN THE HIGHEST DESCRIPTOR NUMBER THIS PROCESS CAN EVER HOLD, by a
-/// limit no thread of an unprivileged process can raise — so a number read
-/// before a fork still bounds the child's whole table, whatever another thread
-/// did in between.
+/// One more than the highest descriptor number this process can ever hold, by a limit no
+/// thread of an unprivileged process can raise, so a number read before a fork still bounds
+/// the child's whole table.
 ///
-/// Darwin: `kern.maxfilesperproc` (92 160 here; root alone can change it).
-/// Darwin hands out numbers up to it whenever the soft `RLIMIT_NOFILE` is
-/// higher, so the soft limit — the old ceiling, capped at 65 536 — is not one.
-/// Linux: the HARD `RLIMIT_NOFILE`, which only `CAP_SYS_RESOURCE` can raise
-/// and which bounds every soft limit a number is allocated under — though not a
-/// number opened before a process LOWERED it, which is why the strip lists the
-/// table there (`close_range`, `/proc/self/fd`) and loops to this bound only
-/// as its last resort. Elsewhere, or when the read fails: 2^20.
+/// Darwin: `kern.maxfilesperproc` (92 160 here; root alone can change it), which Darwin
+/// allocates up to whenever the soft `RLIMIT_NOFILE` is higher, so the soft limit bounds
+/// nothing. Linux: the hard `RLIMIT_NOFILE`, which only `CAP_SYS_RESOURCE` can raise, though a
+/// number opened before a process lowered it can sit above it; hence the strip lists the
+/// table there and loops to this bound only as its last resort. Elsewhere, or when the read
+/// fails: 2^20.
 #[must_use]
 pub fn descriptor_bound() -> RawFd {
     const FALLBACK: RawFd = 1 << 20;
@@ -1642,17 +1704,14 @@ pub fn descriptor_bound() -> RawFd {
     }
 }
 
-/// PASS libnotify's ONCE-GATE, so that no fork after this returns can catch it
-/// half taken. Darwin; a no-op elsewhere.
+/// Pass libnotify's once-gate, so that no fork after this returns can catch it half taken.
+/// Darwin; a no-op elsewhere.
 ///
-/// `fork(2)` runs libSystem's own child handlers before it returns in the
-/// child, and one of them, `_notify_fork_child`, reaches libnotify's globals
-/// through an `os_alloc_once` gate. A thread INSIDE that gate — making the
-/// process's first libnotify call, which `getpwuid_r`, `confstr`,
-/// `os_log_create` and CFPreferences all reach — when another thread forks
-/// hands the child a gate held by a thread the child does not have, and
-/// libplatform kills the child inside `fork()`, before one instruction of the
-/// child branch runs:
+/// `fork(2)` runs libSystem's child handlers before it returns in the child, and
+/// `_notify_fork_child` reaches libnotify's globals through an `os_alloc_once` gate. A thread
+/// inside that gate (making the process's first libnotify call, which `getpwuid_r`, `confstr`,
+/// `os_log_create` and CFPreferences all reach) when another thread forks hands the child a
+/// gate held by a thread it does not have, and libplatform kills the child inside `fork()`:
 ///
 /// ```text
 ///   BUG IN CLIENT OF LIBPLATFORM: os_once_t is corrupt
@@ -1661,34 +1720,15 @@ pub fn descriptor_bound() -> RawFd {
 ///     <- _os_alloc_once <- _notify_fork_child <- libSystem_atfork_child <- fork
 /// ```
 ///
-/// SIGKILL, and the parent cannot tell it from success: the child's copy of a
-/// close-on-exec status pipe closes with it, which reads as an `exec` that
-/// worked. Passing the gate closes the window for good — `os_once` makes a
-/// caller that finds another thread inside wait for it, and a passed gate is
-/// never taken again — so the forks that strip pass it themselves
-/// ([`InheritStrip::prepare`]), rather than trust whatever the rest of the
-/// process happened to call first. The
-/// first call builds the globals (a few allocations); every later one is a
-/// token lookup under libnotify's lock.
+/// The parent cannot tell that from success: the child's copy of a close-on-exec status pipe
+/// closes with it, which reads as an `exec` that worked. Passing the gate closes the window for
+/// good (`os_once` makes a caller that finds another thread inside wait, and a passed gate is
+/// never taken again), so the forks that strip pass it themselves ([`InheritStrip::prepare`])
+/// rather than trust whatever the process happened to call first. The first call builds the
+/// globals (a few allocations); later ones are a token lookup under libnotify's lock.
 ///
-/// MEASURED 2026-10-01 (load 60-110 on 18 cores): 160 full runs of aterm-pty's
-/// tests failed 4 times on a child lost this way — its fork-safety test's raw
-/// forks and a `setsid` stand-in's `Command` — and left 5 such crash reports,
-/// one of them a PTY shell forked by `spawn_shell_with_pid_cell_px`. In 30 of
-/// 30 runs the process's first libnotify call was a sibling test's
-/// `getpwuid_r`. The shipped binary's window passes the gate on its main
-/// thread (NSApplication's `+initialize`) before it forks anything, but its
-/// session forks the shell with the gate still cold — and with `$TMPDIR` unset
-/// the first spawn's own status-FIFO lookup was the first caller
-/// (`std::env::temp_dir` -> `confstr`, since replaced by aterm-pty's
-/// `fifo_dir_in`).
-///
-/// libSystem's other child handlers have gates of the same shape (libxpc's
-/// `os_alloc_once`, libsystem_coreservices' `os_once`); none has been seen to
-/// kill a child, so none is passed here. Even `confstr`'s harm went through
-/// this one alone: put back into aterm-pty's status-FIFO naming, it cost that
-/// fork-safety test a child in 21 of 150 runs with this gate cold, and in 0 of
-/// 150 with it passed at load.
+/// libSystem's other child handlers have gates of the same shape (libxpc's `os_alloc_once`,
+/// libsystem_coreservices' `os_once`); none has been seen to kill a child, so none is passed.
 pub fn pass_libnotify_gate() {
     #[cfg(target_vendor = "apple")]
     {
@@ -1699,13 +1739,11 @@ pub fn pass_libnotify_gate() {
     }
 }
 
-/// FOR A TEST BINARY: pass [`pass_libnotify_gate`] at IMAGE LOAD, before the
-/// harness has started a thread — for a test process whose own forks (a
-/// `pre_exec` stand-in, a raw `fork` probe) do not go through
-/// [`InheritStrip::prepare`] while sibling tests make libnotify calls on other
-/// threads. Expand it once per test crate, under
-/// `#[cfg(all(test, target_vendor = "apple"))]`: dyld runs the function it
-/// registers before `main`.
+/// For a test binary: pass [`pass_libnotify_gate`] at image load, before the harness starts a
+/// thread, for a test process whose own forks (a `pre_exec` stand-in, a raw `fork` probe) do
+/// not go through [`InheritStrip::prepare`]. Expand it once per test crate, under
+/// `#[cfg(all(test, target_vendor = "apple"))]`: dyld runs the function it registers before
+/// `main`.
 #[macro_export]
 macro_rules! pass_libnotify_gate_at_load {
     () => {
@@ -1824,9 +1862,8 @@ mod linux_strip {
     }
 }
 
-// The FFI every Unix build needs, in one block. `fcntl` is variadic by
-// declaration, which is not cosmetic — on arm64 Darwin a variadic argument is
-// passed differently from a fixed one.
+// The FFI every Unix build needs. `fcntl` is variadic by declaration, which is not cosmetic:
+// on arm64 Darwin a variadic argument is passed differently from a fixed one.
 unsafe extern "C" {
     fn fcntl(fd: RawFd, cmd: i32, ...) -> i32;
     fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
@@ -1881,9 +1918,10 @@ const EMFILE: i32 = 24;
 #[cfg(not(target_vendor = "apple"))]
 const X_OK: i32 = 1;
 
+/// `spawnfd`'s tests; [`tests::translator`] is every test's in the crate.
 #[cfg(test)]
 #[path = "spawnfd_tests.rs"]
-mod tests;
+pub(crate) mod tests;
 
 #[cfg(test)]
 #[path = "spawnfd_command_tests.rs"]
@@ -1893,8 +1931,8 @@ mod command_tests;
 #[path = "spawnfd_transparent_tests.rs"]
 mod transparent_tests;
 
-/// TEST-ONLY, DELIBERATELY LEAKY spawns that owe nothing to `std`'s: the
-/// CONTROL arm of every inheritance test here (and in [`crate::pspawn`]).
+/// Test-only, deliberately leaky spawns that owe nothing to std's: the control arm of every
+/// inheritance test here (and in [`crate::pspawn`]).
 #[cfg(test)]
 #[path = "spawnfd_test_support.rs"]
 pub(crate) mod test_support;

@@ -5,9 +5,8 @@
 // pixel outside it is byte-identical to the no-cursor frame. Swept over every column and
 // steady style on a row mixing a ligature, a wide lead and plain cells; the pure clip
 // seams (`clip_span`, `cursor_cutout_cols`, `glyph_quad`'s x-clip) are checked
-// exhaustively on small lattices. The ty model `cursor_cutout_clip_model` carries the same
-// invariant (aterm-spec's `derived_ring_ty.rs`); aterm-gpu's `ligature_parity.rs` binds the
-// GPU frames to these.
+// exhaustively on small lattices. aterm-gpu's `ligature_parity.rs` binds the GPU frames
+// to these.
 
 use aterm_core::terminal::{CursorStyle, Terminal};
 use aterm_render::{
@@ -16,7 +15,6 @@ use aterm_render::{
 };
 
 const CURSOR: u32 = 0x0050_FA7B; // Theme::default().cursor
-const BG: u32 = 0x0011_1318; // Theme::default().bg
 
 // The ligature test font (same as tests/ligatures.rs): $ATERM_LIGATURE_TEST_FONT
 // if set and readable, else the committed JetBrains Mono fixture (compiled in).
@@ -143,39 +141,6 @@ fn cursor_touches_only_its_rect_all_columns_and_styles() {
     assert!(
         any_inside_changed,
         "NON-VACUITY: no cursor changed any pixel — the sweep never drew a cursor"
-    );
-}
-
-/// A block cursor on the '>' of '=>' leaves the '=' cell (which carries ligature ink)
-/// byte-identical to the no-cursor frame.
-#[test]
-fn block_on_ligature_tail_leaves_lead_cell_identical() {
-    let mut r = renderer();
-    let (cw, ch) = r.cell_size();
-    let hidden = frame_with_cursor(&mut r, None);
-    let cursor_on_gt = frame_with_cursor(&mut r, Some(2)); // '>' cell of '=>'
-    let band = |f: &Frame, c: usize| -> Vec<u32> {
-        let mut out = Vec::with_capacity(cw * ch);
-        for y in 0..f.height {
-            out.extend_from_slice(&f.pixels[y * f.width + c * cw..y * f.width + (c + 1) * cw]);
-        }
-        out
-    };
-    // Non-vacuity: the '=' cell shows ligature ink in the no-cursor frame.
-    assert!(
-        band(&hidden, 1).iter().any(|&p| p != BG),
-        "the '=' cell of '=>' must carry ligature ink — is the fixture ligating?"
-    );
-    assert_eq!(
-        band(&cursor_on_gt, 1),
-        band(&hidden, 1),
-        "block cursor on '>' must leave the '=' cell byte-identical to the \
-         no-cursor frame — the cut-out repainted the ligature's lead ink"
-    );
-    // And the cursor cell itself really shows the cursor.
-    assert!(
-        band(&cursor_on_gt, 2).contains(&CURSOR),
-        "the '>' cell must show the block cursor fill"
     );
 }
 

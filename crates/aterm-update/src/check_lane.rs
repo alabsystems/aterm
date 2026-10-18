@@ -130,7 +130,7 @@ mod tests {
 
     #[test]
     fn a_join_requires_a_new_completion_for_the_requested_source_and_build() {
-        let model = aterm_spec::derive::native_update_check_join_model();
+        let model = aterm_models_update::native_update_check_join_model();
         for fresh in [false, true] {
             for same_source in [false, true] {
                 for same_build in [false, true] {
@@ -199,7 +199,7 @@ mod tests {
             lane.state.is_poisoned(),
             "the fixture really poisoned the shipping mutex"
         );
-        let model = aterm_spec::derive::native_update_check_join_model();
+        let model = aterm_models_update::native_update_check_join_model();
         let mut historical = model.init_state();
         historical.insert("poisoned", 1);
         historical.insert("recovered", 1);
@@ -251,7 +251,7 @@ mod tests {
         let lane = Lane::new();
         let guard = lane.try_lock().unwrap();
         let gate = aterm_update_core::FileLock::acquire(&file_path).unwrap();
-        let model = aterm_spec::derive::native_update_check_wait_model();
+        let model = aterm_models_update::native_update_check_wait_model();
         let mut historical = model.init_state();
         historical.insert("sleeping", 1);
         historical.insert("file_held", 0);

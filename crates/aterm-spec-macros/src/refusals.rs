@@ -204,11 +204,11 @@
 //! Accepted twin:
 //!
 //! ```
-//! #[aterm_spec::refines(machine = "Twin", action = "Up", project = "twin::project")]
+//! #[aterm_spec_anchor::refines(machine = "Twin", action = "Up", project = "twin::project")]
 //! fn up(n: u32) -> u32 {
 //!     n + 1
 //! }
-//! #[aterm_spec::spec_unmodeled(reason = "a platform fast path", machine = "Twin")]
+//! #[aterm_spec_anchor::spec_unmodeled(reason = "a platform fast path", machine = "Twin")]
 //! fn fast() {}
 //! # fn main() { assert_eq!(up(1), 2); fast(); }
 //! ```
@@ -216,11 +216,11 @@
 //! A key the attribute does not take:
 //!
 //! ```compile_fail
-//! #[aterm_spec::refines(machine = "Twin", action = "Up", project = "twin::project", tla = "x")]
+//! #[aterm_spec_anchor::refines(machine = "Twin", action = "Up", project = "twin::project", tla = "x")]
 //! fn up(n: u32) -> u32 {
 //!     n + 1
 //! }
-//! #[aterm_spec::spec_unmodeled(reason = "a platform fast path", machine = "Twin")]
+//! #[aterm_spec_anchor::spec_unmodeled(reason = "a platform fast path", machine = "Twin")]
 //! fn fast() {}
 //! # fn main() { assert_eq!(up(1), 2); fast(); }
 //! ```
@@ -228,11 +228,11 @@
 //! A value that is not a string literal:
 //!
 //! ```compile_fail
-//! #[aterm_spec::refines(machine = "Twin", action = Up, project = "twin::project")]
+//! #[aterm_spec_anchor::refines(machine = "Twin", action = Up, project = "twin::project")]
 //! fn up(n: u32) -> u32 {
 //!     n + 1
 //! }
-//! #[aterm_spec::spec_unmodeled(reason = "a platform fast path", machine = "Twin")]
+//! #[aterm_spec_anchor::spec_unmodeled(reason = "a platform fast path", machine = "Twin")]
 //! fn fast() {}
 //! # fn main() { assert_eq!(up(1), 2); fast(); }
 //! ```
@@ -240,11 +240,11 @@
 //! A waiver with no `reason`:
 //!
 //! ```compile_fail
-//! #[aterm_spec::refines(machine = "Twin", action = "Up", project = "twin::project")]
+//! #[aterm_spec_anchor::refines(machine = "Twin", action = "Up", project = "twin::project")]
 //! fn up(n: u32) -> u32 {
 //!     n + 1
 //! }
-//! #[aterm_spec::spec_unmodeled(machine = "Twin")]
+//! #[aterm_spec_anchor::spec_unmodeled(machine = "Twin")]
 //! fn fast() {}
 //! # fn main() { assert_eq!(up(1), 2); fast(); }
 //! ```

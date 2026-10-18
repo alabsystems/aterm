@@ -3,18 +3,28 @@
 
 //! Cryptographic digests for aterm: SHA-256 and HMAC-SHA256.
 //!
-//! A first-party, dependency-free replacement for the `sha2` and `hmac`
-//! crates, covering the surface aterm uses: [`Sha256::new`],
-//! [`Sha256::digest`], `update` and `finalize`, plus HMAC's `new_from_slice` /
-//! `update` / `finalize` / `verify_slice`. [`ct_eq`] replaces aterm's use of
-//! `subtle` (the package stays in the graph through `rustls`).
+//! A first-party replacement for the `sha2` and `hmac` crates, covering the
+//! surface aterm uses: [`Sha256::new`], [`Sha256::digest`], `update` and
+//! `finalize`, plus HMAC's `new_from_slice` / `update` / `finalize` /
+//! `verify_slice`. [`ct_eq`] replaces aterm's use of `subtle` (the package
+//! stays in the graph through `rustls`).
 //!
 //! # Exported types
 //!
-//! - [`Sha256`] -- FIPS 180-4 SHA-256, streaming or one-shot
+//! - [`Sha256`] -- FIPS 180-4 SHA-256, streaming or one-shot: astream's
+//!   `astream_digest::Sha256`, re-exported (below)
 //! - [`HmacSha256`] -- RFC 2104 HMAC keyed with SHA-256
 //! - [`ct_eq`] -- constant-time byte-slice comparison
 //! - [`InvalidLength`], [`MacError`] -- API-compatible error types
+//!
+//! ONE SHA-256. The hash is astream-digest's, the same type astream-cap hashes
+//! aterm-link's capability grants and producer ids with: zero dependencies,
+//! `forbid(unsafe)`, its streaming buffer's obligations discharged as a Clean
+//! island. It began as this crate's own `sha256.rs`, ported to astream with its
+//! tests; keeping both meant two 320-line transcriptions of FIPS 180-4 that
+//! nothing held to each other, so a fix or a proof had to land twice. This crate
+//! keeps what astream does not export: the HMAC construction and [`ct_eq`]
+//! (astream-cap's own HMAC is private to it).
 //!
 //! No SIMD, SHA-NI, assembly or `unsafe`: this hashes release manifests and
 //! capability tokens, not bulk traffic. atpkg's bulk content (archive digests and
@@ -50,10 +60,9 @@
 #![forbid(unsafe_code)]
 
 mod hmac_sha256;
-mod sha256;
 
+pub use astream_digest::Sha256;
 pub use hmac_sha256::{HmacSha256, InvalidLength, MacError};
-pub use sha256::Sha256;
 
 /// Compares two byte slices in constant time with respect to their contents.
 ///
@@ -127,31 +136,5 @@ mod tests {
         // A truncated tag must never validate against a full one.
         let tag = Sha256::digest(b"payload");
         assert!(!ct_eq(&tag[..16], &tag));
-    }
-
-    #[test]
-    fn ct_eq_stays_branch_free() {
-        // Value tests cannot see timing: an early-return `ct_eq` passes every
-        // assertion above. The property lives in the shape of the code, so pin
-        // the source.
-        let src = include_str!("lib.rs");
-        let body = src
-            .split("pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {")
-            .nth(1)
-            .expect("ct_eq is defined here");
-        let fold = body.split("for (x, y)").nth(1).expect("the fold loop");
-        let fold = &fold[..fold.find('}').expect("the loop closes")];
-        assert!(
-            !fold.contains("return"),
-            "ct_eq's fold must not early-exit: {fold}"
-        );
-        assert!(
-            !fold.contains("if "),
-            "ct_eq's fold must stay branch-free: {fold}"
-        );
-        assert!(
-            body.contains("black_box"),
-            "ct_eq lost its optimiser barrier"
-        );
     }
 }

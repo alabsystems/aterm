@@ -15,7 +15,8 @@
 //! it reserves the session id (and a window's id), copies the spawn
 //! factory and hands [`crate::spawn::spawn_session`] to the one `aterm-spawner`
 //! thread. The folder a pane held by another program reported is checked
-//! there too ([`crate::spawn_folder::PaneFolder`]), not in the turn. The
+//! there too ([`crate::spawn_folder::PaneFolder`]), not in the turn, and so is
+//! a request's agent identity ([`IdentityPrep`]). The
 //! session comes back in [`crate::Wake::TabSpawned`]; the main thread attaches
 //! its reader and installs the tab or pane as Cmd-T and Cmd-D always did
 //! ([`App::land_tab_spawn`]). Whoever waits is answered then
@@ -237,12 +238,24 @@ pub(crate) struct TabSpawnJob {
     cwd: Option<String>,
     pane_folders: Vec<crate::spawn_folder::PaneFolder>,
     identity: Option<String>,
-    /// Make `identity` first, if it does not exist (the picker's new-identity
-    /// row): its primer syncs every file it writes.
-    create_identity: bool,
+    /// What is done with `identity` before the fork.
+    identity_prep: IdentityPrep,
     /// The session a controller-as-tab preset observes.
     observe: Option<aterm_session::SessionId>,
     completion: Arc<TabSpawnCompletion>,
+    /// An adopted warm spare (`crate::spare`): handed over as it is when its
+    /// check passes, else dropped and the cold spawn above runs under `id`.
+    adopt: Option<Box<AdoptSpare>>,
+}
+
+/// A warm spare a Cmd-T adopts, on its way through the spawner.
+pub(crate) struct AdoptSpare {
+    /// The id it was spawned under, which it keeps.
+    pub(crate) id: u64,
+    pub(crate) session: Session,
+    pub(crate) check: crate::spare::AdoptCheck,
+    /// Where the spawner says why it was not handed over.
+    pub(crate) miss: Arc<OnceLock<&'static str>>,
 }
 
 /// Admission facts captured when a spawn is booked on the main thread.
@@ -271,12 +284,34 @@ pub(crate) struct SpawnAsk {
     pub(crate) folder_of: Option<crate::spawn_folder::PaneFolder>,
     /// The agent identity the newborn spawns under; `None` is the human's own.
     pub(crate) identity: Option<String>,
-    /// Make `identity` first if it does not exist (the picker's new-identity
-    /// row).
-    pub(crate) create_identity: bool,
+    /// What the spawner does with `identity` before the fork.
+    pub(crate) identity_prep: IdentityPrep,
     /// The session a controller-as-tab preset observes
     /// (`ATERM_OBSERVE_SESSION_ID`).
     pub(crate) observe: Option<aterm_session::SessionId>,
+    /// The newborn's own theme (`spawn theme=`), validated when asked; a
+    /// split with none inherits the divided pane's ([`App::install_spawned`]).
+    pub(crate) theme: Option<crate::session_theme::SessionTheme>,
+}
+
+/// What the spawner does with a spawn's agent identity before it forks, where
+/// the identities folder's metadata (it can sit on a slow volume) and a
+/// primer's synced writes hold no window.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum IdentityPrep {
+    /// Only the spawn's own check that it exists (a picker row naming one from
+    /// the roster).
+    #[default]
+    Exists,
+    /// Admit it as a request's spawn does
+    /// ([`crate::agent_identity::check_for_spawn`]): it exists, its folders are
+    /// private, and an `inherited` one is re-primed off this thread. Refused,
+    /// the waiter hears why in the words the request's turn refused it with,
+    /// and no failure row is posted ([`Refusal`]).
+    Admit { inherited: bool },
+    /// Make it first, if it does not exist (the picker's new-identity row): its
+    /// primer syncs every file it writes.
+    Create,
 }
 
 impl SpawnAsk {
@@ -288,6 +323,44 @@ impl SpawnAsk {
             ..Self::default()
         }
     }
+
+    /// A wire `spawn`'s ask: the folder it named and the identity it wears,
+    /// admitted on the spawner; `inherited` when the request named none and
+    /// the aimed session's is passed down.
+    pub(crate) fn requested(
+        cwd: Option<String>,
+        identity: Option<String>,
+        inherited: bool,
+    ) -> Self {
+        Self {
+            cwd,
+            identity,
+            identity_prep: IdentityPrep::Admit { inherited },
+            ..Self::default()
+        }
+    }
+}
+
+/// A spawn the spawner refused before forking, for a reason its waiter hears
+/// verbatim, with no failure row: what the request's turn refused before the
+/// check moved to the spawner ([`IdentityPrep::Admit`]).
+#[derive(Debug)]
+struct Refusal(String);
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refusal {}
+
+/// The words of the [`Refusal`] `e` carries, if the spawner refused the spawn
+/// rather than failed it.
+fn refusal(e: &std::io::Error) -> Option<String> {
+    e.get_ref()
+        .and_then(|inner| inner.downcast_ref::<Refusal>())
+        .map(|refused| refused.0.clone())
 }
 
 /// What the spawner thread hands back ([`crate::Wake::TabSpawned`]).
@@ -378,6 +451,10 @@ impl TabSpawnCompletion {
 /// A tab, split or window in flight, as the main thread remembers it.
 struct InFlight {
     id: u64,
+    /// An adopted warm spare's fallback (`crate::spare`): the id a cold spawn
+    /// lands under when the spawner finds the spare no longer valid. `None` for
+    /// every cold spawn.
+    alt_id: Option<u64>,
     /// The window it lands in: a tab's or split's own, or a new window's
     /// reserved id.
     window: WindowId,
@@ -388,14 +465,17 @@ struct InFlight {
     /// parent: a controlled window's origin, else none.
     parent: Option<aterm_session::SessionId>,
     /// The engine colors its factory copy carried: the engine-config generation
-    /// (`App::engine_color_fanouts`) and the reported scheme.
-    colors: (u64, aterm_types::Appearance),
+    /// (`App::engine_color_fanouts`), which also moves with the scheme baseline
+    /// (`TerminalConfig::color_scheme` rides in the projection).
+    colors: u64,
     /// The window's grid and cell box the session is spawned at: rows, cols and
     /// `spawn_cell_px`.
     grid: SpawnGrid,
     then: TabSpawnThen,
     admission: SpawnAdmission,
     completion: Arc<TabSpawnCompletion>,
+    /// The newborn's own theme, as asked ([`SpawnAsk::theme`]).
+    theme: Option<crate::session_theme::SessionTheme>,
 }
 
 /// A window's grid (rows, cols) and cell box in device pixels, as a spawn takes
@@ -485,25 +565,22 @@ fn send_to_spawner(job: TabSpawnJob) -> Option<TabSpawnJob> {
         let (tx, rx) = channel::<TabSpawnJob>();
         let stopping = Arc::new(AtomicBool::new(false));
         let worker_stopping = Arc::clone(&stopping);
-        std::thread::Builder::new()
-            .name("aterm-spawner".into())
-            .spawn(move || {
-                // A person who pressed Cmd-T watches for the tab: the keystroke path.
-                crate::qos::set_self(crate::qos::Role::Interactive);
-                for job in rx {
-                    if worker_stopping.load(Ordering::Acquire) {
-                        job.completion.cancel();
-                    } else {
-                        run(job);
-                    }
+        crate::qos::spawn_lane_thread("aterm-spawner", crate::qos::Role::Interactive, move || {
+            // A person who pressed Cmd-T watches for the tab: the keystroke path.
+            for job in rx {
+                if worker_stopping.load(Ordering::Acquire) {
+                    job.completion.cancel();
+                } else {
+                    run(job);
                 }
-            })
-            .ok()
-            .map(|worker| Spawner {
-                tx: Mutex::new(Some(tx)),
-                worker: Mutex::new(Some(worker)),
-                stopping,
-            })
+            }
+        })
+        .ok()
+        .map(|worker| Spawner {
+            tx: Mutex::new(Some(tx)),
+            worker: Mutex::new(Some(worker)),
+            stopping,
+        })
     });
     match spawner {
         Some(spawner) => match spawner
@@ -549,12 +626,47 @@ fn run(job: TabSpawnJob) {
         cwd,
         pane_folders,
         identity,
-        create_identity,
+        identity_prep,
         observe,
         completion,
+        adopt,
     } = job;
     if completion.cancelled() {
         return;
+    }
+    // An adopted spare (design §8 step 2): its rc generation and folder are
+    // checked here, off the main thread; valid, it is handed over at once, its
+    // reader already running. Otherwise it goes (a warm one with its whole
+    // session) and this spawn runs cold under the fallback id.
+    if let Some(adopt) = adopt {
+        let AdoptSpare {
+            id: spare_id,
+            session,
+            check,
+            miss,
+        } = *adopt;
+        match check.miss(&session) {
+            None => {
+                publish_completion(
+                    &completion,
+                    TabSpawned {
+                        id: spare_id,
+                        window,
+                        session: Ok(session),
+                        reader_gate: None,
+                    },
+                    |wake| proxy.send_event(wake).is_ok(),
+                );
+                return;
+            }
+            Some(reason) => {
+                let _ = miss.set(reason);
+                if check.kill {
+                    crate::spare::kill_session(session.pid);
+                }
+                drop(session);
+            }
+        }
     }
     hold_for_test(&completion);
     if completion.cancelled() {
@@ -566,7 +678,7 @@ fn run(job: TabSpawnJob) {
         // A held pane's folder is checked here, where a hung volume holds only
         // this thread, for at most the check's budget per pane.
         let cwd = cwd.or_else(|| crate::spawn_folder::PaneFolder::first_taken(pane_folders));
-        let session = provision(identity.as_deref(), create_identity).and_then(|()| {
+        let session = provision(identity.as_deref(), identity_prep).and_then(|()| {
             crate::spawn::spawn_session(
                 id,
                 window,
@@ -596,15 +708,25 @@ fn run(job: TabSpawnJob) {
     );
 }
 
-/// Make agent identity `identity` first when `create` says so (the picker's
-/// new-identity rows): here, where its primer's synced writes hold no window.
-/// Otherwise the spawn checks that it exists.
-fn provision(identity: Option<&str>, create: bool) -> std::io::Result<()> {
-    match identity {
-        Some(name) if create => crate::agent_identity::ensure(name, true)
+/// Ready agent identity `identity` for the spawn as `prep` says: admit it, or
+/// make it first. With [`IdentityPrep::Exists`] the spawn's own check that it
+/// exists is all.
+fn provision(identity: Option<&str>, prep: IdentityPrep) -> std::io::Result<()> {
+    let Some(name) = identity else {
+        return Ok(());
+    };
+    match prep {
+        IdentityPrep::Exists => Ok(()),
+        IdentityPrep::Admit { inherited } => {
+            crate::agent_identity::check_for_spawn(name, inherited)
+                .map(drop)
+                .map_err(|e| {
+                    std::io::Error::new(e.kind(), Refusal(format!("identity {name}: {e}")))
+                })
+        }
+        IdentityPrep::Create => crate::agent_identity::ensure(name, true)
             .map(drop)
             .map_err(|e| std::io::Error::new(e.kind(), format!("identity {name}: {e}"))),
-        _ => Ok(()),
     }
 }
 
@@ -697,33 +819,29 @@ impl App {
     /// Open a new tab in `owner` with its shell spawned off the event loop: reserve
     /// the session id, remember the tab is in flight, and hand the spawn to the
     /// spawner thread. `cwd_override` is the folder the caller named (`None`
-    /// inherits the focused pane's), `identity` the agent identity the newborn
-    /// spawns under. Nothing to host it (no such window, no event loop) answers
-    /// `then` at once.
+    /// inherits the focused pane's). Nothing to host it (no such window, no
+    /// event loop) answers `then` at once.
     pub(crate) fn open_tab_off_loop(
         &mut self,
         owner: WindowId,
         cwd_override: Option<&str>,
-        identity: Option<&str>,
         then: TabSpawnThen,
     ) {
-        let ask = SpawnAsk::new(cwd_override, identity);
+        let ask = SpawnAsk::new(cwd_override, None);
         self.open_off_loop(owner, SpawnPlace::Tab, ask, then);
     }
 
     /// Split `owner`'s focused pane in `dir` with the new pane's shell spawned off
-    /// the event loop. The caller has refused what cannot be split
-    /// ([`App::split_refusal`]); the landing asks again, since the window may
-    /// change while the shell starts.
+    /// the event loop, asked for as `ask` says. The caller has refused what
+    /// cannot be split ([`App::split_refusal`]); the landing asks again, since
+    /// the window may change while the shell starts.
     pub(crate) fn open_split_off_loop(
         &mut self,
         owner: WindowId,
         dir: crate::pane::SplitDir,
-        cwd_override: Option<&str>,
-        identity: Option<&str>,
+        ask: SpawnAsk,
         then: TabSpawnThen,
     ) {
-        let ask = SpawnAsk::new(cwd_override, identity);
         self.open_off_loop(owner, SpawnPlace::Split(dir), ask, then);
     }
 
@@ -826,20 +944,89 @@ impl App {
         then: TabSpawnThen,
         proxy: EventLoopProxy<Wake>,
     ) {
+        // THE WARM SPARE (design §7.3, §8): a plain ask whose gates all pass
+        // takes the spare, keeping its id; the cold spawn below is its fallback,
+        // under a fresh id. A miss is counted and the cold path runs unchanged.
+        // A split of a pane with its own theme inherits it (`split_theme`),
+        // decided here once: a spare's already-running reader would miss it,
+        // so such a split takes no spare, and the landing applies exactly what
+        // was decided now, whatever the focus is by then.
+        let inherited = self.inherited_theme(window, place, ask.theme.as_ref());
+        let tried = if inherited.is_some() {
+            Err("theme")
+        } else {
+            self.try_adopt_spare(window, place.asked_from(window), grid, &ask)
+        };
+        let adopted = match tried {
+            Ok(adopted) => Some(adopted),
+            Err(reason) => {
+                self.spares.note_miss(reason);
+                self.publish_spare();
+                None
+            }
+        };
         let SpawnAsk {
             admission,
             cwd,
             folder_of,
             identity,
-            create_identity,
+            identity_prep,
             observe,
+            theme,
         } = ask;
+        let theme = theme.or(inherited);
         // A queued shell is not in an overlap's manifest, even before its
         // completion wake can arrive and invalidate that capture.
         self.note_update_handoff_activity();
         let id = self.next_session_id;
         self.next_session_id += 1;
         let (rows, cols, cell_px) = grid;
+        let mut colors = self.engine_color_fanouts;
+        let (inflight_id, alt_id, adopt) = match adopted {
+            Some((slot, session)) => {
+                // The spare's engine was built with the colours of its booking:
+                // the landing catches it up as for any tab in flight.
+                colors = slot.colors;
+                let miss = Arc::new(OnceLock::new());
+                let warm = slot.state.warm();
+                let now = Instant::now();
+                self.spares.transit.push(crate::spare::Transit {
+                    id: slot.id,
+                    link: Arc::clone(&slot.link),
+                    tier: slot.state,
+                    grid: slot.grid,
+                    age: now.saturating_duration_since(slot.booked),
+                    rc_ms: slot
+                        .link
+                        .witness
+                        .start_seen
+                        .get()
+                        .and_then(|seen| {
+                            session
+                                .shell_start
+                                .as_ref()
+                                .map(|st| seen.at.saturating_duration_since(st.at))
+                        })
+                        .map(|d| d.as_millis() as u64),
+                    inputs: slot.inputs.clone(),
+                    miss: Arc::clone(&miss),
+                });
+                let adopt = AdoptSpare {
+                    id: slot.id,
+                    session,
+                    check: crate::spare::AdoptCheck {
+                        cwd: slot.cwd.clone(),
+                        generation: warm.then(|| (slot.inputs.clone(), slot.generation)),
+                        link: Arc::clone(&slot.link),
+                        kill: warm && slot.state != crate::spare::SlotState::Ready,
+                    },
+                    miss,
+                };
+                self.publish_spare();
+                (slot.id, Some(id), Some(Box::new(adopt)))
+            }
+            None => (id, None, None),
+        };
         // Inherit the focused pane's cwd so a new tab, pane or window opens
         // where the user is, unless the caller overrode it or named the pane to
         // inherit from; a held pane's is checked on the spawner. A window
@@ -860,16 +1047,18 @@ impl App {
         factory.reader_after_install = true;
         let completion = Arc::new(TabSpawnCompletion::default());
         self.tab_spawns.in_flight.push(InFlight {
-            id,
+            id: inflight_id,
+            alt_id,
             window,
             place,
             asked: Instant::now(),
             parent,
-            colors: (self.engine_color_fanouts, factory.appearance),
+            colors,
             grid,
             then,
             admission,
             completion: Arc::clone(&completion),
+            theme,
         });
         let job = TabSpawnJob {
             id,
@@ -882,9 +1071,10 @@ impl App {
             cwd,
             pane_folders,
             identity,
-            create_identity,
+            identity_prep,
             observe,
             completion,
+            adopt,
         };
         if let Some(job) = send_to_spawner(job) {
             // No spawner thread: spawn in this turn, as before, and land it as usual.
@@ -923,7 +1113,8 @@ impl App {
     /// The install half of [`Self::land_tab_spawn`]: install and register the
     /// tab, pane or window, start its reader, answer its waiter. `false` when
     /// nothing landed: the spawn failed (said through `new_tab_failed`,
-    /// `split_failed` or `new_window_failed`), its window closed, its split is
+    /// `split_failed` or `new_window_failed`) or was refused before its fork
+    /// (said only to its waiter), its window closed, its split is
     /// refused now, a new window's OS window could not be made, or the loop is
     /// exiting (the session drops, and its teardown stops the parked reader and
     /// hangs up and reaps the shell). `os` is the event loop in a run.
@@ -934,34 +1125,66 @@ impl App {
             session,
             reader_gate,
         } = done;
-        let (place, parent, colors, grid, then, admission) =
-            match self.tab_spawns.in_flight.iter().position(|t| t.id == id) {
-                Some(at) => {
-                    let t = self.tab_spawns.in_flight.remove(at);
-                    (
-                        t.place,
-                        t.parent,
-                        Some(t.colors),
-                        Some(t.grid),
-                        t.then,
-                        t.admission,
-                    )
-                }
-                None => (
-                    SpawnPlace::Tab,
-                    None,
-                    None,
-                    None,
-                    TabSpawnThen::Nothing,
-                    SpawnAdmission::Plain,
-                ),
-            };
+        // An adopted spare's fallback lands under its alternate id: the spare
+        // is retired for good, and the miss the spawner found is counted.
+        if let Some(t) = self
+            .tab_spawns
+            .in_flight
+            .iter()
+            .find(|t| t.alt_id == Some(id))
+            && let Some(at) = self.spares.transit.iter().position(|tr| tr.id == t.id)
+        {
+            let transit = self.spares.transit.remove(at);
+            self.spares
+                .note_miss(transit.miss.get().copied().unwrap_or("stale"));
+            self.spares.tombstone_public(transit.id);
+            self.publish_spare();
+        }
+        // An adopted spare lands under its own id with its reader running, at
+        // the grid it was spawned at.
+        let spare_grid = self
+            .spares
+            .transit
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| t.grid);
+        let adopted_spare = spare_grid.is_some();
+        let (place, parent, colors, grid, then, admission, theme) = match self
+            .tab_spawns
+            .in_flight
+            .iter()
+            .position(|t| t.id == id || t.alt_id == Some(id))
+        {
+            Some(at) => {
+                let t = self.tab_spawns.in_flight.remove(at);
+                (
+                    t.place,
+                    t.parent,
+                    Some(t.colors),
+                    Some(t.grid),
+                    t.then,
+                    t.admission,
+                    t.theme,
+                )
+            }
+            None => (
+                SpawnPlace::Tab,
+                None,
+                None,
+                None,
+                TabSpawnThen::Nothing,
+                SpawnAdmission::Plain,
+                None,
+            ),
+        };
         let new_window = matches!(place, SpawnPlace::Window { .. });
+        let admission_plain = matches!(admission, SpawnAdmission::Plain);
         let outcome = match session {
             // A quit (or the last window's close) overtook it: as the quit's
             // cancel would, the session drops with its reader still parked.
             _ if os.exiting() => Err(QUITTING.to_string()),
-            Err(e) => Err(place.failed(self, &e.to_string())),
+            // Refused before the fork: in the request's own words, no row.
+            Err(e) => Err(refusal(&e).unwrap_or_else(|| place.failed(self, &e.to_string()))),
             Ok(_) if !new_window && !self.windows.contains_key(&window) => {
                 Err("the window closed before the session started".to_string())
             }
@@ -981,8 +1204,14 @@ impl App {
                     break 'land Err(why);
                 }
                 // Parked on the spawner, or attached here (off unix). A real run
-                // always has a proxy (test-only None: a stub has no reader).
+                // always has a proxy (test-only None: a stub has no reader). An
+                // adopted spare's reader is already running: it gets the cold
+                // path's own session wiring instead (design §8 step 4).
                 let attached = match (&reader_gate, self.proxy.clone()) {
+                    _ if adopted_spare => {
+                        self.prepare_adopted_spare(&mut session, window);
+                        Ok(())
+                    }
                     (None, Some(proxy)) => crate::spawn::attach_reader(
                         &mut session,
                         window,
@@ -996,6 +1225,8 @@ impl App {
                         if let Some(colors) = colors {
                             self.catch_up_colors(&session, colors);
                         }
+                        // `theme` is what booking decided: asked, or for a
+                        // split the divided pane's own as it was then.
                         let sid = session.ctx.self_id.as_str().to_string();
                         let installed = match place {
                             SpawnPlace::Tab => {
@@ -1018,12 +1249,33 @@ impl App {
                                 self.install_window_session(window, session, parent, grid, os)
                             }
                         };
+                        // Its own theme on the engine before its reader runs.
+                        if installed.is_ok() && theme.is_some() {
+                            self.set_session_theme(id, theme);
+                        }
                         // Registered: the reader may tell the loop about it now.
                         // Not installed, the session has dropped with its gate shut.
+                        // An adopted spare goes live and is told `go` (`crate::spare`);
+                        // a cold tab's visible rc run is one the spare's gate learns from.
                         installed.map(|()| {
                             if let Some(gate) = reader_gate {
                                 gate.release();
                             }
+                            if adopted_spare {
+                                // Sized before its release, so its first prompt
+                                // is drawn at the grid it lands at; a tab whose
+                                // window grid is the spare's has nothing to size.
+                                if !matches!(place, SpawnPlace::Tab)
+                                    || spare_grid != Some(self.spawn_grid(window))
+                                {
+                                    self.resize_panes(window);
+                                }
+                                self.adopt_live(id, window);
+                            } else if admission_plain {
+                                let inputs = self.spare_gen_inputs();
+                                self.observe_spare_run(id, inputs);
+                            }
+                            self.spare_poke();
                             sid
                         })
                     }
@@ -1032,6 +1284,15 @@ impl App {
             }
         };
         let landed = outcome.is_ok();
+        // An adopted spare that did not land (its window closed, a split now
+        // refused, the loop exiting) dropped with the session: it is retired.
+        if adopted_spare
+            && !landed
+            && let Some(at) = self.spares.transit.iter().position(|t| t.id == id)
+        {
+            let transit = self.spares.transit.remove(at);
+            self.spares.tombstone_public(transit.id);
+        }
         then.answer(self, window, outcome);
         landed
     }
@@ -1049,16 +1310,16 @@ impl App {
     /// TOGETHER WITH its booking, [`App::reserve_window`], which minted the id:
     /// `window_routing_conformance` validates the pair as one transition.
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "window_routing",
             action = "CreateWindow",
             project = "aterm_gui::App::project_window_routing"
         )
     )]
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "window_routing",
             action = "ConnectedCreateWindow",
             project = "aterm_gui::App::project_window_routing"
@@ -1090,8 +1351,40 @@ impl App {
         Ok(())
     }
 
+    /// The theme a spawn booked at `place` in `window` inherits when it asks
+    /// for none (`asked`): a split's [`Self::split_theme`], judged at
+    /// booking; a tab or a window inherits none.
+    pub(crate) fn inherited_theme(
+        &self,
+        window: WindowId,
+        place: SpawnPlace,
+        asked: Option<&crate::session_theme::SessionTheme>,
+    ) -> Option<crate::session_theme::SessionTheme> {
+        match place {
+            SpawnPlace::Split(_) if asked.is_none() => self.split_theme(window),
+            SpawnPlace::Split(_) | SpawnPlace::Tab | SpawnPlace::Window { .. } => None,
+        }
+    }
+
+    /// The theme a split of `window`'s focused pane inherits: that pane's own
+    /// theme, as [`crate::session_theme::SessionThemeOrigin::Split`]; `None`
+    /// when it has none (an identity theme is not carried: it resolves from
+    /// the newborn's own identity).
+    pub(crate) fn split_theme(
+        &self,
+        window: WindowId,
+    ) -> Option<crate::session_theme::SessionTheme> {
+        let focused = self.focused_session_id(window)?;
+        // A Choose Tab Theme… highlight is tentative: the prior is inherited.
+        self.kept_session_theme(focused)
+            .map(|theme| crate::session_theme::SessionTheme {
+                selector: theme.selector.clone(),
+                origin: crate::session_theme::SessionThemeOrigin::Split,
+            })
+    }
+
     /// `window`'s grid and cell box as a spawn takes them now.
-    fn spawn_grid(&self, window: WindowId) -> SpawnGrid {
+    pub(crate) fn spawn_grid(&self, window: WindowId) -> SpawnGrid {
         let (rows, cols) = self
             .windows
             .get(&window)
@@ -1102,19 +1395,18 @@ impl App {
     /// Bring a newborn engine up to the colors installed while its tab was in
     /// flight: `App::install_colors` reaches only the sessions in the pool, and
     /// the engine was built from the factory as it was when the tab was asked
-    /// for (`asked`). A new session has no DEC 2031 subscriber yet, so no report
-    /// is owed.
-    fn catch_up_colors(&self, session: &Session, asked: (u64, aterm_types::Appearance)) {
-        let (fanouts, appearance) = asked;
-        let engine_moved = fanouts != self.engine_color_fanouts;
-        if !engine_moved && appearance == self.session_factory.appearance {
+    /// for (`asked`, the engine-config generation). The projection carries the
+    /// scheme baseline, so one `apply_config` catches up both. A new session
+    /// has no DEC 2031 subscriber yet, so no report is owed.
+    fn catch_up_colors(&self, session: &Session, asked: u64) {
+        if asked == self.engine_color_fanouts {
             return;
         }
-        let mut term = crate::term_lock(&session.term);
-        if engine_moved && let Some(tc) = &self.session_factory.terminal_config {
+        if let Some(tc) = &self.session_factory.terminal_config {
+            let mut term = crate::term_lock(&session.term);
             term.apply_config(tc);
+            session.ctx.crash_journal.host_settings(&term, Some(tc));
         }
-        term.set_color_scheme(self.session_factory.appearance);
     }
 
     /// Hold `event`, typed into `wid`, for the spawn in flight that takes `wid`'s
@@ -1231,10 +1523,11 @@ pub(crate) mod test_support {
         let id = app.next_session_id;
         app.next_session_id += 1;
         let parent = app.new_tab_parent(wid);
-        let colors = (app.engine_color_fanouts, app.session_factory.appearance);
+        let colors = app.engine_color_fanouts;
         let grid = app.spawn_grid(wid);
         app.tab_spawns.in_flight.push(InFlight {
             id,
+            alt_id: None,
             window: wid,
             place: SpawnPlace::Tab,
             asked: Instant::now(),
@@ -1244,6 +1537,7 @@ pub(crate) mod test_support {
             then,
             admission: SpawnAdmission::Plain,
             completion: Arc::new(TabSpawnCompletion::default()),
+            theme: None,
         });
         id
     }
@@ -1260,9 +1554,10 @@ pub(crate) mod test_support {
         let (window, place, grid) = app.reserve_window();
         let id = app.next_session_id;
         app.next_session_id += 1;
-        let colors = (app.engine_color_fanouts, app.session_factory.appearance);
+        let colors = app.engine_color_fanouts;
         app.tab_spawns.in_flight.push(InFlight {
             id,
+            alt_id: None,
             window,
             place,
             asked: Instant::now(),
@@ -1272,6 +1567,7 @@ pub(crate) mod test_support {
             then,
             admission,
             completion: Arc::new(TabSpawnCompletion::default()),
+            theme: None,
         });
         (id, window)
     }
@@ -1462,8 +1758,10 @@ pub(crate) mod tests {
         then: TabSpawnThen,
     ) -> u64 {
         let id = book(app, wid, then);
+        let theme = app.inherited_theme(wid, SpawnPlace::Split(dir), None);
         if let Some(t) = app.tab_spawns.in_flight.last_mut() {
             t.place = SpawnPlace::Split(dir);
+            t.theme = theme;
         }
         id
     }
@@ -1828,6 +2126,60 @@ pub(crate) mod tests {
         );
     }
 
+    /// A REQUEST'S IDENTITY IS ADMITTED ON THE SPAWNER, before the fork, and
+    /// a refusal there is still the request's own answer: the waiter hears
+    /// `identity <name>: <why>`, the words the request's turn refused it with,
+    /// and no "Couldn't open a new tab" row goes up, since nobody gestured.
+    /// NEGATIVE CONTROL: a failure that is not a refusal still posts its row
+    /// (the test above).
+    #[test]
+    fn an_identity_the_spawner_refuses_answers_its_waiter_without_a_failure_row() {
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("aterm-spawn-admit")
+            .tempdir()
+            .expect("scratch dir");
+        crate::test_env::scoped("ATERM_STATE_HOME", scratch.path().join("state"), || {
+            let refused = provision(Some("ghost"), IdentityPrep::Admit { inherited: true })
+                .expect_err("nobody made `ghost`");
+            assert_eq!(
+                refusal(&refused).as_deref(),
+                Some("identity ghost: no such identity ghost")
+            );
+
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            let (old, _old_pty) = piped_session(app.next_session_id);
+            app.push_stub_tab(wid, old);
+            let tabs = app.windows[&wid].tab_set.len();
+            let (tx, rx) = channel();
+            let id = book(
+                &mut app,
+                wid,
+                TabSpawnThen::Reply {
+                    reply: tx,
+                    raise: false,
+                },
+            );
+            assert!(!app.install_spawned_tab(TabSpawned {
+                id,
+                window: wid,
+                session: Err(refused),
+                reader_gate: None
+            }));
+            assert_eq!(
+                rx.try_recv(),
+                Ok(Err("identity ghost: no such identity ghost".to_string()))
+            );
+            assert_eq!(app.windows[&wid].tab_set.len(), tabs, "no tab");
+            assert!(
+                !app.messages
+                    .live_rows()
+                    .any(|l| l.msg.title == "Couldn't open a new tab"),
+                "a request's refusal is its reply, not a row"
+            );
+        });
+    }
+
     /// A window that closed while its tab was in flight lands nothing: the session
     /// is dropped, which hangs up and reaps its shell, and the waiter hears why.
     #[test]
@@ -1839,11 +2191,12 @@ pub(crate) mod tests {
         app.next_session_id += 1;
         app.tab_spawns.in_flight.push(InFlight {
             id,
+            alt_id: None,
             window: gone,
             place: SpawnPlace::Tab,
             asked: Instant::now(),
             parent: None,
-            colors: (app.engine_color_fanouts, app.session_factory.appearance),
+            colors: app.engine_color_fanouts,
             grid: app.spawn_grid(gone),
             then: TabSpawnThen::Reply {
                 reply: tx,
@@ -1851,6 +2204,7 @@ pub(crate) mod tests {
             },
             admission: SpawnAdmission::Plain,
             completion: Arc::new(TabSpawnCompletion::default()),
+            theme: None,
         });
         let (session, _pty) = piped_session(id);
         let sid = session.ctx.self_id.clone();
@@ -1972,26 +2326,31 @@ pub(crate) mod tests {
     #[test]
     fn a_tab_lands_with_the_scheme_installed_while_it_was_in_flight() {
         use aterm_types::Appearance;
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        let asked = app.session_factory.appearance;
-        let later = if asked == Appearance::Dark {
-            Appearance::Light
-        } else {
-            Appearance::Dark
+        // `bump`: whether the install moved the engine-config generation, as
+        // `App::install_colors` does with every projection change.
+        let land = |bump: bool| {
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            let id = book(&mut app, wid, TabSpawnThen::Nothing);
+            let (session, _pty) = piped_session(id);
+            crate::term_lock(&session.term).set_color_scheme(Appearance::Dark);
+            let tc = app.session_factory.terminal_config.get_or_insert_default();
+            tc.color_scheme = Some(Appearance::Light);
+            if bump {
+                app.engine_color_fanouts += 1;
+            }
+            let term = Arc::clone(&session.term);
+            assert!(app.install_spawned_tab(TabSpawned {
+                id,
+                window: wid,
+                session: Ok(session),
+                reader_gate: None
+            }));
+            crate::term_lock(&term).color_scheme()
         };
-        let id = book(&mut app, wid, TabSpawnThen::Nothing);
-        let (session, _pty) = piped_session(id);
-        crate::term_lock(&session.term).set_color_scheme(asked);
-        app.session_factory.appearance = later;
-        let term = Arc::clone(&session.term);
-        assert!(app.install_spawned_tab(TabSpawned {
-            id,
-            window: wid,
-            session: Ok(session),
-            reader_gate: None
-        }));
-        assert_eq!(crate::term_lock(&term).color_scheme(), later);
+        assert_eq!(land(true), Appearance::Light);
+        // NEG: an unchanged generation runs no `apply_config`.
+        assert_eq!(land(false), Appearance::Dark);
     }
 
     /// A window that re-gridded while its tab was in flight (a resize, a font zoom)
@@ -2123,6 +2482,109 @@ pub(crate) mod tests {
         );
         drop(t);
         assert!(app.structural_invariants_ok());
+    }
+
+    /// Spec `session-theme-carry`: a split from a pane with its own theme
+    /// lands with that theme (origin `split`) on its engine before its reader
+    /// runs; a new tab from the same window lands with none. A theme asked
+    /// for at spawn beats the inherited one.
+    #[test]
+    fn split_inherits_tab_does_not() {
+        use crate::session_theme::{SessionTheme, SessionThemeOrigin};
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let hearth = aterm_types::scheme::builtin("Hearth").expect("built-in");
+        app.set_session_theme(
+            0,
+            Some(SessionTheme {
+                selector: "Hearth".to_string(),
+                origin: SessionThemeOrigin::Ctl,
+            }),
+        );
+        let land = |app: &mut App, id: u64| {
+            let (session, _pty) = piped_session(id);
+            assert!(app.install_spawned_tab(TabSpawned {
+                id,
+                window: wid,
+                session: Ok(session),
+                reader_gate: None
+            }));
+        };
+        let split = book_split(
+            &mut app,
+            wid,
+            crate::pane::SplitDir::Vertical,
+            TabSpawnThen::Nothing,
+        );
+        land(&mut app, split);
+        assert_eq!(
+            app.pool.theme(split),
+            Some(&SessionTheme {
+                selector: "Hearth".to_string(),
+                origin: SessionThemeOrigin::Split,
+            })
+        );
+        assert_eq!(
+            crate::term_lock(&app.pool.get(split).expect("landed").term).default_background(),
+            hearth.background
+        );
+        // An asked theme wins over the pane's.
+        let asked = book_split(
+            &mut app,
+            wid,
+            crate::pane::SplitDir::Horizontal,
+            TabSpawnThen::Nothing,
+        );
+        app.tab_spawns.in_flight.last_mut().expect("booked").theme = Some(SessionTheme {
+            selector: "Linen".to_string(),
+            origin: SessionThemeOrigin::Spawn,
+        });
+        land(&mut app, asked);
+        assert_eq!(
+            app.pool
+                .theme(asked)
+                .map(|t| (t.selector.as_str(), t.origin)),
+            Some(("Linen", SessionThemeOrigin::Spawn))
+        );
+        let tab = book(&mut app, wid, TabSpawnThen::Nothing);
+        land(&mut app, tab);
+        assert_eq!(app.pool.theme(tab), None, "a new tab takes none");
+    }
+
+    /// Spec `session-theme-carry`: a split's inherited theme is decided when
+    /// it is booked. A split booked from an unthemed pane (which may have
+    /// taken a warm spare whose rc ran under the instance colours) lands with
+    /// no theme even when the focused pane has one by then.
+    #[test]
+    fn a_split_inherits_what_the_pane_had_when_it_was_booked() {
+        use crate::session_theme::{SessionTheme, SessionThemeOrigin};
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let split = book_split(
+            &mut app,
+            wid,
+            crate::pane::SplitDir::Vertical,
+            TabSpawnThen::Nothing,
+        );
+        app.set_session_theme(
+            0,
+            Some(SessionTheme {
+                selector: "Hearth".to_string(),
+                origin: SessionThemeOrigin::Ctl,
+            }),
+        );
+        let (session, _pty) = piped_session(split);
+        assert!(app.install_spawned_tab(TabSpawned {
+            id: split,
+            window: wid,
+            session: Ok(session),
+            reader_gate: None
+        }));
+        assert_eq!(
+            app.pool.theme(split),
+            None,
+            "booked unthemed, lands unthemed"
+        );
     }
 
     /// The window can change while a split's shell starts: a split its focused
@@ -2266,16 +2728,17 @@ pub(crate) mod tests {
         let state = aterm_tempfile::tempdir().expect("scratch state root");
         crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
             let root = state.path().join("identities");
-            assert!(provision(Some("gamma"), true).is_ok());
+            assert!(provision(Some("gamma"), IdentityPrep::Create).is_ok());
             assert!(
                 root.join("gamma").is_dir(),
                 "made under the identities root"
             );
             assert_eq!(crate::agent_identity::roster(), ["gamma"]);
-            assert!(provision(Some("delta"), false).is_ok());
+            assert!(provision(Some("delta"), IdentityPrep::Exists).is_ok());
             assert!(!root.join("delta").exists(), "only a create row makes one");
-            assert!(provision(None, true).is_ok());
-            let refused = provision(Some("Bad Name"), true).expect_err("the grammar refuses it");
+            assert!(provision(None, IdentityPrep::Create).is_ok());
+            let refused = provision(Some("Bad Name"), IdentityPrep::Create)
+                .expect_err("the grammar refuses it");
             assert!(
                 refused.to_string().starts_with("identity Bad Name: "),
                 "{refused}"

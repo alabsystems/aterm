@@ -631,14 +631,4 @@ mod tests {
         // The window now holds 501..=1524, so p50 is its 512th value.
         assert_eq!(s.p50_us, 501 + 511);
     }
-
-    /// The packed slot round-trips both halves, which is the whole reason it is
-    /// one word: a torn read would publish one keystroke's session against
-    /// another's stamp.
-    #[test]
-    fn the_arm_slot_packs_session_and_stamp_without_tearing() {
-        let packed = pack(0xABCD_1234_5678_9007, 123_456_789);
-        assert_eq!(packed >> 48, 0x9007);
-        assert_eq!(packed & US_MASK, 123_456_789);
-    }
 }

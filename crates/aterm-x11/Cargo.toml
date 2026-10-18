@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-x11"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "First-party X11 for aterm: the wire codec held to x11rb-protocol's bytes, a libxcb transport opened at run time, ICCCM properties and the resource database"
+
+# docs/AUDIT-third-party-2026-10-15.md, linux-windowing LW.6. No x11rb or
+# x11rb-protocol here, not even as dev-dependencies: their recorded bytes
+# under tests/recorded/ are the oracle (tests/recorder, its own workspace,
+# wrote them), so this crate's tests outlive the registry crates leaving the
+# lock at LW.7.
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# libxcb and libX11-xcb, opened at run time.
+aterm-dl = { workspace = true }
+# free(3) for the packets libxcb hands back.
+libc = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# tests/xlib_layout.rs: the C probe's scratch directory and its compiler.
+aterm-tempfile = { workspace = true }
+aterm-uds = { workspace = true }
+
+[lints]
+workspace = true

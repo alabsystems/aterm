@@ -33,6 +33,11 @@
 //!   window blocks `SIGUSR1` (aterm-gui's snapshot thread).
 //! * Process group and session: [`Command::process_group`] and [`Command::setsid`], spawn
 //!   attributes on Darwin; with both, the session wins and the child leads its own group.
+//! * Responsibility, which std has no word for: [`Command::disclaim_responsibility`] starts the
+//!   child as its own responsible process (Darwin's private spawn attribute), so macOS asks its
+//!   TCC and syspolicyd questions about the child's code identity instead of this process's
+//!   responsible app. Fail-closed: off Darwin, where the SPI is missing, and beside `exec` it is
+//!   `Unsupported` and nothing is started.
 //! * No `pre_exec`: code between a fork and an exec is what this type exists to avoid. A
 //!   spawn that needs it (a PTY child's `setrlimit` and controlling terminal, a descriptor
 //!   handed over above stdio) builds a `std::process::Command` with
@@ -47,9 +52,9 @@
 //! Off Darwin the same type starts its child through std, forked, with
 //! [`super::InheritStrip`] in the child and the mask emptied there too.
 
-use super::{F_GETFL, F_SETFL, fcntl};
+use super::{DISCLAIM_SPI, F_GETFL, F_SETFL, fcntl};
 use std::collections::BTreeMap;
-use std::ffi::{OsStr, OsString};
+use std::ffi::{CStr, OsStr, OsString};
 use std::fmt;
 use std::io::{self, Read as _};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -212,6 +217,10 @@ pub struct Command {
     stderr: Option<Stdio>,
     pgroup: Option<i32>,
     setsid: bool,
+    /// The SPI that makes the child its own responsible process, when asked
+    /// ([`Self::disclaim_responsibility`]): always [`DISCLAIM_SPI`] but in a
+    /// test that names one no image exports.
+    disclaim: Option<&'static CStr>,
 }
 
 /// The stdio a spawn gives a slot the caller left unset.
@@ -237,6 +246,7 @@ impl Command {
             stderr: None,
             pgroup: None,
             setsid: false,
+            disclaim: None,
         }
     }
 
@@ -338,6 +348,39 @@ impl Command {
     /// so [`Self::process_group`]`(0)` beside it changes nothing.
     pub fn setsid(&mut self, setsid: bool) -> &mut Self {
         self.setsid = setsid;
+        self
+    }
+
+    /// Start the child as its OWN RESPONSIBLE PROCESS (`true`), not charged to
+    /// the one this process is charged to. macOS attributes a process's TCC
+    /// and syspolicyd questions — a privacy grant, the Developer Tools verdict
+    /// — to its responsible process, which a child inherits from a parent that
+    /// has one (a shell's child under an app is asked about as that app).
+    /// Disclaimed, the child is asked about as its own code identity, and
+    /// evaluated afresh (aterm starts its own executable this way once the
+    /// owner adds aterm to Privacy & Security ▸ Developer Tools: a process
+    /// checked before the grant keeps a stale "not a developer tool" verdict,
+    /// a fresh responsible process with aterm's identity clears it — measured
+    /// in a VM 2026-10-16). A plain child of a disclaimed one is charged to it.
+    ///
+    /// Darwin's private SPI `responsibility_spawnattrs_setdisclaim`, looked up
+    /// at each spawn and set on the spawn's attributes. FAIL-CLOSED: a child
+    /// asked to disclaim is never started without it. The spawn answers
+    /// `Unsupported`, starting nothing, off Darwin, on a macOS whose libSystem
+    /// exports no such SPI, and beside [`Self::exec`] (`POSIX_SPAWN_SETEXEC`
+    /// with a disclaim is unmeasured); a refusal by the SPI itself is the
+    /// spawn's error, likewise before anything starts. `false` (the default)
+    /// asks for nothing.
+    pub fn disclaim_responsibility(&mut self, disclaim: bool) -> &mut Self {
+        self.disclaim = disclaim.then_some(DISCLAIM_SPI);
+        self
+    }
+
+    /// TEST SEAM: disclaim through the SPI named `spi` instead of
+    /// [`DISCLAIM_SPI`] — one no image exports, to drive the fail-closed path.
+    #[cfg(test)]
+    pub(super) fn disclaim_through(&mut self, spi: &'static CStr) -> &mut Self {
+        self.disclaim = Some(spi);
         self
     }
 
@@ -673,7 +716,8 @@ type Handle = super::LaneChild;
 impl Command {
     /// Replace this process with the program (`POSIX_SPAWN_SETEXEC`): it holds this process's
     /// stdio and nothing else, and this process's own table is untouched if the exec fails.
-    /// Unset stdio is inherited. Returns only on failure.
+    /// Unset stdio is inherited. Returns only on failure — at once, `Unsupported` and this
+    /// process untouched, beside [`Self::disclaim_responsibility`].
     pub fn exec(&mut self) -> io::Error {
         match self.launch(Fallback::Inherit, true, true) {
             Ok(_) => io::Error::other("the exec returned a child"),
@@ -706,6 +750,15 @@ impl Command {
             placeable_copy,
         };
         use std::os::unix::ffi::OsStrExt as _;
+        // An exec that disclaims would make THIS process, replaced, its own responsible
+        // process: `POSIX_SPAWN_SETEXEC` with the disclaim attribute was never measured, so it
+        // is refused before anything is built, never tried.
+        if replace && self.disclaim.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "an exec cannot disclaim responsibility: spawn the disclaimed child instead",
+            ));
+        }
         let mut image = Image::build(&self.program, &self.args, &self.env.capture())?;
         if let Some(arg0) = &self.arg0 {
             image.argv[0] = c_string(arg0.as_bytes())?;
@@ -805,6 +858,7 @@ impl Command {
                 replace,
                 long_entry_ends: !self.env.saw_path(),
                 inherit_all: false,
+                disclaim: self.disclaim,
             },
         )?;
         drop(handed);
@@ -899,7 +953,8 @@ impl Command {
     /// ([`super::InheritNothing`] says what that means). The hooks run in this process, so a
     /// failed exec also leaves its signal mask empty and, with [`Self::setsid`], this process
     /// leading a new session (Darwin's `exec` changes nothing when it fails). Returns only on
-    /// failure.
+    /// failure — at once, `Unsupported` and nothing run, beside
+    /// [`Self::disclaim_responsibility`].
     pub fn exec(&mut self) -> io::Error {
         use std::os::unix::process::CommandExt as _;
         match self.forked() {
@@ -935,14 +990,24 @@ impl Command {
     }
 
     /// The `std` command this one is: [`super::InheritNothing`]'s strip
-    /// first, then the empty mask and the session in one more hook.
-    #[expect(
-        clippy::disallowed_types,
-        reason = "spawnfd's own Command, started through std's fork with the strip installed first"
-    )]
-    fn forked(&self) -> io::Result<std::process::Command> {
+    /// first, then the empty mask and the session in one more hook. A
+    /// disclaim is refused first of all — Darwin's responsibility SPI has no
+    /// counterpart here, and a child asked to disclaim is never started
+    /// without it — so `spawn`, `output`, `status` and `exec` all answer
+    /// `Unsupported` with nothing started and this process untouched.
+    fn forked(&self) -> io::Result<super::StdCommand> {
         use super::InheritNothing as _;
         use std::os::unix::process::CommandExt as _;
+        if self.disclaim.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "disclaiming responsibility is Darwin's: no child is started without it",
+            ));
+        }
+        #[expect(
+            clippy::disallowed_types,
+            reason = "spawnfd's own Command, started through std's fork with the strip installed first"
+        )]
         let mut command = std::process::Command::new(&self.program);
         command.inherit_nothing().args(&self.args);
         if let Some(arg0) = &self.arg0 {

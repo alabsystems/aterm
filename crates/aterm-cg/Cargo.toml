@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-cg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aterm's CoreGraphics display declarations (active displays, bounds, modes) for the windowing backend, held to the SDK headers."
+
+# ZERO third-party dependencies, like aterm-objc, which it builds on. Its own
+# crate rather than a feature of aterm-objc: CoreGraphics is a GUI framework
+# whose link is not dead-stripped, so only the binaries that link the windowing
+# backend (crates/aterm-window, the one dependent) may load it. A feature was
+# unified into every binary of a build that also compiled winit, and forked
+# aterm-objc between `-p` and `--workspace` selections.
+autotests = false
+
+[lints]
+workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+aterm-objc = { workspace = true }
+
+[dev-dependencies]
+# The SDK probe's scratch directories (`tests/cg_sdk.rs`, through aterm-objc's
+# shared `sdk_consts`), removed on drop.
+aterm-tempfile = { workspace = true }
+
+# Every CoreGraphics declaration held to the SDK headers by clang, both arches,
+# with aterm-objc's shared declaration probe.
+[[test]]
+name = "cg_sdk"
+path = "tests/cg_sdk.rs"

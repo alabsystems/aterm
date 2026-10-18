@@ -27,15 +27,42 @@ pub fn available_bytes(start: &Path) -> Option<u64> {
     }
 }
 
+/// One volume's free space, size and free inodes, as the system reports them
+/// ([`volume_stats`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VolumeStats {
+    /// Bytes free to an unprivileged user.
+    pub free: u64,
+    /// The volume's size in bytes.
+    pub total: u64,
+    /// Inodes free, where the system counts them.
+    pub files_free: Option<u64>,
+}
+
+/// [`VolumeStats`] of the volume that will hold `start`, walking up to its nearest
+/// existing ancestor as [`available_bytes`] does. `None` on any query failure.
+#[must_use]
+pub fn volume_stats(start: &Path) -> Option<VolumeStats> {
+    let mut p = start;
+    loop {
+        if p.exists() {
+            return crate::platform::volume_stats(p);
+        }
+        p = p.parent()?;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn available_bytes_of_existing_dir_is_positive() {
+    fn volume_stats_reads_a_size_at_least_the_free_figure() {
         let d = std::env::temp_dir();
-        let avail = available_bytes(&d).expect("statvfs of a real dir should succeed");
-        assert!(avail > 0, "a mounted volume reports some free space");
+        let st = volume_stats(&d.join("atpkg-volume-stats/not/here")).expect("statvfs");
+        assert!(st.total > 0 && st.free <= st.total, "{st:?}");
+        #[cfg(unix)]
+        assert!(st.files_free.is_some(), "{st:?}");
     }
 
     #[test]

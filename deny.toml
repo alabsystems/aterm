@@ -94,8 +94,8 @@ ignore = []
 allow = [
     "Apache-2.0",   # workspace license + many deps
     "MIT",          # the dominant permissive license in the tree
-    "BSD-2-Clause", # arrayref
-    "BSD-3-Clause", # tiny-skia, tiny-skia-path
+    "BSD-2-Clause", # zerocopy (also MIT OR Apache-2.0); arrayref left at LW.5
+    "BSD-3-Clause", # subtle; tiny-skia and tiny-skia-path left at LW.5
     "CC0-1.0",      # hexf-parse
     "ISC",          # libloading
     "Unicode-3.0",  # unicode-ident: "(MIT OR Apache-2.0) AND Unicode-3.0"

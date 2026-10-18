@@ -11,7 +11,9 @@
 mod encode_legacy;
 
 use super::{Key, KeyEventType, KeyboardMode, Modifiers, NamedKey};
-use encode_legacy::{ctrl_character, encode_character_legacy, encode_named_legacy};
+use encode_legacy::{
+    chord_ctrl_byte, ctrl_character, encode_character_legacy, encode_named_legacy,
+};
 
 /// Encode a key press into terminal bytes, legacy or Kitty protocol as `mode` says.
 #[must_use]
@@ -62,18 +64,29 @@ pub fn encode_key_with_layout(
 }
 
 /// [`encode_key_with_layout`] plus `layout_text`: the character the user's active layout
-/// typed for this press, when the host knows it.
+/// types on this key at the press's Shift and lock level, Ctrl and Alt aside (xkb's keysym,
+/// AppKit's `-charactersIgnoringModifiers`), when the host knows it.
 ///
 /// `key` is the layout's unshifted key (winit's `key_without_modifiers`). Without layout text
 /// the engine derives Shift and Caps Lock from the US table ([`typed_character`]), which is
-/// wrong elsewhere (German Shift+2 types `"`, Russian Shift+ф types `Ф`). Given, a TEXT press
-/// writes it: as UTF-8 in the legacy and text-preserving kitty modes, as the shifted key under
-/// `REPORT_ALTERNATE_KEYS` while Shift is held, and as `REPORT_ASSOCIATED_TEXT`'s text. The
-/// kitty key code stays `key`'s.
+/// wrong elsewhere (German Shift+2 types `"`, Russian Shift+ф types `Ф`). Given:
 ///
-/// Honoured only for a `Key::Character` press with no Ctrl, Alt, Meta, Hyper or Super: a chord
-/// keeps its base-key encoding (Ctrl+c is 0x03 on every layout), and a control character is
-/// never text.
+/// - a TEXT press (no Ctrl, Alt, Meta, Hyper or Super) writes it, as UTF-8 in the legacy and
+///   text-preserving kitty modes and as `REPORT_ASSOCIATED_TEXT`'s text;
+/// - an Alt (or ESC-prefixed Meta) chord writes ESC + it: German Alt+Shift+2 is ESC `"`, as
+///   xterm prefixes its `XLookupString` text and kitty the layout's shifted key;
+/// - a Ctrl chord writes its control byte when the key's own character has none, and the
+///   control byte of the key's US QWERTY character (`base_layout_key`) when neither has one
+///   on a non-ASCII key: Russian Ctrl+Х (the `[` key) is ESC, AZERTY Ctrl+é (the 2 key) NUL,
+///   as kitty and ghostty send them;
+/// - a chord with neither form (no control byte for the key, it or the US character, or Alt
+///   under `ALT_NO_ESC`) writes it, the character the layout types at that level: German
+///   Ctrl+Shift+ö (the `;` key) writes `Ö`;
+/// - kitty's shifted key under `REPORT_ALTERNATE_KEYS` is it while Shift is held, chord or not
+///   ("the shifted version, in the currently active keyboard layout").
+///
+/// The kitty key code stays `key`'s. A control character is never layout text, and a named key
+/// takes none.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn encode_key_with_text(
@@ -84,7 +97,7 @@ pub fn encode_key_with_text(
     base_layout_key: Option<char>,
     layout_text: Option<char>,
 ) -> Vec<u8> {
-    let layout_text = text_press_glyph(key, modifiers, layout_text);
+    let layout_text = layout_glyph(key, layout_text);
     // Kitty folds keypad keys onto their main-block twins ([`Key::main_block_twin`]) unless
     // the app asked to tell them apart: disambiguate, report-all, or DECKPAM (the legacy
     // spelling of that request). With no kitty flag the legacy encoder owns keypad keys.
@@ -103,15 +116,29 @@ pub fn encode_key_with_text(
         None
     };
     let kitty_key = folded.as_ref().unwrap_or(key);
+    // Ctrl on a non-Latin layout: a layout character with no control byte (Russian 'с', 'х')
+    // is named by the physical key's US character (`base_layout_key`: 'c', '['). The win32
+    // record and the legacy encoders read that key; kitty reports the layout's key with the
+    // US key in its base-layout field. The layout's character names the pressed key, never
+    // its twin, so the twin goes out without it (modifyOtherKeys reports Russian Ctrl+Shift+х
+    // as Ctrl+Shift+[, the key whose byte it sends, not as 'Х').
+    let ctrl_twin = ctrl_layout_twin(key, modifiers, base_layout_key, layout_text);
+    let legacy_key = ctrl_twin.as_ref().unwrap_or(key);
+    let legacy_text = if ctrl_twin.is_some() {
+        None
+    } else {
+        layout_text
+    };
 
-    // ConPTY win32-input-mode (DEC 9001): a key conhost cannot read from legacy VT goes out
-    // as its INPUT_RECORD pair ([`win32_key_record`]), ahead of the kitty gate and xterm
-    // modifyOtherKeys, because conhost is the only reader: an application's kitty push and
-    // modifyOtherKeys reach this terminal, but conhost drops the `CSI 13;2 u`, `CSI 27;2;13 ~`
-    // and `CSI 27 u` written back. A routed key's release encodes to nothing: the pair carries
-    // its key-up. 9001 is never set on Unix.
+    // ConPTY win32-input-mode (DEC 9001): a key conhost cannot read from legacy VT, or reads
+    // as another key, goes out as its INPUT_RECORD pair ([`win32_key_record`]), ahead of the
+    // kitty gate and xterm modifyOtherKeys, because conhost is the only reader: an
+    // application's kitty push and modifyOtherKeys reach this terminal, but conhost drops the
+    // `CSI 13;2 u`, `CSI 27;2;13 ~` and `CSI 27 u` written back. A routed key's release
+    // encodes to nothing: the pair carries its key-up. 9001 is never set on Unix.
     if mode.contains(KeyboardMode::WIN32_INPUT)
-        && let Some(record) = win32_key_record(key, modifiers, mode, base_layout_key)
+        && let Some(record) =
+            win32_key_record(legacy_key, modifiers, mode, base_layout_key, legacy_text)
     {
         return if event_type == KeyEventType::Release {
             Vec::new()
@@ -135,62 +162,88 @@ pub fn encode_key_with_text(
         return Vec::new();
     }
 
-    // Ctrl on a non-Latin layout: the layout's letter (Russian 'с') has no control byte, so
-    // the physical key's US letter (`base_layout_key`, 'c') names it, as macOS terminals do.
-    // Kitty, above, reports the layout's key with the US key in its base-layout field.
-    let ctrl_twin = ctrl_layout_twin(key, modifiers, base_layout_key);
-    let key = ctrl_twin.as_ref().unwrap_or(key);
-
     // The kitty protocol supersedes xterm modifyOtherKeys (an app may set both): a key the
     // kitty gate left as text (Shift+a -> 'A') is not re-escaped in the xterm dialect.
     if !mode.intersects(KeyboardMode::KITTY_PROTOCOL_FLAGS)
-        && let Some(bytes) = encode_xterm_other_keys(key, modifiers, mode, layout_text)
+        && let Some(bytes) = encode_xterm_other_keys(legacy_key, modifiers, mode, legacy_text)
     {
         return bytes;
     }
 
-    encode_legacy(key, modifiers, mode, layout_text)
+    encode_legacy(legacy_key, modifiers, mode, legacy_text)
 }
 
 /// The chord modifiers that make a press something other than TEXT: with any
-/// of them held the key encodes from its base (a control byte, an ESC
-/// prefix, a CSI form), never from the layout's composed character.
+/// of them held the key writes its chord form (a control byte, an ESC prefix,
+/// a CSI form) where one exists, and otherwise the character the layout types
+/// at that level ([`encode_key_with_text`]).
 const NON_TEXT_MODIFIERS: Modifiers = Modifiers::CTRL
     .union(Modifiers::ALT)
     .union(Modifiers::META)
     .union(Modifiers::HYPER)
     .union(Modifiers::SUPER);
 
-/// `layout_text` when it may stand for this press's text: a character key,
-/// no [`NON_TEXT_MODIFIERS`], and a printable glyph. See
-/// [`encode_key_with_text`].
+/// `layout_text` when it may stand for the layout's character on this key: a character key
+/// and a printable glyph. See [`encode_key_with_text`].
 #[cfg_attr(trust_verify, trust::skip)]
-fn text_press_glyph(key: &Key, modifiers: Modifiers, layout_text: Option<char>) -> Option<char> {
-    if !matches!(key, Key::Character(_)) || modifiers.intersects(NON_TEXT_MODIFIERS) {
+fn layout_glyph(key: &Key, layout_text: Option<char>) -> Option<char> {
+    if !matches!(key, Key::Character(_)) {
         return None;
     }
     layout_text.filter(|glyph| !glyph.is_control())
 }
 
-/// The US letter a Ctrl chord on a non-Latin layout stands for: `Some('c')` for Ctrl + Russian
-/// 'с' (physical C), the C0 byte Terminal.app and iTerm2 send. Only for a letter the control
-/// table does not know, on a key whose US twin is a letter: a Latin layout keeps its bytes,
-/// and a letter on a US digit or symbol key (AZERTY 'é' on 2) stays as it is.
+/// The US key a Ctrl chord on a non-Latin layout stands for: `Some('c')` for Ctrl + Russian
+/// 'с' (physical C) and `Some('[')` for Ctrl + Russian 'х' or German 'ü' (physical [), the C0
+/// byte kitty (its `alternate_key` for a non-ASCII key) and ghostty (its physical key) send;
+/// Terminal.app and iTerm2 send Ctrl + Russian 'с' as ETX too. Only for a non-ASCII key whose
+/// character, and the layout's character at this Shift level (`layout_glyph`), have no control
+/// byte, on a key whose US character has one: AZERTY Ctrl+é (the 2 key) is Ctrl+2, NUL; German
+/// Ctrl+Shift+ß types '?' at that level and keeps DEL. A Latin layout's ASCII keys keep their
+/// bytes (AZERTY Ctrl+a on the Q key is 0x01, German Ctrl+# stays '#'), and German Ctrl+ö (the
+/// ; key, which has no control byte either) stays 'ö'.
+///
+/// Where [`layout_letter_twin`] names a letter (a non-Latin letter on a US letter key) this
+/// names that letter too, unless the layout's character at this level has its own control
+/// byte, so the Ctrl byte and the shortcut lookup agree there. Past it, on a US digit or
+/// symbol key, only the byte follows the US key: a shortcut there keeps the layout's key.
 #[cfg_attr(trust_verify, trust::skip)]
-fn ctrl_layout_twin(key: &Key, modifiers: Modifiers, base_layout_key: Option<char>) -> Option<Key> {
+fn ctrl_layout_twin(
+    key: &Key,
+    modifiers: Modifiers,
+    base_layout_key: Option<char>,
+    layout_glyph: Option<char>,
+) -> Option<Key> {
     let Key::Character(c) = key else {
         return None;
     };
     if !modifiers.contains(Modifiers::CTRL)
         || c.is_ascii()
-        || !c.is_alphabetic()
-        || ctrl_character(*c).is_some()
+        || chord_ctrl_byte(*c, modifiers, layout_glyph).is_some()
     {
         return None;
     }
-    base_layout_key
-        .filter(char::is_ascii_alphabetic)
-        .map(Key::Character)
+    let base = base_layout_key?;
+    chord_ctrl_byte(base, modifiers, None).map(|_| Key::Character(base))
+}
+
+/// The US-QWERTY letter that a non-Latin layout's letter stands for in a chord:
+/// `Some('c')` for Russian 'с' on the physical C key (`base_layout_key`, the key's
+/// US-QWERTY character). The GUI's shortcut lookup reads it (Ctrl+Shift+'с' is Copy),
+/// and the encoder's Ctrl byte names no other US key wherever this names a letter (Ctrl+'с'
+/// is ^C; `ctrl_layout_twin`), so the two never disagree about which letter a press names.
+///
+/// `None` for an ASCII character (a Latin layout keeps its own keys: AZERTY's 'a'
+/// stays 'a' though it sits on US 'q'), a non-letter, and a letter on a US digit or
+/// symbol key (AZERTY 'é' on 2, Russian 'б' on comma): those keys mean what their
+/// layout says.
+#[cfg_attr(trust_verify, trust::skip)]
+#[must_use]
+pub fn layout_letter_twin(layout_char: char, base_layout_key: Option<char>) -> Option<char> {
+    if layout_char.is_ascii() || !layout_char.is_alphabetic() {
+        return None;
+    }
+    base_layout_key.filter(char::is_ascii_alphabetic)
 }
 
 /// Modifier and lock keys, mirroring kitty's `is_modifier_key` (kitty also gates
@@ -712,19 +765,24 @@ struct Win32KeyRecord {
     cs: u32,
 }
 
-/// The win32-input-mode record for a key conhost cannot read from legacy VT, or `None` for a
-/// key it reads correctly, which keeps its legacy bytes: the Enter chords legacy VT has no
-/// byte for ([`win32_enter_chord`]) and the keys whose legacy bytes conhost holds once it has
-/// read a record ([`win32_escape_record`]).
+/// The win32-input-mode record for a key conhost cannot read from legacy VT, or reads as a
+/// different key, or `None` for a key it reads correctly, which keeps its legacy bytes: the
+/// Enter chords legacy VT has no byte for ([`win32_enter_chord`]), the keys whose legacy bytes
+/// conhost holds once it has read a record ([`win32_escape_record`]), and Ctrl+H, whose BS
+/// conhost reads as Ctrl+Backspace ([`win32_ctrl_character_record`]).
 #[cfg_attr(trust_verify, trust::skip)]
 fn win32_key_record(
     key: &Key,
     modifiers: Modifiers,
     mode: KeyboardMode,
     base_layout_key: Option<char>,
+    layout_glyph: Option<char>,
 ) -> Option<Win32KeyRecord> {
     win32_enter_chord(key, modifiers)
-        .or_else(|| win32_escape_record(key, modifiers, mode, base_layout_key))
+        .or_else(|| win32_escape_record(key, modifiers, mode, base_layout_key, layout_glyph))
+        .or_else(|| {
+            win32_ctrl_character_record(key, modifiers, mode, base_layout_key, layout_glyph)
+        })
 }
 
 /// The win32-input-mode record for an Enter chord: `Some` only for Enter (main block or
@@ -821,8 +879,9 @@ fn win32_escape_record(
     modifiers: Modifiers,
     mode: KeyboardMode,
     base_layout_key: Option<char>,
+    layout_glyph: Option<char>,
 ) -> Option<Win32KeyRecord> {
-    let legacy = encode_legacy(key, modifiers, mode, None);
+    let legacy = encode_legacy(key, modifiers, mode, layout_glyph);
     if !conhost_holds_once_switched(&legacy) {
         return None;
     }
@@ -851,6 +910,97 @@ fn win32_escape_record(
         cs |= WIN32_LEFT_ALT_PRESSED;
     }
     Some(Win32KeyRecord { vk, sc, uc, cs })
+}
+
+/// BS, the legacy byte of Ctrl+H: conhost decodes a bare BS as Ctrl+Backspace.
+const LEGACY_CTRL_H: u8 = 0x08;
+
+/// The record for a Ctrl letter chord whose legacy byte conhost reads as a different key:
+/// `Some` only when the legacy bytes are a lone BS, which a letter key writes for Ctrl+H and
+/// Ctrl+Shift+H, Caps Lock or not (and Ctrl+р on a Russian layout's H key, through
+/// [`ctrl_layout_twin`]). A BS character, no letter, names no key and keeps its byte.
+///
+/// Measured 2026-10-16, conhost 10.0.26200: a bare BS reaches `ReadKey` as `Backspace
+/// MODS=Control CHAR=0x7F`, i.e. Ctrl+Backspace. PSReadLine (2.4.5 under pwsh 7.6.7, 2.0.0
+/// under powershell 5.1) runs BackwardKillWord on it and cmd.exe deletes a word, where
+/// readline's C-h, the meaning BS has on Unix, deletes one character. The record of the H key
+/// (`VK_H`, scan 0x23, char BS, `LEFT_CTRL_PRESSED`) arrives as `H MODS=Control CHAR=0x08`:
+/// PSReadLine's stock Ctrl+h, BackwardDeleteChar, deletes one character in its Windows and
+/// Emacs modes on both versions, and cmd.exe and Git Bash (MSYS2 readline) delete one
+/// character. Claude Code 2.1.302 deletes a word on either spelling. Ctrl+Backspace, a named
+/// key, keeps its BS: conhost's reading of it is the Windows word delete.
+///
+/// The record re-spells what the legacy byte said: `Uc` is the BS, `dwControlKeyState` is
+/// `LEFT_CTRL_PRESSED` alone. No `LEFT_ALT_PRESSED`: the byte carries no ESC prefix. No
+/// `SHIFT_PRESSED` either, Shift held or `H` typed: BS carries no Shift, and on Unix Ctrl+H
+/// and Ctrl+Shift+H are one key. Windows Terminal's Ctrl+Shift+H record does set it, and
+/// that reached `ReadKey` as `H MODS=Shift+Control CHAR=0x08`. PSReadLine 2.4.5 and 2.0.0
+/// bind that chord (`Ctrl+H`) in neither mode, so they inserted a literal BS, where the
+/// legacy BS had deleted a word (Windows mode) or one character (Emacs mode). cmd.exe and
+/// Git Bash deleted one character on either record (measured 2026-10-16, conhost
+/// 10.0.26200).
+///
+/// `Sc` names the physical key as [`win32_escape_record`]'s does: `base_layout_key`'s US key,
+/// else the letter's own. `Vk` does not follow it. A Windows Latin layout gives a letter key
+/// the VK of the letter it types (Dvorak's H, on the US J key, is `VK_H`), and a non-Latin
+/// layout's letter keys keep the US VKs, so the chord's letter names the VK; a reader that
+/// binds by VK would take the US J key's `VK_J` for Ctrl+J.
+///
+/// Alt+Ctrl+H keeps `ESC BS`. Those are Ctrl+Alt+Backspace's bytes too (readline's M-C-h,
+/// backward-kill-word), and conhost reads them, before and after the switch, as
+/// Ctrl+Alt+Backspace, a key with the Unix meaning. A Windows keyboard gives Ctrl+Alt+H no
+/// char (Ctrl+Alt is AltGr, and US has no AltGr H), so no record re-spells them. With
+/// altSendsEscape reset (DECRST 1039) Alt+Ctrl+H has Ctrl+H's lone BS and gets Ctrl+H's record.
+///
+/// Known siblings, left on their legacy bytes because none was measured as a key: the other
+/// Ctrl chords whose lone C0 byte conhost's control-character translation turns into a
+/// different key (expected from that translation; only LF's decode was observed, from aterm's
+/// old Shift+Enter LF). A record would hand the reader the chord pressed instead:
+/// - Ctrl+I (HT) → Tab and Ctrl+M (CR) → Enter: readline reads C-i and C-m as Tab and Enter
+///   too, so the misread is the Unix meaning and a record would only take it away.
+/// - Ctrl+J (LF) → Ctrl+Enter: PSReadLine's InsertLineAbove today, where readline's C-j
+///   accepts the line.
+/// - Ctrl+2 (NUL) → Ctrl+Shift+2: a record would hand a reader that binds by key the digit
+///   chord. Ctrl+Space shares the NUL but is NOT on this list: it was fed raw into a ConPTY tab
+///   on 2026-09-27 and arrived as Ctrl+Space (`win32_keys_conhost_still_reads_keep_their_bytes` in
+///   the tests); a 2026-10-16 scratch read saw Ctrl+Shift+2 instead, so re-measure before
+///   acting on either.
+/// - Ctrl+4 (FS) → Ctrl+\, Ctrl+5 (GS) → Ctrl+], Ctrl+6 and Ctrl+~ (RS) → Ctrl+Shift+6,
+///   Ctrl+/ and Ctrl+7 (US) → Ctrl+Shift+-, Ctrl+8 (DEL) → Backspace: each is the Windows key
+///   for that byte, so a record would change only which key a reader that binds by key sees.
+///
+/// Ctrl+[ and Ctrl+3 (ESC) are records already ([`win32_escape_record`]). Ctrl+A and Ctrl+C
+/// were measured arriving as themselves, and Ctrl+C keeps the ETX the shell's interrupt keys on.
+#[cfg_attr(trust_verify, trust::skip)]
+fn win32_ctrl_character_record(
+    key: &Key,
+    modifiers: Modifiers,
+    mode: KeyboardMode,
+    base_layout_key: Option<char>,
+    layout_glyph: Option<char>,
+) -> Option<Win32KeyRecord> {
+    if !modifiers.contains(Modifiers::CTRL) {
+        return None;
+    }
+    // The bytes the legacy path writes: a non-Latin layout's letter through its US twin.
+    let twin = ctrl_layout_twin(key, modifiers, base_layout_key, layout_glyph);
+    let key = twin.as_ref().unwrap_or(key);
+    let Key::Character(c) = key else {
+        return None;
+    };
+    let legacy = encode_legacy(key, modifiers, mode, layout_glyph);
+    if legacy != [LEGACY_CTRL_H] || !c.is_ascii_alphabetic() {
+        return None;
+    }
+    let (_, sc, _) = base_layout_key
+        .and_then(us_physical_key)
+        .or_else(|| us_physical_key(*c))?;
+    Some(Win32KeyRecord {
+        vk: u32::from(c.to_ascii_uppercase()),
+        sc,
+        uc: u32::from(LEGACY_CTRL_H),
+        cs: WIN32_LEFT_CTRL_PRESSED,
+    })
 }
 
 /// The US-QWERTY main-block key that types `c`: its `wVirtualKeyCode`, its set-1 scan code (a
@@ -945,19 +1095,19 @@ fn encode_legacy(
     } else {
         modifiers
     };
+    let text_press = !modifiers.intersects(NON_TEXT_MODIFIERS);
     match key {
         // A TEXT press writes the character it types: the layout's when given, else Caps
-        // Lock's capital. Everything else is the legacy encoder's (Shift table, control and
-        // ESC forms).
-        Key::Character(c) => match layout_text.or_else(|| {
-            (caps_lock && !modifiers.intersects(NON_TEXT_MODIFIERS))
-                .then(|| typed_character(*c, modifiers | Modifiers::CAPS_LOCK))
+        // Lock's capital. Everything else is the legacy encoder's (control and ESC forms,
+        // from the layout's character when given, else the US Shift table).
+        Key::Character(c) => match layout_text.filter(|_| text_press).or_else(|| {
+            (caps_lock && text_press).then(|| typed_character(*c, modifiers | Modifiers::CAPS_LOCK))
         }) {
             Some(glyph) => {
                 let mut buf = [0u8; 4];
                 glyph.encode_utf8(&mut buf).as_bytes().to_vec()
             }
-            None => encode_character_legacy(*c, modifiers, mode),
+            None => encode_character_legacy(*c, modifiers, mode, layout_text),
         },
         Key::Named(named) => encode_named_legacy(*named, modifiers, mode),
     }
@@ -977,8 +1127,13 @@ fn encode_xterm_other_keys(
 
     let effective_mods =
         modifiers & (Modifiers::SHIFT | Modifiers::ALT | Modifiers::CTRL | Modifiers::SUPER);
+    // xterm reports the keysym after Shift (XLookupString's), the one its level-2 test
+    // reads below: the layout's when the host gave it, else the US Shift table. Shift+2
+    // is 64 ('@'), not 50, or vim's decoder inserts '2' for '@'.
     let code: u32 = match *key {
-        Key::Character(c) => c as u32,
+        Key::Character(c) => {
+            u32::from(layout_text.unwrap_or_else(|| shifted_character(c, modifiers).unwrap_or(c)))
+        }
         Key::Named(NamedKey::Tab) => 9,
         Key::Named(NamedKey::Enter) => 13,
         Key::Named(NamedKey::Escape) => 27,

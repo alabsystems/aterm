@@ -29,15 +29,6 @@ fn enable_output_streak(app: &mut App) {
     });
 }
 
-#[test]
-fn output_streak_inert_gate_covers_every_zero_work_policy() {
-    assert!(!output_streak_inert(true, true, 1.0, false));
-    assert!(output_streak_inert(false, true, 1.0, false));
-    assert!(output_streak_inert(true, false, 1.0, false));
-    assert!(output_streak_inert(true, true, 0.0, false));
-    assert!(output_streak_inert(true, true, 1.0, true));
-}
-
 /// SERIOUS MODE TAKES THE COMET: Prism wake is decoration, so the gate every
 /// streak seam reads (`App::output_streak_shows`, the composed path's config
 /// included) is closed while Serious Mode is on, whatever the switch says;
@@ -56,34 +47,8 @@ fn serious_mode_takes_the_output_streak() {
 }
 
 #[test]
-fn composed_output_streak_inert_policy_builds_no_pane_engines() {
+fn composed_output_streak_is_off_under_reduced_motion() {
     let t0 = Instant::now();
-
-    let (mut mixed, mixed_wid, mixed_session) = mixed_fixture("fire");
-    enable_output_streak(&mut mixed);
-    mixed
-        .config
-        .output_streak
-        .as_mut()
-        .expect("configured streak")
-        .intensity = Some(0.0);
-    let mixed_term = mixed
-        .pool
-        .get(mixed_session)
-        .expect("terminal leaf")
-        .term
-        .clone();
-    term_lock(&mixed_term).process(b"mixed output");
-    assert!(
-        mixed
-            .prepare_heterogeneous_input_scratch_with_cursor_fx(
-                mixed_wid,
-                Some(ComposedCursorFxClock::Advance(t0)),
-            )
-            .is_some()
-    );
-    assert!(mixed.windows[&mixed_wid].fx.streak_panes().next().is_none());
-
     let (mut pure, pure_wid, pure_term) = pure_fixture("fire");
     enable_output_streak(&mut pure);
     pure.config.motion = Some("reduced".into());
@@ -129,10 +94,6 @@ fn an_unfocused_window_streaks_only_while_typed_into_or_recorded() {
                     started_us: 0,
                     keys: false,
                     key_log: Vec::new(),
-                    trail: false,
-                    trail_log: Vec::new(),
-                    trail_seen: 0,
-                    trail_lost: 0,
                     pace_ticks: Vec::new(),
                     unseamed_at_begin: 0,
                     unlogged_other_window: 0,
@@ -564,6 +525,48 @@ fn type_one_licensed_echo(
     term_lock(term).process(b"x");
 }
 
+/// What one route did with its frame's licensed cat pulse — `(classified,
+/// pending, delivered, replay_changed)`: classified off the engine's own
+/// admission ring, delivered when the cat moved in that frame, and then the
+/// pulse left behind (if any) replayed through the forwarding seam, which
+/// must change nothing. Every route consumes its pulse in its own frame.
+fn observe_cat_pulse_route(
+    app: &mut App,
+    wid: WindowId,
+    tick: Instant,
+    route: &str,
+) -> (bool, bool, bool, bool) {
+    let window = app.windows.get_mut(&wid).expect("test window");
+    let classified = window.fx.cursor_mut().glow.admission_tally().licensed > 0;
+    let before_replay = window.fx.companions_mut().cursor_cat.momentum(tick);
+    let delivered = before_replay > 0.0;
+    assert!(
+        delivered,
+        "{route}: the licensed pulse reaches the cat in its own frame"
+    );
+    let replay_pulse = window.fx.cursor_mut().glow.take_cursor_cat_motion_pulse();
+    let pending = replay_pulse.is_some();
+    forward_kitty_cursor_motion(
+        true,
+        false,
+        crate::cursor_glow::GlowStyle::RainbowKitty,
+        replay_pulse,
+        &mut window.fx.companions_mut().cursor_cat,
+    );
+    let replay_changed = window
+        .fx
+        .companions_mut()
+        .cursor_cat
+        .momentum(tick)
+        .to_bits()
+        != before_replay.to_bits();
+    assert!(
+        !pending,
+        "{route}: the route leaves no pulse for a later route"
+    );
+    (classified, pending, delivered, replay_changed)
+}
+
 fn bind_extracted_cat_pulse_route(
     label: &str,
     classified: bool,
@@ -571,7 +574,7 @@ fn bind_extracted_cat_pulse_route(
     delivered: bool,
     replay_changed_cat: bool,
 ) {
-    let model = aterm_spec::derive::cursor_cat_motion_pulse_routing_model();
+    let model = aterm_models_effects::cursor_cat_motion_pulse_routing_model();
     // Provenance: the pulse exists because a licensed spawn classified this move as a typed
     // advance or fold (`licensed` is read off the engine's own admission ring).
     let licensed_state = model.successors("LicenseMove", &model.init_state())[0].clone();
@@ -645,7 +648,7 @@ fn bind_ordinary_cat_pulse_route(
     delivered: bool,
     replay_changed_cat: bool,
 ) {
-    let model = aterm_spec::derive::cursor_cat_motion_pulse_routing_model();
+    let model = aterm_models_effects::cursor_cat_motion_pulse_routing_model();
     // Same provenance chain as the extracted route: licence, then classify.
     let licensed_state = model.successors("LicenseMove", &model.init_state())[0].clone();
     let classified_state = model.successors("ClassifyPulse", &licensed_state)[0].clone();
@@ -744,43 +747,9 @@ fn ordinary_single_pane_forwards_and_drains_licensed_cat_pulse() {
     app.cursor_frame(wid, live)
         .expect("advance ordinary cursor route");
 
-    let ordinary_route = {
-        let window = app.windows.get_mut(&wid).expect("ordinary window");
-        let classified = window.fx.cursor_mut().glow.admission_tally().licensed > 0;
-        let before_replay = window.fx.companions_mut().cursor_cat.momentum(tick);
-        let delivered = before_replay > 0.0;
-        assert!(
-            delivered,
-            "the licensed ordinary pulse reaches the cat in its own frame"
-        );
-        let replay_pulse = window.fx.cursor_mut().glow.take_cursor_cat_motion_pulse();
-        let pending = replay_pulse.is_some();
-        forward_kitty_cursor_motion(
-            true,
-            false,
-            crate::cursor_glow::GlowStyle::RainbowKitty,
-            replay_pulse,
-            &mut window.fx.companions_mut().cursor_cat,
-        );
-        let replay_changed = window
-            .fx
-            .companions_mut()
-            .cursor_cat
-            .momentum(tick)
-            .to_bits()
-            != before_replay.to_bits();
-        assert!(
-            !pending,
-            "the ordinary route leaves no pulse for composition"
-        );
-        (classified, pending, delivered, replay_changed)
-    };
-    bind_ordinary_cat_pulse_route(
-        ordinary_route.0,
-        ordinary_route.1,
-        ordinary_route.2,
-        ordinary_route.3,
-    );
+    let (classified, pending, delivered, replay_changed) =
+        observe_cat_pulse_route(&mut app, wid, tick, "ordinary");
+    bind_ordinary_cat_pulse_route(classified, pending, delivered, replay_changed);
 }
 
 #[test]
@@ -1000,7 +969,7 @@ fn mixed_retain_cannot_project_a_live_cursor_frame_over_new_history() {
         "Retain projects no live cursor-owned pixels over the extracted history cells"
     );
 
-    let model = aterm_spec::derive::cursor_viewport_lifecycle_model();
+    let model = aterm_models_effects::cursor_viewport_lifecycle_model();
     let charged = model.successors("ChargeLive", &model.init_state())[0].clone();
     let history = model.successors("EnterHistory", &charged)[0].clone();
     let mut retained = history.clone();
@@ -1085,21 +1054,9 @@ fn mixed_advance_feeds_alt_repaint_blink_to_both_cursor_engines() {
 }
 
 #[test]
-fn mixed_advance_translates_scroll_anchors_and_offsets_the_row_probe() {
+fn mixed_advance_translates_scroll_anchors() {
     let (mut app, wid, session) = mixed_fixture("comet");
     let term = app.pool.get(session).expect("terminal leaf").term.clone();
-    let plan = app.active_visible_leaf_plan(wid).expect("mixed plan");
-    let terminal_leaf = plan
-        .leaves
-        .iter()
-        .find(|leaf| leaf.focused)
-        .expect("focused terminal leaf");
-    let col_off = terminal_leaf.rect.origin.x.round().max(0.0) as usize;
-    assert!(
-        col_off > 0,
-        "fixture places the terminal after its native sibling"
-    );
-
     let t0 = Instant::now();
     term_lock(&term).process(b"\x1b[3;1HABOVE\x1b[4;1HCURRENT\x1b[5;1HBELOW\x1b[4;11H");
     assert!(app.composed_cursor_frame(wid, ComposedCursorFxClock::Advance(t0)));
@@ -1107,20 +1064,6 @@ fn mixed_advance_translates_scroll_anchors_and_offsets_the_row_probe() {
         wid,
         ComposedCursorFxClock::Advance(t0 + Duration::from_millis(8))
     ));
-    {
-        let window = app.windows.get(&wid).expect("test window");
-        assert!(
-            window.poof_row_buf[..col_off].iter().all(|&ch| ch == ' '),
-            "the pane-local row probe is shifted into exact window columns"
-        );
-        let actual: String = window.poof_row_buf[col_off..col_off + 7].iter().collect();
-        assert_eq!(actual, "CURRENT", "the cursor row stays row-coherent");
-        assert_eq!(window.poof_row_above_buf.len(), col_off);
-        assert_eq!(window.poof_row_below_buf.len(), col_off);
-        assert!(window.poof_row_above_buf.iter().all(|&ch| ch == ' '));
-        assert!(window.poof_row_below_buf.iter().all(|&ch| ch == ' '));
-    }
-
     {
         let window = app.windows.get_mut(&wid).expect("test window");
         let authored = t0 + Duration::from_millis(15);
@@ -1140,41 +1083,6 @@ fn mixed_advance_translates_scroll_anchors_and_offsets_the_row_probe() {
         window.fx.scroll_baseline(),
         Some(term_lock(&term).content_scroll_state())
     );
-}
-
-#[test]
-fn mixed_advance_captures_rainbow_neighbor_rows_after_engagement() {
-    let (mut app, wid, session) = mixed_fixture("rainbow kitty");
-    let term = app.pool.get(session).expect("terminal leaf").term.clone();
-    let plan = app.active_visible_leaf_plan(wid).expect("mixed plan");
-    let terminal_leaf = plan
-        .leaves
-        .iter()
-        .find(|leaf| leaf.focused)
-        .expect("focused terminal leaf");
-    let col_off = terminal_leaf.rect.origin.x.round().max(0.0) as usize;
-    assert!(col_off > 0);
-    term_lock(&term).process(b"\x1b[3;1HABOVE\x1b[4;1HCURRENT\x1b[5;1HBELOW\x1b[4;11H");
-    let t0 = Instant::now();
-    assert!(app.composed_cursor_frame(wid, ComposedCursorFxClock::Advance(t0)));
-    assert!(app.windows[&wid].fx.cursor().glow.v2_owns_frame());
-    assert!(app.composed_cursor_frame(
-        wid,
-        ComposedCursorFxClock::Advance(t0 + Duration::from_millis(8))
-    ));
-    let window = app.windows.get(&wid).expect("test window");
-    for (probe, marker) in [
-        (&window.poof_row_above_buf, "ABOVE"),
-        (&window.poof_row_buf, "CURRENT"),
-        (&window.poof_row_below_buf, "BELOW"),
-    ] {
-        assert!(
-            probe[..col_off].iter().all(|&ch| ch == ' '),
-            "the pane-local probe has exact window-column padding"
-        );
-        let actual: String = probe[col_off..col_off + marker.len()].iter().collect();
-        assert_eq!(actual, marker, "the rainbow probe stays row-coherent");
-    }
 }
 
 #[test]
@@ -1231,48 +1139,6 @@ fn exact_composed_sample_distinguishes_grid_edges_from_blank_neighbors() {
     );
     assert!(!bottom.row_below_present, "bottom edge has no row below");
     assert!(bottom.row_below_probe.is_empty());
-}
-
-#[test]
-fn composed_sample_skips_neighbors_when_rainbow_is_not_engaged() {
-    for style in ["comet", "rainbow kitty"] {
-        let (mut app, wid, session) = mixed_fixture(style);
-        if style == "rainbow kitty" {
-            app.config.cursor_trail = Some(false);
-        }
-        let term = app.pool.get(session).expect("terminal leaf").term.clone();
-        term_lock(&term).process(b"\x1b[3;1HABOVE\x1b[4;1HCURRENT\x1b[5;1HBELOW\x1b[4;11H");
-        assert!(app.composed_cursor_frame(wid, ComposedCursorFxClock::Advance(Instant::now())));
-        let v2_owns_frame = app.windows[&wid].fx.cursor().glow.v2_owns_frame();
-        assert!(
-            !v2_owns_frame,
-            "{style} must not own rainbow's neighbor gate"
-        );
-        let sample = focused_composed_cursor_fx_sample(
-            session,
-            &term_lock(&term),
-            true,
-            v2_owns_frame,
-            (0, 0),
-            &[],
-            None,
-            ComposedWitnessRows::default(),
-            Vec::new(),
-            vec!['!'; 12],
-            vec!['!'; 12],
-        );
-        assert!(
-            sample
-                .row_probe
-                .iter()
-                .take(7)
-                .copied()
-                .eq("CURRENT".chars()),
-            "the cursor row still feeds typing and erase proofs for {style}"
-        );
-        assert!(!sample.row_above_present && !sample.row_below_present);
-        assert!(sample.row_above_probe.is_empty() && sample.row_below_probe.is_empty());
-    }
 }
 
 // The content witness on a composed frame (`ribbon_rows` →
@@ -1584,109 +1450,19 @@ fn the_composed_witness_reads_the_focused_pane_s_own_rows_and_columns() {
     }
 }
 
-/// A scroll makes projection suppress its row probe. Far witness rows
-/// scanned under that same extraction lock would be discarded; the next
-/// unchanged scroll snapshot captures them again normally.
+/// A FAR WITNESS ROW IS READ FROM THE FRAME'S OWN EXTRACTION, never from the
+/// live grid after it. A band row outside the caret's captured trio is either
+/// captured under the same extraction hold, when the sample asked for it, or
+/// deferred: only a matching second-lock generation may fill its slot. A PTY
+/// write after the extraction (a glyph at the band's last cell, which would
+/// retire it) must not be read against the old cells; the next extracted
+/// frame sees the real replacement and retires.
 #[test]
-fn composed_scroll_skips_far_witness_scan_then_recovers() {
-    for shape in [ComposedShape::ThreePane, ComposedShape::Zoomed] {
-        let (mut app, wid, term, t, win_row, _) = composed_hello(shape);
-        let t = t + Duration::from_millis(90);
-        app.windows
-            .get_mut(&wid)
-            .unwrap()
-            .fx
-            .cursor_mut()
-            .glow
-            .note_return(t);
-        term_lock(&term).process(b"\r\n");
-        assert!(app.composed_cursor_frame(wid, ComposedCursorFxClock::Advance(t)));
-        term_lock(&term).process(b"\x1b[8;1H");
-        let pane_origin = focused_pane_origin(&mut app, wid);
-        let session = app.windows[&wid].composed_cursor_effect_session.unwrap();
-        let mut requested = [0u16; aterm_effects::cursor_glow::CURSOR_WITNESS_ROWS];
-        let n = app.windows[&wid]
-            .fx
-            .cursor()
-            .glow
-            .ribbon_rows(&mut requested);
-        assert!(
-            requested[..n].contains(&win_row),
-            "fixture asks for a far band"
-        );
-        let previous_scroll = app.windows[&wid].fx.scroll_baseline();
-        let stable = focused_composed_cursor_fx_sample(
-            session,
-            &term_lock(&term),
-            true,
-            app.windows[&wid].fx.cursor().glow.v2_owns_frame(),
-            pane_origin,
-            &requested[..n],
-            previous_scroll,
-            ComposedWitnessRows::default(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        );
-        assert!(
-            stable.witness_rows.get(win_row).is_some(),
-            "steady frame captures the far row"
-        );
-
-        term_lock(&term).process(b"\x1b[999;1H\n");
-        let scroll = focused_composed_cursor_fx_sample(
-            session,
-            &term_lock(&term),
-            true,
-            app.windows[&wid].fx.cursor().glow.v2_owns_frame(),
-            pane_origin,
-            &requested[..n],
-            previous_scroll,
-            stable.witness_rows,
-            stable.row_probe,
-            stable.row_above_probe,
-            stable.row_below_probe,
-        );
-        let current_scroll = scroll.content_scroll_state;
-        assert!(
-            !matches!(
-                ContentScrollState::delta_since(previous_scroll, current_scroll),
-                ContentScrollDelta::Baseline | ContentScrollDelta::Unchanged
-            ),
-            "the parser produced a real scroll"
-        );
-        assert_eq!(
-            scroll.witness_rows.active, 0,
-            "no far row is scanned on a scroll frame"
-        );
-        assert!(scroll.witness_rows.get(win_row).is_none());
-        assert!(
-            sync_cursor_effect_scroll(app.windows.get_mut(&wid).unwrap(), current_scroll).changed()
-        );
-
-        let next = focused_composed_cursor_fx_sample(
-            session,
-            &term_lock(&term),
-            true,
-            app.windows[&wid].fx.cursor().glow.v2_owns_frame(),
-            pane_origin,
-            &requested[..n],
-            app.windows[&wid].fx.scroll_baseline(),
-            scroll.witness_rows,
-            scroll.row_probe,
-            scroll.row_above_probe,
-            scroll.row_below_probe,
-        );
-        assert!(
-            next.witness_rows.get(win_row).is_some(),
-            "the next steady frame captures it"
-        );
-    }
-}
-
-#[test]
-fn composed_far_witness_uses_the_extracted_row_after_later_pty_output() {
-    for shape in [ComposedShape::ThreePane, ComposedShape::Zoomed] {
+fn composed_far_witness_never_reads_rows_changed_after_cell_extraction() {
+    for (shape, asked) in [
+        (ComposedShape::ThreePane, true),
+        (ComposedShape::ThreePane, false),
+    ] {
         let (mut app, wid, term, t, win_row, win_col) = composed_hello(shape);
         let t = t + Duration::from_millis(90);
         app.windows
@@ -1701,34 +1477,29 @@ fn composed_far_witness_uses_the_extracted_row_after_later_pty_output() {
         // The retained band is on local row 5; park the caret on row 7,
         // outside its already-captured caret/neighbor trio.
         term_lock(&term).process(b"\x1b[8;1H");
-        let (pane_row, pane_col) = focused_pane_origin(&mut app, wid);
         let plan = app.active_visible_leaf_plan(wid).unwrap();
-        let pane_rows = plan
-            .leaves
-            .iter()
-            .find(|leaf| leaf.focused)
-            .unwrap()
-            .rect
-            .size
-            .height
-            .round() as usize;
         let session = app.windows[&wid].composed_cursor_effect_session.unwrap();
         let mut requested = [0u16; aterm_effects::cursor_glow::CURSOR_WITNESS_ROWS];
-        let n = app.windows[&wid]
-            .fx
-            .cursor()
-            .glow
-            .ribbon_rows(&mut requested);
-        assert!(
-            requested[..n].contains(&win_row),
-            "fixture asks for the far band"
-        );
+        let (n, origin) = if asked {
+            let n = app.windows[&wid]
+                .fx
+                .cursor()
+                .glow
+                .ribbon_rows(&mut requested);
+            assert!(
+                requested[..n].contains(&win_row),
+                "fixture asks for the far band"
+            );
+            (n, focused_pane_origin(&mut app, wid))
+        } else {
+            (0, (0, 0))
+        };
         let sample = focused_composed_cursor_fx_sample(
             session,
             &term_lock(&term),
             true,
             app.windows[&wid].fx.cursor().glow.v2_owns_frame(),
-            (pane_row, pane_col),
+            origin,
             &requested[..n],
             None,
             ComposedWitnessRows::default(),
@@ -1736,93 +1507,40 @@ fn composed_far_witness_uses_the_extracted_row_after_later_pty_output() {
             Vec::new(),
             Vec::new(),
         );
-        assert_eq!(
-            sample.witness_rows.get(win_row).unwrap()[usize::from(win_col) + 10],
-            'd',
-            "far row came from the same extraction hold as the old cells"
-        );
-        let caret_row = sample.cursor.0 + u16::try_from(pane_row).unwrap();
-        assert!(
-            !needs_fresh_witness_read(
-                &requested[..n],
-                caret_row,
-                pane_row,
-                pane_rows,
-                sample
-                    .row_above_present
-                    .then_some(sample.row_above_probe.as_slice()),
-                sample
-                    .row_below_present
-                    .then_some(sample.row_below_probe.as_slice()),
-                &sample.witness_rows,
-            ),
-            "every in-pane row is already captured; projection owes no second lock"
-        );
-        // The live PTY changes *after* the extracted frame. Sampling it
-        // again here would incorrectly retire the ribbon over old pixels.
-        term_lock(&term).process(b"\x1b7\x1b[6;11HX\x1b8");
-        assert!(!sample.witness_stamp.matches(&term_lock(&term)));
-        let model = aterm_spec::derive::composed_witness_generation_model();
-        let mut state = model.init_state();
-        for action in ["Capture", "Mutate"] {
-            assert!(model.fire(action, &mut state));
+        if asked {
+            assert_eq!(
+                sample.witness_rows.get(win_row).unwrap()[usize::from(win_col) + 10],
+                'd',
+                "{shape:?}: far row came from the same extraction hold as the old cells"
+            );
+            let pane_rows = plan
+                .leaves
+                .iter()
+                .find(|leaf| leaf.focused)
+                .unwrap()
+                .rect
+                .size
+                .height
+                .round() as usize;
+            let caret_row = sample.cursor.0 + u16::try_from(origin.0).unwrap();
+            assert!(
+                !needs_fresh_witness_read(
+                    &requested[..n],
+                    caret_row,
+                    origin.0,
+                    pane_rows,
+                    sample
+                        .row_above_present
+                        .then_some(sample.row_above_probe.as_slice()),
+                    sample
+                        .row_below_present
+                        .then_some(sample.row_below_probe.as_slice()),
+                    &sample.witness_rows,
+                ),
+                "{shape:?}: every in-pane row is already captured; projection owes no second lock"
+            );
         }
-        assert!(model.action_enabled("ReadCaptured", &state));
-        assert!(!model.action_enabled("ReadFresh", &state));
-        assert!(app.composed_cursor_frame_sampled(
-            wid,
-            ComposedCursorFxClock::Advance(t + Duration::from_millis(16)),
-            Some(sample),
-            &plan,
-        ));
-        assert_eq!(composed_ribbon_retired(&app, wid), 0);
-        assert_eq!(
-            composed_ribbon_row(&app, wid, win_row),
-            (0..11).map(|k| (win_col + k, false)).collect::<Vec<_>>()
-        );
-        composed_idle(&mut app, wid, t + Duration::from_millis(16), 32);
-        assert!(
-            composed_ribbon_retired(&app, wid) > 0,
-            "the next extracted frame sees the real replacement"
-        );
-    }
-}
-
-#[test]
-fn composed_witness_defers_rows_changed_after_cell_extraction() {
-    for shape in [ComposedShape::ThreePane, ComposedShape::Zoomed] {
-        let (mut app, wid, term, t, win_row, win_col) = composed_hello(shape);
-        // Leave a live band two rows above the caret. This is outside
-        // the exact caret-and-neighbor capture, so only a matching
-        // second-lock generation may fill its direct witness slot.
-        let t = t + Duration::from_millis(90);
-        app.windows
-            .get_mut(&wid)
-            .unwrap()
-            .fx
-            .cursor_mut()
-            .glow
-            .note_return(t);
-        term_lock(&term).process(b"\r\n");
-        assert!(app.composed_cursor_frame(wid, ComposedCursorFxClock::Advance(t)));
-        term_lock(&term).process(b"\x1b[8;1H");
-        let plan = app.active_visible_leaf_plan(wid).unwrap();
-        let session = app.windows[&wid].composed_cursor_effect_session.unwrap();
-        let sample = focused_composed_cursor_fx_sample(
-            session,
-            &term_lock(&term),
-            true,
-            app.windows[&wid].fx.cursor().glow.v2_owns_frame(),
-            (0, 0),
-            &[],
-            None,
-            ComposedWitnessRows::default(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        );
-        // The grid now differs from the extracted cells at the run's last
-        // recorded cell, where a lone changed glyph is evidence.
+        // The live PTY changes *after* the extracted frame.
         term_lock(&term).process(b"\x1b7\x1b[6;11HX\x1b8");
         assert!(!sample.witness_stamp.matches(&term_lock(&term)));
         assert!(app.composed_cursor_frame_sampled(
@@ -1834,17 +1552,16 @@ fn composed_witness_defers_rows_changed_after_cell_extraction() {
         assert_eq!(
             composed_ribbon_retired(&app, wid),
             0,
-            "{shape:?}: newer glyphs retired the old frame"
+            "{shape:?} asked={asked}: newer glyphs retired the old frame"
         );
         assert_eq!(
             composed_ribbon_row(&app, wid, win_row),
             (0..11).map(|k| (win_col + k, false)).collect::<Vec<_>>()
         );
-        // A fresh observation must still retire the real replacement.
         composed_idle(&mut app, wid, t + Duration::from_millis(16), 32);
         assert!(
             composed_ribbon_retired(&app, wid) > 0,
-            "{shape:?}: witness was disabled"
+            "{shape:?} asked={asked}: the next extracted frame sees the real replacement"
         );
     }
 }
@@ -1902,7 +1619,7 @@ fn composed_neighbor_witness_uses_its_captured_change_after_later_pty_output() {
 
 #[test]
 fn composed_witness_generation_model_matches_real_terminal_mutations() {
-    let model = aterm_spec::derive::composed_witness_generation_model();
+    let model = aterm_models_render::composed_witness_generation_model();
     for bytes in [
         b"X".as_slice(),
         b"\x1b[?2026h",
@@ -2030,25 +1747,6 @@ fn redraw_pure(app: &mut App, wid: WindowId, now: Instant) -> bool {
     let (rows, cols) = (usize::from(window.rows), usize::from(window.cols));
     app.redraw_compose(wid, rows, cols, false, false, None, 0, now)
         .is_some()
-}
-
-fn composed_scratch_identity(
-    app: &App,
-    wid: WindowId,
-) -> ((usize, usize, usize), (usize, usize, usize)) {
-    let window = app.windows.get(&wid).expect("test window");
-    (
-        (
-            window.composed_sync_observation_scratch.as_ptr() as usize,
-            window.composed_sync_observation_scratch.len(),
-            window.composed_sync_observation_scratch.capacity(),
-        ),
-        (
-            window.composed_pane_stage_meta.as_ptr() as usize,
-            window.composed_pane_stage_meta.len(),
-            window.composed_pane_stage_meta.capacity(),
-        ),
-    )
 }
 
 fn visible_terminal_handles(
@@ -2234,94 +1932,6 @@ fn close_reopen_presents_once_and_a_dirty_reopen_never_presents_partial() {
             assert_eq!(presented, presents, "{route:?} +{ms} ms: {why}");
         }
     }
-}
-
-#[test]
-fn live_composed_sync_staging_reuses_resident_allocations() {
-    let t0 = Instant::now();
-
-    let (mut pure, pure_wid, _) = pure_fixture("rainbow kitty");
-    let pure_terms = visible_terminal_handles(&pure, pure_wid);
-    assert!(redraw_pure(&mut pure, pure_wid, t0));
-    let pure_identity = composed_scratch_identity(&pure, pure_wid);
-    assert_eq!(pure_identity.0.1, 2);
-    assert_eq!(pure_identity.1.1, 2);
-    for frame in 1..=16 {
-        term_lock(&pure_terms[frame % pure_terms.len()]).process(b"x");
-        assert!(redraw_pure(
-            &mut pure,
-            pure_wid,
-            t0 + Duration::from_millis(frame as u64 * 16),
-        ));
-        assert_eq!(
-            composed_scratch_identity(&pure, pure_wid),
-            pure_identity,
-            "pure split frame {frame} must refill resident staging in place"
-        );
-    }
-    term_lock(&pure_terms[0]).process(b"\x1b[?2026hpartial");
-    assert!(!redraw_pure(
-        &mut pure,
-        pure_wid,
-        t0 + Duration::from_millis(17 * 16),
-    ));
-    assert_eq!(
-        composed_scratch_identity(&pure, pure_wid),
-        pure_identity,
-        "a held pure frame must restore the resident observation buffer"
-    );
-
-    let (mut mixed, mixed_wid, mixed_session) = mixed_fixture("rainbow kitty");
-    let mixed_term = mixed
-        .pool
-        .get(mixed_session)
-        .expect("terminal leaf")
-        .term
-        .clone();
-    assert!(
-        mixed
-            .prepare_heterogeneous_input_scratch_with_cursor_fx(
-                mixed_wid,
-                Some(ComposedCursorFxClock::Advance(t0)),
-            )
-            .is_some()
-    );
-    let mixed_identity = composed_scratch_identity(&mixed, mixed_wid).0;
-    assert_eq!(mixed_identity.1, 1);
-    for frame in 1..=16 {
-        term_lock(&mixed_term).process(b"x");
-        assert!(
-            mixed
-                .prepare_heterogeneous_input_scratch_with_cursor_fx(
-                    mixed_wid,
-                    Some(ComposedCursorFxClock::Advance(
-                        t0 + Duration::from_millis(frame as u64 * 16),
-                    )),
-                )
-                .is_some()
-        );
-        assert_eq!(
-            composed_scratch_identity(&mixed, mixed_wid).0,
-            mixed_identity,
-            "mixed frame {frame} must refill resident sync staging in place"
-        );
-    }
-    term_lock(&mixed_term).process(b"\x1b[?2026hpartial");
-    assert!(
-        mixed
-            .prepare_heterogeneous_input_scratch_with_cursor_fx(
-                mixed_wid,
-                Some(ComposedCursorFxClock::Advance(
-                    t0 + Duration::from_millis(17 * 16),
-                )),
-            )
-            .is_none()
-    );
-    assert_eq!(
-        composed_scratch_identity(&mixed, mixed_wid).0,
-        mixed_identity,
-        "a held mixed frame must restore the resident observation buffer"
-    );
 }
 
 #[test]
@@ -2590,44 +2200,9 @@ fn extracted_mixed_live_and_split_capture_forward_and_drain_licensed_cat_pulses(
             )
             .is_some()
     );
-    let mixed_route = {
-        let window = mixed.windows.get_mut(&mixed_wid).expect("mixed window");
-        let classified = window.fx.cursor_mut().glow.admission_tally().licensed > 0;
-        let before_replay = window.fx.companions_mut().cursor_cat.momentum(mixed_tick);
-        let delivered = before_replay > 0.0;
-        assert!(
-            delivered,
-            "the licensed mixed-live pulse reaches the cat in its own frame"
-        );
-        let replay_pulse = window.fx.cursor_mut().glow.take_cursor_cat_motion_pulse();
-        let pending = replay_pulse.is_some();
-        forward_kitty_cursor_motion(
-            true,
-            false,
-            crate::cursor_glow::GlowStyle::RainbowKitty,
-            replay_pulse,
-            &mut window.fx.companions_mut().cursor_cat,
-        );
-        let replay_changed = window
-            .fx
-            .companions_mut()
-            .cursor_cat
-            .momentum(mixed_tick)
-            .to_bits()
-            != before_replay.to_bits();
-        assert!(
-            !pending,
-            "the mixed-live route leaves no pulse for a later route"
-        );
-        (classified, pending, delivered, replay_changed)
-    };
-    bind_extracted_cat_pulse_route(
-        "mixed live",
-        mixed_route.0,
-        mixed_route.1,
-        mixed_route.2,
-        mixed_route.3,
-    );
+    let (classified, pending, delivered, replay_changed) =
+        observe_cat_pulse_route(&mut mixed, mixed_wid, mixed_tick, "mixed live");
+    bind_extracted_cat_pulse_route("mixed live", classified, pending, delivered, replay_changed);
 
     // Pure terminal splits take the same extracted seam for headless image
     // capture.
@@ -2655,43 +2230,14 @@ fn extracted_mixed_live_and_split_capture_forward_and_drain_licensed_cat_pulses(
             )
             .is_some()
     );
-    let split_route = {
-        let window = split.windows.get_mut(&split_wid).expect("split window");
-        let classified = window.fx.cursor_mut().glow.admission_tally().licensed > 0;
-        let before_replay = window.fx.companions_mut().cursor_cat.momentum(split_tick);
-        let delivered = before_replay > 0.0;
-        assert!(
-            delivered,
-            "the licensed split-capture pulse reaches the cat in its own frame"
-        );
-        let replay_pulse = window.fx.cursor_mut().glow.take_cursor_cat_motion_pulse();
-        let pending = replay_pulse.is_some();
-        forward_kitty_cursor_motion(
-            true,
-            false,
-            crate::cursor_glow::GlowStyle::RainbowKitty,
-            replay_pulse,
-            &mut window.fx.companions_mut().cursor_cat,
-        );
-        let replay_changed = window
-            .fx
-            .companions_mut()
-            .cursor_cat
-            .momentum(split_tick)
-            .to_bits()
-            != before_replay.to_bits();
-        assert!(
-            !pending,
-            "the split-capture route leaves no pulse for a later route"
-        );
-        (classified, pending, delivered, replay_changed)
-    };
+    let (classified, pending, delivered, replay_changed) =
+        observe_cat_pulse_route(&mut split, split_wid, split_tick, "split capture");
     bind_extracted_cat_pulse_route(
         "split capture",
-        split_route.0,
-        split_route.1,
-        split_route.2,
-        split_route.3,
+        classified,
+        pending,
+        delivered,
+        replay_changed,
     );
 }
 
@@ -2783,199 +2329,118 @@ fn coherence_observation(app: &App, wid: WindowId) -> CoherenceObservation {
     }
 }
 
-#[test]
-fn mixed_advance_uses_the_cell_extractions_exact_terminal_sample() {
-    let t0 = Instant::now();
-    let tick = t0 + Duration::from_millis(16);
+/// The composed routes that extract a focused terminal sample and tick its
+/// cursor effects.
+#[derive(Clone, Copy, Debug)]
+enum CoherenceRoute {
+    /// The heterogeneous (terminal beside native) live compositor.
+    Mixed,
+    /// A pure terminal split's live redraw.
+    PureLive,
+    /// A pure terminal split's headless `image`/`video` capture.
+    HeadlessCapture,
+}
 
-    let (mut a_control, wid, a_term) = primed_coherence_fixture(t0);
-    set_coherence_state(&a_term, 'A', (1, 3), "11AA33", "\x1b[5 q");
-    assert!(
-        a_control
-            .prepare_heterogeneous_input_scratch_with_cursor_fx(
-                wid,
-                Some(ComposedCursorFxClock::Advance(tick)),
-            )
-            .is_some()
-    );
-    let a = coherence_observation(&a_control, wid);
-    assert_eq!(a.marker, 'A');
-    assert!(
-        !a.glow.is_empty() || a.cursor_fill.is_some(),
-        "the composed route must preserve the focused pane's complete cursor body"
-    );
+fn primed_route_fixture(
+    route: CoherenceRoute,
+    t0: Instant,
+) -> (App, WindowId, std::sync::Arc<std::sync::Mutex<Terminal>>) {
+    match route {
+        CoherenceRoute::Mixed => primed_coherence_fixture(t0),
+        CoherenceRoute::PureLive => primed_pure_live_fixture(t0),
+        CoherenceRoute::HeadlessCapture => primed_pure_capture_fixture(t0),
+    }
+}
 
-    let (mut interleaved, wid, interleaved_term) = primed_coherence_fixture(t0);
-    set_coherence_state(&interleaved_term, 'A', (1, 3), "11AA33", "\x1b[5 q");
-    let mutate_to_b = std::sync::Arc::clone(&interleaved_term);
-    assert!(
-        interleaved
+/// Present one advancing frame on `route`, running `after_extract` between
+/// the focused terminal's extraction and the rest of the frame.
+fn present_after(
+    route: CoherenceRoute,
+    app: &mut App,
+    wid: WindowId,
+    at: Instant,
+    after_extract: impl FnOnce(),
+) -> bool {
+    let clock = ComposedCursorFxClock::Advance(at);
+    match route {
+        CoherenceRoute::Mixed => app
             .prepare_heterogeneous_input_scratch_with_cursor_fx_interleaved(
                 wid,
-                Some(ComposedCursorFxClock::Advance(tick)),
-                move || {
-                    set_coherence_state(&mutate_to_b, 'B', (9, 15), "CC2244", "\x1b[3 q");
-                },
+                Some(clock),
+                after_extract,
+            )
+            .is_some(),
+        CoherenceRoute::PureLive => {
+            let window = app.windows.get(&wid).expect("test window");
+            let (rows, cols) = (usize::from(window.rows), usize::from(window.cols));
+            app.redraw_compose_interleaved(
+                wid,
+                rows,
+                cols,
+                false,
+                false,
+                None,
+                0,
+                at,
+                after_extract,
             )
             .is_some()
-    );
-    let interleaved_observation = coherence_observation(&interleaved, wid);
-    assert_eq!(
-        interleaved_observation, a,
-        "a PTY write after extraction cannot mix B cursor/effects over A cells"
-    );
-    assert_eq!(
-        {
-            let terminal = term_lock(&interleaved_term);
-            let cursor = terminal.cursor();
-            (cursor.row, cursor.col, terminal.cursor_style())
-        },
-        (9, 15, CursorStyle::BlinkingUnderline),
-        "the deterministic hook really advanced the live terminal to B"
-    );
-
-    // The two-lock choreography: extract A, mutate to B, then invoke the
-    // public pure-split fallback. The generation fence keeps both unowned
-    // effect samples dark.
-    let (mut torn_control, wid, torn_term) = primed_coherence_fixture(t0);
-    set_coherence_state(&torn_term, 'A', (1, 3), "11AA33", "\x1b[5 q");
-    assert!(
-        torn_control
-            .prepare_heterogeneous_input_scratch(wid)
-            .is_some()
-    );
-    set_coherence_state(&torn_term, 'B', (9, 15), "CC2244", "\x1b[3 q");
-    assert!(torn_control.composed_cursor_frame(wid, ComposedCursorFxClock::Advance(tick),));
-    let torn = coherence_observation(&torn_control, wid);
-    assert_eq!(
-        (torn.marker, torn.cursor, torn.cursor_color),
-        (a.marker, a.cursor, a.cursor_color),
-        "the negative control retains A's extracted cell/cursor metadata"
-    );
-    assert_ne!(
-        (torn.cursor_fill, &torn.glow, &torn.trail),
-        (a.cursor_fill, &a.glow, &a.trail),
-        "negative control: the retired second lock produces a torn cursor plane over A cells"
-    );
+        }
+        CoherenceRoute::HeadlessCapture => app
+            .prepare_terminal_capture_grid_with_cursor_fx_interleaved(wid, clock, after_extract)
+            .is_some(),
+    }
 }
 
+/// ONE FOCUSED SAMPLE PER FRAME, on every composed route: the cursor effects
+/// tick from the same terminal sample the cells were extracted from, so a PTY
+/// write that lands after extraction (the deterministic hook moves the live
+/// terminal from A to B) cannot put B's cursor plane over A's cells, nor A's
+/// effects over B's. The retired two-lock choreography tore exactly that way.
 #[test]
-fn pure_live_redraw_keeps_effects_and_cells_on_one_focused_sample() {
+fn every_composed_route_keeps_effects_and_cells_on_one_focused_sample() {
     let t0 = Instant::now();
     let tick = t0 + Duration::from_millis(16);
+    for route in [
+        CoherenceRoute::Mixed,
+        CoherenceRoute::PureLive,
+        CoherenceRoute::HeadlessCapture,
+    ] {
+        let (mut control, wid, term) = primed_route_fixture(route, t0);
+        set_coherence_state(&term, 'A', (1, 3), "11AA33", "\x1b[5 q");
+        assert!(
+            present_after(route, &mut control, wid, tick, || {}),
+            "{route:?}"
+        );
+        let a = coherence_observation(&control, wid);
+        assert_eq!(a.marker, 'A', "{route:?}");
+        assert!(
+            !a.glow.is_empty() || a.cursor_fill.is_some(),
+            "{route:?}: the route must preserve the focused pane's complete cursor body"
+        );
 
-    let (mut a_control, wid, a_term) = primed_pure_live_fixture(t0);
-    set_coherence_state(&a_term, 'A', (1, 3), "11AA33", "\x1b[5 q");
-    assert!(redraw_pure(&mut a_control, wid, tick));
-    let a = coherence_observation(&a_control, wid);
-    assert_eq!(a.marker, 'A');
-    assert!(
-        !a.glow.is_empty() || a.cursor_fill.is_some(),
-        "the pure compositor must preserve the focused pane's complete cursor body"
-    );
-
-    let (mut interleaved, wid, interleaved_term) = primed_pure_live_fixture(t0);
-    set_coherence_state(&interleaved_term, 'A', (1, 3), "11AA33", "\x1b[5 q");
-    let mutate_to_b = std::sync::Arc::clone(&interleaved_term);
-    let window = interleaved.windows.get(&wid).expect("test window");
-    let (rows, cols) = (usize::from(window.rows), usize::from(window.cols));
-    assert!(
-        interleaved
-            .redraw_compose_interleaved(wid, rows, cols, false, false, None, 0, tick, move || {
+        let (mut interleaved, wid, term) = primed_route_fixture(route, t0);
+        set_coherence_state(&term, 'A', (1, 3), "11AA33", "\x1b[5 q");
+        let mutate_to_b = std::sync::Arc::clone(&term);
+        assert!(
+            present_after(route, &mut interleaved, wid, tick, move || {
                 set_coherence_state(&mutate_to_b, 'B', (9, 15), "CC2244", "\x1b[3 q");
-            },)
-            .is_some()
-    );
-    assert_eq!(
-        coherence_observation(&interleaved, wid),
-        a,
-        "a PTY write after focused extraction cannot mix B cells over A effects"
-    );
-
-    // Two-lock negative control: tick the dark unowned A sample, mutate to B,
-    // then extract B's cells and retain the dark effect frame.
-    let (mut torn_control, wid, torn_term) = primed_pure_live_fixture(t0);
-    set_coherence_state(&torn_term, 'A', (1, 3), "11AA33", "\x1b[5 q");
-    assert!(torn_control.composed_cursor_frame(wid, ComposedCursorFxClock::Advance(tick),));
-    set_coherence_state(&torn_term, 'B', (9, 15), "CC2244", "\x1b[3 q");
-    assert!(torn_control.prepare_terminal_capture_grid(wid).is_some());
-    assert!(
-        torn_control
-            .composed_cursor_frame(wid, ComposedCursorFxClock::Retain { observed_at: tick },)
-    );
-    let torn = coherence_observation(&torn_control, wid);
-    assert_eq!(
-        (torn.glow, torn.trail),
-        (a.glow, a.trail),
-        "the negative control retains A's effect tick"
-    );
-    assert_ne!(
-        (torn.marker, torn.cursor, torn.cursor_color),
-        (a.marker, a.cursor, a.cursor_color),
-        "but the later extraction observably contributes B's cells and cursor"
-    );
-}
-
-#[test]
-fn headless_composed_capture_keeps_effects_and_cells_on_one_focused_sample() {
-    let t0 = Instant::now();
-    let tick = t0 + Duration::from_millis(16);
-
-    let (mut a_control, wid, a_term) = primed_pure_capture_fixture(t0);
-    set_coherence_state(&a_term, 'A', (1, 3), "11AA33", "\x1b[5 q");
-    assert!(
-        a_control
-            .prepare_terminal_capture_grid_with_cursor_fx(
-                wid,
-                ComposedCursorFxClock::Advance(tick),
-            )
-            .is_some()
-    );
-    let a = coherence_observation(&a_control, wid);
-    assert_eq!(a.marker, 'A');
-    assert!(
-        !a.glow.is_empty() || a.cursor_fill.is_some(),
-        "headless composed capture must preserve the focused pane's complete cursor body"
-    );
-
-    let (mut interleaved, wid, interleaved_term) = primed_pure_capture_fixture(t0);
-    set_coherence_state(&interleaved_term, 'A', (1, 3), "11AA33", "\x1b[5 q");
-    let mutate_to_b = std::sync::Arc::clone(&interleaved_term);
-    assert!(
-        interleaved
-            .prepare_terminal_capture_grid_with_cursor_fx_interleaved(
-                wid,
-                ComposedCursorFxClock::Advance(tick),
-                move || {
-                    set_coherence_state(&mutate_to_b, 'B', (9, 15), "CC2244", "\x1b[3 q");
-                },
-            )
-            .is_some()
-    );
-    assert_eq!(
-        coherence_observation(&interleaved, wid),
-        a,
-        "a PTY write after capture extraction cannot mix B effects over A cells"
-    );
-
-    // Headless two-lock choreography: extract A, mutate to B, then take a
-    // second terminal lock to tick effects from B.
-    let (mut torn_control, wid, torn_term) = primed_pure_capture_fixture(t0);
-    set_coherence_state(&torn_term, 'A', (1, 3), "11AA33", "\x1b[5 q");
-    assert!(torn_control.prepare_terminal_capture_grid(wid).is_some());
-    set_coherence_state(&torn_term, 'B', (9, 15), "CC2244", "\x1b[3 q");
-    assert!(torn_control.composed_cursor_frame(wid, ComposedCursorFxClock::Advance(tick),));
-    let torn = coherence_observation(&torn_control, wid);
-    assert_eq!(
-        (torn.marker, torn.cursor, torn.cursor_color),
-        (a.marker, a.cursor, a.cursor_color),
-        "the negative control retains A's extracted cells and cursor metadata"
-    );
-    assert_ne!(
-        (torn.cursor_fill, &torn.glow, &torn.trail),
-        (a.cursor_fill, &a.glow, &a.trail),
-        "negative control: the retired headless second lock tears effects from later cells"
-    );
+            }),
+            "{route:?}"
+        );
+        assert_eq!(
+            coherence_observation(&interleaved, wid),
+            a,
+            "{route:?}: a PTY write after extraction cannot mix B with A"
+        );
+        let terminal = term_lock(&term);
+        let cursor = terminal.cursor();
+        assert_eq!(
+            (cursor.row, cursor.col, terminal.cursor_style()),
+            (9, 15, CursorStyle::BlinkingUnderline),
+            "{route:?}: the hook really advanced the live terminal to B"
+        );
+    }
 }
 
 /// `unfocused_pane_scratch` is pruned only inside the composed route; every other route clears

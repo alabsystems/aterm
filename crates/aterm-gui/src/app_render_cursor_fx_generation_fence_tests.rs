@@ -49,6 +49,23 @@ fn band_peak(app: &App, wid: WindowId) -> u8 {
         .unwrap_or(0)
 }
 
+/// All the light the `glow_under` stream lays on glass: each quad's
+/// premultiplied colour at both ends of its ramp, over its pixel area. What a
+/// MOVING band's "brighter or not" is read from ([`band_peak`] is not: see the
+/// curtain test).
+fn band_light(app: &App, wid: WindowId) -> u64 {
+    let rgb =
+        |c: u32| u64::from((c >> 16) & 0xFF) + u64::from((c >> 8) & 0xFF) + u64::from(c & 0xFF);
+    app.windows[&wid]
+        .fx
+        .cursor()
+        .glow
+        .under_quads()
+        .iter()
+        .map(|q| (rgb(q.color) + rgb(q.color2)) * u64::from(q.w) * u64::from(q.h))
+        .sum()
+}
+
 /// `(leftmost x, rightmost x + w)` of the band on glass, in window pixels.
 fn band_span(app: &App, wid: WindowId) -> Option<(i32, i32)> {
     let quads = app.windows[&wid].fx.cursor().glow.under_quads();
@@ -81,6 +98,11 @@ fn a_coordinate_space_seam_curtains_the_rainbow_ribbon_over_a_quarter_second() {
         full > 0,
         "precondition: the typed key laid a lit ribbon cell"
     );
+    let full_light = band_light(&app, wid);
+    assert!(
+        full_light > 0,
+        "precondition: the lit ribbon cell lays light"
+    );
 
     // The seam, on its own clock (`Instant::now()` inside it).
     retire_torn_cursor_fx(app.windows.get_mut(&wid).expect("window"));
@@ -100,7 +122,14 @@ fn a_coordinate_space_seam_curtains_the_rainbow_ribbon_over_a_quarter_second() {
     );
     // Law A2: the light only goes down and draws on at least three 30 fps frames; six 33 ms
     // frames fit inside the 0.24 s curtain.
-    let mut prev = full;
+    //
+    // "Never brightens" is read off the band's whole light, not its brightest quad: the band
+    // MOVES under a curtain (drawn into the hand), and a quad's opacity follows the hue sampled
+    // where it lands (the per-hue ceilings of `GlowQuad::alpha`). The 2026-09-29 snapshot
+    // (6ad1a274d8) recorded it with a 10 px cell on Windows: the brightest quad re-snapped at
+    // +132 ms from x=27 w=3 to x=28 w=2 before its cell's turn to spend, one row reading 218
+    // against 217, while the band's light fell by a third.
+    let mut prev = full_light;
     let mut spending = 0;
     for ms in [33_u64, 66, 99, 132, 165, 198] {
         tick_at(
@@ -110,12 +139,12 @@ fn a_coordinate_space_seam_curtains_the_rainbow_ribbon_over_a_quarter_second() {
             (2, 3),
             true,
         );
-        let now = band_peak(&app, wid);
+        let now = band_light(&app, wid);
         assert!(
             now <= prev,
-            "+{ms} ms: the curtain never brightens ({prev} -> {now})"
+            "+{ms} ms: the curtain never brightens (light {prev} -> {now})"
         );
-        if now > 0 {
+        if band_peak(&app, wid) > 0 {
             spending += 1;
         }
         prev = now;

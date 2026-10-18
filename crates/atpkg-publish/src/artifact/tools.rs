@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! [`Tools`]: every external program a pack runs (the build driver, a compiler's `-vV`,
-//! the smoke and hello probes, `strip`, `codesign`, `lipo`, `atpkg::relocate`), each
+//! the smoke and hello probes, `strip`, `codesign`, `lipo`, [`super::relocate`]), each
 //! spelled once in [`HostTools`]. [`super::pack`] and [`super::bundle`] call nothing else,
 //! so their tests drive a fake over crafted trees, with no build, signing service or
 //! toolchain on the box.
@@ -173,13 +173,16 @@ pub trait Tools {
     /// Why it failed.
     fn thin(&self, file: &Path, arch: &str, out: &Path) -> Result<(), String>;
 
-    /// Pack-time relocation (`atpkg::relocate::relocate_stage`, donors already admitted).
+    /// Pack-time relocation (`crate::artifact::relocate::relocate_stage`, donors already admitted).
     ///
     /// # Errors
     ///
     /// The relocator's refusal.
-    fn relocate(&self, stage: &Path, donors: &[PathBuf])
-    -> Result<atpkg::relocate::Report, String>;
+    fn relocate(
+        &self,
+        stage: &Path,
+        donors: &[PathBuf],
+    ) -> Result<crate::artifact::relocate::Report, String>;
 }
 
 /// A compiler's `-vV`, bounded — the probe the client's lineage checker takes.
@@ -336,7 +339,7 @@ impl Tools for HostTools {
         &self,
         stage: &Path,
         donors: &[PathBuf],
-    ) -> Result<atpkg::relocate::Report, String> {
-        atpkg::relocate::relocate_stage(stage, None, donors)
+    ) -> Result<crate::artifact::relocate::Report, String> {
+        crate::artifact::relocate::relocate_stage(stage, None, donors)
     }
 }

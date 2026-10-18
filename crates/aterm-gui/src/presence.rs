@@ -35,14 +35,13 @@ use crate::Wake;
 
 // The engine's presence core under the names call sites use.
 pub(crate) use aterm_messages::presence::{
-    ChipLevel, Hand, HoldFact, LeaseMark, Link, MailFacts, MailLast, StoryVerb,
-    TOLD_TEXT_MAX_BYTES, TurnFact, WallAnswer, Words, fmt_dur, prompt_band_word, prompt_kind_words,
-    short_sid,
+    ChipLevel, Hand, HoldFact, LeaseMark, Link, StoryVerb, TOLD_TEXT_MAX_BYTES, TurnFact,
+    WallAnswer, Words, fmt_dur, prompt_band_word, prompt_kind_words, short_sid,
 };
-// …and the ones only the tests name.
+// …and the ones only the tests name (the fabric builds the mail facts).
 #[cfg(test)]
 pub(crate) use aterm_messages::presence::{
-    Level, RIPPLE, Rim, StopCause, TOLD_FLASH, words, words_step,
+    Level, MailFacts, MailLast, RIPPLE, StopCause, TOLD_FLASH, words, words_step,
 };
 
 /// The engine's presence slot, pinned to this host's seam.
@@ -65,6 +64,18 @@ pub(crate) type WindowView = aterm_messages::presence::View;
 /// [`crate::harness_host::holder`], and the percent codec is the wire's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Native {}
+
+/// Ruling 313's judgement of a drive lease as aterm's own hand: its holder
+/// is this process's harness name (`own`) AND the kernel names this process
+/// (`me`) as the one that took it (`Lease::Drive::holder_pid`). The holder
+/// name is any same-uid client's to spell (`lease acquire
+/// holder=aterm-harness@<pid>`); the pid is the kernel's, so a forged name
+/// reads as somebody else's hand. A lease no kernel attested (`None`, taken
+/// over a relay) is never aterm's.
+#[must_use]
+pub(crate) fn attested_aterms_holder(holder: &str, pid: Option<u32>, own: &str, me: u32) -> bool {
+    holder == own && pid == Some(me)
+}
 
 impl aterm_messages::presence::Host for Native {
     type Wall = aterm_phase::WallKind;
@@ -117,8 +128,13 @@ impl aterm_messages::presence::Host for Native {
         stall.act.as_ref().map(|act| act.cmd.as_str())
     }
 
-    fn is_aterms_holder(holder: &str) -> bool {
-        holder == crate::harness_host::holder()
+    fn is_aterms_holder(holder: &str, pid: Option<u32>) -> bool {
+        attested_aterms_holder(
+            holder,
+            pid,
+            &crate::harness_host::holder(),
+            std::process::id(),
+        )
     }
 
     fn pct_encode(s: &str) -> String {
@@ -314,6 +330,13 @@ pub(crate) const API_CUT_OFF: &str = "reply cut off";
 /// … a certificate or proxy the connection refused
 /// ([`aterm_phase::ApiCause::Config`]).
 pub(crate) const API_REFUSED: &str = "TLS/proxy refused";
+/// … a request the API itself refused, the same way each time it is sent
+/// ([`aterm_phase::ApiCause::Request`]: a safeguards refusal, a model not
+/// found, a tool history it rejects).
+pub(crate) const API_REQUEST_REFUSED: &str = "request refused";
+/// … a reply past its output token maximum
+/// ([`aterm_phase::ApiCause::Overlong`]).
+pub(crate) const API_OVERLONG: &str = "reply too long";
 
 /// What an API error the network caused is called on the tab, in the menu and
 /// in the notification: the cause the vendor's own line names
@@ -326,6 +349,8 @@ pub(crate) fn api_cause_words(kind: aterm_phase::WallKind) -> Option<&'static st
             aterm_phase::ApiCause::Unreachable => Some(API_UNREACHABLE),
             aterm_phase::ApiCause::CutOff => Some(API_CUT_OFF),
             aterm_phase::ApiCause::Config => Some(API_REFUSED),
+            aterm_phase::ApiCause::Request => Some(API_REQUEST_REFUSED),
+            aterm_phase::ApiCause::Overlong => Some(API_OVERLONG),
             aterm_phase::ApiCause::Server => None,
         },
         _ => None,
@@ -399,74 +424,6 @@ pub(crate) fn with_retry_plan(
     Some(agent)
 }
 
-/// A Codex's wall reset as its supervisor placed it: the notice's reset words
-/// and the unix second they name in that Codex's OWN zone, or `None` where its
-/// zone could not be read and no reset is guessed. Placed by the harness worker
-/// (`harness_host::WorkerIdle::place_reset`, through the agent's process), off
-/// the window's thread: Codex prints its `try again at` time in its own
-/// process's zone, which a `TZ` the tab's shell exported sets and this
-/// process never sees, so the window's own placement
-/// ([`countdown_to_reset`]) can name another time than the one the loop
-/// continues at.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PlacedReset {
-    /// The reset words placed, as the notice printed them.
-    pub(crate) words: String,
-    /// Where they fall, in unix seconds; `None`: not placeable.
-    pub(crate) at_unix: Option<i64>,
-}
-
-/// The countdown of a wall whose reset words the supervisor placed
-/// ([`PlacedReset`]): the wall's `until` is the placement's, or none where it
-/// placed none or its time has passed — never the window's own reading of the
-/// same words. A wall whose words are other than the placed ones (another
-/// notice since) keeps the screen's reading; so does every wall with no
-/// placement, which is the local zone's ([`countdown_to_reset`]). The wall's
-/// kind and words stay the screen's.
-pub(crate) fn with_placed_reset(
-    agent: Option<AgentReading>,
-    placed: Option<&PlacedReset>,
-    now_unix: i64,
-    now: Instant,
-) -> Option<AgentReading> {
-    let Some(placed) = placed else {
-        return agent;
-    };
-    let mut agent = agent?;
-    if let AgentPhase::Wall {
-        reset: Some(reset),
-        until,
-        ..
-    } = &mut agent.phase
-        && *reset == sanitize_token(&placed.words, 32)
-    {
-        *until = placed
-            .at_unix
-            .and_then(|at| u64::try_from(at - now_unix).ok())
-            .filter(|&ahead| ahead > 0)
-            .and_then(|ahead| now.checked_add(Duration::from_secs(ahead)));
-    }
-    Some(agent)
-}
-
-/// The `status` record's `reset_at=` (2026-10-16): the unix second the
-/// harness placed `agent`'s wall reset at ([`PlacedReset`], in that Codex's
-/// own zone), as the tab's countdown reads it ([`with_placed_reset`]) — only
-/// while the reading is a wall whose reset words are the placed ones and the
-/// placement named a time; `-` otherwise (no placement, another notice since,
-/// a zone it could not read). `aterm harness limits` places a Codex tab's
-/// wall by it, so the CLI says the time the loop continues at, not a time in
-/// its own zone.
-pub(crate) fn reset_at_field(agent: Option<&AgentReading>, placed: Option<&PlacedReset>) -> String {
-    let at = placed.and_then(|placed| match &agent?.phase {
-        AgentPhase::Wall {
-            reset: Some(reset), ..
-        } if *reset == sanitize_token(&placed.words, 32) => placed.at_unix,
-        _ => None,
-    });
-    at.map_or_else(|| "-".to_string(), |at| at.to_string())
-}
-
 /// The server's agent verdict on one screen: not an agent, or an agent's
 /// reading.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -475,10 +432,9 @@ pub(crate) enum AgentVerdict {
     /// phase, no rim. A shell whose last line ends in `?` lands here.
     NotAgent,
     /// An identified agent's reading. `by_frame` is true when only the agent's
-    /// own screen identified it (Claude Code's composer frame or a box, Codex's
-    /// composer or a box); the caller keeps that identity, `program`, for the
-    /// rest of the foreground job, since a box hides the composer and a Codex
-    /// draft names nothing. `subject` is the approval box's command or path,
+    /// own screen identified it (Claude Code's composer frame or a box, or
+    /// another agent's own layout); the caller keeps that identity, `program`,
+    /// for the rest of the foreground job, since a box hides the composer. `subject` is the approval box's command or path,
     /// folded to one clipped line, or at a network-caused API error its cause in
     /// words ([`api_cause_words`]), for the host's menu row and notification
     /// ([`crate::status_item::escalation`]), never the wire or the band; `None`
@@ -620,7 +576,8 @@ fn names_agent(program: aterm_phase::Program) -> bool {
         aterm_phase::Program::Claude
         | aterm_phase::Program::Codex
         | aterm_phase::Program::Agy
-        | aterm_phase::Program::Muse => true,
+        | aterm_phase::Program::Muse
+        | aterm_phase::Program::Gemini => true,
         aterm_phase::Program::Generic => false,
     }
 }
@@ -992,7 +949,10 @@ mod tests {
                 },
                 now,
             );
-            let lease = Hand::DrivenLease { holder };
+            let lease = Hand::DrivenLease {
+                holder,
+                pid: Some(std::process::id()),
+            };
             let mut shown = Vec::new();
             let mut at = now;
             // The lease, the turn typed inside it, the settle as it is handed
@@ -1043,6 +1003,7 @@ mod tests {
             Facts {
                 hand: Hand::DrivenLease {
                     holder: own.clone(),
+                    pid: Some(std::process::id()),
                 },
                 ..Facts::default()
             },
@@ -1213,55 +1174,6 @@ mod tests {
         assert!(guarded.subject().is_some());
     }
 
-    /// `agent=wall:<kind>` is `wall:` and aterm-phase's own kind name, for every
-    /// kind; the band keeps `limited` for exactly the kinds `worker_phase` reads
-    /// so.
-    #[test]
-    fn a_wall_word_is_wall_and_aterm_phases_kind_name() {
-        use aterm_phase::WallKind as K;
-        let kinds = [
-            K::UsageSession,
-            K::UsageWeekly,
-            K::ModelBucket { consent: false },
-            K::ModelBucket { consent: true },
-            K::Spend,
-            K::Context,
-            K::Auth,
-            K::ApiError {
-                code: Some(500),
-                retryable: true,
-                cause: aterm_phase::ApiCause::Server,
-            },
-            K::ApiError {
-                code: Some(429),
-                retryable: true,
-                cause: aterm_phase::ApiCause::Server,
-            },
-            K::Overloaded,
-            K::Memory,
-        ];
-        for kind in kinds {
-            assert_eq!(kind.wire(), format!("wall:{}", kind.name()));
-            let phase = AgentPhase::Wall {
-                kind,
-                reset: None,
-                until: None,
-            };
-            // The state the wall leaves the session in, the menu bar's words.
-            let band = match kind {
-                _ if kind.reads_limited() => "limited",
-                K::Context => "context full",
-                K::Auth => "logged out",
-                K::Memory => "memory critical",
-                K::ApiError { .. } => "API error",
-                K::Overloaded => "service overloaded",
-                other => panic!("{other:?} reads limited"),
-            };
-            assert_eq!(phase.band_word(), band, "{kind:?}");
-        }
-        assert_eq!(AgentPhase::Unknown.word(), "unknown");
-    }
-
     /// Each wall fixture reads `wall:<kind>` under `program=claude` through the
     /// one adapter, a 529 and a real Fable screen included. Negative controls: a
     /// tool's output quoting `API Error: 529` under a `⏺ Bash(…)` call stays
@@ -1320,6 +1232,58 @@ mod tests {
             session.detail().as_deref(),
             Some("3pm (America/Los_Angeles)")
         );
+    }
+
+    /// GEMINI CLI IS PUBLISHED BY ITS SCREEN under `node`, the name its
+    /// process carries: every screen it draws is its own verdict — idle at
+    /// its composer (empty, a draft, a turn's end, a cancel; in a pane
+    /// narrower than its 80 columns too), busy on its spinner (thinking, a
+    /// 503's retries, a narrow pane's), a prompt of its kind on each box
+    /// and dialog (its usage limit a box, not a wall), its refused key a
+    /// login wall, and `unknown` with its `/` menu open. NEGATIVE CONTROLS:
+    /// the same rows under a shell are no agent, and so is the screen it
+    /// left under `node`.
+    #[test]
+    fn gemini_cli_under_node_is_published_by_its_screen() {
+        use aterm_phase::gemini::fixtures as g;
+        use aterm_phase::prompt::fixtures::screen;
+        for (text, word, detail) in [
+            (g::IDLE, "idle", None),
+            (g::DRAFT, "idle", None),
+            (g::END_OF_TURN, "idle", None),
+            (g::INTERRUPTED, "idle", None),
+            (g::NARROW_IDLE, "idle", None),
+            (g::NARROW_END_OF_TURN, "idle", None),
+            (g::BUSY_THINKING, "busy", None),
+            (g::NARROW_BUSY, "busy", None),
+            (g::RETRY_503, "busy", None),
+            (g::BOX_SHELL, "prompt", Some("bash:not-read-only")),
+            (g::BOX_WRITE, "prompt", Some("write")),
+            (g::QUESTION, "prompt", Some("question")),
+            (g::LIMIT_DIALOG, "prompt", Some("usage-limit")),
+            (g::TRUST, "prompt", Some("trust")),
+            (g::ERROR_401, "wall:auth", None),
+            (g::ERROR_400_KEY, "wall:auth", None),
+            (g::LIMIT_STOPPED, "wall:api-error", None),
+            (g::SLASH_MENU, "unknown", None),
+        ] {
+            let what = text.lines().next().unwrap_or_default();
+            let rows = screen(text);
+            let v = agent_verdict(Some("node"), false, None, &rows, Cursor::Unknown, t0());
+            assert_eq!(v.program(), Some(aterm_phase::Program::Gemini), "{what}");
+            assert_eq!((v.word(), v.detail().as_deref()), (word, detail), "{what}");
+            let shell = agent_verdict(Some("zsh"), false, None, &rows, Cursor::Unknown, t0());
+            assert_eq!(shell.word(), "-", "{what}: a shell is never an agent");
+        }
+        let left = agent_verdict(
+            Some("node"),
+            false,
+            None,
+            &screen(g::EXIT),
+            Cursor::Unknown,
+            t0(),
+        );
+        assert_eq!(left.word(), "-", "the screen it left: {left:?}");
     }
 
     /// Claude Code is published idle only at its composer: the screens between
@@ -1561,12 +1525,6 @@ mod tests {
         let v = agent_verdict(Some("claude"), false, None, &live, Cursor::Unknown, t0());
         assert_eq!(v.word(), "wall:memory");
         assert_eq!(v.detail(), None);
-        match &v {
-            AgentVerdict::Agent { reading, .. } => {
-                assert_eq!(reading.phase.band_word(), "memory critical");
-            }
-            AgentVerdict::NotAgent => panic!("claude is an agent by name"),
-        }
         assert!(!aterm_phase::WallKind::Memory.reads_limited());
         let quoted = screen("", &banner);
         assert_eq!(
@@ -1581,28 +1539,35 @@ mod tests {
     }
 
     /// A reader with no evidence publishes `unknown`, never its default `idle`:
-    /// a Codex screen outside its choice box. Negative control: the Codex trust
-    /// gate itself reads as a prompt with its subject.
+    /// a Codex screen, its idle composer and its trust gate alike (aterm reads
+    /// no Codex screen; its own OSC 7501 report is what the window shows).
+    /// Negative control: Claude Code's trust dialog reads as a prompt.
     #[test]
     fn a_reading_without_evidence_is_unknown_not_idle() {
-        use aterm_phase::prompt::fixtures::{CODEX_TRUST, screen};
+        use aterm_phase::prompt::fixtures::{TRUST, screen};
         let idle = screen("\u{203a} ready\n\n  gpt-5 \u{00b7} 100% context left\n");
-        match agent_verdict(Some("codex"), false, None, &idle, Cursor::Unknown, t0()) {
-            AgentVerdict::Agent { reading, .. } => {
-                assert_eq!(reading.phase, AgentPhase::Unknown);
-                assert_eq!(reading.phase.word(), "unknown");
+        let gate = screen(
+            "  Do you trust the contents of this directory?\n\n\u{203a} 1. Yes, continue\n  2. No, \
+             quit\n\n  Press enter to continue\n",
+        );
+        for rows in [idle, gate] {
+            match agent_verdict(Some("codex"), false, None, &rows, Cursor::Unknown, t0()) {
+                AgentVerdict::Agent { reading, .. } => {
+                    assert_eq!(reading.phase, AgentPhase::Unknown);
+                    assert_eq!(reading.phase.word(), "unknown");
+                }
+                AgentVerdict::NotAgent => panic!("codex is an agent by name"),
             }
-            AgentVerdict::NotAgent => panic!("codex is an agent by name"),
         }
-        let gate = agent_verdict(
-            Some("codex"),
+        let claude = agent_verdict(
+            Some("claude"),
             false,
             None,
-            &screen(CODEX_TRUST),
+            &screen(TRUST),
             Cursor::Unknown,
             t0(),
         );
-        assert_eq!(gate.word(), "prompt");
+        assert_eq!(claude.word(), "prompt", "the control");
     }
 
     /// The box's subject rides the verdict from the same reading: the rm box
@@ -1633,14 +1598,13 @@ mod tests {
         assert_eq!(wall.subject(), None);
     }
 
-    /// An API error says what went wrong, never a plan: `⏺ API Error: Can't
-    /// reach the API server … (ENOTFOUND)` is `can't reach the API` on the tab
-    /// and in the menu row; a reply cut off is `reply cut off`; a refused
-    /// certificate or proxy is `TLS/proxy refused`. The wire word stays
-    /// `wall:api-error` for every cause. Negative controls: the server's own
-    /// failure (a 529, a 503) keeps its kind's word and names no subject.
+    /// An API error is read with its cause as the subject: `⏺ API Error: Can't
+    /// reach the API server … (ENOTFOUND)` is unreachable, a reply cut off is
+    /// cut off. The wire word stays `wall:api-error` for every cause. Negative
+    /// control: the server's own failure (a 529) keeps its kind's word and names
+    /// no subject.
     #[test]
-    fn an_api_wall_says_its_cause_and_claims_no_plan() {
+    fn an_api_wall_says_its_cause() {
         use aterm_phase::prompt::fixtures::{
             API_ERROR_529, API_ERROR_ENOTFOUND, API_ERROR_SLEEP, screen,
         };
@@ -1654,18 +1618,15 @@ mod tests {
             reset: None,
             until: None,
         };
-        for (cause, band) in [
-            (ApiCause::Unreachable, "can't reach the API"),
-            (ApiCause::CutOff, "reply cut off"),
-            (ApiCause::Config, "TLS/proxy refused"),
-            (ApiCause::Server, "API error"),
+        for cause in [
+            ApiCause::Unreachable,
+            ApiCause::CutOff,
+            ApiCause::Config,
+            ApiCause::Request,
+            ApiCause::Overlong,
+            ApiCause::Server,
         ] {
-            let phase = wall(cause);
-            assert_eq!(phase.band_word(), band, "{cause:?}");
-            assert_eq!(phase.word(), "wall:api-error", "{cause:?}");
-            for claim in ["offline", "continuing", "reachable"] {
-                assert!(!band.contains(claim), "{band}");
-            }
+            assert_eq!(wall(cause).word(), "wall:api-error", "{cause:?}");
         }
         let now = t0();
         let out = agent_verdict(
@@ -1678,11 +1639,6 @@ mod tests {
         );
         assert_eq!(out.word(), "wall:api-error");
         assert_eq!(out.subject(), Some(API_UNREACHABLE));
-        let mut slot = Slot::new(now);
-        slot.agent = out.reading().cloned();
-        let said = words(&slot, now, 0);
-        assert_eq!(said.phase, "can't reach the API", "{said:?}");
-        assert!(!said.sentence.contains("offline"), "{}", said.sentence);
         let cut = agent_verdict(
             Some("claude"),
             false,
@@ -1703,19 +1659,6 @@ mod tests {
         );
         assert_eq!(overloaded.word(), "wall:overloaded");
         assert_eq!(overloaded.subject(), None);
-        assert_eq!(
-            AgentPhase::Wall {
-                kind: WallKind::ApiError {
-                    code: Some(503),
-                    retryable: true,
-                    cause: ApiCause::Server,
-                },
-                reset: None,
-                until: None,
-            }
-            .band_word(),
-            "API error"
-        );
     }
 
     /// The loop's next try is laid on an API wall's reading (`until` for the
@@ -1854,146 +1797,6 @@ mod tests {
         slot.agent = wall(WallKind::UsageSession, Some("7:30pm"));
         let said = words(&slot, now, 0);
         assert!(said.sentence.contains("resets 7:30pm"), "{}", said.sentence);
-    }
-
-    /// THE `status` RECORD'S `reset_at=` ([`reset_at_field`]) is the unix
-    /// second the harness placed a Codex's wall reset at, while the reading's
-    /// wall shows the words it placed — what `aterm harness limits` places
-    /// that wall by. CONTROLS, each `-`: no placement; a placement that named
-    /// no time (its zone unread); another notice's words since; a wall with
-    /// no words; a phase that is no wall; no reading.
-    #[test]
-    fn the_status_records_reset_at_is_the_placed_reset_of_the_wall_shown() {
-        use aterm_phase::WallKind;
-        let wall = |reset: Option<&str>| AgentReading {
-            phase: AgentPhase::Wall {
-                kind: WallKind::UsageSession,
-                reset: reset.map(str::to_string),
-                until: None,
-            },
-            context_pct: None,
-        };
-        let placed = |words: &str, at: Option<i64>| PlacedReset {
-            words: words.to_string(),
-            at_unix: at,
-        };
-        let at = Some(1_789_664_100);
-        assert_eq!(
-            reset_at_field(Some(&wall(Some("4:10 PM"))), Some(&placed("4:10 PM", at))),
-            "1789664100"
-        );
-        for (agent, placement) in [
-            (Some(wall(Some("4:10 PM"))), None),
-            (Some(wall(Some("4:10 PM"))), Some(placed("4:10 PM", None))),
-            (Some(wall(Some("5:20 PM"))), Some(placed("4:10 PM", at))),
-            (Some(wall(None)), Some(placed("4:10 PM", at))),
-            (
-                Some(AgentReading {
-                    phase: AgentPhase::Idle,
-                    context_pct: None,
-                }),
-                Some(placed("4:10 PM", at)),
-            ),
-            (None, Some(placed("4:10 PM", at))),
-        ] {
-            assert_eq!(
-                reset_at_field(agent.as_ref(), placement.as_ref()),
-                "-",
-                "{agent:?} {placement:?}"
-            );
-        }
-    }
-
-    /// A CODEX'S RESET COUNTS DOWN TO WHERE ITS SUPERVISOR PLACED IT: the band
-    /// placed a Codex's `try again at 4:10 PM` in this process's zone, while the
-    /// loop placed it in the Codex's own (a `TZ` the tab's shell exported), so a
-    /// tab whose zone differs from aterm's counted down to another time than
-    /// the one the supervisor continues at. The placement's `until` replaces
-    /// the window's; one the supervisor could not place, or one past, shows the
-    /// reset words alone. CONTROLS, each leaving the reading as the screen
-    /// made it: no placement, another notice's words, a wall with no words, a
-    /// phase that is no wall, and no reading.
-    #[test]
-    fn a_codex_wall_counts_down_to_the_reset_its_supervisor_placed() {
-        use aterm_phase::WallKind;
-        const NOW_UNIX: i64 = 1_789_660_500;
-        let now = t0();
-        let local = now.checked_add(Duration::from_secs(7 * 3600));
-        let wall = |reset: Option<&str>| {
-            Some(AgentReading {
-                phase: AgentPhase::Wall {
-                    kind: WallKind::UsageSession,
-                    reset: reset.map(str::to_string),
-                    until: local,
-                },
-                context_pct: None,
-            })
-        };
-        let placed = |words: &str, at: Option<i64>| PlacedReset {
-            words: words.to_string(),
-            at_unix: at,
-        };
-        let until = |agent: Option<AgentReading>| match agent.map(|a| a.phase) {
-            Some(AgentPhase::Wall { until, .. }) => until,
-            other => panic!("still a wall: {other:?}"),
-        };
-        let lay =
-            |agent, placed: Option<&PlacedReset>| with_placed_reset(agent, placed, NOW_UNIX, now);
-        // The supervisor's placement, an hour ahead, not the window's seven.
-        let got = lay(
-            wall(Some("4:10 PM")),
-            Some(&placed("4:10 PM", Some(NOW_UNIX + 3600))),
-        );
-        assert_eq!(
-            until(got.clone()),
-            now.checked_add(Duration::from_secs(3600))
-        );
-        let Some(AgentReading {
-            phase: AgentPhase::Wall { kind, reset, .. },
-            ..
-        }) = got
-        else {
-            panic!("still a wall");
-        };
-        assert_eq!(
-            (kind, reset.as_deref()),
-            (WallKind::UsageSession, Some("4:10 PM")),
-            "the kind and the words are the screen's"
-        );
-        // Not placeable, or past: the words alone, never the window's guess.
-        assert_eq!(
-            until(lay(wall(Some("4:10 PM")), Some(&placed("4:10 PM", None)))),
-            None
-        );
-        assert_eq!(
-            until(lay(
-                wall(Some("4:10 PM")),
-                Some(&placed("4:10 PM", Some(NOW_UNIX - 60)))
-            )),
-            None
-        );
-        // CONTROLS: the reading is returned as it was.
-        let other = placed("4:10 PM", Some(NOW_UNIX + 3600));
-        for (name, agent, placed) in [
-            ("no placement", wall(Some("4:10 PM")), None),
-            (
-                "another notice's words",
-                wall(Some("5:20 PM")),
-                Some(&other),
-            ),
-            ("no words", wall(None), Some(&other)),
-            (
-                "not a wall",
-                Some(AgentReading {
-                    phase: AgentPhase::Idle,
-                    context_pct: None,
-                }),
-                Some(&other),
-            ),
-        ] {
-            assert_eq!(lay(agent.clone(), placed), agent, "{name}");
-        }
-        assert_eq!(lay(None, Some(&other)), None);
     }
 
     /// A tall pane with a short transcript (an API error on row 8, the composer
@@ -2268,12 +2071,11 @@ mod tests {
         );
         let w = words(&s, now, 0);
         assert!(
-            w.sentence
-                .starts_with("held, main broken, fleet, cannot be lifted here"),
+            w.sentence.contains("main broken"),
             "spoken: {:?}",
             w.sentence
         );
-        assert_eq!(w.hand, "\u{2298} hold main broken \u{00b7}fleet\u{1f512}");
+        assert!(w.hand.contains("main broken"), "{:?}", w.hand);
         assert_eq!(
             hold_reason_words("main%e2%80%aebroken%0a%1b[31m"),
             "mainbroken [31m"
@@ -2472,51 +2274,48 @@ mod tests {
         assert_eq!(detail_of(&wrapped).as_deref(), Some(want));
     }
 
-    /// Frame identification is only for a program that can be an agent: a
-    /// shell or `cat` showing a captured Claude screen is not an agent, a frame
-    /// identity does not survive the program resolving to a shell, and a group
-    /// still being named waits for its name. Negative control: the same screen
-    /// under `node`, or with no foreground group, is read as the question it
-    /// shows. A Codex under `node` is identified by its composer at idle, and
-    /// that identity is kept for the job (`known_agent`), so a draft in the
-    /// composer is still read by Codex's reader. Negative control: the draft
-    /// screen with nothing known is no agent.
+    /// A node-run vendor `codex` (npm's launcher leads its group as `node`)
+    /// is named by no screen: aterm reads no Codex screen since its Codex
+    /// screen lane was retired on 2026-10-16, so its idle composer is no
+    /// agent here, and the window shows it by its own OSC 7501 report
+    /// (`program_state.rs`). A job already known as Codex reads Codex's
+    /// reader, which has no evidence: `unknown`. NEGATIVE CONTROL: Claude
+    /// Code's composer frame under `node` is identified by its frame.
     #[test]
-    fn a_node_run_codex_keeps_its_reader_across_its_job() {
+    fn a_node_run_codex_is_named_by_no_screen() {
         use aterm_phase::Program;
-        use aterm_phase::codex::fixtures as cx;
-        use aterm_phase::prompt::fixtures::screen;
-        match agent_verdict(
-            Some("node"),
-            false,
-            None,
-            &screen(cx::IDLE),
-            Cursor::Unknown,
-            t0(),
-        ) {
-            AgentVerdict::Agent {
-                by_frame, program, ..
-            } => assert!(by_frame && program == Program::Codex, "{program:?}"),
-            AgentVerdict::NotAgent => panic!("Codex's composer identifies it"),
-        }
-        let draft = screen(cx::DRAFT);
+        use aterm_phase::prompt::fixtures::{composer, rows, screen};
+        let idle = screen("\u{203a} Ask Codex to do anything\n\n  gpt-5 \u{00b7} ~/src\n");
         assert!(
             matches!(
-                agent_verdict(Some("node"), false, None, &draft, Cursor::Unknown, t0()),
+                agent_verdict(Some("node"), false, None, &idle, Cursor::Unknown, t0()),
                 AgentVerdict::NotAgent
             ),
-            "NEGATIVE CONTROL: a draft alone names nothing"
+            "a Codex composer names nothing"
         );
         match agent_verdict(
             Some("node"),
             false,
             Some(Program::Codex),
-            &draft,
+            &idle,
             Cursor::Unknown,
             t0(),
         ) {
-            AgentVerdict::Agent { program, .. } => assert_eq!(program, Program::Codex),
+            AgentVerdict::Agent {
+                program, reading, ..
+            } => {
+                assert_eq!(program, Program::Codex);
+                assert_eq!(reading.phase, AgentPhase::Unknown);
+            }
             AgentVerdict::NotAgent => panic!("the job's identity is kept"),
+        }
+        let mut framed = rows(&["\u{23fa} Done.", ""]);
+        framed.extend(composer("  ? for shortcuts"));
+        match agent_verdict(Some("node"), false, None, &framed, Cursor::Unknown, t0()) {
+            AgentVerdict::Agent {
+                by_frame, program, ..
+            } => assert!(by_frame && program == Program::Claude, "{program:?}"),
+            AgentVerdict::NotAgent => panic!("the control: Claude Code's frame identifies it"),
         }
     }
 

@@ -1,11 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! One session's log (design §2.3, §5.1, slice-1 form): a ring bounded by
-//! BOTH a record count and an encoded size, dropping the oldest record and
-//! counting every loss exactly, with the open/close discipline of §2.3
-//! enforced by the API and the fold kept beside the ring.
+//! One session's log (design §2.3, §5.1): a ring bounded by BOTH a record
+//! count and an encoded size, evicting LEVEL-AWARE and counting every loss
+//! exactly, with the open/close discipline of §2.3 enforced by the API and
+//! the fold kept beside the ring.
 //!
+//! - **Eviction** ([`evict_class`], THE policy). A ring past its limits
+//!   evicts in one batch down to its low-water mark ([`low_water`]), oldest
+//!   first within each class, in this order: detail of closed structure
+//!   ([`EvictClass::ClosedDetail`]); the open records of closed runs and turns
+//!   (their close records carry the rollup); the close records of runs and
+//!   turns while those alone pass half the budget ([`closes_over_half`]);
+//!   current detail ([`EvictClass::OpenDetail`]); then the remaining closes.
+//!   The open records of open nodes and the session's own open and close
+//!   ([`EvictClass::Pinned`]) are never evicted, nor the record just
+//!   appended, nor a close whose subtree holds that record. Detail is
+//!   anchored by its nearest turn, and detail hanging from a run or the
+//!   session is current only while it is newer than the newest run or turn
+//!   that closed beneath that node: a verdict mark from three turns ago is
+//!   history, not the present.
+//! - **Losses** are counted where they happened: into the log's `lost`, and
+//!   into the rollup of the record's nearest open node (a closed node's
+//!   rollup is already written).
 //! - **Opening.** A child opens only under an open parent; with none, it
 //!   attaches to the nearest open ancestor and carries `orphan=1`. A parent
 //!   is never invented.
@@ -21,18 +38,24 @@
 //!   carry them ([`Close::dur_ms`] and [`Close::dur_wall`] give a duration
 //!   measured elsewhere, a block's stamps say).
 //! - **Readers** pull with a [`Cursor`], the `aterm_buffer` contract: seqs
-//!   are monotone, `since` is exclusive, and a reader behind the oldest live
-//!   record gets a [`Gap`] with the exact count it lost and where to resync.
+//!   are monotone and `since` is exclusive. A read that covers a record the
+//!   reader will never see gets a [`Gap`] with the exact count; level-aware
+//!   eviction takes records from the middle of the window, so the count may
+//!   be spread among the records returned, whose seqs show where (see
+//!   [`Log::read`]). Seqs this log never held (an update's overlap,
+//!   [`Log::skip_to`]) are no loss of its own: a read across them says
+//!   [`GapWhy::Handoff`].
 //! - **The fold** ([`Fold`]) is applied as each record is appended and lives
 //!   outside the ring, so eviction never changes the current state.
 //!
-//! Slice 1 carries no records across a seamless update: the successor starts
-//! a fresh log with [`Log::after_handoff`], whose first record is
-//! `gap why=handoff`, and its seqs restart (§10; phase 2 carries `log_seq`).
-//! A reader holding a cursor of the old epoch gets [`GapWhy::Reset`] and
-//! drops it, which needs the reader's epoch: see [`Log::read`].
+//! An update that carries no records starts a fresh log with
+//! [`Log::after_handoff`], whose first record is `gap why=handoff`; its seqs
+//! go on past the predecessor's (the host carries the count with a reserve,
+//! §2.2), so no seq names two records of the session. A reader holding a
+//! cursor of the old epoch gets [`GapWhy::Reset`] and drops it, which needs
+//! the reader's epoch: see [`Log::read`].
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use crate::field::{FieldError, Fields, Key, Tier, Val};
 use crate::fold::{Fold, SessionState};
@@ -40,6 +63,29 @@ use crate::line::{EncodeError, MAX_RECORD_BYTES, encode_bus, encoded_size};
 use crate::rec::{Rec, Stamp};
 use crate::vocab::{Actor, CLS_WORDS, Conf, Kind, Lvl, Node, Op, Src};
 use crate::words::{Out, RunOut, StepOut, TurnOut};
+
+#[path = "carry.rs"]
+mod carry;
+#[path = "journal_log.rs"]
+mod journal_log;
+#[path = "mirror.rs"]
+mod mirror;
+#[path = "summary.rs"]
+mod summary;
+pub use carry::{
+    CARRY_MAX_BYTES, CARRY_MAX_HOST_BYTES, CARRY_MAX_HOST_LINES, CARRY_MAX_LINE, CARRY_MAX_LINES,
+    CARRY_SKELETON_BYTES, CARRY_TOTAL_BYTES, CarryAdopt, CarryBudget, CarryError, CarryOut,
+    CarrySnapshot, CarryStats, PreparedCarry,
+};
+pub use journal_log::{JOURNAL_IMAGE_MAX_RECORDS, JournalImage};
+pub use mirror::{
+    BusCopy, BusCursor, CoverWhy, ENTRY_BYTES, LOG_MIRROR_BYTES, LandRefused, Landed, Prior,
+    SNAP_EVERY, Slot, SlotKind, TAKE_MAX, Take, cover_body, is_bus_step,
+};
+#[path = "log_quota.rs"]
+mod quota;
+pub use quota::mark_quota;
+pub use summary::CLOSED_SUMMARY_BYTES;
 
 /// A session ring's record bound (§5.1).
 pub const MAX_RECORDS: usize = 2048;
@@ -50,6 +96,24 @@ pub const MAX_OPEN: usize = 64;
 /// How many closed nodes' parents the log remembers, to find a closed
 /// parent's nearest open ancestor.
 const CLOSED_PARENTS: usize = 64;
+/// How many update overlaps (seq ranges this log never held, [`Log::skip_to`])
+/// a log remembers. Past it the oldest is dropped and the log accounts only
+/// for seqs after it ([`Log::complete_from`]): a reader of an earlier epoch
+/// behind that point is reset, never told a wrong count.
+pub const MAX_HOLES: usize = 64;
+/// THE SEQ LIMIT: no log's seq passes it by much. A carried head
+/// ([`Log::from_carry`]) or a count a successor is told to continue from
+/// ([`Log::after_handoff`], [`CarryAdopt::next_seq`]) past it is a corrupt or
+/// foreign file, never a log's own (at a million records a second a session
+/// takes some 146,000 years to reach it), and is refused or read as none. So
+/// a host's reserve above every seq a log holds always fits the signed 64 bits
+/// a TOML manifest writes, and a ceiling drawn from it is always above the
+/// log's head.
+pub const SEQ_LIMIT: u64 = 1 << 62;
+/// The longest parent chain the log walks (a run under a run under a run …
+/// is opened only under open nodes, so no chain is longer than the most nodes
+/// open at once).
+const MAX_DEPTH: usize = MAX_OPEN + 2;
 
 /// A ring's bounds: whichever is reached first evicts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,10 +144,115 @@ impl Limits {
 }
 
 /// Whether a ring holding `records` records of `bytes` encoded bytes is past
-/// `limits`: THE eviction policy (drop the oldest while this holds).
+/// `limits`: when an append starts an eviction batch.
 #[must_use]
 pub const fn over_limits(records: usize, bytes: usize, limits: Limits) -> bool {
     records > limits.records || bytes > limits.bytes
+}
+
+/// Where an eviction batch stops: an eighth under each bound (at least one
+/// record and one largest record's bytes), so a full ring classifies its
+/// records once per eighth of its budget, not on every append.
+#[must_use]
+pub const fn low_water(l: Limits) -> Limits {
+    let slack_records = if l.records / 8 > 1 { l.records / 8 } else { 1 };
+    let slack_bytes = if l.bytes / 8 > MAX_RECORD_BYTES {
+        l.bytes / 8
+    } else {
+        MAX_RECORD_BYTES
+    };
+    Limits {
+        records: l.records.saturating_sub(slack_records),
+        bytes: l.bytes.saturating_sub(slack_bytes),
+    }
+}
+
+/// Whether the live close records of runs and turns (`count` of them,
+/// `bytes` encoded) alone pass half of `l`: only then is a close evicted
+/// before current detail (§5.1's third class).
+#[must_use]
+pub const fn closes_over_half(count: usize, bytes: usize, l: Limits) -> bool {
+    count.saturating_mul(2) > l.records || bytes.saturating_mul(2) > l.bytes
+}
+
+/// A record's eviction class (§5.1), in the order a batch takes them:
+/// [`EvictClass::ClosedDetail`] first, [`EvictClass::Pinned`] never.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EvictClass {
+    /// Detail of closed structure: marks, amends, gaps and step records under
+    /// a closed turn (or a closed run, or a node gone from the index), and
+    /// detail hanging from an open run or the session that is older than the
+    /// newest run or turn closed beneath it.
+    ClosedDetail,
+    /// The open record of a closed run or turn: its close carries the rollup.
+    ClosedOpen,
+    /// The close record of a run or turn (taken before current detail only
+    /// while the closes pass half the budget, [`closes_over_half`]).
+    CloseRecord,
+    /// Current detail: under an open turn, or hanging from an open run or the
+    /// session and newer than every run or turn closed beneath it.
+    OpenDetail,
+    /// Never evicted: the open record of an open node, the session's own
+    /// open and close.
+    Pinned,
+}
+
+/// What [`evict_class`] needs to know of a node the log indexes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NodeView {
+    /// Its parent ([`Node::INSTANCE`]: not known, a closed node whose open
+    /// record and parent this log no longer holds).
+    pub parent: Node,
+    /// Whether it is open.
+    pub open: bool,
+    /// The seq of the newest close of a run or turn beneath it (0: none).
+    pub closed_below: u64,
+}
+
+/// THE EVICTION CLASS of `r` (§5.1), given the log's index of nodes (`node`:
+/// `None` for a node the log no longer indexes, which is closed). Detail is
+/// anchored at its nearest turn ancestor-or-self: an open one keeps it
+/// current. Detail with no turn above it is anchored at the run or session
+/// it hangs from, and is current only while that node is open and the
+/// record is newer than every run or turn closed beneath it.
+#[must_use]
+pub fn evict_class(r: &Rec, node: impl Fn(Node) -> Option<NodeView>) -> EvictClass {
+    if r.node == Node::SESSION && matches!(r.op, Op::Open | Op::Close) {
+        return EvictClass::Pinned;
+    }
+    match r.op {
+        Op::Open if node(r.node).is_some_and(|v| v.open) => return EvictClass::Pinned,
+        Op::Open if matches!(r.node.lvl, Lvl::Run | Lvl::Turn) => return EvictClass::ClosedOpen,
+        Op::Close if matches!(r.node.lvl, Lvl::Run | Lvl::Turn) => {
+            return EvictClass::CloseRecord;
+        }
+        _ => {}
+    }
+    let mut at = r.node;
+    for _ in 0..MAX_DEPTH {
+        let v = node(at);
+        match at.lvl {
+            Lvl::Turn => {
+                return if v.is_some_and(|v| v.open) {
+                    EvictClass::OpenDetail
+                } else {
+                    EvictClass::ClosedDetail
+                };
+            }
+            Lvl::Run | Lvl::Session => {
+                return match v {
+                    Some(v) if v.open && r.seq > v.closed_below => EvictClass::OpenDetail,
+                    _ => EvictClass::ClosedDetail,
+                };
+            }
+            Lvl::Step => match v {
+                Some(v) if v.parent != Node::INSTANCE => at = v.parent,
+                _ => return EvictClass::ClosedDetail,
+            },
+            Lvl::Instance => return EvictClass::ClosedDetail,
+        }
+    }
+    EvictClass::ClosedDetail
 }
 
 /// Why an append was refused. A refused append changes nothing.
@@ -107,6 +276,11 @@ pub enum Refused {
     SessionClosed,
     /// The session was already opened.
     AlreadyOpen,
+    /// A closed node the log no longer places: no record of its subtree is
+    /// live and its close is older than the last [`CLOSED_PARENTS`] closes,
+    /// so where it hung is not known, and an amend of it could be classed and
+    /// counted only by a guess ([`Log::amend`]).
+    Forgotten(Node),
 }
 
 impl From<FieldError> for Refused {
@@ -381,9 +555,13 @@ struct Ender {
 }
 
 /// Why records were lost (`gap why=`), and why a reader's cursor broke.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum GapWhy {
-    /// A seamless update carried nothing (slice 1): seqs restarted.
+    /// A seamless update: one that carried nothing (its successor's first
+    /// record), or, for a reader, a read across the seqs a carried update's
+    /// outgoing process may have written after the carry was taken
+    /// ([`Log::skip_to`]): those records are not here and nobody counted
+    /// them, so the gap's `lost` is a lower bound.
     Handoff,
     /// The previous process died.
     Crash,
@@ -394,6 +572,9 @@ pub enum GapWhy {
     Evicted,
     /// The cursor belongs to another epoch (or is ahead of the log).
     Reset,
+    /// A journal read stopped at its byte budget before it reached them
+    /// (design §5.3, phase 2B): they may be on disk, unread by this reply.
+    Unread,
 }
 
 impl GapWhy {
@@ -406,7 +587,24 @@ impl GapWhy {
             GapWhy::Pruned => "pruned",
             GapWhy::Evicted => "evicted",
             GapWhy::Reset => "reset",
+            GapWhy::Unread => "unread",
         }
+    }
+
+    /// The why a `why=` word names, or `None` for a word this build does not
+    /// know.
+    #[must_use]
+    pub fn from_word(word: &str) -> Option<GapWhy> {
+        [
+            GapWhy::Handoff,
+            GapWhy::Crash,
+            GapWhy::Pruned,
+            GapWhy::Evicted,
+            GapWhy::Reset,
+            GapWhy::Unread,
+        ]
+        .into_iter()
+        .find(|w| w.word() == word)
     }
 }
 
@@ -414,9 +612,9 @@ impl GapWhy {
 /// `since` is exclusive: a read returns records after `seq`.
 ///
 /// `ep` must be the epoch the reader was last told (a reply's `ep=`), never
-/// the log's own: in slice 1 seqs restart at an update, so a seq alone
-/// cannot say which epoch it counts. A verb that takes `since=` takes `ep=`
-/// beside it.
+/// the log's own: an update that carries no records starts a new accounting
+/// epoch even though seqs continue beyond its predecessor. A verb that takes
+/// `since=` takes `ep=` beside it so that old cursors can be reset correctly.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Cursor {
     /// The epoch the seq belongs to.
@@ -433,14 +631,21 @@ impl Cursor {
     }
 }
 
-/// What a reader that fell behind (or holds another epoch's cursor) is told.
+/// What a reader is told when the seqs a read covers hold records it will
+/// never see, or another process's (or holds another epoch's cursor).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Gap {
-    /// Evicted, or the cursor was reset.
+    /// Evicted, across an update's overlap, or the cursor was reset.
     pub why: GapWhy,
-    /// Exactly how many records the reader will never see.
+    /// Exactly how many records of the covered seqs (the cursor's, exclusive,
+    /// to the read's `next`) this log held and the reader will never see: the
+    /// ones before `resync_to` and any evicted from between the records
+    /// returned (whose seqs show where). Across an update's overlap
+    /// ([`GapWhy::Handoff`]) a lower bound: the outgoing process's records
+    /// after its carry were never counted.
     pub lost: u64,
-    /// The seq to resume after (the records returned begin past it).
+    /// The seq to resume after: the records returned begin past it (the
+    /// first record's seq less one; the read's `next` when none is returned).
     pub resync_to: u64,
 }
 
@@ -549,6 +754,10 @@ pub struct OpenEntry {
     pub orphan: bool,
     /// Its counters so far.
     pub roll: Rollup,
+    /// Whether it opened in another process (a seamless update carried it):
+    /// its `mono` is this process's clock clamped, so a close measures it on
+    /// the wall clock (`dur_ms= dur=wall`, §3.5).
+    pub wall_clock: bool,
 }
 
 /// The last node id issued per numbered level. A successor's log continues
@@ -574,6 +783,62 @@ impl IdCounters {
 struct Entry {
     rec: Rec,
     bytes: usize,
+    /// The record's place in the bus class's dense count (phase 4, design
+    /// §5.5): `1..` for a bus-class record ([`Rec::is_bus_class`]), 0 for a
+    /// local one. Assigned at append whether or not anything mirrors, so a
+    /// mirror turned on later finds every record numbered; its only cost
+    /// with the mirror off is these 8 bytes a record ([`ENTRY_BYTES`]).
+    ms: u64,
+}
+
+/// One node of the log's index: a node that is open, or whose subtree holds
+/// a live record (so every live record's parent chain can be walked, for the
+/// eviction class and for `log <node>`'s subtree, after the records that
+/// named its parents were evicted).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NodeInfo {
+    /// Its parent ([`Node::INSTANCE`] when not known; the session is its own).
+    parent: Node,
+    open: bool,
+    /// Live records in its subtree, its own included.
+    live: u32,
+    /// The seq of the newest close of a run or turn beneath it.
+    closed_below: u64,
+    /// Its open record's encoded bytes, while that is live and pinned.
+    open_bytes: usize,
+}
+
+/// THE JOURNAL'S WAKE (design §5.3; phase 2B, ruling R6): a host's dirty
+/// notifier, rung by every append and every eviction of a log it is installed
+/// in ([`Log::set_notify`]), so no producer path can write a record the host's
+/// journal writer is not woken for. The host's function sets its own flag and
+/// wakes its own writer; this crate only calls it (it spawns no thread). A
+/// log without one rings nothing.
+#[derive(Clone)]
+pub struct Notify(std::sync::Arc<dyn Fn() + Send + Sync>);
+
+impl Notify {
+    /// A notifier that runs `f`.
+    pub fn new(f: impl Fn() + Send + Sync + 'static) -> Notify {
+        Notify(std::sync::Arc::new(f))
+    }
+
+    /// Run it.
+    pub fn ring(&self) {
+        (self.0)();
+    }
+
+    /// Whether `self` and `other` are one notifier.
+    #[must_use]
+    pub fn same(&self, other: &Notify) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl std::fmt::Debug for Notify {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Notify")
+    }
 }
 
 /// One session's log.
@@ -581,13 +846,31 @@ struct Entry {
 pub struct Log {
     ep: u32,
     limits: Limits,
+    /// The byte budget evictions keep to (at most `limits.bytes`; lowered by
+    /// the host's instance-wide sweep, [`Log::set_byte_budget`]).
+    budget_bytes: usize,
     ring: VecDeque<Entry>,
     bytes: usize,
     last_seq: u64,
     lost: u64,
+    /// The newest seq this log held and no longer does (0: none).
+    newest_lost: u64,
+    /// The live close records of runs and turns, and their bytes.
+    close_count: usize,
+    close_bytes: usize,
+    /// The oldest epoch whose cursors count in this log's seqs.
+    base_ep: u32,
+    /// The first seq this log accounts for.
+    first_seq: u64,
+    /// Seq ranges (inclusive) this log never held, oldest first, each with
+    /// why a read across it says it was not held: an update's overlap
+    /// ([`GapWhy::Handoff`]), or, in a log a journal read built
+    /// ([`Log::from_journal`]), segments pruned or left unread.
+    holes: VecDeque<(u64, u64, GapWhy)>,
     /// The last id issued per numbered level: run, turn, step.
     issued: [u32; 3],
     open: Vec<OpenEntry>,
+    nodes: BTreeMap<Node, NodeInfo>,
     closed_parents: VecDeque<(Node, Node)>,
     session_opened: bool,
     session_closed: bool,
@@ -595,7 +878,44 @@ pub struct Log {
     session_mono: u64,
     session_kind: Kind,
     session_roll: Rollup,
+    /// Whether the session node opened in another process (its `mono` is
+    /// clamped; its close measures the wall clock).
+    session_wall_clock: bool,
+    /// The session's own open and close records' bytes (pinned).
+    session_bytes: usize,
+    /// An operation of several records is under way (a cascade of closes, a
+    /// supersede and its open): its batch runs once it is whole, so the
+    /// classes it reads are those of the structure the operation leaves.
+    hold_batch: bool,
+    /// Readers' fence while an update's carry stands ([`Log::fence_reads`]):
+    /// the seq they see up to, and the fold as it stood there.
+    fence: Option<Box<(u64, Fold)>>,
+    /// The live records' estimated heap ([`Log::footprint`]).
+    heap: usize,
     fold: Fold,
+    /// The host's journal wake ([`Notify`]), if one is installed.
+    notify: Option<Notify>,
+    /// The newest seq the host's journal writer has taken
+    /// ([`Log::note_journaled`]), while one follows this log.
+    journaled: Option<u64>,
+    /// The bus class's count in this seq space (phase 4): the `ms` of the
+    /// newest bus-class record appended, evicted or not.
+    ms_head: u64,
+    /// [`Self::ms_head`] when the readers were fenced ([`Log::fence_reads`]):
+    /// what a take under the fence and its tail gap stop at (ruling Q2).
+    fence_ms: u64,
+    /// THE MIRROR (phase 4, `mirror.rs`): where this log's bus-class records
+    /// stand on the bus. `None` until the first take, which a bridge makes
+    /// only while `[fabric] log = "turns"`: with the mirror off nothing is
+    /// ever held here, and the carry writes no byte of it.
+    mirror: Option<Box<mirror::Mirror>>,
+}
+
+/// One live record's estimated heap: its ring entry, its fields' vector and
+/// the text and tokens they hold.
+fn entry_heap(rec: &Rec) -> usize {
+    let strings: usize = rec.f.iter().map(|(_, v)| v.heap_len()).sum();
+    std::mem::size_of::<Entry>() + rec.f.len() * std::mem::size_of::<(Key, Val)>() + strings
 }
 
 /// The index of a numbered level in [`Log::issued`].
@@ -631,15 +951,34 @@ impl Log {
     /// An empty log with `limits` (tests and models use small rings).
     #[must_use]
     pub fn with_limits(ep: u32, limits: Limits) -> Log {
+        let mut nodes = BTreeMap::new();
+        nodes.insert(
+            Node::SESSION,
+            NodeInfo {
+                parent: Node::SESSION,
+                open: true,
+                live: 0,
+                closed_below: 0,
+                open_bytes: 0,
+            },
+        );
         Log {
             ep,
             limits,
+            budget_bytes: limits.bytes,
             ring: VecDeque::new(),
             bytes: 0,
             last_seq: 0,
             lost: 0,
+            newest_lost: 0,
+            close_count: 0,
+            close_bytes: 0,
+            base_ep: ep,
+            first_seq: 1,
+            holes: VecDeque::new(),
             issued: [0; 3],
             open: Vec::new(),
+            nodes,
             closed_parents: VecDeque::new(),
             session_opened: false,
             session_closed: false,
@@ -647,19 +986,51 @@ impl Log {
             session_mono: 0,
             session_kind: Kind::Spawn,
             session_roll: Rollup::default(),
+            session_wall_clock: false,
+            session_bytes: 0,
+            hold_batch: false,
+            fence: None,
+            heap: 0,
             fold: Fold::new(ep),
+            notify: None,
+            journaled: None,
+            ms_head: 0,
+            fence_ms: 0,
+            mirror: None,
         }
     }
 
-    /// The successor's log after a seamless update that carried no records
-    /// (slice 1): epoch `ep`, its first record `gap - gap why=handoff
-    /// epoch=<ep>`, its node ids continuing `ids`, the predecessor's
-    /// [`Log::id_counters`] (three integers the update carries beside the
-    /// timeline's id). A reader with a cursor of the old epoch is reset.
+    /// The successor's log after a seamless update that carried no records:
+    /// epoch `ep`, its first record `gap - gap why=handoff epoch=<ep>` at
+    /// seq `next_seq` (at least 1), its node ids continuing `ids`, the
+    /// predecessor's [`Log::id_counters`] (three integers the update carries
+    /// beside the timeline's id).
+    ///
+    /// `next_seq` continues the predecessor's seqs past its last plus the
+    /// overlap's reserve (the host carries that count, design §2.2), so no
+    /// seq is used twice under the session; 1 when nothing was carried (an
+    /// older producer), and read as 1 past [`SEQ_LIMIT`] (a count no log
+    /// reaches). The log accounts for no seq before it, and a reader
+    /// with a cursor of an earlier epoch is reset: what the predecessor held
+    /// past its cursor is gone, and nobody counted it.
     #[must_use]
-    pub fn after_handoff(ep: u32, limits: Limits, ids: IdCounters, at: Stamp) -> Log {
+    pub fn after_handoff(
+        ep: u32,
+        limits: Limits,
+        ids: IdCounters,
+        next_seq: u64,
+        at: Stamp,
+    ) -> Log {
         let mut log = Log::with_limits(ep, limits);
         log.issued = ids.slots();
+        // A count past the limit is no count ([`SEQ_LIMIT`]): a new seq space.
+        let next_seq = if next_seq > SEQ_LIMIT.saturating_add(1) {
+            1
+        } else {
+            next_seq.max(1)
+        };
+        log.last_seq = next_seq - 1;
+        log.first_seq = next_seq;
         log.gap(GapWhy::Handoff, 0, at);
         log
     }
@@ -694,7 +1065,9 @@ impl Log {
         self.last_seq
     }
 
-    /// The oldest live seq; `last_seq + 1` when the ring is empty.
+    /// The oldest live seq; `last_seq + 1` when the ring is empty. The open
+    /// path is never evicted, so records after it may be gone: see
+    /// [`Log::complete_from`].
     #[must_use]
     pub fn oldest_seq(&self) -> u64 {
         self.ring
@@ -702,10 +1075,252 @@ impl Log {
             .map_or(self.last_seq.saturating_add(1), |e| e.rec.seq)
     }
 
-    /// Records evicted, exactly.
+    /// The seq from which the window is whole: every seq this log held from
+    /// it on is live, so a reader at `since=<complete_from - 1>` crosses no
+    /// loss of this log's (`log`'s `oldest=`). Never before
+    /// [`Log::first_seq`].
+    #[must_use]
+    pub fn complete_from(&self) -> u64 {
+        self.newest_lost.saturating_add(1).max(self.first_seq)
+    }
+
+    /// The first seq this log accounts for: 1, or where an update that
+    /// carried no records started it, or past the oldest overlap it forgot
+    /// ([`MAX_HOLES`]).
+    #[must_use]
+    pub const fn first_seq(&self) -> u64 {
+        self.first_seq
+    }
+
+    /// The oldest epoch whose cursors count in this log's seqs: this log's
+    /// own, or the earliest a chain of carried updates continued.
+    #[must_use]
+    pub const fn base_ep(&self) -> u32 {
+        self.base_ep
+    }
+
+    /// The seq ranges (inclusive) this log never held, oldest first.
+    pub fn holes(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.holes.iter().map(|&(lo, hi, _)| (lo, hi))
+    }
+
+    /// [`Log::holes`] with why each was not held.
+    pub fn holes_why(&self) -> impl Iterator<Item = (u64, u64, GapWhy)> + '_ {
+        self.holes.iter().copied()
+    }
+
+    /// Install (or remove) the host's journal wake ([`Notify`]): from now on
+    /// every append, eviction, overlap and fence change of this log rings it.
+    pub fn set_notify(&mut self, notify: Option<Notify>) {
+        self.notify = notify;
+    }
+
+    /// The host's journal wake, if one is installed.
+    #[must_use]
+    pub const fn notify(&self) -> Option<&Notify> {
+        self.notify.as_ref()
+    }
+
+    /// The host's journal writer has taken every record up to `seq` (phase
+    /// 2B): from now on an eviction batch takes the records it holds before
+    /// any it has not reached, each in the policy's order, so a burst between
+    /// two of its passes loses nothing it could still write while the ring
+    /// keeps its bounds. Only when nothing it holds is left to take does a
+    /// record it has not reached go (its next take says the loss).
+    pub fn note_journaled(&mut self, seq: u64) {
+        self.journaled = Some(self.journaled.map_or(seq, |j| j.max(seq)));
+    }
+
+    /// The newest seq the journal writer has taken, while one follows.
+    #[must_use]
+    pub const fn journaled(&self) -> Option<u64> {
+        self.journaled
+    }
+
+    /// Ring the host's journal wake, if one is installed.
+    fn rang(&self) {
+        if let Some(n) = &self.notify {
+            n.ring();
+        }
+    }
+
+    /// Records this log held and no longer does (evicted), exactly.
     #[must_use]
     pub const fn lost(&self) -> u64 {
         self.lost
+    }
+
+    /// The log's estimated heap, in bytes: its live records (their entries,
+    /// field vectors and text), its node index, open entries and overlaps,
+    /// and its fold. What a host's instance-wide cap charges (design §5.1:
+    /// the encoded bytes [`Log::bytes`] counts are a third or so of it).
+    #[must_use]
+    pub fn footprint(&self) -> usize {
+        let node = std::mem::size_of::<(Node, NodeInfo)>() + 2 * std::mem::size_of::<usize>();
+        std::mem::size_of::<Log>()
+            .saturating_add(self.heap)
+            .saturating_add(self.nodes.len() * node)
+            .saturating_add(self.open.len() * std::mem::size_of::<OpenEntry>())
+            .saturating_add(self.closed_parents.len() * std::mem::size_of::<(Node, Node)>())
+            .saturating_add(self.holes.len() * std::mem::size_of::<(u64, u64, GapWhy)>())
+            .saturating_add(self.fold.footprint())
+            .saturating_add(self.fence.as_ref().map_or(0, |f| f.1.footprint()))
+            .saturating_add(
+                self.mirror
+                    .as_ref()
+                    .map_or(0, |_| std::mem::size_of::<mirror::Mirror>()),
+            )
+    }
+
+    /// The byte budget evictions keep to ([`Log::set_byte_budget`]).
+    #[must_use]
+    pub const fn budget_bytes(&self) -> usize {
+        self.budget_bytes
+    }
+
+    /// The bounds evictions keep to: the record bound, and the byte budget.
+    #[must_use]
+    pub const fn effective_limits(&self) -> Limits {
+        Limits {
+            records: self.limits.records,
+            bytes: self.budget_bytes,
+        }
+    }
+
+    /// The encoded bytes of the records no eviction takes: the open records
+    /// of open nodes and the session's own open and close. A ring holds at
+    /// least these, whatever its budget.
+    #[must_use]
+    pub fn pinned_bytes(&self) -> usize {
+        self.nodes
+            .values()
+            .filter(|n| n.open)
+            .map(|n| n.open_bytes)
+            .sum::<usize>()
+            .saturating_add(self.session_bytes)
+    }
+
+    /// Set the byte budget to `bytes` (clamped to one largest record's bytes
+    /// and to the session bound), evicting level-aware at once when the ring
+    /// is past it: the host's instance-wide cap (design §5.1) shares memory
+    /// out this way, never inside an append to another session's log.
+    pub fn set_byte_budget(&mut self, bytes: usize) {
+        self.budget_bytes = bytes.clamp(MAX_RECORD_BYTES, self.limits.bytes);
+        // A lowered budget lowers the marks' share with it.
+        let quota = self.enforce_mark_quota();
+        if over_limits(self.ring.len(), self.bytes, self.effective_limits()) {
+            self.evict_batch();
+            self.rang();
+        } else if quota > 0 {
+            self.rang();
+        }
+    }
+
+    /// What a closed session keeps (a host's closed-session index, design
+    /// §6): a copy of this log evicted level-aware to `bytes` encoded, by
+    /// the policy an append past its budget runs, never below what no
+    /// eviction takes (the session's own open and close, and an open log's
+    /// open path). The copy's accounting stays exact: every record left out
+    /// counts in its `lost` and its rollups, and a cursor reads it as it
+    /// would have read this log (the same epoch, seqs and gaps). Its readers
+    /// see past any fence. `bytes` = 0 keeps only what is pinned: the
+    /// accounting, the node index and the fold, over the session's open and
+    /// close. Only a read is meant of it, never an append.
+    #[must_use]
+    pub fn kept_within(&self, bytes: usize) -> Log {
+        let mut kept = self.clone();
+        kept.fence = None;
+        kept.notify = None;
+        kept.journaled = None;
+        kept.hold_batch = false;
+        // Only an append asks a closed node's parent (`parent_for`); a read
+        // walks a live record's chain through the node index alone.
+        kept.closed_parents = VecDeque::new();
+        kept.budget_bytes = bytes.min(kept.limits.bytes);
+        if over_limits(kept.ring.len(), kept.bytes, kept.effective_limits()) {
+            kept.evict_batch();
+        }
+        kept.ring.shrink_to_fit();
+        kept
+    }
+
+    /// The parent of `n`, as far as the log still knows it: an open node's,
+    /// an indexed node's (one whose subtree holds a live record), or a
+    /// recently closed node's. `None` for the session and for a node the log
+    /// no longer knows.
+    #[must_use]
+    pub fn parent_of(&self, n: Node) -> Option<Node> {
+        if n == Node::SESSION {
+            return None;
+        }
+        self.open_entry(n)
+            .map(|e| e.parent)
+            .or_else(|| {
+                self.nodes
+                    .get(&n)
+                    .map(|i| i.parent)
+                    .filter(|p| *p != Node::INSTANCE)
+            })
+            .or_else(|| {
+                self.closed_parents
+                    .iter()
+                    .rev()
+                    .find(|(c, _)| *c == n)
+                    .map(|(_, p)| *p)
+            })
+    }
+
+    /// The index's view of `n` (an open node, or one whose subtree holds a
+    /// live record): what [`evict_class`] reads. `None` for a node the log
+    /// no longer indexes, which is closed.
+    #[must_use]
+    pub fn node_view(&self, n: Node) -> Option<NodeView> {
+        self.view(n)
+    }
+
+    /// The eviction class of the live record `r` as the log stands now.
+    #[must_use]
+    pub fn class_of(&self, r: &Rec) -> EvictClass {
+        evict_class(r, |n| self.view(n))
+    }
+
+    /// How many seqs in `(lo, hi]` this log held: the seqs it accounts for
+    /// ([`Log::first_seq`] on), less the ones it never held (its holes).
+    #[must_use]
+    pub fn held_between(&self, lo: u64, hi: u64) -> u64 {
+        let lo = lo.max(self.first_seq.saturating_sub(1));
+        if hi <= lo {
+            return 0;
+        }
+        let mut n = hi - lo;
+        for &(a, b, _) in &self.holes {
+            let (a, b) = (a.max(lo.saturating_add(1)), b.min(hi));
+            if b >= a {
+                n = n.saturating_sub(b - a + 1);
+            }
+        }
+        n
+    }
+
+    /// How many live records have a seq in `(lo, hi]`, counting only the
+    /// seqs this log accounts for.
+    fn live_between(&self, lo: u64, hi: u64) -> u64 {
+        let lo = lo.max(self.first_seq.saturating_sub(1));
+        if hi <= lo {
+            return 0;
+        }
+        let a = self.ring.partition_point(|e| e.rec.seq <= lo);
+        let b = self.ring.partition_point(|e| e.rec.seq <= hi);
+        b.saturating_sub(a) as u64
+    }
+
+    /// Why the oldest seq range this log never held that `(lo, hi]` meets
+    /// was not held, if it meets one.
+    fn crosses_hole(&self, lo: u64, hi: u64) -> Option<GapWhy> {
+        self.holes
+            .iter()
+            .find(|&&(a, b, _)| a <= hi && b > lo)
+            .map(|&(.., why)| why)
     }
 
     /// Live records.
@@ -727,7 +1342,7 @@ impl Log {
     }
 
     /// The live records, oldest first.
-    pub fn window(&self) -> impl Iterator<Item = &Rec> {
+    pub fn window(&self) -> impl DoubleEndedIterator<Item = &Rec> + ExactSizeIterator {
         self.ring.iter().map(|e| &e.rec)
     }
 
@@ -790,10 +1405,26 @@ impl Log {
         }
     }
 
-    /// Records after `cursor`, at most `max` of them (§5.1's pull cursor).
-    /// A cursor behind the oldest live record gets a [`Gap`] with the exact
-    /// count it lost; a cursor of another epoch, or ahead of the log, gets
-    /// [`GapWhy::Reset`] and the epoch's records from its oldest live one.
+    /// Records after `cursor`, at most `max` of them (§5.1's pull cursor),
+    /// and the gap the read crossed.
+    ///
+    /// The read covers the seqs from the cursor (exclusive) to its `next`:
+    /// the last record returned when `max` cut it, else the log's head; a
+    /// read of `max = 0` covers only the seqs up to the first live record (it
+    /// says the gap ahead, and moves past it). Its [`Gap`] says, exactly, how
+    /// many records of those seqs this log held and the reader will never see
+    /// (some may lie between the records returned: their seqs show where),
+    /// and whether the seqs cross an update's overlap ([`GapWhy::Handoff`],
+    /// whose count is then a lower bound). A read with nothing to say has no
+    /// gap. So a reader that keeps pulling from each `next` is told every
+    /// loss once.
+    ///
+    /// A cursor this log cannot place gets [`GapWhy::Reset`] and every live
+    /// record from the oldest, its count the losses of every seq the log
+    /// accounts for: one of an epoch after the log's, or before its
+    /// [`Log::base_ep`] (another seq space), or ahead of its head, or of an
+    /// earlier epoch and behind the seqs it still accounts for
+    /// ([`Log::first_seq`]).
     ///
     /// The host passes the READER's epoch in `cursor.ep` (the `ep=` the
     /// reader was last told), never [`Log::ep`]: once a successor's seqs
@@ -803,51 +1434,77 @@ impl Log {
     /// one that has read nothing (`since=0`).
     #[must_use]
     pub fn read(&self, cursor: Cursor, max: usize) -> Read<'_> {
-        let oldest = self.oldest_seq();
-        let (gap, from) = if cursor.ep != self.ep || cursor.seq > self.last_seq {
-            let behind = oldest.saturating_sub(1);
-            (
-                Some(Gap {
-                    why: GapWhy::Reset,
-                    lost: behind,
-                    resync_to: behind,
-                }),
-                oldest,
-            )
-        } else if cursor.seq.saturating_add(1) < oldest {
-            let behind = oldest - 1;
-            (
-                Some(Gap {
-                    why: GapWhy::Evicted,
-                    lost: behind - cursor.seq,
-                    resync_to: behind,
-                }),
-                oldest,
-            )
-        } else {
-            (None, cursor.seq.saturating_add(1))
-        };
-        let skip = usize::try_from(from.saturating_sub(oldest)).unwrap_or(usize::MAX);
+        // A fenced log shows its readers nothing past the fence.
+        let head = self.reader_last_seq();
+        let reset = cursor.ep > self.ep
+            || cursor.ep < self.base_ep
+            || cursor.seq > head
+            || (cursor.ep < self.ep && cursor.seq.saturating_add(1) < self.first_seq);
+        let from = if reset { 0 } else { cursor.seq };
+        let start = self.ring.partition_point(|e| e.rec.seq <= from);
+        let end = self.ring.partition_point(|e| e.rec.seq <= head).max(start);
         let recs: Vec<&Rec> = self
             .ring
-            .iter()
-            .skip(skip)
+            .range(start..end)
             .take(max)
             .map(|e| &e.rec)
             .collect();
-        let held = recs
-            .last()
-            .map(|r| r.seq)
-            .or(gap.map(|g| g.resync_to))
-            .unwrap_or(cursor.seq);
+        let next = match (max, recs.last()) {
+            // A probe: the seqs up to the first live record.
+            (0, _) => self
+                .ring
+                .get(start)
+                .filter(|e| e.rec.seq <= head)
+                .map_or(head, |e| e.rec.seq.saturating_sub(1))
+                .max(from),
+            (_, Some(last)) if recs.len() == max => last.seq,
+            _ => head,
+        };
+        let lost = self
+            .held_between(from, next)
+            .saturating_sub(self.live_between(from, next));
+        let hole = self.crosses_hole(from, next);
+        let gap = (reset || lost > 0 || hole.is_some()).then(|| Gap {
+            why: if reset {
+                GapWhy::Reset
+            } else if let Some(why) = hole {
+                why
+            } else {
+                GapWhy::Evicted
+            },
+            lost,
+            resync_to: recs.first().map_or(next, |r| r.seq.saturating_sub(1)),
+        });
         Read {
             gap,
             recs,
-            next: Cursor::new(self.ep, held),
+            next: Cursor::new(self.ep, next),
         }
     }
 
     // ---- writing -----------------------------------------------------
+
+    /// Continue at `next_seq`: the seqs from the head up to it are ones this
+    /// log never held (a carried update's overlap, in which the outgoing
+    /// process may have gone on writing after its carry was taken). A read
+    /// across them says [`GapWhy::Handoff`], and they count as no loss of
+    /// this log's. A `next_seq` at or below the head changes nothing. Past
+    /// [`MAX_HOLES`] such ranges the oldest is forgotten and the log
+    /// accounts only for seqs after it ([`Log::first_seq`]).
+    pub fn skip_to(&mut self, next_seq: u64) {
+        if next_seq <= self.last_seq.saturating_add(1) {
+            return;
+        }
+        self.holes
+            .push_back((self.last_seq + 1, next_seq - 1, GapWhy::Handoff));
+        self.last_seq = next_seq - 1;
+        while self.holes.len() > MAX_HOLES {
+            if let Some((_, hi, _)) = self.holes.pop_front() {
+                self.first_seq = self.first_seq.max(hi.saturating_add(1));
+            }
+        }
+        self.rang();
+    }
 
     /// Open the session node (`open - spawn|adopt|restore`), once.
     ///
@@ -941,34 +1598,37 @@ impl Log {
             f,
         };
         fits(&rec)?;
-        if lvl == Lvl::Turn {
-            let stale: Vec<Node> = self.open_under(parent, Lvl::Turn).map(|e| e.node).collect();
-            for old in stale {
-                let end = Ender {
-                    out: Out::Turn(TurnOut::Superseded),
-                    src: o.src,
-                    conf: o.conf,
-                    by: o.by,
-                    dur: None,
-                };
-                self.close_cascade(old, end, Fields::new(), at);
+        self.whole(|log| {
+            if lvl == Lvl::Turn {
+                let stale: Vec<Node> = log.open_under(parent, Lvl::Turn).map(|e| e.node).collect();
+                for old in stale {
+                    let end = Ender {
+                        out: Out::Turn(TurnOut::Superseded),
+                        src: o.src,
+                        conf: o.conf,
+                        by: o.by,
+                        dur: None,
+                    };
+                    log.close_cascade_held(old, end, Fields::new(), at);
+                }
             }
-        }
-        self.issued[slot] = n;
-        let cls = rec.f.get_word(Key::Cls);
-        let continues = rec.f.get(Key::Cont).is_some();
-        self.push(rec);
-        if lvl == Lvl::Step && !continues {
-            self.count_step(parent, o.kind, cls);
-        }
-        self.open.push(OpenEntry {
-            node,
-            kind: o.kind,
-            parent,
-            t: at.wall_ms,
-            mono: at.mono_ms,
-            orphan,
-            roll: Rollup::default(),
+            log.issued[slot] = n;
+            let cls = rec.f.get_word(Key::Cls);
+            let continues = rec.f.get(Key::Cont).is_some();
+            log.push(rec);
+            if lvl == Lvl::Step && !continues {
+                log.count_step(parent, o.kind, cls);
+            }
+            log.open.push(OpenEntry {
+                node,
+                kind: o.kind,
+                parent,
+                t: at.wall_ms,
+                mono: at.mono_ms,
+                orphan,
+                roll: Rollup::default(),
+                wall_clock: false,
+            });
         });
         Ok(node)
     }
@@ -1082,9 +1742,17 @@ impl Log {
     /// (§2.3 "Amending"; the fold accepts them only at equal or higher
     /// confidence, §3.7). Returns its seq.
     ///
+    /// The amend hangs where its node did: an open node, a closed one the
+    /// index still holds (a record of its subtree is live), or one among the
+    /// last [`CLOSED_PARENTS`] closed, whose parent chain the log puts back
+    /// into its index. So its eviction class, the rollup a loss of it counts
+    /// into and the closes it shelters as the newest record are its node's
+    /// own, never a guess.
+    ///
     /// # Errors
     ///
     /// [`Refused::NotIssued`] for a node this log never issued,
+    /// [`Refused::Forgotten`] for a closed node it no longer places,
     /// [`Refused::KindDoesNotFit`] for a kind of another level, or an
     /// encoding refusal.
     pub fn amend(&mut self, node: Node, a: Amend, at: Stamp) -> Result<u64, Refused> {
@@ -1093,6 +1761,9 @@ impl Log {
         }
         if !a.kind.fits(Op::Amend, node.lvl) {
             return Err(Refused::KindDoesNotFit(a.kind));
+        }
+        if !self.nodes.contains_key(&node) && self.structural_parent(node).is_none() {
+            return Err(Refused::Forgotten(node));
         }
         let rec = Rec {
             seq: 0,
@@ -1173,8 +1844,11 @@ impl Log {
         (Node::SESSION, under.is_some() || lvl != Lvl::Run)
     }
 
-    /// The parent of `n`, open or recently closed.
-    fn parent_of(&self, n: Node) -> Option<Node> {
+    /// The parent of `n` as the open path and the last [`CLOSED_PARENTS`]
+    /// closes know it: what an append places a node by. Never the node
+    /// index's, which keeps a closed node only while a record of its subtree
+    /// is live, so a parent found there would depend on what was evicted.
+    fn structural_parent(&self, n: Node) -> Option<Node> {
         self.open_entry(n).map(|e| e.parent).or_else(|| {
             self.closed_parents
                 .iter()
@@ -1184,9 +1858,10 @@ impl Log {
         })
     }
 
-    /// The nearest open ancestor of `n` a `lvl` node may hang from.
+    /// The nearest open ancestor of `n` a `lvl` node may hang from, by
+    /// [`Log::structural_parent`]: the same whatever was evicted.
     fn nearest_open_ancestor(&self, n: Node, lvl: Lvl) -> Option<Node> {
-        let mut at = self.parent_of(n)?;
+        let mut at = self.structural_parent(n)?;
         for _ in 0..MAX_OPEN {
             if Log::may_hang_from(at.lvl, lvl) && self.is_open(at) {
                 return Some(at);
@@ -1194,7 +1869,7 @@ impl Log {
             if at == Node::SESSION {
                 return None;
             }
-            at = self.parent_of(at)?;
+            at = self.structural_parent(at)?;
         }
         None
     }
@@ -1241,6 +1916,11 @@ impl Log {
     /// built to fit (the rollup is added only as room allows), so a
     /// cascade is never refused half-way.
     fn close_cascade(&mut self, node: Node, end: Ender, f: Fields, at: Stamp) -> u64 {
+        self.whole(|log| log.close_cascade_held(node, end, f, at))
+    }
+
+    /// [`Log::close_cascade`]'s records, its batch held by the caller.
+    fn close_cascade_held(&mut self, node: Node, end: Ender, f: Fields, at: Stamp) -> u64 {
         let descendants: Vec<Node> = if node == Node::SESSION {
             self.open.iter().map(|e| e.node).collect()
         } else {
@@ -1285,12 +1965,13 @@ impl Log {
             by,
             dur,
         } = end;
-        let (kind, parent, mono, roll) = if node == Node::SESSION {
+        let (kind, parent, mono, wall_from, roll) = if node == Node::SESSION {
             self.session_closed = true;
             (
                 self.session_kind,
                 None,
                 self.session_mono,
+                self.session_wall_clock.then_some(self.session_t),
                 self.session_roll,
             )
         } else {
@@ -1298,8 +1979,19 @@ impl Log {
                 return self.last_seq;
             };
             let e = self.open.remove(i);
-            (e.kind, Some(e.parent), e.mono, e.roll)
+            (
+                e.kind,
+                Some(e.parent),
+                e.mono,
+                e.wall_clock.then_some(e.t),
+                e.roll,
+            )
         };
+        // A node carried from another process measures the wall clock.
+        let dur = dur.or_else(|| wall_from.map(|t| Dur::Wall(at.wall_ms.saturating_sub(t))));
+        // Closed in the index before its close is appended: the batch that
+        // append may run classifies by it.
+        self.index_close(node, self.last_seq.saturating_add(1));
         let mut f = Fields::new();
         let _ = f.set(Key::Out, Val::Word(out.word()));
         let ms = match dur {
@@ -1355,34 +2047,346 @@ impl Log {
     }
 
     /// Append a record that fits: assign its seq, apply it to the fold,
-    /// then evict the oldest while the ring is past its limits.
+    /// index it, then evict a batch when the ring is past its limits.
     fn push(&mut self, mut rec: Rec) -> u64 {
         self.last_seq = self.last_seq.saturating_add(1);
         rec.seq = self.last_seq;
         let bytes = encoded_size(&rec, Tier::Content).unwrap_or(MAX_RECORD_BYTES);
+        let claim = rec.src == Src::Mark;
+        let ms = if rec.is_bus_class() {
+            self.ms_head = self.ms_head.saturating_add(1);
+            self.ms_head
+        } else {
+            0
+        };
         self.fold.apply(&rec);
-        self.ring.push_back(Entry { rec, bytes });
+        self.index_push(&rec, bytes);
+        self.heap = self.heap.saturating_add(entry_heap(&rec));
+        self.ring.push_back(Entry { rec, bytes, ms });
         self.bytes = self.bytes.saturating_add(bytes);
-        self.evict();
+        // A claim's append keeps the marks within their quarter of the ring
+        // (`log_quota`), before any batch: the batch then sees the ring the
+        // quota left.
+        if claim {
+            self.enforce_mark_quota();
+        }
+        if !self.hold_batch {
+            self.settle_batch();
+        }
+        self.rang();
         self.last_seq
     }
 
-    /// Drop the oldest record while the ring is past its limits, counting
-    /// each loss in the log and in its node's rollup while that is open.
-    fn evict(&mut self) {
-        while self.ring.len() > 1 && over_limits(self.ring.len(), self.bytes, self.limits) {
-            let Some(old) = self.ring.pop_front() else {
+    /// Run the eviction batch when the ring is past its limits.
+    fn settle_batch(&mut self) {
+        if over_limits(self.ring.len(), self.bytes, self.effective_limits()) {
+            self.evict_batch();
+        }
+    }
+
+    /// Run `f`, an operation of several records, with its eviction batch held
+    /// until it is whole.
+    fn whole<T>(&mut self, f: impl FnOnce(&mut Log) -> T) -> T {
+        let held = std::mem::replace(&mut self.hold_batch, true);
+        let out = f(self);
+        self.hold_batch = held;
+        if !held {
+            self.settle_batch();
+        }
+        out
+    }
+
+    /// The index's view of `n`, for [`evict_class`].
+    fn view(&self, n: Node) -> Option<NodeView> {
+        self.nodes.get(&n).map(|i| NodeView {
+            parent: i.parent,
+            open: i.open,
+            closed_below: i.closed_below,
+        })
+    }
+
+    /// `n` and its ancestors in the index, nearest first (at most
+    /// [`MAX_DEPTH`]).
+    fn chain(&self, n: Node) -> Vec<Node> {
+        let mut out = Vec::new();
+        let mut at = n;
+        for _ in 0..MAX_DEPTH {
+            let Some(info) = self.nodes.get(&at) else {
                 break;
             };
-            self.bytes = self.bytes.saturating_sub(old.bytes);
-            self.lost = self.lost.saturating_add(1);
-            let node = old.rec.node;
-            if node == Node::SESSION {
-                self.session_roll.lost = self.session_roll.lost.saturating_add(1);
-            } else if let Some(e) = self.open.iter_mut().find(|e| e.node == node) {
-                e.roll.lost = e.roll.lost.saturating_add(1);
+            out.push(at);
+            if at == Node::SESSION || info.parent == Node::INSTANCE {
+                break;
+            }
+            at = info.parent;
+        }
+        out
+    }
+
+    /// Index a record about to enter the ring: an open adds its node (with
+    /// its parent, pinned bytes counted), and every record counts as live in
+    /// its node's subtree and each ancestor's. A record of a node the index
+    /// no longer holds (an amend of a closed node whose records were all
+    /// evicted, which [`Log::amend`] admits only for a node it places) puts
+    /// the node back with the chain of closed ancestors the index lost, by
+    /// [`Log::structural_parent`], up to one it holds.
+    fn index_push(&mut self, rec: &Rec, bytes: usize) {
+        if rec.op == Op::Open && rec.node != Node::SESSION {
+            self.nodes.insert(
+                rec.node,
+                NodeInfo {
+                    parent: rec.par.unwrap_or(Node::SESSION),
+                    open: true,
+                    live: 0,
+                    closed_below: 0,
+                    open_bytes: bytes,
+                },
+            );
+        } else {
+            let mut at = rec.node;
+            for _ in 0..MAX_DEPTH {
+                if self.nodes.contains_key(&at) {
+                    break;
+                }
+                let parent = self.structural_parent(at).unwrap_or(Node::INSTANCE);
+                self.nodes.insert(
+                    at,
+                    NodeInfo {
+                        parent,
+                        open: false,
+                        live: 0,
+                        closed_below: 0,
+                        open_bytes: 0,
+                    },
+                );
+                if parent == Node::INSTANCE {
+                    break;
+                }
+                at = parent;
             }
         }
+        if rec.node == Node::SESSION && matches!(rec.op, Op::Open | Op::Close) {
+            self.session_bytes = self.session_bytes.saturating_add(bytes);
+        }
+        if rec.op == Op::Close && matches!(rec.node.lvl, Lvl::Run | Lvl::Turn) {
+            self.close_count += 1;
+            self.close_bytes = self.close_bytes.saturating_add(bytes);
+        }
+        self.bump_chain(rec.node, true);
+    }
+
+    /// Count one live record more (or less) in `n`'s subtree and each
+    /// ancestor's, walking the index without allocating.
+    fn bump_chain(&mut self, n: Node, more: bool) {
+        let mut at = n;
+        for _ in 0..MAX_DEPTH {
+            let Some(info) = self.nodes.get_mut(&at) else {
+                return;
+            };
+            info.live = if more {
+                info.live.saturating_add(1)
+            } else {
+                info.live.saturating_sub(1)
+            };
+            if at == Node::SESSION || info.parent == Node::INSTANCE {
+                return;
+            }
+            at = info.parent;
+        }
+    }
+
+    /// Mark `node` closed in the index at the close record `seq` (the close
+    /// of a run or turn is newer than all detail of each ancestor written so
+    /// far: [`EvictClass::ClosedDetail`]'s time rule), its open record no
+    /// longer pinned.
+    fn index_close(&mut self, node: Node, seq: u64) {
+        let structural = matches!(node.lvl, Lvl::Run | Lvl::Turn);
+        let ancestors: Vec<Node> = self.chain(node).into_iter().skip(1).collect();
+        if let Some(info) = self.nodes.get_mut(&node) {
+            info.open = false;
+            info.open_bytes = 0;
+        }
+        if structural {
+            for a in ancestors {
+                if let Some(info) = self.nodes.get_mut(&a) {
+                    info.closed_below = info.closed_below.max(seq);
+                }
+            }
+        }
+        self.forget_if_spent(node);
+    }
+
+    /// Drop `n` (and any ancestor left the same) from the index once it is
+    /// closed and nothing in its subtree is live.
+    fn forget_if_spent(&mut self, n: Node) {
+        let mut at = n;
+        for _ in 0..MAX_DEPTH {
+            if at == Node::SESSION {
+                return;
+            }
+            let Some(info) = self.nodes.get(&at) else {
+                return;
+            };
+            if info.open || info.live > 0 {
+                return;
+            }
+            let parent = info.parent;
+            self.nodes.remove(&at);
+            if parent == Node::INSTANCE {
+                return;
+            }
+            at = parent;
+        }
+    }
+
+    /// Count one lost record of `node` into the rollup of its nearest open
+    /// ancestor-or-self (the session's, at the root): a closed node's rollup
+    /// is already written.
+    fn count_loss(&mut self, node: Node) {
+        let mut at = node;
+        for _ in 0..MAX_DEPTH {
+            if at == Node::SESSION {
+                break;
+            }
+            if let Some(e) = self.open.iter_mut().find(|e| e.node == at) {
+                e.roll.lost = e.roll.lost.saturating_add(1);
+                return;
+            }
+            match self.nodes.get(&at).map(|i| i.parent) {
+                Some(p) if p != Node::INSTANCE => at = p,
+                _ => break,
+            }
+        }
+        self.session_roll.lost = self.session_roll.lost.saturating_add(1);
+    }
+
+    /// THE EVICTION BATCH (§5.1): classify every live record but the newest
+    /// ([`evict_class`]) and take victims, oldest first within each class, in
+    /// policy order until the ring is at its low-water mark ([`low_water`]):
+    /// closed detail, the opens of closed runs and turns, closes while those
+    /// pass half the budget ([`closes_over_half`]), current detail, then the
+    /// remaining closes. Never a pinned record, never the newest, never a
+    /// close whose subtree holds the newest (a close outlives its detail).
+    /// Each victim is counted into the log's `lost` and its nearest open
+    /// node's rollup. One pass to classify and one to rebuild: a full ring of
+    /// 2048 records pays it once per eighth of its budget, and a ring that
+    /// holds only its open path (no victim to take) is at most the open path
+    /// plus one record long. While a journal writer follows the log
+    /// ([`Log::note_journaled`]), the policy runs over the records it has
+    /// taken before the ones it has not.
+    fn evict_batch(&mut self) {
+        let n = self.ring.len();
+        if n <= 1 {
+            return;
+        }
+        let lim = self.effective_limits();
+        let low = low_water(lim);
+        // The newest record's node and its ancestors: their closes stay.
+        let newest = self.ring.back().map(|e| e.rec.node);
+        let shelter: Vec<Node> = newest.map(|nd| self.chain(nd)).unwrap_or_default();
+        // While an update's carry stands, its records stay: a reader may be
+        // shown them, and the successor continues them.
+        let frozen = self.read_fence().unwrap_or(0);
+        let mut buckets: [Vec<usize>; 4] = Default::default();
+        for (i, e) in self.ring.iter().enumerate().take(n - 1) {
+            if e.rec.seq <= frozen {
+                continue;
+            }
+            let class = evict_class(&e.rec, |nd| self.view(nd));
+            let slot = match class {
+                EvictClass::ClosedDetail => 0,
+                EvictClass::ClosedOpen => 1,
+                EvictClass::CloseRecord if !shelter.contains(&e.rec.node) => 2,
+                EvictClass::OpenDetail => 3,
+                EvictClass::CloseRecord | EvictClass::Pinned => continue,
+            };
+            buckets[slot].push(i);
+        }
+        let mut victim = vec![false; n];
+        let (mut len, mut bytes) = (n, self.bytes);
+        let (mut closes, mut close_bytes) = (self.close_count, self.close_bytes);
+        let entry_bytes: Vec<usize> = self.ring.iter().map(|e| e.bytes).collect();
+        let seqs: Vec<u64> = self.ring.iter().map(|e| e.rec.seq).collect();
+        let reached = |len: usize, bytes: usize| !over_limits(len, bytes, low);
+        // While a journal writer follows this log, the policy runs first over
+        // the records it has taken, then over the rest (`note_journaled`);
+        // without one, once over everything.
+        let tiers: &[Option<u64>] = match self.journaled {
+            Some(j) => &[Some(j), None],
+            None => &[None],
+        };
+        'policy: for tier in tiers {
+            let open = |i: usize, victim: &[bool]| !victim[i] && tier.is_none_or(|j| seqs[i] <= j);
+            // Closed detail, then the opens of closed structure.
+            for slot in [0, 1] {
+                for &i in &buckets[slot] {
+                    if reached(len, bytes) {
+                        break 'policy;
+                    }
+                    if open(i, &victim) {
+                        victim[i] = true;
+                        len -= 1;
+                        bytes = bytes.saturating_sub(entry_bytes[i]);
+                    }
+                }
+            }
+            // Closes, only while they alone pass half the budget.
+            for &i in &buckets[2] {
+                if reached(len, bytes) || !closes_over_half(closes, close_bytes, lim) {
+                    break;
+                }
+                if open(i, &victim) {
+                    victim[i] = true;
+                    len -= 1;
+                    bytes = bytes.saturating_sub(entry_bytes[i]);
+                    closes -= 1;
+                    close_bytes = close_bytes.saturating_sub(entry_bytes[i]);
+                }
+            }
+            // Current detail, then whatever closes are left.
+            for slot in [3, 2] {
+                for &i in &buckets[slot] {
+                    if reached(len, bytes) {
+                        break 'policy;
+                    }
+                    if open(i, &victim) {
+                        victim[i] = true;
+                        len -= 1;
+                        bytes = bytes.saturating_sub(entry_bytes[i]);
+                    }
+                }
+            }
+        }
+        if !victim.iter().any(|v| *v) {
+            return;
+        }
+        let mut gone: Vec<Entry> = Vec::new();
+        let old = std::mem::take(&mut self.ring);
+        for (e, v) in old.into_iter().zip(victim) {
+            if v {
+                gone.push(e);
+            } else {
+                self.ring.push_back(e);
+            }
+        }
+        for e in gone {
+            self.evicted(&e);
+        }
+    }
+
+    /// Account for one record leaving the ring.
+    fn evicted(&mut self, e: &Entry) {
+        self.bytes = self.bytes.saturating_sub(e.bytes);
+        self.heap = self.heap.saturating_sub(entry_heap(&e.rec));
+        self.lost = self.lost.saturating_add(1);
+        self.newest_lost = self.newest_lost.max(e.rec.seq);
+        if e.rec.op == Op::Close && matches!(e.rec.node.lvl, Lvl::Run | Lvl::Turn) {
+            self.close_count = self.close_count.saturating_sub(1);
+            self.close_bytes = self.close_bytes.saturating_sub(e.bytes);
+        }
+        self.count_loss(e.rec.node);
+        self.bump_chain(e.rec.node, false);
+        self.forget_if_spent(e.rec.node);
     }
 }
 

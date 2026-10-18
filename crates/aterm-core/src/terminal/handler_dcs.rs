@@ -24,7 +24,6 @@ impl TerminalHandler<'_> {
 
         // A Sixel cut off by a parser reset (no dcs_unhook) leaves its decoder active: stop
         // it, so no stale image comes out later.
-        #[cfg(feature = "sixel")]
         if matches!(self.dcs.dcs_type, DcsType::Sixel) {
             // Frees the pixel buffer without composing the image `unhook` would return.
             self.sixel.decoder.abort();
@@ -34,15 +33,8 @@ impl TerminalHandler<'_> {
             self.dcs.dcs_type = DcsType::Decrqss;
         } else if intermediates.is_empty() && final_byte == b'q' {
             // Sixel: DCS Ps1 ; Ps2 ; Ps3 q <sixel-data> ST
-            #[cfg(feature = "sixel")]
-            {
-                self.dcs.dcs_type = DcsType::Sixel;
-                self.sixel.decoder.hook();
-            }
-            #[cfg(not(feature = "sixel"))]
-            {
-                self.dcs.dcs_type = DcsType::Unknown;
-            }
+            self.dcs.dcs_type = DcsType::Sixel;
+            self.sixel.decoder.hook();
         } else if intermediates == *b"+" && final_byte == b'q' {
             self.dcs.dcs_type = DcsType::Xtgettcap;
         } else {
@@ -69,7 +61,6 @@ impl TerminalHandler<'_> {
                     self.dcs.data.push(byte);
                 }
             }
-            #[cfg(feature = "sixel")]
             DcsType::Sixel => {
                 self.dcs.total_bytes += 1;
                 self.dcs.sequence_bytes += 1;
@@ -130,7 +121,6 @@ impl TerminalHandler<'_> {
         match self.dcs.dcs_type {
             // Accumulate the parameter string (Pt) up to 256 bytes.
             DcsType::Decrqss => self.push_dcs_data_capped(data, 256),
-            #[cfg(feature = "sixel")]
             DcsType::Sixel => {
                 // Pixel allocation is charged to the budget, sampled once per run.
                 let alloc_before = self.sixel.decoder.pixel_alloc_bytes();
@@ -167,8 +157,9 @@ impl TerminalHandler<'_> {
     }
 
     /// Finish a DCS string at ST: answer DECRQSS or XTGETTCAP, or place the Sixel image. A
-    /// string cut short by CAN/SUB (`canceled`) is discarded: no reply, no image. Then reset
-    /// DCS state and release the sequence's budget.
+    /// string cut short by CAN/SUB, or broken off by an ESC that does not begin ST
+    /// (`canceled`), is discarded: no reply, no image, as xterm answers or applies a DCS
+    /// only at ST. Then reset DCS state and release the sequence's budget.
     pub(super) fn dcs_unhook_inner(
         &mut self,
         cap: &super::super::response_capability::ResponseCapability,
@@ -177,11 +168,11 @@ impl TerminalHandler<'_> {
         match self.dcs.dcs_type {
             // A canceled query is not answered: the handback's own CAN ends
             // one its holder left torn, and the reply would reach the next
-            // holder (the shell) as typed input.
+            // holder (the shell) as typed input; and one an ESC broke off was
+            // never asked whole.
             DcsType::Decrqss if !canceled => {
                 self.handle_decrqss(cap);
             }
-            #[cfg(feature = "sixel")]
             DcsType::Sixel => {
                 if canceled {
                     // Drop the half-decoded image without a copy: a canceled control
@@ -231,5 +222,144 @@ mod tests {
         t.process(b"\x1bP+q544E");
         assert_eq!(t.manual_handback().bytes, vec![0x18]);
         assert_eq!(t.take_response(), None);
+    }
+
+    /// `bytes` fed in two reads cut at `cut`.
+    fn fed(bytes: &[u8], cut: usize) -> Terminal {
+        let mut t = Terminal::new(24, 80);
+        let (head, tail) = bytes.split_at(cut);
+        t.process(head);
+        t.process(tail);
+        t
+    }
+
+    /// A DCS is answered or applied only at ST, as xterm answers it. An ESC that
+    /// does not begin ST breaks the string off and cancels it, as CAN and SUB do,
+    /// so a DECRQSS or XTGETTCAP query is not answered (`ESC P $ q m ESC [ 0 m`
+    /// replied `ESC P 1 $ r 0 m ESC \`), and what the ESC begins runs as
+    /// anywhere. The ESC and the byte after it in two reads decide the same way.
+    #[test]
+    fn a_query_broken_off_by_an_escape_is_not_answered() {
+        for query in [&b"\x1bP$qm"[..], b"\x1bP+q544E"] {
+            for brk in [
+                &b"\x1b[5;7H"[..],
+                b"\x1b]2;t\x07\x1b[5;7H",
+                b"\x1b\x1b[5;7H",
+            ] {
+                let bytes = [query, brk].concat();
+                for cut in 0..=bytes.len() {
+                    let mut t = fed(&bytes, cut);
+                    let shown = String::from_utf8_lossy(&bytes);
+                    assert_eq!(t.take_response(), None, "{shown:?} cut {cut}: answered");
+                    let cursor = t.cursor();
+                    assert_eq!((cursor.row, cursor.col), (4, 6), "{shown:?} cut {cut}");
+                }
+            }
+            // Wrapped in a tmux passthrough that reached aterm itself: the
+            // wrapper doubles the query's own ST into `ESC ESC \`.
+            let bytes = [&b"\x1bPtmux;\x1b"[..], query, &b"\x1b\x1b\\\x1b\\"[..]].concat();
+            for cut in 0..=bytes.len() {
+                let shown = String::from_utf8_lossy(&bytes);
+                assert_eq!(
+                    fed(&bytes, cut).take_response(),
+                    None,
+                    "{shown:?} cut {cut}"
+                );
+            }
+        }
+    }
+
+    /// Negative control: ST ends a query complete however it is cut, the ESC in
+    /// one read and the `\` in the next included, and so does the 8-bit ST.
+    #[test]
+    fn a_query_ended_at_st_is_answered_however_it_is_cut() {
+        for (query, reply) in [
+            (&b"\x1bP$qm"[..], &b"\x1bP1$r0m\x1b\\"[..]),
+            (b"\x1bP+q544E", b"\x1bP1+r544E="),
+        ] {
+            for st in [&b"\x1b\\"[..], b"\x9c"] {
+                let bytes = [query, st].concat();
+                for cut in 0..=bytes.len() {
+                    let response = fed(&bytes, cut).take_response();
+                    assert!(
+                        response.as_deref().is_some_and(|r| r.starts_with(reply)),
+                        "{:?} cut {cut}: {response:?}",
+                        String::from_utf8_lossy(&bytes)
+                    );
+                }
+            }
+        }
+    }
+
+    /// The strings the engine consumes and ignores (tmux passthrough, tmux control
+    /// mode, the SSH conductor, DECDLD, a kitty remote-control command, the DCS
+    /// synchronized-update pair) end with nothing at ST or broken off alike, and
+    /// what breaks one off runs: a tmux passthrough wrapper's doubled ESC still
+    /// breaks into its inner OSC. An inner DCS's own ST is doubled too
+    /// (`ESC ESC \`), so a query wrapped that way is broken off, not answered.
+    #[test]
+    fn a_consumed_string_broken_off_runs_what_breaks_it_off() {
+        let heads: [&[u8]; 6] = [
+            b"\x1bPtmux;",
+            b"\x1bP1000p%begin 1 1 0\n",
+            b"\x1bP2000pabc",
+            b"\x1bP1;1{ @???",
+            b"\x1bP@kitty-cmd{",
+            b"\x1bP=1s",
+        ];
+        for head in heads {
+            let bytes = [head, &b"\x1b\x1b]2;inner\x07\x1b\\after"[..]].concat();
+            for cut in 0..=bytes.len() {
+                let mut t = fed(&bytes, cut);
+                let shown = String::from_utf8_lossy(&bytes);
+                assert_eq!(t.title(), "inner", "{shown:?} cut {cut}");
+                assert_eq!(
+                    t.row_text(0).as_deref().map(str::trim_end),
+                    Some("after"),
+                    "{shown:?} cut {cut}"
+                );
+                assert_eq!(t.take_response(), None, "{shown:?} cut {cut}");
+            }
+        }
+    }
+
+    /// A query torn at the ESC that may begin its ST is still open: the handback's
+    /// `CAN` ends it, and it is not answered.
+    #[test]
+    fn a_handback_does_not_answer_a_query_torn_at_its_escape() {
+        for query in [&b"\x1b[1m\x1bP$qm\x1b"[..], b"\x1bP+q544E\x1b"] {
+            let mut t = Terminal::new(24, 80);
+            t.process(query);
+            assert_eq!(t.manual_handback().bytes, vec![0x18], "{query:?}");
+            assert_eq!(t.take_response(), None, "{query:?}");
+        }
+    }
+
+    /// The cells carrying an inline image.
+    fn image_cells(t: &Terminal) -> usize {
+        let grid = t.grid();
+        (0..grid.rows())
+            .flat_map(|r| (0..grid.cols()).map(move |c| (r, c)))
+            .filter(|&(r, c)| grid.cell_extra(r, c).is_some_and(|e| e.image().is_some()))
+            .count()
+    }
+
+    /// A sixel is placed only at ST: one broken off by an ESC is dropped, as one
+    /// CAN or SUB cancels is. Negative control: ST places it, however it is cut.
+    #[test]
+    fn a_sixel_broken_off_by_an_escape_is_not_placed() {
+        let sixel = b"\x1bPq#0;2;100;0;0#0~~~~~~-~~~~~~";
+        for brk in [&b"\x1b[5;7H"[..], b"\x1b\x1b\\"] {
+            let bytes = [&sixel[..], brk].concat();
+            for cut in 0..=bytes.len() {
+                assert_eq!(image_cells(&fed(&bytes, cut)), 0, "{brk:?} cut {cut}");
+            }
+        }
+        for st in [&b"\x1b\\"[..], b"\x9c"] {
+            let bytes = [&sixel[..], st].concat();
+            for cut in 0..=bytes.len() {
+                assert!(image_cells(&fed(&bytes, cut)) > 0, "{st:?} cut {cut}");
+            }
+        }
     }
 }

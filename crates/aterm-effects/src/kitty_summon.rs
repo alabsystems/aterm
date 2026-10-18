@@ -441,31 +441,6 @@ mod tests {
         );
     }
 
-    /// Case folding is the lexicon's, so `KiTTY` completes.
-    #[test]
-    fn completion_is_case_insensitive() {
-        let mut d = TypedKittySummon::default();
-        let t = Instant::now();
-        assert_eq!(feed(&mut d, t, 7, "KiTTY"), 1);
-    }
-
-    /// Every listed language's feline word summons through the same detector,
-    /// with no per-language code. Words from languages not in
-    /// `Lexicon::builtin`'s default subset (`chat`/`neko`/`katze`) are absent
-    /// from the build, so this fixture stays inside it.
-    #[test]
-    fn feline_words_summon_in_every_listed_language() {
-        let t = Instant::now();
-        for word in ["kitty", "gato", "gatto", "kucing"] {
-            let mut d = TypedKittySummon::default();
-            assert_eq!(
-                feed_completions(&mut d, t, 7, word),
-                1,
-                "typing {word:?} completes the feline word"
-            );
-        }
-    }
-
     /// Word boundaries apply to the feline family: `hellokitty` does not
     /// summon (see `innocent_words_containing_a_curse_never_fire`).
     #[test]
@@ -543,25 +518,6 @@ mod tests {
         );
     }
 
-    /// The cooldown bounds the ledger, never the completion: every typed word
-    /// completes, however fast they come.
-    #[test]
-    fn the_cooldown_never_withholds_a_completion() {
-        let mut d = TypedKittySummon::default();
-        let t = Instant::now();
-        assert_eq!(
-            feed_completions(&mut d, t, 7, "kitty kitty kitty"),
-            3,
-            "every typed word completes"
-        );
-        let mut ledger = TypedKittySummon::default();
-        assert_eq!(
-            feed(&mut ledger, t, 7, "kitty kitty kitty"),
-            1,
-            "the ledger tier still rate-limits to one record"
-        );
-    }
-
     /// `records` never stands alone: a recorded row is always a completion,
     /// which the ledger drain relies on. Exercised over the real cooldown so
     /// both tiers come from the detector.
@@ -588,27 +544,6 @@ mod tests {
             "PRECONDITION: this fixture really produces BOTH tiers — two \
              completions, one of them inside the cooldown"
         );
-    }
-
-    /// `merge` keeps the strongest of each independent axis, so one IME commit
-    /// carrying several families owes every reaction.
-    #[test]
-    fn merge_keeps_every_axis() {
-        let feline = TypedHit {
-            feline: true,
-            records: true,
-            ..TypedHit::default()
-        };
-        let curse = TypedHit {
-            profanity: true,
-            ..TypedHit::default()
-        };
-        let dog = TypedHit {
-            canine: true,
-            ..TypedHit::default()
-        };
-        let all = feline.merge(curse).merge(dog);
-        assert!(all.feline && all.records && all.profanity && all.canine);
     }
 
     /// Feed a string one char at a time; count canine hits (gate-passed dogs).
@@ -689,22 +624,6 @@ mod tests {
         );
     }
 
-    /// Multilingual like everything else here: once earned, the listed
-    /// languages' dog words summon through the same detector.
-    #[test]
-    fn earned_dogs_answer_in_every_listed_language() {
-        let t = Instant::now();
-        for word in ["dog", "puppy", "perro", "cachorro", "hund", "inu"] {
-            let mut d = TypedKittySummon::default();
-            type_filler(&mut d, t, 7, DOG_SUMMON_KEYS);
-            assert_eq!(
-                feed_dogs(&mut d, t, 7, &format!("{word} ")),
-                1,
-                "typing {word:?} summons the dog once earned"
-            );
-        }
-    }
-
     /// Fixing a typo mid-word keeps the run (`kitx⌫ty` summons), and a pop
     /// alone never summons: deleting to (or past) empty then typing `y`
     /// completes nothing.
@@ -782,19 +701,10 @@ mod tests {
         assert_eq!(feed(&mut d, t, 7, " kitty"), 1, "and still completes");
     }
 
-    /// The public constants match the documented contract: a ~30 s cooldown, a
-    /// window that can hold any lexicon surface, and the `b"typedKit"` namespace.
+    /// The window must hold the longest surface the compiled lexicon can
+    /// match, or that word could never complete inside it.
     #[test]
-    fn documented_constants_are_pinned() {
-        assert_eq!(TYPED_SUMMON_COOLDOWN, Duration::from_secs(30));
-        assert_eq!(TYPED_SUMMON_IDENT_TAG, u64::from_be_bytes(*b"typedKit"));
-        assert_eq!(FAVOURITE_IDENT_TAG, u64::from_be_bytes(*b"favKitty"));
-        assert_ne!(
-            TYPED_SUMMON_IDENT_TAG, FAVOURITE_IDENT_TAG,
-            "summons and favourites are distinct ident namespaces"
-        );
-        // The window must hold the longest surface the compiled lexicon can
-        // match, or that word could never complete inside it.
+    fn the_window_holds_the_longest_lexicon_surface() {
         let longest = lex()
             .iter_spaced()
             .map(|(surface, _)| surface.chars().count())

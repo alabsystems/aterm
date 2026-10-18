@@ -97,36 +97,52 @@ fn cjk_row() -> Terminal {
     term
 }
 
+/// An edge on either half of a wide glyph takes the glyph whole, painted and
+/// copied alike, rather than dropping it from the copy; and the direction of
+/// the drag never shows up in either answer (anchor order is normalized before
+/// the edges widen).
 #[test]
-fn a_selection_starting_on_a_wide_glyphs_right_half_copies_what_it_paints() {
-    let mut term = cjk_row();
-    {
-        let sel = term.text_selection_mut();
-        // The drag begins on col 3 — the blank right half of 漢.
-        sel.start_selection(0, 3, SelectionSide::Left, SelectionType::Simple);
-        sel.update_selection(0, 6, SelectionSide::Right);
-        sel.complete_selection();
+fn an_edge_on_either_half_of_a_wide_glyph_takes_it_whole_in_both_directions() {
+    use SelectionSide::{Left, Right};
+    type Case = (&'static str, (u16, SelectionSide), (u16, SelectionSide));
+    let wide_tail: &[usize] = &[2, 3, 4, 5, 6];
+    let wide_head: &[usize] = &[0, 1, 2, 3];
+    let cases: [(Case, &str, &[usize]); 4] = [
+        // The drag begins on col 3, the blank right half of 漢.
+        (
+            ("start on a wide continuation", (3, Left), (6, Right)),
+            "漢字C",
+            wide_tail,
+        ),
+        // The drag stops on col 2, the lead of 漢, its right half untouched.
+        (
+            ("end on a wide lead", (0, Left), (2, Right)),
+            "AB漢",
+            wide_head,
+        ),
+        (
+            ("backwards over a continuation", (6, Right), (3, Left)),
+            "漢字C",
+            wide_tail,
+        ),
+        (
+            ("backwards ending at a lead", (2, Right), (0, Left)),
+            "AB漢",
+            wide_head,
+        ),
+    ];
+    for ((what, (start, start_side), (end, end_side)), want, cols) in cases {
+        let mut term = cjk_row();
+        {
+            let sel = term.text_selection_mut();
+            sel.start_selection(0, start, start_side, SelectionType::Simple);
+            sel.update_selection(0, end, end_side);
+            sel.complete_selection();
+        }
+        assert_paint_and_copy_agree(&mut term, 3, 20, 0, what);
+        assert_eq!(term.selection_to_string().as_deref(), Some(want), "{what}");
+        assert_eq!(painted_cols(&mut term, 3, 20, 0), cols, "{what}");
     }
-    assert_paint_and_copy_agree(&mut term, 3, 20, 0, "start on a wide continuation");
-    // Which way they agree is itself the contract: the glyph the edge landed
-    // inside joins the selection whole, rather than being dropped from the copy.
-    assert_eq!(term.selection_to_string().as_deref(), Some("漢字C"));
-    assert_eq!(painted_cols(&mut term, 3, 20, 0), vec![2, 3, 4, 5, 6]);
-}
-
-#[test]
-fn a_selection_ending_on_a_wide_glyphs_left_half_copies_what_it_paints() {
-    let mut term = cjk_row();
-    {
-        let sel = term.text_selection_mut();
-        // The drag stops on col 2 — the lead of 漢, its right half untouched.
-        sel.start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
-        sel.update_selection(0, 2, SelectionSide::Right);
-        sel.complete_selection();
-    }
-    assert_paint_and_copy_agree(&mut term, 3, 20, 0, "end on a wide lead");
-    assert_eq!(term.selection_to_string().as_deref(), Some("AB漢"));
-    assert_eq!(painted_cols(&mut term, 3, 20, 0), vec![0, 1, 2, 3]);
 }
 
 #[test]
@@ -150,33 +166,6 @@ fn a_drag_that_halts_between_the_halves_of_a_glyph_agrees_on_both_sides() {
         sel.complete_selection();
     }
     assert_paint_and_copy_agree(&mut term, 3, 20, 0, "start at the glyph's midpoint");
-}
-
-#[test]
-fn a_backwards_drag_over_a_wide_glyph_agrees_exactly_as_a_forwards_one_does() {
-    let mut term = cjk_row();
-    {
-        let sel = term.text_selection_mut();
-        // Same two edges, anchored in the opposite order (pointer moving left).
-        sel.start_selection(0, 6, SelectionSide::Right, SelectionType::Simple);
-        sel.update_selection(0, 3, SelectionSide::Left);
-        sel.complete_selection();
-    }
-    assert_paint_and_copy_agree(&mut term, 3, 20, 0, "backwards over a wide continuation");
-    assert_eq!(term.selection_to_string().as_deref(), Some("漢字C"));
-
-    {
-        let sel = term.text_selection_mut();
-        sel.start_selection(0, 2, SelectionSide::Right, SelectionType::Simple);
-        sel.update_selection(0, 0, SelectionSide::Left);
-        sel.complete_selection();
-    }
-    assert_paint_and_copy_agree(&mut term, 3, 20, 0, "backwards ending at a wide lead");
-    // The same span the forward drag produced: anchor order is normalized away
-    // before the edges widen, so the direction of the pointer never shows up in
-    // either answer.
-    assert_eq!(term.selection_to_string().as_deref(), Some("AB漢"));
-    assert_eq!(painted_cols(&mut term, 3, 20, 0), vec![0, 1, 2, 3]);
 }
 
 #[test]

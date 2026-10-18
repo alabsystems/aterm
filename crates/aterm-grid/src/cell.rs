@@ -40,15 +40,14 @@
 //!
 //! - Exhaustive tests: `cell_tests.rs`
 //!   (`cell_packing_is_lossless_over_every_input`: every char, every visual
-//!   flag set, every indexed colour pair, every overflow index and StyleId).
+//!   flag set, every indexed colour pair and every overflow index).
 //! - Compile-time assert: `size_of::<Cell>() == 8`
 
 pub use super::cell_colors::{PackedColor, PackedColors};
 pub use super::cell_flags::CellFlags;
-use super::style::StyleId;
 
 // Constructors (from_ascii_fast, from_ascii_styled, new, with_style,
-// with_overflow_index, with_style_id, from_ascii_with_style_id) and color
+// with_overflow_index) and color
 // conversion helpers are in cell_constructors.rs.
 
 /// A single terminal cell (8 bytes). See module docs for layout details.
@@ -157,8 +156,7 @@ impl Cell {
     }
 
     // Constructors in cell_constructors.rs: from_ascii_fast, from_ascii_styled,
-    // new, with_style, convert_colors, convert_legacy_colors, with_overflow_index,
-    // with_style_id, from_ascii_with_style_id.
+    // new, with_style, convert_colors, convert_legacy_colors, with_overflow_index.
 
     /// Get the raw char_data value.
     ///
@@ -229,50 +227,6 @@ impl Cell {
     #[inline]
     pub const fn colors(&self) -> PackedColors {
         self.colors
-    }
-
-    /// Check if this cell uses StyleId instead of inline colors.
-    ///
-    /// When true, use `style_id()` to get the StyleId and look up
-    /// colors/attributes from the StyleTable.
-    #[must_use]
-    #[inline]
-    pub const fn uses_style_id(&self) -> bool {
-        // Copy from packed struct to avoid unaligned access
-        let flags = self.flags;
-        flags.uses_style_id()
-    }
-
-    /// Get the StyleId (only valid when `uses_style_id()` is true).
-    ///
-    /// The StyleId is stored in the low 16 bits of the colors field.
-    /// Use this to look up the actual style from the StyleTable.
-    #[must_use]
-    #[inline]
-    #[allow(
-        clippy::trivially_copy_pass_by_ref,
-        reason = "consistent &self API; Cell is exactly 8 bytes (at threshold limit)"
-    )]
-    pub const fn style_id(&self) -> StyleId {
-        // Copy from packed struct to avoid unaligned access
-        let colors = self.colors;
-        #[allow(
-            clippy::cast_possible_truncation,
-            reason = "mask 0xFFFF guarantees value fits in u16"
-        )]
-        StyleId::new((colors.0 & 0xFFFF) as u16)
-    }
-
-    /// Get the StyleId if this cell uses style interning, otherwise None.
-    #[cfg(test)]
-    #[must_use]
-    #[inline]
-    pub const fn style_id_opt(&self) -> Option<StyleId> {
-        if self.uses_style_id() {
-            Some(self.style_id())
-        } else {
-            None
-        }
     }
 
     /// Set the character (BMP only, use overflow for non-BMP).

@@ -28,7 +28,9 @@
 //! [`aterm_core::terminal::Terminal::manual_handback`]: the handback's own
 //! byte plan without its evidence gate (a torn sequence gets `CAN`; every
 //! program-negotiable mode goes back to its host target; an open OSC 8 link
-//! is closed), never clearing the screen or the scrollback.
+//! is closed; the theme colours a program set — palette, fg/bg/cursor/
+//! selection — go back through OSC 104/110-119, `reverted=…,colors`, the
+//! colour stack kept), never clearing the screen or the scrollback.
 //!
 //! # Where it runs — in the byte stream, like the handback
 //!
@@ -73,7 +75,9 @@
 //! not built). Elsewhere nothing is flushed and the reply says `discarded=-`.
 
 use std::sync::Arc;
-use std::sync::mpsc::{RecvTimeoutError, SyncSender, TrySendError};
+#[cfg(unix)]
+use std::sync::mpsc::TrySendError;
+use std::sync::mpsc::{RecvTimeoutError, SyncSender};
 use std::time::Duration;
 
 use aterm_core::terminal::Terminal;
@@ -257,6 +261,10 @@ pub(crate) fn request(
 
 /// What [`ResetLane::offer`] did with a request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(unix),
+    expect(dead_code, reason = "only a unix reader takes a reset off the lane")
+)]
 pub(crate) enum LaneOffer {
     /// On the parse stage's channel.
     Queued,
@@ -309,6 +317,21 @@ impl ResetLane {
         if slot.as_ref().is_some_and(|(g, _)| *g == generation) {
             *slot = None;
         }
+    }
+
+    /// Nudge the parse stage to bring the session's crash-restore journal up to
+    /// date (`crate::crash_restore`): a host resize or settings change that no
+    /// output will follow is recorded, or keyframed, now. The lane is the reader's
+    /// own channel, so the nudge needs no lane of its own nor a second generation
+    /// stamp: it rides the sender this lane already holds, and goes when the reader
+    /// does. Never blocks; `false` when no reader is attached (its next hold catches
+    /// up, and the header word the caller stored meanwhile counts what a crash would
+    /// miss) or its queue is full (a batch is queued, whose hold catches up first).
+    #[cfg(unix)]
+    pub(crate) fn nudge(&self) -> bool {
+        let slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        slot.as_ref()
+            .is_some_and(|(_, tx)| tx.try_send(crate::spawn::GatherMsg::Journal).is_ok())
     }
 
     /// Offer `req` to the parse stage without blocking (the main thread calls

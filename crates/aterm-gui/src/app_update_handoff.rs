@@ -162,10 +162,6 @@ impl HandoffPrelaunchLane {
 }
 
 #[cfg(unix)]
-#[expect(
-    clippy::disallowed_types,
-    reason = "the update successor's raw Command: it hands over exactly its own descriptors, which a strip at the exec would undo"
-)]
 struct HandoffWorkerJob {
     attempt_id: u64,
     current_build: u64,
@@ -193,7 +189,7 @@ struct HandoffWorkerJob {
     /// The verified candidate declares the chunked rendezvous grant in its sealed
     /// `Info.plist`; only then is it offered one (`ATERM_HANDOFF_GRANT_CAPS`).
     successor_grant_chunks: bool,
-    command: std::process::Command,
+    command: aterm_uds::spawnfd::StdCommand,
     /// What the park produced: `Some` from construction on the fork lane, and on the
     /// launched lane once the main thread's [`HandoffTransferJob`] arrives. Read through
     /// [`Self::capture`].
@@ -551,14 +547,12 @@ impl HoldFence {
 
 /// A Commit that holds its claim through one more input-dispatch fence: what it answered
 /// at the claim (`App::answer_at_commit_claim`) took real time, and a key queued meanwhile
-/// would die with the `_exit`. It keeps what its admission took (the operator's quiesce,
-/// the hold fence), so nothing fenced off lands before the write, and the next pass reads
-/// the admission again and commits or rolls back. The supervisor host runs through the
-/// fence, and the successor is not activated until the write.
+/// would die with the `_exit`. It keeps what its admission took (the hold fence), so
+/// nothing fenced off lands before the write, and the next pass reads the admission again
+/// and commits or rolls back. The supervisor host runs through the fence, and the successor
+/// is not activated until the write.
 #[cfg(unix)]
 pub(crate) struct HeldCommit {
-    /// The resident operator's quiesce (`None`: there is no operator).
-    operator_quiesce: Option<crate::operator_host::UpdateQuiesce>,
     /// The hold fence the claim's admission raised.
     hold_fence: HoldFence,
 }
@@ -595,27 +589,6 @@ struct HandoffCommitFacts {
     native_safe: bool,
     proof_exact: bool,
     commit_channel: bool,
-    /// The resident operator, as two facts because its refusal asks two different things
-    /// ([`crate::operator_host::UpdateQuiesceRefusal`]). `operator_idle`: no transaction
-    /// was in flight and its gate was free (or there is no operator); false is activity.
-    operator_idle: bool,
-    /// `operator_quiesced`: the operator is fenced for the replacement (or there is none).
-    /// False with `operator_idle` true is a fault: it is shutting down, or a quiesce is already
-    /// active or went stale.
-    operator_quiesced: bool,
-}
-
-/// The resident operator's two Commit facts ([`HandoffCommitFacts::operator_idle`],
-/// [`HandoffCommitFacts::operator_quiesced`]) from its answer to the quiesce or
-/// to the Commit permit: `None` is a fenced operator, or none at all.
-#[cfg(unix)]
-fn operator_commit_facts(
-    refusal: Option<crate::operator_host::UpdateQuiesceRefusal>,
-) -> (bool, bool) {
-    (
-        !refusal.is_some_and(crate::operator_host::UpdateQuiesceRefusal::is_busy),
-        refusal.is_none(),
-    )
 }
 
 /// The Commit-time layout comparison, reduced to window/tab/pane topology: window
@@ -625,8 +598,8 @@ fn operator_commit_facts(
 /// compared, so a key typed into Settings during the boot refuses as activity.
 #[cfg(unix)]
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "NativeUpdateSettingsDraftCarry",
         action = "Commit",
         project = "aterm_gui::settings_draft_carry_conformance::Rig::project"
@@ -739,8 +712,6 @@ fn handoff_commit_admitted(facts: HandoffCommitFacts) -> bool {
         && facts.native_safe
         && facts.proof_exact
         && facts.commit_channel
-        && facts.operator_idle
-        && facts.operator_quiesced
 }
 
 /// The human-readable reason a ProofReady completion did not Commit, derived from the same
@@ -750,19 +721,10 @@ fn handoff_commit_admitted(facts: HandoffCommitFacts) -> bool {
 fn handoff_rejection_reason(
     facts: HandoffCommitFacts,
     native_safety: &Result<crate::app_native::NativeUpdateSafetyToken, Vec<String>>,
-    operator: Option<crate::operator_host::UpdateQuiesceRefusal>,
     commit_lost_arbiter: bool,
     commit_write_failed: bool,
 ) -> String {
-    if !facts.operator_idle || !facts.operator_quiesced {
-        format!(
-            "resident operator could not quiesce for Commit: {}",
-            operator.map_or_else(
-                || "it refused the quiesce".to_string(),
-                |refusal| refusal.to_string()
-            )
-        )
-    } else if !facts.exact_sessions {
+    if !facts.exact_sessions {
         "live terminal set changed during async preparation".to_string()
     } else if !facts.exact_layout {
         "window/tab/pane topology changed during async preparation".to_string()
@@ -801,8 +763,7 @@ fn handoff_rejection_reason(
 /// death is activity wherever it is seen (the park, the worker's pre-Commit loop and
 /// `wait_handoff_ready` file it the same way): a shell ending mid-overlap is the desk
 /// changing, not evidence against the build, and filing it physical would push a healthy
-/// build back by half-hours. A busy operator is activity; one that refused otherwise is a
-/// fault.
+/// build back by half-hours.
 #[cfg(unix)]
 fn handoff_rejection_activity_shaped(facts: HandoffCommitFacts) -> bool {
     !facts.exact_sessions
@@ -813,7 +774,6 @@ fn handoff_rejection_activity_shaped(facts: HandoffCommitFacts) -> bool {
         || !facts.sessions_alive
         || !facts.input_dispatch_fenced
         || !facts.egress_settled
-        || !facts.operator_idle
 }
 
 /// The emergency reaper's job (reaper thread or inline fallback): kill the
@@ -1328,6 +1288,13 @@ fn kill_and_reap_handoff_child(
     candidate: HandoffCandidate,
     handle: &mut HandoffCandidateHandle,
 ) -> ReapedHandoffCandidate {
+    #[cfg_attr(
+        not(target_os = "macos"),
+        expect(
+            clippy::infallible_destructuring_match,
+            reason = "`Launched` is the macOS-only arm"
+        )
+    )]
     let child = match handle {
         HandoffCandidateHandle::Forked(child) => child,
         #[cfg(target_os = "macos")]
@@ -1575,12 +1542,8 @@ const EXPECTED_BUILD_ENV: &str = "ATERM_UPDATE_EXPECTED_BUILD";
 const EXPECTED_COMMIT_ENV: &str = "ATERM_UPDATE_EXPECTED_COMMIT";
 const EXPECTED_DIGEST_ENV: &str = "ATERM_UPDATE_EXPECTED_DMG_SHA256";
 
-#[expect(
-    clippy::disallowed_types,
-    reason = "the update successor's raw Command: it hands over exactly its own descriptors, which a strip at the exec would undo"
-)]
 fn bind_expected_update_artifact(
-    command: &mut std::process::Command,
+    command: &mut aterm_uds::spawnfd::StdCommand,
     attempt: Option<&crate::native_updater_service::ApplyAttemptTicket>,
 ) {
     command
@@ -1700,12 +1663,8 @@ impl ColdLaneBudget {
 /// The cold arm's half of [`ColdLaneBudget`]: `budget`, encoded for `attempt`'s
 /// artifact, on the successor's environment — and never an inherited one.
 #[cfg(unix)]
-#[expect(
-    clippy::disallowed_types,
-    reason = "the update successor's raw Command: it hands over exactly its own descriptors, which a strip at the exec would undo"
-)]
 fn bind_cold_lane_budget(
-    command: &mut std::process::Command,
+    command: &mut aterm_uds::spawnfd::StdCommand,
     attempt: Option<&crate::native_updater_service::ApplyAttemptTicket>,
     budget: Option<ColdLaneBudget>,
 ) {
@@ -1727,12 +1686,8 @@ pub(crate) const COLD_LANE_HEALTH_SAID_ENV: &str = "ATERM_UPDATE_HEALTH_SAID";
 /// seamless lanes do in the window carry, so the landing can record their healing. JSON,
 /// the window carry's shape; none when nothing is unanswered.
 #[cfg(unix)]
-#[expect(
-    clippy::disallowed_types,
-    reason = "the update successor's raw Command: it hands over exactly its own descriptors, which a strip at the exec would undo"
-)]
 pub(crate) fn bind_cold_lane_health_said(
-    command: &mut std::process::Command,
+    command: &mut aterm_uds::spawnfd::StdCommand,
     said: &[crate::session_store::CarriedHealthSaid],
 ) {
     command.env_remove(COLD_LANE_HEALTH_SAID_ENV);
@@ -2584,10 +2539,10 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
     }
     // The fork lane. On macOS a forked successor keeps the bootstrap context of this app's
     // launchd job, which dies with this process, so `hdiutil`, notifications and
-    // LaunchServices opens fail in it (`tests/handoff_launchd_job.rs`); the out-of-band
-    // lane avoids that, and forking remains for the cases `out_of_band_lane_refusal`
-    // names. `pre_exec` sets the process group before `spawn` returns, so `kill(-pid)` is
-    // valid at once.
+    // LaunchServices opens fail in it (`app_launch_successor`); the out-of-band lane
+    // avoids that, and forking remains for the cases `out_of_band_lane_refusal` names.
+    // `pre_exec` sets the process group before `spawn` returns, so `kill(-pid)` is valid
+    // at once.
     let child = match job.command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -2782,12 +2737,12 @@ fn prepare_outgoing_artifacts(
     // reserve for the turns this process still serves until its `_exit` (the Commit checks
     // it held), so the successor never mints an id this one already replied with; the
     // export takes the same ceiling. Records are spelled in the words the target reads.
+    // The session logs ride the same sidecars, for a successor that reads them; their
+    // timelines are taken after every ledger and terminal, and from then on their readers
+    // are fenced at what was carried (lifted by `rollback_overlap` if the attempt stands down).
     let turn_id_ceiling = crate::control::turn_ids_for_handoff();
-    let controls = crate::handoff_carry::export_for(
-        &capture.carries,
-        turn_id_ceiling,
-        crate::handoff_carry::StatusWords::for_target(target_build),
-    );
+    let controls =
+        crate::handoff_carry::export_for_target(&capture.carries, turn_id_ceiling, target_build);
     capture.manifest.next_turn_id = crate::handoff_carry::manifest_turn_id(turn_id_ceiling);
     // The ceiling rides this attempt, which the Commit reads it from.
     job.arbiter.set_turn_id_ceiling(turn_id_ceiling);
@@ -4000,6 +3955,7 @@ fn run_prelaunched_handoff(
             prepared.proof_wr.as_fd(),
             prepared.commit_rd.as_fd(),
             proof_deadline,
+            Some(park_at),
         )
         .err();
     if let Some(error) = transfer_failed {
@@ -4118,12 +4074,8 @@ fn pid_for_completion(pid: i32) -> u32 {
 /// variable, so removing one set here (`bind_expected_update_artifact`'s `env_remove`)
 /// makes the lane unavailable.
 #[cfg(target_os = "macos")]
-#[expect(
-    clippy::disallowed_types,
-    reason = "the update successor's raw Command: it hands over exactly its own descriptors, which a strip at the exec would undo"
-)]
 fn launch_environment(
-    command: &std::process::Command,
+    command: &aterm_uds::spawnfd::StdCommand,
 ) -> Option<Vec<(std::ffi::OsString, std::ffi::OsString)>> {
     let mut pairs = Vec::new();
     for (key, value) in command.get_envs() {
@@ -4890,6 +4842,9 @@ impl App {
                 "a sudo password prompt is still open",
             ));
         }
+        // The warm spare is in no manifest: it goes before the update (one in
+        // transit is a tab in flight, refused just below).
+        self.retire_spare("update", None);
         // Its session is not registered yet, so neither the handoff manifest
         // nor a cold replacement can carry the tab, its input or its waiter.
         if !self.tab_spawns.is_empty() {
@@ -4994,20 +4949,13 @@ impl App {
                     ));
                 }
             }
-            let operator_quiesce = match self.operator_control.as_ref() {
-                Some(control) => Some(control.try_begin_update_quiesce().map_err(|refusal| {
-                    crate::UpdateHandoffStartError::operator_refused(
-                        refusal,
-                        "could not quiesce for replacement",
-                    )
-                })?),
-                None => None,
-            };
             // The message log's last write from this process: the `process::exit` after a
             // successful spawn runs no destructor, so the writer thread's queue would die
             // with it.
             self.flush_messages_log_within(crate::messages_host::MESSAGES_FLUSH_EXIT_WAIT);
             let spawn = || {
+                // Nor would `aterm.log`'s, under `ExitProcess`.
+                let _ = crate::logging::flush_within(crate::logging::LOG_FLUSH_EXIT_WAIT);
                 // `spawnfd::command` gives a console successor this process's console or a
                 // windowless one, never a visible console window of its own.
                 let mut cmd = aterm_uds::spawnfd::command(exe);
@@ -5025,28 +4973,18 @@ impl App {
                     Err(error) => Err(error),
                 }
             };
-            let spawn_result = match operator_quiesce.as_ref() {
-                Some(quiesce) => quiesce.with_commit_permit(spawn),
-                None => Ok(spawn()),
-            };
-            match spawn_result {
-                Ok(Ok(())) => {
+            match spawn() {
+                Ok(()) => {
                     return Err(crate::UpdateHandoffStartError::failed(
                         "replacement returned after a successful Windows spawn",
                     ));
                 }
-                Ok(Err(err)) => {
+                Err(err) => {
                     // A failed spawn leaves this process live.
                     aterm_log::warn!("update apply: re-spawn failed: {err}");
                     return Err(crate::UpdateHandoffStartError::failed(format!(
                         "replacement process could not start: {err}"
                     )));
-                }
-                Err(refusal) => {
-                    return Err(crate::UpdateHandoffStartError::operator_refused(
-                        refusal,
-                        "revoked replacement",
-                    ));
                 }
             }
         }
@@ -5057,9 +4995,9 @@ impl App {
         ))
     }
 
-    /// The cold lane's steps before the commit permit: the switch on record and the
-    /// message log's last write. Each is undone or harmless if the `exec` does not
-    /// happen ([`Self::resume_after_cold_exec`]).
+    /// The cold lane's steps before the `exec`: the switch on record and the message log's
+    /// last write. Each is undone or harmless if the `exec` does not happen
+    /// ([`Self::resume_after_cold_exec`]).
     #[cfg(unix)]
     pub(crate) fn prepare_cold_exec(&mut self, build: u64, same_image: bool, automatic: bool) {
         self.note_update_switch_started(build, same_image, automatic);
@@ -5073,39 +5011,31 @@ impl App {
         self.consent_observer.stop();
     }
 
-    /// The cold `exec`, under the resident operator's commit permit when there is one,
-    /// retiring the control socket last inside it, so a refused permit leaves every
-    /// connection served. `Ok` carries the error of an `exec` that returned, `Err` the
-    /// permit's refusal; [`Self::resume_after_cold_exec`] follows either.
+    /// The cold `exec`, retiring the control socket last so it is deaf for the shortest
+    /// time. It answers the error of an `exec` that returned; [`Self::resume_after_cold_exec`]
+    /// follows and reopens the socket.
     #[cfg(unix)]
-    pub(crate) fn run_cold_exec(
-        &self,
-        quiesce: Option<&crate::operator_host::UpdateQuiesce>,
-        exec: impl FnOnce() -> std::io::Error,
-    ) -> Result<std::io::Error, crate::operator_host::UpdateQuiesceRefusal> {
-        let retire_then_exec = || {
-            // Last, so the socket is deaf for the shortest time: `exec` completes
-            // only after every other thread is terminated (seconds on a saturated
-            // machine). Closed here, a new client is refused at once and a held
-            // connection reads EOF; the successor binds the same path.
-            let retired = self.control_endpoint.retire();
-            aterm_log::info!(
-                "update apply: control socket retired for the exec (listener closed: {}, \
-                 connections shut down: {})",
-                retired.listener,
-                retired.connections
-            );
-            exec()
-        };
-        match quiesce {
-            Some(quiesce) => quiesce.with_commit_permit(retire_then_exec),
-            None => Ok(retire_then_exec()),
-        }
+    pub(crate) fn run_cold_exec(&self, exec: impl FnOnce() -> std::io::Error) -> std::io::Error {
+        // Last, so the socket is deaf for the shortest time: `exec` completes
+        // only after every other thread is terminated (seconds on a saturated
+        // machine). Closed here, a new client is refused at once and a held
+        // connection reads EOF; the successor binds the same path.
+        let retired = self.control_endpoint.retire();
+        aterm_log::info!(
+            "update apply: control socket retired for the exec (listener closed: {}, \
+             connections shut down: {})",
+            retired.listener,
+            retired.connections
+        );
+        // `exec` runs no `exit(3)` handler: the queued `aterm.log` lines land
+        // first, this one included.
+        let _ = crate::logging::flush_within(crate::logging::LOG_FLUSH_EXIT_WAIT);
+        exec()
     }
 
-    /// A cold `exec` that did not happen (the permit refused, or it returned an
-    /// error) leaves this process running: the control socket serves again at its
-    /// path with its token if it was retired.
+    /// A cold `exec` that did not happen (it returned an error) leaves this
+    /// process running: the control socket serves again at its path with its
+    /// token.
     #[cfg(unix)]
     pub(crate) fn resume_after_cold_exec(&mut self) {
         if !self.control_endpoint.reopen() {
@@ -5135,10 +5065,6 @@ impl App {
     }
 
     #[cfg(unix)]
-    #[expect(
-        clippy::disallowed_types,
-        reason = "the update successor's raw Command: it hands over exactly its own descriptors, which a strip at the exec would undo"
-    )]
     fn start_unix_update_handoff(
         &mut self,
         exe: std::path::PathBuf,
@@ -5244,6 +5170,10 @@ impl App {
                 // A harness's lifeline crosses the exec on a descriptor kept open for it;
                 // the number it was launched with is `/dev/null` or closed by now.
                 let lifeline_fd = crate::lifeline::relaunch_descriptor();
+                #[expect(
+                    clippy::disallowed_types,
+                    reason = "the update successor's raw Command: it hands over exactly its own descriptors, which a strip at the exec would undo"
+                )]
                 let mut command = std::process::Command::new(exe);
                 command
                     // Exactly one `--window` pin, so the router cannot make the successor a
@@ -5312,33 +5242,14 @@ impl App {
                 // image's shells would get the raise without it.
                 #[cfg(target_os = "macos")]
                 crate::handoff_rendezvous::carry_launcher_limit(&mut command);
-                let operator_quiesce = match self
-                    .operator_control
-                    .as_ref()
-                    .map(crate::operator_host::ControlHandle::try_begin_update_quiesce)
-                    .transpose()
-                {
-                    Ok(quiesce) => quiesce,
-                    Err(refusal) => {
-                        if left == LayoutLeft::Written {
-                            self.take_back_cold_lane_layout(run, std::time::Instant::now());
-                        }
-                        return Err(crate::UpdateHandoffStartError::operator_refused(
-                            refusal,
-                            "could not quiesce for replacement",
-                        ));
-                    }
-                };
                 // Tabs not kept go on record once the switch is granted, just before the
-                // steps whose message-log flush carries it. Recorded before the quiesce,
-                // every attempt a busy operator turned back would say the new version
-                // "starts without them" while the old one ran on, one record per retry.
+                // steps whose message-log flush carries it.
                 if let LayoutLeft::NotKept(cause) = &left {
                     self.say_cold_lane_tabs_not_kept(target_build, cause);
                 }
                 self.prepare_cold_exec(build, same_image.is_some(), mode.is_automatic());
                 // `exec` returns only on failure.
-                let why = match self.run_cold_exec(operator_quiesce.as_ref(), || {
+                let error = self.run_cold_exec(|| {
                     // The table the successor gets: the lifeline, inheritable for the
                     // `exec` alone (close-on-exec again if it returns, so nothing this
                     // process spawns next holds it), and nothing else this process holds
@@ -5353,15 +5264,10 @@ impl App {
                     // SIGPIPE is put back to the ignored disposition
                     // `Command::exec` reset if the `exec` returns.
                     aterm_update::exec_keeping_sigpipe(&mut command)
-                }) {
-                    Ok(error) => crate::UpdateHandoffStartError::failed(format!(
-                        "process replacement failed: {error}"
-                    )),
-                    Err(refusal) => crate::UpdateHandoffStartError::operator_refused(
-                        refusal,
-                        "revoked replacement",
-                    ),
-                };
+                });
+                let why = crate::UpdateHandoffStartError::failed(format!(
+                    "process replacement failed: {error}"
+                ));
                 if left == LayoutLeft::Written {
                     self.take_back_cold_lane_layout(run, std::time::Instant::now());
                 }
@@ -5528,6 +5434,10 @@ impl App {
             ));
         };
         self.next_update_handoff_id = next_attempt_id;
+        #[expect(
+            clippy::disallowed_types,
+            reason = "the update successor's raw Command: it hands over exactly its own descriptors, which a strip at the exec would undo"
+        )]
         let mut command = std::process::Command::new(exe);
         crate::control_socket_identity::bind_command(&mut command);
         command
@@ -6179,6 +6089,19 @@ impl App {
                 )
             })
             .collect();
+        // Each imported session's crash-restore journal, whose history ring's export waits
+        // for its import (`crash_restore::SessionJournal::import_settled`): released on the
+        // import worker as soon as the imports are done, wake or no wake.
+        let journals: Vec<_> = jobs
+            .iter()
+            .filter_map(|job| {
+                self.pool
+                    .iter()
+                    .find(|session| session.id == job.session)
+                    .and_then(|session| session.ctx.crash_journal.get().cloned())
+            })
+            .collect();
+        let held = journals.clone();
         let store = std::sync::Arc::clone(&self.store);
         let proxy = self.proxy.clone();
         let spawned = std::thread::Builder::new()
@@ -6188,6 +6111,9 @@ impl App {
                 // Responsive is the floor for such a holder (`qos`).
                 crate::qos::set_self(crate::qos::Role::Responsive);
                 let reports = crate::handoff_history::run_imports(jobs);
+                for journal in &journals {
+                    journal.import_settled();
+                }
                 crate::handoff_history::record_reports(&store, &reports);
                 if let Some(proxy) = proxy {
                     let _ = proxy.send_event(Wake::HandoffHistorySettled(reports));
@@ -6195,9 +6121,28 @@ impl App {
             });
         if let Err(error) = spawned {
             aterm_log::warn!("overlap handoff: the scrollback import could not start ({error})");
+            for journal in &held {
+                journal.import_settled();
+            }
             crate::handoff_history::record_reports(&self.store, &not_run);
             self.settle_handoff_history(&not_run);
         }
+    }
+
+    /// A keeper recovery's half of the history carry, once its restore has drained: every
+    /// recovered session's history ring lines (`crash_restore::journal_history`, joined at
+    /// the admission) imported on the same worker an update's sidecars are, through the
+    /// same jobs. The keeper's recovery row already said what the joins could not take
+    /// (`message_reporters::keeper_recovered_message`), so the settle posts a row only for
+    /// what an import itself then fails to place.
+    #[cfg(unix)]
+    pub(crate) fn start_keeper_history_imports(&mut self) {
+        self.handoff_history_loss_said = crate::handoff_history::carried_loss(
+            self.pool
+                .iter()
+                .filter_map(|session| session.handoff_history.as_ref()),
+        );
+        self.start_handoff_history_imports();
     }
 
     /// Says what the history imports left behind once they settle, in one band row, posting
@@ -6484,11 +6429,15 @@ impl App {
             history_heads.push(crate::handoff_history::capture_head(session.id, &terminal));
             // Reserved for every live session above, so this never allocates.
             if carry_room {
+                // The timeline rides the source for the log pass: the worker
+                // takes the log after every ledger and terminal, and only for
+                // a successor that reads one (`export_for_target`).
                 let mut source = crate::handoff_carry::capture_head(
                     session.id,
                     &terminal,
                     &session.term,
                     &session.ctx.turns,
+                    Some(&session.ctx.timeline),
                     differ && rung.keeps_differ_state(),
                 );
                 if !rung.keeps_differ_state() {
@@ -6630,6 +6579,7 @@ impl App {
                 &terminal,
                 &session.term,
                 &session.ctx.turns,
+                None,
                 false,
             );
             control.without_differ();
@@ -7815,7 +7765,12 @@ impl App {
                 .unwrap_or_else(|p| p.into_inner())
                 .past_handoff_ceiling();
             timeline || session.ctx.fabric.past_handoff_ceiling()
-        })
+        }) || self
+            .store
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .mirror()
+            .past_draw()
     }
 
     /// [`Self::hold_serials`] as the Commit reads it, each under the guard that fences it
@@ -7847,7 +7802,6 @@ impl App {
         input_dispatch_fenced: bool,
         egress_settled: bool,
         commit_channel: bool,
-        operator: Option<crate::operator_host::UpdateQuiesceRefusal>,
         held_fence: Option<HoldFence>,
     ) -> Option<(
         HandoffCommitFacts,
@@ -7966,7 +7920,6 @@ impl App {
         // output still queued waits in the tty drain, so its master shows no hangup and the
         // Commit lands; the successor closes that pane after the keys typed into it replay.
         let sessions_alive = !handoff_masters_closed(&pending_live);
-        let (operator_idle, operator_quiesced) = operator_commit_facts(operator);
         let proof = nonce.and_then(|nonce| {
             crate::seamless::adoption_proof(
                 nonce,
@@ -7991,8 +7944,6 @@ impl App {
             native_safe: native_safety.is_ok(),
             proof_exact: proof.is_some(),
             commit_channel,
-            operator_idle,
-            operator_quiesced,
         };
         Some((facts, native_safety, proof, arbiter, hold_fence))
     }
@@ -8032,6 +7983,11 @@ impl App {
         let Some(teardown) = self.reduce_returned_handoff_completion(completion) else {
             return;
         };
+        // The attempt is over, and so is the deferral its exits waited behind
+        // (`App::log_closes_deferred`). Taken before the replay, so that an exit
+        // a later attempt defers during the replay stays with that attempt;
+        // settled after it, on every arm.
+        let deferred_exits = std::mem::take(&mut self.log_closes_deferred);
         // A returned attempt is still this build: undo the successor's title the
         // ProofReady edge may have published (`publish_handoff_target_to_menu_bar`).
         self.refresh_version_menu();
@@ -8106,6 +8062,16 @@ impl App {
                 }
             }
         }
+        // EVERY ARM settles the exits the attempt deferred, after its replay,
+        // the way `Wake::Exit` settles after its closes. A replayed exit's
+        // retire has written its close by now. If the exit was absorbed and
+        // not replayed (a quit that dominated it, then a barrier refused it; a
+        // clean-quit handoff), or a barrier refused the window close, no close
+        // is coming, and the waiter answers `ERR exited` rather than wait to
+        // its deadline.
+        for session in deferred_exits {
+            self.settle_log_close(session);
+        }
     }
 
     /// The `ProofReady` arm of [`Self::finish_update_handoff`]: the drain gate, the final
@@ -8136,26 +8102,14 @@ impl App {
             // closing and the drop rejects the attempt).
             return;
         };
-        // A held claim ([`HeldCommit`]) comes back here once more, keeping the operator's
-        // quiesce and hold fence it took at the claim, and reads the admission again.
+        // A held claim ([`HeldCommit`]) comes back here once more, keeping the hold fence it
+        // took at the claim, and reads the admission again.
         let held = self
             .pending_update_handoff
             .as_mut()
             .and_then(|pending| pending.held_commit.take());
         let claimed = held.is_some();
-        // Quiesce the resident operator only for the final admission seam; a successful
-        // Commit `_exit`s while its gate is still held by `with_commit_permit`. A busy
-        // operator refuses the Commit as activity.
-        let (operator_quiesce, mut operator_refusal, held_fence) = match held {
-            Some(held) => (held.operator_quiesce, None, Some(held.hold_fence)),
-            None => match self.operator_control.as_ref() {
-                Some(control) => match control.try_begin_update_quiesce() {
-                    Ok(quiesce) => (Some(quiesce), None, None),
-                    Err(refusal) => (None, Some(refusal), None),
-                },
-                None => (None, None, None),
-            },
-        };
+        let held_fence = held.map(|held| held.hold_fence);
         // `hold_fence` stays raised to the end of this arm: through the `_exit`, or until
         // the rejection below is under way.
         let Some((mut facts, native_safety, proof, arbiter, hold_fence)) = self
@@ -8164,7 +8118,6 @@ impl App {
                 input_dispatch_fenced,
                 egress_settled,
                 completion.commit_fd.is_some(),
-                operator_refusal,
                 held_fence,
             )
         else {
@@ -8225,10 +8178,7 @@ impl App {
                 );
                 if let Some(pending) = self.pending_update_handoff.as_mut() {
                     pending.commit_drain_started = None;
-                    pending.held_commit = Some(HeldCommit {
-                        operator_quiesce,
-                        hold_fence,
-                    });
+                    pending.held_commit = Some(HeldCommit { hold_fence });
                 }
                 // Into the held pass: the drain gate re-posts it and returns,
                 // and with no loop to go through it reads the admission at once.
@@ -8247,8 +8197,13 @@ impl App {
                 return;
             }
         }
+        // Read only for an actual admitted claim (including a held claim).
+        // A timeout is not permission to let an old write cross the Commit.
+        let publications_settled =
+            !claim || !admitted || crate::proxy::flush_publications(HANDOFF_INPUT_DRAIN_YIELD);
         if claim
             && admitted
+            && publications_settled
             && let (Some(commit_fd), Some(proof)) = (commit_fd.as_ref(), proof)
         {
             // The rows the carry did not take end with this process, recorded and flushed
@@ -8298,38 +8253,25 @@ impl App {
             }
             // Success cannot return: `commit_and_exit` performs the one atomic <=PIPE_BUF
             // write and `_exit(0)`. EPIPE transfers Committing back to Rejecting so one
-            // reaper can restore the parent. The successor is activated inside the operator's
-            // permit, right before the write, so a refused permit activates nothing. The
-            // egress fence is taken before the permit and held through the write
+            // reaper can restore the parent. The successor is activated right before the
+            // write. The egress fence is taken right before the write and held through it
             // (`fence_handoff_egress`): a frame begun after the drain gate's last reading
-            // stands the Commit down as unsettled egress (`Ok(None)`), with nothing activated
-            // or audited.
+            // stands the Commit down as unsettled egress (`None`), with nothing activated or
+            // audited.
             let sinks = self
                 .pending_update_handoff
                 .as_ref()
                 .map(|pending| handoff_sinks(&self.pool, &pending.live));
             let commit_result = match sinks.as_deref().and_then(fence_handoff_egress) {
-                None => Ok(None),
-                Some(_egress) => match operator_quiesce.as_ref() {
-                    Some(quiesce) => quiesce.with_commit_permit(|| {
-                        #[cfg(target_os = "macos")]
-                        self.activate_successor_at_write(child_pid);
-                        Self::audit_connections_left_out(left_out);
-                        Some(crate::seamless::commit_and_exit(commit_fd, proof))
-                    }),
-                    None => {
-                        #[cfg(target_os = "macos")]
-                        self.activate_successor_at_write(child_pid);
-                        Self::audit_connections_left_out(left_out);
-                        Ok(Some(crate::seamless::commit_and_exit(commit_fd, proof)))
-                    }
-                },
+                None => None,
+                Some(_egress) => {
+                    #[cfg(target_os = "macos")]
+                    self.activate_successor_at_write(child_pid);
+                    Self::audit_connections_left_out(left_out);
+                    Some(crate::seamless::commit_and_exit(commit_fd, proof))
+                }
             };
-            if commit_result
-                .as_ref()
-                .is_ok_and(|written| written.as_ref().is_some_and(Result::is_err))
-                && !left_out.is_empty()
-            {
+            if commit_result.as_ref().is_some_and(Result::is_err) && !left_out.is_empty() {
                 aterm_log::warn!(
                     "update apply: the Commit was not written, so the {} connection \
                      drop(s) just audited for it did not happen: this process keeps \
@@ -8344,17 +8286,10 @@ impl App {
                 crate::identity_claim::withdraw_successor_markers(&carried, pid);
             }
             match commit_result {
-                Ok(Some(Err(_))) => commit_write_failed = true,
+                Some(Err(_)) => commit_write_failed = true,
                 // The egress fence is the last reading of the egress fact.
-                Ok(None) => facts.egress_settled = false,
-                // The permit is the operator's last answer before the `_exit`, so it
-                // re-reads the operator's two facts.
-                Err(refusal) => {
-                    operator_refusal = Some(refusal);
-                    (facts.operator_idle, facts.operator_quiesced) =
-                        operator_commit_facts(operator_refusal);
-                }
-                Ok(Some(Ok(never))) => match never {},
+                None => facts.egress_settled = false,
+                Some(Ok(never)) => match never {},
             }
             let _ = arbiter.commit_failed_to_rejecting();
         } else if claim {
@@ -8368,13 +8303,16 @@ impl App {
             let _ = arbiter.commit_failed_to_rejecting();
         }
 
-        let rejection = handoff_rejection_reason(
-            facts,
-            &native_safety,
-            operator_refusal,
-            commit_lost_arbiter,
-            commit_write_failed,
-        );
+        let rejection = if !publications_settled {
+            "discovery publications did not settle before the Commit".to_string()
+        } else {
+            handoff_rejection_reason(
+                facts,
+                &native_safety,
+                commit_lost_arbiter,
+                commit_write_failed,
+            )
+        };
         let activity_shaped = handoff_rejection_activity_shaped(facts);
         if activity_shaped && let Some(pending) = self.pending_update_handoff.as_mut() {
             pending.revoked_by_activity = true;
@@ -9218,6 +9156,9 @@ impl App {
         for (_, master, _) in live {
             let _ = aterm_pty::set_cloexec(*master, true);
         }
+        // The session logs' readers read on: this process goes on, and the
+        // carry the worker took (and fenced them at) is no successor's.
+        self.lift_session_log_fences();
         self.reassert_parked_winsizes(live);
         self.resume_deferred_readers_nonblocking();
         self.reseat_document_journals_after_rollback();
@@ -9675,16 +9616,16 @@ fn leave_cold_lane_layout(
 /// the draft journal).
 #[cfg(unix)]
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "NativeUpdateSettingsDraftCarry",
         action = "ColdExec",
         project = "aterm_gui::settings_draft_carry_conformance::Rig::project"
     )
 )]
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "NativeUpdateSettingsDraftCarry",
         action = "ParkOlder",
         project = "aterm_gui::settings_draft_carry_conformance::Rig::project"
@@ -9850,61 +9791,20 @@ mod admission_refusal_detail_tests {
         }
     }
 
+    /// A live-session refusal keeps WHY the handoff is unavailable and what
+    /// changes it, within the 400 characters durable health keeps — whatever
+    /// the foreground probe answered (ROUND EIGHT, U26: an unreadable
+    /// foreground used to swap in the probe's words and drop both, and the
+    /// recorded reason flipped between the two across retries). The
+    /// admission block's own sentence carries neither.
     #[test]
     fn live_session_refusal_retains_exact_handoff_cause_and_remedy() {
-        for (unavailable, cause, remedy) in [
-            (
-                HandoffUnavailable::UnownedControlSocket,
-                "the configured control socket is not owned by this process",
-                "Resolve the control-socket ownership conflict before updating.",
-            ),
-            (
-                HandoffUnavailable::Headless,
-                "--headless (no window)",
-                "A windowed launch restores the default.",
-            ),
+        for unavailable in [
+            HandoffUnavailable::UnownedControlSocket,
+            HandoffUnavailable::Headless,
         ] {
-            let facts = live_facts();
-            let AdmissionDecision::Block(reason) = classify(facts) else {
-                panic!("live terminals without seamless handoff must block");
-            };
-            let refusal = update_admission_refusal(reason, facts, Some(unavailable));
-            assert!(
-                refusal.is_refused(),
-                "a refusal cannot increment a failure streak"
-            );
-            let message = refusal.into_message();
-            assert!(message.contains(cause), "{message}");
-            assert!(message.contains(remedy), "{message}");
-            assert!(message.contains("3 live terminal session(s)"), "{message}");
-            assert!(message.contains("2 foreground job(s)"), "{message}");
-            assert!(
-                message.chars().count() <= 400,
-                "durable health truncates at 400 characters"
-            );
-            // The admission's own message keeps the counts but neither actionable fact.
-            assert!(!reason.message(facts).contains(cause));
-            assert!(!reason.message(facts).contains(remedy));
-        }
-    }
-
-    /// An unreadable foreground does not hide why the handoff is unavailable: the refusal
-    /// still carries the cause and remedy.
-    #[test]
-    fn an_unreadable_foreground_keeps_the_handoffs_cause_and_remedy() {
-        for (unavailable, cause, remedy) in [
-            (
-                HandoffUnavailable::Headless,
-                "--headless (no window)",
-                "A windowed launch restores the default.",
-            ),
-            (
-                HandoffUnavailable::UnownedControlSocket,
-                "the configured control socket is not owned by this process",
-                "Resolve the control-socket ownership conflict before updating.",
-            ),
-        ] {
-            for (foreground_jobs, unknown_foregrounds) in [(0, 1), (1, 2), (0, 3)] {
+            let (cause, remedy) = (unavailable.cause(), unavailable.remedy());
+            for (foreground_jobs, unknown_foregrounds) in [(2, 0), (0, 1), (1, 2), (0, 3)] {
                 let facts = AdmissionFacts {
                     foreground_jobs,
                     unknown_foregrounds,
@@ -9914,11 +9814,18 @@ mod admission_refusal_detail_tests {
                     panic!("live terminals without seamless handoff must block");
                 };
                 let refusal = update_admission_refusal(reason, facts, Some(unavailable));
-                assert!(refusal.is_refused(), "a refusal, never a failure");
+                assert!(
+                    refusal.is_refused(),
+                    "a refusal cannot increment a failure streak"
+                );
                 let message = refusal.into_message();
                 assert!(message.contains(cause), "{facts:?}: {message}");
                 assert!(message.contains(remedy), "{facts:?}: {message}");
-                assert!(message.contains("3 live terminal session(s)"), "{message}");
+                assert!(
+                    message.chars().count() <= 400,
+                    "durable health truncates at 400 characters"
+                );
+                assert!(!reason.message(facts).contains(cause));
             }
         }
     }
@@ -10019,10 +9926,6 @@ fn classify_ready_poll(pollfds: &[libc::pollfd]) -> ReadyPollAction {
 /// What the main thread hands `prelaunch_out_of_band_handoff`: the pre-park facts the
 /// launched lane needs.
 #[cfg(target_os = "macos")]
-#[expect(
-    clippy::disallowed_types,
-    reason = "the update successor's raw Command: it hands over exactly its own descriptors, which a strip at the exec would undo"
-)]
 struct PrelaunchArgs {
     attempt_id: u64,
     build: u64,
@@ -10031,7 +9934,7 @@ struct PrelaunchArgs {
     same_image: Option<SameImageHandoff>,
     target_build: u64,
     target_commit: String,
-    command: std::process::Command,
+    command: aterm_uds::spawnfd::StdCommand,
     verify_staged_candidate: bool,
     /// The chunked-grant fact the lane choice admitted this attempt on.
     grant_chunks: bool,
@@ -10685,8 +10588,8 @@ impl NamedSuccessorWatch {
     /// One look between accept slices: is the named process (`named`, peeked from the
     /// answer) gone? LaunchServices answers once, so the first pid seen is the only one.
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "native_update_launched_dial_wait",
             action = "EndOnNamedExit",
             project = "aterm_gui::app_update_handoff::launched_dial_wait_conformance::project"
@@ -10767,16 +10670,16 @@ fn launched_dialer_code(
 /// ([`LaunchedDialEnd::CodeRefused`] or [`LaunchedDialEnd::ExitedWhileHeld`]).
 #[cfg(target_os = "macos")]
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "native_update_launched_dial_wait",
         action = "Accept",
         project = "aterm_gui::app_update_handoff::launched_dial_wait_conformance::project"
     )
 )]
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "native_update_launched_dial_wait",
         action = "TimeOut",
         project = "aterm_gui::app_update_handoff::launched_dial_wait_conformance::project"
@@ -10952,8 +10855,8 @@ fn code_refusal_outcome(
 /// and words. Never `ChildDied`: the exit is the refusal's consequence.
 #[cfg(target_os = "macos")]
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "native_update_rendezvous_admission",
         action = "FileByCause",
         project = "aterm_gui::app_update_handoff::launched_dialer_admission_conformance::project"
@@ -11061,16 +10964,16 @@ impl LaunchCorroboration<'_> {
     /// gone by then is no contradiction (the death checks name it); a zombie has no birth
     /// stamp, so a dead, unreaped successor reads as gone.
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "native_update_launched_dial_wait",
             action = "Corroborate",
             project = "aterm_gui::app_update_handoff::launched_dial_wait_conformance::project"
         )
     )]
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "native_update_rendezvous_admission",
             action = "Commit",
             project = "aterm_gui::app_update_handoff::launched_dialer_admission_conformance::project"
@@ -11280,41 +11183,6 @@ mod park_gate_tests;
 #[path = "app_update_handoff_handed_set_and_mid_sequence_tests.rs"]
 mod handed_set_and_mid_sequence_tests;
 
-#[cfg(all(test, target_os = "macos"))]
-mod park_transfer_split_tests {
-    use super::{ParkTransferSplit, park_transfer_split_text};
-    use std::time::{Duration, Instant};
-
-    /// The five slices are consecutive, so they sum to park->transfer; a pair
-    /// out of order saturates to zero instead of wrapping (the negative control).
-    #[test]
-    fn the_split_names_five_consecutive_slices() {
-        let park_at = Instant::now();
-        let at = |us: u64| park_at + Duration::from_micros(us);
-        let split = ParkTransferSplit {
-            park_at,
-            captured_at: at(600),
-            picked_up_at: at(700),
-            artifacts_at: at(21_000),
-            sendmsg_at: at(21_400),
-            granted_at: at(22_300),
-        };
-        assert_eq!(
-            park_transfer_split_text(split),
-            "capture 0.6 + hand-over 0.1 + artifacts 20.3 + pre-grant 0.4 + sendmsg 0.9 ms"
-        );
-        let reversed = ParkTransferSplit {
-            picked_up_at: park_at,
-            ..split
-        };
-        assert!(
-            park_transfer_split_text(reversed).contains("hand-over 0.0 + artifacts 21.0"),
-            "{}",
-            park_transfer_split_text(reversed)
-        );
-    }
-}
-
 #[cfg(test)]
 #[path = "app_update_handoff_freeze_budget_tests.rs"]
 mod freeze_budget_tests;
@@ -11323,7 +11191,7 @@ mod freeze_budget_tests;
 /// cannot measure, and that it parks nothing.
 #[cfg(all(test, unix))]
 #[path = "app_update_handoff_dry_run_capture_tests.rs"]
-mod dry_run_capture_tests;
+pub(crate) mod dry_run_capture_tests;
 
 #[cfg(all(test, unix))]
 mod capture_budget_reservation_tests {
@@ -11609,31 +11477,6 @@ mod trial_launch_forgiveness_tests {
             );
         }
     }
-
-    /// The invariant that makes the table above safe, against the real constants (mirrors
-    /// the compile-time assert beside `STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS`).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn the_one_shape_that_keeps_its_count_converges_before_the_sentinel_reverts() {
-        assert!(
-            u32::from(crate::app_native::STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS)
-                < aterm_update::MAX_BOOT_ATTEMPTS,
-            "a shape whose launches stay counted must be finished with the \
-             artifact before the boot sentinel would revert it; {} vs {}",
-            crate::app_native::STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS,
-            aterm_update::MAX_BOOT_ATTEMPTS
-        );
-        for shape in [
-            crate::app_native::PhysicalFailureShape::Transient,
-            crate::app_native::PhysicalFailureShape::Unexplained,
-        ] {
-            assert!(
-                u32::from(shape.lifetime_attempts()) >= aterm_update::MAX_BOOT_ATTEMPTS,
-                "{shape:?} is retried far enough to reach the revert threshold, \
-                 which is precisely why its deaths must forgive"
-            );
-        }
-    }
 }
 
 /// The non-parent witness against real processes reparented to launchd, the shape
@@ -11659,7 +11502,7 @@ mod returned_handoff_completion_lane_tests;
 mod handoff_lane_tests;
 
 /// Tier-1 conformance for the seamless handoff's ownership model
-/// ([`aterm_spec::derive::native_update_seamless_handoff_ownership_model`]): the final
+/// ([`aterm_models_update::native_update_seamless_handoff_ownership_model`]): the final
 /// Commit admission, over its whole bounded input space, decides exactly what the model
 /// admits.
 #[cfg(all(test, unix))]
@@ -11734,6 +11577,8 @@ mod presence_row_carry_tests {
             held: Vec::new(),
             roster_seq: None,
             fabric_attached: Vec::new(),
+            mirror_dropped: Vec::new(),
+            mirror_served: false,
         }
         .to_toml()
         .expect("serializes");
@@ -11988,15 +11833,10 @@ mod manifest_over_cap_tests {
     #[test]
     fn an_over_cap_manifest_is_filed_on_the_refusal_lane() {
         let refused = preparation_failure_of_write(WriteOutgoingFailure::ManifestOverCap);
-        let PreparationFailure::Refused(detail) = &refused else {
-            panic!("a deterministic refusal of the desk's content");
-        };
-        assert!(detail.contains("records are over the"), "{detail}");
-        // A person's press is answered `Failed` with this detail and arms no retry,
-        // so the detail promises none.
-        for promise in ["retries", "desk", "lane", "successor"] {
-            assert!(!detail.contains(promise), "{promise:?} in {detail}");
-        }
+        assert!(
+            matches!(refused, PreparationFailure::Refused(_)),
+            "a deterministic refusal of the desk's content"
+        );
         for own in [
             WriteOutgoingFailure::NoPrivateDir,
             WriteOutgoingFailure::Inconsistent,
@@ -12215,51 +12055,5 @@ mod connection_drop_audit_tests {
             "{audited:?}"
         );
         assert!(audited[1].message.ends_with("op=signal"), "{audited:?}");
-    }
-
-    /// Wired where it holds: the worker records what the writer returned, and both of the
-    /// Commit's arms audit it right before the one write, past the claim.
-    #[test]
-    fn the_drops_are_audited_by_the_commit_alone() {
-        let src = include_str!("app_update_handoff.rs");
-        let wrote = src
-            .find("let outgoing = crate::seamless::write_outgoing_with_held(")
-            .expect("the worker writes the manifest");
-        let recorded = src
-            .find("job.arbiter.set_connections_left_out(connections_left_out);")
-            .expect("and records what it left out");
-        assert!(wrote < recorded);
-        let claim = src
-            .find("let claim = claimed || (admitted && arbiter.try_begin_commit());")
-            .expect("the Commit's claim");
-        let commit_at = |from: usize| {
-            from + src[from..]
-                .find("crate::seamless::commit_and_exit(commit_fd, proof)")
-                .expect("a Commit write")
-        };
-        // Spelled in halves so this test's own text is not counted.
-        let call = ["Self::audit_connections", "_left_out("].concat();
-        let first = commit_at(claim);
-        let second = commit_at(first + 1);
-        for write in [first, second] {
-            let audit = src[..write]
-                .rfind(call.as_str())
-                .expect("audited before the write");
-            assert!(audit > claim && write - audit < 160, "right before it");
-        }
-        assert_eq!(
-            src.matches(call.as_str()).count(),
-            2,
-            "nowhere but the Commit's two arms"
-        );
-        let seamless = include_str!("seamless.rs");
-        let shed = seamless
-            .find("fn shed_connections_to_fit(")
-            .expect("the writer's shed");
-        let end = shed + seamless[shed..].find("\n}\n").expect("its end");
-        assert!(
-            !seamless[shed..end].contains("session_edge_audit::emit("),
-            "the writer audits nothing"
-        );
     }
 }

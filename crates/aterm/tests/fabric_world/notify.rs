@@ -28,7 +28,7 @@ use crate::harness;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use aterm_spec::derive::notify_follow_checkpoint_model;
+use aterm_models_session::notify_follow_checkpoint_model;
 use harness::{FLEET, Fleet, until};
 
 /// A `notify` run's captured output.

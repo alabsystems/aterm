@@ -134,9 +134,22 @@ fn rss_text(mb: u64) -> String {
     format!("rss {}.{} GB", tenths / 10, tenths % 10)
 }
 
+/// THE EXPLICIT RESTART REFUSED FOR ANOTHER HAND ON THE SESSION, which the
+/// next read may lift: `restart unavailable: halted` (a hold),
+/// `driver-lease` or `driver-turn` (a driver's) — the server's
+/// `input_stall::host_hand_refusal`. Uncounted, as `busy` and `ERR halted`
+/// are: a short manager turn never ends a remedy for good (the review of
+/// 2026-10-16, finding 4). Every other `restart unavailable` (not the host's
+/// agent, not relaunchable, not supervised) is the act's for good.
+pub(super) fn refusal_lifts(r: &CtlReply) -> bool {
+    ["halted", "driver-lease", "driver-turn"]
+        .iter()
+        .any(|why| r.is_err(&format!("restart unavailable: {why}")))
+}
+
 /// A reply's one line for the journal: an `OK`'s first line, else its error
 /// (the server's `ERR …`, without the client's prefix).
-fn reply_line(r: &CtlReply) -> String {
+pub(super) fn reply_line(r: &CtlReply) -> String {
     if r.ok() {
         return r.stdout.lines().next().unwrap_or("OK").trim().to_string();
     }
@@ -340,7 +353,7 @@ impl<C: Ctl> Session<'_, C> {
         if kind != "ask" || !review.unattended() || self.stalled.is_some() {
             return Ok(false);
         }
-        if self.manager.is_none() && !self.stall_suspect && self.caps.input != Some(false) {
+        if self.setup.manager.is_none() && !self.stall_suspect && self.caps.input != Some(false) {
             let r = self.call(&["status"])?;
             if self.unserved(&r) {
                 return Err(Fail::Lost(format!("status failed: {}", r.stderr.trim())));
@@ -349,7 +362,7 @@ impl<C: Ctl> Session<'_, C> {
         if !self.stall_in_hand(review) {
             return Ok(false);
         }
-        let mail = if self.manager.is_none() {
+        let mail = if self.setup.manager.is_none() {
             "skipped: no --inbox and no $ATERM_PARENT_SESSION_ID".to_string()
         } else {
             format!("skipped: {WITHHELD}")
@@ -440,7 +453,7 @@ impl<C: Ctl> Session<'_, C> {
                 // The turn-end policy's badge, if that was ours, went too.
                 self.turn_end_badge = false;
             }
-            let mail = match self.manager.clone() {
+            let mail = match self.setup.manager.clone() {
                 None => "skipped: no --inbox and no $ATERM_PARENT_SESSION_ID".to_string(),
                 Some(to) if read_rest.fabric == "connected" => {
                     let rows = self.last.as_ref().map_or(&[][..], |s| s.rows.as_slice());
@@ -452,7 +465,7 @@ impl<C: Ctl> Session<'_, C> {
                         &stall,
                         program,
                         &self.after_restart(),
-                        self.sid.as_deref(),
+                        self.setup.sid.as_deref(),
                         leader,
                     );
                     let to = format!("to={to}");
@@ -504,7 +517,9 @@ impl<C: Ctl> Session<'_, C> {
     /// explicit restart under `stall_term = true` (`restart pid=<leader>
     /// if-stalled quiet=<grace>`; an older server, `signal term`). Once per
     /// episode, only where the host relaunches the agent, never under a
-    /// person's or another driver's hand, never for a stopped job. A refusal
+    /// person's or another driver's hand, never for a stopped job — beside a
+    /// proven self-claim too, on the stall alone (no record's idle point:
+    /// a frozen TUI's record never rests). A refusal
     /// the next read may lift (`not-stalled`, `busy`, `halted`) is not
     /// counted, so the next read tries again; one it cannot (`restart
     /// unavailable`) is, the warning said instead.
@@ -536,6 +551,12 @@ impl<C: Ctl> Session<'_, C> {
         if self.stall_termed || bound_ms == 0 || !stall.wait_ms.is_some_and(|ms| ms >= bound_ms) {
             return Ok(());
         }
+        // BESIDE A PROVEN SELF-CLAIM the stall alone decides, as it does for
+        // every agent (contract §4: the watch-only worker keeps aterm's stall
+        // remedy). The agent's record is NOT read for an idle point here: a
+        // TUI that stopped reading its input mid-turn keeps a record that
+        // says `busy` for ever, and gated on its rest it was never restarted
+        // and nobody was warned (the review of 2026-10-16, finding 2).
         if !self.stall_term {
             // The default: a warning where the restart would be, once per
             // episode: said, and one record for the person (the Messages).
@@ -573,7 +594,7 @@ impl<C: Ctl> Session<'_, C> {
             return self.stall_signal_term(&stall, seq, review);
         }
         let reply = reply_line(&r);
-        if r.is_err("restart unavailable") {
+        if r.is_err("restart unavailable") && !refusal_lifts(&r) {
             // The server cannot carry the restart here: counted, and the
             // warning said instead, naming what a person can do.
             self.stall_termed = true;
@@ -583,7 +604,8 @@ impl<C: Ctl> Session<'_, C> {
             });
             return self.warn_stall(read, &stall, &after, seq, review, &format!("({reply})"));
         }
-        // `ERR not-stalled`, `busy`, `halted`: not counted, the next read
+        // `ERR not-stalled`, `busy`, `halted`, another hand's `restart
+        // unavailable` ([`refusal_lifts`]): not counted, the next read
         // decides.
         if r.ok() {
             self.stall_termed = true;
@@ -621,7 +643,7 @@ impl<C: Ctl> Session<'_, C> {
         let reader = aterm_phase::identify(read.program.as_deref(), rows).program();
         let program = read.program.as_deref().unwrap_or(reader.name());
         let leader = self.stall_host.as_ref().and_then(|h| h.agent_pid());
-        let text = frozen_warning_text(stall, program, self.sid.as_deref(), after, leader);
+        let text = frozen_warning_text(stall, program, self.setup.sid.as_deref(), after, leader);
         if let Some(host) = &self.stall_host {
             host.inform(&text);
         }
@@ -774,79 +796,14 @@ mod tests {
         assert!(!publishes_input("OK schema=1 hold=0\n"));
     }
 
+    /// A stopped job's remedy is `signal cont`, never a restart of the
+    /// worker's conversation.
     #[test]
-    fn the_frozen_mail_names_the_wait_the_backlog_the_size_and_the_remedy() {
-        let s = worker_stall(STALLED).expect("stall");
-        // The worker's own conversation as the host read it, never
-        // `claude --continue`.
-        let own = AfterRestart::Command(
-            "claude --model opus --resume 5f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f".to_string(),
-        );
-        assert_eq!(
-            frozen_mail_text(&s, "claude", &own, Some("@s-1"), Some(4242)),
-            "claude frozen: not reading input for 2m41s (1 B queued, rss 38.8 GB); pressing \
-             nothing until it reads again \u{2014} restart it: signal term (signal kill if it \
-             survives), then claude --model opus --resume 5f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f"
-        );
-        // The host relaunches it itself: no command for the manager to run.
-        let hosted = frozen_mail_text(
-            &s,
-            "claude",
-            &AfterRestart::Relaunch,
-            Some("@s-1"),
-            Some(4242),
-        );
-        assert!(
-            hosted.ends_with(
-                "restart it: aterm ctl @s-1 restart pid=4242 if-stalled; aterm relaunches it on \
-                 its conversation"
-            ),
-            "{hosted}"
-        );
-        // A program with no resume command, or a Claude Code whose record
-        // was not read: the restart alone — never a guess.
-        let t = frozen_mail_text(&s, "vim", &AfterRestart::Unknown, Some("@s-1"), Some(4242));
-        assert!(
-            t.ends_with("restart it: signal term (signal kill if it survives)"),
-            "{t}"
-        );
-        // A small program reads MB, never `0.0 GB`; unknown numbers are left
-        // out, never printed as `-`.
-        let small = WorkerStall {
-            rss_mb: Some(12),
-            wait_ms: None,
-            ..s.clone()
-        };
-        assert_eq!(
-            frozen_mail_text(
-                &small,
-                "claude",
-                &AfterRestart::Unknown,
-                Some("@s-1"),
-                Some(4242)
-            ),
-            "claude frozen: not reading input (1 B queued, rss 12 MB); pressing nothing until \
-             it reads again \u{2014} restart it: signal term (signal kill if it survives)"
-        );
-        let stopped = WorkerStall {
-            word: "stopped",
-            rss_mb: None,
-            wait_ms: Some(41_000),
-            ..s
-        };
-        assert_eq!(
-            frozen_mail_text(&stopped, "claude", &own, Some("@s-1"), Some(4242)),
-            "claude stopped with input queued for 41s (1 B queued); pressing nothing until it \
-             reads again \u{2014} resume it: signal cont"
-        );
-    }
-
-    #[test]
-    fn a_wait_reads_as_the_band_reads_one() {
-        assert_eq!(wait_text(999), "0s");
-        assert_eq!(wait_text(41_000), "41s");
-        assert_eq!(wait_text(123_000), "2m03s");
-        assert_eq!(wait_text(9_660_000), "2h41m");
-        assert_eq!(wait_text(97_200_000), "1d 3h");
+    fn a_stopped_jobs_mail_names_signal_cont() {
+        let s = worker_stall("OK input=stopped input_bytes=1 input_wait_ms=41000 fg_rss_mb=-\n")
+            .expect("stopped is a stall");
+        let own = AfterRestart::Command("claude --resume 5f1c2d3e".to_string());
+        let t = frozen_mail_text(&s, "claude", &own, Some("@s-1"), Some(4242));
+        assert!(t.ends_with("signal cont") && !t.contains("--resume"), "{t}");
     }
 }

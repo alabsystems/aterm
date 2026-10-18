@@ -742,7 +742,14 @@ fn the_unreachable_seam_clauses_fall_back_to_the_whole_grid_fill() {
                     blank,
                 );
                 if shortfall {
-                    super::seam_declared_shortfall(&mut dst, theme, tile, src.rows, src.cols, &[]);
+                    super::seam_declared_shortfall(
+                        &mut dst,
+                        theme.into(),
+                        tile,
+                        src.rows,
+                        src.cols,
+                        &[],
+                    );
                 }
             }
         }

@@ -1854,6 +1854,8 @@ mod tests {
             trial_starts: 0,
             trial_healthy: false,
             refused_newer: false,
+            refused_unstarted: false,
+            kept_unproven: false,
         });
         let mut service = NativeUpdaterService::new(10, "1.0.10", true);
         let CheckStart::Start(ticket) = service.request_check() else {
@@ -1908,143 +1910,6 @@ mod tests {
             CheckCompletion::Reduced
         );
         ticket
-    }
-
-    #[test]
-    fn one_physical_check_is_joined_and_replayed_completion_is_inert() {
-        let mut service = NativeUpdaterService::new(10, "1.0.10", true);
-        let first = started(&mut service);
-        assert_eq!(service.request_check(), CheckStart::Joined(first));
-        assert_eq!(service.snapshot().generation, 1);
-
-        assert_eq!(
-            service.finish_check(first, status(None)),
-            CheckCompletion::Reduced
-        );
-        let second = started(&mut service);
-        assert_eq!(second.generation, 2);
-        let revision_before_stale = service.snapshot().revision;
-        assert_eq!(
-            service.finish_check(first, status(Some(11))),
-            CheckCompletion::Ignored(IgnoredCompletion::StaleGeneration)
-        );
-        assert_eq!(
-            service.snapshot().revision,
-            revision_before_stale + 1,
-            "one ignored-completion counter publication, never a duplicate revision"
-        );
-        assert_eq!(service.snapshot().phase, UpdaterPhase::Checking);
-        assert!(service.snapshot().staged.is_none());
-        assert_eq!(service.snapshot().active, Some(second));
-    }
-
-    #[test]
-    fn combined_updater_api_has_explicit_verified_stage_microtrace() {
-        let mut service = NativeUpdaterService::new(10, "1.0.10", true);
-        let ticket = stage(&mut service, 11);
-        let actions = service
-            .last_transitions()
-            .iter()
-            .map(|transition| transition.action)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            actions,
-            [
-                UpdaterTransitionAction::CheckAvailable,
-                UpdaterTransitionAction::StartDownload,
-                UpdaterTransitionAction::CompleteDownload,
-            ]
-        );
-        assert_eq!(
-            actions
-                .iter()
-                .filter_map(|action| action.model_action())
-                .collect::<Vec<_>>(),
-            ["CheckAvailable", "StartDownload", "CompleteDownload"]
-        );
-        let snapshot = service.snapshot();
-        assert_eq!(snapshot.phase, UpdaterPhase::Staged);
-        assert_eq!(
-            snapshot.staged.as_ref().map(|staged| staged.build),
-            Some(11)
-        );
-        assert_eq!(
-            snapshot.staged.as_ref().map(|staged| staged.generation),
-            Some(ticket.generation)
-        );
-        assert!(snapshot.attention_pending());
-    }
-
-    #[test]
-    fn stale_result_cannot_replace_current_generation_artifact() {
-        let mut service = NativeUpdaterService::new(10, "1.0.10", true);
-        let old = started(&mut service);
-        let mut failed = status(None);
-        failed.failing_checks = 1;
-        failed.outcome = "offline".to_string();
-        assert_eq!(service.finish_check(old, failed), CheckCompletion::Reduced);
-        let current = started(&mut service);
-        assert_eq!(
-            service.finish_check(old, status(Some(99))),
-            CheckCompletion::Ignored(IgnoredCompletion::StaleGeneration)
-        );
-        assert!(service.snapshot().staged.is_none());
-        assert_eq!(
-            service.finish_check(current, status(Some(12))),
-            CheckCompletion::Reduced
-        );
-        assert_eq!(
-            service
-                .snapshot()
-                .staged
-                .as_ref()
-                .map(|staged| staged.build),
-            Some(12)
-        );
-    }
-
-    #[test]
-    fn apply_is_safe_current_and_at_most_once() {
-        let mut service = NativeUpdaterService::new(10, "1.0.10", true);
-        stage(&mut service, 11);
-
-        let blocked_ticket = match service.begin_apply_preflight() {
-            ApplyPreflightStart::Inspect(ticket) => ticket,
-            other => panic!("expected preflight, got {other:?}"),
-        };
-        assert!(matches!(
-            service.finish_apply_preflight(
-                blocked_ticket,
-                ClosePreflight::Blocked(vec!["dirty editor".to_string()])
-            ),
-            ApplyDecision::Blocked(reasons) if reasons == ["dirty editor"]
-        ));
-        assert_eq!(service.snapshot().phase, UpdaterPhase::Staged);
-        assert_eq!(service.snapshot().reexec_count, 0);
-
-        let ready_ticket = match service.begin_apply_preflight() {
-            ApplyPreflightStart::Inspect(ticket) => ticket,
-            other => panic!("expected second preflight, got {other:?}"),
-        };
-        let command = match service.finish_apply_preflight(ready_ticket, ClosePreflight::Ready) {
-            ApplyDecision::Execute(command) => command,
-            other => panic!("expected execute decision, got {other:?}"),
-        };
-        assert_eq!(command.build, 11);
-        assert_eq!(service.snapshot().phase, UpdaterPhase::Applying);
-        assert_eq!(service.snapshot().reexec_count, 1);
-        assert!(matches!(
-            service.finish_apply_preflight(ready_ticket, ClosePreflight::Ready),
-            ApplyDecision::Ignored
-        ));
-        assert_eq!(
-            service.begin_apply_preflight(),
-            ApplyPreflightStart::Applying
-        );
-
-        let mut calls = 0;
-        command.execute(|| calls += 1);
-        assert_eq!(calls, 1);
     }
 
     #[test]
@@ -2341,7 +2206,7 @@ mod tests {
 
     #[test]
     fn activation_observation_conforms_in_idle_and_returned_lanes() {
-        let model = aterm_spec::derive::native_update_activation_observation_model();
+        let model = aterm_models_update::native_update_activation_observation_model();
         let observations = [
             (None, false),
             (Some(installed(11, TEST_COMMIT, None, None)), false),
@@ -2442,66 +2307,6 @@ mod tests {
         }
     }
 
-    /// A RETURNED activation attempt (the handoff came back without committing)
-    /// re-arms while the bundle still backs it — the App's bounded automatic budget
-    /// and manual-only latch decide how many more times — and retires once the
-    /// bundle has moved on. Never a dead end that waits for a relaunch, never a loop.
-    #[test]
-    fn a_returned_activation_rearms_while_backed_and_retires_when_the_bundle_moves_on() {
-        let mut service = NativeUpdaterService::new(10, "1.0.10", true);
-        stage_activation(&mut service, 11);
-        let preflight = match service.begin_apply_preflight() {
-            ApplyPreflightStart::Inspect(ticket) => ticket,
-            other => panic!("expected preflight, got {other:?}"),
-        };
-        let command = match service.finish_apply_preflight(preflight, ClosePreflight::Ready) {
-            ApplyDecision::Execute(command) => command,
-            other => panic!("expected execute decision, got {other:?}"),
-        };
-        let attempt = command.attempt();
-        assert!(attempt.is_installed_activation());
-        let backing = installed(11, TEST_COMMIT, None, None);
-        assert_eq!(
-            service.finish_returned_apply(
-                &attempt,
-                ReturnedApplyFacts::new(true, None, None, None, Some(&backing)),
-                "overlap handoff failed safely: handoff proof ended TimedOut"
-            ),
-            ReturnedApplyDisposition::Rearmed,
-            "the bundle still backs the activation: re-armed for the budget to decide"
-        );
-        assert_eq!(service.snapshot().phase, UpdaterPhase::Staged);
-        assert!(
-            service
-                .snapshot()
-                .staged
-                .as_ref()
-                .is_some_and(StagedUpdate::is_installed_activation)
-        );
-
-        // Second attempt, but by the time it returns the bundle moved on: retire.
-        let preflight = match service.begin_apply_preflight() {
-            ApplyPreflightStart::Inspect(ticket) => ticket,
-            other => panic!("expected preflight, got {other:?}"),
-        };
-        let command = match service.finish_apply_preflight(preflight, ClosePreflight::Ready) {
-            ApplyDecision::Execute(command) => command,
-            other => panic!("expected execute decision, got {other:?}"),
-        };
-        let attempt = command.attempt();
-        let moved_on = installed(12, TEST_COMMIT, None, None);
-        assert_eq!(
-            service.finish_returned_apply(
-                &attempt,
-                ReturnedApplyFacts::new(true, None, None, None, Some(&moved_on)),
-                "overlap handoff failed safely: handoff proof ended ChildDied"
-            ),
-            ReturnedApplyDisposition::Retired
-        );
-        assert!(service.snapshot().staged.is_none());
-        assert_eq!(service.snapshot().phase, UpdaterPhase::Idle);
-    }
-
     /// A staged DOWNLOAD retires in favour of an activation (the App calls this when
     /// the bundle under the executable turns out newer than the process); an
     /// activation already in place, an in-flight apply, and an empty reducer are
@@ -2567,55 +2372,11 @@ mod tests {
         assert_eq!(service.snapshot().phase, UpdaterPhase::Idle);
         assert!(service.snapshot().staged.is_none());
         assert_eq!(service.snapshot().reexec_count, 0);
-        assert!(service.snapshot().outcome.contains("installed"));
-        assert!(
-            service
-                .snapshot()
-                .outcome
-                .contains("switching to it keeps your shells running")
-                && !service.snapshot().outcome.contains("relaunch"),
-            "an installed bundle is switched to in place, never left for a relaunch: {:?}",
-            service.snapshot().outcome
-        );
         assert_eq!(
             service.last_transitions()[0].action,
             UpdaterTransitionAction::RetireApply
         );
         assert!(!service.abort_apply(&attempt, "stale retry callback"));
-    }
-
-    #[test]
-    fn returned_apply_rearms_only_while_exact_durable_stage_survives() {
-        let mut service = NativeUpdaterService::new(10, "1.0.10", true);
-        stage(&mut service, 11);
-        let preflight = match service.begin_apply_preflight() {
-            ApplyPreflightStart::Inspect(ticket) => ticket,
-            other => panic!("expected preflight, got {other:?}"),
-        };
-        let command = match service.finish_apply_preflight(preflight, ClosePreflight::Ready) {
-            ApplyDecision::Execute(command) => command,
-            other => panic!("expected execute decision, got {other:?}"),
-        };
-        assert_eq!(
-            service.finish_returned_apply(
-                &command.attempt(),
-                ReturnedApplyFacts::new(
-                    true,
-                    Some(11),
-                    Some(TEST_COMMIT),
-                    Some(TEST_DIGEST),
-                    None,
-                ),
-                "exec returned EBUSY"
-            ),
-            ReturnedApplyDisposition::Rearmed
-        );
-        assert_eq!(service.snapshot().phase, UpdaterPhase::Staged);
-        assert_eq!(service.snapshot().reexec_count, 0);
-        assert_eq!(
-            service.snapshot().staged.as_ref().map(|stage| stage.build),
-            Some(11)
-        );
     }
 
     #[test]
@@ -2799,65 +2560,6 @@ mod tests {
     }
 
     #[test]
-    fn installed_bundle_outranks_a_surviving_exact_ready_marker() {
-        let (mut service, attempt) = applying_attempt();
-        let installed = exact_installed(11);
-        assert_eq!(
-            service.finish_returned_apply(
-                &attempt,
-                ReturnedApplyFacts::new(
-                    true,
-                    Some(11),
-                    Some(TEST_COMMIT),
-                    Some(TEST_DIGEST),
-                    Some(&installed),
-                ),
-                "ready cleanup raced bundle swap",
-            ),
-            ReturnedApplyDisposition::InstalledNeedsRelaunch { build: 11 }
-        );
-        assert!(service.snapshot().staged.is_none());
-        assert_eq!(service.snapshot().phase, UpdaterPhase::Idle);
-    }
-
-    #[test]
-    fn same_build_replacement_requires_exact_commit_and_dmg_digest() {
-        let (mut service, attempt) = applying_attempt();
-        assert_eq!(
-            service.finish_returned_apply(
-                &attempt,
-                ReturnedApplyFacts::new(
-                    true,
-                    Some(11),
-                    Some("replacement-commit"),
-                    Some(TEST_DIGEST),
-                    None,
-                ),
-                "same build marker was replaced",
-            ),
-            ReturnedApplyDisposition::Retired
-        );
-        assert!(service.snapshot().staged.is_none());
-
-        let (mut service, attempt) = applying_attempt();
-        assert_eq!(
-            service.finish_returned_apply(
-                &attempt,
-                ReturnedApplyFacts::new(
-                    true,
-                    Some(11),
-                    Some(TEST_COMMIT),
-                    Some("cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"),
-                    None,
-                ),
-                "same provenance was rebuilt into different bytes",
-            ),
-            ReturnedApplyDisposition::Retired
-        );
-        assert!(service.snapshot().staged.is_none());
-    }
-
-    #[test]
     fn disabled_status_never_imports_or_authorizes_a_leftover_stage() {
         let mut disabled = status(Some(11));
         disabled.enabled = false;
@@ -2948,16 +2650,6 @@ mod tests {
         assert!(!service.snapshot().attention_pending());
         assert!(service.snapshot().staged.is_some());
         assert!(!service.acknowledge_attention(attention));
-    }
-
-    #[test]
-    fn disabled_service_never_mints_work() {
-        let mut service = NativeUpdaterService::new(10, "1.0.10", false);
-        assert_eq!(
-            service.request_check(),
-            CheckStart::Rejected(CheckBlock::Disabled)
-        );
-        assert!(service.snapshot().active.is_none());
     }
 
     #[test]

@@ -56,7 +56,9 @@ pub use grid::{
     str_grid_columns, str_grid_columns_with,
 };
 pub use position::{byte_to_column, byte_to_column_with, column_to_char_index};
-pub use props::{GeneralCategory, PROPS_UNICODE_VERSION, Script, general_category, script};
+pub use props::{
+    GeneralCategory, PROPS_UNICODE_VERSION, Script, general_category, script, script_runs,
+};
 pub use tables::{char_width, char_width_cjk, is_ambiguous_width, str_width};
 pub use types::{Grapheme, GraphemeInfo};
 pub use width::{
@@ -65,23 +67,6 @@ pub use width::{
     split_graphemes_with_config,
 };
 pub use word::{Words, is_word_char, word_break_before, word_start_before, words};
-
-// === Test-only API ===
-#[cfg(test)]
-pub use position::{
-    GraphemeCells, GraphemeSegmenter, ascii_width, assign_cells, column_to_byte, grapheme_at_byte,
-    grapheme_at_column, is_ascii_only, pad_to_width, truncate_to_width,
-};
-#[cfg(test)]
-pub use types::GraphemeType;
-#[cfg(test)]
-pub use width::{
-    classify_grapheme, has_skin_tone, has_zwj, is_flag_emoji, is_regional_indicator,
-    is_skin_tone_modifier,
-};
-
-#[cfg(test)]
-mod ucs_detect_tests;
 
 #[cfg(test)]
 mod tests;

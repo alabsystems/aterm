@@ -323,6 +323,72 @@ impl CursorGlow {
         self.translate_band_state(top, bottom, delta, self.last_ch, self.last_origin_y);
     }
 
+    /// Whether a typed key is in flight: a fresh typed stamp, or a press whose
+    /// cell no echo has laid yet. The hand rides its line only under a key
+    /// ([`Self::lift_hand_row`]).
+    pub(super) fn key_in_flight(&self, now: Instant) -> bool {
+        self.type_hint.any_fresh(now, Self::TYPE_HINT_FRESH)
+            || self.type_press_ring.presses_within(now) > 0
+    }
+
+    /// The seam's half of the hand riding its line ([`rk::Engine::lift_hand`]):
+    /// the follow pass proved the hand's own line repainted on row `to`
+    /// (a composer's box grown or shrunk a row with no scroll), so the
+    /// hand-addressed members on row `from` ride with it as a band move would
+    /// carry them: the last observed caret, its visible twin and the hide-bridge
+    /// estimate, the hand's row, the recent typed run, the torn lay and the
+    /// cell it saw, a held park, the last licensed and anchor-swept rows, the
+    /// paid wrap cell and the insert seam's rows
+    /// ([`Self::translate_insert_rows`]). The next caret move is then judged in
+    /// the text's own frame, a key's same-row echo. The hand's line keeps its
+    /// echo-anchor memory (its end and its program-row brand) on its new row,
+    /// whose old entry described text that is gone; every other row keeps its
+    /// own.
+    pub(super) fn lift_hand_row(&mut self, from: u16, to: u16) {
+        let map = |r: u16| if r == from { to } else { r };
+        self.last = self.last.map(|(r, c)| (map(r), c));
+        self.last_visible = self.last_visible.map(|((r, c), at)| ((map(r), c), at));
+        self.hide_bridge_shown = self.hide_bridge_shown.map(|(r, c)| (map(r), c));
+        // The retained source probes describe that same line. Their neighbour
+        // captures have no such identity proof and cannot ride with it.
+        for probe in self
+            .row_prev_meta
+            .iter_mut()
+            .chain(self.row_shown_meta.iter_mut())
+            .filter(|probe| probe.row == from)
+        {
+            probe.row = to;
+            probe.above = NbrProbe::Unprobed;
+            probe.below = NbrProbe::Unprobed;
+        }
+        self.hand_row = self.hand_row.map(|hand| {
+            if hand.row == from {
+                HandRow::at(to)
+            } else {
+                hand
+            }
+        });
+        if let Some(run) = &mut self.recent_typed_run {
+            run.row = map(run.row);
+        }
+        if let Some(lay) = &mut self.torn_lay {
+            lay.row = map(lay.row);
+            lay.seen = lay.seen.map(|(r, c)| (map(r), c));
+        }
+        self.carry_held_park(|r| Some(map(r)));
+        self.last_licensed_row = self.last_licensed_row.map(|(r, at)| (map(r), at));
+        self.last_anchor_sweep = self.last_anchor_sweep.map(|(r, at)| (map(r), at));
+        self.wrap_paid_row = self.wrap_paid_row.map(map);
+        self.translate_insert_rows(&|r| Some(map(r)));
+        for slot in &mut self.anchor_rows {
+            match slot {
+                Some(m) if m.row == to => *slot = None,
+                Some(m) if m.row == from => m.row = to,
+                _ => {}
+            }
+        }
+    }
+
     /// Move every live, position-bearing member with a row-band move, under the
     /// [`band_row`] law: outside untouched, inside moved by `delta`, past either
     /// edge gone. `cell_h` and `origin_y` come from the outermost engine (see

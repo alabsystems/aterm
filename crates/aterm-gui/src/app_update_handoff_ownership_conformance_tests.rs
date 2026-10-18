@@ -5,8 +5,9 @@ use super::{
     HandoffCommitFacts, handoff_commit_admitted, handoff_rejection_activity_shaped,
     handoff_rejection_reason,
 };
-use aterm_spec::derive::{Model, native_update_seamless_handoff_ownership_model};
-use aterm_spec::interp::{State, admits, with_buggy};
+use aterm_models_update::native_update_seamless_handoff_ownership_model;
+use aterm_spec::derive::Model;
+use aterm_spec::interp::{State, admits};
 
 const TO_DESCRIPTORS_TRANSFERRED: [&str; 4] = [
     "ParkOutgoingReaders",
@@ -52,32 +53,6 @@ fn assert_every_invariant_holds(model: &Model, state: &State) {
     }
 }
 
-/// Every reachable state, by BFS over the interpreter's successor relation.
-/// Small by construction (two sessions, a chain protocol), so the bound is a
-/// tripwire.
-fn reachable(model: &Model) -> Vec<State> {
-    let mut seen: std::collections::BTreeSet<State> = std::collections::BTreeSet::new();
-    let mut queue: std::collections::VecDeque<State> = std::collections::VecDeque::new();
-    let init = model.init_state();
-    seen.insert(init.clone());
-    queue.push_back(init);
-    while let Some(state) = queue.pop_front() {
-        for action in &model.actions {
-            for next in model.successors(action.name, &state) {
-                if seen.insert(next.clone()) {
-                    queue.push_back(next);
-                }
-            }
-        }
-    }
-    assert!(
-        seen.len() < 20_000,
-        "the ownership model's bounded space regressed to {} states",
-        seen.len()
-    );
-    seen.into_iter().collect()
-}
-
 /// Is a state satisfying `goal` reachable from `from`?
 fn reaches(model: &Model, from: &State, goal: impl Fn(&State) -> bool) -> bool {
     let mut seen: std::collections::BTreeSet<State> = std::collections::BTreeSet::new();
@@ -113,13 +88,11 @@ fn facts_from_bits(bits: u32) -> HandoffCommitFacts {
         proof_exact: bits & (1 << 9) != 0,
         commit_channel: bits & (1 << 10) != 0,
         exact_agent_carry: bits & (1 << 11) != 0,
-        operator_idle: bits & (1 << 12) != 0,
-        operator_quiesced: bits & (1 << 13) != 0,
     }
 }
 
 /// How many bounded facts the Commit admission reads ([`facts_from_bits`]).
-const FACTS: u32 = 14;
+const FACTS: u32 = 12;
 
 /// Every fact true: the one combination that may Commit.
 const ALL_FACTS: u32 = (1 << FACTS) - 1;
@@ -138,9 +111,7 @@ fn model_revoked(facts: HandoffCommitFacts) -> bool {
         && facts.input_dispatch_fenced
         && facts.egress_settled
         && facts.native_safe
-        && facts.commit_channel
-        && facts.operator_idle
-        && facts.operator_quiesced)
+        && facts.commit_channel)
 }
 
 /// Projects one fact combination onto the model's pre-Commit state, including states the
@@ -199,90 +170,6 @@ fn session_death_before_commit_is_filed_as_the_activity_the_park_files_it_as() {
     assert!(!handoff_rejection_activity_shaped(proof));
 }
 
-/// A busy resident operator (a proposal in flight) refuses the Commit as activity, so the
-/// automatic lane files it `ActivityRevoked`, never a strike. Idle admits; shutting down is a
-/// fault on the physical schedule.
-#[test]
-fn a_busy_resident_operator_refuses_the_commit_as_activity_never_a_strike() {
-    use crate::app_native::{HandoffFailureLane, PhysicalFailureShape};
-    use crate::native_updater_service::ApplyMode;
-    use crate::operator_host::{ControlHandle, UpdateQuiesceRefusal};
-    let all = facts_from_bits(ALL_FACTS);
-    let with_operator = |refusal: Option<UpdateQuiesceRefusal>| {
-        let (operator_idle, operator_quiesced) = super::operator_commit_facts(refusal);
-        HandoffCommitFacts {
-            operator_idle,
-            operator_quiesced,
-            ..all
-        }
-    };
-    let lane = |mode: ApplyMode, facts: HandoffCommitFacts| {
-        HandoffFailureLane::classify(
-            mode,
-            crate::UpdateHandoffOutcome::Rejected,
-            crate::ChildDeathEvidence::Unobserved,
-            handoff_rejection_activity_shaped(facts),
-        )
-    };
-    let (notify_tx, _notify_rx) = std::sync::mpsc::sync_channel(8);
-    let operator = ControlHandle::new("test-commit-operator-busy".to_string(), notify_tx);
-
-    let proposal = operator.begin_action_activity().expect("a proposal starts");
-    let busy = operator
-        .try_begin_update_quiesce()
-        .err()
-        .expect("a proposal is in flight at the Commit");
-    assert!(busy.is_busy(), "{busy:?}");
-    let facts = with_operator(Some(busy));
-    assert!(!handoff_commit_admitted(facts), "a busy operator refuses");
-    assert!(handoff_rejection_activity_shaped(facts), "…as activity");
-    assert_eq!(
-        handoff_rejection_reason(facts, &Err(Vec::new()), Some(busy), false, false),
-        "resident operator could not quiesce for Commit: operator transaction is in \
-         flight; retry update"
-    );
-    for mode in [ApplyMode::Automatic, ApplyMode::AutomaticPastGrace] {
-        assert_eq!(
-            lane(mode, facts),
-            HandoffFailureLane::ActivityRevoked,
-            "{mode:?}"
-        );
-    }
-    // The Commit permit's moment (another thread holding the gate) is the same fact, re-read
-    // at the `_exit`.
-    let permit_busy = with_operator(Some(UpdateQuiesceRefusal::Busy(
-        "operator authority transition is busy",
-    )));
-    assert_eq!(
-        lane(ApplyMode::Automatic, permit_busy),
-        HandoffFailureLane::ActivityRevoked
-    );
-
-    // The same operator idle: fenced, and the Commit admits.
-    drop(proposal);
-    let fenced = operator
-        .try_begin_update_quiesce()
-        .expect("an idle operator fences");
-    assert!(handoff_commit_admitted(with_operator(None)));
-    drop(fenced);
-
-    // Negative control: an operator refusing for anything but work (shutting down) is a fault,
-    // and stays on the physical schedule.
-    operator.begin_shutdown();
-    let shut = operator
-        .try_begin_update_quiesce()
-        .err()
-        .expect("a shutting-down operator refuses");
-    assert!(!shut.is_busy(), "{shut:?}");
-    let facts = with_operator(Some(shut));
-    assert!(!handoff_commit_admitted(facts));
-    assert!(!handoff_rejection_activity_shaped(facts));
-    assert_eq!(
-        lane(ApplyMode::Automatic, facts),
-        HandoffFailureLane::Physical(PhysicalFailureShape::Transient)
-    );
-}
-
 /// An agent relaunch owed or settled between the two captures refuses the Commit by its own
 /// name, as activity: the successor would restore a layout without it, and the rollback lets
 /// this process relaunch it. Lossless and repeatable, never a fault against the build, and
@@ -296,23 +183,20 @@ fn an_agent_carry_that_moved_refuses_the_commit_by_its_own_name() {
     };
     assert!(!handoff_commit_admitted(moved));
     assert!(handoff_rejection_activity_shaped(moved));
-    let reason = handoff_rejection_reason(moved, &Err(Vec::new()), None, false, false);
-    assert_eq!(
-        reason,
-        "an agent's relaunch became owed or was settled during async preparation"
-    );
-    // Negative control: the topology's own reason is unchanged.
+    let reason = handoff_rejection_reason(moved, &Err(Vec::new()), false, false);
+    // Negative control: never read as the topology changing.
     let topology = HandoffCommitFacts {
         exact_layout: false,
         ..all
     };
-    assert_eq!(
-        handoff_rejection_reason(topology, &Err(Vec::new()), None, false, false),
-        "window/tab/pane topology changed during async preparation"
+    assert_ne!(
+        reason,
+        handoff_rejection_reason(topology, &Err(Vec::new()), false, false),
+        "the carry is named apart from the window/tab/pane topology"
     );
 }
 
-/// `handoff_commit_admitted` alone decides whether ownership moves; all 2^14 fact combinations
+/// `handoff_commit_admitted` alone decides whether ownership moves; all 2^12 fact combinations
 /// must get the same verdict from it and from the model's `CommitAtomically` guard.
 #[test]
 fn real_commit_admission_conforms_to_the_ownership_model_over_every_bounded_fact_combination() {
@@ -385,63 +269,5 @@ fn real_commit_admission_conforms_to_the_ownership_model_over_every_bounded_fact
     assert_eq!(
         admitted_combinations, 1,
         "exactly one bounded combination may authorize a Commit"
-    );
-}
-
-/// Every reachable pre-Commit state of the ownership model has a rollback path to Resumed
-/// with both sessions still the outgoing process's; the Buggy=1 mutant can orphan a session
-/// and put two readers on one master.
-#[test]
-fn every_pre_commit_state_has_a_path_back_to_resumed_with_both_sessions_still_ours() {
-    let model = native_update_seamless_handoff_ownership_model();
-    let states = reachable(&model);
-    assert!(states.len() > 10, "vacuous reachable space");
-
-    let (mut pre_commit, mut committed, mut settled) = (0usize, 0usize, 0usize);
-    for state in &states {
-        assert_every_invariant_holds(&model, state);
-        if state["commits"] > 0 {
-            committed += 1;
-            continue;
-        }
-        if state["phase"] == 7 || state["phase"] == 8 {
-            settled += 1;
-            continue;
-        }
-        if state["phase"] == 0 {
-            continue;
-        }
-        pre_commit += 1;
-        assert!(
-            reaches(&model, state, |candidate| {
-                candidate["phase"] == 7
-                    && candidate["out_live"] == 1
-                    && candidate["out_readers"] == 1
-                    && candidate["owner_a"] == 1
-                    && candidate["owner_b"] == 1
-                    && candidate["commits"] == 0
-            }),
-            "no rollback path to Resumed from {state:?}"
-        );
-    }
-    assert!(
-        pre_commit > 0 && committed > 0 && settled > 0,
-        "the sweep must see all three lanes: {pre_commit} pre-commit, \
-         {committed} committed, {settled} settled"
-    );
-
-    let buggy = with_buggy(&model, 1);
-    let broken = reachable(&buggy);
-    assert!(
-        broken
-            .iter()
-            .any(|state| !buggy.check_invariant("NoSessionIsEverOrphaned", state)),
-        "the mutant must be able to orphan a session"
-    );
-    assert!(
-        broken
-            .iter()
-            .any(|state| !buggy.check_invariant("NeverTwoReadersOnOneMaster", state)),
-        "the mutant must be able to put two readers on one master"
     );
 }

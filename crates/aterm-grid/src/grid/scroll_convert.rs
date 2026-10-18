@@ -22,7 +22,6 @@ use crate::CellExtra;
 use crate::CellFlags;
 use crate::PackedColor;
 use crate::Row;
-use crate::StyleTable;
 use crate::{CellCoord, CellExtras};
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -132,8 +131,8 @@ fn append_plain_run(
 }
 
 /// Whether any cell carries something [`Grid::extract_row_extras_into`] can
-/// extract without the extras map: a style id, a complex codepoint, or an RGB
-/// overflow colour.
+/// extract without the extras map: a complex codepoint or an RGB overflow
+/// colour.
 ///
 /// Consulted only when the map holds no entry on the row, so ignoring
 /// `Cell::has_extras()` is exact and a stale flag (bulk clears leave them)
@@ -143,10 +142,7 @@ fn append_plain_run(
 fn row_has_extractable_cells(cells: &[Cell]) -> bool {
     let mut found = false;
     for cell in cells {
-        found |= cell.uses_style_id()
-            | cell.is_complex()
-            | cell.fg_needs_overflow()
-            | cell.bg_needs_overflow();
+        found |= cell.is_complex() | cell.fg_needs_overflow() | cell.bg_needs_overflow();
     }
     found
 }
@@ -193,11 +189,7 @@ impl DeferredLine {
         // it even when the wrap blanked it with a background colour (the row's
         // length then covers it); a row rebuilt from the line records the hole
         // again (`fill_row_cells`).
-        let len = if row.has_early_wrap_hole() {
-            row.len().min(row.cols().saturating_sub(1))
-        } else {
-            row.len()
-        };
+        let len = row.written_len();
         scratch.clear();
         if len != 0 {
             scratch.extend_from_slice(&row.as_slice()[..len as usize]);
@@ -397,7 +389,7 @@ impl DeferredLine {
             let col_u16 = u16::try_from(physical_col).unwrap_or(u16::MAX);
             let char_count = push_cell_text(&mut text, *cell, extras, &mut cursors, col_u16);
             let fg_raw = resolve_cell_color(
-                cell.fg_needs_overflow() || cell.uses_style_id(),
+                cell.fg_needs_overflow(),
                 cell.fg_color().map_or(PackedColor::DEFAULT_FG.0, |c| c.0),
                 &extras.rgb_fg,
                 &mut cursors.rgb_fg_idx,
@@ -405,7 +397,7 @@ impl DeferredLine {
                 PackedColor::DEFAULT_FG.0,
             );
             let bg_raw = resolve_cell_color(
-                cell.bg_needs_overflow() || cell.uses_style_id(),
+                cell.bg_needs_overflow(),
                 cell.bg_color().map_or(PackedColor::DEFAULT_BG.0, |c| c.0),
                 &extras.rgb_bg,
                 &mut cursors.rgb_bg_idx,
@@ -738,6 +730,36 @@ impl LazyBuffer {
         n
     }
 
+    /// Whether staged rows exceed `budget`, before a caller walks their weights.
+    #[must_use]
+    pub(crate) fn outweighs(&self, budget: usize) -> bool {
+        self.staged_bytes > budget
+    }
+
+    /// Estimated peak at `line_cap` rows if incoming rows keep the average
+    /// retained weight of the newest `sample` rows. Include both the current
+    /// backlog plus its unfilled share and a full share of that newest weight.
+    /// The marker counts as a row in the cap, as in [`Self::len`].
+    #[must_use]
+    pub(crate) fn projected_peak(&self, line_cap: usize, sample: usize) -> usize {
+        let (rows, bytes) = self
+            .lines
+            .iter()
+            .rev()
+            .take(sample)
+            .fold((0usize, 0usize), |(rows, bytes), line| {
+                (rows + 1, bytes + line.staged_bytes())
+            });
+        if rows == 0 {
+            return self.staged_bytes;
+        }
+        let per_row = bytes / rows;
+        let to_come = line_cap.saturating_sub(self.len());
+        self.staged_bytes
+            .saturating_add(per_row.saturating_mul(to_come))
+            .max(per_row.saturating_mul(line_cap))
+    }
+
     /// The running staged-byte sum (see the field). Test-only: pins that the
     /// sum always equals a fresh walk, whichever path removed the rows.
     #[cfg(test)]
@@ -1042,8 +1064,8 @@ pub struct ScrolledRowExtras {
     pub complex_chars: Vec<(u16, Arc<str>)>,
     /// Combining characters keyed by physical column.
     pub combining: Vec<(u16, SmallVec<char, 2>)>,
-    /// Resolved foreground colours keyed by physical column (RGB overflow and
-    /// style-id cells).
+    /// Resolved foreground colours keyed by physical column (RGB overflow
+    /// cells).
     pub rgb_fg: Vec<(u16, [u8; 3])>,
     /// Resolved background colours keyed by physical column (as `rgb_fg`).
     pub rgb_bg: Vec<(u16, [u8; 3])>,
@@ -1174,9 +1196,11 @@ impl Grid {
     }
 
     /// Convert a row to a [`Line`] using extras extracted at scroll time (RGB
-    /// overflow and style-id colours already resolved).
+    /// overflow colours already resolved).
     pub(crate) fn row_to_line_with_stored_extras(row: &Row, extras: &ScrolledRowExtras) -> Line {
-        Self::row_to_line_with_stored_extras_at_len(row, extras, row.len())
+        // As a staged line reads it (`DeferredLine::new_boxed`): a recorded
+        // early-wrap hole is not content, also when BCE put it inside `len`.
+        Self::row_to_line_with_stored_extras_at_len(row, extras, row.written_len())
     }
 
     /// [`Self::row_to_line_with_stored_extras`] with an explicit cell count.
@@ -1213,9 +1237,6 @@ impl Grid {
 
         let cells = &row.as_slice()[..len];
         for (physical_col, cell) in cells.iter().enumerate() {
-            #[cfg(any(test, debug_assertions))]
-            super::count_row_to_line_cell();
-
             if is_spacer(cells, physical_col) {
                 continue;
             }
@@ -1223,7 +1244,7 @@ impl Grid {
             let col_u16 = u16::try_from(physical_col).unwrap_or(u16::MAX);
             let char_count = push_cell_text(&mut text, *cell, extras, &mut cursors, col_u16);
             let fg_raw = resolve_cell_color(
-                cell.fg_needs_overflow() || cell.uses_style_id(),
+                cell.fg_needs_overflow(),
                 cell.fg_color().map_or(PackedColor::DEFAULT_FG.0, |c| c.0),
                 &extras.rgb_fg,
                 &mut cursors.rgb_fg_idx,
@@ -1231,7 +1252,7 @@ impl Grid {
                 PackedColor::DEFAULT_FG.0,
             );
             let bg_raw = resolve_cell_color(
-                cell.bg_needs_overflow() || cell.uses_style_id(),
+                cell.bg_needs_overflow(),
                 cell.bg_color().map_or(PackedColor::DEFAULT_BG.0, |c| c.0),
                 &extras.rgb_bg,
                 &mut cursors.rgb_bg_idx,
@@ -1272,25 +1293,17 @@ impl Grid {
 
         let mut idx = 0;
         while idx < cells.len() {
-            // The cell counter steps once per cell, whichever arm covers it.
             let run_end = append_plain_run(cells, idx, &mut text, &mut attrs_rle);
             if run_end > idx {
-                #[cfg(any(test, debug_assertions))]
-                for _ in idx..run_end {
-                    super::count_row_to_line_cell();
-                }
                 idx = run_end;
                 continue;
             }
-
-            #[cfg(any(test, debug_assertions))]
-            super::count_row_to_line_cell();
 
             let cell = &cells[idx];
             if !is_spacer(cells, idx) {
                 // No complex chars possible — char_data is always a BMP codepoint.
                 text.push(cell.char());
-                // No overflow or style_id — read inline colors directly.
+                // No overflow — read inline colors directly.
                 attrs_rle.push(cell_attrs_of(cell));
             }
             idx += 1;
@@ -1303,16 +1316,15 @@ impl Grid {
         line
     }
 
-    /// Extract a row's extras (hyperlinks, complex chars, combining marks, RGB
-    /// and style-id colours) before `shift_rows_up_by` discards them.
+    /// Extract a row's extras (hyperlinks, complex chars, combining marks and
+    /// RGB colours) before `shift_rows_up_by` discards them.
     pub(crate) fn extract_row_extras(
         row: &Row,
         extras: &CellExtras,
         row_idx: u16,
-        styles: &StyleTable,
     ) -> ScrolledRowExtras {
         let mut result = ScrolledRowExtras::default();
-        Self::extract_row_extras_into(&mut result, row, extras, row_idx, styles);
+        Self::extract_row_extras_into(&mut result, row, extras, row_idx);
         result
     }
 
@@ -1324,7 +1336,6 @@ impl Grid {
         row: &Row,
         extras: &CellExtras,
         row_idx: u16,
-        styles: &StyleTable,
     ) {
         result.clear();
         // Headless scrollback-text-only mode: skip colour/style extraction but
@@ -1345,11 +1356,8 @@ impl Grid {
 
         // `has_any_data()`, not `is_empty()`: ring-only entries (complex chars,
         // RGB colours) bypass the map on the write path and would otherwise be
-        // dropped on scroll. Style-id cells need resolution without any extras,
-        // hence the row flag; it originates only in the test-only
-        // `row/style_id_write.rs`, so in the shipped binary this rests on
-        // `has_any_data()` alone.
-        if !extras.has_any_data() && !row.has_style_id() {
+        // dropped on scroll.
+        if !extras.has_any_data() {
             return;
         }
 
@@ -1370,11 +1378,10 @@ impl Grid {
         }
 
         // Pre-size the rgb vectors (one counting pass, skipped when recycled
-        // vectors already have capacity) so style-id and RGB-overflow rows pay
-        // no repeated growth on the scroll path. Not gated on
-        // `row.has_style_id()`: truecolor writes (`set_rgb_ring_range`) set no
-        // row flag. fg and bg are counted separately so neither over-reserves;
-        // the counts are an upper bound (the ring may have evicted an entry).
+        // vectors already have capacity) so RGB-overflow rows pay no repeated
+        // growth on the scroll path. fg and bg are counted separately so
+        // neither over-reserves; the counts are an upper bound (the ring may
+        // have evicted an entry).
         if result.rgb_fg.capacity() == 0 || result.rgb_bg.capacity() == 0 {
             let cap_cells = &row.as_slice()[..len];
             let (mut n_fg, mut n_bg) = (0usize, 0usize);
@@ -1382,11 +1389,6 @@ impl Grid {
                 // Mirror the main loop's spacer skip so the reserve matches what
                 // is actually pushed.
                 if is_spacer(cap_cells, i) {
-                    continue;
-                }
-                if c.uses_style_id() {
-                    n_fg += 1;
-                    n_bg += 1;
                     continue;
                 }
                 if c.fg_needs_overflow() {
@@ -1406,9 +1408,6 @@ impl Grid {
 
         // Track open hyperlink span: (start_col, url, id)
         let mut current_span: Option<(u16, Arc<str>, Option<Arc<str>>)> = None;
-        // One-entry cache for StyleId resolution: styled runs share the same
-        // id across consecutive cells, so this skips most table lookups.
-        let mut last_style: Option<(crate::StyleId, [u8; 3], [u8; 3])> = None;
 
         let cells = &row.as_slice()[..len];
         for (physical_col, cell) in cells.iter().enumerate() {
@@ -1418,27 +1417,6 @@ impl Grid {
 
             let col_u16 = u16::try_from(physical_col).unwrap_or(u16::MAX);
             let coord = CellCoord::new(row_idx, col_u16);
-
-            // StyleId cells: resolve colors from the style table now, before
-            // the cell scrolls off and loses access to the table.
-            if cell.uses_style_id() {
-                let sid = cell.style_id();
-                let resolved = match last_style {
-                    Some((cached_id, fg, bg)) if cached_id == sid => Some((fg, bg)),
-                    _ => styles.get(sid).map(|style| {
-                        let (r, g, b) = style.fg.to_rgb();
-                        let fg = [r, g, b];
-                        let (r, g, b) = style.bg.to_rgb();
-                        let bg = [r, g, b];
-                        last_style = Some((sid, fg, bg));
-                        (fg, bg)
-                    }),
-                };
-                if let Some((fg, bg)) = resolved {
-                    result.rgb_fg.push((col_u16, fg));
-                    result.rgb_bg.push((col_u16, bg));
-                }
-            }
 
             // Complex character: prefer full Arc<str> from HashMap (preserves
             // multi-codepoint ZWJ sequences), fall back to ring buffer codepoint.
@@ -1455,7 +1433,6 @@ impl Grid {
             // RGB foreground from the ring or the map, outside the
             // `extras.get(coord)` block so ring-only cells are not missed.
             if cell.fg_needs_overflow()
-                && !cell.uses_style_id()
                 && let Some(rgb) = extras.fg_rgb_for(row_idx, col_u16)
             {
                 result.rgb_fg.push((col_u16, rgb));
@@ -1463,7 +1440,6 @@ impl Grid {
 
             // RGB background — same ring-first lookup.
             if cell.bg_needs_overflow()
-                && !cell.uses_style_id()
                 && let Some(rgb) = extras.bg_rgb_for(row_idx, col_u16)
             {
                 result.rgb_bg.push((col_u16, rgb));
@@ -1659,9 +1635,8 @@ impl Grid {
         row: &Row,
         extras: &CellExtras,
         row_idx: u16,
-        styles: &StyleTable,
     ) -> Line {
-        let extracted = Self::extract_row_extras(row, extras, row_idx, styles);
+        let extracted = Self::extract_row_extras(row, extras, row_idx);
         Self::row_to_line_with_stored_extras(row, &extracted)
     }
 }
@@ -1727,7 +1702,7 @@ pub(in crate::grid) fn next_combining<'a>(
 
 /// Resolve one channel of a cell's colour the way the Line serializer does:
 /// inline when the cell carries it, else the column's pre-resolved stored RGB
-/// (extraction resolved RGB overflow and `StyleId` at scroll time), else the
+/// (extraction resolved RGB overflow at scroll time), else the
 /// default. Shared with the ring fast materializer.
 pub(in crate::grid) fn resolve_cell_color(
     needs_stored: bool,
@@ -1993,32 +1968,6 @@ mod plain_run_equivalence_tests {
             "\0\u{1f}\u{7f}\u{80}é世!\u{fffd}\u{fffd}"
         );
     }
-
-    #[test]
-    fn plain_run_equivalence_rejects_lost_text_attributes_and_wrap() {
-        let cells = vec![styled('x', 2, CellFlags::BOLD); 65];
-        let expected = old_cell_loop(&cells, true);
-        assert!(
-            equivalent(&expected, &expected),
-            "positive comparator control"
-        );
-        assert!(
-            !equivalent(&old_cell_loop(&cells[..64], true), &expected),
-            "dropping the first byte after a chunk must be caught"
-        );
-        let mut wrong_attrs = cells.clone();
-        wrong_attrs[64] = Cell::new('x');
-        let wrong_attrs = old_cell_loop(&wrong_attrs, true);
-        assert_eq!(wrong_attrs.to_string(), expected.to_string());
-        assert!(
-            !equivalent(&wrong_attrs, &expected),
-            "text equality alone must not hide a lost attribute at the chunk boundary"
-        );
-        assert!(
-            !equivalent(&old_cell_loop(&cells, false), &expected),
-            "losing the wrapped bit must be caught"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -2050,7 +1999,7 @@ mod extract_gate_tests {
         );
 
         let row = grid.storage.row(0).expect("row 0");
-        let extracted = Grid::extract_row_extras(row, grid.extras(), 0, grid.styles());
+        let extracted = Grid::extract_row_extras(row, grid.extras(), 0);
         assert_eq!(
             extracted.rgb_fg,
             vec![(0u16, [9u8, 8, 7])],
@@ -2070,7 +2019,7 @@ mod extract_gate_tests {
 
         let before = {
             let row = grid.storage.row(0).expect("row 0");
-            Grid::extract_row_extras(row, grid.extras(), 0, grid.styles())
+            Grid::extract_row_extras(row, grid.extras(), 0)
         };
         assert!(before.is_empty(), "a plain row extracts nothing");
 
@@ -2089,7 +2038,7 @@ mod extract_gate_tests {
 
         let after = {
             let row = grid.storage.row(0).expect("row 0");
-            Grid::extract_row_extras(row, grid.extras(), 0, grid.styles())
+            Grid::extract_row_extras(row, grid.extras(), 0)
         };
         assert!(
             after.is_empty(),

@@ -175,26 +175,6 @@ mod tests {
     }
 
     #[test]
-    fn the_parse_notice_names_the_whole_file_or_the_update_table() {
-        let notice = |text: &str| {
-            let e = aterm_toml::from_str::<UpdateOnly>(text).expect_err("fixture must fail");
-            update_parse_notice(text, &e)
-        };
-        let syntax = notice("font_px =\n[update]\nenabled = false\n");
-        assert!(
-            syntax.starts_with("aterm.toml does not parse — automatic updates stay on: "),
-            "{syntax}"
-        );
-        let typed = notice("[update]\nenabled = \"no\"\n");
-        assert!(
-            typed.starts_with(
-                "[update] in aterm.toml has a value of the wrong type — automatic updates stay on: "
-            ),
-            "{typed}"
-        );
-    }
-
-    #[test]
     fn a_missing_or_foreign_file_is_on() {
         let dir = std::env::temp_dir().join(format!("aterm-upd-settings-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

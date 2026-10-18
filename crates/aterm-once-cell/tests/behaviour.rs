@@ -93,8 +93,9 @@ fn a_failed_initialiser_leaves_the_cell_empty_and_retryable() {
     let second: Result<&u32, &str> = cell.get_or_try_init(|| Ok(3));
     assert_eq!(second, Ok(&3), "a later call must be able to try again");
     assert_eq!(cell.get(), Some(&3));
-    // …and now it is closed: x11-dl and xkbcommon-dl both rely on the cached
-    // handle never being replaced once a load succeeds.
+    // …and now it is closed: a library loader (x11-dl's and xkbcommon-dl's,
+    // until LW.7) relied on the cached handle never being replaced once a load
+    // succeeds.
     assert_eq!(cell.get_or_try_init(|| Ok::<u32, &str>(9)), Ok(&3));
 }
 
@@ -255,8 +256,9 @@ fn lazy_is_sync_when_upstream_says_it_is() {
 
 #[test]
 fn lazy_forced_concurrently_runs_its_initialiser_once() {
-    // `wayland-sys` has eight of these, each `dlopen`ing a library; running the
-    // initialiser twice would open it twice.
+    // A `Lazy` static's initialiser may have effects (`wayland-sys`'s eight each
+    // `dlopen`ed a library until LW.7 left it lock-only); running one twice would
+    // repeat them.
     let runs = Arc::new(AtomicUsize::new(0));
     let runs2 = Arc::clone(&runs);
     let lazy: Arc<sync::Lazy<u32, Box<dyn Fn() -> u32 + Send>>> =

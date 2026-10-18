@@ -220,6 +220,8 @@ flags! {
         RDWR = libc::O_RDWR;
         /// `O_CREAT`.
         CREATE = libc::O_CREAT;
+        /// `O_APPEND` — every write lands at the file's end.
+        APPEND = libc::O_APPEND;
         /// `O_EXCL` — with `O_CREAT`, fail if the name already exists. The
         /// atomic "create or lose" the private-file path depends on.
         EXCL = libc::O_EXCL;
@@ -335,6 +337,16 @@ pub struct Stat {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileType(u32);
 
+#[cfg_attr(
+    any(
+        target_os = "linux",
+        all(target_os = "android", target_pointer_width = "64")
+    ),
+    expect(
+        clippy::unnecessary_cast,
+        reason = "mode_t is u32 here and u16 on Apple and 32-bit Android"
+    )
+)]
 impl FileType {
     /// Extract the type from a raw `st_mode`.
     #[must_use]
@@ -399,6 +411,13 @@ pub fn fstat<Fd: AsFd>(fd: Fd) -> Result<Stat> {
     Ok(Stat {
         st_dev: raw.st_dev as u64,
         st_ino: raw.st_ino as u64,
+        #[cfg_attr(
+            any(target_os = "linux", target_os = "android"),
+            expect(
+                clippy::useless_conversion,
+                reason = "st_mode is u32 here and u16 on Apple"
+            )
+        )]
         st_mode: u32::from(raw.st_mode),
         st_nlink: raw.st_nlink as u64,
     })

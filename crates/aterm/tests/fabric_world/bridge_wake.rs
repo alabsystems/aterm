@@ -9,8 +9,8 @@
 
 use crate::harness;
 
-use aterm_spec::derive::fabric_outbox_wake_model;
-use harness::{FLEET, World, until};
+use aterm_models_session::fabric_outbox_wake_model;
+use harness::{FLEET, World, until, watchers};
 
 /// A newly parked bus fetch wakes the bridge through its `fetch` timeline
 /// event. The test fault disables only the periodic outbox drain, so the reply
@@ -38,17 +38,7 @@ fn a_queued_fetch_has_a_prompt_event_without_the_roster_drain() {
     // word that the seed happened (the adoption path registers only after it
     // seeds, aterm-gui subscribe.rs), and every later event follows it.
     until("the push lane to watch the fetcher's session", || {
-        w.verb("who")
-            .rows()
-            .iter()
-            .find(|row| row.split_whitespace().nth(1) == Some(b.as_str()))
-            .and_then(|row| {
-                row.split_whitespace()
-                    .find_map(|t| t.strip_prefix("watchers="))
-                    .and_then(|n| n.parse::<u64>().ok())
-            })
-            .is_some_and(|n| n >= 1)
-            .then_some(())
+        (watchers(&w, &b)? >= 1).then_some(())
     });
     std::fs::write(w.state.join("skip-roster-outbox"), b"1\n").unwrap();
 

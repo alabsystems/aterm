@@ -145,3 +145,80 @@ fn a_carried_osc_is_canceled_by_can_in_the_tail() {
         );
     }
 }
+
+/// What `parser` delivers for `bytes` fed whole, cut once at every byte, and
+/// one byte at a time, through `advance_fast`: every feeding must agree, so
+/// the first answer stands for all of them.
+fn feed_every_way(c1: bool, bytes: &[u8]) -> RecordingSink {
+    let whole = feed_chunked(&mut parser(c1), bytes, 0);
+    let shown = String::from_utf8_lossy(bytes).into_owned();
+    for cut in 1..bytes.len() {
+        let sink = feed_chunked(&mut parser(c1), bytes, 1 << (cut - 1));
+        assert_eq!(sink, whole, "{shown:?} c1={c1} cut after byte {cut}");
+    }
+    let byte_at_a_time = feed_chunked(&mut parser(c1), bytes, u32::MAX);
+    assert_eq!(byte_at_a_time, whole, "{shown:?} c1={c1} byte at a time");
+    whole
+}
+
+/// A DCS ends at ST alone. An ESC that does not begin ST (`ESC \`) breaks the
+/// string off, and a broken-off string is canceled as CAN and SUB cancel one
+/// (`dcs_unhook(true)`): xterm answers or applies a DCS only at ST. What the
+/// ESC begins reads exactly as it reads from Ground. The next byte decides,
+/// so an ESC at the end of one read and its follower in the next decide the
+/// same way.
+#[test]
+fn an_escape_that_does_not_begin_st_cancels_a_dcs() {
+    let heads: [(&[u8], (Vec<u16>, Vec<u8>, u8), &[u8]); 3] = [
+        (b"\x1bP$qm", (vec![], b"$".to_vec(), b'q'), b"m"),
+        (b"\x1bP+q544E", (vec![], b"+".to_vec(), b'q'), b"544E"),
+        (b"\x1bPq#0~", (vec![], vec![], b'q'), b"#0~"),
+    ];
+    let breaks: [&[u8]; 8] = [
+        b"\x1b[5;7H",
+        b"\x1b]2;t\x07",
+        b"\x1b7",
+        // A second ESC (a tmux passthrough wrapper doubles every ESC), then ST.
+        b"\x1b\x1b\\",
+        // Another DCS, ended at ST: it is answered.
+        b"\x1bP$qm\x1b\\",
+        b"\x1b_Ga=q\x1b\\",
+        b"\x1b\x18",
+        b"\x1bc",
+    ];
+    for c1 in [false, true] {
+        for (head, hook, payload) in &heads {
+            for tail in breaks {
+                let mut bytes = head.to_vec();
+                bytes.extend_from_slice(tail);
+                let got = feed_every_way(c1, &bytes);
+                let mut expected = feed_every_way(c1, tail);
+                expected.dcs_hooks.insert(0, hook.clone());
+                expected.dcs_puts.splice(0..0, payload.iter().copied());
+                expected.dcs_cancels += 1;
+                assert_eq!(
+                    got,
+                    expected,
+                    "c1={c1} {:?}: the string is canceled and what the ESC begins reads as from Ground",
+                    String::from_utf8_lossy(&bytes)
+                );
+            }
+        }
+    }
+}
+
+/// Negative control: `ESC \` is ST however it is cut, an ESC read at the end
+/// of one chunk and the `\` at the start of the next included, and so is the
+/// 8-bit ST. The string ends complete (`dcs_unhook(false)`) and `ESC \`
+/// dispatches as the ESC sequence it is.
+#[test]
+fn st_still_ends_a_dcs_complete() {
+    for c1 in [false, true] {
+        let sink = feed_every_way(c1, b"\x1bP$qm\x1b\\ok");
+        assert_eq!((sink.dcs_unhooks, sink.dcs_cancels), (1, 0), "c1={c1}");
+        assert_eq!(sink.esc_dispatches, vec![(vec![], b'\\')]);
+        assert_eq!(sink.prints.iter().collect::<String>(), "ok");
+        let sink = feed_every_way(c1, b"\x1bP$qm\x9cok");
+        assert_eq!((sink.dcs_unhooks, sink.dcs_cancels), (1, 0), "c1={c1}");
+    }
+}

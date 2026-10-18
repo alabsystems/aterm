@@ -227,6 +227,34 @@ function(arg0) {
             getDataViewMemory0().setInt32(arg0 + 4 * 0, ptr, true);
         }";
 
+/// The object table: a JS object argument is stored here and its index
+/// passed (`addHeapObject`), an import reads it back (`getObject`), and the
+/// module releases it (`aterm_host.object_drop`). Index 0 is never handed
+/// out.
+pub(crate) const HEAP: &str = "\
+const heap = [undefined];
+const heapFree = [];
+function addHeapObject(obj) {
+    const idx = heapFree.length > 0 ? heapFree.pop() : heap.length;
+    heap[idx] = obj;
+    return idx;
+}
+function getObject(idx) {
+    return heap[idx];
+}
+function dropObject(idx) {
+    if (idx === 0 || idx >= heap.length) return;
+    heap[idx] = undefined;
+    heapFree.push(idx);
+}
+";
+
+/// `aterm_host.object_drop(index)`.
+pub(crate) const OBJECT_DROP_SHIM: &str = "\
+function(arg0) {
+            dropObject(arg0);
+        }";
+
 /// `aterm_host.performance_now()`.
 pub(crate) const PERFORMANCE_NOW_SHIM: &str = "\
 function() {

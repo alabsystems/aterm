@@ -1,0 +1,19 @@
+# claude-code 2.1.302 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (50x40, aterm 0.105.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the pane at 50 columns: a reply of two paragraphs (the stub's reply.txt), the second wrapped over two rows, its last row `every caller now. Which do you prefer (1 or 2)?`
+ ▐▛███▛█   Claude Code v2.1.302
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.9n81/proj
+
+
+❯ what next
+
+⏺ I finished the parser and the suite is green.
+
+  Two ways on from here: keep the old API, or move
+  every caller now. Which do you prefer (1 or 2)?
+
+✻ Crunched for 0s · done 6:15 PM
+
+──────────────────────────────────────────────────
+❯
+──────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)

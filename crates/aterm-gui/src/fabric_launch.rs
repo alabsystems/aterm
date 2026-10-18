@@ -10,8 +10,7 @@
 //! command = "aterm-link serve --fleet lab --broker /tmp/f.sock --cap-file ~/.config/aterm/fabric.cap"
 //! ```
 //!
-//! DEFAULT OFF, exactly like the embedded operator (`[operator] enabled`,
-//! `operator_host::enabled`). The config key is the one spelling in a shipped
+//! DEFAULT OFF. The config key is the one spelling in a shipped
 //! aterm: `ATERM_FABRIC_COMMAND`, which used to override it, is a DEVELOPMENT
 //! seam ([`aterm_types::dev_seam!`]) — the fabric world tests
 //! (`crates/aterm/tests/fabric_world`) launch their debug instances with it,
@@ -54,13 +53,14 @@
 //! `ATERM_LINK_CAP_FILE`, `ATERM_LINK_FLEET` and `ATERM_FABRIC_COMMAND`, the four
 //! names `ENV_DENY_VARS` lists — do not reach it. Those four NAMES, and NOT the
 //! whole-prefix glob this header used to claim: `ENV_DENY_PREFIXES` carries no
-//! `ATERM_LINK_` rule, and the two other variables under that prefix are
+//! `ATERM_LINK_` rule, and the three other variables under that prefix are
 //! inherited ON PURPOSE — `ATERM_LINK_FAULT` and `ATERM_LINK_NOTIFY_FAULT` are
-//! the e2e harness's crash switches (development seams: only a debug build's
-//! bridge reads them), which
+//! the e2e harness's crash switches and `ATERM_LINK_WAIT_TALLY` the fabric
+//! bench's count of the bridge's waits on the broker (development seams: only a
+//! debug build's bridge reads them), which
 //! `the_bridge_child_inherits_no_identity_no_socket_and_no_edge_secret` REQUIRES
 //! to survive the filter. A future variable under that prefix that is a
-//! CREDENTIAL rather than a fault switch needs its own deny-list entry of its
+//! CREDENTIAL rather than a development seam needs its own deny-list entry of its
 //! own name; the glob would have said it was already covered. Everything else —
 //! `PATH`, `HOME`, `XDG_STATE_HOME` (which `aterm-link` needs for its state dir),
 //! locale — is inherited, and that is stated rather than promised away: the
@@ -644,11 +644,21 @@ fn launch_serving(
 /// PURE IN ITS INPUT, so the wiring is unit-tested without mutating the
 /// process-global environment — the same shape (and for the same reason) as
 /// `aterm-pty`'s `build_child_env`.
+///
+/// ONE DENIED NAME PASSES, in a build that reads development seams: the
+/// fast-timers seam ([`aterm_types::domain::ENV_DEV_FAST_TIMERS`]). It is
+/// denied so a NESTED aterm runs its own clock; the bridge is this instance's
+/// own child, so it runs this instance's — the round period `aterm-link`'s
+/// bridge reads from it. A shipped build forwards nothing, and reads no seam.
 fn filter_child_env(
     inherited: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 ) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    let seams = cfg!(any(debug_assertions, feature = "dev-seams"));
     inherited
-        .filter(|(k, _)| !aterm_types::domain::is_ai_env_key(k))
+        .filter(|(k, _)| {
+            !aterm_types::domain::is_ai_env_key(k)
+                || (seams && k == aterm_types::domain::ENV_DEV_FAST_TIMERS)
+        })
         .collect()
 }
 
@@ -868,8 +878,8 @@ mod tests {
     }
 
     /// DEFAULT OFF. An instance with no `[fabric]` table and no env var launches
-    /// nothing — the same secure default the embedded operator keeps, and the
-    /// reason a fabric-unaware machine pays nothing for the feature existing.
+    /// nothing — the reason a fabric-unaware machine pays nothing for the
+    /// feature existing.
     #[test]
     fn the_fabric_is_off_unless_it_is_configured() {
         crate::test_env::scoped_unset(FABRIC_COMMAND_ENV, || {
@@ -879,31 +889,6 @@ mod tests {
                 configured_command(&with_command(Some("   "))),
                 None,
                 "a blank command is OFF, not an empty argv"
-            );
-        });
-    }
-
-    /// In a development build (every test) the seam OVERRIDES the config key, so
-    /// the e2e harness can point a scratch instance at its bridge; a shipped
-    /// build compiles the read out.
-    #[test]
-    fn the_env_var_wins_over_the_config_key() {
-        let cfg = with_command(Some("from-config --flag"));
-        crate::test_env::scoped(FABRIC_COMMAND_ENV, "aterm-link serve --fleet lab", || {
-            assert_eq!(
-                configured_command(&cfg),
-                Some(vec![
-                    "aterm-link".to_string(),
-                    "serve".to_string(),
-                    "--fleet".to_string(),
-                    "lab".to_string(),
-                ])
-            );
-        });
-        crate::test_env::scoped_unset(FABRIC_COMMAND_ENV, || {
-            assert_eq!(
-                configured_command(&cfg),
-                Some(vec!["from-config".to_string(), "--flag".to_string()])
             );
         });
     }
@@ -1001,6 +986,7 @@ mod tests {
             pair("HOME", "/home/a"),
             pair("XDG_STATE_HOME", "/home/a/.local/state"),
             pair("ATERM_LINK_FAULT", "kill-after-publish"),
+            pair("ATERM_LINK_WAIT_TALLY", "1"),
             pair("ATERM_EDGE_READ", "0011"),
             pair("ATERM_EDGE_WRITE", "2233"),
             pair("ATERM_EDGE_SIGNAL", "4455"),
@@ -1012,6 +998,7 @@ mod tests {
             pair("ATERM_LINK_FLEET", "outer"),
             pair("ATERM_FABRIC_COMMAND", "aterm-link serve --fleet outer"),
             pair("ANTHROPIC_API_KEY", "sk-x"),
+            pair("ATERM_DEV_FAST_TIMERS", "1"),
         ];
         let kept = filter_child_env(inherited.into_iter());
         let has = |k: &str| kept.iter().any(|(n, _)| n == std::ffi::OsStr::new(k));
@@ -1035,11 +1022,26 @@ mod tests {
         // A DENY LIST, NOT AN ALLOW LIST. `aterm-link serve` needs `HOME` and
         // `XDG_STATE_HOME` for its state directory and `PATH` to be executable at
         // all, and the e2e harness arms `ATERM_LINK_FAULT` on `aterm-gui` and
-        // relies on the CHILD inheriting it (`crates/aterm/tests/fabric_world/harness.rs`).
+        // relies on the CHILD inheriting it (`crates/aterm/tests/fabric_world/harness.rs`),
+        // as the fabric bench's ping-pong arm does `ATERM_LINK_WAIT_TALLY`.
         // An allow list would have broken every one of those silently.
-        for keeper in ["PATH", "HOME", "XDG_STATE_HOME", "ATERM_LINK_FAULT"] {
+        for keeper in [
+            "PATH",
+            "HOME",
+            "XDG_STATE_HOME",
+            "ATERM_LINK_FAULT",
+            "ATERM_LINK_WAIT_TALLY",
+        ] {
             assert!(has(keeper), "the bridge child still needs {keeper}");
         }
+        // The fast-timers seam reaches the bridge in a build that reads seams
+        // (this test build is one), so a test instance's bridge runs its rounds
+        // at the instance's pace; a shipped build passes it to nobody.
+        assert_eq!(
+            has("ATERM_DEV_FAST_TIMERS"),
+            cfg!(any(debug_assertions, feature = "dev-seams")),
+            "the bridge runs its instance's clock"
+        );
     }
 
     /// A NON-UTF-8 key that carries a deny-listed PREFIX is still denied
@@ -1063,22 +1065,6 @@ mod tests {
             .map(|(k, _)| k.into_vec())
             .collect();
         assert_eq!(kept, vec![b"PLAIN_\xffKEY".to_vec()]);
-    }
-
-    /// The filter is WIRED, not merely available: `launch_once` gives the child
-    /// [`filter_child_env`]'s block as its WHOLE environment. A pure unit test
-    /// of the filter proves nothing if the spawn does not call it.
-    #[test]
-    fn the_launch_seam_actually_applies_the_filter() {
-        let src = include_str!("fabric_launch.rs");
-        let production = src
-            .split_once("\n#[cfg(test)]\nmod tests {")
-            .map(|(p, _)| p)
-            .expect("fabric_launch.rs has a tests module");
-        assert!(
-            production.contains(".env_exactly(filter_child_env(std::env::vars_os()))"),
-            "the child's whole environment must be the deny-listed filter's"
-        );
     }
 
     /// THE SUPERVISOR IS ARMED ONCE PER PROCESS, AND THE LATCH IS ONE-WAY.

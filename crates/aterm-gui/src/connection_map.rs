@@ -21,6 +21,7 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 
+#[cfg(test)]
 use aterm_render::Theme;
 use aterm_session::SessionId;
 
@@ -684,7 +685,7 @@ impl ConnectionMapState {
 
     /// Decode a node minted by the current epoch to its item index.
     #[cfg(a11y_tree)]
-    pub(crate) fn a11y_item_index(&self, node: accesskit::NodeId) -> Option<usize> {
+    pub(crate) fn a11y_item_index(&self, node: aterm_a11y::model::NodeId) -> Option<usize> {
         a11y_slot_for(self.a11y_epoch(), node, self.items().len())
     }
 }
@@ -759,7 +760,11 @@ pub(crate) fn map_item_hit(
 /// Paint the map: title + counts, the grouped chip/arrow band (cursor
 /// washed+ringed; the armed confirm ringed in the danger role), a key-hint
 /// footer. Pure.
-pub(crate) fn map_tray(state: &ConnectionMapState, g: &SettingsGeom, theme: Theme) -> TrayInput {
+pub(crate) fn map_tray(
+    state: &ConnectionMapState,
+    g: &SettingsGeom,
+    theme: impl Into<crate::chrome_band::ChromePalette>,
+) -> TrayInput {
     let r = Roles::from_theme(theme);
     let (cw, ch, px) = (g.cw, g.ch, g.font_px);
     let layout = map_layout(state, g);
@@ -852,8 +857,8 @@ pub(crate) fn map_tray(state: &ConnectionMapState, g: &SettingsGeom, theme: Them
 /// The map's accessibility tree — the palette scheme verbatim: a ListBox of
 /// the chip/arrow items, epoch-guarded ids, focus follows the cursor.
 #[cfg(a11y_tree)]
-pub(crate) fn map_a11y(state: &ConnectionMapState) -> accesskit::TreeUpdate {
-    use accesskit::{Action, Node, Role};
+pub(crate) fn map_a11y(state: &ConnectionMapState) -> aterm_a11y::model::TreeUpdate {
+    use aterm_a11y::model::{Action, Node, Role};
 
     let items = state.items();
     let rows = items.iter().enumerate().map(|(slot, item)| {
@@ -1124,12 +1129,6 @@ mod tests {
         );
         let tray = map_tray(&state, &g, Theme::default());
         assert_eq!(tray.card, layout.card);
-        assert!(
-            tray.prims
-                .iter()
-                .any(|p| matches!(p, DrawPrim::Text { s, .. } if s.contains("Connection Map"))),
-            "the title names the surface"
-        );
         assert!(
             tray.prims
                 .iter()

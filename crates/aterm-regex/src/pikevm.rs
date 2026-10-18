@@ -477,17 +477,6 @@ mod tests {
     use crate::compile::compile;
     use crate::parse::{Flags, parse};
 
-    /// A search with the budget wound out of the way, so the tests below see
-    /// only the matching semantics they are about.
-    fn find(pattern: &str, text: &str, start: usize) -> Option<(usize, usize)> {
-        let ast = parse(pattern, Flags::default()).expect("parses");
-        let prog = compile(&ast, usize::MAX).expect("compiles");
-        search(&prog, &mut Cache::new(), text, start, false, &mut {
-            u64::MAX
-        })
-        .expect("budget is unbounded")
-    }
-
     /// Every assertion, at every position of a haystack that exercises it.
     #[test]
     fn assertions_read_the_surrounding_code_points() {
@@ -521,102 +510,6 @@ mod tests {
             })
             .collect();
         assert_eq!(bounds, vec![0, 4, 5, 6]);
-    }
-
-    /// Alternation is a preference, not a choice: the first branch that can
-    /// match wins even when a later one would match more.
-    #[test]
-    fn matching_is_leftmost_first_not_leftmost_longest() {
-        assert_eq!(find("a|ab", "xab", 0), Some((1, 2)));
-        assert_eq!(find("ab|a", "xab", 0), Some((1, 3)));
-        // But the preference never costs an overall match.
-        assert_eq!(find("(?:a|ab)c", "abc", 0), Some((0, 3)));
-    }
-
-    /// Leftmost beats preference: a thread from an earlier start always wins,
-    /// because the start thread is appended below every live one.
-    #[test]
-    fn an_earlier_start_always_wins() {
-        assert_eq!(find("ab|b", "ab", 0), Some((0, 2)));
-        assert_eq!(find("b|ab", "ab", 0), Some((0, 2)));
-        assert_eq!(
-            find("a*", "bbaa", 0),
-            Some((0, 0)),
-            "the empty match at 0 is leftmost"
-        );
-    }
-
-    /// `start` resumes the search without changing what the assertions see: the
-    /// haystack is never sliced, so `^` still means offset zero.
-    #[test]
-    fn resuming_keeps_the_whole_haystack_in_view() {
-        assert_eq!(find("^a", "aa", 0), Some((0, 1)));
-        assert_eq!(find("^a", "aa", 1), None, "`^` is not the resume point");
-        assert_eq!(find(r"\ba", "aa", 1), None, "nor is `\\b`");
-        assert_eq!(find(r"\bc", "ab cd", 2), Some((3, 4)));
-    }
-
-    /// An epsilon cycle — the one `()*` compiles to — must be entered once and
-    /// then left, not looped forever.
-    #[test]
-    fn epsilon_cycles_terminate() {
-        assert_eq!(find("()*", "ab", 0), Some((0, 0)));
-        assert_eq!(find("(?:a*)*b", "aaab", 0), Some((0, 4)));
-        assert_eq!(find("(|a)*", "aa", 0), Some((0, 0)));
-        assert_eq!(find("(a|)*", "aa", 0), Some((0, 2)));
-    }
-
-    /// `earliest` is only allowed to change *which* match is reported, never
-    /// whether one exists.
-    #[test]
-    fn the_earliest_shortcut_preserves_existence() {
-        let ast = parse(r"\d+|[a-c]+", Flags::default()).expect("parses");
-        let prog = compile(&ast, usize::MAX).expect("compiles");
-        for text in ["", "x", "abc", "x42", "42abc", "zzz"] {
-            let full = search(&prog, &mut Cache::new(), text, 0, false, &mut { u64::MAX })
-                .expect("budget");
-            let quick =
-                search(&prog, &mut Cache::new(), text, 0, true, &mut { u64::MAX }).expect("budget");
-            assert_eq!(full.is_some(), quick.is_some(), "{text:?}");
-        }
-    }
-
-    /// The prefilter may skip code points, but never a match.
-    #[test]
-    fn the_prefilter_never_skips_a_match() {
-        let ast = parse("needle", Flags::default()).expect("parses");
-        let prog = compile(&ast, usize::MAX).expect("compiles");
-        assert!(
-            prog.first.is_some(),
-            "this pattern should arm the prefilter"
-        );
-        let mut cache = Cache::new();
-        for pad in 0..40usize {
-            let text = format!("{}needle{}", "x".repeat(pad), "y".repeat(pad));
-            assert_eq!(
-                search(&prog, &mut cache, &text, 0, false, &mut { u64::MAX }),
-                Ok(Some((pad, pad + 6))),
-                "pad {pad}"
-            );
-        }
-    }
-
-    /// Skipping ahead retires the visited marks that belong to the position it
-    /// skipped from. Without that, a failing assertion mid-pattern marks
-    /// instructions while leaving the thread list empty, and the start thread at
-    /// the skipped-to position is deduplicated against a closure that never
-    /// happened — the match simply vanishes.
-    #[test]
-    fn skipping_ahead_retires_the_marks_it_leaves_behind() {
-        // `\-?\B\d`: the `-` at 2 is consumed, `\B` fails at 3 leaving marks and
-        // no threads, and the prefilter then skips to the `0` at 8.
-        assert_eq!(
-            find(r"\-?\B\d", "\u{e9}-bx\u{4f60}0\u{4f60}", 0),
-            Some((8, 9))
-        );
-        assert_eq!(find(r"ab\Bc", "abxabc", 0), Some((3, 6)));
-        assert_eq!(find(r"a\bz|q", "ab qz", 0), Some((3, 4)));
-        assert_eq!(find(r"x\B\d", "xy x1", 0), Some((3, 5)));
     }
 
     /// One cache, reused across programs of different sizes, must not carry

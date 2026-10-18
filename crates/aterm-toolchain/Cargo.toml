@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# THE TOOLCHAIN, ONE SOURCE: where the pinned Trust toolchain is, where rustup is,
+# where plain targo puts its build intermediates, when a checkout is gone, and the
+# lease a run holds on the toolchain it resolved. Std only, so the check runner
+# (aterm-verify), the libc oracle's gate and the package manager (atpkg, which
+# re-exports every module under its old path) depend on it instead of compiling a
+# file of another crate by `#[path]`.
+
+[package]
+name = "aterm-toolchain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "The pinned Trust toolchain's discovery, rustup's home and binary, the shared build-cache rule, the gone-checkout rule and the toolchain lease, std only"
+
+[dependencies]
+# None: std only.
+
+[dev-dependencies]
+# The lease tests' scratch prefixes, and their one-minute hang detector.
+aterm-spec = { workspace = true }
+aterm-tempfile = { workspace = true }
+
+[lints]
+workspace = true

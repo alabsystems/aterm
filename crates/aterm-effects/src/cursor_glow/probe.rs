@@ -93,6 +93,7 @@ impl CursorGlow {
         self.row_prev.clear();
         self.row_cur_meta = None;
         self.row_prev_meta = None;
+        self.row_shown_meta = None;
         self.clear_neighbor_rows();
         self.kill_hint = None;
         self.bs_poof_hint = None;

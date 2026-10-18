@@ -497,29 +497,6 @@ mod tests {
         );
     }
 
-    /// A window with no editor surface (off macOS, `tab_strip_rows = 0`) refuses the command,
-    /// and `can_rename_session`, which the menu, palette and context-menu rows gate on, agrees.
-    #[test]
-    fn a_window_with_no_editor_surface_refuses_and_reports_it_cannot_rename() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        app.tab_strip_rows = 0;
-        assert!(
-            !app.can_rename_session(wid),
-            "no strip and no native editor means no surface"
-        );
-        assert!(!app.begin_active_session_rename(wid), "the command refuses");
-        assert_eq!(
-            app.rename_edit_session(wid),
-            None,
-            "and installs no invisible modal state"
-        );
-
-        app.tab_strip_rows = 1;
-        assert!(app.can_rename_session(wid), "a visible strip is a surface");
-        assert!(app.begin_active_session_rename(wid));
-    }
-
     /// Renaming a different tab while one edit is live commits the first, like every other way
     /// of leaving a field.
     #[test]
@@ -680,6 +657,10 @@ mod tests {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         assert_eq!(app.tab_strip_rows, 0, "negative control: no strip");
+        assert!(
+            !app.can_rename_session(wid),
+            "the menu/palette capability agrees with the write path"
+        );
 
         assert!(
             !app.begin_active_session_rename(wid),
@@ -692,6 +673,7 @@ mod tests {
 
         // With the strip on, the same call succeeds: the refusal is about presentation.
         app.tab_strip_rows = 1;
+        assert!(app.can_rename_session(wid), "a visible strip is a surface");
         assert!(app.begin_active_session_rename(wid));
         assert_eq!(app.rename_edit_session(wid), Some(0));
         assert!(

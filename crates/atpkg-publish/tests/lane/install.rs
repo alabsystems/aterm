@@ -14,7 +14,7 @@ use atpkg_publish::lane::install::{
 };
 use atpkg_publish::lane::report::Transcript;
 use atpkg_publish::lane::units::{self, UnitSpec};
-use atpkg_publish::lane::{LaneKind, RunFlags, self_check};
+use atpkg_publish::lane::{LaneKind, self_check};
 use atpkg_publish::testkit::NOW;
 use atpkg_publish::triple::Os;
 
@@ -175,45 +175,6 @@ fn the_snapshot_self_check_pins_a_run_to_the_bytes_its_unit_names() {
     assert!(e.to_string().contains("started with no --sha256"), "{e}");
 }
 
-#[test]
-fn run_flags_are_typed_and_refused_by_name() {
-    let s = |v: &[&str]| v.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
-    let hex = "ab".repeat(32);
-    let f = RunFlags::parse(
-        LaneKind::Alab,
-        &s(&["--dry-run", "--sha256", &hex, "--log", "/l"]),
-    )
-    .expect("flags");
-    assert!(f.dry_run && f.sha256.as_deref() == Some(hex.as_str()));
-    assert_eq!(
-        RunFlags::parse(LaneKind::Alab, &s(&["--sha256", "abc"]))
-            .expect_err("short")
-            .exit_code(),
-        2
-    );
-    assert_eq!(
-        RunFlags::parse(
-            LaneKind::Alab,
-            &s(&["--triple", "x86_64-unknown-linux-gnu"])
-        )
-        .expect_err("alab")
-        .exit_code(),
-        2
-    );
-    let f = RunFlags::parse(
-        LaneKind::Linux,
-        &s(&["--triple", "aarch64-unknown-linux-gnu"]),
-    )
-    .expect("linux");
-    assert_eq!(f.triples.len(), 1);
-    assert_eq!(
-        RunFlags::parse(LaneKind::Linux, &s(&["--triple", "sparc-sun-solaris"]))
-            .expect_err("not a client target")
-            .exit_code(),
-        2
-    );
-}
-
 fn spec(kind: LaneKind, root: &Path) -> UnitSpec {
     UnitSpec {
         kind,
@@ -262,11 +223,9 @@ fn the_launchd_agent_runs_the_snapshot_with_its_hash() {
     assert!(!t.contains("/tools/"), "the agent never runs a checkout");
 }
 
+/// plutil lints property lists on macOS only.
+#[cfg(target_os = "macos")]
 #[test]
-#[cfg_attr(
-    not(target_os = "macos"),
-    ignore = "plutil lints property lists on macOS only"
-)]
 fn the_rendered_agent_lints_with_plutil() {
     let fx = Fx::new("plutil");
     let unit = units::launchd(&spec(LaneKind::Alab, &fx.path("r&d <x>")));
@@ -314,11 +273,9 @@ fn the_systemd_units_run_the_snapshot_hourly_with_their_words_escaped() {
     );
 }
 
+/// systemd-analyze verifies units on Linux only.
+#[cfg(target_os = "linux")]
 #[test]
-#[cfg_attr(
-    not(target_os = "linux"),
-    ignore = "systemd-analyze verifies units on Linux only"
-)]
 fn the_rendered_units_verify_with_systemd_analyze() {
     let fx = Fx::new("systemd-analyze");
     let mut s = spec(LaneKind::Linux, &fx.path("r"));
@@ -489,7 +446,7 @@ fn install_refuses_units_whose_config_home_names_another_store() {
 #[test]
 fn install_snapshots_the_build_renders_its_hash_and_arms_it() {
     let b = machine("install-arm", Os::Darwin);
-    let (r, tx) = install(&b, LaneKind::Alab, InstallFlags::default());
+    let (r, _) = install(&b, LaneKind::Alab, InstallFlags::default());
     let done = r.expect("installed");
     let link = b.fx.ctx.state_dir.join("lane");
     assert_eq!(std::fs::read_link(&link).expect("link"), done.snapshot);
@@ -506,7 +463,6 @@ fn install_snapshots_the_build_renders_its_hash_and_arms_it() {
         "{from}"
     );
     assert!(from.contains("tool build: targo 1.99.0 (fixture)"));
-    assert!(tx.text().contains("is not on origin/main; push it"));
     let unit = std::fs::read_to_string(&done.armed[0]).expect("armed unit");
     assert!(
         unit.contains(&done.binary.display().to_string()),

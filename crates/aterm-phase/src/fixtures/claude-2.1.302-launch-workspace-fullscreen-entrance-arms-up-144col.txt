@@ -1,0 +1,41 @@
+# claude-code 2.1.302 · MEASURED 2026-10-17, `aterm ctl text` of a private headless aterm (144x40, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a frame of the fullscreen renderer's one-time entrance (CLAUDE_CODE_NO_FLICKER=1, --effort workspace, the first launch of this build on this config): the mascot walks in and raises both arms (row 1 opens with ▗▟, not ▐, and ends in ▄; row 2 is ▜██████▘), no wand yet, the text already at column 13; about 150 ms later it rests holding the wand
+
+▗▟▛███▛█▄    Claude Code v2.1.302
+ ▜██████▘    Opus 5.5 with xhigh effort · API Usage Billing
+ ▝▝   ▝▝     /private/tmp/at.9AQG/proj
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                 ◉ xhigh · workspace · /effort
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── workspace ─
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

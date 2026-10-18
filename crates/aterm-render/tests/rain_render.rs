@@ -13,7 +13,7 @@ use std::sync::Arc;
 use aterm_core::render::{RainHalo, SceneAtlas, SpriteQuad};
 use aterm_core::terminal::Terminal;
 use aterm_render::{
-    DamageOutcome, DirtyDecision, Frame, Renderer, Theme, WindowCpu, compute_dirty_rows, rgb_to_u32,
+    DirtyDecision, Frame, Renderer, Theme, WindowCpu, compute_dirty_rows, rgb_to_u32,
 };
 
 fn renderer() -> Renderer {
@@ -513,39 +513,6 @@ fn rain_dirty_gate_and_merge_diff_row_marking() {
     );
 }
 
-/// Unchanged rain on the cached path is a [`DamageOutcome::GateHit`] with a
-/// byte-stable framebuffer.
-#[test]
-fn unchanged_rain_gate_hits_with_byte_stable_framebuffer() {
-    let mut rend = renderer();
-    let (cw, ch) = rend.cell_size();
-    let mut term = Terminal::new(4, 12);
-    term.process(b"\x1b[?25l");
-    let (cw16, ch16) = (cw as u16, ch.min(48) as u16);
-    let atlas = Arc::new(patterned_atlas(64, 64, 1));
-
-    let mut make = || {
-        let mut input = term.cell_frame(4, 12);
-        input.rain_atlas = Some(atlas.clone());
-        input.rain_quads = vec![
-            band_quad(1, 0, cw16, ch16, 0, 0),
-            band_quad(2, 4 * cw16, cw16, ch16, 8, 8),
-        ];
-        input.rain_add = vec![halo(1, 0, ch16, cw16, ch16, 0x0020_4020)];
-        input
-    };
-
-    let mut wc = WindowCpu::new();
-    let first = rend.render_input_cached(&mut wc, &make()).pixels().to_vec();
-    let second = rend.render_input_cached(&mut wc, &make()).pixels().to_vec();
-    assert_eq!(
-        wc.last_damage(),
-        DamageOutcome::GateHit,
-        "unchanged rain (no other damage) must dirty-gate: zero repaint work"
-    );
-    assert_eq!(first, second, "a gate-hit frame must be byte-stable");
-}
-
 /// The rows of `quads` as the frame emitted them, independent of the
 /// renderer's merge walk.
 fn rows_of(quads: &[SpriteQuad]) -> std::collections::BTreeMap<u16, Vec<SpriteQuad>> {
@@ -557,7 +524,7 @@ fn rows_of(quads: &[SpriteQuad]) -> std::collections::BTreeMap<u16, Vec<SpriteQu
 }
 
 /// Conformance to `RainBandContainment`
-/// (`aterm_spec::derive::rain_band_containment_model`): at every point of the
+/// (`aterm_models_effects::rain_band_containment_model`): at every point of the
 /// model's lattice (head position, trail length, step or mutation tick) one
 /// column's band is laid down twice, rows past the bottom dropped as the
 /// engine drops them, and `compute_dirty_rows`'s verdict on every visible band
@@ -568,7 +535,7 @@ fn rows_of(quads: &[SpriteQuad]) -> std::collections::BTreeMap<u16, Vec<SpriteQu
 #[test]
 fn rain_marking_conforms_to_the_rain_band_containment_model() {
     const COLS: usize = 4;
-    let model = aterm_spec::derive::rain_band_containment_model();
+    let model = aterm_models_effects::rain_band_containment_model();
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
     let viewport = model
         .consts

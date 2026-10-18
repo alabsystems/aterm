@@ -34,7 +34,6 @@ pub(crate) fn config(style: GlowStyle) -> GlowConfig {
         ring: true,
         beam: false,
         head_dx: 0.5,
-        pack: None,
     }
 }
 

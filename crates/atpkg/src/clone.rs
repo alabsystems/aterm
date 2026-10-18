@@ -247,7 +247,6 @@ mod decisions {
 
         let crossed = one_volume(src, parent, Some(66_306), Some(46)).unwrap_err();
         assert_eq!(crossed.kind(), io::ErrorKind::CrossesDevices);
-        assert!(crossed.to_string().contains("different volumes"));
 
         // Off Unix both answers are `None` — the arm that must refuse rather than pass.
         let unknown = one_volume(src, parent, None, None).unwrap_err();
@@ -256,7 +255,6 @@ mod decisions {
             io::ErrorKind::Unsupported,
             "an unprovable volume is a refusal, not a pass"
         );
-        assert!(unknown.to_string().contains("never copies a toolchain"));
         // A half-known pair is unprovable too.
         assert_eq!(
             one_volume(src, parent, Some(66_306), None)

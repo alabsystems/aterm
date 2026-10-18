@@ -148,3 +148,37 @@ pub fn machine(installed: &[&str]) -> Box3 {
         state,
     }
 }
+
+/// A [`super::fleet::Fetcher`] that serves fixed bodies by URL and records what it was asked;
+/// any other URL is unreachable.
+#[derive(Default)]
+pub struct FakeFetcher {
+    bodies: Mutex<Vec<(String, Vec<u8>)>>,
+    asked: Mutex<Vec<String>>,
+}
+
+impl FakeFetcher {
+    /// Serves `body` at `url` (replacing what it served there).
+    pub fn serve(&self, url: &str, body: &[u8]) {
+        let mut bodies = self.bodies.lock().expect("bodies");
+        bodies.retain(|(u, _)| u != url);
+        bodies.push((url.to_string(), body.to_vec()));
+    }
+
+    /// The URLs asked, in order.
+    pub fn asked(&self) -> Vec<String> {
+        self.asked.lock().expect("asked").clone()
+    }
+}
+
+impl super::fleet::Fetcher for FakeFetcher {
+    fn get(&self, url: &str, max: u64) -> Result<Vec<u8>, String> {
+        self.asked.lock().expect("asked").push(url.to_string());
+        let bodies = self.bodies.lock().expect("bodies");
+        match bodies.iter().find(|(u, _)| u == url) {
+            Some((_, b)) if b.len() as u64 > max => Err("over the cap".to_string()),
+            Some((_, b)) => Ok(b.clone()),
+            None => Err("unreachable".to_string()),
+        }
+    }
+}

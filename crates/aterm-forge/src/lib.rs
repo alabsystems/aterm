@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-forge`: the owned-fork production line for aterm's third-party
-//! surface, behind the `targo --unverified forge` alias.
-//!
-//! # Why this exists
+//! `aterm-forge`: the owned-fork production line for aterm's third-party surface, behind the
+//! `targo --unverified forge` alias.
 //!
 //! The shipped `aterm` binary resolves many packages aterm did not write
-//! (counts in `measured::MAC_ARM` / `measured::LINUX`; the same-owner astream
+//! (counts per cell in `tools/forge-budget.tsv`; the same-owner astream
 //! submodule is excluded via `provenance::is_first_party`). For that surface
 //! every build lane disables in-compilation verification (`-Ztrust-verify=off`,
 //! appended by `targo --unverified`; `.cargo/config.toml` carried it until
@@ -17,8 +15,8 @@
 //! Forge shrinks it on a measured, ratcheted, provenance-carrying basis: it
 //! surveys the graph, attributes each package's true cost, notarizes every fork
 //! against its pristine upstream, and refuses silent regressions. Pinned counts
-//! live only in `measured`; prose names the constant rather than copying
-//! digits.
+//! live only in the ratchet, `tools/forge-budget.tsv`; prose names the row
+//! rather than copying digits.
 //!
 //! # What it does not claim
 //!
@@ -35,15 +33,14 @@
 //! | [`model`] | package identity, graph, cells, per-package facts |
 //! | [`resolve`] | `cargo tree` → [`model::Graph`], per cell, offline |
 //! | [`dominator`] | `dom(C) = reach(root) \ reach(root, block C)` — true cost |
-//! | [`loc`] | LOC, unsafe TOKENS, build scripts, proc-macro flags, SPDX |
+//! | [`loc`] | LOC, unsafe tokens, build scripts, proc-macro flags, SPDX |
 //! | [`survey`] | the inventory report, emitted (never transcribed) |
 //! | [`blame`] | which first-party manifest line forces a given package/feature |
-//! | [`policy`] | `vendor/forge.toml` — the fork ledger, hand-edited, held to the tree by `check` |
+//! | [`policy`] | `vendor/forge.toml` — the hand-edited fork ledger, held to the tree by `check` |
 //! | [`budget`] | `tools/forge-budget.tsv` — the lower-only ratchet |
 //! | [`attest`] | provenance, license and `[patch]`-liveness obligations |
-//! | [`check`] | the gate reporter: all of the above, no compilation |
+//! | [`check`] | the `forge` check: all of the above, no compilation |
 //! | [`serde_attrs`] | every `#[serde(...)]` key and form: the first-party derive's closed set |
-//! | `measured` | test-only: the pinned per-cell baseline, in ONE place |
 #![allow(
     clippy::disallowed_types,
     reason = "never linked into the shipped binary: the third-party survey behind targo --unverified forge"
@@ -57,23 +54,6 @@ pub mod deny;
 mod direct_vendor;
 pub mod dominator;
 pub mod loc;
-/// The pinned measurement baseline, read by every test that asserts a real
-/// number about this tree. Test-only: shipped verbs measure, never consult it.
-#[cfg(test)]
-pub mod measured;
-#[cfg(test)]
-pub(crate) mod test_support {
-    use std::path::{Path, PathBuf};
-
-    /// The workspace root (aterm-forge sits two levels under it).
-    pub(crate) fn repo_root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .expect("crates/aterm-forge sits two levels under the workspace root")
-            .to_path_buf()
-    }
-}
 pub mod model;
 pub mod policy;
 pub mod provenance;
@@ -85,7 +65,7 @@ pub mod survey;
 pub mod exit {
     /// Every obligation held.
     pub const PASS: u8 = 0;
-    /// A policy obligation failed — the check is RED.
+    /// A policy obligation failed.
     pub const FAIL: u8 = 1;
     /// The command line was wrong.
     pub const USAGE: u8 = 2;
@@ -93,16 +73,15 @@ pub mod exit {
     pub const COULD_NOT_RUN: u8 = 3;
 }
 
-/// The house verdict shape, mirroring `aterm_census::CensusOutcome`: the log is
-/// returned rather than printed so each consumer routes it (verify → its log,
-/// build gate → compile error).
+/// The verdict shape, mirroring `aterm_census::CensusOutcome`: the log is returned rather than
+/// printed so each consumer routes it.
 pub struct Outcome {
     pub ok: bool,
     pub log: String,
 }
 
-/// The honest limits of this tool, printed verbatim in every RED diagnostic so
-/// the report cannot over-claim.
+/// The limits of this tool, printed verbatim in every red diagnostic so the report cannot
+/// over-claim.
 pub const PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits of forge):
       - RESOLUTION, not compilation: the graph comes from `targo tree --locked
         --offline -e normal`, which is cargo's own resolver. Feature unification

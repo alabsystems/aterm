@@ -79,12 +79,18 @@ fn fields_table_is_in_key_order_and_names_are_unique() {
             "v", "t", "ep", "seq", "ms", "op", "node", "k", "par", "by", "src", "conf",
         ] {
             assert_ne!(key.word(), header, "a field key spells a header token");
+            assert_eq!(Key::from_word(header), None, "{header} is no field key");
         }
+    }
+    for stranger in ["", "Out", "out ", "nope", "dur_m", "titlex"] {
+        assert_eq!(Key::from_word(stranger), None, "{stranger:?}");
     }
 }
 
+/// Every word of every closed vocabulary is one wire token, and no vocabulary
+/// names a word twice (two changes that each add the same word merge cleanly).
 #[test]
-fn every_vocabulary_word_is_one_wire_token() {
+fn every_vocabulary_word_is_one_wire_token_named_once() {
     for list in [
         BOX_WORDS,
         WALL_WORDS,
@@ -100,12 +106,13 @@ fn every_vocabulary_word_is_one_wire_token() {
         STATE_WORDS,
         CAUSE_WORDS,
     ] {
-        for w in list {
+        for (i, w) in list.iter().enumerate() {
             assert!(
                 !w.is_empty() && w.bytes().all(|b| b.is_ascii_graphic() && b != b'%'),
                 "{w:?} is not one token"
             );
             assert_eq!(aterm_codec::pct::encode(w), *w);
+            assert!(!list[..i].contains(w), "{w:?} is listed twice");
         }
     }
     for k in Kind::ALL {
@@ -173,6 +180,47 @@ fn unknown_tokens_are_skipped_and_unknown_words_read_unknown() {
         assert!(decode(bad).is_err(), "{bad:?}");
     }
     assert_eq!(decode_bus("v=1 t=5 ev=x"), Err(DecodeError::Opaque));
+}
+
+/// A BUS BODY'S UNKNOWN WORDS ARE NOT LOSS (§3.4: a new word never changes
+/// `v`): an operation or a node level this build does not know decodes, with
+/// its `ep`, `seq` and `ms`, to a record no bus class holds — a mark of kind
+/// `unknown` on the session, its fields dropped — while a body missing its
+/// seq, operation, node or kind is still refused.
+#[test]
+fn a_bus_bodys_unknown_words_decode_to_a_record_no_bus_class_holds() {
+    for body in [
+        "v=2 t=7 ep=3 seq=9 ms=4 op=zzzop node=t1 k=need word=help src=mark conf=claim",
+        "v=2 t=7 ep=3 seq=9 ms=4 op=zzzop src=mark conf=claim",
+        "v=2 t=7 ep=3 seq=9 ms=4 op=open node=q1 par=- k=turn src=mark conf=claim",
+        "v=2 t=7 ep=3 seq=9 ms=4 op=close node=t0 k=turn out=ok src=mark conf=claim",
+    ] {
+        let b = decode_bus(body).unwrap_or_else(|e| panic!("{e:?}: {body}"));
+        assert_eq!(
+            (b.ep, b.rec.seq, b.ms, b.rec.t),
+            (3, 9, Some(4), 7),
+            "{body}"
+        );
+        assert!(!b.rec.is_bus_class(), "{body}");
+        assert_eq!(
+            (b.rec.op, b.rec.node, b.rec.par, b.rec.k),
+            (Op::Mark, Node::SESSION, None, Kind::Unknown),
+            "{body}"
+        );
+        assert!(b.rec.f.is_empty(), "nothing of it is read: {body}");
+        assert_eq!((b.rec.src, b.rec.conf), (Src::Mark, Conf::Claim));
+    }
+    for (body, err) in [
+        (
+            "v=2 t=7 ep=3 ms=4 op=zzzop node=t1 k=turn",
+            DecodeError::Seq,
+        ),
+        ("v=2 t=7 ep=3 seq=9 ms=4 node=t1 k=turn", DecodeError::Op),
+        ("v=2 t=7 ep=3 seq=9 ms=4 op=open k=turn", DecodeError::Node),
+        ("v=2 t=7 ep=3 seq=9 ms=4 op=open node=t1", DecodeError::Kind),
+    ] {
+        assert_eq!(decode_bus(body), Err(err), "{body}");
+    }
 }
 
 #[test]

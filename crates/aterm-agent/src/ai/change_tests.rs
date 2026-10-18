@@ -417,6 +417,32 @@ fn a_tracked_link_is_named_too() {
     assert!(!c.diff.contains("PRIVATE-MARKER"));
 }
 
+#[test]
+fn an_unborn_head_repository_includes_staged_files_and_counts_emitted_hunks() {
+    let dir = aterm_tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("unborn");
+    std::fs::create_dir_all(&root).expect("root");
+    git(&root, &["init", "-q"]);
+    std::fs::write(root.join("staged.rs"), "fn staged() {}\n").expect("staged");
+    git(&root, &["add", "staged.rs"]);
+    std::fs::write(root.join("untracked.rs"), "fn untracked() {}\n").expect("untracked");
+    std::fs::write(root.join("blob.bin"), b"\x00\x01\x02").expect("binary");
+    let r = Repo { _dir: dir, root };
+    let c = take(&r, &Base::Uncommitted).expect("unborn change");
+    assert!(
+        c.diff.contains("+++ b/staged.rs") && c.diff.contains("+fn staged() {}"),
+        "{}",
+        c.diff
+    );
+    assert!(
+        c.diff.contains("+++ b/untracked.rs") && c.diff.contains("+fn untracked() {}"),
+        "{}",
+        c.diff
+    );
+    assert!(!c.diff.contains("blob.bin"), "{}", c.diff);
+    assert_eq!(c.files, 2);
+}
+
 #[cfg(unix)]
 fn root_whitespace_keeps_the_selected_repository(suffix: &str) {
     let mut r = repo();

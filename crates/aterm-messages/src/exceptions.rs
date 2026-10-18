@@ -66,8 +66,8 @@ pub enum Family {
     /// off. Raised at the give-up and cleared when the epoch heals, by event.
     Render,
     /// What a program in a tab asked the terminal for and the owner's own
-    /// configuration refused (`terminal.<cause>`): a palette set under
-    /// `allow_palette_reconfigure = false`. One line for every tab, since the
+    /// configuration refused (`terminal.<cause>`): a palette set under an
+    /// explicit `allow_palette_reconfigure = false`. One line for every tab, since the
     /// setting is one; raised by event at a session's first refusal.
     Terminal,
 }

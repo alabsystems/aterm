@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 bind for `ChromeRegrowFloor` (`aterm_spec::derive::chrome_regrow_floor_model`):
+//! Tier-1 bind for `ChromeRegrowFloor` (`aterm_models_gui::chrome_regrow_floor_model`):
 //! after any rise of a window's chrome rows, no chrome source's quiet fall re-grids the
 //! window back inside `CHROME_REGROW_SETTLE`.
 //!
@@ -22,7 +22,8 @@ use std::time::{Duration, Instant};
 use aterm_messages::chrome::CHROME_REGROW_SETTLE;
 use aterm_messages::presence::drive::{self, Desk};
 use aterm_messages::{Message, MessageId, SHRINK_QUIET, Severity, WallStamp, tags};
-use aterm_spec::derive::{Model, chrome_regrow_floor_model};
+use aterm_models_gui::chrome_regrow_floor_model;
+use aterm_spec::derive::Model;
 use aterm_spec::interp::{self, State};
 
 use crate::presence::StoryVerb;
@@ -710,31 +711,31 @@ fn only_a_window_whose_grid_moves_for_its_chrome_has_a_floor() {
 // The machine's other actions: environment steps, time, the frame and the `Buggy`
 // members. The re-grids carry `#[refines]` anchors on `App::regrid_message_band` and
 // `App::regrid_window_for_chrome_rows`.
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ChromeRegrowFloor",
     action = "BandUnwant",
     reason = "The band row's want drops (a dismissal, a hold's end): the center's state. \
               Tier-1 dismisses a real row and settles the real host step."
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ChromeRegrowFloor",
     action = "BandBack",
     reason = "A band row wanted again while its shrink waits: no re-grid (D1). The engine's \
               `commit_rows` Equal arm; pinned by the center's own D1 tests."
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ChromeRegrowFloor",
     action = "PresUnwant",
     reason = "The presence row's want drops (a lease ends): the session's facts. Tier-1 ends a \
               real turn lease and delivers its wake."
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ChromeRegrowFloor",
     action = "PresBack",
     reason = "The presence row wanted again while its fold waits: no re-grid (ruling 394). \
               Pinned by `presence_drive_tests`' fold-quiet tests."
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ChromeRegrowFloor",
     action = "PresRead",
     reason = "A person's keystroke reads a calm story: the fold law's input. Tier-1 drives the \
@@ -742,49 +743,49 @@ fn only_a_window_whose_grid_moves_for_its_chrome_has_a_floor() {
               the shipping key arm (`App::dispatch_hw_key`) reads through \
               `drive::human_acted_on` after `on_key`."
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ChromeRegrowFloor",
     action = "BandQuiet",
     reason = "Time: the band's own `SHRINK_QUIET` runs out. Tier-1 steps the clock past \
               `MessageCenter::quiet_shrink_at`."
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ChromeRegrowFloor",
     action = "PresQuiet",
     reason = "Time: the presence row's own `FOLD_QUIET` runs out. Tier-1 steps the clock past \
               `presence::drive::fold_due`."
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ChromeRegrowFloor",
     action = "Tick",
     reason = "Time: the floor's `CHROME_REGROW_SETTLE` runs out. Tier-1 steps the clock past \
               the window's `RegrowFloor::floor`."
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ChromeRegrowFloor",
     action = "Cramp",
     reason = "The window's frame loses its room (a drag, a zoom): the OS window's size, \
               booked by `on_resize`. Tier-1 takes the stand-in's terminal rows to none and \
               drives both takes (`BandTaken`, `PresTaken`) inside the floor."
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ChromeRegrowFloor",
     action = "Uncramp",
     reason = "The window's frame gets its room back: the OS window's size."
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ChromeRegrowFloor",
     action = "BandFallOwnQuiet",
     reason = "`Buggy = 1` mutant: the band's quiet shrink before the floor. The Tier-1 \
               negative control is admitted only as this."
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ChromeRegrowFloor",
     action = "PresFallOwnQuiet",
     reason = "`Buggy = 1` mutant: the presence fold before the floor. The Tier-1 negative \
               control is admitted only as this."
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ChromeRegrowFloor",
     action = "Restart",
     reason = "`Buggy = 1` mutant: a floor re-anchored on a step that is no rise. No shipping \

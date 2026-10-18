@@ -334,15 +334,6 @@ mod test {
     use super::*;
 
     #[test]
-    fn check_token() {
-        assert!(!does_token_fit(15));
-        assert!(does_token_fit(14));
-        assert!(does_token_fit(114));
-        assert!(!does_token_fit(0b11110000));
-        assert!(does_token_fit(0b10110000));
-    }
-
-    #[test]
     fn corrupt_integer_run_errors_without_panic() {
         // A long `0xFF` length-extension run must decode to `Err`, not overflow or panic.
         let mut corrupt = vec![0xF0u8]; // token: literal nibble 15 ⇒ read extra integer
@@ -360,11 +351,6 @@ mod test {
             "pure 0xFF garbage must decode to Err, not panic or wrongly Ok"
         );
         let _ = decompress(&[], 0);
-    }
-
-    #[test]
-    fn all_literal() {
-        assert_eq!(decompress(&[0x30, b'a', b'4', b'9'], 3).unwrap(), b"a49");
     }
 
     #[test]

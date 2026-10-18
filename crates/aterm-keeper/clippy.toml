@@ -1,0 +1,55 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# aterm-keeper's lint config: the workspace clippy.toml's rows (clippy reads only the
+# nearest file, so they are repeated here word for word; the root file says why
+# each exists) and THE KEEPER MAPS NO REGION.
+#
+# THE KEEPER MAPS NO REGION. The keeper holds each session's crash-restore region
+# beside its master as a read-only descriptor and never maps it (the crash-restore
+# plan §5): mapped, every session's screen and scrollback would sit in the keeper's
+# memory and jetsam's ledger, against its rule that it never touches PTY bytes
+# (keeper decision 10), on which the region's privacy argument rests. aterm-uds's
+# region API maps (`Region::create` read-write, `Region::map_readonly` read-only,
+# the writable-custody test twin read-write), and so do libc's calls; these rows
+# name them by path, so an import of any spelling (a grouped `use`, an alias) is
+# caught. The keeper's own tests play the windows and make regions: each such
+# statement carries the `#[expect]`. A local `extern` declaration of `mmap` names no
+# path these rows could; the aterm-census guard `keeper-no-mmap` fences those words.
+disallowed-methods = [
+  { path = "std::fs::File::lock", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
+  { path = "std::fs::File::try_lock", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
+  { path = "std::fs::File::lock_shared", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
+  { path = "std::fs::File::try_lock_shared", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
+  { path = "std::fs::File::sync_all", reason = "finish the write with aterm_durable::durable or aterm_durable::ordered: name what a power loss may leave (clippy.toml: a chosen flush)" },
+  { path = "std::fs::File::sync_data", reason = "finish the write with aterm_durable::durable_data or aterm_durable::ordered: name what a power loss may leave (clippy.toml: a chosen flush)" },
+  { path = "libc::flock", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
+  { path = "rustix::fs::flock", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
+  { path = "nix::fcntl::flock", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
+  { path = "libc::forkpty", reason = "the shell runs through aterm-pty's confined spawn (clippy.toml: the confined shell)" },
+  { path = "libc::execvp", reason = "the shell runs through aterm-pty's confined spawn (clippy.toml: the confined shell)" },
+  { path = "std::process::abort", reason = "die by SIGKILL: aterm_uds::process::kill_self_now() (clippy.toml: no core-dump death)" },
+  { path = "libc::abort", reason = "die by SIGKILL: aterm_uds::process::kill_self_now() (clippy.toml: no core-dump death)" },
+  { path = "libc::raise", reason = "a raised core signal writes a crash report: die by SIGKILL (clippy.toml: no core-dump death)" },
+  { path = "std::os::windows::process::CommandExt::creation_flags", reason = "set a child's console with aterm_uds::spawn (clippy.toml: one Windows console decision)", allow-invalid = true },
+  { path = "windows_sys::Win32::System::Threading::CreateProcessW", reason = "start children with aterm_uds::spawnfd::command (clippy.toml: one Windows console decision)", allow-invalid = true },
+  { path = "windows_sys::Win32::System::Threading::CreateProcessA", reason = "start children with aterm_uds::spawnfd::command (clippy.toml: one Windows console decision)", allow-invalid = true },
+  { path = "windows_sys::Win32::UI::Shell::ShellExecuteW", reason = "start children with aterm_uds::spawnfd::command (clippy.toml: one Windows console decision)", allow-invalid = true },
+  { path = "windows_sys::Win32::UI::Shell::ShellExecuteExW", reason = "start children with aterm_uds::spawnfd::command (clippy.toml: one Windows console decision)", allow-invalid = true },
+  { path = "windows::Win32::System::Threading::CreateProcessW", reason = "start children with aterm_uds::spawnfd::command (clippy.toml: one Windows console decision)", allow-invalid = true },
+  { path = "windows::Win32::UI::Shell::ShellExecuteW", reason = "start children with aterm_uds::spawnfd::command (clippy.toml: one Windows console decision)", allow-invalid = true },
+  { path = "aterm_objc::msg", reason = "use checked_msg: the debug-build send checks the prototype against the runtime (clippy.toml: a checked send)" },
+  { path = "wgpu::Device::create_render_pipeline", reason = "build it from its pipeline-table row: aterm_gpu's pipeline_table::build_wgpu (clippy.toml: one pipeline table)", allow-invalid = true },
+  { path = "winit::event_loop::EventLoop::new", reason = "build the loop with aterm_gui's driver_event_loop_builder (clippy.toml: a quiet event loop)" },
+  { path = "winit::event_loop::EventLoop::builder", reason = "build the loop with aterm_gui's driver_event_loop_builder (clippy.toml: a quiet event loop)" },
+  { path = "winit::event_loop::EventLoop::with_user_event", reason = "build the loop with aterm_gui's driver_event_loop_builder (clippy.toml: a quiet event loop)" },
+  { path = "aterm_uds::shm::Region::create", reason = "the keeper maps no crash-restore region: it holds the read-only descriptor a window sends (clippy.toml: the keeper maps no region)" },
+  { path = "aterm_uds::shm::Region::map_readonly", reason = "the keeper maps no crash-restore region: it holds the read-only descriptor a window sends (clippy.toml: the keeper maps no region)" },
+  { path = "aterm_uds::shm::testing::create_with_writable_custody", reason = "the keeper maps no crash-restore region: it holds the read-only descriptor a window sends (clippy.toml: the keeper maps no region)" },
+  { path = "libc::mmap", reason = "the keeper maps no crash-restore region: it holds the read-only descriptor a window sends (clippy.toml: the keeper maps no region)" },
+  { path = "libc::munmap", reason = "the keeper maps no crash-restore region: it holds the read-only descriptor a window sends (clippy.toml: the keeper maps no region)" },
+  { path = "libc::mprotect", reason = "the keeper maps no crash-restore region: it holds the read-only descriptor a window sends (clippy.toml: the keeper maps no region)" },
+]
+disallowed-types = [
+  { path = "std::process::Command", reason = "build children with aterm_uds::spawnfd::command, which hands them stdio and nothing else (clippy.toml: one child constructor)" },
+]

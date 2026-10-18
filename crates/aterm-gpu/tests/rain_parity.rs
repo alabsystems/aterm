@@ -8,10 +8,12 @@
 // `(c*f+127)/255`, the GPU multiplies in f32 in `fs_sprite_over`, and the
 // tests assert non-trivial tints so the check is never vacuous.
 //
-// No GPU or no font: no-op. Byte-exact additive checks also skip on downlevel
-// (sRGB-offscreen) adapters via `additive_is_byte_exact`.
+// No GPU or no font: COULD NOT RUN. On a downlevel (sRGB-offscreen) adapter
+// (`additive_is_byte_exact`) a test runs its other checks, then ends COULD NOT
+// RUN naming the byte-exact comparisons it could not make (`common::ByteExact`).
 
 use crate::common;
+use crate::common::ByteExact;
 use crate::rain_common::RainScene;
 use aterm_core::terminal::Terminal;
 use aterm_render::{Theme, WindowCpu};
@@ -28,6 +30,7 @@ use crate::common::{backends, max_channel_delta};
 ///   (d) sprites + halos: within the sprite bar.
 #[test]
 fn rain_effect_only_parity_pinned_over_bg_and_text() {
+    let exact = ByteExact::default();
     let theme = Theme::default();
     let (mut cpu, mut gpu) = backends(18.0, theme);
     let mut win = aterm_gpu::WindowGpu::new();
@@ -104,18 +107,16 @@ fn rain_effect_only_parity_pinned_over_bg_and_text() {
         "rain_add halo GPU vs CPU max per-channel delta = {delta_a} ({} halo quads)",
         scene.add.len()
     );
-    if gpu.additive_is_byte_exact() {
+    if exact.holds(&gpu, "byte-exact rain_add gate") {
         assert_eq!(
             delta_a, 0,
             "rain_add premultiplied additive must be BYTE-EXACT CPU==GPU (got {delta_a})"
         );
-    } else {
-        eprintln!("SKIP byte-exact rain_add gate: downlevel sRGB offscreen (linear add)");
     }
 
     // (d) The full frame (sprites + halos), as the gui sends it: within the
-    // sprite bar.
-    if gpu.additive_is_byte_exact() {
+    // sprite bar, which holds only where the halos composite byte-exact.
+    if exact.holds(&gpu, "the full rain frame within the sprite bar") {
         let mut full_in = term.cell_frame(rows, cols);
         scene.apply(&mut full_in);
         let cpu_f = cpu.render_input(&full_in);

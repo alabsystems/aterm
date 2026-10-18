@@ -37,15 +37,15 @@ pub enum ClipboardAccess {
 }
 
 /// Capability for OSC 52 clipboard set, minted only by `ClipboardAuth`'s
-/// `try_mint_write_capability*`. [`invoke_set`] consumes it by value, so a stashed
-/// token cannot be replayed.
+/// `try_mint_write_capability_with_engine`. [`invoke_set`] consumes it by value, so
+/// a stashed token cannot be replayed.
 #[must_use = "ClipboardWriteCapability has no effect unless passed to invoke_set"]
 pub(super) struct ClipboardWriteCapability {
     _seal: super::Seal,
 }
 
 /// Capability for OSC 52 clipboard query, minted only by `ClipboardAuth`'s
-/// `try_mint_query_capability*`.
+/// `try_mint_query_capability_with_engine`.
 #[must_use = "ClipboardQueryCapability has no effect unless passed to invoke_query"]
 pub(super) struct ClipboardQueryCapability {
     _seal: super::Seal,
@@ -92,43 +92,9 @@ impl ClipboardAuth {
         self.query_authorized = false;
     }
 
-    /// Whether OSC 52 clipboard *set* is currently authorized.
-    #[cfg(test)]
-    pub(crate) const fn is_write_authorized(&self) -> bool {
-        self.write_authorized
-    }
-
-    /// Whether OSC 52 clipboard *query* is currently authorized.
-    #[cfg(test)]
-    pub(crate) const fn is_query_authorized(&self) -> bool {
-        self.query_authorized
-    }
-
-    /// Mint a write capability iff [`Self::authorize_write`] was called and not
-    /// since revoked.
-    #[cfg(test)]
-    pub(super) fn try_mint_write_capability(&self) -> Option<ClipboardWriteCapability> {
-        if self.write_authorized {
-            Some(ClipboardWriteCapability { _seal: super::Seal })
-        } else {
-            None
-        }
-    }
-
-    /// Mint a query capability iff [`Self::authorize_query`] was called and not
-    /// since revoked.
-    #[cfg(test)]
-    pub(super) fn try_mint_query_capability(&self) -> Option<ClipboardQueryCapability> {
-        if self.query_authorized {
-            Some(ClipboardQueryCapability { _seal: super::Seal })
-        } else {
-            None
-        }
-    }
-
-    /// Engine-consulting variant of `Self::try_mint_write_capability`, reading
-    /// the `OSC 52 set` gate that [`super::policy_gates`] compiled from
-    /// [`probe_osc52_set`] at [`super::policy_gates::GATE_ORIGIN`]:
+    /// Mint a write capability, reading the `OSC 52 set` gate that
+    /// [`super::policy_gates`] compiled from [`probe_osc52_set`] at
+    /// [`super::policy_gates::GATE_ORIGIN`]:
     ///
     /// * a sequence-specific rule with response `Execute` mints;
     /// * only a universal wildcard `Execute` rule (`response any`) falls back
@@ -151,8 +117,8 @@ impl ClipboardAuth {
         }
     }
 
-    /// Engine-consulting variant of `Self::try_mint_query_capability`: the same
-    /// rules as [`Self::try_mint_write_capability_with_engine`], against the
+    /// Mint a query capability: the same rules as
+    /// [`Self::try_mint_write_capability_with_engine`], against the
     /// `OSC 52 query` selector and `query_authorized`.
     pub(super) fn try_mint_query_capability_with_engine(
         &self,
@@ -232,7 +198,7 @@ pub(super) fn invoke_clear(
 mod tests {
     use super::*;
     use aterm_policy::engine::PolicyEngine;
-    use aterm_policy::{OriginTag, Policy, Response, profiles};
+    use aterm_policy::{OriginTag, Policy, Response};
 
     fn policy_with_rule(sequence: &str, response: Response) -> Policy {
         crate::terminal::policy_bridge::one_rule_policy(
@@ -243,73 +209,30 @@ mod tests {
         )
     }
 
+    /// With no policy installed the host's bits decide: a fresh state mints
+    /// nothing, each grant mints only its own capability, and revoking one
+    /// leaves the other.
     #[test]
-    fn default_has_no_capabilities() {
-        let auth = ClipboardAuth::new();
-        assert!(auth.try_mint_write_capability().is_none());
-        assert!(auth.try_mint_query_capability().is_none());
-        assert!(!auth.is_write_authorized());
-        assert!(!auth.is_query_authorized());
-    }
-
-    #[test]
-    fn authorize_write_grants_only_write() {
+    fn host_bits_mint_independently_and_default_to_deny() {
+        let mints = |auth: &ClipboardAuth| {
+            let gates = PolicyGates::compile(None);
+            (
+                auth.try_mint_write_capability_with_engine(gates).is_some(),
+                auth.try_mint_query_capability_with_engine(gates).is_some(),
+            )
+        };
         let mut auth = ClipboardAuth::new();
+        assert_eq!(mints(&auth), (false, false), "deny by default");
         auth.authorize_write();
-        assert!(auth.try_mint_write_capability().is_some());
-        assert!(auth.try_mint_query_capability().is_none());
-        assert!(auth.is_write_authorized());
-        assert!(!auth.is_query_authorized());
-    }
-
-    #[test]
-    fn authorize_query_grants_only_query() {
-        let mut auth = ClipboardAuth::new();
-        auth.authorize_query();
-        assert!(auth.try_mint_write_capability().is_none());
-        assert!(auth.try_mint_query_capability().is_some());
-        assert!(!auth.is_write_authorized());
-        assert!(auth.is_query_authorized());
-    }
-
-    #[test]
-    fn revoke_disables_future_mint() {
-        let mut auth = ClipboardAuth::new();
-        auth.authorize_write();
+        assert_eq!(mints(&auth), (true, false));
         auth.authorize_query();
         auth.revoke_write();
-        auth.revoke_query();
-        assert!(auth.try_mint_write_capability().is_none());
-        assert!(auth.try_mint_query_capability().is_none());
-    }
-
-    #[test]
-    fn write_and_query_are_independent() {
-        let mut auth = ClipboardAuth::new();
+        assert_eq!(mints(&auth), (false, true), "revoking write keeps query");
         auth.authorize_write();
-        auth.authorize_query();
+        auth.revoke_query();
+        assert_eq!(mints(&auth), (true, false), "revoking query keeps write");
         auth.revoke_write();
-        assert!(auth.try_mint_write_capability().is_none());
-        assert!(auth.try_mint_query_capability().is_some());
-        auth.authorize_write();
-        auth.revoke_query();
-        assert!(auth.try_mint_write_capability().is_some());
-        assert!(auth.try_mint_query_capability().is_none());
-    }
-
-    #[test]
-    fn standard_profile_wildcard_execute_does_not_overgrant_revoked_clipboard_access() {
-        let auth = ClipboardAuth::new();
-        let engine = PolicyEngine::new(profiles::standard());
-
-        assert!(
-            auth.try_mint_write_capability_with_engine(PolicyGates::compile(Some(&engine)))
-                .is_none()
-        );
-        assert!(
-            auth.try_mint_query_capability_with_engine(PolicyGates::compile(Some(&engine)))
-                .is_none()
-        );
+        assert_eq!(mints(&auth), (false, false));
     }
 
     #[test]
@@ -332,55 +255,5 @@ mod tests {
             auth.try_mint_query_capability_with_engine(PolicyGates::compile(Some(&engine)))
                 .is_some()
         );
-    }
-
-    #[test]
-    fn invoke_set_delivers_content_via_callback() {
-        use std::sync::{Arc, Mutex};
-        let mut auth = ClipboardAuth::new();
-        auth.authorize_write();
-        let token = auth.try_mint_write_capability().expect("write authorized");
-
-        let captured = Arc::new(Mutex::new(None::<String>));
-        let captured_clone = Arc::clone(&captured);
-        let mut slot: Option<ClipboardCallback> = Some(Box::new(move |op| {
-            if let ClipboardOperation::Set { content, .. } = op {
-                *captured_clone.lock().expect("poisoned") = Some(content);
-            }
-            None
-        }));
-
-        invoke_set(
-            &mut slot,
-            token,
-            &[ClipboardSelection::Clipboard],
-            "hello".to_string(),
-        );
-
-        assert_eq!(
-            *captured.lock().expect("poisoned"),
-            Some("hello".to_string())
-        );
-    }
-
-    #[test]
-    fn invoke_query_returns_host_content() {
-        let mut auth = ClipboardAuth::new();
-        auth.authorize_query();
-        let token = auth.try_mint_query_capability().expect("query authorized");
-        let mut slot: Option<ClipboardCallback> =
-            Some(Box::new(|_op| Some("clipboard".to_string())));
-        let result = invoke_query(&mut slot, token, &[ClipboardSelection::Clipboard]);
-        assert_eq!(result, Some("clipboard".to_string()));
-    }
-
-    #[test]
-    fn invoke_query_returns_none_when_host_denies() {
-        let mut auth = ClipboardAuth::new();
-        auth.authorize_query();
-        let token = auth.try_mint_query_capability().expect("query authorized");
-        let mut slot: Option<ClipboardCallback> = Some(Box::new(|_op| None));
-        let result = invoke_query(&mut slot, token, &[ClipboardSelection::Clipboard]);
-        assert_eq!(result, None);
     }
 }

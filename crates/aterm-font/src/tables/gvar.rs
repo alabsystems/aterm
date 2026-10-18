@@ -65,13 +65,14 @@ const MAX_STACK_TUPLES_LEN: u16 = 32;
 /// [`MAX_STACK_TUPLES_LEN`], on the heap past it.
 ///
 /// This is ttf-parser's `gvar-alloc` behaviour, the one aterm's Linux build
-/// ships (winit's `wayland-csd-adwaita` turns it on through sctk-adwaita and
-/// ab_glyph, for the one ttf-parser aterm-render shares). Its macOS, Windows
-/// and wasm builds leave it off, and there a glyph with more than 32 tuples
-/// has no outline at all, at every instance the default included (SF Pro's
-/// `SFNS.ttf`: 2,590 of its 2,954 glyphs). aterm-font draws them on every
-/// platform; `tests/fixtures/font-oracle/reader-gvar-alloc.txt` holds it to
-/// ttf-parser's `gvar-alloc` answers.
+/// shipped while it had ttf-parser (winit's `wayland-csd-adwaita` turned it on
+/// through sctk-adwaita and ab_glyph, until linux-windowing LW.5 took them out).
+/// Without it a glyph with more than 32 tuples has no outline at all, at every
+/// instance the default included (SF Pro's `SFNS.ttf`: 2,590 of its 2,954
+/// glyphs), which is what aterm's macOS, Windows and wasm builds drew before
+/// aterm-font. aterm-font draws them on every platform;
+/// `tests/fixtures/font-oracle/reader-gvar-alloc.txt` holds it to ttf-parser's
+/// `gvar-alloc` answers.
 ///
 /// This is the only part of the `gvar` algorithm that allocates: every
 /// tuple is walked in parallel, point by point.

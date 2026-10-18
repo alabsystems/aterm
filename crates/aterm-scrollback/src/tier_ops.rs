@@ -378,20 +378,6 @@ impl Scrollback {
         true
     }
 
-    /// Create a snapshot containing only hot + warm tier lines (skip cold).
-    ///
-    /// This is the fast path for checkpointing: cold tier decompression
-    /// (LZ4 or disk I/O) is skipped, bounding the snapshot to at most
-    /// `hot_limit + warm_limit` lines. Hot lines are already uncompressed;
-    /// warm lines require only LZ4 decompression (~5 GB/s throughput).
-    ///
-    /// Use this instead of the full `iter()` snapshot when the caller holds
-    /// a lock and cannot afford unbounded decompression time. (#5946)
-    #[must_use]
-    pub fn checkpoint_snapshot_fast(&self) -> Scrollback {
-        super::access::checkpoint_snapshot_fast_from(self)
-    }
-
     /// Handle memory pressure by evicting warm → cold, then cold FIFO.
     fn handle_memory_pressure(&mut self) {
         let mut changed = false;

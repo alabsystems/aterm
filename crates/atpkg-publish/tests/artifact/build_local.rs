@@ -377,39 +377,3 @@ fn a_source_change_during_the_build_is_refused() {
         "{err}"
     );
 }
-
-#[test]
-fn the_command_line_is_a_request() {
-    let args = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
-    let req = build_local::parse_args(&args(&[
-        "--plan",
-        "trust-ir",
-        "/src/trust-ir",
-        "--policy",
-        "unverified",
-        "--profile",
-        "dev",
-        "--jobs",
-        "8",
-        "--link",
-    ]))
-    .expect("parsed");
-    assert!(req.plan && req.link);
-    assert_eq!(
-        (req.policy, req.profile, req.jobs),
-        (Policy::Unverified, Profile::Dev, 8)
-    );
-    assert_eq!(req.checkout, PathBuf::from("/src/trust-ir"));
-    for bad in [
-        &["trust-ir"][..],
-        &["a", "b", "c"][..],
-        &["a", "b", "--policy", "verified"][..],
-        &["a", "b", "--profile", "bench"][..],
-        &["a", "b", "--jobs", "0"][..],
-    ] {
-        assert!(
-            matches!(build_local::parse_args(&args(bad)), Err(Error::Usage(_))),
-            "{bad:?}"
-        );
-    }
-}

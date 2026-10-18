@@ -122,7 +122,9 @@ fn positive<T: std::str::FromStr + PartialOrd + Default>(
 }
 
 impl Args {
-    /// Parse the options [`super::parse`] collected.
+    /// Parse the options the arena lanes read: `super::main` hands this only
+    /// those (`super::options_for`), so a flag with no arm here is one
+    /// [`super::OPTIONS`] gives an arena lane and this parser forgot.
     pub(crate) fn from_options(options: &BTreeMap<&'static str, String>) -> Result<Args, String> {
         let mut a = Args::default();
         for (flag, raw) in options {
@@ -170,6 +172,9 @@ impl Args {
                 "--allow-legacy-metric" => a.allow_legacy_metric = true,
                 "--warm" => a.warm = true,
                 "--dev-smoke" => a.dev_smoke = true,
+                // The run's switch, which `super::main` reads; it names every
+                // lane, so every lane's parser is handed it.
+                "--no-windows" => {}
                 other => return Err(format!("internal: `{other}` has no parser")),
             }
         }
@@ -556,22 +561,28 @@ pub(crate) fn build_aterm() -> Result<Aterm, String> {
         ));
     }
     let bin = release_dir()?.join("aterm");
+    Ok(Aterm {
+        sha256: sha256_file(&bin)?,
+        git: git_provenance(&workspace_root()),
+        bin,
+    })
+}
+
+/// The checkout at `dir`: `HEAD`'s short sha, `-dirty` when its tracked files
+/// have changes, `unknown` when git cannot say.
+pub(crate) fn git_provenance(dir: &Path) -> String {
     let sha = stdout_of(
         command("git")
             .args(["rev-parse", "--short=12", "HEAD"])
-            .current_dir(workspace_root()),
+            .current_dir(dir),
     )
     .unwrap_or_else(|| "unknown".into());
     let clean = command("git")
         .args(["diff", "--quiet"])
-        .current_dir(workspace_root())
+        .current_dir(dir)
         .status()
         .is_ok_and(|s| s.success());
-    Ok(Aterm {
-        sha256: sha256_file(&bin)?,
-        git: if clean { sha } else { format!("{sha}-dirty") },
-        bin,
-    })
+    if clean { sha } else { format!("{sha}-dirty") }
 }
 
 /// Where the release build lands.
@@ -644,13 +655,25 @@ pub(crate) fn ctl(bin: &Path, sock: &Path) -> Command {
     cmd
 }
 
-/// Run one `ctl` verb and return its stdout, or the failure.
+/// How long a `ctl` client may run past its verb's own `timeout=`: the hang
+/// detector for a client that wedges, never a latency budget (`start`'s own).
+const CTL_HUNG: Duration = Duration::from_secs(60);
+
+/// The verb's own `timeout=<ms>`, which the instance bounds its answer by; none
+/// when it names none.
+fn verb_timeout(verb: &[&str]) -> Duration {
+    verb.iter()
+        .find_map(|a| a.strip_prefix("timeout=")?.parse::<u64>().ok())
+        .map_or(Duration::ZERO, Duration::from_millis)
+}
+
+/// Run one `ctl` verb and return its stdout, or the failure. Bounded by the
+/// verb's own timeout plus [`CTL_HUNG`]: a wedged client is killed and named,
+/// never waited on forever.
 pub(crate) fn ctl_out(bin: &Path, sock: &Path, verb: &[&str]) -> Result<String, String> {
-    let out = ctl(bin, sock)
-        .args(verb)
-        .stdin(aterm_uds::spawnfd::Stdio::null())
-        .output()
-        .map_err(|e| format!("could not run ctl {}: {e}", verb.join(" ")))?;
+    let deadline = Instant::now() + verb_timeout(verb) + CTL_HUNG;
+    let out = aterm_uds::deadline::output_until(ctl(bin, sock).args(verb), deadline)
+        .map_err(|e| format!("ctl {}: {e}", verb.join(" ")))?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
@@ -800,6 +823,19 @@ pub(crate) fn macos_version() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `ctl` call's deadline starts from its verb's own timeout: what
+    /// `timeout=<ms>` says, and nothing for a verb without one or an unreadable
+    /// value.
+    #[test]
+    fn a_ctl_call_is_bounded_by_its_verbs_timeout_and_the_hang_detector() {
+        assert_eq!(
+            verb_timeout(&["await", "idle", "1000", "timeout=60000"]),
+            Duration::from_secs(60)
+        );
+        assert_eq!(verb_timeout(&["metrics", "--json"]), Duration::ZERO);
+        assert_eq!(verb_timeout(&["send", "timeout=x"]), Duration::ZERO);
+    }
 
     #[test]
     fn options_parse_into_typed_args_and_refuse_bad_values() {

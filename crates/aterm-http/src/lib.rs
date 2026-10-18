@@ -16,7 +16,7 @@
 //!
 //! HTTPS endpoints are checked against the OPERATING SYSTEM's trust store,
 //! never a root set baked into the binary, so an endpoint is reached the way
-//! the OS would reach it; a caller that names its own CA bundle
+//! the OS would reach it; a caller that names its own roots
 //! ([`Trust::Roots`]) REPLACES the platform roots rather than adding to them.
 //! [`verifier`] makes the OS calls itself (`SecTrustEvaluateWithError` on
 //! macOS, `CertGetCertificateChain` on Windows, the distro CA store plus
@@ -26,16 +26,18 @@
 //!
 //! * [`uri`] — strict absolute-URL parsing; rejects userinfo and control
 //!   characters instead of sanitising them.
-//! * [`pem`] — CA-bundle decoding for the per-endpoint trust override.
 //! * [`tls`] — the two trust models, over `rustls` + the `ring` provider.
 //! * [`verifier`] — the platform certificate verifier behind
 //!   [`Trust::PlatformVerifier`].
+//! * [`pem`] — the Linux/BSD CA-store parser the verifier reads.
 //! * [`proxy`] — `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY`, failing
 //!   closed on a setting it cannot use; a caller keeps a loopback endpoint off
 //!   every proxy with [`ProxyMode::Direct`].
 //! * [`stream`] — TCP/TLS bytes, one global deadline, and the revocable
 //!   authority re-checked at every read and write.
 //! * [`client`] — request rendering and response parsing.
+//! * [`connect`] — a timed TCP connect whose refusal is prompt on Windows too,
+//!   for a caller that splits a short budget across a host's addresses.
 //!
 //! # What it deliberately does NOT do
 //!
@@ -46,6 +48,8 @@
 //! influence where the next request goes.
 
 pub mod client;
+/// `TcpStream::connect_timeout`, with a refusal reported promptly on Windows too.
+pub mod connect;
 pub mod pem;
 pub mod proxy;
 pub mod stream;

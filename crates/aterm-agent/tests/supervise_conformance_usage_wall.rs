@@ -32,10 +32,10 @@
 //! line, no turn ran: the walk runs `Met` both ways).
 //! NEGATIVE CONTROLS: the `Buggy = 1` model disagrees (a first act at once); the same walk with the
 //! reader replaced by the precedence of 2026-09-28 (Busy beats a wall, so a
-//! screen that counts a shell reads busy) disagrees at every `bg = 1` wall —
+//! screen that counts a shell reads busy) disagrees at a `bg = 1` wall —
 //! the stall the model's liveness calls `WallMasked`; and the loop of
 //! 2026-10-01, which read a wall standing after an untaken act as no print,
-//! disagrees after every unseen `Met` of a wall found sitting.
+//! disagrees after an unseen `Met` of a wall found sitting.
 //!
 //! THE LEFT WALL (`NoticeLeaves`, the review of 2026-10-14): the wall's notice
 //! leaves an idle screen — here the measured wall with a person's `/model`
@@ -59,10 +59,10 @@
 //! continued by itself, whose word the real decider ties to that limit's
 //! notice, not this one's.
 //! NEGATIVE CONTROLS: the loop before 2026-10-14, which read a person's turn
-//! no read saw busy as no turn, still waits after EVERY `PersonTurnServed`,
+//! no read saw busy as no turn, still waits after a `PersonTurnServed`,
 //! before the reset too — the model's `PersonTurnUnseen`; the loop of
 //! 44ed0f339, which counted a turn served under ANY limit's notice, ends the
-//! wait after every `ConversationResumed` — the model's
+//! wait after a `ConversationResumed` — the model's
 //! `OtherLimitsTurnRead`; and the loop of ef02ee212, which read the vendor's
 //! continuation under ANY limit's notice as this limit's, ends it after every
 //! `ArmedConversationResumed` — the model's `OtherLimitsContinuationRead`.
@@ -103,8 +103,8 @@
 //! wall placed on the print as an answer is), the real state waits on the
 //! reset from that reading, through the window, exactly where the model's
 //! wall stands. NEGATIVE CONTROL: the loop of 1afcdade3, which read no limit
-//! there, waits on nothing after every `WallAppearsLeft` and forgets the wall
-//! at the end of every retry's window its answer left unread — the model's
+//! there, waits on nothing after a `WallAppearsLeft` and forgets the wall
+//! at the end of a retry's window its answer left unread — the model's
 //! `UnreadLeftDropped` and `UnreadAnswerReadAsTaken`.
 //!
 //! A PERSON'S TURN ANSWERED THE SAME WAY (`PersonWallLeft`, round 17's
@@ -114,7 +114,7 @@
 //! reads the cancel under the notice as the answer to a turn asked since that
 //! look, and the real state waits on the reset exactly where the model's wall
 //! stands; the loop of 15248f2b3 (`blind_to_a_persons_left`: it read a cancel's limit
-//! only as an act's answer) waits on nothing after every `PersonWallLeft`. AN
+//! only as an act's answer) waits on nothing after a `PersonWallLeft`. AN
 //! OLDER CANCELLED LIMIT `/resume`d inside the own act's window
 //! (`OlderLeftResumed`): read as the act's answer with nothing to date its
 //! print (the bind is the hostless loop: an answer the screen cannot tell
@@ -137,14 +137,15 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use aterm_agent::supervise::SupervisorConfig;
-use aterm_agent::supervise::limit::{ResetSpec, place_reset, reset_at, within_a_session_window};
+use aterm_agent::supervise::limit::{ResetSpec, place_reset, within_a_session_window};
 use aterm_agent::supervise::phase::Phase;
 use aterm_agent::supervise::policy::turn_end::{
     RULE_CONTINUE, RULE_LIMIT_RESUME, TurnEndAction, TurnEndReading, TurnEndState, TurnEndTiming,
     decide_turn_end,
 };
+use aterm_models_harness::supervisor_usage_wall_model;
 use aterm_phase::prompt::fixtures::screen;
-use aterm_spec::derive::{Model, supervisor_usage_wall_model};
+use aterm_spec::derive::Model;
 
 use crate::common::cnst;
 
@@ -496,6 +497,7 @@ fn reading(
             kind: own.kind,
             reset: own.reset,
             served: false,
+            fired: true,
             model_set: false,
             chosen_model: None,
         });
@@ -830,13 +832,13 @@ fn waits_as_modelled(real: &Real, st: &State) -> bool {
 }
 
 /// What a walk saw: every state, the states the real side disagreed at (its
-/// verdict there, or its wait after the transition into it), and each
-/// action's transitions — how many fired, and the states BEFORE each one
-/// after which the real wait disagreed.
+/// verdict there, or its wait after the transition into it), and how many
+/// transitions each action fired.
 struct Walked {
     states: BTreeSet<State>,
     off: Vec<State>,
     fired: BTreeMap<&'static str, usize>,
+    /// The states each action left the real wait disagreeing from.
     off_after: BTreeMap<&'static str, Vec<State>>,
 }
 
@@ -917,8 +919,7 @@ fn tier1_the_real_reader_and_decider_continue_a_usage_wall_exactly_where_the_mod
             unseen,
             ..Run::default()
         };
-        let walked = walk(&m, true, run);
-        let states = &walked.states;
+        let states = walk(&m, true, run).states;
         let left = states.iter().filter(|st| st["wall"] == 6).count();
         let resumed = states.iter().filter(|st| st["other"] == 1).count();
         let armed_resumed = states.iter().filter(|st| st["other"] == 2).count();
@@ -926,195 +927,12 @@ fn tier1_the_real_reader_and_decider_continue_a_usage_wall_exactly_where_the_mod
             .iter()
             .filter(|st| st["wall"] == 6 && st["due"] < cnst(&m, "ResetAt"))
             .count();
-        eprintln!(
-            "usage wall Tier-1 (unseen {unseen}): {} states walked, {left} of them left walls \
-             ({resumed} on a resumed conversation, {armed_resumed} on one resumed at the armed \
-             wall, {early} lifted before the reset)",
-            states.len()
-        );
         assert!(
             states.len() > 100 && left > 20 && resumed > 5 && armed_resumed > 5 && early > 5,
             "{} {left} {resumed} {armed_resumed} {early}",
             states.len()
         );
     }
-}
-
-/// THE LOOP OF 2026-10-01 is not the model: a wall found sitting, its far bare
-/// clock guessed passed, tried once and answered with the line held — no turn
-/// run, no busy read — kept the guess, and the ladder typed into the standing
-/// wall at every rung (24 lines until the reset). Read without
-/// `untaken_act`, the walk disagrees exactly there: after an unseen `Met` of a
-/// wall found sitting, where the model waits for the reset. With it (the
-/// strict walk above), nowhere.
-#[test]
-fn the_loop_that_reads_no_print_in_an_untaken_act_types_into_a_standing_wall() {
-    let m = walled_model();
-    let run = Run {
-        unseen: true,
-        blind_to_untaken: true,
-        ..Run::default()
-    };
-    let off = walk(&m, false, run).off;
-    assert!(!off.is_empty(), "the blind loop agreed everywhere");
-    // The wall showing, or its notice left: the same wait either way.
-    assert!(
-        off.iter().all(|st| (st["wall"] == 1 || st["wall"] == 6)
-            && st["sitting"] == 1
-            && st["view"] == 0
-            && st["tries"] >= 1),
-        "{off:?}"
-    );
-    // ... and the model's defect `MetKeepsTheGuess` is that loop: it types a
-    // second act into the wall before the tokens are back.
-    let buggy = aterm_spec::interp::with_buggy(&m, 1);
-    let mut st = buggy.init_state();
-    for a in ["WallFoundSitting", "Act", "MetKeepsTheGuess", "Tick", "Act"] {
-        assert!(buggy.fire(a, &mut st), "{a} at {st:?}");
-    }
-    assert!(!buggy.check_invariant("NoBlindAct", &st), "{st:?}");
-    let mut st = m.init_state();
-    for a in ["WallFoundSitting", "Act", "Met", "Tick"] {
-        assert!(m.fire(a, &mut st), "{a} at {st:?}");
-    }
-    assert!(!m.action_enabled("Act", &st), "{st:?}");
-}
-
-/// NEGATIVE CONTROLS: the reader of 2026-09-28 (a screen that counts a shell is
-/// busy) disagrees at every wall that shows over background work; and the
-/// `Buggy = 1` model (a first act at once, a reset placed in the past) is not
-/// the real decider either.
-#[test]
-fn the_masked_reader_and_the_buggy_model_disagree_with_the_real_code() {
-    let m = walled_model();
-    let seen = |masked: bool| Run {
-        masked,
-        ..Run::default()
-    };
-    // The mask is the shell's: walked with no notice leaving the screen,
-    // where a wall the masked reader never read would be left unread too.
-    let unleft = aterm_spec::interp::with_consts(&m, &[("Leaves", 0)]);
-    let masked = walk(&unleft, false, seen(true)).off;
-    assert!(!masked.is_empty(), "the masked reader agreed everywhere");
-    assert!(
-        masked.iter().all(|st| st["bg"] == 1 && st["wall"] == 1),
-        "{masked:?}"
-    );
-    // The placement control: the session window's rule, for the same wall a
-    // day-less clock 13 h off, is in the PAST — the misplacement the model's
-    // `view = 1` stands for, which the real placement makes only for a wall
-    // found with nothing to date its print.
-    let nine = ResetSpec::At {
-        date: None,
-        hour: 9,
-        minute: 0,
-        zone: Some("America/Los_Angeles".to_string()),
-    };
-    assert!(reset_at(&nine, PRINT, PDT, zone) < PRINT);
-    assert_eq!(
-        place_reset(&nine, false, PRINT, Some(PRINT - 7 * 60), PDT, zone),
-        PRINT + 13 * 3600
-    );
-    let buggy = aterm_spec::interp::with_buggy(&m, 1);
-    let off = walk(&buggy, false, seen(false)).off;
-    assert!(
-        off.iter()
-            .any(|st| st["wall"] == 1 && st["view"] == 1 && st["sitting"] == 0 && st["tries"] == 0),
-        "no disagreement at a misplaced reset's first act: {} states",
-        off.len()
-    );
-}
-
-/// THE LOOP BEFORE 2026-10-14 is not the model: at a wall whose notice left the
-/// screen it read a person's turn no read saw busy as no turn, and waited on
-/// the reset over it — the model's `PersonTurnUnseen`. Walked with that reading
-/// (the turn's own evidence dropped), the real state still waits after EVERY
-/// `PersonTurnServed`, where the model's wall is over — some of them served
-/// before the named reset (`LimitLiftedEarly`), the hold spanning the wait;
-/// with the notice's leaving switched off, nowhere — the control is the left
-/// wall's alone.
-#[test]
-fn the_loop_blind_to_a_persons_turn_waits_over_it() {
-    let m = walled_model();
-    let run = Run {
-        blind_to_a_persons_turn: true,
-        ..Run::default()
-    };
-    let walked = walk(&m, false, run);
-    assert!(!walked.off.is_empty(), "the blind loop agreed everywhere");
-    let served = walked.fired.get("PersonTurnServed").copied().unwrap_or(0);
-    let held = walked
-        .off_after
-        .get("PersonTurnServed")
-        .cloned()
-        .unwrap_or_default();
-    assert!(served > 0, "{:?}", walked.fired);
-    assert_eq!(held.len(), served, "every served turn is waited over");
-    assert!(
-        held.iter().any(|st| st["clock"] < cnst(&m, "ResetAt")),
-        "served before the reset: {held:?}"
-    );
-    let unleft = aterm_spec::interp::with_consts(&m, &[("Leaves", 0)]);
-    let off = walk(&unleft, false, run).off;
-    assert!(off.is_empty(), "{off:?}");
-    // ... and the model's defect is that loop.
-    let buggy = aterm_spec::interp::with_buggy(&m, 1);
-    let mut st = buggy.init_state();
-    for a in [
-        "WallAppears",
-        "NoticeLeaves",
-        "Tick",
-        "Tick",
-        "PersonTurnUnseen",
-    ] {
-        assert!(buggy.fire(a, &mut st), "{a} at {st:?}");
-    }
-    assert!(
-        !buggy.check_invariant("NoWaitOverAServedTurn", &st),
-        "{st:?}"
-    );
-}
-
-/// THE LOOP OF 44ED0F339 is not the model: it counted a turn served under ANY
-/// limit's notice as one since the limit it waits on, so a person who
-/// `/resume`d another conversation at the left wall — its history redrawn, an
-/// older limit with a turn served under it — ended the wait, and the continue
-/// policy typed into the standing limit (measured on 2.1.300 by the review of
-/// 2026-10-14) — the model's `OtherLimitsTurnRead`. Walked with that reading,
-/// the real state stops waiting after EVERY `ConversationResumed`, where the
-/// model's limit stands; the loop as it is (the strict walk) waits on.
-#[test]
-fn the_loop_that_ties_no_turn_to_its_limit_ends_the_wait_on_a_resumed_conversation() {
-    let m = walled_model();
-    let run = Run {
-        untied: true,
-        ..Run::default()
-    };
-    let walked = walk(&m, false, run);
-    let resumed = walked
-        .fired
-        .get("ConversationResumed")
-        .copied()
-        .unwrap_or(0);
-    let ended = walked
-        .off_after
-        .get("ConversationResumed")
-        .map_or(0, Vec::len);
-    assert!(resumed > 0, "{:?}", walked.fired);
-    assert_eq!(ended, resumed, "every resumed conversation ends the wait");
-    // ... and the model's defect is that loop: it types into the standing
-    // limit before its tokens are back.
-    let buggy = aterm_spec::interp::with_buggy(&m, 1);
-    let mut st = buggy.init_state();
-    for a in [
-        "WallAppears",
-        "NoticeLeaves",
-        "ConversationResumed",
-        "OtherLimitsTurnRead",
-    ] {
-        assert!(buggy.fire(a, &mut st), "{a} at {st:?}");
-    }
-    assert!(!buggy.check_invariant("NoBlindAct", &st), "{st:?}");
 }
 
 /// THE LOOP OF EF02EE212 is not the model (W1 of ATERM-KI-1015-1, measured
@@ -1185,277 +1003,135 @@ fn tier1_a_limit_met_inside_the_own_acts_take_window_is_tracked_where_the_model_
             },
         );
         let states = &walked.states;
-        let held = |wall: i64, retried: bool| {
+        // The continue policy's act (`tries = 0`) and the retry, each with a
+        // wall read inside its window, with its notice left there, and with
+        // its notice cancelled before any read.
+        let count = |pick: &dyn Fn(&State) -> bool, retried: bool| {
             states
                 .iter()
-                .filter(|st| st["held"] == 1 && st["wall"] == wall && (st["tries"] >= 1) == retried)
+                .filter(|st| pick(st) && (st["tries"] >= 1) == retried)
                 .count()
         };
-        eprintln!(
-            "usage wall Tier-1 (the own acts' windows, unseen {unseen}): {} states walked; \
-             the continue policy's act: {} with a wall read inside the window, {} with its \
-             notice left there; the retry: {} answered inside its window, {} left there",
-            states.len(),
-            held(1, false),
-            held(6, false),
-            held(1, true),
-            held(6, true)
-        );
-        let unread = |retried: bool| {
-            states
-                .iter()
-                .filter(|st| st["unread"] == 1 && (st["tries"] >= 1) == retried)
-                .count()
-        };
-        eprintln!(
-            "  ... their notice cancelled before any read: {} after the continue policy's act, \
-             {} after the retry",
-            unread(false),
-            unread(true)
-        );
-        assert!(
-            held(1, false) > 2
-                && held(6, false) > 2
-                && held(1, true) > 2
-                && held(6, true) > 2
-                && unread(false) > 2
-                && unread(true) > 2
-                && walked.fired.contains_key("OwnActTyped")
-                && walked.fired.contains_key("MetInWindow")
-                && walked.fired.contains_key("WallAppearsLeft")
-                && walked.fired.contains_key("MetLeftUnread")
-                && walked.fired.contains_key("PersonWallLeft")
-                && walked.fired.contains_key("OlderLeftResumed"),
-            "{:?}",
-            walked.fired
-        );
+        for retried in [false, true] {
+            assert!(
+                count(&|st| st["held"] == 1 && st["wall"] == 1, retried) > 2
+                    && count(&|st| st["held"] == 1 && st["wall"] == 6, retried) > 2
+                    && count(&|st| st["unread"] == 1, retried) > 2,
+                "retried {retried}, unseen {unseen}"
+            );
+        }
+        for action in [
+            "OwnActTyped",
+            "MetInWindow",
+            "WallAppearsLeft",
+            "MetLeftUnread",
+            "PersonWallLeft",
+            "OlderLeftResumed",
+        ] {
+            assert!(
+                walked.fired.contains_key(action),
+                "{action} never fired: {:?}",
+                walked.fired
+            );
+        }
     }
 }
 
-/// THE LOOP OF 1AFCDADE3 is not the model: where the limit answered the act at
-/// once and a person's Esc on the vendor's countdown came before the loop's
-/// first read, it read the cancel under the notice as no limit (round 16's
-/// residual (a), the lab's `tw16after` on 2.1.300) — so nothing tracked a
-/// limit that answered the continue policy's act, and a retry's answer
-/// cancelled so read as the retry taken at its window's end. Walked with that
-/// reading, the real state disagrees after EVERY `WallAppearsLeft` (it waits
-/// on nothing where the model's wall stands), and after the window's end of
-/// every retry whose answer was cancelled unread (the track dropped); with
-/// the own acts' windows switched off, or every notice read before it leaves
-/// (`Unread = 0`), nowhere — the control is the unread answer's alone (the
-/// strict walk, the loop as it is, agrees everywhere).
+/// NEGATIVE CONTROLS: the `Buggy = 1` model, and each past loop the module
+/// documentation names, emulated on the real side by its [`Run`] switch,
+/// disagree with the real code somewhere in the walk — so the strict walks
+/// above are not vacuous over the path each one broke. The model's own
+/// counterexamples are the registry sweep's (`aterm-models/tests/non_vacuity.rs`).
 #[test]
-fn the_loop_blind_to_the_cancel_under_the_acts_answer_waits_on_nothing() {
-    let run = Run {
-        blind_to_left: true,
-        ..Run::default()
-    };
-    let walked = walk(&windowed_model(), false, run);
-    let left = walked.fired.get("WallAppearsLeft").copied().unwrap_or(0);
-    let dropped = walked.off_after.get("WallAppearsLeft").map_or(0, Vec::len);
-    assert!(left > 0, "{:?}", walked.fired);
-    assert_eq!(dropped, left, "every unread answer waits on nothing");
-    let ends = walked.off_after.get("Tick").cloned().unwrap_or_default();
-    assert!(
-        ends.iter()
-            .any(|st| st["unread"] == 1 && st["tries"] >= 1 && st["held"] == 1),
-        "a retry's window ending on its unread answer: {:?}",
-        walked.off_after.keys()
-    );
-    // ... the person's turn too, where the own act is switched off: after
-    // every `PersonWallLeft`.
-    let walled = walk(&walled_model(), false, run);
-    let person = walled.fired.get("PersonWallLeft").copied().unwrap_or(0);
-    assert!(person > 0, "{:?}", walled.fired);
-    assert_eq!(
-        walled.off_after.get("PersonWallLeft").map_or(0, Vec::len),
-        person,
-        "every person's turn left unread waits on nothing"
-    );
-    let off = walk(&read_windowed_model(), false, run).off;
-    assert!(off.is_empty(), "every notice read: {off:?}");
-    // ... and the model's defects are that loop: it types into the standing
-    // limit before its tokens are back, and forgets the wall a retry met.
-    let buggy = aterm_spec::interp::with_buggy(&windowed_model(), 1);
-    let mut st = buggy.init_state();
-    for a in ["OwnActTyped", "WallAppearsLeft", "UnreadLeftDropped"] {
-        assert!(buggy.fire(a, &mut st), "{a} at {st:?}");
-    }
-    assert!(!buggy.check_invariant("NoBlindAct", &st), "{st:?}");
-    let mut st = buggy.init_state();
-    for a in [
-        "WallAppearsLate",
-        "Tick",
-        "Tick",
-        "Tick",
-        "Act",
-        "MetLeftUnread",
-        "UnreadAnswerReadAsTaken",
-    ] {
-        assert!(buggy.fire(a, &mut st), "{a} at {st:?}");
-    }
-    assert!(!buggy.check_invariant("WallRemembered", &st), "{st:?}");
-}
-
-/// THE LOOP OF 15248F2B3 is not the model (round 17's residual (a)): it read
-/// the limit a cancel left as the answer to an act of its own only — so a
-/// person's turn the limit answered at once, cancelled before any read, was
-/// read as no limit and the continue policy's next act went into it — and it
-/// placed an older cancelled limit a conversation `/resume`d inside the act's
-/// window ended on, which it read as the act's answer, on that act's print:
-/// a clock already past was tomorrow's. Walked with the first reading, the
-/// real state disagrees after EVERY `PersonWallLeft`; with the second, the
-/// decider disagrees exactly where an `OlderLeftResumed` wall stands past the
-/// act's window (it waits a day where the model acts), and nowhere else.
-#[test]
-fn the_loop_that_reads_a_cancel_only_as_its_own_acts_answer_misses_a_person_and_waits_a_day() {
-    let run = Run {
-        blind_to_a_persons_left: true,
-        ..Run::default()
-    };
-    let walked = walk(&windowed_model(), false, run);
-    let person = walked.fired.get("PersonWallLeft").copied().unwrap_or(0);
-    assert!(person > 0, "{:?}", walked.fired);
-    assert_eq!(
-        walked.off_after.get("PersonWallLeft").map_or(0, Vec::len),
-        person,
-        "every person's turn left unread waits on nothing"
-    );
-    let run = Run {
-        uncapped: true,
-        ..Run::default()
-    };
-    let walked = walk(&windowed_model(), false, run);
-    assert!(
-        !walked.off.is_empty(),
-        "the uncapped loop agreed everywhere"
-    );
-    assert!(
-        walked
-            .off
-            .iter()
-            .all(|st| st["wall"] == 6 && st["sitting"] == 1 && st["view"] == 1 && st["held"] == 0),
-        "only an older cancelled limit past the act's window: {:?}",
-        walked.off
-    );
-    assert!(walked.off_after.is_empty(), "{:?}", walked.off_after);
-    let off = walk(&read_windowed_model(), false, run).off;
-    assert!(off.is_empty(), "every notice read: {off:?}");
-    // ... and the model's defects are that loop.
-    let buggy = aterm_spec::interp::with_buggy(&windowed_model(), 1);
-    let mut st = buggy.init_state();
-    for a in ["PersonWallLeft", "UnreadLeftDropped"] {
-        assert!(buggy.fire(a, &mut st), "{a} at {st:?}");
-    }
-    assert!(!buggy.check_invariant("NoBlindAct", &st), "{st:?}");
-    let mut st = buggy.init_state();
-    for a in ["OwnActTyped", "OlderLeftPlacedTomorrow"] {
-        assert!(buggy.fire(a, &mut st), "{a} at {st:?}");
-    }
-    assert!(!buggy.check_invariant("NoDayWait", &st), "{st:?}");
-}
-
-/// THE LOOP OF 1D54A69E9 is not the model: it read the wall that answered a
-/// retry inside the retry's window, but the window's end — the answer's
-/// notice gone (Esc on the vendor's new countdown) — judged the retry taken
-/// and dropped the track, and the continue policy typed into the standing
-/// limit (round 16's review). Walked with that judgement, the real side
-/// disagrees after exactly those windows and nowhere else: every state it
-/// disagrees at is one a retry was made at, and among them the left wall a
-/// tick past the retry's window; with the windows switched off, nowhere.
-#[test]
-fn the_loop_that_reads_a_retrys_answer_as_its_taking_forgets_the_wall() {
-    let run = Run {
-        answer_read_as_taken: true,
-        ..Run::default()
-    };
-    let walked = walk(&read_windowed_model(), false, run);
-    assert!(
-        !walked.off.is_empty(),
-        "the loop of 1d54a69e9 agreed everywhere"
-    );
-    assert!(
-        walked.off.iter().all(|st| st["tries"] >= 1),
-        "only where a retry was made: {:?}",
-        walked.off
-    );
-    let ends = walked.off_after.get("Tick").cloned().unwrap_or_default();
-    assert!(
-        !ends.is_empty()
-            && ends
-                .iter()
-                .all(|st| st["held"] == 1 && st["wall"] == 6 && st["tries"] >= 1),
-        "the retry's window ending on its answer's left notice: {ends:?}\n{:?}",
-        walked.off_after
-    );
-    let off = walk(&walled_model(), false, run).off;
-    assert!(off.is_empty(), "{off:?}");
-    // ... and the model's defect is that loop: the wall forgotten.
-    let buggy = aterm_spec::interp::with_buggy(&windowed_model(), 1);
-    let mut st = buggy.init_state();
-    for a in [
-        "WallAppearsLate",
-        "Tick",
-        "Tick",
-        "Tick",
-        "Act",
-        "MetInWindow",
-        "NoticeLeaves",
-        "RetryReadAsTaken",
-    ] {
-        assert!(buggy.fire(a, &mut st), "{a} at {st:?}");
-    }
-    assert!(!buggy.check_invariant("WallRemembered", &st), "{st:?}");
-}
-
-/// THE LOOP BEFORE ROUND 16 is not the model: it folded a wall read inside the
-/// own act's take window in only at the point that judged the act, so a limit
-/// that answered the act at once was waited on by nothing — and once its
-/// notice left inside the window, the window's end read the act's short turn
-/// and the continue policy typed into the standing limit. Walked with that
-/// reading, the real state disagrees after transitions out of the window's
-/// states alone (`held = 1`), the wall's appearance there among them; with the
-/// own act switched off, nowhere — the control is the window's alone.
-#[test]
-fn the_loop_that_folds_a_wall_only_at_a_point_waits_on_nothing_in_the_window() {
-    let run = Run {
-        blind_in_window: true,
-        ..Run::default()
-    };
-    let walked = walk(&read_windowed_model(), false, run);
-    assert!(!walked.off.is_empty(), "the blind loop agreed everywhere");
-    assert!(
-        walked
-            .off_after
-            .values()
-            .flatten()
-            .all(|st| st["held"] == 1),
-        "{:?}",
-        walked.off_after
-    );
-    assert!(
-        walked
-            .off_after
-            .get("WallAppears")
-            .is_some_and(|before| !before.is_empty()),
-        "{:?}",
-        walked.off_after
-    );
-    let off = walk(&walled_model(), false, run).off;
-    assert!(off.is_empty(), "{off:?}");
-    // ... and the model's defect is that loop: it types into the standing
-    // limit before its tokens are back.
-    let buggy = aterm_spec::interp::with_buggy(&windowed_model(), 1);
-    let mut st = buggy.init_state();
-    for a in [
-        "OwnActTyped",
-        "WallAppears",
-        "NoticeLeaves",
-        "TakeWindowDropsWall",
-    ] {
-        assert!(buggy.fire(a, &mut st), "{a} at {st:?}");
-    }
-    assert!(!buggy.check_invariant("NoBlindAct", &st), "{st:?}");
+fn the_buggy_model_and_every_past_loop_disagree_with_the_real_code() {
+    let walled = walled_model();
+    // The mask is the shell's: walked with no notice leaving the screen,
+    // where a wall the masked reader never read would be left unread too.
+    let unleft = aterm_spec::interp::with_consts(&walled, &[("Leaves", 0)]);
+    let buggy = aterm_spec::interp::with_buggy(&walled, 1);
+    let windowed = windowed_model();
+    let read_windowed = read_windowed_model();
+    let on = Run::default();
+    let cases: [(&str, &Model, Run); 10] = [
+        ("the Buggy model", &buggy, on),
+        (
+            "2026-09-28: busy beats a wall",
+            &unleft,
+            Run { masked: true, ..on },
+        ),
+        (
+            "2026-10-01: no print in an untaken act",
+            &walled,
+            Run {
+                unseen: true,
+                blind_to_untaken: true,
+                ..on
+            },
+        ),
+        (
+            "before 2026-10-14: blind to a person's turn",
+            &walled,
+            Run {
+                blind_to_a_persons_turn: true,
+                ..on
+            },
+        ),
+        (
+            "44ed0f339: a served turn tied to no limit",
+            &walled,
+            Run { untied: true, ..on },
+        ),
+        (
+            "1afcdade3: no limit under a cancel",
+            &windowed,
+            Run {
+                blind_to_left: true,
+                ..on
+            },
+        ),
+        (
+            "15248f2b3: a cancel's limit only as an act's answer",
+            &windowed,
+            Run {
+                blind_to_a_persons_left: true,
+                ..on
+            },
+        ),
+        (
+            "15248f2b3: an older cancelled limit on the act's print",
+            &windowed,
+            Run {
+                uncapped: true,
+                ..on
+            },
+        ),
+        (
+            "1d54a69e9: a retry's answer judged its taking",
+            &read_windowed,
+            Run {
+                answer_read_as_taken: true,
+                ..on
+            },
+        ),
+        (
+            "before round 16: a wall folded in only at a point",
+            &read_windowed,
+            Run {
+                blind_in_window: true,
+                ..on
+            },
+        ),
+    ];
+    std::thread::scope(|scope| {
+        for (name, m, run) in cases {
+            scope.spawn(move || {
+                assert!(
+                    !walk(m, false, run).off.is_empty(),
+                    "{name}: agreed with the real code everywhere"
+                );
+            });
+        }
+    });
 }
 
 /// USAGE CREDITS, WALKED: every reachable state of the model with credits

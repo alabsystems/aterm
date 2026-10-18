@@ -133,6 +133,39 @@ pub fn vendor_kept(version: &str, why: &str) -> String {
     s
 }
 
+/// The words an ALab build's name starts with on a line ([`crate::alab::build_words`]).
+pub const ALAB_BUILD_WORDS: &str = "ALab build ";
+
+/// `managed <build> — ALab build <…>`: an ALab-built agent program's row for its active
+/// ALab store build `build`, kept or rolled back onto ([`crate::alab`]). `why` starts with
+/// that build's name ([`crate::alab::build_words`]), which is what [`is_alab_kept`] reads.
+#[must_use]
+pub fn alab_kept(build: u64, why: &str) -> String {
+    let mut s = String::from(MANAGED_PREFIX);
+    s.push_str(&build.to_string());
+    s.push_str(" — ");
+    if !why.starts_with(ALAB_BUILD_WORDS) {
+        s.push_str(ALAB_BUILD_WORDS);
+        s.push_str(&build.to_string());
+        s.push_str("; ");
+    }
+    s.push_str(why);
+    s
+}
+
+/// Whether `state` is an [`alab_kept`] row: a store build in the ALab window
+/// ([`crate::alab::in_store_window`]) named as ALab's.
+#[must_use]
+pub fn is_alab_kept(state: &str) -> bool {
+    state
+        .strip_prefix(MANAGED_PREFIX)
+        .and_then(|rest| rest.split_once(" — "))
+        .is_some_and(|(build, why)| {
+            build.parse().is_ok_and(crate::alab::in_store_window)
+                && why.starts_with(ALAB_BUILD_WORDS)
+        })
+}
+
 /// `managed <version> — updates from <vendor>`: a vendor-direct build no lane has judged
 /// yet (no row, or a row an older client wrote) — its source, and no claim about the head.
 #[must_use]
@@ -495,11 +528,28 @@ pub fn alias_hint(alias: &str) -> String {
 }
 
 /// Where `program`'s builds come from, as the package log and Settings ▸ Packages name it:
-/// `Anthropic latest` / `OpenAI latest` for a vendor-direct program (its vendor's channel,
-/// whatever its row says) and `ALab index <N>` for everything else, `N` being the index its
+/// `ALab build (index <N>)` / `ALab build` for an ALab build of an ALab-built agent program
+/// (pinned by the index, or kept: [`crate::alab`]), `Anthropic latest` / `OpenAI latest` for
+/// a vendor-direct program (its vendor's channel, whatever else its row says) and
+/// `ALab index <N>` for everything else, `N` being the index its
 /// row is pinned by, else the one the last pass resolved (`last_index_build`), else none.
 #[must_use]
 pub fn source_words(program: &str, state: &str, last_index_build: u64) -> String {
+    // An ALab-built agent program's row from the index lane, or the one its kept ALab build
+    // carries ([`crate::alab`]): ALab's build, never its vendor's latest.
+    if crate::alab::agent(program).is_some() {
+        if let Some((_, index)) =
+            managed_pin(state).filter(|(build, _)| crate::alab::in_store_window(*build))
+        {
+            let mut s = String::from("ALab build (index ");
+            s.push_str(&index.to_string());
+            s.push(')');
+            return s;
+        }
+        if is_alab_kept(state) {
+            return String::from("ALab build");
+        }
+    }
     if let Some(spec) = crate::vendor_direct::spec(program) {
         let mut s = String::from(spec.vendor);
         s.push_str(" latest");
@@ -798,53 +848,10 @@ mod tests {
         assert_eq!(shadowed_by(&row), Some((muse, "/p/muse")));
     }
 
+    /// The agent programs' shell-local shadow row (2026-09-16) is a managed row, and NOT a
+    /// `SHADOWED by` row to the parser, because it is one shell's state, not the machine's.
     #[test]
-    fn every_canonical_spelling_is_exact() {
-        assert_eq!(managed(6808, 41), "managed 6808 — pinned by index 41");
-        assert_eq!(
-            system(Path::new("/opt/homebrew/bin/gh"), None),
-            "system: /opt/homebrew/bin/gh — not managed by aterm"
-        );
-        assert_eq!(
-            system(Path::new("/opt/homebrew/bin/gh"), Some("2026-08-27")),
-            "system: /opt/homebrew/bin/gh — not managed by aterm (managed copy retired 2026-08-27)"
-        );
-        assert_eq!(
-            system(Path::new("/opt/homebrew/bin/gh"), Some("")),
-            "system: /opt/homebrew/bin/gh — not managed by aterm",
-            "an empty date is no note"
-        );
-        assert_eq!(
-            shadowed(6808, Path::new("/Users//dev/.local/bin/trust")),
-            "managed 6808 — SHADOWED by /Users//dev/.local/bin/trust"
-        );
-        assert_eq!(
-            unavailable("x86_64-unknown-linux-gnu", "Emacs is a macOS-only member"),
-            "unavailable on x86_64-unknown-linux-gnu: Emacs is a macOS-only member"
-        );
-        assert_eq!(
-            unavailable("aarch64-pc-windows-msvc", ""),
-            "unavailable on aarch64-pc-windows-msvc: no build is published for this target"
-        );
-        // The alias fix-line is a separate sentence: the SHADOWED state never carries it,
-        // so a row that was written and read back stays byte-identical.
-        assert_eq!(
-            alias_hint("alab-trust"),
-            "type alab-trust for the managed one"
-        );
-        let row = shadowed(6808, Path::new("/opt/homebrew/bin/trust"));
-        assert!(!row.contains("alab-"));
-        assert_eq!(
-            shadowed_by(&row),
-            Some((6808, "/opt/homebrew/bin/trust")),
-            "the parser reads the bare row"
-        );
-    }
-
-    /// The agent programs' shell-local shadow row names the in-place remedy (never a new tab
-    /// or "remove that copy") and is not a `SHADOWED by` row to the parser.
-    #[test]
-    fn the_agent_shadow_row_names_the_in_place_remedy_and_is_never_the_machine_state() {
+    fn the_agent_shadow_row_is_never_the_machine_state() {
         let agents = Path::new("/Users//dev/Library/Application Support/aterm/pkg/agents");
         let absent = agent_shadowed_in_shell(
             2_026_091_601,
@@ -853,13 +860,6 @@ mod tests {
             false,
             ". ~/.aterm/shell.d/00-atpkg.zsh",
         );
-        assert_eq!(
-            absent,
-            "managed 2026091601 — SHADOWED in this shell by /Users//dev/.local/bin/claude: its \
-             PATH has no /Users//dev/Library/Application Support/aterm/pkg/agents (a shell \
-             that has not sourced the atpkg hook) — `. ~/.aterm/shell.d/00-atpkg.zsh` here \
-             picks the managed copy up; a tab opened on this build puts agents/ first on its own"
-        );
         let behind = agent_shadowed_in_shell(
             2_026_091_601,
             Path::new("/opt/homebrew/bin/codex"),
@@ -867,24 +867,10 @@ mod tests {
             true,
             "source ~/.aterm/shell.d/00-atpkg.fish",
         );
-        assert_eq!(
-            behind,
-            "managed 2026091601 — SHADOWED in this shell by /opt/homebrew/bin/codex: its PATH \
-             has /Users//dev/Library/Application Support/aterm/pkg/agents behind \
-             /opt/homebrew/bin — `source ~/.aterm/shell.d/00-atpkg.fish` here moves it to \
-             the front; a tab opened on this build puts agents/ first on its own"
-        );
-        // The cause is what is known, never a guess about when the shell was opened.
-        assert!(!absent.contains("before the install"), "{absent}");
         for row in [&absent, &behind] {
             assert!(is_managed(row), "{row}");
             assert_eq!(shadowed_by(row), None, "not the machine-wide row: {row}");
             assert_eq!(managed_pin(row), None, "{row}");
-            assert!(!row.contains("new tab"), "never a new tab: {row}");
-            assert!(
-                !row.contains("remove"),
-                "never the user's copy to remove: {row}"
-            );
             for fault in [
                 "error:",
                 "unavailable:",

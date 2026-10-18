@@ -102,8 +102,22 @@ pub fn read_process_parent(pid: i32) -> Option<u32> {
     read_bsdinfo(pid).map(|info| info.parent)
 }
 
+/// See the Apple twin. Linux: the `PPid:` line of `/proc/<pid>/status`, read between
+/// two [`read_process_start`] reads that must agree, so the pid named one live process
+/// of this uid throughout. `Some(1)`: re-parented to init. Under a user manager that
+/// is a child subreaper (`systemd --user`), an orphan is re-parented to it instead, so
+/// `1` is rarer here than launchd's adoption on macOS.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[must_use]
+pub fn read_process_parent(pid: i32) -> Option<u32> {
+    let start = read_process_start(pid)?;
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let parent = procfs::parent(&status)?;
+    (read_process_start(pid)? == start).then_some(parent)
+}
+
 /// See the Apple twin: no parent-pid primitive is wired here.
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
 #[must_use]
 pub fn read_process_parent(_pid: i32) -> Option<u32> {
     None
@@ -136,8 +150,25 @@ pub fn read_process_path(pid: i32) -> Option<std::path::PathBuf> {
     )))
 }
 
+/// See the Apple twin, whose contract this keeps: Linux reads the `/proc/<pid>/exe`
+/// link between two [`read_process_start`] reads that must agree, and answers `None`
+/// for a live process whose binary was deleted — the kernel then appends ` (deleted)`
+/// to the name it kept ([`procfs::live_exe`]), where macOS names no path at all.
+/// A link the kernel refuses to read answers `None` too: for a live process of this
+/// uid, a non-dumpable one (a set-id exec, `PR_SET_DUMPABLE` 0) or a security
+/// module's denial. aterm never makes itself non-dumpable, so for a live aterm
+/// process `None` means deleted unless such a module refuses the read.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[must_use]
+pub fn read_process_path(pid: i32) -> Option<std::path::PathBuf> {
+    let start = read_process_start(pid)?;
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    let exe = procfs::live_exe(exe)?;
+    (read_process_start(pid)? == start).then_some(exe)
+}
+
 /// See the Apple twin: no executable-path primitive is wired here.
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
 #[must_use]
 pub fn read_process_path(_pid: i32) -> Option<std::path::PathBuf> {
     None
@@ -466,6 +497,13 @@ pub fn read_process_start(pid: i32) -> Option<ProcessStart> {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 // Skip: bottoms out at the `geteuid`/`getauxval` FFI calls.
 #[cfg_attr(trust_verify, trust::skip)]
+#[cfg_attr(
+    target_pointer_width = "64",
+    expect(
+        clippy::useless_conversion,
+        reason = "c_ulong is u64 on LP64 and u32 on 32-bit"
+    )
+)]
 fn linux_reader() -> Option<(u32, u64)> {
     unsafe extern "C" {
         fn geteuid() -> u32;
@@ -509,6 +547,24 @@ pub mod procfs {
         // Field 3 was the state; fields 4 through 21 are skipped.
         let start = fields.nth(18)?.parse().ok()?;
         Some((state, start))
+    }
+
+    /// The parent pid in a `/proc/<pid>/status` text: its `PPid:` line.
+    #[must_use]
+    pub fn parent(status: &str) -> Option<u32> {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix("PPid:"))?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    /// The executable a `/proc/<pid>/exe` link names, or `None` when the kernel
+    /// marks it ` (deleted)`: the process runs a binary no longer at that path.
+    #[must_use]
+    pub fn live_exe(link: std::path::PathBuf) -> Option<std::path::PathBuf> {
+        (!link.as_os_str().as_encoded_bytes().ends_with(b" (deleted)")).then_some(link)
     }
 
     /// The effective uid in a `/proc/<pid>/status` text: the second of the four
@@ -559,6 +615,181 @@ pub mod procfs {
     }
 }
 
+/// Read the argument words of one live process of this uid, between two
+/// matching [`ProcessStart`] records. No display-text splitting, environment
+/// return, or lossy conversion. Failure, a changed/unavailable start record,
+/// unsupported platform or a resource ceiling means unknown, never a prefix.
+///
+/// This is an observation, not an exec lock: a process can replace its image
+/// or rewrite its argument memory without changing its start record. Darwin's
+/// KERN_PROCARGS2 layout uses NUL padding before a normal nonempty argv[0];
+/// it cannot distinguish a deliberately empty argv[0] from that padding.
+#[must_use]
+pub fn read_process_argv(pid: i32) -> Option<Vec<std::ffi::OsString>> {
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+    {
+        argv_of_same_process(pid, read_process_start, read_process_argv_inner)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "android",
+    all(test, unix)
+))]
+fn argv_of_same_process(
+    pid: i32,
+    mut start: impl FnMut(i32) -> Option<ProcessStart>,
+    argv: impl FnOnce(i32) -> Option<Vec<std::ffi::OsString>>,
+) -> Option<Vec<std::ffi::OsString>> {
+    if pid <= 1 {
+        return None;
+    }
+    let before = start(pid)?;
+    let words = argv(pid)?;
+    (start(pid)? == before).then_some(words)
+}
+
+// Diagnostic ceilings, not kernel ARG_MAX laws. Valid larger vectors become
+// unknown. Both raw bytes and the decoded word-container allocation are bounded.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "android",
+    all(test, unix)
+))]
+const PROCESS_ARGV_MAX: usize = 8 * 1024 * 1024;
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "android",
+    all(test, unix)
+))]
+const PROCESS_ARGV_WORDS: usize = 65_536;
+
+#[cfg(target_os = "macos")]
+#[cfg_attr(trust_verify, trust::skip)]
+fn read_process_argv_inner(pid: i32) -> Option<Vec<std::ffi::OsString>> {
+    // Local SDK sys/sysctl.h: CTL_KERN=1, KERN_ARGMAX=8, KERN_PROCARGS2=49.
+    unsafe extern "C" {
+        fn sysctl(
+            name: *mut i32,
+            namelen: u32,
+            oldp: *mut core::ffi::c_void,
+            oldlenp: *mut usize,
+            newp: *mut core::ffi::c_void,
+            newlen: usize,
+        ) -> i32;
+    }
+    let mut argmax = 0i32;
+    let mut len = std::mem::size_of::<i32>();
+    let mut key = [1, 8];
+    // SAFETY: owned exact-size buffers; null newp requests a read only.
+    let rc = unsafe {
+        sysctl(
+            key.as_mut_ptr(),
+            2,
+            (&raw mut argmax).cast(),
+            &raw mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || len != std::mem::size_of::<i32>() {
+        return None;
+    }
+    let cap = usize::try_from(argmax)
+        .ok()
+        .filter(|&n| n > std::mem::size_of::<i32>() && n <= PROCESS_ARGV_MAX)?;
+    let mut bytes = vec![0u8; cap];
+    let mut len = cap;
+    let mut key = [1, 49, pid];
+    // SAFETY: bytes owns cap writable bytes; only an in-bounds successful
+    // returned length reaches the parser. No environment bytes are returned.
+    let rc = unsafe {
+        sysctl(
+            key.as_mut_ptr(),
+            3,
+            bytes.as_mut_ptr().cast(),
+            &raw mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || len > cap {
+        return None;
+    }
+    argv_from_procargs2(bytes.get(..len)?)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn read_process_argv_inner(pid: i32) -> Option<Vec<std::ffi::OsString>> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(format!("/proc/{pid}/cmdline")).ok()?;
+    let mut bytes = Vec::new();
+    file.take((PROCESS_ARGV_MAX + 1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    argv_from_cmdline(&bytes)
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn argv_from_procargs2(bytes: &[u8]) -> Option<Vec<std::ffi::OsString>> {
+    use std::os::unix::ffi::OsStringExt as _;
+    if bytes.len() > PROCESS_ARGV_MAX {
+        return None;
+    }
+    let argc = i32::from_ne_bytes(bytes.get(..4)?.try_into().ok()?);
+    let argc = usize::try_from(argc)
+        .ok()
+        .filter(|&n| n > 0 && n <= PROCESS_ARGV_WORDS)?;
+    let rest = bytes.get(4..)?;
+    let path_end = rest.iter().position(|&b| b == 0)?;
+    if path_end == 0 {
+        return None;
+    }
+    let mut at = path_end;
+    while rest.get(at) == Some(&0) {
+        at += 1;
+    }
+    if argc > rest.len().checked_sub(at)? {
+        return None;
+    }
+    let mut argv = Vec::with_capacity(argc);
+    for _ in 0..argc {
+        let tail = rest.get(at..)?;
+        let end = tail.iter().position(|&b| b == 0)?;
+        argv.push(std::ffi::OsString::from_vec(tail.get(..end)?.to_vec()));
+        at = at.checked_add(end)?.checked_add(1)?;
+    }
+    // The kernel's argc separates argv from its environment trailer.
+    Some(argv)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", all(test, unix)))]
+fn argv_from_cmdline(bytes: &[u8]) -> Option<Vec<std::ffi::OsString>> {
+    use std::os::unix::ffi::OsStringExt as _;
+    if bytes.is_empty() || bytes.len() > PROCESS_ARGV_MAX {
+        return None;
+    }
+    let body = bytes.strip_suffix(b"\0")?;
+    let count = body.split(|&b| b == 0).count();
+    if count > PROCESS_ARGV_WORDS {
+        return None;
+    }
+    Some(
+        body.split(|&b| b == 0)
+            .map(|word| std::ffi::OsString::from_vec(word.to_vec()))
+            .collect(),
+    )
+}
+
 /// End this process by `SIGKILL`, here: no destructor, exit handler or buffered flush runs.
 /// For fault injection that must die at one exact point; a `SIGKILL` death leaves no macOS
 /// crash report.
@@ -597,6 +828,76 @@ pub fn kill_self_now() -> ! {
         reason = "Windows has no SIGKILL: abort ends the process at once, and no macOS crash report exists here"
     )]
     std::process::abort()
+}
+
+/// `sigset_t`: a 32-bit mask on Darwin, 1024 bits on Linux.
+#[cfg(target_vendor = "apple")]
+type SigSet = u32;
+#[cfg(all(unix, not(target_vendor = "apple")))]
+type SigSet = [u64; 16];
+
+/// SIGTERM, SIGINT and SIGHUP, the signals a supervisor or a terminal stops a process with
+/// (launchd at logout, `launchctl bootout`, `systemctl stop`, ^C, a terminal gone away). Their
+/// numbers are the same on every supported Unix.
+#[cfg(unix)]
+// Skip: bottoms out at the sigset FFI calls.
+#[cfg_attr(trust_verify, trust::skip)]
+fn stop_set() -> SigSet {
+    unsafe extern "C" {
+        fn sigemptyset(set: *mut SigSet) -> i32;
+        fn sigaddset(set: *mut SigSet, sig: i32) -> i32;
+    }
+    let mut set = SigSet::default();
+    // SAFETY: `sigemptyset` initialises the set it is handed; `sigaddset` then adds valid
+    // signal numbers to that initialised set.
+    unsafe {
+        sigemptyset(&mut set);
+        for sig in [15, 2, 1] {
+            sigaddset(&mut set, sig);
+        }
+    }
+    set
+}
+
+/// TAKE THE STOP SIGNALS (SIGTERM, SIGINT, SIGHUP) so a process can stop cleanly instead of
+/// dying of their default action. They are blocked in the calling thread, which must be the
+/// process's only one, since every thread started after inherits the mask. One thread of
+/// their own, named `name`, then takes the first with `sigwait` and hands its number to
+/// `on_stop`. `false` when that thread cannot start: the mask is restored and the signals keep
+/// their default action. A second signal is left pending.
+#[cfg(unix)]
+// wasm32 never links aterm-uds; the census's wasm closure scans it anyway (OB-12).
+#[cfg(not(target_arch = "wasm32"))]
+// Skip: bottoms out at the signal-mask FFI calls.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn take_stop_signals(name: &str, on_stop: impl FnOnce(i32) + Send + 'static) -> bool {
+    unsafe extern "C" {
+        fn pthread_sigmask(how: i32, set: *const SigSet, old: *mut SigSet) -> i32;
+        fn sigwait(set: *const SigSet, sig: *mut i32) -> i32;
+    }
+    let (block, unblock) = if cfg!(target_os = "linux") || cfg!(target_os = "android") {
+        (0, 1)
+    } else {
+        (1, 2)
+    };
+    let set = stop_set();
+    // SAFETY: changes only the calling thread's mask, from a live, initialised set.
+    unsafe { pthread_sigmask(block, &set, std::ptr::null_mut()) };
+    let spawned = std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            let set = stop_set();
+            let mut sig = 0;
+            // SAFETY: waits on a live, initialised set and writes one int.
+            while unsafe { sigwait(&set, &mut sig) } != 0 {}
+            on_stop(sig);
+        });
+    if spawned.is_err() {
+        // SAFETY: as above.
+        unsafe { pthread_sigmask(unblock, &set, std::ptr::null_mut()) };
+        return false;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -818,10 +1119,9 @@ mod tests {
     }
 }
 
-#[cfg(all(test, target_vendor = "apple"))]
+#[cfg(all(test, any(target_vendor = "apple", target_os = "linux")))]
 mod parent_and_path_tests {
     use super::{read_process_parent, read_process_path};
-    use std::io::BufRead;
 
     /// This process: its parent is the one `std` reports, and its executable
     /// is the test binary running now.
@@ -840,45 +1140,185 @@ mod parent_and_path_tests {
         );
     }
 
-    /// An orphan reads parent 1: a shell backgrounds a `sleep` and exits, and launchd adopts
-    /// the sleep. The control is the shell's own child while the shell still runs.
+    /// Linux's `/proc` text: the `PPid:` line, and an exe link the kernel marks
+    /// ` (deleted)` names no live binary.
+    #[cfg(target_os = "linux")]
     #[test]
-    fn an_orphan_reads_parent_one() {
-        // `spawnfd`'s, so neither the shell nor its `sleep` holds another test thread's pipe.
-        let mut shell = crate::spawnfd::command("/bin/sh")
-            .args(["-c", "/bin/sleep 120 & echo $!; read -r _"])
-            .stdin(crate::spawnfd::Stdio::piped())
-            .stdout(crate::spawnfd::Stdio::piped())
-            .spawn()
-            .expect("sh");
-        let mut line = String::new();
-        std::io::BufReader::new(shell.stdout.take().expect("stdout"))
-            .read_line(&mut line)
-            .expect("the sleep's pid");
-        let sleep: i32 = line.trim().parse().expect("a pid");
-        let shell_pid = shell.id();
+    fn linux_reads_the_parent_line_and_refuses_a_deleted_exe_link() {
+        use super::procfs;
+        let status = "Name:\tcat\nUmask:\t0002\nState:\tR (running)\nTgid:\t13\nNgid:\t0\n\
+                      Pid:\t13\nPPid:\t4417\nTracerPid:\t0\n";
+        assert_eq!(procfs::parent(status), Some(4417));
+        assert_eq!(procfs::parent("Name:\tcat\n"), None);
+        let live = std::path::PathBuf::from("/opt/aterm/aterm");
+        assert_eq!(procfs::live_exe(live.clone()), Some(live));
         assert_eq!(
-            read_process_parent(sleep),
-            Some(shell_pid),
-            "the control: its shell"
+            procfs::live_exe(std::path::PathBuf::from("/opt/aterm/aterm (deleted)")),
+            None
         );
-        drop(shell.stdin.take()); // `read` sees EOF: the shell exits
-        shell.wait().expect("the shell exits");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        let parent = loop {
-            let parent = read_process_parent(sleep);
-            if parent == Some(1) || std::time::Instant::now() > deadline {
-                break parent;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    /// A live process whose binary was deleted under it reads no path — the macOS
+    /// contract — while its start record still answers. The control is the same
+    /// process before the delete.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_on_a_deleted_binary_reads_no_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-uds-deleted-exe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        // Copied by `cp`, never by this process: a binary this process held open
+        // for writing could be inherited by another test thread's fork, and its
+        // exec would fail ETXTBSY.
+        let copy = dir.join("sleep-copy");
+        let copied = crate::spawnfd::command("/bin/cp")
+            .arg("/bin/sleep")
+            .arg(&copy)
+            .status()
+            .expect("run cp");
+        assert!(copied.success(), "cp /bin/sleep: {copied}");
+        let mut child = crate::spawnfd::command(&copy)
+            .arg("120")
+            .spawn()
+            .expect("spawn the copy");
+        let pid = i32::try_from(child.id()).expect("pid");
+        assert_eq!(read_process_path(pid), Some(copy.clone()), "the control");
+        std::fs::remove_file(&copy).expect("delete the binary");
+        let path = read_process_path(pid);
+        let start = super::read_process_start(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(path, None, "a deleted binary names no path");
+        assert!(start.is_some(), "the process itself still reads");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod argv_tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt as _;
+
+    fn mac_frame(argc: i32, tail: &[u8]) -> Vec<u8> {
+        let mut bytes = argc.to_ne_bytes().to_vec();
+        bytes.extend_from_slice(b"/bin/aterm\0\0");
+        bytes.extend_from_slice(tail);
+        bytes
+    }
+
+    #[test]
+    fn a_kernel_argv_buffer_keeps_words_and_stops_before_the_environment() {
+        let expected = vec![
+            OsString::from("/bin/aterm"),
+            OsString::from("link"),
+            OsString::from_vec(b"name\xff with --durability relaxed".to_vec()),
+            OsString::new(),
+        ];
+        let bytes = mac_frame(4, b"/bin/aterm\0link\0name\xff with --durability relaxed\0\0--durability=relaxed\0SECRET=not-argv\0\0");
+        assert_eq!(argv_from_procargs2(&bytes), Some(expected));
+        let ordinary = mac_frame(1, b"/bin/aterm\0SECRET=not-argv\0");
+        assert_eq!(
+            argv_from_procargs2(&ordinary),
+            Some(vec![OsString::from("/bin/aterm")])
+        );
+        let mut broken = Vec::new();
+        for argc in [-1, 0, PROCESS_ARGV_WORDS as i32 + 1] {
+            broken.push(mac_frame(argc, b"/bin/aterm\0"));
+        }
+        broken.push(mac_frame(2, b"/bin/aterm\0"));
+        broken.push(mac_frame(1, b"/bin/aterm"));
+        broken.push(vec![1, 0, 0]);
+        let got: Vec<_> = broken
+            .iter()
+            .map(|bytes| argv_from_procargs2(bytes))
+            .collect();
+        assert!(got.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn a_proc_cmdline_keeps_empty_and_non_utf8_words_but_refuses_a_prefix() {
+        assert_eq!(
+            argv_from_cmdline(b"aterm\0\0name\xff with --durability relaxed\0\0"),
+            Some(vec![
+                OsString::from("aterm"),
+                OsString::new(),
+                OsString::from_vec(b"name\xff with --durability relaxed".to_vec()),
+                OsString::new()
+            ])
+        );
+        assert_eq!(
+            argv_from_cmdline(b"aterm\0"),
+            Some(vec![OsString::from("aterm")])
+        );
+        assert_eq!(argv_from_cmdline(b""), None);
+        assert_eq!(argv_from_cmdline(b"aterm\0truncated"), None);
+        let at_limit = vec![0u8; PROCESS_ARGV_WORDS];
+        assert_eq!(
+            argv_from_cmdline(&at_limit).unwrap().len(),
+            PROCESS_ARGV_WORDS
+        );
+        let over_limit = vec![0u8; PROCESS_ARGV_WORDS + 1];
+        assert_eq!(argv_from_cmdline(&over_limit), None);
+    }
+
+    #[test]
+    fn an_argv_observation_needs_the_same_known_process_start_on_both_sides() {
+        let old = ProcessStart {
+            boot: BootClock(17),
+            wall: None,
         };
-        unsafe extern "C" {
-            fn kill(pid: i32, sig: i32) -> i32;
+        let new = ProcessStart {
+            boot: BootClock(18),
+            wall: None,
+        };
+        let words = || Some(vec![OsString::from("aterm"), OsString::new()]);
+        let mut count = 0;
+        assert_eq!(
+            argv_of_same_process(
+                71,
+                |_| {
+                    count += 1;
+                    Some(old)
+                },
+                |_| words()
+            ),
+            words()
+        );
+        assert_eq!(count, 2);
+        for after in [None, Some(new)] {
+            let mut n = 0;
+            assert_eq!(
+                argv_of_same_process(
+                    71,
+                    |_| {
+                        n += 1;
+                        if n == 1 { Some(old) } else { after }
+                    },
+                    |_| words()
+                ),
+                None
+            );
+            assert_eq!(n, 2);
         }
-        // SAFETY: SIGKILL (9) to a pid this test started; the result is not needed.
-        unsafe {
-            kill(sleep, 9);
+        assert_eq!(
+            argv_of_same_process(
+                71,
+                |_| None,
+                |_| panic!("unknown identity must not read argv")
+            ),
+            None
+        );
+        for pid in [-1, 0, 1] {
+            assert_eq!(
+                argv_of_same_process(pid, |_| panic!("invalid pid"), |_| panic!("invalid pid")),
+                None
+            );
         }
-        assert_eq!(parent, Some(1), "launchd adopted the orphan");
     }
 }

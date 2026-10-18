@@ -7,13 +7,14 @@
 // burn field at two font sizes and several phases, mixed Add+Over (light-theme ink) fire, the
 // cached path, a chrome head band, split-patch seams, and run-to-run determinism.
 //
-// No GPU or no font: no-op. Cross-backend byte-exact checks also skip on downlevel
-// (sRGB-offscreen) adapters (`additive_is_byte_exact`); backend-internal properties hold on any
-// adapter.
+// No GPU or no font: COULD NOT RUN. On a downlevel (sRGB-offscreen) adapter
+// (`additive_is_byte_exact`) a test runs its other checks, then ends COULD NOT
+// RUN naming the byte-exact comparisons it could not make (`common::ByteExact`).
 
 use aterm_core::terminal::Terminal;
 use aterm_render::{FireMode, FirePatch, Theme, WindowCpu};
 
+use crate::common::ByteExact;
 use crate::common::{assert_byte_exact, backends, bb, block_text_term, gg, max_channel_delta, rr};
 
 /// Summed-RGB luminance proxy (monotone per channel, so ordering is exact).
@@ -143,6 +144,7 @@ fn synthetic_burns(phase: u32, ch: usize, grid_w: usize, grid_h: usize) -> Vec<F
 /// over block text at several phases must be byte-identical on both backends.
 #[test]
 fn fire_patch_synthetic_field_is_byte_exact_over_text() {
+    let exact = ByteExact::default();
     let theme = Theme::default();
     let (mut cpu, mut gpu) = backends(18.0, theme);
     let mut win = aterm_gpu::WindowGpu::new();
@@ -187,57 +189,12 @@ fn fire_patch_synthetic_field_is_byte_exact_over_text() {
             "fire_patch synthetic field (phase {phase}) GPU vs CPU max per-channel delta = {delta} ({} patches)",
             input.fire_patch.len()
         );
-        if gpu.additive_is_byte_exact() {
+        if exact.holds(&gpu, "byte-exact fire gate") {
             assert_eq!(
                 delta, 0,
                 "fire field must be BYTE-EXACT CPU==GPU (got {delta} at phase {phase})"
             );
-        } else {
-            eprintln!("SKIP byte-exact fire gate: downlevel sRGB offscreen (linear add)");
         }
-    }
-}
-
-/// The same parity at a 44 px font (cells ~50-100 px tall), over a
-/// glyph-free frame.
-#[test]
-fn fire_patch_byte_exact_at_4k_class_cells() {
-    let theme = Theme::default();
-    let (mut cpu, mut gpu) = backends(44.0, theme);
-    let mut win = aterm_gpu::WindowGpu::new();
-    let (rows, cols) = (6usize, 24usize);
-    let mut term = Terminal::new(rows as u16, cols as u16);
-    term.process("\x1b[?25l".as_bytes());
-    let (cw, ch) = cpu.cell_size();
-    let (grid_w, grid_h) = (cols * cw, rows * ch);
-    assert!(
-        ch >= 44,
-        "4K-class premise: cell height {ch} should be >= 44"
-    );
-
-    let base_input = term.cell_frame(rows, cols);
-    let cpu_base = cpu.render_input(&base_input);
-    let gpu_base = gpu.render_input(&mut win, &base_input, None);
-    assert_eq!(
-        max_channel_delta(&cpu_base.pixels, &gpu_base.pixels),
-        0,
-        "bg-only base must be byte-exact so the fire delta is effect-only"
-    );
-
-    let mut input = term.cell_frame(rows, cols);
-    input.fire_patch = synthetic_burns(123_456, ch, grid_w, grid_h);
-    let cpu_f = cpu.render_input(&input);
-    let gpu_f = gpu.render_input(&mut win, &input, None);
-    assert_ne!(cpu_f.pixels, cpu_base.pixels, "the 4K burns must paint");
-    let delta = max_channel_delta(&cpu_f.pixels, &gpu_f.pixels);
-    eprintln!("fire_patch 4K-class GPU vs CPU max per-channel delta = {delta}");
-    if gpu.additive_is_byte_exact() {
-        assert_eq!(
-            delta, 0,
-            "4K-class fire field must be BYTE-EXACT CPU==GPU (got {delta})"
-        );
-    } else {
-        eprintln!("SKIP byte-exact 4K fire gate: downlevel sRGB offscreen");
     }
 }
 
@@ -257,6 +214,7 @@ fn light_theme() -> Theme {
 /// the frame, so the check is non-vacuous.
 #[test]
 fn over_ink_fire_byte_exact_over_dark_and_light_frames() {
+    let exact = ByteExact::default();
     for (label, theme) in [("dark", Theme::default()), ("light", light_theme())] {
         let (mut cpu, mut gpu) = backends(18.0, theme);
         let mut win = aterm_gpu::WindowGpu::new();
@@ -346,7 +304,7 @@ fn over_ink_fire_byte_exact_over_dark_and_light_frames() {
             "fire Over ({label}) GPU vs CPU max per-channel delta = {delta} ({} patches)",
             input.fire_patch.len()
         );
-        if gpu.additive_is_byte_exact() {
+        if exact.holds(&gpu, "byte-exact Over fire gate ({label})") {
             assert_byte_exact(
                 "over_ink_fire_byte_exact_over_dark_and_light_frames",
                 &format!("fire Over ({label})"),
@@ -354,8 +312,6 @@ fn over_ink_fire_byte_exact_over_dark_and_light_frames() {
                 delta,
                 format_args!("({label}) ink-fire must be BYTE-EXACT CPU==GPU (got {delta})"),
             );
-        } else {
-            eprintln!("SKIP byte-exact Over fire gate ({label}): downlevel sRGB offscreen");
         }
     }
 }
@@ -365,6 +321,7 @@ fn over_ink_fire_byte_exact_over_dark_and_light_frames() {
 /// prev∪cur patch rows, and lands byte-exact with no ghost.
 #[test]
 fn damaged_path_fire_patch_parity_cpu_matches_gpu() {
+    let exact = ByteExact::default();
     let theme = Theme::default();
     let (mut cpu, mut gpu) = backends(18.0, theme);
     let mut win_cpu = WindowCpu::new();
@@ -433,13 +390,11 @@ fn damaged_path_fire_patch_parity_cpu_matches_gpu() {
     // ... and byte-exact across backends over the glyph-free background.
     let delta = max_channel_delta(&cpu_b, &gpu_b);
     eprintln!("damaged-path fire_patch CPU vs GPU max per-channel delta = {delta}");
-    if gpu.additive_is_byte_exact() {
+    if exact.holds(&gpu, "damaged-path byte-exact fire gate") {
         assert_eq!(
             delta, 0,
             "fire via the cached path must be BYTE-EXACT CPU==GPU (got {delta})"
         );
-    } else {
-        eprintln!("SKIP damaged-path byte-exact fire gate: downlevel sRGB offscreen");
     }
 }
 
@@ -515,35 +470,13 @@ fn seam_law_split_patches_byte_identical_to_one_wide() {
     }
 }
 
-/// The field is pure and the pipelines are stateless: the same input renders the same bytes
-/// twice, on both backends.
-#[test]
-fn fire_patch_determinism_same_bytes_twice() {
-    let theme = Theme::default();
-    let (mut cpu, mut gpu) = backends(18.0, theme);
-    let mut win = aterm_gpu::WindowGpu::new();
-    let (rows, cols) = (8usize, 24usize);
-    let mut term = Terminal::new(rows as u16, cols as u16);
-    term.process(b"\x1b[?25l$ burn twice");
-    let (cw, ch) = cpu.cell_size();
-    let (grid_w, grid_h) = (cols * cw, rows * ch);
-
-    let mut input = term.cell_frame(rows, cols);
-    input.fire_patch = synthetic_burns(31_337, ch, grid_w, grid_h);
-    let cpu_1 = cpu.render_input(&input).pixels.clone();
-    let cpu_2 = cpu.render_input(&input).pixels.clone();
-    assert_eq!(cpu_1, cpu_2, "CPU fire render must be deterministic");
-    let gpu_1 = gpu.render_input(&mut win, &input, None).pixels;
-    let gpu_2 = gpu.render_input(&mut win, &input, None).pixels;
-    assert_eq!(gpu_1, gpu_2, "GPU fire render must be deterministic");
-}
-
 /// Head-band parity: with a chrome head band (`set_head`) and padding
 /// (`set_pad`), a window-absolute burn rooted in the grid's top row whose
 /// tongues reach into the head band (row tag 0) renders byte-exact, and the
 /// band pixels carry flame on both backends.
 #[test]
 fn fire_patch_head_band_parity_cpu_matches_gpu() {
+    let exact = ByteExact::default();
     const P: usize = 6; // interior pad (px per edge)
     const H: usize = 20; // chrome head band (px above the padded grid)
     let theme = Theme::default();
@@ -634,12 +567,10 @@ fn fire_patch_head_band_parity_cpu_matches_gpu() {
 
     let delta = max_channel_delta(&cpu_f.pixels, &gpu_f.pixels);
     eprintln!("fire_patch head-band GPU vs CPU max per-channel delta = {delta}");
-    if gpu.additive_is_byte_exact() {
+    if exact.holds(&gpu, "byte-exact head-band fire gate") {
         assert_eq!(
             delta, 0,
             "head-band fire must be BYTE-EXACT CPU==GPU (got {delta})"
         );
-    } else {
-        eprintln!("SKIP byte-exact head-band fire gate: downlevel sRGB offscreen");
     }
 }

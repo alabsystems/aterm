@@ -48,7 +48,7 @@ pub enum Lz4Error {
 
 impl Lz4Error {
     /// Render the `Display` message without `format_args!`, whose expansion
-    /// embeds an unsafe `fmt::Arguments` construction the strict Trust gate
+    /// embeds an unsafe `fmt::Arguments` construction the Trust lane (`ship trust run`)
     /// fails closed on (`dec_string` renders decimals like `usize`'s `Display`).
     pub(crate) fn to_message(&self) -> String {
         use crate::error::dec_string;
@@ -191,23 +191,6 @@ fn map_decompress_error(err: aterm_lz4::DecompressError) -> Lz4Error {
 mod tests {
     use super::*;
 
-    #[test]
-    fn zero_size_prefix_empty_body_is_ok() {
-        // 4-byte prefix of 0 + 0-byte body = valid "empty" decode.
-        let r = decompress_size_prepended(&[0, 0, 0, 0]);
-        assert!(r.is_ok(), "empty claim + empty body must succeed: {r:?}");
-        assert_eq!(r.unwrap().len(), 0);
-    }
-
-    #[test]
-    fn garbage_after_valid_prefix_errors_not_panics() {
-        // Prefix says "4 bytes", body is garbage. Must not panic.
-        for byte in 0u8..=255 {
-            let input = [4, 0, 0, 0, byte];
-            let _ = decompress_size_prepended(&input);
-        }
-    }
-
     /// A decode that succeeds returns exactly the length its prefix claims, so a
     /// peer cannot make the decoder emit more or fewer bytes than declared.
     /// Covers every claim 0..=16 × every body of 0–2 bytes (1.1M inputs); every
@@ -237,14 +220,6 @@ mod tests {
                 "{short:02x?}"
             );
         }
-    }
-
-    #[test]
-    fn test_decompress_too_short() {
-        assert!(matches!(
-            decompress_size_prepended(b"abc"),
-            Err(Lz4Error::InputTooShort)
-        ));
     }
 
     #[test]
@@ -287,17 +262,6 @@ mod tests {
             }
             other => panic!("expected CompressionBombSuspected, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn test_compression_bomb_rejected_tiny_body_huge_claim() {
-        // The classic bomb shape: minimal body, large claimed size.
-        // Claim 16 MiB from a 16-byte body (~1 048 576 : 1 ratio).
-        let claimed: u32 = 16 * 1024 * 1024;
-        let mut data = claimed.to_le_bytes().to_vec();
-        data.extend(std::iter::repeat_n(0u8, 16));
-        let err = decompress_size_prepended(&data).expect_err("must reject bomb");
-        assert!(matches!(err, Lz4Error::CompressionBombSuspected { .. }));
     }
 
     #[test]

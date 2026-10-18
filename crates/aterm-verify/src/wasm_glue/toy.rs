@@ -22,7 +22,9 @@
 //!    signed) in a copy of the glue; the driver must fail on it, by name.
 //!
 //! A machine without node or the stable wasm32 std is a skip with the fix.
-//! Progress goes to the caller's log, never the terminal.
+//! Progress goes to the caller's log, never the terminal. The check's second
+//! row, [`super::oracle`], holds the goldens and the driver to wasm-bindgen
+//! 0.2.108.
 
 use aterm_uds::output::CommandOutput as _;
 use std::fmt::Write as _;
@@ -81,21 +83,34 @@ pub(crate) fn first_difference(got: &str, want: &str) -> String {
 /// The check over the checkout at `root`, building in `work`; its progress
 /// lines are appended to `log`.
 pub(crate) fn gate(root: &Path, work: &Path, record: bool, log: &mut String) -> LaneRun {
+    let rustup = match stable_wasm32() {
+        Ok(rustup) => rustup,
+        Err(skip) => return skip,
+    };
+    match run(root, &rustup, work, record, log) {
+        Ok(()) => LaneRun::pass(),
+        Err(e) => LaneRun::fail(e),
+    }
+}
+
+/// What a toy build and its driver need: node, and rustup with the stable
+/// wasm32 std (found: rustup's path), else the skip naming the install.
+pub(super) fn stable_wasm32() -> Result<PathBuf, LaneRun> {
     if !command("node")
         .arg("--version")
         .output_owned()
         .is_ok_and(|o| o.status.success())
     {
-        return LaneRun::skip(
+        return Err(LaneRun::skip(
             "node not found; the toy runs under node",
-            "install node (brew install node)",
-        );
+            crate::install_fix("node", "node", "nodejs"),
+        ));
     }
     let Some(rustup) = crate::rustup::find_rustup() else {
-        return LaneRun::skip(
+        return Err(LaneRun::skip(
             format!("no rustup ({})", crate::rustup::RUSTUP_LOOKED),
             "install rustup (https://rustup.rs) and the stable wasm32 target",
-        );
+        ));
     };
     let has_target = command(&rustup)
         .args(["target", "list", "--installed", "--toolchain", "stable"])
@@ -107,15 +122,12 @@ pub(crate) fn gate(root: &Path, work: &Path, record: bool, log: &mut String) -> 
             )
         });
     if !has_target {
-        return LaneRun::skip(
+        return Err(LaneRun::skip(
             "no stable wasm32-unknown-unknown target",
             "rustup target add wasm32-unknown-unknown --toolchain stable",
-        );
+        ));
     }
-    match run(root, &rustup, work, record, log) {
-        Ok(()) => LaneRun::pass(),
-        Err(e) => LaneRun::fail(e),
-    }
+    Ok(rustup)
 }
 
 fn run(
@@ -273,7 +285,7 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
 /// `crates/` as members. The root manifest is the toy's, with the
 /// workspace's own `[workspace.package]`, lints and dependency rows for the
 /// staged crates, so they build as they do in the tree.
-fn stage(root: &Path, dir: &Path) -> Result<PathBuf, String> {
+pub(super) fn stage(root: &Path, dir: &Path) -> Result<PathBuf, String> {
     if dir.exists() {
         std::fs::remove_dir_all(dir)
             .map_err(|e| format!("could not clear {}: {e}", dir.display()))?;
@@ -360,22 +372,34 @@ fn host_paths(bytes: &[u8], root: &Path) -> Vec<String> {
 
 /// Build the toy for wasm32 on stable; the module cargo wrote.
 fn build(root: &Path, rustup: &Path, work: &Path, log: &mut String) -> Result<PathBuf, String> {
+    let manifest = stage(root, &work.join("stage"))?;
+    build_staged(rustup, &manifest, &work.join("target"), "the toy", log)
+}
+
+/// Build the staged crate at `manifest` (`what`, for the log) for wasm32,
+/// release, on stable, into `target`; the module cargo wrote.
+pub(super) fn build_staged(
+    rustup: &Path,
+    manifest: &Path,
+    target: &Path,
+    what: &str,
+    log: &mut String,
+) -> Result<PathBuf, String> {
     // STOCK EXCEPTION: Trust lacks a wasm32 std (module doc).
     let stable = crate::rustup::Toolchain::resolve(rustup, "stable")?;
-    let manifest = stage(root, &work.join("stage"))?;
     let neutral = std::env::temp_dir().join(format!("aterm-wasm-glue-{}", std::process::id()));
     std::fs::create_dir_all(&neutral)
         .map_err(|e| format!("could not create {}: {e}", neutral.display()))?;
     let _ = writeln!(
         log,
-        "  building the toy (wasm32, release) on {}",
+        "  building {what} (wasm32, release) on {}",
         stable.name
     );
     let built = stable
         .cargo()
         .env_remove("RUSTFLAGS")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
-        .env("CARGO_TARGET_DIR", work.join("target"))
+        .env("CARGO_TARGET_DIR", target)
         .current_dir(&neutral)
         .args([
             "build",
@@ -385,25 +409,25 @@ fn build(root: &Path, rustup: &Path, work: &Path, log: &mut String) -> Result<Pa
             "wasm32-unknown-unknown",
             "--manifest-path",
         ])
-        .arg(&manifest)
+        .arg(manifest)
         .output_owned();
     let _ = std::fs::remove_dir_all(&neutral);
     match built {
         Ok(o) if o.status.success() => {}
         Ok(o) => {
             return Err(format!(
-                "the toy's wasm32 build exited {:?}:\n{}",
+                "{what}'s wasm32 build exited {:?}:\n{}",
                 o.status.code(),
                 String::from_utf8_lossy(&o.stderr).trim_end()
             ));
         }
         Err(e) => return Err(format!("could not run {}: {e}", stable.cargo.display())),
     }
-    Ok(work.join(format!("target/wasm32-unknown-unknown/release/{STEM}.wasm")))
+    Ok(target.join(format!("wasm32-unknown-unknown/release/{STEM}.wasm")))
 }
 
 /// Run the driver on `dir`: whether it passed, and what it printed.
-fn drive(driver: &Path, dir: &Path) -> Result<(bool, String), String> {
+pub(super) fn drive(driver: &Path, dir: &Path) -> Result<(bool, String), String> {
     let out = command("node")
         .arg("--expose-gc")
         .arg(driver)

@@ -2,156 +2,101 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Saturation boundary and `try_extend_with`/`try_push` overflow tests (#5010).
+//! The `u32::MAX` capacity: the clamping and rejecting forms of extend and
+//! push, and mutations of a sequence filled to the brim (#5010).
 
-use crate::{Rle, RleCapacityError};
+use crate::{Rle, Run};
 
-/// Helper: verify `total_length == sum(run.length)` invariant.
-fn assert_invariant(rle: &Rle<u8>, label: &str) {
-    let run_total: u32 = rle.runs().iter().map(|run| run.length).sum();
-    assert_eq!(run_total, rle.len(), "invariant broken: {label}");
-}
-
-/// try_extend_with succeeds when there is sufficient capacity.
+/// `extend_with` and `push` clamp to the remaining capacity, on the new-run
+/// and the same-value merge paths alike, and never desynchronize the runs
+/// from the length.
 #[test]
-fn try_extend_with_succeeds_within_capacity() {
-    let mut rle = Rle::<u8>::new();
-    assert!(rle.try_extend_with(1, 100).is_ok());
-    assert_eq!(rle.len(), 100);
-    assert_invariant(&rle, "after try_extend_with within capacity");
-}
-
-/// try_extend_with returns an error when count exceeds remaining capacity.
-#[test]
-fn try_extend_with_rejects_overflow() {
+fn extend_and_push_clamp_to_the_remaining_capacity() {
     let mut rle = Rle::<u8>::new();
     rle.extend_with(1, u32::MAX);
+    rle.extend_with(2, 1);
+    rle.push(1);
+    rle.push(2);
+    assert_eq!(
+        rle.runs(),
+        &[Run {
+            value: 1,
+            length: u32::MAX
+        }]
+    );
+    assert_eq!(rle.remaining_capacity(), 0);
 
-    let err = rle.try_extend_with(2, 1).unwrap_err();
-    assert_eq!(err.requested, 1);
-    assert_eq!(err.available, 0);
-
-    // RLE must be unchanged after the rejected operation.
+    // Same value: only the 10 cells of slack are taken.
+    let mut rle = Rle::<u8>::new();
+    rle.extend_with(1, u32::MAX - 10);
+    rle.extend_with(1, 20);
+    assert_eq!(rle.runs().len(), 1);
     assert_eq!(rle.len(), u32::MAX);
-    assert_eq!(rle.run_count(), 1);
-    assert_invariant(&rle, "after rejected try_extend_with");
+    assert_eq!(rle.get(u32::MAX - 1), Some(1));
 }
 
-/// try_extend_with rejects partial overflow (some capacity but not enough).
+/// `try_extend_with` and `try_push` take a request that fits whole, and
+/// refuse one that does not, naming what was asked and what was free, with
+/// the sequence left exactly as it was.
 #[test]
-fn try_extend_with_rejects_partial_overflow() {
+fn try_forms_take_a_whole_request_or_change_nothing() {
     let mut rle = Rle::<u8>::new();
     rle.extend_with(1, u32::MAX - 5);
-
     let err = rle.try_extend_with(2, 10).unwrap_err();
-    assert_eq!(err.requested, 10);
-    assert_eq!(err.available, 5);
+    assert_eq!((err.requested, err.available), (10, 5));
+    assert_eq!((rle.len(), rle.run_count()), (u32::MAX - 5, 1));
 
-    // RLE must be unchanged — no partial insertion.
-    assert_eq!(rle.len(), u32::MAX - 5);
-    assert_eq!(rle.run_count(), 1);
-    assert_invariant(&rle, "after rejected partial try_extend_with");
+    assert!(
+        rle.try_extend_with(1, 4).is_ok(),
+        "the same-value merge path"
+    );
+    assert!(rle.try_push(2).is_ok(), "the new-run path, exactly full");
+    assert_eq!((rle.len(), rle.run_count()), (u32::MAX, 2));
+
+    for refused in [rle.try_push(2), rle.try_extend_with(1, 1)] {
+        let err = refused.unwrap_err();
+        assert_eq!((err.requested, err.available), (1, 0));
+    }
+    assert_eq!((rle.len(), rle.run_count()), (u32::MAX, 2));
 }
 
-/// try_push succeeds when there is capacity.
+/// Regression: after a clamped extend, `set`, `set_range` and `resize` at
+/// near-`u32::MAX` offsets keep exact length accounting.
 #[test]
-fn try_push_succeeds_within_capacity() {
+fn post_clamp_mutations_preserve_invariant() {
     let mut rle = Rle::<u8>::new();
     rle.extend_with(1, u32::MAX - 1);
+    rle.extend_with(2, 10); // Clamp to a single trailing cell.
 
-    assert!(rle.try_push(2).is_ok());
-    assert_eq!(rle.len(), u32::MAX);
-    assert_eq!(rle.run_count(), 2);
-    assert_invariant(&rle, "after try_push within capacity");
-}
+    assert_eq!(
+        rle.runs(),
+        &[
+            Run {
+                value: 1,
+                length: u32::MAX - 1,
+            },
+            Run {
+                value: 2,
+                length: 1,
+            },
+        ]
+    );
+    assert_eq!(rle.get(u32::MAX - 2), Some(1));
+    assert!(rle.set(u32::MAX - 1, 3));
+    assert_eq!(rle.get(u32::MAX - 1), Some(3));
 
-/// try_push returns an error when at capacity.
-#[test]
-fn try_push_rejects_at_capacity() {
-    let mut rle = Rle::<u8>::new();
-    rle.extend_with(1, u32::MAX);
+    rle.set_range(u32::MAX - 2, u32::MAX, 4);
+    assert_eq!(rle.get(u32::MAX - 2), Some(4));
+    assert_eq!(rle.get(u32::MAX - 1), Some(4));
 
-    let err = rle.try_push(2).unwrap_err();
-    assert_eq!(err.requested, 1);
-    assert_eq!(err.available, 0);
+    rle.resize(u32::MAX - 1);
+    assert_eq!(rle.len(), u32::MAX - 1);
+    assert_eq!(rle.get(u32::MAX - 1), None);
 
-    assert_eq!(rle.len(), u32::MAX);
-    assert_eq!(rle.run_count(), 1);
-    assert_invariant(&rle, "after rejected try_push");
-}
-
-/// remaining_capacity reports correct values.
-#[test]
-fn remaining_capacity_accurate() {
-    let mut rle = Rle::<u8>::new();
-    assert_eq!(rle.remaining_capacity(), u32::MAX);
-
-    rle.extend_with(1, 100);
-    assert_eq!(rle.remaining_capacity(), u32::MAX - 100);
-
-    rle.extend_with(2, u32::MAX - 100);
-    assert_eq!(rle.remaining_capacity(), 0);
-}
-
-/// RleCapacityError Display implementation.
-#[test]
-fn capacity_error_display() {
-    let err = RleCapacityError {
-        requested: 10,
-        available: 5,
-    };
-    let msg = err.to_string();
-    assert!(msg.contains("10"), "should show requested count");
-    assert!(msg.contains("5"), "should show available count");
-}
-
-/// Verify invariant holds after a sequence of saturating operations then
-/// mutations (truncate, set, set_range, resize).
-#[test]
-fn saturation_then_full_mutation_sequence() {
-    let mut rle = Rle::<u8>::new();
-    rle.extend_with(1, u32::MAX - 2);
-    rle.extend_with(2, 10); // Clamped to 2.
-    assert_eq!(rle.len(), u32::MAX);
-    assert_invariant(&rle, "after clamped extend");
-
-    // Truncate below the second run boundary.
-    rle.resize(u32::MAX - 3);
-    assert_eq!(rle.len(), u32::MAX - 3);
-    assert_invariant(&rle, "after truncate");
-
-    // set at the new last index.
-    assert!(rle.set(u32::MAX - 4, 5));
-    assert_eq!(rle.get(u32::MAX - 4), Some(5));
-    assert_invariant(&rle, "after set");
-
-    // set_range near the boundary.
-    rle.set_range(u32::MAX - 6, u32::MAX - 3, 6);
-    for i in (u32::MAX - 6)..(u32::MAX - 3) {
-        assert_eq!(rle.get(i), Some(6));
-    }
-    assert_invariant(&rle, "after set_range");
-
-    // Grow back to near-max.
-    rle.resize(u32::MAX);
-    assert_eq!(rle.len(), u32::MAX);
-    assert_invariant(&rle, "after resize grow to max");
-}
-
-/// Verify try_extend_with with same-value merge path at capacity boundary.
-#[test]
-fn try_extend_with_same_value_at_boundary() {
-    let mut rle = Rle::<u8>::new();
-    rle.extend_with(1, u32::MAX - 5);
-
-    // Same-value merge: exactly fills remaining capacity.
-    assert!(rle.try_extend_with(1, 5).is_ok());
-    assert_eq!(rle.len(), u32::MAX);
-    assert_eq!(rle.run_count(), 1);
-    assert_invariant(&rle, "same-value merge at exact boundary");
-
-    // Now at capacity — same-value merge should also fail.
-    let err = rle.try_extend_with(1, 1).unwrap_err();
-    assert_eq!(err.available, 0);
-    assert_invariant(&rle, "same-value merge rejected at capacity");
+    let run_total: u32 = rle.runs().iter().map(|run| run.length).sum();
+    assert_eq!(
+        run_total,
+        rle.len(),
+        "post-clamp mutations must keep total_length exact"
+    );
 }

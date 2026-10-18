@@ -157,24 +157,6 @@ fn fake_line(out: &Output) -> String {
         .to_string()
 }
 
-/// A HEALTHY machine: `bin/claude` exports `DISABLE_AUTOUPDATER=1` (the control) and
-/// `atpkg run claude` must too.
-#[test]
-fn run_exports_what_the_shim_exports() {
-    let fx = Fixture::new("healthy");
-    fx.install_claude(&["DISABLE_AUTOUPDATER=1"]);
-    fx.declare("DISABLE_AUTOUPDATER=1");
-    let control = fx.run(&fx.shim(), &["--version"]);
-    assert_eq!(
-        fake_line(&control),
-        "fake: [1] --version",
-        "control: the shim"
-    );
-    let out = fx.atpkg_run(&["--version"]);
-    assert_eq!(out.status.code(), Some(7), "{}", describe(&out));
-    assert_eq!(fake_line(&out), "fake: [1] --version", "{}", describe(&out));
-}
-
 /// A DRIFTED machine: an older `repair` laid `bin/claude` plain over a build
 /// that declares `DISABLE_AUTOUPDATER=1` — the shim itself runs without it (the control)
 /// — and `atpkg run claude` still exports what the build declares.

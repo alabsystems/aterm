@@ -49,11 +49,9 @@
 //!
 //! ## Build-truth tier capabilities
 //!
-//! This build's tier shape is what the CARGO FEATURES say, not what a caller
-//! wishes: the wasm crates build `aterm-core` without `disk-tier` → RAM-only
-//! store with LZ4 cold pages; native daemon builds may add the disk spill.
-//! [`WebTerminal::tier_capabilities_json`] exposes that truth so a host
-//! sizing budgets never assumes a disk spill on a RAM-only build.
+//! Every build's tier shape is a RAM-only store with LZ4 cold pages: the engine
+//! has no disk spill. [`WebTerminal::tier_capabilities_json`] reports that so
+//! a host sizing budgets never assumes one.
 //!
 //! Shared with `aterm-gpu-web`, which mounts this file by `#[path]`;
 //! [`WebTerminal`] is each crate's own terminal type.
@@ -228,11 +226,59 @@ fn render_tier_capabilities_json(caps: aterm_core::scrollback::TierCapabilities)
 }
 
 /// This crate's own tests of the surface, from `src/scrollback_tiers_api_tests.rs` of the
-/// crate compiling this shared file: the CPU and GPU hosts draw differently.
+/// crate compiling this shared file (the CPU and GPU hosts draw differently),
+/// and the tests both hosts share, written once below it.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/src/scrollback_tiers_api_tests.rs"
     ));
+
+    // THE TESTS BOTH HOSTS SHARE: each crate's file above names its `Host` and
+    // its `term()` (the shipped constructor on the bundled face); these are
+    // written once.
+
+    #[test]
+    fn ctor_attaches_tiered_store_with_the_unified_default_total() {
+        let t = term();
+        assert!(
+            t.term.scrollback().is_some(),
+            "E1: the web ctor must attach the tiered store"
+        );
+        assert_eq!(
+            t.term.scrollback_line_limit(),
+            Some(aterm_core::scrollback::DEFAULT_LINE_LIMIT),
+            "the construction default round-trips as ONE total"
+        );
+    }
+
+    /// The JSON wire contract the host glue parses: exact keys, lowercase codec
+    /// tokens, JSON-lowercase booleans.
+    ///
+    /// Every combination is pinned against the pure renderer, so no arm can go
+    /// dead, and the exported method is checked to report this build.
+    #[test]
+    fn tier_capabilities_json_pins_the_wire_contract() {
+        use aterm_core::scrollback::{ColdTierCodec, TierCapabilities};
+        let json = |cold_codec, disk_spill| {
+            render_tier_capabilities_json(TierCapabilities {
+                cold_codec,
+                disk_spill,
+            })
+        };
+        assert_eq!(
+            json(ColdTierCodec::Lz4, false),
+            "{\"coldCodec\":\"lz4\",\"diskSpill\":false}"
+        );
+        assert_eq!(
+            json(ColdTierCodec::Lz4, true),
+            "{\"coldCodec\":\"lz4\",\"diskSpill\":true}"
+        );
+        assert_eq!(
+            Host::tier_capabilities_json(),
+            render_tier_capabilities_json(TierCapabilities::current()),
+            "the exported method must report the capabilities of THIS build"
+        );
+    }
 }

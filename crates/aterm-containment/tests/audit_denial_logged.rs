@@ -116,13 +116,12 @@ fn log_denial_includes_all_modes() {
         ContainmentMode::Containment,
         ContainmentMode::Safety,
         ContainmentMode::User,
-        ContainmentMode::Master,
     ] {
         aterm_containment::log_denial("test", "op", mode, "reason");
     }
 
     let records = captured().lock().unwrap();
-    assert_eq!(records.len(), 4, "expected one record per mode");
+    assert_eq!(records.len(), 3, "expected one record per mode");
 
     // All use the same target.
     for record in records.iter() {
@@ -133,7 +132,6 @@ fn log_denial_includes_all_modes() {
     assert!(records[0].message.contains("Containment"));
     assert!(records[1].message.contains("Safety"));
     assert!(records[2].message.contains("User"));
-    assert!(records[3].message.contains("Master"));
 }
 
 #[test]
@@ -190,7 +188,6 @@ fn decide_permit_is_not_logged_as_denied() {
         ContainmentMode::Containment,
         ContainmentMode::Safety,
         ContainmentMode::User,
-        ContainmentMode::Master,
     ] {
         let decision = aterm_containment::decide_spawn(mode);
         let expected = mode != ContainmentMode::Containment || sandboxed;
@@ -205,7 +202,7 @@ fn decide_permit_is_not_logged_as_denied() {
     let records = captured().lock().unwrap();
     // One record per decision either way: a posture line per permitted spawn,
     // one denial for a refused one.
-    assert_eq!(records.len(), 4, "expected one audit record per decision");
+    assert_eq!(records.len(), 3, "expected one audit record per decision");
     let denied: Vec<&CapturedRecord> = records
         .iter()
         .filter(|r| r.message.contains("DENIED:"))
@@ -237,7 +234,7 @@ fn decide_permit_is_not_logged_as_denied() {
 
 #[test]
 fn posture_claims_resource_limits_only_for_the_mode_that_has_them() {
-    // Master and User get aterm's own limits (`Limits::inherit`) and Safety the
+    // User gets aterm's own limits (`Limits::inherit`) and Safety the
     // hardened ones (`Limits::shell_default`), so only Safety's no-sandbox
     // record may claim resource limits.
     let _lock = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -245,7 +242,6 @@ fn posture_claims_resource_limits_only_for_the_mode_that_has_them() {
     aterm_log::set_max_level(aterm_log::LevelFilter::Info);
 
     for (mode, hardened) in [
-        (ContainmentMode::Master, false),
         (ContainmentMode::User, false),
         (ContainmentMode::Safety, true),
     ] {

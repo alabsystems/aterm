@@ -107,41 +107,6 @@ fn nova_dirty_gate_settled_hits_changed_marks_prev_union_cur_rows() {
     );
 }
 
-/// A ring spanning several rows is one quad per row band, so when it vanishes
-/// rows-only prev∪cur marking still covers every previously lit row.
-#[test]
-fn multi_row_nova_marks_every_quad_row_on_change() {
-    let mut term = Terminal::new(8, 10);
-    term.process(b"\x1b[?25l");
-    let (cw, ch) = (10usize, 20usize);
-
-    // A ring over rows 1..=4 (one band quad per row) on prev; settled on cur.
-    let mut prev = term.cell_frame(8, 10);
-    for r in 1..=4u16 {
-        prev.nova_add
-            .push(quad_at(cw, ch, r, 3, premul_rgb(0x004C_C8FF, 120)));
-    }
-    let cur = term.cell_frame(8, 10);
-    let mut dirty = Vec::new();
-    let DirtyDecision::Rows(d) =
-        compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
-    else {
-        panic!("identical-geometry frames must take the row-damage path");
-    };
-    assert!(d.nova_changed, "a vanishing ring must set nova_changed");
-    assert!(!d.is_gate_hit(), "a vanishing ring must NOT gate-hit");
-    let marked: Vec<usize> = dirty
-        .iter()
-        .enumerate()
-        .filter_map(|(r, &b)| b.then_some(r))
-        .collect();
-    assert_eq!(
-        marked,
-        vec![1, 2, 3, 4],
-        "every band of the multi-row ring must be marked so no stale light survives"
-    );
-}
-
 /// On the cached path, re-presenting the same nova is byte-stable and clearing
 /// it restores the exact base bytes.
 #[test]

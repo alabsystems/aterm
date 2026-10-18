@@ -3,7 +3,7 @@
 //
 //! Conformance: the real `transact()` obeys the derived no-lost-update discipline.
 //!
-//! `aterm_spec::derive::transact_model()`: a transaction commits only if no
+//! `aterm_models_session::transact_model()`: a transaction commits only if no
 //! write intervened since it read the head (`CommitClean`, `seq = tbase`);
 //! otherwise it aborts (`Abort`, `seq > tbase`) without clobbering the concurrent
 //! write. Each real `Surface::transact` outcome is checked against the model's
@@ -12,7 +12,7 @@
 
 use crate::support::write_cap;
 use aterm_buffer::{Edit, Surface, TxnOutcome};
-use aterm_spec::derive::transact_model;
+use aterm_models_session::transact_model;
 use std::collections::BTreeMap;
 
 /// Project the state of a transaction attempting to commit (`active = 1`)

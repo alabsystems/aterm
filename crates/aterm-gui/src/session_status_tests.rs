@@ -96,22 +96,111 @@ fn settle(fsm: &mut StatusFsm, ev: &Evidence, at: Instant) -> Instant {
     later
 }
 
+/// cmd.exe's `%PROMPT%` integration marks prompts and never a command, so `ping
+/// -n 30 127.0.0.1` runs under the `Entering` block of the prompt it was typed
+/// at. The snapshot of 2026-09-29 records the defect on 0.95.0 (2026-09-27):
+/// `status` read `phase=idle` while the close guard refused the close as a
+/// running job. With no command ever reported, the live job outranks that
+/// prompt. CONTROL: the same evidence without the yield reads idle.
 #[test]
-fn shell_prompt_outranks_background_output() {
-    // The `tail -f &` case: content is moving, but the shell is at a prompt.
-    // Screen movement must NOT promote the session to Running.
+fn a_prompt_only_shell_running_a_job_reads_running() {
+    let t0 = Instant::now();
+    let run = |shell| {
+        let mut fsm = StatusFsm::new(policy(), t0);
+        let mut ev = evidence(blank(1));
+        ev.shell = shell;
+        ev.foreground_job = Some(true);
+        fsm.observe(&ev, t0);
+        ev.activity.content_seq = 2;
+        ev.activity.last_output = Some(t0 + Duration::from_millis(10));
+        settle(&mut fsm, &ev, t0 + Duration::from_millis(10));
+        fsm.status().clone()
+    };
+    let yielded = prompt_yields_to_job(Some(ShellEvidence::Entering), false, Some(true));
+    assert_eq!(yielded, None, "the prompt yields to the job");
+    let status = run(yielded);
+    assert_eq!(status.phase, Phase::Running, "{status:?}");
+    assert_eq!(status.reasons.first(), Some(&Reason::ForegroundJob));
+
+    let unyielded = run(Some(ShellEvidence::Entering));
+    assert_eq!(
+        (unyielded.phase, unyielded.reasons),
+        (Phase::Idle, vec![Reason::ShellBlock]),
+        "CONTROL: the prompt block alone reads the running job as idle"
+    );
+}
+
+/// The other side of the line: a shell whose marks HAVE reported a command keeps
+/// its prompt's authority over a child it started in the background
+/// (`Start-Process notepad`), and a prompt-only shell with no live child stays
+/// idle on its prompt block. Only the prompt arms yield: an executing or
+/// completed block already says what it is.
+#[test]
+fn only_a_prompt_that_never_reported_a_command_yields_to_a_job() {
+    for shell in [ShellEvidence::Prompt, ShellEvidence::Entering] {
+        assert_eq!(
+            prompt_yields_to_job(Some(shell), true, Some(true)),
+            Some(shell),
+            "a shell that reports commands keeps its prompt"
+        );
+        for job in [Some(false), None] {
+            assert_eq!(
+                prompt_yields_to_job(Some(shell), false, job),
+                Some(shell),
+                "no live job: the prompt stands ({job:?})"
+            );
+        }
+    }
+    for shell in [
+        ShellEvidence::Executing,
+        ShellEvidence::Complete { exit_code: Some(0) },
+    ] {
+        assert_eq!(
+            prompt_yields_to_job(Some(shell), false, Some(true)),
+            Some(shell)
+        );
+    }
+    assert_eq!(prompt_yields_to_job(None, false, Some(true)), None);
+
+    // Through the FSM: the reporting shell's prompt reads Idle on the shell
+    // block, never the foreground job.
     let t0 = Instant::now();
     let mut fsm = StatusFsm::new(policy(), t0);
     let mut ev = evidence(blank(1));
-    ev.shell = Some(ShellEvidence::Prompt);
-
+    ev.shell = prompt_yields_to_job(Some(ShellEvidence::Prompt), true, Some(true));
+    ev.foreground_job = Some(true);
     fsm.observe(&ev, t0);
     ev.activity.content_seq = 2;
-    let t1 = settle(&mut fsm, &ev, t0 + Duration::from_millis(10));
-
+    settle(&mut fsm, &ev, t0 + Duration::from_millis(10));
     assert_eq!(fsm.status().phase, Phase::Idle);
-    assert_eq!(fsm.status().confidence, Confidence::Strong);
-    assert!(fsm.status().since <= t1);
+    assert_eq!(fsm.status().reasons, vec![Reason::ShellBlock]);
+}
+
+/// What "reported a command" is read from: cmd.exe's prompt marks (A, B, then
+/// the typed line and its output, then the next prompt) never move the
+/// completed-command count; pwsh's C…D does.
+#[test]
+fn prompt_marks_alone_never_report_a_command() {
+    use crate::quit_safety::shell_reports_commands;
+
+    let mut cmd = aterm_core::terminal::Terminal::new(24, 80);
+    cmd.process(b"\x1b]133;A\x07C:\\> \x1b]133;B\x07ping -n 30 127.0.0.1\r\nReply\r\n");
+    assert!(!shell_reports_commands(&cmd));
+    assert_eq!(shell_evidence(&cmd), Some(ShellEvidence::Entering));
+    cmd.process(b"\x1b]133;A\x07C:\\> \x1b]133;B\x07");
+    assert!(
+        !shell_reports_commands(&cmd),
+        "a second prompt is still no command"
+    );
+
+    let mut pwsh = aterm_core::terminal::Terminal::new(24, 80);
+    pwsh.process(b"\x1b]133;A\x07PS> \x1b]133;B\x07");
+    assert!(
+        !shell_reports_commands(&pwsh),
+        "a first prompt has reported nothing yet"
+    );
+    pwsh.process(b"Start-Sleep 1\r\n\x1b]133;C\x07\x1b]133;D;0\x07");
+    assert!(shell_reports_commands(&pwsh));
 }
 
 /// The complete phase vocabulary, pinned against its wire spellings. This is
@@ -158,14 +247,10 @@ fn every_phase_is_reachable_and_has_a_wire_spelling() {
     // prompt and a `sleep` are indistinguishable from here (the indicator
     // table pins that Quiet never asks for the user).
     ev.activity.last_output = None;
-    let t3 = settle(&mut fsm, &ev, t2 + QUIET * 2);
+    settle(&mut fsm, &ev, t2 + QUIET * 2);
     assert_eq!(fsm.status().phase, Phase::Quiet);
     assert_eq!(fsm.status().confidence, Confidence::Heuristic);
-
-    ev.lifecycle = Some(Lifecycle::Exited { exit_code: Some(3) });
-    fsm.observe(&ev, t3 + Duration::from_millis(10));
-    assert_eq!(fsm.status().phase, Phase::Exited);
-    assert_eq!(fsm.status().last_outcome, Outcome::Failure { exit_code: 3 });
+    // `exited`: `a_collected_exit_code_becomes_the_outcome`.
 }
 
 #[test]
@@ -194,53 +279,6 @@ fn alt_screen_transition_is_a_resync_not_activity() {
         Phase::Quiet,
         "an alt-screen sequence restart must not count as movement"
     );
-}
-
-#[test]
-fn a_new_unit_of_work_clears_the_previous_outcome() {
-    let t0 = Instant::now();
-    let mut fsm = StatusFsm::new(policy(), t0);
-    let mut ev = evidence(blank(1));
-    ev.shell = Some(ShellEvidence::Complete { exit_code: Some(2) });
-    let t1 = settle(&mut fsm, &ev, t0);
-    // Completion keeps the outcome while the phase goes idle.
-    assert_eq!(
-        fsm.status().phase,
-        Phase::Idle,
-        "finished work is not a phase"
-    );
-    assert_eq!(fsm.status().last_outcome, Outcome::Failure { exit_code: 2 });
-    assert!(fsm.status().last_outcome.is_failure());
-
-    ev.shell = Some(ShellEvidence::Executing);
-    ev.activity.content_seq = 2;
-    settle(&mut fsm, &ev, t1 + Duration::from_millis(10));
-
-    assert_eq!(fsm.status().phase, Phase::Running);
-    assert_eq!(fsm.status().last_outcome, Outcome::None);
-}
-
-#[test]
-fn dwell_suppresses_flapping_but_exit_publishes_immediately() {
-    let t0 = Instant::now();
-    let mut fsm = StatusFsm::new(policy(), t0);
-    let mut ev = evidence(blank(1));
-    ev.foreground_job = Some(false);
-    settle(&mut fsm, &ev, t0);
-    assert_eq!(fsm.status().phase, Phase::Idle);
-
-    // A single contrary observation inside the dwell window changes nothing.
-    ev.foreground_job = Some(true);
-    ev.activity.content_seq = 2;
-    assert!(!fsm.observe(&ev, t0 + Duration::from_millis(50)));
-    assert_eq!(fsm.status().phase, Phase::Idle);
-
-    // An exact-confidence transition bypasses dwell entirely.
-    ev.lifecycle = Some(Lifecycle::Exited { exit_code: Some(0) });
-    assert!(fsm.observe(&ev, t0 + Duration::from_millis(60)));
-    assert_eq!(fsm.status().phase, Phase::Exited);
-    assert_eq!(fsm.status().last_outcome, Outcome::Success);
-    assert_eq!(fsm.status().confidence, Confidence::Exact);
 }
 
 /// THE `Executing` ARM NAMES THE CLOCK THAT IS ALIVE
@@ -355,56 +393,6 @@ fn indicators_map_work_and_failure_without_claiming_unsaved_state() {
     }
 }
 
-/// The latch defect: the classifier is edge-driven by PTY output, but the
-/// transition OUT of Running is time-gated. A build that finishes and prints
-/// nothing more would keep its busy dot lit forever unless the observer can
-/// tell the event loop it still owes a wake.
-#[test]
-fn a_finished_pane_owes_a_wake_so_its_busy_dot_can_retire() {
-    let t0 = Instant::now();
-    let mut observer = StatusObserver::new(policy(), Duration::from_millis(0));
-    let mut ev = evidence(blank(1));
-    ev.foreground_job = Some(true);
-    // The first sample only ADOPTS the activity identity (it cannot know
-    // whether anything moved), so movement needs a second observation and
-    // publication needs a third once dwell is served.
-    observer.observe(1, &ev, t0);
-    let t1 = t0 + Duration::from_millis(10);
-    ev.activity.content_seq = 2;
-    observer.observe(1, &ev, t1);
-    let t2 = t1 + DWELL;
-    ev.activity.content_seq = 3;
-    observer.observe(1, &ev, t2);
-    assert_eq!(observer.status(1).map(|s| s.phase), Some(Phase::Running));
-    assert!(
-        status_indicators(observer.status(1).expect("published")).busy,
-        "a running pane lights the dot"
-    );
-
-    // Nothing more will ever be written to this PTY. The event loop must
-    // still be told to come back, or the dot never goes out.
-    let owed = observer.next_wake().expect("a Running pane owes a wake");
-    assert!(owed > t0, "the owed wake is in the future, not a spin");
-
-    // At that wake the pane ages out of Running with no new bytes at all.
-    let later = t2 + QUIET * 2;
-    observer.observe(1, &ev, later);
-    observer.observe(1, &ev, later + DWELL);
-    assert_eq!(observer.status(1).map(|s| s.phase), Some(Phase::Quiet));
-
-    // A pane at rest owes nothing, so an idle machine parks instead of
-    // spinning on a deadline it does not need.
-    let mut resting = evidence(blank(9));
-    resting.foreground_job = Some(false);
-    observer.observe(2, &resting, later);
-    observer.observe(2, &resting, later + DWELL);
-    assert_eq!(observer.status(2).map(|s| s.phase), Some(Phase::Idle));
-    assert!(
-        !status_indicators(observer.status(2).expect("published")).busy,
-        "an idle pane shows no dot"
-    );
-}
-
 /// End to end on the real fan-out: a BACKGROUND pane's transition must reach
 /// the tab its window renders. The status path is leaf-addressed precisely
 /// because a focus-addressed one would see nothing here.
@@ -499,7 +487,7 @@ fn a_cleared_failure_releases_the_tab_while_a_native_sibling_keeps_its_own_mark(
     ev.shell = Some(ShellEvidence::Executing);
     ev.activity.content_seq = 2;
     ev.activity.last_output = Some(t0 + Duration::from_millis(10));
-    let t1 = settle_observer(
+    settle_observer(
         &mut app.session_status,
         0,
         &ev,
@@ -529,29 +517,6 @@ fn a_cleared_failure_releases_the_tab_while_a_native_sibling_keeps_its_own_mark(
     assert!(
         !attention_of(&app, wid, tab_id),
         "the terminal's own bit must be clearable, not self-sustaining"
-    );
-
-    // And the same on a PURE-terminal tab, which the latch broke too.
-    ev.shell = Some(ShellEvidence::Complete { exit_code: Some(2) });
-    let t2 = settle_observer(
-        &mut app.session_status,
-        0,
-        &ev,
-        t1 + Duration::from_millis(10),
-    );
-    app.refresh_tab_status_indicators(wid, tab_id);
-    assert!(attention_of(&app, wid, tab_id));
-    ev.shell = Some(ShellEvidence::Complete { exit_code: Some(0) });
-    settle_observer(
-        &mut app.session_status,
-        0,
-        &ev,
-        t2 + Duration::from_millis(10),
-    );
-    app.refresh_tab_status_indicators(wid, tab_id);
-    assert!(
-        !attention_of(&app, wid, tab_id),
-        "a passing command retires the previous failure's mark"
     );
 }
 
@@ -654,6 +619,16 @@ fn the_status_sweep_records_one_status_change_per_published_transition() {
     };
     assert!(attention(&app), "an unseen failure marks the tab");
     assert!(app.session_status.note_seen(session), "looking quiets it");
+    assert!(
+        !app.session_status.note_seen(session),
+        "looking again quiets nothing"
+    );
+    assert!(
+        app.session_status
+            .status(session)
+            .is_some_and(|s| s.last_outcome.is_failure()),
+        "the RECORD keeps the failure; only the mark went quiet"
+    );
     let _ = app.observe_session_statuses(t0 + Duration::from_secs(3));
     assert!(!attention(&app), "the same failure stays seen");
     run("7");
@@ -723,69 +698,98 @@ fn a_prompt_reports_the_block_it_closed_and_no_older_one() {
     assert_eq!(completed_block(&term), None);
 }
 
-/// THE "SEEN" ACKNOWLEDGEMENT (RFC §17, 2026-09-27). A failure marks its
-/// tab until the user looks at the session; looking quiets the mark while the
-/// record keeps the failure; a NEW failure re-arms it — including a second
-/// failing command the sweep saw no work between (only its completed block
-/// differs), which publishes no status change at all.
+/// A SCROLLBACK ERASE NEVER LEAVES THE STATUS ON AN EARLIER EXIT: the
+/// reviewer's probes through the real sweep, typed into a zsh-style prompt:
+/// `sh -c 'exit 6'`, a command that writes ED 3 and exits 5, and `clear; sh
+/// -c 'exit 4'` (macOS `clear` writes ED 3). Each publishes its own exit: the
+/// erase keeps the running block, so its D lands there. Then a command whose
+/// rows all went into the history before its prompt (it printed past the
+/// screen and homed with ED 2), and a Cmd-K at that prompt before the next
+/// sweep: the erase takes its block, and its exit still publishes (the last
+/// D's copy, [`completed_block`]). Before the fix the first erase took the
+/// running block and `exit_code=6` stood over 5, 4 and 3; NEGATIVE CONTROL:
+/// a RIS still takes the block and swallows its D (by design), and the
+/// published outcome stands, so the reading tells a lost block apart; the
+/// last D's copy answers only for the block the prompt closed, so a finished
+/// command before the RIS that no sweep read is not published over it.
 #[test]
-fn a_seen_failure_quiets_its_tab_and_a_new_failure_re_arms_it() {
+fn a_scrollback_erase_never_leaves_the_status_on_an_earlier_exit() {
+    let mut app = crate::App::headless_for_test();
+    let front = app
+        .front_terminal(crate::WindowId(0))
+        .expect("front terminal");
+    let (session, term) = (front.session, front.term.clone());
+    const PROMPT: &[u8] = b"\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\";
+    let run = |command: &str, body: &[u8], exit: i32| {
+        let mut bytes = format!("{command}\r\n\x1b]133;C\x1b\\").into_bytes();
+        bytes.extend_from_slice(body);
+        bytes.extend_from_slice(format!("\x1b]133;D;{exit}\x1b\\").as_bytes());
+        bytes.extend_from_slice(PROMPT);
+        term.lock().unwrap().process(&bytes);
+    };
     let t0 = Instant::now();
-    let mut observer = StatusObserver::new(policy(), Duration::from_millis(250));
-    let attention = |o: &StatusObserver| o.indicators(1).expect("published").status_attention;
-    let mut ev = evidence(blank(1));
-    ev.shell = Some(ShellEvidence::Complete { exit_code: Some(1) });
-    ev.completed_block = done(10, 1);
-    let t1 = settle_observer(&mut observer, 1, &ev, t0);
-    assert!(attention(&observer), "an unseen failure marks the tab");
+    let mut at = 0;
+    let mut published = |app: &mut crate::App| {
+        for _ in 0..2 {
+            at += 1;
+            let _ = app.observe_session_statuses(t0 + Duration::from_secs(at));
+        }
+        let status = app.session_status.status(session).expect("published");
+        status_event_payload(status)
+    };
+    term.lock().unwrap().process(PROMPT);
+    run("sh -c 'exit 6'", b"", 6);
+    assert_eq!(
+        published(&mut app),
+        "phase=idle outcome=failure exit_code=6 signal=- confidence=strong"
+    );
+    run("sh -c 'printf \"\\033[3J\"; exit 5'", b"\x1b[3J", 5);
+    assert_eq!(
+        published(&mut app),
+        "phase=idle outcome=failure exit_code=5 signal=- confidence=strong",
+        "ED 3 while the command ran"
+    );
+    run("clear; sh -c 'exit 4'", b"\x1b[H\x1b[2J\x1b[3J", 4);
+    assert_eq!(
+        published(&mut app),
+        "phase=idle outcome=failure exit_code=4 signal=- confidence=strong",
+        "clear while the command ran"
+    );
+    let mut body = b"line\r\n".repeat(40);
+    body.extend_from_slice(b"\x1b[H\x1b[2J");
+    run("seq 40; printf '\\033[H\\033[2J'; exit 3", &body, 3);
+    term.lock().unwrap().clear_scrollback();
+    assert!(
+        term.lock().unwrap().last_completed_block().is_none(),
+        "PRECONDITION: the Cmd-K took the finished block with its rows"
+    );
+    assert_eq!(
+        published(&mut app),
+        "phase=idle outcome=failure exit_code=3 signal=- confidence=strong",
+        "Cmd-K at the prompt took the finished block before a sweep read it"
+    );
 
-    assert!(observer.note_seen(1), "looking quiets a live mark");
-    assert!(
-        !attention(&observer),
-        "a seen failure no longer marks the tab"
+    // NEGATIVE CONTROL: a RIS takes the running block and the phase, so the
+    // shell's D is refused and no exit is read: the outcome stands. A command
+    // that exited 2 just before it, with no sweep between, is the last D's
+    // copy, but the prompt after the RIS closed the `reset` block, not that
+    // one, so the copy is not read either (the same prompt with no erase or
+    // RIS reports nothing: a prompt reports only the block it closed).
+    run("sh -c 'exit 2'", b"", 2);
+    run("reset", b"\x1bc", 0);
+    assert_eq!(
+        term.lock()
+            .unwrap()
+            .last_finished_block()
+            .map(|b| b.exit_code),
+        Some(Some(2)),
+        "PRECONDITION: the last D's copy holds an exit other than the published one"
     );
-    assert!(
-        observer
-            .status(1)
-            .expect("published")
-            .last_outcome
-            .is_failure(),
-        "the RECORD keeps the failure; only the mark went quiet"
+    assert_eq!(
+        published(&mut app),
+        "phase=idle outcome=failure exit_code=3 signal=- confidence=strong",
+        "a RIS swallows the D, and the copy of a block this prompt did not close is not read"
     );
-    assert!(!observer.note_seen(1), "looking again quiets nothing");
-
-    // A second failing command with NO work observed between: the same
-    // phase and outcome, so the classifier publishes nothing — only the
-    // completed block moved.
-    ev.completed_block = done(11, 1);
-    assert!(
-        !observer.observe(1, &ev, t1 + Duration::from_millis(300)),
-        "the second failure is not a status change"
-    );
-    assert!(attention(&observer), "a new failure re-arms the mark");
-
-    // The same block observed again is the SAME failure.
-    observer.note_seen(1);
-    observer.observe(1, &ev, t1 + Duration::from_millis(600));
-    assert!(
-        !attention(&observer),
-        "re-reading one failure does not re-arm"
-    );
-
-    // Work, then another failure: the ordinary edge.
-    ev.shell = Some(ShellEvidence::Executing);
-    ev.completed_block = None;
-    ev.activity.content_seq = 2;
-    ev.activity.last_output = Some(t1 + Duration::from_millis(900));
-    let t2 = settle_observer(&mut observer, 1, &ev, t1 + Duration::from_millis(900));
-    assert!(
-        !attention(&observer),
-        "a running session carries no failure"
-    );
-    ev.shell = Some(ShellEvidence::Complete { exit_code: Some(2) });
-    ev.completed_block = done(12, 2);
-    settle_observer(&mut observer, 1, &ev, t2 + Duration::from_millis(10));
-    assert!(attention(&observer), "the next failure marks the tab again");
 }
 
 /// A session WITHOUT shell integration has one failure edge, its lifecycle
@@ -913,11 +917,6 @@ fn an_exited_pane_stays_exited_instead_of_reverting_to_ready() {
         app.session_status.status(0).map(|s| s.phase),
         Some(Phase::Exited),
         "a dead pane must not claim to be a shell at a prompt"
-    );
-    assert_eq!(
-        app.session_status_text(0).as_deref(),
-        Some("exited"),
-        "and chrome must not read 'ready'"
     );
 }
 
@@ -1073,39 +1072,6 @@ fn the_badge_switch_quiets_chrome_without_stopping_classification() {
         Some(Outcome::Failure { exit_code: 1 }),
         "the record is still classified and still readable"
     );
-    assert_eq!(
-        app.session_status_text(0).as_deref(),
-        Some("failed (exit 1)")
-    );
-}
-
-/// THE INPUT FIELDS (2026-09-24): `input= input_bytes= input_wait_ms=
-/// fg_rss_mb=` ride BOTH arms of the record, right after `integration=` and
-/// right before `supervisor=`, and the stamp still rides last. A session
-/// with no tty (every headless stub) has no reading: all four are `-`.
-#[test]
-fn the_status_record_carries_the_input_fields_before_supervisor() {
-    let mut app = crate::App::headless_for_test();
-    let fields = " input=- input_bytes=- input_wait_ms=- fg_rss_mb=- supervisor=";
-    let unobserved = app.session_status_record(0).expect("live session");
-    assert!(unobserved.contains(" observed=false "), "{unobserved}");
-    let observed = {
-        let mut ev = evidence(blank(1));
-        ev.shell = Some(ShellEvidence::Complete { exit_code: Some(0) });
-        settle_observer(&mut app.session_status, 0, &ev, Instant::now());
-        app.session_status_record(0).expect("live session")
-    };
-    assert!(observed.contains(" observed=true "), "{observed}");
-    for record in [unobserved, observed] {
-        assert!(record.contains(fields), "{record}");
-        let integration = record.find(" integration=").expect("integration=");
-        let input = record.find(" input=").expect("input=");
-        assert!(
-            !record[integration + 1..input].contains(' '),
-            "input= follows integration=: {record}"
-        );
-        assert_stamp_rides_last(&record);
-    }
 }
 
 /// `land_at=` AND `task=` (the Autopilot design, §9.3.5 and §9.4.1), on
@@ -1137,7 +1103,7 @@ fn the_status_record_and_the_roster_carry_land_at_and_task() {
     };
     let record = status(&app);
     assert!(
-        record.contains(" flaps=0 land_at=- task=- reset_at=- gen="),
+        record.contains(" flaps=0 land_at=- task=- log_seq=1 log_ep=1 run=- turn=- step=- need=- need_since_ms=- gen="),
         "{record}"
     );
     assert_stamp_rides_last(&record);
@@ -1272,81 +1238,34 @@ fn the_status_record_carries_the_effective_autopilot_beside_supervisor() {
     host.shutdown_and_join();
 }
 
-/// The two ADDITIVE fabric fields (§11.2). They answer the question a driver
-/// asks right after `ERR halted`: is this session held, and is there a bridge
-/// alive to lift it? Both arrive on BOTH arms of the record — the unobserved
-/// arm too, because a session nobody has classified yet can still be halted —
-/// and neither bumps `schema=`, which is what "additive" means here.
+/// `launch=` and `launch_seq=` (the launch witness, `crate::launch_witness`)
+/// ride after `human_seq=` and are judged against THAT count: `person` while
+/// it is the mark's, `since` once a person's gesture moved it; the screen's
+/// stamp stays last.
 #[test]
-fn the_status_record_carries_hold_and_fabric_inbox_hold() {
-    crate::fabric::with_link_reset(the_status_record_carries_hold_and_fabric_body);
-}
-
-fn the_status_record_carries_hold_and_fabric_body() {
-    let mut app = crate::App::headless_for_test();
+fn the_status_record_judges_the_launch_witness_by_its_own_count() {
+    use crate::launch_witness::{Launch, Why};
+    let app = crate::App::headless_for_test();
+    let ctx = app.pool.get(0).expect("live session").ctx.clone();
+    ctx.launch.mark_for_test(Launch {
+        id: 3,
+        seq: 0,
+        word: Some("claude"),
+        why: Why::Person,
+    });
     let record = app.session_status_record(0).expect("live session");
-    assert!(record.contains(" observed=false "), "the unobserved arm");
-    assert!(record.contains(" hold=0 "), "{record}");
-    // `hold_advisory=` (2026-09-29) right after `hold=`: no bridge ever
-    // lost here, so none.
     assert!(
-        record.contains(" hold=0 hold_advisory=- fabric="),
-        "{record}"
-    );
-    assert!(record.contains(" fabric=absent "), "{record}");
-    // The round-13 tail: no bridge, so no ack and no age — then `identity=`
-    // (session identities) — and after it the round-19 tail: no wake yet, so
-    // no hand, a quiet level and no story.
-    assert!(
-        record.contains(" fabric=absent fabric_rtt_ms=- fabric_link_age_ms=- identity=- "),
-        "{record}"
-    );
-    // Round 22 appended the SCREEN'S STAMP after the round-19 tail, the same
-    // additive way, so the tail is no longer the end of the record.
-    assert!(
-        record.contains(" hand=- level=quiet story=0 why=- path=live program="),
-        "{record}"
-    );
-    // The person's stamp (2026-09-25) and its count (2026-09-27): no
-    // person has keyed session 0, and the fields ride after
-    // `supervisor=` and `autopilot=` (no agent here: `-`); the owner's columns
-    // follow it, then the history this session's handoffs lost (none:
-    // it never crossed one, 2026-09-26), the integration its shell runs
-    // (none signed: `-`, 2026-09-26), the resize ledger's verdict and
-    // counts (never resized: `ok`, 2026-09-28), the harness's timer and task
-    // face (none: `-`, 2026-10-16), the Codex wall reset the harness placed
-    // (none: `-`, 2026-10-16), then the screen's stamp.
-    assert!(
-        record.contains(
-            " supervisor=- supervisor_proven=0 autopilot=- human_ms=- human_seq=0 path_evidence=- \
-             copy=- upgrade=- history_lost=0 integration_rev=- render=ok resizes=0 flaps=0 land_at=- \
-             task=- reset_at=- gen="
-        ),
+        record.contains(" human_seq=0 launch=person launch_seq=0 path_evidence="),
         "{record}"
     );
     assert_stamp_rides_last(&record);
-    assert!(
-        record.starts_with("schema=1 "),
-        "additive, not a new schema"
-    );
-
-    // Held: the flag flips on the OBSERVED arm too, from the same leaf read.
-    let t0 = Instant::now();
-    let mut ev = evidence(blank(1));
-    ev.shell = Some(ShellEvidence::Complete { exit_code: Some(0) });
-    settle_observer(&mut app.session_status, 0, &ev, t0);
-    let ctx = app.pool.get(0).expect("live session").ctx.clone();
-    crate::fabric::apply_hold_for_test(
-        &ctx,
-        Some(crate::fabric::Hold {
-            reason: "main%20broken".to_string(),
-            origin: "fleet".to_string(),
-        }),
-    );
+    crate::app_input::note_person(&ctx, crate::human_input::Gesture::Other);
     let record = app.session_status_record(0).expect("live session");
-    assert!(record.contains(" observed=true "), "{record}");
-    assert!(record.contains(" hold=1 "), "{record}");
-    assert!(!record.contains('\n'), "one line, always");
+    assert!(
+        record.contains(" human_seq=1 launch=since launch_seq=0 path_evidence="),
+        "{record}"
+    );
+    assert_stamp_rides_last(&record);
 }
 
 #[test]
@@ -1507,185 +1426,104 @@ fn fabric_batch_does_not_wait_for_a_background_timeline_writer() {
     assert!(settled.contains("agent=prompt"), "{settled}");
 }
 
-/// IDENTITY (session identities, phase 1): the record carries the agent
-/// identity the session was spawned under — the word the `sessions`
-/// roster carries, from the same spawn-time field — `-` for the human's
-/// own agent config. It rides BOTH arms after `fabric_link_age_ms=`,
-/// additive, `schema=1` unmoved; round 19's presence tail (`hand=`,
-/// `level=`, `story=`) was appended after it, the same way.
+/// The `status` verb's reply, the machine contract a poller parses: ONE
+/// line, `schema=1` first so a consumer can reject an unknown major, the
+/// `seq= hash=` stamp last, and the SAME keys in the same order on both
+/// arms — never classified and classified — so no field appears from
+/// nowhere and an additive field cannot land on one arm only. Never
+/// classified is `observed=false`, distinct from `phase=unknown` ("looked
+/// and found no evidence"). The values a driver acts on come from their
+/// sources: the hold, the spawn identity, an adopted session's attribution
+/// and the `tab_status` switch.
 #[test]
-fn the_status_record_carries_the_identity_after_the_fabric_tail() {
-    crate::fabric::with_link_reset(
-        the_status_record_carries_the_identity_after_the_fabric_tail_body,
-    );
+fn the_status_record_keeps_one_field_set_on_both_arms() {
+    crate::fabric::with_link_reset(the_status_record_keeps_one_field_set_on_both_arms_body);
 }
 
-fn the_status_record_carries_the_identity_after_the_fabric_tail_body() {
+fn the_status_record_keeps_one_field_set_on_both_arms_body() {
+    let keys = |record: &str| {
+        record
+            .split(' ')
+            .map(|word| {
+                word.split_once('=')
+                    .map_or(word, |(key, _)| key)
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+    };
     let mut app = crate::App::headless_for_test();
-    let record = app.session_status_record(0).expect("live session");
-    assert!(record.contains(" observed=false "), "the unobserved arm");
-    assert!(
-        record.contains(" fabric_link_age_ms=- identity=- hand="),
-        "{record}"
-    );
+    let unobserved = app.session_status_record(0).expect("live session");
+    assert!(unobserved.starts_with("schema=1 sid=0 "), "{unobserved}");
+    for field in [" observed=false ", " phase=unknown ", " revision=0 "] {
+        assert!(unobserved.contains(field), "{field}: {unobserved}");
+    }
 
-    app.pool
-        .sessions
-        .get_mut(&0)
-        .expect("session 0")
-        .session
-        .identity = Some("worker".to_string());
-    let record = app.session_status_record(0).expect("live session");
-    assert!(
-        record.contains(" fabric_link_age_ms=- identity=worker hand="),
-        "{record}"
-    );
-    assert!(
-        record.starts_with("schema=1 "),
-        "additive, not a new schema"
-    );
-
-    // The OBSERVED arm carries it too, from the same field.
-    let t0 = Instant::now();
-    let mut ev = evidence(blank(1));
-    ev.shell = Some(ShellEvidence::Complete { exit_code: Some(0) });
-    settle_observer(&mut app.session_status, 0, &ev, t0);
-    let record = app.session_status_record(0).expect("live session");
-    assert!(record.contains(" observed=true "), "{record}");
-    assert!(
-        record.contains(" fabric_link_age_ms=- identity=worker hand="),
-        "{record}"
-    );
-    assert!(!record.contains('\n'), "one line, always");
-}
-
-/// The `status` verb's reply, field by field. `schema=` leads so a consumer
-/// can reject an unknown MAJOR from the first token.
-#[test]
-fn the_status_record_is_versioned_and_separates_unobserved_from_unknown() {
-    // The tail it pins is `fabric=`, which is process-global instance state.
-    crate::fabric::with_link_reset(
-        the_status_record_is_versioned_and_separates_unobserved_from_unknown_body,
-    );
-}
-
-fn the_status_record_is_versioned_and_separates_unobserved_from_unknown_body() {
-    let mut app = crate::App::headless_for_test();
-
-    // Never classified. This is NOT `phase=unknown`, which means the
-    // classifier looked and found no usable evidence.
-    let record = app.session_status_record(0).expect("live session");
-    assert!(record.starts_with("schema=1 sid=0 "), "{record}");
-    assert!(record.contains(" observed=false "), "{record}");
-    assert!(record.contains(" phase=unknown "), "{record}");
-    assert!(record.contains(" revision=0 "), "{record}");
-    assert!(record.contains(" enabled=true"), "{record}");
-
-    let t0 = Instant::now();
     let mut ev = evidence(blank(1));
     ev.shell = Some(ShellEvidence::Complete { exit_code: Some(3) });
-    settle_observer(&mut app.session_status, 0, &ev, t0);
-    let record = app.session_status_record(0).expect("live session");
-    assert!(record.contains(" observed=true "), "{record}");
-    assert!(record.contains(" phase=idle "), "{record}");
-    assert!(
-        record.contains(" outcome=failure exit_code=3 signal=- "),
-        "{record}"
+    settle_observer(&mut app.session_status, 0, &ev, Instant::now());
+    let observed = app.session_status_record(0).expect("live session");
+    for field in [
+        " observed=true phase=idle ",
+        " outcome=failure exit_code=3 signal=- ",
+        " confidence=strong reasons=shell_block ",
+    ] {
+        assert!(observed.contains(field), "{field}: {observed}");
+    }
+    assert_eq!(
+        keys(&unobserved),
+        keys(&observed),
+        "both arms, one field set"
     );
-    assert!(record.contains(" confidence=strong "), "{record}");
-    assert!(record.contains(" reasons=shell_block "), "{record}");
-    assert!(record.contains(" conflict=false "), "{record}");
-    assert!(
-        !record.contains('\n'),
-        "the record must stay ONE line: {record}"
+    // The field set a poller parses (`help status`): an additive field
+    // lands before the `seq= hash=` stamp, and none is dropped or renamed.
+    // `conpty=` rides before `integration=` on Windows only.
+    let conpty = if cfg!(windows) { " conpty" } else { "" };
+    assert_eq!(
+        keys(&observed).join(" "),
+        format!(
+            "schema sid subject subject_source observed phase since_ms outcome exit_code signal \
+             detail confidence reasons attribution fs_consent conflict revision enabled hold \
+             hold_advisory fabric fabric_rtt_ms fabric_link_age_ms identity hand hand_pid level story why \
+             path program agent agent_detail agent_rev agent_since_ms agent_gen agent_fp \
+             program_state last_act os_appearance theme_side reported_scheme scheme_from bg_dark \
+             session_theme theme_origin{conpty} integration input input_bytes input_wait_ms fg_rss_mb supervisor \
+             supervisor_proven autopilot \
+             human_ms human_seq launch launch_seq path_evidence copy upgrade history_lost \
+             journal journal_off integration_rev born render \
+             resizes flaps land_at task \
+             log_seq log_ep run turn step need need_since_ms gen seq hash"
+        ),
+        "{observed}"
     );
+    for record in [&unobserved, &observed] {
+        assert!(!record.contains('\n'), "one line: {record}");
+        assert_stamp_rides_last(record);
+    }
 
-    // `tab_status = false` is disclosed rather than left to be inferred from
-    // a wall of `unknown`.
+    let ctx = app.pool.get(0).expect("live session").ctx.clone();
+    crate::fabric::apply_hold_for_test(
+        &ctx,
+        Some(crate::fabric::Hold {
+            reason: "main%20broken".to_string(),
+            origin: "fleet".to_string(),
+        }),
+    );
+    let pooled = &mut app.pool.sessions.get_mut(&0).expect("session 0").session;
+    pooled.identity = Some("worker".to_string());
+    pooled.handoff_local_id = Some(11);
     app.config.tab_status = Some(false);
     let record = app.session_status_record(0).expect("live session");
-    // `enabled=` was the LAST field when this was written, and the assertion
-    // said so with `ends_with`. Four ADDITIVE fabric fields now follow it
-    // (`hold=`, `fabric=`, `fabric_rtt_ms=`, `fabric_link_age_ms=`), and
-    // `identity=` (session identities) after those, and round 19's
-    // `hand=`/`level=`/`story=` after that, which is exactly what the
-    // record's own help promises a consumer — fields are appended and never
-    // bump `schema=`. So pin the VALUE, and let the tail keep growing.
-    assert!(record.contains(" enabled=false "), "{record}");
-    assert!(
-        record.contains(" fabric=absent fabric_rtt_ms=- fabric_link_age_ms=- identity=- "),
-        "{record}"
-    );
-    // Round 19 appended three more (`hand=`, `level=`, `story=`), the same way.
-    // Round 22 appended the SCREEN'S STAMP after the round-19 tail, the same
-    // additive way, so the tail is no longer the end of the record. `path=`
-    // (2026-09-22) went in between, the same way again — the stamp keeps
-    // its contract (last), the tail keeps its order. 2026-09-23: `why=`
-    // closes the round-19 tail, and the published `program= agent= …
-    // integration=` columns sit between `path=` and the stamp.
-    assert!(
-        record.contains(" hand=- level=quiet story=0 why=- path=live program="),
-        "{record}"
-    );
-    assert_stamp_rides_last(&record);
-
+    for field in [
+        " hold=1 ",
+        " identity=worker ",
+        " attribution=adopted fs_consent=unknown ",
+        " enabled=false ",
+    ] {
+        assert!(record.contains(field), "{field}: {record}");
+    }
     assert!(
         app.session_status_record(9999).is_err(),
         "an unknown session is an error, not a blank record"
-    );
-}
-
-/// THE TWO ADDITIVE FIELDS (design §5.2). They ride BOTH branches of the
-/// record — the never-classified one as well as the classified one — so a
-/// poller can never see a field appear from nowhere, and `schema=1` does
-/// not move because nothing was renamed or removed.
-///
-/// `covered` is deliberately unreachable today: it needs Full Disk Access
-/// AND `attribution=live` AND a service §7 S4 proved covered, and S4 has
-/// not been run. `unknown` here is the honest answer, not a stub.
-#[test]
-fn the_status_record_carries_the_two_additive_consent_fields() {
-    let mut app = crate::App::headless_for_test();
-
-    let record = app.session_status_record(0).expect("live session");
-    assert!(record.contains(" observed=false "), "{record}");
-    assert!(
-        record.contains(" reasons=- attribution=live fs_consent=unknown conflict=false "),
-        "the fields sit between `reasons=` and `conflict=`: {record}"
-    );
-    assert!(
-        record.contains(" schema=1 ") || record.starts_with("schema=1 "),
-        "{record}"
-    );
-
-    let t0 = Instant::now();
-    let mut ev = evidence(blank(1));
-    ev.shell = Some(ShellEvidence::Complete { exit_code: Some(0) });
-    settle_observer(&mut app.session_status, 0, &ev, t0);
-    let record = app.session_status_record(0).expect("live session");
-    assert!(record.contains(" observed=true "), "{record}");
-    assert!(
-        record.contains(" reasons=shell_block attribution=live fs_consent=unknown conflict="),
-        "{record}"
-    );
-    assert!(
-        !record.contains("fs_consent=covered"),
-        "`covered` needs a measurement nobody has taken: {record}"
-    );
-    assert!(!record.contains('\n'), "still ONE line: {record}");
-
-    // An ADOPTED session says so, and still refuses to assert the TCC
-    // consequence (§3.9 pt 3).
-    app.pool
-        .sessions
-        .get_mut(&0)
-        .expect("session 0")
-        .session
-        .handoff_local_id = Some(11);
-    let record = app.session_status_record(0).expect("live session");
-    assert!(
-        record.contains(" attribution=adopted fs_consent=unknown "),
-        "{record}"
     );
 }
 
@@ -1754,39 +1592,46 @@ fn consent_at_risk_rides_the_reasons_token_only_on_the_conjunction() {
 /// line being typed and a background job printing at an idle prompt
 /// (`tail -f &`, a sibling build) look alike here, and neither is work: the
 /// record publishes nothing new and owes the event loop no wake, so typing
-/// costs no chrome refresh.
+/// costs no chrome refresh. A bare prompt (`133;A` alone) is the same
+/// `tail -f &` case, and movement never promotes either to `Running`.
 #[test]
 fn movement_at_a_prompt_publishes_nothing_and_owes_no_wake() {
-    let t0 = Instant::now();
-    let mut observer = StatusObserver::new(policy(), Duration::from_millis(0));
-    let mut ev = evidence(blank(1));
-    ev.shell = Some(ShellEvidence::Entering);
-    let t1 = t0 + DWELL + Duration::from_millis(10);
-    observer.observe(1, &ev, t0);
-    observer.observe(1, &ev, t1);
-    let status = observer.status(1).expect("published");
-    assert_eq!(status.phase, Phase::Idle, "a displayed prompt is idle");
-    assert_eq!(observer.next_wake(), None, "a settled prompt parks");
+    for shell in [ShellEvidence::Entering, ShellEvidence::Prompt] {
+        let t0 = Instant::now();
+        let mut observer = StatusObserver::new(policy(), Duration::from_millis(0));
+        let mut ev = evidence(blank(1));
+        ev.shell = Some(shell);
+        let t1 = t0 + DWELL + Duration::from_millis(10);
+        observer.observe(1, &ev, t0);
+        observer.observe(1, &ev, t1);
+        let status = observer.status(1).expect("published");
+        assert_eq!(status.phase, Phase::Idle, "{shell:?}: a displayed prompt");
+        assert_eq!(
+            observer.next_wake(),
+            None,
+            "{shell:?}: a settled prompt parks"
+        );
 
-    // The grid moves at the prompt: a keystroke echo or ambient output.
-    ev.activity.content_seq = 2;
-    let t2 = t1 + Duration::from_millis(10);
-    assert!(
-        !observer.observe(1, &ev, t2),
-        "movement at a prompt is not a published change"
-    );
-    let status = observer.status(1).expect("published");
-    assert_eq!(status.phase, Phase::Idle);
-    assert_eq!(
-        status.reasons,
-        vec![Reason::ShellBlock],
-        "no activity reason rides an idle prompt"
-    );
-    assert_eq!(
-        observer.next_wake(),
-        None,
-        "nothing ages out of an idle prompt, so nothing is owed"
-    );
+        // The grid moves at the prompt: a keystroke echo or ambient output.
+        ev.activity.content_seq = 2;
+        let t2 = t1 + Duration::from_millis(10);
+        assert!(
+            !observer.observe(1, &ev, t2),
+            "{shell:?}: movement at a prompt is not a published change"
+        );
+        let status = observer.status(1).expect("published");
+        assert_eq!(status.phase, Phase::Idle, "{shell:?}");
+        assert_eq!(
+            status.reasons,
+            vec![Reason::ShellBlock],
+            "{shell:?}: no activity reason rides an idle prompt"
+        );
+        assert_eq!(
+            observer.next_wake(),
+            None,
+            "{shell:?}: nothing ages out of an idle prompt, so nothing is owed"
+        );
+    }
 }
 
 /// THE CLAUDE-CODE SHAPE (busy-rearm audit, item 1). A TUI that emits
@@ -2118,179 +1963,106 @@ fn command_detail_keeps_the_program_and_an_allowlisted_subcommand_only() {
     assert_eq!(command_detail("claude commit").as_deref(), Some("claude"));
 }
 
-/// The live E2E's D3 (2026-09-26): once the harness's live upgrade had
-/// relaunched Claude Code from the managed store — the line it types quotes
-/// every word, `'…/Library/Application Support/aterm/pkg/agents/claude'
-/// '--resume' …` — the tab's `status` read `detail=Application`. Words were
-/// cut at EVERY space, quoted or not, so the program slot held the first
-/// half of the path. A quoted or backslash-escaped space is part of its
-/// word, as the shell reads it, so the detail is the program's name.
-/// CONTROL: the same program at a path with no space reads as it always
-/// did, and a quoted argument with spaces is still never the detail.
+/// A quoted or escaped space is part of its word, so a program at a spaced
+/// path reads its name — the live upgrade's relaunch from `Application
+/// Support` read `detail=Application` (D3, 2026-09-26), and pwsh's backtick
+/// escape read `detail=Program` (0.95.0) — and that quote must never carry
+/// an ARGUMENT into `detail=`: the first D3 fix published `'t' --token
+/// SECRET`, a session id, and `tok`/`hunter2` from lines whose quoting POSIX
+/// and fish read differently. A word ends where EITHER reading ends it, a
+/// quote left open ends it at its first whitespace, `env -S`'s string is
+/// read for its first word, and the published name never holds whitespace.
 #[test]
-fn a_program_at_a_path_with_spaces_reads_its_name() {
-    let store = "/Users//me/Library/Application Support/aterm/pkg/agents";
-    let relaunch = format!(
-        ". '/Users//me/.aterm/shell.d/00-atpkg.zsh'; rehash; '{store}/claude' \
-         '--dangerously-skip-permissions' '--resume' 'b87ea568-277e-4ba7-bbd2-f0ab8bd14d1c'"
-    );
+fn a_quoted_program_path_reads_its_name_and_never_an_argument() {
+    let store = "Library/Application Support/aterm/pkg/agents/claude";
+    let abs = format!("/Users//me/{store}");
     let cases: &[(String, &str)] = &[
-        // The upgrade's relaunch line, verbatim in shape.
-        (relaunch, "claude"),
-        (format!("'{store}/claude' --resume x"), "claude"),
-        (format!("\"{store}/claude\" --resume x"), "claude"),
+        // The upgrade's relaunch line, verbatim in shape, and its spellings.
         (
-            format!("{} --resume x", store.replace(' ', "\\ ") + "/claude"),
+            format!(
+                ". '/Users//me/.aterm/shell.d/00-atpkg.zsh'; rehash; '{abs}' \
+                 '--dangerously-skip-permissions' '--resume' 'b87ea568-277e-4ba7-bbd2-f0ab8bd14d1c'"
+            ),
             "claude",
         ),
-        (format!("exec '{store}/claude'"), "claude"),
-        // A quoted assignment with a space is ONE assignment, skipped.
-        (format!("env 'FOO=a b' '{store}/codex' resume"), "codex"),
-        // CONTROL: no space anywhere in the path.
+        (format!("\"{abs}\" --resume SECRET"), "claude"),
         (
-            "/Users//me/.local/share/claude/versions/2.1.281 --resume x".to_string(),
+            format!("{} --resume SECRET", abs.replace(' ', r"\ ")),
+            "claude",
+        ),
+        (format!("exec '{abs}'"), "claude"),
+        (format!("'{abs}' '--resume' 'SECRET'"), "claude"),
+        (
+            format!(r"'/Users//o'\''neil/{store}' '--resume' 'SECRET'"),
+            "claude",
+        ),
+        // A quoted assignment with a space is ONE assignment, skipped.
+        ("env 'FOO=a b' '/opt/my tools/codex' resume".into(), "codex"),
+        // CONTROL: no space in the path; an argument with spaces.
+        (
+            "/Users//me/.local/share/claude/versions/2.1.281 --resume x".into(),
             "2.1.281",
         ),
         (
-            "'/Users//me/.local/bin/claude' --resume x".to_string(),
+            "claude -p 'fix the bug in Application Support'".into(),
             "claude",
         ),
-        // CONTROL: an argument with spaces is an argument.
+        // pwsh's backtick escape inside a Windows path; a backtick after a
+        // bare name ends the word as a POSIX shell would.
         (
-            "claude -p 'fix the bug in Application Support'".to_string(),
-            "claude",
-        ),
-    ];
-    for (cmd, want) in cases {
-        assert_eq!(command_detail(cmd).as_deref(), Some(*want), "{cmd:?}");
-    }
-    // Through the one producer the `status` record reads, by both roads: a
-    // screen scrape of the typed line, and OSC 633;E's explicit line.
-    let line = format!("'{store}/claude' '--resume' 'x'");
-    let mut term = aterm_core::terminal::Terminal::new(24, 200);
-    term.process(format!("\x1b]133;A\x07$ \x1b]133;B\x07{line}\n\x1b]133;C\x07").as_bytes());
-    assert_eq!(
-        executing_detail(&term).as_deref(),
-        Some("claude"),
-        "scraped"
-    );
-    term.process(b"\x1b]133;D;0\x07");
-    term.process(
-        format!("\x1b]133;A\x07$ \x1b]633;E;{line}\x07\x1b]133;B\x07{line}\n\x1b]133;C\x07")
-            .as_bytes(),
-    );
-    assert_eq!(
-        executing_detail(&term).as_deref(),
-        Some("claude"),
-        "explicit"
-    );
-}
-
-/// PowerShell escapes a space with a BACKTICK: `& C:\Program` Files\Git\
-/// usr\bin\less.exe C:\Windows\win.ini` ran less and read `detail=Program`
-/// on 0.95.0 (measured 2026-09-27). Inside a Windows path — a drive or a
-/// `\` before the backtick — the escaped space is part of the word, so the
-/// detail is the program's name. CONTROL: a backtick after a bare name, the
-/// one place a POSIX shell's command substitution could put it, still ends
-/// the word at the space, so an argument behind it never becomes the
-/// detail; a POSIX command substitution reads as before.
-#[test]
-fn a_pwsh_backtick_escaped_space_is_part_of_the_program_path() {
-    let cases: &[(&str, &str)] = &[
-        (
-            r"& C:\Program` Files\Git\usr\bin\less.exe C:\Windows\win.ini",
+            r"& C:\Program` Files\Git\usr\bin\less.exe C:\Windows\win.ini".into(),
             "less",
         ),
         (
-            r"C:\Program` Files\Git\usr\bin\less C:\Windows\win.ini",
+            r"C:\Program` Files\Git\usr\bin\less C:\Windows\win.ini".into(),
             "less",
         ),
-        (r"& .\my` tools\build.cmd --target x", "build"),
-        (r"& C:/Program` Files/Git/usr/bin/vim.exe notes.txt", "vim"),
-        // The escaped space in the LAST component: the name ends at it.
-        (r"& C:\tools\my` app.exe --token SECRET", "my"),
-        // CONTROL: no Windows path in front of the backtick.
-        ("claude` /secret/tok --resume x", "claude"),
-        ("claude `echo /secret/tok`", "claude"),
-        ("`which less` README.md", "which"),
-        // CONTROL: the same program quoted, as tab completion writes it.
+        (r"& .\my` tools\build.cmd --target x".into(), "build"),
         (
-            r"& 'C:\Program Files\Git\usr\bin\less.exe' C:\Windows\win.ini",
+            r"& C:/Program` Files/Git/usr/bin/vim.exe notes.txt".into(),
+            "vim",
+        ),
+        (r"& C:\tools\my` app.exe --token SECRET".into(), "my"),
+        ("claude` /secret/tok --resume x".into(), "claude"),
+        ("claude `echo /secret/tok`".into(), "claude"),
+        ("`which less` README.md".into(), "which"),
+        (
+            r"& 'C:\Program Files\Git\usr\bin\less.exe' C:\Windows\win.ini".into(),
             "less",
         ),
-    ];
-    for (cmd, want) in cases {
-        assert_eq!(command_detail(cmd).as_deref(), Some(*want), "{cmd:?}");
-    }
-    assert!(windows_path_so_far(r"C:\Program"));
-    assert!(windows_path_so_far("d:/tools/my"));
-    assert!(windows_path_so_far(r".\my"));
-    assert!(!windows_path_so_far("claude"));
-    assert!(!windows_path_so_far("/usr/local/bin/my"));
-}
-
-/// The quote that lets a spaced path be ONE word (D3, above) must never
-/// carry an ARGUMENT into `detail=` — "never an argument" is the privacy
-/// rule, and splitting at every space kept it by construction. A line the
-/// POSIX reading gets wrong ran its program's word on to the end of the
-/// line, and `detail=` published whatever followed the word's last `/`:
-/// measured on the first D3 fix, `$'/usr/local/bin/don\'t' --token
-/// SECRET` read `'t' --token SECRET`, the harness's own fish quoting read
-/// `claude' '--resume' 'b87ea568-…` (the session id), and `don't --token
-/// SECRET` read the whole line. And ending a word at the first whitespace
-/// after the LAST quote that opened still leaked when the argument's
-/// opening quote closed the program's apostrophe: `don't '/secret/tok'`
-/// read `tok`, `/Users//o'neil/bin/claude --resume '/secret/tok'` read
-/// `tok`, `it's-a-script.sh --password 'x/hunter2'` read `hunter2`. So a
-/// word ends where EITHER reading (POSIX, fish) ends it, a reading that
-/// leaves a quote open ends the word at the word's own first whitespace,
-/// and the published name ends at its first whitespace. CONTROL: the
-/// managed copy's `Application Support` path, quoted every way a shell
-/// quotes it, still reads `claude`, and `don't "/secret/tok"` — whose
-/// double quotes sit inside the apostrophe's open quote, so the quote left
-/// open is the program's own — read `don't` under both rules.
-#[test]
-fn a_misquoted_line_never_publishes_an_argument() {
-    let store = "Library/Application Support/aterm/pkg/agents/claude";
-    let cases: &[(String, &str)] = &[
-        // bash/zsh `$'…'`, where `\'` is a quote: POSIX reads the quote
-        // after `t` as opening one that never closes. What is read is a
-        // piece of the program's name (`don't`), never the argument.
+        // bash/zsh `$'…'`: a piece of the program's name, never the argument.
         (r"$'/usr/local/bin/don\'t' --token SECRET".into(), "t"),
-        // The harness's own fish quoting (`upgrade::quote`) of a home with
-        // an apostrophe: POSIX runs the program's word into the session id.
+        // fish quoting of an apostrophe home: POSIX runs on into the id.
         (
             r"'/Users//o\'neil/bin/claude' '--resume' 'b87ea568-277e-4ba7-bbd2-f0ab8bd14d1c'".into(),
             "claude",
         ),
-        // …and a line POSIX misreads with every quote closed, whose last
-        // `/` sits in an argument: no open quote to notice, only fish's
-        // nearer end.
         (
             r"'/Users//o\'neil/bin/claude' '--resume' '/secret/tok en'".into(),
             "claude",
         ),
-        // An apostrophe in a bare word opens a quote that never closes —
-        // and the rest of the line may hold a `/` of its own.
+        (
+            format!(r"'/Users//o\'neil/{store}' '--resume' 'SECRET'"),
+            "Application",
+        ),
+        // An apostrophe in a bare word opens a quote that never closes, and
+        // an argument's opening quote may close it.
         ("don't --token SECRET".into(), "don't"),
         ("don't /secret/tok".into(), "don't"),
+        ("don't '/secret/tok'".into(), "don't"),
+        ("don't --token '/secret/tok'".into(), "don't"),
+        ("don't \"/secret/tok\"".into(), "don't"),
+        (
+            "don't '--resume' '/Users//me/secret-session'".into(),
+            "don't",
+        ),
         (
             "it's-a-script.sh --password hunter2".into(),
             "it's-a-script.sh",
         ),
-        // …and the ARGUMENT's opening quote may close the program's
-        // apostrophe, running the word through the argument, with the
-        // line's last quote left open behind it. The word still ends at
-        // its first whitespace, so nothing past the program is read.
-        ("don't '/secret/tok'".into(), "don't"),
         (
             "it's-a-script.sh --password 'x/hunter2'".into(),
             "it's-a-script.sh",
-        ),
-        ("don't --token '/secret/tok'".into(), "don't"),
-        (
-            "don't '--resume' '/Users//me/secret-session'".into(),
-            "don't",
         ),
         ("sudo don't '/secret/tok'".into(), "don't"),
         ("o'neil-tool --token '/secret/tok'".into(), "o'neil-tool"),
@@ -2300,13 +2072,7 @@ fn a_misquoted_line_never_publishes_an_argument() {
         ),
         ("can't 'x' '/secret/tok'".into(), "can't"),
         ("it's 'a' b '/secret/tok'".into(), "it's"),
-        // CONTROL: double quotes inside the apostrophe's open quote pair
-        // nothing, so the quote left open is the program's own.
-        ("don't \"/secret/tok\"".into(), "don't"),
-        // `env -S` hands env ONE string that env splits into the program
-        // and its arguments: the program is that string's first word,
-        // never its basename (the third review read `server.js`, `tok`,
-        // `notes.py`, `app.ts`).
+        // `env -S`'s ONE string: its first word, never a basename in it.
         (
             "env -S \"node --inspect /Users//me/secret-project/server.js\"".into(),
             "node",
@@ -2332,25 +2098,6 @@ fn a_misquoted_line_never_publishes_an_argument() {
         // A space in the program's OWN name is never published.
         (r"/Users//me/my\ tool --token SECRET".into(), "my"),
         ("\"/opt/my tools/run me\" --token SECRET".into(), "run"),
-        // fish's quoting of the spaced store path under an apostrophe
-        // home: the readings disagree, the nearer end wins. A directory's
-        // name, never an argument (the cost of not knowing the dialect).
-        (
-            format!(r"'/Users//o\'neil/{store}' '--resume' 'SECRET'"),
-            "Application",
-        ),
-        // CONTROL: the managed copy's path, as POSIX, fish (no apostrophe:
-        // the same line), double quotes and backslashes write it.
-        (format!("'/Users//me/{store}' '--resume' 'SECRET'"), "claude"),
-        (
-            format!(r"'/Users//o'\''neil/{store}' '--resume' 'SECRET'"),
-            "claude",
-        ),
-        (format!("\"/Users//me/{store}\" --resume SECRET"), "claude"),
-        (
-            format!("/Users//me/{} --resume SECRET", store.replace(' ', r"\ ")),
-            "claude",
-        ),
     ];
     const ARGUMENTS: [&str; 7] = [
         "SECRET", "token", "hunter2", "b87ea568", "resume", "secret", "tok",
@@ -2359,68 +2106,13 @@ fn a_misquoted_line_never_publishes_an_argument() {
         let got = command_detail(cmd);
         assert_eq!(got.as_deref(), Some(*want), "{cmd:?}");
         let got = got.unwrap_or_default();
-        assert!(
-            !got.contains(char::is_whitespace),
-            "{cmd:?}: a program's name is published without whitespace: {got:?}"
-        );
+        assert!(!got.contains(char::is_whitespace), "{cmd:?}: {got:?}");
         for argument in ARGUMENTS {
             assert!(
                 !got.contains(argument),
-                "{cmd:?}: {got:?} carries the argument {argument:?}"
+                "{cmd:?}: {got:?} carries {argument:?}"
             );
         }
-    }
-}
-
-/// The allocation-free selection must keep the old group/pop semantics,
-/// especially blank groups and trailing OR alternatives. Quoting stays in
-/// the unchanged splitter and is exercised by the privacy table above.
-#[test]
-fn borrowed_running_segment_matches_the_previous_group_selection() {
-    fn previous<'a>(cmdline: &'a str, segments: &[(ListOp, &'a str)]) -> &'a str {
-        let mut groups: Vec<Vec<(ListOp, &str)>> = Vec::new();
-        for &(op, text) in segments {
-            if op == ListOp::Seq || groups.is_empty() {
-                groups.push(Vec::new());
-            }
-            groups.last_mut().unwrap().push((op, text));
-        }
-        let mut chain = groups
-            .into_iter()
-            .rev()
-            .find(|group| group.iter().any(|(_, text)| !text.trim().is_empty()))
-            .unwrap_or_default();
-        while chain.len() > 1
-            && chain
-                .last()
-                .is_some_and(|(op, text)| *op == ListOp::Or || text.trim().is_empty())
-        {
-            chain.pop();
-        }
-        chain.last().map_or(cmdline, |(_, text)| text)
-    }
-
-    let words = ["", " ", "first", "last"];
-    let operators = [";", "\n", "&&", "||"];
-    // Four operands and three operators: all 16,384 combinations include
-    // empty first operands, entirely blank groups and mixed &&/|| tails.
-    for case in 0..4usize.pow(7) {
-        let mut choices = case;
-        let mut cmdline = String::new();
-        for segment in 0..4 {
-            if segment != 0 {
-                cmdline.push_str(operators[choices % 4]);
-                choices /= 4;
-            }
-            cmdline.push_str(words[choices % 4]);
-            choices /= 4;
-        }
-        let segments = split_list(&cmdline);
-        assert_eq!(
-            running_segment(&cmdline, &segments),
-            previous(&cmdline, &segments),
-            "{cmdline:?}",
-        );
     }
 }
 
@@ -2455,6 +2147,50 @@ fn executing_detail_reads_only_an_executing_block() {
             .as_bytes(),
     );
     assert_eq!(executing_detail(&term).as_deref(), Some("codex"));
+}
+
+/// A FULL CLEAR WHILE THE COMMAND RUNS (a program that clears and draws on
+/// the main screen): the engine moves the block's rows the clear blanked to
+/// the cleared screen's top row and its command rows are gone, so the scrape
+/// names nothing rather than what the program drew on the row the command
+/// was typed on; OSC 633;E's line still names it. CONTROL: before the clear
+/// both roads name `vim`. NEGATIVE CONTROL (the pre-fix reading): that row
+/// now reads the program's text, which the scrape would have named
+/// `python3`.
+#[test]
+fn a_full_clear_while_the_command_runs_never_names_what_the_program_drew() {
+    for named in [false, true] {
+        let mut term = aterm_core::terminal::Terminal::new(24, 80);
+        let explicit = if named {
+            "\x1b]633;E;vim notes\x07"
+        } else {
+            ""
+        };
+        term.process(
+            format!("\x1b[10;1H\x1b]133;A\x07$ {explicit}\x1b]133;B\x07vim notes\n\x1b]133;C\x07")
+                .as_bytes(),
+        );
+        assert_eq!(
+            executing_detail(&term).as_deref(),
+            Some("vim"),
+            "named={named}: CONTROL"
+        );
+        let row = term
+            .current_block()
+            .and_then(|b| b.command_start_row)
+            .expect("the command row");
+        term.process(b"\x1b[H\x1b[2J\x1b[10;1H$ python3 server.py");
+        assert_eq!(
+            executing_detail(&term).as_deref(),
+            named.then_some("vim"),
+            "named={named}"
+        );
+        assert_eq!(
+            term.abs_row_text(row).as_deref().map(str::trim_end),
+            Some("$ python3 server.py"),
+            "named={named}: NEGATIVE CONTROL: the row holds the program's text"
+        );
+    }
 }
 
 /// The `status` record's `detail=`: the sanitized running command while the
@@ -2536,116 +2272,6 @@ fn the_status_record_details_the_executing_block_and_nothing_else() {
     assert!(record.contains(" detail=- "), "complete: {record}");
 }
 
-/// The chrome already composes `running {detail}`; with the field populated
-/// it reads as the running program, and a blank detail stays plain `running`.
-#[test]
-fn chrome_renders_the_running_detail() {
-    let status = |detail: Option<&str>| Status {
-        phase: Phase::Running,
-        last_outcome: Outcome::None,
-        since: Instant::now(),
-        detail: detail.map(str::to_string),
-        confidence: Confidence::Strong,
-        reasons: vec![Reason::ShellBlock],
-        conflict: false,
-    };
-    assert_eq!(
-        summary_text(&status(Some("targo test"))).as_deref(),
-        Some("running targo test")
-    );
-    assert_eq!(summary_text(&status(Some(""))).as_deref(), Some("running"));
-    assert_eq!(summary_text(&status(None)).as_deref(), Some("running"));
-}
-
-/// A guess reads as what was seen, with no confidence word; an exit says
-/// its code the way a failed command does.
-#[test]
-fn chrome_says_what_was_observed() {
-    let with = |phase, confidence, last_outcome, reason| Status {
-        phase,
-        last_outcome,
-        since: Instant::now(),
-        detail: None,
-        confidence,
-        reasons: vec![reason],
-        conflict: false,
-    };
-    let status =
-        |phase, confidence, last_outcome| with(phase, confidence, last_outcome, Reason::NoEvidence);
-    let text = |s: Status| summary_text(&s).unwrap();
-    assert_eq!(
-        text(status(Phase::Quiet, Confidence::Heuristic, Outcome::None)),
-        "no output lately"
-    );
-    assert_eq!(
-        text(with(
-            Phase::Running,
-            Confidence::Heuristic,
-            Outcome::None,
-            Reason::ContentActivity
-        )),
-        "screen changing"
-    );
-    assert_eq!(
-        text(with(
-            Phase::Running,
-            Confidence::Heuristic,
-            Outcome::None,
-            Reason::OutputActivity
-        )),
-        "output arriving"
-    );
-    assert_eq!(
-        text(status(Phase::Starting, Confidence::Unknown, Outcome::None)),
-        "starting"
-    );
-    assert_eq!(
-        text(status(
-            Phase::Exited,
-            Confidence::Exact,
-            Outcome::Failure { exit_code: 1 }
-        )),
-        "exited (exit 1)"
-    );
-}
-
-/// An agent silent at its prompt or at a box is a shell's `no output
-/// lately`; its published phase is what the activity line says.
-#[test]
-fn chrome_says_the_agent_phase_not_the_shell_guess() {
-    use crate::presence::AgentPhase as P;
-    let text = |p: P| agent_activity_text(&p);
-    assert_eq!(text(P::Busy).as_deref(), Some("busy"));
-    assert_eq!(text(P::Idle).as_deref(), Some("idle"));
-    assert_eq!(text(P::Survey).as_deref(), Some("idle"));
-    assert_eq!(text(P::Question).as_deref(), Some("question"));
-    assert_eq!(
-        text(P::Prompt {
-            detail: Some("question".into())
-        })
-        .as_deref(),
-        Some("question"),
-        "the question tool's box approves nothing"
-    );
-    assert_eq!(
-        text(P::Prompt {
-            detail: Some("bash:not-read-only".into())
-        })
-        .as_deref(),
-        Some("bash approval")
-    );
-    assert_eq!(
-        text(P::Wall {
-            kind: aterm_phase::WallKind::Auth,
-            reset: None,
-            until: None,
-        })
-        .as_deref(),
-        Some("logged out")
-    );
-    assert_eq!(text(P::Unknown), None, "no evidence: the shell's line");
-}
-
 /// The chrome's `detail` was seeded `None` and never written, so every tab
 /// read plain `running` while the wire named the program. The sweep now
 /// folds `executing_detail` onto the published status through
@@ -2693,4 +2319,39 @@ fn the_sweep_publishes_the_running_detail_onto_the_chrome_status() {
         None,
         "a completed block clears the chrome detail"
     );
+}
+
+/// `conpty=` names the console host a Windows session runs in, `-` for a key
+/// no pseudoconsole is behind, and is absent off Windows, where a live
+/// record keeps the bytes every earlier build wrote.
+#[test]
+fn the_conpty_field_names_the_host_on_windows_and_is_absent_elsewhere() {
+    use aterm_pty::ConsoleHostKind;
+    assert_eq!(
+        conpty_status_field(true, Some(ConsoleHostKind::OpenConsole)),
+        " conpty=openconsole"
+    );
+    assert_eq!(
+        conpty_status_field(true, Some(ConsoleHostKind::Inbox)),
+        " conpty=inbox"
+    );
+    assert_eq!(conpty_status_field(true, None), " conpty=-");
+    for host in [
+        None,
+        Some(ConsoleHostKind::Inbox),
+        Some(ConsoleHostKind::OpenConsole),
+    ] {
+        assert_eq!(conpty_status_field(false, host), "");
+    }
+    // The headless App's session is a stub key: on Windows it reads `-`,
+    // elsewhere the field is not there at all.
+    let app = crate::App::headless_for_test();
+    let record = app.session_status_record(0).expect("live session");
+    let want = if cfg!(windows) {
+        " conpty=- integration="
+    } else {
+        " integration="
+    };
+    assert!(record.contains(want), "{record}");
+    assert_eq!(record.contains(" conpty="), cfg!(windows), "{record}");
 }

@@ -72,7 +72,8 @@
 //! | `cur/<key>` | the next offset to scan for one selector; MONOTONE |
 //! | `journal` | the newest [`JOURNAL_KEEP`] verdicts, `<off> firing\|fired\|dropped …` |
 //! | `log` | the identity of the bus log the two above are offsets on |
-//! | `logs/<identity>/` | `cur/` and `journal` of any other log this notifier read ([`Store::for_log`]) |
+//! | `logs/<identity>/` | `cur/` and `journal` of any other log this notifier read ([`Store::for_log`]) — a moved generation's carried over from the one it continues, clamped at the fork — the newest [`LOGS_KEEP`] kept |
+//! | `logs/used` | those other logs' identities, the latest read last ([`Store::prune_logs`]) |
 //! | `standing` | per presence subject, the `attention=` a human was last told of ([`STANDING_KEEP`]) |
 //! | `rate` | the timestamps of the last fires, for the budget window |
 //! | `suppressed` | rate-dropped notifications a human has not been told about yet |
@@ -112,12 +113,25 @@ use crate::subject::{is_fleet, is_principal};
 use crate::transport::{self, Backoff, Closer, Conn, Transport};
 
 /// How many records one `Fetch` page asks for while catching up.
-const PAGE: u32 = 256;
+///
+/// [`crate::transport::POST_PAGE`]'s width, NOT a row face's, for two reasons.
+/// An `ask:<p>` selector reads posts, whose bodies a page buffers whole. And
+/// the page is the unit of crash re-scan: a catch-up moves its cursor once per
+/// page, so the journal must outlive every hit one page can hold ([`JOURNAL_KEEP`]) —
+/// an `attention` page of presence rows can be ALL hits, and a re-scan past an
+/// evicted verdict tells a human twice. Widening this means re-keying the
+/// journal, not changing a number.
+const PAGE: u32 = crate::transport::POST_PAGE;
 
 /// How many verdicts the journal keeps. Far above [`PAGE`] on purpose: the
 /// cursor never moves backwards, so the only re-scan is of the page a crash
 /// interrupted, and the journal has to outlive that page with room to spare.
 const JOURNAL_KEEP: usize = 1024;
+
+/// How many other logs' stores (`logs/<identity>/`) are kept beside the
+/// root's ([`Store::prune_logs`]): the newest read, so a log that comes back
+/// after an off/on of its broker resumes, and the rest are removed.
+const LOGS_KEEP: usize = 4;
 
 /// How many subjects `standing` remembers. Past it the oldest is forgotten,
 /// which can only cost a re-page of an escalation already told, never a missed
@@ -153,7 +167,18 @@ enum Notice {
     /// with this identity (`None`: one that predates identity). Sent before
     /// any record of that connection, so the executor files each record's
     /// verdict and cursor under the log it was read from ([`Store::for_log`]).
-    Log(usize, Option<astream_broker::LogIdentity>),
+    Log(usize, ReadLog),
+}
+
+/// The log a connection reached: its identity (`None`: a broker that predates
+/// identity) and the lineage the same `Hello` told beside it (`None`: a broker
+/// before lineage, or a log astream recorded none for) — what
+/// [`Store::for_log`] files a reader's cursors and verdicts under, and carries
+/// a moved generation's store over by.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ReadLog {
+    id: Option<astream_broker::LogIdentity>,
+    lineage: Option<astream_broker::Lineage>,
 }
 
 /// A broker reader hands one row directly to the serial notification executor.
@@ -455,6 +480,20 @@ pub enum Since {
 /// notifier has never read starts the way a first run does, from `--since`.
 /// The rate budget and the `suppressed` count are the human's, not a log's,
 /// and stay at the root.
+///
+/// A MOVED GENERATION OF A LOG IT READ IS NOT A FIRST RUN. After a power loss
+/// under a weak tier (or a torn batch cut, or a repair's cut) astream moves
+/// the log's generation and says where the generations still agree
+/// ([`astream_broker::LogIdentity::continues`], from the lineage its `Hello`
+/// tells). Read from `--since head`, the new generation would start past every
+/// escalation posted between the broker's restart and this notifier's first
+/// read of it — the cost the relaxed tier used to carry. So its store is
+/// CARRIED OVER from the store of the generation it continues
+/// ([`Store::carry`]): each cursor resumes at the lower of itself and the
+/// fork, and the journal keeps only the verdicts below it — one at or above
+/// it names a record the loss took, and keyed by bare offset it would swallow
+/// the new record that reuses that offset. Nothing below the fork pages twice;
+/// nothing after it is skipped.
 #[derive(Clone)]
 struct Store {
     root: PathBuf,
@@ -479,6 +518,10 @@ impl Store {
             let mut f = std::fs::File::create(&tmp)?;
             f.write_all(value.as_bytes())?;
             f.write_all(b"\n")?;
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "aterm-link's flushes are the Ordered-tier work's to classify; the full flush is kept until then"
+            )]
             f.sync_all()?;
         }
         std::fs::rename(&tmp, &target)
@@ -494,8 +537,15 @@ impl Store {
     /// The store whose `cur/` and `journal` are the log `log`'s
     /// ([`Store`]'s doc): this root for a broker that predates identity, for
     /// the log the root's `log` file names, and — recorded there — for the
-    /// first identity read; `logs/<identity>/` for any other.
-    fn for_log(&self, log: Option<astream_broker::LogIdentity>) -> io::Result<Store> {
+    /// first identity read; `logs/<identity>/` for any other, which for a
+    /// moved generation of a log this notifier read is first CARRIED OVER from
+    /// that log's store, clamped where `lineage` (the one the same `Hello`
+    /// told) says the two agree ([`Store::carry`]).
+    fn for_log(
+        &self,
+        log: Option<astream_broker::LogIdentity>,
+        lineage: Option<&astream_broker::Lineage>,
+    ) -> io::Result<Store> {
         let Some(log) = log else {
             return Ok(self.clone());
         };
@@ -531,12 +581,224 @@ impl Store {
                 Ok(self.clone())
             }
             Some(owner) if owner == log => Ok(self.clone()),
-            Some(_) => {
+            Some(owner) => {
                 let root = self.root.join("logs").join(&name);
+                // A store this log already has — read before, or carried
+                // over by another selector's reader — is its own. Only a log
+                // with none is carried over, and only once.
+                if !root.exists() {
+                    if let Some((from, fork)) = self.predecessor(owner, log, lineage)? {
+                        self.carry(&from, &root, fork)?;
+                    }
+                }
                 std::fs::create_dir_all(root.join("cur"))?;
+                // Housekeeping, never a refusal: a store left behind costs
+                // disk, and a notifier stopped for it pages nobody.
+                if let Err(e) = self.prune_logs(&name) {
+                    eprintln!(
+                        "aterm-link notify: could not prune the stores of old logs under {}: {e}",
+                        self.root.join("logs").display()
+                    );
+                }
                 Ok(Store { root })
             }
         }
+    }
+
+    /// THE STORE `log` CONTINUES, if any: among the stores this notifier
+    /// holds — the root's (whose log is `owner`) and every `logs/<identity>/`
+    /// — the one of the NEWEST generation of the same log that `log` continues
+    /// by `lineage` ([`astream_broker::LogIdentity::continues`]), with the
+    /// offset below which the two agree. The newest, because its cursors and
+    /// verdicts are the latest this notifier wrote for that log, and its fork
+    /// the highest the chain allows. `None` with no lineage (a broker before
+    /// it, or a log found shorter, re-based or foreign, which astream records
+    /// none for), for another log's `id`, or a generation past the window:
+    /// then the log is read the way a first run reads it, from `--since`.
+    fn predecessor(
+        &self,
+        owner: astream_broker::LogIdentity,
+        log: astream_broker::LogIdentity,
+        lineage: Option<&astream_broker::Lineage>,
+    ) -> io::Result<Option<(Store, u64)>> {
+        let Some(lineage) = lineage else {
+            return Ok(None);
+        };
+        let mut held = vec![(owner, self.root.clone())];
+        match std::fs::read_dir(self.root.join("logs")) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
+                    let name = entry.file_name();
+                    if let Some(id) = name.to_str().and_then(astream_broker::LogIdentity::parse) {
+                        held.push((id, entry.path()));
+                    }
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        Ok(held
+            .into_iter()
+            .filter(|(earlier, _)| *earlier != log)
+            .filter_map(|(earlier, root)| {
+                let fork = log.continues(earlier, lineage)?;
+                Some((earlier.generation, Store { root }, fork))
+            })
+            .max_by_key(|(generation, _, _)| *generation)
+            .map(|(_, store, fork)| (store, fork)))
+    }
+
+    /// Carry admits absence only when the name is absent. A read failure or
+    /// damaged cursor must not publish a successor with missing state.
+    fn carry_text(&self, name: &str) -> io::Result<Option<String>> {
+        let path = self.root.join(name);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => Ok(Some(text)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                match std::fs::symlink_metadata(&path) {
+                    Err(missing) if missing.kind() == io::ErrorKind::NotFound => Ok(None),
+                    Err(other) => Err(other),
+                    Ok(_) => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// CARRY `from`'s store over to `to`, a moved generation that agrees with
+    /// `from`'s log below `fork` ([`Store`]'s doc): every `cur/<key>` at the
+    /// lower of itself and `fork`; the journal's verdicts below `fork` only (a
+    /// line whose offset does not parse names nothing, and goes); `standing`
+    /// as it is — a token a human was told of stays told, whatever record
+    /// carried it.
+    ///
+    /// Built whole in a scratch directory beside `to`, each file written
+    /// durably, then RENAMED into place: a crash leaves either no store for the
+    /// new log — the next read carries it over again from the same `from` — or
+    /// all of it, never a store with some cursors missing (a missing cursor
+    /// starts from `--since`, the very skip this exists to prevent). Two
+    /// readers carrying at once both build, and the second rename finds the
+    /// first's store and gives way to it: they carried the same thing.
+    fn carry(&self, from: &Store, to: &Path, fork: u64) -> io::Result<()> {
+        let logs = to.parent().unwrap_or(&self.root).to_path_buf();
+        std::fs::create_dir_all(&logs)?;
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix(".carry-")
+            .tempdir_in(&logs)?;
+        let built = Store {
+            root: scratch.path().to_path_buf(),
+        };
+        std::fs::create_dir(built.root.join("cur"))?;
+        let carried = (|| -> io::Result<()> {
+            match std::fs::read_dir(from.root.join("cur")) {
+                Ok(entries) => {
+                    for entry in entries {
+                        let entry = entry?;
+                        let name = entry.file_name();
+                        let Some(key) = name.to_str().filter(|k| !k.contains('.')) else {
+                            continue;
+                        };
+                        let text = std::fs::read_to_string(entry.path())?;
+                        let off = text.trim().parse::<u64>().map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "invalid carried notifier cursor",
+                            )
+                        })?;
+                        built.write(&format!("cur/{key}"), &off.min(fork).to_string())?;
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    match std::fs::symlink_metadata(from.root.join("cur")) {
+                        Err(missing) if missing.kind() == io::ErrorKind::NotFound => {}
+                        Err(other) => return Err(other),
+                        Ok(_) => return Err(e),
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+            let journal = from.carry_text("journal")?.unwrap_or_default();
+            let below: Vec<String> = journal
+                .lines()
+                .filter(|line| {
+                    line.split_whitespace()
+                        .next()
+                        .and_then(|t| t.parse::<u64>().ok())
+                        .is_some_and(|off| off < fork)
+                })
+                .map(str::to_string)
+                .collect();
+            if !below.is_empty() {
+                built.set_journal(&below)?;
+            }
+            if let Some(standing) = from.carry_text("standing")? {
+                // Preserve the successful standing contents; Store::write appends its
+                // ordinary final newline, and the reader retains malformed-row leniency.
+                if !standing.is_empty() {
+                    built.write("standing", &standing)?;
+                }
+            }
+            crate::state::sync_dir(&built.root.join("cur"))?;
+            crate::state::sync_dir(&built.root)
+        })();
+        carried?;
+        match std::fs::rename(scratch.path(), to) {
+            Ok(()) => {
+                // Publication transferred the directory. Disarm cleanup of its
+                // former name before a later caller can acquire that name.
+                let _ = scratch.keep();
+                crate::state::sync_dir(&logs)
+            }
+            // Another reader's carry landed first: retire only our own stage.
+            Err(_) if to.join("cur").is_dir() => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// KEEP ONLY THE NEWEST [`LOGS_KEEP`] OTHER LOGS' STORES. A log change
+    /// files a new `logs/<identity>/` (its `cur/`, journal and `standing`),
+    /// and an old one is read again only if exactly that identity comes back —
+    /// the same log after an off/on of its broker, never a moved generation,
+    /// a repaired or recreated one (a moved generation carries its store over
+    /// into a new one instead, [`Store::carry`]). Changes used to be rare;
+    /// under a relaxed broker one follows every reboot it was not cleanly
+    /// stopped before ([`crate::durability`]), and stores nothing reads would
+    /// pile up, one per change, for ever. So `logs/used` lists the identities read, the latest
+    /// last: `name`, read now, moves to its end, and every `logs/<identity>/`
+    /// outside its newest [`LOGS_KEEP`] is removed — those from before the
+    /// list included. A pruned log read again starts the way a first run
+    /// does, from `--since`. Only names that parse as an identity are
+    /// touched, and the root's own store (the log `notify/log` names) is
+    /// never under `logs/`.
+    fn prune_logs(&self, name: &str) -> io::Result<()> {
+        let mut used: Vec<String> = self
+            .read("logs/used")
+            .map(|text| {
+                text.lines()
+                    .filter(|l| *l != name && astream_broker::LogIdentity::parse(l).is_some())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        used.push(name.to_string());
+        let keep = used.split_off(used.len().saturating_sub(LOGS_KEEP));
+        self.write("logs/used", &keep.join("\n"))?;
+        for entry in std::fs::read_dir(self.root.join("logs"))? {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            let Some(id) = file_name
+                .to_str()
+                .filter(|n| astream_broker::LogIdentity::parse(n).is_some())
+            else {
+                continue;
+            };
+            if !keep.iter().any(|k| k == id) {
+                // Not followed if it is a link: the link itself goes.
+                std::fs::remove_dir_all(entry.path())?;
+            }
+        }
+        Ok(())
     }
 
     fn cursor(&self, key: &str) -> Option<u64> {
@@ -696,7 +958,7 @@ struct Notifier {
     log_now: Option<astream_broker::LogIdentity>,
     /// The log each follow-mode reader's connection last reached
     /// ([`Notice::Log`]), by selector index.
-    reader_log: Vec<Option<astream_broker::LogIdentity>>,
+    reader_log: Vec<ReadLog>,
     journal: Vec<String>,
     /// The log in hand's `standing` ([`Store::standing`]): per presence
     /// subject, the `attention=` token a human was last told of.
@@ -718,7 +980,7 @@ impl Notifier {
             suppressed: store.suppressed(),
             log_store: store.clone(),
             log_now: None,
-            reader_log: vec![None; cfg.on.len()],
+            reader_log: vec![ReadLog::default(); cfg.on.len()],
             store,
             cfg,
             fault,
@@ -740,11 +1002,12 @@ impl Notifier {
     /// ([`Store::for_log`]), loading its journal when that is another log
     /// than the one in hand. Said once on stderr: the human reading it learns
     /// why escalations already journalled are not skipped on this log.
-    fn scope_to(&mut self, log: Option<astream_broker::LogIdentity>) -> io::Result<()> {
+    fn scope_to(&mut self, read: &ReadLog) -> io::Result<()> {
+        let log = read.id;
         if log == self.log_now {
             return Ok(());
         }
-        let scoped = self.store.for_log(log)?;
+        let scoped = self.store.for_log(log, read.lineage.as_ref())?;
         if scoped.root != self.log_store.root {
             eprintln!(
                 "aterm-link notify: the broker serves {} — its cursors and journal are {}",
@@ -1086,7 +1349,7 @@ impl Notifier {
     fn catch_up(&mut self) -> io::Result<()> {
         let mut conn = self.connect()?;
         let log = log_of(&mut conn, &self.cfg)?;
-        self.scope_to(log)?;
+        self.scope_to(&log)?;
         for sel in self.cfg.on.clone() {
             let filter = sel.filter(&self.cfg.fleet);
             let key = sel.key();
@@ -1132,13 +1395,15 @@ impl Notifier {
                     let Some(sel) = self.cfg.on.get(idx).cloned() else {
                         continue;
                     };
-                    self.scope_to(self.reader_log[idx])?;
+                    let log = self.reader_log[idx].clone();
+                    self.scope_to(&log)?;
                     self.on_record(&sel, off, &subject, &body)?;
                     self.log_store.set_cursor(&sel.key(), off + 1)?;
                 }
                 Notice::Checkpoint(idx, next) => {
                     if let Some(key) = self.cfg.on.get(idx).map(Sel::key) {
-                        self.scope_to(self.reader_log[idx])?;
+                        let log = self.reader_log[idx].clone();
+                        self.scope_to(&log)?;
                         self.log_store.set_cursor(&key, next)?;
                     }
                 }
@@ -1277,7 +1542,7 @@ fn connect_for_reader(
     filter: &str,
     seen: &mut Option<u64>,
     seen_on: &mut Option<PathBuf>,
-) -> io::Result<(Conn, Closer, u64, Option<astream_broker::LogIdentity>)> {
+) -> io::Result<(Conn, Closer, u64, ReadLog)> {
     let (mut conn, closer) = transport::connect(&cfg.transport, &cfg.broker, ACK_DEADLINE)?;
     transport::attach_cap_files(&mut conn, &cfg.cap_files)?;
     // THE CURSOR IS THIS LOG'S ([`Store::for_log`]), and so is what this
@@ -1286,7 +1551,7 @@ fn connect_for_reader(
     let store = Store {
         root: root.to_path_buf(),
     }
-    .for_log(log)?;
+    .for_log(log.id, log.lineage.as_ref())?;
     if seen_on.as_ref().is_some_and(|on| *on != store.root) {
         *seen = None;
     }
@@ -1309,15 +1574,29 @@ fn connect_for_reader(
     Ok((conn, closer, from, log))
 }
 
-/// The identity of the log `conn` reaches: what its attach's `Hello` answered,
-/// or — with no cap file, so no `Hello` went — one asked for now. `None` is a
-/// broker that predates identity.
-fn log_of(conn: &mut Conn, cfg: &Config) -> io::Result<Option<astream_broker::LogIdentity>> {
-    match conn.seen_log_identity() {
-        Some(log) => Ok(Some(log)),
-        None if cfg.cap_files.is_empty() => conn.log_identity(),
-        None => Ok(None),
-    }
+/// The log `conn` reaches: the identity its attach's `Hello` answered, or —
+/// with no cap file, so no `Hello` went — one asked for now (`None`: a broker
+/// that predates identity), and the lineage that SAME answer told beside it
+/// ([`astream_broker::Client::log_lineage`]), so the two always describe one
+/// log.
+fn log_of(conn: &mut Conn, cfg: &Config) -> io::Result<ReadLog> {
+    let id = match conn.seen_log_identity() {
+        Some(log) => Some(log),
+        None if cfg.cap_files.is_empty() => conn.log_identity()?,
+        None => None,
+    };
+    let lineage = conn.log_lineage().cloned();
+    #[cfg(test)]
+    let lineage = lineage.filter(|_| !FORGET_LINEAGE.with(std::cell::Cell::get));
+    Ok(ReadLog { id, lineage })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// THE NEGATIVE CONTROL of the carry-over tests: a notifier on this thread
+    /// reads no lineage, and so meets a moved generation as another log, from
+    /// `--since` — the notifier before lineage. Tests only.
+    static FORGET_LINEAGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 // ---------------------------------------------------------------------------
@@ -1527,49 +1806,17 @@ fn parse_rate(s: &str) -> Result<(u32, u64), String> {
 mod tests {
     use super::*;
 
-    /// A BUILD WITHOUT THE SEALED WIRE refuses notify's `--tcp --key-file` by
-    /// name in `main`, before `parse` reads the key file (which does not exist
-    /// here, so the refusal is the only answer that can name the feature).
-    #[cfg(not(feature = "sealed"))]
+    /// A slow `--exec` leaves the consumer unavailable, and a reader must stop
+    /// at its current row rather than queue broker bodies while it runs: an
+    /// unbounded channel let a slow command grow without limit.
     #[test]
-    fn a_default_build_refuses_the_sealed_wire_by_name() {
-        let args: Vec<String> =
-            "--fleet f1 --broker 127.0.0.1:7000 --on halt --exec true --tcp --key-file /none/k"
-                .split(' ')
-                .map(str::to_string)
-                .collect();
-        let why = transport::sealed_flags_refusal(&args).expect("a default build refuses");
-        assert!(why.contains("`sealed` cargo feature"), "{why}");
-        let Err(e) = parse(&args) else {
-            panic!("a key file that does not exist parsed");
-        };
-        assert!(e.starts_with("--key-file /none/k: "), "{e}");
-    }
-
-    /// A slow `--exec` leaves the consumer unavailable. Readers must stop at
-    /// their current row rather than queue broker bodies while it runs. Once
-    /// the executor accepts rows, a reader still delivers them in order.
-    #[test]
-    fn follow_handoff_backpressures_a_stalled_executor_without_losing_order() {
-        let (tx, rx) = notice_handoff();
-        let first = Notice::Record(0, 41, String::from("first"), vec![1; 1024]);
-        let first = match tx.try_send(first) {
-            Err(mpsc::TrySendError::Full(row)) => row,
-            other => panic!("a stalled executor must leave no queued row: {other:?}"),
-        };
-        let second = Notice::Record(0, 42, String::from("second"), vec![2; 1024]);
-        let producer = std::thread::spawn(move || {
-            tx.send(first).expect("executor accepts first row");
-            tx.send(second).expect("executor accepts second row");
-        });
-
-        // Hang detectors for a producer thread's two sends, each of which
-        // lands the moment that thread is scheduled.
-        let first = rx.recv_timeout(Duration::from_secs(60)).unwrap();
-        assert!(matches!(first, Notice::Record(0, 41, subject, _) if subject == "first"));
-        let second = rx.recv_timeout(Duration::from_secs(60)).unwrap();
-        assert!(matches!(second, Notice::Record(0, 42, subject, _) if subject == "second"));
-        producer.join().unwrap();
+    fn follow_handoff_buffers_no_row_for_a_stalled_executor() {
+        let (tx, _rx) = notice_handoff();
+        let row = Notice::Record(0, 41, String::from("first"), vec![1; 1024]);
+        assert!(
+            matches!(tx.try_send(row), Err(mpsc::TrySendError::Full(_))),
+            "a stalled executor must leave no queued row"
+        );
     }
 
     /// Every subject segment that becomes an environment value is a principal:
@@ -1999,7 +2246,7 @@ mod tests {
                 _ => unreachable!(),
             }
             assert!(
-                store.for_log(Some(b)).is_err(),
+                store.for_log(Some(b), None).is_err(),
                 "{bad}: uncertainty is not permission to adopt A's offsets as B's"
             );
             assert_eq!(store.cursor("attention"), Some(900));
@@ -2017,13 +2264,87 @@ mod tests {
             // with its own empty namespace, rather than A's cursor/journal.
             std::fs::remove_file(&path).unwrap();
             store.write("log", &a.to_string()).unwrap();
-            let resumed = store.for_log(Some(a)).unwrap();
+            let resumed = store.for_log(Some(a), None).unwrap();
             assert_eq!(resumed.cursor("attention"), Some(900));
             assert_eq!(resumed.journal(), ["7 fired"]);
-            let fresh = store.for_log(Some(b)).unwrap();
+            let fresh = store.for_log(Some(b), None).unwrap();
             assert_eq!(fresh.cursor("attention"), None);
             assert!(fresh.journal().is_empty());
         }
+    }
+
+    /// **A LOG CHANGE DOES NOT LEAVE A STORE BEHIND FOR EVER.** The root
+    /// claims log 0; six log changes follow (each a relaxed broker's unclean
+    /// reboot, say), each filing a cursor under its own `logs/<identity>/`.
+    /// Only the newest [`LOGS_KEEP`] stay — a store from before `logs/used`
+    /// went with the old ones — and a kept log read again is the newest, its
+    /// cursor standing; a pruned one read again starts as a first run. The
+    /// root's store, and a name under `logs/` that is not an identity, are
+    /// never touched.
+    #[test]
+    fn only_the_newest_other_logs_stores_are_kept() {
+        let id = |n: u8| astream_broker::LogIdentity {
+            id: [n; 16],
+            generation: 0,
+        };
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("notify-prune")
+            .tempdir()
+            .unwrap();
+        let store = Store::open(dir.path().to_str().unwrap()).unwrap();
+        store
+            .for_log(Some(id(0)), None)
+            .unwrap()
+            .set_cursor("attention", 900)
+            .unwrap();
+        let logs = store.root.join("logs");
+        std::fs::create_dir_all(logs.join("not-an-identity")).unwrap();
+        std::fs::create_dir_all(logs.join(id(99).to_string()).join("cur")).unwrap();
+        let kept = || {
+            let mut names: Vec<String> = std::fs::read_dir(&logs)
+                .unwrap()
+                .filter_map(|e| e.unwrap().file_name().into_string().ok())
+                .filter(|n| astream_broker::LogIdentity::parse(n).is_some())
+                .collect();
+            names.sort();
+            names
+        };
+        let named = |ns: &[u8]| ns.iter().map(|n| id(*n).to_string()).collect::<Vec<_>>();
+        for n in 1..=6 {
+            store
+                .for_log(Some(id(n)), None)
+                .unwrap()
+                .set_cursor("attention", u64::from(n))
+                .unwrap();
+        }
+        assert_eq!(kept(), named(&[3, 4, 5, 6]), "the newest {LOGS_KEEP}");
+        assert_eq!(
+            store
+                .for_log(Some(id(3)), None)
+                .unwrap()
+                .cursor("attention"),
+            Some(3),
+            "a kept log resumes"
+        );
+        store.for_log(Some(id(7)), None).unwrap();
+        assert_eq!(kept(), named(&[3, 5, 6, 7]), "3 was read again, 4 was not");
+        assert_eq!(
+            store
+                .for_log(Some(id(1)), None)
+                .unwrap()
+                .cursor("attention"),
+            None,
+            "a pruned log comes back as a first run"
+        );
+        assert_eq!(
+            store
+                .for_log(Some(id(0)), None)
+                .unwrap()
+                .cursor("attention"),
+            Some(900),
+            "the root's store stands"
+        );
+        assert!(logs.join("not-an-identity").is_dir());
     }
 
     /// The cursor is MONOTONE. A cursor that walked backwards would re-offer
@@ -2102,6 +2423,296 @@ mod tests {
             .join("cur/attention")
             .exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// How the relaxed broker of [`after_a_relaxed_stop`] ended in boot 1.
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    enum Ended {
+        /// Its clean stop: the listener dropped, and astream flushed the log
+        /// in full and recorded it `Closed`.
+        Clean,
+        /// Killed, nothing lost: the page cache kept every record, and the
+        /// run stays `Open` in the log's sidecar.
+        Killed,
+        /// A power loss: every ack after the first was page cache, so the log
+        /// comes back cut to one record, the run still `Open`.
+        PowerLoss,
+    }
+
+    /// A relaxed broker in boot 1 carries four escalations (`help-0`..`3`,
+    /// offsets 0..3), each fired by a notifier on `since` that read the empty
+    /// log once before them — its cursor and journal filed under that log's
+    /// identity. The broker ends as `ended` and is reopened relaxed in `boot`,
+    /// and a NEW escalation, `help-9`, lands. `forget` runs the notifier with
+    /// no lineage ([`FORGET_LINEAGE`]: the notifier before lineage). Answers the
+    /// offset `help-9` took, the `<offset> <text>` lines the notifier fired
+    /// after the reopen, and the identities before and after.
+    #[cfg(unix)]
+    fn after_a_relaxed_stop(
+        tag: &str,
+        since: Since,
+        ended: Ended,
+        boot: u8,
+        forget: bool,
+    ) -> (u64, Vec<String>) {
+        use crate::durability::{self, Durability};
+        let dir = scratch(tag);
+        let base = PathBuf::from(&dir);
+        std::fs::create_dir_all(&base).expect("scratch");
+        let log = base.join("r.log");
+        let sock = base.join("r.sock");
+        let fired = base.join("fired");
+        let mut c = cfg(&dir);
+        c.broker = sock.to_string_lossy().into_owned();
+        c.since = since;
+        c.limit = 10;
+        c.exec = format!(
+            "printf '%s %s\\n' \"$ATERM_NOTIFY_OFFSET\" \"$ATERM_NOTIFY_TEXT\" >> {}",
+            fired.display()
+        );
+        let escalate = |text: &str| {
+            let (mut conn, _) =
+                transport::connect(&Transport::Unix, &sock.to_string_lossy(), ACK_DEADLINE)
+                    .unwrap();
+            // `help-<d>` publishes as sequence d + 1: one key per text.
+            let seq = u64::from(text.as_bytes()[text.len() - 1] - b'0') + 1;
+            let body = format!("v=1 t=1 attention={text}");
+            conn.publish(7, seq, "/f/f1/pub/n-a/s-x/presence", body.as_bytes())
+                .unwrap()
+                .0
+        };
+        let run = || {
+            Notifier::new(c.clone())
+                .expect("open")
+                .catch_up()
+                .expect("catch up");
+            std::fs::read_to_string(&fired).unwrap_or_default()
+        };
+        let unclean;
+        let (before, cut) = {
+            let opened = durability::open(
+                &log,
+                None,
+                Durability::Relaxed,
+                Some(durability::test_boot(1)),
+            )
+            .unwrap();
+            unclean = durability::UncleanStop::capture(&log);
+            let mut server = opened.broker.serve(&sock).unwrap();
+            assert_eq!(run(), "", "an empty log: the cursor is claimed at 0");
+            assert_eq!(escalate("help-0"), 0);
+            let cut = std::fs::metadata(&log).unwrap().len();
+            for text in ["help-1", "help-2", "help-3"] {
+                escalate(text);
+            }
+            assert_eq!(run().lines().count(), 4, "all four fire in boot 1");
+            // The last listener's shutdown is astream's clean close.
+            server.shutdown();
+            (opened.broker.log_identity(), cut)
+        };
+        if !matches!(ended, Ended::Clean) {
+            // What a stop that never reached the clean close leaves.
+            unclean.leave(&log);
+        }
+        if matches!(ended, Ended::PowerLoss) {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&log)
+                .unwrap()
+                .set_len(cut)
+                .unwrap();
+        }
+        let reopened = durability::open(
+            &log,
+            None,
+            Durability::Relaxed,
+            Some(durability::test_boot(boot)),
+        )
+        .unwrap();
+        let now = reopened.broker.log_identity();
+        let moved = now != before;
+        assert_eq!(
+            now.id, before.id,
+            "{tag}: the same log, whatever its generation"
+        );
+        let _server = reopened.broker.serve(&sock).unwrap();
+        let off = escalate("help-9");
+        FORGET_LINEAGE.with(|f| f.set(forget));
+        let after = run().lines().skip(4).map(str::to_string).collect();
+        FORGET_LINEAGE.with(|f| f.set(false));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            moved,
+            boot != 1 && !matches!(ended, Ended::Clean),
+            "{tag}: only an unclean stop and a reboot move the generation"
+        );
+        (off, after)
+    }
+
+    /// **A RELAXED BROKER'S POWER LOSS COSTS THE NOTIFIER NOTHING BUT WHAT IT
+    /// TOOK** ([`crate::durability`]). The power loss keeps only `help-0`, the
+    /// next boot's open moves the log's generation with lineage `(g + 1, 1)`,
+    /// and the new escalation lands at offset 1 — an offset the notifier's
+    /// cursor (4) and journal (`1 fired`) account for under the old generation.
+    ///
+    /// * The store is CARRIED OVER: the cursor resumes at the fork (1), the
+    ///   journal keeps `0 fired` and loses `1..3 fired` (they name records the
+    ///   loss took). The new escalation fires, on the DEFAULT `--since head` as
+    ///   on `--since start` (a carried cursor is no first run), and the
+    ///   surviving one is not paged again.
+    /// * NEGATIVE CONTROL, the notifier before lineage (it reads none): the new
+    ///   generation is another log, a first run. On `--since head` that starts
+    ///   past the new escalation, which never fires — the residual cost the
+    ///   relaxed tier used to carry; on `--since start` it re-reads from 0 and
+    ///   pages the survivor twice.
+    /// * NEGATIVE CONTROL, opened in boot 1 (a same-boot reopen is a process
+    ///   crash to astream, which moves nothing): the cursor past the head and
+    ///   the journal's `1 fired` swallow it even from `--since start` — the
+    ///   hazard the generation move closes.
+    #[cfg(unix)]
+    #[test]
+    fn a_power_loss_under_a_relaxed_broker_resumes_the_notifier_where_the_log_continues() {
+        for since in [Since::Head, Since::Start] {
+            let tag = format!("pl-{since:?}");
+            let (off, fired) = after_a_relaxed_stop(&tag, since, Ended::PowerLoss, 2, false);
+            assert_eq!(off, 1, "{tag}: the new escalation reuses offset 1");
+            assert_eq!(
+                fired,
+                ["1 help-9"],
+                "{tag}: carried over, clamped at the fork"
+            );
+        }
+
+        let (off, fired) =
+            after_a_relaxed_stop("pl-forget", Since::Head, Ended::PowerLoss, 2, true);
+        assert_eq!(off, 1);
+        assert!(
+            fired.is_empty(),
+            "CONTROL: a first run starts past it: {fired:?}"
+        );
+        let (_, fired) =
+            after_a_relaxed_stop("pl-forget-0", Since::Start, Ended::PowerLoss, 2, true);
+        assert_eq!(
+            fired,
+            ["0 help-0", "1 help-9"],
+            "CONTROL: re-read from the start"
+        );
+
+        let (off, fired) = after_a_relaxed_stop("pl-ctl", Since::Start, Ended::PowerLoss, 1, false);
+        assert_eq!(off, 1);
+        assert!(
+            fired.is_empty(),
+            "CONTROL: the kept identity swallows it: {fired:?}"
+        );
+    }
+
+    /// **NEITHER A CLEAN STOP NOR A KILL COSTS A DEFAULT NOTIFIER ANYTHING
+    /// ACROSS A REBOOT.** Stopped cleanly (astream's close: a full flush, then
+    /// `Closed`), the log keeps its identity in boot 2, and the new escalation
+    /// at offset 4 fires on the default `--since head`, as under a strict
+    /// broker. Killed instead — nothing lost, but the run stays `Open`, so the
+    /// next boot moves the generation with lineage `(g + 1, 4)` — the carried
+    /// cursor (4) still pages it. NEGATIVE CONTROL: the same kill read with no
+    /// lineage is a first run from the head, past it — what a kill used to
+    /// cost.
+    #[cfg(unix)]
+    #[test]
+    fn a_clean_stop_or_a_kill_keeps_a_default_notifiers_place_across_a_reboot() {
+        let (off, fired) = after_a_relaxed_stop("clean", Since::Head, Ended::Clean, 2, false);
+        assert_eq!(off, 4, "nothing was lost");
+        assert_eq!(fired, ["4 help-9"]);
+
+        let (off, fired) = after_a_relaxed_stop("killed", Since::Head, Ended::Killed, 2, false);
+        assert_eq!(off, 4, "nothing was lost");
+        assert_eq!(fired, ["4 help-9"], "the moved generation continues at 4");
+
+        let (off, fired) = after_a_relaxed_stop("killed-ctl", Since::Head, Ended::Killed, 2, true);
+        assert_eq!(off, 4);
+        assert!(fired.is_empty(), "CONTROL: read from its head: {fired:?}");
+    }
+
+    /// THE CARRY-OVER IS THE STORE OF THE NEWEST GENERATION IT CONTINUES,
+    /// whole or not at all. A notifier read `(id, 0)` (the root's store) and
+    /// `(id, 1)` (under `logs/`); `(id, 2)`, whose lineage forks at 5 from 1
+    /// and at 3 from 0, is carried over from `(id, 1)`'s store — cursor 9 → 5,
+    /// journal kept below 5, `standing` as it was — and a second read of
+    /// `(id, 2)` finds that store and carries nothing again. A lineage missing
+    /// the step to the generation held (a move astream recorded none for), or
+    /// another `id`, carries nothing: a first run.
+    #[test]
+    fn a_moved_generation_carries_the_newest_store_it_continues() {
+        let dir = scratch("carry");
+        let store = Store::open(&dir).expect("open");
+        let g = |generation| astream_broker::LogIdentity {
+            id: [7; 16],
+            generation,
+        };
+        let root = store.for_log(Some(g(0)), None).unwrap();
+        root.set_cursor("attention", 4).unwrap();
+        root.set_journal(&["1 fired rc=0".to_string()]).unwrap();
+        let one = store.for_log(Some(g(1)), None).unwrap();
+        assert_ne!(one.root, root.root);
+        assert_eq!(one.cursor("attention"), None, "no lineage: a first run");
+        one.set_cursor("attention", 9).unwrap();
+        one.set_journal(&[
+            "2 fired rc=0".to_string(),
+            "6 fired rc=0".to_string(),
+            "junk".into(),
+        ])
+        .unwrap();
+        one.set_standing(&[("/f/f1/pub/n-a/s-x/presence".into(), "help".into())])
+            .unwrap();
+
+        let lineage = lineage_of(&[(1, 3), (2, 5)]);
+        let two = store.for_log(Some(g(2)), Some(&lineage)).unwrap();
+        assert_eq!(
+            two.cursor("attention"),
+            Some(5),
+            "from (id, 1), at its fork"
+        );
+        assert_eq!(
+            two.journal(),
+            ["2 fired rc=0"],
+            "the verdicts below the fork"
+        );
+        assert_eq!(two.standing(), one.standing());
+        two.set_cursor("attention", 7).unwrap();
+        let again = store.for_log(Some(g(2)), Some(&lineage)).unwrap();
+        assert_eq!(
+            again.cursor("attention"),
+            Some(7),
+            "carried once, then its own"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(PathBuf::from(&dir).join("notify/logs"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".carry-"))
+            .collect();
+        assert!(leftovers.is_empty(), "no scratch left behind");
+
+        // A chain with a step missing, or another log: nothing carried.
+        let gap = lineage_of(&[(3, 4)]);
+        let three = store.for_log(Some(g(4)), Some(&gap)).unwrap();
+        assert_eq!(
+            three.cursor("attention"),
+            None,
+            "a step missing: a first run"
+        );
+        let other = astream_broker::LogIdentity {
+            id: [8; 16],
+            generation: 1,
+        };
+        let foreign = store
+            .for_log(Some(other), Some(&lineage_of(&[(1, 9)])))
+            .unwrap();
+        assert_eq!(foreign.cursor("attention"), None, "another id: a first run");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A lineage of these steps ([`crate::durability::lineage_of`]).
+    fn lineage_of(steps: &[(u64, u64)]) -> astream_broker::Lineage {
+        crate::durability::lineage_of(steps).expect("rising generations, at most MAX")
     }
 
     #[test]
@@ -2200,5 +2811,106 @@ mod tests {
             parse(&args(&format!("{base} --on halt --rate"))).is_err(),
             "a flag needs a value"
         );
+    }
+
+    #[test]
+    fn a_carry_refuses_incomplete_cursor_and_verdict_reads() {
+        let dir = aterm_tempfile::TempDir::new().expect("owned notifier");
+        let from = Store {
+            root: dir.path().join("from"),
+        };
+        std::fs::create_dir_all(from.root.join("cur")).unwrap();
+        from.set_cursor("attention", 2).unwrap();
+        from.set_journal(&["1 fired rc=0".into(), "7 fired rc=0".into()])
+            .unwrap();
+        from.set_standing(&[("/f/f/pub/n-a/s-a/presence".into(), "help".into())])
+            .unwrap();
+        let logs = dir.path().join("logs");
+        let ordinary = logs.join("ordinary");
+        from.carry(&from, &ordinary, 6).unwrap();
+        let carried = Store { root: ordinary };
+        assert_eq!(carried.cursor("attention"), Some(2));
+        assert_eq!(carried.journal(), ["1 fired rc=0"]);
+        assert_eq!(carried.standing(), from.standing());
+        // Truly absent optional files are empty, rather than an I/O refusal.
+        let empty = Store {
+            root: dir.path().join("empty"),
+        };
+        std::fs::create_dir_all(&empty.root).unwrap();
+        empty.carry(&empty, &logs.join("empty"), 6).unwrap();
+
+        let mut refused = Vec::new();
+        for (n, bytes) in [b"not an offset".as_slice(), b"", b"\xff"]
+            .into_iter()
+            .enumerate()
+        {
+            std::fs::write(from.root.join("cur/attention"), bytes).unwrap();
+            let to = logs.join(format!("bad-cursor-{n}"));
+            let result = from.carry(&from, &to, 6);
+            refused.push(
+                result.is_err()
+                    && !to.exists()
+                    && std::fs::read(from.root.join("cur/attention")).is_ok_and(|got| got == bytes),
+            );
+        }
+        from.set_cursor("attention", 2).unwrap();
+        for name in ["journal", "standing"] {
+            let path = from.root.join(name);
+            std::fs::remove_file(&path).unwrap();
+            std::fs::create_dir(&path).unwrap();
+            let to = logs.join(format!("unreadable-{name}"));
+            let result = from.carry(&from, &to, 6);
+            refused.push(result.is_err() && !to.exists() && path.is_dir());
+            std::fs::remove_dir(&path).unwrap();
+            from.write(name, "").unwrap();
+        }
+        assert!(
+            refused.into_iter().all(|held| held),
+            "CARRY_PUBLISHED_INCOMPLETE_EVIDENCE"
+        );
+    }
+
+    /// Publication and returned-error cleanup may retire only the stage this
+    /// invocation acquired; pre-existing sibling and target bytes stay whole.
+    #[test]
+    fn a_carry_retires_only_its_exclusively_owned_stage() {
+        let dir = aterm_tempfile::TempDir::new().expect("owned carry parent");
+        let from = Store {
+            root: dir.path().join("from"),
+        };
+        std::fs::create_dir_all(from.root.join("cur")).unwrap();
+        from.set_cursor("attention", 2).unwrap();
+        let logs = dir.path().join("logs");
+        std::fs::create_dir(&logs).unwrap();
+        let foreign = logs.join(format!(".carry-{}-0", std::process::id()));
+        std::fs::create_dir(&foreign).unwrap();
+        std::fs::write(foreign.join("owner"), b"standing owner").unwrap();
+        let target = logs.join("landed");
+        from.carry(&from, &target, 6).unwrap();
+        assert_eq!(Store { root: target }.cursor("attention"), Some(2));
+        let winner = logs.join("winner");
+        std::fs::create_dir_all(winner.join("cur")).unwrap();
+        std::fs::write(winner.join("cur/attention"), b"4").unwrap();
+        from.carry(&from, &winner, 6).unwrap();
+        assert_eq!(std::fs::read(winner.join("cur/attention")).unwrap(), b"4");
+        let blocked = logs.join("blocked");
+        std::fs::write(&blocked, b"do not replace").unwrap();
+        assert!(from.carry(&from, &blocked, 6).is_err());
+        assert_eq!(std::fs::read(&blocked).unwrap(), b"do not replace");
+        assert_eq!(
+            std::fs::read(foreign.join("owner")).unwrap(),
+            b"standing owner"
+        );
+        let stages: Vec<_> = std::fs::read_dir(&logs)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".carry-")
+            })
+            .collect();
+        assert_eq!(stages, [foreign], "only the pre-existing owner remains");
     }
 }

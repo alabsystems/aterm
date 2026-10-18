@@ -36,9 +36,9 @@
 //! **As the worker reads it** ([`WorkerEnv`]): every probe runs the git the
 //! worker's `PATH` finds with the worker process's environment, read from the
 //! kernel, never aterm's own. Escalated instead: an unreadable environment; a
-//! `PATH` entry ahead of git the worker could write ([`WorkerEnv::view`]); a
+//! `PATH` entry ahead of git the worker could write ([`WorkerEnv::raw_git_view`]); a
 //! git-relevant variable Claude Code's settings give the Bash tool but not the
-//! process ([`WorkerEnv::settings_env`]).
+//! process ([`WorkerEnv::git_settings_env`]).
 //!
 //! Not covered: a box that runs on another machine (escalated). The shell
 //! snapshot, `CLAUDE_ENV_FILE` and rc files Claude Code sources before each
@@ -287,14 +287,36 @@ const MAX_SUBMODULES: usize = 64;
 /// ([`atpkg::caller_shell::process_args`]): its environment, `KEY=value` in
 /// the kernel's order, which every command its Bash tool runs starts from,
 /// and its argv (a `--settings` it was launched with,
-/// [`Self::settings_env`]) — and git as it runs there ([`Self::view`]).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// [`Self::git_settings_env`]) — and git as it runs there ([`Self::raw_git_view`]).
+///
+/// THE ENVIRONMENT NEVER LEAVES THIS VALUE. It holds whatever the person's
+/// shell exported — API keys, tokens, a cloud credential — so its `Debug`
+/// names how many variables there are, never one of them, and a harness tape
+/// holds only its [`Self::digest`] and the derived answers the approval
+/// policy's probes read off it (`super::probe`): the reads that see the
+/// variables run inside a probe's live call, and what crosses the probe is
+/// what they concluded.
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct WorkerEnv {
     process: ProcArgs,
     /// The worker's pid — the session's foreground process group's leader —
     /// where it was read from the kernel ([`Self::with_pid`]): what the files
     /// its job holds open are read by.
     pid: Option<u32>,
+    /// The digest a harness tape knows this worker by, fixed where the worker
+    /// crossed the probe that read it ([`Self::digested`]); `None`: computed
+    /// from the environment when asked.
+    digest: Option<u64>,
+}
+
+impl std::fmt::Debug for WorkerEnv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerEnv")
+            .field("pid", &self.pid)
+            .field("vars", &self.process.env.len())
+            .field("argv", &self.process.argv.len())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Variables the probe does not pass on to its own git. `GIT_CONFIG` names
@@ -309,7 +331,53 @@ impl WorkerEnv {
     /// The worker process `process`.
     #[must_use]
     pub fn new(process: ProcArgs) -> Self {
-        Self { process, pid: None }
+        Self {
+            process,
+            pid: None,
+            digest: None,
+        }
+    }
+
+    /// The digest a harness tape names this worker by in each probe's request
+    /// (`super::probe`): an xxh64, seeded with `seed` (the tape's own), of the
+    /// environment and argv as the kernel recorded them — the one fixed where
+    /// it crossed a probe ([`Self::digested`]), else computed now. A probe's
+    /// answer is keyed by it, so a later read under another environment is
+    /// another key. Seeded per tape, it says nothing across tapes; it is no
+    /// copy of a variable, and the variables are never written beside it.
+    #[must_use]
+    pub fn digest(&self, seed: u64) -> u64 {
+        self.digest.unwrap_or_else(|| {
+            let mut h = aterm_zstd::xxh64::Xxh64::new(seed);
+            for (part, words) in [(0u8, &self.process.env), (1, &self.process.argv)] {
+                h.update(&[part]);
+                for word in words {
+                    h.update(&(word.len() as u64).to_le_bytes());
+                    h.update(word.as_bytes());
+                }
+            }
+            h.digest()
+        })
+    }
+
+    /// This worker with its [`Self::digest`] under `seed` fixed: what a probe
+    /// that read the worker hands on, so every later request names it the way
+    /// the tape did.
+    #[must_use]
+    pub fn digested(mut self, seed: u64) -> Self {
+        self.digest = Some(self.digest(seed));
+        self
+    }
+
+    /// A worker known only by what a harness tape holds of it: its digest and
+    /// pid, no variable — what a read of the tape hands back.
+    #[must_use]
+    pub fn recorded(digest: u64, pid: Option<u32>) -> Self {
+        Self {
+            process: ProcArgs::default(),
+            pid,
+            digest: Some(digest),
+        }
     }
 
     /// The same worker, known as process `pid`.
@@ -433,7 +501,13 @@ impl WorkerEnv {
     /// `core.fsmonitor` program (which reading the index would run),
     /// `ls-files` and `check-attr` for the populated submodules and the filter
     /// drivers the attributes select. The git is [`Self::git_program`]'s.
-    pub fn view(
+    ///
+    /// RAW: every entry and value as loaded. The policy never judges this one
+    /// — its probe's live arm projects it ([`GitView::project`]) and hands on
+    /// only that — and its name is its own, never the probe's `git_view`, so
+    /// the `supervise-fx` source guard (`aterm-census`) can tell a call of it
+    /// from above the probe's door, which it names, from a call of the probe.
+    pub fn raw_git_view(
         &self,
         dir: &Path,
         worker_writes: &dyn Fn(&Path) -> bool,
@@ -455,11 +529,14 @@ impl WorkerEnv {
     /// tool's commands, not to the process environment this check reads, so
     /// such a read escalates, as it does where a settings file cannot be read
     /// whole or does not parse (its `env` could say anything).
-    pub fn settings_env(&self, launch: &Path) -> Result<(), String> {
+    ///
+    /// The live body of the probe's `settings_env`, named apart from it for
+    /// the same reason as [`Self::raw_git_view`].
+    pub fn git_settings_env(&self, launch: &Path) -> Result<(), String> {
         self.settings_env_where(launch, git_relevant, "a git read")
     }
 
-    /// [`Self::settings_env`] for the variables `relevant` names, the
+    /// [`Self::git_settings_env`] for the variables `relevant` names, the
     /// escalation's reason about `subject` (`a git read`): the same settings
     /// files, read the same way — the shell-startup check
     /// ([`super::shell_startup`]) asks it for the variables that choose the
@@ -497,6 +574,22 @@ impl WorkerEnv {
         }
         Ok(())
     }
+}
+
+/// Why a git the probe ran in `at` failed: `what` and the directory, git's
+/// exit status, and the command that shows the person git's own complaint.
+///
+/// Not git's stderr: that complaint can quote what git read — a malformed
+/// `GIT_CONFIG_PARAMETERS` entry from the worker's environment is echoed
+/// whole (`bogus config parameter: …`), an include's path as written — and
+/// this reason is `probe.git_view`'s answer, which a harness tape holds
+/// (`super::probe`: what crosses a probe is what it concluded, never what it
+/// read). The person runs `command` in `at` to read it.
+fn git_failed(what: &str, at: &Path, status: std::process::ExitStatus, command: &str) -> String {
+    format!(
+        "{what} {} (git {status}; `{command}` there says why)",
+        at.display()
+    )
 }
 
 /// The Claude Code directory of a process whose `CLAUDE_CONFIG_DIR` is
@@ -567,7 +660,7 @@ impl Probe<'_> {
         cmd
     }
 
-    /// [`WorkerEnv::view`] of `dir`, `depth` submodules down, `count`
+    /// [`WorkerEnv::raw_git_view`] of `dir`, `depth` submodules down, `count`
     /// populated submodules read so far.
     fn view_at(&self, dir: &Path, depth: usize, count: &mut usize) -> Result<GitView, String> {
         let dir = dir
@@ -578,10 +671,11 @@ impl Probe<'_> {
         let listed = run(&["config", "--list", "-z", "--show-scope"])
             .map_err(|e| format!("cannot read the git config in {}: {e}", dir.display()))?;
         if !listed.status.success() {
-            return Err(format!(
-                "cannot read the git config in {}: {}",
-                dir.display(),
-                String::from_utf8_lossy(&listed.stderr).trim()
+            return Err(git_failed(
+                "cannot read the git config in",
+                dir,
+                listed.status,
+                "git config --list",
             ));
         }
         let mut view = GitView {
@@ -653,10 +747,11 @@ impl Probe<'_> {
             .output()
             .map_err(|e| format!("cannot list the index in {}: {e}", top.display()))?;
         if !out.status.success() {
-            return Err(format!(
-                "cannot list the index in {}: {}",
-                top.display(),
-                String::from_utf8_lossy(&out.stderr).trim()
+            return Err(git_failed(
+                "cannot list the index in",
+                top,
+                out.status,
+                "git ls-files --stage",
             ));
         }
         Ok(String::from_utf8_lossy(&out.stdout)
@@ -769,6 +864,11 @@ fn is_bool(v: Option<&str>) -> bool {
     }
 }
 
+/// What a partial clone's key is said to run ([`hazard`]).
+const PARTIAL_CLONE: &str = "a partial clone: a read may fetch a missing object from its \
+                             promisor remote, and credential helpers, ssh and the remote's \
+                             programs run there";
+
 /// Whether git reads `v` as boolean false.
 fn is_false(v: Option<&str>) -> bool {
     v.is_some_and(|v| {
@@ -779,21 +879,140 @@ fn is_false(v: Option<&str>) -> bool {
     })
 }
 
-/// The first thing in `view` that `reads` would run, as a reason naming the
-/// key (or the hook) — `None` when nothing it loads runs a program.
-pub(crate) fn hazard(view: &GitView, reads: &GitReads) -> Option<String> {
-    let enabled = |key: &str| {
-        view.config
-            .iter()
-            .rev()
-            .find(|(_, k, _)| k == key)
-            .is_some_and(|(_, _, v)| {
-                v.as_deref().is_none_or(|v| {
-                    matches!(v.to_ascii_lowercase().as_str(), "true" | "yes" | "on" | "1")
+/// Whether git reads `v` as boolean true — and a bare key (`None`) is true.
+fn is_true(v: Option<&str>) -> bool {
+    v.is_none_or(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "yes" | "on" | "1"))
+}
+
+/// What a configuration key is to [`hazard`]: the ONE place a key's name is
+/// tested, read by [`hazard`] to judge a view and by [`GitView::project`] to
+/// decide which entries a harness tape keeps ([`consulted`]). Keeping the two
+/// on one predicate is what makes the projection safe: a key [`hazard`] would
+/// look at can never be one the projection dropped, so `hazard(v, r) ==
+/// hazard(v.project(), r)` holds for every view and every read by
+/// construction, not by a second list kept in step with this one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Consulted<'a> {
+    /// `core.fsmonitor`: a program unless its value is a boolean.
+    Fsmonitor,
+    /// `diff.external`.
+    DiffExternal,
+    /// `extensions.partialclone`.
+    PartialClone,
+    /// `remote.<name>.promisor`: a partial clone unless its value is false.
+    Promisor,
+    /// `diff.<driver>.textconv` / `.command`.
+    DiffDriver,
+    /// `filter.<driver>.clean|smudge|process`, with its driver.
+    Filter(&'a str),
+    /// `gpg.program`, `gpg.<format>.program`: run to verify a signature.
+    Signer,
+    /// `log.showsignature`: makes a plain `log` display signatures — read for
+    /// its truth alone.
+    ShowSignature,
+}
+
+/// [`Consulted`] for `key`, or `None` for a key [`hazard`] never reads.
+fn consult(key: &str) -> Option<Consulted<'_>> {
+    Some(match key {
+        "core.fsmonitor" => Consulted::Fsmonitor,
+        "diff.external" => Consulted::DiffExternal,
+        "extensions.partialclone" => Consulted::PartialClone,
+        "log.showsignature" => Consulted::ShowSignature,
+        k if k.starts_with("remote.") && k.ends_with(".promisor") => Consulted::Promisor,
+        k if k.starts_with("diff.") && (k.ends_with(".textconv") || k.ends_with(".command")) => {
+            Consulted::DiffDriver
+        }
+        k if k.starts_with("gpg.") && k.ends_with("program") => Consulted::Signer,
+        k => Consulted::Filter(filter_driver(k)?),
+    })
+}
+
+/// Whether [`hazard`] reads a configuration key named `key` at all: the
+/// entries a view projected for a harness tape keeps ([`GitView::project`]).
+#[must_use]
+pub(crate) fn consulted(key: &str) -> bool {
+    consult(key).is_some()
+}
+
+/// The version of [`GitView::project`]'s rule, written on every projected
+/// view a harness tape holds. A later build whose `consulted` reads more
+/// keys sees a recorded view as missing them; the version beside the record
+/// is how a counterfactual replay knows the view it was handed was projected
+/// by another rule, and says so (`Unrecorded`), instead of judging a key
+/// that was never kept as one that was never set.
+pub const PROJECTION: u32 = 1;
+
+/// The one value a projected entry keeps in place of anything but a boolean
+/// ([`GitView::project`]).
+pub const VALUE_SET: &str = "<set>";
+
+/// A configuration value as [`hazard`] can tell it apart, and no finer: a
+/// bare key (`None`), git's true (`true`), git's false (`false`, the empty
+/// value among them) or anything else ([`VALUE_SET`]). [`is_bool`],
+/// [`is_false`] and [`is_true`] each answer the class exactly as they answer
+/// every value in it, so a projected view judges as the view did.
+fn value_class(v: Option<&str>) -> Option<String> {
+    let v = v?;
+    Some(
+        if is_true(Some(v)) {
+            "true"
+        } else if is_false(Some(v)) {
+            "false"
+        } else {
+            VALUE_SET
+        }
+        .to_string(),
+    )
+}
+
+impl GitView {
+    /// This view as a harness tape keeps it: only the entries `hazard`
+    /// reads (`consulted`), each value reduced to its class
+    /// (`value_class`); the worker's `GIT_EXTERNAL_DIFF` reduced to its
+    /// presence; the hook's path, the selected filter drivers and each
+    /// submodule (projected the same way, recursively) kept, as `hazard`'s
+    /// reasons name them. `hazard` judges the projection as it judges the
+    /// view, reason for reason — its reasons print a key, its scope, a hook's
+    /// path and a submodule's, never a value — while nothing of a URL, a
+    /// token, a credential helper or an `http.<url>.extraheader` survives:
+    /// none of those keys is one `hazard` reads, and a URL in a key's
+    /// own name (`url.<base>.insteadof`) goes with its key.
+    #[must_use]
+    pub fn project(&self) -> GitView {
+        GitView {
+            config: self
+                .config
+                .iter()
+                .filter(|(_, key, _)| consulted(key))
+                .map(|(scope, key, value)| {
+                    (scope.clone(), key.clone(), value_class(value.as_deref()))
                 })
-            })
-    };
-    let signatures = reads.signatures || (reads.log_like && enabled("log.showsignature"));
+                .collect(),
+            index_hook: self.index_hook.clone(),
+            filters_selected: self.filters_selected.clone(),
+            submodules: self
+                .submodules
+                .iter()
+                .map(|(path, sub)| (path.clone(), sub.project()))
+                .collect(),
+            external_diff: self.external_diff.as_ref().map(|_| VALUE_SET.to_string()),
+        }
+    }
+}
+
+/// The first thing in `view` that `reads` would run, as a reason naming the
+/// key (or the hook) — `None` when nothing it loads runs a program. Every key
+/// is told apart by [`consult`] alone, the predicate the projection a tape
+/// keeps is cut by.
+pub(crate) fn hazard(view: &GitView, reads: &GitReads) -> Option<String> {
+    let shows = view
+        .config
+        .iter()
+        .rev()
+        .find(|(_, k, _)| consult(k) == Some(Consulted::ShowSignature))
+        .is_some_and(|(_, _, v)| is_true(v.as_deref()));
+    let signatures = reads.signatures || (reads.log_like && shows);
     if view.external_diff.is_some() {
         return Some(
             "git read: `GIT_EXTERNAL_DIFF` is set in the worker's environment: git runs it \
@@ -803,34 +1022,29 @@ pub(crate) fn hazard(view: &GitView, reads: &GitReads) -> Option<String> {
     }
     for (scope, key, value) in &view.config {
         let runs = |what: &str| Some(format!("git read: `{key}` is set ({scope} config): {what}"));
-        let k = key.as_str();
-        if k == "core.fsmonitor" && !is_bool(value.as_deref()) {
-            return runs("git runs it on every read of the index");
-        }
-        if k == "diff.external" {
-            return runs("git runs it for every diff");
-        }
-        if k == "extensions.partialclone"
-            || (k.starts_with("remote.") && k.ends_with(".promisor") && !is_false(value.as_deref()))
-        {
-            return runs(
-                "a partial clone: a read may fetch a missing object from its promisor \
-                 remote, and credential helpers, ssh and the remote's programs run there",
-            );
-        }
-        if k.starts_with("diff.") && (k.ends_with(".textconv") || k.ends_with(".command")) {
-            return runs("git runs it on a diff of a file the attributes select");
-        }
-        if let Some(driver) = filter_driver(k)
-            && view
-                .filters_selected
-                .as_ref()
-                .is_none_or(|selected| selected.iter().any(|d| d == driver))
-        {
-            return runs("git runs it on a status or diff of a file the attributes select");
-        }
-        if signatures && k.starts_with("gpg.") && k.ends_with("program") {
-            return runs("git runs it to verify the signatures this read displays");
+        let value = value.as_deref();
+        match consult(key) {
+            Some(Consulted::Fsmonitor) if !is_bool(value) => {
+                return runs("git runs it on every read of the index");
+            }
+            Some(Consulted::DiffExternal) => return runs("git runs it for every diff"),
+            Some(Consulted::PartialClone) => return runs(PARTIAL_CLONE),
+            Some(Consulted::Promisor) if !is_false(value) => return runs(PARTIAL_CLONE),
+            Some(Consulted::DiffDriver) => {
+                return runs("git runs it on a diff of a file the attributes select");
+            }
+            Some(Consulted::Filter(driver))
+                if view
+                    .filters_selected
+                    .as_ref()
+                    .is_none_or(|selected| selected.iter().any(|d| d == driver)) =>
+            {
+                return runs("git runs it on a status or diff of a file the attributes select");
+            }
+            Some(Consulted::Signer) if signatures => {
+                return runs("git runs it to verify the signatures this read displays");
+            }
+            _ => {}
         }
     }
     if let Some(h) = &view.index_hook {

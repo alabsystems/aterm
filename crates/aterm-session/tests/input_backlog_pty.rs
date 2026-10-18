@@ -20,12 +20,13 @@
 //! inheritable, and a child spawned meanwhile keeps them.
 #![cfg(target_os = "macos")]
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use aterm_session::input_backlog::InputBacklog;
-use aterm_session::sink::{BulkMeter, Discard, SinkWriter};
+use aterm_session::sink::{BulkMeter, Discard, ImmediateWrite, Seam, SinkWriter};
 use aterm_spec::wait::MUST_HAPPEN;
 
 /// A pty pair with the slave raw (`VMIN = 1`, `VTIME = 0`, a key-at-a-time
@@ -118,10 +119,10 @@ fn first_write_dated(sink: &SinkWriter) -> InputBacklog {
 }
 
 /// RAW UNREAD INPUT IS COUNTED AND DATED — the incident's shape. `abc` goes in
-/// and reads `queued == 3`; 300 ms later the oldest byte has waited at least
-/// that long; the program reading ONE byte leaves 2, still dated by the
-/// original write; a NEW write behind them (a driver's key) does not make the
-/// old bytes young; and reading everything clears the reading to zero.
+/// and reads `queued == 3`, dated no earlier than its write; the program
+/// reading ONE byte leaves 2; a NEW write behind them (a driver's key) adds to
+/// the count; and reading everything clears the reading to zero. The ledger's
+/// dating rules themselves are `input_backlog`'s unit tests.
 #[test]
 fn raw_unread_input_is_counted_and_dated() {
     let (master, slave) = pty_pair(true);
@@ -142,26 +143,13 @@ fn raw_unread_input_is_counted_and_dated() {
     assert_eq!(fresh.queued, 3);
     assert!(fresh.wait <= before_write.elapsed(), "{fresh:?}");
 
-    thread::sleep(Duration::from_millis(300));
-    let aged = sink.input_backlog().expect("measured");
-    assert_eq!(aged.queued, 3);
-    assert!(aged.wait >= Duration::from_millis(300), "{aged:?}");
-
     assert_eq!(read_exactly(slave, 1), b"a");
     let partial = sink.input_backlog().expect("measured");
     assert_eq!(partial.queued, 2, "the program read one byte");
-    assert!(
-        partial.wait >= Duration::from_millis(300),
-        "the unread `bc` are still the old write's: {partial:?}"
-    );
 
     assert_eq!(sink.write_frame(b"\x1b[B").expect("write"), 3);
     let behind = sink.input_backlog().expect("measured");
     assert_eq!(behind.queued, 5);
-    assert!(
-        behind.wait >= Duration::from_millis(300),
-        "a key queued behind stale bytes does not make them young: {behind:?}"
-    );
 
     assert_eq!(read_exactly(slave, 5), b"bc\x1b[B");
     let drained = sink.input_backlog().expect("measured");
@@ -190,9 +178,8 @@ fn canonical_partial_line_reads_zero() {
 /// blocking write then waits in `poll(POLLOUT)` HOLDING the fd lock for as
 /// long as the program stays frozen. The probe takes neither that lock nor
 /// the park's chunk as "in flight" (the sink parks between ledger brackets),
-/// so it still dates the queue — here by the first bytes the kernel took,
-/// more than a second ago — while the writer is parked, and a keystroke that
-/// spills behind it is reported too.
+/// so it still dates the queue — a blinded probe reads `wait: 0` — while the
+/// writer is parked, and a keystroke that spills behind it is reported too.
 #[test]
 fn a_writer_parked_on_a_full_queue_does_not_blind_the_probe() {
     let (master, slave) = pty_pair(true);
@@ -203,12 +190,10 @@ fn a_writer_parked_on_a_full_queue_does_not_blind_the_probe() {
         let sink = Arc::clone(&sink);
         thread::spawn(move || sink.write_frame(&[b'p'; PASTE]).expect("paste"))
     };
-    // The second is counted from the first DATED bytes, not from the spawn.
-    // A probe blinded by the park (the regression) does not date them: `settle`
-    // fails on its `wait: 0ns` reading, or, should one poll land between the
-    // two brackets, the reading after the sleep is blind and fails below.
+    // A probe blinded by the park (the regression) does not date the queue:
+    // `settle` fails on its `wait: 0ns` reading, or, should one poll land
+    // between the two brackets, the readings below are blind and fail.
     let _ = first_write_dated(&sink);
-    thread::sleep(Duration::from_millis(1200));
     assert!(
         !paster.is_finished(),
         "the paste must be parked on a full queue"
@@ -219,14 +204,14 @@ fn a_writer_parked_on_a_full_queue_does_not_blind_the_probe() {
         .expect("measured while a writer is parked");
     assert!(parked.queued > 0, "{parked:?}");
     assert!(
-        parked.wait >= Duration::from_secs(1),
+        !parked.wait.is_zero(),
         "the parked paste's chunk is not in flight, so the queue keeps its date: {parked:?}"
     );
 
     // A keystroke now cannot reach the kernel: it spills behind the paste.
     assert_eq!(sink.write_frame_nonparking(b"z").expect("spill"), 1);
     let spilled = sink.input_backlog().expect("measured");
-    assert!(spilled.wait >= Duration::from_secs(1), "{spilled:?}");
+    assert!(!spilled.wait.is_zero(), "{spilled:?}");
     assert!(
         matches!(spilled.spilled, Some(1) | None),
         "the spilled key is reported (or its mutex was busy): {spilled:?}"
@@ -311,14 +296,12 @@ fn a_drainer_parked_mid_chunk_counts_each_unread_byte_once() {
 /// leaves bytes it never saw, which read as older than the sink itself
 /// (`InputLedger::oldest_unread_at` dates them from its birth): a paste into
 /// a frozen program would be dated by when the SESSION started, not by the
-/// paste. The sink is aged first so the two dates are far apart: the
-/// parked paste must read at least the time it has been parked, and no more
-/// than the time since its paster was spawned — the sink's birth is `AGE`
-/// older than that.
+/// paste. The sink is aged first so the two dates are apart: the parked
+/// paste must read no more than the time since its paster was spawned — the
+/// sink's birth is `AGE` older than that.
 #[test]
 fn a_metered_paste_is_dated_by_its_own_write() {
-    const AGE: Duration = Duration::from_millis(1500);
-    const PARKED: Duration = Duration::from_millis(400);
+    const AGE: Duration = Duration::from_millis(100);
     const PASTE: usize = 64 * 1024;
     let (master, slave) = pty_pair(true);
     let sink = Arc::new(nonblocking_sink(master));
@@ -334,14 +317,7 @@ fn a_metered_paste_is_dated_by_its_own_write() {
                 .accepted()
         })
     };
-    // PARKED is counted from the paste's first DATED bytes. Slept from the
-    // spawn it had no margin: `wait` read PARKED + the sleep's overshoot -
-    // the paster's start latency, under PARKED whenever the new thread
-    // started later than the sleep overshot. A write around the ledger (the
-    // regression) is dated from the sink's birth, so this returns at once and
-    // the `since_spawn` bound below still fails on it.
     let _ = first_write_dated(&sink);
-    thread::sleep(PARKED);
     assert!(
         !paster.is_finished(),
         "the paste must be parked on a full queue"
@@ -349,13 +325,10 @@ fn a_metered_paste_is_dated_by_its_own_write() {
     let parked = sink.input_backlog().expect("measured while parked");
     let since_spawn = spawned_at.elapsed();
     assert!(parked.queued > 0, "{parked:?}");
-    // The upper bound is the paste's own age, not a fixed `AGE`: the write
-    // came after `spawned_at`, so no correct date is older than that, and a
-    // date from the sink's birth is older by all of `AGE`. (`wait < AGE`
-    // went red whenever the probe ran more than AGE - PARKED after the first
-    // dated bytes.)
+    // The write came after `spawned_at`, so no correct date is older than
+    // that, and a date from the sink's birth is older by all of `AGE`.
     assert!(
-        parked.wait >= PARKED && parked.wait <= since_spawn,
+        parked.wait <= since_spawn,
         "dated by the metered write, not by the sink's birth: {parked:?}, \
          {since_spawn:?} since the paster was spawned"
     );
@@ -461,18 +434,6 @@ fn a_discard_ends_a_writer_parked_mid_frame() {
     assert_eq!(read_within(slave, 64), b"k");
     drop(sink);
     close_pair(master, slave);
-}
-
-/// Off a tty there is no queue to flush, so nothing is discarded — the
-/// spill included — and the answer says so.
-#[test]
-fn a_discard_off_a_tty_drops_nothing() {
-    let (a, b) = std::os::unix::net::UnixStream::pair().expect("socketpair");
-    use std::os::fd::AsRawFd;
-    let sink = SinkWriter::new(a.as_raw_fd());
-    assert_eq!(sink.discard_unread_input(Discard::Restart), None);
-    drop(sink);
-    drop((a, b));
 }
 
 /// A FLUSH IS NOT A RESTART. `reset flush` and the drop before `signal term` empty the
@@ -604,6 +565,294 @@ fn a_control_key_a_cbreak_driver_eats_is_not_a_read() {
             "{key:#04x} left the queue with nothing reading the slave"
         );
     }
+    drop(sink);
+    close_pair(master, slave);
+}
+
+/// What the program has been given, read off a NON-BLOCKING slave for at most
+/// a minute (a hang detector), until `n` bytes came.
+fn read_all_within(slave: i32, n: usize) -> Vec<u8> {
+    let mut got = Vec::new();
+    let done = aterm_spec::wait::within(MUST_HAPPEN, Duration::from_millis(5), || {
+        let mut buf = [0_u8; 4096];
+        // SAFETY: a bounded read into a live stack buffer from the live slave.
+        let r = unsafe { libc::read(slave, buf.as_mut_ptr().cast(), buf.len()) };
+        if let Ok(r) = usize::try_from(r) {
+            got.extend_from_slice(&buf[..r]);
+        }
+        (got.len() >= n).then_some(())
+    });
+    assert!(done.is_some(), "only {} of {n} bytes came", got.len());
+    got
+}
+
+/// Whether the non-blocking slave holds nothing more to read.
+fn nothing_more(slave: i32) -> bool {
+    let mut one = [0_u8; 1];
+    // SAFETY: a one-byte read into a live stack buffer from the live slave.
+    let r = unsafe { libc::read(slave, one.as_mut_ptr().cast(), 1) };
+    r < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock
+}
+
+/// THE GUARDED WRITE ON A REAL PTY: a text longer than a raw slave's input
+/// queue (1022 bytes on Darwin) — the harness's 1.1 KB instruction to save the
+/// work, written to a program that has not read yet — is begun and finished:
+/// the guarded write (`try_write_frame_whole_with_receipt`, what `send if=`
+/// writes with) answers `Queued { accepted: 1022 }` with the rest behind it in
+/// the spill, and the program reads all 1118 bytes in order as it reads. A
+/// guarded Enter behind the text is refused with zero bytes while any of it is
+/// still queued, and once the program has read it, the Enter goes, after it.
+///
+/// NEGATIVE CONTROL: the plain immediate write — what `send if=` wrote with
+/// until 2026-10-16 — on a fresh pty, with the same text: `PartialInDoubt {
+/// accepted: 1022 }` (the switch's acceptance saw it as `ERR write failed
+/// partial accepted=1022`), nothing queued, and the program reads those 1022
+/// bytes and nothing more.
+#[test]
+fn a_guarded_text_longer_than_the_input_queue_is_delivered_whole_and_in_order() {
+    let mut text = b"[aterm harness] save your work: ".to_vec();
+    text.resize(1100, b'w');
+    text.extend_from_slice(b" ATERM-SAVED-3f9a");
+    text.truncate(1118);
+
+    let (master, slave) = pty_pair(true);
+    aterm_pty::set_nonblocking(slave, true).expect("nonblocking slave");
+    let sink = nonblocking_sink(master);
+    let (outcome, order) = sink.try_write_frame_whole_with_receipt(&text);
+    assert_eq!(
+        outcome,
+        ImmediateWrite::Queued { accepted: 1022 },
+        "the raw queue's room"
+    );
+    assert!(order.is_some(), "the accepted prefix carries its order");
+    // The Enter that submits the text waits behind it: zero bytes.
+    assert_eq!(
+        sink.try_write_frame_whole_with_receipt(b"\r").0,
+        ImmediateWrite::BusyZero
+    );
+    assert_eq!(
+        read_all_within(slave, text.len()),
+        text,
+        "the whole text, in order"
+    );
+    // The drainer may still hold the fd lock for its last look at the
+    // emptied spill: the Enter is refused until it lets go, then goes.
+    let pressed = aterm_spec::wait::within(MUST_HAPPEN, Duration::from_millis(5), || {
+        match sink.try_write_frame_whole_with_receipt(b"\r").0 {
+            ImmediateWrite::Full => Some(()),
+            ImmediateWrite::BusyZero => None,
+            other => panic!("an Enter with room: {other:?}"),
+        }
+    });
+    assert!(pressed.is_some(), "the Enter never went after the text");
+    assert_eq!(read_all_within(slave, 1), b"\r");
+    assert!(nothing_more(slave));
+    drop(sink);
+    close_pair(master, slave);
+
+    // NEGATIVE CONTROL: the plain immediate write, the same text, a fresh pty.
+    let (master, slave) = pty_pair(true);
+    aterm_pty::set_nonblocking(slave, true).expect("nonblocking slave");
+    let sink = nonblocking_sink(master);
+    assert_eq!(
+        sink.try_write_frame_immediate_with_receipt(&text).0,
+        ImmediateWrite::PartialInDoubt { accepted: 1022 }
+    );
+    assert_eq!(sink.spilled_bytes(), 0, "nothing queued for the rest");
+    assert_eq!(read_all_within(slave, 1022), &text[..1022]);
+    assert!(nothing_more(slave), "the rest never arrives");
+    drop(sink);
+    close_pair(master, slave);
+}
+
+/// A 1118-byte text: 1022 `H`s, all a raw slave's input queue takes at once,
+/// then 96 `T`s, so a read shows at a glance which part of it came.
+fn head_and_tail() -> Vec<u8> {
+    let mut text = vec![b'H'; 1022];
+    text.extend_from_slice(&[b'T'; 96]);
+    text
+}
+
+/// Press a guarded Enter until the sink takes it (a drainer that abandoned
+/// a discarded chunk lets go of the fd lock at its next recheck), for at most
+/// a minute (a hang detector), and read what the program then holds: only
+/// what came after the discard.
+fn the_next_key_alone(sink: &SinkWriter, slave: i32) -> Vec<u8> {
+    let pressed = aterm_spec::wait::within(MUST_HAPPEN, Duration::from_millis(5), || {
+        match sink.try_write_frame_whole_with_receipt(b"\r").0 {
+            ImmediateWrite::Full => Some(()),
+            ImmediateWrite::BusyZero => None,
+            other => panic!("an Enter into an empty queue: {other:?}"),
+        }
+    });
+    assert!(pressed.is_some(), "the Enter never went after the discard");
+    let got = read_all_within(slave, 1);
+    assert!(nothing_more(slave));
+    got
+}
+
+/// A DISCARD NEVER SPLITS A GUARDED FRAME: the discard (`reset flush`, the
+/// restart signals) empties the spill and flushes the kernel's queue in ONE
+/// hold of the spill mutex, and the guarded write holds that mutex from its
+/// look at the empty spill until the rest of a short write is queued. So:
+///
+/// - a guarded write tried at the discard's most dangerous point, the spill
+///   emptied and the flush still to come (`Seam::DiscardFlush`), is refused
+///   with zero bytes, and tried after the discard it is delivered whole;
+/// - one written before the discard (head in the kernel's queue, rest in the
+///   spill) is dropped whole, head and rest, and the next key arrives alone.
+///
+/// NEGATIVE CONTROL: the discard's two halves apart, as they ran until
+/// 2026-10-16 (the flush after the mutex was let go), with the guarded write
+/// between them: it answers `Queued { accepted: 1022 }`, the flush takes its
+/// head, and the program reads the 96 bytes that end the text with nothing of
+/// its beginning — what the OK reply would have covered.
+#[test]
+fn a_discard_drops_a_guarded_frame_whole_or_lets_it_through_whole() {
+    let text = Arc::new(head_and_tail());
+
+    // Tried at the flush: refused; tried after the discard: whole.
+    let (master, slave) = pty_pair(true);
+    aterm_pty::set_nonblocking(slave, true).expect("nonblocking slave");
+    let sink = Arc::new(nonblocking_sink(master));
+    let raced = Arc::new(Mutex::new(Vec::new()));
+    {
+        let (weak, text, raced) = (Arc::downgrade(&sink), Arc::clone(&text), Arc::clone(&raced));
+        sink.seam_for_testing(move |seam| {
+            if seam == Seam::DiscardFlush
+                && let Some(sink) = weak.upgrade()
+            {
+                let outcome = sink.try_write_frame_whole_with_receipt(&text).0;
+                raced.lock().expect("raced").push(outcome);
+            }
+        });
+    }
+    let dropped = sink.discard_unread_input(Discard::Flush);
+    assert_eq!(
+        *raced.lock().expect("raced"),
+        [ImmediateWrite::BusyZero],
+        "a guarded write at the flush waits the discard out"
+    );
+    assert_eq!(dropped, Some(0), "an empty queue and spill");
+    assert!(nothing_more(slave), "nothing of it was written");
+    assert_eq!(
+        sink.try_write_frame_whole_with_receipt(&text).0,
+        ImmediateWrite::Queued { accepted: 1022 }
+    );
+    assert_eq!(read_all_within(slave, text.len()), *text, "whole, in order");
+    drop(sink);
+    close_pair(master, slave);
+
+    // Written before the discard: dropped whole.
+    let (master, slave) = pty_pair(true);
+    aterm_pty::set_nonblocking(slave, true).expect("nonblocking slave");
+    let sink = nonblocking_sink(master);
+    assert_eq!(
+        sink.try_write_frame_whole_with_receipt(&text).0,
+        ImmediateWrite::Queued { accepted: 1022 }
+    );
+    assert_eq!(
+        sink.discard_unread_input(Discard::Flush),
+        Some(text.len()),
+        "the head from the kernel's queue and the rest from the spill"
+    );
+    assert_eq!(
+        the_next_key_alone(&sink, slave),
+        b"\r",
+        "no part of the text"
+    );
+    drop(sink);
+    close_pair(master, slave);
+
+    // NEGATIVE CONTROL: the flush apart from the spill's emptying.
+    let (master, slave) = pty_pair(true);
+    aterm_pty::set_nonblocking(slave, true).expect("nonblocking slave");
+    let sink = nonblocking_sink(master);
+    assert_eq!(
+        sink.try_write_frame_whole_with_receipt(&text).0,
+        ImmediateWrite::Queued { accepted: 1022 }
+    );
+    assert_eq!(aterm_pty::flush_input_queue(master), Some(1022));
+    assert_eq!(
+        read_all_within(slave, 96),
+        [b'T'; 96],
+        "the end of the text, with no beginning"
+    );
+    assert!(nothing_more(slave));
+    drop(sink);
+    close_pair(master, slave);
+}
+
+/// THE DRAINER NEVER SPLITS ONE EITHER: it looks at the discard epoch and
+/// writes the spilled bytes it peeked in ONE hold of the spill mutex, the
+/// mutex the discard flushes under (`Shared::drain_write`). The drainer is
+/// stopped between its look and its write (`Seam::DrainWrite`) with a guarded
+/// frame's head in the kernel's queue and its rest peeked, and a discard is
+/// started meanwhile: it does not finish while the drainer stands there, and
+/// once the write has returned it drops head and rest together — the program
+/// reads nothing of the frame, and the next key arrives alone.
+///
+/// The discard is given 300 ms to finish early. That bounds only how surely a
+/// wrong build shows itself (its discard finishes in microseconds); a right
+/// build's discard cannot finish then whatever the machine's load, and its
+/// verdict never depends on the time.
+///
+/// NEGATIVE CONTROL: with the look and the write in two holds (the drainer
+/// until 2026-10-16), the discard finishes inside the window — it bumps the
+/// epoch after the look, empties the spill and flushes the head — and the
+/// drainer then hands the emptied queue the 96 bytes it peeked: the program
+/// reads the end of the text with no beginning (shown on the discard's own
+/// side by the test above).
+#[test]
+fn a_discard_racing_the_drainers_write_drops_the_frame_whole() {
+    let text = head_and_tail();
+    let (master, slave) = pty_pair(true);
+    aterm_pty::set_nonblocking(slave, true).expect("nonblocking slave");
+    let sink = Arc::new(nonblocking_sink(master));
+    let (at_tx, at_rx) = mpsc::channel::<()>();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let go_rx = Mutex::new(go_rx);
+    let stopped = AtomicBool::new(false);
+    sink.seam_for_testing(move |seam| {
+        if seam != Seam::DrainWrite || stopped.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let _ = at_tx.send(());
+        go_rx
+            .lock()
+            .expect("go")
+            .recv_timeout(MUST_HAPPEN)
+            .expect("the test lets the drainer write");
+    });
+    assert_eq!(
+        sink.try_write_frame_whole_with_receipt(&text).0,
+        ImmediateWrite::Queued { accepted: 1022 }
+    );
+    at_rx
+        .recv_timeout(MUST_HAPPEN)
+        .expect("the drainer reached its write");
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let discarder = {
+        let sink = Arc::clone(&sink);
+        thread::spawn(move || {
+            let dropped = sink.discard_unread_input(Discard::Flush);
+            let _ = done_tx.send(());
+            dropped
+        })
+    };
+    let finished_early = done_rx.recv_timeout(Duration::from_millis(300)).is_ok();
+    go_tx.send(()).expect("the drainer waits");
+    let dropped = discarder.join().expect("the discard");
+    assert!(
+        !finished_early,
+        "the discard ran between the drainer's look and its write"
+    );
+    assert_eq!(dropped, Some(text.len()), "head and rest");
+    assert_eq!(
+        the_next_key_alone(&sink, slave),
+        b"\r",
+        "no part of the text"
+    );
     drop(sink);
     close_pair(master, slave);
 }

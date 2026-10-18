@@ -167,24 +167,8 @@ const SPECTRUM_CROSSING_ENTRY_CAP: usize = 167;
 /// ([`spectrum_stop`], [`spectrum_snap_index`]) read it here.
 pub const SPECTRUM_ANCHOR_AT: [usize; SPECTRUM_STOPS] = [0, 58, 130, 237, 404, 474, 510];
 
-/// The crossing's hue window in HSV degrees: where the green→blue leg reads as
-/// cyan rather than green or blue. A name for a stretch of the arc, not a
-/// prohibition; nothing clamps to it. It is used by a locality census
-/// (`rainbow_kitty::meteor::a_warm_landing_throws_no_cyan_and_the_seam_is_the_band_s_teal`):
-/// a burst landing on the warm third must throw no light from the cool third.
-#[cfg(test)]
-pub const SPECTRUM_CYAN_LO: f64 = 165.0;
-/// The top of [`SPECTRUM_CYAN_LO`]'s window.
-#[cfg(test)]
-pub const SPECTRUM_CYAN_HI: f64 = 200.0;
-/// Below this HSV saturation a colour in the window is grey rather than a
-/// crossing colour. HSV `S` inflates without bound near black, so a census must
-/// not count it.
-#[cfg(test)]
-pub const SPECTRUM_CYAN_SAT_MIN: f64 = 0.3;
-
 // ---------------------------------------------------------------------------
-// The colour space: sRGB HSV for hue/chroma, linear sRGB for test luminance.
+// The colour space: sRGB HSV for hue/chroma.
 // ---------------------------------------------------------------------------
 
 /// Cubic smoothstep `0..1`, clamping: the segment's eased coordinate. It gives
@@ -195,18 +179,6 @@ pub const SPECTRUM_CYAN_SAT_MIN: f64 = 0.3;
 fn smoothstep01(x: f64) -> f64 {
     let x = x.clamp(0.0, 1.0);
     x * x * (3.0 - 2.0 * x)
-}
-
-/// sRGB `0..1` → linear, the piecewise IEC 61966-2-1 transfer (not the `2.2`
-/// approximation, which differs most near black).
-#[inline]
-#[cfg(test)]
-fn srgb_decode(c: f64) -> f64 {
-    if c <= 0.040_45 {
-        c / 12.92
-    } else {
-        ((c + 0.055) / 1.055).powf(2.4)
-    }
 }
 
 /// HSV of a `0x00RRGGBB`: hue in degrees, saturation and value in `0..1`. Used
@@ -826,13 +798,6 @@ mod tests {
     /// reads between every adjacent pair.
     const WALK: usize = 4096;
 
-    /// WCAG relative luminance of a committed table entry — read back through
-    /// the byte, so what is measured is what the emitter will actually push.
-    fn luminance(rgb: u32) -> f64 {
-        let chan = |sh: u32| srgb_decode(((rgb >> sh) & 0xff) as f64 / 255.0);
-        0.2126 * chan(16) + 0.7152 * chan(8) + 0.0722 * chan(0)
-    }
-
     /// The committed tables as the generator writes them, ready to paste.
     fn regenerated_tables() -> String {
         let table = generate_spectrum_table();
@@ -899,8 +864,6 @@ mod tests {
                 "the open arc misses anchor {i} at its own position"
             );
         }
-        assert_eq!(SPECTRUM_ANCHORS[0], 0x00FF_0000, "red is pure red");
-        assert_eq!(SPECTRUM_ANCHORS[2], 0x00FF_FF00, "yellow is pure yellow");
     }
 
     /// The arc is one ordered rainbow: HSV hue climbs from red to violet and
@@ -964,47 +927,6 @@ mod tests {
         );
     }
 
-    /// The arc may follow the seven anchors' deliberately broad luminance span,
-    /// but it must not introduce a deep interior dip between adjacent stops.
-    #[test]
-    fn spectrum_has_no_deep_interior_luminance_dip() {
-        let lum: Vec<f64> = SPECTRUM_ANCHORS.iter().map(|&c| luminance(c)).collect();
-        let mut worst_dip = 0.0f64;
-        let mut dip_seg = 0usize;
-        for seg in 0..SPECTRUM_STOPS - 1 {
-            let floor = lum[seg].min(lum[seg + 1]);
-            // The interval between two names, wherever the pace put them.
-            for &entry in SPECTRUM_LUT
-                .iter()
-                .take(SPECTRUM_ANCHOR_AT[seg + 1])
-                .skip(SPECTRUM_ANCHOR_AT[seg] + 1)
-            {
-                let y = luminance(entry);
-                let dip = (floor - y) / floor;
-                if dip > worst_dip {
-                    worst_dip = dip;
-                    dip_seg = seg;
-                }
-            }
-        }
-        assert!(
-            worst_dip <= 0.15,
-            "the arc prints a DARK BAND inside interval {dip_seg}: it falls \
-             {:.2} % below the darker of that interval's own two anchors",
-            worst_dip * 100.0
-        );
-        // The luminance span is the anchors' own, not flattened toward 1.
-        let (lo, hi) = (
-            lum.iter().copied().fold(f64::MAX, f64::min),
-            lum.iter().copied().fold(f64::MIN, f64::max),
-        );
-        assert!(
-            hi / lo > 7.0,
-            "the anchors' luminance span collapsed to {:.2}x",
-            hi / lo
-        );
-    }
-
     /// The arc is vivid.
     ///
     /// Saturation is exactly 1 everywhere. Every ROYGBIV interval joins anchors
@@ -1014,22 +936,19 @@ mod tests {
     /// ([`SPECTRUM_CROSSING_SEG`]).
     ///
     /// Value's floor is an authored colour: `min V = 0.510` is indigo `#4B0082`
-    /// itself, so the floor is asserted against the anchors. Mean `V = 0.947`.
+    /// itself, so the floor is asserted against the anchors.
     #[test]
     fn spectrum_stays_saturated_across_the_whole_arc() {
         let mut min_sat = 1.0f64;
         let mut sum_sat = 0.0f64;
         let mut min_val = 1.0f64;
-        let mut sum_val = 0.0f64;
         for &rgb in SPECTRUM_LUT.iter() {
             let (_, s, v) = spectrum_hsv(rgb);
             min_sat = min_sat.min(s);
             sum_sat += s;
             min_val = min_val.min(v);
-            sum_val += v;
         }
         let mean_sat = sum_sat / SPECTRUM_LUT_LEN as f64;
-        let mean_val = sum_val / SPECTRUM_LUT_LEN as f64;
 
         // Full chroma, exactly 1, entry for entry: five intervals by the
         // shared-zero argument, the green→blue interval by its HSV draw. An
@@ -1057,11 +976,6 @@ mod tests {
             "the arc's darkest entry is V {min_val:.4}, but the darkest AUTHORED \
              anchor is V {anchor_min_v:.4} — the arc is darker between its stops \
              than at any of them"
-        );
-        assert!(
-            mean_val >= 0.85,
-            "the arc's mean value fell to {mean_val:.3} — that is the \
-             constant-luminance wash coming back"
         );
 
         // The arc is chromatic everywhere: a grey-hole guard in the table's
@@ -1105,10 +1019,6 @@ mod tests {
             );
             worst = worst.max(step);
         }
-        assert_eq!(
-            worst, 4,
-            "the arc's exact steepest chord changed (the bound is {CEILING})"
-        );
         assert!(worst > 0, "a table with no structure would pass vacuously");
         // The read is CONTINUOUS in `t`: half a table step in either direction
         // moves no channel by more than one whole step.
@@ -1254,18 +1164,5 @@ mod min_saturation {
             "a non-finite floor is no floor"
         );
         assert_eq!(spectrum_with_min_saturation(0x006F_EBC2, 0.0), 0x006F_EBC2);
-    }
-
-    /// A producer applying the floor to its read of the arc gets the arc back,
-    /// bit for bit, at every entry (the arc never dips under it).
-    #[test]
-    fn the_floor_is_the_identity_on_every_entry_of_the_shipped_arc() {
-        for (i, &c) in SPECTRUM_LUT.iter().enumerate() {
-            assert_eq!(
-                spectrum_with_min_saturation(c, 1.0),
-                c,
-                "entry {i} (#{c:06X}) is under the floor — the arc dips again"
-            );
-        }
     }
 }

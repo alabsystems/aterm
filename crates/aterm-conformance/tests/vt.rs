@@ -23,12 +23,6 @@ mod sixel;
 mod vt_categories;
 mod vt_categories2;
 mod vt_categories3;
+mod vt_oracle;
 mod xterm_alternate_finals;
 mod xterm_differential_regressions;
-
-// aterm-core's fresh-terminal escape-soup fuzz cases, mounted here so they
-// also run against aterm-core with `sixel` (this crate's dependency) under
-// `-p aterm-conformance` alone. They only read their seed and case-count
-// overrides from the environment, so they share this process safely.
-#[path = "../../aterm-core/tests/fuzz_process_never_panics/fresh.rs"]
-mod fresh_terminal;

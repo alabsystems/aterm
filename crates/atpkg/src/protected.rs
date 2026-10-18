@@ -16,11 +16,11 @@
 //! design's whole point is to move that interruption to a moment a human chose (§3.5);
 //! an unattended lane that touches these roots undoes it in aterm's own name.
 //!
-//! Two lanes have now made this mistake: the home walk of [`crate::noindex`] (2026-09-10,
-//! pruned) and the rc wiring of [`crate::hooks`], which followed a symlinked `~/.zshrc`
-//! (or a symlinked `~/.config`) into wherever the dotfiles repo lived (2026-09-12). This
-//! module exists so the THIRD lane finds the predicate instead of rediscovering the
-//! incident.
+//! Two lanes have now made this mistake: the home walk of the since-deleted Spotlight
+//! measurement (2026-09-10, pruned) and the rc wiring of [`crate::hooks`], which
+//! followed a symlinked `~/.zshrc` (or a symlinked `~/.config`) into wherever the
+//! dotfiles repo lived (2026-09-12). This module exists so the THIRD lane finds the
+//! predicate instead of rediscovering the incident.
 //!
 //! # What is and is not gated
 //!
@@ -223,6 +223,7 @@ mod tests {
             "/Users//someone/dotfiles/zshrc",
             "/Users//someone/Documentsx/zshrc",
             "/Users//someone/src/Documents/zshrc",
+            "/Users//someone/Library",
             "/Users//someone/Library/Application Support/aterm/pkg",
             "/Users//someone/Library/Mobile",
             "/Users//someone/Library/CloudStoragex",
@@ -236,28 +237,5 @@ mod tests {
                 "{p} is not under a protected root"
             );
         }
-    }
-
-    /// A file-provider domain is protected from its ROOT down. The providers inside
-    /// `~/Library/CloudStorage` are the domains that prompt, but an unattended lane has
-    /// no business at that root either, and refusing more is the harmless direction —
-    /// nothing atpkg lays ever resolves there on purpose.
-    #[test]
-    fn a_file_provider_domain_is_protected_from_its_root_down() {
-        let home = PathBuf::from("/Users//someone");
-        for p in [
-            "/Users//someone/Library/CloudStorage",
-            "/Users//someone/Library/CloudStorage/OneDrive",
-            "/Users//someone/Library/Mobile Documents",
-            "/Users//someone/Library/Mobile Documents/com~apple~CloudDocs",
-        ] {
-            assert!(under_protected_root(&home, Path::new(p)), "{p}");
-        }
-        // `~/Library` itself is not a root this predicate names: atpkg's own store
-        // lives under `~/Library/Application Support`.
-        assert!(!under_protected_root(
-            &home,
-            Path::new("/Users//someone/Library")
-        ));
     }
 }

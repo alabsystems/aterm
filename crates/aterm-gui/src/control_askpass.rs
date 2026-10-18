@@ -92,6 +92,11 @@ pub(crate) fn serve(
     // `attribute_from` is sudo's parent: the window attributes from there,
     // past sudo (whose PROC_PIDTBSDINFO the session walker cannot read).
     let invoker_pid = aterm_uds::sudo::parent_of(sudo_pid).unwrap_or(sudo_pid);
+    // A warm spare's rc asks nobody (`crate::spare`): refused, and the spare
+    // tainted; one from a session before its start record is counted.
+    if crate::spare::askpass_refused(invoker_pid) {
+        return public_reply("ERR askpass refused no such session\n");
+    }
     let command = ps_command_line(sudo_pid);
     let invoker = ps_command_line(invoker_pid);
     if command.is_empty() {

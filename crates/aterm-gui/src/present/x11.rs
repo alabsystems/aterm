@@ -1,0 +1,594 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! The X11 CPU presenter: the frame in a shared-memory segment the server
+//! reads by descriptor (MIT-SHM AttachFd, then ShmPutImage per damaged
+//! rectangle), or, on a server without MIT-SHM 1.2, the pixels sent whole by
+//! PutImage. It draws through the window's own connection, the libxcb one
+//! under winit's Xlib `Display`, as softbuffer 0.4.8's X11 backend did; this
+//! replaces it (docs/AUDIT-third-party-2026-10-15.md, linux-windowing LW.6).
+//!
+//! Its present protocol is softbuffer's, so the pixels on the window are what
+//! they were: one buffer, which the server may still be reading after a
+//! present. A GetInputFocus sent after the ShmPutImages is answered only once
+//! they are done, so the next acquire waits for that reply before handing
+//! the buffer out again. Errors of the drawing requests are discarded, as
+//! softbuffer discarded them, so a window destroyed under a present costs a
+//! frame, not the session.
+
+use std::num::NonZeroU32;
+use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
+
+use aterm_types::native_window::{HasNativeWindow, NativeWindow};
+use aterm_x11::Connection;
+use aterm_x11::proto::xproto::{
+    self, GetInputFocusReply, Setup, gc, image_format, image_order, visual_class,
+};
+use aterm_x11::proto::{ValueList, shm};
+use winit::window::Window;
+
+use super::shm_mem::ShmMem;
+use super::{CpuFrameBuffer, DamageRect};
+
+/// Why the X11 presenter failed.
+#[derive(Debug)]
+pub(crate) enum X11PresentError {
+    /// The window is not an X11 window, or its handle is incomplete.
+    NotX11,
+    /// The window's visual does not store pixels as `0x00RRGGBB` words.
+    Visual(u32),
+    /// A size past X11's 16-bit coordinates.
+    Size(u32, u32),
+    /// A damage rectangle past X11's 16-bit coordinates (softbuffer's
+    /// `DamageOutOfRange`).
+    Damage(DamageRect),
+    /// The transport or the server refused.
+    X11(aterm_x11::Error),
+    /// The shared-memory segment could not be made.
+    Shm(std::io::Error),
+}
+
+impl std::fmt::Display for X11PresentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotX11 => f.write_str("not an X11 window"),
+            Self::Visual(v) => write!(
+                f,
+                "visual {v:#x} does not store 0x00RRGGBB words and is unsupported"
+            ),
+            Self::Size(w, h) => write!(f, "{w}x{h} is past X11's 16-bit sizes"),
+            Self::Damage(r) => write!(
+                f,
+                "damage {}x{} at {},{} is past X11's 16-bit coordinates",
+                r.width, r.height, r.x, r.y
+            ),
+            Self::X11(e) => write!(f, "{e}"),
+            Self::Shm(e) => write!(f, "shared memory: {e}"),
+        }
+    }
+}
+
+impl From<aterm_x11::Error> for X11PresentError {
+    fn from(e: aterm_x11::Error) -> Self {
+        Self::X11(e)
+    }
+}
+
+/// The segment attached to the server, and its id there.
+struct Segment {
+    mem: ShmMem,
+    id: shm::Seg,
+}
+
+enum Store {
+    /// MIT-SHM, at the extension's major opcode. `pending` is the sequence of
+    /// the GetInputFocus sent after the last present's ShmPutImages.
+    Shm {
+        major: u8,
+        seg: Option<Segment>,
+        pending: Option<u64>,
+    },
+    /// No MIT-SHM: the pixels go on the wire.
+    Wire(Vec<u32>),
+}
+
+/// One window's X11 presenter.
+pub(crate) struct X11Presenter {
+    conn: Connection,
+    window: u32,
+    gc: u32,
+    depth: u8,
+    store: Store,
+    size: Option<(u16, u16)>,
+    presented: bool,
+    /// Holds the winit window, and with it the Xlib display `conn` borrows;
+    /// dropped last.
+    _window: Arc<Window>,
+}
+
+// SAFETY: the connection is libxcb's, which is thread-safe; the segment is
+// owned. The presenter moves between threads only with its window state.
+unsafe impl Send for X11Presenter {}
+
+/// The pixel layouts the presenter can draw with: a 24- or 32-bit visual
+/// whose 32-bit pixels are `0x00RRGGBB` in this client's byte order, as
+/// softbuffer's `supported_visuals` accepted them. The format and visual
+/// must both belong to the depth observed on this window.
+fn visual_supported(setup: &Setup, visual: u32, window_depth: u8) -> bool {
+    let pixels_are_words = setup
+        .pixmap_formats
+        .iter()
+        .any(|f| f.depth == window_depth && f.bits_per_pixel == 32);
+    if !matches!(window_depth, 24 | 32) || !pixels_are_words {
+        return false;
+    }
+    let native = if cfg!(target_endian = "little") {
+        image_order::LSB_FIRST
+    } else {
+        image_order::MSB_FIRST
+    };
+    let masks = if setup.image_byte_order == native {
+        (0x00ff_0000, 0x0000_ff00, 0x0000_00ff)
+    } else {
+        (0x0000_ff00, 0x00ff_0000, 0xff00_0000)
+    };
+    setup.roots.iter().any(|screen| {
+        screen
+            .allowed_depths
+            .iter()
+            .filter(|d| d.depth == window_depth)
+            .flat_map(|d| &d.visuals)
+            .any(|v| {
+                v.visual_id == visual
+                    && matches!(
+                        v.class,
+                        visual_class::TRUE_COLOR | visual_class::DIRECT_COLOR
+                    )
+                    && (v.red_mask, v.green_mask, v.blue_mask) == masks
+            })
+    })
+}
+
+/// A rectangle as ShmPutImage takes it (source `x`, `y`, `width`, `height`,
+/// then the same corner as the destination), or `None` past 16 bits.
+fn shm_rect(rect: &DamageRect) -> Option<(u16, u16, u16, u16, i16, i16)> {
+    let fits = |v: u32| u16::try_from(v).ok();
+    let (x, y) = (fits(rect.x)?, fits(rect.y)?);
+    Some((
+        x,
+        y,
+        fits(rect.width.get())?,
+        fits(rect.height.get())?,
+        i16::try_from(x).ok()?,
+        i16::try_from(y).ok()?,
+    ))
+}
+
+/// Whether the server takes AttachFd: MIT-SHM 1.2, and a 4 KiB segment
+/// attached and detached without error (a remote server cannot map it).
+fn shm_major(conn: &Connection) -> Option<u8> {
+    let ext = conn.extension(shm::NAME).ok()??;
+    let version = conn
+        .send(shm::query_version(ext.major_opcode))
+        .ok()?
+        .reply()
+        .ok()?;
+    if (version.major_version, version.minor_version) < (1, 2) {
+        return None;
+    }
+    let mem = ShmMem::new(c"aterm-x11-probe", 4096).ok()?;
+    let fd = mem.fd().try_clone_to_owned().ok()?;
+    let id = conn.generate_id().ok()?;
+    let attach = conn
+        .send_void_with_fds(shm::attach_fd(ext.major_opcode, id, true), vec![fd])
+        .ok()?;
+    let detach = conn.send_void(shm::detach(ext.major_opcode, id)).ok()?;
+    (attach.check().is_ok() && detach.check().is_ok()).then_some(ext.major_opcode)
+}
+
+impl X11Presenter {
+    /// Attach to `window`, an X11 window of winit's.
+    pub(crate) fn new(window: Arc<Window>) -> Result<Self, X11PresentError> {
+        let Some(NativeWindow::Xlib {
+            display,
+            window: xid,
+            visual,
+            ..
+        }) = window.native_window()
+        else {
+            return Err(X11PresentError::NotX11);
+        };
+        if xid == 0 {
+            return Err(X11PresentError::NotX11);
+        }
+        // SAFETY: winit's live `Display *`, which `_window` keeps open for
+        // as long as this presenter (and so this connection) lives.
+        let conn = unsafe { Connection::from_xlib_display(display) }?;
+        let geometry = conn.send(xproto::get_geometry(xid))?;
+        let visual = match (visual != 0).then_some(visual) {
+            Some(v) => v,
+            None => {
+                conn.send(xproto::get_window_attributes(xid))?
+                    .reply()?
+                    .visual
+            }
+        };
+        let depth = geometry.reply()?.depth;
+        if !visual_supported(conn.setup(), visual, depth) {
+            return Err(X11PresentError::Visual(visual));
+        }
+        let gc_id = conn.generate_id()?;
+        conn.send_void(xproto::create_gc(
+            gc_id,
+            xid,
+            &ValueList::new().set(gc::GRAPHICS_EXPOSURES, 0),
+        ))?
+        .check()?;
+        let store = match shm_major(&conn) {
+            Some(major) => Store::Shm {
+                major,
+                seg: None,
+                pending: None,
+            },
+            None => {
+                aterm_log::warn!("x11 present: no MIT-SHM 1.2; frames go over the wire");
+                Store::Wire(Vec::new())
+            }
+        };
+        Ok(Self {
+            conn,
+            window: xid,
+            gc: gc_id,
+            depth,
+            store,
+            size: None,
+            presented: false,
+            _window: window,
+        })
+    }
+
+    /// Set the frame size; the store grows (never shrinks) to hold it.
+    pub(crate) fn resize(
+        &mut self,
+        width: NonZeroU32,
+        height: NonZeroU32,
+    ) -> Result<(), X11PresentError> {
+        let size_err = || X11PresentError::Size(width.get(), height.get());
+        let w = u16::try_from(width.get()).map_err(|_| size_err())?;
+        let h = u16::try_from(height.get()).map_err(|_| size_err())?;
+        if self.size == Some((w, h)) {
+            return Ok(());
+        }
+        self.presented = false;
+        let words = usize::from(w) * usize::from(h);
+        match &mut self.store {
+            Store::Wire(buf) => buf.resize(words, 0),
+            Store::Shm {
+                major,
+                seg,
+                pending,
+            } => {
+                let want = (words * 4).next_power_of_two();
+                if seg.as_ref().is_none_or(|s| s.mem.len() < want) {
+                    let mem = ShmMem::new(c"aterm-x11", want).map_err(X11PresentError::Shm)?;
+                    let fd = mem
+                        .fd()
+                        .try_clone_to_owned()
+                        .map_err(X11PresentError::Shm)?;
+                    let id = self.conn.generate_id()?;
+                    drop(
+                        self.conn
+                            .send_void_with_fds(shm::attach_fd(*major, id, true), vec![fd])?,
+                    );
+                    if let Some(old) = seg.replace(Segment { mem, id }) {
+                        // The server may still be reading the old segment.
+                        if let Some(seq) = pending.take() {
+                            self.conn.wait_reply::<GetInputFocusReply>(seq)?;
+                        }
+                        drop(self.conn.send_void(shm::detach(*major, old.id))?);
+                    }
+                }
+            }
+        }
+        self.size = Some((w, h));
+        Ok(())
+    }
+
+    /// Wait until the server has read the last present, then hand the
+    /// buffer out.
+    pub(crate) fn buffer_mut(&mut self) -> Result<X11Frame<'_>, X11PresentError> {
+        if let Store::Shm { pending, .. } = &mut self.store
+            && let Some(seq) = pending.take()
+        {
+            self.conn.wait_reply::<GetInputFocusReply>(seq)?;
+        }
+        Ok(X11Frame { p: self })
+    }
+
+    fn words(&self) -> usize {
+        self.size
+            .map_or(0, |(w, h)| usize::from(w) * usize::from(h))
+    }
+
+    fn present(&mut self, damage: &[DamageRect]) -> Result<(), X11PresentError> {
+        let Some((w, h)) = self.size else {
+            return Ok(());
+        };
+        match &mut self.store {
+            Store::Wire(buf) => {
+                // softbuffer sent the whole frame on this path, whatever the
+                // damage; so does this, in bands the server's request limit
+                // takes (BIG-REQUESTS or not).
+                let row_bytes = usize::from(w) * 4;
+                let limit = self.conn.maximum_request_bytes().saturating_sub(32);
+                let rows = (limit / row_bytes.max(1)).clamp(1, usize::from(h));
+                for (band, chunk) in buf.chunks(rows * usize::from(w)).enumerate() {
+                    let y = band * rows;
+                    let band_rows = chunk.len() / usize::from(w).max(1);
+                    let bytes: Vec<u8> = chunk.iter().flat_map(|p| p.to_ne_bytes()).collect();
+                    drop(self.conn.send_void(xproto::put_image(
+                        image_format::Z_PIXMAP,
+                        self.window,
+                        self.gc,
+                        w,
+                        u16::try_from(band_rows).unwrap_or(h),
+                        0,
+                        i16::try_from(y).unwrap_or(i16::MAX),
+                        0,
+                        self.depth,
+                        &bytes,
+                    ))?);
+                }
+            }
+            Store::Shm {
+                major,
+                seg,
+                pending,
+            } => {
+                let Some(seg) = seg else {
+                    return Ok(());
+                };
+                // Every rectangle is checked before one is sent: a refused
+                // present sends nothing, and the caller's next frame is whole.
+                if let Some(bad) = damage.iter().find(|r| shm_rect(r).is_none()) {
+                    return Err(X11PresentError::Damage(*bad));
+                }
+                for (x, y, rw, rh, dx, dy) in damage.iter().filter_map(shm_rect) {
+                    drop(self.conn.send_void(shm::put_image(
+                        *major,
+                        self.window,
+                        self.gc,
+                        w,
+                        h,
+                        x,
+                        y,
+                        rw,
+                        rh,
+                        dx,
+                        dy,
+                        self.depth,
+                        image_format::Z_PIXMAP,
+                        false,
+                        seg.id,
+                        0,
+                    ))?);
+                }
+                *pending = Some(self.conn.send(xproto::get_input_focus())?.detach());
+            }
+        }
+        self.conn.flush()?;
+        self.presented = true;
+        Ok(())
+    }
+}
+
+impl Drop for X11Presenter {
+    fn drop(&mut self) {
+        if let Store::Shm {
+            major,
+            seg,
+            pending,
+        } = &mut self.store
+        {
+            if let Some(seq) = pending.take() {
+                let _ = self.conn.wait_reply::<GetInputFocusReply>(seq);
+            }
+            if let Some(seg) = seg.take() {
+                if let Ok(c) = self.conn.send_void(shm::detach(*major, seg.id)) {
+                    drop(c);
+                }
+                // The server has finished with it (the wait above); unmapped
+                // here, after the detach is queued.
+                drop(seg.mem);
+            }
+        }
+        if let Ok(c) = self.conn.send_void(xproto::free_gc(self.gc)) {
+            drop(c);
+        }
+        let _ = self.conn.flush();
+    }
+}
+
+/// One acquired X11 frame.
+pub(crate) struct X11Frame<'a> {
+    p: &'a mut X11Presenter,
+}
+
+impl Deref for X11Frame<'_> {
+    type Target = [u32];
+
+    fn deref(&self) -> &[u32] {
+        let words = self.p.words();
+        match &self.p.store {
+            Store::Wire(buf) => &buf[..words.min(buf.len())],
+            Store::Shm { seg, .. } => seg
+                .as_ref()
+                .and_then(|s| s.mem.words(0, words))
+                .unwrap_or_default(),
+        }
+    }
+}
+
+impl DerefMut for X11Frame<'_> {
+    fn deref_mut(&mut self) -> &mut [u32] {
+        let words = self.p.words();
+        match &mut self.p.store {
+            Store::Wire(buf) => {
+                let n = words.min(buf.len());
+                &mut buf[..n]
+            }
+            Store::Shm { seg, .. } => seg
+                .as_mut()
+                .and_then(|s| s.mem.words_mut(0, words))
+                .unwrap_or_default(),
+        }
+    }
+}
+
+impl CpuFrameBuffer for X11Frame<'_> {
+    type Error = X11PresentError;
+
+    fn age(&self) -> u8 {
+        u8::from(self.p.presented)
+    }
+
+    fn present(self) -> Result<(), Self::Error> {
+        let Some((w, h)) = self.p.size else {
+            return Ok(());
+        };
+        let whole = DamageRect {
+            x: 0,
+            y: 0,
+            width: NonZeroU32::from(
+                std::num::NonZeroU16::new(w).unwrap_or(std::num::NonZeroU16::MIN),
+            ),
+            height: NonZeroU32::from(
+                std::num::NonZeroU16::new(h).unwrap_or(std::num::NonZeroU16::MIN),
+            ),
+        };
+        self.p.present(&[whole])
+    }
+
+    fn present_with_damage(self, damage: &[DamageRect]) -> Result<(), Self::Error> {
+        self.p.present(damage)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aterm_x11::proto::xproto::{Depth, Format, Screen, Visualtype};
+
+    fn setup() -> Setup {
+        let visual = |id| Visualtype {
+            visual_id: id,
+            class: visual_class::TRUE_COLOR,
+            bits_per_rgb_value: 8,
+            colormap_entries: 256,
+            red_mask: 0x00ff_0000,
+            green_mask: 0x0000_ff00,
+            blue_mask: 0x0000_00ff,
+        };
+        Setup {
+            status: 1,
+            protocol_major_version: 11,
+            protocol_minor_version: 0,
+            release_number: 0,
+            resource_id_base: 0,
+            resource_id_mask: 0,
+            motion_buffer_size: 0,
+            maximum_request_length: 65535,
+            image_byte_order: if cfg!(target_endian = "little") {
+                image_order::LSB_FIRST
+            } else {
+                image_order::MSB_FIRST
+            },
+            bitmap_format_bit_order: 0,
+            bitmap_format_scanline_unit: 32,
+            bitmap_format_scanline_pad: 32,
+            min_keycode: 8,
+            max_keycode: 255,
+            vendor: Vec::new(),
+            pixmap_formats: vec![
+                Format {
+                    depth: 24,
+                    bits_per_pixel: 32,
+                    scanline_pad: 32,
+                },
+                Format {
+                    depth: 32,
+                    bits_per_pixel: 32,
+                    scanline_pad: 32,
+                },
+            ],
+            roots: vec![Screen {
+                root: 1,
+                default_colormap: 0,
+                white_pixel: 0,
+                black_pixel: 0,
+                current_input_masks: 0,
+                width_in_pixels: 80,
+                height_in_pixels: 24,
+                width_in_millimeters: 0,
+                height_in_millimeters: 0,
+                min_installed_maps: 0,
+                max_installed_maps: 0,
+                root_visual: 0x24,
+                backing_stores: 0,
+                save_unders: false,
+                root_depth: 24,
+                allowed_depths: vec![
+                    Depth {
+                        depth: 24,
+                        visuals: vec![visual(0x24)],
+                    },
+                    Depth {
+                        depth: 32,
+                        visuals: vec![visual(0x32)],
+                    },
+                ],
+            }],
+        }
+    }
+
+    /// Formats, visuals and the observed window depth must describe one layout.
+    #[test]
+    fn the_windows_depth_owns_its_pixel_format_and_visual() {
+        let ordinary = setup();
+        assert!(visual_supported(&ordinary, 0x24, 24));
+        assert!(visual_supported(&ordinary, 0x32, 32));
+        assert!(!visual_supported(&ordinary, 0xff, 24));
+        let mut wrong_masks = ordinary.clone();
+        wrong_masks.roots[0].allowed_depths[0].visuals[0].red_mask ^= 1;
+        assert!(!visual_supported(&wrong_masks, 0x24, 24));
+        let mut wrong_class = ordinary.clone();
+        wrong_class.roots[0].allowed_depths[0].visuals[0].class = u8::MAX;
+        assert!(!visual_supported(&wrong_class, 0x24, 24));
+        let mut absent = ordinary.clone();
+        absent.pixmap_formats.clear();
+        assert!(!visual_supported(&absent, 0x24, 24));
+
+        let mut admitted = Vec::new();
+        let mut packed24 = ordinary.clone();
+        packed24.pixmap_formats[0].bits_per_pixel = 24;
+        if visual_supported(&packed24, 0x24, 24) {
+            admitted.push("24-bit format borrowed from depth32");
+        }
+        let mut packed32 = ordinary.clone();
+        packed32.pixmap_formats[1].bits_per_pixel = 24;
+        if visual_supported(&packed32, 0x32, 32) {
+            admitted.push("32-bit format borrowed from depth24");
+        }
+        if visual_supported(&ordinary, 0x24, 32) {
+            admitted.push("visual from another depth");
+        }
+        if visual_supported(&ordinary, 0x24, 16) {
+            admitted.push("unsupported window depth");
+        }
+        assert!(
+            admitted.is_empty(),
+            "X11_WINDOW_DEPTH_MUST_OWN_ITS_LAYOUT: {admitted:?}"
+        );
+    }
+}

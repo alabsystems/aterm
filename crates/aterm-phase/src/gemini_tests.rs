@@ -1,0 +1,1807 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! One test per measured Gemini CLI screen (gemini-cli 0.46.0), each with
+//! its negative control.
+
+use super::fixtures::*;
+use super::*;
+use crate::prompt::fixtures::{provenance, rows, screen};
+use crate::reader::{
+    AgyReader, ClaudeReader, CodexReader, MuseReader, Program, ScreenReader, identify, read,
+};
+
+fn gemini(text: &str) -> crate::reader::Reading {
+    read(Some("gemini"), &screen(text), None)
+}
+
+fn roles(p: &PromptV2) -> Vec<Role> {
+    p.options.iter().map(|o| o.role).collect()
+}
+
+fn labels(p: &PromptV2) -> Vec<&str> {
+    p.options.iter().map(|o| o.label.as_str()).collect()
+}
+
+/// `rows` with the last row that starts with `head` replaced by `with`.
+fn edited(rows: &[String], head: &str, with: &str) -> Vec<String> {
+    let at = rows
+        .iter()
+        .rposition(|r| r.starts_with(head))
+        .unwrap_or_else(|| panic!("a row starting {head:?}"));
+    let mut out = rows.to_vec();
+    out[at] = with.to_string();
+    out
+}
+
+/// The row of the composer's band that holds its caret: the last ` > ` row.
+fn caret_at(rows: &[String]) -> usize {
+    rows.iter()
+        .rposition(|r| r.starts_with(" > "))
+        .expect("a caret row")
+}
+
+/// The status row: the one right above the live zone's rule.
+fn status_at(rows: &[String]) -> usize {
+    rows.iter()
+        .rposition(|r| plain_rule_width(r).is_some())
+        .expect("the rule")
+        - 1
+}
+
+/// Every Gemini CLI capture under `src/fixtures/`, by file name.
+fn captures() -> Vec<(String, String)> {
+    crate::text::fixture_files()
+        .into_iter()
+        .filter(|(name, _)| name.starts_with("gemini-"))
+        .collect()
+}
+
+/// A fresh session at its composer is idle as evidence: no message yet, the
+/// status row's `? for shortcuts`, and the composer EMPTY — its placeholder
+/// read as no text at all, since neither its cursor (column 3) nor its colour
+/// (grey, not dim) tells it from a draft. NEGATIVE CONTROLS: the busy
+/// screen's composer is the same placeholder, and busy; the placeholder's
+/// words TYPED (one blank after the caret, not three) are a draft.
+#[test]
+fn a_fresh_session_is_idle_at_its_composer_and_its_placeholder_is_no_draft() {
+    let r = gemini(IDLE);
+    let rows = screen(IDLE);
+    assert_eq!(r.program, Program::Gemini);
+    assert_eq!(
+        (r.phase.clone(), r.phase_authoritative),
+        (Phase::Idle, true)
+    );
+    assert!(r.fresh);
+    assert_eq!((r.prompt, r.wall, r.said_tail), (None, None, None));
+    assert!(!r.interrupted);
+    let caret = caret_at(&rows);
+    assert_eq!(r.composer, Some((caret, vec![String::new()])));
+    assert!(
+        rows[caret].contains(anchor_text("gemini.composer.placeholder")),
+        "{}",
+        rows[caret]
+    );
+    let busy = gemini(BUSY_THINKING);
+    assert_eq!(busy.phase, Phase::Busy, "the control");
+    assert_eq!(busy.composer.map(|(_, l)| l), Some(vec![String::new()]));
+    assert!(!busy.fresh, "a message was sent");
+
+    let typed = edited(&rows, " > ", " > Type your message or @path/to/file");
+    assert_eq!(
+        composer_draft(&typed).map(|(_, l)| l),
+        Some(vec!["Type your message or @path/to/file".to_string()])
+    );
+    assert_eq!(
+        phase(&typed),
+        (Phase::Idle, false),
+        "a draft under the hint"
+    );
+}
+
+/// A typed draft is the composer's text, and the status row is BLANK while
+/// it is held: idle as evidence, the session still fresh. NEGATIVE CONTROL:
+/// a status row of words this grammar has not measured over the same draft
+/// says nothing.
+#[test]
+fn an_unsent_draft_is_the_composers() {
+    let r = gemini(DRAFT);
+    let rows = screen(DRAFT);
+    assert_eq!(
+        r.composer,
+        Some((
+            caret_at(&rows),
+            vec!["a draft the lab never sends".to_string()]
+        ))
+    );
+    assert_eq!((r.phase, r.phase_authoritative), (Phase::Idle, true));
+    assert!(r.fresh);
+    let mut tipped = rows.clone();
+    tipped[status_at(&rows)] = format!("{:>143}", "Tip: a tip this grammar never read");
+    assert_eq!(phase(&tipped), (Phase::Idle, false), "the control");
+}
+
+/// A draft that wrapped: its rows under the caret row, at column 3, are
+/// lines of the draft. NEGATIVE CONTROL: a row at column 1 under the caret
+/// row is no row of the band, and leaves no composer read.
+#[test]
+fn a_wrapped_draft_is_every_row_of_the_band() {
+    let rows = screen(DRAFT);
+    let caret = caret_at(&rows);
+    let mut wrapped = rows.clone();
+    wrapped.insert(caret + 1, "   and a second row".to_string());
+    assert_eq!(
+        composer_draft(&wrapped).map(|(_, l)| l),
+        Some(vec![
+            "a draft the lab never sends".to_string(),
+            "and a second row".to_string()
+        ])
+    );
+    assert_eq!(phase(&wrapped), (Phase::Idle, true));
+    wrapped[caret + 1] = " not the band".to_string();
+    assert_eq!(composer_draft(&wrapped), None, "the control");
+}
+
+/// THE LAB'S HAZARD: every message a person sent is drawn in the composer's
+/// own band, so with a box up (the live zone gone) the last band on the
+/// screen is the message the box answers. It is never the composer: no rule
+/// stands over it. NEGATIVE CONTROLS: the box's screen has no composer, and
+/// neither has the transcript left when the box is cut away; the composer's
+/// band, with its rule, is read; a rule further up than the live zone's own
+/// rows under it reach (the mode row, and a narrow pane's summary) is no rule
+/// of the band's.
+#[test]
+fn a_sent_message_is_never_the_composer() {
+    let boxed = screen(BOX_SHELL);
+    assert!(boxed.iter().any(|r| r == " > toolstart"), "the sent band");
+    assert_eq!(composer_draft(&boxed), None);
+    assert_eq!(gemini(BOX_SHELL).composer, None);
+    let band_end = boxed
+        .iter()
+        .rposition(|r| r.starts_with('▀'))
+        .expect("the sent band's bottom");
+    let transcript = boxed[..=band_end].to_vec();
+    assert_eq!(composer_draft(&transcript), None);
+    assert_eq!(phase(&transcript), (Phase::Idle, false));
+    let idle = screen(IDLE);
+    assert!(composer_draft(&idle).is_some(), "the control");
+    let rule = status_at(&idle) + 1;
+    let mut far = idle.clone();
+    far.splice(
+        rule + 1..rule + 1,
+        [" one", " two", " three", " four"].map(String::from),
+    );
+    assert_eq!(
+        composer_draft(&far),
+        None,
+        "five rows between the rule and the band"
+    );
+}
+
+/// THE SPINNER ON THE STATUS ROW IS BUSY — thinking, streaming its reply,
+/// and through every retry of a 503 and a 500, which draw no row of their
+/// own (the CLI retries them for ever): no wall, no last words. NEGATIVE
+/// CONTROLS: the spinner row turned to words this grammar has not measured
+/// is no turn running and no evidence; `? for shortcuts` back in its place,
+/// or nothing (no hint drawn), is the turn's end, as evidence.
+#[test]
+fn the_spinner_is_busy_through_thinking_streaming_and_retries() {
+    for text in [BUSY_THINKING, BUSY_STREAMING, RETRY_503, RETRY_500] {
+        let r = gemini(text);
+        let what = provenance(text).unwrap_or_default();
+        assert_eq!(
+            (r.phase.clone(), r.phase_authoritative),
+            (Phase::Busy, true),
+            "{what}"
+        );
+        assert_eq!((r.said_tail, r.wall), (None, None), "{what}");
+        let rows = screen(text);
+        let status = status_at(&rows);
+        assert!(is_spinner_row(&rows[status]), "{what}");
+        assert!(
+            rows[status].contains(anchor_text("gemini.status.cancel")),
+            "{what}"
+        );
+        let mut gone = rows.clone();
+        gone[status] = " Thinking... (esc to cancel, 3s)".to_string();
+        assert_eq!(phase(&gone), (Phase::Idle, false), "{what}");
+        gone[status] = format!("{:>143}", "? for shortcuts");
+        assert_eq!(phase(&gone), (Phase::Idle, true), "{what}: the control");
+        gone[status] = String::new();
+        assert_eq!(phase(&gone), (Phase::Idle, true), "{what}: no hint");
+    }
+}
+
+/// A turn ends on its reply, with no row marking the end: the spinner gone
+/// and `? for shortcuts` back. Its last words are the reply's rows, the `✦`
+/// stripped — after a 503's and a 500's retries too. NEGATIVE CONTROLS: a
+/// reply whose last words ask is a question; a reply followed by a tool's
+/// row is no last words.
+#[test]
+fn a_turn_ends_on_its_reply() {
+    let r = gemini(END_OF_TURN);
+    assert_eq!((r.phase, r.phase_authoritative), (Phase::Idle, true));
+    let said = r.said_tail.expect("the reply");
+    assert!(said.starts_with("tick 16 tick 17"), "{said}");
+    assert!(said.ends_with("tick 30"), "{said}");
+    assert!(!r.fresh && !r.interrupted);
+    for text in [RETRY_503_RECOVERED, RETRY_500_RECOVERED] {
+        let r = gemini(text);
+        assert_eq!((r.phase, r.phase_authoritative), (Phase::Idle, true));
+        assert_eq!(
+            r.said_tail.as_deref(),
+            Some("Hi! I am the local lab stub, not a model. (reply 3)")
+        );
+        assert_eq!(r.wall, None);
+    }
+    let rows = screen(END_OF_TURN);
+    let at = rows
+        .iter()
+        .position(|r| r.starts_with("✦ tick 16"))
+        .expect("the reply");
+    let mut asks = rows.clone();
+    asks.insert(at + 1, "  Shall I go on?".to_string());
+    assert_eq!(phase(&asks), (Phase::Question, true));
+    assert_eq!(
+        said_tail(&asks)
+            .as_deref()
+            .map(|s| s.ends_with("Shall I go on?")),
+        Some(true)
+    );
+    let mut tooled = rows.clone();
+    tooled.insert(at + 1, "  ✓  Shell  ls → done".to_string());
+    assert_eq!(said_tail(&tooled), None);
+}
+
+/// Esc in a turn ends it on `ℹ Request cancelled.`: idle as evidence, and
+/// the PERSON's — the next message is theirs; no last words, no wall.
+/// NEGATIVE CONTROLS: a turn that ended by itself is not interrupted; nor is
+/// one whose cancel a newer message answered, nor a reply that says the
+/// words.
+#[test]
+fn an_interrupted_turn_is_the_persons() {
+    let r = gemini(INTERRUPTED);
+    assert_eq!((r.phase, r.phase_authoritative), (Phase::Idle, true));
+    assert!(r.interrupted);
+    assert_eq!((r.said_tail, r.wall), (None, None));
+    assert!(!gemini(END_OF_TURN).interrupted, "the control");
+
+    let rows = screen(INTERRUPTED);
+    let at = rows
+        .iter()
+        .position(|r| r == "ℹ Request cancelled.")
+        .expect("the cancel row");
+    let band = |text: &str| {
+        [
+            "▄".repeat(144),
+            format!(" > {text}"),
+            "▀".repeat(144),
+            "✦ Done again.".to_string(),
+        ]
+    };
+    let mut answered = rows.clone();
+    answered.splice(at + 1..at + 1, band("again, shorter"));
+    assert!(!interrupted(&answered), "a newer message answered it");
+    assert_eq!(said_tail(&answered).as_deref(), Some("Done again."));
+    let quoted = edited(&rows, "ℹ Request cancelled.", "✦ Request cancelled.");
+    assert!(!interrupted(&quoted), "the words in a reply");
+}
+
+/// A NARROW PANE (measured at 72 columns, a `GEMINI.md` loaded): the context
+/// summary stands on a row of its own under a blank, four rows between the
+/// rule and the band, and the status row never says `? for shortcuts` — so
+/// its rest is a blank status row over an empty composer: idle as evidence,
+/// and its turn's end too, with its wrapped reply; its draft is idle with
+/// its text, its spinner busy, and every screen is Gemini CLI's by its
+/// layout. The wide pane with the summary on the mode's row is read as
+/// before. NEGATIVE CONTROLS: a status row of words this grammar has not
+/// measured over an empty composer is no evidence, in either width; a band
+/// row between the rule and the band unmakes the composer; and a rule with
+/// five rows under it is none of its (four, a wrapped summary's, still is).
+#[test]
+fn a_narrow_pane_is_read_without_its_shortcuts_hint() {
+    for (what, text) in [("narrow", NARROW_IDLE), ("wide", IDLE_CONTEXT)] {
+        let r = gemini(text);
+        assert_eq!(
+            (r.phase, r.phase_authoritative),
+            (Phase::Idle, true),
+            "{what}"
+        );
+        let (caret, lines) = r.composer.expect("the composer");
+        assert_eq!(lines, [""], "{what}: the placeholder is no draft");
+        assert!(screen(text)[caret].starts_with(" > "), "{what}");
+        assert_eq!(
+            identify(Some("node"), &screen(text)).program(),
+            Program::Gemini,
+            "{what}"
+        );
+        assert!(r.said_tail.is_none() && r.prompt.is_none(), "{what}");
+    }
+    let draft = gemini(NARROW_DRAFT);
+    assert_eq!(
+        (draft.phase, draft.phase_authoritative),
+        (Phase::Idle, true)
+    );
+    assert_eq!(
+        draft.composer.map(|(_, l)| l),
+        Some(vec!["count in a narrow pane".to_string()])
+    );
+    let busy = gemini(NARROW_BUSY);
+    assert_eq!((busy.phase, busy.phase_authoritative), (Phase::Busy, true));
+    let ended = gemini(NARROW_END_OF_TURN);
+    assert_eq!(
+        (ended.phase, ended.phase_authoritative),
+        (Phase::Idle, true)
+    );
+    assert!(
+        ended
+            .said_tail
+            .as_deref()
+            .is_some_and(|t| t.starts_with("tick 16") && t.ends_with("tick 30")),
+        "{:?}",
+        ended.said_tail
+    );
+    for text in [NARROW_IDLE, NARROW_DRAFT, NARROW_BUSY, NARROW_END_OF_TURN] {
+        assert_eq!(
+            identify(Some("node"), &screen(text)).program(),
+            Program::Gemini,
+            "{:?}",
+            provenance(text)
+        );
+    }
+
+    for text in [IDLE, NARROW_IDLE] {
+        let rows = screen(text);
+        let at = status_at(&rows);
+        let mut tipped = rows.clone();
+        tipped[at] = " Tip: a tip this grammar never read".to_string();
+        assert_eq!(
+            phase(&tipped),
+            (Phase::Idle, false),
+            "{:?}",
+            provenance(text)
+        );
+    }
+
+    let narrow = screen(NARROW_IDLE);
+    let rule = narrow
+        .iter()
+        .rposition(|r| plain_rule_width(r).is_some())
+        .expect("the rule");
+    let mut banded = narrow.clone();
+    banded[rule + 2] = "▀".repeat(72);
+    assert!(
+        composer_draft(&banded).is_none(),
+        "a band row under the rule"
+    );
+    let mut far = narrow.clone();
+    far.splice(rule + 1..rule + 1, [String::new(), String::new()]);
+    assert!(composer_draft(&far).is_none(), "five rows between");
+    let mut wrapped = narrow.clone();
+    wrapped.insert(rule + 1, String::new());
+    assert!(composer_draft(&wrapped).is_some(), "four rows between");
+}
+
+/// A box the PERSON refused with Esc (`No, suggest changes (esc)`, measured
+/// under a supervised lab) ends the turn as Esc in a turn does: the tool's
+/// row marked `-` in its own small box, then `ℹ Request cancelled.` — idle as
+/// evidence, the person's, no last words and no wall, and no box up.
+/// NEGATIVE CONTROLS: the same screen with the cancel row gone is no
+/// person's stop; and the box it refused, read before the Esc, is a box.
+#[test]
+fn a_box_refused_with_esc_is_the_persons_stop() {
+    let r = gemini(BOX_DENIED);
+    assert_eq!((r.phase, r.phase_authoritative), (Phase::Idle, true));
+    assert!(r.interrupted);
+    assert_eq!((r.said_tail, r.wall, r.prompt), (None, None, None));
+    assert_eq!(
+        identify(Some("node"), &screen(BOX_DENIED)).program(),
+        Program::Gemini
+    );
+    let rows = screen(BOX_DENIED);
+    let last = rows
+        .iter()
+        .rposition(|r| r == "ℹ Request cancelled.")
+        .expect("the cancel row");
+    let mut uncancelled = rows.clone();
+    uncancelled[last] = String::new();
+    assert!(!interrupted(&uncancelled), "the control");
+    assert_eq!(gemini(BOX_SHELL).phase, Phase::Prompt, "the box before it");
+}
+
+/// `/` opens the command menu under the composer's band: the composer is
+/// still the composer, its draft the `/`, and no box is up, but nothing is
+/// evidence — the menu stands where the footer did. NEGATIVE CONTROL: the
+/// menu's rows gone and the footer back under the band, the same draft is
+/// idle as evidence.
+#[test]
+fn the_command_menu_is_no_box_and_no_evidence() {
+    let r = gemini(SLASH_MENU);
+    let rows = screen(SLASH_MENU);
+    assert_eq!(r.composer, Some((caret_at(&rows), vec!["/".to_string()])));
+    assert_eq!(r.prompt, None);
+    assert_eq!((r.phase, r.phase_authoritative), (Phase::Idle, false));
+    let bottom = caret_at(&rows) + 1;
+    let footer = rows
+        .iter()
+        .position(|r| r.contains(anchor_text("gemini.footer.workspace")))
+        .expect("the footer");
+    let mut closed = rows[..=bottom].to_vec();
+    closed.extend_from_slice(&rows[footer..]);
+    assert_eq!(phase(&closed), (Phase::Idle, true), "the control");
+}
+
+/// Every box's span runs from its TITLE row to its last row, as every
+/// reader's does ([`PromptV2::span`]): the row a press or an answer is
+/// fenced on where no row of its own is named — the tool's row, the trust
+/// dialog's question, the question dialog's and the usage limit's title —
+/// never the round top border every box of that width shares. NEGATIVE
+/// CONTROL: that border stands above the span, outside it.
+#[test]
+fn every_box_span_opens_on_its_title_row() {
+    for (fixture, title) in [
+        (BOX_SHELL, "│ ? Shell  touch lab-probe.txt"),
+        (
+            BOX_SHELL_REDIRECTION,
+            "│ ? Shell  env | cut -d= -f1 | sort > envnames.txt",
+        ),
+        (BOX_WRITE, "│ ? WriteFile  Writing to lab-write.txt"),
+        (BOX_EDIT, "│ ? Edit  lab-write.txt: written by the lab stub"),
+        (QUESTION, "│ Answer Questions"),
+        (LIMIT_DIALOG, "│ Usage limit reached for gemini-3.5-flash."),
+        (TRUST, "│ Do you trust the files in this folder?"),
+    ] {
+        let rows = screen(fixture);
+        let p = prompt(&rows).expect("the box");
+        let (top, bottom) = p.span;
+        assert!(rows[top].trim_start().starts_with(title), "{:?}", rows[top]);
+        assert_eq!(bottom, rows.len() - 1, "{title}");
+        let border = rows[..top]
+            .iter()
+            .rposition(|r| r.trim_start().starts_with('╭'))
+            .expect("the top border");
+        assert!(
+            rows[border + 1..top]
+                .iter()
+                .all(|r| crate::text::trim(r).trim_matches('│').trim().is_empty()),
+            "only blank rows between the border and {title}"
+        );
+    }
+}
+
+/// The shell box for a command with a REDIRECTION draws a warning under its
+/// question (`Redirection detected. To auto-accept, press Shift+Tab`,
+/// captured under the lab): it is the same Bash prompt, its question the
+/// row over the warning, its options' roles the shell box's. NEGATIVE
+/// CONTROL: any other row in the warning's place leaves the box unnamed by
+/// its question (a kind this grammar does not read, `Other`).
+#[test]
+fn a_shell_box_with_a_redirection_warning_is_still_the_shell_box() {
+    let rows = screen(BOX_SHELL_REDIRECTION);
+    let p = prompt(&rows).expect("the box");
+    assert_eq!(p.kind, PromptKind::Bash);
+    assert_eq!(p.command, "env | cut -d= -f1 | sort > envnames.txt");
+    assert!(
+        p.question
+            .is_some_and(|q| rows[q].contains("Allow execution of [Shell]?")),
+        "{:?}",
+        p.question
+    );
+    assert_eq!(roles(&p), vec![Role::Once, Role::Persist, Role::Deny]);
+    let other = edited(
+        &rows,
+        "│ Redirection detected.",
+        &rows
+            .iter()
+            .find(|r| r.starts_with("│ Redirection detected."))
+            .expect("the warning")
+            // The same width, so the row stays inside the box.
+            .replacen("Redirection detected.", "Something else noted.", 1),
+    );
+    let p = prompt(&other).expect("still a box");
+    assert_eq!((p.kind, p.question), (PromptKind::Other, None));
+}
+
+/// The shell tool's box: a Bash prompt for the command in the box drawn
+/// inside it, its three options by their roles — `Allow once` the one-shot,
+/// `Allow for this session` a standing grant ([`Role::Persist`]: every later
+/// command of the same root), `No, suggest changes (esc)` the refusal and the
+/// box's Esc — the first focused, chosen by digit. It replaces the live zone:
+/// no composer, no wall. NEGATIVE CONTROLS: a second cursor, or a gap in the
+/// numbering, and no option carries a role.
+#[test]
+fn the_shell_box_is_a_bash_prompt_with_its_roles() {
+    let r = gemini(BOX_SHELL);
+    assert_eq!((r.phase, r.phase_authoritative), (Phase::Prompt, true));
+    assert_eq!((r.composer, r.wall), (None, None));
+    let p = r.prompt.expect("the box");
+    let rows = screen(BOX_SHELL);
+    assert_eq!(p.kind, PromptKind::Bash);
+    assert_eq!(p.title, "Shell  touch lab-probe.txt");
+    assert_eq!(p.command, "touch lab-probe.txt");
+    assert_eq!(p.readings(), vec!["touch lab-probe.txt".to_string()]);
+    assert_eq!(roles(&p), vec![Role::Once, Role::Persist, Role::Deny]);
+    assert_eq!(
+        labels(&p),
+        vec![
+            anchor_text("gemini.box.once"),
+            anchor_text("gemini.box.session"),
+            anchor_text("gemini.box.deny")
+        ]
+    );
+    assert_eq!(p.focused().map(|o| o.n), Some(Some(1)));
+    assert_eq!(p.select, Select::Digits);
+    assert!(
+        p.question
+            .is_some_and(|q| rows[q].contains("Allow execution of [Shell]?"))
+    );
+    let cancel = p.cancel.expect("esc");
+    assert_eq!(
+        (cancel.verb.as_str(), cancel.effect),
+        ("No, suggest changes", CancelEffect::Reject)
+    );
+    assert_eq!(p.span.1, rows.len() - 1, "the box is the last thing drawn");
+
+    let two = rows
+        .iter()
+        .position(|r| r.contains("  2. Allow for this session"))
+        .expect("option 2");
+    let mut cursors = rows.clone();
+    cursors[two] = rows[two].replacen("  2.", "● 2.", 1);
+    let p = prompt(&cursors).expect("still a box");
+    assert!(
+        roles(&p).iter().all(|&r| r == Role::Other),
+        "{:?}",
+        roles(&p)
+    );
+    let mut gap = rows.clone();
+    gap[two] = rows[two].replacen("2.", "5.", 1);
+    let p = prompt(&gap).expect("still a box");
+    assert!(
+        roles(&p).iter().all(|&r| r == Role::Other),
+        "{:?}",
+        roles(&p)
+    );
+}
+
+/// The file boxes: `WriteFile` is a Write prompt and `Edit` an Edit prompt,
+/// each for the file its title names, both asking `Apply this change?` over
+/// four options — `Modify with external editor` [`Role::Other`], since it
+/// opens an editor, and `Allow for this session` [`Role::Persist`], since on
+/// a file box it switches the session to accepting every edit. NEGATIVE
+/// CONTROLS: Claude Code's and agy's readers see no box on either, and the
+/// same box asking another question is named by nothing.
+#[test]
+fn the_file_boxes_are_write_and_edit_prompts() {
+    for (text, kind) in [(BOX_WRITE, PromptKind::Write), (BOX_EDIT, PromptKind::Edit)] {
+        let r = gemini(text);
+        let what = provenance(text).unwrap_or_default();
+        assert_eq!((r.phase, r.phase_authoritative), (Phase::Prompt, true));
+        let p = r.prompt.expect("the box");
+        assert_eq!(p.kind, kind, "{what}");
+        assert_eq!(
+            (p.path.as_deref(), p.command.as_str()),
+            (Some("lab-write.txt"), "lab-write.txt"),
+            "{what}"
+        );
+        assert_eq!(
+            roles(&p),
+            vec![Role::Once, Role::Persist, Role::Other, Role::Deny],
+            "{what}"
+        );
+        assert_eq!(labels(&p)[2], anchor_text("gemini.box.editor"));
+        let rows = screen(text);
+        assert_eq!(ClaudeReader.prompt(&rows), None, "the control");
+        assert_eq!(AgyReader.prompt(&rows), None, "the control");
+        let asked = edited(
+            &rows,
+            "│ Apply this change?",
+            &rows[rows
+                .iter()
+                .rposition(|r| r.starts_with("│ Apply this change?"))
+                .expect("the question")]
+            .replacen("Apply this change?", "Apply these edits?", 1),
+        );
+        let p = prompt(&asked).expect("still a box");
+        assert_eq!(p.kind, PromptKind::Other);
+        assert_eq!(roles(&p)[0], Role::Once, "its one-shot still names it");
+    }
+}
+
+/// The ask-the-user tool's dialog: a Question prompt, its question the row
+/// under `Answer Questions`, the model's answers [`Role::Answer`] (their
+/// descriptions under them no options) and `Enter a custom value` (the
+/// person's own words) [`Role::Other`], chosen by digit, its key row's `Esc
+/// to cancel` leaving it unanswered. NEGATIVE CONTROLS: Claude Code's reader
+/// sees no question on it, and once answered the dialog's `✓ Ask User` box
+/// is transcript — no box, and the reply under it is the turn's last words.
+#[test]
+fn the_question_tool_is_a_question_with_answers() {
+    let r = gemini(QUESTION);
+    assert_eq!((r.phase, r.phase_authoritative), (Phase::Prompt, true));
+    let p = r.prompt.expect("the question");
+    assert_eq!(p.kind, PromptKind::Question);
+    assert_eq!(p.title, anchor_text("gemini.question.title"));
+    assert_eq!(p.description, "Which colour should the lab probe use?");
+    assert_eq!(labels(&p), vec!["Red", "Blue", "Enter a custom value"]);
+    assert_eq!(roles(&p), vec![Role::Answer, Role::Answer, Role::Other]);
+    assert_eq!(p.select, Select::Digits);
+    let cancel = p.cancel.expect("esc");
+    assert_eq!(
+        (cancel.verb.as_str(), cancel.effect),
+        ("cancel", CancelEffect::Back)
+    );
+    assert!(
+        p.footer
+            .as_deref()
+            .is_some_and(|f| f.starts_with(anchor_text("gemini.question.keys")))
+    );
+    let rows = screen(QUESTION);
+    assert!(!matches!(
+        ClaudeReader.phase(&rows),
+        Phase::Prompt | Phase::Question
+    ));
+
+    let answered = gemini(QUESTION_ANSWERED);
+    assert_eq!(answered.prompt, None);
+    assert_eq!(
+        (answered.phase, answered.phase_authoritative),
+        (Phase::Idle, true)
+    );
+    assert_eq!(answered.said_tail.as_deref(), Some("Tool call done."));
+}
+
+/// THE PER-DAY QUOTA'S DIALOG IS A BOX, NOT A WALL (module header): a
+/// [`PromptKind::UsageLimit`] box in place of the composer, read as a
+/// prompt with no wall, and neither `Keep trying` nor `Stop` has a role any
+/// rule presses. Answered `Stop`, the turn ends on `✕ [API Error: An unknown
+/// error occurred.]`: an API error with no status, which the CLI does not
+/// retry. NEGATIVE CONTROL: its title reworded, the box is named by nothing,
+/// and its options still carry no role.
+#[test]
+fn the_usage_limit_dialog_is_a_box_with_nothing_to_press() {
+    let r = gemini(LIMIT_DIALOG);
+    assert_eq!((r.phase, r.phase_authoritative), (Phase::Prompt, true));
+    assert_eq!((r.wall, r.composer), (None, None));
+    let p = r.prompt.expect("the dialog");
+    assert_eq!(p.kind, PromptKind::UsageLimit);
+    assert!(p.title.starts_with(anchor_text("gemini.usage.title")));
+    assert_eq!(labels(&p), vec![anchor_text("gemini.usage.retry"), "Stop"]);
+    assert_eq!(roles(&p), vec![Role::Other, Role::Other]);
+    assert_eq!(p.cancel, None);
+
+    let stopped = gemini(LIMIT_STOPPED);
+    assert_eq!(
+        (stopped.phase, stopped.phase_authoritative),
+        (Phase::Idle, true)
+    );
+    let w = stopped.wall.expect("the error row");
+    assert_eq!(
+        w.kind,
+        WallKind::ApiError {
+            code: None,
+            retryable: false,
+            cause: ApiCause::Server
+        }
+    );
+    assert_eq!(w.message, "[API Error: An unknown error occurred.]");
+
+    let rows = screen(LIMIT_DIALOG);
+    let renamed = edited(
+        &rows,
+        "│ Usage limit reached",
+        &rows[rows
+            .iter()
+            .position(|r| r.starts_with("│ Usage limit reached"))
+            .expect("the title")]
+        .replacen("Usage limit reached", "Quota exhausted xxx", 1),
+    );
+    let p = prompt(&renamed).expect("still a box");
+    assert_eq!(p.kind, PromptKind::Other);
+    assert!(roles(&p).iter().all(|&r| r == Role::Other));
+}
+
+/// The folder-trust dialog of a first run is a box no typing answers: a
+/// Trust prompt, `Trust folder (<dir>)` the trust, `Trust parent folder
+/// (<parent>)` a wider standing grant, `Don't trust` the refusal, chosen by
+/// digit; its Esc quits the program and is drawn nowhere, so none is
+/// offered. NEGATIVE CONTROLS: Claude Code's reader, whose own trust dialog
+/// asks in other words, sees no box on it; with two cursors no option
+/// carries a role.
+#[test]
+fn the_trust_dialog_is_a_trust_prompt() {
+    let r = gemini(TRUST);
+    assert_eq!((r.phase, r.phase_authoritative), (Phase::Prompt, true));
+    assert_eq!(r.composer, None);
+    let p = r.prompt.expect("the dialog");
+    assert_eq!(p.kind, PromptKind::Trust);
+    assert_eq!(p.description, anchor_text("gemini.trust.title"));
+    assert_eq!(
+        labels(&p),
+        vec![
+            "Trust folder (proj)",
+            "Trust parent folder (at.7EJB)",
+            "Don't trust"
+        ]
+    );
+    assert_eq!(roles(&p), vec![Role::Trust, Role::Persist, Role::Deny]);
+    assert_eq!(p.select, Select::Digits);
+    assert_eq!(p.cancel, None);
+    let rows = screen(TRUST);
+    assert_eq!(ClaudeReader.prompt(&rows), None, "the control");
+    let both = edited(
+        &rows,
+        " │   3. Don't trust",
+        &rows[rows
+            .iter()
+            .position(|r| r.starts_with(" │   3. Don't trust"))
+            .expect("option 3")]
+        .replacen("  3.", "● 3.", 1),
+    );
+    let p = prompt(&both).expect("still a box");
+    assert!(roles(&p).iter().all(|&r| r == Role::Other));
+}
+
+/// AN API ERROR ROW IS THE TURN'S WALL: the 401 and the 400 Google answers
+/// a key that is no key are the login ([`WallKind::Auth`]), their JSON read
+/// across the rows it wrapped onto (mid-token); the message is the row and
+/// its wrap, joined. Idle as evidence, no last words. NEGATIVE CONTROLS: a
+/// reply under the error is a turn that went on; a 400 with another reason
+/// and a 503 are API errors, the 503 retryable; the error read while a turn
+/// runs is no wall.
+#[test]
+fn an_api_error_row_is_the_turns_wall() {
+    for text in [ERROR_401, ERROR_400_KEY] {
+        let r = gemini(text);
+        let what = provenance(text).unwrap_or_default();
+        assert_eq!(
+            (r.phase.clone(), r.phase_authoritative),
+            (Phase::Idle, true),
+            "{what}"
+        );
+        assert_eq!(r.said_tail, None, "{what}");
+        let w = r.wall.expect("the wall");
+        assert_eq!(w.kind, WallKind::Auth, "{what}");
+        assert_eq!(w.placement, Placement::ErrorRow);
+        assert!(w.message.starts_with("[API Error: {"), "{}", w.message);
+        assert!(w.message.ends_with("}}]"), "{}", w.message);
+        let rows = screen(text);
+        assert!(
+            rows[w.row + 1..]
+                .iter()
+                .any(|r| r.contains(anchor_text("gemini.error.failed"))),
+            "{what}"
+        );
+        let mut replied = rows.clone();
+        replied.insert(status_at(&rows), "✦ Retrying now.".to_string());
+        assert_eq!(wall(&replied), None, "{what}");
+        assert_eq!(said_tail(&replied).as_deref(), Some("Retrying now."));
+        let mut running = rows.clone();
+        let status = status_at(&rows);
+        running[status] = " ⠏ Thinking... (esc to cancel, 1s)".to_string();
+        assert_eq!(wall(&running), None, "{what}");
+    }
+    assert_eq!(
+        error_kind(
+            r#"[API Error: {"error":{"code":400,"message":"bad","status":"INVALID_ARGUMENT"}}]"#
+        ),
+        WallKind::ApiError {
+            code: Some(400),
+            retryable: false,
+            cause: ApiCause::Server
+        }
+    );
+    assert_eq!(
+        error_kind(r#"[API Error: {"error":{"code":503,"status":"UNAVAILABLE"}}]"#),
+        WallKind::ApiError {
+            code: Some(503),
+            retryable: true,
+            cause: ApiCause::Server
+        }
+    );
+    assert_eq!(
+        error_kind("[API Error: {\"error\":{\"co\n  de\":401}}]"),
+        WallKind::Auth,
+        "a code the wrap cut"
+    );
+}
+
+/// AN ERROR'S NOTICE WRAPS in a pane narrower than its line (measured at 72
+/// columns: `ℹ This request failed. …` over `  change "Error Verbosity" …`),
+/// and the error is the turn's wall all the same: the `Stop` a usage limit
+/// left, a non-retryable API error, idle as evidence. NEGATIVE CONTROLS: an
+/// indented row under a blank, with no notice over it, is no notice's, and
+/// a reply under the notice is a turn that went on.
+#[test]
+fn an_error_whose_notice_wrapped_is_still_the_wall() {
+    let r = gemini(NARROW_LIMIT_STOPPED);
+    assert_eq!((r.phase, r.phase_authoritative), (Phase::Idle, true));
+    assert_eq!(
+        r.wall.map(|w| (w.kind, w.message)),
+        Some((
+            WallKind::ApiError {
+                code: None,
+                retryable: false,
+                cause: ApiCause::Server
+            },
+            "[API Error: An unknown error occurred.]".to_string()
+        ))
+    );
+    let rows = screen(NARROW_LIMIT_STOPPED);
+    let notice = rows
+        .iter()
+        .position(|r| r.starts_with("ℹ This request failed."))
+        .expect("the notice");
+    assert!(rows[notice + 1].starts_with("  change "), "its wrap");
+    let mut stray = rows.clone();
+    stray.insert(notice + 2, String::new());
+    stray.insert(notice + 3, "  a row of nobody's".to_string());
+    assert_eq!(wall(&stray), None, "an indented row under a blank");
+    let mut replied = rows.clone();
+    replied.insert(notice + 2, "✦ Went on.".to_string());
+    assert_eq!(wall(&replied), None, "a reply under it");
+}
+
+/// `/quit`: the farewell box, the resume line inside it, and the shell's
+/// prompt under it. Gemini CLI has left: no composer, no box (the farewell
+/// offers nothing to choose, so even drawn last it is none), no evidence,
+/// and the screen names no program. NEGATIVE CONTROL: the shell's rows cut
+/// away, the farewell is the last thing drawn, and still no box.
+#[test]
+fn an_exited_gemini_is_read_as_nothing() {
+    let r = gemini(EXIT);
+    assert_eq!((r.phase, r.phase_authoritative), (Phase::Idle, false));
+    assert_eq!((r.composer, r.prompt), (None, None));
+    let rows = screen(EXIT);
+    assert_eq!(identify(None, &rows).program(), Program::Generic);
+    assert!(
+        rows.iter()
+            .any(|r| r.contains(anchor_text("gemini.exit.resume")))
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.contains(anchor_text("gemini.exit.farewell")))
+    );
+    let last = rows
+        .iter()
+        .rposition(|r| r.starts_with('╰'))
+        .expect("the farewell's bottom");
+    let cut = rows[..=last].to_vec();
+    assert!(gemini_box(&cut).is_some(), "drawn last");
+    assert_eq!(prompt(&cut), None);
+    assert_eq!(phase(&cut), (Phase::Idle, false));
+}
+
+/// A box whose head scrolled off the rows read is named by nothing (an Other
+/// prompt, its head off the screen), and its options take the approval
+/// boxes' roles where `Allow once` is among them. NEGATIVE CONTROL: with no
+/// `Allow once` among them, no option carries a role.
+#[test]
+fn a_box_whose_head_scrolled_off_is_named_by_its_one_shot_allow() {
+    let rows = screen(BOX_SHELL);
+    let at = rows
+        .iter()
+        .position(|r| r.starts_with("│ Allow execution of"))
+        .expect("the question");
+    let cut = rows[at..].to_vec();
+    assert_eq!(phase(&cut), (Phase::Prompt, true));
+    let p = prompt(&cut).expect("still a box");
+    assert_eq!((p.kind, p.head_off_screen), (PromptKind::Other, true));
+    assert_eq!(roles(&p), vec![Role::Once, Role::Persist, Role::Deny]);
+    let unnamed = edited(
+        &cut,
+        "│ ● 1. Allow once",
+        &cut[cut
+            .iter()
+            .position(|r| r.starts_with("│ ● 1. Allow once"))
+            .expect("option 1")]
+        .replacen("Allow once", "Allow it  ", 1),
+    );
+    let p = prompt(&unnamed).expect("still a box");
+    assert!(
+        roles(&p).iter().all(|&r| r == Role::Other),
+        "{:?}",
+        roles(&p)
+    );
+}
+
+/// Claude Code's, Codex's, agy's and Muse Code's readers on Gemini CLI's
+/// screens: never a box, never a question.
+#[test]
+fn the_other_readers_see_no_box_and_no_question_on_gemini_screens() {
+    for (name, text) in captures() {
+        let r = screen(&text);
+        for reader in [
+            &ClaudeReader as &dyn ScreenReader,
+            &CodexReader,
+            &AgyReader,
+            &MuseReader,
+        ] {
+            let phase = reader.phase(&r);
+            assert!(
+                !matches!(phase, Phase::Prompt | Phase::Question),
+                "{:?} on {name}: {phase:?}",
+                reader.program()
+            );
+            assert_eq!(reader.prompt(&r), None, "{:?} on {name}", reader.program());
+        }
+    }
+}
+
+/// A shell, a pager or a viewer showing Gemini CLI's screen is not Gemini
+/// CLI: the program's NAME wins. With no name, under `node` (the name its
+/// own process carries) or under `gemini`, EVERY screen it draws names it —
+/// its composer idle, holding a draft, busy, retrying and at a turn's end,
+/// its menu, each box, its question, its usage-limit and trust dialogs, its
+/// error rows — but the screen it left. NEGATIVE CONTROLS: a screen with its
+/// words and no frame names nothing; a shell's name wins over its screen.
+#[test]
+fn a_shell_quoting_gemini_is_not_gemini() {
+    let r = screen(BOX_SHELL);
+    for shell in ["zsh", "-bash", "less", "cat"] {
+        let reading = read(Some(shell), &r, None);
+        assert_eq!(reading.program, Program::Generic, "{shell}");
+        assert_eq!(reading.prompt, None, "{shell}");
+    }
+    let mut named = 0;
+    for (file, text) in captures() {
+        let rows = screen(&text);
+        if text == EXIT {
+            continue;
+        }
+        for name in [None, Some("node"), Some("/opt/homebrew/bin/gemini")] {
+            assert_eq!(
+                identify(name, &rows).program(),
+                Program::Gemini,
+                "{name:?}: {file}"
+            );
+        }
+        assert_eq!(
+            identify(Some("zsh"), &rows).program(),
+            Program::Generic,
+            "the name wins: {file}"
+        );
+        named += 1;
+    }
+    assert_eq!(named, captures().len() - 1, "every capture but the exit");
+    assert!(named >= 22, "the 0.46.0 captures: {named}");
+    let quoted = rows(&[
+        "% grep -h Thinking log.txt",
+        " ⠧ Thinking... (esc to cancel, 3s)",
+        " > think slowly",
+        "%",
+    ]);
+    assert_eq!(identify(None, &quoted).program(), Program::Generic);
+}
+
+/// Gemini CLI is named `gemini`, by its path and arguments too, and its busy
+/// row is the spinner on the status row: exactly one on each busy screen —
+/// in column 1, or in column 0 with the UI details hidden. NEGATIVE
+/// CONTROLS: the idle status row, a reply's row, a frame in column 2, the
+/// blank braille cell and a frame with no blank after it are no spinner row.
+#[test]
+fn gemini_is_named_and_busy_on_its_spinner_row() {
+    assert_eq!(crate::reader::program_of("gemini"), Some(Program::Gemini));
+    assert_eq!(
+        crate::reader::program_of("/opt/homebrew/bin/gemini --resume latest"),
+        Some(Program::Gemini)
+    );
+    assert_eq!(Program::Gemini.product(), "Gemini CLI");
+    for text in [
+        BUSY_THINKING,
+        BUSY_STREAMING,
+        RETRY_503,
+        RETRY_500,
+        DETAILS_HIDDEN_BUSY,
+    ] {
+        let spinners = screen(text).iter().filter(|r| is_spinner_row(r)).count();
+        assert_eq!(spinners, 1, "{}", provenance(text).unwrap_or_default());
+    }
+    assert!(is_spinner_row("⠋ Lab stub thinking (esc to cancel, 1s)"));
+    for row in [
+        &format!("{:>143}", "? for shortcuts"),
+        "✦ tick 16 tick 17 tick 18",
+        "  ⠧ Thinking... (esc to cancel, 3s)",
+        " ⠀ blank braille is no frame",
+        " ⠧Thinking...",
+    ] {
+        assert!(!is_spinner_row(row), "{row}");
+    }
+    assert_eq!(busy_guard(), "^\\s?[\u{2801}-\u{28ff}]\\s\\S");
+}
+
+/// THE OTHER SNIFFS CLAIM NONE OF GEMINI CLI'S SCREENS, so the sniff's order
+/// is no part of naming them: Muse Code's, agy's, Claude Code's (its frame,
+/// and its box parser where it names its own kind) say no on every Gemini
+/// CLI capture. NEGATIVE CONTROL: each
+/// says yes on one capture of its own.
+#[test]
+fn no_other_sniff_claims_a_gemini_screen() {
+    use crate::prompt::{PromptKind, parse_prompt_v2};
+    let names_claude =
+        |r: &[String]| parse_prompt_v2(r).is_some_and(|p| p.kind != PromptKind::Other);
+    for (name, text) in captures() {
+        let r = screen(&text);
+        assert!(!crate::muse::is_muse_screen(&r), "muse: {name}");
+        assert!(!crate::agy::is_agy_screen(&r), "agy: {name}");
+        assert!(
+            !crate::phase::has_composer_frame(&r),
+            "claude frame: {name}"
+        );
+        assert!(!names_claude(&r), "claude box: {name}");
+    }
+    assert!(crate::muse::is_muse_screen(&screen(
+        crate::muse::fixtures::IDLE
+    )));
+    assert!(crate::agy::is_agy_screen(&screen(
+        crate::agy::fixtures::IDLE
+    )));
+    assert!(crate::phase::has_composer_frame(&screen(
+        crate::prompt::fixtures::LAUNCH_REPL_READY
+    )));
+    assert!(names_claude(&screen(crate::prompt::fixtures::TRUST)));
+}
+
+/// Only Gemini CLI draws its caret one column in: every other reader's guard
+/// anchors the caret at column 0 ([`ScreenReader::caret_column`]).
+#[test]
+fn only_gemini_clis_caret_is_one_column_in() {
+    for p in Program::ALL {
+        let want = usize::from(p == Program::Gemini);
+        assert_eq!(p.reader().caret_column(), want, "{p:?}");
+    }
+    assert_eq!(Program::Gemini.reader().caret(), Some('>'));
+    assert!(
+        !Program::Gemini.reader().placeholder(),
+        "taken out by its reader"
+    );
+    assert!(Program::Gemini.reader().paste_guard());
+}
+
+/// THE SNIFF CLAIMS NO OTHER PROGRAM'S SCREEN: over every capture of Claude
+/// Code, agy and Muse Code under `src/fixtures/`, Gemini CLI's layout
+/// test says no, the screen is never identified as Gemini CLI's, and Gemini
+/// CLI's reader reads no box and no composer on it. The control: it says
+/// yes on Gemini CLI's own (but the one it left).
+#[test]
+fn the_gemini_sniff_claims_no_other_programs_screen() {
+    let mut swept = 0;
+    for (name, text) in crate::text::fixture_files() {
+        let r = screen(&text);
+        if name.starts_with("gemini-") {
+            assert_eq!(is_gemini_screen(&r), text != EXIT, "{name}");
+            continue;
+        }
+        swept += 1;
+        assert!(!is_gemini_screen(&r), "{name}");
+        assert_ne!(identify(None, &r).program(), Program::Gemini, "{name}");
+        assert_eq!(prompt(&r), None, "{name}");
+        assert_eq!(composer_draft(&r), None, "{name}");
+    }
+    assert!(swept > 150, "only {swept} other captures");
+}
+
+/// SHELL MODE (`!` typed into the empty composer, measured): Gemini CLI's
+/// screen, named by its layout, but no evidence and no composer — what is
+/// typed there runs as a shell command — and no caret anything is typed
+/// under; its command's run draws no box this reader reads. Left with Esc,
+/// the composer is back at rest as evidence, and the command's `$` band is
+/// the person's last message (the session no longer fresh). NEGATIVE
+/// CONTROLS: the same screen with its caret `>` and its placeholder the
+/// composer's is the composer at rest, as evidence; the left screen with the
+/// `$` band's caret changed is a session with no message yet.
+#[test]
+fn shell_mode_is_geminis_screen_but_no_composer_and_no_evidence() {
+    for text in [SHELL_MODE, SHELL_MODE_DRAFT, SHELL_MODE_RAN] {
+        let what = provenance(text).unwrap_or_default();
+        let rows = screen(text);
+        let r = gemini(text);
+        assert_eq!(
+            (r.phase, r.phase_authoritative),
+            (Phase::Idle, false),
+            "{what}"
+        );
+        assert_eq!((r.composer, r.prompt, r.wall), (None, None, None), "{what}");
+        assert_eq!(Program::Gemini.reader().caret_on(&rows), None, "{what}");
+        assert_eq!(identify(Some("node"), &rows).program(), Program::Gemini);
+    }
+    let rows = screen(SHELL_MODE);
+    let caret = rows
+        .iter()
+        .rposition(|r| r.starts_with(" ! "))
+        .expect("the shell caret");
+    let mut message = rows.clone();
+    message[caret] = " >   Type your message or @path/to/file".to_string();
+    assert_eq!(phase(&message), (Phase::Idle, true), "the control");
+    assert_eq!(
+        composer_draft(&message).map(|(_, l)| l),
+        Some(vec![String::new()])
+    );
+
+    let left = gemini(SHELL_MODE_LEFT);
+    assert_eq!((left.phase, left.phase_authoritative), (Phase::Idle, true));
+    assert_eq!(left.composer.map(|(_, l)| l), Some(vec![String::new()]));
+    assert!(!left.fresh, "the shell command is the person's message");
+    assert_eq!((left.said_tail, left.wall), (None, None));
+    let unsent = edited(
+        &screen(SHELL_MODE_LEFT),
+        " $ ",
+        " % echo lab-shell-$((6*7))",
+    );
+    assert!(fresh(&unsent), "the control: no message yet");
+}
+
+/// YOLO (ctrl+y, measured) draws the composer's caret `*`: the composer all
+/// the same — at rest, with a draft, busy under the spinner and at a turn's
+/// end, its tool run with no box — and a guard on typed text anchors to `*`
+/// there ([`caret_on`]). NEGATIVE CONTROLS: the default composer's caret is
+/// `>`, and a box screen's is `>` too; a `*` band with no rule over it (the
+/// transcript's) is no composer.
+#[test]
+fn yolo_is_a_composer_under_its_own_caret() {
+    for (text, phase_, draft) in [
+        (YOLO_IDLE, Phase::Idle, ""),
+        (YOLO_DRAFT, Phase::Idle, "hello in yolo"),
+        (YOLO_BUSY, Phase::Busy, ""),
+        (YOLO_END_OF_TURN, Phase::Idle, ""),
+        (YOLO_TOOL_RAN, Phase::Idle, ""),
+    ] {
+        let what = provenance(text).unwrap_or_default();
+        let rows = screen(text);
+        let r = gemini(text);
+        assert_eq!((r.phase, r.phase_authoritative), (phase_, true), "{what}");
+        assert_eq!(
+            r.composer.map(|(_, l)| l),
+            Some(vec![draft.to_string()]),
+            "{what}"
+        );
+        assert_eq!(caret_on(&rows), Some('*'), "{what}");
+        assert_eq!(Program::Gemini.reader().caret_on(&rows), Some('*'));
+    }
+    assert!(
+        gemini(YOLO_END_OF_TURN)
+            .said_tail
+            .is_some_and(|t| t.starts_with("tick 16") && t.ends_with("tick 30"))
+    );
+    assert_eq!(
+        gemini(YOLO_TOOL_RAN).said_tail.as_deref(),
+        Some("Tool call done.")
+    );
+    assert_eq!(caret_on(&screen(IDLE)), Some('>'), "the control");
+    assert_eq!(caret_on(&screen(BOX_SHELL)), Some('>'));
+    let top = "▄".repeat(144);
+    let bottom = "▀".repeat(144);
+    let sent = rows(&["✦ Hi.", &top, " * not the composer", &bottom, "╭──╮"]);
+    assert_eq!(composer_draft(&sent), None);
+}
+
+/// THE UI DETAILS HIDDEN (Tab twice, measured, `focusUiEnabled` in the CLI's
+/// state, so it stays across sessions): no rule, mode row or footer — the
+/// status row right over the band, the band the last thing drawn — and still
+/// the composer: at rest under `press tab twice for more` (or a blank row
+/// with the hint off), with a draft under a blank row, busy under the
+/// spinner in column 0, at a turn's end with its last words, under YOLO with
+/// `● YOLO` on the status row and the rule back, or the mode's row alone
+/// over a draft; its box is the shell box. NEGATIVE CONTROLS: a row drawn
+/// under the band (a menu, a list) unmakes it; a status row of words this
+/// grammar has not measured unmakes it; a band whose status row is a reply's
+/// row is the transcript's.
+#[test]
+fn the_composer_with_the_ui_details_hidden_is_read() {
+    for (text, phase_, draft, caret) in [
+        (DETAILS_HIDDEN_IDLE, Phase::Idle, "", '>'),
+        (DETAILS_HIDDEN_DRAFT, Phase::Idle, "a hidden draft", '>'),
+        (DETAILS_HIDDEN_BUSY, Phase::Busy, "", '>'),
+        (DETAILS_HIDDEN_END_OF_TURN, Phase::Idle, "", '>'),
+        (DETAILS_HIDDEN_YOLO_IDLE, Phase::Idle, "", '*'),
+        (
+            DETAILS_HIDDEN_YOLO_DRAFT,
+            Phase::Idle,
+            "yolo hidden draft",
+            '*',
+        ),
+        (HINT_OFF_DETAILS_HIDDEN_IDLE, Phase::Idle, "", '>'),
+    ] {
+        let what = provenance(text).unwrap_or_default();
+        let rows = screen(text);
+        let r = gemini(text);
+        assert_eq!((r.phase, r.phase_authoritative), (phase_, true), "{what}");
+        assert_eq!(
+            r.composer.map(|(_, l)| l),
+            Some(vec![draft.to_string()]),
+            "{what}"
+        );
+        assert_eq!(caret_on(&rows), Some(caret), "{what}");
+        assert_eq!(identify(None, &rows).program(), Program::Gemini, "{what}");
+        assert_eq!(r.prompt, None, "{what}");
+    }
+    assert!(
+        gemini(DETAILS_HIDDEN_END_OF_TURN)
+            .said_tail
+            .is_some_and(|t| t.ends_with("tick 30"))
+    );
+    let boxed = gemini(DETAILS_HIDDEN_BOX_SHELL);
+    assert_eq!(boxed.prompt.map(|p| p.kind), Some(PromptKind::Bash));
+    assert_eq!(boxed.composer, None);
+
+    let rows = screen(DETAILS_HIDDEN_IDLE);
+    let bottom = rows
+        .iter()
+        .rposition(|r| r.starts_with('▀'))
+        .expect("the band");
+    let mut listed = rows[..=bottom].to_vec();
+    listed.push("  /about   Show version info".to_string());
+    assert_eq!(composer_draft(&listed), None, "a row under the band");
+    assert_eq!(phase(&listed), (Phase::Idle, false));
+    let top = bottom - 2;
+    let mut tipped = rows[..=bottom].to_vec();
+    tipped[top - 1] = " Tip: a tip this grammar never read".to_string();
+    assert_eq!(composer_draft(&tipped), None, "unmeasured words");
+    let mut replied = rows[..=bottom].to_vec();
+    replied[top - 1] = "✦ a reply's row".to_string();
+    assert_eq!(composer_draft(&replied), None, "the transcript's band");
+}
+
+/// `ui.showShortcutsHint = false` (measured at 144 columns): the status row
+/// is blank at rest in a wide pane too, and that is the composer's rest, as
+/// evidence — the session continued as any other; busy is the spinner, and
+/// the turn's end is the spinner gone with its last words. NEGATIVE CONTROL:
+/// the same rest with the spinner's words but no spinner glyph is no
+/// evidence.
+#[test]
+fn a_rest_with_the_shortcuts_hint_off_is_evidence() {
+    let idle = gemini(HINT_OFF_IDLE);
+    assert_eq!((idle.phase, idle.phase_authoritative), (Phase::Idle, true));
+    assert_eq!(idle.composer.map(|(_, l)| l), Some(vec![String::new()]));
+    let rows = screen(HINT_OFF_IDLE);
+    assert!(
+        rows[status_at(&rows)].trim().is_empty(),
+        "the blank status row"
+    );
+    let busy = gemini(HINT_OFF_BUSY);
+    assert_eq!((busy.phase, busy.phase_authoritative), (Phase::Busy, true));
+    let ended = gemini(HINT_OFF_END_OF_TURN);
+    assert_eq!(
+        (ended.phase.clone(), ended.phase_authoritative),
+        (Phase::Idle, true)
+    );
+    assert!(ended.said_tail.is_some_and(|t| t.ends_with("tick 30")));
+    let mut worded = rows.clone();
+    worded[status_at(&rows)] = " Lab stub thinking (esc to cancel, 1s)".to_string();
+    assert_eq!(phase(&worded), (Phase::Idle, false), "the control");
+}
+
+/// SEVERAL QUESTIONS (measured, two): each tab is a question box whose
+/// question is the row under the tab row (the tab row its note), and its
+/// options carry NO role — such a dialog is a person's whole (module
+/// header); its review tab, with no numbered option, is a question box with
+/// none, its answers its notes, `Enter to submit · …` its key row; submitted,
+/// the turn ends on the tool's row. NEGATIVE CONTROLS: the one-question
+/// dialog keeps its answers' roles; the review's head reworded is no box.
+#[test]
+fn several_questions_are_read_tab_by_tab_and_left_to_a_person() {
+    for (text, asks) in [
+        (QUESTION_MULTI, "Which colour should the lab probe use?"),
+        (QUESTION_MULTI_SECOND, "How big should the lab probe be?"),
+    ] {
+        let what = provenance(text).unwrap_or_default();
+        let r = gemini(text);
+        assert_eq!((r.phase, r.phase_authoritative), (Phase::Prompt, true));
+        let p = r.prompt.expect("the question");
+        assert_eq!(p.kind, PromptKind::Question, "{what}");
+        assert_eq!(p.description, asks, "{what}");
+        assert!(is_tab_row(&p.notes[0]), "{what}: {:?}", p.notes);
+        assert_eq!(labels(&p).len(), 3, "{what}");
+        assert!(roles(&p).iter().all(|&r| r == Role::Other), "{what}");
+    }
+    let r = gemini(QUESTION_MULTI_REVIEW);
+    assert_eq!((r.phase, r.phase_authoritative), (Phase::Prompt, true));
+    assert_eq!(
+        identify(None, &screen(QUESTION_MULTI_REVIEW)).program(),
+        Program::Gemini
+    );
+    let p = r.prompt.expect("the review");
+    assert_eq!(p.kind, PromptKind::Question);
+    assert!(p.options.is_empty());
+    assert_eq!(p.description, anchor_text("gemini.question.review"));
+    assert!(p.notes.iter().any(|n| n == "Colour → Red"), "{:?}", p.notes);
+    assert!(p.notes.iter().any(|n| n == "Size → Small"), "{:?}", p.notes);
+    assert!(
+        p.footer
+            .as_deref()
+            .is_some_and(|f| f.starts_with(anchor_text("gemini.question.submit")))
+    );
+    let answered = gemini(QUESTION_MULTI_ANSWERED);
+    assert_eq!(
+        (answered.phase, answered.phase_authoritative),
+        (Phase::Idle, true)
+    );
+    assert_eq!(answered.said_tail.as_deref(), Some("Tool call done."));
+
+    let single = gemini(QUESTION).prompt.expect("the question");
+    assert!(single.notes.is_empty());
+    assert_eq!(roles(&single)[0], Role::Answer, "the control");
+    let reworded = edited(
+        &screen(QUESTION_MULTI_REVIEW),
+        "│ Review your answers:",
+        &format!("│ {:<140} │", "Look over your answers:"),
+    );
+    assert_eq!(prompt(&reworded), None, "no option, no review");
+}
+
+/// THE MCP, FETCH AND SANDBOX-EXPANSION BOXES (measured: a local stdio MCP
+/// server, a `web_fetch` call, a shell call naming `additional_permissions`
+/// with no sandbox on): each a box of kind Other, named Gemini CLI's by its
+/// one `Allow once`, read whole — the MCP and fetch boxes' title the tool's
+/// row under `Action Required`, each question kept, the expansion's command
+/// and its `• …` rows — with `Allow once` the one-shot, every `… for this
+/// session` a standing grant and `No, suggest changes (esc)` the refusal.
+/// NEGATIVE CONTROLS: a session label in other words carries no role; the
+/// expansion's question reworded leaves no question read.
+#[test]
+fn the_mcp_fetch_and_expansion_boxes_are_read_whole() {
+    let mcp = gemini(BOX_MCP).prompt.expect("the MCP box");
+    assert_eq!(mcp.kind, PromptKind::Other);
+    assert!(
+        mcp.title.starts_with("lab_echo (lab MCP Server)"),
+        "{}",
+        mcp.title
+    );
+    assert_eq!(
+        mcp.description,
+        "Allow execution of MCP tool \"lab_echo\" from server \"lab\"?"
+    );
+    assert_eq!(
+        roles(&mcp),
+        vec![Role::Once, Role::Persist, Role::Persist, Role::Deny]
+    );
+    assert!(mcp.cancel.is_some());
+    let fetch = gemini(BOX_WEB_FETCH).prompt.expect("the fetch box");
+    assert_eq!(fetch.kind, PromptKind::Other);
+    assert!(
+        fetch.title.starts_with("WebFetch Processing URLs"),
+        "{}",
+        fetch.title
+    );
+    assert_eq!(fetch.description, anchor_text("gemini.box.proceed"));
+    assert_eq!(roles(&fetch), vec![Role::Once, Role::Persist, Role::Deny]);
+    let wide = gemini(BOX_SANDBOX_EXPANSION).prompt.expect("the expansion");
+    assert_eq!(wide.kind, PromptKind::Other);
+    assert_eq!(
+        wide.description,
+        "To run [Shell], allow access to the following?"
+    );
+    assert_eq!(wide.command, "touch lab-sandbox.txt");
+    assert_eq!(
+        wide.notes,
+        vec![
+            "• Network: All Urls",
+            "• Write: /tmp/lab-write",
+            "• Read: /tmp/lab-read"
+        ]
+    );
+    assert_eq!(roles(&wide), vec![Role::Once, Role::Persist, Role::Deny]);
+    for text in [BOX_MCP, BOX_WEB_FETCH, BOX_SANDBOX_EXPANSION] {
+        let rows = screen(text);
+        assert_eq!(identify(None, &rows).program(), Program::Gemini);
+        assert_eq!(phase(&rows), (Phase::Prompt, true));
+    }
+
+    let relabelled = edited(
+        &screen(BOX_MCP),
+        "│   2. Allow tool for this session",
+        &format!("│ {:<140} │", "  2. Allow tool again later"),
+    );
+    let p = prompt(&relabelled).expect("still the box");
+    assert_eq!(p.options[1].role, Role::Other, "the control");
+    let reworded = edited(
+        &screen(BOX_SANDBOX_EXPANSION),
+        "│ To run",
+        &format!("│ {:<140} │", "To go on, widen the sandbox?"),
+    );
+    let p = prompt(&reworded).expect("still a box");
+    assert_eq!((p.question, p.description.as_str()), (None, ""));
+}
+
+/// IN A NARROW PANE, A 401 AND A 403 (measured at 72 columns): each error
+/// wraps over rows two columns in, its notice too, and is still the turn's
+/// wall — the 401 the login, the 403 `PERMISSION_DENIED` (`SERVICE_DISABLED`)
+/// an API error the CLI does not retry. A 404 for the turn's model draws the
+/// usage-limit dialog's sibling, `It seems like you don't have access to
+/// …`: a box of no kind named Gemini CLI's by that row, its message read
+/// whole, neither option pressed; answered `Stop`, an API error with no
+/// status. NEGATIVE CONTROL: the dialog's first row reworded names it no
+/// program's.
+#[test]
+fn narrow_errors_and_the_no_access_dialog() {
+    let r401 = gemini(NARROW_ERROR_401);
+    assert_eq!(r401.wall.map(|w| w.kind), Some(WallKind::Auth));
+    assert_eq!((r401.phase, r401.phase_authoritative), (Phase::Idle, true));
+    let w = gemini(NARROW_ERROR_403).wall.expect("the 403");
+    assert_eq!(
+        w.kind,
+        WallKind::ApiError {
+            code: Some(403),
+            retryable: false,
+            cause: ApiCause::Server
+        }
+    );
+    assert!(w.message.contains("SERVICE_DISABLED"));
+
+    let rows = screen(NARROW_NO_ACCESS);
+    let r = gemini(NARROW_NO_ACCESS);
+    assert_eq!((r.phase, r.phase_authoritative), (Phase::Prompt, true));
+    let p = r.prompt.expect("the dialog");
+    assert_eq!(p.kind, PromptKind::Other);
+    assert!(
+        p.description
+            .starts_with("It seems like you don't have access to gemini-3.5-flash."),
+        "{}",
+        p.description
+    );
+    assert_eq!(labels(&p), vec![anchor_text("gemini.usage.retry"), "Stop"]);
+    assert_eq!(roles(&p), vec![Role::Other, Role::Other]);
+    assert_eq!(identify(None, &rows).program(), Program::Gemini);
+    let stopped = gemini(NARROW_NO_ACCESS_STOPPED).wall.expect("the error");
+    assert_eq!(
+        stopped.kind,
+        WallKind::ApiError {
+            code: None,
+            retryable: false,
+            cause: ApiCause::Server
+        }
+    );
+    let reworded = edited(
+        &rows,
+        "│ It seems like",
+        &format!("│ {:<68} │", "No model for you today."),
+    );
+    assert_ne!(
+        identify(None, &reworded).program(),
+        Program::Gemini,
+        "the control"
+    );
+}
+
+/// A BOX KEPT OVER THE COMPOSER (`ui.collapseDrawerDuringApproval = false`,
+/// measured): the shell box stays in the transcript over a composer still
+/// drawn and focused, its status row blank — with the composer empty, with
+/// a draft typed into it, with that draft queued under the box by an Enter,
+/// and with the UI details hidden too. Each is the PROMPT, as evidence, read
+/// whole (the shell box, its command and options), every option a person's
+/// (the composer has the keys: a digit is typed into it). NEGATIVE CONTROLS:
+/// the same screen with the box blanked out is the composer at rest; the box
+/// with no option under the cursor (a finished tool's box) is no prompt; the
+/// default layout's shell box keeps its roles.
+#[test]
+fn a_box_kept_over_the_composer_is_a_persons_prompt() {
+    for text in [
+        DRAWER_KEPT_BOX_SHELL,
+        DRAWER_KEPT_BOX_SHELL_DRAFT,
+        DRAWER_KEPT_BOX_SHELL_QUEUED,
+        DRAWER_KEPT_DETAILS_HIDDEN_BOX_SHELL,
+    ] {
+        let what = provenance(text).unwrap_or_default();
+        let rows = screen(text);
+        let r = gemini(text);
+        assert_eq!(
+            (r.phase.clone(), r.phase_authoritative),
+            (Phase::Prompt, true),
+            "{what}"
+        );
+        let p = r.prompt.expect("the kept box");
+        assert_eq!(
+            (p.kind, p.command.as_str()),
+            (PromptKind::Bash, "touch lab-drawer.txt"),
+            "{what}"
+        );
+        assert_eq!(
+            labels(&p),
+            vec![
+                anchor_text("gemini.box.once"),
+                anchor_text("gemini.box.session"),
+                anchor_text("gemini.box.deny")
+            ],
+            "{what}"
+        );
+        assert!(p.options[0].focused, "{what}");
+        assert!(roles(&p).iter().all(|&r| r == Role::Other), "{what}");
+        assert_eq!(identify(Some("node"), &rows).program(), Program::Gemini);
+
+        let top = rows
+            .iter()
+            .rposition(|r| r.starts_with('╭'))
+            .expect("the box's top");
+        let bottom = rows
+            .iter()
+            .rposition(|r| r.starts_with('╰'))
+            .expect("the box's bottom");
+        let mut gone = rows.clone();
+        for row in &mut gone[top..=bottom] {
+            row.clear();
+        }
+        assert_eq!(phase(&gone), (Phase::Idle, true), "{what}: the control");
+        assert_eq!(prompt(&gone), None, "{what}");
+        let finished: Vec<String> = rows.iter().map(|r| r.replace("│ ● 1.", "│   1.")).collect();
+        assert_ne!(finished, rows, "{what}");
+        assert_eq!(
+            prompt(&finished),
+            None,
+            "{what}: no option under the cursor"
+        );
+        assert_ne!(phase(&finished).0, Phase::Prompt, "{what}");
+    }
+    let plain = gemini(BOX_SHELL).prompt.expect("the shell box");
+    assert_eq!(
+        roles(&plain),
+        vec![Role::Once, Role::Persist, Role::Deny],
+        "the control"
+    );
+}
+
+/// UNDER ITS OWN SANDBOX (measured outside the lab's jail: its seatbelt,
+/// `GEMINI_SANDBOX=sandbox-exec`, and its per-tool one,
+/// `security.toolSandboxing`, at 144 and 72 columns): the footer's sandbox
+/// column says `current process` or `all tools`, and a fresh session is
+/// still idle as evidence at its empty composer — `? for shortcuts` in a
+/// wide pane, a blank status row in a narrow one; a turn under the seatbelt
+/// is busy on its spinner and ends on its reply. NEGATIVE CONTROLS: the
+/// footer's words put on the status row are words this grammar has not
+/// measured, and say nothing; the busy screen is busy.
+#[test]
+fn a_session_under_its_sandbox_reads_as_without_it() {
+    for (text, says) in [
+        (SANDBOX_IDLE, "current process"),
+        (SANDBOX_TOOLS_IDLE, "all tools"),
+        (SANDBOX_NARROW_IDLE, "current process"),
+        (SANDBOX_TOOLS_NARROW_IDLE, "all tools"),
+    ] {
+        let what = provenance(text).unwrap_or_default();
+        let rows = screen(text);
+        let r = gemini(text);
+        assert_eq!(identify(None, &rows).program(), Program::Gemini, "{what}");
+        assert_eq!(
+            (r.phase.clone(), r.phase_authoritative),
+            (Phase::Idle, true),
+            "{what}"
+        );
+        assert!(r.fresh, "{what}");
+        assert_eq!(
+            r.composer,
+            Some((caret_at(&rows), vec![String::new()])),
+            "{what}"
+        );
+        let footer = rows.len() - 1;
+        assert!(rows[footer].contains(says), "{what}: {:?}", rows[footer]);
+        assert!(
+            rows[footer - 1].contains(anchor_text("gemini.footer.workspace")),
+            "{what}"
+        );
+        let mut moved = rows.clone();
+        moved[status_at(&rows)] = format!(" {says}");
+        assert_eq!(phase(&moved), (Phase::Idle, false), "{what}: the control");
+    }
+    let busy = gemini(SANDBOX_BUSY);
+    assert_eq!((busy.phase, busy.phase_authoritative), (Phase::Busy, true));
+    let ended = gemini(SANDBOX_END_OF_TURN);
+    assert_eq!(
+        (ended.phase.clone(), ended.phase_authoritative),
+        (Phase::Idle, true)
+    );
+    assert_eq!(
+        ended.said_tail.as_deref(),
+        Some(
+            "This reply is streaming slowly from the fake backend so the busy state stays on \
+             screen for a while before it finishes. Done."
+        )
+    );
+    assert!(!ended.interrupted && ended.wall.is_none());
+}
+
+/// A SHELL COMMAND THE SANDBOX DENIED, with nothing offered (measured: a
+/// write outside the project and a `curl` to a non-loopback address under
+/// its seatbelt; the same write once a sandbox expansion was allowed, which
+/// widens nothing the process's own profile denies; a `touch` with both
+/// sandboxes on, whose per-tool `sandbox-exec` cannot apply inside the
+/// other): the tool's row is `✓` — the command ran and exited non-zero, no
+/// tool error — with the denial in its box, and the turn ends on the
+/// model's reply: idle as evidence, its last words the reply, no wall, no
+/// person's stop, no box. NEGATIVE CONTROL: the reply's rows gone, the turn
+/// ends on the tool's box, which is Gemini CLI's own and no last words.
+#[test]
+fn a_command_its_sandbox_denied_ends_the_turn_on_the_reply() {
+    for (text, denial) in [
+        (SANDBOX_DENIED, "Operation not permitted"),
+        (SANDBOX_DENIED_NETWORK, "Couldn't connect to server"),
+        (SANDBOX_RETRY_ALLOWED, "Operation not permitted"),
+        (
+            SANDBOX_NESTED_DENIED,
+            "sandbox-exec: sandbox_apply: Operation not permitted",
+        ),
+    ] {
+        let what = provenance(text).unwrap_or_default();
+        let rows = screen(text);
+        let r = gemini(text);
+        assert_eq!(
+            (r.phase.clone(), r.phase_authoritative),
+            (Phase::Idle, true),
+            "{what}"
+        );
+        assert_eq!((r.wall, r.prompt), (None, None), "{what}");
+        assert!(!r.interrupted && !r.fresh, "{what}");
+        let said = r.said_tail.expect("the reply");
+        assert!(
+            said.starts_with("Done. run_shell_command returned"),
+            "{what}: {said}"
+        );
+        let tool = rows
+            .iter()
+            .rposition(|row| row.starts_with("│ ✓  Shell "))
+            .expect("the tool's row");
+        assert!(
+            rows[tool + 1..tool + 4]
+                .iter()
+                .any(|row| row.contains(denial)),
+            "{what}"
+        );
+        let reply = rows
+            .iter()
+            .rposition(|row| row.starts_with("✦ "))
+            .expect("the reply");
+        let mut unsaid = rows.clone();
+        for row in &mut unsaid[reply..status_at(&rows)] {
+            row.clear();
+        }
+        assert_eq!(said_tail(&unsaid), None, "{what}: the control");
+        assert_eq!(phase(&unsaid), (Phase::Idle, true), "{what}");
+    }
+}
+
+/// THE SANDBOX-EXPANSION BOX OFFERED WITH THE SANDBOX ON (measured: after
+/// the per-tool seatbelt denied a write outside the project, at 144, 100 and
+/// 72 columns, `• Write:` and `• Read:` the directory above the denied path;
+/// before a `curl` runs, `• Network: All Urls`; after the process's seatbelt
+/// denied the write, for the model's next call naming
+/// `additional_permissions`, under the denied call's finished row): each a
+/// box of kind Other named Gemini CLI's by its `Allow once`, read whole —
+/// the command in the box drawn inside it, the question, the `• …` rows as
+/// notes — `Allow once` the one-shot, `Allow for this session` a standing
+/// grant, `No, suggest changes (esc)` the refusal and its Esc, chosen by
+/// digit. NEGATIVE CONTROLS: the box blanked out, the denied call's
+/// finished box above it is no prompt; its question reworded, no question
+/// is read.
+#[test]
+fn the_expansion_box_after_a_denial_is_read_whole() {
+    let write = "touch /Users//Shared/gemini-sandbox-probe.txt";
+    let both = vec!["• Write: /Users//Shared", "• Read: /Users//Shared"];
+    for (text, command, notes) in [
+        (SANDBOX_TOOLS_EXPANSION, write, both.clone()),
+        (SANDBOX_TOOLS_EXPANSION_100, write, both.clone()),
+        (SANDBOX_TOOLS_NARROW_EXPANSION, write, both.clone()),
+        (
+            SANDBOX_TOOLS_NETWORK,
+            "curl --noproxy '*' -sS -m 5 http://192.0.2.1/",
+            vec!["• Network: All Urls"],
+        ),
+        (
+            SANDBOX_RETRY_EXPANSION,
+            write,
+            vec!["• Write: /Users//Shared"],
+        ),
+    ] {
+        let what = provenance(text).unwrap_or_default();
+        let rows = screen(text);
+        let r = gemini(text);
+        assert_eq!(identify(None, &rows).program(), Program::Gemini, "{what}");
+        assert_eq!(
+            (r.phase.clone(), r.phase_authoritative),
+            (Phase::Prompt, true),
+            "{what}"
+        );
+        assert_eq!((r.composer, r.wall), (None, None), "{what}");
+        let p = r.prompt.expect("the box");
+        assert_eq!(p.kind, PromptKind::Other, "{what}");
+        assert_eq!(p.title, format!("Shell  {command}"), "{what}");
+        assert_eq!(p.command, command, "{what}");
+        assert_eq!(
+            p.description, "To run [Shell], allow access to the following?",
+            "{what}"
+        );
+        assert_eq!(p.notes, notes, "{what}");
+        assert_eq!(
+            labels(&p),
+            vec![
+                anchor_text("gemini.box.once"),
+                anchor_text("gemini.box.session"),
+                anchor_text("gemini.box.deny")
+            ],
+            "{what}"
+        );
+        assert_eq!(
+            roles(&p),
+            vec![Role::Once, Role::Persist, Role::Deny],
+            "{what}"
+        );
+        assert_eq!(p.select, Select::Digits, "{what}");
+        assert_eq!(esc(&p), Some(CancelEffect::Reject), "{what}");
+        assert!(
+            rows[p.span.0].contains(&format!("? Shell  {command}")),
+            "{what}"
+        );
+
+        let top = rows
+            .iter()
+            .rposition(|row| row.starts_with('╭'))
+            .expect("the box's top");
+        let mut gone = rows.clone();
+        for row in &mut gone[top..] {
+            row.clear();
+        }
+        assert_eq!(prompt(&gone), None, "{what}: the control");
+        let ask = p.question.expect("its question");
+        let width = rows[ask].chars().count();
+        let mut reworded = rows.clone();
+        reworded[ask] = format!("│ {:<w$} │", "To go on, widen the sandbox?", w = width - 4);
+        let p = prompt(&reworded).expect("still a box");
+        assert_eq!((p.question, p.description.as_str()), (None, ""), "{what}");
+    }
+}
+
+/// A SANDBOX EXPANSION REFUSED WITH ESC (measured). The box the model's own
+/// call raised, and the one a `curl` raised before it ran, end the turn as
+/// every refused box does — the call's row marked `-`, `ℹ Request
+/// cancelled.` — the person's stop. The box the per-tool seatbelt raised
+/// after a real denial does not: the call draws no row, and the CLI sends
+/// the expansion request back to the model as the call's error, so the turn
+/// goes on — a turn's end like any other, at 144, 100 and 72 columns. The
+/// reply's `sandbox_expansion` is the local fake's echo of that error, not
+/// what a model would say. NEGATIVE CONTROLS: the cancel row gone, the first
+/// are no person's stop; a cancel row under the second's reply would make it
+/// one.
+#[test]
+fn a_refused_expansion_is_the_persons_stop_or_the_models_turn() {
+    for text in [SANDBOX_RETRY_REFUSED, SANDBOX_TOOLS_NETWORK_REFUSED] {
+        let what = provenance(text).unwrap_or_default();
+        let r = gemini(text);
+        assert_eq!((r.phase, r.phase_authoritative), (Phase::Idle, true));
+        assert!(r.interrupted, "{what}");
+        assert_eq!((r.said_tail, r.wall, r.prompt), (None, None, None));
+        let rows = screen(text);
+        let cancelled = rows
+            .iter()
+            .rposition(|row| row == "ℹ Request cancelled.")
+            .expect("the cancel row");
+        let mut uncancelled = rows.clone();
+        uncancelled[cancelled] = String::new();
+        assert!(!interrupted(&uncancelled), "{what}: the control");
+    }
+    for text in [
+        SANDBOX_TOOLS_EXPANSION_REFUSED,
+        SANDBOX_TOOLS_EXPANSION_REFUSED_100,
+        SANDBOX_TOOLS_NARROW_EXPANSION_REFUSED,
+    ] {
+        let what = provenance(text).unwrap_or_default();
+        let rows = screen(text);
+        let r = gemini(text);
+        assert_eq!(
+            (r.phase.clone(), r.phase_authoritative),
+            (Phase::Idle, true),
+            "{what}"
+        );
+        assert!(!r.interrupted, "{what}");
+        assert_eq!((r.wall, r.prompt), (None, None), "{what}");
+        assert!(
+            !rows.iter().any(|row| row.contains("Shell touch")),
+            "{what}: no row for the call"
+        );
+        let said = r.said_tail.expect("the reply");
+        assert!(
+            said.starts_with("Done. run_shell_command returned {\"error\"")
+                && said.contains("sandbox_expansion"),
+            "{what}: {said}"
+        );
+        let mut cancelled = rows.clone();
+        cancelled.insert(status_at(&rows), "ℹ Request cancelled.".to_string());
+        assert!(interrupted(&cancelled), "{what}: the control");
+    }
+}

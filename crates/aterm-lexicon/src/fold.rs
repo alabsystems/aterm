@@ -139,20 +139,10 @@ pub fn has_foldable_marks(s: &str) -> bool {
     })
 }
 
-/// A combining mark we DROP during folding (a non-spacing diacritic in a script
-/// whose base letters are written separately). Restricted to the ranges where
-/// stripping is safe: Latin, Greek, Cyrillic, Arabic harakat, Hebrew niqqud.
-/// Deliberately excludes Indic / Thai / SE-Asian spacing marks (category Mc),
-/// which are part of the syllable.
-#[must_use]
-fn is_strippable_mark(c: char) -> bool {
-    // ASCII cannot be a combining mark, and the ranges below say so: the lowest
-    // starts at U+0300. Terminal text is overwhelmingly ASCII and this runs per
-    // character of every folded token.
-    if c.is_ascii() {
-        return false;
-    }
-    matches!(c as u32,
+/// [`is_strippable_mark`]'s ranges, as one pattern: the predicate and the
+/// build's ASCII check below match the same tokens.
+macro_rules! strippable_mark_ranges {
+    () => {
         0x0300..=0x036F   // Combining Diacritical Marks (Latin)
         | 0x0483..=0x0489 // Cyrillic combining
         | 0x0591..=0x05BD // Hebrew points (niqqud)
@@ -171,7 +161,42 @@ fn is_strippable_mark(c: char) -> bool {
         | 0x1DC0..=0x1DFF // Combining Diacritical Marks Supplement
         | 0x20D0..=0x20FF // Combining Diacritical Marks for Symbols
         | 0xFE20..=0xFE2F // Combining Half Marks
-    )
+    };
+}
+
+/// A combining mark we DROP during folding (a non-spacing diacritic in a script
+/// whose base letters are written separately). Restricted to the ranges where
+/// stripping is safe: Latin, Greek, Cyrillic, Arabic harakat, Hebrew niqqud.
+/// Deliberately excludes Indic / Thai / SE-Asian spacing marks (category Mc),
+/// which are part of the syllable.
+#[must_use]
+fn is_strippable_mark(c: char) -> bool {
+    // ASCII cannot be a combining mark, and the table says so: its lowest range
+    // starts at U+0300 (the build checks it, below the tables). Terminal text
+    // is overwhelmingly ASCII and this runs per character of every folded
+    // token.
+    if c.is_ascii() {
+        return false;
+    }
+    matches!(c as u32, strippable_mark_ranges!())
+}
+
+/// [`is_no_space_script`]'s ranges, as one pattern (see
+/// `strippable_mark_ranges`).
+macro_rules! no_space_script_ranges {
+    () => {
+        0x3040..=0x30FF   // Hiragana + Katakana
+        | 0x31F0..=0x31FF // Katakana phonetic extensions
+        | 0x3400..=0x4DBF // CJK Unified Ideographs Extension A
+        | 0x4E00..=0x9FFF // CJK Unified Ideographs
+        | 0xF900..=0xFAFF // CJK Compatibility Ideographs
+        | 0xAC00..=0xD7AF // Hangul syllables
+        | 0x1100..=0x11FF // Hangul Jamo
+        | 0x0E00..=0x0E7F // Thai
+        | 0x0E80..=0x0EFF // Lao
+        | 0x1780..=0x17FF // Khmer
+        | 0x20000..=0x2A6DF // CJK Ext B
+    };
 }
 
 /// True for a character that belongs to a *no-space* script (CJK ideographs,
@@ -185,25 +210,13 @@ fn is_strippable_mark(c: char) -> bool {
 /// the resolver emits it as a `cjk = true` entry instead).
 #[must_use]
 pub fn is_no_space_script(c: char) -> bool {
-    // No ASCII scalar is in a no-space script — the lowest range here starts at
-    // U+0E00 (Thai). This predicate opens `is_token_char`, so it is the FIRST
-    // thing every scanned character meets.
+    // No ASCII scalar is in a no-space script — the table's lowest range starts
+    // at U+0E00 (Thai; the build checks it). This predicate opens
+    // `is_token_char`, so it is the FIRST thing every scanned character meets.
     if c.is_ascii() {
         return false;
     }
-    matches!(c as u32,
-        0x3040..=0x30FF   // Hiragana + Katakana
-        | 0x31F0..=0x31FF // Katakana phonetic extensions
-        | 0x3400..=0x4DBF // CJK Unified Ideographs Extension A
-        | 0x4E00..=0x9FFF // CJK Unified Ideographs
-        | 0xF900..=0xFAFF // CJK Compatibility Ideographs
-        | 0xAC00..=0xD7AF // Hangul syllables
-        | 0x1100..=0x11FF // Hangul Jamo
-        | 0x0E00..=0x0E7F // Thai
-        | 0x0E80..=0x0EFF // Lao
-        | 0x1780..=0x17FF // Khmer
-        | 0x20000..=0x2A6DF // CJK Ext B
-    )
+    matches!(c as u32, no_space_script_ranges!())
 }
 
 /// True for a character that can sit *inside* a whitespace-delimited token: a
@@ -230,6 +243,17 @@ pub fn is_token_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || is_strippable_mark(c) || is_kept_mark(c)
 }
 
+/// [`is_kept_mark`]'s ranges, as one pattern (see `strippable_mark_ranges`).
+macro_rules! kept_mark_ranges {
+    () => {
+        0x0900..=0x097F   // Devanagari (matras, virama)
+        | 0x0980..=0x09FF // Bengali
+        | 0x0B80..=0x0BFF // Tamil
+        | 0x0A00..=0x0A7F // Gurmukhi
+        | 0x0C00..=0x0C7F // Telugu
+    };
+}
+
 /// A spacing/combining mark we KEEP (Indic / Thai etc.) — these are part of the
 /// token but are not stripped by `fold`.
 fn is_kept_mark(c: char) -> bool {
@@ -237,14 +261,29 @@ fn is_kept_mark(c: char) -> bool {
     if c.is_ascii() {
         return false;
     }
-    matches!(c as u32,
-        0x0900..=0x097F   // Devanagari (matras, virama)
-        | 0x0980..=0x09FF // Bengali
-        | 0x0B80..=0x0BFF // Tamil
-        | 0x0A00..=0x0A7F // Gurmukhi
-        | 0x0C00..=0x0C7F // Telugu
-    )
+    matches!(c as u32, kept_mark_ranges!())
 }
+
+/// THE ASCII EARLY-OUTS ARE ONLY SOUND WHILE THE TABLES STAY ABOVE ASCII, and
+/// the hazard is the day someone adds an ASCII codepoint to one of them and the
+/// early-out silently shadows it. Asserting "every ASCII scalar answers false"
+/// of the predicates would be circular (the early-out is what makes it true),
+/// so the build asks the TABLES, early-outs aside, about all 128 ASCII scalars:
+/// a table that grows an ASCII entry stops the compile. The predicates match
+/// the same pattern macros inline, so they call nothing (no obligation the
+/// Trust lane would have to discharge through a callee).
+const _: () = {
+    let mut cp: u32 = 0;
+    while cp < 0x80 {
+        assert!(
+            !matches!(cp, strippable_mark_ranges!())
+                && !matches!(cp, no_space_script_ranges!())
+                && !matches!(cp, kept_mark_ranges!()),
+            "a fold table names an ASCII scalar, which its predicate's early-out would skip"
+        );
+        cp += 1;
+    }
+};
 
 /// ASCII punctuation that signals a *code / path / URL* context rather than
 /// prose. A whole-word match immediately adjacent to one of these is suppressed
@@ -282,26 +321,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fold_lowercases_ascii() {
-        assert_eq!(fold("FuCKing"), "fucking");
-    }
-
-    #[test]
-    fn fold_eszett_to_ss() {
-        assert_eq!(fold("Scheiße"), "scheisse");
-        assert_eq!(fold("SCHEIẞE"), "scheisse");
-    }
-
-    #[test]
-    fn fold_strips_latin_combining() {
-        // "Kätzchen" written decomposed: K a +U+0308 t z c h e n
-        let decomposed = "Ka\u{0308}tzchen";
-        let precomposed = "Kätzchen";
-        assert_eq!(fold(decomposed), fold(precomposed));
-        assert_eq!(fold(decomposed), "katzchen");
-    }
-
-    #[test]
     fn fold_greek_final_sigma() {
         // ΓΑΤΕΣ vs γάτες should both collapse the final sigma
         assert_eq!(fold("γάτες"), fold("γατες"));
@@ -309,9 +328,11 @@ mod tests {
 
     #[test]
     fn fold_is_idempotent() {
-        for s in ["fucking", "Kätzchen", "Scheiße", "猫", "γάτα", "بسة"] {
+        for s in ["fucking", "Kätzchen", "Scheiße", "猫", "γάτα", "بسة", "İ"] {
             assert_eq!(fold(&fold(s)), fold(s), "fold not idempotent for {s}");
         }
+        // 'İ'.to_lowercase() emits 'i' + a combining dot; fold drops the dot.
+        assert_eq!(fold("İ"), fold("i"));
     }
 
     #[test]
@@ -327,52 +348,5 @@ mod tests {
         assert!(is_no_space_script('ね'));
         assert!(is_no_space_script('고'));
         assert!(!is_no_space_script('a'));
-    }
-
-    /// THE EARLY-OUTS ARE ONLY SOUND WHILE THE TABLES STAY ABOVE ASCII, and the
-    /// hazard is not today — it is the day someone adds an ASCII codepoint to
-    /// one of these tables and the early-out silently shadows it.
-    ///
-    /// Asserting "every ASCII scalar answers false" would be CIRCULAR: the
-    /// early-out is what makes it true. So this reads the source of the three
-    /// range tables instead and pins the structural fact the fast paths rest
-    /// on — no scalar below U+0080 is named in any of them. A table that grows
-    /// an ASCII entry fails here rather than going quietly unreachable.
-    #[test]
-    fn every_range_the_ascii_early_outs_skip_lies_above_ascii() {
-        let src = include_str!("fold.rs");
-        for name in [
-            "fn is_strippable_mark",
-            "fn is_kept_mark",
-            "pub fn is_no_space_script",
-        ] {
-            let start = src
-                .find(name)
-                .unwrap_or_else(|| panic!("{name} moved or was renamed"));
-            let body = &src[start..];
-            let end = body.find("\n}").expect("function has a closing brace");
-            let body = &body[..end];
-            let mut seen = 0usize;
-            let mut rest = body;
-            while let Some(at) = rest.find("0x") {
-                rest = &rest[at + 2..];
-                let hex: String = rest.chars().take_while(char::is_ascii_hexdigit).collect();
-                if hex.is_empty() {
-                    continue;
-                }
-                let cp = u32::from_str_radix(&hex, 16).expect("hex literal parses");
-                assert!(
-                    cp >= 0x80,
-                    "{name} names U+{cp:04X}, which is ASCII — the `c.is_ascii()` \
-                     early-out would skip it and this predicate would silently \
-                     stop matching it",
-                );
-                seen += 1;
-            }
-            assert!(
-                seen >= 5,
-                "{name}: found only {seen} codepoints — did the scan break?"
-            );
-        }
     }
 }

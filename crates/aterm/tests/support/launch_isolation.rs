@@ -141,6 +141,29 @@ pub fn prepare(root: &Path) -> std::io::Result<()> {
     )
 }
 
+/// The executable chosen by a private external test collector. An explicit
+/// artifact must be absolute and a regular file; an invalid selection is a
+/// broken fixture, never permission to launch a different build. The collector
+/// attests the owned artifact's hash before and after the test. This test-only
+/// variable is stripped from children by [`apply`].
+pub fn aterm_executable() -> std::path::PathBuf {
+    let Some(selected) = std::env::var_os("ATERM_TEST_EXECUTABLE") else {
+        return Path::new(env!("CARGO_BIN_EXE_aterm")).to_owned();
+    };
+    let selected = std::path::PathBuf::from(selected);
+    assert!(
+        selected.is_absolute(),
+        "ATERM_TEST_EXECUTABLE must name an absolute owned artifact: {selected:?}"
+    );
+    let metadata = std::fs::metadata(&selected)
+        .unwrap_or_else(|error| panic!("ATERM_TEST_EXECUTABLE {selected:?}: {error}"));
+    assert!(
+        metadata.is_file(),
+        "ATERM_TEST_EXECUTABLE must name a regular file: {selected:?}"
+    );
+    selected
+}
+
 pub fn apply(cmd: &mut Command, root: &Path) {
     // Isolated from this process's descriptors as well, before any hook a caller
     // adds: the launch holds its stdio (the lifeline on stdin) and nothing else.
@@ -154,9 +177,9 @@ pub fn apply(cmd: &mut Command, root: &Path) {
     // The aterm under test is a fresh build whose first exec can wait out the
     // system's code-policy check for over a minute: run that file once,
     // unclocked, before the caller's clock starts (`aterm_spec::wait::first_exec`).
-    let aterm = Path::new(env!("CARGO_BIN_EXE_aterm"));
+    let aterm = aterm_executable();
     if Path::new(cmd.get_program()) == aterm {
-        aterm_spec::wait::first_exec(aterm, &["--help"]);
+        aterm_spec::wait::first_exec(&aterm, &["--help"]);
     }
     // Remove both inherited context and explicit command overrides before
     // assigning this fixture's authority. Callers may then add the one setting

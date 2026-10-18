@@ -4,10 +4,9 @@
 
 //! Build-time tier capabilities of this scrollback crate.
 //!
-//! Every build keeps hot (RAM) + warm (LZ4) + LZ4 cold pages; native builds may
-//! add the mmap disk spill. Hosts embedding several engine builds (wasm renderer
-//! panes, native daemon sessions) read this to size budgets and describe
-//! retention per build.
+//! Every build keeps hot (RAM) + warm (LZ4) + LZ4 cold pages, all in memory.
+//! Hosts embedding several engine builds (wasm renderer panes, native daemon
+//! sessions) read this to size budgets and describe retention per build.
 
 /// Codec used for cold-tier pages in this build.
 ///
@@ -27,8 +26,8 @@ pub enum ColdTierCodec {
 pub struct TierCapabilities {
     /// Cold-tier page codec.
     pub cold_codec: ColdTierCodec,
-    /// `disk-tier` feature: mmap-backed cold spill is available
-    /// ([`DiskBackedScrollback`](crate::DiskBackedScrollback)).
+    /// Whether cold pages can spill to disk. Always `false`: the disk tier is
+    /// gone. The field stays so the wire shape (`diskSpill`) is unchanged.
     pub disk_spill: bool,
 }
 
@@ -39,7 +38,7 @@ impl TierCapabilities {
     pub const fn current() -> Self {
         Self {
             cold_codec: ColdTierCodec::Lz4,
-            disk_spill: cfg!(feature = "disk-tier"),
+            disk_spill: false,
         }
     }
 }

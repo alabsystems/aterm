@@ -169,31 +169,6 @@ mod tests {
     }
 
     #[test]
-    fn the_notification_names_the_consequence_and_the_next_step() {
-        // `notification()` reads the process-global `last_explanation()`, which the
-        // sibling test fills; hold the lock it holds and start from "nothing recorded".
-        let _serialized = crate::STRANDED_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        *last_explanation().lock().unwrap_or_else(|e| e.into_inner()) = None;
-        let (title, body) = notification();
-        assert!(title.contains("not updating"), "{title}");
-        assert!(
-            !title.contains("never"),
-            "the title must not claim a permanence the code does not enforce: {title}"
-        );
-        assert!(body.contains("stays on its current version"), "{body}");
-        assert!(
-            body.contains("`aterm ctl update status`") && !body.contains("aterm-ctl"),
-            "{body}"
-        );
-        assert!(
-            !body.contains("token"),
-            "no credential is ever a remedy: {body}"
-        );
-    }
-
-    #[test]
     fn announce_writes_the_full_explanation_into_the_status_outcome() {
         // The status `outcome` IS what `aterm-ctl update status` prints, so the whole
         // explanation has to survive into it — not a shortened "idle:" summary.

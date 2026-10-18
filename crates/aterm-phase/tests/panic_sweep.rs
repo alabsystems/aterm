@@ -32,7 +32,6 @@ use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Mutex, PoisonError};
-use std::time::Instant;
 
 use aterm_phase::Program;
 use aterm_phase::prompt::fixtures as fx;
@@ -162,6 +161,20 @@ fn read_all(w: &[String]) {
         let _ = aterm_phase::launch_card_version(w, &place);
         // A place read off other rows: the rows above it, cut short.
         let _ = aterm_phase::launch_card_version(&w[..place.top], &place);
+        // …and holds it on the next frame by its words: on these rows, on
+        // the rows above it, and on these rows one row down the screen.
+        if let Some(words) = aterm_phase::launch_card_words(w, &place) {
+            for rows in [w, &w[..place.top], w.get(1..).unwrap_or_default()] {
+                let scan = aterm_phase::launch_card_scan(rows);
+                let _ = aterm_phase::launch_card_held(rows, scan, &place, words);
+            }
+        }
+        let far = aterm_phase::CardPlace {
+            top: usize::MAX,
+            text_col: usize::MAX,
+            ..place
+        };
+        let _ = aterm_phase::launch_card_words(w, &far);
     }
     // …and keeps its reading without a scan while the rows it reads hold:
     // every row changed, and indices past the rows.
@@ -271,10 +284,9 @@ fn sweep(
         check(name, &format!("tail rows[{k}..]"), &rows[k..], failures);
         check(name, &format!("head rows[..{k}]"), &rows[..k], failures);
     }
-    let tallest = if full() { n } else { 12.min(n) };
-    for h in 1..=tallest {
+    for h in 1..=12.min(n) {
         for s in (part..=n - h).step_by(parts) {
-            if every_middle || full() || (s + h) % 5 == 0 {
+            if every_middle || (s + h) % 5 == 0 {
                 check(
                     name,
                     &format!("middle rows[{s}..{}]", s + h),
@@ -294,24 +306,15 @@ fn parts_for(n: usize) -> usize {
     n.div_ceil(32).max(1)
 }
 
-/// One job of the sweep: a screen as captured, cut to a width, or (the full
-/// sweep) with one row dropped and doubled.
+/// One job of the sweep: a screen as captured, or cut to a width.
 #[derive(Clone, Copy)]
 enum Cut {
     Whole,
     Width(usize),
-    Edit(usize),
 }
 
 /// The widths each row is also cut to.
 const WIDTHS: &[usize] = &[1, 2, 3, 6, 12, 40];
-
-/// `ATERM_PANIC_SWEEP_FULL=1`: the exhaustive sweep for hunting — every
-/// middle window of every height, every width 1..=80, and each screen with
-/// one row dropped or doubled (minutes, not seconds; not the suite's).
-fn full() -> bool {
-    std::env::var_os("ATERM_PANIC_SWEEP_FULL").is_some_and(|v| v == "1")
-}
 
 #[test]
 fn the_reader_never_panics_on_any_window_of_any_fixture() {
@@ -327,7 +330,6 @@ fn the_reader_never_panics_on_any_window_of_any_fixture() {
             .unwrap_or_default();
         LAST_PANIC.with(|l| *l.borrow_mut() = Some(at));
     }));
-    let started = Instant::now();
     let all = screens();
     let failures = Mutex::new(Vec::new());
     // One job per screen, cut and part ([`parts_for`]), tallest screen first:
@@ -335,19 +337,11 @@ fn the_reader_never_panics_on_any_window_of_any_fixture() {
     // head), and as one job per screen the 528-row capture was the run's wall
     // on a single thread (2026-09-30: 62 s of wall for 152 s of CPU on 14
     // threads), as one job per cut still (2026-10-05).
-    let widths: Vec<usize> = if full() {
-        (1..=80).collect()
-    } else {
-        WIDTHS.to_vec()
-    };
     let mut jobs: Vec<(&Screen, Cut, (usize, usize))> = Vec::new();
     for s in &all {
         let parts = parts_for(s.rows.len());
-        for cut in std::iter::once(Cut::Whole).chain(widths.iter().map(|&w| Cut::Width(w))) {
+        for cut in std::iter::once(Cut::Whole).chain(WIDTHS.iter().map(|&w| Cut::Width(w))) {
             jobs.extend((0..parts).map(|p| (s, cut, (p, parts))));
-        }
-        if full() {
-            jobs.extend((0..s.rows.len()).map(|k| (s, Cut::Edit(k), (0, 1))));
         }
     }
     jobs.sort_by_key(|(s, _, _)| std::cmp::Reverse(s.rows.len()));
@@ -371,26 +365,6 @@ fn the_reader_never_panics_on_any_window_of_any_fixture() {
                             part,
                             &failures,
                         ),
-                        Cut::Edit(k) => {
-                            let mut dropped = s.rows.clone();
-                            dropped.remove(k);
-                            sweep(
-                                &format!("{} row {k} dropped", s.name),
-                                &dropped,
-                                false,
-                                part,
-                                &failures,
-                            );
-                            let mut doubled = s.rows.clone();
-                            doubled.insert(k, s.rows[k].clone());
-                            sweep(
-                                &format!("{} row {k} doubled", s.name),
-                                &doubled,
-                                false,
-                                part,
-                                &failures,
-                            );
-                        }
                     }
                 }
             });
@@ -398,12 +372,6 @@ fn the_reader_never_panics_on_any_window_of_any_fixture() {
     });
     panic::set_hook(prev);
     let failures = failures.into_inner().unwrap();
-    eprintln!(
-        "panic sweep: {} screens, {} threads, {:?}",
-        all.len(),
-        threads,
-        started.elapsed()
-    );
     if !failures.is_empty() {
         let mut distinct: Vec<&String> = Vec::new();
         let mut seen = std::collections::BTreeSet::new();

@@ -36,13 +36,16 @@
 //! can tell it from every other refusal and decide by what it knows. The broker
 //! cannot know whether another producer will ever introduce the subject — after
 //! which the identical request is an update and lands — but the producer often can:
-//! one that is the only writer of its subjects (its own lanes) may retire the record
+//! one that is the only writer of its subjects (its own lanes) may drop the record
 //! for good, while one that shares a subject may wait for it. A broker older than
 //! code 10 answers it with 5.
 //!
 //! One code-8 refusal is told apart by its WORDS, not by a code of its own: an
 //! expired capability's message starts [`CAP_EXPIRED_PREFIX`], and
 //! [`BrokerRefusal::is_expired`](crate::client::BrokerRefusal::is_expired) reads it.
+//! So is one code-5 refusal: every write a POISONED log refuses starts
+//! [`LOG_POISONED_PREFIX`], and
+//! [`BrokerRefusal::is_poisoned`](crate::client::BrokerRefusal::is_poisoned) reads it.
 //!
 //! # The one layout every version keeps
 //!
@@ -53,12 +56,45 @@
 //! that speaks ANOTHER protocol at all: [`encode_protocol_refusal`] stamps this layout
 //! with the PEER's version byte, so the peer's own decoder reads it, whichever version
 //! that is.
+//!
+//! # What the wire says about durability
+//!
+//! Three things, all additive, none spending a request tag, a protocol version or an
+//! error code:
+//!
+//! - **The tier served**: tag 0x01 of the `Hello` answer's extension block
+//!   ([`NonceExt::durability`], [`ServedInfo`]) — the tier asked for, the tier in force
+//!   and why they differ, the Ordered horizon and the escalation table's size. A status
+//!   line on any host reads the tier from the broker, never from how it was started. It
+//!   can change in a running broker in one direction only: a log that latches to Strict
+//!   (a barrier refused, a full flush failed) answers `served = Strict` from then on.
+//! - **The durable head**: [`Response::Mark`]'s optional `durable` trailer, on EVERY
+//!   `Mark` a broker of this build sends — every record below it is on stable media by
+//!   a full flush. It is the in-band proof a reader on another host needs: a `Fetch` head
+//!   query (`max = 0`) answers "is offset `o` durable?" with `durable > o`. An older
+//!   broker sends none; it serves Strict or Relaxed, never Ordered, and the one before
+//!   Ordered says which in its `Hello` block: on Strict read `None` as "durable =
+//!   visible", on Relaxed as "nothing acked since the open (or a clean close) is
+//!   durable". A broker older still sends no block and may serve Relaxed unannounced:
+//!   "durable = visible" holds there only for a reader that knows its broker strict. In
+//!   process the same value is [`Broker::durable_head`](crate::Broker::durable_head).
+//! - **Durable marks**: on a broker that SERVES Ordered, a subscriber that asked for
+//!   idle marks (`Request::IdleMarks`, which `Client::subscribe` negotiates) gets one
+//!   extra `Mark` when a full flush covers records it was delivered and not yet told are
+//!   durable — at most one per such flush. Not on Strict (the durable head is the
+//!   visible head after every batch, so a mark per delivery would say nothing) and not
+//!   on Relaxed (it does not move between opens).
+//!
+//! An escalated record (the broker's escalation table; see
+//! [`Escalation`](crate::Escalation)) never needs any of these to be safe: the broker
+//! holds the visible head at it until its full flush has succeeded, so no reader is ever
+//! delivered, and no producer acked, an escalated record that a power loss can take.
 
 use astream_wire::frame::{MAGIC as FRAME_MAGIC, VERSION as FRAME_VERSION};
 use astream_wire::{crc32_ieee, Frame, FrameError, HEADER_SIZE, MAX_PAYLOAD_LEN};
 use std::io::{self, Read, Write};
 
-use crate::logid::LogIdentity;
+use crate::logid::{Lineage, LogIdentity};
 
 /// Protocol version (the payload's first byte).
 pub const PROTO_VERSION: u8 = 2;
@@ -125,6 +161,33 @@ pub const ERR_UNAUTHORIZED: u8 = 8;
 /// so against such a broker that one refusal reads as not expired.
 pub const CAP_EXPIRED_PREFIX: &str = "unauthorized: capability expired";
 
+/// How every write a POISONED log refuses begins, word for word: an [`ERR_REFUSED`]
+/// refusal of a publish, a commit, a will, a binding or a flush the writer answers
+/// while the log is poisoned ([`BrokerLog::poisoned`](crate::BrokerLog::poisoned)),
+/// followed by the reason in parentheses. No other refusal starts with it.
+///
+/// A poisoned log is a refusal of a kind no resend on this broker cures: a full flush
+/// failed with acked or held records no full flush covers, or a rollback could not put
+/// the file back, and every write is refused until the log is REOPENED — a new open,
+/// which only the embedder can make (exit, and let a supervisor start the broker
+/// again). Code 5 is right for it, because to the producer it is transient: the same
+/// record lands once the log is reopened. But a producer that retries a code-5
+/// refusal on the same connection waits for ever, and one that reads code 5 as "the
+/// broker is answering" reports a broker as working while it takes nothing. So the
+/// condition is carried in the words, which astream owns, and
+/// [`BrokerRefusal::is_poisoned`](crate::client::BrokerRefusal::is_poisoned) is the
+/// test: a producer that sees it knows the connection is worth nothing until the
+/// broker restarts. Adding a code instead would have changed the wire, which this
+/// does not.
+///
+/// The op whose own flush POISONED the log (an escalated publish, a held commit, a
+/// `flush_durable`) is answered with what happened to it — "outcome unknown, resend" —
+/// not with this; its resend is answered with this. A broker older than this constant
+/// answered the first op of a batch on a poisoned log with `append failed: log
+/// poisoned (…)` and every later one with `batch aborted (prior append I/O error)`, so
+/// against it this is `false`: the fail-safe reading, under which a producer retries.
+pub const LOG_POISONED_PREFIX: &str = "log poisoned";
+
 /// The request is in ANOTHER astream protocol: its version byte is not this broker's
 /// [`PROTO_VERSION`]. The broker answers it once, with [`encode_protocol_refusal`] —
 /// the refusal layout every version keeps, stamped with the PEER's version byte so the
@@ -176,6 +239,126 @@ const TAG_MARK: u8 = 0x84;
 const TAG_NONCE: u8 = 0x85;
 const TAG_BUDGET_REPLY: u8 = 0x86;
 
+// The Clean island, out of line: only a Trust compiler lexes it, so it mounts under
+// `cfg(clean_islands)` (build.rs) and a stock compiler never opens the file.
+#[cfg(clean_islands)]
+#[path = "proto_island.rs"]
+mod proto_island;
+#[cfg(not(clean_islands))]
+pub use crate::twins::{
+    committed_watermark, compact_floor_monotone, credit_horizon_monotone, epoch_advance_monotone,
+    fenced_ack_select, group_commit_monotone, high_water_monotone, replica_ack_monotone,
+    window_gate_send,
+};
+#[cfg(clean_islands)]
+pub use proto_island::{
+    committed_watermark, compact_floor_monotone, credit_horizon_monotone, epoch_advance_monotone,
+    fenced_ack_select, group_commit_monotone, high_water_monotone, replica_ack_monotone,
+    window_gate_send,
+};
+
+/// 5-parameter epoch-fenced replication watermark kernel:
+/// rejects stale-epoch follower acks (`req_epoch < leader_epoch`), otherwise
+/// advances `cur_ack` monotonically to `max(cur_ack, cand_ack)` and clamps the
+/// committed watermark at `min(primary_head, next_ack)`.
+///
+/// Composes the 4-parameter Clean-origin [`fenced_ack_select`] with
+/// [`committed_watermark`] and [`replica_ack_monotone`]
+/// (`TlaEpochWatermarkReplication::fenced_replica_watermark_le_head`).
+#[must_use]
+pub const fn fenced_replica_watermark(
+    leader_epoch: u64,
+    req_epoch: u64,
+    primary_head: u64,
+    cur_ack: u64,
+    cand_ack: u64,
+) -> u64 {
+    committed_watermark(
+        primary_head,
+        fenced_ack_select(
+            req_epoch,
+            leader_epoch,
+            cur_ack,
+            replica_ack_monotone(cur_ack, cand_ack),
+        ),
+    )
+}
+
+/// 4-parameter credit-windowed send advance kernel:
+/// verifies well-formedness (`ack_seq <= sent_seq`) and available credit
+/// (`sent_seq < credit_horizon`), then advances `sent_seq` toward `cand_seq`
+/// clamped by `credit_horizon`.
+///
+/// Composes the 4-parameter Clean-origin [`window_gate_send`] with
+/// [`credit_horizon_monotone`] and [`committed_watermark`]
+/// (`TlaCreditFlowWindow::windowed_send_advance_ge_sent`).
+#[must_use]
+pub const fn windowed_send_advance(
+    sent_seq: u64,
+    ack_seq: u64,
+    credit_horizon: u64,
+    cand_seq: u64,
+) -> u64 {
+    if ack_seq <= sent_seq {
+        window_gate_send(
+            sent_seq,
+            credit_horizon,
+            credit_horizon_monotone(sent_seq, committed_watermark(credit_horizon, cand_seq)),
+            sent_seq,
+        )
+    } else {
+        sent_seq
+    }
+}
+
+contract_fn! {
+    /// Kernel-certified incarnation fence predicate `will_seq < high_water`, used by
+    /// [`crate::store::BrokerLog`] when deciding whether a pending last will is fenced
+    /// by a later normal publish from the same producer (`TlaWillFencing`).
+    #[must_use]
+    pub fn will_is_fenced(high_water: u64, will_seq: u64) -> bool
+    clauses [ensures result == (will_seq < high_water)]
+    {
+        will_seq < high_water
+    }
+}
+
+contract_fn! {
+    /// Kernel-certified replication epoch fence predicate `req_epoch < cur_epoch`,
+    /// used by [`crate::store::BrokerLog`] and [`crate::broker`] to reject stale
+    /// primary replication frames (`TlaEpochWatermarkReplication`).
+    #[must_use]
+    pub fn epoch_is_fenced(cur_epoch: u64, req_epoch: u64) -> bool
+    clauses [ensures result == (req_epoch < cur_epoch)]
+    {
+        req_epoch < cur_epoch
+    }
+}
+
+contract_fn! {
+    /// Kernel-certified committed-offset visibility predicate `offset < committed_upto`,
+    /// used by [`crate::store::BrokerLog::is_offset_replicated_committed`] and
+    /// [`crate::store::BrokerLog::fetch_replicated_committed`] (`TlaEpochWatermarkReplication`).
+    #[must_use]
+    pub fn offset_is_committed(committed_upto: u64, offset: u64) -> bool
+    clauses [ensures result == (offset < committed_upto)]
+    {
+        offset < committed_upto
+    }
+}
+
+contract_fn! {
+    /// Kernel-certified pipelined flow-control window guard `next_seq < horizon`,
+    /// used by [`crate::client::CreditWindow`] when pipelining frames over high-RTT links
+    /// (`TlaCreditFlowWindow`).
+    #[must_use]
+    pub fn can_send_in_window(horizon: u64, next_seq: u64) -> bool
+    clauses [ensures result == (next_seq < horizon)]
+    {
+        next_seq < horizon
+    }
+}
+
 /// A client → broker request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
@@ -212,7 +395,10 @@ pub enum Request {
         upto: u64,
     },
     /// Subscribe as consumer `group`: deliver matching records from the group's
-    /// durable committed offset (broker-enforced resume), then tail live.
+    /// committed offset (broker-enforced resume) — the newest commit not held back for a
+    /// full flush, at what the tier promises of it (durable on Strict, and on Ordered and
+    /// Relaxed when the escalation table names the group; on the Replicated tier, one a
+    /// quorum may not hold yet) — then tail live.
     SubscribeGroup { group: String, filter: String },
     /// Add a capability to this connection's KEYRING. `grant` is the signed grant
     /// string (`[rw|ro][,p=<principal>]:<filter>`, or a bare filter for the
@@ -378,10 +564,22 @@ pub enum Response {
     /// the frame at that byte, so a `Mark` that ends after `head` is a current peer's
     /// frame cut short: it decodes as malformed like every other short body (read as
     /// `resume = ""` it would report "this was the last page" for a truncated answer).
+    ///
+    /// `durable` IS an optional trailer, after `resume`: the broker's DURABLE head when
+    /// it wrote the `Mark` — every record below it is on stable media by a full flush
+    /// (never above `head`). A broker of this build writes it on EVERY `Mark`; an older
+    /// client never checked where a `Mark` body ends and ignores it, and an older broker
+    /// sends none (`None`): it serves Strict or Relaxed, never Ordered, and a reader
+    /// reads which from its `Hello` block where it sends one — on Strict "durable =
+    /// visible", on Relaxed nothing acked since its open (see the module docs). A body that ends one to seven bytes after `resume` is a frame
+    /// cut short (malformed); bytes after the eight are a later trailer, skipped. On a
+    /// broker that serves [`Tier::Ordered`], a subscriber that asked for idle marks also
+    /// gets a DURABLE mark when a full flush covers records it was delivered.
     Mark {
         next: u64,
         head: u64,
         resume: String,
+        durable: Option<u64>,
     },
     /// This connection's fresh nonce (32 bytes), the answer to
     /// [`Request::Hello`]. An `Attach`'s proof is `HMAC-SHA256(tag, nonce ‖ grant)`
@@ -393,9 +591,19 @@ pub enum Response {
     /// broker that predates log identity sends none (`None` — nothing known either
     /// way), and a client that predates it never reads the bytes (its decoder stops
     /// after the nonce).
+    ///
+    /// `ext` is the EXTENSION BLOCK after the identity: what the broker says about the
+    /// log beside its name — the tier it serves ([`NonceExt::durability`]) and where the
+    /// log's generations agree ([`NonceExt::lineage`]). Present only when `log` is, and
+    /// additive both ways: an older client never reads past the identity, and an older
+    /// broker sends none (both fields `None`). See [`NonceExt`] for the layout. The WIRE
+    /// is additive; the variant is not: code that builds a `Response::Nonce` literal (a
+    /// test's stand-in broker) names the field — `ext: NonceExt::default()` says
+    /// nothing, as a broker before the block did.
     Nonce {
         nonce: Vec<u8>,
         log: Option<LogIdentity>,
+        ext: NonceExt,
     },
     /// The answer to [`Request::Budget`]: `subjects` index entries are charged to the
     /// producer, its registered wills hold `reserved` more, and a publish that would
@@ -406,6 +614,214 @@ pub enum Response {
         reserved: u64,
         max: u64,
     },
+}
+
+/// A durability tier as the `Hello` block (and `<log>.id`) codes it: 0 Strict,
+/// 1 Ordered, 2 Relaxed. A code this build does not know is kept as [`Tier::Other`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Tier {
+    /// An ack is on stable media.
+    Strict,
+    /// An ack is ordered on the device (a broker that serves it is newer than this
+    /// build's tiers; reported as told).
+    Ordered,
+    /// An ack is in the page cache.
+    Relaxed,
+    /// A code this build does not know.
+    Other(u8),
+}
+
+impl Tier {
+    fn code(self) -> u8 {
+        match self {
+            Tier::Strict => 0,
+            Tier::Ordered => 1,
+            Tier::Relaxed => 2,
+            Tier::Other(c) => c,
+        }
+    }
+
+    fn from_code(c: u8) -> Tier {
+        match c {
+            0 => Tier::Strict,
+            1 => Tier::Ordered,
+            2 => Tier::Relaxed,
+            c => Tier::Other(c),
+        }
+    }
+}
+
+/// Why a broker serves a tier other than the one it was asked for.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ServedReason {
+    /// It serves what it was asked for.
+    None,
+    /// The ordering-only flush exists only on Apple.
+    NotApple,
+    /// The log is not on the boot volume.
+    NotBootVolume,
+    /// The device refused the barrier when the log was opened.
+    BarrierRefused,
+    /// A barrier failed while serving, so the log latched to Strict.
+    LatchedAfterBarrierError,
+    /// A full flush failed while serving: the log latched to Strict, and refuses every
+    /// write until it is reopened (the records that flush was to cover may be lost).
+    LatchedAfterFlushFailure,
+    /// A code this build does not know.
+    Other(u8),
+}
+
+impl ServedReason {
+    fn code(self) -> u8 {
+        match self {
+            ServedReason::None => 0,
+            ServedReason::NotApple => 1,
+            ServedReason::NotBootVolume => 2,
+            ServedReason::BarrierRefused => 3,
+            ServedReason::LatchedAfterBarrierError => 4,
+            ServedReason::LatchedAfterFlushFailure => 5,
+            ServedReason::Other(c) => c,
+        }
+    }
+
+    fn from_code(c: u8) -> ServedReason {
+        match c {
+            0 => ServedReason::None,
+            1 => ServedReason::NotApple,
+            2 => ServedReason::NotBootVolume,
+            3 => ServedReason::BarrierRefused,
+            4 => ServedReason::LatchedAfterBarrierError,
+            5 => ServedReason::LatchedAfterFlushFailure,
+            c => ServedReason::Other(c),
+        }
+    }
+}
+
+/// What a broker says about the durability it serves: the `Hello` block's tag 0x01, so
+/// a status line or a doctor on any host reads the tier in force from the broker itself
+/// and never infers it from an argv.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ServedInfo {
+    /// The tier the broker was opened at.
+    pub requested: Tier,
+    /// The tier in force.
+    pub served: Tier,
+    /// Why they differ ([`ServedReason::None`] when they do not).
+    pub reason: ServedReason,
+    /// The Ordered HORIZON asked for, in milliseconds rounded UP (a sub-millisecond
+    /// horizon reads 1, never 0): the writer issues a full flush once this long has passed
+    /// since the first ack no full flush covers, after the batch in hand — so the oldest
+    /// such ack is at most this plus one batch plus one full flush old. `Some(0)`: a full
+    /// flush after every batch. `None` for `Ordered { horizon: None }` — NO bound: only
+    /// an escalation, a `flush_durable` and a clean close flush in full, so a power loss
+    /// can take every batch since the last of them — and `None` whenever the tier asked
+    /// for is not Ordered (Strict flushes every batch; Relaxed keeps no horizon).
+    ///
+    /// The two Ordered cases that are opposite promises — no bound, and a flush after
+    /// every batch — never read alike: the wire carries `u32::MAX` for no horizon and
+    /// saturates a real one at `u32::MAX - 1` (49 days).
+    pub horizon_ms: Option<u32>,
+    /// How many escalation rules the broker holds (records it flushes in full).
+    pub rules: u16,
+}
+
+/// The wire's `horizon_ms` for "no horizon" ([`ServedInfo::horizon_ms`] `None`).
+const HORIZON_NONE: u32 = u32::MAX;
+
+impl ServedInfo {
+    /// The horizon `h` as [`horizon_ms`](Self::horizon_ms) reports it: milliseconds
+    /// rounded up, saturating below the wire's "none".
+    #[must_use]
+    pub fn horizon_ms_of(h: std::time::Duration) -> u32 {
+        u32::try_from(h.as_nanos().div_ceil(1_000_000))
+            .unwrap_or(HORIZON_NONE)
+            .min(HORIZON_NONE - 1)
+    }
+}
+
+/// The `Nonce` answer's EXTENSION BLOCK: after the identity trailer, `(tag u8, len u16
+/// LE, bytes)*` to the end of the body. A tag a reader does not know is skipped by its
+/// length; an entry cut short is a malformed frame. It is sent only with an identity,
+/// and, like the identity, before authentication: tiers, generations and offsets are
+/// not secrets.
+///
+/// | tag  | entry      | bytes |
+/// |------|------------|-------|
+/// | 0x01 | durability | `requested u8, served u8, reason u8, horizon_ms u32 LE, rules u16 LE` ([`ServedInfo`]) |
+/// | 0x02 | lineage    | `n u8`, then `n × (generation u64 LE, common u64 LE)` ([`Lineage`]) |
+/// | 0x03 | reserved   | the request set a broker announces (the subject-retire design) |
+///
+/// No request tag, no protocol version and no error code are spent on it: a broker
+/// that predates the block sends a frame that ends at the identity, which reads here
+/// as both fields `None`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NonceExt {
+    /// Tag 0x01: the tier the broker serves.
+    pub durability: Option<ServedInfo>,
+    /// Tag 0x02: where the log's generations agree.
+    pub lineage: Option<Lineage>,
+}
+
+/// The extension-block tags ([`NonceExt`]).
+const EXT_DURABILITY: u8 = 0x01;
+const EXT_LINEAGE: u8 = 0x02;
+
+impl NonceExt {
+    fn put(&self, p: &mut Vec<u8>) {
+        let mut entry = |tag: u8, body: &[u8]| {
+            p.push(tag);
+            p.extend_from_slice(&(body.len() as u16).to_le_bytes());
+            p.extend_from_slice(body);
+        };
+        if let Some(d) = &self.durability {
+            let mut b = vec![d.requested.code(), d.served.code(), d.reason.code()];
+            b.extend_from_slice(&d.horizon_ms.unwrap_or(HORIZON_NONE).to_le_bytes());
+            b.extend_from_slice(&d.rules.to_le_bytes());
+            entry(EXT_DURABILITY, &b);
+        }
+        if let Some(l) = &self.lineage {
+            let mut b = Vec::new();
+            l.put(&mut b);
+            entry(EXT_LINEAGE, &b);
+        }
+    }
+
+    /// Read the block from `b` (the bytes after the identity) to its end; `None` for an
+    /// entry cut short, or a known entry whose bytes are not its layout.
+    fn read(mut b: &[u8]) -> Option<NonceExt> {
+        let mut ext = NonceExt::default();
+        while let Some((&tag, rest)) = b.split_first() {
+            let len = u16::from_le_bytes(rest.get(..2)?.try_into().ok()?) as usize;
+            let end = 2usize.checked_add(len)?;
+            let body = rest.get(2..end)?;
+            b = rest.get(end..)?;
+            match tag {
+                EXT_DURABILITY => {
+                    let [req, served, reason, h0, h1, h2, h3, r0, r1] = *body else {
+                        return None;
+                    };
+                    let requested = Tier::from_code(req);
+                    let horizon = u32::from_le_bytes([h0, h1, h2, h3]);
+                    ext.durability = Some(ServedInfo {
+                        requested,
+                        served: Tier::from_code(served),
+                        reason: ServedReason::from_code(reason),
+                        // A horizon belongs to Ordered alone; the broker that predates
+                        // Ordered sent 0 for Strict and Relaxed, which is no horizon.
+                        horizon_ms: (requested == Tier::Ordered && horizon != HORIZON_NONE)
+                            .then_some(horizon),
+                        rules: u16::from_le_bytes([r0, r1]),
+                    });
+                }
+                EXT_LINEAGE => ext.lineage = Some(Lineage::from_wire(body)?),
+                // Unknown (0x03 included): skipped by its length.
+                _ => {}
+            }
+        }
+        Some(ext)
+    }
 }
 
 fn put_str(p: &mut Vec<u8>, s: &str) {
@@ -423,8 +839,9 @@ struct Reader<'a> {
 }
 impl<'a> Reader<'a> {
     fn u8(&mut self) -> Option<u8> {
+        let end = self.i.checked_add(1)?;
         let v = *self.b.get(self.i)?;
-        self.i += 1;
+        self.i = end;
         Some(v)
     }
     fn u64(&mut self) -> Option<u64> {
@@ -461,8 +878,9 @@ impl<'a> Reader<'a> {
         if self.i == self.b.len() {
             return Some(None);
         }
+        let end = self.i.checked_add(LogIdentity::WIRE_LEN)?;
         let ident = LogIdentity::from_wire(self.b.get(self.i..)?)?;
-        self.i += LogIdentity::WIRE_LEN;
+        self.i = end;
         Some(Some(ident))
     }
 }
@@ -614,7 +1032,8 @@ pub fn encode_replicate(
     commit: Option<(&str, u64)>,
     leader: Option<&LogIdentity>,
 ) -> Vec<u8> {
-    let mut p = vec![PROTO_VERSION, TAG_REPLICATE];
+    let mut p = Vec::new();
+    p.extend_from_slice(&[PROTO_VERSION, TAG_REPLICATE]);
     p.extend_from_slice(&seq.to_le_bytes());
     p.extend_from_slice(&producer_id.to_le_bytes());
     p.extend_from_slice(&producer_seq.to_le_bytes());
@@ -746,16 +1165,29 @@ pub fn encode_response(resp: &Response) -> Vec<u8> {
             p.push(*code);
             put_str(&mut p, msg);
         }
-        Response::Mark { next, head, resume } => {
+        Response::Mark {
+            next,
+            head,
+            resume,
+            durable,
+        } => {
             p[1] = TAG_MARK;
             p.extend_from_slice(&next.to_le_bytes());
             p.extend_from_slice(&head.to_le_bytes());
             put_str(&mut p, resume);
+            if let Some(d) = durable {
+                p.extend_from_slice(&d.to_le_bytes());
+            }
         }
-        Response::Nonce { nonce, log } => {
+        Response::Nonce { nonce, log, ext } => {
             p[1] = TAG_NONCE;
             put_bytes(&mut p, nonce);
             put_identity(&mut p, log.as_ref());
+            // The block rides only behind an identity: a frame without one stays the
+            // frame a broker that predates log identity sends.
+            if log.is_some() {
+                ext.put(&mut p);
+            }
         }
         Response::Budget {
             subjects,
@@ -777,7 +1209,7 @@ pub fn encode_response(resp: &Response) -> Vec<u8> {
 /// and body are read by reference (no deep copy on the read path; the only copy is the
 /// one unavoidable assembly into the outgoing frame).
 pub fn encode_delivery(offset: u64, subject: &str, body: &[u8]) -> Vec<u8> {
-    let mut p = Vec::with_capacity(2 + 8 + 4 + subject.len() + 4 + body.len());
+    let mut p = Vec::new();
     put_delivery(&mut p, offset, subject, body);
     p
 }
@@ -789,6 +1221,63 @@ fn put_delivery(p: &mut Vec<u8>, offset: u64, subject: &str, body: &[u8]) {
     put_bytes(p, body);
 }
 
+fn put_publish(p: &mut Vec<u8>, producer_id: u64, producer_seq: u64, subject: &str, body: &[u8]) {
+    p.extend_from_slice(&[PROTO_VERSION, TAG_PUBLISH]);
+    p.extend_from_slice(&producer_id.to_le_bytes());
+    p.extend_from_slice(&producer_seq.to_le_bytes());
+    put_str(p, subject);
+    put_bytes(p, body);
+}
+
+fn encode_header_bytes(len32: u32, crc: u32) -> [u8; HEADER_SIZE] {
+    let l = len32.to_le_bytes();
+    let c = crc.to_le_bytes();
+    [
+        FRAME_MAGIC[0],
+        FRAME_MAGIC[1],
+        FRAME_VERSION,
+        0,
+        l[0],
+        l[1],
+        l[2],
+        l[3],
+        c[0],
+        c[1],
+        c[2],
+        c[3],
+    ]
+}
+
+/// Append one framed `Publish` request to `out`, assembled in place: `subject` and
+/// `body` are copied once into `out` instead of allocating a `String`, a `Vec<u8>`,
+/// a request payload buffer, and a framed buffer.
+pub(crate) fn append_publish_frame(
+    out: &mut Vec<u8>,
+    producer_id: u64,
+    producer_seq: u64,
+    subject: &str,
+    body: &[u8],
+) -> io::Result<()> {
+    append_framed(out, |p| {
+        put_publish(p, producer_id, producer_seq, subject, body)
+    })
+}
+
+/// Compute the exact wire CRC-32/IEEE of a `Response::Delivery { offset, subject, body }`
+/// payload without allocating or copying a temporary payload buffer.
+#[must_use]
+pub fn compute_delivery_crc(offset: u64, subject: &str, body: &[u8]) -> u32 {
+    let mut hdr = [0u8; 14];
+    hdr[0] = PROTO_VERSION;
+    hdr[1] = TAG_DELIVERY;
+    hdr[2..10].copy_from_slice(&offset.to_le_bytes());
+    hdr[10..14].copy_from_slice(&(subject.len() as u32).to_le_bytes());
+    let crc = astream_wire::crc32_ieee_update(0, &hdr);
+    let crc = astream_wire::crc32_ieee_update(crc, subject.as_bytes());
+    let crc = astream_wire::crc32_ieee_update(crc, &(body.len() as u32).to_le_bytes());
+    astream_wire::crc32_ieee_update(crc, body)
+}
+
 /// Append one framed `Delivery` to `out`, assembled in place: the body is copied once,
 /// into `out`, instead of into a payload, then a `Frame`, then the encoded frame. A
 /// streaming verb gathers several into one buffer and writes them with one call.
@@ -798,7 +1287,40 @@ pub(crate) fn append_delivery_frame(
     subject: &str,
     body: &[u8],
 ) -> io::Result<()> {
-    append_framed(out, |p| put_delivery(p, offset, subject, body))
+    append_delivery_frame_with_crc(out, offset, subject, body, None).map(|_| ())
+}
+
+/// Append one framed `Delivery` to `out`, reusing `precomputed_crc` when `Some` so a
+/// 64-subscriber fan-out computes the frame CRC once per record instead of 64 times.
+/// Returns the frame's CRC-32/IEEE so the caller can populate a lock-free cache.
+pub(crate) fn append_delivery_frame_with_crc(
+    out: &mut Vec<u8>,
+    offset: u64,
+    subject: &str,
+    body: &[u8],
+    precomputed_crc: Option<u32>,
+) -> io::Result<u32> {
+    let start = out.len();
+    out.extend_from_slice(&[0u8; HEADER_SIZE]);
+    let payload_start = out.len();
+    put_delivery(out, offset, subject, body);
+    let len = out.len().saturating_sub(payload_start);
+    let Some(len32) = u32::try_from(len).ok().filter(|_| len <= MAX_PAYLOAD_LEN) else {
+        out.truncate(start);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "payload exceeds cap",
+        ));
+    };
+    let payload_slice = out.get(payload_start..).unwrap_or(&[]);
+    let crc = precomputed_crc.unwrap_or_else(|| crc32_ieee(payload_slice));
+    if let Some((hdr, _)) = out
+        .get_mut(start..)
+        .and_then(|s| s.split_first_chunk_mut::<HEADER_SIZE>())
+    {
+        *hdr = encode_header_bytes(len32, crc);
+    }
+    Ok(crc)
 }
 
 /// Append `payload`, framed, to `out` (one copy). See [`append_delivery_frame`].
@@ -812,9 +1334,10 @@ pub(crate) fn append_frame(out: &mut Vec<u8>, payload: &[u8]) -> io::Result<()> 
 /// is `InvalidData`.
 fn append_framed(out: &mut Vec<u8>, fill: impl FnOnce(&mut Vec<u8>)) -> io::Result<()> {
     let start = out.len();
-    out.resize(start + HEADER_SIZE, 0);
+    out.extend_from_slice(&[0u8; HEADER_SIZE]);
+    let payload_start = out.len();
     fill(out);
-    let len = out.len() - start - HEADER_SIZE;
+    let len = out.len().saturating_sub(payload_start);
     let Some(len32) = u32::try_from(len).ok().filter(|_| len <= MAX_PAYLOAD_LEN) else {
         out.truncate(start);
         return Err(io::Error::new(
@@ -822,13 +1345,13 @@ fn append_framed(out: &mut Vec<u8>, fill: impl FnOnce(&mut Vec<u8>)) -> io::Resu
             "payload exceeds cap",
         ));
     };
-    let crc = crc32_ieee(&out[start + HEADER_SIZE..]);
-    let hdr = &mut out[start..start + HEADER_SIZE];
-    hdr[..2].copy_from_slice(&FRAME_MAGIC);
-    hdr[2] = FRAME_VERSION;
-    hdr[3] = 0; // flags: none defined
-    hdr[4..8].copy_from_slice(&len32.to_le_bytes());
-    hdr[8..].copy_from_slice(&crc.to_le_bytes());
+    let crc = crc32_ieee(out.get(payload_start..).unwrap_or(&[]));
+    if let Some((hdr, _)) = out
+        .get_mut(start..)
+        .and_then(|s| s.split_first_chunk_mut::<HEADER_SIZE>())
+    {
+        *hdr = encode_header_bytes(len32, crc);
+    }
     Ok(())
 }
 
@@ -897,19 +1420,34 @@ pub fn decode_response(p: &[u8]) -> Option<Response> {
             code: r.u8()?,
             msg: r.string()?,
         }),
-        TAG_MARK => Some(Response::Mark {
-            next: r.u64()?,
-            head: r.u64()?,
+        TAG_MARK => {
+            let next = r.u64()?;
+            let head = r.u64()?;
             // NOT optional. An older broker is refused at the version byte above, so a
             // Mark that ends after `head` is a current peer's truncated frame, and an
             // empty `resume` means something specific ("the scan reached the end of the
             // filter's range") that a truncation must not be read as.
-            resume: r.string()?,
-        }),
-        TAG_NONCE => Some(Response::Nonce {
-            nonce: r.bytes()?,
-            log: r.identity_trailer()?,
-        }),
+            let resume = r.string()?;
+            // Optional: an older broker ends the body here. One to seven bytes more is a
+            // frame cut short; anything past eight is a later trailer, skipped.
+            let durable = match r.b.len().checked_sub(r.i)? {
+                0 => None,
+                1..=7 => return None,
+                _ => Some(r.u64()?),
+            };
+            Some(Response::Mark {
+                next,
+                head,
+                resume,
+                durable,
+            })
+        }
+        TAG_NONCE => {
+            let nonce = r.bytes()?;
+            let log = r.identity_trailer()?;
+            let ext = NonceExt::read(r.b.get(r.i..)?)?;
+            Some(Response::Nonce { nonce, log, ext })
+        }
         TAG_BUDGET_REPLY => Some(Response::Budget {
             subjects: r.u64()?,
             reserved: r.u64()?,
@@ -923,6 +1461,7 @@ pub fn decode_response(p: &[u8]) -> Option<Response> {
 /// bytes arrive rather than being allocated at the declared length up front, so a peer
 /// that announces a 16 MiB frame and then stalls pins one chunk (plus what it actually
 /// sent) until its read times out — not the whole declared length.
+#[cfg(test)]
 const READ_CHUNK: usize = 64 * 1024;
 
 /// Read exactly one frame's payload from `r` (blocking). `Ok(None)` on a clean EOF
@@ -943,7 +1482,13 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
     if first == 0 {
         return Ok(None);
     }
-    r.read_exact(&mut hdr[first..])?;
+    let Some(hdr_rem) = hdr.get_mut(first..) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid read length",
+        ));
+    };
+    r.read_exact(hdr_rem)?;
     // The header is judged BEFORE the payload it announces is read: a bad magic,
     // version or flags byte, or a length over the cap, is refused on these 12 bytes.
     // A header on its own decodes as "need more bytes" — or, announcing an empty
@@ -962,11 +1507,13 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
     let len = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
     let crc = u32::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]);
     // Read straight into the payload buffer (no header copy, no second copy out).
-    let mut payload = Vec::with_capacity(len.min(READ_CHUNK));
-    while payload.len() < len {
-        let start = payload.len();
-        payload.resize(start + (len - start).min(READ_CHUNK), 0);
-        r.read_exact(&mut payload[start..])?;
+    let mut payload = Vec::new();
+    (&mut *r).take(len as u64).read_to_end(&mut payload)?;
+    if payload.len() < len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated frame",
+        ));
     }
     if crc32_ieee(&payload) != crc {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "corrupt frame"));
@@ -976,7 +1523,7 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
 
 /// Frame `payload` and write it to `w` (blocking), in one `write_all`.
 pub fn write_frame(w: &mut impl Write, payload: &[u8]) -> io::Result<()> {
-    let mut out = Vec::with_capacity(HEADER_SIZE + payload.len());
+    let mut out = Vec::new();
     append_frame(&mut out, payload)?;
     w.write_all(&out)
 }
@@ -1385,6 +1932,7 @@ mod tests {
                     next: 0,
                     head: 0,
                     resume: String::new(),
+                    durable: Some(0),
                 },
             ),
             (
@@ -1392,6 +1940,7 @@ mod tests {
                 Response::Nonce {
                     nonce: Vec::new(),
                     log: None,
+                    ext: NonceExt::default(),
                 },
             ),
             (
@@ -1483,13 +2032,15 @@ mod tests {
             next: 4,
             head: 9,
             resume: "/f/x".to_string(),
+            durable: None,
         });
         assert_eq!(
             decode_response(&full),
             Some(Response::Mark {
                 next: 4,
                 head: 9,
-                resume: "/f/x".to_string()
+                resume: "/f/x".to_string(),
+                durable: None,
             })
         );
         // The 18-byte prefix: version, tag, next, head, and nothing more.
@@ -1502,6 +2053,62 @@ mod tests {
         let mut older = full.clone();
         older[0] = PROTO_VERSION - 1;
         assert_eq!(decode_response(&older), None);
+    }
+
+    /// The `Mark` decoder of the release before `Mark.durable`, frozen here as it stood
+    /// (next, head, resume — and no check of where the body ends): what an OLDER client
+    /// runs on a `Mark` this build's broker sends.
+    fn older_client_mark(p: &[u8]) -> Option<(u64, u64, String)> {
+        let mut r = Reader { b: p, i: 0 };
+        if r.u8()? != PROTO_VERSION || r.u8()? != TAG_MARK {
+            return None;
+        }
+        Some((r.u64()?, r.u64()?, r.string()?))
+    }
+
+    /// `Mark.durable` is an ADDITIVE trailer both ways: an older client reads a `Mark`
+    /// carrying it as the same `(next, head, resume)` (it never checked where the body
+    /// ends); this build reads an older broker's `Mark`, which ends at `resume`, as
+    /// `durable: None`. One to seven bytes after `resume` is a frame cut short; bytes past
+    /// the eight are a later trailer, skipped.
+    #[test]
+    fn a_marks_durable_trailer_is_additive_both_ways() {
+        let with = Response::Mark {
+            next: 4,
+            head: 9,
+            resume: "/f/x".to_string(),
+            durable: Some(7),
+        };
+        let bytes = encode_response(&with);
+        assert_eq!(
+            older_client_mark(&bytes),
+            Some((4, 9, "/f/x".to_string())),
+            "an older client reads a new broker's Mark"
+        );
+        assert_eq!(decode_response(&bytes), Some(with.clone()));
+        // An older broker's Mark: the same bytes without the trailer.
+        let without = &bytes[..bytes.len() - 8];
+        let Some(Response::Mark { durable, .. }) = decode_response(without) else {
+            panic!("an older broker's Mark decodes")
+        };
+        assert_eq!(
+            durable, None,
+            "an older broker says nothing about durability"
+        );
+        for cut in 1..8 {
+            assert_eq!(
+                decode_response(&bytes[..bytes.len() - cut]),
+                None,
+                "a trailer cut {cut} bytes short is malformed"
+            );
+        }
+        let mut later = bytes.clone();
+        later.extend_from_slice(&[0xAB; 5]);
+        assert_eq!(
+            decode_response(&later),
+            Some(with),
+            "a later trailer is skipped"
+        );
     }
 
     /// The log-identity trailers are ADDITIVE, so neither side has to be upgraded
@@ -1519,6 +2126,7 @@ mod tests {
         let nonce = |log| Response::Nonce {
             nonce: vec![1; 32],
             log,
+            ext: NonceExt::default(),
         };
         let mut older = vec![PROTO_VERSION, TAG_NONCE];
         older.extend_from_slice(&32u32.to_le_bytes());
@@ -1541,9 +2149,13 @@ mod tests {
                 "cut {cut}"
             );
         }
+        // Behind the identity comes the extension block: an entry of an unknown tag is
+        // skipped by its length, one cut short is a malformed frame.
         let mut longer = with.clone();
-        longer.push(9);
+        longer.extend_from_slice(&[0x7f, 2, 0, 0xaa, 0xbb]);
         assert_eq!(decode_response(&longer), Some(nonce(Some(ident))));
+        longer.push(9);
+        assert_eq!(decode_response(&longer), None, "an entry cut short");
 
         let replicate = |leader| Request::Replicate {
             seq: 3,
@@ -1573,6 +2185,131 @@ mod tests {
     }
 
     /// THE REFUSAL A PEER OF ANY VERSION READS, pinned byte by byte:
+    /// The `Nonce` extension block: the served tier (0x01) and the lineage (0x02) round
+    /// trip; the frame without them is byte-identical to the identity-only frame, which
+    /// is a prefix of the frame with them — exactly what an OLDER client reads, stopping
+    /// after the identity; an unknown tag (0x03, reserved for the retire design's
+    /// request set) is skipped; a known entry whose bytes are not its layout, or a block
+    /// with no identity before it, is malformed or absent.
+    #[test]
+    fn the_nonce_extension_block_is_additive_and_skips_unknown_tags() {
+        let ident = LogIdentity {
+            id: [0xcd; 16],
+            generation: 3,
+        };
+        let ext = NonceExt {
+            durability: Some(ServedInfo {
+                requested: Tier::Relaxed,
+                served: Tier::Relaxed,
+                reason: ServedReason::None,
+                horizon_ms: None,
+                rules: 0,
+            }),
+            lineage: Some(Lineage::default().step(3, 41)),
+        };
+        let nonce = |log, ext| Response::Nonce {
+            nonce: vec![2; 32],
+            log,
+            ext,
+        };
+        let plain = encode_response(&nonce(Some(ident), NonceExt::default()));
+        let full = encode_response(&nonce(Some(ident), ext.clone()));
+        assert_eq!(
+            full[..plain.len()],
+            plain[..],
+            "an older client's frame is a prefix"
+        );
+        assert_eq!(
+            decode_response(&full),
+            Some(nonce(Some(ident), ext.clone()))
+        );
+        // With no identity no block is sent, whatever the caller passed.
+        assert_eq!(
+            encode_response(&nonce(None, ext.clone())),
+            encode_response(&nonce(None, NonceExt::default()))
+        );
+        // A future tier and reason are kept as told, not refused.
+        let mut future = full.clone();
+        let at = plain.len() + 3;
+        future[at] = 9;
+        future[at + 2] = 77;
+        match decode_response(&future) {
+            Some(Response::Nonce { ext, .. }) => {
+                let d = ext.durability.unwrap();
+                assert_eq!(
+                    (d.requested, d.reason),
+                    (Tier::Other(9), ServedReason::Other(77))
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        // The reserved tag 0x03 is skipped.
+        let mut reserved = full.clone();
+        reserved.extend_from_slice(&[0x03, 1, 0, 0xff]);
+        assert_eq!(
+            decode_response(&reserved),
+            Some(nonce(Some(ident), ext.clone()))
+        );
+        // A durability entry one byte short is malformed.
+        let mut short = plain.clone();
+        short.extend_from_slice(&[0x01, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(decode_response(&short), None);
+    }
+
+    /// THE HORIZON TELLS NO BOUND FROM A FLUSH AFTER EVERY BATCH. An Ordered broker with
+    /// no horizon (a power loss can take every batch since the last escalation) and one
+    /// with a zero horizon (a full flush after every batch) are opposite promises, and
+    /// both used to read `horizon_ms = 0` — the value Strict sent too. Now none reads
+    /// `None`, zero reads `Some(0)`, a sub-millisecond horizon rounds UP to `Some(1)`
+    /// (never down to the every-batch promise), and a horizon on a tier other than
+    /// Ordered is no horizon whatever the wire carried (the broker before Ordered sent 0
+    /// for Strict and Relaxed).
+    #[test]
+    fn the_hello_horizon_tells_none_from_zero() {
+        use std::time::Duration;
+        let ident = LogIdentity {
+            id: [0xcd; 16],
+            generation: 0,
+        };
+        let told = |requested: Tier, horizon_ms: Option<u32>| {
+            let ext = NonceExt {
+                durability: Some(ServedInfo {
+                    requested,
+                    served: requested,
+                    reason: ServedReason::None,
+                    horizon_ms,
+                    rules: 1,
+                }),
+                lineage: None,
+            };
+            let frame = encode_response(&Response::Nonce {
+                nonce: vec![2; 32],
+                log: Some(ident),
+                ext,
+            });
+            match decode_response(&frame) {
+                Some(Response::Nonce { ext, .. }) => ext.durability.unwrap().horizon_ms,
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(told(Tier::Ordered, None), None, "no horizon");
+        assert_eq!(told(Tier::Ordered, Some(0)), Some(0), "every batch");
+        assert_eq!(told(Tier::Ordered, Some(1000)), Some(1000));
+        assert_ne!(told(Tier::Ordered, None), told(Tier::Ordered, Some(0)));
+        assert_eq!(told(Tier::Strict, Some(0)), None, "not Ordered: no horizon");
+        assert_eq!(told(Tier::Relaxed, Some(0)), None);
+        assert_eq!(ServedInfo::horizon_ms_of(Duration::ZERO), 0);
+        assert_eq!(ServedInfo::horizon_ms_of(Duration::from_nanos(1)), 1);
+        assert_eq!(ServedInfo::horizon_ms_of(Duration::from_micros(999)), 1);
+        assert_eq!(ServedInfo::horizon_ms_of(Duration::from_millis(1000)), 1000);
+        assert_eq!(ServedInfo::horizon_ms_of(Duration::from_micros(1001)), 2);
+        assert_eq!(
+            ServedInfo::horizon_ms_of(Duration::MAX),
+            u32::MAX - 1,
+            "a real horizon never reads as none"
+        );
+    }
+
     /// `[peer][0x83][ERR_PROTOCOL][len:u32 LE][msg][PROTO_VERSION]`. Under the peer's own
     /// version byte it is the refusal layout every version keeps, so the peer's decoder
     /// reads `Error { code: 9 }`; the byte after the message, which no decoder reads, is
@@ -1631,6 +2368,7 @@ mod tests {
             next: 1,
             head: 2,
             resume: String::new(),
+            durable: None,
         };
         assert_eq!(
             foreign_protocol(&stamped(&malformed, PROTO_VERSION - 1)),

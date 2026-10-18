@@ -167,6 +167,108 @@ pub(crate) fn without_local_identity(title: &str) -> &str {
     without_identity_of(title, full, short)
 }
 
+/// Whether `host` names THIS machine, by the rule the strip reads a prompt's
+/// `user@host:` with ([`host_is_local`]): the question a file citation asks of
+/// the host a session's OSC 7 named (`crate::path_link`), where a remote
+/// shell's directory must never resolve against this machine's disk. Any of
+/// the machine's names counts: the one the strip uses (a `$HOSTNAME` override
+/// first) and, on unix, every name the kernel has given it while this process
+/// looked ([`MachineNames`]: `gethostname(3)`, what zsh's `$HOST` and bash's
+/// `$HOSTNAME` hold, so what a local shell reports).
+///
+/// The kernel's name is READ AGAIN on every ask, never kept from the first:
+/// on a Mac with no `HostName` set the network names the machine
+/// (`m19Macb128GB2TB.localdomain` on one network, `<name>.local` on another), so a
+/// shell started after a move reports a name the first read never saw. The
+/// names read before are kept too, as a shell started before the move still
+/// reports its old one; each session's spawn notes the name its shell starts
+/// under ([`note_this_machine_name`]). A machine whose own names cannot be
+/// read calls no host its own (fail closed).
+#[must_use]
+pub(crate) fn names_this_machine(host: &str) -> bool {
+    let (full, short) = local_host_names();
+    host_is_local(host, full, short) || {
+        let mut names = MACHINE_NAMES.lock().unwrap_or_else(|p| p.into_inner());
+        names.note(kernel_host_name());
+        names.names(host)
+    }
+}
+
+/// Note the kernel's name for this machine as it is now: a session's spawn
+/// calls it, so the name its shell captures at start is one
+/// [`names_this_machine`] knows however the network renames the machine
+/// later.
+pub(crate) fn note_this_machine_name() {
+    MACHINE_NAMES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .note(kernel_host_name());
+}
+
+/// The kernel's name for this machine now (`gethostname(3)`), or `None`.
+fn kernel_host_name() -> Option<String> {
+    #[cfg(unix)]
+    {
+        unix_host_name()
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// Every name this process has read the kernel give this machine.
+static MACHINE_NAMES: std::sync::Mutex<MachineNames> =
+    std::sync::Mutex::new(MachineNames { seen: Vec::new() });
+
+/// The kernel names a machine has had while this process looked, oldest
+/// first, at most [`MachineNames::KEPT`] (a machine renamed more often than
+/// that forgets its oldest, which then names no shell: fail closed).
+#[derive(Debug, Default)]
+pub(crate) struct MachineNames {
+    seen: Vec<String>,
+}
+
+impl MachineNames {
+    /// Names kept, at most.
+    const KEPT: usize = 16;
+
+    /// Keep `name` (the kernel's now), once.
+    pub(crate) fn note(&mut self, name: Option<String>) {
+        let Some(name) = name.filter(|name| !name.is_empty()) else {
+            return;
+        };
+        if self
+            .seen
+            .iter()
+            .any(|seen| seen.eq_ignore_ascii_case(&name))
+        {
+            return;
+        }
+        if self.seen.len() >= Self::KEPT {
+            self.seen.remove(0);
+        }
+        self.seen.push(name);
+    }
+
+    /// Whether `host` is one of the names kept, by [`host_is_local`].
+    pub(crate) fn names(&self, host: &str) -> bool {
+        self.seen.iter().any(|full| {
+            let short = full
+                .split_once('.')
+                .map_or(full.as_str(), |(label, _)| label);
+            host_is_local(host, full, short)
+        })
+    }
+}
+
+/// This machine's own name as [`names_this_machine`] reads it (`""` when it
+/// cannot be read), for a test that must spell a local OSC 7.
+#[cfg(test)]
+pub(crate) fn this_machine_name() -> &'static str {
+    &local_host_names().0
+}
+
 /// The title with everything that names only what the user already knows
 /// removed: a `user@host:` prefix naming this machine
 /// ([`without_local_identity`]) and the console's own program path
@@ -277,6 +379,40 @@ mod tests {
     const FULL: &str = "m17-tower.local";
     const SHORT: &str = "m17-tower";
 
+    /// The network renames a Mac with no `HostName` set while aterm runs: a
+    /// shell started before the move reports the old name, one started after
+    /// it the new one, and both are this machine. NEGATIVE CONTROLS: a name
+    /// the kernel never gave it, and the oldest name once more renames than
+    /// are kept have pushed it out, name another machine; nothing read names
+    /// nothing.
+    #[test]
+    fn every_name_the_kernel_gave_this_machine_stays_its_own() {
+        let mut names = super::MachineNames::default();
+        assert!(!names.names("m19Macb128GB2TB"), "nothing read yet");
+        names.note(None);
+        names.note(Some(String::new()));
+        assert!(!names.names(""), "an unreadable name names nothing");
+        names.note(Some("m19Macb128GB2TB.localdomain".into()));
+        // The move: a new name, read again at the next ask.
+        names.note(Some("m19-Macbook-M5-Max-128GB-2TB.local".into()));
+        for host in [
+            "m19Macb128GB2TB.localdomain",
+            "m19Macb128GB2TB",
+            "M19MACB128GB2TB",
+            "m19-Macbook-M5-Max-128GB-2TB.local",
+            "m19-Macbook-M5-Max-128GB-2TB",
+        ] {
+            assert!(names.names(host), "{host}");
+        }
+        assert!(!names.names("build-box.example"), "never this machine's");
+        assert!(!names.names("m19"), "a prefix is not the name");
+        for i in 0..super::MachineNames::KEPT {
+            names.note(Some(format!("renamed-{i}.local")));
+        }
+        assert!(!names.names("m19Macb128GB2TB"), "the oldest name is gone");
+        assert!(names.names("renamed-0"), "the kept ones stay");
+    }
+
     fn strip(title: &str) -> &str {
         without_identity_of(title, FULL, SHORT)
     }
@@ -306,52 +442,37 @@ mod tests {
         }
     }
 
+    /// Only this machine's own `user@host:` prefix is shed: the stock prompt
+    /// keeps its directory, a title that is only this machine leaves nothing
+    /// (the caller's fall-through to the cwd rung), another machine keeps the
+    /// identity that is the point of the tab, and a title a program chose is
+    /// returned untouched.
     #[test]
-    fn the_stock_prompt_title_keeps_only_the_directory() {
-        // The measured defect: bash's default `\u@\h: \w`.
-        assert_eq!(strip("user@m17-tower: ~/aterm"), "~/aterm");
-        // Fully-qualified (`\H`) and a no-space spelling reach the same rung.
-        assert_eq!(strip("user@m17-tower.local: ~/aterm"), "~/aterm");
-        assert_eq!(strip("user@m17-tower:~/aterm"), "~/aterm");
-    }
-
-    #[test]
-    fn a_title_that_is_only_this_machine_leaves_nothing_to_show() {
-        // Empty is the caller's fall-through signal, NOT a label: the cwd rung
-        // renders the same fact with the part worth reading still in it.
-        assert_eq!(strip("user@m17-tower"), "");
-        assert_eq!(strip("user@m17-tower:"), "");
-        assert_eq!(strip("  user@m17-tower:   "), "");
-    }
-
-    #[test]
-    fn another_machine_keeps_the_identity_that_is_the_point_of_the_tab() {
-        // The case the prefix EARNS its width: this tab is not local.
-        assert_eq!(
-            strip("root@prod-db-01: /var/log"),
-            "root@prod-db-01: /var/log"
-        );
-        assert_eq!(
-            strip("user@m17-tower-2: ~/aterm"),
-            "user@m17-tower-2: ~/aterm"
-        );
-    }
-
-    #[test]
-    fn a_title_a_program_chose_is_never_touched() {
-        for title in [
-            "vim README.md",
-            "make: *** No rule to make target 'all'",
-            "cargo test -p aterm-gui",
-            "~/aterm",
-            "",
+    fn only_this_machines_prompt_identity_is_shed() {
+        for (title, want) in [
+            // The measured defect: bash's default `\u@\h: \w`, plus `\H` and a
+            // no-space spelling.
+            ("user@m17-tower: ~/aterm", "~/aterm"),
+            ("user@m17-tower.local: ~/aterm", "~/aterm"),
+            ("user@m17-tower:~/aterm", "~/aterm"),
+            ("user@m17-tower", ""),
+            ("user@m17-tower:", ""),
+            ("  user@m17-tower:   ", ""),
+            ("root@prod-db-01: /var/log", "root@prod-db-01: /var/log"),
+            ("user@m17-tower-2: ~/aterm", "user@m17-tower-2: ~/aterm"),
+            ("vim README.md", "vim README.md"),
+            ("~/aterm", "~/aterm"),
+            ("", ""),
             // Contains an address but is prose, not a prompt's identity.
-            "sent to user@m17-tower: ok",
+            (
+                "sent to user@m17-tower: ok",
+                "sent to user@m17-tower: ok",
+            ),
             // Shape-like but degenerate on one side.
-            "@m17-tower: ~/aterm",
-            "user@: ~/aterm",
+            ("@m17-tower: ~/aterm", "@m17-tower: ~/aterm"),
+            ("user@: ~/aterm", "user@: ~/aterm"),
         ] {
-            assert_eq!(strip(title), title, "rewrote a title it does not own");
+            assert_eq!(strip(title), want, "{title:?}");
         }
     }
 
@@ -375,70 +496,52 @@ mod tests {
     /// The measured defect: ConPTY's title for a fresh console is the program's
     /// own path, which names nothing the user did not just choose. Empty is the
     /// fall-through to the cwd rung, exactly as for the local identity.
+    /// `cmd.exe`'s `<path> - <command>` keeps the command. Every title that is
+    /// not an absolute Windows path to an `.exe` — including ones that CONTAIN
+    /// one — is returned byte-identical.
     #[test]
-    fn a_console_program_path_leaves_nothing_to_show() {
+    fn only_a_bare_console_program_path_is_shed() {
         for path in [
             "C:\\Program Files\\WindowsApps\\Microsoft.PowerShell_7.6.6.0_x64__8wekyb3d8bbwe\\pwsh.exe",
-            "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
             "C:\\Windows\\system32\\cmd.exe",
             "c:/windows/system32/CMD.EXE",
             "\\\\build-01\\tools\\shell.exe",
             "  C:\\Windows\\system32\\cmd.exe  ",
+            "C:\\Windows\\system32\\cmd.exe - ",
         ] {
             assert_eq!(without_console_program_path(path), "", "{path:?}");
             assert_eq!(informative(path), "", "{path:?}");
         }
-    }
-
-    /// `cmd.exe` writes `<path> - <command>` while a command runs: the path
-    /// goes, the command — the half that says what the tab is doing — stays.
-    #[test]
-    fn a_command_after_the_program_path_is_the_part_worth_reading() {
-        assert_eq!(
-            without_console_program_path("C:\\Windows\\system32\\cmd.exe - ping  build-01"),
-            "ping  build-01"
-        );
-        assert_eq!(
-            without_console_program_path("C:\\Windows\\system32\\cmd.exe - C:\\tools\\run.exe"),
-            "C:\\tools\\run.exe"
-        );
-        // A dash with nothing after it says nothing either.
-        assert_eq!(
-            without_console_program_path("C:\\Windows\\system32\\cmd.exe - "),
-            ""
-        );
-    }
-
-    /// Only the bare console shape is dropped: every title that is not an
-    /// absolute Windows path to an `.exe` — including ones that CONTAIN one —
-    /// is returned byte-identical, so nothing a program chose is rewritten and
-    /// Unix labels (which never take the shape) cannot change at all.
-    #[test]
-    fn a_title_that_is_not_a_bare_program_path_is_never_touched() {
-        for title in [
-            "~\\aterm",
-            "~/aterm",
-            "vim README.md",
-            "/usr/bin/bash",
-            "pwsh.exe",
-            "bin\\tool.exe",
-            "C:\\apps\\foo.exe.bak\\notes.txt",
-            "C:\\Users\\x\\aterm",
-            "running C:\\tools\\run.exe now",
-            "C:\\tools\\run.exe.",
-            "C:\\tools\\run.exe -v",
-            "C:",
-            "",
-            "user@m17-tower: ~/aterm",
+        for (title, want) in [
+            (
+                "C:\\Windows\\system32\\cmd.exe - ping  build-01",
+                "ping  build-01",
+            ),
+            (
+                "C:\\Windows\\system32\\cmd.exe - C:\\tools\\run.exe",
+                "C:\\tools\\run.exe",
+            ),
+            ("~\\aterm", "~\\aterm"),
+            ("/usr/bin/bash", "/usr/bin/bash"),
+            ("pwsh.exe", "pwsh.exe"),
+            ("bin\\tool.exe", "bin\\tool.exe"),
+            (
+                "C:\\apps\\foo.exe.bak\\notes.txt",
+                "C:\\apps\\foo.exe.bak\\notes.txt",
+            ),
+            ("C:\\Users\\x\\aterm", "C:\\Users\\x\\aterm"),
+            (
+                "running C:\\tools\\run.exe now",
+                "running C:\\tools\\run.exe now",
+            ),
+            ("C:\\tools\\run.exe.", "C:\\tools\\run.exe."),
+            ("C:\\tools\\run.exe -v", "C:\\tools\\run.exe -v"),
+            ("C:", "C:"),
+            ("", ""),
+            ("user@m17-tower: ~/aterm", "user@m17-tower: ~/aterm"),
         ] {
-            assert_eq!(
-                without_console_program_path(title),
-                title,
-                "rewrote {title:?}"
-            );
+            assert_eq!(without_console_program_path(title), want, "{title:?}");
         }
-        // The two sheds compose: identity first, then the path shape.
-        assert_eq!(informative("vim README.md"), "vim README.md");
     }
 
     /// Windows names this machine from the OS, with no `hostname.exe` child (the

@@ -6,12 +6,9 @@
 //!
 //! A Bloom filter rejects absent trigrams; intersecting per-trigram posting lists
 //! (delta + varint line ids) yields candidate lines, which are verified against the
-//! text. The [`streaming`] module searches content row by row with bounded memory
-//! (literal, regex, fuzzy).
+//! text.
 //!
-//! `tests/search_vs_bruteforce.rs` pins verified search against brute force;
-//! `tests/conformance_streaming.rs` binds the streaming engine to the derived
-//! `StreamingSearch` model (`aterm_spec::derive::streaming_search_model()`).
+//! `tests/search_vs_bruteforce.rs` pins verified search against brute force.
 
 #![warn(missing_docs)]
 #![cfg_attr(
@@ -33,7 +30,6 @@ mod grapheme;
 mod index;
 mod iterators;
 mod literal;
-pub mod streaming;
 mod types;
 
 pub use bloom::BloomFilter;

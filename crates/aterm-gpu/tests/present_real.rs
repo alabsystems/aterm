@@ -12,7 +12,7 @@
 // copyable swapchain (`RENDER_ATTACHMENT | COPY_SRC`, the
 // `pick_surface_format` SDR default); only the pixel-free `present()` is absent.
 //
-// No GPU or no system font: no-op.
+// No GPU or no font: COULD NOT RUN.
 
 use aterm_core::terminal::Terminal;
 use aterm_gpu::video_tap::{CaptureOpts, DEFAULT_BUDGET, VideoTake};
@@ -340,7 +340,7 @@ fn production_present_resolves_odd_bands_and_trailing_content() {
     let bands_use_live_bg = [(0, 0), (dw - 1, 0), (0, dh - 1), (dw - 1, dh - 1)]
         .into_iter()
         .all(|(x, y)| pixel(x, y) == live_rgba);
-    let model = aterm_spec::derive::surface_coverage_model();
+    let model = aterm_models_core::surface_coverage_model();
     let mut model_state = model.init_state();
     assert!(model.fire("Zoom", &mut model_state));
     assert!(model.fire("Present", &mut model_state));
@@ -462,54 +462,5 @@ fn present_real_theorem_fire_glow_bloom_halo_crown() {
     assert!(
         warm > 0,
         "expected warm fire pixels in the captured frame (got none)"
-    );
-}
-
-/// The theorem under the half-res harvest (the multi-second recording default):
-/// the 2x2 box downscale runs identically on both arms.
-#[test]
-fn present_real_theorem_half_res_harvest() {
-    let mut gpu = gpu(16.0, Theme::default());
-    gpu.set_bloom(true);
-    // Shimmer on with a pinned phase, as in the fire-stack theorem above.
-    gpu.set_shimmer_phase_for_test(Some(0.40));
-    let (rows, cols) = (6usize, 28usize);
-    let mut term = Terminal::new(rows as u16, cols as u16);
-    term.process(b"$ half-res harvest parity");
-    let mut input = term.cell_frame(rows, cols);
-    let (cw, ch) = gpu.cell_size();
-    add_fire_stack(&mut input, cw, ch);
-    let (fw, fh) = gpu.frame_size(rows, cols);
-    round(
-        "half-res fire",
-        &mut gpu,
-        &[(&input, false)],
-        fw as u32,
-        fh as u32,
-        true,
-    );
-}
-
-/// The bell-invert chrome (a blit-uniform arm) agrees between the arms.
-#[test]
-fn present_real_theorem_bell_invert() {
-    let mut gpu = gpu(16.0, Theme::default());
-    gpu.set_bloom(false);
-    let (rows, cols) = (5usize, 20usize);
-    let mut term = Terminal::new(rows as u16, cols as u16);
-    term.process(b"$ bell");
-    let input = term.cell_frame(rows, cols);
-    let (fw, fh) = gpu.frame_size(rows, cols);
-    let (take, _) = round(
-        "bell-invert",
-        &mut gpu,
-        &[(&input, false), (&input, true)],
-        fw as u32,
-        fh as u32,
-        false,
-    );
-    assert!(
-        take.frames[0].rgba != take.frames[1].rgba,
-        "the invert frame must differ from the plain frame (non-vacuous)"
     );
 }

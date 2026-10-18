@@ -16,7 +16,8 @@ use serde::{Deserialize, Deserializer};
 enum Shape {
     Scalar,
     Object(&'static [Field]),
-    /// A list, each element read by the shape.
+    /// A list, each element read by the shape: a message's content as its
+    /// [`CONTENT_PART`]s ([`CONTENT`]) or its [`CALL_PART`]s ([`CALLS`]).
     Seq(&'static Shape),
 }
 
@@ -95,6 +96,35 @@ const COMMAND: Shape = Shape::Object(&COMMAND_FIELDS);
 const CONTENT_PART: Shape = Shape::Object(&[("type", Shape::Scalar), ("text", Shape::Scalar)]);
 /// A message's content: its parts' type and text, or the plain string.
 const CONTENT: Shape = Shape::Seq(&CONTENT_PART);
+/// A tool call or a tool's result as the approval loop reads it
+/// (`supervise::policy::box_call`): its kind, the call's id, its tool and the
+/// file it names, and the id of the call a result answers. Never the call's
+/// other arguments (`old_string`, `new_string`, `command`) nor the result's
+/// content.
+const CALL_PART: Shape = Shape::Object(&[
+    ("type", Shape::Scalar),
+    ("id", Shape::Scalar),
+    ("name", Shape::Scalar),
+    ("tool_use_id", Shape::Scalar),
+    (
+        "input",
+        Shape::Object(&[
+            ("file_path", Shape::Scalar),
+            ("notebook_path", Shape::Scalar),
+        ]),
+    ),
+]);
+/// A row as the approval loop reads it for the calls still waiting on a
+/// result: its type, whether it is a subagent's, and its content's calls and
+/// results (a prompt's plain string kept as it is).
+const CALLS: Shape = Shape::Object(&[
+    ("type", Shape::Scalar),
+    ("isSidechain", Shape::Scalar),
+    (
+        "message",
+        Shape::Object(&[("content", Shape::Seq(&CALL_PART))]),
+    ),
+]);
 /// What is kept of a limit row's `quotaLimits`: whether the request was
 /// rejected, the reset it names, which of the account's limits it was, and
 /// what it says of the account's usage credits — whether they are on
@@ -133,50 +163,47 @@ const CONVERSATION: Shape = Shape::Object(&[
     ("isCompactSummary", Shape::Scalar),
     ("isApiErrorMessage", Shape::Scalar),
     ("error", Shape::Scalar),
+    // A notice's typed kind (since 2.1.295) and the status it answered: what
+    // names the wall a notice is where its words do not
+    // (`supervise/wall_confirm.rs`'s `transcript_wall`).
+    ("apiError", Shape::Scalar),
+    ("apiErrorStatus", Shape::Scalar),
     ("timestamp", Shape::Scalar),
     ("subtype", Shape::Scalar),
+    // A `turn_duration` row's count of the background agents and dynamic
+    // workflows the turn ended waiting on: the supervisor's carried wait
+    // (`supervise/wall_confirm.rs`'s `waits_on_background`).
+    ("pendingBackgroundAgentCount", Shape::Scalar),
+    ("pendingWorkflowCount", Shape::Scalar),
     ("content", Shape::Scalar),
+    // Who asked a user row's turn (`task-notification`, `auto-continuation`,
+    // `peer`, `human`): Claude Code's own wakes reopen no finished task
+    // (`upgrade::FinishedScan`).
+    ("origin", Shape::Object(&[("kind", Shape::Scalar)])),
+    // The turn a user row was written in: a row that asks nothing under the
+    // running turn's id (a Stop hook's feedback) goes on that turn, and a
+    // prompt typed while the agent worked is recorded only as an attachment
+    // absorbed into it (`queued_command`; `upgrade::FinishedScan`).
+    ("promptId", Shape::Scalar),
+    (
+        "attachment",
+        Shape::Object(&[
+            ("type", Shape::Scalar),
+            ("prompt", CONTENT),
+            ("origin", Shape::Object(&[("kind", Shape::Scalar)])),
+        ]),
+    ),
+    // A system row's level, and the build that wrote a row: the resumed
+    // build's warning that something did not come back
+    // (`upgrade::resumed_build_warned`).
+    ("level", Shape::Scalar),
+    ("version", Shape::Scalar),
     ("quotaLimits", QUOTA_LIMITS),
     (
         "message",
         Shape::Object(&[("model", Shape::Scalar), ("content", CONTENT)]),
     ),
 ]);
-
-/// The Codex turn/head and sandbox readers use only these discriminants and
-/// context facts. Instructions, environment state, tool payloads and messages
-/// are still validated, but never materialized merely to identify their row.
-const CODEX_METADATA: Shape = Shape::Object(&[
-    ("type", Shape::Scalar),
-    ("timestamp", Shape::Scalar),
-    (
-        "payload",
-        Shape::Object(&[
-            ("type", Shape::Scalar),
-            ("role", Shape::Scalar),
-            ("cwd", Shape::Scalar),
-            ("model", Shape::Scalar),
-            ("sandbox_policy", Shape::Object(&[("type", Shape::Scalar)])),
-            // A `turn_context`'s permission mode, which a relaunch carries
-            // (`upgrade_codex::ThreadMode`); a `granular` policy's object
-            // is kept as null.
-            ("approval_policy", Shape::Scalar),
-            ("approvals_reviewer", Shape::Scalar),
-        ]),
-    ),
-]);
-
-struct CodexMetadata(Value);
-
-impl<'de> Deserialize<'de> for CodexMetadata {
-    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
-        CODEX_METADATA.deserialize(de).map(Self)
-    }
-}
-
-pub(crate) fn codex_metadata(line: &str) -> aterm_json::Result<Value> {
-    aterm_json::from_str::<CodexMetadata>(line).map(|v| v.0)
-}
 
 /// One token count of a Codex turn, in OpenAI's classes: `input_tokens`
 /// holds `cached_input_tokens`, and `output_tokens` holds
@@ -191,10 +218,11 @@ const CODEX_TOKENS: Shape = Shape::Object(&[
 ]);
 
 /// What the Codex spend fold reads of a rollout line
-/// (`supervise::codex_usage::TurnReader`): its stamp, a `session_meta`'s fork
-/// parent, a `turn_context`'s model and service tier, and a `token_count`'s
-/// running total and last turn. Instructions, tool payloads, messages and
-/// the rate limits are validated, never materialized.
+/// (`harness::codex_rollout::TurnReader`): its stamp, a `session_meta`'s
+/// thread, fork parent and history mode, a `thread_settings_applied`'s
+/// thread, a `turn_context`'s model and service tier, and a `token_count`'s
+/// running total and last turn. Instructions, tool payloads, messages, the
+/// thread settings and the rate limits are validated, never materialized.
 const CODEX_SPEND: Shape = Shape::Object(&[
     ("type", Shape::Scalar),
     ("timestamp", Shape::Scalar),
@@ -202,7 +230,10 @@ const CODEX_SPEND: Shape = Shape::Object(&[
         "payload",
         Shape::Object(&[
             ("type", Shape::Scalar),
+            ("id", Shape::Scalar),
+            ("thread_id", Shape::Scalar),
             ("forked_from_id", Shape::Scalar),
+            ("history_mode", Shape::Scalar),
             ("model", Shape::Scalar),
             ("service_tier", Shape::Scalar),
             (
@@ -228,9 +259,101 @@ pub(crate) fn codex_spend(line: &str) -> aterm_json::Result<Value> {
     aterm_json::from_str::<CodexSpend>(line).map(|v| v.0)
 }
 
+/// What the Codex limits reader reads of a rollout's first line
+/// (`ai::codex_limits::opening_account`): its stamp, and of its
+/// `session_meta` the thread, its conversation, its fork parent, its history
+/// mode and the two ids the account key is made from (hashed by the reader,
+/// never kept). The base instructions (about 20 KB) are validated, never
+/// materialized.
+const CODEX_META: Shape = Shape::Object(&[
+    ("type", Shape::Scalar),
+    ("timestamp", Shape::Scalar),
+    (
+        "payload",
+        Shape::Object(&[
+            ("id", Shape::Scalar),
+            ("session_id", Shape::Scalar),
+            ("forked_from_id", Shape::Scalar),
+            ("history_mode", Shape::Scalar),
+            ("creator_account_id", Shape::Scalar),
+            ("creator_user_id", Shape::Scalar),
+        ]),
+    ),
+]);
+
+struct CodexMeta(Value);
+
+impl<'de> Deserialize<'de> for CodexMeta {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        CODEX_META.deserialize(de).map(Self)
+    }
+}
+
+pub(crate) fn codex_meta(line: &str) -> aterm_json::Result<Value> {
+    aterm_json::from_str::<CodexMeta>(line).map(|v| v.0)
+}
+
+/// One window of a `token_count`'s `rate_limits` slot.
+const CODEX_WINDOW: Shape = Shape::Object(&[
+    ("used_percent", Shape::Scalar),
+    ("window_minutes", Shape::Scalar),
+    ("resets_at", Shape::Scalar),
+]);
+
+/// What the Codex limits reader reads of a `token_count`
+/// (`ai::codex_limits::rollout_rate_limits`): its stamp and its
+/// `rate_limits`, every key Codex 0.163.0 writes there but
+/// `normal_model_slug` (design F10). `individual_limit` is kept only as a
+/// scalar: no capture has carried anything but null. The turn's counts
+/// (`info`) are validated, never materialized.
+const CODEX_LIMITS: Shape = Shape::Object(&[
+    ("type", Shape::Scalar),
+    ("timestamp", Shape::Scalar),
+    (
+        "payload",
+        Shape::Object(&[
+            ("type", Shape::Scalar),
+            (
+                "rate_limits",
+                Shape::Object(&[
+                    ("limit_id", Shape::Scalar),
+                    ("limit_name", Shape::Scalar),
+                    ("primary", CODEX_WINDOW),
+                    ("secondary", CODEX_WINDOW),
+                    (
+                        "credits",
+                        Shape::Object(&[
+                            ("has_credits", Shape::Scalar),
+                            ("unlimited", Shape::Scalar),
+                            ("balance", Shape::Scalar),
+                        ]),
+                    ),
+                    ("individual_limit", Shape::Scalar),
+                    ("spend_control_reached", Shape::Scalar),
+                    ("plan_type", Shape::Scalar),
+                    ("rate_limit_reached_type", Shape::Scalar),
+                ]),
+            ),
+        ]),
+    ),
+]);
+
+struct CodexLimits(Value);
+
+impl<'de> Deserialize<'de> for CodexLimits {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        CODEX_LIMITS.deserialize(de).map(Self)
+    }
+}
+
+pub(crate) fn codex_limits(line: &str) -> aterm_json::Result<Value> {
+    aterm_json::from_str::<CodexLimits>(line).map(|v| v.0)
+}
+
 struct Usage(Value);
 struct Metadata<const CONTENT: bool>(Value);
 struct Conversation(Value);
+struct Calls(Value);
 
 impl<'de> Deserialize<'de> for Usage {
     fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
@@ -248,6 +371,12 @@ impl<'de, const CONTENT: bool> Deserialize<'de> for Metadata<CONTENT> {
 impl<'de> Deserialize<'de> for Conversation {
     fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
         CONVERSATION.deserialize(de).map(Self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Calls {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        CALLS.deserialize(de).map(Self)
     }
 }
 
@@ -269,6 +398,12 @@ pub(super) fn command(line: &str) -> aterm_json::Result<Value> {
 /// own error/limit metadata, but never tool arguments, images, or results.
 pub(crate) fn conversation(line: &str) -> aterm_json::Result<Value> {
     aterm_json::from_str::<Conversation>(line).map(|v| v.0)
+}
+
+/// The approval loop needs which calls wait on a result, their tools and the
+/// files they name, but never what a call writes or a result holds.
+pub(crate) fn calls(line: &str) -> aterm_json::Result<Value> {
+    aterm_json::from_str::<Calls>(line).map(|v| v.0)
 }
 
 impl<'de> DeserializeSeed<'de> for Shape {
@@ -405,6 +540,7 @@ mod tests {
             r#""text\n\uD83D\uDE80""#,
             r#"{"model":"opus","content":[{"type":"tool_use","input":{"rows":[1,2]}}],"usage":{"input_tokens":42}}"#,
             r#"{"model":"opus","content":[{"type":"tool_result","content":[{"text":"not a prompt"}]},null,12,"scalar",["nested"],{"type":"text","text":"first"},{"type":"text","text":"second"}]}"#,
+            r#"{"content":[{"type":"tool_use","id":"toolu_1","name":"Edit","input":{"file_path":"/p/notes.txt","old_string":"seed","new_string":"sprout","file_path":{"wrong":1}}},{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"text","text":"done"}]},{"type":"tool_use","id":2,"name":["Bash"],"input":"sed -i"}]}"#,
         ] {
             for text in [
                 value.to_owned(),
@@ -430,6 +566,9 @@ mod tests {
                     r#"{{"payload":{{"info":{{"total_token_usage":{value},"last_token_usage":{{"input_tokens":{value},"total_tokens":3,"total_tokens":{value}}},"rate_limits":{value}}}}}}}"#
                 ),
                 format!(
+                    r#"{{"payload":{{"type":{value},"id":{value},"thread_id":{value},"history_mode":{value},"creator_account_id":{value},"creator_user_id":"u","rate_limits":{{"limit_id":{value},"primary":{{"used_percent":{value},"resets_at":3,"resets_at":{value}}},"secondary":{value},"credits":{{"balance":{value}}},"individual_limit":{value},"normal_model_slug":{value}}}}}}}"#
+                ),
+                format!(
                     r#"{{"type":"ignored","t\u0079pe":"assistant","message":null,"message":{{"model":"opus","usage":{{"input_tokens":3,"input_tokens":{value}}}}}}}"#
                 ),
             ] {
@@ -447,54 +586,21 @@ mod tests {
                     conversation(&text).expect("conversation"),
                     project(full.clone(), CONVERSATION)
                 );
-                assert_eq!(
-                    codex_metadata(&text).expect("Codex metadata"),
-                    project(full.clone(), CODEX_METADATA)
-                );
+                assert_eq!(calls(&text).expect("calls"), project(full.clone(), CALLS));
                 assert_eq!(
                     codex_spend(&text).expect("Codex spend"),
-                    project(full, CODEX_SPEND)
+                    project(full.clone(), CODEX_SPEND)
+                );
+                assert_eq!(
+                    codex_meta(&text).expect("Codex meta"),
+                    project(full.clone(), CODEX_META)
+                );
+                assert_eq!(
+                    codex_limits(&text).expect("Codex limits"),
+                    project(full, CODEX_LIMITS)
                 );
             }
         }
-    }
-
-    /// THE LIMIT ROW, as Claude Code 2.1.286 writes it (the accounts design
-    /// §1's row; ids cut): the conversation projection keeps the keys of
-    /// `quotaLimits` its readers ask for — `status`, `resetsAt`,
-    /// `rateLimitType` and the usage credits' four — and nothing else of it
-    /// (`unifiedRateLimitFallbackAvailable`); the other projections keep no
-    /// `quotaLimits` at all. A key of the wrong shape reads as the null it
-    /// stands for, and does not cost the row its other keys.
-    #[test]
-    fn the_conversation_keeps_a_limit_rows_status_reset_and_limit_type() {
-        let row = r#"{"type":"assistant","isApiErrorMessage":true,"error":"rate_limit","timestamp":"2026-09-30T19:02:11.123Z","quotaLimits":{"status":"rejected","resetsAt":1790870400,"unifiedRateLimitFallbackAvailable":false,"rateLimitType":"seven_day","overageStatus":"rejected","overageDisabledReason":"org_level_disabled","isUsingOverage":false},"message":{"model":"<synthetic>","content":[{"type":"text","text":"You've hit your weekly limit · resets Oct 1 at 9am (America/Los_Angeles)"}]}}"#;
-        let kept = conversation(row).expect("a row");
-        let quota = kept.get("quotaLimits").expect("quotaLimits");
-        assert_eq!(
-            aterm_json::to_string(quota).expect("json"),
-            r#"{"isUsingOverage":false,"overageDisabledReason":"org_level_disabled","overageStatus":"rejected","rateLimitType":"seven_day","resetsAt":1790870400,"status":"rejected"}"#
-        );
-        // NEGATIVE CONTROL: the projections that read no limit keep none.
-        for other in [usage(row), metadata(row), command(row)] {
-            assert_eq!(other.expect("a row").get("quotaLimits"), None);
-        }
-        // Vendor type drift: each key of the wrong shape is null, the others
-        // are kept.
-        let drift = row
-            .replace(r#""status":"rejected""#, r#""status":{"is":"rejected"}"#)
-            .replace(
-                r#""rateLimitType":"seven_day""#,
-                r#""rateLimitType":["seven_day"]"#,
-            );
-        let kept = conversation(&drift).expect("a row");
-        let quota = kept.get("quotaLimits").expect("quotaLimits");
-        assert_eq!(quota.get("status"), Some(&Value::Null));
-        assert_eq!(quota.get("rateLimitType"), Some(&Value::Null));
-        assert_eq!(
-            quota.get("resetsAt").and_then(Value::as_u64),
-            Some(1_790_870_400)
-        );
     }
 
     #[test]
@@ -513,8 +619,10 @@ mod tests {
                 assert!(usage(&text).is_err(), "{text}");
                 assert!(metadata(&text).is_err(), "{text}");
                 assert!(conversation(&text).is_err(), "{text}");
-                assert!(codex_metadata(&text).is_err(), "{text}");
+                assert!(calls(&text).is_err(), "{text}");
                 assert!(codex_spend(&text).is_err(), "{text}");
+                assert!(codex_meta(&text).is_err(), "{text}");
+                assert!(codex_limits(&text).is_err(), "{text}");
             }
         }
         let deep = format!("{}0{}", "[".repeat(130), "]".repeat(130));

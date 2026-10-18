@@ -173,17 +173,6 @@ const _: () = {
     const _: () = assert!(M::SRCCOPY == 13369376);
 };
 
-// Win32::Networking::WinSock
-const _: () = {
-    use aterm_win32::Win32::Networking::WinSock as M;
-    const _: () = assert!(M::POLLIN == 768);
-    const _: () = assert!(M::SOCKET_ERROR == -1);
-    const _: () = assert!(size_of::<M::WSAPOLLFD>() == 16 && align_of::<M::WSAPOLLFD>() == 8);
-    const _: () = assert!(offset_of!(M::WSAPOLLFD, fd) == 0);
-    const _: () = assert!(offset_of!(M::WSAPOLLFD, events) == 8);
-    const _: () = assert!(offset_of!(M::WSAPOLLFD, revents) == 10);
-};
-
 // Win32::Security
 const _: () = {
     use aterm_win32::Win32::Security as M;

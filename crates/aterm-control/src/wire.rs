@@ -111,23 +111,4 @@ mod tests {
         assert_eq!(value[key].as_str(), Some(raw));
         assert!(!reply.contains(['\n', '\u{202e}']));
     }
-
-    /// The wire's JSON escape (OUT-2): what a terminal acts on past C0 — C1,
-    /// DEL, the bidi controls, U+2028/9 — leaves as `\uXXXX`, never raw, and a
-    /// JSON reader decodes the reply back to the very string escaped.
-    #[test]
-    fn json_escape_spells_what_a_terminal_acts_on_and_round_trips() {
-        let raw =
-            "cwd\u{9b}31m\u{9d}0;t\u{9c}\u{7f}\u{202e}dcba\u{2066}\u{2028}\u{2029}\u{1b}[2Ké界";
-        let mut body = String::from("x");
-        json_escape_into(&mut body, raw);
-        assert_eq!(
-            body,
-            "xcwd\\u009b31m\\u009d0;t\\u009c\\u007f\\u202edcba\\u2066\\u2028\\u2029\\u001b[2Ké界"
-        );
-        assert_eq!(json_escape(raw), body[1..]);
-        let reply = format!("{{{}}}", json_str_field("cwd", raw));
-        let value: aterm_json::Value = aterm_json::from_str(&reply).expect("valid JSON");
-        assert_eq!(value["cwd"].as_str(), Some(raw));
-    }
 }

@@ -57,8 +57,18 @@ fn durable(app: &App) -> (String, u64, usize) {
 }
 
 fn run(app: &mut App, op: ThemeCtlOp, now: Instant) -> Result<String, String> {
+    run_on(app, op, None, now)
+}
+
+/// [`run`] aimed at `session` (the session path's `@<sid>`).
+fn run_on(
+    app: &mut App,
+    op: ThemeCtlOp,
+    session: Option<u64>,
+    now: Instant,
+) -> Result<String, String> {
     let (tx, rx) = std::sync::mpsc::channel();
-    app.theme_control(op, now, tx);
+    app.theme_control(op, session, now, tx);
     rx.try_recv().expect("answered at once")
 }
 
@@ -473,7 +483,43 @@ fn control_theme_form_grammar() {
         parse_theme_form("preview Nord ttl=3600"),
         preview("Nord", 3600)
     );
+    // Spec `session-theme-draw`: the session sub-forms and the palette read.
+    assert_eq!(
+        parse_theme_form("palette"),
+        op(ThemeCtlOp::Palette { session: false })
+    );
+    assert_eq!(
+        parse_theme_form("palette session"),
+        op(ThemeCtlOp::Palette { session: true })
+    );
+    assert_eq!(parse_theme_form("session"), op(ThemeCtlOp::SessionStatus));
+    assert_eq!(
+        parse_theme_form("session status"),
+        op(ThemeCtlOp::SessionStatus)
+    );
+    assert_eq!(
+        parse_theme_form("session clear"),
+        op(ThemeCtlOp::SessionClear)
+    );
+    assert_eq!(
+        parse_theme_form("session set \"Harbour Night\""),
+        op(ThemeCtlOp::SessionSet {
+            selector: "Harbour Night".to_string()
+        })
+    );
+    assert_eq!(
+        parse_theme_form("session set dark:Aterm Night,light:Aterm Day"),
+        op(ThemeCtlOp::SessionSet {
+            selector: "dark:Aterm Night,light:Aterm Day".to_string()
+        })
+    );
     for junk in [
+        "session set",
+        "session set \"\"",
+        "session bogus",
+        "session clear now",
+        "session status x",
+        "palette x",
         "bogus",
         "status now",
         "list all",
@@ -608,4 +654,117 @@ fn settings_trial_never_takes_over_a_ctl_preview_and_refuses_a_missing_theme() {
             .as_deref()
             .is_some_and(|line| line.contains("No Such Theme"))
     );
+}
+
+/// One `key=value` field of a status line.
+fn field<'a>(status: &'a str, key: &str) -> &'a str {
+    status
+        .split_whitespace()
+        .find_map(|word| word.strip_prefix(key)?.strip_prefix('='))
+        .unwrap_or_else(|| panic!("{key} in {status}"))
+}
+
+/// `theme` names the chrome accent, where it came from and who set it: a
+/// grey-cursor theme borrows its ANSI blue, a coloured cursor is the accent,
+/// and a config `accent_color` is authored by the config. NEGATIVE CONTROL:
+/// with nothing authored, every chrome key's origin is `default` and the
+/// selected tab has no colour.
+#[test]
+fn theme_status_line_reports_chrome() {
+    let now = Instant::now();
+    let mut dracula = app_with("theme = \"Dracula\"\n");
+    let status = run(&mut dracula, ThemeCtlOp::Status, now).expect("status");
+    assert_eq!(field(&status, "accent_source"), "blue");
+    let blue = builtin("Dracula").ansi[4];
+    assert_eq!(
+        field(&status, "accent"),
+        format!("#{:02x}{:02x}{:02x}", blue.r, blue.g, blue.b)
+    );
+    for key in [
+        "accent_from",
+        "border_from",
+        "search_match_from",
+        "active_tab_from",
+    ] {
+        assert_eq!(field(&status, key), "default", "{key}");
+    }
+    assert_eq!(field(&status, "active_tab"), "-");
+
+    let mut default = app_with("");
+    let status = run(&mut default, ThemeCtlOp::Status, now).expect("status");
+    assert_eq!(field(&status, "accent_source"), "cursor");
+    assert_eq!(field(&status, "accent"), "#50fa7b");
+
+    let mut authored = app_with(
+        "theme = \"Dracula\"\naccent_color = \"#ff00aa\"\nactive_tab_color = \"#123456\"\n",
+    );
+    let status = run(&mut authored, ThemeCtlOp::Status, now).expect("status");
+    assert_eq!(field(&status, "accent_source"), "authored");
+    assert_eq!(field(&status, "accent"), "#ff00aa");
+    assert_eq!(field(&status, "accent_from"), "config");
+    assert_eq!(field(&status, "active_tab"), "#123456");
+    assert_eq!(field(&status, "active_tab_from"), "config");
+    assert_eq!(field(&status, "border_from"), "default");
+}
+
+/// The value of a `key="…"` field (Rust `{:?}` escaping), unescaped.
+fn quoted_field(status: &str, key: &str) -> String {
+    let start = status
+        .find(&format!(" {key}=\""))
+        .unwrap_or_else(|| panic!("{key} in {status}"))
+        + key.len()
+        + 3;
+    let mut out = String::new();
+    let mut chars = status[start..].chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => out.push(chars.next().expect("an escaped char")),
+            '"' => return out,
+            c => out.push(c),
+        }
+    }
+    panic!("{key} is unterminated in {status}");
+}
+
+/// `theme` names the typography the drawn theme applies, the keys a config
+/// key beat, and the size scale, each escaped so a font name with a quote in
+/// it cannot split the line. NEGATIVE CONTROL: a theme without typography
+/// reports `-` for all three.
+#[test]
+fn theme_status_line_reports_typography() {
+    let now = Instant::now();
+    let parsed = aterm_types::scheme::parse_theme_str(
+        "fg = #ffffff\nbg = #000000\nfont_family = Odd \"Quote\" Mono\nline_height = 1.2\n",
+    )
+    .expect("a typography theme");
+    let mut app = App::headless_for_test();
+    app.reload_theme_catalog(crate::app_config::ThemeCatalog::from_parsed([(
+        "Studio".to_string(),
+        parsed,
+    )]));
+    app.config = aterm_toml::from_str("theme = \"Studio\"\nline_height = 1.0\n").expect("toml");
+    app.typography = app.config.resolved_typography_with_flag(
+        aterm_types::Appearance::Dark,
+        &app.config_assets.themes,
+        None,
+    );
+    let status = run(&mut app, ThemeCtlOp::Status, now).expect("status");
+    assert!(
+        quoted_field(&status, "typography").contains("Odd \"Quote\" Mono"),
+        "{status}"
+    );
+    assert_eq!(quoted_field(&status, "typography_keys"), "font_family");
+    assert_eq!(
+        quoted_field(&status, "typography_shadowed"),
+        "line_height:config"
+    );
+    assert_eq!(field(&status, "font_size_scale"), "1.0");
+    // The fields after it still parse whole.
+    assert_eq!(field(&status, "palette").split(',').count(), 16);
+
+    let mut plain = app_with("theme = \"Dracula\"\n");
+    let status = run(&mut plain, ThemeCtlOp::Status, now).expect("status");
+    for key in ["typography", "typography_keys", "typography_shadowed"] {
+        assert_eq!(field(&status, key), "-", "{key}");
+    }
 }

@@ -298,6 +298,34 @@ unsafe impl Encode for *mut *mut std::ffi::c_uchar {
     const ENCODING: &'static str = "^*";
 }
 
+// SAFETY: `const uint8_t *` — a byte buffer an argument only reads
+// (`-initWithBytes:length:encoding:`, `-replaceRegion:…withBytes:…`); clang
+// spells it `r*` or `r^v`, every one a pointer in a general register.
+unsafe impl Encode for *const u8 {
+    const ENCODING: &'static str = "r*";
+}
+
+// SAFETY: `const uint32_t *` — a word buffer read by the caller of a getter.
+unsafe impl Encode for *const u32 {
+    const ENCODING: &'static str = "r^I";
+}
+
+// SAFETY: `unichar *` — `-getCharacters:range:`'s buffer (`^S`).
+unsafe impl Encode for *mut u16 {
+    const ENCODING: &'static str = "^S";
+}
+
+// SAFETY: `const unichar *` — `-initWithCharacters:length:`'s (`r^S`; the
+// qualifier changes nothing the call passes).
+unsafe impl Encode for *const u16 {
+    const ENCODING: &'static str = "^S";
+}
+
+// SAFETY: `id *` — an `NSError **` out-parameter (`^@`), written by the callee.
+unsafe impl Encode for *mut crate::runtime::Id {
+    const ENCODING: &'static str = "^@";
+}
+
 /// `@encode(BOOL *)` for the target being compiled. Not `"^"` plus
 /// [`BOOL_ENCODING`] on x86_64, and not `*` either:
 ///
@@ -311,7 +339,7 @@ unsafe impl Encode for *mut *mut std::ffi::c_uchar {
 ///
 /// Foundation's compiled methods agree:
 /// `-[NSFileManager fileExistsAtPath:isDirectory:]` is `c32@0:8@16^c24` on
-/// x86_64. `tests/adversary_w2d.rs` compares that argument with this constant.
+/// x86_64. `tests/declared_abi.rs` compares that argument with this constant.
 #[cfg(target_arch = "aarch64")]
 const BOOL_PTR_ENCODING: &str = "^B";
 /// See the `aarch64` arm.

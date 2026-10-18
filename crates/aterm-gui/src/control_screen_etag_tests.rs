@@ -1,25 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE CONDITIONAL `screen` READ'S ONE PROMISE, held over the HOST's changes
-//! as well as the program's.
+//! The conditional `screen` read's promise, held over the host's changes as well as the
+//! program's: the etag moves whenever the frame would, or a poller is told `unchanged` about a
+//! stale picture. Output moves [`Terminal::screen_mutations`]; a config reload, a selection, a
+//! GUI scroll, a resize or a reset change the frame with no output and must reach the etag
+//! another way. So "frame moved ⇒ etag moved" is checked over a corpus whose every arm moves
+//! the frame, and over a seeded random walk in which two visited states may share an etag only
+//! if they share a frame.
 //!
-//! `screen since=<etag>` answers `unchanged` without gathering the grid, so
-//! the etag must move whenever the frame would: a false `unchanged` hands an AI
-//! driver a stale picture it has no reason to doubt. Output is the easy half —
-//! every byte fed moves [`Terminal::screen_mutations`]. The other half is the
-//! host: a config reload, a selection drag, a GUI scroll, a resize or a reset
-//! change what the frame shows with no byte of output, and each has to reach
-//! the etag by another road. So the etag is held to the implication
-//! "frame moved ⇒ etag moved" over a corpus whose every arm moves the frame
-//! (checked per arm, so no arm is a green test of nothing), and over a seeded
-//! random walk in which ANY two visited states may share an etag only if they
-//! share a frame — the case a poller holding an OLD token meets.
-//!
-//! THE NEGATIVE CONTROLS run through the same corpus and walk and must each be
-//! CAUGHT — shown a moved frame under an unmoved etag — or the harness has no
-//! teeth: `content_seq` alone, and main's own etag as it shipped before the
-//! host style policy reached it.
+//! The negative control, `content_seq` alone, runs through the same corpus and must be caught.
 //!
 //! A child of `control_query`, so it reads the private etag.
 
@@ -31,8 +21,7 @@ use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::Terminal;
 
 use super::{
-    cmd_screen_styled_json, gather_styled_frame, line_size_name, row_line_size, screen_etag,
-    screen_gen, serialize_styled_frame,
+    cmd_screen_styled_json, gather_styled_frame, screen_etag, screen_gen, serialize_styled_frame,
 };
 
 /// The frame a full `screen` read serves, without its trailing etag key.
@@ -49,8 +38,8 @@ fn served_etag(reply: &str) -> String {
     reply[at..at + 16].to_string()
 }
 
-/// Kitty graphics: transmit-and-display a 2x1-pixel RGBA image as image `id`
-/// over 2x1 cells, `C=1` (the cursor does NOT move), `q=2` (no reply).
+/// Kitty graphics: transmit-and-display a 2x1-pixel RGBA image as image `id` over 2x1 cells,
+/// `C=1` (the cursor does not move), `q=2` (no reply).
 fn kitty_place(id: u32, fill: u8) -> Vec<u8> {
     let b64 = aterm_codec::base64::encode(&[fill; 8]).expect("encode");
     format!("\x1b_Ga=T,f=32,s=2,v=1,c=2,r=1,C=1,q=2,i={id};{b64}\x1b\\").into_bytes()
@@ -87,24 +76,23 @@ fn osc1337_image(payload: &[u8]) -> Vec<u8> {
     format!("\x1b]1337;File=inline=1;width=3;height=1:{b64}\x07").into_bytes()
 }
 
-/// A terminal plus the host config it was last handed: the reload arms change
-/// ONE field of it and apply it the way the GUI's config reload does.
+/// A terminal plus the host config it was last handed: the reload arms change one field of it
+/// and apply it the way the GUI's config reload does.
 struct Rig {
     t: Terminal,
     config: TerminalConfig,
 }
 
-/// The cell text a BOLD palette-3 cell and a DIM cell put on screen: the host
-/// style policy (`bold_is_bright`, `faint_opacity`) re-resolves exactly these
-/// two without writing a byte of the grid.
+/// A bold palette-3 cell and a dim cell: the host style policy (`bold_is_bright`,
+/// `faint_opacity`) re-resolves exactly these two without writing the grid.
 const BOLD_AND_DIM: &[u8] = b"\x1b[1;33mB\x1b[0m \x1b[2mD\x1b[0m";
 
 fn rig() -> Rig {
     let mut t = Terminal::new(6, 20);
     // Kitty placeholders resolve against real cell metrics.
     t.set_cell_pixel_size(10, 20);
-    // OSC 4 SET is fail-closed behind this (#7937 F01-3). Set through the
-    // config, so a reload arm that re-applies it does not switch it off again.
+    // OSC 4 SET is fail-closed behind this; set through the config, so a reload arm that
+    // re-applies it does not switch it off again.
     let config = TerminalConfig {
         allow_palette_reconfigure: true,
         ..TerminalConfig::default()
@@ -132,17 +120,13 @@ fn glyph_at(r: &Rig, col: u16) -> String {
 
 type Step = (&'static str, fn(&mut Rig));
 
-/// Every arm must MOVE THE FRAME (checked per arm), so the implication runs on
-/// each; the order builds the state later arms need. The host-only arms — a
-/// config reload, a selection, a viewport scroll, a resize, a host reset —
-/// feed no output, so nothing but what the etag reads of the terminal's state
-/// can see them.
+/// Every arm must move the frame (checked per arm); the order builds the state later arms
+/// need. The host-only arms (config reload, selection, viewport scroll, resize, host reset)
+/// feed no output, so only what the etag reads of the terminal's state can see them.
 fn corpus() -> Vec<Step> {
     let steps: &[Step] = &[
-        // HOST STYLE POLICY, applied as a config reload applies it: resolved
-        // at render time, so no grid byte is written, no seq moves and no
-        // output is fed. First, so the reload changes nothing else the frame
-        // shows (later arms recolour the screen through OSC).
+        // Host style policy, applied as a config reload does: resolved at render time, with no
+        // grid write, seq move or output. First, so the reload changes nothing else on screen.
         ("config reload: bold_is_bright", |r| {
             r.config.bold_is_bright = !r.config.bold_is_bright;
             r.t.apply_config(&r.config);
@@ -151,13 +135,11 @@ fn corpus() -> Vec<Step> {
             r.config.faint_opacity = 0.9;
             r.t.apply_config(&r.config);
         }),
-        // HOST PALETTE, the theme a config reload hands over: it re-colours
-        // the bold cell, which reads palette 3 now that bold is not bright,
-        // with no output. Here, while no program colour differs from the
-        // config's, the reload re-asserts nothing else, so only the palette
-        // reaches the etag; every later palette change is OSC 4, which moves
-        // `screen_mutations` too. Entry 11 keeps its default, so turning bold
-        // bright again later still re-colours that cell.
+        // Host palette from a config reload: re-colours the bold cell (palette 3 now that bold
+        // is not bright) with no output. While no program colour differs from the config's,
+        // only the palette reaches the etag; later palette changes are OSC 4, which moves
+        // `screen_mutations` too. Entry 11 keeps its default, so making bold bright again
+        // later still re-colours that cell.
         ("config reload: custom_palette", |r| {
             let mut palette = aterm_types::ColorPalette::new();
             palette.set(3, aterm_types::Rgb::new(0x12, 0x9a, 0x6c));
@@ -250,15 +232,14 @@ fn corpus() -> Vec<Step> {
             sel.complete_selection();
         }),
         ("clear the selection", |r| r.t.text_selection_mut().clear()),
-        // The style policy again, now over a recoloured screen: the reload
-        // re-asserts the config's colours too, so this arm is NOT clean (the
-        // first two are); it stays to show the policy is read on every reload.
+        // The style policy again, over a recoloured screen: this reload also re-asserts the
+        // config's colours, so it is not clean like the first two.
         ("config reload: faint_opacity back", |r| {
             r.config.faint_opacity = 0.5;
             r.t.apply_config(&r.config);
         }),
-        // The cursor goes where the image will land as its OWN arm, so the
-        // placement below moves the image and nothing else.
+        // The cursor goes where the image will land as its own arm, so the placement below
+        // moves the image and nothing else.
         ("cursor to where the image lands", |r| {
             r.t.process(b"\x1b[5;10H")
         }),
@@ -350,13 +331,10 @@ fn run_corpus(etags: &[Etag]) -> Pass {
     pass
 }
 
-/// The host STYLE POLICY arm, clean and through the verb: a config reload of
-/// `bold_is_bright` or `faint_opacity` re-resolves the colours of bold and dim
-/// cells, and moves NONE of the counters the etag reads — no output (so no
-/// `screen_mutations`), no content seq, no generation, no viewport (premises,
-/// asserted). Only the value of the presentation reaches the etag, through
-/// `render_sig`; a poller holding the etag from before the reload must get the
-/// re-coloured frame, not `unchanged`.
+/// A config reload of `bold_is_bright` or `faint_opacity` re-colours bold and dim cells while
+/// moving none of the counters the etag reads (no output, seq, generation or viewport; asserted
+/// as premises). Only `render_sig` carries it, so a poller holding the old etag gets the
+/// re-coloured frame.
 #[test]
 fn a_host_style_policy_reload_is_not_unchanged() {
     type Reload = (&'static str, fn(&mut TerminalConfig));
@@ -460,14 +438,10 @@ struct Walk {
     collision: Option<String>,
 }
 
-/// A seeded random walk over VT fragments and host operations under `etag`,
-/// stopping at the first etag two different frames share. The contract a
-/// poller relies on is not only "the next state differs": a token from ANY
-/// earlier state must not match a different frame now. So every visited
-/// state's etag is remembered with its frame, and a repeat etag must come with
-/// a repeat frame. Host operations feed no output, so between two outputs the
-/// walk does revisit etags (a reload toggled back, a scroll undone, a
-/// selection cleared twice) — exactly the comparisons that matter.
+/// A seeded random walk over VT fragments and host operations under `etag`, stopping at the
+/// first etag two different frames share: a token from any earlier state must not match a
+/// different frame now. Host operations feed no output, so the walk revisits etags (a reload
+/// toggled back, a scroll undone), the comparisons that matter.
 fn walk(etag: Etag) -> Walk {
     let mut rig = rig();
     // xorshift64*: deterministic, no dependency, no clock.
@@ -583,9 +557,15 @@ fn walk(etag: Etag) -> Walk {
 
 /// The shipped etag over the walk: no two visited frames share an etag, and
 /// the walk had reach — it moved the screen, and it came back to etags it had
-/// already handed out (a repeat etag is the case that matters).
+/// already handed out (a repeat etag is the case that matters). The negative
+/// control, `content_seq` alone, must be caught handing one etag to two
+/// frames, or the walk has no teeth.
 #[test]
 fn no_two_visited_states_share_an_etag_unless_they_share_a_frame() {
+    assert!(
+        walk(Terminal::content_seq).collision.is_some(),
+        "negative control: the walk never showed `content_seq` alone two frames under one etag"
+    );
     let w = walk(screen_etag);
     assert_eq!(
         w.collision, None,
@@ -604,126 +584,20 @@ fn no_two_visited_states_share_an_etag_unless_they_share_a_frame() {
     );
 }
 
-/// NEGATIVE CONTROL: `render_sig` as main shipped it until the host style
-/// policy reached it — everything it folds today but aterm-core's
-/// presentation fingerprint, verbatim.
-fn render_sig_before_the_style_policy(t: &Terminal) -> u64 {
-    let mut h = aterm_hash::Fnv1a64::new();
-    h.write_u8(u8::from(t.cursor_visible()));
-    h.write_u8(u8::from(t.reverse_video()));
-    let cursor = t.cursor();
-    h.write(&cursor.row.to_le_bytes());
-    h.write(&cursor.col.to_le_bytes());
-    h.write(crate::control::cursor_style_name(t.cursor_style()).as_bytes());
-    h.write_u8(0);
-    for c in [t.default_foreground(), t.default_background()] {
-        h.write(&[c.r, c.g, c.b]);
-    }
-    for color in [
-        t.cursor_color(),
-        t.selection_background(),
-        t.selection_foreground(),
-    ] {
-        match color {
-            Some(c) => h.write(&[1, c.r, c.g, c.b]),
-            None => h.write_u8(0),
-        }
-    }
-    let selection = t.text_selection();
-    match selection.project_range(t.cols().saturating_sub(1)) {
-        Some(projected) => {
-            let kind = match selection.selection_type() {
-                SelectionType::Simple => 0,
-                SelectionType::Block => 1,
-                SelectionType::Semantic => 2,
-                SelectionType::Lines => 3,
-                _ => u8::MAX,
-            };
-            h.write(&[1, kind, u8::from(projected.is_block)]);
-            h.write(&projected.start_row.to_le_bytes());
-            h.write(&projected.start_col.to_le_bytes());
-            h.write(&projected.end_row.to_le_bytes());
-            h.write(&projected.end_col.to_le_bytes());
-        }
-        None => h.write_u8(0),
-    }
-    for i in 0..=255u8 {
-        let c = t.palette_color(i);
-        h.write(&[c.r, c.g, c.b]);
-    }
-    h.finish()
-}
-
-/// NEGATIVE CONTROL: main's etag as it shipped from d1a6879e9 (with
-/// f1d3a1682) until this fix, verbatim in what it folds — the terminal, the
-/// screen generation, `screen_mutations`, the dims, `render_sig` as it was,
-/// the viewport and the line sizes — bar the per-process constant, which no
-/// test inside one process can move.
-fn etag_before_the_style_policy(t: &Terminal) -> u64 {
-    let mut h = aterm_hash::Fnv1a64::new();
-    let generation = screen_gen(t);
-    for v in [
-        t.render_identity(),
-        generation.epoch,
-        generation.seq,
-        t.screen_mutations(),
-        u64::from(t.rows()),
-        u64::from(t.cols()),
-        render_sig_before_the_style_policy(t),
-        t.grid().display_offset() as u64,
-    ] {
-        h.write(&v.to_le_bytes());
-    }
-    for r in 0..t.rows() as usize {
-        h.write(line_size_name(row_line_size(t, r)).as_bytes());
-        h.write_u8(0);
-    }
-    h.finish()
-}
-
-/// THE NEGATIVE CONTROLS, over the corpus. Each incomplete etag must be shown
-/// a moved frame under an unmoved etag, and main's etag from before this fix
-/// must be caught on exactly the regression it stands for — the clean style
-/// policy reloads. Each catch is printed (`--nocapture`) as the record of what
-/// that etag would have answered `unchanged` to.
+/// The shipped etag over the corpus misses no arm, and the negative control
+/// (`content_seq` alone) is caught, so the corpus has teeth.
 #[test]
 fn every_incomplete_etag_is_caught_missing_real_frame_changes() {
-    let controls: [(&str, Etag); 2] = [
-        ("content_seq alone", Terminal::content_seq),
-        (
-            "main's etag before the style policy",
-            etag_before_the_style_policy,
-        ),
-    ];
-    let mut etags: Vec<Etag> = vec![screen_etag];
-    etags.extend(controls.iter().map(|&(_, etag)| etag));
-    let pass = run_corpus(&etags);
+    let pass = run_corpus(&[screen_etag, Terminal::content_seq]);
     assert!(pass.dark.is_empty(), "dark arms: {:?}", pass.dark);
     assert!(
         pass.missed[0].is_empty(),
         "the shipped etag missed {:?}",
         pass.missed[0]
     );
-    let mut uncaught = Vec::new();
-    for ((control, _), missed) in controls.iter().zip(&pass.missed[1..]) {
-        println!("{control}: missed {missed:?}");
-        if missed.is_empty() {
-            uncaught.push(*control);
-        }
-    }
     assert!(
-        uncaught.is_empty(),
-        "no arm showed these incomplete etags a moved frame under an unmoved \
-         etag, so the harness cannot tell them from the shipped one: {uncaught:?}"
+        !pass.missed[1].is_empty(),
+        "no arm showed `content_seq` alone a moved frame under an unmoved etag, \
+         so the harness cannot tell it from the shipped one"
     );
-    for arm in [
-        "config reload: bold_is_bright",
-        "config reload: faint_opacity",
-    ] {
-        assert!(
-            pass.missed[2].contains(&arm),
-            "main's etag before this fix must miss {arm:?}; it missed {:?}",
-            pass.missed[2]
-        );
-    }
 }

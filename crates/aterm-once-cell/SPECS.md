@@ -3,6 +3,10 @@
 
 # aterm-once-cell: spec recovery from its 23 unit tests
 
+> Status 2026-10-17: seven of the eight §4 checks are deleted (the racy-cell negative control and
+> the six `consumers.rs` dependency-graph guards), and their rows are gone. Counts elsewhere in this
+> file were taken before.
+
 > Status 2026-10-16: spec recovery only, and no test has been deleted yet. This file is
 > the crate's migration worklist. Each of the 8 specs below is proved through Trust/Clean,
 > and then the tests it subsumes are deleted. The 8 checks in §4 sample no spec. Two of them
@@ -95,14 +99,14 @@ CellModel) → `oncebox-refines-cellmodel` and `lazy-refines-lazymodel` (by comp
 `sync-panic-leaves-cell-empty-and-unpoisoned` (panic edges) → `sync-init-exactly-once-concurrent`
 (the concurrent model).
 
-## 2. Test → spec map (TSV; all 23)
+## 2. Test → spec map (TSV)
 
-`primary` is the spec that retires the test. `also` lists the other specs the same test samples.
+`primary` is the spec that retires the test. `also` lists the other specs the same test samples. The
+tests deleted since have no row.
 
 ```tsv
 file	test	primary	also
 tests/behaviour.rs	get_or_try_init_runs_the_closure_exactly_once_under_contention	sync-init-exactly-once-concurrent	sync-oncecell-refines-cellmodel
-tests/behaviour.rs	the_exactly_once_test_catches_a_racy_cell	NON-SPEC (tests a test-only RacyCell; timing-dependent, retries)	
 tests/behaviour.rs	a_failed_initialiser_leaves_the_cell_empty_and_retryable	sync-oncecell-refines-cellmodel	
 tests/behaviour.rs	set_is_single_assignment_and_reports_the_loser	sync-oncecell-refines-cellmodel	
 tests/behaviour.rs	take_and_into_inner_empty_the_cell	sync-oncecell-refines-cellmodel	
@@ -118,12 +122,6 @@ tests/behaviour.rs	once_box_runs_its_initialiser_once_under_contention	sync-init
 tests/behaviour.rs	unsync_once_cell_matches_its_sync_sibling	unsync-oncecell-refines-cellmodel	sync-oncecell-refines-cellmodel
 tests/behaviour.rs	unsync_get_or_try_init_refuses_a_reentrant_initialisation	unsync-reentrant-init-panics	
 tests/behaviour.rs	a_panicking_initialiser_leaves_the_cell_usable	sync-panic-leaves-cell-empty-and-unpoisoned	sync-oncecell-refines-cellmodel
-tests/consumers.rs	parse_path_resolves_every_import_form_or_says_it_cannot	NON-SPEC (test-only helper)	
-tests/consumers.rs	every_once_cell_path_in_the_graph_is_an_item_this_shim_provides	NON-SPEC (dependency-graph guard)	
-tests/consumers.rs	no_consumer_reaches_for_an_item_this_shim_omits	NON-SPEC (dependency-graph guard)	
-tests/consumers.rs	the_consumer_set_is_still_the_one_this_shim_was_measured_against	NON-SPEC (lockfile tripwire)	
-tests/consumers.rs	the_dead_consumers_are_still_dead	NON-SPEC (dependency-graph guard)	
-tests/consumers.rs	no_cell_enables_a_feature_this_shim_ignores	NON-SPEC (build-graph guard)	
 ```
 
 ## 3. Coverage
@@ -137,21 +135,15 @@ tests/consumers.rs	no_cell_enables_a_feature_this_shim_ignores	NON-SPEC (build-g
 ## 4. Tests that are not spec samples
 
 > Status 2026-10-16: `the_exactly_once_test_catches_a_racy_cell` (and its test-only `RacyCell`) is deleted; the contention test it guarded stays until the `sync-init-exactly-once-concurrent` proof lands.
+>
+> Status 2026-10-17: the six `consumers.rs` guards are deleted too, and their rows and the racy
+> cell's are gone. One row is left.
 
 | test | why | action |
 |---|---|---|
-| behaviour::the_exactly_once_test_catches_a_racy_cell | It tests `RacyCell`, a type that exists only in the test file, as the negative control for a timing-dependent test. It retries up to 20 times and depends on a 120 ms sleep. AGENTS.md forbids both: a check never retries, and timing tests are deleted. The proof of `sync-init-exactly-once-concurrent` replaces it with a mutation control that removes the gate. | **delete** |
 | behaviour::the_unwind_safety_surface_matches_upstream | The trait solver decides this at compile time, and the runtime body does nothing. Move the `rus`/`us` assertions into a module-level `const _: () = { .. }` or `fn _assert()` item, like the existing `WasmBindgenShapedCell` const block, so rustc itself is the proof. Then delete the `#[test]`. | **delete** (after moving the assertions to a const item) |
-| consumers::parse_path_resolves_every_import_form_or_says_it_cannot | It tests `parse_path`, a helper that is defined only in this test file and has no production caller. If the consumer census becomes an `aterm-census` guard, the helper and its check go with it. | **move-to-bench** (with the census guard) |
-| consumers::every_once_cell_path_in_the_graph_is_an_item_this_shim_provides | A repository tripwire over the resolved dependency graph and third-party sources (`cargo metadata`, a filesystem walk). It is not a property of any function in the crate. | **move-to-bench** (an `aterm-census` guard or a `verify` check) |
-| consumers::no_consumer_reaches_for_an_item_this_shim_omits | A lexical scan of third-party sources for names the shim omits. It is a dependency-graph guard. | **move-to-bench** |
-| consumers::the_consumer_set_is_still_the_one_this_shim_was_measured_against | It pins the `cargo tree` parent set of each cell against a hardcoded table. That is an environment and lockfile tripwire. | **move-to-bench** |
-| consumers::the_dead_consumers_are_still_dead | It checks cfg guards in third-party sources and the resolved feature sets. That is a dependency-graph guard. | **move-to-bench** |
-| consumers::no_cell_enables_a_feature_this_shim_ignores | It checks the resolved feature flags across five target cells through `cargo tree`. That is a build-graph guard. | **move-to-bench** |
 
-Counts by action: delete 2, move-to-bench 6. "move-to-bench" here means leaving the unit suite
-for an `aterm-census` guard or a `verify` check (`verify guards`). These are repository
-guards, not benchmarks.
+Counts by action: delete 1.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
@@ -163,25 +155,19 @@ guards, not benchmarks.
    and the doc reads as if it covered `Lazy` too. Recommendation: either narrow the doc or add a
    clause to `lazy-refines-lazymodel`: a panicking `init` leaves `(None, None)`, and every later
    force panics.
-2. **`consumers.rs` breaks the process-spawning rule.** It runs `Command::new(env!("CARGO"))`
-   (`cargo_uncached`) under a file-wide `#![allow(clippy::disallowed_types)]`. AGENTS.md requires
-   `aterm_uds::spawnfd::command` and an `#[expect]` on the one statement. Its 15+ `cargo tree` and
-   `cargo metadata` invocations also make these tests depend on the network and the lockfile. They
-   are repository guards, not unit tests.
-3. **The contention tests are probabilistic.** `the_exactly_once_test_catches_a_racy_cell` loops up
-   to 20 times until it sees a race (a retrying check) and depends on a 120 ms sleep window. The
-   three contention tests also widen the window with `thread::sleep`. That does not affect their
-   passing direction, but they catch a broken cell only by chance. The proof must not inherit this:
-   its negative control is a mutation (remove the gate), not a race.
-4. **Prose-pinning on std's panic message.** `unsync_get_or_try_init_refuses_a_reentrant_initialisation`
+2. **The contention tests are probabilistic.** The three contention tests widen the race window
+   with `thread::sleep`. That does not affect their passing direction, but they catch a broken cell
+   only by chance. The proof must not inherit this: its negative control is a mutation (remove the
+   gate), not a race.
+3. **Prose-pinning on std's panic message.** `unsync_get_or_try_init_refuses_a_reentrant_initialisation`
    pins the panic text "reentrant init". In the `get_or_init` and control cases that text comes from
    `core::cell::OnceCell`, not from this crate. The spec requires only that the call panics.
-5. **Pinning std's pointer formatting.** `debug_and_eq_match_the_upstream_shapes` asserts that the
+4. **Pinning std's pointer formatting.** `debug_and_eq_match_the_upstream_shapes` asserts that the
    Debug output of a null `OnceBox` is exactly `"OnceBox(0x0)"`. That pins std's `{:p}` rendering,
    not a property of this crate. The spec says only that the pointer is null iff `Abs = None`. The
    `Lazy` Debug field layout it checks is a legitimate compatibility contract with upstream, and it
    stays in the spec.
-6. **Two tests in the map mix a compile-time fact with a runtime sample.**
+5. **Two tests in the map mix a compile-time fact with a runtime sample.**
    `lazy_new_is_unbounded_in_f_the_way_wasm_bindgen_needs` and `lazy_is_sync_when_upstream_says_it_is`
    mainly assert trait or const facts, and only their final `assert_eq!` samples `lazy-refines-lazymodel`.
    Move the `Sync` assertion into a `const _` item like the existing one, then delete both tests once
@@ -212,7 +198,5 @@ not retire a test.
    Trust's concurrency lane (gaps 10, 13). Do not delete the three contention tests until the
    proof about the compiled code is Certified.
 
-Do the §4 actions now. They need no proof: move the unwind-safety and `Sync` assertions into
-`const _` items, delete `the_exactly_once_test_catches_a_racy_cell` and
-`the_unwind_safety_surface_matches_upstream`, and move the six `consumers.rs` guards to
-`aterm-census`.
+Do the §4 action now. It needs no proof: move the unwind-safety and `Sync` assertions into
+`const _` items and delete `the_unwind_safety_surface_matches_upstream`.

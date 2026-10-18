@@ -3,9 +3,11 @@
 
 use super::*;
 
-/// A due read is already in flight when the owner switches Codex off. Its
-/// answer cannot start an upgrade or become a step the loop applies; Claude's
-/// worker continues under the same policy. Channels order the edit and answer.
+/// A due read is already in flight when the owner switches Claude Code off.
+/// Its answer cannot start an upgrade or become a step the loop applies;
+/// another agent's worker (agy's) continues under the same policy. Channels
+/// order the edit and answer. (Re-homed from Codex, whose worker watches
+/// only and reads nothing due since the Codex screen lane's retirement.)
 #[test]
 fn switching_one_agent_off_fences_an_inflight_idle_read() {
     switch_off_during_idle(false);
@@ -32,12 +34,12 @@ fn release_after_edit(release: &(Mutex<bool>, Condvar), entered: &std::sync::mps
 
 fn switch_off_during_idle(in_step: bool) {
     let world = Arc::new(World::default());
-    world.set(&[("codex", Program::Codex), ("claude", Program::Claude)]);
+    world.set(&[("off", Program::Claude), ("other", Program::Agy)]);
     let reading = Arc::new(AtomicBool::new(false));
     let release = Arc::new((Mutex::new(false), Condvar::new()));
     let advance = Arc::new(AtomicBool::new(false));
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-    let (claude_tx, claude_rx) = std::sync::mpsc::channel();
+    let (other_tx, other_rx) = std::sync::mpsc::channel();
     let (result_tx, result_rx) = std::sync::mpsc::channel();
     let steps = Arc::new(Mutex::new(Vec::new()));
     let body: Arc<BodyFn> = {
@@ -47,10 +49,10 @@ fn switch_off_during_idle(in_step: bool) {
             let me = std::thread::current();
             let parked = me.clone();
             *job.interrupt.lock().unwrap() = Some(Box::new(move || parked.unpark()));
-            if job.agent == Program::Codex {
+            if job.sid == "off" {
                 reading.store(true, Ordering::SeqCst);
             } else {
-                claude_tx.send(me).unwrap();
+                other_tx.send(me).unwrap();
                 while !advance.load(Ordering::SeqCst) && !job.stop.load(Ordering::SeqCst) {
                     std::thread::park();
                 }
@@ -68,7 +70,7 @@ fn switch_off_during_idle(in_step: bool) {
         let release = Arc::clone(&release);
         let entered = entered_tx.clone();
         Arc::new(move |sid| {
-            if sid == "codex" {
+            if sid == "off" {
                 if !reading.load(Ordering::SeqCst) {
                     return Due::No;
                 }
@@ -84,7 +86,7 @@ fn switch_off_during_idle(in_step: bool) {
         let release = Arc::clone(&release);
         Arc::new(move |sid, _| {
             steps.lock().unwrap().push(sid.to_string());
-            if sid == "codex" && in_step {
+            if sid == "off" && in_step {
                 release_after_edit(&release, &entered_tx);
             }
             "wait:point".to_string()
@@ -92,9 +94,9 @@ fn switch_off_during_idle(in_step: bool) {
     };
     let host = HostHandle::start(on(), false, false, h);
     entered_rx.recv_timeout(Duration::from_secs(60)).unwrap();
-    let claude = claude_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+    let other = other_rx.recv_timeout(Duration::from_secs(60)).unwrap();
     let mut cfg = on();
-    cfg.set("codex.enabled", "false").unwrap();
+    cfg.set("claude.enabled", "false").unwrap();
     host.set_config(cfg);
     let stops: Vec<_> = host
         .shared
@@ -104,7 +106,7 @@ fn switch_off_during_idle(in_step: bool) {
         .map(|s| (s.agent, s.stop.load(Ordering::SeqCst)))
         .collect();
     advance.store(true, Ordering::SeqCst);
-    claude.unpark();
+    other.unpark();
     {
         let (lock, wake) = &*release;
         *lock.lock().unwrap() = true;
@@ -115,33 +117,27 @@ fn switch_off_during_idle(in_step: bool) {
         .collect();
     host.shutdown_and_join();
     assert!(
-        stops.contains(&(Program::Codex, true)),
-        "off synchronously stops Codex"
+        stops.contains(&(Program::Claude, true)),
+        "off synchronously stops Claude Code"
     );
     assert!(
-        stops.contains(&(Program::Claude, false)),
-        "Claude's existing worker keeps running"
+        stops.contains(&(Program::Agy, false)),
+        "the other agent's existing worker keeps running"
     );
     let steps = steps.lock().unwrap();
     assert_eq!(
-        steps.iter().filter(|s| *s == "codex").count(),
+        steps.iter().filter(|s| *s == "off").count(),
         usize::from(in_step),
         "a late read starts no upgrade; an already-started request runs once"
     );
     assert_eq!(
-        steps.iter().filter(|s| *s == "claude").count(),
-        1,
-        "the other agent can still take its next idle step"
-    );
-    assert_eq!(
-        results.get("codex"),
+        results.get("off"),
         Some(&false),
-        "Codex's late result is discarded"
+        "the switched-off agent's late result is discarded"
     );
-    assert_eq!(
-        results.get("claude"),
-        Some(&true),
-        "Claude still applies its step"
+    assert!(
+        results.contains_key("other"),
+        "the other agent's worker still reaches its idle point"
     );
 }
 
@@ -173,7 +169,7 @@ fn revoke_exit_read(commit: bool) {
     };
     h.acts.carry = {
         let carries = Arc::clone(&carries);
-        Arc::new(move |_, _, _, _| {
+        Arc::new(move |_, _, _, _, _| {
             carries.fetch_add(1, Ordering::SeqCst);
             "done".to_string()
         })
@@ -227,7 +223,7 @@ fn switching_off_revokes_a_cold_relaunch_read_already_inflight() {
     };
     h.acts.relaunch_restored = {
         let relaunched = Arc::clone(&relaunched);
-        Arc::new(move |_, _, _| {
+        Arc::new(move |_, _, _, _| {
             relaunched.fetch_add(1, Ordering::SeqCst);
             "done".to_string()
         })
@@ -382,7 +378,7 @@ fn an_off_on_edit_revokes_an_inflight_restored_landing_read() {
     let release = Arc::new((Mutex::new(false), Condvar::new()));
     let released = Arc::clone(&release);
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-    hooks.acts.relaunch_restored = Arc::new(|_, _, _| "adopted".to_string());
+    hooks.acts.relaunch_restored = Arc::new(|_, _, _, _| "adopted".to_string());
     hooks.acts.exited = Arc::new(|_, _| true);
     hooks.acts.snapshot = Arc::new(move |sid| {
         release_after_edit(&released, &entered_tx);
@@ -473,25 +469,38 @@ fn claude_code_switched_off_turns_the_accounts_off() {
 /// THE REOPENED LAYOUT'S ROW ASKS THE ADMISSION OF EACH AGENT IT CARRIED
 /// ([`HostHandle::relaunches_restored_of`]): with Codex switched off, a
 /// restored Claude Code is relaunched and a restored Codex is not, as the
-/// restored queue decides ([`restored_allowed`]). NEGATIVE CONTROLS: with
-/// both on, both are; with `[harness] relaunch = false`, neither is.
+/// restored queue decides ([`restored_allowed`]). Muse Code is relaunched
+/// (its relaunch lane), and with Muse Code switched off it is not. agy and
+/// Gemini CLI, which a leaf may name, are relaunched never: switched on and
+/// admitted, they have no lane (`lanes()`), so the row says them lost, never
+/// resuming. NEGATIVE CONTROLS: with all on, Claude Code, Codex and Muse Code
+/// are; with `[harness] relaunch = false`, none is.
 #[test]
 fn the_reopened_row_asks_each_agents_admission() {
     use aterm_agent::harness::upgrade::Agent;
     let of = |cfg: SupervisorConfig| {
         let world = Arc::new(World::default());
         let host = HostHandle::start(cfg, false, true, hooks(&world, parking_body(&world)));
-        let told = [Agent::Claude, Agent::Codex].map(|agent| host.relaunches_restored_of(agent));
+        let admitted = Agent::ALL.map(|agent| host.admits(agent.program()));
+        let told = Agent::ALL.map(|agent| host.relaunches_restored_of(agent));
         host.shutdown_and_join();
-        told
+        (admitted, told)
     };
     let mut codex_off = on();
     codex_off.off.push(Program::Codex);
-    assert_eq!(of(codex_off), [true, false]);
-    assert_eq!(of(on()), [true, true]);
+    let ([_, _, unlaned @ ..], told) = of(codex_off);
+    assert_eq!(
+        unlaned, [true; 3],
+        "PRECONDITION: agy, Muse Code, Gemini CLI admitted"
+    );
+    assert_eq!(told, [true, false, false, true, false]);
+    assert_eq!(of(on()).1, [true, true, false, true, false]);
+    let mut muse_off = on();
+    muse_off.off.push(Program::Muse);
+    assert_eq!(of(muse_off).1, [true, true, false, false, false]);
     let mut limited = on();
     limited.set("relaunch", "false").unwrap();
-    assert_eq!(of(limited), [false, false]);
+    assert_eq!(of(limited).1, [false; 5]);
 }
 
 /// AN AGENT SWITCHED OFF IN THE TAB ENDS THE EXIT LEFT TO THE HOST: a
@@ -518,7 +527,7 @@ fn an_agent_switched_off_in_the_tab_ends_the_exit_left_to_the_host() {
         a.open.lock().unwrap().insert("s-a".to_string());
         a.set(&[("s-a", Program::Claude)]);
         let mut h = a.hooks();
-        h.acts.relaunch_restored = Arc::new(|_, _, _| "refused:inert".to_string());
+        h.acts.relaunch_restored = Arc::new(|_, _, _, _| "refused:inert".to_string());
         // The line types nothing while another program holds the tab, as the
         // live one waits for its shell's prompt.
         let (world, line) = (Arc::clone(&a), Arc::clone(&h.acts.relaunch));
@@ -615,6 +624,7 @@ fn revocation_fixture() -> (HostHandle, WorkerJob, Workers, Hooks) {
         interrupt: Arc::clone(&worker.interrupt),
         handover: Arc::clone(&worker.handover),
         clear_badge: false,
+        unset_mark: false,
         faults: Arc::default(),
         park: Arc::clone(&worker.park),
         look_at: Arc::clone(&worker.look_at),
@@ -654,7 +664,7 @@ fn an_agent_switched_off_overtakes_a_restored_relaunch_of_its_tab() {
         let a = Arc::new(Acting::default());
         a.open.lock().unwrap().insert("s-a".to_string());
         let mut h = a.hooks();
-        h.acts.relaunch_restored = Arc::new(|_, _, _| "wait:shell-prompt".to_string());
+        h.acts.relaunch_restored = Arc::new(|_, _, _, _| "wait:shell-prompt".to_string());
         let mut codex_off = on();
         codex_off.off.push(Program::Codex);
         let host = HostHandle::start(codex_off, false, false, h);
@@ -766,7 +776,7 @@ fn an_agent_ended_while_switched_off_is_forgotten() {
 fn the_hosts_admission_is_the_policys_agent_by_agent() {
     let agents: Vec<Program> = Program::ALL
         .into_iter()
-        .filter(|p| p.supervisable())
+        .filter(|p| p.harness_table())
         .collect();
     let mut every_off = on();
     every_off.off = agents.clone();

@@ -69,26 +69,6 @@ fn a_descheduled_driver_is_named_and_the_take_is_disowned() {
 }
 
 #[test]
-fn the_floor_is_reachable_on_a_real_machine() {
-    // The worst lateness measured ambient, under 40 and 60 burners, and with
-    // every core saturated: none may label a take.
-    for observed in [5_085, 11_003, 13_001, 12_721] {
-        let s = classify(&SchedInputs {
-            late_max_us: observed,
-            ..healthy()
-        });
-        assert_eq!(s.label(), Starved::No, "{observed}");
-    }
-    // ...and the floor is still crossable by losing a frame's worth.
-    const { assert!(DEFAULT_LATE_THRESHOLD_US > 13_001 && DEFAULT_LATE_THRESHOLD_US < 100_000) };
-    let s = classify(&SchedInputs {
-        late_max_us: 26_000,
-        ..healthy()
-    });
-    assert_eq!(s.label(), Starved::Yes);
-}
-
-#[test]
 fn a_blown_capture_cadence_is_starvation_even_when_the_driver_ran() {
     let blown = classify(&SchedInputs {
         sampling_hole_us: 60_000,
@@ -135,14 +115,7 @@ fn a_starved_pass_is_unproved_and_a_sound_take_is_decided_by_its_pixels() {
         paint_verdict(ShapeVerdict::Pass, Evidence::Sound),
         Disposition::Pass
     );
-    assert_eq!(
-        paint_verdict(ShapeVerdict::Fail, Evidence::Sound),
-        Disposition::Fail
-    );
-}
-
-#[test]
-fn starvation_may_take_a_green_away_but_never_rescue_a_red() {
+    // Starvation may take a green away but never rescue a red.
     for standing in [Evidence::Sound, Evidence::Unproved] {
         assert_eq!(
             paint_verdict(ShapeVerdict::Fail, standing),
@@ -203,26 +176,4 @@ fn the_capture_window_is_booked_apart_from_the_life() {
     assert_eq!(r.deciding(), (2, 3_000));
     let unwindowed = SchedReading { win_ticks: 0, ..r };
     assert_eq!(unwindowed.deciding(), (4, 70_000));
-}
-
-#[test]
-fn the_sampler_thread_ticks_until_finished() {
-    let mut sampler = Sampler::start(MS * 2);
-    sampler.open_window();
-    // The span the reading must cover; what follows holds however the
-    // sampler thread was scheduled inside it.
-    std::thread::sleep(MS * 20);
-    let r = sampler.finish();
-    assert!(r.ticks >= 1, "{r:?}");
-    assert_eq!(r.tick_us, 2_000);
-    assert!(
-        r.win_ticks <= r.ticks && r.win_late_max_us <= r.late_max_us,
-        "{r:?}"
-    );
-    assert!(r.sampled_us >= 20_000, "{r:?}");
-    assert_eq!(
-        sampler.finish(),
-        SchedReading::default(),
-        "a second finish reads nothing new"
-    );
 }

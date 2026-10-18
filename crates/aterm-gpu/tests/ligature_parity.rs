@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 //
 // CPU==GPU parity with a ligating font: plain, under a selection, under a block
-// cursor and under ink. No GPU: the tests end as COULD NOT RUN.
+// cursor and under ink. No GPU or no font: COULD NOT RUN.
 
 use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::Terminal;

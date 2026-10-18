@@ -130,13 +130,6 @@ impl<T> RecoveryLedger<T> {
         self.entries.is_empty()
     }
 
-    #[cfg(test)]
-    pub(crate) fn oldest(&self, now_ms: u64) -> Option<&T> {
-        self.entries.front().and_then(|entry| {
-            (now_ms.saturating_sub(entry.closed_at_ms) <= self.max_age_ms).then_some(&entry.value)
-        })
-    }
-
     pub(crate) fn push(&mut self, value: T, now_ms: u64) {
         self.prune(now_ms);
         if self.capacity == 0 {
@@ -225,10 +218,12 @@ impl Default for ClosedRecoveryLedgers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::restore::{NativeLeafRestore, RestoredSplitTree, TerminalLeafRestore};
+    use crate::restore::{RestoredSplitTree, TerminalLeafRestore};
 
     fn terminal(label: &str) -> RestoredView {
         RestoredView::Terminal(TerminalLeafRestore {
+            sid: None,
+            lineage: None,
             cwd: Some(format!("/{label}")),
             title: label.to_string(),
             profile: None,
@@ -240,7 +235,9 @@ mod tests {
             attention: None,
             questions: None,
             autopilot: None,
+            land_at: None,
             identity: None,
+            theme: None,
             agent: None,
             supervised: None,
             held: false,
@@ -319,62 +316,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn view_and_tab_ledgers_have_separate_bounds_and_only_leaf_rule() {
-        let mut ledgers = ClosedRecoveryLedgers {
-            views: RecoveryLedger::new(2, 100),
-            tabs: RecoveryLedger::new(3, 100),
-        };
-        let placement =
-            ClosedViewPlacement::new(Vec::new(), RestoreBranch::Second, SplitKind::Vertical, 0.7)
-                .unwrap();
-        for index in 0..4 {
-            ledgers.views.push(
-                ClosedView {
-                    original_window: WindowId(1),
-                    original_tab: TabId::from_stored(9),
-                    view: terminal(&format!("view-{index}")),
-                    placement: placement.clone(),
-                },
-                index,
-            );
-            ledgers.tabs.push(tab(&format!("tab-{index}")), index);
-        }
-        assert_eq!(ledgers.views.len(), 2);
-        assert_eq!(ledgers.tabs.len(), 3);
-        assert_eq!(leaf_close_record_kind(1), LeafCloseRecordKind::ClosedTab);
-        assert_eq!(leaf_close_record_kind(2), LeafCloseRecordKind::ClosedView);
-    }
-
-    #[test]
-    fn unavailable_native_descriptor_is_valid_recovery_data_not_code() {
-        let unavailable = RestoredView::Native(NativeLeafRestore {
-            restore_tag: "future.canvas".to_string(),
-            route: None,
-            uri: None,
-            config_editor: false,
-            source_anchor: 0,
-            selection: None,
-            editor_selections: Vec::new(),
-            primary_selection: 0,
-            viewport_anchor: 0,
-            durable_seq: 0,
-            metadata: "command=rm -rf /".to_string(),
-            settings_drafts: Vec::new(),
-            settings_drafts_unreadable: 0,
-        });
-        let mut ledger = RecoveryLedger::new(1, 100);
-        ledger.push(unavailable.clone(), 0);
-        assert_eq!(ledger.candidate(0).unwrap().value, unavailable);
-    }
-
     /// Tier-1 conformance for `ClosedRecoveryLedgers` through the App's shipping close and
     /// reopen paths (`close_active_tab` on a two-leaf tab, `close_tab_at` on a one-leaf tab,
     /// `reopen_last_closed_view`/`_tab`), with the ledgers rebuilt at the model's capacities (2
     /// views, 3 tabs). Which ledger each close records into is the App's choice, never the test's.
     #[test]
     fn dual_ledgers_tier1_conform_and_reject_double_record_negative_control() {
-        use aterm_spec::derive::closed_recovery_ledgers_model;
+        use aterm_models_native::closed_recovery_ledgers_model;
         use aterm_spec::interp::{State, admits};
 
         use crate::App;

@@ -7,12 +7,13 @@
 //!
 //! This crate is published into the build under the package name `arrayvec`
 //! (the directory is `crates/aterm-arrayvec`; see the manifest for why the two
-//! names differ) so that `[patch.crates-io]` can redirect the five third-party
-//! consumers in aterm's graph — `naga`, `wgpu`, `wgpu-core`, `wgpu-hal` and
-//! `tiny-skia` (Linux only, under `sctk-adwaita`) — at code we own.
+//! names differ) so that `[patch.crates-io]` can redirect the four third-party
+//! consumers in aterm's graph — `naga`, `wgpu`, `wgpu-core` and `wgpu-hal` — at
+//! code we own. (`tiny-skia`, a fifth on Linux under `sctk-adwaita`, left with
+//! it at linux-windowing LW.5.)
 //!
 //! The claim is narrower and more checkable than "our ArrayVec is as good as
-//! theirs". It is: **every item the five consumers name resolves, with the same
+//! theirs". It is: **every item the consumers name resolves, with the same
 //! signature and the same behaviour.** Three things back it up.
 //!
 //! 1. **The surface was enumerated from the consumers' source, not guessed.**
@@ -32,9 +33,8 @@
 //!    consumers write — and it has to be, because no cell compiles all of what
 //!    they write, and this one compiles least of all. On macOS the four wgpu-
 //!    family crates do build, but with the feature sets that switch most of
-//!    their `ArrayVec` sites off; and `tiny-skia` never enters the graph at
-//!    all (it arrives under Linux's `sctk-adwaita`). See the per-cell note
-//!    below for exactly which impls that leaves untested here.
+//!    their `ArrayVec` sites off. See the per-cell note below for exactly which
+//!    impls that leaves untested here.
 //!
 //! 3. **A differential runs this type and a `Vec`-backed model of upstream's
 //!    contract through the same operation scripts and asserts they agree**,
@@ -59,9 +59,9 @@
 //! backend contains zero `ArrayVec` uses). That cell exercises `Hash`,
 //! `Extend`, by-value `IntoIterator` and `into_inner`; it does NOT exercise
 //! `drain`, by-`&`/`&mut` `IntoIterator`, `new_const` or `clone_from`. Windows
-//! and Linux (`dx12,gles,vulkan` + naga's `spv-out`, plus tiny-skia on Linux)
-//! are the cells that cover the whole surface. `tests/consumer_forms.rs` exists
-//! precisely to close that gap here, on any cell.
+//! (`dx12` + naga's `spv-out`) is the cell that covers the whole surface.
+//! `tests/consumer_forms.rs` exists precisely to close that gap here, on any
+//! cell.
 //!
 //! # Where the replacement is NOT exactly upstream
 //!

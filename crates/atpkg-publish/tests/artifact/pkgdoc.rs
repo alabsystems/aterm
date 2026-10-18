@@ -280,5 +280,5 @@ fn the_aarch64_darwin_asset_keeps_its_bare_name_and_every_other_target_names_its
     for t in Triple::all().filter(|t| *t != AARCH64_APPLE_DARWIN) {
         assert_eq!(pkgdoc::asset_name("ay", 9, t), format!("ay-9-{t}.tar.zst"));
     }
-    assert_eq!(pkgdoc::file_name("ay", 9), "pkg-ay-9.toml");
+    assert_eq!(pkgdoc::manifest_name("ay", 9), "pkg-ay-9.toml");
 }

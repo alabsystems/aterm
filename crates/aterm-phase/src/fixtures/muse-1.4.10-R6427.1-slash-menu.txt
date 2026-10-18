@@ -1,0 +1,16 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab) · `/` typed into the composer: the command menu · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+  Muse Code 1.4.10
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ /
+  /bug                                         Report a bug to the team
+  /clear                                       Clear terminal and start a fresh session
+  /compact                                     Summarize the conversation to free up context
+  /copy                                        Copy a response, code block, or ran command to the clipboard
+  /deep-research                               Research a question across sources with cross-checking and citations
+  /effort                                      Set the model's effort level
+  /export                                      Save the conversation, or the full session log
+  ↓ 44 more
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  lab-stub · high · /private/tmp/at.lab0/proj · Auto-review

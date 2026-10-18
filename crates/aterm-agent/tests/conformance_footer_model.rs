@@ -35,7 +35,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use aterm_agent::harness::footer::{self, FooterFacts, LaunchFacts, SessionEntry, TailCache};
-use aterm_spec::derive::{Model, claude_footer_model_model};
+use aterm_models_harness::claude_footer_model_model;
+use aterm_spec::derive::Model;
 use aterm_spec::{verify, xref};
 
 type Vars = BTreeMap<&'static str, i64>;
@@ -801,7 +802,7 @@ fn in_walk_order(
 }
 
 /// Where the reader is anchored in the shipping code (`#[refines]` on
-/// `Read`, this crate's `spec-anchors`, on through its dev edge on itself):
+/// `Read`, expanded in every test and debug build of this crate):
 /// every part of the one read the host's resolver runs — the facts for a
 /// registry entry, the tail cache's read and its session switch, the scan,
 /// and a command result's fold.

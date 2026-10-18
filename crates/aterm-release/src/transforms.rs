@@ -7,9 +7,14 @@
 //!
 //! * vendor/astream — a submodule of a PRIVATE repository, and a gitlink is not
 //!   source — is written as files: astream's root Cargo.toml and, for every astream
-//!   crate the export reaches ([`astream_closure`]), each crate's Cargo.toml and src/,
-//!   from the gitlink commit of the EXPORTED commit, read from the submodule's object
-//!   store (never its working tree), plus aterm's LICENSE and a README saying what it is.
+//!   crate the export reaches ([`astream_closure`]), each crate's tree but its tests/,
+//!   examples/ and benches/ (its build script and the files its src/ includes from
+//!   beside it go with it), from the gitlink commit of the EXPORTED commit, read from
+//!   the submodule's object store (never its working tree), plus aterm's LICENSE and a
+//!   README saying what it is.
+//!   The root keeps its `[workspace]` tables, which the crates inherit from, and no members
+//!   ([`memberless_root`]): its member list names crates the export does not write, and the
+//!   engine's workspace-closure guard loads every workspace in the export.
 //! * A `[[test]]`/`[[bench]]`/`[[example]]`/`[[bin]]` table whose file the export
 //!   withholds is dropped with the comment block above it, so a public clone's build
 //!   resolves every target it declares.
@@ -169,13 +174,18 @@ fn astream(inputs: &Inputs) -> Result<(String, Vec<String>), String> {
     let crates = astream_closure(&inputs.export, &sub, &rev)
         .map_err(|e| format!("could not derive the astream crates the export depends on: {e}"))?;
     std::fs::create_dir_all(&dest).map_err(|e| format!("{}: {e}", dest.display()))?;
+    // A crate's build reads more than src/: its build script, and the files src/ and
+    // the script include from beside src/ (astream-wire's contract_fn.rs,
+    // twin_answers.rs and clean_islands.rs, which every astream crate includes).
     let mut paths = vec!["Cargo.toml".to_string()];
+    let mut roots = vec!["Cargo.toml".to_string()];
     for c in &crates {
         paths.push(format!("crates/{c}/Cargo.toml"));
         paths.push(format!("crates/{c}/src"));
+        roots.push(format!("crates/{c}"));
     }
     let mut args = vec!["ls-tree", "-r", "-z", rev.as_str(), "--"];
-    args.extend(paths.iter().map(String::as_str));
+    args.extend(roots.iter().map(String::as_str));
     let tree = git(&sub, &args)?;
     let entries: Vec<(String, String, String)> = tree
         .split(|b| *b == 0)
@@ -190,6 +200,7 @@ fn astream(inputs: &Inputs) -> Result<(String, Vec<String>), String> {
                 path.to_string(),
             ))
         })
+        .filter(|(_, _, path)| !in_target_dir(path))
         .collect();
     for wanted in &paths {
         let covered = entries
@@ -222,17 +233,25 @@ fn astream(inputs: &Inputs) -> Result<(String, Vec<String>), String> {
                 .map_err(|e| format!("{}: {e}", target.display()))?;
         }
     }
+    let root_manifest = dest.join("Cargo.toml");
+    let text = std::fs::read_to_string(&root_manifest)
+        .map_err(|e| format!("{}: {e}", root_manifest.display()))?;
+    std::fs::write(&root_manifest, memberless_root(&text)?)
+        .map_err(|e| format!("{}: {e}", root_manifest.display()))?;
     std::fs::copy(root.join("LICENSE"), dest.join("LICENSE"))
         .map_err(|e| format!("LICENSE: {e}"))?;
     let named: Vec<String> = crates.iter().map(|c| format!("`{c}`")).collect();
     let readme = format!(
         "# vendor/astream\n\n\
-         The astream crates aterm's fabric bridge (crates/aterm-link) builds against —\n\
+         The astream crates aterm builds against (the fabric bridge, crates/aterm-link,\n\
+         and the conformance suite's differential VT oracle) —\n\
          {} — as plain\n\
-         files from astream commit `{rev}`: each crate's `Cargo.toml` and `src/`,\n\
-         and astream's root `Cargo.toml`, whose workspace fields they inherit. Apache-2.0\n\
-         (`LICENSE`). The root `Cargo.toml` excludes this directory from aterm's\n\
-         workspace, so the crates build as dependencies and nothing else.\n\n\
+         files from astream commit `{rev}`: each crate's tree but its `tests/`,\n\
+         `examples/` and `benches/`, and astream's root `Cargo.toml`, whose workspace\n\
+         fields they inherit, with its member list emptied (it names crates not copied\n\
+         here). Apache-2.0 (`LICENSE`).\n\
+         aterm's root `Cargo.toml` excludes this directory from aterm's workspace, so the\n\
+         crates build as dependencies and nothing else.\n\n\
          That commit is on astream's development line. https://github.com/alabsystems/astream\n\
          carries astream's own releases, each published as a snapshot commit of its own, so\n\
          that commit's id does not appear there, and the version these manifests declare\n\
@@ -243,14 +262,132 @@ fn astream(inputs: &Inputs) -> Result<(String, Vec<String>), String> {
     Ok((rev, crates))
 }
 
-/// A manifest's dependency rows that cargo follows into a dependency's build: its
-/// `[dependencies]` and `[build-dependencies]`, target-specific and
-/// `[workspace.dependencies]` ones included, optional ones too (a feature can turn any
-/// on); never `[dev-dependencies]`, which cargo reads of no dependency. Each row is
-/// (name, `path`, `workspace = true`).
-fn dependency_rows(manifest: &aterm_toml::Value) -> Vec<(String, Option<String>, bool)> {
+/// Whether an astream path is in a crate's tests/, examples/ or benches/: targets a
+/// dependency's build never reads, which stay private; a manifest table naming a file
+/// in one is dropped with it (the target strip).
+fn in_target_dir(path: &str) -> bool {
+    let Some((_, in_crate)) = path
+        .strip_prefix("crates/")
+        .and_then(|rest| rest.split_once('/'))
+    else {
+        return false;
+    };
+    ["tests/", "examples/", "benches/"]
+        .iter()
+        .any(|d| in_crate.starts_with(d))
+}
+
+/// astream's root manifest as the export writes it: the `[workspace]` table's `members`
+/// emptied and its `default-members` dropped, every other byte as committed. The crates
+/// the export writes build as aterm's path dependencies, which inherit from this root
+/// without being its members, so a member list naming crates the export leaves out only
+/// makes the root a workspace nothing can load (the engine's closure guard loads it).
+///
+/// # Errors
+/// The manifest has no `[workspace]` table, an array in it does not close, or the result
+/// does not parse with empty members.
+fn memberless_root(text: &str) -> Result<String, String> {
+    let mut out = String::with_capacity(text.len());
+    let (mut in_workspace, mut seen) = (false, false);
+    let mut rest = text;
+    while !rest.is_empty() {
+        let line_end = rest.find('\n').map_or(rest.len(), |i| i + 1);
+        let line = &rest[..line_end];
+        let code = line.split('#').next().unwrap_or_default().trim();
+        if code.starts_with('[') {
+            in_workspace = code == "[workspace]";
+            seen |= in_workspace;
+        }
+        let key = code.split_once('=').map(|(k, _)| k.trim());
+        let Some(key @ ("members" | "default-members")) = key.filter(|_| in_workspace) else {
+            out.push_str(line);
+            rest = &rest[line_end..];
+            continue;
+        };
+        let open = rest.find('[').filter(|&i| i < line_end).ok_or_else(|| {
+            format!("astream's root manifest: `{key}` in [workspace] is not an array")
+        })?;
+        let close = open
+            + array_end(&rest[open..])
+                .ok_or_else(|| format!("astream's root manifest: `{key}` never closes"))?;
+        let after = rest[close..]
+            .find('\n')
+            .map_or(rest.len(), |i| close + i + 1);
+        if key == "members" {
+            let indent = &line[..line.len() - line.trim_start().len()];
+            out.push_str(indent);
+            out.push_str("members = []");
+            out.push_str(&rest[close..after]);
+        }
+        rest = &rest[after..];
+    }
+    if !seen {
+        return Err("astream's root manifest has no [workspace] table".into());
+    }
+    let parsed = aterm_toml::from_str::<aterm_toml::Value>(&out)
+        .map_err(|e| format!("astream's root manifest, members emptied: {e}"))?;
+    let workspace = parsed.get("workspace");
+    let empty = workspace
+        .and_then(|w| w.get("members"))
+        .and_then(aterm_toml::Value::as_array)
+        .is_some_and(Vec::is_empty);
+    if !empty || workspace.and_then(|w| w.get("default-members")).is_some() {
+        return Err("astream's root manifest still names members after emptying them".into());
+    }
+    Ok(out)
+}
+
+/// The length of the TOML array `s` starts with, through its closing `]`: brackets in
+/// strings and comments do not count.
+fn array_end(s: &str) -> Option<usize> {
+    let (mut depth, mut quote, mut escaped, mut comment) = (0usize, None, false, false);
+    for (i, c) in s.char_indices() {
+        if comment {
+            comment = c != '\n';
+        } else if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' && q == '"' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+        } else {
+            match c {
+                '"' | '\'' => quote = Some(c),
+                '#' => comment = true,
+                '[' => depth += 1,
+                ']' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(i + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// A manifest's dependency rows that cargo follows: its `[dependencies]` and
+/// `[build-dependencies]`, target-specific and `[workspace.dependencies]` ones included,
+/// optional ones too (a feature can turn any on), and with `dev` its
+/// `[dev-dependencies]`. Cargo reads a WORKSPACE MEMBER's dev-dependencies whenever it
+/// loads the workspace (they are in the lock, and a missing path is a load error), and
+/// no DEPENDENCY's: so an exported manifest's are followed (aterm-conformance's
+/// astream-term, the differential VT oracle's fold), an astream crate's never. Each row
+/// is (name, `path`, `workspace = true`).
+fn dependency_rows(manifest: &aterm_toml::Value, dev: bool) -> Vec<(String, Option<String>, bool)> {
     use aterm_toml::Value;
-    const KINDS: [&str; 3] = ["dependencies", "build-dependencies", "build_dependencies"];
+    const KINDS: [&str; 5] = [
+        "dependencies",
+        "build-dependencies",
+        "build_dependencies",
+        "dev-dependencies",
+        "dev_dependencies",
+    ];
+    let kinds = if dev { &KINDS[..] } else { &KINDS[..3] };
     let Some(root) = manifest.as_table() else {
         return Vec::new();
     };
@@ -261,7 +398,7 @@ fn dependency_rows(manifest: &aterm_toml::Value) -> Vec<(String, Option<String>,
     }
     let mut rows = Vec::new();
     for scope in scopes {
-        for kind in KINDS {
+        for &kind in kinds {
             let Some(table) = scope.get(kind).and_then(Value::as_table) else {
                 continue;
             };
@@ -291,7 +428,8 @@ fn join_lexically(base: &str, path: &str) -> String {
 }
 
 /// The astream crates the export needs, by directory name, sorted: each one an exported
-/// manifest path-depends on under `vendor/astream/crates/`, and each one those reach in
+/// manifest path-depends on under `vendor/astream/crates/` (dev-dependencies included:
+/// see [`dependency_rows`]), and each one those reach in
 /// turn at `rev` (`path = …`, or `workspace = true` through astream's root
 /// `[workspace.dependencies]`). DERIVED, never listed: a hand list went stale when
 /// astream-cap came to depend on astream-digest, and the export would have carried a
@@ -316,7 +454,8 @@ pub fn astream_closure(export: &Path, sub: &Path, rev: &str) -> Result<Vec<Strin
             .unwrap_or_default();
         let text = std::fs::read_to_string(&manifest)
             .map_err(|e| format!("{}: {e}", manifest.display()))?;
-        for (_, path, _) in dependency_rows(&parse(&text, &rel_manifest.display().to_string())?) {
+        let rows = dependency_rows(&parse(&text, &rel_manifest.display().to_string())?, true);
+        for (_, path, _) in rows {
             let Some(path) = path else { continue };
             let target = join_lexically(&rel_dir, &path);
             if let Some(name) = target.strip_prefix("vendor/astream/crates/")
@@ -345,7 +484,7 @@ pub fn astream_closure(export: &Path, sub: &Path, rev: &str) -> Result<Vec<Strin
     let root =
         at_rev("Cargo.toml").ok_or_else(|| format!("astream {short} has no root Cargo.toml"))?;
     let workspace: std::collections::BTreeMap<String, String> =
-        dependency_rows(&parse(&root, "astream's root Cargo.toml")?)
+        dependency_rows(&parse(&root, "astream's root Cargo.toml")?, false)
             .into_iter()
             .filter_map(|(name, path, _)| Some((name, path?)))
             .collect();
@@ -363,7 +502,7 @@ pub fn astream_closure(export: &Path, sub: &Path, rev: &str) -> Result<Vec<Strin
             ));
         };
         let own = format!("crates/{krate}");
-        for (name, path, in_workspace) in dependency_rows(&parse(&manifest, &own)?) {
+        for (name, path, in_workspace) in dependency_rows(&parse(&manifest, &own)?, false) {
             let target = match (path, in_workspace) {
                 (Some(p), _) => join_lexically(&own, &p),
                 (None, true) => match workspace.get(&name) {
@@ -806,6 +945,23 @@ mod tests {
         );
         // the version is not a rewrite: a patch slot other than 0 reaches the engine
         case("version = \"0.104.7\"".into(), "version = \"0.104.7\"");
+    }
+
+    #[test]
+    fn astreams_root_keeps_what_its_crates_inherit_and_names_no_member() {
+        let root = "# head\n[workspace]\nresolver = \"2\"\nmembers = [\n    \"crates/a\", # \
+                    the gate ]\n    \"crates/b]\",\n]\n# kept\ndefault-members = \
+                    [\"crates/a\"]\n\n[workspace.package]\nversion = \"0.2.0\"\n\n\
+                    [workspace.dependencies]\na = { path = \"crates/a\" }\nmembers = \"1\"\n";
+        assert_eq!(
+            memberless_root(root).unwrap(),
+            "# head\n[workspace]\nresolver = \"2\"\nmembers = []\n# kept\n\n\
+             [workspace.package]\nversion = \"0.2.0\"\n\n[workspace.dependencies]\na = { path = \
+             \"crates/a\" }\nmembers = \"1\"\n"
+        );
+        // no workspace table, or one whose list never closes, writes nothing
+        assert!(memberless_root("[package]\nname = \"a\"\n").is_err());
+        assert!(memberless_root("[workspace]\nmembers = [\n  \"crates/a\",\n").is_err());
     }
 
     /// A sample lock in cargo's v4 shape: `app` and `lab` are workspace packages, `lab`

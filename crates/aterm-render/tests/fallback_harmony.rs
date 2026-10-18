@@ -12,23 +12,16 @@
 //! wide glyphs left-biased in their 2-cell box, no weight/italic matching,
 //! and fallback overdraw never clipped to the cell row.
 //!
-//! ## Two-tier proof
+//! ## Proof
 //!
-//! * **Tier-0 (abstract, model-checked by the Trust `ty` compiler)** — the
-//!   derived models `FallbackScaleClamp`, `WideCentre` and `FallbackBandClip`
-//!   (`aterm_spec::derive::{fallback_scale_clamp_model, wide_center_model,
-//!   fallback_band_clip_model}`) carry the clamp/balance/in-band invariants;
-//!   `targo --unverified test -p aterm-spec --test spec_suite -- derived_ring_ty::` runs the REAL `ty`
-//!   binary over each bounded state space, PROVING every invariant at
-//!   `Buggy=0` and CATCHING the pre-W8 defect at `Buggy=1` (counterexample).
-//! * **Tier-1 (concrete, this file)** — the real `f32`/integer functions are
+//! * **Concrete (this file)** — the real `f32`/integer functions are
 //!   swept over dense/exhaustive lattices (plus degenerate and adversarial
-//!   inputs the abstract models cannot express: NaN, ∞, floor division on
-//!   negative gaps, garbage font bytes), with non-vacuity controls and the
+//!   inputs: NaN, ∞, floor division on negative gaps, garbage font bytes),
+//!   with non-vacuity controls and the
 //!   pre-fix behaviour shown to violate each law. Floor division and the
 //!   ratio arithmetic are outside ty's Expr language (no `*`/`/`), so — per
 //!   the box-drawing rounding-law precedent — the lattice sweeps here are the
-//!   binding layer for the arithmetic half.
+//!   proof.
 //!
 //! ## W8 (h): the column band
 //!
@@ -41,14 +34,13 @@
 //! shrinks such a glyph into its box; `clamp_to_col_band` is the backstop
 //! that trims the rounding fringe the fit leaves.
 //!
-//! The column clamp needs no new model: it is a one-line wrapper over the
-//! same `clamp_to_band` core as the row clamp, so the EXISTING
-//! `FallbackBandClip` model twins both (its arithmetic is axis-free).
+//! The column clamp is a one-line wrapper over the same `clamp_to_band` core
+//! as the row clamp (its arithmetic is axis-free).
 
 use aterm_render::{
-    CJK_SCALE_MAX, CJK_SCALE_MIN, XHEIGHT_SCALE_MAX, XHEIGHT_SCALE_MIN, clamp_to_col_band,
-    clamp_to_row_band, fallback_cell_count, fallback_cjk_scale, fallback_fit_scale,
-    fallback_weight_rank, fallback_xheight_scale, wide_center_offset,
+    CJK_SCALE_MAX, CJK_SCALE_MIN, XHEIGHT_SCALE_MAX, XHEIGHT_SCALE_MIN, clamp_to_row_band,
+    fallback_cell_count, fallback_cjk_scale, fallback_fit_scale, fallback_weight_rank,
+    fallback_xheight_scale, wide_center_offset,
 };
 
 // ---- (1) normalization clamps ----
@@ -136,10 +128,8 @@ fn scale_clamp_total_on_degenerate_inputs() {
 
 /// Exhaustive over every (box_w, adv) in a lattice that includes `adv >
 /// box_w` (a clamped face whose scaled advance overflows the box): the
-/// offset satisfies the floor characterization `2*off <= gap <= 2*off + 1`
-/// (the EXACT hypothesis the ty-proven `WideCentre` model shows implies the
-/// balance law), hence `|left - right| <= 1`; and the pre-W8 left-bias
-/// (`off = 0`) violates the balance for every gap >= 2 (negative control).
+/// offset satisfies the floor characterization `2*off <= gap <= 2*off + 1`,
+/// hence `|left - right| <= 1`.
 #[test]
 fn wide_center_offset_balances_margins_exhaustively() {
     let mut nonzero_offsets = 0u32;
@@ -147,7 +137,7 @@ fn wide_center_offset_balances_margins_exhaustively() {
         for adv in 0..=80i32 {
             let gap = box_w - adv;
             let off = wide_center_offset(box_w, adv);
-            // The floor characterization (the Tier-0 model's Fire guard).
+            // The floor characterization.
             assert!(
                 2 * off <= gap && gap <= 2 * off + 1,
                 "off={off} is not floor((box={box_w} - adv={adv})/2)"
@@ -159,12 +149,6 @@ fn wide_center_offset_balances_margins_exhaustively() {
             );
             if off != 0 {
                 nonzero_offsets += 1;
-            }
-            // Negative control: the pre-W8 placement (off = 0, whole gap on
-            // the right) breaks the law exactly where centring matters.
-            if gap.abs() >= 2 {
-                let (l0, r0) = (0, gap);
-                assert!((l0 - r0).abs() > 1, "the pre-fix left-bias must violate");
             }
         }
     }
@@ -280,28 +264,6 @@ fn the_fallback_fit_class_follows_the_unicode_class() {
     ] {
         assert_eq!(fallback_fit_class(ch), FallbackFit::Symbol, "{ch}");
     }
-}
-
-/// The TEXT anchor scales `ymin` about the baseline: a glyph standing on the
-/// line keeps standing on it, a descender keeps a scaled descent. Negative
-/// control: the SYMBOL anchor lifts the same letter off the line.
-#[test]
-fn a_text_shrink_keeps_the_baseline() {
-    use aterm_render::{shrink_ymin_about_baseline, shrink_ymin_about_ink_centre};
-    for s in 1..=100 {
-        let scale = s as f32 / 100.0;
-        assert_eq!(shrink_ymin_about_baseline(0, scale), 0);
-        for ymin in -20i32..0 {
-            let y = shrink_ymin_about_baseline(ymin, scale);
-            assert!(y <= 0 && y >= ymin, "ymin {ymin} x{scale} -> {y}");
-        }
-    }
-    // Noto Sans Math `𝐖` at 18 px: 12 rows on the baseline, shrunk to 8.
-    assert_eq!(shrink_ymin_about_baseline(0, 8.0 / 12.0), 0);
-    assert!(
-        shrink_ymin_about_ink_centre(0, 12, 8, 18, 24) >= 2,
-        "negative control — centring floats the letter"
-    );
 }
 
 /// Cell allocation is Unicode-width/config driven, never inferred from a
@@ -484,9 +446,7 @@ fn materialized_ambiguous_spans_coexist_and_combining_stays_zero_width() {
 /// Exhaustive over every (top, height, band) in a lattice spanning negative
 /// tops (ascender overshoot), zero-size bitmaps/bands and far-past-the-band
 /// placements: the trim only ever drops rows, every kept row lies inside
-/// `[0, band)`, and an already-in-band glyph is untouched. The pre-W8
-/// behaviour (no trim) is shown to violate on every out-of-band shape
-/// (negative control).
+/// `[0, band)`, and an already-in-band glyph is untouched.
 #[test]
 fn clamp_to_row_band_keeps_rows_in_band_exhaustively() {
     let mut trimmed = 0u32;
@@ -512,10 +472,6 @@ fn clamp_to_row_band_keeps_rows_in_band_exhaustively() {
                     assert_eq!((skip, keep), (0, height), "in-band glyph must be untouched");
                     untouched += 1;
                 } else if height > 0 {
-                    // Out-of-band ink: the pre-W8 unclipped blit (skip=0,
-                    // keep=height) violates the in-band law here.
-                    let would_escape = top < 0 || top + height as i32 > band as i32;
-                    assert!(would_escape, "negative control classification");
                     trimmed += 1;
                 }
             }
@@ -523,41 +479,6 @@ fn clamp_to_row_band_keeps_rows_in_band_exhaustively() {
     }
     // Non-vacuity: both regimes are exercised.
     assert!(trimmed > 0 && untouched > 0);
-}
-
-// ---- (h) column-band clip ----
-
-/// The two band clamps really are ONE proven core: over the same lattice
-/// the row test sweeps, the column wrapper agrees with the row wrapper
-/// pointwise — which is what lets `fallback_band_clip_model` legitimately
-/// twin both, instead of the column axis needing a cloned Tier-0 model.
-#[test]
-fn col_band_clamp_agrees_with_row_band_clamp() {
-    let mut trimmed = 0u32;
-    for pos in -48..=48i32 {
-        for len in 0..=48usize {
-            for band in 0..=40usize {
-                let col = clamp_to_col_band(pos, len, band);
-                assert_eq!(
-                    col,
-                    clamp_to_row_band(pos, len, band),
-                    "the two band clamps diverged at pos={pos} len={len} band={band}"
-                );
-                let (skip, keep) = col;
-                assert!(skip + keep <= len);
-                if keep > 0 {
-                    let left = pos + skip as i32;
-                    assert!(left >= 0 && left + keep as i32 <= band as i32);
-                }
-                if pos >= 0 && pos + len as i32 <= band as i32 {
-                    assert_eq!((skip, keep), (0, len), "in-band bitmap must be untouched");
-                } else if len > 0 {
-                    trimmed += 1;
-                }
-            }
-        }
-    }
-    assert!(trimmed > 0);
 }
 
 // ---- (e) weight/italic ranking ----

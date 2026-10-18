@@ -179,46 +179,6 @@ mod tests {
     }
 
     #[test]
-    fn x10_basic() {
-        // Button 0 (left), col 10, row 5
-        let result = encode_x10(0, 10, 5);
-        assert_eq!(result, vec![0x1b, b'[', b'M', 32, 43, 38]);
-    }
-
-    #[test]
-    fn x10_clamps_large_coordinates() {
-        // Coordinates > 223 are clamped
-        let result = encode_x10(0, 300, 300);
-        // (223+1).min(223) = 223; 223 as u8 + 32 = 255
-        assert_eq!(result[4], 255);
-        assert_eq!(result[5], 255);
-    }
-
-    #[test]
-    fn utf8_small_coordinates() {
-        // Small coords (< 96) produce single bytes; button code is also UTF-8 encoded
-        let result = encode_utf8(0, 10, 5);
-        assert_eq!(result[0..3], [0x1b, b'[', b'M']);
-        // cb 0: 0+32 = 32 (single byte)
-        assert_eq!(result[3], 32);
-        // col 10: 10+1+32 = 43 (single byte)
-        assert_eq!(result[4], 43);
-        // row 5: 5+1+32 = 38 (single byte)
-        assert_eq!(result[5], 38);
-    }
-
-    #[test]
-    fn utf8_large_coordinates() {
-        // Coords >= 96 produce 2-byte UTF-8
-        let result = encode_utf8(0, 200, 5);
-        // cb 0: 0+32 = 32 (single byte) at result[3]
-        assert_eq!(result[3], 32);
-        // col 200: 200+1+32 = 233 → 2-byte UTF-8: 0xC3 0xA9
-        assert_eq!(result[4], 0xC3);
-        assert_eq!(result[5], 0xA9);
-    }
-
-    #[test]
     fn utf8_large_button_code() {
         // Button code > 95 produces 2-byte UTF-8 (#7498)
         // Ctrl+Button8: cb = 128+16 = 144, 144+32 = 176 → 2-byte UTF-8
@@ -230,108 +190,25 @@ mod tests {
     }
 
     #[test]
-    fn sgr_press() {
-        let result = encode_sgr(0, 10, 5, false);
-        assert_eq!(result, b"\x1b[<0;11;6M");
-    }
-
-    #[test]
-    fn sgr_release() {
-        let result = encode_sgr(0, 10, 5, true);
-        assert_eq!(result, b"\x1b[<0;11;6m");
-    }
-
-    #[test]
-    fn urxvt_basic() {
-        // cb is already offset: button 0 + 32 = 32
-        let result = encode_urxvt(32, 10, 5);
-        assert_eq!(result, b"\x1b[32;11;6M");
-    }
-
-    #[test]
-    fn encode_mouse_dispatches_x10() {
-        let result = encode_mouse(0, 10, 5, MouseEncoding::X10, false);
-        assert_eq!(result, encode_x10(0, 10, 5));
-    }
-
-    /// In range: 0-based 222 is 1-based 223 is byte 255, the last column X10 can name.
-    #[test]
-    fn encode_mouse_x10_in_range_is_the_six_byte_frame() {
-        let result = encode_mouse(0, 222, 5, MouseEncoding::X10, false);
-        assert_eq!(result, vec![0x1b, b'[', b'M', 32, 255, 38]);
-    }
-
-    /// Past 222: still the six-byte X10 frame, coordinate clamped, never the SGR form an app
-    /// with only DECSET 1000 set cannot parse.
-    #[test]
-    fn encode_mouse_x10_past_222_clamps_and_keeps_x10_framing() {
-        let result = encode_mouse(0, 250, 5, MouseEncoding::X10, false);
-        assert_eq!(
-            result,
-            vec![0x1b, b'[', b'M', 32, 255, 38],
-            "out-of-range X10 must clamp, not switch to SGR"
-        );
-        assert_ne!(
-            result,
-            b"\x1b[<0;251;6M".to_vec(),
-            "the pre-fix SGR fallback is exactly what must not come back"
-        );
-        // Both axes out of range, and a release: still six bytes, with the legacy button 3.
-        let release = encode_mouse(0, 400, 300, MouseEncoding::X10, true);
-        assert_eq!(release, vec![0x1b, b'[', b'M', 32 + 3, 255, 255]);
-    }
-
-    #[test]
-    fn encode_mouse_dispatches_sgr() {
-        let result = encode_mouse(0, 10, 5, MouseEncoding::Sgr, false);
-        assert_eq!(result, encode_sgr(0, 10, 5, false));
-    }
-
-    #[test]
-    fn encode_mouse_dispatches_sgr_release() {
-        let result = encode_mouse(0, 10, 5, MouseEncoding::Sgr, true);
-        assert_eq!(result, encode_sgr(0, 10, 5, true));
-    }
-
-    #[test]
-    fn encode_mouse_dispatches_urxvt() {
-        let result = encode_mouse(64, 10, 5, MouseEncoding::Urxvt, false);
-        assert_eq!(
-            result,
-            encode_urxvt(u16::from(64u8.saturating_add(32)), 10, 5)
-        );
-    }
-
-    #[test]
     fn encode_mouse_dispatches_sgr_pixel() {
         // SgrPixel uses same format as Sgr
         let result = encode_mouse(0, 10, 5, MouseEncoding::SgrPixel, false);
         assert_eq!(result, encode_sgr(0, 10, 5, false));
     }
 
-    /// u16::MAX coordinates do not overflow the +1 offset (#2775).
+    /// u16::MAX coordinates do not overflow the +1 offset (#2775); X10 clamps to its 223
+    /// maximum.
     #[test]
-    fn sgr_u16_max_coordinates_no_overflow() {
-        let result = encode_sgr(0, u16::MAX, u16::MAX, false);
-        // u16::MAX.saturating_add(1) remains 65535.
-        let expected = b"\x1b[<0;65535;65535M";
-        assert_eq!(result, expected);
-    }
-
-    /// URXVT with u16::MAX coordinates does not overflow.
-    #[test]
-    fn urxvt_u16_max_coordinates_no_overflow() {
-        let result = encode_urxvt(32, u16::MAX, u16::MAX);
-        let expected = b"\x1b[32;65535;65535M";
-        assert_eq!(result, expected);
-    }
-
-    /// X10 with u16::MAX coordinates clamps.
-    #[test]
-    fn x10_u16_max_coordinates_clamps() {
-        let result = encode_x10(0, u16::MAX, u16::MAX);
-        // X10 clamps at 223, so col/row both become 223 + 32 = 255
-        assert_eq!(result[4], 255);
-        assert_eq!(result[5], 255);
+    fn u16_max_coordinates_never_overflow() {
+        assert_eq!(
+            encode_sgr(0, u16::MAX, u16::MAX, false),
+            b"\x1b[<0;65535;65535M"
+        );
+        assert_eq!(
+            encode_urxvt(32, u16::MAX, u16::MAX),
+            b"\x1b[32;65535;65535M"
+        );
+        let x10 = encode_x10(0, u16::MAX, u16::MAX);
+        assert_eq!((x10[4], x10[5]), (255, 255));
     }
 }

@@ -46,41 +46,132 @@ use aterm_uds::process::ProcessBirth;
 /// this an instance writing its entry in its first moments could read as
 /// younger than it and have its live entry pruned. The window costs nothing in
 /// the other direction: a reused pid born inside it needs the pid counter to
-/// wrap in two seconds, and it takes about ten minutes here.
-const WRITE_SLACK: Duration = Duration::from_secs(2);
+/// wrap in two seconds, and it takes about ten minutes here. The slack of a
+/// kernel wall-clock record (macOS); Linux places its birth (`PLACED_SLACK`).
+#[cfg(any(not(any(target_os = "linux", target_os = "android")), test))]
+pub(crate) const WRITE_SLACK: Duration = Duration::from_secs(2);
+
+/// `WRITE_SLACK` for a birth PLACED on the wall clock from the boot clock
+/// ([`read_birth`] on Linux): the placement uses this client's clocks now, so a
+/// wall-clock step made since the writer wrote moves it by the step. A minute
+/// absorbs any step short of a manual reset and costs nothing in the other
+/// direction: a reused pid born inside it needs the pid counter to wrap within
+/// a minute of the write, and Linux's `pid_max` (4194304 here) makes that far
+/// rarer than macOS's ten minutes. Linux only: nothing else places a birth.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) const PLACED_SLACK: Duration = Duration::from_secs(60);
+
+/// A live process's start on the wall clock ([`read_birth`]), with the slack its
+/// writer judgement allows ([`is_entry_writer`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Birth {
+    pub(crate) at: ProcessBirth,
+    pub(crate) slack: Duration,
+}
+
+/// The clocks [`read_birth`] places a Linux boot-clock start by: ONE paired
+/// reading of the wall and boot clocks, taken at the first read through it,
+/// after that read's start (so the process read is never younger than the
+/// pairing). Every read through one `Clocks` places one process at one instant,
+/// so two reads of it agree exactly; a judgement takes a fresh one, so a client
+/// that lives on (the fleet bridge's repeated discovery, `aterm fleet events`)
+/// still places a process born after its earlier judgements — a start later
+/// than a pairing places nowhere. Elsewhere it holds nothing: macOS keeps the
+/// wall-clock record itself.
+#[derive(Debug, Default)]
+pub(crate) struct Clocks {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    paired: std::cell::OnceCell<Option<(SystemTime, aterm_uds::process::BootClock)>>,
+}
+
+/// When the live process `pid` of this uid started, on the wall clock, or `None`
+/// where this client cannot say (another uid's process, an ended one, a
+/// platform with neither record).
+///
+/// macOS keeps the wall-clock record itself (`read_process_birth`, exact,
+/// `WRITE_SLACK`). Linux keeps only a boot-clock start (`/proc/<pid>/stat`
+/// `starttime`, `read_process_start`): it is placed on the wall clock by the
+/// paired reading `clocks` holds, so two reads of one process through one
+/// [`Clocks`] agree exactly (`PLACED_SLACK`). Until 2026-10-16 Linux answered
+/// `None` here, and a graph entry whose pid had been handed to another process
+/// was listed by `aterm ctl instances` as a phantom private instance.
+pub(crate) fn read_birth(pid: i32, clocks: &Clocks) -> Option<Birth> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let start = aterm_uds::process::read_process_start(pid)?;
+        let (wall, boot) = (*clocks.paired.get_or_init(|| {
+            let boot = aterm_uds::process::boot_clock_now()?;
+            Some((SystemTime::now(), boot))
+        }))?;
+        place_on_wall(start.boot, wall, boot).map(|at| Birth {
+            at,
+            slack: PLACED_SLACK,
+        })
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let Clocks {} = clocks;
+        aterm_uds::process::read_process_birth(pid).map(|at| Birth {
+            at,
+            slack: WRITE_SLACK,
+        })
+    }
+}
+
+/// A boot-clock start (Linux nanoseconds) on the wall clock, by the paired reading
+/// `wall` / `boot` taken at one moment: `wall - (boot - start)`. `None` for a start
+/// after the reading or one that does not fit. Pure.
+#[cfg(any(target_os = "linux", target_os = "android", all(test, unix)))]
+pub(crate) fn place_on_wall(
+    start: aterm_uds::process::BootClock,
+    wall: SystemTime,
+    boot: aterm_uds::process::BootClock,
+) -> Option<ProcessBirth> {
+    let age = Duration::from_nanos(boot.0.checked_sub(start.0)?);
+    let born = wall.checked_sub(age)?.duration_since(UNIX_EPOCH).ok()?;
+    Some(ProcessBirth {
+        seconds: born.as_secs(),
+        microseconds: u64::from(born.subsec_micros()),
+    })
+}
 
 /// Whether the LIVE process born at `birth` is the one that wrote a graph entry
 /// naming its pid, last written at `written`.
 ///
-/// `Some(true)`: born no later than the write ([`WRITE_SLACK`] aside). Alive
-/// now, it held that pid at the write, and no two processes hold one pid at
-/// once, so it is the writer. `Some(false)`: born after the entry was last
-/// written, it cannot have written it — the writer is gone and the pid was
-/// handed on. `None`: the times do not compare (a birth past what `SystemTime`
-/// holds), and nothing is claimed either way.
-pub(crate) fn is_entry_writer(birth: ProcessBirth, written: SystemTime) -> Option<bool> {
+/// `Some(true)`: born no later than the write (`slack` aside, `WRITE_SLACK` or
+/// `PLACED_SLACK`). Alive now, it held that pid at the write, and no two
+/// processes hold one pid at once, so it is the writer. `Some(false)`: born after
+/// the entry was last written, it cannot have written it — the writer is gone and
+/// the pid was handed on. `None`: the times do not compare (a birth past what
+/// `SystemTime` holds), and nothing is claimed either way.
+pub(crate) fn is_entry_writer(
+    birth: ProcessBirth,
+    slack: Duration,
+    written: SystemTime,
+) -> Option<bool> {
     let born = UNIX_EPOCH
         .checked_add(Duration::from_secs(birth.seconds))?
         .checked_add(Duration::from_micros(birth.microseconds))?;
-    Some(born <= written.checked_add(WRITE_SLACK)?)
+    Some(born <= written.checked_add(slack)?)
 }
 
 /// Whether the instance that wrote a graph entry naming `pid` (non-zero), last
 /// written at `written`, is provably gone: the pid is dead, or it now names a
 /// process younger than the entry ([`is_entry_writer`]). A birth this client
-/// cannot read — another uid's process, a sandbox refusing `proc_pidinfo`, a
-/// platform that keeps no wall-clock birth — proves nothing, and the entry is
-/// kept as before.
+/// cannot read ([`read_birth`]: another uid's process, a sandbox refusing
+/// `proc_pidinfo`, a platform with no start record) proves nothing, and the
+/// entry is kept as before.
 pub(crate) fn writer_gone(pid: u32, written: Option<SystemTime>) -> bool {
     if !aterm_uds::process::pid_alive(pid) {
         return true;
     }
     let birth = i32::try_from(pid)
         .ok()
-        .and_then(aterm_uds::process::read_process_birth);
+        .and_then(|pid| read_birth(pid, &Clocks::default()));
     matches!(
         (birth, written),
-        (Some(birth), Some(written)) if is_entry_writer(birth, written) == Some(false)
+        (Some(birth), Some(written))
+            if is_entry_writer(birth.at, birth.slack, written) == Some(false)
     )
 }
 
@@ -168,25 +259,9 @@ mod tests {
         aterm_tempfile::TempDir::new_in("/tmp").expect("scratch dir")
     }
 
-    /// The entry still says what was read: removed, and nothing is left aside.
-    #[test]
-    fn prune_removes_an_unchanged_dead_entry_and_leaves_nothing_aside() {
-        let s = scratch();
-        let entry = s.path().join("s-0bad");
-        let body = "sock /tmp/x/a.sock\nnonce 00\npid 1234567\n";
-        std::fs::write(&entry, body).unwrap();
-        assert!(prune_dead_entry(&entry, body));
-        assert!(!entry.exists());
-        assert_eq!(
-            std::fs::read_dir(s.path()).unwrap().count(),
-            0,
-            "no aside file"
-        );
-    }
-
     /// A live instance rewrote the sid after it was read dead: the rewrite
     /// survives byte for byte. Control: the same call with the body it now
-    /// holds removes it.
+    /// holds removes it, leaving nothing aside.
     #[test]
     fn prune_never_removes_an_entry_rewritten_after_it_was_read() {
         let s = scratch();
@@ -205,6 +280,11 @@ mod tests {
             prune_dead_entry(&entry, &live),
             "control: the guard, not a no-op"
         );
+        assert_eq!(
+            std::fs::read_dir(s.path()).unwrap().count(),
+            0,
+            "removed, and no aside file"
+        );
     }
 
     /// The identity rule's edges: born before the write is the writer, born
@@ -217,24 +297,49 @@ mod tests {
             seconds,
             microseconds,
         };
-        assert_eq!(is_entry_writer(at(1_789_999_000, 0), written), Some(true));
         assert_eq!(
-            is_entry_writer(at(1_790_000_002, 0), written),
+            is_entry_writer(at(1_789_999_000, 0), WRITE_SLACK, written),
+            Some(true)
+        );
+        assert_eq!(
+            is_entry_writer(at(1_790_000_002, 0), WRITE_SLACK, written),
             Some(true),
             "inside the slack"
         );
         assert_eq!(
-            is_entry_writer(at(1_790_000_002, 1), written),
+            is_entry_writer(at(1_790_000_002, 1), WRITE_SLACK, written),
             Some(false),
             "a microsecond past it"
         );
-        assert_eq!(is_entry_writer(at(u64::MAX, 0), written), None);
+        assert_eq!(is_entry_writer(at(u64::MAX, 0), WRITE_SLACK, written), None);
+    }
+
+    /// A boot-clock start lands on the wall clock its age before the paired
+    /// reading; a start after the reading lands nowhere.
+    #[test]
+    fn a_boot_clock_start_is_placed_its_age_before_the_paired_reading() {
+        use aterm_uds::process::BootClock;
+        let wall = UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+        let boot = BootClock(5_000_000_000_000);
+        assert_eq!(
+            place_on_wall(BootClock(4_000_000_250_000), wall, boot),
+            Some(ProcessBirth {
+                seconds: 1_789_999_000,
+                microseconds: 250,
+            })
+        );
+        assert_eq!(
+            place_on_wall(BootClock(5_000_000_000_001), wall, boot),
+            None,
+            "a start after the reading"
+        );
     }
 
     /// Live, on this test process: a dead pid's writer is gone; a live pid
     /// older than its entry, or one with no entry time to judge, is kept; and
-    /// a live pid YOUNGER than its entry is gone wherever the kernel keeps the
-    /// wall-clock birth (macOS) — elsewhere it proves nothing and is kept.
+    /// a live pid YOUNGER than its entry is gone wherever this client reads a
+    /// start (macOS's wall record, Linux's boot-clock one placed on the wall) —
+    /// elsewhere it proves nothing and is kept.
     #[test]
     fn a_writer_is_gone_when_its_pid_is_dead_or_younger_than_its_entry() {
         let me = std::process::id();
@@ -248,26 +353,50 @@ mod tests {
         let before_me = UNIX_EPOCH + Duration::from_secs(1_000);
         assert_eq!(
             writer_gone(me, Some(before_me)),
-            cfg!(target_vendor = "apple"),
+            cfg!(any(
+                target_vendor = "apple",
+                target_os = "linux",
+                target_os = "android"
+            )),
             "an entry written before this process was born is not its"
         );
     }
 
-    /// The body and the mtime come from the same file.
+    /// A client that lives on (the fleet bridge's repeated discovery) still
+    /// judges a pid born after its earlier judgements: each judgement places
+    /// births by its own pairing of the clocks, where one pairing kept for the
+    /// process's life placed every later start nowhere and left it unjudged.
+    /// Two reads of one process through one pairing agree exactly. The 20 ms
+    /// gap covers two Linux ticks of `starttime` truncation.
     #[test]
-    fn read_entry_returns_the_body_and_its_last_write() {
-        let s = scratch();
-        let entry = s.path().join("s-0bad");
-        std::fs::write(&entry, "sock /tmp/x/a.sock\npid 7\n").unwrap();
-        let old = UNIX_EPOCH + Duration::from_secs(1_000);
-        std::fs::File::options()
-            .write(true)
-            .open(&entry)
-            .and_then(|f| f.set_modified(old))
-            .unwrap();
-        let (body, written) = read_entry(&entry).unwrap();
-        assert_eq!(body, "sock /tmp/x/a.sock\npid 7\n");
-        assert_eq!(written, Some(old));
+    fn a_pid_born_after_an_earlier_judgement_is_still_judged() {
+        let me = std::process::id();
+        let own = i32::try_from(me).unwrap();
+        let kept = Clocks::default();
+        let first = read_birth(own, &kept);
+        assert!(
+            !writer_gone(me, Some(SystemTime::now())),
+            "a first judgement"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+        let mut child = aterm_uds::spawnfd::command("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn /bin/sleep");
+        let pid = child.id();
+        let gone = writer_gone(pid, Some(UNIX_EPOCH + Duration::from_secs(1_000)));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(
+            gone,
+            cfg!(any(
+                target_vendor = "apple",
+                target_os = "linux",
+                target_os = "android"
+            )),
+            "a pid younger than its entry, born after the first judgement"
+        );
+        assert_eq!(read_birth(own, &kept), first, "one pairing, one instant");
     }
 
     /// Only a socket OUTSIDE the directory with NO readable token is foreign:

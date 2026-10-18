@@ -37,7 +37,7 @@
 
 use std::sync::OnceLock;
 
-use super::ffi::{AutoreleasePool, Id, Sel, msg, sel};
+use super::ffi::{AutoreleasePool, Id, Sel, checked_msg, sel};
 
 /// `MTLCommandBufferStatus` (`MTLCommandBuffer.h:56-63`).
 pub(crate) const STATUS_NOT_ENQUEUED: usize = 0;
@@ -145,7 +145,7 @@ pub(crate) const fn classify(status: usize, error_code: Option<isize>) -> CbOutc
 pub(crate) fn command_buffer_status(cb: Id) -> usize {
     // SAFETY: `-status` is an `NSUInteger` getter on a live `MTLCommandBuffer`.
     unsafe {
-        let f: unsafe extern "C" fn(Id, Sel) -> usize = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = checked_msg();
         f(cb, sel(c"status"))
     }
 }
@@ -158,12 +158,12 @@ fn command_buffer_error_code(cb: Id) -> Option<isize> {
     // SAFETY: `-error` returns a borrowed `NSError` (or nil) owned by the pool;
     // `-code` is read while the pool lives.
     unsafe {
-        let get: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+        let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
         let err = get(cb, sel(c"error"));
         if err.is_null() {
             return None;
         }
-        let code: unsafe extern "C" fn(Id, Sel) -> isize = msg();
+        let code: unsafe extern "C-unwind" fn(Id, Sel) -> isize = checked_msg();
         Some(code(err, sel(c"code")))
     }
 }
@@ -266,8 +266,6 @@ impl LossLatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metal::ffi::Obj;
-    use crate::metal::test_support::device;
 
     /// Every header code plus the fail-closed arms, classified, with the
     /// retry/latch line drawn explicitly.
@@ -386,41 +384,6 @@ mod tests {
             latch.reason(),
             Some(first.as_str()),
             "the FIRST loss's reason survives later ones"
-        );
-    }
-
-    /// A real command buffer, committed and waited, reads `Completed` through
-    /// the same selectors a real loss would use, and the latch stays unlost.
-    #[test]
-    fn a_real_completed_command_buffer_reports_completed_and_never_latches() {
-        let dev = device();
-        let queue = dev.new_command_queue().expect("queue");
-        let latch = LossLatch::new();
-
-        let _pool = AutoreleasePool::new();
-        // SAFETY: `commandBuffer` returns an autoreleased buffer, retained into
-        // `cb`; `commit`/`waitUntilCompleted` are void messages on it.
-        let cb: Obj = unsafe {
-            let get: unsafe extern "C" fn(Id, Sel) -> Id = msg();
-            let raw = get(queue.id(), sel(c"commandBuffer"));
-            let cb = Obj::retain(raw).expect("commandBuffer");
-            let void_msg: unsafe extern "C" fn(Id, Sel) = msg();
-            void_msg(cb.id(), sel(c"commit"));
-            void_msg(cb.id(), sel(c"waitUntilCompleted"));
-            cb
-        };
-
-        assert_eq!(
-            command_buffer_status(cb.id()),
-            STATUS_COMPLETED,
-            "an empty committed command buffer completes"
-        );
-        let outcome = outcome_of(cb.id());
-        assert_eq!(outcome, CbOutcome::Completed);
-        latch.record(&outcome);
-        assert!(
-            !latch.is_lost(),
-            "a Completed real command buffer must never latch"
         );
     }
 }

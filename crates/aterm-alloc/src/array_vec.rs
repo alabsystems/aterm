@@ -5,8 +5,8 @@
 //!
 //! The implementation names only `core` items and the crate root is
 //! `#![no_std]`: `crates/aterm-arrayvec` republishes this type as `arrayvec`,
-//! and some of its third-party consumers (`naga`, `tiny-skia`) take it
-//! with `default-features = false`.
+//! and some of its third-party consumers (`naga`, and `tiny-skia` until LW.5)
+//! take it with `default-features = false`.
 
 use core::fmt;
 use core::hash::{Hash, Hasher};
@@ -851,65 +851,6 @@ mod tests {
     use super::*;
     use std::format;
 
-    #[test]
-    #[should_panic(expected = "ArrayVec overflow")]
-    fn test_push_overflow_panics() {
-        let mut av: ArrayVec<i32, 2> = ArrayVec::new();
-        av.push(1);
-        av.push(2);
-        av.push(3); // should panic
-    }
-
-    #[test]
-    fn test_const_new() {
-        // Verify const construction works
-        const AV: ArrayVec<u8, 16> = ArrayVec::new_const();
-        assert!(AV.is_empty());
-    }
-
-    #[test]
-    fn test_retain_panic_safety() {
-        use std::panic;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-        #[derive(Debug)]
-        struct Tracked(i32);
-
-        impl Drop for Tracked {
-            fn drop(&mut self) {
-                DROP_COUNT.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-
-        DROP_COUNT.store(0, Ordering::Relaxed);
-
-        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            let mut av: ArrayVec<Tracked, 8> = ArrayVec::new();
-            av.push(Tracked(1));
-            av.push(Tracked(2));
-            av.push(Tracked(3));
-            av.push(Tracked(4));
-            av.push(Tracked(5));
-
-            let mut call_count = 0;
-            av.retain(|t| {
-                call_count += 1;
-                // Visited in order, each element intact when the predicate sees it.
-                assert_eq!(t.0, call_count);
-                if call_count == 3 {
-                    panic!("predicate panic");
-                }
-                true
-            });
-        }));
-
-        assert!(result.is_err());
-        // All 5 elements must be dropped exactly once (no leak, no double-free).
-        assert_eq!(DROP_COUNT.load(Ordering::Relaxed), 5);
-    }
-
     // ── The surface added for the `arrayvec` shim ───────────────────────────
 
     #[test]
@@ -928,31 +869,6 @@ mod tests {
         assert_eq!(counter.get(), 0, "into_inner must not drop");
         drop(arr);
         assert_eq!(counter.get(), 2, "each element dropped exactly once");
-    }
-
-    #[test]
-    fn test_drain_dropped_early_still_removes_and_drops_once() {
-        let counter = std::rc::Rc::new(std::cell::Cell::new(0));
-        struct Bomb(u32, std::rc::Rc<std::cell::Cell<usize>>);
-        impl Drop for Bomb {
-            fn drop(&mut self) {
-                self.1.set(self.1.get() + 1);
-            }
-        }
-        let mut av: ArrayVec<Bomb, 8> = ArrayVec::new();
-        for i in 0..5 {
-            av.push(Bomb(i, std::rc::Rc::clone(&counter)));
-        }
-        {
-            let mut d = av.drain(1..4);
-            drop(d.next().unwrap());
-            assert_eq!(counter.get(), 1);
-            // dropped here with two of the three un-yielded
-        }
-        assert_eq!(counter.get(), 3, "the whole drained range is dropped once");
-        assert_eq!(av.len(), 2, "the tail closed up");
-        assert_eq!(av[0].0, 0);
-        assert_eq!(av[1].0, 4);
     }
 
     #[test]

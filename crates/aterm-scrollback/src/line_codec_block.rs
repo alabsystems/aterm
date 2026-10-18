@@ -41,6 +41,34 @@ pub fn serialize_lines(lines: &[Line]) -> Vec<u8> {
     result
 }
 
+/// Serialize a block only if its entire wire form fits `max_bytes`.
+///
+/// Every line is measured before any output allocation. Saturated measurements and
+/// aggregate overflow refuse the block; the wire form is the same as [`serialize_lines`].
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn serialize_lines_bounded(lines: &[Line], max_bytes: usize) -> Option<Vec<u8>> {
+    let count = u32::try_from(lines.len()).ok()?;
+    let size = lines.iter().try_fold(4usize, |size, line| {
+        let line_size = line.serialized_size_estimate();
+        if line_size == usize::MAX {
+            return None;
+        }
+        size.checked_add(line_size)
+            .filter(|size| *size <= max_bytes)
+    })?;
+    if size > max_bytes {
+        return None;
+    }
+    let mut result = Vec::new();
+    result.try_reserve_exact(size).ok()?;
+    result.extend_from_slice(&count.to_le_bytes());
+    for line in lines {
+        line.append_serialized(&mut result);
+    }
+    (result.len() <= max_bytes).then_some(result)
+}
+
 /// [`serialize_lines`] for a store that must decode what it writes: the lines
 /// in consecutive pages, oldest first, as `(lines in the page, page bytes)`,
 /// none longer than `max_page_bytes` unless one line alone is, which then gets
@@ -250,7 +278,7 @@ fn hyperlinks_size_v3(data: &[u8], base_size: usize) -> Option<usize> {
 }
 
 /// Absolute cap on the number of lines a single [`deserialize_lines_capped`] call
-/// reconstructs from a size-bounded block (the disk cold tier's decoded page).
+/// reconstructs from a size-bounded block (a decoded cold page).
 ///
 /// A 64 MiB decoded page of 5-byte empty records declares ~13.4M lines, ~850 MiB
 /// of `Line` structs; this cap keeps the `Vec<Line>` near the 64 MiB decode
@@ -259,8 +287,8 @@ fn hyperlinks_size_v3(data: &[u8], base_size: usize) -> Option<usize> {
 /// input-proportional and serializes the visible rows last, so a cap there would
 /// drop the live screen.
 ///
-/// It also clamps a configured `block_size` (`Scrollback::with_block_size`,
-/// `DiskBackedScrollbackConfig`), so the cap never clips a legitimate block.
+/// It also clamps a configured `block_size` (`Scrollback::with_block_size`), so
+/// the cap never clips a legitimate block.
 pub(crate) const MAX_DECODE_PAGE_LINES: usize = 1 << 20;
 
 #[cfg(test)]
@@ -366,7 +394,7 @@ pub(crate) fn count_page_lines(data: &[u8], max_lines: usize) -> usize {
 }
 
 /// Deserialize multiple lines from a block, capped at `max_lines` reconstructed
-/// lines. See [`MAX_DECODE_PAGE_LINES`] for why the disk decode path needs this and
+/// lines. See [`MAX_DECODE_PAGE_LINES`] for why the cold-page decode needs this and
 /// why the checkpoint path must not be capped.
 #[must_use]
 // Skip: the block decode reader's guarded slice walk (the SliceBoundsCheck /
@@ -381,9 +409,9 @@ pub fn deserialize_lines_capped(data: &[u8], max_lines: usize) -> Vec<Line> {
     // 5 bytes.
     let max_possible = data.len().saturating_sub(4) / 5;
     // Also cap the initial reservation: `count` is untrusted and a crafted page
-    // can inflate it over a few real records, and spare capacity retained in the
-    // DiskColdTier cache is not counted by `page_byte_size` (which measures len).
-    // A real cold page is one warm block (~10K lines by default).
+    // can inflate it over a few real records, and a retained Vec would pin spare
+    // capacity no len-based byte count sees. A real cold page is one warm block
+    // (~10K lines by default).
     const MAX_PREALLOC_LINES: usize = 16_384;
     let mut lines = Vec::with_capacity(count.min(max_possible).min(MAX_PREALLOC_LINES));
 
@@ -413,9 +441,8 @@ pub fn deserialize_lines_capped(data: &[u8], max_lines: usize) -> Vec<Line> {
         crate::log_shim::warn_str(&msg);
     }
 
-    // Drop spare capacity from an over-estimated `count`: a page retained in the
-    // DiskColdTier cache then pins only its content, which keeps
-    // `cache_byte_limit` (measured from len) honest.
+    // Drop spare capacity from an over-estimated `count`: a retained page then
+    // pins only its content, which len-based byte counts measure.
     lines.shrink_to_fit();
     lines
 }
@@ -680,10 +707,10 @@ pub fn deserialize_lines_tail_strict(
     Some(tail.into_iter().collect())
 }
 
-/// Deserialize a decoded disk page, capped at [`MAX_DECODE_PAGE_LINES`].
+/// Deserialize a decoded cold page, capped at [`MAX_DECODE_PAGE_LINES`].
 ///
 /// `decode_cold_bounded` bounds the decompressed bytes but not the line count;
-/// every disk-page decode goes through here so a crafted page cannot amplify
+/// every cold-page decode goes through here so a crafted page cannot amplify
 /// into hundreds of MiB of `Line` structs.
 #[must_use]
 pub fn deserialize_page_lines(data: &[u8]) -> Vec<Line> {
@@ -693,7 +720,7 @@ pub fn deserialize_page_lines(data: &[u8]) -> Vec<Line> {
 /// Deserialize multiple lines from a block, uncapped.
 ///
 /// For the checkpoint path, whose body is uncompressed and input-proportional.
-/// A size-bounded disk decode uses [`deserialize_page_lines`] instead.
+/// A size-bounded cold-page decode uses [`deserialize_page_lines`] instead.
 #[must_use]
 pub fn deserialize_lines(data: &[u8]) -> Vec<Line> {
     deserialize_lines_capped(data, usize::MAX)

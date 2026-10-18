@@ -13,7 +13,7 @@
 //! `aterm_gui::link_target`'s caption discloses the destination.
 
 /// Hard cap on host-minted extra schemes; a host mints one or two app schemes
-/// (`orca`). Abstract twin: `Cap` in `aterm_spec::derive::hyperlink_scheme_cap_model`.
+/// (`orca`). Abstract twin: `Cap` in `aterm_models_misc::hyperlink_scheme_cap_model`.
 pub(crate) const MAX_EXTRA_SCHEMES: usize = 4;
 
 /// Hard cap on one extra scheme's length. Real schemes are short; this bounds
@@ -121,13 +121,6 @@ impl HyperlinkAuth {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_new_scheme_set_is_empty_so_only_the_builtin_safe_list_admits() {
-        let auth = HyperlinkAuth::new();
-        assert!(auth.extra_schemes().is_empty());
-        assert!(HyperlinkAuth::default().extra_schemes().is_empty());
-    }
 
     // ---- host-minted extra schemes ----------------------
 

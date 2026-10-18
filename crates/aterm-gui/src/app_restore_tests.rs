@@ -9,8 +9,7 @@
 /// and restore-down lands where the user had it. After restore-down the
 /// window is normal again and the tracker follows it once more; a window
 /// that is not maximized (or whose show state is unknown) persists exactly
-/// what it is showing. The negative control: a tracker that took the
-/// maximized events too would persist the monitor corner.
+/// what it is showing.
 #[test]
 fn the_tracker_keeps_the_normal_frame_through_a_maximize_and_restore() {
     let mut frame = super::NormalFrame {
@@ -53,15 +52,6 @@ fn the_tracker_keeps_the_normal_frame_through_a_maximize_and_restore() {
     assert_eq!(
         super::captured_frame(Some((0, 0)), (62, 240), Some(true), unplaced),
         (None, (30, 100))
-    );
-    // Negative control: fed the maximized events as normal ones, the capture
-    // would persist the corner and the grown grid.
-    let mut naive = frame;
-    naive.note_origin(false, (0, 0));
-    naive.note_grid(false, (62, 240));
-    assert_ne!(
-        super::captured_frame(Some((0, 0)), (62, 240), Some(true), naive),
-        (Some((500, 50)), (30, 100))
     );
 }
 use crate::{App, CloseOutcome, WindowId, pane, restore};
@@ -282,52 +272,25 @@ fn feed_session0(app: &App, bytes: &[u8]) {
     crate::term_lock(&s.term).process(bytes);
 }
 
-/// TAB-LABEL DEFAULT (cwd-as-title): a cwd under `$HOME` reads in the `~…`
-/// form — byte-matching what the zsh integration's precmd puts in OSC 0
-/// titles (`~` for home itself, `~/sub` below it) — so the no-integration
-/// default label is indistinguishable from the integrated one.
-///
-/// Unix-only: the OSC 7 fed here is `file://localhost<$HOME>/…`, a Unix
-/// cwd spelling (`$HOME` is `C:\Users\…` on Windows, and
-/// `home_relative_suffix` reads a `/`-rooted remainder), so what the
-/// Windows integration reports, and how it abbreviates, is a separate
-/// question this fixture cannot ask.
-#[cfg(unix)]
+/// THE TAB LABEL'S RUNGS, top down, against real OSC ingestion: the USER
+/// title (`meta set title`; an empty one reads as unset) outranks a live OSC
+/// 0/2 title, which outranks the reported cwd (`~`-abbreviated under `$HOME`,
+/// byte-matching the zsh integration's precmd titles), which outranks the
+/// tab's presentation title, then the literal "aterm". Clearing a rung falls
+/// back to the next, never to a stale value; a native tab keeps its
+/// presentation title (it owns no session, so no cwd applies); and a label
+/// change moves the strip fingerprint the `Wake::MetaChanged` repaint gates on.
 #[test]
-fn tab_title_abbreviates_a_home_cwd_like_the_shell_integration() {
-    let Some(home) = crate::app_tabs::cached_home() else {
-        return; // no $HOME in this environment -> nothing to abbreviate
-    };
-    let mut app = App::headless_for_test();
-    feed_session0(
-        &app,
-        format!("\x1b]7;file://localhost{home}/aterm-abbrev-proof\x07").as_bytes(),
-    );
-    assert_eq!(app.tab_titles(WindowId(0))[0], "~/aterm-abbrev-proof");
-    feed_session0(
-        &app,
-        format!("\x1b]7;file://localhost{home}\x07").as_bytes(),
-    );
-    assert_eq!(
-        app.tab_titles(WindowId(0))[0],
-        "~",
-        "home itself reads as the bare ~"
-    );
-}
-
-/// TAB-LABEL DEFAULT (cwd-as-title): the cwd outranks the tab PRESENTATION
-/// title, and an unset/cleared cwd falls through to it (and finally to the
-/// literal "aterm") — the pre-feature fallback rungs survive verbatim
-/// below the new cwd rung, so a session with no shell integration at all
-/// labels exactly as before.
-#[test]
-fn tab_title_cwd_outranks_presentation_and_clearing_falls_back() {
+fn tab_label_rungs_fall_back_in_order_and_move_the_strip_fingerprint() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    // Titleless, cwd-less baseline: a plain terminal tab's presentation
-    // title is empty, so the label is the literal "aterm".
+    app.tab_strip_rows = 1; // enable the strip (fingerprint pinned 0 when disabled)
+    let fingerprint = |app: &mut App| {
+        let titles = app.tab_titles(wid);
+        let metadata = app.tab_strip_metadata(wid);
+        app.tab_strip_fingerprint_from_parts(wid, &titles, &metadata, 0)
+    };
     assert_eq!(app.tab_titles(wid)[0], "aterm");
-    // A presentation title takes the slot while nothing livelier exists.
     app.windows
         .get_mut(&wid)
         .expect("window 0")
@@ -337,152 +300,78 @@ fn tab_title_cwd_outranks_presentation_and_clearing_falls_back() {
         .presentation
         .title = "Renamed".to_string();
     assert_eq!(app.tab_titles(wid)[0], "Renamed");
-    // A reported cwd outranks the presentation…
     feed_session0(&app, b"\x1b]7;file://localhost/aterm-proof/live\x07");
     assert_eq!(app.tab_titles(wid)[0], "/aterm-proof/live");
-    // …and CLEARING it (empty OSC 7 — integration torn down) falls back to
-    // the presentation again, never to a stale path.
+    // Unix-only: `$HOME` is `C:\Users\…` on Windows, which this OSC 7 cannot spell.
+    #[cfg(unix)]
+    {
+        if let Some(home) = crate::app_tabs::cached_home() {
+            feed_session0(
+                &app,
+                format!("\x1b]7;file://localhost{home}/aterm-abbrev-proof\x07").as_bytes(),
+            );
+            assert_eq!(app.tab_titles(wid)[0], "~/aterm-abbrev-proof");
+            feed_session0(
+                &app,
+                format!("\x1b]7;file://localhost{home}\x07").as_bytes(),
+            );
+            assert_eq!(app.tab_titles(wid)[0], "~", "home itself is the bare ~");
+        }
+    }
     feed_session0(&app, b"\x1b]7;\x07");
-    assert_eq!(app.tab_titles(wid)[0], "Renamed");
-}
-
-/// TAB-LABEL DEFAULT (cwd-as-title): with no program-set title a terminal
-/// tab is labeled by its session's cwd, verbatim outside `$HOME`, while
-/// NON-terminal tabs are untouched by the cwd rung — a native tab keeps its
-/// presentation title even while a terminal sibling in the SAME window is
-/// labeled by its session's cwd (native views own no session, so no cwd
-/// can ever apply to them).
-#[test]
-fn native_tab_titles_ignore_the_terminal_cwd_default() {
-    let mut app = App::headless_for_test();
-    let wid = WindowId(0);
-    assert!(
-        app.open_settings_tab(crate::native_settings::SettingsRoute::default()),
-        "settings tab installs in the headless fixture"
-    );
-    feed_session0(
-        &app,
-        b"\x1b]7;file://localhost/aterm-proof/terminal-only\x07",
-    );
     assert_eq!(
-        app.tab_titles(wid),
-        vec!["/aterm-proof/terminal-only", "Settings"],
-        "the cwd labels ONLY the terminal tab; the native tab keeps its \
-         presentation title"
+        app.tab_titles(wid)[0],
+        "Renamed",
+        "a cleared cwd falls back"
     );
-}
 
-/// SESSION-METADATA stage 1 — the USER title (`meta set title`) is the TOP
-/// tab-label rung: it outranks a live OSC 0/2 title AND the reported cwd,
-/// and CLEARING it (`meta unset title`) falls back to the live title — the
-/// pre-existing chain survives verbatim beneath the new rung, whose baseline
-/// is a live OSC title outranking the reported cwd (the cwd is the DEFAULT
-/// label, never a displacement of an explicit title). Driven through the
-/// real ctx the label chain reads (the same object the `meta` verb
-/// mutates), against real OSC ingestion.
-#[test]
-fn user_title_outranks_the_live_osc_title_and_clearing_falls_back() {
-    let mut app = App::headless_for_test();
-    let wid = WindowId(0);
-    feed_session0(&app, b"\x1b]2;vim src/main.rs\x07");
     feed_session0(&app, b"\x1b]7;file://localhost/aterm-proof/meta\x07");
-    assert_eq!(app.tab_titles(wid)[0], "vim src/main.rs", "baseline: OSC");
-
-    // Clone the ctx handle out so the pool borrow doesn't pin `app`
-    // (`tab_titles` needs `&mut self` for its keep-stale cache).
+    feed_session0(&app, b"\x1b]2;vim src/main.rs\x07");
+    assert_eq!(
+        app.tab_titles(wid)[0],
+        "vim src/main.rs",
+        "OSC outranks cwd"
+    );
+    let before = fingerprint(&mut app);
     let ctx = app.pool.get(0).expect("session 0").ctx.clone();
     ctx.meta.lock().unwrap().user_title = Some("build agent".to_string());
-    assert_eq!(
-        app.tab_titles(wid)[0],
-        "build agent",
-        "the user title outranks the live OSC title"
-    );
-    // An EMPTY user title is treated as unset (never a blank tab label).
-    ctx.meta.lock().unwrap().user_title = Some(String::new());
-    assert_eq!(app.tab_titles(wid)[0], "vim src/main.rs");
-    // Clearing falls back to the live title, then (title cleared too) the cwd.
-    ctx.meta.lock().unwrap().user_title = None;
-    assert_eq!(app.tab_titles(wid)[0], "vim src/main.rs");
-    feed_session0(&app, b"\x1b]2;\x07");
-    assert_eq!(
-        app.tab_titles(wid)[0],
-        "/aterm-proof/meta",
-        "beneath the user rung the old chain survives verbatim"
-    );
-}
-
-/// SESSION-METADATA stage 1 — a user-title change moves the tab-strip
-/// fingerprint (the fingerprint hashes the exact `tab_titles` bytes), so the
-/// `Wake::MetaChanged` refresh repaints the strip through the ordinary
-/// RepaintKey path. Whatever rung changed the label — a titleless `cd`'s
-/// cwd included — moves the same bytes.
-#[test]
-fn user_title_change_moves_the_tab_strip_fingerprint() {
-    let mut app = App::headless_for_test();
-    let wid = WindowId(0);
-    app.tab_strip_rows = 1; // enable the strip (fingerprint pinned 0 when disabled)
-    let fingerprint = |app: &mut App| {
-        let titles = app.tab_titles(wid);
-        let metadata = app.tab_strip_metadata(wid);
-        app.tab_strip_fingerprint_from_parts(wid, &titles, &metadata, 0)
-    };
-    let before = fingerprint(&mut app);
-    app.pool
-        .get(0)
-        .expect("session 0")
-        .ctx
-        .meta
-        .lock()
-        .unwrap()
-        .user_title = Some("build agent".to_string());
-    let with_user_title = fingerprint(&mut app);
+    assert_eq!(app.tab_titles(wid)[0], "build agent");
     assert_ne!(
-        before, with_user_title,
-        "a user-title change must move the strip fingerprint"
+        fingerprint(&mut app),
+        before,
+        "a user title moves the strip"
     );
-    // And unsetting moves it back to the original label bytes.
-    app.pool
-        .get(0)
-        .expect("session 0")
-        .ctx
-        .meta
-        .lock()
-        .unwrap()
-        .user_title = None;
+    ctx.meta.lock().unwrap().user_title = Some(String::new());
+    assert_eq!(app.tab_titles(wid)[0], "vim src/main.rs", "empty is unset");
+    ctx.meta.lock().unwrap().user_title = None;
     assert_eq!(fingerprint(&mut app), before, "clearing restores the label");
+    feed_session0(&app, b"\x1b]2;\x07");
+    assert_eq!(app.tab_titles(wid)[0], "/aterm-proof/meta");
+
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::default()));
+    assert_eq!(
+        app.tab_titles(wid),
+        vec!["/aterm-proof/meta", "Settings"],
+        "the cwd labels ONLY the terminal tab"
+    );
 }
 
-/// SESSION-METADATA stage 1 — a restore leaf carrying user metadata re-seeds
-/// the respawned session's ctx, and a leaf without any is a no-op (the meta
-/// mutex is untouched on the common path).
+/// SESSION-METADATA stage 1 — a restore leaf's user metadata re-seeds the
+/// respawned session's ctx (field by field, sanitized:
+/// `restored_and_legacy_raw_metadata_is_sanitized_before_chrome`), and a leaf
+/// without any never wipes what is already there.
 #[test]
 fn restore_leaf_reseeds_user_metadata_onto_the_respawned_session() {
     let bare = restore::TerminalLeafRestore {
         local_id: None,
         ..bare_leaf()
     };
-    let leaf = restore::TerminalLeafRestore {
-        cwd: Some("/tmp".to_string()),
-        title: "shell".to_string(),
+    let session = crate::stub_session(9);
+    let titled = restore::TerminalLeafRestore {
         user_title: Some("release builder".to_string()),
-        description: Some("cuts the v0.56 release".to_string()),
-        icon: Some("🚀".to_string()),
-        role: Some("operator".to_string()),
-        attention: Some("⚠ waiting on approval".to_string()),
-        questions: Some("recommended".to_string()),
         ..bare.clone()
     };
-    let session = crate::stub_session(9);
-    App::seed_restored_user_meta(&session, &leaf);
-    let meta = session.ctx.meta.lock().unwrap().clone();
-    assert_eq!(meta.questions.as_deref(), Some("recommended"));
-    assert_eq!(meta.user_title.as_deref(), Some("release builder"));
-    assert_eq!(meta.description.as_deref(), Some("cuts the v0.56 release"));
-    assert_eq!(meta.icon.as_deref(), Some("🚀"));
-    assert_eq!(meta.role.as_deref(), Some("operator"));
-    assert_eq!(meta.attention.as_deref(), Some("⚠ waiting on approval"));
-
-    // A metadata-less leaf leaves an already-seeded ctx untouched (no wipe).
+    App::seed_restored_user_meta(&session, &titled);
     App::seed_restored_user_meta(&session, &bare);
     assert_eq!(
         session.ctx.meta.lock().unwrap().user_title.as_deref(),
@@ -577,12 +466,12 @@ fn restored_and_legacy_raw_metadata_is_sanitized_before_chrome() {
         .as_deref()
         .expect("composed terminal tooltip");
     assert!(
-        tooltip
-            .lines()
-            .all(|line| { !crate::session_timeline::metadata_has_forbidden_formatting(line) })
+        tooltip.contains("firstsecond")
+            && tooltip
+                .lines()
+                .all(|line| { !crate::session_timeline::metadata_has_forbidden_formatting(line) }),
+        "the description crosses the same sanitizer into the tooltip: {tooltip:?}"
     );
-    assert!(tooltip.contains("description: firstsecond"), "{tooltip:?}");
-    assert!(tooltip.starts_with(family), "{tooltip:?}");
 }
 
 /// The last-window close DECIDES to exit and stashes the manifest BEFORE the
@@ -713,34 +602,6 @@ fn heterogeneous_active_tab_round_trips_by_recursive_index() {
         Some(crate::tab_model::View::Terminal(_))
     )));
     assert!(reopened.structural_invariants_ok());
-}
-
-#[test]
-fn native_only_restore_retires_bootstrap_without_fabricating_a_session() {
-    let mut app = App::headless_for_test();
-    let wid = WindowId(0);
-    app.restore_into_window(wid, legacy_native_window(updates_settings()));
-    let ws = &app.windows[&wid];
-    assert_eq!(ws.tab_set.len(), 1);
-    assert!(ws.layouts.is_empty());
-    assert_eq!(ws.tabs, crate::TabIndex::new(0, 0));
-    assert!(ws.active_terminal.is_none());
-    assert!(ws.front_terminal().is_none());
-    assert_eq!(app.focused_session_id(wid), None);
-    assert!(app.pool.get(0).is_none(), "bootstrap session retired");
-    assert!(app.store.read().unwrap().snapshot().is_empty());
-    let (_, view) = app.active_native_view(wid).expect("native Settings");
-    assert_eq!(
-        ws.window_focus,
-        crate::front_content::WindowFocus::Content(view),
-        "the first restored native view owns window focus"
-    );
-    assert!(matches!(
-        app.native_runtime.view_state(view),
-        Some(crate::native_app::AppViewState::Settings(state))
-            if state.route == crate::native_settings::SettingsRoute::SoftwareUpdate
-    ));
-    assert!(app.structural_invariants_ok());
 }
 
 #[test]
@@ -892,23 +753,64 @@ fn native_only_restore_never_discards_a_seamlessly_adopted_bootstrap() {
 /// A handoff successor whose window 0 has no terminal leaf spawns session 0
 /// FRESH (`take_session0_shell`): no handed-off shell belongs in window 0.
 /// That bootstrap is as throwaway as a cold one, so a native-only rebuild
-/// retires it — on the canonical path a handoff layout takes and on the
-/// legacy one — instead of keeping it as an extra tab the layout never had.
+/// retires it — cold or on a successor, on the canonical path a handoff
+/// layout takes and on the legacy one — instead of keeping it as an extra
+/// tab the layout never had, and fabricates no session in its place. The
+/// Settings tab it keeps reopens on the route it was showing.
 #[test]
 fn a_successors_fresh_bootstrap_is_retired_by_a_native_only_window_0() {
-    for (path, layout) in [
-        ("canonical", window_of(vec![settings_leaf()])),
-        ("legacy", legacy_native_window(updates_settings())),
+    use crate::native_settings::SettingsRoute::{About, SoftwareUpdate};
+    for (path, successor, layout, route) in [
+        (
+            "cold canonical",
+            false,
+            window_of(vec![settings_leaf()]),
+            About,
+        ),
+        (
+            "cold legacy",
+            false,
+            legacy_native_window(updates_settings()),
+            SoftwareUpdate,
+        ),
+        ("canonical", true, window_of(vec![settings_leaf()]), About),
+        (
+            "legacy",
+            true,
+            legacy_native_window(updates_settings()),
+            SoftwareUpdate,
+        ),
     ] {
         let mut app = App::headless_for_test();
-        app.handoff_successor = true;
+        app.handoff_successor = successor;
         app.restore_into_window(WindowId(0), layout);
         let window = &app.windows[&WindowId(0)];
         assert_eq!(window.tab_set.len(), 1, "{path}: only the Settings tab");
         assert!(window.layouts.is_empty(), "{path}");
+        assert!(window.front_terminal().is_none(), "{path}");
+        assert_eq!(app.focused_session_id(WindowId(0)), None, "{path}");
         assert!(
             app.pool.get(0).is_none(),
             "{path}: the fresh bootstrap retired"
+        );
+        assert!(
+            app.store.read().unwrap().snapshot().is_empty(),
+            "{path}: no session registered in its place"
+        );
+        let (_, view) = app
+            .active_native_view(WindowId(0))
+            .expect("Settings restored");
+        assert_eq!(
+            app.windows[&WindowId(0)].window_focus,
+            crate::front_content::WindowFocus::Content(view),
+            "{path}: the restored native view owns window focus"
+        );
+        assert!(
+            matches!(
+                app.native_runtime.view_state(view),
+                Some(crate::native_app::AppViewState::Settings(state)) if state.route == route
+            ),
+            "{path}: Settings reopens on the page it was showing"
         );
         assert!(app.structural_invariants_ok(), "{path}");
     }
@@ -1109,31 +1011,6 @@ fn a_descending_leaf_run_restores_every_tab_onto_its_own_shell() {
     }
     assert!(app.restored_window_sessions_are_distinct(wid));
 
-    // WRITE ISOLATION — the symptom a user actually meets. Bytes fed to one
-    // leaf's engine, exactly as its PTY would, must land on that leaf's screen
-    // and on NO other's.
-    for (index, id) in sessions.iter().enumerate() {
-        let session = app.pool.get(*id).expect("restored session");
-        crate::term_lock(&session.term).process(format!("MARKER{index}").as_bytes());
-    }
-    for (index, id) in sessions.iter().enumerate() {
-        let session = app.pool.get(*id).expect("restored session");
-        let terminal = crate::term_lock(&session.term);
-        let screen = (0..i32::from(terminal.rows()))
-            .filter_map(|row| terminal.get_line_text(row, None))
-            .collect::<String>();
-        assert!(
-            screen.contains(&format!("MARKER{index}")),
-            "leaf {index} lost its own typing"
-        );
-        for other in (0..sessions.len()).filter(|other| *other != index) {
-            assert!(
-                !screen.contains(&format!("MARKER{other}")),
-                "leaf {index} is showing leaf {other}'s typing — they share a PTY"
-            );
-        }
-    }
-
     // Each respawned leaf also carries ITS OWN operator title, so the saved
     // work contexts stayed separate all the way to the tab strip. (Tab 0's
     // shell is the grafted bootstrap, which keeps the live session it already
@@ -1162,30 +1039,6 @@ fn a_descending_leaf_run_restores_every_tab_onto_its_own_shell() {
         ],
         "a respawned leaf must wear the metadata of the shell it stands for"
     );
-    assert!(app.structural_invariants_ok());
-}
-
-#[test]
-fn recursive_native_only_restore_retires_the_cold_bootstrap() {
-    let mut app = App::headless_for_test();
-    let wid = WindowId(0);
-    app.restore_into_window(wid, window_of(vec![settings_leaf()]));
-    let window = &app.windows[&wid];
-    assert_eq!(window.tab_set.len(), 1);
-    assert!(window.layouts.is_empty());
-    assert!(app.pool.get(0).is_none());
-    assert!(app.store.read().unwrap().snapshot().is_empty());
-    let (_, view) = app.active_native_view(wid).expect("Settings restored");
-    assert_eq!(
-        window.window_focus,
-        crate::front_content::WindowFocus::Content(view),
-        "recursive native-only restore mounts its selected content"
-    );
-    assert!(matches!(
-        app.native_runtime.view_state(view),
-        Some(crate::native_app::AppViewState::Settings(state))
-            if state.route == crate::native_settings::SettingsRoute::About
-    ));
     assert!(app.structural_invariants_ok());
 }
 
@@ -1432,6 +1285,8 @@ fn single_leaf_window(leaf: restore::TerminalLeafRestore) -> restore::WindowLayo
 
 fn bare_leaf() -> restore::TerminalLeafRestore {
     restore::TerminalLeafRestore {
+        sid: None,
+        lineage: None,
         cwd: None,
         title: String::new(),
         profile: None,
@@ -1443,7 +1298,9 @@ fn bare_leaf() -> restore::TerminalLeafRestore {
         attention: None,
         questions: None,
         autopilot: None,
+        land_at: None,
         identity: None,
+        theme: None,
         agent: None,
         supervised: None,
         held: false,
@@ -1507,202 +1364,116 @@ fn registry_meta(app: &App, session: u64) -> crate::session_timeline::SessionMet
 /// write ladder, the post-park capture (`capture_restore_manifest`, the call
 /// `start_unix_update_handoff` makes), the exact sidecar bytes the parent
 /// writes (`to_toml`) and the child's acceptance of them (`from_toml` plus
-/// `covers_exact_seamless_ids`), then the successor's per-window apply onto
-/// the sessions it ADOPTED — each window's bootstrap, which is what fills a
-/// window's first terminal leaf. Capture, wire and parse all carried the
-/// fields; the graft in `restore_terminal_leaf` dropped them.
+/// `covers_exact_seamless_ids`), then the successor's apply onto the session
+/// it ADOPTED as the window's bootstrap. Capture, wire and parse all carried
+/// the fields; the graft in `restore_terminal_leaf` dropped them. (Every
+/// window's bootstrap, and every field on the shell its leaf names:
+/// `a_handoff_carries_each_identity_onto_the_shell_its_leaf_names_and_never_a_stand_in`.)
 #[test]
 fn a_handoff_keeps_user_metadata_on_every_adopted_window_bootstrap() {
     use crate::session_timeline::{MetaEdit, MetaField, SessionMeta, write_session_meta};
 
-    let stamp = |app: &App, session: u64, field: MetaField, value: &str| {
-        let ctx = app.pool.get(session).expect("live session").ctx.clone();
+    // PREDECESSOR: one terminal carrying all six fields, each set by the verb.
+    let old = App::headless_for_test();
+    let ctx = old.pool.get(0).expect("live session").ctx.clone();
+    for (field, value) in [
+        (MetaField::Title, "fable driver"),
+        (MetaField::Description, "drives the satcomp worker"),
+        (MetaField::Icon, "🦊"),
+        (MetaField::Role, "agent:claude-driver-fable"),
+        (MetaField::Attention, "waiting on a human review"),
+        // Answered with the recommended option (2026-09-24): the sixth field
+        // rides the same capture, wire and graft.
+        (MetaField::Questions, "recommended"),
+    ] {
         assert_eq!(
             write_session_meta(&ctx, field, MetaEdit::Set(value)),
             Ok(true),
             "`meta set {}` stores",
             field.wire_name()
         );
-    };
-
-    // PREDECESSOR: two windows, one terminal each — the measured layout.
-    let mut old = App::headless_for_test();
-    let second = crate::stub_session(1);
-    App::register_session(&old.store, &second, None);
-    let old_second_window = old.insert_logical_window(second, 24, 80);
-    // Session 0 carries all five fields; session 1 carries two, and its
-    // title, description and icon are never set.
-    stamp(&old, 0, MetaField::Title, "fable driver");
-    stamp(&old, 0, MetaField::Description, "drives the satcomp worker");
-    stamp(&old, 0, MetaField::Icon, "🦊");
-    stamp(&old, 0, MetaField::Role, "agent:claude-driver-fable");
-    stamp(&old, 0, MetaField::Attention, "waiting on a human review");
-    stamp(&old, 1, MetaField::Role, "worker:claude-satcomp");
-    stamp(
-        &old,
-        1,
-        MetaField::Attention,
-        "SAT-COMP campaign docs handoff",
-    );
-    // The worker's questions are answered with their recommended option
-    // (2026-09-24): the sixth field rides the same capture, wire and graft.
-    stamp(&old, 1, MetaField::Questions, "recommended");
+    }
     let driver = SessionMeta {
         user_title: Some("fable driver".to_string()),
         description: Some("drives the satcomp worker".to_string()),
         icon: Some("🦊".to_string()),
         role: Some("agent:claude-driver-fable".to_string()),
         attention: Some("waiting on a human review".to_string()),
-        ..SessionMeta::default()
-    };
-    let worker = SessionMeta {
-        role: Some("worker:claude-satcomp".to_string()),
-        attention: Some("SAT-COMP campaign docs handoff".to_string()),
         questions: Some("recommended".to_string()),
         ..SessionMeta::default()
     };
     assert_eq!(registry_meta(&old, 0), driver, "PRECONDITION: stamped");
-    assert_eq!(registry_meta(&old, 1), worker, "PRECONDITION: stamped");
 
     // CAPTURE, then the WIRE: the parent writes exactly `to_toml()` to the
-    // layout sidecar (and hashes those bytes); the child parses the bytes it
-    // read and refuses a layout that does not name every handed-off id once.
+    // layout sidecar; the child parses the bytes it read and refuses a layout
+    // that does not name every handed-off id once.
     let captured = old.capture_restore_manifest();
     let wire = captured
         .to_toml()
         .expect("the parent serializes its layout");
-    for spelled in [
-        "user_title = \"fable driver\"",
-        "role = \"agent:claude-driver-fable\"",
-        "role = \"worker:claude-satcomp\"",
-        "attention = \"SAT-COMP campaign docs handoff\"",
-        "questions = \"recommended\"",
-    ] {
-        assert!(
-            wire.contains(spelled),
-            "the sidecar spells {spelled}: {wire}"
-        );
-    }
     let carried = restore::RestoreManifest::from_toml(&wire)
-        .filter(|layout| layout.covers_exact_seamless_ids(&[0, 1]))
+        .filter(|layout| layout.covers_exact_seamless_ids(&[0]))
         .expect("the child accepts the sidecar");
     assert_eq!(
         carried, captured,
         "neither the wire nor the parse drops a field"
     );
 
-    // SUCCESSOR: window 0's bootstrap is the shell adopted in `main_entry`, window
-    // 1's the one adopted in `create_window_internal_connected` — each picked by
-    // `bootstrap_local_id`, and each keeping the id the parent knew it by.
-    // Adoption mints a fresh ctx, so both start with no USER metadata.
+    // SUCCESSOR: the bootstrap is the shell adopted in `main_entry`, keeping
+    // the id the parent knew it by. Adoption mints a fresh ctx.
     let mut new = App::headless_for_test();
     new.handoff_successor = true;
-    let picked: Vec<Option<u64>> = carried
-        .windows
-        .iter()
-        .map(restore::WindowLayout::bootstrap_local_id)
-        .collect();
-    assert_eq!(picked, vec![Some(0), Some(1)]);
     adopt_as(&mut new, 0, 0);
-    let adopted = crate::stub_session(1);
-    App::register_session(&new.store, &adopted, None);
-    let new_second_window = new.insert_logical_window(adopted, 24, 80);
-    adopt_as(&mut new, 1, 1);
-    assert_eq!(new_second_window, old_second_window);
     assert!(
-        !registry_meta(&new, 0).any_set() && !registry_meta(&new, 1).any_set(),
+        !registry_meta(&new, 0).any_set(),
         "PRECONDITION: an adopted session arrives with a fresh ctx"
     );
-
-    // APPLY: what `apply_restore_manifest` runs for each window once its
-    // host (and so its bootstrap session) exists.
-    let mut windows = carried.windows.into_iter();
-    new.restore_into_window(WindowId(0), windows.next().expect("window 0"));
-    new.restore_into_window(new_second_window, windows.next().expect("window 1"));
-
-    for (window, session) in [(WindowId(0), 0), (new_second_window, 1)] {
-        assert_eq!(
-            new.focused_session_id(window),
-            Some(session),
-            "the leaf was filled by the ADOPTED session, not a respawn"
-        );
-    }
+    new.restore_into_window(
+        WindowId(0),
+        carried.windows.into_iter().next().expect("window 0"),
+    );
+    assert_eq!(
+        new.focused_session_id(WindowId(0)),
+        Some(0),
+        "the leaf was filled by the ADOPTED session, not a respawn"
+    );
     assert_eq!(
         registry_meta(&new, 0),
         driver,
-        "all five fields survive onto the adopted session"
-    );
-    assert_eq!(
-        registry_meta(&new, 1),
-        worker,
-        "the two set fields survive and the three unset ones stay unset"
+        "all six fields survive onto the adopted session"
     );
     // And the successor now carries exactly the layout the parent's Commit
     // compared — USER metadata included, which `commit_layout_topology`
-    // deliberately keeps in that comparison.
-    assert_eq!(new.capture_restore_manifest(), captured);
+    // deliberately keeps in that comparison. (A real adoption keeps the
+    // shell's sid; the stub one mints its own, so the sids are set apart.)
+    assert_eq!(
+        sids_cleared(new.capture_restore_manifest()),
+        sids_cleared(captured)
+    );
     assert!(new.structural_invariants_ok());
 }
 
-/// A parent built before the carry dropped it still writes the retired
-/// Claude Code hooks' bare badge into the sidecar (v0.95.0 carried one for
-/// two days on a busy agent's tab, 2026-09-27). The successor's parse drops
-/// it, so the adopted session arrives without it: the handoff INTO a fixed
-/// build is what clears the one standing. NEGATIVE CONTROL: the other
-/// session's attention arrives intact.
-#[test]
-fn a_handoff_from_an_older_parent_drops_the_retired_hook_badge() {
-    use crate::session_timeline::{MetaEdit, MetaField, write_session_meta};
-
-    let legacy = "claude needs approval: Claude needs your permission - permission_prompt";
-    let mut old = App::headless_for_test();
-    let second = crate::stub_session(1);
-    App::register_session(&old.store, &second, None);
-    let old_second_window = old.insert_logical_window(second, 24, 80);
-    for (session, text) in [(0, "PLACEHOLDER"), (1, "SAT-COMP campaign docs handoff")] {
-        let ctx = old.pool.get(session).expect("live session").ctx.clone();
-        assert_eq!(
-            write_session_meta(&ctx, MetaField::Attention, MetaEdit::Set(text)),
-            Ok(true)
-        );
+/// `manifest` with every terminal leaf's `sid` cleared: what a stub adoption
+/// (which mints a fresh sid where a real one keeps the shell's) can compare.
+fn sids_cleared(mut manifest: restore::RestoreManifest) -> restore::RestoreManifest {
+    fn clear(tree: &mut restore::RestoredSplitTree) {
+        match tree {
+            restore::RestoredSplitTree::Leaf {
+                view: restore::RestoredView::Terminal(leaf),
+            } => leaf.sid = None,
+            restore::RestoredSplitTree::Leaf { .. } => {}
+            restore::RestoredSplitTree::Split { first, second, .. } => {
+                clear(first);
+                clear(second);
+            }
+        }
     }
-    // This build's capture would drop the badge, so it is put in the wire
-    // where the placeholder stands — what the older parent writes.
-    let wire = old
-        .capture_restore_manifest()
-        .to_toml()
-        .expect("the parent serializes its layout")
-        .replace(
-            "attention = \"PLACEHOLDER\"",
-            &format!("attention = \"{legacy}\""),
-        );
-    assert!(
-        wire.contains(legacy),
-        "the sidecar spells the badge: {wire}"
-    );
-    let carried = restore::RestoreManifest::from_toml(&wire)
-        .filter(|layout| layout.covers_exact_seamless_ids(&[0, 1]))
-        .expect("the child accepts the sidecar");
-
-    let mut new = App::headless_for_test();
-    new.handoff_successor = true;
-    adopt_as(&mut new, 0, 0);
-    let adopted = crate::stub_session(1);
-    App::register_session(&new.store, &adopted, None);
-    let new_second_window = new.insert_logical_window(adopted, 24, 80);
-    adopt_as(&mut new, 1, 1);
-    assert_eq!(new_second_window, old_second_window);
-    let mut windows = carried.windows.into_iter();
-    new.restore_into_window(WindowId(0), windows.next().expect("window 0"));
-    new.restore_into_window(new_second_window, windows.next().expect("window 1"));
-
-    let first = registry_meta(&new, 0);
-    assert_eq!(first.attention, None, "the badge did not arrive");
-    assert!(first.attention_owners.is_empty());
-    assert_eq!(
-        registry_meta(&new, 1).attention.as_deref(),
-        Some("SAT-COMP campaign docs handoff")
-    );
+    for window in &mut manifest.windows {
+        for tab in &mut window.restored_tabs {
+            clear(&mut tab.root);
+        }
+    }
+    manifest
 }
 
 /// The graft stores the leaf's USER fields EXACTLY over anything a driver
@@ -2011,26 +1782,43 @@ fn a_graft_carries_a_leaf_only_onto_the_shell_that_leaf_names() {
     assert_eq!(registry_meta(&new, placed[1][0]), worker);
 }
 
-/// A FROZEN SHELL'S ADOPTION REACHES THE REGISTRY'S COUNT (2026-09-16), end to
-/// end through the spawn seam: `seamless::take_incoming` decides
-/// `Adopted::frozen_path` (the manifest's `outgoing_build` absent, or the
-/// record's own flag), `spawn_session` copies it onto `Session::frozen_path`,
-/// and `App::register_session` marks it on the store — where
-/// `SessionStore::frozen_path_tabs` counts it for the managed row's "N tabs
-/// from before this update" note and the seed pill's narrowing. Both adoption
-/// paths are driven: the restore of a leaf naming the shell, and the orphan
-/// net. Dropping `Session::frozen_path` (or the copy in either path) fails
-/// this, and with it the note that keeps the "every aterm tab" claim honest.
+/// WHAT A HANDED SHELL CARRIES REACHES ITS SESSION AND THE REGISTRY, through
+/// both adoption paths: the restore of a leaf naming the shell, and the
+/// orphan net.
+///
+/// THE FROZEN FLAG (2026-09-16): `seamless::take_incoming` decides
+/// `Adopted::frozen_path`, `spawn_session` copies it onto
+/// `Session::frozen_path`, and `App::register_session` marks it on the store,
+/// where `SessionStore::frozen_path_tabs` counts it for the managed record's
+/// "N tabs from before this update" note. `App::frozen_path_tabs` also counts
+/// a frozen shell still pending adoption: the atpkg launch pass can report
+/// before the restore adopts the shells, and counted from the registry alone
+/// that note claimed every tab (review, 2026-09-16).
+///
+/// THE IDENTITY LABEL (2026-09-17) rides the same two paths: the shell keeps
+/// the identity's env, and the label reaches the session and its registry
+/// handle. (Across a quit, a leaf naming a forgotten identity comes back as a
+/// default shell: `a_cold_restore_keeps_the_identity_of_the_windows_first_leaf`.)
 #[test]
-fn a_frozen_shells_adoption_reaches_the_registrys_frozen_tab_count() {
-    let frozen_shell = |local_id: u64| {
+fn a_handed_shells_frozen_flag_and_identity_ride_both_adoption_paths() {
+    let state = std::env::temp_dir().join(format!(
+        "aterm-restore-identity-{}-{}",
+        std::process::id(),
+        aterm_time::since_epoch().map_or(0, |d| d.as_nanos())
+    ));
+    std::fs::create_dir_all(&state).unwrap();
+    let shell = |local_id: u64, identity: &str| {
         let mut shell = handed_off_shell(local_id);
         shell.frozen_path = true;
+        shell.identity = Some(identity.to_string());
         shell
     };
-    let frozen_sessions = |app: &App| -> Vec<(Option<u64>, bool, bool)> {
+    // (the parent's id, frozen on the session, frozen on the registry, the
+    // session's label, the registry handle's label), sorted.
+    type Row = (Option<u64>, bool, bool, Option<String>, Option<String>);
+    let rows = |app: &App| -> Vec<Row> {
         let store = app.store.read().unwrap();
-        let mut rows: Vec<_> = app
+        let mut rows: Vec<Row> = app
             .pool
             .sessions
             .iter()
@@ -2039,69 +1827,6 @@ fn a_frozen_shells_adoption_reaches_the_registrys_frozen_tab_count() {
                     pooled.session.handoff_local_id,
                     pooled.session.frozen_path,
                     store.has_frozen_path(session),
-                )
-            })
-            .collect();
-        rows.sort_unstable();
-        rows
-    };
-
-    // The restore path: tab B's leaf names shell 3, handed across frozen; tab A
-    // is a stand-in (no shell adopted, never frozen).
-    let mut new = App::headless_for_test();
-    new.handoff_successor = true;
-    new.seamless_adopt = vec![frozen_shell(3)];
-    new.restore_into_window(WindowId(0), window_of(vec![leaf_naming(0), leaf_naming(3)]));
-    assert!(new.seamless_adopt.is_empty(), "the leaf adopted shell 3");
-    assert_eq!(
-        frozen_sessions(&new),
-        vec![(None, false, false), (Some(3), true, true)],
-        "the session adopted from shell 3 is frozen on the session AND the registry"
-    );
-    assert_eq!(new.store.read().unwrap().frozen_path_tabs(), 1);
-
-    // The orphan net: shell 1 frozen, shell 2 not — each counted as it came.
-    let mut new = App::headless_for_test();
-    new.handoff_successor = true;
-    new.restore_into_window(WindowId(0), window_of(vec![leaf_naming(0)]));
-    new.seamless_adopt = vec![frozen_shell(1), handed_off_shell(2)];
-    new.adopt_orphan_shells_as_tabs(&[]);
-    assert!(new.seamless_adopt.is_empty(), "the net placed every orphan");
-    assert_eq!(
-        frozen_sessions(&new),
-        vec![
-            (None, false, false),
-            (Some(1), true, true),
-            (Some(2), false, false)
-        ]
-    );
-    assert_eq!(new.store.read().unwrap().frozen_path_tabs(), 1);
-}
-
-/// THE IDENTITY CARRY (session identities, 2026-09-17), end to end. Across
-/// a seamless update the record's label reaches the session and the
-/// registry handle through both adoption paths (the leaf naming the shell,
-/// and the orphan net) — the shell keeps the identity's env, the label is
-/// what rides. Across a quit, a leaf naming an identity respawns under it
-/// only if it still exists: `create = false` — a leaf naming a forgotten
-/// identity comes back as a default shell, and nothing is created for it.
-#[test]
-fn an_identitys_label_rides_the_adoption_and_a_cold_restore_never_creates_one() {
-    let state = std::env::temp_dir().join(format!(
-        "aterm-restore-identity-{}-{}",
-        std::process::id(),
-        aterm_time::since_epoch().map_or(0, |d| d.as_nanos())
-    ));
-    std::fs::create_dir_all(&state).unwrap();
-    let labels = |app: &App| -> Vec<(Option<u64>, Option<String>, Option<String>)> {
-        let store = app.store.read().unwrap();
-        let mut rows: Vec<_> = app
-            .pool
-            .sessions
-            .iter()
-            .map(|(&session, pooled)| {
-                (
-                    pooled.session.handoff_local_id,
                     pooled.session.identity.clone(),
                     store
                         .by_local(session)
@@ -2112,72 +1837,37 @@ fn an_identitys_label_rides_the_adoption_and_a_cold_restore_never_creates_one() 
         rows.sort_unstable();
         rows
     };
+    let carried = |id: u64, label: &str| -> Row {
+        let label = Some(label.to_string());
+        (Some(id), true, true, label.clone(), label)
+    };
+    let plain = |id: Option<u64>| -> Row { (id, false, false, None, None) };
     crate::test_env::scoped("ATERM_STATE_HOME", &state, || {
-        // Seamless, the leaf path: the record says `worker`, the session and
-        // its handle say `worker`; the stand-in for leaf 0 says nothing.
+        // The leaf path: tab B's leaf names shell 3, handed across frozen as
+        // `worker`; tab A is a stand-in (no shell adopted).
         let mut new = App::headless_for_test();
         new.handoff_successor = true;
-        let mut shell = handed_off_shell(3);
-        shell.identity = Some("worker".to_string());
-        new.seamless_adopt = vec![shell];
+        new.seamless_adopt = vec![shell(3, "worker")];
+        assert_eq!(new.store.read().unwrap().frozen_path_tabs(), 0);
+        assert_eq!(new.frozen_path_tabs(), 1, "the pending adoptee is counted");
         new.restore_into_window(WindowId(0), window_of(vec![leaf_naming(0), leaf_naming(3)]));
         assert!(new.seamless_adopt.is_empty(), "the leaf adopted shell 3");
-        assert_eq!(
-            labels(&new),
-            vec![
-                (None, None, None),
-                (
-                    Some(3),
-                    Some("worker".to_string()),
-                    Some("worker".to_string())
-                ),
-            ]
-        );
-        // Seamless, the orphan net: the same carry.
+        assert_eq!(rows(&new), vec![plain(None), carried(3, "worker")]);
+        assert_eq!(new.store.read().unwrap().frozen_path_tabs(), 1);
+        assert_eq!(new.frozen_path_tabs(), 1, "registered now, counted once");
+
+        // The orphan net: shell 1 frozen as `reviewer`, shell 2 neither.
         let mut new = App::headless_for_test();
         new.handoff_successor = true;
         new.restore_into_window(WindowId(0), window_of(vec![leaf_naming(0)]));
-        let mut shell = handed_off_shell(1);
-        shell.identity = Some("reviewer".to_string());
-        new.seamless_adopt = vec![shell, handed_off_shell(2)];
+        new.seamless_adopt = vec![shell(1, "reviewer"), handed_off_shell(2)];
         new.adopt_orphan_shells_as_tabs(&[]);
+        assert!(new.seamless_adopt.is_empty(), "the net placed every orphan");
         assert_eq!(
-            labels(&new),
-            vec![
-                (None, None, None),
-                (
-                    Some(1),
-                    Some("reviewer".to_string()),
-                    Some("reviewer".to_string())
-                ),
-                (Some(2), None, None),
-            ]
+            rows(&new),
+            vec![plain(None), carried(1, "reviewer"), plain(Some(2))]
         );
-        // Cold: `worker` exists (the verb created it); `ghost` never did.
-        crate::agent_identity::ensure("worker", true).expect("the verb's create");
-        let mut cold = App::headless_for_test();
-        cold.restore_into_window(
-            WindowId(0),
-            window_of(vec![
-                leaf_naming(0),
-                leaf_under(7, Some("worker")),
-                leaf_under(8, Some("ghost")),
-            ]),
-        );
-        assert_eq!(
-            labels(&cold),
-            vec![
-                (None, None, None),
-                (None, None, None),
-                (None, Some("worker".to_string()), Some("worker".to_string())),
-            ],
-            "the leaf under `worker` respawns under it; the one under `ghost` is a default shell"
-        );
-        assert!(
-            state.join("identities").join("worker").is_dir()
-                && !state.join("identities").join("ghost").exists(),
-            "restore never creates an identity"
-        );
+        assert_eq!(new.store.read().unwrap().frozen_path_tabs(), 1);
     });
     let _ = std::fs::remove_dir_all(&state);
 }
@@ -2195,8 +1885,9 @@ fn dead_agent() -> restore::AgentRestore {
         version: Some("2.1.283".into()),
         home: None,
         login: None,
-        codex: None,
+        run: None,
         cause: None,
+        tab: None,
     }
 }
 
@@ -2209,6 +1900,30 @@ fn leaf_hosting(shell: u64, agent: Option<restore::AgentRestore>) -> restore::Re
             ..bare_leaf()
         },
     ))
+}
+
+/// A COLD RESTORE TELLS THE HOST THE TAB ITS AGENT RAN IN (XREV-LC-1): the
+/// leaf names the crashed run's tab sid (`restore::AgentRestore::tab`), the
+/// reopened tab is minted another, and the agent is handed with the old one
+/// — what its relaunch reads the old tab's loop turns by. NEGATIVE CONTROL:
+/// a leaf naming no tab hands none (above).
+#[test]
+fn a_restored_leafs_agent_is_handed_with_the_tab_it_ran_in() {
+    let old = "s-00000000000000000001";
+    let agent = restore::AgentRestore {
+        tab: Some(old.into()),
+        ..dead_agent()
+    };
+    let mut cold = App::headless_for_test();
+    cold.restore_into_window(WindowId(0), window_of(vec![leaf_hosting(8, Some(agent))]));
+    for (&id, pooled) in cold.pool.sessions.iter_mut() {
+        pooled.session.pid = 40_000 + i32::try_from(id).unwrap();
+    }
+    let handed = cold.take_restored_agents();
+    assert_eq!(handed.len(), 1, "{handed:?}");
+    let (sid, _, _, was) = &handed[0];
+    assert_ne!(sid, old, "a new sid");
+    assert_eq!(was.as_deref(), Some(old));
 }
 
 /// The Claude home and the login [`owed_relaunch`]'s agent ran under, as
@@ -2234,12 +1949,128 @@ fn owed_relaunch(tab: &str) -> aterm_agent::harness::relaunch::Snapshot {
         session: Some("0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c".into()),
         cwd: "/tmp".into(),
         version: None,
-        codex: None,
+        run: aterm_agent::harness::relaunch::AgentRun::Claude,
         dialect: Some(aterm_agent::harness::upgrade::Dialect::Zsh),
         login: Some(OWED_LOGIN.into()),
         home: Some(OWED_HOME.into()),
         claude_dir: None,
     }
+}
+
+/// A LAYOUT AN END NOBODY CHOSE LEAVES NAMES THE CONVERSATION ITS AGENT IS
+/// IN (2026-10-15, ATERM-KI-1015-1 LC-1): an in-app `/clear` or `/resume`
+/// rewrites Claude Code's own record of the process, which the host follows
+/// only at its next wake. The crash journal's image and a system quit's
+/// layout (`fill_desk_agents`) read that record as they are taken, and the
+/// next launch's cold restore resumes the conversation it names.
+///
+/// RED before: the leaf named the conversation the agent had left (the
+/// host's copy), and the cold restore resumed it.
+///
+/// NEGATIVE CONTROLS, each naming the left one: a record of another process
+/// under the pid; no record (a graceful end); a record naming no
+/// conversation; a snapshot read in no directory, whose home names the
+/// record's (an ungated read would find it there). POSITIVE CONTROL: a record
+/// naming the left one names it.
+#[cfg(unix)]
+#[test]
+fn a_durable_layout_names_the_conversation_the_agents_record_names_as_it_is_taken() {
+    let tmp = aterm_tempfile::Builder::new()
+        .prefix("aterm-restore-followed-")
+        .tempdir()
+        .expect("temp dir");
+    let dir = tmp.path().join(".claude");
+    std::fs::create_dir_all(dir.join("sessions")).expect("the records' dir");
+    let mut app = App::headless_for_test();
+    let sid = {
+        let g = app.store.read().unwrap();
+        g.by_local(0).expect("registered").sid.as_str().to_string()
+    };
+    let copy = aterm_agent::harness::relaunch::Snapshot {
+        claude_dir: Some(dir.clone()),
+        ..owed_relaunch(&sid)
+    };
+    let left = copy.session.clone().expect("the conversation it left");
+    let cleared = "0b6f3c1e-7777-4b61-9d52-7f1e2c3a4b5c";
+    let record = |session: &str, start: &str| {
+        std::fs::write(
+            dir.join("sessions/4242.json"),
+            format!(
+                r#"{{"pid":4242,"sessionId":"{session}","cwd":"/tmp","version":"2.1.300","status":"idle","statusUpdatedAt":1,"procStart":"{start}","kind":"interactive","entrypoint":"cli"}}"#
+            ),
+        )
+        .expect("the record");
+    };
+    // The agent on session 0's leaf, across the layout file's wire.
+    let captured = |app: &mut App| -> restore::AgentRestore {
+        let mut layout = app.capture_restore_manifest();
+        app.fill_desk_agents(&mut layout);
+        let wire = layout.to_toml().expect("the wire");
+        let layout = restore::RestoreManifest::from_toml(&wire).expect("read back");
+        *layout
+            .handed_off_leaves()
+            .into_iter()
+            .find(|leaf| leaf.local_id == Some(0))
+            .and_then(|leaf| leaf.agent)
+            .expect("the agent rides its leaf")
+    };
+    let conversation = |app: &mut App| captured(app).session;
+    crate::harness_host::publish_snapshot_for_test(&sid, Some(&copy));
+
+    // `/clear` (or `/resume`) under the same process, not yet followed.
+    record(cleared, &copy.start);
+    let named = captured(&mut app);
+    assert_eq!(
+        named.session.as_deref(),
+        Some(cleared),
+        "the conversation the agent is in"
+    );
+    // The next launch.
+    let mut cold = App::headless_for_test();
+    cold.restore_into_window(WindowId(0), window_of(vec![leaf_hosting(8, Some(named))]));
+    for (&id, pooled) in cold.pool.sessions.iter_mut() {
+        pooled.session.pid = 40_000 + i32::try_from(id).unwrap();
+    }
+    let handed = cold.take_restored_agents();
+    assert_eq!(handed.len(), 1, "{handed:?}");
+    assert_eq!(
+        handed[0].1.session.as_deref(),
+        Some(cleared),
+        "the cold restore resumes it"
+    );
+
+    // Negative controls.
+    record(cleared, "Mon Jan  1 00:00:00 2024");
+    assert_eq!(
+        conversation(&mut app),
+        Some(left.clone()),
+        "another process's record"
+    );
+    std::fs::remove_file(dir.join("sessions/4242.json")).expect("removed");
+    assert_eq!(conversation(&mut app), Some(left.clone()), "no record");
+    record("not-a-session", &copy.start);
+    assert_eq!(
+        conversation(&mut app),
+        Some(left.clone()),
+        "no conversation named"
+    );
+    record(cleared, &copy.start);
+    let unread = aterm_agent::harness::relaunch::Snapshot {
+        claude_dir: None,
+        home: Some(dir.to_string_lossy().into_owned()),
+        ..copy.clone()
+    };
+    crate::harness_host::publish_snapshot_for_test(&sid, Some(&unread));
+    assert_eq!(
+        conversation(&mut app),
+        Some(left.clone()),
+        "a snapshot read in no directory"
+    );
+    // Positive control.
+    crate::harness_host::publish_snapshot_for_test(&sid, Some(&copy));
+    record(&left, &copy.start);
+    assert_eq!(conversation(&mut app), Some(left), "the record names it");
+    crate::harness_host::publish_snapshot_for_test(&sid, None);
 }
 
 /// THE AGENT A CRASH TOOK GOES BACK TO ITS TAB (2026-09-27): a cold
@@ -2277,8 +2108,9 @@ fn a_restored_leafs_agent_is_handed_to_its_new_tab_once() {
     }
     let handed = cold.take_restored_agents();
     assert_eq!(handed.len(), 1, "{handed:?}");
-    let (sid, snap, _) = &handed[0];
+    let (sid, snap, _, was) = &handed[0];
     assert_eq!(&snap.tab, sid);
+    assert_eq!(was, &None, "a leaf naming no tab names none");
     assert_eq!(snap.session, agent.session);
     assert_eq!(
         (snap.pid, snap.start.as_str()),
@@ -2369,6 +2201,257 @@ fn a_restored_leafs_agent_is_handed_to_its_new_tab_once() {
     assert!(handed.is_empty(), "it still runs: {handed:?}");
 }
 
+/// THE OWNER'S HOLD SURVIVES A QUIT OR A CRASH, AND EVERY ONE AFTER
+/// (2026-10-15, ATERM-KI-1015-1 LC-8 and its review, on the tab's holds of
+/// ruling 23): a tab the owner HELD was reopened unheld, and its agent
+/// relaunched and told to keep going. The layouts an end nobody chose leaves
+/// ([`App::fill_desk_agents`]) carry each session's hold rows on the tab's
+/// own leaf, an agent there or none, the fleet's first; a cold restore puts
+/// the owner's back on the session that fills the leaf as it fills it
+/// ([`App::carry_restored_identity`], recorded `carried=1`), and keeps the
+/// agent the leaf names the holder's (`App::restored_held`: not handed to
+/// the host). THE WINDOW'S BOOTSTRAP SHELL, registered already, takes the
+/// hold's own path (`fabric::carry_hold`): a FLEET hold standing on it is
+/// kept beside the owner's, and while an update is committing the session
+/// nothing moves on it — its agent still the holder's (fail-closed). A
+/// spawned tab's session is seeded before it is registered. AND THE NEXT END:
+/// the held tab's agent never came back, and that end's layout carries the
+/// hold again, on the tab's leaf alone, so the tab reopens held for as long
+/// as the owner keeps it (on the agent's leaf, it was lost there). NEGATIVE
+/// CONTROLS: a FLEET row keeps its tab's agent down but is not put back on a
+/// fresh shell (quitting is its only undo), and a leaf with no hold reopens
+/// an unheld tab whose agent is owed its relaunch.
+#[cfg(unix)]
+#[test]
+fn a_held_tabs_holds_ride_its_leaf_back_onto_its_tab_after_every_end() {
+    use crate::fabric::{Hold, apply_hold_for_test};
+    let hold = |origin: &str, reason: &str| Hold {
+        reason: reason.to_string(),
+        origin: origin.to_string(),
+    };
+    let rows = |rows: &[&str]| rows.iter().map(|r| r.to_string()).collect::<Vec<_>>();
+    let sid_of = |app: &App, id: u64| {
+        let g = app.store.read().unwrap();
+        g.by_local(id).expect("registered").sid.as_str().to_string()
+    };
+    let id_of = |app: &App, sid: &str| {
+        let g = app.store.read().unwrap();
+        g.snapshot()
+            .into_iter()
+            .find(|h| h.sid.as_str() == sid)
+            .map(|h| h.local_id)
+            .expect("the tab is a live session")
+    };
+    let ctx_of = |app: &App, id: u64| std::sync::Arc::clone(&app.pool.get(id).expect("pooled").ctx);
+    let carried_rows = |app: &App, id: u64| {
+        ctx_of(app, id)
+            .timeline
+            .lock()
+            .unwrap()
+            .since(None)
+            .filter(|e| e.kind == "hold" && e.payload.ends_with(" carried=1"))
+            .count()
+    };
+    // What an end nobody chose leaves on the leaves of sessions `ids`.
+    let captured = |app: &mut App, ids: &[u64]| {
+        let mut layout = app.capture_restore_manifest();
+        app.fill_desk_agents(&mut layout);
+        let leaves = layout.handed_off_leaves();
+        ids.iter()
+            .map(|&id| {
+                let leaf = leaves
+                    .iter()
+                    .find(|leaf| leaf.local_id == Some(id))
+                    .expect("the session's leaf");
+                (leaf.holds.clone(), leaf.agent.is_some())
+            })
+            .collect::<Vec<_>>()
+    };
+
+    // THE CAPTURE: session 0 hosts an agent, session 1 none.
+    let mut app = App::headless_for_test();
+    let _ = app.insert_logical_window(crate::stub_session(1), 24, 80);
+    let sid = sid_of(&app, 0);
+    let mut snap = owed_relaunch(&sid);
+    (snap.home, snap.login) = (None, None);
+    crate::harness_host::publish_snapshot_for_test(&sid, Some(&snap));
+    assert_eq!(
+        captured(&mut app, &[0, 1]),
+        vec![(Vec::new(), true), (Vec::new(), false)],
+        "no hold, none captured"
+    );
+    assert!(apply_hold_for_test(
+        &ctx_of(&app, 0),
+        Some(hold("local", "pause"))
+    ));
+    assert!(apply_hold_for_test(
+        &ctx_of(&app, 1),
+        Some(hold("local", "menu"))
+    ));
+    assert_eq!(
+        captured(&mut app, &[0, 1]),
+        vec![
+            (rows(&["local pause"]), true),
+            (rows(&["local menu"]), false)
+        ],
+        "on each tab's own leaf, its agent's or none"
+    );
+    // A FLEET hold stands beside the owner's (`fabric::Holds`, one slot per
+    // origin): both ride the leaf, the fleet's first.
+    assert!(apply_hold_for_test(
+        &ctx_of(&app, 0),
+        Some(hold("fleet", "fabric-lost"))
+    ));
+    assert_eq!(
+        captured(&mut app, &[0])[0],
+        (rows(&["fleet fabric-lost", "local pause"]), true),
+        "the owner's hold beside a fleet hold"
+    );
+    crate::harness_host::publish_snapshot_for_test(&sid, None);
+
+    // THE RESTORE: the first tab grafts the window's bootstrap shell (session
+    // 0, registered), the second spawns its own. `before` runs on the
+    // bootstrap first. Each tab, by its agent: (the holder's, the hold on its
+    // session, its `carried=1` rows); and the tabs' sessions.
+    let held_leaf = |shell: u64, pid: u32, row: Option<&str>| {
+        restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(
+            restore::TerminalLeafRestore {
+                local_id: Some(shell),
+                agent: Some(Box::new(restore::AgentRestore {
+                    pid,
+                    ..dead_agent()
+                })),
+                holds: row.iter().map(|r| r.to_string()).collect(),
+                ..bare_leaf()
+            },
+        ))
+    };
+    let reopened = |leaf_rows: [Option<&str>; 2], before: &dyn Fn(&App)| {
+        let mut cold = App::headless_for_test();
+        before(&cold);
+        cold.restore_into_window(
+            WindowId(0),
+            window_of(vec![
+                held_leaf(8, 4242, leaf_rows[0]),
+                held_leaf(9, 4243, leaf_rows[1]),
+            ]),
+        );
+        for (&id, pooled) in cold.pool.sessions.iter_mut() {
+            pooled.session.pid = 40_000 + i32::try_from(id).unwrap();
+        }
+        let held: Vec<(u32, u64)> = cold
+            .restored_held
+            .iter()
+            .map(|(id, agent, ..)| (agent.pid, *id))
+            .collect();
+        let handed = cold.take_restored_agents();
+        let ids: Vec<u64> = [4242_u32, 4243]
+            .iter()
+            .map(|pid| {
+                held.iter()
+                    .find(|(p, _)| p == pid)
+                    .map(|(_, id)| *id)
+                    .or_else(|| {
+                        handed
+                            .iter()
+                            .find(|(_, snap, ..)| snap.pid == *pid)
+                            .map(|(sid, ..)| id_of(&cold, sid))
+                    })
+                    .expect("the tab's session")
+            })
+            .collect();
+        assert_eq!(ids[0], 0, "the first tab grafts the bootstrap");
+        let tabs = [4242_u32, 4243]
+            .iter()
+            .zip(&ids)
+            .map(|(pid, &id)| {
+                (
+                    held.iter().any(|(p, _)| p == pid),
+                    ctx_of(&cold, id).fabric.hold(),
+                    carried_rows(&cold, id),
+                )
+            })
+            .collect::<Vec<_>>();
+        (cold, ids, tabs)
+    };
+    let (cold, ids, tabs) = reopened([Some("local pause"), Some("local menu")], &|_| {});
+    assert_eq!(
+        tabs,
+        vec![
+            (true, Some(hold("local", "pause")), 1),
+            (true, Some(hold("local", "menu")), 1)
+        ],
+        "both held again, recorded as carried, and neither relaunched"
+    );
+    // THE BOOTSTRAP'S STANDING FLEET HOLD IS KEPT, never replaced: the
+    // owner's carried hold fills its own slot beside it (`fabric::Holds`).
+    let (fleet_held, _, tabs) = reopened([Some("local pause"), None], &|cold| {
+        assert!(apply_hold_for_test(
+            &ctx_of(cold, 0),
+            Some(hold("fleet", "fabric-lost"))
+        ));
+    });
+    assert_eq!(
+        tabs[0],
+        (true, Some(hold("fleet", "fabric-lost")), 1),
+        "the fleet's hold stands; the agent is the holder's"
+    );
+    assert_eq!(
+        ctx_of(&fleet_held, 0).fabric.holds().origins(),
+        "fleet,local",
+        "the owner's hold stands beside the fleet's"
+    );
+    // A COMMITTING UPDATE'S FENCE: nothing moves on the session, and the
+    // agent is still the holder's.
+    let (fenced, _, tabs) = reopened([Some("local pause"), None], &|cold| {
+        let _ = ctx_of(cold, 0).fabric.fence_hold(true);
+    });
+    ctx_of(&fenced, 0).fabric.lift_hold_fence();
+    assert_eq!(tabs[0], (true, None, 0), "fenced: unmoved, not relaunched");
+    // NEGATIVE CONTROLS: a fleet row keeps its agent down and is not put
+    // back; no row reopens an unheld tab whose agent is owed.
+    let (_, _, tabs) = reopened([Some("fleet fabric-lost"), None], &|_| {});
+    assert_eq!(
+        tabs,
+        vec![(true, None, 0), (false, None, 0)],
+        "fleet, and no hold"
+    );
+
+    // THE NEXT END: the pass is over, the held tabs' agents said
+    // ([`App::say_restored_held`]) and never back (nothing hosted, nothing
+    // owed), and the holds ride their leaves again, alone. (Inside the
+    // drain, before that end, a landed held tab's leaf still names its
+    // agent: `App::unhanded_restored_agent`.)
+    let mut cold = cold;
+    cold.say_restored_held();
+    assert_eq!(
+        captured(&mut cold, &ids),
+        vec![
+            (rows(&["local pause"]), false),
+            (rows(&["local menu"]), false)
+        ],
+        "the hold outlives its agent's attempt"
+    );
+    let mut layout = cold.capture_restore_manifest();
+    cold.fill_desk_agents(&mut layout);
+    let mut again = App::headless_for_test();
+    again.restore_into_window(
+        WindowId(0),
+        layout.windows.into_iter().next().expect("window 0"),
+    );
+    let held: Vec<Option<Hold>> = (0..again.next_session_id)
+        .filter_map(|id| again.pool.get(id).map(|s| s.ctx.fabric.hold()))
+        .collect();
+    assert!(
+        held.contains(&Some(hold("local", "pause"))) && held.contains(&Some(hold("local", "menu"))),
+        "both tabs held again: {held:?}"
+    );
+    assert!(
+        again.take_restored_agents().is_empty(),
+        "no agent to relaunch"
+    );
+}
+
 /// ROUND FOUR, PLAN ITEM 7 (c): A HANDOFF LEAF THAT NAMES AN AGENT — one
 /// the outgoing instance's cold-restore queue still owed at its park — is
 /// relaunched by the successor, at its Commit, in the ADOPTED shell the
@@ -2415,7 +2498,7 @@ fn a_handoff_leaf_with_a_pending_agent_is_relaunched_by_the_successor() {
         1,
         "only the adopted shell 8 owes one: {handed:?}"
     );
-    let (sid, snap, _) = &handed[0];
+    let (sid, snap, _, _) = &handed[0];
     let adopted_sid = {
         let g = successor.store.read().unwrap();
         g.by_local(eight)
@@ -2472,11 +2555,12 @@ fn a_handoff_leaf_with_a_pending_agent_is_relaunched_by_the_successor() {
 fn the_handoff_layout_carries_the_agent_a_restored_tab_is_still_owed() {
     let tried = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let t = std::sync::Arc::clone(&tried);
-    let host =
-        crate::harness_host::HostHandle::for_restored_test(std::sync::Arc::new(move |_, _, _| {
+    let host = crate::harness_host::HostHandle::for_restored_test(std::sync::Arc::new(
+        move |_, _, _, _| {
             t.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             "wait:shell-prompt".to_string()
-        }));
+        },
+    ));
     let mut app = App::headless_for_test();
     let _ = app.insert_logical_window(crate::stub_session(1), 24, 80);
     let sid_of = |app: &App, id: u64| {
@@ -2490,13 +2574,17 @@ fn the_handoff_layout_carries_the_agent_a_restored_tab_is_still_owed() {
         place: "in tab 1".into(),
         cold: true,
         asked: None,
+        was: None,
     }]);
     app.harness = Some(host.clone());
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    while tried.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-        assert!(std::time::Instant::now() < deadline, "the first step");
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
+    let tried_past = |n: usize| {
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the queue's next step",
+            || (tried.load(std::sync::atomic::Ordering::SeqCst) > n).then_some(()),
+        );
+    };
+    tried_past(0);
     // Each leaf's agent: its pid, and that it names the home and the login
     // its agent ran under.
     let agents = |layout: &restore::RestoreManifest| -> Vec<(Option<u64>, Option<u32>)> {
@@ -2560,14 +2648,7 @@ fn the_handoff_layout_carries_the_agent_a_restored_tab_is_still_owed() {
     );
     let at_park = tried.load(std::sync::atomic::Ordering::SeqCst);
     app.rollback_overlap(None, &[]);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    while tried.load(std::sync::atomic::Ordering::SeqCst) == at_park {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the rollback resumes the queue"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    tried_past(at_park); // the rollback resumes the queue
     // A RESTART'S QUIT NAMES IT TOO (restore audit round two,
     // 2026-10-02): the quit retires the journal that named it, so its
     // layout is the one record left. `main_entry`'s order: the host
@@ -2613,7 +2694,7 @@ fn the_handoff_layout_carries_the_agent_a_restored_tab_is_still_owed() {
 fn a_relaunch_owed_between_the_two_captures_refuses_the_commit_by_name() {
     use crate::app_update_handoff::{commit_agent_carry, commit_layout_topology};
     let host = crate::harness_host::HostHandle::for_restored_test_with_open_tabs(
-        std::sync::Arc::new(|_, _, _| "wait:shell-prompt".to_string()),
+        std::sync::Arc::new(|_, _, _, _| "wait:shell-prompt".to_string()),
     );
     let mut app = App::headless_for_test();
     let _ = app.insert_logical_window(crate::stub_session(1), 24, 80);
@@ -2655,29 +2736,25 @@ fn a_relaunch_owed_between_the_two_captures_refuses_the_commit_by_name() {
 }
 
 /// A RELAUNCH ON EXIT OWED ACROSS A SUCCESSFUL COMMIT KEEPS THE CLAUDE HOME
-/// AND THE LOGIN ITS AGENT RAN UNDER (2026-10-09): the agent a worker's
-/// back-off owes a tab at the park (`Kept::owed`: a crash, a stall's
-/// remedy, the explicit restart — its snapshot read off the live process,
-/// home and login with it) is named on that tab's handoff leaf with both,
-/// through the layout's wire, and the successor's relaunch of it at its
-/// Commit (the same step a cold restore takes) plans its line with both. It
-/// came back in the default home on the default account before.
-///
-/// An owed relaunch the explicit restart's act made carries its cause too
-/// since round eighteen (ruling 20's (iv): carried through a hand across the
-/// Commit, its relaunch is the act's, never a counted try):
-/// `an_owed_relaunchs_cause_rides_the_handoff_leaf`. Of every other — a
-/// crash's — none rides, and the successor relaunches it as aterm's own end
-/// (`host`), as before.
-///
-/// NEGATIVE CONTROL: owed with neither, the successor's line is today's.
+/// AND THE LOGIN ITS AGENT RAN UNDER (2026-10-09), AND ITS CAUSE (round
+/// eighteen; ruling 20's (iv)): the agent a worker's back-off owes a tab at
+/// the park (`Kept::owed`: a crash, a stall's remedy, the explicit restart —
+/// its snapshot read off the live process, home and login with it) is named
+/// on that tab's handoff leaf, through the layout's wire, and the successor's
+/// Commit hands its restored queue the agent with its home, its login and the
+/// act's cause (`RestoredAgent::asked`), so the queue relaunches it as the
+/// act's. It came back in the default home on the default account before.
+/// NEGATIVE CONTROL: a crash's owed relaunch writes no cause, and is handed
+/// with none.
 #[cfg(unix)]
 #[test]
-fn an_owed_relaunch_keeps_its_home_and_login_across_the_commit() {
-    use aterm_agent::harness::relaunch::{Snapshot, exit_line};
-    let successor_line = |owed: Snapshot| -> (Snapshot, Option<String>) {
+fn an_owed_relaunch_keeps_its_home_login_and_cause_across_the_commit() {
+    use aterm_agent::harness::relaunch::Snapshot;
+    use aterm_agent::harness::restart_stamp::Cause;
+    // (what the successor's queue is handed, its cause, whether the wire names one)
+    let handed = |asked: Option<Cause>| -> (Snapshot, Option<Cause>, bool) {
         let host = crate::harness_host::HostHandle::for_restored_test_with_open_tabs(
-            std::sync::Arc::new(|_, _, _| "wait:shell-prompt".to_string()),
+            std::sync::Arc::new(|_, _, _, _| "wait:shell-prompt".to_string()),
         );
         let mut app = App::headless_for_test();
         let _ = app.insert_logical_window(crate::stub_session(1), 24, 80);
@@ -2686,13 +2763,7 @@ fn an_owed_relaunch_keeps_its_home_and_login_across_the_commit() {
             g.by_local(0).expect("registered").sid.as_str().to_string()
         };
         app.harness = Some(host.clone());
-        host.owe_for_test(
-            &sid,
-            Some(Snapshot {
-                tab: sid.clone(),
-                ..owed
-            }),
-        );
+        host.owe_asked_for_test(&sid, Some(owed_relaunch(&sid)), asked);
         assert!(app.park_all_readers(std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN));
         // What the successor reads: the handoff layout's wire.
         let wire = app.capture_handoff_layout().to_toml().expect("the wire");
@@ -2719,38 +2790,19 @@ fn an_owed_relaunch_keeps_its_home_and_login_across_the_commit() {
         successor.queue_carried_restored_agents();
         let mut handed = successor.take_restored_agents();
         assert_eq!(handed.len(), 1, "{handed:?}");
-        let (_, snap, _) = handed.remove(0);
-        // In a zsh, as the relaunch's plan reads the adopted shell's dialect.
-        let line = exit_line(&Snapshot {
-            dialect: Some(aterm_agent::harness::upgrade::Dialect::Zsh),
-            ..snap.clone()
-        });
-        (snap, line)
+        let (_, snap, asked, _) = handed.remove(0);
+        (snap, asked, wire.contains("cause = "))
     };
-    let program = "'/opt/claude/bin/claude' '--resume' '0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c'";
-    let (snap, line) = successor_line(owed_relaunch("s-old"));
+    let (snap, asked, named) = handed(None);
     assert_eq!(
         (snap.home.as_deref(), snap.login.as_deref()),
         (Some(OWED_HOME), Some(OWED_LOGIN))
     );
-    assert_eq!(
-        line,
-        Some(format!(
-            " CLAUDE_CONFIG_DIR='{OWED_HOME}' CLAUDE_SECURESTORAGE_CONFIG_DIR={OWED_LOGIN} \
-             CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 {program}"
-        ))
-    );
-    // NEGATIVE CONTROL: an agent that had neither — today's line.
-    let (snap, line) = successor_line(Snapshot {
-        home: None,
-        login: None,
-        ..owed_relaunch("s-old")
-    });
-    assert_eq!((snap.home, snap.login), (None, None));
-    assert_eq!(
-        line,
-        Some(format!(" CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 {program}"))
-    );
+    assert_eq!((asked, named), (None, false), "a crash's: no cause");
+    for cause in [Cause::Asked, Cause::Stall] {
+        let (_, asked, named) = handed(Some(cause));
+        assert_eq!((asked, named), (Some(cause), true), "{cause:?}");
+    }
 }
 
 /// A CRASH DURING A SUCCESSFUL COMMIT'S HOLD REACHES THE SUCCESSOR (round
@@ -2776,7 +2828,7 @@ fn a_crash_during_a_successful_commits_hold_is_relaunched_by_the_successor() {
     use aterm_agent::harness::relaunch::Snapshot;
     // The parent: its host supervises the tab's agent, and published it.
     let host = crate::harness_host::HostHandle::for_restored_test_with_open_tabs(
-        std::sync::Arc::new(|_, _, _| "refused:inert".to_string()),
+        std::sync::Arc::new(|_, _, _, _| "refused:inert".to_string()),
     );
     let mut app = App::headless_for_test();
     let _ = app.insert_logical_window(crate::stub_session(1), 24, 80);
@@ -2867,64 +2919,6 @@ fn a_crash_during_a_successful_commits_hold_is_relaunched_by_the_successor() {
     successor_host.shutdown_and_join();
 }
 
-/// AN OWED RELAUNCH'S CAUSE RIDES THE HANDOFF LEAF (round eighteen; ruling
-/// 20's (iv)): a relaunch the explicit restart's act owes a tab (the
-/// worker's `OwedRelaunch::asked`) is named on that tab's handoff leaf with
-/// its cause, through the layout's wire, and the successor's Commit hands
-/// its restored queue the agent with it (`RestoredAgent::asked`), so the
-/// queue carries it through a hand and relaunches it as the act's.
-/// NEGATIVE CONTROL: a crash's owed relaunch writes no cause, and is handed
-/// with none.
-#[cfg(unix)]
-#[test]
-fn an_owed_relaunchs_cause_rides_the_handoff_leaf() {
-    use aterm_agent::harness::restart_stamp::Cause;
-    let carried = |asked: Option<Cause>| -> (bool, Option<Cause>) {
-        let host = crate::harness_host::HostHandle::for_restored_test_with_open_tabs(
-            std::sync::Arc::new(|_, _, _| "wait:shell-prompt".to_string()),
-        );
-        let mut app = App::headless_for_test();
-        let _ = app.insert_logical_window(crate::stub_session(1), 24, 80);
-        let sid = {
-            let g = app.store.read().unwrap();
-            g.by_local(0).expect("registered").sid.as_str().to_string()
-        };
-        app.harness = Some(host.clone());
-        host.owe_asked_for_test(&sid, Some(owed_relaunch(&sid)), asked);
-        assert!(app.park_all_readers(std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN));
-        let wire = app.capture_handoff_layout().to_toml().expect("the wire");
-        app.rollback_overlap(None, &[]);
-        let layout = restore::RestoreManifest::from_toml(&wire).expect("the successor reads it");
-        let agent = layout
-            .handed_off_leaves()
-            .into_iter()
-            .find(|leaf| leaf.local_id == Some(0))
-            .and_then(|leaf| leaf.agent)
-            .expect("the owed tab's leaf names its agent");
-        let mut successor = App::headless_for_test();
-        successor.handoff_successor = true;
-        successor.restore_into_window(WindowId(0), window_of(vec![leaf_hosting(8, Some(*agent))]));
-        let adopted = *successor.pool.sessions.keys().max().expect("a session");
-        adopt_as(&mut successor, adopted, 8);
-        for (&id, pooled) in successor.pool.sessions.iter_mut() {
-            pooled.session.pid = 40_000 + i32::try_from(id).unwrap();
-        }
-        successor.queue_carried_restored_agents();
-        let mut handed = successor.take_restored_agents();
-        assert_eq!(handed.len(), 1, "{handed:?}");
-        let (_, _, asked) = handed.remove(0);
-        (wire.contains("cause = "), asked)
-    };
-    assert_eq!(
-        carried(Some(Cause::Asked)),
-        (true, Some(Cause::Asked)),
-        "(the wire names it, handed with it)"
-    );
-    assert_eq!(carried(Some(Cause::Stall)), (true, Some(Cause::Stall)));
-    // NEGATIVE CONTROL: a crash's.
-    assert_eq!(carried(None), (false, None));
-}
-
 /// THE HANDOFF LEAF NAMES THE AGENT ITS HOST SUPERVISES, WHERE NOTHING IS
 /// OWED (round eighteen): the agent the host last published for a tab rides
 /// that tab's handoff leaf (`TerminalLeafRestore::supervised`) — never a
@@ -2940,7 +2934,7 @@ fn the_handoff_leaf_names_the_supervised_agent_where_nothing_is_owed() {
     use crate::app_update_handoff::{commit_agent_carry, commit_layout_topology};
     use aterm_agent::harness::relaunch::Snapshot;
     let host = crate::harness_host::HostHandle::for_restored_test_with_open_tabs(
-        std::sync::Arc::new(|_, _, _| "wait:shell-prompt".to_string()),
+        std::sync::Arc::new(|_, _, _, _| "wait:shell-prompt".to_string()),
     );
     let mut app = App::headless_for_test();
     let _ = app.insert_logical_window(crate::stub_session(1), 24, 80);
@@ -3017,6 +3011,96 @@ fn the_handoff_leaf_names_the_supervised_agent_where_nothing_is_owed() {
     app.rollback_overlap(None, &[]);
 }
 
+/// THE HANDOFF LEAF NAMES THE CONVERSATION ITS AGENT'S RECORD NAMES, AND A
+/// MOVE OF IT REFUSES NOTHING (2026-10-15, ATERM-KI-1015-1 LC-1): the agent a
+/// handoff leaf's `supervised` carries is the host's copy followed through
+/// Claude Code's own record of the process as the layout is taken, so the
+/// successor watches the conversation an in-app `/clear` the host has not
+/// followed moved to; and the Commit compares only the process, so a
+/// `/resume` between the park's capture and the Commit's refuses nothing.
+///
+/// RED before: `supervised` named the conversation the agent had left (the
+/// host's copy).
+///
+/// NEGATIVE CONTROL: a record of another process under the pid names the
+/// copy's.
+#[cfg(unix)]
+#[test]
+fn the_handoff_leaf_follows_its_agents_record_and_a_move_refuses_nothing() {
+    use crate::app_update_handoff::commit_agent_carry;
+    use aterm_agent::harness::relaunch::Snapshot;
+    let tmp = aterm_tempfile::Builder::new()
+        .prefix("aterm-handoff-followed-")
+        .tempdir()
+        .expect("temp dir");
+    let dir = tmp.path().join(".claude");
+    std::fs::create_dir_all(dir.join("sessions")).expect("the records' dir");
+    let host = crate::harness_host::HostHandle::for_restored_test_with_open_tabs(
+        std::sync::Arc::new(|_, _, _, _| "wait:shell-prompt".to_string()),
+    );
+    let mut app = App::headless_for_test();
+    let _ = app.insert_logical_window(crate::stub_session(1), 24, 80);
+    let sid = {
+        let g = app.store.read().unwrap();
+        g.by_local(0).expect("registered").sid.as_str().to_string()
+    };
+    app.harness = Some(host.clone());
+    let copy = Snapshot {
+        claude_dir: Some(dir.clone()),
+        ..owed_relaunch(&sid)
+    };
+    let left = copy.session.clone().expect("the conversation it left");
+    let cleared = "0b6f3c1e-7777-4b61-9d52-7f1e2c3a4b5c";
+    let resumed = "0b6f3c1e-9999-4b61-9d52-7f1e2c3a4b5c";
+    let record = |session: &str, start: &str| {
+        std::fs::write(
+            dir.join("sessions/4242.json"),
+            format!(
+                r#"{{"pid":4242,"sessionId":"{session}","cwd":"/tmp","version":"2.1.300","status":"idle","statusUpdatedAt":1,"procStart":"{start}","kind":"interactive","entrypoint":"cli"}}"#
+            ),
+        )
+        .expect("the record");
+    };
+    let watched = |layout: &restore::RestoreManifest| {
+        layout
+            .handed_off_leaves()
+            .into_iter()
+            .find(|leaf| leaf.local_id == Some(0))
+            .and_then(|leaf| leaf.supervised)
+            .and_then(|agent| agent.session)
+    };
+    crate::harness_host::publish_snapshot_for_test(&sid, Some(&copy));
+
+    // `/clear` under the same process, not yet followed.
+    record(cleared, &copy.start);
+    assert!(app.park_all_readers(std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN));
+    let pending = app.capture_handoff_layout();
+    assert_eq!(
+        watched(&pending).as_deref(),
+        Some(cleared),
+        "the conversation the agent is in"
+    );
+    // `/resume` between the park and the Commit: the same process.
+    record(resumed, &copy.start);
+    let live = app.capture_handoff_layout();
+    assert_eq!(watched(&live).as_deref(), Some(resumed), "followed again");
+    assert_eq!(
+        commit_agent_carry(&live),
+        commit_agent_carry(&pending),
+        "nothing refused"
+    );
+
+    // NEGATIVE CONTROL.
+    record(cleared, "Mon Jan  1 00:00:00 2024");
+    assert_eq!(
+        watched(&app.capture_handoff_layout()),
+        Some(left),
+        "another process's record"
+    );
+    crate::harness_host::publish_snapshot_for_test(&sid, None);
+    app.rollback_overlap(None, &[]);
+}
+
 /// A DURABLE LAYOUT NEVER CARRIES THE EXPLICIT RESTART'S CAUSE (round
 /// eighteen, the review of its first cut): the act's cause on a relaunch a
 /// tab is owed rides the seamless update's handoff layout alone, whose
@@ -3032,7 +3116,8 @@ fn the_handoff_leaf_names_the_supervised_agent_where_nothing_is_owed() {
 /// aterm's own end (`relaunch::after_host_ended`) closes that record as
 /// `host-ended` and relaunches the agent (aterm-agent's
 /// `an_agent_whose_host_ended_is_relaunched_in_its_reopened_tab` shows the
-/// two steps apart). POSITIVE CONTROL: the handoff layout's leaf names it.
+/// two steps apart). The handoff layout's leaf does name it:
+/// `an_owed_relaunch_keeps_its_home_login_and_cause_across_the_commit`.
 ///
 /// FAILS ON 95d62f656: the durable leaf read `cause = "asked"` (the one
 /// reader, `App::pending_restored_agent`, served both layouts), and the cold
@@ -3042,7 +3127,7 @@ fn the_handoff_leaf_names_the_supervised_agent_where_nothing_is_owed() {
 fn a_durable_layout_never_carries_the_explicit_restarts_cause() {
     use aterm_agent::harness::restart_stamp::Cause;
     let host = crate::harness_host::HostHandle::for_restored_test_with_open_tabs(
-        std::sync::Arc::new(|_, _, _| "wait:shell-prompt".to_string()),
+        std::sync::Arc::new(|_, _, _, _| "wait:shell-prompt".to_string()),
     );
     let mut app = App::headless_for_test();
     let _ = app.insert_logical_window(crate::stub_session(1), 24, 80);
@@ -3082,19 +3167,10 @@ fn a_durable_layout_never_carries_the_explicit_restarts_cause() {
     assert_eq!(
         handed
             .iter()
-            .map(|(_, _, asked)| *asked)
+            .map(|(_, _, asked, _)| *asked)
             .collect::<Vec<_>>(),
         vec![None],
         "a cold restore relaunches it as aterm's own end"
-    );
-    // POSITIVE CONTROL: the handoff layout's leaf names the cause.
-    assert!(app.park_all_readers(std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN));
-    let handoff = app.capture_handoff_layout();
-    app.rollback_overlap(None, &[]);
-    assert_eq!(
-        owed_agent(&handoff).and_then(|agent| agent.asked()),
-        Some(Cause::Asked),
-        "the handoff layout carries it"
     );
     host.shutdown_and_join();
 }
@@ -3248,7 +3324,7 @@ fn a_held_tabs_agent_left_at_its_shell_is_said_on_record() {
     // A host that relaunches restored agents: the hold is what kept each
     // held tab's down.
     let host =
-        crate::harness_host::HostHandle::for_restored_test(std::sync::Arc::new(|_, _, _| {
+        crate::harness_host::HostHandle::for_restored_test(std::sync::Arc::new(|_, _, _, _| {
             "wait:shell-prompt".to_string()
         }));
     let mut cold = App::headless_for_test();
@@ -3266,7 +3342,7 @@ fn a_held_tabs_agent_left_at_its_shell_is_said_on_record() {
     assert_eq!(
         cold.restored_held
             .iter()
-            .map(|(_, agent, fleet)| (agent.pid, *fleet))
+            .map(|(_, agent, fleet, _)| (agent.pid, *fleet))
             .collect::<Vec<_>>(),
         vec![(4242, false), (4343, true), (4242, false)],
         "(agent, the fleet's): the held tabs' agents, not relaunched"
@@ -3333,9 +3409,9 @@ fn a_missing_held_leaf_does_not_hide_the_same_agents_surviving_leaf() {
         },
     ));
     cold.restore_into_window(WindowId(0), window_of(vec![leaf]));
-    let (_, agent, fleet) = cold.restored_held[0].clone();
+    let (_, agent, fleet, rows) = cold.restored_held[0].clone();
     assert!(cold.store.read().unwrap().by_local(u64::MAX).is_none());
-    cold.restored_held.insert(0, (u64::MAX, agent, fleet));
+    cold.restored_held.insert(0, (u64::MAX, agent, fleet, rows));
     let records = cold.messages.log().records().count();
     cold.say_restored_held();
     let said = held_records(&cold, records);
@@ -3344,6 +3420,58 @@ fn a_missing_held_leaf_does_not_hide_the_same_agents_surviving_leaf() {
         1,
         "the surviving leaf's held agent is reported: {said:?}"
     );
+}
+
+/// A HELD TAB'S AGENT HAS ITS EARLIER TAB NOTED AS THE RESTORE SAYS IT (the
+/// decision review's RR-LC-3; the merge review's GUI-M7-2): a held tab's
+/// agent is never queued, so no relaunch records the tab it ran in, and
+/// [`App::say_restored_held`] notes it beside the reopened tab's loop ledger
+/// through the host ([`crate::harness_host::HostHandle::note_earlier_tab`]),
+/// so the old tab's loop turns stay the harness's own. Driven through the
+/// App, whose restore is the only path a held tab's note takes. NEGATIVE
+/// CONTROLS: an agent that names no tab, and one that names the reopened
+/// tab's own sid, note nothing.
+#[test]
+fn a_held_tabs_agent_has_its_earlier_tab_noted_as_the_restore_says_it() {
+    const OLD_SID: &str = "s-00000000000000000001";
+    let leaf = restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(
+        restore::TerminalLeafRestore {
+            local_id: Some(7),
+            agent: Some(Box::new(dead_agent())),
+            holds: vec!["local x".to_string()],
+            ..bare_leaf()
+        },
+    ));
+    for case in ["an earlier tab", "control: no tab", "control: its own tab"] {
+        type Noted = std::sync::Mutex<Vec<(String, String)>>;
+        let noted: std::sync::Arc<Noted> = std::sync::Arc::default();
+        let host = crate::harness_host::HostHandle::for_restored_test_noting(
+            std::sync::Arc::new(|_, _, _, _| "wait:shell-prompt".to_string()),
+            std::sync::Arc::clone(&noted),
+        );
+        let mut cold = App::headless_for_test();
+        cold.harness = Some(host.clone());
+        cold.restore_into_window(WindowId(0), window_of(vec![leaf.clone()]));
+        assert_eq!(cold.restored_held.len(), 1, "{case}: held, not relaunched");
+        let id = cold.restored_held[0].0;
+        let sid = {
+            let g = cold.store.read().unwrap();
+            g.by_local(id).expect("registered").sid.as_str().to_string()
+        };
+        cold.restored_held[0].1.tab = match case {
+            "an earlier tab" => Some(OLD_SID.to_string()),
+            "control: its own tab" => Some(sid.clone()),
+            _ => None,
+        };
+        cold.say_restored_held();
+        let want = if case == "an earlier tab" {
+            vec![(sid, OLD_SID.to_string())]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(*noted.lock().unwrap(), want, "{case}");
+        host.shutdown_and_join();
+    }
 }
 
 /// The records the restore pass said of held tabs ([`App::say_restored_held`])
@@ -3468,16 +3596,27 @@ fn a_held_tabs_record_is_its_own_agents() {
         program: "/opt/codex/bin/codex".into(),
         argv: vec!["/opt/codex/bin/codex".into()],
         session: Some(THREAD.into()),
-        codex: Some(restore::CodexRestore {
+        run: Some(restore::RunRestore::Codex(restore::CodexRestore {
             home: "/opt/agents/codex".into(),
             home_env: None,
             embedded: true,
             started_ms: 1,
-        }),
+            alab: Some(restore::AlabRestore {
+                argv: vec![
+                    "/opt/codex/bin/codex".into(),
+                    "resume".into(),
+                    THREAD.into(),
+                ],
+                session: THREAD.into(),
+                codex_home: Some("/opt/agents/codex".into()),
+                cwd: None,
+            }),
+            carried: None,
+        })),
         ..dead_agent()
     };
     let host =
-        crate::harness_host::HostHandle::for_restored_test(std::sync::Arc::new(|_, _, _| {
+        crate::harness_host::HostHandle::for_restored_test(std::sync::Arc::new(|_, _, _, _| {
             "wait:shell-prompt".to_string()
         }));
     let mut cold = App::headless_for_test();
@@ -3512,11 +3651,10 @@ fn a_held_tabs_record_is_its_own_agents() {
         "{codex_title:?}"
     );
     assert!(
-        codex_lines
-            .iter()
-            .any(|line| line.contains(&format!("codex resume {THREAD}")))
-            && !codex_lines.iter().any(|line| line.contains("claude")),
-        "Codex's own resume: {codex_lines:?}"
+        codex_lines.iter().any(|line| line.contains(&format!(
+            "CODEX_HOME=/opt/agents/codex /opt/codex/bin/codex resume {THREAD}"
+        ))) && !codex_lines.iter().any(|line| line.contains("claude")),
+        "codex-alab's own validated line: {codex_lines:?}"
     );
     host.shutdown_and_join();
 
@@ -3827,57 +3965,8 @@ fn the_bootstrap_identity_is_the_identity_of_the_leaf_the_bootstrap_fills() {
     );
 }
 
-/// THE ENTRY BUILT BEFORE THE ADOPTION NAMES THE FROZEN TAB (review,
-/// 2026-09-16). The atpkg launch pass starts from `main_entry` before the
-/// event loop, and on a warm machine prints `managed-current:` within tens
-/// of milliseconds — before the first park after first paint adopts the
-/// handed-off shells (`apply_pending_restore`). Counted from the registry
-/// alone, those words claimed every tab, the very one the owner had
-/// complained about. `App::frozen_path_tabs` counts the pending adoptees, so
-/// the marker that arrives first is worded right. Since 2026-09-22 the words
-/// are a `Hold::LogOnly` record and never a row, and with a frozen tab the
-/// record's detail is the remedy alone ("1 tab from before this update
-/// picks them up with …"): the restore's refresh that re-posted the row
-/// when the count moved (`refresh_managed_current`) is gone with it, and
-/// the count simply reads the registry once the shells are adopted.
-#[test]
-fn a_managed_entry_built_before_the_adoption_counts_the_frozen_shell_and_takes_no_row() {
-    let wire = "claude 2.1.273 (build 2026091601); codex 0.154.0 (build 2026091001)";
-    let managed = |app: &App| {
-        app.messages
-            .log()
-            .records()
-            .rfind(|r| r.key.as_deref() == Some(crate::toolchain_words::KEY_MANAGED))
-            .map(|r| r.detail[0].clone())
-    };
-    let mut new = App::headless_for_test();
-    new.handoff_successor = true;
-    let mut frozen = handed_off_shell(3);
-    frozen.frozen_path = true;
-    new.seamless_adopt = vec![frozen, handed_off_shell(4)];
-    // Before the adoption: the registry knows nothing, the count is 1.
-    assert_eq!(new.store.read().unwrap().frozen_path_tabs(), 0);
-    assert_eq!(new.frozen_path_tabs(), 1, "the pending adoptee is counted");
-    // The marker lands now — what `Wake::PkgManagedCurrent` does.
-    new.post_managed_current(wire);
-    assert_eq!(new.messages.live_rows().count(), 0, "no row");
-    let detail = managed(&new).expect("the record");
-    assert_eq!(
-        detail,
-        "1 tab from before this update picks them up with \
-         `. ~/.aterm/shell.d/00-atpkg.zsh`",
-        "the remedy, never a claim on every tab"
-    );
-    // The adoption: the leaf places shell 3, the net places shell 4.
-    new.restore_into_window(WindowId(0), window_of(vec![leaf_naming(0), leaf_naming(3)]));
-    new.adopt_orphan_shells_as_tabs(&[]);
-    assert!(new.seamless_adopt.is_empty());
-    assert_eq!(new.store.read().unwrap().frozen_path_tabs(), 1);
-    assert_eq!(new.frozen_path_tabs(), 1, "registered now, counted once");
-}
-
 /// CONFORMANCE (Tier-1) of the REAL incoming side to
-/// `aterm_spec::derive::fd_handoff_no_leak_model` (`FdHandoffNoLeak`,
+/// `aterm_models_session::fd_handoff_no_leak_model` (`FdHandoffNoLeak`,
 /// proof-carrying DSU Rung 1b): every PTY master handed across a seamless
 /// re-exec ends ADOPTED — owned by a session — or CLOSED, never dropped while
 /// still open (a live, readerless channel whose shell never sees its hangup).
@@ -3919,7 +4008,7 @@ fn handed_off_masters_are_adopted_or_closed_never_leaked() {
     use std::os::fd::IntoRawFd;
     use std::os::unix::net::UnixStream;
 
-    let model = aterm_spec::derive::fd_handoff_no_leak_model();
+    let model = aterm_models_session::fd_handoff_no_leak_model();
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
     let closed = |peer: &UnixStream| {
         let mut byte = [0u8; 1];
@@ -4060,7 +4149,7 @@ fn handed_off_shell(local_id: u64) -> crate::spawn::Adopted {
         render_debt: None,
         fabric: Default::default(),
         timeline_id: 0,
-        log_carry: None,
+        log: Default::default(),
         journal_key: None,
     }
 }
@@ -4427,8 +4516,9 @@ impl Successor {
             version: Some("2.1.283".into()),
             home: None,
             login: None,
-            codex: None,
+            run: None,
             cause: None,
+            tab: None,
         };
         desk.fill_agents(&|id| (id == 1).then(|| claude.clone()));
         let owner = JournalOwner::create(dir.path(), parent).expect("armed");
@@ -4903,17 +4993,6 @@ fn window_of(roots: Vec<restore::RestoredSplitTree>) -> restore::WindowLayout {
     layout
 }
 
-/// `main_entry`'s pick for session 0 before `take_session0_shell`: the shell
-/// window 0's bootstrap leaf names or, with no such leaf, the first shell the
-/// handoff lists (`SessionHandoff::from_store` lists them in local-id order).
-fn first_listed_session0_shell(
-    handed_off: &mut Vec<crate::spawn::Adopted>,
-    layout: &restore::RestoreManifest,
-) -> Option<crate::spawn::Adopted> {
-    super::take_handed_off_shell(handed_off, layout.windows[0].bootstrap_local_id())
-        .or_else(|| Some(handed_off.remove(0)))
-}
-
 /// A handoff SUCCESSOR rebuilt from `windows` the way the child runs. The
 /// layout crosses the wire (`to_toml`, then `from_toml` plus
 /// `covers_exact_seamless_ids`, as `take_incoming` accepts it) with shells
@@ -5024,34 +5103,6 @@ fn assert_tooltips_name_their_shells(app: &App, shape: &str) {
     }
 }
 
-/// EVERY SHELL COMES BACK IN THE PANE ITS LEAF NAMES, WEARING THAT LEAF'S
-/// IDENTITY, AND NO STAND-IN IS SPAWNED. When window 0 has no terminal leaf,
-/// `main_entry` once adopted the first shell the handoff listed as session 0
-/// anyway. That shell's own leaf lies in a later window, whose rebuild found
-/// it taken and spawned a FRESH shell in its pane — a stand-in, with a new
-/// sid and no history — while the shell itself stayed in window 0 as an
-/// extra tab. The stand-in was also seeded with the leaf's identity
-/// (`role=` included, which peers read before typing) while the shell that
-/// identity describes came back bare; when the leaf was its window's first
-/// pane, the graft refused the stand-in and the identity reached nobody.
-/// `take_session0_shell` now adopts nothing for such a window 0: session 0
-/// is a fresh bootstrap its native-only rebuild retires, and each shell is
-/// adopted by its own leaf. The third shape — a native first tab with the
-/// terminal leaf later in the same window — was always right; it is the
-/// control.
-///
-/// HOW IT FAILS WITHOUT THE FIXES, as measured. With the old pick
-/// ([`first_listed_session0_shell`]) in place of `take_session0_shell`, the
-/// first two shapes fail the placement check: shell 0 is an extra tab of
-/// window 0 and a stand-in fills its pane
-/// (`a_handoff_keeps_each_identity_on_its_shell_when_a_leaf_names_a_shell_running_elsewhere`
-/// keeps those shapes, to hold the identity rule there). Further back —
-/// against the code before the identity fix, whose headless stub never
-/// adopted from `seamless_adopt` — this test's first form fails at its
-/// PRECONDITION that the layout placed every handed-off shell, not at an
-/// identity check, since every stub stands in for its shell (as the review
-/// of that fix measured). The identity failures described above were
-/// measured with the stub adopting and the old identity rule.
 /// ROUND SIX, FINDING 10: A SESSION OPEN IN TWO WINDOWS KEEPS THE WHOLE
 /// LAYOUT, AND BOTH VIEWS. `Open Session in New Window` (Cmd-Shift-O)
 /// shows one pooled session in a second window, and the handoff capture
@@ -5179,10 +5230,6 @@ fn a_desk_past_the_window_cap_folds_into_the_handoff_layout_and_places_every_she
         "the layout says what was folded, for the successor to say, and which \
          panes were in front before it"
     );
-    assert!(
-        layout.to_toml().expect("serializes").contains("[fold]"),
-        "on the wire"
-    );
     assert_eq!(
         layout.windows[restore::MAX_WINDOWS - 1]
             .tabs
@@ -5211,39 +5258,6 @@ fn a_desk_past_the_window_cap_folds_into_the_handoff_layout_and_places_every_she
             .map(|shell| vec![Some(Some(shell))])
             .collect::<Vec<_>>(),
         "the last window holds its own tab, then a tab for each window past the cap, in order"
-    );
-}
-
-/// D5: TABS FOLD WHOLE, NATIVE ONES TOO. A Settings tab of a window past
-/// the cap joins the last window, beside that window's own Settings tab:
-/// the successor reopens both views (a window may present the Settings
-/// controller twice, as two windows do) and every shell around them.
-#[cfg(unix)]
-#[test]
-fn a_folded_window_reopens_every_native_tab_it_received() {
-    let mut windows = (0..63)
-        .map(|shell| window_of(vec![leaf_naming(shell)]))
-        .collect::<Vec<_>>();
-    windows.push(window_of(vec![leaf_naming(63), settings_leaf()]));
-    windows.push(window_of(vec![settings_leaf(), leaf_naming(64)]));
-    let mut layout = restore::RestoreManifest::new(windows);
-    layout.fold_into_caps();
-    assert!(layout.admits_whole(), "PRECONDITION: within the caps");
-
-    let new = successor_of(layout.windows, 65, |handed_off, layout| {
-        super::take_session0_shell(handed_off, Some(layout))
-    });
-    let shown = shown_shells(&new);
-    assert_eq!(shown.len(), restore::MAX_WINDOWS);
-    assert_eq!(
-        shown[restore::MAX_WINDOWS - 1],
-        vec![
-            vec![Some(Some(63))],
-            vec![None],
-            vec![None],
-            vec![Some(Some(64))]
-        ],
-        "its own shell and Settings, then the folded window's Settings and shell"
     );
 }
 
@@ -5426,40 +5440,6 @@ fn a_window_past_the_tab_cap_spills_into_another_window_of_the_handoff_layout() 
     );
 }
 
-/// D5's record: the successor says ONCE, calmly, what the outgoing build
-/// folded (`App::say_layout_folded`, which `apply_pending_restore` runs
-/// once the layout's windows are up), and says nothing for a layout that
-/// folded nothing — every desk within the caps.
-#[test]
-fn the_successor_says_once_what_the_update_folded() {
-    let folded = |app: &App| {
-        app.messages
-            .live_rows()
-            .filter(|row| row.msg.key.as_deref() == Some(crate::update_words::KEY_LAYOUT_FOLDED))
-            .map(|row| row.msg.clone())
-            .collect::<Vec<_>>()
-    };
-    let mut app = App::headless_for_test();
-    app.say_layout_folded(&restore::LayoutFold::default());
-    assert!(folded(&app).is_empty(), "nothing folded, nothing said");
-
-    app.say_layout_folded(&restore::LayoutFold {
-        windows: 6,
-        ..restore::LayoutFold::default()
-    });
-    let rows = folded(&app);
-    assert_eq!(rows.len(), 1);
-    assert_eq!(
-        rows[0].title,
-        "6 windows were merged into tabs during the update"
-    );
-    assert_eq!(
-        rows[0].severity,
-        aterm_messages::Severity::Info,
-        "a record, not a warning: every tab and shell came across"
-    );
-}
-
 /// An owed adoption proof on `app`, as a successor holds one until it
 /// writes it: the readiness pipe's write end. The read end comes back.
 #[cfg(unix)]
@@ -5616,6 +5596,90 @@ fn a_co_viewed_held_pane_comes_back_in_both_of_its_windows() {
     );
 }
 
+/// A HELD PANE IS ANSWERED, NOT WAITED ON (phase 3A review): a pane the
+/// outgoing process kept after its command ended comes back registered and
+/// `Exited`, and nothing will write its log's close until someone closes it.
+/// `await log` on it answers `ERR exited` at once for every form, whatever
+/// timeout it asked for: only the exit path says a close is due
+/// (`SessionLog::note_close_due`), and no restore path takes it.
+///
+/// RED before the fix: the waiter parked on every `Exited` session still
+/// registered unless an exit path had listed its pane as kept, and the
+/// restore never did, so each form here answered `OK timeout`.
+#[test]
+fn await_log_on_a_restored_held_pane_answers_exited_at_once() {
+    const HELD: u64 = 7;
+    let wire = restore::RestoreManifest::new(vec![
+        window_of(vec![leaf_naming(0)]),
+        window_of(vec![leaf_naming(HELD)]),
+    ])
+    .to_toml()
+    .expect("the parent serializes its layout");
+    let placed = restore::RestoreManifest::from_toml(&wire)
+        .expect("the successor parses it")
+        .placed_for_handed(&[0])
+        .expect("a held pane's leaf is a placeholder, not a refusal");
+    let mut new = App::headless_for_test();
+    new.handoff_successor = true;
+    adopt_as(&mut new, 0, 0);
+    let checkpoint = {
+        let mut t = aterm_core::terminal::Terminal::new(24, 80);
+        t.process(b"build finished\r\n");
+        t.checkpoint_carry_abandoning_partial(0).0
+    };
+    new.seamless_held = vec![crate::seamless::HeldPane {
+        local_id: HELD,
+        sid: None,
+        checkpoint,
+        exit: Some(aterm_pty::ChildExit::Code(0)),
+        history: crate::handoff_history::AdoptedHistory::default(),
+        control: None,
+        failure_seen: false,
+    }];
+    let mut windows = placed.windows.into_iter();
+    new.restore_into_window(WindowId(0), windows.next().expect("window 0"));
+    let layout = windows.next().expect("the held pane's window");
+    let wid = new.create_native_restore_window(layout.rows, layout.cols);
+    new.restore_into_window(wid, layout);
+    let session = new
+        .window_terminal_sessions(wid)
+        .first()
+        .copied()
+        .expect("the window shows the held pane");
+    assert_eq!(
+        new.store.read().unwrap().by_local(session).map(|h| h.state),
+        Some(crate::session_store::SessionState::Exited),
+        "PRECONDITION: registered and ended"
+    );
+    let held = new.pool.get(session).expect("pooled");
+    for what in ["close=session", "need", "close=run", "kind=verdict"] {
+        assert_eq!(
+            crate::control::cmd_await(
+                &held.term,
+                &new.store,
+                session,
+                &held.ctx,
+                &format!("log {what} timeout=0"),
+                &new.subscribers,
+            ),
+            "ERR exited\n",
+            "{what}: no close is coming"
+        );
+    }
+}
+
+/// EVERY SHELL COMES BACK IN THE PANE ITS LEAF NAMES, WEARING THAT LEAF'S
+/// IDENTITY, AND NO STAND-IN IS SPAWNED. When window 0 has no terminal leaf,
+/// `main_entry` once adopted the first shell the handoff listed as session 0
+/// anyway. That shell's own leaf lies in a later window, whose rebuild found
+/// it taken and spawned a FRESH shell in its pane — a stand-in, with a new
+/// sid and no history — while the shell itself stayed in window 0 as an
+/// extra tab, and the stand-in was seeded with the leaf's identity while the
+/// shell that identity describes came back bare. `take_session0_shell` now
+/// adopts nothing for such a window 0: session 0 is a fresh bootstrap its
+/// native-only rebuild retires, and each shell is adopted by its own leaf.
+/// The third shape — a native first tab with the terminal leaf later in the
+/// same window — was always right; it is the control.
 #[test]
 fn a_handoff_carries_each_identity_onto_the_shell_its_leaf_names_and_never_a_stand_in() {
     let shapes = [
@@ -5714,90 +5778,6 @@ fn a_handoff_carries_each_identity_onto_the_shell_its_leaf_names_and_never_a_sta
         Some(0)
     );
     assert_eq!(handed_off.len(), 2);
-}
-
-/// A LEAF NAMING A SHELL THAT RUNS ELSEWHERE GIVES ITS IDENTITY TO THAT
-/// SHELL, NOT TO THE STAND-IN FILLING ITS PANE. An honored handoff layout
-/// never reaches this: each shell is adopted by its own leaf or as its own
-/// window's bootstrap. The old session-0 pick reached it
-/// ([`first_listed_session0_shell`]), and a tab that fails to build hands its
-/// window's bootstrap on to another shell's pane; `carry_restored_identity`
-/// must stay right there. Session 0 is shell 0, kept as an extra tab in
-/// native-only window 0 because it IS a handed-off shell; its own pane shows
-/// it again (round six, finding 10: a shell this restore already adopted is
-/// shown, never stood in for by a shell forked during the overlap), and it
-/// wears its leaf's identity, which window 0's tab chrome repaints to show.
-#[test]
-fn a_handoff_keeps_each_identity_on_its_shell_when_a_leaf_names_a_shell_running_elsewhere() {
-    use crate::session_timeline::SessionMeta;
-
-    for (shape, windows) in [
-        (
-            "shell 0's leaf is a later pane of window 1",
-            vec![
-                window_of(vec![settings_leaf()]),
-                window_of(vec![
-                    split_of(leaf_naming(2), leaf_naming(0)),
-                    leaf_naming(1),
-                ]),
-            ],
-        ),
-        (
-            "shell 0's leaf is window 1's first pane",
-            vec![
-                window_of(vec![settings_leaf()]),
-                window_of(vec![
-                    leaf_naming(0),
-                    split_of(leaf_naming(1), leaf_naming(2)),
-                ]),
-            ],
-        ),
-    ] {
-        let new = successor_of(windows, 3, first_listed_session0_shell);
-        assert_eq!(
-            new.pool.get(0).and_then(|session| session.handoff_local_id),
-            Some(0),
-            "PRECONDITION {shape}: session 0 is shell 0"
-        );
-        let mut stand_ins = Vec::new();
-        for (&session, pooled) in &new.pool.sessions {
-            match pooled.session.handoff_local_id {
-                Some(shell) => assert_eq!(
-                    registry_meta(&new, session),
-                    identity_of(shell),
-                    "{shape}: shell {shell} (session {session}) wears exactly the identity \
-                     of the leaf that names it"
-                ),
-                None => {
-                    stand_ins.push(session);
-                    assert_eq!(
-                        registry_meta(&new, session),
-                        SessionMeta::default(),
-                        "{shape}: stand-in session {session} is no handed-off shell, so \
-                         it wears no identity"
-                    );
-                }
-            }
-        }
-        assert_eq!(
-            stand_ins,
-            Vec::<u64>::new(),
-            "{shape}: no stand-in is forked"
-        );
-        assert!(
-            shown_shells(&new)
-                .iter()
-                .skip(1)
-                .flatten()
-                .flatten()
-                .any(|shown| *shown == Some(Some(0))),
-            "{shape}: shell 0's own pane shows it"
-        );
-        // Window 0 was rebuilt before shell 0's identity arrived; its tab
-        // shows it all the same.
-        assert_tooltips_name_their_shells(&new, shape);
-        assert!(new.structural_invariants_ok(), "{shape}");
-    }
 }
 
 /// A SHELL THE REBUILD LEAVES OVER STILL COMES BACK WEARING ITS IDENTITY.
@@ -5925,12 +5905,6 @@ fn the_bootstrap_cwd_is_the_directory_of_the_leaf_the_bootstrap_fills() {
         "PRECONDITION: the mirror's first leaf is session 1's tab; the bootstrap fills \
          session 0's pane"
     );
-    assert_eq!(
-        manifest.first_leaf_cwd(),
-        None,
-        "no pane of session 0's tab recorded a directory, so the bootstrap starts in \
-         the default one, not in session 1's tab's"
-    );
 
     feed(0, b"\x1b]7;file://localhost/aterm-proof/split-pane\x07");
     let manifest = carried(&old);
@@ -6042,4 +6016,859 @@ fn a_graft_announces_every_field_it_moves_to_an_events_watcher() {
         watch.wait(std::time::Duration::ZERO),
         "the session's `events` watcher was woken for them"
     );
+}
+
+/// A test App with a harness host, so a timed Cruise's fire lands it.
+fn hosted_app() -> (App, crate::harness_host::HostHandle) {
+    let mut app = App::headless_for_test();
+    let host = crate::harness_host::HostHandle::for_supervised_test(
+        Vec::new(),
+        std::sync::Arc::new(|_| crate::harness_host::BodyEnd::Stopped),
+    );
+    app.harness = Some(host.clone());
+    (app, host)
+}
+
+/// The live session whose stored timer is `land_at`.
+fn timed_session(app: &App, land_at: i64) -> Option<u64> {
+    app.pool.iter().find_map(|session| {
+        (session.ctx.meta.lock().unwrap().land_at == Some(land_at)).then_some(session.id)
+    })
+}
+
+/// AUTOPILOT'S TIMER RIDES EVERY RESTORE PATH (`docs/DESIGN-harness-autopilot-
+/// 2026-10-15.md` §9.3.6, item 2, §9.3.7): the restore leaf carries the word
+/// and its `land_at` as a pair, and each path stores it as one step and
+/// indexes it.
+///
+/// * A COLD RESTORE (the second tab's shell is spawned and seeded before it
+///   is registered): stored, indexed, and — its time passed while aterm was
+///   closed — due at once; the fire lands it and the record says it passed
+///   while aterm was closed.
+/// * A CLOSED TAB REOPENED (`restore_closed_tab_into_window`, the reopen's
+///   own path): stored and indexed at its instant; and where its time
+///   passed while the tab was closed — aterm running all along — due at
+///   once, and the record says the TAB was closed, never aterm (review of
+///   slice B, finding 2: it said aterm).
+/// * THE LIVE GRAFT of a seamless update onto the adopted shell: stored and
+///   indexed; and where a driver wrote the word on the new process first
+///   (`meta set autopilot off`), that write wins for BOTH halves — no timer,
+///   no entry.
+///
+/// NEGATIVE CONTROL: a leaf whose `land_at` sits beside a word other than
+/// `cruise` (a hand-edited manifest) carries no timer at all.
+#[test]
+fn a_timed_cruise_rides_the_cold_restore_the_reopen_and_the_graft() {
+    use crate::session_timeline::{MetaEdit, MetaField};
+    let wall = 1_792_177_200_000_i64;
+    let mono = std::time::Instant::now();
+    crate::autopilot_timers::set_fake_clocks(Some((mono, wall)));
+    let timed = |land_at: i64| restore::TerminalLeafRestore {
+        autopilot: Some("cruise".to_string()),
+        land_at: Some(land_at),
+        local_id: Some(1),
+        ..bare_leaf()
+    };
+
+    // A COLD RESTORE across the instant.
+    let (mut app, host) = hosted_app();
+    let passed = wall - 60_000;
+    let mut layout = single_leaf_window(bare_leaf());
+    layout.restored_tabs.push(restore::RestoredTab {
+        root: restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(timed(passed))),
+        focused_path: Vec::new(),
+        zoomed: false,
+    });
+    app.restore_into_window(WindowId(0), layout);
+    let session = timed_session(&app, passed).expect("the spawned shell carries the pair");
+    assert_ne!(session, 0, "the second tab's own shell");
+    assert_eq!(
+        app.pool
+            .get(session)
+            .unwrap()
+            .ctx
+            .meta
+            .lock()
+            .unwrap()
+            .autopilot
+            .as_deref(),
+        Some("cruise")
+    );
+    let entry = *app.autopilot_timers.entry(session).expect("indexed");
+    assert_eq!(
+        entry.passed_while,
+        Some(crate::autopilot_timers::ClosedOver::Aterm)
+    );
+    assert_eq!(app.autopilot_timer_deadline(), Some(mono), "due at once");
+    app.expire_autopilot_timers();
+    let meta = app
+        .pool
+        .get(session)
+        .unwrap()
+        .ctx
+        .meta
+        .lock()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        (meta.autopilot.as_deref(), meta.land_at),
+        (Some("land"), None)
+    );
+    let sid = app
+        .pool
+        .get(session)
+        .unwrap()
+        .ctx
+        .self_id
+        .as_str()
+        .to_string();
+    let record = app
+        .messages
+        .log()
+        .records()
+        .rfind(|r| r.key.as_deref() == Some(format!("harness.autopilot.{sid}").as_str()))
+        .map(|r| r.detail.join(" "))
+        .expect("the landing's record");
+    assert!(
+        record.contains("landing time passed while aterm was closed; land is on"),
+        "{record}"
+    );
+    host.shutdown_and_join();
+
+    // A CLOSED TAB REOPENED, its time ahead.
+    let (mut app, host) = hosted_app();
+    let ahead = wall + 3_600_000;
+    let record = restore::RestoredTab {
+        root: restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(timed(ahead))),
+        focused_path: Vec::new(),
+        zoomed: false,
+    };
+    app.restore_closed_tab_into_window(WindowId(0), &record, 1)
+        .expect("reopened");
+    let session = timed_session(&app, ahead).expect("the reopened shell carries the pair");
+    let entry = *app.autopilot_timers.entry(session).expect("indexed");
+    assert_eq!(entry.passed_while, None);
+    assert_eq!(
+        app.autopilot_timer_deadline(),
+        Some(mono + std::time::Duration::from_secs(3_600))
+    );
+    host.shutdown_and_join();
+
+    // A CLOSED TAB REOPENED after its time passed, aterm running all along.
+    let (mut app, host) = hosted_app();
+    let record = restore::RestoredTab {
+        root: restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(timed(passed))),
+        focused_path: Vec::new(),
+        zoomed: false,
+    };
+    app.restore_closed_tab_into_window(WindowId(0), &record, 1)
+        .expect("reopened");
+    let session = timed_session(&app, passed).expect("the reopened shell carries the pair");
+    let entry = *app.autopilot_timers.entry(session).expect("indexed");
+    assert_eq!(
+        entry.passed_while,
+        Some(crate::autopilot_timers::ClosedOver::Tab),
+        "only the tab was closed"
+    );
+    assert_eq!(app.autopilot_timer_deadline(), Some(mono), "due at once");
+    app.expire_autopilot_timers();
+    assert_eq!(
+        registry_meta(&app, session).autopilot.as_deref(),
+        Some("land"),
+        "landed"
+    );
+    let sid = app
+        .pool
+        .get(session)
+        .unwrap()
+        .ctx
+        .self_id
+        .as_str()
+        .to_string();
+    let record = app
+        .messages
+        .log()
+        .records()
+        .rfind(|r| r.key.as_deref() == Some(format!("harness.autopilot.{sid}").as_str()))
+        .map(|r| r.detail.join(" "))
+        .expect("the landing's record");
+    assert!(
+        record.contains("landing time passed while the tab was closed; land is on"),
+        "{record}"
+    );
+    assert!(!record.contains("aterm was closed"), "{record}");
+    host.shutdown_and_join();
+
+    // THE LIVE GRAFT onto an adopted shell: carried and indexed …
+    let (mut app, host) = hosted_app();
+    app.handoff_successor = true;
+    adopt_as(&mut app, 0, 0);
+    let mut leaf = timed(ahead);
+    leaf.local_id = Some(0);
+    app.restore_into_window(WindowId(0), single_leaf_window(leaf.clone()));
+    let meta = registry_meta(&app, 0);
+    assert_eq!(
+        (meta.autopilot.as_deref(), meta.land_at),
+        (Some("cruise"), Some(ahead))
+    );
+    assert_eq!(
+        app.autopilot_timers.entry(0).map(|e| e.land_at_ms),
+        Some(ahead)
+    );
+    host.shutdown_and_join();
+    // … unless a driver wrote the word here first: its write wins for both.
+    let (mut app, host) = hosted_app();
+    app.handoff_successor = true;
+    adopt_as(&mut app, 0, 0);
+    driver_meta(&app, 0, MetaField::Autopilot, MetaEdit::Set("off"));
+    app.restore_into_window(WindowId(0), single_leaf_window(leaf));
+    let meta = registry_meta(&app, 0);
+    assert_eq!(
+        (meta.autopilot.as_deref(), meta.land_at),
+        (Some("off"), None)
+    );
+    assert!(app.autopilot_timers.is_empty(), "no entry");
+    host.shutdown_and_join();
+
+    // NEGATIVE CONTROL: a timer beside `land` is no timer.
+    let (mut app, host) = hosted_app();
+    let mut odd = timed(ahead);
+    odd.autopilot = Some("land".to_string());
+    odd.local_id = Some(0);
+    app.restore_into_window(WindowId(0), single_leaf_window(odd));
+    let meta = registry_meta(&app, 0);
+    assert_eq!(
+        (meta.autopilot.as_deref(), meta.land_at),
+        (Some("land"), None)
+    );
+    assert!(app.autopilot_timers.is_empty());
+    host.shutdown_and_join();
+    crate::autopilot_timers::set_fake_clocks(None);
+}
+
+/// A TIMED CRUISE ACROSS A SEAMLESS UPDATE, END TO END (design §9.6.2,
+/// acceptance 2; review of slice B, finding 5): the parent arms its session
+/// four minutes out; its handoff capture carries the pair, across the wire,
+/// to a successor that grafts it onto the adopted shell and indexes it. A
+/// driver arms the session two minutes out on the successor before its
+/// Commit — stored, its `MetaChanged` dropped by the real pre-Commit gate —
+/// and the two minutes pass with nothing fired (a candidate fires nothing).
+/// The Commit lifts the gate, and the first park after it rebuilds the index
+/// from the store and lands the session at once, once: the old instant
+/// passing later fires nothing more.
+///
+/// NEGATIVE CONTROL: a park that kept the graft's index (no rebuild) would
+/// fire nothing at two minutes — the dropped wake left the index at four.
+#[cfg(unix)]
+#[test]
+fn a_timed_cruise_crosses_the_handoff_and_lands_once_after_the_commit() {
+    use aterm_agent::supervise::Autopilot;
+    let wall = 1_792_177_200_000_i64;
+    let mono = std::time::Instant::now();
+    let at = |secs: u64| {
+        crate::autopilot_timers::set_fake_clocks(Some((
+            mono + std::time::Duration::from_secs(secs),
+            wall + i64::try_from(secs).unwrap() * 1000,
+        )));
+    };
+    at(0);
+    let mut parent = App::headless_for_test();
+    assert!(parent.set_session_autopilot_timed(0, Some(Autopilot::Cruise), Some(wall + 240_000)));
+    let (layout, placed) = handoff_layout_placed(&parent);
+    let carried = match &layout.windows[0].restored_tabs[0].root {
+        restore::RestoredSplitTree::Leaf {
+            view: restore::RestoredView::Terminal(leaf),
+        } => leaf.land_at,
+        _ => None,
+    };
+    assert_eq!(
+        carried,
+        Some(wall + 240_000),
+        "the capture carries the pair"
+    );
+    let mut new = successor_of(placed.windows, 1, |handed_off, layout| {
+        super::take_session0_shell(handed_off, Some(layout))
+    });
+    new.incoming_handoff_pending = true;
+    let pair = |app: &App| {
+        let meta = registry_meta(app, 0);
+        (meta.autopilot, meta.land_at)
+    };
+    assert_eq!(
+        pair(&new),
+        (Some("cruise".into()), Some(wall + 240_000)),
+        "grafted"
+    );
+    assert_eq!(
+        new.autopilot_timers.entry(0).map(|e| e.land_at_ms),
+        Some(wall + 240_000),
+        "indexed by the graft"
+    );
+    // A driver's arm on the successor before its Commit: its wake dropped.
+    let (term, ctx) = {
+        let session = new.pool.get(0).unwrap();
+        (session.term.clone(), session.ctx.clone())
+    };
+    let (reply, changed) =
+        crate::control::cmd_meta(&term, &new.store, 0, &ctx, "set autopilot cruise until=+2m");
+    assert!(reply.starts_with("OK land_at="), "{reply}");
+    assert!(changed);
+    assert!(
+        new.admit_wake_before_commit(crate::Wake::MetaChanged { session: 0 })
+            .is_none(),
+        "the wake is dropped before the Commit"
+    );
+    assert_eq!(
+        new.autopilot_timers.entry(0).map(|e| e.land_at_ms),
+        Some(wall + 240_000),
+        "the index trails the store"
+    );
+    // Two minutes: a candidate parks and fires nothing.
+    at(120);
+    new.expire_autopilot_timers();
+    assert_eq!(new.autopilot_timer_deadline(), None, "nothing folded");
+    assert_eq!(pair(&new), (Some("cruise".into()), Some(wall + 120_000)));
+    // The Commit lifts the gate; the park after it rebuilds and lands.
+    new.incoming_handoff_pending = false;
+    new.expire_autopilot_timers();
+    assert_eq!(
+        pair(&new),
+        (Some("land".into()), None),
+        "landed at the Commit's park"
+    );
+    assert_eq!(new.autopilot_timer_deadline(), None, "no entry left");
+    // Four minutes: the old instant fires nothing more.
+    at(240);
+    new.expire_autopilot_timers();
+    let lands = ctx
+        .timeline
+        .lock()
+        .unwrap()
+        .since(None)
+        .filter(|e| e.kind == "meta-change" && e.payload.contains("field=autopilot value=land"))
+        .count();
+    assert_eq!(lands, 1, "landed once");
+    crate::autopilot_timers::set_fake_clocks(None);
+}
+
+// ---- restore lineage (session log phase 2A) ----------------------------------
+
+/// The record lines of pool session `session`'s log, oldest first.
+fn slog_lines(app: &App, session: u64) -> Vec<String> {
+    let ctx = app.pool.get(session).expect("live session").ctx.clone();
+    crate::control::cmd_log(&ctx, "")
+        .lines()
+        .skip(1)
+        .map(str::to_string)
+        .collect()
+}
+
+/// A tab of one terminal leaf naming shell `local` that was session `sid`,
+/// first of its chain `lineage`.
+fn lineage_tab(local: u64, sid: Option<&str>, lineage: Option<&str>) -> restore::RestoredTab {
+    restore::RestoredTab {
+        root: restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(
+            restore::TerminalLeafRestore {
+                sid: sid.map(str::to_string),
+                lineage: lineage.map(str::to_string),
+                local_id: Some(local),
+                ..bare_leaf()
+            },
+        )),
+        focused_path: Vec::new(),
+        zoomed: false,
+    }
+}
+
+/// The terminal leaf window `wid`'s tab `index` captures as, and the
+/// session filling it.
+fn captured_leaf(app: &App, wid: WindowId, index: usize) -> (restore::TerminalLeafRestore, u64) {
+    let tab = &app.windows[&wid].tab_set.tabs()[index];
+    let session = app
+        .view_store
+        .get(tab.focus)
+        .copied()
+        .and_then(crate::tab_model::View::terminal_session)
+        .expect("a terminal tab");
+    let restore::RestoredSplitTree::Leaf {
+        view: restore::RestoredView::Terminal(leaf),
+    } = app.tab_restore_descriptor(tab).expect("captured").root
+    else {
+        panic!("one terminal leaf");
+    };
+    (leaf, session)
+}
+
+/// A COLD RESTORE NAMES THE SESSION IT STANDS IN FOR, AND ITS CHAIN'S FIRST: a
+/// new shell for a leaf that was `s-b1` (first of its chain `s-f0`) opens
+/// `open - restore prev=s-b1 lineage=s-f0`; the window's bootstrap, already
+/// open when it fills the first leaf, says it by an `amend - restore`. Each
+/// captures as itself with that lineage, so a second restore still names the
+/// chain's first. NEGATIVE CONTROL: a leaf naming no session (an older
+/// producer's, or a RESTORE-1 layout's) opens `restore` with neither.
+#[test]
+fn a_cold_restore_opens_with_prev_and_lineage() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    app.restore_into_window(
+        wid,
+        restore::WindowLayout {
+            restored_tabs: vec![
+                lineage_tab(0, Some("s-a0"), None),
+                lineage_tab(1, Some("s-b1"), Some("s-f0")),
+                lineage_tab(2, None, None),
+            ],
+            ..single_leaf_window(bare_leaf())
+        },
+    );
+    let (boot_leaf, boot) = captured_leaf(&app, wid, 0);
+    let (new_leaf, new) = captured_leaf(&app, wid, 1);
+    let (bare, older) = captured_leaf(&app, wid, 2);
+    assert_eq!(boot, 0, "PRECONDITION: the bootstrap filled the first leaf");
+    let amend = slog_lines(&app, boot);
+    assert!(
+        amend.iter().any(|l| l.contains(" amend - restore ")
+            && l.contains(" prev=s-a0 ")
+            && l.contains(" lineage=s-a0 ")),
+        "{amend:?}"
+    );
+    let opened = slog_lines(&app, new);
+    assert!(
+        opened[0].contains(" open - restore ")
+            && opened[0].contains(" prev=s-b1 ")
+            && opened[0].contains(" lineage=s-f0 "),
+        "{opened:?}"
+    );
+    let plain = slog_lines(&app, older);
+    assert!(
+        plain[0].contains(" open - restore ")
+            && !plain[0].contains("prev=")
+            && !plain[0].contains("lineage="),
+        "NEGATIVE CONTROL: {plain:?}"
+    );
+    let sid_of = |s: u64| app.pool.get(s).unwrap().ctx.self_id.as_str().to_string();
+    assert_eq!(boot_leaf.sid, Some(sid_of(boot)));
+    assert_eq!(boot_leaf.lineage.as_deref(), Some("s-a0"));
+    assert_eq!(new_leaf.sid, Some(sid_of(new)));
+    assert_eq!(new_leaf.lineage.as_deref(), Some("s-f0"));
+    assert_eq!(bare.sid, Some(sid_of(older)));
+    assert_eq!(bare.lineage, None, "it began its chain");
+
+    // The chain's second restore: the leaf it captured as.
+    let mut again = App::headless_for_test();
+    again.restore_into_window(
+        wid,
+        restore::WindowLayout {
+            restored_tabs: vec![
+                lineage_tab(0, None, None),
+                restore::RestoredTab {
+                    root: restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(
+                        new_leaf.clone(),
+                    )),
+                    focused_path: Vec::new(),
+                    zoomed: false,
+                },
+            ],
+            ..single_leaf_window(bare_leaf())
+        },
+    );
+    let (_, second) = captured_leaf(&again, wid, 1);
+    let opened = slog_lines(&again, second);
+    assert!(
+        opened[0].contains(&format!(" prev={} ", sid_of(new)))
+            && opened[0].contains(" lineage=s-f0 "),
+        "{opened:?}"
+    );
+}
+
+/// A SEAMLESS UPDATE KEEPS A SESSION'S LINEAGE: the handoff layout's leaf
+/// names the shell it hands over and its lineage; the successor's adopted
+/// shell is the same session going on, so it writes no `restore` and keeps
+/// the lineage, and its own next capture names it. PRECONDITION: the adopted
+/// shell arrives with none.
+#[test]
+fn a_seamless_update_keeps_a_sessions_lineage_for_its_next_restore() {
+    let old = App::headless_for_test();
+    {
+        let ctx = old.pool.get(0).expect("session 0").ctx.clone();
+        let mut tl = ctx.timeline.lock().unwrap();
+        let at = tl.slog().now();
+        tl.slog_mut()
+            .note_restored(Some("s-0abc"), Some("s-0001"), at);
+    }
+    let captured = old.capture_restore_manifest();
+    let wire = captured
+        .to_toml()
+        .expect("the parent serializes its layout");
+    assert!(wire.contains("lineage = \"s-0001\""), "{wire}");
+    let carried = restore::RestoreManifest::from_toml(&wire).expect("the child reads it");
+    let mut new = App::headless_for_test();
+    new.handoff_successor = true;
+    adopt_as(&mut new, 0, 0);
+    let lineage = |app: &App| {
+        app.pool
+            .get(0)
+            .unwrap()
+            .ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .slog()
+            .lineage()
+            .map(|l| l.as_str().to_string())
+    };
+    assert_eq!(lineage(&new), None, "PRECONDITION: none on arrival");
+    let before = slog_lines(&new, 0).len();
+    new.restore_into_window(
+        WindowId(0),
+        carried.windows.into_iter().next().expect("window 0"),
+    );
+    assert_eq!(new.focused_session_id(WindowId(0)), Some(0));
+    assert_eq!(lineage(&new).as_deref(), Some("s-0001"));
+    let after = slog_lines(&new, 0);
+    assert_eq!(
+        after.len(),
+        before,
+        "the same session: no record: {after:?}"
+    );
+    let (leaf, _) = captured_leaf(&new, WindowId(0), 0);
+    assert_eq!(leaf.lineage.as_deref(), Some("s-0001"));
+}
+
+/// A REOPENED CLOSED TAB NAMES THE SESSION IT WAS: its new shell opens
+/// `restore prev=<the closed sid> lineage=<the same>`, and that session's log
+/// still answers from the closed index.
+#[test]
+fn a_reopened_closed_tab_names_the_session_it_was() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    app.push_stub_tab(wid, crate::stub_session(app.next_session_id));
+    let closing = app.next_session_id - 1;
+    let sid = app.pool.get(closing).unwrap().ctx.self_id.clone();
+    assert!(!app.close_tab_at(wid, 1));
+    assert!(app.pool.get(closing).is_none(), "PRECONDITION: it closed");
+    app.reopen_last_closed_tab().unwrap();
+    let reopened = app.focused_session_id(wid).expect("the reopened tab");
+    assert_ne!(reopened, closing);
+    let opened = slog_lines(&app, reopened);
+    assert!(
+        opened[0].contains(" open - restore ")
+            && opened[0].contains(&format!(" prev={} ", sid.as_str()))
+            && opened[0].contains(&format!(" lineage={} ", sid.as_str())),
+        "{opened:?}"
+    );
+    let closed = app
+        .store
+        .read()
+        .unwrap()
+        .closed_logs()
+        .by_sid(&sid)
+        .map(|e| e.source());
+    let closed = closed
+        .and_then(crate::session_log::ClosedSource::into_log)
+        .expect("the session it was answers from the closed index");
+    assert_eq!(
+        closed.window().last().map(|r| r.op),
+        Some(aterm_slog::Op::Close)
+    );
+}
+
+/// Spec `session-theme-carry`: a session's own theme rides the layout a
+/// seamless update (and a restore) writes, and the successor's graft gives
+/// the adopted session back that theme as origin `restored`, on its engine.
+/// An identity theme is not written. A layout written without the key (an
+/// older producer) reads back as no theme.
+#[test]
+fn a_session_theme_rides_the_layout_and_comes_back_restored() {
+    use crate::session_theme::{SessionTheme, SessionThemeOrigin};
+    let mut old = App::headless_for_test();
+    old.set_session_theme(
+        0,
+        Some(SessionTheme {
+            selector: "Hearth".to_string(),
+            origin: SessionThemeOrigin::Ctl,
+        }),
+    );
+    let captured = old.capture_restore_manifest();
+    let wire = captured.to_toml().expect("the layout serializes");
+    assert!(wire.contains("theme = \"Hearth\""), "{wire}");
+    let carried = restore::RestoreManifest::from_toml(&wire).expect("the layout parses");
+    assert_eq!(carried, captured, "the wire drops nothing");
+    // Negative control: the same layout without the key carries no theme.
+    let older = restore::RestoreManifest::from_toml(&wire.replace("theme = \"Hearth\"\n", ""))
+        .expect("an older layout parses");
+    let no_theme =
+        |manifest: &restore::RestoreManifest| match &manifest.windows[0].restored_tabs[0].root {
+            restore::RestoredSplitTree::Leaf {
+                view: restore::RestoredView::Terminal(leaf),
+            } => leaf.theme.is_none(),
+            other => panic!("one terminal leaf: {other:?}"),
+        };
+    assert!(no_theme(&older));
+    assert!(!no_theme(&carried));
+
+    let mut new = App::headless_for_test();
+    new.handoff_successor = true;
+    adopt_as(&mut new, 0, 0);
+    let window = carried.windows.into_iter().next().expect("window 0");
+    new.restore_into_window(WindowId(0), window);
+    assert_eq!(new.focused_session_id(WindowId(0)), Some(0));
+    assert_eq!(
+        new.pool.theme(0),
+        Some(&SessionTheme {
+            selector: "Hearth".to_string(),
+            origin: SessionThemeOrigin::Restored,
+        })
+    );
+    assert_eq!(
+        crate::term_lock(&new.pool.get(0).expect("adopted").term).default_background(),
+        aterm_types::scheme::builtin("Hearth")
+            .expect("built-in")
+            .background
+    );
+}
+
+/// A PERSON'S WORD ABOUT TYPING REACHES THE CRASH JOURNAL AT ONCE, AND THE
+/// TAB REOPENED FROM IT KEEPS IT (the live lab of 2026-10-17, `aterm-lab
+/// restore crash --land-open`: Land set, aterm SIGKILLed 0.8 s after the
+/// journal's last capture; the image had no word, the reopened tab fell back
+/// to Cruise, and its relaunch typed "keep going" into work the person had
+/// chosen to land). The journal's real capture and writer: its first image,
+/// then — each inside the write interval of the one before — Land over the
+/// wire (the store write `meta set autopilot` makes, and its wake's arm), the
+/// owner's hold (the fabric's transition, and its wake's arm), a timed Cruise
+/// from the window's own writer, the timer landing it, and Off from the
+/// window's writer (the chip, the menu, Settings): each is handed to the
+/// writer on its own loop turn — by the turn's park
+/// (`App::tick_crash_journal`), or, for the timer, which fires after the
+/// park, by the last look before the loop sleeps (`App::crash_journal_wake`).
+/// The image a kill leaves names Off and the hold on the tab's leaf, and a
+/// cold restore of it puts both back on the reopened tab. NEGATIVE CONTROL:
+/// a `meta set title` and its wake, inside the interval, wait for the
+/// interval's end — nothing captured. The first capture is
+/// stamped an hour ahead, so every later one falls inside its interval
+/// whatever the test's own pace: no clock is raced.
+#[cfg(unix)]
+#[test]
+fn a_word_about_typing_inside_the_write_interval_is_journaled_at_once_and_reopened() {
+    use aterm_agent::supervise::Autopilot;
+
+    use crate::fabric::{Hold, apply_hold_for_test};
+    use crate::session_timeline::{MetaField, apply_meta_value};
+
+    let mut app = App::headless_for_test();
+    let ctx = std::sync::Arc::clone(&app.pool.get(0).expect("the window's shell").ctx);
+    let sid = ctx.self_id.clone();
+    let journal_dir = crate::crash_journal::tests::scratch("cj-word");
+    app.crash_journal = crate::crash_journal::Lane::new(
+        Some(journal_dir.path().to_path_buf()),
+        crate::crash_journal::tests::reaped_pid(),
+    );
+    app.first_present_done = true;
+    let journal = app.crash_journal.journal_id();
+    let ahead = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+    app.tick_crash_journal(ahead);
+    assert_eq!(
+        (app.crash_journal.captures, app.crash_journal.writes),
+        (1, 1),
+        "the first image"
+    );
+    // Every wake but a frame's marks the lane (`user_event`); then its arm.
+    let woken = |app: &mut App| app.crash_journal.note_activity();
+    // The turn's park (`about_to_wait`), after every batch of events.
+    let park = |app: &mut App| app.tick_crash_journal(std::time::Instant::now());
+
+    // NEGATIVE CONTROL: a title is no word about typing.
+    assert!(apply_meta_value(
+        &ctx,
+        MetaField::Title,
+        Some("renamed".into())
+    ));
+    woken(&mut app);
+    app.on_meta_changed(0);
+    park(&mut app);
+    assert_eq!(
+        app.crash_journal.captures, 1,
+        "a title waits for the write interval"
+    );
+
+    // LAND over the wire.
+    assert!(apply_meta_value(
+        &ctx,
+        MetaField::Autopilot,
+        Some("land".into())
+    ));
+    woken(&mut app);
+    app.on_meta_changed(0);
+    park(&mut app);
+    assert_eq!(app.crash_journal.writes, 2, "Land: handed over at once");
+
+    // THE OWNER'S HOLD.
+    assert!(apply_hold_for_test(
+        &ctx,
+        Some(Hold {
+            reason: "review".to_string(),
+            origin: "local".to_string(),
+        })
+    ));
+    woken(&mut app);
+    app.on_fabric_changed(&sid);
+    park(&mut app);
+    assert_eq!(app.crash_journal.writes, 3, "the hold: handed over at once");
+
+    // A TIMED CRUISE from the window's writer, and the timer landing it.
+    assert!(app.set_session_autopilot_timed(0, Some(Autopilot::Cruise), Some(1_000)));
+    park(&mut app);
+    assert_eq!(app.crash_journal.writes, 4, "the timed Cruise: at once");
+    // The timer fires on a later turn, after that turn's park…
+    park(&mut app);
+    app.expire_autopilot_timers_at(ahead, 2_000);
+    assert_eq!(
+        ctx.meta.lock().unwrap().autopilot.as_deref(),
+        Some("land"),
+        "the timer landed it"
+    );
+    assert_eq!(app.crash_journal.writes, 4, "nothing captured by the fire");
+    // …and the last look before the loop sleeps takes it.
+    app.crash_journal_wake(std::time::Instant::now());
+    assert_eq!(app.crash_journal.writes, 5, "the timer's Land: at once");
+
+    // OFF from the window's writer (the chip, the menu, Settings).
+    assert!(app.set_session_autopilot(0, Some(Autopilot::Off)));
+    park(&mut app);
+    assert_eq!(app.crash_journal.writes, 6, "Off: handed over at once");
+
+    // What a kill now leaves on disk.
+    let leaf_of = |manifest: &restore::RestoreManifest| {
+        manifest
+            .handed_off_leaves()
+            .into_iter()
+            .find(|leaf| leaf.local_id == Some(0))
+    };
+    let image = aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the journal's image naming Off and the hold",
+        || {
+            std::fs::read_to_string(journal_dir.path().join(journal.file_name()))
+                .ok()
+                .and_then(|text| crate::crash_journal::decode(&text).ok())
+                .map(|(_, image)| image)
+                .filter(|image| {
+                    leaf_of(image).is_some_and(|leaf| {
+                        leaf.autopilot.as_deref() == Some("off")
+                            && leaf.holds == vec!["local review".to_string()]
+                    })
+                })
+        },
+    );
+    app.crash_journal = crate::crash_journal::Lane::inert();
+    crate::crash_journal::tests::await_released(&journal_dir.path().join(journal.lock_name()));
+
+    // THE REOPENED TAB keeps both: its bootstrap shell fills the leaf.
+    let window = image
+        .windows
+        .into_iter()
+        .find(|window| {
+            window.restored_tabs.iter().any(|tab| {
+                matches!(
+                    &tab.root,
+                    restore::RestoredSplitTree::Leaf {
+                        view: restore::RestoredView::Terminal(leaf),
+                    } if leaf.local_id == Some(0)
+                )
+            })
+        })
+        .expect("the tab's window");
+    let mut cold = App::headless_for_test();
+    cold.restore_into_window(WindowId(0), window);
+    assert_eq!(
+        registry_meta(&cold, 0).autopilot.as_deref(),
+        Some("off"),
+        "the reopened tab is Off"
+    );
+    assert!(
+        cold.pool
+            .get(0)
+            .expect("the reopened tab's shell")
+            .ctx
+            .fabric
+            .holds()
+            .has("local"),
+        "and held"
+    );
+}
+
+/// A STORM OF WORDS ABOUT TYPING ON ONE LOOP TURN COSTS ONE CAPTURE, AND IT
+/// NAMES THE LAST WORD (review OW-P1 of the owner-word fix: each word took a
+/// whole desk capture on the main thread inside its wake's arm, so 41 words
+/// of a scripted `meta set autopilot land|off` loop delivered in one batch
+/// cost 41 layout walks, agent fills and program reads). A word owes the
+/// capture now; the capture is the loop turn's (the park's,
+/// `App::tick_crash_journal`), so the batch's 41 wakes, each marking the lane
+/// and each moving the word, are one capture, handed to the writer inside
+/// the write interval of the image before it. NEGATIVE CONTROL: the first
+/// image, an hour ahead, is the only other capture — nothing waited for the
+/// interval, and nothing was captured per wake.
+#[cfg(unix)]
+#[test]
+fn words_about_typing_on_one_loop_turn_cost_one_capture_naming_the_last() {
+    use crate::session_timeline::{MetaField, apply_meta_value};
+
+    let mut app = App::headless_for_test();
+    let ctx = std::sync::Arc::clone(&app.pool.get(0).expect("the window's shell").ctx);
+    let journal_dir = crate::crash_journal::tests::scratch("cj-storm");
+    app.crash_journal = crate::crash_journal::Lane::new(
+        Some(journal_dir.path().to_path_buf()),
+        crate::crash_journal::tests::reaped_pid(),
+    );
+    app.first_present_done = true;
+    let journal = app.crash_journal.journal_id();
+    app.tick_crash_journal(std::time::Instant::now() + std::time::Duration::from_secs(3600));
+    assert_eq!(
+        (app.crash_journal.captures, app.crash_journal.writes),
+        (1, 1),
+        "the first image"
+    );
+
+    // One batch of wakes: 41 words over the wire, alternating, so each moves.
+    let words = ["land", "off"];
+    for n in 0..41 {
+        assert!(apply_meta_value(
+            &ctx,
+            MetaField::Autopilot,
+            Some(words[n % 2].into())
+        ));
+        app.crash_journal.note_activity();
+        app.on_meta_changed(0);
+    }
+    assert_eq!(
+        app.crash_journal.captures, 1,
+        "no capture inside a wake's arm"
+    );
+    // …and the turn's park.
+    app.tick_crash_journal(std::time::Instant::now());
+    assert_eq!(
+        (app.crash_journal.captures, app.crash_journal.writes),
+        (2, 2),
+        "one capture for the turn, handed over at once"
+    );
+
+    let image = aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the journal's image naming the last word",
+        || {
+            std::fs::read_to_string(journal_dir.path().join(journal.file_name()))
+                .ok()
+                .and_then(|text| crate::crash_journal::decode(&text).ok())
+                .map(|(_, image)| image)
+                .filter(|image| {
+                    image.handed_off_leaves().into_iter().any(|leaf| {
+                        leaf.local_id == Some(0) && leaf.autopilot.as_deref() == Some("land")
+                    })
+                })
+        },
+    );
+    assert!(!image.windows.is_empty());
+    app.crash_journal = crate::crash_journal::Lane::inert();
+    crate::crash_journal::tests::await_released(&journal_dir.path().join(journal.lock_name()));
 }

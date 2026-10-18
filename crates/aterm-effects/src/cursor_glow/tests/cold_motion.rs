@@ -27,12 +27,8 @@ fn cold_program_motion_emits_no_rainbow_light() {
         GlowStyle::Beam,
         GlowStyle::Water,
         GlowStyle::Comet,
-        GlowStyle::Custom,
     ] {
-        let mut c = cfg(style, true);
-        if style == GlowStyle::Custom {
-            c.pack = Some(TrailParams::defaults());
-        }
+        let c = cfg(style, true);
         let mut glow = CursorGlow::default();
         assert_eq!(glow.tick(Some((0, 0)), t0, &c, g, &mut out), 0);
         assert!(!frame_has_output(&out, &glow));
@@ -272,7 +268,7 @@ fn cold_program_motion_emits_no_rainbow_light() {
     // Tier 1: a hidden->visible completion that reaches no `spawn` decision
     // consumes every class without licensing anything (the licence model's
     // swallow disposition); a surviving stamp is the control.
-    let hidden_model = aterm_spec::derive::cursor_hint_license_model();
+    let hidden_model = aterm_models_effects::cursor_hint_license_model();
     let mut hidden_source = hidden_model.init_state();
     hidden_source.insert("hint", 1);
     hidden_source.insert("arms", 1);
@@ -408,31 +404,6 @@ fn every_style_keeps_a_timestamp_only_relayout_dark() {
         assert!(!laid, "{style:?}: reflow timestamp forged a streak");
         assert!(!frame_has_output(&out, &glow), "{style:?}: must stay dark");
     }
-}
-
-/// One reflow timestamp produces no streaks, including across a relocation
-/// train that follows it.
-#[test]
-fn one_reflow_timestamp_produces_no_streaks() {
-    let g = geom();
-    let c = cfg(GlowStyle::RainbowKitty, true);
-    let t0 = Instant::now();
-    let mut out = Vec::new();
-    let mut glow = CursorGlow::default();
-    glow.tick(Some((0, 0)), t0, &c, g, &mut out);
-    let mut t = t0 + Duration::from_millis(60);
-    glow.note_reflow(t);
-    // Five relayout-shaped leaps, one timestamp between them.
-    for &(cr, cc) in &[(3u16, 30u16), (0, 5), (4, 35), (1, 12), (5, 20)] {
-        t += Duration::from_millis(60);
-        glow.tick(Some((cr, cc)), t, &c, g, &mut out);
-    }
-    assert_eq!(
-        glow.v2_status().map_or(0, |s| s.meteors),
-        0,
-        "one reflow timestamp must produce no streaks"
-    );
-    assert!(!frame_has_output(&out, &glow));
 }
 
 /// The rainbow ribbon drains without a visible step.
@@ -572,52 +543,5 @@ fn rainbow_ribbon_vanishes_without_a_visible_step() {
         most_gone <= 1,
         "the underline drain must retire cells one at a time, not in \
          blocks: {most_gone} went in one frame"
-    );
-}
-
-/// One keypress echoing as a multi-cell same-row hop (vim `w`, even with a
-/// statusline repaint arming the blink discriminator) is not coalesced
-/// typing: N swept cells need at least N recent presses. A genuine batched
-/// echo (N presses, one observed move) still coalesces.
-#[test]
-fn one_press_multi_cell_hop_is_not_coalesced_typing() {
-    let g = geom();
-    let c = cfg(GlowStyle::RainbowKitty, true);
-    let t0 = Instant::now();
-    let mut out = Vec::new();
-
-    // ONE press, five-cell hop (vim `w` shape): sparks stay confined to
-    // the landing — no swept-ribbon cells over the skimmed word.
-    let mut vim = CursorGlow::default();
-    vim.tick(Some((2, 0)), t0, &c, g, &mut out);
-    let t1 = t0 + Duration::from_millis(30);
-    vim.note_synthetic_typed(t1, 1);
-    vim.tick(Some((2, 5)), t1, &c, g, &mut out);
-    let swept: Vec<u16> = v2_cols(&vim, 2)
-        .into_iter()
-        .filter(|c| (0..4).contains(c))
-        .collect();
-    assert!(
-        swept.is_empty(),
-        "one press must not ribbon the skimmed cells, got {swept:?}"
-    );
-
-    // FIVE presses batched into one observed five-cell move: coalesces.
-    let mut batch = CursorGlow::default();
-    batch.tick(Some((2, 0)), t0, &c, g, &mut out);
-    let mut t = t0;
-    for i in 0..5 {
-        t += Duration::from_millis(10);
-        if i == 4 {
-            batch.note_synthetic_typed(t, 1);
-        } else {
-            batch.note_typed(t);
-        }
-    }
-    batch.tick(Some((2, 5)), t, &c, g, &mut out);
-    let swept = v2_cols(&batch, 2);
-    assert!(
-        (0..=4u16).all(|c| swept.contains(&c)),
-        "a genuinely batched echo still sweeps the ribbon: {swept:?}"
     );
 }

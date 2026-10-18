@@ -143,6 +143,10 @@ impl Parser {
                 "TLA+ FlagStateConsistent violated: apc_active set but state={:?}",
                 self.state
             );
+            // DcsStPendingInEscape: a DCS string waits on the byte after its ESC
+            // only in `Escape`, where that ESC put the parser; the next byte
+            // always clears it.
+            assert!(!self.dcs_st_pending || self.state == State::Escape);
 
             // Utf8StateConsistent: UTF-8 accumulation is gated on `Ground`.
             assert!(
@@ -189,9 +193,9 @@ impl Parser {
             // `subparam_mask`) do NOT admit a clean state coupling — `clear()`
             // resets them on sequence START but `push_current_param` does not
             // clear `last_was_colon`/`subparam_mask`, so they LEAK into `Ground`
-            // after a CSI dispatch (see `tests::invariants::
-            // assert_invariants_after_subparams`, which reaches Ground with
-            // `last_was_colon == true`). Their only invariant is `subparam_mask`'s
+            // after a CSI dispatch (`CSI 4:3 m` read a byte at a time reaches
+            // Ground with `last_was_colon == true`; the CSI fast path keeps its
+            // colon in a local). Their only invariant is `subparam_mask`'s
             // bound vs `params.len()` (the `SubparamMaskValid` conjunct above),
             // which is state-independent.
         }

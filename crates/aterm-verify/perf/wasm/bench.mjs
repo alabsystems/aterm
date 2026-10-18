@@ -2,8 +2,8 @@
 // Copyright 2026 Andrew Yates
 //
 // WASM-BENCH scenarios (E0): drive the REAL exports of the two shipped
-// renderer modules (the CPU module's glue from `verify glue`, the GPU
-// module's from wasm-bindgen) under node and report medians as one flat JSON
+// renderer modules (both modules' glue from `verify glue`) under node and
+// report medians as one flat JSON
 // line on stdout (the harness convention the perf lanes parse). Human
 // notes go to stderr. Deterministic corpora, median-of-N + warmup — the same
 // non-flake discipline as the native harnesses.

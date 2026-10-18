@@ -276,54 +276,42 @@ pub(crate) fn published() -> Option<SocketIdentity> {
 /// witness must still verify against the files ([`SocketIdentity::matches_current`]),
 /// or nothing is published and a later handoff fails closed rather than
 /// trusting a stale inode. Returns whether the witness moved.
+#[cfg(unix)]
 pub(crate) fn republish_rebound(plan: &SocketPlan, previous: (u64, u64)) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let mut slot = PUBLISHED
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(current) = slot.as_ref() else {
-            return false;
-        };
-        if (current.device, current.inode) != previous {
-            return false;
-        }
-        let Some(socket) = socket_metadata(&plan.sock_path) else {
-            return false;
-        };
-        let mut next = current.clone();
-        next.device = socket.dev();
-        next.inode = socket.ino();
-        if !next.matches_current(plan) {
-            return false;
-        }
-        *slot = Some(next);
-        true
+    use std::os::unix::fs::MetadataExt;
+    let mut slot = PUBLISHED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(current) = slot.as_ref() else {
+        return false;
+    };
+    if (current.device, current.inode) != previous {
+        return false;
     }
-    #[cfg(not(unix))]
-    {
-        let _ = (plan, previous);
-        false
+    let Some(socket) = socket_metadata(&plan.sock_path) else {
+        return false;
+    };
+    let mut next = current.clone();
+    next.device = socket.dev();
+    next.inode = socket.ino();
+    if !next.matches_current(plan) {
+        return false;
     }
+    *slot = Some(next);
+    true
 }
 
 /// Clear inherited authority, then carry only this process's bound listener.
 #[cfg(unix)]
-#[expect(
-    clippy::disallowed_types,
-    reason = "the update successor's raw Command: it hands over exactly its own descriptors, which a strip at the exec would undo"
-)]
-pub(crate) fn bind_command(command: &mut std::process::Command) {
+pub(crate) fn bind_command(command: &mut aterm_uds::spawnfd::StdCommand) {
     bind_command_identity(command, published().as_ref());
 }
 
 #[cfg(unix)]
-#[expect(
-    clippy::disallowed_types,
-    reason = "the update successor's raw Command: it hands over exactly its own descriptors, which a strip at the exec would undo"
-)]
-fn bind_command_identity(command: &mut std::process::Command, identity: Option<&SocketIdentity>) {
+fn bind_command_identity(
+    command: &mut aterm_uds::spawnfd::StdCommand,
+    identity: Option<&SocketIdentity>,
+) {
     // LaunchServices accepts merge-only environment additions. Removing a key
     // would force the fork fallback, so an explicit empty value clears inherited
     // authority while preserving the outgoing transport's process identity.
@@ -335,7 +323,7 @@ fn bind_command_identity(command: &mut std::process::Command, identity: Option<&
 
 /// [`consume_incoming_from`] over the process environment: the env-shaped entry
 /// point this module's suite drives (`handoff_env::through_process_env`).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn consume_incoming() -> Result<Option<SocketIdentity>, String> {
     crate::handoff_env::through_process_env(&[ENV_IDENTITY], consume_incoming_from)
 }

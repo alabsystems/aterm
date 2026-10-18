@@ -14,9 +14,8 @@
 //!
 //! A swizzle cannot change a type encoding (`method_setImplementation` takes no
 //! `types`; `class_replaceMethod` ignores a differing one on an existing row;
-//! `class_addMethod` refuses — `tests/swizzle.rs`), so every encoding check
-//! ([`crate::method_types`], [`crate::class_methods`], the seam census) is
-//! blind to one.
+//! `class_addMethod` refuses), so every encoding check
+//! ([`crate::method_types`], [`crate::class_methods`]) is blind to one.
 //!
 //! 1. That the swizzle happened: not provable by any encoding check.
 //! 2. Whose code the runtime will call: provable, by resolving the IMP's image
@@ -30,8 +29,7 @@
 //! The check catches every disagreement that moves a register or changes a
 //! width (return type, arity, argument size, `BOOL` versus object, struct by
 //! value versus pointer). It cannot see the class behind `"@"`, the
-//! constness behind `"^v"`, or a newtype behind `"q"`; `tests/swizzle.rs` has
-//! a passing case showing that.
+//! constness behind `"^v"`, or a newtype behind `"q"`.
 //!
 //! # Ownership
 //!
@@ -512,13 +510,6 @@ impl<F: MethodFn> SwizzleSite<F> {
         // encoding equals the one `F` derives; `F` is a pointer-wide function
         // pointer, so this reads the word back as the checked type.
         Some(unsafe { std::mem::transmute_copy::<*const c_void, F>(&raw) })
-    }
-
-    /// The address this site displaced, untyped — for identity comparison and
-    /// for `dladdr`.
-    #[must_use]
-    pub fn original_imp(&self) -> Option<Imp> {
-        self.claim().map(|c| c.original)
     }
 
     /// The row this site is installed on (the class the implementation lives

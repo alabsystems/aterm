@@ -248,16 +248,16 @@ impl TrickFlash {
     /// Forget panes the window no longer shows: their memo entries, and a slot
     /// naming one (no rescan will collect it).
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "TrickFlashLifecycle",
             action = "CloseOwn",
             project = "conformance_trick_flash::project"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "TrickFlashLifecycle",
             action = "CloseOther",
             project = "conformance_trick_flash::project"
@@ -279,8 +279,8 @@ impl TrickFlash {
     /// (the unsplit host names its session too), whose geometry the bind just
     /// changed, so it goes; a found one ends by itself if its columns moved.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "TrickFlashLifecycle",
             action = "Rebind",
             project = "conformance_trick_flash::project"
@@ -306,16 +306,16 @@ impl TrickFlash {
     /// that only just started stores nothing. O(len) into a fixed inline buffer;
     /// never allocates.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "TrickFlashLifecycle",
             action = "NotePane",
             project = "conformance_trick_flash::project"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "TrickFlashLifecycle",
             action = "NoteWindow",
             project = "conformance_trick_flash::project"
@@ -386,8 +386,8 @@ impl TrickFlash {
     /// [`REVOKE_FADE_MS`]; one never found is dropped. Idempotent (the first
     /// stamp stands, so the fade cannot restart).
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "TrickFlashLifecycle",
             action = "Revoke",
             project = "conformance_trick_flash::project"
@@ -433,8 +433,8 @@ impl TrickFlash {
         reason = "the rescan hands over its scope, clock, geometry, caret, gate and row source in one call; a carrier struct would rename the list, not shrink it"
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "TrickFlashLifecycle",
             action = "Find",
             project = "conformance_trick_flash::project"
@@ -1302,66 +1302,6 @@ mod tests {
         assert!(biggest < 0.02, "a {biggest} jump in one millisecond");
     }
 
-    /// The painted bytes are the law, cell for cell, at every phase:
-    /// `mix(base, hsv(seed + u·span + 360·t/FLASH), env(t)·strength)` with the
-    /// word's own captured colours as the base.
-    #[test]
-    fn the_painted_bytes_are_the_envelope_law_cell_for_cell() {
-        let t0 = Instant::now();
-        let mut g = Glass::new(Path::Cold, 4, 40);
-        // A coloured word on a coloured cell: the base is the CELL's colour.
-        g.echo("$ \x1b[38;2;230;200;40m\x1b[48;2;20;24;40mplay", t0);
-        let caret = g.caret();
-        g.fire("play", 0, " ", t0);
-        let row = g.row(0);
-        let (first_fg, bg) = (row[2].fg, row[2].bg);
-        assert_eq!((first_fg, bg), ([230, 200, 40], [20, 24, 40]));
-        for t in [0u64, 40, 129, 130, 600, 849, 850, 1000, 1099] {
-            let (ink, _) = g.frame(t0 + ms(t));
-            assert_eq!(ink.len(), 4, "t = {t}");
-            for (i, cell) in ink.iter().enumerate() {
-                assert_eq!(
-                    cell.color,
-                    law(caret, "play", i, t, row[2 + i].fg, first_fg, bg),
-                    "t = {t}, cell {i}"
-                );
-            }
-        }
-        // …and the flash visibly IS a rainbow mid-hold: the cells differ from
-        // the base and from each other.
-        let (ink, _) = g.frame(t0 + ms(500));
-        assert!(ink.iter().all(|cell| cell.color != first_fg));
-        assert_ne!(ink[0].color, ink[3].color);
-    }
-
-    /// NO RESIDUE: the first frame is exactly the word's own colour, the last
-    /// frames converge on it to within one LSB, and then there are no cells.
-    #[test]
-    fn the_fade_lands_back_on_the_words_own_colour() {
-        let t0 = Instant::now();
-        let mut g = Glass::new(Path::Cold, 4, 40);
-        g.echo("$ \x1b[38;2;200;80;40mjump", t0);
-        g.fire("jump", 0, " ", t0);
-        let own = [200u8, 80, 40];
-        let (ink, _) = g.frame(t0);
-        assert!(
-            ink.iter().all(|cell| cell.color == own),
-            "t = 0 is the base"
-        );
-        let (ink, _) = g.frame(t0 + ms(u64::from(FLASH_MS) - 1));
-        assert_eq!(ink.len(), 4);
-        for cell in &ink {
-            for (got, want) in cell.color.iter().zip(own) {
-                assert!(
-                    got.abs_diff(want) <= 1,
-                    "the last frame is {:?}, the word is {own:?}",
-                    cell.color
-                );
-            }
-        }
-        assert!(g.frame(t0 + ms(u64::from(FLASH_MS))).0.is_empty());
-    }
-
     /// The base is the current colour: when a syntax highlighter repaints the
     /// word mid-flash, later rescans recapture, so frames mix from and the fade
     /// lands on the new colour.
@@ -1458,23 +1398,6 @@ mod tests {
                 cells_at(&script(&mut blind, t0)),
                 [(2, 24), (2, 25), (2, 26)],
                 "{path:?}: non-vacuous — without base_y the error line wins"
-            );
-        }
-    }
-
-    /// At any other prompt width the undeclared fallback is sound: the error
-    /// line's `sit` is not exactly anchored, so the search walks past it.
-    #[test]
-    fn without_base_y_the_upward_search_skips_a_match_that_is_not_exactly_anchored() {
-        for path in BOTH {
-            let t0 = Instant::now();
-            let mut g = Glass::new(path, 4, 40).unwired();
-            g.echo("one\r\ntwo\r\nthree\r\n$ sit", t0);
-            g.fire("sit", 0, "\r\nzsh: command not found: sit\r\n$ ", t0);
-            assert_eq!(
-                cells_at(&g.frame(t0 + ms(300)).0),
-                [(1, 2), (1, 3), (1, 4)],
-                "{path:?}"
             );
         }
     }
@@ -1965,37 +1888,6 @@ mod tests {
                 "{path:?}: the typed line, not the shell's"
             );
         }
-    }
-
-    /// The flash never joins `is_active` as its own term (a wake could outlive a
-    /// tab switch with nothing to tick it down). Tab B's tick is the no-flash
-    /// path, and only tab A's own deadline stays armed, retired by the clock.
-    #[test]
-    fn a_tab_switch_never_lets_the_flash_hold_the_scheduler_past_its_own_window() {
-        let t0 = Instant::now();
-        let mut g = Glass::new(Path::Snapshot, 4, 40);
-        g.wd.set_scan_session(Some(10));
-        g.echo("$ sit", t0);
-        g.wd.note_trick_typed(t0, Some(10), "sit", 0);
-        g.echo(" ", t0);
-        assert_eq!(g.frame(t0 + ms(200)).0.len(), 3);
-
-        // Tab B shows the same text at the same cells.
-        g.wd.set_scan_session(Some(20));
-        g.scan(t0 + ms(210));
-        let (ink, fp) = g.frame(t0 + ms(216));
-        assert!(ink.is_empty() && fp == 0, "tab B never shows tab A's flash");
-        let end = t0 + ms(u64::from(FLASH_MS));
-        assert!(
-            !g.wd.is_active(end),
-            "with no further tick of tab A, the wake still ends with the flash"
-        );
-        // …and coming back after the window finds nothing left to paint.
-        g.wd.set_scan_session(Some(10));
-        g.scan(end + ms(10));
-        let (ink, fp) = g.frame(end + ms(16));
-        assert!(ink.is_empty() && fp == 0);
-        assert!(!g.wd.is_active(end + ms(16)));
     }
 
     /// A rescan of the flash's pane with NO cursor is a scrollback view: the

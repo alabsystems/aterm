@@ -7,9 +7,10 @@
 //! content, so keystrokes (even the caret's own protection halo) cannot flip
 //! it at the key rate. These tests measure a real `Terminal` snapshot stream:
 //! blackout frames, on->off cuts, and the largest single-frame opacity drop
-//! (which separates a fade from a cut). The guard remains: a protected surface
-//! must still take the pet to zero, and ordinary ink moves the resident behind
-//! the glyphs rather than switching it off.
+//! (which separates a fade from a cut). The guard that remains (a protected
+//! surface still takes the pet to zero; ordinary ink moves the resident behind
+//! the glyphs) is pinned in `console_hidden_cursor_coverage.rs` and
+//! `console_life_geometry.rs`.
 
 use std::time::{Duration, Instant};
 
@@ -46,11 +47,10 @@ struct Fixture {
     world: PetWorld,
     term: Terminal,
     now: Instant,
-    presentable: bool,
 }
 
 impl Fixture {
-    fn new(presentable: bool) -> Self {
+    fn new() -> Self {
         let mut term = Terminal::new(ROWS, COLS);
         // Match a presented host: an unresolved COLOR_UNSET default cannot
         // certify a blank sprite footprint even on an empty terminal.
@@ -60,7 +60,6 @@ impl Fixture {
             world: PetWorld::default(),
             term,
             now: Instant::now(),
-            presentable,
         }
     }
 
@@ -78,7 +77,7 @@ impl Fixture {
         self.brain
             .observe_console(&input, &facts, PetPane::full(&input));
         self.world.observe(&input, &facts, PetPane::full(&input));
-        self.brain.set_console_presentable(self.presentable);
+        self.brain.set_console_presentable(true);
         let cursor = self.term.cursor();
         self.brain.tick(PetSense {
             caret_drawn: true,
@@ -144,7 +143,7 @@ impl Strobe {
 /// on screen so the pet starts from a settled station.
 #[test]
 fn typing_never_blanks_the_pet() {
-    let mut f = Fixture::new(true);
+    let mut f = Fixture::new();
     f.term.process(b"$ ");
     f.settle();
     let mut strobe = Strobe::default();
@@ -168,7 +167,7 @@ fn typing_never_blanks_the_pet() {
 /// a blank line with no ink near the sprite, so no frame may be blank.
 #[test]
 fn the_caret_alone_never_blanks_its_escort() {
-    let mut f = Fixture::new(true);
+    let mut f = Fixture::new();
     f.settle();
     let mut strobe = Strobe::default();
     let mut prev = f.tick(16).alpha;
@@ -194,7 +193,7 @@ fn the_caret_alone_never_blanks_its_escort() {
 /// legitimate; reaching it by a cut, or blanking over blank cells, is not.
 #[test]
 fn an_output_burst_yields_by_fading_never_by_cutting() {
-    let mut f = Fixture::new(true);
+    let mut f = Fixture::new();
     f.settle();
     let mut strobe = Strobe::default();
     let mut prev = f.tick(16).alpha;
@@ -221,76 +220,4 @@ fn an_output_burst_yields_by_fading_never_by_cutting() {
         strobe.blank_over_nothing, 0,
         "the pet is blanked with no glyph under it: {strobe:?}"
     );
-}
-
-/// The veto's reason to exist: ordinary ink in front of the body is a z-order
-/// fact (the resident stays whole and renders under the glyphs,
-/// `PetFrame::under_ink`; see `console_cursor_home.rs`'s
-/// `ordinary_dense_output_does_not_make_an_idle_resident_blink_out`). A held
-/// verdict never licenses painting in front of the user's text, and a
-/// protected surface (a full-screen selection) still takes the pet to zero.
-#[test]
-fn a_full_screen_of_text_goes_under_the_ink_and_a_protected_one_still_yields() {
-    use aterm_core::selection::{SelectionSide, SelectionType};
-
-    let mut f = Fixture::new(true);
-    f.settle();
-    let mut fill = Vec::new();
-    for row in 1..=ROWS {
-        fill.extend_from_slice(format!("\x1b[{row};1H").as_bytes());
-        fill.extend(std::iter::repeat_n(b'#', COLS as usize));
-    }
-    fill.extend_from_slice(b"\x1b[12;40H");
-    f.term.process(&fill);
-    let mut last = f.tick(16);
-    for _ in 0..89 {
-        last = f.tick(16);
-    }
-    assert!(
-        last.alpha > 0,
-        "ordinary ink is a z-order fact: the resident stays whole"
-    );
-    assert!(
-        last.under_ink,
-        "…and it may never be painted IN FRONT of the user's text"
-    );
-
-    // A PROTECTED surface is the other half, and it still yields to zero.
-    f.term
-        .text_selection_mut()
-        .start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
-    f.term.text_selection_mut().update_selection(
-        i32::from(ROWS - 1),
-        COLS - 1,
-        SelectionSide::Right,
-    );
-    let mut last = 255;
-    for _ in 0..90 {
-        last = f.tick(16).alpha;
-    }
-    assert_eq!(
-        last, 0,
-        "the pet must not stand on a completely selected screen"
-    );
-}
-
-/// The console-life gate is the only difference between these two runs, and
-/// with it OFF there is no veto at all — the control for every number above.
-#[test]
-fn the_gate_is_the_only_difference() {
-    let mut off = Fixture::new(false);
-    off.term.process(b"$ ");
-    off.settle();
-    let mut frames = 0;
-    let mut blackouts = 0;
-    for ch in b"the quick brown fox jumps over the lazy dog" {
-        off.brain.note_console_input(off.now, PetInputKind::Text);
-        off.term.process(&[*ch]);
-        for _ in 0..8 {
-            frames += 1;
-            blackouts += usize::from(off.tick(16).alpha == 0);
-        }
-    }
-    println!("gate OFF: frames={frames} blackouts={blackouts}");
-    assert_eq!(blackouts, 0, "control run must never blank");
 }

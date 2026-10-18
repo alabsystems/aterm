@@ -196,11 +196,76 @@ pub const fn settle_due(since_mono: u64, now_mono: u64) -> bool {
     now_mono >= since_mono.saturating_add(SETTLE_MS)
 }
 
-/// Whether an input at `input_mono` is recent enough at `now_mono` to be
-/// the opening turn's `by=` (§2.5).
+/// Whether an input at `input` is recent enough at `now` to be the opening
+/// turn's `by=` (§2.5), by BOTH clocks: in one process they agree, and a
+/// stamp carried across a seamless update keeps its wall time while its
+/// monotonic one can only be clamped to the successor's clock start (which
+/// would make an old input look recent). A wall clock stepped forward fails
+/// closed; one stepped back leaves the monotonic clock to decide.
 #[must_use]
-pub const fn attributes(input_mono: u64, now_mono: u64) -> bool {
-    now_mono >= input_mono && now_mono - input_mono <= ATTRIBUTION_MS
+pub const fn attributes(input: Stamp, now: Stamp) -> bool {
+    now.mono_ms >= input.mono_ms
+        && now.mono_ms - input.mono_ms <= ATTRIBUTION_MS
+        && now.wall_ms.saturating_sub(input.wall_ms) <= ATTRIBUTION_MS
+}
+
+/// `s`, read in another process, on this process's clocks at `now`: its
+/// wall time kept, its monotonic time moved by the wall age (clamped to this
+/// clock's start; a settle so moved comes due later, never earlier, and an
+/// attribution is judged by the wall too, [`attributes`]).
+#[must_use]
+pub const fn rebase(wall_ms: u64, now: Stamp) -> Stamp {
+    Stamp::new(
+        wall_ms,
+        now.mono_ms
+            .saturating_sub(now.wall_ms.saturating_sub(wall_ms)),
+    )
+}
+
+/// A screen step's carry word.
+const fn screen_step_word(w: ScreenStep) -> &'static str {
+    match w {
+        ScreenStep::Approval(_) => "approval",
+        ScreenStep::Question => "question",
+        ScreenStep::Wall(_) => "wall",
+        ScreenStep::Stall => "stall",
+        ScreenStep::Survey => "survey",
+    }
+}
+
+impl Settle {
+    /// Whether it is due at `now_mono`: [`settle_due`] of its `since` in one
+    /// process, the wall clock's deadline for a carried one.
+    const fn is_due(self, now_mono: u64) -> bool {
+        now_mono >= self.due_mono
+    }
+
+    /// How long its resting word has held at `now_mono`.
+    const fn held(self, now_mono: u64) -> u64 {
+        now_mono
+            .saturating_sub(self.due_mono.saturating_sub(SETTLE_MS))
+            .saturating_add(self.prior_ms)
+    }
+}
+
+/// A settle cause's carry word: its resting word.
+const fn settle_word(c: SettleCause) -> &'static str {
+    match c {
+        SettleCause::Idle => "idle",
+        SettleCause::Question => "question",
+        SettleCause::Wall(k) => k.wire(),
+        SettleCause::Survey => "survey",
+    }
+}
+
+fn settle_from_word(w: &str) -> Option<SettleCause> {
+    match w {
+        "idle" => Some(SettleCause::Idle),
+        "question" => Some(SettleCause::Question),
+        "survey" => Some(SettleCause::Survey),
+        w if w.starts_with("wall:") => WallKind::from_name(w).map(SettleCause::Wall),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -217,6 +282,15 @@ struct Held {
 struct Settle {
     since: Stamp,
     cause: SettleCause,
+    /// Elapsed time not represented by the deadline's local origin: before
+    /// monotonic zero, or older than a deadline already due at adoption.
+    /// Zero for a local settle or a carried future origin.
+    prior_ms: u64,
+    /// When it comes due, on this process's monotonic clock: `since` plus
+    /// [`SETTLE_MS`] ([`settle_due`]), or, for a settle carried across an
+    /// update, when the wall clock says it does (its `since` is another
+    /// process's, its monotonic part clamped).
+    due_mono: u64,
 }
 
 /// How the tracker's last turn closed.
@@ -259,11 +333,14 @@ pub struct TurnTracker {
     word: Verdict,
     settle: Option<Settle>,
     interrupted: bool,
-    /// A `ctl turn`'s ledger id, its sender and when it arrived: it labels
-    /// the next turn only when that turn opens within [`ATTRIBUTION_MS`]
-    /// and is attributed to the same sender.
-    pending_ledger: Option<(u64, Actor, u64)>,
-    last_input: Option<(Actor, u64)>,
+    /// A `ctl turn`'s ledger id, its sender, when it arrived and what it
+    /// said it acted on (`cause=`): it labels the next turn only when that
+    /// turn opens within [`ATTRIBUTION_MS`] and is attributed to the same
+    /// sender.
+    pending_ledger: Option<(u64, Actor, Stamp, Option<ShortId>)>,
+    /// The latest input: its sender, when it came, and the mail or record it
+    /// said it acted on (`cause=`, phase 3A), which the turn it opens names.
+    last_input: Option<(Actor, Stamp, Option<ShortId>)>,
     last_close: Option<LastClose>,
 }
 
@@ -299,8 +376,7 @@ impl TurnTracker {
     /// The monotonic time the tracker wants [`TurnTracker::tick`] at, if any.
     #[must_use]
     pub fn wake_at(&self) -> Option<u64> {
-        self.settle
-            .map(|s| s.since.mono_ms.saturating_add(SETTLE_MS))
+        self.settle.map(|s| s.due_mono)
     }
 
     /// The published verdict moved to `v` (with its detail: a wall's reset,
@@ -406,10 +482,18 @@ impl TurnTracker {
     /// [`ATTRIBUTION_MS`] is attributed to it. Input from anyone else drops
     /// a pending `ctl turn` ledger: the turn it opens is not that exchange.
     pub fn note_input(&mut self, by: Actor, at: Stamp) {
-        if self.pending_ledger.is_some_and(|(_, who, _)| who != by) {
+        self.note_input_caused(by, None, at);
+    }
+
+    /// [`Self::note_input`] of input that said what it acted on (`cause=@<off>`
+    /// for mail, `cause=<seq>` for a record, validated by the host): a turn it
+    /// opens carries `cause=` and `cause_k=`. Input from anyone after it
+    /// takes the turn without the cause.
+    pub fn note_input_caused(&mut self, by: Actor, cause: Option<ShortId>, at: Stamp) {
+        if self.pending_ledger.is_some_and(|(_, who, ..)| who != by) {
             self.pending_ledger = None;
         }
-        self.last_input = Some((by, at.mono_ms));
+        self.last_input = Some((by, at, cause));
     }
 
     /// A `ctl turn` exchange (`ledger` is its `TurnLedger` id) from `by`:
@@ -419,13 +503,26 @@ impl TurnTracker {
     /// with its settle's outcome, dated when it came to rest. Returns when
     /// to tick.
     pub fn ctl_turn(&mut self, log: &mut Log, by: Actor, ledger: u64, at: Stamp) -> Option<u64> {
+        self.ctl_turn_caused(log, by, ledger, None, at)
+    }
+
+    /// [`Self::ctl_turn`] of an exchange that said what it acted on
+    /// (`turn cause=`): the turn it opens carries `cause=` too.
+    pub fn ctl_turn_caused(
+        &mut self,
+        log: &mut Log,
+        by: Actor,
+        ledger: u64,
+        cause: Option<ShortId>,
+        at: Stamp,
+    ) -> Option<u64> {
         self.resync(log);
         self.settle_if_due(log, at);
         if let Some(s) = self.settle {
             self.settle_now(log, s, at, true);
         }
-        self.note_input(by, at);
-        self.pending_ledger = Some((ledger, by, at.mono_ms));
+        self.note_input_caused(by, cause, at);
+        self.pending_ledger = Some((ledger, by, at, cause));
         self.wake_at()
     }
 
@@ -436,11 +533,207 @@ impl TurnTracker {
             turn: self.turn,
             step: self.step.as_ref().map(|h| (h.node, h.what, h.under_turn)),
             word: self.word,
-            settle: self
-                .settle
-                .map(|s| (s.cause, now_mono.saturating_sub(s.since.mono_ms))),
+            settle: self.settle.map(|s| (s.cause, s.held(now_mono))),
             last_close: self.last_close,
         }
+    }
+
+    // ---- the seamless carry ------------------------------------------
+
+    /// The tracker as one carry line (design §5.2, phase 2A): its run, turn
+    /// and screen step, the current word, an armed settle (its cause and the
+    /// wall time its word first held), whether the turn was interrupted, and
+    /// a pending `ctl turn` ledger and the last input, each with its wall
+    /// time. An input or ledger older than [`ATTRIBUTION_MS`] at `now` is
+    /// left out: it can attribute nothing any more. The last close (a
+    /// view's) does not cross.
+    #[must_use]
+    pub fn carry_line(&self, now: Stamp) -> String {
+        let mut s = format!(
+            "tracker run={} turn={} word={} interrupted={}",
+            self.run,
+            self.turn
+                .map_or_else(|| "none".to_string(), |t| t.to_string()),
+            self.word.word(),
+            u8::from(self.interrupted)
+        );
+        if let Verdict::Prompt(b) = self.word {
+            s.push_str(" box=");
+            s.push_str(b.word());
+        }
+        if let Some(h) = &self.step {
+            s.push_str(&format!(
+                " step={} step_under={} step_what={}",
+                h.node,
+                u8::from(h.under_turn),
+                screen_step_word(h.what)
+            ));
+            match h.what {
+                ScreenStep::Approval(b) => {
+                    s.push_str(" step_box=");
+                    s.push_str(b.word());
+                }
+                ScreenStep::Wall(k) => {
+                    s.push_str(" step_wall=");
+                    s.push_str(k.name());
+                }
+                _ => {}
+            }
+            // As the step's own `detail=` field holds it (a token of at most
+            // its key's bytes), so the line stays within a carry line's bound
+            // whatever the screen said, and a step it continues writes the
+            // same field.
+            if let Some(d) = h
+                .detail
+                .as_deref()
+                .and_then(|d| crate::field::BoundedToken::new(Key::Detail, d))
+            {
+                s.push_str(" step_detail=");
+                aterm_codec::pct::encode_into(&mut s, d.as_str());
+            }
+        }
+        if let Some(st) = self.settle {
+            s.push_str(&format!(
+                " settle={} settle_wall={}",
+                settle_word(st.cause),
+                st.since.wall_ms
+            ));
+        }
+        if let Some((id, by, at, cause)) = self
+            .pending_ledger
+            .filter(|(_, _, t, _)| attributes(*t, now))
+        {
+            s.push_str(&format!(
+                " ledger={id} ledger_by={} ledger_wall={}",
+                by.word(),
+                at.wall_ms
+            ));
+            if let Some(c) = cause {
+                s.push_str(&format!(" ledger_cause={c}"));
+            }
+        }
+        if let Some((by, at, cause)) = self.last_input.filter(|(_, t, _)| attributes(*t, now)) {
+            s.push_str(&format!(
+                " input_by={} input_wall={}",
+                by.word(),
+                at.wall_ms
+            ));
+            if let Some(c) = cause {
+                s.push_str(&format!(" input_cause={c}"));
+            }
+        }
+        s
+    }
+
+    /// The tracker a [`TurnTracker::carry_line`] wrote, on this process's
+    /// clocks at `now` ([`rebase`]): `None` for a line this build does not
+    /// read. An input or ledger older than [`ATTRIBUTION_MS`] by the wall
+    /// clock at `now` is dropped (fail closed: it attributes nothing).
+    #[must_use]
+    pub fn from_carry_line(line: &str, now: Stamp) -> Option<TurnTracker> {
+        let mut toks = line.split(' ').filter(|t| !t.is_empty());
+        if toks.next() != Some("tracker") {
+            return None;
+        }
+        let kv: Vec<(&str, &str)> = toks.filter_map(|t| t.split_once('=')).collect();
+        let get = |k: &str| kv.iter().find(|(key, _)| *key == k).map(|(_, v)| *v);
+        let wall = |k: &str| get(k).and_then(|v| v.parse::<u64>().ok());
+        let run = Node::parse(get("run")?).filter(|n| n.lvl == crate::vocab::Lvl::Run)?;
+        let turn = match get("turn")? {
+            "none" => None,
+            t => Some(Node::parse(t).filter(|n| n.lvl == crate::vocab::Lvl::Turn)?),
+        };
+        let word = match get("word")? {
+            "prompt" => Verdict::Prompt(BoxWord::from_wire(get("box")?)),
+            w => Verdict::from_agent_word(w, None),
+        };
+        let interrupted = match get("interrupted")? {
+            "0" => false,
+            "1" => true,
+            _ => return None,
+        };
+        let step = match get("step") {
+            None => None,
+            Some(n) => {
+                let node = Node::parse(n).filter(|n| n.lvl == crate::vocab::Lvl::Step)?;
+                let what = match get("step_what")? {
+                    "approval" => ScreenStep::Approval(BoxWord::from_wire(get("step_box")?)),
+                    "question" => ScreenStep::Question,
+                    "wall" => ScreenStep::Wall(WallKind::from_name(get("step_wall")?)?),
+                    "stall" => ScreenStep::Stall,
+                    "survey" => ScreenStep::Survey,
+                    _ => return None,
+                };
+                let under_turn = match get("step_under")? {
+                    "0" => false,
+                    "1" => true,
+                    _ => return None,
+                };
+                let detail = get("step_detail").map(aterm_codec::pct::decode);
+                Some(Held {
+                    node,
+                    what,
+                    under_turn,
+                    detail,
+                })
+            }
+        };
+        let settle = match get("settle") {
+            None => None,
+            Some(c) => {
+                let w = wall("settle_wall")?;
+                let due_mono = now
+                    .mono_ms
+                    .saturating_add(w.saturating_add(SETTLE_MS).saturating_sub(now.wall_ms));
+                let represented = now
+                    .mono_ms
+                    .saturating_sub(due_mono.saturating_sub(SETTLE_MS));
+                Some(Settle {
+                    since: rebase(w, now),
+                    cause: settle_from_word(c)?,
+                    prior_ms: now.wall_ms.saturating_sub(w).saturating_sub(represented),
+                    due_mono,
+                })
+            }
+        };
+        let fresh = |w: u64| now.wall_ms.saturating_sub(w) <= ATTRIBUTION_MS;
+        // A cause is additive (phase 3A): absent on a 2A line; one that does
+        // not read as an id refuses the line, as any malformed value does.
+        let cause = |k: &str| -> Option<Option<ShortId>> {
+            match get(k) {
+                None => Some(None),
+                Some(c) => ShortId::new(c).map(Some),
+            }
+        };
+        let pending_ledger = match get("ledger") {
+            None => None,
+            Some(id) => {
+                let id: u64 = id.parse().ok()?;
+                let by = Actor::from_word(get("ledger_by")?);
+                let w = wall("ledger_wall")?;
+                let c = cause("ledger_cause")?;
+                fresh(w).then(|| (id, by, rebase(w, now), c))
+            }
+        };
+        let last_input = match get("input_by") {
+            None => None,
+            Some(by) => {
+                let w = wall("input_wall")?;
+                let c = cause("input_cause")?;
+                fresh(w).then(|| (Actor::from_word(by), rebase(w, now), c))
+            }
+        };
+        Some(TurnTracker {
+            run,
+            turn,
+            step,
+            word,
+            settle,
+            interrupted,
+            pending_ledger,
+            last_input,
+            last_close: None,
+        })
     }
 
     // ---- internals ---------------------------------------------------
@@ -459,13 +752,21 @@ impl TurnTracker {
     }
 
     fn arm(&mut self, cause: SettleCause, at: Stamp) {
-        self.settle = Some(Settle { since: at, cause });
+        // THE settle rule: due once `settle_due(since, now)` holds.
+        let due_mono = at.mono_ms.saturating_add(SETTLE_MS);
+        debug_assert!(settle_due(at.mono_ms, due_mono) && !settle_due(at.mono_ms, due_mono - 1));
+        self.settle = Some(Settle {
+            since: at,
+            cause,
+            prior_ms: 0,
+            due_mono,
+        });
     }
 
     /// Apply the armed settle when it is due at `at` ([`settle_due`]).
     fn settle_if_due(&mut self, log: &mut Log, at: Stamp) {
         if let Some(s) = self.settle
-            && settle_due(s.since.mono_ms, at.mono_ms)
+            && s.is_due(at.mono_ms)
         {
             self.settle_now(log, s, at, false);
         }
@@ -485,7 +786,7 @@ impl TurnTracker {
             .as_ref()
             .filter(|h| matches!(h.what, ScreenStep::Wall(_)))
             .map(|h| (h.node, h.detail.clone()));
-        let held = now.mono_ms.saturating_sub(s.since.mono_ms);
+        let held = s.held(now.mono_ms);
         self.close_turn(log, out, conf, Some(held), ctl, s.since);
         if let SettleCause::Wall(k) = s.cause {
             let (cont, detail) = wall.map_or((None, None), |(n, d)| (Some(n), d));
@@ -497,19 +798,24 @@ impl TurnTracker {
         if self.turn.is_some() {
             return;
         }
-        let by = self
-            .last_input
-            .filter(|(_, t)| attributes(*t, at.mono_ms))
-            .map_or(Actor::Nobody, |(a, _)| a);
+        let attributed = self.last_input.filter(|(_, t, _)| attributes(*t, at));
+        let by = attributed.map_or(Actor::Nobody, |(a, ..)| a);
         // A ledger labels only the turn its exchange opened: recent, and
         // attributed to its sender.
         let ledger = self
             .pending_ledger
-            .filter(|(_, who, t)| *who == by && attributes(*t, at.mono_ms))
+            .filter(|(_, who, t, _)| *who == by && attributes(*t, at))
             .map(|(l, ..)| l);
         let mut f = Fields::new();
         if let Some(ledger) = ledger {
             let _ = f.set(Key::Ledger, Val::U(ledger));
+        }
+        // The attributed input's `cause=` (phase 3A): the turn names the mail
+        // or record its opening input said it acted on.
+        if let Some(c) = attributed.and_then(|(.., c)| c)
+            && let Ok(caused) = f.clone().cause(c.as_str())
+        {
+            f = caused;
         }
         let open = Open::new(Kind::Turn, Src::Screen, conf)
             .under(self.run)

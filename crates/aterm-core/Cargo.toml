@@ -15,31 +15,18 @@ description = "aterm — lean, headless VT terminal engine core"
 autotests = false
 
 [features]
-default = ["disk-tier"]
-# Disk-backed scrollback cold tier, forwarded to aterm-grid and aterm-scrollback.
-# A wasm consumer disables it (--no-default-features) to drop libc.
-disk-tier = ["aterm-grid/disk-tier", "aterm-scrollback/disk-tier"]
 # Serde on the CheckpointMeta seam (seamless-update screen carry): derives on the
 # checkpoint's scalar projections only — grid bodies stay on the binary Line codec.
 serde = ["dep:serde", "aterm-types/serde"]
-# Heavyweight stress/stability tests (tests/stress_stability.rs).
-long-tests = []
-# UAX #9 BiDi visual reordering (terminal/bidi_reorder.rs):
-# `Terminal::bidi_visual_order`. Applying the permutation is the renderer's job.
-bidi = ["dep:aterm-bidi"]
-# Compile the `#[refines]`/`#[spec_unmodeled]` anchors into the library so
-# aterm-gui's `spec_xref_closure` test can collect them via `aterm_spec::registry`. Off in
-# production: no `aterm-spec` in the closure.
-spec-anchors = ["dep:aterm-spec"]
-# Sixel graphics: decode a sixel DCS into an inline image (the OSC 1337 `File=`
-# placement path) and advertise DA1 code 4. Without it sixel DCS is consumed and
-# dropped.
-sixel = ["dep:aterm-sixel"]
+# Sixel decoding is always on. The empty feature stays because orca-alab's
+# orca-terminal still asks for `features = ["sixel"]`, which cargo refuses on a
+# crate that does not declare it.
+sixel = []
 
 [dependencies]
-# Library dependency only under `spec-anchors` (the anchors emit
-# `::aterm_spec::registry::submit!`).
-aterm-spec = { workspace = true, optional = true }
+# The anchor attributes' registry (std-only): `#[cfg_attr(any(test, debug_assertions),
+# aterm_spec_anchor::refines(…))]` expands in every test and debug build; release strips it.
+aterm-spec-anchor = { workspace = true }
 aterm-log = { workspace = true }
 aterm-hash = { workspace = true }
 aterm-codec = { workspace = true }
@@ -48,29 +35,37 @@ aterm-codec = { workspace = true }
 # frames, which composes pixels.
 aterm-png = { workspace = true }
 aterm-types = { workspace = true }
+# The one dark/light classifier (`aterm_messages::ink::bg_is_light`), which the
+# reported colour scheme (DSR 996 / mode 2031) shares with the chrome.
+# aterm-messages depends only on aterm-time, so this adds no cycle and stays
+# wasm-clean.
+aterm-messages = { workspace = true }
 serde = { workspace = true, optional = true, features = ["derive"] }
 aterm-provenance = { workspace = true }
 aterm-grapheme = { workspace = true }
-# Path, not `workspace = true`, so default-features = false stays local; this
-# crate's `disk-tier` default re-enables it.
-aterm-grid = { path = "../aterm-grid", default-features = false, features = ["alacritty-compat"] }
+aterm-grid = { workspace = true }
 aterm-parser = { workspace = true }
 aterm-scrollback = { workspace = true }
 aterm-policy = { workspace = true }
-aterm-vi = { workspace = true }
 aterm-selection = { workspace = true }
 aterm-search = { workspace = true }
 aterm-shell-integration = { workspace = true }
 # Clock seam: std::time on native, the JS clock on wasm32 (where std's panics).
 aterm-time = { workspace = true }
-aterm-bidi = { workspace = true, optional = true }
-# No self dev-dependency enables `sixel`: cargo cannot turn a dev-dependency's
-# feature off, so the default no-sixel engine would go untested. aterm-conformance
-# builds it and mounts tests/fuzz_process_never_panics/fresh.rs in its `vt` suite.
-aterm-sixel = { workspace = true, optional = true }
+# UAX #9 BiDi visual reordering (terminal/bidi_reorder.rs):
+# `Terminal::bidi_visual_order_cells`. Applying the permutation is the renderer's job.
+aterm-bidi = { workspace = true }
+# Sixel graphics: decode a sixel DCS into an inline image (the OSC 1337 `File=`
+# placement path); DA1 advertises code 4.
+aterm-sixel = { workspace = true }
 
 [dev-dependencies]
 aterm-spec = { workspace = true }
+# The models its tests drive (a model edit rebuilds only their tests).
+aterm-models-core = { workspace = true }
+aterm-models-misc = { workspace = true }
+aterm-models-render = { workspace = true }
+aterm-models-session = { workspace = true }
 
 [lints]
 workspace = true
@@ -80,12 +75,6 @@ workspace = true
 [[test]]
 name = "core_suite"
 path = "tests/core_suite.rs"
-
-# The deterministic-LCG fuzzers (the crate's CPU long poles), as one binary,
-# kept off core_suite's clock.
-[[test]]
-name = "core_fuzz"
-path = "tests/core_fuzz.rs"
 
 # Alone: installs a #[global_allocator] and asserts process-wide byte counts.
 [[test]]
@@ -102,14 +91,8 @@ path = "tests/perf_scaling.rs"
 name = "scoped_extract_alloc"
 path = "tests/scoped_extract_alloc.rs"
 
-# Alone: the scrollback share registry is process-global, and the exact
-# arithmetic needs this binary to own every share it sees.
+# Alone: it sets the process-wide scrollback budget every terminal in the process
+# obeys, and the exact arithmetic needs this binary to own every share it sees.
 [[test]]
 name = "conformance_shared_budget"
 path = "tests/conformance_shared_budget.rs"
-
-# The long stress run, only under `long-tests`.
-[[test]]
-name = "stress_stability"
-path = "tests/stress_stability.rs"
-required-features = ["long-tests"]

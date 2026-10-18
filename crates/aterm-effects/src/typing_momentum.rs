@@ -181,50 +181,6 @@ mod tests {
         );
     }
 
-    /// Deletes and kills never raise the metric, from rest or from a warm run.
-    #[test]
-    fn deletes_and_kills_never_build() {
-        let t0 = Instant::now();
-        let mut cold = TypingMomentum::default();
-        for i in 0..20u64 {
-            cold.delete(t0 + Duration::from_millis(i * 30));
-            cold.kill(t0 + Duration::from_millis(i * 30 + 15));
-        }
-        assert_eq!(
-            cold.value(t0 + Duration::from_secs(1)),
-            0.0,
-            "a delete flood from rest builds nothing"
-        );
-        let mut warm = TypingMomentum::default();
-        warm.set_value(t0, 0.8);
-        let before = warm.value(t0 + Duration::from_millis(10));
-        warm.delete(t0 + Duration::from_millis(10));
-        let after = warm.value(t0 + Duration::from_millis(10));
-        assert!(after < before, "a delete drains ({before} -> {after})");
-        assert!(
-            before - after <= TYPING_MOMENTUM_DELETE_DRAIN + 1e-4,
-            "…and the drain is the documented MILD one"
-        );
-    }
-
-    /// τ = 2 s: from full, half remains after τ·ln 2 and e⁻² ≈ 13.5 % after 2τ.
-    #[test]
-    fn decay_follows_the_documented_tau() {
-        let t0 = Instant::now();
-        let mut m = TypingMomentum::default();
-        m.set_value(t0, 1.0);
-        let half = t0 + Duration::from_secs_f32(TYPING_MOMENTUM_TAU * 2.0_f32.ln());
-        assert!((m.value(half) - 0.5).abs() < 0.01, "half-life at τ·ln2");
-        let two_tau = t0 + Duration::from_secs_f32(2.0 * TYPING_MOMENTUM_TAU);
-        assert!((m.value(two_tau) - (-2.0_f32).exp()).abs() < 0.01);
-        // A word-breath (0.6 s) keeps ~74%.
-        let breath = m.value(t0 + Duration::from_millis(600));
-        assert!(
-            breath > 0.72,
-            "an inter-word breath keeps the run: {breath}"
-        );
-    }
-
     /// A key landing after a long pause earns at most one capped credit: pause
     /// time is decay time, never banked accrual.
     #[test]

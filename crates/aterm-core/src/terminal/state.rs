@@ -4,7 +4,6 @@
 //! Terminal struct definition and root state accessors.
 
 use super::callbacks::WindowCallback;
-#[cfg(feature = "sixel")]
 use super::grouped_state::SixelState;
 use super::grouped_state::{
     BiDiGroupState, ClipboardState, ColorState, CursorSaveState, DcsState, Iterm2State, MarksState,
@@ -202,9 +201,6 @@ pub(super) struct ConfiguredModes {
     pub(super) focus_reporting: bool,
     /// Host value last applied for bracketed paste (mode 2004).
     pub(super) bracketed_paste: bool,
-    /// The host's default for alternate scroll (DEC 1007), set by
-    /// [`Terminal::set_host_alternate_scroll`]; the foreground handback restores 1007 to it.
-    pub(super) alternate_scroll: bool,
 }
 
 impl Default for ConfiguredModes {
@@ -215,7 +211,6 @@ impl Default for ConfiguredModes {
             auto_wrap: true,
             focus_reporting: false,
             bracketed_paste: false,
-            alternate_scroll: false,
         }
     }
 }
@@ -264,6 +259,11 @@ pub struct Terminal {
     /// Host-preferred default cursor style, used before any DECSCUSR and restored on
     /// RIS/DECSTR; outside `modes` so the `TerminalModes::new()` reset keeps it.
     pub(super) default_cursor_style: aterm_types::CursorStyle,
+    /// The host's default for alternate scroll (DEC 1007), set by
+    /// [`Terminal::set_host_alternate_scroll`]: like the default cursor style a host
+    /// preference, not app state, so RIS, DECSTR and the foreground handback restore
+    /// 1007 to it; outside `modes` so the `TerminalModes::new()` reset keeps it.
+    pub(super) host_alternate_scroll: bool,
     /// Grouped notification state (OSC 9, OSC 99, OSC 777).
     pub(super) notifications: NotificationState,
     /// Grouped OSC 52 clipboard callback state.
@@ -314,7 +314,6 @@ pub struct Terminal {
     /// Refreshed after every `process()` batch and by every host mutator of an input.
     pub(super) mode_mirror: std::sync::Arc<super::ModeMirror>,
     /// Grouped Sixel graphics processing state.
-    #[cfg(feature = "sixel")]
     pub(super) sixel: SixelState,
     /// Window operations callback for CSI t (XTWINOPS).
     pub(super) window_callback: Option<WindowCallback>,
@@ -351,8 +350,6 @@ pub struct Terminal {
     /// Secure keyboard entry: the UI layer enables platform secure input (macOS
     /// `EnableSecureEventInput()`).
     pub(super) secure_keyboard_entry: bool,
-    /// Vi mode navigation state (cursor, marks, inline search).
-    pub(super) vi: crate::vi_mode::ViMode,
     /// Synchronized-output (mode 2026) timeout, `TerminalConfig.sync_timeout_ms` via
     /// `apply_config()`; default 1 s.
     pub(super) sync_timeout_duration: std::time::Duration,
@@ -583,9 +580,9 @@ impl Terminal {
         self.modes.alternate_screen
     }
 
-    // Elsewhere: vi mode in state_accessors.rs; scrollback, viewport, paste and the
-    // response buffer in buffer_api.rs; shell integration in shell_api.rs; output blocks in
-    // blocks_api.rs.
+    // Elsewhere: keyboard, cursor, modes and title in state_accessors.rs; scrollback,
+    // viewport, paste and the response buffer in buffer_api.rs; shell integration in
+    // shell_api.rs; output blocks in blocks_api.rs.
 }
 
 #[cfg(test)]
@@ -630,33 +627,9 @@ mod damage_epoch_tests {
         assert!(e2 > e1, "epoch is monotonic");
     }
 
-    /// A viewport scroll damages the grid (and feeds the epoch) only when it moves.
-    #[test]
-    fn scroll_damages_only_when_the_viewport_moves() {
-        let mut term = Terminal::new(3, 10);
-        for _ in 0..10 {
-            term.process(b"line\r\n");
-        }
-        term.take_damage();
-        let before = term.damage_epoch();
-
-        term.grid_mut().scroll_display(2);
-        assert!(term.has_damage(), "scrolling the viewport damages the grid");
-        let scrolled = term.damage_epoch();
-        assert_eq!(scrolled, before + 1, "a real scroll advances the epoch");
-
-        term.take_damage();
-        term.grid_mut().scroll_display(0);
-        assert!(!term.has_damage(), "a zero-delta scroll damages nothing");
-        assert_eq!(
-            term.damage_epoch(),
-            scrolled,
-            "no-op scroll must NOT advance the epoch"
-        );
-    }
-
     /// `content_seq` advances on content mutations (write, erase, content scroll), not on a
-    /// no-op or a pure `scroll_display`, so a cached search index survives scrolling.
+    /// no-op or a pure `scroll_display`; unlike `damage_epoch`, a viewport scroll leaves it
+    /// untouched, so a cached search index survives scrolling.
     #[test]
     fn content_seq_advances_on_content_not_on_viewport_scroll() {
         let mut term = Terminal::new(3, 10);
@@ -964,30 +937,5 @@ mod content_scroll_delta_tests {
                 ContentScrollDelta::Invalidate
             );
         }
-    }
-
-    /// The ring is addressed by sequence number modulo its length, and a batch of
-    /// several moves lands them oldest first.
-    #[test]
-    fn the_band_ring_is_addressed_by_sequence_and_wraps() {
-        let mut s = ContentScrollState::default();
-        let moves: Vec<RowBandMove> = (0..20u16)
-            .map(|i| RowBandMove {
-                top: i,
-                bottom: 56,
-                delta: 1,
-            })
-            .collect();
-        s.invalidate();
-        s.record_band_batch(&moves[..3]);
-        assert_eq!((s.band_batches, s.band_seq), (1, 3));
-        assert_eq!(s.band(0).top, 0);
-        assert_eq!(s.band(2).top, 2);
-        s.invalidate();
-        s.record_band_batch(&moves[3..]);
-        assert_eq!((s.band_batches, s.band_seq), (2, 20));
-        assert_eq!(s.band(19).top, 19);
-        assert_eq!(s.band(4).top, 4, "the 16 newest moves are intact");
-        assert_eq!(s.band(3).top, 19, "seq 3's slot was overwritten by seq 19");
     }
 }

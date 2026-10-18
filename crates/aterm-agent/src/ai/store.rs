@@ -413,11 +413,14 @@ impl Store {
         let record = records.by_id.entry(id.to_string()).or_default();
         record.apply(how, outcome, now);
         record.generation = Some(generation);
-        crate::harness::upgrade_models::write_atomic(
+        // Ordered: older login outcomes are tolerated (the next review or login
+        // writes them again), and the wake marker means only "changed" to a live
+        // watcher, which no power loss leaves.
+        crate::harness::upgrade_models::write_atomic_ordered(
             &self.dir.join(RECORD_FILE),
             &records.render(),
         )?;
-        crate::harness::upgrade_models::write_atomic(&self.wake_path(), "")
+        crate::harness::upgrade_models::write_atomic_ordered(&self.wake_path(), "")
     }
 }
 

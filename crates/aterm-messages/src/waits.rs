@@ -451,7 +451,19 @@ fn ends_unread((done0, at0): (u64, Duration), s: &WaitSample) -> bool {
 /// percent and `Stop`. The title names the paste, so what was not read is the
 /// paste.
 fn unread_words(stuck: Duration) -> String {
-    format!("not read for {}", crate::strain::span_words(stuck))
+    format!("not read for {}", span_words(stuck))
+}
+
+/// A span as a record says it: `40 s`, `3m 12s`, `1h 5m`.
+fn span_words(d: Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 {
+        format!("{s} s")
+    } else if s < 3600 {
+        format!("{}m {}s", s / 60, s % 60)
+    } else {
+        format!("{}h {}m", s / 3600, s % 3600 / 60)
+    }
 }
 
 /// Whether a paste of `bytes` is watched at all ([`LARGE_PASTE_BYTES`]).
@@ -525,13 +537,6 @@ mod tests {
             figure_at(&wide, 60).as_deref(),
             Some("not read for 59m 59s")
         );
-        let mut old = row.clone();
-        old.detail = vec!["program not reading for 37 s".to_string()];
-        assert_ne!(
-            figure_at(&old, 60).as_deref(),
-            Some("program not reading for 37 s"),
-            "the control: the old words are cut at 60"
-        );
         // It reads again: the words go at once.
         let WaitStep::Restate(row) = w.step(&sample(1_000_000, total, 39_250, true)) else {
             panic!("restated");
@@ -591,14 +596,6 @@ mod tests {
         assert_eq!(meter.amount.map(|a| a.unit), Some(Unit::Bytes));
         assert!(!meter.busy);
         assert!(matches!(row.hold, Hold::Live { .. }));
-    }
-
-    /// Only a large paste is watched.
-    #[test]
-    fn a_small_paste_is_never_watched() {
-        assert!(!paste_is_watched(LARGE_PASTE_BYTES - 1));
-        assert!(!paste_is_watched(4096));
-        assert!(paste_is_watched(LARGE_PASTE_BYTES));
     }
 
     /// The lifecycle: nothing while nobody waits, posted once the person

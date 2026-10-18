@@ -133,7 +133,7 @@ fn native_leaf_cache_lifetime_conforms_across_split_zoom_tab_and_capture() {
         .unwrap();
     let (_, terminal) =
         app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Vertical);
-    let model = aterm_spec::derive::native_leaf_cache_lifetime_model();
+    let model = aterm_models_render::native_leaf_cache_lifetime_model();
     let mut expected = model.init_state();
 
     for action in [
@@ -255,7 +255,7 @@ fn native_route_card_composes_global_priority_and_modal_suppression() {
             geom: 1,
         });
         window.badge_card = Some(host([0, 0, 255, 255], 2));
-        window.bubble_card = Some(host([0, 255, 0, 255], 3));
+        window.conn_wire_card = Some(host([0, 255, 0, 255], 3));
     }
 
     assert!(app.compose_native_route_card(wid));
@@ -266,9 +266,9 @@ fn native_route_card_composes_global_priority_and_modal_suppression() {
             .expect("combined route card")
             .rgba[4..8],
         &[0, 255, 0, 255],
-        "the bubble outranks the badge over the retained native base"
+        "the connection wire outranks the badge over the retained native base"
     );
-    app.windows.get_mut(&wid).unwrap().bubble_card = None;
+    app.windows.get_mut(&wid).unwrap().conn_wire_card = None;
     assert!(app.compose_native_route_card(wid));
     assert_eq!(
         &app.windows[&wid].route_card.as_ref().unwrap().rgba[4..8],
@@ -843,7 +843,7 @@ fn drive_native_preview_action<T>(action: &str, drive: impl FnOnce() -> T) -> T 
 fn static_native_preview_paints_the_completed_font_before_disarming() {
     use aterm_spec::interp::State;
 
-    let model = aterm_spec::derive::native_preview_font_convergence_model();
+    let model = aterm_models_misc::native_preview_font_convergence_model();
     let preview = |app: &App, wid, view| {
         app.windows[&wid].leaf_render_cache[&view]
             .native
@@ -1081,7 +1081,7 @@ fn appearance_paint_identity_forces_full_native_raster() {
         width,
         height,
         1.0,
-        app.chrome_palette_theme(),
+        app.chrome_palette_theme().into(),
         app.theme,
     );
     let raster = cache.native.as_ref().unwrap();

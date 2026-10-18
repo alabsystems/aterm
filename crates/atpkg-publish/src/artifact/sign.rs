@@ -16,6 +16,7 @@
 //! works offline from the installed roster.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, PoisonError};
 
 use super::lineage_switch::{self, Switch};
 use super::pkgdoc;
@@ -72,18 +73,14 @@ impl Authority {
 /// The channel head's roster pair, downloaded into `dir`: `Ok(None)` when the channel
 /// serves no index yet.
 fn head_roster(ctx: &Ctx, dir: &Path) -> std::result::Result<Option<PathBuf>, String> {
-    let host = &ctx.hosts.channel;
     let slug = ctx.index_slug();
-    let releases = match host.releases(&slug) {
-        Ok(r) => r,
-        Err(HostError::NotFound) => return Ok(None),
+    let n = match quad::head_build(ctx, &slug) {
+        Ok(Some(n)) => n,
+        Ok(None) | Err(HostError::NotFound) => return Ok(None),
         Err(e) => return Err(format!("listing {slug}: {e}")),
     };
-    let Some(n) = quad::head_number(&releases) else {
-        return Ok(None);
-    };
     let tag = quad::index_tag(n);
-    host.download(&slug, &tag, &QUAD_FILES[2..], dir)
+    quad::download_quad_files(ctx, &slug, &tag, &QUAD_FILES[2..], dir)
         .map_err(|e| format!("{tag} on {slug}: {e}"))?;
     Ok(Some(dir.join(QUAD_FILES[2])))
 }
@@ -122,13 +119,56 @@ pub fn authority(ctx: &Ctx) -> Result<Authority> {
              checks them again under the roster it ships"
         ),
     }
-    for path in [
+    candidates.extend(local_candidates(ctx));
+    elect(ctx, &candidates)
+}
+
+/// The roster pairs on this machine: the aterm checkout's `dist/` and the installed one.
+fn local_candidates(ctx: &Ctx) -> Vec<(String, PathBuf)> {
+    [
         ctx.repo_root.join("dist").join(QUAD_FILES[2]),
         ctx.identity.roster.clone(),
-    ] {
-        candidates.push((ctx.shown(&path), path));
+    ]
+    .into_iter()
+    .map(|path| (ctx.shown(&path), path))
+    .collect()
+}
+
+/// Elect this context's generation ([`elected`]) from a channel head the caller already
+/// downloaded and verified (a lane's baseline, a group's floor), so none of its packs reads
+/// the head again. Nothing changes when one is elected already; an election that fails
+/// here is left to the first pack, which reads the head itself and refuses the same way.
+pub fn elect_from_head(ctx: &Ctx, head: &crate::quad::VerifiedQuad) {
+    let mut slot = ctx.elected.lock().unwrap_or_else(PoisonError::into_inner);
+    if slot.is_some() || ctx.anchor.is_empty() {
+        return;
     }
-    elect(ctx, &candidates)
+    let mut candidates = vec![(
+        format!("the head of {}", ctx.index_slug()),
+        head.file(QUAD_FILES[2]),
+    )];
+    candidates.extend(local_candidates(ctx));
+    if let Ok(authority) = elect(ctx, &candidates) {
+        *slot = Some(Arc::new(authority));
+    }
+}
+
+/// [`authority`], elected once per context and shared by its clones, so every pack of a
+/// lane or a group is verified under the one generation read for the first, without
+/// reading the channel head again. A failed election is not kept: the next asks again,
+/// and refuses the same way.
+///
+/// # Errors
+///
+/// [`authority`]'s.
+pub fn elected(ctx: &Ctx) -> Result<Arc<Authority>> {
+    let mut slot = ctx.elected.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(held) = slot.as_ref() {
+        return Ok(Arc::clone(held));
+    }
+    let fresh = Arc::new(authority(ctx)?);
+    *slot = Some(Arc::clone(&fresh));
+    Ok(fresh)
 }
 
 /// The election is the index's ([`newest_roster`]), so a package signature and the index

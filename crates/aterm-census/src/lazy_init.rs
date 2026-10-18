@@ -1166,13 +1166,9 @@ fn run_synth_sources(sources: &[(String, String)]) -> CensusOutcome {
 mod tests {
     use super::*;
 
-    fn src(path: &str, body: &str) -> (String, String) {
-        (path.to_string(), body.to_string())
-    }
-
-    /// The self-reentrant `debug_seamless_reexec_armed` shape (fn-local
-    /// `OnceLock`, multi-statement closure, self-call first) and its
-    /// main-thread caller.
+    /// The self-reentrant `debug_seamless_reexec_armed` shape that shipped in
+    /// v0.65 (fn-local `OnceLock`, multi-statement closure, self-call first)
+    /// and its main-thread caller.
     const V065_SHIPPED_SHAPE: &str = r#"
 pub(crate) fn debug_seamless_reexec_armed() -> bool {
     static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1191,48 +1187,40 @@ pub(crate) fn apply_staged_update_now() -> bool {
 }
 "#;
 
-    /// The self-reentrant fn-local `OnceLock` shape is red, naming the cell and
-    /// the accessor.
-    #[test]
-    fn the_v065_self_recursive_once_lock_is_red_with_its_path() {
-        let sources = vec![src(
-            "crates/aterm-gui/src/app_update_screen.rs",
-            V065_SHIPPED_SHAPE,
-        )];
-        let out = run_synth_sources(&sources);
-        assert!(
-            !out.ok,
-            "the shipped freeze shape must be RED:\n{}",
-            out.log
-        );
-        assert!(
-            out.log.contains("[OB-19]"),
-            "wrong obligation:\n{}",
-            out.log
-        );
-        assert!(
-            out.log.contains("`ARMED`"),
-            "must name the cell:\n{}",
-            out.log
-        );
-        assert!(
-            out.log.contains("debug_seamless_reexec_armed"),
-            "must name the accessor the initializer calls back into:\n{}",
-            out.log
-        );
-        assert!(
-            out.log.contains("lazy-init census: FAILED"),
-            "the FAILED verdict line is missing:\n{}",
-            out.log
-        );
+    /// One synthetic tree: its name, its `(path, source)` files, and `None`
+    /// for GREEN or `Some(tokens)` for RED with every token in the log.
+    type Case = (String, Vec<(String, String)>, Option<Vec<&'static str>>);
+
+    fn case(name: &str, files: &[(&str, &str)], red: Option<&[&'static str]>) -> Case {
+        (
+            name.to_string(),
+            files
+                .iter()
+                .map(|(path, body)| ((*path).to_string(), (*body).to_string()))
+                .collect(),
+            red.map(<[&str]>::to_vec),
+        )
     }
 
-    /// The repair (the initializer reads the environment, not itself) is green.
+    /// Every shape the derivation must judge: each red one a re-entry it
+    /// must reach (naming its obligation and cell), each green one a shape
+    /// that must not fabricate a finding.
     #[test]
-    fn the_shipped_repair_of_that_site_is_green() {
-        let sources = vec![src(
-            "crates/aterm-gui/src/app_update_screen.rs",
-            r#"
+    fn every_reentry_shape_is_judged() {
+        let mut cases: Vec<Case> = vec![
+            case(
+                "the v0.65 self-recursive fn-local OnceLock",
+                &[(
+                    "crates/aterm-gui/src/app_update_screen.rs",
+                    V065_SHIPPED_SHAPE,
+                )],
+                Some(&["[OB-19]", "`ARMED`", "debug_seamless_reexec_armed"]),
+            ),
+            case(
+                "the shipped repair of that site (it reads the environment)",
+                &[(
+                    "crates/aterm-gui/src/app_update_screen.rs",
+                    r#"
 pub(crate) fn debug_seamless_reexec_armed() -> bool {
     static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ARMED.get_or_init(|| {
@@ -1244,18 +1232,14 @@ pub(crate) fn debug_seamless_reexec_armed() -> bool {
     })
 }
 "#,
-        )];
-        let out = run_synth_sources(&sources);
-        assert!(out.ok, "the shipped repair must be GREEN:\n{}", out.log);
-    }
-
-    /// OB-20: two accessors that initialise through each other. No self-loop
-    /// anywhere, and still a permanent park for whichever thread arrives first.
-    #[test]
-    fn a_mutual_pair_is_red_as_one_component() {
-        let sources = vec![src(
-            "crates/aterm-gui/src/pair.rs",
-            r#"
+                )],
+                None,
+            ),
+            case(
+                "OB-20: two accessors that initialise through each other",
+                &[(
+                    "crates/aterm-gui/src/pair.rs",
+                    r#"
 fn alpha() -> bool {
     static A: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *A.get_or_init(|| beta())
@@ -1266,27 +1250,14 @@ fn beta() -> bool {
     *B.get_or_init(|| alpha())
 }
 "#,
-        )];
-        let out = run_synth_sources(&sources);
-        assert!(!out.ok, "a mutual pair must be RED:\n{}", out.log);
-        assert!(
-            out.log.contains("[OB-20]"),
-            "wrong obligation:\n{}",
-            out.log
-        );
-        assert!(
-            out.log.contains('A') && out.log.contains('B'),
-            "both cells must be named:\n{}",
-            out.log
-        );
-    }
-
-    /// Peeking at the own cell through `get()` cannot park and is not a finding.
-    #[test]
-    fn a_non_blocking_get_back_edge_is_not_a_finding() {
-        let sources = vec![src(
-            "crates/aterm-gui/src/peek.rs",
-            r#"
+                )],
+                Some(&["[OB-20]", "`A`", "`B`"]),
+            ),
+            case(
+                "a non-blocking get() peek at the own cell",
+                &[(
+                    "crates/aterm-gui/src/peek.rs",
+                    r#"
 fn armed() -> bool {
     static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ARMED.get_or_init(|| {
@@ -1295,18 +1266,14 @@ fn armed() -> bool {
     })
 }
 "#,
-        )];
-        let out = run_synth_sources(&sources);
-        assert!(out.ok, "a `get()` peek must stay GREEN:\n{}", out.log);
-    }
-
-    /// A `LazyLock` has no accessor method to look for — every use derefs it,
-    /// so the reader that mentions it is the trigger.
-    #[test]
-    fn a_deref_lazy_cell_reentered_through_a_reader_is_red() {
-        let sources = vec![src(
-            "crates/aterm-gui/src/table.rs",
-            r#"
+                )],
+                None,
+            ),
+            case(
+                "a deref LazyLock re-entered through a reader",
+                &[(
+                    "crates/aterm-gui/src/table.rs",
+                    r#"
 static TABLE: std::sync::LazyLock<Vec<u8>> = std::sync::LazyLock::new(|| build());
 
 fn build() -> Vec<u8> {
@@ -1317,40 +1284,19 @@ fn seed() -> Vec<u8> {
     TABLE.clone()
 }
 "#,
-        )];
-        let out = run_synth_sources(&sources);
-        assert!(!out.ok, "a deref-lazy re-entry must be RED:\n{}", out.log);
-        assert!(
-            out.log.contains("`TABLE`"),
-            "must name the cell:\n{}",
-            out.log
-        );
-    }
-
-    /// OB-21 is what keeps GREEN honest: nothing to scan is not the same as
-    /// nothing to find.
-    #[test]
-    fn an_empty_tree_fails_ob21_rather_than_passing_vacuously() {
-        let out = run_synth_sources(&[]);
-        assert!(
-            !out.ok,
-            "an empty derivation must not be GREEN:\n{}",
-            out.log
-        );
-        assert!(
-            out.log.contains("[OB-21]"),
-            "wrong obligation:\n{}",
-            out.log
-        );
-    }
-
-    /// A body-less `extern "C"` declaration owns no lines, so it cannot absorb
-    /// the next function's body and invent a self-reentrancy.
-    #[test]
-    fn an_extern_declaration_does_not_absorb_the_next_fn_body() {
-        let sources = vec![src(
-            "crates/aterm-gui/src/keymap.rs",
-            r#"
+                )],
+                Some(&["`TABLE`"]),
+            ),
+            case(
+                "OB-21: an empty tree is not vacuously green",
+                &[],
+                Some(&["[OB-21]"]),
+            ),
+            case(
+                "a body-less extern declaration absorbs no fn body",
+                &[(
+                    "crates/aterm-gui/src/keymap.rs",
+                    r#"
 unsafe extern "C" {
     fn IOServiceMatching(name: *const u8) -> *mut u8;
     fn IOServiceOpen(
@@ -1369,32 +1315,24 @@ fn open_port(dict: *mut u8) -> Option<u32> {
     None
 }
 "#,
-        )];
-        let out = run_synth_sources(&sources);
-        assert!(
-            out.ok,
-            "an FFI declaration must not fabricate a reentrancy finding:\n{}",
-            out.log
-        );
-    }
-
-    /// A qualified constructor reference (`CELL.get_or_init(Type::new)`) is not
-    /// followed through the merged `new` node.
-    #[test]
-    fn a_qualified_ctor_reference_is_not_followed() {
-        let sources = vec![
-            src(
-                "crates/aterm-core/src/terminal/color_resolve.rs",
-                r#"
+                )],
+                None,
+            ),
+            case(
+                "a qualified ctor reference (`Type::new`) is not followed",
+                &[
+                    (
+                        "crates/aterm-core/src/terminal/color_resolve.rs",
+                        r#"
 fn transfer_tables() -> &'static TransferTables {
     static TABLES: std::sync::OnceLock<TransferTables> = std::sync::OnceLock::new();
     TABLES.get_or_init(TransferTables::new)
 }
 "#,
-            ),
-            src(
-                "crates/aterm-core/src/other.rs",
-                r#"
+                    ),
+                    (
+                        "crates/aterm-core/src/other.rs",
+                        r#"
 fn new() -> u8 {
     transfer_tables_reader()
 }
@@ -1403,23 +1341,15 @@ fn transfer_tables_reader() -> u8 {
     0
 }
 "#,
+                    ),
+                ],
+                None,
             ),
-        ];
-        let out = run_synth_sources(&sources);
-        assert!(
-            out.ok,
-            "a qualified ctor reference must not be walked into:\n{}",
-            out.log
-        );
-    }
-
-    /// An unqualified fn reference passed instead of a closure is the
-    /// initializer and is followed.
-    #[test]
-    fn an_unqualified_fn_reference_initializer_is_followed() {
-        let sources = vec![src(
-            "crates/aterm-gui/src/terse.rs",
-            r#"
+            case(
+                "an unqualified fn-reference initializer is followed",
+                &[(
+                    "crates/aterm-gui/src/terse.rs",
+                    r#"
 fn rules() -> &'static Rules {
     static RULES: std::sync::OnceLock<Rules> = std::sync::OnceLock::new();
     RULES.get_or_init(build_rules)
@@ -1429,26 +1359,14 @@ fn build_rules() -> Rules {
     rules().clone()
 }
 "#,
-        )];
-        let out = run_synth_sources(&sources);
-        assert!(
-            !out.ok,
-            "a fn-reference initializer must be walked:\n{}",
-            out.log
-        );
-        assert!(
-            out.log.contains("[OB-19]"),
-            "wrong obligation:\n{}",
-            out.log
-        );
-    }
-
-    /// `#[cfg(test)]` code is masked out, not reported.
-    #[test]
-    fn a_test_only_self_recursion_is_not_a_shipped_finding() {
-        let sources = vec![src(
-            "crates/aterm-gui/src/gated.rs",
-            r#"
+                )],
+                Some(&["[OB-19]"]),
+            ),
+            case(
+                "a cfg(test) self-recursion never ships",
+                &[(
+                    "crates/aterm-gui/src/gated.rs",
+                    r#"
 #[cfg(test)]
 fn probe() -> bool {
     static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1460,22 +1378,14 @@ fn live() -> bool {
     *L.get_or_init(|| std::env::var_os("K").is_some())
 }
 "#,
-        )];
-        let out = run_synth_sources(&sources);
-        assert!(
-            out.ok,
-            "a cfg(test) initializer must not fail the shipped census:\n{}",
-            out.log
-        );
-    }
-
-    /// A `Once` is a cell too: `ONCE.call_once(|| ..)` parks exactly the same
-    /// way.
-    #[test]
-    fn a_self_recursive_once_call_once_is_red() {
-        let sources = vec![src(
-            "crates/aterm-net/src/tls.rs",
-            r#"
+                )],
+                None,
+            ),
+            case(
+                "a self-recursive Once::call_once",
+                &[(
+                    "crates/aterm-http/src/tls.rs",
+                    r#"
 fn init_crypto() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -1483,22 +1393,14 @@ fn init_crypto() {
     });
 }
 "#,
-        )];
-        let out = run_synth_sources(&sources);
-        assert!(!out.ok, "a self-recursive Once must be RED:\n{}", out.log);
-        assert!(
-            out.log.contains("[OB-19]"),
-            "wrong obligation:\n{}",
-            out.log
-        );
-    }
-
-    /// A `OnceLock` struct field re-entered from its own initializer is red.
-    #[test]
-    fn a_self_recursive_oncelock_field_is_red() {
-        let sources = vec![src(
-            "crates/demo/src/session.rs",
-            r#"
+                )],
+                Some(&["[OB-19]"]),
+            ),
+            case(
+                "a OnceLock struct field re-entered from its initializer",
+                &[(
+                    "crates/demo/src/session.rs",
+                    r#"
 pub struct Session {
     cache: std::sync::OnceLock<bool>,
 }
@@ -1509,31 +1411,14 @@ impl Session {
     }
 }
 "#,
-        )];
-        let out = run_synth_sources(&sources);
-        assert!(
-            !out.ok,
-            "a self-recursive field cell must be RED:\n{}",
-            out.log
-        );
-        assert!(
-            out.log.contains("[OB-19]"),
-            "wrong obligation:\n{}",
-            out.log
-        );
-        assert!(
-            out.log.contains("FIELD"),
-            "the diagnostic must say the cell is a field:\n{}",
-            out.log
-        );
-    }
-
-    /// A field cell whose initializer does not re-enter is green.
-    #[test]
-    fn an_ordinary_oncelock_field_is_green() {
-        let sources = vec![src(
-            "crates/demo/src/session.rs",
-            r#"
+                )],
+                Some(&["[OB-19]", "FIELD"]),
+            ),
+            case(
+                "an ordinary OnceLock field",
+                &[(
+                    "crates/demo/src/session.rs",
+                    r#"
 pub struct Session {
     cache: std::sync::OnceLock<bool>,
     name: String,
@@ -1545,13 +1430,100 @@ impl Session {
     }
 }
 "#,
-        )];
-        let out = run_synth_sources(&sources);
-        assert!(
-            out.ok,
-            "an ordinary field cell must stay GREEN:\n{}",
-            out.log
-        );
+                )],
+                None,
+            ),
+            case(
+                "a receiver rustfmt wrapped onto its own line",
+                &[(
+                    "crates/aterm-gui/src/app_update_screen.rs",
+                    r#"
+pub fn debug_seamless_reexec_armed() -> bool {
+    static ARMED_SEAMLESS_REEXEC_FLAG: std::sync::OnceLock<bool> =
+        std::sync::OnceLock::new();
+    *ARMED_SEAMLESS_REEXEC_FLAG
+        .get_or_init(|| crate::app_update_screen::debug_seamless_reexec_armed())
+}
+"#,
+                )],
+                Some(&["[OB-19]"]),
+            ),
+            case(
+                "an array length in a signature keeps the fn in the graph",
+                &[(
+                    "crates/demo/src/lut.rs",
+                    r#"
+static TABLE: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+
+pub fn table() -> &'static [f32; 256] {
+    TABLE.get_or_init(|| build())
+}
+
+fn build() -> [f32; 256] {
+    let t = table();
+    *t
+}
+"#,
+                )],
+                Some(&["[OB-19]"]),
+            ),
+            case(
+                "a wrapped LazyLock ctor after a `;` in the type",
+                &[(
+                    "crates/demo/src/lut.rs",
+                    r#"
+static SRGB_TO_LINEAR_LUT: std::sync::LazyLock<[f32; 256]> =
+    std::sync::LazyLock::new(|| build());
+
+fn build() -> [f32; 256] {
+    *SRGB_TO_LINEAR_LUT
+}
+"#,
+                )],
+                Some(&["[OB-19]"]),
+            ),
+            case(
+                "a turbofished get_or_init",
+                &[(
+                    "crates/demo/src/lib.rs",
+                    r#"
+static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+pub fn armed() -> bool {
+    *ARMED.get_or_init::<_>(|| armed())
+}
+"#,
+                )],
+                Some(&["[OB-19]"]),
+            ),
+        ];
+        for vis in ["pub ", "pub(crate) ", "pub(super) "] {
+            let body = format!(
+                "\n{vis}static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();\n\n\
+                 pub fn armed() -> bool {{\n    *ARMED.get_or_init(|| armed())\n}}\n"
+            );
+            cases.push((
+                format!("a `{vis}static` cell"),
+                vec![("crates/demo/src/lib.rs".to_string(), body)],
+                Some(vec!["[OB-19]"]),
+            ));
+        }
+        for (name, sources, red) in &cases {
+            let out = run_synth_sources(sources);
+            match red {
+                None => assert!(out.ok, "{name}: must be GREEN:\n{}", out.log),
+                Some(tokens) => {
+                    assert!(!out.ok, "{name}: must be RED:\n{}", out.log);
+                    for token in tokens {
+                        assert!(
+                            out.log.contains(token),
+                            "{name}: no `{token}`:\n{}",
+                            out.log
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// A borrowed `&OnceLock<T>` parameter is not a declaration; the owner
@@ -1564,167 +1536,6 @@ impl Session {
         assert!(field_cell_name("    pub(crate) cache: OnceLock<bool>,").is_some());
         assert!(field_cell_name("    pub cache: OnceLock<bool>,").is_some());
         assert!(field_cell_name("    name: String,").is_none());
-    }
-
-    /// The receiver and the blocking method on different lines (as rustfmt
-    /// wraps long identifiers) is still red.
-    #[test]
-    fn a_receiver_the_formatter_wrapped_onto_its_own_line_is_still_red() {
-        let sources = vec![src(
-            "crates/aterm-gui/src/app_update_screen.rs",
-            r#"
-pub fn debug_seamless_reexec_armed() -> bool {
-    static ARMED_SEAMLESS_REEXEC_FLAG: std::sync::OnceLock<bool> =
-        std::sync::OnceLock::new();
-    *ARMED_SEAMLESS_REEXEC_FLAG
-        .get_or_init(|| crate::app_update_screen::debug_seamless_reexec_armed())
-}
-"#,
-        )];
-        let out = run_synth_sources(&sources);
-        assert!(
-            !out.ok,
-            "a wrapped receiver must still be RED:\n{}",
-            out.log
-        );
-        assert!(
-            out.log.contains("[OB-19]"),
-            "wrong obligation:\n{}",
-            out.log
-        );
-    }
-
-    /// `pub(crate) static CELL: OnceLock<..>` is recognised as a cell.
-    #[test]
-    fn a_pub_static_cell_is_still_a_cell() {
-        for vis in ["pub ", "pub(crate) ", "pub(super) ", ""] {
-            let sources = vec![src(
-                "crates/demo/src/lib.rs",
-                &format!(
-                    r#"
-{vis}static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-
-pub fn armed() -> bool {{
-    *ARMED.get_or_init(|| armed())
-}}
-"#
-                ),
-            )];
-            let out = run_synth_sources(&sources);
-            assert!(
-                !out.ok,
-                "a `{vis}static` cell must be seen and its cycle caught:\n{}",
-                out.log
-            );
-        }
-    }
-
-    /// An array length in a return type (`fn table() -> [f32; 256] {`) does not
-    /// end the signature, so the function stays in the call graph.
-    #[test]
-    fn an_array_length_in_a_signature_does_not_delete_the_function() {
-        let sources = vec![src(
-            "crates/demo/src/lut.rs",
-            r#"
-static TABLE: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
-
-pub fn table() -> &'static [f32; 256] {
-    TABLE.get_or_init(|| build())
-}
-
-fn build() -> [f32; 256] {
-    let t = table();
-    *t
-}
-"#,
-        )];
-        let out = run_synth_sources(&sources);
-        assert!(
-            !out.ok,
-            "an array-typed accessor must not vanish from the graph:\n{}",
-            out.log
-        );
-        assert!(
-            out.log.contains("[OB-19]"),
-            "wrong obligation:\n{}",
-            out.log
-        );
-    }
-
-    /// A real body-less declaration still owns no lines.
-    #[test]
-    fn the_depth_rule_still_treats_a_real_declaration_as_bodyless() {
-        let lines = vec![
-            "unsafe extern \"C\" {",
-            "    fn IOServiceMatching(name: *const u8) -> *mut u8;",
-            "}",
-            "fn real() -> [u8; 4] {",
-            "    [0; 4]",
-            "}",
-        ];
-        assert!(
-            is_bodyless_declaration(&lines, 1),
-            "an extern decl is bodyless"
-        );
-        assert!(
-            !is_bodyless_declaration(&lines, 3),
-            "an array-returning fn has a body"
-        );
-    }
-
-    /// A `;` inside a static's type (`LazyLock<[f32; 256]>`) does not end its
-    /// declaration, so the wrapped initializer is found.
-    #[test]
-    fn a_wrapped_ctor_after_a_semicolon_in_the_type_is_still_found() {
-        let sources = vec![src(
-            "crates/demo/src/lut.rs",
-            r#"
-static SRGB_TO_LINEAR_LUT: std::sync::LazyLock<[f32; 256]> =
-    std::sync::LazyLock::new(|| build());
-
-fn build() -> [f32; 256] {
-    *SRGB_TO_LINEAR_LUT
-}
-"#,
-        )];
-        let out = run_synth_sources(&sources);
-        assert!(
-            !out.ok,
-            "a wrapped LazyLock ctor must still be found and its cycle caught:\n{}",
-            out.log
-        );
-        assert!(
-            out.log.contains("[OB-19]"),
-            "wrong obligation:\n{}",
-            out.log
-        );
-    }
-
-    /// A turbofish (`CELL.get_or_init::<_>(|| ..)`) is still a touch with an
-    /// initializer.
-    #[test]
-    fn a_turbofished_blocking_call_is_still_a_touch() {
-        let sources = vec![src(
-            "crates/demo/src/lib.rs",
-            r#"
-static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-
-pub fn armed() -> bool {
-    *ARMED.get_or_init::<_>(|| armed())
-}
-"#,
-        )];
-        let out = run_synth_sources(&sources);
-        assert!(
-            !out.ok,
-            "a turbofished get_or_init must be RED:\n{}",
-            out.log
-        );
-        assert!(
-            out.log.contains("[OB-19]"),
-            "wrong obligation:\n{}",
-            out.log
-        );
     }
 
     /// The name must end at the method: `get_or_init_with` is its own

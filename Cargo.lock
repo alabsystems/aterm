@@ -3,130 +3,6 @@
 version = 4
 
 [[package]]
-name = "ab_glyph"
-version = "0.2.32"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01c0457472c38ea5bd1c3b5ada5e368271cb550be7a4ca4a0b4634e9913f6cc2"
-dependencies = [
- "ab_glyph_rasterizer",
- "owned_ttf_parser",
-]
-
-[[package]]
-name = "ab_glyph_rasterizer"
-version = "0.1.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "366ffbaa4442f4684d91e2cd7c5ea7c4ed8add41959a31447066e279e432b618"
-
-[[package]]
-name = "accesskit"
-version = "0.24.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3b7f7f85a7e5f68090000ed7622545829afd484d210358702ae4cb97dd0c320"
-dependencies = [
- "uuid",
-]
-
-[[package]]
-name = "accesskit_atspi_common"
-version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e98018dbef3583d751dbb96e07b8728fb99581360e1c3df408af16f4a80b821"
-dependencies = [
- "accesskit",
- "accesskit_consumer",
- "atspi-common",
- "phf",
- "serde",
- "zvariant",
-]
-
-[[package]]
-name = "accesskit_consumer"
-version = "0.37.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f950720ce064757a1b629caad3a408e8d2c63bb01f29b8a3ff8daa331053ffeb"
-dependencies = [
- "accesskit",
- "hashbrown 0.16.1",
-]
-
-[[package]]
-name = "accesskit_ios"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02ecb52198c7cf5f8d3e9ffc03d2ca0a5c7201926befd96721437829da4c5c6a"
-dependencies = [
- "accesskit",
- "accesskit_consumer",
- "hashbrown 0.16.1",
- "objc2 0.5.2",
- "objc2-foundation 0.2.2",
- "objc2-ui-kit",
-]
-
-[[package]]
-name = "accesskit_macos"
-version = "0.26.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17cb8b66cef272d48161b02a6317cc2bdd5f98bb0a5e79c68f704a5862aa396b"
-dependencies = [
- "accesskit",
- "accesskit_consumer",
- "hashbrown 0.16.1",
- "objc2 0.5.2",
- "objc2-app-kit",
- "objc2-foundation 0.2.2",
-]
-
-[[package]]
-name = "accesskit_unix"
-version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5376ba4cc23312587634abb5250b1ce8618f01a55915608209aafd01efb4bf8c"
-dependencies = [
- "accesskit",
- "accesskit_atspi_common",
- "async-channel",
- "async-executor",
- "async-task",
- "atspi",
- "futures-lite",
- "futures-util",
- "serde",
- "zbus",
-]
-
-[[package]]
-name = "accesskit_windows"
-version = "0.33.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36e93ac7bf50b964f1cbb75f741629a4e950571baa1ef1274457ab5a80d9bcc2"
-dependencies = [
- "accesskit",
- "accesskit_consumer",
- "hashbrown 0.16.1",
- "static_assertions",
- "windows",
- "windows-core",
-]
-
-[[package]]
-name = "accesskit_winit"
-version = "0.33.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41fe5862066316f6caaf02cd3aecd54bced25503ac5dbbfd0d03a42bc1246217"
-dependencies = [
- "accesskit",
- "accesskit_ios",
- "accesskit_macos",
- "accesskit_unix",
- "accesskit_windows",
- "raw-window-handle",
- "winit",
-]
-
-[[package]]
 name = "aead"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -152,23 +28,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "arrayref"
-version = "0.3.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76a2e8124351fda1ef8aaaa3bbd7ebbcb486bbcd4225aca0aa0d84bb2db8fecb"
-
-[[package]]
 name = "arrayvec"
 version = "0.7.8"
 dependencies = [
  "aterm-alloc",
 ]
-
-[[package]]
-name = "as-raw-xcb-connection"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "175571dd1d178ced59193a6fc02dde1b972eb0bc56c892cde9beeceac5bf0f6b"
 
 [[package]]
 name = "ash"
@@ -184,7 +48,7 @@ name = "astream-aead"
 version = "0.2.0"
 dependencies = [
  "chacha20poly1305",
- "getrandom 0.2.17",
+ "getrandom",
 ]
 
 [[package]]
@@ -193,6 +57,7 @@ version = "0.2.0"
 dependencies = [
  "astream-aead",
  "astream-cap",
+ "astream-sys",
  "astream-wire",
 ]
 
@@ -209,148 +74,30 @@ name = "astream-digest"
 version = "0.2.0"
 
 [[package]]
+name = "astream-effects"
+version = "0.2.0"
+
+[[package]]
+name = "astream-sys"
+version = "0.2.0"
+
+[[package]]
+name = "astream-term"
+version = "0.2.0"
+
+[[package]]
 name = "astream-wire"
 version = "0.2.0"
 
 [[package]]
-name = "async-broadcast"
-version = "0.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "435a87a52755b8f27fcf321ac4f04b2802e337c8c4872923137471ec39c37532"
-dependencies = [
- "event-listener",
- "event-listener-strategy",
- "futures-core",
- "pin-project-lite",
-]
-
-[[package]]
-name = "async-channel"
-version = "2.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "924ed96dd52d1b75e9c1a3e6275715fd320f5f9439fb5a4a11fa51f4221158d2"
-dependencies = [
- "concurrent-queue",
- "event-listener-strategy",
- "futures-core",
- "pin-project-lite",
-]
-
-[[package]]
-name = "async-executor"
-version = "1.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c96bf972d85afc50bf5ab8fe2d54d1586b4e0b46c97c50a0c9e71e2f7bcd812a"
-dependencies = [
- "async-task",
- "concurrent-queue",
- "fastrand",
- "futures-lite",
- "pin-project-lite",
- "slab",
-]
-
-[[package]]
-name = "async-io"
-version = "2.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "456b8a8feb6f42d237746d4b3e9a178494627745c3c56c6ea55d92ba50d026fc"
-dependencies = [
- "autocfg",
- "cfg-if",
- "concurrent-queue",
- "futures-io",
- "futures-lite",
- "parking",
- "polling",
- "rustix 1.1.4",
- "slab",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "async-lock"
-version = "3.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "290f7f2596bd5b78a9fec8088ccd89180d7f9f55b94b0576823bbbdc72ee8311"
-dependencies = [
- "event-listener",
- "event-listener-strategy",
- "pin-project-lite",
-]
-
-[[package]]
-name = "async-process"
-version = "2.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc50921ec0055cdd8a16de48773bfeec5c972598674347252c0399676be7da75"
-dependencies = [
- "async-channel",
- "async-io",
- "async-lock",
- "async-signal",
- "async-task",
- "blocking",
- "cfg-if",
- "event-listener",
- "futures-lite",
- "rustix 1.1.4",
-]
-
-[[package]]
-name = "async-recursion"
-version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b43422f69d8ff38f95f1b2bb76517c91589a924d1559a0e935d7c8ce0274c11"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
-name = "async-signal"
-version = "0.2.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52b5aaafa020cf5053a01f2a60e8ff5dccf550f0f77ec54a4e47285ac2bab485"
-dependencies = [
- "async-io",
- "async-lock",
- "atomic-waker",
- "cfg-if",
- "futures-core",
- "futures-io",
- "rustix 1.1.4",
- "signal-hook-registry",
- "slab",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "async-task"
-version = "4.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b75356056920673b02621b35afd0f7dda9306d03c79a30f5c56c44cf256e3de"
-
-[[package]]
-name = "async-trait"
-version = "0.1.89"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9035ad2d096bed7955a320ee7e2230574d28fd3c3a0f186cbea1ff3c7eed5dbb"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
 name = "aterm"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "astream-broker",
  "astream-cap",
  "aterm-agent",
  "aterm-cli",
+ "aterm-containment",
  "aterm-control",
  "aterm-ctl",
  "aterm-gui",
@@ -358,7 +105,10 @@ dependencies = [
  "aterm-keeper",
  "aterm-link",
  "aterm-log",
+ "aterm-machines",
+ "aterm-models-session",
  "aterm-pty",
+ "aterm-slog",
  "aterm-spec",
  "aterm-tempfile",
  "aterm-time",
@@ -373,83 +123,111 @@ dependencies = [
 ]
 
 [[package]]
-name = "aterm-agent"
-version = "0.105.0"
+name = "aterm-a11y"
+version = "0.106.0"
 dependencies = [
- "aterm-agent",
+ "aterm-dbus",
+ "aterm-log",
+ "aterm-types",
+ "aterm-uds",
+ "libc",
+]
+
+[[package]]
+name = "aterm-agent"
+version = "0.106.0"
+dependencies = [
+ "astream-effects",
  "aterm-codec",
  "aterm-ctl",
  "aterm-digest",
  "aterm-dirfd",
+ "aterm-durable",
  "aterm-grapheme",
  "aterm-hash",
  "aterm-json",
+ "aterm-lz4",
  "aterm-messages",
- "aterm-net",
+ "aterm-models-harness",
  "aterm-observe",
  "aterm-phase",
  "aterm-primer",
  "aterm-pty",
  "aterm-serde",
- "aterm-session",
  "aterm-shell-integration",
  "aterm-spec",
+ "aterm-spec-anchor",
  "aterm-sysprobe",
  "aterm-tempfile",
  "aterm-time",
  "aterm-toml",
+ "aterm-toolchain",
  "aterm-types",
  "aterm-uds",
+ "aterm-update-core",
+ "aterm-zstd",
  "atpkg",
  "libc",
+ "ring",
 ]
 
 [[package]]
 name = "aterm-alloc"
-version = "0.105.0"
-dependencies = [
- "arrayvec",
-]
+version = "0.106.0"
 
 [[package]]
 name = "aterm-bench"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-core",
  "aterm-grid",
+ "aterm-restore",
  "aterm-zstd",
 ]
 
 [[package]]
 name = "aterm-bidi"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-spec",
 ]
 
 [[package]]
 name = "aterm-bits"
-version = "0.105.0"
+version = "0.106.0"
 
 [[package]]
 name = "aterm-buffer"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-cap",
+ "aterm-models-core",
+ "aterm-models-session",
  "aterm-spec",
 ]
 
 [[package]]
 name = "aterm-cap"
-version = "0.105.0"
+version = "0.106.0"
+dependencies = [
+ "aterm-models-core",
+]
 
 [[package]]
 name = "aterm-census"
-version = "0.105.0"
+version = "0.106.0"
+
+[[package]]
+name = "aterm-cg"
+version = "0.106.0"
+dependencies = [
+ "aterm-objc",
+ "aterm-tempfile",
+]
 
 [[package]]
 name = "aterm-cli"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-cap",
  "aterm-containment",
@@ -461,6 +239,9 @@ dependencies = [
  "aterm-pty",
  "aterm-render",
  "aterm-sandbox",
+ "aterm-spec",
+ "aterm-tempfile",
+ "aterm-theme-pack",
  "aterm-time",
  "aterm-toml",
  "aterm-types",
@@ -472,18 +253,20 @@ dependencies = [
 
 [[package]]
 name = "aterm-codec"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-spec",
 ]
 
 [[package]]
 name = "aterm-conformance"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
+ "astream-term",
  "aterm-core",
  "aterm-json",
  "aterm-png",
+ "aterm-spec",
  "aterm-tempfile",
  "aterm-types",
  "aterm-uds",
@@ -492,9 +275,10 @@ dependencies = [
 
 [[package]]
 name = "aterm-containment"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-log",
+ "aterm-spec",
  "aterm-tempfile",
  "aterm-uds",
  "libc",
@@ -502,16 +286,17 @@ dependencies = [
 
 [[package]]
 name = "aterm-control"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-codec",
  "aterm-core",
  "aterm-json",
+ "aterm-uds",
 ]
 
 [[package]]
 name = "aterm-core"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-bidi",
  "aterm-codec",
@@ -519,6 +304,11 @@ dependencies = [
  "aterm-grid",
  "aterm-hash",
  "aterm-log",
+ "aterm-messages",
+ "aterm-models-core",
+ "aterm-models-misc",
+ "aterm-models-render",
+ "aterm-models-session",
  "aterm-parser",
  "aterm-png",
  "aterm-policy",
@@ -530,14 +320,14 @@ dependencies = [
  "aterm-shell-integration",
  "aterm-sixel",
  "aterm-spec",
+ "aterm-spec-anchor",
  "aterm-time",
  "aterm-types",
- "aterm-vi",
 ]
 
 [[package]]
 name = "aterm-ctl"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-codec",
  "aterm-pty",
@@ -549,7 +339,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-dbus"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-codec",
  "aterm-spec",
@@ -560,30 +350,51 @@ dependencies = [
 
 [[package]]
 name = "aterm-digest"
-version = "0.105.0"
+version = "0.106.0"
+dependencies = [
+ "astream-digest",
+]
 
 [[package]]
 name = "aterm-dirfd"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-tempfile",
  "libc",
 ]
 
 [[package]]
+name = "aterm-dl"
+version = "0.106.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "aterm-durable"
+version = "0.106.0"
+dependencies = [
+ "astream-sys",
+ "aterm-tempfile",
+]
+
+[[package]]
 name = "aterm-effects"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-core",
- "aterm-effects",
  "aterm-grapheme",
  "aterm-hash",
  "aterm-lexicon",
+ "aterm-models-effects",
+ "aterm-models-misc",
+ "aterm-models-render",
  "aterm-png",
  "aterm-render",
  "aterm-scene",
  "aterm-serde",
  "aterm-spec",
+ "aterm-spec-anchor",
  "aterm-time",
  "aterm-toml",
  "aterm-types",
@@ -592,7 +403,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-font"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-bidi",
  "aterm-grapheme",
@@ -600,7 +411,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-forge"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-census",
  "aterm-json",
@@ -611,22 +422,26 @@ dependencies = [
 
 [[package]]
 name = "aterm-gpu"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-bits",
  "aterm-codec",
  "aterm-core",
  "aterm-effects",
- "aterm-gpu",
  "aterm-hash",
  "aterm-log",
+ "aterm-models-core",
+ "aterm-models-misc",
+ "aterm-models-render",
  "aterm-objc",
  "aterm-png",
  "aterm-render",
  "aterm-spec",
- "aterm-spec-models",
+ "aterm-spec-anchor",
  "aterm-time",
  "aterm-types",
+ "aterm-wasm-abi",
+ "libc",
  "raw-window-handle",
  "wgpu",
  "windows",
@@ -634,7 +449,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-gpu-web"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-core",
  "aterm-effects",
@@ -642,43 +457,44 @@ dependencies = [
  "aterm-messages",
  "aterm-predict",
  "aterm-render",
+ "aterm-spec",
  "aterm-time",
  "aterm-types",
  "aterm-wasm-abi",
- "wasm-bindgen",
- "wasm-bindgen-futures",
 ]
 
 [[package]]
 name = "aterm-grapheme"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
+ "aterm-models-core",
  "aterm-spec",
  "aterm-types",
 ]
 
 [[package]]
 name = "aterm-grid"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-alloc",
  "aterm-grapheme",
  "aterm-hash",
  "aterm-log",
+ "aterm-models-core",
+ "aterm-models-misc",
  "aterm-rle",
  "aterm-scrollback",
  "aterm-selection",
  "aterm-spec",
- "aterm-tempfile",
+ "aterm-spec-anchor",
  "aterm-types",
 ]
 
 [[package]]
 name = "aterm-gui"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
- "accesskit",
- "accesskit_winit",
+ "aterm-a11y",
  "aterm-agent",
  "aterm-buffer",
  "aterm-cap",
@@ -687,12 +503,19 @@ dependencies = [
  "aterm-control",
  "aterm-core",
  "aterm-ctl",
+ "aterm-dbus",
  "aterm-digest",
  "aterm-dirfd",
+ "aterm-durable",
  "aterm-effects",
  "aterm-gpu",
  "aterm-grapheme",
  "aterm-grid",
+ "aterm-gui-consent",
+ "aterm-gui-documents",
+ "aterm-gui-fabric",
+ "aterm-gui-tabs",
+ "aterm-gui-timing",
  "aterm-hash",
  "aterm-http",
  "aterm-json",
@@ -700,7 +523,17 @@ dependencies = [
  "aterm-lexicon",
  "aterm-log",
  "aterm-messages",
- "aterm-net",
+ "aterm-models-atpkg",
+ "aterm-models-core",
+ "aterm-models-effects",
+ "aterm-models-gui",
+ "aterm-models-harness",
+ "aterm-models-misc",
+ "aterm-models-native",
+ "aterm-models-release",
+ "aterm-models-render",
+ "aterm-models-session",
+ "aterm-models-update",
  "aterm-objc",
  "aterm-observe",
  "aterm-phase",
@@ -710,42 +543,103 @@ dependencies = [
  "aterm-primer",
  "aterm-pty",
  "aterm-render",
+ "aterm-restore",
  "aterm-sandbox",
  "aterm-scrollback",
  "aterm-search",
- "aterm-selection",
  "aterm-serde",
  "aterm-session",
  "aterm-slog",
  "aterm-spec",
+ "aterm-spec-anchor",
  "aterm-sysprobe",
  "aterm-tempfile",
+ "aterm-theme-pack",
  "aterm-time",
  "aterm-toml",
  "aterm-types",
  "aterm-uds",
  "aterm-update",
  "aterm-update-core",
+ "aterm-wayland",
  "aterm-winit-keymap",
  "aterm-winres",
+ "aterm-x11",
  "atpkg",
  "libc",
  "softbuffer",
- "tracing",
  "windows",
  "winit",
- "x11rb",
+]
+
+[[package]]
+name = "aterm-gui-consent"
+version = "0.106.0"
+dependencies = [
+ "aterm-containment",
+ "aterm-durable",
+ "aterm-effects",
+ "aterm-spec",
+ "aterm-tempfile",
+ "aterm-time",
+ "libc",
+]
+
+[[package]]
+name = "aterm-gui-documents"
+version = "0.106.0"
+dependencies = [
+ "aterm-buffer",
+ "aterm-cap",
+ "aterm-core",
+ "aterm-grapheme",
+ "aterm-models-native",
+ "aterm-spec",
+]
+
+[[package]]
+name = "aterm-gui-fabric"
+version = "0.106.0"
+dependencies = [
+ "aterm-control",
+ "aterm-gui-timing",
+ "aterm-log",
+ "aterm-messages",
+ "aterm-serde",
+ "aterm-session",
+ "aterm-spec",
+ "aterm-toml",
+ "aterm-types",
+]
+
+[[package]]
+name = "aterm-gui-tabs"
+version = "0.106.0"
+dependencies = [
+ "aterm-core",
+ "aterm-models-gui",
+ "aterm-serde",
+ "aterm-session",
+ "aterm-spec",
+]
+
+[[package]]
+name = "aterm-gui-timing"
+version = "0.106.0"
+dependencies = [
+ "aterm-types",
 ]
 
 [[package]]
 name = "aterm-hash"
-version = "0.105.0"
+version = "0.106.0"
 
 [[package]]
 name = "aterm-http"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-codec",
+ "aterm-spec",
  "aterm-uds",
  "rustls",
  "windows-sys 0.61.2",
@@ -753,108 +647,230 @@ dependencies = [
 
 [[package]]
 name = "aterm-json"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-serde",
 ]
 
 [[package]]
 name = "aterm-keeper"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
+ "aterm-core",
  "aterm-hash",
+ "aterm-models-core",
  "aterm-pty",
+ "aterm-restore",
  "aterm-spec",
+ "aterm-spec-anchor",
  "aterm-uds",
 ]
 
 [[package]]
 name = "aterm-lexicon"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-hash",
  "aterm-serde",
+ "aterm-spec",
  "aterm-toml",
 ]
 
 [[package]]
 name = "aterm-libc-oracle"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-json",
- "aterm-serde",
  "aterm-spec",
  "aterm-tempfile",
+ "aterm-toolchain",
  "aterm-uds",
 ]
 
 [[package]]
 name = "aterm-link"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "astream-broker",
  "astream-cap",
+ "astream-sys",
  "aterm-codec",
  "aterm-ctl",
  "aterm-digest",
  "aterm-hash",
+ "aterm-models-core",
+ "aterm-models-session",
+ "aterm-slog",
  "aterm-spec",
  "aterm-tempfile",
  "aterm-time",
  "aterm-toml",
  "aterm-types",
  "aterm-uds",
+ "libc",
 ]
 
 [[package]]
 name = "aterm-log"
-version = "0.105.0"
+version = "0.106.0"
 
 [[package]]
 name = "aterm-lz4"
-version = "0.105.0"
+version = "0.106.0"
+
+[[package]]
+name = "aterm-machines"
+version = "0.106.0"
+dependencies = [
+ "aterm-codec",
+ "aterm-digest",
+ "aterm-durable",
+ "aterm-json",
+ "aterm-serde",
+ "aterm-tempfile",
+ "aterm-toml",
+ "aterm-types",
+ "aterm-uds",
+ "libc",
+]
 
 [[package]]
 name = "aterm-macro-support"
-version = "0.105.0"
+version = "0.106.0"
 
 [[package]]
 name = "aterm-messages"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-codec",
  "aterm-grapheme",
+ "aterm-models-session",
  "aterm-spec",
  "aterm-time",
  "aterm-types",
 ]
 
 [[package]]
-name = "aterm-net"
-version = "0.105.0"
+name = "aterm-models"
+version = "0.106.0"
 dependencies = [
- "aterm-codec",
- "aterm-digest",
+ "aterm-agent",
+ "aterm-core",
+ "aterm-effects",
+ "aterm-gpu",
+ "aterm-grid",
+ "aterm-gui",
+ "aterm-keeper",
+ "aterm-models-atpkg",
+ "aterm-models-core",
+ "aterm-models-effects",
+ "aterm-models-gui",
+ "aterm-models-harness",
+ "aterm-models-misc",
+ "aterm-models-native",
+ "aterm-models-release",
+ "aterm-models-render",
+ "aterm-models-session",
+ "aterm-models-update",
+ "aterm-pty",
+ "aterm-render",
+ "aterm-sandbox",
+ "aterm-search",
+ "aterm-selection",
  "aterm-session",
  "aterm-spec",
- "aterm-uds",
- "libc",
- "rustls",
- "windows-sys 0.61.2",
+ "aterm-update",
+]
+
+[[package]]
+name = "aterm-models-atpkg"
+version = "0.106.0"
+dependencies = [
+ "aterm-spec",
+]
+
+[[package]]
+name = "aterm-models-core"
+version = "0.106.0"
+dependencies = [
+ "aterm-spec",
+]
+
+[[package]]
+name = "aterm-models-effects"
+version = "0.106.0"
+dependencies = [
+ "aterm-spec",
+]
+
+[[package]]
+name = "aterm-models-gui"
+version = "0.106.0"
+dependencies = [
+ "aterm-spec",
+]
+
+[[package]]
+name = "aterm-models-harness"
+version = "0.106.0"
+dependencies = [
+ "aterm-spec",
+]
+
+[[package]]
+name = "aterm-models-misc"
+version = "0.106.0"
+dependencies = [
+ "aterm-spec",
+]
+
+[[package]]
+name = "aterm-models-native"
+version = "0.106.0"
+dependencies = [
+ "aterm-spec",
+]
+
+[[package]]
+name = "aterm-models-release"
+version = "0.106.0"
+dependencies = [
+ "aterm-spec",
+]
+
+[[package]]
+name = "aterm-models-render"
+version = "0.106.0"
+dependencies = [
+ "aterm-spec",
+]
+
+[[package]]
+name = "aterm-models-session"
+version = "0.106.0"
+dependencies = [
+ "aterm-spec",
+]
+
+[[package]]
+name = "aterm-models-update"
+version = "0.106.0"
+dependencies = [
+ "aterm-spec",
 ]
 
 [[package]]
 name = "aterm-objc"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
- "aterm-objc",
+ "aterm-models-core",
  "aterm-spec",
  "aterm-tempfile",
 ]
 
 [[package]]
 name = "aterm-observe"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-core",
  "aterm-regex",
@@ -862,27 +878,29 @@ dependencies = [
 
 [[package]]
 name = "aterm-parser"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-alloc",
  "aterm-provenance",
- "aterm-spec",
 ]
 
 [[package]]
 name = "aterm-phase"
-version = "0.105.0"
+version = "0.106.0"
+dependencies = [
+ "aterm-tempfile",
+]
 
 [[package]]
 name = "aterm-png"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-codec",
 ]
 
 [[package]]
 name = "aterm-policy"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-policy",
  "aterm-serde",
@@ -892,35 +910,37 @@ dependencies = [
 
 [[package]]
 name = "aterm-predict"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
+ "aterm-core",
  "aterm-grapheme",
+ "aterm-models-core",
  "aterm-spec",
  "aterm-time",
 ]
 
 [[package]]
 name = "aterm-primer"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
+ "aterm-durable",
  "aterm-tempfile",
- "aterm-time",
- "aterm-types",
 ]
 
 [[package]]
 name = "aterm-provenance"
-version = "0.105.0"
+version = "0.106.0"
 
 [[package]]
 name = "aterm-pty"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-cap",
  "aterm-containment",
  "aterm-sandbox",
  "aterm-spec",
- "aterm-spec-models",
+ "aterm-spec-anchor",
+ "aterm-tempfile",
  "aterm-types",
  "aterm-uds",
  "libc",
@@ -928,16 +948,18 @@ dependencies = [
 
 [[package]]
 name = "aterm-regex"
-version = "0.105.0"
+version = "0.106.0"
 
 [[package]]
 name = "aterm-release"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-codec",
  "aterm-digest",
+ "aterm-durable",
  "aterm-json",
  "aterm-messages",
+ "aterm-models-release",
  "aterm-serde",
  "aterm-spec",
  "aterm-tempfile",
@@ -946,14 +968,16 @@ dependencies = [
  "aterm-uds",
  "aterm-update",
  "aterm-update-core",
+ "aterm-verify",
  "atpkg",
  "atpkg-keys",
+ "atpkg-publish",
  "ring",
 ]
 
 [[package]]
 name = "aterm-render"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-bidi",
  "aterm-codec",
@@ -962,52 +986,68 @@ dependencies = [
  "aterm-font",
  "aterm-grapheme",
  "aterm-hash",
- "aterm-log",
  "aterm-messages",
+ "aterm-models-effects",
+ "aterm-models-render",
  "aterm-png",
- "aterm-pty",
  "aterm-spec",
+ "aterm-spec-anchor",
  "aterm-types",
  "libc",
 ]
 
 [[package]]
-name = "aterm-rle"
-version = "0.105.0"
+name = "aterm-restore"
+version = "0.106.0"
 dependencies = [
+ "astream-wire",
+ "aterm-core",
+ "aterm-json",
+ "aterm-lz4",
+ "aterm-models-session",
+ "aterm-spec",
+ "aterm-spec-anchor",
+ "aterm-types",
+ "aterm-uds",
+]
+
+[[package]]
+name = "aterm-rle"
+version = "0.106.0"
+dependencies = [
+ "aterm-models-core",
  "aterm-spec",
 ]
 
 [[package]]
 name = "aterm-sandbox"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-cap",
- "aterm-spec",
+ "aterm-models-core",
+ "aterm-spec-anchor",
  "libc",
 ]
 
 [[package]]
 name = "aterm-scene"
-version = "0.105.0"
+version = "0.106.0"
 
 [[package]]
 name = "aterm-scrollback"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-alloc",
  "aterm-log",
  "aterm-lz4",
  "aterm-rle",
  "aterm-spec",
- "aterm-tempfile",
  "aterm-types",
- "libc",
 ]
 
 [[package]]
 name = "aterm-search"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-grapheme",
  "aterm-hash",
@@ -1019,24 +1059,26 @@ dependencies = [
 
 [[package]]
 name = "aterm-selection"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-grapheme",
+ "aterm-models-core",
  "aterm-regex",
  "aterm-spec",
+ "aterm-spec-anchor",
  "aterm-types",
 ]
 
 [[package]]
 name = "aterm-serde"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-serde-derive",
 ]
 
 [[package]]
 name = "aterm-serde-derive"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-macro-support",
  "aterm-serde",
@@ -1044,45 +1086,54 @@ dependencies = [
 
 [[package]]
 name = "aterm-session"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
+ "aterm-models-core",
+ "aterm-models-session",
  "aterm-pty",
  "aterm-spec",
+ "aterm-spec-anchor",
  "aterm-uds",
  "libc",
 ]
 
 [[package]]
 name = "aterm-shell-integration"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
+ "aterm-cap",
  "aterm-containment",
  "aterm-digest",
  "aterm-log",
+ "aterm-pty",
+ "aterm-sandbox",
+ "aterm-spec",
  "aterm-tempfile",
  "aterm-uds",
 ]
 
 [[package]]
 name = "aterm-sixel"
-version = "0.105.0"
+version = "0.106.0"
 
 [[package]]
 name = "aterm-slog"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-codec",
  "aterm-messages",
+ "aterm-models-session",
  "aterm-phase",
  "aterm-spec",
 ]
 
 [[package]]
 name = "aterm-spec"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-json",
  "aterm-spec",
+ "aterm-spec-anchor",
  "aterm-spec-macros",
  "aterm-tempfile",
  "aterm-uds",
@@ -1090,72 +1141,100 @@ dependencies = [
 ]
 
 [[package]]
+name = "aterm-spec-anchor"
+version = "0.106.0"
+dependencies = [
+ "aterm-spec-macros",
+]
+
+[[package]]
 name = "aterm-spec-macros"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-macro-support",
  "aterm-spec",
+ "aterm-spec-anchor",
 ]
 
 [[package]]
 name = "aterm-spec-models"
-version = "0.105.0"
+version = "0.106.0"
 
 [[package]]
 name = "aterm-sysprobe"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
- "aterm-messages",
- "aterm-objc",
- "aterm-tempfile",
  "libc",
 ]
 
 [[package]]
 name = "aterm-tempfile"
-version = "0.105.0"
+version = "0.106.0"
+
+[[package]]
+name = "aterm-theme-pack"
+version = "0.106.0"
+dependencies = [
+ "aterm-tempfile",
+ "aterm-types",
+]
 
 [[package]]
 name = "aterm-time"
-version = "0.105.0"
+version = "0.106.0"
 
 [[package]]
 name = "aterm-toml"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-serde",
 ]
 
 [[package]]
-name = "aterm-tracing-attributes"
-version = "0.105.0"
+name = "aterm-toolchain"
+version = "0.106.0"
+dependencies = [
+ "aterm-spec",
+ "aterm-tempfile",
+]
 
 [[package]]
 name = "aterm-types"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-alloc",
+ "aterm-durable",
  "aterm-hash",
+ "aterm-json",
  "aterm-log",
  "aterm-serde",
  "aterm-spec",
+ "aterm-tempfile",
  "aterm-time",
 ]
 
 [[package]]
 name = "aterm-uds"
-version = "0.105.0"
+version = "0.106.0"
+dependencies = [
+ "aterm-tempfile",
+ "libc",
+]
 
 [[package]]
 name = "aterm-update"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-codec",
  "aterm-digest",
+ "aterm-durable",
  "aterm-json",
  "aterm-log",
+ "aterm-models-misc",
+ "aterm-models-update",
  "aterm-serde",
  "aterm-spec",
+ "aterm-spec-anchor",
  "aterm-tempfile",
  "aterm-time",
  "aterm-toml",
@@ -1169,10 +1248,11 @@ dependencies = [
 
 [[package]]
 name = "aterm-update-core"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-codec",
  "aterm-digest",
+ "aterm-durable",
  "aterm-json",
  "aterm-log",
  "aterm-serde",
@@ -1187,31 +1267,27 @@ dependencies = [
 
 [[package]]
 name = "aterm-verify"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-census",
+ "aterm-codec",
  "aterm-digest",
  "aterm-forge",
  "aterm-hash",
  "aterm-json",
+ "aterm-png",
  "aterm-serde",
  "aterm-tempfile",
  "aterm-toml",
+ "aterm-toolchain",
  "aterm-uds",
  "aterm-wasm-abi",
  "libc",
 ]
 
 [[package]]
-name = "aterm-vi"
-version = "0.105.0"
-dependencies = [
- "aterm-types",
-]
-
-[[package]]
 name = "aterm-wasm"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-control",
  "aterm-core",
@@ -1219,6 +1295,7 @@ dependencies = [
  "aterm-messages",
  "aterm-predict",
  "aterm-render",
+ "aterm-spec",
  "aterm-time",
  "aterm-types",
  "aterm-wasm-abi",
@@ -1226,7 +1303,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-wasm-abi"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-wasm-abi",
  "aterm-wasm-abi-macros",
@@ -1234,19 +1311,30 @@ dependencies = [
 
 [[package]]
 name = "aterm-wasm-abi-macros"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-macro-support",
  "aterm-wasm-abi",
 ]
 
 [[package]]
+name = "aterm-wayland"
+version = "0.106.0"
+dependencies = [
+ "aterm-dl",
+ "aterm-log",
+ "aterm-tempfile",
+ "aterm-uds",
+ "libc",
+]
+
+[[package]]
 name = "aterm-win32"
-version = "0.105.0"
+version = "0.106.0"
 
 [[package]]
 name = "aterm-win32-oracle"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-census",
  "aterm-json",
@@ -1257,7 +1345,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-winit-keymap"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-types",
  "winit",
@@ -1265,38 +1353,52 @@ dependencies = [
 
 [[package]]
 name = "aterm-winres"
-version = "0.105.0"
+version = "0.106.0"
 
 [[package]]
 name = "aterm-winsign"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-update-core",
 ]
 
 [[package]]
+name = "aterm-x11"
+version = "0.106.0"
+dependencies = [
+ "aterm-dl",
+ "aterm-tempfile",
+ "aterm-uds",
+ "libc",
+]
+
+[[package]]
+name = "aterm-xkb"
+version = "0.106.0"
+dependencies = [
+ "aterm-dl",
+ "aterm-x11",
+]
+
+[[package]]
 name = "aterm-zstd"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-digest",
 ]
 
 [[package]]
-name = "atomic-waker"
-version = "1.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
-
-[[package]]
 name = "atpkg"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-codec",
  "aterm-containment",
  "aterm-digest",
+ "aterm-durable",
  "aterm-forge",
  "aterm-hash",
  "aterm-json",
+ "aterm-models-atpkg",
  "aterm-primer",
  "aterm-pty",
  "aterm-serde",
@@ -1304,6 +1406,7 @@ dependencies = [
  "aterm-tempfile",
  "aterm-time",
  "aterm-toml",
+ "aterm-toolchain",
  "aterm-types",
  "aterm-uds",
  "aterm-update-core",
@@ -1314,9 +1417,11 @@ dependencies = [
 
 [[package]]
 name = "atpkg-keys"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
  "aterm-codec",
+ "aterm-durable",
+ "aterm-models-release",
  "aterm-pty",
  "aterm-spec",
  "aterm-tempfile",
@@ -1332,9 +1437,12 @@ dependencies = [
 
 [[package]]
 name = "atpkg-publish"
-version = "0.105.0"
+version = "0.106.0"
 dependencies = [
+ "aterm-digest",
+ "aterm-durable",
  "aterm-json",
+ "aterm-models-atpkg",
  "aterm-spec",
  "aterm-tempfile",
  "aterm-time",
@@ -1345,43 +1453,6 @@ dependencies = [
  "aterm-zstd",
  "atpkg",
  "atpkg-keys",
-]
-
-[[package]]
-name = "atspi"
-version = "0.29.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c77886257be21c9cd89a4ae7e64860c6f0eefca799bb79127913052bd0eefb3d"
-dependencies = [
- "atspi-common",
- "atspi-proxies",
-]
-
-[[package]]
-name = "atspi-common"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20c5617155740c98003016429ad13fe43ce7a77b007479350a9f8bf95a29f63d"
-dependencies = [
- "enumflags2",
- "serde",
- "static_assertions",
- "zbus",
- "zbus-lockstep",
- "zbus-lockstep-macros",
- "zbus_names",
- "zvariant",
-]
-
-[[package]]
-name = "atspi-proxies"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2230e48787ed3eb4088996eab66a32ca20c0b67bbd4fd6cdfe79f04f1f04c9fc"
-dependencies = [
- "atspi-common",
- "serde",
- "zbus",
 ]
 
 [[package]]
@@ -1413,38 +1484,18 @@ checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
 
 [[package]]
 name = "block2"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c132eebf10f5cad5289222520a4a058514204aed6d791f1cf4fe8088b82d15f"
-dependencies = [
- "objc2 0.5.2",
-]
-
-[[package]]
-name = "block2"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cdeb9d870516001442e364c5220d3574d2da8dc765554b4a617230d33fa58ef5"
 dependencies = [
- "objc2 0.6.4",
-]
-
-[[package]]
-name = "blocking"
-version = "1.6.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e83f8d02be6967315521be875afa792a316e28d57b5a2d401897e2a7921b7f21"
-dependencies = [
- "async-channel",
- "async-task",
- "futures-io",
- "futures-lite",
- "piper",
+ "objc2",
 ]
 
 [[package]]
 name = "bumpalo"
 version = "3.20.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
 name = "bytemuck"
@@ -1464,32 +1515,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "calloop"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b99da2f8558ca23c71f4fd15dc57c906239752dd27ff3c00a1d56b685b7cbfec"
-dependencies = [
- "bitflags",
- "log",
- "polling",
- "rustix 0.38.44",
- "slab",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "calloop-wayland-source"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95a66a987056935f7efce4ab5668920b5d0dac4a7c99991a67395f13702ddd20"
-dependencies = [
- "calloop",
- "rustix 0.38.44",
- "wayland-backend",
- "wayland-client",
 ]
 
 [[package]]
@@ -1557,15 +1582,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "concurrent-queue"
-version = "2.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ca0197aee26d1ae37445ee532fefce43251d24cc7c166799f4d46817f1d3973"
-dependencies = [
- "crossbeam-utils",
-]
-
-[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1573,12 +1589,6 @@ checksum = "59ed5838eebb26a2bb2e58f6d5b5316989ae9d08bab10e0e6d103e656d1b0280"
 dependencies = [
  "libc",
 ]
-
-[[package]]
-name = "crossbeam-utils"
-version = "0.8.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
 name = "crunchy"
@@ -1597,28 +1607,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "ctor"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83cf0d42651b16c6dfe68685716d18480d18a9c39c62d76e8cf3eb6ed5d8bcbf"
-dependencies = [
- "dtor",
-]
-
-[[package]]
-name = "cursor-icon"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
-
-[[package]]
 name = "dispatch2"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e0e367e4e7da84520dedcac1901e4da967309406d1e51017ae1abfb97adbd38"
 dependencies = [
  "bitflags",
- "objc2 0.6.4",
+ "objc2",
 ]
 
 [[package]]
@@ -1635,86 +1630,10 @@ name = "document-features"
 version = "0.2.12"
 
 [[package]]
-name = "downcast-rs"
-version = "1.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
-
-[[package]]
-name = "dtor"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "edf234dd1594d6dd434a8fb8cada51ddbbc593e40e4a01556a0b31c62da2775b"
-
-[[package]]
-name = "endi"
-version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66b7e2430c6dff6a955451e2cfc438f09cea1965a9d6f87f7e3b90decc014099"
-
-[[package]]
-name = "enumflags2"
-version = "0.7.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1027f7680c853e056ebcec683615fb6fbbc07dbaa13b4d5d9442b146ded4ecef"
-dependencies = [
- "enumflags2_derive",
- "serde",
-]
-
-[[package]]
-name = "enumflags2_derive"
-version = "0.7.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67c78a4d8fdf9953a5c9d458f9efe940fd97a0cab0941c075a813ac594733827"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
-
-[[package]]
-name = "errno"
-version = "0.3.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
-dependencies = [
- "libc",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "event-listener"
-version = "5.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e13b66accf52311f30a0db42147dadea9850cb48cd070028831ae5f5d4b856ab"
-dependencies = [
- "concurrent-queue",
- "parking",
- "pin-project-lite",
-]
-
-[[package]]
-name = "event-listener-strategy"
-version = "0.5.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8be9f3dfaaffdae2972880079a491a1a8bb7cbed0b8dd7a347f668b4150a3b93"
-dependencies = [
- "event-listener",
- "pin-project-lite",
-]
-
-[[package]]
-name = "fastrand"
-version = "2.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
 name = "find-msvc-tools"
@@ -1735,61 +1654,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
-name = "futures-core"
-version = "0.3.32"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e3450815272ef58cec6d564423f6e755e25379b217b0bc688e295ba24df6b1d"
-
-[[package]]
-name = "futures-io"
-version = "0.3.32"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cecba35d7ad927e23624b22ad55235f2239cfa44fd10428eecbeba6d6a717718"
-
-[[package]]
-name = "futures-lite"
-version = "2.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f78e10609fe0e0b3f4157ffab1876319b5b0db102a2c60dc4626306dc46b44ad"
-dependencies = [
- "fastrand",
- "futures-core",
- "futures-io",
- "parking",
- "pin-project-lite",
-]
-
-[[package]]
-name = "futures-macro"
-version = "0.3.32"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e835b70203e41293343137df5c0664546da5745f82ec9b84d40be8336958447b"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
-name = "futures-task"
-version = "0.3.32"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "037711b3d59c33004d3856fbdc83b99d4ff37a24768fa1be9ce3538a1cde4393"
-
-[[package]]
-name = "futures-util"
-version = "0.3.32"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "389ca41296e6190b48053de0321d02a77f32f8a5d2461dd38762c0593805c6d6"
-dependencies = [
- "futures-core",
- "futures-macro",
- "futures-task",
- "pin-project-lite",
- "slab",
-]
-
-[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1800,33 +1664,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "gethostname"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1bd49230192a3797a9a4d6abe9b3eed6f7fa4c8a8a4947977c6f80025f92cbd8"
-dependencies = [
- "rustix 1.1.4",
- "windows-link",
-]
-
-[[package]]
 name = "getrandom"
 version = "0.2.17"
 dependencies = [
  "aterm-uds",
  "ring",
-]
-
-[[package]]
-name = "getrandom"
-version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
-dependencies = [
- "cfg-if",
- "libc",
- "r-efi",
- "wasip2",
 ]
 
 [[package]]
@@ -1928,18 +1770,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hermit-abi"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
-
-[[package]]
-name = "hex"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
-
-[[package]]
 name = "hexf-parse"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1947,7 +1777,9 @@ checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
 name = "indexmap"
-version = "2.14.0"
+version = "2.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7714e70437a7dc3ac8eb7e6f8df75fd8eb422675fc7678aff7364301092b1017"
 dependencies = [
  "equivalent",
  "hashbrown 0.16.1",
@@ -2036,12 +1868,6 @@ name = "libm"
 version = "0.2.16"
 
 [[package]]
-name = "linux-raw-sys"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
-
-[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2059,24 +1885,6 @@ name = "memchr"
 version = "2.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b947ae49db0d222b1dbc6b113ce7248a3fc3a6ca21b696717bfc000ba4484d8"
-
-[[package]]
-name = "memmap2"
-version = "0.9.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "714098028fe011992e1c3962653c96b2d578c4b4bce9036e15ff220319b1e0e3"
-dependencies = [
- "libc",
-]
-
-[[package]]
-name = "memoffset"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
-dependencies = [
- "autocfg",
-]
 
 [[package]]
 name = "naga"
@@ -2161,80 +1969,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "objc-sys"
-version = "0.3.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdb91bdd390c7ce1a8607f35f3ca7151b65afc0ff5ff3b34fa350f7d7c7e4310"
-
-[[package]]
-name = "objc2"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46a785d4eeff09c14c487497c162e92766fbb3e4059a71840cecc03d9a50b804"
-dependencies = [
- "objc-sys",
- "objc2-encode",
-]
-
-[[package]]
 name = "objc2"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a12a8ed07aefc768292f076dc3ac8c48f3781c8f2d5851dd3d98950e8c5a89f"
 dependencies = [
  "objc2-encode",
-]
-
-[[package]]
-name = "objc2-app-kit"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4e89ad9e3d7d297152b17d39ed92cd50ca8063a89a9fa569046d41568891eff"
-dependencies = [
- "bitflags",
- "block2 0.5.1",
- "libc",
- "objc2 0.5.2",
- "objc2-core-data",
- "objc2-core-image",
- "objc2-foundation 0.2.2",
- "objc2-quartz-core 0.2.2",
-]
-
-[[package]]
-name = "objc2-cloud-kit"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74dd3b56391c7a0596a295029734d3c1c5e7e510a4cb30245f8221ccea96b009"
-dependencies = [
- "bitflags",
- "block2 0.5.1",
- "objc2 0.5.2",
- "objc2-core-location",
- "objc2-foundation 0.2.2",
-]
-
-[[package]]
-name = "objc2-contacts"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5ff520e9c33812fd374d8deecef01d4a840e7b41862d849513de77e44aa4889"
-dependencies = [
- "block2 0.5.1",
- "objc2 0.5.2",
- "objc2-foundation 0.2.2",
-]
-
-[[package]]
-name = "objc2-core-data"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "617fbf49e071c178c0b24c080767db52958f716d9eabdf0890523aeae54773ef"
-dependencies = [
- "bitflags",
- "block2 0.5.1",
- "objc2 0.5.2",
- "objc2-foundation 0.2.2",
 ]
 
 [[package]]
@@ -2245,7 +1985,7 @@ checksum = "2a180dd8642fa45cdb7dd721cd4c11b1cadd4929ce112ebd8b9f5803cc79d536"
 dependencies = [
  "bitflags",
  "dispatch2",
- "objc2 0.6.4",
+ "objc2",
 ]
 
 [[package]]
@@ -2256,33 +1996,9 @@ checksum = "e022c9d066895efa1345f8e33e584b9f958da2fd4cd116792e15e07e4720a807"
 dependencies = [
  "bitflags",
  "dispatch2",
- "objc2 0.6.4",
+ "objc2",
  "objc2-core-foundation",
  "objc2-io-surface",
-]
-
-[[package]]
-name = "objc2-core-image"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "55260963a527c99f1819c4f8e3b47fe04f9650694ef348ffd2227e8196d34c80"
-dependencies = [
- "block2 0.5.1",
- "objc2 0.5.2",
- "objc2-foundation 0.2.2",
- "objc2-metal 0.2.2",
-]
-
-[[package]]
-name = "objc2-core-location"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "000cfee34e683244f284252ee206a27953279d370e309649dc3ee317b37e5781"
-dependencies = [
- "block2 0.5.1",
- "objc2 0.5.2",
- "objc2-contacts",
- "objc2-foundation 0.2.2",
 ]
 
 [[package]]
@@ -2293,24 +2009,12 @@ checksum = "ef25abbcd74fb2609453eb695bd2f860d389e457f67dc17cafc8b8cbc89d0c33"
 
 [[package]]
 name = "objc2-foundation"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ee638a5da3799329310ad4cfa62fbf045d5f56e3ef5ba4149e7452dcf89d5a8"
-dependencies = [
- "bitflags",
- "block2 0.5.1",
- "libc",
- "objc2 0.5.2",
-]
-
-[[package]]
-name = "objc2-foundation"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3e0adef53c21f888deb4fa59fc59f7eb17404926ee8a6f59f5df0fd7f9f3272"
 dependencies = [
  "bitflags",
- "objc2 0.6.4",
+ "objc2",
  "objc2-core-foundation",
 ]
 
@@ -2321,32 +2025,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "180788110936d59bab6bd83b6060ffdfffb3b922ba1396b312ae795e1de9d81d"
 dependencies = [
  "bitflags",
- "objc2 0.6.4",
+ "objc2",
  "objc2-core-foundation",
-]
-
-[[package]]
-name = "objc2-link-presentation"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1a1ae721c5e35be65f01a03b6d2ac13a54cb4fa70d8a5da293d7b0020261398"
-dependencies = [
- "block2 0.5.1",
- "objc2 0.5.2",
- "objc2-app-kit",
- "objc2-foundation 0.2.2",
-]
-
-[[package]]
-name = "objc2-metal"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd0cba1276f6023976a406a14ffa85e1fdd19df6b0f737b063b95f6c8c7aadd6"
-dependencies = [
- "bitflags",
- "block2 0.5.1",
- "objc2 0.5.2",
- "objc2-foundation 0.2.2",
 ]
 
 [[package]]
@@ -2356,22 +2036,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a0125f776a10d00af4152d74616409f0d4a2053a6f57fa5b7d6aa2854ac04794"
 dependencies = [
  "bitflags",
- "block2 0.6.2",
- "objc2 0.6.4",
- "objc2-foundation 0.3.2",
-]
-
-[[package]]
-name = "objc2-quartz-core"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e42bee7bff906b14b167da2bac5efe6b6a07e6f7c0a21a7308d40c960242dc7a"
-dependencies = [
- "bitflags",
- "block2 0.5.1",
- "objc2 0.5.2",
- "objc2-foundation 0.2.2",
- "objc2-metal 0.2.2",
+ "block2",
+ "objc2",
+ "objc2-foundation",
 ]
 
 [[package]]
@@ -2381,65 +2048,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96c1358452b371bf9f104e21ec536d37a650eb10f7ee379fff67d2e08d537f1f"
 dependencies = [
  "bitflags",
- "objc2 0.6.4",
+ "objc2",
  "objc2-core-foundation",
- "objc2-foundation 0.3.2",
- "objc2-metal 0.3.2",
-]
-
-[[package]]
-name = "objc2-symbols"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a684efe3dec1b305badae1a28f6555f6ddd3bb2c2267896782858d5a78404dc"
-dependencies = [
- "objc2 0.5.2",
- "objc2-foundation 0.2.2",
-]
-
-[[package]]
-name = "objc2-ui-kit"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8bb46798b20cd6b91cbd113524c490f1686f4c4e8f49502431415f3512e2b6f"
-dependencies = [
- "bitflags",
- "block2 0.5.1",
- "objc2 0.5.2",
- "objc2-cloud-kit",
- "objc2-core-data",
- "objc2-core-image",
- "objc2-core-location",
- "objc2-foundation 0.2.2",
- "objc2-link-presentation",
- "objc2-quartz-core 0.2.2",
- "objc2-symbols",
- "objc2-uniform-type-identifiers",
- "objc2-user-notifications",
-]
-
-[[package]]
-name = "objc2-uniform-type-identifiers"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44fa5f9748dbfe1ca6c0b79ad20725a11eca7c2218bceb4b005cb1be26273bfe"
-dependencies = [
- "block2 0.5.1",
- "objc2 0.5.2",
- "objc2-foundation 0.2.2",
-]
-
-[[package]]
-name = "objc2-user-notifications"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76cfcbf642358e8689af64cee815d139339f3ed8ad05103ed5eaf73db8d84cb3"
-dependencies = [
- "bitflags",
- "block2 0.5.1",
- "objc2 0.5.2",
- "objc2-core-location",
- "objc2-foundation 0.2.2",
+ "objc2-foundation",
+ "objc2-metal",
 ]
 
 [[package]]
@@ -2460,31 +2072,6 @@ checksum = "b7d950ca161dc355eaf28f82b11345ed76c6e1f6eb1f4f4479e0323b9e2fbd0e"
 dependencies = [
  "num-traits",
 ]
-
-[[package]]
-name = "ordered-stream"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9aa2b01e1d916879f73a53d01d1d6cee68adbb31d6d9177a8cfce093cced1d50"
-dependencies = [
- "futures-core",
- "pin-project-lite",
-]
-
-[[package]]
-name = "owned_ttf_parser"
-version = "0.25.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36820e9051aca1014ddc75770aab4d68bc1e9e632f0f5627c4086bc216fb583b"
-dependencies = [
- "ttf-parser",
-]
-
-[[package]]
-name = "parking"
-version = "2.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f38d5652c16fde515bb1ecef450ab0f6a219d619a7274976324d5e377f7dceba"
 
 [[package]]
 name = "parking_lot"
@@ -2510,84 +2097,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "phf"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1562dc717473dbaa4c1f85a36410e03c047b2e7df7f45ee938fbef64ae7fadf"
-dependencies = [
- "phf_macros",
- "phf_shared",
- "serde",
-]
-
-[[package]]
-name = "phf_generator"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "135ace3a761e564ec88c03a77317a7c6b80bb7f7135ef2544dbe054243b89737"
-dependencies = [
- "fastrand",
- "phf_shared",
-]
-
-[[package]]
-name = "phf_macros"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "812f032b54b1e759ccd5f8b6677695d5268c588701effba24601f6932f8269ef"
-dependencies = [
- "phf_generator",
- "phf_shared",
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
-name = "phf_shared"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e57fef6bc5981e38c2ce2d63bfa546861309f875b8a75f092d1d54ae2d64f266"
-dependencies = [
- "siphasher",
-]
-
-[[package]]
-name = "pin-project-lite"
-version = "0.2.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
-
-[[package]]
-name = "piper"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c835479a4443ded371d6c535cbfd8d31ad92c5d23ae9770a61bc155e4992a3c1"
-dependencies = [
- "atomic-waker",
- "fastrand",
- "futures-io",
-]
-
-[[package]]
 name = "pkg-config"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
-
-[[package]]
-name = "polling"
-version = "3.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d0e4f59085d47d8241c88ead0f274e8a0cb551f3625263c05eb8dd897c34218"
-dependencies = [
- "cfg-if",
- "concurrent-queue",
- "hermit-abi",
- "pin-project-lite",
- "rustix 1.1.4",
- "windows-sys 0.61.2",
-]
 
 [[package]]
 name = "poly1305"
@@ -2644,16 +2157,6 @@ name = "profiling"
 version = "1.0.18"
 
 [[package]]
-name = "quick-xml"
-version = "0.39.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdcc8dd4e2f670d309a5f0e83fe36dfdc05af317008fea29144da1a2ac858e5e"
-dependencies = [
- "memchr",
- "serde",
-]
-
-[[package]]
 name = "quote"
 version = "1.0.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2661,12 +2164,6 @@ checksum = "41f2619966050689382d2b44f664f4bc593e129785a36d6ee376ddf37259b924"
 dependencies = [
  "proc-macro2",
 ]
-
-[[package]]
-name = "r-efi"
-version = "5.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
 
 [[package]]
 name = "range-alloc"
@@ -2686,10 +2183,10 @@ version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40d213455a5f1dc59214213c7330e074ddf8114c9a42411eb890c767357ce135"
 dependencies = [
- "objc2 0.6.4",
+ "objc2",
  "objc2-core-foundation",
- "objc2-foundation 0.3.2",
- "objc2-quartz-core 0.3.2",
+ "objc2-foundation",
+ "objc2-quartz-core",
 ]
 
 [[package]]
@@ -2715,7 +2212,7 @@ checksum = "a4689e6c2294d81e88dc6261c768b63bc4fcdb852be6d1352498b114f61383b7"
 dependencies = [
  "cc",
  "cfg-if",
- "getrandom 0.2.17",
+ "getrandom",
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
@@ -2726,27 +2223,6 @@ name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
-
-[[package]]
-name = "rustix"
-version = "0.38.44"
-dependencies = [
- "libc",
- "rustix 1.1.4",
-]
-
-[[package]]
-name = "rustix"
-version = "1.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
-dependencies = [
- "bitflags",
- "errno",
- "libc",
- "linux-raw-sys",
- "windows-sys 0.61.2",
-]
 
 [[package]]
 name = "rustls"
@@ -2789,39 +2265,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
-name = "scoped-tls"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1cf6437eb19a8f4a6cc0f7dca544973b0b78843adbfeb3683d1a94a0024a294"
-
-[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
-
-[[package]]
-name = "sctk-adwaita"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6277f0217056f77f1d8f49f2950ac6c278c0d607c45f5ee99328d792ede24ec"
-dependencies = [
- "ab_glyph",
- "log",
- "memmap2",
- "smithay-client-toolkit",
- "tiny-skia",
-]
-
-[[package]]
-name = "serde"
-version = "1.0.228"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
-dependencies = [
- "serde_core",
- "serde_derive",
-]
 
 [[package]]
 name = "serde_core"
@@ -2844,43 +2291,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde_repr"
-version = "0.1.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "175ee3e80ae9982737ca543e96133087cbd9a485eecc3bc4de9c1a37b47ea59c"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
 name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
-
-[[package]]
-name = "signal-hook-registry"
-version = "1.4.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
-dependencies = [
- "errno",
- "libc",
-]
-
-[[package]]
-name = "siphasher"
-version = "1.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
-
-[[package]]
-name = "slab"
-version = "0.4.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "slotmap"
@@ -2899,59 +2313,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "smithay-client-toolkit"
-version = "0.19.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3457dea1f0eb631b4034d61d4d8c32074caa6cd1ab2d59f2327bd8461e2c0016"
-dependencies = [
- "bitflags",
- "calloop",
- "calloop-wayland-source",
- "cursor-icon",
- "libc",
- "log",
- "memmap2",
- "rustix 0.38.44",
- "thiserror 1.0.69",
- "wayland-backend",
- "wayland-client",
- "wayland-csd-frame",
- "wayland-cursor",
- "wayland-protocols",
- "wayland-protocols-wlr",
- "wayland-scanner",
- "xkeysym",
-]
-
-[[package]]
 name = "softbuffer"
 version = "0.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aac18da81ebbf05109ab275b157c22a653bb3c12cf884450179942f81bcbf6c3"
 dependencies = [
- "as-raw-xcb-connection",
  "bytemuck",
- "fastrand",
  "js-sys",
- "memmap2",
  "ndk",
- "objc2 0.6.4",
+ "objc2",
  "objc2-core-foundation",
  "objc2-core-graphics",
- "objc2-foundation 0.3.2",
- "objc2-quartz-core 0.3.2",
+ "objc2-foundation",
+ "objc2-quartz-core",
  "raw-window-handle",
  "redox_syscall",
- "rustix 1.1.4",
- "tiny-xlib",
  "tracing",
  "wasm-bindgen",
- "wayland-backend",
- "wayland-client",
- "wayland-sys",
  "web-sys",
  "windows-sys 0.61.2",
- "x11rb",
 ]
 
 [[package]]
@@ -2970,12 +2350,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
-name = "strict-num"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6637bab7722d379c8b41ba849228d680cc12d0a45ba1fa2b48f2a30577a06731"
-
-[[package]]
 name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2990,19 +2364,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
-]
-
-[[package]]
-name = "tempfile"
-version = "3.27.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
-dependencies = [
- "fastrand",
- "getrandom 0.3.4",
- "once_cell",
- "rustix 1.1.4",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3046,44 +2407,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tiny-skia"
-version = "0.11.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83d13394d44dae3207b52a326c0c85a8bf87f1541f23b0d143811088497b09ab"
-dependencies = [
- "arrayref",
- "arrayvec",
- "bytemuck",
- "cfg-if",
- "log",
- "tiny-skia-path",
-]
-
-[[package]]
-name = "tiny-skia-path"
-version = "0.11.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c9e7fc0c2e86a30b117d0462aa261b72b7a99b7ebd7deb3a14ceda95c5bdc93"
-dependencies = [
- "arrayref",
- "bytemuck",
- "strict-num",
-]
-
-[[package]]
-name = "tiny-xlib"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a90a0ca3ee6a69f2ad28fd11621a4c3f03b371f366be500b64df260c4ffbafb4"
-dependencies = [
- "as-raw-xcb-connection",
- "ctor",
- "libloading",
- "pkg-config",
- "tracing",
-]
-
-[[package]]
 name = "toml_datetime"
 version = "1.1.1+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3116,32 +2439,12 @@ dependencies = [
 [[package]]
 name = "tracing"
 version = "0.1.44"
-dependencies = [
- "aterm-tracing-attributes",
-]
-
-[[package]]
-name = "ttf-parser"
-version = "0.25.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 
 [[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
-
-[[package]]
-name = "uds_windows"
-version = "1.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
-dependencies = [
- "memoffset",
- "tempfile",
- "windows-sys 0.61.2",
-]
 
 [[package]]
 name = "unicode-ident"
@@ -3173,30 +2476,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
-name = "uuid"
-version = "1.23.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "144d6b123cef80b301b8f72a9e2ca4370ddec21950d0a103dd22c437006d2db7"
-dependencies = [
- "js-sys",
- "serde_core",
- "wasm-bindgen",
-]
-
-[[package]]
 name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "wasip2"
-version = "1.0.3+wasi-0.2.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20064672db26d7cdc89c7798c48a0fdfac8213434a1186e5ef29fd560ae223d6"
-dependencies = [
- "wit-bindgen",
-]
 
 [[package]]
 name = "wasm-bindgen"
@@ -3209,19 +2492,6 @@ dependencies = [
  "rustversion",
  "wasm-bindgen-macro",
  "wasm-bindgen-shared",
-]
-
-[[package]]
-name = "wasm-bindgen-futures"
-version = "0.4.58"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70a6e77fd0ae8029c9ea0063f87c46fde723e7d887703d74ad2616d792e51e6f"
-dependencies = [
- "cfg-if",
- "js-sys",
- "once_cell",
- "wasm-bindgen",
- "web-sys",
 ]
 
 [[package]]
@@ -3254,103 +2524,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f01b580c9ac74c8d8f0c0e4afb04eeef2acf145458e52c03845ee9cd23e3d12"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "wayland-backend"
-version = "0.3.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2857dd20b54e916ec7253b3d6b4d5c4d7d4ca2c33c2e11c6c76a99bd8744755d"
-dependencies = [
- "cc",
- "downcast-rs",
- "rustix 1.1.4",
- "scoped-tls",
- "smallvec",
- "wayland-sys",
-]
-
-[[package]]
-name = "wayland-client"
-version = "0.31.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "645c7c96bb74690c3189b5c9cb4ca1627062bb23693a4fad9d8c3de958260144"
-dependencies = [
- "bitflags",
- "rustix 1.1.4",
- "wayland-backend",
- "wayland-scanner",
-]
-
-[[package]]
-name = "wayland-csd-frame"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "625c5029dbd43d25e6aa9615e88b829a5cad13b2819c4ae129fdbb7c31ab4c7e"
-dependencies = [
- "bitflags",
- "cursor-icon",
- "wayland-backend",
-]
-
-[[package]]
-name = "wayland-cursor"
-version = "0.31.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a52d18780be9b1314328a3de5f930b73d2200112e3849ca6cb11822793fb34d"
-dependencies = [
- "rustix 1.1.4",
- "wayland-client",
- "xcursor",
-]
-
-[[package]]
-name = "wayland-protocols"
-version = "0.32.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "563a85523cade2429938e790815fd7319062103b9f4a2dc806e9b53b95982d8f"
-dependencies = [
- "bitflags",
- "wayland-backend",
- "wayland-client",
- "wayland-scanner",
-]
-
-[[package]]
-name = "wayland-protocols-plasma"
-version = "0.3.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b6d8cf1eb2c1c31ed1f5643c88a6e53538129d4af80030c8cabd1f9fa884d91"
-dependencies = [
- "bitflags",
- "wayland-backend",
- "wayland-client",
- "wayland-protocols",
- "wayland-scanner",
-]
-
-[[package]]
-name = "wayland-protocols-wlr"
-version = "0.3.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb04e52f7836d7c7976c78ca0250d61e33873c34156a2a1fc9474828ec268234"
-dependencies = [
- "bitflags",
- "wayland-backend",
- "wayland-client",
- "wayland-protocols",
- "wayland-scanner",
-]
-
-[[package]]
-name = "wayland-scanner"
-version = "0.31.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c324a910fd86ebdc364a3e61ec1f11737d3b1d6c273c0239ee8ff4bc0d24b4a"
-dependencies = [
- "proc-macro2",
- "quick-xml",
- "quote",
 ]
 
 [[package]]
@@ -3388,15 +2561,12 @@ dependencies = [
  "cfg_aliases",
  "document-features",
  "hashbrown 0.16.1",
- "js-sys",
  "log",
  "portable-atomic",
  "profiling",
  "raw-window-handle",
  "smallvec",
  "static_assertions",
- "wasm-bindgen",
- "web-sys",
  "wgpu-core",
  "wgpu-hal",
  "wgpu-types",
@@ -3428,7 +2598,7 @@ dependencies = [
  "smallvec",
  "thiserror 2.0.18",
  "wgpu-core-deps-apple",
- "wgpu-core-deps-wasm",
+ "wgpu-core-deps-emscripten",
  "wgpu-core-deps-windows-linux-android",
  "wgpu-hal",
  "wgpu-naga-bridge",
@@ -3445,10 +2615,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "wgpu-core-deps-wasm"
+name = "wgpu-core-deps-emscripten"
 version = "29.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c2f2fb042f36920771deb0b966543c5751b18f3d327760ffc90f74e20b2dcd4"
+checksum = "3487cd6293a963bc5c0c0396f6a2192043c50003c07f4efdccbad3d90ec9d819"
 dependencies = [
  "wgpu-hal",
 ]
@@ -3473,7 +2643,7 @@ dependencies = [
  "ash",
  "bit-set",
  "bitflags",
- "block2 0.6.2",
+ "block2",
  "bytemuck",
  "cfg-if",
  "cfg_aliases",
@@ -3489,11 +2659,11 @@ dependencies = [
  "log",
  "naga",
  "ndk-sys",
- "objc2 0.6.4",
+ "objc2",
  "objc2-core-foundation",
- "objc2-foundation 0.3.2",
- "objc2-metal 0.3.2",
- "objc2-quartz-core 0.3.2",
+ "objc2-foundation",
+ "objc2-metal",
+ "objc2-quartz-core",
  "once_cell",
  "ordered-float",
  "parking_lot",
@@ -3665,28 +2835,18 @@ dependencies = [
 name = "winit"
 version = "0.30.13"
 dependencies = [
+ "aterm-cg",
  "aterm-grapheme",
  "aterm-hash",
  "aterm-objc",
  "aterm-types",
- "bytemuck",
- "calloop",
- "cursor-icon",
+ "aterm-wayland",
+ "aterm-x11",
+ "aterm-xkb",
  "libc",
- "memmap2",
  "raw-window-handle",
- "rustix 0.38.44",
- "sctk-adwaita",
- "smithay-client-toolkit",
  "tracing",
- "wayland-backend",
- "wayland-client",
- "wayland-protocols",
- "wayland-protocols-plasma",
  "windows-sys 0.61.2",
- "x11-dl",
- "x11rb",
- "xkbcommon-dl",
 ]
 
 [[package]]
@@ -3699,170 +2859,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "wit-bindgen"
-version = "0.57.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
-
-[[package]]
-name = "x11-dl"
-version = "2.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38735924fedd5314a6e548792904ed8c6de6636285cb9fec04d5b1db85c1516f"
-dependencies = [
- "libc",
- "once_cell",
- "pkg-config",
-]
-
-[[package]]
-name = "x11rb"
-version = "0.13.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9993aa5be5a26815fe2c3eacfc1fde061fc1a1f094bf1ad2a18bf9c495dd7414"
-dependencies = [
- "as-raw-xcb-connection",
- "gethostname",
- "libc",
- "libloading",
- "once_cell",
- "rustix 1.1.4",
- "x11rb-protocol",
-]
-
-[[package]]
-name = "x11rb-protocol"
-version = "0.13.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
-
-[[package]]
-name = "xcursor"
-version = "0.3.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bec9e4a500ca8864c5b47b8b482a73d62e4237670e5b5f1d6b9e3cae50f28f2b"
-
-[[package]]
-name = "xkbcommon-dl"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d039de8032a9a8856a6be89cea3e5d12fdd82306ab7c94d74e6deab2460651c5"
-dependencies = [
- "bitflags",
- "dlib",
- "log",
- "once_cell",
- "xkeysym",
-]
-
-[[package]]
-name = "xkeysym"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9cc00251562a284751c9973bace760d86c0276c471b4be569fe6b068ee97a56"
-
-[[package]]
 name = "xml-rs"
 version = "0.8.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
-
-[[package]]
-name = "zbus"
-version = "5.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eee682d202a77e4a9f3b2c2bdf48a7b28af5c08c34ddf66f98c93e5e39464285"
-dependencies = [
- "async-broadcast",
- "async-executor",
- "async-io",
- "async-lock",
- "async-process",
- "async-recursion",
- "async-task",
- "async-trait",
- "blocking",
- "enumflags2",
- "event-listener",
- "futures-core",
- "futures-lite",
- "hex",
- "libc",
- "ordered-stream",
- "rustix 1.1.4",
- "serde",
- "serde_repr",
- "tracing",
- "uds_windows",
- "uuid",
- "windows-sys 0.61.2",
- "winnow",
- "zbus_macros",
- "zbus_names",
- "zvariant",
-]
-
-[[package]]
-name = "zbus-lockstep"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6998de05217a084b7578728a9443d04ea4cd80f2a0839b8d78770b76ccd45863"
-dependencies = [
- "zbus_xml",
- "zvariant",
-]
-
-[[package]]
-name = "zbus-lockstep-macros"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10da05367f3a7b7553c8cdf8fa91aee6b64afebe32b51c95177957efc47ca3a0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
- "zbus-lockstep",
- "zbus_xml",
- "zvariant",
-]
-
-[[package]]
-name = "zbus_macros"
-version = "5.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "adf1bd45a81a103745b1757754762a26e8cd01e4532e4d6c8ec431624b80d1d6"
-dependencies = [
- "proc-macro-crate",
- "proc-macro2",
- "quote",
- "syn",
- "zbus_names",
- "zvariant",
- "zvariant_utils",
-]
-
-[[package]]
-name = "zbus_names"
-version = "4.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7074f3e50b894eac91750142016d30d0a89be8e67dbfd9704fb875825760e52d"
-dependencies = [
- "serde",
- "winnow",
- "zvariant",
-]
-
-[[package]]
-name = "zbus_xml"
-version = "5.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a8067892e940ed1727dea64690378601603b31d62dfde019a5335fbb7c0e0ed9"
-dependencies = [
- "quick-xml",
- "serde",
- "zbus_names",
- "zvariant",
-]
 
 [[package]]
 name = "zerocopy"
@@ -3889,43 +2889,3 @@ name = "zeroize"
 version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
-
-[[package]]
-name = "zvariant"
-version = "5.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a192a0bde63360d77a7523c833d4b4ce6070a927e2c53246e4c540b1a3e27be0"
-dependencies = [
- "endi",
- "enumflags2",
- "serde",
- "winnow",
- "zvariant_derive",
- "zvariant_utils",
-]
-
-[[package]]
-name = "zvariant_derive"
-version = "5.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90bc6cde9c01c511074be97f7ccb6c19d0da89e3f8662e812e999dcfd4638737"
-dependencies = [
- "proc-macro-crate",
- "proc-macro2",
- "quote",
- "syn",
- "zvariant_utils",
-]
-
-[[package]]
-name = "zvariant_utils"
-version = "3.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e8535915cfa75547e559d8c68e8139909a4aeee076831e4ef7fc59d8172c4d6"
-dependencies = [
- "proc-macro2",
- "quote",
- "serde",
- "syn",
- "winnow",
-]

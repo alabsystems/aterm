@@ -19,7 +19,8 @@ description = "First-party no-op `document_features!` for aterm (replaces the do
 name = "document_features"
 path = "src/lib.rs"
 proc-macro = true
-# No unit tests live in src/; tests/ expands the macro in its consumers' form.
+# No tests: the expansion is one empty string literal, and wgpu's build is the
+# consumer that exercises it.
 test = false
 
 [dependencies]

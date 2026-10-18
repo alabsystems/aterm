@@ -1,0 +1,990 @@
+# claude-code 2.1.302 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (Wx60, aterm 0.105.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a multi-select's free-text row holding the short-term text, typed by hand, then `down` to `Submit`, the pane resized to each width W from 26 to 160 columns (`aterm ctl resize 60 W`, then `up` and `down`): each frame's rows from the free-text row to the divider under `Submit`, under a `## W columns` line (ATERM-KI-1015-1 F2)
+## 26 columns
+  4. [✔]Decide yourself:
+        choose the option
+        that gets the
+        current
+        deliverable done
+        soonest at
+        acceptable risk.
+        Say which you
+        chose and why in
+        one line and
+        continue without
+        asking again.
+        (Answered by the
+        aterm harness by
+❯    Submiticy. The user
+──────────────────────────
+## 27 columns
+  4. [✔]Decide yourself:
+        choose the option
+        that gets the
+        current deliverable
+        done soonest at
+        acceptable risk.
+        Say which you chose
+        and why in one
+        line and continue
+        without asking
+        again. (Answered by
+        the aterm harness
+        by policy. The user
+❯    Submit not asked.)
+───────────────────────────
+## 28 columns
+  4. [✔]Decide yourself:
+        choose the option
+        that gets the
+        current deliverable
+        done soonest at
+        acceptable risk. Say
+        which you chose and
+        why in one line and
+        continue without
+        asking again.
+        (Answered by the
+        aterm harness by
+        policy. The user was
+❯    Submit asked.)
+────────────────────────────
+## 29 columns
+  4. [✔]Decide yourself:
+        choose the option
+        that gets the current
+        deliverable done
+        soonest at acceptable
+        risk. Say which you
+        chose and why in one
+        line and continue
+        without asking again.
+        (Answered by the
+        aterm harness by
+        policy. The user was
+❯    Submit asked.)
+─────────────────────────────
+## 30 columns
+  4. [✔]Decide yourself:
+        choose the option that
+        gets the current
+        deliverable done
+        soonest at acceptable
+        risk. Say which you
+        chose and why in one
+        line and continue
+        without asking again.
+        (Answered by the aterm
+        harness by policy.
+❯    Submit user was not
+──────────────────────────────
+## 31 columns
+  4. [✔]Decide yourself: choose
+        the option that gets
+        the current deliverable
+        done soonest at
+        acceptable risk. Say
+        which you chose and why
+        in one line and
+        continue without asking
+        again. (Answered by
+        the aterm harness by
+❯    Submiticy. The user was
+───────────────────────────────
+## 32 columns
+  4. [✔]Decide yourself: choose
+        the option that gets the
+        current deliverable
+        done soonest at
+        acceptable risk. Say
+        which you chose and why
+        in one line and continue
+        without asking again.
+        (Answered by the aterm
+        harness by policy. The
+❯    Submitr was not asked.)
+────────────────────────────────
+## 33 columns
+  4. [✔]Decide yourself: choose
+        the option that gets the
+        current deliverable done
+        soonest at acceptable
+        risk. Say which you chose
+        and why in one line and
+        continue without asking
+        again. (Answered by the
+        aterm harness by policy.
+        The user was not asked.)
+❯    Submit
+─────────────────────────────────
+## 34 columns
+  4. [✔]Decide yourself: choose
+        the option that gets the
+        current deliverable done
+        soonest at acceptable
+        risk. Say which you chose
+        and why in one line and
+        continue without asking
+        again. (Answered by the
+        aterm harness by policy.
+❯    Submit user was not asked.)
+──────────────────────────────────
+## 35 columns
+  4. [✔]Decide yourself: choose the
+        option that gets the
+        current deliverable done
+        soonest at acceptable risk.
+        Say which you chose and
+        why in one line and
+        continue without asking
+        again. (Answered by the
+        aterm harness by policy.
+❯    Submit user was not asked.)
+───────────────────────────────────
+## 36 columns
+  4. [✔]Decide yourself: choose the
+        option that gets the current
+        deliverable done soonest at
+        acceptable risk. Say which
+        you chose and why in one
+        line and continue without
+        asking again. (Answered by
+        the aterm harness by policy.
+        The user was not asked.)
+❯    Submit
+────────────────────────────────────
+## 37 columns
+  4. [✔]Decide yourself: choose the
+        option that gets the current
+        deliverable done soonest at
+        acceptable risk. Say which
+        you chose and why in one line
+        and continue without asking
+        again. (Answered by the aterm
+        harness by policy. The user
+        was not asked.)
+❯    Submit
+─────────────────────────────────────
+## 38 columns
+  4. [✔]Decide yourself: choose the
+        option that gets the current
+        deliverable done soonest at
+        acceptable risk. Say which you
+        chose and why in one line and
+        continue without asking
+        again. (Answered by the aterm
+        harness by policy. The user
+        was not asked.)
+❯    Submit
+──────────────────────────────────────
+## 39 columns
+  4. [✔]Decide yourself: choose the
+        option that gets the current
+        deliverable done soonest at
+        acceptable risk. Say which you
+        chose and why in one line and
+        continue without asking again.
+        (Answered by the aterm harness
+        by policy. The user was not
+❯    Submited.)
+───────────────────────────────────────
+## 40 columns
+  4. [✔]Decide yourself: choose the
+        option that gets the current
+        deliverable done soonest at
+        acceptable risk. Say which you
+        chose and why in one line and
+        continue without asking again.
+        (Answered by the aterm harness
+        by policy. The user was not
+❯    Submited.)
+────────────────────────────────────────
+## 41 columns
+  4. [✔]Decide yourself: choose the
+        option that gets the current
+        deliverable done soonest at
+        acceptable risk. Say which you
+        chose and why in one line and
+        continue without asking again.
+        (Answered by the aterm harness by
+        policy. The user was not asked.)
+❯    Submit
+─────────────────────────────────────────
+## 42 columns
+  4. [✔]Decide yourself: choose the option
+        that gets the current deliverable
+        done soonest at acceptable risk.
+        Say which you chose and why in one
+        line and continue without asking
+        again. (Answered by the aterm
+        harness by policy. The user was
+❯    Submit asked.)
+──────────────────────────────────────────
+## 43 columns
+  4. [✔]Decide yourself: choose the option
+        that gets the current deliverable
+        done soonest at acceptable risk.
+        Say which you chose and why in one
+        line and continue without asking
+        again. (Answered by the aterm
+        harness by policy. The user was not
+❯    Submited.)
+───────────────────────────────────────────
+## 44 columns
+  4. [✔]Decide yourself: choose the option
+        that gets the current deliverable
+        done soonest at acceptable risk. Say
+        which you chose and why in one line
+        and continue without asking again.
+        (Answered by the aterm harness by
+        policy. The user was not asked.)
+❯    Submit
+────────────────────────────────────────────
+## 45 columns
+  4. [✔]Decide yourself: choose the option
+        that gets the current deliverable
+        done soonest at acceptable risk. Say
+        which you chose and why in one line
+        and continue without asking again.
+        (Answered by the aterm harness by
+        policy. The user was not asked.)
+❯    Submit
+─────────────────────────────────────────────
+## 46 columns
+  4. [✔]Decide yourself: choose the option
+        that gets the current deliverable done
+        soonest at acceptable risk. Say which
+        you chose and why in one line and
+        continue without asking again.
+        (Answered by the aterm harness by
+        policy. The user was not asked.)
+❯    Submit
+──────────────────────────────────────────────
+## 47 columns
+  4. [✔]Decide yourself: choose the option that
+        gets the current deliverable done
+        soonest at acceptable risk. Say which
+        you chose and why in one line and
+        continue without asking again.
+        (Answered by the aterm harness by
+        policy. The user was not asked.)
+❯    Submit
+───────────────────────────────────────────────
+## 48 columns
+  4. [✔]Decide yourself: choose the option that
+        gets the current deliverable done
+        soonest at acceptable risk. Say which
+        you chose and why in one line and
+        continue without asking again. (Answered
+        by the aterm harness by policy. The
+        user was not asked.)
+❯    Submit
+────────────────────────────────────────────────
+## 49 columns
+  4. [✔]Decide yourself: choose the option that
+        gets the current deliverable done soonest
+        at acceptable risk. Say which you chose
+        and why in one line and continue without
+        asking again. (Answered by the aterm
+        harness by policy. The user was not
+❯    Submited.)
+─────────────────────────────────────────────────
+## 50 columns
+  4. [✔]Decide yourself: choose the option that
+        gets the current deliverable done soonest
+        at acceptable risk. Say which you chose
+        and why in one line and continue without
+        asking again. (Answered by the aterm
+        harness by policy. The user was not
+❯    Submited.)
+──────────────────────────────────────────────────
+## 51 columns
+  4. [✔] Decide yourself: choose the option that
+         gets the current deliverable done soonest
+         at acceptable risk. Say which you chose
+         and why in one line and continue without
+         asking again. (Answered by the aterm
+         harness by policy. The user was not
+❯    Submitked.)
+───────────────────────────────────────────────────
+## 52 columns
+  4. [✔] Decide yourself: choose the option that
+         gets the current deliverable done soonest
+         at acceptable risk. Say which you chose and
+         why in one line and continue without
+         asking again. (Answered by the aterm
+         harness by policy. The user was not asked.)
+❯    Submit
+────────────────────────────────────────────────────
+## 53 columns
+  4. [✔] Decide yourself: choose the option that gets
+         the current deliverable done soonest at
+         acceptable risk. Say which you chose and why
+         in one line and continue without asking
+         again. (Answered by the aterm harness by
+         policy. The user was not asked.)
+❯    Submit
+─────────────────────────────────────────────────────
+## 54 columns
+  4. [✔] Decide yourself: choose the option that gets
+         the current deliverable done soonest at
+         acceptable risk. Say which you chose and why
+         in one line and continue without asking
+         again. (Answered by the aterm harness by
+         policy. The user was not asked.)
+❯    Submit
+──────────────────────────────────────────────────────
+## 55 columns
+  4. [✔] Decide yourself: choose the option that gets
+         the current deliverable done soonest at
+         acceptable risk. Say which you chose and why
+         in one line and continue without asking again.
+         (Answered by the aterm harness by policy. The
+         user was not asked.)
+❯    Submit
+───────────────────────────────────────────────────────
+## 56 columns
+  4. [✔] Decide yourself: choose the option that gets
+         the current deliverable done soonest at
+         acceptable risk. Say which you chose and why in
+         one line and continue without asking again.
+         (Answered by the aterm harness by policy. The
+❯    Submiter was not asked.)
+────────────────────────────────────────────────────────
+## 57 columns
+  4. [✔] Decide yourself: choose the option that gets the
+         current deliverable done soonest at acceptable
+         risk. Say which you chose and why in one line
+         and continue without asking again. (Answered by
+         the aterm harness by policy. The user was not
+❯    Submitked.)
+─────────────────────────────────────────────────────────
+## 58 columns
+  4. [✔] Decide yourself: choose the option that gets the
+         current deliverable done soonest at acceptable
+         risk. Say which you chose and why in one line and
+         continue without asking again. (Answered by the
+         aterm harness by policy. The user was not asked.)
+❯    Submit
+──────────────────────────────────────────────────────────
+## 59 columns
+  4. [✔] Decide yourself: choose the option that gets the
+         current deliverable done soonest at acceptable
+         risk. Say which you chose and why in one line and
+         continue without asking again. (Answered by the
+         aterm harness by policy. The user was not asked.)
+❯    Submit
+───────────────────────────────────────────────────────────
+## 60 columns
+  4. [✔] Decide yourself: choose the option that gets the
+         current deliverable done soonest at acceptable
+         risk. Say which you chose and why in one line and
+         continue without asking again. (Answered by the
+         aterm harness by policy. The user was not asked.)
+❯    Submit
+────────────────────────────────────────────────────────────
+## 61 columns
+  4. [✔] Decide yourself: choose the option that gets the
+         current deliverable done soonest at acceptable risk.
+         Say which you chose and why in one line and
+         continue without asking again. (Answered by the
+         aterm harness by policy. The user was not asked.)
+❯    Submit
+─────────────────────────────────────────────────────────────
+## 62 columns
+  4. [✔] Decide yourself: choose the option that gets the
+         current deliverable done soonest at acceptable risk.
+         Say which you chose and why in one line and continue
+         without asking again. (Answered by the aterm harness
+         by policy. The user was not asked.)
+❯    Submit
+──────────────────────────────────────────────────────────────
+## 63 columns
+  4. [✔] Decide yourself: choose the option that gets the
+         current deliverable done soonest at acceptable risk.
+         Say which you chose and why in one line and continue
+         without asking again. (Answered by the aterm harness
+         by policy. The user was not asked.)
+❯    Submit
+───────────────────────────────────────────────────────────────
+## 64 columns
+  4. [✔] Decide yourself: choose the option that gets the
+         current deliverable done soonest at acceptable risk.
+         Say which you chose and why in one line and continue
+         without asking again. (Answered by the aterm harness by
+         policy. The user was not asked.)
+❯    Submit
+────────────────────────────────────────────────────────────────
+## 65 columns
+  4. [✔] Decide yourself: choose the option that gets the current
+         deliverable done soonest at acceptable risk. Say which
+         you chose and why in one line and continue without
+         asking again. (Answered by the aterm harness by policy.
+         The user was not asked.)
+❯    Submit
+─────────────────────────────────────────────────────────────────
+## 66 columns
+  4. [✔] Decide yourself: choose the option that gets the current
+         deliverable done soonest at acceptable risk. Say which
+         you chose and why in one line and continue without asking
+         again. (Answered by the aterm harness by policy. The
+         user was not asked.)
+❯    Submit
+──────────────────────────────────────────────────────────────────
+## 67 columns
+  4. [✔] Decide yourself: choose the option that gets the current
+         deliverable done soonest at acceptable risk. Say which you
+         chose and why in one line and continue without asking
+         again. (Answered by the aterm harness by policy. The user
+         was not asked.)
+❯    Submit
+───────────────────────────────────────────────────────────────────
+## 68 columns
+  4. [✔] Decide yourself: choose the option that gets the current
+         deliverable done soonest at acceptable risk. Say which you
+         chose and why in one line and continue without asking
+         again. (Answered by the aterm harness by policy. The user
+         was not asked.)
+❯    Submit
+────────────────────────────────────────────────────────────────────
+## 69 columns
+  4. [✔] Decide yourself: choose the option that gets the current
+         deliverable done soonest at acceptable risk. Say which you
+         chose and why in one line and continue without asking again.
+         (Answered by the aterm harness by policy. The user was not
+         asked.)
+❯    Submit
+─────────────────────────────────────────────────────────────────────
+## 70 columns
+  4. [✔] Decide yourself: choose the option that gets the current
+         deliverable done soonest at acceptable risk. Say which you
+         chose and why in one line and continue without asking again.
+         (Answered by the aterm harness by policy. The user was not
+         asked.)
+❯    Submit
+──────────────────────────────────────────────────────────────────────
+## 71 columns
+  4. [✔] Decide yourself: choose the option that gets the current
+         deliverable done soonest at acceptable risk. Say which you
+         chose and why in one line and continue without asking again.
+         (Answered by the aterm harness by policy. The user was not
+         asked.)
+❯    Submit
+───────────────────────────────────────────────────────────────────────
+## 72 columns
+  4. [✔] Decide yourself: choose the option that gets the current
+         deliverable done soonest at acceptable risk. Say which you
+         chose and why in one line and continue without asking again.
+         (Answered by the aterm harness by policy. The user was not
+❯    Submitked.)
+────────────────────────────────────────────────────────────────────────
+## 73 columns
+  4. [✔] Decide yourself: choose the option that gets the current
+         deliverable done soonest at acceptable risk. Say which you chose
+         and why in one line and continue without asking again.
+         (Answered by the aterm harness by policy. The user was not
+❯    Submitked.)
+─────────────────────────────────────────────────────────────────────────
+## 74 columns
+  4. [✔] Decide yourself: choose the option that gets the current
+         deliverable done soonest at acceptable risk. Say which you chose
+         and why in one line and continue without asking again. (Answered
+         by the aterm harness by policy. The user was not asked.)
+❯    Submit
+──────────────────────────────────────────────────────────────────────────
+## 75 columns
+  4. [✔] Decide yourself: choose the option that gets the current
+         deliverable done soonest at acceptable risk. Say which you chose
+         and why in one line and continue without asking again. (Answered
+         by the aterm harness by policy. The user was not asked.)
+❯    Submit
+───────────────────────────────────────────────────────────────────────────
+## 76 columns
+  4. [✔] Decide yourself: choose the option that gets the current
+         deliverable done soonest at acceptable risk. Say which you chose
+         and why in one line and continue without asking again. (Answered by
+         the aterm harness by policy. The user was not asked.)
+❯    Submit
+────────────────────────────────────────────────────────────────────────────
+## 77 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable
+         done soonest at acceptable risk. Say which you chose and why in one
+         line and continue without asking again. (Answered by the aterm
+         harness by policy. The user was not asked.)
+❯    Submit
+─────────────────────────────────────────────────────────────────────────────
+## 78 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable
+         done soonest at acceptable risk. Say which you chose and why in one
+         line and continue without asking again. (Answered by the aterm
+         harness by policy. The user was not asked.)
+❯    Submit
+──────────────────────────────────────────────────────────────────────────────
+## 79 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable
+         done soonest at acceptable risk. Say which you chose and why in one
+         line and continue without asking again. (Answered by the aterm harness
+         by policy. The user was not asked.)
+❯    Submit
+───────────────────────────────────────────────────────────────────────────────
+## 80 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable
+         done soonest at acceptable risk. Say which you chose and why in one
+         line and continue without asking again. (Answered by the aterm harness
+         by policy. The user was not asked.)
+❯    Submit
+────────────────────────────────────────────────────────────────────────────────
+## 81 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable
+         done soonest at acceptable risk. Say which you chose and why in one line
+         and continue without asking again. (Answered by the aterm harness by
+         policy. The user was not asked.)
+❯    Submit
+─────────────────────────────────────────────────────────────────────────────────
+## 82 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done
+         soonest at acceptable risk. Say which you chose and why in one line and
+         continue without asking again. (Answered by the aterm harness by policy.
+         The user was not asked.)
+❯    Submit
+──────────────────────────────────────────────────────────────────────────────────
+## 83 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done
+         soonest at acceptable risk. Say which you chose and why in one line and
+         continue without asking again. (Answered by the aterm harness by policy.
+         The user was not asked.)
+❯    Submit
+───────────────────────────────────────────────────────────────────────────────────
+## 84 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done
+         soonest at acceptable risk. Say which you chose and why in one line and
+         continue without asking again. (Answered by the aterm harness by policy.
+         The user was not asked.)
+❯    Submit
+────────────────────────────────────────────────────────────────────────────────────
+## 85 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done
+         soonest at acceptable risk. Say which you chose and why in one line and
+         continue without asking again. (Answered by the aterm harness by policy. The
+         user was not asked.)
+❯    Submit
+─────────────────────────────────────────────────────────────────────────────────────
+## 86 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done
+         soonest at acceptable risk. Say which you chose and why in one line and
+         continue without asking again. (Answered by the aterm harness by policy. The
+         user was not asked.)
+❯    Submit
+──────────────────────────────────────────────────────────────────────────────────────
+## 87 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done
+         soonest at acceptable risk. Say which you chose and why in one line and
+         continue without asking again. (Answered by the aterm harness by policy. The
+         user was not asked.)
+❯    Submit
+───────────────────────────────────────────────────────────────────────────────────────
+## 88 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done
+         soonest at acceptable risk. Say which you chose and why in one line and
+         continue without asking again. (Answered by the aterm harness by policy. The
+❯    Submiter was not asked.)
+────────────────────────────────────────────────────────────────────────────────────────
+## 89 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done
+         soonest at acceptable risk. Say which you chose and why in one line and continue
+         without asking again. (Answered by the aterm harness by policy. The user was
+❯    Submitt asked.)
+─────────────────────────────────────────────────────────────────────────────────────────
+## 90 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest
+         at acceptable risk. Say which you chose and why in one line and continue without
+         asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+──────────────────────────────────────────────────────────────────────────────────────────
+## 91 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest
+         at acceptable risk. Say which you chose and why in one line and continue without
+         asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+───────────────────────────────────────────────────────────────────────────────────────────
+## 92 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest
+         at acceptable risk. Say which you chose and why in one line and continue without
+         asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+────────────────────────────────────────────────────────────────────────────────────────────
+## 93 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at
+         acceptable risk. Say which you chose and why in one line and continue without
+         asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+─────────────────────────────────────────────────────────────────────────────────────────────
+## 94 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at
+         acceptable risk. Say which you chose and why in one line and continue without asking
+         again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+──────────────────────────────────────────────────────────────────────────────────────────────
+## 95 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at
+         acceptable risk. Say which you chose and why in one line and continue without asking
+         again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+───────────────────────────────────────────────────────────────────────────────────────────────
+## 96 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at
+         acceptable risk. Say which you chose and why in one line and continue without asking
+         again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+────────────────────────────────────────────────────────────────────────────────────────────────
+## 97 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at
+         acceptable risk. Say which you chose and why in one line and continue without asking
+         again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+─────────────────────────────────────────────────────────────────────────────────────────────────
+## 98 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at
+         acceptable risk. Say which you chose and why in one line and continue without asking
+         again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+──────────────────────────────────────────────────────────────────────────────────────────────────
+## 99 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at
+         acceptable risk. Say which you chose and why in one line and continue without asking
+         again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+───────────────────────────────────────────────────────────────────────────────────────────────────
+## 100 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at
+         acceptable risk. Say which you chose and why in one line and continue without asking again.
+         (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+────────────────────────────────────────────────────────────────────────────────────────────────────
+## 101 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at
+         acceptable risk. Say which you chose and why in one line and continue without asking again.
+         (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+─────────────────────────────────────────────────────────────────────────────────────────────────────
+## 102 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at
+         acceptable risk. Say which you chose and why in one line and continue without asking again.
+         (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+──────────────────────────────────────────────────────────────────────────────────────────────────────
+## 103 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at
+         acceptable risk. Say which you chose and why in one line and continue without asking again.
+         (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+───────────────────────────────────────────────────────────────────────────────────────────────────────
+## 104 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable
+         risk. Say which you chose and why in one line and continue without asking again. (Answered by
+         the aterm harness by policy. The user was not asked.)
+❯    Submit
+────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 105 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable
+         risk. Say which you chose and why in one line and continue without asking again. (Answered by
+         the aterm harness by policy. The user was not asked.)
+❯    Submit
+─────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 106 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable
+         risk. Say which you chose and why in one line and continue without asking again. (Answered by the
+         aterm harness by policy. The user was not asked.)
+❯    Submit
+──────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 107 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable
+         risk. Say which you chose and why in one line and continue without asking again. (Answered by the
+         aterm harness by policy. The user was not asked.)
+❯    Submit
+───────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 108 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable
+         risk. Say which you chose and why in one line and continue without asking again. (Answered by the
+         aterm harness by policy. The user was not asked.)
+❯    Submit
+────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 109 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable
+         risk. Say which you chose and why in one line and continue without asking again. (Answered by the
+         aterm harness by policy. The user was not asked.)
+❯    Submit
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 110 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk.
+         Say which you chose and why in one line and continue without asking again. (Answered by the aterm
+         harness by policy. The user was not asked.)
+❯    Submit
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 111 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk.
+         Say which you chose and why in one line and continue without asking again. (Answered by the aterm
+         harness by policy. The user was not asked.)
+❯    Submit
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 112 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk.
+         Say which you chose and why in one line and continue without asking again. (Answered by the aterm
+         harness by policy. The user was not asked.)
+❯    Submit
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 113 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk.
+         Say which you chose and why in one line and continue without asking again. (Answered by the aterm
+         harness by policy. The user was not asked.)
+❯    Submit
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 114 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say
+         which you chose and why in one line and continue without asking again. (Answered by the aterm harness by
+         policy. The user was not asked.)
+❯    Submit
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 115 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say
+         which you chose and why in one line and continue without asking again. (Answered by the aterm harness by
+         policy. The user was not asked.)
+❯    Submit
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 116 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say
+         which you chose and why in one line and continue without asking again. (Answered by the aterm harness by
+         policy. The user was not asked.)
+❯    Submit
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 117 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say
+         which you chose and why in one line and continue without asking again. (Answered by the aterm harness by
+         policy. The user was not asked.)
+❯    Submit
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 118 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say
+         which you chose and why in one line and continue without asking again. (Answered by the aterm harness by
+         policy. The user was not asked.)
+❯    Submit
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 119 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say
+         which you chose and why in one line and continue without asking again. (Answered by the aterm harness by
+         policy. The user was not asked.)
+❯    Submit
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 120 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which
+         you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The
+         user was not asked.)
+❯    Submit
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 121 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which
+         you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The
+         user was not asked.)
+❯    Submit
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 122 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which
+         you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The
+         user was not asked.)
+❯    Submit
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 123 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which
+         you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The
+         user was not asked.)
+❯    Submit
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 124 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you
+         chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user
+         was not asked.)
+❯    Submit
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 125 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you
+         chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was
+         not asked.)
+❯    Submit
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 126 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you
+         chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was
+         not asked.)
+❯    Submit
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 127 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you
+         chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was
+         not asked.)
+❯    Submit
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 128 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you
+         chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not
+         asked.)
+❯    Submit
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 129 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you
+         chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not
+❯    Submitked.)
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 130 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you chose
+         and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not
+❯    Submitked.)
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 131 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you chose
+         and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 132 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you chose
+         and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 133 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you chose
+         and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 134 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you chose and
+         why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 135 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you chose and
+         why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 136 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you chose and
+         why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 137 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you chose and
+         why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 138 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you chose and why
+         in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 139 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you chose and why
+         in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 140 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you chose and why
+         in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 141 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you chose and why in
+         one line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 142 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you chose and why in
+         one line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 143 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you chose and why in
+         one line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 144 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you chose and why in
+         one line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 145 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you chose and why in one
+         line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 146 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you chose and why in one
+         line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 147 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you chose and why in one
+         line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 148 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you chose and why in one
+         line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 149 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you chose and why in one
+         line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 150 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you chose and why in one line
+         and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 151 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you chose and why in one line
+         and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 152 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you chose and why in one line
+         and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 153 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you chose and why in one line
+         and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 154 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you chose and why in one line and
+         continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 155 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you chose and why in one line and
+         continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 156 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you chose and why in one line and
+         continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 157 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you chose and why in one line and
+         continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 158 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you chose and why in one line and
+         continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 159 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you chose and why in one line and
+         continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## 160 columns
+  4. [✔] Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you chose and why in one line and
+         continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)
+❯    Submit
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────

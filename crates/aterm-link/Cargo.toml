@@ -30,18 +30,29 @@ publish = false
 # default row; trust/floors.tsv).
 sealed = ["astream-broker/aead"]
 # Development seams (`aterm_types::dev_seam!`) in an optimized build: `ATERM_BIN`,
-# the bridge's and notifier's fault switches, `fabric on`'s effect trace and mint
-# fault, and the redirected fabric root. Debug builds compile them anyway; the
+# the bridge's and notifier's fault switches, the bridge's broker-wait tally (the
+# fabric bench's ping-pong arm), `fabric on`'s effect trace and mint fault, and the
+# redirected fabric root. Debug builds compile them anyway; the
 # release buildplan never enables this, so a shipped binary reads none of them.
 dev-seams = []
 
 [dependencies]
+# Exclusively owned notifier carry stages, removed on error/drop.
+aterm-tempfile = { workspace = true }
 # The bus: `cap` for the bound grant every fabric principal attaches with. Its
 # SHA-256 is astream's own astream-digest, so a default build takes no
 # third-party crate from astream; with `sealed`, the crate's whole third-party
 # crypto surface is chacha20poly1305 and getrandom.
 astream-broker = { path = "../../vendor/astream/crates/astream-broker", features = ["cap"] }
 astream-cap = { path = "../../vendor/astream/crates/astream-cap" }
+# The kernel's boot session (`boot_session`), aterm-link's ONE reading of this
+# boot (`durability::this_boot`): the boot the broker opens its log in and judges
+# a legacy relaxed mark by (`durability.rs`, "One boot, one reading"), and whether
+# the page cache holding the incarnation lease's unflushed write has run
+# throughout (`state.rs`, "The incarnation lease"). Zero dependencies; its one
+# cordoned unsafe module is the two Apple calls astream's own log already makes,
+# so aterm-link stays `forbid(unsafe_code)`.
+astream-sys = { path = "../../vendor/astream/crates/astream-sys" }
 # The verb table (what the bridge may call) and the control-socket vocabulary.
 aterm-types = { workspace = true }
 # The body's informational `t=` (`now_ms`).
@@ -59,18 +70,27 @@ aterm-digest = { workspace = true }
 # `aterm ctl instances`/`ls` use, so `aterm fabric` and the bridge's hosted set
 # cannot find different instances than the client does.
 aterm-ctl = { path = "../aterm-ctl" }
+# The session log's bus records (phase 4): the mirror's cursor type, and the
+# reader's view and fold `aterm fabric brief` shows. An engine crate: no I/O.
+aterm-slog = { workspace = true }
 # `[fabric] command` is read with the app's own aterm.toml parser, so the report
 # and the instance cannot disagree about the file. Its `serde` is already in the
 # shipped graph.
 aterm-toml = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# `pthread_sigmask` and `sigwait`, for a relaxed broker's clean stop
+# (`cli::take_stop_signals`): the workspace's own libc (crates/aterm-libc).
+libc = { workspace = true }
 
 [dev-dependencies]
 # The unit tests drop the broker's retained record and dedup entry together.
 astream-broker = { path = "../../vendor/astream/crates/astream-broker", features = ["cap", "retention"] }
 # The unit tests' derived models and hang detectors.
 aterm-spec = { workspace = true }
-# Scratch directories removed on drop.
-aterm-tempfile = { workspace = true }
+# The models its tests drive (a model edit rebuilds only their tests).
+aterm-models-core = { workspace = true }
+aterm-models-session = { workspace = true }
 
 [lints]
 workspace = true

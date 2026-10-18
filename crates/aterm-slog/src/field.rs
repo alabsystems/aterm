@@ -81,6 +81,18 @@ macro_rules! keys {
                     $(Key::$variant => $word,)*
                 }
             }
+
+            /// The key a wire word names, or `None` (a reader skips it): one
+            /// `match` over the same list, so a decode costs no scan of the
+            /// table (a carried log is line-decoded inside the update's
+            /// freeze, design §5.2).
+            #[must_use]
+            pub fn from_word(word: &str) -> Option<Key> {
+                match word {
+                    $($word => Some(Key::$variant),)*
+                    _ => None,
+                }
+            }
         }
     };
 }
@@ -115,6 +127,9 @@ keys! {
     State "state" Wire Cap::Word(STATE_WORDS),
     Phase "phase" Wire Cap::Word(PHASE_WORDS),
     Why "why" Wire Cap::Word(WHY_WORDS),
+    // A crash gap's last seq the journal holds (`gap why=crash after=<seq>`,
+    // design §5.4): what came after it in the dead process is not known.
+    After "after" Wire Cap::U,
     Cont "cont" Wire Cap::Id,
     // `cause=@<off>|<seq>` and `re=<seq|@off>` may name mail by its broker
     // offset, which stays on the host (§3.6, §5.5): the bus learns only the
@@ -147,6 +162,17 @@ keys! {
     // session's parent is no node of its log.
     Parent "parent" Wire Cap::Id,
     Field "field" Wire Cap::Tok(Charset::Lower, 24),
+    // A bus snapshot's open path (phase 4, §5.5): `<node>:<kind>` for the
+    // deepest open run, turn and need-bearing step, comma-separated; only
+    // bus-class nodes (ruling S17).
+    Open "open" Wire Cap::Tok(Charset::Rollup, 64),
+    // A bus snapshot's open needs, most urgent first:
+    // `<word>.<node>.<kind>.<by>.<src>`, comma-separated, cut whole at the cap.
+    Needs "needs" Wire Cap::Tok(Charset::Rollup, 200),
+    // A bus snapshot's `ms` head: the snapshot is the fold of every bus-class
+    // record of its space at or below it, so a reader seeds from it a view
+    // whose covers all lie at or below it (phase 4).
+    Upto "upto" Wire Cap::U,
     Prog "prog" WireMeta Cap::Tok(Charset::Detail, 48),
     Agent "agent" WireMeta Cap::Tok(Charset::Lower, 32),
     Detail "detail" WireMeta Cap::Tok(Charset::Detail, 48),
@@ -184,12 +210,6 @@ impl Key {
     pub fn cap(self) -> Cap {
         self.row().2
     }
-
-    /// The key a wire word names, or `None` (a reader skips it).
-    #[must_use]
-    pub fn from_word(word: &str) -> Option<Key> {
-        FIELDS.iter().map(|row| row.0).find(|k| k.word() == word)
-    }
 }
 
 /// The bytes `s` takes percent-encoded (`aterm_codec::pct::encode`'s rule:
@@ -224,6 +244,14 @@ pub fn clamp_encoded(s: &str, cap: usize) -> &str {
         used += need;
     }
     s
+}
+
+/// Whether `name` (a chosen name: an `as=`) is one of the actor words a
+/// connection's class names ([`crate::vocab::RESERVED_ACTOR_WORDS`]), in any
+/// case and around any space.
+#[must_use]
+pub fn is_reserved_name(name: &str) -> bool {
+    crate::vocab::is_reserved_actor_word(&name.trim().to_ascii_lowercase())
 }
 
 /// A token value: already through its key's sanitizer and cap.
@@ -278,7 +306,13 @@ pub struct BoundedText(String);
 
 impl BoundedText {
     /// `raw` sanitized and clamped for `key`, or `None` when `key` holds no
-    /// text (only H and C keys do) or nothing survives.
+    /// text (only H and C keys do) or nothing survives. An `as=` (the name a
+    /// claim's author declares, printed right after its `by=`) is never one
+    /// of the actor words a connection's class names
+    /// ([`crate::vocab::RESERVED_ACTOR_WORDS`], in any case): `by=- as=harness`
+    /// would read as the harness to a program or an agent reading the log.
+    /// Every path that builds one — a mark's fields, the line decoder, the
+    /// fold snapshot — comes through here, so none can hold it.
     #[must_use]
     pub fn new(key: Key, raw: &str) -> Option<BoundedText> {
         let Cap::Text(cap) = key.cap() else {
@@ -292,6 +326,9 @@ impl BoundedText {
             .filter(|c| !aterm_messages::text::is_hidden_char(*c))
             .collect();
         let clamped = clamp_encoded(&kept, cap);
+        if key == Key::As && is_reserved_name(clamped) {
+            return None;
+        }
         (!clamped.is_empty()).then(|| BoundedText(clamped.to_string()))
     }
 
@@ -320,6 +357,15 @@ pub enum Val {
 }
 
 impl Val {
+    /// Owned content bytes, excluding spare capacity and allocator overhead.
+    pub(crate) fn heap_len(&self) -> usize {
+        match self {
+            Val::Tok(t) => t.as_str().len(),
+            Val::Text(t) => t.as_str().len(),
+            Val::Word(_) | Val::U(_) | Val::I(_) | Val::Id(_) => 0,
+        }
+    }
+
     /// Whether this value has the shape `cap` declares (a word must be one
     /// of the cap's list; `unknown` is always allowed, since a reader puts
     /// it in place of a word it does not know).

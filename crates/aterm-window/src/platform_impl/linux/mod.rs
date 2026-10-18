@@ -4,7 +4,10 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/mod.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-// Modified by the aterm project in 2026; see the repository NOTICE.
+// Modified by the aterm project in 2026; see the repository NOTICE. (The X11 types are
+// first-party aterm-x11's, and the event loops answer no `AsFd`: the X11 loop waits in a
+// poll(2) over two descriptors, not one epoll descriptor an embedder could watch, and no
+// aterm crate embeds the loop: docs/AUDIT-third-party-2026-10-15.md, LW.7.)
 
 #![cfg(free_unix)]
 
@@ -12,7 +15,6 @@
 compile_error!("Please select a feature to build for unix: `x11`, `wayland`");
 
 use std::collections::VecDeque;
-use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{env, fmt};
@@ -83,6 +85,12 @@ impl ApplicationName {
 #[derive(Clone, Debug)]
 pub struct PlatformSpecificWindowAttributes {
     pub name: Option<ApplicationName>,
+    /// The launcher's startup-notification token (`DESKTOP_STARTUP_ID` on X11,
+    /// `XDG_ACTIVATION_TOKEN` on Wayland): X11 names it on the window and ends the
+    /// launch sequence with it once the window maps; Wayland activates the surface
+    /// with it. An aterm addition back onto the fork's cut of upstream's
+    /// `startup_notify` (only this consuming half).
+    pub activation_token: Option<String>,
     #[cfg(x11_platform)]
     pub x11: X11WindowAttributes,
 }
@@ -90,14 +98,14 @@ pub struct PlatformSpecificWindowAttributes {
 #[derive(Clone, Debug)]
 #[cfg(x11_platform)]
 pub struct X11WindowAttributes {
-    pub visual_id: Option<x11rb::protocol::xproto::Visualid>,
+    pub visual_id: Option<aterm_x11::proto::Visualid>,
     pub screen_id: Option<i32>,
     pub base_size: Option<Size>,
     pub override_redirect: bool,
     pub x11_window_types: Vec<XWindowType>,
 
     /// The parent window to embed this window into.
-    pub embed_window: Option<x11rb::protocol::xproto::Window>,
+    pub embed_window: Option<aterm_x11::proto::Window>,
 }
 
 #[cfg_attr(not(x11_platform), allow(clippy::derivable_impls))]
@@ -105,6 +113,7 @@ impl Default for PlatformSpecificWindowAttributes {
     fn default() -> Self {
         Self {
             name: None,
+            activation_token: None,
             #[cfg(x11_platform)]
             x11: X11WindowAttributes {
                 visual_id: None,
@@ -610,18 +619,47 @@ impl Window {
         Some(x11_or_wayland!(match self; Window(w) => w.primary_monitor()?; as MonitorHandle))
     }
 
+    /// LOCAL PATCH (aterm), 2026-10-17 (docs/AUDIT-third-party-2026-10-15.md, winit-core step 6,
+    /// the Linux half): the window's X11 or Wayland handles, which `window::Window` hands out
+    /// through first-party `aterm_types::native_window::HasNativeWindow`.
+    #[inline]
+    pub fn native_window(&self) -> aterm_types::native_window::NativeWindow {
+        x11_or_wayland!(match self; Window(window) => window.native_window())
+    }
+
+    /// The opt-in `rwh_06` window handle: [`Self::native_window`]'s answer in raw-window-handle's
+    /// words, so the two cannot name different windows.
     #[cfg(feature = "rwh_06")]
     #[inline]
     pub fn raw_window_handle_rwh_06(&self) -> Result<rwh_06::RawWindowHandle, rwh_06::HandleError> {
-        x11_or_wayland!(match self; Window(window) => window.raw_window_handle_rwh_06())
+        use aterm_types::native_window::NativeWindow;
+        Ok(match self.native_window() {
+            NativeWindow::Xlib { window, visual, .. } => {
+                let mut handle = rwh_06::XlibWindowHandle::new(window.into());
+                handle.visual_id = visual.into();
+                handle.into()
+            },
+            NativeWindow::Wayland { surface, .. } => {
+                rwh_06::WaylandWindowHandle::new(surface).into()
+            },
+        })
     }
 
+    /// The opt-in `rwh_06` display handle, off [`Self::native_window`] as above.
     #[cfg(feature = "rwh_06")]
     #[inline]
     pub fn raw_display_handle_rwh_06(
         &self,
     ) -> Result<rwh_06::RawDisplayHandle, rwh_06::HandleError> {
-        x11_or_wayland!(match self; Window(window) => window.raw_display_handle_rwh_06())
+        use aterm_types::native_window::NativeWindow;
+        Ok(match self.native_window() {
+            NativeWindow::Xlib { display, screen, .. } => {
+                rwh_06::XlibDisplayHandle::new(Some(display), screen).into()
+            },
+            NativeWindow::Wayland { display, .. } => {
+                rwh_06::WaylandDisplayHandle::new(display).into()
+            },
+        })
     }
 
     #[inline]
@@ -861,18 +899,6 @@ impl<T: 'static> EventLoop<T> {
     }
 }
 
-impl<T> AsFd for EventLoop<T> {
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        any_backend!(match self; EventLoop(evlp) => evlp.as_fd())
-    }
-}
-
-impl<T> AsRawFd for EventLoop<T> {
-    fn as_raw_fd(&self) -> RawFd {
-        any_backend!(match self; EventLoop(evlp) => evlp.as_raw_fd())
-    }
-}
-
 impl<T: 'static> EventLoopProxy<T> {
     pub fn send_event(&self, event: T) -> Result<(), EventLoopClosed<T>> {
         any_backend!(match self; EventLoopProxy(proxy) => proxy.send_event(event))
@@ -990,7 +1016,7 @@ pub(crate) enum OwnedDisplayHandle {
     #[cfg(x11_platform)]
     X(Arc<XConnection>),
     #[cfg(wayland_platform)]
-    Wayland(wayland_client::Connection),
+    Wayland(Arc<wayland::Connection>),
     /// A headless run owns no display connection. Nothing that could ask for a raw
     /// handle exists without a surface, so the variant carries nothing.
     Headless,
@@ -1017,14 +1043,10 @@ impl OwnedDisplayHandle {
             .into()),
 
             #[cfg(wayland_platform)]
-            Self::Wayland(conn) => {
-                use sctk::reexports::client::Proxy;
-
-                Ok(rwh_06::WaylandDisplayHandle::new(
-                    NonNull::new(conn.display().id().as_ptr().cast()).unwrap(),
-                )
-                .into())
-            },
+            Self::Wayland(conn) => Ok(rwh_06::WaylandDisplayHandle::new(
+                NonNull::new(conn.display().as_ptr()).expect("wl_display is never null"),
+            )
+            .into()),
         }
     }
 }
@@ -1038,7 +1060,10 @@ fn min_timeout(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
 
 #[cfg(target_os = "linux")]
 fn is_main_thread() -> bool {
-    rustix::thread::gettid() == rustix::process::getpid()
+    // SAFETY: getpid(2) cannot fail, and SYS_gettid takes no arguments and cannot fail;
+    // glibc's own `gettid` wrapper exists only since 2.30. A process's main thread is the
+    // one whose thread id is the process id.
+    unsafe { libc::syscall(libc::SYS_gettid) == libc::c_long::from(libc::getpid()) }
 }
 
 #[cfg(any(target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd"))]

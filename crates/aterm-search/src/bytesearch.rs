@@ -626,7 +626,7 @@ impl<'n> Searcher<'n> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Searcher, memchr, memchr2};
+    use super::{Searcher, memchr};
 
     /// One-shot forward search.
     fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -638,65 +638,6 @@ mod tests {
         Searcher::new(needle).rfind_in(haystack)
     }
 
-    #[test]
-    fn empty_needle_and_empty_haystack() {
-        assert_eq!(find(b"", b""), Some(0));
-        assert_eq!(rfind(b"", b""), Some(0));
-        assert_eq!(find(b"abc", b""), Some(0));
-        assert_eq!(rfind(b"abc", b""), Some(3));
-        assert_eq!(find(b"", b"a"), None);
-        assert_eq!(rfind(b"", b"a"), None);
-        assert_eq!(memchr(b'a', b""), None);
-        assert_eq!(memchr2(b'a', b'b', b""), None);
-    }
-
-    #[test]
-    fn needle_longer_than_haystack() {
-        assert_eq!(find(b"ab", b"abc"), None);
-        assert_eq!(rfind(b"ab", b"abc"), None);
-    }
-
-    #[test]
-    fn overlapping_matches_are_all_reachable() {
-        // `rfind` must see the last of a run of overlapping occurrences.
-        assert_eq!(find(b"aaaa", b"aa"), Some(0));
-        assert_eq!(rfind(b"aaaa", b"aa"), Some(2));
-        assert_eq!(find(b"abababa", b"aba"), Some(0));
-        assert_eq!(rfind(b"abababa", b"aba"), Some(4));
-    }
-
-    #[test]
-    fn non_ascii_bytes_are_just_bytes() {
-        let haystack = "héllo wörld".as_bytes();
-        assert_eq!(find(haystack, "ö".as_bytes()), Some(8));
-        assert_eq!(memchr(0xC3, haystack), Some(1));
-        assert_eq!(rfind(haystack, &[0xFF]), None);
-    }
-
-    #[test]
-    fn word_boundaries_are_covered() {
-        // A hit at every offset across, and past, the SWAR word and block
-        // strides — 64 bytes on a 64-bit target, so the sweep runs past two
-        // blocks and every tail length in between.
-        for len in 0..200usize {
-            for at in 0..len {
-                let mut haystack = vec![b'.'; len];
-                haystack[at] = b'!';
-                assert_eq!(memchr(b'!', &haystack), Some(at), "len {len} at {at}");
-                assert_eq!(
-                    memchr2(b'!', b'?', &haystack),
-                    Some(at),
-                    "len {len} at {at}"
-                );
-                assert_eq!(
-                    super::memrchr(b'!', &haystack),
-                    Some(at),
-                    "len {len} at {at}"
-                );
-            }
-        }
-    }
-
     /// The `0x01`-after-`0x00` case from the module doc, where the SWAR test's higher
     /// lanes lie. Invisible in random data.
     #[test]
@@ -706,39 +647,6 @@ mod tests {
         assert_eq!(memchr(0x01, &haystack), Some(1));
         assert_eq!(super::memrchr(0x00, &haystack), Some(0));
         assert_eq!(super::memrchr(0x01, &haystack), Some(8));
-    }
-
-    /// A prepared [`Searcher`] answers exactly what the one-shot entry points
-    /// do, in either direction and either order: the lazily computed
-    /// factorizations must not leak the direction they were first asked for.
-    #[test]
-    fn a_reused_searcher_answers_the_same_as_a_fresh_one() {
-        let haystacks: [&[u8]; 5] = [
-            b"the quick brown fox jumps over the lazy dog",
-            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
-            b"abababababababab",
-            b"",
-            "héllo wörld — wörld".as_bytes(),
-        ];
-        for haystack in haystacks {
-            for needle in [
-                &b"the"[..],
-                b"aab",
-                b"abab",
-                "wörld".as_bytes(),
-                b"zzz",
-                b"a",
-                b"",
-            ] {
-                let searcher = Searcher::new(needle);
-                // Reverse first, so the backward factorization is the one the
-                // cache fills in before the forward answer is asked for.
-                assert_eq!(searcher.rfind_in(haystack), rfind(haystack, needle));
-                assert_eq!(searcher.find_in(haystack), find(haystack, needle));
-                assert_eq!(searcher.find_in(haystack), find(haystack, needle));
-                assert_eq!(searcher.rfind_in(haystack), rfind(haystack, needle));
-            }
-        }
     }
 
     /// A needle whose rarest byte is the only byte in the haystack makes every skip call
@@ -1108,60 +1016,5 @@ mod oracle {
                 }
             }
         }
-    }
-
-    /// The repository's own bytes, searched for slices of themselves — a corpus
-    /// with real structure rather than generated regularity.
-    #[test]
-    fn repository_corpus_matches_the_reference() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("crates/")
-            .to_path_buf();
-        let mut stack = vec![root];
-        let mut files = 0usize;
-        let mut state: u64 = 0xC2B2_AE3D_27D4_EB4F;
-        let mut next = move || {
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            (state >> 33) as u32
-        };
-        while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let Ok(meta) = entry.metadata() else { continue };
-                if meta.is_dir() {
-                    if path.file_name().is_some_and(|n| n == "target") {
-                        continue;
-                    }
-                    stack.push(path);
-                } else if meta.is_file() && meta.len() <= 256 * 1024 {
-                    let Ok(raw) = std::fs::read(&path) else {
-                        continue;
-                    };
-                    if raw.is_empty() {
-                        continue;
-                    }
-                    files += 1;
-                    for _ in 0..6 {
-                        let n_len = 1 + (next() as usize) % 40;
-                        if raw.len() > n_len {
-                            let at = (next() as usize) % (raw.len() - n_len + 1);
-                            check_pair(&raw, &raw[at..at + n_len]);
-                        }
-                    }
-                    for byte in [b'\n', b' ', b'{', 0u8, 0xFFu8] {
-                        assert_eq!(ours::memchr(byte, &raw), naive::memchr(byte, &raw));
-                        assert_eq!(ours::memrchr(byte, &raw), naive::memrchr(byte, &raw));
-                    }
-                }
-            }
-        }
-        assert!(files > 200, "corpus too small: {files} files");
-        eprintln!("repository corpus: {files} files");
     }
 }

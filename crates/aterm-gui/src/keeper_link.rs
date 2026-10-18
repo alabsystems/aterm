@@ -21,15 +21,18 @@
 //! * RELEASE — from `Session::drop` ([`release`]);
 //! * PENDING — the update successor's pid, in both seamless-update lanes,
 //!   written before the grant ([`pending_before_grant`]);
-//! * BYE — once, on the final-exit path just before `exit(0)` ([`bye`]; the one
-//!   call site is pinned by `the_bye_has_one_call_site`).
+//! * BYE — once, on the final-exit path just before `exit(0)` ([`bye`], from its
+//!   one call site).
 //!
 //! AT BOOT a window that is not an update's candidate says HELLO, and every
 //! OFFER — a crashed window's master the keeper kept — passes the ONE admission
 //! ([`admit_recovered_master`]: `seamless::admit_master_descriptor`, the
 //! per-record refusals `take_incoming` makes, plus the shell's liveness and
 //! birth) into the same `seamless_adopt` landing the update uses, with the dead
-//! window's crash journal as the layout. An update's CANDIDATE registers
+//! window's crash journal as the layout, and the screen restored from the
+//! crash-restore region the keeper offered beside the master (`crash_restore`;
+//! every REGISTER this window sends is followed by its session's COMPANION, or by
+//! COMPANION_RELEASE when it has no region). An update's CANDIDATE registers
 //! nothing until its Commit ([`activate`], beside
 //! `crash_signal::adopt_app_identity`): before it, the outgoing window owns the
 //! sessions (`PtyKeeperCustody`'s `RegisterA` guard).
@@ -200,6 +203,9 @@ pub(crate) struct Claim {
     /// The pair the crash journal image its registrant took over keys it by,
     /// when that image was older than its parent's ([`Tag::keyed`]).
     keyed: Option<(u32, u64)>,
+    /// What the crash restore brought back for this master (its rung and
+    /// losses), taken by the spawn onto the session for `status restore=`.
+    restore: Option<crate::crash_restore::RestoreReport>,
     armed: bool,
 }
 
@@ -212,6 +218,7 @@ impl Claim {
             owner,
             handed: None,
             keyed: None,
+            restore: None,
             armed: true,
         }
     }
@@ -220,11 +227,10 @@ impl Claim {
     /// `tag`: its window, and the parent's session it was.
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn of_tag(rdev: u64, tag: &Tag) -> Self {
-        Self {
-            handed: tag.handed,
-            keyed: tag.keyed,
-            ..Self::new(rdev, tag.owner)
-        }
+        let mut claim = Self::new(rdev, tag.owner);
+        claim.handed = tag.handed;
+        claim.keyed = tag.keyed;
+        claim
     }
 
     /// The window that registered the master (the tag's `owner`).
@@ -248,6 +254,11 @@ impl Claim {
     #[cfg(test)]
     pub(crate) fn rdev(&self) -> u64 {
         self.rdev
+    }
+
+    /// What the crash restore brought back for this master, taken once.
+    pub(crate) fn take_restore(&mut self) -> Option<crate::crash_restore::RestoreReport> {
+        self.restore.take()
     }
 
     /// The master became a registered session: nothing to release here.
@@ -434,9 +445,14 @@ pub(crate) struct Recovery {
     /// which closes its copy).
     pub(crate) refused: Vec<(u64, &'static str)>,
     /// The dead windows the offers came from (their pids, from the tags).
+    #[cfg(unix)]
     pub(crate) owners: Vec<u32>,
     /// The shell pids of the adopted sessions (what `End sessions` ends).
     pub(crate) shells: Vec<i32>,
+    /// How many adopted sessions the crash restore brought back exactly, as a
+    /// screen with a loss counted, or blank (`crash_restore::Rung`): the band row
+    /// and the recovery census say it.
+    pub(crate) restores: crate::crash_restore::RestoreTally,
 }
 
 /// The build string a HELLO carries.
@@ -447,6 +463,49 @@ fn build() -> String {
         crate::build_info::version(),
         crate::build_info::build_number()
     )
+}
+
+/// Whether this window's HELLOs state `CAP_JOURNAL`: it registers a crash-restore region beside
+/// each master and reads the regions it is offered (the keeper's companions, `crash_restore`).
+/// Stating it binds the window to settle every claim it makes: each REGISTER is followed by its
+/// session's COMPANION, or by COMPANION_RELEASE when the session has no region ([`register`]).
+/// A claim left unsettled holds the keeper's poison window open, so a crash would read to the
+/// keeper as a restorer that died and the next window would be offered an older region.
+#[cfg(unix)]
+const JOURNAL: bool = true;
+
+/// Whether the keeper this window booted with takes companions: set from the boot
+/// WELCOME's caps. True when no keeper answered at boot (or for an update's candidate,
+/// which says no boot HELLO): the link keeps each region with its master and tells the
+/// next keeper that takes them. False only for a keeper that answered without
+/// `CAP_JOURNAL` (an older one), whose window then makes no regions at all.
+#[cfg(unix)]
+static KEEPER_JOURNALS: AtomicBool = AtomicBool::new(true);
+
+/// Development seam `$ATERM_DEBUG_NO_CRASH_JOURNAL` (`aterm_types::dev_seam!`, debug builds
+/// only): a window that journals no session, whatever its keeper takes — every claim settled
+/// with COMPANION_RELEASE — so a live test's negative control sees the restore it makes
+/// without a region (the META rung).
+const NO_JOURNAL_SEAM: &str = "ATERM_DEBUG_NO_CRASH_JOURNAL";
+
+/// Why a session spawned now gets no crash-restore journal (`crash_restore`), or `None` when
+/// it gets one: the keeper link is on and its keeper takes companions
+/// ([`KEEPER_JOURNALS`]). The reason is what `status journal_off=` says.
+pub(crate) fn journal_refusal() -> Option<&'static str> {
+    if !on() {
+        return Some("keeper-off");
+    }
+    if aterm_types::dev_seam!(NO_JOURNAL_SEAM).is_some_and(|v| !v.is_empty() && v != "0") {
+        return Some("seam");
+    }
+    #[cfg(unix)]
+    {
+        (!KEEPER_JOURNALS.load(Ordering::Relaxed)).then_some("keeper-takes-none")
+    }
+    #[cfg(not(unix))]
+    {
+        Some("platform")
+    }
 }
 
 /// This window's crash marker, as the keeper is told it at HELLO (§5.4 row 3's
@@ -488,7 +547,16 @@ fn takes_part(headless: bool, installed_keeper: bool) -> bool {
     !(headless && installed_keeper)
 }
 
-pub(crate) fn boot(enabled: bool, candidate: bool, headless: bool) -> Recovery {
+///
+/// `cfg` is the config this window builds a live session's engine with: a recovered
+/// session's crash restore replays into an engine built the same way
+/// (`crash_restore::restore_offered`).
+pub(crate) fn boot(
+    enabled: bool,
+    candidate: bool,
+    headless: bool,
+    cfg: Option<&aterm_core::config::TerminalConfig>,
+) -> Recovery {
     if !enabled {
         return Recovery::default();
     }
@@ -507,11 +575,11 @@ pub(crate) fn boot(enabled: bool, candidate: bool, headless: bool) -> Recovery {
     let _ = headless;
     #[cfg(unix)]
     {
-        boot_unix(candidate)
+        boot_unix(candidate, cfg)
     }
     #[cfg(not(unix))]
     {
-        let _ = candidate;
+        let _ = (candidate, cfg);
         aterm_log::info!("keeper: not available on this platform");
         Recovery::default()
     }
@@ -535,7 +603,7 @@ fn place() -> Option<(std::path::PathBuf, aterm_keeper::identity::Identity)> {
 }
 
 #[cfg(unix)]
-fn boot_unix(candidate: bool) -> Recovery {
+fn boot_unix(candidate: bool, cfg: Option<&aterm_core::config::TerminalConfig>) -> Recovery {
     let Some((socket, identity)) = place() else {
         return Recovery::default();
     };
@@ -552,8 +620,11 @@ fn boot_unix(candidate: bool) -> Recovery {
     crate::handoff_rendezvous::raise_descriptor_limit_for_recovery();
     let mut recovery = Recovery::default();
     let booted = match KeeperClient::connect(&socket, &identity, Duration::from_secs(2)) {
-        Ok(client) => match client.hello_app_marked(&build(), marker()) {
+        Ok(client) => match client.hello_app_marked(&build(), marker(), JOURNAL) {
             Ok(offers) => {
+                // An older keeper takes no companions: this window then makes no
+                // regions (its sessions' claims are settled with nothing to say).
+                KEEPER_JOURNALS.store(client.keeper_journals(), Ordering::Relaxed);
                 let mut used_cells = 0u64;
                 for offer in offers {
                     let rdev = offer.header.rdev;
@@ -563,8 +634,13 @@ fn boot_unix(candidate: bool) -> Recovery {
                     {
                         recovery.owners.push(owner);
                     }
-                    match admit_recovered_master(offer, &mut used_cells) {
+                    match admit_recovered_master(offer, &mut used_cells, cfg) {
                         Ok(adopted) => {
+                            if let Some(report) =
+                                adopted.keeper.as_ref().and_then(|c| c.restore.as_ref())
+                            {
+                                recovery.restores.note(report);
+                            }
                             recovery.shells.push(adopted.pid);
                             recovery.adopted.push(adopted);
                         }
@@ -602,12 +678,16 @@ fn boot_unix(candidate: bool) -> Recovery {
     };
     if !recovery.adopted.is_empty() {
         aterm_log::info!(
-            "keeper: {} session(s) the last window's end left running are reattached (from pid(s) {:?})",
+            "keeper: {} session(s) the last window's end left running are reattached (from pid(s) \
+             {:?}); screens restored exactly {}, with a loss counted {}, blank {}",
             recovery.adopted.len(),
-            recovery.owners
+            recovery.owners,
+            recovery.restores.counts.exact,
+            recovery.restores.counts.screen,
+            recovery.restores.counts.meta
         );
     }
-    match KeeperLink::start_marked(socket, identity, build(), marker(), booted) {
+    match KeeperLink::start_marked(socket, identity, build(), marker(), booted, JOURNAL) {
         Ok(link) => {
             keeper_state().phase = Phase::Live(Arc::new(link));
             start_meta_pump();
@@ -624,31 +704,29 @@ fn boot_unix(candidate: bool) -> Recovery {
 /// from here this process is the window, so the link starts and every
 /// registration its adopted sessions queued is sent — the successor's claim
 /// that turns the keeper's hold into custody (§5.3 step 8).
+#[cfg(unix)]
 pub(crate) fn activate() {
-    #[cfg(unix)]
-    {
-        if !on() {
-            return;
-        }
-        let mut st = keeper_state();
-        if !matches!(st.phase, Phase::Armed) {
-            return;
-        }
-        let Some((socket, identity)) = place() else {
-            return;
-        };
-        match KeeperLink::start_marked(socket, identity, build(), marker(), None) {
-            Ok(link) => {
-                for (_, op) in st.buffered.drain(..) {
-                    let _ = link.enqueue(op);
-                }
-                st.phase = Phase::Live(Arc::new(link));
-                drop(st);
-                start_meta_pump();
-                aterm_log::info!("keeper: this successor's sessions are registered at its Commit");
+    if !on() {
+        return;
+    }
+    let mut st = keeper_state();
+    if !matches!(st.phase, Phase::Armed) {
+        return;
+    }
+    let Some((socket, identity)) = place() else {
+        return;
+    };
+    match KeeperLink::start_marked(socket, identity, build(), marker(), None, JOURNAL) {
+        Ok(link) => {
+            for (_, op) in st.buffered.drain(..) {
+                let _ = link.enqueue(op);
             }
-            Err(e) => aterm_log::warn!("keeper: the link worker did not start: {e}"),
+            st.phase = Phase::Live(Arc::new(link));
+            drop(st);
+            start_meta_pump();
+            aterm_log::info!("keeper: this successor's sessions are registered at its Commit");
         }
+        Err(e) => aterm_log::warn!("keeper: the link worker did not start: {e}"),
     }
 }
 
@@ -678,8 +756,16 @@ pub(crate) struct Tag {
     /// (`SessionRecord::journal_key`). `handed` alone names only one
     /// generation back, and that image's leaves carry none of its ids.
     pub(crate) keyed: Option<(u32, u64)>,
+    /// THE SESSION LOG'S EPOCH (additive, `slog_ep=<n>`; a build that
+    /// predates it ignores the key; phase 2A of the session log): the epoch
+    /// of the log this process keeps for the shell. A crash recovery's log
+    /// takes an epoch above it (`session_log::SessionLog::adopt`), so a
+    /// reader's cursor of the crashed window's log is reset, never read on
+    /// into another process's records.
+    pub(crate) slog_ep: Option<u32>,
 }
 
+#[cfg(any(unix, test))]
 impl Tag {
     /// `key=value` lines, version first; a value with a newline is dropped.
     pub(crate) fn encode(&self) -> Vec<u8> {
@@ -706,6 +792,9 @@ impl Tag {
         }
         if let Some((owner, id)) = self.keyed {
             put("keyed", &format!("{owner}:{id}"));
+        }
+        if let Some(ep) = self.slog_ep {
+            put("slog_ep", &ep.to_string());
         }
         for (k, on) in [
             ("rekey", self.rekey),
@@ -745,6 +834,7 @@ impl Tag {
                         .and_then(|(owner, id)| Some((owner.parse().ok()?, id.parse().ok()?)));
                 }
                 "keyed" => tag.keyed = crate::session_store::parse_journal_key(v),
+                "slog_ep" => tag.slog_ep = v.parse().ok().filter(|ep| *ep >= 1),
                 _ => {}
             }
         }
@@ -782,13 +872,16 @@ fn birth_of(micros: u64) -> Birth {
 /// the shell — still alive, still born when it was registered, and still the
 /// session leader of THIS terminal (`aterm_pty::record_adopted_shell`, whose
 /// identity the session then keeps, F3) — and the tag's session id. Admitted,
-/// it is an [`crate::spawn::Adopted`] on the Repaint rung built from its META
-/// (`seamless::recovered_checkpoint`), repainted by the size pulse. Refused,
-/// the master closes here, through `HandedMaster`'s drop.
+/// it is an [`crate::spawn::Adopted`] whose screen is the crash restore's
+/// (`crash_restore::restore_offered`, from the region the keeper offered with
+/// the master: exact, or with a loss counted and repainted by the size pulse),
+/// else the Repaint rung built from its META (`seamless::recovered_checkpoint`).
+/// Refused, the master and its region close here, through their drops.
 #[cfg(unix)]
 pub(crate) fn admit_recovered_master(
     offer: Offered,
     used_cells: &mut u64,
+    cfg: Option<&aterm_core::config::TerminalConfig>,
 ) -> Result<crate::spawn::Adopted, &'static str> {
     use std::os::fd::IntoRawFd as _;
     let Offered {
@@ -796,17 +889,64 @@ pub(crate) fn admit_recovered_master(
         header,
         tag,
         meta,
+        companion,
+        attempts,
     } = offer;
     let master = crate::spawn::HandedMaster::new(master.into_raw_fd());
-    admit_recovered(master, header, &tag, &meta, used_cells)
+    admit_recovered_journaled(
+        master,
+        header,
+        &tag,
+        &meta,
+        Journaled {
+            companion,
+            attempts,
+            cfg,
+        },
+        used_cells,
+    )
 }
 
+/// The crash-restore half of an offer: the region the keeper offered with the master,
+/// its poison brake, and the config a restore replays under.
 #[cfg(unix)]
+struct Journaled<'a> {
+    companion: Option<aterm_keeper::client::OfferedCompanion>,
+    attempts: u8,
+    cfg: Option<&'a aterm_core::config::TerminalConfig>,
+}
+
+/// [`admit_recovered_journaled`] with no region: the META rung, as before the journal (the
+/// admission's tests).
+#[cfg(all(unix, test))]
 fn admit_recovered(
     master: crate::spawn::HandedMaster,
     header: MasterHeader,
     tag: &[u8],
     meta: &[u8],
+    used_cells: &mut u64,
+) -> Result<crate::spawn::Adopted, &'static str> {
+    admit_recovered_journaled(
+        master,
+        header,
+        tag,
+        meta,
+        Journaled {
+            companion: None,
+            attempts: 0,
+            cfg: None,
+        },
+        used_cells,
+    )
+}
+
+#[cfg(unix)]
+fn admit_recovered_journaled(
+    master: crate::spawn::HandedMaster,
+    header: MasterHeader,
+    tag: &[u8],
+    meta: &[u8],
+    journaled: Journaled<'_>,
     used_cells: &mut u64,
 ) -> Result<crate::spawn::Adopted, &'static str> {
     let fd = master.raw();
@@ -839,25 +979,73 @@ fn admit_recovered(
             fabric.queued_lost
         );
     }
+    // THE SCREEN (`crash_restore`, the plan's §2.7): the dead window's region,
+    // replayed in a scratch engine, after every refusal above (a refused offer
+    // costs no restore). Exact, it lands with no repaint, and a main-screen
+    // session gets no size pulse (`adoption_needs_size_pulse`); with a loss
+    // counted, the screen lands and the program is pulsed; with no region, or a
+    // restore that failed, the META rung as before: a blank screen with the
+    // keeper's scalars, repainted by the pulse. `hydrate_adopted_engine` is
+    // unchanged: the checkpoint carries no nonce, so the shell re-keys as it does
+    // on the META rung.
+    let Journaled {
+        companion,
+        attempts,
+        cfg,
+    } = journaled;
+    // SAFETY: `companion` came with the boot HELLO's OFFER, which a keeper makes only
+    // beside an orphaned master, after every window that claimed it (the region's only
+    // writers) has died; the keeper holds it unmapped and read-only, so nothing modifies
+    // or resizes the object while the restore maps it.
+    let restored =
+        unsafe { crate::crash_restore::restore_offered(companion, attempts, cfg, used_cells) };
+    let (checkpoint, repaint, report, history) = match restored {
+        Ok(restore) => (
+            Some(restore.checkpoint),
+            restore.repaint,
+            restore.report,
+            restore.history,
+        ),
+        Err(report) => {
+            // The META rung: a blank screen, and the scrollback the region held, when the
+            // restore read it, counted lost (`crash_restore::RestoreReport::history_lost`).
+            let history = crate::crash_restore::meta_history(&report);
+            (
+                crate::seamless::recovered_checkpoint(meta, used_cells),
+                true,
+                report,
+                history,
+            )
+        }
+    };
+    if report.rung != crate::crash_restore::Rung::Meta || report.why != "no-region" {
+        aterm_log::info!("keeper: session {sid}'s screen: {}", report.status_words());
+    }
+    // From here the master is released if it becomes no session.
+    let mut claim = Claim::of_tag(header.rdev, &tag);
+    claim.restore = Some(report);
     Ok(crate::spawn::Adopted {
-        // From here the master is released if it becomes no session.
-        keeper: Some(Claim::of_tag(header.rdev, &tag)),
+        keeper: Some(claim),
         local_id: header.local_id,
         master,
         pid,
         sid: aterm_session::SessionId::new(sid),
         nonce: aterm_session::LaunchNonce::generate(),
-        checkpoint: crate::seamless::recovered_checkpoint(meta, used_cells),
+        checkpoint,
         control: None,
-        // The screen is blank on purpose: the pulse makes the program redraw.
-        repaint: true,
+        repaint,
         frozen_path: tag.frozen,
         identity: tag.identity,
         topics: fabric.topics,
         fg_holder: 0,
         rekey: tag.rekey,
         loader: tag.loader,
-        history: crate::handoff_history::AdoptedHistory::default(),
+        // THE SCROLLBACK (`crash_restore::journal_history`): the history ring's lines the
+        // join takes, imported below the restored screen after the recovery's restore
+        // drain (`App::start_handoff_history_imports`), and the lines it could not take,
+        // counted from the session's registration on (`status history_lost=`); on the META
+        // rung, the lines the region held, when the restore read it.
+        history,
         holds: fabric.holds,
         title: String::new(),
         supervisor: None,
@@ -867,8 +1055,13 @@ fn admit_recovered(
         render_debt: None,
         fabric: fabric.carry,
         timeline_id: 0,
-        // A crashed window's shell: no manifest carried its log's counters.
-        log_carry: None,
+        // A crashed window's shell: no manifest carried its log's counters,
+        // but the keeper's tag names the epoch its log was at.
+        log: crate::session_log::LogAdopt {
+            keeper_ep: tag.slog_ep,
+            mirror: None,
+            ..Default::default()
+        },
         journal_key: None,
     })
 }
@@ -954,14 +1147,87 @@ fn register_unix(session: &crate::Session) -> bool {
             last: None,
         },
     );
+    // THE CLAIM SETTLED (`JOURNAL`): right behind its REGISTER, the session's
+    // crash-restore region (its read-only custody descriptor, which the link keeps
+    // with the master and tells a restarted keeper again), or that it has none. A
+    // recovered session's COMPANION is what ends the keeper's poison window for the
+    // region it was restored from.
+    let journal = match session
+        .ctx
+        .crash_journal
+        .get()
+        .and_then(|j| j.take_custody())
+    {
+        Some((region, len)) => LinkOp::Companion { rdev, region, len },
+        None => LinkOp::CompanionRelease { rdev },
+    };
+    match &st.phase {
+        Phase::Live(link) => {
+            let _ = link.enqueue(op);
+            let _ = link.enqueue(journal);
+        }
+        Phase::Armed => {
+            st.buffered.push((session.id, op));
+            st.buffered.push((session.id, journal));
+        }
+        Phase::Off => {}
+    }
+    true
+}
+
+/// COMPANION_RELEASE (`crash_restore::SessionJournal::stop`): session `session_id`'s
+/// journal stopped, so the keeper drops its region and a crash restores the session
+/// blank rather than from a region that stopped mid-way. Nothing for a session the
+/// link never registered (its registration then says it has no region).
+#[cfg(unix)]
+pub(crate) fn release_companion(session_id: u64) {
+    if !on() {
+        return;
+    }
+    let mut st = keeper_state();
+    let Some(rdev) = st.tracked.get(&session_id).map(|t| t.rdev) else {
+        return;
+    };
+    let op = LinkOp::CompanionRelease { rdev };
     match &st.phase {
         Phase::Live(link) => {
             let _ = link.enqueue(op);
         }
-        Phase::Armed => st.buffered.push((session.id, op)),
+        Phase::Armed => st.buffered.push((session_id, op)),
         Phase::Off => {}
     }
-    true
+}
+
+/// COMPANION again (`crash_restore::SessionJournal::replace_region`, the memory shed):
+/// session `session_id` journals into a fresh region, whose read-only custody descriptor
+/// `region` takes the place of the one the link keeps with the session's master (the old
+/// one closes there) and reaches the keeper, which replaces and closes the claim's old
+/// region on it. Queued behind everything already queued for the session, so it lands
+/// after the session's REGISTER and whatever its registration settled. The descriptor
+/// comes back when no link carries the session (the link is off, or the session was
+/// never registered or is gone), for the caller to keep.
+#[cfg(unix)]
+pub(crate) fn replace_companion(
+    session_id: u64,
+    region: std::os::fd::OwnedFd,
+    len: u64,
+) -> Option<std::os::fd::OwnedFd> {
+    if !on() {
+        return Some(region);
+    }
+    let mut st = keeper_state();
+    let Some(rdev) = st.tracked.get(&session_id).map(|t| t.rdev) else {
+        return Some(region);
+    };
+    let op = LinkOp::Companion { rdev, region, len };
+    match &st.phase {
+        Phase::Live(link) => {
+            let _ = link.enqueue(op);
+        }
+        Phase::Armed => st.buffered.push((session_id, op)),
+        Phase::Off => {}
+    }
+    None
 }
 
 /// What `session`'s registration by window `own_pid` says of it: its sid,
@@ -983,6 +1249,19 @@ pub(crate) fn registration_tag(
         frozen: session.frozen_path,
         handed: predecessor.zip(session.handoff_local_id),
         keyed: session.journal_key,
+        // Read off the session's log under its timeline's leaf lock, the one
+        // lock taken here: the epoch is decided at the spawn or adoption,
+        // before this registration, and never changes in this process.
+        slog_ep: Some(
+            session
+                .ctx
+                .timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .slog()
+                .log()
+                .ep(),
+        ),
     }
 }
 
@@ -1013,6 +1292,7 @@ pub(crate) fn release(session_id: u64) {
 /// master (§5.3 step 8). `true` when written, or when the keeper is off; a
 /// `false` is logged and the grant goes on: the holder scan is the keeper's
 /// independent gate against a second reader.
+#[cfg(any(unix, test))]
 pub(crate) fn pending_before_grant(successor: u32) -> bool {
     if !on() {
         return true;
@@ -1037,8 +1317,8 @@ pub(crate) fn pending_before_grant(successor: u32) -> bool {
     }
 }
 
-/// BYE — ONLY from the final-exit path, just before `exit(0)` (§5.3 step 4;
-/// `the_bye_has_one_call_site`): quit intent, so the keeper closes this
+/// BYE — ONLY from the final-exit path, just before `exit(0)` (§5.3 step 4):
+/// quit intent, so the keeper closes this
 /// window's masters and the kernel hangs the shells up as today. Waits at most
 /// [`BYE_WAIT`] for the frame to be written.
 pub(crate) fn bye() {
@@ -1070,12 +1350,12 @@ fn start_meta_pump() {
         }
         st.pump = true;
     }
-    let spawned = std::thread::Builder::new()
-        .name("aterm-keeper-meta".to_string())
-        .spawn(|| {
+    let spawned = crate::qos::spawn_lane_thread(
+        "aterm-keeper-meta".to_string(),
+        crate::qos::Role::Housekeeping,
+        || {
             // Housekeeping: four looks a second at a few scalars, never in the
             // band the program being typed into runs in.
-            crate::qos::set_self(crate::qos::Role::Housekeeping);
             loop {
                 std::thread::sleep(META_POLL);
                 if !on() {
@@ -1083,7 +1363,8 @@ fn start_meta_pump() {
                 }
                 meta_pass();
             }
-        });
+        },
+    );
     if let Err(e) = spawned {
         aterm_log::warn!("keeper: the META pump did not start: {e}");
         keeper_state().pump = false;
@@ -1210,18 +1491,25 @@ mod tests {
             frozen: true,
             handed: Some((4141, 7)),
             keyed: Some((4040, 3)),
+            slog_ep: Some(1_792_000_000),
         };
         assert_eq!(Tag::decode(&tag.encode()), Some(tag));
         assert_eq!(Tag::decode(b"v=2\nsid=s-00\n"), None, "another version");
-        let hostile =
-            Tag::decode(b"v=1\nsid=../../x\nidentity=a b\nowner=zz\nhanded=1\nkeyed=0:1\nnew=1\n")
-                .expect("v1");
+        let hostile = Tag::decode(
+            b"v=1\nsid=../../x\nidentity=a b\nowner=zz\nhanded=1\nkeyed=0:1\nnew=1\nslog_ep=zz\n",
+        )
+        .expect("v1");
         assert_eq!(
             hostile,
             Tag::default(),
             "a sid, label, owner or parent that is not one is dropped; unknown keys ignored"
         );
         assert!(tag_under_the_wire_bound());
+        // An older window's tag has no epoch; an epoch of 0 is none.
+        let older = Tag::decode(b"v=1\nsid=s-00ff\nowner=7\n").expect("v1");
+        assert_eq!(older.slog_ep, None);
+        assert_eq!(Tag::decode(b"v=1\nslog_ep=0\n").unwrap().slog_ep, None);
+        assert_eq!(Tag::decode(b"v=1\nslog_ep=-3\n").unwrap().slog_ep, None);
     }
 
     fn tag_under_the_wire_bound() -> bool {
@@ -1234,6 +1522,7 @@ mod tests {
             frozen: true,
             handed: Some((u32::MAX, u64::MAX)),
             keyed: Some((u32::MAX, u64::MAX)),
+            slog_ep: Some(u32::MAX),
         };
         let bytes = long.encode();
         Tag::decode(&bytes).is_some_and(|t| t == long) && bytes.len() <= aterm_keeper::wire::MAX_TAG
@@ -1257,7 +1546,7 @@ mod tests {
     /// and the exit's BYE do nothing (the flag is never raised).
     #[test]
     fn with_the_keeper_off_nothing_registers() {
-        let recovery = boot(false, false, false);
+        let recovery = boot(false, false, false, None);
         assert!(recovery.adopted.is_empty());
         assert!(!on(), "boot(false) leaves the link off");
         assert!(
@@ -1307,116 +1596,6 @@ mod tests {
         assert!(parse("[keeper]\nenabled = true\n").keeper_enabled());
     }
 
-    /// BYE is written from the final-exit path and nowhere else (§5.3 step 4):
-    /// a second site would tell the keeper "quit" on a path that does not end
-    /// the process, and the keeper would close masters a live window reads.
-    /// The idiom of `spawn.rs`'s wiring guards: the source itself is read.
-    #[test]
-    fn the_bye_has_one_call_site() {
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut sites = Vec::new();
-        let mut stack = vec![src];
-        while let Some(dir) = stack.pop() {
-            for entry in std::fs::read_dir(&dir).expect("src").flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    stack.push(path);
-                    continue;
-                }
-                if path.extension().is_none_or(|e| e != "rs") {
-                    continue;
-                }
-                let text = std::fs::read_to_string(&path).expect("read");
-                for (n, line) in text.lines().enumerate() {
-                    let code = line.split("//").next().unwrap_or("");
-                    // Spelled in two halves so this line is not a site itself.
-                    if code.contains(&["keeper_link", "::bye()"].concat()) {
-                        sites.push((path.clone(), n));
-                    }
-                }
-            }
-        }
-        assert_eq!(sites.len(), 1, "exactly one BYE site: {sites:?}");
-        let (file, line) = &sites[0];
-        assert!(file.ends_with("lib.rs"), "{file:?}");
-        let text = std::fs::read_to_string(file).expect("read");
-        let after: Vec<&str> = text.lines().skip(line + 1).take(3).collect();
-        assert!(
-            after.iter().any(|l| l.trim() == "std::process::exit(0);"),
-            "the BYE sits just before the final exit(0): {after:?}"
-        );
-    }
-
-    /// THE UPDATE INTERACTION (§5.3 step 8, "ships in P3, never later"): in
-    /// each lane the PENDING precedes the grant — the rendezvous transfer of
-    /// the masters, and the fork lane's proof/Commit decision — and the
-    /// successor's registration is released at its Commit, beside the
-    /// identity it adopts there, and nowhere else. Read off the source, as
-    /// `spawn.rs`'s wiring guards are.
-    #[test]
-    fn the_update_lanes_send_pending_before_the_grant_and_register_at_commit() {
-        let handoff = include_str!("app_update_handoff.rs");
-        let oob_pending = handoff
-            .find("keeper_link::pending_before_grant(held.candidate.pid)")
-            .expect("the launched lane sends PENDING");
-        let transfer = handoff.find(".transfer(").expect("the grant");
-        assert!(
-            oob_pending < transfer,
-            "PENDING before the rendezvous grant"
-        );
-        let fork_pending = handoff
-            .find("keeper_link::pending_before_grant(candidate.pid)")
-            .expect("the fork lane sends PENDING");
-        let spawn = handoff
-            .find("let child = match job.command.spawn()")
-            .expect("the fork");
-        // The fork lane's OWN decision: the first after its fork. (A search
-        // from the PENDING would also find the launched lane's, further down
-        // the file, and pass a PENDING moved past this lane's grant.)
-        let decision = spawn
-            + handoff[spawn..]
-                .find("run_handoff_decision(")
-                .expect("the fork lane's decision follows its fork");
-        assert!(
-            spawn < fork_pending && fork_pending < decision,
-            "PENDING between the fork and the fork lane's decision: spawn={spawn} \
-             pending={fork_pending} decision={decision}"
-        );
-        assert_eq!(
-            handoff
-                .matches("keeper_link::pending_before_grant(")
-                .count(),
-            2,
-            "one PENDING per lane"
-        );
-        let lib = include_str!("lib.rs");
-        let adopt = lib
-            .find("if crate::crash_signal::adopt_app_identity() {")
-            .expect("the Commit's identity adoption");
-        let activate = lib
-            .find("crate::keeper_link::activate();")
-            .expect("the Commit registers");
-        assert!(adopt < activate && activate - adopt < 1_000, "beside it");
-        assert_eq!(lib.matches("keeper_link::activate()").count(), 1);
-        // The candidate's registrations name the parent's session (finding 5's
-        // second review): the parent is named beside the journal's take-over,
-        // at boot, and every registration reads it.
-        let lane = lib
-            .find("crash_journal.set_predecessor(parent.pid(), parent.birth_unix_nanos());")
-            .expect("the journal's predecessor");
-        let named = lib
-            .find("keeper_link::set_predecessor(parent.pid());")
-            .expect("the keeper's predecessor");
-        assert!(lane < named && named - lane < 600, "beside it");
-        let own = include_str!("keeper_link.rs");
-        let register = &own[own.find("fn register_unix(").expect("register_unix")..];
-        assert!(
-            register[..register.find("\n}\n").expect("its end")]
-                .contains("registration_tag(session, std::process::id(), predecessor)"),
-            "every registration is tagged by `registration_tag`"
-        );
-    }
-
     /// P3 REVIEW — A CANDIDATE IS AN ADMITTED PAIR, NOT THE VARIABLES. A
     /// launch whose overlap pair was refused with nothing offered boots fresh
     /// as a plain window; armed as a candidate it would never say its HELLO —
@@ -1424,7 +1603,7 @@ mod tests {
     /// crash survival off though `[keeper] enabled = true`. `main_entry`
     /// decides it from the admitted pair (`handoff_commit`), and a shell the
     /// keeper kept, having no parked twin, is read at once even under the
-    /// variables. Read off the source, as the update lanes' guard above is.
+    /// variables.
     #[test]
     fn only_an_admitted_overlap_pair_or_an_adopted_handoff_arms_a_candidate() {
         assert!(
@@ -1434,59 +1613,6 @@ mod tests {
         assert!(is_update_candidate(true, false), "an admitted pair");
         assert!(is_update_candidate(false, true), "an adopted handoff");
         assert!(is_update_candidate(true, true));
-
-        let code = |text: &'static str| -> String {
-            text.lines()
-                .map(|line| line.split("//").next().unwrap_or(""))
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        let lib = code(include_str!("lib.rs"));
-        assert!(
-            lib.contains("let overlap_admitted = handoff_commit.is_some();"),
-            "the candidate is decided by the admitted pair"
-        );
-        let boot = lib.find("keeper_link::boot(").expect("the boot");
-        let args = &lib[boot..boot + 200];
-        assert!(
-            args.contains("keeper_link::is_update_candidate(overlap_admitted, seamless_adopting)"),
-            "{args}"
-        );
-        assert!(!args.contains("overlap_channels_present"), "{args}");
-        // The recovered shells are placed by owner before any pane takes one.
-        let place = lib
-            .find("keeper_link::place_by_owner(")
-            .expect("the placement");
-        let session0 = lib
-            .find("app_restore::take_session0_shell(&mut seamless_adopt")
-            .expect("session 0's pick");
-        assert!(boot < place && place < session0);
-
-        let spawn = code(include_str!("spawn.rs"));
-        assert!(spawn.contains("let recovered = keeper_claim.is_some();"));
-        assert!(
-            spawn.contains(
-                "if !(adopted && factory.defer_adopted_readers && !recovered) && !factory.reader_after_install {"
-            ),
-            "a recovered shell's reader is never deferred to a Commit that will not come"
-        );
-        assert!(spawn.contains("crate::keeper_link::register(&session, keeper_claim);"));
-
-        // ROOM FOR THE RECOVERY (round seven, finding 26's review): the soft
-        // descriptor limit is raised before the HELLO hands any master over,
-        // as a handoff's claim raises it before it dials.
-        let own = code(include_str!("keeper_link.rs"));
-        let body = &own[own.find("fn boot_unix(").expect("boot_unix")..];
-        let raise = body
-            .find("crate::handoff_rendezvous::raise_descriptor_limit_for_recovery();")
-            .expect("the recovery raises the limit");
-        let hello = body.find(".hello_app_marked(").expect("the HELLO");
-        assert!(raise < hello, "raised before the HELLO");
-        let candidate = body.find("if candidate {").expect("the candidate's return");
-        assert!(
-            candidate < raise,
-            "a candidate takes no offers and raises nothing here"
-        );
     }
 
     /// A real PTY whose shell leads it: `/bin/sh` parked in a `sleep`, and
@@ -1561,6 +1687,7 @@ mod tests {
             frozen: false,
             handed: None,
             keyed: None,
+            slog_ep: Some(4),
         }
         .encode()
     }
@@ -1613,6 +1740,17 @@ mod tests {
         assert_eq!(adopted.local_id, 3);
         assert_eq!(adopted.sid.as_str(), "s-0123456789abcdef0123");
         assert!(adopted.repaint && adopted.rekey);
+        // THE LOG'S EPOCH the crashed window registered (`slog_ep=4`), for
+        // the recovery's log to take one above (`session_log::crash_epoch`);
+        // no manifest carried anything else of it.
+        assert_eq!(
+            adopted.log,
+            crate::session_log::LogAdopt {
+                keeper_ep: Some(4),
+                mirror: None,
+                ..Default::default()
+            }
+        );
         assert_eq!(
             adopted
                 .keeper
@@ -1698,6 +1836,28 @@ mod tests {
             refused.err(),
             Some("its shell's pid now names another process")
         );
+
+        // NEGATIVE CONTROL: an older window's tag, without the key, names
+        // no epoch (the recovery takes the wall clock's seconds, slice 1's).
+        let older = Tag {
+            slog_ep: None,
+            ..Tag::decode(&tag()).expect("the tag reads")
+        }
+        .encode();
+        assert!(
+            !String::from_utf8_lossy(&older).contains("slog_ep"),
+            "PRECONDITION: the key is not written"
+        );
+        let adopted = admit_recovered(
+            dup_of(sh.master),
+            header_for(sh.pid, birth),
+            &older,
+            &meta,
+            &mut used,
+        )
+        .expect("a live shell is admitted");
+        assert_eq!(adopted.log.keeper_ep, None);
+        drop(adopted);
 
         // No session id in the tag.
         let refused = admit_recovered(

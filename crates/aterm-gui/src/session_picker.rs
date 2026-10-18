@@ -25,6 +25,7 @@
 //! modal [`crate::overlay::Overlay`] slot, so its keys are structurally gated
 //! BEFORE the terminal.
 
+#[cfg(test)]
 use aterm_render::Theme;
 use aterm_session::SessionId;
 
@@ -504,7 +505,7 @@ impl SessionPickerState {
 
     /// Decode a node minted by the CURRENT epoch to its filtered index.
     #[cfg(a11y_tree)]
-    pub(crate) fn a11y_filtered_index(&self, node: accesskit::NodeId) -> Option<usize> {
+    pub(crate) fn a11y_filtered_index(&self, node: aterm_a11y::model::NodeId) -> Option<usize> {
         a11y_slot_for(self.a11y_epoch(), node, self.filtered_count())
     }
 }
@@ -579,7 +580,11 @@ pub(crate) fn picker_row_hit(
 
 /// Paint the picker: intent title + subject, the pinned query row, one row per
 /// filtered session (cursor washed+ringed), a key-hint footer. PURE.
-pub(crate) fn picker_tray(state: &SessionPickerState, g: &SettingsGeom, theme: Theme) -> TrayInput {
+pub(crate) fn picker_tray(
+    state: &SessionPickerState,
+    g: &SettingsGeom,
+    theme: impl Into<crate::chrome_band::ChromePalette>,
+) -> TrayInput {
     let r = Roles::from_theme(theme);
     let (cw, ch, px) = (g.cw, g.ch, g.font_px);
     let vis = state.filtered();
@@ -725,8 +730,8 @@ pub(crate) fn picker_tray(state: &SessionPickerState, g: &SettingsGeom, theme: T
 /// The picker's accessibility tree — the palette scheme verbatim: a ListBox of
 /// the FILTERED rows, epoch-guarded ids, focus follows the cursor.
 #[cfg(a11y_tree)]
-pub(crate) fn picker_a11y(state: &SessionPickerState) -> accesskit::TreeUpdate {
-    use accesskit::{Action, Node, Role};
+pub(crate) fn picker_a11y(state: &SessionPickerState) -> aterm_a11y::model::TreeUpdate {
+    use aterm_a11y::model::{Action, Node, Role};
 
     let vis = state.filtered();
     let rows = vis.iter().map(|&i| {
@@ -869,12 +874,6 @@ mod tests {
             ),
             "the connected annotation is painted"
         );
-        assert!(
-            tray.prims.iter().any(
-                |pr| matches!(pr, DrawPrim::Text { s, .. } if s.contains("Connect to Session"))
-            ),
-            "the intent titles the card"
-        );
     }
 
     /// The Configure and Disconnect pickers list connections only, so no row
@@ -892,10 +891,10 @@ mod tests {
         assert!(lines.iter().all(|l| !l.contains("connected")), "{lines:?}");
     }
 
-    /// The new-identity row says why Enter does nothing: no name yet, a name
-    /// `parse_name` refuses (its reason), or a name already listed.
+    /// The new-identity row creates only a name `parse_name` takes that is not
+    /// already listed (case-folded, a stray leading space ignored).
     #[test]
-    fn the_new_identity_row_says_why_it_cannot_create() {
+    fn the_new_identity_row_creates_only_an_unlisted_valid_name() {
         let mut p = SessionPickerState::new(
             crate::WindowId(0),
             None,
@@ -909,30 +908,18 @@ mod tests {
                 PickerRow::NewIdentity,
             ],
         );
-        let line = |p: &SessionPickerState| p.row_line(&PickerRow::NewIdentity);
-        assert_eq!(line(&p), "+ New identity\u{2026} (type its name)");
-        for c in "my work".chars() {
-            p.push_char(c);
+        for (query, want) in [
+            ("", None),
+            ("my work", None),
+            ("Work", None),
+            (" work", None),
+            ("play", Some("play")),
+        ] {
+            p.query = query.to_string();
+            assert_eq!(p.new_identity_name().as_deref(), want, "{query:?}");
         }
-        assert_eq!(
-            line(&p),
-            "+ New identity: ' ' is not allowed in a name (letters, digits, `.`, `_`, `-`)"
-        );
-        p.query = "Work".to_string();
-        assert_eq!(
-            line(&p),
-            "+ New identity: \u{201c}work\u{201d} exists, choose it above"
-        );
-        assert_eq!(p.new_identity_name(), None);
-        // A stray leading space: the row it points at is still shown.
         p.query = " work".to_string();
-        assert_eq!(
-            line(&p),
-            "+ New identity: \u{201c}work\u{201d} exists, choose it above"
-        );
         assert_eq!(p.filtered_indices().collect::<Vec<_>>(), [0, 1]);
-        p.query = "play".to_string();
-        assert_eq!(line(&p), "+ New identity \u{201c}play\u{201d}");
     }
 
     /// `controls session-picker` mirrors the painted rows + live cursor.

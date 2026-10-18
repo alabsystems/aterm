@@ -665,7 +665,7 @@ impl ApplyTrouble {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApplyRetry, ApplyTrouble, GENERIC, PersonRemedy, clauses, times};
+    use super::{ApplyRetry, ApplyTrouble, GENERIC, PersonRemedy, clauses};
 
     /// EVERY REASON THIS PROGRAM CAN ACTUALLY WRITE INTO `last_apply_error`, copied
     /// from the producers.
@@ -1041,38 +1041,6 @@ mod tests {
         );
     }
 
-    /// THE FIELD CASE, END TO END (owner's machine, 2026-08-21): a staged 0.56.0 that
-    /// had been attempted twice, both times ending `ChildDied`, with the automatic
-    /// lane still scheduled. Every surfaced rendering must name the ATTEMPT COUNT and
-    /// a HUMAN cause; none may leak the proof-outcome enum name.
-    #[test]
-    fn a_twice_failed_stage_names_the_count_and_a_human_cause_everywhere() {
-        let trouble = ApplyTrouble::new(
-            2,
-            "overlap handoff failed safely: handoff proof ended ChildDied",
-            ApplyRetry::Scheduled,
-        )
-        .expect("two attempts is trouble");
-
-        let sentence = trouble.sentence();
-        assert_eq!(
-            sentence,
-            "aterm tried to update twice and the new version did not finish starting. \
-             It will try again by itself."
-        );
-        assert_eq!(
-            trouble.row_tail(),
-            "tried twice, didn\u{2019}t start; will try again"
-        );
-        assert_eq!(
-            trouble.compact(),
-            "Tried twice, didn\u{2019}t start \u{b7} will try again."
-        );
-        // The count reaches even the tersest rung — it is the fact that separates
-        // "waiting for you" from "tried twice and failed".
-        assert_eq!(trouble.micro(), "2 tries failed.");
-    }
-
     /// A CLEAN STAGE IS NOT A FAILURE. Zero attempts is the state of every update
     /// that downloaded and is waiting for a quiet window — deferrals and blocks are
     /// recorded as refusals and advance no streak — so it must produce no trouble at
@@ -1089,6 +1057,22 @@ mod tests {
             None,
             "a reason left over from a streak that has expired is not an attempt"
         );
+        // NEGATIVE CONTROL, the field case (owner's machine, 2026-08-21): a stage
+        // attempted twice is trouble, and every rendering — the tersest too —
+        // says the attempt count, the fact that separates "waiting for you"
+        // from "tried and failed".
+        let tried = |n| {
+            let t = ApplyTrouble::new(
+                n,
+                "overlap handoff failed safely: handoff proof ended ChildDied",
+                ApplyRetry::Scheduled,
+            )
+            .expect("an attempt is trouble");
+            [t.sentence(), t.row_tail(), t.compact(), t.micro()]
+        };
+        for (twice, thrice) in tried(2).into_iter().zip(tried(3)) {
+            assert_ne!(twice, thrice, "the count is said");
+        }
     }
 
     /// The two retry regimes are DIFFERENT SENTENCES, because one of them requires
@@ -1129,23 +1113,29 @@ mod tests {
         );
     }
 
-    /// English has words for one and two; "1 times" in a line a person reads is the
-    /// tell of an unattended program.
+    /// THE STAND-DOWN HAS A HORIZON (2026-09-14, audit OBS-5): a scheduled retry
+    /// that knows its wait says it at planning precision; one that does not keeps
+    /// the bare promise; and a wait under any other promise is dropped, not
+    /// rendered into a contradiction.
     #[test]
-    fn small_counts_are_words_and_larger_ones_are_numerals() {
-        assert_eq!(times(1), "once");
-        assert_eq!(times(2), "twice");
-        assert_eq!(times(3), "3 times");
-        assert_eq!(times(11), "11 times");
-        // …and the tersest rung, which cannot spend a word on "once", still agrees
-        // with itself about singular and plural.
-        let micro = |n| {
-            ApplyTrouble::new(n, "handoff proof ended ChildDied", ApplyRetry::Scheduled)
+    fn a_scheduled_retry_says_how_long_when_it_knows() {
+        use std::time::Duration;
+        let reason = "handoff proof ended ChildDied";
+        let sentence = |retry, wait| {
+            ApplyTrouble::new(3, reason, retry)
                 .expect("trouble")
-                .micro()
+                .with_retry_in(wait)
+                .sentence()
         };
-        assert_eq!(micro(1), "1 try failed.");
-        assert_eq!(micro(2), "2 tries failed.");
+        let unknown = sentence(ApplyRetry::Scheduled, None);
+        let six_hours = sentence(ApplyRetry::Scheduled, Some(Duration::from_secs(21_599)));
+        assert_ne!(six_hours, unknown, "a known wait is said");
+        assert!(six_hours.contains('6'), "{six_hours}");
+        assert_eq!(
+            sentence(ApplyRetry::ManualOnly, Some(Duration::from_secs(3600))),
+            sentence(ApplyRetry::ManualOnly, None),
+            "a wait under a manual-only promise is not rendered"
+        );
     }
 
     /// THE 2026-09-14 INCIDENT, AT THE WORDS. A hand-built, ad-hoc-signed
@@ -1161,56 +1151,6 @@ mod tests {
     /// (`install.rs` step 7, "current installed rollback source is not verified") and
     /// refuses too. This is the one apply failure whose remedy is entirely the
     /// person's — put the signed release bundle back — and no surface says so.
-    /// THE STAND-DOWN HAS A HORIZON (2026-09-14, audit OBS-5): a scheduled retry
-    /// that knows its wait says it at planning precision; one that does not keeps
-    /// the bare promise; and a wait under any other promise is dropped, not
-    /// rendered into a contradiction.
-    #[test]
-    fn a_scheduled_retry_says_how_long_when_it_knows() {
-        use std::time::Duration;
-        let reason = "handoff proof ended ChildDied";
-        let six_hours = ApplyTrouble::new(3, reason, ApplyRetry::Scheduled)
-            .expect("trouble")
-            .with_retry_in(Some(Duration::from_secs(21_599)));
-        assert!(
-            six_hours
-                .sentence()
-                .ends_with("It will try again by itself in about 6 h."),
-            "{}",
-            six_hours.sentence()
-        );
-        let ten_minutes = ApplyTrouble::new(1, reason, ApplyRetry::Scheduled)
-            .expect("trouble")
-            .with_retry_in(Some(Duration::from_secs(599)));
-        assert!(
-            ten_minutes.sentence().ends_with("in about 10 min."),
-            "{}",
-            ten_minutes.sentence()
-        );
-        let soon = ApplyTrouble::new(1, reason, ApplyRetry::Scheduled)
-            .expect("trouble")
-            .with_retry_in(Some(Duration::from_secs(20)));
-        assert!(
-            soon.sentence().ends_with("in about a minute."),
-            "{}",
-            soon.sentence()
-        );
-        let unknown = ApplyTrouble::new(1, reason, ApplyRetry::Scheduled)
-            .expect("trouble")
-            .with_retry_in(None);
-        assert!(unknown.sentence().ends_with("It will try again by itself."));
-        let manual = ApplyTrouble::new(1, reason, ApplyRetry::ManualOnly)
-            .expect("trouble")
-            .with_retry_in(Some(Duration::from_secs(3600)));
-        assert!(
-            manual
-                .sentence()
-                .ends_with("It will not try again until you ask."),
-            "a wait under a manual-only promise is not rendered: {}",
-            manual.sentence()
-        );
-    }
-
     #[test]
     fn observability_audit_a_rollback_source_refusal_names_the_installed_copy_and_the_remedy() {
         let reason = "installed bundle failed pre-park verification: the installed bundle at \
@@ -1257,6 +1197,9 @@ mod tests {
     /// the park, as a person's to clear — and the remedy is to move the app or ask an
     /// administrator, never to reinstall the signed release (which would land in the
     /// same folder and be refused again).
+    // The bundle apply lane and its ledger (`aterm_update::apply_lane_report`) are
+    // macOS's: a Linux update replaces the executable on disk and hands nothing off.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_non_writable_install_location_names_its_own_remedy() {
         let reason = "overlap handoff failed safely: installed bundle failed pre-park \

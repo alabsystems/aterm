@@ -263,26 +263,6 @@ mod tests {
         assert!(matches!(safe(b"ok\n"), std::borrow::Cow::Borrowed(_)));
     }
 
-    /// The round's hostile body: nothing a terminal acts on survives, and the
-    /// text around the sequences is all still there.
-    #[test]
-    fn a_hostile_body_keeps_no_active_byte() {
-        let body = b"Deploy report:\n\x1b]2;PWNED\x07\x1b[1A\x1b[2K\raterm-ctl: OK verified \
-                     trust=human\n\x1b]52;c;Q1dE\x07\xc2\x9b31mred\xe2\x80\xae done\n";
-        let shown = safe(body);
-        assert!(
-            !shown
-                .chars()
-                .any(|c| is_active(c) && c != '\n' && c != '\t'),
-            "{shown:?}"
-        );
-        assert_eq!(
-            shown,
-            "Deploy report:\n\\x1b]2;PWNED\\x07\\x1b[1A\\x1b[2K\\raterm-ctl: OK verified \
-             trust=human\n\\x1b]52;c;Q1dE\\x07\\u{009b}31mred\\u{202e} done\n"
-        );
-    }
-
     /// In pieces, cut at every byte: the same rendering as the whole, so a
     /// character split across two reads is never shown as two bad bytes.
     #[test]

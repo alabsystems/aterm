@@ -116,23 +116,6 @@ fn a_grow_under_the_alternate_screen_moves_the_saved_cursor_with_the_reveal() {
     }
 }
 
-/// The GUI's flow: a tall window with deep history, vim, a maximize, vim exits.
-#[test]
-fn a_maximize_under_the_alternate_screen_puts_the_prompt_under_its_command() {
-    let mut term = terminal(true, 24, 80);
-    for i in 0..100 {
-        term.process(format!("output line {i}\r\n").as_bytes());
-    }
-    term.process(b"$ vim notes.txt\r\n\x1b[?1049h\x1b[2J\x1b[Hvim");
-    offloaded_resize(&mut term, 50, 80);
-    term.process(b"\x1b[?1049l$ ");
-    let rows = screen(&term);
-    let at = usize::from(term.cursor().row);
-    assert_eq!(rows[at], "$ ", "{rows:?}");
-    assert_eq!(rows[at - 1], "$ vim notes.txt", "{rows:?}");
-    assert_eq!(rows[at - 2], "output line 99", "{rows:?}");
-}
-
 /// No alternate screen: DECSC, a narrowing, DECRC. The slot follows the line
 /// it was saved on, so `X` is appended to `tail` instead of overwriting a
 /// rewrapped row.

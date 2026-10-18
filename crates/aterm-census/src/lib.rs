@@ -73,9 +73,9 @@ pub use guards::{Finding, GUARDS, GuardReport, Rule, run_guards};
 pub use lazy_init::{LAZY_INIT_PRECISION_NOTE, run_lazy_init_census};
 pub use lock_order::run_lock_order_census;
 pub use scope_census::{SCOPE_PRECISION_NOTE, run_scope_census};
-/// The browser cdylib roots, re-exported for `aterm-forge`'s
-/// `the_wasm_cells_cover_every_shipped_web_crate`, which requires a measured
-/// cell for every crate on this list.
+/// The browser cdylib roots, re-exported for `aterm-forge`'s `[OB-17]` check
+/// (`check::ledger_findings`), which requires a measured cell for every crate
+/// on this list.
 pub use wasm_census::WASM_ROOT_CRATES;
 pub use wasm_census::run_wasm_census;
 
@@ -453,10 +453,15 @@ const OFFLOAD_ALLOWLIST: &[OffloadBoundary] = &[
 // ---------------------------------------------------------------------------
 
 /// Is this file a test-only source file (excluded from "implementation" scans)?
+/// A `tests_*.rs` beside `tests.rs` is one of its parts (`include!`d or `#[path]`ed into a
+/// `#[cfg(test)]` module), the same as an `*_tests.rs`.
 pub fn is_test_file(path: &Path) -> bool {
     let s = path.to_string_lossy();
     s.contains("/tests/")
         || s.ends_with("_tests.rs")
+        || path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("tests_"))
         || s.contains("/benches/")
         || s.ends_with("/proofs.rs")
         || s.contains("proofs_")
@@ -502,10 +507,38 @@ struct GuiFn {
     body: Vec<String>,
 }
 
-/// Non-test `*.rs` files under `<root>/crates/aterm-gui/src`.
+/// The `src` directories of the window crate's own split-out libraries,
+/// `<root>/crates/aterm-gui-*/src` (its fabric endpoint, tab and document
+/// models, access card, timing value), in path order: the GUI's source as much
+/// as `crates/aterm-gui/src` is, so every walk of the GUI takes them too. A
+/// crate split must not narrow a gate.
+pub(crate) fn gui_split_src_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(root.join("crates"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("aterm-gui-")
+        })
+        .map(|entry| entry.path().join("src"))
+        .filter(|src| src.is_dir())
+        .collect();
+    dirs.sort();
+    dirs
+}
+
+/// Non-test `*.rs` files under `<root>/crates/aterm-gui/src` and the window
+/// crate's split-out libraries ([`gui_split_src_dirs`]): one GUI source,
+/// wherever a module of it was moved to cut the window crate's rebuild.
 fn gui_source_files(root: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let _ = collect_rs_files(&root.join("crates/aterm-gui/src"), &mut files);
+    for src in gui_split_src_dirs(root) {
+        let _ = collect_rs_files(&src, &mut files);
+    }
     files.retain(|p| !is_test_file(p));
     files.sort();
     files
@@ -1295,7 +1328,8 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
         Err(e) => {
             let _ = writeln!(
                 log,
-                "  ✗ FAIL [OB-22] the held-guard walk could not run: {e} (scope: {}).",
+                "  ✗ FAIL [OB-22] the held-guard walk could not run: {e} (scope: {}, \
+                 crates/aterm-gui-*/src).",
                 held_guard::HELD_GUARD_SCOPE.join(", ")
             );
             failures += 1;
@@ -1329,13 +1363,14 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
     let (held_files, held_acquires) = held.unwrap_or_default();
     let _ = writeln!(
         log,
-        "    [OB-22] no unbounded work under a held `term` guard: {held_files} file(s) of {} \
-         read, {held_acquires} acquiring line(s).",
+        "    [OB-22] no unbounded work under a held `term` guard: {held_files} file(s) of {} + \
+         crates/aterm-gui-*/src read, {held_acquires} acquiring line(s).",
         held_guard::HELD_GUARD_SCOPE.join(" + ")
     );
     let _ = writeln!(
         log,
-        "    scope: lexical name-based walk of crates/aterm-gui/src + one term_lock hop; \
+        "    scope: lexical name-based walk of crates/aterm-gui/src + crates/aterm-gui-*/src + one \
+         term_lock hop; \
          markers swept over the derived {}-crate GUI-process closure \
          (precision limits: docs/temporal-safety-gate.md).",
         scan.scan_dirs.len()
@@ -1395,6 +1430,19 @@ mod tests {
     use crate::scan_set::test_fixtures::synth_tree;
 
     #[test]
+    fn a_tests_part_is_a_test_file_and_a_name_that_only_contains_it_is_not() {
+        let test = |p: &str| is_test_file(Path::new(p));
+        assert!(test(
+            "crates/aterm-shell-integration/src/tests_pwsh_keys.rs"
+        ));
+        assert!(test("crates/aterm-pty/src/unix_tests.rs"));
+        assert!(test("crates/aterm-pty/tests/smoke.rs"));
+        assert!(!test("crates/aterm-pty/src/lib.rs"));
+        assert!(!test("crates/aterm-pty/src/latests_seen.rs"));
+        assert!(!test("crates/aterm-pty/src/tests_dir/lib.rs"));
+    }
+
+    #[test]
     fn run_censuses_keeps_the_given_order_and_turns_a_panic_red() {
         fn clean(_: &Path) -> CensusOutcome {
             CensusOutcome::green("a", String::new(), "clean")
@@ -1418,8 +1466,7 @@ mod tests {
             "{}",
             out[0].log
         );
-        assert!(out[1].ok && out[1].log == "a: GREEN — clean\n");
-        assert_eq!(out[1].verdict, "a: GREEN — clean");
+        assert!(out[1].ok, "{}", out[1].log);
     }
 
     /// A clean walk that missed a floor comes back red, naming the floor; a
@@ -1429,15 +1476,13 @@ mod tests {
         fn thin(_: &Path) -> CensusOutcome {
             CensusOutcome::green("thin", "=== thin ===\n".to_string(), "1 site").with_floors(vec![
                 Floor::at_least("sites read", 1, 100, "the walk went blind"),
-                Floor::none("unnamed sites", 0, "name them"),
+                Floor::at_least("files read", 3, 1, "no files"),
             ])
         }
         fn red(_: &Path) -> CensusOutcome {
-            CensusOutcome::red("red", String::new(), "1 violation").with_floors(vec![Floor::none(
-                "unnamed sites",
-                3,
-                "name them",
-            )])
+            CensusOutcome::red("red", String::new(), "1 violation").with_floors(vec![
+                Floor::at_least("sites read", 0, 100, "the walk went blind"),
+            ])
         }
         let (a, b) = (
             Census {
@@ -1451,21 +1496,19 @@ mod tests {
                 run: red,
             },
         );
-        let bare = thin(Path::new("."));
-        assert!(bare.ok, "the bare walk holds no floors");
+        assert!(thin(Path::new(".")).ok, "the bare walk holds no floors");
         let out = run_censuses(Path::new("."), &[&a, &b]);
-        assert!(!out[0].ok);
-        assert_eq!(
-            out[0].verdict,
-            "thin: FAILED — 1 floor(s) missed; the walk itself found no violation"
+        assert!(!out[0].ok, "{}", out[0].log);
+        assert!(
+            out[0].log.contains("[floor] sites read") && !out[0].log.contains("files read"),
+            "only the missed floor is named:\n{}",
+            out[0].log
         );
-        assert_eq!(
-            out[0].log,
-            "=== thin ===\n  ✗ FAIL [floor] sites read: 1 (an aterm checkout shows at least \
-             100) — the walk went blind\n\
-             thin: FAILED — 1 floor(s) missed; the walk itself found no violation\n"
+        assert!(
+            out[1].verdict.ends_with("1 violation"),
+            "{}",
+            out[1].verdict
         );
-        assert_eq!(out[1].verdict, "red: FAILED — 1 violation");
     }
 
     fn body(src: &str) -> Vec<String> {

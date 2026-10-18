@@ -245,6 +245,13 @@ mod tests {
         served: &BTreeMap<String, Vec<u8>>,
         releases: &[Release],
     ) -> Result<Option<LinuxDownload>, String> {
+        elected(served, releases).map(|f| f.linux(LINUX_ARCHES[1]).cloned())
+    }
+
+    fn elected(
+        served: &BTreeMap<String, Vec<u8>>,
+        releases: &[Release],
+    ) -> Result<crate::site::releases::Facts, String> {
         let master = pk(&MASTER);
         let masters = [master.as_str()];
         let mut get = |url: &str, _limit: u64| {
@@ -259,9 +266,7 @@ mod tests {
             now_unix: NOW,
             get: &mut get,
         };
-        elect(releases, SLUG, &mut chain, &mut Vec::new())
-            .map(|f| f.linux(LINUX_ARCHES[1]).cloned())
-            .map_err(|e| e.to_string())
+        elect(releases, SLUG, &mut chain, &mut Vec::new()).map_err(|e| e.to_string())
     }
 
     #[test]
@@ -275,7 +280,7 @@ mod tests {
             9000,
             true,
         );
-        let d = run(&served, &[head]).unwrap().unwrap();
+        let d = run(&served, std::slice::from_ref(&head)).unwrap().unwrap();
         assert_eq!(d.label, "aterm-0.64.0-linux-aarch64");
         assert_eq!(
             d.kind,
@@ -283,6 +288,17 @@ mod tests {
                 sha256: "b".repeat(64),
                 size: 9000
             }
+        );
+        // the head's own executable: the page offers the plain installer command,
+        // and only for the architecture the release carries
+        let facts = elected(&served, &[head]).unwrap();
+        assert_eq!(
+            crate::site::pages::linux_install_command(&facts, "aarch64").as_deref(),
+            Some("curl -fsSL https://alab.systems/install.sh | bash")
+        );
+        assert_eq!(
+            crate::site::pages::linux_install_command(&facts, "x86_64"),
+            None
         );
     }
 
@@ -314,8 +330,16 @@ mod tests {
             9000,
             false,
         );
-        let d = run(&served, &[head.clone(), old]).unwrap().unwrap();
+        let d = run(&served, &[head.clone(), old.clone()]).unwrap().unwrap();
         assert_eq!(d.tag, "v0.64.0");
+        // an unpinned install.sh takes the head, which has no aarch64 build: the
+        // command pins the release that has one
+        let facts = elected(&served, &[head.clone(), old]).unwrap();
+        assert_eq!(facts.head, "v0.65.0");
+        assert_eq!(
+            crate::site::pages::linux_install_command(&facts, "aarch64").as_deref(),
+            Some("curl -fsSL https://alab.systems/install.sh | bash -s -- --version 0.64.0")
+        );
         // the head's floor retires the older build: refused, never fallen back from
         let floor_cast = head_cast.replace("min_build = 0", "min_build = 21");
         let mut served2 = BTreeMap::new();

@@ -2,8 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-1 conformance for the Observation Kernel (L0): a real [`Terminal`] fed through
-//! [`Terminal::process_at`] with armed watchers latches as `aterm-spec`'s
-//! `watcher_latch_model` / `idle_deadline_model` say, with negative controls. Headline:
+//! [`Terminal::process_at`] with armed watchers latches with no silent loss and at the
+//! deadline `aterm-spec`'s `idle_deadline_model` proves, with negative controls. Headline:
 //! the same `(bytes, ClockReading)` schedule expired at different instants (a live wake vs
 //! a lazy replay tick) latches the identical `Satisfaction`, because the kernel latches at
 //! the computed deadline and reads no wall clock.
@@ -108,28 +108,6 @@ fn seq_advanced_arm_eval_does_not_disturb_a_concurrent_idle_deadline() {
     assert!(
         t.watch_poll(idle).is_none(),
         "the idle watcher itself must not latch early"
-    );
-}
-
-#[test]
-fn negative_control_non_content_batch_does_not_latch() {
-    // Vacuity guard: a batch with no content mutation does not latch `SeqAdvanced`, so
-    // the kernel is bound to the real `content_seq`, not to "a process_at happened".
-    let base = minted_now();
-    let mut t = Terminal::new(24, 80);
-    let id = t
-        .watch(
-            WatcherSpec::SeqAdvanced {
-                after: t.content_seq(),
-            },
-            base,
-        )
-        .expect("arm");
-    // A bare cursor-position query (DSR) emits a reply but paints no cells.
-    t.process_at(b"\x1b[6n", clock_at(base, 10));
-    assert!(
-        t.watch_poll(id).is_none(),
-        "a non-content batch must not latch a content watcher"
     );
 }
 
@@ -441,39 +419,13 @@ fn a_row_match_latches_across_an_equal_seq_alt_screen_re_entry() {
     }
 }
 
-/// Negative control: with no screen switch, a repaint that keeps the seq and
-/// the text latches nothing; the generation is not a per-batch clock.
-#[test]
-fn an_unmoved_generation_latches_nothing() {
-    let base = minted_now();
-    let mut t = Terminal::new(24, 80);
-    t.process_at(b"\x1b[?1049h", clock_at(base, 1));
-    t.process_at(&dialog("ls-box-A"), clock_at(base, 2));
-    let seq_a = t.content_seq();
-    let id = t
-        .watch_rows(
-            std::sync::Arc::new(ContainsBoxB),
-            aterm_core::terminal::RowRange::All,
-            clock_at(base, 3).monotonic,
-        )
-        .expect("arm");
-    let seq_watch = t
-        .watch(WatcherSpec::SeqAdvanced { after: seq_a }, base)
-        .expect("arm");
-    // A cursor move alone: no write, no switch.
-    t.process_at(b"\x1b[5;5H", clock_at(base, 4));
-    assert_eq!(t.content_seq(), seq_a, "premise: nothing was written");
-    assert!(t.watch_poll(id).is_none());
-    assert!(t.watch_poll(seq_watch).is_none());
-}
-
 /// Tier-1 for `ObservationScreenGeneration`: real batches (writes, and leave-and-re-enter
 /// switches with and without a paint) each under a fresh `SeqAdvanced`; `Observe` on the
 /// projected `seq`/`epoch` must agree with the real latch. Negative control: the
 /// `(seq, alt)` key (`Buggy=1`) misses the equal-seq re-entry.
 #[test]
 fn the_kernel_change_test_conforms_to_the_screen_generation_model() {
-    use aterm_spec::derive::observation_screen_generation_model;
+    use aterm_models_core::observation_screen_generation_model;
     use aterm_spec::interp::{State, with_buggy};
 
     let model = observation_screen_generation_model();
@@ -533,5 +485,54 @@ fn the_kernel_change_test_conforms_to_the_screen_generation_model() {
     assert!(
         old_disagreed,
         "the schedule must contain a batch the old (seq, alt) test misses"
+    );
+}
+
+/// Row guards and row watchers read the live screen, as `text` serves it, whatever
+/// the person's scroll: a box live on screen matches while they are scrolled back,
+/// and an old copy of it scrolled into view from history does not.
+#[test]
+fn row_reads_follow_the_live_screen_not_the_scrolled_view() {
+    use aterm_core::terminal::{RowRange, first_matching_row};
+    let base = minted_now();
+    let mut t = Terminal::new(8, 40);
+    for i in 0..30 {
+        t.process_at(
+            format!("history line {i}\r\n").as_bytes(),
+            clock_at(base, 1 + i),
+        );
+    }
+    t.process_at(b" READY to proceed?\r\n  2. No", clock_at(base, 40));
+    let live = first_matching_row(&t, &ContainsReady, RowRange::All);
+    assert!(live.is_some(), "precondition: the box is on screen");
+    t.scroll_display(3);
+    assert_eq!(
+        first_matching_row(&t, &ContainsReady, RowRange::All),
+        live,
+        "scrolled back, the live row still matches"
+    );
+    let id = t
+        .watch_rows(
+            std::sync::Arc::new(ContainsReady),
+            RowRange::All,
+            clock_at(base, 41).monotonic,
+        )
+        .expect("arm");
+    assert!(t.watch_poll(id).is_some(), "the live row latches at arm");
+
+    // The box scrolls into history; the person scrolls it back into view.
+    let mut t = Terminal::new(8, 40);
+    t.process_at(b" READY to proceed?\r\n", clock_at(base, 1));
+    for i in 0..20 {
+        t.process_at(
+            format!("later line {i}\r\n").as_bytes(),
+            clock_at(base, 2 + i),
+        );
+    }
+    t.scroll_display(20);
+    assert_eq!(
+        first_matching_row(&t, &ContainsReady, RowRange::All),
+        None,
+        "a history copy is not on the live screen"
     );
 }

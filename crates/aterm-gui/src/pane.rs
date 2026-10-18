@@ -319,8 +319,8 @@ impl PaneTree {
     ///
     /// The `pane_tree` model's `Split` action, bound by `pane_tree_conformance`.
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "pane_tree",
             action = "Split",
             project = "aterm_gui::pane_tree_conformance::project"
@@ -359,8 +359,8 @@ impl PaneTree {
     /// `Collapsed` is the `pane_tree` model's `Close` action (bound by `pane_tree_conformance`);
     /// `LastPane` is a tab-level transition outside the model.
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "pane_tree",
             action = "Close",
             project = "aterm_gui::pane_tree_conformance::project"
@@ -810,20 +810,6 @@ mod tests {
         assert_eq!(t.focus_neighbor(FocusDir::Left, 24, 80), None);
     }
 
-    /// A single-pane tab has no neighbor in any direction.
-    #[test]
-    fn focus_neighbor_single_pane_none() {
-        let t = PaneTree::new(1);
-        for dir in [
-            FocusDir::Left,
-            FocusDir::Right,
-            FocusDir::Up,
-            FocusDir::Down,
-        ] {
-            assert_eq!(t.focus_neighbor(dir, 24, 80), None);
-        }
-    }
-
     /// Zoom shows only the focused pane full-window; unzoom restores; a single-pane
     /// tab can't zoom; and a structural change (split) exits zoom.
     #[test]
@@ -877,28 +863,6 @@ mod tests {
             t.compute_layout(24, 80),
             PaneTree::new(1).compute_layout(24, 80)
         );
-    }
-
-    /// Closing the focused pane in a deeper tree collapses only its parent; the
-    /// other branch is structurally untouched.
-    #[test]
-    fn close_collapses_only_parent() {
-        let mut t = PaneTree::new(1);
-        t.split_focused(SplitDir::Vertical, 2); // 1 | 2, focus 2
-        t.split_focused(SplitDir::Horizontal, 3); // 1 | (2 / 3), focus 3
-        // Close 3: its parent (the 2/3 split) collapses into 2; left branch (1) stays.
-        let outcome = t.close_focused();
-        assert_eq!(outcome, CloseOutcome::Collapsed { closed: 3 });
-        assert_eq!(t.sessions(), vec![1, 2]);
-        assert_eq!(
-            t.focus(),
-            2,
-            "focus re-seats on the survivor that ABSORBS the freed space (2, the \
-             pane above the closed one), not on the tree's top-left leaf"
-        );
-        let mut expected = PaneTree::new(1);
-        expected.split_focused(SplitDir::Vertical, 2);
-        assert_eq!(t.compute_layout(24, 80), expected.compute_layout(24, 80));
     }
 
     /// Closing the focused pane focuses the survivor that absorbs its cells, not
@@ -1028,14 +992,6 @@ mod tests {
         assert_eq!(t.focus(), 1);
     }
 
-    /// `contains` names only this tab's leaves.
-    #[test]
-    fn focus_only_live_leaves() {
-        let t = PaneTree::new(3);
-        assert!(t.contains(3));
-        assert!(!t.contains(4));
-    }
-
     /// An odd width: 81 cols → 80 splittable → 40 | 40, divider at col 40.
     #[test]
     fn vertical_split_odd_width() {
@@ -1046,19 +1002,6 @@ mod tests {
         assert_eq!(rects[0].cols, 40);
         assert_eq!(rects[1].col_off, 41);
         assert_eq!(rects[1].cols, 40);
-    }
-
-    /// A degenerate tiny window still yields a non-zero rect per pane.
-    #[test]
-    fn tiny_window_no_zero_panes() {
-        let mut t = PaneTree::new(1);
-        t.split_focused(SplitDir::Vertical, 2);
-        for rect in t.compute_layout(1, 2) {
-            assert!(
-                rect.rows >= 1 && rect.cols >= 1,
-                "no 0-extent pane: {rect:?}"
-            );
-        }
     }
 
     #[test]

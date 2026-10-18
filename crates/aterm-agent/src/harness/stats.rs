@@ -28,7 +28,7 @@
 //! | ledger | `declined` | [`HarnessStats::declined`] |
 //! | ledger | `typed` `continue@v1`, `continue-suggestion@v1`, `continue-done-check@v1`, `continue-open-items@v1` | [`HarnessStats::continued`] |
 //! | ledger | `typed` `answer@v1`, `prose-long-term@v1`, `prose-short-term@v1`, `land-answer@v1` | [`HarnessStats::answered`] (a question asked in prose) |
-//! | ledger | `typed` `land@v1`, `land-nudge@v1` | [`HarnessStats::landed`] |
+//! | ledger | `typed` `land@v1`, `land-nudge@v1` | [`HarnessStats::land_prompts`] (land PROMPTS typed, never landings) |
 //! | ledger | `typed` `usage-resume@v1`, `api-retry@v1`, `api-back@v1`, `api-cutoff@v1`, and `context-compact@v1`'s continuation (not its `/compact`) | [`HarnessStats::resumed`] |
 //! | ledger | `typed` under any other rule (`auth-login@v1`, `consent-accept@v1`, `model-fallback@v1`, `model-restore@v1`, `account-rotate@v1`, `memory-restart@v1`, `model-wind-down@v1`, `harness-turn@v1`, `usage-probe@v1`, `context-compact@v1`'s `/compact`, …) | nothing but [`HarnessStats::by_rule`] |
 //! | ledger | `waiting` `wall-wait@v1`, to the session's `wall-wait-end@v1` or its next `typed` row | [`HarnessStats::limit_wait_ms`] |
@@ -45,6 +45,13 @@
 //! | upgrade | `relaunched` onto another build | [`HarnessStats::upgraded`] |
 //! | upgrade | every other step | nothing but [`HarnessStats::rows`] |
 //!
+//! THE LEDGER'S ROWS ARE SORTED ONCE. Which counter an `approved`,
+//! `declined` or `typed` row adds to is [`super::acts::sort`]'s answer — the
+//! same function that says which act the window's Autopilot chip lights for
+//! it (design §9.2.3) — so the page and the chip never disagree about what
+//! an act is. They count a question dialog the same way, once: the page by
+//! the journal's `chose`, the chip by coalescing the dialog's keys.
+//!
 //! ANSWERS, CONTINUATIONS AND RESUMES are three different acts. An ANSWER
 //! replies to a question the worker asked (a dialog's option, or a prose
 //! question's `answer_text`). A CONTINUATION is typed at an ordinary turn end
@@ -53,7 +60,9 @@
 //! the connection cut, a full context — and is the wall's own act; the walls
 //! that need a login, a consent or a relaunch are counted where their act is
 //! (the relaunch) or only by rule. Land's instruction and its nudges are
-//! neither: they bring the work down, and count as [`HarnessStats::landed`].
+//! neither: they bring the work down, and count as
+//! [`HarnessStats::land_prompts`] — the prompts typed, never the landings
+//! they led to.
 //!
 //! THE WAITS are pairs, matched per session in the files' order (time
 //! order). A PERSON'S WAIT runs while a badge of the loop's stands: the
@@ -97,31 +106,36 @@
 //! the window's start, and [`HarnessStats::cut`] says so. A file shorter than
 //! that was never cut: a short session that began inside the window is whole.
 //!
-//! The folds are pure. [`stats_under`] is the one reader: it creates nothing
-//! (a missing directory is an empty result), reads only the files named
-//! above, and leaves a ledger no row has been appended to since the window
-//! opened unread. The window's host calls it off the event loop.
+//! PER SESSION (`docs/DESIGN-harness-autopilot-2026-10-15.md` §10.3.3, item
+//! 2). An accumulator built by [`HarnessStats::per_session`] — the page's
+//! today window — also keeps each session's share of its counts and waits
+//! ([`HarnessStats::by_session`], a [`Tally`] per `sid`; the upgrade ledger's
+//! by its `tab`), bumped where the totals are, so the shares sum to the
+//! totals; a file whose cut may have shortened the window marks its own
+//! session's share `cut` too.
+//!
+//! ONE READING, TWO WINDOWS (§10.3.3, item 1). [`stats_windows`] is the
+//! page's reader: it lists the files once, for the earlier window's start,
+//! reads each file once through [`tail_lines`], parses each line once, and
+//! folds it into both windows — a file no row was appended to since a
+//! window opened is folded into neither that window's counts nor its `bad`
+//! lines, as [`stats_under`] would leave it unread. [`stats_under`] reads
+//! one window, and is what the one pass must equal. Both create nothing (a
+//! missing directory is an empty result) and read only the files named
+//! above. The folds are pure; the window's host calls the reader off the
+//! event loop.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use aterm_json::Value;
 
+use super::acts::{self, Counter};
 use super::cli::{DISK_LEDGER_KEEP_ROWS, READ_MAX_ROWS, tail_lines};
 use crate::supervise::approvals::{self, Outcome, RULE_WALL_WAIT, RULE_WALL_WAIT_END};
 use crate::supervise::journal::{
     ADOPTED, ATTENTION_SKIPPED, CLEARED_BADGES, FROZEN, JournalRecord, MAIL_ADOPTED, MAIL_RETRY,
     MAIL_UNPARKED,
-};
-use crate::supervise::policy::approval::QuestionPriority;
-use crate::supervise::policy::question::is_question_rule;
-// Land's rules (design §2.2) are the policy's own consts, as every other rule
-// here is: a rule id is never reworded (a ledger an earlier build wrote reads
-// the same), so the fold counts Land's rows whichever build wrote them.
-use crate::supervise::policy::turn_end::{
-    RULE_API_BACK, RULE_API_CUTOFF, RULE_API_RETRY, RULE_COMPACT, RULE_CONTINUE, RULE_DONE_CHECK,
-    RULE_LAND, RULE_LAND_ANSWER, RULE_LAND_NUDGE, RULE_LIMIT_RESUME, RULE_OPEN_ITEMS,
-    RULE_SUGGESTION,
 };
 
 /// How much older than the window's start a file's last write may be before
@@ -154,8 +168,9 @@ pub struct HarnessStats {
     pub answered: u64,
     /// Continuations typed at an ordinary turn end (Cruise).
     pub continued: u64,
-    /// Land's instruction and its nudges (`land@v1`, `land-nudge@v1`).
-    pub landed: u64,
+    /// Land's instruction and its nudges typed (`land@v1`,
+    /// `land-nudge@v1`): land prompts, never landings.
+    pub land_prompts: u64,
     /// The work carried on past a wall: a usage reset, an API error, a reply
     /// cut off, a full context.
     pub resumed: u64,
@@ -186,8 +201,135 @@ pub struct HarnessStats {
     /// The window may be partial: a file's cut (or this read's ring) may have
     /// dropped rows the window starts with (module docs, THE WINDOW).
     pub cut: bool,
+    /// Each session's share of the counts above, by `sid` (module docs, PER
+    /// SESSION): `Some` only for an accumulator built by
+    /// [`Self::per_session`]. A session with no counted row has none.
+    pub by_session: Option<BTreeMap<String, Tally>>,
     /// The folds' memory of what is still open.
     open: Open,
+}
+
+/// One session's share of a window ([`HarnessStats::by_session`]): the
+/// counts and waits its rows added to the window's totals, the newest
+/// escalation's time, and whether its own files' cut may have shortened the
+/// window. Each field sums, over every session, to the total of the same
+/// name (a sid no live session claims holds its share too).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Tally {
+    /// [`HarnessStats::approved`]'s share.
+    pub approved: u64,
+    /// [`HarnessStats::unproven`]'s share.
+    pub unproven: u64,
+    /// [`HarnessStats::declined`]'s share.
+    pub declined: u64,
+    /// [`HarnessStats::answered`]'s share.
+    pub answered: u64,
+    /// [`HarnessStats::continued`]'s share.
+    pub continued: u64,
+    /// [`HarnessStats::land_prompts`]' share.
+    pub land_prompts: u64,
+    /// [`HarnessStats::resumed`]'s share.
+    pub resumed: u64,
+    /// [`HarnessStats::escalated`]'s share.
+    pub escalated: u64,
+    /// [`HarnessStats::human_wait_ms`]' share.
+    pub human_wait_ms: u64,
+    /// [`HarnessStats::limit_wait_ms`]' share.
+    pub limit_wait_ms: u64,
+    /// [`HarnessStats::relaunched`]'s share (the upgrade ledger's `tab`).
+    pub relaunched: u64,
+    /// [`HarnessStats::upgraded`]'s share (the upgrade ledger's `tab`).
+    pub upgraded: u64,
+    /// When the newest escalation counted in the window was handed to a
+    /// person (unix ms).
+    pub last_escalated_ms: Option<i64>,
+    /// The session's own ledger or journal may have lost the window's start
+    /// ([`HarnessStats::cut`] for its files alone).
+    pub cut: bool,
+}
+
+/// A count a row adds to: the window's total and, per session, its share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Count {
+    /// The counter THE ONE SORT names ([`acts::sort`]).
+    Act(Counter),
+    /// A full-power press the safe rules could not prove.
+    Unproven,
+    /// A point handed to a person.
+    Escalated,
+    /// An agent started again on the build it ran.
+    Relaunched,
+    /// An agent relaunched onto another build.
+    Upgraded,
+}
+
+/// A wait a pair of rows measures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wait {
+    /// A person's: a badge of the loop's stood.
+    Human,
+    /// A limit's: the harness waited at a wall.
+    Limit,
+}
+
+/// The counts a window's totals and a session's share both keep.
+trait Counts {
+    /// The slot `count` adds to.
+    fn slot(&mut self, count: Count) -> &mut u64;
+    /// The slot `wait` adds to.
+    fn wait_slot(&mut self, wait: Wait) -> &mut u64;
+}
+
+impl Counts for HarnessStats {
+    fn slot(&mut self, count: Count) -> &mut u64 {
+        match count {
+            Count::Act(counter) => match counter {
+                Counter::Approved => &mut self.approved,
+                Counter::Declined => &mut self.declined,
+                Counter::Answered => &mut self.answered,
+                Counter::Continued => &mut self.continued,
+                Counter::Resumed => &mut self.resumed,
+                Counter::LandPrompts => &mut self.land_prompts,
+            },
+            Count::Unproven => &mut self.unproven,
+            Count::Escalated => &mut self.escalated,
+            Count::Relaunched => &mut self.relaunched,
+            Count::Upgraded => &mut self.upgraded,
+        }
+    }
+
+    fn wait_slot(&mut self, wait: Wait) -> &mut u64 {
+        match wait {
+            Wait::Human => &mut self.human_wait_ms,
+            Wait::Limit => &mut self.limit_wait_ms,
+        }
+    }
+}
+
+impl Counts for Tally {
+    fn slot(&mut self, count: Count) -> &mut u64 {
+        match count {
+            Count::Act(counter) => match counter {
+                Counter::Approved => &mut self.approved,
+                Counter::Declined => &mut self.declined,
+                Counter::Answered => &mut self.answered,
+                Counter::Continued => &mut self.continued,
+                Counter::Resumed => &mut self.resumed,
+                Counter::LandPrompts => &mut self.land_prompts,
+            },
+            Count::Unproven => &mut self.unproven,
+            Count::Escalated => &mut self.escalated,
+            Count::Relaunched => &mut self.relaunched,
+            Count::Upgraded => &mut self.upgraded,
+        }
+    }
+
+    fn wait_slot(&mut self, wait: Wait) -> &mut u64 {
+        match wait {
+            Wait::Human => &mut self.human_wait_ms,
+            Wait::Limit => &mut self.limit_wait_ms,
+        }
+    }
 }
 
 /// What a fold carries from one row to the next: the waits still open and
@@ -213,11 +355,68 @@ impl HarnessStats {
         }
     }
 
+    /// [`Self::new`], keeping each session's share of the counts
+    /// ([`Self::by_session`]): the page's today window, whose SESSIONS rows
+    /// each say their own day.
+    #[must_use]
+    pub fn per_session(since_ms: i64) -> Self {
+        Self {
+            by_session: Some(BTreeMap::new()),
+            ..Self::new(since_ms)
+        }
+    }
+
     /// No row of any file fell in the window: the page says the harness has
     /// done nothing there yet (a line that is no row says nothing).
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.rows == 0
+    }
+
+    /// `sid`'s share, made where this accumulator keeps shares and it has
+    /// none yet; `None` where it keeps none.
+    fn tally(&mut self, sid: &str) -> Option<&mut Tally> {
+        let shares = self.by_session.as_mut()?;
+        if !shares.contains_key(sid) {
+            shares.insert(sid.to_string(), Tally::default());
+        }
+        shares.get_mut(sid)
+    }
+
+    /// One `count` of `sid`'s: the window's total and the session's share.
+    fn count(&mut self, sid: &str, count: Count) {
+        bump(self.slot(count));
+        if let Some(tally) = self.tally(sid) {
+            bump(tally.slot(count));
+        }
+    }
+
+    /// `ms` more of `sid`'s `wait`: the window's total and the session's
+    /// share.
+    fn waited(&mut self, sid: &str, wait: Wait, ms: u64) {
+        let total = self.wait_slot(wait);
+        *total = total.saturating_add(ms);
+        if let Some(tally) = self.tally(sid) {
+            let share = tally.wait_slot(wait);
+            *share = share.saturating_add(ms);
+        }
+    }
+
+    /// An escalation of `sid`'s at `at` (unix ms) counted in the window.
+    fn escalated_at(&mut self, sid: &str, at: i64) {
+        self.count(sid, Count::Escalated);
+        if let Some(tally) = self.tally(sid) {
+            tally.last_escalated_ms = Some(tally.last_escalated_ms.map_or(at, |last| last.max(at)));
+        }
+    }
+
+    /// `sid`'s own file may have lost the window's start: the window and the
+    /// session's share say so.
+    fn cut_of(&mut self, sid: &str) {
+        self.cut = true;
+        if let Some(tally) = self.tally(sid) {
+            tally.cut = true;
+        }
     }
 
     /// One row of `sid`'s in the window.
@@ -246,9 +445,7 @@ impl HarnessStats {
     /// counts.
     fn badge_down(&mut self, sid: &str, at: i64) {
         if let Some(start) = self.open.human.remove(sid) {
-            self.human_wait_ms =
-                self.human_wait_ms
-                    .saturating_add(span_ms(start, at, self.since_ms));
+            self.waited(sid, Wait::Human, span_ms(start, at, self.since_ms));
         }
     }
 }
@@ -265,58 +462,23 @@ fn span_ms(start: i64, end: i64, since_ms: i64) -> u64 {
     u64::try_from(end.saturating_sub(start.max(since_ms))).unwrap_or(0)
 }
 
-/// Whether an `approved` row under `rule` is one key of a question dialog
-/// (its tab, a toggle, its submit) rather than a box's press. Land's answer
-/// is among them for the day Land answers dialogs: deferred (design §2.2),
-/// so today a dialog under Land is keyed under the question rules, and
-/// [`RULE_LAND_ANSWER`] is only ever typed in prose.
-fn is_dialog_key(rule: &str) -> bool {
-    is_question_rule(rule) || rule == RULE_LAND_ANSWER
-}
-
-/// Whether a `typed` row under `rule` answers a question asked in prose:
-/// `answer_text` under any priority ([`QuestionPriority::prose_rule_id`]),
-/// or Land's answer.
-fn is_prose_answer(rule: &str) -> bool {
-    rule == RULE_LAND_ANSWER
-        || QuestionPriority::ALL
-            .into_iter()
-            .any(|p| p.prose_rule_id() == rule)
-}
-
-/// The counter a `typed` row under `rule`, typing `command`, adds to (module
-/// docs' table); `None`: only [`HarnessStats::by_rule`].
-fn typed_counter<'a>(acc: &'a mut HarnessStats, rule: &str, command: &str) -> Option<&'a mut u64> {
-    if matches!(
-        rule,
-        RULE_CONTINUE | RULE_SUGGESTION | RULE_DONE_CHECK | RULE_OPEN_ITEMS
-    ) {
-        Some(&mut acc.continued)
-    } else if is_prose_answer(rule) {
-        Some(&mut acc.answered)
-    } else if matches!(rule, RULE_LAND | RULE_LAND_NUDGE) {
-        Some(&mut acc.landed)
-    } else if matches!(
-        rule,
-        RULE_LIMIT_RESUME | RULE_API_RETRY | RULE_API_BACK | RULE_API_CUTOFF
-    ) || (rule == RULE_COMPACT && !command.starts_with('/'))
-    {
-        Some(&mut acc.resumed)
-    } else {
-        None
-    }
-}
-
 /// Fold one line of a session's approval ledger
 /// ([`crate::supervise::approvals::Row::to_json`]'s shape) into `acc`, over
 /// its window ([`HarnessStats::since_ms`]). A line that is no row (not JSON,
-/// no `ts`) is [`HarnessStats::bad`]. A row before the window counts nothing,
-/// but still opens or closes a limit's wait the window may hold the rest of.
+/// no `ts`) is [`HarnessStats::bad`]; a row is [`fold_ledger_row`]'s.
 pub fn fold_ledger_line(acc: &mut HarnessStats, line: &str) {
-    let Some((v, ts)) = row_and_time(line, "ts") else {
-        bump(&mut acc.bad);
-        return;
-    };
+    match row_and_time(line, "ts") {
+        Some((v, ts)) => fold_ledger_row(acc, &v, ts),
+        None => bump(&mut acc.bad),
+    }
+}
+
+/// Fold one approval ledger row `v`, written at `ts` (unix ms), into `acc`,
+/// over its window ([`HarnessStats::since_ms`]): a row before the window
+/// counts nothing, but still opens or closes a limit's wait the window may
+/// hold the rest of. The one pass parses a line once and folds the row into
+/// each window ([`stats_windows`]).
+pub fn fold_ledger_row(acc: &mut HarnessStats, v: &Value, ts: i64) {
     let text = |k: &str| v.get(k).and_then(Value::as_str);
     let sid = text("sid").unwrap_or_default();
     let rule = text("rule_id").unwrap_or("-");
@@ -335,36 +497,28 @@ pub fn fold_ledger_line(acc: &mut HarnessStats, line: &str) {
         return;
     }
     acc.row_of(sid);
-    match outcome {
-        Some(Outcome::Approved) => {
-            acc.act(rule);
-            if !is_dialog_key(rule) {
-                bump(&mut acc.approved);
-                if text("reason").is_some_and(|r| r.starts_with("unproven:")) {
-                    bump(&mut acc.unproven);
-                }
-            }
-        }
-        Some(Outcome::Declined) => {
-            acc.act(rule);
-            bump(&mut acc.declined);
-        }
-        Some(Outcome::Typed) => {
-            acc.act(rule);
-            if let Some(n) = typed_counter(acc, rule, text("command").unwrap_or_default()) {
-                bump(n);
-            }
-        }
-        _ => {}
+    // Every act (`approved`, `declined`, `typed`) counts by its rule, and by
+    // the counter THE ONE SORT names (`acts::sort`, which says what the
+    // Autopilot chip lights too): a dialog's key counts nothing, `/compact`
+    // nothing, its continuation a resume.
+    let Some(outcome @ (Outcome::Approved | Outcome::Declined | Outcome::Typed)) = outcome else {
+        return;
+    };
+    acc.act(rule);
+    let Some(kind) = acts::sort(rule, outcome, text("command").unwrap_or_default()).counter else {
+        return;
+    };
+    acc.count(sid, Count::Act(kind));
+    if kind == Counter::Approved && text("reason").is_some_and(|r| r.starts_with("unproven:")) {
+        acc.count(sid, Count::Unproven);
     }
 }
 
 /// `sid`'s limit wait, if one is open, closed at `at` (unix ms).
 fn close_limit(acc: &mut HarnessStats, sid: &str, at: i64) {
     if let Some(start) = acc.open.limit.remove(sid) {
-        acc.limit_wait_ms = acc
-            .limit_wait_ms
-            .saturating_add(span_ms(start, at, acc.since_ms));
+        let ms = span_ms(start, at, acc.since_ms);
+        acc.waited(sid, Wait::Limit, ms);
     }
 }
 
@@ -482,7 +636,7 @@ pub fn fold_journal(acc: &mut HarnessStats, recs: &[JournalRecord]) {
                 Escalation::Again => acc.badge_up(sid, r.t),
                 Escalation::Asked => {
                     if inside {
-                        bump(&mut acc.escalated);
+                        acc.escalated_at(sid, r.t);
                     }
                     acc.badge_up(sid, r.t);
                 }
@@ -496,7 +650,7 @@ pub fn fold_journal(acc: &mut HarnessStats, recs: &[JournalRecord]) {
             }
             "other" if is_adopted(r) => acc.badge_up(sid, r.t),
             "other" if frozen_takes_badge_down(r) => acc.badge_down(sid, r.t),
-            "chose" if inside => bump(&mut acc.answered),
+            "chose" if inside => acc.count(sid, Count::Act(Counter::Answered)),
             _ => {}
         }
         if inside {
@@ -511,24 +665,32 @@ pub fn fold_journal(acc: &mut HarnessStats, recs: &[JournalRecord]) {
 /// ms). A `relaunched` row is an upgrade where both builds are known and
 /// differ, else a relaunch. A line that is no row is [`HarnessStats::bad`].
 pub fn fold_upgrade_line(acc: &mut HarnessStats, line: &str) {
-    let Some((v, t)) = row_and_time(line, "t") else {
-        bump(&mut acc.bad);
-        return;
-    };
+    match row_and_time(line, "t") {
+        Some((v, t)) => fold_upgrade_row(acc, &v, t),
+        None => bump(&mut acc.bad),
+    }
+}
+
+/// Fold one live upgrade ledger row `v`, written at unix second `t`, into
+/// `acc`, over its window ([`HarnessStats::since_ms`], unix ms): its
+/// session is its `tab`.
+pub fn fold_upgrade_row(acc: &mut HarnessStats, v: &Value, t: i64) {
     if t.saturating_mul(1000) < acc.since_ms {
         return;
     }
     let text = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default();
-    match text("tab") {
+    let tab = text("tab");
+    match tab {
         "" | "-" => bump(&mut acc.rows),
         tab => acc.row_of(tab),
     }
     if text("step") == "relaunched" {
-        if moved_build(text("from"), text("to")) {
-            bump(&mut acc.upgraded);
+        let count = if moved_build(text("from"), text("to")) {
+            Count::Upgraded
         } else {
-            bump(&mut acc.relaunched);
-        }
+            Count::Relaunched
+        };
+        acc.count(tab, count);
     }
 }
 
@@ -569,49 +731,84 @@ enum DriveFile {
     Journal,
 }
 
+impl DriveFile {
+    /// The name's ending past the session's id.
+    const fn suffix(self) -> &'static str {
+        match self {
+            Self::Ledger => ".jsonl",
+            Self::Journal => ".journal.jsonl",
+        }
+    }
+}
+
+/// A ledger or journal [`drive_files`] listed: its path, what it is, the
+/// session its name carries, and when it was last written (unix ms; `None`
+/// where that cannot be read, and the file is read).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Listed {
+    path: PathBuf,
+    kind: DriveFile,
+    sid: String,
+    modified_ms: Option<i64>,
+}
+
 /// The ledgers and journals under `drive` (`<state>/drive`), in name order;
 /// none for a directory that is missing or cannot be read. Everything else
 /// there (`<sid>.goal-hold.json`, a cut's `.tmp`, a directory) is passed
 /// over, and so is a file no row was appended to since the window opened at
 /// `since_ms`.
-fn drive_files(drive: &Path, since_ms: i64) -> Vec<(PathBuf, DriveFile)> {
+fn drive_files(drive: &Path, since_ms: i64) -> Vec<Listed> {
     let Ok(entries) = std::fs::read_dir(drive) else {
         return Vec::new();
     };
-    let mut out: Vec<(PathBuf, DriveFile)> = entries
+    let mut out: Vec<Listed> = entries
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
         .filter_map(|e| {
             let name = e.file_name();
             let name = name.to_str()?;
-            let kind = if name.ends_with(".journal.jsonl") {
+            let kind = if name.ends_with(DriveFile::Journal.suffix()) {
                 DriveFile::Journal
-            } else if name.ends_with(".jsonl") {
+            } else if name.ends_with(DriveFile::Ledger.suffix()) {
                 DriveFile::Ledger
             } else {
                 return None;
             };
-            Some((e.path(), kind))
+            let sid = name.strip_suffix(kind.suffix()).unwrap_or(name).to_string();
+            let path = e.path();
+            let modified_ms = modified_ms(&path);
+            Some(Listed {
+                path,
+                kind,
+                sid,
+                modified_ms,
+            })
         })
-        .filter(|(path, _)| !untouched_since(path, since_ms))
+        .filter(|file| !untouched(file.modified_ms, since_ms))
         .collect();
-    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out.sort_by(|a, b| a.path.cmp(&b.path));
     out
 }
 
-/// Whether `path` was last written before the window at `since_ms` opened
-/// (less [`MTIME_SLACK_MS`]): none of its rows can fall in the window. A file
-/// whose time cannot be read is read.
-fn untouched_since(path: &Path, since_ms: i64) -> bool {
-    let Some(modified_ms) = std::fs::metadata(path)
+/// When `path` was last written, unix ms; `None` where that cannot be read.
+fn modified_ms(path: &Path) -> Option<i64> {
+    std::fs::metadata(path)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .and_then(|d| i64::try_from(d.as_millis()).ok())
-    else {
-        return false;
-    };
-    modified_ms.saturating_add(MTIME_SLACK_MS) < since_ms
+}
+
+/// Whether a file last written at `modified_ms` was written before the
+/// window at `since_ms` opened (less [`MTIME_SLACK_MS`]): none of its rows
+/// can fall in the window. A file whose time cannot be read is read.
+fn untouched(modified_ms: Option<i64>, since_ms: i64) -> bool {
+    modified_ms.is_some_and(|ms| ms.saturating_add(MTIME_SLACK_MS) < since_ms)
+}
+
+/// [`untouched`], `path`'s time read now.
+fn untouched_since(path: &Path, since_ms: i64) -> bool {
+    untouched(modified_ms(path), since_ms)
 }
 
 /// The live upgrade's ledger under the harness state directory:
@@ -627,15 +824,16 @@ fn upgrade_ledger(harness_state: &Path) -> PathBuf {
 /// read through [`tail_lines`]' ring of at most [`READ_MAX_ROWS`] rows, never
 /// whole. Nothing is created and nothing is written: a missing directory or
 /// file is no rows, one that cannot be read is passed over. Blocking file
-/// I/O: call it off the event loop.
+/// I/O: call it off the event loop. One window; the page reads two in one
+/// pass ([`stats_windows`]), which must equal two calls of this.
 #[must_use]
 pub fn stats_under(state_dir: &Path, harness_state: &Path, since_ms: i64) -> HarnessStats {
     let mut acc = HarnessStats::new(since_ms);
-    for (path, kind) in drive_files(&state_dir.join("drive"), since_ms) {
-        let Ok(lines) = tail_lines(&path, READ_MAX_ROWS) else {
+    for file in drive_files(&state_dir.join("drive"), since_ms) {
+        let Ok(lines) = tail_lines(&file.path, READ_MAX_ROWS) else {
             continue;
         };
-        match kind {
+        match file.kind {
             DriveFile::Ledger => {
                 let oldest = lines
                     .iter()
@@ -672,6 +870,126 @@ pub fn stats_under(state_dir: &Path, harness_state: &Path, since_ms: i64) -> Har
         }
     }
     acc
+}
+
+/// ONE READING, TWO WINDOWS (module docs): what the harness did since
+/// `today_ms` — with each session's share ([`HarnessStats::per_session`]) —
+/// and since `week_ms` (unix ms), as `(today, week)`, from ONE pass over the
+/// files [`stats_under`] reads: the files listed once, for the earlier
+/// start; each read once through [`tail_lines`]; each line parsed once and
+/// folded into each window it can hold a row of. Each window equals
+/// [`stats_under`]'s for its start (its shares aside). Blocking file I/O:
+/// call it off the event loop.
+#[must_use]
+pub fn stats_windows(
+    state_dir: &Path,
+    harness_state: &Path,
+    today_ms: i64,
+    week_ms: i64,
+) -> (HarnessStats, HarnessStats) {
+    stats_windows_with(state_dir, harness_state, today_ms, week_ms, &mut |path| {
+        tail_lines(path, READ_MAX_ROWS)
+    })
+}
+
+/// [`stats_windows`], each file's lines read by `read` (the ring
+/// [`tail_lines`] keeps; a test counts the reads).
+fn stats_windows_with(
+    state_dir: &Path,
+    harness_state: &Path,
+    today_ms: i64,
+    week_ms: i64,
+    read: &mut dyn FnMut(&Path) -> std::io::Result<Vec<String>>,
+) -> (HarnessStats, HarnessStats) {
+    let mut today = HarnessStats::per_session(today_ms);
+    let mut week = HarnessStats::new(week_ms);
+    for file in drive_files(&state_dir.join("drive"), today_ms.min(week_ms)) {
+        // Which windows the file can hold a row of: a window it was not
+        // written in folds nothing of it, its bad lines included.
+        let wants = [
+            !untouched(file.modified_ms, today_ms),
+            !untouched(file.modified_ms, week_ms),
+        ];
+        let Ok(lines) = read(&file.path) else {
+            continue;
+        };
+        match file.kind {
+            DriveFile::Ledger => {
+                let mut oldest = None;
+                for line in &lines {
+                    let row = row_and_time(line, "ts");
+                    if oldest.is_none() {
+                        oldest = row.as_ref().map(|(_, t)| *t);
+                    }
+                    for (acc, wanted) in [(&mut today, wants[0]), (&mut week, wants[1])] {
+                        match &row {
+                            Some((v, ts)) if wanted => fold_ledger_row(acc, v, *ts),
+                            None if wanted => bump(&mut acc.bad),
+                            _ => {}
+                        }
+                    }
+                }
+                for (acc, wanted) in [(&mut today, wants[0]), (&mut week, wants[1])] {
+                    if wanted && window_cut(lines.len(), approvals::KEEP_ROWS, oldest, acc.since_ms)
+                    {
+                        acc.cut_of(&file.sid);
+                    }
+                }
+            }
+            DriveFile::Journal => {
+                let mut recs = Vec::with_capacity(lines.len());
+                let mut bad = 0_u64;
+                for line in &lines {
+                    match JournalRecord::from_json(line) {
+                        Ok(r) => recs.push(r),
+                        Err(_) => bump(&mut bad),
+                    }
+                }
+                let oldest = recs.first().map(|r| r.t);
+                for (acc, wanted) in [(&mut today, wants[0]), (&mut week, wants[1])] {
+                    if !wanted {
+                        continue;
+                    }
+                    acc.bad = acc.bad.saturating_add(bad);
+                    if window_cut(lines.len(), approvals::KEEP_ROWS, oldest, acc.since_ms) {
+                        acc.cut_of(&file.sid);
+                    }
+                    fold_journal(acc, &recs);
+                }
+            }
+        }
+    }
+    let path = upgrade_ledger(harness_state);
+    let modified = modified_ms(&path);
+    let wants = [
+        !untouched(modified, today_ms),
+        !untouched(modified, week_ms),
+    ];
+    if wants.contains(&true)
+        && let Ok(lines) = read(&path)
+    {
+        let mut oldest = None;
+        for line in &lines {
+            let row = row_and_time(line, "t");
+            if oldest.is_none() {
+                oldest = row.as_ref().map(|(_, t)| t.saturating_mul(1000));
+            }
+            for (acc, wanted) in [(&mut today, wants[0]), (&mut week, wants[1])] {
+                match &row {
+                    Some((v, t)) if wanted => fold_upgrade_row(acc, v, *t),
+                    None if wanted => bump(&mut acc.bad),
+                    _ => {}
+                }
+            }
+        }
+        for (acc, wanted) in [(&mut today, wants[0]), (&mut week, wants[1])] {
+            // The upgrade ledger is every session's: its cut is the window's.
+            if wanted && window_cut(lines.len(), DISK_LEDGER_KEEP_ROWS, oldest, acc.since_ms) {
+                acc.cut = true;
+            }
+        }
+    }
+    (today, week)
 }
 
 #[cfg(test)]

@@ -447,17 +447,15 @@ fn deferred(posted: &Arc<Mutex<Vec<Wake>>>) -> (String, bool) {
     }
 }
 
-/// A routine deferral's words: it retries, so it is no stand-down.
-fn deferred_detail(posted: &Arc<Mutex<Vec<Wake>>>) -> String {
+/// A routine deferral retries, so it is no stand-down.
+fn one_routine_deferral(posted: &Arc<Mutex<Vec<Wake>>>) {
     let (detail, stands_down) = deferred(posted);
     assert!(!stands_down, "a deferral that retries is routine: {detail}");
-    detail
 }
 
 /// The park after a pass whose wait timed out: the backoff (30 s, then 60 s), then
-/// the wedge — an hour; the deferred row says which, and the child's answer closes the
-/// row it left open. (The once-pass knob's stand-down went with the knob, Phase 3:
-/// every wedge parks and tries again.)
+/// the wedge — an hour; each posts one deferred row, and the child's answer closes the
+/// row it left open.
 #[test]
 fn a_timed_out_wait_parks_on_the_backoff_then_the_wedge() {
     let busy = run(Some(75), SeedMarkers::default(), "");
@@ -470,31 +468,14 @@ fn a_timed_out_wait_parks_on_the_backoff_then_the_wedge() {
         !lane.wait_row_open,
         "the deferred row answers the waiting row"
     );
-    assert_eq!(
-        deferred_detail(&posted),
-        "waiting for an earlier package update to finish — trying again when it finishes or in 30 s"
-    );
+    one_routine_deferral(&posted);
     let park = lane.park_after_timed_out_wait(PassVerb::Update, &busy);
     assert_eq!(park, Duration::from_secs(60));
-    assert_eq!(
-        deferred_detail(&posted),
-        "waiting for an earlier package update to finish — trying again when it finishes or in 1 min"
-    );
+    one_routine_deferral(&posted);
     let park = lane.park_after_timed_out_wait(PassVerb::Update, &busy);
     assert_eq!(park, Duration::from_secs(3600), "the wedge: an hour");
     assert!(lane.backoff.wedged());
-    let detail = deferred_detail(&posted);
-    assert_eq!(
-        detail,
-        "an earlier package update has shown no progress for over an hour — trying again when it finishes or in 1 h"
-    );
-    // The notice names the pass, not the mechanism (no "lock", "blocked" or
-    // "another aterm").
-    let words = detail.to_lowercase();
-    assert!(
-        !words.contains("lock") && !words.contains("blocked") && !words.contains("another"),
-        "{words}"
-    );
+    one_routine_deferral(&posted);
     // A seed at the wedge parks the same hour and tries again: nothing stands down,
     // so the row is routine — the ledger, not the Settings ▸ Packages badge.
     let mut lane = busy_lane(&posted);

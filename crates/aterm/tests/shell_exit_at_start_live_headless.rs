@@ -98,15 +98,13 @@ fn stdout(out: &Output) -> String {
 /// `line`; then the instance must still be running, and `ls` must still list
 /// its one session.
 fn kept_with_line(prefix: &str, name: &str, body: &str, line: &str) {
-    let Some(mut inst) = headless_boot::boot_with(
+    let mut inst = headless_boot::boot_with(
         prefix,
         |root, cmd| {
             cmd.arg("--shell").arg(stub_shell(root, name, body));
         },
         |_| true,
-    ) else {
-        return;
-    };
+    );
     let began = Instant::now();
     let deadline = began + CEILING;
     let text = loop {
@@ -177,12 +175,10 @@ fn a_shell_that_queried_the_terminal_then_failed_keeps_its_pane() {
 }
 
 /// Launch a headless instance over a fresh scratch world with `extra` args and
-/// require it to end by itself, cleanly. No scratch base is a SKIP.
+/// require it to end by itself, cleanly. No scratch base is COULD NOT RUN
+/// ([`headless_boot::scratch_root`]).
 fn ends_by_itself(prefix: &str, extra: impl FnOnce(&Path, &mut Command)) {
-    let Some(root) = headless_boot::scratch_root(prefix) else {
-        eprintln!("SKIP: no scratch base with a short enough socket path");
-        return;
-    };
+    let root = headless_boot::scratch_root(prefix);
     let log = root.join("gui.log");
     let out = std::fs::File::create(&log).expect("the instance log");
     let err = out.try_clone().expect("the instance log, twice");

@@ -312,6 +312,12 @@ mod tests {
         assert_eq!(duration_from_millis_f64(f64::INFINITY), Duration::ZERO);
         assert_eq!(duration_from_millis_f64(-1.0), Duration::ZERO);
         assert_eq!(duration_from_millis_f64(0.0), Duration::ZERO);
+        // A reading beyond `u64::MAX` milliseconds saturates instead of
+        // wrapping into a time in the past.
+        assert_eq!(
+            duration_from_millis_f64(f64::MAX),
+            Duration::from_millis(u64::MAX)
+        );
     }
 
     /// Whole and fractional milliseconds both survive the conversion.
@@ -341,14 +347,6 @@ mod tests {
             "0.1ms apart after an hour resolved as {:?}",
             b.saturating_sub(a)
         );
-    }
-
-    /// A clock reading beyond `u64::MAX` milliseconds saturates instead of
-    /// wrapping into a time in the past.
-    #[test]
-    fn absurd_readings_saturate() {
-        let huge = duration_from_millis_f64(f64::MAX);
-        assert_eq!(huge, Duration::from_millis(u64::MAX));
     }
 
     /// `Instant` differences: forward is the gap, backward is zero (with the
@@ -427,18 +425,5 @@ mod tests {
         );
         assert_eq!(UNIX_EPOCH.checked_sub(Duration::from_secs(1)), None);
         assert_eq!(t.checked_add(Duration::MAX), None);
-    }
-
-    /// A clock that never advances (a suspended tab, or a browser clamping for
-    /// Spectre mitigation) produces zero-length spans, not negative ones.
-    #[test]
-    fn a_stalled_clock_produces_zero_spans() {
-        let a = Instant::from_js_millis(4242.0);
-        let b = Instant::from_js_millis(4242.0);
-        assert_eq!(b.duration_since(a), Duration::ZERO);
-        assert_eq!(a, b);
-        let s = SystemTime::from_js_millis(4242.0);
-        let t = SystemTime::from_js_millis(4242.0);
-        assert_eq!(t.duration_since(s).expect("equal times"), Duration::ZERO);
     }
 }

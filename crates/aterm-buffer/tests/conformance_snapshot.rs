@@ -3,14 +3,14 @@
 //
 //! Conformance: the real `snapshot()` obeys the derived isolation discipline.
 //!
-//! `aterm_spec::derive::snapshot_model()`'s `SnapshotIsolated` (`leaked = 0`):
+//! `aterm_models_session::snapshot_model()`'s `SnapshotIsolated` (`leaked = 0`):
 //! a write after `Surface::snapshot` does not reach `Snapshot::read_text`. The
 //! observed state is checked against the model's own invariant. Pure Rust, so
 //! it always runs.
 
 use crate::support::{read_cap, write_cap};
 use aterm_buffer::{Edit, LineId, Range, Surface};
-use aterm_spec::derive::snapshot_model;
+use aterm_models_session::snapshot_model;
 use std::collections::BTreeMap;
 
 fn full_range() -> Range {

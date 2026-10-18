@@ -161,9 +161,6 @@ fn the_frame_that_echoes_the_key_already_shows_its_ribbon_cell() {
     let next = echo + Duration::from_millis(17);
     glow.tick(Some((2, 8)), next, &c, g, &mut out);
     let on_next = under_light_at(glow.under_quads(), g, 2, 7);
-    eprintln!(
-        "ribbon cell (2,7): echo tick (+0.3 ms) light={on_echo}, next tick (+17.3 ms) light={on_next}"
-    );
     assert!(on_next > 0, "the settled cell is lit at all: {on_next}");
     assert!(
         on_echo > 0 && on_echo * 4 >= on_next,
@@ -292,73 +289,17 @@ fn v2_idle_is_exactly_zero() {
     assert!(glow.drain_sound_cues().next().is_none());
 }
 
-/// Every spelling naming the rainbow kitty (the default, the pet, the bare
-/// word, `nyan`/`rainbow`, the flying/tall/underline presentations and the
-/// `… v2` aliases) parses to `RainbowKitty`, and a fresh engine engages v2 on
-/// its first drawing tick. `… v1` is an unknown word that falls back to
-/// `Lumen`.
+/// Only the rainbow kitty engages v2: a fresh engine draws v2 on its first
+/// drawing tick under `RainbowKitty`, and no other built-in style engages it.
 #[test]
-fn every_rainbow_kitty_spelling_engages_v2() {
+fn only_the_rainbow_kitty_engages_v2() {
     let g = geom();
-    let c = cfg(GlowStyle::RainbowKitty, true);
-    for raw in [
-        "rainbow kitty pet",
-        "rainbow kitty",
-        "kitty",
-        "nyan",
-        "nyan rainbow",
-        "rainbow",
-        "rainbow kitty flying",
-        "rainbow kitty tall",
-        "rainbow kitty underline",
-        "rainbow kitty v2",
-        "Rainbow Kitty V2",
-        "rainbow v2",
-        "nyan v2",
-        "kitty v2",
-    ] {
-        assert_eq!(GlowStyle::parse(raw), GlowStyle::RainbowKitty, "{raw}");
+    for style in BUILTINS {
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
-        glow.tick(Some((2, 4)), Instant::now(), &c, g, &mut out);
-        assert!(glow.v2.engaged(), "{raw}: a fresh engine draws v2 untold");
-        assert!(glow.v2_status().is_some(), "{raw}: the status row is v2's");
-    }
-    for raw in [
-        "rainbow kitty v1",
-        "Rainbow Kitty V1",
-        " rainbow kitty v1 ",
-        "rainbow v1",
-        "nyan v1",
-        "kitty v1",
-        "comet",
-        "phaser",
-        "v1",
-        "v2",
-        "pack:kitty",
-        "",
-    ] {
-        assert_ne!(
-            GlowStyle::parse(raw),
-            GlowStyle::RainbowKitty,
-            "{raw}: no spelling names a second rainbow kitty"
-        );
-    }
-    // …and the other nine styles never engage it, told or not.
-    for style in BUILTINS
-        .iter()
-        .filter(|s| !matches!(s, GlowStyle::RainbowKitty))
-    {
-        let mut glow = CursorGlow::default();
-        let mut out = Vec::new();
-        glow.tick(
-            Some((2, 4)),
-            Instant::now(),
-            &cfg(*style, true),
-            g,
-            &mut out,
-        );
-        assert!(!glow.v2.engaged(), "{style:?} engaged v2");
-        assert!(glow.v2_status().is_none());
+        glow.tick(Some((2, 4)), Instant::now(), &cfg(style, true), g, &mut out);
+        let kitty = matches!(style, GlowStyle::RainbowKitty);
+        assert_eq!(glow.v2.engaged(), kitty, "{style:?}");
+        assert_eq!(glow.v2_status().is_some(), kitty, "{style:?}");
     }
 }

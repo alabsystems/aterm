@@ -13,11 +13,9 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use aterm_json::Value;
-use serde::Serialize;
-
 use crate::rustdoc::{Namespace, Public, Result};
 use crate::shape::function_has_body;
+use aterm_json::Value;
 
 /// The `link_name` an item's attributes give it, if any. rustdoc renders it as
 /// `#[attr = LinkName {name: "…"}]` (older formats: `#[link_name = "…"]`).
@@ -62,8 +60,7 @@ pub fn extern_symbols(public: &Public<'_>) -> Result<BTreeMap<String, String>> {
 }
 
 /// A declaration the shim binds differently from the reference.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(tag = "symbol", rename_all = "snake_case")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SymbolDiff {
     /// The shim declares an extern the reference does not have on this cell.
     AbsentFromReference { name: String },

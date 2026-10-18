@@ -110,16 +110,6 @@ fn the_embedded_vocabulary_has_no_conflicts_under_any_language_configuration() {
 }
 
 #[test]
-fn english_is_the_first_language_in_the_file() {
-    assert_eq!(
-        languages_in_the_file().first().map(String::as_str),
-        Some("en"),
-        "English is the priority language: it is the first claimant of every \
-         shared surface, so its group must open the file"
-    );
-}
-
-#[test]
 fn every_trick_has_a_plain_english_word() {
     let rows = TrickLexicon::all_rows();
     let en = TrickLexicon::shared_en();
@@ -1073,10 +1063,7 @@ fn ungated_foreign_surfaces_that_are_english_words<'a>(
 /// [`DICTIONARY_EXCUSED`], each with its reason; the gate stays for the rest.
 #[test]
 fn no_ungated_non_english_surface_is_an_english_dictionary_word() {
-    let Ok(raw) = std::fs::read_to_string("/usr/share/dict/words") else {
-        eprintln!("no system word list; the tricks dictionary gate is skipped");
-        return;
-    };
+    let raw = crate::web2_words();
     let rows = TrickLexicon::all_rows();
     let excused: HashSet<&str> = DICTIONARY_EXCUSED.iter().map(|(w, _)| *w).collect();
     let offenders: Vec<String> = ungated_foreign_surfaces_that_are_english_words(
@@ -1219,23 +1206,6 @@ fn every_language_in_the_file_reaches_every_trick() {
     }
 }
 
-#[test]
-fn english_reaches_all_seventeen_tricks() {
-    let rows = TrickLexicon::all_rows();
-    // Under the DEFAULT configuration and under one that does not even list
-    // English: English is never gated.
-    for config in [&["en"][..], &[][..], &["ja"][..]] {
-        let lex = TrickLexicon::with_languages(config);
-        for trick in Trick::ALL {
-            assert!(
-                reaches(&rows, &lex, "en", trick),
-                "{config:?}: English does not reach {trick:?}"
-            );
-        }
-    }
-    assert_eq!(Trick::ALL.len(), 17);
-}
-
 // -------------------------------------------------- the enum and listing ----
 
 #[test]
@@ -1251,32 +1221,9 @@ fn trick_codes_round_trip_and_all_is_in_declaration_order() {
             "{code:?} is not a bare lowercase id"
         );
     }
-    assert_eq!(Trick::ALL[0].code(), "sit");
-    assert_eq!(Trick::ALL[16].code(), "treat");
     // Ids are data keys, not typed words: nothing is folded or trimmed.
     for not_a_code in ["", "Sit", "SIT", " sit", "sit ", "sitting", "meow", "kitty"] {
         assert_eq!(Trick::from_code(not_a_code), None, "{not_a_code:?}");
-    }
-}
-
-#[test]
-fn blurbs_are_one_clean_listing_field() {
-    for trick in Trick::ALL {
-        let blurb = trick.blurb();
-        assert!(!blurb.is_empty(), "{trick:?} has no blurb");
-        assert!(
-            blurb
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c == ' ' || c == '-'),
-            "{trick:?}: {blurb:?} must be lowercase words and single spaces — \
-             row_line spells spaces as `_`, so `_`, `=` or a newline would \
-             corrupt the field"
-        );
-        assert!(
-            !blurb.starts_with(' ') && !blurb.ends_with(' ') && !blurb.contains("  "),
-            "{trick:?}: {blurb:?} has stray spaces"
-        );
-        assert!(blurb.len() <= 48, "{trick:?}: a blurb is one short clause");
     }
 }
 

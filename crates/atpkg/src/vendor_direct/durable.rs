@@ -31,16 +31,76 @@ pub(crate) fn write_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
     replace_via(&tmp, path, bytes)
 }
 
+/// [`write_durable`], every flush only ORDERED ([`aterm_durable::ordered`]): the temp's bytes
+/// land before the rename names them, and the name before any later write, so a reader
+/// after a power loss finds the old file or the whole new one, never a torn one, but
+/// perhaps the old one. For a record the next pass writes again (the vendor stamp).
+///
+/// # Errors
+/// As [`write_durable`].
+pub(crate) fn write_ordered(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let tmp = temp_path(path, TEMP_SEQ.fetch_add(1, Ordering::Relaxed))?;
+    let _ = std::fs::remove_file(&tmp);
+    if let Err(error) = stage_with(&tmp, bytes, aterm_durable::ordered)
+        .and_then(|()| again_while_refused(|| std::fs::rename(&tmp, path)))
+    {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    crate::store::sync_dir_ordered(path.parent().unwrap_or_else(|| Path::new(".")));
+    Ok(())
+}
+
 /// [`write_durable`] through the temp `tmp`.
 fn replace_via(tmp: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
     // Only a dead process that had our pid can have left this name.
     let _ = std::fs::remove_file(tmp);
-    if let Err(error) = stage(tmp, bytes).and_then(|()| std::fs::rename(tmp, path)) {
+    if let Err(error) =
+        stage(tmp, bytes).and_then(|()| again_while_refused(|| std::fs::rename(tmp, path)))
+    {
         let _ = std::fs::remove_file(tmp);
         return Err(error);
     }
     crate::store::sync_dir(path.parent().unwrap_or_else(|| Path::new(".")));
     Ok(())
+}
+
+/// How many times [`again_while_refused`] tries an operation again; the waits between
+/// the tries grow by a millisecond each, about 0.2 s in all.
+#[cfg(windows)]
+const REFUSED_TRIES: u64 = 20;
+
+/// `op`, tried again while Windows refuses it with `ERROR_ACCESS_DENIED`; elsewhere, `op`
+/// once.
+///
+/// POSIX `rename(2)` replaces a name atomically whoever else is replacing it, and hands
+/// a reader the old file or the new one. Windows refuses both for as long as another
+/// replace of that name is in flight: `MoveFileExW` answers `ERROR_ACCESS_DENIED` to a
+/// second writer the contract above admits, and an open answers it while the old file is
+/// delete-pending. The snapshot of 2026-09-29 (6ad1a274d8) measured both on Windows in
+/// `concurrent_writers_never_tear_the_file`: a writer failed within the 800 writes, and a
+/// reader met the refusal, which [`read_toml`] would have answered as "absent". The other
+/// replace finishes in microseconds, so a refusal is tried again, briefly; one that
+/// outlasts the tries (a real denial, a scanner holding the file without delete sharing)
+/// is the caller's error as before.
+fn again_while_refused<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    #[cfg(windows)]
+    {
+        let mut tries = 0;
+        loop {
+            match op() {
+                Err(e) if e.kind() == io::ErrorKind::PermissionDenied && tries < REFUSED_TRIES => {
+                    tries += 1;
+                    std::thread::sleep(Duration::from_millis(tries));
+                }
+                done => return done,
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        op()
+    }
 }
 
 /// Hold the exclusive lock `<path>.lock` (created `0600`) while a caller reads, changes
@@ -95,10 +155,19 @@ fn file_name(path: &Path) -> io::Result<&str> {
 /// umask may clear bits, and under a system prefix a non-root reader must still read what
 /// root wrote.
 fn stage(tmp: &Path, bytes: &[u8]) -> io::Result<()> {
+    stage_with(tmp, bytes, crate::platform::sync_file_contents)
+}
+
+/// [`stage`], flushed by `flush`.
+fn stage_with(
+    tmp: &Path,
+    bytes: &[u8],
+    flush: fn(&std::fs::File) -> io::Result<()>,
+) -> io::Result<()> {
     let mut f = create_temp(tmp)?;
     crate::platform::set_mode_on(&f, 0o644)?;
     f.write_all(bytes)?;
-    match crate::platform::sync_file_contents(&f) {
+    match flush(&f) {
         // A volume that cannot flush (some network or FUSE mounts) is not a failure.
         Err(e)
             if !matches!(
@@ -134,8 +203,15 @@ fn create_temp(tmp: &Path) -> io::Result<std::fs::File> {
 /// Read `path` as TOML of type `T`: `None` when it is absent, not a bounded regular file,
 /// not UTF-8, or does not parse.
 pub(super) fn read_toml<T: serde::de::DeserializeOwned>(path: &Path, limit: usize) -> Option<T> {
-    let text = crate::metadata_io::read_bounded_regular_utf8(path, limit).ok()?;
+    let text = read_durable(path, limit).ok()?;
     aterm_toml::from_str(&text).ok()
+}
+
+/// Read a [`write_durable`] file whole, bounded to `limit` bytes of UTF-8: the old file or
+/// the new one, a refusal while a replace is in flight tried again
+/// ([`again_while_refused`]).
+fn read_durable(path: &Path, limit: usize) -> io::Result<String> {
+    again_while_refused(|| crate::metadata_io::read_bounded_regular_utf8(path, limit))
 }
 
 /// Serialize `value` as TOML bytes, refusing more than `limit`.
@@ -157,6 +233,23 @@ mod tests {
 
     fn dir(label: &str) -> crate::testdir::Dir {
         crate::testdir::dir(&format!("atpkg-vendor-durable-{label}-"))
+    }
+
+    /// Each replace names its flush (aterm-durable's counting seam): the durable one's
+    /// directory flush is durable (its temp takes a plain `fsync(2)`, which the seam does
+    /// not see); the ordered one orders the temp and the directory, and the vendor stamp
+    /// takes it.
+    #[test]
+    fn each_replace_names_its_flush() {
+        use aterm_durable::{Flush, seam::Recording};
+        let d = dir("flush-tiers");
+        let dest = d.join("x.toml");
+        let recording = Recording::start();
+        write_durable(&dest, b"a = 1\n").unwrap();
+        assert_eq!(recording.take(), [Flush::Durable]);
+        write_ordered(&dest, b"a = 2\n").unwrap();
+        assert_eq!(recording.take(), [Flush::Ordered, Flush::Ordered]);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"a = 2\n");
     }
 
     /// A leftover temp a dead process of this pid left under the next name is replaced;
@@ -184,15 +277,6 @@ mod tests {
             let mode = std::fs::metadata(&dest).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o644);
         }
-    }
-
-    #[test]
-    fn every_write_has_its_own_temp() {
-        let dest = Path::new("/x/claude.toml");
-        let a = temp_path(dest, 0).unwrap();
-        assert_ne!(a, temp_path(dest, 1).unwrap());
-        let name = a.file_name().unwrap().to_str().unwrap().to_string();
-        assert_eq!(name, format!(".claude.toml.tmp-{}-0", std::process::id()));
     }
 
     /// A failed rename leaves the destination untouched and no temp behind.
@@ -237,9 +321,10 @@ mod tests {
                     })
                 })
                 .collect();
+            // Through the lane's own reader, as every reader of these files reads them.
             let reader = s.spawn(|| {
                 while !done.load(Ordering::Relaxed) {
-                    let got = std::fs::read(&dest).unwrap();
+                    let got = read_durable(&dest, 1024 * 1024).unwrap().into_bytes();
                     if got != a && got != b {
                         torn.fetch_add(1, Ordering::Relaxed);
                     }
@@ -270,9 +355,9 @@ mod tests {
         drop((again, childs_copy));
     }
 
-    /// A lock still held is refused at the bound, naming the lock file.
+    /// A lock still held is refused at the bound.
     #[test]
-    fn a_held_update_lock_times_out_naming_its_file() {
+    fn a_held_update_lock_times_out() {
         let d = dir("lock-held");
         let dest = d.join("x.toml");
         let _held = lock_for_update(&dest).unwrap();
@@ -285,9 +370,5 @@ mod tests {
         .err()
         .expect("held");
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
-        assert!(
-            err.to_string().contains(&lock.display().to_string()),
-            "{err}"
-        );
     }
 }

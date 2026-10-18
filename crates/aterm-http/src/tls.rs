@@ -11,10 +11,10 @@
 //!   the distribution's CA store (`$SSL_CERT_FILE`, `$SSL_CERT_DIR`,
 //!   `/etc/ssl/certs` and friends) through `rustls`'s webpki on Linux/BSD.
 //!   Anywhere else construction FAILS rather than falling back to a bundled
-//!   root set. The default, and what every endpoint without a CA file gets.
-//! * [`Trust::Roots`] — exactly the certificates in a caller-supplied PEM
-//!   bundle, and NOTHING else. An override, not an addition: the platform
-//!   roots are not consulted, so a bundle pins the endpoint to its own issuer.
+//!   root set. The default, and what every endpoint without its own roots gets.
+//! * [`Trust::Roots`] — exactly the DER certificates a caller supplies, and
+//!   NOTHING else. An override, not an addition: the platform roots are not
+//!   consulted, so the roots pin the endpoint to its own issuer.
 
 use std::sync::Arc;
 
@@ -41,9 +41,8 @@ pub(crate) fn provider() -> rustls::crypto::CryptoProvider {
 
 /// Install `provider()` as the process default, once.
 ///
-/// Idempotent, and it tolerates another component having already installed one
-/// — `aterm-net` installs the same provider for the L3 drive, and whichever
-/// runs first wins with an identical result.
+/// Idempotent, and it tolerates another component having already installed one:
+/// whichever runs first wins.
 pub fn init_crypto() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -55,7 +54,7 @@ pub fn init_crypto() {
 ///
 /// # Errors
 ///
-/// A malformed certificate in a configured bundle, or a platform verifier the
+/// A malformed certificate in caller-supplied roots, or a platform verifier the
 /// OS refuses to construct.
 pub fn client_config(trust: &Trust) -> Result<Arc<ClientConfig>, String> {
     init_crypto();

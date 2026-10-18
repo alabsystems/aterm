@@ -46,6 +46,8 @@ fn realistic_layout() -> RestoreManifest {
                 ratio: 0.618_034,
                 first: Box::new(RestoredSplitTree::leaf(RestoredView::Terminal(
                     TerminalLeafRestore {
+                        sid: None,
+                        lineage: None,
                         cwd: Some("/Users//example/aterm".to_string()),
                         title: "zsh".to_string(),
                         profile: None,
@@ -57,7 +59,9 @@ fn realistic_layout() -> RestoreManifest {
                         attention: None,
                         questions: None,
                         autopilot: None,
+                        land_at: None,
                         identity: None,
+                        theme: None,
                         agent: None,
                         supervised: None,
                         held: false,
@@ -66,6 +70,8 @@ fn realistic_layout() -> RestoreManifest {
                 ))),
                 second: Box::new(RestoredSplitTree::leaf(RestoredView::Terminal(
                     TerminalLeafRestore {
+                        sid: None,
+                        lineage: None,
                         cwd: Some("/Users//example".to_string()),
                         title: "claude".to_string(),
                         profile: None,
@@ -77,7 +83,9 @@ fn realistic_layout() -> RestoreManifest {
                         attention: None,
                         questions: None,
                         autopilot: None,
+                        land_at: None,
                         identity: None,
+                        theme: None,
                         agent: None,
                         supervised: None,
                         held: false,
@@ -239,13 +247,6 @@ fn an_over_long_inactive_grid_blob_names_itself() {
         rendered.contains("inactive grid") && rendered.contains("session 0"),
         "the message must name the grid and the session: {rendered}"
     );
-}
-
-/// The healthy path still yields a digest — the `Result` rewrite changed no
-/// predicate, so a well-formed capture is accepted exactly as before.
-#[test]
-fn a_well_formed_capture_still_commits() {
-    screen_digest(&[(0, live_checkpoint())]).expect("a live checkpoint commits");
 }
 
 /// CONTROL for the screen side. The child never passed `screen_digest`

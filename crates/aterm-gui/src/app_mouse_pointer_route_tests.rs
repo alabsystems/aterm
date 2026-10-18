@@ -759,6 +759,7 @@ fn a_wheel_report_is_a_position_for_the_next_motion() {
     let wheel = InputEvent::Wheel {
         dir: aterm_types::mouse::WheelDir::Up,
         lines: 1,
+        detent: true,
         row: 4,
         col: 7,
         mods: 0,
@@ -833,4 +834,386 @@ fn a_hover_report_to_a_sibling_keeps_the_fronts_typed_move_licence() {
     move_to(app, wid, window_cell(app, wid, f.bottom, (2, 3)), 0.0);
     assert_eq!(drain(&mut f.bottom_wire), "\x1b[<35;4;3M");
     assert!(!licensed(app), "the front's own report retires it");
+}
+
+/// A Settings page beside a terminal whose program tracks the mouse, with the
+/// page focused (a left click on it, as a hand focuses it): the terminal's
+/// session and the wire its program reads.
+fn native_focused_beside_a_tracking_terminal() -> (App, WindowId, u64, UnixStream) {
+    let (mut wire, sink) = observer();
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+    let (_, native) = app.active_native_view(wid).expect("native front");
+    let (terminal, _) =
+        app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
+    app.pool
+        .insert(crate::stub_session_with_sink(terminal, sink));
+    app.resync_active_or_window(wid);
+    arm(&app, terminal, b"\x1b[?1002h\x1b[?1006h");
+    let rect = app
+        .active_visible_leaf_plan(wid)
+        .unwrap()
+        .leaf(native)
+        .expect("native leaf")
+        .rect;
+    move_to(
+        &mut app,
+        wid,
+        (rect.origin.y as u16 + 2, rect.origin.x as u16 + 2),
+        0.0,
+    );
+    click(&mut app, wid, MouseButton::Left);
+    assert_eq!(
+        app.active_native_view(wid).map(|(_, view)| view),
+        Some(native),
+        "fixture: the page has focus"
+    );
+    let _ = drain(&mut wire);
+    (app, wid, terminal, wire)
+}
+
+/// ATERM-KI-1015-9: with a native page focused, a non-left press and a wheel
+/// notch over the terminal beside it are that terminal's, at its own cell,
+/// routed by the pane under the pointer as they are between two terminals.
+/// Before, the page's pointer boundary swallowed the button and scrolled the
+/// page by the wheel.
+#[test]
+fn a_press_and_wheel_over_a_terminal_beside_a_focused_native_page_reach_its_program() {
+    let (mut app, wid, terminal, mut wire) = native_focused_beside_a_tracking_terminal();
+    let over_terminal = window_cell(&app, wid, terminal, (3, 4));
+    move_to(&mut app, wid, over_terminal, 0.0);
+    click(&mut app, wid, MouseButton::Right);
+    assert_eq!(drain(&mut wire), "\x1b[<2;5;4M\x1b[<2;5;4m", "right button");
+    click(&mut app, wid, MouseButton::Middle);
+    assert_eq!(
+        drain(&mut wire),
+        "\x1b[<1;5;4M\x1b[<1;5;4m",
+        "middle button"
+    );
+    app.on_mouse_wheel(wid, MouseScrollDelta::LineDelta(0.0, -1.0));
+    assert_eq!(drain(&mut wire), "\x1b[<65;5;4M", "wheel");
+    // A drag the press began there reports its motion there too.
+    app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Right);
+    let further = window_cell(&app, wid, terminal, (3, 6));
+    move_to(&mut app, wid, further, 0.0);
+    app.on_mouse_input(wid, ElementState::Released, MouseButton::Right);
+    assert_eq!(
+        drain(&mut wire),
+        "\x1b[<2;5;4M\x1b[<34;7;4M\x1b[<2;7;4m",
+        "a right drag"
+    );
+    assert!(
+        app.active_native_view(wid).is_some(),
+        "a non-left press moves no focus"
+    );
+    let ws = &app.windows[&wid];
+    assert_eq!((ws.reported_buttons, ws.held_mouse_button), (0, None));
+}
+
+/// ATERM-KI-1015-9: a reported press whose release a modal swallows still
+/// ends: the program that got the press is told the button went up, and the
+/// window holds no button. Before, a non-left release the palette swallowed
+/// left the button marked held, so every later motion reported a drag to the
+/// press's program.
+#[test]
+fn a_release_a_modal_swallows_still_ends_the_press() {
+    let (mut wire, sink) = observer();
+    let mut app = App::headless_for_test_with_sink(sink);
+    let wid = WindowId(0);
+    arm(&app, 0, b"\x1b[?1002h\x1b[?1006h");
+    let _ = drain(&mut wire);
+    move_to(&mut app, wid, (4, 7), 0.0);
+    app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Right);
+    assert_eq!(drain(&mut wire), "\x1b[<2;8;5M");
+    app.toggle_palette();
+    assert!(app.windows[&wid].palette().is_some(), "fixture: a modal");
+    app.on_mouse_input(wid, ElementState::Released, MouseButton::Right);
+    let ws = &app.windows[&wid];
+    assert_eq!((ws.reported_buttons, ws.held_mouse_button), (0, None));
+    assert_eq!(drain(&mut wire), "\x1b[<2;8;5m", "the press's program");
+    app.toggle_palette();
+    move_to(&mut app, wid, (5, 9), 0.0);
+    assert_eq!(drain(&mut wire), "", "no drag after the button is up");
+}
+
+/// A control on the focused native page beside the terminal: its key and the
+/// window pixel at its centre, read off the mixed frame's retained artifact (as
+/// a present marks it), which the shipping hit test reads.
+fn a_page_control(app: &mut App, wid: WindowId) -> (crate::native_ui::UiKey, f64, f64) {
+    let (_, view) = app.active_native_view(wid).expect("native front");
+    assert!(app.prepare_heterogeneous_input_scratch(wid).is_some());
+    for cache in app
+        .windows
+        .get_mut(&wid)
+        .expect("window")
+        .leaf_render_cache
+        .values_mut()
+    {
+        if let Some(raster) = cache.native.as_mut() {
+            raster.presented = true;
+        }
+    }
+    let artifact = app
+        .retained_native_leaf_artifact(wid, view, true)
+        .expect("the page's presented artifact");
+    let hit = artifact
+        .compiled
+        .hits
+        .iter()
+        .find(|hit| hit.rect.width > 4.0 && hit.rect.height > 4.0)
+        .expect("a control on the page");
+    let x =
+        artifact.device_x as f64 + f64::from(hit.rect.x + hit.rect.width * 0.5) * artifact.scale;
+    let y =
+        artifact.device_y as f64 + f64::from(hit.rect.y + hit.rect.height * 0.5) * artifact.scale;
+    (hit.key.clone(), x, y)
+}
+
+/// The control the focused native page has armed with a press.
+fn page_pressed(app: &App, wid: WindowId) -> Option<crate::native_ui::UiKey> {
+    let (_, view) = app.active_native_view(wid)?;
+    app.native_runtime
+        .view_state(view)?
+        .common()
+        .pressed
+        .clone()
+}
+
+/// ATERM-KI-1015-9 review: while a press the terminal beside a focused native
+/// page took is held, a left press on the page is the page's: it arms the
+/// control under the pointer, and the terminal's program sees no left press.
+/// The held button decides where its own drag and release go, not where a new
+/// press lands. Before, the held press's owner decided this press too: the
+/// page's boundary was skipped and the press reached nobody.
+#[test]
+fn a_left_press_on_the_page_while_the_terminal_beside_it_holds_a_button_is_the_pages() {
+    let (mut app, wid, terminal, mut wire) = native_focused_beside_a_tracking_terminal();
+    let over_terminal = window_cell(&app, wid, terminal, (3, 4));
+    move_to(&mut app, wid, over_terminal, 0.0);
+    app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Right);
+    assert_eq!(
+        drain(&mut wire),
+        "\x1b[<2;5;4M",
+        "fixture: the terminal's press"
+    );
+    let (key, x, y) = a_page_control(&mut app, wid);
+    app.on_cursor_moved(wid, x, y);
+    let _ = drain(&mut wire);
+    app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
+    assert_eq!(
+        page_pressed(&app, wid),
+        Some(key),
+        "the page armed its control"
+    );
+    assert_eq!(drain(&mut wire), "", "the terminal saw no left press");
+    app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
+    assert_eq!(drain(&mut wire), "", "nor its release");
+    app.on_mouse_input(wid, ElementState::Released, MouseButton::Right);
+    let release = drain(&mut wire);
+    assert!(
+        release.starts_with("\x1b[<2;") && release.ends_with('m'),
+        "the right release is still the terminal's: {release:?}"
+    );
+    let ws = &app.windows[&wid];
+    assert_eq!((ws.reported_buttons, ws.held_mouse_button), (0, None));
+}
+
+/// ATERM-KI-1015-9 review: a drag that starts on a focused native page is the
+/// page's while its button is held, so the terminal beside it, whose program
+/// tracks every motion, is not sent hover reports as the pointer crosses into
+/// it; once the button is up, the hover is that program's again. Before, the
+/// native motion fell through to the terminal whenever the pane under the
+/// pointer was one.
+#[test]
+fn a_drag_from_the_page_over_the_terminal_beside_it_is_not_reported_to_its_program() {
+    let (mut app, wid, terminal, mut wire) = native_focused_beside_a_tracking_terminal();
+    arm(&app, terminal, b"\x1b[?1003h");
+    let (key, x, y) = a_page_control(&mut app, wid);
+    app.on_cursor_moved(wid, x, y);
+    app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
+    assert_eq!(
+        page_pressed(&app, wid),
+        Some(key),
+        "fixture: the page's press"
+    );
+    let _ = drain(&mut wire);
+    let into = window_cell(&app, wid, terminal, (3, 4));
+    move_to(&mut app, wid, into, 0.0);
+    let further = window_cell(&app, wid, terminal, (3, 6));
+    move_to(&mut app, wid, further, 0.0);
+    assert_eq!(
+        drain(&mut wire),
+        "",
+        "no report while the page's button is held"
+    );
+    app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
+    assert_eq!(drain(&mut wire), "", "nor at its release");
+    let after = window_cell(&app, wid, terminal, (3, 8));
+    move_to(&mut app, wid, after, 0.0);
+    assert_eq!(
+        drain(&mut wire),
+        "\x1b[<35;9;4M",
+        "the button up, the hover is its"
+    );
+}
+
+/// ATERM-KI-1015-9 review: a left press on an empty part of the focused page
+/// (no control under it, so nothing is armed) is the page's too, and so is its
+/// drag: the terminal beside it, whose program tracks every motion, is sent no
+/// hover reports while the button is held, and the hover is its program's
+/// again once the button is up, as after a press on a control. Before, only a
+/// press that armed a control kept the drag, so this one reported no-button
+/// motion to a program that never saw the gesture end.
+#[test]
+fn a_drag_from_an_empty_part_of_the_page_is_not_reported_to_the_terminal_beside_it() {
+    let (mut app, wid, terminal, mut wire) = native_focused_beside_a_tracking_terminal();
+    arm(&app, terminal, b"\x1b[?1003h");
+    let (_, native) = app.active_native_view(wid).expect("native front");
+    let rect = app
+        .active_visible_leaf_plan(wid)
+        .unwrap()
+        .leaf(native)
+        .expect("native leaf")
+        .rect;
+    let empty = (
+        (rect.origin.y + rect.size.height) as u16 - 2,
+        (rect.origin.x + rect.size.width) as u16 - 2,
+    );
+    move_to(&mut app, wid, empty, 0.0);
+    let _ = drain(&mut wire);
+    app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
+    assert_eq!(
+        page_pressed(&app, wid),
+        None,
+        "fixture: no control under the press"
+    );
+    assert_eq!(
+        app.active_native_view(wid).map(|(_, view)| view),
+        Some(native),
+        "fixture: the page keeps the front"
+    );
+    assert_eq!(drain(&mut wire), "", "fixture: the press was the page's");
+    let into = window_cell(&app, wid, terminal, (3, 4));
+    move_to(&mut app, wid, into, 0.0);
+    let further = window_cell(&app, wid, terminal, (3, 6));
+    move_to(&mut app, wid, further, 0.0);
+    assert_eq!(
+        drain(&mut wire),
+        "",
+        "no report while the page's button is held"
+    );
+    app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
+    assert_eq!(drain(&mut wire), "", "nor at its release");
+    let after = window_cell(&app, wid, terminal, (3, 8));
+    move_to(&mut app, wid, after, 0.0);
+    assert_eq!(
+        drain(&mut wire),
+        "\x1b[<35;9;4M",
+        "the button up, the hover is its"
+    );
+}
+
+/// The window pixel at the middle of the in-grid strip segment `kind`.
+fn strip_px(app: &App, wid: WindowId, kind: crate::tab_bar::TabHit) -> (f64, f64) {
+    let seg = app.windows[&wid]
+        .tab_segments
+        .iter()
+        .find(|seg| seg.kind == kind)
+        .expect("the strip laid out that segment");
+    let (cw, ch) = app.win_cell_size(wid);
+    let pad = app.win_pad(wid) as f64;
+    let head = (app.win_pad_top(wid) + app.win_head(wid)) as f64;
+    let col = f64::from(seg.start_col + seg.end_col) / 2.0;
+    (pad + (col + 0.5) * cw as f64, head + ch as f64 * 0.5)
+}
+
+/// A middle press on the in-grid tab strip is the strip's, never the
+/// terminal's: on a chip it closes that tab (the GTK, browser and Windows
+/// Terminal convention), and nowhere on the strip does it paste PRIMARY into
+/// the front pane (Linux) or hand a tracking program a press at the last grid
+/// cell the pointer crossed. Before, the inactive chip stayed open and the
+/// front shell got the PRIMARY text, or the TUI a stale-cell report.
+#[test]
+fn a_middle_press_on_the_tab_strip_closes_a_chip_and_reaches_no_terminal() {
+    use crate::tab_bar::TabHit;
+    let (mut wire, sink) = observer();
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    app.tab_strip_rows = 1;
+    let front = app.next_session_id;
+    app.push_stub_tab(wid, crate::stub_session_with_sink(front, sink));
+    app.splice_tab_strip(wid);
+    assert_eq!(app.focused_session_id(wid), Some(front));
+    #[cfg(target_os = "linux")]
+    crate::control::PRIMARY_STUB.with(|s| *s.borrow_mut() = Some("PRIMARY-TEXT".into()));
+
+    // Tracking off: the middle press on the inactive chip closes it.
+    let (x, y) = strip_px(&app, wid, TabHit::Select(0));
+    app.on_cursor_moved(wid, x, y);
+    click(&mut app, wid, MouseButton::Middle);
+    assert_eq!(app.windows[&wid].tab_set.len(), 1, "the chip's tab closed");
+    assert_eq!(app.focused_session_id(wid), Some(front));
+    assert_eq!(
+        written_before_marker(&mut app, wid, front, &mut wire),
+        "",
+        "no PRIMARY paste into the front pane"
+    );
+
+    // Tracking on: a grid press is reported; a middle press on the strip's
+    // `+` afterwards is neither reported (at that stale cell) nor a new tab.
+    arm(&app, front, b"\x1b[?1000h\x1b[?1006h");
+    let (gx, gy) = app.cell_centre_px(wid, 4, 5).expect("cell on the grid");
+    app.on_cursor_moved(wid, gx, gy);
+    click(&mut app, wid, MouseButton::Middle);
+    let grid = written_before_marker(&mut app, wid, front, &mut wire);
+    assert!(grid.starts_with("\x1b[<1;"), "the grid press: {grid:?}");
+    app.splice_tab_strip(wid);
+    let (x, y) = strip_px(&app, wid, TabHit::NewTab);
+    app.on_cursor_moved(wid, x, y);
+    click(&mut app, wid, MouseButton::Middle);
+    assert_eq!(written_before_marker(&mut app, wid, front, &mut wire), "");
+    assert_eq!(app.windows[&wid].tab_set.len(), 1, "no new tab either");
+    #[cfg(target_os = "linux")]
+    crate::control::PRIMARY_STUB.with(|s| *s.borrow_mut() = None);
+}
+
+/// Off macOS a Shift+drag over a mouse-tracking program selects text locally
+/// and reports nothing (the xterm convention, and the one left where the
+/// window manager takes Alt+drag); a plain drag still reports. Before, the
+/// Shift press and release went to the program with the shift bit.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_shift_drag_over_a_tracking_program_selects_and_reports_nothing() {
+    let (mut wire, sink) = observer();
+    let mut app = App::headless_for_test_with_sink(sink);
+    let wid = WindowId(0);
+    let front = app.focused_session_id(wid).expect("front terminal");
+    let term = app.pool.get(front).expect("live session").term.clone();
+    term_lock(&term).process(b"\x1b[HSELECTABLE words");
+    arm(&app, front, b"\x1b[?1000h\x1b[?1006h");
+    let drag = |app: &mut App, mods| {
+        app.windows.get_mut(&wid).unwrap().mods = mods;
+        move_to(app, wid, (0, 0), 0.0);
+        app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
+        move_to(app, wid, (0, 10), 0.0);
+        app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
+        app.windows.get_mut(&wid).unwrap().mods = winit::keyboard::ModifiersState::empty();
+    };
+
+    drag(&mut app, winit::keyboard::ModifiersState::SHIFT);
+    assert_eq!(
+        term_lock(&term).selection_to_string().as_deref(),
+        Some("SELECTABLE")
+    );
+    assert_eq!(
+        written_before_marker(&mut app, wid, front, &mut wire),
+        "",
+        "the program saw no shifted press or release"
+    );
+
+    // Control: a plain drag is still the program's.
+    drag(&mut app, winit::keyboard::ModifiersState::empty());
+    let plain = written_before_marker(&mut app, wid, front, &mut wire);
+    assert!(plain.starts_with("\x1b[<0;"), "the plain press: {plain:?}");
 }

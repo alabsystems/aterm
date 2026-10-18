@@ -659,6 +659,19 @@ pub struct UniformExtras<'a> {
     pub hyperlink_id: Option<&'a Arc<str>>,
 }
 
+/// The SGR 58 parameter for an underline colour in the packed `0xTT_XXXXXX`
+/// form of [`CellExtra::underline_color_u32`]: `58:5:I` for an indexed colour,
+/// else `58:2::R:G:B`. DECRQSS and the screen serializer both encode with it.
+#[must_use]
+pub fn underline_color_sgr(packed: u32) -> String {
+    if (packed >> 24) & 0xFF == 0x02 {
+        format!("58:5:{}", packed & 0xFF)
+    } else {
+        let (r, g, b) = ((packed >> 16) & 0xFF, (packed >> 8) & 0xFF, packed & 0xFF);
+        format!("58:2::{r}:{g}:{b}")
+    }
+}
+
 /// Check if a character is a Unicode combining mark.
 ///
 /// Combining marks include:

@@ -10,6 +10,7 @@
 //!   person.
 //! * `aterm ai login <id>` — one CLI's sign-in.
 //! * `aterm ai review […]` and `aterm ai review --show <id>` — reviews across AIs.
+//! * `aterm ai fleet […]` — the fleet document: its status, a fetch, and the owner's signing.
 
 use std::ffi::OsString;
 use std::io::{self, Read as _, Write};
@@ -20,10 +21,12 @@ use std::time::Duration;
 use aterm_json::{Map, Number, Value};
 
 use super::change::{self, Base};
-use super::config::{self, FleetState, Settings};
+use super::config::{self, FleetSource, FleetState, Settings};
 use super::connector::{self, Connector};
 use super::facts::{self, Facts, Job, LiveRunner, Machine, Runner};
+use super::fleet::{self, Fetched, Fetcher, Held, LiveFetcher};
 use super::login::{self, Done};
+use super::permission::{self, Asker, Choice, Level};
 use super::review;
 use super::state::{self, Mark, Row, State};
 use super::store::Store;
@@ -40,14 +43,25 @@ a doctor that signs in what needs it, and reviews one AI asks of another.
                                 on other machines over ssh ([harness] hosts)
   aterm ai login <cli>          one CLI's sign-in
   aterm ai review [--with <cli>,… | --all] [--from <cli>] [--base <ref> | --uncommitted]
-                  [--timeout <s>] [--json] [--] [<what to look for> | -]
-                                hand this directory's change to the CLIs listed in
-                                [ai] reviewers, read-only, and print their answers
+                  [--permissions <inherit|yolo|edits|ask|plan>] [--timeout <s>] [--json]
+                  [--] [<what to look for> | -]
+                                hand this directory's change to every AI CLI used here but
+                                the asker, each with all its tools, in this repository, at
+                                the asking agent's own permission level; print the answers
   aterm ai review --show <id> [--json]
                                 a review's answers again (kept a day)
+  aterm ai fleet [status]       the fleet document: where it comes from, what is held
+  aterm ai fleet fetch          fetch the fleet document from its URL now, and verify it
+  aterm ai fleet keygen <secret-key-file>
+                                make the key that signs a fleet document (owner, once)
+  aterm ai fleet sign <doc> --key <secret-key-file>
+                                sign a fleet document: writes <doc>.sig beside it
+  aterm ai fleet verify <doc> [--key <public-key>]
+                                check <doc> against <doc>.sig
 
 Settings ▸ Harness ▸ AI CLIs, and `aterm help ai`, say more. Configuration: [ai] in
-aterm.toml, and the fleet document (ai-fleet.toml beside it).";
+aterm.toml, and the fleet document ([ai] fleet: a file or an https:// URL, else
+ai-fleet.toml beside aterm.toml).";
 
 /// Everything the verbs read of the process, once.
 #[derive(Debug, Clone)]
@@ -74,6 +88,9 @@ pub struct Env {
     pub stdin_tty: bool,
     /// This program.
     pub exe: Option<PathBuf>,
+    /// The nearest AI CLI among this process's ancestors, and the permission level its own
+    /// launch flags name; incomplete observations remain Unknown.
+    pub asker: Asker,
 }
 
 impl Env {
@@ -85,7 +102,7 @@ impl Env {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .filter(|h| h.is_absolute());
-        let aterm_state = crate::operator::default_state_root().ok();
+        let aterm_state = aterm_types::dirs::state_dir();
         let harness_state = match std::env::var_os("ATERM_HARNESS_STATE") {
             Some(dir) if Path::new(&dir).is_absolute() => Some(PathBuf::from(dir)),
             Some(_) => None,
@@ -93,6 +110,13 @@ impl Env {
                 .as_ref()
                 .map(|s| s.join("harness").join(crate::harness::cli::HARNESS)),
         };
+        let asker = permission::asker(&permission::LiveProcs, &|| {
+            let dir = std::env::var_os("CLAUDE_CONFIG_DIR")
+                .map(PathBuf::from)
+                .filter(|d| d.is_absolute())
+                .or_else(|| home.as_ref().map(|h| h.join(".claude")))?;
+            permission::claude_default_mode(&dir)
+        });
         Env {
             now: crate::supervise::limit::unix_now(),
             home,
@@ -105,6 +129,7 @@ impl Env {
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
             stdin_tty: io::stdin().is_terminal(),
             exe: std::env::current_exe().ok(),
+            asker,
         }
     }
 
@@ -122,6 +147,14 @@ impl Env {
     pub fn store(&self) -> Option<Store> {
         self.aterm_state.as_deref().map(Store::at)
     }
+
+    /// The AI store's directory, where a URL's fleet document is held.
+    #[must_use]
+    pub fn ai_dir(&self) -> Option<PathBuf> {
+        self.aterm_state
+            .as_deref()
+            .map(|s| s.join(super::store::DIR))
+    }
 }
 
 /// One look at every CLI.
@@ -135,12 +168,66 @@ pub struct Look {
     pub rows: Vec<Row>,
     /// Why the AI store's record was not used, if it was not.
     pub store_note: Option<String>,
+    /// The asking agent, as [`Env::asker`].
+    pub asker: Asker,
+    /// What is held of a fleet document from a URL, when `[ai] fleet` names one.
+    pub held: Option<Held>,
+}
+
+/// The asking agent's level, and why: a person, with no agent among the ancestors, may do
+/// anything.
+fn inherited(asker: Asker) -> Result<(Level, String), &'static str> {
+    match asker {
+        Asker::Agent(id, level) => Ok((level, format!("inherited from {id}"))),
+        Asker::Person => Ok((Level::Yolo, "a person asks".to_string())),
+        Asker::Unknown => {
+            Err("the asking agent's permissions are unknown; choose --permissions explicitly")
+        }
+    }
+}
+
+/// The level reviewers run at, or why inherited permissions are not proven.
+pub fn review_level(s: &Settings, asker: Asker) -> Result<(Level, String), &'static str> {
+    match s.review_permissions.0 {
+        Choice::Fixed(level) => Ok((level, format!("set in {}", s.review_permissions.1.word()))),
+        Choice::Inherit => inherited(asker),
+    }
+}
+
+/// What the cache holds of the URL `[ai] fleet` names, under its pinned key.
+fn held_of(s: &Settings, ai_dir: Option<&Path>) -> Option<Held> {
+    let url = s.fleet_source.as_deref().filter(|u| fleet::is_url(u))?;
+    let key = s.fleet_key.as_deref().unwrap_or_default();
+    fleet::held_state(ai_dir?).filter(|h| h.of(url, key))
+}
+
+/// Fetches the fleet document from the URL `[ai] fleet` names: when due, or now with
+/// `force`. `None`: no URL is named.
+pub fn fleet_fetch(env: &Env, fetcher: &dyn Fetcher, force: bool) -> Option<Fetched> {
+    let text = env.config.as_deref().and_then(|p| {
+        crate::harness::accounts::read_bounded(p, config::CONFIG_MAX_BYTES)
+            .ok()
+            .flatten()
+    });
+    let (local, _) = config::read(text.as_deref().unwrap_or_default());
+    let Some(FleetSource::Url(url)) = local.fleet else {
+        return None;
+    };
+    let Some(dir) = env.ai_dir() else {
+        return Some(Fetched::Refused(
+            "aterm's state directory is unknown".to_string(),
+        ));
+    };
+    let key = local.fleet_key.unwrap_or_default();
+    Some(fleet::fetch(&dir, &url, &key, env.now, fetcher, force))
 }
 
 /// Looks at every CLI.
 #[must_use]
 pub fn look(env: &Env) -> Look {
-    let settings = config::load(env.config.as_deref());
+    let ai_dir = env.ai_dir();
+    let settings = config::load_with(env.config.as_deref(), ai_dir.as_deref(), env.now);
+    let held = held_of(&settings, ai_dir.as_deref());
     let store = env.store();
     let (records, store_note) = match store.as_ref().map(Store::load) {
         Some(Ok(r)) => (r, None),
@@ -188,6 +275,8 @@ pub fn look(env: &Env) -> Look {
         facts,
         rows,
         store_note,
+        asker: env.asker,
+        held,
     }
 }
 
@@ -229,36 +318,29 @@ pub fn render_text(out: &mut dyn Write, look: &Look, fixes: bool, next: &str) {
             let _ = writeln!(out, "{}fix: {fix}", " ".repeat(LABEL_W));
         }
     }
-    let reviewers: Vec<&str> = s.reviewers.0.iter().map(|c| c.id).collect();
-    if reviewers.is_empty() {
-        let _ = writeln!(
-            out,
-            "{}off: list in [ai] reviewers the CLIs whose vendors may receive this machine's code",
-            pad("reviews:", LABEL_W)
-        );
-    } else {
-        let _ = writeln!(
-            out,
-            "{}{}{} · {} per review · {} s",
-            pad("reviews:", LABEL_W),
-            reviewers.join(", "),
-            from(s.reviewers.1),
-            s.review_count.0,
-            s.review_timeout_s.0
-        );
-    }
+    let _ = writeln!(out, "{}{}", pad("reviews:", LABEL_W), reviews_line(look));
     let fleet = match &s.fleet {
         FleetState::None => "none".to_string(),
-        FleetState::Read { path, row } => format!(
-            "{}{} in {}",
+        FleetState::Read { source, row } => format!(
+            "{}{} in {source}{}",
             s.machine.as_deref().unwrap_or("no [ai] machine"),
             if *row { "" } else { " (no row of its own)" },
-            path.display()
+            held_words(look.held.as_ref(), s.fleet_key.as_deref())
         ),
-        FleetState::Refused { path, why } => format!("refused ({why}): {}", path.display()),
+        FleetState::Refused { source, why } => format!("refused ({why}): {source}"),
     };
     let _ = writeln!(out, "{}{fleet}", pad("fleet:", LABEL_W));
-    for note in s.notes.iter().chain(look.store_note.iter()) {
+    let fetch_note = look
+        .held
+        .as_ref()
+        .and_then(|h| h.error.as_ref())
+        .map(|e| format!("the fleet document's last fetch failed ({e}); what is held stands"));
+    for note in s
+        .notes
+        .iter()
+        .chain(look.store_note.iter())
+        .chain(fetch_note.iter())
+    {
         let _ = writeln!(
             out,
             "{}{}",
@@ -268,6 +350,70 @@ pub fn render_text(out: &mut dyn Write, look: &Look, fixes: bool, next: &str) {
     }
     let h = state::health(&look.rows);
     let _ = writeln!(out, "\nhealth: {}", h.line(next));
+}
+
+/// The reviewers a review asks by default: the listed ones used here, less the asker.
+fn default_reviewers<'s>(s: &'s Settings, asker: &str) -> Vec<&'s str> {
+    s.reviewers
+        .0
+        .iter()
+        .filter(|c| s.wants(c.id) && c.id != asker)
+        .map(|c| c.id)
+        .collect()
+}
+
+/// The asking CLI: `--from`, else the agent among the ancestors, else the agent's own
+/// variables, else the preferred CLI.
+fn asker_id(env: &Env, s: &Settings) -> &'static str {
+    if let Some((id, _)) = env.asker.agent() {
+        return id;
+    }
+    if env.var("CLAUDECODE").is_some() {
+        "claude"
+    } else if env.var("CODEX_THREAD_ID").is_some() {
+        "codex"
+    } else {
+        s.preferred.0.id
+    }
+}
+
+/// The doctor's reviews line.
+fn reviews_line(look: &Look) -> String {
+    let s = &look.settings;
+    if !s.reviews.0 {
+        return format!("off ([ai] reviews = false, {})", s.reviews.1.word());
+    }
+    let asker = look.asker.agent().map_or(s.preferred.0.id, |(id, _)| id);
+    let who = default_reviewers(s, asker);
+    let (level, why) = review_level(s, look.asker)
+        .map(|(level, why)| (level.word().to_string(), why))
+        .unwrap_or_else(|why| ("unknown".to_string(), why.to_string()));
+    let who = if who.is_empty() {
+        "nobody: no other AI CLI is used here".to_string()
+    } else {
+        who.join(", ")
+    };
+    format!(
+        "on · {who} (when {asker} asks) · up to {} per review · {} s · {} ({why})",
+        s.review_count.0,
+        s.review_timeout_s.0,
+        level.as_str()
+    )
+}
+
+/// What is held of a fleet document from a URL, in a few words.
+fn held_words(held: Option<&Held>, key: Option<&str>) -> String {
+    let signer = key.map_or(String::new(), |k| {
+        format!(" · signer {}…", fleet::fingerprint(k))
+    });
+    match held {
+        Some(h) if h.fetched_at.is_some() => format!(
+            " · seq {} · fetched {}{signer}",
+            h.seq.map_or("?".to_string(), |n| n.to_string()),
+            h.fetched_at.map_or(String::new(), state::when),
+        ),
+        _ => signer,
+    }
 }
 
 fn int(n: i64) -> Value {
@@ -336,28 +482,64 @@ pub fn render_json(look: &Look, now: i64, next: &str) -> String {
             Value::from(next)
         },
     );
+    let asker = look.asker.agent().map_or(s.preferred.0.id, |(id, _)| id);
+    let (level, level_why) = review_level(s, look.asker)
+        .map(|(level, why)| (level.word().to_string(), why))
+        .unwrap_or_else(|why| ("unknown".to_string(), why.to_string()));
     let mut reviews = Map::new();
+    reviews.insert("on".to_string(), Value::Bool(s.reviews.0));
+    reviews.insert("on_from".to_string(), Value::from(s.reviews.1.word()));
     reviews.insert(
         "reviewers".to_string(),
         Value::Array(s.reviewers.0.iter().map(|c| Value::from(c.id)).collect()),
     );
     reviews.insert("from".to_string(), Value::from(s.reviewers.1.word()));
+    reviews.insert("asker".to_string(), Value::from(asker));
+    reviews.insert(
+        "asks".to_string(),
+        Value::Array(
+            default_reviewers(s, asker)
+                .into_iter()
+                .map(Value::from)
+                .collect(),
+        ),
+    );
     reviews.insert("count".to_string(), int(i64::from(s.review_count.0)));
     reviews.insert(
         "timeout_s".to_string(),
         int(i64::from(s.review_timeout_s.0)),
     );
+    reviews.insert(
+        "permissions".to_string(),
+        Value::from(s.review_permissions.0.word()),
+    );
+    reviews.insert(
+        "permissions_from".to_string(),
+        Value::from(s.review_permissions.1.word()),
+    );
+    reviews.insert("level".to_string(), Value::from(level.as_str()));
+    reviews.insert("level_why".to_string(), Value::from(level_why.as_str()));
     let mut fleet = Map::new();
     fleet.insert("state".to_string(), Value::from(s.fleet.word()));
-    match &s.fleet {
-        FleetState::None => {}
-        FleetState::Read { path, .. } => {
-            fleet.insert("path".to_string(), Value::from(path.display().to_string()));
-        }
-        FleetState::Refused { path, why } => {
-            fleet.insert("path".to_string(), Value::from(path.display().to_string()));
-            fleet.insert("why".to_string(), Value::from(why.as_str()));
-        }
+    if let Some(source) = &s.fleet_source {
+        fleet.insert("source".to_string(), Value::from(source.as_str()));
+    }
+    if let Some(key) = &s.fleet_key {
+        fleet.insert("key".to_string(), Value::from(key.as_str()));
+    }
+    if let FleetState::Refused { why, .. } = &s.fleet {
+        fleet.insert("why".to_string(), Value::from(why.as_str()));
+    }
+    if let Some(h) = &look.held {
+        fleet.insert("seq".to_string(), opt_int(h.seq));
+        fleet.insert("fetched_at".to_string(), opt_int(h.fetched_at));
+        fleet.insert("fetched_at_rfc3339".to_string(), rfc(h.fetched_at));
+        fleet.insert("tried_at".to_string(), opt_int(h.tried_at));
+        fleet.insert("valid_until".to_string(), opt_int(h.valid_until));
+        fleet.insert(
+            "error".to_string(),
+            h.error.as_deref().map_or(Value::Null, Value::from),
+        );
     }
     let mut o = Map::new();
     o.insert("schema".to_string(), int(1));
@@ -539,9 +721,11 @@ fn doctor_here(
             ) else {
                 continue;
             };
-            if r.mark == Mark::Fail {
+            if r.mark == Mark::Fail || matches!(r.state, State::Due(_)) {
                 let done = sign_in_one(env, runner, &store, f, r, out);
                 let _ = writeln!(out, "{}", done_line(f.connector, &done));
+            } else {
+                let _ = writeln!(out, "{}: installed ({})", r.connector.id, r.fact);
             }
             continue;
         }
@@ -889,6 +1073,7 @@ struct ReviewArgs {
     from: Option<String>,
     base: Option<Base>,
     timeout: Option<u32>,
+    permissions: Option<Choice>,
     json: bool,
     show: Option<String>,
     words: Option<String>,
@@ -925,6 +1110,13 @@ fn parse_review(args: &[String]) -> Result<ReviewArgs, String> {
                                 config::TIMEOUT_MAX_S
                             )
                         })?,
+                );
+            }
+            "--permissions" => {
+                let v = value(&mut i, "--permissions")?;
+                r.permissions = Some(
+                    Choice::parse(&v)
+                        .ok_or("--permissions takes inherit, yolo, edits, ask or plan")?,
                 );
             }
             "--json" => r.json = true,
@@ -1000,27 +1192,41 @@ fn review_verb(
     }
     let l = look(env);
     let s = &l.settings;
-    if s.reviewers.0.is_empty() {
+    if !s.reviews.0 {
         return refuse(
             err,
-            "no reviewers: list in [ai] reviewers (aterm.toml) the CLIs whose vendors may receive this machine's code",
+            &format!(
+                "reviews are off ([ai] reviews = false, {})",
+                s.reviews.1.word()
+            ),
         );
     }
-    let reviewer_ids: Vec<&str> = s.reviewers.0.iter().map(|c| c.id).collect();
+    let asker: &'static str = match &a.from {
+        Some(f) => match connector::connector(f) {
+            Some(c) => c.id,
+            None => {
+                return refuse(
+                    err,
+                    &format!("--from `{}` is no AI CLI", crate::harness::one_line(f, 40)),
+                );
+            }
+        },
+        None => asker_id(env, s),
+    };
     let asked: Option<Vec<&'static str>> = if a.all {
         Some(s.reviewers.0.iter().map(|c| c.id).collect())
     } else if let Some(with) = &a.with {
         let mut ids = Vec::new();
         for w in with {
-            match s.reviewers.0.iter().find(|c| c.id == w.as_str()) {
+            match connector::connector(w) {
                 Some(c) => ids.push(c.id),
                 None => {
                     return refuse(
                         err,
                         &format!(
-                            "`{}` is not in [ai] reviewers ({})",
+                            "`{}` is no AI CLI ({})",
                             crate::harness::one_line(w, 40),
-                            reviewer_ids.join(", ")
+                            connector::ids().join(", ")
                         ),
                     );
                 }
@@ -1030,17 +1236,29 @@ fn review_verb(
     } else {
         None
     };
-    let asker = match &a.from {
-        Some(f) if connector::connector(f).is_some() => f.clone(),
-        Some(f) => {
-            return refuse(
-                err,
-                &format!("--from `{}` is no AI CLI", crate::harness::one_line(f, 40)),
-            );
-        }
-        None if env.var("CLAUDECODE").is_some() => "claude".to_string(),
-        None if env.var("CODEX_THREAD_ID").is_some() => "codex".to_string(),
-        None => s.preferred.0.id.to_string(),
+    // By default only the CLIs used here review; a CLI named with --with or --all is asked
+    // whatever its `use` (its row says why it cannot answer, if it cannot).
+    let pool: Vec<&'static Connector> = match &asked {
+        Some(ids) => ids
+            .iter()
+            .filter_map(|id| connector::connector(id))
+            .collect(),
+        None => s
+            .reviewers
+            .0
+            .iter()
+            .copied()
+            .filter(|c| s.wants(c.id))
+            .collect(),
+    };
+    let permission = match a.permissions {
+        Some(Choice::Fixed(level)) => Ok((level, "--permissions".to_string())),
+        Some(Choice::Inherit) => inherited(env.asker),
+        None => review_level(s, env.asker),
+    };
+    let (level, level_why) = match permission {
+        Ok(level) => level,
+        Err(why) => return refuse(err, why),
     };
     let words = if a.words_stdin {
         let mut buf = Vec::new();
@@ -1069,7 +1287,7 @@ fn review_verb(
         Ok(c) => c,
         Err(change::Refused(why)) => return refuse(err, &why),
     };
-    let cands = review::candidates(&s.reviewers.0, asked.as_deref(), &asker, &l.rows, env.now);
+    let cands = review::candidates(&pool, asked.as_deref(), asker, &l.rows, env.now);
     let count = if asked.is_some() {
         cands.len()
     } else {
@@ -1081,13 +1299,14 @@ fn review_verb(
     let host = review::Host {
         runner,
         var: &var,
+        vars: &env.vars,
         store: &store,
         now: &now,
     };
     let dir = review::reviews_dir(&store).join(&id);
     let _ = writeln!(
         err,
-        "aterm ai review {id}: {} — asking {}",
+        "aterm ai review {id}: {} — asking {} at {} ({level_why})",
         change.describes,
         {
             let names: Vec<&str> = cands
@@ -1100,17 +1319,19 @@ fn review_verb(
             } else {
                 names.join(", ")
             }
-        }
+        },
+        level.word()
     );
     let ask = review::Ask {
         change: &change,
-        asker: &asker,
+        asker,
         words: words.as_deref(),
         count,
         budget,
+        level,
     };
     let answers = review::run_review(&host, &cands, &l.facts, &ask);
-    let json = review::json(&id, &dir, &asker, &change, &answers, env.now);
+    let json = review::json(&id, &dir, asker, &change, &answers, env.now);
     if let Err(e) = review::keep(&store, &id, &json) {
         let _ = writeln!(err, "aterm ai review: the answers could not be kept: {e}");
     }
@@ -1126,10 +1347,320 @@ fn review_verb(
     }
 }
 
-/// Runs `aterm ai <args>` against `env` and `runner`.
+/// The largest secret key file read.
+const SECRET_MAX: u64 = 4096;
+
+/// A secret key file's PKCS#8 bytes: base64 text (what `keygen` writes) or raw.
+fn secret_of(path: &Path) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let file =
+        std::fs::File::open(path).map_err(|e| crate::harness::one_line(&e.to_string(), 120))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| crate::harness::one_line(&e.to_string(), 120))?;
+    if !meta.is_file() {
+        return Err("not a regular file".to_string());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if meta.permissions().mode() & 0o077 != 0 {
+            return Err("others may read it: `chmod 600` it first".to_string());
+        }
+    }
+    let mut raw = Vec::new();
+    file.take(SECRET_MAX + 1)
+        .read_to_end(&mut raw)
+        .map_err(|e| crate::harness::one_line(&e.to_string(), 120))?;
+    if raw.len() as u64 > SECRET_MAX {
+        return Err("too large to be a secret key".to_string());
+    }
+    let text = std::str::from_utf8(&raw).ok().map(str::trim);
+    Ok(text
+        .and_then(|t| aterm_codec::base64::decode_strict(t.as_bytes()).ok())
+        .unwrap_or(raw))
+}
+
+/// The bytes of a fleet document named on the command line, bounded.
+fn doc_of(path: &Path) -> Result<Vec<u8>, String> {
+    crate::harness::accounts::read_bounded(path, config::FLEET_MAX_BYTES)
+        .map_err(|e| crate::harness::one_line(&format!("{e:?}"), 120))?
+        .map(String::into_bytes)
+        .ok_or_else(|| "no such file".to_string())
+}
+
+fn sig_path(doc: &Path) -> PathBuf {
+    let mut p = doc.as_os_str().to_owned();
+    p.push(".sig");
+    PathBuf::from(p)
+}
+
+/// `aterm ai fleet status`.
+fn fleet_status(env: &Env, out: &mut dyn Write) -> ExitCode {
+    let l = look(env);
+    let s = &l.settings;
+    let _ = writeln!(
+        out,
+        "{}{}",
+        pad("source:", LABEL_W),
+        s.fleet_source
+            .as_deref()
+            .unwrap_or("none ([ai] fleet names none, and no ai-fleet.toml lies beside aterm.toml)")
+    );
+    let _ = writeln!(
+        out,
+        "{}{}",
+        pad("signer:", LABEL_W),
+        s.fleet_key
+            .as_deref()
+            .map_or("none pinned ([ai] fleet_key)".to_string(), |k| k
+                .to_string())
+    );
+    let state = match &s.fleet {
+        FleetState::None => "none".to_string(),
+        FleetState::Read { row, .. } => format!(
+            "read{}",
+            match (&s.machine, row) {
+                (Some(m), true) => format!(", with a [machine.{m}] row"),
+                (Some(m), false) => format!(", with no [machine.{m}] row: its top level applies"),
+                (None, _) => ", top level only (no [ai] machine is set)".to_string(),
+            }
+        ),
+        FleetState::Refused { why, .. } => format!("refused: {why}"),
+    };
+    let _ = writeln!(out, "{}{state}", pad("document:", LABEL_W));
+    if let Some(h) = &l.held {
+        let at = |t: Option<i64>| t.map_or("never".to_string(), state::when);
+        let _ = writeln!(
+            out,
+            "{}seq {} · fetched {} · tried {}{}",
+            pad("held:", LABEL_W),
+            h.seq.map_or("?".to_string(), |n| n.to_string()),
+            at(h.fetched_at),
+            at(h.tried_at),
+            h.valid_until.map_or(String::new(), |t| format!(
+                " · valid until {}",
+                state::when(t)
+            ))
+        );
+        if let Some(e) = &h.error {
+            let _ = writeln!(out, "{}{e}", pad("last try:", LABEL_W));
+        }
+    } else if s.fleet_source.as_deref().is_some_and(fleet::is_url) {
+        let _ = writeln!(
+            out,
+            "{}nothing yet: `aterm ai fleet fetch`",
+            pad("held:", LABEL_W)
+        );
+    }
+    for note in &s.notes {
+        let _ = writeln!(
+            out,
+            "{}{}",
+            pad("note:", LABEL_W),
+            crate::harness::one_line(note, 300)
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+/// `aterm ai fleet keygen <secret-key-file>`.
+fn fleet_keygen(path: &Path, out: &mut dyn Write) -> Result<(), String> {
+    use std::io::Write as _;
+    let (secret, public) = fleet::keygen()?;
+    let text = aterm_codec::base64::encode(&secret).map_err(|_| "the key does not encode")?;
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        open.mode(0o600);
+    }
+    let mut file = open.open(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            format!("{} already exists; it is never overwritten", path.display())
+        } else {
+            crate::harness::one_line(&e.to_string(), 120)
+        }
+    })?;
+    file.write_all(format!("{text}\n").as_bytes())
+        // Durable: the person is told the key is saved and is to be kept.
+        .and_then(|()| crate::durable::sync_all(&file))
+        .map_err(|e| crate::harness::one_line(&e.to_string(), 120))?;
+    let _ = writeln!(
+        out,
+        "secret key: {} (keep it private, and out of the fleet document's repository)\n\
+         public key: {public}\n\n\
+         Sign a document with `aterm ai fleet sign <doc> --key {}`, serve <doc> and <doc>.sig\n\
+         side by side over HTTPS, and on each machine set, in aterm.toml:\n\n\
+         [ai]\n\
+         fleet = \"https://…/ai-fleet.toml\"\n\
+         fleet_key = \"{public}\"",
+        path.display(),
+        path.display()
+    );
+    Ok(())
+}
+
+/// `aterm ai fleet sign <doc> --key <secret-key-file>`.
+fn fleet_sign(doc: &Path, key: &Path, out: &mut dyn Write) -> Result<(), String> {
+    let bytes = doc_of(doc)?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| "the document is not UTF-8")?;
+    let (_, notes) =
+        config::read_fleet(text).map_err(|why| format!("the document is refused: {why}"))?;
+    let (seq, _) = fleet::meta(text)?;
+    let secret = secret_of(key).map_err(|why| format!("{}: {why}", key.display()))?;
+    let sig = fleet::sign(&secret, &bytes)?;
+    let public = fleet::public_of(&secret)?;
+    let to = sig_path(doc);
+    // Ordered: a signature lost to a power loss is made again from the document and
+    // the key, and a stale one is refused by every verifier.
+    crate::harness::upgrade_models::write_atomic_ordered(&to, &format!("{sig}\n"))
+        .map_err(|e| crate::harness::one_line(&e.to_string(), 120))?;
+    // The signature is published beside the document: readable by the web server.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&to, std::fs::Permissions::from_mode(0o644));
+    }
+    let _ = writeln!(
+        out,
+        "signed {} → {} (signer {}…)",
+        doc.display(),
+        to.display(),
+        fleet::fingerprint(&public)
+    );
+    match seq {
+        Some(n) => {
+            let _ = writeln!(out, "seq {n}: a machine takes it only over a lower seq");
+        }
+        None => {
+            let _ = writeln!(
+                out,
+                "warning: no `seq`: a machine fetching it from a URL refuses it (add `seq = 1`, \
+                 raised at every edit)"
+            );
+        }
+    }
+    for n in notes {
+        let _ = writeln!(out, "note: {}", crate::harness::one_line(&n, 300));
+    }
+    Ok(())
+}
+
+/// `aterm ai fleet verify <doc> [--key <public-key>]`.
+fn fleet_verify(
+    env: &Env,
+    doc: &Path,
+    key: Option<&str>,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    let key = match key {
+        Some(k) => k.to_string(),
+        None => look(env)
+            .settings
+            .fleet_key
+            .ok_or("no key: pass --key <public-key>, or pin one in [ai] fleet_key")?,
+    };
+    let bytes = doc_of(doc)?;
+    let sig = std::fs::read(sig_path(doc)).map_err(|e| {
+        format!(
+            "{}: {}",
+            sig_path(doc).display(),
+            crate::harness::one_line(&e.to_string(), 120)
+        )
+    })?;
+    fleet::verify(&bytes, &sig, &key)?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| "the document is not UTF-8")?;
+    config::read_fleet(text).map_err(|why| format!("verified, but refused: {why}"))?;
+    let (seq, until) = fleet::meta(text)?;
+    let _ = writeln!(
+        out,
+        "verified under {}… · seq {}{}",
+        fleet::fingerprint(&key),
+        seq.map_or("none".to_string(), |n| n.to_string()),
+        until.map_or(String::new(), |t| format!(
+            " · valid until {}",
+            state::when(t)
+        ))
+    );
+    Ok(())
+}
+
+/// `aterm ai fleet …`.
+fn fleet_verb(
+    env: &Env,
+    fetcher: &dyn Fetcher,
+    args: &[String],
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let fail = |err: &mut dyn Write, why: &str| {
+        let _ = writeln!(
+            err,
+            "aterm ai fleet: {}",
+            crate::harness::one_line(why, 300)
+        );
+        ExitCode::from(1)
+    };
+    let usage = |err: &mut dyn Write| {
+        let _ = writeln!(
+            err,
+            "usage: aterm ai fleet [status | fetch | keygen <secret-key-file> | \
+             sign <doc> --key <secret-key-file> | verify <doc> [--key <public-key>]]"
+        );
+        ExitCode::from(2)
+    };
+    let arg = |i: usize| args.get(i).map(String::as_str);
+    match (arg(0), arg(1), arg(2), arg(3), args.len()) {
+        (None | Some("status"), _, _, _, 0 | 1) => fleet_status(env, out),
+        (Some("fetch"), _, _, _, 1) => match fleet_fetch(env, fetcher, true) {
+            None => {
+                let _ = writeln!(
+                    err,
+                    "aterm ai fleet fetch: [ai] fleet names no https:// URL; nothing to fetch"
+                );
+                ExitCode::from(2)
+            }
+            Some(got) => {
+                let _ = writeln!(out, "{}", got.says());
+                match got {
+                    Fetched::Fresh(_) | Fetched::Same(_) => ExitCode::SUCCESS,
+                    _ => ExitCode::from(1),
+                }
+            }
+        },
+        (Some("keygen"), Some(path), _, _, 2) => match fleet_keygen(Path::new(path), out) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(why) => fail(err, &why),
+        },
+        (Some("sign"), Some(doc), Some("--key"), Some(key), 4) => {
+            match fleet_sign(Path::new(doc), Path::new(key), out) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(why) => fail(err, &why),
+            }
+        }
+        (Some("verify"), Some(doc), None, _, 2) => {
+            match fleet_verify(env, Path::new(doc), None, out) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(why) => fail(err, &why),
+            }
+        }
+        (Some("verify"), Some(doc), Some("--key"), Some(key), 4) => {
+            match fleet_verify(env, Path::new(doc), Some(key), out) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(why) => fail(err, &why),
+            }
+        }
+        _ => usage(err),
+    }
+}
+
+/// Runs `aterm ai <args>` against `env`, `runner` and `fetcher`.
 pub fn run(
     env: &Env,
     runner: &dyn Runner,
+    fetcher: &dyn Fetcher,
     args: &[String],
     out: &mut dyn Write,
     err: &mut dyn Write,
@@ -1182,6 +1713,9 @@ pub fn run(
             }
             let read_only = flag("--read-only");
             let json = flag("--json");
+            // The doctor fetches a fleet document from its URL when one is due; what the
+            // fetch came to shows in the look (`fleet:`, and a note when it failed).
+            let _ = fleet_fetch(env, fetcher, false);
             if fleet || on.is_some() {
                 doctor_away(env, runner, on.as_deref(), read_only, json, out, err)
             } else {
@@ -1200,6 +1734,7 @@ pub fn run(
             }
         },
         Some("review") => review_verb(env, runner, &args[1..], out, err),
+        Some("fleet") => fleet_verb(env, fetcher, &args[1..], out, err),
         Some("help" | "--help" | "-h") => {
             let _ = writeln!(out, "{USAGE}");
             ExitCode::SUCCESS
@@ -1225,7 +1760,7 @@ pub fn main_entry(argv: Vec<OsString>) -> ExitCode {
     let env = Env::from_process();
     let mut out = io::stdout().lock();
     let mut err = io::stderr();
-    run(&env, &LiveRunner, &args, &mut out, &mut err)
+    run(&env, &LiveRunner, &LiveFetcher, &args, &mut out, &mut err)
 }
 
 #[cfg(test)]

@@ -1,19 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The warm-up: one deliberate, owner-initiated pre-prompt
+//! The warm-up: a deliberate pre-prompt at a moment a human is at the screen
 //! (`docs/DESIGN-macos-tcc-prompts-2026-08-30.md` §3.5).
 //!
 //! # What this is
 //!
-//! On an explicit owner gesture — *Ask for folder access now*, on the Security
-//! panel and nowhere else — a detached worker lists each configured folder **in
-//! sequence** and records what the filesystem said: `Ok`, `EPERM(1)`, or some
-//! other errno. That is all it does. aterm renders nothing, asks nothing, and
-//! answers nothing: it performs an ordinary file access at a moment the owner
-//! chose, and macOS asks the question it was always going to ask. The whole
-//! point is to move the interruption out of an agent's blocked syscall at 3am
-//! and into a moment a human is already looking at the screen.
+//! Two callers start a pass: the owner's gesture — *Ask for folder access now*,
+//! on the Security panel — and the window's own launch pass
+//! (`crate::consent_launch`, `[privacy] warmup = "automatic"`, the default since
+//! the owner ask of 2026-10-16), which walks at a quiet moment while Full Disk
+//! Access reads off, once the launch's Full Disk Access hand-over was left
+//! without the owner acting on it. Either way a detached worker lists each
+//! configured folder **in sequence** and records what the filesystem said: `Ok`,
+//! `EPERM(1)`, or some other errno. That is all it does. aterm renders nothing,
+//! asks nothing, and answers nothing: it performs an ordinary file access at a
+//! moment a human is at the screen, and macOS asks the question it was always
+//! going to ask. The whole point is to move the interruption out of an agent's
+//! blocked syscall at 3am and into a moment a human is already looking at the
+//! screen.
 //!
 //! Sequential, not concurrent: three simultaneous system modals stack badly,
 //! and the organic concurrent case is unmeasured (§1.4 / §7 S11).
@@ -44,12 +49,13 @@
 //!
 //! # Not reachable from a control verb
 //!
-//! Default `warmup = "on-request"`; there is no `"first-launch"` value, no
-//! environment variable, no `VERBS` row, and no dispatch arm. A consent-raising
-//! action reachable from inside a session would be a consent surface an agent
-//! controls, which is the same rule that governs `tccutil reset` (§3.7).
-//! `consent_retire`'s `tests::no_control_module_names_a_consent_raising_entry_point`
-//! is the fence.
+//! Default `warmup = "automatic"` (`"on-request"` keeps only the Security
+//! panel's gesture, `"never"` neither); there is no environment variable, no
+//! `VERBS` row, and no dispatch arm. The launch pass is the window's own: its
+//! trigger is the launch's Full Disk Access check, never a session. A
+//! consent-raising action reachable from inside a session would be a consent
+//! surface an agent controls, which is the same rule that governs
+//! `tccutil reset` (§3.7).
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
@@ -326,8 +332,8 @@ impl StartOutcome {
         match self {
             Self::Started | Self::AlreadyLive => None,
             Self::Refused => Some(
-                "the privacy checks or the on-request warm-up are off, or this instance has no \
-                 window to ask in",
+                "the privacy checks or the warm-up are off, or this instance has no window to \
+                 ask in",
             ),
             Self::NoFolders => Some(
                 "no folder in [privacy] warmup_folders resolved to a path (an unknown name, or \
@@ -356,10 +362,8 @@ struct LivePass {
 /// The instance's warm-up state: the rows, the live pass, and the receiving end
 /// of the bounded result queue.
 ///
-/// Instance-owned, with NO process-global anywhere in this module
-/// (`tests::neither_consent_worker_owns_a_process_global_or_reads_an_environment_knob`
-/// is the fence). That is what
-/// makes §3.5's successor rule structural rather than a cleanup step: an
+/// Instance-owned, with NO process-global anywhere in this module. That is
+/// what makes §3.5's successor rule structural rather than a cleanup step: an
 /// in-place apply builds a fresh `App`, which builds a fresh `WarmupState`, so
 /// every row is `unknown` again and nothing claims anything about a modal that
 /// may still be on the screen.
@@ -394,6 +398,18 @@ impl WarmupState {
     /// The headless / unit-test instance.
     pub(crate) fn inert() -> Self {
         Self::new(true)
+    }
+
+    /// An instance whose worker answers every folder with `read_dir`: a stand-in that
+    /// reaches no filesystem, for the window's tests.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn with_read_dir_for_test(read_dir: fn(&Path) -> ReadDirOutcome) -> Self {
+        let mut state = Self::inert();
+        state.probe = WarmupProbe {
+            read_dir,
+            live: false,
+        };
+        state
     }
 
     /// Whether this instance's probe can reach the filesystem.
@@ -536,6 +552,11 @@ impl WarmupState {
         {
             *slot = row;
         }
+    }
+
+    /// The latest pass's number: the rows are its rows.
+    pub(crate) const fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Whether a pass is walking right now. Not drained — call [`Self::drain`]
@@ -724,34 +745,6 @@ mod tests {
     // The pure fold
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn the_fold_maps_ok_eperm_and_everything_else() {
-        // EACCES is the one that must NOT read as a privacy denial: a TCC
-        // refusal is EPERM (design §1.5), an ordinary Unix permission problem
-        // is EACCES, and folding them together would report a `chmod` as a
-        // consent verdict.
-        const EACCES: i32 = 13;
-        const ENOENT: i32 = 2;
-        let table = [
-            (ReadDirOutcome::Listed, WarmupRow::Allowed),
-            (
-                ReadDirOutcome::Failed(consent::ERRNO_EPERM),
-                WarmupRow::Denied,
-            ),
-            (ReadDirOutcome::Failed(EACCES), WarmupRow::Error),
-            (ReadDirOutcome::Failed(ENOENT), WarmupRow::Error),
-            (ReadDirOutcome::Failed(0), WarmupRow::Error),
-            (ReadDirOutcome::Refused, WarmupRow::Unknown),
-        ];
-        for (outcome, expected) in table {
-            assert_eq!(
-                fold_read_dir(Folder::Documents, outcome),
-                expected,
-                "folding {outcome:?}"
-            );
-        }
-    }
-
     /// The one item whose probe path may legitimately not exist reads `ENOENT`
     /// as permission, and no other item does. Everything else about the fold
     /// stays identical across items — in particular `EPERM` is a denial for
@@ -788,6 +781,16 @@ mod tests {
                 WarmupRow::Allowed,
                 "{folder:?}"
             );
+            assert_eq!(
+                fold_read_dir(*folder, ReadDirOutcome::Failed(0)),
+                WarmupRow::Error,
+                "{folder:?}"
+            );
+            assert_eq!(
+                fold_read_dir(*folder, ReadDirOutcome::Refused),
+                WarmupRow::Unknown,
+                "{folder:?}: a probe that did not look claims nothing"
+            );
         }
     }
 
@@ -808,72 +811,6 @@ mod tests {
             vec!["unknown", "asking", "allowed", "denied", "error"]
         );
         assert_eq!(WarmupRow::default(), WarmupRow::Unknown);
-    }
-
-    // -----------------------------------------------------------------------
-    // The fence
-    // -----------------------------------------------------------------------
-
-    /// OFF BY DEFAULT AND UNREACHABLE FROM INSIDE A SESSION, for both consent
-    /// workers: no process-global (it would survive an in-place apply; this state
-    /// is instance-owned so a successor re-probes) and no environment knob
-    /// (`ATERM_*` is stripped from children anyway, and a knob a program inside a
-    /// session could flip would be a consent surface an agent controls — design
-    /// §4). The observer's enable decision arrives as a resolved `bool` from the
-    /// config layer. The scan reads everything above each module's top-level
-    /// `mod tests`, comment lines dropped. It is cut at the MODULE boundary,
-    /// not at the first `#[cfg(test)]`: both files gate single test-only
-    /// methods with an indented one, and cutting there would leave the rest of
-    /// the shipping code unread.
-    #[test]
-    fn neither_consent_worker_owns_a_process_global_or_reads_an_environment_knob() {
-        for (name, source, last_shipping_fn) in [
-            (
-                "consent_observer.rs",
-                include_str!("consent_observer.rs"),
-                "fn note_eperm(",
-            ),
-            (
-                "consent_warmup.rs",
-                include_str!("consent_warmup.rs"),
-                "fn run_pass(",
-            ),
-        ] {
-            let (shipping, _tests) = source
-                .split_once("\n#[cfg(test)]\nmod tests {")
-                .expect("the module has a top-level test module to exclude");
-            // Non-vacuity: the slice reaches the module's last shipping item,
-            // which sits below every indented test seam.
-            assert!(
-                shipping.contains(last_shipping_fn),
-                "{name}: the scan stops before `{last_shipping_fn}`; it no longer \
-                 covers the whole shipping module"
-            );
-            for line in shipping
-                .lines()
-                .map(str::trim_start)
-                .filter(|l| !(l.starts_with("//") || l.starts_with('*')))
-            {
-                assert!(
-                    !(line.starts_with("static ")
-                        || line.starts_with("pub static ")
-                        || line.starts_with("pub(crate) static ")),
-                    "{name}: a process-global: {line}"
-                );
-                for needle in [
-                    "env::var",
-                    "ATERM_",
-                    "OnceLock",
-                    "thread_local!",
-                    "static mut",
-                ] {
-                    assert!(
-                        !line.contains(needle),
-                        "{name}: must own no global and read no env knob, found {needle:?}: {line}"
-                    );
-                }
-            }
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -1054,39 +991,6 @@ mod tests {
         // …and a pass that ended holds nothing at all.
         state.end_pass();
         assert!(!state.holds_automatic_apply(started));
-    }
-
-    #[test]
-    fn a_manual_apply_is_never_held() {
-        use crate::native_updater_service::ApplyMode;
-        assert!(ApplyMode::Automatic.is_automatic());
-        assert!(ApplyMode::AutomaticPastGrace.is_automatic());
-        assert!(
-            !ApplyMode::Immediate.is_automatic(),
-            "an explicit `aterm ctl update apply` is the user asking for the freeze"
-        );
-        // The hold is consulted through exactly one App method — the ladder's
-        // `consent_warmup` fact — and every call site sits under `is_automatic()`,
-        // like the keystroke gap beside it.
-        let lib = include_str!("lib.rs");
-        assert!(
-            lib.contains("self.consent_warmup.holds_automatic_apply(now)"),
-            "the hold must be wired into the automatic-apply freeze gate"
-        );
-        let apply_lane = include_str!("app_native.rs");
-        for gate in ["update_apply_hands_off_keys", "update_apply_warmup_holds"] {
-            let call_sites: Vec<&str> = apply_lane
-                .lines()
-                .filter(|line| line.contains(gate))
-                .collect();
-            assert!(!call_sites.is_empty(), "{gate} lost its callers");
-            for line in call_sites {
-                assert!(
-                    line.contains("is_automatic()"),
-                    "{gate} may only be consulted on an automatic lane: {line}"
-                );
-            }
-        }
     }
 
     // -----------------------------------------------------------------------

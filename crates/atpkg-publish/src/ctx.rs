@@ -9,7 +9,7 @@
 //! and [`crate::host::fake::FakeHost`] hosts.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
 use crate::host::gh::GhCli;
@@ -81,6 +81,10 @@ pub struct Ctx {
     pub now_unix: i64,
     /// The release hosts.
     pub hosts: Hosts,
+    /// The roster generation this context's packs sign under, elected once
+    /// ([`crate::artifact::sign::elected`]) and shared by every clone: a lane or a group
+    /// reads the channel head for it once, not once per pack.
+    pub(crate) elected: Arc<Mutex<Option<Arc<crate::artifact::sign::Authority>>>>,
 }
 
 impl Ctx {
@@ -151,6 +155,7 @@ impl Ctx {
                 .collect(),
             now_unix,
             hosts: Hosts::single(Arc::new(crate::host::fake::FakeHost::new())),
+            elected: Arc::default(),
         }
     }
 

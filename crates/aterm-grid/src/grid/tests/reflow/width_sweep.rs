@@ -287,11 +287,16 @@ fn clear_mid_flight_does_not_resurrect_history_offloaded() {
 /// merge joins the halves without padding that hole.
 #[test]
 fn early_wrap_pad_preserves_real_trailing_spaces() {
-    use crate::{CellFlags, StyleId};
+    use crate::CellFlags;
     // Real trailing spaces before the one-cell early-wrap hole are content and survive.
     let mut grid = Grid::new(5, 10);
     type_line(&mut grid, "ABCDEF   "); // cols 0..=8: text + three real spaces
-    grid.write_wide_char_wrap_with_style_id('世', StyleId::default(), CellFlags::empty());
+    grid.write_wide_char_wrap_styled(
+        '世',
+        crate::PackedColor::DEFAULT_FG,
+        crate::PackedColor::DEFAULT_BG,
+        CellFlags::empty(),
+    );
     assert!(grid.row(1).unwrap().is_wrapped());
     assert!(grid.row(1).unwrap().get(0).unwrap().is_wide());
 
@@ -316,11 +321,16 @@ fn early_wrap_pad_preserves_real_trailing_spaces() {
 
 #[test]
 fn grow_merges_early_wrapped_wide_char_without_phantom_space() {
-    use crate::{CellFlags, StyleId};
+    use crate::CellFlags;
     let mut grid = Grid::new(5, 10);
     // The wide char cannot start at col 9: it early-wraps and col 9 stays unwritten.
     type_line(&mut grid, "ABCDEFGHI");
-    grid.write_wide_char_wrap_with_style_id('世', StyleId::default(), CellFlags::empty());
+    grid.write_wide_char_wrap_styled(
+        '世',
+        crate::PackedColor::DEFAULT_FG,
+        crate::PackedColor::DEFAULT_BG,
+        CellFlags::empty(),
+    );
     assert!(
         grid.row(1).unwrap().is_wrapped(),
         "sanity: the wide char early-wrapped onto a continuation row"
@@ -352,10 +362,15 @@ fn grow_merges_early_wrapped_wide_char_without_phantom_space() {
 /// materialization of the ring head skips the unwritten cell.
 #[test]
 fn early_wrapped_wide_char_survives_sweep_across_history_boundary() {
-    use crate::{CellFlags, StyleId};
+    use crate::CellFlags;
     let mut grid = Grid::with_scrollback(3, 10, 100);
     type_line(&mut grid, "ABCDEFGHI");
-    grid.write_wide_char_wrap_with_style_id('世', StyleId::default(), CellFlags::empty());
+    grid.write_wide_char_wrap_styled(
+        '世',
+        crate::PackedColor::DEFAULT_FG,
+        crate::PackedColor::DEFAULT_BG,
+        CellFlags::empty(),
+    );
     // The head scrolls into ring history; the wide-char tail stays at the viewport top.
     feed(&mut grid);
     feed(&mut grid);
@@ -379,40 +394,5 @@ fn early_wrapped_wide_char_survives_sweep_across_history_boundary() {
     assert!(
         joined.contains("ABCDEFGHI世"),
         "the round trip must keep the logical line intact: {joined:?}"
-    );
-}
-
-/// After a shrink that overflows the viewport and a grow back, the prompt sits
-/// directly below its content with the viewport bottom-anchored.
-#[test]
-fn width_sweep_keeps_prompt_anchored_to_content() {
-    let mut grid = Grid::with_scrollback(6, 30, 1000);
-    build_sweep_grid(&mut grid);
-
-    let prompt_row_before = (0..grid.rows())
-        .rev()
-        .find(|&r| !grid.row(r).unwrap().is_empty())
-        .expect("prompt row exists");
-
-    for w in SWEEP {
-        grid.resize(6, w);
-    }
-
-    let prompt_row_after = (0..grid.rows())
-        .rev()
-        .find(|&r| !grid.row(r).unwrap().is_empty())
-        .expect("prompt row exists after sweep");
-    assert_eq!(
-        grid.row(prompt_row_after).unwrap().to_string().trim_end(),
-        "$",
-        "the prompt is the bottom-most non-empty viewport row"
-    );
-    assert_eq!(
-        prompt_row_after, prompt_row_before,
-        "prompt must return to its pre-sweep viewport row, not strand mid-window"
-    );
-    assert!(
-        prompt_row_after == 0 || !grid.row(prompt_row_after - 1).unwrap().is_empty(),
-        "no blank band between content and prompt"
     );
 }

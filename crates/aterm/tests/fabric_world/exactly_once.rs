@@ -402,11 +402,10 @@ fn a_deduped_first_send_is_a_collision_that_rolls_the_incarnation() {
     let (a, b) = w.two_sessions();
 
     w.stop_broker();
-    let inc: u64 = std::fs::read_to_string(w.state.join("inc"))
-        .expect("the bridge's incarnation")
-        .trim()
-        .parse()
-        .expect("a number");
+    // The incarnation the bridge took (the `inc` file holds the top of the
+    // incarnation LEASE, `aterm-link`'s `state.rs`): the reattach takes the next.
+    let inc = aterm_link::state::StateDir::peek(&w.state).incarnation();
+    assert!(inc >= 1, "the bridge attached under an incarnation");
     let claimed = ((inc + 1) << 32) + 1;
     let scratch = w.tmp.join("claim.sock");
     let (claimed_off, deduped) = {

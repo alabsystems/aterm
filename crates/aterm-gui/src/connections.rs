@@ -567,6 +567,24 @@ pub(crate) fn sweep_session_closed_in(
             session_edge_audit::emit(EdgeAction::RevokeSrc, "close", closing, &sid, "*");
         }
     }
+    // The read grants closed sessions keep in the closed-session index are
+    // tables too: revoke the closing source even in its own retained table.
+    // A live source's rows remain. Taken out
+    // under the store's read lock, each locked after it, one at a time.
+    let closed: Vec<(SessionId, Arc<Mutex<EdgeTable>>)> = sessions
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .closed_logs()
+        .read_tables();
+    for (sid, reads) in closed {
+        let removed = {
+            let mut edges = reads.lock().unwrap_or_else(|p| p.into_inner());
+            edges.revoke_src(closing)
+        };
+        if removed > 0 {
+            session_edge_audit::emit(EdgeAction::RevokeSrc, "close", closing, &sid, "*");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -595,7 +613,7 @@ mod tests {
             output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
             modes: Arc::default(),
             ui_waiting: Arc::default(),
-            edges: Mutex::new(EdgeTable::new()),
+            edges: std::sync::Arc::new(Mutex::new(EdgeTable::new())),
             self_id: sid.clone(),
             nonce,
             turn_lease: Mutex::new(None),
@@ -608,11 +626,15 @@ mod tests {
                 crate::session_timeline::SessionTimeline::default(),
             )),
             fabric: std::sync::Arc::default(),
+            idem: Default::default(),
             rewrap_gauge: std::sync::Arc::default(),
             human_input: Default::default(),
+            launch: Default::default(),
             generation_look: Default::default(),
             reset_lane: Default::default(),
+            crash_journal: Default::default(),
             update_parked: Default::default(),
+            witness: Default::default(),
             fenced_writes: Default::default(),
         });
         SessionHandle {

@@ -12,7 +12,8 @@ use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::Terminal;
 use aterm_effects::kitty_pet::{PetAttention, PetBrain, PetFrame, PetSense};
 use aterm_effects::pet_world::{PetCell, PetPane, PetWorld, PetWorldFacts};
-use aterm_spec::derive::{Model, console_resident_handoff_model};
+use aterm_models_effects::console_resident_handoff_model;
+use aterm_spec::derive::Model;
 
 type State = BTreeMap<&'static str, i64>;
 

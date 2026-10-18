@@ -296,7 +296,9 @@ fn declared(code: &str) -> impl Iterator<Item = &str> {
 // handed on only as `HandoffName`s (crates/aterm-gui/src/handoff_env.rs).
 // ---------------------------------------------------------------------------
 
-const HANDOFF_SCOPE: &[&str] = &["crates/aterm-gui/src/"];
+/// aterm-gui's source: the window crate's and its split-out libraries'
+/// (`crates/aterm-gui-*`).
+const HANDOFF_SCOPE: &[&str] = &["crates/aterm-gui/src/", "crates/aterm-gui-"];
 /// The module that owns the names' environment.
 const HANDOFF_HOME: &str = "crates/aterm-gui/src/handoff_env.rs";
 const HANDOFF_PREFIXES: &[&str] = &["\"ATERM_SEAMLESS_", "\"ATERM_HANDOFF_"];

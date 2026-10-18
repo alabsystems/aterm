@@ -54,8 +54,9 @@ pub fn peer_closed(stream: &CtlStream) -> bool {
 /// client that sent its request and EOF, a relay's child that answered) and then shuts
 /// nothing, so that waiting peer gets no end-of-file.
 ///
-/// Returns whether this call shut either half: `false` for a socket that is not connected (a
-/// listening one; on Darwin one whose peer closed entirely) or already shut both ways.
+/// Returns whether this call shut either half. Darwin answers `false` for a socket that is not
+/// connected (a listening one, or one whose peer closed entirely) or already shut both ways;
+/// Linux's `shutdown(2)` succeeds on any AF_UNIX socket, so there it is `true` every time.
 pub fn hang_up(stream: &CtlStream) -> bool {
     let wrote = stream.shutdown(std::net::Shutdown::Write).is_ok();
     let read = stream.shutdown(std::net::Shutdown::Read).is_ok();
@@ -113,29 +114,14 @@ mod tests {
         (&*stream).read(&mut [0u8; 16]).map_err(|e| e.kind())
     }
 
-    /// The `try_clone` stands in for the copy a forked child holds until it execs. Negative
-    /// control (macOS): a both-ways `shutdown` is refused once the peer half-closed and shuts
-    /// no half.
+    /// The `try_clone` stands in for the copy a forked child holds until it execs. (Darwin
+    /// refuses a both-ways `shutdown` once the peer half-closed, and shuts no half.)
     #[test]
     fn a_hang_up_reaches_a_peer_that_half_closed_though_a_copy_survives() {
         let (near, far) = crate::CtlStream::pair().expect("pair");
         let forked_copy = near.try_clone().expect("a surviving copy");
         far.shutdown(std::net::Shutdown::Write)
             .expect("the peer half-closes toward `near`");
-        #[cfg(target_os = "macos")]
-        {
-            assert_eq!(
-                near.shutdown(std::net::Shutdown::Both)
-                    .map_err(|e| e.kind()),
-                Err(ErrorKind::NotConnected),
-                "Darwin refuses a both-ways shutdown of a socket its peer half-closed"
-            );
-            assert_eq!(
-                read_now(&far),
-                Err(ErrorKind::WouldBlock),
-                "and that refusal shut no half: the peer reads no end-of-file"
-            );
-        }
         assert!(hang_up(&near), "the write half was still open to shut");
         assert_eq!(read_now(&far), Ok(0), "the peer reads its end-of-file");
         assert_eq!(
@@ -143,6 +129,9 @@ mod tests {
             Ok(0),
             "a reader of a surviving copy reads its own"
         );
+        // Darwin refuses to shut a half again; Linux's shutdown(2) succeeds on
+        // any connected AF_UNIX stream, shut or not (the Linux lane, 2026-10-16).
+        #[cfg(target_os = "macos")]
         assert!(!hang_up(&near), "nothing is left to shut");
     }
 

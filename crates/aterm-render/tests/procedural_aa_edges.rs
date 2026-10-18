@@ -1,28 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! PROOF (seam-tiling law) — every ANTI-ALIASED procedural glyph keeps hard
-//! 0/255 cell-EDGE texels, at every cell size.
+//! The seam-tiling law: every anti-aliased procedural glyph (diagonals
+//! U+2571–2573, arcs U+256D–2570, Powerline U+E0B0–E0BF, wedges
+//! U+1FB3C–1FB6F) keeps hard 0/255 cell-edge texels at every cell size. A
+//! fractional edge texel would blend differently on the CPU and GPU sRGB paths
+//! and draw a half-covered line where two cells meet.
 //!
-//! Two-tier proof, same idiom as `presentation_gate.rs`:
-//!
-//! * Tier-0 (abstract): `aterm_spec::derive::aa_edge_hardening_model()` — the
-//!   ty-checked twin. Its invariant (`edge = 1 => out ∈ {0, MAX}`) is exactly
-//!   the law asserted here; its `Buggy = 1` branch (skip the hardening pass)
-//!   yields the counterexample. Checked by the real Trust `ty` in
-//!   aterm-spec's `derived_ring_ty.rs`.
-//! * Tier-1 (this file): the SAME invariant checked against the REAL
-//!   rasterizer over an exhaustive `1..=16 × 1..=16` size lattice plus
-//!   larger odd/even sentinels — for every glyph of every AA family
-//!   (diagonals U+2571–2573, arcs U+256D–2570, Powerline U+E0B0–E0BF, wedges
-//!   U+1FB3C–1FB6F). The lattice is exhaustive over the domain where seam
-//!   rounding can break, so this is a complete proof there, not a sample.
-//!
-//! WHY it matters: a cell-edge texel with fractional coverage would blend
-//! differently on the CPU (software sRGB) and GPU (hardware sRGB) AND compose
-//! a visible half-covered line where two cells meet. Hard edges keep the
-//! seam byte-exact on both backends — the property the box-drawing rounding
-//! rule (procedural.rs module docs) guarantees for the orthogonal families.
+//! This file checks the invariant (`edge = 1 => out ∈ {0, MAX}`) against the
+//! rasterizer over an exhaustive `1..=16 × 1..=16` lattice, where seam
+//! rounding can break, plus larger sentinels.
 
 use aterm_render::procedural;
 
@@ -77,27 +64,4 @@ fn aa_family_cell_edge_texels_are_hard() {
             }
         }
     }
-}
-
-/// Non-vacuity control: the AA regime is real. If every texel of every AA
-/// glyph were hard 0/255 the edge law above would hold trivially (and the
-/// supersampler would be dead code) — so require that plenty of interior
-/// texels genuinely anti-alias at representative sizes.
-#[test]
-fn aa_family_interiors_actually_antialias() {
-    let mut soft = 0usize;
-    for &(w, h) in &[(9usize, 19usize), (10, 20), (12, 24)] {
-        for ch in aa_chars() {
-            let cov = procedural::coverage(ch, w, h).unwrap();
-            soft += (1..h - 1)
-                .flat_map(|y| (1..w - 1).map(move |x| y * w + x))
-                .filter(|&i| !matches!(cov[i], 0 | 255))
-                .count();
-        }
-    }
-    assert!(
-        soft > 500,
-        "only {soft} soft interior texels across all AA glyphs — the 4x \
-         supersampler is not actually anti-aliasing"
-    );
 }

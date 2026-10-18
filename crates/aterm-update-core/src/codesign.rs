@@ -302,24 +302,6 @@ mod tests {
         ));
     }
 
-    /// An unsigned file is refused (exit 1) with codesign's own words.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn an_unsigned_file_is_refused_with_codesigns_reason() {
-        let dir = std::env::temp_dir().join(format!("codesign-unsigned-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("not-code");
-        std::fs::write(&file, b"#!/bin/sh\necho hi\n").unwrap();
-        match verify_developer_id(&file, "Q6L2SF6YDW", false) {
-            Err(CodesignError::Refused { code, stderr }) => {
-                assert_eq!(code, Some(1), "{stderr}");
-                assert!(stderr.contains("not signed"), "{stderr}");
-            }
-            other => panic!("{other:?}"),
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// Exit 3, and exit 1 naming a signature fault, are verdicts; exit 1 for an unreadable
     /// file or internal failure, any other exit, a signal and a failure to run are not.
     #[test]

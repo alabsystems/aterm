@@ -132,20 +132,6 @@ fn two_resizes_keep_truecolor() {
 }
 
 #[test]
-fn alt_quiet_flap_keeps_truecolor() {
-    let mut grid = painted(6, 10, 5, 0);
-    let before: Vec<_> = (0..6).map(|r| colours(&grid, r, 10)).collect();
-    grid.resize_no_reflow(5, 10);
-    grid.resize_no_reflow(6, 10);
-    let after: Vec<_> = (0..6).map(|r| colours(&grid, r, 10)).collect();
-    assert_eq!(
-        after, before,
-        "the flap the engine undoes brings colour back"
-    );
-    assert_every_row_keeps_its_colour(&grid, 10, "quiet flap");
-}
-
-#[test]
 fn main_width_change_keeps_truecolor() {
     // The control: the column-reflow path reads the ring itself.
     let mut grid = painted(6, 10, 5, 100);

@@ -123,11 +123,12 @@ pub const fn roster_tier_armed() -> bool {
 ///    constant.
 ///
 /// 4. **Set the value below** to the 10-character Team ID (public: it is in the `subject.OU` of
-///    every Developer-ID signature), and update the armed value that
+///    every Developer-ID signature).
 ///    `the_shipped_anchor_is_armed_and_an_empty_anchor_still_resolves_inert`
-///    (`crates/aterm-release/tests/it/apple_tier.rs`) asserts.
+///    (`crates/aterm-release/tests/it/apple_tier.rs`) asserts the anchor is armed, so a fork
+///    that empties it fails there.
 ///
-/// 5. **Cut a rehearsal first.** `--rehearse` and `--dry-run` sign and notarize for real.
+/// 5. **Cut a dry run first.** `--dry-run` signs and notarizes for real.
 // Armed on m3: two overlapping certificates, so its credentials profile pins
 // signing_identity_sha1; the notarytool credential is keychain profile "notary".
 pub const APPLE_TEAM_ID: &str = "A66A9P66Z7";

@@ -8,7 +8,7 @@
 // `present_virtual` (the same `present_to_view` body as the swapchain arm) and
 // harvest the presented bytes through the video tap.
 //
-// No GPU / no system font: no-op.
+// No GPU or no font: COULD NOT RUN.
 
 use aterm_core::terminal::Terminal;
 use aterm_gpu::video_tap::{CaptureOpts, DEFAULT_BUDGET, VideoTake};

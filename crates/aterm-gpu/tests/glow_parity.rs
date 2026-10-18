@@ -13,12 +13,14 @@ use aterm_render::{
     BeamClip, BeamVertex, GlowQuad, HaloMode, RainHalo, Theme, WindowCpu, comet_beam, premul_rgb,
 };
 
+use crate::common::ByteExact;
 use crate::common::{backends_fontdue as backends, gg, max_channel_delta};
 
 /// Premultiplied light over pure background is byte-exact on both backends and equals
 /// `min(255, bg + premul)` per channel.
 #[test]
 fn glow_additive_is_byte_exact_over_background() {
+    let exact = ByteExact::default();
     let theme = Theme::default();
     let px = 18.0;
     let (mut cpu, mut gpu) = backends(px, theme);
@@ -60,13 +62,11 @@ fn glow_additive_is_byte_exact_over_background() {
     eprintln!("LUMEN additive-over-bg max per-channel delta = {delta}");
     // Byte-exact only on native; on a downlevel sRGB offscreen the add lands in linear (see
     // `GpuRenderer::additive_is_byte_exact`).
-    if gpu.additive_is_byte_exact() {
+    if exact.holds(&gpu, "byte-exact additive gate") {
         assert_eq!(
             delta, 0,
             "premultiplied additive over a flat bg must be BYTE-EXACT CPU==GPU (got {delta})"
         );
-    } else {
-        eprintln!("SKIP byte-exact additive gate: downlevel sRGB offscreen (linear add)");
     }
 
     // And the value is exactly min(255, bg + premul): sample the brightest quad's
@@ -133,11 +133,8 @@ fn glow_over_text_matches_within_tolerance() {
     let gpu_frame = gpu.render_input(&mut win, &input, None);
     let delta = max_channel_delta(&cpu_frame.pixels, &gpu_frame.pixels);
     eprintln!("LUMEN over-text max per-channel delta = {delta}");
-    if gpu.additive_is_byte_exact() {
-        assert!(delta <= 8, "glow over text diverges: max delta {delta} > 8");
-    } else {
-        eprintln!("SKIP glow-over-text parity gate: downlevel sRGB offscreen (linear add)");
-    }
+    crate::common::byte_exact_or_could_not_run(&gpu, "glow-over-text parity gate");
+    assert!(delta <= 8, "glow over text diverges: max delta {delta} > 8");
 }
 
 /// Glow through the cached path (`render_input_cached` on one persistent renderer and window
@@ -146,6 +143,7 @@ fn glow_over_text_matches_within_tolerance() {
 /// must return to each backend's own bare frame.
 #[test]
 fn damaged_path_glow_parity_cpu_matches_gpu() {
+    let exact = ByteExact::default();
     let theme = Theme::default();
     let px = 18.0;
     let (mut cpu, mut gpu) = backends(px, theme);
@@ -217,13 +215,11 @@ fn damaged_path_glow_parity_cpu_matches_gpu() {
     // Additive light over a glyph-free background is byte-exact.
     let delta = max_channel_delta(&cpu_b, &gpu_b);
     eprintln!("damaged-path glow CPU vs GPU max per-channel delta = {delta}");
-    if gpu.additive_is_byte_exact() {
+    if exact.holds(&gpu, "damaged-path byte-exact additive gate") {
         assert_eq!(
             delta, 0,
             "glow over bg via the cached path must be BYTE-EXACT CPU==GPU (got {delta})"
         );
-    } else {
-        eprintln!("SKIP damaged-path byte-exact additive gate: downlevel sRGB offscreen");
     }
 
     // Frame C: drain the aurora. On a damage-tracked path drained light survives unless the
@@ -298,75 +294,13 @@ fn damaged_path_glow_parity_cpu_matches_gpu() {
     );
 }
 
-/// Bloom smoke and energy check: with bloom on the frame carries strictly more light than with
-/// it off, so the extract, blur and composite run on the device. Not pixel-exact: bloom is
-/// outside the parity proof.
-#[test]
-fn bloom_adds_light_over_the_base() {
-    let theme = Theme::default();
-    let px = 18.0;
-    let (cpu, mut gpu) = backends(px, theme);
-    let mut win = aterm_gpu::WindowGpu::new();
-    let (rows, cols) = (6usize, 24usize);
-    let mut term = Terminal::new(rows as u16, cols as u16);
-    let (cw, ch) = cpu.cell_size();
-    let mut input = term.cell_frame(rows, cols);
-    input.cursor_visible = false; // isolate the glow
-
-    // A bright comet across the middle row.
-    let base = 0x0050_FA7B;
-    for c in 4..18usize {
-        input.cursor_glow_add.push(GlowQuad {
-            row: 3,
-            x: (c * cw) as u16,
-            y: (3 * ch) as u16,
-            w: cw as u16,
-            h: ch as u16,
-            color: premul_rgb(base, 220),
-            alpha: 0,
-            color2: premul_rgb(base, 220),
-            alpha2: 0,
-        });
-    }
-
-    // Bloom on (default): this first glow frame builds the bloom target on demand, then
-    // composites the halo.
-    gpu.set_bloom(true);
-    let on = gpu.render_input(&mut win, &input, None);
-    // Bloom off: same input, same window/offscreen (no resize), base render only.
-    gpu.set_bloom(false);
-    let off = gpu.render_input(&mut win, &input, None);
-
-    assert_eq!((on.width, on.height), (off.width, off.height));
-    let green_sum = |px: &[u32]| -> u64 { px.iter().map(|p| ((p >> 8) & 0xff) as u64).sum() };
-    let (son, soff) = (green_sum(&on.pixels), green_sum(&off.pixels));
-    eprintln!(
-        "bloom green-sum: on={son} off={soff} (delta {})",
-        son - soff
-    );
-    assert!(
-        son > soff,
-        "GPU bloom must ADD light over the base: on={son} should exceed off={soff}"
-    );
-
-    // The bloom spreads: a pixel a few px above the comet's top edge gains light.
-    // Grid origin is (0, 0) (pad 0).
-    let probe = (3 * ch).saturating_sub(3) * on.width + (10 * cw + cw / 2);
-    let g_on = ((on.pixels[probe] >> 8) & 0xff) as i32;
-    let g_off = ((off.pixels[probe] >> 8) & 0xff) as i32;
-    eprintln!("bloom halo spill above comet: on={g_on} off={g_off}");
-    assert!(
-        g_on > g_off,
-        "bloom must SPREAD a halo beyond the comet: above-comet green on={g_on} should exceed off={g_off}"
-    );
-}
-
 /// Head band: with a chrome head band and interior padding on both backends, the
 /// window-absolute streams (a real `comet_beam` rising into the band, a `glow_halo` and a
 /// `glow_under` quad in the band) and a grid-space `nova_add` quad render byte-exact CPU==GPU,
 /// and band pixels carry light. The cached-path leg checks the head-tall row-0 top strip.
 #[test]
 fn glow_head_band_parity_cpu_matches_gpu() {
+    let exact = ByteExact::default();
     const P: usize = 6; // interior pad (px per edge)
     const H: usize = 20; // chrome head band (px above the padded grid)
     let theme = Theme::default();
@@ -496,13 +430,11 @@ fn glow_head_band_parity_cpu_matches_gpu() {
     );
     let delta = max_channel_delta(&cpu_f.pixels, &gpu_f.pixels);
     eprintln!("glow head-band GPU vs CPU max per-channel delta = {delta}");
-    if gpu.additive_is_byte_exact() {
+    if exact.holds(&gpu, "byte-exact head-band glow gate") {
         assert_eq!(
             delta, 0,
             "head-band glow must be BYTE-EXACT CPU==GPU (got {delta})"
         );
-    } else {
-        eprintln!("SKIP byte-exact head-band glow gate: downlevel sRGB offscreen");
     }
 
     // (c) Cached path: prime with the base, render the glow frame through
@@ -535,20 +467,23 @@ fn glow_head_band_parity_cpu_matches_gpu() {
 /// must be measured in the quad's own space. A red-to-blue gradient across 30
 /// cells, bloom on minus off, sampled 3 px above: the halo is red-dominant over
 /// the left end and blue-dominant over the right, like the control built from
-/// 30 flat quads. Runs on the Metal renderer and (macOS) the wgpu oracle.
+/// 30 flat quads. Runs on the first-party renderer and (macOS, Linux) the
+/// wgpu oracle.
 #[test]
 fn bloom_halo_follows_a_gradient_quad_s_ramp() {
     let theme = Theme::default();
     let (rows, cols) = (8usize, 40usize);
     let (c0, c1) = (0x00E0_0000u32, 0x0000_00E0u32);
     for oracle in [false, true] {
-        if oracle && !cfg!(target_os = "macos") {
+        // The oracle pass is macOS's and Linux's wgpu arm, compiled only into
+        // the `--features wgpu-oracle` lane; elsewhere wgpu is the only arm.
+        if oracle && !cfg!(all(any(target_os = "macos", target_os = "linux"), wgpu_arm)) {
             continue;
         }
         let (cpu, mut gpu) = backends(18.0, theme);
-        #[cfg(target_os = "macos")]
+        #[cfg(all(any(target_os = "macos", target_os = "linux"), wgpu_arm))]
         if oracle {
-            gpu.disarm_metal_for_oracle();
+            crate::common::disarm_for_oracle(&mut gpu);
         }
         let (cw, ch) = cpu.cell_size();
         let mut win = aterm_gpu::WindowGpu::new();

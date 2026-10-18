@@ -12,10 +12,11 @@ use crate::{
     semantic_prewarm_replacement_carries_base, semantic_prewarm_result_decision,
     semantic_prewarm_result_is_current,
 };
-use aterm_spec::derive::{
-    Model, semantic_prewarm_generation_model, semantic_prewarm_handshake_model,
+use aterm_models_misc::{
+    semantic_prewarm_generation_model, semantic_prewarm_handshake_model,
     semantic_prewarm_request_swap_model,
 };
+use aterm_spec::derive::Model;
 use aterm_spec::interp::{State, admits};
 
 fn project_before(model: &Model, current: i64, result: i64) -> State {

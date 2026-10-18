@@ -12,68 +12,17 @@
 //! fire, an IME commit, a session switch, or the glued reading of a no-space
 //! run, which probes borrowed halves of the inline token, hit or miss).
 //!
-//! One `#[test]` in its own binary: the counter is a process-global allocator
-//! switched by a global flag, so a parallel test would bleed into the count.
-//! Do not add tests to this file. (`aterm-lexicon`'s `lexicon_alloc` binary
-//! can hold two pins because its allocator counts per thread.)
-
-use std::{
-    alloc::{GlobalAlloc, Layout, System},
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-};
+//! Counted by the suite's per-thread allocator (`alloc_count`), so the pin
+//! shares `effects_suite` with every other test and no parallel test bleeds
+//! into its count.
 
 use aterm_effects::typed_tricks::{TrickEvent, TrickListener};
 use aterm_lexicon::TrickLexicon;
 use aterm_time::{Duration, Instant};
 
-struct CountingAllocator;
-
-static COUNT_ALLOCATIONS: AtomicBool = AtomicBool::new(false);
-static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
-
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: delegate the allocation unchanged to the system allocator.
-        let ptr = unsafe { System.alloc(layout) };
-        if !ptr.is_null() && COUNT_ALLOCATIONS.load(Ordering::Relaxed) {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        }
-        ptr
-    }
-
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: delegate the allocation unchanged to the system allocator.
-        let ptr = unsafe { System.alloc_zeroed(layout) };
-        if !ptr.is_null() && COUNT_ALLOCATIONS.load(Ordering::Relaxed) {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        }
-        ptr
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        // SAFETY: `ptr`, `layout`, and `new_size` are forwarded unchanged.
-        let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
-        if !new_ptr.is_null() && COUNT_ALLOCATIONS.load(Ordering::Relaxed) {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        }
-        new_ptr
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: `ptr` and `layout` came from this delegating allocator.
-        unsafe { System.dealloc(ptr, layout) };
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: CountingAllocator = CountingAllocator;
-
+/// How many allocations `f` makes on this thread.
 fn allocations_during(f: impl FnOnce()) -> usize {
-    ALLOCATIONS.store(0, Ordering::Relaxed);
-    COUNT_ALLOCATIONS.store(true, Ordering::Release);
-    f();
-    COUNT_ALLOCATIONS.store(false, Ordering::Release);
-    ALLOCATIONS.load(Ordering::Relaxed)
+    crate::alloc_count::allocations_during(f).1
 }
 
 /// The scripts the no-space lanes need; English rides the embedded file.

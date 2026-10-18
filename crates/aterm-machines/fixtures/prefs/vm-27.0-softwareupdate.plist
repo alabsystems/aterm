@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>DDMPersistedErrorKey</key>
+	<dict>
+		<key>count</key>
+		<integer>1</integer>
+		<key>reason</key>
+		<string>Software update failed.</string>
+		<key>timestamp</key>
+		<string>2026-10-16T23:00:45Z</string>
+	</dict>
+	<key>FirstOfferDateDictionary</key>
+	<dict>
+		<key>MSU_UPDATE_26A434_patch_27.0.1_minor</key>
+		<date>2026-10-16T22:41:30Z</date>
+	</dict>
+	<key>LastAttemptBuildVersion</key>
+	<string>27.0 (26A428)</string>
+	<key>LastAttemptSystemVersion</key>
+	<string>27.0 (26A428)</string>
+	<key>LastBackgroundSuccessfulDate</key>
+	<date>2026-10-16T22:41:28Z</date>
+	<key>LastBootBaseBuildVersion</key>
+	<string>26A428</string>
+	<key>LastExecutedMSUBackgroundActionDate</key>
+	<date>2026-10-16T22:41:31Z</date>
+	<key>LastFullSuccessfulDate</key>
+	<date>2026-10-16T23:27:21Z</date>
+	<key>LastRecommendedMajorOSBundleIdentifier</key>
+	<string></string>
+	<key>LastResultCode</key>
+	<integer>0</integer>
+	<key>LastSessionSuccessful</key>
+	<true/>
+	<key>LastSuccessfulDate</key>
+	<date>2026-10-16T23:27:21Z</date>
+	<key>LastSuccessfulMSUScanDate</key>
+	<date>2026-10-16T23:27:27Z</date>
+	<key>PostSuccessfulMinorUpdatePostLogOutNotification</key>
+	<false/>
+	<key>PrimaryLanguages</key>
+	<array>
+		<string>en</string>
+	</array>
+	<key>RecommendedUpdates</key>
+	<array>
+		<dict>
+			<key>Display Name</key>
+			<string>Command Line Tools for Xcode 27.0</string>
+			<key>Display Version</key>
+			<string>27.0</string>
+			<key>Identifier</key>
+			<string>Command Line Tools for Xcode 27.0</string>
+			<key>Product Key</key>
+			<string>082-83364</string>
+		</dict>
+		<dict>
+			<key>Display Name</key>
+			<string>macOS 27.0.1</string>
+			<key>Display Version</key>
+			<string>27.0.1</string>
+			<key>Identifier</key>
+			<string>MSU_UPDATE_26A434_patch_27.0.1_minor</string>
+			<key>MobileSoftwareUpdate</key>
+			<true/>
+			<key>Product Key</key>
+			<string>MSU_UPDATE_26A434_patch_27.0.1_minor</string>
+		</dict>
+	</array>
+	<key>SplatEnabled</key>
+	<true/>
+</dict>
+</plist>

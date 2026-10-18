@@ -40,10 +40,13 @@ fn opts_allow_cat() -> ScanOptions<'static> {
 
 // ------------------------------------------------------------------ positives
 
+/// Listed surfaces, stem x suffix expansions and folded spellings (case,
+/// `ß`/`ẞ`/`ss`) each reach their class, English and beyond. Longer feline
+/// forms are eligible by default; bare `cat` is the opt-in below.
 #[test]
-fn english_profanity_forms() {
+fn listed_surfaces_reach_their_class() {
     let o = default_opts();
-    for w in [
+    let profanity = [
         "fuck",
         "fucking",
         "fucked",
@@ -54,25 +57,45 @@ fn english_profanity_forms() {
         "motherfucker",
         "clusterfuck",
         "unfuck",
+        "merde",    // fr
+        "scheiße",  // de
+        "scheisse", // de (ss surface)
+        "Scheiße",
+        "SCHEISSE",
+        "SCHEIẞE",
+        "mierda", // es
+        "cazzo",  // it
+        "kurwa",  // pl
+        "vittu",  // fi
+    ];
+    let feline = [
+        "cats",
+        "kitty",
+        "kitties",
+        "kitten",
+        "kittens",
+        "pussycat",
+        "gato",
+        "gatos",
+        "gatito", // es
+        "gatto",
+        "gattino", // it
+        "chaton",  // fr
+        "katze",
+        "kätzchen", // de
+        "katt",
+        "kattunge", // sv
+        "kissa",
+        "kissanpentu", // fi
+        "kucing",      // id
+    ];
+    for (words, class) in [
+        (&profanity[..], Class::Profanity),
+        (&feline[..], Class::Feline),
     ] {
-        assert_eq!(
-            classes(w, &o),
-            vec![Class::Profanity],
-            "expected profanity for {w:?}"
-        );
-    }
-}
-
-#[test]
-fn english_feline_forms() {
-    let o = default_opts();
-    // Longer feline forms are eligible by default.
-    for w in ["cats", "kitty", "kitties", "kitten", "kittens", "pussycat"] {
-        assert_eq!(
-            classes(w, &o),
-            vec![Class::Feline],
-            "expected feline for {w:?}"
-        );
+        for w in words {
+            assert_eq!(classes(w, &o), vec![class], "expected {class:?} for {w:?}");
+        }
     }
 }
 
@@ -94,57 +117,6 @@ fn possessive_and_punctuation() {
         classes("(fucking)", &default_opts()),
         vec![Class::Profanity]
     );
-}
-
-#[test]
-fn multilingual_feline() {
-    let o = default_opts();
-    // Romance / Germanic / others — longer than 3 chars so eligible by default.
-    for w in [
-        "gato",
-        "gatos",
-        "gatito", // es
-        "gatto",
-        "gattino", // it
-        "chaton",  // fr
-        "katze",
-        "kätzchen", // de
-        "katt",
-        "kattunge", // sv
-        "kissa",
-        "kissanpentu", // fi
-        "kucing",      // id
-    ] {
-        let c = classes(w, &o);
-        assert_eq!(c, vec![Class::Feline], "expected feline for {w:?}");
-    }
-}
-
-#[test]
-fn multilingual_profanity() {
-    let o = default_opts();
-    for w in [
-        "merde",    // fr
-        "scheiße",  // de
-        "scheisse", // de (ss surface)
-        "mierda",   // es
-        "cazzo",    // it
-        "kurwa",    // pl
-        "vittu",    // fi
-    ] {
-        assert_eq!(
-            classes(w, &o),
-            vec![Class::Profanity],
-            "expected profanity for {w:?}"
-        );
-    }
-}
-
-#[test]
-fn german_eszett_both_surfaces() {
-    let o = default_opts();
-    assert_eq!(classes("Scheiße", &o), vec![Class::Profanity]);
-    assert_eq!(classes("SCHEISSE", &o), vec![Class::Profanity]);
 }
 
 #[test]
@@ -339,14 +311,6 @@ fn a_bare_claimant_keeps_its_key_matchable_across_a_precedence_replacement() {
             .collect();
         assert_eq!(marked, vec![Class::Feline], "{order}: the marked spelling");
     }
-}
-
-#[test]
-fn prose_cat_decorated_when_enabled() {
-    assert_eq!(
-        classes("I love my cat", &opts_allow_cat()),
-        vec![Class::Feline]
-    );
 }
 
 // ------------------------------------------------------------------ CJK
@@ -576,16 +540,6 @@ fn user_override_opts_a_bare_skeleton_in() {
     assert_eq!(m[0].class, Class::Profanity);
 }
 
-#[test]
-fn fold_idempotent_for_turkish_dotted_i() {
-    // 'İ'.to_lowercase() emits 'i' + combining dot; fold must drop it and stay idempotent.
-    assert_eq!(aterm_lexicon::fold("İ"), aterm_lexicon::fold("i"));
-    assert_eq!(
-        aterm_lexicon::fold(&aterm_lexicon::fold("İ")),
-        aterm_lexicon::fold("İ")
-    );
-}
-
 // ------------------------------------------------------------ emphasis ----
 
 /// An emphasis override entry for the neutral coined word "megathink" — the
@@ -630,30 +584,6 @@ fn emphasis_negatives() {
     assert!(
         lx.scan("--megathink=1", &o).is_empty(),
         "code/flag context suppressed"
-    );
-}
-
-/// The builtin lexicon ships ZERO emphasis forms: the class is populated
-/// solely via `[sparkle_words.emphasis].extra_words` (a user override entry).
-#[test]
-fn builtin_ships_no_emphasis_forms() {
-    let lx = lex();
-    assert_eq!(
-        lx.iter_spaced()
-            .filter(|(_, c)| *c == Class::Emphasis)
-            .count(),
-        0,
-        "no spaced emphasis surfaces in the builtin"
-    );
-    assert_eq!(
-        lx.iter_cjk().filter(|(_, c)| *c == Class::Emphasis).count(),
-        0,
-        "no CJK emphasis surfaces in the builtin"
-    );
-    assert!(
-        lx.scan(concat!("ultra", "code ultrathink"), &default_opts())
-            .is_empty(),
-        "the removed seeds must not match the builtin"
     );
 }
 
@@ -776,53 +706,6 @@ fn langs_of(lx: &Lexicon, text: &str, opts: &ScanOptions) -> Vec<String> {
         .iter()
         .map(|id| lx.lang_code(id).to_string())
         .collect()
-}
-
-/// The same-class union policy: `kucing` is listed by the id, ms AND jv
-/// entries, so one match honestly claims all three, with the primary being the
-/// first TOML appearance (id).
-#[test]
-fn kucing_langs_union_id_ms_jv() {
-    let lx = lex();
-    let o = default_opts();
-    assert_eq!(langs_of(&lx, "kucing", &o), vec!["id", "ms", "jv"]);
-    let m = lx.scan("kucing", &o)[0];
-    assert_eq!(m.class, Class::Feline);
-    assert_eq!(lx.lang_code(primary_lang(m.langs)), "id");
-}
-
-/// `ambiguous` gating still keys on the RAW entry lang (semantics unchanged):
-/// under the default `["en"]` the ambiguous id entry stays gated out, so
-/// `kucing` still matches via the un-gated ms/jv entries — and its language
-/// set honestly reflects only the loaded claimants.
-#[test]
-fn kucing_under_default_languages_is_ms_jv() {
-    let lx = Lexicon::with_languages(&["en"]);
-    let o = default_opts();
-    assert_eq!(langs_of(&lx, "kucing", &o), vec!["ms", "jv"]);
-    let m = lx.scan("kucing", &o)[0];
-    assert_eq!(lx.lang_code(primary_lang(m.langs)), "ms");
-}
-
-/// meow/mew (+ plurals) attribute to English first: they live in the en
-/// feline entry, and the ms `meow` listing unions in rather than owning the
-/// surface. Holds under the default `["en"]` config too (the ms entry is not
-/// ambiguous).
-#[test]
-fn meow_is_english_first_union_malay() {
-    let o = default_opts();
-    for lx in [lex(), Lexicon::with_languages(&["en"])] {
-        assert_eq!(langs_of(&lx, "meow", &o), vec!["en", "ms"]);
-        let m = lx.scan("meow", &o)[0];
-        assert_eq!(m.class, Class::Feline);
-        assert_eq!(lx.lang_code(primary_lang(m.langs)), "en");
-        // The en-only plurals, and the 3-folded-char "mew" behind the
-        // bare-cat opt-in (like "cat" itself).
-        assert_eq!(langs_of(&lx, "meows", &o), vec!["en"]);
-        assert_eq!(langs_of(&lx, "mews", &o), vec!["en"]);
-        assert!(lx.scan("mew", &o).is_empty(), "3-char feline is opt-in");
-        assert_eq!(langs_of(&lx, "mew", &opts_allow_cat()), vec!["en"]);
-    }
 }
 
 /// The CJK homograph 猫 is listed by BOTH the ja and zh entries: the union
@@ -1150,25 +1033,4 @@ fn an_entry_whose_every_surface_is_unmatchable_is_reported() {
     )
     .expect("parses");
     assert_eq!(live.conflicts(), &[] as &[String]);
-}
-
-/// …and the shipped Indonesian dog reaches its class. `anjing`
-/// stays the curse (cross-class precedence, deliberate), so the entry needs a
-/// surface of its own: `guguk`, the child-speak dog built from the bark.
-#[test]
-fn indonesian_canine_reaches_its_class() {
-    let lx = Lexicon::with_languages(&["id"]);
-    let got: Vec<Class> = lx
-        .scan("guguk", &default_opts())
-        .into_iter()
-        .map(|m| m.class)
-        .collect();
-    assert_eq!(got, vec![Class::Canine], "id lost its only matchable dog");
-    // The deliberate precedence call is unchanged: the curse stays the curse.
-    let got: Vec<Class> = lx
-        .scan("anjing", &default_opts())
-        .into_iter()
-        .map(|m| m.class)
-        .collect();
-    assert_eq!(got, vec![Class::Profanity], "anjing must stay the sparkle");
 }

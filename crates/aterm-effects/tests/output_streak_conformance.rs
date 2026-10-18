@@ -14,7 +14,8 @@ use aterm_effects::cursor_glow::{Geom, GlowStyle};
 use aterm_effects::output_streak::{OutputStreak, StreakConfig, StreakSound};
 use aterm_effects::tone::Tone;
 use aterm_effects::trail_sound::{SoundEvent, SoundGesture, SoundKind, SoundVoice, TrailSynth};
-use aterm_spec::derive::{Model, output_streak_episode_delivery_model};
+use aterm_models_effects::output_streak_episode_delivery_model;
+use aterm_spec::derive::Model;
 
 type State = BTreeMap<&'static str, i64>;
 

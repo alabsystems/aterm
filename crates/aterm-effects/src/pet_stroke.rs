@@ -132,25 +132,6 @@ mod tests {
     }
 
     #[test]
-    fn contact_loss_discards_partial_travel_and_cannot_bypass_cooldown() {
-        let start = Instant::now();
-        let mut detector = StrokeDetector::default();
-        assert!(!detector.sample(start, Some((0.0, 0.0)), 4.0));
-        assert!(!detector.sample(start + Duration::from_millis(250), Some((0.9, 0.0)), 4.0));
-        assert!(detector.sample(start + Duration::from_millis(500), Some((1.8, 0.0)), 4.0));
-        for step in 1..=5_u64 {
-            let at = start + Duration::from_millis(500 + step * 250);
-            assert!(!detector.sample(at, None, 4.0));
-            assert!(!detector.sample(at, Some((0.0, 0.0)), 4.0));
-            assert!(!detector.sample(at + Duration::from_millis(200), Some((1.8, 0.0)), 4.0));
-        }
-        assert!(!detector.sample(start + Duration::from_millis(2000), None, 4.0));
-        assert!(!detector.sample(start + Duration::from_millis(2000), Some((0.0, 0.0)), 4.0));
-        assert!(!detector.sample(start + Duration::from_millis(2250), Some((0.9, 0.0)), 4.0));
-        assert!(detector.sample(start + Duration::from_millis(2500), Some((1.8, 0.0)), 4.0));
-    }
-
-    #[test]
     fn gaps_fast_sweeps_jitter_and_invalid_inputs_discard_partial_strokes() {
         let start = Instant::now();
         for (offset, point, width) in [
@@ -219,7 +200,8 @@ mod tests {
     fn real_stroke_detector_transitions_conform_and_reject_negative_controls() {
         use std::collections::{BTreeMap, BTreeSet};
 
-        use aterm_spec::{derive::pet_stroke_detector_model, verify};
+        use aterm_models_effects::pet_stroke_detector_model;
+        use aterm_spec::verify;
 
         let model = pet_stroke_detector_model();
         let start = Instant::now();

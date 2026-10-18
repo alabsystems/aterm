@@ -6,8 +6,7 @@
 //! bounded waits that keep the whole thing deterministic.
 //!
 //! Both suites mount this file, so it carries NO `#[test]` of its own: one
-//! would run once per mounting binary. Its self-tests live in
-//! `fabric_world/harness_self.rs`, which runs them once.
+//! would run once per mounting binary.
 //!
 //! NOTHING HERE SLEEPS AS SYNCHRONISATION. Every wait is `until <observable
 //! state>`, bounded by [`DEADLINE`] — and that bound is a HANG DETECTOR, not a
@@ -25,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use astream_broker::{Broker, BrokerHandle, Client};
+use astream_broker::{Broker, BrokerHandle, Client, Durability};
 use aterm_link::ctl::{Ctl, Reply};
 
 /// The mint secret every test's broker is guarded with.
@@ -563,6 +562,10 @@ pub struct World {
     pub node: String,
     pub state: PathBuf,
     pub gui_log: PathBuf,
+    /// The tier this world's own broker acks at: Strict, as aterm opens it,
+    /// for every world but the fabric bench's ceiling arm
+    /// ([`World::boot_durable`]). A restarted broker keeps it.
+    pub durability: Durability,
     /// The read connection every polled broker read shares ([`World::read`]).
     watch: std::sync::Mutex<Option<Client>>,
 }
@@ -689,26 +692,67 @@ impl World {
         env: &[(&str, &str)],
         broker_at: Option<&str>,
     ) -> Self {
-        Self::boot_full(tag, accept_from, env, broker_at, &[], None)
+        Self::boot_full(
+            tag,
+            accept_from,
+            env,
+            broker_at,
+            &[],
+            None,
+            Durability::Strict,
+        )
     }
 
     /// [`World::boot`] with extra flags on the bridge's `serve` line
     /// (`--presence minimal`, say).
     pub fn boot_flags(tag: &str, extra_serve_flags: &[&str]) -> Self {
-        Self::boot_full(tag, &[], &[], None, extra_serve_flags, None)
+        Self::boot_full(
+            tag,
+            &[],
+            &[],
+            None,
+            extra_serve_flags,
+            None,
+            Durability::Strict,
+        )
     }
 
     /// [`World::boot_flags`] and [`World::boot_with`] at once: extra `serve`
     /// flags AND extra environment for the bridge child — a `--receipts`
     /// bridge under a fault the test arms.
     pub fn boot_flags_with(tag: &str, extra_serve_flags: &[&str], env: &[(&str, &str)]) -> Self {
-        Self::boot_full(tag, &[], env, None, extra_serve_flags, None)
+        Self::boot_full(
+            tag,
+            &[],
+            env,
+            None,
+            extra_serve_flags,
+            None,
+            Durability::Strict,
+        )
+    }
+
+    /// [`World::boot`] with this world's broker acking at `durability` instead
+    /// of Strict — through the same guarded open (`Broker::open_guarded_with`:
+    /// the same capability checks, only what an ack promises changes). The
+    /// fabric bench's ceiling arm (`FABRIC_BENCH durability=relaxed`) is its
+    /// caller; every test world stays Strict, as aterm opens its broker.
+    pub fn boot_durable(tag: &str, durability: Durability) -> Self {
+        Self::boot_full(tag, &[], &[], None, &[], None, durability)
+    }
+
+    /// [`World::boot_durable`] with extra environment for the bridge child: the
+    /// fabric bench's ping-pong arm turns the bridge's wait tally on
+    /// (`aterm_link::wait_tally::SEAM`) in a world of its own, so no other
+    /// world's bridge runs with it.
+    pub fn boot_durable_with(tag: &str, durability: Durability, env: &[(&str, &str)]) -> Self {
+        Self::boot_full(tag, &[], env, None, &[], None, durability)
     }
 
     /// [`World::boot`] with the node's cap file holding `grants(node)` instead
     /// of the whole node ring — a bridge whose cap is short of something.
     pub fn boot_with_grants(tag: &str, grants: GrantsFor<'_>) -> Self {
-        Self::boot_full(tag, &[], &[], None, &[], Some(grants))
+        Self::boot_full(tag, &[], &[], None, &[], Some(grants), Durability::Strict)
     }
 
     fn boot_full(
@@ -718,6 +762,7 @@ impl World {
         broker_at: Option<&str>,
         extra_serve_flags: &[&str],
         grants: Option<GrantsFor<'_>>,
+        durability: Durability,
     ) -> Self {
         // ONE PERMIT PER STACK COMING UP (see [`boot_permit`]). Dropped when this
         // function returns, which is after the control socket answers — so the
@@ -755,8 +800,8 @@ impl World {
         let (broker, handle) = if broker_at.is_some() {
             (None, None)
         } else {
-            let broker =
-                Broker::open_guarded(&broker_log, SECRET.to_vec()).expect("guarded broker");
+            let broker = Broker::open_guarded_with(&broker_log, SECRET.to_vec(), durability)
+                .expect("guarded broker");
             let handle = broker.serve(&broker_sock).expect("serve the broker");
             (Some(broker), Some(handle))
         };
@@ -817,6 +862,7 @@ impl World {
             node,
             state,
             gui_log,
+            durability,
             watch: std::sync::Mutex::new(None),
         };
         let gui = world.gui.as_mut().expect("the gui just spawned");
@@ -933,7 +979,7 @@ impl World {
     /// waits for can only be the new attach's.
     pub fn start_broker(&mut self) {
         let _ = std::fs::remove_file(&self.broker_sock);
-        let broker = Broker::open_guarded(&self.broker_log, SECRET.to_vec())
+        let broker = Broker::open_guarded_with(&self.broker_log, SECRET.to_vec(), self.durability)
             .expect("reopen the guarded broker");
         let handle = broker
             .serve(&self.broker_sock)
@@ -1266,7 +1312,7 @@ pub type Record = (u64, u64, String, Vec<u8>);
 /// answer each one's `(offset, deduped)` in that order — with the acks read
 /// BEHIND the sends (astream's pipelined publish), never one round trip each.
 ///
-/// WHY. Every world's broker is `open_guarded`, which is `Durability::Strict`:
+/// WHY. Every test world's broker is `open_guarded`, which is `Durability::Strict`:
 /// an ack is an fsync, and a test that seeds a backlog one blocking `publish`
 /// at a time pays one fsync per record: `x2`'s 560 fillers took 5.9 s of its
 /// 7.2 s alone (10.5 ms a record), and the world suite seeds 2,806 records that
@@ -1345,6 +1391,71 @@ pub fn bridge_holds(w: &World, sid: &str, topic: &str) -> Option<()> {
         .lines()
         .any(|l| l.split(' ').next() == Some(topic))
         .then_some(())
+}
+
+/// How many push-lane watches aterm counts on `sid` — `who`'s `watchers=` —
+/// or `None` while `who` does not answer it, so a wait polls on. aterm
+/// registers a watch only after seeding it at the session's timeline high, and
+/// queues its `sub` ack in the same wake, ahead of every frame the watch
+/// drains (aterm-gui `subscribe.rs`). So `>= 1` says every record made from
+/// now on is above the watch's watermark, and the ack is ordered before every
+/// frame of any later wake.
+pub fn watchers(w: &World, sid: &str) -> Option<u64> {
+    let reply = w.verb("who");
+    if !reply.ok() {
+        return None;
+    }
+    reply
+        .rows()
+        .iter()
+        .find(|row| row.split_whitespace().nth(1) == Some(sid))?
+        .split_whitespace()
+        .find_map(|t| t.strip_prefix("watchers="))?
+        .parse()
+        .ok()
+}
+
+/// The endpoint's debug-only PUSH HOLDS, armed by `$ATERM_TEST_PUSH_HOLD`
+/// (aterm-gui `subscribe.rs`, `push_held`). While a file named for a step
+/// stands in the directory, the push loop skips that step and keeps its
+/// cursor, and the first wake after [`Hold::off`] resumes from it. The steps:
+/// `adopt` (watch a session the store lists), `sessions` (announce it on the
+/// roster) and `timeline` (drain a watch's timeline — read under the lock
+/// each record is appended under, so a record made after [`Hold::on`] returns
+/// is withheld until [`Hold::off`], whatever the push loop was doing, except a
+/// closing session's final pass, and what the ring evicted meanwhile comes
+/// back as a `GAP`). A held membership state is one aterm reaches by itself;
+/// the hold chooses only how long it lasts. The `timeline` hold withholds that
+/// stream alone, so a test may rely on the timeline's own order and the `GAP`
+/// count, not on order across streams.
+pub struct Hold(aterm_tempfile::TempDir);
+
+impl Hold {
+    /// An exclusively created hold directory for the test `tag`.
+    pub fn new(tag: &str) -> Self {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix(&format!("atl-{tag}-hold-"))
+            .tempdir()
+            .expect("exclusive hold directory");
+        Hold(dir)
+    }
+
+    /// The value of `$ATERM_TEST_PUSH_HOLD` that arms it in aterm.
+    pub fn env(&self) -> String {
+        self.0.path().to_string_lossy().into_owned()
+    }
+
+    /// Hold `step`.
+    pub fn on(&self, step: &str) {
+        std::fs::write(self.0.path().join(step), b"")
+            .unwrap_or_else(|e| panic!("hold {step}: {e}"));
+    }
+
+    /// Release `step`.
+    pub fn off(&self, step: &str) {
+        std::fs::remove_file(self.0.path().join(step))
+            .unwrap_or_else(|e| panic!("release {step}: {e}"));
+    }
 }
 
 /// The session's presence row on the bus, as its body.
@@ -1530,6 +1641,8 @@ pub struct Fleet {
     next: u32,
     /// The read connection every polled broker read shares ([`Fleet::read`]).
     watch: std::sync::Mutex<Option<aterm_link::transport::Conn>>,
+    /// Exclusive scratch ownership, dropped after the broker and read connection.
+    scratch: Option<aterm_tempfile::TempDir>,
 }
 
 impl Drop for Fleet {
@@ -1542,18 +1655,23 @@ impl Drop for Fleet {
         // end-to-end test whose evidence deletes itself is a test nobody can
         // diagnose; this is the one escape hatch, and it is off by default so a
         // green run leaves nothing.
-        if std::env::var_os("ATERM_LINK_KEEP").is_none() {
-            let _ = std::fs::remove_dir_all(&self.tmp);
+        if std::env::var_os("ATERM_LINK_KEEP").is_some()
+            && let Some(scratch) = self.scratch.take()
+        {
+            let _ = scratch.keep();
         }
     }
 }
 
 impl Fleet {
-    /// Boot the broker. `tag` keeps parallel tests off each other's paths.
-    pub fn boot(tag: &str) -> Self {
-        let tmp = PathBuf::from(format!("/tmp/a5-{tag}{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).expect("scratch");
+    /// Boot the broker under exclusive scratch ownership. The short fixed prefix
+    /// keeps every node's control socket below Unix sockaddr path limits.
+    pub fn boot(_tag: &str) -> Self {
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("a5-")
+            .tempdir_in("/tmp")
+            .expect("exclusive fleet scratch");
+        let tmp = scratch.path().to_path_buf();
         // A FIXED KEY, not a random one: the test is about the wire being
         // sealed, and a key nobody can print is a test nobody can debug. It is
         // written in the same 64-hex shape `asb --key-file` reads, because one
@@ -1596,6 +1714,7 @@ impl Fleet {
             key,
             next: 0,
             watch: std::sync::Mutex::new(None),
+            scratch: Some(scratch),
         }
     }
 

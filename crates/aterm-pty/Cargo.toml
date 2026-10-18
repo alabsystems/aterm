@@ -9,56 +9,39 @@ repository.workspace = true
 description = "aterm's single PTY spawn + IO seam (ATERM_DESIGN WS-G): all raw libc forkpty/read/write/ioctl contained in one auditable place."
 
 [features]
-default = []
-# TRUST_NATIVE_TLA Phase 2: compile the source↔spec `#[refines]`/`#[spec_unmodeled]`
-# anchors binding `write_all` (→ external `WriteAll.tla`) and the fork→exec child
-# seam (→ `ForkExec.tla`) to those specs. OFF by default (byte-identical production
-# seam, no `aterm-spec`); the workspace `spec_xref_closure` gate
-# (aterm-gui's test build) enables it to COLLECT the anchors cross-crate.
-spec-anchors = ["dep:aterm-spec"]
-# Development seams in an optimized build (`aterm_types::dev_seam!`: the
-# `ATERM_PTY_IDLE_POLL_US` sweep, Windows' `ATERM_TRACE_BOOST`). Debug builds compile
-# them anyway; the release cutter never enables this — aterm-release's buildplan
-# pins it.
+# Development seams (`aterm_types::dev_seam!`: `ATERM_PTY_IDLE_POLL_US`, Windows'
+# `ATERM_TRACE_BOOST`) in an optimized build; debug builds always have them. Releases
+# never enable it.
 dev-seams = []
 
 [dependencies]
 aterm-cap = { workspace = true }
 aterm-sandbox = { workspace = true }
-# Canonical PTY env-sanitization deny-list (`aterm_types::domain::is_ai_env_var`),
-# applied in `spawn_shell_with_pid` so AI-tool / containment env vars don't leak
-# into child shells. Used PARENT-side (before forkpty), so it adds no child-side
-# allocation. Default-feature only (no serde/winit) — stays a lean leaf dep.
+# `domain::is_ai_env_key`: the env deny-list applied parent-side before the fork.
 aterm-types = { workspace = true }
-# Optional: only pulled in by the off-by-default `spec-anchors` feature.
-aterm-spec = { workspace = true, optional = true }
+# The anchor attributes' registry (std-only): `#[cfg_attr(any(test, debug_assertions),
+# aterm_spec_anchor::refines(…))]` expands in every test and debug build; release strips it.
+aterm-spec-anchor = { workspace = true }
 
-# POSIX-only: the forkpty/execve seam (src/unix.rs). The Windows backend
-# (src/windows/) is direct kernel32 `extern "system"` FFI — no libc.
+# The Windows backend calls kernel32 directly and needs no libc.
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
-# The child's inheritance strip (`spawnfd::InheritStrip`): the one copy of it,
-# beside the workspace's other descriptor primitives. Dependency-free.
+# The child's inheritance strip (`spawnfd::InheritStrip`).
 aterm-uds = { workspace = true }
 
-# Test-only: the pty tests mint a root `Authority` (unix.rs, windows/mod.rs,
-# tests/windows_smoke.rs). `launcher-mint` makes the sealed
-# `aterm_cap::Authority::root_authority()` nameable for this crate's OWN test build
-# only — the production spawn seam never mints, it receives `Cap`s by argument.
+# Tests mint a root `Authority`; `launcher-mint` makes it nameable in this crate's test
+# build only. The production seam receives its `Cap`s by argument.
 [dev-dependencies]
 aterm-cap = { workspace = true, features = ["launcher-mint"] }
-
-# These back Unix-only tests (Seatbelt wrap, forkpty conformance); the Windows
-# test lane is tests/windows_smoke.rs + the pure cmdline/shell unit tests.
-[target.'cfg(unix)'.dev-dependencies]
-# Test-only: lock this seam's inlined SANDBOX_EXEC_PATH against the canonical one
-# in the policy crate, and reuse the network-deny profile in the OS-sandbox-wrap
-# enforcement test. NOT a build dependency of the lean seam.
-aterm-containment = { workspace = true }
-# Test-only: Tier-1 `WriteAll.tla` conformance (`tests/conformance_writeall.rs`)
-# drives the real `write_all` drain loop and validates the offset trajectory.
+# `aterm_spec::host::could_not_run` (a host that cannot run a test, the Windows smoke
+# included) and `aterm_spec::wait::within`, the hang detector for must-happen waits.
 aterm-spec = { workspace = true }
-aterm-spec-models = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+# Exclusive ownership of shell resolver fixture directories.
+aterm-tempfile = { workspace = true }
+# The sandbox-wrap enforcement tests reuse the policy crate's base profile.
+aterm-containment = { workspace = true }
 
 [lints]
 workspace = true

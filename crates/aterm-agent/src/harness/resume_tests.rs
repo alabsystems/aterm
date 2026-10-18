@@ -58,6 +58,7 @@ fn line_of(dir: &ClaudeDir, pid: u32, started: Option<u64>, argv: &[String]) -> 
             offset_at: &offset,
         },
         None,
+        None,
     )
     .and_then(|facts| facts.resume)
 }
@@ -137,6 +138,7 @@ fn two_records_in_one_directory_each_pid_resumes_its_own_conversation() {
             now: 0,
             offset_at: &offset,
         },
+        None,
         None,
     )
     .expect("the footer reads the record");
@@ -270,204 +272,149 @@ fn a_named_resume_line_is_kept_whole_bare_or_not_at_all() {
     }
 }
 
-/// A Codex's thread.
-const THREAD: &str = "019a0b1c-2d3e-7f40-8a5b-6c7d8e9f0a1b";
-
-/// A CODEX'S LINE ([`codex_command`]) is `codex resume <kept flags>
-/// <thread>`, each word quoted as Claude Code's line quotes one, and steps
-/// down as Claude Code's does ([`shorter`]): its approval and sandbox flags
-/// alone ([`mode_of`]), then `codex resume <thread>` ([`bare_of`]). A word
-/// that needs quotes reads back whole. NEGATIVE CONTROLS: a thread that is
-/// not one, and a launch the rewrite refuses, give no line; a line that is
-/// all permission mode steps straight to its bare form; text that is not
-/// exactly such a line has no shorter form.
+/// A SHORTER FORM NEVER DROPS THE CLAUDE HOME IT CARRIES (ATERM-KI-1015-1
+/// LC-4): a told line carries the home its agent ran under in front of it
+/// ([`with_env`]: plain where it can be, quoted otherwise), and every form a
+/// tight budget steps down to — its permission mode alone, then the
+/// conversation alone — keeps it, as [`never_cut`] keeps the whole clause or
+/// none. Before, the permission form was none (its first word not `claude`)
+/// and the bare form dropped the home: a line that resumes nothing under
+/// the tab's shell's home. NEGATIVE CONTROLS: a line with no home gives the
+/// forms it always did; a bad name or a control character gives no line.
 #[test]
-fn a_codex_line_steps_down_to_its_mode_and_its_bare_form() {
-    let launch = argv(&[
-        "/opt/codex",
-        "-m",
-        "gpt-5-codex",
-        "-c",
-        "model_reasoning_effort=\"high\"",
-        "-s",
-        "read-only",
-        "-a",
-        "never",
-        "hello",
-    ]);
-    let line = codex_command(&launch, THREAD, None).expect("a line");
-    assert_eq!(
-        line,
-        format!(
-            "codex resume -m gpt-5-codex -c 'model_reasoning_effort=\"high\"' -s read-only -a \
-             never {THREAD}"
-        )
-    );
-    let mode = format!("codex resume -s read-only -a never {THREAD}");
-    let bare = format!("codex resume {THREAD}");
-    assert_eq!(mode_of(&line), Some(mode.clone()));
-    assert_eq!(bare_of(&line), Some(bare.clone()));
-    assert_eq!(shorter(&line), [mode, bare.clone()]);
-    let bypass = codex_command(
-        &argv(&["codex", "--dangerously-bypass-approvals-and-sandbox"]),
-        THREAD,
-        None,
+fn a_shorter_form_never_drops_the_home_it_carries() {
+    let line = command(
+        &argv(&[
+            "claude",
+            "--permission-mode",
+            "plan",
+            "--model",
+            "claude-opus-5-5",
+        ]),
+        OURS,
     )
     .expect("a line");
-    assert_eq!(
-        mode_of(&bypass).as_ref(),
-        Some(&bypass),
-        "its mode is all of it"
-    );
-    assert_eq!(shorter(&bypass), std::slice::from_ref(&bare));
-    assert_eq!(shorter(&bare), Vec::<String>::new());
-    // Negative controls.
-    assert_eq!(codex_command(&argv(&["codex"]), "not-a-thread", None), None);
-    assert_eq!(
-        codex_command(&argv(&["codex", "--worktree"]), THREAD, None),
-        None
-    );
-    assert_eq!(
-        codex_command(&argv(&["codex", "--unknown"]), THREAD, None),
-        None
-    );
-    for text in [
-        format!("codex resume {THREAD} trailing"),
-        format!("codex resume --nope {THREAD}"),
-        format!("codex fork {THREAD}"),
+    let plain_forms = shorter(&line);
+    assert_eq!(plain_forms.len(), 2, "{plain_forms:?}");
+    for (env, head) in [
+        (vec![("HOME", "/o")], "HOME=/o "),
+        (vec![("HOME", "/o w")], "HOME='/o w' "),
+        (
+            vec![(crate::harness::accounts::HOME_ENV, "/a b/.claude")],
+            "CLAUDE_CONFIG_DIR='/a b/.claude' ",
+        ),
     ] {
+        let homed = with_env(&env, &line).expect("a homed line");
+        assert_eq!(homed, format!("{head}{line}"));
         assert_eq!(
-            (bare_of(&text), shorter(&text)),
-            (None, Vec::new()),
-            "{text}"
+            shorter(&homed),
+            plain_forms
+                .iter()
+                .map(|form| format!("{head}{form}"))
+                .collect::<Vec<_>>(),
+            "{homed}"
         );
+        assert_eq!(
+            bare_of(&homed),
+            Some(format!("{head}claude --resume {OURS}"))
+        );
+        // Whatever the budget, the clause is whole, home and all, or gone.
+        let text = format!("Claude Code froze{THEN_RESUME_WITH}{homed}.");
+        for cap in (20..text.len() + 10).step_by(7) {
+            let out = never_cut(&text, |t| t.chars().take(cap).collect());
+            assert!(
+                !out.contains(" --resume ") || out.contains(head),
+                "{cap}: {out}"
+            );
+        }
     }
+    // NEGATIVE CONTROLS.
+    assert_eq!(with_env(&[], &line).as_deref(), Some(line.as_str()));
+    assert_eq!(with_env(&[("home", "/o")], &line), None);
+    assert_eq!(with_env(&[("HOME", "/o\nx")], &line), None);
 }
 
-/// A CODEX'S LINE A REASON NAMES IS NEVER CUT ([`never_cut`]), as Claude
-/// Code's is not: whole, else its permission mode alone, else `codex resume
-/// <thread>`, else its clause dropped. A flag's value that is itself a
-/// thread id ends no line before the thread does. NEGATIVE CONTROL: the
-/// renderer alone names the command and cuts its thread away.
+/// THE FOOTER'S RESUME LINE CARRIES THE CLAUDE HOME ITS PROCESS RUNS UNDER
+/// (ATERM-KI-1015-1 LC-4; [`crate::harness::footer::read_pid`], [`home_env`]):
+/// the frozen-program remedy and the menu-bar row tell the line every other
+/// surface tells — `HOME=<it>` for a process whose records are another
+/// `HOME`'s `.claude`, its `CLAUDE_CONFIG_DIR` where its environment named
+/// one. NEGATIVE CONTROL: records under the user's own `.claude` carry
+/// nothing, and a read with no user home known adds nothing.
 #[test]
-fn a_named_codex_line_is_kept_whole_bare_or_not_at_all() {
-    let cap = |n: usize| {
-        move |s: &str| {
-            if s.len() <= n {
-                s.to_string()
-            } else {
-                format!("{}…", &s[..n - '…'.len_utf8()])
-            }
+fn the_footers_resume_line_carries_the_home_its_process_runs_under() {
+    use crate::harness::footer;
+    let root = ClaudeDir::new("footer-home");
+    let other = root.0.path().join("other");
+    let claude = other.join(".claude");
+    std::fs::create_dir_all(claude.join("sessions")).expect("sessions");
+    let (pid, started) = (46_977, 1_790_194_435);
+    std::fs::write(
+        claude.join(format!("sessions/{pid}.json")),
+        format!(
+            r#"{{"pid":{pid},"sessionId":"{OURS}","cwd":"/w","startedAt":{},"procStart":"{}","version":"2.1.281","kind":"interactive","entrypoint":"cli","status":"idle","statusUpdatedAt":1}}"#,
+            started * 1000,
+            footer::lstart_utc(started),
+        ),
+    )
+    .expect("record");
+    let read = |user_home: Option<&Path>, config: Option<&str>| {
+        let offset = |_: Option<&str>, _: i64| None;
+        footer::read_pid(
+            &claude,
+            pid,
+            Some(started),
+            |_| {
+                (
+                    footer::LaunchFacts {
+                        config: config.map(str::to_string),
+                        ..footer::LaunchFacts::default()
+                    },
+                    argv(&["claude"]),
+                )
+            },
+            &mut footer::TailCache::default(),
+            &mut footer::FooterCache::default(),
+            &footer::ReadClock {
+                read_at: std::time::SystemTime::now(),
+                now: 0,
+                offset_at: &offset,
+            },
+            None,
+            user_home,
+        )
+        .and_then(|facts| facts.resume)
+    };
+    let bare = format!("claude --resume {OURS}");
+    // A value as the line writes it: plain, or in single quotes.
+    let word = |value: &str| {
+        if value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'/' | b'-'))
+        {
+            value.to_string()
+        } else {
+            format!("'{value}'")
         }
     };
-    let launch = argv(&[
-        "codex",
-        "--profile",
-        "0a0b0c0d-1111-4222-8333-444455556666",
-        "-s",
-        "read-only",
-        "-c",
-        "model_reasoning_effort=high",
-    ]);
-    let line = codex_command(&launch, THREAD, None).expect("a line");
-    let mode = format!("codex resume -s read-only {THREAD}");
-    let bare = format!("codex resume {THREAD}");
-    let text =
-        format!("memory critical: restart it{THEN_RESUME_WITH}{line}: Memory usage critical");
-    let head = "memory critical: restart it, then resume with ".len();
-    assert_eq!(never_cut(&text, cap(500)), text);
-    let out = never_cut(&text, cap(text.len() - 5));
-    assert!(out.contains(&line), "{out}");
-    let out = never_cut(&text, cap(head + mode.len() + 3));
-    assert!(out.contains(&mode), "{out}");
-    let out = never_cut(&text, cap(head + bare.len() + 3));
-    assert!(out.contains(&bare) && !out.contains("read-only"), "{out}");
-    let out = never_cut(&text, cap(40));
-    assert!(
-        !out.contains("codex") && !out.contains("resume with"),
-        "{out}"
-    );
-    assert!(
-        out.starts_with("memory critical: restart it: Memory"),
-        "{out}"
-    );
-    // Negative control: cut by the renderer alone, the command is named and
-    // its thread is not.
-    let cut = cap(head + bare.len() + 3)(&text);
-    assert!(
-        cut.contains("resume with codex resume") && !cut.contains(THREAD),
-        "{cut}"
-    );
-}
-
-/// A CODEX STARTED UNDER `CODEX_HOME=<dir>` IS TOLD A LINE THAT CARRIES IT
-/// ([`codex_command`]), as its relaunch line does: `CODEX_HOME=<dir> codex
-/// resume <kept flags> <thread>`, the value quoted where a shell needs it and
-/// the name never (a quoted `NAME=` is a command). Its shorter forms keep it
-/// ([`shorter`]: the permission mode alone, then the bare form, each still
-/// behind the home), and a reason names it whole or not at all
-/// ([`never_cut`]). NEGATIVE CONTROLS: a Codex started with none is told no
-/// home; a home with a control character gives no line; a line whose home is
-/// not this one's spelling is no line of [`codex_command`]'s.
-#[test]
-fn a_codex_line_carries_the_codex_home_its_tui_was_started_with() {
-    let launch = argv(&["codex", "-m", "gpt-5-codex", "-s", "read-only"]);
-    let home = "/Users//x/my codex";
-    let line = codex_command(&launch, THREAD, Some(home)).expect("a line");
+    let homedir = other.to_string_lossy().into_owned();
     assert_eq!(
-        line,
-        format!("CODEX_HOME='/Users//x/my codex' codex resume -m gpt-5-codex -s read-only {THREAD}")
+        read(Some(Path::new("/u/me")), None),
+        Some(format!("HOME={} {bare}", word(&homedir))),
+        "another HOME's records"
     );
-    // Read back by a shell's rules: one assignment, then the command.
-    let words = crate::harness::upgrade_drive::last_command(&line);
-    assert_eq!(words[0], format!("CODEX_HOME={home}"));
-    assert_eq!(words[1..3], ["codex", "resume"]);
-    let mode = format!("CODEX_HOME='/Users//x/my codex' codex resume -s read-only {THREAD}");
-    let bare = format!("CODEX_HOME='/Users//x/my codex' codex resume {THREAD}");
-    assert_eq!(mode_of(&line), Some(mode.clone()));
-    assert_eq!(bare_of(&line), Some(bare.clone()));
-    assert_eq!(shorter(&line), [mode.clone(), bare.clone()]);
-    // A plain path needs no quotes.
+    let config = claude.to_string_lossy().into_owned();
     assert_eq!(
-        codex_command(&argv(&["codex"]), THREAD, Some("/alt/home")),
-        Some(format!("CODEX_HOME=/alt/home codex resume {THREAD}"))
+        read(Some(Path::new("/u/me")), Some(&config)),
+        Some(format!("CLAUDE_CONFIG_DIR={} {bare}", word(&config))),
+        "its CLAUDE_CONFIG_DIR"
     );
-    // A reason keeps the line whole, steps it down behind its home, or drops
-    // the clause.
-    let text =
-        format!("memory critical: restart it{THEN_RESUME_WITH}{line}: Memory usage critical");
-    let head = "memory critical: restart it, then resume with ".len();
-    let cap = |n: usize| {
-        move |s: &str| {
-            if s.len() <= n {
-                s.to_string()
-            } else {
-                format!("{}…", &s[..n - '…'.len_utf8()])
-            }
-        }
-    };
-    assert_eq!(never_cut(&text, cap(500)), text);
-    let out = never_cut(&text, cap(head + mode.len() + 3));
-    assert!(out.contains(&mode), "{out}");
-    let out = never_cut(&text, cap(head + bare.len() + 3));
-    assert!(out.contains(&bare) && !out.contains("read-only"), "{out}");
-    let out = never_cut(&text, cap(head + 10));
-    assert!(
-        !out.contains("CODEX_HOME") && !out.contains("resume with"),
-        "{out}"
-    );
-    // Negative controls.
+    // NEGATIVE CONTROLS.
     assert_eq!(
-        codex_command(&launch, THREAD, None),
-        Some(format!("codex resume -m gpt-5-codex -s read-only {THREAD}"))
+        read(Some(&other), None),
+        Some(bare.clone()),
+        "the user's own"
     );
-    assert_eq!(codex_command(&launch, THREAD, Some("/a\nb")), None);
-    let respelled = line.replace(
-        "CODEX_HOME='/Users//x/my codex'",
-        "CODEX_HOME=\"/Users//x/my codex\"",
-    );
-    assert_eq!(
-        (bare_of(&respelled), shorter(&respelled)),
-        (None, Vec::new())
-    );
+    assert_eq!(read(None, None), Some(bare));
+    assert!(home_env(Path::new("/u/me"), None, Some(Path::new("/u/me/.claude"))).is_empty());
 }

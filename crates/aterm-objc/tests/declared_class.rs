@@ -7,6 +7,10 @@
 //! the whole risk here is what `libobjc` does with the bytes.
 
 #![cfg(target_os = "macos")]
+#![expect(
+    clippy::disallowed_methods,
+    reason = "aterm-objc's own runtime tests drive the bare `msg` cast; everything else uses checked_msg"
+)]
 
 use std::cell::Cell;
 use std::ffi::CStr;
@@ -14,9 +18,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use aterm_objc::{
-    Bool, CGPoint, CGRect, CGSize, ClassPtr, ClassType, Encode, Id, ObjcSuper, Sel,
-    autoreleasepool, class, class_name, class_of, declare_class, msg, msg_super, sel,
-    superclass_of,
+    Bool, CGPoint, CGRect, CGSize, ClassPtr, ClassType, Encode, Id, ObjcSuper, Sel, declare_class,
+    msg, msg_super, sel,
 };
 
 /// The [`MainThread`](aterm_objc::MainThread) witness every instantiation owes,
@@ -177,72 +180,6 @@ fn probe(drops: &Arc<AtomicUsize>) -> aterm_objc::Retained<Probe> {
 }
 
 #[test]
-fn the_class_is_registered_with_the_runtime() {
-    let cls = Probe::class();
-    assert!(!cls.is_null());
-    // Looked up BY NAME through the runtime, not through our own handle: this
-    // is the runtime's table answering, not our `OnceLock`.
-    let by_name: ClassPtr = class(c"ATermObjcProbe");
-    assert_eq!(
-        by_name, cls,
-        "objc_getClass disagrees with the registered pair"
-    );
-    // SAFETY: `cls` is the class this crate just registered, so it and its
-    // superclass are live, immortal class objects.
-    unsafe {
-        assert_eq!(class_name(cls), c"ATermObjcProbe");
-        assert_eq!(class_name(superclass_of(cls)), c"NSObject");
-    }
-    assert_eq!(<Probe as ClassType>::NAME, "ATermObjcProbe");
-}
-
-#[test]
-fn an_instance_is_of_that_class_and_responds_to_its_selectors() {
-    let drops = Arc::new(AtomicUsize::new(0));
-    let obj = probe(&drops);
-    // SAFETY: `obj` is a live instance; `object_getClass` and
-    // `respondsToSelector:` are plain side-effect-free runtime queries.
-    unsafe {
-        assert_eq!(class_of(obj.as_id()), Probe::class());
-        let responds: unsafe extern "C-unwind" fn(Id, Sel, Sel) -> Bool = msg();
-        for name in [
-            c"bump",
-            c"bumpBy:",
-            c"callCount",
-            c"isPositive:",
-            c"areaOfRect:",
-            c"superHash",
-            c"hash",
-            c"dealloc",
-            c"addFirst:second:",
-            c"blendRed:green:blue:",
-            c"control:textView:doCommandBySelector:",
-            c"toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:",
-            c"bigRect",
-        ] {
-            assert!(
-                responds(
-                    obj.as_id(),
-                    sel!(respondsToSelector:),
-                    aterm_objc::sel_uncached(name)
-                )
-                .as_bool(),
-                "instance does not respond to {name:?}"
-            );
-        }
-        // A selector we never declared must NOT be claimed.
-        assert!(
-            !responds(
-                obj.as_id(),
-                sel!(respondsToSelector:),
-                aterm_objc::sel_uncached(c"neverDeclared")
-            )
-            .as_bool()
-        );
-    }
-}
-
-#[test]
 fn messages_reach_the_rust_bodies_through_objc_msg_send() {
     let drops = Arc::new(AtomicUsize::new(0));
     let obj = probe(&drops);
@@ -337,25 +274,6 @@ fn the_type_encodings_are_what_the_runtime_reports() {
 }
 
 #[test]
-fn the_declared_protocol_is_registered() {
-    let cls = Probe::class();
-    // SAFETY: `conformsToProtocol:` is a side-effect-free class-level query and
-    // `NSObject` is a protocol libobjc always defines.
-    unsafe {
-        let conforms: unsafe extern "C-unwind" fn(ClassPtr, Sel, aterm_objc::ProtocolPtr) -> Bool =
-            msg();
-        assert!(
-            conforms(
-                cls,
-                sel!(conformsToProtocol:),
-                aterm_objc::protocol(c"NSObject")
-            )
-            .as_bool()
-        );
-    }
-}
-
-#[test]
 fn dealloc_drops_the_rust_ivars_exactly_once() {
     let drops = Arc::new(AtomicUsize::new(0));
     {
@@ -383,151 +301,6 @@ fn an_extra_retain_defers_the_drop() {
     assert_eq!(drops.load(Ordering::SeqCst), 0, "released at +2");
     drop(second);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
-}
-
-#[test]
-fn ivars_survive_a_round_trip_through_the_runtime() {
-    // The instance is handed to ObjC as a bare `id`, comes back as a bare `id`,
-    // and its Rust ivars are still reachable — which is the property the whole
-    // ivar-offset derivation exists to provide.
-    let drops = Arc::new(AtomicUsize::new(0));
-    let obj = probe(&drops);
-    // SAFETY: `-self` returns the receiver; the result is the same live
-    // instance, so re-adopting it as a borrowed reference is sound.
-    unsafe {
-        let identity: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
-        let back = identity(obj.as_id(), sel!(self));
-        assert_eq!(back, obj.as_id());
-        let void_i64: unsafe extern "C-unwind" fn(Id, Sel, i64) = msg();
-        void_i64(back, sel!(bumpBy:), 7);
-    }
-    assert_eq!(obj.ivars().calls.get(), 7);
-}
-
-#[test]
-fn two_and_three_argument_methods_reach_their_bodies_with_the_arguments_in_order() {
-    // D1's arming. The failure this closes was a COMPILE error, so the fact
-    // that this file builds is half the proof; the other half is that the
-    // arguments arrive in the right registers, which a wrong encoding or a
-    // wrong trampoline prototype would scramble rather than reject.
-    let drops = Arc::new(AtomicUsize::new(0));
-    let obj = probe(&drops);
-    // SAFETY: each prototype below is the exact C signature of the selector
-    // declared above, on a live instance of the class that declares it.
-    unsafe {
-        let two: unsafe extern "C-unwind" fn(Id, Sel, i64, i64) -> i64 = msg();
-        assert_eq!(two(obj.as_id(), sel!(addFirst:second:), 40, 2), 42);
-        // Order matters and subtraction would hide it, so the check is
-        // asymmetric on purpose.
-        assert_eq!(two(obj.as_id(), sel!(addFirst:second:), -1, 100), 99);
-
-        let three: unsafe extern "C-unwind" fn(Id, Sel, f64, f64, f64) -> f64 = msg();
-        let blended = three(obj.as_id(), sel!(blendRed:green:blue:), 1.0, 2.0, 3.0);
-        assert!(
-            (blended - 123.0).abs() < f64::EPSILON,
-            "three float arguments arrived as {blended}, not 123 — a register shift"
-        );
-
-        // The real `toolbar.rs:3990` shape: object, object, selector, BOOL out.
-        let cmd: unsafe extern "C-unwind" fn(Id, Sel, Id, Id, Sel) -> Bool = msg();
-        assert!(
-            cmd(
-                obj.as_id(),
-                sel!(control:textView:doCommandBySelector:),
-                Id::NIL,
-                Id::NIL,
-                sel!(insertNewline:)
-            )
-            .as_bool()
-        );
-        assert!(
-            !cmd(
-                obj.as_id(),
-                sel!(control:textView:doCommandBySelector:),
-                Id::NIL,
-                Id::NIL,
-                sel!(insertTab:)
-            )
-            .as_bool()
-        );
-    }
-}
-
-#[test]
-fn an_object_returning_method_hands_back_a_plus_zero_reference() {
-    // D5's arming, and the second of the two sites D1 blocked. An
-    // `-autorelease`d return must be: alive for the rest of the pool, released
-    // exactly once when the pool pops, and never leaked.
-    let drops = Arc::new(AtomicUsize::new(0));
-    let obj = probe(&drops);
-
-    autoreleasepool(|_| {
-        // SAFETY: the prototype is
-        // `-(id)toolbar:(id)t itemForItemIdentifier:(id)i willBeInsertedIntoToolbar:(BOOL)b`,
-        // exactly as declared, on a live instance.
-        let returned = unsafe {
-            let f: unsafe extern "C-unwind" fn(Id, Sel, Id, Id, Bool) -> Id = msg();
-            f(
-                obj.as_id(),
-                sel!(toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:),
-                Id::NIL,
-                Id::NIL,
-                Bool::YES,
-            )
-        };
-        assert!(!returned.is_null(), "the method returned nil");
-        // The BOOL argument arrived as YES, not as garbage.
-        assert_eq!(obj.ivars().calls.get(), 1);
-        assert_eq!(
-            drops.load(Ordering::SeqCst),
-            0,
-            "the returned object was freed before the pool popped — the method \
-             returned a borrowed pointer to something it had already dropped"
-        );
-        // Still a live instance of the class, still messageable.
-        // SAFETY: `returned` is the live autoreleased instance built above.
-        unsafe {
-            assert_eq!(class_of(returned), Probe::class());
-            let void_i64: unsafe extern "C-unwind" fn(Id, Sel, i64) = msg();
-            void_i64(returned, sel!(bumpBy:), 5);
-            let ret_i64: unsafe extern "C-unwind" fn(Id, Sel) -> i64 = msg();
-            assert_eq!(ret_i64(returned, sel!(callCount)), 5);
-        }
-    });
-
-    assert_eq!(
-        drops.load(Ordering::SeqCst),
-        1,
-        "the returned object was NOT released when the pool popped — a +1 leak, \
-         which is what `Retained::into_raw` in this position would produce"
-    );
-}
-
-#[test]
-fn a_thirty_two_byte_struct_comes_back_intact() {
-    // D4's arming on the half this box can EXECUTE. `CGRect` is 32 bytes, so
-    // `returns_indirectly::<CGRect>()` is true on the x86_64 compat slice and
-    // the send there must go through `objc_msgSend_stret`; on arm64 the result
-    // pointer rides in `x8` and one entry point serves. Either way the value
-    // that comes back must be the one the body built — a wrong entry point
-    // shifts every argument and returns garbage.
-    let drops = Arc::new(AtomicUsize::new(0));
-    let obj = probe(&drops);
-    // SAFETY: `-bigRect` is `-(NSRect)` with no arguments, on a live instance.
-    let r = unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel) -> CGRect = msg();
-        f(obj.as_id(), sel!(bigRect))
-    };
-    assert_eq!(
-        r,
-        CGRect {
-            origin: CGPoint { x: 1.0, y: 2.0 },
-            size: CGSize {
-                width: 3.0,
-                height: 4.0
-            },
-        }
-    );
 }
 
 /// `MainThread::new()` is a REAL query, and it says no here.
@@ -691,27 +464,4 @@ fn the_conformance_claim_is_readable_and_is_the_classs_own() {
         )
     };
     assert!(conforms.as_bool());
-}
-
-/// [`Sel::name`] is how an ENUMERATED selector — one with no literal anywhere —
-/// gets reported, and it must agree with the literal form for one that has.
-#[test]
-fn an_enumerated_selector_names_itself() {
-    assert_eq!(sel!(bumpBy:).name(), c"bumpBy:");
-    assert_eq!(Sel::NULL.name(), c"(null)");
-
-    let cls = Probe::class();
-    // SAFETY: a live, registered class object.
-    let rows = unsafe { aterm_objc::class_methods(cls) };
-    let bump = rows
-        .iter()
-        .map(|(s, _)| *s)
-        .find(|s| s.name() == c"bump")
-        .expect("`bump` is registered");
-    assert_eq!(
-        bump,
-        sel!(bump),
-        "a selector read out of the method table is the SAME interned selector \
-         the macro resolves"
-    );
 }

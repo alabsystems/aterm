@@ -9,7 +9,8 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::{iter, slice};
 
-use x11rb::connection::Connection;
+use aterm_x11::proto::xproto::cw;
+use aterm_x11::proto::ValueList;
 
 use crate::platform_impl::PlatformCustomCursorSource;
 use crate::window::CursorIcon;
@@ -89,12 +90,11 @@ impl XConnection {
     }
 
     fn update_cursor(&self, window: xproto::Window, cursor: ffi::Cursor) -> Result<(), X11Error> {
-        self.xcb_connection()
-            .change_window_attributes(
-                window,
-                &xproto::ChangeWindowAttributesAux::new().cursor(cursor as xproto::Cursor),
-            )?
-            .ignore_error();
+        self.send_void(xproto::change_window_attributes(
+            window,
+            &ValueList::new().set(cw::CURSOR, cursor as xproto::Cursor),
+        ))?
+        .ignore_error();
 
         self.xcb_connection().flush()?;
         Ok(())

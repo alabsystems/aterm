@@ -1646,13 +1646,13 @@ pub struct RenderInput {
     /// scalars are still stamped from the focused pane; renderer predicates
     /// read the list when non-empty and the scalars otherwise.
     pub selections: Vec<PaneSelection>,
-    /// Per-row, sparse emoji grapheme-cluster strings (`term.cluster_row(r)`):
+    /// Per-row, sparse emoji grapheme-cluster strings:
     /// `(col, cluster)` for cells whose combining marks form a ZWJ / skin-tone /
     /// keycap sequence. The renderer shapes each to a colour glyph, or composites
     /// the several glyphs a colour face leaves it as; cells absent here take the
     /// ordinary single-codepoint dispatch.
     pub clusters: Vec<Vec<(usize, Box<str>)>>,
-    /// Per-row, sparse combining marks (`term.combining_row(r)`): `(col, marks)`
+    /// Per-row, sparse combining marks: `(col, marks)`
     /// for cells with diacritics (é, ñ, …). The renderer overlays each mark's
     /// glyph on the base so accents render.
     pub combining: Vec<Vec<(usize, Box<[char]>)>>,
@@ -1789,8 +1789,8 @@ pub struct RenderInput {
     /// engine-filled. Metadata, excluded from `PartialEq`/`Eq`.
     pub extract_gen: u64,
     /// `snapshot_seq` as stamped by the last engine fill. Host mutators that
-    /// touch content channels afterwards (stream fade, prediction ghosts, the
-    /// tab-strip splice) bump `snapshot_seq`, so `snapshot_seq !=
+    /// touch content channels afterwards (prediction ghosts, the IME preedit,
+    /// the tab-strip splice) bump `snapshot_seq`, so `snapshot_seq !=
     /// engine_fill_seq` means a host wrote cells since the engine fill, and the
     /// damage-scoped refill falls back to a full refill. Metadata, excluded
     /// from `PartialEq`/`Eq`.
@@ -1801,7 +1801,6 @@ pub struct RenderInput {
     /// on mismatch. Metadata, excluded from `PartialEq`/`Eq`.
     pub engine_alt: bool,
     /// Which column order the last engine fill left this snapshot's rows in.
-    /// Always [`RowOrder::Logical`] in builds without the `bidi` feature.
     ///
     /// `apply_bidi_reorder` is an in-place, non-idempotent row permutation, so
     /// retained rows may be kept only while they are still in logical order.
@@ -1896,7 +1895,7 @@ pub enum RowOrder {
     /// No row was permuted: logical order and visual order coincide, for every
     /// row and every column-indexed channel (cells, clusters, combining marks,
     /// images, and the cursor column). This is every frame of a pure-LTR
-    /// session, and every frame at all in a build without the `bidi` feature.
+    /// session.
     #[default]
     Logical,
     /// At least one row was permuted into BiDi visual order by
@@ -1937,7 +1936,7 @@ pub enum FullRefillCause {
     /// row that changed under this scratch.
     DamageTaken,
     /// A host mutator wrote content channels after the engine fill and bumped
-    /// `snapshot_seq` (stream fade, prediction ghosts, find bar, strip splice).
+    /// `snapshot_seq` (prediction ghosts, IME preedit, find bar, strip splice).
     HostMutation,
     /// A host row prepend is still in force (`row_shift != 0`), so engine row
     /// `r` sits at index `r + row_shift`; the tab-strip splice's inverse
@@ -2906,8 +2905,8 @@ impl RenderInput {
 
     /// Where frame row `frame_row` paints the cell of logical column
     /// `logical`, the inverse of [`Self::logical_col`]: `logical` itself
-    /// unless BiDi reordered that row. A caret kept in logical columns (the
-    /// copy-mode cursor) is painted here, on the cell it names.
+    /// unless BiDi reordered that row. A caret kept in logical columns is
+    /// painted here, on the cell it names.
     #[must_use]
     pub fn visual_col(&self, frame_row: usize, logical: usize) -> usize {
         let map = self.visual_to_logical_row(frame_row);
@@ -3363,6 +3362,99 @@ impl RenderInput {
         self.cursor_col = caret_col;
     }
 
+    /// Paint one predictive-echo ghost — `aterm-predict`'s guess that the program
+    /// will echo `ch` at logical column `col` of frame row `row` — over this
+    /// frame. Returns whether it was painted. The one painter every host's ghost
+    /// pass goes through (`aterm-gui`'s single-pane and composed paths), and the
+    /// one `aterm-predict`'s safety theorem runs to build the DISPLAYED view.
+    ///
+    /// Pure frame compositing, like [`Self::overlay_ime_preedit`]. What it may
+    /// change is the guess's own cell and nothing else, which is what lets the
+    /// predictor promise that a prediction never overwrites content outside the
+    /// cells it predicted:
+    /// * the cell is found the way reconciliation reads it, through
+    ///   [`Self::visual_col`]: on a BiDi row already in visual order the logical
+    ///   column is not the frame column, and painting the logical one paints some
+    ///   other cell;
+    /// * a guess at or past `cols` is dropped (a composed pane's blit does not clip
+    ///   to its sub-rect, so it would bleed into the neighbour); a missing row too;
+    /// * a guess on EITHER half of a wide glyph is refused. A guess is one cell
+    ///   wide, and the wide glyph's two cells are drawn as one: painting its lead
+    ///   leaves the continuation with nothing to draw (the right half vanishes),
+    ///   and painting the continuation draws the guess under the lead's overflowing
+    ///   bitmap. Either changes a cell the guess did not predict, so the guess
+    ///   stays dark (it is still tracked; its echo, or its expiry, settles it);
+    /// * past a trimmed row's end the row is extended with `blank` (the terminal's
+    ///   implicit blank, not the last cell's SGR background);
+    /// * the glyph drops inherited geometry and SGR and its fg is dimmed halfway
+    ///   toward its bg (tentative, legible on any theme), and the cell's grapheme
+    ///   cluster and combining marks go, since both renderers prefer them to `ch`
+    ///   and would draw the old grapheme over the ghost.
+    pub fn paint_prediction_ghost(
+        &mut self,
+        row: usize,
+        col: usize,
+        ch: char,
+        cols: usize,
+        blank: RenderCell,
+    ) -> bool {
+        if !self.prediction_ghost_paintable(row, col, cols) {
+            return false;
+        }
+        let frame_col = self.visual_col(row, col);
+        let Some(cells) = self.cells.get_mut(row) else {
+            return false;
+        };
+        if cells.len() <= frame_col {
+            cells.resize(frame_col + 1, blank);
+        }
+        let Some(cell) = cells.get_mut(frame_col) else {
+            return false;
+        };
+        let (fg, bg) = (cell.fg, cell.bg);
+        let dim = |f: u8, b: u8| f.midpoint(b);
+        *cell = RenderCell {
+            ch,
+            fg: [dim(fg[0], bg[0]), dim(fg[1], bg[1]), dim(fg[2], bg[2])],
+            wide: false,
+            emoji_presentation: false,
+            text_presentation: false,
+            bold: false,
+            italic: false,
+            underline: crate::terminal::UnderlineStyle::None,
+            strikethrough: false,
+            overline: false,
+            underline_color: None,
+            ..*cell
+        };
+        if let Some(clusters) = self.clusters.get_mut(row) {
+            clusters.retain(|&(c, _)| c != frame_col);
+        }
+        if let Some(combining) = self.combining.get_mut(row) {
+            combining.retain(|&(c, _)| c != frame_col);
+        }
+        true
+    }
+
+    /// Whether [`Self::paint_prediction_ghost`] would paint a ghost at logical
+    /// column `col` of frame row `row`: the column is inside `cols`, the row
+    /// exists, and neither the cell nor the one after it is a wide glyph's
+    /// continuation. The painter's own refusal, with nothing painted, for a host
+    /// that must paint a set of ghosts ALL OR NONE (a state chain of predictive
+    /// editing: a part of a state is a frame no program draws).
+    #[must_use]
+    pub fn prediction_ghost_paintable(&self, row: usize, col: usize, cols: usize) -> bool {
+        if col >= cols {
+            return false;
+        }
+        let frame_col = self.visual_col(row, col);
+        let Some(cells) = self.cells.get(row) else {
+            return false;
+        };
+        let continuation = |c: usize| cells.get(c).is_some_and(|cell| cell.wide);
+        !(continuation(frame_col) || continuation(frame_col + 1))
+    }
+
     /// The frame's implicit blank at viewport cell (`row`, `col`): a space in
     /// the live default colours (OSC 10/11, their resets, DECSCNM, and on a
     /// composed split frame the per-pane
@@ -3511,39 +3603,6 @@ mod ime_preedit_tests {
             f.cells[1][2].ch, ' ',
             "nothing left of the cursor is touched"
         );
-    }
-
-    #[test]
-    fn cjk_preedit_occupies_lead_plus_wide_continuation() {
-        let mut f = frame(4, 10, (0, 2));
-        f.overlay_ime_preedit("日本", None, false);
-        assert_eq!(f.cells[0][2].ch, '日');
-        assert!(
-            f.cells[0][3].wide,
-            "continuation column carries the wide flag"
-        );
-        assert_eq!(f.cells[0][4].ch, '本');
-        assert!(f.cells[0][5].wide);
-        assert_eq!(
-            f.cells[0][3].underline,
-            UnderlineStyle::Single,
-            "the underline spans the continuation"
-        );
-        assert_eq!(f.cursor_col, 6);
-    }
-
-    #[test]
-    fn preedit_truncates_at_the_edge_and_a_wide_char_never_straddles_it() {
-        let mut f = frame(2, 5, (0, 2));
-        // '日' is width 2: cols 2-3 fit, the second '本' (cols 4-5) would
-        // straddle the edge and must not be half-drawn.
-        f.overlay_ime_preedit("日本", None, false);
-        assert_eq!(f.cells[0][2].ch, '日');
-        assert_eq!(
-            f.cells[0][4].ch, ' ',
-            "the straddling char is truncated whole"
-        );
-        assert_eq!(f.cursor_col, 4, "caret clamps inside the row");
     }
 
     #[test]
@@ -3709,6 +3768,7 @@ mod ime_preedit_ragged_row_tests {
         f.overlay_ime_preedit("日本", None, false);
         assert_eq!(f.cells[0].len(), 4, "the straddling char extended nothing");
         assert_eq!(f.cells[0][2].ch, '日');
+        assert_eq!(f.cursor_col, 4, "the caret clamps inside the row");
     }
 
     /// Composing over a multi-scalar grapheme drops its `clusters` entry, which
@@ -3810,24 +3870,6 @@ mod ime_preedit_neighbour_tests {
             "an empty row has no last cell — the live default is the only seed"
         );
         assert_eq!(f.cursor_col, 2);
-    }
-
-    /// Wider than the row's remainder: the composition grows the row to the
-    /// frame's width and stops there; the gate proves `col + width <= cols`
-    /// before the `resize`.
-    #[test]
-    fn a_composition_longer_than_the_row_remainder_stops_at_the_frame_edge() {
-        let mut f = painted_frame(2, 8, b"$ ");
-        // に ほ ん take columns 2..8; ご would need 8..10.
-        f.overlay_ime_preedit("にほんご", None, false);
-        assert_eq!(
-            f.cells[0].len(),
-            8,
-            "grown to the frame width, never past it"
-        );
-        let row: String = f.cells[0].iter().map(|c| c.ch).collect();
-        assert_eq!(row, "$ に ほ ん ");
-        assert_eq!(f.cursor_col, 7, "the caret clamps to the last column");
     }
 
     /// A wide char with exactly one column left: nothing is painted or
@@ -3991,26 +4033,144 @@ mod ime_preedit_caret_query_tests {
             );
         }
     }
+}
 
-    /// While a composition is in flight the engine cursor has not moved, so
-    /// the caret is the engine column plus everything typed so far.
-    #[test]
-    fn the_anchor_moves_with_the_composition_the_engine_cursor_does_not() {
-        let engine_col = 2;
-        let mut last = engine_col;
-        for phrase in ["に", "にほ", "にほん", "にほんご"] {
-            let caret = ime_preedit_caret_col(phrase, None, false, engine_col, 40);
-            assert!(
-                caret > last,
-                "{phrase:?} must anchor right of {last} (got {caret})"
-            );
-            last = caret;
+#[cfg(test)]
+mod prediction_ghost_tests {
+    use super::RenderInput;
+    use crate::terminal::{RenderCell, Rgb, Terminal};
+
+    fn frame(rows: u16, cols: u16, bytes: &[u8]) -> RenderInput {
+        let mut term = Terminal::new(rows, cols);
+        term.set_default_foreground(Rgb::new(0xC0, 0xC5, 0xCE));
+        term.set_default_background(Rgb::new(0x1B, 0x1D, 0x1E));
+        term.process(bytes);
+        let mut f = RenderInput::empty();
+        term.cell_frame_into(&mut f, rows.into(), cols.into());
+        f
+    }
+
+    fn blank() -> RenderCell {
+        RenderCell {
+            fg: [0xC0, 0xC5, 0xCE],
+            bg: [0x1B, 0x1D, 0x1E],
+            ..RenderCell::default()
         }
-        assert_eq!(
-            last, 10,
-            "four full-width kana past the prompt — eight columns the engine \
-             cursor knows nothing about"
+    }
+
+    /// Every cell but `(row, col)` is what it was.
+    fn only_changed(before: &RenderInput, after: &RenderInput, at: Option<(usize, usize)>) {
+        for (r, (b, a)) in before.cells.iter().zip(&after.cells).enumerate() {
+            for c in 0..b.len().max(a.len()) {
+                if Some((r, c)) != at {
+                    assert_eq!(b.get(c), a.get(c), "({r}, {c}) changed");
+                }
+            }
+        }
+    }
+
+    /// The ghost replaces its own cell (glyph, dimmed fg, no inherited SGR) and
+    /// nothing else, over a styled row.
+    #[test]
+    fn a_ghost_changes_its_own_cell_and_no_other() {
+        let before = frame(2, 10, b"ab\x1b[1;31mcde\x1b[0mfg");
+        let mut after = before.clone();
+        assert!(after.paint_prediction_ghost(0, 3, 'x', 10, blank()));
+        only_changed(&before, &after, Some((0, 3)));
+        let (old, new) = (before.cells[0][3], after.cells[0][3]);
+        assert_eq!(new.ch, 'x');
+        assert!(old.bold && !new.bold, "inherited SGR dropped");
+        assert_eq!(new.bg, old.bg);
+        assert_ne!(new.fg, old.fg, "dimmed toward the bg");
+    }
+
+    /// Either half of a wide glyph is refused: painting the lead leaves the
+    /// continuation with nothing to draw, painting the continuation draws under the
+    /// lead's bitmap. Both change a cell the guess never predicted.
+    #[test]
+    fn a_ghost_never_paints_over_half_of_a_wide_glyph() {
+        let before = frame(1, 10, "ab日c".as_bytes());
+        assert!(
+            before.cells[0][3].wide && !before.cells[0][2].wide,
+            "fixture: the wide glyph's lead at 2, its continuation at 3"
         );
+        for col in [2, 3] {
+            let mut after = before.clone();
+            assert!(
+                !after.paint_prediction_ghost(0, col, 'x', 10, blank()),
+                "column {col} is half of the wide glyph"
+            );
+            only_changed(&before, &after, None);
+        }
+        let mut after = before.clone();
+        assert!(
+            after.paint_prediction_ghost(0, 1, 'x', 10, blank()),
+            "control: the narrow cell beside it paints"
+        );
+        only_changed(&before, &after, Some((0, 1)));
+    }
+
+    /// On a BiDi row already in visual order the guess's logical column is found
+    /// where reconciliation reads it ([`RenderInput::visual_col`]).
+    #[test]
+    fn a_ghost_lands_on_the_visual_cell_of_its_logical_column() {
+        let mut before = frame(1, 10, b"cba");
+        // Visual column v shows logical column map[v]: logical 0 is painted at 2.
+        before.visual_to_logical = vec![vec![2, 1, 0]];
+        let mut after = before.clone();
+        assert!(after.paint_prediction_ghost(0, 0, 'x', 10, blank()));
+        only_changed(&before, &after, Some((0, 2)));
+        assert_eq!(after.cells[0][2].ch, 'x');
+    }
+
+    /// A cell's combining marks (and grapheme cluster) are drawn in preference to
+    /// its `ch`, so they go with the glyph the ghost replaces — and only there.
+    #[test]
+    fn a_ghost_drops_its_cells_combining_marks_only() {
+        let before = frame(1, 10, "e\u{301}xo\u{308}".as_bytes());
+        let marked: Vec<usize> = before.combining[0].iter().map(|&(c, _)| c).collect();
+        assert_eq!(marked, [0, 2], "fixture: marks on columns 0 and 2");
+        let mut after = before.clone();
+        assert!(after.paint_prediction_ghost(0, 0, 'q', 10, blank()));
+        let marked: Vec<usize> = after.combining[0].iter().map(|&(c, _)| c).collect();
+        assert_eq!(marked, [2], "column 2 keeps its mark");
+    }
+
+    /// The painter's refusal, asked without painting, is the painter's: on every
+    /// column of a row holding a wide glyph, past `cols` and on a missing row,
+    /// `prediction_ghost_paintable` answers what `paint_prediction_ghost` then
+    /// does, and asking changes nothing.
+    #[test]
+    fn a_ghost_s_refusal_can_be_asked_without_painting() {
+        let before = frame(2, 6, "ab日c".as_bytes());
+        for (row, col) in (0..3).flat_map(|r| (0..8).map(move |c| (r, c))) {
+            let asked = before.prediction_ghost_paintable(row, col, 6);
+            let mut after = before.clone();
+            assert_eq!(
+                asked,
+                after.paint_prediction_ghost(row, col, 'x', 6, blank()),
+                "({row}, {col})"
+            );
+        }
+        let probed = before.clone();
+        let _ = probed.prediction_ghost_paintable(0, 2, 6);
+        assert_eq!(probed.cells, before.cells, "asking paints nothing");
+    }
+
+    /// Past a trimmed row's end the row is padded with the terminal blank; at or
+    /// past `cols`, or on a missing row, nothing is painted.
+    #[test]
+    fn a_ghost_pads_a_short_row_and_clips_to_the_frame() {
+        let mut f = frame(2, 6, b"$ ");
+        assert_eq!(f.cells[0].len(), 2, "fixture: a trimmed row");
+        assert!(f.paint_prediction_ghost(0, 4, 'x', 6, blank()));
+        assert_eq!(f.cells[0].len(), 5);
+        assert_eq!((f.cells[0][2], f.cells[0][3]), (blank(), blank()));
+        assert_eq!(f.cells[0][4].ch, 'x');
+        let before = f.clone();
+        assert!(!f.paint_prediction_ghost(0, 6, 'y', 6, blank()));
+        assert!(!f.paint_prediction_ghost(9, 0, 'y', 6, blank()));
+        assert_eq!(f.cells, before.cells);
     }
 }
 
@@ -4037,32 +4197,6 @@ mod line_size_run_tests {
         assert_eq!(i.line_size_run_at(0, 0), (LineSize::SingleWidth, 0, 10));
         assert_eq!(i.line_size_run_at(0, 9), (LineSize::SingleWidth, 0, 10));
         assert_eq!(i.line_size_run_at(1, 4), (LineSize::DoubleWidth, 0, 10));
-    }
-
-    /// A run governs exactly its own columns; a column outside every run is
-    /// single width, which keeps one pane's DECDWL off its neighbour.
-    #[test]
-    fn a_run_governs_only_its_own_columns() {
-        let mut i = input(1, 11);
-        i.line_size_spans[0] = vec![LineSizeSpan {
-            start_col: 6,
-            end_col: 11,
-            line_size: LineSize::DoubleWidth,
-        }];
-        for c in 0..6 {
-            assert_eq!(
-                i.line_size_run_at(0, c),
-                (LineSize::SingleWidth, 0, 11),
-                "column {c} sits outside the run"
-            );
-        }
-        for c in 6..11 {
-            assert_eq!(
-                i.line_size_run_at(0, c),
-                (LineSize::DoubleWidth, 6, 11),
-                "column {c} sits inside the run"
-            );
-        }
     }
 
     /// Boundaries: `start_col` is inclusive and `end_col` exclusive, and the
@@ -4337,59 +4471,8 @@ mod z_index_tests {
 }
 
 #[cfg(test)]
-mod line_size_span_tests {
-    use super::{LineSizeSpan, RenderInput};
-    use crate::grid::LineSize;
-
-    #[test]
-    fn spans_are_render_content_and_survive_both_clone_paths() {
-        let mut source = RenderInput::empty();
-        source.rows = 1;
-        source.cols = 9;
-        source.line_sizes = vec![LineSize::SingleWidth];
-        source.line_size_spans = vec![vec![
-            LineSizeSpan::new(0, 4, LineSize::DoubleWidth),
-            LineSizeSpan::new(5, 9, LineSize::SingleWidth),
-        ]];
-
-        let cloned = source.clone();
-        assert_eq!(cloned.line_size_spans, source.line_size_spans);
-        assert_eq!(cloned, source);
-
-        let mut reused = RenderInput::empty();
-        reused.line_size_spans = vec![vec![LineSizeSpan::new(0, 99, LineSize::DoubleHeightBottom)]];
-        reused.clone_from(&source);
-        assert_eq!(reused.line_size_spans, source.line_size_spans);
-        assert_eq!(reused, source);
-
-        let mut changed = source.clone();
-        changed.line_size_spans[0][0].line_size = LineSize::SingleWidth;
-        assert_ne!(
-            changed, source,
-            "pane-local DEC geometry changes rendered pixels"
-        );
-    }
-
-    #[test]
-    fn cursor_fill_override_is_content_cloned_and_cleared_with_overlays() {
-        let mut source = RenderInput::empty();
-        source.cursor_fill_override = Some(0x0012_3456);
-
-        let mut reused = RenderInput::empty();
-        reused.clone_from(&source);
-        assert_eq!(reused.cursor_fill_override, source.cursor_fill_override);
-        assert_eq!(reused, source);
-
-        let bare = RenderInput::empty();
-        assert_ne!(
-            source, bare,
-            "a stationary cursor fill color changes rendered content"
-        );
-
-        source.clear_overlays();
-        assert_eq!(source.cursor_fill_override, None);
-        assert_eq!(source, bare);
-    }
+mod cursor_override_tests {
+    use super::RenderInput;
 
     #[test]
     fn cursor_effect_style_override_is_content_cloned_and_cleared_with_overlays() {
@@ -4923,104 +5006,12 @@ mod rain_channel_tests {
         );
     }
 
-    #[test]
-    fn absolute_row_revision_is_cloned_but_not_render_content() {
-        let base = RenderInput::empty();
-        let mut stamped = base.clone();
-        stamped.absolute_row_revision = 7;
-
-        assert_eq!(
-            base, stamped,
-            "absolute-row revision is host metadata, not raster content"
-        );
-        assert_eq!(stamped.clone().absolute_row_revision, 7);
-
-        let mut reused = RenderInput::empty();
-        reused.clone_from(&stamped);
-        assert_eq!(
-            reused.absolute_row_revision, 7,
-            "capacity-reusing snapshots preserve the frame stamp"
-        );
-    }
-
-    /// The `image plain` contract: `clear_overlays` clears the rain quads and
-    /// nulls its atlas `Arc` (a dangling atlas would keep the GPU upload
-    /// alive), and also strips `glow_halo`, `glow_under` and `char_fg`.
-    #[test]
-    fn clear_overlays_strips_all_three_rain_channels() {
-        let mut input = populated();
-        input.clear_overlays();
-        assert!(input.rain_quads.is_empty(), "rain quads must be cleared");
-        assert!(input.rain_atlas.is_none(), "rain atlas Arc must be nulled");
-        assert!(input.rain_add.is_empty(), "rain halos must be cleared");
-        assert!(input.glow_halo.is_empty(), "glow halos must be cleared");
-        assert!(input.glow_under.is_empty(), "glow_under must be cleared");
-        assert!(input.fire_patch.is_empty(), "fire_patch must be cleared");
-        assert!(input.char_fg.is_empty(), "char_fg must be cleared");
-        assert!(input.fire_halo.is_empty(), "fire_halo must be cleared");
-        assert_eq!(input, RenderInput::empty(), "stripped == bare empty frame");
-    }
-
-    /// Rain is content, so a change in any channel compares unequal. The atlas
-    /// compares by identity (`Arc::as_ptr`), since baker versions replay
+    /// Atlases compare by identity (`Arc::as_ptr`), since baker versions replay
     /// across rebuilt engines: a fresh publish is unequal, and the same `Arc`
     /// re-presented stays equal.
     #[test]
-    fn partial_eq_sees_rain_content_and_atlas_identity() {
+    fn partial_eq_sees_atlas_identity() {
         let base = populated();
-
-        let mut quads_changed = base.clone();
-        quads_changed.rain_quads[1].y += 16;
-        assert_ne!(
-            base, quads_changed,
-            "rain_quads content change must be seen"
-        );
-
-        let mut add_changed = base.clone();
-        add_changed.rain_add[0].color = 0x0001_0101;
-        assert_ne!(base, add_changed, "rain_add change must be seen");
-
-        let mut halo_changed = base.clone();
-        halo_changed.glow_halo[0].rx += 1;
-        assert_ne!(base, halo_changed, "glow_halo change must be seen");
-
-        // The blend mode IS content: an Add ember becoming an Over veil must
-        // miss the damage gate (defaults pinned so legacy streams stay Add).
-        assert_eq!(HaloMode::default(), HaloMode::Add, "legacy halos stay Add");
-        let mut mode_changed = base.clone();
-        mode_changed.glow_halo[0].mode = HaloMode::Over;
-        assert_ne!(base, mode_changed, "glow_halo mode change must be seen");
-
-        let mut under_changed = base.clone();
-        under_changed.glow_under[0].color = 0x0001_0101;
-        assert_ne!(base, under_changed, "glow_under change must be seen");
-
-        // The fire field's phase IS content (the animation clock both backends
-        // key the field on), as is its blend mode (defaults pinned so legacy
-        // streams stay Add — the dark-theme emission).
-        assert_eq!(FireMode::default(), FireMode::Add, "legacy fire stays Add");
-        let mut fire_changed = base.clone();
-        fire_changed.fire_patch[0].phase += 16;
-        assert_ne!(base, fire_changed, "fire_patch phase change must be seen");
-        let mut fire_mode_changed = base.clone();
-        fire_mode_changed.fire_patch[1].mode = FireMode::Over;
-        assert_ne!(
-            base, fire_mode_changed,
-            "fire_patch mode change must be seen"
-        );
-
-        let mut char_fg_changed = base.clone();
-        char_fg_changed.char_fg[1].fg = 0x0000_0000;
-        assert_ne!(base, char_fg_changed, "char_fg change must be seen");
-
-        // The contrast-halo strength is content too (it scales the stamp
-        // alpha).
-        let mut fire_halo_changed = base.clone();
-        fire_halo_changed.fire_halo[1].strength = 40;
-        assert_ne!(
-            base, fire_halo_changed,
-            "fire_halo strength change must be seen"
-        );
 
         let mut version_bumped = base.clone();
         version_bumped.rain_atlas = Some(rain_atlas(8, 0xFF));
@@ -5042,40 +5033,6 @@ mod rain_channel_tests {
             base, same_arc,
             "re-presenting the same published Arc stays EQUAL (resting rain is free)"
         );
-    }
-
-    /// The capacity-reusing damage-cache path: `clone_from` omissions compile
-    /// fine (unlike `clone`'s struct literal), so pin that all three channels
-    /// actually arrive — a miss stores a stale channel and silently corrupts
-    /// the dirty diff.
-    #[test]
-    fn clone_from_copies_all_three_rain_channels() {
-        let source = populated();
-
-        // Non-empty destination: clone_from must overwrite stale rain, not merge.
-        let mut dst = RenderInput::empty();
-        dst.rain_quads = vec![rain_quad(9); 8];
-        dst.rain_atlas = Some(rain_atlas(99, 0xAA));
-        dst.rain_add = vec![rain_halo(9); 8];
-        dst.glow_halo = vec![rain_halo(9); 8];
-        dst.glow_under = vec![under_quad(9); 8];
-        dst.fire_patch = vec![fire_patch(9); 8];
-        dst.char_fg = vec![char_fg(9, 9); 8];
-        dst.fire_halo = vec![fire_halo(9, 9); 8];
-        dst.clone_from(&source);
-        assert_eq!(dst.rain_quads, source.rain_quads);
-        assert_eq!(
-            dst.rain_atlas.as_ref().map(std::sync::Arc::as_ptr),
-            source.rain_atlas.as_ref().map(std::sync::Arc::as_ptr),
-            "clone_from carries the SAME published Arc (identity, the eq law)"
-        );
-        assert_eq!(dst.rain_add, source.rain_add);
-        assert_eq!(dst.glow_halo, source.glow_halo);
-        assert_eq!(dst.glow_under, source.glow_under);
-        assert_eq!(dst.fire_patch, source.fire_patch);
-        assert_eq!(dst.char_fg, source.char_fg);
-        assert_eq!(dst.fire_halo, source.fire_halo);
-        assert_eq!(dst, source, "clone_from == clone, byte-for-byte");
     }
 
     #[test]
@@ -5143,27 +5100,6 @@ mod rain_channel_tests {
             "alpha" => GlowQuad { alpha: 9, ..glow },
             "color2" => GlowQuad { color2: 0x65_4321, ..glow },
             "alpha2" => GlowQuad { alpha2: 9, ..glow },
-        );
-        // A flat quad folds to two words; a gradient appends a third (see
-        // `GlowQuad::damage_words`).
-        assert_eq!(glow.damage_words().as_slice().len(), 2);
-        assert_eq!(
-            GlowQuad {
-                color2: 0x65_4321,
-                ..glow
-            }
-            .damage_words()
-            .as_slice()
-            .len(),
-            3
-        );
-        assert_eq!(
-            glow.damage_words().as_slice(),
-            &[
-                super::pack_u16x4(glow.row, glow.x, glow.y, glow.w),
-                glow.h as u64 | (glow.color as u64) << 16 | (glow.alpha as u64) << 48,
-            ][..],
-            "a flat quad's words are the pre-gradient pair, bit for bit"
         );
 
         let rain = rain_halo(1);

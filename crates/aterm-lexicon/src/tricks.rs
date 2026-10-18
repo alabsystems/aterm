@@ -184,7 +184,7 @@ impl Trick {
     /// What the pet does, as one short clause for the command listing. Plain
     /// words and spaces only: [`row_line`] spells the spaces as `_` so the
     /// clause stays one field, which an authored `_` or `=` would corrupt
-    /// (pinned by `blurbs_are_one_clean_listing_field`).
+    /// (pinned by `every_listing_line_of_the_embedded_file_is_one_line_of_key_value_fields`).
     #[must_use]
     pub fn blurb(self) -> &'static str {
         match self {

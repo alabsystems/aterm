@@ -2,9 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! BiDi visual-reordering bridge (feature `bidi`, off by default, on in `aterm-gui`):
-//! wires [`BiDiMode`] + [`ParagraphDirection`] to the UAX #9 reordering in
-//! `aterm-bidi`. Without the feature rows render in logical order.
+//! BiDi visual-reordering bridge: wires [`BiDiMode`] + [`ParagraphDirection`] to
+//! the UAX #9 reordering in `aterm-bidi`.
 //!
 //! [`Terminal::apply_bidi_reorder`] permutes each row of the render snapshot (from
 //! `cell_frame_into`) into visual order for the CPU and GPU renderers and the `image`
@@ -20,19 +19,6 @@ use super::Terminal;
 use aterm_types::{BiDiMode, ParagraphDirection};
 
 impl Terminal {
-    /// Visual→logical column permutation for `scalars` under this terminal's BiDi
-    /// settings (`result[v] == l`); the identity when BiDi is off or the line is LTR.
-    #[must_use]
-    #[cfg(test)]
-    pub fn bidi_visual_order(&self, scalars: &[char]) -> Vec<usize> {
-        compute_visual_order(
-            self.modes.bidi_mode,
-            self.modes.bidi_direction,
-            self.modes.bidi_autodetection,
-            scalars,
-        )
-    }
-
     /// Visual→logical cell permutation for a rendered row under this terminal's BiDi
     /// mode/direction; a wide glyph's lead and continuation cells stay paired and
     /// unmirrored. `result[v] == l` means logical cell `l` is drawn at visual column
@@ -323,27 +309,10 @@ impl Terminal {
     }
 }
 
-/// Pure mapping from BiDi config and line scalars to the visual→logical permutation,
-/// testable without a `Terminal`. `autodetect` is DECSET 2501 (see [`base_direction`]).
-#[must_use]
-#[cfg(test)]
-pub fn compute_visual_order(
-    mode: BiDiMode,
-    dir: ParagraphDirection,
-    autodetect: bool,
-    scalars: &[char],
-) -> Vec<usize> {
-    // Disabled, or a pure-LTR line: identity (the common, hot case).
-    if mode == BiDiMode::Disabled || !aterm_bidi::has_bidi(scalars) {
-        return (0..scalars.len()).collect();
-    }
-    let base = base_direction(dir, autodetect, scalars);
-    aterm_bidi::reorder_visual_to_logical(scalars, base)
-}
-
-/// Per-cell scalars and wide-continuation flags in, visual→logical cell permutation
-/// out, keeping wide-glyph pairs together (see
-/// [`aterm_bidi::reorder_cells_with_classes`]). `autodetect` is DECSET 2501.
+/// Pure mapping from BiDi config and per-cell scalars and wide-continuation
+/// flags to the visual→logical cell permutation, keeping
+/// wide-glyph pairs together (see [`aterm_bidi::reorder_cells_with_classes`]).
+/// `autodetect` is DECSET 2501.
 #[must_use]
 pub fn compute_visual_order_cells(
     mode: BiDiMode,
@@ -401,52 +370,15 @@ fn visual_order_cells_into(
     order
 }
 
-/// Map the engine's [`ParagraphDirection`] onto an `aterm-bidi` `BaseDirection`.
+/// Map the engine's [`ParagraphDirection`] onto an `aterm-bidi`
+/// `BaseDirection`, reading the row's precomputed per-cell
+/// [`BidiClass`](aterm_bidi::BidiClass)es.
 ///
 /// `autodetect` is DECSET 2501, the Terminal WG's only switch for first-strong
 /// detection (default off; SCP 0 is the terminal's default, LTR). Without it `Auto` is
 /// an LTR paragraph and `AutoRtl` an RTL one; with it `Auto` runs UAX #9 P2/P3 and
 /// `AutoRtl` does too when a strong L/R/AL character is present (else `Rtl`). SCP 1/2
 /// (`Ltr`/`Rtl`) force their direction.
-#[cfg(test)]
-fn base_direction(
-    dir: ParagraphDirection,
-    autodetect: bool,
-    scalars: &[char],
-) -> aterm_bidi::BaseDirection {
-    use aterm_bidi::{BaseDirection, BidiClass};
-    let default_ltr = if autodetect {
-        BaseDirection::Auto
-    } else {
-        BaseDirection::Ltr
-    };
-    match dir {
-        ParagraphDirection::Auto => default_ltr,
-        ParagraphDirection::Ltr => BaseDirection::Ltr,
-        ParagraphDirection::Rtl => BaseDirection::Rtl,
-        ParagraphDirection::AutoRtl => {
-            if !autodetect {
-                return BaseDirection::Rtl;
-            }
-            let has_strong = scalars.iter().any(|&c| {
-                matches!(
-                    aterm_bidi::bidi_class(c),
-                    BidiClass::L | BidiClass::R | BidiClass::AL
-                )
-            });
-            if has_strong {
-                BaseDirection::Auto
-            } else {
-                BaseDirection::Rtl
-            }
-        }
-        _ => default_ltr,
-    }
-}
-
-/// [`base_direction`] for callers that already have the per-cell
-/// [`BidiClass`](aterm_bidi::BidiClass) slice; `AutoRtl`'s strong-character
-/// scan reads the precomputed classes.
 fn base_direction_from_classes(
     dir: ParagraphDirection,
     autodetect: bool,
@@ -490,27 +422,6 @@ mod tests {
 
     const ALEF: char = '\u{05D0}';
     const BET: char = '\u{05D1}';
-
-    /// A render snapshot of a Hebrew line is reordered into visual order by
-    /// `cell_frame` (via `apply_bidi_reorder`), while a pure-ASCII line stays in
-    /// logical order.
-    #[test]
-    fn cell_frame_reorders_rtl_row_visually() {
-        let mut term = Terminal::new(4, 8);
-        // Default BiDiMode is Implicit, so a fresh terminal reorders RTL.
-        assert_ne!(term.modes.bidi_mode, BiDiMode::Disabled);
-
-        // Three Hebrew letters in logical order: alef, bet, gimel.
-        term.process("\u{05D0}\u{05D1}\u{05D2}".as_bytes());
-        let frame = term.cell_frame(4, 8);
-        let row: Vec<char> = frame.cells[0].iter().take(3).map(|c| c.ch).collect();
-        // Visual order is reversed for an RTL run.
-        assert_eq!(
-            row,
-            vec!['\u{05D2}', '\u{05D1}', '\u{05D0}'],
-            "Hebrew run must render right-to-left in the snapshot"
-        );
-    }
 
     #[test]
     fn scp_direction_change_reorders_and_damages_an_existing_row() {
@@ -560,152 +471,77 @@ mod tests {
     }
 
     #[test]
-    fn cell_frame_leaves_ascii_row_in_logical_order() {
-        let mut term = Terminal::new(4, 8);
-        term.process(b"abc");
-        let frame = term.cell_frame(4, 8);
-        let row: Vec<char> = frame.cells[0].iter().take(3).map(|c| c.ch).collect();
-        assert_eq!(row, vec!['a', 'b', 'c'], "ASCII stays in logical order");
-    }
-
-    /// The shipping default: DECSET 2501 reset, so no first-strong detection.
-    fn cv(mode: BiDiMode, dir: ParagraphDirection, s: &str) -> Vec<usize> {
-        compute_visual_order(mode, dir, false, &s.chars().collect::<Vec<_>>())
-    }
-
-    #[test]
-    fn disabled_is_always_identity() {
-        // Even with RTL content, Disabled keeps logical order.
-        assert_eq!(
-            cv(
-                BiDiMode::Disabled,
-                ParagraphDirection::Auto,
-                "\u{05D0}\u{05D1}"
-            ),
-            vec![0, 1]
-        );
-    }
-
-    #[test]
-    fn pure_ltr_is_identity_without_invoking_reorder() {
-        assert_eq!(
-            cv(BiDiMode::Implicit, ParagraphDirection::Auto, "abc"),
-            vec![0, 1, 2]
-        );
-    }
-
-    #[test]
-    fn implicit_reorders_rtl() {
-        // A Hebrew run reverses within the default LTR paragraph.
-        assert_eq!(
-            cv(
-                BiDiMode::Implicit,
-                ParagraphDirection::Auto,
-                "\u{05D0}\u{05D1}"
-            ),
-            vec![1, 0]
-        );
-    }
-
-    #[test]
-    fn explicit_mode_also_reorders_via_the_bridge() {
-        // The bridge treats every non-Disabled mode alike (Explicit included).
-        assert_eq!(
-            cv(BiDiMode::Explicit, ParagraphDirection::Rtl, "ab"),
-            vec![0, 1]
-        );
-    }
-
-    #[test]
     fn autortl_defaults_rtl_only_without_strong_chars() {
         use aterm_bidi::BaseDirection;
+        let base = |dir, autodetect, scalars: &[char]| {
+            let classes: Vec<_> = scalars.iter().map(|&c| aterm_bidi::bidi_class(c)).collect();
+            base_direction_from_classes(dir, autodetect, &classes)
+        };
         // With DECSET 2501 set, a neutral-only line under AutoRtl uses an RTL
         // base; with a strong char it auto-detects normally.
-        assert_eq!(
-            base_direction(ParagraphDirection::AutoRtl, true, &[' ', '.']),
-            BaseDirection::Rtl
-        );
-        assert_eq!(
-            base_direction(ParagraphDirection::AutoRtl, true, &['a']),
-            BaseDirection::Auto
-        );
-        assert_eq!(
-            base_direction(ParagraphDirection::AutoRtl, true, &[ALEF]),
-            BaseDirection::Auto
-        );
-        // With 2501 reset (default) the SCP direction is used directly: `Auto`
-        // is LTR, `AutoRtl` is RTL, strong characters or not; SCP 1/2 force
-        // their direction.
-        assert_eq!(
-            base_direction(ParagraphDirection::Auto, false, &[ALEF, 'a']),
-            BaseDirection::Ltr
-        );
-        assert_eq!(
-            base_direction(ParagraphDirection::Auto, true, &[ALEF, 'a']),
-            BaseDirection::Auto
-        );
-        assert_eq!(
-            base_direction(ParagraphDirection::AutoRtl, false, &['a']),
-            BaseDirection::Rtl
-        );
-        assert_eq!(
-            base_direction(ParagraphDirection::Ltr, true, &[ALEF]),
-            BaseDirection::Ltr
-        );
-        assert_eq!(
-            base_direction(ParagraphDirection::Rtl, true, &['a']),
-            BaseDirection::Rtl
-        );
-        // The class-slice twin agrees with the scalar mapping on every arm.
-        for dir in [
-            ParagraphDirection::Auto,
-            ParagraphDirection::AutoRtl,
-            ParagraphDirection::Ltr,
-            ParagraphDirection::Rtl,
-        ] {
-            for autodetect in [false, true] {
-                for scalars in [&[' ', '.'][..], &['a'][..], &[ALEF][..]] {
-                    let classes: Vec<_> =
-                        scalars.iter().map(|&c| aterm_bidi::bidi_class(c)).collect();
-                    assert_eq!(
-                        base_direction_from_classes(dir, autodetect, &classes),
-                        base_direction(dir, autodetect, scalars),
-                        "{dir:?} autodetect={autodetect} {scalars:?}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn terminal_method_uses_default_implicit_config() {
-        // A fresh Terminal defaults to Implicit/Auto, so the method reorders RTL.
-        let term = Terminal::new(24, 80);
-        assert_eq!(term.bidi_visual_order(&[ALEF, BET]), vec![1, 0]);
-        // Plain ASCII stays identity.
-        assert_eq!(term.bidi_visual_order(&['x', 'y', 'z']), vec![0, 1, 2]);
-    }
-
-    const CJK: char = '\u{4E2D}'; // 中 — a wide (2-cell) glyph
-
-    #[test]
-    fn cells_disabled_is_identity() {
-        // Disabled mode: identity even with RTL + wide content, autodetected or not.
-        let chars = [ALEF, CJK, ' '];
-        let wide = [false, false, true];
-        for autodetect in [false, true] {
+        let cases = [
+            (
+                ParagraphDirection::AutoRtl,
+                true,
+                &[' ', '.'][..],
+                BaseDirection::Rtl,
+            ),
+            (
+                ParagraphDirection::AutoRtl,
+                true,
+                &['a'][..],
+                BaseDirection::Auto,
+            ),
+            (
+                ParagraphDirection::AutoRtl,
+                true,
+                &[ALEF][..],
+                BaseDirection::Auto,
+            ),
+            // With 2501 reset (default) the SCP direction is used directly:
+            // `Auto` is LTR, `AutoRtl` is RTL, strong characters or not; SCP 1/2
+            // force their direction.
+            (
+                ParagraphDirection::Auto,
+                false,
+                &[ALEF, 'a'][..],
+                BaseDirection::Ltr,
+            ),
+            (
+                ParagraphDirection::Auto,
+                true,
+                &[ALEF, 'a'][..],
+                BaseDirection::Auto,
+            ),
+            (
+                ParagraphDirection::AutoRtl,
+                false,
+                &['a'][..],
+                BaseDirection::Rtl,
+            ),
+            (
+                ParagraphDirection::Ltr,
+                true,
+                &[ALEF][..],
+                BaseDirection::Ltr,
+            ),
+            (
+                ParagraphDirection::Rtl,
+                true,
+                &['a'][..],
+                BaseDirection::Rtl,
+            ),
+        ];
+        for (dir, autodetect, scalars, want) in cases {
             assert_eq!(
-                compute_visual_order_cells(
-                    BiDiMode::Disabled,
-                    ParagraphDirection::Auto,
-                    autodetect,
-                    &chars,
-                    &wide
-                ),
-                vec![0, 1, 2]
+                base(dir, autodetect, scalars),
+                want,
+                "{dir:?} autodetect={autodetect} {scalars:?}"
             );
         }
     }
+
+    const CJK: char = '\u{4E2D}'; // 中 — a wide (2-cell) glyph
 
     #[test]
     fn cells_implicit_reorders_rtl_keeping_wide_pair() {
@@ -783,36 +619,6 @@ mod tests {
         assert!(ltr.row_display_order(2).is_none(), "off the screen");
     }
 
-    #[test]
-    fn terminal_cell_method_uses_default_config_and_real_cells() {
-        // Drive a real engine so the method runs over actual RenderCell rows.
-        let mut term = Terminal::new(2, 8);
-        term.process("ab".as_bytes());
-        let cells = term.render_row(0);
-        // Pure ASCII row → identity.
-        assert_eq!(
-            term.bidi_visual_order_cells(&cells),
-            (0..cells.len()).collect::<Vec<_>>()
-        );
-
-        let mut rtl = Terminal::new(2, 8);
-        rtl.process("\u{05D0}\u{05D1}".as_bytes()); // ALEF BET
-        let rcells = rtl.render_row(0);
-        // The two Hebrew lead cells reverse; trailing blanks stay in place.
-        let order = rtl.bidi_visual_order_cells(&rcells);
-        assert_eq!(
-            order[0], 1,
-            "first visual cell is the 2nd Hebrew letter; got {order:?}"
-        );
-        assert_eq!(
-            order[1], 0,
-            "second visual cell is the 1st Hebrew letter; got {order:?}"
-        );
-        // Still a permutation of all cells.
-        let mut seen = order.clone();
-        seen.sort_unstable();
-        assert_eq!(seen, (0..rcells.len()).collect::<Vec<_>>());
-    }
     /// `abc שלום עולם def`: the frame paints the two Hebrew words reversed in
     /// place, so visual cells 4..=7 show עולם (logical 9..=12) and 9..=12 show
     /// שלום (logical 4..=7).
@@ -1161,11 +967,12 @@ mod tests {
                         let blanks = " ".repeat(pad);
                         let row = format!("{lead}{blanks}{rtl}{blanks}{trail}");
                         let scalars: Vec<char> = row.chars().collect();
-                        let order = compute_visual_order(
+                        let order = compute_visual_order_cells(
                             BiDiMode::Implicit,
                             ParagraphDirection::Auto,
                             false,
                             &scalars,
+                            &vec![false; scalars.len()],
                         );
                         for (l, &c) in scalars.iter().enumerate() {
                             if c.is_ascii() && c != ' ' {
@@ -1180,11 +987,12 @@ mod tests {
                         // logical cell lands in the last visual column.
                         let rtl_first = format!("{rtl}{blanks}{lead}{blanks}{trail}");
                         let scalars: Vec<char> = rtl_first.chars().collect();
-                        let order = compute_visual_order(
+                        let order = compute_visual_order_cells(
                             BiDiMode::Implicit,
                             ParagraphDirection::Auto,
                             true,
                             &scalars,
+                            &vec![false; scalars.len()],
                         );
                         assert_eq!(
                             order[scalars.len() - 1],

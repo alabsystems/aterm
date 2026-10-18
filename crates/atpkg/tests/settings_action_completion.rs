@@ -122,9 +122,7 @@ fn native_settings_package_actions_complete_with_hostile_metadata_files() {
 
 /// The conventional help spellings, at the real process edge: they exit 0 on the help
 /// surface instead of the unknown-verb error path — `atpkg` rides PATH as an argv0
-/// alias, so `--help` is the first thing a shell (or an AI) tries. (`sync`, once
-/// asserted here as an update alias, is deleted; the unknown-verb hint's coherence
-/// with the dispatch is pinned by cli.rs's own `verb_hint_matches_dispatch`.)
+/// alias, so `--help` is the first thing a shell (or an AI) tries.
 #[test]
 fn help_spellings_dispatch_as_advertised() {
     let tmp = scratch("verb-dispatch");

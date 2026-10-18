@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A self-contained X11 clipboard (CLIPBOARD + PRIMARY) over the pure-Rust x11rb connection
-//! (already a winit dependency), with no helper binary (`xclip`/`xsel`).
+//! A self-contained X11 clipboard (CLIPBOARD + PRIMARY) over a connection of its own
+//! (`aterm_x11`, libxcb opened at run time), with no helper binary (`xclip`/`xsel`). It ran
+//! over x11rb's pure-Rust connection until LW.6 of docs/AUDIT-third-party-2026-10-15.md; the
+//! protocol it speaks is unchanged.
 //!
 //! X11 has no "set and forget" clipboard: the copying client must own the selection and answer
 //! `SelectionRequest` conversions for as long as the data should stay pasteable. One background
@@ -12,21 +14,17 @@
 //! briefly for the reply.
 //!
 //! Scope: UTF-8 text. Serving is single-shot (no INCR), which covers ordinary terminal copies;
-//! pasting also accepts INCR. Without `$DISPLAY` [`X11Clipboard::get_handle`] returns `None`.
+//! pasting also accepts INCR. Without `$DISPLAY` (or without libxcb)
+//! [`X11Clipboard::get_handle`] returns `None`.
 
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use x11rb::connection::Connection;
-use x11rb::protocol::Event;
-use x11rb::protocol::xproto::{
-    Atom, AtomEnum, ConnectionExt as _, CreateWindowAux, EventMask, PropMode, Property,
-    SELECTION_NOTIFY_EVENT, SelectionNotifyEvent, SelectionRequestEvent, Window, WindowClass,
-};
-use x11rb::rust_connection::RustConnection;
-use x11rb::wrapper::ConnectionExt as _;
-use x11rb::{CURRENT_TIME, NONE};
+use aterm_x11::Connection;
+use aterm_x11::proto::event::{Event, SelectionNotify, SelectionRequest, property as notify_state};
+use aterm_x11::proto::xproto::{self, PropMode, cw, event_mask, window_class};
+use aterm_x11::proto::{Atom, CURRENT_TIME, NONE, ValueList, Window, atom};
 
 /// Which X selection to read/write. `Clipboard` is the explicit-copy buffer
 /// (Ctrl+Shift+C / Ctrl+Shift+V); `Primary` is the select-to-copy / middle-click
@@ -64,12 +62,12 @@ struct Atoms {
     incr: Atom,
 }
 
-/// Shared state between the event-serving thread and the `set`/`get` callers. The
-/// `RustConnection` is `Sync` and supports concurrent write-only requests (set
-/// owner / convert) from a caller thread while the event thread blocks in
-/// `wait_for_event`, which is exactly the access pattern here.
+/// Shared state between the event-serving thread and the `set`/`get` callers. libxcb
+/// is thread-safe: a caller thread may send requests (set owner, convert) and wait for
+/// a reply (`set`'s ownership check) while the event thread blocks in `wait_for_event`,
+/// which is exactly the access pattern here.
 struct Inner {
-    conn: RustConnection,
+    conn: Connection,
     win: Window,
     atoms: Atoms,
     /// Text we currently serve for CLIPBOARD (the selection we own), or `None`.
@@ -123,57 +121,54 @@ impl X11Clipboard {
         clipboard_name: &[u8],
         primary_override: Option<&[u8]>,
     ) -> Option<X11Clipboard> {
-        let (conn, screen_num) = RustConnection::connect(None).ok()?;
+        let (conn, screen_num) = Connection::connect(None).ok()?;
         let screen = conn.setup().roots.get(screen_num)?;
         let root = screen.root;
         let root_visual = screen.root_visual;
         let win = conn.generate_id().ok()?;
-        conn.create_window(
-            x11rb::COPY_DEPTH_FROM_PARENT,
-            win,
-            root,
-            0,
-            0,
-            1,
-            1,
-            0,
-            WindowClass::INPUT_OUTPUT,
-            root_visual,
-            &CreateWindowAux::new().event_mask(EventMask::PROPERTY_CHANGE),
-        )
-        .ok()?;
+        drop(
+            conn.send_void(xproto::create_window(
+                0, // CopyFromParent depth
+                win,
+                root,
+                0,
+                0,
+                1,
+                1,
+                0,
+                window_class::INPUT_OUTPUT,
+                root_visual,
+                &ValueList::new().set(cw::EVENT_MASK, event_mask::PROPERTY_CHANGE),
+            ))
+            .ok()?,
+        );
+        let [clipboard, utf8, text, targets, text_plain, recv, incr] = conn
+            .intern_atoms(&[
+                clipboard_name,
+                b"UTF8_STRING",
+                b"TEXT",
+                b"TARGETS",
+                b"text/plain;charset=utf-8",
+                b"ATERM_CLIPBOARD_RECV",
+                b"INCR",
+            ])
+            .ok()?[..]
+        else {
+            return None;
+        };
+        let primary = match primary_override {
+            Some(name) => *conn.intern_atoms(&[name]).ok()?.first()?,
+            None => atom::PRIMARY,
+        };
         let atoms = Atoms {
-            clipboard: conn
-                .intern_atom(false, clipboard_name)
-                .ok()?
-                .reply()
-                .ok()?
-                .atom,
-            primary: match primary_override {
-                Some(name) => conn.intern_atom(false, name).ok()?.reply().ok()?.atom,
-                None => AtomEnum::PRIMARY.into(),
-            },
-            utf8: conn
-                .intern_atom(false, b"UTF8_STRING")
-                .ok()?
-                .reply()
-                .ok()?
-                .atom,
-            text: conn.intern_atom(false, b"TEXT").ok()?.reply().ok()?.atom,
-            targets: conn.intern_atom(false, b"TARGETS").ok()?.reply().ok()?.atom,
-            text_plain: conn
-                .intern_atom(false, b"text/plain;charset=utf-8")
-                .ok()?
-                .reply()
-                .ok()?
-                .atom,
-            recv: conn
-                .intern_atom(false, b"ATERM_CLIPBOARD_RECV")
-                .ok()?
-                .reply()
-                .ok()?
-                .atom,
-            incr: conn.intern_atom(false, b"INCR").ok()?.reply().ok()?.atom,
+            clipboard,
+            primary,
+            utf8,
+            text,
+            targets,
+            text_plain,
+            recv,
+            incr,
         };
         conn.flush().ok()?;
         let inner = std::sync::Arc::new(Inner {
@@ -194,19 +189,27 @@ impl X11Clipboard {
     }
 
     /// Take ownership of `sel` and serve `text` to any client that pastes it.
-    /// Returns whether ownership was requested successfully.
+    /// Returns whether this client owns `sel` once the server has processed the
+    /// request: ICCCM 2.1 has the owner confirm with `GetSelectionOwner`, and
+    /// that round trip also flushes the request, so a paste from any client
+    /// after `set` returns reaches this owner.
     pub(crate) fn set(&self, sel: Sel, text: &str) -> bool {
         let atom = self.sel_atom(sel);
         if let Some(slot) = self.inner.slot(atom) {
             *slot.lock().unwrap() = Some(text.to_owned());
         }
-        let ok = self
-            .inner
-            .conn
-            .set_selection_owner(self.inner.win, atom, CURRENT_TIME)
-            .is_ok();
-        let _ = self.inner.conn.flush();
-        ok
+        let conn = &self.inner.conn;
+        conn.send_void(xproto::set_selection_owner(
+            self.inner.win,
+            atom,
+            CURRENT_TIME,
+        ))
+        .is_ok()
+            && conn
+                .send(xproto::get_selection_owner(atom))
+                .ok()
+                .and_then(|cookie| cookie.reply().ok())
+                .is_some_and(|reply| reply.owner == self.inner.win)
     }
 
     /// Read the current contents of `sel` as text, or `None` if empty / unavailable.
@@ -220,11 +223,7 @@ impl X11Clipboard {
         if let Some(t) = self.get_owned(sel) {
             return Some(t);
         }
-        for target in [
-            self.inner.atoms.utf8,
-            self.inner.atoms.text,
-            Atom::from(AtomEnum::STRING),
-        ] {
+        for target in [self.inner.atoms.utf8, self.inner.atoms.text, atom::STRING] {
             match self.convert_once(atom, target) {
                 PasteOutcome::Text(t) => return Some(t),
                 PasteOutcome::Unsupported => continue,
@@ -249,13 +248,13 @@ impl X11Clipboard {
     fn convert_once(&self, selection: Atom, target: Atom) -> PasteOutcome {
         let (tx, rx) = channel();
         *self.inner.pending.lock().unwrap() = Some(tx);
-        let req = self.inner.conn.convert_selection(
+        let req = self.inner.conn.send_void(xproto::convert_selection(
             self.inner.win,
             selection,
             target,
             self.inner.atoms.recv,
             CURRENT_TIME,
-        );
+        ));
         if req.is_err() || self.inner.conn.flush().is_err() {
             *self.inner.pending.lock().unwrap() = None;
             return PasteOutcome::Timeout; // connection/write broken — do not retry
@@ -282,7 +281,10 @@ impl X11Clipboard {
 fn serve(inner: &Inner) {
     loop {
         let ev = match inner.conn.wait_for_event() {
-            Ok(ev) => ev,
+            Ok(packet) => match Event::parse(&packet) {
+                Ok(ev) => ev,
+                Err(_) => continue, // a packet that does not parse: skip it
+            },
             Err(_) => return, // connection gone — nothing more to serve
         };
         match ev {
@@ -310,7 +312,7 @@ fn serve(inner: &Inner) {
 
 /// Answer one `SelectionRequest`: place the requested data on the requestor's
 /// property and reply with a `SelectionNotify` (property = `NONE` on refusal).
-fn serve_request(inner: &Inner, req: &SelectionRequestEvent) {
+fn serve_request(inner: &Inner, req: &SelectionRequest) {
     let a = &inner.atoms;
     // Obsolete clients send property = None; the convention is to use `target`.
     let property = if req.property == NONE {
@@ -328,28 +330,30 @@ fn serve_request(inner: &Inner, req: &SelectionRequestEvent) {
             // Native UTF-8 carriers: bytes + property type == the requested target.
             ok = inner
                 .conn
-                .change_property8(
-                    PropMode::REPLACE,
+                .send_void(xproto::change_property(
+                    PropMode::Replace,
                     req.requestor,
                     property,
                     req.target,
+                    8,
                     text.as_bytes(),
-                )
+                ))
                 .is_ok();
         } else if req.target == a.text {
             // TEXT is polymorphic (owner picks the encoding); we answer UTF-8 and
             // label the property UTF8_STRING so the requestor decodes it correctly.
             ok = inner
                 .conn
-                .change_property8(
-                    PropMode::REPLACE,
+                .send_void(xproto::change_property(
+                    PropMode::Replace,
                     req.requestor,
                     property,
                     a.utf8,
+                    8,
                     text.as_bytes(),
-                )
+                ))
                 .is_ok();
-        } else if req.target == Atom::from(AtomEnum::STRING) {
+        } else if req.target == atom::STRING {
             // ICCCM: STRING is ISO-8859-1 (Latin-1), not UTF-8. Characters
             // outside Latin-1 become '?'.
             let latin1: Vec<u8> = text
@@ -358,39 +362,33 @@ fn serve_request(inner: &Inner, req: &SelectionRequestEvent) {
                 .collect();
             ok = inner
                 .conn
-                .change_property8(
-                    PropMode::REPLACE,
+                .send_void(xproto::change_property(
+                    PropMode::Replace,
                     req.requestor,
                     property,
                     req.target,
+                    8,
                     &latin1,
-                )
+                ))
                 .is_ok();
         } else if req.target == a.targets {
-            let list = [
-                a.targets,
-                a.utf8,
-                a.text,
-                Atom::from(AtomEnum::STRING),
-                a.text_plain,
-            ];
+            let list = [a.targets, a.utf8, a.text, atom::STRING, a.text_plain];
             ok = inner
                 .conn
-                .change_property32(
-                    PropMode::REPLACE,
+                .send_void(xproto::change_property32(
+                    PropMode::Replace,
                     req.requestor,
                     property,
-                    Atom::from(AtomEnum::ATOM),
+                    atom::ATOM,
                     &list,
-                )
+                ))
                 .is_ok();
         }
     }
     if !ok {
         reported = NONE;
     }
-    let notify = SelectionNotifyEvent {
-        response_type: SELECTION_NOTIFY_EVENT,
+    let notify = SelectionNotify {
         sequence: 0,
         time: req.time,
         requestor: req.requestor,
@@ -398,9 +396,12 @@ fn serve_request(inner: &Inner, req: &SelectionRequestEvent) {
         target: req.target,
         property: reported,
     };
-    let _ = inner
-        .conn
-        .send_event(false, req.requestor, EventMask::NO_EVENT, notify);
+    let _ = inner.conn.send_void(xproto::send_event(
+        false,
+        req.requestor,
+        event_mask::NO_EVENT,
+        &notify.to_bytes(),
+    ));
     let _ = inner.conn.flush();
 }
 
@@ -410,7 +411,14 @@ fn serve_request(inner: &Inner, req: &SelectionRequestEvent) {
 fn read_paste(inner: &Inner, property: Atom) -> Option<String> {
     let reply = inner
         .conn
-        .get_property(true, inner.win, property, AtomEnum::ANY, 0, u32::MAX)
+        .send(xproto::get_property(
+            true,
+            inner.win,
+            property,
+            atom::ANY,
+            0,
+            u32::MAX,
+        ))
         .ok()?
         .reply()
         .ok()?;
@@ -426,7 +434,7 @@ fn read_paste(inner: &Inner, property: Atom) -> Option<String> {
     // Decode by the property's actual type, per ICCCM: STRING is Latin-1,
     // UTF8_STRING and text/plain;charset=utf-8 are UTF-8. Latin-1 → Unicode is
     // the identity on 0..=0xFF, so `b as char` is exact.
-    if reply.type_ == Atom::from(AtomEnum::STRING) {
+    if reply.type_ == atom::STRING {
         Some(reply.value.iter().map(|&b| b as char).collect())
     } else {
         String::from_utf8(reply.value).ok()
@@ -448,7 +456,10 @@ fn read_incr(inner: &Inner, property: Atom) -> Option<String> {
     let mut buf: Vec<u8> = Vec::new();
     while Instant::now() < deadline {
         let ev = match inner.conn.poll_for_event() {
-            Ok(Some(ev)) => ev,
+            Ok(Some(packet)) => match Event::parse(&packet) {
+                Ok(ev) => ev,
+                Err(_) => continue,
+            },
             Ok(None) => {
                 std::thread::sleep(Duration::from_millis(2));
                 continue;
@@ -459,11 +470,18 @@ fn read_incr(inner: &Inner, property: Atom) -> Option<String> {
             Event::PropertyNotify(p)
                 if p.window == inner.win
                     && p.atom == property
-                    && p.state == Property::NEW_VALUE =>
+                    && p.state == notify_state::NEW_VALUE =>
             {
                 let chunk = inner
                     .conn
-                    .get_property(true, inner.win, property, AtomEnum::ANY, 0, u32::MAX)
+                    .send(xproto::get_property(
+                        true,
+                        inner.win,
+                        property,
+                        atom::ANY,
+                        0,
+                        u32::MAX,
+                    ))
                     .ok()?
                     .reply()
                     .ok()?;
@@ -514,8 +532,6 @@ mod tests {
             a.set(Sel::Clipboard, payload),
             "a must take CLIPBOARD ownership"
         );
-        // Let `a`'s serving thread register ownership before `b` asks for it.
-        std::thread::sleep(std::time::Duration::from_millis(100));
         assert_eq!(
             b.get(Sel::Clipboard).as_deref(),
             Some(payload),
@@ -524,7 +540,6 @@ mod tests {
         // PRIMARY is an independent buffer (select-to-copy / middle-click).
         let prim = "primary selection text";
         assert!(a.set(Sel::Primary, prim));
-        std::thread::sleep(std::time::Duration::from_millis(100));
         assert_eq!(b.get(Sel::Primary).as_deref(), Some(prim));
         // CLIPBOARD is unchanged by the PRIMARY write (the two never alias).
         assert_eq!(b.get(Sel::Clipboard).as_deref(), Some(payload));

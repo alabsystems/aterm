@@ -12,14 +12,16 @@
 //! dependency.
 
 pub mod cast_drift;
+pub mod hangup;
 pub mod host;
 pub mod selection;
 pub mod wire;
 
-/// The verb-matrix suite every [`SessionHost`] must pass, plus the reference
-/// in-memory host it is proven non-vacuous against. Always compiled under
-/// `cfg(test)`; the `conformance` feature exposes it to downstream hosts.
-#[cfg(any(test, feature = "conformance"))]
+/// The verb-matrix suite every [`SessionHost`] must pass; this crate's tests
+/// run it against a reference in-memory host. Compiled in every debug build,
+/// so a downstream host's tests and its main-thread gate binary run it from
+/// the ordinary dev target with no feature; a release build carries none of it.
+#[cfg(any(test, debug_assertions))]
 pub mod conformance;
 
 pub use host::{ChangeWait, HostCapabilities, Selector, SessionEntry, SessionHost, SessionState};

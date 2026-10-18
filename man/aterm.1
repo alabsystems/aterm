@@ -1,0 +1,466 @@
+.\" SPDX-License-Identifier: Apache-2.0
+.\" Copyright 2026 Andrew Yates
+.\" Manual page for aterm. The generated, drift-proof references are
+.\" `aterm help`, `aterm --window --help` and `aterm ctl help`.
+.TH ATERM 1 "2026-10-15" "aterm" "aterm Manual"
+.SH NAME
+aterm \- a transparent, introspecting terminal
+.SH SYNOPSIS
+.B aterm
+.RI [ OPTIONS ]
+.br
+.B aterm \-\-window
+.RI [ WINDOW\-OPTIONS ]
+.br
+.B aterm \-\-headless
+.RI [ WINDOW\-OPTIONS ]
+.br
+.B aterm ctl
+.RB [ \-\-sock
+.I PATH
+|
+.B \-\-pid
+.IR PID ]
+.RB [ \-\-timeout
+.IR SECS ]
+.RI [ @<sel> ]
+.I verb
+.RI [ args... ]
+.br
+.B aterm
+.I verb
+.RI [ args... ]
+.br
+.B aterm
+.I tool
+.RI [ args... ]
+.br
+.B aterm help
+.RI [ topic ]
+.SH DESCRIPTION
+.B aterm
+is one binary. With a TTY it is the
+.IR session :
+it spawns your
+.B $SHELL
+in a PTY and passes I/O through unchanged; the host terminal draws the bytes,
+and the session keeps no screen state and serves no control socket. With no
+TTY,
+.B \-\-window
+or
+.B \-\-headless
+it is the
+.IR window :
+a GPU terminal (Metal on macOS, wgpu elsewhere, with a CPU fallback) or,
+headless, the same engine, PTYs and control socket with no window.
+.B aterm ctl
+drives the window through that socket.
+.PP
+The names
+.BR aterm\-gui ,
+.BR aterm\-cli ,
+.BR aterm\-ctl ,
+.BR aterm\-fleet ,
+.BR aterm\-drive ,
+.B aterm\-link
+and
+.B atpkg
+are links to this binary, dispatched by
+.IR argv[0] .
+.PP
+In the
+.B user
+(default) and
+.B master
+containment modes the shell inherits the launching shell's limits. In
+.B safety
+it gets soft
+.BR setrlimit (2)
+caps (8192 open files; 16 GiB address space off macOS), which its rc can
+raise, or, on Windows, Job Object limits.
+.B containment
+adds the macOS sandbox (Seatbelt) and sets those caps as hard limits, which
+the program cannot raise; it refuses to start where there is no OS sandbox.
+.SH OPTIONS
+.TP
+.B \-\-window
+Open the GPU window (a launch with no TTY, such as from Finder, opens it too).
+.TP
+.B \-\-headless
+Serve the engine and control socket with no window (announced on stderr).
+.TP
+.B \-\-session
+Force the transparent shell session (piped or CI runs).
+.TP
+.BI \-\-containment " MODE"
+.BR master ", " user ", " safety " or " containment
+(case\-insensitive; the last flag wins). An invalid value fails closed to
+.BR containment .
+.B \-\-sandbox
+and
+.B \-\-no\-sandbox
+are shorthands for
+.B containment
+and
+.BR user .
+.IP
+The sandbox allows no network, no debugger attach, writes only to temp dirs
+and shell history, no access to credential stores or private data, and no
+mach service lookup but user and group queries, so
+.BR open ,
+.BR osascript ,
+.B pbcopy
+and the keychain do nothing. The window brokers nothing for a contained tab:
+no OSC 52 clipboard, no Kitty file, temp\-file or shared\-memory image, no
+desktop notification. A plain
+.B aterm \-\-sandbox
+session parses nothing, so the terminal around it applies its own policy to
+the program's escape sequences (an aterm window in
+.B user
+mode writes the pasteboard from its OSC 52).
+.TP
+.B \-\-no\-reroute
+Restore the upstream Rust names (cargo, rustc, ...) in this session; see
+.BR "aterm help reroute" .
+.TP
+.BR \-q ", " \-\-quiet
+Hide the session's startup line.
+.TP
+.B \-\-verbose
+Session: a one\-line summary on exit. Window: routine startup notices.
+.TP
+.BR \-h ", " \-\-help ", " \-V ", " \-\-version
+Print help / version and exit.
+.SS Window options
+Run
+.B aterm \-\-window \-\-help
+for the complete set and the config keys. Precedence is flag > config >
+default.
+.TP
+.BI \-e ", " \-\-command " cmd [args...]"
+Run
+.I cmd
+instead of
+.BR $SHELL ;
+consumes the rest of the command line.
+.B \-\-hold
+keeps the window open after it exits.
+.TP
+.BI \-d ", " \-\-working\-directory " dir"
+Start in
+.IR dir .
+.TP
+.BI \-\-control\-sock " path"
+Bind the control socket at
+.I path
+.RB ( 0 / off
+or
+.B \-\-no\-control\-sock
+disables it).
+.TP
+.BI \-\-columns " n" ", " \-\-lines " n"
+Initial grid size.
+.TP
+.BR \-\-gpu ", " \-\-cpu
+Force the renderer for this launch (the last one wins).
+.TP
+.BI \-\-scale " f"
+Force the render scale; headless, the
+.B image
+capture renders at that DPI.
+.TP
+.BI \-\-font\-px " n"
+Font size in physical pixels.
+.TP
+.BI \-\-shell " name|path"
+The interactive shell to spawn.
+.TP
+.B \-\-no\-shell\-integration
+Disable the shell\-integration marks.
+.TP
+.B \-\-diagnose
+Print a diagnostics report and exit.
+.SH SUBCOMMANDS
+Each runs without spawning a shell:
+.BR show\-config ,
+.BR explain\-config ,
+.B doctor
+(fixes what it can unless
+.BR \-\-read\-only ;
+exits 1 only when the shell cannot start),
+.BR list\-fonts ,
+.BI show\-face " family" ,
+.BR list\-themes ,
+.BR list\-kitty\-commands ,
+.BR exceptions " [" \-\-all ].
+.SH VERBS
+.BI "aterm help " verb
+has each one's page.
+.TP
+.B aterm ctl \fIargs\fR
+Read and drive an aterm window's sessions over its control socket (below).
+.TP
+.B aterm conn \fR[\fIcmd\fR]
+Standing pull/push wiring between sessions
+.RB ( ls / add / set / rm / spawn / show / map ).
+.TP
+.B aterm pkg \fIargs\fR
+Install, update and verify the toolchain (the package manager).
+.TP
+.B aterm \fItool\fR [\fIargs\fR]
+Run an installed toolchain program from the managed store, never
+.BR $PATH ;
+.BI "aterm pkg install " tool
+adds one.
+.TP
+.B aterm fleet \fIargs\fR
+Watch and drive the sessions of every aterm window on this machine.
+.TP
+.B aterm drive \fIargs\fR
+Drive an agent
+.RI ( prompt " | " read " | " await " | " shot )
+and supervise it
+.RI ( supervise " | " watch " | " task " | " report " | " ledger ).
+.TP
+.BR "aterm link" ", " "aterm fabric"
+Mail between sessions and hosts.
+.TP
+.B aterm fabric brief \fR[\fB@\fIsid\fR[\fB@\fInode\fR]] [\fB\-\-window\fR \fIrecords\fR] [\fB\-\-budget\fR \fItokens\fR]
+The fleet's session logs folded from the bus alone (no control socket): each
+session's open run and turn, its needs and recent turns, marked
+.B partial
+when the window holds neither its start nor a snapshot
+.RB ( why=no-start ),
+when it lost records no snapshot it holds folds past
+.RB ( why=lost ),
+when its node went away or relaunched before its close reached the bus
+.RB ( why=node-gone ),
+or when its own presence says it exited without that close
+.RB ( why=no-close ),
+and
+.B holes=
+for loss nobody said, from the first record the window reaches. The whole is
+held to
+.B \-\-budget
+tokens; the sessions past it are counted
+.BR more=sessions: .
+It shows something only for a node whose bridge runs
+with
+.BR "[fabric] log = \(dqturns\(dq" :
+the default
+.B \(dqoff\(dq
+puts nothing of the session logs on the bus. With
+.B \(dqturns\(dq
+each session's turns, runs, needs and the approval, question, wall and stall
+steps they rise from go to its
+.B ev
+face as counts and closed words: no command line, title, cwd, note text or
+mail party, and a session that drove another reads as
+.BR by=e<8\ hex> ,
+never its sid (the hash keyed by a secret the node mints once).
+.B aterm fabric tail \-\-bodies
+prints such a record's wire fields, labelled by its
+.BR src= .
+Before the broker keeps a retention policy, a node stops
+mirroring at 256 MiB of records
+.RB ( "aterm ctl fabric status"
+says
+.BR mirror=capped ).
+Closed sessions' records still held for a bridge that no longer mirrors are
+said there as
+.BR "mirror=unserved tails=" \fIk\fR.
+.TP
+.B aterm ship \fIargs\fR
+Cut and release a build (needs a source checkout).
+.TP
+.B aterm update \fR[\fIcmd\fR]
+Report or check for an update
+.RI ( status " | " check " | " identity ).
+.TP
+.B aterm agents \fR[\fIcmd\fR]
+Keep the aterm primer in coding agents' context files.
+.TP
+.B aterm machines \fIcmd\fR
+Configure and manage a lab of Macs from this one over SSH, with no MDM and no
+Apple account
+.RI ( init " | " scan " | " enroll " | " status " | " plan " | " apply " | " person " | " screen );
+macOS only.
+.TP
+.B aterm harness \fIcmd\fR
+Claude Code's spend, limits and accounts, the disk, the approval ledger;
+.B upgrade
+moves a live Claude Code onto a newer build.
+.TP
+.B aterm keeper \fIcmd\fR
+The PTY keeper (macOS, opt\-in with
+.BR "[keeper] enabled = true" ).
+.TP
+.BR "aterm new\-tab" ", " "aterm new\-window" ", " "aterm split\-pane"
+Open a tab, window or split
+.RB ( \-d
+.IR dir ;
+split takes
+.BR \-V / \-H ).
+.SH CONTROL SOCKET
+A window serves a per\-user Unix socket in a mode 0700 directory, speaking
+newline\-delimited text. Only same\-uid peers that present the per\-launch
+token are served;
+.B aterm ctl
+presents it. The complete verb list is generated from the engine's verb table:
+.B aterm ctl help
+(or
+.B aterm help introspection
+anywhere).
+.PP
+Without
+.B \-\-sock
+or
+.BR \-\-pid ,
+a call from a shell an aterm window or
+.B \-\-headless
+instance spawned drives the instance hosting the calling terminal
+.RB ( $ATERM_PARENT_SESSION_ID );
+otherwise
+.IR <dir>/aterm.sock ,
+the newest instance.
+.I <dir>
+is
+.B $XDG_RUNTIME_DIR/aterm
+when set, else
+.B ~/Library/Application Support/aterm
+(every Unix, Linux included) or
+.B %TMP%\eaterm
+(Windows).
+.PP
+A leading selector addresses any session of any same\-user instance:
+.BI @s\- hex
+(a session id from
+.BR ls ),
+.B @self
+(your own),
+.B @.\&
+(the active tab),
+.BI @ n
+(a local number), and
+.B @*
+.RB ( subscribe
+only). Verbs group as observe
+.RB ( text ", " screen ", " cursor ", " search ", " blocks ),
+capture
+.RB ( image ", " cast ", " temporal ),
+live
+.RB ( subscribe ),
+drive
+.RB ( send ", " key ", " turn ", " resize ", " select ),
+wait
+.RB ( ready ", " await ", " wait ),
+session log
+.RB ( log ", " brief ", " mark ,
+.B await log
+and
+.BI "subscribe @" sid " log" ;
+a mark is an attributed claim and never acts),
+app
+.RB ( spawn ", " close ", " tab ", " invoke ", " controls ", " settings ),
+connections
+.RB ( connect ", " disconnect ", " flows )
+and discovery
+.RB ( ls ", " instances ", " windows ", " mux ).
+.PP
+.B aterm ctl
+exits 0 on
+.BR OK ;
+1 on
+.BR ERR ,
+a connection or usage failure, or, for
+.BR ls / instances / windows ,
+a socket directory with no instance in it; 2 when
+.BR ls / instances / windows
+could not look or reach (sockets found but none answered, or the directory
+missing, unreadable or unresolvable); 75 when the instance went away
+mid\-exchange and nothing replaced it; 124 on a timeout (the client's
+.B \-\-timeout
+or a server
+.BR status=timeout ).
+.SH ENVIRONMENT
+No environment variable selects a launch choice or overrides an aterm.toml
+key;
+.B XDG_CONFIG_HOME
+only locates the file (FILES). A shell an aterm window or
+.B \-\-headless
+instance spawns gets
+.BR TERM_PROGRAM=aterm ", " ATERM_CHILD=1 ", " ATERM_PARENT_SESSION_ID ,
+.B ATERM_SESSION_ID
+and the tool directory on
+.BR PATH ;
+a plain aterm session gets the tool directory on
+.B PATH
+but none of those four variables. Every spawned shell has AI\-tool variables
+.RB ( CLAUDE* ", " ANTHROPIC_* ", " COPILOT_* ", " CODEX_* ", " ANTIGRAVITY_* ", " GEMINI_* ", " CURSOR_* ", " AI_* ", " _DEVTOOL_* )
+stripped.
+.SH FILES
+.TP
+.I <config>/aterm/aterm.toml
+The configuration, which the window reloads live.
+.I <config>
+is
+.B $XDG_CONFIG_HOME
+when set, else
+.B ~/.config
+(macOS, Linux) or
+.B %APPDATA%
+(Windows);
+.B aterm explain\-config
+shows the resolution.
+.TP
+.IR <dir>/aterm\-<pid>.sock ", " <dir>/aterm\-<pid>.token
+An instance's control socket and its per\-launch token;
+.I <dir>/aterm.sock
+points at the newest.
+.TP
+.I <logs>/messages.log
+Every message aterm showed or recorded (rotated past 1 MiB, one older copy
+kept); notices scripts post go to
+.IR messages.wire.log .
+.I <logs>
+is
+.B ~/Library/Logs/aterm
+(macOS),
+.B $XDG_STATE_HOME/aterm/logs
+(Linux) or
+.B %LOCALAPPDATA%\eaterm\elogs
+(Windows).
+.TP
+.I <logs>/session\-log/
+The session journal, only with
+.B "[session_log] journal = true"
+(off by default; macOS and Linux): each session's log as
+.IB <instance> . <n> .slog
+segments, 0600 in a 0700 folder, at most 64 MiB and 2048 files, the oldest
+deleted first, so
+.B aterm ctl log @<sid>
+answers for a session from an earlier run. It keeps each command's first word
+as typed (so a secret typed at a prompt and run is kept too), never its
+arguments. Off, nothing is created there.
+.SH EXAMPLES
+.nf
+aterm                                  # an interactive shell
+aterm \-\-sandbox                        # the same shell under the macOS sandbox
+aterm \-\-headless \-\-control\-sock /tmp/a.sock \-\-columns 110 \-\-lines 32 &
+aterm ctl \-\-sock /tmp/a.sock image before.png
+aterm ctl ls                           # every session of every instance
+aterm ctl @s\-ab12cd text
+.fi
+.SH SEE ALSO
+.B aterm help
+(the full manual),
+.B aterm ctl help
+(the control verbs),
+.B aterm \-\-window \-\-help
+(window flags and config keys), and
+.I docs/INTROSPECTION.md
+in the aterm source tree.
+.SH AUTHOR
+Andrew Yates.
+.SH COPYRIGHT
+Copyright 2026 Andrew Yates. Licensed under the Apache License, Version 2.0.

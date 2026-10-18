@@ -18,21 +18,20 @@
 //! `cargo tree --workspace --target <cell> -e normal,build -i cfg-if --depth 1`
 //! on all four cells:
 //!
-//! * **mac-arm and win-msvc**, 7 each — `getrandom 0.2.17`, `half 2.7.1`,
-//!   `naga 29.0.3`, `parking_lot_core 0.9.12`, `ring 0.17.14`, `wgpu 29.0.3`,
-//!   `wgpu-hal 29.0.3`.
-//! * **linux-gnu**, 15 — those seven plus `ahash 0.8.12` (through our winit
-//!   fork), `async-io 2.6.0`, `async-process 2.5.0`, `async-signal 0.2.14`,
-//!   `getrandom 0.3.4`, `libloading 0.8.9`, `polling 3.11.0` and
-//!   `tiny-skia 0.11.4` (through `sctk-adwaita`).
-//! * **wasm32**, 8 — `half 2.7.1`, `naga 29.0.3`, `parking_lot_core 0.9.12`,
-//!   `ring 0.17.14`, `wasm-bindgen 0.2.108`, `wasm-bindgen-futures 0.4.58`,
-//!   `wgpu 29.0.3` and `wgpu-hal 29.0.3` (re-measured 2026-10-15, when
-//!   `console_error_panic_hook` left for `aterm-wasm-abi`, wasm-platform WP.3).
-//!   Per shipped module (`-p aterm-gpu-web` / `-p aterm-wasm` in place of
-//!   `--workspace`), the GPU module reaches all of them but `ring`, and the
-//!   CPU module none: its only one was `wasm-bindgen`, which it left at
-//!   wasm-platform WP.7 (re-measured 2026-10-16).
+//! * **mac-arm**, 1 — `ring 0.17.14`.
+//! * **win-msvc**, 6 — `half 2.7.1`, `naga 29.0.3`, `parking_lot_core 0.9.12`,
+//!   `ring 0.17.14`, `wgpu 29.0.3`, `wgpu-hal 29.0.3`.
+//! * **linux-gnu**, 6 — `async-io 2.6.0`, `async-process 2.5.0`,
+//!   `async-signal 0.2.14`, `libloading 0.8.9`, `polling 3.11.0` and
+//!   `ring 0.17.14` (re-measured 2026-10-17, after linux-windowing LW.5 took
+//!   `tiny-skia 0.11.4` out with `sctk-adwaita`).
+//! * **wasm32**, 2 — `ring 0.17.14` and `wasm-bindgen 0.2.108`, through
+//!   workspace members no shipped module compiles for wasm32 (re-measured
+//!   2026-10-17, when the GPU module left wgpu and wasm-bindgen at
+//!   wasm-platform WP.8, taking `half`, `naga`, `parking_lot_core`, `wgpu`
+//!   and `wgpu-hal` with it). Per shipped module (`-p aterm-gpu-web` /
+//!   `-p aterm-wasm` in place of `--workspace`), neither reaches it: the CPU
+//!   module left at WP.7, the GPU module at WP.8.
 //!
 //! A patch also redirects DEV and BUILD edges, so `cargo test` compiles more
 //! `cfg_if!` call sites than the census above (`-e normal,build,dev` lists

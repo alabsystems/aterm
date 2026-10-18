@@ -48,10 +48,40 @@ pub struct Group {
 /// then ungrouped singletons, members sorted.
 #[must_use]
 pub fn plan_groups(index: &Index, channel: &Channel) -> Vec<Group> {
+    plan_groups_with(index, channel, &|_| false)
+}
+
+/// [`plan_groups`] on this machine: a vendor-table program the source rule hands to the
+/// index lane here ([`crate::alab::source_in`] is [`crate::alab::Source::Index`]: an ALab
+/// build pinned for `triple` from ALab's repo) is planned like any index program; every other
+/// vendor-table program stays its vendor lane's.
+#[must_use]
+pub fn plan_groups_here(
+    layout: &crate::store::Layout,
+    index: &Index,
+    channel: &Channel,
+    triple: &str,
+) -> Vec<Group> {
+    plan_groups_with(index, channel, &|program| {
+        matches!(
+            crate::alab::source_in(layout, index, channel, program, triple),
+            crate::alab::Source::Index { .. }
+        )
+    })
+}
+
+/// [`plan_groups`] with `index_owns` naming the vendor-table programs the index lane owns
+/// here; every other one is skipped.
+#[must_use]
+pub fn plan_groups_with(
+    index: &Index,
+    channel: &Channel,
+    index_owns: &dyn Fn(&str) -> bool,
+) -> Vec<Group> {
     let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut singletons: Vec<String> = Vec::new();
     for program in channel.pin.keys() {
-        if crate::vendor_direct::is_vendor(program) {
+        if crate::vendor_direct::is_vendor(program) && !index_owns(program) {
             continue;
         }
         // Reachability: only programs the verified index names are installable.
@@ -404,13 +434,9 @@ repo = "aterm"
             &mut |n| n != "trust", // ay flips ok, trust's flip fails
             &mut |n| rolled.push(n.to_string()),
         );
-        assert_eq!(
-            out,
-            TxnOutcome::Aborted {
-                failed: "trust".into(),
-                during_flip: true,
-                why: "the flip failed and the members already flipped were rolled back".into(),
-            }
+        assert!(
+            matches!(&out, TxnOutcome::Aborted { failed, during_flip: true, .. } if failed == "trust"),
+            "{out:?}"
         );
         assert_eq!(
             rolled,

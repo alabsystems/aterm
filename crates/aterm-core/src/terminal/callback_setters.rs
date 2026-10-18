@@ -191,8 +191,6 @@ impl Terminal {
         };
         let next = target.and_then(|grid| grid.reattach_reflowed_scrollback_or_redetach(reflowed));
         self.take_back_saved_cursors();
-        // The history is back: the vi cursor is clamped against it now.
-        self.vi_shift(0);
         next
     }
 
@@ -210,7 +208,6 @@ impl Terminal {
         if let Some(grid) = target {
             grid.abort_reflow_offload();
         }
-        self.vi_shift(0);
     }
 
     /// Attach or detach the off-thread compression worker on the
@@ -255,6 +252,18 @@ impl Terminal {
         target.map_or(0, |grid| grid.drain_lazy_bounded(max_lines))
     }
 
+    /// A pressure-relief batch on the same primary-content backlog, refusing
+    /// to promote an open cut's marker. The grid rechecks each batch, including
+    /// one owed before the caller released its terminal lock.
+    pub fn drain_lazy_pressure_bounded(&mut self, max_lines: usize) -> usize {
+        let target = if self.modes.alternate_screen {
+            self.alt_grid.as_mut()
+        } else {
+            Some(&mut self.grid)
+        };
+        target.map_or(0, |grid| grid.drain_lazy_pressure_bounded(max_lines))
+    }
+
     /// One bounded drain opportunity for a host polling mid-flood (the
     /// compression worker's trickle, a wasm host's per-frame drain), on the same
     /// backlog as [`drain_lazy_bounded`](Self::drain_lazy_bounded). Skipped while
@@ -287,9 +296,8 @@ impl Terminal {
         // from `take_last_resize_row_shift`, which selection custody drains).
         self.journal_resize(origin);
         // Only a width change invalidates coordinates (rewrap renumbers rows): the
-        // selections clear, and the vi cursor is only clamped since a rewrap maps
-        // nothing. A rows-only resize keeps row identity: the selection and vi
-        // cursor are relabelled by the row shift (resize undo included) and clamped.
+        // selections clear. A rows-only resize keeps row identity: the selection is
+        // relabelled by the row shift (resize undo included) and clamped.
         if cols_changed {
             // A width change never keeps a grid resize undo, so none is open.
             self.resize_undo_selection = None;
@@ -299,7 +307,6 @@ impl Terminal {
             // `abort_resize_offload` later mutate that grid's scrollback with no
             // selection call; sound only while the offload path is width-only.
             self.parked_text_selection.clear();
-            self.vi_shift(0);
         } else {
             // A rows grow that revealed retained history moves every pre-resize row
             // `revealed` rows down, as the grid does for its cursors;
@@ -308,7 +315,6 @@ impl Terminal {
             // shrink is not uniform: the bottom `demoted` viewport rows go to history
             // while top rows stay, the piecewise map `adjust_for_rows_shrink` applies.
             let selection_before = self.text_selection.clone();
-            let vi_before = self.vi_is_active().then(|| self.vi.cursor_point().line);
             let revealed = i32::from(self.grid.take_last_resize_row_shift());
             let max_rows = i32::from(self.grid.rows());
             let demoted = i32::from(rows_before.saturating_sub(self.grid.rows()));
@@ -318,18 +324,16 @@ impl Terminal {
                 // trimming trailing blank rows moves nothing.
                 self.text_selection
                     .adjust_for_rows_shrink(max_rows, revealed, floor);
-                self.vi_shift(revealed.saturating_neg());
             } else {
                 self.text_selection
                     .adjust_for_scroll(-revealed, max_rows, floor);
-                self.vi_shift(revealed);
             }
             // Resize undo: the transform above clamps an anchor on a row the alt grid
             // demoted, so the grow would land it a row low though every cell came
             // back. Keep the selection the first shrink found and restore it when the
             // grid hands its undo back whole. Active screen only: the parked main
             // grid keeps history and opens no undo.
-            self.follow_resize_undo_selection(selection_before, vi_before, undone);
+            self.follow_resize_undo_selection(selection_before, undone);
             // The parked selection follows the other grid, with that grid's own shift
             // and floor (the active alt grid's `scrollback_lines()` is 0 and would
             // evict every scrollback anchor); both grids ran the same height change.
@@ -354,22 +358,14 @@ impl Terminal {
                 }
             }
         }
-        // DEC mode 2048: send an in-band size report on every resize. This writes
-        // the response buffer directly, so honor its cap: a resize storm against
-        // a host not draining responses must not grow it past
-        // MAX_RESPONSE_BUFFER_SIZE. The report is <= 48 bytes.
-        if self.modes.in_band_size_reports
-            && self.transient.response_buffer.len().saturating_add(48)
-                <= super::MAX_RESPONSE_BUFFER_SIZE
-        {
-            let (rows, cols) = (self.grid.rows(), self.grid.cols());
-            let (cw, ch) = self.iterm2.cell_px;
+        // DEC mode 2048: send an in-band size report on every resize (the emitter
+        // holds the response buffer's cap against a resize storm).
+        if self.modes.in_band_size_reports {
             super::state_accessors::push_in_band_size_report(
                 &mut self.transient.response_buffer,
-                rows,
-                cols,
-                cw,
-                ch,
+                self.grid.rows(),
+                self.grid.cols(),
+                self.iterm2.host_cell_px(),
             );
         }
         // Resize is a major grid mutation boundary: check structure (debug builds).
@@ -415,28 +411,6 @@ impl Terminal {
     /// (`ESC ] 9 ; message BEL|ST`); it receives the message.
     pub fn set_notification_callback<F: FnMut(&str) + Send + 'static>(&mut self, callback: F) {
         self.notifications.callback = Some(Box::new(callback));
-    }
-
-    /// Set the callback for dynamic color changes (OSC 10/11/12, 110/111/112):
-    /// it receives which color changed, its new value and whether it was set,
-    /// reset or made dynamic.
-    #[cfg(test)]
-    pub fn set_color_change_callback<F>(&mut self, callback: F)
-    where
-        F: FnMut(super::ColorTarget, aterm_types::Rgb, super::ColorChangeOp) + Send + 'static,
-    {
-        self.color.change_callback = Some(Box::new(callback));
-    }
-
-    /// Set the callback consulted first for dynamic color queries (OSC 10/11/12
-    /// `?`), for a host that renders colors other than the palette's. `Some`
-    /// answers the query; `None` falls back to the palette.
-    #[cfg(test)]
-    pub fn set_color_query_callback<F>(&mut self, callback: F)
-    where
-        F: FnMut(super::ColorTarget) -> Option<aterm_types::Rgb> + Send + 'static,
-    {
-        self.color.query_callback = Some(Box::new(callback));
     }
 
     /// Set the callback for complete OSC 99 (kitty: title, body, urgency, id)

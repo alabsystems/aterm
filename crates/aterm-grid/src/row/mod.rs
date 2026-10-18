@@ -17,6 +17,13 @@ fn u16_from_usize(value: usize) -> u16 {
     value.try_into().unwrap_or(u16::MAX)
 }
 
+/// Where the halves of wide pairs an ICH/DCH/ECH blanked with its BCE fill ended
+/// up once its shift was done (at most four), beyond the span it vacated or
+/// erased. The grid gives each the fill's dense-RGB-ring bytes, as it gives that
+/// span (`Grid::fill_bce_rgb_cols`): a truecolour blank resolves its colour
+/// there, and finds no bytes, or a dead glyph's, if none were written.
+pub type BlankedHalves = [Option<u16>; 4];
+
 /// A cell an early-wrap hole can still be: a blank (space) that is no half of
 /// a wide glyph and no complex cluster. Its colours do not matter, since xterm
 /// blanks the hole with the current background (BCE).
@@ -61,11 +68,8 @@ aterm_types::bitflags! {
         /// `Row::set`/`overwrite_span` of a wide cell; cleared by whole-row
         /// clears. Gates the wide fixups so narrow-only rows skip the scan.
         const HAS_WIDE_CHARS = 1 << 5;
-        /// At least one cell uses a StyleId (cell flag USES_STYLE_ID). Set by
-        /// the (test-only) StyleId write paths and `Row::set`/`overwrite_span`;
-        /// cleared by whole-row clears. Lets `extract_row_extras` skip the
-        /// per-cell scan.
-        const HAS_STYLE_ID = 1 << 6;
+        // Bit 6 is unassigned (it was HAS_STYLE_ID, for style-interned
+        // cells, which nothing writes).
         /// The row's last cell is an early-wrap hole: a width-2 glyph that
         /// could not start there wrapped to the next row and left the cell
         /// unwritten (xterm blanks it with the current background; Ghostty's
@@ -115,8 +119,8 @@ impl Row {
     /// another owner, that owner must not outlive the backing page store.
     #[must_use]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "ResizeRowReuse",
             action = "Grow",
             project = "grid::tests::resize_row_reuse::resize_row_reuse_conforms"
@@ -139,8 +143,8 @@ impl Row {
     ///
     /// `pages` must be the live PageStore that allocated this row's cells.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "ResizeRowReuse",
             action = "Shrink",
             project = "grid::tests::resize_row_reuse::resize_row_reuse_conforms"
@@ -172,16 +176,8 @@ impl Row {
         self.flags |= RowFlags::DIRTY | RowFlags::HAS_WIDE_CHARS;
     }
 
-    /// Check if this row contains any cell with a `StyleId`.
-    #[must_use]
-    #[inline]
-    pub fn has_style_id(&self) -> bool {
-        self.flags.contains(RowFlags::HAS_STYLE_ID)
-    }
-
     /// Get the page ID for this row's cell storage.
-    ///
-    /// Used for pin invalidation tracking.
+    #[cfg(test)]
     #[must_use]
     #[inline]
     pub(crate) fn page_id(&self) -> super::page::PageId {
@@ -250,6 +246,21 @@ impl Row {
             self.flags |= RowFlags::EARLY_WRAP_HOLE;
         } else {
             self.flags -= RowFlags::EARLY_WRAP_HOLE;
+        }
+    }
+
+    /// The cells output wrote on this row, less a recorded early-wrap hole: the
+    /// row's text as written. [`Row::len`] covers the hole when the wrap blanked
+    /// it with a background colour (BCE), but the hole is still not content
+    /// ([`RowFlags::EARLY_WRAP_HOLE`]), so every reader of a row as written (a
+    /// history line, a copy, a search row) stops before it.
+    #[must_use]
+    #[inline]
+    pub fn written_len(&self) -> u16 {
+        if self.has_early_wrap_hole() {
+            self.len.min(self.cols().saturating_sub(1))
+        } else {
+            self.len
         }
     }
 
@@ -378,15 +389,6 @@ impl Row {
         unsafe { self.cells.get_unchecked_mut(col as usize) }
     }
 
-    /// Mutable access to all cells (bulk writes); call `update_len()` after.
-    #[cfg(miri)]
-    #[must_use]
-    #[inline]
-    pub fn cells_mut(&mut self) -> &mut [Cell] {
-        self.flags |= RowFlags::DIRTY;
-        &mut self.cells[..]
-    }
-
     /// Get mutable access to a cell range after clearing any orphaned wide-char halves.
     ///
     /// Returns a clipped slice when `count` would extend past the row end.
@@ -431,9 +433,9 @@ impl Row {
     }
 
     /// Overwrite the cells from column `left` with `cells` (clipped to the
-    /// row), keeping the row's hints as [`Self::set`] does: `HAS_WIDE_CHARS`
-    /// for a copied wide head, `HAS_STYLE_ID` for a style-id cell. `len` is
-    /// left to the caller, which recomputes it after its boundary fixup.
+    /// row), keeping the row's hint as [`Self::set`] does: `HAS_WIDE_CHARS`
+    /// for a copied wide head. `len` is left to the caller, which recomputes
+    /// it after its boundary fixup.
     ///
     /// The margined scrolls and IL/DL copy through here: a copy that dropped
     /// `HAS_WIDE_CHARS` would let the bulk writers (whose wide fixups it gates)
@@ -446,14 +448,11 @@ impl Row {
         let n = cells.len().min(dst.len());
         dst[..n].copy_from_slice(&cells[..n]);
         let mut hints = RowFlags::DIRTY;
-        for cell in &cells[..n] {
-            let flags = cell.flags();
-            if flags.contains(super::CellFlags::WIDE) {
-                hints |= RowFlags::HAS_WIDE_CHARS;
-            }
-            if flags.contains(super::CellFlags::USES_STYLE_ID) {
-                hints |= RowFlags::HAS_STYLE_ID;
-            }
+        if cells[..n]
+            .iter()
+            .any(|cell| cell.flags().contains(super::CellFlags::WIDE))
+        {
+            hints |= RowFlags::HAS_WIDE_CHARS;
         }
         self.flags |= hints;
     }
@@ -473,12 +472,6 @@ impl Row {
             // bypassed after reflow copies wide cells via this method.
             if cell.flags().contains(super::CellFlags::WIDE) {
                 new_flags |= RowFlags::HAS_WIDE_CHARS;
-            }
-            // Propagate HAS_STYLE_ID so extract_row_extras can short-circuit on
-            // plain rows even after reflow/checkpoint restore copies
-            // style-interned cells via Row::set.
-            if cell.flags().contains(super::CellFlags::USES_STYLE_ID) {
-                new_flags |= RowFlags::HAS_STYLE_ID;
             }
             self.flags |= new_flags;
             self.note_write_through(usize::from(col) + 1);
@@ -588,16 +581,6 @@ impl Row {
     }
 
     /// Copy cells from another row.
-    #[cfg(miri)]
-    pub fn copy_from(&mut self, other: &Row) {
-        let copy_len = self.cols().min(other.cols()) as usize;
-        self.cells[..copy_len].copy_from_slice(&other.cells[..copy_len]);
-        self.len = other.len.min(self.cols());
-        self.flags = other.flags | RowFlags::DIRTY;
-    }
-
-    /// Copy cells from another row.
-    #[cfg(not(miri))]
     pub(crate) fn copy_from(&mut self, other: &Row) {
         let copy_len = self.cols().min(other.cols()) as usize;
         self.cells[..copy_len].copy_from_slice(&other.cells[..copy_len]);
@@ -657,9 +640,6 @@ mod char_ops;
 mod clear;
 mod fmt;
 mod write;
-
-#[cfg(test)]
-mod style_id_write;
 
 #[cfg(test)]
 mod tests;

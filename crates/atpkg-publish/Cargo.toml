@@ -22,9 +22,11 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
-# The client. The producer emits the client's own types and verifies with the client's
-# own chain (sig::admit_roster -> authorize_index -> verify_pkg); tree_root, lineage,
-# relocate and the toolchain lease are its library functions, never a copy.
+# THE CLIENT. Every type the producer emits is the one the client parses (manifest,
+# Channel::for_target, TARGETS), every "verified" is the client's own chain
+# (sig::admit_roster -> authorize_index -> verify_pkg), and tree_root, the lineage
+# admission and object scan, and the toolchain lease are its library functions — never
+# a copy. Pack-time relocation and the LINEAGE stamp are producer-only (artifact::).
 atpkg = { workspace = true }
 # The signer as a library: `sign`/`pubkey_b64` over the machine key, `verify_signed` for
 # an ALab release's SHA256SUMS, and (tests) `generate` + `roster_ops`.
@@ -35,6 +37,8 @@ aterm-update-core = { workspace = true }
 # The epoch-clock read, and RFC3339 parsing of `valid_until`.
 aterm-time = { workspace = true }
 aterm-types = { workspace = true }
+# How each write is finished: durable (F_FULLFSYNC) or ordered (F_BARRIERFSYNC).
+aterm-durable = { workspace = true }
 # The client's TOML parser, for what the typed client structs cannot answer (the head
 # channel's keys, the machine record, a merge base, a seal's trust-version.toml, the
 # lanes' unsigned staged manifests). Published manifests go through the client's verifier.
@@ -48,6 +52,9 @@ aterm-zstd = { workspace = true }
 # `targo metadata` and `--message-format=json` (artifact::pack), build-local's record,
 # and the publication engine's ledger (`mappings.json`).
 aterm-json = { workspace = true }
+# SHA-256 over the digests of a package's compiler binaries, the way codex-alab's
+# `alab/package.sh` records its compiler (artifact::package).
+aterm-digest = { workspace = true }
 # Scratch dirs: new, mode 0700, random name, removed on drop (a predictable path in a
 # shared /tmp can be pre-created by another user).
 aterm-tempfile = { workspace = true }
@@ -56,6 +63,8 @@ aterm-tempfile = { workspace = true }
 # The derived `AtpkgIndexPublishWalk` model, whose writer half drives the index's
 # compare-and-swap (tests/channel/).
 aterm-spec = { workspace = true }
+# The models its tests drive (a model edit rebuilds only their tests).
+aterm-models-atpkg = { workspace = true }
 
 [lints]
 workspace = true

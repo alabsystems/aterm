@@ -337,13 +337,18 @@ impl Terminal {
     /// It runs the byte plan of [`Self::foreground_handback_scoped`] without
     /// the evidence gate (step 0's `CAN` if mid-sequence, steps 1-12 where the
     /// live value differs from the host target, phase B), plus `OSC 8 ; ; ST`
-    /// when a hyperlink is open (`"hyperlink"`). The bytes go through
-    /// [`Self::process_at`] so the host records them and replay matches.
+    /// when a hyperlink is open (`"hyperlink"`), plus the colour resets that
+    /// put back the theme colours a program set (OSC 4/10/11/12/17/19/21):
+    /// `OSC 104` for the palette and `OSC 110/111/112/117/119` for each
+    /// dynamic slot the program owns (`"colors"`). The colour stack (OSC
+    /// 30001) is kept: a running program's later pop is its own business. The
+    /// bytes go through [`Self::process_at`] so the host records them and
+    /// replay matches.
     ///
     /// It never clears the screen or scrollback or touches the SGR pen,
-    /// palette, titles, tab stops or images; phase B puts the cursor back. The
+    /// titles, tab stops or images; phase B puts the cursor back. The
     /// alternate screen is left (`?1049l`). Run under a live TUI, it strips
-    /// that TUI's modes too.
+    /// that TUI's modes and colours too.
     ///
     /// Always returns a [`ForegroundHandback`]; its `bytes` are empty when the
     /// terminal was already at its host defaults (nothing is processed then).
@@ -374,6 +379,9 @@ impl Terminal {
         if manual && self.transient.current_hyperlink.is_some() {
             bytes.extend_from_slice(b"\x1b]8;;\x1b\\");
             reverted.push("hyperlink");
+        }
+        if manual {
+            self.manual_colour_reset(&mut bytes, &mut reverted);
         }
         if bytes.is_empty() {
             return None;
@@ -406,6 +414,31 @@ impl Terminal {
             }
         }
         Some(ForegroundHandback { bytes, reverted })
+    }
+
+    /// The manual reset's colour step: exactly the OSC resets that clear what a
+    /// program set over the configured colours ([`Self::program_color_overrides`]),
+    /// each ST-terminated, and `"colors"` when there was any. Every reset is
+    /// ungated and lands on the configured baseline, so afterwards the diff is
+    /// empty. The automatic handback never runs this.
+    fn manual_colour_reset(&self, bytes: &mut Vec<u8>, reverted: &mut Vec<&'static str>) {
+        let o = self.color.capture_overrides();
+        let start = bytes.len();
+        for (set, seq) in [
+            (!o.palette.is_empty(), &b"\x1b]104\x1b\\"[..]),
+            (o.foreground.is_some(), b"\x1b]110\x1b\\"),
+            (o.background.is_some(), b"\x1b]111\x1b\\"),
+            (o.cursor.is_some(), b"\x1b]112\x1b\\"),
+            (o.selection_background.is_some(), b"\x1b]117\x1b\\"),
+            (o.selection_foreground.is_some(), b"\x1b]119\x1b\\"),
+        ] {
+            if set {
+                bytes.extend_from_slice(seq);
+            }
+        }
+        if bytes.len() > start {
+            reverted.push("colors");
+        }
     }
 
     /// Phase A of [`Self::foreground_handback`]: the byte plan's steps 1–12,
@@ -469,8 +502,8 @@ impl Terminal {
         put(m.report_color_scheme, "\x1b[?2031l", "color-scheme-reports");
         // 1007 goes back to the host's value (aterm-gui: on), not power-on.
         put(
-            m.alternate_scroll != cfg.alternate_scroll,
-            set_reset(cfg.alternate_scroll, "\x1b[?1007h", "\x1b[?1007l"),
+            m.alternate_scroll != self.host_alternate_scroll,
+            set_reset(self.host_alternate_scroll, "\x1b[?1007h", "\x1b[?1007l"),
             "alternate-scroll",
         );
         put(

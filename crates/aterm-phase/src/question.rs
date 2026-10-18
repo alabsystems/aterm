@@ -49,7 +49,8 @@
 //! space after it, its rows a column short (MEASURED at 50 columns: `4.
 //! [✔]Decide yourself: …` over rows at column 8, where 80 columns draws `[✔]
 //! Decide` over column 9; ATERM-KI-1015-1 F2): read either way
-//! ([`checkbox`], [`label_col`]).
+//! ([`checkbox`], [`label_col`]), a row continuing at the column its own
+//! text starts at, never another.
 //!
 //! **NEVER READ WHOLE UNLESS SOUND.** A form is read only when every row of
 //! it is one of the rows above, the options are numbered `1..=N` from the
@@ -470,22 +471,36 @@ fn numbered(row: &str) -> Option<(Pointer, u8, &str)> {
 /// `(true, "x")` — and `[✔]x`, the box with no space after it, as Claude
 /// Code 2.1.300 draws a ticked free-text row in a narrow pane (MEASURED at 50
 /// columns: `4. [✔]Decide yourself: …`, its rows at column 8, the fixture
-/// `claude-2.1.300-question-multi-typed-50col.txt`; ATERM-KI-1015-1 F2).
+/// `claude-2.1.300-question-multi-typed-50col.txt`; ATERM-KI-1015-1 F2). The
+/// same row unticked, `[ ]x`, is read alike: a row that reads unticked, its
+/// answer none, never a form with no rows.
+///
+/// THE SPACE IS THE CHECKBOX'S. An option's checkbox sits in a box that
+/// never shrinks, the gap after it the row's; the free-text row's is a text
+/// with its space inside it (`["[", tick, "]", " "]`, read from the 2.1.300
+/// bundle), and once the focus leaves a text that overflows the row, the
+/// flex layout takes that space: the text, and every row it wraps onto,
+/// starts one cell left of the label column (MEASURED with the long-term
+/// text at 38, 39 and 41 to 51 columns; from 52 up it is drawn at the label
+/// column). Which widths draw it so depends on the text, so nothing may
+/// assume a column: [`options_zone`] reads the rows under a numbered row at
+/// its own [`label_col`].
 fn checkbox(text: &str) -> Option<(bool, &str)> {
-    if let Some(rest) = text.strip_prefix("[ ] ") {
-        Some((false, rest))
-    } else if let Some(rest) = text.strip_prefix("[✔] ") {
-        Some((true, rest))
-    } else {
-        text.strip_prefix("[✔]")
-            .filter(|rest| rest.starts_with(|c: char| !c.is_whitespace()))
-            .map(|rest| (true, rest))
+    let (ticked, rest) = match text.strip_prefix("[ ]") {
+        Some(rest) => (false, rest),
+        None => (true, text.strip_prefix("[✔]")?),
+    };
+    match rest.strip_prefix(' ') {
+        Some(label) => Some((ticked, label)),
+        None => rest
+            .starts_with(|c: char| !c.is_whitespace())
+            .then_some((ticked, rest)),
     }
 }
 
 /// The column a numbered row's label starts at, its rows under it with it
 /// (module header): 5, past `N. `, and in multi-select past the checkbox as
-/// drawn ([`checkbox`]: 9 past `[ ] `, 8 past `[✔]` with no space).
+/// drawn ([`checkbox`]: 9 past `[ ] `, 8 past `[✔]` or `[ ]` with no space).
 fn label_col(text: &str, multi: bool) -> usize {
     match checkbox(text).filter(|_| multi) {
         Some((_, label)) => 5 + cells(text) - cells(label),
@@ -775,8 +790,9 @@ fn head(rows: &[String], gap: usize) -> Result<Option<Head>, ()> {
 /// the options zone; a blank row; the question; a blank row; the tab bar;
 /// the top rule. `preview` when the footer has the `n to add notes` item.
 /// `None` when the rows are not this shape (the caller reads them as
-/// before); a shape whose walk ran off the screen's top once the options
-/// began is the dialog with its head off the screen.
+/// before); a shape whose walk ran off the screen's top once it passed the
+/// divider (the divider the screen's top row, or the options zone cut by it)
+/// is the dialog with its head off the screen.
 pub(crate) fn footed(rows: &[String], footer: usize, preview: bool) -> Option<QShape> {
     if crate::phase::composer_top(rows).is_some_and(|t| t > footer) {
         return None;
@@ -802,6 +818,11 @@ pub(crate) fn footed(rows: &[String], footer: usize, preview: bool) -> Option<QS
         width,
         ..QShape::unknown(HEAD_CUT, first_visible(), footer, true)
     };
+    // The divider on the screen's top row: the options over it and the head
+    // are off the rows read.
+    if divider == 0 {
+        return Some(cut());
+    }
     let zone = if preview {
         preview_zone(rows, divider)?
     } else {
@@ -878,10 +899,33 @@ fn options_zone(rows: &[String], divider: usize) -> Option<Walk> {
         .clone()
         .filter_map(|i| numbered(&rows[i]).map(|(_, _, t)| t))
         .collect();
-    let multi = !texts.is_empty() && texts.iter().all(|t| checkbox(t).is_some());
-    // The label column of the numbered row above (of a cut one, at the
-    // screen's top, the column its box draws with a space).
-    let mut col = if multi { 9 } else { 5 };
+    // Cut by the screen's top, the rows over the first numbered row are the
+    // rest of one cut off, at its label column ([`label_col`]): 5, or past a
+    // checkbox 9, or 8 (`[✔]` with no space). A zone cut under a
+    // multi-select's last numbered row holds none, and its rows say it is a
+    // multi-select by what no single-select draws: a row at column 8 or 9 (a
+    // cut inside the free-text row's text, a long text wrapped over more rows
+    // than the read left of the dialog: MEASURED on 2.1.302 at 41x60, the
+    // 40-row tail of `claude-2.1.302-question-multi-typed-41x60.txt`), or the
+    // focused button (`❯` before a word at column 5) as the zone's last row —
+    // the zone of a cut AT the focused `Submit` is that row alone (the 40-row
+    // tail of a fresh 41x67 pane after `down`, MEASURED on 2.1.302 in the
+    // real-Claude lab, `Submit` on grid row 27; the tests build that pane
+    // from the 41x60 captures `claude-2.1.302-question-multi-reflow-long-*col.txt`
+    // drawn from its row 7).
+    let cut_col = (top == 0 && numbered(&rows[0]).is_none()).then(|| leading_spaces(&rows[0]));
+    let multi = if texts.is_empty() {
+        cut_col.is_some_and(|c| matches!(c, 8 | 9))
+            || button_row(&rows[divider - 1]).is_some_and(|(_, focused)| focused)
+    } else {
+        texts.iter().all(|t| checkbox(t).is_some())
+    };
+    // The label column of the numbered row above (of a cut one, its rows').
+    let mut col = match cut_col {
+        Some(c @ (8 | 9)) if multi => c,
+        _ if multi => 9,
+        _ => 5,
+    };
     let mut button = None;
     let mut seen_numbered = false;
     let mut scrolled = false;

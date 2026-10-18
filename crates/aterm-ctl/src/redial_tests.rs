@@ -110,6 +110,42 @@ fn handshake(stream: &CtlStream, reader: &mut BufReader<&CtlStream>, request: &s
     assert!(status.starts_with("OK subscribe"), "{status}");
 }
 
+/// [`relay_subscription`] of the first leg on `stream` (its status line read
+/// through `reader`), from `server` at `dialed`, with no listener identity
+/// and no deadline: the exit code and what it relayed.
+#[cfg(unix)]
+fn relay<'b>(
+    stream: &'b CtlStream,
+    reader: &mut BufReader<&'b CtlStream>,
+    dialed: &str,
+    server: Option<u32>,
+    request: &str,
+    redial: &Redial,
+) -> (ExitCode, String) {
+    let mut out = Vec::new();
+    let code = relay_subscription(
+        FirstLeg {
+            stream,
+            reader,
+            dialed,
+            server,
+            listener: None,
+        },
+        request,
+        None,
+        redial,
+        &mut out,
+    )
+    .expect("relay");
+    (code, String::from_utf8(out).expect("UTF-8 frames"))
+}
+
+/// The relay's frame parser: a session ends only on every target's
+/// `exited` frame (`@*` follows the live roster and never ends), a body that
+/// reads like a frame is skipped by its declared length, a header split
+/// across reads is not a frame yet, and unframeable input means "cannot say".
+/// It also keeps what a resume needs: the `sub <n> <sid>` ties and the newest
+/// `block-complete` and `turn` ids, which outlive the leg that relayed them.
 #[test]
 fn the_tracker_ends_a_session_only_on_every_targets_exited_frame() {
     let mut t = FrameTracker::new("subscribe @s-a,@s-b screen,events\n");
@@ -125,8 +161,13 @@ fn the_tracker_ends_a_session_only_on_every_targets_exited_frame() {
 
     // A body that reads like the marker is skipped by its declared length.
     let mut t = FrameTracker::new("subscribe @s-a screen,bytes,events\n");
-    t.feed(b"sub 1 s-a\nDELTA 1 seq=4 screen 2\nEVENT 1 exited\nrow two\n");
+    t.feed(b"sub 1 s-a\nDELTA 1 seq=4 screen 2\nEVENT 1 exited\nsub 9 s-row\n");
     assert!(!t.session_over(), "screen rows are rows, not frames");
+    assert_eq!(
+        t.sids(),
+        [("1".to_string(), "s-a".to_string())],
+        "a body that reads like a `sub` line is no target"
+    );
     t.feed(b"BYTES 1 15\nEVENT 1 exit");
     t.feed(b"ed\n\n");
     assert!(!t.session_over(), "raw PTY bytes are a body, not a frame");
@@ -138,157 +179,246 @@ fn the_tracker_ends_a_session_only_on_every_targets_exited_frame() {
     t.feed(b"sub 1 s-a\nEVENT 1 exited\n");
     assert!(!t.session_over());
 
-    // A new leg forgets the old locals.
+    // A new leg forgets the old locals, and keeps the carried anchors.
     let mut t = FrameTracker::new("subscribe @s-a events\n");
-    t.feed(b"sub 1 s-a\nEVENT 1 exited\n");
+    t.feed(
+        b"sub 1 s-a\nEVENT 1 block-complete 12 exit=0\n\
+          EVENT 1 turn 7 submitted=1 status=settled dur_ms=5\nEVENT 1 exited\n",
+    );
     t.start_leg(LegSession::Same);
     assert!(!t.session_over());
+    assert_eq!(
+        t.anchors(),
+        EventAnchors {
+            block: Some(12),
+            turn: Some(7),
+            ..EventAnchors::default()
+        }
+    );
     // Unframeable input can only ever mean "cannot say".
     let mut t = FrameTracker::new("subscribe @s-a events\n");
     t.feed(b"sub 1 s-a\nEVENT 1 exited\nDELTA 1 seq=1 screen x\n");
     assert!(!t.session_over());
 }
 
+/// What a resumed `subscribe` asks the successor. `since=` (an old-process
+/// screen seq) goes; the carried event anchors (`since-block`, `since-turn`,
+/// ids the handoff carries) ride — never below the anchor the stream was
+/// opened with, and never on a multi-target stream. A local number is
+/// rewritten to the sid its `sub` line named (a successor numbers adopted
+/// sessions afresh); one never tied cannot be followed. A SELF target (`@.`,
+/// `@`, or none) is resolved again on the successor — for a client outside
+/// every session, the active tab — so the anchors ride only once it is pinned
+/// to the sid the stream named; with no such sid they are left off, or
+/// another tab's finished blocks would come back as fresh events.
+///
+/// THE FALLBACK FOR A PINNED RESUME THE SUCCESSOR REFUSES (a replacement that
+/// is not an update names its sessions afresh): the self target AS WRITTEN and
+/// NO anchors — only where there is a pin to give up.
 #[test]
-fn a_resumed_subscribe_drops_its_old_process_anchors() {
+fn a_resumed_subscribe_carries_only_what_the_successor_can_answer() {
     let none = EventAnchors::default();
-    assert_eq!(
-        resume_request(
-            "@s-a subscribe screen,events since=41 since-turn=7 since-block=3 every-frame\n",
-            &[],
-            &none,
-        )
-        .as_deref(),
-        Some("@s-a subscribe screen,events every-frame since-block=3 since-turn=7\n"),
-        "`since=` goes; the carried event anchors stay"
-    );
-    assert_eq!(
-        resume_request("subscribe @* sessions\n", &[], &none).as_deref(),
-        Some("subscribe @* sessions\n")
-    );
-}
-
-/// A resumed `events` stream asks for what follows the newest `block-complete`
-/// and `turn` it relayed, never below its opening anchor; a multi-target stream
-/// carries none.
-#[test]
-fn a_resumed_events_stream_keeps_its_carried_anchors() {
-    let mut t = FrameTracker::new("subscribe @s-a events\n");
-    t.feed(
-        b"sub 1 s-a\nEVENT 1 block-complete 12 exit=0\n\
-          EVENT 1 turn 7 submitted=1 status=settled dur_ms=5\n",
-    );
-    t.start_leg(LegSession::Same);
-    assert_eq!(
-        resume_request("subscribe @s-a events\n", &t.sids(), &t.anchors()).as_deref(),
-        Some("subscribe @s-a events since-block=12 since-turn=7\n"),
-        "the anchors outlive the leg that relayed them"
-    );
-    assert_eq!(
-        resume_request(
-            "subscribe @s-a events since-block=20\n",
-            &[],
-            &EventAnchors {
-                block: Some(12),
-                turn: None
-            }
-        )
-        .as_deref(),
-        Some("subscribe @s-a events since-block=20\n"),
-        "never below the anchor the stream was opened with"
-    );
-    assert_eq!(
-        resume_request(
-            "subscribe @s-a,@s-b events\n",
-            &[],
-            &EventAnchors {
-                block: Some(12),
-                turn: Some(7)
-            }
-        )
-        .as_deref(),
-        Some("subscribe @s-a,@s-b events\n"),
-        "a multi-target stream carries no anchor"
-    );
-}
-
-/// A self target carries anchors only once pinned to the stream's `sub` sid
-/// (unpinned, another tab's finished blocks would come back as fresh events);
-/// a refused pin falls back to self as written, with no anchors.
-#[test]
-fn a_refused_pin_falls_back_to_self_as_written_without_anchors() {
     let seen = EventAnchors {
         block: Some(12),
         turn: Some(7),
+        ..EventAnchors::default()
     };
     let tied = [("1".to_string(), "s-aaaa".to_string())];
-    for (request, pinned, fallback) in [
+    let local = [
+        ("3".to_string(), "s-aaaa".to_string()),
+        ("5".to_string(), "s-bbbb".to_string()),
+    ];
+    for (request, sids, anchors, resumed) in [
+        (
+            "@s-a subscribe screen,events since=41 since-turn=7 since-block=3 every-frame\n",
+            &[][..],
+            none,
+            Some("@s-a subscribe screen,events every-frame since-block=3 since-turn=7\n"),
+        ),
+        (
+            "subscribe @* sessions\n",
+            &[][..],
+            none,
+            Some("subscribe @* sessions\n"),
+        ),
+        (
+            "subscribe @s-a events since-block=20\n",
+            &[][..],
+            EventAnchors {
+                block: Some(12),
+                turn: None,
+                ..EventAnchors::default()
+            },
+            Some("subscribe @s-a events since-block=20\n"),
+        ),
+        (
+            "subscribe @s-a,@s-b events\n",
+            &[][..],
+            seen,
+            Some("subscribe @s-a,@s-b events\n"),
+        ),
+        (
+            "subscribe @s-bbbb events\n",
+            &[][..],
+            seen,
+            Some("subscribe @s-bbbb events since-block=12 since-turn=7\n"),
+        ),
+        (
+            "subscribe @3 screen,events since=9\n",
+            &local[..],
+            none,
+            Some("subscribe @s-aaaa screen,events\n"),
+        ),
+        (
+            "subscribe @3,@s-cccc,@.,@5 events\n",
+            &local[..],
+            none,
+            Some("subscribe @s-aaaa,@s-cccc,@.,@s-bbbb events\n"),
+        ),
+        ("subscribe @4 events\n", &local[..], none, None),
         (
             "subscribe @. events\n",
-            "subscribe @s-aaaa events since-block=12 since-turn=7\n",
-            "subscribe @. events\n",
+            &tied[..],
+            seen,
+            Some("subscribe @s-aaaa events since-block=12 since-turn=7\n"),
         ),
         (
             "subscribe events\n",
-            "subscribe @s-aaaa events since-block=12 since-turn=7\n",
-            "subscribe events\n",
+            &tied[..],
+            seen,
+            Some("subscribe @s-aaaa events since-block=12 since-turn=7\n"),
         ),
         (
             "@ subscribe screen,events since=4\n",
-            "@s-aaaa subscribe screen,events since-block=12 since-turn=7\n",
-            "@ subscribe screen,events\n",
+            &tied[..],
+            seen,
+            Some("@s-aaaa subscribe screen,events since-block=12 since-turn=7\n"),
         ),
-    ] {
-        assert_eq!(
-            resume_request(request, &tied, &seen).as_deref(),
-            Some(pinned),
-            "{request}"
-        );
-        assert_eq!(
-            unpinned_resume_request(request, &tied, &seen).as_deref(),
-            Some(fallback),
-            "{request}"
-        );
-    }
-    // Nothing to pin it to: the selector stays and the anchors do not ride; a
-    // sid target carries its anchors.
-    for (request, resumed) in [
+        // Nothing to pin a self target to: the selector stays, no anchors.
         (
             "subscribe @. events since-block=3\n",
-            "subscribe @. events\n",
+            &[][..],
+            seen,
+            Some("subscribe @. events\n"),
         ),
-        ("subscribe events\n", "subscribe events\n"),
         (
-            "subscribe @s-bbbb events\n",
-            "subscribe @s-bbbb events since-block=12 since-turn=7\n",
+            "subscribe events\n",
+            &[][..],
+            seen,
+            Some("subscribe events\n"),
         ),
     ] {
         assert_eq!(
-            resume_request(request, &[], &seen).as_deref(),
-            Some(resumed),
+            resume_request(request, sids, &anchors).as_deref(),
+            resumed,
             "{request}"
         );
     }
-    // Negative controls: nothing else to ask.
-    for (request, sids) in [
-        // A sid target keeps its anchors and has no self to fall back to.
-        ("subscribe @s-bbbb events\n", &tied[..]),
+    for (request, sids, fallback) in [
+        (
+            "subscribe @. events\n",
+            &tied[..],
+            Some("subscribe @. events\n"),
+        ),
+        ("subscribe events\n", &tied[..], Some("subscribe events\n")),
+        (
+            "@ subscribe screen,events since=4\n",
+            &tied[..],
+            Some("@ subscribe screen,events\n"),
+        ),
+        // A sid target has no self to fall back to.
+        ("subscribe @s-bbbb events\n", &tied[..], None),
         // Nothing tied: the selector already stays, with no anchors.
-        ("subscribe @. events\n", &[][..]),
+        ("subscribe @. events\n", &[][..], None),
         // Several targets: the anchors never ride.
-        ("subscribe @.,@s-cccc events\n", &tied[..]),
-        ("@. subscribe @s-cccc events\n", &tied[..]),
+        ("subscribe @.,@s-cccc events\n", &tied[..], None),
+        ("@. subscribe @s-cccc events\n", &tied[..], None),
         // A local number is tied to its sid, never re-resolved.
-        ("subscribe @1 events\n", &tied[..]),
-        // The live roster.
-        ("subscribe @* sessions\n", &tied[..]),
+        ("subscribe @1 events\n", &tied[..], None),
+        ("subscribe @* sessions\n", &tied[..], None),
     ] {
         assert_eq!(
-            unpinned_resume_request(request, sids, &seen),
-            None,
+            unpinned_resume_request(request, sids, &seen).as_deref(),
+            fallback,
             "{request}"
         );
     }
+}
+
+/// A resumed `log` stream asks for what follows the LAST RECORD IT RELAYED, in
+/// the epoch it was read in — never the request's own `since-log=` (whose
+/// replay would push every relayed record again) and never nothing (which
+/// would lose what came between the legs): from the `sub` line's start, each
+/// `LOG` line, and a `GAP`'s `resync_to=`/`ep=`. A stream that never learned
+/// its epoch (an older server's `sub` line) resumes live, as before; the
+/// fallback to self and another session's leg carry none.
+#[test]
+fn a_resumed_log_stream_continues_after_the_last_record_relayed() {
+    let request = "subscribe @s-a log since-log=5 log-ep=1\n";
+    let mut t = FrameTracker::new(request);
+    t.feed(
+        b"OK subscribe 1\nsub 1 s-a log_seq=5 log_ep=1\n\
+          LOG 1 6 open r1 cmd src=shell conf=strong t=1\n\
+          LOG 1 9 close r1 cmd out=ok src=shell conf=strong t=2\n",
+    );
+    let resumed = resume_request(request, &t.sids(), &t.anchors()).expect("resumes");
+    assert_eq!(resumed, "subscribe @s-a log since-log=9 log-ep=1\n");
+    assert!(
+        !resumed.contains("since-log=5"),
+        "NEGATIVE CONTROL: the request's own anchor would replay 6..9"
+    );
+    // Opened live: the `sub` line names where it started; one more leg.
+    let live = "subscribe @s-a log\n";
+    let mut t = FrameTracker::new(live);
+    t.feed(b"OK subscribe 1\nsub 1 s-a log_seq=12 log_ep=3\n");
+    assert_eq!(
+        resume_request(live, &t.sids(), &t.anchors()).as_deref(),
+        Some("subscribe @s-a log since-log=12 log-ep=3\n"),
+        "nothing relayed yet: from where it started"
+    );
+    t.start_leg(LegSession::Same);
+    t.feed(
+        b"OK subscribe 1\nsub 1 s-a log_seq=12 log_ep=3\n\
+          GAP 1 log-lost=0 why=handoff resync_to=1012 ep=4\n\
+          LOG 1 1013 mark - handoff src=aterm conf=exact t=3\n",
+    );
+    assert_eq!(
+        resume_request(live, &t.sids(), &t.anchors()).as_deref(),
+        Some("subscribe @s-a log since-log=1013 log-ep=4\n"),
+        "a gap's epoch, then the record after it"
+    );
+    // An older server names no start: the stream resumes live, as before.
+    let mut t = FrameTracker::new(live);
+    t.feed(b"OK subscribe 1\nsub 1 s-a\nLOG 1 4 mark - bell src=engine conf=strong t=1\n");
+    assert_eq!(
+        resume_request(live, &t.sids(), &t.anchors()).as_deref(),
+        Some(live)
+    );
+    // Self pinned to its sid carries the cursor; its fallback and a multi-target
+    // stream carry none, and another session's leg forgets it.
+    let tied = [("1".to_string(), "s-a".to_string())];
+    let seen = EventAnchors {
+        log_seq: Some(9),
+        log_ep: Some(1),
+        ..EventAnchors::default()
+    };
+    let own = "subscribe @. log since-log=5 log-ep=1\n";
+    assert_eq!(
+        resume_request(own, &tied, &seen).as_deref(),
+        Some("subscribe @s-a log since-log=9 log-ep=1\n")
+    );
+    assert_eq!(
+        unpinned_resume_request(own, &tied, &seen).as_deref(),
+        Some("subscribe @. log\n")
+    );
+    assert_eq!(
+        resume_request("subscribe @s-a,@s-b log\n", &[], &seen).as_deref(),
+        Some("subscribe @s-a,@s-b log\n")
+    );
+    let mut t = FrameTracker::new(live);
+    t.feed(b"sub 1 s-a log_seq=7 log_ep=2\n");
+    t.start_leg(LegSession::Other);
+    assert_eq!(t.anchors(), EventAnchors::default());
 }
 
 /// The fallback derives from the original request, not from a last leg pinned to
@@ -298,6 +428,7 @@ fn a_fallback_to_self_survives_a_leg_that_was_pinned() {
     let seen = EventAnchors {
         block: Some(5),
         turn: None,
+        ..EventAnchors::default()
     };
     let tied = [("1".to_string(), "s-a".to_string())];
     let original = "subscribe @. cursor,events\n";
@@ -331,180 +462,6 @@ fn started_later(_: u32) -> Option<Stamp> {
         boot: Some(BootClock(u64::MAX)),
         wall: SystemTime::now().checked_add(Duration::from_secs(3600)),
     })
-}
-
-/// A successor whose start cannot be read.
-fn start_unknown(_: u32) -> Option<Stamp> {
-    None
-}
-
-/// A successor lacking the pinned `s-old` is asked again, unpinned, only when it
-/// started after the hang-up; one already running (this test process) ends the
-/// stream 75. Controls: an unreadable start fails closed, a carried session is
-/// asked for pinned once, a stream naming `@s-old` is never re-targeted, and a
-/// refusal other than `ERR no such session` never moves it.
-#[cfg(unix)]
-#[test]
-fn a_self_stream_moves_to_a_successors_own_session_only_when_it_started_after_the_hangup() {
-    const PINNED: &str = "subscribe @s-old cursor,events since-block=12\n";
-    const NO_SUCH: &str = "ERR no such session\n";
-    type Started = Option<fn(u32) -> Option<Stamp>>;
-    let later: Started = Some(started_later);
-    for (case, request, carried, started, refusal, asked, followed) in [
-        (
-            "fresh-self",
-            "subscribe @. cursor,events\n",
-            false,
-            later,
-            NO_SUCH,
-            &[PINNED, "subscribe @. cursor,events\n"][..],
-            Some("sub 4 s-new"),
-        ),
-        (
-            "fresh-bare",
-            "subscribe cursor,events\n",
-            false,
-            later,
-            NO_SUCH,
-            &[PINNED, "subscribe cursor,events\n"][..],
-            Some("sub 4 s-new"),
-        ),
-        (
-            "stranger-self",
-            "subscribe @. cursor,events\n",
-            false,
-            None,
-            NO_SUCH,
-            &[PINNED][..],
-            None,
-        ),
-        (
-            "unknown-self",
-            "subscribe @. cursor,events\n",
-            false,
-            Some(start_unknown as fn(u32) -> Option<Stamp>),
-            NO_SUCH,
-            &[PINNED][..],
-            None,
-        ),
-        (
-            "carried-self",
-            "subscribe @. cursor,events\n",
-            true,
-            None,
-            NO_SUCH,
-            &[PINNED][..],
-            Some("sub 4 s-old"),
-        ),
-        (
-            "fresh-named",
-            "subscribe @s-old cursor,events\n",
-            false,
-            later,
-            NO_SUCH,
-            &[PINNED][..],
-            None,
-        ),
-        (
-            "fresh-refused",
-            "subscribe @. cursor,events\n",
-            false,
-            later,
-            "ERR subscription lanes full\n",
-            &[PINNED][..],
-            None,
-        ),
-    ] {
-        let (_dir, sock) = scratch_sock(&format!("rd-{case}"));
-        let path = sock.to_str().unwrap().to_string();
-        let (seen_tx, seen) = std::sync::mpsc::channel();
-        let old = fake_server(
-            aterm_uds::CtlListener::bind(&sock).unwrap(),
-            sock.clone(),
-            "OK subscribe 1\nsub 0 s-old\nEVENT 0 block-complete 12 exit=0\n",
-            true,
-            seen_tx.clone(),
-        );
-        let stream = CtlStream::connect(&sock).expect("connect");
-        let mut reader = BufReader::new(&stream);
-        handshake(&stream, &mut reader, request);
-        old.join().unwrap();
-        // The successor's own session is `s-new`; it holds `s-old` only when
-        // it carried it.
-        let successor_path = sock.clone();
-        let successor = std::thread::spawn(move || {
-            let listener = aterm_uds::CtlListener::bind(&successor_path).unwrap();
-            loop {
-                let Ok((conn, _)) = listener.accept() else {
-                    return;
-                };
-                let mut reader = std::io::BufReader::new(&conn);
-                let mut request = String::new();
-                if reader.read_line(&mut request).unwrap_or(0) == 0 {
-                    continue;
-                }
-                let reply: &[u8] = if request.starts_with("version") {
-                    b"OK aterm test\n"
-                } else if request.starts_with("stop") {
-                    return;
-                } else if !request.contains("@s-old") {
-                    let _ = seen_tx.send(request);
-                    b"OK subscribe 1\nsub 4 s-new\nDELTA 4 seq=1 cursor 5 5 1 block\nEVENT 4 exited\n"
-                } else if carried {
-                    let _ = seen_tx.send(request);
-                    b"OK subscribe 1\nsub 4 s-old\nDELTA 4 seq=1 cursor 5 5 1 block\nEVENT 4 exited\n"
-                } else {
-                    let _ = seen_tx.send(request);
-                    refusal.as_bytes()
-                };
-                let _ = (&conn).write_all(reply);
-            }
-        });
-        let redial = Redial::new(Follow::Path(path.clone())).with_bound(REACHED);
-        let redial = match started {
-            Some(started) => redial.with_started(started),
-            None => redial,
-        };
-        let mut out = Vec::new();
-        let code = relay_subscription(
-            FirstLeg {
-                stream: &stream,
-                reader: &mut reader,
-                dialed: &path,
-                server: Some(gone_pid()),
-                listener: None,
-            },
-            request,
-            None,
-            &redial,
-            &mut out,
-        )
-        .expect("relay");
-        stop(&sock);
-        successor.join().unwrap();
-        let requests: Vec<String> = seen.try_iter().collect();
-        assert_eq!(
-            requests.first().map(String::as_str),
-            Some(request),
-            "{case}"
-        );
-        assert_eq!(
-            &requests[1..],
-            asked,
-            "{case}: what the successor was asked"
-        );
-        let text = String::from_utf8(out).unwrap();
-        match followed {
-            Some(sub) => {
-                assert_eq!(code, ExitCode::SUCCESS, "{case}: the successor's `exited`");
-                assert!(text.contains(sub), "{case}: {text}");
-            }
-            None => {
-                assert_eq!(code, ExitCode::from(EXIT_REPLACED), "{case}");
-                assert!(!text.contains("sub 4"), "{case}: {text}");
-            }
-        }
-    }
 }
 
 /// The decision at a refused resume: asked again, self as written, only after
@@ -586,44 +543,6 @@ fn a_refused_pin_is_asked_again_only_of_a_fresh_successor() {
         ),
         Err(Unresumed::Refused),
         "the fallback refused in turn ends it"
-    );
-}
-
-/// A fallen-back stream's next resume carries only the new session's anchors;
-/// a same-session leg keeps the old ones.
-#[test]
-fn a_fallen_back_stream_carries_only_its_new_sessions_anchors() {
-    let original = "subscribe @. events\n";
-    let old_leg = b"sub 0 s-old\nEVENT 0 block-complete 12 exit=0\nEVENT 0 turn 7 status=settled\n";
-    let new_leg = b"sub 4 s-new\nEVENT 4 block-complete 2 exit=0\n";
-    let mut t = FrameTracker::new(original);
-    t.feed(old_leg);
-    let pinned = resume_request(original, &t.sids(), &t.anchors()).expect("pinned");
-    assert_eq!(
-        pinned,
-        "subscribe @s-old events since-block=12 since-turn=7\n"
-    );
-    let asked = Ask {
-        request: pinned,
-        session: LegSession::Same,
-    };
-    let fallback = unpinned_resume_request(original, &t.sids(), &t.anchors());
-    let ask = after_refusal(&asked, NO_SUCH_SESSION, fallback, Arrival::Fresh)
-        .expect("a fresh successor is asked again");
-    t.start_leg(ask.session);
-    t.feed(new_leg);
-    assert_eq!(
-        resume_request(&ask.request, &t.sids(), &t.anchors()).as_deref(),
-        Some("subscribe @s-new events since-block=2\n")
-    );
-    let mut same = FrameTracker::new(original);
-    same.feed(old_leg);
-    same.start_leg(LegSession::Same);
-    same.feed(new_leg);
-    assert_eq!(
-        resume_request(&ask.request, &same.sids(), &same.anchors()).as_deref(),
-        Some("subscribe @s-new events since-block=12 since-turn=7\n"),
-        "control: a same-session leg keeps the old anchors"
     );
 }
 
@@ -976,23 +895,16 @@ fn a_fallen_back_stream_asks_the_next_successor_for_its_new_sessions_anchors_onl
             return;
         }
     });
-    let mut out = Vec::new();
-    let code = relay_subscription(
-        FirstLeg {
-            stream: &stream,
-            reader: &mut reader,
-            dialed: &path,
-            server: Some(gone_pid()),
-            listener: None,
-        },
+    let (code, out) = relay(
+        &stream,
+        &mut reader,
+        &path,
+        Some(gone_pid()),
         request,
-        None,
         &Redial::new(Follow::Path(path.clone()))
             .with_bound(REACHED)
             .with_started(started_later),
-        &mut out,
-    )
-    .expect("relay");
+    );
     first.join().unwrap();
     let asked: Vec<String> = seen.try_iter().collect();
     assert_eq!(
@@ -1011,7 +923,7 @@ fn a_fallen_back_stream_asks_the_next_successor_for_its_new_sessions_anchors_onl
     );
     assert_eq!(code, ExitCode::SUCCESS, "the second successor's `exited`");
     assert!(
-        String::from_utf8(out).unwrap().contains("sub 5 s-new\n"),
+        out.contains("sub 5 s-new\n"),
         "the second successor's stream relayed"
     );
 }
@@ -1037,8 +949,8 @@ fn conn_after(
 }
 
 /// A failed write reads the refusal a busy listener left before closing unread;
-/// a close with nothing left is `Gone`; an `OK`, and a close after the request,
-/// are lines.
+/// a close with nothing left is `Gone`; a close after the request was read is an
+/// empty line.
 #[cfg(unix)]
 #[test]
 fn a_write_that_fails_reads_the_refusal_the_successor_left() {
@@ -1075,41 +987,25 @@ fn a_write_that_fails_reads_the_refusal_the_successor_left() {
         matches!(ask_once(&client, &mut reader, None, "subscribe @s-a cursor\n"), Answer::Line(l) if l.is_empty())
     );
     server.join().unwrap();
-    // Control: an `OK` is a line too.
-    let (_d, sock) = scratch_sock("rd-ask-ok");
-    let listener = aterm_uds::CtlListener::bind(&sock).unwrap();
-    let client = CtlStream::connect(&sock).expect("connect");
-    let server = std::thread::spawn(move || {
-        let (conn, _) = listener.accept().expect("accept");
-        let mut request = String::new();
-        std::io::BufReader::new(&conn)
-            .read_line(&mut request)
-            .unwrap();
-        (&conn).write_all(b"OK subscribe 1\n").unwrap();
-    });
-    let mut reader = BufReader::new(&client);
-    assert!(
-        matches!(ask_once(&client, &mut reader, None, "subscribe @s-a cursor\n"), Answer::Line(l) if l == "OK subscribe 1")
-    );
-    server.join().unwrap();
 }
 
 /// A live successor that closes on the resume ask is asked again, and the
 /// stream never ends 0 without it. Each closed ask is held 50 ms and dropped
-/// unread, so the 4 MiB write fails. Busy and silent: asked again, the stream
-/// goes on. Saturated: silent, then busy to the next three connections, the
-/// probe among them proving it still there. Silent forever: exit 75 once the
-/// wait is spent.
+/// unread, so the 4 MiB write fails. Silent: asked again, the stream goes on
+/// (a busy reason left behind is
+/// [`a_write_that_fails_reads_the_refusal_the_successor_left`] and
+/// [`a_busy_successor_is_asked_again_and_the_stream_resumes`]). Saturated:
+/// silent, then busy to the next three connections, the probe among them
+/// proving it still there. Silent forever: exit 75 once the wait is spent.
 #[cfg(unix)]
 #[test]
 fn a_successor_that_closes_on_the_resume_is_asked_again_and_never_a_silent_exit_0() {
     let filler = "x".repeat(4 << 20);
     let request = format!("subscribe @s-a cursor,events {filler}\n");
-    for (shape, refusal, closes, saturated) in [
-        ("busy", Some("ERR control server busy; retry\n"), 1, 0),
-        ("silent", None, 1, 0),
-        ("saturated", None, 1, 3),
-        ("silent-forever", None, usize::MAX, 0),
+    for (shape, closes, saturated) in [
+        ("silent", 1, 0),
+        ("saturated", 1, 3),
+        ("silent-forever", usize::MAX, 0),
     ] {
         let (_dir, sock) = scratch_sock(&format!("rd-close-{shape}"));
         let path = sock.to_str().unwrap().to_string();
@@ -1160,9 +1056,6 @@ fn a_successor_that_closes_on_the_resume_is_asked_again_and_never_a_silent_exit_
                     // Held until the client is mid-write, then closed with
                     // the request unread.
                     std::thread::sleep(Duration::from_millis(50));
-                    if let Some(reason) = refusal {
-                        let _ = (&conn).write_all(reason.as_bytes());
-                    }
                     busy = saturated;
                 } else {
                     // Taken: the whole request read, then the stream.
@@ -1180,26 +1073,18 @@ fn a_successor_that_closes_on_the_resume_is_asked_again_and_never_a_silent_exit_
         } else {
             REACHED
         };
-        let mut out = Vec::new();
-        let code = relay_subscription(
-            FirstLeg {
-                stream: &stream,
-                reader: &mut reader,
-                dialed: &path,
-                server: Some(gone_pid()),
-                listener: None,
-            },
+        let (code, out) = relay(
+            &stream,
+            &mut reader,
+            &path,
+            Some(gone_pid()),
             &request,
-            None,
             &Redial::new(Follow::Path(path.clone()))
                 .with_bound(bound)
                 .with_started(started_later),
-            &mut out,
-        )
-        .expect("relay");
+        );
         stop(&sock);
         successor.join().unwrap();
-        let out = String::from_utf8(out).unwrap();
         if closes == usize::MAX {
             assert_eq!(code, ExitCode::from(EXIT_REPLACED), "{shape}: never 0");
             assert!(
@@ -1272,84 +1157,23 @@ fn a_busy_successor_is_asked_again_and_the_stream_resumes() {
             }
         }
     });
-    let mut out = Vec::new();
-    let code = relay_subscription(
-        FirstLeg {
-            stream: &stream,
-            reader: &mut reader,
-            dialed: &path,
-            server: Some(gone_pid()),
-            listener: None,
-        },
+    let (code, out) = relay(
+        &stream,
+        &mut reader,
+        &path,
+        Some(gone_pid()),
         request,
-        None,
         &Redial::new(Follow::Path(path.clone()))
             .with_bound(REACHED)
             .with_started(started_later),
-        &mut out,
-    )
-    .expect("relay");
+    );
     stop(&sock);
     successor.join().unwrap();
-    let out = String::from_utf8(out).unwrap();
     assert_eq!(code, ExitCode::SUCCESS, "the stream resumed: {out}");
     assert_eq!(asks.load(std::sync::atomic::Ordering::SeqCst), 3);
     assert!(
         out.ends_with("sub 1 s-a\nEVENT 1 exited\n"),
         "the successor's leg was relayed: {out}"
-    );
-}
-
-/// A resumed stream marks the hole between its legs with `GAP <local> replaced`,
-/// before the successor's frames.
-#[cfg(unix)]
-#[test]
-fn a_resumed_stream_marks_the_hole_between_its_legs() {
-    let request = "subscribe @s-a bytes\n";
-    let (_dir, sock) = scratch_sock("rd-gap");
-    let path = sock.to_str().unwrap().to_string();
-    let (seen_tx, _seen) = std::sync::mpsc::channel();
-    let old = fake_server(
-        aterm_uds::CtlListener::bind(&sock).unwrap(),
-        sock.clone(),
-        "OK subscribe 1\nsub 1 s-a\nBYTES 1 3\nabc\n",
-        true,
-        seen_tx,
-    );
-    let stream = CtlStream::connect(&sock).expect("connect");
-    let mut reader = BufReader::new(&stream);
-    handshake(&stream, &mut reader, request);
-    old.join().unwrap();
-    let (asked_tx, _asked) = std::sync::mpsc::channel();
-    let successor = fake_server(
-        aterm_uds::CtlListener::bind(&sock).unwrap(),
-        sock.clone(),
-        "OK subscribe 1\nsub 1 s-a\nBYTES 1 3\nxyz\nEVENT 1 exited\n",
-        false,
-        asked_tx,
-    );
-    let mut out = Vec::new();
-    let code = relay_subscription(
-        FirstLeg {
-            stream: &stream,
-            reader: &mut reader,
-            dialed: &path,
-            server: Some(gone_pid()),
-            listener: None,
-        },
-        request,
-        None,
-        &Redial::new(Follow::Path(path.clone())).with_bound(REACHED),
-        &mut out,
-    )
-    .expect("relay");
-    stop(&sock);
-    successor.join().unwrap();
-    assert_eq!(code, ExitCode::SUCCESS);
-    assert_eq!(
-        String::from_utf8(out).unwrap(),
-        "sub 1 s-a\nBYTES 1 3\nabc\nGAP 1 replaced\nsub 1 s-a\nBYTES 1 3\nxyz\nEVENT 1 exited\n",
-        "the hole is marked between the legs, before the successor's frames"
     );
 }
 
@@ -1466,121 +1290,6 @@ fn a_forwarded_stream_follows_its_hosts_successor_not_the_relay() {
     }
 }
 
-/// A leg that relays the session the stream followed, asked with `request`.
-fn same_leg(request: &str) -> Ask {
-    Ask {
-        request: request.to_owned(),
-        session: LegSession::Same,
-    }
-}
-
-/// The resume note names the hole and what it lost, and says events go on from
-/// the last relayed only where the resume carried that anchor.
-#[test]
-fn the_resume_note_says_what_was_not_delivered() {
-    let note = |asked: &str| {
-        resumed_note(
-            7,
-            9,
-            "/r/a.sock",
-            asked,
-            &same_leg(asked),
-            Arrival::Predates,
-        )
-    };
-    let both = note("subscribe @s-a bytes,events since-block=3 since-turn=2\n");
-    assert!(
-        both.contains("`GAP <local> replaced`") && both.contains("output, mail and records"),
-        "{both}"
-    );
-    assert!(!both.contains("screen frames between"), "{both}");
-    assert!(
-        both.ends_with("its block and turn events go on after the last ones relayed"),
-        "{both}"
-    );
-    assert!(note("subscribe @s-a events since-block=3\n").ends_with(
-        "its block events go on after the last one relayed, and its turn events start \
-             from the successor's newest"
-    ));
-    assert!(note("subscribe @s-a events since-turn=2\n").ends_with(
-        "its turn events go on after the last one relayed, and its block events start \
-             from the successor's newest"
-    ));
-    assert!(
-        note("subscribe @s-a,@s-b events\n")
-            .ends_with("its block and turn events start from the successor's newest")
-    );
-}
-
-/// The resume note names the successor only as far as it is known: an update,
-/// a relaunch that recovered the session (whose counts started over), a bare
-/// relaunch, or just a replaced aterm.
-#[test]
-fn the_resume_note_says_what_the_successor_was_only_as_far_as_it_is_known() {
-    let pinned = same_leg("subscribe @s-a events since-block=12 since-turn=4\n");
-    let note = |arrival| resumed_note(7, 9, "/r/a.sock", "subscribe @. events\n", &pinned, arrival);
-    let update = note(Arrival::Predates);
-    assert!(
-        update.contains("pid 7 -> 9, an update)") && !update.contains("fresh"),
-        "{update}"
-    );
-    assert!(
-        update.contains("go on after the last ones relayed"),
-        "{update}"
-    );
-    let relaunch = note(Arrival::Fresh);
-    assert!(
-        relaunch.contains("a relaunch that recovered the session"),
-        "{relaunch}"
-    );
-    assert!(!relaunch.contains("an update"), "{relaunch}");
-    assert!(
-        relaunch.contains(
-            "its block and turn events start over with the relaunch's own count, so some \
-             between the two may not have been delivered"
-        ),
-        "{relaunch}"
-    );
-    assert!(!relaunch.contains("live high"), "{relaunch}");
-    // Unpinned, nothing recovered: `@*`, and a self stream whose `sub` line
-    // tied no sid, resolve among the relaunch's own sessions.
-    for asked in [
-        "subscribe @* events\n",
-        "subscribe @. events\n",
-        "subscribe events\n",
-    ] {
-        let fresh = resumed_note(7, 9, "/r/a.sock", asked, &same_leg(asked), Arrival::Fresh);
-        assert!(fresh.contains("(pid 7 -> 9, a relaunch);"), "{fresh}");
-        assert!(!fresh.contains("recovered"), "{fresh}");
-        assert!(
-            fresh.ends_with("its block and turn events start from the relaunch's newest"),
-            "{fresh}"
-        );
-    }
-    // A stream that named several sessions by id carries no anchors, and a
-    // relaunch that took it holds them.
-    let named = resumed_note(
-        7,
-        9,
-        "/r/a.sock",
-        "subscribe @1,@2 events\n",
-        &same_leg("subscribe @s-a,@s-b events\n"),
-        Arrival::Fresh,
-    );
-    assert!(named.contains("a relaunch that recovered"), "{named}");
-    for arrival in [Arrival::Unknown, Arrival::Shared] {
-        let unknown = note(arrival);
-        assert!(
-            unknown.contains("aterm was replaced (pid 7 -> 9);"),
-            "{unknown}"
-        );
-        assert!(
-            !unknown.contains("update") && !unknown.contains("relaunch"),
-            "{unknown}"
-        );
-    }
-}
-
 /// The moment [`a_later_successor_is_judged_against_the_hangup_it_follows`]
 /// puts between two hang-ups: when its second successor "started".
 #[cfg(unix)]
@@ -1657,23 +1366,16 @@ fn a_later_successor_is_judged_against_the_hangup_it_follows() {
                 &seen_tx,
             );
         });
-        let mut out = Vec::new();
-        let code = relay_subscription(
-            FirstLeg {
-                stream: &stream,
-                reader: &mut reader,
-                dialed: &path,
-                server: Some(gone_pid()),
-                listener: None,
-            },
+        let (code, out) = relay(
+            &stream,
+            &mut reader,
+            &path,
+            Some(gone_pid()),
             &request,
-            None,
             &Redial::new(Follow::Path(path.clone()))
                 .with_bound(REACHED)
                 .with_started(started),
-            &mut out,
-        )
-        .expect("relay");
+        );
         stop(&sock);
         s2.join().unwrap();
         let brief = |r: String| r.replace(&filler, "<4 MiB>");
@@ -1692,7 +1394,7 @@ fn a_later_successor_is_judged_against_the_hangup_it_follows() {
         };
         assert_eq!(s1.asked(), s1_asked, "{case}: what S1 was asked");
         let s2_asked: Vec<String> = seen.try_iter().skip(1).map(brief).collect();
-        let text = String::from_utf8(out).unwrap();
+        let text = out;
         assert_eq!(
             text.contains("sub 5 s-old"),
             role == "carrier",
@@ -1710,156 +1412,67 @@ fn a_later_successor_is_judged_against_the_hangup_it_follows() {
     }
 }
 
-/// A self stream moves to a fresh successor's own session only on a fixed
-/// `--sock` path (`fixed`), which only a relaunch can bind. On the alias, a
-/// link, an instance's own socket, or through a stale graph entry, a fresh
-/// process may be another window's, and the stream ends 75
-/// ([`only_a_relaunch_binds`]).
+/// A self stream moves only on the fixed socket the call named
+/// ([`Redial::arrival`]): there only a relaunch of the instance configured on
+/// it can bind, so a fresh successor is judged by its start. Elsewhere a fresh
+/// process may be another window's (e.g. its update successor republishing
+/// the `latest` alias), so it is [`Arrival::Shared`] and the stream is never
+/// moved to its active tab: `--sock` to the alias, to another link, to a plain
+/// socket named as the alias, or to an instance's own `aterm-<pid>.sock`; the
+/// flagless follow, inside a session or out; and a successor answering on a
+/// path other than the fixed one. (The relay acting on the verdict:
+/// [`a_refusal_is_judged_by_the_process_that_gave_it`].)
 #[cfg(unix)]
 #[test]
 fn a_self_stream_moves_only_on_the_fixed_socket_the_call_named() {
-    let request = "subscribe @. cursor,events\n";
-    let pinned = "subscribe @s-old cursor,events since-block=12\n";
-    let (gone, own) = (gone_pid(), std::process::id());
-    for case in [
-        "fixed",
-        "alias",
-        "alias-follow",
-        "link",
-        "alias-name",
-        "instance",
-        "graph-entry",
+    let (_scratch, dir) = scratch_rendezvous("rd-where");
+    let at = |name: &str| dir.join(name).to_str().unwrap().to_string();
+    let (fixed, alias, link, instance) = (
+        at("fixed.sock"),
+        at(super::super::SOCK_FILE),
+        at("l.sock"),
+        at("aterm-4242.sock"),
+    );
+    std::os::unix::fs::symlink(dir.join("a.sock"), &link).unwrap();
+    let flagless = |self_sid: Option<&str>| Follow::Flagless {
+        dir: dir.clone(),
+        self_sid: self_sid.map(String::from),
+    };
+    for (case, follow, answered_at, arrival) in [
+        ("fixed", Follow::Path(fixed.clone()), &fixed, Arrival::Fresh),
+        (
+            "alias",
+            Follow::Path(alias.clone()),
+            &alias,
+            Arrival::Shared,
+        ),
+        ("link", Follow::Path(link.clone()), &link, Arrival::Shared),
+        (
+            "instance",
+            Follow::Path(instance.clone()),
+            &instance,
+            Arrival::Shared,
+        ),
+        (
+            "elsewhere",
+            Follow::Path(fixed.clone()),
+            &alias,
+            Arrival::Shared,
+        ),
+        ("alias-follow", flagless(None), &alias, Arrival::Shared),
+        (
+            "graph-entry",
+            flagless(Some("s-00ab")),
+            &fixed,
+            Arrival::Shared,
+        ),
     ] {
-        let (_scratch, dir) = scratch_rendezvous(&format!("rd-where-{case}"));
-        let alias = dir.join(super::super::SOCK_FILE);
-        let old_instance = dir.join(format!("aterm-{gone}.sock"));
-        let new_instance = dir.join(format!("aterm-{own}.sock"));
-        let named = |p: &std::path::Path| p.to_str().unwrap().to_string();
-        // (the old server's socket, the successor's, the path dialled (a link
-        // to the old one's when it differs), and what the call follows)
-        let (old_at, new_at, dialed, follow) = match case {
-            "fixed" => {
-                let fixed = dir.join("fixed.sock");
-                (
-                    fixed.clone(),
-                    fixed.clone(),
-                    fixed.clone(),
-                    Follow::Path(named(&fixed)),
-                )
-            }
-            "alias" => (
-                old_instance.clone(),
-                new_instance.clone(),
-                alias.clone(),
-                Follow::Path(named(&alias)),
-            ),
-            "alias-follow" => (
-                old_instance.clone(),
-                new_instance.clone(),
-                alias.clone(),
-                Follow::Flagless {
-                    dir: dir.clone(),
-                    self_sid: None,
-                },
-            ),
-            "link" => {
-                let link = dir.join("l.sock");
-                (
-                    dir.join("a.sock"),
-                    dir.join("b.sock"),
-                    link.clone(),
-                    Follow::Path(named(&link)),
-                )
-            }
-            "alias-name" => (
-                alias.clone(),
-                alias.clone(),
-                alias.clone(),
-                Follow::Path(named(&alias)),
-            ),
-            "graph-entry" => {
-                let fixed = dir.join("fixed.sock");
-                publish_graph_entry(&dir, "s-00ab", &fixed);
-                (
-                    fixed.clone(),
-                    fixed.clone(),
-                    fixed.clone(),
-                    Follow::Flagless {
-                        dir: dir.clone(),
-                        self_sid: Some("s-00ab".to_string()),
-                    },
-                )
-            }
-            _ => (
-                old_instance.clone(),
-                old_instance.clone(),
-                old_instance.clone(),
-                Follow::Path(named(&old_instance)),
-            ),
-        };
-        let (seen_tx, seen) = std::sync::mpsc::channel();
-        let old = fake_server(
-            aterm_uds::CtlListener::bind(&old_at).unwrap(),
-            old_at.clone(),
-            "OK subscribe 1\nsub 0 s-old\nEVENT 0 block-complete 12 exit=0\n",
-            true,
-            seen_tx.clone(),
+        let redial = Redial::new(follow).with_started(started_later);
+        assert_eq!(
+            redial.arrival(4242, answered_at, Stamp::now()),
+            arrival,
+            "{case}"
         );
-        if dialed != old_at {
-            std::os::unix::fs::symlink(&old_at, &dialed).unwrap();
-        }
-        let stream = CtlStream::connect(&dialed).expect("connect");
-        let mut reader = BufReader::new(&stream);
-        handshake(&stream, &mut reader, request);
-        old.join().unwrap();
-        let (bind_at, link) = (new_at.clone(), (dialed != old_at).then(|| dialed.clone()));
-        let successor = std::thread::spawn(move || {
-            let listener = aterm_uds::CtlListener::bind(&bind_at).unwrap();
-            if let Some(link) = link {
-                aterm_uds::latest::publish(&link, bind_at.to_str().unwrap());
-            }
-            serve_by(
-                &listener,
-                |asked| {
-                    if asked.contains("@s-old") {
-                        "ERR no such session\n"
-                    } else {
-                        "OK subscribe 1\nsub 4 s-new\nEVENT 4 exited\n"
-                    }
-                },
-                &seen_tx,
-            );
-        });
-        let mut out = Vec::new();
-        let code = relay_subscription(
-            FirstLeg {
-                stream: &stream,
-                reader: &mut reader,
-                dialed: &named(&dialed),
-                server: Some(gone),
-                listener: None,
-            },
-            request,
-            None,
-            &Redial::new(follow)
-                .with_bound(REACHED)
-                .with_started(started_later),
-            &mut out,
-        )
-        .expect("relay");
-        stop(&new_at);
-        successor.join().unwrap();
-        let asked: Vec<String> = seen.try_iter().skip(1).collect();
-        let text = String::from_utf8(out).unwrap();
-        if case == "fixed" {
-            assert_eq!(asked, [pinned, request], "{case}");
-            assert_eq!(code, ExitCode::SUCCESS, "{case}");
-            assert!(text.contains("sub 4 s-new"), "{case}: {text}");
-        } else {
-            assert_eq!(asked, [pinned], "{case}: never asked for its self");
-            assert_eq!(code, ExitCode::from(EXIT_REPLACED), "{case}");
-            assert!(!text.contains("sub 4"), "{case}: {text}");
-        }
     }
 }
 
@@ -1928,30 +1541,23 @@ fn a_refusal_is_judged_by_the_process_that_gave_it() {
                 let _ = (&conn).write_all(b"ERR not this one\n");
             }
         });
-        let mut out = Vec::new();
-        let code = relay_subscription(
-            FirstLeg {
-                stream: &stream,
-                reader: &mut reader,
-                dialed: old_sock.to_str().unwrap(),
-                server: Some(gone_pid()),
-                listener: None,
-            },
+        let (code, out) = relay(
+            &stream,
+            &mut reader,
+            old_sock.to_str().unwrap(),
+            Some(gone_pid()),
             request,
-            None,
             &Redial::new(Follow::Path(fixed.to_str().unwrap().to_string()))
                 .with_bound(REACHED)
                 .with_started(started),
-            &mut out,
-        )
-        .expect("relay");
+        );
         p1.join().unwrap();
         assert_eq!(
             seen.try_iter().skip(1).count(),
             0,
             "{case}: P1 was never asked"
         );
-        let text = String::from_utf8(out).unwrap();
+        let text = out;
         if followed {
             assert_eq!(p2.asked(), format!("{pinned}{request}"), "{case}");
             assert_eq!(code, ExitCode::SUCCESS, "{case}");
@@ -1962,59 +1568,6 @@ fn a_refusal_is_judged_by_the_process_that_gave_it() {
             assert!(!text.contains("sub 5"), "{case}: {text}");
         }
     }
-}
-
-/// A fallback leg's note says a relaunch without the stream's session and names
-/// self as the caller wrote it; an unresumed one names the instance answering
-/// now, or the same pid reopening its socket.
-#[test]
-fn the_notes_say_what_the_successor_was() {
-    for (original, words) in [
-        ("subscribe @. events\n", "(`@.` resolved there)"),
-        ("@ subscribe events\n", "(`@` resolved there)"),
-        (
-            "subscribe events\n",
-            "(the request names no session, and it resolved there)",
-        ),
-    ] {
-        let note = resumed_note(
-            7,
-            9,
-            "/r/a.sock",
-            original,
-            &Ask {
-                request: original.to_owned(),
-                session: LegSession::Other,
-            },
-            Arrival::Predates,
-        );
-        assert!(
-            note.starts_with(
-                "aterm was replaced (pid 7 -> 9, a relaunch without this stream's session); \
-                 the stream resumed on /r/a.sock"
-            ) && note.contains("(`GAP <local> replaced` on each target)"),
-            "{note}"
-        );
-        assert!(note.contains(words), "{original:?}: {note}");
-        assert_eq!(note.contains("@."), original.contains("@."), "{note}");
-    }
-    for why in [Unresumed::Predates, Unresumed::Unknown, Unresumed::Shared] {
-        assert_eq!(
-            unresumed_note(7, 9, "/r/a.sock", why),
-            "aterm (pid 7) went away; /r/a.sock now answers as pid 9, which does not hold the \
-             session this stream followed; re-issue it"
-        );
-        assert_eq!(
-            unresumed_note(7, 7, "/r/a.sock", why),
-            "aterm (pid 7) reopened its control socket without the session this stream \
-             followed; re-issue it"
-        );
-    }
-    assert_eq!(
-        unresumed_note(7, 9, "/r/a.sock", Unresumed::Busy),
-        "aterm was replaced (pid 7 -> 9), and its successor stayed too busy to resume this \
-         subscription; re-issue it"
-    );
 }
 
 /// A successor's start is the kernel's boot-clock record (macOS and Linux): a
@@ -2055,80 +1608,6 @@ fn a_process_started_after_a_moment_is_fresh_against_it() {
     }
 }
 
-/// A self stream (`subscribe @. cursor,events`) on an in-process server at a
-/// fixed `--sock` path hangs up; a successor in this process then answers on
-/// that path, lacking `s-old` (`ERR no such session` to the pinned resume) and
-/// serving its own `s-new` otherwise. Returns what `redial` (with the test's
-/// clock and start record) makes of it: exit code, requests seen, stdout.
-#[cfg(unix)]
-fn relay_to_a_successor_without_the_session(
-    tag: &str,
-    redial: impl FnOnce(Redial) -> Redial,
-) -> (ExitCode, Vec<String>, String) {
-    let request = "subscribe @. cursor,events\n";
-    let (_dir, sock) = scratch_sock(tag);
-    let path = sock.to_str().unwrap().to_string();
-    let (seen_tx, seen) = std::sync::mpsc::channel();
-    let old = fake_server(
-        aterm_uds::CtlListener::bind(&sock).unwrap(),
-        sock.clone(),
-        "OK subscribe 1\nsub 0 s-old\nEVENT 0 block-complete 12 exit=0\n",
-        true,
-        seen_tx.clone(),
-    );
-    let stream = CtlStream::connect(&sock).expect("connect");
-    let mut reader = BufReader::new(&stream);
-    handshake(&stream, &mut reader, request);
-    old.join().unwrap();
-    let successor_path = sock.clone();
-    let successor = std::thread::spawn(move || {
-        let listener = aterm_uds::CtlListener::bind(&successor_path).unwrap();
-        serve_by(
-            &listener,
-            |asked| {
-                if asked.contains("@s-old") {
-                    "ERR no such session\n"
-                } else {
-                    "OK subscribe 1\nsub 4 s-new\nEVENT 4 exited\n"
-                }
-            },
-            &seen_tx,
-        );
-    });
-    let mut out = Vec::new();
-    let code = relay_subscription(
-        FirstLeg {
-            stream: &stream,
-            reader: &mut reader,
-            dialed: &path,
-            server: Some(gone_pid()),
-            listener: None,
-        },
-        request,
-        None,
-        &redial(Redial::new(Follow::Path(path.clone())).with_bound(REACHED)),
-        &mut out,
-    )
-    .expect("relay");
-    stop(&sock);
-    successor.join().unwrap();
-    let asked = seen.try_iter().skip(1).collect();
-    (code, asked, String::from_utf8(out).unwrap())
-}
-
-/// A hang-up read on a Linux boot clock ([`linux_clock`]): 1234.567 89 s after
-/// boot, inside clock tick 123456 at 100 Hz.
-const LINUX_HANGUP: u64 = 1_234_567_890_000;
-
-/// This relay's clock on Linux: the boot clock alone (`CLOCK_BOOTTIME`, in
-/// nanoseconds), read at [`LINUX_HANGUP`].
-fn linux_clock() -> Stamp {
-    Stamp {
-        boot: Some(BootClock(LINUX_HANGUP)),
-        wall: None,
-    }
-}
-
 /// `pid`'s start as Linux records it (a `/proc/<pid>/stat` line with `state`
 /// and `starttime` `ticks`, and a `status` with effective uid 501), read through
 /// the Linux relay's parser by a uid-501 reader at 100 Hz.
@@ -2153,144 +1632,9 @@ fn linux_started(pid: u32, ticks: u64, state: char) -> Option<Stamp> {
     })
 }
 
-/// Started in the tick after the hang-up's.
-fn linux_next_tick(pid: u32) -> Option<Stamp> {
-    linux_started(pid, 123_457, 'S')
-}
-
-/// Started in the hang-up's own tick — before or after it, the record cannot
-/// say.
-fn linux_same_tick(pid: u32) -> Option<Stamp> {
-    linux_started(pid, 123_456, 'S')
-}
-
-/// Started well before the hang-up.
-fn linux_earlier(pid: u32) -> Option<Stamp> {
-    linux_started(pid, 120_000, 'S')
-}
-
-/// A record whose process has already ended.
-fn linux_zombie(pid: u32) -> Option<Stamp> {
-    linux_started(pid, 123_457, 'Z')
-}
-
-/// The Linux start record moves a self stream only for a relaunch, run on any
-/// host with Linux's clock and start record ([`linux_started`]): a start in the
-/// tick after the hang-up's is followed; one well before, in the hang-up's own
-/// tick, or of an ended process ends the stream 75.
-#[cfg(unix)]
-#[test]
-fn a_linux_start_record_moves_a_self_stream_only_for_a_relaunch() {
-    let request = "subscribe @. cursor,events\n";
-    let pinned = "subscribe @s-old cursor,events since-block=12\n";
-    type Started = fn(u32) -> Option<Stamp>;
-    for (case, started, followed) in [
-        ("next tick", linux_next_tick as Started, true),
-        ("same tick", linux_same_tick, false),
-        ("earlier", linux_earlier, false),
-        ("zombie", linux_zombie, false),
-    ] {
-        let (code, asked, text) = relay_to_a_successor_without_the_session(
-            &format!("rd-linux-{}", case.replace(' ', "-")),
-            |r| r.with_clock(linux_clock).with_started(started),
-        );
-        if followed {
-            assert_eq!(asked, [pinned, request], "{case}");
-            assert_eq!(code, ExitCode::SUCCESS, "{case}");
-            assert!(text.contains("sub 4 s-new"), "{case}: {text}");
-        } else {
-            assert_eq!(asked, [pinned], "{case}: never asked for its self");
-            assert_eq!(code, ExitCode::from(EXIT_REPLACED), "{case}");
-            assert!(!text.contains("sub 4"), "{case}: {text}");
-        }
-    }
-}
-
 /// A fixed wall-clock moment the clock stand-ins below read around.
 fn wall_at(seconds: u64) -> Option<SystemTime> {
     UNIX_EPOCH.checked_add(Duration::from_secs(1_800_000_000 + seconds))
-}
-
-/// A hang-up as the x86_64 slice reads it under Rosetta
-/// ([`aterm_uds::process::boot_clock_now`] answers `None` there): the wall
-/// clock alone, at [`wall_at`] 10.
-fn rosetta_clock() -> Stamp {
-    Stamp {
-        boot: None,
-        wall: wall_at(10),
-    }
-}
-
-/// The same hang-up had the translated `mach_absolute_time` (nanoseconds) been
-/// taken for the boot clock.
-fn rosetta_clock_in_nanoseconds() -> Stamp {
-    Stamp {
-        boot: Some(BootClock(705_901_910_571_583)),
-        wall: wall_at(10),
-    }
-}
-
-/// A relaunch's start as the kernel records it on Apple silicon, in its own
-/// 24 MHz ticks, with its wall record after [`rosetta_clock`]'s.
-fn started_in_kernel_ticks_after(_: u32) -> Option<Stamp> {
-    Some(Stamp {
-        boot: Some(BootClock(16_941_646_465_128)),
-        wall: wall_at(11),
-    })
-}
-
-/// The same record, its wall time before the hang-up's: already running.
-fn started_in_kernel_ticks_before(_: u32) -> Option<Stamp> {
-    Some(Stamp {
-        boot: Some(BootClock(16_941_646_465_128)),
-        wall: wall_at(9),
-    })
-}
-
-/// Under Rosetta (no boot clock, start records in kernel ticks) a relaunch is
-/// ordered on the wall clock; the translated nanoseconds taken for boot ticks
-/// would end the same relaunch 75.
-#[cfg(unix)]
-#[test]
-fn a_relay_under_rosetta_orders_a_relaunch_on_the_wall_clock() {
-    let request = "subscribe @. cursor,events\n";
-    let pinned = "subscribe @s-old cursor,events since-block=12\n";
-    type Clock = fn() -> Stamp;
-    type Started = fn(u32) -> Option<Stamp>;
-    for (case, clock, started, followed) in [
-        (
-            "relaunch",
-            rosetta_clock as Clock,
-            started_in_kernel_ticks_after as Started,
-            true,
-        ),
-        (
-            "already running",
-            rosetta_clock,
-            started_in_kernel_ticks_before,
-            false,
-        ),
-        (
-            "nanoseconds as boot ticks",
-            rosetta_clock_in_nanoseconds,
-            started_in_kernel_ticks_after,
-            false,
-        ),
-    ] {
-        let (code, asked, text) = relay_to_a_successor_without_the_session(
-            &format!("rd-rosetta-{}", case.replace(' ', "-")),
-            |r| r.with_clock(clock).with_started(started),
-        );
-        if followed {
-            assert_eq!(asked, [pinned, request], "{case}");
-            assert_eq!(code, ExitCode::SUCCESS, "{case}");
-            assert!(text.contains("sub 4 s-new"), "{case}: {text}");
-        } else {
-            assert_eq!(asked, [pinned], "{case}: never asked for its self");
-            assert_eq!(code, ExitCode::from(EXIT_REPLACED), "{case}");
-            assert!(!text.contains("sub 4"), "{case}: {text}");
-        }
-    }
 }
 
 /// The boot clock orders a start and a hang-up wherever both have it, whatever
@@ -2332,6 +1676,45 @@ fn the_boot_clock_orders_a_start_and_a_hangup_wherever_both_have_it() {
         "no shared clock"
     );
     assert_eq!(arrival_of(None, hung_up), Arrival::Unknown, "no record");
+
+    // Linux: the relay reads the boot clock alone (`CLOCK_BOOTTIME`, ns); a
+    // start is `/proc/<pid>/stat` field 22 in 100 Hz ticks, read through the
+    // Linux relay's parser. The hang-up falls inside tick 123456: a start in
+    // the next tick is a relaunch; one in the hang-up's own tick reads as the
+    // tick's first instant, so it is not; an ended process has no start.
+    let linux_hangup = at(Some(1_234_567_890_000), None);
+    for (case, ticks, state, arrival) in [
+        ("next tick", 123_457, 'S', Arrival::Fresh),
+        ("same tick", 123_456, 'S', Arrival::Predates),
+        ("earlier", 120_000, 'S', Arrival::Predates),
+        ("zombie", 123_457, 'Z', Arrival::Unknown),
+    ] {
+        assert_eq!(
+            arrival_of(linux_started(1, ticks, state), linux_hangup),
+            arrival,
+            "linux {case}"
+        );
+    }
+    // ROSETTA: the translated x86_64 slice reads no boot clock
+    // ([`aterm_uds::process::boot_clock_now`] answers `None`) while start
+    // records are in Apple silicon's 24 MHz kernel ticks, so the wall clock
+    // orders a relaunch. The translated `mach_absolute_time` (ns) taken for
+    // the boot clock would put the hang-up x125/3 after every start.
+    let kernel_ticks = |wall| at(Some(16_941_646_465_128), Some(wall));
+    let rosetta = at(None, Some(10));
+    assert_eq!(arrival_of(Some(kernel_ticks(11)), rosetta), Arrival::Fresh);
+    assert_eq!(
+        arrival_of(Some(kernel_ticks(9)), rosetta),
+        Arrival::Predates
+    );
+    assert_eq!(
+        arrival_of(
+            Some(kernel_ticks(11)),
+            at(Some(705_901_910_571_583), Some(10))
+        ),
+        Arrival::Predates,
+        "nanoseconds taken for boot ticks"
+    );
 
     let seen = at(Some(5_000), Some(100));
     assert_eq!(earliest(seen, None), seen, "no exit stamp: the read");
@@ -2679,46 +2062,6 @@ fn a_relaunch_after_a_later_legs_server_crashed_is_judged_by_that_exit() {
     assert!(text.contains("sub 5 s-new"), "R's leg: {text}");
 }
 
-/// A resumed subscribe names each local target by the sid its `sub` line tied
-/// it to; an untied one cannot be followed.
-#[test]
-fn a_resumed_subscribe_names_a_local_target_by_its_sid() {
-    let tied = [
-        ("3".to_string(), "s-aaaa".to_string()),
-        ("5".to_string(), "s-bbbb".to_string()),
-    ];
-    assert_eq!(
-        resume_request(
-            "subscribe @3 screen,events since=9\n",
-            &tied,
-            &EventAnchors::default()
-        )
-        .as_deref(),
-        Some("subscribe @s-aaaa screen,events\n")
-    );
-    assert_eq!(
-        resume_request(
-            "subscribe @3,@s-cccc,@.,@5 events\n",
-            &tied,
-            &EventAnchors::default()
-        )
-        .as_deref(),
-        Some("subscribe @s-aaaa,@s-cccc,@.,@s-bbbb events\n")
-    );
-    assert_eq!(
-        resume_request("subscribe @4 events\n", &tied, &EventAnchors::default()),
-        None,
-        "a local number the stream never tied to a session"
-    );
-    let mut t = FrameTracker::new("subscribe @3 screen,events\n");
-    t.feed(b"sub 3 s-aaaa\nDELTA 3 seq=1 screen 1\nsub 9 s-row\n");
-    assert_eq!(
-        t.sids(),
-        [("3".to_string(), "s-aaaa".to_string())],
-        "a body that reads like a `sub` line is no target"
-    );
-}
-
 #[test]
 fn only_anchorless_blocking_reads_are_asked_again() {
     let parts = |s: &str| -> Vec<String> { s.split_whitespace().map(String::from).collect() };
@@ -2733,6 +2076,11 @@ fn only_anchorless_blocking_reads_are_asked_again() {
         "await idle 500",
         "await match prompt",
         "await inbox",
+        // The session log's seq space continues across an update; `need`
+        // latches on what the carried fold holds open.
+        "await log need",
+        "@s-a await log need timeout=600000",
+        "await log close=turn since=4 ep=1 timeout=600000",
     ] {
         assert!(retries_across_replacement(&parts(yes)), "{yes}");
         assert!(is_blocking_read(&parts(yes)), "{yes}");
@@ -2751,6 +2099,12 @@ fn only_anchorless_blocking_reads_are_asked_again() {
         "inbox since=7",
         "inbox 16 since=7",
         "@s-a await seq 3 timeout=500",
+        // An `await log` with no `since=` (but `need`) is armed at the head:
+        // a record the successor wrote before a retry armed would never
+        // answer it.
+        "await log close=turn",
+        "@s-a await log kind=verdict timeout=5000",
+        "await log open=step timeout=1000",
         // A local number names a session of the old process.
         "@3 text",
         "@3 await match DONE",
@@ -2771,49 +2125,58 @@ fn only_anchorless_blocking_reads_are_asked_again() {
     assert!(!is_blocking_read(&parts("send hi")));
 }
 
+/// A since-less `await log` cut by a replacement is not asked again, and its
+/// note says how to wait again without missing what the update wrote: from
+/// `status`'s cursor.
+#[test]
+fn a_cut_since_less_await_log_says_to_wait_again_from_status() {
+    let parts = |s: &str| -> Vec<String> { s.split_whitespace().map(String::from).collect() };
+    let cut = parts("@s-a await log close=turn timeout=600000");
+    assert!(reports_replacement(&cut));
+    assert!(!retries_across_replacement(&cut));
+    let note = not_asked_again_note(&cut);
+    assert!(note.contains("since=<log_seq> ep=<log_ep>"), "{note}");
+}
+
 /// A cut `turn` or `post` is reported as a replacement (exit 75, a note that it
 /// may already have taken effect), never as a bare error a caller would retry,
-/// and is never asked again; other writes keep their error.
+/// and is never asked again; with nothing answering in time (`Hangup::Gone`)
+/// its gone note carries the same advice. Other requests keep their error.
 #[test]
 fn a_cut_turn_or_post_is_reported_as_a_replacement_and_never_asked_again() {
     let parts = |s: &str| -> Vec<String> { s.split_whitespace().map(String::from).collect() };
-    const TYPED: &[&str] = &["may already have been typed"];
-    const POSTED: &[&str] = &["never post it again blind", "key="];
-    for (write, words) in [
-        ("turn hi", TYPED),
-        ("@s-a turn timeout=1800000 implement X", TYPED),
-        ("@3 turn go", TYPED),
-        ("post to=@s-b hi", POSTED),
-        ("post to=h-andrew kind=ask --wait=30000 which?", POSTED),
-        ("@s-a post to=@s-b kind=task --wait-ack=60000 go", POSTED),
+    let gone = gone_note(Some(7), Duration::from_secs(30), false, None);
+    let head = gone
+        .strip_suffix(" (exit 75)")
+        .expect("a gone note ends in its exit");
+    for (write, reported) in [
+        ("turn hi", true),
+        ("@s-a turn timeout=1800000 implement X", true),
+        ("@3 turn go", true),
+        ("post to=@s-b hi", true),
+        ("@s-a post to=@s-b kind=task --wait-ack=60000 go", true),
+        ("send hi", false),
+        ("key enter", false),
     ] {
-        assert!(reports_replacement(&parts(write)), "{write}");
+        assert_eq!(reports_replacement(&parts(write)), reported, "{write}");
         assert!(!retries_across_replacement(&parts(write)), "{write}");
-        let note = not_asked_again_note(&parts(write));
-        for &word in words {
-            assert!(note.contains(word), "{write}: {note}");
+        // And when nothing answered in time (`Hangup::Gone`), a cut `turn` or
+        // `post` gets the same advice (was: the bare gone note): the write may
+        // have taken effect before the hang-up.
+        let note = gone_request_note(gone.clone(), &parts(write));
+        if reported {
+            assert!(note.starts_with(head), "{write}: {note}");
+            assert!(
+                note.contains(&not_asked_again_note(&parts(write))),
+                "{write}: {note}"
+            );
+            assert!(note.ends_with(" (exit 75)"), "{write}: {note}");
+        } else {
+            assert_eq!(note, gone, "{write}");
         }
-        // And when nothing answered in time — a crash the PTY keeper recovers
-        // the session from leaves its agent running — the same instead.
-        let gone = gone_request_note(
-            gone_note(Some(7), Duration::from_secs(30), false, None),
-            &parts(write),
-        );
-        for &word in words.iter().chain(&["cannot be resumed"]) {
-            assert!(gone.contains(word), "{write}: {gone}");
-        }
-        assert!(gone.ends_with("(exit 75)"), "{gone}");
     }
     // NEGATIVE CONTROL: a read cut by a crash says only that it is gone.
-    let gone = gone_note(Some(7), Duration::from_secs(30), false, None);
     assert_eq!(gone_request_note(gone.clone(), &parts("text")), gone);
-    for write in ["send hi", "key enter"] {
-        assert!(!reports_replacement(&parts(write)), "{write}");
-    }
-    assert!(reports_replacement(&parts("await block")));
-    assert!(not_asked_again_note(&parts("await block")).contains("before waiting again"));
-    assert!(not_asked_again_note(&parts("await seq")).contains("before waiting again"));
-    assert!(not_asked_again_note(&parts("await seq 4")).contains("re-issue it"));
 }
 
 /// A listener that accepts but never answers (a process mid-exit whose socket
@@ -2871,7 +2234,6 @@ fn a_hangup_is_classified_by_who_serves_the_path_now() {
         Hangup::Unknown
     );
     // Nothing answers: the server is gone and nobody replaced it.
-    let started = Instant::now();
     assert!(matches!(
         follow.after_hangup(&path, Some(gone), None, None),
         Hangup::Gone {
@@ -2879,10 +2241,6 @@ fn a_hangup_is_classified_by_who_serves_the_path_now() {
             ..
         }
     ));
-    assert!(
-        started.elapsed() >= Duration::from_millis(300),
-        "it waited the bound"
-    );
 
     let (tx, _rx) = std::sync::mpsc::channel();
     let server = fake_server(
@@ -3036,23 +2394,21 @@ fn a_pid_pin_whose_process_has_ended_unreaped_is_gone_at_once() {
     );
 }
 
-/// A `subscribe` whose server is replaced mid-stream: the old leg's frames,
-/// then the successor's (answering on the same fixed path), all on one stdout;
-/// the resumed request carries no `since=`; the relay ends 0 only when the
-/// stream says its session exited. Negative control: a plain copy-to-EOF relay
-/// stops at the hang-up.
+/// A local target the stream never tied to a sid (no `sub` line read) is not
+/// followed: a successor numbers adopted sessions afresh, so `@3` there may
+/// be another session. Exit 75, the successor asked nothing. (A tied one is
+/// rewritten to its sid: [`a_resumed_subscribe_carries_only_what_the_successor_can_answer`].)
 #[cfg(unix)]
 #[test]
-fn a_subscription_follows_its_server_across_a_replacement() {
-    let (_dir, sock) = scratch_sock("rd-relay");
+fn a_subscription_by_an_untied_local_number_is_not_followed() {
+    let (_dir, sock) = scratch_sock("rd-local-untied");
     let path = sock.to_str().unwrap().to_string();
-    let request = "subscribe @s-a cursor,events since=9\n";
+    let request = "subscribe @3 cursor,events\n";
     let (seen_tx, seen) = std::sync::mpsc::channel();
-
     let old = fake_server(
         aterm_uds::CtlListener::bind(&sock).unwrap(),
         sock.clone(),
-        "OK subscribe 1\nsub 1 s-a\nDELTA 1 seq=9 cursor 0 0 1 block\n",
+        "OK subscribe 1\n",
         true,
         seen_tx.clone(),
     );
@@ -3060,20 +2416,13 @@ fn a_subscription_follows_its_server_across_a_replacement() {
     let mut reader = BufReader::new(&stream);
     handshake(&stream, &mut reader, request);
     old.join().unwrap();
-    // The successor: binds the same path once the old one is gone.
-    let successor_path = sock.clone();
-    let successor = std::thread::spawn(move || {
-        let listener = aterm_uds::CtlListener::bind(&successor_path).unwrap();
-        serve(
-            &listener,
-            &successor_path,
-            "OK subscribe 1\nsub 7 s-a\nDELTA 7 seq=1 cursor 5 5 1 block\nEVENT 7 exited\n",
-            false,
-            &seen_tx,
-        );
-    });
-
-    let mut out = Vec::new();
+    let successor = fake_server(
+        aterm_uds::CtlListener::bind(&sock).unwrap(),
+        sock.clone(),
+        "OK subscribe 1\nsub 1 s-aaaa\nEVENT 1 exited\n",
+        false,
+        seen_tx,
+    );
     let code = relay_subscription(
         FirstLeg {
             stream: &stream,
@@ -3085,117 +2434,17 @@ fn a_subscription_follows_its_server_across_a_replacement() {
         request,
         None,
         &Redial::new(Follow::Path(path.clone())).with_bound(REACHED),
-        &mut out,
+        &mut Vec::new(),
     )
     .expect("relay");
     stop(&sock);
     successor.join().unwrap();
-    let text = String::from_utf8(out).unwrap();
-    assert_eq!(code, ExitCode::SUCCESS, "ended by the successor's `exited`");
-    let old_at = text
-        .find("DELTA 1 seq=9 cursor 0 0")
-        .expect("old leg relayed");
-    let new_at = text
-        .find("DELTA 7 seq=1 cursor 5 5")
-        .unwrap_or_else(|| panic!("successor leg relayed: {text}"));
-    assert!(old_at < new_at, "{text}");
-    let requests: Vec<String> = seen.try_iter().collect();
-    assert_eq!(requests.len(), 2, "{requests:?}");
-    assert!(requests[0].contains("since=9"));
-    assert_eq!(requests[1], "subscribe @s-a cursor,events\n");
-
-    // Control: a plain copy-to-EOF relay stops at the hang-up.
-    let (_dir2, sock2) = scratch_sock("rd-before");
-    let (tx2, _rx2) = std::sync::mpsc::channel();
-    let old2 = fake_server(
-        aterm_uds::CtlListener::bind(&sock2).unwrap(),
-        sock2.clone(),
-        "OK subscribe 1\nsub 1 s-a\nDELTA 1 seq=9 cursor 0 0 1 block\n",
-        true,
-        tx2,
+    assert_eq!(code, ExitCode::from(EXIT_REPLACED));
+    assert_eq!(
+        seen.try_iter().count(),
+        1,
+        "the successor was asked nothing"
     );
-    let stream2 = CtlStream::connect(&sock2).expect("connect");
-    let mut reader2 = BufReader::new(&stream2);
-    handshake(&stream2, &mut reader2, request);
-    old2.join().unwrap();
-    let mut before = Vec::new();
-    std::io::copy(&mut reader2, &mut before).unwrap();
-    assert!(
-        !String::from_utf8_lossy(&before).contains("cursor 5 5"),
-        "control: the old relay ends at the hang-up (and returned SUCCESS there)"
-    );
-}
-
-/// A stream by local number follows its session: the successor is asked for
-/// the sid its `sub` line tied (`@s-aaaa`, not `@3`); untied, exit 75 with
-/// nothing asked.
-#[cfg(unix)]
-#[test]
-fn a_subscription_by_local_number_follows_its_session_not_the_number() {
-    for (case, first_leg, expect) in [
-        (
-            "tied",
-            "OK subscribe 1\nsub 3 s-aaaa\nDELTA 3 seq=9 cursor 0 0 1 block\n",
-            Some("subscribe @s-aaaa cursor,events\n"),
-        ),
-        ("untied", "OK subscribe 1\n", None),
-    ] {
-        let (_dir, sock) = scratch_sock(&format!("rd-local-{case}"));
-        let path = sock.to_str().unwrap().to_string();
-        let request = "subscribe @3 cursor,events\n";
-        let (seen_tx, seen) = std::sync::mpsc::channel();
-        let old = fake_server(
-            aterm_uds::CtlListener::bind(&sock).unwrap(),
-            sock.clone(),
-            first_leg,
-            true,
-            seen_tx.clone(),
-        );
-        let stream = CtlStream::connect(&sock).expect("connect");
-        let mut reader = BufReader::new(&stream);
-        handshake(&stream, &mut reader, request);
-        old.join().unwrap();
-        let successor_path = sock.clone();
-        let successor = std::thread::spawn(move || {
-            let listener = aterm_uds::CtlListener::bind(&successor_path).unwrap();
-            serve(
-                &listener,
-                &successor_path,
-                "OK subscribe 1\nsub 1 s-aaaa\nEVENT 1 exited\n",
-                false,
-                &seen_tx,
-            );
-        });
-        let mut out = Vec::new();
-        let code = relay_subscription(
-            FirstLeg {
-                stream: &stream,
-                reader: &mut reader,
-                dialed: &path,
-                server: Some(gone_pid()),
-                listener: None,
-            },
-            request,
-            None,
-            &Redial::new(Follow::Path(path.clone())).with_bound(REACHED),
-            &mut out,
-        )
-        .expect("relay");
-        stop(&sock);
-        successor.join().unwrap();
-        let requests: Vec<String> = seen.try_iter().collect();
-        match expect {
-            Some(resumed) => {
-                assert_eq!(code, ExitCode::SUCCESS, "{case}");
-                assert_eq!(requests.len(), 2, "{case}: {requests:?}");
-                assert_eq!(requests[1], resumed, "{case}");
-            }
-            None => {
-                assert_eq!(code, ExitCode::from(EXIT_REPLACED), "{case}");
-                assert_eq!(requests.len(), 1, "{case}: the successor asked nothing");
-            }
-        }
-    }
 }
 
 /// [`serve`] for a successor that answers by request: every request but
@@ -3229,44 +2478,6 @@ fn serve_by(
     }
 }
 
-/// No successor: the relay says so and exits 75 — never 0.
-#[cfg(unix)]
-#[test]
-fn a_subscription_whose_server_is_not_replaced_exits_75() {
-    let (_dir, sock) = scratch_sock("rd-gone");
-    let path = sock.to_str().unwrap().to_string();
-    let request = "subscribe @s-a screen\n";
-    let (tx, _rx) = std::sync::mpsc::channel();
-    let old = fake_server(
-        aterm_uds::CtlListener::bind(&sock).unwrap(),
-        sock.clone(),
-        "OK subscribe 1\nsub 1 s-a\nDELTA 1 seq=2 screen 1\nhello\n",
-        true,
-        tx,
-    );
-    let stream = CtlStream::connect(&sock).expect("connect");
-    let mut reader = BufReader::new(&stream);
-    handshake(&stream, &mut reader, request);
-    old.join().unwrap();
-    let mut out = Vec::new();
-    let code = relay_subscription(
-        FirstLeg {
-            stream: &stream,
-            reader: &mut reader,
-            dialed: &path,
-            server: Some(gone_pid()),
-            listener: None,
-        },
-        request,
-        None,
-        &Redial::new(Follow::Path(path.clone())).with_bound(Duration::from_millis(400)),
-        &mut out,
-    )
-    .unwrap();
-    assert_eq!(code, ExitCode::from(EXIT_REPLACED));
-    assert!(String::from_utf8(out).unwrap().contains("hello"));
-}
-
 /// A server that still answers ended the stream on purpose (a fixed-target
 /// subscription whose sessions closed): exit 0 at once, no successor wait.
 #[cfg(unix)]
@@ -3287,21 +2498,14 @@ fn a_deliberate_end_by_a_live_server_is_still_exit_0_and_immediate() {
     let mut reader = BufReader::new(&stream);
     handshake(&stream, &mut reader, request);
     let started = Instant::now();
-    let mut out = Vec::new();
-    let code = relay_subscription(
-        FirstLeg {
-            stream: &stream,
-            reader: &mut reader,
-            dialed: &path,
-            server: Some(std::process::id()),
-            listener: None,
-        },
+    let (code, _) = relay(
+        &stream,
+        &mut reader,
+        &path,
+        Some(std::process::id()),
         request,
-        None,
         &Redial::new(Follow::Path(path.clone())).with_bound(FAR),
-        &mut out,
-    )
-    .unwrap();
+    );
     assert_eq!(code, ExitCode::SUCCESS);
     // At once: well under the bound a missed StillServing would wait out.
     assert!(started.elapsed() < REACHED, "{:?}", started.elapsed());
@@ -3370,7 +2574,8 @@ fn a_blocking_read_is_asked_again_only_where_that_means_the_same_question() {
         ExitCode::from(124),
         "the successor's answer is the answer"
     );
-    // ...but a wait anchored in the old process is not.
+    // ...but a wait anchored in the old process is not (which requests are:
+    // `only_anchorless_blocking_reads_are_asked_again`).
     let code = super::super::replaced_before_reply(
         &path,
         Some(gone),
@@ -3383,35 +2588,6 @@ fn a_blocking_read_is_asked_again_only_where_that_means_the_same_question() {
     )
     .unwrap();
     assert_eq!(code, ExitCode::from(EXIT_REPLACED));
-    // Nor an inbox row id: each process numbers its own rows.
-    let code = super::super::replaced_before_reply(
-        &path,
-        Some(gone),
-        None,
-        &parts("@s-a inbox get 4"),
-        &served,
-        None,
-        |_| panic!("an inbox id means nothing to the successor"),
-        None,
-    )
-    .unwrap();
-    assert_eq!(code, ExitCode::from(EXIT_REPLACED));
-    // Nor a wait whose anchor is its own arm, nor a `turn`, which types: 75,
-    // never asked again.
-    for cut in ["@s-a await block timeout=600000", "@s-a turn implement X"] {
-        let code = super::super::replaced_before_reply(
-            &path,
-            Some(gone),
-            None,
-            &parts(cut),
-            &redial,
-            None,
-            |_| panic!("`{cut}` is not asked again"),
-            None,
-        )
-        .unwrap();
-        assert_eq!(code, ExitCode::from(EXIT_REPLACED), "{cut}");
-    }
     // The same server still answering: the original error.
     let err = super::super::replaced_before_reply(
         &path,
@@ -3431,10 +2607,11 @@ fn a_blocking_read_is_asked_again_only_where_that_means_the_same_question() {
 
 /// An explicit `--timeout` bounds the wait for a successor: the classification,
 /// a `subscribe` relay and a blocking read each give up at the deadline (exit
-/// 75, naming it). Each must end inside `deadline..`[`REACHED`] against a
-/// [`FAR`] bound, so load cannot decide it; the 2 s deadline also leaves the
-/// relay time to read its buffered frames. Control: with no deadline the whole
-/// (1 s) bound is waited.
+/// 75). Each must end inside [`REACHED`], a minute's hang detector (AGENTS.md)
+/// that sits minutes under the [`FAR`] bound ignoring the deadline would wait;
+/// the 2 s deadline also leaves the relay time to read its buffered frames.
+/// (With no deadline the verdict is the bound's:
+/// [`a_hangup_is_classified_by_who_serves_the_path_now`].)
 #[cfg(unix)]
 #[test]
 fn an_explicit_timeout_bounds_the_wait_for_a_successor() {
@@ -3447,7 +2624,7 @@ fn an_explicit_timeout_bounds_the_wait_for_a_successor() {
     let within_the_deadline = |started: Instant| {
         let took = started.elapsed();
         assert!(
-            took >= deadline && took < REACHED,
+            took < REACHED,
             "took {took:?} against a {deadline:?} deadline and a {FAR:?} bound"
         );
     };
@@ -3516,21 +2693,6 @@ fn an_explicit_timeout_bounds_the_wait_for_a_successor() {
     .unwrap();
     assert_eq!(code, ExitCode::from(EXIT_REPLACED));
     within_the_deadline(started);
-
-    // Control: no deadline, the whole bound.
-    let bound = Duration::from_secs(1);
-    let started = Instant::now();
-    assert!(matches!(
-        Redial::new(Follow::Path(path.clone()))
-            .with_bound(bound)
-            .after_hangup(&path, Some(gone), None, None),
-        Hangup::Gone {
-            by_deadline: false,
-            ..
-        }
-    ));
-    assert!(started.elapsed() >= bound, "{:?}", started.elapsed());
-    assert!(gone_note(Some(gone), deadline, true, None).contains("its --timeout left"));
 }
 
 /// A scratch rendezvous dir — what `aterm_uds::control_socket_dir` names —
@@ -3618,7 +2780,7 @@ fn a_flagless_call_follows_its_session_to_the_successors_own_socket() {
 
 /// …and never a stranger: a live instance in the same dir that neither the
 /// session's graph entry nor the `latest` alias names is not a successor.
-/// Control: once the entry names it (its successor republished it), it is.
+/// Control: outside any session, the alias naming it is followed.
 #[cfg(unix)]
 #[test]
 fn a_flagless_call_never_takes_an_unrelated_instance_for_a_successor() {
@@ -3671,92 +2833,8 @@ fn a_flagless_call_never_takes_an_unrelated_instance_for_a_successor() {
         outside.after_hangup(old, Some(gone), None, None),
         Hangup::Successor { pid, .. } if pid == own
     ));
-    std::fs::remove_file(&alias).unwrap();
-
-    publish_graph_entry(&dir, sid, &stranger_sock);
-    let reached = Redial::new(Follow::Flagless {
-        dir: dir.clone(),
-        self_sid: Some(sid.to_string()),
-    })
-    .with_bound(REACHED);
-    assert_eq!(
-        reached.after_hangup(old, Some(gone), None, None),
-        Hangup::Successor {
-            path: stranger_sock.to_str().unwrap().to_string(),
-            pid: own
-        }
-    );
     stop(&stranger_sock);
     stranger.join().unwrap();
-}
-
-/// Across the real update path the stream resumes on the successor's own
-/// socket, found through the graph entry it republishes after the hang-up.
-#[cfg(unix)]
-#[test]
-fn a_flagless_subscription_resumes_on_the_successors_new_socket() {
-    let (_scratch, dir) = scratch_rendezvous("rd-flag-relay");
-    let gone = gone_pid();
-    let old_sock = dir.join(format!("aterm-{gone}.sock"));
-    let new_sock = dir.join(format!("aterm-{}.sock", std::process::id()));
-    let sid = "s-89abcdef";
-    let request = "subscribe @s-a cursor,events\n";
-    let (seen_tx, seen) = std::sync::mpsc::channel();
-    let old = fake_server(
-        aterm_uds::CtlListener::bind(&old_sock).unwrap(),
-        old_sock.clone(),
-        "OK subscribe 1\nsub 1 s-a\nDELTA 1 seq=3 cursor 0 0 1 block\n",
-        true,
-        seen_tx.clone(),
-    );
-    publish_graph_entry(&dir, sid, &old_sock);
-    let stream = CtlStream::connect(&old_sock).expect("connect");
-    let mut reader = BufReader::new(&stream);
-    handshake(&stream, &mut reader, request);
-    old.join().unwrap();
-
-    let (bind_at, entry_dir) = (new_sock.clone(), dir.clone());
-    let successor = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(200));
-        let listener = aterm_uds::CtlListener::bind(&bind_at).unwrap();
-        publish_graph_entry(&entry_dir, sid, &bind_at);
-        serve(
-            &listener,
-            &bind_at,
-            "OK subscribe 1\nsub 4 s-a\nDELTA 4 seq=1 cursor 9 9 1 block\nEVENT 4 exited\n",
-            false,
-            &seen_tx,
-        );
-    });
-    let mut out = Vec::new();
-    let code = relay_subscription(
-        FirstLeg {
-            stream: &stream,
-            reader: &mut reader,
-            dialed: old_sock.to_str().unwrap(),
-            server: Some(gone),
-            listener: None,
-        },
-        request,
-        None,
-        &Redial::new(Follow::Flagless {
-            dir: dir.clone(),
-            self_sid: Some(sid.to_string()),
-        })
-        .with_bound(REACHED),
-        &mut out,
-    )
-    .expect("relay");
-    stop(&new_sock);
-    successor.join().unwrap();
-    let text = String::from_utf8(out).unwrap();
-    assert_eq!(code, ExitCode::SUCCESS, "ended by the successor's `exited`");
-    let old_at = text.find("cursor 0 0").expect("old leg relayed");
-    let new_at = text
-        .find("cursor 9 9")
-        .unwrap_or_else(|| panic!("successor leg relayed: {text}"));
-    assert!(old_at < new_at, "{text}");
-    assert_eq!(seen.try_iter().count(), 2, "one request per leg");
 }
 
 /// Where a redial looks follows how the call resolved: a `--pid` pin follows no
@@ -3797,298 +2875,4 @@ fn a_redial_follows_what_the_call_resolved_through() {
         Follow::Nothing(Unfollowed::NoRendezvousDir),
         "no rendezvous dir"
     );
-}
-
-/// A `dial … subscribe` stream the local server hangs up while still serving:
-/// it only relays a dial, so the remote connection closed under it; exit 75.
-/// Negative control: the same stream without `dial` is a deliberate end, exit 0
-/// ([`a_deliberate_end_by_a_live_server_is_still_exit_0_and_immediate`]).
-#[cfg(unix)]
-#[test]
-fn a_dial_stream_whose_remote_closes_is_exit_75_not_0() {
-    let (_dir, sock) = scratch_sock("rd-dial");
-    let path = sock.to_str().unwrap().to_string();
-    let request = "dial work subscribe @s-a screen\n";
-    let (tx, _rx) = std::sync::mpsc::channel();
-    let server = fake_server(
-        aterm_uds::CtlListener::bind(&sock).unwrap(),
-        sock.clone(),
-        "OK subscribe 1\nsub 1 s-a\nDELTA 1 seq=2 screen 1\nhello\n",
-        false,
-        tx,
-    );
-    let stream = CtlStream::connect(&sock).expect("connect");
-    let mut reader = BufReader::new(&stream);
-    handshake(&stream, &mut reader, request);
-    let started = Instant::now();
-    let mut out = Vec::new();
-    let code = relay_subscription(
-        FirstLeg {
-            stream: &stream,
-            reader: &mut reader,
-            dialed: &path,
-            server: Some(std::process::id()),
-            listener: None,
-        },
-        request,
-        None,
-        &Redial::new(Follow::Path(path.clone())).with_bound(FAR),
-        &mut out,
-    )
-    .unwrap();
-    assert_eq!(code, ExitCode::from(EXIT_REPLACED));
-    assert!(String::from_utf8(out).unwrap().contains("hello"));
-    // A hang detector: a successor wait would sit out [`FAR`].
-    assert!(started.elapsed() < REACHED, "no successor wait");
-    stop(&sock);
-    server.join().unwrap();
-}
-
-/// Each exit-75 note says the one reason the call knows, never a list of the
-/// reasons it could be.
-#[test]
-fn each_exit_75_note_gives_the_one_reason_it_knows() {
-    let second = Duration::from_secs(1);
-    assert_eq!(
-        gone_note(Some(7), Duration::ZERO, false, Some(&Unfollowed::PidPin(7))),
-        "aterm (pid 7) went away; a --pid call follows no other instance; the exchange cannot \
-         be resumed (exit 75)"
-    );
-    assert!(
-        gone_note(None, Duration::ZERO, false, Some(&Unfollowed::PidPin(7)))
-            .starts_with("aterm (pid 7) went away; a --pid call follows no other instance"),
-        "a --pid call names its process even when no hello said it"
-    );
-    assert_eq!(
-        gone_note(Some(7), Duration::ZERO, false, Some(&Unfollowed::AskedOnce)),
-        "aterm (pid 7) went away; this was already the one retry; the exchange cannot be \
-         resumed (exit 75)"
-    );
-    assert_eq!(
-        gone_note(
-            Some(7),
-            Duration::ZERO,
-            false,
-            Some(&Unfollowed::NoRendezvousDir)
-        ),
-        "aterm (pid 7) went away; with $HOME and $XDG_RUNTIME_DIR unset there is nowhere to \
-         find a successor; the exchange cannot be resumed (exit 75)"
-    );
-    assert_eq!(
-        gone_note(Some(7), 30 * second, false, None),
-        "aterm (pid 7) went away and nothing replaced it within 30.0 s; the exchange cannot be \
-         resumed (exit 75)"
-    );
-    assert_eq!(
-        remote_closed_note_for(&["dial", "work", "text"], false).as_deref(),
-        Some(
-            "the connection to the remote 'work' closed before it answered; the exchange cannot \
-             be resumed (exit 75)"
-        )
-    );
-    assert_eq!(
-        remote_closed_note_for(&["dial", "work", "subscribe", "@s-a", "screen"], true).as_deref(),
-        Some(
-            "the connection to the remote 'work' closed before its sessions exited; the \
-             exchange cannot be resumed (exit 75)"
-        )
-    );
-
-    let parts = |s: &str| -> Vec<String> { s.split_whitespace().map(String::from).collect() };
-    for (request, anchor) in [
-        ("await seq 40", Some("seq 40")),
-        ("await inbox since=12", Some("since=12")),
-        ("@s-a inbox get 4", Some("inbox get 4")),
-        ("inbox --peek", None),
-        ("@3 await match DONE", Some("@3")),
-        ("await seq timeout=0", None),
-        ("await", None),
-    ] {
-        assert_eq!(
-            old_process_anchor(&parts(request)).as_deref(),
-            anchor,
-            "{request}"
-        );
-    }
-    // The replacement note names the anchor when the request has one, and
-    // claims no reason when it has none.
-    assert_eq!(
-        not_asked_again_note(&parts("await inbox since=12")),
-        "`since=12` names a position in the old process — re-issue it"
-    );
-    assert_eq!(
-        not_asked_again_note(&parts("@3 await match DONE")),
-        "`@3` names a position in the old process — re-issue it"
-    );
-    assert_eq!(
-        not_asked_again_note(&parts("await")),
-        "re-issue the request"
-    );
-    assert_eq!(
-        not_asked_again_note(&parts("@s-a await")),
-        "re-issue the request"
-    );
-    // The whole line `replaced_before_reply` prints: the replacement, the one
-    // reason, and the exit code every exit-75 note names.
-    assert_eq!(
-        super::super::not_asked_again_line(7, 8, &parts("await inbox since=12")),
-        "aterm was replaced (pid 7 -> 8) before it answered; `since=12` names a \
-         position in the old process — re-issue it (exit 75)"
-    );
-    assert_eq!(
-        super::super::not_asked_again_line(7, 8, &parts("turn hi")),
-        "aterm was replaced (pid 7 -> 8) before it answered; a `turn` TYPES: its \
-         text may already have been typed, and submitted, in the session — read the screen \
-         (`text`) before sending it again; never retry it blind (exit 75)"
-    );
-    assert_eq!(
-        super::super::not_asked_again_line(7, 8, &parts("await")),
-        "aterm was replaced (pid 7 -> 8) before it answered; re-issue the request \
-         (exit 75)"
-    );
-    assert_eq!(
-        untied_local_target("subscribe @s-a,@3 screen\n", &[("1".into(), "s-a".into())]).as_deref(),
-        Some("@3")
-    );
-    assert_eq!(
-        dial_name(&["dial", "work", "text"]),
-        Some("work"),
-        "the dial's connection"
-    );
-    assert_eq!(dial_name(&["text"]), None);
-}
-
-/// A dialled `turn` or `post` cut by its remote says never to send it again
-/// blind. Each case is the whole request, as both call sites pass it.
-#[test]
-fn a_dialled_turn_or_post_cut_by_its_remote_is_never_sent_again_blind() {
-    for (request, words) in [
-        (
-            &["dial", "work", "turn", "hi"][..],
-            "its `turn` may already have been typed",
-        ),
-        (
-            &["dial", "work", "@s-a", "turn", "timeout=1800000", "go"][..],
-            "never retry it blind",
-        ),
-        (
-            &["dial", "work", "post", "to=@s-b", "hi"][..],
-            "never post it again blind",
-        ),
-        (
-            &["dial", "work", "@s-a", "post", "key=k1", "go"][..],
-            "the same `key=`",
-        ),
-    ] {
-        let note = remote_closed_note_for(request, false).expect("a dial");
-        assert!(
-            note.starts_with("the connection to the remote 'work' closed before it answered; "),
-            "{note}"
-        );
-        assert!(note.contains(words), "{request:?}: {note}");
-        assert!(!note.contains("cannot be resumed"), "{request:?}: {note}");
-        assert!(note.ends_with("(exit 75)"), "{note}");
-    }
-    assert_eq!(
-        remote_closed_note_for(&["turn", "hi"], false),
-        None,
-        "not a dial"
-    );
-    // A bare `await seq` with a parameter is still bare: the arm note, not the
-    // anchor list.
-    let parts = |s: &str| -> Vec<String> { s.split_whitespace().map(String::from).collect() };
-    assert!(
-        not_asked_again_note(&parts("await seq timeout=0")).starts_with("a bare `await seq`"),
-        "{}",
-        not_asked_again_note(&parts("await seq timeout=0"))
-    );
-    assert_eq!(
-        not_asked_again_note(&parts("await seq 40")),
-        "`seq 40` names a position in the old process — re-issue it"
-    );
-}
-
-/// A dialled wait from its arm cut by its remote says to read the session there
-/// before waiting again; a plain read and an `await seq` with a counter keep
-/// the plain note.
-#[test]
-fn a_dialled_wait_from_its_arm_cut_by_its_remote_reads_the_session_first() {
-    for (request, wait) in [
-        (
-            &["dial", "work", "await", "block", "timeout=600000"][..],
-            "await block",
-        ),
-        (
-            &["dial", "work", "@s-a", "await", "consent"][..],
-            "await consent",
-        ),
-        (&["dial", "work", "await", "seq"][..], "await seq"),
-        (
-            &["dial", "work", "@s-a", "await", "seq", "timeout=0"][..],
-            "await seq",
-        ),
-    ] {
-        assert_eq!(
-            remote_closed_note_for(request, false),
-            Some(format!(
-                "the connection to the remote 'work' closed before it answered; its `{wait}` \
-                 waits for a change after it was armed, which may have happened on the remote; \
-                 read the session there (`status`, `text`) before waiting again (exit 75)"
-            )),
-            "{request:?}"
-        );
-    }
-    for plain in [
-        &["dial", "work", "await", "idle", "500"][..],
-        &["dial", "work", "await", "seq", "40"][..],
-    ] {
-        assert_eq!(
-            remote_closed_note_for(plain, false).as_deref(),
-            Some(
-                "the connection to the remote 'work' closed before it answered; the exchange \
-                 cannot be resumed (exit 75)"
-            ),
-            "{plain:?}"
-        );
-    }
-}
-
-/// End to end: a `dial` request cut before its reply while the relay still
-/// serves exits 75, not the exit-1 transport error a caller retries (the note's
-/// words are pinned by the tests above; stderr is not captured here).
-#[cfg(unix)]
-#[test]
-fn a_dialled_turn_or_post_cut_while_the_relay_serves_is_exit_75() {
-    for (tag, request, verb) in [
-        ("rd-dial-cut", "dial work await idle 500\n", "await"),
-        ("rd-dial-turn", "dial work turn implement X\n", "turn"),
-        ("rd-dial-post", "dial work post to=@s-b key=k1 hi\n", "post"),
-    ] {
-        let (_dir, sock) = scratch_sock(tag);
-        let path = sock.to_str().unwrap().to_string();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let server = fake_server(
-            aterm_uds::CtlListener::bind(&sock).unwrap(),
-            sock.clone(),
-            "",
-            false,
-            tx,
-        );
-        let frame = request.trim_end().trim_start_matches("dial work ");
-        let code = super::super::exchange(
-            &path,
-            super::super::TargetOrigin::Pinned,
-            request,
-            verb,
-            frame,
-            Some(Duration::from_secs(60)),
-            false,
-            &Redial::new(Follow::Path(path.clone())).with_bound(REACHED),
-        )
-        .expect("a closed remote is an outcome, not an error");
-        assert_eq!(code, ExitCode::from(EXIT_REPLACED), "{request}");
-        assert_eq!(rx.recv().unwrap(), request);
-        stop(&sock);
-        server.join().unwrap();
-    }
 }

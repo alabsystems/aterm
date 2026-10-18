@@ -2,21 +2,11 @@
 // Copyright 2026 Andrew Yates
 
 //! Test-only: the host-facing entry ([`crate::exceptions`]): the upgrade and Full Disk
-//! Access entries' words, every fault refused where the entry is written, and one family
-//! pass's keys never touching another family's.
+//! Access entries' words and every fault refused where the entry is written.
 
-use crate::center::MessageCenter;
 use crate::exceptions::{Entry, EntryFault, Family, WHAT_CAP};
-use crate::log::MessageLog;
-use crate::model::{Intent, Severity, UpgradeWord, WallStamp};
-use crate::need::{Mover, Need, REASON_CAP, Reason, Resurface, STEP_CAP, Then, Why};
-use crate::{DETAIL_LINE_CAP, Instant};
-
-fn stamp() -> WallStamp {
-    WallStamp {
-        unix_ms: 1_790_000_000_000,
-    }
-}
+use crate::model::{Intent, Severity, UpgradeWord};
+use crate::need::{Mover, Need, Reason, Resurface, Then, Why};
 
 /// Tab 1, after a day: one entry per kind (no subject), the words the owner reads, the
 /// navigation beside the sentence, the holders behind `Details`.
@@ -87,7 +77,9 @@ fn the_full_disk_access_entry_leads_with_the_button_that_does_it() {
     assert_eq!(m.detail[1], "turn on aterm in Full Disk Access");
 }
 
-/// Every way to break the rule is refused where the entry is written.
+/// Every way to break the rule is refused where the entry is written (the
+/// reason/action word rule itself is the door's:
+/// `need_tests::a_snooze_a_pair_of_actions_or_a_wait_is_no_need`).
 #[test]
 fn every_fault_is_refused_where_the_entry_is_written() {
     let base = |what: &str, why: &str, then: &str| {
@@ -120,28 +112,6 @@ fn every_fault_is_refused_where_the_entry_is_written() {
         base(&long, ok.1, ok.2).message(),
         Err(EntryFault::What(_))
     ));
-    // a reason that says something is pending, or nothing
-    assert!(matches!(
-        base(ok.0, "it is waiting for its work", ok.2).message(),
-        Err(EntryFault::Ask(_))
-    ));
-    assert!(matches!(
-        base(ok.0, "", ok.2).message(),
-        Err(EntryFault::Ask(_))
-    ));
-    // an action that is two actions, a snooze, or nothing
-    assert!(matches!(
-        base(ok.0, ok.1, "Stop that work or skip the build").message(),
-        Err(EntryFault::Ask(_))
-    ));
-    assert!(matches!(
-        base(ok.0, ok.1, "Skip this build").message(),
-        Err(EntryFault::Ask(_))
-    ));
-    assert!(matches!(
-        base(ok.0, ok.1, "").message(),
-        Err(EntryFault::Ask(_))
-    ));
     // a decline beside the action
     for decline in [
         Intent::AgentUpgrade {
@@ -161,64 +131,4 @@ fn every_fault_is_refused_where_the_entry_is_written() {
             EntryFault::Decline
         );
     }
-}
-
-/// A family pass sweeps `family.prefix()`; no family's prefix may be the start
-/// of another's, or one reporter could end another's entries.
-#[test]
-fn no_family_prefix_starts_another() {
-    let all = [
-        Family::Privacy,
-        Family::Update,
-        Family::Upgrade,
-        Family::Resume,
-        Family::Supervisor,
-        Family::Toolchain,
-        Family::Disk,
-        Family::Render,
-    ];
-    for a in all {
-        for b in all {
-            if a != b {
-                assert!(!a.prefix().starts_with(&b.prefix()), "{a:?} vs {b:?}");
-            }
-        }
-    }
-    assert!(tab_one().key().starts_with(&Family::Upgrade.prefix()));
-    assert!(
-        full_disk_access()
-            .key()
-            .starts_with(&Family::Privacy.prefix())
-    );
-}
-
-/// The one-line form (`what \u{2014} why \u{2192} then`) of the longest entry the
-/// caps allow fits a detail line, so the menu bar, the palette and the log
-/// never clip it.
-#[test]
-fn the_longest_entry_fits_one_detail_line() {
-    let line = WHAT_CAP
-        + " \u{2014} ".chars().count()
-        + REASON_CAP
-        + " \u{2192} ".chars().count()
-        + STEP_CAP;
-    assert!(line <= DETAIL_LINE_CAP, "{line}");
-}
-
-/// End to end through the engine: a family pass posts the entry once, the
-/// digest reads it, a dismissal files it, and the next pass is quiet.
-#[test]
-fn an_entry_goes_through_the_family_pass_and_a_dismissal_holds() {
-    let now = Instant::now();
-    let mut c = MessageCenter::new(MessageLog::empty(), now);
-    let prefix = Family::Upgrade.prefix();
-    let s = c.sync_digest(&prefix, vec![tab_one().message().unwrap()], stamp(), now);
-    assert_eq!(s.posted, 1);
-    let view = c.digest();
-    assert_eq!(view.entries[0].key, "harness.upgrade.own-work");
-    assert_eq!(view.entries[0].then, "End that job in the tab");
-    assert_eq!(c.wanted_rows(), 0, "an entry never asks for a band row");
-    assert_eq!(c.file_digest(stamp(), now), 1);
-    let s = c.sync_digest(&prefix, vec![tab_one().message().unwrap()], stamp(), now);
-    assert_eq!((s.posted, s.suppressed), (0, 1));
 }

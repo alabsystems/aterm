@@ -1,0 +1,34 @@
+# muse 1.4.9-R6297.1 · MEASURED 2026-10-16, `aterm ctl text --json` of a private headless aterm 120x40 (aterm 0.105.0 80b670745), the atpkg-managed muse (Meta latest) launched through its shim with a scratch HOME, `--base-url` at a local scripted stand-in for Meta's Responses endpoint (`--model fake-1`, a dummy META_API_KEY: no login and no model; the stand-in returns the tool call that raises the box, the box is muse's own), harness off · turns after approvals: `◆ Ran command · Create the marker file · ✓ · 35s · ctrl+o` rows, then the box answered `2`: `◆ Ran touch muse-approved.txt — denied` (the diamond bold 8a9098, `denied` f38ba8), `  └ approval aborted`, `    The user rejected this action. Don't retry it unless they ask.`, the model's next reply `◆ Done: the tool call came back.` and the idle composer · cursor=30,2 (visible) · scratch path redacted at equal length
+
+  Muse Code 1.4.9
+
+❯ APPROVE this please
+
+◆ Ran command · Create the marker file · ✓ · 35s · ctrl+o
+
+◆ Done: the tool call came back.
+
+❯ APPROVE again
+
+◆ Ran command · Create the marker file · ✓ · 3s · ctrl+o
+
+◆ Done: the tool call came back.
+
+❯ APPROVE with y
+
+◆ Ran command · Create the marker file · ✓ · 3s · ctrl+o
+
+◆ Done: the tool call came back.
+
+❯ APPROVE then deny
+
+◆ Ran touch muse-approved.txt — denied
+  └ approval aborted
+    The user rejected this action. Don't retry it unless they ask.
+
+◆ Done: the tool call came back.
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  fake-1 · high · /private/tmp/at.XXXXXX/mwork · Auto-review

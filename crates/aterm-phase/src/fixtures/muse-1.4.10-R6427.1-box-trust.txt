@@ -1,0 +1,10 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab) · launched in the lab's project dir with a fresh scratch HOME and no --trust-workspace: the workspace-trust box, before any key · the lab's random project dir is spelled /private/tmp/at.lab0 here
+Do you trust this workspace?
+Workspace: /private/tmp/at.lab0/proj
+
+Trusting allows project-local skills, rules, hooks, and plugin config to load before the model runs.
+Only trust this workspace when you trust its contents.
+⟩ 1  Trust and continue
+  2  Quit
+
+Use Up/Down or 1/2, then Enter. Esc quits.

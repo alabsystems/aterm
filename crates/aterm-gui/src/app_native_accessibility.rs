@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Shipping AccessKit seam for native tab applications.
+//! Shipping accessibility seam (`aterm_a11y::model`) for native tab applications.
 //!
 //! Paint stages a projection from its exact [`crate::native_ui::CompiledUi`]. A successful
 //! present consumes that stage into the window adapter and retains only a stable action-route
@@ -106,7 +106,7 @@ impl App {
     pub(crate) fn take_native_accessibility_update(
         &mut self,
         wid: WindowId,
-    ) -> Option<Result<(accesskit::TreeUpdate, PublishedNativeAccessibility), String>> {
+    ) -> Option<Result<(aterm_a11y::model::TreeUpdate, PublishedNativeAccessibility), String>> {
         let Some(plan) = self.active_visible_leaf_plan(wid) else {
             return Some(Err(
                 "native accessibility window is no longer live".to_string()
@@ -119,7 +119,7 @@ impl App {
         &mut self,
         wid: WindowId,
         plan: &crate::tab_model::VisibleLeafPlan,
-    ) -> Option<Result<(accesskit::TreeUpdate, PublishedNativeAccessibility), String>> {
+    ) -> Option<Result<(aterm_a11y::model::TreeUpdate, PublishedNativeAccessibility), String>> {
         let (owners, focused_native) =
             match self.visible_native_accessibility_owners_from_plan(plan) {
                 Ok((owners, focused_native)) if !owners.is_empty() => (owners, focused_native),
@@ -248,7 +248,7 @@ impl App {
         &self,
         wid: WindowId,
         view: ViewId,
-    ) -> Option<accesskit::Affine> {
+    ) -> Option<aterm_a11y::model::Affine> {
         if let Some(transform) = self.retained_native_accessibility_transform_for_view(wid, view) {
             return Some(transform);
         }
@@ -276,8 +276,8 @@ impl App {
         };
         let scale = window.scale.max(f64::EPSILON);
         Some(
-            accesskit::Affine::translate(accesskit::Vec2::new(x as f64, y as f64))
-                * accesskit::Affine::scale(scale),
+            aterm_a11y::model::Affine::translate(aterm_a11y::model::Vec2::new(x as f64, y as f64))
+                * aterm_a11y::model::Affine::scale(scale),
         )
     }
 
@@ -289,7 +289,7 @@ impl App {
         &self,
         wid: WindowId,
         view: ViewId,
-    ) -> Option<accesskit::Affine> {
+    ) -> Option<aterm_a11y::model::Affine> {
         let window = self.windows.get(&wid)?;
         let card = window.settings_card.as_ref()?;
         let raster = window.leaf_render_cache.get(&view)?.native.as_ref()?;
@@ -307,19 +307,19 @@ impl App {
             .saturating_add(i64::from(raster.presented_y));
         let scale = window.scale.max(f64::EPSILON);
         Some(
-            accesskit::Affine::translate(accesskit::Vec2::new(x as f64, y as f64))
-                * accesskit::Affine::scale(scale),
+            aterm_a11y::model::Affine::translate(aterm_a11y::model::Vec2::new(x as f64, y as f64))
+                * aterm_a11y::model::Affine::scale(scale),
         )
     }
 
     /// Compatibility accessor for single/focused-native tests and host seams.
     #[cfg(test)]
-    fn native_accessibility_transform(&self, wid: WindowId) -> Option<accesskit::Affine> {
+    fn native_accessibility_transform(&self, wid: WindowId) -> Option<aterm_a11y::model::Affine> {
         let (_, view) = self.active_native_view(wid)?;
         self.native_accessibility_transform_for_view(wid, view)
     }
 
-    fn native_accessibility_window_bounds(&self, wid: WindowId) -> Option<accesskit::Rect> {
+    fn native_accessibility_window_bounds(&self, wid: WindowId) -> Option<aterm_a11y::model::Rect> {
         let window = self.windows.get(&wid)?;
         let (cw, ch) = self.win_cell_size(wid);
         let pad = self.win_pad(wid);
@@ -336,7 +336,7 @@ impl App {
             },
             |size| (size.width.max(1) as usize, size.height.max(1) as usize),
         );
-        Some(accesskit::Rect {
+        Some(aterm_a11y::model::Rect {
             x0: 0.0,
             y0: 0.0,
             x1: width.max(1) as f64,
@@ -359,11 +359,11 @@ impl App {
 
     /// Route a platform request only through the exact native view/generation whose tree
     /// was published. Any tab switch, detach, generation change, unknown node, or unsupported
-    /// action is a silent fail-closed no-op as required by AccessKit's action contract.
+    /// action is a silent fail-closed no-op as required by the model's action contract (`ActionHandler::do_action`).
     pub(crate) fn on_native_accessibility_action(
         &mut self,
         wid: WindowId,
-        request: accesskit::ActionRequest,
+        request: aterm_a11y::model::ActionRequest,
     ) {
         let Some(published) = self
             .windows
@@ -438,8 +438,9 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use accesskit::{Action, ActionRequest, TreeId};
-    use aterm_spec::derive::{Model, composite_accessibility_route_model};
+    use aterm_a11y::model::{Action, ActionRequest, TreeId};
+    use aterm_models_native::composite_accessibility_route_model;
+    use aterm_spec::derive::Model;
     use aterm_spec::interp::{State, admits};
 
     use super::*;
@@ -695,7 +696,7 @@ mod tests {
                 .expect("window root")
                 .1
                 .role(),
-            accesskit::Role::Window
+            aterm_a11y::model::Role::Window
         );
         assert_eq!(published.view, view);
         assert_eq!(published.generation, generation);
@@ -826,7 +827,7 @@ mod tests {
             assert_eq!(line.character_positions.len(), line.character_widths.len());
             assert!(update.nodes.iter().any(|(node, access)| {
                 *node == line.node
-                    && access.role() == accesskit::Role::TextRun
+                    && access.role() == aterm_a11y::model::Role::TextRun
                     && access.value() == Some(line.text.as_str())
             }));
         }
@@ -1067,8 +1068,9 @@ mod tests {
                 .expect("retained presented leaf");
             let x = frame_x + card_x + i64::from(raster.presented_x);
             let y = frame_y + card_y + i64::from(raster.presented_y);
-            let expected = accesskit::Affine::translate(accesskit::Vec2::new(x as f64, y as f64))
-                * accesskit::Affine::scale(scale);
+            let expected = aterm_a11y::model::Affine::translate(aterm_a11y::model::Vec2::new(
+                x as f64, y as f64,
+            )) * aterm_a11y::model::Affine::scale(scale);
             assert_eq!(
                 update
                     .nodes
@@ -1078,7 +1080,7 @@ mod tests {
                     .1
                     .transform(),
                 Some(&expected),
-                "AccessKit geometry must equal the retained raster placement at {scale}x"
+                "accessibility geometry must equal the retained raster placement at {scale}x"
             );
             let owner = published.route_owner(root).expect("root route owner");
             assert_eq!(owner.view, view);
@@ -1087,10 +1089,11 @@ mod tests {
                 app.native_runtime.view_generation(view).unwrap()
             );
             if view == second {
-                let omitted_pad = accesskit::Affine::translate(accesskit::Vec2::new(
-                    (frame_x + i64::from(raster.presented_x)) as f64,
-                    y as f64,
-                )) * accesskit::Affine::scale(scale);
+                let omitted_pad =
+                    aterm_a11y::model::Affine::translate(aterm_a11y::model::Vec2::new(
+                        (frame_x + i64::from(raster.presented_x)) as f64,
+                        y as f64,
+                    )) * aterm_a11y::model::Affine::scale(scale);
                 assert_ne!(
                     expected, omitted_pad,
                     "omitting the compositor card's win_pad destination must fail at {scale}x"
@@ -1098,10 +1101,9 @@ mod tests {
                 match axis {
                     crate::tab_model::SplitAxis::Horizontal => {
                         assert!(raster.presented_x > 0);
-                        let omitted_leaf = accesskit::Affine::translate(accesskit::Vec2::new(
-                            (frame_x + card_x) as f64,
-                            y as f64,
-                        )) * accesskit::Affine::scale(scale);
+                        let omitted_leaf = aterm_a11y::model::Affine::translate(
+                            aterm_a11y::model::Vec2::new((frame_x + card_x) as f64, y as f64),
+                        ) * aterm_a11y::model::Affine::scale(scale);
                         assert_ne!(
                             expected, omitted_leaf,
                             "omitting the retained leaf x destination must fail at {scale}x"
@@ -1109,10 +1111,9 @@ mod tests {
                     }
                     crate::tab_model::SplitAxis::Vertical => {
                         assert!(raster.presented_y > 0);
-                        let omitted_leaf = accesskit::Affine::translate(accesskit::Vec2::new(
-                            x as f64,
-                            (frame_y + card_y) as f64,
-                        )) * accesskit::Affine::scale(scale);
+                        let omitted_leaf = aterm_a11y::model::Affine::translate(
+                            aterm_a11y::model::Vec2::new(x as f64, (frame_y + card_y) as f64),
+                        ) * aterm_a11y::model::Affine::scale(scale);
                         assert_ne!(
                             expected, omitted_leaf,
                             "omitting the retained leaf y destination must fail at {scale}x"
@@ -1124,7 +1125,7 @@ mod tests {
         assert_eq!(
             update.focus,
             stable_node_id_for_view(second, &root_keys[1]),
-            "the focused native sibling owns AccessKit focus"
+            "the focused native sibling owns accessibility focus"
         );
 
         if scale == 1.0 {
@@ -1359,10 +1360,10 @@ mod tests {
         let transform = app
             .native_accessibility_transform(wid)
             .expect("partially visible retained scene remains publishable");
-        let expected = accesskit::Affine::translate(accesskit::Vec2::new(
+        let expected = aterm_a11y::model::Affine::translate(aterm_a11y::model::Vec2::new(
             artifact.device_x as f64,
             artifact.device_y as f64,
-        )) * accesskit::Affine::scale(artifact.scale);
+        )) * aterm_a11y::model::Affine::scale(artifact.scale);
         assert_eq!(transform, expected);
     }
 

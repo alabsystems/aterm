@@ -12,7 +12,7 @@ use crate::model::{
     Amount, Decision, Hold, Intent, Message, MessageId, Meter, Severity, Unit, WallStamp, tags,
 };
 use crate::text::char_width;
-use crate::{Duration, HOLD_ASK, Instant, STALE_STRAIN, STALE_UPDATE, STRAIN_KEY};
+use crate::{Duration, HOLD_ASK, Instant, STALE_UPDATE};
 
 fn stamp() -> WallStamp {
     WallStamp { unix_ms: 1 }
@@ -46,7 +46,7 @@ fn download(title: &str, done: u64) -> Message {
 }
 
 /// The five-kinds composition (the GUI's `95-five-kinds-overflow` shot): a misspelled
-/// setting, the download at 45 %, the strain gauge, a retrospective Error and a standing
+/// setting, the download at 45 %, a fleet notice, a retrospective Error and a standing
 /// Error. Returns the center and the download's id.
 fn five_kinds(now: Instant) -> (MessageCenter, MessageId) {
     let mut c = MessageCenter::new(MessageLog::empty(), now - ms(5000));
@@ -65,12 +65,7 @@ fn five_kinds(now: Instant) -> (MessageCenter, MessageId) {
         )
         .id;
     c.post(
-        Message::new(tags::SYSTEM, Severity::Info, "Typing slowed by yes")
-            .key(STRAIN_KEY)
-            .hold(Hold::Live {
-                stale_after: STALE_STRAIN,
-            })
-            .meter(Meter::level(740, "6 of 8 cores")),
+        Message::new(tags::FABRIC, Severity::Info, "Fleet link restored"),
         stamp(),
         near,
     );
@@ -286,8 +281,8 @@ fn an_ask_keeps_its_row_over_the_reserved_progress() {
     assert_eq!(p.rows[2].title.1, "2 more \u{203a}");
 }
 
-/// A count the row shows sets its fill whatever the reporter sent, a level keeps its
-/// gauge, a busy row stays a comet, and a size beside the percent names its total.
+/// A count the row shows sets its fill whatever the reporter sent, a busy row stays a
+/// comet, and a size beside the percent names its total.
 #[test]
 fn a_rows_count_and_percent_agree_and_a_size_has_its_referent() {
     let counted = |fill: Option<u16>, stats: &str| {
@@ -335,14 +330,10 @@ fn a_rows_count_and_percent_agree_and_a_size_has_its_referent() {
         Some(420),
         "past its total"
     );
-    // A busy row stays a comet; a level keeps its gauge.
+    // A busy row stays a comet.
     let busy = Meter::busy("3 of 4 tabs").normalized();
     assert_eq!(busy.fill_permille, None);
     assert!(busy.busy);
-    assert_eq!(
-        Meter::level(740, "6 of 8 cores").normalized().fill_permille,
-        Some(740)
-    );
     // The painted percent is the count's.
     let now = Instant::now();
     let mut c = MessageCenter::new(MessageLog::empty(), now);

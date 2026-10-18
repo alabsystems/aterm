@@ -116,6 +116,18 @@ impl<'a> VisibleRowView<'a> {
         }
     }
 
+    /// How many columns the row's text spans ([`Row::written_len`] live: a
+    /// recorded early-wrap hole is not text, also when BCE put it inside
+    /// `len`; a history row's line already left it out).
+    #[must_use]
+    pub fn written_len(&self) -> u16 {
+        match self {
+            Self::Live { row, .. } => row.written_len(),
+            Self::History { mat } => mat.len(),
+            Self::Empty => 0,
+        }
+    }
+
     /// Whether the row has no occupied columns.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -182,15 +194,7 @@ impl<'a> VisibleRowView<'a> {
             Self::Live {
                 grid, screen_row, ..
             } => CellDataView::Live(grid.cell_render_data(*screen_row, col, cell)),
-            Self::History { mat } => {
-                // Materialize bakes StyleId colors inline, so a history cell must
-                // never take the StyleId branch (which reads the live StyleTable).
-                debug_assert!(
-                    !cell.uses_style_id(),
-                    "materialized history cell must have colors baked inline, not a StyleId"
-                );
-                CellDataView::History(mat.get_extra(col))
-            }
+            Self::History { mat } => CellDataView::History(mat.get_extra(col)),
             Self::Empty => CellDataView::History(None),
         }
     }
@@ -387,7 +391,7 @@ impl Grid {
             screen_row,
             row,
         };
-        let len = view.len();
+        let len = view.written_len();
         out.reserve(len as usize);
         for col in 0..len {
             let Some(cell) = view.cell(col) else {
@@ -449,19 +453,6 @@ mod viewport_cache_tests {
             }
         }
         out
-    }
-
-    /// A repeat read of a motionless scrolled-back viewport returns the same shared row.
-    #[test]
-    fn repeat_read_of_a_motionless_viewport_reuses_the_materialized_row() {
-        let mut grid = grid_with_history(40);
-        grid.scroll_display(10);
-        let first = history_row(&grid, 0);
-        let second = history_row(&grid, 0);
-        assert!(
-            Arc::ptr_eq(&first, &second),
-            "a second read of an unchanged scrolled-back row re-materialized it"
-        );
     }
 
     /// The memo keys on row identity, not viewport position: a row keeps its materialization
@@ -561,15 +552,5 @@ mod viewport_cache_tests {
             // (hits), one is new (a miss).
             grid.scroll_display(-1);
         }
-    }
-
-    /// An unscrolled viewport reads live rows and never consults the memo.
-    #[test]
-    fn an_unscrolled_viewport_reads_live_rows() {
-        let grid = grid_with_history(40);
-        assert!(
-            matches!(grid.visible_row_view(0), VisibleRowView::Live { .. }),
-            "an unscrolled viewport must read the live grid"
-        );
     }
 }

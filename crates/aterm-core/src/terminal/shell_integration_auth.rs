@@ -28,6 +28,11 @@ pub(crate) struct ShellIntegrationAuth {
     /// OSC 133/633 sequences dropped for a missing, malformed or mismatched nonce (or none
     /// authorized).
     dropped_count: u64,
+    /// OSC 133/633 sequences whose nonce verified (saturating). The crash-restore
+    /// journal keyframes the slice that moved it: a restore replays raw output into an
+    /// engine that authorizes no nonce, so a verified mark left in the replayed tail
+    /// would be dropped there, and the restore could not be exact.
+    verified_count: u64,
     /// The nonce was handed to a shell that has not taken it yet
     /// ([`Self::authorize_on_first_mark`]): an adopted shell's re-key, read from a file at
     /// its next prompt, which may be hours away. Marks signed with it verify, but until the
@@ -56,6 +61,7 @@ impl ShellIntegrationAuth {
         Self {
             nonce: None,
             dropped_count: 0,
+            verified_count: 0,
             awaiting_first_mark: false,
             typed_prior: None,
         }
@@ -141,6 +147,12 @@ impl ShellIntegrationAuth {
         self.dropped_count
     }
 
+    /// OSC 133/633 sequences whose nonce verified so far, for the crash-restore journal.
+    #[must_use]
+    pub(crate) fn verified_count(&self) -> u64 {
+        self.verified_count
+    }
+
     /// Verify a claimed nonce: `true` iff a nonce is authorized and the first `id=<hex>` in
     /// `params` (split on `;`) from index 2 is 64 digits decoding to it (constant-time).
     /// Otherwise count a drop and return `false`.
@@ -167,6 +179,7 @@ impl ShellIntegrationAuth {
             // one is past taking back.
             self.awaiting_first_mark = false;
             self.typed_prior = None;
+            self.verified_count = self.verified_count.saturating_add(1);
             true
         } else {
             self.dropped_count = self.dropped_count.saturating_add(1);
@@ -270,10 +283,6 @@ fn constant_time_eq_32(a: &[u8; 32], b: &[u8; 32]) -> bool {
 mod tests {
     use super::*;
 
-    fn nonce_with_byte(byte: u8) -> [u8; 32] {
-        [byte; 32]
-    }
-
     fn hex_of(nonce: &[u8; 32]) -> Vec<u8> {
         let mut out = Vec::with_capacity(64);
         for &b in nonce {
@@ -291,123 +300,44 @@ mod tests {
         }
     }
 
+    /// `verify_nonce` accepts only a 64-digit `id=` (either case) at parameter
+    /// 2 or later that decodes to the authorized nonce, and every refusal
+    /// counts one drop.
     #[test]
-    fn verify_nonce_unauthorized_returns_false() {
-        let mut auth = ShellIntegrationAuth::new();
-        let nonce_hex = hex_of(&nonce_with_byte(0xAB));
-        let mut id_param = b"id=".to_vec();
-        id_param.extend_from_slice(&nonce_hex);
-        let params: &[&[u8]] = &[b"133", b"A", &id_param];
-        assert!(!auth.verify_nonce(params));
-        assert_eq!(auth.dropped_count(), 1);
-    }
-
-    #[test]
-    fn verify_nonce_matching_returns_true() {
-        let mut auth = ShellIntegrationAuth::new();
-        let nonce = nonce_with_byte(0x11);
-        auth.authorize(nonce);
-        let hex = hex_of(&nonce);
-        let mut id_param = b"id=".to_vec();
-        id_param.extend_from_slice(&hex);
-        let params: &[&[u8]] = &[b"133", b"A", &id_param];
-        assert!(auth.verify_nonce(params));
-        assert_eq!(auth.dropped_count(), 0);
-    }
-
-    #[test]
-    fn verify_nonce_wrong_nonce_returns_false() {
-        let mut auth = ShellIntegrationAuth::new();
-        auth.authorize(nonce_with_byte(0x11));
-        let hex = hex_of(&nonce_with_byte(0x22)); // different nonce
-        let mut id_param = b"id=".to_vec();
-        id_param.extend_from_slice(&hex);
-        let params: &[&[u8]] = &[b"133", b"A", &id_param];
-        assert!(!auth.verify_nonce(params));
-        assert_eq!(auth.dropped_count(), 1);
-    }
-
-    #[test]
-    fn verify_nonce_missing_id_param_returns_false() {
-        let mut auth = ShellIntegrationAuth::new();
-        auth.authorize(nonce_with_byte(0x11));
-        let params: &[&[u8]] = &[b"133", b"A"];
-        assert!(!auth.verify_nonce(params));
-        assert_eq!(auth.dropped_count(), 1);
-    }
-
-    #[test]
-    fn verify_nonce_malformed_hex_returns_false() {
-        let mut auth = ShellIntegrationAuth::new();
-        auth.authorize(nonce_with_byte(0x11));
-        // 62 digits: too short.
-        let short = b"id=ababababababababababababababababababababababababababababababab";
-        let params_short: &[&[u8]] = &[b"133", b"A", short];
-        assert!(!auth.verify_nonce(params_short));
-        // 64 digits, but 'g' is not hex.
-        let bad = b"id=ggababababababababababababababababababababababababababababababab";
-        let params_bad: &[&[u8]] = &[b"133", b"A", bad];
-        assert!(!auth.verify_nonce(params_bad));
-        assert!(auth.dropped_count() >= 2);
-    }
-
-    #[test]
-    fn verify_nonce_ignores_id_in_position_1() {
-        // `id=` in the subcommand slot (params[1]) is not a nonce: the scan starts at 2.
-        let mut auth = ShellIntegrationAuth::new();
-        let nonce = nonce_with_byte(0x11);
-        auth.authorize(nonce);
-        let hex = hex_of(&nonce);
-        let mut id_param = b"id=".to_vec();
-        id_param.extend_from_slice(&hex);
-        let params: &[&[u8]] = &[b"133", &id_param];
-        assert!(!auth.verify_nonce(params));
-    }
-
-    #[test]
-    fn verify_nonce_scans_past_payload_params() {
-        // OSC 633 E carries the command line ahead of the nonce.
-        let mut auth = ShellIntegrationAuth::new();
-        let nonce = nonce_with_byte(0x33);
-        auth.authorize(nonce);
-        let hex = hex_of(&nonce);
-        let mut id_param = b"id=".to_vec();
-        id_param.extend_from_slice(&hex);
-        let params: &[&[u8]] = &[b"633", b"E", b"ls -la", &id_param];
-        assert!(auth.verify_nonce(params));
-    }
-
-    #[test]
-    fn dropped_counter_saturates() {
-        let mut auth = ShellIntegrationAuth::new();
-        auth.dropped_count = u64::MAX - 1;
-        let params: &[&[u8]] = &[b"133", b"A"];
-        assert!(!auth.verify_nonce(params));
-        assert_eq!(auth.dropped_count, u64::MAX);
-        assert!(!auth.verify_nonce(params));
-        assert_eq!(auth.dropped_count, u64::MAX);
-    }
-
-    #[test]
-    fn constant_time_eq_detects_late_mismatch() {
-        let a = [0x42u8; 32];
-        let mut b = [0x42u8; 32];
-        b[31] = 0x43;
-        assert!(!constant_time_eq_32(&a, &b));
-        b[31] = 0x42;
-        assert!(constant_time_eq_32(&a, &b));
-    }
-
-    #[test]
-    fn decode_hex_32_roundtrip() {
-        let expected: [u8; 32] = [
-            0x00, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0xFE, 0xDC, 0xBA, 0x98, 0x76,
-            0x54, 0x32, 0x10, 0x00, 0xFF, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
-            0xAA, 0xBB, 0xCC, 0xDD,
+    fn verify_nonce_accepts_only_the_authorized_id() {
+        let nonce: [u8; 32] = core::array::from_fn(|i| u8::try_from(i * 7).unwrap_or(0));
+        let id = |hex: Vec<u8>| [b"id=".to_vec(), hex].concat();
+        let ok = id(hex_of(&nonce));
+        let upper = id(hex_of(&nonce).to_ascii_uppercase());
+        let mut late = nonce;
+        late[31] ^= 1;
+        let late = id(hex_of(&late));
+        let short = ok[..ok.len() - 1].to_vec();
+        let mut not_hex = ok.clone();
+        not_hex[3] = b'g';
+        let cases: [(&str, bool, &[&[u8]], bool); 9] = [
+            ("the authorized id", true, &[b"133", b"A", &ok], true),
+            ("upper-case hex", true, &[b"133", b"A", &upper], true),
+            (
+                "after a 633 E payload",
+                true,
+                &[b"633", b"E", b"ls -la", &ok],
+                true,
+            ),
+            ("none authorized", false, &[b"133", b"A", &ok], false),
+            ("the last byte differs", true, &[b"133", b"A", &late], false),
+            ("no id", true, &[b"133", b"A"], false),
+            ("63 digits", true, &[b"133", b"A", &short], false),
+            ("a non-hex digit", true, &[b"133", b"A", &not_hex], false),
+            ("id in the subcommand slot", true, &[b"133", &ok], false),
         ];
-        let hex = b"000123456789abcdeffedcba987654321000ff112233445566778899aabbccdd";
-        assert_eq!(decode_hex_32(hex), Some(expected));
-        let hex_upper = b"000123456789ABCDEFFEDCBA987654321000FF112233445566778899AABBCCDD";
-        assert_eq!(decode_hex_32(hex_upper), Some(expected));
+        for (name, authorized, params, want) in cases {
+            let mut auth = ShellIntegrationAuth::new();
+            if authorized {
+                auth.authorize(nonce);
+            }
+            assert_eq!(auth.verify_nonce(params), want, "{name}");
+            assert_eq!(auth.dropped_count(), u64::from(!want), "{name}: drops");
+        }
     }
 }

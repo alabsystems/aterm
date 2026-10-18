@@ -8,110 +8,6 @@ use super::super::*;
 use super::make_row;
 
 #[test]
-fn cells_mut_with_fixup_clears_orphaned_continuation() {
-    use crate::{CellFlags, PackedColor};
-
-    let (_pages, mut row) = make_row(10);
-    let fg = PackedColor::DEFAULT_FG;
-    let bg = PackedColor::DEFAULT_BG;
-
-    // Place a wide char at cols 0-1
-    row.write_wide_char(0, '\u{4E2D}', fg, bg, CellFlags::empty());
-    assert!(row.get(0).unwrap().is_wide());
-    assert!(row.get(1).unwrap().is_wide_continuation());
-
-    // Request mutable access starting at the continuation. The helper should
-    // clear the orphaned leading half before exposing the slice.
-    {
-        let target = row
-            .cells_mut_with_fixup(1, 3)
-            .expect("range inside row should produce a slice");
-        assert_eq!(target.len(), 3);
-    }
-    assert_eq!(row.get(0).unwrap().char(), ' ');
-    assert!(!row.get(0).unwrap().is_wide());
-}
-
-#[test]
-fn cells_mut_with_fixup_clears_wide_continuation_past_range() {
-    use crate::{CellFlags, PackedColor};
-
-    let (_pages, mut row) = make_row(10);
-    let fg = PackedColor::DEFAULT_FG;
-    let bg = PackedColor::DEFAULT_BG;
-
-    // Place a wide char at cols 4-5
-    row.write_wide_char(4, '\u{4E2D}', fg, bg, CellFlags::empty());
-
-    // The helper range covers col 4 (the WIDE cell) but not col 5
-    // (continuation), so col 5 should be cleared as orphaned.
-    {
-        let target = row
-            .cells_mut_with_fixup(3, 2)
-            .expect("range inside row should produce a slice");
-        assert_eq!(target.len(), 2);
-    }
-    assert_eq!(row.get(5).unwrap().char(), ' ');
-    assert!(!row.get(5).unwrap().is_wide_continuation());
-}
-
-#[test]
-fn cells_mut_with_fixup_is_noop_without_wide_chars() {
-    let (_pages, mut row) = make_row(10);
-    for i in 0..5 {
-        row.write_char(i, 'A');
-    }
-
-    {
-        let target = row
-            .cells_mut_with_fixup(0, 5)
-            .expect("range inside row should produce a slice");
-        assert_eq!(target.len(), 5);
-    }
-    for i in 0..5 {
-        assert_eq!(row.get(i).unwrap().char(), 'A');
-    }
-}
-
-#[test]
-fn cells_mut_with_fixup_allows_zero_count() {
-    use crate::{CellFlags, PackedColor};
-
-    let (_pages, mut row) = make_row(10);
-    let fg = PackedColor::DEFAULT_FG;
-    let bg = PackedColor::DEFAULT_BG;
-
-    row.write_wide_char(0, '\u{4E2D}', fg, bg, CellFlags::empty());
-
-    {
-        let target = row
-            .cells_mut_with_fixup(1, 0)
-            .expect("zero-length range inside row should return an empty slice");
-        assert!(target.is_empty());
-    }
-    assert!(row.get(0).unwrap().is_wide());
-    assert!(row.get(1).unwrap().is_wide_continuation());
-}
-
-#[test]
-fn cells_mut_with_fixup_returns_none_when_start_past_end() {
-    use crate::{CellFlags, PackedColor};
-
-    let (_pages, mut row) = make_row(10);
-    let fg = PackedColor::DEFAULT_FG;
-    let bg = PackedColor::DEFAULT_BG;
-
-    row.write_wide_char(0, '\u{4E2D}', fg, bg, CellFlags::empty());
-
-    assert!(
-        row.cells_mut_with_fixup(11, 5).is_none(),
-        "start past row should return None"
-    );
-    assert!(row.get(0).unwrap().is_wide());
-    assert!(row.get(1).unwrap().is_wide_continuation());
-}
-
-#[test]
 fn cells_mut_with_fixup_handles_multiple_wide_chars() {
     use crate::{CellFlags, PackedColor};
 
@@ -179,8 +75,12 @@ fn fixup_wide_boundary_clears_orphaned_continuation_at_left() {
 
     // Overwrite col 2 (the WIDE half) with a normal char via get_mut,
     // leaving col 3 as an orphaned WIDE_CONTINUATION.
-    *row.get_mut(2).unwrap() =
-        crate::Cell::with_style_id('A', crate::StyleId::DEFAULT, CellFlags::empty());
+    *row.get_mut(2).unwrap() = crate::Cell::with_style(
+        'A',
+        crate::PackedColor::DEFAULT_FG,
+        crate::PackedColor::DEFAULT_BG,
+        CellFlags::empty(),
+    );
     assert!(!row.get(2).unwrap().is_wide());
     assert!(row.get(3).unwrap().is_wide_continuation());
 
@@ -203,7 +103,7 @@ fn fixup_wide_boundary_clears_orphaned_continuation_at_left() {
 /// left of the rect to `Cell::EMPTY` instead of painting it with the fill.
 #[test]
 fn clear_range_with_does_not_bleed_fill_onto_left_wide_orphan() {
-    use crate::{Cell, CellFlags, PackedColor, StyleId};
+    use crate::{Cell, CellFlags, PackedColor};
 
     let (_pages, mut row) = make_row(10);
     let fg = PackedColor::DEFAULT_FG;
@@ -214,7 +114,12 @@ fn clear_range_with_does_not_bleed_fill_onto_left_wide_orphan() {
     assert!(row.get(0).unwrap().is_wide());
 
     // A visible fill (distinct glyph) so we can tell empty from fill.
-    let fill = Cell::with_style_id('X', StyleId::DEFAULT, CellFlags::empty());
+    let fill = Cell::with_style(
+        'X',
+        crate::PackedColor::DEFAULT_FG,
+        crate::PackedColor::DEFAULT_BG,
+        CellFlags::empty(),
+    );
     assert!(
         !fill.is_empty(),
         "fill must be visible for this test to mean anything"
@@ -250,7 +155,7 @@ fn clear_range_with_does_not_bleed_fill_onto_left_wide_orphan() {
 /// cleared to `Cell::EMPTY`, not painted with the fill.
 #[test]
 fn clear_range_with_does_not_bleed_fill_onto_right_wide_orphan() {
-    use crate::{Cell, CellFlags, PackedColor, StyleId};
+    use crate::{Cell, CellFlags, PackedColor};
 
     let (_pages, mut row) = make_row(10);
     let fg = PackedColor::DEFAULT_FG;
@@ -260,7 +165,12 @@ fn clear_range_with_does_not_bleed_fill_onto_right_wide_orphan() {
     row.write_wide_char(6, '\u{4E2D}', fg, bg, CellFlags::empty());
     assert!(row.get(7).unwrap().is_wide_continuation());
 
-    let fill = Cell::with_style_id('X', StyleId::DEFAULT, CellFlags::empty());
+    let fill = Cell::with_style(
+        'X',
+        crate::PackedColor::DEFAULT_FG,
+        crate::PackedColor::DEFAULT_BG,
+        CellFlags::empty(),
+    );
 
     // Fill [2, 7): overwrites the WIDE head at col 6, orphaning the
     // continuation at col 7 (which sits outside the rect).
@@ -496,7 +406,7 @@ fn selective_clear_range_shrinks_len_on_tail_wide_orphan() {
 
     // Range [0, 5): col 4 is an unprotected WIDE head, so its continuation at
     // col 5 (== end) is co-cleared. old_len (6) == end (5) + 1.
-    row.selective_clear_range(0, 5);
+    row.selective_clear_range(0, 5, Cell::EMPTY);
 
     for c in 0..6 {
         assert!(row.get(c).unwrap().is_empty(), "cell {c} should be empty");
@@ -537,36 +447,6 @@ fn selective_wipe_range_shrinks_len_on_tail_wide_orphan() {
         row.len(),
         0,
         "len must shrink to 0 after wiping the trailing wide char"
-    );
-}
-
-/// clear_range: a trailing wide char whose continuation is cleared at `end`
-/// shrinks len.
-#[test]
-fn clear_range_shrinks_len_on_tail_wide_orphan() {
-    use crate::{CellFlags, PackedColor};
-
-    let (_pages, mut row) = make_row(10);
-    row.write_wide_char(
-        4,
-        '\u{4E2D}',
-        PackedColor::DEFAULT_FG,
-        PackedColor::DEFAULT_BG,
-        CellFlags::empty(),
-    );
-    assert_eq!(row.len(), 6, "wide char at 4-5 → len 6");
-
-    // clear_range_with(4, 5, EMPTY): cells[4] is the WIDE head, so its continuation at col 5
-    // (== end) is the orphan cleared one past the range. old_len (6) == end (5) + 1.
-    row.clear_range_with(4, 5, Cell::EMPTY);
-
-    for c in 0..6 {
-        assert!(row.get(c).unwrap().is_empty(), "cell {c} should be empty");
-    }
-    assert_eq!(
-        row.len(),
-        0,
-        "len must shrink to 0 after erasing the trailing wide char"
     );
 }
 

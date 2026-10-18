@@ -1023,7 +1023,7 @@ fn chrome_policy_from_code(code: u8) -> WindowTheme {
 /// as it did before this resolution existed).
 ///
 /// The darkness predicate is [`crate::tab_bar::theme_is_dark`] — deliberately the SAME
-/// Rec. 601 luma classifier that already drives the native toolbar strip's appearance
+/// one dark/light rule (the WCAG pole) that already drives the native toolbar strip's appearance
 /// (`toolbar::set_strip_dark`). Reusing it, instead of adding a second luminance
 /// function here, is what guarantees the caption and the tab strip directly beneath it
 /// can never disagree about whether the window is a dark one.
@@ -1096,8 +1096,8 @@ const CAPTION_TEXT_UNFOCUSED_DIM: f32 = 0.45;
 /// included) when any gate defers. Pure, so the whole gate ladder is testable
 /// without a window.
 ///
-/// The ink is white-on-dark / black-on-light by the SAME Rec. 601 classifier
-/// ([`crate::tab_bar::theme_is_dark`]) that resolves the immersive-dark caption,
+/// The ink is white-on-dark / black-on-light by the SAME one dark/light rule
+/// ([`crate::tab_bar::theme_is_dark`], the WCAG pole) that resolves the immersive-dark caption,
 /// so the tint and the dark-mode caption buttons can never disagree about which
 /// side of the split the window is on. Unfocused, the ink blends toward the
 /// caption fill by [`CAPTION_TEXT_UNFOCUSED_DIM`] via the shared
@@ -2276,7 +2276,7 @@ impl AppRt for AppRtWindows {
     /// shipped. Buttons mirror the macOS `NSAlert`: proceed is the Return
     /// default, Escape cancels. `None` (no v6 comctl32 in this process — a test
     /// binary or resource-less dev build — or a failed dialog) falls back to the
-    /// caller's titlebar-warning confirm, exactly as before.
+    /// caller's in-window confirm banner, exactly as before.
     ///
     /// Note the POLICY is not this method's: `quit_safety::confirm_prompt_windows`
     /// decides Windows prompts per the WT convention (multiple tabs or busy —

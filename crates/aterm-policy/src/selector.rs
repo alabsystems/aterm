@@ -558,99 +558,45 @@ fn non_empty_string(s: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Every selector spelling of the grammar, aliases included, and the
+    /// selector it parses to; then the spellings that are refused.
     #[test]
-    fn parses_catch_all() {
-        let sel = SequenceSelector::parse("*").expect("parses");
-        assert_eq!(sel, SequenceSelector::catch_all());
-    }
-
-    #[test]
-    fn parses_response_any_as_catch_all() {
-        let sel = SequenceSelector::parse("response any").expect("parses");
-        assert_eq!(sel.function, FunctionKind::Wildcard);
-        assert!(sel.matches(&DispatchedSequence::osc(0, ["anything".to_owned()])));
-    }
-
-    #[test]
-    fn parses_plain_osc() {
-        let sel = SequenceSelector::parse("OSC 4").expect("parses");
-        assert_eq!(sel.function, FunctionKind::Osc);
-        assert_eq!(sel.major, Some(4));
-        assert!(sel.params.is_empty());
-    }
-
-    #[test]
-    fn parses_osc_with_query_suffix() {
-        let sel = SequenceSelector::parse("OSC 4;*;?").expect("parses");
-        assert_eq!(sel.major, Some(4));
-        assert_eq!(sel.params.len(), 2);
-        assert!(matches!(sel.params[0], SelectorParam::Wildcard));
-        assert!(matches!(sel.params[1], SelectorParam::Query));
-    }
-
-    #[test]
-    fn parses_osc_with_notquery_suffix() {
-        let sel = SequenceSelector::parse("OSC 4;*;<not-question>").expect("parses");
-        assert_eq!(sel.params.len(), 2);
-        assert!(matches!(sel.params[1], SelectorParam::NotQuery));
-    }
-
-    #[test]
-    fn parses_osc_52_set_alias() {
-        let sel = SequenceSelector::parse("OSC 52 set").expect("parses");
-        assert_eq!(sel.function, FunctionKind::Osc);
-        assert_eq!(sel.major, Some(52));
-        assert_eq!(sel.params.len(), 2);
-        assert!(matches!(sel.params[1], SelectorParam::NotQuery));
-    }
-
-    #[test]
-    fn parses_osc_52_query_alias() {
-        let sel = SequenceSelector::parse("OSC 52 query").expect("parses");
-        assert_eq!(sel.major, Some(52));
-        assert!(matches!(sel.params[1], SelectorParam::Query));
-    }
-
-    #[test]
-    fn parses_csi_specific_param() {
-        let sel = SequenceSelector::parse("CSI 20 t").expect("parses");
-        assert_eq!(sel.function, FunctionKind::Csi);
-        assert_eq!(sel.major, Some(20));
-        assert_eq!(sel.suffix.as_deref(), Some("t"));
-    }
-
-    #[test]
-    fn parses_csi_final_only() {
-        let sel = SequenceSelector::parse("CSI t").expect("parses");
-        assert_eq!(sel.major, None);
-        assert_eq!(sel.suffix.as_deref(), Some("t"));
-    }
-
-    #[test]
-    fn parses_dcs_intermediate_final() {
-        let sel = SequenceSelector::parse("DCS 2000p").expect("parses");
-        assert_eq!(sel.function, FunctionKind::Dcs);
-        assert_eq!(sel.suffix.as_deref(), Some("2000p"));
-    }
-
-    #[test]
-    fn parses_dcs_separated_intermediate_final() {
-        let sel = SequenceSelector::parse("DCS 2000 p").expect("parses");
-        assert_eq!(sel.suffix.as_deref(), Some("2000p"));
-    }
-
-    #[test]
-    fn rejects_unknown_function() {
-        let err = SequenceSelector::parse("XYZ 1").unwrap_err();
-        assert!(matches!(err, SelectorParseError::UnknownFunction(_)));
-    }
-
-    #[test]
-    fn rejects_empty() {
-        assert_eq!(
-            SequenceSelector::parse("").unwrap_err(),
-            SelectorParseError::Empty
-        );
+    fn selector_spellings_parse() {
+        use FunctionKind::{Csi, Dcs, Osc};
+        use SelectorParam::{NotQuery, Query, Wildcard};
+        let sel =
+            |function, major, suffix: Option<&str>, params: &[SelectorParam]| SequenceSelector {
+                function,
+                major,
+                suffix: suffix.map(str::to_owned),
+                params: params.to_vec(),
+            };
+        for (spelling, want) in [
+            ("*", SequenceSelector::catch_all()),
+            ("response any", SequenceSelector::catch_all()),
+            ("OSC 4", sel(Osc, Some(4), None, &[])),
+            ("OSC 4;*;?", sel(Osc, Some(4), None, &[Wildcard, Query])),
+            (
+                "OSC 4;*;<not-question>",
+                sel(Osc, Some(4), None, &[Wildcard, NotQuery]),
+            ),
+            (
+                "OSC 52 set",
+                sel(Osc, Some(52), None, &[Wildcard, NotQuery]),
+            ),
+            ("OSC 52 query", sel(Osc, Some(52), None, &[Wildcard, Query])),
+            ("CSI 20 t", sel(Csi, Some(20), Some("t"), &[])),
+            ("CSI t", sel(Csi, None, Some("t"), &[])),
+            ("DCS 2000p", sel(Dcs, None, Some("2000p"), &[])),
+            ("DCS 2000 p", sel(Dcs, None, Some("2000p"), &[])),
+        ] {
+            assert_eq!(SequenceSelector::parse(spelling), Ok(want), "{spelling:?}");
+        }
+        assert!(matches!(
+            SequenceSelector::parse("XYZ 1"),
+            Err(SelectorParseError::UnknownFunction(_))
+        ));
+        assert_eq!(SequenceSelector::parse(""), Err(SelectorParseError::Empty));
     }
 
     /// `(selector, sequence, matches?)` — each selector against the
@@ -695,33 +641,6 @@ mod tests {
                 "{selector} vs {sequence:?}"
             );
         }
-    }
-
-    #[test]
-    fn bucket_key_reflects_function_and_major() {
-        let sel = SequenceSelector::parse("OSC 4").expect("parses");
-        assert_eq!(
-            sel.bucket_key(),
-            BucketKey {
-                function: FunctionKind::Osc,
-                major: Some(4),
-            }
-        );
-        let wild = SequenceSelector::catch_all();
-        assert_eq!(
-            wild.bucket_key(),
-            BucketKey {
-                function: FunctionKind::Wildcard,
-                major: None,
-            }
-        );
-    }
-
-    #[test]
-    fn wildcard_param_rejects_empty_string() {
-        // Guards against matching a zero-length OSC param token, which
-        // today's parser never produces but a future caller might.
-        assert!(!SelectorParam::Wildcard.matches(""));
     }
 
     #[test]

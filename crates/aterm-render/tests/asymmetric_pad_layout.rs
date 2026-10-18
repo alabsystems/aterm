@@ -5,8 +5,8 @@
 //! driven against the shipping `Renderer` layout and CPU cache.
 
 use aterm_core::terminal::Terminal;
+use aterm_models_render::asymmetric_pad_layout_model;
 use aterm_render::{DamageOutcome, Renderer, Theme, WindowCpu, project_asymmetric_pad_layout};
-use aterm_spec::derive::asymmetric_pad_layout_model;
 
 const FONT: &[u8] = include_bytes!("../assets/DejaVuSansMono.ttf");
 

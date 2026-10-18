@@ -1,0 +1,5726 @@
+# The AT-SPI semantics oracle (docs/AUDIT-third-party-2026-10-15.md, unit a11y,
+# A11Y.5): registry accesskit_atspi_common 0.19.0 over accesskit_consumer 0.37.0
+# and accesskit 0.24.1, recorded once by tests/recorder from the corpus of
+# tests/oracle/corpus.rs through tests/oracle/transcript.rs (main @ c1b839fd73).
+# Per step: the events as text (sorted: the registry crates emit them in hash
+# order), then the tree, text and actions blocks as FNV-1a digest and line count.
+# aterm-a11y's semantics replay it in src/atspi/oracle.rs. Never edit by hand.
+scenario fixture terminal
+step 0 open w0
+  w0 object n1 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x21
+  w0 register n1 0x40021
+  w0 register n1099511627776 0x23
+  w0 register n1099511627777 0x23
+  w0 register n2 0x4021
+  tree acfac1e1e865eb6a 174
+  text 7e1536d15be0e644 463
+  actions db23c958b4191832 133
+step 1 bounds w0
+  tree ed57fd363b99c883 189
+  text 5bc235d6624b78be 463
+  actions 68a83522586ca1b3 133
+step 2 update w0 (2 nodes)
+  w0 object n1 caret 46
+  w0 object n1 text-inserted 45 1 "c"
+  w0 register n1 0x0
+  w0 unregister n1 0x0
+  tree ed57fd363b99c883 189
+  text 1081f947b10580e0 472
+  actions 663be3bcdf927cc2 133
+step 3 update w0 (2 nodes)
+  w0 object n1 caret 47
+  w0 object n1 text-inserted 46 1 "a"
+  w0 register n1 0x0
+  w0 unregister n1 0x0
+  tree ed57fd363b99c883 189
+  text 7a881dac3962c76c 481
+  actions b95bcc9c3bd280b8 133
+step 4 update w0 (2 nodes)
+  w0 object n1 caret 48
+  w0 object n1 text-inserted 47 1 "t"
+  w0 register n1 0x0
+  w0 unregister n1 0x0
+  tree ed57fd363b99c883 189
+  text 90627db32aacb661 490
+  actions 44aa963178b1914f 133
+step 5 update w0 (1 nodes)
+  w0 object n1 caret 36
+  w0 object n1 text-selection-changed
+  w0 register n1 0x0
+  w0 unregister n1 0x0
+  tree ed57fd363b99c883 189
+  text 026e14efa100e615 490
+  actions 7c592c063a1a3fc3 133
+step 6 update w0 (1 nodes)
+  w0 object n1 caret 48
+  w0 object n1 text-selection-changed
+  w0 register n1 0x0
+  w0 unregister n1 0x0
+  tree ed57fd363b99c883 189
+  text 90627db32aacb661 490
+  actions 44aa963178b1914f 133
+step 7 update w0 (5 nodes)
+  w0 object n1 bounds (12,36 320x64)
+  w0 object n1 caret 65
+  w0 object n1 text-inserted 0 65 "notes  todo.txt\nuser@host:~$ cat todo.txt\n- ship it\nuser@host:~$ "
+  w0 object n1 text-removed 0 48 "user@host:~$ ls\nnotes  todo.txt\nuser@host:~$ cat"
+  w0 register n1 0x0
+  w0 unregister n1 0x0
+  tree 2c20d37f0efb546b 189
+  text 5f2014ae12911215 643
+  actions 5b4d27b030b3a240 133
+step 8 update w0 (1 nodes)
+  w0 register n1 0x0
+  w0 unregister n1 0x0
+  tree 2c20d37f0efb546b 189
+  text 0d83fb99463fc5bc 643
+  actions ee03f8e2bb2ef7aa 133
+step 9 update w0 (9 nodes)
+  w0 object n1 caret 65
+  w0 object n1099511627776 state selected false
+  w0 object n1099511627777 state selected true
+  w0 object n2 selection-changed
+  w0 register n1 0x0
+  w0 register n1099511627776 0x0
+  w0 register n1099511627777 0x0
+  w0 unregister n1 0x0
+  w0 unregister n1099511627776 0x0
+  w0 unregister n1099511627777 0x0
+  tree 120770db14f04fcc 189
+  text 5f2014ae12911215 643
+  actions 4b2be6e1ec7552fd 133
+step 10 focus w0 false
+  w0 object n0 state active false
+  w0 object n1 state focused false
+  w0 register n1 0x0
+  w0 unregister n1 0x0
+  w0 window n0 "~" deactivated
+  tree 69a6ecc602a38add 189
+  text 5f2014ae12911215 643
+  actions 4b2be6e1ec7552fd 133
+step 11 focus w0 true
+  w0 object n0 state active true
+  w0 object n1 caret 65
+  w0 object n1 state focused true
+  w0 object root active-descendant n0
+  w0 register n1 0x0
+  w0 unregister n1 0x0
+  w0 window n0 "~" activated
+  tree 120770db14f04fcc 189
+  text 5f2014ae12911215 643
+  actions 4b2be6e1ec7552fd 133
+step 12 update w0 (0 nodes)
+  w0 object n1 state focused false
+  w0 object n1099511627777 state focused true
+  w0 register n1 0x0
+  w0 register n1099511627777 0x0
+  w0 unregister n1 0x0
+  w0 unregister n1099511627777 0x0
+  tree 29b3efd065fed178 189
+  text 5f2014ae12911215 643
+  actions 4b2be6e1ec7552fd 133
+step 13 update w0 (0 nodes)
+  w0 object n1 caret 65
+  w0 object n1 state focused true
+  w0 object n1099511627777 state focused false
+  w0 register n1 0x0
+  w0 register n1099511627777 0x0
+  w0 unregister n1 0x0
+  w0 unregister n1099511627777 0x0
+  tree 120770db14f04fcc 189
+  text 5f2014ae12911215 643
+  actions 4b2be6e1ec7552fd 133
+step 14 bounds w0
+  tree 81a8c9028db658f4 189
+  text d46bc89eec70af75 643
+  actions 9c2cc59941d481a1 133
+step 15 update w0 (3 nodes)
+  w0 object n1 bounds (12,36 320x32)
+  w0 object n1 caret 1
+  w0 object n1 text-inserted 0 1 "\n"
+  w0 object n1 text-removed 0 65 "notes  todo.txt\nuser@host:~$ cat todo.txt\n- ship it\nuser@host:~$ "
+  w0 register n1 0x0
+  w0 unregister n1 0x0
+  tree 27d1992c8c12ccf9 189
+  text d048b13c234d6dc0 67
+  actions 60c60e031ce411f7 133
+exit
+  w0 object root child-removed n0
+scenario fixture chrome messages
+step 0 open w0
+  w0 object n1 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x21
+  w0 register n1 0x40021
+  w0 register n1048577 0x23
+  w0 register n1048578 0x80001
+  w0 register n1048579 0x3
+  w0 register n1099511627776 0x23
+  w0 register n1099511627777 0x23
+  w0 register n2 0x4021
+  tree 9e92ebbb7c2d10ce 255
+  text 8484b956067e5ac5 157
+  actions 16eea764304e2450 199
+step 1 update w0 (1 nodes)
+  w0 object n1048577 announce "Pasted 3 lines" 1
+  w0 object n1048577 name "Pasted 3 lines"
+  w0 register n1048577 0x0
+  w0 unregister n1048577 0x0
+  tree e9e51993e6d92dea 255
+  text 8484b956067e5ac5 157
+  actions 16eea764304e2450 199
+step 2 update w0 (1 nodes)
+  w0 object n1048578 value 75
+  w0 register n1048578 0x0
+  w0 unregister n1048578 0x0
+  tree 20424190709adc27 255
+  text 8484b956067e5ac5 157
+  actions 16eea764304e2450 199
+step 3 update w0 (1 nodes)
+  w0 object n1048578 state indeterminate true
+  w0 register n1048578 0x0
+  w0 unregister n1048578 0x80000
+  tree e46e95f399b17b26 255
+  text 8484b956067e5ac5 157
+  actions 16eea764304e2450 199
+step 4 update w0 (2 nodes)
+  w0 cache-add n1048580
+  w0 object n0 child-added 5 n1048580
+  w0 object n1048580 announce "Disk almost full" 2
+  w0 register n0 0x0
+  w0 register n1048580 0x1
+  w0 unregister n0 0x0
+  tree 0db41388e09b02b0 277
+  text 8484b956067e5ac5 157
+  actions a5ec0b6dc5f523c4 221
+step 5 update w0 (1 nodes)
+  w0 object n1048580 announce "Disk full" 2
+  w0 object n1048580 name "Disk full"
+  w0 register n1048580 0x0
+  w0 unregister n1048580 0x0
+  tree c9266c22c57ff070 277
+  text 8484b956067e5ac5 157
+  actions a5ec0b6dc5f523c4 221
+step 6 update w0 (1 nodes)
+  w0 cache-remove n1048580
+  w0 object n0 child-removed n1048580
+  w0 object n1048580 state defunct true
+  w0 register n0 0x0
+  w0 unregister n0 0x0
+  w0 unregister n1048580 0x1
+  tree e46e95f399b17b26 255
+  text 8484b956067e5ac5 157
+  actions 16eea764304e2450 199
+step 7 update w0 (5 nodes)
+  w0 cache-add n1048581
+  w0 cache-add n1048582
+  w0 cache-add n1048583
+  w0 cache-add n1048584
+  w0 object n0 child-added 5 n1048581
+  w0 object n1 state focused false
+  w0 object n1048582 state focused true
+  w0 register n0 0x0
+  w0 register n1 0x0
+  w0 register n1048581 0x21
+  w0 register n1048582 0x23
+  w0 register n1048583 0x23
+  w0 register n1048584 0x3
+  w0 unregister n0 0x0
+  w0 unregister n1 0x0
+  tree b6c43e0a2c04e572 388
+  text 8484b956067e5ac5 157
+  actions a80f2511e8b6b74f 287
+step 8 update w0 (2 nodes)
+  w0 object n1048582 state focused false
+  w0 object n1048583 state focused true
+  w0 object n1048584 state pressed true
+  w0 register n1048582 0x0
+  w0 register n1048583 0x0
+  w0 register n1048584 0x0
+  w0 unregister n1048582 0x0
+  w0 unregister n1048583 0x0
+  w0 unregister n1048584 0x0
+  tree da82a123152bc2bb 388
+  text 8484b956067e5ac5 157
+  actions a80f2511e8b6b74f 287
+step 9 update w0 (1 nodes)
+  w0 object n1048584 state indeterminate true
+  w0 object n1048584 state pressed false
+  w0 register n1048584 0x0
+  w0 unregister n1048584 0x0
+  tree 3191c56dc48d9739 388
+  text 8484b956067e5ac5 157
+  actions a80f2511e8b6b74f 287
+step 10 focus w0 false
+  w0 object n0 state active false
+  w0 object n1048583 state focused false
+  w0 register n1048583 0x0
+  w0 unregister n1048583 0x0
+  w0 window n0 "~" deactivated
+  tree 5f0adb7804bcf894 388
+  text 8484b956067e5ac5 157
+  actions a80f2511e8b6b74f 287
+step 11 update w0 (1 nodes)
+  w0 cache-remove n1048581
+  w0 cache-remove n1048582
+  w0 cache-remove n1048583
+  w0 cache-remove n1048584
+  w0 object n0 child-removed n1048581
+  w0 object n1048581 state defunct true
+  w0 object n1048582 state defunct true
+  w0 object n1048583 state defunct true
+  w0 object n1048584 state defunct true
+  w0 register n0 0x0
+  w0 unregister n0 0x0
+  w0 unregister n1048581 0x21
+  w0 unregister n1048582 0x23
+  w0 unregister n1048583 0x23
+  w0 unregister n1048584 0x3
+  tree 790bfe2cd4e7c4d5 255
+  text 8484b956067e5ac5 157
+  actions 16eea764304e2450 199
+step 12 focus w0 true
+  w0 object n0 state active true
+  w0 object n1 caret 11
+  w0 object n1 state focused true
+  w0 object root active-descendant n0
+  w0 register n1 0x0
+  w0 unregister n1 0x0
+  w0 window n0 "~" activated
+  tree e46e95f399b17b26 255
+  text 8484b956067e5ac5 157
+  actions 16eea764304e2450 199
+exit
+  w0 object root child-removed n0
+scenario fixture find field
+step 0 open w0
+  w0 object n1 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x21
+  w0 register n1 0x40021
+  w0 register n1099511627776 0x23
+  w0 register n1099511627777 0x23
+  w0 register n2 0x4021
+  tree acfac1e1e865eb6a 174
+  text 27a3452a3e939d99 184
+  actions c97387decb806663 133
+step 1 update w0 (3 nodes)
+  w0 cache-add n3
+  w0 object n0 child-added 2 n3
+  w0 object n1 state focused false
+  w0 object n3 caret 0
+  w0 object n3 state focused true
+  w0 register n0 0x0
+  w0 register n1 0x0
+  w0 register n3 0x40001
+  w0 unregister n0 0x0
+  w0 unregister n1 0x0
+  tree 0c6add578492cb67 196
+  text 91b89c5be8881f33 227
+  actions c62b73ea274ca2f1 180
+step 2 update w0 (2 nodes)
+  w0 object n3 caret 1
+  w0 object n3 description "3 matches"
+  w0 object n3 text-inserted 0 1 "f"
+  w0 register n3 0x0
+  w0 unregister n3 0x0
+  tree 076868efcf7546b3 196
+  text 1449c34d1c96d39c 236
+  actions 6b07ea91f7b747e2 180
+step 3 update w0 (2 nodes)
+  w0 object n3 caret 2
+  w0 object n3 description "2 matches"
+  w0 object n3 text-inserted 1 1 "o"
+  w0 register n3 0x0
+  w0 unregister n3 0x0
+  tree d690038a3bcc910c 196
+  text 58fd102fcdbe63e9 245
+  actions 317ce2b133ec5e00 180
+step 4 update w0 (2 nodes)
+  w0 object n3 caret 3
+  w0 object n3 description "1 of 2"
+  w0 object n3 text-inserted 2 1 "o"
+  w0 register n3 0x0
+  w0 unregister n3 0x0
+  tree 257846a94cbcb935 196
+  text 8be9b4f9ff806f57 254
+  actions 21578cdcc3add9d6 180
+step 5 update w0 (1 nodes)
+  w0 object n3 caret 1
+  w0 register n3 0x0
+  w0 unregister n3 0x0
+  tree 257846a94cbcb935 196
+  text 821179ea9e34a02d 254
+  actions 695fe7f35edc1e4a 180
+step 6 update w0 (1 nodes)
+  w0 object n3 caret 3
+  w0 object n3 text-selection-changed
+  w0 register n3 0x0
+  w0 unregister n3 0x0
+  tree 257846a94cbcb935 196
+  text dfdaa4cb71367b7b 254
+  actions 21578cdcc3add9d6 180
+step 7 update w0 (2 nodes)
+  w0 object n3 caret 0
+  w0 object n3 description "no query"
+  w0 object n3 text-removed 0 3 "foo"
+  w0 object n3 text-selection-changed
+  w0 register n3 0x0
+  w0 unregister n3 0x0
+  tree 794ed21cf0138116 196
+  text 91b89c5be8881f33 227
+  actions c62b73ea274ca2f1 180
+step 8 update w0 (1 nodes)
+  w0 cache-remove n3
+  w0 object n0 child-removed n3
+  w0 object n1 caret 14
+  w0 object n1 state focused true
+  w0 object n3 state defunct true
+  w0 object n3 state focused false
+  w0 register n0 0x0
+  w0 register n1 0x0
+  w0 unregister n0 0x0
+  w0 unregister n1 0x0
+  w0 unregister n3 0x40001
+  tree 054b93d29a60879f 174
+  text 27a3452a3e939d99 184
+  actions c97387decb806663 133
+exit
+  w0 object root child-removed n0
+scenario fixture menu
+step 0 open w0
+  w0 object n536870913 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x21
+  w0 register n1 0x40021
+  w0 register n1099511627776 0x23
+  w0 register n1099511627777 0x23
+  w0 register n2 0x4021
+  w0 register n536870911 0x3
+  w0 register n536870912 0x4021
+  w0 register n536870913 0x23
+  w0 register n536870914 0x23
+  w0 register n536870915 0x23
+  w0 register n536870916 0x23
+  tree b40b49b8ae86bb7f 381
+  text 3e4abfb385548422 157
+  actions e1f7ba2ee71017ae 265
+step 1 update w0 (0 nodes)
+  w0 object n536870913 state focused false
+  w0 object n536870914 state focused true
+  w0 register n536870913 0x0
+  w0 register n536870914 0x0
+  w0 unregister n536870913 0x0
+  w0 unregister n536870914 0x0
+  tree 9831c8ac665536d0 381
+  text 3e4abfb385548422 157
+  actions e1f7ba2ee71017ae 265
+step 2 update w0 (2 nodes)
+  w0 object n536870913 state checked false
+  w0 object n536870914 state checked true
+  w0 register n536870913 0x0
+  w0 register n536870914 0x0
+  w0 unregister n536870913 0x0
+  w0 unregister n536870914 0x0
+  tree 3af07c6f144578c0 381
+  text 3e4abfb385548422 157
+  actions e1f7ba2ee71017ae 265
+step 3 update w0 (0 nodes)
+  w0 object n536870914 state focused false
+  w0 object n536870915 state focused true
+  w0 register n536870914 0x0
+  w0 register n536870915 0x0
+  w0 unregister n536870914 0x0
+  w0 unregister n536870915 0x0
+  tree 42475c0eb286f814 381
+  text 3e4abfb385548422 157
+  actions e1f7ba2ee71017ae 265
+step 4 update w0 (5 nodes)
+  w0 cache-add n536870977
+  w0 cache-add n536870978
+  w0 cache-add n536870979
+  w0 cache-add n536870980
+  w0 cache-remove n536870913
+  w0 cache-remove n536870914
+  w0 cache-remove n536870915
+  w0 cache-remove n536870916
+  w0 object n536870912 child-added 0 n536870977
+  w0 object n536870912 child-added 1 n536870978
+  w0 object n536870912 child-added 2 n536870979
+  w0 object n536870912 child-added 3 n536870980
+  w0 object n536870912 child-removed n536870913
+  w0 object n536870912 child-removed n536870914
+  w0 object n536870912 child-removed n536870915
+  w0 object n536870912 child-removed n536870916
+  w0 object n536870913 state defunct true
+  w0 object n536870914 state defunct true
+  w0 object n536870915 state defunct true
+  w0 object n536870915 state focused false
+  w0 object n536870916 state defunct true
+  w0 object n536870977 state focused true
+  w0 register n536870912 0x0
+  w0 register n536870977 0x23
+  w0 register n536870978 0x23
+  w0 register n536870979 0x23
+  w0 register n536870980 0x23
+  w0 unregister n536870912 0x0
+  w0 unregister n536870913 0x23
+  w0 unregister n536870914 0x23
+  w0 unregister n536870915 0x23
+  w0 unregister n536870916 0x23
+  tree 90f776fbadd551ee 381
+  text 3e4abfb385548422 157
+  actions 33e73e92bd39158a 265
+step 5 update w0 (1 nodes)
+  w0 cache-remove n536870911
+  w0 cache-remove n536870912
+  w0 cache-remove n536870977
+  w0 cache-remove n536870978
+  w0 cache-remove n536870979
+  w0 cache-remove n536870980
+  w0 object n0 child-removed n536870911
+  w0 object n0 child-removed n536870912
+  w0 object n1 caret 11
+  w0 object n1 state focused true
+  w0 object n536870911 state defunct true
+  w0 object n536870912 state defunct true
+  w0 object n536870977 state defunct true
+  w0 object n536870977 state focused false
+  w0 object n536870978 state defunct true
+  w0 object n536870979 state defunct true
+  w0 object n536870980 state defunct true
+  w0 register n0 0x0
+  w0 register n1 0x0
+  w0 unregister n0 0x0
+  w0 unregister n1 0x0
+  w0 unregister n536870911 0x3
+  w0 unregister n536870912 0x4021
+  w0 unregister n536870977 0x23
+  w0 unregister n536870978 0x23
+  w0 unregister n536870979 0x23
+  w0 unregister n536870980 0x23
+  tree 9f1ed97c424080c4 174
+  text 3e4abfb385548422 157
+  actions 7ca3a57977f84848 133
+exit
+  w0 object root child-removed n0
+scenario fixture settings
+step 0 open w0
+  w0 object n23 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x21
+  w0 register n10 0x21
+  w0 register n100 0x23
+  w0 register n101 0x23
+  w0 register n102 0x23
+  w0 register n11 0x21
+  w0 register n12 0x21
+  w0 register n13 0x21
+  w0 register n20 0x21
+  w0 register n21 0x21
+  w0 register n22 0x23
+  w0 register n23 0x80021
+  w0 register n24 0x40021
+  w0 register n26 0x40021
+  w0 register n27 0x40021
+  w0 register n28 0x21
+  w0 register n29 0x23
+  tree 69143c649f98471b 618
+  text 3809b67b2648d4ff 759
+  actions 4a8b63e998bc71b8 447
+step 1 bounds w0
+  tree c49173d76bb1603c 633
+  text b326e3d72207a268 759
+  actions 90869d1f056dce2d 447
+step 2 update w0 (1 nodes)
+  w0 object n23 value 0.55
+  w0 register n23 0x0
+  w0 unregister n23 0x0
+  tree 08188059d8119cbd 633
+  text b326e3d72207a268 759
+  actions 90869d1f056dce2d 447
+step 3 update w0 (2 nodes)
+  w0 object n22 state focused true
+  w0 object n22 state pressed true
+  w0 object n23 state focused false
+  w0 register n22 0x0
+  w0 register n23 0x0
+  w0 register n29 0x0
+  w0 unregister n22 0x0
+  w0 unregister n23 0x0
+  w0 unregister n29 0x0
+  tree 3572b775c470fc62 633
+  text b326e3d72207a268 759
+  actions 90869d1f056dce2d 447
+step 4 update w0 (2 nodes)
+  w0 object n22 state focused false
+  w0 object n24 caret 5
+  w0 object n24 state focused true
+  w0 object n24 text-inserted 4 1 "2"
+  w0 register n22 0x0
+  w0 register n24 0x0
+  w0 unregister n22 0x0
+  w0 unregister n24 0x0
+  tree 27fb8a869d4ef61c 633
+  text fa062ec2fe8940a0 768
+  actions 3239492af346707f 447
+step 5 update w0 (2 nodes)
+  w0 object n24 caret 3
+  w0 object n24 text-removed 3 2 "k2"
+  w0 register n24 0x0
+  w0 unregister n24 0x0
+  tree 27fb8a869d4ef61c 633
+  text cf12153260cc72c4 750
+  actions f09d131e70e1e78a 447
+step 6 update w0 (2 nodes)
+  w0 object n24 caret 0
+  w0 object n24 text-removed 0 3 "wor"
+  w0 register n24 0x0
+  w0 unregister n24 0x0
+  tree 27fb8a869d4ef61c 633
+  text b1e629debba14fb1 723
+  actions c7d7ca55d9070e17 447
+step 7 update w0 (1 nodes)
+  w0 object n10 bounds (24,48 1220x800)
+  w0 register n10 0x0
+  w0 unregister n10 0x0
+  tree 15a72f28eeb4aad9 633
+  text 9e979da906dfd1c3 723
+  actions d35a4ee4e41d9338 447
+step 8 update w0 (3 nodes)
+  w0 object n100 state selected false
+  w0 object n101 state focused true
+  w0 object n101 state selected true
+  w0 object n21 name "Keys"
+  w0 object n24 state focused false
+  w0 register n100 0x0
+  w0 register n101 0x0
+  w0 register n21 0x0
+  w0 register n24 0x0
+  w0 unregister n100 0x0
+  w0 unregister n101 0x0
+  w0 unregister n21 0x0
+  w0 unregister n24 0x0
+  tree 10b1e260052643dc 633
+  text 9e979da906dfd1c3 723
+  actions d35a4ee4e41d9338 447
+step 9 update w0 (2 nodes)
+  w0 object n101 state focused false
+  w0 object n27 caret 15
+  w0 object n27 state focused true
+  w0 object n28 announce "Saved config.toml" 1
+  w0 object n28 name "Saved config.toml"
+  w0 register n101 0x0
+  w0 register n27 0x0
+  w0 register n28 0x0
+  w0 unregister n101 0x0
+  w0 unregister n27 0x0
+  w0 unregister n28 0x0
+  tree a85fadbca7ca7d16 633
+  text 2955c2496a905917 723
+  actions bdc16f6f9e57acd4 447
+step 10 update w0 (3 nodes)
+  w0 object n22 state enabled false
+  w0 object n22 state read-only true
+  w0 object n22 state sensitive false
+  w0 object n23 state enabled false
+  w0 object n23 state read-only true
+  w0 object n23 state sensitive false
+  w0 object n24 state editable false
+  w0 object n24 state enabled false
+  w0 object n24 state read-only true
+  w0 object n24 state sensitive false
+  w0 register n22 0x0
+  w0 register n23 0x0
+  w0 register n24 0x0
+  w0 unregister n22 0x0
+  w0 unregister n23 0x0
+  w0 unregister n24 0x0
+  tree 2951d8b69dd685b0 633
+  text 2955c2496a905917 723
+  actions bdc16f6f9e57acd4 447
+exit
+  w0 object root child-removed n0
+scenario fixture palette
+step 0 open w0
+  w0 object n1 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x21
+  w0 register n1 0x23
+  w0 register n18446744073709551615 0x4021
+  w0 register n2 0x23
+  w0 register n3 0x23
+  w0 register n4 0x23
+  tree ae1ee40d68ab6965 211
+  text cbf29ce484222325 0
+  actions defa5f7217ad99b6 130
+step 1 update w0 (2 nodes)
+  w0 object n1 state focused false
+  w0 object n1 state selected false
+  w0 object n18446744073709551615 selection-changed
+  w0 object n3 state focused true
+  w0 object n3 state selected true
+  w0 register n1 0x0
+  w0 register n3 0x0
+  w0 unregister n1 0x0
+  w0 unregister n3 0x0
+  tree d528368785a716e0 211
+  text cbf29ce484222325 0
+  actions f56c0fe7eebccf28 130
+step 2 update w0 (3 nodes)
+  w0 cache-remove n3
+  w0 cache-remove n4
+  w0 object n1 announce "Split right" 1
+  w0 object n1 description "sp: 0"
+  w0 object n1 name "Split right"
+  w0 object n1 state focused true
+  w0 object n1 state selected true
+  w0 object n18446744073709551615 child-removed n3
+  w0 object n18446744073709551615 child-removed n4
+  w0 object n18446744073709551615 selection-changed
+  w0 object n2 announce "Split down" 1
+  w0 object n2 description "sp: 1"
+  w0 object n2 name "Split down"
+  w0 object n3 state defunct true
+  w0 object n3 state focused false
+  w0 object n4 state defunct true
+  w0 register n1 0x0
+  w0 register n18446744073709551615 0x0
+  w0 register n2 0x0
+  w0 unregister n1 0x0
+  w0 unregister n18446744073709551615 0x0
+  w0 unregister n2 0x0
+  w0 unregister n3 0x23
+  w0 unregister n4 0x23
+  tree e1bf25fad2af7ccb 137
+  text cbf29ce484222325 0
+  actions b1a06d7bb95a2846 86
+step 3 update w0 (1 nodes)
+  w0 cache-remove n1
+  w0 cache-remove n2
+  w0 object n1 state defunct true
+  w0 object n1 state focused false
+  w0 object n18446744073709551615 child-removed n1
+  w0 object n18446744073709551615 child-removed n2
+  w0 object n18446744073709551615 selection-changed
+  w0 object n18446744073709551615 state focusable true
+  w0 object n18446744073709551615 state focused true
+  w0 object n2 state defunct true
+  w0 register n18446744073709551615 0x0
+  w0 unregister n1 0x23
+  w0 unregister n18446744073709551615 0x0
+  w0 unregister n2 0x23
+  tree 6ee14bab189fb551 63
+  text cbf29ce484222325 0
+  actions 9535ea338c6dbc31 42
+step 4 update w0 (5 nodes)
+  w0 cache-add n1
+  w0 cache-add n2
+  w0 cache-add n3
+  w0 cache-add n4
+  w0 object n1 announce "New tab" 1
+  w0 object n18446744073709551615 child-added 0 n1
+  w0 object n18446744073709551615 child-added 1 n2
+  w0 object n18446744073709551615 child-added 2 n3
+  w0 object n18446744073709551615 child-added 3 n4
+  w0 object n18446744073709551615 selection-changed
+  w0 object n18446744073709551615 state focusable false
+  w0 object n18446744073709551615 state focused false
+  w0 object n2 announce "New window" 1
+  w0 object n3 announce "Split right" 1
+  w0 object n4 announce "Split down" 1
+  w0 object n4 state focused true
+  w0 register n1 0x23
+  w0 register n18446744073709551615 0x0
+  w0 register n2 0x23
+  w0 register n3 0x23
+  w0 register n4 0x23
+  w0 unregister n18446744073709551615 0x0
+  tree 22e7355b4adc1dd3 211
+  text cbf29ce484222325 0
+  actions 195e0f561eabdded 130
+exit
+  w0 object root child-removed n0
+scenario fixture two windows
+step 0 open w0
+  w0 object n1 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x21
+  w0 register n1 0x40021
+  w0 register n1099511627776 0x23
+  w0 register n1099511627777 0x23
+  w0 register n2 0x4021
+  tree 60dd192fac59dc91 174
+  text e58ea4e7f3f77e3c 130
+  actions e71772df453ab533 133
+step 1 open w1
+  w1 object root child-added 1 n0
+  w1 register n0 0x21
+  w1 register n10 0x21
+  w1 register n100 0x23
+  w1 register n101 0x23
+  w1 register n102 0x23
+  w1 register n11 0x21
+  w1 register n12 0x21
+  w1 register n13 0x21
+  w1 register n20 0x21
+  w1 register n21 0x21
+  w1 register n22 0x23
+  w1 register n23 0x80021
+  w1 register n24 0x40021
+  w1 register n26 0x40021
+  w1 register n27 0x40021
+  w1 register n28 0x21
+  w1 register n29 0x23
+  tree ec6bc54965bfc268 786
+  text d4450a4fac2ef0ab 889
+  actions 30dddcc868c5dcb5 579
+step 2 focus w0 false
+  w0 object n0 state active false
+  w0 object n1 state focused false
+  w0 register n1 0x0
+  w0 unregister n1 0x0
+  w0 window n0 "~" deactivated
+  tree 6a648b1d1d72730f 786
+  text d4450a4fac2ef0ab 889
+  actions 30dddcc868c5dcb5 579
+step 3 focus w1 true
+  w1 object n0 state active true
+  w1 object n23 state focused true
+  w1 object root active-descendant n0
+  w1 register n23 0x0
+  w1 unregister n23 0x0
+  w1 window n0 "Settings" activated
+  tree 30765d8a23158fdc 786
+  text d4450a4fac2ef0ab 889
+  actions 30dddcc868c5dcb5 579
+step 4 close w0
+  w0 object root child-removed n0
+  tree 8175d9181a5e0a24 618
+  text 4837ac59a0b332ae 759
+  actions 91ca02b7ec318efc 447
+step 5 open w2
+  w2 object root child-added 1 n0
+  w2 register n0 0x21
+  w2 register n1 0x23
+  w2 register n18446744073709551615 0x4021
+  w2 register n2 0x23
+  tree 6b34c121326a34aa 749
+  text 4837ac59a0b332ae 759
+  actions 2ef1aa27b57a4e07 532
+step 6 focus w1 false
+  w1 object n0 state active false
+  w1 object n23 state focused false
+  w1 register n23 0x0
+  w1 unregister n23 0x0
+  w1 window n0 "Settings" deactivated
+  tree 7e14598ae0fc2307 749
+  text 4837ac59a0b332ae 759
+  actions 2ef1aa27b57a4e07 532
+step 7 focus w2 true
+  w2 object n0 state active true
+  w2 object n2 state focused true
+  w2 object root active-descendant n0
+  w2 register n2 0x0
+  w2 unregister n2 0x0
+  w2 window n0 "Command palette" activated
+  tree 14b33b186f7838f4 749
+  text 4837ac59a0b332ae 759
+  actions 2ef1aa27b57a4e07 532
+step 8 close w1
+  w1 object root child-removed n0
+  tree 58bf49f33dfbe116 137
+  text cbf29ce484222325 0
+  actions 0df10a1efa88221d 86
+step 9 close w2
+  w2 object root child-removed n0
+  tree 36c6bcc1650385ea 6
+  text cbf29ce484222325 0
+  actions d1285318ab49aad6 1
+exit
+scenario fixture unicode text
+step 0 open w0
+  w0 object n1 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x21
+  w0 register n1 0x40021
+  w0 register n1099511627776 0x23
+  w0 register n1099511627777 0x23
+  w0 register n2 0x4021
+  tree 1f61f06aa907f518 174
+  text 2831a87ba0176922 463
+  actions b98be4c74920f192 133
+step 1 update w0 (1 nodes)
+  w0 object n1 caret 25
+  w0 object n1 text-selection-changed
+  w0 register n1 0x0
+  w0 unregister n1 0x0
+  tree 669f15f997cffe07 174
+  text 1ce2a1cbb2274083 463
+  actions 9645d34ac282d940 133
+step 2 update w0 (3 nodes)
+  w0 object n1 caret 28
+  w0 object n1 text-inserted 28 3 "文 🙂"
+  w0 object n1 text-removed 28 1 " "
+  w0 object n1 text-selection-changed
+  w0 register n1 0x0
+  w0 unregister n1 0x0
+  tree 669f15f997cffe07 174
+  text 5d1327775f519087 481
+  actions b71c27459382bfd1 133
+exit
+  w0 object root child-removed n0
+scenario fixture link and dialog root
+step 0 open w0
+  w0 object n5 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x21
+  w0 register n16 0x1
+  w0 register n5 0x423
+  w0 register n6 0x21
+  w0 register n7 0x23
+  tree 7732dc2462f168d4 159
+  text cbf29ce484222325 0
+  actions 3238a598b3cd5c95 108
+step 1 update w0 (2 nodes)
+  w0 object n5 name "other docs"
+  w0 object n6 name "other docs"
+  w0 register n5 0x0
+  w0 register n6 0x0
+  w0 unregister n5 0x0
+  w0 unregister n6 0x0
+  tree 387fc4aab8c732a0 159
+  text cbf29ce484222325 0
+  actions 3238a598b3cd5c95 108
+step 2 update w0 (2 nodes)
+  w0 object n16 name "Close"
+  w0 object n5 state focused false
+  w0 object n7 name "Close"
+  w0 object n7 state focusable true
+  w0 object n7 state focused true
+  w0 register n16 0x0
+  w0 register n5 0x0
+  w0 register n7 0x0
+  w0 unregister n16 0x0
+  w0 unregister n5 0x400
+  w0 unregister n7 0x0
+  tree 5bd5f88c552c6500 159
+  text cbf29ce484222325 0
+  actions 3238a598b3cd5c95 108
+step 3 update w0 (1 nodes)
+  w0 object n0 role 39
+  w0 object n0 state active false
+  w0 register n0 0x0
+  w0 unregister n0 0x0
+  tree 826e26ff3fe10322 159
+  text cbf29ce484222325 0
+  actions 3238a598b3cd5c95 108
+step 4 focus w0 false
+  w0 object n7 state focused false
+  w0 register n7 0x0
+  w0 unregister n7 0x0
+  tree cbc34cf396bc308b 159
+  text cbf29ce484222325 0
+  actions 3238a598b3cd5c95 108
+exit
+  w0 object root child-removed n0
+scenario generated 0
+step 0 open w0
+  w0 object root child-added 0 n0
+  w0 register n0 0x21
+  w0 register n16 0x4023
+  w0 register n19 0x1
+  w0 register n20 0x1
+  w0 register n22 0x4001
+  w0 register n26 0x3
+  w0 register n281474976710673 0x1
+  w0 register n281474976710679 0x1
+  w0 register n29 0x40001
+  w0 register n3 0x21
+  w0 register n5 0x40023
+  tree 048995b8b7265464 306
+  text 95aa49ece30c00b7 515
+  actions 1f5d8684ecb5aeea 290
+step 1 update w0 (1 nodes)
+  w0 cache-remove n19
+  w0 object n16 child-removed n19
+  w0 object n19 state defunct true
+  w0 register n16 0x0
+  w0 register n20 0x0
+  w0 unregister n16 0x0
+  w0 unregister n19 0x1
+  w0 unregister n20 0x0
+  tree 7241c61067c0b65d 284
+  text 95aa49ece30c00b7 515
+  actions 4ccbc61960dc2e45 268
+step 2 update w0 (16 nodes)
+  tree 7241c61067c0b65d 284
+  text 95aa49ece30c00b7 515
+  actions 4ccbc61960dc2e45 268
+step 3 update w0 (1 nodes)
+  w0 object n29 text-removed 0 12 " 1 é2e\u{301}ß.2中\n"
+  w0 register n29 0x0
+  w0 unregister n29 0x0
+  tree 7241c61067c0b65d 284
+  text 4e3bde1508ef411c 407
+  actions 1ac9de24976d5bd4 268
+step 4 update w0 (1 nodes)
+  w0 register n5 0x0
+  w0 unregister n5 0x0
+  tree 7241c61067c0b65d 284
+  text a2dcb23b30375237 407
+  actions 904d3a5f0691b99c 268
+step 5 bounds w0
+  tree 2b71bcd6f0b65d99 284
+  text 62d1a791eb3c3d22 407
+  actions 21d0355b99db3645 268
+step 6 update w0 (1 nodes)
+  w0 object n20 announce "" 1
+  w0 object n20 bounds (149,75 146x45)
+  w0 object n20 description "zsh"
+  w0 object n20 name ""
+  w0 object n20 state focusable true
+  w0 object n20 state selectable false
+  w0 register n20 0x22
+  w0 unregister n20 0x0
+  tree 3e400397235c39f5 299
+  text 62d1a791eb3c3d22 407
+  actions c653d79ef3131f04 268
+step 7 update w0 (1 nodes)
+  w0 object n29 text-inserted 3 9 "-e\u{301}ay éab"
+  tree 3e400397235c39f5 299
+  text bf711a2dc8918392 488
+  actions 8ae4e540ff11d280 268
+step 8 update w0 (1 nodes)
+  tree 3e400397235c39f5 299
+  text 2dff4311d137438d 488
+  actions 1d7658f7bf7d389f 268
+step 9 update w0 (1 nodes)
+  w0 object n281474976710673 bounds (12,225 163x7)
+  w0 object n281474976710673 description "ok"
+  w0 object n281474976710673 name ""
+  w0 object n281474976710673 state focusable false
+  w0 register n281474976710673 0x20
+  w0 unregister n281474976710673 0x0
+  tree f410a26d365565d1 314
+  text 2dff4311d137438d 488
+  actions 1d7658f7bf7d389f 268
+step 10 update w0 (1 nodes)
+  w0 object n5 state focusable true
+  w0 object n5 text-removed 19 5 "1 x2 "
+  w0 register n5 0x0
+  w0 unregister n5 0x0
+  tree 43665770520d3ed9 314
+  text c7a0e13b6577d6d4 443
+  actions 945631b5f51eaa4e 268
+step 11 update w0 (0 nodes)
+  tree f410a26d365565d1 314
+  text c7a0e13b6577d6d4 443
+  actions 945631b5f51eaa4e 268
+step 12 update w0 (1 nodes)
+  tree f410a26d365565d1 314
+  text c7a0e13b6577d6d4 443
+  actions 945631b5f51eaa4e 268
+exit
+  w0 object root child-removed n0
+scenario generated 1
+step 0 open w0
+  w0 object n3 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x23
+  w0 register n281474976710665 0x1
+  w0 register n3 0x4021
+  w0 register n4 0x84001
+  w0 register n7 0x1
+  tree ef17436d3d0e7ec0 144
+  text cbf29ce484222325 0
+  actions e6641c03ad0ffc31 108
+step 1 update w0 (1 nodes)
+  w0 object n4 bounds (91,236 71x53)
+  w0 object n4 description "été"
+  w0 register n4 0x20
+  w0 unregister n4 0x0
+  tree f57ba28d99e18d34 159
+  text cbf29ce484222325 0
+  actions e6641c03ad0ffc31 108
+step 2 update w0 (1 nodes)
+  w0 object n7 announce "" 2
+  w0 object n7 bounds (263,157 51x14)
+  w0 object n7 name ""
+  w0 object n7 state focusable true
+  w0 register n7 0x22
+  w0 unregister n7 0x0
+  tree b3bbb32c530df276 174
+  text cbf29ce484222325 0
+  actions e6641c03ad0ffc31 108
+step 3 update w0 (1 nodes)
+  w0 object n281474976710665 bounds (49,86 93x18)
+  w0 object n281474976710665 state focusable true
+  w0 register n281474976710665 0x420
+  w0 unregister n281474976710665 0x0
+  tree 69149d37840e0db7 189
+  text cbf29ce484222325 0
+  actions e6641c03ad0ffc31 108
+step 4 focus w0 false
+  w0 object n0 state active false
+  w0 object n3 state focused false
+  w0 register n3 0x0
+  w0 unregister n3 0x0
+  w0 window n0 "" deactivated
+  tree 94c4939eb5cd6bd6 189
+  text cbf29ce484222325 0
+  actions e6641c03ad0ffc31 108
+step 5 update w0 (0 nodes)
+  tree 94c4939eb5cd6bd6 189
+  text cbf29ce484222325 0
+  actions e6641c03ad0ffc31 108
+step 6 update w0 (2 nodes)
+  w0 cache-remove n281474976710665
+  w0 object n0 child-removed n281474976710665
+  w0 object n281474976710665 state defunct true
+  w0 object n7 bounds (239,235 123x53)
+  w0 object n7 description "ok"
+  w0 object n7 state focusable false
+  w0 register n0 0x0
+  w0 register n7 0x0
+  w0 unregister n0 0x0
+  w0 unregister n281474976710665 0x421
+  w0 unregister n7 0x0
+  tree bb340215064c72f0 152
+  text cbf29ce484222325 0
+  actions 39931f6a6c4110bb 86
+step 7 update w0 (0 nodes)
+  tree fabbeb4f85c09150 152
+  text cbf29ce484222325 0
+  actions 39931f6a6c4110bb 86
+step 8 update w0 (2 nodes)
+  w0 cache-add n11
+  w0 object n11 announce "save" 2
+  w0 object n7 child-added 0 n11
+  w0 register n11 0x80021
+  w0 register n7 0x0
+  w0 unregister n7 0x0
+  tree 648cf54c69efddac 189
+  text cbf29ce484222325 0
+  actions ada9481931986469 108
+step 9 update w0 (5 nodes)
+  tree 648cf54c69efddac 189
+  text cbf29ce484222325 0
+  actions ada9481931986469 108
+step 10 update w0 (1 nodes)
+  w0 object n11 announce "été" 2
+  w0 object n11 name "été"
+  w0 register n11 0x0
+  w0 unregister n11 0x0
+  tree 4f0a32efc03cd01b 189
+  text cbf29ce484222325 0
+  actions ada9481931986469 108
+step 11 update w0 (2 nodes)
+  w0 object n4 announce "ok" 2
+  w0 object n4 bounds (365,293 133x7)
+  w0 object n4 description "logs"
+  w0 object n4 name "ok"
+  w0 object n4 state focusable true
+  w0 object n4 value 97
+  w0 object n7 announce "logs" 2
+  w0 object n7 name "logs"
+  w0 register n4 0x2
+  w0 register n7 0x0
+  w0 unregister n4 0x0
+  w0 unregister n7 0x0
+  tree 9bd5087689bdea9f 189
+  text cbf29ce484222325 0
+  actions ada9481931986469 108
+step 12 update w0 (1 nodes)
+  w0 cache-remove n11
+  w0 object n11 state defunct true
+  w0 object n7 child-removed n11
+  w0 register n7 0x0
+  w0 unregister n11 0x80021
+  w0 unregister n7 0x0
+  tree 3719ea666f637136 152
+  text cbf29ce484222325 0
+  actions 39931f6a6c4110bb 86
+exit
+  w0 object root child-removed n0
+scenario generated 2
+step 0 open w0
+  w0 object n4 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x21
+  w0 register n1 0x80021
+  w0 register n11 0x1
+  w0 register n13 0x40001
+  w0 register n18 0x23
+  w0 register n19 0x3
+  w0 register n21 0x1
+  w0 register n26 0x23
+  w0 register n27 0x80021
+  w0 register n281474976710679 0x21
+  w0 register n3 0x23
+  w0 register n4 0x4021
+  w0 register n6 0x21
+  w0 register n7 0x21
+  w0 register n9 0x80021
+  tree b10fdc36c25516c8 499
+  text ed15cb6562d4b401 241
+  actions 49c166d3bdde150e 353
+step 1 update w0 (1 nodes)
+  w0 cache-remove n26
+  w0 object n19 child-removed n26
+  w0 object n26 state defunct true
+  w0 register n19 0x0
+  w0 register n27 0x0
+  w0 unregister n19 0x0
+  w0 unregister n26 0x23
+  w0 unregister n27 0x0
+  tree f89f95e85786f7ec 462
+  text ed15cb6562d4b401 241
+  actions 37c3b0b3f1780a14 331
+step 2 update w0 (17 nodes)
+  tree f89f95e85786f7ec 462
+  text ed15cb6562d4b401 241
+  actions 37c3b0b3f1780a14 331
+step 3 update w0 (17 nodes)
+  tree f89f95e85786f7ec 462
+  text ed15cb6562d4b401 241
+  actions 37c3b0b3f1780a14 331
+step 4 update w0 (1 nodes)
+  w0 object n13 text-inserted 7 5 " . a2"
+  tree f89f95e85786f7ec 462
+  text 50d93f6d6ae68cb7 286
+  actions 55d7e93d9afb7f8d 331
+step 5 update w0 (1 nodes)
+  w0 object n13 text-removed 6 3 "b ."
+  w0 object n18 state focusable true
+  w0 object n18 state focused true
+  w0 object n4 state focused false
+  w0 register n18 0x0
+  w0 register n4 0x0
+  w0 unregister n18 0x0
+  w0 unregister n4 0x0
+  tree 178c94fb9753376e 462
+  text dae0bf0a68d68cfa 259
+  actions 7fed3fc90759e4bd 331
+step 6 update w0 (0 nodes)
+  w0 object n18 state focusable false
+  w0 object n18 state focused false
+  w0 object n7 state focusable true
+  w0 object n7 state focused true
+  w0 register n18 0x0
+  w0 register n7 0x0
+  w0 unregister n18 0x0
+  w0 unregister n7 0x0
+  tree 1784a6469e2e74e4 462
+  text dae0bf0a68d68cfa 259
+  actions 7fed3fc90759e4bd 331
+step 7 update w0 (0 nodes)
+  tree 1784a6469e2e74e4 462
+  text dae0bf0a68d68cfa 259
+  actions 7fed3fc90759e4bd 331
+step 8 update w0 (17 nodes)
+  tree 1784a6469e2e74e4 462
+  text dae0bf0a68d68cfa 259
+  actions 7fed3fc90759e4bd 331
+step 9 focus w0 false
+  w0 object n0 state active false
+  w0 object n7 state focused false
+  w0 register n7 0x0
+  w0 unregister n7 0x0
+  w0 window n0 "logs" deactivated
+  tree 04bd2cdf09af10a5 462
+  text dae0bf0a68d68cfa 259
+  actions 7fed3fc90759e4bd 331
+step 10 update w0 (1 nodes)
+  w0 register n4 0x0
+  w0 register n6 0x0
+  w0 register n9 0x0
+  w0 unregister n4 0x0
+  w0 unregister n6 0x0
+  w0 unregister n9 0x0
+  tree 64a6f4bfc6860a67 462
+  text dae0bf0a68d68cfa 259
+  actions 4bfe7078f2158b61 331
+step 11 update w0 (1 nodes)
+  w0 object n281474976710679 description "été"
+  w0 object n281474976710679 state focusable true
+  w0 object n281474976710679 state indeterminate true
+  w0 object n281474976710679 value 39
+  w0 register n281474976710679 0x80002
+  w0 unregister n281474976710679 0x0
+  tree a4fdab47b737ecb1 462
+  text dae0bf0a68d68cfa 259
+  actions 4bfe7078f2158b61 331
+step 12 update w0 (1 nodes)
+  w0 object n1 announce "save" 1
+  w0 object n1 name "save"
+  w0 register n1 0x0
+  w0 unregister n1 0x0
+  tree 21a0d0a8c0a7f19e 462
+  text dae0bf0a68d68cfa 259
+  actions 4bfe7078f2158b61 331
+exit
+  w0 object root child-removed n0
+scenario generated 3
+step 0 open w0
+  w0 object n8 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x21
+  w0 register n15 0x21
+  w0 register n18 0x21
+  w0 register n3 0x4001
+  w0 register n5 0x1
+  w0 register n8 0x21
+  w0 register n9 0x40021
+  tree 6b5507f18c9080e0 233
+  text fd1df54c41c9634d 238
+  actions 4e1b2fe67e3ad43a 177
+step 1 update w0 (1 nodes)
+  w0 object n9 text-inserted 20 14 "2bc中x2🙂.c y-e\u{301}"
+  tree 1781b4789b1b520b 233
+  text 08ce8c947306d6e5 364
+  actions 42859c131c5cdea7 177
+step 2 update w0 (2 nodes)
+  w0 object n9 text-inserted 3 40 " yaxb e\u{301}中bx  🙂a yßé中a  ae\u{301}x中 b2bc中x2🙂.c "
+  w0 object n9 text-removed 3 29 "🙂a yßé中a  ae\u{301}x中 b2bc中x2🙂.c y-"
+  tree 1781b4789b1b520b 233
+  text 4d21a0101841c68c 463
+  actions 6aecf8f3a7fda034 177
+step 3 update w0 (4 nodes)
+  w0 cache-add n20
+  w0 object n0 child-added 3 n20
+  w0 object n15 bounds (48,233 117x40)
+  w0 object n15 description "ok"
+  w0 object n15 name "ok"
+  w0 object n9 text-removed 26 1 "a"
+  w0 register n0 0x0
+  w0 register n15 0x2
+  w0 register n18 0x0
+  w0 register n20 0x21
+  w0 unregister n0 0x0
+  w0 unregister n15 0x0
+  w0 unregister n18 0x0
+  tree 4c90370ef2e94182 270
+  text 43a3c7f6d13cb831 454
+  actions 063cd0843d9a50bc 199
+step 4 update w0 (10 nodes)
+  tree 4c90370ef2e94182 270
+  text 43a3c7f6d13cb831 454
+  actions 063cd0843d9a50bc 199
+step 5 update w0 (6 nodes)
+  w0 cache-add n23
+  w0 object n3 child-added 2 n23
+  w0 register n23 0xc0021
+  w0 register n3 0x0
+  w0 unregister n3 0x0
+  tree 6c38bb5ddb74b417 307
+  text d3aa6bd0a20e5ee7 818
+  actions b8ad0bcce0137313 246
+step 6 bounds w0
+  tree 91b4718b0556e694 307
+  text 7344c8d2ae541bfe 818
+  actions 5dfd4c735117f9bb 246
+step 7 update w0 (0 nodes)
+  tree 91b4718b0556e694 307
+  text 7344c8d2ae541bfe 818
+  actions 5dfd4c735117f9bb 246
+step 8 update w0 (2 nodes)
+  w0 object n18 bounds (60,89 23x37)
+  w0 object n18 state focusable true
+  w0 object n18 state indeterminate false
+  w0 object n18 value 87
+  w0 register n18 0x80002
+  w0 unregister n18 0x0
+  tree fc4fa0813953bae7 307
+  text 7344c8d2ae541bfe 818
+  actions 5dfd4c735117f9bb 246
+step 9 update w0 (2 nodes)
+  w0 object n23 name " 1xe\u{301} z 2\r\ny中🙂x -\r\n zßzcy \n"
+  w0 object n23 text-inserted 15 12 " -\r\n zßzcy \n"
+  w0 object n23 text-removed 15 19 "ß🙂z1 -\r\n zßzcy \n.aa"
+  w0 register n23 0x0
+  w0 unregister n23 0x0
+  tree 990702f906f2b6c2 307
+  text 3cb2be93de288700 755
+  actions 298bb7669df26816 246
+step 10 update w0 (1 nodes)
+  w0 cache-add n11
+  w0 object n11 state focused true
+  w0 object n23 bounds (112,150 98x52)
+  w0 object n23 state focusable true
+  w0 object n8 state focusable false
+  w0 object n8 state focused false
+  w0 register n11 0x1
+  w0 register n23 0x0
+  w0 register n8 0x0
+  w0 unregister n23 0x0
+  w0 unregister n8 0x0
+  tree 2a9f400e70b82d1d 329
+  text b8d3d7fb85d35712 755
+  actions 0907a7614be6dff9 268
+step 11 update w0 (0 nodes)
+  w0 cache-add n25
+  w0 cache-remove n11
+  w0 object n11 state defunct true
+  w0 object n11 state focused false
+  w0 object n25 state focused true
+  w0 register n25 0x1
+  w0 unregister n11 0x1
+  tree b9be472abec4e9b5 329
+  text b8d3d7fb85d35712 755
+  actions b4a61392134a776a 268
+step 12 update w0 (1 nodes)
+  w0 object n9 text-removed 25 19 " e\u{301}x中 b2bc中x2🙂.c e\u{301}"
+  w0 register n9 0x0
+  w0 unregister n9 0x0
+  tree b9be472abec4e9b5 329
+  text c6cf9a6efb6c135e 584
+  actions 0a029d57374e3fa4 268
+exit
+  w0 object root child-removed n0
+scenario generated 4
+step 0 open w0
+  w0 object n8 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x23
+  w0 register n14 0x21
+  w0 register n2 0x40023
+  w0 register n8 0x1
+  w0 register n9 0x40021
+  tree eb80b87477e68cc9 174
+  text 719d80dfa87eba36 323
+  actions 549ec40e7e11da50 158
+step 1 update w0 (2 nodes)
+  w0 object n9 announce "save" 2
+  w0 object n9 bounds (121,272 41x6)
+  w0 object n9 name "save"
+  w0 object n9 text-inserted 5 4 "xzx "
+  w0 register n9 0x0
+  w0 unregister n9 0x0
+  tree 5d26d2a244e80533 174
+  text c49b6f0af63fd500 359
+  actions e3b89c8ee405fa26 158
+step 2 update w0 (8 nodes)
+  tree 5d26d2a244e80533 174
+  text c49b6f0af63fd500 359
+  actions e3b89c8ee405fa26 158
+step 3 update w0 (8 nodes)
+  tree 5d26d2a244e80533 174
+  text c49b6f0af63fd500 359
+  actions e3b89c8ee405fa26 158
+step 4 update w0 (1 nodes)
+  w0 cache-remove n9
+  w0 object n0 child-removed n9
+  w0 object n9 state defunct true
+  w0 register n0 0x0
+  w0 register n14 0x0
+  w0 unregister n0 0x0
+  w0 unregister n14 0x0
+  w0 unregister n9 0x40021
+  tree 0f65133049ce33b8 137
+  text e1023a0cdb157daa 157
+  actions 50ce33ea1b087129 111
+step 5 update w0 (2 nodes)
+  w0 object n14 bounds (521,295 148x87)
+  w0 object n14 name "été"
+  w0 object n2 text-removed 0 11 "by1ß🙂1 1中 \n"
+  w0 register n14 0x0
+  w0 register n2 0x0
+  w0 register n8 0x0
+  w0 unregister n14 0x0
+  w0 unregister n2 0x0
+  w0 unregister n8 0x0
+  tree 504f508cc9546ee6 137
+  text ece77e0ebe1bc216 58
+  actions fd1fd4040bfe9ea7 111
+step 6 focus w0 true
+  tree 504f508cc9546ee6 137
+  text ece77e0ebe1bc216 58
+  actions fd1fd4040bfe9ea7 111
+step 7 update w0 (1 nodes)
+  w0 object n2 text-inserted 0 4 " -z🙂"
+  w0 register n8 0x0
+  w0 unregister n8 0x0
+  tree 504f508cc9546ee6 137
+  text 74451c24c28530f7 94
+  actions 6634b1f13423f001 111
+step 8 update w0 (0 nodes)
+  w0 cache-remove n8
+  w0 object n2 caret 0
+  w0 object n2 child-removed n8
+  w0 object n2 state focusable true
+  w0 object n2 state focused true
+  w0 object n8 state defunct true
+  w0 object n8 state focused false
+  w0 register n2 0x0
+  w0 unregister n2 0x0
+  w0 unregister n8 0x1
+  tree 3978db5727205d61 115
+  text 74451c24c28530f7 94
+  actions c3547925357b554b 89
+step 9 update w0 (0 nodes)
+  w0 object n14 state focusable true
+  w0 object n14 state focused true
+  w0 object n2 state focusable false
+  w0 object n2 state focused false
+  w0 register n14 0x0
+  w0 register n2 0x0
+  w0 unregister n14 0x0
+  w0 unregister n2 0x0
+  tree ad0fbfb387043d57 115
+  text 74451c24c28530f7 94
+  actions c3547925357b554b 89
+step 10 update w0 (1 nodes)
+  w0 object n2 text-inserted 3 4 ".2y "
+  tree ad0fbfb387043d57 115
+  text e9a371c52c8410a6 130
+  actions 78c09e7fddb25d51 89
+step 11 update w0 (0 nodes)
+  tree ad0fbfb387043d57 115
+  text e9a371c52c8410a6 130
+  actions 78c09e7fddb25d51 89
+step 12 update w0 (1 nodes)
+  w0 object n2 name "été"
+  w0 register n2 0x0
+  w0 unregister n2 0x2
+  tree 494efd540edd599b 115
+  text e9a371c52c8410a6 130
+  actions 78c09e7fddb25d51 89
+exit
+  w0 object root child-removed n0
+scenario generated 5
+step 0 open w0
+  w0 object n1 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x21
+  w0 register n1 0x40001
+  w0 register n5 0x21
+  tree a855694d911f1285 100
+  text f7ded06fbeb5a020 115
+  actions 2fe0998e6b11353f 89
+step 1 update w0 (2 nodes)
+  w0 cache-remove n5
+  w0 object n0 child-removed n5
+  w0 object n1 caret 3
+  w0 object n1 text-selection-changed
+  w0 object n5 state defunct true
+  w0 register n0 0x0
+  w0 register n1 0x0
+  w0 unregister n0 0x0
+  w0 unregister n1 0x0
+  w0 unregister n5 0x21
+  tree 9dc4cf1c1e17b336 63
+  text 2e0275940bf1f250 115
+  actions faed67147ba741b5 67
+step 2 update w0 (1 nodes)
+  w0 object n0 bounds (208,211 151x35)
+  w0 object n0 state checkable true
+  w0 object n0 state checked true
+  w0 object n0 state focusable false
+  w0 register n0 0x0
+  w0 unregister n0 0x0
+  tree 565d7211e11b4c45 63
+  text 2e0275940bf1f250 115
+  actions 0cf607cfa9dece6f 67
+step 3 update w0 (0 nodes)
+  w0 cache-add n4
+  w0 object n1 child-added 0 n4
+  w0 object n1 state focusable false
+  w0 object n1 state focused false
+  w0 object n4 state focused true
+  w0 register n1 0x0
+  w0 register n4 0x1
+  w0 unregister n1 0x0
+  tree aed6f4a2adfd4001 85
+  text 2e0275940bf1f250 115
+  actions f7f1d8860fc279bd 89
+step 4 update w0 (1 nodes)
+  w0 object n1 text-inserted 1 7 "🙂🙂.中 .z"
+  w0 object n1 text-removed 1 5 "中 .z1"
+  w0 register n4 0x0
+  w0 unregister n4 0x0
+  tree aed6f4a2adfd4001 85
+  text 70cbd98b53aeb476 133
+  actions 7bb36a5defb81964 89
+step 5 bounds w0
+  tree d4820ce67b3ce758 85
+  text 70cbd98b53aeb476 133
+  actions b672c11c32213fb6 89
+step 6 update w0 (1 nodes)
+  w0 cache-remove n4
+  w0 object n1 caret 3
+  w0 object n1 child-removed n4
+  w0 object n1 state focusable true
+  w0 object n1 state focused true
+  w0 object n1 text-removed 6 1 "."
+  w0 object n1 text-selection-changed
+  w0 object n4 state defunct true
+  w0 object n4 state focused false
+  w0 register n1 0x0
+  w0 unregister n1 0x0
+  w0 unregister n4 0x1
+  tree 0779ecccdea1eb1c 63
+  text 32e2519a4cb91625 124
+  actions 7baef899a0ea0dcc 67
+step 7 update w0 (0 nodes)
+  w0 object n0 state focusable true
+  w0 object n0 state focused true
+  w0 object n1 state focusable false
+  w0 object n1 state focused false
+  w0 register n0 0x0
+  w0 register n1 0x0
+  w0 unregister n0 0x0
+  w0 unregister n1 0x0
+  tree eb229517bef60e04 63
+  text 32e2519a4cb91625 124
+  actions 7baef899a0ea0dcc 67
+step 8 update w0 (2 nodes)
+  w0 object n1 text-inserted 3 13 " .aa🙂cé2ß-   "
+  w0 register n1 0x0
+  w0 unregister n1 0x0
+  tree eb229517bef60e04 63
+  text d96afcdbbc45a48b 241
+  actions d9e4c60408298177 67
+step 9 update w0 (1 nodes)
+  w0 object n0 bounds (184,7 0x0)
+  w0 object n0 name "logs"
+  w0 register n0 0x0
+  w0 unregister n0 0x0
+  tree 05ea7751fcb8a15d 63
+  text d96afcdbbc45a48b 241
+  actions 749cd7a217dbfd42 67
+step 10 update w0 (1 nodes)
+  w0 object n1 text-removed 7 5 "🙂cé2ß"
+  tree 05ea7751fcb8a15d 63
+  text 13df9593aa85bdb5 196
+  actions ee1e5d935ffacd80 67
+step 11 update w0 (1 nodes)
+  w0 object n1 text-inserted 10 7 "-é ß🙂éc"
+  tree 05ea7751fcb8a15d 63
+  text 0e4df07d953b299a 259
+  actions c4a9d9fd8b8d9299 67
+step 12 update w0 (0 nodes)
+  w0 cache-add n4
+  w0 object n0 state focused false
+  w0 object n4 state focused true
+  w0 register n0 0x0
+  w0 register n4 0x1
+  w0 unregister n0 0x0
+  tree 345f5c4b78f0b3d7 85
+  text 0e4df07d953b299a 259
+  actions 462bfd35d6882fc1 89
+exit
+  w0 object root child-removed n0
+scenario generated 6
+step 0 open w0
+  w0 object n23 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x23
+  w0 register n14 0x40023
+  w0 register n2 0x40021
+  w0 register n23 0x1
+  w0 register n26 0x3
+  w0 register n27 0x3
+  w0 register n281474976710688 0x1
+  w0 register n30 0x3
+  w0 register n35 0x21
+  w0 register n36 0x1
+  w0 register n38 0x21
+  w0 register n41 0x4021
+  w0 register n42 0x1
+  w0 register n45 0x1
+  w0 register n47 0x23
+  w0 register n48 0x3
+  tree 1ba81a9aff2d9063 446
+  text df3ac1a8fbdfac5a 593
+  actions 93b38b239117d01b 400
+step 1 open w1
+  w1 object root child-added 1 n0
+  w1 register n0 0x21
+  w1 register n49 0x4021
+  tree 20e1769fc671c944 518
+  text df3ac1a8fbdfac5a 593
+  actions 4422c0579c02c733 441
+step 2 update w0 (1 nodes)
+  w0 cache-remove n48
+  w0 object n41 child-removed n48
+  w0 object n41 selection-changed
+  w0 object n48 state defunct true
+  w0 register n41 0x0
+  w0 unregister n41 0x0
+  w0 unregister n48 0x3
+  tree ff850e0fb8836a9b 496
+  text df3ac1a8fbdfac5a 593
+  actions 8289c79fff7dd51f 419
+step 3 update w0 (22 nodes)
+  tree ff850e0fb8836a9b 496
+  text df3ac1a8fbdfac5a 593
+  actions 8289c79fff7dd51f 419
+step 4 update w0 (1 nodes)
+  w0 object n14 text-removed 1 8 "xy中中zc\n中"
+  w0 register n14 0x0
+  w0 register n23 0x0
+  w0 unregister n14 0x0
+  w0 unregister n23 0x0
+  tree ff850e0fb8836a9b 496
+  text 018a08e9ab2d8171 521
+  actions f21c96005f8774b4 419
+step 5 update w0 (2 nodes)
+  w0 object n281474976710688 bounds (104,150 100x15)
+  w0 object n281474976710688 name "save"
+  w0 object n281474976710688 state selectable false
+  w0 register n14 0x0
+  w0 register n281474976710688 0x20
+  w0 unregister n14 0x0
+  w0 unregister n281474976710688 0x0
+  tree 735e7a04d20d0bd9 511
+  text fb952072df529c9f 521
+  actions 866ff20b67e1c0e4 419
+step 6 update w0 (21 nodes)
+  tree 735e7a04d20d0bd9 511
+  text fb952072df529c9f 521
+  actions 866ff20b67e1c0e4 419
+step 7 update w0 (2 nodes)
+  w0 cache-remove n45
+  w0 object n23 bounds (333,118 139x16)
+  w0 object n23 name "été"
+  w0 object n41 child-removed n45
+  w0 object n45 state defunct true
+  w0 register n23 0x20
+  w0 register n41 0x0
+  w0 register n47 0x0
+  w0 unregister n23 0x0
+  w0 unregister n41 0x0
+  w0 unregister n45 0x1
+  w0 unregister n47 0x0
+  tree 0a707d429119ad04 504
+  text fb952072df529c9f 521
+  actions e5568f0ae9296e5a 397
+step 8 update w0 (2 nodes)
+  w0 object n14 bounds (335,143 180x17)
+  w0 object n14 description "save"
+  w0 object n14 name "logs"
+  w0 object n14 value 35
+  w0 object n2 text-inserted 6 2 "2 "
+  w0 register n14 0x80000
+  w0 unregister n14 0x2
+  tree 9853972b28df563e 504
+  text 293ef802bd9a5637 539
+  actions 11ec65ee3a110f9b 397
+step 9 update w0 (0 nodes)
+  tree 9853972b28df563e 504
+  text 293ef802bd9a5637 539
+  actions 11ec65ee3a110f9b 397
+step 10 update w0 (0 nodes)
+  w0 cache-remove n23
+  w0 object n0 state focused true
+  w0 object n23 state defunct true
+  w0 object n23 state focused false
+  w0 register n0 0x0
+  w0 unregister n0 0x0
+  w0 unregister n23 0x21
+  tree 6fa3ac811f52d2db 467
+  text 293ef802bd9a5637 539
+  actions e935c4b58dde2612 375
+step 11 update w0 (0 nodes)
+  tree 6fa3ac811f52d2db 467
+  text 293ef802bd9a5637 539
+  actions e935c4b58dde2612 375
+step 12 update w0 (0 nodes)
+  w0 object n0 state focused false
+  w0 object n38 state focusable true
+  w0 object n38 state focused true
+  w0 register n0 0x0
+  w0 register n38 0x0
+  w0 unregister n0 0x0
+  w0 unregister n38 0x0
+  tree e323062ba80aeb07 467
+  text 293ef802bd9a5637 539
+  actions e935c4b58dde2612 375
+step 13 update w0 (1 nodes)
+  w0 object n27 bounds (309,66 117x48)
+  w0 object n27 state checkable true
+  w0 object n27 value 63
+  w0 register n27 0x80020
+  w0 unregister n27 0x0
+  tree 5e3b14d3519b6743 482
+  text 293ef802bd9a5637 539
+  actions e935c4b58dde2612 375
+step 14 close w1
+  w1 object root child-removed n0
+  tree 32e24f8908f0de2f 410
+  text 293ef802bd9a5637 539
+  actions fb228342bb14a20e 334
+exit
+  w0 object root child-removed n0
+scenario generated 7
+step 0 open w0
+  w0 object n5 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x21
+  w0 register n11 0x80023
+  w0 register n12 0x23
+  w0 register n13 0x80023
+  w0 register n14 0x21
+  w0 register n281474976710659 0x4021
+  w0 register n281474976710660 0x23
+  w0 register n5 0x21
+  w0 register n7 0x21
+  w0 register n8 0x1
+  tree ff8d5acd0ae5fc21 359
+  text cbf29ce484222325 0
+  actions 6ebafa7699bc5b06 218
+step 1 update w0 (10 nodes)
+  tree bf660e1784b091d2 359
+  text cbf29ce484222325 0
+  actions 6ebafa7699bc5b06 218
+step 2 update w0 (10 nodes)
+  tree bf660e1784b091d2 359
+  text cbf29ce484222325 0
+  actions 6ebafa7699bc5b06 218
+step 3 update w0 (0 nodes)
+  tree bf660e1784b091d2 359
+  text cbf29ce484222325 0
+  actions 6ebafa7699bc5b06 218
+step 4 update w0 (0 nodes)
+  w0 object n5 state focused false
+  w0 object n8 state focusable true
+  w0 object n8 state focused true
+  w0 register n5 0x0
+  w0 register n8 0x0
+  w0 unregister n5 0x0
+  w0 unregister n8 0x0
+  tree 90db5fb8f59a7752 359
+  text cbf29ce484222325 0
+  actions 6ebafa7699bc5b06 218
+step 5 focus w0 false
+  w0 object n0 state active false
+  w0 object n8 state focused false
+  w0 register n8 0x0
+  w0 unregister n8 0x0
+  w0 window n0 "" deactivated
+  tree 707ed58923e94a31 359
+  text cbf29ce484222325 0
+  actions 6ebafa7699bc5b06 218
+step 6 update w0 (10 nodes)
+  tree 707ed58923e94a31 359
+  text cbf29ce484222325 0
+  actions 6ebafa7699bc5b06 218
+step 7 update w0 (10 nodes)
+  tree 707ed58923e94a31 359
+  text cbf29ce484222325 0
+  actions 6ebafa7699bc5b06 218
+step 8 update w0 (10 nodes)
+  tree 707ed58923e94a31 359
+  text cbf29ce484222325 0
+  actions 6ebafa7699bc5b06 218
+step 9 update w0 (5 nodes)
+  w0 cache-add n16
+  w0 cache-add n19
+  w0 cache-add n20
+  w0 cache-add n21
+  w0 object n11 child-added 0 n16
+  w0 register n11 0x0
+  w0 register n16 0x23
+  w0 register n19 0x21
+  w0 register n20 0x21
+  w0 register n21 0x21
+  w0 unregister n11 0x0
+  tree 542bd3f5be84774f 507
+  text cbf29ce484222325 0
+  actions 45ad384ded3aaab9 306
+step 10 update w0 (1 nodes)
+  w0 cache-remove n8
+  w0 object n281474976710659 child-removed n8
+  w0 object n281474976710659 state focusable true
+  w0 object n8 state defunct true
+  w0 register n281474976710659 0x0
+  w0 unregister n281474976710659 0x0
+  w0 unregister n8 0x1
+  tree 751824dd4dbc4f30 485
+  text cbf29ce484222325 0
+  actions 705618f2be0d3086 284
+step 11 update w0 (0 nodes)
+  tree 751824dd4dbc4f30 485
+  text cbf29ce484222325 0
+  actions 705618f2be0d3086 284
+step 12 update w0 (1 nodes)
+  w0 object n11 announce "" 1
+  w0 object n11 name ""
+  w0 object n11 state focusable true
+  w0 register n11 0x0
+  w0 unregister n11 0x2
+  tree b01234f7473b0b8a 485
+  text cbf29ce484222325 0
+  actions 705618f2be0d3086 284
+exit
+  w0 object root child-removed n0
+scenario generated 8
+step 0 open w0
+  w0 object root child-added 0 n0
+  w0 register n0 0x21
+  w0 register n3 0x40023
+  w0 register n8 0x80021
+  w0 register n9 0x40001
+  tree 8e30a8b1753062b5 122
+  text 9d50c8b0b11e9197 308
+  actions d8140d2afdee01a1 136
+step 1 focus w0 true
+  w0 object n0 state active true
+  w0 object n9 caret 7
+  w0 object n9 state focused true
+  w0 object root active-descendant n0
+  w0 register n9 0x0
+  w0 unregister n9 0x0
+  w0 window n0 "ok" activated
+  tree 1190db4405848de1 122
+  text 9d50c8b0b11e9197 308
+  actions d8140d2afdee01a1 136
+step 2 update w0 (1 nodes)
+  tree 1190db4405848de1 122
+  text 9d50c8b0b11e9197 308
+  actions d8140d2afdee01a1 136
+step 3 update w0 (1 nodes)
+  w0 object n0 state focusable true
+  w0 object n0 state focused true
+  w0 object n3 text-inserted 4 8 ".x. yxxé"
+  w0 object n9 state focusable false
+  w0 object n9 state focused false
+  w0 register n0 0x0
+  w0 register n9 0x0
+  w0 unregister n0 0x0
+  w0 unregister n9 0x0
+  tree 0fdfa122e0bef3df 122
+  text 0bfe68e3d076292b 380
+  actions d9b4d1d02c0be182 136
+step 4 focus w0 false
+  w0 object n0 state active false
+  w0 object n0 state focused false
+  w0 register n0 0x0
+  w0 unregister n0 0x0
+  w0 window n0 "ok" deactivated
+  tree e1dbec7f98b3fa80 122
+  text 0bfe68e3d076292b 380
+  actions d9b4d1d02c0be182 136
+step 5 update w0 (7 nodes)
+  tree e1dbec7f98b3fa80 122
+  text 0bfe68e3d076292b 380
+  actions d9b4d1d02c0be182 136
+step 6 update w0 (7 nodes)
+  tree e1dbec7f98b3fa80 122
+  text 0bfe68e3d076292b 380
+  actions d9b4d1d02c0be182 136
+step 7 update w0 (7 nodes)
+  tree e1dbec7f98b3fa80 122
+  text 0bfe68e3d076292b 380
+  actions d9b4d1d02c0be182 136
+step 8 update w0 (3 nodes)
+  w0 object n0 name "logs"
+  w0 register n0 0x0
+  w0 unregister n0 0x0
+  tree eb8ddef74c356643 122
+  text 0bfe68e3d076292b 380
+  actions d9b4d1d02c0be182 136
+step 9 update w0 (3 nodes)
+  w0 object n9 text-inserted 2 13 "-2ze\u{301}y-.e\u{301} 🙂中"
+  w0 register n3 0x0
+  w0 register n9 0x0
+  w0 unregister n3 0x0
+  w0 unregister n9 0x0
+  tree eb8ddef74c356643 122
+  text ec815bc2d66af3c0 497
+  actions bc3730c36bfe0c3f 136
+step 10 update w0 (7 nodes)
+  tree eb8ddef74c356643 122
+  text ec815bc2d66af3c0 497
+  actions bc3730c36bfe0c3f 136
+step 11 update w0 (0 nodes)
+  tree eb8ddef74c356643 122
+  text ec815bc2d66af3c0 497
+  actions bc3730c36bfe0c3f 136
+step 12 update w0 (7 nodes)
+  tree eb8ddef74c356643 122
+  text ec815bc2d66af3c0 497
+  actions bc3730c36bfe0c3f 136
+exit
+  w0 object root child-removed n0
+scenario generated 9
+step 0 open w0
+  w0 object n10 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x21
+  w0 register n1 0x4021
+  w0 register n10 0x84021
+  w0 register n11 0x21
+  w0 register n17 0x80021
+  w0 register n18 0x4021
+  w0 register n19 0x21
+  w0 register n22 0x21
+  w0 register n23 0x1
+  w0 register n26 0x21
+  w0 register n281474976710663 0x80021
+  w0 register n281474976710670 0x4023
+  w0 register n281474976710685 0x4023
+  w0 register n3 0x3
+  w0 register n4 0x21
+  tree 34e77a250b11c5fb 529
+  text cbf29ce484222325 0
+  actions ef6fa4d5b7b4f0e8 328
+step 1 update w0 (1 nodes)
+  w0 object n0 name "save"
+  w0 register n0 0x0
+  w0 unregister n0 0x0
+  tree 5648e0cfb438070d 529
+  text cbf29ce484222325 0
+  actions ef6fa4d5b7b4f0e8 328
+step 2 update w0 (15 nodes)
+  tree 5648e0cfb438070d 529
+  text cbf29ce484222325 0
+  actions ef6fa4d5b7b4f0e8 328
+step 3 update w0 (5 nodes)
+  w0 cache-add n30
+  w0 cache-add n31
+  w0 cache-add n34
+  w0 cache-add n36
+  w0 object n281474976710663 child-added 0 n30
+  w0 object n30 selection-changed
+  w0 object n31 announce "" 1
+  w0 register n281474976710663 0x0
+  w0 register n30 0x4001
+  w0 register n31 0x3
+  w0 register n34 0x1
+  w0 register n36 0x23
+  w0 unregister n281474976710663 0x0
+  tree a1cf491469881c38 632
+  text cbf29ce484222325 0
+  actions 0f4f399540016112 416
+step 4 update w0 (0 nodes)
+  w0 object n10 state focusable false
+  w0 object n10 state focused false
+  w0 object n4 state focusable true
+  w0 object n4 state focused true
+  w0 register n10 0x0
+  w0 register n4 0x0
+  w0 unregister n10 0x0
+  w0 unregister n4 0x0
+  tree 2d85282afcbfce68 632
+  text cbf29ce484222325 0
+  actions 0f4f399540016112 416
+step 5 bounds w0
+  tree a442527368af1bf7 632
+  text cbf29ce484222325 0
+  actions c21dd3cbe9ce1166 416
+step 6 update w0 (1 nodes)
+  w0 object n22 state focusable true
+  w0 object n22 state focused true
+  w0 object n4 state focusable false
+  w0 object n4 state focused false
+  w0 register n18 0x0
+  w0 register n19 0x0
+  w0 register n22 0x0
+  w0 register n23 0x0
+  w0 register n4 0x0
+  w0 unregister n18 0x0
+  w0 unregister n19 0x0
+  w0 unregister n22 0x0
+  w0 unregister n23 0x0
+  w0 unregister n4 0x0
+  tree 379eea1ed92abdbf 632
+  text cbf29ce484222325 0
+  actions e932085b134465b2 416
+step 7 update w0 (1 nodes)
+  w0 object n4 bounds (335,103 135x13)
+  w0 object n4 state checkable true
+  w0 object n4 state indeterminate true
+  w0 register n4 0x0
+  w0 unregister n4 0x0
+  tree bd6293182c1e513a 632
+  text cbf29ce484222325 0
+  actions e932085b134465b2 416
+step 8 update w0 (19 nodes)
+  tree bd6293182c1e513a 632
+  text cbf29ce484222325 0
+  actions e932085b134465b2 416
+step 9 update w0 (0 nodes)
+  w0 object n22 state focusable false
+  w0 object n22 state focused false
+  w0 object n281474976710685 state focusable true
+  w0 object n281474976710685 state focused true
+  w0 register n22 0x0
+  w0 register n281474976710685 0x0
+  w0 unregister n22 0x0
+  w0 unregister n281474976710685 0x0
+  tree c47b1091d3850372 632
+  text cbf29ce484222325 0
+  actions e932085b134465b2 416
+step 10 update w0 (0 nodes)
+  tree c47b1091d3850372 632
+  text cbf29ce484222325 0
+  actions e932085b134465b2 416
+step 11 update w0 (1 nodes)
+  w0 cache-remove n18
+  w0 cache-remove n19
+  w0 cache-remove n22
+  w0 cache-remove n23
+  w0 object n17 child-removed n18
+  w0 object n17 state focusable true
+  w0 object n17 state focused true
+  w0 object n18 state defunct true
+  w0 object n19 state defunct true
+  w0 object n22 state defunct true
+  w0 object n23 state defunct true
+  w0 object n281474976710685 state focusable false
+  w0 object n281474976710685 state focused false
+  w0 register n17 0x0
+  w0 register n26 0x0
+  w0 register n281474976710685 0x0
+  w0 unregister n17 0x0
+  w0 unregister n18 0x4021
+  w0 unregister n19 0x21
+  w0 unregister n22 0x21
+  w0 unregister n23 0x1
+  w0 unregister n26 0x0
+  w0 unregister n281474976710685 0x0
+  tree a3b6f1effd4396ef 499
+  text cbf29ce484222325 0
+  actions 8eacf0e87b640bd9 328
+step 12 update w0 (0 nodes)
+  w0 object n11 state focusable true
+  w0 object n11 state focused true
+  w0 object n17 state focusable false
+  w0 object n17 state focused false
+  w0 register n11 0x0
+  w0 register n17 0x0
+  w0 unregister n11 0x0
+  w0 unregister n17 0x0
+  tree fc566fa871fa7ff9 499
+  text cbf29ce484222325 0
+  actions 8eacf0e87b640bd9 328
+exit
+  w0 object root child-removed n0
+scenario generated 10
+step 0 open w0
+  w0 object root child-added 0 n0
+  w0 register n0 0x21
+  w0 register n11 0x80001
+  w0 register n12 0x21
+  w0 register n13 0x80021
+  w0 register n24 0x21
+  w0 register n25 0xc0003
+  w0 register n281474976710662 0x23
+  w0 register n281474976710672 0x40001
+  w0 register n3 0x4001
+  w0 register n8 0x3
+  tree f362a558edcfc3f1 299
+  text 1e48e9d209cb5aa6 302
+  actions 45c8457864758c42 268
+step 1 update w0 (2 nodes)
+  w0 cache-remove n281474976710662
+  w0 object n25 text-inserted 1 13 "ze\u{301} ézßßbßaéß"
+  w0 object n281474976710662 state defunct true
+  w0 object n3 child-removed n281474976710662
+  w0 register n11 0x0
+  w0 register n3 0x0
+  w0 register n8 0x0
+  w0 unregister n11 0x0
+  w0 unregister n281474976710662 0x23
+  w0 unregister n3 0x0
+  w0 unregister n8 0x0
+  tree 0de220851746ef05 262
+  text c6a86f12a2e0434d 419
+  actions 45a6e6116c14087d 246
+step 2 update w0 (13 nodes)
+  tree 0de220851746ef05 262
+  text c6a86f12a2e0434d 419
+  actions 45a6e6116c14087d 246
+step 3 update w0 (2 nodes)
+  w0 object n11 bounds (308,235 20x56)
+  w0 object n11 description "Find"
+  w0 object n11 state focusable false
+  w0 object n11 state selectable true
+  w0 object n12 bounds (213,121 33x33)
+  w0 object n12 state checkable true
+  w0 object n12 state focusable true
+  w0 register n11 0x20
+  w0 register n12 0x0
+  w0 unregister n11 0x0
+  w0 unregister n12 0x0
+  tree 9cdeef045bf2e437 277
+  text c6a86f12a2e0434d 419
+  actions fbb621801cdd7c4d 246
+step 4 update w0 (1 nodes)
+  w0 register n281474976710672 0x0
+  w0 unregister n281474976710672 0x0
+  tree 9cdeef045bf2e437 277
+  text f08822e59b429222 419
+  actions 26e26e967371a56b 246
+step 5 bounds w0
+  tree b930aff338ee7a9c 277
+  text 509bb4735d1f88f2 419
+  actions 67926c995a847f77 246
+step 6 update w0 (1 nodes)
+  tree 7d166d359053da9c 277
+  text 509bb4735d1f88f2 419
+  actions 67926c995a847f77 246
+step 7 update w0 (13 nodes)
+  tree 7d166d359053da9c 277
+  text 509bb4735d1f88f2 419
+  actions 67926c995a847f77 246
+step 8 focus w0 false
+  tree 7d166d359053da9c 277
+  text 509bb4735d1f88f2 419
+  actions 67926c995a847f77 246
+step 9 update w0 (13 nodes)
+  tree 7d166d359053da9c 277
+  text 509bb4735d1f88f2 419
+  actions 67926c995a847f77 246
+step 10 update w0 (0 nodes)
+  tree 7d166d359053da9c 277
+  text 509bb4735d1f88f2 419
+  actions 67926c995a847f77 246
+step 11 update w0 (1 nodes)
+  w0 object n281474976710672 text-removed 2 1 "2"
+  tree 7d166d359053da9c 277
+  text c7db61393e3267bc 410
+  actions b29d1a1a67315266 246
+step 12 update w0 (0 nodes)
+  tree 7d166d359053da9c 277
+  text c7db61393e3267bc 410
+  actions b29d1a1a67315266 246
+exit
+  w0 object root child-removed n0
+scenario generated 11
+step 0 open w0
+  w0 object n281474976710658 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x23
+  w0 register n12 0x84023
+  w0 register n281474976710658 0x80021
+  w0 register n281474976710659 0x40021
+  tree c1fdd16f8df05baf 152
+  text fb4a3bb0308e5a71 490
+  actions 2bcda9494b1ba156 111
+step 1 update w0 (2 nodes)
+  w0 object n0 name "zsh"
+  w0 object n0 state focusable true
+  w0 object n281474976710658 state focusable false
+  w0 object n281474976710658 state focused false
+  w0 object n281474976710659 caret 10
+  w0 object n281474976710659 state focusable true
+  w0 object n281474976710659 state focused true
+  w0 register n0 0x0
+  w0 register n281474976710658 0x0
+  w0 register n281474976710659 0x0
+  w0 unregister n0 0x2
+  w0 unregister n281474976710658 0x0
+  w0 unregister n281474976710659 0x0
+  tree 081ba382ad9a8cf5 152
+  text d315e9d08e972373 490
+  actions 8d880f3ad95dcc1f 111
+step 2 focus w0 false
+  w0 object n0 state active false
+  w0 object n281474976710659 state focused false
+  w0 register n281474976710659 0x0
+  w0 unregister n281474976710659 0x0
+  w0 window n0 "zsh" deactivated
+  tree bf89eebecd8d690c 152
+  text d315e9d08e972373 490
+  actions 8d880f3ad95dcc1f 111
+step 3 update w0 (1 nodes)
+  tree b876bcdccd0c54e4 152
+  text e526e870644af47a 490
+  actions 8d880f3ad95dcc1f 111
+step 4 update w0 (1 nodes)
+  w0 object n281474976710658 bounds (327,171 159x7)
+  w0 object n281474976710658 name "été"
+  w0 object n281474976710658 state enabled false
+  w0 object n281474976710658 state read-only true
+  w0 object n281474976710658 state sensitive false
+  w0 object n281474976710658 value 96
+  w0 register n281474976710658 0x2
+  w0 unregister n281474976710658 0x0
+  tree ef35b7d4c28f8148 152
+  text e526e870644af47a 490
+  actions 8d880f3ad95dcc1f 111
+step 5 update w0 (1 nodes)
+  tree ef35b7d4c28f8148 152
+  text e526e870644af47a 490
+  actions 8d880f3ad95dcc1f 111
+step 6 update w0 (0 nodes)
+  tree ef35b7d4c28f8148 152
+  text e526e870644af47a 490
+  actions 8d880f3ad95dcc1f 111
+step 7 update w0 (1 nodes)
+  tree ef35b7d4c28f8148 152
+  text df51a35647584de6 490
+  actions b6ed5f64f2e9fa02 111
+step 8 update w0 (1 nodes)
+  w0 object n281474976710659 text-removed 40 3 ". z"
+  tree fdde28dcc7e2457c 152
+  text 7e610ce64042e23d 463
+  actions ea3f8e4e840fb90b 111
+step 9 update w0 (2 nodes)
+  w0 object n281474976710659 text-inserted 33 8 "\r\n cß e\u{301}"
+  w0 object n281474976710659 text-removed 33 11 "21\r\n cß e\u{301} "
+  tree fb13161eda4f99db 152
+  text b5f743c43035ff6d 436
+  actions b2157b06c4328340 111
+step 10 update w0 (6 nodes)
+  w0 cache-add n15
+  w0 object n0 child-added 2 n15
+  w0 register n0 0x0
+  w0 register n12 0x0
+  w0 register n15 0x40021
+  w0 unregister n0 0x0
+  w0 unregister n12 0x0
+  tree 1288a2d96cdfdbef 189
+  text a019b57d95c0dfbc 755
+  actions cb0ca95a900e70de 158
+step 11 update w0 (1 nodes)
+  tree 1288a2d96cdfdbef 189
+  text a019b57d95c0dfbc 755
+  actions cb0ca95a900e70de 158
+step 12 update w0 (1 nodes)
+  w0 register n281474976710659 0x0
+  w0 unregister n281474976710659 0x0
+  tree 1288a2d96cdfdbef 189
+  text a5701240264ccf55 755
+  actions 58fae7eab493d9fe 158
+exit
+  w0 object root child-removed n0
+scenario generated 12
+step 0 open w0
+  w0 object n281474976710662 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x21
+  w0 register n2 0x4021
+  w0 register n281474976710661 0x40001
+  w0 register n281474976710662 0x1
+  tree eec449820b3b4002 122
+  text c14f23ad57901a65 124
+  actions b135e02e3ee8b8fe 111
+step 1 update w0 (3 nodes)
+  w0 object n0 bounds (171,199 17x27)
+  w0 object n0 name ""
+  w0 object n281474976710661 name "z22cx-..y  中"
+  w0 object n281474976710661 text-inserted 9 3 "  中"
+  w0 register n0 0x0
+  w0 register n281474976710661 0x0
+  w0 unregister n0 0x0
+  w0 unregister n281474976710661 0x0
+  tree 20472f7e82638599 122
+  text 27174d2c60f1eccc 151
+  actions 046c2025c3cb000c 111
+step 2 update w0 (1 nodes)
+  tree 20472f7e82638599 122
+  text 27174d2c60f1eccc 151
+  actions 046c2025c3cb000c 111
+step 3 update w0 (5 nodes)
+  w0 cache-add n11
+  w0 object n0 child-added 1 n11
+  w0 register n0 0x0
+  w0 register n11 0x40021
+  w0 register n281474976710661 0x0
+  w0 unregister n0 0x0
+  w0 unregister n281474976710661 0x0
+  tree a3d7c90aef8387c3 159
+  text 96451c7319493fb1 443
+  actions 4152d5d9ff260d0a 158
+step 4 update w0 (1 nodes)
+  w0 cache-add n15
+  w0 cache-remove n281474976710661
+  w0 cache-remove n281474976710662
+  w0 object n0 child-removed n281474976710661
+  w0 object n15 state focused true
+  w0 object n281474976710661 state defunct true
+  w0 object n281474976710662 state defunct true
+  w0 object n281474976710662 state focused false
+  w0 register n0 0x0
+  w0 register n15 0x1
+  w0 unregister n0 0x0
+  w0 unregister n281474976710661 0x40001
+  w0 unregister n281474976710662 0x1
+  tree bdb305d9db54473e 137
+  text a60cfb2e66ba4672 292
+  actions a72527df543db055 111
+step 5 bounds w0
+  tree 7c18b46bab4289d9 137
+  text 95a7af2c0f10db57 292
+  actions 63613b5cfa1c2a58 111
+step 6 update w0 (6 nodes)
+  tree 7c18b46bab4289d9 137
+  text 95a7af2c0f10db57 292
+  actions 63613b5cfa1c2a58 111
+step 7 update w0 (6 nodes)
+  w0 cache-add n16
+  w0 object n0 bounds (62,0 125x0)
+  w0 object n0 state checkable true
+  w0 object n0 state indeterminate true
+  w0 object n2 child-added 0 n16
+  w0 register n0 0x0
+  w0 register n16 0x40021
+  w0 register n2 0x0
+  w0 unregister n0 0x0
+  w0 unregister n2 0x0
+  tree 3c6252af239b3c2f 174
+  text cff432521e9eefc1 566
+  actions b87a33d2345512eb 158
+step 8 update w0 (1 nodes)
+  w0 object n16 text-inserted 12 1 "y"
+  tree 3c6252af239b3c2f 174
+  text 5b4d6d9ebaf29c21 575
+  actions 50f6a77dfcf1274d 158
+step 9 update w0 (0 nodes)
+  w0 cache-add n12
+  w0 cache-remove n15
+  w0 object n12 state focused true
+  w0 object n15 state defunct true
+  w0 object n15 state focused false
+  w0 register n12 0x21
+  w0 unregister n15 0x1
+  tree a1b151a4d5216b47 189
+  text 5b4d6d9ebaf29c21 575
+  actions 609437cc5f2c5a8b 158
+step 10 update w0 (2 nodes)
+  w0 cache-add n24
+  w0 object n2 child-added 1 n24
+  w0 register n2 0x0
+  w0 register n24 0x1
+  w0 unregister n2 0x0
+  tree 88d2445aa1985683 211
+  text 5b4d6d9ebaf29c21 575
+  actions 5df6c759d1a38237 180
+step 11 update w0 (11 nodes)
+  tree 88d2445aa1985683 211
+  text 5b4d6d9ebaf29c21 575
+  actions 5df6c759d1a38237 180
+step 12 update w0 (6 nodes)
+  w0 cache-add n26
+  w0 object n2 child-added 1 n26
+  w0 object n26 announce "ok" 1
+  w0 register n2 0x0
+  w0 register n24 0x0
+  w0 register n26 0x40001
+  w0 unregister n2 0x0
+  w0 unregister n24 0x0
+  tree 52a244d9f3d1dfc1 233
+  text d0983f9df6b4a679 906
+  actions f811bf3a3b0edbe3 227
+exit
+  w0 object root child-removed n0
+scenario generated 13
+step 0 open w0
+  w0 object n7 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x21
+  w0 register n281474976710659 0x40023
+  w0 register n7 0x21
+  tree db3157380c3effd9 100
+  text 0789fc30969eaa95 175
+  actions adf648a762d6f8ce 89
+step 1 update w0 (1 nodes)
+  w0 cache-remove n7
+  w0 object n281474976710659 caret 2
+  w0 object n281474976710659 child-removed n7
+  w0 object n281474976710659 state focusable true
+  w0 object n281474976710659 state focused true
+  w0 object n281474976710659 text-removed 5 1 "\n"
+  w0 object n281474976710659 text-selection-changed
+  w0 object n7 state defunct true
+  w0 object n7 state focused false
+  w0 register n281474976710659 0x0
+  w0 unregister n281474976710659 0x0
+  w0 unregister n7 0x21
+  tree 7a60a23c3edc6305 63
+  text f50a6699a31fde61 166
+  actions 08bcaf27c1278f3b 67
+step 2 focus w0 false
+  w0 object n0 state active false
+  w0 object n281474976710659 state focused false
+  w0 register n281474976710659 0x0
+  w0 unregister n281474976710659 0x0
+  w0 window n0 "Find" deactivated
+  tree ba28d30d876f0476 63
+  text f50a6699a31fde61 166
+  actions 08bcaf27c1278f3b 67
+step 3 update w0 (1 nodes)
+  w0 object n281474976710659 text-removed 0 3 ".  "
+  tree ba28d30d876f0476 63
+  text d493798aa4a1c6f0 139
+  actions fbdf116853f991e0 67
+step 4 update w0 (1 nodes)
+  w0 cache-remove n281474976710659
+  w0 object n0 child-removed n281474976710659
+  w0 object n0 state focusable true
+  w0 object n281474976710659 state defunct true
+  w0 register n0 0x0
+  w0 unregister n0 0x0
+  w0 unregister n281474976710659 0x40023
+  tree 90e3de9682bcfc53 26
+  text cbf29ce484222325 0
+  actions be90e7d8cb38624b 20
+step 5 update w0 (0 nodes)
+  tree 90e3de9682bcfc53 26
+  text cbf29ce484222325 0
+  actions be90e7d8cb38624b 20
+step 6 update w0 (1 nodes)
+  tree 90e3de9682bcfc53 26
+  text cbf29ce484222325 0
+  actions be90e7d8cb38624b 20
+step 7 update w0 (1 nodes)
+  w0 register n0 0x0
+  w0 unregister n0 0x0
+  tree 90e3de9682bcfc53 26
+  text cbf29ce484222325 0
+  actions be90e7d8cb38624b 20
+step 8 update w0 (1 nodes)
+  tree 90e3de9682bcfc53 26
+  text cbf29ce484222325 0
+  actions be90e7d8cb38624b 20
+step 9 update w0 (0 nodes)
+  tree 90e3de9682bcfc53 26
+  text cbf29ce484222325 0
+  actions be90e7d8cb38624b 20
+step 10 update w0 (1 nodes)
+  tree 90e3de9682bcfc53 26
+  text cbf29ce484222325 0
+  actions be90e7d8cb38624b 20
+step 11 update w0 (1 nodes)
+  w0 object n0 bounds (10,8 123x58)
+  w0 register n0 0x2
+  w0 unregister n0 0x0
+  tree ef0904eef3e32693 41
+  text cbf29ce484222325 0
+  actions be90e7d8cb38624b 20
+step 12 update w0 (6 nodes)
+  w0 cache-add n10
+  w0 cache-add n12
+  w0 object n0 child-added 0 n10
+  w0 register n0 0x0
+  w0 register n10 0x21
+  w0 register n12 0x40021
+  w0 unregister n0 0x0
+  tree b20086a6aad3ee87 115
+  text 19e7978f8eee68d1 355
+  actions 1e4c85d36cb36bd7 89
+exit
+  w0 object root child-removed n0
+scenario generated 14
+step 0 open w0
+  w0 object root child-added 0 n0
+  w0 register n0 0x23
+  w0 register n3 0x21
+  tree 89798e517cbe3d6e 63
+  text cbf29ce484222325 0
+  actions cfd65254b0396644 42
+step 1 update w0 (1 nodes)
+  w0 object n3 bounds (185,85 129x58)
+  w0 register n3 0x0
+  w0 unregister n3 0x0
+  tree 1ad63f219fcc95dc 63
+  text cbf29ce484222325 0
+  actions cfd65254b0396644 42
+step 2 update w0 (5 nodes)
+  w0 cache-add n6
+  w0 object n0 child-added 0 n6
+  w0 register n0 0x0
+  w0 register n3 0x0
+  w0 register n6 0x40001
+  w0 unregister n0 0x0
+  w0 unregister n3 0x0
+  tree a44d1b6e62b10cf4 85
+  text 1af1a31e6de57a57 169
+  actions 8895c9382c9a07ea 89
+step 3 update w0 (6 nodes)
+  tree a44d1b6e62b10cf4 85
+  text 1af1a31e6de57a57 169
+  actions 8895c9382c9a07ea 89
+step 4 update w0 (2 nodes)
+  w0 register n3 0x0
+  w0 unregister n3 0x0
+  tree a44d1b6e62b10cf4 85
+  text 1af1a31e6de57a57 169
+  actions 8895c9382c9a07ea 89
+step 5 focus w0 false
+  tree a44d1b6e62b10cf4 85
+  text 1af1a31e6de57a57 169
+  actions 8895c9382c9a07ea 89
+step 6 update w0 (1 nodes)
+  tree a44d1b6e62b10cf4 85
+  text 1af1a31e6de57a57 169
+  actions 8895c9382c9a07ea 89
+step 7 update w0 (0 nodes)
+  tree a44d1b6e62b10cf4 85
+  text 1af1a31e6de57a57 169
+  actions 8895c9382c9a07ea 89
+step 8 update w0 (1 nodes)
+  w0 object n6 text-inserted 0 6 "🙂ß-cé1"
+  tree a44d1b6e62b10cf4 85
+  text 3fbbb667ba535043 223
+  actions eff3a74423ff868f 89
+step 9 update w0 (1 nodes)
+  w0 object n6 state focusable true
+  w0 register n6 0x0
+  w0 unregister n6 0x0
+  tree 382723a0db151bb4 85
+  text 95825b55f43151a6 223
+  actions d6005914f30f57cd 89
+step 10 update w0 (2 nodes)
+  w0 object n6 text-removed 8 1 "y"
+  w0 register n6 0x0
+  w0 unregister n6 0x0
+  tree 382723a0db151bb4 85
+  text 36813a17d6635f9b 214
+  actions 57466a679569280e 89
+step 11 update w0 (5 nodes)
+  w0 cache-add n16
+  w0 object n0 child-added 0 n16
+  w0 object n6 state focusable false
+  w0 register n0 0x0
+  w0 register n16 0x40003
+  w0 register n3 0x0
+  w0 register n6 0x0
+  w0 unregister n0 0x0
+  w0 unregister n3 0x0
+  w0 unregister n6 0x0
+  tree 88759b089ce08011 107
+  text d118fb0f68d4e8c4 563
+  actions e1919b5db69b4415 136
+step 12 update w0 (0 nodes)
+  tree 88759b089ce08011 107
+  text d118fb0f68d4e8c4 563
+  actions e1919b5db69b4415 136
+exit
+  w0 object root child-removed n0
+scenario generated 15
+step 0 open w0
+  w0 object root child-added 0 n0
+  w0 register n0 0x23
+  w0 register n11 0x40021
+  w0 register n19 0x40023
+  w0 register n29 0x21
+  w0 register n3 0x21
+  w0 register n30 0x1
+  w0 register n5 0x4023
+  w0 register n6 0x23
+  w0 register n9 0x3
+  tree c0a2d87af9aff274 292
+  text 23f22f9b201cd3b5 503
+  actions c4497cc68f2768ec 246
+step 1 open w1
+  w1 object root child-added 1 n0
+  w1 register n0 0x21
+  w1 register n32 0x3
+  w1 register n33 0x21
+  w1 register n35 0x21
+  w1 register n38 0x21
+  w1 register n40 0x23
+  tree 19101f0d84ca7ec4 497
+  text 23f22f9b201cd3b5 503
+  actions 20ae82c369eb90ed 375
+step 2 update w0 (1 nodes)
+  w0 object n11 text-inserted 10 9 "y -c🙂zyé中"
+  w0 object n11 text-removed 10 2 " -"
+  tree fa1a11e05b00b51a 497
+  text 0d178bb4ed57901d 566
+  actions 21712b7fb366bc5d 375
+step 3 bounds w0
+  tree 8ff46f8e161efa7a 512
+  text a0f72d9ecfa2f8b1 566
+  actions dfb7efe81b9af228 375
+step 4 update w0 (1 nodes)
+  w0 register n5 0x0
+  w0 register n6 0x0
+  w0 register n9 0x0
+  w0 unregister n5 0x0
+  w0 unregister n6 0x0
+  w0 unregister n9 0x0
+  tree 6ac191d290c08c4c 512
+  text a0f72d9ecfa2f8b1 566
+  actions 522fa5a8b1ab410e 375
+step 5 update w0 (2 nodes)
+  w0 register n19 0x0
+  w0 unregister n19 0x0
+  tree 6ac191d290c08c4c 512
+  text 39bba729ad37e1ef 566
+  actions 010365abede7cfe6 375
+step 6 bounds w0
+  tree c79e660493c8a7a1 512
+  text 26b5799c160b856e 566
+  actions 56265cf039cf172a 375
+step 7 update w0 (2 nodes)
+  w0 register n19 0x0
+  w0 unregister n19 0x0
+  tree c79e660493c8a7a1 512
+  text 8e48a86e5a45fb25 566
+  actions 837d40739e6738fa 375
+step 8 update w0 (3 nodes)
+  w0 object n11 text-inserted 20 16 "ze\u{301}e\u{301} zß中e\u{301}c--y "
+  w0 object n19 text-removed 2 8 "aya121 🙂"
+  w0 register n19 0x0
+  w0 unregister n19 0x0
+  tree 379d6a3d7c362598 512
+  text 5ec84d1f8306e770 638
+  actions 24d27351bce18a5b 375
+step 9 update w0 (2 nodes)
+  w0 object n11 text-inserted 6 7 "ze\u{301}é  🙂"
+  w0 object n19 text-removed 12 2 "1."
+  tree b695d0259ebc062e 512
+  text 7295bf4d12a559e6 683
+  actions 23e35ac9c4de8730 375
+step 10 update w0 (2 nodes)
+  w0 cache-add n43
+  w0 object n3 child-added 0 n43
+  w0 object n43 announce "Find" 2
+  w0 register n3 0x0
+  w0 register n43 0x21
+  w0 unregister n3 0x0
+  tree 6f43bea9def25945 549
+  text 7295bf4d12a559e6 683
+  actions 6417c26318b2b6c1 397
+step 11 bounds w0
+  tree d687ec4af511dc64 549
+  text 71429d06b999bc88 683
+  actions 0210cc841934908d 397
+step 12 update w0 (18 nodes)
+  tree d687ec4af511dc64 549
+  text 71429d06b999bc88 683
+  actions 0210cc841934908d 397
+step 13 focus w1 false
+  tree d687ec4af511dc64 549
+  text 71429d06b999bc88 683
+  actions 0210cc841934908d 397
+step 14 close w1
+  w1 object root child-removed n0
+  tree df5994486a8a6547 344
+  text 71429d06b999bc88 683
+  actions bfff86afd8ea1f4c 268
+exit
+  w0 object root child-removed n0
+scenario generated 16
+step 0 open w0
+  w0 object n26 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x80021
+  w0 register n11 0x1
+  w0 register n14 0x3
+  w0 register n17 0xc0001
+  w0 register n2 0x40021
+  w0 register n21 0x40021
+  w0 register n24 0x40021
+  w0 register n26 0x21
+  tree 450e6db44cac72aa 240
+  text b16677102ebad0a2 793
+  actions a597dcfa8eac24dc 274
+step 1 update w0 (0 nodes)
+  tree 380c1e0d92203795 240
+  text b16677102ebad0a2 793
+  actions a597dcfa8eac24dc 274
+step 2 bounds w0
+  tree a133e3bdc501f183 255
+  text 50fc6f1c0613843d 793
+  actions db9bcfd38d0617d4 274
+step 3 update w0 (18 nodes)
+  tree a133e3bdc501f183 255
+  text 50fc6f1c0613843d 793
+  actions db9bcfd38d0617d4 274
+step 4 focus w0 true
+  tree a133e3bdc501f183 255
+  text 50fc6f1c0613843d 793
+  actions db9bcfd38d0617d4 274
+step 5 bounds w0
+  tree 0e054e7d34f106b0 255
+  text 3f5348ddd3ad40ad 793
+  actions 0dfbc0d1fa66ddb9 274
+step 6 update w0 (2 nodes)
+  w0 object n2 text-removed 1 9 "2ébz1ß z "
+  w0 register n2 0x0
+  w0 unregister n2 0x0
+  tree 0e054e7d34f106b0 255
+  text cc1499a5fa7a0c44 712
+  actions f29fecfa06350d51 274
+step 7 update w0 (2 nodes)
+  w0 cache-remove n11
+  w0 object n0 child-removed n11
+  w0 object n11 state defunct true
+  w0 object n21 text-inserted 2 16 "e\u{301}-e\u{301}z éaz1ye\u{301}中b"
+  w0 register n0 0x0
+  w0 register n14 0x0
+  w0 register n24 0x0
+  w0 unregister n0 0x0
+  w0 unregister n11 0x1
+  w0 unregister n14 0x0
+  w0 unregister n24 0x0
+  tree 7811c2998ce02ffa 233
+  text bac81ed1c5ecf729 856
+  actions ad78d663aa3e14f7 252
+step 8 bounds w0
+  tree 18a9e4dad6a2a268 233
+  text b738fdb3676a4bee 856
+  actions 9526f468c8ffeae3 252
+step 9 update w0 (1 nodes)
+  w0 object n24 text-removed 2 1 " "
+  w0 register n26 0x0
+  w0 unregister n26 0x0
+  tree 18a9e4dad6a2a268 233
+  text eec8150f8378f17c 847
+  actions bbb82dd4ee0e52e9 252
+step 10 update w0 (1 nodes)
+  w0 register n2 0x0
+  w0 unregister n2 0x0
+  tree 18a9e4dad6a2a268 233
+  text a9749347a69f77e5 847
+  actions 36a5232fb507f58d 252
+step 11 update w0 (2 nodes)
+  w0 object n2 text-removed 4 3 "🙂🙂ß"
+  w0 register n14 0x0
+  w0 register n17 0x0
+  w0 register n2 0x0
+  w0 register n21 0x0
+  w0 unregister n14 0x0
+  w0 unregister n17 0x0
+  w0 unregister n2 0x0
+  w0 unregister n21 0x0
+  tree cbd2a803805bd5cc 233
+  text fa3157d48fa6d72f 820
+  actions f25e31d79dbc2747 252
+step 12 update w0 (1 nodes)
+  w0 register n17 0x0
+  w0 unregister n17 0x0
+  tree cbd2a803805bd5cc 233
+  text 908b5d892c4695df 820
+  actions bfd1fa4676ab533b 252
+exit
+  w0 object root child-removed n0
+scenario generated 17
+step 0 open w0
+  w0 object n31 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x21
+  w0 register n12 0x23
+  w0 register n13 0x4001
+  w0 register n15 0x1
+  w0 register n18 0x1
+  w0 register n19 0x23
+  w0 register n20 0x21
+  w0 register n23 0x1
+  w0 register n25 0x1
+  w0 register n27 0x21
+  w0 register n281474976710659 0x1
+  w0 register n281474976710684 0x21
+  w0 register n281474976710686 0x80001
+  w0 register n31 0x21
+  w0 register n6 0x4001
+  w0 register n8 0x23
+  w0 register n9 0x21
+  tree 3a1360659e88b979 513
+  text cbf29ce484222325 0
+  actions 65278babf5abb54d 372
+step 1 open w1
+  w1 object root child-added 1 n0
+  w1 register n0 0x21
+  w1 register n281474976710702 0x40003
+  w1 register n281474976710718 0x21
+  w1 register n33 0x84001
+  w1 register n36 0x80001
+  w1 register n39 0x1
+  w1 register n42 0x1
+  w1 register n45 0x23
+  w1 register n56 0x1
+  w1 register n59 0x23
+  w1 register n63 0x1
+  w1 register n66 0x1
+  w1 register n67 0x21
+  w1 register n69 0x21
+  tree 95ecb3521e6c0bbe 909
+  text 8e3b1c912e7c9e99 196
+  actions 05e3c39e62af2a7c 702
+step 2 update w0 (0 nodes)
+  tree 95ecb3521e6c0bbe 909
+  text 8e3b1c912e7c9e99 196
+  actions 05e3c39e62af2a7c 702
+step 3 update w0 (0 nodes)
+  tree 95ecb3521e6c0bbe 909
+  text 8e3b1c912e7c9e99 196
+  actions 05e3c39e62af2a7c 702
+step 4 update w0 (0 nodes)
+  w0 object n20 state focusable true
+  w0 object n20 state focused true
+  w0 object n31 state focusable false
+  w0 object n31 state focused false
+  w0 register n20 0x0
+  w0 register n31 0x0
+  w0 unregister n20 0x0
+  w0 unregister n31 0x0
+  tree 5d609fade83c4dd8 909
+  text 8e3b1c912e7c9e99 196
+  actions 05e3c39e62af2a7c 702
+step 5 update w0 (17 nodes)
+  tree 5d609fade83c4dd8 909
+  text 8e3b1c912e7c9e99 196
+  actions 05e3c39e62af2a7c 702
+step 6 update w0 (1 nodes)
+  w0 object n281474976710686 bounds (143,99 96x46)
+  w0 object n281474976710686 name "save"
+  w0 object n281474976710686 state enabled true
+  w0 object n281474976710686 state read-only false
+  w0 object n281474976710686 state sensitive true
+  w0 object n281474976710686 value 66
+  w0 register n281474976710686 0x22
+  w0 unregister n281474976710686 0x0
+  tree eb9ae504570ccb76 924
+  text 8e3b1c912e7c9e99 196
+  actions 05e3c39e62af2a7c 702
+step 7 update w0 (3 nodes)
+  w0 cache-add n71
+  w0 cache-add n72
+  w0 object n12 child-added 0 n71
+  w0 object n19 state focusable true
+  w0 object n19 state focused true
+  w0 object n20 state focusable false
+  w0 object n20 state focused false
+  w0 register n12 0x0
+  w0 register n19 0x0
+  w0 register n20 0x0
+  w0 register n71 0x4001
+  w0 register n72 0x1
+  w0 unregister n12 0x0
+  w0 unregister n19 0x0
+  w0 unregister n20 0x0
+  tree af1035317a0bcec2 968
+  text 8e3b1c912e7c9e99 196
+  actions 30b773b11032ebdc 746
+step 8 bounds w0
+  tree 325b14953d19f37b 968
+  text 8e3b1c912e7c9e99 196
+  actions e982de001bcefa7c 746
+step 9 bounds w0
+  tree db358d80ae653f07 968
+  text 8e3b1c912e7c9e99 196
+  actions 9c69cd597fd6c0ec 746
+step 10 update w0 (7 nodes)
+  w0 cache-add n74
+  w0 cache-add n75
+  w0 cache-add n77
+  w0 cache-add n85
+  w0 object n281474976710684 child-added 0 n74
+  w0 register n281474976710684 0x0
+  w0 register n74 0x21
+  w0 register n75 0x23
+  w0 register n77 0x40001
+  w0 register n85 0x21
+  w0 unregister n281474976710684 0x0
+  tree db58e71fb1b3e021 1101
+  text 8e6a3a1a2a1a0a4b 365
+  actions 504c2bc6d8c166f3 859
+step 11 update w0 (1 nodes)
+  w0 object n77 text-inserted 0 6 " 🙂 ée\u{301}"
+  tree 7b55e1940b5b9c73 1101
+  text fee2a70e93c1e2cc 419
+  actions 4553814bf209f0ae 859
+step 12 update w0 (2 nodes)
+  w0 object n74 name "zsh"
+  w0 register n15 0x0
+  w0 register n74 0x0
+  w0 unregister n15 0x0
+  w0 unregister n74 0x0
+  tree abbd4e8a912dce99 1101
+  text fee2a70e93c1e2cc 419
+  actions 4553814bf209f0ae 859
+step 13 update w0 (0 nodes)
+  w0 object n19 state focusable false
+  w0 object n19 state focused false
+  w0 object n8 state focusable true
+  w0 object n8 state focused true
+  w0 register n19 0x0
+  w0 register n8 0x0
+  w0 unregister n19 0x0
+  w0 unregister n8 0x0
+  tree 4aadd3998946d267 1101
+  text fee2a70e93c1e2cc 419
+  actions 4553814bf209f0ae 859
+step 14 close w1
+  w1 object root child-removed n0
+  tree af02c3570d44aa11 705
+  text 12cff85f2a176660 223
+  actions b2def73b2c854d6f 529
+exit
+  w0 object root child-removed n0
+scenario generated 18
+step 0 open w0
+  w0 object root child-added 0 n0
+  w0 register n0 0x21
+  w0 register n2 0x4003
+  w0 register n3 0x21
+  w0 register n6 0x1
+  tree 531a50be90691882 122
+  text cbf29ce484222325 0
+  actions 39d38d3c803956a2 86
+step 1 update w0 (0 nodes)
+  tree 5ebd0956d8024d9b 122
+  text cbf29ce484222325 0
+  actions 39d38d3c803956a2 86
+step 2 update w0 (3 nodes)
+  w0 cache-add n281474976710664
+  w0 object n281474976710664 announce "ok" 1
+  w0 object n3 child-added 0 n281474976710664
+  w0 object n6 bounds (290,24 91x6)
+  w0 register n281474976710664 0x4023
+  w0 register n3 0x0
+  w0 register n6 0x20
+  w0 unregister n3 0x0
+  w0 unregister n6 0x0
+  tree aa2cb48c788c4c66 174
+  text cbf29ce484222325 0
+  actions f6c1e4962a996405 108
+step 3 update w0 (1 nodes)
+  w0 register n0 0x0
+  w0 unregister n0 0x0
+  tree aa2cb48c788c4c66 174
+  text cbf29ce484222325 0
+  actions f6c1e4962a996405 108
+step 4 update w0 (0 nodes)
+  tree 08f2c55a663d9d76 174
+  text cbf29ce484222325 0
+  actions f6c1e4962a996405 108
+step 5 update w0 (1 nodes)
+  w0 object n0 bounds (371,62 120x43)
+  w0 object n0 name "zsh"
+  w0 object n0 state checkable true
+  w0 register n0 0x0
+  w0 unregister n0 0x0
+  tree 29317e8ce0b0d4b7 174
+  text cbf29ce484222325 0
+  actions eb47e506b4ca490b 108
+step 6 update w0 (0 nodes)
+  tree 29317e8ce0b0d4b7 174
+  text cbf29ce484222325 0
+  actions eb47e506b4ca490b 108
+step 7 update w0 (0 nodes)
+  tree 9f72771bd9ec4757 174
+  text cbf29ce484222325 0
+  actions eb47e506b4ca490b 108
+step 8 update w0 (0 nodes)
+  tree 9f72771bd9ec4757 174
+  text cbf29ce484222325 0
+  actions eb47e506b4ca490b 108
+step 9 update w0 (2 nodes)
+  w0 cache-add n10
+  w0 object n6 child-added 0 n10
+  w0 object n6 state focusable true
+  w0 register n10 0x21
+  w0 register n6 0x0
+  w0 unregister n6 0x0
+  tree 170ee2103ec62959 211
+  text cbf29ce484222325 0
+  actions 96d6379ff44c9fb2 130
+step 10 update w0 (2 nodes)
+  w0 cache-remove n10
+  w0 object n10 state defunct true
+  w0 object n2 description "zsh"
+  w0 object n2 name "save"
+  w0 object n2 state checkable true
+  w0 object n2 state focusable true
+  w0 object n2 state indeterminate true
+  w0 object n6 child-removed n10
+  w0 register n2 0x0
+  w0 register n6 0x0
+  w0 unregister n10 0x21
+  w0 unregister n2 0x2
+  w0 unregister n6 0x0
+  tree e117d293eec39b48 174
+  text cbf29ce484222325 0
+  actions eb47e506b4ca490b 108
+step 11 update w0 (2 nodes)
+  w0 object n2 name "logs"
+  w0 object n2 state focusable false
+  w0 register n0 0x0
+  w0 register n2 0x0
+  w0 unregister n0 0x0
+  w0 unregister n2 0x0
+  tree 6e253b0f4410a17e 174
+  text cbf29ce484222325 0
+  actions eb47e506b4ca490b 108
+step 12 update w0 (4 nodes)
+  w0 cache-add n12
+  w0 cache-add n14
+  w0 cache-add n17
+  w0 object n17 announce "Find" 2
+  w0 object n2 child-added 0 n12
+  w0 register n12 0x84023
+  w0 register n14 0x21
+  w0 register n17 0x1
+  w0 register n2 0x0
+  w0 register n3 0x0
+  w0 register n6 0x0
+  w0 unregister n2 0x0
+  w0 unregister n3 0x0
+  w0 unregister n6 0x0
+  tree 1e70a8b8d859d728 270
+  text cbf29ce484222325 0
+  actions c9487306fd352f48 174
+exit
+  w0 object root child-removed n0
+scenario generated 19
+step 0 open w0
+  w0 object root child-added 0 n0
+  w0 register n0 0x21
+  w0 register n11 0x40023
+  w0 register n13 0x80023
+  w0 register n16 0x23
+  w0 register n19 0x4023
+  w0 register n22 0x21
+  w0 register n24 0x1
+  w0 register n27 0x21
+  w0 register n281474976710658 0x1
+  w0 register n281474976710662 0x1
+  w0 register n281474976710677 0x21
+  w0 register n3 0x1
+  w0 register n4 0x84021
+  w0 register n7 0x21
+  w0 register n8 0x1
+  tree cd22ec6272b8b0bc 484
+  text 21b39db41cca2233 148
+  actions 08af1cfdc52c9f90 353
+step 1 update w0 (6 nodes)
+  w0 cache-add n30
+  w0 cache-add n33
+  w0 cache-add n35
+  w0 cache-add n38
+  w0 object n13 state checkable true
+  w0 object n13 state checked true
+  w0 object n281474976710677 child-added 0 n30
+  w0 object n33 announce "Find" 2
+  w0 object n38 announce "logs" 2
+  w0 register n13 0x0
+  w0 register n281474976710677 0x0
+  w0 register n30 0x4021
+  w0 register n33 0x1
+  w0 register n35 0x21
+  w0 register n38 0x21
+  w0 unregister n13 0x2
+  w0 unregister n281474976710677 0x0
+  tree 6297c111264084b6 617
+  text 21b39db41cca2233 148
+  actions 09527e6e4421f5d6 441
+step 2 update w0 (3 nodes)
+  w0 cache-add n281474976710696
+  w0 object n16 child-added 0 n281474976710696
+  w0 object n281474976710696 announce "" 2
+  w0 register n11 0x0
+  w0 register n16 0x0
+  w0 register n281474976710696 0x80001
+  w0 unregister n11 0x0
+  w0 unregister n16 0x0
+  tree f98f08f7e45d7875 639
+  text c3b343eca1307851 148
+  actions 1a64d4c3e8ef256f 463
+step 3 update w0 (2 nodes)
+  w0 object n11 bounds (382,173 44x31)
+  w0 object n11 description "logs"
+  w0 object n11 name "ßéa-z11-y"
+  w0 object n11 text-removed 8 1 "a"
+  w0 register n11 0x0
+  w0 unregister n11 0x0
+  tree 5743bd38558b4ff2 639
+  text 4c7cdb72bddb10eb 139
+  actions 74f158d016c7f302 463
+step 4 update w0 (2 nodes)
+  w0 object n11 name "ßéa-z1-y"
+  w0 object n11 text-removed 6 1 "1"
+  w0 register n11 0x0
+  w0 unregister n11 0x2
+  tree ba7dbc9391b68d30 639
+  text e55bc7a002502985 130
+  actions 53cf5f51a0ddec87 463
+step 5 update w0 (1 nodes)
+  w0 object n11 text-removed 0 7 "ßéa-z1-"
+  tree 4802b8a3fe0bdd14 639
+  text 81cc4f6c761b7658 67
+  actions bd384050e98e80a5 463
+step 6 update w0 (2 nodes)
+  w0 object n11 state focusable true
+  w0 object n27 announce "logs" 2
+  w0 object n27 bounds (424,228 298x78)
+  w0 object n27 name "logs"
+  w0 object n27 state focusable false
+  w0 object n27 state selectable false
+  w0 register n11 0x0
+  w0 register n27 0x0
+  w0 unregister n11 0x0
+  w0 unregister n27 0x0
+  tree 7a3d094a66155f64 639
+  text 0075fcc69fa3fcdf 67
+  actions d248d443d32dc3bd 463
+step 7 focus w0 false
+  tree 7a3d094a66155f64 639
+  text 0075fcc69fa3fcdf 67
+  actions d248d443d32dc3bd 463
+step 8 update w0 (2 nodes)
+  w0 cache-remove n30
+  w0 cache-remove n33
+  w0 cache-remove n35
+  w0 cache-remove n38
+  w0 object n11 state focusable false
+  w0 object n281474976710677 child-removed n30
+  w0 object n30 state defunct true
+  w0 object n33 state defunct true
+  w0 object n35 state defunct true
+  w0 object n38 state defunct true
+  w0 register n11 0x0
+  w0 register n281474976710677 0x0
+  w0 unregister n11 0x0
+  w0 unregister n281474976710677 0x0
+  w0 unregister n30 0x4021
+  w0 unregister n33 0x1
+  w0 unregister n35 0x21
+  w0 unregister n38 0x21
+  tree 5e5dc5b15d3cadb4 506
+  text 0075fcc69fa3fcdf 67
+  actions cee742b9d3b33b9b 375
+step 9 update w0 (0 nodes)
+  tree 5e5dc5b15d3cadb4 506
+  text 0075fcc69fa3fcdf 67
+  actions cee742b9d3b33b9b 375
+step 10 update w0 (7 nodes)
+  w0 cache-add n281474976710700
+  w0 cache-add n43
+  w0 cache-add n47
+  w0 cache-add n48
+  w0 object n11 announce " y" 2
+  w0 object n11 name " y"
+  w0 object n11 state focusable true
+  w0 object n11 text-inserted 0 1 " "
+  w0 object n281474976710696 child-added 0 n43
+  w0 register n11 0x0
+  w0 register n281474976710696 0x0
+  w0 register n281474976710700 0x21
+  w0 register n43 0x1
+  w0 register n47 0x21
+  w0 register n48 0x3
+  w0 unregister n11 0x0
+  w0 unregister n281474976710696 0x0
+  tree 45246f233442051d 624
+  text a4be133c1c14fa2a 76
+  actions b81e39ee340e20ad 463
+step 11 update w0 (2 nodes)
+  w0 object n11 announce " 🙂x y" 2
+  w0 object n11 name " 🙂x y"
+  w0 object n11 text-inserted 1 3 "🙂x "
+  w0 register n11 0x0
+  w0 unregister n11 0x0
+  tree 7f73aa7d16b4eecf 624
+  text 72140535a2a3b527 103
+  actions 12304bacc270ed8c 463
+step 12 update w0 (2 nodes)
+  w0 cache-add n49
+  w0 object n4 child-added 2 n49
+  w0 register n4 0x0
+  w0 register n49 0x21
+  w0 unregister n4 0x0
+  tree 75b53e20e2f47139 661
+  text 72140535a2a3b527 103
+  actions 8c00328b62c6a997 485
+exit
+  w0 object root child-removed n0
+scenario generated 20
+step 0 open w0
+  w0 object root child-added 0 n0
+  w0 register n0 0x23
+  w0 register n3 0x4003
+  tree be9c5cd1382a113e 63
+  text cbf29ce484222325 0
+  actions 717c8c049f999410 42
+step 1 update w0 (0 nodes)
+  tree a53431c84003cf8d 63
+  text cbf29ce484222325 0
+  actions 717c8c049f999410 42
+step 2 update w0 (0 nodes)
+  tree a53431c84003cf8d 63
+  text cbf29ce484222325 0
+  actions 717c8c049f999410 42
+step 3 update w0 (0 nodes)
+  tree a53431c84003cf8d 63
+  text cbf29ce484222325 0
+  actions 717c8c049f999410 42
+step 4 update w0 (7 nodes)
+  w0 cache-add n13
+  w0 cache-add n281474976710665
+  w0 cache-add n6
+  w0 object n13 announce "cyz \nba 中.ß- yy" 2
+  w0 object n3 child-added 0 n6
+  w0 object n6 announce "logs" 2
+  w0 register n13 0x40021
+  w0 register n281474976710665 0x40001
+  w0 register n3 0x0
+  w0 register n6 0x1
+  w0 unregister n3 0x0
+  tree 6efd255bf97a66d7 144
+  text 70a6e66274e84f2f 236
+  actions 98e5ed82ce891b4b 158
+step 5 update w0 (1 nodes)
+  w0 object n13 text-inserted 0 7 " 1e\u{301}cz "
+  w0 object n13 text-removed 0 1 "c"
+  tree c9008c615d8d16be 144
+  text a3789e27a19c245a 290
+  actions 6f470254193f7c3a 158
+step 6 focus w0 false
+  tree c9008c615d8d16be 144
+  text a3789e27a19c245a 290
+  actions 6f470254193f7c3a 158
+step 7 update w0 (1 nodes)
+  w0 object n13 text-removed 20 1 "y"
+  tree bb133bea67d2b6d9 144
+  text 2e8b542648023289 281
+  actions f208a3828f85f7cd 158
+step 8 update w0 (1 nodes)
+  w0 register n13 0x0
+  w0 unregister n13 0x0
+  tree bb133bea67d2b6d9 144
+  text d2fd6c666d2a295d 281
+  actions b6e165d1292f573d 158
+step 9 update w0 (0 nodes)
+  tree d211be47a0f2d379 144
+  text d2fd6c666d2a295d 281
+  actions b6e165d1292f573d 158
+step 10 bounds w0
+  tree 9083496caa991a46 144
+  text 91c774618453e031 281
+  actions 59eb481cf631d9e7 158
+step 11 focus w0 true
+  w0 object n0 state active true
+  w0 object n13 caret 0
+  w0 object n13 state focused true
+  w0 object n13 text-selection-changed
+  w0 object root active-descendant n0
+  w0 register n13 0x0
+  w0 unregister n13 0x0
+  w0 window n0 "" activated
+  tree 8f8250be3ebf09c7 144
+  text 91c774618453e031 281
+  actions 59eb481cf631d9e7 158
+step 12 update w0 (0 nodes)
+  w0 object n0 state focusable true
+  w0 object n0 state focused true
+  w0 object n13 state focusable false
+  w0 object n13 state focused false
+  w0 register n0 0x0
+  w0 register n13 0x0
+  w0 unregister n0 0x0
+  w0 unregister n13 0x0
+  tree cadafa8d6e5095a3 144
+  text 91c774618453e031 281
+  actions 59eb481cf631d9e7 158
+exit
+  w0 object root child-removed n0
+scenario generated 21
+step 0 open w0
+  w0 object n12 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x21
+  w0 register n12 0x21
+  w0 register n13 0x80023
+  w0 register n15 0x21
+  w0 register n17 0x1
+  w0 register n2 0x3
+  w0 register n281474976710675 0x80021
+  w0 register n5 0x21
+  w0 register n8 0x4021
+  w0 register n9 0x80001
+  tree 041a72d3591743e3 329
+  text cbf29ce484222325 0
+  actions b4fac6ff2c695bcb 218
+step 1 open w1
+  w1 object root child-added 1 n0
+  w1 register n0 0x23
+  w1 register n21 0x4021
+  w1 register n24 0x21
+  w1 register n27 0x21
+  w1 register n29 0x40001
+  tree 8f1b37e3c613e723 482
+  text 452972fe38501b90 142
+  actions c824c6ad548d679a 350
+step 2 update w0 (0 nodes)
+  w0 object n12 state focused false
+  w0 object n281474976710675 state focusable true
+  w0 object n281474976710675 state focused true
+  w0 register n12 0x0
+  w0 register n281474976710675 0x0
+  w0 unregister n12 0x0
+  w0 unregister n281474976710675 0x0
+  tree 59e463a17360d8c7 482
+  text 452972fe38501b90 142
+  actions c824c6ad548d679a 350
+step 3 focus w1 true
+  w1 object n0 state active true
+  w1 object n24 state focused true
+  w1 object root active-descendant n0
+  w1 register n24 0x0
+  w1 unregister n24 0x0
+  w1 window n0 "zsh" activated
+  tree b4b2ea6eb43e71dc 482
+  text 452972fe38501b90 142
+  actions c824c6ad548d679a 350
+step 4 update w0 (1 nodes)
+  w0 cache-remove n17
+  w0 object n17 state defunct true
+  w0 object n5 child-removed n17
+  w0 register n281474976710675 0x0
+  w0 register n5 0x0
+  w0 unregister n17 0x1
+  w0 unregister n281474976710675 0x0
+  w0 unregister n5 0x0
+  tree 279285a41dc89dc6 460
+  text 452972fe38501b90 142
+  actions f99aff9655a5b8ca 328
+step 5 update w0 (1 nodes)
+  w0 register n12 0x2
+  w0 unregister n12 0x0
+  tree 35b82ebb1c7629bb 460
+  text 452972fe38501b90 142
+  actions 8eaabe6aa01cf046 328
+step 6 update w0 (1 nodes)
+  w0 cache-remove n9
+  w0 object n15 state focusable true
+  w0 object n15 state focused true
+  w0 object n281474976710675 state focusable false
+  w0 object n281474976710675 state focused false
+  w0 object n8 child-removed n9
+  w0 object n9 state defunct true
+  w0 register n12 0x0
+  w0 register n13 0x0
+  w0 register n15 0x0
+  w0 register n281474976710675 0x0
+  w0 register n8 0x0
+  w0 unregister n12 0x0
+  w0 unregister n13 0x0
+  w0 unregister n15 0x0
+  w0 unregister n281474976710675 0x0
+  w0 unregister n8 0x0
+  w0 unregister n9 0x80001
+  tree 9744e8781b698e3e 438
+  text 452972fe38501b90 142
+  actions e708e019027ec0e4 306
+step 7 update w0 (0 nodes)
+  w0 object n12 state focused true
+  w0 object n15 state focusable false
+  w0 object n15 state focused false
+  w0 register n12 0x0
+  w0 register n15 0x0
+  w0 unregister n12 0x0
+  w0 unregister n15 0x0
+  tree 8aec813973a84fac 438
+  text 452972fe38501b90 142
+  actions e708e019027ec0e4 306
+step 8 update w0 (6 nodes)
+  w0 cache-add n35
+  w0 cache-add n37
+  w0 cache-add n38
+  w0 cache-add n41
+  w0 object n2 child-added 0 n35
+  w0 object n35 announce "zsh" 1
+  w0 object n38 announce "été" 1
+  w0 object n41 announce "ok" 1
+  w0 object n5 bounds (344,119 178x23)
+  w0 object n5 name "zsh"
+  w0 object n5 state checkable true
+  w0 register n2 0x0
+  w0 register n35 0x4003
+  w0 register n37 0x1
+  w0 register n38 0x1
+  w0 register n41 0x21
+  w0 register n5 0x0
+  w0 unregister n2 0x0
+  w0 unregister n5 0x0
+  tree 92267256bdf86ba8 541
+  text 452972fe38501b90 142
+  actions a44e9e91cfe13752 394
+step 9 update w0 (1 nodes)
+  w0 register n12 0x0
+  w0 register n15 0x0
+  w0 register n8 0x0
+  w0 unregister n12 0x0
+  w0 unregister n15 0x0
+  w0 unregister n8 0x0
+  tree bf241d2853531e70 541
+  text 452972fe38501b90 142
+  actions 74efc38890b1964a 394
+step 10 update w0 (12 nodes)
+  tree bf241d2853531e70 541
+  text 452972fe38501b90 142
+  actions 74efc38890b1964a 394
+step 11 bounds w0
+  tree 50246afb4b40b8a9 541
+  text 452972fe38501b90 142
+  actions 0ab7b1f6b25c7c11 394
+step 12 update w0 (2 nodes)
+  w0 cache-remove n12
+  w0 cache-remove n13
+  w0 cache-remove n15
+  w0 cache-remove n281474976710675
+  w0 cache-remove n5
+  w0 cache-remove n8
+  w0 object n0 child-removed n5
+  w0 object n0 state focused true
+  w0 object n12 state defunct true
+  w0 object n12 state focused false
+  w0 object n13 state defunct true
+  w0 object n15 state defunct true
+  w0 object n281474976710675 state defunct true
+  w0 object n37 state focusable false
+  w0 object n5 state defunct true
+  w0 object n8 state defunct true
+  w0 register n0 0x0
+  w0 register n37 0x0
+  w0 unregister n0 0x0
+  w0 unregister n12 0x23
+  w0 unregister n13 0x80023
+  w0 unregister n15 0x21
+  w0 unregister n281474976710675 0x80021
+  w0 unregister n37 0x0
+  w0 unregister n5 0x21
+  w0 unregister n8 0x4021
+  tree bfb3dc87b0b03f94 319
+  text 452972fe38501b90 142
+  actions 78cbda45b8d6e481 262
+step 13 update w0 (6 nodes)
+  tree bfb3dc87b0b03f94 319
+  text 452972fe38501b90 142
+  actions 78cbda45b8d6e481 262
+step 14 close w1
+  w1 object root child-removed n0
+  tree 54e971b3647c8004 166
+  text cbf29ce484222325 0
+  actions 69ee7d29d5385f6e 130
+exit
+  w0 object root child-removed n0
+scenario generated 22
+step 0 open w0
+  w0 object root child-added 0 n0
+  w0 register n0 0x23
+  w0 register n2 0x401
+  w0 register n3 0x23
+  w0 register n4 0x4021
+  w0 register n5 0x21
+  tree 552307dae9533562 174
+  text cbf29ce484222325 0
+  actions eef07f8453a230f9 108
+step 1 open w1
+  w1 object root child-added 1 n0
+  w1 register n0 0x21
+  w1 register n22 0x1
+  w1 register n25 0x1
+  w1 register n281474976710674 0x40021
+  w1 register n281474976710683 0x1
+  w1 register n6 0xc0003
+  tree 138234e4e3c5339e 334
+  text ece45ab366dafe9a 758
+  actions 1d8afe6d4c1d5b35 287
+step 2 update w0 (7 nodes)
+  w0 cache-add n30
+  w0 cache-add n33
+  w0 cache-add n36
+  w0 cache-add n38
+  w0 cache-add n41
+  w0 object n4 bounds (82,53 140x18)
+  w0 object n4 name "save"
+  w0 object n4 state focusable true
+  w0 object n5 child-added 0 n30
+  w0 register n30 0x4001
+  w0 register n33 0x1
+  w0 register n36 0x21
+  w0 register n38 0x80023
+  w0 register n4 0x0
+  w0 register n41 0x1
+  w0 register n5 0x0
+  w0 unregister n4 0x0
+  w0 unregister n5 0x0
+  tree 3b5cafef2018990f 474
+  text ece45ab366dafe9a 758
+  actions f2db6805e3280b3e 397
+step 3 update w0 (4 nodes)
+  w0 cache-add n281474976710699
+  w0 cache-add n45
+  w0 cache-add n48
+  w0 object n30 child-added 1 n281474976710699
+  w0 register n281474976710699 0x80021
+  w0 register n30 0x0
+  w0 register n36 0x0
+  w0 register n38 0x0
+  w0 register n41 0x0
+  w0 register n45 0x1
+  w0 register n48 0x23
+  w0 unregister n30 0x0
+  w0 unregister n36 0x0
+  w0 unregister n38 0x0
+  w0 unregister n41 0x0
+  tree 540b3d7d47d84bd1 570
+  text ece45ab366dafe9a 758
+  actions d750c225713c8648 463
+step 4 update w0 (1 nodes)
+  w0 cache-remove n281474976710699
+  w0 cache-remove n30
+  w0 cache-remove n33
+  w0 cache-remove n36
+  w0 cache-remove n38
+  w0 cache-remove n41
+  w0 cache-remove n45
+  w0 cache-remove n48
+  w0 cache-remove n5
+  w0 object n281474976710699 state defunct true
+  w0 object n30 state defunct true
+  w0 object n33 state defunct true
+  w0 object n36 state defunct true
+  w0 object n38 state defunct true
+  w0 object n4 child-removed n5
+  w0 object n4 selection-changed
+  w0 object n41 state defunct true
+  w0 object n45 state defunct true
+  w0 object n48 state defunct true
+  w0 object n5 state defunct true
+  w0 register n4 0x0
+  w0 unregister n281474976710699 0x80021
+  w0 unregister n30 0x4001
+  w0 unregister n33 0x1
+  w0 unregister n36 0x21
+  w0 unregister n38 0x80023
+  w0 unregister n4 0x0
+  w0 unregister n41 0x1
+  w0 unregister n45 0x1
+  w0 unregister n48 0x23
+  w0 unregister n5 0x21
+  tree d0e3a0812aaaf152 297
+  text ece45ab366dafe9a 758
+  actions 0123b90cdce1e8a7 265
+step 5 bounds w0
+  tree 786281757a8f8962 297
+  text ece45ab366dafe9a 758
+  actions 37ec5c75d979b7ed 265
+step 6 update w0 (1 nodes)
+  w0 object n0 description "save"
+  w0 object n0 name "zsh"
+  w0 register n0 0x0
+  w0 unregister n0 0x2
+  tree 0013af74da491859 297
+  text ece45ab366dafe9a 758
+  actions 37ec5c75d979b7ed 265
+step 7 update w0 (0 nodes)
+  tree 3b9201e383b27e91 297
+  text ece45ab366dafe9a 758
+  actions 37ec5c75d979b7ed 265
+step 8 update w0 (3 nodes)
+  w0 cache-add n50
+  w0 object n3 child-added 0 n50
+  w0 register n3 0x0
+  w0 register n4 0x0
+  w0 register n50 0x40001
+  w0 unregister n3 0x0
+  w0 unregister n4 0x0
+  tree fa64a5db0f4e229a 319
+  text 89848c838a8f6bf8 801
+  actions c3d5dcaa492a52af 312
+step 9 update w0 (0 nodes)
+  tree fa64a5db0f4e229a 319
+  text 89848c838a8f6bf8 801
+  actions c3d5dcaa492a52af 312
+step 10 update w0 (0 nodes)
+  tree fa64a5db0f4e229a 319
+  text 89848c838a8f6bf8 801
+  actions c3d5dcaa492a52af 312
+step 11 update w0 (2 nodes)
+  w0 cache-add n53
+  w0 object n3 child-added 0 n53
+  w0 register n3 0x0
+  w0 register n4 0x0
+  w0 register n50 0x0
+  w0 register n53 0x4023
+  w0 unregister n3 0x0
+  w0 unregister n4 0x0
+  w0 unregister n50 0x0
+  tree 00a336804071d372 356
+  text 89848c838a8f6bf8 801
+  actions cd00372adf1bb8aa 334
+step 12 update w0 (1 nodes)
+  w0 cache-remove n4
+  w0 object n3 child-removed n4
+  w0 object n4 state defunct true
+  w0 register n3 0x0
+  w0 unregister n3 0x0
+  w0 unregister n4 0x4021
+  tree 096557801e3427ed 319
+  text 89848c838a8f6bf8 801
+  actions ec6543abeeb6be67 312
+step 13 update w0 (0 nodes)
+  tree 409a5361fce2a145 319
+  text 89848c838a8f6bf8 801
+  actions ec6543abeeb6be67 312
+step 14 close w1
+  w1 object root child-removed n0
+  tree 3043753cac2c44ec 159
+  text 288c964393940ebf 43
+  actions 5eea966f54225837 133
+exit
+  w0 object root child-removed n0
+scenario generated 23
+step 0 open w0
+  w0 object n24 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x23
+  w0 register n12 0x40021
+  w0 register n2 0x4021
+  w0 register n21 0x4023
+  w0 register n22 0x1
+  w0 register n24 0x40021
+  w0 register n281474976710684 0x4021
+  w0 register n3 0x21
+  w0 register n5 0x1
+  w0 register n8 0x21
+  w0 register n9 0x21
+  tree 7a62d8c3d1454eed 366
+  text cf5aa6ac21d46cc0 413
+  actions 8d4be3a13005780d 290
+step 1 update w0 (16 nodes)
+  tree 433a423e57464c26 366
+  text cf5aa6ac21d46cc0 413
+  actions 8d4be3a13005780d 290
+step 2 update w0 (2 nodes)
+  w0 object n24 name "save"
+  w0 object n5 announce "Find" 2
+  w0 object n5 name "Find"
+  w0 register n24 0x0
+  w0 register n5 0x0
+  w0 unregister n24 0x0
+  w0 unregister n5 0x0
+  tree e5106c38e74fd17e 366
+  text cf5aa6ac21d46cc0 413
+  actions 8d4be3a13005780d 290
+step 3 update w0 (0 nodes)
+  w0 object n24 state focused false
+  w0 object n3 state focusable true
+  w0 object n3 state focused true
+  w0 register n24 0x0
+  w0 register n3 0x0
+  w0 unregister n24 0x0
+  w0 unregister n3 0x0
+  tree 33e554815982c2ac 366
+  text cf5aa6ac21d46cc0 413
+  actions 8d4be3a13005780d 290
+step 4 update w0 (1 nodes)
+  w0 cache-add n15
+  w0 object n15 state focused true
+  w0 object n3 state focusable false
+  w0 object n3 state focused false
+  w0 register n15 0x21
+  w0 register n3 0x0
+  w0 unregister n3 0x0
+  tree c5c2dc694ada5044 403
+  text cf5aa6ac21d46cc0 413
+  actions 439ba2d39b98802f 312
+step 5 update w0 (1 nodes)
+  w0 cache-remove n15
+  w0 object n0 state focusable true
+  w0 object n0 state focused true
+  w0 object n15 state defunct true
+  w0 object n15 state focused false
+  w0 object n24 text-removed 7 2 "az"
+  w0 register n0 0x0
+  w0 unregister n0 0x0
+  w0 unregister n15 0x21
+  tree 23775f2a86a1c48c 366
+  text e20bed2ce27cae0e 395
+  actions e3674a8b413a5450 290
+step 6 update w0 (2 nodes)
+  w0 object n21 announce "logs" 2
+  w0 object n21 description "été"
+  w0 object n21 name "logs"
+  w0 register n12 0x0
+  w0 register n21 0x0
+  w0 unregister n12 0x0
+  w0 unregister n21 0x2
+  tree a0ca9292da37e5ac 366
+  text 1770771d98f7f055 395
+  actions b943075268b151ca 290
+step 7 update w0 (0 nodes)
+  tree a0ca9292da37e5ac 366
+  text 1770771d98f7f055 395
+  actions b943075268b151ca 290
+step 8 update w0 (1 nodes)
+  w0 object n12 text-inserted 2 4 " 🙂 c"
+  tree a0ca9292da37e5ac 366
+  text b8ba2fc70d4394c1 431
+  actions c3375b67f878eb6c 290
+step 9 update w0 (2 nodes)
+  w0 object n12 text-inserted 21 4 "yz1 "
+  w0 object n3 description "zsh"
+  w0 object n3 name "save"
+  w0 object n3 state enabled false
+  w0 object n3 state read-only true
+  w0 object n3 state sensitive false
+  w0 register n3 0x0
+  w0 unregister n3 0x0
+  tree 6696ed32448727a0 366
+  text 5d52b16b4317e6be 467
+  actions 06cfabcb522aae47 290
+step 10 update w0 (1 nodes)
+  w0 object n281474976710684 name "ok"
+  w0 object n281474976710684 state focusable true
+  w0 object n281474976710684 value 74
+  w0 register n281474976710684 0x80000
+  w0 unregister n281474976710684 0x0
+  tree aa8a1ae266e8af36 366
+  text 5d52b16b4317e6be 467
+  actions 06cfabcb522aae47 290
+step 11 update w0 (1 nodes)
+  w0 register n2 0x0
+  w0 register n3 0x0
+  w0 register n8 0x0
+  w0 unregister n2 0x0
+  w0 unregister n3 0x0
+  w0 unregister n8 0x0
+  tree 9d6c880e0edceb66 366
+  text 5d52b16b4317e6be 467
+  actions b380afab6e43fdcd 290
+step 12 update w0 (0 nodes)
+  w0 object n0 state focusable false
+  w0 object n0 state focused false
+  w0 object n12 caret 20
+  w0 object n12 state focusable true
+  w0 object n12 state focused true
+  w0 register n0 0x0
+  w0 register n12 0x0
+  w0 unregister n0 0x0
+  w0 unregister n12 0x0
+  tree a9627e0c1b5547b4 366
+  text 5d52b16b4317e6be 467
+  actions b380afab6e43fdcd 290
+exit
+  w0 object root child-removed n0
+scenario generated 24
+step 0 open w0
+  w0 object n38 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x21
+  w0 register n19 0x23
+  w0 register n22 0x1
+  w0 register n25 0x40021
+  w0 register n281474976710689 0x40001
+  w0 register n29 0x40021
+  w0 register n3 0x1
+  w0 register n38 0x80021
+  w0 register n4 0x21
+  w0 register n40 0x84021
+  w0 register n41 0x40003
+  w0 register n46 0x80021
+  w0 register n6 0x21
+  w0 register n7 0x40021
+  tree 8faf1f419e6c7dc0 462
+  text ceb45be6d8c8163e 620
+  actions d7a4054fb8fd0955 431
+step 1 update w0 (0 nodes)
+  tree 697f70b5a7af6fed 462
+  text ceb45be6d8c8163e 620
+  actions d7a4054fb8fd0955 431
+step 2 update w0 (0 nodes)
+  w0 object n25 state focusable true
+  w0 object n25 state focused true
+  w0 object n38 state focusable false
+  w0 object n38 state focused false
+  w0 register n25 0x0
+  w0 register n38 0x0
+  w0 unregister n25 0x0
+  w0 unregister n38 0x0
+  tree edd202be0408e5b3 462
+  text ceb45be6d8c8163e 620
+  actions d7a4054fb8fd0955 431
+step 3 update w0 (1 nodes)
+  w0 object n25 state focusable false
+  w0 object n25 state focused false
+  w0 object n4 state focused true
+  w0 register n25 0x0
+  w0 register n4 0x0
+  w0 unregister n25 0x0
+  w0 unregister n4 0x0
+  tree 0d7bf5f2a1409053 462
+  text ceb45be6d8c8163e 620
+  actions d7a4054fb8fd0955 431
+step 4 bounds w0
+  tree d924a0119e13cb66 462
+  text 52a6a2d61b11a49f 620
+  actions 5dca477f948366ec 431
+step 5 update w0 (2 nodes)
+  w0 cache-add n43
+  w0 object n29 text-removed 0 1 " "
+  w0 object n4 state focused false
+  w0 object n43 state focused true
+  w0 register n281474976710689 0x0
+  w0 register n4 0x0
+  w0 register n43 0x21
+  w0 unregister n281474976710689 0x0
+  w0 unregister n4 0x0
+  tree ca0eca635ca08473 499
+  text d98f2a1ad9a433f6 611
+  actions ec3ea5e10a51fba5 453
+step 6 update w0 (0 nodes)
+  w0 cache-remove n43
+  w0 object n43 state defunct true
+  w0 object n43 state focused false
+  w0 object n6 state focusable true
+  w0 object n6 state focused true
+  w0 register n6 0x0
+  w0 unregister n43 0x21
+  w0 unregister n6 0x0
+  tree 64718cf23111f488 462
+  text d98f2a1ad9a433f6 611
+  actions da833c4db78c72d8 431
+step 7 update w0 (2 nodes)
+  w0 cache-remove n4
+  w0 object n29 announce "" 2
+  w0 object n29 name ""
+  w0 object n29 state focusable true
+  w0 object n29 value 23
+  w0 object n3 child-removed n4
+  w0 object n4 state defunct true
+  w0 register n29 0x80000
+  w0 register n3 0x0
+  w0 register n6 0x0
+  w0 unregister n29 0x0
+  w0 unregister n3 0x0
+  w0 unregister n4 0x21
+  w0 unregister n6 0x0
+  tree 6921178584b46414 425
+  text d98f2a1ad9a433f6 611
+  actions 7e5d2b7ebe89a52e 409
+step 8 update w0 (1 nodes)
+  w0 cache-remove n38
+  w0 cache-remove n40
+  w0 cache-remove n41
+  w0 cache-remove n46
+  w0 object n0 child-removed n38
+  w0 object n38 state defunct true
+  w0 object n40 state defunct true
+  w0 object n41 state defunct true
+  w0 object n46 state defunct true
+  w0 register n0 0x0
+  w0 unregister n0 0x0
+  w0 unregister n38 0x80021
+  w0 unregister n40 0x84021
+  w0 unregister n41 0x40003
+  w0 unregister n46 0x80021
+  tree 251637dc6a302421 292
+  text 558b3c28a86c1cba 514
+  actions db9507a9b06ba9e0 296
+step 9 focus w0 false
+  w0 object n0 state active false
+  w0 object n6 state focused false
+  w0 register n6 0x0
+  w0 unregister n6 0x0
+  w0 window n0 "ok" deactivated
+  tree e3c031b763c0c21c 292
+  text 558b3c28a86c1cba 514
+  actions db9507a9b06ba9e0 296
+step 10 focus w0 false
+  tree e3c031b763c0c21c 292
+  text 558b3c28a86c1cba 514
+  actions db9507a9b06ba9e0 296
+step 11 update w0 (2 nodes)
+  w0 cache-remove n19
+  w0 cache-remove n22
+  w0 cache-remove n25
+  w0 cache-remove n281474976710689
+  w0 cache-remove n29
+  w0 object n0 child-removed n19
+  w0 object n19 state defunct true
+  w0 object n22 state defunct true
+  w0 object n25 state defunct true
+  w0 object n281474976710689 state defunct true
+  w0 object n29 state defunct true
+  w0 register n0 0x0
+  w0 unregister n0 0x0
+  w0 unregister n19 0x23
+  w0 unregister n22 0x1
+  w0 unregister n25 0x40021
+  w0 unregister n281474976710689 0x40001
+  w0 unregister n29 0xc0021
+  tree 9b646951569877eb 137
+  text eeb2fa99da9a0336 319
+  actions b2d99524df76e5b9 111
+step 12 bounds w0
+  tree 4dad76627f34179a 137
+  text f8b1c31f1b98e67a 319
+  actions faa144c3e5692f1f 111
+exit
+  w0 object root child-removed n0
+scenario generated 25
+step 0 open w0
+  w0 object n8 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x21
+  w0 register n3 0x21
+  w0 register n6 0x21
+  w0 register n8 0x40021
+  tree c93a3cbb150d734d 137
+  text 5de7111c20eb59b1 211
+  actions 79e24a6fedafaddb 111
+step 1 bounds w0
+  tree 7783847d62b9afca 152
+  text a9f1297f1d4926f0 211
+  actions 2df5028d698da063 111
+step 2 bounds w0
+  tree 11b3222ff063ef29 152
+  text def9d6865da04a56 211
+  actions 54aa6f8d9d015a4f 111
+step 3 update w0 (1 nodes)
+  w0 object n0 bounds (107,37 0x0)
+  w0 object n0 description "logs"
+  w0 object n0 name "logs"
+  w0 register n0 0x0
+  w0 unregister n0 0x0
+  tree ae6de8c69d080b18 152
+  text def9d6865da04a56 211
+  actions af161cee2bc0b67d 111
+step 4 update w0 (1 nodes)
+  w0 register n6 0x0
+  w0 unregister n6 0x0
+  tree ae6de8c69d080b18 152
+  text def9d6865da04a56 211
+  actions af161cee2bc0b67d 111
+step 5 update w0 (1 nodes)
+  w0 object n3 bounds (345,63 98x1)
+  w0 register n3 0x2
+  w0 unregister n3 0x0
+  tree eba683c5674309b3 152
+  text def9d6865da04a56 211
+  actions af161cee2bc0b67d 111
+step 6 update w0 (4 nodes)
+  w0 cache-add n14
+  w0 object n0 name "été"
+  w0 object n3 name ""
+  w0 object n6 child-added 0 n14
+  w0 register n0 0x0
+  w0 register n14 0x80001
+  w0 register n3 0x0
+  w0 register n6 0x0
+  w0 unregister n0 0x0
+  w0 unregister n3 0x2
+  w0 unregister n6 0x0
+  tree 97953c2fffa6774f 174
+  text def9d6865da04a56 211
+  actions b2d900d4b738ec4b 133
+step 7 update w0 (1 nodes)
+  w0 object n8 caret 11
+  w0 register n8 0x0
+  w0 unregister n8 0x0
+  tree 97953c2fffa6774f 174
+  text cb7812dd9cb2da0a 211
+  actions 82d75ddf84a35867 133
+step 8 bounds w0
+  tree e6373cb45a40ad2b 174
+  text c524d5f065462d2d 211
+  actions 43e0cf43e20c5840 133
+step 9 update w0 (1 nodes)
+  w0 cache-remove n8
+  w0 object n0 child-removed n8
+  w0 object n0 state focusable true
+  w0 object n0 state focused true
+  w0 object n8 state defunct true
+  w0 object n8 state focused false
+  w0 register n0 0x0
+  w0 unregister n0 0x0
+  w0 unregister n8 0x40021
+  tree 4f0c8824d351ffd8 137
+  text cbf29ce484222325 0
+  actions 3b738082f951eac8 86
+step 10 update w0 (6 nodes)
+  w0 cache-add n15
+  w0 cache-add n17
+  w0 cache-add n19
+  w0 cache-add n22
+  w0 cache-add n24
+  w0 object n0 child-added 1 n15
+  w0 object n15 selection-changed
+  w0 object n19 announce "save" 1
+  w0 object n22 announce "logs" 1
+  w0 object n24 announce "save" 1
+  w0 register n0 0x0
+  w0 register n15 0x4001
+  w0 register n17 0x21
+  w0 register n19 0x21
+  w0 register n22 0x23
+  w0 register n24 0x21
+  w0 register n6 0x0
+  w0 unregister n0 0x0
+  w0 unregister n6 0x0
+  tree b6181d9f7703c945 307
+  text cbf29ce484222325 0
+  actions 4d568a70af7bebee 196
+step 11 update w0 (0 nodes)
+  tree b6181d9f7703c945 307
+  text cbf29ce484222325 0
+  actions 4d568a70af7bebee 196
+step 12 update w0 (4 nodes)
+  w0 cache-add n25
+  w0 object n0 state focusable false
+  w0 object n0 state focused false
+  w0 object n22 state focused true
+  w0 object n24 bounds (150,177 31x60)
+  w0 object n24 state focusable true
+  w0 object n24 state selectable false
+  w0 object n25 announce "🙂..aébyß2" 1
+  w0 object n3 child-added 0 n25
+  w0 register n0 0x0
+  w0 register n22 0x0
+  w0 register n24 0x0
+  w0 register n25 0x40001
+  w0 register n3 0x0
+  w0 unregister n0 0x0
+  w0 unregister n22 0x0
+  w0 unregister n24 0x0
+  w0 unregister n3 0x0
+  tree 9c7f932648c1a0c0 329
+  text 5866a83df42e85b9 124
+  actions cd3910b17d62e52b 243
+exit
+  w0 object root child-removed n0
+scenario generated 26
+step 0 open w0
+  w0 object n7 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x21
+  w0 register n1 0x40021
+  w0 register n7 0x1
+  tree 2ad2edd09b4e09af 100
+  text f3e1813dc7404028 229
+  actions acd492120ff6ae87 89
+step 1 open w1
+  w1 object root child-added 1 n0
+  w1 register n0 0x21
+  w1 register n11 0x21
+  w1 register n13 0x21
+  w1 register n16 0x23
+  w1 register n19 0x401
+  w1 register n9 0x4021
+  tree 0a5a1adf924abcde 305
+  text f3e1813dc7404028 229
+  actions 42129279f08dd33e 218
+step 2 bounds w0
+  tree 5226e4583f62ce41 305
+  text e4da10d8acda5a12 229
+  actions 8c18e4f5b705efec 218
+step 3 update w0 (2 nodes)
+  w0 cache-remove n7
+  w0 object n0 bounds (168,35 0x0)
+  w0 object n0 description ""
+  w0 object n0 name "zsh"
+  w0 object n0 state focusable true
+  w0 object n0 state focused true
+  w0 object n1 text-inserted 6 3 "2.x"
+  w0 object n7 state defunct true
+  w0 object n7 state focused false
+  w0 register n0 0x0
+  w0 unregister n0 0x0
+  w0 unregister n7 0x1
+  tree 03c859340f71adc6 283
+  text cf3b2a5b7485ecf1 256
+  actions cdb2650084dc8cff 196
+step 4 update w0 (3 nodes)
+  w0 cache-add n4
+  w0 object n0 state focused false
+  w0 object n1 child-added 0 n4
+  w0 object n1 text-inserted 4 7 ".x\n2 -a"
+  w0 object n1 text-removed 4 16 "2🙂2.x\n2 -a.2-z ."
+  w0 object n4 state focused true
+  w0 register n0 0x0
+  w0 register n1 0x0
+  w0 register n4 0x21
+  w0 unregister n0 0x0
+  w0 unregister n1 0x0
+  tree b30dde5741b270e4 320
+  text d984eb6037ce4cf7 175
+  actions 63a093c3c3279df7 218
+step 5 update w0 (1 nodes)
+  w0 object n1 text-inserted 1 9 "c-🙂y. 🙂e\u{301}"
+  w0 register n4 0x0
+  w0 unregister n4 0x0
+  tree b30dde5741b270e4 320
+  text 085719465946edce 256
+  actions c70809e10e9644c5 218
+step 6 update w0 (1 nodes)
+  w0 object n1 text-removed 8 4 "e\u{301} z"
+  w0 register n4 0x0
+  w0 unregister n4 0x0
+  tree b30dde5741b270e4 320
+  text b1cb4e1c714a26dc 220
+  actions d914606b12d5a847 218
+step 7 update w0 (0 nodes)
+  tree b30dde5741b270e4 320
+  text b1cb4e1c714a26dc 220
+  actions d914606b12d5a847 218
+step 8 update w0 (1 nodes)
+  tree b30dde5741b270e4 320
+  text b1cb4e1c714a26dc 220
+  actions d914606b12d5a847 218
+step 9 update w0 (0 nodes)
+  w0 cache-add n7
+  w0 cache-remove n4
+  w0 object n4 state defunct true
+  w0 object n4 state focused false
+  w0 object n7 state focused true
+  w0 register n7 0x21
+  w0 unregister n4 0x21
+  tree 32a395de6f5cd56f 320
+  text b1cb4e1c714a26dc 220
+  actions 195e3b19ad149e63 218
+step 10 update w0 (1 nodes)
+  w0 cache-remove n1
+  w0 cache-remove n7
+  w0 object n0 child-removed n1
+  w0 object n0 state focused true
+  w0 object n1 state defunct true
+  w0 object n7 state defunct true
+  w0 object n7 state focused false
+  w0 register n0 0x0
+  w0 unregister n0 0x0
+  w0 unregister n1 0x40021
+  w0 unregister n7 0x21
+  tree 2529e1b23f2d2af8 246
+  text cbf29ce484222325 0
+  actions 8994c4e68f01c472 149
+step 11 update w0 (0 nodes)
+  tree 2529e1b23f2d2af8 246
+  text cbf29ce484222325 0
+  actions 8994c4e68f01c472 149
+step 12 update w0 (0 nodes)
+  tree 2529e1b23f2d2af8 246
+  text cbf29ce484222325 0
+  actions 8994c4e68f01c472 149
+step 13 update w0 (0 nodes)
+  tree 2529e1b23f2d2af8 246
+  text cbf29ce484222325 0
+  actions 8994c4e68f01c472 149
+step 14 close w1
+  w1 object root child-removed n0
+  tree e697db4243a416d0 41
+  text cbf29ce484222325 0
+  actions 4ab78ba3acc92343 20
+exit
+  w0 object root child-removed n0
+scenario generated 27
+step 0 open w0
+  w0 object n5 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x23
+  w0 register n1 0x40021
+  w0 register n5 0x1
+  tree 77bf50aa41562df1 100
+  text 1c04e686042c1f18 337
+  actions 2a23dde06dd3ad12 89
+step 1 focus w0 true
+  tree 1587426026ec0170 100
+  text 1c04e686042c1f18 337
+  actions 2a23dde06dd3ad12 89
+step 2 bounds w0
+  tree 6fdf775733b39926 100
+  text 1c04e686042c1f18 337
+  actions 5f85a3117d88177a 89
+step 3 update w0 (3 nodes)
+  w0 object n1 bounds (36,241 115x49)
+  w0 object n1 state enabled true
+  w0 object n1 state read-only false
+  w0 object n1 state sensitive true
+  w0 object n1 value 86
+  w0 register n1 0x80002
+  w0 unregister n1 0x0
+  tree e54d8f68f4b5393f 100
+  text 4afb573794b83529 337
+  actions 2059d7ada23fb815 89
+step 4 focus w0 true
+  tree e54d8f68f4b5393f 100
+  text 4afb573794b83529 337
+  actions 2059d7ada23fb815 89
+step 5 focus w0 true
+  tree e54d8f68f4b5393f 100
+  text 4afb573794b83529 337
+  actions 2059d7ada23fb815 89
+step 6 update w0 (2 nodes)
+  w0 cache-add n11
+  w0 cache-remove n5
+  w0 object n0 bounds (57,13 0x0)
+  w0 object n0 child-added 1 n11
+  w0 object n0 description "ok"
+  w0 object n0 name "logs"
+  w0 object n1 child-removed n5
+  w0 object n1 state focusable true
+  w0 object n1 state focused true
+  w0 object n5 state defunct true
+  w0 object n5 state focused false
+  w0 register n0 0x0
+  w0 register n1 0x0
+  w0 register n11 0x80021
+  w0 unregister n0 0x2
+  w0 unregister n1 0x0
+  w0 unregister n5 0x1
+  tree 2bd485e060f6f465 115
+  text 4afb573794b83529 337
+  actions 0134dbf98248f237 89
+step 7 update w0 (2 nodes)
+  w0 object n0 announce "zsh" 1
+  w0 object n0 bounds (57,13 0x0)
+  w0 object n0 name "zsh"
+  w0 register n0 0x0
+  w0 unregister n0 0x0
+  tree ebbafa09d075066b 115
+  text 4afb573794b83529 337
+  actions 8b01302ded59bccb 89
+step 8 update w0 (7 nodes)
+  tree ebbafa09d075066b 115
+  text 4afb573794b83529 337
+  actions 8b01302ded59bccb 89
+step 9 update w0 (1 nodes)
+  w0 object n1 bounds (381,119 178x1)
+  w0 object n1 state enabled false
+  w0 object n1 state read-only true
+  w0 object n1 state sensitive false
+  w0 register n1 0x0
+  w0 unregister n1 0x2
+  tree bf69dafaac03042f 115
+  text ebff6faebde8b242 337
+  actions 8b01302ded59bccb 89
+step 10 update w0 (0 nodes)
+  tree bf69dafaac03042f 115
+  text ebff6faebde8b242 337
+  actions 8b01302ded59bccb 89
+step 11 update w0 (7 nodes)
+  tree bf69dafaac03042f 115
+  text ebff6faebde8b242 337
+  actions 8b01302ded59bccb 89
+step 12 update w0 (7 nodes)
+  tree bf69dafaac03042f 115
+  text ebff6faebde8b242 337
+  actions 8b01302ded59bccb 89
+exit
+  w0 object root child-removed n0
+scenario generated 28
+step 0 open w0
+  w0 object n3 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x21
+  w0 register n1 0x40021
+  w0 register n3 0x1
+  tree f8bf115e2147bc29 85
+  text b4241db49b5b73f0 391
+  actions 6135e46f34272431 89
+step 1 update w0 (0 nodes)
+  tree c7dde8ad9d1026e2 85
+  text b4241db49b5b73f0 391
+  actions 6135e46f34272431 89
+step 2 update w0 (2 nodes)
+  w0 register n1 0x0
+  w0 unregister n1 0x0
+  tree c7dde8ad9d1026e2 85
+  text cc1f975389ed82c8 391
+  actions 1d7a969f071090e1 89
+step 3 update w0 (1 nodes)
+  tree c7dde8ad9d1026e2 85
+  text cc1f975389ed82c8 391
+  actions 1d7a969f071090e1 89
+step 4 update w0 (2 nodes)
+  w0 object n1 text-removed 34 2 "c "
+  tree c7dde8ad9d1026e2 85
+  text f56b5517b1700ceb 373
+  actions 99d446b0effb1014 89
+step 5 update w0 (1 nodes)
+  w0 object n1 text-removed 9 2 "b."
+  tree c7dde8ad9d1026e2 85
+  text d3f259048f6cc369 355
+  actions ffaae7674c8022f1 89
+step 6 update w0 (6 nodes)
+  tree c7dde8ad9d1026e2 85
+  text d3f259048f6cc369 355
+  actions ffaae7674c8022f1 89
+step 7 bounds w0
+  tree 0e289d0833c41a7a 100
+  text 990921a83176f082 355
+  actions 06fa6eb3ee34c449 89
+step 8 update w0 (0 nodes)
+  tree 0e289d0833c41a7a 100
+  text 990921a83176f082 355
+  actions 06fa6eb3ee34c449 89
+step 9 update w0 (1 nodes)
+  tree 0e289d0833c41a7a 100
+  text d65f473b1ad7f158 355
+  actions 06fa6eb3ee34c449 89
+step 10 focus w0 true
+  tree 0e289d0833c41a7a 100
+  text d65f473b1ad7f158 355
+  actions 06fa6eb3ee34c449 89
+step 11 update w0 (2 nodes)
+  w0 object n0 bounds (29,11 0x9)
+  w0 object n0 name "save"
+  w0 object n0 state focusable true
+  w0 object n3 bounds (315,80 81x22)
+  w0 register n0 0x0
+  w0 register n3 0x22
+  w0 unregister n0 0x0
+  w0 unregister n3 0x0
+  tree 8f07c3435caea02e 115
+  text 1df38aa8a04ab462 355
+  actions 815d046557d0ad00 89
+step 12 update w0 (1 nodes)
+  tree 8f07c3435caea02e 115
+  text 651dc8ec2d5e7a7f 355
+  actions 815d046557d0ad00 89
+exit
+  w0 object root child-removed n0
+scenario generated 29
+step 0 open w0
+  w0 object n5 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x21
+  w0 register n281474976710658 0x4021
+  w0 register n281474976710667 0x80021
+  w0 register n5 0x21
+  w0 register n6 0x21
+  w0 register n8 0x21
+  tree f78d2cfa00a01432 226
+  text cbf29ce484222325 0
+  actions d42efafe5b506840 130
+step 1 update w0 (1 nodes)
+  w0 cache-remove n8
+  w0 object n281474976710658 child-removed n8
+  w0 object n281474976710658 selection-changed
+  w0 object n281474976710658 state focusable true
+  w0 object n281474976710658 state focused true
+  w0 object n5 state focusable false
+  w0 object n5 state focused false
+  w0 object n8 state defunct true
+  w0 register n281474976710658 0x0
+  w0 register n5 0x0
+  w0 unregister n281474976710658 0x0
+  w0 unregister n5 0x0
+  w0 unregister n8 0x21
+  tree 802c3b40750f6115 189
+  text cbf29ce484222325 0
+  actions c9604b0028d934b7 108
+step 2 update w0 (1 nodes)
+  w0 object n281474976710658 state focusable false
+  w0 object n281474976710658 state focused false
+  w0 object n5 state focusable true
+  w0 object n5 state focused true
+  w0 register n281474976710658 0x0
+  w0 register n5 0x0
+  w0 register n6 0x0
+  w0 unregister n281474976710658 0x0
+  w0 unregister n5 0x0
+  w0 unregister n6 0x0
+  tree a433ec0b7c229227 189
+  text cbf29ce484222325 0
+  actions bdf09fd1185fa641 108
+step 3 update w0 (1 nodes)
+  w0 object n281474976710667 name ""
+  w0 object n281474976710667 value 23
+  w0 register n281474976710667 0x0
+  w0 unregister n281474976710667 0x0
+  tree 0eed1f70c5e4b19b 189
+  text cbf29ce484222325 0
+  actions bdf09fd1185fa641 108
+step 4 focus w0 false
+  w0 object n0 state active false
+  w0 object n5 state focused false
+  w0 register n5 0x0
+  w0 unregister n5 0x0
+  w0 window n0 "" deactivated
+  tree 2214ec464c1425ba 189
+  text cbf29ce484222325 0
+  actions bdf09fd1185fa641 108
+step 5 bounds w0
+  tree 6281725d00aba6bb 189
+  text cbf29ce484222325 0
+  actions 9be544297e3a8f53 108
+step 6 update w0 (1 nodes)
+  w0 cache-remove n281474976710658
+  w0 cache-remove n5
+  w0 cache-remove n6
+  w0 object n0 child-removed n281474976710658
+  w0 object n0 state focusable true
+  w0 object n281474976710658 state defunct true
+  w0 object n5 state defunct true
+  w0 object n6 state defunct true
+  w0 register n0 0x0
+  w0 register n281474976710667 0x0
+  w0 unregister n0 0x0
+  w0 unregister n281474976710658 0x4021
+  w0 unregister n281474976710667 0x0
+  w0 unregister n5 0x21
+  w0 unregister n6 0x21
+  tree 421db662264a60d1 78
+  text cbf29ce484222325 0
+  actions 8f8e983cc246adcf 42
+step 7 update w0 (0 nodes)
+  tree 421db662264a60d1 78
+  text cbf29ce484222325 0
+  actions 8f8e983cc246adcf 42
+step 8 update w0 (2 nodes)
+  tree 421db662264a60d1 78
+  text cbf29ce484222325 0
+  actions 8f8e983cc246adcf 42
+step 9 update w0 (0 nodes)
+  tree 421db662264a60d1 78
+  text cbf29ce484222325 0
+  actions 8f8e983cc246adcf 42
+step 10 update w0 (2 nodes)
+  w0 object n0 bounds (53,0 0x0)
+  w0 object n0 name "zsh"
+  w0 object n281474976710667 bounds (167,173 198x32)
+  w0 object n281474976710667 value 98
+  w0 register n0 0x0
+  w0 register n281474976710667 0x0
+  w0 unregister n0 0x0
+  w0 unregister n281474976710667 0x0
+  tree 65f8002936cec34f 78
+  text cbf29ce484222325 0
+  actions e6b69488317aca12 42
+step 11 update w0 (0 nodes)
+  tree 65f8002936cec34f 78
+  text cbf29ce484222325 0
+  actions e6b69488317aca12 42
+step 12 update w0 (0 nodes)
+  tree 65f8002936cec34f 78
+  text cbf29ce484222325 0
+  actions e6b69488317aca12 42
+exit
+  w0 object root child-removed n0
+scenario generated 30
+step 0 open w0
+  w0 object n3 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x80021
+  w0 register n3 0x421
+  w0 register n6 0x1
+  tree 87bcbdcde200cb2b 100
+  text cbf29ce484222325 0
+  actions 7d4be8f3e45d4eb4 64
+step 1 update w0 (0 nodes)
+  w0 object n0 state focusable true
+  w0 object n0 state focused true
+  w0 object n3 state focusable false
+  w0 object n3 state focused false
+  w0 register n0 0x0
+  w0 register n3 0x0
+  w0 unregister n0 0x0
+  w0 unregister n3 0x0
+  tree fdfea9c509cc87ee 100
+  text cbf29ce484222325 0
+  actions 7d4be8f3e45d4eb4 64
+step 2 update w0 (0 nodes)
+  tree fdfea9c509cc87ee 100
+  text cbf29ce484222325 0
+  actions 7d4be8f3e45d4eb4 64
+step 3 update w0 (2 nodes)
+  w0 cache-add n7
+  w0 object n3 child-added 0 n7
+  w0 register n3 0x0
+  w0 register n7 0x80001
+  w0 unregister n3 0x0
+  tree f13c85de1ad2bb3f 122
+  text cbf29ce484222325 0
+  actions 092a6347e7a2760a 86
+step 4 update w0 (0 nodes)
+  w0 object n0 state focusable false
+  w0 object n0 state focused false
+  w0 object n6 state focused true
+  w0 register n0 0x0
+  w0 register n6 0x0
+  w0 unregister n0 0x0
+  w0 unregister n6 0x0
+  tree db77da2c916f1fe9 122
+  text cbf29ce484222325 0
+  actions 092a6347e7a2760a 86
+step 5 bounds w0
+  tree 2b61cffdb85eb909 122
+  text cbf29ce484222325 0
+  actions db44ae1a6f2b9141 86
+step 6 update w0 (1 nodes)
+  w0 object n6 bounds (152,190 27x57)
+  w0 object n6 description "save"
+  w0 register n6 0x422
+  w0 unregister n6 0x0
+  tree b17bd5e9b085c634 137
+  text cbf29ce484222325 0
+  actions db44ae1a6f2b9141 86
+step 7 update w0 (2 nodes)
+  w0 object n6 bounds (26,239 162x50)
+  w0 object n6 state checkable true
+  w0 object n6 state indeterminate true
+  w0 register n0 0x0
+  w0 register n3 0x0
+  w0 register n6 0x0
+  w0 unregister n0 0x0
+  w0 unregister n3 0x0
+  w0 unregister n6 0x2
+  tree e5387b71265e4e6f 137
+  text cbf29ce484222325 0
+  actions e8df3ffdb8dc44c1 86
+step 8 update w0 (0 nodes)
+  tree e5387b71265e4e6f 137
+  text cbf29ce484222325 0
+  actions e8df3ffdb8dc44c1 86
+step 9 update w0 (1 nodes)
+  w0 cache-remove n3
+  w0 cache-remove n7
+  w0 object n0 child-removed n3
+  w0 object n3 state defunct true
+  w0 object n7 state defunct true
+  w0 register n0 0x0
+  w0 unregister n0 0x0
+  w0 unregister n3 0x421
+  w0 unregister n7 0x80001
+  tree a68db91aa112a395 78
+  text cbf29ce484222325 0
+  actions f5c4a6b1f1f03a17 42
+step 10 focus w0 true
+  tree a68db91aa112a395 78
+  text cbf29ce484222325 0
+  actions f5c4a6b1f1f03a17 42
+step 11 update w0 (1 nodes)
+  w0 object n0 bounds (134,39 0x0)
+  w0 object n0 description "Find"
+  w0 object n0 name "logs"
+  w0 object n0 state focusable true
+  w0 object n0 state focused true
+  w0 object n6 state focusable false
+  w0 object n6 state focused false
+  w0 register n0 0x0
+  w0 register n6 0x0
+  w0 unregister n0 0x0
+  w0 unregister n6 0x0
+  tree 8c7b7aded39c537e 78
+  text cbf29ce484222325 0
+  actions f3805093b6414ad4 42
+step 12 update w0 (1 nodes)
+  w0 object n0 bounds (134,39 0x0)
+  w0 object n0 name "été"
+  w0 object n0 state checkable true
+  w0 object n0 state checked true
+  w0 object n0 value 90
+  w0 register n0 0x2
+  w0 unregister n0 0x0
+  tree bdf64102b7fa72e0 78
+  text cbf29ce484222325 0
+  actions 53f1a9ba0f20720d 42
+exit
+  w0 object root child-removed n0
+scenario generated 31
+step 0 open w0
+  w0 object n6 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x21
+  w0 register n3 0x40023
+  w0 register n6 0x1
+  tree c23a6c3c6ac443c1 85
+  text bbff12b7fb641324 193
+  actions 05690f9d57356251 89
+step 1 update w0 (1 nodes)
+  w0 object n3 bounds (38,288 145x19)
+  w0 object n3 name "été"
+  w0 register n3 0x0
+  w0 unregister n3 0x2
+  tree 4d1117525c028440 85
+  text beb730ca41ac1451 193
+  actions b42fe8f6d86cd20c 89
+step 2 update w0 (0 nodes)
+  tree 4d1117525c028440 85
+  text beb730ca41ac1451 193
+  actions b42fe8f6d86cd20c 89
+step 3 update w0 (7 nodes)
+  w0 cache-add n15
+  w0 cache-add n17
+  w0 object n0 child-added 0 n15
+  w0 object n15 announce "Find" 1
+  w0 object n17 announce "été" 1
+  w0 register n0 0x0
+  w0 register n15 0x3
+  w0 register n17 0x40001
+  w0 register n3 0x0
+  w0 unregister n0 0x0
+  w0 unregister n3 0x0
+  tree 77bb1dde3c0801c2 129
+  text 4fd8cbb86da1fe99 596
+  actions 0190426394ee20c0 158
+step 4 update w0 (11 nodes)
+  tree 77bb1dde3c0801c2 129
+  text 4fd8cbb86da1fe99 596
+  actions 0190426394ee20c0 158
+step 5 update w0 (1 nodes)
+  w0 object n17 announce "" 1
+  w0 object n17 bounds (97,22 39x49)
+  w0 object n17 name ""
+  w0 register n17 0x22
+  w0 unregister n17 0x0
+  tree 64827afb95d88ca2 144
+  text 8ec7cab0478b587e 611
+  actions 997fda6c8e2c071c 158
+step 6 update w0 (1 nodes)
+  w0 object n17 text-inserted 16 2 " ."
+  tree 64827afb95d88ca2 144
+  text 06dc28ac8bbf6c9a 629
+  actions 0657671bb214d00b 158
+step 7 update w0 (0 nodes)
+  tree 64827afb95d88ca2 144
+  text 06dc28ac8bbf6c9a 629
+  actions 0657671bb214d00b 158
+step 8 update w0 (0 nodes)
+  w0 cache-remove n6
+  w0 object n3 caret 11
+  w0 object n3 child-removed n6
+  w0 object n3 state focusable true
+  w0 object n3 state focused true
+  w0 object n3 text-selection-changed
+  w0 object n6 state defunct true
+  w0 object n6 state focused false
+  w0 register n3 0x0
+  w0 unregister n3 0x0
+  w0 unregister n6 0x1
+  tree 8b38773828013c04 122
+  text 06dc28ac8bbf6c9a 629
+  actions eea4bbe6962989f9 136
+step 9 update w0 (0 nodes)
+  w0 cache-add n25
+  w0 object n25 state focused true
+  w0 object n3 state focusable false
+  w0 object n3 state focused false
+  w0 register n25 0x1
+  w0 register n3 0x0
+  w0 unregister n3 0x0
+  tree ed7d32c818abbd39 144
+  text 06dc28ac8bbf6c9a 629
+  actions e29a190f4e90d40f 158
+step 10 update w0 (2 nodes)
+  w0 object n17 bounds (209,170 45x54)
+  w0 object n17 state focusable true
+  w0 object n17 value 92
+  w0 object n3 text-removed 1 1 "🙂"
+  w0 register n17 0x80000
+  w0 unregister n17 0x2
+  tree 7ce383b371777422 144
+  text 50cc0146fe3ce33b 620
+  actions d548668b4c1fac8f 158
+step 11 update w0 (2 nodes)
+  w0 register n17 0x0
+  w0 unregister n17 0x0
+  tree 7ce383b371777422 144
+  text 776846890d9d312e 620
+  actions dfd468a734ff574f 158
+step 12 update w0 (11 nodes)
+  tree 7ce383b371777422 144
+  text 776846890d9d312e 620
+  actions dfd468a734ff574f 158
+exit
+  w0 object root child-removed n0
+scenario generated 32
+step 0 open w0
+  w0 object root child-added 0 n0
+  w0 register n0 0x21
+  w0 register n10 0x1
+  w0 register n13 0x21
+  w0 register n16 0x40021
+  w0 register n24 0x40023
+  w0 register n28 0x4001
+  w0 register n281474976710659 0x40001
+  w0 register n31 0x1
+  w0 register n34 0x21
+  w0 register n36 0x1
+  w0 register n37 0x21
+  tree f57bf3026eac8c93 336
+  text 2527165b5401952d 609
+  actions d4c6bb0a931e2190 315
+step 1 update w0 (0 nodes)
+  tree dfef7be84ca3f038 336
+  text 2527165b5401952d 609
+  actions d4c6bb0a931e2190 315
+step 2 update w0 (16 nodes)
+  tree dfef7be84ca3f038 336
+  text 2527165b5401952d 609
+  actions d4c6bb0a931e2190 315
+step 3 update w0 (2 nodes)
+  w0 register n24 0x0
+  w0 unregister n24 0x0
+  tree dfef7be84ca3f038 336
+  text ad6f976a523b4b3f 609
+  actions 44aadb4b383c2380 315
+step 4 update w0 (2 nodes)
+  w0 object n13 announce "" 1
+  w0 object n13 name ""
+  w0 object n13 state checkable true
+  w0 object n13 state focusable false
+  w0 register n13 0x0
+  w0 unregister n13 0x0
+  tree 6ea7ae5f80a25600 336
+  text ad6f976a523b4b3f 609
+  actions 44aadb4b383c2380 315
+step 5 bounds w0
+  tree 7d6327f6b7f985a2 336
+  text 349b47b7ecd6bf01 609
+  actions 6ecd5836c9074a5e 315
+step 6 update w0 (3 nodes)
+  w0 cache-add n39
+  w0 object n0 child-added 1 n39
+  w0 object n39 announce "logs" 1
+  w0 register n0 0x0
+  w0 register n10 0x0
+  w0 register n281474976710659 0x0
+  w0 register n39 0x84021
+  w0 unregister n0 0x0
+  w0 unregister n10 0x0
+  w0 unregister n281474976710659 0x0
+  tree 90fbe02a8ede7b5b 373
+  text 05a2ea0253958ba8 609
+  actions baf155f76248aed3 337
+step 7 update w0 (17 nodes)
+  tree 90fbe02a8ede7b5b 373
+  text 05a2ea0253958ba8 609
+  actions baf155f76248aed3 337
+step 8 update w0 (1 nodes)
+  w0 object n16 text-inserted 17 4 " xc."
+  w0 object n16 text-removed 17 5 "xc.y2"
+  tree 9fac1f1f7c07822b 373
+  text cde3b4186fcc6c9d 600
+  actions bc905acf03f9021c 337
+step 9 update w0 (2 nodes)
+  w0 object n0 name "save"
+  w0 object n0 state focusable true
+  w0 object n37 bounds (628,114 294x2)
+  w0 object n37 description "save"
+  w0 object n37 name "save"
+  w0 register n0 0x2
+  w0 register n37 0x0
+  w0 unregister n0 0x0
+  w0 unregister n37 0x0
+  tree 7c48798cf564913c 373
+  text cde3b4186fcc6c9d 600
+  actions bc905acf03f9021c 337
+step 10 bounds w0
+  tree 7ba9a1164b08f44e 373
+  text cde3b4186fcc6c9d 600
+  actions dada3a868ab1645a 337
+step 11 update w0 (0 nodes)
+  tree 5926cdc52bef123e 373
+  text cde3b4186fcc6c9d 600
+  actions dada3a868ab1645a 337
+step 12 update w0 (0 nodes)
+  tree 5926cdc52bef123e 373
+  text cde3b4186fcc6c9d 600
+  actions dada3a868ab1645a 337
+exit
+  w0 object root child-removed n0
+scenario generated 33
+step 0 open w0
+  w0 object n27 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x23
+  w0 register n11 0x40021
+  w0 register n18 0xc0003
+  w0 register n2 0x40001
+  w0 register n23 0x23
+  w0 register n24 0x23
+  w0 register n26 0x80021
+  w0 register n27 0x4003
+  w0 register n281474976710687 0x21
+  w0 register n29 0x21
+  w0 register n33 0x21
+  w0 register n5 0x80001
+  w0 register n8 0x21
+  tree 2ca194410df0f1a9 425
+  text e0820de50dab5094 540
+  actions 7c1ca7625da9d2b6 359
+step 1 open w1
+  w1 object root child-added 1 n0
+  w1 register n0 0x21
+  w1 register n36 0x1
+  tree 0d104d86b81f2bf0 482
+  text e0820de50dab5094 540
+  actions 24577e33d0796c9c 400
+step 2 update w0 (2 nodes)
+  w0 object n0 state focusable true
+  w0 object n0 state focused true
+  w0 object n2 text-removed 3 1 "a"
+  w0 object n27 state focusable false
+  w0 object n27 state focused false
+  w0 register n0 0x0
+  w0 register n27 0x0
+  w0 unregister n0 0x0
+  w0 unregister n27 0x0
+  tree 036079559199ae88 482
+  text 375c93d06a01a60e 531
+  actions c6ac524f6113dcdb 400
+step 3 update w0 (18 nodes)
+  tree 036079559199ae88 482
+  text 375c93d06a01a60e 531
+  actions c6ac524f6113dcdb 400
+step 4 update w0 (2 nodes)
+  w0 cache-remove n11
+  w0 cache-remove n18
+  w0 cache-remove n23
+  w0 cache-remove n24
+  w0 cache-remove n26
+  w0 cache-remove n281474976710687
+  w0 cache-remove n5
+  w0 cache-remove n8
+  w0 object n0 child-removed n5
+  w0 object n0 state focusable false
+  w0 object n0 state focused false
+  w0 object n11 state defunct true
+  w0 object n18 state defunct true
+  w0 object n23 state defunct true
+  w0 object n24 state defunct true
+  w0 object n26 state defunct true
+  w0 object n27 child-removed n281474976710687
+  w0 object n281474976710687 state defunct true
+  w0 object n29 state focusable true
+  w0 object n29 state focused true
+  w0 object n5 state defunct true
+  w0 object n8 state defunct true
+  w0 register n0 0x0
+  w0 register n27 0x0
+  w0 register n29 0x0
+  w0 register n33 0x0
+  w0 unregister n0 0x0
+  w0 unregister n11 0x40021
+  w0 unregister n18 0xc0003
+  w0 unregister n23 0x23
+  w0 unregister n24 0x23
+  w0 unregister n26 0x80021
+  w0 unregister n27 0x0
+  w0 unregister n281474976710687 0x21
+  w0 unregister n29 0x0
+  w0 unregister n33 0x0
+  w0 unregister n5 0x80001
+  w0 unregister n8 0x21
+  tree 6e83b5d7ee559bf5 216
+  text f16072e2c96c7946 106
+  actions 257b5494fd2ccabb 174
+step 5 update w0 (1 nodes)
+  w0 register n2 0x0
+  w0 unregister n2 0x0
+  tree 6e83b5d7ee559bf5 216
+  text 088418b1ecb131de 106
+  actions 4e441a716e0b7e51 174
+step 6 update w0 (6 nodes)
+  tree 6e83b5d7ee559bf5 216
+  text 088418b1ecb131de 106
+  actions 4e441a716e0b7e51 174
+step 7 update w0 (1 nodes)
+  w0 object n2 text-removed 0 2 "2 "
+  tree 6e83b5d7ee559bf5 216
+  text 13c1d72619b10dde 88
+  actions 22dc7c2f4b9a09c8 174
+step 8 update w0 (0 nodes)
+  tree 6e83b5d7ee559bf5 216
+  text 13c1d72619b10dde 88
+  actions 22dc7c2f4b9a09c8 174
+step 9 update w0 (2 nodes)
+  w0 object n2 text-removed 3 1 "-"
+  w0 register n2 0x0
+  w0 unregister n2 0x0
+  tree 6e83b5d7ee559bf5 216
+  text 6b9c9057073094a9 79
+  actions 9b5c561d6cfeadda 174
+step 10 update w0 (0 nodes)
+  w0 object n0 state focusable true
+  w0 object n0 state focused true
+  w0 object n29 state focusable false
+  w0 object n29 state focused false
+  w0 register n0 0x0
+  w0 register n29 0x0
+  w0 unregister n0 0x0
+  w0 unregister n29 0x0
+  tree 82605415b1bc498d 216
+  text 6b9c9057073094a9 79
+  actions 9b5c561d6cfeadda 174
+step 11 update w0 (2 nodes)
+  w0 object n29 bounds (711,549 182x38)
+  w0 object n33 bounds (197,4 118x39)
+  w0 register n29 0x0
+  w0 register n33 0x0
+  w0 unregister n29 0x0
+  w0 unregister n33 0x0
+  tree 4bcfde87d93da5fa 216
+  text 6b9c9057073094a9 79
+  actions 9b5c561d6cfeadda 174
+step 12 update w0 (0 nodes)
+  tree 4bcfde87d93da5fa 216
+  text 6b9c9057073094a9 79
+  actions 9b5c561d6cfeadda 174
+step 13 update w0 (0 nodes)
+  tree 4bcfde87d93da5fa 216
+  text 6b9c9057073094a9 79
+  actions 9b5c561d6cfeadda 174
+step 14 close w1
+  w1 object root child-removed n0
+  tree 15e3f069c493bbe6 159
+  text 6b9c9057073094a9 79
+  actions edcdb6fed11c9a60 133
+exit
+  w0 object root child-removed n0
+scenario generated 34
+step 0 open w0
+  w0 object n2 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x21
+  w0 register n2 0x80023
+  tree 1c842b1331056268 78
+  text cbf29ce484222325 0
+  actions 3f1ddb035d43f9fa 42
+step 1 update w0 (1 nodes)
+  w0 object n0 bounds (59,126 86x40)
+  w0 object n0 description "zsh"
+  w0 register n0 0x2
+  w0 unregister n0 0x0
+  tree 2983fb8dc28177ac 78
+  text cbf29ce484222325 0
+  actions 20f79cb6fe7289db 42
+step 2 update w0 (0 nodes)
+  tree 2983fb8dc28177ac 78
+  text cbf29ce484222325 0
+  actions 20f79cb6fe7289db 42
+step 3 update w0 (1 nodes)
+  w0 object n2 announce "été" 1
+  w0 object n2 name "été"
+  w0 object n2 state checkable true
+  w0 object n2 state indeterminate true
+  w0 register n2 0x0
+  w0 unregister n2 0x2
+  tree cbb412510ba3afe7 78
+  text cbf29ce484222325 0
+  actions 20f79cb6fe7289db 42
+step 4 update w0 (1 nodes)
+  w0 object n0 state focusable true
+  w0 object n0 state focused true
+  w0 object n2 announce "ok" 1
+  w0 object n2 bounds (627,297 270x36)
+  w0 object n2 name "ok"
+  w0 object n2 state focusable false
+  w0 object n2 state focused false
+  w0 register n0 0x0
+  w0 register n2 0x0
+  w0 unregister n0 0x0
+  w0 unregister n2 0x0
+  tree 1aae9c4f7d191fa0 78
+  text cbf29ce484222325 0
+  actions 20f79cb6fe7289db 42
+step 5 update w0 (2 nodes)
+  tree 1aae9c4f7d191fa0 78
+  text cbf29ce484222325 0
+  actions 20f79cb6fe7289db 42
+step 6 update w0 (0 nodes)
+  tree 1aae9c4f7d191fa0 78
+  text cbf29ce484222325 0
+  actions 20f79cb6fe7289db 42
+step 7 update w0 (0 nodes)
+  tree 1aae9c4f7d191fa0 78
+  text cbf29ce484222325 0
+  actions 20f79cb6fe7289db 42
+step 8 update w0 (1 nodes)
+  w0 object n2 bounds (537,335 163x79)
+  w0 object n2 name ""
+  w0 register n2 0x0
+  w0 unregister n2 0x0
+  tree b1a967a52c2bdcf3 78
+  text cbf29ce484222325 0
+  actions 20f79cb6fe7289db 42
+step 9 focus w0 false
+  w0 object n0 state focused false
+  w0 register n0 0x0
+  w0 unregister n0 0x0
+  tree 5e718781b4f112c4 78
+  text cbf29ce484222325 0
+  actions 20f79cb6fe7289db 42
+step 10 update w0 (1 nodes)
+  w0 object n2 bounds (104,51 6x52)
+  w0 object n2 description ""
+  w0 object n2 name "save"
+  w0 register n2 0x0
+  w0 unregister n2 0x0
+  tree f2dc3265dad4c887 78
+  text cbf29ce484222325 0
+  actions 20f79cb6fe7289db 42
+step 11 update w0 (1 nodes)
+  w0 object n0 bounds (196,281 191x35)
+  w0 register n0 0x0
+  w0 unregister n0 0x0
+  tree 7b5cc9371a3c53f7 78
+  text cbf29ce484222325 0
+  actions 15b874919c998603 42
+step 12 bounds w0
+  tree a7bd6b9a8175b7f2 78
+  text cbf29ce484222325 0
+  actions 7747db2f6c1f4a2a 42
+exit
+  w0 object root child-removed n0
+scenario generated 35
+step 0 open w0
+  w0 object n4 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x80021
+  w0 register n10 0x23
+  w0 register n11 0x3
+  w0 register n14 0xc0001
+  w0 register n19 0x21
+  w0 register n2 0x1
+  w0 register n20 0x1
+  w0 register n23 0x4021
+  w0 register n25 0x1
+  w0 register n28 0x21
+  w0 register n3 0x1
+  w0 register n4 0x4001
+  w0 register n5 0x21
+  w0 register n8 0x21
+  tree 1e9295c5a8d58aca 402
+  text 9ad9158c4e2d55e9 151
+  actions 02564ca0772fbdab 331
+step 1 update w0 (1 nodes)
+  w0 object n14 text-inserted 6 12 " 1cß1 zéyyé1"
+  tree 64adfae4c2f902f5 402
+  text fbf7fbb20f2890d2 259
+  actions 7afeab98072e5d58 331
+step 2 update w0 (15 nodes)
+  tree 64adfae4c2f902f5 402
+  text fbf7fbb20f2890d2 259
+  actions 7afeab98072e5d58 331
+step 3 bounds w0
+  tree 67e37c25559c783b 417
+  text fbf7fbb20f2890d2 259
+  actions b6fb52352b538fee 331
+step 4 focus w0 true
+  tree 67e37c25559c783b 417
+  text fbf7fbb20f2890d2 259
+  actions b6fb52352b538fee 331
+step 5 update w0 (7 nodes)
+  w0 cache-add n281474976710696
+  w0 cache-add n31
+  w0 cache-add n32
+  w0 cache-add n34
+  w0 cache-add n37
+  w0 object n281474976710696 announce "zsh" 2
+  w0 object n32 announce "save" 2
+  w0 object n4 selection-changed
+  w0 object n8 child-added 0 n31
+  w0 register n14 0x0
+  w0 register n281474976710696 0x1
+  w0 register n31 0x80021
+  w0 register n32 0x21
+  w0 register n34 0x21
+  w0 register n37 0x23
+  w0 register n8 0x0
+  w0 unregister n14 0x0
+  w0 unregister n8 0x0
+  tree 1c187625c9bd7e51 587
+  text 3bea131739b3284d 259
+  actions bb05b2d6c15acfdf 441
+step 6 focus w0 false
+  w0 object n0 state active false
+  w0 object n4 state focused false
+  w0 register n4 0x0
+  w0 unregister n4 0x0
+  w0 window n0 "save" deactivated
+  tree 8ebb871a8057ddc8 587
+  text 3bea131739b3284d 259
+  actions bb05b2d6c15acfdf 441
+step 7 update w0 (2 nodes)
+  w0 object n14 text-inserted 24 8 "xzzé -a "
+  w0 object n19 announce "ok" 1
+  w0 object n19 bounds (144,208 156x28)
+  w0 object n19 description ""
+  w0 object n19 name "ok"
+  w0 register n19 0x2
+  w0 unregister n19 0x0
+  tree 5690c6bc5a7edbd8 587
+  text deda2d7db22d540c 331
+  actions bd3e08179c2034e7 441
+step 8 update w0 (0 nodes)
+  tree 5690c6bc5a7edbd8 587
+  text deda2d7db22d540c 331
+  actions bd3e08179c2034e7 441
+step 9 update w0 (1 nodes)
+  w0 cache-remove n281474976710696
+  w0 cache-remove n31
+  w0 cache-remove n32
+  w0 cache-remove n34
+  w0 cache-remove n37
+  w0 cache-remove n8
+  w0 object n281474976710696 state defunct true
+  w0 object n31 state defunct true
+  w0 object n32 state defunct true
+  w0 object n34 state defunct true
+  w0 object n37 state defunct true
+  w0 object n4 child-removed n8
+  w0 object n4 selection-changed
+  w0 object n4 state focusable false
+  w0 object n8 state defunct true
+  w0 register n10 0x0
+  w0 register n4 0x0
+  w0 unregister n10 0x0
+  w0 unregister n281474976710696 0x1
+  w0 unregister n31 0x80021
+  w0 unregister n32 0x21
+  w0 unregister n34 0x21
+  w0 unregister n37 0x23
+  w0 unregister n4 0x0
+  w0 unregister n8 0x21
+  tree 1b2387e9d849a94c 380
+  text deda2d7db22d540c 331
+  actions 29b04ee71e48215b 309
+step 10 update w0 (1 nodes)
+  w0 cache-remove n23
+  w0 cache-remove n25
+  w0 object n19 child-removed n23
+  w0 object n23 state defunct true
+  w0 object n25 state defunct true
+  w0 register n19 0x0
+  w0 unregister n19 0x0
+  w0 unregister n23 0x4021
+  w0 unregister n25 0x1
+  tree 24dffac9ae5c98b8 321
+  text deda2d7db22d540c 331
+  actions 7e2845ec7d494447 265
+step 11 update w0 (1 nodes)
+  w0 cache-remove n10
+  w0 cache-remove n4
+  w0 cache-remove n5
+  w0 object n10 state defunct true
+  w0 object n3 child-removed n4
+  w0 object n4 state defunct true
+  w0 object n5 state defunct true
+  w0 register n11 0x0
+  w0 register n3 0x0
+  w0 unregister n10 0x23
+  w0 unregister n11 0x0
+  w0 unregister n3 0x0
+  w0 unregister n4 0x4001
+  w0 unregister n5 0x21
+  tree a1ab3c10d23e4b13 225
+  text deda2d7db22d540c 331
+  actions 0361e9485b945636 199
+step 12 update w0 (4 nodes)
+  w0 cache-add n281474976710697
+  w0 cache-add n43
+  w0 object n11 child-added 0 n281474976710697
+  w0 object n14 text-inserted 29 5 "x🙂c🙂b"
+  w0 register n11 0x0
+  w0 register n281474976710697 0x4003
+  w0 register n43 0x3
+  w0 unregister n11 0x0
+  tree f7d1d1cea9365a8c 269
+  text b7d17f067f2209e8 376
+  actions 9cd7808953fe26d5 243
+exit
+  w0 object root child-removed n0
+scenario generated 36
+step 0 open w0
+  w0 object n38 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x21
+  w0 register n10 0x40001
+  w0 register n28 0x21
+  w0 register n281474976710658 0x21
+  w0 register n281474976710677 0x40021
+  w0 register n30 0x1
+  w0 register n33 0x21
+  w0 register n35 0x23
+  w0 register n36 0x40021
+  w0 register n38 0x21
+  w0 register n4 0x80023
+  w0 register n6 0x80021
+  w0 register n7 0x1
+  w0 register n8 0x21
+  w0 register n9 0x80021
+  tree e455023f1db98296 499
+  text f94948507a174288 654
+  actions 852feb857c3499af 403
+step 1 update w0 (1 nodes)
+  w0 object n10 text-removed 32 1 "y"
+  tree 38ab08c40380d4b8 499
+  text a13a7e9a4711f84f 645
+  actions 439f74c8c7e657b2 403
+step 2 update w0 (0 nodes)
+  tree 38ab08c40380d4b8 499
+  text a13a7e9a4711f84f 645
+  actions 439f74c8c7e657b2 403
+step 3 update w0 (2 nodes)
+  w0 object n10 text-inserted 16 3 " e\u{301}"
+  w0 object n9 description "Find"
+  w0 object n9 state focusable false
+  w0 object n9 value 12
+  w0 register n9 0x0
+  w0 unregister n9 0x0
+  tree 3d81ba07af519b06 499
+  text ed99a703b8c59810 672
+  actions 4a5f8f8ba3babe91 403
+step 4 bounds w0
+  tree 42c1e080cb272c31 514
+  text cad1edae4674ff7a 672
+  actions 73501472773faa87 403
+step 5 bounds w0
+  tree e1be7aff54881e8d 514
+  text 4b4e763869759681 672
+  actions aa72154e0f05ebb8 403
+step 6 update w0 (0 nodes)
+  w0 cache-add n37
+  w0 cache-remove n38
+  w0 object n37 state focused true
+  w0 object n38 state defunct true
+  w0 object n38 state focused false
+  w0 register n37 0x21
+  w0 unregister n38 0x21
+  tree 65685fc64b2a2a49 514
+  text 4b4e763869759681 672
+  actions 4002aeaa8af54f82 403
+step 7 update w0 (2 nodes)
+  w0 object n33 name "été"
+  w0 object n33 state focusable false
+  w0 object n35 bounds (273,47 163x16)
+  w0 register n33 0x2
+  w0 register n35 0x0
+  w0 unregister n33 0x0
+  w0 unregister n35 0x0
+  tree 2d0ce093ebf5d5e8 514
+  text 4b4e763869759681 672
+  actions 4002aeaa8af54f82 403
+step 8 bounds w0
+  tree aa02c874bc9356d0 514
+  text 20dfea3a10ef99ad 672
+  actions 09010bb40a050215 403
+step 9 update w0 (1 nodes)
+  w0 object n281474976710677 text-inserted 18 4 " x-🙂"
+  tree aa02c874bc9356d0 514
+  text 0fcbc14b88ae82ee 708
+  actions d30c40d8f7156de5 403
+step 10 update w0 (1 nodes)
+  w0 object n10 text-removed 16 8 " e\u{301}yy中21"
+  tree 40b78427b6ef858a 514
+  text 9ad2217403c1ab08 636
+  actions 66f2bdc6de47f7c8 403
+step 11 update w0 (1 nodes)
+  w0 object n4 bounds (251,183 130x54)
+  w0 object n4 state checkable true
+  w0 object n4 state indeterminate true
+  w0 register n4 0x0
+  w0 unregister n4 0x2
+  tree 765c32da5b00e71d 514
+  text 9ad2217403c1ab08 636
+  actions 66f2bdc6de47f7c8 403
+step 12 update w0 (0 nodes)
+  w0 cache-remove n37
+  w0 object n0 state focusable true
+  w0 object n0 state focused true
+  w0 object n37 state defunct true
+  w0 object n37 state focused false
+  w0 register n0 0x0
+  w0 unregister n0 0x0
+  w0 unregister n37 0x21
+  tree ad0c7442e5d2b723 477
+  text 9ad2217403c1ab08 636
+  actions 380130479e09fb5c 381
+exit
+  w0 object root child-removed n0
+scenario generated 37
+step 0 open w0
+  w0 object n22 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x80023
+  w0 register n17 0x40001
+  w0 register n22 0x1
+  w0 register n23 0x40023
+  w0 register n26 0x3
+  w0 register n27 0x40023
+  w0 register n3 0x1
+  w0 register n31 0x80001
+  w0 register n33 0x40021
+  w0 register n4 0x23
+  w0 register n7 0x21
+  w0 register n8 0x40021
+  tree 265fc7d20d509e9c 358
+  text d4f03df165bca5d0 1004
+  actions 1f2dc9e546bcdf17 387
+step 1 open w1
+  w1 object root child-added 1 n0
+  w1 register n0 0x21
+  w1 register n281474976710694 0x84003
+  w1 register n281474976710702 0x4003
+  w1 register n281474976710705 0x80021
+  w1 register n281474976710711 0x21
+  w1 register n281474976710713 0x21
+  w1 register n41 0x4001
+  w1 register n43 0x21
+  w1 register n52 0x21
+  w1 register n56 0x21
+  tree f4d51aa9b40592f0 681
+  text d4f03df165bca5d0 1004
+  actions e4f4bd702b588800 604
+step 2 update w0 (1 nodes)
+  w0 cache-add n28
+  w0 object n17 text-inserted 2 1 "🙂"
+  w0 object n22 state active false
+  w0 object n22 state focusable false
+  w0 object n22 state focused false
+  w0 object n28 state focused true
+  w0 register n22 0x0
+  w0 register n28 0x21
+  w0 unregister n22 0x0
+  tree 11d9f8ee5fa920d5 718
+  text b5a9e547fc2397d5 1013
+  actions f08394a2e4e5539d 626
+step 3 bounds w0
+  tree e070d22621158697 733
+  text e50e48443a3f2515 1013
+  actions 6b505384943725f8 626
+step 4 update w0 (1 nodes)
+  w0 cache-remove n28
+  w0 object n22 state active true
+  w0 object n22 state focusable true
+  w0 object n22 state focused true
+  w0 object n28 state defunct true
+  w0 object n28 state focused false
+  w0 object n33 state focusable true
+  w0 register n22 0x0
+  w0 register n33 0x0
+  w0 unregister n22 0x0
+  w0 unregister n28 0x21
+  w0 unregister n33 0x0
+  tree 491f79a474e6bd9f 696
+  text e50e48443a3f2515 1013
+  actions 945db2e008239f39 604
+step 5 bounds w0
+  tree 5b0f8ed112bb7dc2 696
+  text e6d8ebd89ba16ebf 1013
+  actions ff6ba4465792b727 604
+step 6 update w0 (0 nodes)
+  tree 5b0f8ed112bb7dc2 696
+  text e6d8ebd89ba16ebf 1013
+  actions ff6ba4465792b727 604
+step 7 update w0 (2 nodes)
+  w0 object n17 bounds (307,107 34x26)
+  w0 object n17 description "été"
+  w0 object n17 name "zsh"
+  w0 object n17 state focusable true
+  w0 object n22 state active false
+  w0 object n22 state focusable false
+  w0 object n22 state focused false
+  w0 object n8 state focusable true
+  w0 object n8 state focused true
+  w0 object n8 text-removed 0 8 "..22🙂中\r\n"
+  w0 register n17 0x20
+  w0 register n22 0x0
+  w0 register n8 0x0
+  w0 unregister n17 0x0
+  w0 unregister n22 0x0
+  w0 unregister n8 0x0
+  tree 5de251a88c69177b 711
+  text 4b6d752a9d48a658 956
+  actions 7b6546bef3c67b28 604
+step 8 update w0 (1 nodes)
+  w0 cache-remove n17
+  w0 object n17 state defunct true
+  w0 object n7 child-removed n17
+  w0 register n7 0x0
+  w0 unregister n17 0x40021
+  w0 unregister n7 0x0
+  tree d5a276595df8e286 674
+  text 894282ed3c6f4128 862
+  actions e9cf02db105e847c 557
+step 9 update w0 (0 nodes)
+  tree d5a276595df8e286 674
+  text 894282ed3c6f4128 862
+  actions e9cf02db105e847c 557
+step 10 update w0 (1 nodes)
+  w0 register n33 0x0
+  w0 unregister n33 0x0
+  tree d5a276595df8e286 674
+  text 9e3e958a710bcbbe 862
+  actions 445b37e128030ed3 557
+step 11 bounds w0
+  tree 72973eff1398726e 674
+  text f30ad3663e5a3b39 862
+  actions ac1a5d8d4c6ccbb4 557
+step 12 update w0 (2 nodes)
+  w0 object n23 bounds (216,131 49x12)
+  w0 register n0 0x0
+  w0 register n23 0x0
+  w0 register n27 0x0
+  w0 register n3 0x0
+  w0 register n31 0x0
+  w0 register n33 0x0
+  w0 unregister n0 0x0
+  w0 unregister n23 0x2
+  w0 unregister n27 0x0
+  w0 unregister n3 0x0
+  w0 unregister n31 0x0
+  w0 unregister n33 0x0
+  tree 2427c7162f5581e1 674
+  text 1954364045e019fc 862
+  actions 23d0db714f7b6273 557
+step 13 bounds w0
+  tree bd1690b2f009407d 674
+  text 06a1315c83be41d6 862
+  actions 93c67f695fbe2270 557
+step 14 close w1
+  w1 object root child-removed n0
+  tree eaf5a74e74ab2d8a 351
+  text 06a1315c83be41d6 862
+  actions d29019d8c09d1aa7 340
+exit
+  w0 object root child-removed n0
+scenario generated 38
+step 0 open w0
+  w0 object n34 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x80021
+  w0 register n1 0x40001
+  w0 register n12 0x23
+  w0 register n15 0x23
+  w0 register n17 0x40001
+  w0 register n21 0x80021
+  w0 register n24 0x1
+  w0 register n25 0x21
+  w0 register n28 0x21
+  w0 register n30 0x23
+  w0 register n32 0x3
+  w0 register n34 0x80023
+  w0 register n35 0x21
+  tree ef69222195fa2afe 425
+  text fcb4e93c503cd161 266
+  actions 5fc26991ae6e8c31 334
+step 1 open w1
+  w1 object root child-added 1 n0
+  w1 register n0 0x21
+  w1 register n281474976710721 0x80001
+  w1 register n36 0x40001
+  w1 register n45 0x4021
+  w1 register n48 0x1
+  w1 register n50 0x23
+  w1 register n51 0x23
+  w1 register n54 0x40023
+  w1 register n62 0x4003
+  w1 register n66 0x23
+  w1 register n67 0x23
+  w1 register n68 0x40021
+  tree 3593150e47ccb137 807
+  text 9a17ba9813d7d979 983
+  actions 045609cc637907ab 670
+step 2 update w0 (0 nodes)
+  tree 3593150e47ccb137 807
+  text 9a17ba9813d7d979 983
+  actions 045609cc637907ab 670
+step 3 update w0 (1 nodes)
+  w0 object n1 text-removed 8 1 "中"
+  tree 3593150e47ccb137 807
+  text fbff61f69105bee3 974
+  actions bed2e05276da3b8a 670
+step 4 update w0 (1 nodes)
+  w0 object n1 text-removed 3 1 "b"
+  tree 3593150e47ccb137 807
+  text b8e45287a7afbe7c 965
+  actions bb9246fd5167439d 670
+step 5 update w0 (2 nodes)
+  w0 object n17 bounds (274,245 7x37)
+  w0 object n25 state focusable false
+  w0 register n17 0x22
+  w0 register n25 0x0
+  w0 unregister n17 0x0
+  w0 unregister n25 0x0
+  tree c96bbe8fedfcc100 822
+  text 09a1a831c33b0570 980
+  actions bb9246fd5167439d 670
+step 6 update w0 (1 nodes)
+  w0 cache-add n11
+  w0 object n1 text-inserted 1 14 "c1.ß2e\u{301}x-ß bb🙂"
+  w0 object n11 state focused true
+  w0 object n34 state focusable false
+  w0 object n34 state focused false
+  w0 register n11 0x1
+  w0 register n34 0x0
+  w0 unregister n34 0x0
+  tree f38f28fd17871c72 844
+  text 8751dcf77961e248 1106
+  actions 2bff2dc00425e12b 692
+step 7 bounds w0
+  tree 98410b6cfd227327 844
+  text ac6a4fea746325a8 1106
+  actions 8cb6b2630439433f 692
+step 8 update w0 (0 nodes)
+  w0 cache-remove n11
+  w0 object n11 state defunct true
+  w0 object n11 state focused false
+  w0 object n25 state focusable true
+  w0 object n25 state focused true
+  w0 register n25 0x0
+  w0 unregister n11 0x1
+  w0 unregister n25 0x0
+  tree 57b223a709eb1d2b 822
+  text ac6a4fea746325a8 1106
+  actions 118b900501a7a03d 670
+step 9 update w0 (2 nodes)
+  w0 object n1 text-inserted 17 7 "e\u{301}-cbaa"
+  w0 object n12 state focusable true
+  w0 object n12 state focused true
+  w0 object n24 bounds (254,205 109x60)
+  w0 object n24 description ""
+  w0 object n24 value 61
+  w0 object n25 state focusable false
+  w0 object n25 state focused false
+  w0 register n12 0x0
+  w0 register n24 0x80020
+  w0 register n25 0x0
+  w0 unregister n12 0x0
+  w0 unregister n24 0x0
+  w0 unregister n25 0x0
+  tree 0fc90df28f0f1665 837
+  text 92403aa4600f9e70 1169
+  actions 5965c564b569a278 670
+step 10 update w0 (1 nodes)
+  w0 object n1 text-inserted 17 11 "é🙂 c e\u{301} xé中"
+  tree 0fc90df28f0f1665 837
+  text 7628d258c8a16bbb 1268
+  actions f3ea7ab337b2185b 670
+step 11 update w0 (1 nodes)
+  w0 object n15 bounds (381,293 36x37)
+  w0 object n15 name ""
+  w0 register n15 0x0
+  w0 unregister n15 0x0
+  tree 5ba1ac57a82fd077 837
+  text 7628d258c8a16bbb 1268
+  actions f3ea7ab337b2185b 670
+step 12 update w0 (1 nodes)
+  w0 cache-add n281474976710676
+  w0 object n1 text-removed 11 2 " b"
+  w0 object n12 state focusable false
+  w0 object n12 state focused false
+  w0 object n281474976710676 state focused true
+  w0 register n12 0x0
+  w0 register n281474976710676 0x1
+  w0 unregister n12 0x0
+  tree e3ee25862a1629a4 859
+  text a11b66a88f74829f 1250
+  actions f48688488cfffeb6 692
+step 13 focus w1 false
+  tree e3ee25862a1629a4 859
+  text a11b66a88f74829f 1250
+  actions f48688488cfffeb6 692
+step 14 close w1
+  w1 object root child-removed n0
+  tree 4a96b9c3e2dc89d8 477
+  text e33313654cc66c7b 533
+  actions b6a3c93bec6bc2f4 356
+exit
+  w0 object root child-removed n0
+scenario generated 39
+step 0 open w0
+  w0 object n13 state focused true
+  w0 object root child-added 0 n0
+  w0 register n0 0x21
+  w0 register n13 0x1
+  w0 register n27 0x4021
+  w0 register n28 0x1
+  w0 register n281474976710660 0x423
+  w0 register n281474976710663 0x40001
+  w0 register n281474976710674 0xc0021
+  w0 register n3 0x80003
+  w0 register n5 0x21
+  tree ff2755b183172174 262
+  text f519312e4e8ef389 668
+  actions 09a850cb508835a5 246
+step 1 update w0 (0 nodes)
+  tree 6e69b04f7eb026b3 262
+  text f519312e4e8ef389 668
+  actions 09a850cb508835a5 246
+step 2 focus w0 true
+  tree 6e69b04f7eb026b3 262
+  text f519312e4e8ef389 668
+  actions 09a850cb508835a5 246
+step 3 update w0 (2 nodes)
+  w0 object n281474976710674 text-inserted 19 11 " 1ze\u{301}中中yéza"
+  w0 object n3 bounds (131,85 180x32)
+  w0 object n3 description "zsh"
+  w0 object n3 value 39
+  w0 register n3 0x20
+  w0 unregister n3 0x2
+  tree 78dbda4dd161b83f 277
+  text 458f20b04d090f9b 767
+  actions 877139f906b32315 246
+step 4 update w0 (2 nodes)
+  w0 object n281474976710660 name ""
+  w0 register n281474976710660 0x0
+  w0 unregister n281474976710660 0x0
+  tree f92ff9313804b1bc 277
+  text 6529c17d38fa6eb2 767
+  actions 877139f906b32315 246
+step 5 update w0 (1 nodes)
+  w0 object n281474976710674 text-removed 25 6 "中yézaz"
+  tree f92ff9313804b1bc 277
+  text 98b6c869bacde2b5 713
+  actions bcbc8d9915a8c144 246
+step 6 update w0 (16 nodes)
+  tree f92ff9313804b1bc 277
+  text 98b6c869bacde2b5 713
+  actions bcbc8d9915a8c144 246
+step 7 update w0 (2 nodes)
+  w0 cache-remove n13
+  w0 object n13 state defunct true
+  w0 object n13 state focused false
+  w0 object n3 state focusable true
+  w0 object n3 state focused true
+  w0 register n3 0x0
+  w0 unregister n13 0x1
+  w0 unregister n3 0x0
+  tree 405ab6ebfca69178 255
+  text 1d30de42562d2424 713
+  actions 87822eaeaa306634 224
+step 8 update w0 (1 nodes)
+  w0 object n281474976710663 text-removed 29 1 "1"
+  tree 405ab6ebfca69178 255
+  text 2f1c8f488cd84444 704
+  actions fd1a10b315d04bfd 224
+step 9 update w0 (1 nodes)
+  w0 register n0 0x0
+  w0 register n27 0x0
+  w0 register n281474976710660 0x0
+  w0 register n281474976710674 0x0
+  w0 register n3 0x0
+  w0 unregister n0 0x0
+  w0 unregister n27 0x0
+  w0 unregister n281474976710660 0x0
+  w0 unregister n281474976710674 0x0
+  w0 unregister n3 0x0
+  tree d522e2e05ffecbf0 255
+  text 398b09597e640b9a 704
+  actions bc16fc2496b8f29f 224
+step 10 update w0 (16 nodes)
+  tree d522e2e05ffecbf0 255
+  text 398b09597e640b9a 704
+  actions bc16fc2496b8f29f 224
+step 11 update w0 (6 nodes)
+  w0 cache-add n30
+  w0 cache-add n31
+  w0 object n281474976710660 child-added 0 n30
+  w0 register n0 0x0
+  w0 register n27 0x0
+  w0 register n281474976710660 0x0
+  w0 register n281474976710674 0x0
+  w0 register n3 0x0
+  w0 register n30 0x21
+  w0 register n31 0x40021
+  w0 unregister n0 0x0
+  w0 unregister n27 0x0
+  w0 unregister n281474976710660 0x0
+  w0 unregister n281474976710674 0x0
+  w0 unregister n3 0x0
+  tree b3ef34f180572e7b 329
+  text f236e3c2fc5234e6 942
+  actions 2259e34317301097 293
+step 12 update w0 (20 nodes)
+  tree b3ef34f180572e7b 329
+  text f236e3c2fc5234e6 942
+  actions 2259e34317301097 293
+exit
+  w0 object root child-removed n0

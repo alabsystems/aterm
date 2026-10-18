@@ -1,0 +1,41 @@
+# claude-code 2.1.302 · MEASURED 2026-10-17, `aterm ctl text` of a private headless aterm (144x40, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · FRAME 1 (stand) of one fullscreen entrance (CLAUDE_CODE_NO_FLICKER=1, --effort workspace, the first fullscreen launch of this build on this config), the screen read every ~50 ms: the JUMP sequence, read as stand, dust, dust, arms up, stand, dust, dust, arms up, stand, then the rest with the wand, 0.85 s from the first stand; the card's words never move: the mascot STANDS at the card's text column (its top row opens with ▐, no wand yet: the mascot ends at column 9, the text at 13)
+
+ ▐▛███▛█     Claude Code v2.1.302
+▝▜██████▀    Opus 5.5 with xhigh effort · API Usage Billing
+ ▝▝   ▝▝     /private/tmp/at.TOxX/proj
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                 ◉ xhigh · workspace · /effort
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── workspace ─
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

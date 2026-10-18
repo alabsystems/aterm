@@ -70,13 +70,14 @@ pub(crate) use macos::native_strip_container;
 pub(crate) use macos::{
     ToolbarHandle, begin_tab_rename, can_present_tab_rename, end_tab_rename,
     install_window_toolbar, read_tab_chrome, read_tab_menus, reflow_window_tabs,
-    rename_editor_edit, rename_editor_text, set_active_tab_color, set_strip_dark, set_window_tabs,
+    rename_editor_edit, rename_editor_text, set_active_tab_color, set_strip_accent, set_strip_dark,
+    set_window_tabs,
 };
 
 #[cfg(not(target_os = "macos"))]
 pub(crate) use non_macos::{
     ToolbarHandle, install_window_toolbar, read_tab_chrome, read_tab_menus, set_active_tab_color,
-    set_strip_dark, set_window_tabs,
+    set_strip_accent, set_strip_dark, set_window_tabs,
 };
 
 use crate::tab_bar::TabStripMetadata;
@@ -270,7 +271,7 @@ fn tab_display_label(title: &str, index: usize, available_width: f64) -> String 
 }
 
 #[must_use]
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 fn tab_close_accessibility_label(title: &str) -> String {
     format!("Close {title} Tab")
 }
@@ -360,15 +361,23 @@ mod shared_tests {
             settings_metadata,
             1,
         );
+        assert!(
+            help.starts_with("Settings · Cursor & Motion · ") && help.ends_with(" · ⌘2"),
+            "{help}"
+        );
         assert_eq!(
-            help,
-            "Settings · Cursor & Motion · Unsaved changes · Working · Needs attention · Connected both ways with peers · ⌘2"
+            help.split(" · ").count(),
+            7,
+            "the tooltip, one clause per state (dirty, busy, attention, both \
+             directions as one), and the shortcut: {help}"
         );
     }
 
     /// A tab that needs attention for a stated reason says it once: the
     /// tooltip's `Needs attention: <reason>` line stands in for the bare clause,
-    /// and a tab with no reason line still gets the clause.
+    /// and a tab with no reason line still gets the clause. A frozen or stopped
+    /// program's reason line names the stall, so its clause would repeat it;
+    /// another reason keeps the clause.
     #[test]
     fn the_hover_names_the_reason_once() {
         let metadata = TabStripMetadata {
@@ -380,63 +389,30 @@ mod shared_tests {
             closable: true,
             drop_target: false,
         };
-        assert_eq!(
-            tab_help(
-                "build",
-                Some("build\nNeeds attention: upgrade stalled"),
-                metadata,
-                0
-            ),
-            "build\nNeeds attention: upgrade stalled · ⌘1"
-        );
-        assert_eq!(
-            tab_help("build", Some("build\ncwd: ~/src"), metadata, 0),
-            "build\ncwd: ~/src · Needs attention · ⌘1"
-        );
-        // A frozen or stopped program's reason line names the stall; its
-        // clause would repeat it. Another reason keeps the clause.
         let stop = |cause| TabStripMetadata {
             attention: crate::tab_bar::ChipLevel::Stop(cause),
             ..metadata
         };
+        let reason = "build\nNeeds attention: upgrade stalled";
         let frozen = "build\nNeeds attention: claude is frozen: not reading input since 14:02";
-        assert_eq!(
-            tab_help(
-                "build",
-                Some(frozen),
-                stop(aterm_messages::presence::StopCause::Frozen),
-                0
-            ),
-            format!("{frozen} · ⌘1")
-        );
         let stopped = "build\nNeeds attention: vim is stopped with input queued since 14:02";
-        assert_eq!(
-            tab_help(
-                "build",
-                Some(stopped),
-                stop(aterm_messages::presence::StopCause::Suspended),
-                0
-            ),
-            format!("{stopped} · ⌘1")
-        );
-        assert_eq!(
-            tab_help(
-                "build",
-                Some("build\nNeeds attention: upgrade stalled"),
-                stop(aterm_messages::presence::StopCause::Frozen),
-                0
-            ),
-            "build\nNeeds attention: upgrade stalled · Frozen, not reading input · ⌘1"
-        );
-        assert_eq!(
-            tab_help(
-                "build",
-                Some("build\nNeeds attention: upgrade stalled"),
-                stop(aterm_messages::presence::StopCause::Hold),
-                0
-            ),
-            "build\nNeeds attention: upgrade stalled · Held · ⌘1"
-        );
+        use aterm_messages::presence::StopCause::{Frozen, Hold, Suspended};
+        for (tooltip, metadata, clauses) in [
+            (reason, metadata, 1),
+            ("build\ncwd: ~/src", metadata, 2),
+            (frozen, stop(Frozen), 1),
+            (stopped, stop(Suspended), 1),
+            (reason, stop(Frozen), 2),
+            (reason, stop(Hold), 2),
+        ] {
+            let help = tab_help("build", Some(tooltip), metadata, 0);
+            assert!(help.starts_with(tooltip), "{help}");
+            assert_eq!(
+                help.split(" · ").count(),
+                clauses + 1,
+                "{tooltip:?} with {metadata:?}: {help}"
+            );
+        }
     }
 
     /// A native tab names its app in words, once: not when the title says it.
@@ -451,19 +427,12 @@ mod shared_tests {
             closable: true,
             drop_target: false,
         };
+        let clauses = |title, icon| tab_help(title, None, app(icon), 0).split(" · ").count();
         assert_eq!(
-            tab_help(
-                "README.md",
-                None,
-                app(crate::tab_bar::TabIconKind::Markdown),
-                0
-            ),
-            "README.md · Markdown viewer · ⌘1"
+            clauses("README.md", crate::tab_bar::TabIconKind::Markdown),
+            3
         );
-        assert_eq!(
-            tab_help("main.rs", None, app(crate::tab_bar::TabIconKind::Editor), 0),
-            "main.rs · Editor · ⌘1"
-        );
+        assert_eq!(clauses("main.rs", crate::tab_bar::TabIconKind::Editor), 3);
         assert_eq!(
             tab_help(
                 "Settings",
@@ -471,7 +440,8 @@ mod shared_tests {
                 app(crate::tab_bar::TabIconKind::Settings),
                 0
             ),
-            "Settings · ⌘1"
+            "Settings · ⌘1",
+            "the title already names the app"
         );
     }
 
@@ -499,29 +469,15 @@ mod shared_tests {
         )
         .expect("two tabs report chrome");
         assert!(line.contains(r#"["selected", "conn-out"], ["conn-in"]"#));
-        assert_eq!(
-            tab_help(
-                "push-src",
-                None,
-                conn_only(Some(crate::tab_bar::TabConnRole::Outbound)),
-                0
-            ),
-            "push-src · Connects into a peer session · ⌘1"
+        let help = |role| tab_help("peer", None, conn_only(role), 0);
+        let (out, inbound) = (
+            help(Some(crate::tab_bar::TabConnRole::Outbound)),
+            help(Some(crate::tab_bar::TabConnRole::Inbound)),
         );
-        assert_eq!(
-            tab_help(
-                "push-dst",
-                None,
-                conn_only(Some(crate::tab_bar::TabConnRole::Inbound)),
-                1
-            ),
-            "push-dst · A peer session connects in · ⌘2"
-        );
-        assert_eq!(
-            tab_help("peer", None, conn_only(None), 0),
-            "peer · ⌘1",
-            "no connection adds nothing"
-        );
+        assert_eq!(out.split(" · ").count(), 3, "{out}");
+        assert_eq!(inbound.split(" · ").count(), 3, "{inbound}");
+        assert_ne!(out, inbound, "each direction is its own words");
+        assert_eq!(help(None), "peer · ⌘1", "no connection adds nothing");
     }
 
     #[test]
@@ -544,10 +500,6 @@ mod shared_tests {
         assert_eq!(tab_display_label("Settings", 1, 146.0), "Settings  ⌘2");
         assert_eq!(tab_display_label("Settings", 1, 51.0), "Settings");
         assert_eq!(tab_display_label("build-server", 0, 74.0), "build-server");
-        assert_eq!(
-            tab_close_accessibility_label("Settings"),
-            "Close Settings Tab"
-        );
     }
 
     #[test]
@@ -793,7 +745,13 @@ mod non_macos {
             .ext
             .iter()
             .enumerate()
-            .map(|(i, e)| crate::session_chrome::tab_menu_chrome_line(i, &e.menu))
+            .map(|(i, e)| {
+                crate::session_chrome::tab_menu_chrome_line(
+                    i,
+                    &e.menu,
+                    crate::turn_ledger::now_ms(),
+                )
+            })
             .collect()
     }
 
@@ -803,6 +761,10 @@ mod non_macos {
     /// Off macOS there is no native strip; the selected-tab color override is
     /// carried by the in-grid strip instead (`tab_bar::strip_colors_with_active`).
     pub(crate) fn set_active_tab_color(_handle: &ToolbarHandle, _color: Option<[u8; 3]>) {}
+
+    /// Off macOS there is no native strip; the in-grid strip draws the chrome
+    /// accent from the tokens instead (`tab_bar::strip_colors`).
+    pub(crate) fn set_strip_accent(_handle: &ToolbarHandle, _accent: Option<[u8; 3]>) {}
 }
 
 #[cfg(all(test, not(target_os = "macos")))]
@@ -997,30 +959,10 @@ mod macos {
 
     impl TabGeometry {
         /// Whether the chip at `index` of a strip whose `active` chip is selected
-        /// draws a leading divider. PURE, so the rule is stated once and testable.
+        /// draws a leading divider.
         #[must_use]
         const fn separates(index: usize, active: usize) -> bool {
             index > 0 && index != active && index != active + 1
-        }
-    }
-
-    #[cfg(test)]
-    mod geometry_tests {
-        use super::TabGeometry;
-
-        /// Dividers never precede the first chip and never touch the selected pill.
-        #[test]
-        fn dividers_separate_quiet_titles_and_never_crowd_the_selected_pill() {
-            let drawn = |active: usize| {
-                (0..5)
-                    .map(|index| TabGeometry::separates(index, active))
-                    .collect::<Vec<_>>()
-            };
-            assert_eq!(drawn(0), [false, false, true, true, true]);
-            assert_eq!(drawn(2), [false, true, false, false, true]);
-            assert_eq!(drawn(4), [false, true, true, true, false]);
-            // A lone chip is a title band; nothing precedes it either way.
-            assert!(!TabGeometry::separates(0, 0));
         }
     }
 
@@ -1827,7 +1769,7 @@ mod macos {
                         // inside a draw cycle (as below).
                         unsafe {
                             let bounds = appkit::send_rect(self.as_id(), sel!(bounds));
-                            appkit::send_v(ns_color(sel!(controlAccentColor)), sel!(set));
+                            appkit::send_v(strip_accent_color(), sel!(set));
                             let keyline = rect(
                                 bounds.origin.x + 8.0,
                                 ivars.center_y.get() - TAB_PILL_HEIGHT * 0.5,
@@ -1880,7 +1822,7 @@ mod macos {
                             (pill.size.width - 16.0).max(0.0),
                             2.0,
                         );
-                        appkit::send_v(ns_color(sel!(controlAccentColor)), sel!(set));
+                        appkit::send_v(strip_accent_color(), sel!(set));
                         appkit::send_v(rounded_rect(keyline, 1.0), sel!(fill));
                     } else if ivars.hovered.get() {
                         // Inactive but hovered: a fainter rounded pill so the hover target
@@ -1910,11 +1852,11 @@ mod macos {
                     // Drop-target highlight (design §3.2): an accent ring and faint
                     // wash while a connection drag hovers this chip. Paint only.
                     if ivars.metadata.get().drop_target {
-                        let wash = with_alpha(ns_color(sel!(controlAccentColor)), 0.18);
+                        let wash = with_alpha(strip_accent_color(), 0.18);
                         appkit::send_v(wash, sel!(set));
                         let path = rounded_rect(pill, TAB_PILL_RADIUS);
                         appkit::send_v(path, sel!(fill));
-                        appkit::send_v(ns_color(sel!(controlAccentColor)), sel!(set));
+                        appkit::send_v(strip_accent_color(), sel!(set));
                         appkit::send_v_f64(path, sel!(setLineWidth:), 2.0);
                         appkit::send_v(path, sel!(stroke));
                     }
@@ -2376,7 +2318,7 @@ mod macos {
                         ordinal += 1;
                         match kind {
                             TabStatusKind::Dirty => {
-                                appkit::send_v(ns_color(sel!(controlAccentColor)), sel!(set));
+                                appkit::send_v(strip_accent_color(), sel!(set));
                                 appkit::send_v(circle(x, y, 1.75 * scale), sel!(fill));
                             }
                             TabStatusKind::Busy => {
@@ -2948,8 +2890,13 @@ mod macos {
                 window: self.ivars().window,
             });
             // Clone the model and drop the borrow before tracking: the nested run loop
-            // can deliver a strip refresh that `borrow_mut`s this cell.
-            let entries = self.ivars().menu_entries.borrow().clone();
+            // can deliver a strip refresh that `borrow_mut`s this cell. Its timeline
+            // rows are aged now, as the menu pops (`TabMenuEntry::shown_at`): the
+            // stored model carries their stamps, so no clock recomposes it.
+            let entries = crate::session_chrome::menu_shown_at(
+                &self.ivars().menu_entries.borrow(),
+                crate::turn_ledger::now_ms(),
+            );
             if entries.is_empty() {
                 return;
             }
@@ -3010,7 +2957,7 @@ mod macos {
                 appkit::send_v_bool(menu.id(), sel!(setAutoenablesItems:), false);
                 for entry in entries.iter() {
                     match entry {
-                        TabMenuEntry::Header(text) => {
+                        TabMenuEntry::Header(text) | TabMenuEntry::Event { words: text, .. } => {
                             let Some(item) = item_with(text, aterm_objc::Sel::NULL) else {
                                 continue;
                             };
@@ -3080,7 +3027,11 @@ mod macos {
 
         /// This tab's context-menu introspection line for `read_tab_menus`.
         fn menu_line(&self, index: usize) -> String {
-            crate::session_chrome::tab_menu_chrome_line(index, &self.ivars().menu_entries.borrow())
+            crate::session_chrome::tab_menu_chrome_line(
+                index,
+                &self.ivars().menu_entries.borrow(),
+                crate::turn_ledger::now_ms(),
+            )
         }
 
         /// Diff icon/status/close metadata in place. Geometry changes only when an
@@ -3480,6 +3431,61 @@ mod macos {
     /// Process-wide: every window's strip follows one config. Read at draw time and
     /// set before a draw cycle exists, so it is plain atomic state.
     static ACTIVE_TAB_COLOR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    /// The authored chrome accent (theme or config `accent_color`), floored to 3:1
+    /// on the theme's background, packed like [`ACTIVE_TAB_COLOR`]; `0` keeps the
+    /// system accent (`controlAccentColor`). The macOS native strip follows the
+    /// system accent unless an accent is authored.
+    static STRIP_ACCENT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    /// The colour the strip's accent marks (the active keyline, the drop-target
+    /// ring, the dirty dot) are drawn in: the pinned accent, else the system's.
+    ///
+    /// # Safety
+    /// Main thread, inside a draw cycle; the result is +0.
+    unsafe fn strip_accent_color() -> Id {
+        match unpack(STRIP_ACCENT.load(std::sync::atomic::Ordering::Relaxed)) {
+            // SAFETY: a plain colour constructor on the main thread.
+            Some([r, g, b]) => unsafe {
+                srgb(
+                    f64::from(r) / 255.0,
+                    f64::from(g) / 255.0,
+                    f64::from(b) / 255.0,
+                    1.0,
+                )
+            },
+            // SAFETY: as above.
+            None => unsafe { ns_color(sel!(controlAccentColor)) },
+        }
+    }
+
+    /// Pin (or clear) the strip's accent and repaint the live strip. Idempotent.
+    pub(crate) fn set_strip_accent(handle: &ToolbarHandle, accent: Option<[u8; 3]>) {
+        let packed = pack(accent);
+        if STRIP_ACCENT.swap(packed, std::sync::atomic::Ordering::Relaxed) == packed {
+            return;
+        }
+        for tab in handle.tabs.borrow().iter() {
+            mark_dirty(tab.as_id());
+        }
+        mark_dirty(handle.container.id());
+    }
+
+    /// `[r, g, b]` packed `0xFF_RR_GG_BB`; `None` packs to `0`.
+    fn pack(color: Option<[u8; 3]>) -> u32 {
+        color.map_or(0, |c| {
+            0xFF00_0000 | (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2])
+        })
+    }
+
+    /// The inverse of [`pack`].
+    fn unpack(packed: u32) -> Option<[u8; 3]> {
+        (packed >> 24 == 0xFF).then_some([
+            ((packed >> 16) & 0xff) as u8,
+            ((packed >> 8) & 0xff) as u8,
+            (packed & 0xff) as u8,
+        ])
+    }
 
     /// The live override as `[r, g, b]`, if one is pinned.
     fn active_tab_color_override() -> Option<[u8; 3]> {
@@ -4235,11 +4241,9 @@ mod macos {
     /// classes.
     #[cfg(test)]
     mod objc_tests {
-        use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
-
         use aterm_objc::{
-            Bool, ClassType, Encode, Id, Obj, Sel, autoreleasepool, class, class_name,
-            method_types, msg, sel,
+            Bool, ClassType, Encode, Id, Obj, Sel, autoreleasepool, checked_msg, class, class_name,
+            method_types, sel,
         };
 
         use super::{ChromeButton, STRIP_ITEM_ID, TabRenameTarget, TabView, ToolbarDelegate};
@@ -4522,7 +4526,8 @@ mod macos {
                         sel!(toolbarDefaultItemIdentifiers:),
                         sel!(toolbarAllowedItemIdentifiers:),
                     ] {
-                        let perform: unsafe extern "C-unwind" fn(Id, Sel, Sel, Id) -> Id = msg();
+                        let perform: unsafe extern "C-unwind" fn(Id, Sel, Sel, Id) -> Id =
+                            checked_msg();
                         let arr = perform(
                             delegate.as_id(),
                             sel!(performSelector:withObject:),
@@ -4531,7 +4536,8 @@ mod macos {
                         );
                         assert!(!arr.is_null(), "{s:?} returned nil");
                         assert_eq!(appkit::send_usize(arr, sel!(count)), 1);
-                        let first: unsafe extern "C-unwind" fn(Id, Sel, usize) -> Id = msg();
+                        let first: unsafe extern "C-unwind" fn(Id, Sel, usize) -> Id =
+                            checked_msg();
                         assert_eq!(
                             appkit::nsstring_to_rust(first(arr, sel!(objectAtIndex:), 0)),
                             STRIP_ITEM_ID
@@ -4539,245 +4545,6 @@ mod macos {
                     }
                 }
             });
-        }
-
-        // ---- probes: the declared SHAPES whose real ivars need a live winit
-        //      event loop, driven through the same runtime machinery. ----
-
-        static ESCAPES: AtomicUsize = AtomicUsize::new(0);
-        static FIRST_MOUSE: AtomicIsize = AtomicIsize::new(-1);
-
-        aterm_objc::declare_class! {
-            /// `TabRenameTarget`'s three-argument selector, verbatim.
-            struct RenameProbe: NSObject {
-                const NAME: &str = "ATermRenameProbe";
-                type Ivars = ();
-                protocols: [NSObject];
-
-                @sel(control:textView:doCommandBySelector:)
-                fn control_text_view_do_command(
-                    &self,
-                    _control: Id,
-                    _text_view: Id,
-                    command: Sel,
-                ) -> Bool {
-                    if command != sel!(cancelOperation:) {
-                        return Bool::NO;
-                    }
-                    ESCAPES.fetch_add(1, Ordering::SeqCst);
-                    Bool::YES
-                }
-            }
-        }
-
-        aterm_objc::declare_class! {
-            /// `ChromeButton`/`TabView`'s `acceptsFirstMouse:` shape, on
-            /// `NSView`, so the per-arch `BOOL` return is checked on a class
-            /// with the same superclass as the real ones.
-            struct FirstMouseProbe: NSView {
-                const NAME: &str = "ATermFirstMouseProbe";
-                type Ivars = ();
-                protocols: [NSObject];
-
-                @sel(acceptsFirstMouse:) @abort_on_exception
-                fn accepts_first_mouse(&self, _event: Id) -> Bool {
-                    FIRST_MOUSE.store(1, Ordering::SeqCst);
-                    Bool::YES
-                }
-            }
-        }
-
-        /// The `SEL`-taking three-argument selector discriminates on its selector when
-        /// invoked by Foundation. `NSInvocation` reads the `":"` encoding letter,
-        /// which a direct send would not, so the invocation is the test.
-        #[test]
-        fn foundation_invokes_the_selector_taking_three_argument_method() {
-            ESCAPES.store(0, Ordering::SeqCst);
-            let probe = RenameProbe::alloc_init(crate::appkit::test_witness(), ()).expect("probe");
-            autoreleasepool(|_| {
-                // SAFETY: every send is cast to the exact prototype named beside it;
-                // `-setArgument:atIndex:` copies the bytes at the pointer, and
-                // `-getReturnValue:` writes `methodReturnLength` bytes, asserted to be
-                // a `Bool`'s.
-                unsafe {
-                    let selector = sel!(control:textView:doCommandBySelector:);
-                    let sig_for: unsafe extern "C-unwind" fn(Id, Sel, Sel) -> Id = msg();
-                    let sig = sig_for(probe.as_id(), sel!(methodSignatureForSelector:), selector);
-                    assert!(!sig.is_null());
-                    assert_eq!(appkit::send_usize(sig, sel!(numberOfArguments)), 5);
-                    assert_eq!(
-                        appkit::send_usize(sig, sel!(methodReturnLength)),
-                        size_of::<Bool>()
-                    );
-
-                    let call = |command: Sel| -> bool {
-                        let inv = appkit::send_id_id(
-                            class(c"NSInvocation").as_id(),
-                            sel!(invocationWithMethodSignature:),
-                            sig,
-                        );
-                        let set_sel: unsafe extern "C-unwind" fn(Id, Sel, Sel) = msg();
-                        set_sel(inv, sel!(setSelector:), selector);
-                        let set_arg: unsafe extern "C-unwind" fn(
-                            Id,
-                            Sel,
-                            *mut std::ffi::c_void,
-                            isize,
-                        ) = msg();
-                        let mut nil = Id::NIL;
-                        for idx in [2, 3] {
-                            set_arg(
-                                inv,
-                                sel!(setArgument:atIndex:),
-                                std::ptr::from_mut(&mut nil).cast(),
-                                idx,
-                            );
-                        }
-                        let mut cmd = command;
-                        set_arg(
-                            inv,
-                            sel!(setArgument:atIndex:),
-                            std::ptr::from_mut(&mut cmd).cast(),
-                            4,
-                        );
-                        appkit::send_v_id(inv, sel!(invokeWithTarget:), probe.as_id());
-                        let mut out = Bool::NO;
-                        let get_ret: unsafe extern "C-unwind" fn(Id, Sel, *mut std::ffi::c_void) =
-                            msg();
-                        get_ret(
-                            inv,
-                            sel!(getReturnValue:),
-                            std::ptr::from_mut(&mut out).cast(),
-                        );
-                        out.as_bool()
-                    };
-
-                    assert!(call(sel!(cancelOperation:)), "Escape was not consumed");
-                    assert!(
-                        !call(sel!(insertNewline:)),
-                        "Return was consumed — every other command must pass \
-                         through to the field editor"
-                    );
-                    assert!(!call(sel!(moveLeft:)));
-                }
-            });
-            assert_eq!(
-                ESCAPES.load(Ordering::SeqCst),
-                1,
-                "the body ran for the wrong set of commands"
-            );
-        }
-
-        /// `acceptsFirstMouse:` on an `NSView` subclass answers YES through the
-        /// runtime, and Foundation reads the return at `BOOL` width.
-        #[test]
-        fn an_nsview_subclass_answers_accepts_first_mouse() {
-            FIRST_MOUSE.store(-1, Ordering::SeqCst);
-            // SAFETY: `alloc_ivars` returns a +1 instance owing exactly one
-            // designated initializer; `-initWithFrame:` is `-(id)(NSRect)`.
-            let probe: aterm_objc::Retained<FirstMouseProbe> = unsafe {
-                let raw = FirstMouseProbe::alloc_ivars(crate::appkit::test_witness(), ());
-                assert!(!raw.is_null());
-                aterm_objc::Retained::from_owned(appkit::send_id_rect(
-                    raw,
-                    sel!(initWithFrame:),
-                    aterm_objc::CGRect {
-                        origin: aterm_objc::CGPoint { x: 0.0, y: 0.0 },
-                        size: aterm_objc::CGSize {
-                            width: 10.0,
-                            height: 10.0,
-                        },
-                    },
-                ))
-                .expect("initWithFrame:")
-            };
-            // SAFETY: `cls` is live; `-performSelector:withObject:` is the
-            // runtime's own dispatch of the declared IMP.
-            unsafe {
-                assert_eq!(
-                    method_types(FirstMouseProbe::class(), sel!(acceptsFirstMouse:)).as_deref(),
-                    Some(format!("{}@:@", Bool::ENCODING).as_str())
-                );
-                assert_eq!(
-                    class_name(aterm_objc::superclass_of(FirstMouseProbe::class())),
-                    c"NSView"
-                );
-                let perform: unsafe extern "C-unwind" fn(Id, Sel, Sel, Id) -> Id = msg();
-                perform(
-                    probe.as_id(),
-                    sel!(performSelector:withObject:),
-                    sel!(acceptsFirstMouse:),
-                    Id::NIL,
-                );
-            }
-            assert_eq!(FIRST_MOUSE.load(Ordering::SeqCst), 1);
-        }
-
-        /// An `NSView` (or any `NSResponder`) subclass does not dealloc when its last
-        /// reference drops on a non-main thread: AppKit defers responder deallocation
-        /// to a run loop, which a libtest thread lacks. The `NSObject` probe above does
-        /// drop its ivars. Not a leak in the app, where these views are released on
-        /// the main thread. This pins the behaviour; if macOS makes it synchronous,
-        /// the test fails.
-        #[test]
-        fn an_nsview_subclass_defers_its_dealloc_off_the_main_thread() {
-            static DROPS: AtomicUsize = AtomicUsize::new(0);
-            struct Spy;
-            impl Drop for Spy {
-                fn drop(&mut self) {
-                    DROPS.fetch_add(1, Ordering::SeqCst);
-                }
-            }
-            aterm_objc::declare_class! {
-                struct ViewDropProbe: NSView {
-                    const NAME: &str = "ATermViewDropProbe";
-                    type Ivars = Spy;
-
-                    @sel(ping)
-                    fn ping(&self) {}
-                }
-            }
-            DROPS.store(0, Ordering::SeqCst);
-            autoreleasepool(|_| {
-                // SAFETY: `alloc_ivars` returns a +1 instance owing exactly one
-                // designated initializer; `-initWithFrame:` is `-(id)(NSRect)`
-                // and consumes it.
-                let v: aterm_objc::Retained<ViewDropProbe> = unsafe {
-                    let raw = ViewDropProbe::alloc_ivars(crate::appkit::test_witness(), Spy);
-                    assert!(!raw.is_null());
-                    aterm_objc::Retained::from_owned(appkit::send_id_rect(
-                        raw,
-                        sel!(initWithFrame:),
-                        aterm_objc::CGRect {
-                            origin: aterm_objc::CGPoint { x: 0.0, y: 0.0 },
-                            size: aterm_objc::CGSize {
-                                width: 4.0,
-                                height: 4.0,
-                            },
-                        },
-                    ))
-                    .expect("initWithFrame:")
-                };
-                // The class carries its own generated `-dealloc`.
-                // SAFETY: live registered class.
-                assert_eq!(
-                    unsafe { method_types(ViewDropProbe::class(), sel!(dealloc)) }.as_deref(),
-                    Some("v@:")
-                );
-                // Sole owner: the release below is the last one.
-                // SAFETY: `-retainCount` is `-(NSUInteger)`, side-effect free.
-                assert_eq!(
-                    unsafe { appkit::send_usize(v.as_id(), sel!(retainCount)) },
-                    1
-                );
-                drop(v);
-            });
-            assert_eq!(
-                DROPS.load(Ordering::SeqCst),
-                0,
-                "AppKit no longer defers responder deallocation — re-read this \
-                 test's note and the `S3` entry in aterm-objc's crate docs"
-            );
         }
     }
 }

@@ -1,7 +1,10 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-//! Native Trust driver for the independent pinned Windows reference workspace.
+//! Native Trust driver for the independent pinned Windows reference
+//! workspaces: win32-oracle/ (the 0.61 closure) and, for `oracle-052`,
+//! crates/aterm-windows-sys-052/tests/oracle (the 0.52 facade ring reads).
 mod emit;
+mod facade052;
 mod model;
 mod oracle;
 mod plants;
@@ -14,7 +17,7 @@ use std::process::{ExitCode, Output};
 type Result<T> = std::result::Result<T, String>;
 const VERSION: &str = "0.61.2";
 const TRIPLES: [&str; 2] = ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"];
-const HELP: &str = "aterm-win32-oracle — generated declaration closure and independent Windows ABI oracle\n\nusage: targo --unverified run -p aterm-win32-oracle -- <gen|check|record|oracle> [options]\n\n  --root <checkout>     containing win32-oracle/ (default: ancestor of cwd)\n  --upstream <dir>      pinned registry windows-sys0.61.2 source\n  --out <dir>           gen only: write a checkout-shaped private output tree\n  --target-dir <dir>    oracle builds (default: <root>/win32-oracle/target)\n  --stock <toolchain>   foreign oracle toolchain (default: stable)\n  --no-format          gen only: leave emitted Rust unformatted\n\nThe driver, graph and host recorder use Trust. oracle is a STOCK EXCEPTION:\nabsolute stock Cargo/RUSTC compile Windows std, no Windows program runs.\nThe reference workspace has no patch table; gen/check read its pinned registry\nsource and Cargo's actual consumer/feature graph. record explicitly rewrites\nrecorded.json from the reference's host answers. check never blesses drift.\nExit:0 pass,1 finding,2 usage,3 could not run; no proof or Windows-runtime claim.\n";
+const HELP: &str = "aterm-win32-oracle — generated declaration closure and independent Windows ABI oracle\n\nusage: targo --unverified run -p aterm-win32-oracle -- <gen|check|record|oracle|oracle-052> [options]\n\n  --root <checkout>     containing win32-oracle/ (default: ancestor of cwd)\n  --upstream <dir>      pinned registry windows-sys0.61.2 source (not oracle-052)\n  --out <dir>           gen only: write a checkout-shaped private output tree\n  --target-dir <dir>    oracle builds (default: <root>/win32-oracle/target; oracle-052:\n                        <root>/crates/aterm-windows-sys-052/tests/oracle/target)\n  --stock <toolchain>   foreign oracle toolchain (default: stable)\n  --no-format          gen only: leave emitted Rust unformatted\n\nThe driver, graph and host recorder use Trust. oracle and oracle-052 are a STOCK\nEXCEPTION: absolute stock Cargo/RUSTC compile Windows std, no Windows program runs.\nThe reference workspaces have no patch table; gen/check read its pinned registry\nsource and Cargo's actual consumer/feature graph. record explicitly rewrites\nrecorded.json from the reference's host answers. check never blesses drift.\noracle-052 holds crates/aterm-windows-sys-052 (WB.1) to registry windows-sys 0.52.0:\nconformance, imports, and every planted mismatch caught.\nExit:0 pass,1 finding,2 usage,3 could not run; no proof or Windows-runtime claim.\n";
 #[derive(Clone)]
 struct Tools {
     targo: PathBuf,
@@ -95,6 +98,19 @@ fn upstream() -> Result<PathBuf> {
         .next()
         .ok_or("no cached windows-sys0.61.2; use --upstream".into())
 }
+/// rustup: on PATH, else where its installer puts it ($CARGO_HOME/bin, then
+/// ~/.cargo/bin).
+fn rustup() -> Result<PathBuf> {
+    which("rustup").or_else(|missing| {
+        std::env::var_os("CARGO_HOME")
+            .map(PathBuf::from)
+            .into_iter()
+            .chain(std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo")))
+            .map(|home| home.join("bin/rustup"))
+            .find(|p| p.is_file())
+            .ok_or(missing)
+    })
+}
 fn tools(root: &Path, stock: Option<&str>) -> Result<Tools> {
     for name in [
         "RUSTFLAGS",
@@ -121,7 +137,7 @@ fn tools(root: &Path, stock: Option<&str>) -> Result<Tools> {
         },
     };
     if let Some(name) = stock {
-        let rustup = which("rustup")?;
+        let rustup = rustup()?;
         let mut paths = vec![];
         for driver in ["cargo", "rustc"] {
             let answer = run(&rustup, &["which", "--toolchain", name, driver], root, None)?;
@@ -358,7 +374,7 @@ fn start() -> Result<u8> {
         print!("{HELP}");
         return Ok(0);
     }
-    if !["gen", "check", "record", "oracle"].contains(&verb.as_str()) {
+    if !["gen", "check", "record", "oracle", "oracle-052"].contains(&verb.as_str()) {
         eprintln!("unknown verb {verb}\n{HELP}");
         return Ok(2);
     }
@@ -375,10 +391,12 @@ fn start() -> Result<u8> {
             };
             match arg.as_str() {
                 "--root" => root = Some(PathBuf::from(value(&mut args)?)),
-                "--upstream" => up = Some(PathBuf::from(value(&mut args)?)),
+                "--upstream" if verb != "oracle-052" => {
+                    up = Some(PathBuf::from(value(&mut args)?));
+                }
                 "--out" if verb == "gen" => out = Some(PathBuf::from(value(&mut args)?)),
                 "--target-dir" => target = Some(PathBuf::from(value(&mut args)?)),
-                "--stock" if verb == "oracle" => stock = value(&mut args)?,
+                "--stock" if verb.starts_with("oracle") => stock = value(&mut args)?,
                 "--no-format" if verb == "gen" => format = false,
                 "--help" | "-h" => {
                     return Ok(true);
@@ -404,6 +422,13 @@ fn start() -> Result<u8> {
         .ok_or("cannot locate checkout; use --root")?
         .canonicalize()
         .map_err(|e| e.to_string())?;
+    let target = target.or_else(|| std::env::var_os("ORACLE_TARGET_DIR").map(PathBuf::from));
+    if verb == "oracle-052" {
+        // The 0.52 facade has its own reference workspace and no harvest.
+        let tools = tools(&root, Some(stock.as_str()))?;
+        let target = target.unwrap_or_else(|| root.join(facade052::WORKSPACE).join("target"));
+        return facade052::gate(&root, &tools, &target);
+    }
     let up = match up {
         Some(p) => p,
         None => upstream()?,
@@ -429,11 +454,7 @@ fn start() -> Result<u8> {
     for note in &model.notes {
         println!("note: {note}")
     }
-    let target = target.unwrap_or_else(|| {
-        std::env::var_os("ORACLE_TARGET_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| root.join("win32-oracle/target"))
-    });
+    let target = target.unwrap_or_else(|| root.join("win32-oracle/target"));
     match verb.as_str() {
         "gen" => {
             generate(

@@ -23,29 +23,12 @@
 //! What it pins: every `sub <local> <sid>` line is written only after its
 //! watch has recorded where it starts, and the bridge reads that session's
 //! topics again on it. The 2 s roster round would also learn the opt-in, a
-//! round later; `bridge.rs`'s
-//! `a_session_read_before_its_watch_is_read_again_on_the_watch_ack` pins the
-//! ack's read alone, and this test the end-to-end path.
+//! round later; `bridge.rs`'s `bridge_rounds_refine_the_announcement_model`
+//! pins the ack's read alone, and this test the end-to-end path.
 
 use crate::harness;
 
-use harness::{World, bridge_holds, until};
-
-/// How many push-lane watchers aterm counts on `sid` — `who`'s `watchers=`.
-fn watchers(w: &World, sid: &str) -> u64 {
-    let reply = w.verb("who");
-    assert!(reply.ok(), "who: {}", reply.header());
-    reply
-        .rows()
-        .iter()
-        .find(|row| row.split_whitespace().nth(1) == Some(sid))
-        .and_then(|row| {
-            row.split_whitespace()
-                .find_map(|t| t.strip_prefix("watchers="))
-                .and_then(|n| n.parse().ok())
-        })
-        .unwrap_or_else(|| panic!("`who` lists no {sid}: {:?}", reply.rows()))
-}
+use harness::{Hold, World, bridge_holds, until, watchers};
 
 /// Opt `sid` into `topic`.
 fn topic_add(w: &World, sid: &str, topic: &str) {
@@ -77,11 +60,8 @@ fn a_topic_added_before_the_adoption_is_learned_after_it() {
     const LATE: &str = "r26.late";
     const WAKE: &str = "r26.wake";
 
-    let hold = std::env::temp_dir().join(format!("atl-r26-hold-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&hold);
-    std::fs::create_dir_all(&hold).expect("the hold directory");
-    let hold_env = hold.to_string_lossy().into_owned();
-    let w = World::boot_with("r26", &[], &[("ATERM_TEST_PUSH_HOLD", &hold_env)]);
+    let hold = Hold::new("r26");
+    let w = World::boot_with("r26", &[], &[("ATERM_TEST_PUSH_HOLD", &hold.env())]);
     w.wait_ready();
     let s0 = until("aterm's boot session", || {
         w.sessions().first().map(|(_, sid, _)| sid.clone())
@@ -89,13 +69,13 @@ fn a_topic_added_before_the_adoption_is_learned_after_it() {
     // THE BOOT SESSION IS WATCHED before anything is held: it is the one whose
     // pushed record later proves the adoption was handled.
     until("the push lane to watch the boot session", || {
-        (watchers(&w, &s0) >= 1).then_some(())
+        (watchers(&w, &s0)? >= 1).then_some(())
     });
 
     // HOLD BOTH DECISIONS, then spawn: the session registers in the store and
     // the push lane neither announces nor adopts it.
-    std::fs::write(hold.join("adopt"), b"").expect("hold the adoption");
-    std::fs::write(hold.join("sessions"), b"").expect("hold the announcement");
+    hold.on("adopt");
+    hold.on("sessions");
     let reply = w.verb("spawn");
     assert!(reply.ok(), "spawn: {}", reply.header());
     let s = reply
@@ -110,12 +90,12 @@ fn a_topic_added_before_the_adoption_is_learned_after_it() {
     // The bridge's `session-created` arm reads the new session's topics (or a
     // roster round does); learning WARM is the observation that a read after
     // the add has happened.
-    std::fs::remove_file(hold.join("sessions")).expect("release the announcement");
+    hold.off("sessions");
     until("the bridge to read the new session's opt-ins", || {
         bridge_holds(&w, &s, WARM)
     });
     assert_eq!(
-        watchers(&w, &s),
+        watchers(&w, &s).unwrap_or_else(|| panic!("`who` lists no {s}")),
         0,
         "the premise: the bridge read {s}'s topics while nothing watched it"
     );
@@ -124,21 +104,21 @@ fn a_topic_added_before_the_adoption_is_learned_after_it() {
     // before any watch exists to push it.
     topic_add(&w, &s, LATE);
     assert_eq!(
-        watchers(&w, &s),
+        watchers(&w, &s).unwrap_or_else(|| panic!("`who` lists no {s}")),
         0,
         "the premise: {LATE} was recorded while nothing watched {s}"
     );
 
     // RELEASE THE ADOPTION, and make the push lane report a record that is
     // ordered after it on the one lane the bridge reads.
-    std::fs::remove_file(hold.join("adopt")).expect("release the adoption");
+    hold.off("adopt");
     topic_add(&w, &s0, WAKE);
     until(
         "the bridge to learn the boot session's pushed opt-in",
         || bridge_holds(&w, &s0, WAKE),
     );
     assert!(
-        watchers(&w, &s) >= 1,
+        watchers(&w, &s).is_some_and(|n| n >= 1),
         "the adoption ran before the boot session's record was pushed"
     );
     assert!(
@@ -158,5 +138,4 @@ fn a_topic_added_before_the_adoption_is_learned_after_it() {
                 .find(|r| r.contains(&format!(" topic={LATE} ")) && r.contains("text=r26late"))
         },
     );
-    let _ = std::fs::remove_dir_all(&hold);
 }

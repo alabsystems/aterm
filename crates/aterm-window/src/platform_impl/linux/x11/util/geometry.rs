@@ -4,7 +4,12 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/util/geometry.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
+// Modified by the aterm project in 2026; see the repository NOTICE. (aterm-x11's requests,
+// where upstream used x11rb's.)
+
 use std::cmp;
+
+use aterm_x11::proto::atom;
 
 use super::*;
 
@@ -101,7 +106,7 @@ impl XConnection {
         window: xproto::Window,
         root: xproto::Window,
     ) -> Result<xproto::TranslateCoordinatesReply, X11Error> {
-        self.xcb_connection().translate_coordinates(window, root, 0, 0)?.reply().map_err(Into::into)
+        self.request(xproto::translate_coordinates(window, root, 0, 0))
     }
 
     // This is adequate for inner_size
@@ -109,7 +114,7 @@ impl XConnection {
         &self,
         window: xproto::Window,
     ) -> Result<xproto::GetGeometryReply, X11Error> {
-        self.xcb_connection().get_geometry(window)?.reply().map_err(Into::into)
+        self.request(xproto::get_geometry(window))
     }
 
     fn get_frame_extents(&self, window: xproto::Window) -> Option<FrameExtents> {
@@ -123,9 +128,8 @@ impl XConnection {
         // Of the WMs tested, xmonad, i3, dwm, IceWM (1.3.x and earlier), and blackbox don't
         // support this. As this is part of EWMH (Extended Window Manager Hints), it's likely to
         // be unsupported by many smaller WMs.
-        let extents: Option<Vec<u32>> = self
-            .get_property(window, extents_atom, xproto::Atom::from(xproto::AtomEnum::CARDINAL))
-            .ok();
+        let extents: Option<Vec<u32>> =
+            self.get_property(window, extents_atom, atom::CARDINAL).ok();
 
         extents.and_then(|extents| {
             if extents.len() >= 4 {
@@ -149,15 +153,14 @@ impl XConnection {
             return None;
         }
 
-        let client_list: Option<Vec<xproto::Window>> = self
-            .get_property(root, client_list_atom, xproto::Atom::from(xproto::AtomEnum::WINDOW))
-            .ok();
+        let client_list: Option<Vec<xproto::Window>> =
+            self.get_property(root, client_list_atom, atom::WINDOW).ok();
 
         client_list.map(|client_list| client_list.contains(&(window as xproto::Window)))
     }
 
     fn get_parent_window(&self, window: xproto::Window) -> Result<xproto::Window, X11Error> {
-        let parent = self.xcb_connection().query_tree(window)?.reply()?.parent;
+        let parent = self.request(xproto::query_tree(window))?.parent;
         Ok(parent)
     }
 

@@ -1,11 +1,13 @@
 # The font oracle (TF.1, docs/AUDIT-third-party-2026-10-15.md), written by
 # crates/aterm-render/tests/font_oracle.rs. One case per line, TAB-separated:
 #   kind  label  file-key#index  instance  features  case  input  answer
-# kind: shape (rustybuzz 0.20.1), read (ttf-parser 0.25.1), font (aterm's
-# font::Font), vary (aterm's variation module). file-key: FNV-1a 64 of the
-# font file; a system face is never committed, so its lines are skipped on a
-# host without that exact file. instance: `-` sets no variation, else the
-# user-space coordinates applied. input: the shaped text, non-ASCII as \u{..}.
+# kind: shape (rustybuzz 0.20.1), read (recorded from ttf-parser 0.25.1;
+# since TF.5 answered here by aterm-font, and re-answered with ttf-parser by
+# the recorder's `replay`), font (aterm's font::Font), vary (aterm's
+# variation module). file-key: FNV-1a 64 of the font file; a system face is
+# never committed, so its lines are skipped on a host without that exact
+# file. instance: `-` sets no variation, else the user-space coordinates
+# applied. input: the shaped text, non-ASCII as \u{..}.
 # Digests are FNV-1a 64; an answer over 480 bytes is its digest and length.
 font	AndaleMono	630fcf91f00adff4#0	-	-	cmap	-	probed=730 mapped=691 fnv=a7fe2919f4112f6b
 font	AndaleMono	630fcf91f00adff4#0	-	-	kern13	-	glyphs=191 pairs=0 fnv=cbf29ce484222325
@@ -140,6 +142,20 @@ font	IosevkaTerm-BoldItalic	ec1d8bee3d9b3bc0#0	-	-	lines13	-	asc=12.545 desc=-3.
 font	IosevkaTerm-BoldItalic	ec1d8bee3d9b3bc0#0	-	-	metrics13	-	n=6241 fnv=ac85654db5f409ca
 font	IosevkaTerm-BoldItalic	ec1d8bee3d9b3bc0#0	-	-	raster13	-	glyphs=202 fnv=f2da5ab4f02f483a
 font	IosevkaTerm-BoldItalic	ec1d8bee3d9b3bc0#0	-	-	raster26	-	glyphs=202 fnv=7719551e7647fa7e
+font	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	-	cmap	-	probed=5082 mapped=5015 fnv=8f4f737c21b2b47a
+font	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	-	kern13	-	glyphs=191 pairs=0 fnv=cbf29ce484222325
+font	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	-	ligature_gate	-	0
+font	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	-	lines13	-	asc=12.545 desc=-3.7050002 gap=0.0 new_line=16.25
+font	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	-	metrics13	-	n=6054 fnv=30c0609a85ad4f84
+font	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	-	raster13	-	glyphs=202 fnv=8973d208ce8fb9a4
+font	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	-	raster26	-	glyphs=202 fnv=601ced46e615ba10
+font	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	-	cmap	-	probed=5082 mapped=5015 fnv=a24166e1bacad89a
+font	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	-	kern13	-	glyphs=191 pairs=0 fnv=cbf29ce484222325
+font	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	-	ligature_gate	-	0
+font	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	-	lines13	-	asc=12.545 desc=-3.7050002 gap=0.0 new_line=16.25
+font	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	-	metrics13	-	n=6067 fnv=e54843fee9f4a89f
+font	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	-	raster13	-	glyphs=202 fnv=32f8aca47781077a
+font	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	-	raster26	-	glyphs=202 fnv=a97346c0c34769fd
 font	IosevkaTerm-Italic	595fb17ffbdf0d02#0	-	-	cmap	-	probed=5082 mapped=5015 fnv=a24166e1bacad89a
 font	IosevkaTerm-Italic	595fb17ffbdf0d02#0	-	-	kern13	-	glyphs=191 pairs=0 fnv=cbf29ce484222325
 font	IosevkaTerm-Italic	595fb17ffbdf0d02#0	-	-	ligature_gate	-	1
@@ -154,6 +170,20 @@ font	IosevkaTerm-Regular	2ccc643fb1e37af3#0	-	-	lines13	-	asc=12.545 desc=-3.705
 font	IosevkaTerm-Regular	2ccc643fb1e37af3#0	-	-	metrics13	-	n=6228 fnv=10ab9cfe93945fde
 font	IosevkaTerm-Regular	2ccc643fb1e37af3#0	-	-	raster13	-	glyphs=202 fnv=3087aafe8c542824
 font	IosevkaTerm-Regular	2ccc643fb1e37af3#0	-	-	raster26	-	glyphs=202 fnv=b36dac75fcc55f10
+font	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	-	cmap	-	probed=5082 mapped=5015 fnv=8f4f737c21b2b47a
+font	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	-	kern13	-	glyphs=191 pairs=0 fnv=cbf29ce484222325
+font	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	-	ligature_gate	-	0
+font	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	-	lines13	-	asc=12.545 desc=-3.7050002 gap=0.0 new_line=16.25
+font	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	-	metrics13	-	n=6054 fnv=3ab99ebe183b9ba7
+font	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	-	raster13	-	glyphs=202 fnv=f890ef28cd2ffe2b
+font	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	-	raster26	-	glyphs=202 fnv=d42221905a21f487
+font	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	-	cmap	-	probed=5082 mapped=5015 fnv=a24166e1bacad89a
+font	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	-	kern13	-	glyphs=191 pairs=0 fnv=cbf29ce484222325
+font	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	-	ligature_gate	-	0
+font	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	-	lines13	-	asc=12.545 desc=-3.7050002 gap=0.0 new_line=16.25
+font	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	-	metrics13	-	n=6067 fnv=1c064ed256874ebd
+font	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	-	raster13	-	glyphs=202 fnv=bd38c9e49194f428
+font	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	-	raster26	-	glyphs=202 fnv=1e9a643ad76cef2c
 font	JetBrainsMono-Bold	6ab899dbbae41e07#0	-	-	cmap	-	probed=1435 mapped=1363 fnv=bcb7a311de894704
 font	JetBrainsMono-Bold	6ab899dbbae41e07#0	-	-	kern13	-	glyphs=191 pairs=0 fnv=cbf29ce484222325
 font	JetBrainsMono-Bold	6ab899dbbae41e07#0	-	-	ligature_gate	-	1
@@ -867,6 +897,52 @@ read	IosevkaTerm-BoldItalic	ec1d8bee3d9b3bc0#0	-	-	outline.4096	-	n=1023 fnv=596
 read	IosevkaTerm-BoldItalic	ec1d8bee3d9b3bc0#0	-	-	outline.5120	-	n=1024 fnv=3bb552ed9d1e05d7
 read	IosevkaTerm-BoldItalic	ec1d8bee3d9b3bc0#0	-	-	outline.6144	-	n=97 fnv=25ef143b74208608
 read	IosevkaTerm-BoldItalic	ec1d8bee3d9b3bc0#0	-	-	vmtx	-	n=6241 fnv=247052a3377db353
+read	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	-	bbox	-	n=5957 fnv=2a901f006be1bd4f
+read	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	-	cmap.index	-	probed=5082 mapped=5015 fnv=0621bc6bf39c35f6
+read	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	-	cmap.sub0	-	p=Unicode e=3 f=4 unicode=1 n=4768 fnv=37837b523a123383
+read	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	-	cmap.sub1	-	p=Unicode e=4 f=12 unicode=1 n=5015 fnv=afc8e2130564cf8c
+read	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	-	cmap.sub2	-	p=Windows e=1 f=4 unicode=1 n=4768 fnv=37837b523a123383
+read	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	-	cmap.sub3	-	p=Windows e=10 f=12 unicode=1 n=5015 fnv=afc8e2130564cf8c
+read	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	-	cmap.vs	-	n=0 fnv=cbf29ce484222325
+read	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	-	gdef	-	classes=1 fnv=3267de7214577ef7
+read	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	-	gpos	-	scripts=DFLT,cyrl,grek,latn features=2 tags=mark,mkmk lookups=25 fv=0 fnv=7cc2dbcb0e384009
+read	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	-	gsub	-	scripts=DFLT,cyrl,grek,latn features=14 tags=ccmp,dnom,frac,locl,numr lookups=49 fv=0 fnv=a3d33c17a118daaf
+read	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	-	gsub.lookups	-	lookups=49 kinds=1:32,2:4,4:6,6:25,8:1 unparsed=0 fnv=6b7064e2d4e599b7
+read	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	-	head	-	upem=1000 glyphs=6054 bbox=-1000,-604,1361,1197 variable=0 faces=- italic_angle=0.0 mono=1 tables=GDEF,GPOS,GSUB,OS/2,cmap,glyf,head,hhea,hmtx,loca,maxp,name,post
+read	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	-	hmtx	-	n=6054 fnv=90780d1fed687a96
+read	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	-	metrics	-	asc=965 desc=-285 gap=0 height=1250 typo=965,-285,0 vert=-,-,-,- x=520 cap=735 ul=-50,50 st=265,51 sub=665,716,0,143 sup=665,716,0,491
+read	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	-	name	-	n=35 fnv=23315ebc988f3ae1 family=Iosevka\u{20}Term\u{20}Extrabold
+read	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	-	os2	-	weight=800 width=5 style=Normal bold=1 italic=0 oblique=0 regular=1 perm=Installable subset=1 outline_embed=1 ranges=00000000000400205000ffffe00006ff
+read	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	-	outline.0	-	n=941 fnv=ea30f57adb341431
+read	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	-	outline.1024	-	n=1024 fnv=bdefc708cb49c525
+read	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	-	outline.2048	-	n=1011 fnv=bfc587aff0398358
+read	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	-	outline.3072	-	n=1024 fnv=a2ae61da7e52c444
+read	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	-	outline.4096	-	n=1023 fnv=cf811dc283b90c1f
+read	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	-	outline.5120	-	n=934 fnv=66e1bbae8ca0ee59
+read	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	-	vmtx	-	n=6054 fnv=068d0c6e29725069
+read	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	-	bbox	-	n=5970 fnv=eb28a8ea0dc13acc
+read	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	-	cmap.index	-	probed=5082 mapped=5015 fnv=b5a95d7cbdd61be6
+read	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	-	cmap.sub0	-	p=Unicode e=3 f=4 unicode=1 n=4768 fnv=edb900fb7c133333
+read	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	-	cmap.sub1	-	p=Unicode e=4 f=12 unicode=1 n=5015 fnv=161622ea35a60484
+read	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	-	cmap.sub2	-	p=Windows e=1 f=4 unicode=1 n=4768 fnv=edb900fb7c133333
+read	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	-	cmap.sub3	-	p=Windows e=10 f=12 unicode=1 n=5015 fnv=161622ea35a60484
+read	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	-	cmap.vs	-	n=0 fnv=cbf29ce484222325
+read	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	-	gdef	-	classes=1 fnv=3c67597ab2e268f9
+read	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	-	gpos	-	scripts=DFLT,cyrl,grek,latn features=2 tags=mark,mkmk lookups=25 fv=0 fnv=7cc2dbcb0e384009
+read	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	-	gsub	-	scripts=DFLT,cyrl,grek,latn features=14 tags=ccmp,dnom,frac,locl,numr lookups=49 fv=0 fnv=a3d33c17a118daaf
+read	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	-	gsub.lookups	-	lookups=49 kinds=1:32,2:4,4:6,6:25,8:1 unparsed=0 fnv=d1cca26b60dcfcd1
+read	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	-	head	-	upem=1000 glyphs=6067 bbox=-1058,-605,1427,1199 variable=0 faces=- italic_angle=-9.0 mono=1 tables=GDEF,GPOS,GSUB,OS/2,cmap,glyf,head,hhea,hmtx,loca,maxp,name,post
+read	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	-	hmtx	-	n=6067 fnv=591fda8efe7c4339
+read	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	-	metrics	-	asc=965 desc=-285 gap=0 height=1250 typo=965,-285,0 vert=-,-,-,- x=520 cap=735 ul=-50,50 st=265,51 sub=665,716,0,143 sup=665,716,0,491
+read	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	-	name	-	n=35 fnv=dec331a0abc554fc family=Iosevka\u{20}Term\u{20}Extrabold
+read	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	-	os2	-	weight=800 width=5 style=Italic bold=1 italic=1 oblique=0 regular=0 perm=Installable subset=1 outline_embed=1 ranges=00000000000400205000ffffe00006ff
+read	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	-	outline.0	-	n=941 fnv=1f606816e5261d2d
+read	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	-	outline.1024	-	n=1024 fnv=cb2620b5de97b34a
+read	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	-	outline.2048	-	n=1011 fnv=0655f5290d35bd8c
+read	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	-	outline.3072	-	n=1024 fnv=fa96f5068e1cd38d
+read	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	-	outline.4096	-	n=1023 fnv=c64d119472ae190a
+read	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	-	outline.5120	-	n=947 fnv=4bc0e601b7cb1300
+read	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	-	vmtx	-	n=6067 fnv=52a6f82be5f7f2bf
 read	IosevkaTerm-Italic	595fb17ffbdf0d02#0	-	-	bbox	-	n=6144 fnv=04e32d420ae657dc
 read	IosevkaTerm-Italic	595fb17ffbdf0d02#0	-	-	cmap.index	-	probed=5082 mapped=5015 fnv=b5a95d7cbdd61be6
 read	IosevkaTerm-Italic	595fb17ffbdf0d02#0	-	-	cmap.sub0	-	p=Unicode e=3 f=4 unicode=1 n=4768 fnv=edb900fb7c133333
@@ -915,6 +991,52 @@ read	IosevkaTerm-Regular	2ccc643fb1e37af3#0	-	-	outline.4096	-	n=1023 fnv=6a64d2
 read	IosevkaTerm-Regular	2ccc643fb1e37af3#0	-	-	outline.5120	-	n=1024 fnv=3f6e668258229d0f
 read	IosevkaTerm-Regular	2ccc643fb1e37af3#0	-	-	outline.6144	-	n=84 fnv=9acac0699428fb2b
 read	IosevkaTerm-Regular	2ccc643fb1e37af3#0	-	-	vmtx	-	n=6228 fnv=445d66123dc0781d
+read	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	-	bbox	-	n=5957 fnv=e5e31b4016a0975e
+read	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	-	cmap.index	-	probed=5082 mapped=5015 fnv=0621bc6bf39c35f6
+read	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	-	cmap.sub0	-	p=Unicode e=3 f=4 unicode=1 n=4768 fnv=37837b523a123383
+read	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	-	cmap.sub1	-	p=Unicode e=4 f=12 unicode=1 n=5015 fnv=afc8e2130564cf8c
+read	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	-	cmap.sub2	-	p=Windows e=1 f=4 unicode=1 n=4768 fnv=37837b523a123383
+read	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	-	cmap.sub3	-	p=Windows e=10 f=12 unicode=1 n=5015 fnv=afc8e2130564cf8c
+read	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	-	cmap.vs	-	n=0 fnv=cbf29ce484222325
+read	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	-	gdef	-	classes=1 fnv=3267de7214577ef7
+read	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	-	gpos	-	scripts=DFLT,cyrl,grek,latn features=2 tags=mark,mkmk lookups=25 fv=0 fnv=7cc2dbcb0e384009
+read	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	-	gsub	-	scripts=DFLT,cyrl,grek,latn features=14 tags=ccmp,dnom,frac,locl,numr lookups=49 fv=0 fnv=a3d33c17a118daaf
+read	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	-	gsub.lookups	-	lookups=49 kinds=1:32,2:4,4:6,6:25,8:1 unparsed=0 fnv=6b7064e2d4e599b7
+read	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	-	head	-	upem=1000 glyphs=6054 bbox=-1000,-601,1350,1194 variable=0 faces=- italic_angle=0.0 mono=1 tables=GDEF,GPOS,GSUB,OS/2,cmap,glyf,head,hhea,hmtx,loca,maxp,name,post
+read	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	-	hmtx	-	n=6054 fnv=107b7474b09c52f5
+read	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	-	metrics	-	asc=965 desc=-285 gap=0 height=1250 typo=965,-285,0 vert=-,-,-,- x=520 cap=735 ul=-50,50 st=265,51 sub=665,716,0,143 sup=665,716,0,491
+read	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	-	name	-	n=35 fnv=7c8232f00b9fe261 family=Iosevka\u{20}Term\u{20}Semibold
+read	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	-	os2	-	weight=600 width=5 style=Normal bold=0 italic=0 oblique=0 regular=1 perm=Installable subset=1 outline_embed=1 ranges=00000000000400205000ffffe00006ff
+read	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	-	outline.0	-	n=941 fnv=5171e6fc98b6d90f
+read	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	-	outline.1024	-	n=1024 fnv=6acad8d8739bd0d2
+read	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	-	outline.2048	-	n=1011 fnv=dfeb7396f6719352
+read	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	-	outline.3072	-	n=1024 fnv=f68c05a0ec5332b7
+read	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	-	outline.4096	-	n=1023 fnv=ed1e4eec482bda5f
+read	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	-	outline.5120	-	n=934 fnv=3ecc4d62de3d9f4c
+read	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	-	vmtx	-	n=6054 fnv=068d0c6e29725069
+read	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	-	bbox	-	n=5970 fnv=ce785df78e38dc68
+read	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	-	cmap.index	-	probed=5082 mapped=5015 fnv=b5a95d7cbdd61be6
+read	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	-	cmap.sub0	-	p=Unicode e=3 f=4 unicode=1 n=4768 fnv=edb900fb7c133333
+read	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	-	cmap.sub1	-	p=Unicode e=4 f=12 unicode=1 n=5015 fnv=161622ea35a60484
+read	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	-	cmap.sub2	-	p=Windows e=1 f=4 unicode=1 n=4768 fnv=edb900fb7c133333
+read	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	-	cmap.sub3	-	p=Windows e=10 f=12 unicode=1 n=5015 fnv=161622ea35a60484
+read	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	-	cmap.vs	-	n=0 fnv=cbf29ce484222325
+read	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	-	gdef	-	classes=1 fnv=3c67597ab2e268f9
+read	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	-	gpos	-	scripts=DFLT,cyrl,grek,latn features=2 tags=mark,mkmk lookups=25 fv=0 fnv=7cc2dbcb0e384009
+read	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	-	gsub	-	scripts=DFLT,cyrl,grek,latn features=14 tags=ccmp,dnom,frac,locl,numr lookups=49 fv=0 fnv=a3d33c17a118daaf
+read	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	-	gsub.lookups	-	lookups=49 kinds=1:32,2:4,4:6,6:25,8:1 unparsed=0 fnv=d1cca26b60dcfcd1
+read	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	-	head	-	upem=1000 glyphs=6067 bbox=-1058,-602,1417,1196 variable=0 faces=- italic_angle=-9.0 mono=1 tables=GDEF,GPOS,GSUB,OS/2,cmap,glyf,head,hhea,hmtx,loca,maxp,name,post
+read	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	-	hmtx	-	n=6067 fnv=18d036e7a733b8ee
+read	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	-	metrics	-	asc=965 desc=-285 gap=0 height=1250 typo=965,-285,0 vert=-,-,-,- x=520 cap=735 ul=-50,50 st=265,51 sub=665,716,0,143 sup=665,716,0,491
+read	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	-	name	-	n=35 fnv=a9ee12d2446a702c family=Iosevka\u{20}Term\u{20}Semibold
+read	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	-	os2	-	weight=600 width=5 style=Italic bold=0 italic=1 oblique=0 regular=0 perm=Installable subset=1 outline_embed=1 ranges=00000000000400205000ffffe00006ff
+read	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	-	outline.0	-	n=941 fnv=e5b10c032bfefb0c
+read	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	-	outline.1024	-	n=1024 fnv=ec3f473549f751fb
+read	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	-	outline.2048	-	n=1011 fnv=3489fd682cd66a38
+read	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	-	outline.3072	-	n=1024 fnv=437623118b6af9e7
+read	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	-	outline.4096	-	n=1023 fnv=707a12abfed2214a
+read	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	-	outline.5120	-	n=947 fnv=766f9cf2fc80adc9
+read	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	-	vmtx	-	n=6067 fnv=52a6f82be5f7f2bf
 read	JetBrainsMono-Bold	6ab899dbbae41e07#0	-	-	bbox	-	n=1734 fnv=34c19880b34aaca3
 read	JetBrainsMono-Bold	6ab899dbbae41e07#0	-	-	cmap.index	-	probed=1435 mapped=1363 fnv=f764ae875b26684c
 read	JetBrainsMono-Bold	6ab899dbbae41e07#0	-	-	cmap.sub0	-	p=Unicode e=3 f=4 unicode=1 n=1317 fnv=20c5d06369fe2810

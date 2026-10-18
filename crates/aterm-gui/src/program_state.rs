@@ -10,7 +10,8 @@
 //! beside the agent verdict, decides which report a session shows:
 //!
 //! - only while the program in front names `codex` (the sweep's published
-//!   program, its argv0's word: [`aterm_phase::program_of`]);
+//!   program, its argv0's word: [`aterm_phase::program_of`]), or is a runtime
+//!   that hosts one (`node`, `bun`: npm's `codex`; [`honoured_for`]);
 //! - after a foreground move, only a report newer than the previous sweep's
 //!   reading. Already observed reports are cleared; an unseen report can show
 //!   immediately. The PTY does not attribute bytes to a writer, so an old
@@ -38,6 +39,14 @@ pub(crate) struct ProgramStateGate {
     floor_seq: u64,
     /// The report shown, and since when.
     shown: Option<(ProgramState, Instant)>,
+    /// How many shown `working` reports were followed by a shown `done` or
+    /// `idle`: the program's own turn ends, which the presence band tells as
+    /// a story point (`Facts::program_turn_ends`). Display only.
+    turn_ends: u64,
+    /// How many shown `working` reports began a turn ([`starts_a_turn`]):
+    /// what pairs one turn's end with the ledger settle of the same turn, so
+    /// the presence band tells it once (`Facts::program_turn_starts`).
+    turn_starts: u64,
 }
 
 impl ProgramStateGate {
@@ -64,8 +73,26 @@ impl ProgramStateGate {
         if self.shown.map(|(state, _)| state) == next && (!group_moved || next.is_none()) {
             return false;
         }
+        if ends_a_turn(self.shown.map(|(state, _)| state), next) {
+            self.turn_ends += 1;
+        }
+        if starts_a_turn(self.shown.map(|(state, _)| state), next) {
+            self.turn_starts += 1;
+        }
         self.shown = next.map(|state| (state, now));
         true
+    }
+
+    /// How many turn ends this session's program has reported
+    /// ([`ends_a_turn`]), as shown.
+    pub(crate) fn turn_ends(&self) -> u64 {
+        self.turn_ends
+    }
+
+    /// How many turns this session's program has begun ([`starts_a_turn`]),
+    /// as shown.
+    pub(crate) fn turn_starts(&self) -> u64 {
+        self.turn_starts
     }
 
     /// The report shown, and since when.
@@ -74,14 +101,53 @@ impl ProgramStateGate {
     }
 }
 
-/// Whether a report is honoured under the program in front, by its argv0's
-/// word ([`aterm_phase::program_of`]): only a `codex` writes OSC 7501. An
+/// Whether the shown report moving from `before` to `after` is the program
+/// finishing a turn: `working`, then `done` or `idle`. A foreground move
+/// that shows nothing, a `blocked` or an `error` is not one.
+fn ends_a_turn(before: Option<ProgramState>, after: Option<ProgramState>) -> bool {
+    use aterm_core::terminal::program_state::ProgramStateWord as W;
+    matches!(
+        (before.map(|s| s.state), after.map(|s| s.state)),
+        (Some(W::Working), Some(W::Done | W::Idle))
+    )
+}
+
+/// Whether the shown report moving from `before` to `after` is the program
+/// beginning a turn: entering a turn in progress (`working` or `blocked`)
+/// from no report, `idle`, `done` or `error`. A turn the gate first sees
+/// `blocked` (a permission asked before a sweep saw it work) begins there;
+/// `working` after `blocked` is the same turn resuming, and a move within the
+/// two is no start. So every turn end the gate counts ([`ends_a_turn`]) has
+/// its own start: a turn the person drove themselves moves the count, and
+/// its end never pairs with a ledger settle read at the count before it.
+fn starts_a_turn(before: Option<ProgramState>, after: Option<ProgramState>) -> bool {
+    use aterm_core::terminal::program_state::ProgramStateWord as W;
+    let in_turn = |state: Option<ProgramState>| {
+        matches!(state.map(|s| s.state), Some(W::Working | W::Blocked))
+    };
+    in_turn(after) && !in_turn(before)
+}
+
+/// Whether a report is honoured under the program in front, its published
+/// name (`program=`): under a `codex` ([`aterm_phase::program_of`]), and
+/// under a runtime that hosts one ([`aterm_phase::may_host_agent`]: `node`,
+/// `bun`) — npm's `codex` is `node …/codex.js`, and since aterm supervises no
+/// Codex (the Codex screen lane's retirement, 2026-10-16) its own report is
+/// all a vendor `codex` shows of itself. Only a report naming `app=codex`
+/// is a report at all (the engine's parser), so a runtime running anything
+/// else shows none. Never under another agent's name or a shell's. An
 /// exhaustive match, so a new agent decides here (the agent-gate guard).
-pub(crate) fn honoured_for(program: Option<aterm_phase::Program>) -> bool {
+pub(crate) fn honoured_for(program: Option<&str>) -> bool {
     use aterm_phase::Program;
-    match program {
+    let Some(name) = program else {
+        return false;
+    };
+    match aterm_phase::program_of(name) {
         Some(Program::Codex) => true,
-        Some(Program::Claude | Program::Generic | Program::Agy | Program::Muse) | None => false,
+        Some(
+            Program::Claude | Program::Generic | Program::Agy | Program::Muse | Program::Gemini,
+        ) => false,
+        None => aterm_phase::may_host_agent(name),
     }
 }
 
@@ -183,6 +249,58 @@ mod tests {
         assert!(!gate.observe(term.program_state(), true, false, next_start));
     }
 
+    /// A turn end is `working` then `done`|`idle` as the gate showed them:
+    /// not a `done` with no `working` before it, not `working` → `blocked`,
+    /// and not a report the gate does not honour.
+    #[test]
+    fn only_working_then_done_or_idle_counts_as_a_turn_end() {
+        let mut term = Terminal::new(24, 80);
+        let mut gate = ProgramStateGate::default();
+        let t0 = Instant::now();
+        let done = b"\x1b]7501;state=done:app=codex\x1b\\";
+        let idle = b"\x1b]7501;state=idle:app=codex\x1b\\";
+        term.process(done);
+        gate.observe(term.program_state(), true, false, t0);
+        assert_eq!(gate.turn_ends(), 0, "done with no working before it");
+        term.process(WORKING);
+        gate.observe(term.program_state(), true, false, t0);
+        term.process(BLOCKED_PERMISSION);
+        gate.observe(term.program_state(), true, false, t0);
+        assert_eq!(gate.turn_ends(), 0, "working then blocked");
+        term.process(WORKING);
+        gate.observe(term.program_state(), true, false, t0);
+        term.process(done);
+        gate.observe(term.program_state(), true, false, t0);
+        assert_eq!(gate.turn_ends(), 1);
+        term.process(WORKING);
+        gate.observe(term.program_state(), true, false, t0);
+        term.process(idle);
+        gate.observe(term.program_state(), true, false, t0);
+        assert_eq!(gate.turn_ends(), 2);
+        // Two turns began: the `working` after `blocked` resumed the first.
+        assert_eq!(gate.turn_starts(), 2);
+        // A turn first seen `blocked` (it asked before a sweep saw it work)
+        // begins there, so its end has a start of its own; NEGATIVE CONTROL:
+        // its `working` after the answer is no second start.
+        term.process(BLOCKED_PERMISSION);
+        gate.observe(term.program_state(), true, false, t0);
+        assert_eq!(gate.turn_starts(), 3, "idle then blocked");
+        term.process(WORKING);
+        gate.observe(term.program_state(), true, false, t0);
+        assert_eq!(gate.turn_starts(), 3, "blocked then working resumes it");
+        term.process(done);
+        gate.observe(term.program_state(), true, false, t0);
+        assert_eq!(gate.turn_ends(), 3);
+        // Negative control: the same bytes under a program that is not codex.
+        let mut other = ProgramStateGate::default();
+        for bytes in [WORKING, done.as_slice()] {
+            term.process(bytes);
+            other.observe(term.program_state(), false, false, t0);
+        }
+        assert_eq!(other.turn_ends(), 0);
+        assert_eq!(other.turn_starts(), 0);
+    }
+
     #[test]
     fn a_full_reset_clears_it() {
         let mut term = Terminal::new(24, 80);
@@ -197,13 +315,19 @@ mod tests {
 
     #[test]
     fn only_a_codex_in_front_is_honoured() {
-        use aterm_phase::Program;
-        assert!(honoured_for(Some(Program::Codex)));
-        assert!(!honoured_for(Some(Program::Claude)));
-        assert!(!honoured_for(Some(Program::Generic)));
+        assert!(honoured_for(Some("codex")));
+        assert!(honoured_for(Some("/opt/x/bin/codex")));
+        // npm's codex: `node …/codex.js` leads the group, and its report
+        // stays shown (the runtimes that may host an agent).
+        assert!(honoured_for(Some("node")));
+        assert!(honoured_for(Some("/usr/local/bin/node")));
+        assert!(honoured_for(Some("bun")));
+        // NEGATIVE CONTROLS: another agent, a shell, nothing named.
+        assert!(!honoured_for(Some("claude")));
+        assert!(!honoured_for(Some("zsh")));
+        assert!(!honoured_for(Some("-zsh")));
+        assert!(!honoured_for(Some("vim")));
         assert!(!honoured_for(None));
-        assert!(honoured_for(aterm_phase::program_of("/opt/x/bin/codex")));
-        assert!(!honoured_for(aterm_phase::program_of("zsh")));
     }
 
     #[test]

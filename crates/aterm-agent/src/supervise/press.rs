@@ -9,20 +9,18 @@
 //! `short-term`, its policy text written into the free-text row by one fenced
 //! `send`, [`Session::press_question_text`], never with an Enter); a
 //! decline's focus move, Tab, text and Enter ([`Session::press_decline`]:
-//! never a digit, never unfenced); a Codex question's note under a text
-//! word ([`Session::press_codex_note`]: arrows, Tab, the text, Enter, each
-//! decided on a fresh read, never a digit or Esc); and the survey switch's
+//! never a digit, never unfenced); and the survey switch's
 //! `0` ([`Session::dismiss_survey`]).
 //!
 //! **What binds the `1` to the box that was judged.** The guard is the
 //! judged row itself, anchored ([`super::super::policy::row_guard`]): the
 //! server tests it against every visible row under the same terminal lock as
 //! the write, so a box swapped between the read and the press matches
-//! nothing and the answer is `OK skipped`. Where the server fences a press
-//! on the screen generation (`key if-gen=<epoch>.<seq>`, read from `help key`
-//! once) and the judged read carried one (`text --json`'s `"gen"`,
-//! [`Screen::generation`]), that generation is sent too, and `OK skipped
-//! reason=changed` means the screen moved: the loop reads and decides again.
+//! nothing and the answer is `OK skipped`. Every option-choosing digit
+//! requires the screen generation (`key if-gen=<epoch>.<seq>`, named by
+//! `help key` and carried by the judged read's `"gen"`,
+//! [`Screen::generation`]). `OK skipped reason=changed` means the screen
+//! moved: the loop reads and decides again.
 //! A screen that keeps moving under the press (a blinking row, an auto-deny
 //! countdown) is handed to the manager after [`MAX_CHANGED_PRESSES`] such
 //! skips, never pressed with the fence dropped, since the row guard alone
@@ -39,8 +37,8 @@ use super::super::policy::approval::{
     Answer, AnswerTarget, DeclineStep, QuestionPriority, decline_step,
 };
 use super::super::policy::question::{
-    MAX_QUESTION_FOCUS_STEPS, NoteStep, focus_position, focus_row, note_step, option_label,
-    roles_question_key, target_focus,
+    MAX_QUESTION_FOCUS_STEPS, NoteRead, NoteStep, focus_position, focus_row, note_read, note_step,
+    option_label, roles_question_key, roles_question_notes, target_focus,
 };
 use super::approval_loop::PendingKind;
 use super::*;
@@ -73,6 +71,14 @@ const MAX_NOTE_STEPS: u32 = MAX_QUESTION_FOCUS_STEPS + 3;
 const UNSTAMPED_NOTE: &str = "this host does not stamp a person's input, and a note's keystrokes \
                               could cross a person's";
 
+/// Why a note whose notes field draws only its tail ([`NoteRead::Tail`]) is
+/// not entered: the read's person count is not the one the text was written
+/// on (a person keyed since, or the read carries none), and the head the
+/// field does not draw may hold their keys.
+const TAIL_KEYED: &str = "the notes field draws only the tail of the policy text, and the read \
+                          does not show that no person keyed since it was written: the head it \
+                          does not draw may be theirs";
+
 /// What a note's keystroke is judged landed by: the focused answer's index
 /// and the notes field's text (`None` while it is closed).
 type NoteState = (Option<usize>, Option<String>);
@@ -81,7 +87,7 @@ type NoteState = (Option<usize>, Option<String>);
 fn note_state(q: &aterm_phase::PromptV2, rows: &[String]) -> NoteState {
     (
         q.options.iter().position(|o| o.focused),
-        aterm_phase::codex::question_notes(rows).map(|n| n.text),
+        roles_question_notes(q, rows).map(|n| n.text),
     )
 }
 
@@ -252,8 +258,7 @@ impl<C: Ctl> Session<'_, C> {
     ///
     /// * **Never unfenced.** A host that does not name `if-gen=` in `help
     ///   key`, or a read that carried no generation, is
-    ///   [`Pressing::Unconfirmed`] (the box is handed over); the fallback of
-    ///   [`Self::press_one_guarded`] is never taken for a question.
+    ///   [`Pressing::Unconfirmed`] (the box is handed over).
     /// * **The first key waits** about a second after the tab first appears
     ///   ([`QUESTION_FIRST_KEY_IDLE`], once per question, O4): 2.1.282 refuses
     ///   keys inside a typeahead window after a dialog mounts. The person's
@@ -306,8 +311,7 @@ impl<C: Ctl> Session<'_, C> {
         if steps.unsigned_abs() > MAX_QUESTION_FOCUS_STEPS {
             return unconfirmed("the focus is too far from the option to move it");
         }
-        if self.caps.key_if == Some(false) || !self.gen_fence_known()? || seen.generation.is_none()
-        {
+        if !self.gen_fence_known()? || seen.generation.is_none() {
             return unconfirmed("this host cannot fence a question's key on the screen generation");
         }
         let Some(first) = dialog_of(&seen.rows) else {
@@ -600,8 +604,7 @@ impl<C: Ctl> Session<'_, C> {
         if steps.unsigned_abs() > MAX_QUESTION_FOCUS_STEPS {
             return unconfirmed("the focus is too far from the free-text row to move it");
         }
-        if self.caps.key_if == Some(false) || !self.gen_fence_known()? || seen.generation.is_none()
-        {
+        if !self.gen_fence_known()? || seen.generation.is_none() {
             return unconfirmed("this host cannot fence a question's key on the screen generation");
         }
         if !self.send_fence_known()? || seen.human_seq.is_none() {
@@ -798,6 +801,7 @@ impl<C: Ctl> Session<'_, C> {
         let args = format!("{person} {fence} {guarded} (send)");
         let remember = |s: &mut Self| {
             s.question.typed.insert(key.to_string(), priority);
+            s.question.typed_person.insert(key.to_string(), count);
             s.latch_question_word();
         };
         if let Some(p) = self.refused_press(&r, &args)? {
@@ -893,188 +897,71 @@ impl<C: Ctl> Session<'_, C> {
         Ok(known)
     }
 
-    /// Press `1` on the box `prompt` read at `seen`, under `guard`: the check
-    /// and the press under one server lock where the server has `key if=`
-    /// (`OK skipped seq=<n>`: no row matched, nothing written); else read →
-    /// confirm the same box is still up and the guarded row still drawn →
-    /// press → wait for the worker to take it → re-read → backspace a digit
-    /// that landed in the composer. The fallback presses nothing while the
-    /// session survey is open on the confirming read ([`Pressing::Withheld`]):
-    /// a `1` that reaches the survey instead of the box is a rating.
+    /// One digit choosing an option, bound to the judged read's row,
+    /// generation and person count under the server's write lock. Both an
+    /// automatic policy choice and a controller's explicit answer use this:
+    /// neither path proves that the caller is a manual human writer.
     ///
-    /// The capability probe is the reply: `OK …` proves the guard (pressed or
-    /// skipped); a usage line or a bare `ERR` (a build without `if=` reads
-    /// `if=…` as a key name) drops the generation fence first, then falls back
-    /// for good; `halted`, `busy …` and `rate` are [`Pressing::Halted`] and
-    /// [`Pressing::Refused`]; every other `ERR` (`no such session`,
-    /// `badregex`) is an error, never an approval.
-    ///
-    /// Under [`Fence::Required`] nothing is pressed without the generation
-    /// fence: a host that does not name it, a read that carried no generation,
-    /// or a fenced key the host turns away (a usage line, a bare `ERR`) is
-    /// [`Pressing::Unconfirmed`] (no retry), the fence never dropped and no
-    /// fallback taken — either downgrade refused, since a question's title
-    /// alone cannot tell successive questions with the same heading apart.
-    ///
-    /// A lost connection is [`Pressing::Lost`]: a press whose answer never
-    /// came is not an approval, and is not sent again as it was; the loop
-    /// rides the connection out, then reads and decides again
-    /// ([`Self::drive`]). On the fallback path a `1` the server confirmed is
-    /// written, lost connection or not: it is the approval it was, and a digit
-    /// in the composer is checked on the next turn ([`Self::stray`]).
+    /// Missing stamps or unsupported guards withhold the digit. A usage
+    /// reply never drops a guard, and a person who keys in the gap yields
+    /// the box. Abort, cancel, survey and decline keys have separate paths.
     pub(super) fn press_one_guarded(
         &mut self,
-        prompt: &PromptV2,
         guard: &str,
         digit: &str,
         seen: &Screen,
-        need: Fence,
     ) -> Result<Pressing, Fail> {
-        let unfenced = |turned_away: Option<String>| {
-            let mut why =
-                "this host cannot fence a question's key on the screen generation".to_string();
-            if let Some(said) = turned_away {
-                why.push_str(&format!(": {said}"));
-            }
-            Ok(Pressing::Unconfirmed { why, retry: false })
+        let cannot = |why: &str| {
+            Ok(Pressing::Unconfirmed {
+                why: why.to_string(),
+                retry: false,
+            })
         };
-        if need == Fence::Required && self.caps.key_if == Some(false) {
-            return unfenced(None);
+        let Some(person) = seen.human_seq else {
+            return cannot("the digit's read carried no person count to fence on");
+        };
+        if seen.human == HumanInput::Unknown {
+            return cannot("the digit's read carried no quiet stamp");
         }
-        if self.caps.key_if != Some(false) {
-            // The fence needs both halves: a host that names it (`help key`,
-            // asked once) and a read that carried the generation it names.
-            let mut fence = if self.gen_fence_known()? {
-                seen.generation.clone()
+        if !self.gen_fence_known()? {
+            return cannot("this host cannot fence the digit on the screen generation");
+        }
+        let Some(generation) = seen.generation.as_deref() else {
+            return cannot("the digit's read carried no screen generation to fence on");
+        };
+        let person = format!("if-human={person}");
+        let (r, args) = self.fenced_key(guard, digit, generation, Some(&person))?;
+        if r.ok() {
+            let seq = r.seq().unwrap_or(seen.seq);
+            return Ok(Pressing::Done(if r.skipped_person() {
+                Press::Yielded { seq }
+            } else if r.skipped_changed() {
+                Press::Changed { seq }
+            } else if r.skipped() {
+                Press::Skipped { seq }
             } else {
-                None
-            };
-            if need == Fence::Required && fence.is_none() {
-                return unfenced(None);
-            }
-            loop {
-                let args = super::super::policy::key_args(guard, digit, fence.as_deref());
-                let mut words: Vec<&str> = vec!["key"];
-                words.extend(args.split(' '));
-                let r = self.call(&words)?;
-                if r.ok() {
-                    self.caps.key_if = Some(true);
-                    let seq = r.seq().unwrap_or(seen.seq);
-                    return Ok(Pressing::Done(if r.skipped_changed() {
-                        Press::Changed { seq }
-                    } else if r.skipped() {
-                        Press::Skipped { seq }
-                    } else {
-                        Press::Pressed { seq }
-                    }));
-                }
-                let why = format!("key {args} failed: {}", r.stderr.trim());
-                if self.unserved(&r) {
-                    // The guard ran under the server's lock or not at all: a
-                    // `1` it wrote went to the box, never the composer.
-                    return Ok(Pressing::Lost { known: None, why });
-                }
-                if r.is_err("halted") {
-                    return Ok(Pressing::Halted { why });
-                }
-                if r.is_err("busy") || r.is_err("rate") {
-                    return Ok(Pressing::Refused { why });
-                }
-                if r.unknown_form() {
-                    if need == Fence::Required {
-                        // Turned away: nothing was written, and nothing is
-                        // pressed without the fence.
-                        return unfenced(Some(format!(
-                            "`key {args}` was answered `{}`, and nothing was pressed without \
-                             the fence",
-                            r.err_text()
-                        )));
-                    }
-                    if fence.take().is_some() {
-                        // The fence is what it did not know: the row guard
-                        // alone, from now on.
-                        self.caps.gen_fence = Some(false);
-                        continue;
-                    }
-                    self.caps.key_if = Some(false);
-                    break;
-                }
-                return Err(Fail::Hard(why));
-            }
+                Press::Pressed { seq }
+            }));
         }
-        if need == Fence::Required {
-            // Never reached (each way out of the fenced loop above returns
-            // under `Required`), and never the unfenced fallback if it were.
-            return unfenced(None);
+        let why = format!("key {args} failed: {}", r.stderr.trim());
+        if self.unserved(&r) {
+            return Ok(Pressing::Lost { why });
         }
-        let now = self.screen()?;
-        let reader = self.reader(&now.rows);
-        let still = reader
-            .prompt(&now.rows)
-            .is_some_and(|q| q.command == prompt.command)
-            && aterm_observe::row_matcher(guard)
-                .is_ok_and(|m| now.rows.iter().any(|r| m.matches(r)));
-        if !still {
-            return Ok(Pressing::Done(Press::Skipped { seq: now.seq }));
+        if r.is_err("halted") {
+            return Ok(Pressing::Halted { why });
         }
-        // An unguarded `1` goes wherever keys go when it lands: to the box,
-        // or, the box resolved first, to the session survey parked above the
-        // composer, where it is the rating `Bad`, the person's to give. With
-        // the survey open, nothing is pressed: the box is the manager's.
-        if reader.survey(&now.rows) {
-            return Ok(Pressing::Withheld);
+        if r.is_err("busy") || r.is_err("rate") {
+            return Ok(Pressing::Refused { why });
         }
-        let r = self.call(&["key", digit])?;
-        if !r.ok() {
-            let why = format!("key {digit} failed: {}", r.stderr.trim());
-            if self.unserved(&r) {
-                self.stray = Some(prompt.command.clone());
-                return Ok(Pressing::Lost { known: None, why });
-            }
-            if r.is_err("halted") {
-                return Ok(Pressing::Halted { why });
-            }
-            if r.is_err("busy") || r.is_err("rate") {
-                return Ok(Pressing::Refused { why });
-            }
-            return Err(Fail::Hard(why));
+        if r.unknown_form() {
+            return Ok(Pressing::Unconfirmed { why, retry: false });
         }
-        let seq = r.seq().unwrap_or(now.seq);
-        let pressed = Press::Pressed { seq };
-        // Let the worker take the press before looking for a stray digit: the
-        // first content change after it, bounded.
-        let after = match self
-            .wait(&["seq", &seq.to_string()], STRAY_SETTLE)
-            .and_then(|_| self.screen())
-        {
-            Ok(after) => after,
-            Err(Fail::Lost(why)) => {
-                self.stray = Some(prompt.command.clone());
-                return Ok(Pressing::Lost {
-                    known: Some(pressed),
-                    why,
-                });
-            }
-            Err(e) => return Err(e),
-        };
-        if stray_digit(self.reader(&after.rows), &after, digit) {
-            let r = self.call(&["key", "backspace"])?;
-            let skipped = Press::Skipped { seq: after.seq };
-            if self.unserved(&r) {
-                self.stray = Some(prompt.command.clone());
-                return Ok(Pressing::Lost {
-                    known: Some(skipped),
-                    why: format!("key backspace failed: {}", r.stderr.trim()),
-                });
-            }
-            return Ok(Pressing::Done(skipped));
-        }
-        Ok(Pressing::Done(pressed))
+        Err(Fail::Hard(why))
     }
 
     /// The choice on a dialog answered by its focus (the folder-trust dialog,
     /// unnumbered; under full power any unnumbered box, such as the `Tool use`
-    /// box whose vendor default is `No` or Codex's folder gate; the usage-limit
+    /// box whose vendor default is `No`; the usage-limit
     /// dialog, whose wait row is reached with the arrows and confirmed with
     /// Enter, never by a digit;
     /// [`Choice::Focus`](super::super::policy::approval::Choice::Focus)): move
@@ -1083,12 +970,11 @@ impl<C: Ctl> Session<'_, C> {
     /// row> down`) and the screen read again once it has moved and held still
     /// (`await seq`, then `await idle`); then, once a fresh read shows the same
     /// dialog (kind, and its folder, subject or wait row) with the focus on
-    /// the option labelled `label`, press `key` (Enter, or `s`, the key a Codex
-    /// effort box applies the focused effort to this conversation with),
+    /// the option labelled `label`, press `key` (Enter, or the autocompact
+    /// offer's `left`/`right`),
     /// fenced on that read's generation and guarded on the focused row itself,
     /// `❯` and all. Never without the generation fence
-    /// ([`Pressing::Unconfirmed`]), never by the fallback's unguarded keys,
-    /// and never Esc (the trust dialog's cancel exits Claude Code; the
+    /// ([`Pressing::Unconfirmed`]), and never Esc (the trust dialog's cancel exits Claude Code; the
     /// usage-limit dialog's cancels the wait). A focus that did not land where
     /// it was sent, or a dialog that changed under the moves, is
     /// [`Pressing::Unconfirmed`]: the box is the manager's under the safe
@@ -1140,7 +1026,7 @@ impl<C: Ctl> Session<'_, C> {
         if usize::try_from(steps.unsigned_abs()).unwrap_or(usize::MAX) >= prompt.options.len() {
             return cannot("the option to move the focus to is not among the box's options");
         }
-        if self.caps.key_if == Some(false) || !self.gen_fence_known()? {
+        if !self.gen_fence_known()? {
             return cannot("this host cannot fence a focus move on the screen generation");
         }
         let arrow = if steps >= 0 { "down" } else { "up" };
@@ -1185,9 +1071,12 @@ impl<C: Ctl> Session<'_, C> {
         }
         let reading = aterm_phase::read(self.program.as_deref(), &now.rows, None);
         let focused = reading.prompt.as_ref().and_then(|q| {
-            (q.kind == prompt.kind && q.command == prompt.command)
-                .then(|| q.focused())
-                .flatten()
+            (q.kind == prompt.kind
+                && q.command == prompt.command
+                && (prompt.kind != PromptKind::Question
+                    || roles_question_key(q) == roles_question_key(prompt)))
+            .then(|| q.focused())
+            .flatten()
         });
         let Some(focused) = focused.filter(|o| o.label == label) else {
             // The same dialog, the focus where it was: the keys went nowhere
@@ -1289,10 +1178,7 @@ impl<C: Ctl> Session<'_, C> {
                 retry: false,
             })
         };
-        if self.caps.key_if == Some(false)
-            || !self.gen_fence_known()?
-            || !self.send_fence_known()?
-        {
+        if !self.gen_fence_known()? || !self.send_fence_known()? {
             return unconfirmed("this host cannot fence a keystroke on the screen generation");
         }
         let program = self.program.clone();
@@ -1416,23 +1302,33 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// A Codex question's NOTE under a text word (`Choice::Note`, decided by
-    /// `policy/question.rs`'s `note_answer`): the keystrokes [`note_step`]
-    /// decides on each fresh read — the focus moved onto `None of the above`
-    /// with arrows (a digit answers at once), Tab to open its notes field,
-    /// the word's fixed text in one fenced `send` ([`Self::question_text`],
-    /// which remembers it as the loop's own), and Enter once a read shows the
-    /// field holding exactly that text — every key `key [if-human=<the read's
-    /// person count>] if-gen=<the read> if=<the row as drawn> <key>`, one in
-    /// flight: each one's effect seen on a settled read before the next.
+    /// A Codex or Muse Code question's NOTE under a text word (`Choice::Note`,
+    /// decided by `policy/question.rs`'s `note_answer`): the keystrokes
+    /// [`note_step`] decides on each fresh read — the focus moved onto `None
+    /// of the above` with arrows (a digit answers Codex's at once), Tab to
+    /// open its notes field, the word's fixed text in one fenced `send`
+    /// ([`Self::question_text`], which remembers it as the loop's own), and
+    /// Enter once a read shows the field holding exactly that text — every
+    /// key `key [if-human=<the read's person count>] if-gen=<the read>
+    /// if=<the row as drawn> <key>`, one in flight: each one's effect seen on
+    /// a settled read before the next. A field too short for the text draws
+    /// its tail alone (measured on Codex 0.163.0: at most six rows, scrolled
+    /// to the cursor); that Enter goes only while the read's person count is
+    /// still the one the text's `send` was fenced on
+    /// ([`approval_loop::QuestionMemory::typed_person`]), so no person's key
+    /// reached the field the loop read empty, and the head it does not draw
+    /// is the loop's text.
     ///
     /// * **Never Esc, never Tab in an open field, never a digit**: Esc or Tab
-    ///   there clears the text (measured on 0.163.0), Esc on the dialog
-    ///   interrupts the turn, and a digit answers before any note.
+    ///   there clears the text (measured on Codex 0.163.0 and Muse Code
+    ///   1.4.10), Esc on the dialog interrupts the turn, and a digit answers
+    ///   Codex's before any note. Muse Code's note Enter draws its review,
+    ///   decided as a box of its own (`review_answer`).
     /// * **Never written twice.** A keystroke a read does not show yet is
     ///   waited on (a read like the one it was decided on), up to
-    ///   [`MAX_DECLINE_UNSEEN_READS`] reads, a text drawing in (a strict
-    ///   prefix of it) the same; then handed over ([`Pressing::Unconfirmed`]).
+    ///   [`MAX_DECLINE_UNSEEN_READS`] reads, a text drawing in (a piece of
+    ///   it short of its end, [`NoteRead::Part`]) the same; then handed over
+    ///   ([`Pressing::Unconfirmed`]).
     ///   A Tab whose field never read open latches the question's FALLBACK
     ///   ([`approval_loop::QuestionMemory::fell_back`], `NOTES_UNREAD`) and
     ///   is [`Press::Changed`]: the next decision answers it with its
@@ -1462,10 +1358,7 @@ impl<C: Ctl> Session<'_, C> {
         let Some(text) = priority.text() else {
             return unconfirmed("the recommended policy writes no note");
         };
-        if self.caps.key_if == Some(false)
-            || !self.gen_fence_known()?
-            || !self.send_fence_known()?
-        {
+        if !self.gen_fence_known()? || !self.send_fence_known()? {
             return unconfirmed("this host cannot fence a keystroke on the screen generation");
         }
         let program = self.program.clone();
@@ -1492,11 +1385,13 @@ impl<C: Ctl> Session<'_, C> {
             };
             let state = note_state(&q, &now.rows);
             if let Some((step, was)) = &last {
+                // A text still being drawn shows a piece of it: its head,
+                // or, in a field too short for it, the rows at its cursor.
                 let drawing = matches!(step, NoteStep::Type { .. })
                     && state
                         .1
                         .as_deref()
-                        .is_some_and(|t| t.len() < text.len() && text.starts_with(t));
+                        .is_some_and(|t| t.is_empty() || note_read(text, t) == NoteRead::Part);
                 if *was == state || drawing {
                     unseen += 1;
                     if unseen > MAX_DECLINE_UNSEEN_READS {
@@ -1532,6 +1427,15 @@ impl<C: Ctl> Session<'_, C> {
             if written >= MAX_NOTE_STEPS {
                 return unconfirmed("the note took more keystrokes than a question has rows");
             }
+            // The tail alone is the loop's text only while no person has keyed
+            // since the send, which was fenced on that same count: the field
+            // read empty before it, so its hidden head is the loop's own.
+            if matches!(step, NoteStep::Enter { whole: false, .. })
+                && (now.human_seq.is_none()
+                    || self.question.typed_person.get(&key).copied() != now.human_seq)
+            {
+                return unconfirmed(TAIL_KEYED);
+            }
             let enter = matches!(step, NoteStep::Enter { .. });
             if enter && self.question.note_entered.as_deref() == Some(key.as_str()) {
                 return unconfirmed(
@@ -1542,7 +1446,11 @@ impl<C: Ctl> Session<'_, C> {
             let Some(generation) = now.generation.clone() else {
                 return unconfirmed("the read carried no screen generation to fence on");
             };
-            let person = now.human_seq.map(|n| format!("if-human={n}"));
+            let Some(person) = now.human_seq.map(|n| format!("if-human={n}")) else {
+                return unconfirmed(
+                    "the read carried no person count to fence the note's next key",
+                );
+            };
             let keyed = match &step {
                 NoteStep::Type { guard } => {
                     self.question_text(guard, text, &now, &key, priority)?
@@ -1550,17 +1458,17 @@ impl<C: Ctl> Session<'_, C> {
                 NoteStep::Move { down, guard } => {
                     let arrow = if *down { "down" } else { "up" };
                     let (r, args) =
-                        self.fenced_key(guard, arrow, &generation, person.as_deref())?;
+                        self.fenced_key(guard, arrow, &generation, Some(person.as_str()))?;
                     self.note_keyed(&r, &args, now.seq)?
                 }
                 NoteStep::Open { guard } => {
                     let (r, args) =
-                        self.fenced_key(guard, "tab", &generation, person.as_deref())?;
+                        self.fenced_key(guard, "tab", &generation, Some(person.as_str()))?;
                     self.note_keyed(&r, &args, now.seq)?
                 }
-                NoteStep::Enter { guard } => {
+                NoteStep::Enter { guard, .. } => {
                     let (r, args) =
-                        self.fenced_key(guard, "enter", &generation, person.as_deref())?;
+                        self.fenced_key(guard, "enter", &generation, Some(person.as_str()))?;
                     self.note_keyed(&r, &args, now.seq)?
                 }
             };
@@ -1633,12 +1541,11 @@ impl<C: Ctl> Session<'_, C> {
         args: &str,
     ) -> Result<Option<Pressing>, Fail> {
         if r.ok() {
-            self.caps.key_if = Some(true);
             return Ok(None);
         }
         let why = format!("key {args} failed: {}", r.stderr.trim());
         Ok(Some(if self.unserved(r) {
-            Pressing::Lost { known: None, why }
+            Pressing::Lost { why }
         } else if r.is_err("halted") {
             Pressing::Halted { why }
         } else if r.is_err("busy") || r.is_err("rate") {
@@ -1659,11 +1566,8 @@ impl<C: Ctl> Session<'_, C> {
     /// `0` is the only key it ever presses. Where the read carries the session's
     /// person count (`human_seq`) the key is fenced on it, `key if-human=<n>`: a
     /// person who keyed since the read skips the `0` (`OK skipped reason=person`,
-    /// [`Dismiss::Yielded`]), as every other press of the loop is skipped. A host
-    /// without the guard (a usage line or a bare `ERR`) is never pressed
-    /// unguarded: [`Dismiss::Unguarded`], and the survey is said instead. `ERR
-    /// busy sink` is retried
-    /// [`BUSY_SINK_RETRIES`] times (the guard is the survey's own row, so a
+    /// [`Dismiss::Yielded`]), as every other press of the loop is skipped. `ERR
+    /// busy sink` is retried [`BUSY_SINK_RETRIES`] times (the guard is the survey's own row, so a
     /// retry cannot land anywhere else); `ERR halted`, a busy sink that does
     /// not clear, `ERR busy …` and `ERR rate` are [`Dismiss::Refused`] — the
     /// loop parks or backs off and tries the survey again; a request not
@@ -1688,8 +1592,7 @@ impl<C: Ctl> Session<'_, C> {
     /// since the read ([`Dismiss::Yielded`]). NO `if-gen=`: what each guard
     /// names repaints under it (the card's timer, a panel that is
     /// refreshing), and a generation fence would skip a press its row guard
-    /// allows. Every refusal is [`Self::dismiss_survey`]'s, word for word: a
-    /// host with no `key if=` is never pressed unguarded.
+    /// allows. Every refusal is [`Self::dismiss_survey`]'s, word for word.
     pub(super) fn guarded_key(
         &mut self,
         seen: u64,
@@ -1697,9 +1600,6 @@ impl<C: Ctl> Session<'_, C> {
         key: &str,
         human_seq: Option<u64>,
     ) -> Result<Dismiss, Fail> {
-        if self.caps.key_if == Some(false) {
-            return Ok(Dismiss::Unguarded);
-        }
         // The person fence the other presses carry (`key if-human=<n>`, checked under the
         // same lock hold as the write): a person who keyed since the read that judged the
         // card skips the `0` — it would head what they are typing. A read with no count
@@ -1713,7 +1613,6 @@ impl<C: Ctl> Session<'_, C> {
         loop {
             let r = self.call(&words)?;
             if r.ok() {
-                self.caps.key_if = Some(true);
                 return Ok(if r.skipped_person() {
                     Dismiss::Yielded
                 } else if r.skipped() {
@@ -1728,13 +1627,9 @@ impl<C: Ctl> Session<'_, C> {
             if self.unserved(&r) {
                 return Err(Fail::Lost(why));
             }
-            if r.unknown_form() {
-                self.caps.key_if = Some(false);
-                return Ok(Dismiss::Unguarded);
-            }
             if r.is_err("busy sink") && busy < BUSY_SINK_RETRIES {
                 busy += 1;
-                std::thread::sleep(BUSY_SINK_BACKOFF);
+                self.fx.sleep(BUSY_SINK_BACKOFF);
                 continue;
             }
             if r.is_err("halted") {
@@ -1748,7 +1643,7 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// `key backspace` for a digit the loop left in the composer — the survey's `0` a card
-    /// dropped, the fallback press's `1` — judged like every other press: only an `OK`
+    /// dropped — judged like every other press: only an `OK`
     /// removed the digit. `ERR busy sink` is retried [`BUSY_SINK_RETRIES`] times; `ERR
     /// halted`, a busy sink that does not clear, `ERR busy …` and `ERR rate` are
     /// [`Backspaced::Refused`] — the digit STANDS, and the caller keeps its books so the
@@ -1769,7 +1664,7 @@ impl<C: Ctl> Session<'_, C> {
             }
             if r.is_err("busy sink") && busy < BUSY_SINK_RETRIES {
                 busy += 1;
-                std::thread::sleep(BUSY_SINK_BACKOFF);
+                self.fx.sleep(BUSY_SINK_BACKOFF);
                 continue;
             }
             if r.is_err("halted") {

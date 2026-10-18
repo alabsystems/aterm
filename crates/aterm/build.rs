@@ -1,90 +1,58 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// build.rs — Win32 resources for THE shipped executable.
+// Win32 resources for the shipped executable, and the build facts on every target.
 //
-// WHY HERE: the resource step emits `cargo:rustc-link-arg-bins`, and a build
-// script's link args reach only the bin targets of ITS OWN package. The binary
-// that ships is this crate's `[[bin]] name = "aterm"` (install.ps1 hardlinks every
-// CLI name onto it), so its resources must be embedded here, not in aterm-gui —
-// without them Windows shows the generic exe glyph and a bare filename.
+// The resource step emits `cargo:rustc-link-arg-bins`, which reaches only this package's bins,
+// so the resources of the shipped `aterm` (install.ps1 hardlinks every CLI name onto it) are
+// embedded here, not in aterm-gui. One generated .rc carries:
+//   1 ICON          the application icon (read back by winit's `Icon::from_resource(1, None)`
+//                   in aterm-gui/src/app_window.rs)
+//   1 RT_MANIFEST   assets/aterm.manifest: Common-Controls v6, longPathAware,
+//                   activeCodePage=UTF-8, supportedOS
+//   VS_VERSION_INFO the version block Explorer, Task Manager and ARP read
 //
-// Three resources land here, all through one generated .rc:
-//   1 ICON         the application icon (read back at runtime by winit's
-//                  `Icon::from_resource(1, None)` in aterm-gui/src/app_window.rs)
-//   1 RT_MANIFEST  the side-by-side manifest (assets/aterm.manifest) — Common-
-//                  Controls v6, longPathAware, activeCodePage=UTF-8, supportedOS
-//   VS_VERSION_INFO the version block Explorer / Task Manager / ARP read
+// A missing resource compiler warns but never breaks the build: every outcome but `Linked`
+// prints a banner naming the visible consequence, and `ATERM_REQUIRE_WIN_RESOURCES=1` makes it
+// an error. Off Windows the resource half emits nothing, no link arg included.
 //
-// FAILURE POSTURE: warn loudly, never break the build. A machine with no resource
-// compiler must still build aterm, but a silent miss is how a missing icon ships,
-// so every outcome that is not `Linked` prints a banner naming the user-visible
-// consequence (`aterm_winres::Outcome` has no silent variant), and
-// `ATERM_REQUIRE_WIN_RESOURCES=1` makes it a hard error for release cutters.
-//
-// THE BUILD FACTS are this script's other job, on every target: `mod build_stamp`
-// below emits the commit, build number and build time, and `mod compiler` the
-// compiler provenance, profile and verification state, that `src/main.rs`'s
-// `BUILD_STAMP` compiles in and installs at startup (`aterm_types::version`).
-// Stamped here, in the binary crate, so a commit or a compiler change recompiles
-// this crate rather than the libraries. It emits only `rustc-env` values, never
-// a link arg.
-//
-// Off Windows the resource half returns at once: no .rc, no resource compiler,
-// and NO link arg — a macOS or Linux binary is byte-identical to one built
-// without this file.
+// `mod build_stamp` and `mod compiler` emit the `rustc-env` build facts `src/main.rs`'s
+// `BUILD_STAMP` compiles in, stamped in the binary crate so a commit recompiles only this crate.
 #![allow(
     clippy::disallowed_types,
     reason = "never linked into the shipped binary: a build script"
 )]
 
-/// Ordinal shared by the icon and the manifest.
-///
-/// They do not collide: resources are keyed by (type, id), so `1 ICON` and
-/// `1 RT_MANIFEST` are two distinct entries. Neither number is a free choice —
-/// `CREATEPROCESS_MANIFEST_RESOURCE_ID` is fixed at 1 (the only id the loader
-/// consults for an .exe), and the runtime lookup in aterm-gui asks for icon
-/// ordinal 1 by name. Changing this breaks a live consumer at both ends.
+/// Ordinal of both the icon and the manifest; resources are keyed by (type, id), so they do not
+/// collide. Neither is free: the loader consults manifest id 1 only
+/// (`CREATEPROCESS_MANIFEST_RESOURCE_ID`), and aterm-gui looks up icon ordinal 1.
 const RESOURCE_ID: u16 = 1;
 
-/// `RT_MANIFEST`, spelled as the raw type number.
-///
-/// The prettier `1 RT_MANIFEST "…"` form needs `#include <winuser.h>`, which
-/// drags the whole Windows SDK header set onto the resource compiler's include
-/// path. That turns a box with `rc.exe` but no SDK headers configured from
-/// "builds fine" into "fails to compile a resource" — the precise toolchain-less
-/// case the warn-don't-fail posture above exists to survive. The number is
-/// stable ABI; the macro is a convenience.
+/// `RT_MANIFEST` as its raw type number: the macro needs `#include <winuser.h>`, and a box with
+/// `rc.exe` but no SDK headers on its include path would then fail to compile the resource.
 const RT_MANIFEST: u16 = 24;
 
-/// `VS_VERSION_INFO`, spelled as the raw resource id — and this one is a TRAP
-/// with a measurement behind it.
-///
-/// `VS_VERSION_INFO VERSIONINFO` is the form every example on the internet uses,
-/// and it is WRONG without `#include <winver.h>`: `VS_VERSION_INFO` is a macro
-/// that expands to `1`, and with no include rc.exe cannot know that, so it takes
-/// the bare token as a resource *name string*. The build succeeds, `.rsrc`
-/// appears, and dumping the resource tree shows `TYPE 16 / NAME named=True` — a
-/// version resource keyed by the string "VS_VERSION_INFO". `GetFileVersionInfo`
-/// only ever looks up `MAKEINTRESOURCE(1)`, so it finds nothing:
-/// `GetFileVersionInfoSizeW` returns 0 and every property reads back empty,
-/// which is indistinguishable from having no version block at all. That is
-/// exactly the symptom this whole file exists to fix, so it would have shipped
-/// looking fixed. Measured on a real build before the number replaced the macro.
-///
-/// Same reasoning as `RT_MANIFEST` above: the number is stable ABI, the macro
-/// needs an SDK header the toolchain-less case may not have.
+/// `VS_VERSION_INFO` as its raw id. Without `#include <winver.h>` rc.exe takes the bare macro
+/// as a resource name string: the build succeeds, but `GetFileVersionInfo` looks up only
+/// `MAKEINTRESOURCE(1)`, finds nothing, and every property reads back empty.
 const VS_VERSION_INFO_ID: u16 = 1;
 
 fn main() {
     build_stamp::emit();
     compiler::emit();
 
-    // Build scripts run on the HOST, so `cfg!(windows)` here answers "what am I
-    // running on", not "what am I building for" — wrong for either direction of
-    // cross build. Cargo hands the answer we actually need in the environment.
+    // A build script runs on the host, so `cfg!(windows)` would answer for the host, not the
+    // target.
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
+    }
+
+    // The main thread's stack: MSVC's linker reserves 1 MiB unless told otherwise, macOS
+    // gives 8 MiB, and the window code is written against that. A debug build overflowed
+    // the 1 MiB (0xC00000FD) when its last window closed and on `invoke NewWindow`
+    // (measured 2026-09-27). Reserved address space, committed only as the stack grows.
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo:rustc-link-arg-bins=/STACK:{}", 8 * 1024 * 1024);
     }
 
     let manifest_dir = std::path::PathBuf::from(
@@ -94,15 +62,9 @@ fn main() {
         std::env::var_os("OUT_DIR").expect("cargo always sets OUT_DIR for a build script"),
     );
 
-    // The .ico deliberately stays where it already lives, in aterm-gui's assets:
-    // it is the SAME artwork `aterm-gui.exe` embeds, and a second copy under this
-    // crate would be a second file to keep in sync and a second file to forget.
-    // `crates/aterm` depends on `aterm-gui` by path, so the sibling directory is
-    // present in any tree that can build this crate at all.
-    //
-    // Reached via the parent rather than a literal `../` so the path written into
-    // the generated .rc is a clean absolute one — it is the first thing anyone
-    // debugging a resource-compiler failure will read.
+    // The .ico is aterm-gui's (the same artwork `aterm-gui.exe` embeds, one copy); this crate
+    // depends on aterm-gui by path, so the directory is present. Reached via the parent, not a
+    // literal `../`, so the generated .rc carries a clean absolute path.
     let crates_dir = manifest_dir.parent().unwrap_or(&manifest_dir).to_path_buf();
     let icon = crates_dir.join("aterm-gui/assets/aterm.ico");
     let app_manifest = manifest_dir.join("assets/aterm.manifest");
@@ -118,13 +80,9 @@ fn main() {
         return;
     }
 
-    // The link arg the step emits targets every bin of this package: the console
-    // image `aterm` AND the windowed image `aterm-windowed` (shipped as
-    // `aterm-gui.exe`), which is what we want — both files are launched by
-    // Explorer or shown in Task Manager, so both carry the icon, the manifest
-    // and the version block. One .rc for both: the only per-file string in it
-    // is `OriginalFilename`, and it names `aterm.exe` for the windowed image
-    // too (see the note beside that VALUE).
+    // The link arg reaches every bin of this package, so the console `aterm` and the windowed
+    // `aterm-windowed` (shipped as `aterm-gui.exe`) both carry the resources. One .rc serves
+    // both (see the note beside `OriginalFilename`).
     let outcome = aterm_winres::compile(&rc_path);
     if outcome.is_linked() {
         return;
@@ -132,14 +90,10 @@ fn main() {
     report(&outcome.to_string());
 }
 
-/// Emit the "this exe is going to look unfinished" banner, and honour the
-/// opt-in hard-failure switch.
+/// Print the "this exe will look unfinished" banner and honour `ATERM_REQUIRE_WIN_RESOURCES`.
 ///
-/// Deliberately many lines: cargo prints `cargo:warning` inline with the build
-/// output where a single line disappears into a scrollback of dependency noise,
-/// and *disappearing into the noise* is the specific failure mode being fixed.
-/// The banner names the consequence rather than the mechanism, because the
-/// person who needs to act on it is looking at a window, not at a linker.
+/// Many lines on purpose: a single `cargo:warning` line disappears into the dependency noise.
+/// It names the visible consequence, not the mechanism.
 fn report(why: &str) {
     for line in [
         "-----------------------------------------------------------------".to_string(),
@@ -159,9 +113,7 @@ fn report(why: &str) {
         println!("cargo:warning={line}");
     }
 
-    // Opt-in, not opt-out. A contributor on a fresh box gets a working build and
-    // a loud banner; a release cutter gets a build that refuses to produce an
-    // exe the shell would render as an anonymous rectangle.
+    // Opt-in: a fresh box gets a working build and the banner; a release cut sets the switch.
     let required = std::env::var("ATERM_REQUIRE_WIN_RESOURCES")
         .map(|v| !matches!(v.as_str(), "" | "0" | "false" | "no"))
         .unwrap_or(false);
@@ -170,35 +122,21 @@ fn report(why: &str) {
     }
 }
 
-/// Build the resource script text.
-///
-/// Generated rather than checked in for one reason: `VS_VERSION_INFO` carries the
-/// version FOUR times (two numeric quads, two strings) and a checked-in .rc would
-/// be four more places to forget on a version bump. Everything here comes from
-/// `CARGO_PKG_VERSION_*`, which cargo derives from the workspace `version` this
-/// crate inherits — so the strings Explorer and Task Manager show cannot drift
-/// from the crate version, ever.
+/// Build the resource script text. Generated, not checked in: `VS_VERSION_INFO` carries the
+/// version four times, all from `CARGO_PKG_VERSION_*`, so it cannot drift from the crate's.
 fn resource_script(icon: &std::path::Path, app_manifest: &std::path::Path) -> String {
-    // This crate is the one reader of `CARGO_PKG_VERSION*`: these are the same
-    // workspace `version` `src/main.rs`'s `BUILD_STAMP` compiles in — one
-    // ground truth, read at the only time a build script can read it.
     let major = env_num("CARGO_PKG_VERSION_MAJOR");
     let minor = env_num("CARGO_PKG_VERSION_MINOR");
     let patch = env_num("CARGO_PKG_VERSION_PATCH");
     let display = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".into());
 
-    // The fourth field of a Windows version quad is the build number, and aterm
-    // has a real one (`ATERM_BUILD_NUMBER`, from SOURCE_DATE_EPOCH or HEAD's
-    // committer epoch — see `mod build_stamp`). It is NOT used here: it
-    // is a Unix epoch, which overflows the u16 each quad field is, and
-    // squeezing it into range would buy a number nothing reads. Zero is the honest filler; the
-    // exact build is already in the About panel and `aterm ctl version`.
+    // The quad's fourth field is the build number, left 0: aterm's (`ATERM_BUILD_NUMBER`) is a
+    // Unix epoch, which overflows the u16 field. The exact build is in the About panel and
+    // `aterm ctl version`.
     let quad = format!("{major},{minor},{patch},0");
 
-    // VS_FF_* flags. Both are statements of fact about THIS binary, so both are
-    // computed rather than hardcoded: a debug build says so, and a pre-release
-    // version (`0.45.0-rc1`) says so. FILEFLAGSMASK must cover every bit we may
-    // set, so it is the full 0x3f rather than the two bits used today.
+    // VS_FF_* flags, computed: a debug build and a pre-release version (`0.45.0-rc1`) say so.
+    // FILEFLAGSMASK is the full 0x3f so it covers every bit that may be set.
     const VS_FF_DEBUG: u32 = 0x1;
     const VS_FF_PRERELEASE: u32 = 0x2;
     let mut flags = 0u32;
@@ -267,15 +205,9 @@ END
     )
 }
 
-/// A path as it may appear inside an `.rc` string literal.
-///
-/// Backslash is the ESCAPE character in an .rc string, so a raw Windows path
-/// (`C:\Users\…`) is read as the invalid escapes `\U`, `\…`. Forward slashes
-/// avoid the question entirely: every resource compiler in play (`rc.exe`,
-/// `llvm-rc`, `windres`) hands the path to the platform's file open, and Win32
-/// accepts `/` as a separator. The alternative — doubling every backslash — is
-/// what MSVC's own generator emits, but it is one more transformation to get
-/// wrong and it reads worse in the generated file when debugging.
+/// A path as it may appear inside an `.rc` string literal. Backslash is the .rc escape
+/// character, so separators become `/`: every resource compiler in play (`rc.exe`, `llvm-rc`,
+/// `windres`) hands the path to a Win32 file open, which accepts it.
 fn rc_path_literal(p: &std::path::Path) -> String {
     p.display().to_string().replace('\\', "/")
 }
@@ -301,33 +233,26 @@ fn run(cmd: &str, args: &[&str]) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
-// THE STAMP — the binary's build facts, stamped into THIS crate as compile-time
-// env vars. `src/main.rs` compiles them into ONE `BUILD_STAMP` and installs it
-// first thing (`aterm_types::version::install`), and every surface reads them
-// from there (`aterm-gui/src/build_info.rs`: the About panel, `aterm ctl
-// version`, the menu signature, the handoff identity; `app_version()` everywhere
-// else). `mod build_stamp` emits the per-commit half:
+// The build facts, stamped into this crate as compile-time env vars. `src/main.rs` compiles them
+// into one `BUILD_STAMP` and installs it first thing (`aterm_types::version::install`); every
+// surface reads them from there (`aterm-gui/src/build_info.rs`: the About panel, `aterm ctl
+// version`, the menu signature, the handoff identity; `app_version()` elsewhere).
+// `mod build_stamp` emits the per-commit half:
 //
-//   ATERM_GIT_COMMIT      short commit the binary was built from (+ "-dirty" when the
-//                         working tree had uncommitted changes); "unknown" w/o git.
+//   ATERM_GIT_COMMIT      short commit (+ "-dirty" when the working tree had uncommitted
+//                         changes); "unknown" without git.
 //   ATERM_GIT_COMMIT_FULL all forty hex characters, or "unknown".
 //   ATERM_GIT_DIRTY       "true" | "false".
-//   ATERM_DEV_COMMITS     commits since the newest release tag; "0" w/o git or tag.
-//   ATERM_BUILD_NUMBER    monotonic build number (ordering is independent of the
-//                         display/source version): SOURCE_DATE_EPOCH — the ledger
-//                         claim `targo --unverified ship cut` exports — wins when set;
-//                         else HEAD's committer Unix epoch (dev builds); "0" only w/o git.
+//   ATERM_DEV_COMMITS     commits since the newest release tag; "0" without git or tag.
+//   ATERM_BUILD_NUMBER    monotonic build number: SOURCE_DATE_EPOCH (the ledger claim
+//                         `targo --unverified ship cut` exports) when set, else HEAD's
+//                         committer epoch; "0" only without git.
 //   ATERM_BUILD_TIME      UTC build timestamp (RFC3339), or "unknown".
 //
-// and `mod compiler` the rest (see there).
-//
-// WHY HERE AND NOT IN A LIBRARY'S build script: every value above moves with every
-// commit, and a build script's `rustc-env` reaches every unit of its package.
-// Stamped in aterm-gui, an empty commit recompiled all of aterm-gui (measured 185 s
-// incremental); here it recompiles only this crate's own units.
-//
-// All probes are best-effort: a missing `git`/`date` degrades to "unknown" rather
-// than failing the build (so a source tarball without a .git still compiles).
+// and `mod compiler` the rest. Here, not in a library's build script, because a `rustc-env`
+// reaches every unit of its package: stamped in aterm-gui, an empty commit recompiled all of
+// aterm-gui (185 s incremental). Every probe is best-effort: a missing `git`/`date` degrades to
+// "unknown", so a source tarball without a .git still builds.
 mod build_stamp {
     use super::run;
     use std::path::PathBuf;
@@ -341,10 +266,8 @@ mod build_stamp {
 
     /// Emit the stamp and the `rerun-if` directives that keep it current.
     pub fn emit() {
-        // THE PIN. A caller that already knows these facts — the gate,
-        // which resolves them ONCE for the snapshot it verifies — supplies them, and
-        // this script then asks git nothing and WATCHES NOTHING. That is the whole
-        // point: see `git_watch_paths` for the defect the watch caused.
+        // A caller that has resolved these facts (the release build plan: its snapshot has no
+        // `.git`) pins them, and the script then asks git nothing and watches nothing.
         let pinned_commit = pinned("ATERM_BUILD_GIT_COMMIT");
         let pinned_full_commit = pinned("ATERM_BUILD_GIT_COMMIT_FULL");
         let pinned_dev_commits = pinned("ATERM_BUILD_DEV_COMMITS");
@@ -373,10 +296,8 @@ mod build_stamp {
         println!("cargo:rustc-env=ATERM_GIT_COMMIT_FULL={full_commit}");
         println!("cargo:rustc-env=ATERM_GIT_DIRTY={dirty}");
 
-        // THE DEV COUNTER: commits since the newest release tag, so a development
-        // build is identified by this count and its hash, never by advancing the
-        // version. "0" when git or the tag is unavailable (a source-tarball build
-        // still marks DEV via the release-env discriminator).
+        // Commits since the newest release tag: a dev build is identified by this count and its
+        // hash, never by advancing the version. "0" without git or the tag.
         let dev_commits = pinned_dev_commits.unwrap_or_else(|| {
             run(
                 "git",
@@ -393,26 +314,16 @@ mod build_stamp {
         });
         println!("cargo:rustc-env=ATERM_DEV_COMMITS={dev_commits}");
 
-        // Monotonic build number, epoch-scale (seconds). The updater's "apply only if
-        // greater" ordering lives in this metadata, independent of the app/source
-        // display version. A dev build derives it from HEAD's committer Unix epoch:
-        //   * strictly monotonic across releases — a later release is a later commit;
-        //   * STABLE across rebuilds of the same commit — the committer date is frozen in the
-        //     commit object, so two builds of one release agree.
-        //   * topology-INDEPENDENT — a per-commit field, so it survives a shallow clone and
-        //     rebase/squash/amend just re-stamp it forward; no hand-bumped counter to drift.
-        // Fits a single sub-2^32 CFBundleVersion component (~1.78e9 today, valid past 2100).
+        // Monotonic build number in epoch seconds: the updater's "apply only if greater"
+        // ordering, independent of the display version. A dev build takes HEAD's committer epoch:
+        // later for every later release, stable across rebuilds of one commit, and readable in a
+        // shallow clone. It fits one sub-2^32 CFBundleVersion component.
         //
-        // COORDINATION: `SOURCE_DATE_EPOCH`, when a valid epoch, WINS over the live `git`
-        // read — it is the release PIN. `targo --unverified ship cut` (crates/aterm-release) claims the
-        // build number from the append-only `RELEASES.ledger` (`n = max(tail+1, unix_now)`,
-        // the same epoch scale as the dev fallback) and exports it ONCE, so this binary's
-        // `ATERM_BUILD_NUMBER`, the bundle's sealed CFBundleVersion, and the release
-        // manifest's `build_number` all carry the SAME n even if HEAD moves between build
-        // steps — the tool's post-build self-check asserts the triple agreement. Without
-        // the pin they would each re-read HEAD at a different instant and could DISAGREE,
-        // which fails the updater's sealed-CFBundleVersion == manifest.build_number
-        // anti-replay bind. Unset (a dev build) ⇒ HEAD's committer epoch; "0" only w/o git.
+        // A valid `SOURCE_DATE_EPOCH` wins: `targo --unverified ship cut` claims the number from
+        // `RELEASES.ledger` and exports it once, so this binary's `ATERM_BUILD_NUMBER`, the
+        // bundle's sealed CFBundleVersion and the manifest's `build_number` agree even if HEAD
+        // moves between steps, as the updater's sealed-CFBundleVersion == manifest.build_number
+        // anti-replay bind requires.
         let is_epoch = |s: &String| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
         let build_number = std::env::var("SOURCE_DATE_EPOCH")
             .ok()
@@ -440,14 +351,10 @@ mod build_stamp {
         .unwrap_or_else(|| "unknown".into());
         println!("cargo:rustc-env=ATERM_BUILD_TIME={build_time}");
 
-        // Re-stamp when HEAD moves (new commit / checkout); the release build number
-        // comes from SOURCE_DATE_EPOCH. The git paths are asked of git.
-        //
-        // In a linked worktree `.git` is a FILE, so literal `.git/…` paths never
-        // exist and cargo reruns the script on every build. The index is not watched
-        // (`git status` refreshes it constantly); the dirty flag is computed whenever
-        // the script runs. A PINNED BUILD WATCHES NO GIT PATH AT ALL: see
-        // `git_watch_paths`.
+        // Re-stamp when HEAD moves. The paths are asked of git: in a linked worktree `.git` is a
+        // file, so a literal `.git/…` path never exists and cargo would rerun every build. The
+        // index is not watched (`git status` refreshes it constantly); the dirty flag is computed
+        // whenever the script runs. A pinned build watches no git path.
         if !git_is_pinned {
             for path in git_watch_paths() {
                 println!("cargo:rerun-if-changed={}", path.display());
@@ -475,19 +382,13 @@ mod build_stamp {
         }
     }
 
-    /// The git files whose change means the commit stamp may be stale, resolved
-    /// through git so a linked worktree (whose `.git` is a file) and the main
-    /// checkout both work. Only EXISTING paths are returned: cargo reruns a build
-    /// script on every build while a watched path is missing. The index is not
-    /// watched: `git add` moves no commit.
+    /// The git files whose change may stale the commit stamp, resolved through git so a linked
+    /// worktree (whose `.git` is a file) and the main checkout both work. Only existing paths:
+    /// cargo reruns a build script on every build while a watched path is missing.
     ///
-    /// WHAT THIS WATCH COSTS WHEN IT IS NOT PINNED: the paths hang off the COMMON
-    /// git dir, shared by every linked worktree, so a `fetch`, `gc` or `pack-refs` in
-    /// ANY of them invalidates this crate's compile in ALL of them, mid-gate included.
-    /// The stamp really can change with those files, so the watch is right but
-    /// unpinnable from here. A caller that has resolved the facts passes
-    /// `ATERM_BUILD_GIT_COMMIT`, `ATERM_BUILD_GIT_COMMIT_FULL` and
-    /// `ATERM_BUILD_DEV_COMMITS`, and then neither the probe nor this watch runs.
+    /// The paths hang off the common git dir, so a `fetch`, `gc` or `pack-refs` in any worktree
+    /// invalidates this crate's compile in all of them. Pinning the three `ATERM_BUILD_*` facts
+    /// skips both the probe and this watch.
     fn git_watch_paths() -> Vec<PathBuf> {
         let mut paths = Vec::new();
         let Some(git_dir) = run("git", &["rev-parse", "--absolute-git-dir"]).map(PathBuf::from)
@@ -527,55 +428,32 @@ mod build_stamp {
     }
 }
 
-// COMPILER provenance (which compiler produced this binary — matters because a
-// machine can carry both upstream Rust and the Trust toolchain's trustc, and
-// different machines carry DIFFERENT trust builds), parsed from `$RUSTC -vV` by
-// src/compiler_probe.rs (include!d below so the same parser is unit-tested under
-// the test suite; RUSTC is the env name cargo AND targo hand build scripts):
+// Compiler provenance (a machine can carry both upstream Rust and Trust's trustc, and machines
+// carry different Trust builds), parsed from `$RUSTC -vV` by src/compiler_probe.rs, which is
+// include!d below so the test suite tests the same parser:
 //
 //   ATERM_COMPILER_VERSION_LINE  full first line of `$RUSTC -vV`
 //   ATERM_COMPILER_COMMIT        the compiler's full git commit hash
 //   ATERM_COMPILER_HOST          the compiler's host triple
-//   ATERM_COMPILER_TRUST_VERSION Trust's OWN version (the `trust:` -vV line), "" if none
+//   ATERM_COMPILER_TRUST_VERSION Trust's own version (the `trust:` -vV line), "" if none
 //   ATERM_COMPILER_FLAVOR        'r' (upstream Rust) | 't' (Trust: trustc)
 //   ATERM_BUILD_PROFILE          cargo PROFILE ("debug"/"release")
 //   ATERM_TRUST_VERIFY           "on" iff the Trust verification pipeline was in
 //                                this compile, else "off"
 //
-// All probes are best-effort: a missing compiler answer degrades to "unknown"
-// rather than failing the build.
+// Best-effort: a missing compiler answer degrades to "unknown".
 mod compiler {
     use super::run;
 
-    // Shared with the test suite: `src/main.rs` mounts the same file as a
-    // #[cfg(test)] module, so the -vV parser and the flavor classifier are tested
-    // against real fixtures while this script uses the identical code.
     include!("src/compiler_probe.rs");
 
     /// Emit the compiler, profile and verification facts.
     pub fn emit() {
-        // Interrogate the ACTUAL compiler the build driver is about to use (cargo
-        // and targo both set RUSTC for build scripts — targo's custom_build lane
-        // keeps the env name for drop-in compatibility; bare "rustc" is the
-        // no-driver fallback) rather than trusting whatever is first on PATH —
-        // per-binary provenance is the whole point when upstream Rust and the
-        // Trust toolchain (trustc) coexist on one machine.
+        // Ask the compiler the build driver is about to use (cargo and targo both set RUSTC;
+        // bare "rustc" is the no-driver fallback), not whatever is first on PATH.
         let compiler_path = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
         let vv = run(&compiler_path, &["-vV"]).unwrap_or_default();
         let compiler = parse_rustc_vv(&vv);
-        // Flavor ('r' = upstream Rust, 't' = Trust fork), in priority order:
-        //   1. the -vV self-identification ('binary: trustc' / '(trustc)' version
-        //      line — the 2026-07 toolchains stamp both; covers the lane where a
-        //      bare PATH-resolved `rustc` sets no env hint at all);
-        //   2. RUSTC path containing '/trust/' (the fork lives in $HOME/trust/build/...);
-        //   3. RUSTUP_TOOLCHAIN == 'trust' (a linked `rustup run trust` lane);
-        //   4. default 'r'.
-        // NOT inferred from '-dev' in the release — any local rustc build reports
-        // -dev. There is NO env override: an ATERM_COMPILER_FLAVOR that outranked
-        // the compiler's own self-report let a shell claim trustc provenance for a
-        // binary upstream rustc built, in the one field About and `ctl version`
-        // ship AS evidence. The three signals above cover every lane it was added
-        // for.
         let toolchain = std::env::var("RUSTUP_TOOLCHAIN").ok();
         let flavor = detect_flavor(&vv, &compiler_path, toolchain.as_deref());
         println!(
@@ -584,9 +462,6 @@ mod compiler {
         );
         println!("cargo:rustc-env=ATERM_COMPILER_COMMIT={}", compiler.commit);
         println!("cargo:rustc-env=ATERM_COMPILER_HOST={}", compiler.host);
-        // Trust's OWN version (the `trust:` -vV line, e.g. 0.1.0) — "" when the
-        // compiler reports none. Distinct from the rustc-shaped release token in
-        // the version line, which is the Rust release Trust is compatible with.
         println!(
             "cargo:rustc-env=ATERM_COMPILER_TRUST_VERSION={}",
             compiler.trust_version
@@ -596,9 +471,7 @@ mod compiler {
             "cargo:rustc-env=ATERM_BUILD_PROFILE={}",
             std::env::var("PROFILE").unwrap_or_else(|_| "unknown".into())
         );
-        // Whether the Trust verification pipeline was really in this compile, for
-        // About and `aterm ctl version`. See `trust_verify_state` — the `--print
-        // cfg` probe alone answers this WRONG on a Trust toolchain.
+        // Whether the Trust verification pipeline ran in this compile (`trust_verify_state`).
         println!(
             "cargo:rustc-env=ATERM_TRUST_VERIFY={}",
             trust_verify_state()
@@ -610,27 +483,15 @@ mod compiler {
 
     /// `"on"` iff this compile really runs the Trust verification pipeline.
     ///
-    /// `CARGO_CFG_TRUST_VERIFY` alone is NOT the answer, and trusting it shipped a
-    /// false provenance line for months. Cargo derives every `CARGO_CFG_*` from a
-    /// `rustc --print cfg` probe, and targo deliberately strips the `-Ztrust-verify`
-    /// family from that probe — so on a Trust toolchain the cfg reports the
-    /// compiler's DEFAULT (verification on) while every real unit is compiled with
-    /// `-Ztrust-verify=off` by the `targo --unverified` lane (until 2026-10-07 by
-    /// `.cargo/config.toml`, which carries none now). Printing that as "on" claims
-    /// a hardening the binary does not carry, which is exactly what the honesty
-    /// ratchet forbids. The lane's switch reaches this script in
-    /// `CARGO_ENCODED_RUSTFLAGS` (measured 2026-10-07 on seal 321aaeda7, for
-    /// `targo --unverified` and for a compat `cargo` given the cfg-scoped
-    /// `--config` switch alike).
+    /// `CARGO_CFG_TRUST_VERIFY` alone answers wrong on a Trust toolchain: cargo derives every
+    /// `CARGO_CFG_*` from a `rustc --print cfg` probe, and targo strips the `-Ztrust-verify`
+    /// family from that probe, so the cfg reports the compiler's default (on) while every unit of
+    /// the `targo --unverified` lane compiles with `-Ztrust-verify=off`. That switch reaches this
+    /// script in `CARGO_ENCODED_RUSTFLAGS`, so the rustflags win and the probe is the fallback
+    /// for a build with no explicit flag (stock Rust, where the cfg is unset).
     ///
-    /// So the rustflags cargo will actually pass to rustc win over the probe, and
-    /// the probe is only the fallback for the case it does answer correctly: no
-    /// explicit flag at all (a stock-Rust build, where the cfg is simply unset).
-    ///
-    /// Both spellings of the off-switch are recognised — `-Ztrust-verify=off` is
-    /// current, `-Zno-trust-verify=yes` is the retired one — and both the joined
-    /// (`-Ztrust-verify=off`) and split (`-Z` `trust-verify=off`) argument forms,
-    /// since a rustflags list may carry either.
+    /// Recognises `-Ztrust-verify=off` and the retired `-Zno-trust-verify=yes`, joined or split
+    /// (`-Z` `trust-verify=off`).
     fn trust_verify_state() -> &'static str {
         fn from_value(flag: &str) -> Option<&'static str> {
             if let Some(v) = flag.strip_prefix("trust-verify=") {

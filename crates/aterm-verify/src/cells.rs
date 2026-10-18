@@ -5,6 +5,10 @@
 //! wasm32), or each `--cell` named, linted for its own triple with the
 //! `clippy.toml` bans that resolve or matter only there, and every workspace
 //! member in its graph type-checked with all its targets (wasm32 excepted).
+//! On an OS a fleet machine runs ([`judges_warnings`]) both passes are also red
+//! on any warning rustc itself raises ([`is_cell_warning`]): `dead_code`,
+//! `unused_imports` and the like turn on `cfg`, so the triple's own compile is
+//! the only one that sees them.
 //! The cells a fleet machine hosts are that machine's own `verify lint test`,
 //! and the cell whose triple is this machine's is never cross-checked here.
 //!
@@ -641,8 +645,8 @@ fn check_cell(
         .filter(|id| in_repo(id) && paths.get(*id).is_some_and(|d| is_proc_macro(d)))
         .map(|id| id.name.clone())
         .collect();
-    // Nor is a crate only proc macros reach (crates/aterm-bumpalo under
-    // wasm-bindgen's macro): it compiles for the host with them.
+    // Nor is a crate only proc macros reach (a facade under a third-party
+    // macro): it compiles for the host with them.
     // A third-party proc macro has no path in the tree's output: forge finds
     // its directory in the registry.
     let host = host_side_of(ctx, &graph, &paths);
@@ -892,6 +896,25 @@ fn read_cargo_run(
             format!("in `{pkg}`:\n{}", rendered.trim_end()),
         );
     }
+    let warnings: &[(String, String)] = if judges_warnings(triple) {
+        &read.warnings
+    } else {
+        &[]
+    };
+    let n = warnings.len();
+    for (pkg, rendered) in warnings.iter().take(20) {
+        red.note(
+            format!(
+                "{}({n})",
+                if tests {
+                    "TEST-TARGET-WARNING"
+                } else {
+                    "WARNING"
+                }
+            ),
+            format!("in `{pkg}`:\n{}", rendered.trim_end()),
+        );
+    }
     for line in cargo_level_errors(&run.output) {
         red.note(
             if tests {
@@ -934,9 +957,10 @@ struct CellCargo<'a> {
 
 impl CellCargo<'_> {
     /// `<toolchain cargo> <verb> --target <triple> …` with this cell's
-    /// environment: the toolchain's own `rustc` and its bin first on PATH (so
-    /// `cargo clippy` finds `cargo-clippy` beside it), and the cells lane's
-    /// job cap, since the cells compile beside the run's other builds.
+    /// environment: the toolchain's own `rustc`, its bin first on PATH (so
+    /// `cargo clippy` finds `cargo-clippy` beside it), its lib first on the
+    /// loader path ([`crate::rustup::Toolchain::loader_env`]), and the cells
+    /// lane's job cap, since the cells compile beside the run's other builds.
     fn base(&self, verb: &str) -> Cmd {
         let mut path = OsString::new();
         if let Some(bin) = self.toolchain.cargo.parent() {
@@ -962,15 +986,19 @@ impl CellCargo<'_> {
         if let Some(jobs) = lane_jobs(Lane::CellsTarget, self.ctx.build_jobs_ceiling()) {
             cmd = cmd.env("CARGO_BUILD_JOBS", jobs.to_string());
         }
+        if let Some((var, value)) = self.toolchain.loader_env() {
+            cmd = cmd.env(var, value);
+        }
         for arg in self.shim_args {
             cmd = cmd.arg("--config").arg(arg);
         }
         cmd
     }
 
-    /// The lint of the cell's root package: only the `clippy.toml` bans
-    /// (every other lint is the host's), the browser cells with their own
-    /// clock-only config.
+    /// The lint of the cell's root package: of clippy, only the `clippy.toml`
+    /// bans (every other clippy lint is the host's), the browser cells with
+    /// their own clock-only config; rustc's own warnings are read from the
+    /// stream ([`is_cell_warning`]).
     fn lint(&self, cell: &Cell) -> Cmd {
         let mut cmd = self
             .base("clippy")
@@ -1130,12 +1158,55 @@ pub fn renamed_package(spec: &str) -> Option<&str> {
 }
 
 /// What cargo's JSON stream said: the graph packages that left an artifact
-/// for the triple (test units only when `tests_only`), and every error
-/// diagnostic as `(package, rendered)`.
+/// for the triple (test units only when `tests_only`), every error
+/// diagnostic as `(package, rendered)`, and every warning
+/// [`is_cell_warning`] keeps, once each.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct CargoRead {
     pub checked: BTreeSet<String>,
     pub errors: Vec<(String, String)>,
+    pub warnings: Vec<(String, String)>,
+}
+
+/// Whether a cell's rustc warnings ([`is_cell_warning`]) are findings: when its
+/// OS is one a fleet machine runs ([`FLEET_HOST_TRIPLES`]). That machine's own
+/// `verify lint` holds the OS to `-D warnings`, but only on its own triple's
+/// `cfg`s; the cell holds the OS's other architectures to the same standard,
+/// and so every host that never compiles that OS (a Mac never compiles
+/// `target_os = "linux"`, a Linux box never `target_os = "macos"`). An OS no
+/// fleet machine runs (Windows, the browser) has no such standard to carry yet:
+/// its cells judge errors, bans and stale expectations only.
+///
+/// The judge is the cell's rustup toolchain (stable first, unpinned), not the
+/// fleet's Trust rustc: a newer stable that adds a warn-by-default lint turns
+/// these cells red on code it flags, on every host that updates, before the
+/// Trust toolchain carries that lint, and `ship release` refuses until the
+/// code is fixed or [`is_cell_warning`] excuses the lint.
+#[must_use]
+pub fn judges_warnings(triple: &str) -> bool {
+    let os = |t: &str| t.split_once('-').map(|(_, os)| os.to_string());
+    let Some(own) = os(triple) else {
+        return false;
+    };
+    FLEET_HOST_TRIPLES
+        .iter()
+        .any(|host| os(host).as_deref() == Some(own.as_str()))
+}
+
+/// Whether a warning's lint code makes a cell red: any lint rustc itself
+/// raises. Those are the ones that turn on `cfg` (`dead_code` and
+/// `unused_imports` above all, an item whose only callers are another OS's),
+/// so a host's `-D warnings` lint can never see another triple's, and the
+/// cell's compile is the one place they surface. A warning with no code (a
+/// count of the others) is no finding; clippy's lints are the host's, whose
+/// clippy is not the cell's version; so are the two that only say the cell's
+/// rustc does not know a lint name a newer one may (`unknown_lints`,
+/// `renamed_and_removed_lints`).
+#[must_use]
+pub fn is_cell_warning(code: Option<&str>) -> bool {
+    code.is_some_and(|c| {
+        !c.starts_with("clippy::") && !matches!(c, "unknown_lints" | "renamed_and_removed_lints")
+    })
 }
 
 /// Read the JSON lines of `output` (cargo's other lines are skipped).
@@ -1180,17 +1251,30 @@ pub fn read_cargo_json(
             }
             Some("compiler-message") => {
                 let msg = value.get("message");
-                if msg
-                    .and_then(|m| m.get("level"))
-                    .and_then(aterm_json::Value::as_str)
-                    == Some("error")
-                {
-                    let rendered = msg
-                        .and_then(|m| m.get("rendered"))
+                let rendered = || {
+                    msg.and_then(|m| m.get("rendered"))
                         .and_then(aterm_json::Value::as_str)
                         .unwrap_or_default()
-                        .to_string();
-                    read.errors.push((pkg, rendered));
+                        .to_string()
+                };
+                match msg
+                    .and_then(|m| m.get("level"))
+                    .and_then(aterm_json::Value::as_str)
+                {
+                    Some("error") => read.errors.push((pkg, rendered())),
+                    Some("warning") => {
+                        let code = msg
+                            .and_then(|m| m.get("code"))
+                            .and_then(|c| c.get("code"))
+                            .and_then(aterm_json::Value::as_str);
+                        // A unit and its test twin raise the same warning
+                        // on shared code: it is one finding.
+                        let warning = (pkg, rendered());
+                        if is_cell_warning(code) && !read.warnings.contains(&warning) {
+                            read.warnings.push(warning);
+                        }
+                    }
+                    _ => {}
                 }
             }
             _ => {}
@@ -1298,21 +1382,6 @@ mod tests {
 
     fn names(list: &[&str]) -> BTreeSet<String> {
         list.iter().map(|s| (*s).to_string()).collect()
-    }
-
-    #[test]
-    fn the_foreign_cells_are_every_cell_no_fleet_machine_hosts() {
-        let foreign = foreign_cells();
-        assert!(!foreign.is_empty());
-        for c in &foreign {
-            assert!(
-                !FLEET_HOST_TRIPLES.contains(&c.triple.as_str()),
-                "{}",
-                c.name
-            );
-        }
-        let hosted = aterm_forge::resolve::default_cells().len() - foreign.len();
-        assert!(hosted > 0, "every hosted cell is its host's own build");
     }
 
     #[test]
@@ -1654,6 +1723,111 @@ mod tests {
             cargo_level_errors(&out),
             ["error: failed to run custom build command for `zstd-sys`"]
         );
+    }
+
+    /// rustc's own warnings are the cell's: an item only another OS calls
+    /// (`dead_code`) or an import only it uses never warns on the host, so the
+    /// cell's compile is where it shows. Clippy's (its version is not the
+    /// host's), a count with no code, and a lint name this rustc predates are
+    /// not findings; a unit and its test twin warning alike are one.
+    #[test]
+    fn a_rustc_warning_is_a_cell_finding_and_a_clippy_one_is_the_hosts() {
+        let graph = names(&["gui"]);
+        let warning = |code: &str, rendered: &str| {
+            format!(
+                r#"{{"reason":"compiler-message","package_id":"path+file:///r/gui#gui@1","message":{{"level":"warning","code":{code},"rendered":"{rendered}"}}}}"#
+            )
+        };
+        let dead = "warning: function `launchctl_list` is never used";
+        let out = [
+            warning(r#"{"code":"dead_code","explanation":null}"#, dead),
+            warning(r#"{"code":"dead_code","explanation":null}"#, dead),
+            warning(
+                r#"{"code":"unused_imports","explanation":null}"#,
+                "warning: unused import: `HashSet`",
+            ),
+            warning(
+                r#"{"code":"clippy::duration_suboptimal_units","explanation":null}"#,
+                "warning: constructing a `Duration` using a smaller unit",
+            ),
+            warning(
+                r#"{"code":"unknown_lints","explanation":null}"#,
+                "warning: unknown lint: `newer_lint`",
+            ),
+            warning("null", "warning: 3 warnings emitted"),
+        ]
+        .join("\n");
+        let read = read_cargo_json(&out, "aarch64-unknown-linux-gnu", &graph, false);
+        assert!(read.errors.is_empty());
+        assert_eq!(
+            read.warnings,
+            [
+                ("gui".to_string(), dead.to_string()),
+                (
+                    "gui".to_string(),
+                    "warning: unused import: `HashSet`".to_string()
+                ),
+            ]
+        );
+        assert!(is_cell_warning(Some("unused_variables")));
+        // Linux and macOS are fleet OSes, every architecture of them; Windows
+        // and the browser are not.
+        for (triple, judged) in [
+            ("aarch64-unknown-linux-gnu", true),
+            ("x86_64-unknown-linux-gnu", true),
+            ("aarch64-apple-darwin", true),
+            ("x86_64-apple-darwin", true),
+            ("x86_64-pc-windows-msvc", false),
+            ("aarch64-pc-windows-msvc", false),
+            ("wasm32-unknown-unknown", false),
+        ] {
+            assert_eq!(judges_warnings(triple), judged, "{triple}");
+        }
+        assert!(!is_cell_warning(Some("clippy::single_match")));
+        assert!(!is_cell_warning(Some("renamed_and_removed_lints")));
+        assert!(!is_cell_warning(None));
+        // On an OS a fleet machine runs, a run cargo calls a success is red on
+        // them, in either pass, and the detail carries the compiler's own text.
+        for (tests, status) in [(false, "WARNING(2)"), (true, "TEST-TARGET-WARNING(2)")] {
+            let run = exec::Run {
+                ok: true,
+                output: out.clone(),
+                code: Some(0),
+                spawn_error: None,
+            };
+            let mut red = Red::default();
+            read_cargo_run(&run, "aarch64-unknown-linux-gnu", &graph, tests, &mut red)
+                .expect("the compiler ran");
+            assert_eq!(red.status.as_deref(), Some(status));
+            assert_eq!(red.detail.len(), 2);
+            assert!(red.detail[0].contains("launchctl_list"), "{:?}", red.detail);
+        }
+        // An OS no fleet machine runs is held to errors only.
+        let run = exec::Run {
+            ok: true,
+            output: out.clone(),
+            code: Some(0),
+            spawn_error: None,
+        };
+        let mut red = Red::default();
+        read_cargo_run(&run, "x86_64-pc-windows-msvc", &graph, false, &mut red)
+            .expect("the compiler ran");
+        assert!(red.status.is_none(), "{:?}", red.detail);
+        // Negative control: the clippy-only stream leaves a cell green.
+        let clippy_only = warning(
+            r#"{"code":"clippy::duration_suboptimal_units","explanation":null}"#,
+            "warning: constructing a `Duration` using a smaller unit",
+        );
+        let run = exec::Run {
+            ok: true,
+            output: clippy_only,
+            code: Some(0),
+            spawn_error: None,
+        };
+        let mut red = Red::default();
+        read_cargo_run(&run, "aarch64-unknown-linux-gnu", &graph, false, &mut red)
+            .expect("the compiler ran");
+        assert!(red.status.is_none(), "{:?}", red.detail);
     }
 
     /// Both passes can leave every owed artifact before cargo itself fails.

@@ -45,7 +45,8 @@ impl Host {
             self.glow.note_repaint_blink(self.now);
         }
         self.glow.note_context(self.term.is_alternate_screen());
-        self.glow.observe_print_anchor(self.term.print_anchor());
+        self.glow
+            .observe_print_anchor(aterm_effects::host::motion_print_anchor(&self.term).0);
         self.term.row_cols_into(usize::from(c.row), &mut self.buf);
         self.glow.observe_row(c.row, c.col, &self.buf, self.now);
         // The caret row's neighbours, as `EffectsPipeline::cursor_step` feeds them: the classifiers
@@ -88,7 +89,6 @@ impl Host {
             ring: true,
             beam: false,
             head_dx: 0.5,
-            pack: None,
         };
         let geom = Geom {
             cw: 8,
@@ -185,26 +185,6 @@ fn an_unchanged_composer_redrawn_in_one_batch_or_across_frames_keeps_its_typed_b
         }
         assert_eq!(h.live(20), (2..18).collect::<Vec<_>>(), "{how}");
     }
-}
-
-#[test]
-fn a_background_footer_park_cannot_spend_the_composer_key() {
-    let mut h = Host::new();
-    h.program(b"\x1b[22;1Hstatus footer\x1b[21;3H");
-    for b in b"abcdefgh" {
-        h.key(*b);
-    }
-    h.now += Duration::from_millis(90);
-    h.glow.note_typed_cells(h.now, 1);
-    h.program(b"\x1b[22;30H.");
-    h.program(b"\x1b[21;11Hi");
-    h.program(b"");
-    assert!(h.live(21).is_empty(), "footer stole key: {:?}", h.live(21));
-    assert!(
-        h.live(20).contains(&10),
-        "actual echo went dark: {:?}",
-        h.live(20)
-    );
 }
 
 #[test]

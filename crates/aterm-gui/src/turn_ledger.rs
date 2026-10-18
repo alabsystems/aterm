@@ -337,13 +337,8 @@ pub(crate) fn clamp_text(s: &str) -> String {
 
 /// Milliseconds since the process epoch (a lazily-pinned monotonic `Instant`).
 /// Monotonic and cheap; used for turn `started_ms`/`dur_ms`, not wall-clock.
-pub(crate) fn now_ms() -> u64 {
-    use std::sync::OnceLock;
-    use std::time::Instant;
-    static EPOCH: OnceLock<Instant> = OnceLock::new();
-    let epoch = *EPOCH.get_or_init(Instant::now);
-    Instant::now().saturating_duration_since(epoch).as_millis() as u64
-}
+/// The one process clock, shared with the fabric's mail rows.
+pub(crate) use aterm_gui_timing::now_ms;
 
 #[cfg(test)]
 mod tests {

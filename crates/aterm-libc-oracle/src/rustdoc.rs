@@ -10,8 +10,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use aterm_json::Value;
-use serde::Serialize;
-
 /// A document that is not the rustdoc JSON this gate reads (a trustdoc format
 /// change): nothing about the shim was decided.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,8 +29,7 @@ fn missing(what: impl fmt::Display) -> FormatError {
 
 /// The rustdoc namespace an item kind lives in; other kinds are not public API
 /// this gate compares.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Namespace {
     Type,
     Value,

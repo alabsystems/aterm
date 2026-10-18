@@ -24,11 +24,6 @@ pub struct BiDiConfig {
     /// Whether to apply BiDi reordering on the alternate screen (vim, less, …).
     /// Default: true.
     pub alternate_screen: bool,
-    /// Whether to apply Arabic contextual shaping (initial, medial, final and
-    /// isolated forms, LAM-ALEF ligatures).
-    ///
-    /// Has no effect without the `arabic-shaping` feature. Default: false.
-    pub arabic_shaping: bool,
 }
 
 impl Default for BiDiConfig {
@@ -38,27 +33,7 @@ impl Default for BiDiConfig {
             direction: ParagraphDirection::default(),
             reorder_nsm: true,
             alternate_screen: true,
-            arabic_shaping: false,
         }
-    }
-}
-
-impl BiDiConfig {
-    /// Create a disabled BiDi configuration.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn disabled() -> Self {
-        Self {
-            mode: BiDiMode::Disabled,
-            ..Default::default()
-        }
-    }
-
-    /// Returns true if BiDi processing is enabled.
-    #[cfg(test)]
-    #[inline]
-    pub(crate) fn is_enabled(&self) -> bool {
-        self.mode != BiDiMode::Disabled
     }
 }
 
@@ -110,6 +85,14 @@ pub struct TerminalConfig {
     /// Custom color palette (if any).
     /// When `None`, uses the default xterm 256-color palette.
     pub custom_palette: Option<ColorPalette>,
+
+    /// The host's baseline colour scheme: the appearance of
+    /// `default_background` (a theme's declared appearance). Reported to
+    /// programs (DSR 996 / mode 2031) while no program has moved the
+    /// background. `None` keeps the baseline already set
+    /// (`Terminal::set_color_scheme`), so a host that drives it by hand is
+    /// unaffected.
+    pub color_scheme: Option<aterm_types::Appearance>,
 
     // === Behavior Settings ===
     /// Maximum number of scrollback lines to retain.
@@ -186,9 +169,11 @@ pub struct TerminalConfig {
     /// SGR 2 (dim/faint): the fraction of the foreground retained, `0.0..=1.0`.
     /// The fg is blended toward the cell background in linear light
     /// (`color_resolve::dim_toward_bg`), so faint text recedes on dark and light
-    /// themes, keeping at least this share of the fg's contrast (in log space)
-    /// so dark ink on a light ground never sinks into the mid-greys. Default
-    /// `0.5` (config `faint_opacity`).
+    /// themes. The mix is raised where needed so faint text keeps at least
+    /// this share of the fg's contrast (in log space) and a readable
+    /// `9^faint_opacity` (3:1 at the default), the latter capped at
+    /// `contrast^((1+faint_opacity)/2)` so faint always stays fainter than its
+    /// colour. Default `0.5` (config `faint_opacity`).
     pub faint_opacity: f32,
 
     // === BiDi Settings ===
@@ -209,6 +194,7 @@ impl Default for TerminalConfig {
             selection_background: None,
             selection_foreground: None,
             custom_palette: None,
+            color_scheme: None,
             // Behavior
             scrollback_limit: Some(aterm_scrollback::DEFAULT_LINE_LIMIT),
             auto_wrap: true,
@@ -272,4 +258,8 @@ pub enum ConfigChange {
     AmbiguousWidth,
     /// Style-attribute policy changed (`bold_is_bright` / `faint_opacity`).
     StylePolicy,
+    /// The colour scheme reported to programs (DSR 996 / mode 2031) changed;
+    /// when the program set mode 2031 a `CSI ? 997 ; Ps n` push is queued in
+    /// the response buffer.
+    ColorScheme,
 }

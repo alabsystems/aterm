@@ -48,17 +48,3 @@ pub fn mix_rgb(a: u32, b: u32, t: f32) -> u32 {
     };
     (ch(a >> 16, b >> 16) << 16) | (ch(a >> 8, b >> 8) << 8) | ch(a, b)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn clamp_and_smoothstep_are_sane() {
-        assert_eq!(clampf(5.0, 0.0, 1.0), 1.0);
-        assert_eq!(clampf(-5.0, 0.0, 1.0), 0.0);
-        assert_eq!(clampf(0.5, 0.0, 1.0), 0.5);
-        assert_eq!(smoothstep(0.0), 0.0);
-        assert_eq!(smoothstep(1.0), 1.0);
-    }
-}

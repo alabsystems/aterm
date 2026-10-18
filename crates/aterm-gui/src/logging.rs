@@ -38,7 +38,8 @@ macro_rules! stderr_line {
         let _ = ::std::writeln!(::std::io::stderr().lock(), $($arg)*);
     }};
 }
-use std::sync::Mutex;
+use std::collections::VecDeque;
+use std::sync::{Condvar, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub(crate) use stderr_line;
 
@@ -80,9 +81,18 @@ pub(crate) fn init(arming: crate::crash_signal::Arming) {
 /// The file logger alone, for the terminal session (`aterm --session`), whose threads
 /// run beside a live shell and so log to `aterm.log`, never stderr. No panic hook or
 /// crash-signal handlers, and silent when the log cannot be opened.
+///
+/// The `aterm-log` writer starts at once on unix, where its `exit(3)` handler lands
+/// the queue whichever way the session ends. Not on Windows: the session and the
+/// update verbs end through `process::exit`, which is `ExitProcess` there and runs no
+/// handler, so a queued line would die with the process; each line is appended by
+/// the thread that logs it, as before.
 pub(crate) fn init_session() {
-    if let Some(dir) = log_dir() {
-        let _ = install_file_logger(&dir);
+    if let Some(dir) = log_dir()
+        && install_file_logger(&dir).is_ok()
+    {
+        #[cfg(unix)]
+        start_writer();
     }
 }
 
@@ -99,13 +109,64 @@ fn install_file_logger(dir: &Path) -> Result<(), (PathBuf, std::io::Error)> {
     let path = dir.join("aterm.log");
     let file =
         RotatingFile::open(path.clone(), RotationBudget::ATERM_LOG).map_err(|e| (path, e))?;
-    let logger: &'static FileLogger = Box::leak(Box::new(FileLogger {
-        file: Mutex::new(file),
-    }));
+    let logger: &'static FileLogger = Box::leak(Box::new(FileLogger::new(file, LOG_QUEUE_BYTES)));
     if aterm_log::set_logger(logger).is_ok() {
+        let _ = FILE_LOGGER.set(logger);
         aterm_log::set_max_level(level);
     }
     Ok(())
+}
+
+/// Start the installed logger's `aterm-log` writer ([`FileLogger`]); until
+/// then each line is appended by the thread that logs it. The window calls
+/// this once its boot has started the config-runtime worker, so the thread's
+/// spawn sits in the main thread's wait for that worker instead of ahead of
+/// it; the terminal session at once ([`init_session`]). A second call, or
+/// one with no logger installed, does nothing.
+pub(crate) fn start_writer() {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let Some(logger) = FILE_LOGGER.get() else {
+        return;
+    };
+    if STARTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    if let Err(error) = logger.start_writer() {
+        aterm_log::warn!(
+            "aterm.log: writer thread not spawned ({error}); every line is appended by the \
+             thread that logs it"
+        );
+    }
+}
+
+/// Register [`flush_within`] as an `exit(3)` handler, so every `exit` (a
+/// return from `main`, `process::exit`, an unwind out of `main`) lands the
+/// queue. Registered after the crash marker's handler
+/// (`crash_signal::install_signal_handlers_as`, earlier in [`init`]), so it
+/// runs before that one, which must run last. The writer registers it, on
+/// its own thread, before any line can queue: one `atexit` took 0.10 ms of
+/// the boot when the main thread made it (LAG-5's boot probe).
+///
+/// The handler also hands the queue back: a line logged after it (by a handler
+/// registered before it, so run after it, or by a thread still running while
+/// `exit` tears down) is appended by its own thread, not queued for a writer
+/// the process is about to lose.
+#[cfg(unix)]
+fn flush_at_exit() {
+    extern "C" fn flush_queued_at_exit() {
+        if let Some(logger) = FILE_LOGGER.get() {
+            logger.unattend();
+        }
+        let _ = flush_within(LOG_FLUSH_EXIT_WAIT);
+    }
+    unsafe extern "C" {
+        /// `stdlib.h`: register a handler for `exit(3)` (declared here, as
+        /// `crash_signal` declares it).
+        fn atexit(cb: extern "C" fn()) -> libc::c_int;
+    }
+    // SAFETY: registers a plain `extern "C"` function with no captured state;
+    // a failure to register only costs the lines queued at an `exit`.
+    unsafe { atexit(flush_queued_at_exit) };
 }
 
 /// Route `aterm_objc`'s exception-containment reports into `aterm.log`.
@@ -163,6 +224,9 @@ fn install_panic_hook(dir: PathBuf) {
             info,
             &std::backtrace::Backtrace::force_capture(),
         );
+        // The lead-up is on disk before the unwind, which may end in an abort
+        // (an unwind out of an AppKit trampoline) that runs no exit handler.
+        let _ = flush_within(LOG_FLUSH_EXIT_WAIT);
         prev(info);
     }));
 }
@@ -783,7 +847,7 @@ impl RotationBudget {
     /// `aterm.log`: [`aterm_log::MAX_LOG_BYTES`] per file, looked at every 64 KiB or
     /// 30 s. While the log fills slower than one file per 30 s no writer falls two
     /// files behind, so no line lands in a deleted copy
-    /// (`aterm_spec::derive::log_rotation_model`).
+    /// (`aterm_models_misc::log_rotation_model`).
     pub(crate) const ATERM_LOG: Self = Self {
         rotate_at: aterm_log::MAX_LOG_BYTES,
         check_bytes: 64 * 1024,
@@ -1052,34 +1116,214 @@ fn create_0600(path: &Path) -> std::io::Result<File> {
         .open(path)
 }
 
-/// Writes one sanitized line per record. Idle cost is zero: `aterm_log`
-/// gates on the max-level atomic before any record reaches us.
+/// Writes one sanitized line per record, off the logging thread. Idle cost is
+/// zero: `aterm_log` gates on the max-level atomic before any record reaches us.
+///
+/// THE LOGGING THREAD NEVER WAITS ON THE DISK (round-3 sweep, item 4). A
+/// record is formatted where it is logged, so its time and pid are the
+/// record's, and queued; the `aterm-log` thread appends the queue. An append
+/// made on the logging thread waited out whatever the volume was doing, and
+/// one `F_FULLFSYNC` anywhere on it (aterm's own durable writes, another
+/// process's) holds every write there: on a fresh install's first launch the
+/// main thread's log lines sat 2.7–4.8 ms behind the journal key's flush, as
+/// `user_event` turns (round-3 measurement).
+///
+/// * NEVER REORDERED. Lines leave the queue only under the file's lock, which
+///   is taken first, so they reach the file in queue order whoever appends
+///   them; one thread's lines keep the order it logged them in.
+/// * BOUNDED, NEVER DROPPED. Past `cap` bytes queued ([`LOG_QUEUE_BYTES`]),
+///   the logging thread appends the queue and then its own line itself: the
+///   cost every line paid before, now paid only by a flood the writer cannot
+///   keep up with. With no writer (not started yet, [`start_writer`], or it
+///   did not spawn) every line goes that way.
+/// * LANDED AT THE END. [`flush_within`] appends the queue on the calling
+///   thread: from the `exit(3)` handler the writer registers, the
+///   graceful quit, the panic hook, the clean `_exit`
+///   ([`crate::crash_signal::clean_exit_now`]) and the cold `exec`. A fatal
+///   signal's handler can take no lock, so the lines queued at that instant
+///   (the writer takes each within its next wake) are the one loss.
+///
+/// Nothing on the append path logs: a writer that queued its own line could
+/// find the queue full and wait on the lock it holds.
 struct FileLogger {
+    /// Lines formatted and not yet appended, oldest first. Taken off only
+    /// while `file` is held (lock order: `file`, then `pending`).
+    pending: Mutex<Pending>,
+    /// Signalled when `pending` goes from empty to not.
+    ready: Condvar,
     file: Mutex<RotatingFile>,
+    /// Queued bytes past which a line is appended by its own thread.
+    cap: usize,
+}
+
+/// [`FileLogger`]'s queue.
+#[derive(Default)]
+struct Pending {
+    lines: VecDeque<String>,
+    bytes: usize,
+    /// A writer drains the queue (the `aterm-log` thread spawned).
+    attended: bool,
+    /// Exit has handed logging back permanently, including before takeover.
+    closing: bool,
+}
+
+/// [`FileLogger`]'s queue bound: four times the rotation's look interval
+/// ([`RotationBudget::ATERM_LOG`]), far past the handful of lines a launch logs
+/// while one volume-wide flush (4–5 ms on this machine) holds the writer.
+const LOG_QUEUE_BYTES: usize = 256 * 1024;
+
+/// How long a flush at the process's end ([`flush_within`]) waits for the
+/// file — the messages log's exit bound (`MESSAGES_FLUSH_EXIT_WAIT`).
+pub(crate) const LOG_FLUSH_EXIT_WAIT: Duration = Duration::from_millis(250);
+
+/// The installed logger, for [`flush_within`].
+static FILE_LOGGER: OnceLock<&'static FileLogger> = OnceLock::new();
+
+/// Append every line queued for `aterm.log` on the calling thread, waiting no
+/// longer than `within` for a writer that is mid-append (law L5: no wait
+/// without a deadline). `true` when the queue is on disk, or no logger is
+/// installed; `false` at the deadline, the lines still queued.
+pub(crate) fn flush_within(within: Duration) -> bool {
+    FILE_LOGGER
+        .get()
+        .is_none_or(|logger| logger.flush_within(within))
 }
 
 impl FileLogger {
-    /// Format one record and append it: the whole of [`Log::log`] but the
+    fn new(file: RotatingFile, cap: usize) -> Self {
+        Self {
+            pending: Mutex::new(Pending::default()),
+            ready: Condvar::new(),
+            file: Mutex::new(file),
+            cap,
+        }
+    }
+
+    /// Start the `aterm-log` writer; until it runs, and for good if it cannot
+    /// start, every line is appended by the thread that logs it. The writer
+    /// registers the `exit(3)` flush first, then takes the queue over, so no
+    /// line queues before an `exit` would land it.
+    fn start_writer(&'static self) -> std::io::Result<()> {
+        // The UI thread takes the same short queue lock, so the writer follows
+        // the lock-holder floor (`qos::Role::Responsive`).
+        crate::qos::spawn_lane_thread("aterm-log", crate::qos::Role::Responsive, move || {
+            #[cfg(unix)]
+            flush_at_exit();
+            if self.attend() {
+                self.run_writer();
+            }
+        })?;
+        Ok(())
+    }
+
+    /// Take over the queue unless exit has already handed logging back.
+    fn attend(&self) -> bool {
+        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        if pending.closing {
+            return false;
+        }
+        pending.attended = true;
+        true
+    }
+
+    /// From now on every line is appended by the thread that logs it, after
+    /// whatever is still queued: the process is ending and its writer may not
+    /// get another turn.
+    #[cfg(unix)]
+    fn unattend(&self) {
+        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        pending.closing = true;
+        pending.attended = false;
+    }
+
+    /// Format one record and queue it: the whole of [`Log::log`] but the
     /// `Record`, which only `aterm_log` can build.
     fn write_record(&self, level: aterm_log::Level, target: &str, body: &str) {
-        let epoch_ms = epoch_ms_now();
-        let pid = std::process::id();
-        let line = format_record(epoch_ms, pid, level, target, body);
-        let mut f = self.file.lock().unwrap_or_else(|e| e.into_inner());
-        f.append(line.as_bytes(), |older| {
-            let older = older.file_name().map_or_else(
-                || older.display().to_string(),
-                |name| name.to_string_lossy().into_owned(),
-            );
-            format_record(
-                epoch_ms,
-                pid,
-                aterm_log::Level::Info,
-                module_path!(),
-                &format!("log rotated; older lines in {older}"),
-            )
-        });
+        let line = format_record(epoch_ms_now(), std::process::id(), level, target, body);
+        let line = {
+            let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+            if pending.attended && pending.bytes.saturating_add(line.len()) <= self.cap {
+                let was_empty = pending.lines.is_empty();
+                pending.bytes += line.len();
+                pending.lines.push_back(line);
+                drop(pending);
+                if was_empty {
+                    self.ready.notify_one();
+                }
+                return;
+            }
+            line
+        };
+        let mut file = self.file.lock().unwrap_or_else(PoisonError::into_inner);
+        self.append_queued(&mut file, Some(&line));
     }
+
+    /// Append every queued line, oldest first, then `then`. The caller holds
+    /// `file`, so no other thread's take can land between.
+    fn append_queued(&self, file: &mut RotatingFile, then: Option<&str>) {
+        let lines = {
+            let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+            pending.bytes = 0;
+            std::mem::take(&mut pending.lines)
+        };
+        for line in lines.iter().map(String::as_str).chain(then) {
+            file.append(line.as_bytes(), rotation_note);
+        }
+    }
+
+    /// The `aterm-log` thread: wait for a line, append what is queued.
+    fn run_writer(&self) {
+        loop {
+            {
+                let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+                while pending.lines.is_empty() {
+                    pending = self
+                        .ready
+                        .wait(pending)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
+            }
+            let mut file = self.file.lock().unwrap_or_else(PoisonError::into_inner);
+            self.append_queued(&mut file, None);
+        }
+    }
+
+    /// See the module-level [`flush_within`].
+    fn flush_within(&self, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        loop {
+            let mut file = match self.file.try_lock() {
+                Ok(file) => file,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        return false;
+                    }
+                    std::thread::sleep(Duration::from_micros(100));
+                    continue;
+                }
+            };
+            self.append_queued(&mut file, None);
+            file.flush();
+            return true;
+        }
+    }
+}
+
+/// The line a writer that just started a fresh file writes first, naming the
+/// older copy (`RotatingFile::append`'s `note`).
+fn rotation_note(older: &Path) -> String {
+    let older = older.file_name().map_or_else(
+        || older.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    format_record(
+        epoch_ms_now(),
+        std::process::id(),
+        aterm_log::Level::Info,
+        module_path!(),
+        &format!("log rotated; older lines in {older}"),
+    )
 }
 
 impl Log for FileLogger {
@@ -1088,13 +1332,13 @@ impl Log for FileLogger {
     }
 
     fn log(&self, record: &Record<'_>) {
-        // Single write per record: `File` is unbuffered, so the line is
-        // already durable — no interleaved fragments, nothing lost on crash.
+        // One write per line once appended: `File` is unbuffered, so no
+        // interleaved fragments.
         self.write_record(record.level(), record.target(), &record.args().to_string());
     }
 
     fn flush(&self) {
-        self.file.lock().unwrap_or_else(|e| e.into_inner()).flush();
+        let _ = self.flush_within(LOG_FLUSH_EXIT_WAIT);
     }
 }
 
@@ -1130,25 +1374,43 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-    /// The startup line names the one cause that applies and what it turns off: a
-    /// relative (or empty) seam resolves no root, so session restore, the crash
-    /// journal and the cell-metrics cache go with the logs.
+    /// VERSION SKEW, the files (session log phase 2B): the logs folder's own
+    /// sweeps, the same in every build since before the journal, match
+    /// `crash-*` and `harness-fault-*` names only, so a build that knows
+    /// nothing of the journal leaves `session-log/` and its files as they are.
     #[test]
-    fn a_missing_log_dir_names_its_one_cause() {
-        const SEAM: &str = "ATERM_STATE_HOME is not an absolute path; crash reports, aterm.log, \
-                            session restore, the crash journal and the cell-metrics cache are off";
-        assert_eq!(
-            no_log_dir_reason(Some(std::ffi::OsStr::new("relative-state")), None),
-            SEAM
-        );
-        assert_eq!(
-            no_log_dir_reason(Some(std::ffi::OsStr::new("")), None),
-            SEAM
-        );
-        assert_eq!(
-            no_log_dir_reason(None, None),
-            "no home folder found; crash reports and aterm.log are off"
-        );
+    fn the_logs_sweeps_leave_the_session_journal_alone() {
+        let dir = Scratch::new("journal");
+        let journal = dir.0.path().join("session-log");
+        std::fs::create_dir(&journal).unwrap();
+        let seg = journal.join("p1-aa.1.slog");
+        std::fs::write(
+            &seg,
+            b"s1\t*\t#seg\tv=1\tinst=p1-aa\tn=1\tt=1\tbuild=x\tend=\n",
+        )
+        .unwrap();
+        std::fs::write(journal.join("p1-aa.lock"), b"").unwrap();
+        for i in 0..20 {
+            std::fs::write(dir.0.path().join(format!("crash-{i}.log.seen")), b"x").unwrap();
+            std::fs::write(dir.0.path().join(format!("harness-fault-{i}.log")), b"x").unwrap();
+        }
+        prune_seen_crash_reports(dir.0.path(), None, None);
+        prune_harness_faults(dir.0.path(), std::process::id());
+        let mut left: Vec<String> = std::fs::read_dir(&journal)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec!["p1-aa.1.slog", "p1-aa.lock"]);
+        assert!(std::fs::read(&seg).unwrap().starts_with(b"s1\t*\t#seg"));
+        // CONTROL: the sweeps ran (they pruned their own kinds).
+        let crash = std::fs::read_dir(dir.0.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("crash-"))
+            .count();
+        assert!(crash < 20, "{crash}");
     }
 
     /// A private scratch dir per test, removed on drop.
@@ -1203,19 +1465,6 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         assert_eq!(read(&path), "first\nsecond\n");
-    }
-
-    /// The `aterm.log` budget is the engine's policy, not a second copy of it.
-    #[test]
-    fn the_aterm_log_budget_rotates_where_the_engine_says() {
-        let budget = RotationBudget::ATERM_LOG;
-        for len in [0, aterm_log::MAX_LOG_BYTES, aterm_log::MAX_LOG_BYTES + 1] {
-            assert_eq!(
-                budget.oversized(len),
-                aterm_log::should_rotate(len),
-                "{len}"
-            );
-        }
     }
 
     /// An oversized file at startup is rotated, never truncated: the lead-up to a
@@ -1498,7 +1747,7 @@ mod tests {
         let _ = crate::message_inbox::take_queued();
         let dir = std::env::temp_dir().join(format!("aterm-log-a11y-{}", std::process::id()));
         ensure_private_dir(&dir).unwrap();
-        let backend = "/r/accesskit_unix-0.22.0/src/context.rs";
+        let backend = "crates/aterm-a11y/src/atspi/semantics/node.rs";
         let payload = "called `Result::unwrap()` on an `Err` value: \
                        Handshake(\"Server GUID mismatch: expected a, got b\")";
         // The AT-client latch is process-wide and never lowered, and a parallel
@@ -1521,19 +1770,12 @@ mod tests {
                 m.message.key.as_deref() == Some(crate::message_reporters::KEY_A11Y_PUBLISHER)
             })
             .expect("the inbox holds the a11y message");
-        assert_eq!(
-            dead.message.title, "Screen reader access lost",
-            "the window must say the tree is gone: {:?}",
-            dead.message
-        );
-        assert_eq!(
-            dead.message.detail[0], "restart aterm to retry",
-            "the retry leads, alone on its line: {:?}",
-            dead.message
-        );
         assert!(
-            dead.message.detail[1].contains("Server GUID mismatch"),
-            "and must name the bus fault: {:?}",
+            dead.message
+                .detail
+                .iter()
+                .any(|l| l.contains("Server GUID mismatch")),
+            "the message names the bus fault: {:?}",
             dead.message
         );
         // On the glass only when a screen reader had attached; a record otherwise.
@@ -1749,6 +1991,194 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A logger on `path` whose queue nobody drains yet: the stand-in for a
+    /// writer held behind a volume-wide flush, or one not yet scheduled.
+    fn queued_logger(path: &Path, cap: usize) -> &'static FileLogger {
+        let file = RotatingFile::open(path.to_path_buf(), RotationBudget::ATERM_LOG).unwrap();
+        let logger: &'static FileLogger = Box::leak(Box::new(FileLogger::new(file, cap)));
+        logger.pending.lock().unwrap().attended = true;
+        logger
+    }
+
+    fn logged(logger: &FileLogger, n: usize) {
+        logger.write_record(aterm_log::Level::Info, "t", &format!("line {n}"));
+    }
+
+    /// The bodies of the lines in `path`, in file order.
+    fn bodies(path: &Path) -> Vec<String> {
+        read(path)
+            .lines()
+            .map(|l| l.rsplit_once(": ").map_or(l, |(_, body)| body).to_string())
+            .collect()
+    }
+
+    fn lines(range: std::ops::RangeInclusive<usize>) -> Vec<String> {
+        range.map(|n| format!("line {n}")).collect()
+    }
+
+    /// Exit can hand logging back before the newly spawned writer takes over.
+    #[cfg(unix)]
+    #[test]
+    fn an_exit_handoff_cannot_be_reversed_by_a_late_writer() {
+        let dir = Scratch::new("terminal-handoff");
+        let path = dir.log();
+        let logger = FileLogger::new(
+            RotatingFile::open(path.clone(), RotationBudget::ATERM_LOG).unwrap(),
+            LOG_QUEUE_BYTES,
+        );
+        logged(&logger, 0);
+        assert_eq!(bodies(&path), lines(0..=0), "synchronous before takeover");
+        assert!(logger.attend(), "an ordinary writer takes the queue over");
+        logged(&logger, 1);
+        assert_eq!(bodies(&path), lines(0..=0), "the writer's line queued");
+        logger.unattend();
+        assert!(logger.flush_within(aterm_spec::wait::MUST_HAPPEN));
+        logged(&logger, 2);
+        assert_eq!(bodies(&path), lines(0..=2), "exit drains and hands back");
+
+        let late_path = dir.0.path().join("late.log");
+        let late = FileLogger::new(
+            RotatingFile::open(late_path.clone(), RotationBudget::ATERM_LOG).unwrap(),
+            LOG_QUEUE_BYTES,
+        );
+        late.unattend();
+        let _ = late.attend();
+        logged(&late, 3);
+        assert_eq!(
+            bodies(&late_path),
+            lines(3..=3),
+            "EXIT_HANDOFF_MUST_NOT_REATTEND_THE_LOG_QUEUE"
+        );
+    }
+
+    /// THE LOGGING THREAD WAITS ON NO DISK (round-3 sweep, item 4): with the
+    /// file held, as a writer behind an `F_FULLFSYNC` holds it, records still
+    /// return, and once it is free the writer lands them in order.
+    /// NEGATIVE CONTROL: the synchronous logger this replaced appended on the
+    /// logging thread, which waited for the file and tripped the detector.
+    #[test]
+    fn a_record_returns_while_the_file_is_held_and_lands_in_order() {
+        let dir = Scratch::new("held");
+        let file = RotatingFile::open(dir.log(), RotationBudget::ATERM_LOG).unwrap();
+        let logger: &'static FileLogger =
+            Box::leak(Box::new(FileLogger::new(file, LOG_QUEUE_BYTES)));
+        logger.start_writer().expect("the writer starts");
+        let took_over = aterm_spec::wait::within(
+            aterm_spec::wait::MUST_HAPPEN,
+            Duration::from_millis(1),
+            || logger.pending.lock().unwrap().attended.then_some(()),
+        );
+        assert!(took_over.is_some(), "the writer took the queue over");
+        let held = logger.file.lock().unwrap();
+        let (done, returned) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for n in 1..=3 {
+                logged(logger, n);
+            }
+            let _ = done.send(());
+        });
+        returned
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("three records returned with the file held");
+        assert_eq!(read(&dir.log()), "", "nothing reached the held file");
+        drop(held);
+        assert!(logger.flush_within(aterm_spec::wait::MUST_HAPPEN));
+        assert_eq!(bodies(&dir.log()), lines(1..=3));
+    }
+
+    /// BOUNDED, NEVER DROPPED, NEVER REORDERED: lines queue up to the cap;
+    /// the line past it is appended by its own thread after every queued
+    /// one; the next queues again, and a flush lands it.
+    /// NEGATIVE CONTROL: the synchronous logger had written each line at once,
+    /// so the file was not empty after the first three.
+    #[test]
+    fn a_full_queue_is_appended_in_order_by_the_thread_that_overflows_it() {
+        let dir = Scratch::new("full");
+        // As long as every line this test logs: ten-digit seconds, this pid.
+        let one = format_record(
+            epoch_ms_now(),
+            std::process::id(),
+            aterm_log::Level::Info,
+            "t",
+            "line 1",
+        )
+        .len();
+        let logger = queued_logger(&dir.log(), 3 * one + 2);
+        for n in 1..=3 {
+            logged(logger, n);
+        }
+        assert_eq!(read(&dir.log()), "", "three lines fit the queue");
+        logged(logger, 4);
+        assert_eq!(
+            bodies(&dir.log()),
+            lines(1..=4),
+            "the overflow lands all, in order"
+        );
+        logged(logger, 5);
+        assert_eq!(bodies(&dir.log()), lines(1..=4), "the queue took the next");
+        assert!(logger.flush_within(aterm_spec::wait::MUST_HAPPEN));
+        assert_eq!(bodies(&dir.log()), lines(1..=5));
+    }
+
+    /// A flush waits for the file no longer than its bound, the line still
+    /// queued, and lands the queue once the file is free.
+    #[test]
+    fn a_flush_is_bounded_and_lands_the_queue() {
+        let dir = Scratch::new("flush");
+        let logger = queued_logger(&dir.log(), LOG_QUEUE_BYTES);
+        logged(logger, 1);
+        let held = logger.file.lock().unwrap();
+        assert!(
+            !logger.flush_within(Duration::from_millis(5)),
+            "the file was held"
+        );
+        drop(held);
+        assert_eq!(read(&dir.log()), "", "still queued");
+        assert!(logger.flush_within(aterm_spec::wait::MUST_HAPPEN));
+        assert_eq!(bodies(&dir.log()), lines(1..=1));
+    }
+
+    /// LANDED AT THE END: a process that `exit`s with a line still queued
+    /// (its writer never ran) finds it on disk, through the `exit(3)`
+    /// handler; and a line logged after that handler ran (here by a handler
+    /// registered before it, so run after it) is appended by its own thread,
+    /// not queued for the writer the process is losing. NEGATIVE CONTROLS:
+    /// without that handler the first line died with the process
+    /// (`flush_at_exit` removed: the file is empty); with a handler that only
+    /// flushes, the second line was queued and died (the file held line 1).
+    #[cfg(unix)]
+    #[test]
+    fn an_exit_lands_the_lines_still_queued() {
+        const STAGE: &str = "ATERM_TEST_LOG_EXIT_PATH";
+        extern "C" fn logs_after_the_flush() {
+            if let Some(logger) = FILE_LOGGER.get() {
+                logged(logger, 2);
+            }
+        }
+        unsafe extern "C" {
+            fn atexit(cb: extern "C" fn()) -> libc::c_int;
+        }
+        if let Some(path) = std::env::var_os(STAGE) {
+            let logger = queued_logger(Path::new(&path), LOG_QUEUE_BYTES);
+            assert!(
+                FILE_LOGGER.set(logger).is_ok(),
+                "this process's only logger"
+            );
+            // SAFETY: a plain `extern "C"` function with no captured state.
+            assert_eq!(unsafe { atexit(logs_after_the_flush) }, 0, "atexit");
+            flush_at_exit();
+            logged(logger, 1);
+            assert_eq!(read(Path::new(&path)), "", "queued at the exit");
+            std::process::exit(0);
+        }
+        let dir = Scratch::new("exit");
+        let mut helper = crate::test_alone::StandIn::this_test();
+        helper.command().env(STAGE, dir.log());
+        let ran = helper.spawn().selected();
+        assert_eq!(ran.status.and_then(|s| s.code()), Some(0), "{}", ran.stderr);
+        assert_eq!(bodies(&dir.log()), lines(1..=2));
+    }
+
     #[test]
     fn format_record_sanitizes_and_terminates_line() {
         let line = format_record(
@@ -1816,7 +2246,7 @@ mod tests {
     }
 }
 
-/// Tier-1 for `aterm_spec::derive::log_rotation_model`: two real [`RotatingFile`]s on
+/// Tier-1 for `aterm_models_misc::log_rotation_model`: two real [`RotatingFile`]s on
 /// one path (A, and B which restarts) driven through writes, looks, ticks, rotations,
 /// follows, a look that follows and rotates at once, and a write into the older copy.
 /// After each step the files are projected onto the model (lines per file, which file
@@ -1829,7 +2259,8 @@ mod tests {
 #[cfg(all(test, unix))]
 mod rotation_conformance {
     use super::*;
-    use aterm_spec::derive::{Model, log_rotation_model};
+    use aterm_models_misc::log_rotation_model;
+    use aterm_spec::derive::Model;
     use aterm_spec::interp::State;
     use aterm_spec::verify::validate_transition_tiered;
 

@@ -10,11 +10,7 @@ named for its version:
 ```
 2.1.278/
   manifest.toml                 provenance, plus size and sha256 per file
-  SessionStart/0.json           one file per payload, in arrival order
-  SessionEnd/0.json
   PermissionRequest/0.json, 1.json   the `echo`, then the `rm`
-  PreToolUse/0.json, 1.json
-  PostToolUse/0.json, 1.json
   screen/usage.txt              one painted screen of `/usage`
   screen/usage.status           the session's `status` line beside it
 ```
@@ -32,8 +28,6 @@ agent, so nothing in the tree re-captures this corpus.
 targo --unverified test -p aterm-agent --test agent_suite -- vendor_corpus::
 ```
 
-- Every payload parses, carries a `session_id`, and names its directory's
-  event; each build has `PermissionRequest` and `PreToolUse` payloads.
 - The command in each `PermissionRequest`, drawn into a Bash permission box,
   is pressed (`1`) at full power (`approve = "all"`), and at least one is a
   box `approve = "safe"` would not press.
@@ -53,3 +47,9 @@ vendor's dash-mangled project-directory spelling (`/`, `.` and `_` become
 `-`). Keys, nesting, types and path shapes survive, and payloads that shared a
 session id still share one. The manifest's digests are of the redacted files
 and record what was captured: a fixture is an observation, so never edit one.
+
+## What is not in here
+
+The other hook payloads the capture caught (`SessionStart`, `SessionEnd`,
+`PreToolUse`, `PostToolUse`) were dropped with the hook bridge that read
+them; git history keeps them.

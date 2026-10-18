@@ -1,0 +1,39 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab) · `keep going\\r` written in one burst (`send --stdin`), then `X`: the Enter in the burst made a newline, not a submit, and the X landed on the draft's second row · the lab's random project dir is spelled /private/tmp/at.lab0 here, the lab's scratch home is spelled under /Users//person/ here
+
+  Muse Code 1.4.10
+
+  Rules loaded this session (in precedence order):
+  user: $CONFIG_DIR/AGENTS.md
+  project: none
+  Claude Code rules at /Users//person/Developer/scratch-lab/runs/m3/scratch/home/.claude/CLAUDE.md — not read; import into Muse Code with /rules
+  import.
+  Codex rules at /Users//person/Developer/scratch-lab/runs/m3/scratch/home/.codex/AGENTS.md — not read; import into Muse Code with /rules import.
+
+❯ hello there
+
+◆ Hi! I am the local lab stub, not a model. (reply 2)
+
+❯ toolstart
+
+◆ Ran env | cut -d= -f1 | sort > envnames.txt — failed
+  └ environment failure: sandbox enforcement unavailable: macOS sandbox executable `/usr/bin/sandbox-exec` failed enforcement probe: allowed pro
+    be write did not complete, status=exit status: 71, stderr=sandbox-exec: sandbox_apply: Operation not permitted
+
+    The execution environment is broken: the command was never started and every later command will fail the same way. Do not retry and do not f
+    abricate command output; report this environment failure.
+
+◆ Tool call done. Result: tool failed: environment failure: sandbox enforcement unavailable: macOS sandbox executable /usr/bin/sandbox-exec
+  failed enforcement probe: allowed probe write did not complete, status=exit status:~
+
+❯ toolstart
+
+◆ Ran command · List the environment names · ✓ · 10s · ctrl+o
+
+◆ Tool call done. Result: { "chunk_id": "exec-1-1", "exit_code": 0, "terminal_status": "completed", "output": "", "original_output_bytes": 0,
+  "original_output_tokens": 0, "truncated": false }
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ keep going
+  X
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  lab-stub · high · /private/tmp/at.lab0/proj · Auto-review

@@ -14,7 +14,8 @@
 
 #![cfg(test)]
 
-use aterm_spec::derive::{Model, control_connection_admission_model};
+use aterm_models_native::control_connection_admission_model;
+use aterm_spec::derive::Model;
 use aterm_spec::interp::{State, admits};
 use aterm_uds::CtlStream;
 

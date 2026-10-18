@@ -405,8 +405,8 @@ impl InputBacklog {
     ///
     /// Such a write is not queued behind the unread bytes: the line discipline
     /// turns it into SIGINT, SIGQUIT or SIGTSTP and (unless `NOFLSH`) flushes the
-    /// queue (pinned by `aterm_pty`'s
-    /// `queue_len_never_counts_a_signal_character_while_isig_is_set`). So the
+    /// queue (measured by `tests/input_backlog_pty.rs`'s
+    /// `a_control_key_a_cbreak_driver_eats_is_not_a_read`). So the
     /// unread-input gate does not refuse it: `key ctrl+c` into a stuck cbreak
     /// program is the remedy. Raw mode, a busy or non-empty spill, or a full
     /// queue answer `false`.
@@ -1179,19 +1179,5 @@ mod tests {
             ..cbreak
         };
         assert!(room.signals_on_write(&[0x03]));
-    }
-
-    #[test]
-    fn unread_is_kernel_plus_spill() {
-        let b = InputBacklog {
-            spilled: Some(5),
-            ..raw(3, 0)
-        };
-        assert_eq!(b.unread(), 8);
-        let busy = InputBacklog {
-            spilled: None,
-            ..raw(3, 0)
-        };
-        assert_eq!(busy.unread(), 3);
     }
 }

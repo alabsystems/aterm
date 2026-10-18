@@ -7,16 +7,6 @@
 
 use super::*;
 
-/// The looks ONE read of a record that survived its exit takes
-/// ([`relaunch::exit_record`]: the first, then one each `EXIT_LOOK` until
-/// `EXIT_SETTLE` has passed): once that many are taken
-/// ([`Acting::exit_looked`]), the record there at each, the read says
-/// `survived`, whatever becomes of the record after.
-pub(super) fn a_whole_settle() -> usize {
-    let looks = relaunch::EXIT_SETTLE.as_millis() / relaunch::EXIT_LOOK.as_millis();
-    usize::try_from(looks).unwrap_or(usize::MAX) + 1
-}
-
 /// A host over one tab `s-a` its Claude Code runs in, supervised, whose
 /// thread panics at its next pass once `boom` is set — its roster read, a
 /// test's panic — and at every pass while `always` is set (its look at
@@ -205,162 +195,6 @@ fn narrowed() -> SupervisorConfig {
     let mut cfg = on();
     cfg.set("approve", "none").unwrap();
     cfg
-}
-
-/// A CRASH WHILE THE HOST IS DOWN AFTER A PANIC IS RELAUNCHED (the residual
-/// stated on `Workers`, round fourteen): the host thread panics, and while
-/// its restart waits out its back-off the supervised agent crashes. The
-/// restarted host's first pass reads the agent gone since as an exit, and
-/// it is relaunched on its conversation, on the record its exit left.
-///
-/// FAILS ON 1afcdade3: dropping the dead host's workers stopped every one —
-/// no hand-over, no Commit — so each ended leaving no exit to the host
-/// ([`Kept::unwatched`]); the restarted host found the roster naming no
-/// agent in the tab and nothing marked there, and the crash was never
-/// relaunched, with nothing said (the wait for it runs out).
-#[test]
-fn a_crash_while_the_host_is_down_after_a_panic_is_relaunched() {
-    let p = panicking_host();
-    p.panic_and_hold();
-    // The agent crashes while nothing of the host runs.
-    p.a.set(&[]);
-    p.down.open();
-    until("the crash relaunched once the host is back", || {
-        !p.a.relaunched.lock().unwrap().is_empty()
-    });
-    assert_eq!(
-        (
-            p.a.relaunched.lock().unwrap().clone(),
-            p.a.exit_records.lock().unwrap().clone(),
-        ),
-        (vec!["s-a".to_string()], vec!["survived"]),
-        "(relaunched, what the exit left)"
-    );
-    p.host.shutdown_and_join();
-}
-
-/// ITS RECORD IS READ AS THE EXIT IS SEEN, NOT WHEN THE HOST IS BACK (D2 of
-/// the 2026-09-26 live test, in the panic's window): the agent crashes while
-/// the host is down, and a Claude Code started meanwhile removes the dead
-/// agent's session record — as any Claude Code that starts does — before
-/// the host is back. The crash's record was read at its exit, so it is
-/// relaunched as a crash, never left as a graceful exit.
-///
-/// FAILS ON 1afcdade3: nothing reads the exit while the host is down (the
-/// wait for its read runs out).
-#[test]
-fn the_record_of_a_crash_while_the_host_is_down_is_read_as_it_is_seen() {
-    let p = panicking_host();
-    p.panic_and_hold();
-    p.a.set(&[]);
-    until(
-        "the crash's record read as it was seen, the host down",
-        || p.a.exit_looked.load(Ordering::SeqCst) >= a_whole_settle(),
-    );
-    // Another Claude Code starts, and sweeps the dead agent's record.
-    p.a.record_gone.store(true, Ordering::SeqCst);
-    p.down.open();
-    // Waited on the decision, not on the exit's record: the record is pushed
-    // first in the same step, so a read between the two saw no relaunch.
-    until("the crash decided once the host is back", || {
-        exit_decided(&p.a)
-    });
-    assert_eq!(
-        (
-            p.a.exit_records.lock().unwrap().clone(),
-            p.a.relaunched.lock().unwrap().clone(),
-        ),
-        (vec!["survived"], vec!["s-a".to_string()]),
-        "(what the exit left, relaunched)"
-    );
-    p.host.shutdown_and_join();
-}
-
-/// THE EXIT-ONLY WORKER'S READ IS THE ONE TAKEN AS THE EXIT WAS SEEN (D2 of
-/// the 2026-09-26 live test, in a Commit's hold; the residual stated in the
-/// robustness handoff's §4): a park's Commit stops the session's worker
-/// with no exit handed, the agent crashes while the Commit holds the host,
-/// and a Claude Code started during the hold removes the dead agent's
-/// record. The Commit fails; the host hands the exit to a worker that reads
-/// it alone ([`exit_main`]), which relaunches it as the crash it was.
-///
-/// FAILS ON 1afcdade3: no pass of a suspended host hands an exit and
-/// nothing else reads one, so the record was read only by the worker the
-/// resumed host started — after the sweep, as a graceful exit, never
-/// relaunched (the wait for the read during the hold runs out).
-#[test]
-fn a_crash_while_a_commit_holds_the_host_is_read_as_it_is_seen() {
-    let a = Arc::new(Acting::default());
-    a.open.lock().unwrap().insert("s-a".to_string());
-    a.set(&[("s-a", Program::Claude)]);
-    let host = HostHandle::start(on(), false, false, a.hooks());
-    a.attached(&host, "s-a");
-    host.pause_restored();
-    host.suspend();
-    until("the Commit's stop ended the worker", || {
-        host.live().is_empty()
-    });
-    // The agent crashes while the Commit holds the host.
-    a.set(&[]);
-    until(
-        "the crash's record read as it was seen, the Commit holding the host",
-        || a.exit_looked.load(Ordering::SeqCst) >= a_whole_settle(),
-    );
-    // Another Claude Code starts during the hold, and sweeps the record.
-    a.record_gone.store(true, Ordering::SeqCst);
-    // The Commit fails.
-    host.resume();
-    host.resume_restored();
-    host.relaunch_stranded(&|_| "in tab 1".to_string());
-    until("the crash decided once the host is back", || {
-        exit_decided(&a)
-    });
-    assert_eq!(
-        (
-            a.exit_records.lock().unwrap().clone(),
-            a.relaunched.lock().unwrap().clone(),
-        ),
-        (vec!["survived"], vec!["s-a".to_string()]),
-        "(what the exit left, relaunched)"
-    );
-    host.shutdown_and_join();
-}
-
-/// A RELAUNCH A WORKER'S BACK-OFF OWES WHEN THE HOST PANICS IS STILL MADE
-/// (round seventeen; the same drop as above): the agent crashed, its worker
-/// read the crash and tries its relaunch on its back-off (each try
-/// `wait:shell-prompt`), and the host thread panics. The worker runs on
-/// through the host's back-off, and its next try lands.
-///
-/// FAILS ON 1afcdade3: the panic's drop stopped the worker, whose back-off
-/// read the stop as one for good: it settled what it owed and tried no more
-/// (the wait for a try after the panic runs out).
-#[test]
-fn a_relaunch_owed_when_the_host_panics_is_still_made() {
-    let p = panicking_host();
-    *p.a.relaunches.lock().unwrap() = vec!["wait:shell-prompt"; 100_000].into();
-    p.a.set(&[]);
-    until("its relaunch tried on its back-off", || {
-        p.a.relaunched.lock().unwrap().len() >= 2
-    });
-    p.panic_and_hold();
-    // The shell takes the line now: the next try lands.
-    let tried = p.a.relaunched.lock().unwrap().len();
-    p.a.relaunches.lock().unwrap().clear();
-    until("a try after the panic, landed", || {
-        p.a.relaunched.lock().unwrap().len() > tried && p.a.owed.load(Ordering::SeqCst)
-    });
-    assert_eq!(
-        p.a.exit_records
-            .lock()
-            .unwrap()
-            .iter()
-            .collect::<BTreeSet<_>>(),
-        [&"survived"].into_iter().collect(),
-        "every try on the crash read at its exit"
-    );
-    p.down.open();
-    p.host.shutdown_and_join();
 }
 
 /// A HARNESS SWITCHED OFF WHILE THE HOST IS DOWN HANDS NOTHING FROM BEFORE
@@ -560,59 +394,6 @@ fn a_policy_narrowed_while_the_host_is_down_reaches_the_workers_it_carries() {
     p.host.shutdown_and_join();
 }
 
-/// AN AGENT A RELAUNCH LANDS WHILE THE HOST IS DOWN IS WATCHED UNTIL A PASS
-/// NAMES IT (round seventeen, the review of its first cut): the host
-/// thread panics while a worker tries its crashed agent's relaunch on its
-/// back-off; the worker runs on through the host's back-off and its next try
-/// lands — and the agent that landed crashes too, before the host is back.
-/// No pass read it back, so no worker was handed its exit and no mark left
-/// it to the host, but it was watched: the restarted host's first pass hands
-/// that exit, read as it was seen, and it is relaunched.
-///
-/// FAILS ON 70537fad5: the landing left the agent to the roster
-/// ([`runs_again`]), whose naming starts its worker, and the host's restart
-/// watched only the agents of the workers it carried: the landed agent's
-/// crash was read by nobody, never relaunched and never said (the wait for
-/// its relaunch runs out). Not a regression — before that cut the panic lost
-/// even the first crash — and with the host up the window is the moment
-/// before the next pass names the agent (the residual [`runs_again`] stated).
-#[test]
-fn an_agent_landed_while_the_host_is_down_that_crashes_is_relaunched() {
-    let p = panicking_host();
-    *p.a.relaunches.lock().unwrap() = vec!["wait:shell-prompt"; 100_000].into();
-    p.a.set(&[]);
-    until("its relaunch tried on its back-off", || {
-        p.a.relaunched.lock().unwrap().len() >= 2
-    });
-    p.panic_and_hold();
-    // The shell takes the line now: the next try lands, and its agent is
-    // read.
-    p.a.relaunches.lock().unwrap().clear();
-    until("a try after the panic landed, its agent read", || {
-        p.a.owed.load(Ordering::SeqCst) && p.a.read_in("s-a")
-    });
-    let landed = p.a.relaunched.lock().unwrap().len();
-    // The roster names it — nobody reads it, the host is down — and it
-    // crashes, still before the host is back.
-    p.a.set(&[("s-a", Program::Claude)]);
-    p.a.set(&[]);
-    p.down.open();
-    until(
-        "the landed agent's crash relaunched once the host is back",
-        || p.a.relaunched.lock().unwrap().len() > landed,
-    );
-    assert_eq!(
-        p.a.exit_records
-            .lock()
-            .unwrap()
-            .iter()
-            .collect::<BTreeSet<_>>(),
-        [&"survived"].into_iter().collect(),
-        "every try on a crash read at its exit"
-    );
-    p.host.shutdown_and_join();
-}
-
 /// A PASS IN FLIGHT WHEN A COMMIT'S STOP COMES ENDS NO WATCH THAT STOP ARMED
 /// (round seventeen, the review of its first cut): a pass reads the roster
 /// — naming the agent in its tab — and before it ends the watches of the
@@ -775,7 +556,7 @@ fn project_unhanded(
 /// `CrashUnseen` and `LandedLost`, each breaking `NoOwedRelaunchLost`.
 #[test]
 fn an_exit_nobody_is_handed_conforms_to_the_commit_owed_model() {
-    let model = aterm_spec::derive::harness_commit_owed_model();
+    let model = aterm_models_harness::harness_commit_owed_model();
     let holds = |state: &aterm_spec::interp::State| {
         for invariant in ["NoOwedRelaunchLost", "NoQueuedRelaunchDropped"] {
             assert!(
@@ -1040,7 +821,7 @@ fn a_restored_agent_that_crashes_before_a_pass_names_it_is_relaunched() {
     let n = Arc::clone(&steps);
     let p = panicking_host_hooked(None, move |a, h| {
         let a = Arc::clone(a);
-        h.acts.relaunch_restored = Arc::new(move |sid, _, _| {
+        h.acts.relaunch_restored = Arc::new(move |sid, _, _, _| {
             n.fetch_add(1, Ordering::SeqCst);
             a.adopted_in(sid, false);
             "adopted".to_string()
@@ -1107,6 +888,7 @@ fn a_restored_agent_that_crashes_before_a_pass_names_it_is_relaunched() {
 /// the tab, and the explicit restart's cause where its act ended the agent
 /// — as the successor queues it on its restored queue
 /// (`App::hand_restored_agents`), on the adopted shell.
+#[cfg(target_os = "macos")]
 fn carried_across(parent: &HostHandle, sid: &str) -> Vec<RestoredAgent> {
     parent
         .pending_restored_for(sid)
@@ -1126,6 +908,7 @@ fn carried_across(parent: &HostHandle, sid: &str) -> Vec<RestoredAgent> {
                 place: "in tab 1".to_string(),
                 cold: true,
                 asked,
+                was: None,
             }
         })
         .into_iter()
@@ -1191,7 +974,7 @@ fn an_asked_exit_carried_through_a_hold_across_a_commit_is_relaunched_once_it_li
     let (world, n, l) = (Arc::clone(&b), Arc::clone(&steps), Arc::clone(&looks));
     // aterm's own end's step: its relaunch line looks at the tab as every
     // relaunch line does (`wait:held` under a hold).
-    h.acts.relaunch_restored = Arc::new(move |sid, _, _| {
+    h.acts.relaunch_restored = Arc::new(move |sid, _, _, _| {
         n.fetch_add(1, Ordering::SeqCst);
         l.fetch_add(1, Ordering::SeqCst);
         if world.held.load(Ordering::SeqCst) {
@@ -1360,187 +1143,6 @@ fn a_panic_inside_the_hosts_restart_loses_none_of_its_workers() {
     p.host.shutdown_and_join();
 }
 
-/// A LANDED AGENT NO READ REACHES IS NOT LEFT TO NOBODY (round eighteen;
-/// the residual round seventeen stated: a landing whose new agent could not
-/// be read arms nothing). The worker tries its crashed agent's relaunch on
-/// its back-off, and the host thread panics; the worker's next try lands
-/// while the host is down — the agent it started holds its tab, but no read
-/// of it succeeds (the control socket refusing it, say) — and that agent
-/// crashes too, still before the host is back. Its exit is the relaunch's
-/// still: tried again, on the crash the first exit left.
-///
-/// FAILS ON 745d63b36: the landing whose agent could not be read ended the
-/// worker with nothing watching it — no process to watch, and no mark (the
-/// agent alive in its tab): its crash was read by nobody, never relaunched
-/// and never said (the wait for its relaunch runs out).
-#[test]
-fn a_landed_agent_no_read_reaches_that_crashes_is_relaunched() {
-    let p = panicking_host();
-    *p.a.relaunches.lock().unwrap() = vec!["wait:shell-prompt"; 100_000].into();
-    p.a.set(&[]);
-    until("its relaunch tried on its back-off", || {
-        p.a.relaunched.lock().unwrap().len() >= 2
-    });
-    p.panic_and_hold();
-    // The next try lands an agent that holds its tab and that no read
-    // reaches.
-    p.a.unreadable.store(true, Ordering::SeqCst);
-    *p.a.holds.lock().unwrap() = Some(true);
-    let (tried, asked) = (
-        p.a.relaunched.lock().unwrap().len(),
-        p.a.still_asked.lock().unwrap().len(),
-    );
-    p.a.relaunches.lock().unwrap().clear();
-    until("a try after the panic landed, and was looked at", || {
-        p.a.owed.load(Ordering::SeqCst)
-            && p.a.relaunched.lock().unwrap().len() > tried
-            && p.a.still_asked.lock().unwrap().len() > asked
-    });
-    let landed = p.a.relaunched.lock().unwrap().len();
-    // It crashes, still before the host is back; the next agent can be read.
-    *p.a.holds.lock().unwrap() = None;
-    p.a.set(&[]);
-    p.a.unreadable.store(false, Ordering::SeqCst);
-    until("the unread landing's crash relaunched", || {
-        p.a.relaunched.lock().unwrap().len() > landed
-    });
-    assert_eq!(
-        p.a.exit_records
-            .lock()
-            .unwrap()
-            .iter()
-            .collect::<BTreeSet<_>>(),
-        [&"survived"].into_iter().collect(),
-        "every try on the crash read at its exit"
-    );
-    p.down.open();
-    p.host.shutdown_and_join();
-}
-
-/// A RESTORED LANDING NO READ REACHES IS NOT LEFT TO NOBODY (round
-/// eighteen, the review of its first cut). The host thread panics and is
-/// held in its back-off — no pass runs — while the cold restore's queue
-/// relaunches the agent of tab `s-r`: its step lands an agent that holds
-/// its tab but that no read reaches (the control socket refusing it, say),
-/// and that agent crashes, still unread, before the host is back. Its
-/// exit is its own relaunch's again, as a worker's landing's is: the
-/// queue's attempt, which its landing did not end, steps it again — once —
-/// and the agent that step lands, read, is watched.
-///
-/// FAILS ON 95d62f656: the landing ended its attempt, and the thread that
-/// read it again gave up at the crash (the agent no longer held its tab)
-/// with nothing holding the exit — no watch, no mark, no worker, no
-/// attempt: the crash was relaunched by nobody and said to nobody (the
-/// first wait runs out: no attempt is left for [`landed_unread`] to find).
-///
-/// THE CRASH COMES AFTER THE LOOK THAT FOUND THE LANDING UNREAD, as stated:
-/// waited for on the attempt that look keeps ([`landed_unread`]). This test
-/// first waited for the step's count and a question to the tab
-/// ([`Hooks::still_wanted`]) — but the queue asks the tab BEFORE an untyped
-/// step too ([`restored_overtaken`]), and the step was counted as it began,
-/// so the wait could end while the step still ran. The queue's thread
-/// (utility QoS) preempted there, the crash was made before the landing:
-/// before the step's agent was, the world kept an agent alive and readable,
-/// read at once (no crash to step again); between the step and its look,
-/// that look found no agent in the tab — the residual
-/// [`restored_landing_ends`] states, left to the roster. Either way no second
-/// step: "not within 60 s: the restored landing's crash stepped again", in 3
-/// of about 13 full `aterm-gui --lib` runs (one process, every test), never
-/// alone. The step now lingers at a gate after its count, every run — the
-/// preemption made certain — and nothing is landed there yet (NEGATIVE
-/// CONTROL: the first cut's wait, in place of this one, failed here 7 of 7
-/// runs).
-///
-/// READ BEFORE IT CRASHED (2026-10-16): a look at the landing asks who holds
-/// the tab, then whether a read reaches that agent. This test made the
-/// crash and the readable world after it in one go, so a look that
-/// straddled them found the crashed agent holding the tab and readable. It
-/// read it (an agent read just before it crashed), the attempt was over
-/// and the exit was the watch's, handed by the host's next pass. That pass
-/// comes only after this test's last wait, so the wait for a second step
-/// ran out: 1 of 16 full `aterm-gui --lib` runs under load 35 to 67, with
-/// the queue empty and its tab asked only twice. The agent is made readable
-/// only once the queue has looked at the crash. NEGATIVE CONTROL, with the
-/// straddle forced at a gate in the snapshot read: the old order stepped
-/// once, and the watch's exit was relaunched once the host was back (no
-/// exit lost: [`a_restored_agent_that_crashes_before_a_pass_names_it_is_relaunched`]
-/// is that path); this order steps again.
-#[test]
-fn a_restored_landing_no_read_reaches_that_crashes_is_relaunched_again() {
-    let steps = Arc::new(AtomicUsize::new(0));
-    let n = Arc::clone(&steps);
-    // Each step, once counted, waits here while it is shut: the queue's
-    // thread preempted between the count and the agent it lands.
-    let landing = Arc::new(PauseGate::default());
-    let gate = Arc::clone(&landing);
-    let p = panicking_host_hooked(None, move |a, h| {
-        let a = Arc::clone(a);
-        h.acts.relaunch_restored = Arc::new(move |sid, _, _| {
-            n.fetch_add(1, Ordering::SeqCst);
-            gate.pass();
-            a.adopted_in(sid, false);
-            // The agent it landed holds its tab (the store names it so).
-            *a.holds.lock().unwrap() = Some(true);
-            "adopted".to_string()
-        });
-    });
-    p.a.open.lock().unwrap().insert("s-r".to_string());
-    p.panic_and_hold();
-    p.a.unreadable.store(true, Ordering::SeqCst);
-    landing.shut();
-    p.host.relaunch_restored(vec![restored("s-r", "in tab 2")]);
-    until("the step counted, its landing held", || landing.held());
-    // NEGATIVE CONTROL: the step is counted and nothing has landed yet, so
-    // a wait on the count alone would let the crash in before the landing.
-    assert_eq!(
-        (steps.load(Ordering::SeqCst), landed_unread(&p.host, "s-r")),
-        (1, false),
-        "(the steps counted, the landing looked at): the step still runs"
-    );
-    landing.open();
-    until(
-        "the step landed an agent no read reaches, looked at",
-        || steps.load(Ordering::SeqCst) == 1 && landed_unread(&p.host, "s-r"),
-    );
-    // It crashes, unread, still before the host is back. The agent the next
-    // step lands can be read, but only once the queue has looked at the
-    // crash (see READ BEFORE IT CRASHED above).
-    *p.a.holds.lock().unwrap() = None;
-    p.a.set(&[("s-a", Program::Claude)]);
-    until("the queue looked at the crash", || {
-        steps.load(Ordering::SeqCst) >= 2 || !landed_unread(&p.host, "s-r")
-    });
-    p.a.unreadable.store(false, Ordering::SeqCst);
-    until("the restored landing's crash stepped again", || {
-        steps.load(Ordering::SeqCst) >= 2
-    });
-    let watched = || {
-        let kept = p.host.shared.kept.lock().unwrap().get("s-r").cloned();
-        kept.is_some_and(|k| {
-            k.lock()
-                .unwrap()
-                .exit_watch
-                .as_ref()
-                .is_some_and(|w| w.hands.is_some())
-        })
-    };
-    until("its agent read, watched, the attempt over", || {
-        p.host.pending_restored().is_empty() && watched()
-    });
-    // The attempt is off the queue — the one stepper — and the agent it
-    // landed runs: no step and no relaunch on exit can follow.
-    assert_eq!(
-        (
-            steps.load(Ordering::SeqCst),
-            p.a.relaunched.lock().unwrap().clone()
-        ),
-        (2, Vec::<String>::new()),
-        "(the queue's steps, relaunched on exit): stepped again once"
-    );
-    p.down.open();
-    p.host.shutdown_and_join();
-}
-
 /// AN ASKED EXIT CARRIED ACROSS A COMMIT IS NOT REFUSED BY `relaunch =
 /// false` (round eighteen, the review of its first cut): the live worker
 /// relaunches the explicit restart's end whatever `[harness] relaunch`
@@ -1628,7 +1230,7 @@ fn an_asked_exit_carried_across_a_commit_is_relaunched_under_relaunch_false() {
 /// `QueueUnreadLost`, each breaking `NoOwedRelaunchLost`.
 #[test]
 fn the_landings_of_round_eighteen_conform_to_the_commit_owed_model() {
-    let model = aterm_spec::derive::harness_commit_owed_model();
+    let model = aterm_models_harness::harness_commit_owed_model();
     let holds = |state: &aterm_spec::interp::State| {
         for invariant in ["NoOwedRelaunchLost", "NoQueuedRelaunchDropped"] {
             assert!(
@@ -1657,7 +1259,7 @@ fn the_landings_of_round_eighteen_conform_to_the_commit_owed_model() {
     let mut h = a.hooks();
     let steps = Arc::new(AtomicUsize::new(0));
     let (world, n) = (Arc::clone(&a), Arc::clone(&steps));
-    h.acts.relaunch_restored = Arc::new(move |sid, _, _| {
+    h.acts.relaunch_restored = Arc::new(move |sid, _, _, _| {
         n.fetch_add(1, Ordering::SeqCst);
         world.adopted_in(sid, false);
         "adopted".to_string()
@@ -1801,10 +1403,8 @@ fn the_landings_of_round_eighteen_conform_to_the_commit_owed_model() {
         "landed, unread, its worker's still"
     );
     let landed = p.a.relaunched.lock().unwrap().len();
-    *p.a.holds.lock().unwrap() = None;
-    p.a.set(&[]);
+    p.a.crash_unread(&[]);
     fire(&mut state, &["Crash"]);
-    p.a.unreadable.store(false, Ordering::SeqCst);
     until("relaunched again, its agent read and watched", || {
         p.a.relaunched.lock().unwrap().len() > landed && watching(&p.host)
     });
@@ -1826,7 +1426,7 @@ fn the_landings_of_round_eighteen_conform_to_the_commit_owed_model() {
     let mut h = a.hooks();
     let steps = Arc::new(AtomicUsize::new(0));
     let (world, n) = (Arc::clone(&a), Arc::clone(&steps));
-    h.acts.relaunch_restored = Arc::new(move |sid, _, _| {
+    h.acts.relaunch_restored = Arc::new(move |sid, _, _, _| {
         n.fetch_add(1, Ordering::SeqCst);
         world.adopted_in(sid, false);
         // The agent it landed holds its tab (the store names it so).

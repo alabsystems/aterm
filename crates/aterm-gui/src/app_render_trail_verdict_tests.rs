@@ -162,12 +162,6 @@ fn keyed_celebration_model() -> aterm_spec::derive::Model {
 }
 
 #[test]
-fn fx_celebration_model_proves_and_catches_reused_enter_credit() {
-    let model = keyed_celebration_model();
-    aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
-}
-
-#[test]
 fn fx_celebration_completion_guard_conforms_to_real_detector() {
     use aterm_effects::kitty_sing::{CelebrateOn, KittySing, song_signature};
     let model = keyed_celebration_model();

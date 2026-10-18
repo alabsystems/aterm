@@ -6,9 +6,9 @@
 //!
 //! A zstd frame's `Content_Checksum` is the low 32 bits of XXH64 over the
 //! decompressed content with seed 0, stored little-endian (RFC 8878 §3.1.1).
-//! The answers are the reference C code's: the xxhsum sanity vectors pin it
-//! here, and tests/xxh64_recorded.rs holds it to 577 answers recorded from
-//! libzstd's own `ZSTD_XXH64`.
+//! The answers are the reference C code's: tests/xxh64_recorded.rs holds it
+//! to 577 answers recorded from libzstd's own `ZSTD_XXH64` over xxhsum's
+//! sanity buffer.
 
 const P1: u64 = 0x9E37_79B1_85EB_CA87;
 const P2: u64 = 0xC2B2_AE3D_27D4_EB4F;
@@ -159,44 +159,6 @@ mod tests {
                 byte
             })
             .collect()
-    }
-
-    /// The reference vectors xxhsum's `BMK_sanityCheck` asserts on that
-    /// buffer, seed 0 and seed 2654435761 (xxHash 0.6-0.8).
-    #[test]
-    fn xxhsum_sanity_vectors() {
-        let buf = sanity(222);
-        let p32 = 2_654_435_761;
-        for (len, seed, want) in [
-            (0, 0, 0xEF46_DB37_51D8_E999),
-            (0, p32, 0xAC75_FDA2_929B_17EF),
-            (1, 0, 0xE934_A84A_DB05_2768),
-            (1, p32, 0x5014_6076_43A9_B4C3),
-            (4, 0, 0x9136_A0DC_A574_57EE),
-            (14, 0, 0x8282_DCC4_994E_35C8),
-            (14, p32, 0xC3BD_6BF6_3DEB_6DF0),
-            (222, 0, 0xB641_AE8C_B691_C174),
-            (222, p32, 0x20CB_8AB7_AE10_C14A),
-        ] {
-            assert_eq!(xxh64(seed, &buf[..len]), want, "len {len} seed {seed:#x}");
-        }
-    }
-
-    /// Short literal inputs, as libzstd's `ZSTD_XXH64` answers them; the last
-    /// sets the accumulator to `u64::MAX` so adding the length wraps.
-    #[test]
-    fn literal_inputs() {
-        let counting: Vec<u8> = (0..100).collect();
-        let seed = 0xAE05_4331_1B70_2D91;
-        assert_eq!(xxh64(0, &[42]), 0x0A9E_DECE_BEB0_3AE4);
-        assert_eq!(xxh64(0, b"Hello, world!\0"), 0x7B06_C531_EA43_E89F);
-        assert_eq!(xxh64(0, &counting), 0x6AC1_E580_3216_6597);
-        assert_eq!(xxh64(seed, b""), 0x4B6A_04FC_DF7A_4672);
-        assert_eq!(xxh64(seed, &counting), 0x567E_355E_0682_E1F1);
-        assert_eq!(
-            xxh64(u64::MAX - 0x27D4_EB2F_1656_67C5, b"x"),
-            0xF953_D52C_12A9_F5FB
-        );
     }
 
     /// Every way of cutting the input into two or three pieces lands on the

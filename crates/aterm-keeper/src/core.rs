@@ -25,10 +25,26 @@
 //! nothing holds it, it is an orphan, unless the successor never said HELLO here and ended with
 //! `exit(0)` after a clean Commit, which is a quit and closes it (§5.4 row 3,
 //! `KeeperCore::resolve_holds`).
+//!
+//! **Companions** (the crash-restore plan §5). A window that journals (its HELLO states
+//! [`CAP_JOURNAL`]) registers, beside each master it claims, the read-only descriptor of the
+//! session's journal region (COMPANION). The keeper never maps or decodes one: it keeps at most
+//! one per claim, hands the right one to the next window with the master, and counts the
+//! recovering windows that die on a region (the poison brake, [`Journal::attempts`]), so a region
+//! whose replay kills its restorer is retried once without its tail and then offered no more.
+//! Which companion an offer carries is the companion of the claimant that registered the master
+//! LAST (the reader) when that claimant settled (sent its COMPANION, or COMPANION_RELEASE for
+//! none); otherwise the newest one a claim left behind, with one more attempt counted. After an
+//! update's Commit the successor is the reader, and the outgoing window never is again, even
+//! when the successor's claim ends first ([`Journal`]). The machine is `KeeperCompanionCustody`;
+//! its Tier-1 bind is `src/conformance_companion.rs`.
 
 use std::collections::BTreeMap;
 
-use crate::wire::{Birth, CAP_LINK, CAP_SENDS_BYE, MarkerRef, MasterHeader, PeerClass, RefuseCode};
+use crate::wire::{
+    Birth, CAP_JOURNAL, CAP_LINK, CAP_SENDS_BYE, COMPANION_JOURNAL, MarkerRef, MasterHeader,
+    PeerClass, RefuseCode,
+};
 
 /// A master's identity: its `st_rdev`.
 pub type Rdev = u64;
@@ -120,6 +136,303 @@ pub enum MarkerEvidence {
     Held,
 }
 
+/// A companion descriptor, numbered by the caller.
+pub type CompanionId = u64;
+
+/// How many recovering windows may die on one region: at this count the keeper closes the region
+/// it retained and offers none (the crash-restore plan §5, "the cap"). One death may be the
+/// tail's poison, so the next window replays the keyframe alone; a second death says the
+/// keyframe kills too, and the next window gets today's blank META rung instead of a crash loop.
+pub const MAX_ATTEMPTS: u8 = 2;
+
+/// A crash-restore journal region registered beside a master (COMPANION): the core's handle on
+/// the read-only descriptor its caller holds. The keeper never maps or decodes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Companion {
+    /// The caller's number for the descriptor.
+    pub id: CompanionId,
+    /// What the region is ([`COMPANION_JOURNAL`]).
+    pub kind: u8,
+    /// Its length in bytes (the server checked it against the descriptor before the core saw
+    /// it).
+    pub len: u64,
+}
+
+/// One record's companions and its poison brake (the crash-restore plan §5, §3.2 N4 and N5).
+///
+/// The READER is the claim that registered the master last as a new claim: the only window, or
+/// an update's successor from its Commit REGISTER on (a candidate registers nothing before its
+/// Commit, keeper doc §5.3 step 8, so two claimants exist only after it, when the outgoing window
+/// no longer reads the PTY). A claim that moves to a reconnected link of the same process keeps
+/// what it was: a reconnect is no new reader. Once a newer claim has registered, an older one
+/// never reads again, so it never becomes the reader again either, not even when the newer
+/// claim ends first (an update's successor that dies during its outgoing window's drain): the
+/// record then has a claim and no reader until that claim ends too. Were the outgoing window
+/// promoted, its region would be offered at attempts 0, the rung a restorer replays in full and
+/// calls exact, without the output its successor read after the Commit.
+///
+/// The reader is SETTLED once its COMPANION or COMPANION_RELEASE arrived: from then on its region
+/// (or the absence of one) speaks for what it read. Each claim may hold its own companion
+/// ([`Self::own`]); another claim's (the outgoing window's) is the fallback while the reader has
+/// not settled. The region a claim leaves behind when it ends is [`Self::retained`]: what an
+/// offer carries once no claim is left.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Journal {
+    /// Each live claim's own companion.
+    pub own: BTreeMap<ConnId, Companion>,
+    /// The claim that reads the master (above); `None` with no claim, or once the reader's claim
+    /// ended before an older one's.
+    pub reader: Option<ConnId>,
+    /// Whether [`Self::reader`] settled: its poison window has ended.
+    pub settled: bool,
+    /// The companion an offer carries: left by a claim that ended (the reader's own, judged at its
+    /// end, or the outgoing window's while its update successor has not settled), and closed as
+    /// soon as the reader settles, which supersedes it.
+    pub retained: Option<Companion>,
+    /// Recovering windows that died on [`Self::retained`] before their own COMPANION: an offer
+    /// that reverted to Orphaned, or a reader whose claim ended unsettled (§3.2 N4: such a
+    /// window may have read output the region never saw, so a restore from it is never exact).
+    pub attempts: u8,
+    /// The process whose reader claim ended while an older claim went on (an update's successor
+    /// gone during its outgoing window's drain). Its end is already judged into
+    /// [`Self::retained`] and [`Self::attempts`], as its death alone would have been, so a hold
+    /// the keeper then judges by that same process's end keeps them
+    /// ([`KeeperCore::resolve_holds`]); any other hold closes every region. The next reader
+    /// clears it.
+    pub reader_gone: Option<u32>,
+}
+
+/// A test build's fault point on the poison brake: armed, a death before a COMPANION counts no
+/// attempt, the defect the companion conformance's negative control plants (as
+/// `aterm_core::fault::triggered` is used; the shipped build's check is constant `false`).
+#[cfg(any(test, debug_assertions))]
+pub mod fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        static ATTEMPTS_UNCOUNTED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Run `f` with this thread's keeper counting no attempt, disarmed after it even on unwind.
+    pub fn with_attempts_uncounted<T>(f: impl FnOnce() -> T) -> T {
+        struct Disarm;
+        impl Drop for Disarm {
+            fn drop(&mut self) {
+                ATTEMPTS_UNCOUNTED.with(|a| a.set(false));
+            }
+        }
+        ATTEMPTS_UNCOUNTED.with(|a| a.set(true));
+        let _disarm = Disarm;
+        f()
+    }
+
+    /// Whether the fault is armed on this thread.
+    pub(crate) fn attempts_uncounted() -> bool {
+        ATTEMPTS_UNCOUNTED.with(Cell::get)
+    }
+}
+
+#[cfg(not(any(test, debug_assertions)))]
+mod fault {
+    /// The shipped build: never armed.
+    #[inline]
+    pub(crate) fn attempts_uncounted() -> bool {
+        false
+    }
+}
+
+impl Journal {
+    /// Close every companion it holds: a claim by a window that does not journal (§3.2 N5: no
+    /// region from before that window's life may be offered after it), or a hold that ended with
+    /// no claim. The brake is the record's and stays, and so does the reader: a window that does
+    /// not journal reads unsettled and can never settle.
+    fn close_all(&mut self, out: &mut Vec<Out>) {
+        for c in std::mem::take(&mut self.own).into_values() {
+            out.push(Out::CloseCompanion(c.id));
+        }
+        if let Some(c) = self.retained.take() {
+            out.push(Out::CloseCompanion(c.id));
+        }
+        self.settled = false;
+    }
+
+    /// Make `c` the retained companion, closing the one it supersedes.
+    fn retain(&mut self, c: Companion, out: &mut Vec<Out>) {
+        if let Some(old) = self.retained.replace(c)
+            && old.id != c.id
+        {
+            out.push(Out::CloseCompanion(old.id));
+        }
+    }
+
+    /// Close the retained companion, if any.
+    fn drop_retained(&mut self, out: &mut Vec<Out>) {
+        if let Some(c) = self.retained.take() {
+            out.push(Out::CloseCompanion(c.id));
+        }
+    }
+
+    /// A recovering window died on the retained region before its own COMPANION: one more
+    /// attempt, and at [`MAX_ATTEMPTS`] the region closes.
+    fn count_attempt(&mut self, out: &mut Vec<Out>) {
+        if !fault::attempts_uncounted() {
+            self.attempts = self.attempts.saturating_add(1);
+        }
+        if self.attempts >= MAX_ATTEMPTS {
+            self.drop_retained(out);
+        }
+    }
+
+    /// `conn` registered the master as a new claim (no claim of its process moved to it): it
+    /// reads the master from now on, unsettled, and any older claim never reads it again.
+    fn claimed(&mut self, conn: ConnId) {
+        self.reader = Some(conn);
+        self.settled = false;
+        self.reader_gone = None;
+    }
+
+    /// The claim `from` moved to the newer connection `to` of the same process (a link that
+    /// reconnected and registered again): its companion and its readership move with it, unless
+    /// the newer connection already sent its own, which is newer.
+    fn claim_moved(&mut self, from: ConnId, to: ConnId, out: &mut Vec<Out>) {
+        if let Some(c) = self.own.remove(&from) {
+            match self.own.entry(to) {
+                std::collections::btree_map::Entry::Occupied(_) => {
+                    out.push(Out::CloseCompanion(c.id));
+                }
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(c);
+                }
+            }
+        }
+        if self.reader == Some(from) {
+            self.reader = Some(to);
+        }
+    }
+
+    /// The region an offer would carry were the record orphaned now (`KeeperCompanionCustody`'s
+    /// `comp`): the reader's own once it settled; while it has not, the fallback (another
+    /// claim's own, which is newer than anything retained); with no reader, what the claims that
+    /// ended left.
+    fn would_offer(&self) -> Option<Companion> {
+        match self.reader {
+            Some(r) if self.settled => self.own.get(&r).copied(),
+            Some(r) => self
+                .own
+                .iter()
+                .find(|(c, _)| **c != r)
+                .map(|(_, c)| *c)
+                .or(self.retained),
+            None => self.retained,
+        }
+    }
+
+    /// The reader's claim ended: what an offer carries from now on, judged as the plan's §5
+    /// "orphaning" rule says. Settled, its own region (or none, if it released) with the brake
+    /// reset; unsettled, the fallback with one more attempt counted (it may have read output no
+    /// region saw: §3.2 N4). Every other claim's region is superseded either way: no other claim
+    /// will read the master again.
+    fn reader_ended(&mut self, conn: ConnId, out: &mut Vec<Out>) {
+        let own = self.own.remove(&conn);
+        if std::mem::take(&mut self.settled) {
+            self.attempts = 0;
+            match own {
+                Some(c) => self.retain(c, out),
+                None => self.drop_retained(out),
+            }
+        } else {
+            // A companion settles its claim, so an unsettled reader holds none.
+            if let Some(c) = own {
+                out.push(Out::CloseCompanion(c.id));
+            }
+            // The fallback: the outgoing window's region, newer than any retained one.
+            if let Some(&older) = self.own.keys().next_back()
+                && let Some(c) = self.own.remove(&older)
+            {
+                self.retain(c, out);
+            }
+            self.count_attempt(out);
+        }
+        for c in std::mem::take(&mut self.own).into_values() {
+            out.push(Out::CloseCompanion(c.id));
+        }
+        self.reader = None;
+    }
+
+    /// The claim `conn` of process `pid` ended while another goes on (a RELEASE from one of two
+    /// claimants, or the end of its process). The reader leaving first (an update's successor
+    /// that died, or closed the tab, during its outgoing window's drain) is judged now, as its
+    /// end alone would be, and the outgoing window is left claiming with no reader. Another
+    /// claim's region is the fallback while the reader has not settled (the outgoing window's,
+    /// before its successor's COMPANION), and is superseded otherwise.
+    fn claim_left(&mut self, conn: ConnId, pid: Option<u32>, out: &mut Vec<Out>) {
+        if self.reader == Some(conn) {
+            self.reader_ended(conn, out);
+            self.reader_gone = pid;
+            return;
+        }
+        if let Some(c) = self.own.remove(&conn) {
+            if self.reader.is_some() && !self.settled {
+                self.retain(c, out);
+            } else {
+                out.push(Out::CloseCompanion(c.id));
+            }
+        }
+    }
+
+    /// The last claim, `conn`'s, ended with its process: the record is about to be judged. If
+    /// `conn` is the reader its end is judged ([`Self::reader_ended`]); if the reader's claim
+    /// ended before (an outgoing window outliving its successor), that end was judged then, and
+    /// this claim's own region is no reader's.
+    fn last_claim_left(&mut self, conn: ConnId, out: &mut Vec<Out>) {
+        if self.reader == Some(conn) {
+            self.reader_ended(conn, out);
+        }
+        for c in std::mem::take(&mut self.own).into_values() {
+            out.push(Out::CloseCompanion(c.id));
+        }
+        self.reader = None;
+        self.settled = false;
+    }
+
+    /// What an offer of the record carries: the retained region, under the cap.
+    fn offerable(&self) -> Option<Companion> {
+        self.retained.filter(|_| self.attempts < MAX_ATTEMPTS)
+    }
+
+    /// Every companion held ([`KeeperCore::companions_held`]).
+    fn held(&self) -> impl Iterator<Item = &Companion> {
+        self.own.values().chain(self.retained.iter())
+    }
+}
+
+/// What an OFFER to a window that stated [`CAP_JOURNAL`] carries beside the master (an OFFER's
+/// trailing fields, and the COMPANION_OFFER after it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OfferJournal {
+    /// The record's [`Journal::attempts`].
+    pub attempts: u8,
+    /// The region offered with the master, if any.
+    pub companion: Option<Companion>,
+}
+
+/// The companion side of one record, as `KeeperCompanionCustody` sees it (the Tier-1
+/// projection).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompanionView {
+    /// The companion an offer would carry if the record were orphaned now: the reader's own once
+    /// it settled, else the fallback (the model's `comp`).
+    pub offered: Option<CompanionId>,
+    /// Whether the reader ([`Journal::reader`]) has settled; `None` with no claim reading the
+    /// master (the model's `done`).
+    pub reader_settled: Option<bool>,
+    /// The brake.
+    pub attempts: u8,
+    /// The own region of a claim that is not the reader: an update's outgoing window's, from its
+    /// successor's Commit to its own end (the model's `ocomp`).
+    pub outgoing: Option<CompanionId>,
+}
+
 /// A decision the caller carries out.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Out {
@@ -128,12 +441,24 @@ pub enum Out {
     /// Close the descriptor that arrived with this REGISTER: the keeper already
     /// holds a copy of that master (a claim that moved).
     DropDuplicate(Rdev),
-    /// Close the custody copy of this master: its record is gone.
+    /// Close the custody copy of this master: its record is gone, and every companion beside it
+    /// closes with it (a companion travels only with its master).
     Close(Rdev),
+    /// Keep the descriptor that arrived with this COMPANION: the core holds it as a claim's
+    /// companion. Any other arrived descriptor is closed.
+    KeepCompanion(CompanionId),
+    /// Close this companion's descriptor: superseded, capped, or no longer anyone's.
+    CloseCompanion(CompanionId),
     /// Send WELCOME with this many OFFERs to follow.
     Welcome { conn: ConnId, offers: u16 },
-    /// Send an OFFER of this master, with a duplicate of the custody copy.
-    Offer { conn: ConnId, rdev: Rdev },
+    /// Send an OFFER of this master, with a duplicate of the custody copy; to a window that
+    /// stated [`CAP_JOURNAL`], with its trailing fields, and a COMPANION_OFFER of the companion
+    /// right after it.
+    Offer {
+        conn: ConnId,
+        rdev: Rdev,
+        journal: Option<OfferJournal>,
+    },
     /// Send ORPHANS(n): a live sibling may ADOPT.
     Orphans { conn: ConnId, n: u16 },
     /// Send REFUSED.
@@ -202,16 +527,16 @@ pub fn exited_zero(status: i32) -> bool {
 /// trust it alone (a panic read as a quit).
 #[must_use]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "PtyKeeperCustody",
         action = "KeeperHonoursBye",
         project = "aterm_keeper::KeeperCore::custody_view"
     )
 )]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "KeeperDeathJudgement",
         action = "Judge",
         project = "aterm_keeper::KeeperCore::last_verdict"
@@ -259,24 +584,24 @@ impl RelaunchBrake {
     /// A fresh brake: nothing spent. (The brake machine's environment actions
     /// are waived here: no brake code runs for them.)
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "KeeperRelaunchBrake",
             action = "PickRepeatedDeaths",
             reason = "The environment's pick of a scenario; no brake code runs."
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "KeeperRelaunchBrake",
             action = "PickBootTrial",
             reason = "As PickRepeatedDeaths."
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "KeeperRelaunchBrake",
             action = "Death",
             reason = "A window's non-clean end; the brake is consulted at Decide (KeeperCore's \
@@ -284,16 +609,16 @@ impl RelaunchBrake {
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "KeeperRelaunchBrake",
             action = "CleanQuit",
             reason = "A window's quit; decided at Decide with clean = true."
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "KeeperRelaunchBrake",
             action = "RelaunchFails",
             reason = "The relaunched window's early death or missing HELLO (KeeperCore's \
@@ -320,8 +645,8 @@ impl RelaunchBrake {
     /// Decide at a death: a quit (`clean`) relaunches nothing; otherwise
     /// relaunch after the streak's backoff while it has room, else hold.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "KeeperRelaunchBrake",
             action = "Decide",
             project = "aterm_keeper::RelaunchBrake::streak"
@@ -347,8 +672,8 @@ impl RelaunchBrake {
 
     /// The relaunched window lived [`HEALTHY_MS`]: the streak resets.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "KeeperRelaunchBrake",
             action = "Healthy",
             project = "aterm_keeper::RelaunchBrake::streak"
@@ -360,8 +685,8 @@ impl RelaunchBrake {
 
     /// A launch the keeper did not cause said HELLO: the brake resets.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "KeeperRelaunchBrake",
             action = "ManualLaunch",
             project = "aterm_keeper::RelaunchBrake::streak"
@@ -404,8 +729,12 @@ pub struct Record {
     pub tag: Vec<u8>,
     /// Opaque: never decoded.
     pub meta: Vec<u8>,
+    /// Its claims, oldest first: the last is the READER, the process that registered it last
+    /// (an update's successor after its Commit, else the only claimant).
     pub claimants: Vec<ConnId>,
     pub state: RecordState,
+    /// Its crash-restore companions and their poison brake.
+    pub journal: Journal,
 }
 
 /// One connection's peer.
@@ -436,6 +765,10 @@ pub struct Peer {
 impl Peer {
     fn is_app(&self) -> bool {
         self.class == Some(PeerClass::App)
+    }
+    /// Whether its HELLO stated [`CAP_JOURNAL`].
+    fn journals(&self) -> bool {
+        self.caps & CAP_JOURNAL != 0
     }
     fn connected(&self) -> bool {
         self.eof_at.is_none() && self.exit.is_none()
@@ -552,8 +885,8 @@ impl KeeperCore {
     /// The custody machine's actions that are not the keeper's own code (the window's, the
     /// update's, launchd's) are waived here, each with where its keeper half is.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "PtyKeeperCustody",
             action = "Quit",
             reason = "The window writes BYE on its final-exit path (aterm-gui's keeper_link::bye, beside \
@@ -562,8 +895,8 @@ impl KeeperCore {
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "PtyKeeperCustody",
             action = "StartSuccessor",
             reason = "The seamless update's own step (app_update_handoff); the keeper's half is \
@@ -571,8 +904,8 @@ impl KeeperCore {
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "PtyKeeperCustody",
             action = "Rollback",
             reason = "The window proves its successor dead (app_update_handoff); the keeper sees \
@@ -580,8 +913,8 @@ impl KeeperCore {
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "PtyKeeperCustody",
             action = "AdoptA",
             reason = "The recovering window's admission and reader (aterm-gui's \
@@ -590,16 +923,16 @@ impl KeeperCore {
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "PtyKeeperCustody",
             action = "AdoptB",
             reason = "As AdoptA."
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "PtyKeeperCustody",
             action = "KeeperCrashes",
             reason = "The keeper process dies; the kernel closes every custody copy. The runner \
@@ -607,8 +940,8 @@ impl KeeperCore {
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "PtyKeeperCustody",
             action = "KeeperRestarts",
             reason = "launchd respawns the job (M1: KeepAlive, 10 s throttle); a fresh KeeperCore \
@@ -699,6 +1032,41 @@ impl KeeperCore {
         }
     }
 
+    /// The companion side of `rdev`'s record (the `KeeperCompanionCustody` projection), `None`
+    /// once the record is gone.
+    #[must_use]
+    pub fn companion_view(&self, rdev: Rdev) -> Option<CompanionView> {
+        let rec = self.records.get(&rdev)?;
+        let j = &rec.journal;
+        let reader_settled = (rec.state == RecordState::Claimed)
+            .then_some(j.reader)
+            .flatten()
+            .map(|_| j.settled);
+        let outgoing = j
+            .own
+            .iter()
+            .find(|(c, _)| j.reader != Some(**c))
+            .map(|(_, c)| c.id);
+        Some(CompanionView {
+            offered: j.would_offer().map(|c| c.id),
+            reader_settled,
+            attempts: j.attempts,
+            outgoing,
+        })
+    }
+
+    /// Every companion the core holds (each claim's own and each record's retained one), by the
+    /// caller's number: exactly the descriptors its caller must hold after carrying out every
+    /// [`Out`] so far, no more and no fewer (the server's tests hold it to that).
+    #[must_use]
+    pub fn companions_held(&self) -> std::collections::BTreeSet<CompanionId> {
+        self.records
+            .values()
+            .flat_map(|r| r.journal.held())
+            .map(|c| c.id)
+            .collect()
+    }
+
     /// Orphans on offer now.
     #[must_use]
     pub fn orphan_count(&self) -> usize {
@@ -742,24 +1110,24 @@ impl KeeperCore {
     /// `KeeperDeathJudgement`'s environment (the window's build and end, the evidence degrading,
     /// the shell's own end) is waived here.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "KeeperDeathJudgement",
             action = "PickP3Window",
             reason = "The environment's pick of a window build (a P3 window names no marker); no keeper code runs."
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "KeeperDeathJudgement",
             action = "PickPreByeWindow",
             reason = "As PickP3Window (a window from before BYE: no CAP_SENDS_BYE, no marker)."
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "KeeperDeathJudgement",
             action = "QuitWithBye",
             reason = "The window's final-exit path (aterm-gui's keeper_link::bye, then exit(0), whose atexit \
@@ -767,16 +1135,16 @@ impl KeeperCore {
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "KeeperDeathJudgement",
             action = "QuitByeLost",
             reason = "As QuitWithBye with the BYE not written; the keeper sees only the EOF and the exit."
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "KeeperDeathJudgement",
             action = "Killed",
             reason = "The kernel ends the window with no exit path (SIGKILL, jetsam, a fatal signal); the \
@@ -784,16 +1152,16 @@ impl KeeperCore {
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "KeeperDeathJudgement",
             action = "PanicExit",
             reason = "An unwinding panic: exit(101) through the atexit that unlinks the marker."
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "KeeperDeathJudgement",
             action = "StatusLost",
             reason = "The exit watch could not be armed (ESRCH at the connect); the keeper judges on the \
@@ -801,8 +1169,8 @@ impl KeeperCore {
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "KeeperDeathJudgement",
             action = "MarkerSwept",
             reason = "Another aterm start's install sweep removes a dead, empty marker (aterm-gui's \
@@ -810,16 +1178,16 @@ impl KeeperCore {
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "KeeperDeathJudgement",
             action = "MarkerInherited",
             reason = "A forked child still holds the marker's descriptor and lock."
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "KeeperDeathJudgement",
             action = "ShellDies",
             reason = "The orphan's session leader exits; the keeper learns it from the exit watch it armed \
@@ -924,23 +1292,42 @@ impl KeeperCore {
     /// and whose shell is still the one registered is offered to `conn` and marked Offered to it;
     /// the keeper keeps its copy. A record whose shell is gone is closed.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "PtyKeeperCustody",
             action = "OfferA",
             project = "aterm_keeper::KeeperCore::custody_view"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "PtyKeeperCustody",
             action = "OfferB",
             project = "aterm_keeper::KeeperCore::custody_view"
         )
     )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "KeeperCompanionCustody",
+            action = "OfferNew",
+            project = "aterm_keeper::KeeperCore::companion_view"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "KeeperCompanionCustody",
+            action = "OfferOld",
+            project = "aterm_keeper::KeeperCore::companion_view"
+        )
+    )]
     fn offers_for(&mut self, conn: ConnId, env: &mut dyn KeeperEnv) -> Vec<Out> {
         let mut offers = Vec::new();
+        // A window that journals is offered each record's region beside its master, and the
+        // brake with it; any other gets the OFFER it has always read (§3.2 J2).
+        let journals = self.peers.get(&conn).is_some_and(Peer::journals);
         let mut closes = Vec::new();
         let orphans: Vec<Rdev> = self
             .records
@@ -967,7 +1354,15 @@ impl KeeperCore {
             }
             if let Some(rec) = self.records.get_mut(&rdev) {
                 rec.state = RecordState::Offered { to: conn };
-                offers.push(Out::Offer { conn, rdev });
+                let journal = journals.then(|| OfferJournal {
+                    attempts: rec.journal.attempts,
+                    companion: rec.journal.offerable(),
+                });
+                offers.push(Out::Offer {
+                    conn,
+                    rdev,
+                    journal,
+                });
             }
         }
         let mut out = closes;
@@ -985,19 +1380,35 @@ impl KeeperCore {
     /// custody copy; a claim on a master already held moves the claim and drops
     /// the duplicate (the keeper already holds the same open file description).
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "PtyKeeperCustody",
             action = "RegisterA",
             project = "aterm_keeper::KeeperCore::custody_view"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "PtyKeeperCustody",
             action = "RegisterB",
             project = "aterm_keeper::KeeperCore::custody_view"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "KeeperCompanionCustody",
+            action = "Claim",
+            project = "aterm_keeper::KeeperCore::companion_view"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "KeeperCompanionCustody",
+            action = "SuccessorCommits",
+            project = "aterm_keeper::KeeperCore::companion_view"
         )
     )]
     pub fn register(
@@ -1022,17 +1433,23 @@ impl KeeperCore {
         // out reconnects and registers every master again, and those REGISTERs can be read before
         // the old connection's EOF: counted twice, one window would spend both claim slots and
         // its update successor's REGISTER at Commit be refused. So a claimant of the same process
-        // (pid and birth, or the pid once that connection's EOF was read) on an older connection
-        // is replaced, and a REGISTER still in flight on an older connection, read after the
+        // (pid and birth, or the pid after EOF when either birth is unavailable) on an older
+        // connection is replaced. Two known different births are always different processes:
+        // EOF cannot transfer a settled journal to a recycled PID. A REGISTER still in flight
+        // on an older connection, read after the
         // newer one's, leaves the claim where it is.
         let same_process: Vec<ConnId> = self
             .peers
             .iter()
             .filter(|(c, p)| {
-                **c != conn && p.pid == pid && (p.birth == birth || p.eof_at.is_some())
+                **c != conn
+                    && p.pid == pid
+                    && (p.birth == birth
+                        || (p.eof_at.is_some() && (p.birth.is_none() || birth.is_none())))
             })
             .map(|(c, _)| *c)
             .collect();
+        let journals = self.peers.get(&conn).is_some_and(Peer::journals);
         if let Some(rec) = self.records.get_mut(&rdev) {
             if rec
                 .claimants
@@ -1041,19 +1458,46 @@ impl KeeperCore {
             {
                 return vec![Out::DropDuplicate(rdev)];
             }
+            let moved: Vec<ConnId> = rec
+                .claimants
+                .iter()
+                .copied()
+                .filter(|c| same_process.contains(c))
+                .collect();
             rec.claimants.retain(|c| !same_process.contains(c));
+            let mut new_claim = false;
             if !rec.claimants.contains(&conn) {
+                // Only a claim that replaced none can find the slots full: nothing moved.
                 if rec.claimants.len() >= MAX_CLAIMANTS {
                     return refuse(RefuseCode::TooManyClaimants);
                 }
                 rec.claimants.push(conn);
+                new_claim = moved.is_empty();
+            }
+            let mut out = Vec::new();
+            // A new claim reads the master from now on (an update's successor at its Commit, or
+            // the window it was offered to); the process's companion and its readership follow
+            // a moved claim to the new link: a reconnect is no new reader, opens no poison
+            // window, and never makes an outgoing window the reader again.
+            if new_claim {
+                rec.journal.claimed(conn);
+            }
+            for from in moved {
+                rec.journal.claim_moved(from, conn, &mut out);
+            }
+            // §3.2 N5: a window that does not journal reads this master from now on, so no
+            // region from before its life may ever be offered after it (were it to die, the
+            // retained one would show a screen from before everything it ran).
+            if !journals {
+                rec.journal.close_all(&mut out);
             }
             rec.state = RecordState::Claimed;
             rec.header = header;
             if !tag.is_empty() {
                 rec.tag = tag;
             }
-            return vec![Out::DropDuplicate(rdev)];
+            out.push(Out::DropDuplicate(rdev));
+            return out;
         }
         if self.records.len() >= MAX_MASTERS {
             return refuse(RefuseCode::TooManyMasters);
@@ -1066,6 +1510,10 @@ impl KeeperCore {
                 meta: Vec::new(),
                 claimants: vec![conn],
                 state: RecordState::Claimed,
+                journal: Journal {
+                    reader: Some(conn),
+                    ..Journal::default()
+                },
             },
         );
         vec![Out::Keep(rdev)]
@@ -1087,40 +1535,158 @@ impl KeeperCore {
         }
     }
 
+    /// Who may send a COMPANION or COMPANION_RELEASE for `rdev` of `kind`: a connected window
+    /// that stated [`CAP_JOURNAL`] and claims the master, naming a kind this build knows.
+    fn companion_sender(&self, conn: ConnId, rdev: Rdev, kind: u8) -> Result<(), RefuseCode> {
+        match self.peers.get(&conn) {
+            Some(p) if p.is_app() && p.connected() && p.journals() => {}
+            _ => return Err(RefuseCode::WrongClass),
+        }
+        if kind != COMPANION_JOURNAL {
+            return Err(RefuseCode::NotAJournal);
+        }
+        match self.records.get(&rdev) {
+            None => Err(RefuseCode::NoSuchRecord),
+            Some(rec) if !rec.claimants.contains(&conn) => Err(RefuseCode::NotClaimant),
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// COMPANION: the journal region of a master this connection claims, `id` being the caller's
+    /// number for the read-only descriptor it already checked (POSIX shared memory, `O_RDONLY`,
+    /// `len` bytes within the keeper's bounds). It replaces and closes the claim's previous one.
+    /// From the reader it SETTLES the claim and ends the poison window (attempts 0): from now on
+    /// the region speaks for what this window reads, so the region a dead window left (the
+    /// retained one) is superseded and closes, as the next window's own region arriving closes
+    /// the dead one's (the crash-restore plan §2.7 step 5). From a claim that is not the reader
+    /// (an update's outgoing window telling its region again on a reconnected link after its
+    /// successor's Commit) it is only that claim's region, the fallback should the successor end
+    /// unsettled: the settling and the brake are the reader's, and a window that no longer reads
+    /// the master can vouch for nothing it shows.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "KeeperCompanionCustody",
+            action = "ReaderCompanion",
+            project = "aterm_keeper::KeeperCore::companion_view"
+        )
+    )]
+    pub fn companion(
+        &mut self,
+        conn: ConnId,
+        rdev: Rdev,
+        kind: u8,
+        len: u64,
+        id: CompanionId,
+    ) -> Vec<Out> {
+        if let Err(code) = self.companion_sender(conn, rdev, kind) {
+            return vec![Out::Refused { conn, code, rdev }];
+        }
+        let mut out = Vec::new();
+        if let Some(rec) = self.records.get_mut(&rdev) {
+            let j = &mut rec.journal;
+            if let Some(old) = j.own.insert(conn, Companion { id, kind, len }) {
+                out.push(Out::CloseCompanion(old.id));
+            }
+            if j.reader == Some(conn) {
+                j.settled = true;
+                j.attempts = 0;
+                j.drop_retained(&mut out);
+            }
+            out.push(Out::KeepCompanion(id));
+        }
+        out
+    }
+
+    /// COMPANION_RELEASE: this connection's claim on `rdev` has no journal (its region could
+    /// not be made, or memory pressure shed it). The claim's companion closes. The reader settles
+    /// with none: it reads the master unjournaled, so no older region may speak for it either,
+    /// and the retained one closes too. Another claim (an outgoing window) only loses its region.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "KeeperCompanionCustody",
+            action = "ReaderReleases",
+            project = "aterm_keeper::KeeperCore::companion_view"
+        )
+    )]
+    pub fn companion_release(&mut self, conn: ConnId, rdev: Rdev, kind: u8) -> Vec<Out> {
+        if let Err(code) = self.companion_sender(conn, rdev, kind) {
+            return vec![Out::Refused { conn, code, rdev }];
+        }
+        let mut out = Vec::new();
+        if let Some(rec) = self.records.get_mut(&rdev) {
+            let j = &mut rec.journal;
+            if let Some(old) = j.own.remove(&conn) {
+                out.push(Out::CloseCompanion(old.id));
+            }
+            if j.reader == Some(conn) {
+                j.settled = true;
+                j.attempts = 0;
+                j.drop_retained(&mut out);
+            }
+        }
+        out
+    }
+
     /// RELEASE: the tab or pane closed (or a recovering window refused the
     /// offer). The record goes and the custody copy closes. Only a claimant
     /// (or another connection of a claimant's process: its link that dropped
     /// and came back), or the connection it was offered to, may release it.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "PtyKeeperCustody",
             action = "CloseTabA",
             project = "aterm_keeper::KeeperCore::custody_view"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "PtyKeeperCustody",
             action = "CloseTabB",
             project = "aterm_keeper::KeeperCore::custody_view"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "PtyKeeperCustody",
             action = "OutgoingReleasesA",
             project = "aterm_keeper::KeeperCore::custody_view"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "PtyKeeperCustody",
             action = "SuccessorClosesTabA",
             project = "aterm_keeper::KeeperCore::custody_view"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "KeeperCompanionCustody",
+            action = "Release",
+            project = "aterm_keeper::KeeperCore::companion_view"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "KeeperCompanionCustody",
+            action = "OutgoingEnds",
+            project = "aterm_keeper::KeeperCore::companion_view"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "KeeperCompanionCustody",
+            action = "ReaderDies",
+            project = "aterm_keeper::KeeperCore::companion_view"
         )
     )]
     pub fn release(&mut self, conn: ConnId, rdev: Rdev) -> Vec<Out> {
@@ -1153,11 +1719,17 @@ impl KeeperCore {
             .get(&rdev)
             .is_some_and(|rec| rec.claimants.iter().any(|c| !mine(c)));
         if others_hold {
+            let mut out = Vec::new();
             if let Some(rec) = self.records.get_mut(&rdev) {
+                let ended: Vec<ConnId> = rec.claimants.iter().copied().filter(mine).collect();
                 rec.claimants.retain(|c| !mine(c));
+                for c in ended {
+                    rec.journal.claim_left(c, me.map(|(pid, _)| pid), &mut out);
+                }
             }
-            return Vec::new();
+            return out;
         }
+        // The record goes, and every companion with its master (`Out::Close`).
         self.records.remove(&rdev);
         vec![Out::Close(rdev)]
     }
@@ -1247,19 +1819,27 @@ impl KeeperCore {
     /// first still holds it: the holder scan keeps a second offer away ([`Self::offers_for`]), and
     /// its reconnected link may REGISTER it ([`Self::register`] proves possession, not the offer).
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "PtyKeeperCustody",
             action = "LinkDrops",
             project = "aterm_keeper::KeeperCore::custody_view"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "PtyKeeperCustody",
             action = "RelaunchedLinkDrops",
             project = "aterm_keeper::KeeperCore::custody_view"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "KeeperCompanionCustody",
+            action = "RecipientDrops",
+            project = "aterm_keeper::KeeperCore::companion_view"
         )
     )]
     pub fn eof(&mut self, conn: ConnId, now: u64, env: &mut dyn KeeperEnv) -> Vec<Out> {
@@ -1273,6 +1853,11 @@ impl KeeperCore {
                     rec.state = RecordState::Orphaned;
                     p.returned_offers = true;
                     out.push(Out::WatchPid(rec.header.shell_pid));
+                    // A window that took the region and never claimed may have died replaying
+                    // it: the poison brake counts it (§5, "a death before done").
+                    if p.journals() {
+                        rec.journal.count_attempt(&mut out);
+                    }
                 }
             }
         }
@@ -1328,8 +1913,8 @@ impl KeeperCore {
     /// the keeper sees (it watches each orphan's leader) and when a leader was gone before its
     /// watch could be armed.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "KeeperDeathJudgement",
             action = "KeeperSeesShellExit",
             project = "aterm_keeper::KeeperCore::custody_view"
@@ -1361,8 +1946,8 @@ impl KeeperCore {
     /// The clock: judge deaths whose grace ran out, resolve holds, and run the
     /// relaunch lane.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "PtyKeeperCustody",
             action = "Relaunch",
             project = "aterm_keeper::KeeperCore::custody_view"
@@ -1511,67 +2096,91 @@ impl KeeperCore {
     /// One peer is gone: drop it from every claim; judge the records it was the
     /// last claimant of; return offers made to it to Orphaned.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "PtyKeeperCustody",
             action = "WindowCrashes",
             project = "aterm_keeper::KeeperCore::custody_view"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "PtyKeeperCustody",
             action = "RelaunchedWindowCrashes",
             project = "aterm_keeper::KeeperCore::custody_view"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "PtyKeeperCustody",
             action = "RelaunchedWindowQuits",
             project = "aterm_keeper::KeeperCore::custody_view"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "PtyKeeperCustody",
             action = "SuccessorCrashes",
             project = "aterm_keeper::KeeperCore::custody_view"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "PtyKeeperCustody",
             action = "SuccessorCrashesFirst",
             project = "aterm_keeper::KeeperCore::custody_view"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "PtyKeeperCustody",
             action = "Commit",
             project = "aterm_keeper::KeeperCore::custody_view"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "PtyKeeperCustody",
             action = "SuccessorQuits",
             project = "aterm_keeper::KeeperCore::custody_view"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "PtyKeeperCustody",
             action = "OutgoingDrained",
             project = "aterm_keeper::KeeperCore::custody_view"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "KeeperCompanionCustody",
+            action = "ReaderDies",
+            project = "aterm_keeper::KeeperCore::companion_view"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "KeeperCompanionCustody",
+            action = "OutgoingEnds",
+            project = "aterm_keeper::KeeperCore::companion_view"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "KeeperCompanionCustody",
+            action = "RecipientDrops",
+            project = "aterm_keeper::KeeperCore::companion_view"
         )
     )]
     fn peer_died(&mut self, conn: ConnId, now: u64, env: &mut dyn KeeperEnv) -> Vec<Out> {
@@ -1590,12 +2199,20 @@ impl KeeperCore {
                 rec.state = RecordState::Orphaned;
                 returned_offers = true;
                 out.push(Out::WatchPid(rec.header.shell_pid));
+                if peer.journals() {
+                    rec.journal.count_attempt(&mut out);
+                }
                 continue;
             }
             if let Some(i) = rec.claimants.iter().position(|c| *c == conn) {
                 rec.claimants.remove(i);
+                // Its companion: what the record's next offer carries when this was the last
+                // claim or the reader, the fallback (or superseded) when a claim goes on.
                 if rec.claimants.is_empty() {
+                    rec.journal.last_claim_left(conn, &mut out);
                     last.push(*rdev);
+                } else {
+                    rec.journal.claim_left(conn, Some(peer.pid), &mut out);
                 }
             }
         }
@@ -1787,16 +2404,16 @@ impl KeeperCore {
     /// every Held record no live process holds is an orphan now (F11: a crash mid-update), unless
     /// the successor it waited on never took part and quit (§5.4 row 3): then it is closed.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "PtyKeeperCustody",
             action = "SuccessorFailStops",
             project = "aterm_keeper::KeeperCore::custody_view"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "PtyKeeperCustody",
             action = "SuccessorQuits",
             project = "aterm_keeper::KeeperCore::custody_view"
@@ -1870,6 +2487,23 @@ impl KeeperCore {
             }
             if alive {
                 if let Some(rec) = self.records.get_mut(&rdev) {
+                    // The hold ends with no successor's claim: whoever held the master after
+                    // the outgoing window (a successor that died before its REGISTER, or one
+                    // that never takes part in the keeper) may have read output no region saw,
+                    // for as long as it lived. No region speaks for the session any more.
+                    // Unless the process the hold waited on is the reader whose claim ended
+                    // during the outgoing window's drain: its end was judged then
+                    // (`Journal::reader_gone`), as its death alone would have been, and nobody
+                    // read the master after it (the scan just found no holder, and a process
+                    // that took the master on from it would have been awaited instead).
+                    let judged = matches!(
+                        rec.state,
+                        RecordState::Held { successor: Some(pid), .. }
+                            if rec.journal.reader_gone == Some(pid)
+                    );
+                    if !judged {
+                        rec.journal.close_all(&mut out);
+                    }
                     rec.state = RecordState::Orphaned;
                     out.push(Out::WatchPid(rec.header.shell_pid));
                 }
@@ -1967,6 +2601,9 @@ impl KeeperCore {
                     .count()
             ),
         ];
+        // The crash-restore regions are counted by the server, from the descriptors it holds
+        // (`Server::status_text`): a region the server failed to close shows there, which a
+        // count of this bookkeeping would hide.
         for (rdev, rec) in &self.records {
             lines.push(format!(
                 "master rdev={},{} state={} local_id={} shell={} claimants={}",
@@ -2183,8 +2820,16 @@ mod tests {
             outs,
             vec![
                 Out::Welcome { conn: 2, offers: 2 },
-                Out::Offer { conn: 2, rdev: 10 },
-                Out::Offer { conn: 2, rdev: 11 },
+                Out::Offer {
+                    conn: 2,
+                    rdev: 10,
+                    journal: None
+                },
+                Out::Offer {
+                    conn: 2,
+                    rdev: 11,
+                    journal: None
+                },
             ]
         );
         assert!(k.records().contains_key(&10), "the keeper keeps its copy");
@@ -2706,7 +3351,11 @@ mod tests {
             vec![
                 Out::Close(10),
                 Out::Welcome { conn: 2, offers: 1 },
-                Out::Offer { conn: 2, rdev: 11 }
+                Out::Offer {
+                    conn: 2,
+                    rdev: 11,
+                    journal: None
+                }
             ]
         );
     }
@@ -2821,7 +3470,11 @@ mod tests {
         );
         // A manual launch is offered the orphan and resets the brake.
         let outs = window(&mut k, &mut w, 2, 600, 10_000_001);
-        assert!(outs.contains(&Out::Offer { conn: 2, rdev: 10 }));
+        assert!(outs.contains(&Out::Offer {
+            conn: 2,
+            rdev: 10,
+            journal: None
+        }));
         assert_eq!(k.brake().streak(), 0);
     }
 
@@ -2931,7 +3584,14 @@ mod tests {
         // The keeper relaunches; the new window's HELLO is offered the orphan.
         assert_eq!(k.tick(0, &mut w), vec![Out::Relaunch]);
         let outs = window(&mut k, &mut w, 2, 20, 1);
-        assert!(outs.contains(&Out::Offer { conn: 2, rdev: 10 }), "{outs:?}");
+        assert!(
+            outs.contains(&Out::Offer {
+                conn: 2,
+                rdev: 10,
+                journal: None
+            }),
+            "{outs:?}"
+        );
         assert_eq!(k.records()[&10].state, RecordState::Offered { to: 2 });
         // Its link drops before it registers; the window lives on.
         let outs = k.eof(2, 2, &mut w);
@@ -2952,7 +3612,14 @@ mod tests {
             vec![Out::Welcome { conn: 3, offers: 0 }]
         );
         let outs = k.adopt(3, &mut w);
-        assert!(outs.contains(&Out::Offer { conn: 3, rdev: 10 }), "{outs:?}");
+        assert!(
+            outs.contains(&Out::Offer {
+                conn: 3,
+                rdev: 10,
+                journal: None
+            }),
+            "{outs:?}"
+        );
         // The person quits that window: BYE on the new link, then its end.
         k.bye(3);
         let now = 100_000;
@@ -3135,3 +3802,8 @@ mod late_hello_tests {
         assert_eq!(k.orphan_count(), 1, "the orphan is still kept");
     }
 }
+
+// Named as a test file (`*_tests.rs`), which is how the source guards know one.
+#[cfg(test)]
+#[path = "core_companion_tests.rs"]
+mod companion_tests;

@@ -26,13 +26,18 @@
 //! [`Console::Quiet`]: crate::spawn::Console::Quiet
 
 use std::ffi::OsStr;
-/// `std`'s own types: what the Unix [`Command`], `Stdio` and `Child` stand in
-/// for, so a spawn site shared with Unix names one set of types everywhere.
+/// `std`'s own `Command`, under the one name a reviewed raw site takes it by:
+/// the Unix `StdCommand`'s twin (its docs say why the alias is the one excuse
+/// and why `StdCommand::new` is never spelled outside this crate).
 #[expect(
     clippy::disallowed_types,
-    reason = "off Unix spawnfd's Command is std's: no descriptor table to strip"
+    reason = "the one name a reviewed raw std Command is taken by; off Unix spawnfd's Command is std's too"
 )]
-pub type Command = std::process::Command;
+pub type StdCommand = std::process::Command;
+/// `std`'s own types: what the Unix [`Command`], `Stdio` and `Child` stand in
+/// for, so a spawn site shared with Unix names one set of types everywhere.
+/// Off Unix there is no descriptor table to strip.
+pub type Command = StdCommand;
 pub use std::process::{Child, Stdio};
 
 /// The Unix strip's trait, a no-op here (the module docs say why).

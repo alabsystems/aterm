@@ -40,15 +40,7 @@ impl App {
             let g = self.store.read().unwrap_or_else(|p| p.into_inner());
             g.snapshot()
         };
-        let title_of = |h: &crate::session_store::SessionHandle| {
-            h.ctx
-                .meta
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .get("title")
-                .map(str::to_string)
-                .unwrap_or_else(|| h.title.clone())
-        };
+        let title_of = crate::session_store::SessionHandle::display_title;
         let by_local: std::collections::HashMap<u64, &crate::session_store::SessionHandle> =
             handles.iter().map(|h| (h.local_id, h)).collect();
 
@@ -640,6 +632,48 @@ mod tests {
         // The wire/menu close leg.
         assert!(app.close_aux_overlay(AuxTarget::Connections).is_ok());
         assert!(app.windows[&wid].connection_map().is_none());
+    }
+
+    /// THE MAP'S CHIPS NAME A SESSION WITHOUT ITS AGENT'S SPINNER FRAME (the
+    /// Together run's D7): the map is a snapshot, refreshed only on an
+    /// authority act, so a frame would freeze there. NEGATIVE CONTROL: a title
+    /// the person set stays whole.
+    #[test]
+    fn the_maps_chips_drop_an_agents_spinner_frame() {
+        let (mut app, _wid, sids) = app_with_three();
+        connect(&app, &sids[0], &sids[2]);
+        let local = app.store.read().unwrap().by_sid(&sids[2]).unwrap().local_id;
+        app.store
+            .write()
+            .unwrap()
+            .set_title(local, "\u{2826} Add tested calculator functions");
+        let chip = |app: &App| {
+            app.read_aux_controls(AuxTarget::Connections)
+                .into_iter()
+                .find(|l| l.contains(" chip ") && l.contains(&format!("sid={}", sids[2].as_str())))
+                .expect("the session is a chip")
+        };
+        assert!(app.open_connection_map().is_ok());
+        let line = chip(&app);
+        assert!(
+            line.contains("title=\"Add tested calculator functions\""),
+            "{line}"
+        );
+        assert!(app.close_aux_overlay(AuxTarget::Connections).is_ok());
+
+        app.store
+            .read()
+            .unwrap()
+            .by_sid(&sids[2])
+            .unwrap()
+            .ctx
+            .meta
+            .lock()
+            .unwrap()
+            .set("title", Some("\u{2826} deploy".to_string()));
+        assert!(app.open_connection_map().is_ok());
+        let line = chip(&app);
+        assert!(line.contains("title=\"\u{2826} deploy\""), "{line}");
     }
 
     /// Enter on a chip RAISES through the `raise` body: the hosting window's

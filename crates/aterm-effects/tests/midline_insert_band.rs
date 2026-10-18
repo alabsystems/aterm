@@ -14,7 +14,7 @@
 //! hidden-caret composer reports at the print's end is laid at the insert it
 //! made (`Ribbon::insert_landing`).
 //!
-//! The repaint arrives in six shapes ([`Shape`]): `inkish.py`'s split
+//! The repaint arrives in six shapes ([`Shape`]): the Ink-shaped split
 //! whole-line redraw, the same bytes in one read, the hide alone in the first
 //! read, Claude Code's own diff frame whole or torn after its hide, and
 //! readline's visible reprint-and-`CUB`. The census is the plan's coverage on
@@ -36,7 +36,7 @@ const COLS: usize = 140;
 /// 12 cps, the owner's pace.
 const KEY_MS: u64 = 83;
 const FRAME_MS: u64 = 16;
-/// `inkish.py`'s pause between a redraw's two reads.
+/// The Ink-shaped composer's pause between a redraw's two reads.
 const INK_SPLIT_MS: u64 = 30;
 /// A hole standing longer than this many frames is the defect.
 const HOLE_FRAMES_MAX: usize = 3;
@@ -44,8 +44,8 @@ const HOLE_FRAMES_MAX: usize = 3;
 /// How the composer's repaint reaches the glass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Shape {
-    /// `inkish.py`: hide, home, clear, the whole line | present | 30 ms |
-    /// the caret placed and shown | present.
+    /// The Ink-shaped redraw: hide, home, clear, the whole line | present |
+    /// 30 ms | the caret placed and shown | present.
     InkSplit,
     /// The same bytes in one read, one present.
     InkWhole,
@@ -148,7 +148,8 @@ impl Host {
         self.glow.note_context(self.term.is_alternate_screen());
         observe_caret_row(&self.term, &mut self.glow, &mut self.row_buf, c, self.now);
         observe_ribbon_rows(&self.term, &mut self.glow, &mut self.row_buf);
-        self.glow.observe_print_anchor(self.term.print_anchor());
+        self.glow
+            .observe_print_anchor(aterm_effects::host::motion_print_anchor(&self.term).0);
         let g = geom(ROWS, COLS, CW, CH);
         self.glow.tick(cur, self.now, &self.cfg, g, &mut self.out);
         self.record();

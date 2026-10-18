@@ -70,6 +70,27 @@ fn awaiting_start(state: &State) -> Option<String> {
         })
 }
 
+mod ancestry;
+
+/// The install-path rule the installer's embedded verifier is held to
+/// (`crates/aterm-update/tests/install_sh`): [`ancestry::refusal`] and the
+/// user-private-group, ACL and filesystem facts it reads
+/// ([`aterm_uds::shared_write`]).
+#[cfg(any(test, debug_assertions))]
+pub mod install_path {
+    pub use super::ancestry::refusal;
+    pub use aterm_uds::shared_write::{
+        Account, Group, REMOTE_FILESYSTEMS, acl_carried, is_user_private_group, remote_filesystem,
+        user_private_group,
+    };
+    /// The seams over what only Linux reads: an access ACL laid, the
+    /// filesystem type and the passwd enumeration.
+    #[cfg(target_os = "linux")]
+    pub use aterm_uds::shared_write::{
+        filesystem_type_at, grant_group_class_by_acl, primary_members,
+    };
+}
+
 #[derive(Clone, Debug)]
 struct Context {
     target: PathBuf,
@@ -225,6 +246,21 @@ struct State {
     #[serde(default)]
     staged: Option<Identity>,
     rejected_build: u64,
+    /// Whether [`Self::rejected_build`] was rolled back after its starts spent the trial's
+    /// budget ([`rolls_back_unstarted`]), and not by `aterm update rollback` of a build
+    /// that ran: the check loop tells the window of a crash loop's rollback, never of a
+    /// person's own (`crate::linux_notice::InstallWatch`). Absent in an older build's
+    /// record, which reads as a person's.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    rejected_unstarted: bool,
+    /// The build whose trial ended at a crash loop no rollback could answer
+    /// ([`rollback_refusal`], at the start past the budget in [`count_start_locked`]): it
+    /// stays installed though no start of it finished. Only while it is still the installed
+    /// build does the status say so (`crate::LinuxUpdateStatus::kept_unproven`), and the
+    /// check loop tells the window when it sees the trial end so
+    /// (`crate::linux_notice::InstallWatch`). Absent in an older build's record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kept_unproven: Option<u64>,
     outcome: String,
     updated_at: String,
     failing_checks: u32,
@@ -309,27 +345,8 @@ impl Context {
         // Walk from the root down. An owner-only ancestor excludes every other user from
         // descendant traversal, so a 0775 lib below ~/.local (0700) is safe. A writable
         // ancestor above that boundary (including /tmp) can rename the boundary itself and
-        // is always refused.
-        let mut private_ancestor = false;
-        for ancestor in parent.ancestors().collect::<Vec<_>>().into_iter().rev() {
-            let md = fs::symlink_metadata(ancestor).map_err(|e| e.to_string())?;
-            if !md.is_dir()
-                || ![0, uid()].contains(&md.uid())
-                || (!private_ancestor && md.mode() & 0o022 != 0)
-            {
-                let why = if md.file_type().is_symlink() {
-                    "is a symlink"
-                } else if !md.is_dir() {
-                    "isn\u{2019}t a directory"
-                } else if ![0, uid()].contains(&md.uid()) {
-                    "belongs to another user"
-                } else {
-                    "is writable by other users"
-                };
-                return Err(format!("{} {why}", ancestor.display()));
-            }
-            private_ancestor |= md.uid() == uid() && md.mode() & 0o077 == 0;
-        }
+        // is always refused, unless only this user's private group can write it.
+        ancestry::refusal(parent)?;
         let md = fs::symlink_metadata(parent).map_err(|e| e.to_string())?;
         if md.uid() != uid() || md.mode() & 0o200 == 0 {
             return Err("the executable directory is not owned and writable by this user".into());
@@ -533,7 +550,14 @@ fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
 }
 
 fn sync_dir(path: &Path) -> Result<(), String> {
-    crate::durable::sync_dir(path).map_err(|e| format!("sync {}: {e}", path.display()))
+    crate::durable::sync_dir(path, aterm_durable::Flush::Durable)
+        .map_err(|e| format!("sync {}: {e}", path.display()))
+}
+
+/// [`sync_dir`], only ordered ([`aterm_durable::ordered_dir`]). On Linux, where this lane
+/// runs, that is the same full `fsync(2)`, so each caller names only what it needs.
+fn ordered_dir(path: &Path) -> Result<(), String> {
+    aterm_durable::ordered_dir(path).map_err(|e| format!("sync {}: {e}", path.display()))
 }
 
 fn fresh_file(parent: &Path, stem: &str) -> Result<(PathBuf, File), String> {
@@ -806,6 +830,8 @@ fn initial_state(context: &Context, installed: Identity) -> State {
         trial: None,
         staged: None,
         rejected_build: 0,
+        rejected_unstarted: false,
+        kept_unproven: None,
         outcome: String::new(),
         updated_at: String::new(),
         failing_checks: 0,
@@ -905,7 +931,8 @@ fn install_locked(
         }
         file.set_permissions(fs::Permissions::from_mode(0o755))
             .map_err(|e| e.to_string())?;
-        crate::durable::sync_all(&file).map_err(|e| e.to_string())?;
+        // Ordered: the bytes land before the rename; a lost candidate is fetched again.
+        aterm_durable::ordered(&file).map_err(|e| e.to_string())?;
         verify_binary(&temp, &manifest, native()?).map(|_| ())
     })();
     // Linux refuses exec with ETXTBSY while any writable descriptor remains.
@@ -916,7 +943,7 @@ fn install_locked(
     }
     let candidate = context.dir.join("candidate");
     fs::rename(&temp, &candidate).map_err(|e| e.to_string())?;
-    sync_dir(&context.dir)?;
+    ordered_dir(&context.dir)?;
     proof.save(&context.dir)?;
     if exists && state.installed.sha256 != hash_file(&context.target)? {
         return Err("bootstrap rollback baseline changed; refusing replacement".into());
@@ -1000,7 +1027,8 @@ impl Proof {
                     Err(error) => return Err(error.to_string()),
                 }
             }
-            sync_dir(dir)?;
+            // Ordered: `Proof::read` refuses half a pair, and the next check rewrites it.
+            ordered_dir(dir)?;
         }
         Ok(())
     }
@@ -1165,6 +1193,8 @@ pub fn enable(current_build: u64, proof_dir: Option<&Path>) -> Result<String, St
         trial: None,
         staged: None,
         rejected_build: 0,
+        rejected_unstarted: false,
+        kept_unproven: None,
         outcome: String::new(),
         updated_at: String::new(),
         failing_checks: 0,
@@ -1248,6 +1278,7 @@ fn recover(context: &Context, state: &mut State) -> Result<(), String> {
         Phase::RollbackPrepared if digest == trial.old.sha256 => {
             state.installed = trial.old.clone();
             state.rejected_build = state.rejected_build.max(trial.new.build);
+            state.rejected_unstarted = rolls_back_unstarted(trial);
             state.trial = None;
             context.save(state)
         }
@@ -1359,13 +1390,16 @@ fn apply_with_checkpoints(
     if hash_file(&backup)? != old.sha256 {
         return Err("rollback copy does not match the installed identity".into());
     }
-    crate::durable::sync_all(&checked_file(&backup, BINARY_LIMIT, true)?)
+    // Ordered: the rollback link lands before the replacing rename, and `recover`
+    // covers each checkpoint.
+    aterm_durable::ordered(&checked_file(&backup, BINARY_LIMIT, true)?)
         .map_err(|e| e.to_string())?;
-    sync_dir(&context.dir)?;
+    ordered_dir(&context.dir)?;
     checkpoint(Checkpoint::Backup)?;
     fs::set_permissions(&candidate, fs::Permissions::from_mode(0o755))
         .map_err(|e| e.to_string())?;
-    crate::durable::sync_all(&checked_file(&candidate, BINARY_LIMIT, true)?)
+    // Ordered: the candidate's bytes land before the Prepared intent and the rename.
+    aterm_durable::ordered(&checked_file(&candidate, BINARY_LIMIT, true)?)
         .map_err(|e| e.to_string())?;
     // The trial this intent displaces is kept with it, and put back if the
     // replacement is abandoned before its rename ([`Trial::displaced`]).
@@ -1390,7 +1424,8 @@ fn apply_with_checkpoints(
     // complete new executable. Running processes keep their old inode and PTYs.
     fs::rename(&candidate, &context.target)
         .map_err(|e| format!("replace Linux executable: {e}"))?;
-    sync_dir(
+    // Ordered: `recover` handles the Replaced state a lost rename leaves.
+    ordered_dir(
         context
             .target
             .parent()
@@ -1444,7 +1479,8 @@ fn rollback_with_checkpoint(
         std::io::copy(&mut previous, file).map_err(|e| e.to_string())?;
         file.set_permissions(fs::Permissions::from_mode(0o755))
             .map_err(|e| e.to_string())?;
-        crate::durable::sync_all(file).map_err(|e| e.to_string())?;
+        // Ordered: the restored bytes land before the rename into place.
+        aterm_durable::ordered(file).map_err(|e| e.to_string())?;
         if hash_file(temp)? != trial.old.sha256 {
             return Err("rollback copy changed".into());
         }
@@ -1458,7 +1494,8 @@ fn rollback_with_checkpoint(
     context.save(state)?;
     fs::rename(&temp, &context.target).map_err(|e| e.to_string())?;
     after_replace(&context.target)?;
-    sync_dir(
+    // Ordered: RollbackPrepared was saved first, and `recover` finishes a lost rename.
+    ordered_dir(
         context
             .target
             .parent()
@@ -1469,12 +1506,22 @@ fn rollback_with_checkpoint(
         restored_name(&trial.old),
         trial.new.version
     );
+    state.rejected_unstarted = rolls_back_unstarted(&trial);
     state.installed = trial.old;
     state.rejected_build = state.rejected_build.max(trial.new.build);
     state.trial = None;
     context.save(state)?;
     prune_backups(context, state);
     Ok(())
+}
+
+/// Whether rolling `trial` back ends a crash loop: its starts spent the budget without
+/// proving it ([`crate::linux_trial::start_rolls_back`]'s count, the only one the start
+/// lane rolls back at, [`count_start_locked`]). A person's `aterm update rollback` of a
+/// build that ran is none; one taken while the budget is spent is, since that build
+/// didn't start properly whoever pulled it back.
+fn rolls_back_unstarted(trial: &Trial) -> bool {
+    trial.starts > MAX_TRIAL_STARTS
 }
 
 /// Why `trial` can never be rolled back, or `None` when nothing rules it out: the build it
@@ -2008,6 +2055,7 @@ fn count_start_locked(
         // No rollback can ever be taken, so the trial is over: the build stays, and
         // checks and applies go on so a newer release can replace it.
         state.trial = None;
+        state.kept_unproven = Some(trial.new.build);
         state.outcome = format!(
             "aterm {new} didn\u{2019}t start properly in {MAX_TRIAL_STARTS} launches, but \
              {restored} can\u{2019}t come back ({refusal}), so aterm {new} stays until a newer \
@@ -2390,7 +2438,8 @@ fn check_locked(
         }
         clear_stage(context, state)?;
         fs::rename(&temp, context.dir.join("candidate")).map_err(|e| e.to_string())?;
-        sync_dir(&context.dir)?;
+        // Ordered: a lost candidate is downloaded again.
+        ordered_dir(&context.dir)?;
     }
     // Even a byte-identical existing stage receives current proof and policy;
     // finish_candidate repeats authorization, digest and compiled-identity checks.
@@ -2778,6 +2827,8 @@ fn linux_status(context: &Context, state: &State) -> crate::LinuxUpdateStatus {
         trial_starts: state.trial.as_ref().map_or(0, |trial| trial.starts),
         trial_healthy: state.trial.as_ref().is_some_and(|trial| trial.healthy),
         refused_newer: state.rejected_build > state.installed.build,
+        refused_unstarted: state.rejected_build > state.installed.build && state.rejected_unstarted,
+        kept_unproven: state.kept_unproven == Some(state.installed.build),
     }
 }
 
@@ -2842,17 +2893,11 @@ pub(crate) fn spawn_background_check_with_settings(
             loop {
                 let (status, record, took_lock) = check_recording(current_build, &provider, false);
                 reporter.report(
-                    crate::linux_notice::Pass {
-                        outcome: &status.outcome,
-                        failing_checks: status.failing_checks,
-                        updated_at: &status.updated_at,
-                        record,
-                        took_lock,
-                    },
+                    crate::linux_notice::Pass::of(&status, record, took_lock),
                     on_checked.as_ref(),
                     notify.as_ref(),
                 );
-                std::thread::sleep(Duration::from_secs(60));
+                std::thread::sleep(Duration::from_secs(crate::linux_notice::PASS_SECS));
             }
         });
 }

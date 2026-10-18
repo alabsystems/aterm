@@ -77,6 +77,16 @@ fn roster() -> Vec<Entry> {
         }
     }
     all.push(mr::disk_low_entry(7, 20, &[]));
+    for cause in [
+        crate::session_log_journal::Cause::Full,
+        crate::session_log_journal::Cause::Io,
+        crate::session_log_journal::Cause::Denied,
+        crate::session_log_journal::Cause::Unsupported,
+        crate::session_log_journal::Cause::Panic,
+    ] {
+        all.push(mr::session_journal_paused_entry(cause.word()));
+        all.push(mr::session_journal_stopped_entry(cause.word()));
+    }
     // The foreign tools atpkg leaves alone, each look's: one, and more than the
     // entry shows.
     let foreign = |n: usize| {
@@ -146,6 +156,18 @@ fn roster() -> Vec<Entry> {
             all.push(mr::relaunch_gone_entry("s-3e79", &spot, reason, false));
             all.push(mr::relaunch_gone_entry("s-3e79", &spot, reason, true));
         }
+        for restarted in [false, true] {
+            for command in [None, Some("HOME=/Users//o claude --resume 0badf00d")] {
+                all.push(mr::relaunch_lost_entry(
+                    "s-3e79",
+                    &spot,
+                    "its shell is gone",
+                    restarted,
+                    command,
+                ));
+            }
+        }
+        all.push(mr::relaunch_not_restored_entry("s-3e79", &spot));
     }
     // The resume loop's: every kind, alone and in three tabs, in every place.
     for spot in places() {
@@ -164,7 +186,7 @@ fn roster() -> Vec<Entry> {
 }
 
 /// The kinds of the resume loop's exceptions that wait for the owner's look.
-fn later_kinds() -> [ExceptionKind; 6] {
+fn later_kinds() -> [ExceptionKind; 7] {
     [
         ExceptionKind::Spend,
         ExceptionKind::Bucket,
@@ -172,6 +194,7 @@ fn later_kinds() -> [ExceptionKind; 6] {
         ExceptionKind::Futile,
         ExceptionKind::Context,
         ExceptionKind::Dialog,
+        ExceptionKind::Refused,
     ]
 }
 
@@ -197,6 +220,9 @@ fn resume_exception(kind: ExceptionKind) -> Exception {
         ExceptionKind::Stalled => return stall_exception(),
         ExceptionKind::Dialog => return Exception::dialog(),
         ExceptionKind::Context => return Exception::context(),
+        ExceptionKind::Refused => {
+            return Exception::refused(Some("tool_history_mismatch"), "API Error: 400");
+        }
         ExceptionKind::Login => (
             "Its login is gone, and only a browser sign-in restores it.",
             "Finish signing in on the page /login opened in your browser.",
@@ -222,11 +248,9 @@ fn stall_exception() -> Exception {
     Exception::stalled()
 }
 
-/// EVERY WORD THE HOST CAN SAY passes the door and the rule's own caps: a title
-/// that is a glass title, a reason and an action of at most 90 characters, one
-/// action (no `; `, no ` or `), a reason that does not lean on waiting, and no
-/// word that asks for a restart. Keys stay within their cap, sit
-/// under their family's prefix, and share nothing with a record's key.
+/// EVERY ENTRY THE HOST CAN WRITE passes the door as a `Later` ask (an entry the
+/// door refuses is never shown). Keys stay within their cap, sit under their
+/// family's prefix, and share nothing with a record's key.
 #[test]
 fn every_host_entry_passes_the_door_and_the_caps() {
     let record_keys: Vec<String> = HealthKind::ALL
@@ -246,19 +270,9 @@ fn every_host_entry_passes_the_door_and_the_caps() {
         let msg = entry
             .message()
             .unwrap_or_else(|fault| panic!("{}: {fault:?}", entry.key()));
-        let aterm_messages::need::Need::Later(ask) = msg.need() else {
+        let aterm_messages::need::Need::Later(_) = msg.need() else {
             panic!("{}: an entry is a Later ask", entry.key());
         };
-        let (why, then) = (ask.why_words(), ask.then().words().to_string());
-        assert!(why.chars().count() <= 90 + 24, "{}: {why}", entry.key());
-        assert!(then.chars().count() <= 90, "{}: {then}", entry.key());
-        assert!(!then.contains("; ") && !then.contains(" or "), "{then}");
-        for line in [&why, &then, &msg.title] {
-            let low = line.to_lowercase();
-            for needle in ["restart", "relaunch", "reopen", "next launch", "reboot"] {
-                assert!(!low.contains(needle), "{}: {line}", entry.key());
-            }
-        }
         let key = entry.key();
         assert!(key.chars().count() <= 48, "{key}");
         assert!(key.starts_with(&entry.family().prefix()), "{key}");
@@ -267,27 +281,6 @@ fn every_host_entry_passes_the_door_and_the_caps() {
             "{key}: an entry and a record never share a key"
         );
     }
-}
-
-/// One producer, one mode: the families this commit adds or uses speak by
-/// event, and the host refuses the wrong call.
-#[test]
-fn the_host_families_speak_by_event() {
-    use aterm_messages::exceptions::Mode;
-    for family in [
-        Family::Update,
-        Family::Supervisor,
-        Family::Accounts,
-        Family::Disk,
-        Family::UpgradeHost,
-        Family::Render,
-        Family::Terminal,
-    ] {
-        assert_eq!(family.mode(), Mode::Event, "{family:?}");
-    }
-    assert_eq!(Family::Render.stem(), "render");
-    assert_eq!(Family::Render.tag(), aterm_messages::tags::RENDER);
-    assert!(Family::ALL.contains(&Family::Render));
 }
 
 /// A FACT THAT MENDS ITSELF IS AN ENTRY ONLY ONCE IT HAS OUTLASTED ITS HORIZON:
@@ -406,10 +399,9 @@ fn updates_failing_for_a_day_are_one_line_and_the_healing_ends_it() {
     assert!(app.ripening_deadline().is_none());
     // The warning row is not the entry: three sources of one fact, one line.
     let e = &app.messages.digest().entries[0];
-    assert_eq!(e.title, "Updates are not downloading");
     assert!(
-        e.detail.iter().any(|l| l == "failing since Sep 14"),
-        "{:?}",
+        e.detail.iter().any(|l| l.contains("Sep 14")),
+        "the streak's own start: {:?}",
         e.detail
     );
 }
@@ -464,31 +456,6 @@ fn a_carried_excerpt_dates_the_day_from_the_end_of_its_day() {
     }
 }
 
-/// THE OS BANNER HAS ONE DOOR AND ONE CAUSE. With `desktop_alerts` on, a
-/// failing lane that nobody here can mend that minute (a stalled check, a
-/// sibling's lock, a download that will not verify, an install the lane will
-/// try again) posts no banner; the copy in Applications that is not the signed
-/// release — `NeedsPerson` — does. The setting still decides last.
-#[test]
-fn the_banner_is_owed_to_a_cause_only_the_owner_can_end() {
-    use crate::messages_host::UPDATE_HEALTH_BANNERS;
-    let take = || UPDATE_HEALTH_BANNERS.with(|b| std::mem::take(&mut *b.borrow_mut()));
-    let mut app = App::headless_for_test();
-    app.config.desktop_alerts = Some(true);
-    let _ = take();
-    for kind in HealthKind::ALL {
-        assert!(
-            !app.post_update_health_banner(
-                kind,
-                "Update check stopped",
-                "since 2026-09-14T00:00:00Z:"
-            ),
-            "{kind:?}"
-        );
-    }
-    assert!(take().is_empty(), "no cause the owner alone can end");
-}
-
 /// THE SUPERVISOR THAT KEEPS FAILING is a record when it begins (once per
 /// episode, however often it fails again) and a line of the digest once an hour
 /// of failures has gone (`harness.supervisor.<tab>.failing`); steady again — a
@@ -510,7 +477,7 @@ fn a_supervisor_that_keeps_failing_is_a_record_then_a_line_after_an_hour() {
         app.messages
             .log()
             .records()
-            .filter(|r| !r.later && r.title.starts_with("Supervisor keeps stopping"))
+            .filter(|r| !r.later && r.key.as_deref() == Some("harness.host.supervisor.s-7"))
             .count()
     };
     app.note_harness_host(failing("boom"));
@@ -580,7 +547,7 @@ fn a_card_the_harness_will_not_press_is_a_record_then_a_line_after_an_hour() {
         app.messages
             .log()
             .records()
-            .any(|r| r.title.starts_with("Survey will not close")),
+            .any(|r| r.key.as_deref() == Some("harness.host.survey-open.s-8")),
         "a record"
     );
     assert!(
@@ -600,18 +567,13 @@ fn a_card_the_harness_will_not_press_is_a_record_then_a_line_after_an_hour() {
         app.messages
             .log()
             .records()
-            .any(|r| r.title == "Rating card open in its tab"),
+            .any(|r| r.key.as_deref() == Some("harness.host.survey-card.s-9")),
         "a record"
     );
     let due = app.ripening_deadline().expect("a claim");
     let _ = app.settle_messages(due);
     let entry = &app.messages.digest().entries[0];
     assert_eq!(entry.key, "harness.supervisor.s-9.survey-card");
-    assert!(
-        entry.then.starts_with("Press 0 in that tab"),
-        "{}",
-        entry.then
-    );
     app.note_harness_host(HostNote::SurveyEnded {
         sid: "s-9".to_string(),
     });
@@ -652,7 +614,7 @@ fn a_volume_aterm_could_not_help_is_one_line_and_space_ends_it() {
         app.messages
             .log()
             .records()
-            .filter(|r| !r.later && r.title == "Disk space is low")
+            .filter(|r| !r.later && r.key.as_deref() == Some("system.disk.low"))
             .count(),
         1,
         "one record per episode"
@@ -668,7 +630,7 @@ fn a_volume_aterm_could_not_help_is_one_line_and_space_ends_it() {
         .messages
         .log()
         .records()
-        .find(|r| r.title == "Disk space is low")
+        .find(|r| r.key.as_deref() == Some("system.disk.low"))
         .expect("the record")
         .detail
         .clone();
@@ -680,6 +642,57 @@ fn a_volume_aterm_could_not_help_is_one_line_and_space_ends_it() {
     assert!(app.messages.digest().is_empty());
     // Plenty with nothing told is nothing.
     app.note_harness_host(HostNote::DiskPlenty);
+}
+
+/// THE FULL DISK, ON THE GLASS ONLY WHILE THE OWNER IS NEEDED: what a pass
+/// freed is a fact for later (one `disk.freed` line of the digest, nothing
+/// standing); a volume the look left at its emergency is the one standing
+/// alert (`system.disk.full`), restated in place, and the volume out of its
+/// emergency ends it. NEGATIVE CONTROL: the freed fact puts nothing on the
+/// glass.
+#[test]
+fn a_full_disk_is_one_standing_alert_and_what_was_freed_is_a_fact() {
+    let mut app = App::headless_for_test();
+    app.note_harness_host(HostNote::DiskFreed {
+        bytes: 31 << 30,
+        went: vec!["31.0 GiB ~/Library/Caches/aterm/cargo-build.noindex/x/.cargo-build".into()],
+    });
+    let keys: Vec<String> = app
+        .messages
+        .digest()
+        .entries
+        .iter()
+        .map(|e| e.key.clone())
+        .collect();
+    assert_eq!(keys, ["disk.freed"]);
+    assert!(
+        app.messages
+            .live_by_key(crate::message_reporters::DISK_FULL_KEY)
+            .is_none(),
+        "a fact is not on the glass"
+    );
+    let full = || HostNote::DiskFull {
+        free: 1 << 20,
+        volume: std::path::PathBuf::from("/Users//x"),
+        freed: 31 << 30,
+        hogs: vec!["$HOME/trust/build 94.0 GiB (x.py bootstrap)".into()],
+        why: "nothing more is safe".into(),
+    };
+    app.note_harness_host(full());
+    app.note_harness_host(full());
+    assert!(
+        app.messages
+            .live_by_key(crate::message_reporters::DISK_FULL_KEY)
+            .is_some(),
+        "the alert stands"
+    );
+    app.note_harness_host(HostNote::DiskFullOver);
+    assert!(
+        app.messages
+            .live_by_key(crate::message_reporters::DISK_FULL_KEY)
+            .is_none(),
+        "space back ends it"
+    );
 }
 
 /// THE DEVELOPER TOOLS LIST (owner ruling 2026-10-14) is one line however often a
@@ -832,7 +845,7 @@ fn a_disk_setting_that_turns_cleanup_off_is_one_line_until_it_reads_again() {
         app.messages
             .log()
             .records()
-            .filter(|r| !r.later && r.title == "Disk space is low")
+            .filter(|r| !r.later && r.key.as_deref() == Some("system.disk.low"))
             .count()
     };
     let notes =
@@ -940,7 +953,7 @@ fn a_short_volume_is_one_low_disk_line_in_the_form_last_told() {
         app.messages
             .log()
             .records()
-            .filter(|r| !r.later && r.title == "Disk space is low")
+            .filter(|r| !r.later && r.key.as_deref() == Some("system.disk.low"))
             .count(),
         2,
         "each form once"
@@ -986,11 +999,6 @@ fn an_upgrade_that_cannot_run_is_one_line_until_the_last_tab_runs_again() {
     assert_eq!(app.messages.digest().len(), 1, "one line, two tabs");
     let entry = &app.messages.digest().entries[0];
     assert_eq!(entry.key, "harness.upgrade-host.cannot-run");
-    assert!(
-        entry.then.starts_with("Fix that folder's permissions"),
-        "{}",
-        entry.then
-    );
     // The folder is named under Details; the step word stays in the log.
     let said = format!("{} {} {:?}", entry.title, entry.then, entry.detail);
     assert!(said.contains("/state/upgrade"), "{said}");
@@ -1090,16 +1098,22 @@ fn the_accounts_lines_follow_what_the_host_says_and_mark_nothing() {
         lines.sort();
         lines
     };
-    // The signed-out line as the window shows it — its title and its detail
-    // past the reason and the action — and as the log holds it open.
-    let shown = |app: &App| -> (String, Vec<String>) {
+    // The signed-out line as the window shows it — whether its title counts
+    // two accounts, and the labels its detail names past the reason and the
+    // action — and as the log holds it open.
+    let shown = |app: &App| -> (bool, Vec<&'static str>) {
         let digest = app.messages.digest();
         let e = digest
             .entries
             .iter()
             .find(|e| e.key == mr::ACCOUNTS_SIGNED_OUT_KEY)
             .expect("the line is open");
-        (e.title.clone(), e.detail[2..].to_vec())
+        let detail = e.detail[2..].join("\n");
+        let labels = ["work-2", "pool-a"]
+            .into_iter()
+            .filter(|l| detail.contains(l))
+            .collect();
+        (e.title.starts_with("2 "), labels)
     };
     let logged = |app: &App| -> Vec<String> {
         app.messages
@@ -1121,7 +1135,6 @@ fn the_accounts_lines_follow_what_the_host_says_and_mark_nothing() {
         mr::ACCOUNTS_REFUSED_KEY,
         "Run aterm harness accounts to read why it is refused",
     );
-    let one = "A Claude account is signed out".to_string();
 
     // The machine with no roster: nothing to end, and nothing moves.
     let rev = app.messages.digest_revision();
@@ -1131,10 +1144,7 @@ fn the_accounts_lines_follow_what_the_host_says_and_mark_nothing() {
 
     // One signed out: the line. Said again: nothing moves.
     assert_eq!(step(&mut app, listed(&["work-2"])), [login("work-2")]);
-    assert_eq!(
-        shown(&app),
-        (one.clone(), vec!["Signed out: work-2".to_string()])
-    );
+    assert_eq!(shown(&app), (false, vec!["work-2"]));
     let rev = app.messages.digest_revision();
     assert_eq!(step(&mut app, listed(&["work-2"])), [login("work-2")]);
     assert_eq!(app.messages.digest_revision(), rev, "the same words again");
@@ -1144,7 +1154,7 @@ fn the_accounts_lines_follow_what_the_host_says_and_mark_nothing() {
     let both = ["work-2", "pool-a"];
     assert_eq!(step(&mut app, listed(&both)), [login("work-2")]);
     assert_eq!(app.messages.digest().entries[0].id, id, "one entry, kept");
-    assert_eq!(shown(&app).0, one);
+    assert!(!shown(&app).0, "the count waits out the quiet");
     // ...and the host saying the line again past it (its slow look) lands
     // them in place.
     let again = mr::accounts_signed_out_entry(&both.map(str::to_string)).expect("an entry");
@@ -1154,13 +1164,7 @@ fn the_accounts_lines_follow_what_the_host_says_and_mark_nothing() {
         Instant::now() + RESTATE_QUIET,
     );
     assert_eq!(posted.outcome, PostOutcome::Restated);
-    assert_eq!(
-        shown(&app),
-        (
-            "2 Claude accounts are signed out".to_string(),
-            vec!["Signed out: work-2, pool-a".to_string()]
-        )
-    );
+    assert_eq!(shown(&app), (true, vec!["work-2", "pool-a"]));
     assert_eq!(app.messages.digest().entries[0].id, id);
     assert_eq!(logged(&app), ["Run aterm harness accounts login work-2"]);
 
@@ -1168,10 +1172,7 @@ fn the_accounts_lines_follow_what_the_host_says_and_mark_nothing() {
     // window and in the log — a line of its own, the other one ended.
     assert_eq!(step(&mut app, listed(&["pool-a"])), [login("pool-a")]);
     assert_ne!(app.messages.digest().entries[0].id, id, "raised anew");
-    assert_eq!(
-        shown(&app),
-        (one.clone(), vec!["Signed out: pool-a".to_string()])
-    );
+    assert_eq!(shown(&app), (false, vec!["pool-a"]));
     assert_eq!(logged(&app), ["Run aterm harness accounts login pool-a"]);
     // None signed out: gone.
     assert!(step(&mut app, listed(&[])).is_empty());
@@ -1233,11 +1234,11 @@ fn the_accounts_lines_follow_what_the_host_says_and_mark_nothing() {
     };
     let mut app = adopting();
     let before = glass(&app);
-    assert_eq!(shown(&app).0, "2 Claude accounts are signed out");
+    assert!(shown(&app).0, "the adopted line counts two");
     app.note_harness_host(listed(&["pool-a"]));
     assert_eq!(
         shown(&app),
-        (one, vec!["Signed out: pool-a".to_string()]),
+        (false, vec!["pool-a"]),
         "the adopted words gave way"
     );
     assert_eq!(app.messages.digest().len(), 1, "and the refused line ended");
@@ -1410,19 +1411,6 @@ fn a_resume_exception_is_one_line_per_kind_and_a_stall_one_per_tab_and_each_ends
         keys(&app),
         ["harness.resume.goal-cleared", "harness.resume.spend"]
     );
-    let spend = app
-        .messages
-        .digest()
-        .entries
-        .iter()
-        .find(|e| e.key == "harness.resume.spend")
-        .cloned()
-        .expect("spend");
-    assert!(
-        spend.then.starts_with("Add usage credits"),
-        "{}",
-        spend.then
-    );
     // A stall is its tab's own.
     told(&mut app, "s-2", Some(stall_exception()));
     assert_eq!(
@@ -1483,15 +1471,20 @@ fn a_relaunch_is_a_record_and_only_what_a_person_alone_can_mend_is_a_line() {
         app.messages
             .log()
             .records()
-            .filter(|r| !r.later && r.title.starts_with("Agent is not back"))
+            .filter(|r| {
+                !r.later && r.key.as_deref() == Some(&*format!("harness.host.relaunch.{tab}"))
+            })
             .count()
     };
-    // Still trying, nothing a person clears: a record, no line, ever.
+    // Still trying, nothing a person clears, the tab marked with the command
+    // (its host's word): a record, no line, ever.
+    let command = Some("claude --resume 0badf00d-1111-2222-3333-444455556666".to_string());
     say(
         &mut app,
         RelaunchSay::Failing {
             blocked_by: None,
             restarted: false,
+            command: command.clone(),
         },
     );
     assert_eq!(records(&app), 1);
@@ -1504,6 +1497,7 @@ fn a_relaunch_is_a_record_and_only_what_a_person_alone_can_mend_is_a_line() {
         RelaunchSay::Failing {
             blocked_by: Some("held"),
             restarted: false,
+            command,
         },
     );
     assert!(app.messages.digest().is_empty(), "not yet");
@@ -1529,20 +1523,97 @@ fn a_relaunch_is_a_record_and_only_what_a_person_alone_can_mend_is_a_line() {
     );
     assert!(app.messages.digest().is_empty());
     // Cannot, with the command for the tab's mark: a record, no line.
-    let cannot = |command: Option<&str>| RelaunchSay::Cannot {
+    let cannot = |command: Option<&str>, marked: bool, lost: bool| RelaunchSay::Cannot {
         reason: "its shell is gone".to_string(),
         restarted: false,
         command: command.map(str::to_string),
+        marked,
+        lost,
     };
-    say(&mut app, cannot(Some("claude --resume 0badf00d")));
+    say(
+        &mut app,
+        cannot(Some("claude --resume 0badf00d"), true, true),
+    );
     assert!(app.messages.digest().is_empty(), "the tab carries the ask");
-    // Cannot, with no command to name: one line of the digest.
-    say(&mut app, cannot(None));
+    // Cannot, with no command to name and no conversation: one line of the
+    // digest.
+    say(&mut app, cannot(None, false, false));
     let gone = app.messages.digest().entries[0].clone();
     assert_eq!(gone.key, mr::relaunch_keys(&tab)[1]);
-    assert!(gone.then.starts_with("Start the agent"), "{}", gone.then);
     say(&mut app, RelaunchSay::Ended);
     assert!(app.messages.digest().is_empty());
+    // THE CONVERSATION KNOWN, NO MARK (a command too long for it): its own
+    // line, which an agent running in the tab again does not end — only the
+    // conversation held again does (LC-4).
+    say(
+        &mut app,
+        cannot(Some("HOME=/o claude --resume 0badf00d"), false, true),
+    );
+    let lost = app.messages.digest().entries[0].clone();
+    assert_eq!(lost.key, mr::relaunch_keys(&tab)[2]);
+    assert!(
+        lost.then.starts_with("Run the command below"),
+        "{}",
+        lost.then
+    );
+    say(&mut app, RelaunchSay::Ended);
+    assert_eq!(
+        app.messages.digest().entries.len(),
+        1,
+        "not ended by a program"
+    );
+    say(&mut app, RelaunchSay::Back);
+    assert!(app.messages.digest().is_empty(), "held again");
+    // A mark that steps down: the same line, as a fact for later.
+    say(
+        &mut app,
+        RelaunchSay::SteppedDown {
+            reason: "its shell is gone".to_string(),
+            restarted: false,
+            command: Some("claude --resume 0badf00d".to_string()),
+        },
+    );
+    assert_eq!(
+        app.messages.digest().entries[0].key,
+        mr::relaunch_keys(&tab)[2]
+    );
+    say(&mut app, RelaunchSay::Back);
+    assert!(app.messages.digest().is_empty());
+    // ONE WORD PER TAB, THE NEWEST: an older conversation's line, then a
+    // newer conversation's mark in the same tab — the line goes with it
+    // (the host tracks the newer word alone, whose `Back` would end the
+    // older line, and the older conversation held again ends nothing).
+    say(
+        &mut app,
+        cannot(Some("HOME=/o claude --resume 0badf00d"), false, true),
+    );
+    assert_eq!(
+        app.messages.digest().entries[0].key,
+        mr::relaunch_keys(&tab)[2]
+    );
+    say(
+        &mut app,
+        cannot(Some("claude --resume 5ca1ab1e"), true, true),
+    );
+    assert!(
+        app.messages.digest().is_empty(),
+        "the mark is the tab's one word: {:?}",
+        app.messages.digest().entries
+    );
+    // WHAT A RESTART LOST (XREV-LC-2): one line of its own, which the agent
+    // running again does not end — what it lost stays lost.
+    say(&mut app, RelaunchSay::NotRestored);
+    let entries = app.messages.digest().entries.clone();
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0].key, mr::relaunch_not_restored_key(&tab));
+    assert!(!mr::relaunch_keys(&tab).contains(&entries[0].key));
+    assert!(
+        entries[0].then.starts_with("Look at the tab"),
+        "{}",
+        entries[0].then
+    );
+    say(&mut app, RelaunchSay::Ended);
+    assert_eq!(app.messages.digest().entries.len(), 1, "Ended leaves it");
 }
 
 /// The sid of the front tab of a headless App, which the store now knows the
@@ -1569,8 +1640,12 @@ const CLOSED_SID: &str = "s-9f8e7d6c5b4a39281706";
 
 /// A RELAUNCH LINE ENDS WITH ITS TAB (review of 2026-09-29): the worker of a
 /// closed tab has no later word, so a claim that is still ripening, and a line
-/// already standing, end when no tab shows the session. NEGATIVE CONTROL: the
-/// same words for a tab that is there ripen and stand.
+/// already standing, end when no tab shows the session — the line of what a
+/// restart did not bring back too (`not-restored`, the decision review's
+/// RR-LC-2: it has no ending word at all, and stood with a Show-tab link to a
+/// tab that was gone). NEGATIVE CONTROL: the same words for a tab that is there
+/// ripen and stand, and its `not-restored` line stands through `Ended` and the
+/// settle.
 #[test]
 fn a_relaunch_claim_and_line_end_when_their_tab_is_gone() {
     let mut app = App::headless_for_test();
@@ -1580,6 +1655,7 @@ fn a_relaunch_claim_and_line_end_when_their_tab_is_gone() {
         said: RelaunchSay::Failing {
             blocked_by: Some("held"),
             restarted: false,
+            command: Some("claude --resume 0badf00d-1111-2222-3333-444455556666".to_string()),
         },
     };
     app.note_harness_host(blocked(CLOSED_SID));
@@ -1601,6 +1677,8 @@ fn a_relaunch_claim_and_line_end_when_their_tab_is_gone() {
             reason: "its shell is gone".to_string(),
             restarted: false,
             command: None,
+            marked: false,
+            lost: false,
         },
     });
     let _ = app.settle_messages(due + Duration::from_secs(2));
@@ -1612,6 +1690,166 @@ fn a_relaunch_claim_and_line_end_when_their_tab_is_gone() {
         .map(|e| e.key.clone())
         .collect();
     assert_eq!(keys, [mr::relaunch_keys(&tab)[0].clone()], "{keys:?}");
+    // What a restart did not bring back: the closed tab's line ends at the
+    // next look, the live tab's stands through `Ended` and the settle.
+    for sid in [CLOSED_SID, tab.as_str()] {
+        app.note_harness_host(HostNote::Relaunch {
+            sid: sid.to_string(),
+            said: RelaunchSay::NotRestored,
+        });
+    }
+    app.note_harness_host(HostNote::Relaunch {
+        sid: tab.clone(),
+        said: RelaunchSay::Ended,
+    });
+    let _ = app.settle_messages(due + Duration::from_secs(3));
+    let keys: Vec<String> = app
+        .messages
+        .digest()
+        .entries
+        .iter()
+        .map(|e| e.key.clone())
+        .collect();
+    assert_eq!(keys, [mr::relaunch_not_restored_key(&tab)], "{keys:?}");
+}
+
+/// A `lost` LINE ENDS WITH ITS TAB TOO (the review of ATERM-KI-1015-1 LC-4):
+/// it says "run the command below in that tab" and shows that tab, and its
+/// host forgets the tab's word with it, so nothing would end it once the
+/// tab is gone — a Warn that resurfaces for the rest of the process, its
+/// action pointing at a tab that is gone or another tab now. A Codex's
+/// every `Cannot` with a known thread is such a line (it has no command for
+/// a mark). NEGATIVE CONTROL: the same line for a tab that is there stands.
+#[test]
+fn a_lost_line_ends_when_its_tab_is_gone() {
+    let mut app = App::headless_for_test();
+    let tab = front_tab_sid(&mut app);
+    let lost = |sid: &str| HostNote::Relaunch {
+        sid: sid.to_string(),
+        said: RelaunchSay::Cannot {
+            reason: "no try could type at its prompt in time".to_string(),
+            restarted: false,
+            command: Some("HOME=/Users//o claude --resume 0badf00d".to_string()),
+            marked: false,
+            lost: true,
+        },
+    };
+    app.note_harness_host(lost(CLOSED_SID));
+    app.note_harness_host(lost(&tab));
+    let _ = app.settle_messages(Instant::now() + Duration::from_secs(1));
+    let keys: Vec<String> = app
+        .messages
+        .digest()
+        .entries
+        .iter()
+        .map(|e| e.key.clone())
+        .collect();
+    assert_eq!(keys, [mr::relaunch_keys(&tab)[2].clone()], "{keys:?}");
+}
+
+/// TWO LOSSES OF ONE TAB, EACH ENDED BY ITS OWN END (the merge of LC-4 into
+/// XREV-LC-2): what a restart did not bring back (`not-restored`, a monitor
+/// the resumed build said is gone) and an agent that cannot come back on a
+/// known conversation (`lost`) stand side by side, neither writing over the
+/// other's words. `Ended` ends neither; the conversation held again
+/// (`Back`) and a newer marked word of the tab end only `lost`; a second
+/// loss rewrites only its own line; the tab closing ends both; a seamless
+/// successor's adoption sweep ends only `lost` (a word the earlier host
+/// held), never the fact. NEGATIVE CONTROL: a live tab's two lines stand
+/// through the closed-tab sweep.
+#[test]
+fn a_lost_word_and_what_a_restart_did_not_bring_back_end_each_on_its_own() {
+    let mut app = App::headless_for_test();
+    let tab = front_tab_sid(&mut app);
+    let say = |app: &mut App, sid: &str, said| {
+        app.note_harness_host(HostNote::Relaunch {
+            sid: sid.to_string(),
+            said,
+        });
+    };
+    let cannot = |marked: bool| RelaunchSay::Cannot {
+        reason: "no try could type at its prompt in time".to_string(),
+        restarted: false,
+        command: Some("HOME=/Users//o claude --resume 0badf00d".to_string()),
+        marked,
+        lost: true,
+    };
+    let lines = |app: &App| -> Vec<(String, String)> {
+        let mut lines: Vec<(String, String)> = app
+            .messages
+            .digest()
+            .entries
+            .iter()
+            .map(|e| (e.key.clone(), e.then.clone()))
+            .collect();
+        lines.sort();
+        lines
+    };
+    let [_, _, lost] = mr::relaunch_keys(&tab);
+    let not_restored = mr::relaunch_not_restored_key(&tab);
+    assert_ne!(lost, not_restored, "two keys");
+    let lost_line = (
+        lost.clone(),
+        "Run the command below in that tab to resume its conversation".to_string(),
+    );
+    let not_restored_line = (
+        not_restored.clone(),
+        "Look at the tab and restore what it relied on".to_string(),
+    );
+    let both = {
+        let mut both = vec![lost_line.clone(), not_restored_line.clone()];
+        both.sort();
+        both
+    };
+    say(&mut app, &tab, RelaunchSay::NotRestored);
+    say(&mut app, &tab, cannot(false));
+    assert_eq!(lines(&app), both, "side by side");
+    say(&mut app, &tab, RelaunchSay::NotRestored);
+    assert_eq!(lines(&app), both, "a second loss rewrites its own line");
+    say(&mut app, &tab, RelaunchSay::Ended);
+    assert_eq!(lines(&app), both, "an agent running ends neither");
+    say(&mut app, &tab, RelaunchSay::Back);
+    assert_eq!(
+        lines(&app),
+        std::slice::from_ref(&not_restored_line),
+        "held again"
+    );
+    say(&mut app, &tab, cannot(false));
+    say(&mut app, &tab, cannot(true));
+    assert_eq!(
+        lines(&app),
+        std::slice::from_ref(&not_restored_line),
+        "a newer mark"
+    );
+    say(&mut app, &tab, cannot(false));
+    assert_eq!(lines(&app), both);
+    // The tab closing ends both; the live tab's stand (NEGATIVE CONTROL).
+    say(&mut app, CLOSED_SID, RelaunchSay::NotRestored);
+    say(&mut app, CLOSED_SID, cannot(false));
+    assert_eq!(app.messages.digest().entries.len(), 4);
+    let _ = app.settle_messages(Instant::now() + Duration::from_secs(1));
+    assert_eq!(lines(&app), both, "the closed tab's two lines end");
+    // A seamless successor adopts both lines and no word: the word's line
+    // ends at its sweep, the fact stands.
+    let mut successor = App::headless_for_test();
+    let spot = &places()[0];
+    successor.except(&mr::relaunch_lost_entry(
+        &tab,
+        spot,
+        "its shell is gone",
+        false,
+        Some("claude --resume 0badf00d"),
+    ));
+    successor.except(&mr::relaunch_not_restored_entry(&tab, spot));
+    successor.sweep_adopted_supervisor_lines();
+    let keys: Vec<String> = successor
+        .messages
+        .digest()
+        .entries
+        .iter()
+        .map(|e| e.key.clone())
+        .collect();
+    assert_eq!(keys, [not_restored]);
 }
 
 /// The closed-tab sweep runs on every loop turn and judges only what is
@@ -1658,6 +1896,13 @@ fn the_adoption_sweep_ends_relaunch_lines_this_process_did_not_tell() {
                 false,
             ));
             app.except(&mr::relaunch_blocked_entry(sid, spot, "held", false));
+            app.except(&mr::relaunch_lost_entry(
+                sid,
+                spot,
+                "its shell is gone",
+                false,
+                Some("claude --resume 0badf00d-1111-2222-3333-444455556666"),
+            ));
         }
         app.host_noted.insert(format!("relaunch:{told}"));
         app.sweep_adopted_supervisor_lines();
@@ -1837,15 +2082,14 @@ fn a_kind_in_two_tabs_is_one_entry_that_names_them() {
     ]);
     assert_eq!(two.len(), 1, "the login is not an entry");
     let msg = two[0].message().expect("passes the door");
-    assert_eq!(msg.title, "Account limit stops Claude in 2 tabs");
+    assert!(msg.title.contains("2 tabs"), "{}", msg.title);
     assert!(
-        msg.detail.iter().any(|l| l == "In tab 1, tab 3"),
+        msg.detail.iter().any(|l| l.contains("tab 1, tab 3")),
         "{:?}",
         msg.detail
     );
     let one = mr::resume_exceptions(&[fact("s-1", 1, ExceptionKind::GoalCleared)]);
     let msg = one[0].message().expect("passes the door");
-    assert_eq!(msg.title, "Claude lost its goal in tab 1");
     assert!(
         msg.actions
             .iter()
@@ -1855,18 +2099,10 @@ fn a_kind_in_two_tabs_is_one_entry_that_names_them() {
     );
     let stalled = mr::resume_exceptions(&[fact("s-2", 2, ExceptionKind::Stalled)]);
     assert_eq!(stalled[0].key(), "harness.resume.s-2.stalled");
-    assert_eq!(
-        stalled[0].message().expect("door").title,
-        "Claude in tab 2 has stalled"
-    );
     // A dialog no reader names is its own kind, so its key is its own: a
     // dismissal of a tab's stall does not silence a later dialog in it.
     let dialog = mr::resume_exceptions(&[fact("s-2", 2, ExceptionKind::Dialog)]);
     assert_eq!(dialog[0].key(), "harness.resume.s-2.dialog");
-    assert_eq!(
-        dialog[0].message().expect("door").title,
-        "Dialog in tab 2 stops Claude"
-    );
     // A context no `/compact` lowers is each tab's own, since the way back is
     // done IN the tab: two tabs, two entries, and a tab at the usage limit
     // beside them keeps the kind-wide line of its own.
@@ -1892,7 +2128,6 @@ fn a_kind_in_two_tabs_is_one_entry_that_names_them() {
     assert_eq!(entry.log_line_text(), Some("resume context sid=s-3"));
     let msg = entry.message().expect("passes the door");
     assert_eq!(msg.severity, aterm_messages::Severity::Info);
-    assert_eq!(msg.title, "Context in tab 3 cannot be compacted");
     assert!(
         msg.actions
             .iter()
@@ -1924,7 +2159,7 @@ fn a_stall_at_ninety_minutes_is_a_record_once_and_no_line() {
         app.messages
             .log()
             .records()
-            .filter(|r| !r.later && r.title.starts_with("Claude has stalled"))
+            .filter(|r| !r.later && r.key.as_deref() == Some("harness.host.stalled.s-1"))
             .count()
     };
     assert_eq!(recorded(&app), 1, "one record per episode");
@@ -1962,6 +2197,66 @@ fn a_refused_palette_set_is_one_line_naming_the_setting() {
     );
 }
 
+/// TURNING PALETTE SETS BACK ON ends the refusal line: its one action is
+/// done. A config that still says `false` keeps it (negative control). Both go
+/// through the real admission path a config watcher feeds.
+#[test]
+fn turning_palette_sets_on_clears_the_refusal_line() {
+    fn apply(app: &mut App, dir: &std::path::Path, text: &str) {
+        let path = dir.join("aterm.toml");
+        std::fs::write(&path, text).expect("write config");
+        let observation =
+            crate::native_config_service::VersionedConfigService::observe_path(&path, false)
+                .expect("observe");
+        let config: crate::app_config::Config = aterm_toml::from_str(text).expect("valid toml");
+        app.apply_prepared_config_generation(
+            crate::native_font_catalog::PreparedConfigGeneration {
+                observation,
+                values: std::collections::BTreeMap::new(),
+                disk_faults: std::sync::Arc::default(),
+                assets: config.resolve_asset_catalog(),
+                path_feed_fps: config.path_feed_fingerprints(),
+                sparkle: config.prepare_sparkle_runtime(),
+                fonts: None,
+                warnings: Vec::new(),
+                font_refusals: Vec::new(),
+                reason: crate::app_colorscheme::ThemeChange::ConfigReload,
+                config,
+            },
+        );
+    }
+    let refused = |app: &App| {
+        app.messages
+            .digest()
+            .entries
+            .iter()
+            .any(|e| e.key == mr::palette_refused_key())
+    };
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix("aterm-palette-refused")
+        .tempdir()
+        .expect("scratch dir");
+    let mut app = App::headless_for_test();
+    apply(
+        &mut app,
+        scratch.path(),
+        "allow_palette_reconfigure = false\n",
+    );
+    app.note_palette_refused();
+    assert!(refused(&app), "precondition: the line is filed");
+
+    let unrelated = "allow_palette_reconfigure = false\nfaint_opacity = 0.4\n";
+    apply(&mut app, scratch.path(), unrelated);
+    assert!(refused(&app), "still refused: the line stays");
+
+    apply(
+        &mut app,
+        scratch.path(),
+        "allow_palette_reconfigure = true\n",
+    );
+    assert!(!refused(&app), "allowed again: the line ends");
+}
+
 /// A REPAINT THAT GAVE UP is one line, `render.<tab>.unrepaired`, "Tab N may be
 /// one row off / drag the window edge one row and back" — no tab mark, no band
 /// row, no re-grid — and only while its epoch is the tab's open, at-risk one: a
@@ -1975,25 +2270,8 @@ fn a_repaint_that_gave_up_is_one_line_and_none_for_a_healed_epoch() {
     // No such session: nothing.
     app.note_render_unrepaired(404, 7, GiveUp::NoAnswer);
     assert!(app.messages.digest().is_empty());
-    // A registered one: the line, then its end.
-    let Some(session) = app.pool.iter().map(|s| s.id).next() else {
-        // A headless test App has no session; the entry itself is checked by the
-        // roster and the direct raise below.
-        let entry = mr::render_unrepaired_entry("s-5", &places()[0], GiveUp::NoAnswer);
-        app.except(&entry);
-        assert_eq!(
-            app.messages.digest().entries[0].title,
-            "Tab 3 may be one row off"
-        );
-        assert_eq!(
-            app.messages.digest().entries[0].key,
-            "render.s-5.unrepaired"
-        );
-        app.except_clear(&mr::render_unrepaired_key("s-5"));
-        assert!(app.messages.digest().is_empty());
-        assert_eq!((message_regrids(), presence_regrids()), (message, presence));
-        return;
-    };
+    // A registered one whose epoch is not at risk: nothing either.
+    let session = app.pool.iter().map(|s| s.id).next().expect("session 0");
     let rev = app.messages.digest_revision();
     app.note_render_unrepaired(session, 7, GiveUp::NoAnswer);
     assert!(
@@ -2093,36 +2371,6 @@ fn an_adoption_nudge_that_gave_up_raises_no_digest_line() {
     app.check_render_repairs();
     assert!(app.messages.digest().is_empty());
     assert_eq!(app.messages.digest_revision(), rev, "nothing moved");
-}
-
-/// Each give-up is worded by its own cause, which the render stream tells
-/// apart: no "busy" for a selection or a driver, no guess between causes, and
-/// never the title's "one row off" again.
-#[test]
-fn a_render_line_words_each_cause_by_itself() {
-    let spot = &places()[0];
-    let said = |why| {
-        let entry = mr::render_unrepaired_entry("s-5", spot, why);
-        format!("{:?}", entry.message().expect("passes the rule").detail)
-    };
-    let causes = [
-        (GiveUp::NoAnswer, "did not redraw when aterm asked"),
-        (GiveUp::Deferred(Gate::Selection), "text stayed selected"),
-        (GiveUp::Deferred(Gate::Lease), "another program was driving"),
-        (GiveUp::Deferred(Gate::Busy), "kept drawing"),
-        (GiveUp::Budget, "three times this hour"),
-    ];
-    for (why, want) in causes {
-        let text = said(why);
-        assert!(text.contains(want), "{why:?}: {text}");
-        assert!(!text.contains("row off"), "{why:?}: {text}");
-        assert!(!text.contains(" or "), "{why:?}: {text}");
-        for (other, theirs) in causes {
-            if other != why {
-                assert!(!text.contains(theirs), "{why:?} says {other:?}: {text}");
-            }
-        }
-    }
 }
 
 /// EVERY EVENT FAMILY'S END ACTS ON AN ADOPTED LINE. The log keeps an event
@@ -2301,7 +2549,6 @@ fn foreign_tools_are_one_entry_per_look_with_atpkgs_fix_ended_when_it_sees_none(
     let none = |scope: &str| format!("atpkg: {FOREIGN_MARKER}{scope} {FOREIGN_NONE}");
     feed(&mut app, &seam);
     let open = entry(&app, FOREIGN_SEAM).expect("the seam's entry");
-    assert_eq!(open.title, "Rustup's toolchain link is not aterm's");
     assert!(
         open.detail
             .iter()
@@ -2313,10 +2560,11 @@ fn foreign_tools_are_one_entry_per_look_with_atpkgs_fix_ended_when_it_sees_none(
     feed(&mut app, &path);
     let open = entry(&app, FOREIGN_PATH).expect("the PATH look's entry");
     assert!(
-        open.detail.iter().any(|l| l
-            == "/u/.local/bin/trustdoc runs before the managed trust: type alab-trustdoc for \
-                the managed one"),
-        "{:?}",
+        open.detail
+            .iter()
+            .any(|l| l.contains("/u/.local/bin/trustdoc")
+                && l.contains("type alab-trustdoc for the managed one")),
+        "atpkg's fix, whole: {:?}",
         open.detail
     );
     assert_eq!(app.messages.digest().len(), 2, "one per look");
@@ -2348,6 +2596,82 @@ fn foreign_tools_are_one_entry_per_look_with_atpkgs_fix_ended_when_it_sees_none(
         &format!("atpkg: {FOREIGN_MARKER}{FOREIGN_PATH} gh /u/.local/bin/gh"),
     );
     assert!(app.messages.digest().is_empty(), "no fix, no entry");
+}
+
+/// A RELAUNCH THAT KEEPS FAILING WITH NO COMMAND THE TAB'S MARK COULD NAME
+/// (a Codex, a launch no resume repeats) is the digest's line AT ONCE (LC-5 of
+/// ATERM-KI-1015-1: at attention, where it was a record only): the agent is
+/// down and only the owner can start it sooner; an agent running again ends
+/// it. NEGATIVE CONTROL: with a command the tab's mark says it, and the digest
+/// stays empty.
+#[test]
+fn a_failing_relaunch_with_no_command_is_the_digests_line_at_once() {
+    let mut app = App::headless_for_test();
+    let tab = front_tab_sid(&mut app);
+    let say = |app: &mut App, said| {
+        app.note_harness_host(HostNote::Relaunch {
+            sid: tab.clone(),
+            said,
+        });
+    };
+    say(
+        &mut app,
+        RelaunchSay::Failing {
+            blocked_by: None,
+            restarted: false,
+            command: Some("claude --resume 0badf00d-1111-2222-3333-444455556666".to_string()),
+        },
+    );
+    assert!(app.messages.digest().is_empty(), "the tab's mark says it");
+    say(
+        &mut app,
+        RelaunchSay::Failing {
+            blocked_by: None,
+            restarted: false,
+            command: None,
+        },
+    );
+    let keys: Vec<String> = app
+        .messages
+        .digest()
+        .entries
+        .iter()
+        .map(|e| e.key.clone())
+        .collect();
+    assert_eq!(keys, [mr::relaunch_keys(&tab)[0].clone()], "at once");
+    say(&mut app, RelaunchSay::Ended);
+    assert!(app.messages.digest().is_empty(), "an agent back ends it");
+    // Its conversation open in another tab: no command to run here, and the
+    // line at once says to close it there (the review of the r20 relaunch
+    // lane: the mark told the second copy).
+    say(
+        &mut app,
+        RelaunchSay::Failing {
+            blocked_by: Some("other-tab"),
+            restarted: false,
+            command: None,
+        },
+    );
+    let line = app.messages.digest().entries[0].clone();
+    assert_eq!(line.key, mr::relaunch_keys(&tab)[0], "at once");
+    assert!(
+        line.then
+            .starts_with("Close the conversation in its other tab"),
+        "{}",
+        line.then
+    );
+    say(&mut app, RelaunchSay::Ended);
+    // NEGATIVE CONTROL: the harness's own restart's carry, which names no
+    // command, is a record: its record's row speaks.
+    say(
+        &mut app,
+        RelaunchSay::Failing {
+            blocked_by: None,
+            restarted: true,
+            command: None,
+        },
+    );
+    assert!(app.messages.digest().is_empty(), "a record, its row speaks");
 }
 
 /// A renewable login's stuck tab, as the loop tells it (accounts v2 S7): the

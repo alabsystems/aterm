@@ -47,6 +47,35 @@
 use std::fmt;
 use std::path::Path;
 
+#[cfg(clean_islands)]
+#[path = "capfile_island.rs"]
+mod capfile_island;
+#[cfg(clean_islands)]
+pub use capfile_island::capfile_line_advance;
+
+/// `capfile_line_advance` as `capfile_island.rs` defines it in Clean:
+/// `if cur < cand then cand else cur`.
+#[cfg(not(clean_islands))]
+#[must_use]
+pub const fn capfile_line_advance(cur: u64, cand: u64) -> u64 {
+    if cur < cand {
+        cand
+    } else {
+        cur
+    }
+}
+
+contract_fn! {
+    /// Verified check that a capability tag hex slice is 64 ASCII bytes (`len == 64`),
+    /// linked via `clean-kernel-defeq` to `capfile_tag_hex_len_valid_isl`.
+    #[must_use]
+    pub fn capfile_tag_hex_len_valid(len: usize) -> bool
+    clauses [ensures result == (len == 64)]
+    {
+        len == 64
+    }
+}
+
 /// A tag's width in bytes: one HMAC-SHA256 output.
 const TAG_BYTES: usize = 32;
 
@@ -163,11 +192,14 @@ pub fn format_line(grant: &str, tag: &[u8; TAG_BYTES]) -> String {
     let mut line = grant.to_owned();
     line.reserve(TAIL);
     line.push(' ');
-    for &b in tag {
+    let mut i = 0usize;
+    while i < TAG_BYTES {
+        let b = tag[i];
         // Both nibbles are < 16 == HEX.len(). (`as usize`, a widening cast the
         // verifier models, where `usize::from` is an opaque call to it.)
         line.push(char::from(HEX[(b >> 4) as usize]));
         line.push(char::from(HEX[(b & 0x0f) as usize]));
+        i += 1;
     }
     line
 }
@@ -184,10 +216,12 @@ pub fn parse_line(line: &str) -> Result<Option<Line>, Error> {
     if line.is_empty() || line.starts_with('#') {
         return Ok(None);
     }
-    let (grant, tag_hex) = line
-        .rsplit_once(|c: char| c.is_ascii_whitespace())
-        .filter(|(grant, _)| !grant.is_empty())
-        .ok_or(Error::Shape)?;
+    let Some((grant, tag_hex)) = line.rsplit_once(|c: char| c.is_ascii_whitespace()) else {
+        return Err(Error::Shape);
+    };
+    if grant.is_empty() {
+        return Err(Error::Shape);
+    }
     Ok(Some(Line {
         grant: grant.to_string(),
         tag: decode_tag(tag_hex.as_bytes())?,
@@ -200,21 +234,24 @@ pub fn parse_line(line: &str) -> Result<Option<Line>, Error> {
 /// # Errors
 /// The FIRST malformed line, as `path:line`; no partial ring is returned.
 pub fn parse_text(path: &str, text: &str) -> Result<Vec<Line>, Malformed> {
-    text.lines()
-        .enumerate()
-        .filter_map(|(n, raw)| {
-            parse_line(raw)
-                .map_err(|error| Malformed {
+    let mut out = Vec::new();
+    let mut line_no = 0usize;
+    for raw in text.lines() {
+        let next_no = line_no.saturating_add(1) as u64;
+        line_no = capfile_line_advance(line_no as u64, next_no) as usize;
+        match parse_line(raw) {
+            Ok(Some(item)) => out.push(item),
+            Ok(None) => {}
+            Err(error) => {
+                return Err(Malformed {
                     path: path.to_string(),
-                    // `n` indexes a line of `text`, so it is far below
-                    // `usize::MAX`: saturating never engages; it only makes the
-                    // 1-based line number total.
-                    line: n.saturating_add(1),
+                    line: line_no,
                     error,
-                })
-                .transpose()
-        })
-        .collect()
+                });
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Read a whole ring from the file at `path` — [`parse_text`] over its contents,
@@ -226,35 +263,49 @@ pub fn parse_text(path: &str, text: &str) -> Result<Vec<Line>, Malformed> {
 pub fn read_file(path: impl AsRef<Path>) -> Result<Vec<Line>, ReadError> {
     let path = path.as_ref();
     let shown = path.display().to_string();
-    let text = std::fs::read_to_string(path).map_err(|error| ReadError::Io {
-        path: shown.clone(),
-        error,
-    })?;
-    parse_text(&shown, &text).map_err(ReadError::Malformed)
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(error) => {
+            return Err(ReadError::Io { path: shown, error });
+        }
+    };
+    match parse_text(&shown, &text) {
+        Ok(lines) => Ok(lines),
+        Err(m) => Err(ReadError::Malformed(m)),
+    }
+}
+
+const fn nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b.saturating_sub(b'0')),
+        b'a'..=b'f' => Some(b.saturating_sub(b'a' - 10)),
+        b'A'..=b'F' => Some(b.saturating_sub(b'A' - 10)),
+        _ => None,
+    }
 }
 
 /// Decode exactly [`TAG_BYTES`] bytes from 64 ASCII hex digits. Byte-indexed, so a
 /// multibyte character is a non-hex byte like any other, never a panic.
 fn decode_tag(hex: &[u8]) -> Result<[u8; TAG_BYTES], Error> {
-    fn nibble(b: u8) -> Option<u8> {
-        match b {
-            b'0'..=b'9' => Some(b - b'0'),
-            b'a'..=b'f' => Some(b - b'a' + 10),
-            b'A'..=b'F' => Some(b - b'A' + 10),
-            _ => None,
-        }
-    }
-    if hex.len() != TAG_BYTES * 2 {
+    if hex.len() != TAG_BYTES * 2 || !capfile_tag_hex_len_valid(hex.len()) {
         return Err(Error::TagLength(hex.len()));
     }
     let mut tag = [0u8; TAG_BYTES];
-    for (i, (out, pair)) in tag.iter_mut().zip(hex.as_chunks::<2>().0).enumerate() {
-        // `i < TAG_BYTES`, so the byte offsets `2i` and `2i + 1` are < 64:
-        // saturating never engages; it only makes the offset arithmetic total.
-        let at = i.saturating_mul(2);
-        let hi = nibble(pair[0]).ok_or(Error::TagNotHex(at))?;
-        let lo = nibble(pair[1]).ok_or(Error::TagNotHex(at.saturating_add(1)))?;
-        *out = (hi << 4) | lo;
+    let mut i = 0usize;
+    while i < TAG_BYTES {
+        let at = i * 2;
+        let at1 = at + 1;
+        if at1 >= hex.len() {
+            return Err(Error::TagLength(hex.len()));
+        }
+        let Some(hi) = nibble(hex[at]) else {
+            return Err(Error::TagNotHex(at));
+        };
+        let Some(lo) = nibble(hex[at1]) else {
+            return Err(Error::TagNotHex(at1));
+        };
+        tag[i] = (hi << 4) | lo;
+        i += 1;
     }
     Ok(tag)
 }

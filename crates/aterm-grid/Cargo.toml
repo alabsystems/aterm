@@ -12,37 +12,31 @@ license.workspace = true
 repository.workspace = true
 description = "Terminal grid model: cells, rows, styles, damage tracking, page storage, cursor and region state"
 
+# No `default` feature: a `default` here would enter this crate's hash only when a
+# workspace test selects it, so `build -p aterm` and the test build would compile two
+# aterm-grids.
 [features]
-default = ["disk-tier"]
-# Disk-backed scrollback cold tier (libc mmap). Default-on so native builds keep
-# it; off for wasm32 (no libc), where the grid runs the RAM tiers only.
-disk-tier = ["aterm-scrollback/disk-tier"]
-alacritty-compat = []  # Expose legacy Alacritty-facing CellFlags aliases
-fuzz = ["aterm-scrollback/fuzz"]  # Expose fuzz-only APIs
-# Compile the `#[refines]` anchors (page store, row, resize undo) into the library so
-# the `spec_xref_closure` gate in aterm-gui collects them. Off by default so
-# production builds carry no aterm-spec.
-spec-anchors = ["dep:aterm-spec"]
 
 [dependencies]
 aterm-rle = { workspace = true }
-# Its disk tier is enabled through this crate's `disk-tier` feature, so a wasm
-# consumer can drop libc.
 aterm-scrollback = { workspace = true }
 aterm-types = { workspace = true }
 aterm-log = { workspace = true }
 aterm-hash = { workspace = true }
 aterm-alloc = { workspace = true }
 aterm-grapheme = { workspace = true }
-# The `#[refines]` anchors only (`spec-anchors`).
-aterm-spec = { workspace = true, optional = true }
+# The anchor attributes' registry (std-only): `#[cfg_attr(any(test, debug_assertions),
+# aterm_spec_anchor::refines(…))]` expands in every test and debug build; release strips it.
+aterm-spec-anchor = { workspace = true }
 
 [dev-dependencies]
-aterm-tempfile = { workspace = true }
 aterm-selection = { workspace = true }
 # The `#[refines]` anchors under a plain test run, and the derived models and seeded
 # `XorShift` the tests use.
 aterm-spec = { workspace = true }
+# The models its tests drive (a model edit rebuilds only their tests).
+aterm-models-core = { workspace = true }
+aterm-models-misc = { workspace = true }
 
 [lints]
 workspace = true

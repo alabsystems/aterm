@@ -55,11 +55,12 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
+use aterm_models_session::input_unread_gate_model;
 use aterm_session::input_backlog::{
     Contention, Gate, InputBacklog, InputWord, Liveness, STALL_AFTER, WARN_AFTER, classify, gate,
 };
 use aterm_session::sink::{ImmediateWrite, SinkWriter};
-use aterm_spec::derive::{Model, input_unread_gate_model};
+use aterm_spec::derive::Model;
 use aterm_spec::interp;
 
 type State = BTreeMap<&'static str, i64>;

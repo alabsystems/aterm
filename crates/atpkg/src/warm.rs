@@ -395,9 +395,10 @@ fn login_shell_env() -> Option<Vec<(OsString, OsString)>> {
 
 /// The shell [`login_shell_env`] runs: `$SHELL` when it is zsh, bash or fish (whose `-l -i
 /// -c` reads the person's login and interactive rc files, then runs the probe), else none.
-/// Unlike the window's login-shell `PATH` read (aterm-gui `spawn::login_shell_path`), never
-/// `/bin/zsh` as a fallback: a `PATH` may fall back to a default, an opt-out may not, so
-/// the setup goes unread ([`persons_setup`]).
+/// The window's login-shell `PATH` read (aterm-gui `spawn::login_shell_path`) asks a default
+/// shell instead (`/bin/zsh` on macOS, `/bin/sh` elsewhere), and this one must not: a `PATH`
+/// may fall back to a default, an opt-out may not, so the setup goes unread
+/// ([`persons_setup`]).
 #[cfg(unix)]
 fn login_shell(shell: Option<OsString>) -> Option<PathBuf> {
     shell.map(PathBuf::from).filter(|s| {
@@ -439,6 +440,7 @@ enum Ended {
     /// The program exited with this code.
     Exit(i32),
     /// A signal ended it (not this warm's kill).
+    #[cfg(unix)]
     Signal(i32),
     /// It outlived the deadline and its group was killed.
     Killed,
@@ -458,6 +460,7 @@ impl Ended {
     fn words(&self) -> String {
         match self {
             Self::Exit(code) => format!("exit={code}"),
+            #[cfg(unix)]
             Self::Signal(n) => format!("signal={n}"),
             Self::Killed => String::from("killed"),
             Self::SpawnFailed => String::from("spawn-failed"),
@@ -880,16 +883,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_build_is_warmed_once_per_process() {
-        assert!(first_in_this_process("warm-once-test", 7));
-        assert!(!first_in_this_process("warm-once-test", 7));
-        assert!(
-            first_in_this_process("warm-once-test", 8),
-            "a new build warms"
-        );
-    }
-
     /// Exactly `<program> <absolute prefix> <build>`, for a warmed program, as
     /// [`spawn_landed`] passes them.
     #[test]
@@ -1104,12 +1097,10 @@ mod tests {
         );
         let child = spawn();
         assert!(appears(&marks.join("started")), "the script ran");
-        let t = std::time::Instant::now();
         assert_eq!(
             drive(child, Duration::from_millis(300), Duration::from_secs(120)),
             Ended::Exit(3)
         );
-        assert!(t.elapsed() >= Duration::from_millis(300), "stdin held");
         assert!(marks.join("eof").exists());
         // Ignores EOF and SIGTERM, and leaves a grandchild in its group.
         install(

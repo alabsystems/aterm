@@ -3,13 +3,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Character writes: `write_char`, the ASCII bulk paths (`write_cell_run`,
-//! `write_ascii_blast`, `write_ascii_run_styled_packed`), style-ID resolution, and the
-//! stale-extras probe every writer shares. Wide characters and the split write/advance
-//! primitives are in `write_split.rs`; test-only combined helpers in `write_test_helpers.rs`.
+//! `write_ascii_blast`, `write_ascii_run_styled_packed`), and the stale-extras probe
+//! every writer shares. Wide characters and the split write/advance primitives are in
+//! `write_split.rs`; test-only combined helpers in `write_test_helpers.rs`.
 
-use super::{
-    Cell, CellCoord, CellFlags, ColorType, ExtendedStyle, Grid, PackedColor, PackedColors, StyleId,
-};
+#[cfg(test)]
+use super::PackedColor;
+use super::{Cell, CellCoord, CellFlags, Grid, PackedColors};
 
 /// The extras-map entries a write over `[start, end)` of `row` is about to
 /// leave without a cell to claim them, probed before it lands (the write
@@ -81,15 +81,17 @@ impl StaleExtras {
 // stock rustc (the cross cells of `verify cells`, the x86_64-apple-darwin
 // compat slice) parses a cfg'd-out module's body all the same, so the island's
 // module goes through this macro, which drops its tokens there and emits them
-// unchanged under `cfg(trust_verify)`.
-#[cfg(trust_verify)]
+// unchanged under `cfg(clean_islands)`: set by this crate's build script
+// whenever the compiler is Trust (crates/aterm-log/clean_islands.rs), so the
+// island is kernel-checked at every Trust build, not only the verify lane.
+#[cfg(clean_islands)]
 macro_rules! verify_island {
     ($($tt:tt)*) => {
         $($tt)*
     };
 }
 
-#[cfg(not(trust_verify))]
+#[cfg(not(clean_islands))]
 macro_rules! verify_island {
     ($($tt:tt)*) => {};
 }
@@ -351,43 +353,6 @@ impl Grid {
         debug_assert!(
             self.storage.cursor.col <= self.storage.max_col_for_row(self.storage.cursor.row)
         );
-    }
-
-    /// Resolve a `StyleId` to the `(fg, bg, flags)` a cell write takes; `extra_flags` are
-    /// added to the style's own.
-    #[inline]
-    pub fn resolve_style_to_colors(
-        &self,
-        style_id: StyleId,
-        extra_flags: CellFlags,
-    ) -> (PackedColor, PackedColor, CellFlags) {
-        if let Some(ext_style) = self.storage.styles.extended(style_id) {
-            let fg = match ext_style.fg_type {
-                ColorType::Default => PackedColor::DEFAULT_FG,
-                ColorType::Indexed => PackedColor::indexed(ext_style.fg_index),
-                ColorType::Rgb => {
-                    let rgb = ext_style.style.fg.to_rgb();
-                    PackedColor::rgb(rgb.0, rgb.1, rgb.2)
-                }
-            };
-            let bg = match ext_style.bg_type {
-                ColorType::Default => PackedColor::DEFAULT_BG,
-                ColorType::Indexed => PackedColor::indexed(ext_style.bg_index),
-                ColorType::Rgb => {
-                    let rgb = ext_style.style.bg.to_rgb();
-                    PackedColor::rgb(rgb.0, rgb.1, rgb.2)
-                }
-            };
-            let flags =
-                ExtendedStyle::attrs_to_cell_flags(ext_style.style.attrs).union(extra_flags);
-            (fg, bg, flags)
-        } else {
-            (
-                PackedColor::DEFAULT_FG,
-                PackedColor::DEFAULT_BG,
-                extra_flags,
-            )
-        }
     }
 
     #[doc(hidden)] // Write a char with deferred autowrap (test-only).

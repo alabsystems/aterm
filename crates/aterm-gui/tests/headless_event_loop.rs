@@ -14,13 +14,12 @@
 //!
 //! IT STILL SPEAKS LIBTEST'S COMMAND LINE, for its one test,
 //! `headless_event_loop` (the [`libtest`] module below). cargo hands every test
-//! binary the same arguments, and so does `verify`'s test run
-//! (`aterm_verify::stages::test_run_args`: `-Zunstable-options --report-time`
-//! today). A `main` that ignored its arguments (this file's
-//! first cut) ran under any filter, and `-- --list` ran the loop instead of
-//! naming it. So positional filters and `--skip` select as libtest's do
-//! (substring; whole name under `--exact`), `--ignored` filters it out (it is
-//! not an ignored test), `--list` names it, and a run prints libtest's
+//! binary the same arguments, and so does `verify`'s test run. A `main` that
+//! ignored its arguments (this file's first cut) ran under any filter, and
+//! `-- --list` ran the loop instead of naming it. So positional filters and
+//! `--skip` select as libtest's do (substring; whole name under `--exact`),
+//! `--ignored` filters it out (it is not an ignored test), `--list` names it,
+//! and a run prints libtest's
 //! `running N tests` / `test <name> ... ok|FAILED` / `test result:` lines,
 //! which `aterm_verify::libtest` reads a log by. A failure exits 101, libtest's
 //! code. An option it does not handle is an error, never a silent run or a

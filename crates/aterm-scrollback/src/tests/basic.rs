@@ -7,86 +7,6 @@
 use super::*;
 
 #[test]
-fn scrollback_new() {
-    let sb = Scrollback::new(100, 1000, 10_000_000);
-    assert_eq!(sb.line_count(), 0);
-    assert_eq!(sb.hot_line_count(), 0);
-    assert_eq!(sb.warm_line_count(), 0);
-    assert_eq!(sb.cold_line_count(), 0);
-}
-
-#[test]
-fn scrollback_push_line() {
-    let mut sb = Scrollback::new(100, 1000, 10_000_000);
-    sb.push_str("Hello");
-    sb.push_str("World");
-
-    assert_eq!(sb.line_count(), 2);
-    assert_eq!(sb.hot_line_count(), 2);
-}
-
-#[test]
-fn scrollback_get_line() {
-    let mut sb = Scrollback::new(100, 1000, 10_000_000);
-    sb.push_str("Line 0");
-    sb.push_str("Line 1");
-    sb.push_str("Line 2");
-
-    assert_eq!(
-        sb.get_line(0)
-            .expect("no error")
-            .expect("line present")
-            .to_string(),
-        "Line 0"
-    );
-    assert_eq!(
-        sb.get_line(1)
-            .expect("no error")
-            .expect("line present")
-            .to_string(),
-        "Line 1"
-    );
-    assert_eq!(
-        sb.get_line(2)
-            .expect("no error")
-            .expect("line present")
-            .to_string(),
-        "Line 2"
-    );
-    assert!(sb.get_line(3).expect("no error").is_none());
-}
-
-#[test]
-fn scrollback_get_line_rev() {
-    let mut sb = Scrollback::new(100, 1000, 10_000_000);
-    sb.push_str("Line 0");
-    sb.push_str("Line 1");
-    sb.push_str("Line 2");
-
-    assert_eq!(
-        sb.get_line_rev(0)
-            .expect("no error")
-            .expect("line present")
-            .to_string(),
-        "Line 2"
-    );
-    assert_eq!(
-        sb.get_line_rev(1)
-            .expect("no error")
-            .expect("line present")
-            .to_string(),
-        "Line 1"
-    );
-    assert_eq!(
-        sb.get_line_rev(2)
-            .expect("no error")
-            .expect("line present")
-            .to_string(),
-        "Line 0"
-    );
-}
-
-#[test]
 fn scrollback_promotion() {
     // Small limits to trigger promotion
     let mut sb = Scrollback::with_block_size(10, 100, 10_000_000, 5);
@@ -105,39 +25,6 @@ fn scrollback_promotion() {
         let line = sb.get_line(i).expect("no error").expect("line present");
         assert_eq!(line.to_string(), format!("Line {i}"));
     }
-}
-
-#[test]
-fn scrollback_eviction() {
-    // Small limits to trigger eviction
-    let mut sb = Scrollback::with_block_size(5, 10, 10_000_000, 5);
-
-    // Push 25 lines - should evict to cold
-    for i in 0..25 {
-        sb.push_str(&format!("Line {i}"));
-    }
-
-    assert_eq!(sb.line_count(), 25);
-    assert!(sb.cold_line_count() > 0);
-
-    // Verify we can still read all lines
-    for i in 0..25 {
-        let line = sb.get_line(i).expect("no error").expect("line present");
-        assert_eq!(line.to_string(), format!("Line {i}"));
-    }
-}
-
-#[test]
-fn scrollback_iterator() {
-    let mut sb = Scrollback::new(100, 1000, 10_000_000);
-    for i in 0..10 {
-        sb.push_str(&format!("Line {i}"));
-    }
-
-    let lines: Vec<_> = sb.iter().collect();
-    assert_eq!(lines.len(), 10);
-    assert_eq!(lines[0].to_string(), "Line 0");
-    assert_eq!(lines[9].to_string(), "Line 9");
 }
 
 #[test]

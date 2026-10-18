@@ -2,53 +2,36 @@
 // Copyright 2026 Andrew Yates
 
 //! The supervisor: what a manager agent needs to keep a worker (a Claude Code,
-//! Codex or agy session in another aterm tab) moving without rubber-stamping
-//! it. Each is read by its own grammar (`aterm_phase::Program::reader`); a
-//! Muse Code session is read but never supervised
-//! (`aterm_phase::Program::supervisable`), and no press or typed line ever
-//! answers an agent's sign-in menu, whose options open a browser.
+//! Codex, agy, Muse Code or Gemini CLI session in another aterm tab) moving
+//! without rubber-stamping it. Each is read by its own grammar
+//! (`aterm_phase::Program::reader`), Gemini CLI by its screen under `node`,
+//! the name its process runs as, and answered by the keys it measured
+//! (`aterm_phase::Program::supervisable`): Muse Code's boxes and question by
+//! the cursor and Enter, its typed text submitted only once its echo held
+//! still. No press or typed line ever answers an agent's sign-in menu, whose
+//! options open a browser.
 //!
-//! * [`classify::classify_command`] — is this shell line read-only? (The
-//!   corpus that shaped it is the test.)
-//! * [`policy::approval::decide`] — THE approval decider: which option, if
-//!   any, to press on an approval box, under which rule and behind which
-//!   guard ([`policy`]); a question dialog it hands to
-//!   [`policy::question::answer_question`], which answers it under
-//!   `[harness] answer_questions` — with its recommended option, or, under
-//!   `question_priority` `long-term` / `short-term`, by the worker from that
-//!   word's policy text ([`QuestionPriority`]).
-//! * [`prompt::parse_prompt`] — the approval box on the screen, parsed.
-//! * [`phase::worker_phase`] — busy / prompt / limited / idle / question,
-//!   from one read (busy only from the live zone around the composer);
-//!   [`phase::survey_open`] — the session survey parked above it;
-//!   [`phase::context_left`] — how much context is left before auto-compact.
-//!   (Both modules are the `aterm-phase` crate, re-exported. aterm's
-//!   server reads the screen with the same crate and publishes `agent=`;
-//!   the fabric bridge relays that word and reads no screen of its own.)
-//! * [`run::Session`] — `await-turn`, `supervise` and `watch`, over the
-//!   control verbs.
-//! * [`report`] — `report`: what the worker said since the manager's turn,
-//!   the rows a fullscreen app scrolled off (`offscreen`) joined with the
-//!   screen's.
-//! * [`mail`] — `watch --mail`'s lane on the manager's inbox and `task`: the
-//!   worker's report comes by mail, one line per worker turn.
-//! * [`limit`] — when a limit notice says it resets, as a Unix time: the
-//!   watcher waits for it, stretches its budget past it and continues the
-//!   worker 150 s past its reset, and a share of a minute more per session
-//!   (the turn-end policy's usage resume).
-//! * [`codex_usage`] — what Codex's own rollouts say of a session: how much
-//!   of its usage window is spent (the rate-limit nudge is answered by it),
-//!   and whether its thread fell into a sandbox its launch bypassed.
-//!
-//! It moved here from a scratchpad script because every rule in it was paid for
-//! by a misclassification in a real session; a supervisor that is itself an
-//! agent should not have to rediscover them.
+//! * [`classify::classify_command`]: is this shell line read-only?
+//! * [`policy::approval::decide`]: which option, if any, to press on an approval
+//!   box, under which rule and behind which guard ([`policy`]); a question dialog
+//!   goes to [`policy::question::answer_question`], under `[harness]
+//!   answer_questions` and `question_priority` ([`QuestionPriority`]).
+//! * [`prompt::parse_prompt`]: the approval box on the screen, parsed.
+//! * [`phase::worker_phase`]: busy / prompt / limited / idle / question, from one
+//!   read; [`phase::survey_open`]: the session survey; [`phase::context_left`]:
+//!   context left before auto-compact.
+//! * [`run::Session`]: `await-turn`, `supervise` and `watch`, over the control
+//!   verbs.
+//! * [`report`]: what the worker said since the manager's turn, with the rows a
+//!   fullscreen app scrolled off.
+//! * [`mail`]: `watch --mail`'s lane on the manager's inbox, and `task`.
+//! * [`limit`]: when a limit notice says it resets, as a Unix time.
 
 pub mod approvals;
 pub mod blocks;
 pub mod classify;
-pub mod codex_usage;
 pub mod config;
+pub(crate) mod fx;
 pub mod ladder;
 // The phase reader and the prompt parser live in `aterm-phase` (the server's
 // agent verdict is read by the same reader), re-exported here.
@@ -63,11 +46,12 @@ pub mod policy;
 pub mod report;
 pub mod run;
 pub mod screen;
+pub mod tape;
 pub mod transport;
 
 pub use blocks::View;
 pub use classify::{DEFAULT_PYTHON_ALLOW, classify_command_with};
-pub use config::{Autopilot, SupervisorConfig};
+pub use config::{Autopilot, LandAt, SupervisorConfig};
 pub use journal::{Journal, read_journal};
 pub use ledger::{
     ClockAnchor, Format as LedgerFormat, LedgerHost, LedgerOpts, gather, parse_since,
@@ -83,20 +67,19 @@ pub use report::{DEFAULT_MAX_ROWS, Mark, Marker, Reason, Report, ReportOpts};
 pub use run::{
     ATTENTION_OWNER, AnswerOpts, ApprovalEnv, CLAIM_HELD, CLAIM_RENEW, Caps, Ctl, CtlReply,
     EXIT_NO_BOX, EXIT_NOT_SERVED, EXIT_REFUSED, EXIT_TIMEOUT, Fold, Guard, HostStep, IdleHost,
-    Interrupter, NoLane, ProbeMiss, ReportBrief, Session, StuckSurvey, SuperviseOpts, Turn,
-    UNBOUNDED, UsageSeen, WaitPlan, WorkerSource, event_line, exit_reason, render_phase,
-    render_phase_and_survey, render_result, render_result_mail, reported_event_line,
+    IdlePoint, Interrupter, NoLane, ProbeMiss, ProbeNo, RELAUNCH_ATTENTION_OWNER, ReportBrief,
+    Session, SessionSetup, StuckSurvey, SuperviseOpts, Turn, UNBOUNDED, UsageSeen, WaitPlan,
+    WorkerSource, event_line, exit_reason, render_phase, render_phase_and_survey, render_result,
+    render_result_mail, reported_event_line,
 };
 pub use transport::{Endpoint, RelayCtl, Transport};
 
 /// A scratch path of one call's own, for a test:
 /// `<tmp>/aterm-<kind>-<tag>-<pid>-<n>`, `<n>` a per-process call count.
 ///
-/// Unique by construction rather than by callers passing distinct tags: tests
-/// run on parallel threads of one process, and a shared helper would hand
-/// every caller the same tag, letting one test's clean-up delete another's
-/// files. Nothing is created here: the caller makes, and removes, what it
-/// needs.
+/// Unique by construction: tests run on parallel threads of one process, and a
+/// shared tag would let one test's clean-up delete another's files. Nothing is
+/// created here.
 #[cfg(test)]
 pub(crate) fn test_scratch_path(kind: &str, tag: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -105,16 +88,13 @@ pub(crate) fn test_scratch_path(kind: &str, tag: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("aterm-{kind}-{tag}-{}-{n}", std::process::id()))
 }
 
-/// A scratch directory of ONE call's own, CREATED, and removed when this drops:
-/// the guard form of [`test_scratch_path`] (`aterm-<kind>-<tag>-…`), for a
-/// helper whose callers hold the directory for the length of a test — a test
-/// that fails, or returns early, leaves nothing behind. Dereferences to its
-/// path.
+/// A scratch directory of one call's own, created, and removed on drop (the guard
+/// form of [`test_scratch_path`]), so a failing or early-returning test leaves
+/// nothing behind. Dereferences to its path.
 ///
-/// Under `/tmp` on unix rather than `$TMPDIR`: these directories hold the
-/// stand-in instances' control sockets, and a unix-socket path must fit in 104
-/// bytes, which macOS's per-user temp dir (49 of them) plus a unique name and
-/// a label can exceed.
+/// Under `/tmp` on unix rather than `$TMPDIR`: it holds stand-in instances'
+/// control sockets, and a unix-socket path must fit in 104 bytes, which macOS's
+/// 49-byte per-user temp dir plus a unique name can exceed.
 #[cfg(test)]
 pub(crate) struct ScratchDir(aterm_tempfile::TempDir);
 

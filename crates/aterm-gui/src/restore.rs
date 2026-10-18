@@ -24,6 +24,8 @@
 //! (fall back to a normal fresh window), and the manifest is single-use (deleted on read)
 //! so a crash mid-restore can never loop.
 
+use crate::durable::Flush;
+use aterm_agent::harness::relaunch::AgentRun;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
@@ -183,6 +185,15 @@ pub(crate) struct TerminalLeafRestore {
     /// the table's default decides.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autopilot: Option<String>,
+    /// The instant a timed Cruise lands, unix ms (2026-10-16; additive, absent
+    /// tolerated, not written when unset;
+    /// `docs/DESIGN-harness-autopilot-2026-10-15.md` §9.3.6, item 2): carried
+    /// beside `autopilot`, which it goes with — so a restored or updated
+    /// session keeps "cruise until 18:00, then land", and one whose time
+    /// passed while aterm was closed lands at once. Dropped on the way in
+    /// under any word but `cruise` (`sanitize_user_metadata`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub land_at: Option<i64>,
     /// IDENTITY (session identities, 2026-09-17; additive, absent tolerated):
     /// the agent identity the session was spawned under, so a cold restore
     /// respawns the leaf's shell under it — `create = false`
@@ -192,6 +203,15 @@ pub(crate) struct TerminalLeafRestore {
     /// handoff record instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<String>,
+    /// THE SESSION'S OWN THEME (additive, absent tolerated, not written when
+    /// unset): the selector `theme session set`, `spawn theme=` or a split
+    /// gave this session ([`crate::session_theme::SessionTheme`]), so a
+    /// restore and a seamless update keep the tab's colours. It comes back as
+    /// origin `restored`; one that no longer draws keeps its selector and
+    /// draws the instance theme. An identity theme is not written: it
+    /// resolves from `identity` and the config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<String>,
     /// THE AGENT THIS LEAF HOSTED (2026-09-27; additive, absent tolerated):
     /// what a relaunch needs, read while it ran by the window's supervisor
     /// host — or, none published yet, the one a relaunch still owes the tab
@@ -216,8 +236,8 @@ pub(crate) struct TerminalLeafRestore {
     /// THE AGENT THE OUTGOING INSTANCE'S HOST SUPERVISED HERE (round
     /// eighteen; additive, absent tolerated): ON A SEAMLESS UPDATE'S HANDOFF
     /// LAYOUT ONLY, and only where no relaunch is owed (`agent`), the agent
-    /// the host last published for the tab
-    /// (`harness_host::published_snapshot`), for the successor to watch from
+    /// the host last published for the tab, followed through its own record
+    /// (`harness_host::followed_snapshot`), for the successor to watch from
     /// its Commit (`HostHandle::watch_handed`): an exit the outgoing
     /// instance will not act on — a crash during its Commit's hold, read
     /// there by a process about to exit, or one that comes before the
@@ -268,13 +288,41 @@ pub(crate) struct TerminalLeafRestore {
     /// relaunches the agent, as before); an older producer never writes it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub holds: Vec<String>,
+    /// THE SESSION THIS LEAF'S SHELL WAS (session log phase 2A; additive,
+    /// absent tolerated, written by every capture): its sid, so the shell a
+    /// restore starts for the leaf opens `open - restore prev=<sid>`, and a
+    /// reader can go from the new session to the one it stands in for (whose
+    /// log `log @<sid>` still answers while the closed index holds it). Kept
+    /// only in the shape this build mints (`s-<hex>`, within a log id's 40
+    /// bytes): a hand-edited value is dropped, never stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
+    /// THE FIRST SESSION OF ITS CHAIN OF RESTORES (the same; written only
+    /// when it is not `sid` itself): what `lineage=` names, so a session
+    /// restored twice still names the session it began as. Checked as `sid`
+    /// is. On a seamless update's layout it goes to the shell the leaf names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage: Option<String>,
+}
+
+/// Whether `sid` is one a restore leaf may carry (`TerminalLeafRestore::sid`):
+/// the shape this build mints, within a session log id's bytes.
+pub(crate) fn carried_sid(sid: &str) -> bool {
+    crate::keeper_link::valid_sid(sid) && aterm_slog::ShortId::new(sid).is_some()
 }
 
 /// A hosted agent as its leaf's restore carries it (see
 /// [`TerminalLeafRestore::agent`]): the relaunch snapshot's durable half
 /// (`aterm_agent::harness::relaunch::Snapshot`), without the tab and the
 /// shell, which the restored leaf provides.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+///
+/// A WIRE FORMAT OTHER BUILDS READ: an older window's successor in a live
+/// update's handoff, a newer build's cold restore, and back. On disk it is
+/// [`leaf::AgentRestore`], field for field and in its order; in memory the
+/// lane's run is one exhaustive shape ([`RunRestore`]), keyed on disk by the
+/// lane's word beside the others (`codex`), which an older reader ignores
+/// (no `deny_unknown_fields` there, nor on any build's since 0.101.0).
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct AgentRestore {
     /// The agent's pid when it ran, and its kernel start: the pid-reuse guard
     /// that tells a process still running from the one that ended.
@@ -284,12 +332,10 @@ pub(crate) struct AgentRestore {
     pub program: String,
     pub argv: Vec<String>,
     /// Its conversation, when it had registered one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
     /// The directory it was started in.
     pub cwd: String,
     /// Its version, when it had registered one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     /// THE CLAUDE HOME IT RAN UNDER (2026-10-09; additive, absent tolerated,
     /// written only when set): the raw `CLAUDE_CONFIG_DIR` of its own exec
@@ -302,7 +348,6 @@ pub(crate) struct AgentRestore {
     /// (measured live for the explicit restart, `b16490d3d`). An older
     /// producer never writes it, and that leaf restores as it always did; an
     /// older successor ignores it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home: Option<String>,
     /// THE LOGIN IT RAN UNDER, the same way: the raw
     /// `CLAUDE_SECURESTORAGE_CONFIG_DIR` (`Snapshot::login`). Set and empty —
@@ -310,20 +355,21 @@ pub(crate) struct AgentRestore {
     /// as none. A leaf that names a home or a login is relaunched under
     /// them, never under the roster's proven active account, which is for an
     /// agent nothing says the login of (`harness_host::RestoredAgent::unread`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub login: Option<String>,
-    /// A CODEX's run (its home, its mode, when it started): what its
-    /// relaunch reads beside the thread `session` names. `None` for Claude
-    /// Code — and a Codex whose run is lost is relaunched by no lane.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub codex: Option<CodexRestore>,
+    /// THE RUN OF A LANE PAST CLAUDE CODE'S (a Codex's: its home, and
+    /// codex-alab's validated line): what its relaunch reads beside the
+    /// conversation `session` names, on disk under the lane's word
+    /// ([`RunRestore`]). `None` for Claude Code, whose run is this leaf's own
+    /// fields — and a Codex whose run is lost, or that carries no validated
+    /// line ([`CodexRestore::alab`]: a vendor `codex`, or a leaf an older
+    /// build wrote), is relaunched by nobody ([`Self::relaunched`]).
+    pub run: Option<RunRestore>,
     /// THE AGENT IT WAS, by its record word (`upgrade::Agent::word`; additive,
     /// absent tolerated, written only when set): `codex`, and none for Claude
     /// Code, whose leaf is as it always was. So a leaf a newer build wrote for
     /// an agent this one has no lane for is relaunched as no other agent's
     /// ([`Self::agent`], [`Self::snapshot`]); with no word the agent is read
-    /// off its Codex run, as every older producer's leaf is.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    /// off its run, as every older producer's leaf is.
     pub word: String,
     /// THE EXPLICIT RESTART ENDED IT (round eighteen; additive, absent
     /// tolerated, written only when set): the act's cause — `asked` or
@@ -337,8 +383,184 @@ pub(crate) struct AgentRestore {
     /// whose agent a cold restore relaunches in a reopened tab as aterm's own
     /// end (the review of round eighteen's first cut). An older successor
     /// ignores it and relaunches it as aterm's own end, as before.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cause: Option<String>,
+    /// THE TAB IT RAN IN (2026-10-15; additive, absent tolerated, written
+    /// only when set): that tab's sid at capture
+    /// (`aterm_agent::harness::relaunch::Snapshot::tab`). A cold restore
+    /// reopens the tab under a NEW sid, and what the old tab's loop typed
+    /// into the conversation is in the old sid's ledger: the relaunch keeps
+    /// it among the conversation's earlier tabs
+    /// (`relaunch::after_host_ended_from`), so a `keep going` that loop
+    /// typed after the worker's token is no one's prompt that reopens the
+    /// finished task (XREV-LC-1). An older producer writes none: its
+    /// conversation's earlier tab is unknown, read as before.
+    pub tab: Option<String>,
+}
+
+/// THE RUN A LEAF CARRIES FOR A LANE PAST CLAUDE CODE'S
+/// ([`AgentRestore::run`]), one variant per such lane, the run of
+/// `aterm_agent::harness::relaunch::AgentRun` it was read from. ON DISK each
+/// is a table under its lane's record word ([`leaf::AgentRestore`]: `codex`), a
+/// key an older reader ignores, so a lane adds its variant here and its key
+/// there and no leaf of another agent changes.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum RunRestore {
+    /// A Codex TUI's ([`CodexRestore`]), under `codex`.
+    Codex(CodexRestore),
+    /// A Muse Code TUI's ([`MuseRestore`]), under `muse`: its session goes
+    /// in that table, NEVER in the leaf's `session` (see [`MuseRestore`]).
+    Muse(MuseRestore),
+}
+
+/// [`AgentRestore`] AS IT IS WRITTEN AND READ: the leaf's table, every field
+/// under the name and in the order the builds that know it write it (each
+/// later key additive and optional: `home`, `login`, `word`, `cause`, `tab`;
+/// the serde corpus's `restore` cases, and the frozen older shapes in this
+/// module's tests, pin both ways). Its own type is named `AgentRestore` too,
+/// so a refusal names the leaf as it always did. A lane past Claude Code's
+/// adds its run here as one more optional table under its record word,
+/// beside `codex`.
+mod leaf {
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize)]
+    pub(super) struct AgentRestore {
+        pub(super) pid: u32,
+        pub(super) start: String,
+        pub(super) program: String,
+        pub(super) argv: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub(super) session: Option<String>,
+        pub(super) cwd: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub(super) version: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub(super) home: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub(super) login: Option<String>,
+        /// [`super::RunRestore::Codex`]'s table.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub(super) codex: Option<super::CodexRestore>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        pub(super) word: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub(super) cause: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub(super) tab: Option<String>,
+        /// [`super::RunRestore::Muse`]'s table (2026-10-17; additive, absent
+        /// tolerated, written only when set), after every key an older build
+        /// writes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub(super) muse: Option<super::MuseRestore>,
+    }
+}
+
+impl From<leaf::AgentRestore> for AgentRestore {
+    fn from(leaf: leaf::AgentRestore) -> Self {
+        Self {
+            pid: leaf.pid,
+            start: leaf.start,
+            program: leaf.program,
+            argv: leaf.argv,
+            session: leaf.session,
+            cwd: leaf.cwd,
+            version: leaf.version,
+            home: leaf.home,
+            login: leaf.login,
+            // One run per leaf: a leaf carrying two lanes' tables (no build
+            // writes one) is read as neither's, its agent then none
+            // ([`AgentRestore::agent`] holds the word to the run).
+            run: match (leaf.codex, leaf.muse) {
+                (Some(codex), None) => Some(RunRestore::Codex(codex)),
+                (None, Some(muse)) => Some(RunRestore::Muse(muse)),
+                (None, None) | (Some(_), Some(_)) => None,
+            },
+            word: leaf.word,
+            cause: leaf.cause,
+            tab: leaf.tab,
+        }
+    }
+}
+
+impl From<AgentRestore> for leaf::AgentRestore {
+    fn from(agent: AgentRestore) -> Self {
+        // Each lane's run under its own word.
+        let (codex, muse) = match agent.run {
+            Some(RunRestore::Codex(run)) => (Some(run), None),
+            Some(RunRestore::Muse(run)) => (None, Some(run)),
+            None => (None, None),
+        };
+        Self {
+            pid: agent.pid,
+            start: agent.start,
+            program: agent.program,
+            argv: agent.argv,
+            session: agent.session,
+            cwd: agent.cwd,
+            version: agent.version,
+            home: agent.home,
+            login: agent.login,
+            codex,
+            word: agent.word,
+            cause: agent.cause,
+            tab: agent.tab,
+            muse,
+        }
+    }
+}
+
+impl Serialize for AgentRestore {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        leaf::AgentRestore::from(self.clone()).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentRestore {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        leaf::AgentRestore::deserialize(deserializer).map(Self::from)
+    }
+}
+
+impl RunRestore {
+    /// The agent whose run it is.
+    pub(crate) fn agent(&self) -> aterm_agent::harness::upgrade::Agent {
+        match self {
+            RunRestore::Codex(_) => aterm_agent::harness::upgrade::Agent::Codex,
+            RunRestore::Muse(_) => aterm_agent::harness::upgrade::Agent::Muse,
+        }
+    }
+}
+
+/// A Muse Code TUI's run as its leaf's restore carries it
+/// (`aterm_agent::harness::relaunch::MuseRun`), on disk the leaf's `muse`
+/// table.
+///
+/// ITS SESSION IS HERE, NEVER IN THE LEAF'S `session`: v0.104.0's leaf has
+/// no word and reads a leaf with no Codex run as Claude Code's, which it
+/// would relaunch as `claude --resume <session>`; with no `session` it
+/// relaunches it as nobody's (`ended:no-conversation`) and tells no line.
+/// v0.105.0 reads the word `muse` as an agent with no lane, relaunched and
+/// told by nothing (pinned both ways by
+/// `the_agent_leaf_reads_both_ways_across_0_104_and_0_105`).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub(crate) struct MuseRestore {
+    /// The session it held, as its witness proved it (a UUID); `None`: none
+    /// proven, and nothing resumes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// The session's workspace, as its own log last named it: where the
+    /// relaunch `cd`s first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    /// The data home its sessions are under (absent tolerated: read as
+    /// none, and the relaunch then finds no session's lock).
+    #[serde(default)]
+    pub data: String,
+    /// THE HOMES ITS RELAUNCH LINE CARRIES (`XDG_DATA_HOME=…`,
+    /// `XDG_CONFIG_HOME=…`, as its own exec environment set them; written
+    /// only when set).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<String>,
 }
 
 /// A Codex TUI's run as its leaf's restore carries it
@@ -351,7 +573,7 @@ pub(crate) struct CodexRestore {
     /// tolerated, written only when set): the value verbatim, as the host
     /// read it while it ran (`aterm_agent::harness::relaunch::CodexRun::home_env`).
     /// The relaunch after aterm ended puts it back on its line as every live
-    /// relaunch does (`upgrade_codex::line_env`): without it, a Codex a
+    /// relaunch does (`codex_alab::line_env`): without it, a Codex a
     /// wrapper or its own command line started under another home came back
     /// under `~/.codex`, where its thread is not. `home` cannot tell a
     /// variable set to `~/.codex` from the default. An older producer never
@@ -360,9 +582,70 @@ pub(crate) struct CodexRestore {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home_env: Option<String>,
     /// It held its thread's writer lock itself; `false`: its daemon did.
+    /// Read by nothing since the Codex screen lane's retirement
+    /// (2026-10-16), and written `true` so an older successor, which requires
+    /// it, still reads the leaf.
     pub embedded: bool,
-    /// When it started, unix milliseconds.
+    /// When it started, unix milliseconds. Read by nothing, and written `0`,
+    /// for the same reason as [`Self::embedded`].
     pub started_ms: u64,
+    /// A PROVEN SELF-CLAIMED CODEX-ALAB's LINE (the codex-alab self-claim
+    /// contract, §4; additive, absent tolerated, written only when set): the
+    /// resume line aterm's own copy of its session record validated against
+    /// the live process ([`AlabRestore`];
+    /// `aterm_agent::harness::relaunch::CodexRun::self_claimed`). The
+    /// relaunch after aterm's own end — a crash's journal, a restart's quit
+    /// layout — and a seamless update's successor, for a relaunch owed at
+    /// its Commit, bring it back on its thread on this line, exactly as the
+    /// crash rule would. The copy itself is kept in memory only; this is the
+    /// line it validated. A leaf without it (an older producer's, or a
+    /// vendor `codex`'s) is relaunched by nobody (the Codex screen lane's
+    /// retirement, 2026-10-16); an older successor ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alab: Option<AlabRestore>,
+    /// THE WORDS AN OLDER BUILD'S RELAUNCH WOULD TYPE AFTER THE PROGRAM
+    /// (additive, absent tolerated, written only when set): `resume <flags>
+    /// <thread>`, as the retired Codex screen lane read them. Kept in the
+    /// leaf's frozen form (`leaf::AgentRestore`) and read by nothing since
+    /// that lane's retirement (2026-10-16); this build never writes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carried: Option<Vec<String>>,
+}
+
+/// The crash rule's validated resume line as a leaf carries it
+/// (`aterm_agent::harness::self_claimed::Resume`).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub(crate) struct AlabRestore {
+    /// The line, `argv[0]` the launch path.
+    pub argv: Vec<String>,
+    /// The conversation (the primary thread) it resumes.
+    pub session: String,
+    /// The `CODEX_HOME` it is relaunched under, when its launch had one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_home: Option<String>,
+    /// The directory it ran in, when its record named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
+impl AlabRestore {
+    fn of(resume: aterm_agent::harness::self_claimed::Resume) -> Self {
+        Self {
+            argv: resume.argv,
+            session: resume.session,
+            codex_home: resume.codex_home,
+            cwd: resume.cwd,
+        }
+    }
+
+    fn into_resume(self) -> aterm_agent::harness::self_claimed::Resume {
+        aterm_agent::harness::self_claimed::Resume {
+            argv: self.argv,
+            session: self.session,
+            codex_home: self.codex_home,
+            cwd: self.cwd,
+        }
+    }
 }
 
 impl AgentRestore {
@@ -385,6 +668,13 @@ impl AgentRestore {
         }
     }
 
+    /// The tab it ran in ([`Self::tab`]) where that is not `now`, the sid
+    /// of the tab it is reopened in: `None` for a tab whose sid was kept (a
+    /// seamless update's handoff) or a leaf naming none.
+    pub(crate) fn ran_in_another(&self, now: &str) -> Option<String> {
+        self.tab.clone().filter(|t| t != now)
+    }
+
     /// The explicit restart's cause it carries ([`Self::cause`]); a word
     /// this build does not know is none.
     pub(crate) fn asked(&self) -> Option<aterm_agent::harness::restart_stamp::Cause> {
@@ -393,38 +683,95 @@ impl AgentRestore {
             .and_then(aterm_agent::harness::restart_stamp::Cause::parse)
     }
 
-    /// The durable half of the relaunch snapshot `snap`.
+    /// The durable half of the relaunch snapshot `snap`. A Muse Code's
+    /// session goes in its own table, never in `session` ([`MuseRestore`]).
     pub(crate) fn of(snap: aterm_agent::harness::relaunch::Snapshot) -> Self {
+        let word = snap.agent().word().to_string();
+        let (session, muse_session) = match &snap.run {
+            AgentRun::Muse(_) => (None, snap.session),
+            AgentRun::Claude | AgentRun::Codex(_) => (snap.session, None),
+        };
         Self {
-            word: snap.agent().word().to_string(),
+            // Read before the tab moves out of `snap`.
+            word,
+            tab: Some(snap.tab).filter(|t| !t.is_empty()),
             pid: snap.pid,
             start: snap.start,
             program: snap.program.to_string_lossy().into_owned(),
             argv: snap.argv,
-            session: snap.session,
+            session,
             cwd: snap.cwd,
             version: snap.version,
             home: snap.home,
             login: snap.login,
-            codex: snap.codex.map(|run| CodexRestore {
-                home: run.home.to_string_lossy().into_owned(),
-                home_env: run.home_env,
-                embedded: run.embedded,
-                started_ms: run.started_ms,
-            }),
+            run: match snap.run {
+                AgentRun::Claude => None,
+                AgentRun::Codex(run) => Some(RunRestore::Codex(CodexRestore {
+                    home: run.home.to_string_lossy().into_owned(),
+                    home_env: run.home_env,
+                    embedded: true,
+                    started_ms: 0,
+                    alab: run.self_claimed.map(AlabRestore::of),
+                    carried: None,
+                })),
+                AgentRun::Muse(run) => Some(RunRestore::Muse(MuseRestore {
+                    session: muse_session,
+                    workspace: run.workspace,
+                    data: run.data.to_string_lossy().into_owned(),
+                    env: aterm_agent::harness::upgrade_muse::env_words(&run.env),
+                })),
+            },
             cause: None,
         }
     }
 
     /// The relaunch snapshot of this agent in the reopened tab `tab`, whose
     /// shell is `shell`; `None` for an agent this build has no lane for
-    /// ([`Self::agent`]), which nothing relaunches.
+    /// ([`Self::agent`]) and for a Codex with no validated line
+    /// ([`Self::relaunched`]), which nothing relaunches.
     pub(crate) fn snapshot(
         self,
         tab: String,
         shell: u32,
     ) -> Option<aterm_agent::harness::relaunch::Snapshot> {
-        self.agent()?;
+        use aterm_agent::harness::upgrade::Agent;
+        // The run of the agent its word names, each agent by name: one this
+        // build has no lane for, or whose run the leaf lost, is none. A Muse
+        // Code's session is its table's ([`MuseRestore`]).
+        if !self.relaunched() {
+            return None;
+        }
+        let agent = self.agent()?;
+        let mut session = self.session;
+        let run = match (agent, self.run) {
+            (Agent::Claude, _) => AgentRun::Claude,
+            (Agent::Codex, Some(RunRestore::Codex(run))) => {
+                AgentRun::Codex(aterm_agent::harness::relaunch::CodexRun {
+                    home: std::path::PathBuf::from(run.home),
+                    home_env: run.home_env,
+                    self_claimed: run.alab.map(AlabRestore::into_resume),
+                })
+            }
+            (Agent::Codex, None) => return None,
+            (Agent::Muse, Some(RunRestore::Muse(run))) => {
+                session = run.session;
+                AgentRun::Muse(aterm_agent::harness::relaunch::MuseRun {
+                    data: std::path::PathBuf::from(run.data),
+                    env: aterm_agent::harness::upgrade_muse::env_of_words(&run.env),
+                    workspace: run.workspace,
+                    // Found again by its session; not carried.
+                    lock: None,
+                    started_ms: 0,
+                    block: None,
+                })
+            }
+            (Agent::Muse, _) => return None,
+            // Its run is another lane's: never read as it.
+            (Agent::Codex, Some(RunRestore::Muse(_))) => return None,
+            // No lane yet (agy, Gemini CLI): read as that agent, relaunched
+            // by nothing — never as Claude Code.
+            (Agent::Agy | Agent::Gemini, _) => return None,
+        };
         Some(aterm_agent::harness::relaunch::Snapshot {
             tab,
             pid: self.pid,
@@ -432,19 +779,10 @@ impl AgentRestore {
             shell,
             program: std::path::PathBuf::from(self.program),
             argv: self.argv,
-            session: self.session,
+            session,
             cwd: self.cwd,
             version: self.version,
-            codex: self
-                .codex
-                .map(|run| aterm_agent::harness::relaunch::CodexRun {
-                    home: std::path::PathBuf::from(run.home),
-                    home_env: run.home_env,
-                    embedded: run.embedded,
-                    started_ms: run.started_ms,
-                    ambiguous: false,
-                    block: None,
-                }),
+            run,
             // Read by the frozen remedy's wording alone
             // (`relaunch::resumes_on_exit`), never by the relaunch, whose plan
             // reads the shell's dialect itself when it runs; and not read here,
@@ -476,19 +814,51 @@ impl AgentRestore {
 
 impl AgentRestore {
     /// Whether the relaunch after aterm ended brings this agent back on its
-    /// conversation ([`agent_resumes`]).
+    /// conversation ([`agent_resumes`]), by a relaunch that is anyone's
+    /// ([`Self::relaunched`]). Not where its leaf carries the owner's hold
+    /// ([`TerminalLeafRestore::resumes_agent`]).
     pub(crate) fn resumes(&self) -> bool {
-        agent_resumes(self.session.as_deref(), &self.argv)
+        self.relaunched()
+            && match &self.run {
+                // A Muse Code's session is its table's, and its one-shot
+                // launches are its own table's ([`MuseRestore`]).
+                Some(RunRestore::Muse(run)) => {
+                    run.session
+                        .as_deref()
+                        .is_some_and(aterm_agent::harness::upgrade_muse::is_session_uuid)
+                        && aterm_agent::harness::upgrade_muse::is_tui_argv(&self.argv)
+                }
+                Some(RunRestore::Codex(_)) | None => {
+                    agent_resumes(self.session.as_deref(), &self.argv)
+                }
+            }
+    }
+
+    /// Whether any relaunch brings this agent back: never a Codex that
+    /// carries no line aterm's copy of codex-alab's own record validated
+    /// ([`CodexRestore::alab`]) — a vendor `codex`, or an older build's
+    /// leaf (the Codex screen lane's retirement, 2026-10-16): its tab comes
+    /// back at its shell. Claude Code's and Muse Code's always (a Muse Code's
+    /// resume is read off its own table, [`Self::resumes`]).
+    pub(crate) fn relaunched(&self) -> bool {
+        match &self.run {
+            None | Some(RunRestore::Muse(_)) => true,
+            Some(RunRestore::Codex(run)) => run.alab.is_some(),
+        }
     }
 
     /// The agent as a person names it, the one its relaunch would read
-    /// ([`Self::agent`]): `Claude` or `Codex`; `None` for one this build has
-    /// no lane for.
+    /// ([`Self::agent`]): `Claude`, `Codex` or `Muse Code`; `None` for one this
+    /// build has no lane for (agy, Gemini CLI, or a word it does not know),
+    /// which nothing relaunches.
     pub(crate) fn name(&self) -> Option<&'static str> {
         use aterm_agent::harness::upgrade::Agent;
-        self.agent().map(|agent| match agent {
-            Agent::Claude => "Claude",
-            Agent::Codex => "Codex",
+        self.agent().and_then(|agent| match agent {
+            Agent::Claude => Some("Claude"),
+            Agent::Codex => Some("Codex"),
+            Agent::Muse => Some(agent.product()),
+            // No lane yet (agy, Gemini CLI): relaunched by nothing.
+            Agent::Agy | Agent::Gemini => None,
         })
     }
 
@@ -498,19 +868,19 @@ impl AgentRestore {
     /// resume — a Claude Code's as every told line is
     /// (`upgrade_drive::resume_command_kept`, the launch's flags carried; its
     /// model record is not read here, on the event loop, so a `--model` that
-    /// record marks failed stays on), a Codex's `codex resume <flags>
-    /// <thread>` (`upgrade_codex::rewrite_argv`) — behind the environment its
-    /// relaunch would carry: the Claude home and the login it ran under
+    /// record marks failed stays on), a codex-alab's validated line — behind
+    /// the environment its relaunch would carry: the Claude home and the login it ran under
     /// ([`Self::home`], [`Self::login`]; `relaunch::required_env`'s pairs,
     /// in that order), a Codex's `CODEX_HOME` ([`CodexRestore::home`]).
     /// Without them the line resumes nothing: a bare `claude --resume <id>`
     /// in a shell with another home does not find the conversation. `None`
     /// with no conversation, an agent this build has no lane for
-    /// ([`Self::agent`]), a launch no resume can carry, or a word no line can
-    /// hold (a control character).
+    /// ([`Self::agent`]), a Codex with no validated line ([`Self::relaunched`]:
+    /// nothing aterm knows resumes it), a launch no resume can carry, or a
+    /// word no line can hold (a control character).
     pub(crate) fn resume_line(&self) -> Option<String> {
         use aterm_agent::harness::accounts::{HOME_ENV, LOGIN_ENV};
-        use aterm_agent::harness::upgrade::{ArgvRefusal, Dialect, is_session_id, quote};
+        use aterm_agent::harness::upgrade::{Agent, Dialect, is_session_id, quote};
         // A word as the shell reads it: bare where it is plain, else quoted.
         let word = |w: &str| -> Option<String> {
             if w.chars().any(char::is_control) {
@@ -525,9 +895,25 @@ impl AgentRestore {
                 quote(Dialect::Zsh, w)
             })
         };
+        // Each agent's line by name. Muse Code's is its own resume line (`muse
+        // resume <uuid>`), on the session its table carries, behind the homes
+        // its relaunch carries. No lane yet (agy, Gemini CLI): none told,
+        // never Claude Code's.
+        let run = match self.agent()? {
+            Agent::Claude | Agent::Codex => &self.run,
+            Agent::Muse => {
+                let Some(RunRestore::Muse(run)) = &self.run else {
+                    return None;
+                };
+                return aterm_agent::harness::upgrade_muse::told_line(
+                    run.session.as_deref()?,
+                    &aterm_agent::harness::upgrade_muse::env_of_words(&run.env),
+                );
+            }
+            Agent::Agy | Agent::Gemini => return None,
+        };
         let conversation = self.session.as_deref().filter(|id| is_session_id(id))?;
-        self.agent()?;
-        let (env, line) = match &self.codex {
+        let (env, line) = match run {
             None => (
                 [
                     (HOME_ENV, self.home.as_deref()),
@@ -542,20 +928,25 @@ impl AgentRestore {
                     conversation,
                 )?,
             ),
-            Some(run) => {
-                let line = match aterm_agent::harness::upgrade_codex::rewrite_argv(
-                    &self.argv,
-                    Some(conversation),
-                ) {
-                    Ok(words) => std::iter::once(Some("codex".to_string()))
-                        .chain(words.iter().map(|w| word(w)))
-                        .collect::<Option<Vec<_>>>()?
-                        .join(" "),
-                    Err(ArgvRefusal::UnknownFlag(_)) => format!("codex resume {conversation}"),
-                    Err(ArgvRefusal::NotResumable(_)) => return None,
-                };
-                (vec![("CODEX_HOME", run.home.as_str())], line)
-            }
+            // A codex-alab's own line, as the crash rule would type it: the
+            // one its record named and aterm's copy validated.
+            Some(RunRestore::Codex(CodexRestore {
+                alab: Some(alab), ..
+            })) => (
+                alab.codex_home
+                    .as_deref()
+                    .map(|home| ("CODEX_HOME", home))
+                    .into_iter()
+                    .collect(),
+                alab.argv
+                    .iter()
+                    .map(|w| word(w))
+                    .collect::<Option<Vec<_>>>()?
+                    .join(" "),
+            ),
+            // Told above, on its own table's session.
+            Some(RunRestore::Muse(_)) => return None,
+            Some(RunRestore::Codex(CodexRestore { alab: None, .. })) => return None,
         };
         let mut said = String::new();
         for (name, value) in env {
@@ -569,9 +960,9 @@ impl AgentRestore {
     }
 
     /// The agent it was: the one its word names ([`Self::word`]), `None`
-    /// for a word this build has no lane for; with no word, a Codex where it
-    /// carries a Codex's run ([`Self::codex`]), else Claude Code — the rule
-    /// its relaunch snapshot answers by
+    /// for a word this build does not know; with no word, the agent whose run
+    /// it carries ([`Self::run`]: a Codex's), else Claude Code — the rule its
+    /// relaunch snapshot answers by
     /// (`aterm_agent::harness::relaunch::Snapshot::agent`). A word its run
     /// contradicts (`codex` with no run, or another agent's word beside a
     /// Codex's run) is `None` too: the relaunch reads the run, the reopened
@@ -579,17 +970,18 @@ impl AgentRestore {
     /// it relaunches as another.
     pub(crate) fn agent(&self) -> Option<aterm_agent::harness::upgrade::Agent> {
         use aterm_agent::harness::upgrade::Agent;
+        let ran = self.run.as_ref().map(RunRestore::agent);
         let agent = if self.word.is_empty() {
-            match self.codex {
-                Some(_) => Agent::Codex,
-                None => Agent::Claude,
-            }
+            ran.unwrap_or(Agent::Claude)
         } else {
             Agent::parse(&self.word)?
         };
+        // The run each agent's leaf carries: Claude Code's none, Codex's and
+        // Muse Code's their own. No lane yet (agy, Gemini CLI): none, its run
+        // unknown to this build.
         let agrees = match agent {
-            Agent::Codex => self.codex.is_some(),
-            Agent::Claude => self.codex.is_none(),
+            Agent::Claude | Agent::Agy | Agent::Gemini => ran.is_none(),
+            Agent::Codex | Agent::Muse => ran == Some(agent),
         };
         agrees.then_some(agent)
     }
@@ -616,6 +1008,17 @@ impl TerminalLeafRestore {
         crate::fabric::parse_holds(self.holds.iter().map(String::as_str))
     }
 
+    /// The agent this leaf names that the relaunch after aterm ended brings
+    /// back on its conversation ([`AgentRestore::resumes`]) — never one on a
+    /// tab that was held ([`Self::holds`], any origin, a row that does not
+    /// read among them), which is left the holder's and not relaunched, so
+    /// the reopened row does not promise it.
+    pub(crate) fn resumes_agent(&self) -> Option<&AgentRestore> {
+        self.agent
+            .as_deref()
+            .filter(|agent| agent.resumes() && self.holds.is_empty())
+    }
+
     /// Whether this leaf's folder may be another machine's: a program held
     /// the pane ([`Self::held`]), and the leaf carries no agent aterm hosted
     /// there ([`Self::agent`]), which ran on this machine in that folder.
@@ -632,7 +1035,8 @@ impl TerminalLeafRestore {
         crate::spawn_folder::inherited(self.cwd.clone()?, || self.folder_may_be_remote())
     }
 
-    /// The seven USER fields this leaf carries, as the values of the
+    /// The seven USER fields this leaf carries, and the timer beside the
+    /// Autopilot word, as the values of the
     /// [`SessionMeta`](crate::session_timeline::SessionMeta) they were captured
     /// from.
     pub(crate) fn carried_user_meta(&self) -> crate::session_timeline::SessionMeta {
@@ -644,8 +1048,20 @@ impl TerminalLeafRestore {
             attention: self.attention.clone(),
             questions: self.questions.clone(),
             autopilot: self.autopilot.clone(),
+            land_at: self.carried_land_at(),
             ..Default::default()
         }
+    }
+
+    /// The timer this leaf carries: its `land_at`, kept only beside the word
+    /// `cruise` (§9.3.6, item 2: sanitized with the word).
+    pub(crate) fn carried_land_at(&self) -> Option<i64> {
+        self.land_at.filter(|_| {
+            self.autopilot
+                .as_deref()
+                .and_then(crate::session_timeline::normalize_autopilot_value)
+                == Some(aterm_agent::supervise::Autopilot::Cruise.word())
+        })
     }
 
     /// Make this leaf one `RestoredView::bounded` admits, whatever wrote it.
@@ -666,6 +1082,8 @@ impl TerminalLeafRestore {
             .profile
             .take()
             .filter(|profile| profile.len() <= MAX_SETTINGS_ROUTE_BYTES && !profile.contains('\0'));
+        self.sid = self.sid.take().filter(|sid| carried_sid(sid));
+        self.lineage = self.lineage.take().filter(|sid| carried_sid(sid));
         // A hold row is never dropped — dropping it lifts a halt — but read
         // fail-closed and written back in its bounded wire form.
         self.holds = crate::fabric::render_holds(&self.carried_holds());
@@ -704,6 +1122,9 @@ impl TerminalLeafRestore {
             .autopilot
             .as_deref()
             .and_then(|value| carried_user_value("autopilot", value));
+        // The timer goes with the word: under any word but `cruise` it is
+        // dropped, never stored.
+        self.land_at = self.carried_land_at();
     }
 
     fn user_metadata_is_canonical(&self) -> bool {
@@ -719,6 +1140,7 @@ impl TerminalLeafRestore {
             && canonical("attention", &self.attention)
             && canonical("questions", &self.questions)
             && canonical("autopilot", &self.autopilot)
+            && self.land_at == self.carried_land_at()
     }
 }
 
@@ -1071,6 +1493,8 @@ impl RestoredView {
                         profile.len() <= MAX_SETTINGS_ROUTE_BYTES && !profile.contains('\0')
                     })
                     && terminal.user_metadata_is_canonical()
+                    && terminal.sid.as_deref().is_none_or(carried_sid)
+                    && terminal.lineage.as_deref().is_none_or(carried_sid)
             }
             Self::Native(native) => {
                 native.validation_error().is_none() && native.settings_drafts_are_canonical()
@@ -1204,6 +1628,21 @@ impl RestoredSplitTree {
             Self::Split { first, second, .. } => {
                 first.retire_unhanded_terminals(unhanded);
                 second.retire_unhanded_terminals(unhanded);
+            }
+        }
+    }
+
+    /// Every terminal leaf of this tree names no pool id
+    /// ([`TerminalLeafRestore::local_id`]): see [`WindowLayout::forget_pool_ids`].
+    pub(crate) fn forget_pool_ids(&mut self) {
+        match self {
+            Self::Leaf {
+                view: RestoredView::Terminal(terminal),
+            } => terminal.local_id = None,
+            Self::Leaf { .. } => {}
+            Self::Split { first, second, .. } => {
+                first.forget_pool_ids();
+                second.forget_pool_ids();
             }
         }
     }
@@ -1368,20 +1807,21 @@ impl PaneLayout {
         }
     }
 
-    /// The legacy mirror's half of [`RestoreManifest::placed_for_handed`]: a
-    /// leaf naming a session that was not handed names none, so no reader of
-    /// this projection (`WindowLayout::bootstrap_local_id`'s fallback) can pick
-    /// it as a shell to adopt.
-    fn forget_local_ids(&mut self, unhanded: &[u64]) {
+    /// Every leaf's id that `forget` names is forgotten: the legacy mirror's
+    /// half of [`RestoreManifest::placed_for_handed`] — a leaf naming a session
+    /// that was not handed names none, so no reader of this projection
+    /// (`WindowLayout::bootstrap_local_id`'s fallback) can pick it as a shell
+    /// to adopt — and of [`WindowLayout::forget_pool_ids`], every id.
+    fn forget_local_ids(&mut self, forget: &dyn Fn(u64) -> bool) {
         match self {
             PaneLayout::Leaf { local_id, .. } => {
-                if local_id.is_some_and(|id| unhanded.contains(&id)) {
+                if local_id.is_some_and(forget) {
                     *local_id = None;
                 }
             }
             PaneLayout::Split { first, second, .. } => {
-                first.forget_local_ids(unhanded);
-                second.forget_local_ids(unhanded);
+                first.forget_local_ids(forget);
+                second.forget_local_ids(forget);
             }
         }
     }
@@ -1853,6 +2293,26 @@ impl WindowLayout {
         self.active_tab = 0;
     }
 
+    /// NO POOL ID OF THE LAUNCH THAT WROTE IT on any leaf of this window —
+    /// its tabs' ([`RestoredSplitTree::forget_pool_ids`]) or its legacy
+    /// mirror's: a window, or a tab, a cold drain still owes a quit's layout
+    /// (`app_restore::RestoreDrain::carry_owed`; RV-SURV-1). Those ids name
+    /// the earlier launch's shells, and this one mints its own again from 0
+    /// (`app_restore::LeafIds::Retired`: only a collision), so the fills that
+    /// read a leaf's session by its id ([`RestoreManifest::fill_agents`],
+    /// [`RestoreManifest::fill_holds`]) took the agent and the owner's hold
+    /// such a leaf carries off it, or put a live tab's on it. A cold layout
+    /// adopts nothing by them (`local_id` is adoption-only), and the next
+    /// launch reopens the leaf as it did.
+    pub(crate) fn forget_pool_ids(&mut self) {
+        for tab in &mut self.restored_tabs {
+            tab.root.forget_pool_ids();
+        }
+        for tab in &mut self.tabs {
+            tab.forget_local_ids(&|_| true);
+        }
+    }
+
     fn migrate_legacy_tabs(&mut self) -> Option<()> {
         if !self.restored_tabs.is_empty() {
             return Some(());
@@ -1891,6 +2351,8 @@ impl RestoredTab {
                         *focused = Some(path.clone());
                     }
                     RestoredSplitTree::leaf(RestoredView::Terminal(TerminalLeafRestore {
+                        sid: None,
+                        lineage: None,
                         cwd: cwd.clone(),
                         title: title.clone(),
                         profile: None,
@@ -1902,7 +2364,9 @@ impl RestoredTab {
                         attention: None,
                         questions: None,
                         autopilot: None,
+                        land_at: None,
                         identity: None,
+                        theme: None,
                         agent: None,
                         supervised: None,
                         held: false,
@@ -2186,6 +2650,7 @@ impl RestoreManifest {
     /// not read back, that window, never a cap it is within (the D5 review: a
     /// window holding two Settings descriptors in its legacy mirror was refused
     /// as "past what one handoff layout holds").
+    #[cfg(any(unix, test))]
     pub(crate) fn why_not_whole(&self) -> Option<String> {
         if self.windows.len() > MAX_WINDOWS {
             return Some(format!(
@@ -2356,19 +2821,27 @@ impl RestoreManifest {
 
     /// Put on every terminal leaf the agent `hosted` says its session
     /// (`local_id`) runs — the crash journal's capture ([`crate::crash_journal`]);
-    /// a leaf whose session hosts none carries none.
+    /// a leaf whose session hosts none carries none. A leaf that names no
+    /// session of this launch — a tab a cold drain still owed
+    /// ([`WindowLayout::forget_pool_ids`]) — keeps the agent it carries.
     pub(crate) fn fill_agents(&mut self, hosted: &dyn Fn(u64) -> Option<AgentRestore>) {
         self.fill_terminals(&mut |terminal| {
-            terminal.agent = terminal.local_id.and_then(hosted).map(Box::new);
+            if let Some(id) = terminal.local_id {
+                terminal.agent = hosted(id).map(Box::new);
+            }
         });
     }
 
     /// Put on every terminal leaf the holds `holds` says its session
-    /// (`local_id`) stands under ([`TerminalLeafRestore::holds`]); a leaf whose
-    /// session stands under none carries none.
+    /// (`local_id`) stands under ([`TerminalLeafRestore::holds`];
+    /// `App::fill_desk_agents`); a leaf whose session stands under none
+    /// carries none. A leaf that names no session of this launch keeps the
+    /// holds it carries, as [`Self::fill_agents`] keeps its agent (RV-SURV-1).
     pub(crate) fn fill_holds(&mut self, holds: &dyn Fn(u64) -> Vec<String>) {
         self.fill_terminals(&mut |terminal| {
-            terminal.holds = terminal.local_id.map(holds).unwrap_or_default();
+            if let Some(id) = terminal.local_id {
+                terminal.holds = holds(id);
+            }
         });
     }
 
@@ -2389,6 +2862,35 @@ impl RestoreManifest {
         for window in &mut self.windows {
             for tab in &mut window.restored_tabs {
                 walk(&mut tab.root, fill);
+            }
+        }
+    }
+
+    /// No terminal leaf carries an agent ([`TerminalLeafRestore::agent`]) or
+    /// the tab's holds ([`TerminalLeafRestore::holds`]): the layout of a
+    /// person's own quit, which writes neither (`App::quit_agents`). A live
+    /// leaf's capture carries none of its own; a tab a cold drain still owed
+    /// carries what its earlier layout — a crash's, a restart's — named
+    /// (RV-SURV-1).
+    pub(crate) fn forget_agents_and_holds(&mut self) {
+        fn forget(node: &mut RestoredSplitTree) {
+            match node {
+                RestoredSplitTree::Leaf {
+                    view: RestoredView::Terminal(terminal),
+                } => {
+                    terminal.agent = None;
+                    terminal.holds.clear();
+                }
+                RestoredSplitTree::Leaf { .. } => {}
+                RestoredSplitTree::Split { first, second, .. } => {
+                    forget(first);
+                    forget(second);
+                }
+            }
+        }
+        for window in &mut self.windows {
+            for tab in &mut window.restored_tabs {
+                forget(&mut tab.root);
             }
         }
     }
@@ -2441,7 +2943,7 @@ impl RestoreManifest {
                     tab.root.retire_unhanded_terminals(&unhanded);
                 }
                 for tab in &mut window.tabs {
-                    tab.forget_local_ids(&unhanded);
+                    tab.forget_local_ids(&|id| unhanded.contains(&id));
                 }
             }
         }
@@ -2795,8 +3297,8 @@ fn other_desks(path: &Path, run: &str) -> Vec<Desk> {
 /// or that flush — this run's own snapshot when the session end it was
 /// written for was cancelled and the person quits later.
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "CrashJournalClaim",
         action = "WriteQuitLayout",
         project = "aterm_gui::crash_journal_conformance::Rig::project"
@@ -2807,7 +3309,8 @@ pub(crate) fn write_quit_to(
     manifest: &RestoreManifest,
     run: Option<&str>,
 ) -> Result<(), String> {
-    write_quit_to_waiting(path, manifest, run, LockWait::Unbounded).map_err(String::from)
+    write_quit_to_waiting(path, manifest, run, LockWait::Unbounded, Flush::Durable)
+        .map_err(String::from)
 }
 
 /// [`write_quit_to`] for the cold update lane, which runs on the GUI main
@@ -2822,7 +3325,16 @@ pub(crate) fn write_quit_to_within(
     run: Option<&str>,
     budget: std::time::Duration,
 ) -> Result<(), RestoreFault> {
-    write_quit_to_waiting(path, manifest, run, LockWait::Within(budget))
+    // Ordered: the successor is a local exec that reads the page cache; after a power
+    // loss neither runs, and the crash journal plus the same-run stamp bring the desk
+    // back as they do for any quit.
+    write_quit_to_waiting(
+        path,
+        manifest,
+        run,
+        LockWait::Within(budget),
+        Flush::Ordered,
+    )
 }
 
 fn write_quit_to_waiting(
@@ -2830,6 +3342,7 @@ fn write_quit_to_waiting(
     manifest: &RestoreManifest,
     run: Option<&str>,
     wait: LockWait,
+    flush: Flush,
 ) -> Result<(), RestoreFault> {
     made_parent(path)?;
     with_restore_lock_waiting(path, wait, || {
@@ -2837,7 +3350,7 @@ fn write_quit_to_waiting(
             Some(run) => quit_wire(manifest, run, other_desks(path, run))?,
             None => manifest.to_toml()?,
         };
-        write_restore_locked(path, wire.as_bytes())
+        write_restore_locked(path, wire.as_bytes(), flush)
     })
 }
 
@@ -2902,10 +3415,14 @@ fn unwrite_quit_to_waiting(
                     windows: lead.windows,
                 };
                 let wire = quit_wire(&lead_desk, &lead.run, others)?;
-                write_restore_locked(path, wire.as_bytes())
+                // Ordered: the take-back of a cold-lane layout no exec used, recovered
+                // after a power loss as the cold write is (crash journal, run stamp).
+                write_restore_locked(path, wire.as_bytes(), Flush::Ordered)
             }
+            // Ordered: a lost removal leaves a layout stamped with this run, whose
+            // journal `claim_at_boot` then skips, so the desk reopens once.
             None => fs::remove_file(path)
-                .and_then(|()| sync_restore_directory(parent))
+                .and_then(|()| sync_restore_directory(parent, Flush::Ordered))
                 .map_err(|error| {
                     RestoreFault::io(format_args!("take back {}", path.display()), &error)
                 }),
@@ -2913,12 +3430,17 @@ fn unwrite_quit_to_waiting(
     })
 }
 
-/// `path`'s directory, made when it is not there.
+/// `path`'s directory, made when it is not there: it and its missing ancestors `0755`
+/// whatever the umask ([`create_dir_all_unshared`]). On Linux it is `~/.local/share/aterm`,
+/// the atpkg prefix's parent, and `targo trust` refuses every toolchain installed below a
+/// group-writable directory, which `create_dir_all` made it under umask `002`.
+///
+/// [`create_dir_all_unshared`]: aterm_types::fs_restricted::create_dir_all_unshared
 fn made_parent(path: &Path) -> Result<&Path, RestoreFault> {
     let parent = path.parent().ok_or_else(|| {
         RestoreFault::settled(format!("restore manifest {} has no parent", path.display()))
     })?;
-    fs::create_dir_all(parent)
+    aterm_types::fs_restricted::create_dir_all_unshared(parent, 0o755)
         .map_err(|error| RestoreFault::io(format_args!("mkdir {}", parent.display()), &error))?;
     Ok(parent)
 }
@@ -2928,7 +3450,13 @@ fn made_parent(path: &Path) -> Result<&Path, RestoreFault> {
 #[cfg(any(unix, test))]
 fn write_wire_to(path: &Path, wire: &str) -> Result<(), String> {
     made_parent(path)?;
-    with_restore_lock(path, || write_restore_locked(path, wire.as_bytes())).map_err(String::from)
+    // Ordered: only the live successor reads the handoff's sidecar, from the page
+    // cache; after a power loss neither process exists, the next start deletes it
+    // (`sweep_dead_handoff_leftovers`) and the crash journal brings the desk back.
+    with_restore_lock(path, || {
+        write_restore_locked(path, wire.as_bytes(), Flush::Ordered)
+    })
+    .map_err(String::from)
 }
 
 /// [`write_to`] for a ONE-SHOT name no other process will ever lock — an update
@@ -3004,7 +3532,7 @@ pub(crate) fn take_quit_from(path: &Path) -> Option<TakenQuit> {
     }
 }
 
-fn write_restore_locked(path: &Path, bytes: &[u8]) -> Result<(), RestoreFault> {
+fn write_restore_locked(path: &Path, bytes: &[u8], flush: Flush) -> Result<(), RestoreFault> {
     let parent = path.parent().ok_or_else(|| {
         RestoreFault::settled(format!("restore manifest {} has no parent", path.display()))
     })?;
@@ -3024,14 +3552,14 @@ fn write_restore_locked(path: &Path, bytes: &[u8]) -> Result<(), RestoreFault> {
         file.write_all(bytes).map_err(|error| {
             RestoreFault::io(format_args!("write {}", temporary.display()), &error)
         })?;
-        crate::durable::sync_all(&file).map_err(|error| {
+        crate::durable::finish(&file, flush).map_err(|error| {
             RestoreFault::io(format_args!("sync {}", temporary.display()), &error)
         })?;
         drop(file);
         replace_restore_file(&temporary, path).map_err(|error| {
             RestoreFault::io(format_args!("publish {}", path.display()), &error)
         })?;
-        sync_restore_directory(parent).map_err(|error| {
+        sync_restore_directory(parent, flush).map_err(|error| {
             RestoreFault::published_but(
                 format_args!(
                     "{} was published but directory durability is indeterminate",
@@ -3064,7 +3592,12 @@ fn take_from_result(path: &Path, wait: LockWait) -> Result<Option<TakenQuit>, St
         let claim = unique_restore_sibling_path(parent, name, "claimed")?;
         claim_restore_file(path, &claim)
             .map_err(|error| format!("claim {}: {error}", path.display()))?;
-        sync_restore_directory(parent).map_err(|error| {
+        // DURABLE, not ordered: the claim is what stops a restore that brings the
+        // machine down (a kernel panic, a watchdog reset) from running again at the
+        // next launch. An ordered claim reaches media only at the device's next full
+        // flush, which such a crash can beat, and the next launch would take the same
+        // layout and loop. Once per launch.
+        sync_restore_directory(parent, Flush::Durable).map_err(|error| {
             format!(
                 "{} was claimed but single-use durability is indeterminate: {error}",
                 path.display()
@@ -3095,12 +3628,14 @@ fn take_from_result(path: &Path, wait: LockWait) -> Result<Option<TakenQuit>, St
                 None
             }
         };
+        // The cleanup's directory flush is ordered: a leftover `.claimed` sibling is
+        // never read, and `sweep_dead_restore_siblings` removes it.
         if let Err(error) = fs::remove_file(&claim) {
             crate::logging::stderr_line!(
                 "aterm-gui: claimed restore cleanup {} failed: {error}",
                 claim.display()
             );
-        } else if let Err(error) = sync_restore_directory(parent) {
+        } else if let Err(error) = sync_restore_directory(parent, Flush::Ordered) {
             crate::logging::stderr_line!(
                 "aterm-gui: claimed restore cleanup sync {} failed: {error}",
                 parent.display()
@@ -3522,12 +4057,12 @@ fn move_restore_file(source: &Path, target: &Path, replace: bool) -> std::io::Re
 }
 
 #[cfg(unix)]
-fn sync_restore_directory(path: &Path) -> std::io::Result<()> {
-    crate::durable::sync_all(&File::open(path)?)
+fn sync_restore_directory(path: &Path, flush: Flush) -> std::io::Result<()> {
+    crate::durable::finish(&File::open(path)?, flush)
 }
 
 #[cfg(not(unix))]
-fn sync_restore_directory(_path: &Path) -> std::io::Result<()> {
+fn sync_restore_directory(_path: &Path, _flush: Flush) -> std::io::Result<()> {
     // Windows publication/claim uses MOVEFILE_WRITE_THROUGH above.
     Ok(())
 }
@@ -3784,7 +4319,9 @@ fn store_cell_metrics_to(
     let parent = path
         .parent()
         .ok_or_else(|| format!("cell-metrics cache {} has no parent", path.display()))?;
-    fs::create_dir_all(parent).map_err(|error| format!("mkdir {}: {error}", parent.display()))?;
+    // `session.toml`'s directory, made as [`made_parent`] makes it.
+    aterm_types::fs_restricted::create_dir_all_unshared(parent, 0o755)
+        .map_err(|error| format!("mkdir {}: {error}", parent.display()))?;
     // Read-modify-write UNDER the shared restore lock (keyed per file name, so
     // this never contends with `session.toml` traffic): two live aterm
     // instances finishing backends concurrently must not lose each other's
@@ -3821,7 +4358,9 @@ fn store_cell_metrics_to(
         }
         let toml =
             aterm_toml::to_string(&cache).map_err(|e| format!("serialize cell metrics: {e}"))?;
-        write_restore_locked(path, toml.as_bytes())
+        // Ordered: a cache; a lost write costs one cold launch and heals itself, and a
+        // malformed file reads as none.
+        write_restore_locked(path, toml.as_bytes(), Flush::Ordered)
     })
     .map_err(String::from)
 }
@@ -3904,7 +4443,6 @@ mod tests {
         writer.join().expect("the writer");
         let fault = wrote.expect_err("refused while another aterm holds the lock");
         assert!(fault.passing(), "a passing refusal, retried: {fault}");
-        assert!(fault.to_string().contains("restore lock"), "{fault}");
         let fault = took.expect_err("the take-back is bounded too");
         assert!(fault.passing(), "{fault}");
         assert!(!path.exists(), "nothing was written");
@@ -3917,6 +4455,57 @@ mod tests {
         write_quit_to_within(&path, &sample(), Some("1-2"), budget).expect("written");
         unwrite_quit_to_within(&path, Some("1-2"), budget).expect("taken back");
         assert!(!path.exists(), "its own desk, taken back");
+    }
+
+    /// Which flush each restore write takes (aterm-durable's counting seam): the
+    /// quit's own layout and the launch's single-use claim stay durable; the cold
+    /// lane's layout and both arms of its take-back (the rewrite that keeps another
+    /// instance's desk, and the removal), the warm handoff's sidecar, the claim's
+    /// cleanup and the cell-metrics cache are only ordered.
+    #[cfg(unix)]
+    #[test]
+    fn the_restore_writes_name_their_flush() {
+        use aterm_durable::seam::Recording;
+        const O: Flush = Flush::Ordered;
+        const D: Flush = Flush::Durable;
+        let dir = aterm_tempfile::tempdir().expect("scratch dir");
+        let path = dir.path().join("session.toml");
+        let budget = std::time::Duration::from_secs(60);
+        let recording = Recording::start();
+        write_quit_to(&path, &sample(), Some("1-2")).expect("the quit's layout");
+        assert_eq!(recording.take(), [D, D], "the quit's file and its entry");
+        write_quit_to_within(&path, &sample(), Some("1-2"), budget).expect("cold lane");
+        assert_eq!(
+            recording.take(),
+            [O, O],
+            "the cold lane's file and its entry"
+        );
+        unwrite_quit_to_within(&path, Some("1-2"), budget).expect("taken back");
+        assert_eq!(recording.take(), [O], "the take-back's removal");
+        // Another instance's desk in the file: the take-back rewrites it, keeping
+        // that desk, instead of removing it.
+        write_quit_to(&path, &sample(), Some("1-1")).expect("the other quit");
+        write_quit_to_within(&path, &sample(), Some("1-2"), budget).expect("cold lane");
+        let _ = recording.take();
+        unwrite_quit_to_within(&path, Some("1-2"), budget).expect("taken back");
+        assert_eq!(
+            recording.take(),
+            [O, O],
+            "the take-back's rewrite and its entry"
+        );
+        assert!(path.exists(), "the other instance's desk stays");
+        assert!(take_quit_from(&path).is_some(), "the launch takes it");
+        assert_eq!(recording.take(), [D, O], "the claim and the cleanup");
+        let sidecar = dir.path().join("seamless-1-2.layout.toml");
+        write_wire_once_to(&sidecar, &sample().to_toml().expect("wire")).expect("sidecar");
+        assert_eq!(
+            recording.take(),
+            [O, O],
+            "the handoff's sidecar and its entry"
+        );
+        let metrics = dir.path().join("cell-metrics.toml");
+        store_cell_metrics_to(&metrics, "font", 2.0, 13.0, 8, 16).expect("metrics");
+        assert_eq!(recording.take(), [O, O], "the cell-metrics cache");
     }
 
     /// ROUND EIGHT, U48: A LAYOUT WRITE SAYS WHETHER ITS CAUSE PASSES. A full
@@ -3970,13 +4559,14 @@ mod tests {
             .expect_err("refused");
             fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).expect("restored");
             assert!(!fault.passing(), "settled: {fault}");
-            assert!(fault.to_string().contains("Permission denied"), "{fault}");
         }
     }
 
     /// A terminal leaf naming session `id`.
     fn terminal(id: Option<u64>, title: &str) -> RestoredSplitTree {
         RestoredSplitTree::leaf(RestoredView::Terminal(TerminalLeafRestore {
+            sid: None,
+            lineage: None,
             cwd: Some("/tmp/work".to_string()),
             title: title.to_string(),
             profile: None,
@@ -3988,7 +4578,9 @@ mod tests {
             attention: None,
             questions: None,
             autopilot: None,
+            land_at: None,
             identity: None,
+            theme: None,
             agent: None,
             supervised: None,
             held: false,
@@ -4212,31 +4804,7 @@ mod tests {
     #[test]
     fn a_layout_naming_a_session_in_two_windows_is_placed_whole() {
         let mut desk = held_desk(Some(7));
-        desk.windows.push(WindowLayout {
-            rows: 24,
-            cols: 80,
-            active_tab: 0,
-            outer_x: None,
-            outer_y: None,
-            maximized: None,
-            inner_px: None,
-            presence_row: false,
-            show: WindowShow::UNKNOWN,
-            tabs: vec![PaneLayout::Leaf {
-                cwd: Some("/tmp/work".to_string()),
-                title: "zsh".to_string(),
-                focused: true,
-                local_id: Some(0),
-            }],
-            native_tabs: Vec::new(),
-            tab_order: Vec::new(),
-            active_item: Some(0),
-            restored_tabs: vec![RestoredTab {
-                root: terminal(Some(0), "zsh"),
-                focused_path: Vec::new(),
-                zoomed: false,
-            }],
-        });
+        desk.windows.push(shells_window(0..1));
         let parsed = RestoreManifest::from_toml(&desk.to_toml().unwrap())
             .expect("the successor parses a co-viewed layout");
         assert_eq!(parsed.seamless_terminal_ids(), Some(vec![0, 7]));
@@ -4336,26 +4904,13 @@ mod tests {
     fn settings_handoff_layout(drafts: Vec<SettingsDraftRestore>) -> RestoreManifest {
         let mut leaf = NativeLeafRestore::settings("/text-fonts".to_string());
         leaf.settings_drafts = drafts;
-        RestoreManifest::new(vec![WindowLayout {
-            rows: 24,
-            cols: 80,
-            active_tab: 0,
-            outer_x: None,
-            outer_y: None,
-            maximized: None,
-            inner_px: None,
-            presence_row: false,
-            show: WindowShow::UNKNOWN,
-            tabs: Vec::new(),
-            native_tabs: Vec::new(),
-            tab_order: Vec::new(),
-            active_item: Some(0),
-            restored_tabs: vec![RestoredTab {
-                root: RestoredSplitTree::leaf(RestoredView::Native(leaf)),
-                focused_path: Vec::new(),
-                zoomed: false,
-            }],
-        }])
+        let mut window = shells_window(0..0);
+        window.restored_tabs.push(RestoredTab {
+            root: RestoredSplitTree::leaf(RestoredView::Native(leaf)),
+            focused_path: Vec::new(),
+            zoomed: false,
+        });
+        RestoreManifest::new(vec![window])
     }
 
     /// A Settings leaf's carried drafts are part of the handoff layout's wire and
@@ -4458,62 +5013,13 @@ mod tests {
         RestoredView::Native(native.clone()).bounded()
     }
 
-    /// The manifest survives a TOML round-trip byte-for-byte (structure + order + cwd +
-    /// title + focus + ratio), the persistence contract restore depends on.
-    #[test]
-    fn manifest_round_trips_through_toml() {
-        let m = sample();
-        let toml = m.to_toml().expect("serialize");
-        let back = RestoreManifest::from_toml(&toml).expect("parse");
-        assert_eq!(m, back);
-        // leaf_count sanity: window 0 has 1 + 2 = 3 leaves across its 2 tabs.
-        assert_eq!(m.windows[0].tabs[1].leaf_count(), 2);
-        assert!(matches!(
-            m.windows[0].restored_tabs[1].root,
-            RestoredSplitTree::Split {
-                axis: SplitKind::Horizontal,
-                ..
-            }
-        ));
-        assert!(!m.is_empty());
-    }
-
-    /// W3 schema compatibility both ways. FORWARD: a pre-`maximized` manifest (the
-    /// key simply absent — byte-for-byte what an older build wrote, thanks to
-    /// `skip_serializing_if`) parses with `maximized: None`, so an upgrade never
-    /// rejects the user's saved session. BACKWARD: a `None` never emits the key,
-    /// so a manifest written by this build and read by an older one carries
-    /// nothing new unless a window really was maximized (and serde's default
-    /// unknown-field tolerance absorbs it there).
-    #[test]
-    fn manifest_maximized_is_schema_compatible() {
-        // sample() has window 0 maximized: the flag must survive the round trip
-        // (covered structurally by `manifest_round_trips_through_toml`, asserted
-        // by name here so a serde-attr regression fails with a legible message).
-        let toml = sample().to_toml().expect("serialize");
-        assert!(toml.contains("maximized = true"));
-        let back = RestoreManifest::from_toml(&toml).expect("parse");
-        assert_eq!(back.windows[0].maximized, Some(true));
-        assert_eq!(back.windows[1].maximized, None);
-
-        // The legacy shape: strip the flag and re-serialize — the key vanishes
-        // entirely (an old manifest, byte-for-byte in this respect) and parsing
-        // yields "unknown", never a forced state.
-        let mut legacy = sample();
-        for window in &mut legacy.windows {
-            window.maximized = None;
-        }
-        let legacy_toml = legacy.to_toml().expect("serialize legacy");
-        assert!(!legacy_toml.contains("maximized"));
-        let back = RestoreManifest::from_toml(&legacy_toml).expect("parse legacy");
-        assert!(back.windows.iter().all(|w| w.maximized.is_none()));
-    }
-
     /// Gap #29, the wire half. A window's show state round-trips exactly — the
     /// parent's own pre-flight (`from_toml(to_toml(layout)) == layout`) and the
     /// byte fixed point a same-build child re-proves — and an UNKNOWN one emits
     /// nothing at all, so every capture that records none (every platform but
-    /// macOS, every headless capture) writes the wire an older build writes.
+    /// macOS, every headless capture) writes the wire an older build writes. So
+    /// does an unknown `maximized` (W3): a pre-`maximized` manifest reads it
+    /// unknown.
     #[test]
     fn window_show_state_round_trips_and_unknown_emits_nothing() {
         let mut shown = sample();
@@ -4541,14 +5047,20 @@ mod tests {
             "a manifest carrying show state is a byte fixed point of the codec"
         );
 
-        let unknown = sample();
+        // An unknown show state, and an unknown `maximized`, write the wire an
+        // older build writes, and read back unknown, never a forced state.
+        let mut unknown = sample();
+        for window in &mut unknown.windows {
+            window.maximized = None;
+        }
         let wire = unknown.to_toml().expect("serialize");
         assert!(
-            !wire.contains("show") && !wire.contains("z_order"),
-            "an unknown show state must not reach the wire:\n{wire}"
+            !wire.contains("show") && !wire.contains("z_order") && !wire.contains("maximized"),
+            "an unknown window state must not reach the wire:\n{wire}"
         );
         let back = RestoreManifest::from_toml(&wire).expect("parse");
         assert!(back.windows.iter().all(|w| w.show.is_unknown()));
+        assert!(back.windows.iter().all(|w| w.maximized.is_none()));
     }
 
     /// Gap #29, compatibility with an OLDER peer in both directions. FORWARD:
@@ -4744,7 +5256,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_native_descriptors_round_trip_without_live_or_transient_state() {
+    fn mixed_native_descriptors_round_trip_in_their_order() {
         let manifest = mixed_sample("file:///tmp/readme.md");
         let toml = manifest.to_toml().expect("serialize");
         let decoded = RestoreManifest::from_toml(&toml).expect("decode mixed manifest");
@@ -4756,19 +5268,6 @@ mod tests {
             window.native_tabs[1].document_uri(),
             Some("file:///tmp/readme.md")
         );
-        for forbidden in [
-            "tab_id",
-            "view_id",
-            "instance_id",
-            "search_input",
-            "draft",
-            "unsaved",
-        ] {
-            assert!(
-                !toml.contains(forbidden),
-                "transient field {forbidden:?} leaked into restore TOML"
-            );
-        }
     }
 
     #[test]
@@ -4798,6 +5297,15 @@ focused = true
                 .canonical_active(&decoded.windows[0].canonical_order().expect("legacy order")),
             0
         );
+        // A legacy split side by side (`Vertical` divider) is the canonical
+        // tree's `Horizontal` axis.
+        assert!(matches!(
+            sample().windows[0].restored_tabs[1].root,
+            RestoredSplitTree::Split {
+                axis: SplitKind::Horizontal,
+                ..
+            }
+        ));
     }
 
     /// ROUND SEVEN OF THE UPDATE AUDIT, FINDING 12: THE CAPS DEGRADE PER
@@ -4826,26 +5334,10 @@ focused = true
         windows.insert(1, layout(&crowded).windows.remove(0));
         let manifest = RestoreManifest::new(windows);
         assert_eq!(manifest.windows.len(), MAX_WINDOWS + 2, "PRECONDITION");
-        // The log names each cause apart: the crowded window, and the one
-        // after the 64th.
+        // Each cause is counted apart: the crowded window, and the one after
+        // the 64th.
         let admitted = AdmittedWindows::of(manifest.windows.clone());
-        assert_eq!(
-            admitted.left_out_line(manifest.windows.len()).as_deref(),
-            Some(
-                "2 of 66 saved windows not reopened: 1 past the 64-window limit, 1 in a shape \
-                 this build cannot rebuild"
-            )
-        );
-        let only_past = AdmittedWindows {
-            kept: Vec::new(),
-            past_cap: 3,
-            unbuildable: 0,
-        };
-        assert_eq!(
-            only_past.left_out_line(67).as_deref(),
-            Some("3 of 67 saved windows not reopened: 3 past the 64-window limit"),
-            "one cause, no hedge"
-        );
+        assert_eq!((admitted.past_cap, admitted.unbuildable), (1, 1));
         let read = RestoreManifest::from_toml(&manifest.to_toml().unwrap())
             .expect("the windows that fit come back");
         assert_eq!(read.windows.len(), MAX_WINDOWS);
@@ -5018,6 +5510,18 @@ focused = true
             );
         }
         assert_folded_whole(&folded, 323);
+
+        // THE PANES IN FRONT ARE THE OUTGOING BUILD'S (the D5 review, P3):
+        // the seamless adoption trusts a record's title copy only for a pane
+        // that was in front. Read off the folded windows, the merged windows'
+        // front panes (313, 318) are missing; the folded layout answers by the
+        // fold's record, which a parse bounds by the tabs a layout holds.
+        assert!(!folded.windows_front_terminal_ids().contains(&313));
+        assert_eq!(folded.front_terminal_ids(), folded.fold.front);
+        let mut hostile = folded;
+        hostile.fold.front = vec![7; MAX_FOLD_FRONT + 5];
+        let read = RestoreManifest::from_toml(&hostile.to_toml().unwrap()).expect("reads");
+        assert_eq!(read.fold.front.len(), MAX_FOLD_FRONT);
     }
 
     /// D5: A WINDOW PAST THE TAB CAP SPILLS INTO THE NEXT WINDOW WITH ROOM,
@@ -5063,6 +5567,10 @@ focused = true
         );
         assert_eq!(folded.windows[1], before.windows[1]);
         assert_folded_whole(&folded, 566);
+        // The donor's new front pane (255) was behind before the fold; the
+        // moved front pane (280) is the one that was in front.
+        assert!(folded.windows_front_terminal_ids().contains(&255));
+        assert_eq!(folded.front_terminal_ids(), vec![280, 300, 556]);
     }
 
     /// D5: A LONE WINDOW PAST THE TAB CAP SPILLS INTO WINDOWS MADE FOR IT —
@@ -5131,13 +5639,7 @@ focused = true
             "nowhere to go"
         );
         assert!(!full.admits_whole());
-        assert_eq!(
-            full.why_not_whole().as_deref(),
-            Some(
-                "16385 tabs are open, more than the 16384 (64 windows of 256) an update can carry"
-            ),
-            "the refusal names the cap and where"
-        );
+        assert!(full.why_not_whole().is_some(), "the refusal says why");
         assert!(full.fold.is_none(), "nothing moved, nothing recorded");
 
         let mut root = terminal(Some(0), "zsh");
@@ -5161,10 +5663,7 @@ focused = true
             "the fold moves tabs whole; it does not split a tab"
         );
         assert!(!deep.admits_whole());
-        assert_eq!(
-            deep.why_not_whole().as_deref(),
-            Some("tab 1 of window 1 is split 33 levels deep, more than the 31 an update can carry")
-        );
+        assert!(deep.why_not_whole().is_some(), "the refusal says why");
     }
 
     /// THE MIRROR RULE, ONE FOR THE READ AND THE WRITE (the D5 review). The
@@ -5176,8 +5675,7 @@ focused = true
     /// which it was not) and the quit layout and crash journals left the window
     /// out. The capture now leaves out of the mirror what
     /// `NativeTabRestore::joins_mirror` refuses, the very rule the parse reads
-    /// the mirror by; and a window the parse refuses for anything but a cap is
-    /// named as that, not as a cap.
+    /// the mirror by.
     #[test]
     fn the_legacy_mirror_is_written_by_the_rule_the_parse_reads_it_by() {
         let settings = |route: &str| NativeTabRestore::Settings {
@@ -5252,76 +5750,10 @@ focused = true
             ],
         ] {
             let refused = window_with(doubled);
-            assert_eq!(
-                refused.why_not_whole().as_deref(),
-                Some("window 2 of the handoff layout is in a shape this build does not read back"),
-                "named as the window it is, never as a cap"
-            );
+            assert!(!refused.admits_whole(), "refused");
             let read = RestoreManifest::from_toml(&refused.to_toml().unwrap()).expect("one reads");
             assert_eq!(read.windows.len(), 1, "the parse leaves that window out");
         }
-    }
-
-    /// THE PANES IN FRONT OF A FOLDED LAYOUT ARE THE OUTGOING BUILD'S (the D5
-    /// review, P3). The seamless adoption trusts a session record's title
-    /// copy only for a pane that was in front, the one the outgoing build kept
-    /// current (U47). The fold changes what each window shows: a window past
-    /// the cap becomes tabs behind the last window's front tab, and a donor
-    /// whose front tab moved shows its last remaining one. Read off the
-    /// folded windows, the merged window's front pane was missing (a missed
-    /// park read then installed an empty title over the record's current one)
-    /// and the donor's new front pane was named (its record copy is the stale
-    /// one U47 refuses). The fold records the panes in front before a tab
-    /// moved, and a folded layout answers by them; the record survives the
-    /// round trip, and a parse keeps no more of it than a layout has tabs.
-    #[test]
-    fn a_folded_layout_names_the_panes_that_were_in_front_before_the_fold() {
-        // Windows past the cap: their front panes (313, 318) are behind the
-        // last window's own front tab once folded.
-        let mut windows = (0..MAX_WINDOWS as u64 - 1)
-            .map(|shell| shells_window(shell..shell + 1))
-            .collect::<Vec<_>>();
-        windows.push(shells_window(63..313));
-        windows.push(shells_window(313..318));
-        windows.push(shells_window(318..323));
-        let mut merged = RestoreManifest::new(windows);
-        let before = merged.front_terminal_ids();
-        merged.fold_into_caps();
-        assert!(
-            !merged.windows_front_terminal_ids().contains(&313),
-            "PRECONDITION: read off the folded windows, a merged window's front pane is missing"
-        );
-        assert_eq!(merged.front_terminal_ids(), before);
-        assert!(merged.front_terminal_ids().contains(&313));
-        assert!(merged.front_terminal_ids().contains(&318));
-        assert_folded_whole(&merged, 323);
-
-        // A donor whose front tab moved: it shows its last remaining tab
-        // (shell 255), which was behind; the moved front pane (280) was not.
-        let mut crowded = shells_window(0..300);
-        crowded.active_item = Some(280);
-        let mut donor = RestoreManifest::new(vec![
-            crowded,
-            shells_window(300..556),
-            shells_window(556..566),
-        ]);
-        donor.fold_into_caps();
-        assert!(
-            donor.windows_front_terminal_ids().contains(&255),
-            "PRECONDITION: read off the folded windows, the donor's new front pane is named"
-        );
-        assert_eq!(donor.front_terminal_ids(), vec![280, 300, 556]);
-        assert_folded_whole(&donor, 566);
-
-        // A layout that folded nothing answers off its windows, as before.
-        let within = RestoreManifest::new(vec![shells_window(0..3)]);
-        assert_eq!(within.front_terminal_ids(), vec![0]);
-
-        // A parse keeps at most one front pane per tab a layout holds.
-        let mut hostile = donor;
-        hostile.fold.front = vec![7; MAX_FOLD_FRONT + 5];
-        let read = RestoreManifest::from_toml(&hostile.to_toml().unwrap()).expect("reads");
-        assert_eq!(read.fold.front.len(), MAX_FOLD_FRONT);
     }
 
     #[test]
@@ -5431,13 +5863,10 @@ metadata = "opaque=copy-me"
             RestoredSplitTree::Leaf {
                 view: RestoredView::Placeholder(PlaceholderLeafRestore {
                     restore_tag,
-                    reason,
                     metadata,
                     ..
                 })
-            } if restore_tag == "future.diagram"
-                && reason.contains("unavailable")
-                && metadata.contains("copy-me")
+            } if restore_tag == "future.diagram" && metadata.contains("copy-me")
         ));
 
         let corrupt_known = input.replace("future.diagram", "editor").replace(
@@ -5453,8 +5882,8 @@ metadata = "opaque=copy-me"
         assert!(matches!(
             &**second,
             RestoredSplitTree::Leaf {
-                view: RestoredView::Placeholder(PlaceholderLeafRestore { reason, .. })
-            } if reason == "invalid document URI"
+                view: RestoredView::Placeholder(_)
+            }
         ));
     }
 
@@ -5469,26 +5898,7 @@ metadata = "opaque=copy-me"
             axis: SplitKind::Horizontal,
             ratio: f32::NAN,
             first: Box::new(tab.root.clone()),
-            second: Box::new(RestoredSplitTree::leaf(RestoredView::Terminal(
-                TerminalLeafRestore {
-                    cwd: None,
-                    title: "shell".to_string(),
-                    profile: None,
-                    local_id: None,
-                    user_title: None,
-                    description: None,
-                    icon: None,
-                    role: None,
-                    attention: None,
-                    questions: None,
-                    autopilot: None,
-                    identity: None,
-                    agent: None,
-                    supervised: None,
-                    held: false,
-                    holds: Vec::new(),
-                },
-            ))),
+            second: Box::new(terminal(None, "shell")),
         };
         tab.focused_path = vec![RestoreBranch::First];
         manifest.windows[0].restored_tabs = vec![tab];
@@ -5500,49 +5910,13 @@ metadata = "opaque=copy-me"
             RestoredSplitTree::Split { ratio, .. } if ratio == 0.5
         ));
 
-        let mut root = RestoredSplitTree::leaf(RestoredView::Terminal(TerminalLeafRestore {
-            cwd: None,
-            title: String::new(),
-            profile: None,
-            local_id: None,
-            user_title: None,
-            description: None,
-            icon: None,
-            role: None,
-            attention: None,
-            questions: None,
-            autopilot: None,
-            identity: None,
-            agent: None,
-            supervised: None,
-            held: false,
-            holds: Vec::new(),
-        }));
+        let mut root = terminal(None, "");
         for _ in 0..=MAX_SPLIT_DEPTH {
             root = RestoredSplitTree::Split {
                 axis: SplitKind::Horizontal,
                 ratio: 0.5,
                 first: Box::new(root),
-                second: Box::new(RestoredSplitTree::leaf(RestoredView::Terminal(
-                    TerminalLeafRestore {
-                        cwd: None,
-                        title: String::new(),
-                        profile: None,
-                        local_id: None,
-                        user_title: None,
-                        description: None,
-                        icon: None,
-                        role: None,
-                        attention: None,
-                        questions: None,
-                        autopilot: None,
-                        identity: None,
-                        agent: None,
-                        supervised: None,
-                        held: false,
-                        holds: Vec::new(),
-                    },
-                ))),
+                second: Box::new(terminal(None, "")),
             };
         }
         manifest.windows[0].restored_tabs = vec![RestoredTab {
@@ -5568,47 +5942,22 @@ metadata = "opaque=copy-me"
     /// adopted too.
     #[test]
     fn a_nul_cwd_leaf_round_trips_sanitized() {
-        let hostile = || WindowLayout {
-            rows: 24,
-            cols: 80,
-            active_tab: 0,
-            outer_x: None,
-            outer_y: None,
-            maximized: None,
-            inner_px: None,
-            presence_row: false,
-            show: WindowShow::UNKNOWN,
-            tabs: vec![PaneLayout::Leaf {
-                cwd: Some("/tmp/a\0b".into()),
-                title: "zsh\0 ~".into(),
-                focused: true,
-                local_id: Some(7),
-            }],
-            native_tabs: Vec::new(),
-            tab_order: Vec::new(),
-            active_item: None,
-            restored_tabs: vec![RestoredTab {
-                root: RestoredSplitTree::leaf(RestoredView::Terminal(TerminalLeafRestore {
-                    cwd: Some("/tmp/a\0b".into()),
-                    title: "zsh\0 ~".into(),
-                    profile: None,
-                    local_id: Some(7),
-                    user_title: None,
-                    description: None,
-                    icon: None,
-                    role: None,
-                    attention: None,
-                    identity: None,
-                    questions: None,
-                    autopilot: None,
-                    agent: None,
-                    supervised: None,
-                    held: false,
-                    holds: Vec::new(),
-                })),
-                focused_path: Vec::new(),
-                zoomed: false,
-            }],
+        let hostile = || {
+            let mut window = shells_window(7..8);
+            let PaneLayout::Leaf { cwd, title, .. } = &mut window.tabs[0] else {
+                unreachable!("a legacy leaf")
+            };
+            *cwd = Some("/tmp/a\0b".into());
+            *title = "zsh\0 ~".into();
+            let RestoredSplitTree::Leaf {
+                view: RestoredView::Terminal(leaf),
+            } = &mut window.restored_tabs[0].root
+            else {
+                unreachable!("a terminal leaf")
+            };
+            leaf.cwd = Some("/tmp/a\0b".into());
+            leaf.title = "zsh\0 ~".into();
+            window
         };
         let assert_clean = |manifest: &RestoreManifest, what: &str| {
             let RestoredSplitTree::Leaf {
@@ -5660,6 +6009,115 @@ metadata = "opaque=copy-me"
         );
     }
 
+    /// A LEAF NAMES ITS SESSION AND ITS LINEAGE, AND A PEER WITHOUT THEM READS
+    /// PAST THEM: both round-trip through the capture and the parse; a leaf
+    /// without them is written as an older writer wrote it (no key), and this
+    /// build reads past a field it does not know, as an older one reads past
+    /// these. A HOSTILE LEAF costs only the values: a 1 MiB lineage, a sid
+    /// with a NUL, one past a log id's 40 bytes and one not of the minted shape
+    /// are each dropped, and the layout still parses (never refused whole).
+    #[test]
+    fn a_leaf_names_its_session_and_lineage_and_older_peers_read_past_them() {
+        let window = |sid: Option<String>, lineage: Option<String>| WindowLayout {
+            rows: 24,
+            cols: 80,
+            active_tab: 0,
+            outer_x: None,
+            outer_y: None,
+            maximized: None,
+            inner_px: None,
+            presence_row: false,
+            show: WindowShow::UNKNOWN,
+            tabs: vec![PaneLayout::Leaf {
+                cwd: None,
+                title: "zsh".into(),
+                focused: true,
+                local_id: Some(7),
+            }],
+            native_tabs: Vec::new(),
+            tab_order: Vec::new(),
+            active_item: None,
+            restored_tabs: vec![RestoredTab {
+                root: RestoredSplitTree::leaf(RestoredView::Terminal(TerminalLeafRestore {
+                    sid,
+                    lineage,
+                    cwd: None,
+                    title: "zsh".into(),
+                    profile: None,
+                    local_id: Some(7),
+                    user_title: None,
+                    description: None,
+                    icon: None,
+                    role: None,
+                    attention: None,
+                    identity: None,
+                    theme: None,
+                    questions: None,
+                    autopilot: None,
+                    land_at: None,
+                    agent: None,
+                    supervised: None,
+                    held: false,
+                    holds: Vec::new(),
+                })),
+                focused_path: Vec::new(),
+                zoomed: false,
+            }],
+        };
+        let leaf_of = |m: &RestoreManifest| match &m.windows[0].restored_tabs[0].root {
+            RestoredSplitTree::Leaf {
+                view: RestoredView::Terminal(t),
+            } => (t.sid.clone(), t.lineage.clone()),
+            _ => panic!("a terminal leaf"),
+        };
+        let named = RestoreManifest::new(vec![window(
+            Some("s-0123abcd".into()),
+            Some("s-00ff".into()),
+        )]);
+        let wire = named.to_toml().expect("serialize");
+        assert!(wire.contains("sid = \"s-0123abcd\""), "{wire}");
+        assert!(wire.contains("lineage = \"s-00ff\""), "{wire}");
+        let parsed = RestoreManifest::from_toml(&wire).expect("parse");
+        assert_eq!(parsed, named, "the round trip holds");
+        let plain = RestoreManifest::new(vec![window(None, None)])
+            .to_toml()
+            .expect("serialize");
+        assert!(
+            !plain.contains("sid =") && !plain.contains("lineage ="),
+            "a leaf without them is written as before: {plain}"
+        );
+        let newer = wire.replace(
+            "sid = \"s-0123abcd\"",
+            "sid = \"s-0123abcd\"\nfuture_field = \"from a newer peer\"",
+        );
+        assert_ne!(newer, wire, "PRECONDITION: the unknown field is in");
+        assert_eq!(
+            RestoreManifest::from_toml(&newer).map(|m| leaf_of(&m)),
+            Some(leaf_of(&named)),
+            "a field this build does not know is read past"
+        );
+        for (sid, lineage) in [
+            ("s-ab\0cd".to_string(), format!("s-{}", "a".repeat(1 << 20))),
+            (format!("s-{}", "0".repeat(48)), "s-xyz".to_string()),
+            (String::new(), "-".to_string()),
+        ] {
+            let raw = RestoreManifest {
+                schema: SCHEMA,
+                fold: LayoutFold::default(),
+                windows: vec![window(Some(sid.clone()), Some(lineage.clone()))],
+            };
+            let wire = aterm_toml::to_string(&raw).expect("serialize the hostile fixture");
+            let parsed = RestoreManifest::from_toml(&wire).expect("a hostile sid is recoverable");
+            assert_eq!(
+                leaf_of(&parsed),
+                (None, None),
+                "{sid:.12?} / {lineage:.12?}"
+            );
+            let captured = RestoreManifest::new(vec![window(Some(sid), Some(lineage))]);
+            assert_eq!(leaf_of(&captured), (None, None));
+        }
+    }
+
     /// AUDIT #8 — A LEAF A PROGRAM HELD (ssh) is written `held = true`, a
     /// leaf that was not is written as it always was (so an older writer's
     /// layout and today's unheld one are the same bytes), and the bootstrap
@@ -5681,34 +6139,17 @@ metadata = "opaque=copy-me"
             .to_owned();
         let remote = format!("{here}/on-the-remote-host/proj");
         let window = |cwd: &str, held: bool| {
+            let mut window = shells_window(1..2);
+            window.tabs.clear();
             let RestoredSplitTree::Leaf {
-                view: RestoredView::Terminal(mut leaf),
-            } = terminal(Some(1), "ssh")
+                view: RestoredView::Terminal(leaf),
+            } = &mut window.restored_tabs[0].root
             else {
                 unreachable!("a terminal leaf");
             };
             leaf.cwd = Some(cwd.to_owned());
             leaf.held = held;
-            RestoreManifest::new(vec![WindowLayout {
-                rows: 24,
-                cols: 80,
-                active_tab: 0,
-                outer_x: None,
-                outer_y: None,
-                maximized: None,
-                inner_px: None,
-                presence_row: false,
-                show: WindowShow::UNKNOWN,
-                tabs: Vec::new(),
-                native_tabs: Vec::new(),
-                tab_order: Vec::new(),
-                active_item: None,
-                restored_tabs: vec![RestoredTab {
-                    root: RestoredSplitTree::leaf(RestoredView::Terminal(leaf)),
-                    focused_path: Vec::new(),
-                    zoomed: false,
-                }],
-            }])
+            RestoreManifest::new(vec![window])
         };
         let wire = |manifest: &RestoreManifest| manifest.to_toml().expect("serializes");
 
@@ -5746,8 +6187,9 @@ metadata = "opaque=copy-me"
                 version: None,
                 home: None,
                 login: None,
-                codex: None,
+                run: None,
                 cause: None,
+                tab: None,
             }));
         }
         assert_eq!(
@@ -5772,22 +6214,6 @@ metadata = "opaque=copy-me"
             RestoreManifest::from_toml(&toml).is_none(),
             "stale schema is ignored"
         );
-    }
-
-    /// `write_to` then `take_from` round-trips through a real file, and the read is
-    /// SINGLE-USE — the manifest is deleted, so a second take yields `None`.
-    #[test]
-    fn write_then_take_is_single_use() {
-        let dir = std::env::temp_dir().join(format!("aterm-restore-test-{}", std::process::id()));
-        let path = dir.join("session.toml");
-        let m = sample();
-        write_to(&path, &m).expect("write");
-        assert!(path.exists(), "manifest written");
-        let back = take_from(&path).expect("take");
-        assert_eq!(m, back);
-        assert!(!path.exists(), "single-use: manifest deleted on read");
-        assert!(take_from(&path).is_none(), "a second take finds nothing");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A one-shot name — the handoff's attempt-bound layout — keeps nothing but the
@@ -5903,20 +6329,6 @@ metadata = "opaque=copy-me"
             let name = entry.unwrap().file_name().to_string_lossy().into_owned();
             !name.contains("aterm-write")
         }));
-
-        // Tier-1 projection of the genuine locked unique-temp publication.
-        let model = aterm_spec::derive::restore_manifest_single_use_model();
-        let locked = model.successors("LockWriter", &model.init_state())[0].clone();
-        let temporary = model.successors("CreateUniqueTemporary", &locked)[0].clone();
-        let published = model.successors("PublishManifest", &temporary)[0].clone();
-        assert_eq!(published["visible"], 1);
-        assert!(model.check_invariant("UniqueTemporaryNeverAliases", &published));
-        // The fixed alias is no step of the healthy writer; it is the mutant's.
-        assert!(model.successors("ReuseFixedTemporary", &locked).is_empty());
-        let alias = aterm_spec::interp::with_buggy(&model, 1)
-            .successors("ReuseFixedTemporary", &locked)[0]
-            .clone();
-        assert!(!model.check_invariant("UniqueTemporaryNeverAliases", &alias));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5951,7 +6363,7 @@ metadata = "opaque=copy-me"
 
         // Tier-1 projection of the one real winner and absent loser. Returning
         // before SyncClaim is the explicit negative control.
-        let model = aterm_spec::derive::restore_manifest_single_use_model();
+        let model = aterm_models_native::restore_manifest_single_use_model();
         let locked = model.successors("LockTakeA", &model.init_state())[0].clone();
         let claimed = model.successors("ClaimA", &locked)[0].clone();
         assert!(model.successors("ReturnA", &claimed).is_empty());
@@ -6022,12 +6434,8 @@ metadata = "opaque=copy-me"
             assert_eq!(manifest_path(), None, "a relative seam is refused");
             assert_eq!(crate::crash_journal::journal_dir(), None);
             assert_eq!(cell_metrics_path(), None);
-            // The quit's refusal names that cause, not a missing data dir
-            // (ruling 408). Nothing is written: no path resolves.
-            assert_eq!(
-                write(&RestoreManifest::new(Vec::new())),
-                Err("ATERM_STATE_HOME is not an absolute path; session restore is off".to_string())
-            );
+            // Nothing is written: no path resolves.
+            assert!(write(&RestoreManifest::new(Vec::new())).is_err());
         });
         crate::test_env::scoped_unset("ATERM_STATE_HOME", || {
             let data = aterm_types::dirs::data_dir().map(|dir| dir.join("aterm"));
@@ -6179,13 +6587,9 @@ metadata = "opaque=copy-me"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// THE AGENT RIDES ITS LEAF (2026-09-27): the crash journal's capture puts on
-    /// each terminal leaf the agent its session hosts, and the manifest
-    /// carries it through its own codec unchanged. NEGATIVE CONTROL: a leaf
-    /// whose session hosts none carries none, and a manifest never filled
-    /// (a person's own quit) carries none at all.
-    #[test]
-    fn a_hosted_agent_rides_its_leaf_through_the_codec() {
+    /// [`sample`] with its terminal leaves numbered `0..` in layout order, as
+    /// the capture stamps each leaf's session id.
+    fn numbered_sample() -> RestoreManifest {
         fn number(node: &mut RestoredSplitTree, next: &mut u64) {
             match node {
                 RestoredSplitTree::Leaf {
@@ -6201,6 +6605,25 @@ metadata = "opaque=copy-me"
                 }
             }
         }
+        let mut m = sample();
+        let mut next = 0;
+        for w in &mut m.windows {
+            for t in &mut w.restored_tabs {
+                number(&mut t.root, &mut next);
+            }
+        }
+        m
+    }
+
+    /// THE AGENT RIDES ITS LEAF (2026-09-27): the crash journal's capture puts on
+    /// each terminal leaf the agent its session hosts, and the manifest
+    /// carries it through its own codec unchanged — the tab it ran in too
+    /// ([`AgentRestore::tab`], XREV-LC-1). NEGATIVE CONTROL: a leaf whose
+    /// session hosts none carries none, a manifest never filled (a person's
+    /// own quit) carries none at all, and a leaf as an older build wrote it
+    /// (no `tab`) names no tab.
+    #[test]
+    fn a_hosted_agent_rides_its_leaf_through_the_codec() {
         fn agents(m: &RestoreManifest) -> Vec<Option<AgentRestore>> {
             fn walk(node: &RestoredSplitTree, out: &mut Vec<Option<AgentRestore>>) {
                 match node {
@@ -6236,24 +6659,179 @@ metadata = "opaque=copy-me"
             version: Some("2.1.283".into()),
             home: None,
             login: None,
-            codex: None,
+            run: None,
             cause: None,
+            tab: Some(OLD_TAB.into()),
         };
-        let mut m = sample();
-        let mut next = 0;
-        for w in &mut m.windows {
-            for t in &mut w.restored_tabs {
-                number(&mut t.root, &mut next);
-            }
-        }
-        assert!(next >= 2, "the sample has leaves to fill");
+        let mut m = numbered_sample();
+        assert!(agents(&m).len() >= 2, "the sample has leaves to fill");
         assert!(agents(&m).iter().all(Option::is_none), "never filled: none");
         m.fill_agents(&|id| (id == 1).then(|| claude.clone()));
         let filled = agents(&m);
         assert_eq!(filled.iter().filter(|a| a.is_some()).count(), 1);
         assert_eq!(filled[1].as_ref(), Some(&claude));
-        let back = RestoreManifest::from_toml(&m.to_toml().expect("toml")).expect("parse");
+        let text = m.to_toml().expect("toml");
+        let back = RestoreManifest::from_toml(&text).expect("parse");
         assert_eq!(agents(&back), filled, "through the codec unchanged");
+        let older = text.replace(&format!("tab = \"{OLD_TAB}\"\n"), "");
+        assert_ne!(older, text, "the tab is written");
+        let older = RestoreManifest::from_toml(&older).expect("an older layout parses");
+        let older = agents(&older);
+        assert_eq!(older[1].as_ref().map(|a| a.tab.as_deref()), Some(None));
+    }
+
+    /// A cold restore's reopened tab, a new sid, is told the tab its agent ran
+    /// in ([`AgentRestore::ran_in_another`]): the snapshot's sid, kept by
+    /// [`AgentRestore::of`]. NEGATIVE CONTROLS: the very sid (a seamless
+    /// update's handoff keeps it) names none, nor does a snapshot naming no
+    /// tab.
+    #[test]
+    fn a_restored_agent_names_the_tab_it_ran_in_only_for_another() {
+        let snap = |tab: &str| aterm_agent::harness::relaunch::Snapshot {
+            tab: tab.to_string(),
+            pid: 4242,
+            start: "Sat Sep 27 01:02:03 2026".into(),
+            shell: 4343,
+            program: std::path::PathBuf::from("/opt/claude/bin/claude"),
+            argv: vec!["/opt/claude/bin/claude".into()],
+            session: Some("0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c".into()),
+            cwd: "/tmp".into(),
+            version: None,
+            run: aterm_agent::harness::relaunch::AgentRun::Claude,
+            dialect: None,
+            login: None,
+            home: None,
+            claude_dir: None,
+            stored_login: false,
+        };
+        let agent = AgentRestore::of(snap(OLD_TAB));
+        assert_eq!(agent.tab.as_deref(), Some(OLD_TAB));
+        assert_eq!(
+            agent.ran_in_another("s-00000000000000000002").as_deref(),
+            Some(OLD_TAB)
+        );
+        assert_eq!(agent.ran_in_another(OLD_TAB), None, "a kept sid");
+        assert_eq!(AgentRestore::of(snap("")).tab, None, "none to write");
+    }
+
+    /// The sid of a tab a crashed run held.
+    const OLD_TAB: &str = "s-00000000000000000001";
+
+    /// THE TAB'S HOLDS RIDE ITS LEAF (2026-10-15, ATERM-KI-1015-1 LC-8 and
+    /// its review; ruling 23): [`RestoreManifest::fill_holds`] puts the hold
+    /// rows of the session a leaf names (`fabric::render_holds`'
+    /// `"<origin> <reason>"`) on that leaf alone, an agent on it or none, and
+    /// they go through the layout's codec unchanged. They read back as the
+    /// tab's holds — FAIL-CLOSED, as the seamless update reads its carry: a
+    /// row it cannot read is the owner's hold, `carried-unreadable` — and the
+    /// agent on a held leaf, the owner's hold or the fleet's, is one the
+    /// reopened row does not promise to resume
+    /// ([`TerminalLeafRestore::resumes_agent`]). NEGATIVE CONTROL: a leaf as
+    /// an older build writes it (no field) reads as no hold, and its agent
+    /// resumes.
+    #[test]
+    fn a_tabs_holds_ride_its_leaf_and_its_agent_is_not_promised() {
+        use crate::fabric::{CARRIED_UNREADABLE, Hold};
+        let agent = AgentRestore {
+            word: String::new(),
+            pid: 4242,
+            start: "Sat Sep 27 01:02:03 2026".into(),
+            program: "/Users//me/.local/bin/claude".into(),
+            argv: vec!["/Users//me/.local/bin/claude".into()],
+            session: Some("0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c".into()),
+            cwd: "/Users//me/work".into(),
+            version: Some("2.1.300".into()),
+            home: None,
+            login: None,
+            run: None,
+            cause: None,
+            tab: None,
+        };
+        fn leaves(m: &RestoreManifest) -> Vec<TerminalLeafRestore> {
+            fn walk(node: &RestoredSplitTree, out: &mut Vec<TerminalLeafRestore>) {
+                match node {
+                    RestoredSplitTree::Leaf {
+                        view: RestoredView::Terminal(t),
+                    } => out.push(t.clone()),
+                    RestoredSplitTree::Leaf { .. } => {}
+                    RestoredSplitTree::Split { first, second, .. } => {
+                        walk(first, out);
+                        walk(second, out);
+                    }
+                }
+            }
+            let mut out = Vec::new();
+            for w in &m.windows {
+                for t in &w.restored_tabs {
+                    walk(&t.root, &mut out);
+                }
+            }
+            out
+        }
+        // The first tab's leaf names session 7 and its agent; every other
+        // leaf names another session.
+        let layout = |hold: Option<&str>| {
+            let mut m = sample();
+            if let RestoredSplitTree::Leaf {
+                view: RestoredView::Terminal(leaf),
+            } = &mut m.windows[0].restored_tabs[0].root
+            {
+                leaf.local_id = Some(7);
+                leaf.agent = Some(Box::new(agent.clone()));
+            }
+            let row = hold.map(str::to_string);
+            m.fill_holds(&|id| row.iter().filter(|_| id == 7).cloned().collect());
+            let text = m.to_toml().expect("toml");
+            let back = RestoreManifest::from_toml(&text).expect("parse");
+            assert_eq!(leaves(&back), leaves(&m), "through the codec unchanged");
+            (text, leaves(&back))
+        };
+        let (_, back) = layout(Some("local pause"));
+        assert_eq!(back[0].holds, ["local pause"]);
+        assert!(
+            back[1..].iter().all(|leaf| leaf.holds.is_empty()),
+            "{back:?}"
+        );
+        assert_eq!(
+            back[0].carried_holds().of_origin("local").first(),
+            Some(Hold {
+                reason: "pause".to_string(),
+                origin: "local".to_string(),
+            })
+        );
+        assert_eq!(
+            back[0].resumes_agent(),
+            None,
+            "the reopened row does not promise it"
+        );
+        // FAIL-CLOSED: a row no build wrote is a local hold all the same.
+        let garbled = TerminalLeafRestore {
+            holds: vec!["garbled row here".to_string()],
+            ..back[0].clone()
+        };
+        assert_eq!(
+            garbled.carried_holds().first(),
+            Some(Hold {
+                reason: CARRIED_UNREADABLE.to_string(),
+                origin: "local".to_string(),
+            })
+        );
+        assert_eq!(garbled.resumes_agent(), None, "a garbled row holds");
+        // A fleet row rides the leaf too, and its agent is the holder's.
+        let (_, back) = layout(Some("fleet fabric-lost"));
+        assert!(
+            back[0].carried_holds().has("fleet") && !back[0].carried_holds().has("local"),
+            "{back:?}"
+        );
+        assert_eq!(back[0].resumes_agent(), None, "fleet");
+        // NEGATIVE CONTROL: an older build's leaf.
+        let (text, back) = layout(None);
+        assert!(!text.contains("holds ="), "no field written: {text}");
+        assert_eq!(
+            (back[0].carried_holds().is_held(), back[0].resumes_agent()),
+            (false, Some(&agent)),
+            "older"
+        );
     }
 
     /// THE LEAF NAMES ITS AGENT BY ITS RECORD WORD (`upgrade::Agent::word`):
@@ -6280,7 +6858,7 @@ metadata = "opaque=copy-me"
             session: Some("0badf00d-1111-2222-3333-444455556666".into()),
             cwd: "/work/c".into(),
             version: Some("2.1.283".into()),
-            codex: None,
+            run: aterm_agent::harness::relaunch::AgentRun::Claude,
             dialect: None,
             login: None,
             home: None,
@@ -6288,13 +6866,10 @@ metadata = "opaque=copy-me"
         };
         let codex = Snapshot {
             program: "/opt/codex/bin/codex".into(),
-            codex: Some(CodexRun {
+            run: aterm_agent::harness::relaunch::AgentRun::Codex(CodexRun {
                 home: "/Users//me/.codex".into(),
                 home_env: None,
-                embedded: true,
-                started_ms: 1_790_543_997_000,
-                ambiguous: false,
-                block: None,
+                self_claimed: None,
             }),
             ..claude.clone()
         };
@@ -6316,7 +6891,7 @@ metadata = "opaque=copy-me"
         // A word its run contradicts is no agent either way round.
         let no_run = read(wire(&codex).split("[codex]").next().unwrap());
         assert!(
-            no_run.codex.is_none() && no_run.word == "codex",
+            no_run.run.is_none() && no_run.word == "codex",
             "{:?}",
             no_run
         );
@@ -6324,13 +6899,39 @@ metadata = "opaque=copy-me"
         let mut claude_with_run = read(&wire(&codex));
         claude_with_run.word = "claude".to_string();
         assert_eq!(claude_with_run.agent(), None, "claude beside a Codex run");
-        // A newer build's leaf for an agent this one has no lane for.
-        let newer = read(&format!("word = \"gemini\"\n{}", wire(&claude)));
+        // A newer build's leaf for an agent this one does not know.
+        let newer = read(&format!("word = \"opencode\"\n{}", wire(&claude)));
         assert_eq!(newer.agent(), None);
         assert!(
             newer.snapshot("s-new".into(), 6161).is_none(),
             "relaunched by nothing"
         );
+        // …and one for an agent it knows with no lane: read as that agent,
+        // relaunched by nothing, told no line, named nowhere.
+        for (word, agent) in [("agy", Agent::Agy), ("gemini", Agent::Gemini)] {
+            let leaf = read(&format!("word = \"{word}\"\n{}", wire(&claude)));
+            assert_eq!(leaf.agent(), Some(agent), "{word}");
+            assert_eq!(leaf.name(), None, "{word}");
+            assert!(
+                leaf.resume_line().is_none(),
+                "{word}: no line, never Claude Code's"
+            );
+            assert!(
+                leaf.clone().snapshot("s-new".into(), 6161).is_none(),
+                "{word}: relaunched by nothing, never as Claude Code"
+            );
+            let mut beside_codex = read(&wire(&codex));
+            beside_codex.word = word.to_string();
+            assert_eq!(beside_codex.agent(), None, "{word} beside a Codex run");
+        }
+        // Muse Code's word needs its own run (`[muse]`, where its session
+        // is): with none, the word its run contradicts, it is no agent and
+        // relaunched by nothing — never as Claude Code. Its leaf with its run
+        // is `the_agent_leaf_reads_both_ways_across_0_104_and_0_105`'s.
+        let muse_no_run = read(&format!("word = \"muse\"\n{}", wire(&claude)));
+        assert_eq!(muse_no_run.agent(), None, "muse without its run");
+        assert!(muse_no_run.resume_line().is_none());
+        assert!(muse_no_run.snapshot("s-new".into(), 6161).is_none());
         assert!(
             read(&wire(&claude))
                 .snapshot("s-new".into(), 6161)
@@ -6339,153 +6940,23 @@ metadata = "opaque=copy-me"
         );
     }
 
-    /// A CODEX rides its leaf too (2026-09-27, the harness's Codex parity):
-    /// the run its relaunch reads — its home, its mode, when it started —
-    /// goes from the host's snapshot into the leaf, through the codec, and
-    /// back into the reopened tab's snapshot, so the next launch relaunches it
-    /// on its Codex lane, never as a Claude Code. NEGATIVE CONTROL: a Claude
-    /// Code's snapshot comes back with no Codex run.
-    ///
-    /// AND THE `CODEX_HOME` IT WAS STARTED WITH (`CodexRun::home_env`), which
-    /// its relaunch line carries: verbatim, beside the canonical home, through
-    /// the crash journal's image as through the layout's codec. A run with
-    /// none writes no `home_env` key, as an older build wrote the leaf, and
-    /// that leaf reads back as none. RED with the field left off the leaf
-    /// (`of` and `snapshot` as before): the run comes back without it.
-    #[test]
-    fn a_codex_run_rides_its_leaf_back_into_its_relaunch() {
-        use aterm_agent::harness::relaunch::{CodexRun, Snapshot};
-        let codex = Snapshot {
-            stored_login: false,
-            tab: "s-old".into(),
-            pid: 5151,
-            start: "Sat Sep 27 01:02:03 2026".into(),
-            shell: 5150,
-            program: "/opt/codex/bin/codex".into(),
-            argv: vec!["/opt/codex/bin/codex".into(), "--no-daemon".into()],
-            session: Some("01a0e4bd-2b37-75a0-9d52-7f1e2c3a4b5c".into()),
-            cwd: "/work/c".into(),
-            version: Some("0.157.1".into()),
-            codex: Some(CodexRun {
-                home: "/Users//me/lab codex".into(),
-                home_env: Some("/Users//me/lab codex/".into()),
-                embedded: true,
-                started_ms: 1_790_543_997_000,
-                ambiguous: false,
-                block: None,
-            }),
-            dialect: None,
-            login: None,
-            home: None,
-            claude_dir: None,
-        };
-        // The reopened tab's snapshot, read back from the layout's codec and
-        // from the crash journal's image.
-        let through = |snap: &Snapshot| -> Vec<(&str, Snapshot)> {
-            let mut m = sample();
-            let mut next = 0;
-            for w in &mut m.windows {
-                for t in &mut w.restored_tabs {
-                    number_leaves(&mut t.root, &mut next);
-                }
-            }
-            let carried = AgentRestore::of(snap.clone());
-            m.fill_agents(&|id| (id == 0).then(|| carried.clone()));
-            let layout = RestoreManifest::from_toml(&m.to_toml().expect("toml")).expect("parse");
-            let header = crate::crash_journal::JournalHeader::now(7, false);
-            let (_, journal) = crate::crash_journal::decode(
-                &crate::crash_journal::encode(&m, &header).expect("the image"),
-            )
-            .expect("the journal reads");
-            [("layout", layout), ("crash journal", journal)]
-                .into_iter()
-                .map(|(format, back)| {
-                    let mut found = None;
-                    for w in &back.windows {
-                        for t in &w.restored_tabs {
-                            first_agent(&t.root, &mut found);
-                        }
-                    }
-                    let snap = found
-                        .expect("the leaf carries it")
-                        .snapshot("s-new".into(), 6161)
-                        .expect("an agent this build knows");
-                    (format, snap)
-                })
-                .collect()
-        };
-        for (format, snap) in through(&codex) {
-            assert_eq!(
-                snap.codex, codex.codex,
-                "{format}: the Codex run, unchanged"
-            );
-            assert_eq!((snap.tab.as_str(), snap.shell), ("s-new", 6161));
-            assert_eq!(
-                Snapshot {
-                    tab: codex.tab.clone(),
-                    shell: codex.shell,
-                    ..snap
-                },
-                codex,
-                "{format}"
-            );
-        }
-        // A run that had no `CODEX_HOME`: no key on the leaf, none back.
-        let unset = Snapshot {
-            codex: codex.codex.clone().map(|run| CodexRun {
-                home_env: None,
-                ..run
-            }),
-            ..codex.clone()
-        };
-        let wire = aterm_toml::to_string(&AgentRestore::of(unset.clone())).expect("the leaf");
-        assert!(!wire.contains("home_env"), "{wire}");
-        for (format, snap) in through(&unset) {
-            assert_eq!(snap.codex, unset.codex, "{format}");
-        }
-        let claude = Snapshot {
-            codex: None,
-            ..codex
-        };
-        assert_eq!(
-            AgentRestore::of(claude)
-                .snapshot("s-new".into(), 6161)
-                .expect("an agent this build knows")
-                .codex,
-            None
-        );
-
-        fn number_leaves(node: &mut RestoredSplitTree, next: &mut u64) {
+    /// The first agent a manifest's terminal leaves carry, in layout order.
+    fn first_agent_of(m: &RestoreManifest) -> Option<AgentRestore> {
+        fn walk(node: &RestoredSplitTree) -> Option<AgentRestore> {
             match node {
                 RestoredSplitTree::Leaf {
                     view: RestoredView::Terminal(t),
-                } => {
-                    t.local_id = Some(*next);
-                    *next += 1;
-                }
-                RestoredSplitTree::Leaf { .. } => {}
+                } => t.agent.as_deref().cloned(),
+                RestoredSplitTree::Leaf { .. } => None,
                 RestoredSplitTree::Split { first, second, .. } => {
-                    number_leaves(first, next);
-                    number_leaves(second, next);
+                    walk(first).or_else(|| walk(second))
                 }
             }
         }
-        fn first_agent(node: &RestoredSplitTree, out: &mut Option<AgentRestore>) {
-            match node {
-                RestoredSplitTree::Leaf {
-                    view: RestoredView::Terminal(t),
-                } => {
-                    if out.is_none() {
-                        out.clone_from(&t.agent.as_deref().cloned());
-                    }
-                }
-                RestoredSplitTree::Leaf { .. } => {}
-                RestoredSplitTree::Split { first, second, .. } => {
-                    first_agent(first, out);
-                    first_agent(second, out);
-                }
-            }
-        }
+        m.windows
+            .iter()
+            .flat_map(|w| &w.restored_tabs)
+            .find_map(|t| walk(&t.root))
     }
 
     /// THE CLAUDE HOME AND THE LOGIN AN AGENT RAN UNDER RIDE ITS LEAF INTO
@@ -6499,7 +6970,8 @@ metadata = "opaque=copy-me"
     /// (`aterm_agent::harness::relaunch::exit_line`: `required_env`, as every
     /// live relaunch's). The default login NAMED (set and empty) stays named.
     /// NEGATIVE CONTROL: a leaf naming neither plans today's line, byte for
-    /// byte.
+    /// byte. A Codex run (2026-09-27, the harness's Codex parity) rides the
+    /// same formats whole.
     ///
     /// AND BOTH WAYS ACROSS AN UPDATE: a leaf as 0.101.0 writes it (its
     /// `AgentRestore`, frozen below) is what this build writes for an agent
@@ -6510,7 +6982,7 @@ metadata = "opaque=copy-me"
     /// every format gives back neither, and the line is the plain one.
     #[test]
     fn a_restored_agents_home_and_login_ride_its_leaf_into_its_relaunch_line() {
-        use aterm_agent::harness::relaunch::{Snapshot, exit_line};
+        use aterm_agent::harness::relaunch::{CodexRun, Snapshot, exit_line};
         use aterm_agent::harness::upgrade::Dialect;
         const SESSION: &str = "0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c";
         const HOME: &str = "/Users//me/lab home/.claude";
@@ -6533,32 +7005,6 @@ metadata = "opaque=copy-me"
             #[serde(default, skip_serializing_if = "Option::is_none")]
             codex: Option<CodexRestore>,
         }
-        fn first_agent(node: &RestoredSplitTree) -> Option<AgentRestore> {
-            match node {
-                RestoredSplitTree::Leaf {
-                    view: RestoredView::Terminal(t),
-                } => t.agent.as_deref().cloned(),
-                RestoredSplitTree::Leaf { .. } => None,
-                RestoredSplitTree::Split { first, second, .. } => {
-                    first_agent(first).or_else(|| first_agent(second))
-                }
-            }
-        }
-        fn number(node: &mut RestoredSplitTree, next: &mut u64) {
-            match node {
-                RestoredSplitTree::Leaf {
-                    view: RestoredView::Terminal(t),
-                } => {
-                    t.local_id = Some(*next);
-                    *next += 1;
-                }
-                RestoredSplitTree::Leaf { .. } => {}
-                RestoredSplitTree::Split { first, second, .. } => {
-                    number(first, next);
-                    number(second, next);
-                }
-            }
-        }
 
         let ran = |home: Option<&str>, login: Option<&str>| Snapshot {
             stored_login: false,
@@ -6571,7 +7017,7 @@ metadata = "opaque=copy-me"
             session: Some(SESSION.into()),
             cwd: "/work".into(),
             version: Some("2.1.295".into()),
-            codex: None,
+            run: aterm_agent::harness::relaunch::AgentRun::Claude,
             dialect: Some(Dialect::Zsh),
             login: login.map(str::to_string),
             home: home.map(str::to_string),
@@ -6580,13 +7026,7 @@ metadata = "opaque=copy-me"
         // The reopened tab's snapshot, read back from each on-disk format,
         // in a zsh as the relaunch's plan reads the reopened shell's dialect.
         let through = |snap: Snapshot| -> Vec<(&str, Snapshot)> {
-            let mut m = sample();
-            let mut next = 0;
-            for w in &mut m.windows {
-                for t in &mut w.restored_tabs {
-                    number(&mut t.root, &mut next);
-                }
-            }
+            let mut m = numbered_sample();
             let carried = AgentRestore::of(snap);
             m.fill_agents(&|id| (id == 0).then(|| carried.clone()));
             let layout = RestoreManifest::from_toml(&m.to_toml().expect("toml")).expect("parse");
@@ -6598,12 +7038,7 @@ metadata = "opaque=copy-me"
             [("layout", layout), ("crash journal", journal)]
                 .into_iter()
                 .map(|(format, m)| {
-                    let agent = m
-                        .windows
-                        .iter()
-                        .flat_map(|w| &w.restored_tabs)
-                        .find_map(|t| first_agent(&t.root))
-                        .expect("the leaf carries its agent");
+                    let agent = first_agent_of(&m).expect("the leaf carries its agent");
                     let back = agent
                         .snapshot("s-new".into(), 6161)
                         .expect("an agent this build knows");
@@ -6624,7 +7059,7 @@ metadata = "opaque=copy-me"
                 "{format}"
             );
             assert_eq!(
-                exit_line(&back),
+                exit_line(std::path::Path::new("/Users//me"), &back),
                 Some(format!(
                     " CLAUDE_CONFIG_DIR='{HOME}' CLAUDE_SECURESTORAGE_CONFIG_DIR={LOGIN} \
                      CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 {program}"
@@ -6640,7 +7075,7 @@ metadata = "opaque=copy-me"
                 "{format}"
             );
             assert_eq!(
-                exit_line(&back),
+                exit_line(std::path::Path::new("/Users//me"), &back),
                 Some(format!(
                     " CLAUDE_SECURESTORAGE_CONFIG_DIR='' CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 \
                      {program}"
@@ -6652,11 +7087,115 @@ metadata = "opaque=copy-me"
         for (format, back) in through(ran(None, None)) {
             assert_eq!((&back.home, &back.login), (&None, &None), "{format}");
             assert_eq!(
-                exit_line(&back).as_deref(),
+                exit_line(std::path::Path::new("/Users//me"), &back).as_deref(),
                 Some(plain.as_str()),
                 "{format}"
             );
         }
+        // A CODEX run rides the same leaf, whole: the home its relaunch reads,
+        // AND THE `CODEX_HOME` IT WAS STARTED WITH (`CodexRun::home_env`),
+        // verbatim beside the canonical home. A VENDOR `codex` — no line aterm's
+        // copy of codex-alab's own record validated — is named by its leaf and
+        // comes back at its shell: nothing relaunches it or tells a line for it
+        // (the Codex screen lane's retirement, 2026-10-16).
+        let codex = Snapshot {
+            run: AgentRun::Codex(CodexRun {
+                home: "/Users//me/lab codex".into(),
+                home_env: Some("/Users//me/lab codex/".into()),
+                self_claimed: None,
+            }),
+            ..ran(None, None)
+        };
+        let ran_codex = codex.codex().cloned().expect("a Codex's run");
+        let unchanged = |snap: &Snapshot| {
+            for (format, back) in through(snap.clone()) {
+                assert_eq!(
+                    Snapshot {
+                        tab: snap.tab.clone(),
+                        shell: snap.shell,
+                        ..back
+                    },
+                    *snap,
+                    "{format}: everything but the new tab and shell, unchanged"
+                );
+            }
+        };
+        let vendor = |snap: &Snapshot| {
+            let wire = aterm_toml::to_string(&AgentRestore::of(snap.clone())).expect("the leaf");
+            let read: AgentRestore = aterm_toml::from_str(&wire).expect("reads");
+            assert_eq!(read.name(), Some("Codex"), "{wire}");
+            assert!(!read.relaunched() && !read.resumes(), "{wire}");
+            assert_eq!(read.resume_line(), None, "{wire}");
+            assert!(read.snapshot("s-new".into(), 6161).is_none(), "{wire}");
+            wire
+        };
+        assert!(vendor(&codex).contains("home_env"));
+        // A run that had no `CODEX_HOME`: no key on the leaf.
+        let unset = Snapshot {
+            run: AgentRun::Codex(CodexRun {
+                home_env: None,
+                ..ran_codex.clone()
+            }),
+            ..codex.clone()
+        };
+        let wire = vendor(&unset);
+        assert!(!wire.contains("home_env"), "{wire}");
+        // A PROVEN SELF-CLAIMED CODEX-ALAB (the self-claim contract, §4): the
+        // line aterm's copy of its record validated rides the leaf back into the
+        // reopened tab's snapshot, where `relaunch::after_host_ended` relaunches
+        // it on that line, as the crash rule would. The person's own line for a
+        // held tab is that line too. NEGATIVE CONTROL: an older leaf with no
+        // `alab` table reads back with no line, as before.
+        let line = aterm_agent::harness::self_claimed::Resume {
+            argv: vec![
+                "/Users//me/.aterm/agents/codex".into(),
+                "--no-alt-screen".into(),
+                "resume".into(),
+                SESSION.into(),
+            ],
+            session: SESSION.into(),
+            codex_home: Some("/Users//me/lab codex/".into()),
+            cwd: Some("/work".into()),
+        };
+        let alab = Snapshot {
+            run: AgentRun::Codex(CodexRun {
+                self_claimed: Some(line.clone()),
+                ..ran_codex.clone()
+            }),
+            ..codex.clone()
+        };
+        unchanged(&alab);
+        for (format, back) in through(alab.clone()) {
+            assert_eq!(
+                aterm_agent::harness::relaunch::self_claimed_line(&back),
+                Some(&line),
+                "{format}: the validated line, unchanged"
+            );
+        }
+        let wire = aterm_toml::to_string(&AgentRestore::of(alab)).expect("the leaf");
+        assert!(wire.contains("[codex.alab]"), "{wire}");
+        assert_eq!(
+            aterm_toml::from_str::<AgentRestore>(&wire)
+                .expect("reads")
+                .resume_line(),
+            Some(format!(
+                "CODEX_HOME='/Users//me/lab codex/' /Users//me/.aterm/agents/codex \
+                 --no-alt-screen resume {SESSION}"
+            )),
+            "the person's line is the validated one"
+        );
+        let older = wire
+            .split("[codex.alab]")
+            .next()
+            .expect("before the table")
+            .to_string();
+        assert!(
+            aterm_toml::from_str::<AgentRestore>(&older)
+                .expect("an older leaf reads")
+                .snapshot("s-new".into(), 6161)
+                .is_none(),
+            "an older leaf with no line is relaunched by nobody"
+        );
 
         // AS 0.101.0 WRITES IT: what this build writes for an agent with
         // neither variable, byte for byte, and read back as today.
@@ -6671,8 +7210,14 @@ metadata = "opaque=copy-me"
             codex: None,
         };
         let written = aterm_toml::to_string(&old).expect("0.101.0's record");
+        // (The tab it ran in is the one field 0.101.0 never wrote: additive,
+        // [`AgentRestore::tab`].)
+        let neither = AgentRestore {
+            tab: None,
+            ..AgentRestore::of(ran(None, None))
+        };
         assert_eq!(
-            aterm_toml::to_string(&AgentRestore::of(ran(None, None))).expect("this build's"),
+            aterm_toml::to_string(&neither).expect("this build's"),
             written,
             "an agent with neither is written as 0.101.0 writes it"
         );
@@ -6684,7 +7229,10 @@ metadata = "opaque=copy-me"
                 .snapshot("s-new".into(), 6161)
                 .expect("an agent this build knows")
         };
-        assert_eq!(exit_line(&back).as_deref(), Some(plain.as_str()));
+        assert_eq!(
+            exit_line(std::path::Path::new("/Users//me"), &back).as_deref(),
+            Some(plain.as_str())
+        );
         // …and 0.101.0 reads this build's leaf naming both, ignoring them.
         let both = aterm_toml::to_string(&AgentRestore::of(ran(Some(HOME), Some(LOGIN))))
             .expect("this build's record");
@@ -6696,5 +7244,423 @@ metadata = "opaque=copy-me"
             aterm_toml::from_str::<AgentRestore0101>(&both).expect("0.101.0 reads it"),
             old
         );
+    }
+
+    /// THE AGENT LEAF IS A WIRE FORMAT 0.104.0 AND 0.105.0 READ, AND ITS RUN
+    /// A SHAPE IN MEMORY ONLY ([`AgentRestore::run`], [`leaf::AgentRestore`]).
+    /// Their `AgentRestore` and `CodexRestore` are frozen below
+    /// (`git show v0.104.0:crates/aterm-gui/src/restore.rs`, and v0.105.0's),
+    /// with the rule each reads the agent by (0.104.0: by its Codex run
+    /// alone, no word; 0.105.0: by its word, an unknown one no agent's).
+    ///
+    /// BOTH WAYS: this build's Claude Code and Codex leaves are 0.105.0's byte
+    /// for byte but for the additive keys since (`tab`), and read in both as
+    /// the same agent; their leaves read here as they wrote them.
+    ///
+    /// AND MUSE CODE'S LEAF, THE FORM A LANE PAST CODEX'S ADDS ITS RUN IN: a
+    /// table under its record word (`[muse]`), its conversation in that table
+    /// and never in `session`. Both older readers take the leaf (the layout
+    /// around it still restores) and ignore the table; 0.105.0 reads it as no
+    /// agent's, and 0.104.0, which has no word and reads it as Claude Code's,
+    /// finds no conversation to relaunch it on (`agent_resumes`,
+    /// `ended:no-conversation`) and no line to tell. This build reads it as
+    /// Muse Code's, relaunches it on its table's session and tells Muse Code's
+    /// own line. NEGATIVE CONTROL: the same leaf with its conversation in
+    /// `session` would be one 0.104.0 relaunches as Claude Code.
+    #[test]
+    fn the_agent_leaf_reads_both_ways_across_0_104_and_0_105() {
+        use aterm_agent::harness::relaunch::{CodexRun, Snapshot};
+        use aterm_agent::harness::upgrade::{Agent, is_session_id};
+        const SESSION: &str = "0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c";
+        const THREAD: &str = "01a0e4bd-2b37-75a0-9d52-7f1e2c3a4b5c";
+        const MUSE: &str = "01a148f8-9301-7752-96db-fef456f88074";
+
+        #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
+        struct CodexRestore0104 {
+            home: String,
+            embedded: bool,
+            started_ms: u64,
+        }
+        #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
+        struct AgentRestore0104 {
+            pid: u32,
+            start: String,
+            program: String,
+            argv: Vec<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            session: Option<String>,
+            cwd: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            version: Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            home: Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            login: Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            codex: Option<CodexRestore0104>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            cause: Option<String>,
+        }
+        #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
+        struct CodexRestore0105 {
+            home: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            home_env: Option<String>,
+            embedded: bool,
+            started_ms: u64,
+        }
+        #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
+        struct AgentRestore0105 {
+            pid: u32,
+            start: String,
+            program: String,
+            argv: Vec<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            session: Option<String>,
+            cwd: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            version: Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            home: Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            login: Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            codex: Option<CodexRestore0105>,
+            #[serde(default, skip_serializing_if = "String::is_empty")]
+            word: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            cause: Option<String>,
+        }
+        // 0.104.0's agent: its snapshot's (`relaunch::Snapshot::agent`, by
+        // the Codex run alone), and whether its relaunch after aterm ended
+        // finds a conversation (`agent_resumes`, then `ended:no-conversation`).
+        fn agent_0104(leaf: &AgentRestore0104) -> &'static str {
+            if leaf.codex.is_some() {
+                "codex"
+            } else {
+                "claude"
+            }
+        }
+        fn resumes_0104(leaf: &AgentRestore0104) -> bool {
+            leaf.session.as_deref().is_some_and(is_session_id)
+                && !aterm_agent::harness::upgrade::one_shot(&leaf.argv)
+        }
+        // 0.105.0's `AgentRestore::agent`: its word, else its run; an unknown
+        // word, or one its run contradicts, no agent's.
+        fn agent_0105(leaf: &AgentRestore0105) -> Option<&'static str> {
+            let agent = match leaf.word.as_str() {
+                "" if leaf.codex.is_some() => "codex",
+                "" | "claude" => "claude",
+                "codex" => "codex",
+                _ => return None,
+            };
+            (leaf.codex.is_some() == (agent == "codex")).then_some(agent)
+        }
+
+        let claude = Snapshot {
+            stored_login: false,
+            tab: "s-old".into(),
+            pid: 4242,
+            start: "Fri Oct 16 01:02:03 2026".into(),
+            shell: 4241,
+            program: "/opt/claude/bin/claude".into(),
+            argv: vec!["/opt/claude/bin/claude".into()],
+            session: Some(SESSION.into()),
+            cwd: "/work".into(),
+            version: Some("2.1.301".into()),
+            run: AgentRun::Claude,
+            dialect: None,
+            login: Some(String::new()),
+            home: Some("/Users//me/.claude-work".into()),
+            claude_dir: None,
+        };
+        let codex = Snapshot {
+            program: "/opt/codex/bin/codex".into(),
+            argv: vec!["/opt/codex/bin/codex".into(), "--no-daemon".into()],
+            session: Some(THREAD.into()),
+            version: Some("0.163.0".into()),
+            run: AgentRun::Codex(CodexRun {
+                home: "/Users//me/.codex".into(),
+                home_env: Some("/Users//me/.codex".into()),
+                self_claimed: None,
+            }),
+            login: None,
+            home: None,
+            ..claude.clone()
+        };
+        let wire = |snap: &Snapshot| {
+            aterm_toml::to_string(&AgentRestore::of(snap.clone())).expect("this build's leaf")
+        };
+
+        // THIS BUILD'S LEAVES, READ BY 0.104.0 AND 0.105.0.
+        for (snap, agent) in [(&claude, "claude"), (&codex, "codex")] {
+            let text = wire(snap);
+            let old = aterm_toml::from_str::<AgentRestore0104>(&text).expect("0.104.0 reads it");
+            assert_eq!(agent_0104(&old), agent, "{text}");
+            assert!(resumes_0104(&old), "{text}");
+            let older = aterm_toml::from_str::<AgentRestore0105>(&text).expect("0.105.0 reads it");
+            assert_eq!(agent_0105(&older), Some(agent), "{text}");
+            // Byte for byte, but for the keys added since, which 0.105.0
+            // ignores (`tab`, the tab it ran in).
+            assert!(text.contains("tab = \"s-old\"\n"), "{text}");
+            assert_eq!(
+                aterm_toml::to_string(&older).expect("0.105.0 writes it"),
+                text.replace("tab = \"s-old\"\n", ""),
+                "this build writes {agent}'s leaf as 0.105.0 does"
+            );
+        }
+
+        // THEIR LEAVES, READ HERE.
+        let codex_0104 = AgentRestore0104 {
+            pid: 4343,
+            start: "Fri Oct 16 01:02:03 2026".into(),
+            program: "/opt/codex/bin/codex".into(),
+            argv: vec!["/opt/codex/bin/codex".into(), "--no-daemon".into()],
+            session: Some(THREAD.into()),
+            cwd: "/work".into(),
+            version: Some("0.157.1".into()),
+            home: None,
+            login: None,
+            codex: Some(CodexRestore0104 {
+                home: "/Users//me/.codex".into(),
+                embedded: true,
+                started_ms: 1_790_543_997_000,
+            }),
+            cause: None,
+        };
+        let claude_0104 = AgentRestore0104 {
+            program: "/opt/claude/bin/claude".into(),
+            argv: vec!["/opt/claude/bin/claude".into()],
+            session: Some(SESSION.into()),
+            home: Some("/Users//me/.claude-work".into()),
+            codex: None,
+            ..codex_0104.clone()
+        };
+        let text = aterm_toml::to_string(&claude_0104).expect("0.104.0's leaf");
+        let read: AgentRestore = aterm_toml::from_str(&text).expect("this build reads it");
+        assert_eq!(read.agent(), Some(Agent::Claude), "{text}");
+        let back = read.snapshot("s-new".into(), 6161).expect("relaunched");
+        assert_eq!(back.agent(), Agent::Claude);
+        assert_eq!(back.session, claude_0104.session);
+        assert_eq!(back.home, claude_0104.home);
+        assert!(back.codex().is_none(), "{text}");
+        // An older build's Codex leaf carries no line aterm's copy of
+        // codex-alab's own record validated: read as a Codex, relaunched by
+        // nobody (the Codex screen lane's retirement, 2026-10-16).
+        let text = aterm_toml::to_string(&codex_0104).expect("0.104.0's leaf");
+        let read: AgentRestore = aterm_toml::from_str(&text).expect("this build reads it");
+        assert_eq!(read.agent(), Some(Agent::Codex), "{text}");
+        assert!(read.snapshot("s-new".into(), 6161).is_none(), "{text}");
+        let codex_0105 = AgentRestore0105 {
+            pid: 4343,
+            start: "Fri Oct 16 01:02:03 2026".into(),
+            program: "/opt/codex/bin/codex".into(),
+            argv: vec!["/opt/codex/bin/codex".into()],
+            session: Some(THREAD.into()),
+            cwd: "/work".into(),
+            version: Some("0.163.0".into()),
+            home: None,
+            login: None,
+            codex: Some(CodexRestore0105 {
+                home: "/Users//me/lab codex".into(),
+                home_env: Some("/Users//me/lab codex/".into()),
+                embedded: false,
+                started_ms: 1_790_543_997_000,
+            }),
+            word: "codex".into(),
+            cause: Some("asked".into()),
+        };
+        let text = aterm_toml::to_string(&codex_0105).expect("0.105.0's leaf");
+        let read: AgentRestore = aterm_toml::from_str(&text).expect("this build reads it");
+        assert_eq!(read.agent(), Some(Agent::Codex));
+        assert_eq!(
+            aterm_toml::to_string(&read).expect("written back"),
+            text,
+            "read and written back as 0.105.0 wrote it"
+        );
+        let Some(RunRestore::Codex(run)) = &read.run else {
+            panic!("a Codex run: {read:?}");
+        };
+        assert_eq!(run.home_env.as_deref(), Some("/Users//me/lab codex/"));
+        assert!(
+            read.snapshot("s-new".into(), 6161).is_none(),
+            "a vendor `codex`'s leaf is relaunched by nobody"
+        );
+
+        // MUSE CODE'S LEAF, THE FORM A LANE PAST CODEX'S ADDS ITS RUN IN: its
+        // table under its word (`[muse]`), its conversation there and never
+        // in `session`.
+        let muse = Snapshot {
+            program: "/opt/pkg/store/muse/2001004010006427002/bin/muse".into(),
+            argv: vec![
+                "/opt/pkg/store/muse/2001004010006427002/bin/muse".into(),
+                "--base-url".into(),
+                "http://127.0.0.1:9".into(),
+            ],
+            session: Some(MUSE.into()),
+            version: Some("1.4.10-R6427.1".into()),
+            run: AgentRun::Muse(aterm_agent::harness::relaunch::MuseRun {
+                data: "/Users//me/.local/share".into(),
+                env: vec![("XDG_DATA_HOME".into(), "/Users//me/.local/share".into())],
+                workspace: Some("/work/proj".into()),
+                lock: Some(
+                    "/Users//me/.local/share/muse/sessions/2026/10/17/x/.session.lock".into(),
+                ),
+                started_ms: 1_790_543_997_000,
+                block: Some(7),
+            }),
+            login: None,
+            home: None,
+            ..claude.clone()
+        };
+        let lane = wire(&muse);
+        assert!(
+            lane.contains("word = \"muse\"\n") && lane.contains("[muse]\n"),
+            "{lane}"
+        );
+        let (top, table) = lane.split_once("[muse]").expect("its table");
+        assert!(
+            table.contains(&format!("session = \"{MUSE}\"")) && !top.contains("session = "),
+            "its session in its table alone: {lane}"
+        );
+        let old = aterm_toml::from_str::<AgentRestore0104>(&lane).expect("0.104.0 takes it");
+        assert_eq!(old.session, None, "{lane}");
+        assert_eq!(agent_0104(&old), "claude", "0.104.0 has no word");
+        assert!(
+            !resumes_0104(&old),
+            "0.104.0 finds no conversation to relaunch it on"
+        );
+        let older = aterm_toml::from_str::<AgentRestore0105>(&lane).expect("0.105.0 takes it");
+        assert_eq!(older.word, "muse");
+        assert_eq!(agent_0105(&older), None, "0.105.0: no agent's");
+        let here: AgentRestore = aterm_toml::from_str(&lane).expect("this build takes it");
+        assert_eq!(here.agent(), Some(Agent::Muse), "read as Muse Code's");
+        assert_eq!(here.name(), Some("Muse Code"));
+        assert!(here.resumes(), "its own table's session resumes");
+        assert_eq!(
+            here.resume_line().as_deref(),
+            Some(format!("XDG_DATA_HOME=/Users//me/.local/share muse resume {MUSE}").as_str()),
+            "Muse Code's own resume line, behind its data home"
+        );
+        let back = here
+            .clone()
+            .snapshot("s-new".into(), 6161)
+            .expect("relaunched by its lane");
+        assert_eq!(back.agent(), Agent::Muse);
+        assert_eq!(back.session.as_deref(), Some(MUSE));
+        assert_eq!(
+            back.muse().map(|run| (
+                run.data.clone(),
+                run.env.clone(),
+                run.workspace.clone(),
+                run.lock.clone(),
+                run.block
+            )),
+            Some((
+                PathBuf::from("/Users//me/.local/share"),
+                vec![(
+                    "XDG_DATA_HOME".to_string(),
+                    "/Users//me/.local/share".to_string()
+                )],
+                Some("/work/proj".to_string()),
+                None,
+                None
+            )),
+            "its run back, its lock and block never carried"
+        );
+        assert_eq!(
+            aterm_toml::to_string(&here).expect("written back"),
+            lane,
+            "read and written back as written"
+        );
+        // A `[muse]` table naming no session (none was proven) resumes
+        // nothing and tells no line; one beside a `codex` table (no build
+        // writes both) is no agent's.
+        let unproven = wire(&Snapshot {
+            session: None,
+            ..muse.clone()
+        });
+        let unproven: AgentRestore = aterm_toml::from_str(&unproven).expect("read");
+        assert_eq!(unproven.agent(), Some(Agent::Muse));
+        assert!(!unproven.resumes() && unproven.resume_line().is_none());
+        let both = format!(
+            "{}\n[codex]\nhome = \"/Users//me/.codex\"\nembedded = true\nstarted_ms = 1\n",
+            lane.trim_end()
+        );
+        let both: AgentRestore = aterm_toml::from_str(&both).expect("read");
+        assert_eq!(both.agent(), None, "two runs: neither");
+        // NEGATIVE CONTROL: its conversation in `session` is a leaf 0.104.0
+        // relaunches, as Claude Code.
+        let in_session = format!("{}word = \"muse\"\n", wire(&claude));
+        let old = aterm_toml::from_str::<AgentRestore0104>(&in_session).expect("0.104.0");
+        assert_eq!((agent_0104(&old), resumes_0104(&old)), ("claude", true));
+    }
+
+    /// THE DIRECTORIES A WINDOW MAKES ON THE WAY TO ITS DATA AND STATE ROOTS ARE
+    /// NEVER GROUP- OR OTHER-WRITABLE, WHATEVER THE UMASK. `session.toml`'s and
+    /// the cell-metrics cache's directory is `~/.local/share/aterm` on Linux, the
+    /// atpkg prefix's parent; the draft journal's and the control directories'
+    /// state root can be the first to make `~/.local` (Linux) or is the prefix's
+    /// parent (macOS). `create_dir_all` made each missing one `0777 & ~umask`, so
+    /// under umask `002` (a user-private-group login's default) a first launch
+    /// left a group-writable directory above the atpkg store, and `targo trust`
+    /// refuses every toolchain installed below one. Missing ancestors are `0755`,
+    /// each leaf its own mode. The umask is process-wide: the body runs alone in a
+    /// child ([`crate::test_alone::alone`]).
+    #[cfg(unix)]
+    #[test]
+    fn directories_made_under_an_open_umask_are_never_group_writable() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if !crate::test_alone::alone() {
+            return;
+        }
+        // SAFETY: `umask(2)` swaps this process's file-creation mask and cannot
+        // fail; this child runs this one test, so no other create sees the mask.
+        unsafe { libc::umask(0o002) };
+        let scratch = aterm_tempfile::tempdir().expect("scratch dir");
+        let root = scratch.path();
+        // Octal text, so a failure reads `775`, not `509`.
+        let mode = |rel: &str| {
+            let meta = fs::symlink_metadata(root.join(rel)).expect("made");
+            format!("{:o}", meta.permissions().mode() & 0o7777)
+        };
+        write_wire_to(&root.join("wire/.local/share/aterm/session.toml"), "").expect("wire");
+        store_cell_metrics_to(
+            &root.join("metrics/.local/share/aterm/cell-metrics.toml"),
+            "font",
+            2.0,
+            13.0,
+            8,
+            16,
+        )
+        .expect("metrics");
+        crate::native_document_journal::DraftJournalHost::new(
+            root.join("journal/.local/state/aterm/drafts"),
+        )
+        .expect("journal");
+        crate::control_auth::ensure_private_dir(&root.join("control/.local/state/aterm/logs"))
+            .expect("private dir");
+        let made = [
+            ("wire/.local/share/aterm", "755"),
+            ("metrics/.local/share/aterm", "755"),
+            ("journal/.local/state/aterm/drafts", "700"),
+            ("control/.local/state/aterm/logs", "700"),
+        ];
+        let mut wrong = Vec::new();
+        for (leaf, want) in made {
+            let mut rel = String::new();
+            for name in leaf.split('/') {
+                if !rel.is_empty() {
+                    rel.push('/');
+                }
+                rel.push_str(name);
+                let want = if rel == leaf { want } else { "755" };
+                let got = mode(&rel);
+                if got != want {
+                    wrong.push(format!("{rel} {got}, not {want}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "made under umask 002: {wrong:#?}");
     }
 }

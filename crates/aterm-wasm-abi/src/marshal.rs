@@ -21,6 +21,7 @@
 //! | `&[T]`, `Vec<T>` | pointer, element count | pointer; element count |
 //! | `Option<scalar>` | 1 or 0, value | value; 1 or 0 |
 //! | `Option<String>`, `Option<Vec<T>>` | pointer (0 = `None`), length | pointer (0 = `None`); length |
+//! | a JS object ([`crate::js`]) | its slot in the glue's object table, 0 | — |
 //! | an exported class | — | handle |
 //! | `Option<class>` | — | handle or 0 |
 //! | `Result<T, String>` | — | as `T`; `Err` throws the string |
@@ -557,6 +558,7 @@ mod tests {
         ret::<()>();
         ret::<Result<(), String>>();
         ret::<Result<Option<String>, String>>();
+        param::<crate::js::JsObject>();
         assert!(!ty::<()>().ret_uses_slot());
     }
 

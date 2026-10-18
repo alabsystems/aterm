@@ -397,10 +397,11 @@ fn the_effective_table_is_every_key_against_the_default() {
     cfg.set("codex.enabled", "false").unwrap();
     let rows = config_rows(&cfg);
     let keys: Vec<&str> = rows.iter().map(|row| row.key.as_str()).collect();
-    // The master switch, then each supervisable agent's own, then the rest.
+    // The master switch, then each agent's own (every one with a table),
+    // then the rest.
     let agents: Vec<String> = aterm_phase::Program::ALL
         .into_iter()
-        .filter(|agent| agent.supervisable())
+        .filter(|agent| agent.harness_table())
         .map(|agent| format!("{}.enabled", agent.name()))
         .collect();
     let mut want = vec!["enabled"];
@@ -469,7 +470,7 @@ fn a_press_on_a_sessions_land_writes_its_word() {
 
     // No host: the page lists the session as unharnessed, and a press is
     // refused by the page itself.
-    assert!(app.open_harness_settings(wid));
+    assert!(app.open_harness_settings(wid, crate::harness_screen::HarnessFocus::Top));
     let state = app.harness_state();
     assert_eq!(state.sessions.len(), 1);
     assert_eq!(state.sessions[0].program, "Claude Code");
@@ -497,12 +498,16 @@ fn a_press_on_a_sessions_land_writes_its_word() {
 }
 
 /// Settings ▸ Harness lists the session of every agent the harness
-/// supervises, named by its product: an agy session as `Antigravity CLI`.
-/// NEGATIVE CONTROL: a Muse Code session, read but not supervised, is not
-/// listed.
+/// supervises, named by its product: an agy session as `Antigravity CLI`, a
+/// Muse Code session as `Muse Code`. NEGATIVE CONTROL: a shell's session,
+/// which no agent's reader reads, is not listed.
 #[test]
-fn the_page_lists_an_agy_session_and_no_muse_code_one() {
-    for (program, listed) in [("agy", Some("Antigravity CLI")), ("muse", None)] {
+fn the_page_lists_agy_and_muse_code_sessions_and_no_shells() {
+    for (program, listed) in [
+        ("agy", Some("Antigravity CLI")),
+        ("muse", Some("Muse Code")),
+        ("zsh", None),
+    ] {
         let mut app = App::headless_for_test();
         {
             let ctx = app.pool.get(0).unwrap().ctx.clone();
@@ -510,12 +515,55 @@ fn the_page_lists_an_agy_session_and_no_muse_code_one() {
             tl.note_foreground_group(7);
             tl.set_program(7, Some(program.into()));
         }
-        assert!(app.open_harness_settings(WindowId(0)));
+        assert!(app.open_harness_settings(WindowId(0), crate::harness_screen::HarnessFocus::Top));
         let state = app.harness_state();
         assert_eq!(
             state.sessions.first().map(|s| s.program),
             listed,
             "{program}"
+        );
+    }
+}
+
+/// Settings ▸ Harness lists a Gemini CLI session by its screen: its process
+/// runs as `node`, and the sweep's verdict names its reader, so the page
+/// names it `Gemini CLI`. NEGATIVE CONTROLS: the same `node` with no agent
+/// read on its screen, and Gemini CLI's reader published under a shell's
+/// name, are not listed.
+#[test]
+fn the_page_lists_a_gemini_cli_session_read_under_node() {
+    for (program, reader, listed) in [
+        (
+            "node",
+            Some(aterm_phase::Program::Gemini),
+            Some("Gemini CLI"),
+        ),
+        ("node", None, None),
+        ("zsh", Some(aterm_phase::Program::Gemini), None),
+    ] {
+        let mut app = App::headless_for_test();
+        {
+            let ctx = app.pool.get(0).unwrap().ctx.clone();
+            let mut tl = ctx.timeline.lock().unwrap();
+            tl.note_foreground_group(7);
+            tl.set_program(7, Some(program.into()));
+            tl.publish_agent(
+                "idle",
+                None,
+                None,
+                reader,
+                crate::session_timeline::AgentStamp {
+                    generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
+                    fp: 1,
+                },
+            );
+        }
+        assert!(app.open_harness_settings(WindowId(0), crate::harness_screen::HarnessFocus::Top));
+        let state = app.harness_state();
+        assert_eq!(
+            state.sessions.first().map(|s| s.program),
+            listed,
+            "{program} {reader:?}"
         );
     }
 }
@@ -530,12 +578,13 @@ fn a_reading_for_the_running_ticket_is_kept() {
         let mut today = HarnessStats::new(0);
         today.approved = approved;
         today.rows = 1;
-        Box::new(HarnessStatsReport {
-            today: today.clone(),
-            week: today,
-            collected_unix_ms: 0,
-            offset_s: None,
-        })
+        Box::new(HarnessStatsReport::new(
+            today.clone(),
+            today,
+            0,
+            None,
+            &|_| None,
+        ))
     };
     // Nobody asked: dropped.
     app.finish_harness_stats(app.harness_screen.sequence, Ok(report(1)));
@@ -806,7 +855,7 @@ fn a_lapsed_claim_moves_the_ab_arm_as_a_released_one_does() {
         Some((AbPhase::Waiting, AbArm::Unsupervised)),
         "Off behind another's claim"
     );
-    assert!(app.open_harness_settings(wid));
+    assert!(app.open_harness_settings(wid, crate::harness_screen::HarnessFocus::Top));
     app.publish_native_harness_state();
 
     // The holder dies: its lease runs out (renewed last with an expiry now
@@ -848,7 +897,7 @@ fn a_closed_tab_leaves_the_harness_page_in_the_publish_its_close_makes() {
     let session = app.next_session_id;
     app.push_stub_tab(wid, crate::stub_session(session));
     run_claude(&app, session);
-    assert!(app.open_harness_settings(wid));
+    assert!(app.open_harness_settings(wid, crate::harness_screen::HarnessFocus::Top));
     app.publish_native_harness_state();
     let published = |app: &App| -> Vec<u64> {
         let instance = app
@@ -877,6 +926,96 @@ fn a_closed_tab_leaves_the_harness_page_in_the_publish_its_close_makes() {
         "the close republished the page"
     );
     assert_eq!(published(&app), Vec::<u64>::new(), "no ghost row");
+}
+
+/// THE PAGE FOLLOWS THE WIRE AT ONCE (design §10.2.1, §10.2.3 item 7): with
+/// Settings ▸ Harness open, `meta set autopilot cruise until=+2m` over the
+/// wire and its `Wake::MetaChanged` arm (`App::on_meta_changed`) publish a
+/// snapshot whose SESSIONS row reads `lands at 12:02`, in that publish — the
+/// arm indexes the timer before it publishes the page, as the window's own
+/// writer does. NEGATIVE CONTROL, the old order: the same write with the
+/// page published first and the timer indexed after publishes the row with
+/// no timer (`None`: nothing to say yet), and nothing republishes it.
+#[test]
+fn the_wire_arms_a_timer_and_the_page_reads_it_in_the_same_publish() {
+    use crate::autopilot_timers::{local_offset_at, set_fake_clocks};
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let session = app.next_session_id;
+    app.push_stub_tab(wid, crate::stub_session(session));
+    run_claude(&app, session);
+    let host = idle_host();
+    app.harness = Some(host.clone());
+    // Noon, local, on a Friday: `+2m` lands today, at 12:02.
+    let fri = 1_792_177_200_i64;
+    let off = local_offset_at(fri).expect("the zone reads");
+    let day = (fri + off).div_euclid(86_400);
+    let noon = (day * 86_400 + 12 * 3_600 - off) * 1000;
+    set_fake_clocks(Some((std::time::Instant::now(), noon)));
+    assert!(app.open_harness_settings(wid, crate::harness_screen::HarnessFocus::Top));
+    app.publish_native_harness_state();
+    let row = |app: &App| {
+        let instance = app
+            .native_runtime
+            .instance_by_kind(crate::native_app::AppKind::Settings)
+            .expect("the Settings controller");
+        let Some(crate::native_app::NativeApp::Settings(settings)) =
+            app.native_runtime.app(instance)
+        else {
+            unreachable!("a Settings instance")
+        };
+        let projection = settings.harness_snapshot().projection();
+        let row = projection
+            .sessions
+            .iter()
+            .find(|row| row.local_id == session)
+            .expect("the session's row")
+            .clone();
+        row.state_line()
+    };
+    assert_eq!(row(&app), None, "CONTROL: no timer, nothing to say");
+    let wire = |app: &mut App, rest: &str| {
+        let s = app.pool.get(session).unwrap();
+        let (term, ctx) = (s.term.clone(), s.ctx.clone());
+        let (reply, changed) = crate::control::cmd_meta(&term, &app.store, session, &ctx, rest);
+        assert!(reply.starts_with("OK"), "{reply}");
+        assert!(changed, "{rest}");
+    };
+
+    wire(&mut app, "set autopilot cruise until=+2m");
+    let revision = app.harness_screen.revision;
+    app.on_meta_changed(session);
+    assert_eq!(
+        app.harness_screen.revision,
+        revision + 1,
+        "the arm published the page once"
+    );
+    assert_eq!(
+        row(&app).as_deref(),
+        Some("lands at 12:02"),
+        "the row reads the timer in the publish the write made"
+    );
+
+    // NEGATIVE CONTROL: the old order — the page published, then the timer
+    // indexed — publishes the row without it.
+    wire(&mut app, "set autopilot cruise");
+    app.on_meta_changed(session);
+    assert_eq!(row(&app), None, "the timer dropped");
+    wire(&mut app, "set autopilot cruise until=+2m");
+    app.note_harness_arm(session);
+    app.harness_screen_moved();
+    app.index_autopilot_timer(session, None);
+    assert_eq!(
+        row(&app),
+        None,
+        "indexed after the publish, the row lags the chip"
+    );
+    assert!(
+        app.autopilot_timers.glass(session).is_some(),
+        "CONTROL: the chip has it"
+    );
+    set_fake_clocks(None);
+    host.shutdown_and_join();
 }
 
 /// THE APP REFUSES A STALE PRESS ITSELF (whatever the page thought): with no
@@ -951,6 +1090,43 @@ fn an_autopilot_request_for_a_switched_off_agent_is_refused_by_the_app() {
         written("[harness.codex]\nenabled = false\n"),
         (Some(Autopilot::Land), Some(Autopilot::Cruise))
     );
+}
+
+/// AN AGENT'S OWN SWITCH OFF IS NAMED ON ITS CHIP AND ITS ROW (§10.2.1): a
+/// Claude Code session under `[harness.claude] enabled = false`, the master
+/// switch on, has the view `AgentOff(Claude)` — its chip `⊘ off`, titled
+/// with the switch — and its SESSIONS row says `Supervise Claude Code
+/// sessions is off`, its buttons inert. NEGATIVE CONTROLS: with Codex's
+/// switch off instead, the Claude session runs the default; with the master
+/// off, the row says `harness off in Settings`, as main said for both.
+#[test]
+fn an_agents_own_switch_off_is_named_on_its_chip_and_its_row() {
+    use aterm_phase::Program;
+    let read = |policy: &str| {
+        let mut app = App::headless_for_test();
+        run_claude(&app, 0);
+        let host = idle_host();
+        app.harness = Some(host.clone());
+        app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
+            crate::app_config::HarnessPolicy::read(policy),
+        );
+        let view = app.session_autopilot(0).1;
+        let row = app.harness_state().projection().sessions[0].clone();
+        host.shutdown_and_join();
+        (view, row.detail, row.mode, row.default)
+    };
+    let (view, detail, mode, default) = read("[harness.claude]\nenabled = false\n");
+    assert_eq!(view, AutopilotView::AgentOff(Program::Claude));
+    assert!(
+        detail.ends_with("Supervise Claude Code sessions is off"),
+        "{detail}"
+    );
+    assert_eq!((mode, default), (None, None), "its buttons are inert");
+    let (view, detail, ..) = read("[harness.codex]\nenabled = false\n");
+    assert_eq!(view, AutopilotView::Cruise, "NEGATIVE CONTROL: {detail}");
+    let (view, detail, ..) = read("[harness]\nenabled = false\n");
+    assert_eq!(view, AutopilotView::MasterOff);
+    assert!(detail.ends_with("harness off in Settings"), "{detail}");
 }
 
 /// THE DEFAULT'S BUTTON HANDS A SESSION BACK TO THE DEFAULT: under a default
@@ -1074,12 +1250,13 @@ fn a_failed_reread_beside_a_reading_is_said() {
     today.rows = 2;
     let mut state = HarnessState::unobserved();
     state.observed = true;
-    state.stats.report = Some(Box::new(HarnessStatsReport {
-        today: today.clone(),
-        week: today,
-        collected_unix_ms: 1_000_000_000,
-        offset_s: Some(0),
-    }));
+    state.stats.report = Some(std::sync::Arc::new(HarnessStatsReport::new(
+        today.clone(),
+        today,
+        1_000_000_000,
+        Some(0),
+        &|_| Some(0),
+    )));
     let failed = |state: &HarnessState| {
         state
             .projection()
@@ -1103,6 +1280,88 @@ fn a_failed_reread_beside_a_reading_is_said() {
             "Last check".to_string(),
             "failed: the ledgers' reader failed".to_string()
         ))
+    );
+}
+
+/// WHAT THE HARNESS DID SAYS EVERY FAMILY THE FOLD KEEPS (design §10.3.1):
+/// Land's prompts are `Land prompts` (they count the prompts typed, never
+/// landings); `Declined` and `Waited at limits` are drawn; a press the safe
+/// rules could not prove is said after the window it fell in, only where
+/// one did. NEGATIVE CONTROLS: no `Landed` row; no `unproven` words in a
+/// window with none.
+#[test]
+fn what_the_harness_did_draws_every_family_the_fold_keeps() {
+    let mut today = HarnessStats::new(0);
+    today.approved = 40;
+    today.unproven = 40;
+    today.land_prompts = 2;
+    today.declined = 1;
+    today.limit_wait_ms = 125_000;
+    today.rows = 43;
+    let mut week = HarnessStats::new(0);
+    week.approved = 212;
+    week.land_prompts = 9;
+    week.declined = 4;
+    week.limit_wait_ms = 7_500_000;
+    week.rows = 230;
+    let mut state = HarnessState::unobserved();
+    state.observed = true;
+    state.stats.report = Some(std::sync::Arc::new(HarnessStatsReport::new(
+        today.clone(),
+        week.clone(),
+        1_000_000_000,
+        Some(0),
+        &|_| Some(0),
+    )));
+    let rows = state.projection().did_rows;
+    let words = |label: &str| {
+        rows.iter()
+            .find(|(l, _)| l == label)
+            .map(|(_, w)| w.clone())
+            .unwrap_or_else(|| panic!("no {label} row: {rows:?}"))
+    };
+    assert_eq!(
+        words("Approved"),
+        "40 today \u{b7} 40 unproven \u{b7} 212 in 7 days"
+    );
+    assert_eq!(words("Land prompts"), "2 today \u{b7} 9 in 7 days");
+    assert_eq!(words("Declined"), "1 today \u{b7} 4 in 7 days");
+    assert_eq!(words("Waited at limits"), "2m today \u{b7} 2h 5m in 7 days");
+    let labels: Vec<&str> = rows.iter().map(|(l, _)| l.as_str()).collect();
+    assert_eq!(
+        labels[..11],
+        [
+            "Approved",
+            "Declined",
+            "Answered",
+            "Continued",
+            "Land prompts",
+            "Resumed",
+            "Relaunched",
+            "Upgraded",
+            "Escalated",
+            "Waited on you",
+            "Waited at limits",
+        ]
+    );
+    // NEGATIVE CONTROLS.
+    assert!(!labels.contains(&"Landed"), "{labels:?}");
+    today.unproven = 0;
+    week.unproven = 3;
+    state.stats.report = Some(std::sync::Arc::new(HarnessStatsReport::new(
+        today,
+        week,
+        1_000_000_000,
+        Some(0),
+        &|_| Some(0),
+    )));
+    let rows = state.projection().did_rows;
+    assert_eq!(
+        rows.iter()
+            .find(|(l, _)| l == "Approved")
+            .map(|(_, w)| w.as_str()),
+        Some("40 today \u{b7} 212 in 7 days \u{b7} 3 unproven"),
+        "today had none unproven: said for the week alone"
     );
 }
 
@@ -1146,12 +1405,14 @@ fn a_sessions_row_names_its_agent_once() {
         state.posture = HarnessPosture::On(Autopilot::Cruise);
         state.sessions = vec![HarnessSession {
             local_id: 0,
+            sid: "s-0".to_string(),
             title: title.to_string(),
             place: "in tab 1".to_string(),
             program: "Claude Code",
             word: None,
             view: AutopilotView::Cruise,
             glass: crate::claude_lights::ChipGlass::default(),
+            armed_at_ms: None,
             default: Some(Autopilot::Cruise),
             supervised: true,
         }];
@@ -1200,27 +1461,88 @@ fn a_sessions_row_is_named_as_its_tab_is() {
     assert_eq!(title(&app), "deploy");
 }
 
+/// THE ROW'S NAME DROPS THE AGENT'S SPINNER FRAME (the Together run's D7:
+/// Codex's row read `⠦ Add tested calculator functions | proj-codex`, a
+/// frozen frame drawn as a blank indent): the row is a snapshot, so the
+/// title the agent animates is named without its frame — Codex's braille,
+/// Claude Code's moons. NEGATIVE CONTROLS: Claude Code's rest mark `✳`
+/// stays, and a name the person set is theirs, whole.
+#[test]
+fn a_sessions_row_drops_its_agents_spinner_frame() {
+    let app = App::headless_for_test();
+    run_claude(&app, 0);
+    let title = |app: &App| app.harness_state().sessions[0].title.clone();
+    let osc = |app: &App, text: &str| {
+        let session = app.pool.get(0).unwrap();
+        let mut term = session.term.lock().unwrap();
+        term.process(format!("\x1b]2;{text}\x07").as_bytes());
+    };
+    for (osc_title, row) in [
+        (
+            "\u{2826} Add tested calculator functions | proj-codex",
+            "Add tested calculator functions | proj-codex",
+        ),
+        (
+            "\u{280b} Add tested calculator functions | proj-codex",
+            "Add tested calculator functions | proj-codex",
+        ),
+        (
+            "\u{25D1} Calc.py small tested module",
+            "Calc.py small tested module",
+        ),
+        (
+            "\u{2733} Calc.py small tested module",
+            "\u{2733} Calc.py small tested module",
+        ),
+    ] {
+        osc(&app, osc_title);
+        assert_eq!(title(&app), row, "{osc_title:?}");
+    }
+    app.pool
+        .get(0)
+        .unwrap()
+        .ctx
+        .meta
+        .lock()
+        .unwrap()
+        .set("title", Some("\u{2826} deploy".to_string()));
+    assert_eq!(title(&app), "\u{2826} deploy", "the person's name, whole");
+}
+
 /// THE SESSIONS STATE LINE is formatted from the row's glass for every state
-/// (design §9.3.4), as the chip's face reads it: the timer under Cruise (its
-/// weekday on another day), the task's face and the goal hold under Land,
-/// else the trail's newest act — clock times, never an age. NEGATIVE
-/// CONTROLS: the default glass says nothing under any view (v1's row), and a
-/// face or a timer outside its own mode falls through to the trail.
+/// (design §9.3.4, §10.2.3 item 2), as the chip's face reads it: the timer
+/// under Cruise (its weekday on another day), the task's end under Cruise
+/// and Land — under Cruise with a timer armed over it after ` · ` — the
+/// task's other faces and the goal hold under Land, else the trail's newest
+/// act — clock times, never an age. NEGATIVE CONTROLS: the default glass
+/// says nothing under any view (v1's row), and a face or a timer outside its
+/// own mode falls through to the trail.
 #[test]
 fn the_sessions_state_line_is_formatted_from_the_glass_for_every_state() {
-    use crate::claude_lights::{ChipGlass, Clock, LandAtGlass, Weekday};
+    use crate::claude_lights::{ChipGlass, Clock, LandAtGlass, Stamp, Weekday};
     use aterm_agent::harness::acts::{Act, TaskFace};
     use aterm_agent::supervise::policy::turn_end::LAND_NUDGES;
-    let row = |view: AutopilotView, glass: ChipGlass| HarnessSessionRow {
+    // The day the faces were told (a Friday) and the publish's day.
+    const TODAY: i64 = 20_007;
+    let dated = |view: AutopilotView, glass: ChipGlass, today: i64| HarnessSessionRow {
         local_id: 7,
         title: "fix the build".to_string(),
+        name: "fix the build".to_string(),
+        day_line: None,
         detail: String::new(),
         mode: view.mode(),
         default: view.mode(),
         view,
         glass,
+        armed_at_ms: None,
+        today,
     };
+    let row = |view: AutopilotView, glass: ChipGlass| dated(view, glass, TODAY);
     let clock = |h: u16, m: u16| Clock::of_minute(h * 60 + m);
+    let stamp = |h: u16, m: u16| Stamp {
+        clock: clock(h, m),
+        day: TODAY,
+    };
     let timer = |day| ChipGlass {
         land_at: Some(LandAtGlass {
             clock: clock(18, 0),
@@ -1230,10 +1552,10 @@ fn the_sessions_state_line_is_formatted_from_the_glass_for_every_state() {
     };
     let told = |face| ChipGlass {
         task: Some(face),
-        task_at: Some(clock(17, 42)),
+        task_at: Some(stamp(17, 42)),
         ..ChipGlass::default()
     };
-    let last = Some((Act::Approved, clock(14, 5)));
+    let last = Some((Act::Approved, stamp(14, 5)));
     let cases = [
         (
             AutopilotView::Cruise,
@@ -1255,6 +1577,41 @@ fn the_sessions_state_line_is_formatted_from_the_glass_for_every_state() {
             told(TaskFace::Done),
             "done 17:42".to_string(),
         ),
+        // §10.2: Cruise's ends, and a timer armed over them.
+        (
+            AutopilotView::Cruise,
+            told(TaskFace::Done),
+            "done 17:42".to_string(),
+        ),
+        (
+            AutopilotView::Cruise,
+            told(TaskFace::Landed),
+            "landed 17:42".to_string(),
+        ),
+        (
+            AutopilotView::Cruise,
+            ChipGlass {
+                land_at: timer(None).land_at,
+                ..told(TaskFace::Done)
+            },
+            "done 17:42 \u{b7} lands 18:00".to_string(),
+        ),
+        (
+            AutopilotView::Cruise,
+            ChipGlass {
+                land_at: timer(Some(Weekday::Sat)).land_at,
+                ..told(TaskFace::Landed)
+            },
+            "landed 17:42 \u{b7} lands Sat 18:00".to_string(),
+        ),
+        (
+            AutopilotView::Cruise,
+            ChipGlass {
+                land_at: timer(None).land_at,
+                ..told(TaskFace::Theirs)
+            },
+            "lands at 18:00".to_string(),
+        ),
         (
             AutopilotView::Land,
             told(TaskFace::Spent),
@@ -1264,14 +1621,6 @@ fn the_sessions_state_line_is_formatted_from_the_glass_for_every_state() {
             AutopilotView::Land,
             told(TaskFace::Theirs),
             "quiet: a person's own exchange".to_string(),
-        ),
-        (
-            AutopilotView::Land,
-            ChipGlass {
-                held: true,
-                ..ChipGlass::default()
-            },
-            "held by /goal".to_string(),
         ),
         (
             AutopilotView::Cruise,
@@ -1305,6 +1654,70 @@ fn the_sessions_state_line_is_formatted_from_the_glass_for_every_state() {
             "{view:?} {glass:?}"
         );
     }
+    // THE DAY (§10.2.3, item 3): published the day after, a face's clock and
+    // the `last:` act name their weekday; on their own day, neither does.
+    for (view, glass, line) in [
+        (
+            AutopilotView::Land,
+            told(TaskFace::Landed),
+            "landed Fri 17:42",
+        ),
+        (
+            AutopilotView::Cruise,
+            told(TaskFace::Done),
+            "done Fri 17:42",
+        ),
+        (
+            AutopilotView::Cruise,
+            ChipGlass {
+                land_at: timer(Some(Weekday::Sat)).land_at,
+                ..told(TaskFace::Done)
+            },
+            "done Fri 17:42 \u{b7} lands Sat 18:00",
+        ),
+        (
+            AutopilotView::Cruise,
+            ChipGlass {
+                last,
+                ..ChipGlass::default()
+            },
+            "last: \u{2713} approved Fri 14:05",
+        ),
+    ] {
+        assert_eq!(
+            dated(view, glass, TODAY + 1).state_line().as_deref(),
+            Some(line),
+            "{view:?} {glass:?}"
+        );
+        assert!(
+            !row(view, glass).state_line().unwrap().contains("Fri"),
+            "{view:?}: its own day names none"
+        );
+    }
+    // A WEEK ON (the review's finding 3): a face's clock and the `last:` act
+    // name their date, never the weekday that is today's own (`Fri` on the
+    // Friday after).
+    for (view, glass, line) in [
+        (
+            AutopilotView::Land,
+            told(TaskFace::Landed),
+            "landed 11 Oct 17:42",
+        ),
+        (
+            AutopilotView::Cruise,
+            ChipGlass {
+                last,
+                ..ChipGlass::default()
+            },
+            "last: \u{2713} approved 11 Oct 14:05",
+        ),
+    ] {
+        assert_eq!(
+            dated(view, glass, TODAY + 7).state_line().as_deref(),
+            Some(line),
+            "{view:?} {glass:?}"
+        );
+    }
     for view in AutopilotView::ALL {
         assert_eq!(
             row(view, ChipGlass::default()).state_line(),
@@ -1322,4 +1735,1181 @@ fn the_sessions_state_line_is_formatted_from_the_glass_for_every_state() {
         row(AutopilotView::Land, unplaced).state_line().as_deref(),
         Some("done")
     );
+}
+
+/// The page's acts on an injected clock: an App with session 0 running
+/// Claude Code under an idle host, Settings ▸ Harness open on window 0 and
+/// its reading begun at `t0` (a test App starts no reader thread, so each
+/// test begins its readings where the thread would), and an act's arrival
+/// `ms` after `t0`.
+struct Page {
+    app: App,
+    host: crate::harness_host::HostHandle,
+    t0: std::time::Instant,
+}
+
+impl Page {
+    fn open() -> Self {
+        let mut app = App::headless_for_test();
+        run_claude(&app, 0);
+        let host = idle_host();
+        app.harness = Some(host.clone());
+        assert!(app.open_harness_settings(WindowId(0), crate::harness_screen::HarnessFocus::Top));
+        let t0 = std::time::Instant::now();
+        app.harness_screen.began_reading(t0);
+        Self { app, host, t0 }
+    }
+
+    /// `ms` after `t0`.
+    fn at(&self, ms: u64) -> std::time::Instant {
+        self.t0 + std::time::Duration::from_millis(ms)
+    }
+
+    /// An act of the harness's on session 0, `ms` after `t0`.
+    fn act(&mut self, act: aterm_agent::harness::acts::Act, ms: u64) {
+        let at = crate::harness_glass::Arrival {
+            now: self.at(ms),
+            unix: 1_792_159_500 + i64::try_from(ms / 1000).expect("small"),
+            offset_s: Some(0),
+        };
+        crate::harness_glass::on_act_at(&mut self.app, 0, act, at);
+    }
+
+    /// The running reading lands with empty counts.
+    fn land(&mut self) {
+        let report = Box::new(HarnessStatsReport::new(
+            HarnessStats::new(0),
+            HarnessStats::new(0),
+            0,
+            None,
+            &|_| None,
+        ));
+        let sequence = self.app.harness_screen.sequence;
+        self.app.finish_harness_stats(sequence, Ok(report));
+    }
+
+    /// Whether the page shows its `Newer` line.
+    fn newer(&self) -> bool {
+        self.app
+            .harness_state()
+            .projection()
+            .did_rows
+            .iter()
+            .any(|(label, _)| label == "Newer")
+    }
+}
+
+impl Drop for Page {
+    fn drop(&mut self) {
+        self.host.shutdown_and_join();
+    }
+}
+
+/// AN ACT MARKS THE PAGE STALE AND OWES A RE-READ A DWELL AFTER IT, AT MOST
+/// ONE PER 10 S (design §9.2.1, "The page"): with Settings ▸ Harness on
+/// screen, an act marks WHAT THE HARNESS DID stale (its `Newer` line),
+/// republishes the page — the session's glass carries the act — and owes a
+/// re-read on the act ticker's one deadline 3 s after the act, allowing time
+/// for later journal rows without acknowledging their publication,
+/// never sooner than 10 s after the last reading began, however many acts
+/// come. A reading that lands having begun a dwell after the newest act
+/// clears the mark; one that began before an act, or too soon after it,
+/// leaves it and owes another.
+///
+/// NEGATIVE CONTROL: off the page an act marks nothing and owes nothing —
+/// the page's route reads the ledgers afresh when it opens.
+#[test]
+fn an_act_marks_the_page_stale_and_owes_one_reread_per_ten_seconds() {
+    use crate::harness_glass::{DWELL, REREAD};
+    use aterm_agent::harness::acts::Act;
+    // NEGATIVE CONTROL: off the page.
+    {
+        let mut app = App::headless_for_test();
+        run_claude(&app, 0);
+        let host = idle_host();
+        app.harness = Some(host.clone());
+        let t0 = std::time::Instant::now();
+        crate::harness_glass::on_act_at(
+            &mut app,
+            0,
+            Act::Approved,
+            crate::harness_glass::Arrival {
+                now: t0,
+                unix: 1_792_159_500,
+                offset_s: Some(0),
+            },
+        );
+        assert!(!app.harness_screen.stats.stale);
+        assert_eq!(app.harness_screen.reread_at(), None);
+        app.expire_harness_acts_at(t0 + DWELL);
+        assert_eq!(app.harness_acts_deadline(), None);
+        host.shutdown_and_join();
+    }
+
+    let mut page = Page::open();
+    let revision = page.app.harness_screen.revision;
+    page.act(Act::Continued, 20_000);
+    assert!(page.app.harness_screen.stats.stale);
+    assert!(page.app.harness_screen.revision > revision, "republished");
+    assert_eq!(
+        page.app.harness_state().sessions[0]
+            .glass
+            .last
+            .map(|(act, _)| act),
+        Some(Act::Continued),
+        "the row's glass carries the act"
+    );
+    // The open's reading began 20 s ago: the re-read is owed a dwell after
+    // the act — the label's own end, the one deadline.
+    let owed = page.at(20_000) + DWELL;
+    assert_eq!(page.app.harness_screen.reread_at(), Some(owed));
+    assert_eq!(page.app.harness_acts_deadline(), Some(owed));
+    // The open's reading lands: it began before the act, so still stale.
+    page.land();
+    assert!(page.app.harness_screen.stats.stale, "older than the act");
+    assert!(page.newer(), "the page says so");
+    assert_eq!(page.app.harness_screen.reread_at(), Some(owed));
+    // The re-read comes due with the label's end.
+    page.app.expire_harness_acts_at(owed);
+    assert_eq!(page.app.harness_screen.reread_at(), None, "taken");
+    page.app.harness_screen.began_reading(owed);
+    // Two acts right after: one re-read, 10 s after the last began.
+    page.act(Act::Approved, 24_000);
+    page.act(Act::Answered, 25_000);
+    assert_eq!(page.app.harness_screen.reread_at(), Some(owed + REREAD));
+    assert_eq!(page.app.harness_acts_deadline(), Some(owed + REREAD));
+    // The reading that began at `owed` lands: two acts came after it.
+    page.land();
+    assert!(page.app.harness_screen.stats.stale);
+    assert_eq!(page.app.harness_screen.reread_at(), Some(owed + REREAD));
+    // The re-read at +10 s covers them, and lands fresh: nothing owed.
+    page.app.expire_harness_acts_at(owed + REREAD);
+    page.app.harness_screen.began_reading(owed + REREAD);
+    page.land();
+    assert!(!page.app.harness_screen.stats.stale, "covered: fresh");
+    assert!(!page.newer());
+    assert_eq!(page.app.harness_acts_deadline(), None);
+}
+
+/// EVERY ACT REACHES THE PAGE, A REPEAT THE CHIP COALESCED INCLUDED, AND THE
+/// RE-READ WAITS A DWELL PAST THE NEWEST (§9.2.1, "The page"): two boxes
+/// approved a second apart are one entry on the chip's trail and two rows
+/// the page counts — the second moves the owed re-read to 3 s after it;
+/// a reading begun before then lands stale and
+/// owes another. A question dialog's three keys 1.8 s apart owe it 3 s
+/// past the last key, allowing time for its later `CHOSE` row. This fixture
+/// tests the schedule, not disk publication. A steady run of acts cannot
+/// hold the re-read off: it is never owed later than 10 s after the act that
+/// first owed it.
+///
+/// NEGATIVE CONTROL: the first act alone owes it 3 s after itself.
+#[test]
+fn every_act_reaches_the_page_and_its_reread_waits_a_dwell_past_the_newest() {
+    use crate::harness_glass::{DWELL, REREAD};
+    use aterm_agent::harness::acts::Act;
+    let mut page = Page::open();
+    page.act(Act::Approved, 20_000);
+    // NEGATIVE CONTROL.
+    assert_eq!(
+        page.app.harness_screen.reread_at(),
+        Some(page.at(20_000) + DWELL)
+    );
+    page.act(Act::Approved, 21_000);
+    let glass = &page.app.harness_glass[&0];
+    assert_eq!(glass.trail_gen(), 1, "one entry on the chip's trail");
+    assert_eq!(
+        page.app.harness_screen.reread_at(),
+        Some(page.at(21_000) + DWELL),
+        "the repeat reached the page"
+    );
+    // A Refresh's reading at +23 s, too soon after the second: stale, and
+    // another owed — 10 s after that reading began.
+    page.app.harness_screen.began_reading(page.at(23_000));
+    page.land();
+    assert!(page.app.harness_screen.stats.stale);
+    assert_eq!(page.app.harness_screen.reread_at(), Some(page.at(33_000)));
+    page.app.expire_harness_acts_at(page.at(33_000));
+    assert_eq!(page.app.harness_screen.reread_at(), None, "taken");
+    page.app.harness_screen.began_reading(page.at(33_000));
+    page.land();
+    assert!(!page.app.harness_screen.stats.stale, "both read");
+
+    // A dialog's three keys, 1.8 s apart, after the last reading's 10 s.
+    for ms in [50_000, 51_800, 53_600] {
+        page.act(Act::Answered, ms);
+    }
+    assert_eq!(
+        page.app.harness_screen.reread_at(),
+        Some(page.at(53_600) + DWELL),
+        "a dwell past the dialog's last key"
+    );
+    page.app.expire_harness_acts_at(page.at(56_600));
+    page.app.harness_screen.began_reading(page.at(56_600));
+    page.land();
+    assert!(
+        !page.app.harness_screen.stats.stale,
+        "the dialog read whole"
+    );
+
+    // A steady run, an act every 2 s from +100 s: owed no later than 10 s
+    // after the first.
+    for i in 0..10 {
+        page.act(Act::Continued, 100_000 + 2_000 * i);
+    }
+    assert_eq!(
+        page.app.harness_screen.reread_at(),
+        Some(page.at(100_000) + REREAD)
+    );
+}
+
+/// A RE-READ DUE WHILE ANOTHER READING RUNS LEAVES NO `NEWER` STANDING
+/// (§9.2.1): the re-read an act owes comes due while a Refresh's reading
+/// runs, so it starts nothing and is taken; the Refresh's reading, begun too
+/// soon after the act, lands stale — and owes the re-read again, 10 s after
+/// it began, which lands fresh.
+///
+/// NEGATIVE CONTROL: a reading that began a dwell after the act lands fresh
+/// and owes nothing.
+#[test]
+fn a_reread_due_while_a_reading_runs_is_owed_again() {
+    use crate::harness_glass::{DWELL, REREAD};
+    use aterm_agent::harness::acts::Act;
+    let mut page = Page::open();
+    page.land();
+    page.act(Act::Approved, 7_000);
+    assert_eq!(page.app.harness_screen.reread_at(), Some(page.at(10_000)));
+    // Refresh at +9.8 s; the owed re-read comes due at +10 s while it runs.
+    let refresh = page.at(9_800);
+    page.app.harness_screen.began_reading(refresh);
+    page.app.expire_harness_acts_at(page.at(10_000));
+    assert_eq!(page.app.harness_screen.reread_at(), None, "taken");
+    page.land();
+    assert!(page.app.harness_screen.stats.stale);
+    assert!(page.newer());
+    assert_eq!(
+        page.app.harness_screen.reread_at(),
+        Some(refresh + REREAD),
+        "owed again: the page reads again, as it says"
+    );
+    assert_eq!(page.app.harness_acts_deadline(), Some(refresh + REREAD));
+    page.app.expire_harness_acts_at(refresh + REREAD);
+    page.app.harness_screen.began_reading(refresh + REREAD);
+    page.land();
+    assert!(!page.newer());
+    assert_eq!(page.app.harness_acts_deadline(), None);
+    // NEGATIVE CONTROL.
+    page.act(Act::Approved, 60_000);
+    page.app
+        .harness_screen
+        .began_reading(page.at(60_000) + DWELL);
+    page.land();
+    assert!(!page.app.harness_screen.stats.stale);
+}
+
+/// A PAGE THAT LEAVES THE SCREEN OWES NOTHING (§9.2.3 item 6: with no label
+/// up and no read owed, the slot is empty): the re-read an act owed is no
+/// deadline once the Settings tab is closed, and the next pass of the loop
+/// forgets it with its `Newer` mark — no wake for a page nobody reads.
+///
+/// CONTROL: with the page on screen the same re-read is the deadline.
+#[test]
+fn a_closed_page_keeps_no_reread_armed() {
+    use crate::harness_glass::DWELL;
+    use aterm_agent::harness::acts::Act;
+    let mut page = Page::open();
+    page.act(Act::Approved, 1_000);
+    // The label goes at +4 s; the re-read waits for +10 s.
+    page.app.expire_harness_acts_at(page.at(1_000) + DWELL);
+    assert_eq!(
+        page.app.harness_acts_deadline(),
+        Some(page.at(10_000)),
+        "CONTROL"
+    );
+    assert!(!page.app.close_tab_at(WindowId(0), 1), "the Settings tab");
+    assert!(!page.app.harness_page_shown());
+    assert_eq!(page.app.harness_acts_deadline(), None, "nothing armed");
+    page.app.expire_harness_acts();
+    assert_eq!(page.app.harness_screen.reread_at(), None);
+    assert!(!page.app.harness_screen.stats.stale);
+}
+
+/// A PAGE HELD OPEN ACROSS THE MINUTE SAYS THE DAY FROM THAT MINUTE ON
+/// (§9.3.4; the review of the Together run's D6): Settings ▸ Harness
+/// published at 18:30 on a Friday with `land_at = "18:36"` offers `18:36`
+/// and owes one wake, at 18:36, where the page is published again offering
+/// Saturday's — what the Timer's press then arms. NEGATIVE CONTROL: with the
+/// Settings tab closed nothing is owed, and the loop's next pass drops the
+/// note.
+#[test]
+fn a_page_held_open_across_the_minute_names_the_day_from_then_on() {
+    use crate::autopilot_timers::{TimerChoice, glass_of, local_offset_at, set_fake_clocks};
+    use crate::claude_lights::Weekday;
+    let mut app = App::headless_for_test();
+    let fri = 1_792_177_200_i64;
+    let off = local_offset_at(fri).expect("the zone reads");
+    let day = (fri + off).div_euclid(86_400);
+    let local = |hh: i64, mm: i64| (day * 86_400 + hh * 3_600 + mm * 60 - off) * 1000;
+    let opened = local(18, 30);
+    assert_eq!(
+        local_offset_at(local(23, 59) / 1000),
+        Some(off),
+        "no clock change between"
+    );
+    let t0 = std::time::Instant::now();
+    let mono = |wall: i64| {
+        t0 + std::time::Duration::from_millis(u64::try_from(wall - opened).expect("ahead"))
+    };
+    let clocks = |wall: i64| set_fake_clocks(Some((mono(wall), wall)));
+    clocks(opened);
+    app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
+        crate::app_config::HarnessPolicy::read("[harness]\nland_at = \"18:36\"\n"),
+    );
+    let published = |app: &App| {
+        let instance = app
+            .native_runtime
+            .instance_by_kind(crate::native_app::AppKind::Settings)
+            .expect("the Settings controller");
+        let Some(crate::native_app::NativeApp::Settings(settings)) =
+            app.native_runtime.app(instance)
+        else {
+            unreachable!("a Settings instance")
+        };
+        settings.harness_snapshot().land_at_offer.expect("offered")
+    };
+    assert!(app.open_harness_settings(WindowId(0), crate::harness_screen::HarnessFocus::Top));
+    assert!(app.harness_page_shown());
+    assert_eq!(published(&app).other_day, None, "18:36 is ahead today");
+    assert_eq!(app.autopilot_offer_deadline(), Some(mono(local(18, 36))));
+
+    clocks(local(18, 36));
+    let revision = app.harness_screen.revision;
+    app.expire_autopilot_offer();
+    assert!(app.harness_screen.revision > revision, "published again");
+    let offer = published(&app);
+    assert_eq!(offer.other_day, Some(Weekday::of_days(day + 1)));
+    let armed = app
+        .resolve_timer_choice(TimerChoice::At)
+        .expect("a press arms");
+    assert_eq!(
+        glass_of(armed, local(18, 36), &local_offset_at),
+        Some(offer),
+        "the button says what a press arms"
+    );
+
+    // NEGATIVE CONTROL: the page gone, nothing is owed.
+    assert!(!app.close_tab_at(WindowId(0), 1), "the Settings tab");
+    assert!(!app.harness_page_shown());
+    assert_eq!(
+        app.autopilot_offer_deadline(),
+        None,
+        "no wake for a closed page"
+    );
+    app.expire_autopilot_offer();
+    assert_eq!(app.autopilot_timers.offer_due(), None, "the note dropped");
+    set_fake_clocks(None);
+}
+
+/// A PAGE HELD OPEN PAST MIDNIGHT READS THE NEW DAY (§10.3.3 item 10,
+/// §10.2.3 item 6; the review of v3/stats-fold, finding 1): with no
+/// `[harness] land_at`, Settings ▸ Harness shown at 23:50 on a Friday over
+/// that day's reading owes ONE wake, at the next local midnight; short of
+/// it nothing is read, and past it the page asks for a reading (STATUS's
+/// today and each row's day were Friday's) and owes the next midnight.
+/// With `land_at = "23:55"` the 23:55 turn republishes the offer but reads
+/// nothing, and midnight still reads. NEGATIVE CONTROLS: the 23:55 turn
+/// over a reading of today asks for none; the page gone, nothing is owed.
+#[test]
+fn a_page_held_open_past_midnight_reads_the_new_day() {
+    use crate::autopilot_timers::{local_offset_at, set_fake_clocks};
+    use crate::harness_screen::HarnessFocus;
+    let fri = 1_792_177_200_i64;
+    let off = local_offset_at(fri).expect("the zone reads");
+    let day = (fri + off).div_euclid(86_400);
+    let local = |day: i64, hh: i64, mm: i64| (day * 86_400 + hh * 3_600 + mm * 60 - off) * 1000;
+    let opened = local(day, 23, 50);
+    assert_eq!(
+        local_offset_at(local(day + 2, 0, 0) / 1000),
+        Some(off),
+        "no clock change between"
+    );
+    let t0 = std::time::Instant::now();
+    let mono = |wall: i64| {
+        t0 + std::time::Duration::from_millis(u64::try_from(wall - opened).expect("ahead"))
+    };
+    let clocks = |wall: i64| set_fake_clocks(Some((mono(wall), wall)));
+    // Friday's reading, as the route's arrival would have landed it.
+    let read_friday = |app: &mut App| {
+        app.harness_screen.stats.collecting = false;
+        app.harness_screen.stats.report = Some(std::sync::Arc::new(HarnessStatsReport::new(
+            HarnessStats::per_session(local(day, 0, 0)),
+            HarnessStats::new(local(day - 6, 0, 0)),
+            opened,
+            Some(off),
+            &|_| Some(off),
+        )));
+    };
+    for land_at in [None, Some("23:55")] {
+        let mut app = App::headless_for_test();
+        clocks(opened);
+        if let Some(at) = land_at {
+            app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
+                crate::app_config::HarnessPolicy::read(&format!("[harness]\nland_at = \"{at}\"\n")),
+            );
+        }
+        assert!(app.open_harness_settings(WindowId(0), HarnessFocus::Top));
+        assert!(app.harness_page_shown());
+        read_friday(&mut app);
+        app.publish_native_harness_state();
+        let asked = app.harness_screen.readings_asked;
+        if land_at.is_some() {
+            assert_eq!(
+                app.autopilot_offer_deadline(),
+                Some(mono(local(day, 23, 55))),
+                "{land_at:?}: the offer turns first"
+            );
+            clocks(local(day, 23, 55));
+            let revision = app.harness_screen.revision;
+            app.expire_autopilot_offer();
+            assert!(app.harness_screen.revision > revision, "published again");
+            assert_eq!(
+                app.harness_screen.readings_asked, asked,
+                "CONTROL: a turn over today's reading reads nothing"
+            );
+        }
+        assert_eq!(
+            app.autopilot_offer_deadline(),
+            Some(mono(local(day + 1, 0, 0))),
+            "{land_at:?}: one wake, at midnight"
+        );
+        clocks(local(day + 1, 0, 0) - 1);
+        app.expire_autopilot_offer();
+        assert_eq!(
+            app.harness_screen.readings_asked, asked,
+            "{land_at:?}: short of it"
+        );
+        clocks(local(day + 1, 0, 0));
+        app.expire_autopilot_offer();
+        assert_eq!(
+            app.harness_screen.readings_asked,
+            asked + 1,
+            "{land_at:?}: past midnight the page reads the new day"
+        );
+        if land_at.is_none() {
+            assert_eq!(
+                app.autopilot_offer_deadline(),
+                Some(mono(local(day + 2, 0, 0))),
+                "then the next midnight"
+            );
+        }
+        // NEGATIVE CONTROL: the page gone, nothing is owed.
+        assert!(!app.close_tab_at(WindowId(0), 1), "the Settings tab");
+        assert_eq!(app.autopilot_offer_deadline(), None, "{land_at:?}");
+        set_fake_clocks(None);
+    }
+}
+
+/// THE LANDING LETS GO AT THE NEXT PRESS OR SCROLL (§10.3.1; the review of
+/// v3/stats-fold, finding 3): the landed row's Show is drawn selected until
+/// the wheel (`ScrollLines`), Page Up or Down (`ScrollPage`), or Up or Down
+/// (`StepFocus`, which moves the keyboard or, with no control of the list
+/// focused, scrolls the list a row) — read from the view's own focus, since
+/// a scroll can take the row off the screen `controls prefs` reads.
+/// NEGATIVE CONTROL: a publish of the page (`HarnessChanged`, no press)
+/// keeps the landing.
+#[test]
+fn a_scroll_or_an_arrow_lets_the_landed_row_go() {
+    use crate::app_introspect::AuxTarget;
+    use crate::harness_screen::HarnessFocus;
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    run_claude(&app, 0);
+    let host = idle_host();
+    app.harness = Some(host.clone());
+    let selected = |app: &App| {
+        app.read_aux_controls(AuxTarget::Prefs).iter().any(|l| {
+            l.starts_with("ui key=\"harness/session/0/show\" ") && l.contains("selected:true")
+        })
+    };
+    // The landing itself: a scroll can take the row off the screen read, so
+    // the view's own focus says whether it let go.
+    let landed = |app: &App| {
+        app.native_settings_route_view_target(crate::native_settings::SettingsRoute::Harness)
+            .map(|(_, _, _, state)| state.harness_focus)
+    };
+    for event in [
+        AppEvent::ScrollLines(1),
+        AppEvent::ScrollLines(-1),
+        AppEvent::ScrollPage(1),
+        AppEvent::StepFocus(1),
+        AppEvent::StepFocus(-1),
+    ] {
+        let name = format!("{event:?}");
+        assert!(app.open_harness_settings(wid, HarnessFocus::Session(0)));
+        assert!(selected(&app), "{name}: landed");
+        app.publish_native_harness_state();
+        assert!(selected(&app), "CONTROL {name}: a publish keeps it");
+        assert_eq!(
+            landed(&app),
+            Some(HarnessFocus::Session(0)),
+            "CONTROL {name}"
+        );
+        let (_, view) = app.active_native_view(wid).expect("the Settings view");
+        app.dispatch_native_view_event(wid, view, event)
+            .expect("dispatched");
+        assert_eq!(landed(&app), Some(HarnessFocus::Top), "{name} lets it go");
+        assert!(!selected(&app), "{name}: drawn so");
+    }
+    host.shutdown_and_join();
+}
+
+/// A PAGE HELD OPEN ACROSS MIDNIGHT NAMES A FACE'S DAY FROM THEN ON
+/// (§10.2.3 item 6; §10.2.5, "Idle"): with no `[harness] land_at`,
+/// Settings ▸ Harness shown at 23:58 on a Friday, its session landed at
+/// 23:50, reads `landed 23:50` and owes ONE wake, at the next local
+/// midnight; there the page is published again and the row reads `landed
+/// Fri 23:50`, owing the next midnight. NEGATIVE CONTROL: with the page
+/// closed nothing is owed, and the loop's next pass drops the note.
+#[test]
+fn a_page_held_open_across_midnight_names_the_faces_day_from_then_on() {
+    use crate::autopilot_timers::{local_offset_at, set_fake_clocks};
+    use aterm_agent::harness::acts::TaskFace;
+    let mut app = App::headless_for_test();
+    run_claude(&app, 0);
+    let host = idle_host();
+    app.harness = Some(host.clone());
+    let fri = 1_792_177_200_i64;
+    let off = local_offset_at(fri).expect("the zone reads");
+    let day = (fri + off).div_euclid(86_400);
+    let local = |day: i64, hh: i64, mm: i64| (day * 86_400 + hh * 3_600 + mm * 60 - off) * 1000;
+    let opened = local(day, 23, 58);
+    assert_eq!(
+        local_offset_at(local(day + 1, 23, 59) / 1000),
+        Some(off),
+        "no clock change between"
+    );
+    let t0 = std::time::Instant::now();
+    let mono = |wall: i64| {
+        t0 + std::time::Duration::from_millis(u64::try_from(wall - opened).expect("ahead"))
+    };
+    let clocks = |wall: i64| set_fake_clocks(Some((mono(wall), wall)));
+    clocks(opened);
+    assert!(crate::harness_glass::on_task(
+        &mut app,
+        0,
+        Some(TaskFace::Landed),
+        local(day, 23, 50)
+    ));
+    let line = |app: &App| {
+        let instance = app
+            .native_runtime
+            .instance_by_kind(crate::native_app::AppKind::Settings)
+            .expect("the Settings controller");
+        let Some(crate::native_app::NativeApp::Settings(settings)) =
+            app.native_runtime.app(instance)
+        else {
+            unreachable!("a Settings instance")
+        };
+        settings.harness_snapshot().projection().sessions[0].state_line()
+    };
+    assert!(app.open_harness_settings(WindowId(0), crate::harness_screen::HarnessFocus::Top));
+    assert!(app.harness_page_shown());
+    assert_eq!(line(&app).as_deref(), Some("landed 23:50"), "its own day");
+    assert_eq!(
+        app.autopilot_offer_deadline(),
+        Some(mono(local(day + 1, 0, 0))),
+        "one wake, at midnight"
+    );
+
+    clocks(local(day + 1, 0, 0) - 1);
+    app.expire_autopilot_offer();
+    assert_eq!(line(&app).as_deref(), Some("landed 23:50"), "short of it");
+
+    clocks(local(day + 1, 0, 0));
+    let revision = app.harness_screen.revision;
+    app.expire_autopilot_offer();
+    assert!(app.harness_screen.revision > revision, "published again");
+    let fri = crate::claude_lights::Weekday::of_days(day).short();
+    assert_eq!(
+        line(&app),
+        Some(format!("landed {fri} 23:50")),
+        "yesterday's, by its weekday"
+    );
+    assert_eq!(
+        app.autopilot_offer_deadline(),
+        Some(mono(local(day + 2, 0, 0))),
+        "then the next midnight"
+    );
+
+    // NEGATIVE CONTROL: the page gone, nothing is owed.
+    assert!(!app.close_tab_at(WindowId(0), 1), "the Settings tab");
+    assert!(!app.harness_page_shown());
+    assert_eq!(
+        app.autopilot_offer_deadline(),
+        None,
+        "no wake for a closed page"
+    );
+    app.expire_autopilot_offer();
+    assert_eq!(app.autopilot_timers.offer_due(), None, "the note dropped");
+    set_fake_clocks(None);
+    host.shutdown_and_join();
+}
+
+/// THE PAGE'S `at` OFFER IS THE INSTANT A PRESS WOULD ARM, READ AT THE
+/// PUBLISH (§9.3.4; the Together run's D6): at 18:49 local on a Friday,
+/// `[harness] land_at = "18:36"` is offered as Saturday's — the day in the
+/// zone this runs in — and the Timer's press arms exactly that instant;
+/// `"18:55"` is offered as today's. NEGATIVE CONTROL: with no `land_at`
+/// nothing is offered (the publish still notes the next local midnight,
+/// §10.2.3 item 6, for its day words).
+#[test]
+fn the_pages_land_at_offer_is_the_instant_a_press_would_arm() {
+    use crate::autopilot_timers::{TimerChoice, glass_of, local_offset_at, set_fake_clocks};
+    use crate::claude_lights::Weekday;
+    let mut app = App::headless_for_test();
+    let fri = 1_792_177_200_i64;
+    let off = local_offset_at(fri).expect("the zone reads");
+    let day = (fri + off).div_euclid(86_400);
+    let now = day * 86_400 + 18 * 3_600 + 49 * 60 - off;
+    assert_eq!(local_offset_at(now), Some(off), "no clock change between");
+    set_fake_clocks(Some((std::time::Instant::now(), now * 1000)));
+    for (land_at, other_day) in [("18:36", Some(Weekday::of_days(day + 1))), ("18:55", None)] {
+        app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
+            crate::app_config::HarnessPolicy::read(&format!(
+                "[harness]\nland_at = \"{land_at}\"\n"
+            )),
+        );
+        let offer = app.harness_state().land_at_offer.expect("offered");
+        assert_eq!(
+            (offer.clock.as_str(), offer.other_day),
+            (land_at, other_day),
+            "{land_at}"
+        );
+        let armed = app
+            .resolve_timer_choice(TimerChoice::At)
+            .expect("a press arms");
+        assert_eq!(
+            glass_of(armed, now * 1000, &local_offset_at),
+            Some(offer),
+            "{land_at}: the press arms what the button says"
+        );
+    }
+    app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
+        crate::app_config::HarnessPolicy::read("[harness]\n"),
+    );
+    assert_eq!(app.harness_state().land_at_offer, None);
+    set_fake_clocks(None);
+}
+
+/// A day's counts for the tests below: `pairs` of a family's field and its
+/// count.
+fn day_of(edit: impl FnOnce(&mut HarnessStats)) -> HarnessStats {
+    let mut day = HarnessStats::per_session(0);
+    edit(&mut day);
+    day
+}
+
+/// A state observed, with `today` read (or none, `collecting` or not).
+fn state_with_today(today: Option<HarnessStats>, collecting: bool) -> HarnessState {
+    let mut state = HarnessState::unobserved();
+    state.observed = true;
+    state.stats.collecting = collecting;
+    state.stats.report = today.map(|today| {
+        std::sync::Arc::new(HarnessStatsReport::new(
+            today,
+            HarnessStats::new(0),
+            0,
+            Some(0),
+            &|_| Some(0),
+        ))
+    });
+    state
+}
+
+/// STATUS'S TODAY (§10.3.1): the first three nonzero families lead, the rest
+/// and the person's wait follow; zeros are never said; `nothing yet today`
+/// for an empty day and `reading…` before the first reading; a day that is
+/// only a wait leads with it. NEGATIVE CONTROLS: an unobserved page and one
+/// with no reading running say nothing (no line is promised).
+#[test]
+fn statuss_today_says_its_nonzero_families_in_their_order() {
+    assert_eq!(HarnessState::unobserved().today_lines(), None);
+    assert_eq!(state_with_today(None, false).today_lines(), None);
+    assert_eq!(
+        state_with_today(None, true).today_lines(),
+        Some(("reading\u{2026}".to_string(), String::new()))
+    );
+    assert_eq!(
+        state_with_today(Some(day_of(|_| {})), false).today_lines(),
+        Some(("nothing yet today".to_string(), String::new()))
+    );
+    let full = day_of(|d| {
+        d.approved = 37;
+        d.continued = 12;
+        d.answered = 4;
+        d.resumed = 2;
+        d.land_prompts = 1;
+        d.declined = 0;
+        d.upgraded = 3;
+        d.human_wait_ms = 240_000;
+    });
+    assert_eq!(
+        state_with_today(Some(full), false).today_lines(),
+        Some((
+            "37 approved today \u{b7} 12 kept going \u{b7} 4 answered".to_string(),
+            "2 resumed \u{b7} 1 land prompt \u{b7} 3 upgraded \u{b7} waited on you 4m".to_string()
+        ))
+    );
+    // Three families or fewer: the second line is the wait alone, or empty.
+    let short = day_of(|d| {
+        d.approved = 1;
+        d.answered = 2;
+    });
+    assert_eq!(
+        state_with_today(Some(short), false).today_lines(),
+        Some((
+            "1 approved today \u{b7} 2 answered".to_string(),
+            String::new()
+        ))
+    );
+    let wait = day_of(|d| d.human_wait_ms = 60_000);
+    assert_eq!(
+        state_with_today(Some(wait), false).today_lines(),
+        Some(("waited on you 1m today".to_string(), String::new()))
+    );
+}
+
+/// A SESSIONS ROW'S DAY (§10.3.1): `today:`, the person's need first (how
+/// often, how long, the last time), then at most three nonzero families,
+/// then `partial` where its own ledgers were cut. NEGATIVE CONTROLS: a
+/// session with nothing today has no line; zeros are never said; with no
+/// zone the clock says UTC.
+#[test]
+fn a_rows_day_line_says_its_need_then_three_families_then_partial() {
+    use aterm_agent::harness::stats::Tally;
+    let at_18_29 = (18 * 3_600 + 29 * 60) * 1000;
+    let need = Tally {
+        escalated: 1,
+        human_wait_ms: 71_000,
+        last_escalated_ms: Some(at_18_29),
+        approved: 31,
+        continued: 1,
+        ..Tally::default()
+    };
+    assert_eq!(
+        day_line(&need, Some(0)).as_deref(),
+        Some("today: needed you once, 1m at 18:29 \u{b7} 31 approved \u{b7} 1 kept going")
+    );
+    assert_eq!(
+        day_line(&need, None).as_deref(),
+        Some("today: needed you once, 1m at 18:29 UTC \u{b7} 31 approved \u{b7} 1 kept going")
+    );
+    let many = Tally {
+        escalated: 2,
+        approved: 3,
+        continued: 2,
+        answered: 1,
+        resumed: 4,
+        land_prompts: 1,
+        cut: true,
+        ..Tally::default()
+    };
+    assert_eq!(
+        day_line(&many, Some(0)).as_deref(),
+        Some(
+            "today: needed you twice \u{b7} 3 approved \u{b7} 2 kept going \u{b7} 1 answered \u{b7} partial"
+        )
+    );
+    let thrice = Tally {
+        escalated: 3,
+        ..Tally::default()
+    };
+    assert_eq!(
+        day_line(&thrice, Some(0)).as_deref(),
+        Some("today: needed you 3 times")
+    );
+    assert_eq!(day_line(&Tally::default(), Some(0)), None);
+    // Unproven presses are approvals already counted, never a family.
+    let unproven = Tally {
+        approved: 2,
+        unproven: 2,
+        ..Tally::default()
+    };
+    assert_eq!(
+        day_line(&unproven, Some(0)).as_deref(),
+        Some("today: 2 approved")
+    );
+}
+
+/// THE JOIN (§10.3.3, item 5): each row's day comes from ITS sid's share of
+/// today's reading; a share no live session claims counts in the totals and
+/// in no row; a row with no share has no day. Two rows that share a title
+/// are named by their place too, so their buttons read apart (hunt
+/// surfaces-F5). NEGATIVE CONTROL: a title of its own is the row's name
+/// alone.
+#[test]
+fn each_row_takes_its_own_sessions_day_and_a_name_its_own() {
+    use aterm_agent::harness::stats::Tally;
+    let session = |local_id: u64, title: &str, place: &str| HarnessSession {
+        local_id,
+        sid: format!("s-{local_id}"),
+        title: title.to_string(),
+        place: place.to_string(),
+        program: "Claude Code",
+        word: None,
+        view: AutopilotView::Cruise,
+        glass: crate::claude_lights::ChipGlass::default(),
+        armed_at_ms: None,
+        default: Some(Autopilot::Cruise),
+        supervised: true,
+    };
+    let mut today = HarnessStats::per_session(0);
+    today.approved = 9;
+    let shares = today.by_session.as_mut().expect("per session");
+    shares.insert(
+        "s-1".to_string(),
+        Tally {
+            approved: 4,
+            ..Tally::default()
+        },
+    );
+    shares.insert(
+        "s-gone".to_string(),
+        Tally {
+            approved: 5,
+            ..Tally::default()
+        },
+    );
+    let mut state = state_with_today(Some(today), false);
+    state.posture = HarnessPosture::On(Autopilot::Cruise);
+    state.sessions = vec![
+        session(1, "Claude Code", "in tab 1, left pane"),
+        session(2, "Claude Code", "in tab 1, right pane"),
+        session(3, "fix the build", "in tab 2"),
+    ];
+    let rows = state.projection().sessions;
+    let days: Vec<Option<&str>> = rows.iter().map(|r| r.day_line.as_deref()).collect();
+    assert_eq!(days, [Some("today: 4 approved"), None, None]);
+    let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "Claude Code, tab 1, left pane",
+            "Claude Code, tab 1, right pane",
+            "fix the build"
+        ]
+    );
+    assert!(
+        rows[0].detail.starts_with("Tab 1, left pane"),
+        "{}",
+        rows[0].detail
+    );
+    assert!(
+        rows[1].detail.starts_with("Tab 1, right pane"),
+        "{}",
+        rows[1].detail
+    );
+}
+
+/// A row's escalation clock is the event's local clock, while Checked
+/// remains the reading's. Fixed and unreadable zones are controls; spring
+/// and fall events both lie inside the report's actual local day. The
+/// production report constructor and session-row projection carry the words.
+#[test]
+fn a_rows_escalation_clock_uses_the_events_offset_not_the_readings() {
+    use aterm_agent::harness::stats::Tally;
+    const DAY: i64 = 86_400_000;
+    const HOUR: i64 = 3_600_000;
+    let read = |now: i64, before: i64, after: i64, zone: &dyn Fn(i64) -> Option<i64>| {
+        let since = local_midnight_ms(now, zone);
+        assert!(before >= since && after >= since && before <= now && after <= now);
+        let mut today = HarnessStats::per_session(since);
+        let shares = today.by_session.as_mut().expect("per session");
+        for (sid, at) in [("before", before), ("after", after)] {
+            shares.insert(
+                sid.to_string(),
+                Tally {
+                    escalated: 1,
+                    last_escalated_ms: Some(at),
+                    ..Tally::default()
+                },
+            );
+        }
+        let report =
+            HarnessStatsReport::new(today, HarnessStats::new(0), now, zone(now / 1000), zone);
+        let checked = read_at_words(report.collected_unix_ms, report.offset_s);
+        let session = |local_id, sid: &str| HarnessSession {
+            local_id,
+            sid: sid.to_string(),
+            title: sid.to_string(),
+            place: "in tab 1".to_string(),
+            program: "Claude Code",
+            word: None,
+            view: AutopilotView::Cruise,
+            glass: crate::claude_lights::ChipGlass::default(),
+            armed_at_ms: None,
+            default: Some(Autopilot::Cruise),
+            supervised: false,
+        };
+        let mut state = HarnessState::unobserved();
+        state.observed = true;
+        state.sessions = vec![session(1, "before"), session(2, "after")];
+        state.stats.report = Some(std::sync::Arc::new(report));
+        let words: Vec<String> = state
+            .session_rows()
+            .into_iter()
+            .map(|row| row.day_line.expect("an escalation"))
+            .collect();
+        (checked, words)
+    };
+    let before = 10 * DAY + 6 * HOUR + HOUR / 2;
+    let after = before + HOUR;
+    let now = 10 * DAY + 16 * HOUR;
+    for (offset, expected) in [
+        (Some(0), ["06:30", "07:30"]),
+        (Some(-4 * 3_600), ["02:30", "03:30"]),
+        (None, ["06:30 UTC", "07:30 UTC"]),
+    ] {
+        let (checked, got) = read(now, before, after, &|_| offset);
+        let expected: Vec<String> = expected
+            .into_iter()
+            .map(|at| format!("today: needed you once at {at}"))
+            .collect();
+        assert_eq!(got, expected, "fixed or unknown offset {offset:?}");
+        assert_eq!(checked, read_at_words(now, offset));
+    }
+    let spring = 10 * DAY + 7 * HOUR;
+    let fall = 20 * DAY + 6 * HOUR;
+    let zone = |unix_s: i64| {
+        Some(if (spring..fall).contains(&(unix_s * 1000)) {
+            -4 * 3_600
+        } else {
+            -5 * 3_600
+        })
+    };
+    let mut observations = Vec::new();
+    for (now, before, after, want) in [
+        (
+            10 * DAY + 16 * HOUR,
+            spring - HOUR / 2,
+            spring + HOUR / 2,
+            ["01:30", "03:30"],
+        ),
+        (
+            20 * DAY + 17 * HOUR,
+            fall - HOUR / 2,
+            fall + HOUR / 2,
+            ["01:30", "01:30"],
+        ),
+    ] {
+        assert_ne!(
+            zone(before / 1000),
+            zone(now / 1000),
+            "earlier event's offset differs"
+        );
+        let (checked, got) = read(now, before, after, &zone);
+        assert_eq!(checked, "at 12:00", "the reading keeps its own offset");
+        let expected: Vec<String> = want
+            .into_iter()
+            .map(|at| format!("today: needed you once at {at}"))
+            .collect();
+        observations.push((got, expected));
+    }
+    assert!(
+        observations.iter().all(|(got, expected)| got == expected),
+        "HARNESS_DAY_LINE_USED_COLLECTION_OFFSET: {observations:?}"
+    );
+}
+
+/// THE MIDNIGHT TURN OWES A READING (§10.3.3, item 10) only once the
+/// reading's today has ended: its window began before the local midnight of
+/// now's day. NEGATIVE CONTROLS: a reading taken today, and no reading at
+/// all, owe none; the zone moves the midnight.
+#[test]
+fn the_day_has_ended_only_past_the_midnight_after_its_reading() {
+    const DAY: i64 = 86_400_000;
+    let utc = |_: i64| Some(0);
+    let slot = |since_ms: i64| HarnessStatsSlot {
+        report: Some(std::sync::Arc::new(HarnessStatsReport::new(
+            HarnessStats::per_session(since_ms),
+            HarnessStats::new(0),
+            since_ms,
+            Some(0),
+            &|_| Some(0),
+        ))),
+        ..HarnessStatsSlot::default()
+    };
+    let midnight = 20_000 * DAY;
+    assert!(
+        !slot(midnight).day_ended(midnight + DAY - 1, utc),
+        "the same day"
+    );
+    assert!(
+        slot(midnight).day_ended(midnight + DAY, utc),
+        "the next day"
+    );
+    assert!(!HarnessStatsSlot::default().day_ended(midnight + 2 * DAY, utc));
+    // Two hours east, the day starts two hours earlier: 23:00 UTC is the
+    // next day there.
+    let east = |_: i64| Some(7_200);
+    assert!(slot(midnight - 7_200_000).day_ended(midnight + DAY - 3_600_000, east));
+    assert!(
+        !slot(midnight - 7_200_000).day_ended(midnight + DAY - 3_600_000 - 3 * 3_600_000, east)
+    );
+}
+
+/// THE PANE WORD (§10.3.1, hunt surfaces-F5): two Claude Code sessions split
+/// side by side in one tab are two SESSIONS rows that read apart — `left
+/// pane` and `right pane` in their places and their names, every button of
+/// theirs distinct. NEGATIVE CONTROL: Claude Code beside a shell names no
+/// pane, and its place is the tab's alone.
+#[test]
+fn two_agents_in_one_tab_are_told_apart_by_their_panes() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let right = app.split_active_stub_tab(wid);
+    run_claude(&app, 0);
+    let sid = |app: &App, s: u64| app.pool.get(s).unwrap().ctx.self_id.as_str().to_string();
+    let (left_sid, right_sid) = (sid(&app, 0), sid(&app, right));
+    assert_eq!(
+        app.session_place(&left_sid),
+        app.upgrade_place(&left_sid),
+        "one agent beside a shell: no pane"
+    );
+    assert!(!app.session_place(&left_sid).contains("pane"));
+    run_claude(&app, right);
+    let tab = app.upgrade_place(&left_sid);
+    assert_eq!(app.session_place(&left_sid), format!("{tab}, left pane"));
+    assert_eq!(app.session_place(&right_sid), format!("{tab}, right pane"));
+    assert_eq!(
+        app.upgrade_place(&right_sid),
+        tab,
+        "titles keep the tab alone"
+    );
+    app.harness = Some(idle_host());
+    let rows = app.harness_state().projection().sessions;
+    assert_eq!(rows.len(), 2);
+    assert!(rows[0].name.ends_with("left pane"), "{}", rows[0].name);
+    assert!(rows[1].name.ends_with("right pane"), "{}", rows[1].name);
+    assert_ne!(rows[0].name, rows[1].name);
+}
+
+/// SHOW RAISES THE SESSION'S TAB AND FOCUSES ITS PANE (§10.3.1): from
+/// another tab in front, Show on the right pane's row fronts its tab with
+/// the right pane focused, and on the left one's, the left. NEGATIVE
+/// CONTROLS: `raise` alone fronts the tab and keeps the pane it last had (so
+/// Show's own focus is load-bearing); a session gone since the draw moves
+/// nothing.
+#[test]
+fn show_raises_the_sessions_tab_and_focuses_its_pane() {
+    use crate::native_app::HarnessRequest;
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let right = app.split_active_stub_tab(wid);
+    run_claude(&app, 0);
+    run_claude(&app, right);
+    let other = app.next_session_id;
+    app.push_stub_tab(wid, crate::stub_session(other));
+    app.switch_tab_in(wid, 1);
+    assert_eq!(
+        app.focused_session_id(wid),
+        Some(other),
+        "another tab in front"
+    );
+    let tab_pane = |app: &App| app.focused_session_id(wid);
+    // CONTROL: the raise alone fronts the tab and keeps the pane it last had.
+    app.raise_session_by_id(0).expect("raised");
+    assert_eq!(tab_pane(&app), Some(right), "the raise kept the right pane");
+    app.switch_tab_in(wid, 1);
+    assert_eq!(tab_pane(&app), Some(other));
+    app.execute_native_harness(HarnessRequest::Show { session: 0 });
+    assert_eq!(tab_pane(&app), Some(0), "the left pane, focused");
+    app.execute_native_harness(HarnessRequest::Show { session: right });
+    assert_eq!(tab_pane(&app), Some(right), "the right pane, focused");
+    app.execute_native_harness(HarnessRequest::Show { session: 777 });
+    assert_eq!(tab_pane(&app), Some(right), "a gone session moves nothing");
+}
+
+/// THE PAGE LANDS ON THE ROW (§10.3.3, item 8): `⚙` for a session whose row
+/// is off the page's first screen opens the page with that row in view and
+/// its Show drawn selected — before any render has measured the page, and
+/// again after one has, for another row; the next press lets the selection
+/// go. `Supervision` lands on SUPERVISION's first switch. NEGATIVE CONTROL:
+/// the page opened at its top shows the far row off screen and nothing
+/// selected.
+#[test]
+fn the_gear_lands_the_page_on_its_sessions_row_drawn_selected() {
+    use crate::app_introspect::AuxTarget;
+    use crate::harness_screen::HarnessFocus;
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    run_claude(&app, 0);
+    let mut sessions = vec![0];
+    for _ in 0..9 {
+        let s = app.next_session_id;
+        app.push_stub_tab(wid, crate::stub_session(s));
+        run_claude(&app, s);
+        sessions.push(s);
+    }
+    let host = idle_host();
+    app.harness = Some(host.clone());
+    let far = *sessions.last().expect("sessions");
+    let show = |s: u64| format!("ui key=\"harness/session/{s}/show\" ");
+    let line = |app: &App, s: u64| {
+        app.read_aux_controls(AuxTarget::Prefs)
+            .into_iter()
+            .find(|l| l.starts_with(&show(s)))
+    };
+    let selected =
+        |line: &Option<String>| line.as_ref().is_some_and(|l| l.contains("selected:true"));
+    // CONTROL: at the top, the far row is off this screen.
+    assert!(app.open_harness_settings(wid, HarnessFocus::Top));
+    app.publish_native_harness_state();
+    assert!(
+        !app.read_aux_controls(AuxTarget::Prefs)
+            .iter()
+            .any(|l| l.contains("selected:true") && l.contains("harness/session/")),
+        "nothing landed"
+    );
+    assert_eq!(
+        line(&app, far),
+        None,
+        "the far row is past the first screen"
+    );
+    // Close the page, so the next open is measured by no render.
+    let closed = app.close_settings_tabs();
+    assert!(closed, "the Settings tab closed");
+    assert!(app.open_harness_settings(wid, HarnessFocus::Session(far)));
+    app.publish_native_harness_state();
+    let landed = line(&app, far);
+    assert!(selected(&landed), "landed and selected: {landed:?}");
+    // After a render: another row.
+    assert!(app.open_harness_settings(wid, HarnessFocus::Session(0)));
+    let first = line(&app, 0);
+    assert!(selected(&first), "{first:?}");
+    assert!(!selected(&line(&app, far)), "one row selected");
+    // The next press lets it go.
+    let (_, view) = app.active_native_view(wid).expect("the Settings view");
+    app.dispatch_native_view_event(
+        wid,
+        view,
+        AppEvent::Action(ActionInvocation {
+            id: ActionId::new("harness/refresh"),
+            value: None,
+        }),
+    )
+    .expect("dispatched");
+    assert!(!selected(&line(&app, 0)), "the press let it go");
+    // SUPERVISION: its first switch is on screen.
+    assert!(app.open_harness_settings(wid, HarnessFocus::Supervision));
+    let switch = format!(
+        "ui key=\"settings/control/{}\" ",
+        crate::prefs::EDIT_HARNESS_ENABLED
+    );
+    assert!(
+        app.read_aux_controls(AuxTarget::Prefs)
+            .iter()
+            .any(|l| l.starts_with(&switch)),
+        "SUPERVISION in view"
+    );
+    host.shutdown_and_join();
 }

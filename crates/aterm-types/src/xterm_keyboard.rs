@@ -141,12 +141,18 @@ impl XtermKeyboardState {
 mod tests {
     use super::*;
 
+    /// `Default` (derive) is DISABLED (None) while `new()` is enabled at
+    /// level 0, and the two answer the query differently: disabled reports no
+    /// value parameter (`CSI > 4 m`), enabled an explicit 0.
     #[test]
-    fn test_default_state() {
-        let state = XtermKeyboardState::new();
-        assert_eq!(state.modify_other_keys(), Some(0));
-        assert!(!matches!(state.modify_other_keys(), Some(v) if v > 0));
-        assert_eq!(state.format_other_keys(), 0);
+    fn test_default_vs_new_divergence() {
+        let default = XtermKeyboardState::default();
+        let new = XtermKeyboardState::new();
+        assert_eq!(default.modify_other_keys(), None);
+        assert_eq!(new.modify_other_keys(), Some(0));
+        assert_eq!(new.format_other_keys(), 0);
+        assert_eq!(default.query_modify_other_keys_response(), "\x1b[>4m");
+        assert_eq!(new.query_modify_other_keys_response(), "\x1b[>4;0m");
     }
 
     #[test]

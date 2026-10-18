@@ -30,9 +30,11 @@
 //!   nothing (D2).
 //! * A torn read is not a cleared line: a blanked fragment of a run with a
 //!   glyph still standing in place is released, never searched for as moved
-//!   text; one glyph is never moved text; and a partial release is lifted as
-//!   soon as one of its glyphs is back (`Witness::restored_runs`;
-//!   `tests/torn_read_gaps.rs`, `tests/torn_edit_gaps.rs`).
+//!   text; one glyph is never moved text, unless it is the hand's own and the
+//!   caret stands on the row it arrived at ([`Witness::follow_hand`]); and a
+//!   partial release is lifted as soon as one of its glyphs is back
+//!   (`Witness::restored_runs`; `tests/torn_read_gaps.rs`,
+//!   `tests/torn_edit_gaps.rs`).
 //!
 //! The band follows its text. A bottom-anchored composer grows by repainting
 //! one row higher without a scroll; the host samples the rows above and below
@@ -452,8 +454,7 @@ impl Seen {
     /// The follow offsets at which a glyph found would have arrived: not known
     /// to have been there before ([`Seen::clear`]) and never a twin there. A
     /// twin testifies only about its own row
-    /// (`the_evidence_is_what_each_follow_row_was_seen_holding`,
-    /// `a_twin_testifies_only_about_its_own_row`).
+    /// (`a_twin_testifies_only_about_its_own_row`).
     fn arrivals(&self) -> u8 {
         self.clear & !self.twin & ALL_OFFSETS
     }
@@ -578,6 +579,9 @@ pub struct Witness {
     /// was withheld ([`Witness::find_deferred_runs`]). Resident scratch,
     /// reserved at [`WITNESS_CAP`] by [`Witness::new`].
     deferred_runs: Vec<(u16, u32)>,
+    /// The hand's run waiting for its caret ([`Witness::await_caret`]): the
+    /// next walk passes no verdict on it.
+    awaiting: Option<(u16, u32)>,
     /// When the last walk ran: a scroll arriving before the next walk dates the
     /// copies on rows it brings in from here, starting their [`Seen::pending`]
     /// clocks ([`Witness::translate`]). `None` until the first walk.
@@ -661,6 +665,20 @@ struct FollowVerdict {
     block: bool,
 }
 
+/// Which single arrival may stand for the two-arrival floor
+/// ([`Witness::judge_follow`]); each needs a second witness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SoleArrival {
+    /// None: two arrivals or nothing.
+    Refused,
+    /// The exact short held park's source run: an exact relaid suffix of at
+    /// least three glyphs ([`Witness::follow_runs_with_short_park`]).
+    ShortPark,
+    /// The hand's own glyph at column `glyph`, the frame's caret standing on
+    /// row `to` ([`Witness::follow_hand`]).
+    Hand { glyph: u16, to: u16 },
+}
+
 impl Witness {
     /// An empty witness with capacity reserved once ([`WITNESS_CAP`]) for the
     /// records and the deferral's scratch (at most one entry per record), so a
@@ -687,6 +705,7 @@ impl Witness {
             landed: Vec::new(),
             blind_changed: Vec::with_capacity(WITNESS_CAP),
             deferred_runs: Vec::with_capacity(WITNESS_CAP),
+            awaiting: None,
             last_walk: None,
             shift_cells: Vec::new(),
         }
@@ -780,129 +799,202 @@ impl Witness {
         self.follow_runs.dedup();
         for k in 0..self.follow_runs.len() {
             let (row, cohort) = self.follow_runs[k];
-            let Some(own) = rows.iter().find(|s| s.row == row) else {
-                continue;
+            let sole = if short_owner == Some((row, cohort)) {
+                SoleArrival::ShortPark
+            } else {
+                SoleArrival::Refused
             };
-            self.follow_armed.clear();
-            for cell in cells {
-                if cell.leaving() || cell.row != row || cell.cohort != cohort {
-                    continue;
-                }
-                let Some(i) = self.find(cell.row, cell.col, cell.born) else {
-                    continue;
-                };
-                let seen = self.seen[i];
-                if seen.released {
-                    continue;
-                }
-                let gone = unit_at(own.cols, cell.col) != seen.unit;
-                self.follow_armed
-                    .push((cell.col, seen.unit, gone, seen.arrivals()));
-            }
-            self.follow_armed.sort_unstable_by_key(|a| a.0);
-            self.follow_armed.dedup_by_key(|a| a.0);
-            let armed = self.follow_armed.len();
-            let gone = self.follow_armed.iter().filter(|a| a.2).count();
-            if armed < 2 || gone < 2 || gone * 2 < armed {
-                continue;
-            }
-            let relaid = Self::relaid_suffix(&self.follow_armed, own.cols);
-            let mut named = false;
-            let mut evidence = false;
-            for (k, dr) in FOLLOW_DRS.into_iter().enumerate() {
-                let Some(target) = row.checked_add_signed(dr) else {
-                    continue;
-                };
-                let Some(there) = rows.iter().find(|s| s.row == target) else {
-                    continue;
-                };
-                let v = Self::follow_verdict(&self.follow_armed, there.cols, k, relaid);
-                // The half-gate: two or more arrived, and no fewer than half of
-                // the records neither neutral nor relaid. A single arrival is
-                // allowed only with a substantial exact relaid suffix and no
-                // competing counted cell.
-                let counted = armed.saturating_sub(v.neutral + v.relaid);
-                // A narrow wrap can leave one glyph on the row carried up. One
-                // arrival is ambiguous alone, but the same frame relaying at
-                // least three exact trailing glyphs to the old row's start
-                // identifies the wrap, provided no other counted hole competes.
-                let sole_kept = short_owner == Some((row, cohort))
-                    && v.found == 1
-                    && v.relaid >= 3
-                    && counted == 1;
-                let enough = (v.found >= 2 || sole_kept) && v.found * 2 >= counted;
-                // Evidence without the block: enough records arrived here to be
-                // a move, block or not ([`FollowScore::missed`] counts these
-                // when no offset names the run).
-                evidence |= enough;
-                if !v.block || !enough {
-                    continue;
-                }
-                let (mut lo, mut hi) = (v.lo, v.hi);
-                // A glyph standing here that did not arrive — a twin, or a
-                // row a band move carried beside it unseen: neutral.
-                let neutral = |col: u16, unit: Unit, arrivals: u8| {
-                    arrivals & (1 << k) == 0 && unit_at(there.cols, col) == unit
-                };
-                // The extent, riders included, grows over a bordering
-                // never-armed cell while no record past it on that side stayed
-                // behind.
-                let is_cell = |col: u16| {
-                    cells
-                        .iter()
-                        .any(|c| !c.leaving() && c.row == row && c.cohort == cohort && c.col == col)
-                };
-                let armed_at = |col: u16| {
-                    self.follow_armed
-                        .binary_search_by_key(&col, |a| a.0)
-                        .ok()
-                        .map(|i| self.follow_armed[i])
-                };
-                let beyond_hi = self
-                    .follow_armed
-                    .iter()
-                    .any(|a| a.0 > hi && !neutral(a.0, a.1, a.3));
-                let beyond_lo = self
-                    .follow_armed
-                    .iter()
-                    .any(|a| a.0 < lo && !neutral(a.0, a.1, a.3));
-                while let Some(next) = hi.checked_add(1) {
-                    let grows = match armed_at(next) {
-                        Some(a) => neutral(a.0, a.1, a.3),
-                        None => !beyond_hi && is_cell(next),
-                    };
-                    if !grows {
-                        break;
-                    }
-                    hi = next;
-                }
-                while let Some(prev) = lo.checked_sub(1) {
-                    let grows = match armed_at(prev) {
-                        Some(a) => neutral(a.0, a.1, a.3),
-                        None => !beyond_lo && is_cell(prev),
-                    };
-                    if !grows {
-                        break;
-                    }
-                    lo = prev;
-                }
-                out.push(FollowRun {
-                    row,
-                    cohort,
-                    lo,
-                    hi,
-                    dr,
-                });
-                named = true;
-                break;
-            }
-            if !named && evidence {
-                score.missed = score
-                    .missed
-                    .saturating_add(u32::try_from(gone).unwrap_or(u32::MAX));
-            }
+            let (run, missed) = self.judge_follow(cells, rows, (row, cohort), false, sole);
+            out.extend(run);
+            score.missed = score
+                .missed
+                .saturating_add(u32::try_from(missed).unwrap_or(u32::MAX));
         }
         score
+    }
+
+    /// THE HAND'S OWN LINE, judged on the hand's typed records: the run
+    /// holding the hand's last glyph (the live typed cell left of `hand`, the
+    /// caret mirror) is named when [`Witness::follow_runs`]' law holds over
+    /// its `typing` records alone. Its other cells (a hop's wake folded into
+    /// the band, `Ribbon::fold_wakes_into_band`) are neither found nor holes
+    /// and ride with the block, so a wake whose text an insert pushed along
+    /// cannot dilute the half-gate. With `rode_to` the frame's caret stands on
+    /// that row, a second witness: one arrived glyph there, the hand's own,
+    /// with no other counted record, names the run. Pure in records, cells
+    /// and samples; names nothing for a hand with no typed glyph under it.
+    pub(crate) fn follow_hand(
+        &mut self,
+        cells: &[Cell],
+        rows: &[RowSample<'_>],
+        hand: (u16, u16),
+        rode_to: Option<u16>,
+    ) -> Option<FollowRun> {
+        let glyph = hand.1.checked_sub(1)?;
+        let cohort = cells
+            .iter()
+            .filter(|c| !c.leaving() && c.typing && c.row == hand.0 && c.col == glyph)
+            .max_by_key(|c| c.born)?
+            .cohort;
+        let sole = rode_to.map_or(SoleArrival::Refused, |to| SoleArrival::Hand { glyph, to });
+        self.judge_follow(cells, rows, (hand.0, cohort), true, sole)
+            .0
+    }
+
+    /// One run's follow verdict ([`Witness::follow_runs`]' law): the run
+    /// `(row, cohort)` named when its armed records (only its `typing` cells'
+    /// with `typed_only`) moved as a block to a sampled row one or two away,
+    /// with `sole` saying which single arrival may stand for two. Also returns
+    /// how many records went missing when the evidence was there but no offset
+    /// named the run ([`FollowScore::missed`]).
+    fn judge_follow(
+        &mut self,
+        cells: &[Cell],
+        rows: &[RowSample<'_>],
+        (row, cohort): (u16, u32),
+        typed_only: bool,
+        sole: SoleArrival,
+    ) -> (Option<FollowRun>, usize) {
+        let Some(own) = rows.iter().find(|s| s.row == row) else {
+            return (None, 0);
+        };
+        self.follow_armed.clear();
+        for cell in cells {
+            if cell.leaving()
+                || cell.row != row
+                || cell.cohort != cohort
+                || (typed_only && !cell.typing)
+            {
+                continue;
+            }
+            let Some(i) = self.find(cell.row, cell.col, cell.born) else {
+                continue;
+            };
+            let seen = self.seen[i];
+            if seen.released {
+                continue;
+            }
+            let gone = unit_at(own.cols, cell.col) != seen.unit;
+            self.follow_armed
+                .push((cell.col, seen.unit, gone, seen.arrivals()));
+        }
+        self.follow_armed.sort_unstable_by_key(|a| a.0);
+        self.follow_armed.dedup_by_key(|a| a.0);
+        let armed = self.follow_armed.len();
+        let gone = self.follow_armed.iter().filter(|a| a.2).count();
+        // Two records gone, or the hand's one with the caret as the second
+        // witness.
+        let floor = if matches!(sole, SoleArrival::Hand { .. }) {
+            1
+        } else {
+            2
+        };
+        if armed < floor || gone < floor || gone * 2 < armed {
+            return (None, 0);
+        }
+        let relaid = Self::relaid_suffix(&self.follow_armed, own.cols);
+        let mut evidence = false;
+        for (k, dr) in FOLLOW_DRS.into_iter().enumerate() {
+            let Some(target) = row.checked_add_signed(dr) else {
+                continue;
+            };
+            let Some(there) = rows.iter().find(|s| s.row == target) else {
+                continue;
+            };
+            let v = Self::follow_verdict(&self.follow_armed, there.cols, k, relaid);
+            // The half-gate: two or more arrived, and no fewer than half of
+            // the records neither neutral nor relaid. A single arrival is
+            // allowed only with a second witness and no competing counted
+            // cell.
+            let counted = armed.saturating_sub(v.neutral + v.relaid);
+            let sole_stands = v.found == 1
+                && counted == 1
+                && match sole {
+                    SoleArrival::Refused => false,
+                    // A narrow wrap can leave one glyph on the row carried up.
+                    // One arrival is ambiguous alone, but the same frame
+                    // relaying at least three exact trailing glyphs to the old
+                    // row's start identifies the wrap.
+                    SoleArrival::ShortPark => v.relaid >= 3,
+                    // The hand's own glyph arrived where the caret stands.
+                    SoleArrival::Hand { glyph, to } => {
+                        target == to
+                            && self
+                                .follow_armed
+                                .binary_search_by_key(&glyph, |a| a.0)
+                                .is_ok_and(|i| {
+                                    let (col, unit, _, arrivals) = self.follow_armed[i];
+                                    arrivals & (1 << k) != 0 && unit_at(there.cols, col) == unit
+                                })
+                    }
+                };
+            let enough = (v.found >= 2 || sole_stands) && v.found * 2 >= counted;
+            // Evidence without the block: enough records arrived here to be
+            // a move, block or not ([`FollowScore::missed`] counts these
+            // when no offset names the run).
+            evidence |= enough;
+            if !v.block || !enough {
+                continue;
+            }
+            let (mut lo, mut hi) = (v.lo, v.hi);
+            // A glyph standing here that did not arrive — a twin, or a
+            // row a band move carried beside it unseen: neutral.
+            let neutral = |col: u16, unit: Unit, arrivals: u8| {
+                arrivals & (1 << k) == 0 && unit_at(there.cols, col) == unit
+            };
+            // The extent, riders included, grows over a bordering cell of the
+            // run with no record in the verdict (never armed, or not typed
+            // under `typed_only`) while no record past it on that side stayed
+            // behind.
+            let is_cell = |col: u16| {
+                cells
+                    .iter()
+                    .any(|c| !c.leaving() && c.row == row && c.cohort == cohort && c.col == col)
+            };
+            let armed_at = |col: u16| {
+                self.follow_armed
+                    .binary_search_by_key(&col, |a| a.0)
+                    .ok()
+                    .map(|i| self.follow_armed[i])
+            };
+            let beyond_hi = self
+                .follow_armed
+                .iter()
+                .any(|a| a.0 > hi && !neutral(a.0, a.1, a.3));
+            let beyond_lo = self
+                .follow_armed
+                .iter()
+                .any(|a| a.0 < lo && !neutral(a.0, a.1, a.3));
+            while let Some(next) = hi.checked_add(1) {
+                let grows = match armed_at(next) {
+                    Some(a) => neutral(a.0, a.1, a.3),
+                    None => !beyond_hi && is_cell(next),
+                };
+                if !grows {
+                    break;
+                }
+                hi = next;
+            }
+            while let Some(prev) = lo.checked_sub(1) {
+                let grows = match armed_at(prev) {
+                    Some(a) => neutral(a.0, a.1, a.3),
+                    None => !beyond_lo && is_cell(prev),
+                };
+                if !grows {
+                    break;
+                }
+                lo = prev;
+            }
+            let run = FollowRun {
+                row,
+                cohort,
+                lo,
+                hi,
+                dr,
+            };
+            return (Some(run), 0);
+        }
+        (None, if evidence { gone } else { 0 })
     }
 
     /// One offset's reading of a run's armed records ([`Witness::follow_runs`]),
@@ -1255,6 +1347,19 @@ impl Witness {
     pub fn clear(&mut self) {
         self.seen.clear();
         self.blank_seen.clear();
+        self.awaiting = None;
+    }
+
+    /// THE HAND'S LONE GLYPH WAITS FOR ITS CARET. `run` (the hand's run, named
+    /// by [`Witness::follow_hand`] only with the caret as its second witness)
+    /// stands a row away while the caret is withheld (a torn present, a
+    /// repaint's bracket) under a key in flight, so the next walk passes it no
+    /// verdict, arming or evidence, as a run beside a withheld row waits
+    /// ([`Witness::find_deferred_runs`]): judged gone, it would melt before
+    /// the caret shows on its line. Each follow pass says it again, `None`
+    /// when nothing waits.
+    pub(crate) fn await_caret(&mut self, run: Option<(u16, u32)>) {
+        self.awaiting = run;
     }
 
     /// A scroll moved every cell up by `rows` (`Ribbon::translate_scroll`): the
@@ -1362,28 +1467,6 @@ impl Witness {
     pub fn forget_left_of(&mut self, row: u16, col: u16) {
         self.seen.retain(|s| !(s.row == row && s.col < col));
         self.blank_seen.retain(|b| !(b.0 == row && b.1 < col));
-    }
-
-    /// The records at `(row, col)`, appended to `out` — for the engine's
-    /// hole tripwire (`super::holes`); a record's cost, and only when armed.
-    pub(super) fn describe_cell(&self, row: u16, col: u16, now: Instant, out: &mut String) {
-        use std::fmt::Write as _;
-        for s in self.seen.iter().filter(|s| s.row == row && s.col == col) {
-            let _ = write!(
-                out,
-                "{{born_age_ms={} unit={:?} live={} released={} restorable={} counted={} \
-                 twin={:#06b} pending={:#06b} deferred={}}}",
-                now.saturating_duration_since(s.born).as_millis(),
-                s.unit,
-                s.live,
-                s.released,
-                s.restorable,
-                s.counted,
-                s.twin,
-                s.pending,
-                s.deferred
-            );
-        }
     }
 
     /// The record for the cell `(row, col, born)`, if any.
@@ -1504,7 +1587,8 @@ impl Witness {
     /// A run beside a withheld row waits one walk: `withheld` are rows asked
     /// for and not delivered (`Engine::follow_rows`), and a run with a changed
     /// record beside one gets no verdict, arming or evidence, at most once in a
-    /// row ([`Witness::find_deferred_runs`]).
+    /// row ([`Witness::find_deferred_runs`]). The hand's run waiting for its
+    /// caret ([`Witness::await_caret`]) waits the same way.
     pub fn walk(
         &mut self,
         cells: &[Cell],
@@ -1534,6 +1618,11 @@ impl Witness {
         let mut nb_row = None;
         let mut nb = [None; 4];
         self.find_deferred_runs(cells, rows, withheld);
+        if let Some(run) = self.awaiting.take()
+            && let Err(k) = self.deferred_runs.binary_search(&run)
+        {
+            self.deferred_runs.insert(k, run);
+        }
         for cell in cells {
             if !self.deferred_runs.is_empty()
                 && self
@@ -2446,33 +2535,12 @@ mod tests {
         out.iter().map(|&(r, c, _)| (r, c)).collect()
     }
 
+    /// A malformed or short sample reads blank: a space, a column past the
+    /// sample, and a stray continuation with no lead before it. (Both halves
+    /// of a real wide glyph are one unit: `a_wide_glyph_s_two_cells_are_retired_as_one_unit`.)
     #[test]
-    fn a_unit_is_the_lead_glyph_for_either_half_of_a_wide_one() {
+    fn a_malformed_or_short_sample_reads_blank() {
         let cols = row("a\u{4f60}\0 ");
-        assert_eq!(
-            unit_at(&cols, 0),
-            Unit {
-                ch: 'a',
-                wide: false,
-                cont: false
-            }
-        );
-        assert_eq!(
-            unit_at(&cols, 1),
-            Unit {
-                ch: '\u{4f60}',
-                wide: true,
-                cont: false
-            }
-        );
-        assert_eq!(
-            unit_at(&cols, 2),
-            Unit {
-                ch: '\u{4f60}',
-                wide: true,
-                cont: true
-            }
-        );
         assert!(unit_at(&cols, 3).is_blank(), "a space is blank");
         assert!(unit_at(&cols, 9).is_blank(), "past the sample is blank");
         assert!(
@@ -2512,19 +2580,13 @@ mod tests {
 
     /// The follow pass's verdict once row 5 is blank and row 4 reads `now`.
     fn follow_onto(w: &mut Witness, cells: &[Cell], now: &str) -> Vec<FollowRun> {
-        follow_onto_with(w, cells, "      ", now)
-    }
-
-    /// The follow pass's verdict once row 5 reads `own` and row 4 reads
-    /// `now`.
-    fn follow_onto_with(w: &mut Witness, cells: &[Cell], own: &str, now: &str) -> Vec<FollowRun> {
         let mut out = Vec::new();
         w.follow_runs(
             cells,
             &[
                 RowSample {
                     row: 5,
-                    cols: &row(own),
+                    cols: &row("      "),
                 },
                 RowSample {
                     row: 4,
@@ -2578,110 +2640,80 @@ mod tests {
         assert_eq!(out, vec![up(0, 0)], "the exact run keeps the narrow wrap");
     }
 
-    /// A twin is neutral ([`Witness::follow_runs`]): a glyph that already stood
-    /// a row up when its record was armed neither counts as found nor breaks
-    /// the block. `  c   ` a row up at arm time and the whole run arriving there
-    /// is one block that moved; so are twins at both ends and a block of four
-    /// twins between two arrivals.
+    /// The one-block law ([`Witness::follow_runs`], [`FollowScore::missed`]):
+    /// row 5's run `abcdef` is armed with row 4 holding `above` (`None`: row 4
+    /// not sampled, which is no evidence either way), then row 5 reads `own`
+    /// and row 4 reads `now`. Matched records must be one block, a prefix or
+    /// suffix of the run; a twin (a glyph that already stood a row up at
+    /// arming) is neutral inside the block, and a flush edge twin rides with it
+    /// whether or not its own glyph still reads as standing
+    /// (`tests/composer_growth_follows.rs`); the half is of the records that
+    /// can testify (`tests/composer_multiline_wrap.rs`). Text that arrived but
+    /// not as one block is counted missed (`ribbon_follow_missed=`).
     #[test]
-    fn a_twin_inside_the_block_is_neutral_and_the_block_follows() {
-        for above in ["  c   ", "a    f", " bcde "] {
-            let (mut w, cells) = armed_run(above);
-            assert_eq!(
-                follow_onto(&mut w, &cells, "abcdef"),
-                vec![up(0, 5)],
-                "armed under `{above}`: the whole run arrived a row up and follows as one block"
-            );
-        }
-    }
-
-    /// But a twin whose glyph is not at the target is a hole: `ab def` and
-    /// `ab  ef` a row up are letters either side of a hole, not a move.
-    #[test]
-    fn a_twin_whose_glyph_is_not_at_the_target_is_a_hole() {
-        for now in ["ab def", "ab  ef"] {
-            let (mut w, cells) = armed_run("  c   ");
-            assert_eq!(
-                follow_onto(&mut w, &cells, now),
-                vec![],
-                "`{now}` a row up: a hole in the middle is not a block that moved"
-            );
-        }
-    }
-
-    /// A missed follow is counted ([`FollowScore::missed`],
-    /// `ribbon_follow_missed=`): row 5's six glyphs gone and `abc  f` a row up
-    /// arrive four glyphs but not as one block, so nothing is named and six
-    /// cells count as missed. A named run misses nothing, and neither does a
-    /// run whose text arrived nowhere (an erase under an identical line, a
-    /// kill under a line sharing a prefix, other text a row up).
-    #[test]
-    fn a_run_whose_text_arrived_but_not_as_one_block_is_counted_missed() {
-        let score = |above: &str, own: &str, now: &str| {
-            let (mut w, cells) = armed_run(above);
+    fn a_twin_inside_the_block_is_neutral_and_one_off_the_target_is_a_hole() {
+        const B: &str = "      ";
+        // (above, own, now, the run named over `lo..=hi`, cells missed)
+        type Case = (
+            Option<&'static str>,
+            &'static str,
+            &'static str,
+            Option<(u16, u16)>,
+            Option<u32>,
+        );
+        let cases: [Case; 25] = [
+            (Some(B), B, "abcdef", Some((0, 5)), Some(0)), // the whole run arrived
+            (Some(B), B, "abcd  ", Some((0, 3)), None),    // a prefix
+            (Some(B), B, "  cdef", Some((2, 5)), None),    // a suffix
+            (Some(B), B, "abc  f", None, Some(6)),         // arrived, not a block
+            (Some(B), B, "ab  ef", None, None),            // a hole in the middle
+            (Some(B), B, "a cdef", None, None),            // a hole near the edge
+            (Some(B), B, "uvwxyz", None, Some(0)),         // other text arrived nothing
+            (Some(B), "abcdef", "abcdef", None, Some(0)),  // nothing left its row
+            (None, B, "abcdef", Some((0, 5)), None),       // unseen: may have arrived
+            (Some("abcdef"), B, "abcdef", None, Some(0)),  // an erase under its twin
+            (Some("abc   "), B, "abcxyz", None, Some(0)),  // a prefix twin and holes
+            (Some("  c   "), B, "abcdef", Some((0, 5)), Some(0)), // a twin inside the block
+            (Some("a    f"), B, "abcdef", Some((0, 5)), None), // twins at both ends
+            (Some(" bcde "), B, "abcdef", Some((0, 5)), None), // twins between arrivals
+            (Some("  c   "), B, "ab def", None, None),     // a twin off the target
+            (Some("  c   "), B, "ab  ef", None, None),     // a twin beside a hole
+            (Some("a     "), "a     ", "abcdef", Some((0, 5)), None), // a standing lead twin
+            (Some("     f"), "     f", "abcdef", Some((0, 5)), None), // a standing trail twin
+            (Some("a     "), "a     ", "a cdef", Some((2, 5)), None), // lead twin past a hole
+            (Some("a     "), B, "a cdef", Some((2, 5)), None), // …and gone
+            (Some("     f"), "     f", "abcd f", Some((0, 3)), None), // trail twin past a hole
+            (Some("     f"), B, "abcd f", Some((0, 3)), None), // …and gone
+            (Some("abcd  "), B, "abcdef", Some((0, 5)), None), // a near copy: two arrived
+            (Some("abcdxy"), B, "abcdxy", None, None),     // a near copy, unchanged
+            (Some("abcd  "), B, "abcde ", None, None),     // one arrival is too little
+        ];
+        let own_run = row("abcdef");
+        for (above, own, now, named, missed) in cases {
+            let ctx = format!("armed under {above:?}, then `{own}` / `{now}`");
+            let above = above.map(row);
+            let mut arming = vec![RowSample {
+                row: 5,
+                cols: &own_run,
+            }];
+            if let Some(cols) = &above {
+                arming.push(RowSample { row: 4, cols });
+            }
+            let (mut w, cells) = armed_on(5, &arming);
+            let (own, now) = (row(own), row(now));
             let mut out = Vec::new();
             let score = w.follow_runs(
                 &cells,
                 &[
-                    RowSample {
-                        row: 5,
-                        cols: &row(own),
-                    },
-                    RowSample {
-                        row: 4,
-                        cols: &row(now),
-                    },
+                    RowSample { row: 5, cols: &own },
+                    RowSample { row: 4, cols: &now },
                 ],
                 &mut out,
             );
-            (out.len(), score.missed)
-        };
-        let blank = "      ";
-        for (above, own, now, want, what) in [
-            (blank, blank, "abc  f", (0, 6), "arrived, not a block"),
-            (blank, blank, "abcdef", (1, 0), "named: nothing missed"),
-            ("  c   ", blank, "abcdef", (1, 0), "the twin is neutral"),
-            ("abcdef", blank, "abcdef", (0, 0), "an erase is not a move"),
-            ("abc   ", blank, "abcxyz", (0, 0), "a prefix twin and holes"),
-            (blank, blank, "uvwxyz", (0, 0), "other text arrived nothing"),
-            (blank, "abcdef", "abcdef", (0, 0), "nothing left its row"),
-        ] {
-            assert_eq!(score(above, own, now), want, "{what}");
-        }
-    }
-
-    /// An edge twin rides with its block, gone or standing. A neutral record
-    /// flush against the found block (a lead directly before its first found
-    /// record, a trail directly after its last) rides whether or not its own
-    /// glyph still reads as standing on the run's row: in a bottom-anchored
-    /// composer a kept line's first cell can read as standing because the new
-    /// line starts with the same letter, and leaving it behind lets the old
-    /// run capture the new line's keys (`tests/composer_growth_follows.rs`).
-    /// Only a flush edge rides; a neutral cut off by a hole stays.
-    #[test]
-    fn an_edge_twin_rides_with_its_block_whether_or_not_its_own_glyph_is_gone() {
-        for above in ["a     ", "     f"] {
-            for own in [above, "      "] {
-                let (mut w, cells) = armed_run(above);
-                assert_eq!(
-                    follow_onto_with(&mut w, &cells, own, "abcdef"),
-                    vec![up(0, 5)],
-                    "armed under `{above}`, its row reading `{own}`: the edge twin rides"
-                );
-            }
-        }
-        // …only flush: a hole between the twin and the block leaves it.
-        for (above, now, want) in [
-            ("a     ", "a cdef", up(2, 5)),
-            ("     f", "abcd f", up(0, 3)),
-        ] {
-            for own in [above, "      "] {
-                let (mut w, cells) = armed_run(above);
-                assert_eq!(
-                    follow_onto_with(&mut w, &cells, own, now),
-                    vec![want],
-                    "armed under `{above}`, `{now}` a row up: a twin past a hole is not the block's"
-                );
+            let want: Vec<FollowRun> = named.map(|(lo, hi)| up(lo, hi)).into_iter().collect();
+            assert_eq!(out, want, "{ctx}");
+            if let Some(missed) = missed {
+                assert_eq!(score.missed, missed, "{ctx}: missed");
             }
         }
     }
@@ -2793,116 +2825,6 @@ mod tests {
         }
     }
 
-    /// The one-block law ([`Witness::follow_runs`]): matched records must be
-    /// one block, a prefix or suffix of the run. `abc  f` a row up keeps four
-    /// of six letters but the `f` past the hole marks coincidence: nothing is
-    /// named. Controls: the prefix `abcd` and the whole run are named with
-    /// their extents.
-    #[test]
-    fn the_follow_pass_names_only_a_block_never_letters_around_a_hole() {
-        let (mut w, cells) = armed_run("      ");
-        for holed in ["ab  ef", "abc  f", "a cdef"] {
-            assert_eq!(
-                follow_onto(&mut w, &cells, holed),
-                vec![],
-                "`{holed}`: a hole in the middle is not a block that moved"
-            );
-        }
-        let run = |lo, hi| FollowRun {
-            row: 5,
-            cohort: 7,
-            lo,
-            hi,
-            dr: -1,
-        };
-        assert_eq!(follow_onto(&mut w, &cells, "abcd  "), vec![run(0, 3)]);
-        assert_eq!(follow_onto(&mut w, &cells, "  cdef"), vec![run(2, 5)]);
-        assert_eq!(follow_onto(&mut w, &cells, "abcdef"), vec![run(0, 5)]);
-    }
-
-    /// An erase is not a move: the run armed while the row above already held
-    /// `abcdef` (a command typed again below itself), then its row blanked
-    /// (Ctrl-U). The block standing a row up never arrived, so nothing is
-    /// named. Control: armed over a blank row above, the same final screen is
-    /// a move.
-    ///
-    /// With a twin on part of the run (`abc` armed under `abc`), the arrived
-    /// block `def` is found and the twin prefix rides with it (`0..=5`); the
-    /// all-twin run still names nothing, and twins ride only flush against the
-    /// block
-    /// ([`an_edge_twin_rides_with_its_block_whether_or_not_its_own_glyph_is_gone`]).
-    #[test]
-    fn a_block_already_standing_beside_the_run_when_it_was_armed_is_not_followed() {
-        let (mut w, cells) = armed_run("abcdef");
-        assert_eq!(follow_onto(&mut w, &cells, "abcdef"), vec![]);
-        let (mut w, cells) = armed_run("      ");
-        assert_eq!(follow_onto(&mut w, &cells, "abcdef").len(), 1);
-        // A twin on part of the run: the arrived glyphs are the evidence, and
-        // the bordering twins go with the block, so the whole run is carried.
-        let (mut w, cells) = armed_run("abc   ");
-        assert_eq!(
-            follow_onto(&mut w, &cells, "abcdef"),
-            vec![up(0, 5)],
-            "the arrived block is the evidence; the twins bordering it ride along"
-        );
-    }
-
-    /// A twin inside an arrived block is neutral, not a hole: the run was armed
-    /// under a line holding `c` at the same column; that record did not arrive
-    /// but stands where the moved text puts it, and the run is carried whole
-    /// (owner, 2026-09-24).
-    /// Negative control: the `$ cd ..` erase, every record a twin, names
-    /// nothing.
-    #[test]
-    fn a_twin_inside_an_arrived_block_is_neutral_not_a_hole() {
-        let (mut w, cells) = armed_run("  c   ");
-        assert_eq!(
-            follow_onto(&mut w, &cells, "abcdef"),
-            vec![FollowRun {
-                row: 5,
-                cohort: 7,
-                lo: 0,
-                hi: 5,
-                dr: -1,
-            }]
-        );
-        let (mut w, cells) = armed_run("abcdef");
-        assert_eq!(follow_onto(&mut w, &cells, "abcdef"), vec![]);
-    }
-
-    /// The half is of the records that can testify: a run armed under a line it
-    /// mostly repeats (`abcd` above) moved when its two differing letters
-    /// arrive a row up (two of the two non-twin records), and is carried whole
-    /// (`tests/composer_multiline_wrap.rs`). Controls: the row above unchanged
-    /// (an erase under a near-identical line) and only one letter arriving;
-    /// nothing is named.
-    #[test]
-    fn a_run_under_a_near_copy_of_itself_follows_on_the_letters_that_arrived() {
-        let (mut w, cells) = armed_run("abcd  ");
-        assert_eq!(
-            follow_onto(&mut w, &cells, "abcdef"),
-            vec![FollowRun {
-                row: 5,
-                cohort: 7,
-                lo: 0,
-                hi: 5,
-                dr: -1,
-            }]
-        );
-        let (mut w, cells) = armed_run("abcdxy");
-        assert_eq!(
-            follow_onto(&mut w, &cells, "abcdxy"),
-            vec![],
-            "the row above never changed: nothing arrived"
-        );
-        let (mut w, cells) = armed_run("abcd  ");
-        assert_eq!(
-            follow_onto(&mut w, &cells, "abcde "),
-            vec![],
-            "one arrived letter is too little evidence"
-        );
-    }
-
     /// Six cells of one run on `row`, born at `t0`, armed over `abcdef` on
     /// the samples `rows` alone, at `t0`.
     fn armed_on(row: u16, rows: &[RowSample<'_>]) -> (Witness, Vec<Cell>) {
@@ -2928,14 +2850,6 @@ mod tests {
         assert!(out.is_empty() && rel.is_empty(), "the glyphs stand");
     }
 
-    /// Every record's evidence, `(clear, twin, pending)`, in column order.
-    fn evidence(w: &Witness) -> Vec<(u8, u8, u8)> {
-        w.seen
-            .iter()
-            .map(|s| (s.clear, s.twin, s.pending))
-            .collect()
-    }
-
     /// The run on row 5, cohort 7, carried whole one row up.
     fn whole_up() -> Vec<FollowRun> {
         vec![FollowRun {
@@ -2945,110 +2859,6 @@ mod tests {
             hi: 5,
             dr: -1,
         }]
-    }
-
-    /// What the witness did not see is no evidence either way. The run is armed
-    /// while row 4 (inside the grid) is not sampled; when row 5 is blanked and
-    /// row 4 reads `abcdef`, the run is carried there, as a move to an unseen
-    /// destination (a paste then a wrap, a band moved twice) must be. The
-    /// host's safeguard is the control: the arming row's `±1` is sampled on the
-    /// arming frame (`Engine::ribbon_rows_for`), so a copy seen then is a twin
-    /// and the same erase names nothing (`tests/erased_under_its_twin.rs`).
-    #[test]
-    fn an_unsampled_neighbour_is_no_evidence_either_way() {
-        let own = row("abcdef");
-        let (mut w, cells) = armed_on(5, &[RowSample { row: 5, cols: &own }]);
-        assert_eq!(
-            evidence(&w),
-            vec![(0b1111, 0, 0); 6],
-            "nothing seen: every offset clear, no twin"
-        );
-        assert_eq!(
-            follow_onto(&mut w, &cells, "abcdef"),
-            whole_up(),
-            "row 4 was never seen: the glyphs found there may have arrived"
-        );
-        let copy = row("abcdef");
-        let (mut w, cells) = armed_on(
-            5,
-            &[
-                RowSample { row: 5, cols: &own },
-                RowSample {
-                    row: 4,
-                    cols: &copy,
-                },
-            ],
-        );
-        assert_eq!(
-            follow_onto(&mut w, &cells, "abcdef"),
-            vec![],
-            "row 4 held the line when it was armed: its erase is no move"
-        );
-    }
-
-    /// The evidence offset by offset ([`Seen::observe`]; bit `k` is
-    /// `FOLLOW_DRS[k]` = `−1, +1, −2, +2`). On the arming frame a sampled row
-    /// holding the glyph at its column is a twin at once; every other offset,
-    /// sampled or not, in the grid or past it, is clear. Arrivals
-    /// ([`Seen::arrivals`]) are clear and not twin. A twin testifies only about
-    /// its own row: the row two away past it may still arrive.
-    #[test]
-    fn the_evidence_is_what_each_follow_row_was_seen_holding() {
-        let own = row("abcdef");
-        let blank = row("      ");
-        let twin = row("abcdef");
-        // −1 seen blank, +1 a twin, −2 and +2 not sampled.
-        let (w, _) = armed_on(
-            5,
-            &[
-                RowSample { row: 5, cols: &own },
-                RowSample {
-                    row: 4,
-                    cols: &blank,
-                },
-                RowSample {
-                    row: 6,
-                    cols: &twin,
-                },
-            ],
-        );
-        assert_eq!(evidence(&w), vec![(0b1111, 0b0010, 0); 6]);
-        assert!(
-            w.seen.iter().all(|s| s.arrivals() == 0b1101),
-            "−1, −2 and +2 may arrive; +1 is a twin"
-        );
-        // Every follow row seen, one of them holding the run shifted by a
-        // column (not a twin at any column): all four clear.
-        let (w, _) = armed_on(
-            2,
-            &[
-                RowSample { row: 2, cols: &own },
-                RowSample {
-                    row: 0,
-                    cols: &blank,
-                },
-                RowSample {
-                    row: 1,
-                    cols: &blank,
-                },
-                RowSample {
-                    row: 3,
-                    cols: &row("bcdefa"),
-                },
-                RowSample {
-                    row: 4,
-                    cols: &blank,
-                },
-            ],
-        );
-        assert_eq!(
-            evidence(&w),
-            vec![(0b1111, 0, 0); 6],
-            "all four seen, no twin"
-        );
-        // Row 0: nothing above it, nothing sampled below it.
-        let (w, _) = armed_on(0, &[RowSample { row: 0, cols: &own }]);
-        assert_eq!(evidence(&w), vec![(0b1111, 0, 0); 6]);
     }
 
     /// A copy that appears beside a standing line is a twin once it has stood
@@ -3093,7 +2903,6 @@ mod tests {
         for ms in [16, 32, 48] {
             frame(&mut w, &cells, &copy, ms);
         }
-        assert_eq!(evidence(&w), vec![(0b1111, 0, 0b0001); 6]);
         assert_eq!(
             follow_onto(&mut w, &cells, "abcdef"),
             whole_up(),
@@ -3104,7 +2913,6 @@ mod tests {
         for ms in [16, 32, 48, 64] {
             frame(&mut w, &cells, &copy, ms);
         }
-        assert_eq!(evidence(&w), vec![(0b1111, 0b0001, 0b0001); 6]);
         assert_eq!(
             follow_onto(&mut w, &cells, "abcdef"),
             vec![],
@@ -3120,7 +2928,6 @@ mod tests {
         frame(&mut w, &cells, &copy, 16);
         frame(&mut w, &cells, &other, 48);
         frame(&mut w, &cells, &copy, 80);
-        assert_eq!(evidence(&w), vec![(0b1111, 0, 0b0001); 6]);
         assert_eq!(follow_onto(&mut w, &cells, "abcdef"), whole_up());
         // A frame on which row 4 is not sampled does not break the stand:
         // the copy stood on both frames the witness saw.
@@ -3152,11 +2959,6 @@ mod tests {
         let dests = |out: &[FollowRun]| out.iter().map(|f| (f.row, f.dr)).collect::<Vec<_>>();
         let carried_down = || {
             let (mut w, cells) = armed_run("abcdef");
-            assert_eq!(
-                evidence(&w),
-                vec![(0b1111, 0b0001, 0); 6],
-                "fixture: a twin one row up"
-            );
             let mut out = Vec::new();
             w.follow_runs(
                 &cells,
@@ -3188,11 +2990,6 @@ mod tests {
                 .iter()
                 .map(|c| cell_of(6, c.col, c.born, c.cohort))
                 .collect();
-            assert_eq!(
-                evidence(&w),
-                vec![(0b1111, 0, 0); 6],
-                "carried: as if just armed"
-            );
             (w, carried)
         };
         // Back up on the next frame, the copy still on row 4: it follows.
@@ -3254,79 +3051,6 @@ mod tests {
         assert_eq!(dests(&out), vec![], "erased beside a twin it learned");
     }
 
-    /// A scroll keeps the evidence; a band move keeps only what moved with the
-    /// record ([`Witness::translate`], [`Witness::translate_band`]). A scroll
-    /// moves every row, so the bits ride along (an inline chat box pushed by a
-    /// streamed row keeps its band, `tests/moved_again_without_a_key.rs`). A
-    /// record inside a moved band forgets offsets reaching across its edge, and
-    /// one outside forgets offsets reaching in (vim's `yyp`).
-    #[test]
-    fn a_scroll_keeps_the_evidence_and_a_band_move_keeps_what_moved_with_the_record() {
-        let own = row("abcdef");
-        let blank = row("      ");
-        let everything = |row_: u16| {
-            let mut w = Witness::new();
-            let t0 = Instant::now();
-            let cells: Vec<Cell> = (0..6).map(|c| cell_of(row_, c, t0, 7)).collect();
-            walk_quiet(
-                &mut w,
-                &cells,
-                &[
-                    RowSample {
-                        row: row_,
-                        cols: &own,
-                    },
-                    RowSample {
-                        row: row_ - 2,
-                        cols: &blank,
-                    },
-                    RowSample {
-                        row: row_ - 1,
-                        cols: &blank,
-                    },
-                    RowSample {
-                        row: row_ + 1,
-                        cols: &blank,
-                    },
-                    RowSample {
-                        row: row_ + 2,
-                        cols: &blank,
-                    },
-                ],
-            );
-            assert_eq!(evidence(&w), vec![(0b1111, 0, 0); 6]);
-            w
-        };
-        let mut w = everything(10);
-        w.translate(3, 0);
-        assert!(w.seen.iter().all(|s| s.row == 7));
-        assert_eq!(
-            evidence(&w),
-            vec![(0b1111, 0, 0); 6],
-            "a scroll keeps it all"
-        );
-        // The band 10..=20 moves down one: the record on row 10 moves to 11
-        // with rows 11 and 12 (its +1, +2), while rows 9 and 8 stay put.
-        let mut w = everything(10);
-        w.translate_band(10, 20, 1);
-        assert!(w.seen.iter().all(|s| s.row == 11));
-        assert_eq!(
-            evidence(&w),
-            vec![(0b1010, 0, 0); 6],
-            "+1 and +2 moved with it; −1 and −2 are a new line and a row that stood"
-        );
-        // The band 11..=20 moves down one — vim's `yyp` under row 10: the
-        // record on row 10 stands, its +1 and +2 do not.
-        let mut w = everything(10);
-        w.translate_band(11, 20, 1);
-        assert!(w.seen.iter().all(|s| s.row == 10));
-        assert_eq!(
-            evidence(&w),
-            vec![(0b0101, 0, 0); 6],
-            "−1 and −2 stood with it"
-        );
-    }
-
     /// A band move that opens a row beside a line leaves that row unseen until
     /// a frame shows it ([`Witness::translate_band`]). vim's `yyp` on a line on
     /// row 10: band 11..=20 moves down one and the copy is written into the
@@ -3378,7 +3102,6 @@ mod tests {
             out.iter().map(|f| f.dr).collect::<Vec<_>>()
         };
         let mut w = armed();
-        assert_eq!(evidence(&w), vec![(0b0101, 0, 0); 6]);
         assert_eq!(
             erased_onto_eleven(&mut w),
             Vec::<i16>::new(),
@@ -3433,13 +3156,6 @@ mod tests {
                 }],
             );
             w.translate(1, 24);
-            // `+1` reaches row 23, the row the scroll brought in; `+2`
-            // reaches row 24, past the grid, which no scroll brings in.
-            assert!(
-                w.seen
-                    .iter()
-                    .all(|s| s.row == 22 && s.pending == 0b0010 && s.pend_ms == [0; 4])
-            );
             w
         };
         let erased = |w: &mut Witness| {
@@ -3496,18 +3212,6 @@ mod tests {
         assert_eq!(erased(&mut w), vec![1], "seen blank first: a move");
         let mut w = scrolled();
         assert_eq!(erased(&mut w), vec![1], "never looked at: a move");
-        // An unmeasured grid marks nothing.
-        let mut w = Witness::new();
-        walk_quiet(
-            &mut w,
-            &at(23),
-            &[RowSample {
-                row: 23,
-                cols: &own,
-            }],
-        );
-        w.translate(1, 0);
-        assert!(w.seen.iter().all(|s| s.pending == 0));
     }
 
     /// A run beside a withheld row waits one walk
@@ -3702,10 +3406,6 @@ mod tests {
                     "an interior rewrite is not evidence: {text}"
                 );
             }
-            assert!(
-                w.seen.iter().all(|s| s.twin & 1 == 1),
-                "every record a twin one row up again"
-            );
             w
         };
         let follow = |w: &mut Witness, six: &[char]| {
@@ -3784,114 +3484,50 @@ mod tests {
     }
 
     /// An insert pushes its tail, and the tail is found where it went
-    /// ([`Witness::shift_runs`]). One key inside `hello world`, at the caret and
-    /// one column on, and a three-cell paste: the block from the edit point to
-    /// the line's end is named with its width, including the space before
-    /// `world` when the key went in at it.
+    /// ([`Witness::shift_runs`]): the block from the edit point to the line's
+    /// end is named with its width, the space before a word going along when
+    /// the key went in at it. Where letters repeat the caret picks the edit
+    /// point, and one moved glyph is evidence only under the caret. A rewrite
+    /// or a clear is never an insert (other text over the tail with a
+    /// coincidental copy of its first letter; a found tail whose next glyph
+    /// stands on other text; a cleared tail with a copy further left, ⌃W over
+    /// a repeated word; a Backspace that pulled `also see` together,
+    /// `wrapped_composer_band`'s `c8_bs_mid`).
     #[test]
     fn an_insert_names_the_tail_it_pushed_with_its_width() {
-        let (mut w, cells) = armed_line("hello world");
-        assert_eq!(
-            shift_onto(&mut w, &cells, "hello Xworld", Some(6)),
-            shift(6, 10, 1),
-            "a key typed at the `w`"
+        // (armed, now, caret column, the tail named as `(lo, hi, dc)`)
+        type Case = (
+            &'static str,
+            &'static str,
+            Option<u16>,
+            Option<(u16, u16, i16)>,
         );
-        assert_eq!(
-            shift_onto(&mut w, &cells, "helloX world", Some(5)),
-            shift(5, 10, 1),
-            "a key typed at the space takes the space along"
-        );
-        assert_eq!(
-            shift_onto(&mut w, &cells, "hello XYZworld", Some(6)),
-            shift(6, 10, 3),
-            "a three-cell insert"
-        );
-        assert_eq!(
-            shift_onto(&mut w, &cells, "hello world", Some(11)),
-            vec![],
-            "nothing moved, nothing named"
-        );
-    }
-
-    /// The caret is the edit point where letters repeat. `hello` with an `l`
-    /// typed at the first `l`: only the `o` reads gone, but the extension over
-    /// the repeated letters finds the block, and the caret picks its start.
-    /// Without the caret the one moved glyph is too little.
-    #[test]
-    fn a_key_typed_among_repeated_letters_inserts_at_the_caret() {
-        let (mut w, cells) = armed_line("hello");
-        assert_eq!(
-            shift_onto(&mut w, &cells, "helllo", Some(2)),
-            shift(2, 4, 1)
-        );
-        assert_eq!(
-            shift_onto(&mut w, &cells, "helllo", Some(3)),
-            shift(3, 4, 1)
-        );
-        assert_eq!(
-            shift_onto(&mut w, &cells, "helllo", None),
-            vec![],
-            "one moved glyph and no caret is not evidence"
-        );
-        // `ab|cd` + `b`: the greedy block would start at the `b` left of
-        // the caret; the caret says the key went in at `c`.
-        let (mut w, cells) = armed_line("abcd");
-        assert_eq!(shift_onto(&mut w, &cells, "abbcd", Some(2)), shift(2, 3, 1));
-    }
-
-    /// One glyph is evidence only at the caret: a key typed before the line's
-    /// last letter pushes a one-glyph tail, named only when the caret was at
-    /// the edit point.
-    #[test]
-    fn a_one_glyph_tail_moves_only_under_the_caret() {
-        let (mut w, cells) = armed_line("type");
-        assert_eq!(shift_onto(&mut w, &cells, "typXe", Some(3)), shift(3, 3, 1));
-        assert_eq!(shift_onto(&mut w, &cells, "typXe", None), vec![]);
-        assert_eq!(shift_onto(&mut w, &cells, "typXe", Some(1)), vec![]);
-        // A Backspace case (`wrapped_composer_band`'s `c8_bs_mid`): the caret's
-        // `s` is the band's last cell, the erase pulled `also see` together, and
-        // `see`'s `s` stands three columns on with more text past it, so it is
-        // not an insert.
-        let (mut w, cells) = armed_line("I als");
-        assert_eq!(shift_onto(&mut w, &cells, "I alee see", Some(4)), vec![]);
-    }
-
-    /// A rewrite is not a shift. Negative controls: other text over the tail
-    /// with a coincidental copy of its first letter further along; a found tail
-    /// whose next glyph stands on other text; a cleared tail with a copy
-    /// further left (⌃W over a repeated word). Nothing is named.
-    #[test]
-    fn a_rewrite_or_a_clear_is_never_read_as_an_insert() {
-        let (mut w, cells) = armed_line("hello world");
-        assert_eq!(
-            shift_onto(&mut w, &cells, "hello xyzqw", Some(6)),
-            vec![],
-            "other text with a `w` in it"
-        );
-        assert_eq!(
-            shift_onto(&mut w, &cells, "hello Xwoqqq", Some(6)),
-            vec![],
-            "`wo` found, then other text"
-        );
-        let (mut w, cells) = armed_line("ab cd ab");
-        assert_eq!(
-            shift_onto(&mut w, &cells, "ab cd   ", Some(8)),
-            vec![],
-            "a cleared tail is not text that moved"
-        );
-    }
-
-    /// A tail the row's end took is left behind, not a veto: an insert pushing
-    /// the line's last word past the edge names the glyphs still on the row;
-    /// those whose `col + dc` is blank stay for the walk to release.
-    #[test]
-    fn an_insert_whose_tail_left_the_row_moves_what_stayed() {
-        let (mut w, cells) = armed_line("hi you there");
-        assert_eq!(
-            shift_onto(&mut w, &cells, "hi XYZyou      ", Some(3)),
-            shift(3, 6, 3),
-            "`you ` pushed on, `there` wrapped away"
-        );
+        let cases: [Case; 15] = [
+            ("hello world", "hello Xworld", Some(6), Some((6, 10, 1))), // at the `w`
+            ("hello world", "helloX world", Some(5), Some((5, 10, 1))), // the space goes along
+            ("hello world", "hello XYZworld", Some(6), Some((6, 10, 3))), // three cells
+            ("hello world", "hello world", Some(11), None),             // nothing moved
+            ("hello", "helllo", Some(2), Some((2, 4, 1))), // repeated letters: the caret
+            ("hello", "helllo", Some(3), Some((3, 4, 1))),
+            ("hello", "helllo", None, None), // one moved glyph, no caret
+            ("abcd", "abbcd", Some(2), Some((2, 3, 1))), // the caret, not the greedy block
+            ("type", "typXe", Some(3), Some((3, 3, 1))), // a one-glyph tail at the caret
+            ("type", "typXe", None, None),
+            ("type", "typXe", Some(1), None),
+            ("I als", "I alee see", Some(4), None), // a Backspace pulled text together
+            ("hello world", "hello xyzqw", Some(6), None), // other text with a `w`
+            ("hello world", "hello Xwoqqq", Some(6), None), // `wo` found, then other text
+            ("ab cd ab", "ab cd   ", Some(8), None), // a cleared tail
+        ];
+        for (armed, now, caret, want) in cases {
+            let (mut w, cells) = armed_line(armed);
+            let want = want.map_or_else(Vec::new, |(lo, hi, dc)| shift(lo, hi, dc));
+            assert_eq!(
+                shift_onto(&mut w, &cells, now, caret),
+                want,
+                "`{armed}` -> `{now}`, caret {caret:?}"
+            );
+        }
     }
 
     /// A block landing on its own left-behind tail leaves one record per
@@ -4036,21 +3672,6 @@ mod tests {
             2,
             "released records are KEPT: the cells are resident and unstamped for the retract"
         );
-        // The next frame, still blank: nothing to say, and nothing named
-        // again.
-        let n = w.walk(
-            &cells,
-            &[RowSample {
-                row: 5,
-                cols: &row("  "),
-            }],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        assert!(out.is_empty() && rel.is_empty() && n == 0);
-        assert_eq!(w.len(), 2, "…and the records stand");
     }
 
     /// What one walk named: the positions on `retire`, then on `release`.
@@ -4116,52 +3737,6 @@ mod tests {
         assert_eq!(w.len(), 5, "the landed glyph is armed with its run");
     }
 
-    /// And with the clear that released it: `ab cd` cleared in the batch that
-    /// writes one glyph on the Space's column (a spinner over the cleared
-    /// composer). The letters are released, and the Space's cell goes with
-    /// them on the swoosh (`release`), the run's own verdict, never the melt,
-    /// which would punch a hole in the draining band (`tests/new_line_fade.rs`).
-    #[test]
-    fn a_glyph_landing_on_a_released_run_s_blank_goes_with_the_run() {
-        let t0 = Instant::now();
-        let mut w = Witness::new();
-        let line = [
-            cell(5, 0, t0),
-            cell(5, 1, t0),
-            cell(5, 2, t0),
-            cell(5, 3, t0),
-            cell(5, 4, t0),
-        ];
-        assert_eq!(walk_row(&mut w, &line, 5, "ab cd"), (vec![], vec![]));
-        let (out, rel) = walk_row(&mut w, &line, 5, "  x  ");
-        assert_eq!(rel, vec![(5, 0), (5, 1), (5, 3), (5, 4), (5, 2)]);
-        assert!(out.is_empty(), "nothing melts: {out:?}");
-    }
-
-    /// A glyph landing on a blank does not pull its run's standing text into
-    /// the melt ([`Witness::landed_goes_with_its_run`]). `ab cd ef` →
-    /// `ab*cd eX`: the landed cell has `ab` standing on its far side, so it is
-    /// not the run's loose blank and the span closure does not reach back
-    /// through `cd e`. Likewise a mid-line Backspace, `ab cd efgh` →
-    /// `ab*cd egh `.
-    #[test]
-    fn a_glyph_landing_on_a_blank_between_standing_words_stays_out_of_its_run_s_melt() {
-        let t0 = Instant::now();
-        for (before, after, want) in [
-            ("ab cd ef", "ab*cd eX", vec![(5, 7)]),
-            ("ab cd efgh", "ab*cd egh ", vec![(5, 7), (5, 8), (5, 9)]),
-        ] {
-            let mut w = Witness::new();
-            let n = u16::try_from(before.len()).expect("short");
-            let line: Vec<Cell> = (0..n).map(|c| cell(5, c, t0)).collect();
-            assert_eq!(walk_row(&mut w, &line, 5, before), (vec![], vec![]));
-            let (mut out, rel) = walk_row(&mut w, &line, 5, after);
-            out.sort_unstable();
-            assert_eq!(out, want, "{before:?} -> {after:?}");
-            assert!(rel.is_empty(), "{before:?} -> {after:?}: {rel:?}");
-        }
-    }
-
     /// The last walk's blanks ride with their cells ([`Witness::blank_seen`]):
     /// a follow pass, scroll and band move each carry a never-armed blank, and
     /// the next walk still knows it was blank, so a relay glyph landing on it
@@ -4198,33 +3773,21 @@ mod tests {
     fn a_released_record_is_kept_so_a_glyph_landing_under_it_later_melts_fast_and_counts_once() {
         let t0 = Instant::now();
         let cells = [cell(5, 0, t0), cell(5, 1, t0)];
+        // `hi` armed then released (`blank_to_glyph_only_arms_and_glyph_to_blank_releases`).
         let release = |w: &mut Witness, out: &mut Vec<_>, rel: &mut Vec<_>| {
-            let n = w.walk(
-                &cells,
-                &[RowSample {
-                    row: 5,
-                    cols: &row("hi"),
-                }],
-                &[],
-                Instant::now(),
-                out,
-                rel,
-            );
-            assert!(out.is_empty() && rel.is_empty() && n == 0 && w.len() == 2);
-            let n = w.walk(
-                &cells,
-                &[RowSample {
-                    row: 5,
-                    cols: &row("  "),
-                }],
-                &[],
-                Instant::now(),
-                out,
-                rel,
-            );
-            assert_eq!(pos(rel), vec![(5, 0), (5, 1)], "released");
-            assert!(out.is_empty() && n == 0);
-            assert_eq!(w.len(), 2, "the released records are kept");
+            for text in ["hi", "  "] {
+                w.walk(
+                    &cells,
+                    &[RowSample {
+                        row: 5,
+                        cols: &row(text),
+                    }],
+                    &[],
+                    Instant::now(),
+                    out,
+                    rel,
+                );
+            }
         };
         // (1) The spinner lands under the released cells.
         let mut w = Witness::new();
@@ -4259,27 +3822,7 @@ mod tests {
             w.is_empty(),
             "a retired cell's record goes: it is stamped and leaving"
         );
-        // (2) One glyph lands and the other stays blank: the run is one object,
-        // so the held cell melts with its replaced run-mate (a re-verdict).
-        let mut w = Witness::new();
-        release(&mut w, &mut out, &mut rel);
-        let n = w.walk(
-            &cells,
-            &[RowSample {
-                row: 5,
-                cols: &row(" x"),
-            }],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        let mut got = pos(&out);
-        got.sort_unstable();
-        assert_eq!(got, vec![(5, 0), (5, 1)], "the held cell goes with its run");
-        assert!(rel.is_empty());
-        assert_eq!(n, 2);
-        // (3) The same glyphs back where they were: D2, nothing.
+        // (2) The same glyphs back where they were: D2, nothing.
         let mut w = Witness::new();
         release(&mut w, &mut out, &mut rel);
         let n = w.walk(
@@ -4383,748 +3926,173 @@ mod tests {
     }
 
     /// A release takes no space from between standing letters
-    /// (`wrapped_composer_band`'s `c2_bs`). `ab cd ef` with the last letter
-    /// blanked releases `f` only; the spaces at 2 and 5 stay. Clearing the tail
-    /// from 4 takes the space at 5 with it; clearing the whole row takes every
-    /// blank.
+    /// (`wrapped_composer_band`'s `c2_bs`), and a never-armed cell past a
+    /// cleared suffix (or before a cleared prefix) goes with it. Each run is
+    /// laid under every column of `armed` (its spaces never armed), then the
+    /// row reads `then`: nothing is replaced, and exactly `released` is
+    /// released.
     #[test]
     fn a_partial_release_takes_no_space_from_between_standing_letters() {
-        let t0 = Instant::now();
-        let run: Vec<Cell> = (0..8u16).map(|c| cell_of(5, c, t0, 7)).collect();
-        let arm = |w: &mut Witness, out: &mut Vec<_>, rel: &mut Vec<_>| {
-            w.walk(
-                &run,
-                &[RowSample {
-                    row: 5,
-                    cols: &row("ab cd ef"),
-                }],
-                &[],
-                Instant::now(),
-                out,
-                rel,
-            );
-        };
-        let released = |text: &str| {
-            let mut w = Witness::new();
+        let cols = |r: std::ops::Range<u16>| r.collect::<Vec<u16>>();
+        for (armed, then, released) in [
+            ("ab cd ef", "ab cd e ", vec![7]),    // the blanked letter alone
+            ("ab cd ef", "ab c    ", cols(4..8)), // a cleared tail takes its space
+            ("ab cd ef", "        ", cols(0..8)), // nothing standing: every blank
+            ("hello world ", "hello       ", cols(6..12)), // the trailing space goes
+            (" hello world", "       world", cols(0..6)), // the leading space goes
+        ] {
+            let (mut w, cells) = armed_line(armed);
             let (mut out, mut rel) = (Vec::new(), Vec::new());
-            arm(&mut w, &mut out, &mut rel);
-            w.walk(
-                &run,
-                &[RowSample {
-                    row: 5,
-                    cols: &row(text),
-                }],
-                &[],
-                Instant::now(),
-                &mut out,
-                &mut rel,
-            );
+            let then_row = row(then);
+            let sample = [RowSample {
+                row: 5,
+                cols: &then_row,
+            }];
+            w.walk(&cells, &sample, &[], Instant::now(), &mut out, &mut rel);
             assert!(
                 out.is_empty(),
-                "{text:?}: nothing replaced: {:?}",
+                "`{then}`: nothing replaced: {:?}",
                 pos(&out)
             );
             let mut got: Vec<u16> = pos(&rel).into_iter().map(|(_, c)| c).collect();
             got.sort_unstable();
             got.dedup();
-            got
-        };
-        assert_eq!(
-            released("ab cd e "),
-            vec![7],
-            "the blanked letter alone: the spaces between standing letters stay"
-        );
-        assert_eq!(
-            released("ab c    "),
-            vec![4, 5, 6, 7],
-            "a cleared tail takes its own space with it"
-        );
-        assert_eq!(
-            released("        "),
-            (0..8).collect::<Vec<u16>>(),
-            "a run with nothing standing takes every blank"
-        );
+            assert_eq!(got, released, "`{armed}` -> `{then}`");
+        }
     }
 
-    /// One glyph read blank for a walk takes no space with it. `hello world`;
-    /// a mid-rewrite sample reads the last letter blank for one walk (a
-    /// one-cell suffix, which the shape pass lets stand). The other glyphs
-    /// stand, so the release names that cell and not the never-armed space at
-    /// 5, which keeps its light and clock and takes no released record. The
-    /// glyph back restores the run. Control: a suffix cleared from `w` takes
-    /// the space inside the lost span (`tests/partial_release.rs`)
-    /// (owner, 2026-09-21).
+    /// One glyph read blank for a walk takes no space with it, and the glyph
+    /// back restores the run (`tests/partial_release.rs`) (owner, 2026-09-21).
+    /// `hello world`; a mid-rewrite sample reads the last letter blank for one
+    /// walk. The release names that cell and not the never-armed space at 5,
+    /// which takes no released record. A key typed inside the melt (column
+    /// 11) is armed with no release tag and is no veto: the run is restorable
+    /// with the `d` back, whether the new key's glyph stands or was rewritten
+    /// (then the walk after the restore retires exactly that cell). Control:
+    /// a retype over the released column refuses.
     #[test]
     fn a_partial_release_of_one_glyph_leaves_the_run_s_spaces_standing() {
         let t0 = Instant::now();
-        let mut w = Witness::new();
-        let (mut out, mut rel) = (Vec::new(), Vec::new());
-        let word: Vec<Cell> = (0..11u16).map(|c| cell_of(5, c, t0, 7)).collect();
-        w.walk(
-            &word,
-            &[RowSample {
-                row: 5,
-                cols: &row("hello world"),
-            }],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        assert_eq!(w.len(), 10, "ten letters armed, not the space");
-        let n = w.walk(
-            &word,
-            &[RowSample {
-                row: 5,
-                cols: &row("hello worl "),
-            }],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        assert!(out.is_empty(), "nothing replaced: {:?}", pos(&out));
-        assert_eq!(
-            pos(&rel),
-            vec![(5, 10)],
-            "the one blanked glyph is released, and no space with it"
-        );
-        assert_eq!(n, 0);
-        assert_eq!(w.len(), 10, "the space took no released record");
-        // A key typed inside the melt, past the stamped cell: its cell is
-        // armed on the next walk with no release tag. It is not a veto.
         let t1 = t0 + std::time::Duration::from_millis(50);
-        let mut typed: Vec<Cell> = word.clone();
-        typed.push(cell_of(5, 11, t1, 7));
-        w.walk(
-            &typed,
-            &[RowSample {
-                row: 5,
-                cols: &row("hello worl x"),
-            }],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        assert!(out.is_empty() && rel.is_empty());
-        assert_eq!(w.len(), 11, "the new key's cell is armed");
-        // The glyph back: the recorded identities all stand and the released
-        // record's ink returned, so the run is restorable despite the new cell.
-        let mut restore = Vec::new();
-        w.restored_runs(
-            &typed,
-            &[RowSample {
-                row: 5,
-                cols: &row("hello worldx"),
-            }],
-            &mut restore,
-        );
-        assert_eq!(
-            restore,
-            vec![(7, None)],
-            "the run is restorable with a key typed inside the melt"
-        );
-        // Control: a retype over the released column (a later-born cell at col
-        // 10 with the same `d`) refuses.
-        let mut w2 = w.clone();
-        let mut retyped: Vec<Cell> = word.clone();
-        retyped.push(cell_of(5, 10, t1, 7));
-        w2.walk(
-            &retyped,
-            &[RowSample {
-                row: 5,
-                cols: &row("hello world"),
-            }],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        let mut refused = Vec::new();
-        w2.restored_runs(
-            &retyped,
-            &[RowSample {
-                row: 5,
-                cols: &row("hello world"),
-            }],
-            &mut refused,
-        );
-        assert!(
-            refused.is_empty(),
-            "a retype over the released column does not bring the old light back: {refused:?}"
-        );
-        w.restored(&[7], &typed);
-        let n = w.walk(
-            &typed,
-            &[RowSample {
-                row: 5,
-                cols: &row("hello worldx"),
-            }],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        assert!(out.is_empty() && rel.is_empty(), "the row stands whole");
-        assert_eq!(n, 0);
-        assert_eq!(w.len(), 11);
-        // Control: cleared from `w` on, the space at 5 is outside the lost span
-        // and stands; cleared from `o` on, the space inside it goes.
-        let mut w = Witness::new();
-        w.walk(
-            &word,
-            &[RowSample {
-                row: 5,
-                cols: &row("hello world"),
-            }],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        w.walk(
-            &word,
-            &[RowSample {
-                row: 5,
-                cols: &row("hello      "),
-            }],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        let mut got = pos(&rel);
-        got.sort_unstable();
-        assert_eq!(
-            got,
-            vec![(5, 6), (5, 7), (5, 8), (5, 9), (5, 10)],
-            "a cleared suffix takes its letters; the space before it stands"
-        );
-        let mut w = Witness::new();
-        w.walk(
-            &word,
-            &[RowSample {
-                row: 5,
-                cols: &row("hello world"),
-            }],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        w.walk(
-            &word,
-            &[RowSample {
-                row: 5,
-                cols: &row("hell       "),
-            }],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        let mut got = pos(&rel);
-        got.sort_unstable();
-        assert_eq!(
-            got,
-            (4..11u16).map(|c| (5, c)).collect::<Vec<_>>(),
-            "a suffix cleared across the space takes the space inside it"
-        );
-    }
-
-    /// The tail goes with the suffix. `hello world ` (a typed trailing space at
-    /// 11, never armed), cleared from `w` on: 11 is right of `hi = 10` with
-    /// nothing standing beyond, so it goes; 5 is left of `lo = 6` with `hello`
-    /// standing left of it, so it stands. Mirror: ` hello world` with `hello`
-    /// cleared takes the leading space at 0 and keeps the space at 6.
-    #[test]
-    fn a_never_armed_cell_past_a_cleared_suffix_goes_with_it() {
-        let t0 = Instant::now();
-        let (mut out, mut rel) = (Vec::new(), Vec::new());
-        let mut w = Witness::new();
-        let line: Vec<Cell> = (0..12u16).map(|c| cell_of(5, c, t0, 7)).collect();
-        w.walk(
-            &line,
-            &[RowSample {
-                row: 5,
-                cols: &row("hello world "),
-            }],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        assert_eq!(w.len(), 10, "ten letters armed, neither space");
-        w.walk(
-            &line,
-            &[RowSample {
-                row: 5,
-                cols: &row("hello       "),
-            }],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        assert!(out.is_empty(), "nothing replaced: {:?}", pos(&out));
-        let mut got = pos(&rel);
-        got.sort_unstable();
-        assert_eq!(
-            got,
-            (6..12u16).map(|c| (5, c)).collect::<Vec<_>>(),
-            "the cleared suffix takes the trailing space after it; the space before it stands"
-        );
-        // The mirror: a leading never-armed space before a cleared prefix.
-        let mut w = Witness::new();
-        w.walk(
-            &line,
-            &[RowSample {
-                row: 5,
-                cols: &row(" hello world"),
-            }],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        assert_eq!(w.len(), 10);
-        w.walk(
-            &line,
-            &[RowSample {
-                row: 5,
-                cols: &row("       world"),
-            }],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        assert!(out.is_empty(), "nothing replaced: {:?}", pos(&out));
-        let mut got = pos(&rel);
-        got.sort_unstable();
-        assert_eq!(
-            got,
-            (0..6u16).map(|c| (5, c)).collect::<Vec<_>>(),
-            "the cleared prefix takes the leading space before it; the space after it stands"
-        );
-    }
-
-    /// A record armed after the release whose glyph changed is neutral.
-    /// `hello world` with one glyph released for a walk; a key lands on the
-    /// never-armed column 11 (`x`) and is then rewritten (`y`) as the old text
-    /// returns. The restore is accepted, and the walk after it retires exactly
-    /// the rewritten cell.
-    #[test]
-    fn a_record_armed_after_the_release_whose_glyph_changed_is_neutral_to_the_restore() {
-        let t0 = Instant::now();
-        let mut w = Witness::new();
-        let (mut out, mut rel) = (Vec::new(), Vec::new());
         let word: Vec<Cell> = (0..11u16).map(|c| cell_of(5, c, t0, 7)).collect();
-        w.walk(
-            &word,
-            &[RowSample {
-                row: 5,
-                cols: &row("hello world"),
-            }],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        w.walk(
-            &word,
-            &[RowSample {
-                row: 5,
-                cols: &row("hello worl "),
-            }],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        assert_eq!(
-            pos(&rel),
-            vec![(5, 10)],
-            "the one blanked glyph is released"
-        );
-        let t1 = t0 + std::time::Duration::from_millis(50);
-        let mut typed: Vec<Cell> = word.clone();
+        let mut typed = word.clone();
         typed.push(cell_of(5, 11, t1, 7));
-        w.walk(
-            &typed,
-            &[RowSample {
-                row: 5,
-                cols: &row("hello worl x"),
-            }],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        assert!(out.is_empty() && rel.is_empty());
-        assert_eq!(w.len(), 11, "the new key's cell is armed as `x`");
-        // The glyph at 11 rewritten to `y`, the `d` back at 10.
-        let mut restore = Vec::new();
-        w.restored_runs(
-            &typed,
-            &[RowSample {
-                row: 5,
-                cols: &row("hello worldy"),
-            }],
-            &mut restore,
-        );
-        assert_eq!(
-            restore,
-            vec![(7, None)],
-            "a record armed after the release, its glyph changed, is no veto"
-        );
-        w.restored(&[7], &typed);
-        w.walk(
-            &typed,
-            &[RowSample {
-                row: 5,
-                cols: &row("hello worldy"),
-            }],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        assert_eq!(
-            pos(&out),
-            vec![(5, 11)],
-            "the rewritten cell is retired by the walk, on its own"
-        );
-        assert!(rel.is_empty(), "nothing else leaves: {:?}", pos(&rel));
-        assert_eq!(
-            w.len(),
-            10,
-            "the retired cell's record goes with its verdict; the restored `d` keeps its own, the space still has none"
-        );
-    }
-
-    /// The run decides the clock. `hi` three ways: one glyph replaced and one
-    /// blanked is a re-laid box (the whole run melts); both blanked with `hi`
-    /// on another sampled row is a box re-laid elsewhere (moved, melts); both
-    /// blanked and `hi` nowhere is a submit (released).
-    #[test]
-    fn a_replaced_glyph_or_a_moved_run_melts_fast_and_only_a_vanished_run_is_released() {
-        let t0 = Instant::now();
-        let cells = [cell(5, 0, t0), cell(5, 1, t0)];
-        let arm = |w: &mut Witness, out: &mut Vec<_>, rel: &mut Vec<_>| {
-            w.walk(
-                &cells,
+        let released = || {
+            let mut w = Witness::new();
+            walk_row(&mut w, &word, 5, "hello world");
+            assert_eq!(w.len(), 10, "ten letters armed, not the space");
+            assert_eq!(
+                walk_row(&mut w, &word, 5, "hello worl "),
+                (vec![], vec![(5, 10)]),
+                "the one blanked glyph is released, and no space with it"
+            );
+            assert_eq!(w.len(), 10, "the space took no released record");
+            assert_eq!(
+                walk_row(&mut w, &typed, 5, "hello worl x"),
+                (vec![], vec![])
+            );
+            assert_eq!(w.len(), 11, "the new key's cell is armed");
+            w
+        };
+        let restore = |w: &Witness, cells: &[Cell], text: &str| {
+            let mut runs = Vec::new();
+            w.clone().restored_runs(
+                cells,
                 &[RowSample {
                     row: 5,
-                    cols: &row("hi"),
+                    cols: &row(text),
                 }],
-                &[],
-                Instant::now(),
-                out,
-                rel,
+                &mut runs,
             );
-            assert!(out.is_empty() && rel.is_empty() && w.len() == 2);
+            runs
         };
-        // (1) `h` → `H`, `i` → blank: the run was overwritten.
-        let mut w = Witness::new();
-        let (mut out, mut rel) = (Vec::new(), Vec::new());
-        arm(&mut w, &mut out, &mut rel);
-        w.walk(
-            &cells,
-            &[RowSample {
-                row: 5,
-                cols: &row("H "),
-            }],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        let mut got = pos(&out);
-        got.sort_unstable();
-        assert_eq!(
-            got,
-            vec![(5, 0), (5, 1)],
-            "the blanked `i` melts with its replaced run-mate"
-        );
-        assert!(rel.is_empty());
-        // (2) both blank here, `hi` on the caret's row: the text moved.
-        let mut w = Witness::new();
-        arm(&mut w, &mut out, &mut rel);
-        w.walk(
-            &cells,
-            &[
-                RowSample {
-                    row: 5,
-                    cols: &row("  "),
-                },
-                RowSample {
-                    row: 7,
-                    cols: &row("hi"),
-                },
-            ],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        assert_eq!(
-            pos(&out),
-            vec![(5, 0), (5, 1)],
-            "a run found elsewhere moved: fast"
-        );
-        assert!(rel.is_empty());
-        // (3) both blank, the caret's row holds other text: the text went.
-        let mut w = Witness::new();
-        arm(&mut w, &mut out, &mut rel);
-        w.walk(
-            &cells,
-            &[
-                RowSample {
-                    row: 5,
-                    cols: &row("  "),
-                },
-                RowSample {
-                    row: 7,
-                    cols: &row("> ok"),
-                },
-            ],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        assert!(
-            out.is_empty(),
-            "nothing replaced it and it is nowhere: not the melt"
-        );
-        assert_eq!(pos(&rel), vec![(5, 0), (5, 1)], "released to the swoosh");
-        // A partial match is not the text: `h` alone elsewhere moves nothing.
-        let mut w = Witness::new();
-        arm(&mut w, &mut out, &mut rel);
-        w.walk(
-            &cells,
-            &[
-                RowSample {
-                    row: 5,
-                    cols: &row("  "),
-                },
-                RowSample {
-                    row: 7,
-                    cols: &row("h ho"),
-                },
-            ],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        assert!(
-            out.is_empty(),
-            "`h` and `i` must stand together at their spacing"
-        );
-        assert_eq!(pos(&rel), vec![(5, 0), (5, 1)]);
+        for (back, retired) in [("hello worldx", vec![]), ("hello worldy", vec![(5, 11)])] {
+            let mut w = released();
+            assert_eq!(
+                restore(&w, &typed, back),
+                vec![(7, None)],
+                "`{back}`: the run is restorable with a key typed inside the melt"
+            );
+            w.restored(&[7], &typed);
+            assert_eq!(
+                walk_row(&mut w, &typed, 5, back),
+                (retired, vec![]),
+                "`{back}`: the row stands, bar a rewritten key's own cell"
+            );
+        }
+        // Control: a retype over the released column (a later-born cell at
+        // col 10 with the same `d`) does not bring the old light back.
+        let mut w = released();
+        let mut retyped = word.clone();
+        retyped.push(cell_of(5, 10, t1, 7));
+        walk_row(&mut w, &retyped, 5, "hello world");
+        assert!(restore(&w, &retyped, "hello world").is_empty());
     }
 
-    /// A run that still stands has not moved: a torn read blanks `TO` at the
-    /// end of a line whose `TO` also stands earlier. The blanked fragment of a
-    /// run with glyphs still in place is released (restorable), never melted
-    /// as moved text.
+    /// The run decides the clock. A run armed over `armed` on row 5 and then
+    /// walked against `then`: a re-laid box (a glyph replaced, or the run
+    /// found at another offset of its own row or on another sampled row)
+    /// melts fast, onto `retire`; a run that vanished, or that only a partial
+    /// match or a lone glyph (narrow or wide) stands for elsewhere, and the
+    /// blanked tail of a run whose glyphs still stand, is released onto the
+    /// swoosh. A glyph landing on the never-armed blank of a run the same
+    /// batch cleared goes with the run on its swoosh, never the melt, which
+    /// would punch a hole in the draining band (`tests/new_line_fade.rs`, a
+    /// spinner over the cleared composer); one landing on a blank with
+    /// standing text on its far side stays out of its run's melt
+    /// ([`Witness::landed_goes_with_its_run`]). Both lists are compared sorted
+    /// and deduped (a wide cell is named once per half).
     #[test]
-    fn a_blanked_tail_of_a_standing_run_is_released_though_its_glyphs_stand_elsewhere() {
+    fn a_relaid_run_melts_fast_and_a_vanished_or_unmatched_one_is_released() {
+        // (armed, then: (row, text) samples, retired columns, released columns)
+        type Case = (
+            &'static str,
+            &'static [(u16, &'static str)],
+            &'static [u16],
+            &'static [u16],
+        );
+        let cases: [Case; 11] = [
+            ("hi", &[(5, "H ")], &[0, 1], &[]), // one glyph replaced, one blanked
+            ("hi", &[(5, "  "), (7, "hi")], &[0, 1], &[]), // found on another row
+            ("hi", &[(5, "    hi")], &[0, 1], &[]), // re-laid along its own row
+            ("hi", &[(5, "  "), (7, "> ok")], &[], &[0, 1]), // vanished
+            ("hi", &[(5, "  "), (7, "h ho")], &[], &[0, 1]), // only a partial match
+            ("z", &[(5, " "), (7, "zoom")], &[], &[0]), // one glyph elsewhere
+            ("\u{4f60}\0", &[(5, "  "), (7, "\u{4f60}\0")], &[], &[0, 1]), // one wide glyph
+            ("ab TO cd TO", &[(5, "ab TO cd   ")], &[], &[9, 10]), // a standing run's tail
+            ("ab cd", &[(5, "  x  ")], &[], &[0, 1, 2, 3, 4]), // a glyph on a released blank
+            ("ab cd ef", &[(5, "ab*cd eX")], &[7], &[]), // a glyph between standing words
+            ("ab cd efgh", &[(5, "ab*cd egh ")], &[7, 8, 9], &[]), // …and a mid-line Backspace
+        ];
         let t0 = Instant::now();
-        let mut w = Witness::new();
-        let (mut out, mut rel) = (Vec::new(), Vec::new());
-        let cells: Vec<Cell> = (0..11u16).map(|c| cell(5, c, t0)).collect();
-        w.walk(
-            &cells,
-            &[RowSample {
-                row: 5,
-                cols: &row("ab TO cd TO"),
-            }],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        w.walk(
-            &cells,
-            &[RowSample {
-                row: 5,
-                cols: &row("ab TO cd   "),
-            }],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        assert!(out.is_empty(), "nothing melts: {:?}", pos(&out));
-        let mut got = pos(&rel);
-        got.sort_unstable();
-        assert_eq!(got, vec![(5, 9), (5, 10)], "the blanked `TO` is released");
-    }
-
-    /// One glyph is not a word: a run of one blanked glyph is never ruled moved
-    /// text, wherever its letter stands.
-    #[test]
-    fn one_blanked_glyph_found_elsewhere_is_released_not_moved() {
-        let t0 = Instant::now();
-        let mut w = Witness::new();
-        let (mut out, mut rel) = (Vec::new(), Vec::new());
-        let cells = [cell(5, 0, t0)];
-        w.walk(
-            &cells,
-            &[RowSample {
-                row: 5,
-                cols: &row("z"),
-            }],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        w.walk(
-            &cells,
-            &[
-                RowSample {
-                    row: 5,
-                    cols: &row(" "),
-                },
-                RowSample {
-                    row: 7,
-                    cols: &row("zoom"),
-                },
-            ],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        assert!(out.is_empty(), "a lone `z` elsewhere moves nothing");
-        assert_eq!(pos(&rel), vec![(5, 0)]);
-    }
-
-    /// One wide glyph is one glyph: a single CJK character standing elsewhere
-    /// is not moved text; it is released.
-    #[test]
-    fn one_blanked_wide_glyph_found_elsewhere_is_released_not_moved() {
-        let t0 = Instant::now();
-        let mut w = Witness::new();
-        let (mut out, mut rel) = (Vec::new(), Vec::new());
-        let cells = [cell(5, 0, t0), cell(5, 1, t0)];
-        w.walk(
-            &cells,
-            &[RowSample {
-                row: 5,
-                cols: &row("\u{4f60}\0"),
-            }],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        w.walk(
-            &cells,
-            &[
-                RowSample {
-                    row: 5,
-                    cols: &row("  "),
-                },
-                RowSample {
-                    row: 7,
-                    cols: &row("\u{4f60}\0"),
-                },
-            ],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        assert!(out.is_empty(), "one wide glyph elsewhere moves nothing");
-        // Both halves are released. A wide cell is named once per half by
-        // each of the run's two records, so the list is deduped here.
-        let mut got = pos(&rel);
-        got.sort_unstable();
-        got.dedup();
-        assert_eq!(got, vec![(5, 0), (5, 1)]);
-    }
-
-    /// A partial release takes its own spaces, not the run's: a released tail
-    /// of a run whose text still stands takes the spaces on its side and none
-    /// inside the standing text; a run with nothing standing takes all.
-    #[test]
-    fn a_released_tail_of_a_standing_run_takes_only_its_own_spaces() {
-        let t0 = Instant::now();
-        let mut w = Witness::new();
-        let (mut out, mut rel) = (Vec::new(), Vec::new());
-        // "ab cd ef gh": spaces at 2, 5 and 8.
-        let cells: Vec<Cell> = (0..11u16).map(|c| cell(5, c, t0)).collect();
-        w.walk(
-            &cells,
-            &[RowSample {
-                row: 5,
-                cols: &row("ab cd ef gh"),
-            }],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        w.walk(
-            &cells,
-            &[RowSample {
-                row: 5,
-                cols: &row("ab cd      "),
-            }],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        assert!(out.is_empty());
-        let mut got = pos(&rel);
-        got.sort_unstable();
-        got.dedup();
-        assert_eq!(
-            got,
-            vec![(5, 6), (5, 7), (5, 8), (5, 9), (5, 10)],
-            "`ef gh` and the space between them go; the spaces at 2 and 5 stand"
-        );
-    }
-
-    /// The moved-text search reads the run's own row too, at any other offset
-    /// (a box re-laid four columns right is re-laid), never the original place.
-    #[test]
-    fn a_run_re_laid_elsewhere_on_its_own_row_moved_and_melts_fast() {
-        let t0 = Instant::now();
-        let mut w = Witness::new();
-        let (mut out, mut rel) = (Vec::new(), Vec::new());
-        let cells = [cell(5, 0, t0), cell(5, 1, t0)];
-        w.walk(
-            &cells,
-            &[RowSample {
-                row: 5,
-                cols: &row("hi"),
-            }],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        w.walk(
-            &cells,
-            &[RowSample {
-                row: 5,
-                cols: &row("    hi"),
-            }],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        assert_eq!(pos(&out), vec![(5, 0), (5, 1)], "moved along its row: fast");
-        assert!(rel.is_empty());
+        for (armed, then, want_retire, want_release) in cases {
+            let what = format!("`{armed}` -> {then:?}");
+            let n = u16::try_from(armed.chars().count()).expect("a short line");
+            let cells: Vec<Cell> = (0..n).map(|c| cell(5, c, t0)).collect();
+            let mut w = Witness::new();
+            assert_eq!(
+                walk_row(&mut w, &cells, 5, armed),
+                (vec![], vec![]),
+                "{what}"
+            );
+            let rows: Vec<Vec<char>> = then.iter().map(|&(_, s)| row(s)).collect();
+            let samples: Vec<RowSample<'_>> = then
+                .iter()
+                .zip(&rows)
+                .map(|(&(r, _), cols)| RowSample { row: r, cols })
+                .collect();
+            let (mut out, mut rel) = (Vec::new(), Vec::new());
+            w.walk(&cells, &samples, &[], Instant::now(), &mut out, &mut rel);
+            let named = |v: &[(u16, u16, Instant)]| {
+                let mut got = pos(v);
+                got.sort_unstable();
+                got.dedup();
+                got
+            };
+            let cols = |c: &[u16]| c.iter().map(|&c| (5, c)).collect::<Vec<_>>();
+            assert_eq!(named(&out), cols(want_retire), "{what}: retired");
+            assert_eq!(named(&rel), cols(want_release), "{what}: released");
+        }
     }
 
     #[test]
@@ -5410,75 +4378,6 @@ mod tests {
     }
 
     #[test]
-    fn a_blank_in_a_word_goes_with_its_run_and_stays_with_it_on_a_redraw() {
-        let t0 = Instant::now();
-        let mut w = Witness::new();
-        let mut out = Vec::new();
-        let mut rel = Vec::new();
-        // "ab cd" as one run (cohort 7), and an unrelated run on the same
-        // row (cohort 9) three columns on.
-        let word: Vec<Cell> = (0..5u16).map(|c| cell_of(5, c, t0, 7)).collect();
-        let other: Vec<Cell> = (8..10u16).map(|c| cell_of(5, c, t0, 9)).collect();
-        let cells: Vec<Cell> = word.iter().chain(other.iter()).copied().collect();
-        w.walk(
-            &cells,
-            &[RowSample {
-                row: 5,
-                cols: &row("ab cd   xy"),
-            }],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        assert!(out.is_empty());
-        assert_eq!(w.len(), 6, "the four letters and the two, not the blank");
-        // The same text again: nothing moves, the blank stays with its word.
-        w.walk(
-            &cells,
-            &[RowSample {
-                row: 5,
-                cols: &row("ab cd   xy"),
-            }],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        assert!(out.is_empty());
-        // The word's row cleared under it, the other run's text still there:
-        // the blank goes with its run; the other run is untouched.
-        w.walk(
-            &cells,
-            &[RowSample {
-                row: 5,
-                cols: &row("        xy"),
-            }],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        assert!(
-            out.is_empty(),
-            "`ab cd` went and is nowhere: released, not melted"
-        );
-        let mut got = pos(&rel);
-        got.sort_unstable();
-        got.dedup();
-        assert_eq!(
-            got,
-            vec![(5, 0), (5, 1), (5, 2), (5, 3), (5, 4)],
-            "the blank goes with its run, on the run's own clock"
-        );
-        assert_eq!(
-            w.len(),
-            7,
-            "the other run's records stand, and the released run's are kept — the blank's too"
-        );
-    }
-
-    #[test]
     fn an_unsampled_row_keeps_its_records_and_a_dropped_cell_is_forgotten() {
         let t0 = Instant::now();
         let mut w = Witness::new();
@@ -5529,37 +4428,6 @@ mod tests {
             &mut rel,
         );
         assert!(out.is_empty() && w.len() == 1);
-        // A scroll carries the record with the cell.
-        w.translate(5, 0);
-        let moved = [cell(0, 0, t0)];
-        w.walk(
-            &moved,
-            &[RowSample {
-                row: 0,
-                cols: &row("a"),
-            }],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        assert!(
-            out.is_empty() && w.len() == 1,
-            "the record followed the scroll"
-        );
-        w.walk(
-            &moved,
-            &[RowSample {
-                row: 0,
-                cols: &row(" "),
-            }],
-            &[],
-            Instant::now(),
-            &mut out,
-            &mut rel,
-        );
-        assert!(out.is_empty());
-        assert_eq!(pos(&rel), vec![(0, 0)], "blanked and nowhere: released");
     }
 
     #[test]

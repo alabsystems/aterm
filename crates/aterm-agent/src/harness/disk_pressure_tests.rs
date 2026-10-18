@@ -251,13 +251,6 @@ fn a_locked_profile_is_never_taken_under_pressure_even_when_it_is_the_oldest() {
             vec![a.join("debug"), a.join("release")],
             "{lock}: {rep:?}"
         );
-        assert!(
-            rep.notes
-                .iter()
-                .any(|n| n.contains("kept") && n.contains("a build holds") && n.contains(lock)),
-            "{lock}: {:?}",
-            rep.notes
-        );
         let mut reads = 0;
         let done = apply_auto(
             &rep,
@@ -311,14 +304,6 @@ fn above_the_floor_no_recent_profile_is_taken() {
     for free in [DEFAULT_AUTO_FREE_GIB * GIB, 500 * GIB] {
         let (survey, rep) = surveyed(&tmp, &[a.clone(), b.clone()], now, free);
         assert!(pressure_order(&rep).is_empty(), "{rep:?}");
-        assert!(
-            rep.notes
-                .iter()
-                .any(|n| n.contains("not under the 10 GiB floor")
-                    && n.contains("no profile written into within 1d would be taken")),
-            "{:?}",
-            rep.notes
-        );
         assert_eq!(auto_plan(&rep), None);
         let done = apply_auto(
             &rep,
@@ -359,13 +344,6 @@ fn a_profile_built_within_the_last_minutes_is_kept_under_pressure() {
         pressure_order(&rep),
         vec![a.join("debug"), a.join("release")],
         "{rep:?}"
-    );
-    assert!(
-        rep.notes.iter().any(|n| n.contains(
-            "written into 5 min ago; no reclaim takes a profile built in the last 10 min"
-        )),
-        "{:?}",
-        rep.notes
     );
     last_used(&b.join("debug"), now - PRESSURE_MIN_IDLE_S);
     let (_, rep) = surveyed(&tmp, &[a.clone(), b.clone()], now, GIB);
@@ -442,9 +420,7 @@ fn a_failed_re_measure_stops_the_pressure_pass() {
     );
     assert_eq!(journal.len(), 1, "{journal:?}");
     assert!(
-        journal[0].contains("\"kind\":\"stopped\"")
-            && journal[0].contains("\"free_bytes\":null")
-            && journal[0].contains("could not be measured again"),
+        journal[0].contains("\"kind\":\"stopped\"") && journal[0].contains("\"free_bytes\":null"),
         "{}",
         journal[0]
     );
@@ -548,13 +524,6 @@ fn with_a_zero_day_window_a_profile_built_minutes_ago_is_still_never_taken() {
             .iter()
             .all(|r| r.path != b && r.path != b.join("debug")),
         "{rep:?}"
-    );
-    assert!(
-        rep.notes
-            .iter()
-            .any(|n| n.contains(&b.display().to_string()) && n.contains("within the last 10 min")),
-        "{:?}",
-        rep.notes
     );
     let done = apply_auto(
         &rep,

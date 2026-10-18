@@ -11,28 +11,12 @@ use std::path::{Path, PathBuf};
 use atpkg::PkgManifest;
 
 use crate::api::Build;
+use crate::artifact::pkgdoc::{manifest_name, sig_name};
+use crate::artifact::upload::tag;
 use crate::error::{Error, Result};
 use crate::host::{HostError, HostRef, Slug};
 use crate::quad::VerifiedQuad;
 use crate::triple::Triple;
-
-/// A program build's release tag.
-#[must_use]
-pub fn tag(program: &str, build: Build) -> String {
-    format!("atpkg-{program}-{build}")
-}
-
-/// A program build's manifest asset.
-#[must_use]
-pub fn manifest_name(program: &str, build: Build) -> String {
-    format!("pkg-{program}-{build}.toml")
-}
-
-/// Its signature asset.
-#[must_use]
-pub fn signature_name(program: &str, build: Build) -> String {
-    format!("pkg-{program}-{build}.toml.sig")
-}
 
 /// The client targets `m` carries rows for (a row naming no client target is ignored).
 #[must_use]
@@ -105,10 +89,7 @@ pub fn fetch(
     quad: &VerifiedQuad,
 ) -> Fetched {
     let tag = tag(program, build);
-    let (pkg, sig) = (
-        manifest_name(program, build),
-        signature_name(program, build),
-    );
+    let (pkg, sig) = (manifest_name(program, build), sig_name(program, build));
     match host.release(slug, &tag) {
         Ok(_) => {}
         Err(HostError::NotFound) => return Fetched::Absent(format!("{slug} has no release {tag}")),

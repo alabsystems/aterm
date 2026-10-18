@@ -22,9 +22,7 @@
 //! This module holds the PURE policy: axis clamping, named-instance / weight
 //! resolution, config-spec parsing, and the dark-theme weight-nudge safety
 //! gate — each a total function of parsed facts, so every law is
-//! machine-checkable without font I/O (`tests/variation_instantiation.rs`;
-//! Tier-0 abstract twins `vf_axis_clamp_model` / `vf_nudge_gate_model` in
-//! `aterm_spec::derive`, checked by the Trust `ty` compiler). The only
+//! machine-checkable without font I/O (`tests/variation_instantiation.rs`). The only
 //! impure parts are the `fvar`/`name` probes and the coordinate-applied
 //! metric measurements, all bounds-checked and total (`None` on malformed
 //! input, never a panic).
@@ -83,11 +81,8 @@ pub struct VfProbe {
 /// Total: for EVERY input (including NaN and ±∞) the result is finite and
 /// within `[axis.min, axis.max]` — a non-finite request yields the axis
 /// default. Exact when achievable: a finite request already inside the axis
-/// bounds is returned unchanged. Tier-0 twin: `vf_axis_clamp_model`
-/// (`aterm_spec::derive`, integer clamp law checked by the Trust `ty`
-/// compiler; the float/NaN half is carried by the exhaustive lattice sweep
-/// in `tests/variation_instantiation.rs`, per the box-drawing rounding-law
-/// precedent).
+/// bounds is returned unchanged. Checked by the exhaustive lattice sweep in
+/// `tests/variation_instantiation.rs`.
 #[must_use]
 pub fn clamp_axis(axis: &VfAxis, req: f32) -> f32 {
     // Axis bounds come from `VfAxis` construction (min <= def <= max, all
@@ -180,9 +175,8 @@ pub fn parse_variation_spec(spec: &str) -> Option<(u32, f32)> {
 /// The nudge applies ONLY under advance invariance: `true` requires both
 /// advances finite AND `|adv_nudged − adv_default| <= 0.25px`
 /// ([`DARK_NUDGE_ADVANCE_TOL_PX`]). NaN/∞ (a failed measurement) can never
-/// pass, so the gate is a checked PRECONDITION, not a heuristic. Tier-0
-/// twin: `vf_nudge_gate_model` (`aterm_spec::derive`); exhaustive lattice +
-/// negative controls in `tests/variation_instantiation.rs`.
+/// pass, so the gate is a checked PRECONDITION, not a heuristic. Exhaustive
+/// lattice + negative controls in `tests/variation_instantiation.rs`.
 #[must_use]
 pub fn dark_nudge_permitted(adv_nudged_px: f32, adv_default_px: f32) -> bool {
     adv_nudged_px.is_finite()
@@ -671,35 +665,6 @@ pub(crate) fn inked_wght_font() -> (Vec<u8>, VfAxis, char, u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// FONT-2: the portable outline raster ACTUALLY applies the variation coords — the
-    /// `wght`-min and `wght`-max instances of the same glyph produce DIFFERENT coverage.
-    /// (The pre-FONT-2 fontdue path drew the `fvar` default regardless, so the two would
-    /// be byte-identical.) Over the checked-in variable face ([`inked_wght_font`]).
-    #[test]
-    fn varied_raster_reflects_the_weight_axis() {
-        let (bytes, wght, _, gid) = inked_wght_font();
-        let px = 64.0;
-        let l = varied_glyph_raster(&bytes, 0, &[(WGHT_TAG, wght.min)], gid, px)
-            .expect("the light instance rasters");
-        let h = varied_glyph_raster(&bytes, 0, &[(WGHT_TAG, wght.max)], gid, px)
-            .expect("the heavy instance rasters");
-        // Different instance ⇒ different raster (dims and/or coverage). This is the whole
-        // point of FONT-2: the coords reach the OUTLINE, not just the metrics.
-        let differ = (l.0, l.1) != (h.0, h.1) || l.5 != h.5;
-        assert!(
-            differ,
-            "wght min vs max must yield different rasters (variation reached the raster); \
-             light {}x{} heavy {}x{}",
-            l.0, l.1, h.0, h.1
-        );
-        // Sanity: both rasters carry ink.
-        let ink = |c: &[u8]| c.iter().map(|&b| u32::from(b)).sum::<u32>();
-        assert!(
-            ink(&l.5) > 0 && ink(&h.5) > 0,
-            "both instances must lay down ink"
-        );
-    }
 
     /// [`RASTER_PAD`] EXISTS, demonstrated on the exact geometry that ate the
     /// hinted `'2'` at ppem 19 — no font, no hinter, just the rasterizer.

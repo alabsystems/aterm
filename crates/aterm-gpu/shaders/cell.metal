@@ -513,7 +513,7 @@ vertex GlyphVsOut vs_glyph(uint vi [[vertex_id]],
 // TEXT glyphs. W2 (u.text_blend != 0.0, the linear-corrected default): remap the
 // coverage BEFORE the fixed-function sRGB-view blend so the blended LUMINANCE
 // lands where a gamma-space blend would put it. Gated EXACTLY like the CPU
-// correction_applies: interior coverage only, non-degenerate luminance gap only
+// blend_text: interior coverage only, non-degenerate luminance gap only
 // (0.001 == aterm_render::TEXT_BLEND_EPS).
 fragment float4 fs_glyph(GlyphVsOut in [[stage_in]],
                          texture2d<float> atlas_tex [[texture(0)]],

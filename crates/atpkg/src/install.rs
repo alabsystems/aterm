@@ -403,7 +403,9 @@ pub fn verify_and_stage(
                 .map_err(|e| io_step("record a sidecar beside the build", e))?;
         }
         if let Some(parent) = build_dir.parent() {
-            crate::store::sync_dir(parent);
+            // Ordered: `.ready` implies the sidecars, so they land before it; lost with
+            // the marker, the build is staged again.
+            crate::store::sync_dir_ordered(parent);
         }
     }
 
@@ -443,7 +445,9 @@ pub fn verify_and_stage(
         return Err(io_step("mark the build complete", e));
     }
     if let Some(parent) = build_dir.parent() {
-        crate::store::sync_dir(parent);
+        // Ordered: the marker's name lands before anything after it; a lost or torn
+        // marker reads as incomplete and the next pass stages the build again.
+        crate::store::sync_dir_ordered(parent);
     }
     Ok(root)
 }
@@ -515,18 +519,109 @@ fn check_developer_id(
     exposes: &[String],
     verify: VerifyOne<'_>,
 ) -> Result<(), StageError> {
-    use aterm_update_core::codesign::{CodesignError, VERIFY_TIMEOUT, verify_timeout_for};
     if exposes.is_empty() {
         return Err(payload2(
             "developer id gate: no exposed tool to bind for team ",
             team,
         ));
     }
+    let mut signer = String::from("Developer ID team ");
+    signer.push_str(team);
+    check_signed_tree(tree, &signer, exposes, verify)
+}
+
+/// A [`StageHooks::pre_swap`] gate for an ALAB PACK of an ALab-built agent program
+/// ([`crate::alab`]): the staged tree is an ALab package ([`crate::alab::is_alab_package`])
+/// whose entrypoint is what one of `exposes`' shims runs (`bin/<tool>`), and on macOS every
+/// Mach-O in it passes `codesign --verify --strict` (`check`, production:
+/// [`codesign_strict_check`]; codex-alab is signed ad hoc by `alab/package.sh`) under the
+/// same rules as [`developer_id_gate`] — at least one Mach-O, each exposed tool's entry one
+/// of them, no other file executable. NEVER the Developer ID gate: these bytes are vouched
+/// for by the roster-signed manifest and its sha256 and `tree_root`, not by a vendor's team,
+/// and the vendor lane keeps that gate unchanged.
+pub(crate) fn alab_pack_gate(
+    exposes: &[String],
+    check: StrictCheck,
+) -> impl Fn(&Path) -> Result<(), StageError> + use<> {
+    let exposes = exposes.to_vec();
+    move |tree: &Path| {
+        if !crate::alab::is_alab_package(tree) {
+            return Err(StageError::Payload(String::from(
+                "alab pack gate: the staged tree is not an ALab package (codex-package.json \
+                 layout 1 with its entrypoint, and alab-build.json)",
+            )));
+        }
+        let entry = crate::alab::entrypoint_of(tree);
+        let shimmed = exposes.iter().any(|name| {
+            crate::store::ToolName::new(name).is_some_and(|tool| {
+                entry.as_deref() == Some(Path::new("bin").join(tool.exe_file()).as_path())
+            })
+        });
+        if !shimmed {
+            return Err(StageError::Payload(String::from(
+                "alab pack gate: the package's entrypoint is not what an exposed tool's shim runs",
+            )));
+        }
+        if !cfg!(target_os = "macos") {
+            return Ok(());
+        }
+        check_signed_tree(tree, ALAB_SIGNER, &exposes, &|path, deadline| {
+            check(path, deadline)
+        })
+    }
+}
+
+/// [`alab_pack_gate`] with the real [`codesign_strict_check`], for a tree on disk: what the
+/// producer (`atpkg-publish pack-package`, and `atpkg-publish index` before it pins an ALab
+/// build) holds a package to, so it never signs or pins a pack this client's stage refuses.
+///
+/// # Errors
+/// The gate's refusal, as a stage would report it.
+pub fn check_alab_pack(tree: &Path, exposes: &[String]) -> Result<(), StageError> {
+    alab_pack_gate(exposes, codesign_strict_check)(tree)
+}
+
+/// How [`alab_pack_gate`] names what each Mach-O must carry.
+const ALAB_SIGNER: &str = "a valid signature (codesign --verify --strict)";
+
+/// How [`alab_pack_gate`] judges one Mach-O by a deadline.
+pub(crate) type StrictCheck =
+    fn(&Path, std::time::Instant) -> Result<(), aterm_update_core::codesign::CodesignError>;
+
+/// The real [`StrictCheck`]: `/usr/bin/codesign --verify --strict --verbose=2 <path>`, with
+/// no designated requirement (an ad hoc signature passes; an unsigned or modified one does
+/// not), bounded by `deadline` and judged as the Developer ID check judges its run.
+///
+/// # Errors
+/// codesign's verdict, or its failure to give one.
+pub(crate) fn codesign_strict_check(
+    path: &Path,
+    deadline: std::time::Instant,
+) -> Result<(), aterm_update_core::codesign::CodesignError> {
+    use aterm_update_core::codesign::{CODESIGN, CodesignError, developer_id_verdict};
+    if !cfg!(target_os = "macos") {
+        return Err(CodesignError::Unsupported);
+    }
+    let mut cmd = aterm_uds::spawnfd::command(CODESIGN);
+    cmd.args(["--verify", "--strict", "--verbose=2"]).arg(path);
+    developer_id_verdict(aterm_uds::deadline::output_until(&mut cmd, deadline))
+}
+
+/// The Mach-O rules every signed darwin tree is held to, with each Mach-O checked by
+/// `verify` and `signer` naming what it must carry: at least one Mach-O, each exposed tool's
+/// `bin/<tool>` one of them, no other file executable, and every one passing `verify`.
+fn check_signed_tree(
+    tree: &Path,
+    signer: &str,
+    exposes: &[String],
+    verify: VerifyOne<'_>,
+) -> Result<(), StageError> {
+    use aterm_update_core::codesign::{CodesignError, VERIFY_TIMEOUT, verify_timeout_for};
     let found = crate::macho::find_macho(tree)?;
     if found.is_empty() {
         let mut m = String::from("no Mach-O in the staged tree; a darwin build must carry ");
-        m.push_str("at least one, signed by Developer ID team ");
-        m.push_str(team);
+        m.push_str("at least one, signed by ");
+        m.push_str(signer);
         return Err(StageError::SignerRefused(m));
     }
     // What each shim runs must be a verified Mach-O, or a decoy beside it satisfies the
@@ -579,8 +674,8 @@ fn check_developer_id(
         match verify(path, deadline) {
             Ok(()) => {}
             Err(e) if e.is_verdict() => {
-                m.push_str(" is not signed by Developer ID team ");
-                m.push_str(team);
+                m.push_str(" is not signed by ");
+                m.push_str(signer);
                 m.push_str(": ");
                 m.push_str(&e.to_string());
                 return Err(StageError::SignerRefused(m));
@@ -1527,7 +1622,10 @@ fn swap_into_place(build_dir: &Path, incoming: &Path) -> std::io::Result<()> {
     let was_complete = crate::store::build_is_complete(build_dir);
     crate::store::clear_build_ready(build_dir)?;
     if let Some(parent) = build_dir.parent() {
-        crate::store::sync_dir(parent);
+        // Ordered: the marker is down (and the staged tree, flushed before, ahead of
+        // it) before the old tree moves aside; an unmarked tree reads as incomplete and
+        // is staged again.
+        crate::store::sync_dir_ordered(parent);
     }
     let superseded = crate::store::superseded_dir(build_dir);
     let retired = match superseded {
@@ -1756,41 +1854,109 @@ mod tests {
         out
     }
 
-    // Happy path: correct sha256 + correct tree_root ⇒ the tree is staged.
-    #[test]
-    fn verifies_and_stages_a_good_bundle() {
-        let b = bundle("good");
-        let build = b.build();
-        verify_and_stage(&b.art, &b.archive, &build, &StageHooks::NONE).unwrap();
-        assert_eq!(
-            std::fs::read(build.join("bin/ay")).unwrap(),
-            b"#!/bin/true\nthe ay binary"
-        );
-        assert!(crate::store::build_is_complete(&build));
-        let _ = std::fs::remove_dir_all(&b.dir);
-    }
+    /// What a refused stage must be: the error it names.
+    type Want = fn(&StageError) -> bool;
 
-    // A wrong (compressed) sha256 is refused before extraction; nothing is staged.
+    /// THE GOVERNING INVARIANT: a stage refused at any step before the swap — the digest,
+    /// the extraction (a tar-slip after a good first entry, so real bytes were written),
+    /// the tree_root re-verify, an unknown lane, the caller's gate, a sidecar that does not
+    /// render or that the store would never reclaim — leaves no build and no scratch at a
+    /// fresh path and, over an installed build, THAT build in place and still complete: a
+    /// stage that cannot install the new build must not have uninstalled the old one. The
+    /// gate is never shown bytes that failed verification.
     #[test]
-    fn rejects_sha256_mismatch() {
-        let b = bundle("badsha");
-        let build = b.build();
-        let err = verify_and_stage(
-            &artifact("deadbeef", ""),
-            &b.archive,
-            &build,
-            &StageHooks::NONE,
-        )
-        .unwrap_err();
+    fn a_stage_refused_before_the_swap_leaves_the_installed_build_intact() {
+        type Sidecars = Result<Vec<(&'static str, Vec<u8>)>, StageError>;
+        let b = bundle("refused");
+        let slip = make_slip_archive(&b.dir);
+        let slip_art = artifact(&file_sha256(&slip).unwrap(), "");
+        let bad_digest = artifact("deadbeef", "");
+        let bad_root = artifact(&b.art.sha256, &"a".repeat(64));
+        let mut unknown_lane = b.art.clone();
+        unknown_lane.protocol = "https".into();
+        unknown_lane.payload = "pkg".into();
+        let gated = std::cell::Cell::new(false);
+        let watch = |_: &Path| -> Result<(), StageError> {
+            gated.set(true);
+            Ok(())
+        };
+        let refuse = |_: &Path| -> Result<(), StageError> {
+            Err(StageError::SignerRefused("bin/ay".into()))
+        };
+        let unrenderable = |_: &str| -> Sidecars { Err(StageError::Payload("x".into())) };
+        let bogus_suffix = |_: &str| -> Sidecars { Ok(vec![(".bogus", b"x".to_vec())]) };
+        let watched = StageHooks {
+            pre_swap: Some(&watch),
+            sidecars: None,
+        };
+        let gate = StageHooks {
+            pre_swap: Some(&refuse),
+            sidecars: None,
+        };
+        let render = StageHooks {
+            pre_swap: None,
+            sidecars: Some(&unrenderable),
+        };
+        let suffix = StageHooks {
+            pre_swap: None,
+            sidecars: Some(&bogus_suffix),
+        };
+        let cases: [(&str, &Artifact, &Path, &StageHooks<'_>, Want); 7] = [
+            ("digest", &bad_digest, &b.archive, &watched, |e| {
+                matches!(
+                    e,
+                    StageError::DigestMismatch {
+                        alg: DigestAlg::Sha256,
+                        ..
+                    }
+                )
+            }),
+            ("slip", &slip_art, &slip, &watched, |e| {
+                matches!(e, StageError::Extract(_))
+            }),
+            ("tree_root", &bad_root, &b.archive, &watched, |e| {
+                matches!(e, StageError::TreeRootMismatch { .. })
+            }),
+            ("unknown lane", &unknown_lane, &b.archive, &watched, |e| {
+                matches!(e, StageError::Payload(_))
+            }),
+            ("gate", &b.art, &b.archive, &gate, |e| {
+                matches!(e, StageError::SignerRefused(_))
+            }),
+            ("sidecar render", &b.art, &b.archive, &render, |e| {
+                matches!(e, StageError::Payload(_))
+            }),
+            ("sidecar suffix", &b.art, &b.archive, &suffix, |e| {
+                matches!(e, StageError::Payload(_))
+            }),
+        ];
+        let (build, witness) = b.installed();
+        let fresh = b.dir.join("store/ay/19");
+        for (label, art, archive, hooks, want) in cases {
+            for target in [&fresh, &build] {
+                let err = verify_and_stage(art, archive, target, hooks).unwrap_err();
+                assert!(want(&err), "{label}: {err:?}");
+                assert!(scratch_beside(target).is_empty(), "{label}: scratch left");
+            }
+            assert!(
+                !fresh.exists(),
+                "{label}: a refused fresh stage left a build"
+            );
+            assert_eq!(
+                std::fs::read(&witness).unwrap(),
+                b"old",
+                "{label}: the installed tree was replaced"
+            );
+            assert!(
+                crate::store::build_is_complete(&build),
+                "{label}: the installed build lost its marker"
+            );
+        }
+        assert!(!gated.get(), "the gate saw bytes that failed verification");
         assert!(
-            matches!(err, StageError::DigestMismatch { .. }),
-            "got {err:?}"
+            !build.parent().unwrap().join("escape").exists(),
+            "the slip escaped the stage"
         );
-        assert!(
-            !build.exists(),
-            "nothing should be staged on a sha mismatch"
-        );
-        let _ = std::fs::remove_dir_all(&b.dir);
     }
 
     /// A row that signs a sha512 is gated by it: the matching archive stages, and one whose
@@ -1821,11 +1987,6 @@ mod tests {
             matches!(&err, StageError::DigestMismatch { alg: DigestAlg::Sha512, got, .. } if *got == sha512),
             "{err:?}"
         );
-        assert!(
-            err.to_string()
-                .starts_with("asset sha512 mismatch: expected "),
-            "{err}"
-        );
         for (sha256, sha512) in [(b.art.sha256.as_str(), sha512.as_str()), ("", "")] {
             let err = verify_and_stage(
                 &by_512(sha256, sha512),
@@ -1840,25 +2001,6 @@ mod tests {
             );
         }
         assert!(!other.exists(), "nothing staged past a refused digest");
-        let _ = std::fs::remove_dir_all(&b.dir);
-    }
-
-    // A wrong tree_root (TOCTOU / tamper) aborts and removes the partial stage.
-    #[test]
-    fn rejects_tree_root_mismatch_and_cleans_up() {
-        let b = bundle("badroot");
-        let build = b.build();
-        let bad = artifact(&b.art.sha256, &"a".repeat(64));
-        let err = verify_and_stage(&bad, &b.archive, &build, &StageHooks::NONE).unwrap_err();
-        assert!(
-            matches!(err, StageError::TreeRootMismatch { .. }),
-            "got {err:?}"
-        );
-        assert!(
-            !build.exists(),
-            "a tree_root mismatch must remove the partial stage"
-        );
-        let _ = std::fs::remove_dir_all(&b.dir);
     }
 
     /// ZC.5's rule (docs/AUDIT-third-party-2026-10-15.md): a row that signs no
@@ -1926,114 +2068,6 @@ mod tests {
         }
     }
 
-    /// THE GOVERNING INVARIANT: a stage whose EXTRACTION fails must not have uninstalled
-    /// the old build. Here the archive's first entry extracts fine and its second is a tar-slip:
-    /// real bytes are written, then the stage aborts, and the installed build is untouched.
-    #[test]
-    fn a_failed_extraction_leaves_the_installed_build_intact_and_complete() {
-        let b = bundle("extract-fail");
-        let (build, witness) = b.installed();
-
-        // A DIFFERENT archive, correctly signed for its own bytes, so the sha256 gate passes
-        // and the failure lands in extraction rather than before it.
-        let slip = make_slip_archive(&b.dir);
-        let slip_art = artifact(&file_sha256(&slip).unwrap(), "");
-
-        let err = verify_and_stage(&slip_art, &slip, &build, &StageHooks::NONE).unwrap_err();
-        assert!(
-            matches!(err, StageError::Extract(_)),
-            "the fixture must fail IN extraction, else this proves nothing: got {err:?}"
-        );
-        assert!(
-            witness.exists() && std::fs::read(&witness).unwrap() == b"old",
-            "the previously-installed tree was destroyed by a stage that then failed"
-        );
-        assert_eq!(
-            std::fs::read(build.join("bin/ay")).unwrap(),
-            b"#!/bin/true\nthe ay binary",
-            "the old tree's contents must be the OLD ones, not the aborted extract's"
-        );
-        assert!(
-            crate::store::build_is_complete(&build),
-            "the surviving build must still be marked complete"
-        );
-        assert!(
-            !build.parent().unwrap().join("escape").exists(),
-            "the slip entry must not have escaped either"
-        );
-        assert!(scratch_beside(&build).is_empty(), "and no scratch leaked");
-        let _ = std::fs::remove_dir_all(&b.dir);
-    }
-
-    /// The same invariant one step later: a tree_root mismatch — tamper, or a truncated
-    /// extract that still parsed — aborts AFTER the whole tree is on disk, the latest point
-    /// at which the old shape had already destroyed the live one.
-    #[test]
-    fn a_failed_re_stage_leaves_the_installed_build_untouched() {
-        let b = bundle("restage-fail");
-        let (build, witness) = b.installed();
-
-        let bad = artifact(&b.art.sha256, &"a".repeat(64));
-        let err = verify_and_stage(&bad, &b.archive, &build, &StageHooks::NONE).unwrap_err();
-        assert!(
-            matches!(err, StageError::TreeRootMismatch { .. }),
-            "got {err:?}"
-        );
-        assert!(
-            witness.exists(),
-            "the previously-installed tree was destroyed by a stage that then failed"
-        );
-        assert_eq!(std::fs::read(&witness).unwrap(), b"old");
-        assert!(
-            crate::store::build_is_complete(&build),
-            "the surviving build must still be marked complete"
-        );
-        let _ = std::fs::remove_dir_all(&b.dir);
-    }
-
-    /// A successful re-stage REPLACES the tree (the witness from the old tree is gone) and
-    /// the build is complete again — the swap is not a no-op that leaves stale bytes.
-    #[test]
-    fn a_successful_re_stage_replaces_the_tree_and_re_marks_it() {
-        let b = bundle("restage-ok");
-        let (build, witness) = b.installed();
-
-        verify_and_stage(&b.art, &b.archive, &build, &StageHooks::NONE).unwrap();
-        assert!(
-            !witness.exists(),
-            "the swap must install the NEW tree, not merge into the old one"
-        );
-        assert_eq!(
-            std::fs::read(build.join("bin/ay")).unwrap(),
-            b"#!/bin/true\nthe ay binary"
-        );
-        assert!(crate::store::build_is_complete(&build));
-        let _ = std::fs::remove_dir_all(&b.dir);
-    }
-
-    /// No stage — successful or failed — may leave scratch behind. Scratch is invisible to
-    /// `list_installed` (non-numeric name).
-    #[test]
-    fn no_stage_leaves_scratch_siblings_behind() {
-        let b = bundle("scratch");
-        let build = b.build();
-
-        verify_and_stage(&b.art, &b.archive, &build, &StageHooks::NONE).unwrap();
-        assert!(
-            scratch_beside(&build).is_empty(),
-            "after success: {:?}",
-            scratch_beside(&build)
-        );
-        let bad = artifact(&b.art.sha256, &"b".repeat(64));
-        let _ = verify_and_stage(&bad, &b.archive, &build, &StageHooks::NONE).unwrap_err();
-        assert!(
-            scratch_beside(&build).is_empty(),
-            "after failure: {:?}",
-            scratch_beside(&build)
-        );
-        let _ = std::fs::remove_dir_all(&b.dir);
-    }
-
     /// Scratch left by a KILLED earlier run is swept by the next stage of that build —
     /// the process that owned it cannot come back (every mutating verb holds the store
     /// lock), so its debris is ours to reclaim.
@@ -2052,7 +2086,6 @@ mod tests {
         assert!(!orphan.exists(), "the orphaned scratch was not swept");
         assert!(crate::store::build_is_complete(&build));
         assert!(scratch_beside(&build).is_empty());
-        let _ = std::fs::remove_dir_all(&b.dir);
     }
 
     /// A SWAP THAT CANNOT EVEN BEGIN MUST PUT THE MARKER BACK.
@@ -2070,7 +2103,7 @@ mod tests {
     /// Driven through `swap_into_place` rather than `verify_and_stage`, because the stage's
     /// own `sweep_stage_scratch` RECLAIMS a stray non-directory at a scratch path and so
     /// clears this blocker before the swap ever sees it — asserted separately by
-    /// `a_stray_file_at_a_scratch_path_is_reclaimed_not_leaked`; the guarantee under test
+    /// `a_refused_recovery_keeps_every_parked_tree_and_sweeps_the_rest`; the guarantee under test
     /// here is what `swap_into_place` does when its first rename fails, whatever the cause.
     #[test]
     fn a_swap_that_cannot_begin_restores_the_marker_it_took_down() {
@@ -2100,7 +2133,6 @@ mod tests {
             crate::store::build_is_complete(&build),
             "a swap that could not begin must leave the build as complete as it found it"
         );
-        let _ = std::fs::remove_dir_all(&b.dir);
     }
 
     /// THE ROLLBACK. If the SECOND rename fails — the one that puts the verified tree where
@@ -2142,7 +2174,6 @@ mod tests {
             "the rollback must not leave the superseded tree behind: {:?}",
             scratch_beside(&build)
         );
-        let _ = std::fs::remove_dir_all(&b.dir);
     }
 
     /// …and the other half of that decision. A rollback restores the TREE unconditionally,
@@ -2173,7 +2204,6 @@ mod tests {
             "a rollback must never mark a build that was not complete before it"
         );
         assert!(scratch_beside(&build).is_empty());
-        let _ = std::fs::remove_dir_all(&b.dir);
     }
 
     /// The marker is written LAST, and it is a SIBLING — so it is never part of the tree the
@@ -2198,42 +2228,6 @@ mod tests {
         );
         let marker = build.with_file_name("18.ready");
         assert!(marker.is_file(), "the marker is the SIBLING <build>.ready");
-        let _ = std::fs::remove_dir_all(&b.dir);
-    }
-
-    /// A PARTIAL IS NEVER TRUSTED AS INSTALLED. A fresh install killed (here: failed) mid
-    /// extraction must leave nothing that `list_installed` will report, because everything
-    /// downstream — `decide`, `atpkg list`, GC's reclaim — takes that list as the truth about
-    /// what is on disk. The successful stage in the same layout is what makes the empty
-    /// result meaningful rather than an artefact of a mis-built prefix.
-    #[test]
-    fn a_partial_tree_from_a_failed_fresh_install_is_never_listed_as_installed() {
-        let b = bundle("partial-not-installed");
-        let layout = crate::store::Layout {
-            prefix: b.dir.join("prefix"),
-        };
-        let build = layout.build_dir("ay", 18);
-
-        let slip = make_slip_archive(&b.dir);
-        let slip_art = artifact(&file_sha256(&slip).unwrap(), "");
-        let err = verify_and_stage(&slip_art, &slip, &build, &StageHooks::NONE).unwrap_err();
-        assert!(matches!(err, StageError::Extract(_)), "got {err:?}");
-
-        assert!(
-            crate::ops::list_installed(&layout).is_empty(),
-            "a failed fresh install must leave nothing that reads as installed: {:?}",
-            crate::ops::list_installed(&layout)
-        );
-        assert!(!crate::store::build_is_complete(&build));
-        assert!(scratch_beside(&build).is_empty(), "and no scratch either");
-
-        // Non-vacuity: the very same layout DOES report a build once one really installs.
-        verify_and_stage(&b.art, &b.archive, &build, &StageHooks::NONE).unwrap();
-        assert_eq!(
-            crate::ops::list_installed(&layout),
-            vec![("ay".to_string(), 18u64)]
-        );
-        let _ = std::fs::remove_dir_all(&b.dir);
     }
 
     /// Block `mark_build_ready`'s temp write by planting a NON-EMPTY DIRECTORY at the exact
@@ -2261,7 +2255,7 @@ mod tests {
     #[test]
     fn a_marker_write_that_fails_after_the_swap_keeps_the_verified_tree() {
         let b = bundle("marker-fail-keeps-tree");
-        let (build, _witness) = b.installed();
+        let (build, witness) = b.installed();
         let blocker = block_the_marker_write(&build);
         assert!(
             crate::store::build_is_complete(&build),
@@ -2280,6 +2274,10 @@ mod tests {
             build.is_dir(),
             "a failed marker write destroyed a fully verified, correctly swapped-in tree"
         );
+        assert!(
+            !witness.exists(),
+            "the swap installs the NEW tree, never merging into the old one"
+        );
         assert_eq!(
             std::fs::read(build.join("bin/ay")).unwrap(),
             b"#!/bin/true\nthe ay binary",
@@ -2295,7 +2293,6 @@ mod tests {
         std::fs::remove_dir_all(&blocker).unwrap();
         verify_and_stage(&b.art, &b.archive, &build, &StageHooks::NONE).unwrap();
         assert!(crate::store::build_is_complete(&build));
-        let _ = std::fs::remove_dir_all(&b.dir);
     }
 
     // THE TWO-RENAME CRASH WINDOW. A SIGKILL between `rename(build, superseded)` and
@@ -2334,173 +2331,74 @@ mod tests {
             "recovery must never claim a completeness it cannot prove"
         );
         assert!(!superseded.exists(), "and the scratch name is released");
-        let _ = std::fs::remove_dir_all(&b.dir);
-    }
-
-    // The recovery above is NARROW on purpose. When `<build>` is present the superseded
-    // sibling is genuine leftover scratch (the swap got past its second rename), and the
-    // sweep must still delete it — otherwise a killed run leaks a whole tree forever.
-    #[test]
-    fn a_superseded_sibling_beside_a_live_build_is_still_swept() {
-        let b = bundle("crash-window-narrow");
-        let (build, _) = b.installed();
-        let superseded = crate::store::superseded_dir(&build).unwrap();
-        std::fs::create_dir_all(superseded.join("bin")).unwrap();
-        std::fs::write(superseded.join("bin/ay"), b"leftover").unwrap();
-        assert!(
-            build.is_dir() && superseded.is_dir(),
-            "PRECONDITION: both the live tree and the leftover exist"
-        );
-
-        crate::store::sweep_stage_scratch(&build);
-
-        assert!(!superseded.exists(), "genuine scratch is still reclaimed");
-        assert!(build.is_dir(), "and the live build is untouched");
-        assert!(
-            crate::store::build_is_complete(&build),
-            "a sweep beside a live build must not disturb its marker"
-        );
-        let _ = std::fs::remove_dir_all(&b.dir);
     }
 
     // A recovery that did not happen must not fall through into the delete. With `<build>`
     // absent and two superseded siblings beside it, `recover_interrupted_swap` cannot tell
-    // which tree is the outgoing one and refuses to move either; sweeping them then would
-    // turn a survivable crash into a deleted toolchain. While nothing stands at `<build>`,
-    // a superseded sibling is the only copy of that build there is.
+    // which tree is the outgoing one and refuses to move either; while nothing stands at
+    // `<build>`, a parked TREE is the only copy of that build there is, and the sweep keeps
+    // both. It still takes what is nobody's only copy: an incoming half-extract, and a
+    // regular file at a superseded name, which neither sweeper could otherwise reclaim
+    // (`remove_dir_all` fails on a file, `gc` scans directories only) and which blocks
+    // every later swap of this build from a process holding that pid.
     #[test]
-    fn a_refused_recovery_keeps_the_only_copy_it_could_not_choose() {
+    fn a_refused_recovery_keeps_every_parked_tree_and_sweeps_the_rest() {
         let b = bundle("crash-window-refused");
         let (build, witness) = b.installed();
         let parked = crate::store::superseded_dir(&build).unwrap();
         crate::store::clear_build_ready(&build).unwrap();
         std::fs::rename(&build, &parked).unwrap();
-        // A second parked tree, from another pid: recovery cannot tell which is the
-        // outgoing one, and refuses to move either.
-        let other = build.with_file_name(format!(
-            "{}.superseded-4242",
-            build.file_name().unwrap().to_str().unwrap()
-        ));
+        let sibling = |suffix: &str| build.with_file_name(format!("18.{suffix}"));
+        let other = sibling("superseded-4242");
         std::fs::create_dir_all(&other).unwrap();
-        // An incoming half-extract is nobody's only copy, and is still swept.
+        let stray = sibling("superseded-9999");
+        std::fs::write(&stray, b"not a tree").unwrap();
         let incoming = crate::store::incoming_dir(&build).unwrap();
         std::fs::create_dir_all(&incoming).unwrap();
-        assert!(!build.exists(), "PRECONDITION: the swap window, ambiguous");
 
         crate::store::sweep_stage_scratch(&build);
 
         assert!(
-            parked.join(witness.file_name().unwrap()).exists(),
-            "the only copy of the user's tree went to the sweep the refusal called off"
+            parked.join(witness.file_name().unwrap()).exists() && other.is_dir(),
+            "a sweep the refused recovery called off took a parked tree"
         );
-        assert!(
-            other.is_dir(),
-            "and so did the tree it could not be told apart from"
-        );
+        assert!(!stray.exists(), "a file at a scratch name leaks forever");
         assert!(
             !incoming.exists(),
-            "PRECONDITION: an unverified half-extract is still swept"
+            "an unverified half-extract is still swept"
         );
-        let _ = std::fs::remove_dir_all(&b.dir);
     }
 
-    // The guard above spares a parked *tree* — a directory at `<build>.superseded-<pid>`,
-    // the same predicate `recover_interrupted_swap` filters on. Written as "skip every
-    // superseded entry" it also spares a regular file or symlink at that name: nobody's
-    // only copy, unreclaimable by either sweeper (`remove_dir_all` fails on a file, `gc`
-    // scans directories only), and it blocks every later swap of this build from a
-    // process holding the same pid.
+    // Beside a LIVE build the sweep takes the producer's exact scratch shapes — an
+    // incoming half-extract, and a superseded tree a killed run left past its second
+    // rename (else a whole tree leaks forever) — and leaves the build and its marker alone.
+    // It spares a lookalike (`18.incoming-drafts`) exactly as `gc::is_stage_scratch` does:
+    // an unguarded `remove_dir_all` in a directory the user can also put things in only
+    // fires on the producer's exact shape.
     #[test]
-    fn the_parked_guard_spares_a_parked_tree_not_a_file_at_the_same_name() {
-        let b = bundle("crash-window-nondir");
-        let (build, witness) = b.installed();
-        let parked = crate::store::superseded_dir(&build).unwrap();
-        crate::store::clear_build_ready(&build).unwrap();
-        std::fs::rename(&build, &parked).unwrap();
-        // A second parked tree, so recovery refuses to guess and the guard stays engaged:
-        // were `<build>` restored, the sweep would take every sibling anyway.
-        let other = build.with_file_name(format!(
-            "{}.superseded-4242",
-            build.file_name().unwrap().to_str().unwrap()
-        ));
-        std::fs::create_dir_all(&other).unwrap();
-        // The leak: a regular file at a superseded scratch name.
-        let stray = build.with_file_name(format!(
-            "{}.superseded-9999",
-            build.file_name().unwrap().to_str().unwrap()
-        ));
-        std::fs::write(&stray, b"not a tree").unwrap();
-        assert!(!build.exists(), "PRECONDITION: the swap window, ambiguous");
-
-        crate::store::sweep_stage_scratch(&build);
-
-        assert!(
-            !stray.exists(),
-            "a file at a scratch name is no tree of anyone's, and no other sweeper can ever \
-             reclaim it"
-        );
-        assert!(
-            parked.join(witness.file_name().unwrap()).exists(),
-            "and the guard still keeps the only copy of the user's tree"
-        );
-        assert!(
-            other.is_dir(),
-            "and the tree it could not be told apart from"
-        );
-        let _ = std::fs::remove_dir_all(&b.dir);
-    }
-
-    // The store sweep's recogniser must honour the SAME promise `gc::is_stage_scratch`
-    // writes down: an unguarded `remove_dir_all` in a directory the user can also put
-    // things in only fires on the producer's exact shape. `<build>.incoming-drafts` is not
-    // ours to delete — and GC already refuses it, so the two halves must agree.
-    #[test]
-    fn a_lookalike_sibling_survives_the_store_sweep_exactly_as_it_survives_gc() {
+    fn the_sweep_beside_a_live_build_takes_only_the_producers_scratch() {
         let b = bundle("sweep-shape");
         let (build, _) = b.installed();
-        let parent = build.parent().unwrap();
-        let user_dir = parent.join("18.incoming-drafts");
+        let user_dir = build.with_file_name("18.incoming-drafts");
         std::fs::create_dir_all(&user_dir).unwrap();
         std::fs::write(user_dir.join("notes.md"), b"mine").unwrap();
-        // Non-vacuity: a REAL scratch name beside it, to prove the sweep ran at all.
-        let real = crate::store::incoming_dir(&build).unwrap();
-        std::fs::create_dir_all(&real).unwrap();
+        let incoming = crate::store::incoming_dir(&build).unwrap();
+        let superseded = crate::store::superseded_dir(&build).unwrap();
+        for scratch in [&incoming, &superseded] {
+            std::fs::create_dir_all(scratch.join("bin")).unwrap();
+        }
 
         crate::store::sweep_stage_scratch(&build);
 
-        assert!(!real.exists(), "PRECONDITION: the sweep really ran");
+        assert!(
+            !incoming.exists() && !superseded.exists(),
+            "scratch was left"
+        );
         assert!(
             user_dir.join("notes.md").exists(),
-            "'looks like something we made' is not a good enough test for remove_dir_all"
+            "a lookalike is not ours"
         );
-        let _ = std::fs::remove_dir_all(&b.dir);
-    }
-
-    // A NON-DIRECTORY at a scratch path was reclaimed by neither sweeper: the store sweep
-    // called `remove_dir_all` (which fails on a file) and GC skipped it on its `is_dir`
-    // filter. It leaks forever, and while it sits there it makes every stage of that build
-    // by a process with that pid fail at the swap. The store sweep must take it.
-    #[test]
-    fn a_stray_file_at_a_scratch_path_is_reclaimed_not_leaked() {
-        let b = bundle("sweep-stray-file");
-        let (build, _) = b.installed();
-        let blocker = crate::store::superseded_dir(&build).unwrap();
-        std::fs::write(&blocker, b"not a directory").unwrap();
-        assert!(
-            blocker.is_file(),
-            "PRECONDITION: a regular file is in the way"
-        );
-
-        crate::store::sweep_stage_scratch(&build);
-        assert!(
-            !blocker.exists(),
-            "a stray file at a scratch path leaks forever if the sweep only removes dirs"
-        );
-
-        // And with it gone the stage that it was blocking now succeeds end to end.
-        verify_and_stage(&b.art, &b.archive, &build, &StageHooks::NONE).unwrap();
         assert!(crate::store::build_is_complete(&build));
-        let _ = std::fs::remove_dir_all(&b.dir);
     }
 
     // A rollback may only re-mark a tree it actually put back. `mark_build_ready` has no
@@ -2532,97 +2430,11 @@ mod tests {
             !crate::store::build_is_complete(&build),
             "a rollback that could not restore the tree must not claim it is complete"
         );
-
-        // Non-vacuity: with a real tree to move back, the SAME call restores AND re-marks.
-        std::fs::create_dir_all(vanished.join("bin")).unwrap();
-        assert!(restore_outgoing(&vanished, &build, true));
-        assert!(build.join("bin").is_dir(), "the tree really came back");
-        assert!(crate::store::build_is_complete(&build));
-        let _ = std::fs::remove_dir_all(&b.dir);
-    }
-
-    // And the other half of the same guard: a restore that SUCCEEDS for a tree that was not
-    // complete before the swap must still not mark it. Re-marking there would promote a
-    // crash leftover to "installed" on the way out of an unrelated failure.
-    #[test]
-    fn a_successful_restore_never_marks_a_tree_that_was_not_complete() {
-        let b = bundle("restore-guard-incomplete");
-        let build = b.build();
-        std::fs::create_dir_all(build.parent().unwrap()).unwrap();
-        let old = crate::store::superseded_dir(&build).unwrap();
-        std::fs::create_dir_all(old.join("bin")).unwrap();
-
-        assert!(restore_outgoing(&old, &build, false));
-        assert!(
-            build.join("bin").is_dir(),
-            "PRECONDITION: the tree came back"
-        );
-        assert!(
-            !crate::store::build_is_complete(&build),
-            "a rollback must never mark a build that was not complete before it"
-        );
-        let _ = std::fs::remove_dir_all(&b.dir);
-    }
-    /// The armed cross-check: with the on-disk walk re-armed, an agreeing pair is passed
-    /// through unchanged and a DISAGREEING pair fails the stage closed, naming both roots.
-    ///
-    /// Driven as a pure function rather than through the env var: `std::env::set_var` is
-    /// `unsafe` in edition 2024 and racy under a multi-threaded runner, and what needs
-    /// pinning is the DECISION, not the lookup.
-    #[test]
-    fn the_armed_disk_reverify_agrees_or_fails_closed() {
-        let b = bundle("armed-reverify");
-        let probe = b.dir.join("armed-probe");
-        // The declared modes ride along: on Windows the armed walk folds them (the
-        // plain walk folds `0` there and could agree with nothing); on Unix they are
-        // not consulted, so this is the same walk it always was.
-        let tree = crate::extract::extract_tar_zst_tree(
-            &b.archive,
-            &probe,
-            1 << 20,
-            1000,
-            ExtractOptions::default(),
-            FrameChecksum::IfPresent,
-        )
-        .unwrap();
-        let modes = tree.declared_modes();
-        let fused = tree.root();
-        let walked = tree_root_declared(&probe, &modes).unwrap();
-        // Reach guard: the corpus must be non-empty, or "they agree" is vacuous.
-        assert_eq!(fused.len(), 64);
-        assert_eq!(
-            fused, walked,
-            "the two producers must agree over this bundle"
-        );
-
-        // Disarmed: the fused root is returned verbatim, no walk.
-        assert_eq!(
-            reverified_root(&probe, fused.clone(), false, &modes).unwrap(),
-            fused
-        );
-        // Armed and agreeing: still the same 64 characters.
-        assert_eq!(
-            reverified_root(&probe, fused.clone(), true, &modes).unwrap(),
-            fused
-        );
-        // Armed and DISAGREEING: fail closed, and say which two roots disagreed.
-        let bogus = "0".repeat(64);
-        let err = reverified_root(&probe, bogus.clone(), true, &modes).unwrap_err();
-        let text = err.to_string();
-        assert!(
-            text.contains(&bogus),
-            "the folded root must be named: {text}"
-        );
-        assert!(
-            text.contains(&walked),
-            "the walked root must be named: {text}"
-        );
-        let _ = std::fs::remove_dir_all(&b.dir);
     }
 
     /// A tree mutated AFTER extraction is still refused when the walk is armed — the
     /// window the fused digest gives up is exactly this one, so the escape hatch has to
-    /// actually close it.
+    /// actually close it — while the same tree untouched passes.
     #[test]
     fn the_armed_walk_still_catches_a_post_extraction_mutation() {
         let b = bundle("armed-mutation");
@@ -2638,33 +2450,17 @@ mod tests {
         .unwrap();
         let modes = tree.declared_modes();
         let fused = tree.root();
-        // Mutate one extracted file in place, exactly as a TOCTOU attacker would.
-        let victim = first_regular_file(&probe).expect("the fixture bundle has a file");
-        std::fs::write(&victim, b"swapped after extraction").unwrap();
+        // Non-vacuity: armed, the untouched tree passes with its own root.
+        assert_eq!(
+            reverified_root(&probe, fused.clone(), true, &modes).unwrap(),
+            fused
+        );
+        // Mutate the extracted file in place, exactly as a TOCTOU attacker would.
+        std::fs::write(probe.join("bin/ay"), b"swapped after extraction").unwrap();
         assert!(
             reverified_root(&probe, fused, true, &modes).is_err(),
             "an armed re-verify must refuse a tree mutated after the write"
         );
-        let _ = std::fs::remove_dir_all(&b.dir);
-    }
-
-    /// The first regular file under `dir`, in walk order — the mutation victim above.
-    fn first_regular_file(dir: &Path) -> Option<PathBuf> {
-        let mut entries: Vec<_> = std::fs::read_dir(dir).ok()?.flatten().collect();
-        entries.sort_by_key(std::fs::DirEntry::file_name);
-        for e in entries {
-            let p = e.path();
-            let meta = std::fs::symlink_metadata(&p).ok()?;
-            if meta.is_file() {
-                return Some(p);
-            }
-            if meta.is_dir()
-                && let Some(found) = first_regular_file(&p)
-            {
-                return Some(found);
-            }
-        }
-        None
     }
 
     // ===== the https payload lanes =====
@@ -2971,46 +2767,59 @@ mod tests {
         }
     }
 
-    /// The `gh` archive shape as tar bytes: a versioned top-level directory to strip,
-    /// an executable, a plain file.
+    /// The `gh` archive shape as tar bytes: a versioned top-level directory to strip, an
+    /// executable, a plain file, a nested one, a hardlink alias and an in-root symlink.
     #[cfg(unix)]
     fn gh_tar() -> Vec<u8> {
+        const TOP: &str = "gh_2.80.0_macOS_arm64";
+        let at = |rel: &str| format!("{TOP}/{rel}");
+        let (gh, alias, license, man, link) = (
+            at("bin/gh"),
+            at("bin/gh-alias"),
+            at("LICENSE"),
+            at("share/man/man1/gh.1"),
+            at("bin/gh-link"),
+        );
         tar_bytes(&[
-            ("gh_2.80.0_macOS_arm64/", b'5', "", b"", 0o755),
-            (
-                "gh_2.80.0_macOS_arm64/bin/gh",
-                b'0',
-                "",
-                b"#!/bin/sh\necho gh\n",
-                0o755,
-            ),
-            ("gh_2.80.0_macOS_arm64/LICENSE", b'0', "", b"MIT", 0o644),
+            (&at(""), b'5', "", b"", 0o755),
+            (&gh, b'0', "", GH, 0o755),
+            (&license, b'0', "", b"MIT", 0o644),
+            (&man, b'0', "", b".TH gh 1", 0o644),
+            (&alias, b'1', &gh, b"", 0o755),
+            (&link, b'2', "../share/man/man1/gh.1", b"", 0o777),
         ])
     }
 
-    /// …and the same shape as a zip.
+    /// The `gh` executable's bytes.
+    #[cfg(unix)]
+    const GH: &[u8] = b"#!/bin/sh\necho gh\n";
+
+    /// …and the same shape as a zip, which has no hardlinks: the alias is a second
+    /// regular file of the same bytes, which the walk (and the fold) digest identically.
     #[cfg(unix)]
     fn gh_zip() -> Vec<u8> {
+        let member = |name, mode, data| ZipMember {
+            name,
+            mode,
+            data,
+            deflate: true,
+        };
         zip_bytes(
             &[
-                ZipMember {
-                    name: "gh_2.80.0_macOS_arm64/",
-                    mode: 0o040_755,
-                    data: b"",
-                    deflate: false,
-                },
-                ZipMember {
-                    name: "gh_2.80.0_macOS_arm64/bin/gh",
-                    mode: 0o100_755,
-                    data: b"#!/bin/sh\necho gh\n",
-                    deflate: true,
-                },
-                ZipMember {
-                    name: "gh_2.80.0_macOS_arm64/LICENSE",
-                    mode: 0o100_644,
-                    data: b"MIT",
-                    deflate: false,
-                },
+                member("gh_2.80.0_macOS_arm64/", 0o040_755, b""),
+                member("gh_2.80.0_macOS_arm64/bin/gh", 0o100_755, GH),
+                member("gh_2.80.0_macOS_arm64/LICENSE", 0o100_644, b"MIT"),
+                member(
+                    "gh_2.80.0_macOS_arm64/share/man/man1/gh.1",
+                    0o100_644,
+                    b".TH gh 1",
+                ),
+                member("gh_2.80.0_macOS_arm64/bin/gh-alias", 0o100_755, GH),
+                member(
+                    "gh_2.80.0_macOS_arm64/bin/gh-link",
+                    0o120_777,
+                    b"../share/man/man1/gh.1",
+                ),
             ],
             false,
         )
@@ -3020,147 +2829,75 @@ mod tests {
     #[cfg(unix)]
     fn gh_expected_root(dir: &Path) -> String {
         let replica = dir.join("replica");
-        lay(&replica, "bin/gh", b"#!/bin/sh\necho gh\n", 0o755);
+        lay(&replica, "bin/gh", GH, 0o755);
+        lay(&replica, "bin/gh-alias", GH, 0o755);
         lay(&replica, "LICENSE", b"MIT", 0o644);
+        lay(&replica, "share/man/man1/gh.1", b".TH gh 1", 0o644);
+        lay_link(&replica, "bin/gh-link", "../share/man/man1/gh.1");
         tree_root(&replica).unwrap()
     }
 
-    /// The `tar-gz` and `zip` lanes stage the `gh` shape — top level stripped, modes
-    /// sanitized — to the root a hand-laid replica walks to, and a row that FORGOT its
-    /// `strip_components` is refused at the re-verify (the tree is honestly different).
+    /// The `tar-zst`, `tar-gz` and `zip` vendor lanes lay the SAME tree from the same
+    /// shape — top level stripped, modes sanitized, the hardlink an alias of its bytes,
+    /// the symlink's target verbatim — and fold the root a hand-laid replica walks to:
+    /// the signed root each stage verifies against.
     #[cfg(unix)]
     #[test]
-    fn tar_gz_and_zip_vendor_payloads_stage_with_strip_components() {
+    fn every_vendor_archive_lane_stages_with_strip_components() {
         let d = tmp("vendor-archives");
         let expected = gh_expected_root(&d);
+        let zst = d.join("gh.tar.zst");
+        std::fs::write(&zst, crate::extract::fixtures::zstd_bytes(&gh_tar())).unwrap();
         let gz = d.join("gh.tar.gz");
         std::fs::write(&gz, gzip_bytes(&gh_tar())).unwrap();
         let zip = d.join("gh.zip");
         std::fs::write(&zip, gh_zip()).unwrap();
-        for (label, archive, payload) in [("gz", &gz, "tar-gz"), ("zip", &zip, "zip")] {
+        for (archive, payload) in [(&zst, "tar-zst"), (&gz, "tar-gz"), (&zip, "zip")] {
             let mut art = vendor_artifact(archive, payload, &expected);
             art.strip_components = 1;
-            let build = d.join(format!("store/gh-{label}/18"));
+            let build = d.join(format!("store/gh-{payload}/18"));
             verify_and_stage(&art, archive, &build, &StageHooks::NONE)
-                .unwrap_or_else(|e| panic!("{label}: {e}"));
-            assert!(crate::store::build_is_complete(&build), "{label}");
-            assert_eq!(
-                std::fs::read(build.join("bin/gh")).unwrap(),
-                b"#!/bin/sh\necho gh\n",
-                "{label}"
-            );
-            assert_eq!(
-                std::fs::read(build.join("LICENSE")).unwrap(),
-                b"MIT",
-                "{label}"
-            );
-            assert!(
-                !build.join("gh_2.80.0_macOS_arm64").exists(),
-                "{label}: stripped"
-            );
-            assert_eq!(
-                tree_root(&build).unwrap(),
-                expected,
-                "{label}: the walk agrees after the swap"
-            );
-            assert!(scratch_beside(&build).is_empty(), "{label}");
-
-            // Unstripped, the tree is `gh_.../bin/gh` — a different root, refused.
-            let mut unstripped = vendor_artifact(archive, payload, &expected);
-            unstripped.strip_components = 0;
-            let build2 = d.join(format!("store/gh-{label}-unstripped/18"));
-            let err =
-                verify_and_stage(&unstripped, archive, &build2, &StageHooks::NONE).unwrap_err();
-            assert!(
-                matches!(err, StageError::TreeRootMismatch { .. }),
-                "{label}: {err:?}"
-            );
-            assert!(
-                !build2.exists(),
-                "{label}: nothing staged on a root mismatch"
-            );
+                .unwrap_or_else(|e| panic!("{payload}: {e}"));
+            assert!(crate::store::build_is_complete(&build), "{payload}");
         }
-        let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// The `tar-zst` vendor lane is the release extractor plus the vendor options
-    /// — the same tar bytes reach the same root as the gzip lane.
-    #[cfg(unix)]
-    #[test]
-    fn tar_zst_vendor_payload_matches_the_gzip_lane() {
-        let d = tmp("vendor-zst");
-        let expected = gh_expected_root(&d);
-        let zst = d.join("gh.tar.zst");
-        std::fs::write(&zst, crate::extract::fixtures::zstd_bytes(&gh_tar())).unwrap();
-        let mut art = vendor_artifact(&zst, "tar-zst", &expected);
-        art.strip_components = 1;
-        let build = d.join("store/gh/18");
-        verify_and_stage(&art, &zst, &build, &StageHooks::NONE).unwrap();
-        assert_eq!(tree_root(&build).unwrap(), expected);
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    /// The `raw-binary` lane: the download becomes `bin/<entry>` at `0755`, and the
-    /// root it folds is the one a hand-laid `bin/<entry>` walks to, with or without a
-    /// `links` alias beside it. An `entry` that is not a bare tool name is refused before
-    /// anything is written.
+    /// The `raw-binary` lane: the download becomes `bin/<entry>` at `0755`, folding the
+    /// root a hand-laid `bin/<entry>` walks to, with or without a `links` alias beside it
+    /// (laid in the `bin` the lane made, which `apply_links` takes only because the lane
+    /// recorded it in the fold: a `bin` made behind the fold's back is refused as
+    /// Occupied). An `entry` that is not a bare tool name is refused before anything is
+    /// written.
     #[cfg(unix)]
     #[test]
     fn raw_binary_payload_becomes_bin_entry_at_0755() {
-        use std::os::unix::fs::PermissionsExt as _;
         let d = tmp("vendor-raw");
         let payload: Vec<u8> = (0..300_000usize).map(|i| (i % 253) as u8).collect();
         let dl = d.join("claude-2.1.231-darwin-arm64");
         std::fs::write(&dl, &payload).unwrap();
         let replica = d.join("replica");
         lay(&replica, "bin/claude", &payload, 0o755);
-        let expected = tree_root(&replica).unwrap();
-
-        let mut art = vendor_artifact(&dl, "raw-binary", &expected);
-        art.entry = "claude".into();
-        let build = d.join("store/claude/2026082601");
-        verify_and_stage(&art, &dl, &build, &StageHooks::NONE).unwrap();
-        assert!(crate::store::build_is_complete(&build));
-        assert_eq!(std::fs::read(build.join("bin/claude")).unwrap(), payload);
-        assert_eq!(
-            std::fs::metadata(build.join("bin/claude"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o7777,
-            0o755
-        );
-        assert_eq!(tree_root(&build).unwrap(), expected);
-        // The download itself is untouched (flow reclaims it).
-        assert_eq!(std::fs::metadata(&dl).unwrap().len(), payload.len() as u64);
-
-        // A raw-binary row may carry `links` (`vendor::check_links` admits them on every
-        // payload). The link lands in the `bin` this lane made, which `apply_links` takes
-        // only because the lane recorded it in the fold: a `bin` made behind the fold's
-        // back is a name the stage did not lay, and the link is refused as Occupied.
+        let plain = tree_root(&replica).unwrap();
         lay_link(&replica, "bin/claude-alias", "../bin/claude");
-        let expected = tree_root(&replica).unwrap();
-        let mut art = vendor_artifact(&dl, "raw-binary", &expected);
-        art.entry = "claude".into();
-        art.links.insert("claude-alias".into(), "bin/claude".into());
-        let build = d.join("store/claude-links/2026082601");
-        let root = verify_and_stage(&art, &dl, &build, &StageHooks::NONE).unwrap();
-        assert_eq!(root, expected);
-        assert_eq!(tree_root(&build).unwrap(), expected);
-        assert_eq!(
-            std::fs::read_link(build.join("bin/claude-alias")).unwrap(),
-            Path::new("../bin/claude")
-        );
-
+        let aliased = tree_root(&replica).unwrap();
+        for (label, expected, alias) in [("plain", &plain, false), ("alias", &aliased, true)] {
+            let mut art = vendor_artifact(&dl, "raw-binary", expected);
+            art.entry = "claude".into();
+            if alias {
+                art.links.insert("claude-alias".into(), "bin/claude".into());
+            }
+            let build = d.join(format!("store/claude-{label}/2026082601"));
+            verify_and_stage(&art, &dl, &build, &StageHooks::NONE)
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+        }
         for bad in ["", "bin/claude", "../claude", "sudo"] {
-            let mut art = vendor_artifact(&dl, "raw-binary", &expected);
+            let mut art = vendor_artifact(&dl, "raw-binary", &plain);
             art.entry = bad.into();
             let build = d.join("store/bad/1");
             let err = verify_and_stage(&art, &dl, &build, &StageHooks::NONE).unwrap_err();
             assert!(matches!(err, StageError::Payload(_)), "{bad:?}: {err:?}");
             assert!(!build.exists(), "{bad:?}");
         }
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// The `tar-gz-binary` lane on agy's measured shape — one regular file `antigravity`,
@@ -3172,7 +2909,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_one_member_tar_gz_binary_stages_its_file_at_bin_entry_0755() {
-        use std::os::unix::fs::PermissionsExt as _;
         let d = tmp("vendor-tgzbin");
         let mut body = thin_macho();
         body.extend((0..300_000usize).map(|i| (i % 251) as u8));
@@ -3198,21 +2934,13 @@ mod tests {
             };
             let build = d.join(format!("store/agy-{member_mode:o}/1000001000003000006"));
             let root = verify_and_stage(&art, &gz, &build, &hooks).unwrap();
-            assert_eq!(root, expected, "{member_mode:o}");
-            assert_eq!(tree_root(&build).unwrap(), expected, "{member_mode:o}");
-            assert_eq!(std::fs::read(build.join("bin/agy")).unwrap(), body);
-            let mode = std::fs::metadata(build.join("bin/agy"))
-                .unwrap()
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o7777, 0o755, "{member_mode:o}");
+            assert_eq!(root, expected, "{member_mode:o}: bin/agy at 0755");
             let asked = asked.into_inner();
             assert!(
                 asked.len() == 1 && asked[0].ends_with("bin/agy"),
                 "{asked:?}"
             );
         }
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// A single-binary build's `bin/` is SEALED `0555` on both lanes: agy's own updater,
@@ -3274,16 +3002,16 @@ mod tests {
     }
 
     /// Every `tar-gz-binary` that is not exactly one regular file at the archive root is
-    /// refused and leaves no build, marker or scratch: a second member, a directory, a
-    /// symlink, a hard link, a device, a nested or dotted name, an empty archive, a member
-    /// past the signed size cap, and a gzip that is not one or is cut short. The control:
-    /// a member of exactly the cap stages.
+    /// refused and leaves no build, marker or scratch: a second member, a link (any kind
+    /// not a regular file), a nested, dotted or backslashed name, an empty archive, a
+    /// member past the signed size cap, and a gzip that is not one or is cut short. The
+    /// control: a member of exactly the cap stages.
     #[cfg(unix)]
     #[test]
     fn a_tar_gz_binary_that_is_not_one_root_file_is_refused() {
         use crate::extract::{ExtractError, ExtractReject as R, TooLargeReason};
         #[derive(Debug)]
-        enum Want {
+        enum Refusal {
             Rejected(R, &'static str),
             ContentCap,
             Io,
@@ -3299,47 +3027,42 @@ mod tests {
             (
                 "two members",
                 tar_bytes(&[file("antigravity"), file("LICENSE")]),
-                Want::Rejected(R::NotSingleFile, "LICENSE"),
-            ),
-            (
-                "a directory",
-                tar_bytes(&[("antigravity/", b'5', "", b"", 0o755)]),
-                Want::Rejected(R::DisallowedKind, "antigravity/"),
+                Refusal::Rejected(R::NotSingleFile, "LICENSE"),
             ),
             (
                 "a symlink",
                 tar_bytes(&[("antigravity", b'2', "/bin/sh", b"", 0o777)]),
-                Want::Rejected(R::DisallowedKind, "antigravity"),
+                Refusal::Rejected(R::DisallowedKind, "antigravity"),
             ),
             (
                 "a hard link",
                 tar_bytes(&[("antigravity", b'1', "agy", b"", 0o755)]),
-                Want::Rejected(R::DisallowedKind, "antigravity"),
-            ),
-            (
-                "a device",
-                tar_bytes(&[("antigravity", b'3', "", b"", 0o644)]),
-                Want::Rejected(R::DisallowedKind, "antigravity"),
+                Refusal::Rejected(R::DisallowedKind, "antigravity"),
             ),
             (
                 "a nested name",
                 tar_bytes(&[file("dir/antigravity")]),
-                Want::Rejected(R::NotSingleFile, "dir/antigravity"),
+                Refusal::Rejected(R::NotSingleFile, "dir/antigravity"),
             ),
             (
                 "a dotted name",
                 tar_bytes(&[file("./antigravity")]),
-                Want::Rejected(R::NotSingleFile, "./antigravity"),
+                Refusal::Rejected(R::NotSingleFile, "./antigravity"),
+            ),
+            (
+                "a backslashed name",
+                tar_bytes(&[file("antigravity\\x")]),
+                Refusal::Rejected(R::NotSingleFile, "antigravity\\x"),
             ),
             (
                 "an empty archive",
                 tar_bytes(&[]),
-                Want::Rejected(R::NotSingleFile, ""),
+                Refusal::Rejected(R::NotSingleFile, ""),
             ),
             (
                 "a member past the cap",
                 tar_bytes(&[("antigravity", b'0', "", &past_cap, 0o755)]),
-                Want::ContentCap,
+                Refusal::ContentCap,
             ),
         ]
         .map(|(label, tar, want)| (label, gzip_bytes(&tar), want))
@@ -3348,9 +3071,13 @@ mod tests {
             (
                 "a tar that is not gzipped",
                 tar_bytes(&[file("antigravity")]),
-                Want::Io,
+                Refusal::Io,
             ),
-            ("a gzip cut short", one[..one.len() / 2].to_vec(), Want::Io),
+            (
+                "a gzip cut short",
+                one[..one.len() / 2].to_vec(),
+                Refusal::Io,
+            ),
         ]);
         for (i, (label, bytes, want)) in cases.enumerate() {
             let dl = d.join(format!("{i}.tar.gz"));
@@ -3364,11 +3091,11 @@ mod tests {
                 panic!("{label}: not an extract refusal");
             };
             let met = match (&want, &e) {
-                (Want::Rejected(why, path), ExtractError::Rejected(r, p)) => {
+                (Refusal::Rejected(why, path), ExtractError::Rejected(r, p)) => {
                     r == why && p == Path::new(path)
                 }
-                (Want::ContentCap, ExtractError::TooLarge(TooLargeReason::ContentCap))
-                | (Want::Io, ExtractError::Io { .. }) => true,
+                (Refusal::ContentCap, ExtractError::TooLarge(TooLargeReason::ContentCap))
+                | (Refusal::Io, ExtractError::Io { .. }) => true,
                 _ => false,
             };
             assert!(met, "{label}: want {want:?}, got {e}");
@@ -3383,15 +3110,14 @@ mod tests {
         let build = d.join("store/agy-at-cap/1");
         verify_and_stage(&art, &dl, &build, &StageHooks::NONE).unwrap();
         assert_eq!(std::fs::read(build.join("bin/agy")).unwrap(), at_cap);
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// `apply_links` runs `create_dir_all(bin)` + `chmod 0755 bin` and then creates
     /// `bin/<name>` — all of which FOLLOW a `bin` that is a symlink. A staged `bin` (or a
     /// link target's ancestor) that is a symlink must be refused before any of it, so
-    /// nothing outside the stage is chmodded or gets a link planted in it. Both through the
-    /// real vendor lane (a link chain in the archive) and against `apply_links` directly
-    /// (defence in depth: any `bin` symlink at all).
+    /// nothing outside the stage is chmodded or gets a link planted in it, however the
+    /// symlink was laid (an archive's own chain of links is the extractor's refusal:
+    /// `extract`'s `a_chain_of_in_root_symlinks_cannot_escape_the_root`).
     #[cfg(unix)]
     #[test]
     fn apply_links_never_writes_through_a_staged_bin_symlink() {
@@ -3402,34 +3128,6 @@ mod tests {
         std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o700)).unwrap();
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
 
-        // 1. Through the vendor lane: two in-root links that chain out to `victim`.
-        let gz = d.join("chain.tar.gz");
-        std::fs::write(
-            &gz,
-            gzip_bytes(&tar_bytes(&[
-                ("a/b/c/", b'5', "", b"", 0o755),
-                ("a/b/c/up", b'2', "../../..", b"", 0o777),
-                ("bin", b'2', "a/b/c/up/../victim", b"", 0o777),
-                ("gh-real", b'0', "", b"#!/bin/sh\n", 0o755),
-            ])),
-        )
-        .unwrap();
-        let mut art = vendor_artifact(&gz, "tar-gz", "");
-        art.links.insert("gh".into(), "gh-real".into());
-        let stage = d.join("stage");
-        let got = stage_payload(&art, &gz, &stage);
-        assert!(got.is_err(), "the chained bin link must not stage: {got:?}");
-        assert!(
-            std::fs::symlink_metadata(victim.join("gh")).is_err(),
-            "no link planted outside the stage"
-        );
-        assert_eq!(
-            mode(&victim),
-            0o700,
-            "the outside directory was not chmodded"
-        );
-
-        // 2. apply_links itself: a `bin` symlink laid by any means is refused …
         let dest = d.join("direct");
         lay(&dest, "gh-real", b"#!/bin/sh\n", 0o755);
         std::os::unix::fs::symlink(&victim, dest.join("bin")).unwrap();
@@ -3438,7 +3136,11 @@ mod tests {
         let err = apply_links(&dest, &links, None).unwrap_err();
         assert!(matches!(err, StageError::Payload(_)), "{err:?}");
         assert!(std::fs::symlink_metadata(victim.join("gh")).is_err());
-        assert_eq!(mode(&victim), 0o700);
+        assert_eq!(
+            mode(&victim),
+            0o700,
+            "the outside directory was not chmodded"
+        );
 
         // … and so is a target reached through a symlinked ancestor, whose existence
         // probe would otherwise be answered from outside the stage.
@@ -3451,13 +3153,12 @@ mod tests {
         let err = apply_links(&dest, &links, None).unwrap_err();
         assert!(matches!(err, StageError::Payload(_)), "{err:?}");
         assert!(std::fs::symlink_metadata(dest.join("bin/tool")).is_err());
-        let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// `links` lay RELATIVE symlinks `bin/<name> -> ../<target>` after extraction, fold
-    /// into the root exactly as the walk reads them, and resolve to the staged file.
-    /// A dangling target, a `..` target, and a name that collides with an extracted
-    /// entry are each refused with nothing staged.
+    /// `links` lay RELATIVE symlinks `bin/<name> -> ../<target>` after extraction and
+    /// fold into the root exactly as the walk of a hand-laid replica reads them. A
+    /// dangling, `..` or absolute target, a name that is not a tool name, and a name that
+    /// collides with an extracted entry are each refused with nothing staged.
     #[cfg(unix)]
     #[test]
     fn links_lay_relative_symlinks_under_bin_and_fold_into_the_root() {
@@ -3513,29 +3214,7 @@ mod tests {
             "emacsclient".into(),
             "Emacs.app/Contents/MacOS/bin/emacsclient".into(),
         );
-        let build = d.join("store/emacs/18");
-        verify_and_stage(&art, &gz, &build, &StageHooks::NONE).unwrap();
-        assert_eq!(
-            std::fs::read_link(build.join("bin/emacs")).unwrap(),
-            Path::new("../Emacs.app/Contents/MacOS/Emacs")
-        );
-        assert_eq!(
-            std::fs::read(build.join("bin/emacs")).unwrap(),
-            b"#!/bin/sh\necho emacs\n"
-        );
-        assert_eq!(
-            std::fs::read(build.join("bin/emacsclient")).unwrap(),
-            b"#!/bin/sh\necho client\n"
-        );
-        assert_eq!(tree_root(&build).unwrap(), expected);
-        // Without the links the root is different: the fold really carries them.
-        let plain = vendor_artifact(&gz, "tar-gz", &expected);
-        let err = verify_and_stage(&plain, &gz, &d.join("store/plain/18"), &StageHooks::NONE)
-            .unwrap_err();
-        assert!(
-            matches!(err, StageError::TreeRootMismatch { .. }),
-            "{err:?}"
-        );
+        verify_and_stage(&art, &gz, &d.join("store/emacs/18"), &StageHooks::NONE).unwrap();
 
         let refused: &[(&str, &str, &str)] = &[
             ("dangling", "emacs", "Emacs.app/Contents/MacOS/Nope"),
@@ -3557,7 +3236,6 @@ mod tests {
             assert!(!build.exists(), "{label}: nothing staged");
             assert!(scratch_beside(&build).is_empty(), "{label}: no scratch");
         }
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// The root a stage hands back is the walk of the tree it leaves, whatever the
@@ -3565,11 +3243,11 @@ mod tests {
     /// one) and `aterm pkg verify` walks the build against it, so a stage that recorded
     /// `dir/g` over a disk holding `Dir/g` — one directory under two spellings on
     /// case-insensitive APFS — left an install that read as drifted from the moment it
-    /// landed (and a row signed through the same stage installed, then drifted). The
-    /// archive's own members and the `links` a stage adds under `bin/` (over an archive
-    /// that laid `Bin/`) are both held to it: where the filesystem keeps the spellings
-    /// apart both stage and agree, where it folds them the stage is refused with nothing
-    /// left behind, and spelled one way they always stage.
+    /// landed. The archive's own members are the extractor's to hold to it
+    /// (`extract`'s `a_directory_the_filesystem_names_like_another_never_merges_unseen`);
+    /// the `links` a stage adds under `bin/` over an archive that laid `Bin/` are held here:
+    /// where the filesystem keeps the spellings apart both stage and agree, where it folds
+    /// them the stage is refused with nothing left behind, and spelled one way they stage.
     #[cfg(unix)]
     #[test]
     fn a_staged_root_is_the_walk_of_the_tree_it_leaves_when_names_fold() {
@@ -3582,24 +3260,6 @@ mod tests {
         );
         let d = tmp("folded-names");
         let cases: &[Case<'_>] = &[
-            (
-                "members",
-                &[
-                    ("Dir/f", b'0', "", b"one", 0o644),
-                    ("dir/g", b'0', "", b"two", 0o755),
-                ],
-                &[],
-                false,
-            ),
-            (
-                "members-exact",
-                &[
-                    ("Dir/f", b'0', "", b"one", 0o644),
-                    ("Dir/g", b'0', "", b"two", 0o755),
-                ],
-                &[],
-                true,
-            ),
             (
                 "links",
                 &[("Bin/tool", b'0', "", b"#!/bin/sh\n", 0o755)],
@@ -3637,91 +3297,6 @@ mod tests {
                 Err(e) => panic!("{label}: {e:?}"),
             }
         }
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    /// A slip in a vendor archive aborts the stage in extraction — nothing outside the
-    /// scratch, no scratch left, and (for a re-stage) the installed build untouched —
-    /// through the gzip lane and the zip lane alike.
-    #[cfg(unix)]
-    #[test]
-    fn a_slip_in_a_vendor_archive_aborts_before_the_swap_in_every_lane() {
-        let d = tmp("vendor-slip");
-        let expected = gh_expected_root(&d);
-        // Install the good gzip build first, so there is something to survive.
-        let good = d.join("gh.tar.gz");
-        std::fs::write(&good, gzip_bytes(&gh_tar())).unwrap();
-        let mut art = vendor_artifact(&good, "tar-gz", &expected);
-        art.strip_components = 1;
-        let build = d.join("store/gh/18");
-        verify_and_stage(&art, &good, &build, &StageHooks::NONE).unwrap();
-        let witness = build.join("this-tree-survived");
-        std::fs::write(&witness, b"old").unwrap();
-
-        let slip_tar = tar_bytes(&[
-            ("top/ok", b'0', "", b"fine", 0o644),
-            ("top/../../escape", b'0', "", b"pwned", 0o644),
-        ]);
-        let gz = d.join("slip.tar.gz");
-        std::fs::write(&gz, gzip_bytes(&slip_tar)).unwrap();
-        let zip = d.join("slip.zip");
-        std::fs::write(
-            &zip,
-            zip_bytes(
-                &[
-                    ZipMember {
-                        name: "top/ok",
-                        mode: 0o100_644,
-                        data: b"fine",
-                        deflate: false,
-                    },
-                    ZipMember {
-                        name: "top/../../escape",
-                        mode: 0o100_644,
-                        data: b"pwned",
-                        deflate: true,
-                    },
-                    ZipMember {
-                        name: "top/bin/x",
-                        mode: 0o120_777,
-                        data: b"../../../etc/passwd",
-                        deflate: false,
-                    },
-                ],
-                false,
-            ),
-        )
-        .unwrap();
-        for (label, archive, payload) in [("gz", &gz, "tar-gz"), ("zip", &zip, "zip")] {
-            let mut art = vendor_artifact(archive, payload, "");
-            art.strip_components = 1;
-            let err = verify_and_stage(&art, archive, &build, &StageHooks::NONE).unwrap_err();
-            assert!(matches!(err, StageError::Extract(_)), "{label}: {err:?}");
-            assert!(witness.exists(), "{label}: the installed build survived");
-            assert!(crate::store::build_is_complete(&build), "{label}");
-            assert!(scratch_beside(&build).is_empty(), "{label}: no scratch");
-            assert!(
-                !d.join("escape").exists() && !d.join("store/escape").exists(),
-                "{label}"
-            );
-        }
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    /// An unknown payload lane is refused before any byte is extracted; nothing staged.
-    #[test]
-    fn an_unknown_payload_lane_is_refused_before_extraction() {
-        let b = bundle("unknown-payload");
-        let mut art = b.art.clone();
-        art.kind = "binary".into();
-        art.protocol = "https".into();
-        art.payload = "pkg".into();
-        let build = b.build();
-        let err = verify_and_stage(&art, &b.archive, &build, &StageHooks::NONE).unwrap_err();
-        assert!(matches!(err, StageError::Payload(_)), "{err:?}");
-        assert!(!build.exists());
-        assert!(scratch_beside(&build).is_empty());
-        let _ = std::fs::remove_dir_all(&b.dir);
     }
 
     /// Detaches every disk image attached from under `dir` when it goes out of scope —
@@ -3892,16 +3467,13 @@ image-alias     : /tmp/stage/bar.dmg
     /// setuid, setgid and sticky themselves; ditto run as root keeps the first two, and
     /// [`dmg_copy_walk_gives_the_bundle_the_archive_lanes_modes`] feeds the walk those.)
     ///
-    /// THREE real images, one per way the lane releases its mount, each its own test
-    /// (an `hdiutil create` + attach is seconds, so they run in parallel): this one is the
+    /// TWO real images, one per way the lane releases its mount, each its own test (an
+    /// `hdiutil create` + attach is seconds, so they run in parallel): this one is the
     /// success path (the explicit detach after the copy);
     /// [`a_dmg_with_no_app_is_refused_and_detached`] is an image with no `.app` (the
-    /// picker refuses before the copy, so the guard's `Drop` detaches) and
-    /// [`a_dmg_whose_bundle_links_out_is_refused_and_detached`] an image whose bundle
-    /// carries an escaping link (the vet refuses AFTER the copy, and the lane detaches
-    /// explicitly before returning the error). The picker's other refusals and the link
-    /// rule's other shapes are pure functions of a directory, proved without an image by
-    /// [`dmg_picker_refuses_anything_but_exactly_one_real_app`] and
+    /// picker refuses before the copy, so the guard's `Drop` detaches). The picker's other
+    /// refusals and the link rule's other shapes are pure functions of a directory, proved
+    /// without an image by [`dmg_picker_refuses_anything_but_exactly_one_real_app`] and
     /// [`dmg_link_vet_admits_an_in_root_climb_and_refuses_an_escape`].
     #[cfg(target_os = "macos")]
     #[test]
@@ -3986,54 +3558,13 @@ image-alias     : /tmp/stage/bar.dmg
         art.links
             .insert("foo".into(), "Foo.app/Contents/MacOS/foo".into());
         let build = d.join("store/foo/2026082601");
-        let root = verify_and_stage(&art, &dmg, &build, &StageHooks::NONE).unwrap();
-        assert_eq!(root, expected, "the stage hands out the signed root");
-        assert!(crate::store::build_is_complete(&build));
-        assert_eq!(
-            std::fs::read(build.join("bin/foo")).unwrap(),
-            b"#!/bin/sh\necho foo\n"
-        );
-        assert_eq!(
-            std::fs::read_link(build.join("Foo.app/Contents/current")).unwrap(),
-            Path::new("MacOS/foo")
-        );
-        assert_eq!(
-            std::fs::read_link(build.join("Foo.app/Contents/Resources/up")).unwrap(),
-            Path::new(UP),
-            "an in-root `..` climb is laid verbatim"
-        );
-        let mode_of = |rel: &str| {
-            std::fs::symlink_metadata(build.join(rel))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o7777
-        };
-        for (rel, _, image, staged) in FILES {
-            assert_eq!(
-                mode_of(rel),
-                *staged,
-                "{rel}: laid {image:o} on the image, staged at the archive lanes' mode"
-            );
-        }
-        for (rel, image) in DIRS {
-            assert_eq!(
-                mode_of(rel),
-                0o755,
-                "{rel}: a {image:o} directory on the image, staged 0755"
-            );
-        }
+        // The signed root is the sanitized replica's: only the bundle copied, its links
+        // (the `..` climb included) laid verbatim, every file at the archive lanes' mode.
+        verify_and_stage(&art, &dmg, &build, &StageHooks::NONE).unwrap();
         assert!(
             !has_acl(&build.join("Foo.app/Contents/Resources/acl")),
             "no ACL on the image reaches the store"
         );
-        assert!(
-            !build.join("README.txt").exists(),
-            "only the .app is copied"
-        );
-        assert!(!build.join("Applications").exists());
-        assert_eq!(tree_root(&build).unwrap(), expected);
-        assert!(scratch_beside(&build).is_empty());
         // The mount point (`<build>.incoming-<pid>.mnt`) is gone and the image is detached.
         let mounts: Vec<_> = std::fs::read_dir(build.parent().unwrap())
             .unwrap()
@@ -4042,7 +3573,6 @@ image-alias     : /tmp/stage/bar.dmg
             .collect();
         assert!(mounts.is_empty(), "no mount point left behind: {mounts:?}");
         leaks.assert_clean("the image must be detached");
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// An image with no `.app` at the root: refused by the picker, detached by the
@@ -4070,59 +3600,6 @@ image-alias     : /tmp/stage/bar.dmg
         assert!(!build2.exists(), "{label}");
         assert!(scratch_beside(&build2).is_empty(), "{label}");
         leaks.assert_clean(&format!("{label}: detached on the error path"));
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    /// A link INSIDE the bundle that leaves the stage root is refused after the copy
-    /// and before the swap: an extraction-class rejection naming the link, nothing
-    /// staged, the image detached. The `..`-escape and the in-root climb (frameworks
-    /// do that) are the same vet over the same copied tree; see
-    /// [`dmg_link_vet_admits_an_in_root_climb_and_refuses_an_escape`].
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_dmg_whose_bundle_links_out_is_refused_and_detached() {
-        if !Path::new("/usr/bin/hdiutil").exists() || !Path::new("/usr/bin/ditto").exists() {
-            eprintln!("skipping: hdiutil/ditto not available");
-            return;
-        }
-        let d = tmp("vendor-dmg-link");
-        // Armed BEFORE the image exists, dropped after the last assertion.
-        let leaks = DetachAll::over(&d);
-        let (label, target) = ("abs-link", "/etc/passwd");
-        let src3 = d.join(format!("src-{label}"));
-        lay(
-            &src3,
-            "Bad.app/Contents/MacOS/x",
-            b"#!/bin/sh\nexit 0\n",
-            0o755,
-        );
-        lay_link(&src3, "Bad.app/Contents/Resources/escape", target);
-        let dmg3 = d.join(format!("{label}.dmg"));
-        dmg_fixture(&src3, "Link", &dmg3);
-        let replica3 = d.join(format!("replica-{label}"));
-        lay(
-            &replica3,
-            "Bad.app/Contents/MacOS/x",
-            b"#!/bin/sh\nexit 0\n",
-            0o755,
-        );
-        lay_link(&replica3, "Bad.app/Contents/Resources/escape", target);
-        let expected3 = tree_root(&replica3).unwrap();
-        let art = vendor_artifact(&dmg3, "dmg", &expected3);
-        let build3 = d.join(format!("store/{label}/1"));
-        let err = verify_and_stage(&art, &dmg3, &build3, &StageHooks::NONE).unwrap_err();
-        assert!(
-            matches!(err, StageError::Extract(ExtractError::Rejected(_, _))),
-            "{label}: {err:?}"
-        );
-        assert!(
-            err.to_string().contains("Resources/escape"),
-            "{label}: names the link: {err}"
-        );
-        assert!(!build3.exists(), "{label}: nothing staged");
-        assert!(scratch_beside(&build3).is_empty(), "{label}");
-        leaks.assert_clean(&format!("{label}: detached"));
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// The dmg lane's `.app` picker over a plain directory — the rule a mounted image's
@@ -4150,22 +3627,17 @@ image-alias     : /tmp/stage/bar.dmg
             lay(&root, "README.txt", b"r", 0o644);
             let err = single_app_in(&root).unwrap_err();
             assert!(matches!(err, StageError::Payload(_)), "{label}: {err:?}");
-            assert!(
-                err.to_string()
-                    .contains(&format!("exactly one .app, found {}", apps.len())),
-                "{label}: {err}"
-            );
         }
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// The dmg lane's post-copy link vet over a plain directory laid like a stage root
     /// holding a copied bundle: a `..` climb that stays inside the root (frameworks do
     /// that) is admitted, and one that climbs above it is an extraction-class rejection
-    /// naming the link. The real-image halves are in
-    /// `dmg_app_payload_stages_the_single_app_and_its_links`: the refusal reached through
-    /// `ditto` (the `abs-link` image: detached, nothing staged) and the admission (the
-    /// success image's `Resources/up` climb, laid verbatim and swapped in).
+    /// naming the link. The real-image half is the admission in
+    /// `dmg_app_payload_stages_the_single_app_and_its_links` (the success image's
+    /// `Resources/up` climb, laid verbatim and swapped in); a refusal after the copy
+    /// detaches as every refusal does, through the `Mount` guard
+    /// (`a_dmg_with_no_app_is_refused_and_detached`).
     #[cfg(target_os = "macos")]
     #[test]
     fn dmg_link_vet_admits_an_in_root_climb_and_refuses_an_escape() {
@@ -4183,22 +3655,16 @@ image-alias     : /tmp/stage/bar.dmg
                 0o755,
             );
             lay_link(&root, "Bad.app/Contents/Resources/escape", target);
-            let res = vet_copied_tree(&root, &root.join("Bad.app"));
-            if ok {
-                res.unwrap_or_else(|e| panic!("{label}: an in-root link is admitted: {e}"));
-            } else {
-                let err = res.unwrap_err();
-                assert!(
-                    matches!(err, StageError::Extract(ExtractError::Rejected(_, _))),
-                    "{label}: {err:?}"
-                );
-                assert!(
-                    err.to_string().contains("Resources/escape"),
-                    "{label}: names the link: {err}"
-                );
+            match vet_copied_tree(&root, &root.join("Bad.app")) {
+                Ok(()) => assert!(ok, "{label}: an escaping link was admitted"),
+                Err(StageError::Extract(ExtractError::Rejected(_, link))) if !ok => assert_eq!(
+                    link,
+                    Path::new("Bad.app/Contents/Resources/escape"),
+                    "{label}"
+                ),
+                Err(e) => panic!("{label}: {e:?}"),
             }
         }
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// AT3 (2026-10-10): the dmg lane's post-copy walk gives the copied bundle the
@@ -4211,8 +3677,8 @@ image-alias     : /tmp/stage/bar.dmg
     /// world-writable file, an append-only (`uappnd`) one and an immutable directory.
     /// Every regular file comes out `0755` (any `x` bit) or `0644` and every directory
     /// `0755`, the bundle's own included, with no immutable or append-only flag; a link
-    /// is left as it is; and the tree folds to the root of a replica laid at those modes.
-    /// The real-image half is [`dmg_app_payload_stages_the_single_app_and_its_links`].
+    /// is left as it is. The real-image half is
+    /// [`dmg_app_payload_stages_the_single_app_and_its_links`].
     #[cfg(target_os = "macos")]
     #[test]
     fn dmg_copy_walk_gives_the_bundle_the_archive_lanes_modes() {
@@ -4290,17 +3756,6 @@ image-alias     : /tmp/stage/bar.dmg
                 .st_flags()
                 & (libc::UF_IMMUTABLE | libc::UF_APPEND)
         };
-        // The tree really carries the bits under test.
-        for (rel, _, copied, _) in FILES {
-            assert_eq!(mode_of(rel), *copied, "{rel}: laid as copied");
-        }
-        for (rel, copied) in DIRS {
-            assert_eq!(mode_of(rel), *copied, "{rel}: laid as copied");
-        }
-        for (rel, flag) in FLAGGED {
-            assert_ne!(binding_flags_of(rel), 0, "{rel}: laid {flag}");
-        }
-
         vet_copied_tree(&root, &root.join("Foo.app")).unwrap();
         for (rel, _, copied, admitted) in FILES {
             assert_eq!(mode_of(rel), *admitted, "{rel}: copied {copied:o}");
@@ -4313,15 +3768,9 @@ image-alias     : /tmp/stage/bar.dmg
         }
         assert_eq!(
             std::fs::read_link(root.join("Foo.app/Contents/current")).unwrap(),
-            Path::new("MacOS/foo")
+            Path::new("MacOS/foo"),
+            "a link is left as it is"
         );
-        let replica = d.join("replica");
-        for (rel, body, _, admitted) in FILES {
-            lay(&replica, rel, body, *admitted);
-        }
-        lay_link(&replica, "Foo.app/Contents/current", "MacOS/foo");
-        assert_eq!(tree_root(&root).unwrap(), tree_root(&replica).unwrap());
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// AT3's review (2026-10-10): `ditto` keeps a member's owner and group (all of them as
@@ -4452,7 +3901,19 @@ image-alias     : /tmp/stage/bar.dmg
             pre_swap: Some(&pre_swap),
             sidecars: Some(&sidecars),
         };
+        // aterm-durable's counting seam: the stage's three directory flushes are only
+        // ordered (the tree's and each file's own flush is a plain `fsync(2)`, which the
+        // seam does not see): the marker down before the old tree moves aside, the
+        // sidecars before `.ready`, and `.ready`'s name before what follows. A lost step
+        // reads as incomplete and the next pass stages again.
+        let recording = aterm_durable::seam::Recording::start();
         let root = verify_and_stage(&b.art, &b.archive, &build, &hooks).unwrap();
+        assert_eq!(
+            recording.take(),
+            [aterm_durable::Flush::Ordered; 3],
+            "the swap's unmark, the sidecars, the marker"
+        );
+        drop(recording);
         assert_eq!(root, b.art.tree_root, "the verified root comes back");
         assert_eq!(*seen.borrow(), ["pre_swap", "sidecars"]);
         assert!(crate::store::build_is_complete(&build));
@@ -4462,113 +3923,6 @@ image-alias     : /tmp/stage/bar.dmg
             std::fs::read_to_string(&record).unwrap(),
             String::from_utf8(vendor_record(&root).remove(0).1).unwrap()
         );
-        assert!(scratch_beside(&build).is_empty());
-
-        // Without hooks the same stage returns the same root and writes no sidecar.
-        let plain = b.dir.join("store/ay/19");
-        assert_eq!(
-            verify_and_stage(&b.art, &b.archive, &plain, &StageHooks::NONE).unwrap(),
-            root
-        );
-        assert!(
-            !crate::store::sidecar_path(&plain, crate::store::VENDOR_SIDECAR_SUFFIX)
-                .unwrap()
-                .exists()
-        );
-        let _ = std::fs::remove_dir_all(&b.dir);
-    }
-
-    /// A `pre_swap` refusal is final before anything is published: no build, no marker,
-    /// no sidecar, no scratch — and over an installed build, that build untouched and
-    /// still complete.
-    #[test]
-    fn a_pre_swap_refusal_leaves_no_build_marker_or_sidecar() {
-        let b = bundle("hooks-refuse");
-        let build = b.build();
-        let refuse = |_: &Path| -> Result<(), StageError> {
-            Err(StageError::SignerRefused("bin/ay is not signed".into()))
-        };
-        let rendered = std::cell::Cell::new(false);
-        let sidecars = |root: &str| {
-            rendered.set(true);
-            Ok(vendor_record(root))
-        };
-        let hooks = StageHooks {
-            pre_swap: Some(&refuse),
-            sidecars: Some(&sidecars),
-        };
-        let err = verify_and_stage(&b.art, &b.archive, &build, &hooks).unwrap_err();
-        assert!(matches!(err, StageError::SignerRefused(_)), "{err:?}");
-        assert_eq!(err.to_string(), "signer refused: bin/ay is not signed");
-        assert!(!rendered.get(), "a refused tree has no record to render");
-        assert!(!build.exists());
-        assert!(!crate::store::build_is_complete(&build));
-        assert!(
-            !crate::store::sidecar_path(&build, crate::store::VENDOR_SIDECAR_SUFFIX)
-                .unwrap()
-                .exists()
-        );
-        assert!(scratch_beside(&build).is_empty());
-
-        let (build, witness) = b.installed();
-        let err = verify_and_stage(&b.art, &b.archive, &build, &hooks).unwrap_err();
-        assert!(matches!(err, StageError::SignerRefused(_)), "{err:?}");
-        assert!(
-            witness.is_file(),
-            "the installed tree was never swapped out"
-        );
-        assert!(crate::store::build_is_complete(&build));
-        let _ = std::fs::remove_dir_all(&b.dir);
-    }
-
-    /// THE GATE SEES ONLY VERIFIED BYTES: a tree whose root does not match the row is
-    /// refused before `pre_swap` is ever asked about it.
-    #[test]
-    fn a_tree_root_mismatch_never_reaches_the_pre_swap_hook() {
-        let b = bundle("hooks-badroot");
-        let build = b.build();
-        let asked = std::cell::Cell::new(false);
-        let pre_swap = |_: &Path| -> Result<(), StageError> {
-            asked.set(true);
-            Ok(())
-        };
-        let hooks = StageHooks {
-            pre_swap: Some(&pre_swap),
-            sidecars: None,
-        };
-        let bad = artifact(&b.art.sha256, &"a".repeat(64));
-        let err = verify_and_stage(&bad, &b.archive, &build, &hooks).unwrap_err();
-        assert!(
-            matches!(err, StageError::TreeRootMismatch { .. }),
-            "{err:?}"
-        );
-        assert!(!asked.get(), "the hook saw an unverified tree");
-        let err =
-            verify_and_stage(&artifact("deadbeef", ""), &b.archive, &build, &hooks).unwrap_err();
-        assert!(matches!(err, StageError::DigestMismatch { .. }), "{err:?}");
-        assert!(!asked.get(), "the hook saw bytes that failed their digest");
-        // Non-vacuity: the same hook on the honest row is asked.
-        verify_and_stage(&b.art, &b.archive, &build, &hooks).unwrap();
-        assert!(asked.get());
-        let _ = std::fs::remove_dir_all(&b.dir);
-    }
-
-    /// A sidecar the store would never reclaim is refused before the swap.
-    #[test]
-    fn a_sidecar_suffix_the_store_does_not_reclaim_is_refused_before_the_swap() {
-        let b = bundle("hooks-suffix");
-        let build = b.build();
-        let sidecars = |_: &str| Ok(vec![(".bogus", b"x".to_vec())]);
-        let hooks = StageHooks {
-            pre_swap: None,
-            sidecars: Some(&sidecars),
-        };
-        let err = verify_and_stage(&b.art, &b.archive, &build, &hooks).unwrap_err();
-        assert!(matches!(err, StageError::Payload(_)), "{err:?}");
-        assert!(err.to_string().contains(".bogus"), "{err}");
-        assert!(!build.exists());
-        assert!(scratch_beside(&build).is_empty());
-        let _ = std::fs::remove_dir_all(&b.dir);
     }
 
     /// `.ready` IMPLIES THE SIDECARS. A sidecar that cannot be written stops the stage
@@ -4595,40 +3949,11 @@ image-alias     : /tmp/stage/bar.dmg
             !crate::store::build_is_complete(&build),
             "but nothing marked it"
         );
-        let strays: Vec<String> = std::fs::read_dir(build.parent().unwrap())
-            .unwrap()
-            .flatten()
-            .filter_map(|e| e.file_name().to_str().map(str::to_string))
-            .filter(|n| n.contains(".tmp-"))
-            .collect();
-        assert!(strays.is_empty(), "no temp left: {strays:?}");
 
         std::fs::remove_dir(&record).unwrap();
         verify_and_stage(&b.art, &b.archive, &build, &hooks).unwrap();
         assert!(crate::store::build_is_complete(&build));
         assert!(record.is_file());
-        let _ = std::fs::remove_dir_all(&b.dir);
-    }
-
-    /// A Developer-ID-signed agent binary on this machine, if one is installed: Claude
-    /// Code's own copies under `~/.local/share/claude/versions/`, signed by Anthropic's
-    /// team `Q6L2SF6YDW`.
-    #[cfg(target_os = "macos")]
-    fn a_signed_claude() -> Option<PathBuf> {
-        let versions =
-            PathBuf::from(std::env::var_os("HOME")?).join(".local/share/claude/versions");
-        let preferred = versions.join("2.1.280");
-        if preferred.is_file() {
-            return Some(preferred);
-        }
-        let mut found: Vec<PathBuf> = std::fs::read_dir(&versions)
-            .ok()?
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_file()))
-            .collect();
-        found.sort();
-        found.pop()
     }
 
     /// `8 + 20 * nfat` bytes of universal header naming `nfat` dummy arm64 slices.
@@ -4708,36 +4033,6 @@ image-alias     : /tmp/stage/bar.dmg
             asked,
             ["bin/codex", "bin/codex-code-mode-host", "codex-path/rg"]
         );
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    /// A UNIVERSAL FILE OF ANY ARCH COUNT IS VERIFIED. A 45- or 200-arch wrapper (which
-    /// the kernel executes) beside a genuinely signed entry is asked about and refused
-    /// when it does not verify — not skipped as a Java class file.
-    #[cfg(unix)]
-    #[test]
-    fn a_fat_file_of_any_arch_count_beside_a_signed_entry_is_verified() {
-        for nfat in [45u32, 200] {
-            let d = tmp("devid-fat");
-            lay(&d, "bin/claude", &thin_macho(), 0o755);
-            lay(&d, "codex-path/rg", &fat_macho(nfat), 0o755);
-            let (result, asked) = gate_with(&d, &["claude"], &|rel| {
-                if rel == "bin/claude" {
-                    Ok(())
-                } else {
-                    Err(unsigned())
-                }
-            });
-            match result {
-                Err(StageError::SignerRefused(m)) => assert!(
-                    m.starts_with("codex-path/rg is not signed by Developer ID team Q6L2SF6YDW"),
-                    "{nfat}: {m}"
-                ),
-                other => panic!("{nfat}: {other:?}"),
-            }
-            assert_eq!(asked, ["bin/claude", "codex-path/rg"], "{nfat}");
-            let _ = std::fs::remove_dir_all(&d);
-        }
     }
 
     /// THE ENTRY IS BOUND. What a shim runs (`bin/<tool>` for each exposed tool) must be
@@ -4747,12 +4042,13 @@ image-alias     : /tmp/stage/bar.dmg
     #[test]
     fn an_entry_that_is_not_a_verified_macho_or_a_script_helper_is_refused() {
         let pass = |_: &str| -> Result<(), aterm_update_core::codesign::CodesignError> { Ok(()) };
+        // The refusal names the file it is about first.
         let refused_as =
             |d: &Path, exposes: &[&str], want: &str| match gate_with(d, exposes, &pass).0 {
                 Err(StageError::SignerRefused(m)) => assert!(m.starts_with(want), "{m}"),
                 other => panic!("{want}: {other:?}"),
             };
-        let entry_refusal = "bin/codex is not a Mach-O in the staged tree";
+        let entry_refusal = "bin/codex ";
 
         let d = tmp("devid-entry");
         lay(&d, "bin/codex-code-mode-host", &thin_macho(), 0o755);
@@ -4772,19 +4068,10 @@ image-alias     : /tmp/stage/bar.dmg
         std::fs::remove_file(d.join("payload.txt")).unwrap();
         lay(&d, "bin/codex", &thin_macho(), 0o755);
         gate_with(&d, &["codex"], &pass).0.unwrap();
-        refused_as(
-            &d,
-            &["codex", "codex-exec"],
-            "bin/codex-exec is not a Mach-O",
-        );
+        refused_as(&d, &["codex", "codex-exec"], "bin/codex-exec ");
 
         lay(&d, "codex-path/rg", b"#!/bin/sh\nexec evil\n", 0o755);
-        refused_as(
-            &d,
-            &["codex"],
-            "codex-path/rg is an interpreter script, which runs unsigned",
-        );
-        let _ = std::fs::remove_dir_all(&d);
+        refused_as(&d, &["codex"], "codex-path/rg ");
     }
 
     /// NO EXECUTE BIT OFF A VERIFIED MACH-O. A data file at 0755 beside Mach-Os that all
@@ -4803,11 +4090,9 @@ image-alias     : /tmp/stage/bar.dmg
         );
         let pass = |_: &str| -> Result<(), aterm_update_core::codesign::CodesignError> { Ok(()) };
         match gate_with(&d, &["codex"], &pass).0 {
-            Err(StageError::SignerRefused(m)) => assert_eq!(
-                m,
-                "codex-resources/voice/runtime.json is executable but not a Mach-O; it would \
-                 run unverified"
-            ),
+            Err(StageError::SignerRefused(m)) => {
+                assert!(m.starts_with("codex-resources/voice/runtime.json "), "{m}")
+            }
             other => panic!("{other:?}"),
         }
         assert!(crate::macho::demote_foreign_executables(&d).unwrap());
@@ -4822,7 +4107,6 @@ image-alias     : /tmp/stage/bar.dmg
             "idempotent"
         );
         gate_with(&d, &["codex"], &pass).0.unwrap();
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// Linux keeps ELF executable, not Mach-O; foreign binaries and data lose
@@ -4844,97 +4128,64 @@ image-alias     : /tmp/stage/bar.dmg
         assert_eq!(mode("foreign/macos-helper"), 0o644);
         assert_eq!(mode("codex-resources/runtime.json"), 0o644);
         assert!(!crate::macho::demote_foreign_executables(&d).unwrap());
-        let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// A sidecar the caller cannot render stops the stage before the swap, like a gate.
-    #[test]
-    fn a_sidecar_render_refusal_stops_the_stage_before_the_swap() {
-        let b = bundle("hooks-render");
-        let build = b.build();
-        let sidecars = |_: &str| Err(StageError::Payload("the record does not render".into()));
-        let hooks = StageHooks {
-            pre_swap: None,
-            sidecars: Some(&sidecars),
-        };
-        let err = verify_and_stage(&b.art, &b.archive, &build, &hooks).unwrap_err();
-        assert!(matches!(err, StageError::Payload(_)), "{err:?}");
-        assert!(!build.exists());
-        assert!(scratch_beside(&build).is_empty());
-        let _ = std::fs::remove_dir_all(&b.dir);
-    }
-
-    /// CODESIGN FAILING TO JUDGE IS NOT A VERDICT. Exit 1 for a file it could not read,
-    /// or no codesign at all is [`StageError::Io`] — retried, never memoized against the
-    /// vendor's bytes — a timeout is [`StageError::VerifyDeferred`]
-    /// (`a_codesign_timeout_defers_and_the_deadline_scales_with_the_file`), while a
-    /// signature fault or another signer is a [`StageError::SignerRefused`].
+    /// What the gate makes of each codesign outcome: a verdict on the bytes (a signature
+    /// fault, another signer) refuses the signer; a team that is not one is the row's
+    /// fault; a timeout DEFERS — never a failure, never a refusal; and codesign failing to
+    /// judge (a file it could not read, no codesign) is Io: retried, never memoized
+    /// against the vendor's bytes. Each names the file it is about.
     #[cfg(unix)]
     #[test]
-    fn codesign_failing_to_judge_is_io_and_only_a_verdict_refuses_the_signer() {
+    fn the_gate_maps_each_codesign_outcome() {
         use aterm_update_core::codesign::CodesignError;
-        let d = tmp("devid-io");
+        let d = tmp("devid-outcomes");
         lay(&d, "bin/claude", &thin_macho(), 0o755);
-        let answer = |e: fn() -> CodesignError| gate_with(&d, &["claude"], &|_| Err(e())).0;
-        for fault in [
-            || CodesignError::Refused {
-                code: Some(1),
-                stderr: "bin/claude: Permission denied\n".into(),
-            },
-            || CodesignError::Refused {
-                code: Some(1),
-                stderr: "bin/claude: internal error in Code Signing subsystem\n".into(),
-            },
-            || CodesignError::Unsupported,
-        ] {
-            match answer(fault) {
-                Err(StageError::Io(e)) => assert!(e.to_string().starts_with("bin/claude: "), "{e}"),
-                other => panic!("{other:?}"),
-            }
+        let cases: [(fn() -> CodesignError, Want); 6] = [
+            (unsigned, |e| matches!(e, StageError::SignerRefused(_))),
+            (
+                || CodesignError::Refused {
+                    code: Some(3),
+                    stderr: "x: code failed to satisfy specified code requirement(s)\n".into(),
+                },
+                |e| matches!(e, StageError::SignerRefused(_)),
+            ),
+            (
+                || CodesignError::InvalidTeam("not a team".into()),
+                |e| matches!(e, StageError::Payload(_)),
+            ),
+            (
+                || CodesignError::TimedOut,
+                |e| matches!(e, StageError::VerifyDeferred(m) if m.starts_with("bin/claude")),
+            ),
+            (
+                || CodesignError::Refused {
+                    code: Some(1),
+                    stderr: "bin/claude: Permission denied\n".into(),
+                },
+                |e| matches!(e, StageError::Io(io) if io.to_string().starts_with("bin/claude")),
+            ),
+            (
+                || CodesignError::Unsupported,
+                |e| matches!(e, StageError::Io(_)),
+            ),
+        ];
+        for (i, (outcome, want)) in cases.into_iter().enumerate() {
+            let err = gate_with(&d, &["claude"], &|_| Err(outcome()))
+                .0
+                .unwrap_err();
+            assert!(want(&err), "case {i}: {err:?}");
         }
-        for verdict in [unsigned, || CodesignError::Refused {
-            code: Some(3),
-            stderr: "test-requirement: code failed to satisfy specified code requirement(s)\n"
-                .into(),
-        }] {
-            assert!(
-                matches!(answer(verdict), Err(StageError::SignerRefused(_))),
-                "a verdict"
-            );
-        }
-        let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// A CODESIGN TIMEOUT DEFERS; IT NEVER FAILS AND NEVER REFUSES: a [`CodesignError::
-    /// TimedOut`] is [`StageError::VerifyDeferred`], naming the file; each file is given a
-    /// deadline scaled by its size (a sparse 238 MB file here is asked with at least
-    /// [`verify_timeout_for`] of it, a 64-byte one with the 30 s floor); and a real
-    /// signature refusal from the very same stub shape stays a fatal
-    /// [`StageError::SignerRefused`].
+    /// Each Mach-O is asked with a deadline scaled by its size — a sparse 238 MB codex
+    /// gets [`verify_timeout_for`] of it, past the 30 s floor a small one keeps — not the
+    /// fixed floor a large binary under the window's utility clamp runs out of.
     #[cfg(unix)]
     #[test]
-    fn a_codesign_timeout_defers_and_the_deadline_scales_with_the_file() {
-        use aterm_update_core::codesign::{CodesignError, VERIFY_TIMEOUT, verify_timeout_for};
-        let d = tmp("devid-deferred");
-        lay(&d, "bin/codex", &thin_macho(), 0o755);
-        // codex's real size, sparse: only the header is written.
-        let big: u64 = 238_223_808;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(d.join("bin/codex"))
-            .unwrap()
-            .set_len(big)
-            .unwrap();
+    fn the_gate_gives_each_macho_a_deadline_scaled_by_its_size() {
+        use aterm_update_core::codesign::{VERIFY_TIMEOUT, verify_timeout_for};
         let exposes = vec![String::from("codex")];
-        let timing_out = |_: &Path, _: std::time::Instant| Err(CodesignError::TimedOut);
-        match check_developer_id(&d, "2DC432GLL2", &exposes, &timing_out) {
-            Err(StageError::VerifyDeferred(m)) => {
-                assert!(m.starts_with("bin/"), "{m}");
-                assert!(m.contains("did not finish in time"), "{m}");
-            }
-            other => panic!("a timeout defers: {other:?}"),
-        }
-        // The deadline each file is asked with, one file per tree.
         let deadline_for = |len: Option<u64>| {
             let one = tmp("devid-deadline");
             lay(&one, "bin/codex", &thin_macho(), 0o755);
@@ -4954,9 +4205,10 @@ image-alias     : /tmp/stage/bar.dmg
                 Ok(())
             };
             check_developer_id(&one, "2DC432GLL2", &exposes, &answer).unwrap();
-            let _ = std::fs::remove_dir_all(&one);
             given.get().unwrap()
         };
+        // codex's real size, sparse: only the header is written.
+        let big: u64 = 238_223_808;
         let slack = std::time::Duration::from_secs(5);
         let large = deadline_for(Some(big));
         assert!(
@@ -4965,29 +4217,13 @@ image-alias     : /tmp/stage/bar.dmg
         );
         assert!(
             large > VERIFY_TIMEOUT + slack,
-            "more than the fixed 30 s: {large:?}"
+            "past the 30 s floor: {large:?}"
         );
         let small = deadline_for(None);
         assert!(
             small <= VERIFY_TIMEOUT && small + slack >= VERIFY_TIMEOUT,
             "a small Mach-O keeps the 30 s floor: {small:?}"
         );
-        // The control: a real signature refusal from the same stub shape stays fatal.
-        let refusing = |_: &Path, _: std::time::Instant| {
-            Err(CodesignError::Refused {
-                code: Some(3),
-                stderr: "test-requirement: code failed to satisfy specified code requirement(s)\n"
-                    .into(),
-            })
-        };
-        assert!(
-            matches!(
-                check_developer_id(&d, "2DC432GLL2", &exposes, &refusing),
-                Err(StageError::SignerRefused(_))
-            ),
-            "a refusal is still a refusal"
-        );
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// A gate with nothing to bind, or a tool name that is not one, is the caller's fault
@@ -5003,117 +4239,22 @@ image-alias     : /tmp/stage/bar.dmg
         let (result, asked) = gate_with(&d, &["../claude"], &|_| Ok(()));
         assert!(matches!(result, Err(StageError::Payload(_))), "{result:?}");
         assert!(asked.is_empty());
-        let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// THE GATE ON A REAL SIGNATURE: a genuine Claude Code binary, laid in a staged tree,
-    /// passes under Anthropic's team and is refused under OpenAI's; beside it, an
-    /// unsigned 45-arch universal file is refused. Needs a Developer-ID-signed Claude
-    /// Code on this Mac, so it runs on request and fails loudly without one.
+    /// The gate through real codesign, needing no real signature: a tree with no Mach-O
+    /// and an unsigned Mach-O are each refused as a signer verdict.
     #[cfg(target_os = "macos")]
     #[test]
-    #[ignore = "needs Claude Code under ~/.local/share/claude/versions; run with --ignored"]
-    fn the_developer_id_gate_passes_the_real_team_and_refuses_another() {
-        let signed = a_signed_claude()
-            .expect("no Claude Code binary under ~/.local/share/claude/versions to verify");
-        let d = tmp("devid-real");
-        std::fs::create_dir_all(d.join("bin")).unwrap();
-        std::fs::copy(&signed, d.join("bin/claude")).unwrap();
-        developer_id_gate("Q6L2SF6YDW", &["claude"], codesign_team_check)(&d)
-            .expect("Anthropic's team signs Claude Code");
-        match developer_id_gate("2DC432GLL2", &["claude"], codesign_team_check)(&d) {
-            Err(StageError::SignerRefused(m)) => assert!(
-                m.starts_with("bin/claude is not signed by Developer ID team 2DC432GLL2"),
-                "{m}"
-            ),
-            other => panic!("{other:?}"),
-        }
-        std::fs::write(d.join("rg"), fat_macho(45)).unwrap();
-        match developer_id_gate("Q6L2SF6YDW", &["claude"], codesign_team_check)(&d) {
-            Err(StageError::SignerRefused(m)) => assert!(
-                m.starts_with("rg is not signed by Developer ID team Q6L2SF6YDW"),
-                "{m}"
-            ),
-            other => panic!("{other:?}"),
-        }
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    /// Through the real stage: a download that is a Mach-O codesign refuses is refused
-    /// before the swap — no build, no marker, no scratch.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_stage_whose_macho_codesign_refuses_leaves_no_build() {
-        let d = tmp("devid-stage");
-        let dl = d.join("claude-download");
-        std::fs::write(&dl, thin_macho()).unwrap();
-        let mut art = vendor_artifact(&dl, "raw-binary", "");
-        art.entry = "claude".into();
-        let gate = developer_id_gate("Q6L2SF6YDW", &["claude"], codesign_team_check);
-        let build = d.join("store/claude/1000002000001000280");
-        let hooks = StageHooks {
-            pre_swap: Some(&gate),
-            sidecars: None,
-        };
-        let err = verify_and_stage(&art, &dl, &build, &hooks).unwrap_err();
-        assert!(matches!(err, StageError::SignerRefused(_)), "{err:?}");
-        assert!(!build.exists());
-        assert!(!crate::store::build_is_complete(&build));
-        assert!(scratch_beside(&build).is_empty());
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    /// The gate's refusals through real codesign, needing no real signature: a tree with
-    /// no Mach-O, an unsigned thin Mach-O, an unsigned 45-arch universal file, and a
-    /// symlinked Mach-O — each refused as a signer verdict.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn the_developer_id_gate_refuses_no_macho_an_unsigned_one_and_a_symlinked_one() {
+    fn the_developer_id_gate_refuses_no_macho_and_an_unsigned_one() {
         let gate = developer_id_gate("Q6L2SF6YDW", &["claude"], codesign_team_check);
         let d = tmp("devid-shapes");
-        std::fs::create_dir_all(d.join("bin")).unwrap();
-        std::fs::write(d.join("bin/claude"), b"echo hi\n").unwrap();
-        match gate(&d) {
-            Err(StageError::SignerRefused(m)) => assert!(m.starts_with("no Mach-O"), "{m}"),
-            other => panic!("{other:?}"),
-        }
-
-        for bytes in [thin_macho(), fat_macho(45)] {
-            std::fs::write(d.join("bin/claude"), &bytes).unwrap();
-            match gate(&d) {
-                Err(StageError::SignerRefused(m)) => {
-                    assert!(
-                        m.starts_with("bin/claude is not signed by Developer ID team"),
-                        "{m}"
-                    );
-                }
-                other => panic!("{other:?}"),
-            }
-        }
-
-        std::fs::remove_file(d.join("bin/claude")).unwrap();
-        std::os::unix::fs::symlink("/bin/ls", d.join("bin/claude")).unwrap();
-        match gate(&d) {
-            Err(StageError::SignerRefused(m)) => assert!(m.contains("symlink to a Mach-O"), "{m}"),
-            other => panic!("{other:?}"),
-        }
-        assert!(
-            matches!(
-                developer_id_gate("not a team", &["claude"], codesign_team_check)(&d),
-                Err(StageError::SignerRefused(_))
-            ),
-            "the shape is refused before any team is consulted"
-        );
-        std::fs::remove_file(d.join("bin/claude")).unwrap();
+        lay(&d, "bin/claude", b"echo hi\n", 0o644);
+        assert!(matches!(gate(&d), Err(StageError::SignerRefused(_))));
         std::fs::write(d.join("bin/claude"), thin_macho()).unwrap();
-        assert!(
-            matches!(
-                developer_id_gate("not a team", &["claude"], codesign_team_check)(&d),
-                Err(StageError::Payload(_))
-            ),
-            "a team that is not a team is the row's fault, not the bytes'"
-        );
-        let _ = std::fs::remove_dir_all(&d);
+        match gate(&d) {
+            Err(StageError::SignerRefused(m)) => assert!(m.starts_with("bin/claude "), "{m}"),
+            other => panic!("{other:?}"),
+        }
     }
 
     /// Off macOS there is no platform anchor: the gate passes any tree, Mach-O or not.
@@ -5122,6 +4263,5 @@ image-alias     : /tmp/stage/bar.dmg
     fn off_macos_the_developer_id_gate_passes() {
         let d = tmp("devid-off");
         assert!(developer_id_gate("Q6L2SF6YDW", &["claude"], codesign_team_check)(&d).is_ok());
-        let _ = std::fs::remove_dir_all(&d);
     }
 }

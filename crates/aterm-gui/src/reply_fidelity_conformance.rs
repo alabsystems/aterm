@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 bind for `ReplyFidelity` (`aterm_spec::derive::reply_fidelity_model`):
+//! Tier-1 bind for `ReplyFidelity` (`aterm_models_effects::reply_fidelity_model`):
 //! once a forwarded verb has reached the child, no later failure may be
 //! reported to the client as `ERR forward`, and a failure before that must be.
 //!
@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::mpsc;
 
-use aterm_spec::derive::reply_fidelity_model;
+use aterm_models_effects::reply_fidelity_model;
 use aterm_spec::{interp, verify};
 
 use super::*;

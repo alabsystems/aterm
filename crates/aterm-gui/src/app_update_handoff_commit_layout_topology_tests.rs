@@ -32,6 +32,8 @@ fn captured(position: Option<(i32, i32)>, cwd: Option<&str>, title: &str) -> Res
         active_item: Some(0),
         restored_tabs: vec![RestoredTab {
             root: RestoredSplitTree::leaf(RestoredView::Terminal(TerminalLeafRestore {
+                sid: None,
+                lineage: None,
                 cwd: cwd.map(str::to_string),
                 title: title.to_string(),
                 profile: None,
@@ -43,7 +45,9 @@ fn captured(position: Option<(i32, i32)>, cwd: Option<&str>, title: &str) -> Res
                 attention: None,
                 questions: None,
                 autopilot: None,
+                land_at: None,
                 identity: None,
+                theme: None,
                 agent: None,
                 supervised: None,
                 held: false,
@@ -163,6 +167,8 @@ fn a_real_topology_change_still_rejects_the_commit() {
     let mut readopted = captured(Some((120, 80)), Some("/work"), "zsh");
     readopted.windows[0].restored_tabs[0].root =
         RestoredSplitTree::leaf(RestoredView::Terminal(TerminalLeafRestore {
+            sid: None,
+            lineage: None,
             cwd: Some("/work".to_string()),
             title: "zsh".to_string(),
             profile: None,
@@ -174,7 +180,9 @@ fn a_real_topology_change_still_rejects_the_commit() {
             attention: None,
             questions: None,
             autopilot: None,
+            land_at: None,
             identity: None,
+            theme: None,
             agent: None,
             supervised: None,
             held: false,
@@ -302,13 +310,10 @@ fn the_park_refuses_a_layout_past_the_caps_as_a_fact_about_the_desk() {
         Some(&past),
         "PRECONDITION: the worker's round trip fails on it"
     );
-    let refusal = commit_handoff_layout(&past).expect_err("refused at the park");
+    let refusal: CaptureRefusal = commit_handoff_layout(&past).expect_err("refused at the park");
     assert_eq!(
-        refusal,
-        CaptureRefusal {
-            local_id: None,
-            cause: "65 windows are open, more than the 64 an update can carry".to_string(),
-        }
+        refusal.local_id, None,
+        "a fact about the desk, not about one session"
     );
     // …and the fold the capture runs brings that desk within the caps.
     let mut folded = past;

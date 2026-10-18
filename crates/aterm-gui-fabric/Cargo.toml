@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-gui-fabric"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aterm-gui's fabric endpoint, below the window: each session's inbox ring, outbound posts, watermarks and hold gate, and the instance's view of its bridge. Reaches a session and the registry through two traits; aterm-gui re-exports it as `crate::fabric`."
+
+[dependencies]
+# The wire's percent escape and the blocking verbs' caller-hangup check.
+aterm-control = { workspace = true }
+# The fence and notice waits' one timing value, and the process clock.
+aterm-gui-timing = { workspace = true }
+aterm-log = { workspace = true }
+# The presence band's mail facts, built here from the ring.
+aterm-messages = { workspace = true }
+aterm-session = { workspace = true }
+# The fabric's word grammar and the env seams.
+aterm-types = { workspace = true }
+# The seamless carry rides the update's TOML manifest
+# (`#[derive(Serialize, Deserialize)]`, so the row asks for the derive).
+serde = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+# The hang detector, the environment refusal, and the link's bind to its
+# derived model.
+aterm-spec = { workspace = true }
+# The carry's TOML round trips.
+aterm-toml = { workspace = true }
+
+[lints]
+workspace = true

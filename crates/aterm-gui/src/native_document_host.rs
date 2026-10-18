@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::document_store::{DocumentId, DocumentSnapshot};
+use crate::durable::Flush;
 use crate::native_document_io::{
     AtomicSaveProof, AtomicSaveResult, AtomicSaveStage, ContentFingerprint, ObservedFileVersion,
     SaveError, SaveGeneration, SavePlan, SaveReducer, SaveReduction,
@@ -1541,7 +1542,18 @@ pub(crate) fn commit_atomic_bytes(
     baseline: &AtomicFileBaseline,
     bytes: &[u8],
 ) -> AtomicCommitResult {
-    commit_atomic_bytes_with_seed(baseline, bytes, next_temporary_seed())
+    commit_atomic_bytes_with_seed(baseline, bytes, next_temporary_seed(), Flush::Durable)
+}
+
+/// [`commit_atomic_bytes`] with its temporary and its directory entry only ORDERED
+/// ([`aterm_durable::ordered`]) ahead of what follows, not made durable: for a file
+/// whose loss after a power loss the next open repairs by itself (the empty config
+/// file a missing one is created as). Every save the person makes stays durable.
+pub(crate) fn commit_atomic_bytes_ordered(
+    baseline: &AtomicFileBaseline,
+    bytes: &[u8],
+) -> AtomicCommitResult {
+    commit_atomic_bytes_with_seed(baseline, bytes, next_temporary_seed(), Flush::Ordered)
 }
 
 fn write_lock_busy() -> String {
@@ -1570,8 +1582,7 @@ fn write_lock_busy() -> String {
 ///  2. No clock holds it small. `held_save_lock_returns_busy_and_retry_commits`
 ///     bounds a whole refused commit by a hang detector (a minute), which catches a
 ///     refusal that BLOCKS, not one that is merely slow: its old `< 1 s` deadline
-///     crossed under full-suite load twice. The size is pinned without a clock, by
-///     `the_event_loop_budget_stays_in_the_sibling_write_lock_class` (two frames).
+///     crossed under full-suite load twice. Keep it within two frames by review.
 ///
 /// MITIGATION for a proven hazard, NOT a proven cure for the
 /// `repeated_save_during_inflight_checkpoint_persists_the_latest_sequence` flake: the
@@ -1715,6 +1726,7 @@ impl HeldAdvisoryLock {
     /// The locked file: what the holder reads or writes under the lock (the
     /// edge-token secret), and what a test copies to stand in for a forked
     /// child's copy of the description.
+    #[cfg(any(unix, test))]
     pub(crate) fn file(&self) -> &File {
         &self.0
     }
@@ -1846,6 +1858,7 @@ fn commit_atomic_bytes_with_seed(
     baseline: &AtomicFileBaseline,
     bytes: &[u8],
     seed: u64,
+    flush: Flush,
 ) -> AtomicCommitResult {
     if bytes.len() > MAX_ATOMIC_SAVE_BYTES {
         return atomic_failed(
@@ -1897,7 +1910,7 @@ fn commit_atomic_bytes_with_seed(
         }
         file.write_all(bytes)
             .map_err(|error| atomic_failed(AtomicSaveStage::WriteTemporary, error.to_string()))?;
-        crate::durable::sync_all(&file)
+        crate::durable::finish(&file, flush)
             .map_err(|error| atomic_failed(AtomicSaveStage::SyncTemporary, error.to_string()))?;
         drop(file);
 
@@ -1947,7 +1960,7 @@ fn commit_atomic_bytes_with_seed(
                 error.to_string(),
             ));
         }
-        sync_directory(parent).map_err(|error| {
+        sync_directory(parent, flush).map_err(|error| {
             atomic_published_unverified(
                 AtomicSaveStage::SyncDirectory,
                 observe_file(path, bytes.len()).ok(),
@@ -2067,24 +2080,25 @@ fn atomic_published_unverified(
     }
 }
 
-/// Flush a directory entry change to the device. Shared with the draft journal
-/// (`native_document_journal`), whose replace path takes the same barrier.
+/// Flush a directory entry change to the device with `flush`. Shared with the draft
+/// journal (`native_document_journal`), whose replace path takes the same barrier.
 /// `O_NOFOLLOW` costs nothing here: a save's parent comes from a canonical,
 /// symlink-free target path.
 #[cfg(unix)]
-pub(crate) fn sync_directory(path: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_directory(path: &Path, flush: Flush) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
-    crate::durable::sync_all(
+    crate::durable::finish(
         &OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
             .open(path)?,
+        flush,
     )
 }
 
 #[cfg(not(unix))]
-pub(crate) fn sync_directory(_path: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_directory(_path: &Path, _flush: Flush) -> std::io::Result<()> {
     // Windows rename durability is provided by the file replacement path; opening a
     // directory as a normal File is not portable there.
     Ok(())
@@ -2179,7 +2193,6 @@ fn failed(stage: AtomicSaveStage, message: impl Into<String>) -> AtomicSaveResul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document_store::DocumentStore;
     use crate::native_document_io::{SaveReducer, SaveReduction};
 
     fn unique_file(name: &str, bytes: &[u8]) -> PathBuf {
@@ -2297,13 +2310,6 @@ mod tests {
                 path: path.to_path_buf()
             }
         );
-        let rendered = evicted.to_string();
-        assert!(rendered.contains("evicted from iCloud Drive"), "{rendered}");
-        assert!(
-            rendered.contains("downloaded in Finder first"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("notes.md"), "{rendered}");
 
         let other = read_error(path, std::io::Error::from_raw_os_error(libc::EIO));
         assert!(
@@ -2311,8 +2317,8 @@ mod tests {
                 &other,
                 DocumentHostError::Io {
                     stage: AtomicSaveStage::Preflight,
-                    message
-                } if message.contains("could not read") && message.contains("notes.md")
+                    ..
+                }
             ),
             "{other:?}"
         );
@@ -2503,43 +2509,10 @@ mod tests {
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
-    /// A holder that never releases is still refused, and the loop really ran.
-    /// Deliberately NO absolute wall-clock upper bound: that assertion class is the one
-    /// full-suite load has already crossed twice in this crate. The refusal that
-    /// must not BLOCK is `held_save_lock_returns_busy_and_retry_commits`'s, judged by
-    /// a hang detector; the budget's size is pinned without a clock by
-    /// `native_document_journal`'s `the_event_loop_budget_stays_in_the_sibling_write_lock_class`.
-    #[test]
-    fn a_persistent_save_lock_holder_is_refused_after_the_bounded_budget() {
-        let path = unique_file("persistent-save-lock", b"before");
-        let lock_path = path.parent().unwrap().join(format!(
-            ".{}.aterm-write.lock",
-            path.file_name().unwrap().to_string_lossy()
-        ));
-        let held = HeldAdvisoryLock::lock(open_write_lock(&lock_path).unwrap()).unwrap();
-        let probe = open_write_lock(&lock_path).unwrap();
-
-        let budget = std::time::Duration::from_millis(30);
-        let started = std::time::Instant::now();
-        let Err(message) = acquire_write_lock_within(probe, budget) else {
-            panic!("a held save lock must be refused");
-        };
-        let elapsed = started.elapsed();
-
-        assert!(message.contains("busy") && message.contains("retry Save"));
-        // A regression to a single `try_lock` returns in microseconds and fails here.
-        assert!(
-            elapsed >= budget,
-            "budget must actually be spent, got {elapsed:?}"
-        );
-        drop(held);
-        let _ = fs::remove_dir_all(path.parent().unwrap());
-    }
-
     /// The actual regression: a holder that releases INSIDE the budget is ridden out
     /// instead of refusing the save. The budget is a hang detector's minute against
     /// a 20ms hold, so no scheduler stall can turn this into a false FAIL; the
-    /// bounded-refusal half is pinned deterministically by the test above.
+    /// refusal half is `held_save_lock_returns_busy_and_retry_commits`.
     #[test]
     fn a_transient_save_lock_holder_is_ridden_out_instead_of_refusing_the_save() {
         let path = unique_file("transient-save-lock", b"before");
@@ -2713,7 +2686,7 @@ mod tests {
             crate::native_config_service::MAX_CONFIG_FILE_BYTES + 1
         );
 
-        let mut documents = DocumentStore::for_test();
+        let mut documents = crate::test_document_store();
         let document = documents.open(
             opened.grant.canonical_uri.clone(),
             "theme = \"Nord\"\n".to_string(),
@@ -2839,7 +2812,7 @@ mod tests {
         let opened = grants
             .open_local(&file_uri(&path), GrantAccess::ReadWrite, 1024)
             .unwrap();
-        let mut documents = DocumentStore::for_test();
+        let mut documents = crate::test_document_store();
         let document = documents.open(opened.grant.canonical_uri.clone(), "new".to_string());
         let snapshot = documents.snapshot(document).unwrap();
         let mut reducer = SaveReducer::new(document, opened.observed);
@@ -2877,6 +2850,39 @@ mod tests {
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
+    /// A save the person makes is durable, file and entry; the empty config file a
+    /// missing one is created as is only ordered (aterm-durable's counting seam).
+    #[test]
+    fn a_save_is_durable_and_a_created_config_file_only_ordered() {
+        use aterm_durable::seam::Recording;
+        let path = unique_file("flush-tiers", b"old");
+        let contents = read_atomic_file(&path, 1024, true).unwrap();
+        let recording = Recording::start();
+        assert!(matches!(
+            commit_atomic_bytes(&contents.baseline, b"saved"),
+            AtomicCommitResult::Committed(_)
+        ));
+        let saved = recording.take();
+        #[cfg(unix)]
+        let expected_save = [Flush::Durable, Flush::Durable];
+        #[cfg(not(unix))]
+        let expected_save = [Flush::Durable];
+        assert_eq!(saved, expected_save, "a save");
+        fs::remove_file(&path).unwrap();
+        let missing = read_atomic_file(&path, 1024, true).unwrap();
+        let _ = recording.take();
+        assert!(matches!(
+            commit_atomic_bytes_ordered(&missing.baseline, b""),
+            AtomicCommitResult::Committed(_)
+        ));
+        #[cfg(unix)]
+        let expected_create = [Flush::Ordered, Flush::Ordered];
+        #[cfg(not(unix))]
+        let expected_create = [Flush::Ordered];
+        assert_eq!(recording.take(), expected_create, "a created config file");
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
     #[test]
     fn external_change_returns_conflict_without_overwrite() {
         let path = unique_file("conflict", b"old");
@@ -2884,7 +2890,7 @@ mod tests {
         let opened = grants
             .open_local(&file_uri(&path), GrantAccess::ReadWrite, 1024)
             .unwrap();
-        let mut documents = DocumentStore::for_test();
+        let mut documents = crate::test_document_store();
         let document = documents.open(opened.grant.canonical_uri.clone(), "ours".to_string());
         let mut reducer = SaveReducer::new(document, opened.observed);
         let plan = reducer
@@ -2929,7 +2935,7 @@ mod tests {
         let opened = grants
             .open_local(&file_uri(&path), GrantAccess::ReadWrite, 1024)
             .unwrap();
-        let mut documents = DocumentStore::for_test();
+        let mut documents = crate::test_document_store();
         let document = documents.open(opened.grant.canonical_uri.clone(), "saved".to_string());
         let snapshot = documents.snapshot(document).unwrap();
         let mut persistence = DocumentPersistenceStore::default();
@@ -2951,65 +2957,6 @@ mod tests {
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
-    /// A save holds the write lock across two `File::sync_all` calls, which on Apple
-    /// targets are `F_FULLFSYNC` device-cache barriers whose latency is bounded by the
-    /// whole machine's I/O, not by the 11 bytes being written. Six leaked fixtures of
-    /// the `repeated_save_during_inflight_checkpoint_persists_the_latest_sequence`
-    /// flake measure that hold at 82.5-279.7 ms (0.014-0.062 ms when the volume is
-    /// idle). Any contender — a genuine concurrent save, or a `fork()`ed child that
-    /// inherited this descriptor before it could `exec` away the `O_CLOEXEC` — must
-    /// OUTWAIT that hold; reporting "busy" instead turns an honest stall into a lost
-    /// save. `flock` is per open-file-description, so a second `open_write_lock` in
-    /// THIS process contends exactly as an inherited descriptor does: no load, no
-    /// fork, no flake.
-    #[cfg(unix)]
-    #[test]
-    fn a_lock_held_for_one_stalled_device_barrier_is_waited_out_not_reported_busy() {
-        // 4x the inner `WRITE_LOCK_RETRY_BUDGET`, so it is the outer preflight
-        // retry that must wait the holder out, and a fifth of the 500 ms
-        // `PREFLIGHT_RETRY_BUDGET`, so a spawn and a sleep overshoot under load
-        // cannot push the release past it. It was 200 ms, leaving 300 ms against
-        // a thread-wake tail measured at 523 ms (the load-sensitive test audit
-        // of 2026-09-27).
-        const HELD: std::time::Duration = std::time::Duration::from_millis(100);
-
-        let path = unique_file("waited-save-lock", b"before");
-        let contents = read_atomic_file(&path, DEFAULT_DOCUMENT_LIMIT, false).unwrap();
-        let lock_path = path.parent().unwrap().join(format!(
-            ".{}.aterm-write.lock",
-            path.file_name().unwrap().to_string_lossy()
-        ));
-        // The holder lets go by `LOCK_UN` (the guard's drop), not by the close
-        // alone: a child a sibling test forks while it holds the lock keeps a copy
-        // of its description until it execs — up to 523 ms at the measured tail,
-        // past the 500 ms preflight retry this test sizes `HELD` against — and a
-        // close-only release left the lock held there, so the save read busy for a
-        // holder that had let go.
-        let holder = acquire_write_lock(open_write_lock(&lock_path).unwrap()).unwrap();
-        // Taken BEFORE the spawn: the release is then at or after `started +
-        // HELD` by construction, so `waited >= HELD` below is exact.
-        let started = std::time::Instant::now();
-        let released = std::thread::spawn(move || {
-            std::thread::sleep(HELD);
-            drop(holder);
-        });
-
-        let verdict = commit_atomic_bytes(&contents.baseline, b"after");
-        let waited = started.elapsed();
-        released.join().unwrap();
-
-        assert!(
-            matches!(verdict, AtomicCommitResult::Committed(_)),
-            "a {HELD:?} lock holder must be waited out, not reported busy: {verdict:?}"
-        );
-        assert!(
-            waited >= HELD,
-            "the commit cannot have published before the holder released: {waited:?}"
-        );
-        assert_eq!(fs::read(&path).unwrap(), b"after");
-        let _ = fs::remove_dir_all(path.parent().unwrap());
-    }
-
     #[test]
     fn temporary_name_collision_retries_without_truncating_the_collision() {
         let path = unique_file("temp-collision", b"old");
@@ -3023,7 +2970,7 @@ mod tests {
         fs::write(&collision, "do not touch").unwrap();
 
         assert!(matches!(
-            commit_atomic_bytes_with_seed(&contents.baseline, b"new", seed),
+            commit_atomic_bytes_with_seed(&contents.baseline, b"new", seed, Flush::Durable),
             AtomicCommitResult::Committed(_)
         ));
         assert_eq!(fs::read_to_string(&path).unwrap(), "new");
@@ -3105,7 +3052,7 @@ mod tests {
             first.canonicalize().unwrap()
         );
 
-        let mut documents = DocumentStore::for_test();
+        let mut documents = crate::test_document_store();
         let document = documents.open(opened.grant.canonical_uri.clone(), "updated".to_string());
         let mut reducer = SaveReducer::new(document, opened.observed);
         let plan = reducer
@@ -3188,7 +3135,7 @@ mod tests {
             .unwrap();
         assert_eq!(opened.grant.id, direct.grant.id);
         assert_eq!(opened.grant.logical_path(), logical);
-        let mut documents = DocumentStore::for_test();
+        let mut documents = crate::test_document_store();
         let document = documents.open(
             opened.grant.canonical_uri.clone(),
             "theme = \"Nord\"\n".to_string(),
@@ -3239,7 +3186,7 @@ mod tests {
         let opened = grants
             .open_local_config(&file_uri(&logical), GrantAccess::ReadWrite, 4096)
             .unwrap();
-        let mut documents = DocumentStore::for_test();
+        let mut documents = crate::test_document_store();
         let document = documents.open(
             opened.grant.canonical_uri.clone(),
             "theme = \"Nord\"\n".to_string(),

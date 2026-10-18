@@ -309,7 +309,6 @@ fn stable_single_pane_control_keeps_body_cadence_and_single_pane_latches() {
         state.focused = true;
         state.last_composed = Some(true);
         state.pill_shown = true;
-        state.fade_shown = true;
         state.composed_cursor_effect_valid = true;
         state.composed_cursor_effect_session = Some(0);
         charge_cursor_body(state, now);
@@ -321,8 +320,8 @@ fn stable_single_pane_control_keeps_body_cadence_and_single_pane_latches() {
     let state = &app.windows[&wid];
     assert_eq!(state.last_composed, Some(false));
     assert!(
-        state.pill_shown && state.fade_shown,
-        "single-pane scroll/fade paint remains supported"
+        state.pill_shown,
+        "single-pane scroll paint remains supported"
     );
     assert!(!state.composed_cursor_effect_valid);
     assert_eq!(state.composed_cursor_effect_session, None);
@@ -346,7 +345,6 @@ fn pure_split_control_clears_single_pane_latches_and_includes_body_cadence() {
         state.focused = true;
         state.last_composed = Some(false);
         state.pill_shown = true;
-        state.fade_shown = true;
         state.fx.cursor_mut().glow.note_kill(now, true);
         charge_cursor_body(state, now);
         assert!(state.is_split());
@@ -360,7 +358,6 @@ fn pure_split_control_clears_single_pane_latches_and_includes_body_cadence() {
     let state = &app.windows[&wid];
     assert_eq!(state.last_composed, Some(true));
     assert!(!state.pill_shown);
-    assert!(!state.fade_shown);
     assert!(
         state.fx.cursor().glow.is_active(),
         "an unchanged composed coordinate keeps its charged glow"
@@ -374,62 +371,6 @@ fn pure_split_control_clears_single_pane_latches_and_includes_body_cadence() {
     assert!(
         state.terminal_effect_frame_active(now, false),
         "a live composed body owns the pure-split animation cadence"
-    );
-}
-
-#[test]
-fn same_class_divider_move_resets_coordinate_bound_cursor_effects() {
-    let mut app = App::headless_for_test();
-    let wid = WindowId(0);
-    app.split_active_stub_tab(wid);
-    let route = app.active_visible_content_route(wid).unwrap();
-    assert_eq!(
-        route,
-        crate::VisibleContentRoute::Terminal { composed: true }
-    );
-    assert!(app.prepare_layout_coordinate_space(wid, route));
-
-    let now = Instant::now();
-    app.windows
-        .get_mut(&wid)
-        .unwrap()
-        .fx
-        .cursor_mut()
-        .glow
-        .note_kill(now, true);
-    charge_cursor_body(app.windows.get_mut(&wid).unwrap(), now);
-    assert!(app.windows[&wid].fx.cursor().glow.is_active());
-    let old_key = app.windows[&wid].last_layout_coordinate_space;
-    let divider = app.active_visible_leaf_plan(wid).unwrap().dividers[0]
-        .path
-        .clone();
-    assert!(
-        app.windows
-            .get_mut(&wid)
-            .unwrap()
-            .tab_set
-            .active_mut()
-            .unwrap()
-            .set_divider_ratio(&divider, 0.7)
-    );
-
-    let moved_route = app.active_visible_content_route(wid).unwrap();
-    assert_eq!(
-        moved_route, route,
-        "the retired composed-only predicate is the negative control"
-    );
-    assert!(app.prepare_layout_coordinate_space(wid, moved_route));
-    assert_ne!(
-        app.windows[&wid].last_layout_coordinate_space, old_key,
-        "focused pane geometry participates in the exact key"
-    );
-    assert!(
-        !app.windows[&wid].fx.cursor().glow.is_active(),
-        "a trail cannot cross the divider's coordinate-space change"
-    );
-    assert!(
-        !app.windows[&wid].fx.cursor().rainbow.is_active(),
-        "a rainbow body cannot keep coordinates from the old divider geometry"
     );
 }
 
@@ -761,7 +702,7 @@ fn layout_coordinate_change_rebases_cursor_kitty_and_pet_placement() {
 /// executable semantics generated from the same Rust model that `ty` checks.
 #[test]
 fn shipping_layout_coordinate_reset_conforms_to_derived_model() {
-    let model = aterm_spec::derive::layout_coordinate_reset_model();
+    let model = aterm_models_misc::layout_coordinate_reset_model();
     let mut modeled = model.init_state();
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
@@ -847,7 +788,6 @@ fn mixed_split_uses_canonical_root_and_schedules_the_composed_body() {
         state.focused = true;
         state.last_composed = Some(false);
         state.pill_shown = true;
-        state.fade_shown = true;
         state.fx.cursor_mut().glow.note_kill(now, true);
         charge_cursor_body(state, now);
         assert_eq!(state.tab_set.active().unwrap().root.len(), 2);
@@ -867,7 +807,6 @@ fn mixed_split_uses_canonical_root_and_schedules_the_composed_body() {
     let state = &app.windows[&wid];
     assert_eq!(state.last_composed, Some(true));
     assert!(!state.pill_shown);
-    assert!(!state.fade_shown);
     assert!(state.fx.cursor().glow.is_active());
     assert!(
         state.fx.cursor().rainbow.is_active(),

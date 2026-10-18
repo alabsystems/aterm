@@ -8,8 +8,8 @@
 //! `set_advanced_notification_callback` (OSC 99 / kitty, a structured
 //! [`Notification`] with title + body), gated by the host's
 //! `authorize_notifications`. This module is the GUI side that turns those
-//! callbacks into real macOS / Windows notifications, with two hard rules
-//! borrowed from the OSC 52 clipboard path:
+//! callbacks into real macOS / Windows / Linux notifications, with two hard
+//! rules borrowed from the OSC 52 clipboard path:
 //!
 //! 1. **Never block the engine.** The callbacks fire on a tab's PTY reader
 //!    thread, under the `Terminal` lock. They MUST NOT spawn a subprocess
@@ -28,7 +28,19 @@
 //!    directly, so no escaping is needed on that path. The Windows path writes
 //!    title/body into the fixed-size `NOTIFYICONDATAW` WCHAR fields (no
 //!    interpreter anywhere), so [`fold_to_utf16`] only folds control bytes and
-//!    truncates to the field capacity.
+//!    truncates to the field capacity. The Linux path is a D-Bus call (no
+//!    subprocess, no shell); its body is MARKUP to a server that advertises
+//!    `body-markup` (GNOME, KDE), so [`markup_escape`] escapes `&`, `<` and `>`
+//!    there and folds control bytes.
+//!
+//! **Linux.** `org.freedesktop.Notifications.Notify` on the session bus, through
+//! the first-party `aterm-dbus` client, from the delivery thread: one lazily
+//! opened connection, a bounded call, every failure swallowed (no session bus,
+//! no notification server). A HEADLESS process delivers nothing — it presents no
+//! OS UI, and a test's or an agent's private instance often still carries the
+//! person's real session-bus address. Serious mode is the standard
+//! `suppress-sound` hint at normal urgency, never `urgency = low`, which GNOME
+//! Shell shows with no banner at all.
 //!
 //! **Focus-aware suppression.** The delivery thread reads a shared SUPPRESSION SET
 //! the main (UI) thread keeps current: the active-tab focused-pane session id of
@@ -48,8 +60,8 @@
 //! 99 / 777 are program output; over SSH they are the remote's). That is why the
 //! whole module sits behind the fail-closed `allow_notifications` opt-in
 //! (`handler_osc_notify.rs`: no callback fires while it is off), the same consent
-//! surface as the other program-triggered escapes (`allow_window_ops`,
-//! `allow_osc52_query`, `allow_palette_reconfigure`, `allow_kitty_file_transfer`).
+//! surface as the other fail-closed program-triggered escapes (`allow_window_ops`,
+//! `allow_osc52_query`, `allow_kitty_file_transfer`).
 //! What an `osascript` launched in aterm's name asks the system for was MEASURED
 //! on macOS 26 (2026-09-13, `/usr/bin/log show --predicate 'subsystem ==
 //! "com.apple.TCC"'` over 2026-09-11 00:00 to 2026-09-13 12:00): that PREDICATE
@@ -97,8 +109,7 @@
 //! or an agent wall: usage, spend, context, login, API, overload, memory). Both
 //! use this same bounded queue and focus suppression, and both rate-limit
 //! themselves before the queue. The herald never runs in a headless instance.
-//! The embedded operator's notices (`operator_host`, "aterm operator") ride the
-//! same queue, and the update-health banner calls [`deliver`] directly.
+//! The update-health banner calls [`deliver`] directly.
 //!
 //! **`desktop_alerts` turns aterm's own notices off** (config key, default OFF
 //! since 2026-09-28 — the owner: "I don't know what these OSX alerts are from
@@ -111,21 +122,19 @@
 //! say the setting held the notice back; the update-health banner, which does not
 //! ride the queue). Nothing else changes: the menu bar, the tab marks, the band
 //! and `messages.log` still carry the herald's, the consent path's and update
-//! health's facts. The operator's notices are shown nowhere else, so off they
-//! are dropped and its queue (counted by `aterm fleet status`) is their
-//! one record.
+//! health's facts.
 //! Program notifications (OSC 9/99/777) are [`NotifyMsg::program`] and answer
 //! to `allow_notifications` alone.
 
-// Real delivery exists on macOS and Windows; elsewhere (Linux) this module is a
-// channel-draining stub (`spawn_delivery`), and the real-notification helpers
-// and the fields only they read are compiled out there.
+// Real delivery exists on macOS, Windows and Linux; elsewhere (the BSDs) this
+// module is a channel-draining stub (`spawn_delivery`), and the
+// real-notification helpers and the fields only they read are compiled out there.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::SyncSender;
 
@@ -135,17 +144,17 @@ pub(crate) struct NotifyMsg {
     /// Originating session/tab id (matched against the active tab to suppress
     /// self-notifications the user is already watching). Only a host with real
     /// delivery reads it.
-    #[cfg(any(target_os = "macos", windows, test))]
+    #[cfg(any(target_os = "macos", windows, target_os = "linux", test))]
     pub session: u64,
     /// Notification title (OSC 99 carries one; OSC 9/777 do not — `None`).
-    #[cfg(any(target_os = "macos", windows, test))]
+    #[cfg(any(target_os = "macos", windows, target_os = "linux", test))]
     pub title: Option<String>,
     /// Notification body.
     pub body: String,
     /// `true` for a notice aterm wrote itself ([`Self::own`]), which the
     /// `desktop_alerts` switch governs; `false` for a program's (OSC 9/99/777,
     /// [`Self::program`]), which `allow_notifications` already admitted.
-    #[cfg(any(target_os = "macos", windows, test))]
+    #[cfg(any(target_os = "macos", windows, target_os = "linux", test))]
     pub own: bool,
 }
 
@@ -180,19 +189,9 @@ impl NotifyMsg {
         )
     }
 
-    /// The embedded operator's notice for its `local_id`. Only `operator_host`
-    /// mints an [`OperatorVoice`](crate::operator_host::OperatorVoice).
-    pub(crate) fn operator(
-        _voice: crate::operator_host::OperatorVoice,
-        local_id: u64,
-        body: String,
-    ) -> Self {
-        Self::own(local_id, Some("aterm operator".to_owned()), body)
-    }
-
     /// One notice aterm wrote ITSELF: the delivery thread drops it while
     /// `desktop_alerts` is off (the module doc's *`desktop_alerts`* paragraph).
-    /// Private: aterm's own voice has exactly the three doors above, each
+    /// Private: aterm's own voice has exactly the two doors above, each
     /// taking what only its decider makes, so a new way to interrupt the owner
     /// is a new door written here.
     fn own(session: u64, title: Option<String>, body: String) -> Self {
@@ -200,15 +199,15 @@ impl NotifyMsg {
     }
 
     fn with_origin(session: u64, title: Option<String>, body: String, own: bool) -> Self {
-        #[cfg(not(any(target_os = "macos", windows, test)))]
+        #[cfg(not(any(target_os = "macos", windows, target_os = "linux", test)))]
         let _ = (session, title, own);
         Self {
-            #[cfg(any(target_os = "macos", windows, test))]
+            #[cfg(any(target_os = "macos", windows, target_os = "linux", test))]
             session,
-            #[cfg(any(target_os = "macos", windows, test))]
+            #[cfg(any(target_os = "macos", windows, target_os = "linux", test))]
             title,
             body,
-            #[cfg(any(target_os = "macos", windows, test))]
+            #[cfg(any(target_os = "macos", windows, target_os = "linux", test))]
             own,
         }
     }
@@ -218,7 +217,7 @@ impl NotifyMsg {
 /// while `desktop_alerts` is off (`own_alerts == false`) is dropped, and so is
 /// any notice whose session the person is already looking at (`suppressed`, the
 /// focus set). Pure, so the gate is tested without running a notifier.
-#[cfg(any(target_os = "macos", windows, test))]
+#[cfg(any(target_os = "macos", windows, target_os = "linux", test))]
 fn delivers(msg: &NotifyMsg, suppressed: &HashSet<u64>, own_alerts: bool) -> bool {
     if msg.own && !own_alerts {
         return false;
@@ -243,7 +242,7 @@ const NOTIFY_QUEUE_CAP: usize = 16;
 /// can never be presented as working delivery.
 #[must_use]
 pub(crate) const fn delivery_available() -> bool {
-    cfg!(any(target_os = "macos", windows))
+    cfg!(any(target_os = "macos", windows, target_os = "linux"))
 }
 
 /// Spawn the single, process-wide notification delivery thread and return the
@@ -254,7 +253,7 @@ pub(crate) const fn delivery_available() -> bool {
 /// to apply focus-aware suppression. `own_alerts` is the live `desktop_alerts`
 /// switch the UI thread keeps current: while it reads `false`, every
 /// [`NotifyMsg::own`] notice is dropped here ([`delivers`]).
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 pub(crate) fn spawn_delivery(
     suppress: Arc<Mutex<HashSet<u64>>>,
     silent: Arc<AtomicBool>,
@@ -286,10 +285,10 @@ pub(crate) fn spawn_delivery(
     tx
 }
 
-/// Non-macOS/-Windows stub: drain the channel so senders never block and the
-/// workspace builds everywhere. There is no portable native notifier wired up
-/// off macOS/Windows.
-#[cfg(not(any(target_os = "macos", windows)))]
+/// Stub for a target with no notifier wired up (neither macOS, Windows nor
+/// Linux): drain the channel so senders never block and the workspace builds
+/// everywhere.
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 pub(crate) fn spawn_delivery(
     _suppress: Arc<Mutex<HashSet<u64>>>,
     _silent: Arc<AtomicBool>,
@@ -309,7 +308,7 @@ pub(crate) fn spawn_delivery(
 /// `allow_notifications` gate (the module doc's *Identity and consent* paragraph
 /// says what each subprocess asks the system for under aterm's name, and that
 /// the measured answer is: nothing that prompts). aterm's OWN notices — the
-/// consent attention path, the escalation herald, the embedded operator and the
+/// consent attention path, the escalation herald and the
 /// update-health banner — are not program output and do not pass that gate;
 /// they pass `desktop_alerts` instead (default off). See *aterm's own notices*
 /// in the module doc.
@@ -407,6 +406,172 @@ const fn windows_info_flags(silent: bool) -> u32 {
     const NIIF_NOSOUND: u32 = 0x10;
     const NIIF_RESPECT_QUIET_TIME: u32 = 0x80;
     NIIF_INFO | NIIF_RESPECT_QUIET_TIME | if silent { NIIF_NOSOUND } else { 0 }
+}
+
+/// Deliver one notification on Linux: `org.freedesktop.Notifications.Notify` on
+/// the session bus ([`freedesktop`]). Runs ONLY on the delivery thread (the call
+/// blocks up to [`freedesktop::CALL_TIMEOUT`]). Best-effort: no session bus, no
+/// notification server or a refused call is swallowed. Never from a headless
+/// process (the module doc's *Linux* paragraph), and never from a unit test,
+/// whose process carries the developer's own session-bus address (the live
+/// test drives [`freedesktop::Bus`] against a private daemon instead).
+#[cfg(target_os = "linux")]
+fn deliver(title: Option<&str>, body: &str, silent: bool) {
+    if cfg!(test) || crate::menu::process_is_headless() {
+        return;
+    }
+    let Ok(call) = freedesktop::notify_call(title.unwrap_or("aterm"), body, silent) else {
+        return;
+    };
+    freedesktop::BUS.with(|bus| {
+        bus.borrow_mut()
+            .notify(&call, &aterm_dbus::Connection::session);
+    });
+}
+
+/// `org.freedesktop.Notifications` over the first-party D-Bus client: the
+/// `Notify` call, and the delivery thread's one connection to the session bus.
+#[cfg(target_os = "linux")]
+mod freedesktop {
+    use std::cell::RefCell;
+    use std::time::Duration;
+
+    use aterm_dbus::{Connection, Message, Type, Value};
+
+    /// The notification server's well-known name, object and interface.
+    const SERVER: &str = "org.freedesktop.Notifications";
+    const OBJECT: &str = "/org/freedesktop/Notifications";
+
+    /// How long the delivery thread waits for the server's answer. A server
+    /// answers `Notify` at once; the bound only keeps a wedged bus from holding
+    /// the thread (the bounded queue drops what arrives meanwhile).
+    pub(super) const CALL_TIMEOUT: Duration = Duration::from_secs(2);
+
+    thread_local! {
+        /// The delivery thread's connection, opened at its first notification.
+        pub(super) static BUS: RefCell<Bus> = const { RefCell::new(Bus { conn: None }) };
+    }
+
+    /// One `Notify(susssasa{sv}i)` call. `summary` is plain text by the
+    /// specification; `body` is markup to a server that advertises
+    /// `body-markup`, so it is escaped ([`super::markup_escape`]). The hints
+    /// name aterm's desktop entry (`aterm.desktop`, which tools/install.sh
+    /// lays) so the shell attributes the notification to aterm, keep urgency
+    /// NORMAL, and add `suppress-sound` in serious mode (`silent`).
+    pub(super) fn notify_call(
+        summary: &str,
+        body: &str,
+        silent: bool,
+    ) -> aterm_dbus::Result<Message> {
+        let mut hints = vec![
+            (
+                Value::from("desktop-entry"),
+                Value::variant(Value::from("aterm")),
+            ),
+            (Value::from("urgency"), Value::variant(Value::Byte(1))),
+        ];
+        if silent {
+            hints.push((
+                Value::from("suppress-sound"),
+                Value::variant(Value::Bool(true)),
+            ));
+        }
+        Ok(
+            Message::method_call(Some(SERVER), OBJECT, Some(SERVER), "Notify")?.with_body(vec![
+                Value::from("aterm"),
+                Value::U32(0),
+                Value::from("aterm"),
+                Value::Str(super::fold_controls(summary)),
+                Value::Str(super::markup_escape(body)),
+                Value::strings(std::iter::empty::<String>()),
+                Value::dict(Type::Str, Type::Variant, hints)?,
+                Value::I32(-1),
+            ]),
+        )
+    }
+
+    /// The delivery thread's session-bus connection, opened on first use and
+    /// dialled again when the bus has closed it.
+    pub(super) struct Bus {
+        pub(super) conn: Option<Connection>,
+    }
+
+    impl Bus {
+        /// Send `call` and wait for its answer, best-effort. `open` dials the bus
+        /// (`Connection::session` in the product; a test hands its private
+        /// daemon). A connection that fails — closed by the bus, a socket error,
+        /// a deadline — is dropped; when it was a cached one, a fresh one is
+        /// dialled and the call sent once more, since a long-lived connection
+        /// the bus restarted under is the expected way to find it dead. An error
+        /// the SERVER answered (no notification server on this bus) leaves the
+        /// connection as it is: the bus is fine. Returns whether the server
+        /// accepted the notification.
+        pub(super) fn notify(
+            &mut self,
+            call: &Message,
+            open: &dyn Fn() -> aterm_dbus::Result<Connection>,
+        ) -> bool {
+            for _ in 0..2 {
+                let dialled = self.conn.is_none();
+                if dialled {
+                    self.conn = open().ok();
+                }
+                let Some(conn) = self.conn.as_mut() else {
+                    return false;
+                };
+                // What the bus sent since the last call (`NameAcquired`, a
+                // server's `NotificationClosed`) is not this thread's business:
+                // drop it, so the connection's retained-message cap never fills.
+                while let Ok(Some(_)) = conn.recv(Some(Duration::ZERO)) {}
+                match conn.call(call.clone(), CALL_TIMEOUT) {
+                    Ok(_) => return true,
+                    Err(aterm_dbus::Error::Remote { .. }) => return false,
+                    Err(_) => {
+                        self.conn = None;
+                        if dialled {
+                            return false;
+                        }
+                    }
+                }
+            }
+            false
+        }
+    }
+}
+
+/// Escape a notification body for a freedesktop server that reads it as markup
+/// (`body-markup`: GNOME Shell, KDE Plasma): `&`, `<` and `>` become entities, so
+/// a program's (over SSH, a remote's) `<b>` or `<a href=…>` is shown as text, never
+/// rendered or followed. Control bytes are folded as [`fold_controls`] folds
+/// them, keeping a newline, which the server shows as a line break. Defined
+/// platform-independently so it is unit-tested on every target.
+#[cfg(any(target_os = "linux", test))]
+fn markup_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in fold_controls(s).chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// A notification string with every C0 control byte but a newline folded to a
+/// space (a carriage return and a tab included): notifications carry no
+/// terminal controls, and an escape sequence in one only invites a server's
+/// quirks. Defined platform-independently so it is unit-tested on every target.
+#[cfg(any(target_os = "linux", test))]
+fn fold_controls(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\n' => '\n',
+            c if (c as u32) < 0x20 || c == '\u{7f}' => ' ',
+            c => c,
+        })
+        .collect()
 }
 
 /// Windows balloon/toast delivery over direct `unsafe extern "system"` FFI
@@ -522,7 +687,7 @@ mod win_balloon {
             hWndParent: HWND,
             hMenu: isize,
             hInstance: isize,
-            lpParam: *const c_void,
+            lpParam: *mut c_void,
         ) -> HWND;
         fn DestroyWindow(hWnd: HWND) -> i32;
         fn DefWindowProcW(hWnd: HWND, Msg: u32, wParam: usize, lParam: isize) -> isize;
@@ -611,7 +776,7 @@ mod win_balloon {
                     HWND_MESSAGE,
                     0,
                     hinstance,
-                    std::ptr::null(),
+                    std::ptr::null_mut(),
                 );
                 if hwnd == 0 {
                     return None;
@@ -754,12 +919,15 @@ fn fold_to_utf16(s: &str, out: &mut [u16]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{NotifyMsg, applescript_escape, delivers, fold_to_utf16, windows_info_flags};
+    use super::{
+        NotifyMsg, applescript_escape, delivers, fold_controls, fold_to_utf16, markup_escape,
+        windows_info_flags,
+    };
     use std::collections::HashSet;
 
     /// `desktop_alerts = false` (the delivery thread's `own_alerts`) drops
-    /// every notice aterm wrote itself — the herald's, the operator's, the
-    /// consent path's — and nothing else: a program notification, which
+    /// every notice aterm wrote itself — the herald's, the consent path's —
+    /// and nothing else: a program notification, which
     /// `allow_notifications` already admitted, is still delivered, and the
     /// focus suppression still holds for both origins. Negative control: the
     /// same own notice IS delivered with the switch on, so the drop is the
@@ -767,7 +935,7 @@ mod tests {
     #[test]
     fn desktop_alerts_off_drops_only_aterms_own_notices() {
         let none = HashSet::new();
-        let own = NotifyMsg::own(7, Some("aterm operator".into()), "waiting".into());
+        let own = NotifyMsg::own(7, Some("aterm".into()), "waiting".into());
         let program = NotifyMsg::program(7, None, "build done".into());
         assert!(own.own && !program.own, "the constructors carry the origin");
         assert!(
@@ -904,6 +1072,179 @@ mod tests {
         let mut buf = [0xFFFFu16; 1];
         fold_to_utf16("abc", &mut buf);
         assert_eq!(buf, [0]);
+    }
+
+    /// A program's body cannot be markup to a `body-markup` server: `&`, `<` and
+    /// `>` are entities, so `<a href=…>` is text; control bytes fold to spaces
+    /// and a newline stays one.
+    #[test]
+    fn a_freedesktop_body_is_escaped_markup_and_folded_controls() {
+        assert_eq!(markup_escape("build done ✅"), "build done ✅");
+        assert_eq!(
+            markup_escape("<a href=\"x\">click</a> & <b>"),
+            "&lt;a href=\"x\"&gt;click&lt;/a&gt; &amp; &lt;b&gt;"
+        );
+        assert_eq!(
+            markup_escape("&amp;"),
+            "&amp;amp;",
+            "an entity is escaped too"
+        );
+        assert_eq!(markup_escape("a\nb\r\tc\x1b[0m\x7f"), "a\nb  c [0m ");
+        assert_eq!(fold_controls("t\x07i\ntle"), "t i\ntle");
+    }
+
+    /// The `Notify` call a Linux host sends, end to end through a private
+    /// `dbus-daemon` (never the session's bus) to a stand-in server holding
+    /// `org.freedesktop.Notifications`: the eight arguments in order, the body
+    /// escaped, urgency normal with `suppress-sound` only in serious mode, and
+    /// a second notification over the same cached connection. Skips, saying so,
+    /// where no `dbus-daemon` is on PATH.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_linux_notification_is_a_notify_call_on_the_session_bus() {
+        use aterm_dbus::{Connection, Kind, Message, Value};
+        use std::io::BufRead as _;
+
+        /// A wait for something that must happen: a hang detector, not a budget.
+        const HANG: std::time::Duration = std::time::Duration::from_secs(60);
+
+        let Some(daemon) = std::env::var_os("PATH").and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|dir| dir.join("dbus-daemon"))
+                .find(|p| p.is_file())
+        }) else {
+            eprintln!("skip: no dbus-daemon on PATH, so no live Notify round trip here");
+            return;
+        };
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let socket = scratch.path().join("bus");
+        let conf = scratch.path().join("bus.conf");
+        std::fs::write(
+            &conf,
+            format!(
+                "<!DOCTYPE busconfig PUBLIC \"-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN\"\n \
+                 \"http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd\">\n\
+                 <busconfig><type>session</type><listen>unix:path={}</listen><auth>EXTERNAL</auth>\
+                 <policy context=\"default\"><allow send_destination=\"*\"/>\
+                 <allow receive_sender=\"*\"/><allow own=\"*\"/></policy></busconfig>\n",
+                socket.display()
+            ),
+        )
+        .unwrap();
+        struct Daemon(aterm_uds::spawnfd::Child);
+        impl Drop for Daemon {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut daemon = Daemon(
+            aterm_uds::spawnfd::command(&daemon)
+                .arg(format!("--config-file={}", conf.display()))
+                .arg("--nofork")
+                .arg("--print-address")
+                .stdout(aterm_uds::spawnfd::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut line = String::new();
+        std::io::BufReader::new(daemon.0.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let addresses = aterm_dbus::address::parse(line.trim()).unwrap();
+
+        let mut server = Connection::open(&addresses).unwrap();
+        let owned = server
+            .call(
+                Message::method_call(
+                    Some("org.freedesktop.DBus"),
+                    "/org/freedesktop/DBus",
+                    Some("org.freedesktop.DBus"),
+                    "RequestName",
+                )
+                .unwrap()
+                .with_body(vec![
+                    Value::from("org.freedesktop.Notifications"),
+                    Value::U32(0),
+                ]),
+                HANG,
+            )
+            .unwrap();
+        assert_eq!(
+            owned.body,
+            vec![Value::U32(1)],
+            "the stand-in owns the name"
+        );
+        let served = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            while seen.len() < 2 {
+                let msg = server.recv(Some(HANG)).unwrap().expect("a Notify call");
+                if msg.kind == Kind::MethodCall && msg.member.as_deref() == Some("Notify") {
+                    server.reply(&msg, vec![Value::U32(7)]).unwrap();
+                    seen.push(msg);
+                }
+            }
+            seen
+        });
+
+        let mut bus = super::freedesktop::Bus { conn: None };
+        let open = || Connection::open(&addresses);
+        let loud = super::freedesktop::notify_call("build", "done <b>&</b>", false).unwrap();
+        assert!(bus.notify(&loud, &open), "the server took the first one");
+        let quiet = super::freedesktop::notify_call("aterm", "serious", true).unwrap();
+        assert!(
+            bus.notify(&quiet, &open),
+            "and the second, on the cached connection"
+        );
+        let seen = served.join().unwrap();
+
+        let hints = |msg: &Message| {
+            msg.body[6]
+                .as_dict()
+                .expect("a{sv} hints")
+                .entries()
+                .iter()
+                .map(|(k, v)| (k.as_str().unwrap().to_owned(), v.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            seen[0].body[..6],
+            [
+                Value::from("aterm"),
+                Value::U32(0),
+                Value::from("aterm"),
+                Value::from("build"),
+                Value::from("done &lt;b&gt;&amp;&lt;/b&gt;"),
+                Value::strings(std::iter::empty::<String>()),
+            ]
+        );
+        assert_eq!(seen[0].body[7], Value::I32(-1));
+        assert_eq!(
+            hints(&seen[0]),
+            vec![
+                (
+                    "desktop-entry".to_owned(),
+                    Value::variant(Value::from("aterm"))
+                ),
+                ("urgency".to_owned(), Value::variant(Value::Byte(1))),
+            ]
+        );
+        assert_eq!(
+            hints(&seen[1]),
+            vec![
+                (
+                    "desktop-entry".to_owned(),
+                    Value::variant(Value::from("aterm"))
+                ),
+                ("urgency".to_owned(), Value::variant(Value::Byte(1))),
+                (
+                    "suppress-sound".to_owned(),
+                    Value::variant(Value::Bool(true))
+                ),
+            ],
+            "serious mode is suppress-sound at normal urgency, never urgency low"
+        );
+        assert_eq!(seen[1].body[4], Value::from("serious"));
     }
 
     #[test]

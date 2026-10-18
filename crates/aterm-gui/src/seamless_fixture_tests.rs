@@ -166,6 +166,19 @@ const PINNED_DESKS: &[(&str, &str)] = &[
     ("v0.104.0", "shell-integration"),
     ("v0.104.0", "stalled-sequence"),
     ("v0.104.0", "twelve-panes"),
+    ("v0.105.0", "claude-code-1049"),
+    ("v0.105.0", "colour-and-shell"),
+    ("v0.105.0", "held-pane"),
+    ("v0.105.0", "history"),
+    ("v0.105.0", "history-carry"),
+    ("v0.105.0", "incident-55x149"),
+    ("v0.105.0", "link-dense"),
+    ("v0.105.0", "link-dense-history"),
+    ("v0.105.0", "policy-repaint"),
+    ("v0.105.0", "policy-visible"),
+    ("v0.105.0", "shell-integration"),
+    ("v0.105.0", "stalled-sequence"),
+    ("v0.105.0", "twelve-panes"),
 ];
 
 /// THE DESK SET, one `("vX.Y.0", "<desk>")` row per desk: from that release on,
@@ -1020,7 +1033,6 @@ fn assert_history_imports(desk: &Desk, sessions: Vec<Adopted>) {
             checkpoint.rows,
             checkpoint.cols,
             Some(&config),
-            aterm_types::Appearance::Dark,
             None,
         )));
         crate::spawn::hydrate_adopted_engine(
@@ -1119,7 +1131,6 @@ fn assert_held_history_imports(desk: &Desk, held: Vec<crate::seamless::HeldPane>
             pane.sid.unwrap_or_else(SessionId::generate),
             &pane.checkpoint,
             None,
-            aterm_types::Appearance::Dark,
         );
         let Some(history) = crate::held_pane_history(&session.term, pane.history) else {
             assert_eq!(
@@ -1252,15 +1263,22 @@ fn assert_meta_state_lands(
     if repaint {
         return;
     }
+    // From v0.106.0 a carry keeps a mark while any row it names is carried
+    // (804646426f), so a prompt row older than the successor's oldest row (a
+    // prompt above a visible-only carry's screen) reads Evicted, as in the
+    // live terminal.
+    let oldest = engine.main_grid().oldest_absolute_row();
     for mark in engine.command_marks() {
-        let prompt = text_at(engine, mark.prompt_start_row);
-        assert!(
-            prompt
-                .as_deref()
-                .is_some_and(|text| text.contains("dev@devhost")),
-            "{label}: session {id}'s mark at row {} names its prompt line: {prompt:?}",
-            mark.prompt_start_row
-        );
+        if mark.prompt_start_row >= oldest {
+            let prompt = text_at(engine, mark.prompt_start_row);
+            assert!(
+                prompt
+                    .as_deref()
+                    .is_some_and(|text| text.contains("dev@devhost")),
+                "{label}: session {id}'s mark at row {} names its prompt line: {prompt:?}",
+                mark.prompt_start_row
+            );
+        }
         if let Some(end) = mark.output_end_row {
             assert!(
                 text_at(engine, end).is_some(),
@@ -1998,43 +2016,12 @@ fn every_release_since_the_floor_pins_the_required_desks() {
     }
 }
 
-/// A DESK ADDED FOR A LATER RELEASE ASKS NOTHING OF AN EARLIER ONE (the
-/// round-four review). The next release's `split-sequences` desk, required
-/// from v0.98.0 on, is required of v0.98.0 and after and of no frozen release
-/// before it, while every v0.97.0 desk stays required of v0.97.0.
-///
-/// FAILS WITHOUT THE FIX: the table had one floor for the whole set, so the
-/// new desk was required of v0.97.0 too — whose fixtures can never gain it —
-/// and the floor test above, and the cut's guard gate with it, went red.
-#[test]
-fn a_desk_added_for_a_later_release_asks_nothing_of_an_earlier_one() {
-    const GROWN: &[(&str, &str)] = &[
-        ("v0.97.0", "history"),
-        ("v0.97.0", "stalled-sequence"),
-        ("v0.98.0", "split-sequences"),
-    ];
-    assert_eq!(
-        required_desks_of(GROWN, "v0.97.0"),
-        ["history", "stalled-sequence"]
-    );
-    assert_eq!(
-        required_desks_of(GROWN, "v0.98.0"),
-        ["history", "stalled-sequence", "split-sequences"]
-    );
-    assert_eq!(
-        required_desks_of(GROWN, "v0.100.0"),
-        ["history", "stalled-sequence", "split-sequences"],
-        "releases order as numbers, never as strings"
-    );
-    assert!(required_desks_of(GROWN, "v0.95.0").is_empty());
-}
-
 /// THE SUCCESSOR SAYS WHAT DEGRADED (the 2026-09-22/23 update audit, plan
 /// P1-5). The v0.91.0 incident desk with its shell's meta rewritten to hold a
 /// NUL in the directory — what an older producer carried for an OSC 7 `%00` —
 /// still adopts both sessions, and the count the landing record reads
 /// (`IncomingHandoff::repainted_tabs`) is the one session this build
-/// repainted, which the landing record then names.
+/// repainted.
 /// Before, the degrade was a log line only: the user found a blank tab with
 /// no word about why.
 #[test]
@@ -2054,12 +2041,6 @@ fn a_repainted_session_is_counted_for_the_landing_row() {
     let incoming = take_incoming_as(ReceiverShape::Current);
     assert_eq!(incoming.adopted.len(), 2, "both shells adopt");
     assert_eq!(incoming.repainted_tabs(), 1, "one of them was repainted");
-    let words = crate::update_words::landed("0.92.0", 7, incoming.repainted_tabs(), None);
-    assert_eq!(
-        words.detail.first().map(String::as_str),
-        Some("1 tab repainted"),
-        "the landing record names the repaint"
-    );
     staged.teardown();
 }
 
@@ -2266,6 +2247,7 @@ pub(super) fn capture_transport(scratch: &std::path::Path) -> TransportCapture {
         ready_write.as_fd(),
         commit_read.as_fd(),
         deadline,
+        None,
     )
     .expect("the grant is sent");
     dialer
@@ -2792,10 +2774,6 @@ fn a_v097_policy_desk_is_said_as_the_policys_request() {
             row,
             crate::update_words::scrollback_withheld(loss.lines, loss.tabs),
             "{label}: the row says the new version asked for it"
-        );
-        assert!(
-            !format!("{row:?}").contains("newest lines came across"),
-            "{label}: no claim that the newest lines crossed: {row:?}"
         );
         for (control, own) in [
             ("no policy of its own", None),

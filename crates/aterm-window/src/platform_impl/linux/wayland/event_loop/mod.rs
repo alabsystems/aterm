@@ -7,26 +7,27 @@
 //! Modified by the aterm project in 2026; see the repository NOTICE.
 //!
 //! The event-loop routines.
+//!
+//! LOCAL PATCH (aterm), 2026-10-17 (docs/AUDIT-third-party-2026-10-15.md, LW.7 with winit-core
+//! WC.8): the loop waits in `common::poll` (one `poll(2)` over the display's socket, the loop's
+//! eventfd waker, the clipboard's and any drop being read) and reads the display through
+//! libwayland's `prepare_read` / `read_events` / `dispatch_pending` on its own queue, where
+//! upstream ran a calloop loop with calloop-wayland-source. User events and clipboard requests
+//! come over channels that wake the poll, each with a waker of its own: a user event's wake is
+//! news for the application (`dispatched_events`), and a clipboard request is answered and
+//! flushed within the turn that woke for it, as calloop's channel source answered it, with no
+//! `NewEvents`/`AboutToWait` turn of its own. Key repeat is a deadline the poll waits for. CUT:
+//! the `pump_events` wake-up thread, which existed to wake calloop for an embedder polling the
+//! loop's descriptor (no aterm crate embeds the loop; `AsFd` left with calloop), and the
+//! `AsFd`/`AsRawFd` impls.
 
 use std::cell::{Cell, RefCell};
-use std::io::Result as IOResult;
 use std::marker::PhantomData;
 use std::mem;
-use std::os::fd::OwnedFd;
-use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, RawFd};
-use std::rc::Rc;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread::JoinHandle;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-use calloop::ping::Ping;
-use rustix::event::{PollFd, PollFlags};
-use rustix::pipe::{self, PipeFlags};
-use sctk::reexports::calloop::Error as CalloopError;
-use sctk::reexports::calloop_wayland_source::WaylandSource;
-use sctk::reexports::client::{globals, Connection, QueueHandle};
-use tracing::warn;
 
 use crate::cursor::OnlyCursorImage;
 use crate::dpi::LogicalSize;
@@ -34,6 +35,7 @@ use crate::error::{EventLoopError, OsError as RootOsError};
 use crate::event::{Event, InnerSizeWriter, StartCause, WindowEvent};
 use crate::event_loop::{ActiveEventLoop as RootActiveEventLoop, ControlFlow, DeviceEvents};
 use crate::platform::pump_events::PumpStatus;
+use crate::platform_impl::common::poll::{self, Waker};
 use crate::platform_impl::platform::min_timeout;
 use crate::platform_impl::{
     ActiveEventLoop as PlatformActiveEventLoop, OsError, PlatformCustomCursor,
@@ -46,12 +48,10 @@ pub mod sink;
 pub use proxy::EventLoopProxy;
 use sink::EventSink;
 
-use super::clipboard::WaylandClipboard;
-use super::state::{WindowCompositorUpdate, WinitState};
+use super::clipboard::{ClipboardRequest, WaylandClipboard};
+use super::state::{Connection, WindowCompositorUpdate, WinitState};
 use super::window::state::FrameCallbackState;
-use super::{logical_to_physical_rounded, DeviceId, WaylandError, WindowId};
-
-type WaylandDispatcher = calloop::Dispatcher<'static, WaylandSource<WinitState>, WinitState>;
+use super::{logical_to_physical_rounded, WaylandError, WindowId};
 
 /// The Wayland event loop.
 pub struct EventLoop<T: 'static> {
@@ -63,133 +63,76 @@ pub struct EventLoop<T: 'static> {
     window_ids: Vec<WindowId>,
 
     /// Sender of user events.
-    user_events_sender: calloop::channel::Sender<T>,
+    user_events_sender: Sender<T>,
+
+    /// The user events, as they arrive.
+    user_events_receiver: Receiver<T>,
+
+    /// Pending events from the user, taken from the channel by the last wait.
+    pending_user_events: Vec<T>,
 
     /// The clipboard handle (see `clipboard.rs`); `clipboard()` clones it out.
     clipboard: WaylandClipboard,
 
-    // XXX can't remove RefCell out of here, unless we can plumb generics into the `Window`, which
-    // we don't really want, since it'll break public API by a lot.
-    /// Pending events from the user.
-    pending_user_events: Rc<RefCell<Vec<T>>>,
+    /// The clipboard's requests: any thread posts, the loop thread (which owns the seats,
+    /// their serials and the data devices) answers.
+    clipboard_requests: Receiver<ClipboardRequest>,
 
-    /// The Wayland dispatcher to has raw access to the queue when needed, such as
-    /// when creating a new window.
-    wayland_dispatcher: WaylandDispatcher,
+    /// Wakes the loop for a clipboard request: not news for the application, so its wake
+    /// leaves `dispatched_events` alone.
+    clipboard_waker: Waker,
 
-    /// Connection to the wayland server.
-    connection: Connection,
+    /// Whether the last flush left requests queued (the socket was full): the next wait
+    /// also waits for the socket to take more.
+    flush_pending: bool,
+
+    /// The connection to the Wayland server.
+    connection: Arc<Connection>,
 
     /// Event loop window target.
     window_target: RootActiveEventLoop,
-
-    // XXX drop after everything else, just to be safe.
-    /// Calloop's event loop.
-    event_loop: calloop::EventLoop<'static, WinitState>,
-
-    pump_event_notifier: Option<PumpEventNotifier>,
 }
 
 impl<T: 'static> EventLoop<T> {
     pub fn new() -> Result<EventLoop<T>, EventLoopError> {
-        macro_rules! map_err {
-            ($e:expr, $err:expr) => {
-                $e.map_err(|error| os_error!($err(error).into()))
-            };
-        }
+        let wire_error = |error: aterm_wayland::proxy::Error| os_error!(OsError::from(error));
 
-        let connection = map_err!(Connection::connect_to_env(), WaylandError::Connection)?;
+        let connection = Arc::new(Connection::connect().map_err(wire_error)?);
 
-        let (globals, mut event_queue) =
-            map_err!(globals::registry_queue_init(&connection), WaylandError::Global)?;
-        let queue_handle = event_queue.handle();
-
-        let event_loop =
-            map_err!(calloop::EventLoop::<WinitState>::try_new(), WaylandError::Calloop)?;
-
-        let mut winit_state = WinitState::new(&globals, &queue_handle, event_loop.handle())
-            .map_err(|error| os_error!(error))?;
+        let mut winit_state =
+            WinitState::new(Arc::clone(&connection)).map_err(|error| os_error!(error))?;
 
         // NOTE: do a roundtrip after binding the globals to prevent potential
         // races with the server.
-        map_err!(event_queue.roundtrip(&mut winit_state), WaylandError::Dispatch)?;
+        let result = connection.queue.roundtrip();
+        winit_state.drain();
+        result.map_err(wire_error)?;
 
-        // Register Wayland source.
-        let wayland_source = WaylandSource::new(connection.clone(), event_queue);
-        let wayland_dispatcher =
-            calloop::Dispatcher::new(wayland_source, |_, queue, winit_state: &mut WinitState| {
-                let result = queue.dispatch_pending(winit_state);
-                if result.is_ok()
-                    && (!winit_state.events_sink.is_empty()
-                        || !winit_state.window_compositor_updates.is_empty())
-                {
-                    winit_state.dispatched_events = true;
-                }
-                result
-            });
-
-        map_err!(
-            event_loop.handle().register_dispatcher(wayland_dispatcher.clone()),
-            WaylandError::Calloop
-        )?;
+        // An event's loop awakener to wake up for window events from winit's windows.
+        let waker =
+            Waker::new().map_err(|error| os_error!(OsError::from(WaylandError::Io(error))))?;
 
         // Setup the user proxy.
-        let pending_user_events = Rc::new(RefCell::new(Vec::new()));
-        let pending_user_events_clone = pending_user_events.clone();
-        let (user_events_sender, user_events_channel) = calloop::channel::channel();
-        let result = event_loop
-            .handle()
-            .insert_source(user_events_channel, move |event, _, winit_state: &mut WinitState| {
-                if let calloop::channel::Event::Msg(msg) = event {
-                    winit_state.dispatched_events = true;
-                    pending_user_events_clone.borrow_mut().push(msg);
-                }
-            })
-            .map_err(|error| error.error);
-        map_err!(result, WaylandError::Calloop)?;
+        let (user_events_sender, user_events_receiver) = mpsc::channel();
 
-        // The clipboard's request channel: any thread posts, the loop thread
-        // (which owns the seats, their serials and the data devices) answers.
-        let (clipboard_sender, clipboard_channel) = calloop::channel::channel();
+        // The clipboard's request channel: any thread posts, the loop thread (which owns the
+        // seats, their serials and the data devices) answers.
+        let (clipboard_sender, clipboard_requests) = mpsc::channel();
+        let clipboard_waker =
+            Waker::new().map_err(|error| os_error!(OsError::from(WaylandError::Io(error))))?;
         let clipboard = WaylandClipboard::new(
             clipboard_sender,
+            clipboard_waker.clone(),
             winit_state.clipboard.shared(),
             std::thread::current().id(),
         );
-        let result = event_loop
-            .handle()
-            .insert_source(clipboard_channel, |event, _, winit_state: &mut WinitState| {
-                if let calloop::channel::Event::Msg(request) = event {
-                    winit_state.handle_clipboard_request(request);
-                }
-            })
-            .map_err(|error| error.error);
-        map_err!(result, WaylandError::Calloop)?;
-
-        // An event's loop awakener to wake up for window events from winit's windows.
-        let (event_loop_awakener, event_loop_awakener_source) = map_err!(
-            calloop::ping::make_ping()
-                .map_err(|error| CalloopError::OtherError(Box::new(error).into())),
-            WaylandError::Calloop
-        )?;
-
-        let result = event_loop
-            .handle()
-            .insert_source(event_loop_awakener_source, move |_, _, winit_state: &mut WinitState| {
-                // Mark that we have something to dispatch.
-                winit_state.dispatched_events = true;
-            })
-            .map_err(|error| error.error);
-        map_err!(result, WaylandError::Calloop)?;
 
         let window_target = ActiveEventLoop {
-            connection: connection.clone(),
-            wayland_dispatcher: wayland_dispatcher.clone(),
-            event_loop_awakener,
-            queue_handle,
+            waker,
             control_flow: Cell::new(ControlFlow::default()),
             exit: Cell::new(None),
             state: RefCell::new(winit_state),
+            connection: Arc::clone(&connection),
         };
 
         let event_loop = Self {
@@ -197,17 +140,18 @@ impl<T: 'static> EventLoop<T> {
             compositor_updates: Vec::new(),
             buffer_sink: EventSink::default(),
             window_ids: Vec::new(),
-            connection,
-            wayland_dispatcher,
             user_events_sender,
+            user_events_receiver,
+            pending_user_events: Vec::new(),
             clipboard,
-            pending_user_events,
-            event_loop,
+            clipboard_requests,
+            clipboard_waker,
+            flush_pending: false,
+            connection,
             window_target: RootActiveEventLoop {
                 p: PlatformActiveEventLoop::Wayland(window_target),
                 _marker: PhantomData,
             },
-            pump_event_notifier: None,
         };
 
         Ok(event_loop)
@@ -268,28 +212,6 @@ impl<T: 'static> EventLoop<T> {
 
             PumpStatus::Exit(code)
         } else {
-            // NOTE: spawn a wake-up thread, thus if we have code reading the wayland connection
-            // in parallel to winit, we ensure that the loop itself is marked as having events.
-            if timeout.is_some() && self.pump_event_notifier.is_none() {
-                let awakener = match &self.window_target.p {
-                    PlatformActiveEventLoop::Wayland(window_target) => {
-                        window_target.event_loop_awakener.clone()
-                    },
-                    #[cfg(x11_platform)]
-                    PlatformActiveEventLoop::X(_) => unreachable!(),
-                    PlatformActiveEventLoop::Headless(_) => unreachable!(),
-                };
-
-                self.pump_event_notifier =
-                    Some(PumpEventNotifier::spawn(self.connection.clone(), awakener));
-            }
-
-            if let Some(pump_event_notifier) = self.pump_event_notifier.as_ref() {
-                // Notify that we don't have to wait, since we're out of winit.
-                *pump_event_notifier.control.0.lock().unwrap() = PumpEventNotifierAction::Monitor;
-                pump_event_notifier.control.1.notify_one();
-            }
-
             PumpStatus::Continue
         }
     }
@@ -312,27 +234,22 @@ impl<T: 'static> EventLoop<T> {
                 min_timeout(control_flow_timeout, timeout)
             };
 
-            // NOTE Ideally we should flush as the last thing we do before polling
-            // to wait for events, and this should be done by the calloop
-            // WaylandSource but we currently need to flush writes manually.
-            //
             // Checking for flush error is essential to perform an exit with error, since
             // once we have a protocol error, we could get stuck retrying...
-            if self.connection.flush().is_err() {
-                self.set_exit_code(1);
+            if let Err(code) = self.flush() {
+                self.set_exit_code(code);
                 return;
             }
 
-            if let Err(error) = self.loop_dispatch(timeout) {
+            if let Err(code) = self.loop_dispatch(timeout) {
                 // NOTE We exit on errors from dispatches, since if we've got protocol error
-                // libwayland-client/wayland-rs will inform us anyway, but crashing downstream is
+                // libwayland-client will inform us anyway, but crashing downstream is
                 // not really an option. Instead we inform that the event loop got
                 // destroyed. We may communicate an error that something was
                 // terminated, but winit doesn't provide us with an API to do that
                 // via some event. Still, we set the exit code to the error's OS
                 // error code, or to 1 if not possible.
-                let exit_code = error.raw_os_error().unwrap_or(1);
-                self.set_exit_code(exit_code);
+                self.set_exit_code(code);
                 return;
             }
 
@@ -389,7 +306,7 @@ impl<T: 'static> EventLoop<T> {
 
         // Handle pending user events. We don't need back buffer, since we can't dispatch
         // user events indirectly via callback to the user.
-        for user_event in self.pending_user_events.borrow_mut().drain(..) {
+        for user_event in std::mem::take(&mut self.pending_user_events) {
             callback(Event::UserEvent(user_event), &self.window_target);
         }
 
@@ -399,13 +316,15 @@ impl<T: 'static> EventLoop<T> {
         for mut compositor_update in compositor_updates.drain(..) {
             let window_id = compositor_update.window_id;
             if compositor_update.scale_changed {
-                let (physical_size, scale_factor) = self.with_state(|state| {
+                let Some((physical_size, scale_factor)) = self.with_state(|state| {
                     let windows = state.windows.get_mut();
-                    let window = windows.get(&window_id).unwrap().lock().unwrap();
+                    let window = windows.get(&window_id)?.lock().unwrap();
                     let scale_factor = window.scale_factor();
                     let size = logical_to_physical_rounded(window.inner_size(), scale_factor);
-                    (size, scale_factor)
-                });
+                    Some((size, scale_factor))
+                }) else {
+                    continue;
+                };
 
                 // Stash the old window size.
                 let old_physical_size = physical_size;
@@ -431,11 +350,13 @@ impl<T: 'static> EventLoop<T> {
                 if old_physical_size != physical_size {
                     self.with_state(|state| {
                         let windows = state.windows.get_mut();
-                        let mut window = windows.get(&window_id).unwrap().lock().unwrap();
+                        if let Some(window) = windows.get(&window_id) {
+                            let mut window = window.lock().unwrap();
 
-                        let new_logical_size: LogicalSize<f64> =
-                            physical_size.to_logical(scale_factor);
-                        window.request_inner_size(new_logical_size.into());
+                            let new_logical_size: LogicalSize<f64> =
+                                physical_size.to_logical(scale_factor);
+                            window.request_inner_size(new_logical_size.into());
+                        }
                     });
 
                     // Make it queue resize.
@@ -446,24 +367,26 @@ impl<T: 'static> EventLoop<T> {
             // NOTE: Rescale changed the physical size which winit operates in, thus we should
             // resize.
             if compositor_update.resized || compositor_update.scale_changed {
-                let physical_size = self.with_state(|state| {
+                let Some(physical_size) = self.with_state(|state| {
                     let windows = state.windows.get_mut();
-                    let window = windows.get(&window_id).unwrap().lock().unwrap();
+                    let window = windows.get(&window_id)?.lock().unwrap();
 
+                    // LOCAL PATCH (aterm), LW.5: the client-side frame this drew first (its
+                    // subsurfaces had to be ready before the app's commit inside `Resized`,
+                    // or mutter clipped the stored geometry to the content) is gone; the
+                    // application's header is part of the surface it presents.
                     let scale_factor = window.scale_factor();
                     let size = logical_to_physical_rounded(window.inner_size(), scale_factor);
 
                     // Mark the window as needed a redraw.
-                    state
-                        .window_requests
-                        .get_mut()
-                        .get_mut(&window_id)
-                        .unwrap()
-                        .redraw_requested
-                        .store(true, Ordering::Relaxed);
+                    if let Some(requests) = state.window_requests.get_mut().get_mut(&window_id) {
+                        requests.redraw_requested.store(true, Ordering::Relaxed);
+                    }
 
-                    size
-                });
+                    Some(size)
+                }) else {
+                    continue;
+                };
 
                 callback(
                     Event::WindowEvent {
@@ -511,14 +434,14 @@ impl<T: 'static> EventLoop<T> {
         for window_id in window_ids.iter() {
             let event = self.with_state(|state| {
                 let window_requests = state.window_requests.get_mut();
-                if window_requests.get(window_id).unwrap().take_closed() {
+                if window_requests.get(window_id).is_some_and(|requests| requests.take_closed()) {
                     mem::drop(window_requests.remove(window_id));
                     mem::drop(state.windows.get_mut().remove(window_id));
+                    mem::drop(state.surface_scales.remove(window_id));
                     return Some(WindowEvent::Destroyed);
                 }
 
-                let mut window =
-                    state.windows.get_mut().get_mut(window_id).unwrap().lock().unwrap();
+                let mut window = state.windows.get_mut().get_mut(window_id)?.lock().unwrap();
 
                 if window.frame_callback_state() == FrameCallbackState::Requested {
                     return None;
@@ -526,11 +449,9 @@ impl<T: 'static> EventLoop<T> {
 
                 // Reset the frame callbacks state.
                 window.frame_callback_reset();
-                let mut redraw_requested =
-                    window_requests.get(window_id).unwrap().take_redraw_requested();
-
-                // Redraw the frame while at it.
-                redraw_requested |= window.refresh_frame();
+                let redraw_requested = window_requests
+                    .get(window_id)
+                    .is_some_and(|requests| requests.take_redraw_requested());
 
                 redraw_requested.then_some(WindowEvent::RedrawRequested)
             });
@@ -551,42 +472,9 @@ impl<T: 'static> EventLoop<T> {
         // This is always the last event we dispatch before poll again
         callback(Event::AboutToWait, &self.window_target);
 
-        // Update the window frames and schedule redraws.
-        let mut wake_up = false;
-        for window_id in window_ids.drain(..) {
-            wake_up |= self.with_state(|state| match state.windows.get_mut().get_mut(&window_id) {
-                Some(window) => {
-                    let refresh = window.lock().unwrap().refresh_frame();
-                    if refresh {
-                        state
-                            .window_requests
-                            .get_mut()
-                            .get_mut(&window_id)
-                            .unwrap()
-                            .redraw_requested
-                            .store(true, Ordering::Relaxed);
-                    }
-
-                    refresh
-                },
-                None => false,
-            });
-        }
-
-        // Wakeup event loop if needed.
-        //
-        // If the user draws from the `AboutToWait` this is likely not required, however
-        // we can't do much about it.
-        if wake_up {
-            match &self.window_target.p {
-                PlatformActiveEventLoop::Wayland(window_target) => {
-                    window_target.event_loop_awakener.ping();
-                },
-                #[cfg(x11_platform)]
-                PlatformActiveEventLoop::X(_) => unreachable!(),
-                PlatformActiveEventLoop::Headless(_) => unreachable!(),
-            }
-        }
+        // LOCAL PATCH (aterm), LW.5: upstream redrew each window's client-side frame here and
+        // woke the loop when one needed a redraw; with no frame there is nothing to refresh.
+        window_ids.clear();
 
         std::mem::swap(&mut self.compositor_updates, &mut compositor_updates);
         std::mem::swap(&mut self.buffer_sink, &mut buffer_sink);
@@ -595,7 +483,7 @@ impl<T: 'static> EventLoop<T> {
 
     #[inline]
     pub fn create_proxy(&self) -> EventLoopProxy<T> {
-        EventLoopProxy::new(self.user_events_sender.clone())
+        EventLoopProxy::new(self.user_events_sender.clone(), self.waker().clone())
     }
 
     #[inline]
@@ -603,41 +491,156 @@ impl<T: 'static> EventLoop<T> {
         &self.window_target
     }
 
+    fn active(&self) -> &ActiveEventLoop {
+        match &self.window_target.p {
+            PlatformActiveEventLoop::Wayland(window_target) => window_target,
+            _ => unreachable!(),
+        }
+    }
+
+    fn waker(&self) -> &Waker {
+        &self.active().waker
+    }
+
     fn with_state<'a, U: 'a, F: FnOnce(&'a mut WinitState) -> U>(&'a mut self, callback: F) -> U {
         let state = match &mut self.window_target.p {
             PlatformActiveEventLoop::Wayland(window_target) => window_target.state.get_mut(),
-            #[cfg(x11_platform)]
             _ => unreachable!(),
         };
 
         callback(state)
     }
 
-    fn loop_dispatch<D: Into<Option<std::time::Duration>>>(&mut self, timeout: D) -> IOResult<()> {
-        let state = match &mut self.window_target.p {
-            PlatformActiveEventLoop::Wayland(window_target) => window_target.state.get_mut(),
-            #[cfg(feature = "x11")]
-            _ => unreachable!(),
+    /// Wait for the display, a wake, a drop being read or a key's repeat, at most `timeout`
+    /// (`None`: for ever); read and dispatch what came, and apply it to the state. `Err` is the
+    /// exit code a dead display ends the loop with.
+    fn loop_dispatch(&mut self, timeout: Option<Duration>) -> Result<(), i32> {
+        let connection = Arc::clone(&self.connection);
+        let queue = &connection.queue;
+        let wake_fd = self.waker().as_raw_fd();
+
+        // Dispatch what another reader of the display queued for this loop, then announce
+        // this read; a queue that filled meanwhile is dispatched first.
+        let intent = loop {
+            queue.dispatch_pending().map_err(|error| wire_exit_code(&error))?;
+            self.with_state(WinitState::drain);
+            // What the state answered goes out before the wait (calloop-wayland-source's
+            // `before_sleep` flushed here).
+            self.flush()?;
+            match queue.prepare_read().map_err(|error| wire_exit_code(&error))? {
+                Some(intent) => break intent,
+                None => continue,
+            }
         };
 
-        self.event_loop.dispatch(timeout, state).map_err(|error| {
+        // Something is already waiting to be handled: look, but do not block.
+        let (ready_now, repeat_at, dnd_fds) = self.with_state(|state| {
+            (
+                state.dispatched_events,
+                state.next_key_repeat(),
+                state.dnd_pipes.iter().map(|pipe| pipe.fd()).collect::<Vec<_>>(),
+            )
+        });
+        let busy = ready_now || !self.pending_user_events.is_empty();
+        let wait = if busy {
+            Some(Duration::ZERO)
+        } else {
+            let until_repeat = repeat_at.map(|at| at.saturating_duration_since(Instant::now()));
+            min_timeout(timeout, until_repeat)
+        };
+
+        let display_fd = connection.display().fd().map_err(|error| wire_exit_code(&error))?;
+        let mut fds = Vec::with_capacity(3 + dnd_fds.len());
+        let mut display_events = libc::POLLIN;
+        if self.flush_pending {
+            display_events |= libc::POLLOUT;
+        }
+        fds.push(libc::pollfd { fd: display_fd, events: display_events, revents: 0 });
+        fds.push(poll::readable(wake_fd));
+        fds.push(poll::readable(self.clipboard_waker.as_raw_fd()));
+        fds.extend(dnd_fds.iter().map(|fd| poll::readable(*fd)));
+
+        if let Err(error) = poll::wait(&mut fds, wait) {
             tracing::error!("Error dispatching event loop: {}", error);
-            error.into()
-        })
+            drop(intent);
+            return Err(error.raw_os_error().unwrap_or(1));
+        }
+
+        // Read what the socket holds (a hang-up or an error is read too, and says the
+        // display is gone); a wake that was not the socket's cancels the read.
+        if fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+            intent.read().map_err(|error| wire_exit_code(&error))?;
+        } else {
+            drop(intent);
+        }
+
+        if poll::ready(&fds[1]) {
+            // Mark that we have something to dispatch.
+            self.waker().drain();
+            self.with_state(|state| state.dispatched_events = true);
+        }
+        if poll::ready(&fds[2]) {
+            // A clipboard request, answered below.
+            self.clipboard_waker.drain();
+        }
+
+        queue.dispatch_pending().map_err(|error| wire_exit_code(&error))?;
+        let ready_pipes: Vec<_> =
+            fds[3..].iter().filter(|p| poll::ready(p)).map(|p| p.fd).collect();
+        self.with_state(|state| {
+            state.drain();
+            if !ready_pipes.is_empty() {
+                state.read_dnd_pipes(&ready_pipes);
+            }
+            if state.fire_key_repeats(Instant::now()) {
+                // Required to handle the wakeups from the repeat sources.
+                state.dispatched_events = true;
+            }
+        });
+
+        // The clipboard's requests, which the loop answers now, so their requests to the
+        // compositor go out with this turn's flush.
+        let requests: Vec<ClipboardRequest> = self.clipboard_requests.try_iter().collect();
+        if !requests.is_empty() {
+            self.with_state(|state| {
+                for request in requests {
+                    state.handle_clipboard_request(request);
+                }
+            });
+        }
+
+        // Once dispatching is finished, flush the responses to the compositor.
+        self.flush()?;
+
+        // The user's events.
+        let mut user_events: Vec<T> = self.user_events_receiver.try_iter().collect();
+        if !user_events.is_empty() {
+            self.pending_user_events.append(&mut user_events);
+            self.with_state(|state| state.dispatched_events = true);
+        }
+
+        Ok(())
+    }
+
+    /// Write the queued requests. A full socket (EAGAIN) is not an error: the rest stays
+    /// queued, and the next wait also waits for the socket to take it. `Err` is the exit code
+    /// a dead display ends the loop with: the error's errno (a dead compositor's socket answers
+    /// EPIPE or ECONNRESET), as a failed dispatch's is, so the application can say why its
+    /// display connection ended.
+    fn flush(&mut self) -> Result<(), i32> {
+        match self.connection.display().flush() {
+            Ok(()) => self.flush_pending = false,
+            Err(aterm_wayland::proxy::Error::Display(libc::EAGAIN)) => self.flush_pending = true,
+            Err(error) => return Err(wire_exit_code(&error)),
+        }
+        Ok(())
     }
 
     fn roundtrip(&mut self) -> Result<usize, RootOsError> {
-        let state = match &mut self.window_target.p {
-            PlatformActiveEventLoop::Wayland(window_target) => window_target.state.get_mut(),
-            #[cfg(feature = "x11")]
-            _ => unreachable!(),
-        };
-
-        let mut wayland_source = self.wayland_dispatcher.as_source_mut();
-        let event_queue = wayland_source.queue();
-        event_queue.roundtrip(state).map_err(|error| {
-            os_error!(OsError::WaylandError(Arc::new(WaylandError::Dispatch(error))))
-        })
+        let connection = Arc::clone(&self.connection);
+        let result = connection.queue.roundtrip();
+        self.with_state(|state| state.drain());
+        result.map(|()| 0).map_err(|error| os_error!(OsError::from(error)))
     }
 
     fn control_flow(&self) -> ControlFlow {
@@ -657,24 +660,18 @@ impl<T: 'static> EventLoop<T> {
     }
 }
 
-impl<T> AsFd for EventLoop<T> {
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        self.event_loop.as_fd()
-    }
-}
-
-impl<T> AsRawFd for EventLoop<T> {
-    fn as_raw_fd(&self) -> RawFd {
-        self.event_loop.as_raw_fd()
+/// The exit code a failed display call ends the loop with: the display's errno (`EPIPE` or
+/// `ECONNRESET` when the compositor went, `EPROTO` after a protocol error), else 1.
+fn wire_exit_code(error: &aterm_wayland::proxy::Error) -> i32 {
+    match error {
+        aterm_wayland::proxy::Error::Display(errno) if *errno > 0 => *errno,
+        _ => 1,
     }
 }
 
 pub struct ActiveEventLoop {
     /// The event loop wakeup source.
-    pub event_loop_awakener: Ping,
-
-    /// The main queue used by the event loop.
-    pub queue_handle: QueueHandle<WinitState>,
+    pub(crate) waker: Waker,
 
     /// The application's latest control_flow state
     pub(crate) control_flow: Cell<ControlFlow>,
@@ -686,11 +683,8 @@ pub struct ActiveEventLoop {
     /// Winit state.
     pub state: RefCell<WinitState>,
 
-    /// Dispatcher of Wayland events.
-    pub wayland_dispatcher: WaylandDispatcher,
-
     /// Connection to the wayland server.
-    pub connection: Connection,
+    pub(crate) connection: Arc<Connection>,
 }
 
 impl ActiveEventLoop {
@@ -732,103 +726,24 @@ impl ActiveEventLoop {
     pub fn raw_display_handle_rwh_06(
         &self,
     ) -> Result<rwh_06::RawDisplayHandle, rwh_06::HandleError> {
-        use sctk::reexports::client::Proxy;
-
         Ok(rwh_06::WaylandDisplayHandle::new({
-            let ptr = self.connection.display().id().as_ptr();
-            std::ptr::NonNull::new(ptr as *mut _).expect("wl_display should never be null")
+            std::ptr::NonNull::new(self.connection.display().as_ptr())
+                .expect("wl_display should never be null")
         })
         .into())
     }
 }
 
-#[derive(Debug)]
-struct PumpEventNotifier {
-    /// Whether we're in winit or not.
-    control: Arc<(Mutex<PumpEventNotifierAction>, Condvar)>,
-    /// Waker handle for the working thread.
-    worker_waker: Option<OwnedFd>,
-    /// Thread handle.
-    handle: Option<JoinHandle<()>>,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl Drop for PumpEventNotifier {
-    fn drop(&mut self) {
-        // Wake-up the thread.
-        if let Some(worker_waker) = self.worker_waker.as_ref() {
-            let _ = rustix::io::write(worker_waker.as_fd(), &[0u8]);
-        }
-        *self.control.0.lock().unwrap() = PumpEventNotifierAction::Shutdown;
-        self.control.1.notify_one();
-
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+    #[test]
+    fn a_dead_display_s_errno_is_the_exit_code_and_anything_else_is_one() {
+        use aterm_wayland::proxy::Error;
+        assert_eq!(wire_exit_code(&Error::Display(libc::EPIPE)), libc::EPIPE);
+        assert_eq!(wire_exit_code(&Error::Display(libc::ECONNRESET)), libc::ECONNRESET);
+        assert_eq!(wire_exit_code(&Error::Display(-1)), 1);
+        assert_eq!(wire_exit_code(&Error::NoObject), 1);
     }
-}
-
-impl PumpEventNotifier {
-    fn spawn(connection: Connection, awakener: Ping) -> Self {
-        // Start from the waiting state.
-        let control = Arc::new((Mutex::new(PumpEventNotifierAction::Pause), Condvar::new()));
-        let control_thread = Arc::clone(&control);
-
-        let (read, write) = match pipe::pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK) {
-            Ok((read, write)) => (read, write),
-            Err(_) => return Self { control, handle: None, worker_waker: None },
-        };
-
-        let handle =
-            std::thread::Builder::new().name(String::from("pump_events mon")).spawn(move || {
-                let (lock, cvar) = &*control_thread;
-                'outer: loop {
-                    let mut wait = lock.lock().unwrap();
-                    while *wait == PumpEventNotifierAction::Pause {
-                        wait = cvar.wait(wait).unwrap();
-                    }
-
-                    // Exit the loop when we're asked to. Given that we poll
-                    // only once we can take the `prepare_read`, but in some cases
-                    // it could be not possible, we may block on `join`.
-                    if *wait == PumpEventNotifierAction::Shutdown {
-                        break 'outer;
-                    }
-
-                    // Wake-up the main loop and put this one back to sleep.
-                    *wait = PumpEventNotifierAction::Pause;
-                    drop(wait);
-
-                    while let Some(read_guard) = connection.prepare_read() {
-                        let _ = connection.flush();
-                        let poll_fd = PollFd::from_borrowed_fd(connection.as_fd(), PollFlags::IN);
-                        let pipe_poll_fd = PollFd::from_borrowed_fd(read.as_fd(), PollFlags::IN);
-                        // Read from the `fd` before going back to poll.
-                        if Ok(1) == rustix::io::read(read.as_fd(), &mut [0u8; 1]) {
-                            break 'outer;
-                        }
-                        let _ = rustix::event::poll(&mut [poll_fd, pipe_poll_fd], -1);
-                        // Non-blocking read the connection.
-                        let _ = read_guard.read_without_dispatch();
-                    }
-
-                    awakener.ping();
-                }
-            });
-
-        if let Some(_err) = handle.as_ref().err() {
-            warn!("failed to spawn pump_events wake-up thread: {_err}");
-        }
-
-        PumpEventNotifier { control, handle: handle.ok(), worker_waker: Some(write) }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum PumpEventNotifierAction {
-    /// Monitor the wayland queue.
-    Monitor,
-    /// Pause monitoring.
-    Pause,
-    /// Shutdown the thread.
-    Shutdown,
 }

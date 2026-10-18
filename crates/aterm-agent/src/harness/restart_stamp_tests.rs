@@ -256,14 +256,16 @@ fn the_prune_removes_only_a_stale_stamp() {
     }
 }
 
-/// The relaunch that files an asked exit consumes its stamp, and the cause `asked` is a relaunch's,
-/// not a restart that ended its agent. Negative controls: an exit no act made (`ExitCause::Exit`),
-/// a stamp naming another process, and a dry run take nothing.
+/// THE RELAUNCH THAT FILES AN ASKED EXIT TAKES ITS STAMP: an exit the act
+/// made (its stamp naming the process) is consumed once its relaunch's record
+/// is filed, and the record's cause, `asked`, is a relaunch's — not a restart
+/// that ENDED its agent, whose clock `end_asked_at` dates. NEGATIVE CONTROLS:
+/// an exit no act made (`ExitCause::Exit`) takes nothing, nor does a stamp
+/// naming another process, nor a dry run.
 #[test]
-fn the_relaunch_that_files_an_asked_exit_takes_its_stamp_and_says_why() {
+fn the_relaunch_that_files_an_asked_exit_takes_its_stamp() {
     use super::super::relaunch::{
         CAUSE_ASKED, ExitCause, Snapshot, consume_stamp, ends_its_agent, relaunch_cause,
-        resumed_prompt,
     };
     let tmp = scratch();
     let opts = super::super::upgrade_drive::Opts {
@@ -281,6 +283,8 @@ fn the_relaunch_that_files_an_asked_exit_takes_its_stamp_and_says_why() {
         usage_tap: None,
         instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
         agents_off: Vec::new(),
+        land: false,
+        timings: crate::harness::Timings::FAST,
     };
     let snap = Snapshot {
         stored_login: false,
@@ -293,7 +297,7 @@ fn the_relaunch_that_files_an_asked_exit_takes_its_stamp_and_says_why() {
         session: None,
         cwd: "/".to_string(),
         version: None,
-        codex: None,
+        run: crate::harness::relaunch::AgentRun::Claude,
         dialect: None,
         login: None,
         home: None,
@@ -336,10 +340,5 @@ fn the_relaunch_that_files_an_asked_exit_takes_its_stamp_and_says_why() {
     assert!(
         !ends_its_agent(CAUSE_ASKED),
         "its exit is dated as any relaunch's"
-    );
-    let said = resumed_prompt("2.1.283", CAUSE_ASKED);
-    assert!(
-        said.contains("someone asked aterm to restart Claude Code"),
-        "{said}"
     );
 }

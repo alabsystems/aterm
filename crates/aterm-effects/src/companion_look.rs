@@ -426,7 +426,7 @@ mod tests {
     /// below `TENURE`, never changes the worn cat.
     #[test]
     fn companion_tenure_flicker_conformance_real_gate_holds_the_cat_still() {
-        let m = aterm_spec::derive::companion_tenure_flicker_model();
+        let m = aterm_models_effects::companion_tenure_flicker_model();
         let mut st = m.init_state();
         let mut gate = KittyTenure::default();
         let claude = ident("claude");

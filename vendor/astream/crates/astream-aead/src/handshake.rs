@@ -38,8 +38,166 @@ use astream_digest::Sha256;
 use std::io::{self, Read, Write};
 use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
 
+#[cfg(clean_islands)]
+#[path = "handshake_island.rs"]
+mod handshake_island;
+#[cfg(not(clean_islands))]
+pub use crate::twins::handshake_clamp_info_len;
+#[cfg(clean_islands)]
+pub use handshake_island::handshake_clamp_info_len;
+
+contract_fn! {
+    /// Verified check that a handshake message carries version 1 (`ver == 1`),
+    /// linked via `clean-kernel-defeq` to `handshake_version_valid_isl`.
+    #[must_use]
+    pub fn handshake_version_valid(ver: u8) -> bool
+    clauses [ensures result == (ver == 1)]
+    {
+        ver == 1
+    }
+}
+
 const SHA256_BLOCK: usize = 64;
 const SHA256_OUT: usize = 32;
+const MAX_HKDF_INFO: usize = 1024;
+
+const fn hmac_ipad(k0: &[u8; SHA256_BLOCK]) -> [u8; SHA256_BLOCK] {
+    [
+        k0[0] ^ 0x36,
+        k0[1] ^ 0x36,
+        k0[2] ^ 0x36,
+        k0[3] ^ 0x36,
+        k0[4] ^ 0x36,
+        k0[5] ^ 0x36,
+        k0[6] ^ 0x36,
+        k0[7] ^ 0x36,
+        k0[8] ^ 0x36,
+        k0[9] ^ 0x36,
+        k0[10] ^ 0x36,
+        k0[11] ^ 0x36,
+        k0[12] ^ 0x36,
+        k0[13] ^ 0x36,
+        k0[14] ^ 0x36,
+        k0[15] ^ 0x36,
+        k0[16] ^ 0x36,
+        k0[17] ^ 0x36,
+        k0[18] ^ 0x36,
+        k0[19] ^ 0x36,
+        k0[20] ^ 0x36,
+        k0[21] ^ 0x36,
+        k0[22] ^ 0x36,
+        k0[23] ^ 0x36,
+        k0[24] ^ 0x36,
+        k0[25] ^ 0x36,
+        k0[26] ^ 0x36,
+        k0[27] ^ 0x36,
+        k0[28] ^ 0x36,
+        k0[29] ^ 0x36,
+        k0[30] ^ 0x36,
+        k0[31] ^ 0x36,
+        k0[32] ^ 0x36,
+        k0[33] ^ 0x36,
+        k0[34] ^ 0x36,
+        k0[35] ^ 0x36,
+        k0[36] ^ 0x36,
+        k0[37] ^ 0x36,
+        k0[38] ^ 0x36,
+        k0[39] ^ 0x36,
+        k0[40] ^ 0x36,
+        k0[41] ^ 0x36,
+        k0[42] ^ 0x36,
+        k0[43] ^ 0x36,
+        k0[44] ^ 0x36,
+        k0[45] ^ 0x36,
+        k0[46] ^ 0x36,
+        k0[47] ^ 0x36,
+        k0[48] ^ 0x36,
+        k0[49] ^ 0x36,
+        k0[50] ^ 0x36,
+        k0[51] ^ 0x36,
+        k0[52] ^ 0x36,
+        k0[53] ^ 0x36,
+        k0[54] ^ 0x36,
+        k0[55] ^ 0x36,
+        k0[56] ^ 0x36,
+        k0[57] ^ 0x36,
+        k0[58] ^ 0x36,
+        k0[59] ^ 0x36,
+        k0[60] ^ 0x36,
+        k0[61] ^ 0x36,
+        k0[62] ^ 0x36,
+        k0[63] ^ 0x36,
+    ]
+}
+
+const fn hmac_opad(k0: &[u8; SHA256_BLOCK]) -> [u8; SHA256_BLOCK] {
+    [
+        k0[0] ^ 0x5c,
+        k0[1] ^ 0x5c,
+        k0[2] ^ 0x5c,
+        k0[3] ^ 0x5c,
+        k0[4] ^ 0x5c,
+        k0[5] ^ 0x5c,
+        k0[6] ^ 0x5c,
+        k0[7] ^ 0x5c,
+        k0[8] ^ 0x5c,
+        k0[9] ^ 0x5c,
+        k0[10] ^ 0x5c,
+        k0[11] ^ 0x5c,
+        k0[12] ^ 0x5c,
+        k0[13] ^ 0x5c,
+        k0[14] ^ 0x5c,
+        k0[15] ^ 0x5c,
+        k0[16] ^ 0x5c,
+        k0[17] ^ 0x5c,
+        k0[18] ^ 0x5c,
+        k0[19] ^ 0x5c,
+        k0[20] ^ 0x5c,
+        k0[21] ^ 0x5c,
+        k0[22] ^ 0x5c,
+        k0[23] ^ 0x5c,
+        k0[24] ^ 0x5c,
+        k0[25] ^ 0x5c,
+        k0[26] ^ 0x5c,
+        k0[27] ^ 0x5c,
+        k0[28] ^ 0x5c,
+        k0[29] ^ 0x5c,
+        k0[30] ^ 0x5c,
+        k0[31] ^ 0x5c,
+        k0[32] ^ 0x5c,
+        k0[33] ^ 0x5c,
+        k0[34] ^ 0x5c,
+        k0[35] ^ 0x5c,
+        k0[36] ^ 0x5c,
+        k0[37] ^ 0x5c,
+        k0[38] ^ 0x5c,
+        k0[39] ^ 0x5c,
+        k0[40] ^ 0x5c,
+        k0[41] ^ 0x5c,
+        k0[42] ^ 0x5c,
+        k0[43] ^ 0x5c,
+        k0[44] ^ 0x5c,
+        k0[45] ^ 0x5c,
+        k0[46] ^ 0x5c,
+        k0[47] ^ 0x5c,
+        k0[48] ^ 0x5c,
+        k0[49] ^ 0x5c,
+        k0[50] ^ 0x5c,
+        k0[51] ^ 0x5c,
+        k0[52] ^ 0x5c,
+        k0[53] ^ 0x5c,
+        k0[54] ^ 0x5c,
+        k0[55] ^ 0x5c,
+        k0[56] ^ 0x5c,
+        k0[57] ^ 0x5c,
+        k0[58] ^ 0x5c,
+        k0[59] ^ 0x5c,
+        k0[60] ^ 0x5c,
+        k0[61] ^ 0x5c,
+        k0[62] ^ 0x5c,
+        k0[63] ^ 0x5c,
+    ]
+}
 
 /// HMAC-SHA256 (RFC 2104), composed over `astream-digest`. Ours, not a
 /// dependency — the same stance `astream-cap` takes.
@@ -51,12 +209,8 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; SHA256_OUT] {
     } else {
         k0[..key.len()].copy_from_slice(key);
     }
-    let mut ipad = [0x36u8; SHA256_BLOCK];
-    let mut opad = [0x5cu8; SHA256_BLOCK];
-    for i in 0..SHA256_BLOCK {
-        ipad[i] ^= k0[i];
-        opad[i] ^= k0[i];
-    }
+    let mut ipad = hmac_ipad(&k0);
+    let mut opad = hmac_opad(&k0);
     let inner = {
         let mut h = Sha256::new();
         h.update(ipad);
@@ -66,6 +220,10 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; SHA256_OUT] {
     let mut h = Sha256::new();
     h.update(opad);
     h.update(inner);
+    k0.fill(0);
+    ipad.fill(0);
+    opad.fill(0);
+    core::hint::black_box((&mut k0, &mut ipad, &mut opad));
     h.finalize()
 }
 
@@ -75,7 +233,13 @@ pub(crate) fn hkdf_sha256_32(salt: &[u8], ikm: &[u8], info: &[u8]) -> [u8; 32] {
     // Extract.
     let mut prk = hmac_sha256(salt, ikm);
     // Expand, N = 1: T(1) = HMAC(PRK, T(0)=<empty> ‖ info ‖ 0x01).
-    let mut t1_input = Vec::with_capacity(info.len() + 1);
+    let clamped = handshake_clamp_info_len(info.len() as u64, MAX_HKDF_INFO as u64) as usize;
+    let info_len = if clamped <= MAX_HKDF_INFO {
+        clamped
+    } else {
+        MAX_HKDF_INFO
+    };
+    let mut t1_input = Vec::with_capacity(info_len + 1);
     t1_input.extend_from_slice(info);
     t1_input.push(0x01);
     let okm = hmac_sha256(&prk, &t1_input);
@@ -89,11 +253,67 @@ const HS_VERSION: u8 = 1;
 const HS_MSG_LEN: usize = 4 + 1 + 32; // magic ‖ version ‖ ephemeral pubkey
 const HS_LABEL: &[u8] = b"astream-handshake-v1";
 
+const fn build_hs_msg(pubkey: &[u8; 32]) -> [u8; HS_MSG_LEN] {
+    [
+        HS_MAGIC[0],
+        HS_MAGIC[1],
+        HS_MAGIC[2],
+        HS_MAGIC[3],
+        HS_VERSION,
+        pubkey[0],
+        pubkey[1],
+        pubkey[2],
+        pubkey[3],
+        pubkey[4],
+        pubkey[5],
+        pubkey[6],
+        pubkey[7],
+        pubkey[8],
+        pubkey[9],
+        pubkey[10],
+        pubkey[11],
+        pubkey[12],
+        pubkey[13],
+        pubkey[14],
+        pubkey[15],
+        pubkey[16],
+        pubkey[17],
+        pubkey[18],
+        pubkey[19],
+        pubkey[20],
+        pubkey[21],
+        pubkey[22],
+        pubkey[23],
+        pubkey[24],
+        pubkey[25],
+        pubkey[26],
+        pubkey[27],
+        pubkey[28],
+        pubkey[29],
+        pubkey[30],
+        pubkey[31],
+    ]
+}
+
+const fn has_hs_magic(msg: &[u8; HS_MSG_LEN]) -> bool {
+    msg[0] == HS_MAGIC[0] && msg[1] == HS_MAGIC[1] && msg[2] == HS_MAGIC[2] && msg[3] == HS_MAGIC[3]
+}
+
+const fn hs_msg_version(msg: &[u8; HS_MSG_LEN]) -> u8 {
+    msg[4]
+}
+
+const fn extract_hs_pubkey(msg: &[u8; HS_MSG_LEN]) -> [u8; 32] {
+    [
+        msg[5], msg[6], msg[7], msg[8], msg[9], msg[10], msg[11], msg[12], msg[13], msg[14],
+        msg[15], msg[16], msg[17], msg[18], msg[19], msg[20], msg[21], msg[22], msg[23], msg[24],
+        msg[25], msg[26], msg[27], msg[28], msg[29], msg[30], msg[31], msg[32], msg[33], msg[34],
+        msg[35], msg[36],
+    ]
+}
+
 pub(crate) fn write_hs_msg<W: Write>(w: &mut W, pubkey: &[u8; 32]) -> io::Result<()> {
-    let mut msg = [0u8; HS_MSG_LEN];
-    msg[..4].copy_from_slice(&HS_MAGIC);
-    msg[4] = HS_VERSION;
-    msg[5..].copy_from_slice(pubkey);
+    let msg = build_hs_msg(pubkey);
     w.write_all(&msg)?;
     w.flush()
 }
@@ -101,15 +321,13 @@ pub(crate) fn write_hs_msg<W: Write>(w: &mut W, pubkey: &[u8; 32]) -> io::Result
 pub(crate) fn read_hs_msg<R: Read>(r: &mut R) -> io::Result<[u8; 32]> {
     let mut msg = [0u8; HS_MSG_LEN];
     r.read_exact(&mut msg)?;
-    if msg[..4] != HS_MAGIC || msg[4] != HS_VERSION {
+    if !has_hs_magic(&msg) || !handshake_version_valid(hs_msg_version(&msg)) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "astream handshake: bad magic/version (peer not speaking the sealed handshake)",
         ));
     }
-    let mut pk = [0u8; 32];
-    pk.copy_from_slice(&msg[5..]);
-    Ok(pk)
+    Ok(extract_hs_pubkey(&msg))
 }
 
 /// A fresh ephemeral X25519 keypair, seeded from the OS CSPRNG (`getrandom`, which
@@ -134,7 +352,9 @@ fn derive_session_key(
     client_pub: &[u8; 32],
     server_pub: &[u8; 32],
 ) -> [u8; KEY_LEN] {
-    let mut info = Vec::with_capacity(HS_LABEL.len() + 64);
+    let clamped = handshake_clamp_info_len(HS_LABEL.len() as u64, 64) as usize;
+    let label_len = if clamped <= 64 { clamped } else { 64 };
+    let mut info = Vec::with_capacity(label_len + 64);
     info.extend_from_slice(HS_LABEL);
     info.extend_from_slice(client_pub);
     info.extend_from_slice(server_pub);
@@ -184,11 +404,73 @@ fn agree(
 /// that relays different ephemerals to each leg produces different transcripts, so
 /// its records fail to open on the far side. The identity handshake binds the same
 /// bytes, which are also what its peers sign.
-pub(crate) fn transcript(client_pub: &[u8; 32], server_pub: &[u8; 32]) -> [u8; 64] {
-    let mut t = [0u8; 64];
-    t[..32].copy_from_slice(client_pub);
-    t[32..].copy_from_slice(server_pub);
-    t
+pub(crate) const fn transcript(client_pub: &[u8; 32], server_pub: &[u8; 32]) -> [u8; 64] {
+    [
+        client_pub[0],
+        client_pub[1],
+        client_pub[2],
+        client_pub[3],
+        client_pub[4],
+        client_pub[5],
+        client_pub[6],
+        client_pub[7],
+        client_pub[8],
+        client_pub[9],
+        client_pub[10],
+        client_pub[11],
+        client_pub[12],
+        client_pub[13],
+        client_pub[14],
+        client_pub[15],
+        client_pub[16],
+        client_pub[17],
+        client_pub[18],
+        client_pub[19],
+        client_pub[20],
+        client_pub[21],
+        client_pub[22],
+        client_pub[23],
+        client_pub[24],
+        client_pub[25],
+        client_pub[26],
+        client_pub[27],
+        client_pub[28],
+        client_pub[29],
+        client_pub[30],
+        client_pub[31],
+        server_pub[0],
+        server_pub[1],
+        server_pub[2],
+        server_pub[3],
+        server_pub[4],
+        server_pub[5],
+        server_pub[6],
+        server_pub[7],
+        server_pub[8],
+        server_pub[9],
+        server_pub[10],
+        server_pub[11],
+        server_pub[12],
+        server_pub[13],
+        server_pub[14],
+        server_pub[15],
+        server_pub[16],
+        server_pub[17],
+        server_pub[18],
+        server_pub[19],
+        server_pub[20],
+        server_pub[21],
+        server_pub[22],
+        server_pub[23],
+        server_pub[24],
+        server_pub[25],
+        server_pub[26],
+        server_pub[27],
+        server_pub[28],
+        server_pub[29],
+        server_pub[30],
+        server_pub[31],
+    ]
 }
 
 /// Run the client (initiator) side of the handshake over `stream` and return the

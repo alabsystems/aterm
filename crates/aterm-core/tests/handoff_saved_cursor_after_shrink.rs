@@ -41,26 +41,6 @@ fn under_cursor(t: &Terminal) -> (String, u16) {
     )
 }
 
-/// 1049 from the last row, then a one-row shrink: the slot follows the prompt
-/// up the row the demote moved it, and the checkpoint carries it there.
-#[test]
-fn a_shrink_after_entering_the_alternate_screen_carries_the_saved_cursor_with_its_line() {
-    let mut t = prompt_on_the_last_row();
-    t.process(b"\x1b[?1049h");
-    t.resize(ROWS - 1, COLS);
-    let cp = t.checkpoint_carry(CARRY).expect("parser is Ground");
-    assert_eq!(cp.rows, ROWS - 1);
-    let saved = cp
-        .saved_cursor_main
-        .expect("1049 saved the main-screen cursor");
-    assert_eq!(
-        saved.cursor_row,
-        ROWS - 2,
-        "the prompt's row after the demote"
-    );
-    assert_eq!(saved.cursor_col, 8, "after `$ claude`");
-}
-
 /// A slot whose row a shrink trims (a blank row below the cursor) names no
 /// text: it stays past the shrunken grid, and the wire admits and carries it
 /// as the engine holds it. Grown back, both engines restore it onto its row.

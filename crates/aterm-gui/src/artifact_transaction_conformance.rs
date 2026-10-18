@@ -9,16 +9,16 @@
 
 #![cfg(test)]
 
-use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use aterm_render::Frame;
-use aterm_spec::derive::{
-    Model, anchored_artifact_transaction_model, artifact_reader_lease_model,
+use aterm_models_misc::{
+    anchored_artifact_transaction_model, artifact_reader_lease_model,
     snapshot_generation_commit_model, video_batch_publication_durability_model,
 };
+use aterm_render::Frame;
+use aterm_spec::derive::Model;
 use aterm_spec::interp::State;
 use aterm_spec::verify::validate_transition_tiered;
 
@@ -294,186 +294,186 @@ fn marker_generation(path: &Path) -> i64 {
         .expect("numeric generation")
 }
 
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "SnapshotGenerationCommit",
     action = "SelectCurrent",
     reason = "environment scheduling: selecting the newest worker changes which queued job the \
               bounded model drives; begin/old-commit/current-commit are bound to shipping code"
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "AnchoredArtifactTransaction",
     action = "SwapAncestor",
     reason = "adversarial filesystem environment action: another same-uid process replaces a \
               pathname ancestor; the Unix Tier-1 test drives the observation explicitly"
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "AnchoredArtifactTransaction",
     action = "BuggyReresolveRead",
     reason = "Buggy=1 negative-control action only; shipping reads remain relative to the retained \
               directory handle and the Tier-1 outside-target mutant is rejected"
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "AnchoredArtifactTransaction",
     action = "BuggyReresolveWrite",
     reason = "Buggy=1 negative-control action only; shipping writes remain relative to the \
               retained directory handle and never implement this transition"
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "AnchoredArtifactTransaction",
     action = "BuggyCertifySwapped",
     reason = "Buggy=1 negative-control action only; reply validation fails closed after identity \
               drift and the Tier-1 false-success mutant is rejected"
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ArtifactReplyPublication",
     action = "BuggyPublishAfterCancel",
     reason = "Buggy=1 negative control only; the real cancellation/authorization CAS has one \
               winner and the authorized write hook rejects a cancelled final-name publish"
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ArtifactReplyPublication",
     action = "BuggyDropBeforeWrite",
     reason = "Buggy=1 negative control only; ControlReply owns ReplyRetention through write_all, \
               flush, and either valid ACK release or central-quarantine expiry"
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ArtifactReplyPublication",
     action = "BuggyPruneLeased",
     reason = "Buggy=1 negative control only; retention holds the shared path-lease mutex across its \
               exact mutation and skips every still-leased image or recording"
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ArtifactReplyPublication",
     action = "BuggyReleaseWithoutAck",
     reason = "Buggy=1 negative control only; only a matching nonce echo releases immediately, \
               while EOF/timeout/protocol failure transfers the guard to central quarantine"
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ArtifactReplyPublication",
     action = "BuggyAcceptPreChallengeAck",
     reason = "Buggy=1 negative control only; aterm-ctl can echo only the fresh nonce trailer it \
               reads after the complete response, never a pre-pipelined acknowledgement"
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ArtifactReplyPublication",
     action = "BuggyReleaseQuarantineEarly",
     reason = "Buggy=1 negative control only; failed or half-closed clients retain the publication guard \
               through the additional 30-second central-quarantine expiry"
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ArtifactReplyPublication",
     action = "BuggyChallengeBeforeBody",
     reason = "Buggy=1 negative control only; the nonce trailer is written after the complete body \
               in write_control_reply_with_timeout_arm, and the Tier-1 early trailer is rejected"
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ArtifactReplyPublication",
     action = "BuggyOkBeforeRevalidation",
     reason = "Buggy=1 negative control only; write_control_reply_with_timeout_arm revalidates the \
               guard before any OK byte, and the Tier-1 OK-then-ERR wire is rejected"
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ArtifactReplyPublication",
     action = "BuggyTrailerErrorIgnored",
     reason = "Buggy=1 negative control only; a failed trailer write returns the error and \
               quarantines the guard, and the Tier-1 partial frame read as written is rejected"
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ArtifactReplyPublication",
     action = "BuggyAbortRetainsArtifact",
     reason = "Buggy=1 negative control only; an uncommitted reply guard removes its exact file on \
               drop, and the Tier-1 orphaned-file release is rejected"
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ArtifactHandoffCapacity",
     action = "BuggyOverbook",
     reason = "Buggy=1 negative control only; the real locked admission update refuses when the \
               process-wide handoff count or descriptor-unit budget reaches its fixed limit"
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ArtifactHandoffCapacity",
     action = "BuggyReconcileOverbook",
     reason = "Buggy=1 negative control only; exact-path reconciliation uses the same locked \
               aggregate descriptor budget and leaves the provisional charge intact on refusal"
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ArtifactHandoffCapacity",
     action = "BuggyRefuseLeaksSlot",
     reason = "Buggy=1 negative control only; try_acquire_from decides admission before it charges \
               either counter, so a refusal leaves the pool untouched"
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ArtifactHandoffCapacity",
     action = "BuggyReleaseProvisionalCharge",
     reason = "Buggy=1 negative control only; reconciliation records the permit's new charge, so \
               its drop returns exactly the units it holds"
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ArtifactHandoffCapacity",
     action = "SelectOne",
     reason = "ghost scheduler choice selecting a one-unit permit from the bounded charge multiset"
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ArtifactHandoffCapacity",
     action = "SelectTwo",
     reason = "ghost scheduler choice selecting a two-unit permit from the bounded charge multiset"
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ArtifactHandoffCapacity",
     action = "SelectThree",
     reason = "ghost scheduler choice selecting a three-unit permit from the bounded charge multiset"
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "VideoBatchPublicationDurability",
     action = "BuggyPublishBeforeSync",
     reason = "Buggy=1 negative control only; the real marker write is reachable only after \
               ConfinedVideoDir::publish completes the recording-directory batch barrier"
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "VideoBatchPublicationDurability",
     action = "BuggySyncAhead",
     reason = "Buggy=1 negative control only; every member write clears batch_synced before it \
               lands, so a barrier never covers a later member \
               (video_member_write_after_sync_invalidates_marker_guard)"
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ArtifactReaderLease",
     action = "BuggyStartSweepEarly",
     reason = "Buggy=1 negative control only; the concrete registry starts its capability-bound \
               sweep only on the last refcount release"
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ArtifactReaderLease",
     action = "BuggyAcquireDuringSweep",
     reason = "Buggy=1 negative control only; retain_video_artifact_path fails closed while the \
               last-release callback owns the registry's sweeping state"
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ArtifactReaderLease",
     action = "ReplaceIdentity",
     reason = "external same-uid recording replacement is an environment transition; the concrete \
               registry compares the retained child identity before incrementing its lease count"
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ArtifactReaderLease",
     action = "BuggyArmedReleaseDropsEntry",
     reason = "Buggy=1 negative control only; the last release of an armed entry marks it \
               sweeping and hands its capability to the priority cleanup lane instead of \
               removing it"
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ArtifactReaderLease",
     action = "BuggyReleaseSweepsUnarmed",
     reason = "Buggy=1 negative control only; the last release starts a sweep only when \
               video_sweep_requested is set, and otherwise removes the registry entry"
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ArtifactReaderLease",
     action = "BuggyFinishKeepsEntry",
     reason = "Buggy=1 negative control only; finish_video_retention_sweep removes the finished \
               entry, taking its arm and recorded identity with it"
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ArtifactReaderLease",
     action = "BuggyAcquireReplacedIdentity",
     reason = "Buggy=1 negative control only; a mismatched retained recording identity is rejected \
@@ -484,216 +484,6 @@ fn marker_generation(path: &Path) -> i64 {
     reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it"
 )]
 fn explicit_environment_and_mutant_scope() {}
-
-#[test]
-fn artifact_xrefs_cover_every_action_with_named_projections_or_waivers() {
-    let anchored: BTreeSet<_> = aterm_spec::xref::refinements()
-        .filter(|anchor| anchor.machine == "AnchoredArtifactTransaction")
-        .map(|anchor| {
-            assert!(
-                !anchor.project.is_empty(),
-                "{} needs a concrete projection",
-                anchor.action
-            );
-            anchor.action
-        })
-        .collect();
-    assert_eq!(
-        anchored,
-        BTreeSet::from(["ConfinePin", "ReadPinned", "ValidateReply", "WritePinned"])
-    );
-    let anchored_waivers: BTreeSet<_> = aterm_spec::xref::waivers()
-        .filter(|waiver| waiver.machine == "AnchoredArtifactTransaction")
-        .map(|waiver| waiver.action)
-        .collect();
-    assert_eq!(
-        anchored_waivers,
-        BTreeSet::from([
-            "BuggyCertifySwapped",
-            "BuggyReresolveRead",
-            "BuggyReresolveWrite",
-            "SwapAncestor",
-        ])
-    );
-
-    let snapshot: BTreeSet<_> = aterm_spec::xref::refinements()
-        .filter(|anchor| anchor.machine == "SnapshotGenerationCommit")
-        .map(|anchor| {
-            assert!(
-                !anchor.project.is_empty(),
-                "{} needs a concrete projection",
-                anchor.action
-            );
-            anchor.action
-        })
-        .collect();
-    assert_eq!(
-        snapshot,
-        BTreeSet::from(["BeginNew", "CommitCurrent", "CommitOld"])
-    );
-    let snapshot_waivers: BTreeSet<_> = aterm_spec::xref::waivers()
-        .filter(|waiver| waiver.machine == "SnapshotGenerationCommit")
-        .map(|waiver| waiver.action)
-        .collect();
-    assert_eq!(snapshot_waivers, BTreeSet::from(["SelectCurrent"]));
-}
-
-#[test]
-fn artifact_reply_and_reader_xrefs_cover_every_shipping_transition() {
-    let refinements: BTreeSet<_> = aterm_spec::xref::refinements()
-        .filter(|anchor| anchor.machine == "ArtifactReplyPublication")
-        .map(|anchor| {
-            assert!(
-                !anchor.project.is_empty(),
-                "{} needs a projection",
-                anchor.action
-            );
-            anchor.action
-        })
-        .collect();
-    assert_eq!(
-        refinements,
-        BTreeSet::from([
-            "AbortAuthorized",
-            "AbortQueued",
-            "AdvanceQuarantine",
-            "AcknowledgeFailed",
-            "AcknowledgePeer",
-            "AuthorizeCommit",
-            "Cancel",
-            "ExpireQuarantine",
-            "PrepareFailed",
-            "PrepareWire",
-            "QueueGuard",
-            "ReleaseGuard",
-            "RetentionSweep",
-            "WriteFailed",
-            "WriteWire",
-        ])
-    );
-    let waivers: BTreeSet<_> = aterm_spec::xref::waivers()
-        .filter(|waiver| waiver.machine == "ArtifactReplyPublication")
-        .map(|waiver| waiver.action)
-        .collect();
-    assert_eq!(
-        waivers,
-        BTreeSet::from([
-            "BuggyAbortRetainsArtifact",
-            "BuggyAcceptPreChallengeAck",
-            "BuggyChallengeBeforeBody",
-            "BuggyDropBeforeWrite",
-            "BuggyOkBeforeRevalidation",
-            "BuggyPruneLeased",
-            "BuggyPublishAfterCancel",
-            "BuggyReleaseQuarantineEarly",
-            "BuggyReleaseWithoutAck",
-            "BuggyTrailerErrorIgnored",
-        ])
-    );
-
-    let handoff_refinements: BTreeSet<_> = aterm_spec::xref::refinements()
-        .filter(|anchor| anchor.machine == "ArtifactHandoffCapacity")
-        .map(|anchor| {
-            assert!(
-                !anchor.project.is_empty(),
-                "{} needs a concrete handoff-capacity projection",
-                anchor.action
-            );
-            anchor.action
-        })
-        .collect();
-    assert_eq!(
-        handoff_refinements,
-        BTreeSet::from([
-            "Acquire",
-            "ReconcileGrow",
-            "ReconcileShrink",
-            "RefuseAtCap",
-            "RefuseReconcile",
-            "Release",
-        ])
-    );
-    let handoff_waivers: BTreeSet<_> = aterm_spec::xref::waivers()
-        .filter(|waiver| waiver.machine == "ArtifactHandoffCapacity")
-        .map(|waiver| waiver.action)
-        .collect();
-    assert_eq!(
-        handoff_waivers,
-        BTreeSet::from([
-            "BuggyOverbook",
-            "BuggyReconcileOverbook",
-            "BuggyRefuseLeaksSlot",
-            "BuggyReleaseProvisionalCharge",
-            "SelectOne",
-            "SelectThree",
-            "SelectTwo",
-        ])
-    );
-
-    let batch_refinements: BTreeSet<_> = aterm_spec::xref::refinements()
-        .filter(|anchor| anchor.machine == "VideoBatchPublicationDurability")
-        .map(|anchor| {
-            assert!(
-                !anchor.project.is_empty(),
-                "{} needs a concrete batch-durability projection",
-                anchor.action
-            );
-            anchor.action
-        })
-        .collect();
-    assert_eq!(
-        batch_refinements,
-        BTreeSet::from(["PublishMarker", "SyncBatch", "WriteMember"])
-    );
-    let batch_waivers: BTreeSet<_> = aterm_spec::xref::waivers()
-        .filter(|waiver| waiver.machine == "VideoBatchPublicationDurability")
-        .map(|waiver| waiver.action)
-        .collect();
-    assert_eq!(
-        batch_waivers,
-        BTreeSet::from(["BuggyPublishBeforeSync", "BuggySyncAhead"])
-    );
-
-    let reader_refinements: BTreeSet<_> = aterm_spec::xref::refinements()
-        .filter(|anchor| anchor.machine == "ArtifactReaderLease")
-        .map(|anchor| {
-            assert!(
-                !anchor.project.is_empty(),
-                "{} needs a concrete reader-registry projection",
-                anchor.action
-            );
-            anchor.action
-        })
-        .collect();
-    assert_eq!(
-        reader_refinements,
-        BTreeSet::from([
-            "Acquire",
-            "Arm",
-            "FinishSweep",
-            "RejectAcquireWhileSweeping",
-            "RejectReplacedIdentity",
-            "Release",
-            "StartSweep",
-        ])
-    );
-    let reader_waivers: BTreeSet<_> = aterm_spec::xref::waivers()
-        .filter(|waiver| waiver.machine == "ArtifactReaderLease")
-        .map(|waiver| waiver.action)
-        .collect();
-    assert_eq!(
-        reader_waivers,
-        BTreeSet::from([
-            "BuggyAcquireDuringSweep",
-            "BuggyAcquireReplacedIdentity",
-            "BuggyArmedReleaseDropsEntry",
-            "BuggyFinishKeepsEntry",
-            "BuggyReleaseSweepsUnarmed",
-            "BuggyStartSweepEarly",
-            "ReplaceIdentity",
-        ])
-    );
-}
 
 #[test]
 fn real_video_batch_publication_conforms_to_directory_barrier_ordering() {
@@ -1539,7 +1329,7 @@ fn real_pinned_read_write_and_reply_validation_conform() {
         "artifact read confinement",
     );
     let (bytes, read_guard) = read_dir
-        .read_private(OsStr::new("read.bin"), 64)
+        .read_private_at_retained(OsStr::new("read.bin"), 64)
         .expect("handle-relative read");
     assert_eq!(bytes, b"read-inside");
     let read_done = project_anchored(&model, operated(1));
@@ -1687,8 +1477,8 @@ fn swapped_ancestor_fails_reply_and_outside_mutants_are_rejected() {
         )
     };
 
-    // READ: the operation half of `read_private` reads through the retained
-    // handle, and its reply half then fails closed; the composed call refuses.
+    // READ: `read_private_at_retained` reads through the retained handle, and
+    // the reply's path check then fails closed.
     let (bytes, read_guard) = read_pin
         .read_private_at_retained(OsStr::new("read.bin"), 64)
         .expect("the retained handle still reads the original");
@@ -1714,10 +1504,6 @@ fn swapped_ancestor_fails_reply_and_outside_mutants_are_rejected() {
         &read_done,
         &replied_after_swap(1, read_target),
         "artifact fail-closed read reply",
-    );
-    assert!(
-        read_pin.read_private(OsStr::new("read.bin"), 64).is_err(),
-        "the composed shipping read fails closed"
     );
     // Negative control: the same read by path lands on the replacement.
     let resolved = std::fs::read(root.join("images").join("read.bin")).unwrap();

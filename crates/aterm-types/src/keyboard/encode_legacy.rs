@@ -10,10 +10,15 @@
 
 use super::{KeyboardMode, Modifiers, NamedKey};
 
+/// A character key's legacy bytes for a chord (or a text press with no layout character).
+/// `layout_glyph` is the layout's character on this key at the press's Shift level, Ctrl and
+/// Alt aside, when the host knows it (`encode_key_with_text`); without it the US Shift table
+/// names the glyph.
 pub(super) fn encode_character_legacy(
     c: char,
     modifiers: Modifiers,
     mode: KeyboardMode,
+    layout_glyph: Option<char>,
 ) -> Vec<u8> {
     // DEC private mode 1039 (xterm `altSendsEscape`): set (the default) prefixes
     // an Alt-modified key with ESC. Reset (`ALT_NO_ESC`) suppresses the prefix.
@@ -24,19 +29,8 @@ pub(super) fn encode_character_legacy(
     let meta_sends_escape =
         modifiers.contains(Modifiers::META) && mode.contains(KeyboardMode::META_SENDS_ESC);
 
-    // `Key::Character` carries the unshifted base, so a chord named after a shifted glyph
-    // arrives as base + SHIFT (Ctrl-`_` is Ctrl+Shift+'-'). The shifted glyph's control byte
-    // is only a fallback: a chord whose base is in the table keeps its byte (Ctrl+Shift+'/'
-    // stays 0x1F, not Ctrl-? = 0x7F).
-    let ctrl_base = ctrl_character(c).or_else(|| {
-        if modifiers.contains(Modifiers::SHIFT) {
-            super::shifted_character(c, modifiers).and_then(ctrl_character)
-        } else {
-            None
-        }
-    });
     if modifiers.contains(Modifiers::CTRL)
-        && let Some(ctrl_char) = ctrl_base
+        && let Some(ctrl_char) = chord_ctrl_byte(c, modifiers, layout_glyph)
     {
         if alt_sends_escape || meta_sends_escape {
             return [0x1b, ctrl_char].to_vec();
@@ -44,12 +38,16 @@ pub(super) fn encode_character_legacy(
         return [ctrl_char].to_vec();
     }
 
+    // The glyph the press types: the layout's when given (German Shift+2 is '"'), else the
+    // US Shift table's (Shift+2 is '@').
+    let typed = layout_glyph.unwrap_or_else(|| super::shifted_character(c, modifiers).unwrap_or(c));
+
     if alt_sends_escape || meta_sends_escape {
         let mut buf = [0x1b].to_vec();
-        // Meta sends ESC + the glyph that would be typed: under Shift the shifted glyph
-        // (Alt+Shift+2 is ESC '@').
-        let glyph = if modifiers.contains(Modifiers::SHIFT) {
-            super::shifted_character(c, modifiers).unwrap_or(c)
+        // Meta sends ESC + the glyph that would be typed, as xterm prefixes its
+        // `XLookupString` text: German Alt+Shift+2 is ESC '"', US Alt+Shift+2 ESC '@'.
+        let glyph = if layout_glyph.is_some() || modifiers.contains(Modifiers::SHIFT) {
+            typed
         } else {
             c.to_ascii_lowercase()
         };
@@ -59,13 +57,31 @@ pub(super) fn encode_character_legacy(
         return buf;
     }
 
-    // Shift yields the shifted glyph from the US table, the one the Kitty
-    // `REPORT_ALTERNATE_KEYS` path uses, so the two agree.
-    let output = super::shifted_character(c, modifiers).unwrap_or(c);
-
+    // The US Shift table is the one the Kitty `REPORT_ALTERNATE_KEYS` path falls back to, so
+    // the two agree.
     let mut buf = [0u8; 4];
-    let encoded = output.encode_utf8(&mut buf);
+    let encoded = typed.encode_utf8(&mut buf);
     encoded.as_bytes().to_vec()
+}
+
+/// The control byte a Ctrl chord on character key `c` sends, or `None` when neither the key
+/// nor the character it types has one.
+///
+/// `Key::Character` carries the unshifted base, so a chord named after a shifted glyph
+/// arrives as base + SHIFT (Ctrl-`_` is Ctrl+Shift+'-'). The typed character's control byte
+/// is only a fallback: a chord whose base is in the table keeps its byte (Ctrl+Shift+'/'
+/// stays 0x1F, not Ctrl-? = 0x7F). The typed character is the layout's (`layout_glyph`, German
+/// Shift+ß is '?') when given, else the US Shift table's.
+pub(super) fn chord_ctrl_byte(
+    c: char,
+    modifiers: Modifiers,
+    layout_glyph: Option<char>,
+) -> Option<u8> {
+    ctrl_character(c).or_else(|| {
+        layout_glyph
+            .or_else(|| super::shifted_character(c, modifiers))
+            .and_then(ctrl_character)
+    })
 }
 
 pub(super) fn encode_named_legacy(
@@ -304,7 +320,7 @@ fn encode_numpad_named_legacy(
                 [0x1b, b'O', b'M'].to_vec()
             }
         }
-        NamedKey::NumpadEqual => encode_character_legacy('=', modifiers, mode),
+        NamedKey::NumpadEqual => encode_character_legacy('=', modifiers, mode, None),
         // NumpadSeparator: comma on some international keyboards (SS3 l in DECKPAM).
         NamedKey::NumpadSeparator => encode_numpad(b'l', ',', app_keypad, vt52, modifiers),
         // NumpadBegin (KP_BEGIN, the centre key with NumLock off): SS3 E in DECKPAM, CSI E

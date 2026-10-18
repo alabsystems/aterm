@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 
 use aterm_effects::rainbow_kitty::ribbon::{Cell, Layer};
 use aterm_effects::rainbow_kitty::witness::{RowSample, Witness};
-use aterm_spec::derive::{Model, ribbon_arrival_evidence_model};
+use aterm_models_effects::ribbon_arrival_evidence_model;
+use aterm_spec::derive::Model;
 use aterm_spec::interp;
 
 const TEXT: [char; 3] = ['a', 'b', 'c'];

@@ -598,33 +598,7 @@ mod resize_reflow {
         );
     }
 
-    #[test]
-    fn resize_reflow_keeps_engine_invariants() {
-        let mut s: u64 = 0xD1CE_F00D_1234_5678;
-        let mut term = Terminal::new(24, 80);
-        for it in 0..30_000u32 {
-            emit_content(&mut s, &mut term);
-            // Resize ~1/2 the time through a wide range of dimensions, incl. very
-            // narrow widths that force aggressive re-wrapping and degenerate sizes.
-            if next(&mut s) & 1 == 0 {
-                let r = 1 + (next(&mut s) % 50) as u16;
-                let c = 1 + (next(&mut s) % 200) as u16;
-                term.resize(r, c);
-                check_invariants(&term, it, r, c);
-            }
-        }
-        // Every cell of the final grid must be accessible without panic.
-        let (rows, cols) = (term.rows(), term.cols());
-        for row in 0..rows {
-            for col in 0..cols {
-                if let Some(cell) = term.grid().cell(row, col) {
-                    let _ = cell.char();
-                }
-            }
-        }
-    }
-
-    /// The same schedule under the ConPTY seam policy, plus its law: a rows-only grow appends
+    /// The resize schedule under the ConPTY seam policy, plus its law: a rows-only grow appends
     /// blank rows and reveals nothing, so the history depth and every absolute key stay put.
     /// Fewer iterations: with no reveal, history accumulates and each width change rewraps it.
     #[test]
@@ -682,6 +656,9 @@ mod resize_reflow {
     }
 }
 
-// Fresh-terminal batches. aterm-conformance's `vt` suite mounts the same file, so they
-// also run against aterm-core[sixel] (the module doc says why that takes two binaries).
+// Fresh-terminal batches: a fresh 24x80 terminal fed one multi-KiB batch,
+// chunked soup, 1..=3 x 1..=3 grids, and the adversarial corpus.
+// (This file is a module of `core_fuzz`, so `mod fresh;` finds
+// (This file is a module of `core_suite`, so `mod fresh;` finds
+// `fuzz_process_never_panics/fresh.rs`.)
 mod fresh;

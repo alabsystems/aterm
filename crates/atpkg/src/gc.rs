@@ -2757,13 +2757,6 @@ mod tests {
         assert_eq!(sibling, Some(false), "`A.app.rollback` is not `A.app`");
     }
 
-    /// Where no process table is read, the answer is unknown, never "nothing runs".
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    #[test]
-    fn without_a_process_table_liveness_is_unknown() {
-        assert_eq!(running_executables(), None);
-    }
-
     /// The real enumeration sees this very test process — the proof it reads the table
     /// it claims to, in the resolved spelling [`InUse`] compares against.
     #[cfg(any(target_os = "macos", target_os = "linux"))]

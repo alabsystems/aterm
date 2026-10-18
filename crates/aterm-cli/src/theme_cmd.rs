@@ -21,6 +21,10 @@
 //! `--name` or the file's stem (never a built-in's name), a read-back check,
 //! and an atomic write. Without `--replace` an existing theme of that id is
 //! left alone. This file is the grammar and the report around it.
+//!
+//! `aterm theme pack | install` are the community theme pack's
+//! (`theme_pack_cmd.rs`): built-in, permissively licensed palettes copied
+//! into the themes folder on request.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -30,7 +34,7 @@ use aterm_types::Appearance;
 use aterm_types::scheme;
 use aterm_types::scheme_install::{self, InstallError};
 
-use crate::theme_author;
+use crate::{theme_author, theme_pack_cmd};
 
 /// The verb's usage lines.
 pub(crate) const USAGE: &str = "usage: aterm theme list [--appearance dark|light] [--format text|tsv]\n       \
@@ -38,7 +42,9 @@ pub(crate) const USAGE: &str = "usage: aterm theme list [--appearance dark|light
                                 aterm theme new <name> [--from <theme>] [--appearance dark|light] [--force]\n       \
                                 aterm theme export <name> [--out <file>] [--force]\n       \
                                 aterm theme schema [--format json|text]\n       \
-                                aterm theme import <file> [--name <id>] [--replace]";
+                                aterm theme import <file> [--name <id>] [--replace]\n       \
+                                aterm theme pack [<id>] [--appearance dark|light] [--format text|tsv] [--licences]\n       \
+                                aterm theme install <id>... | --all [--replace]";
 
 /// `aterm theme --help`.
 pub(crate) const HELP: &str = "\
@@ -47,12 +53,14 @@ aterm theme list [--appearance dark|light] [--format text|tsv]
   List every theme `theme = \"<id>\"` can name: the built-ins (Default first),
   then each `<id>.conf` in the themes folder, loaded or not. Each row has the
   id, the label, the appearance it is drawn for, its pair for the other
-  appearance, where it comes from, and its status; a file that did not load
-  says why. The themes folder and, when it holds more than aterm reads, a
+  appearance, where it comes from, its status, and the type settings it
+  names; a file that did not load says why, and one written for a newer
+  theme schema names the keys this aterm skipped. The themes folder and, when it holds more than aterm reads, a
   truncation line close the listing. `aterm list-themes` is the same command.
 
   --appearance dark|light   Only the themes drawn for that appearance.
-  --format tsv              Tab-separated rows for scripts: a header row, then
+  --format tsv              Tab-separated rows for scripts (typography and
+                            skipped columns last): a header row, then
                             one row per theme with a fixed column count, then
                             `#folder` and `#truncated` trailer lines.
 
@@ -76,13 +84,15 @@ aterm theme check <file> [--strict] [--signature] [--format text|json]
                    more, within 15 deg of an accent's hue; accent chroma
                    (both tiers) within 0.07-0.17, max/min at most 1.75. A
                    missed bar is listed; with --strict it fails the check.
-  --format json    One JSON object: {document: \"aterm-theme-check\", version: 1,
+  --format json    One JSON object: {document: \"aterm-theme-check\", version: 2,
                    file, id, status: ok|warnings|invalid, strict, exit_code,
                    theme: null | {display_name, description, author,
                    appearance, appearance_source: declared|measured,
-                   foreground, background, selection, selection_derived},
-                   diagnostics: [{severity: error|warning, code, line, key,
-                   message, foreign_format}],
+                   foreground, background, selection, selection_derived,
+                   bold_is_bright, palette_generate, typography: {key: value},
+                   skipped_keys},
+                   diagnostics: [{severity: error|warning|note, code, line,
+                   key, message, foreign_format}],
                    contrast: [{drawn, on, ratio, minimum, below_minimum}],
                    signature: null | [{code, message}]}. Fields are only
                    added within a version; line, key, minimum,
@@ -91,14 +101,20 @@ aterm theme check <file> [--strict] [--signature] [--format text|json]
 
   Diagnostic codes: errors parse, unreadable, not_utf8; warnings
   low_text_contrast, faint_selection, ansi_matches_background,
-  low_cursor_contrast, appearance_mismatch (admission), and not_conf,
-  invalid_id, shadowed_by_builtin, symlink_not_followed (the file name).
+  low_cursor_contrast, appearance_mismatch, chrome_below_floor,
+  search_match_like_selection, skipped_keys (admission), palette_anchors_close
+  (palette_generate = true over a black and white too close in lightness),
+  and not_conf, invalid_id, shadowed_by_builtin, symlink_not_followed (the
+  file name); notes font_not_installed (a font the theme names is not
+  installed here; aterm falls back) and palette_generate (the anchors slots
+  16-255 are derived from); --strict ignores notes.
 
 aterm theme new <name> [--from <theme>] [--appearance dark|light] [--force]
 
   Write <name>.conf into the themes folder: a complete theme, every key
   under a comment saying what it does, ready to edit. It starts from the
-  colours of --from (any theme `aterm theme list` shows), else Default, or
+  colours and type settings of --from (any theme `aterm theme list` shows),
+  else Default, or
   Default Light with --appearance light. With --appearance, a --from theme
   drawn for the other appearance is swapped for its pair. Prints the path.
   A built-in's name is refused; an existing theme is kept unless --force.
@@ -114,8 +130,9 @@ aterm theme schema [--format json|text]
   Describe every key a theme file can hold: its name and aliases, its type
   and constraints, whether it is required, what leaving it out means, and
   an example. JSON (the default) is {document: \"aterm-theme-schema\",
-  version: 1, syntax, keys: [{name, aliases, type, required, index,
-  constraints, when_omitted, default, description, example}]}. It is printed
+  version: 2, syntax, keys: [{name, aliases, type, required, index,
+  constraints, when_omitted, default, description, example, group,
+  config_key}]}; config_key is the aterm.toml key that wins over the theme's. It is printed
   from the table the parser reads keys by, so it is always the parser's own.
 
 aterm theme import <file> [--name <id>] [--replace]
@@ -136,6 +153,40 @@ aterm theme import <file> [--name <id>] [--replace]
                 Terminal settings.json holding several schemes, the scheme
                 with this name is the one imported.
   --replace     Overwrite an existing theme with this id.
+
+aterm theme pack [<id>] [--appearance dark|light] [--format text|tsv] [--licences]
+
+  The community theme pack: well-known themes (Catppuccin, Kanagawa, Tokyo
+  Night, Rose Pine, GitHub, Iceberg, ...) whose own projects carry a
+  permissive licence (MIT, Apache-2.0, BSD, ISC), built into aterm with
+  their notices and installed only when asked. Without an id, list them:
+  the id, appearance, pair, the project it is from, its licence, and
+  whether the themes folder has it (available, installed, modified, or
+  blocked by a same-name file in another case). With an id, print that
+  theme's file (its provenance and licence notice included). Nothing is
+  downloaded.
+
+  --appearance dark|light   Only the pack themes drawn for that appearance.
+  --format tsv              Tab-separated rows: a header row, one row per
+                            theme with a fixed column count, then a
+                            `#collection` trailer line.
+  --licences                Print every palette's attribution and licence
+                            text (also spelled --licenses).
+
+aterm theme install <id>... | --all [--replace]
+
+  Copy pack themes into the themes folder as ordinary files, where Settings
+  and `theme = \"<id>\"` find them. A theme already there unchanged is left
+  alone; one that differs (you edited it) is kept unless --replace. A file
+  whose name differs only in case blocks the install. Settings ▸ Themes ▸
+  Get More does the same, one theme at a time.
+
+  --all       Every pack theme.
+  --replace   Overwrite a pack theme's file you changed.
+
+  Exit status: 0 every theme asked for is in the folder (written, already
+  there, or kept); 1 a write failed; 2 a usage error (an unknown id writes
+  nothing).
 ";
 
 /// What a run printed and its exit code.
@@ -198,6 +249,13 @@ pub trait ThemeHost {
     /// The appearance a background measures as, by the rule the themes
     /// folder admits a file with.
     fn measure(&self, background: aterm_types::Rgb) -> Appearance;
+    /// Whether a font family a theme names is installed here, by the
+    /// window's own font resolution (never touching a display server);
+    /// `None` when this host cannot tell. `aterm theme check` notes a miss.
+    fn font_available(&self, family: &str) -> Option<bool> {
+        let _ = family;
+        None
+    }
 }
 
 /// `aterm list-themes [<args>]` is `aterm theme list [<args>]`: the theme
@@ -215,7 +273,10 @@ pub fn list_themes_alias(first: &str, rest: &[OsString]) -> Option<Vec<OsString>
 /// `aterm theme …` from the front door.
 pub fn main_entry(args: Vec<OsString>, host: &dyn ThemeHost) -> ExitCode {
     let outcome = run(&args, scheme::user_theme_dir().as_deref(), host);
-    print!("{}", outcome.stdout);
+    if let Err(e) = aterm_uds::stdout::answer(&outcome.stdout) {
+        eprintln!("aterm theme: the answer was not written ({e})");
+        return ExitCode::from(1);
+    }
     eprint!("{}", outcome.stderr);
     ExitCode::from(outcome.code)
 }
@@ -233,6 +294,8 @@ pub(crate) fn run(args: &[OsString], theme_dir: Option<&Path>, host: &dyn ThemeH
         Some("export") => theme_author::export(rest, host),
         Some("schema") => theme_author::schema(rest),
         Some("import") => import(rest, theme_dir),
+        Some("pack") => theme_pack_cmd::pack(rest, theme_dir),
+        Some("install") => theme_pack_cmd::install(rest, theme_dir),
         Some("help" | "--help" | "-h") => Outcome {
             stdout: HELP.to_string(),
             ..Outcome::default()
@@ -268,26 +331,30 @@ fn parse_list_args(args: &[OsString]) -> Result<Option<ThemeListRequest>, String
         };
         match flag {
             "--help" | "-h" => return Ok(None),
-            "--appearance" => {
-                request.appearance = Some(match value(flag)?.as_str() {
-                    "dark" => Appearance::Dark,
-                    "light" => Appearance::Light,
-                    other => {
-                        return Err(format!("--appearance takes dark or light, not {other:?}"));
-                    }
-                });
-            }
-            "--format" => {
-                request.format = match value(flag)?.as_str() {
-                    "text" => ThemeListFormat::Text,
-                    "tsv" => ThemeListFormat::Tsv,
-                    other => return Err(format!("--format takes text or tsv, not {other:?}")),
-                };
-            }
+            "--appearance" => request.appearance = Some(appearance_value(&value(flag)?)?),
+            "--format" => request.format = format_value(&value(flag)?)?,
             other => return Err(format!("list: unknown argument {other:?}")),
         }
     }
     Ok(Some(request))
+}
+
+/// `--appearance`'s value, as `list` and `pack` read it.
+pub(crate) fn appearance_value(value: &str) -> Result<Appearance, String> {
+    match value {
+        "dark" => Ok(Appearance::Dark),
+        "light" => Ok(Appearance::Light),
+        other => Err(format!("--appearance takes dark or light, not {other:?}")),
+    }
+}
+
+/// `--format`'s value, as `list` and `pack` read it.
+pub(crate) fn format_value(value: &str) -> Result<ThemeListFormat, String> {
+    match value {
+        "text" => Ok(ThemeListFormat::Text),
+        "tsv" => Ok(ThemeListFormat::Tsv),
+        other => Err(format!("--format takes text or tsv, not {other:?}")),
+    }
 }
 
 fn list(args: &[OsString], host: &dyn ThemeHost) -> Outcome {
@@ -576,6 +643,46 @@ pub(crate) mod tests {
         // Nothing but the theme is left in the folder.
         let entries: Vec<_> = std::fs::read_dir(&themes).unwrap().collect();
         assert_eq!(entries.len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// No byte below 0x20 but a newline (nor DEL or a C1 control) in `text`.
+    fn printable(text: &str) -> bool {
+        !text.chars().any(|c| c.is_control() && c != '\n')
+    }
+
+    /// A newer-schema theme's skipped key names are untrusted: `theme check`
+    /// and `theme import` print them escaped, never as raw control bytes.
+    /// Negative control: a plain unknown key is listed as written.
+    #[test]
+    fn skipped_key_names_reach_the_terminal_escaped() {
+        let root = scratch("skipped-escaped");
+        for (file, key, listed) in [
+            ("evil.conf", "\x1b]0;PWNED\x07", "\\u{1b}]0;pwned\\u{7}"),
+            ("plain.conf", "future_key", "future_key"),
+        ] {
+            let source = root.join(file);
+            std::fs::write(
+                &source,
+                format!(
+                    "name = Evil\nschema = 999\nbackground = #000000\n\
+                     foreground = #ffffff\n{key} = 1\n"
+                ),
+            )
+            .unwrap();
+            let path = source.to_str().unwrap();
+            let checked = run(&args(&["check", path]), None, &NEVER_LISTS);
+            let imported = run(
+                &args(&["import", path, "--replace"]),
+                Some(&root.join("themes")),
+                &NEVER_LISTS,
+            );
+            for out in [&checked, &imported] {
+                let text = format!("{}{}", out.stdout, out.stderr);
+                assert!(printable(&text), "{file}: {text:?}");
+                assert!(text.contains(listed), "{file}: {text:?}");
+            }
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 

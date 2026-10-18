@@ -4,7 +4,7 @@
 //! over a Unix socket or (with `--tcp`) TCP:
 //!
 //! ```text
-//! asb serve  <endpoint> [<log>] [--tcp] [--secret-file PATH] [--unix SOCKET]
+//! asb serve  <endpoint> [<log>] [--tcp] [--secret-file PATH] [--unix SOCKET] [--durability T]
 //!                                                           run a broker; prints `listening <bound>`
 //! asb pub    <endpoint> <subject> [--id N] [--seq M]        publish stdin's bytes; prints `<offset> new|dup`
 //! asb sub    <endpoint> <filter> [--from N | --group G]     tail as `<offset> <nbytes>\n<bytes>\n`
@@ -15,6 +15,7 @@
 //! asb commit <endpoint> <group> <upto>                      durably commit a consumer group
 //! asb mint   <grant> --secret-env NAME | --secret-file PATH mint a capability line
 //! asb repair <log>                                          truncate at the first corrupt record
+//! asb stats  <log>                                          inspect log offsets, retention, subjects, and bindings
 //! ```
 //!
 //! `commit`'s printed `<offset>` is the COMMIT RECORD's own log offset, NOT
@@ -189,9 +190,39 @@
 //! too, the diagnostic is dropped and the status is the whole message.
 #![forbid(unsafe_code)]
 
+// A contracted fn is written once, through `contract_fn!`: under a Trust compiler
+// (`cfg(clean_islands)`, build.rs) it carries its `ensures` clause, which no stock rustc can
+// parse, and every other compiler gets the plain fn.
+#[macro_use]
+#[path = "../../../astream-wire/contract_fn.rs"]
+mod contract_fn;
+
+#[cfg(clean_islands)]
+#[path = "islands/asb_island.rs"]
+mod asb_island;
+#[cfg(clean_islands)]
+pub use asb_island::asb_drain_count_advance;
+
+#[cfg(any(test, not(clean_islands)))]
+#[path = "islands/asb_twins.rs"]
+mod twins;
+#[cfg(not(clean_islands))]
+pub use twins::asb_drain_count_advance;
+
+contract_fn! {
+    /// Verified check that an `asb` exit code is within the documented `{0, 1, 2}` contract
+    /// (`code <= 2`), linked via `clean-kernel-defeq` to `asb_exit_code_valid_isl`.
+    #[must_use]
+    pub fn asb_exit_code_valid(code: u8) -> bool
+    clauses [ensures result == (code <= 2)]
+    {
+        code <= 2
+    }
+}
+
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
-use std::process::exit;
+use std::process::ExitCode;
 use std::time::Duration;
 
 use astream_broker::{
@@ -215,8 +246,9 @@ use astream_cap::capfile;
 mod capfile;
 
 const USAGE: &str = "usage: asb serve  <endpoint> [log] [--tcp] [--key-env NAME | --key-file PATH] [--handshake]
-                  [--secret-env NAME | --secret-file PATH] [--unix SOCKET] [--allow-remote]
-       asb pub   <endpoint> <subject> [--id N] [--seq M | --seq-file PATH] <transport> <cap>
+                  [--secret-env NAME | --secret-file PATH] [--revocation-file PATH] [--unix SOCKET] [--allow-remote]
+                  [--durability strict|ordered|relaxed] [--horizon-ms N]
+       asb pub    <endpoint> <subject> [--id N] [--seq M | --seq-file PATH] <transport> <cap>
        asb sub    <endpoint> <filter> [--from N | --group G] <transport> <cap>
        asb last   <endpoint> <filter> [--after SUBJECT] [--max N] <transport> <cap>
        asb fetch  <endpoint> <filter> [--from N] [--max N] <transport> <cap>
@@ -224,7 +256,9 @@ const USAGE: &str = "usage: asb serve  <endpoint> [log] [--tcp] [--key-env NAME 
        asb ack    <endpoint> <group> <offset> <subject> handled|refused|deferred [--id N] <transport> <cap>
        asb commit <endpoint> <group> <upto> <transport> <cap>
        asb mint   <grant> --secret-env NAME | --secret-file PATH [--legacy-unbound]
+       asb attenuate <child-grant> --cap-file PATH [--secret-env NAME | --secret-file PATH]
        asb repair <log>
+       asb stats  <log>
   <transport>:                      [--tcp] [--key-env NAME | --key-file PATH] [--handshake]
   <cap>:                            [--cap-file PATH]...   (repeatable; `<grant> <tag-hex>` lines, as `asb mint` prints;
                                     split at the LAST whitespace, so a grant whose filter holds a space reads back)
@@ -232,7 +266,11 @@ const USAGE: &str = "usage: asb serve  <endpoint> [log] [--tcp] [--key-env NAME 
                                     wire (forward secrecy: a later PSK compromise cannot decrypt a recorded
                                     session); needs asb built with --features handshake
   repair:                           truncate a log at its first CORRUPT record (which `serve` refuses to open,
-                                    because the bytes from there may be acked data) and report what was dropped
+                                    because the bytes from there may be acked data) and report what was dropped;
+                                    keyless, so a log sealed at rest is refused, never cut (repair it with its key)
+  stats:                            print operational log counters (`base`, `head`, `records`, `bytes`, `subjects`,
+                                    `producers`, `wills`, `groups`, `replica`) for `<log>`
+  --revocation-file PATH:           load revoked 64-hex Ed25519 keys or capability principals at `serve` startup
   --key-env NAME / --key-file PATH: 64 hex chars (32-byte PSK) for the XChaCha20-Poly1305-sealed TCP transport
                                     (needs asb built with --features aead); a bare --key HEX on argv is refused
   --cap-file PATH:                  present minted capabilities to a guarded broker, as a proof of possession
@@ -248,6 +286,14 @@ const USAGE: &str = "usage: asb serve  <endpoint> [log] [--tcp] [--key-env NAME 
                                     log and guard, so the host's own clients never queue behind the TCP port
   --allow-remote:                   serve with a TCP listener: bind an endpoint that is not loopback (0.0.0.0,
                                     [::], a LAN address). Without it only 127.0.0.1 / ::1 are bound
+  --durability T:                   serve: what an ack promises -- strict (the default: on stable media), ordered
+                                    (ordered on the device, F_BARRIERFSYNC; a power loss can take the newest
+                                    batches and moves the log's generation; served strict off Apple or off the
+                                    boot volume, never weaker), relaxed (the page cache). asb escalates nothing
+  --horizon-ms N:                   serve --durability ordered: flush in full once N ms have passed since the first
+                                    ack no full flush covers, after the batch in hand -- so that ack reaches stable
+                                    media at most N ms + one batch + one full flush after it (default 1000; 0: a
+                                    full flush after every batch)
   --legacy-unbound:                 mint the read-write UNBOUND god cap -- `/f/F/>` or `rw:/f/F/>`, one authority in
                                     two spellings -- which `mint` otherwise refuses; a grant needs an explicit `ro:`
                                     mode, or `rw,p=<principal>:` to write as exactly that principal
@@ -291,14 +337,38 @@ const DEFAULT_IDLE_MS: u64 = 1000;
 /// doc). Taken from the library so both faces derive an ack's key from ONE constant.
 use astream_broker::ACK_SEQ_BASE;
 
+enum AsbErr {
+    Exit(u8),
+    Io(io::Error),
+}
+
+impl From<u8> for AsbErr {
+    fn from(code: u8) -> Self {
+        Self::Exit(code)
+    }
+}
+
+impl From<io::Error> for AsbErr {
+    fn from(e: io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+fn fail_exit(code: u8, msg: &str) -> u8 {
+    warn(&format!("asb: {msg}"));
+    code
+}
+
 /// Decode exactly `out.len()` bytes of hex from `hex`. Strict: ASCII hex digits
 /// only (no sign, no whitespace, no multibyte), exact length. Byte-indexed, so a
 /// multibyte character can never hit a char-boundary panic — it is simply not hex.
 fn decode_hex(hex: &[u8], out: &mut [u8]) -> Result<(), String> {
-    if hex.len() != out.len() * 2 {
+    let Some(expected) = out.len().checked_mul(2) else {
+        return Err("hex output length overflow".to_string());
+    };
+    if hex.len() != expected {
         return Err(format!(
-            "expected {} hex chars ({} bytes), got {} bytes",
-            out.len() * 2,
+            "expected {expected} hex chars ({} bytes), got {} bytes",
             out.len(),
             hex.len()
         ));
@@ -311,10 +381,17 @@ fn decode_hex(hex: &[u8], out: &mut [u8]) -> Result<(), String> {
             _ => None,
         }
     }
-    for (i, pair) in hex.as_chunks::<2>().0.iter().enumerate() {
+    for (i, (slot, pair)) in out
+        .iter_mut()
+        .zip(hex.as_chunks::<2>().0.iter())
+        .enumerate()
+    {
         match (nibble(pair[0]), nibble(pair[1])) {
-            (Some(hi), Some(lo)) => out[i] = (hi << 4) | lo,
-            _ => return Err(format!("not valid hex at char {}", i * 2)),
+            (Some(hi), Some(lo)) => *slot = (hi << 4) | lo,
+            _ => {
+                let pos = i.saturating_mul(2);
+                return Err(format!("not valid hex at char {pos}"));
+            }
         }
     }
     Ok(())
@@ -328,54 +405,50 @@ enum KeySource {
 }
 
 /// Read raw secret material from its source, labelled by `flag` (`--key`,
-/// `--secret`) for the error message. An environment variable is REMOVED after
-/// reading, so it is not inherited by anything this process later spawns.
+/// `--secret`) for the error message. Resolved once per invocation via
+/// `Cli::transport` (`OnceCell`), so multi-connection verbs (`drain`) never
+/// re-read the key source.
 ///
 /// Not `std::env::var`: its `NotUnicode` error renders the variable's VALUE, so a
 /// message built from it would print the secret. The refusal here names the
 /// variable only.
-fn load_bytes(flag: &str, src: &KeySource) -> (String, Vec<u8>) {
+fn load_bytes(flag: &str, src: &KeySource) -> Result<(String, Vec<u8>), u8> {
     match src {
         KeySource::Env(name) => {
-            let v = std::env::var_os(name).unwrap_or_else(|| {
-                warn(&format!(
-                    "asb: {flag}-env {name}: environment variable not found"
+            let Some(v) = std::env::var_os(name) else {
+                return Err(fail_exit(
+                    2,
+                    &format!("{flag}-env {name}: environment variable not found"),
                 ));
-                exit(2);
-            });
-            std::env::remove_var(name);
-            let v = v.into_string().unwrap_or_else(|_| {
-                warn(&format!(
-                    "asb: {flag}-env {name}: environment variable is not valid UTF-8"
+            };
+            let Ok(v) = v.into_string() else {
+                return Err(fail_exit(
+                    2,
+                    &format!("{flag}-env {name}: environment variable is not valid UTF-8"),
                 ));
-                exit(2);
-            });
-            (format!("{flag}-env {name}"), v.into_bytes())
+            };
+            Ok((format!("{flag}-env {name}"), v.into_bytes()))
         }
-        KeySource::File(path) => {
-            let v = std::fs::read(path).unwrap_or_else(|e| {
-                warn(&format!("asb: {flag}-file {path}: {e}"));
-                exit(2);
-            });
-            (format!("{flag}-file {path}"), v)
-        }
+        KeySource::File(path) => match std::fs::read(path) {
+            Ok(v) => Ok((format!("{flag}-file {path}"), v)),
+            Err(e) => Err(fail_exit(2, &format!("{flag}-file {path}: {e}"))),
+        },
     }
 }
 
 /// Read the sealed transport's pre-shared key, decode its 64 hex chars, and scrub
 /// the intermediate buffer. Whitespace around the hex (a trailing newline in a key
 /// file) is fine.
-fn load_key(src: &KeySource) -> [u8; 32] {
-    let (what, mut raw) = load_bytes("--key", src);
+fn load_key(src: &KeySource) -> Result<[u8; 32], u8> {
+    let (what, mut raw) = load_bytes("--key", src)?;
     let mut key = [0u8; 32];
     let res = decode_hex(raw.trim_ascii(), &mut key);
     raw.fill(0);
     std::hint::black_box(&raw);
     if let Err(e) = res {
-        warn(&format!("asb: {what}: {e}"));
-        exit(2);
+        return Err(fail_exit(2, &format!("{what}: {e}")));
     }
-    key
+    Ok(key)
 }
 
 /// The shortest mint secret `mint` seals with and `serve` guards with. HMAC takes a
@@ -390,24 +463,26 @@ const SECRET_MIN: usize = 32;
 /// names the `chmod` rather than fixing it silently, because a key that sat
 /// group-readable may already have been read and the operator should know that.
 #[cfg(unix)]
-fn check_private(flag: &str, path: &str) {
+fn check_private(flag: &str, path: &str) -> Result<(), u8> {
     use std::os::unix::fs::PermissionsExt;
     let mode = match std::fs::metadata(path) {
         Ok(m) => m.permissions().mode() & 0o777,
-        Err(e) => {
-            warn(&format!("asb: {flag} {path}: {e}"));
-            exit(2);
-        }
+        Err(e) => return Err(fail_exit(2, &format!("{flag} {path}: {e}"))),
     };
     if mode & 0o077 != 0 {
-        warn(&format!(
-            "asb: {flag} {path} is mode {mode:04o}: a secret file must be readable by its owner alone (0600) — `chmod 600 {path}`, and treat what it holds as already seen if other users share this machine"
+        return Err(fail_exit(
+            2,
+            &format!(
+                "{flag} {path} is mode {mode:04o}: a secret file must be readable by its owner alone (0600) — `chmod 600 {path}`, and treat what it holds as already seen if other users share this machine"
+            ),
         ));
-        exit(2);
     }
+    Ok(())
 }
 #[cfg(not(unix))]
-fn check_private(_flag: &str, _path: &str) {}
+fn check_private(_flag: &str, _path: &str) -> Result<(), u8> {
+    Ok(())
+}
 
 /// Read the MINT secret — arbitrary bytes, not hex, because that is what
 /// `Broker::open_guarded` takes. `mint` and `serve` read it through this one
@@ -422,27 +497,28 @@ fn check_private(_flag: &str, _path: &str) {}
 /// An environment variable is text and cannot hold arbitrary bytes, so `--secret-env`
 /// is trimmed; write a text secret to a file with `printf %s`, not `echo`, and the
 /// two sources agree.
-fn load_secret(src: &KeySource) -> Vec<u8> {
+fn load_secret(src: &KeySource) -> Result<Vec<u8>, u8> {
     if let KeySource::File(path) = src {
-        check_private("--secret-file", path);
+        check_private("--secret-file", path)?;
     }
-    let (what, raw) = load_bytes("--secret", src);
+    let (what, raw) = load_bytes("--secret", src)?;
     let s = match src {
         KeySource::File(_) => raw,
         KeySource::Env(_) => raw.trim_ascii().to_vec(),
     };
     if s.is_empty() {
-        warn(&format!("asb: {what}: the mint secret is empty"));
-        exit(2);
+        return Err(fail_exit(2, &format!("{what}: the mint secret is empty")));
     }
     if s.len() < SECRET_MIN {
-        warn(&format!(
-            "asb: {what}: the mint secret is {} bytes; it must be at least {SECRET_MIN} (a short key mints capabilities that seal nothing)",
-            s.len()
+        return Err(fail_exit(
+            2,
+            &format!(
+                "{what}: the mint secret is {} bytes; it must be at least {SECRET_MIN} (a short key mints capabilities that seal nothing)",
+                s.len()
+            ),
         ));
-        exit(2);
     }
-    s
+    Ok(s)
 }
 
 /// Whether every address a `<host>:<port>` endpoint resolves to is LOOPBACK — the
@@ -475,19 +551,20 @@ type Cap = capfile::Line;
 ///
 /// A file that cannot be read exits 2 naming it; a malformed line is a usage error
 /// (exit 2) naming `file:line`.
-fn load_caps(paths: &[String]) -> Vec<Cap> {
+fn load_caps(paths: &[String]) -> Result<Vec<Cap>, u8> {
     let mut caps = Vec::new();
     for path in paths {
         match capfile::read_file(path) {
             Ok(ring) => caps.extend(ring),
             Err(e @ capfile::ReadError::Io { .. }) => {
-                warn(&format!("asb: --cap-file {e}"));
-                exit(2);
+                return Err(fail_exit(2, &format!("--cap-file {e}")));
             }
-            Err(capfile::ReadError::Malformed(m)) => usage_error(&format!("--cap-file {m}")),
+            Err(capfile::ReadError::Malformed(m)) => {
+                return Err(usage_error(&format!("--cap-file {m}")));
+            }
         }
     }
-    caps
+    Ok(caps)
 }
 
 /// The producer id a bound grant forces, when the ring names exactly one
@@ -501,7 +578,7 @@ fn load_caps(paths: &[String]) -> Vec<Cap> {
 /// choose an id no writable grant on the ring may publish under, and it could make
 /// an unambiguous ring look ambiguous and demand an `--id` for no reason.
 #[cfg(feature = "cap")]
-fn bound_producer_id(caps: &[Cap]) -> Option<u64> {
+fn bound_producer_id(caps: &[Cap]) -> Result<Option<u64>, u8> {
     let mut names: Vec<String> = caps
         .iter()
         .filter_map(|c| {
@@ -511,22 +588,24 @@ fn bound_producer_id(caps: &[Cap]) -> Option<u64> {
         .collect();
     names.sort();
     names.dedup();
-    match names.len() {
-        0 => None,
-        1 => Some(astream_cap::producer_id_of(&names[0])),
-        _ => usage_error(&format!(
+    if names.is_empty() {
+        Ok(None)
+    } else if let (1, Some(only)) = (names.len(), names.first()) {
+        Ok(Some(astream_cap::producer_id_of(only)))
+    } else {
+        Err(usage_error(&format!(
             "the attached grants bind {} different principals ({}); pass --id to say which producer id to publish under",
             names.len(),
             names.join(", ")
-        )),
+        )))
     }
 }
 
 /// Without the `cap` feature nothing here can attach a capability at all, so
 /// there is never a bound grant to derive a producer id from.
 #[cfg(not(feature = "cap"))]
-fn bound_producer_id(_caps: &[Cap]) -> Option<u64> {
-    None
+fn bound_producer_id(_caps: &[Cap]) -> Result<Option<u64>, u8> {
+    Ok(None)
 }
 
 /// The CLIENT side of every transport is the library's: [`astream_broker::connect`]
@@ -542,21 +621,23 @@ fn bound_producer_id(_caps: &[Cap]) -> Option<u64> {
 /// and never as a silent fall back to plaintext. With no connect timeout, each
 /// transport is its `Client` constructor exactly, as it was before the library had
 /// one erased connect.
-fn connect(t: &Transport, ep: &str) -> io::Result<(AnyClient, Closer)> {
+fn connect(t: &Transport, ep: &str) -> Result<(AnyClient, Closer), AsbErr> {
     match t {
-        Transport::Unix if cfg!(not(unix)) => {
-            warn("asb: Unix-socket endpoints need a unix host; use --tcp");
-            exit(2);
-        }
-        Transport::Sealed(_) if cfg!(not(feature = "aead")) => {
-            warn("asb: --key-env/--key-file require asb built with `--features aead`");
-            exit(2);
-        }
+        Transport::Unix if cfg!(not(unix)) => Err(AsbErr::Exit(fail_exit(
+            2,
+            "Unix-socket endpoints need a unix host; use --tcp",
+        ))),
+        Transport::Sealed(_) if cfg!(not(feature = "aead")) => Err(AsbErr::Exit(fail_exit(
+            2,
+            "--key-env/--key-file require asb built with `--features aead`",
+        ))),
         Transport::Handshake(_) if cfg!(not(feature = "handshake")) => {
-            warn("asb: --handshake requires asb built with `--features handshake`");
-            exit(2);
+            Err(AsbErr::Exit(fail_exit(
+                2,
+                "--handshake requires asb built with `--features handshake`",
+            )))
         }
-        _ => astream_broker::connect(t, ep, None),
+        _ => Ok(astream_broker::connect(t, ep, None)?),
     }
 }
 
@@ -564,35 +645,49 @@ fn connect(t: &Transport, ep: &str) -> io::Result<(AnyClient, Closer)> {
 // feature, asb stays zero-third-party and a key source is a clear error rather than
 // silent plaintext.
 #[cfg(feature = "aead")]
-fn serve_sealed(broker: &Broker, ep: &str, key: &[u8; 32]) -> io::Result<BrokerHandle> {
-    broker.serve_tcp_sealed(ep, *key)
+fn serve_sealed(broker: &Broker, ep: &str, key: &[u8; 32]) -> Result<io::Result<BrokerHandle>, u8> {
+    Ok(broker.serve_tcp_sealed(ep, *key))
 }
 #[cfg(not(feature = "aead"))]
-fn serve_sealed(_broker: &Broker, _ep: &str, _key: &[u8; 32]) -> io::Result<BrokerHandle> {
-    warn("asb: --key-env/--key-file require asb built with `--features aead`");
-    exit(2);
+fn serve_sealed(
+    _broker: &Broker,
+    _ep: &str,
+    _key: &[u8; 32],
+) -> Result<io::Result<BrokerHandle>, u8> {
+    Err(fail_exit(
+        2,
+        "--key-env/--key-file require asb built with `--features aead`",
+    ))
 }
 
 // Forward-secret handshake entry points, gated on the `handshake` feature (which
 // implies `aead`, so parse_key_hex is available here).
 #[cfg(feature = "handshake")]
-fn serve_handshake(broker: &Broker, ep: &str, key: &[u8; 32]) -> io::Result<BrokerHandle> {
-    broker.serve_tcp_handshake(ep, *key)
+fn serve_handshake(
+    broker: &Broker,
+    ep: &str,
+    key: &[u8; 32],
+) -> Result<io::Result<BrokerHandle>, u8> {
+    Ok(broker.serve_tcp_handshake(ep, *key))
 }
 #[cfg(not(feature = "handshake"))]
-fn serve_handshake(_broker: &Broker, _ep: &str, _key: &[u8; 32]) -> io::Result<BrokerHandle> {
-    warn("asb: --handshake requires asb built with `--features handshake`");
-    exit(2);
+fn serve_handshake(
+    _broker: &Broker,
+    _ep: &str,
+    _key: &[u8; 32],
+) -> Result<io::Result<BrokerHandle>, u8> {
+    Err(fail_exit(
+        2,
+        "--handshake requires asb built with `--features handshake`",
+    ))
 }
 
 struct Cli {
     pos: Vec<String>,
     bools: HashSet<String>,
     kv: HashMap<String, String>,
-    /// The transport, resolved ONCE per invocation. A key source is SINGLE-USE:
-    /// `load_bytes` removes the environment variable it read (so no child inherits
-    /// the secret), and `drain` opens two connections, so one resolution must serve
-    /// every connection.
+    /// The transport, resolved ONCE per invocation. `drain` opens two connections,
+    /// so one resolution serves every connection.
     transport: std::cell::OnceCell<Transport>,
     /// `--cap-file` is the one REPEATABLE flag: a connection's keyring holds up to
     /// `MAX_KEYRING` grants, and reading one subtree while committing under another
@@ -614,7 +709,10 @@ const VALUE_FLAGS: &[&str] = &[
     "--key-file",
     "--secret-env",
     "--secret-file",
+    "--revocation-file",
     "--unix",
+    "--durability",
+    "--horizon-ms",
 ];
 
 /// Flags that take no value.
@@ -705,22 +803,27 @@ fn warn(msg: &str) {
     let _ = err.flush();
 }
 
-fn usage_error(msg: &str) -> ! {
+fn usage_error(msg: &str) -> u8 {
     warn(&format!("asb: {msg}\n{USAGE}"));
-    exit(2);
+    2
 }
 
-fn parse() -> Cli {
+fn parse() -> Result<Cli, u8> {
     // `args_os`, NOT `args`: `std::env::args()` PANICS on an argument that is not
     // valid Unicode — exit 101 with a backtrace, before any of this strict-flag
     // handling runs. A non-UTF-8 `--key-file` path is a plausible real input on any
     // filesystem that permits one, and a malformed argument is a usage error.
-    let args: Vec<String> = std::env::args_os()
-        .map(|a| {
-            a.into_string()
-                .unwrap_or_else(|bad| usage_error(&format!("argument is not valid UTF-8: {bad:?}")))
-        })
-        .collect();
+    let mut args: Vec<String> = Vec::new();
+    for a in std::env::args_os() {
+        match a.into_string() {
+            Ok(s) => args.push(s),
+            Err(bad) => {
+                return Err(usage_error(&format!(
+                    "argument is not valid UTF-8: {bad:?}"
+                )));
+            }
+        }
+    }
     let mut pos = Vec::new();
     let mut bools: HashSet<String> = HashSet::new();
     let mut kv: HashMap<String, String> = HashMap::new();
@@ -742,28 +845,28 @@ fn parse() -> Cli {
         // A boolean takes no value, so it never swallows the next token.
         if BOOL_FLAGS.contains(&flag) {
             if inline.is_some() {
-                usage_error(&format!("{flag} takes no value"));
+                return Err(usage_error(&format!("{flag} takes no value")));
             }
             bools.insert(flag.to_string());
             continue;
         }
         if let Some((_, remedy)) = ARGV_SECRETS.iter().find(|(f, _)| *f == flag) {
-            usage_error(&format!(
+            return Err(usage_error(&format!(
                 "{flag} on argv is refused: the value would be visible to every local user via `ps` for the process's lifetime; {remedy}"
-            ));
+            )));
         }
         if flag == "--cap-file" || VALUE_FLAGS.contains(&flag) {
             let v = match inline {
                 Some(v) => v,
                 None => match it.next() {
                     Some(v) if !v.starts_with("--") => v.clone(),
-                    _ => usage_error(&format!("{flag} expects a value")),
+                    _ => return Err(usage_error(&format!("{flag} expects a value"))),
                 },
             };
             if flag == "--cap-file" {
                 cap_files.push(v);
             } else if kv.insert(flag.to_string(), v).is_some() {
-                usage_error(&format!("{flag} given more than once"));
+                return Err(usage_error(&format!("{flag} given more than once")));
             }
             continue;
         }
@@ -774,25 +877,25 @@ fn parse() -> Cli {
         // (`--psk=<key>`) carries the key there.
         if a.starts_with('-') && a.len() > 1 {
             let name = a.split_once('=').map_or(a.as_str(), |(name, _)| name);
-            usage_error(&format!("unknown flag {name}"));
+            return Err(usage_error(&format!("unknown flag {name}")));
         }
         pos.push(a.clone());
     }
-    Cli {
+    Ok(Cli {
         pos,
         bools,
         kv,
         transport: std::cell::OnceCell::new(),
         cap_files,
-    }
+    })
 }
 
 impl Cli {
-    fn at(&self, i: usize, what: &str) -> String {
-        self.pos
-            .get(i)
-            .cloned()
-            .unwrap_or_else(|| usage_error(&format!("missing <{what}>")))
+    fn at(&self, i: usize, what: &str) -> Result<String, u8> {
+        match self.pos.get(i) {
+            Some(s) => Ok(s.clone()),
+            None => Err(usage_error(&format!("missing <{what}>"))),
+        }
     }
 
     fn has(&self, flag: &str) -> bool {
@@ -800,16 +903,17 @@ impl Cli {
     }
 
     /// Reject surplus positionals (a stray token is a mistake, not noise).
-    fn no_more_than(&self, n: usize) {
+    fn no_more_than(&self, n: usize) -> Result<(), u8> {
         if let Some(extra) = self.pos.get(n) {
-            usage_error(&format!("unexpected argument {extra:?}"));
+            return Err(usage_error(&format!("unexpected argument {extra:?}")));
         }
+        Ok(())
     }
 
     /// Reject any flag this verb does not take. A flag that belongs to another verb
     /// is exactly as much of a mistake as a mistyped one — `asb pub --from 3` means
     /// its author expected something the command will not do.
-    fn only(&self, verb: &str, allowed: &[&str]) {
+    fn only(&self, verb: &str, allowed: &[&str]) -> Result<(), u8> {
         let mut given: Vec<&str> = self
             .kv
             .keys()
@@ -822,93 +926,109 @@ impl Cli {
         given.sort_unstable(); // a deterministic message when several are wrong
         for f in given {
             if !allowed.contains(&f) {
-                usage_error(&format!("{f} does not apply to {verb}"));
+                return Err(usage_error(&format!("{f} does not apply to {verb}")));
             }
         }
+        Ok(())
     }
 
     /// The verb's own flags, on top of the transport/capability set every network
     /// verb shares.
-    fn only_net(&self, verb: &str, extra: &[&str]) {
+    fn only_net(&self, verb: &str, extra: &[&str]) -> Result<(), u8> {
         let mut allowed: Vec<&str> = COMMON_FLAGS.to_vec();
         allowed.extend_from_slice(extra);
-        self.only(verb, &allowed);
+        self.only(verb, &allowed)
     }
 
     /// A numeric flag, STRICTLY: absent → `None`; present but not an unsigned
     /// integer → usage error. A present-but-unparsable value must never fall back
     /// to a default (that would silently turn an explicit idempotent `--id/--seq`
     /// into a fresh unique one, or an explicit `--from` into 0).
-    fn num(&self, flag: &str) -> Option<u64> {
-        self.kv.get(flag).map(|v| {
-            v.parse::<u64>().unwrap_or_else(|_| {
-                usage_error(&format!("{flag} expects an unsigned integer, got {v:?}"))
-            })
-        })
+    fn num(&self, flag: &str) -> Result<Option<u64>, u8> {
+        match self.kv.get(flag) {
+            None => Ok(None),
+            Some(v) => match v.parse::<u64>() {
+                Ok(n) => Ok(Some(n)),
+                Err(_) => Err(usage_error(&format!(
+                    "{flag} expects an unsigned integer, got {v:?}"
+                ))),
+            },
+        }
     }
 
     /// The same, for a flag the wire carries as a `u32` (a page size).
-    fn num32(&self, flag: &str) -> Option<u32> {
-        self.kv.get(flag).map(|v| {
-            v.parse::<u32>().unwrap_or_else(|_| {
-                usage_error(&format!(
+    fn num32(&self, flag: &str) -> Result<Option<u32>, u8> {
+        match self.kv.get(flag) {
+            None => Ok(None),
+            Some(v) => match v.parse::<u32>() {
+                Ok(n) => Ok(Some(n)),
+                Err(_) => Err(usage_error(&format!(
                     "{flag} expects an unsigned integer below 2^32, got {v:?}"
-                ))
-            })
-        })
+                ))),
+            },
+        }
     }
 
-    fn pos_num(&self, i: usize, what: &str) -> u64 {
-        let v = self.at(i, what);
-        v.parse::<u64>().unwrap_or_else(|_| {
-            usage_error(&format!("<{what}> expects an unsigned integer, got {v:?}"))
-        })
+    fn pos_num(&self, i: usize, what: &str) -> Result<u64, u8> {
+        let v = self.at(i, what)?;
+        match v.parse::<u64>() {
+            Ok(n) => Ok(n),
+            Err(_) => Err(usage_error(&format!(
+                "<{what}> expects an unsigned integer, got {v:?}"
+            ))),
+        }
     }
 
-    fn key_source(&self) -> Option<KeySource> {
+    fn key_source(&self) -> Result<Option<KeySource>, u8> {
         match (self.kv.get("--key-env"), self.kv.get("--key-file")) {
-            (Some(_), Some(_)) => usage_error("--key-env and --key-file are mutually exclusive"),
-            (Some(e), None) => Some(KeySource::Env(e.clone())),
-            (None, Some(f)) => Some(KeySource::File(f.clone())),
-            (None, None) => None,
+            (Some(_), Some(_)) => Err(usage_error(
+                "--key-env and --key-file are mutually exclusive",
+            )),
+            (Some(e), None) => Ok(Some(KeySource::Env(e.clone()))),
+            (None, Some(f)) => Ok(Some(KeySource::File(f.clone()))),
+            (None, None) => Ok(None),
         }
     }
 
     /// Where the mint secret comes from, if one was given (`serve` guards only when
     /// it was; `mint` requires one).
-    fn secret_source(&self) -> Option<KeySource> {
+    fn secret_source(&self) -> Result<Option<KeySource>, u8> {
         match (self.kv.get("--secret-env"), self.kv.get("--secret-file")) {
-            (Some(_), Some(_)) => {
-                usage_error("--secret-env and --secret-file are mutually exclusive")
-            }
-            (Some(e), None) => Some(KeySource::Env(e.clone())),
-            (None, Some(f)) => Some(KeySource::File(f.clone())),
-            (None, None) => None,
+            (Some(_), Some(_)) => Err(usage_error(
+                "--secret-env and --secret-file are mutually exclusive",
+            )),
+            (Some(e), None) => Ok(Some(KeySource::Env(e.clone()))),
+            (None, Some(f)) => Ok(Some(KeySource::File(f.clone()))),
+            (None, None) => Ok(None),
         }
     }
 
     /// How this invocation reaches the broker — resolved on first use and CACHED,
-    /// because reading the key source is a one-shot act (an environment variable is
-    /// removed as it is read) and `drain` opens two connections.
-    fn transport(&self) -> &Transport {
-        self.transport.get_or_init(|| {
-            let handshake = self.has("--handshake");
-            match self.key_source() {
-                // A key implies TCP (sealing a local Unix socket is pointless).
-                Some(src) if handshake => Transport::Handshake(Box::new(load_key(&src))),
-                Some(src) => Transport::Sealed(Box::new(load_key(&src))),
-                // `--handshake` without a key has nothing to authenticate the agreement:
-                // an unauthenticated ephemeral DH is exactly what a MITM wants.
-                None if handshake => {
-                    usage_error("--handshake needs a key (--key-env NAME or --key-file PATH)")
-                }
-                None if self.has("--tcp") => Transport::Tcp,
-                None => Transport::Unix,
+    /// because `drain` opens two connections.
+    fn transport(&self) -> Result<&Transport, u8> {
+        if let Some(t) = self.transport.get() {
+            return Ok(t);
+        }
+        let handshake = self.has("--handshake");
+        let resolved = match self.key_source()? {
+            // A key implies TCP (sealing a local Unix socket is pointless).
+            Some(src) if handshake => Transport::Handshake(Box::new(load_key(&src)?)),
+            Some(src) => Transport::Sealed(Box::new(load_key(&src)?)),
+            // `--handshake` without a key has nothing to authenticate the agreement:
+            // an unauthenticated ephemeral DH is exactly what a MITM wants.
+            None if handshake => {
+                return Err(usage_error(
+                    "--handshake needs a key (--key-env NAME or --key-file PATH)",
+                ));
             }
-        })
+            None if self.has("--tcp") => Transport::Tcp,
+            None => Transport::Unix,
+        };
+        let _ = self.transport.set(resolved);
+        self.transport.get().ok_or(1)
     }
 
-    fn caps(&self) -> Vec<Cap> {
+    fn caps(&self) -> Result<Vec<Cap>, u8> {
         load_caps(&self.cap_files)
     }
 }
@@ -931,9 +1051,9 @@ fn now_millis() -> u64 {
 
 /// Connect over the chosen transport and attach every capability, in order, under
 /// one `Hello`.
-fn connect_attached(cli: &Cli, ep: &str, caps: &[Cap]) -> io::Result<(AnyClient, Closer)> {
+fn connect_attached(cli: &Cli, ep: &str, caps: &[Cap]) -> Result<(AnyClient, Closer), AsbErr> {
     // Validate every flag (usage errors) before touching the network.
-    let transport = cli.transport();
+    let transport = cli.transport()?;
     let (mut c, closer) = connect(transport, ep)?;
     c.attach_all(caps.iter().map(|cap| (cap.grant.as_str(), &cap.tag[..])))?;
     Ok((c, closer))
@@ -944,19 +1064,19 @@ fn connect_attached(cli: &Cli, ep: &str, caps: &[Cap]) -> io::Result<(AnyClient,
 /// the verbs whose dedup key must survive a restart (`--seq`, `--seq-file`, `ack`): for
 /// those the pid default is not merely unhelpful, it silently breaks the
 /// exactly-once property the caller asked for, so it is an error instead.
-fn producer_id(cli: &Cli, caps: &[Cap], require_stable: Option<&str>) -> u64 {
-    if let Some(id) = cli.num("--id") {
-        return id;
+fn producer_id(cli: &Cli, caps: &[Cap], require_stable: Option<&str>) -> Result<u64, u8> {
+    if let Some(id) = cli.num("--id")? {
+        return Ok(id);
     }
-    if let Some(id) = bound_producer_id(caps) {
-        return id;
+    if let Some(id) = bound_producer_id(caps)? {
+        return Ok(id);
     }
     if let Some(why) = require_stable {
-        usage_error(&format!(
+        return Err(usage_error(&format!(
             "{why} needs a producer id that survives a restart: pass --id N, or attach a grant bound to a principal (--cap-file)"
-        ));
+        )));
     }
-    u64::from(std::process::id())
+    Ok(u64::from(std::process::id()))
 }
 
 fn do_pub(mut c: AnyClient, id: u64, seq: u64, subject: &str, body: &[u8]) -> io::Result<()> {
@@ -1124,12 +1244,13 @@ fn visible_head(c: &mut AnyClient, filter: &str) -> io::Result<u64> {
 /// GROWS, so an `upto` below the head when it was read is still below the head when
 /// the commit lands. The window it declines to serve is an operand that names a
 /// record the broker does not have yet, which is exactly the input this refuses.
-fn refuse_past_head(what: &str, value: u64, head: u64) {
+fn refuse_past_head(what: &str, value: u64, head: u64) -> Result<(), u8> {
     if value >= head {
-        usage_error(&format!(
+        return Err(usage_error(&format!(
             "<{what}> {value} is at or past the broker's visible head {head}: it names no record. A consumer group's committed offset is MONOTONE — nothing lowers it again — so committing past the head durably skips every record the group has not read, and the only recovery is a new group name"
-        ));
+        )));
     }
+    Ok(())
 }
 
 /// A bounded read's answer: the page, then where to resume from.
@@ -1353,19 +1474,52 @@ fn unbound_god_cap_filter(grant: &str) -> Option<String> {
 
 /// Mint a capability and print the one line a `--cap-file` holds.
 #[cfg(feature = "cap")]
-fn do_mint(secret: &[u8], grant: &str) -> io::Result<()> {
-    let cap =
-        astream_cap::mint(secret, grant).unwrap_or_else(|e| usage_error(&format!("mint: {e}")));
+fn do_mint(secret: &[u8], grant: &str) -> Result<(), AsbErr> {
+    let cap = match astream_cap::mint(secret, grant) {
+        Ok(c) => c,
+        Err(e) => return Err(AsbErr::Exit(usage_error(&format!("mint: {e}")))),
+    };
     // Not `say_durable`: minting touches no broker and is deterministic, so a lost
     // line costs nothing but a re-run.
-    say(&capfile::format_line(grant, &cap.tag))
+    Ok(say(&capfile::format_line(grant, &cap.tag))?)
 }
 
 /// Minting needs the same vetted MAC the broker verifies with.
 #[cfg(not(feature = "cap"))]
-fn do_mint(_secret: &[u8], _grant: &str) -> io::Result<()> {
-    warn("asb: mint requires asb built with `--features cap`");
-    exit(2);
+fn do_mint(_secret: &[u8], _grant: &str) -> Result<(), AsbErr> {
+    Err(AsbErr::Exit(fail_exit(
+        2,
+        "mint requires asb built with `--features cap`",
+    )))
+}
+
+/// Attenuate a parent capability into a narrower child capability (`REQUIREMENTS` R6).
+/// When `secret` is `None`, performs offline Macaroon attenuation (`attenuate_offline`)
+/// using the parent capability's bearer tag without needing the broker's mint secret.
+#[cfg(feature = "cap")]
+fn do_attenuate(secret: Option<&[u8]>, parent: &Cap, child_grant: &str) -> Result<(), AsbErr> {
+    let parent_cap = astream_cap::Capability {
+        filter: parent.grant.clone(),
+        tag: parent.tag,
+    };
+    let now = now_millis();
+    let res = match secret {
+        Some(secret) => astream_cap::attenuate(secret, &parent_cap, child_grant, now),
+        None => astream_cap::attenuate_offline(&parent_cap, child_grant, now),
+    };
+    let child = match res {
+        Ok(c) => c,
+        Err(e) => return Err(AsbErr::Exit(usage_error(&format!("attenuate: {e}")))),
+    };
+    Ok(say(&capfile::format_line(&child.filter, &child.tag))?)
+}
+
+#[cfg(not(feature = "cap"))]
+fn do_attenuate(_secret: Option<&[u8]>, _parent: &Cap, _child_grant: &str) -> Result<(), AsbErr> {
+    Err(AsbErr::Exit(fail_exit(
+        2,
+        "attenuate requires asb built with `--features cap`",
+    )))
 }
 
 /// Refuse to take over a Unix socket a live broker is answering on: a peer that
@@ -1373,28 +1527,98 @@ fn do_mint(_secret: &[u8], _grant: &str) -> io::Result<()> {
 /// two daemons on one log. (`Broker::serve` makes the same probe and refuses a path
 /// that is not a socket; checking here names the endpoint in asb's own error.)
 #[cfg(unix)]
-fn refuse_live_socket(ep: &str) {
+fn refuse_live_socket(ep: &str) -> Result<(), u8> {
     if std::fs::metadata(ep).is_ok() && std::os::unix::net::UnixStream::connect(ep).is_ok() {
-        warn(&format!("asb: {ep} is already served by another broker (a peer answered on the socket); refusing to take it over"));
-        exit(1);
+        return Err(fail_exit(
+            1,
+            &format!("{ep} is already served by another broker (a peer answered on the socket); refusing to take it over"),
+        ));
     }
+    Ok(())
 }
 #[cfg(not(unix))]
-fn refuse_live_socket(_ep: &str) {}
+fn refuse_live_socket(_ep: &str) -> Result<(), u8> {
+    Ok(())
+}
 
-/// `Broker::open_guarded` when there is a secret: every attach must then carry a
-/// capability minted under it. `serve` refuses a secret in a build without `cap`
-/// before it reads one, so the fallback below never sees `Some`.
-#[cfg(feature = "cap")]
-fn open_broker(log: &str, secret: Option<Vec<u8>>) -> io::Result<Broker> {
-    match secret {
-        Some(secret) => Broker::open_guarded(log, secret),
-        None => Broker::open(log),
+/// `serve`'s tier: `--durability strict|ordered|relaxed` (strict when absent), and
+/// `--horizon-ms N` for ordered alone (the default horizon, one second, when absent).
+/// Strict like every other flag: an unknown tier, a horizon for another tier or a
+/// non-numeric one is a usage error, never a silent default.
+fn serve_durability(cli: &Cli) -> Result<Durability, u8> {
+    let horizon_ms = cli.num("--horizon-ms")?;
+    let word = match cli.kv.get("--durability") {
+        Some(w) => w.as_str(),
+        None => "strict",
+    };
+    if word == "ordered" {
+        return match horizon_ms {
+            None => Ok(Durability::ordered()),
+            Some(ms) => Ok(Durability::Ordered {
+                horizon: Some(Duration::from_millis(ms)),
+            }),
+        };
+    }
+    if word == "strict" || word == "relaxed" {
+        if horizon_ms.is_some() {
+            return Err(usage_error(
+                "--horizon-ms applies to --durability ordered alone",
+            ));
+        }
+        return if word == "strict" {
+            Ok(Durability::Strict)
+        } else {
+            Ok(Durability::Relaxed)
+        };
+    }
+    Err(usage_error(&format!(
+        "--durability {word:?}: expected strict, ordered or relaxed"
+    )))
+}
+
+/// A tier's name on the command line and in `serve`'s stderr.
+fn tier_word(tier: astream_broker::Tier) -> String {
+    match tier {
+        astream_broker::Tier::Strict => "strict".to_string(),
+        astream_broker::Tier::Ordered => "ordered".to_string(),
+        astream_broker::Tier::Relaxed => "relaxed".to_string(),
+        other => format!("{other:?}"),
     }
 }
+
+/// What an Ordered broker's horizon promises, for `serve`'s stderr: `, horizon N ms`, a
+/// full flush after every batch for 0, and no bound at all for none (which an embedder's
+/// broker can ask for and `asb` cannot); nothing for another tier, which keeps none.
+fn horizon_note(served: &astream_broker::ServedInfo) -> String {
+    if served.requested != astream_broker::Tier::Ordered {
+        return String::new();
+    }
+    match served.horizon_ms {
+        None => ", no horizon (nothing but a clean stop flushes in full)".to_string(),
+        Some(0) => ", horizon 0 ms (a full flush after every batch)".to_string(),
+        Some(ms) => format!(", horizon {ms} ms"),
+    }
+}
+
+/// The broker `serve` runs: at `durability`, and GUARDED when there is a secret (every
+/// attach must then carry a capability minted under it). No escalation table: `asb`
+/// names no record a person would miss, so on the weaker tiers every record rides the
+/// tier's own promise. `serve` refuses a secret in a build without `cap` before it
+/// reads one, so the fallback below never sees `Some`.
+///
+/// `asb serve` keeps the default signal action (it has no signal code, and astream no
+/// libc), so a SIGTERM ends it without the clean close a broker's shutdown runs: after a
+/// reboot, an `ordered` or `relaxed` log `asb serve` served moves its generation once —
+/// the safe direction, and what a reader holding offsets is told by the identity.
+#[cfg(feature = "cap")]
+fn open_broker(log: &str, secret: Option<Vec<u8>>, durability: Durability) -> io::Result<Broker> {
+    let mut opts = astream_broker::OpenOptions::new(durability);
+    opts.guard = secret;
+    Broker::open_opts(log, opts, || Ok(astream_broker::Prepared::Nothing))
+}
 #[cfg(not(feature = "cap"))]
-fn open_broker(log: &str, _secret: Option<Vec<u8>>) -> io::Result<Broker> {
-    Broker::open(log)
+fn open_broker(log: &str, _secret: Option<Vec<u8>>, durability: Durability) -> io::Result<Broker> {
+    Broker::open_with(log, durability)
 }
 
 /// A bind refused AFTER the log was opened must not leave the log behind when
@@ -1410,476 +1634,639 @@ fn discard_created_log(log: &str, created_here: bool, broker: Broker) {
 
 /// Open the log — GUARDED when a mint secret was given — translating "someone else
 /// holds this log" into a clear exit 1.
-fn open_log(log: &str, secret: Option<Vec<u8>>) -> Broker {
-    open_broker(log, secret).unwrap_or_else(|e| {
-        let msg = e.to_string().to_ascii_lowercase();
-        let held = matches!(
-            e.kind(),
-            io::ErrorKind::WouldBlock | io::ErrorKind::AlreadyExists | io::ErrorKind::ResourceBusy
-        ) || msg.contains("lock")
-            || msg.contains("served");
-        if held {
-            warn(&format!(
-                "asb: log {log} is already served by another broker ({e})"
-            ));
-        } else {
-            warn(&format!("asb: open {log}: {e}"));
-        }
-        exit(1);
-    })
-}
-
-fn run() -> io::Result<()> {
-    let cli = parse();
-    match cli.pos.first().map(String::as_str) {
-        // The explicit, operator-invoked repair for a log `serve` refuses to open.
-        // `BrokerLog::open` fails closed on a corrupt record because everything from
-        // there on may be acked data; this is the one command that discards it, and it
-        // says how much it discarded. A clean or merely torn log is left as it is.
-        Some("repair") => {
-            let log = cli.at(1, "log");
-            cli.no_more_than(2);
-            if cli.has("--tcp") {
-                usage_error("--tcp does not apply to repair (it operates on a local log file)");
-            }
-            cli.only("repair", &[]);
-            let (_log, dropped) = BrokerLog::open_repair(&log, Durability::Strict)?;
-            if dropped == 0 {
-                say(&format!("{log}: nothing to repair"))
+fn open_log(log: &str, secret: Option<Vec<u8>>, durability: Durability) -> Result<Broker, u8> {
+    match open_broker(log, secret, durability) {
+        Ok(b) => Ok(b),
+        Err(e) => {
+            let msg = e.to_string().to_ascii_lowercase();
+            let held = matches!(
+                e.kind(),
+                io::ErrorKind::WouldBlock
+                    | io::ErrorKind::AlreadyExists
+                    | io::ErrorKind::ResourceBusy
+            ) || msg.contains("lock")
+                || msg.contains("served");
+            if held {
+                Err(fail_exit(
+                    1,
+                    &format!("log {log} is already served by another broker ({e})"),
+                ))
             } else {
-                say_durable(
-                    &format!(
-                        "{log}: repaired, dropped {dropped} byte(s) from the corrupt record on"
-                    ),
-                    "the log WAS truncated",
-                )
+                Err(fail_exit(1, &format!("open {log}: {e}")))
             }
         }
-        // Mint a capability line. Offline: it touches no broker, only the secret.
-        Some("mint") => {
-            let grant = cli.at(1, "grant");
-            cli.no_more_than(2);
-            cli.only(
-                "mint",
-                &["--secret-env", "--secret-file", "--legacy-unbound"],
-            );
-            // The mode AND the binding are the whole point of the grant string, so
-            // `mint` will not guess them. The read-write grant that names no principal
-            // IS a valid grant — the fleet-root god cap — which is exactly why minting
-            // one is opt-in: the careless command must not be the dangerous one. The
-            // gate reads the PARSED grant, because `/f/F/>` and `rw:/f/F/>` are one
-            // authority in two spellings and gating on the spelling gates on nothing.
-            let legacy = cli.has("--legacy-unbound");
-            match (unbound_god_cap_filter(&grant), legacy) {
-                (Some(filter), false) => usage_error(&format!(
-                    "refusing to mint {grant:?}: it is the READ-WRITE, UNBOUND grant (it may publish under any producer id) — `{filter}` and `rw:{filter}` are the same authority in two spellings. Say the mode and the binding: \"ro:{filter}\" to read, \"rw,p=<principal>:{filter}\" to write as that principal — or --legacy-unbound if the god cap is really what you want"
-                )),
-                (None, true) => usage_error(
-                    "--legacy-unbound applies only to the READ-WRITE, UNBOUND grant (a bare filter, or `rw:` with no `,p=<principal>`); this grant is already read-only or bound to a principal",
-                ),
-                _ => {}
-            }
-            let src = cli.secret_source().unwrap_or_else(|| {
-                usage_error(
-                    "mint needs the broker's mint secret: --secret-env NAME or --secret-file PATH",
-                )
-            });
-            let secret = load_secret(&src);
-            do_mint(&secret, &grant)
-        }
-        Some("serve") => {
-            let ep = cli.at(1, "endpoint");
-            let log = cli
-                .pos
-                .get(2)
-                .cloned()
-                .unwrap_or_else(|| format!("{ep}.log"));
-            cli.no_more_than(3);
-            cli.only(
-                "serve",
-                &[
-                    "--tcp",
-                    "--handshake",
-                    "--key-env",
-                    "--key-file",
-                    "--secret-env",
-                    "--secret-file",
-                    "--unix",
-                    "--allow-remote",
-                ],
-            );
-            // Every refusal below is decided BEFORE a secret is read or the log is
-            // opened, so a usage error consumes no `--*-env` variable and leaves no
-            // file behind.
-            let tcp = cli.has("--tcp") || cli.key_source().is_some();
-            let beside = cli.kv.get("--unix").cloned();
-            if !tcp {
-                if beside.is_some() {
-                    usage_error("--unix needs a TCP listener (--tcp, or a key): without one the endpoint IS the Unix socket");
-                }
-                if cli.has("--allow-remote") {
-                    usage_error(
-                        "--allow-remote applies to a TCP listener; a Unix socket is never remote",
-                    );
-                }
-            }
-            let guard = cli.secret_source();
-            if guard.is_some() && !cfg!(feature = "cap") {
-                usage_error("serve --secret-env/--secret-file (a GUARDED broker) requires asb built with `--features cap`");
-            }
-            if tcp {
-                match is_loopback_endpoint(&ep) {
-                    Ok(true) => {}
-                    Ok(false) if cli.has("--allow-remote") => {}
-                    Ok(false) => usage_error(&format!(
-                        "{ep} is not a loopback address, and a broker bound there is reachable from the network: plain --tcp has no boundary at all, and a pre-shared key is one secret every host of the fleet holds — a transport boundary, not a per-host identity (only a --secret-file guard says which node may publish what). Pass --allow-remote to say that is what you mean"
-                    )),
-                    Err(e) => usage_error(&format!("{ep}: {e} (a <host>:<port> to bind)")),
-                }
-            }
-            if let Some(path) = cli.kv.get("--key-file") {
-                check_private("--key-file", path);
-            }
-            let secret = guard.as_ref().map(load_secret);
-            let guarded = secret.is_some();
-            let transport = cli.transport();
-            if matches!(transport, Transport::Unix) {
-                refuse_live_socket(&ep);
-            }
-            if let Some(sock) = &beside {
-                refuse_live_socket(sock);
-            }
-            let created_here = !std::path::Path::new(&log).exists();
-            let broker = open_log(&log, secret);
-            let refused = |what: &str, e: io::Error, broker: Broker| -> ! {
-                discard_created_log(&log, created_here, broker);
-                if e.kind() == io::ErrorKind::AddrInUse {
-                    warn(&format!(
-                        "asb: {what} is already served by another broker ({e})"
-                    ));
-                } else {
-                    warn(&format!("asb: serve {what}: {e}"));
-                }
-                exit(1);
-            };
-            let served = match transport {
-                Transport::Sealed(key) => serve_sealed(&broker, &ep, key),
-                Transport::Handshake(key) => serve_handshake(&broker, &ep, key),
-                Transport::Tcp => broker.serve_tcp(&ep),
-                Transport::Unix => broker.serve(&ep),
-            };
-            let handle = match served {
-                Ok(h) => h,
-                Err(e) => refused(&ep, e, broker),
-            };
-            // THE SOCKET BESIDE THE PORT: one broker, one log, one guard — two
-            // acceptors.
-            let beside_handle = match beside.as_deref().map(|sock| (sock, broker.serve(sock))) {
-                None => None,
-                Some((_, Ok(h))) => Some(h),
-                Some((sock, Err(e))) => {
-                    drop(handle);
-                    refused(sock, e, broker)
-                }
-            };
-            let bound = handle.tcp_addr().map_or(ep, str::to_string);
-            // The readiness line — callers sync on this, not a sleep — so a caller
-            // that cannot read it will hang waiting for it. `say` flushes and reports
-            // the write error instead of parking forever behind a dead reader. With
-            // --unix a second line follows once that socket is bound too.
-            say(&format!("listening {bound}"))?;
-            if let Some(sock) = &beside {
-                say(&format!("listening {sock}"))?;
-            }
-            warn(&format!(
-                "asb: serving {bound}{} — {}",
-                beside
-                    .as_deref()
-                    .map_or_else(String::new, |sock| format!(" and {sock}")),
-                if guarded {
-                    "GUARDED: an attach must carry a capability minted under the secret"
-                } else {
-                    "unguarded: no capability is checked on attach"
-                }
-            ));
-            // Dropping a handle shuts its acceptor down and unlinks its socket.
-            let _keep = (handle, beside_handle);
-            loop {
-                std::thread::park();
-            }
-        }
-        Some("pub") => {
-            let ep = cli.at(1, "endpoint");
-            let subject = cli.at(2, "subject");
-            cli.no_more_than(3);
-            cli.only_net("pub", &["--id", "--seq", "--seq-file"]);
-            let seq_file = cli.kv.get("--seq-file").cloned();
-            if seq_file.is_some() && cli.kv.contains_key("--seq") {
-                usage_error("--seq and --seq-file both set the producer sequence; pass one");
-            }
-            let caps = cli.caps();
-            // Parse --seq HERE, not after the connect: a malformed value is a usage
-            // error (exit 2) even when the endpoint is not listening.
-            let explicit_seq = cli.num("--seq");
-            // Default to a UNIQUE (id, seq) per invocation, not fixed constants:
-            // the broker dedups by (producer_id, producer_seq), so two independent
-            // publishers both defaulting to (1, 0) would collide and the second
-            // publish would be silently dropped as a dup. A deliberate idempotent
-            // retry passes an explicit sequence, and a sequence is only a dedup key
-            // under an id that survives the process: a per-invocation id would make
-            // a retried `--seq` a fresh record, so either sequence flag demands one.
-            let stable_for = if seq_file.is_some() {
-                Some("--seq-file")
-            } else if explicit_seq.is_some() {
-                Some("--seq")
-            } else {
-                None
-            };
-            let id = producer_id(&cli, &caps, stable_for);
-            // The top half of the sequence space belongs to `ack` (see ACK_SEQ_BASE),
-            // so a publish may not reach into it and collide with one.
-            if explicit_seq.is_some_and(|seq| seq >= ACK_SEQ_BASE) {
-                usage_error(
-                    "--seq must be below 2^63: sequences at or above it are reserved for `asb ack`, which publishes under 2^63|<input offset> so that an ack and an ordinary publish under the same producer id can never share a dedup key",
-                );
-            }
-            let mut body = Vec::new();
-            io::stdin().read_to_end(&mut body)?;
-            // A body over the record cap can never be stored, so retrying cannot
-            // help: refuse it as bad input before connecting or burning a sequence.
-            if body.len() > MAX_RECORD_PAYLOAD {
-                usage_error(&format!(
-                    "the body is {} bytes; a record holds at most {MAX_RECORD_PAYLOAD}",
-                    body.len()
-                ));
-            }
-            let (c, _) = connect_attached(&cli, &ep, &caps)?;
-            // The write-ahead lands here: after the connection is up (so an endpoint
-            // that is not there costs no sequence number) and before the Publish.
-            let seq = match &seq_file {
-                Some(path) => advance_seq_file(path)?,
-                None => explicit_seq.unwrap_or_else(now_nanos),
-            };
-            do_pub(c, id, seq, &subject, &body)
-        }
-        Some("sub") => {
-            let ep = cli.at(1, "endpoint");
-            let filter = cli.at(2, "filter");
-            cli.no_more_than(3);
-            cli.only_net("sub", &["--from", "--group"]);
-            let from = cli.num("--from");
-            let group = cli.kv.get("--group").cloned();
-            if group.is_some() && from.is_some() {
-                usage_error("--group resumes from the group's committed offset; it cannot be combined with --from");
-            }
-            let caps = cli.caps();
-            let (c, _) = connect_attached(&cli, &ep, &caps)?;
-            let sub = match group {
-                Some(g) => c.subscribe_group(&g, &filter)?,
-                None => c.subscribe(from.unwrap_or(0), &filter)?,
-            };
-            do_sub(sub)
-        }
-        // RETAINED STATE: the last record of every subject the filter matches.
-        Some("last") => {
-            let ep = cli.at(1, "endpoint");
-            let filter = cli.at(2, "filter");
-            cli.no_more_than(3);
-            cli.only_net("last", &["--after", "--max"]);
-            let after = cli.kv.get("--after").cloned().unwrap_or_default();
-            let max = cli.num32("--max").unwrap_or(DEFAULT_PAGE);
-            let caps = cli.caps();
-            let (mut c, _) = connect_attached(&cli, &ep, &caps)?;
-            // `last_all`, NOT `Client::last`: the latter drops the resume cursor, and a
-            // page the broker's own row/scan bounds cut short would be printed as if it
-            // were the whole answer. What that does NOT buy is one snapshot — see
-            // `last_all`: the MARK is the FIRST request's, and a subject superseded past
-            // a request's pinned head is omitted from its page.
-            let (records, next, head) = last_all(&mut c, &filter, &after, max)?;
-            print_page(&records, next, head)
-        }
-        // A BOUNDED READ that does not tail: page through history with --from.
-        Some("fetch") => {
-            let ep = cli.at(1, "endpoint");
-            let filter = cli.at(2, "filter");
-            cli.no_more_than(3);
-            cli.only_net("fetch", &["--from", "--max"]);
-            let from = cli.num("--from").unwrap_or(0);
-            let max = cli.num32("--max").unwrap_or(DEFAULT_PAGE);
-            let caps = cli.caps();
-            let (mut c, _) = connect_attached(&cli, &ep, &caps)?;
-            let (records, (next, head)) = c.fetch(from, &filter, max)?;
-            print_page(&records, next, head)
-        }
-        // A BATCH from a durable consumer group, then its commit — the shell face of
-        // `client::drain`. Two connections, because a group subscription's own
-        // connection is a one-way delivery stream.
-        Some("drain") => {
-            let ep = cli.at(1, "endpoint");
-            let group = cli.at(2, "group");
-            let filter = cli.at(3, "filter");
-            cli.no_more_than(4);
-            cli.only_net("drain", &["--max", "--idle", "--peek"]);
-            let max = cli.num("--max").unwrap_or(u64::from(DEFAULT_PAGE)) as usize;
-            let idle_ms = cli.num("--idle").unwrap_or(DEFAULT_IDLE_MS);
-            // Range-checked HERE, before anything is connected:
-            // `set_read_timeout(Some(Duration::ZERO))` is `InvalidInput` by std's
-            // contract, and would otherwise fail only after the group subscription is
-            // registered, as an exit 1 naming neither the flag nor the verb.
-            if idle_ms == 0 {
-                usage_error(
-                    "--idle expects a positive number of milliseconds: 0 is not a non-blocking take, it is a read timeout the OS refuses",
-                );
-            }
-            let idle = Duration::from_millis(idle_ms);
-            let peek = cli.has("--peek");
-            let caps = cli.caps();
-            let (c, closer) = connect_attached(&cli, &ep, &caps)?;
-            let mut committer = if peek {
-                None
-            } else {
-                let (mut c, _) = connect_attached(&cli, &ep, &caps)?;
-                // The committer idles through the whole take, and the broker reaps a
-                // connection that has sent no request within its first-frame timeout:
-                // one round trip now keeps it however long the take runs. (A guarded
-                // broker reaps one with no capability accepted by then; the attach
-                // above is what keeps it there.)
-                c.hello()?;
-                Some(c)
-            };
-            let mut sub = c.subscribe_group(&group, &filter)?;
-            // Bound the wait AFTER the attach round trip, so a short --idle can never
-            // time the capability handshake out.
-            closer.set_read_timeout(Some(idle))?;
-            let records = match committer.as_mut() {
-                // The commit lands BEFORE the print. HONEST BOUNDARY: a crash between
-                // them loses that batch (the group has moved past it); `--peek` plus an
-                // explicit `asb commit` is the at-least-once shape for a sink that
-                // cannot afford that.
-                Some(committer) => astream_broker::drain(&mut sub, committer, &group, max)?,
-                None => astream_broker::take(&mut sub, max)?,
-            };
-            let mut out = stdout_buffered();
-            print_records(&mut out, &records)?;
-            let upto = records
-                .last()
-                .map_or("-".to_string(), |(offset, _, _)| offset.to_string());
-            writeln!(
-                out,
-                "DRAIN n={} upto={upto} committed={}",
-                records.len(),
-                if committer.is_some() && !records.is_empty() {
-                    "yes"
-                } else {
-                    "no"
-                }
-            )?;
-            out.flush()
-        }
-        // THE READ-PROCESS-WRITE ACK: the answer record and the cursor advance in
-        // ONE durable append, deduped by the input offset.
-        Some("ack") => {
-            let ep = cli.at(1, "endpoint");
-            let group = cli.at(2, "group");
-            let offset = cli.pos_num(3, "offset");
-            let subject = cli.at(4, "subject");
-            let verdict = cli.at(5, "verdict");
-            cli.no_more_than(6);
-            cli.only_net("ack", &["--id"]);
-            if !["handled", "refused", "deferred"].contains(&verdict.as_str()) {
-                usage_error(&format!(
-                    "<verdict> is handled|refused|deferred, got {verdict:?}"
-                ));
-            }
-            let caps = cli.caps();
-            // `ack`'s dedup key is (producer_id, 2^63 | input offset). A per-invocation
-            // producer id would make every retry a fresh record — the exact property
-            // this verb exists to provide — so a stable id is required, not defaulted.
-            let id = producer_id(&cli, &caps, Some("ack"));
-            if offset >= ACK_SEQ_BASE {
-                usage_error(
-                    "<offset> must be below 2^63: `ack` publishes under producer sequence 2^63|<input offset>, and a larger offset has no sequence left to name",
-                );
-            }
-            // The body is DESIGN-aterm-fabric.md §4.2's `in/…` ack: the word rides
-            // `verdict=`, the one key an aterm asker decodes. (It rode `state=`, which no
-            // reader decoded, so a refusal arrived as an ack with no word.)
-            let body = format!("v=1 t={} re={offset} verdict={verdict}", now_millis());
-            let (mut c, _) = connect_attached(&cli, &ep, &caps)?;
-            // `<offset>` names a record the consumer acted on, so it must name a record
-            // that EXISTS. The read-process-write advances the group past it in the same
-            // durable append, and that cursor is monotone — an out-of-range ack skipped
-            // the whole inbox permanently at exit 0. The probe reads under the OUTPUT
-            // SUBJECT, which is authorized by the same grant this publish is (see
-            // `visible_head`). A subject that is not even a valid filter is one the
-            // broker will refuse as an output subject a moment later, so skip the probe
-            // and let that refusal — exit 1, naming the subject — stand as it always has.
-            if astream_wire::Filter::new(subject.as_str()).is_ok() {
-                let head = visible_head(&mut c, &subject)?;
-                refuse_past_head("offset", offset, head);
-            }
-            // The `producer_seq` is `ACK_SEQ_BASE | offset` — the SAME derivation, from
-            // the SAME constant, as `astream_broker::ack`, so a retry that crosses the
-            // two faces dedups (`broker.ack-key-is-one-wire-contract`). Do not derive
-            // this key a third way. The frame is built here rather than through the
-            // helper only because the operand checks above belong to the argv face.
-            let (at, dup) = c.process_and_produce(
-                id,
-                ACK_SEQ_BASE | offset,
-                &subject,
-                body.as_bytes(),
-                &group,
-                offset,
-            )?;
-            let (what, line) = if dup {
-                (
-                    "this ack was already on the log (the cursor is already past it)",
-                    format!("{at} dup"),
-                )
-            } else {
-                (
-                    "the ack record IS on the log and the group cursor HAS advanced",
-                    format!("{at} new"),
-                )
-            };
-            say_durable(&line, what)
-        }
-        Some("commit") => {
-            let ep = cli.at(1, "endpoint");
-            let group = cli.at(2, "group");
-            let upto = cli.pos_num(3, "upto");
-            cli.no_more_than(4);
-            cli.only_net("commit", &[]);
-            // The head probe reads under the GROUP NAME, so it is authorized by the
-            // same grant the commit is (see `visible_head`). A group name that is not
-            // even a valid FILTER cannot be probed — and cannot be committed under a
-            // guarded broker either, since `grants_commit` needs it to parse as a
-            // SUBJECT, and every valid subject is a valid filter. Refuse it here, where
-            // the operator can still read why, rather than skip the range check.
-            if let Err(e) = astream_wire::Filter::new(group.as_str()) {
-                usage_error(&format!(
-                    "<group> {group:?} is not a valid subject ({e}): a consumer group's name is a subject the broker authorizes commits against"
-                ));
-            }
-            let caps = cli.caps();
-            let (mut c, _) = connect_attached(&cli, &ep, &caps)?;
-            let head = visible_head(&mut c, &group)?;
-            refuse_past_head("upto", upto, head);
-            let offset = c.commit(&group, upto)?;
-            say_durable(
-                &format!("{offset} committed"),
-                "the group cursor HAS advanced (a commit is monotone: nothing lowers it)",
-            )
-        }
-        Some(other) => usage_error(&format!("unknown verb {other:?}")),
-        None => usage_error("missing verb"),
     }
 }
 
-fn main() {
-    if let Err(e) = run() {
-        warn(&format!("asb: {e}"));
-        exit(1);
+fn refuse_serve(log: &str, created_here: bool, what: &str, e: &io::Error, broker: Broker) -> u8 {
+    discard_created_log(log, created_here, broker);
+    if e.kind() == io::ErrorKind::AddrInUse {
+        fail_exit(
+            1,
+            &format!("{what} is already served by another broker ({e})"),
+        )
+    } else {
+        fail_exit(1, &format!("serve {what}: {e}"))
+    }
+}
+
+// The explicit, operator-invoked repair for a log `serve` refuses to open.
+// `BrokerLog::open` fails closed on a corrupt record because everything from
+// there on may be acked data; this is the one command that discards it, and it
+// says how much it discarded. A clean or merely torn log is left as it is.
+fn cmd_repair(cli: &Cli) -> Result<(), AsbErr> {
+    let log = cli.at(1, "log")?;
+    cli.no_more_than(2)?;
+    if cli.has("--tcp") {
+        return Err(AsbErr::Exit(usage_error(
+            "--tcp does not apply to repair (it operates on a local log file)",
+        )));
+    }
+    cli.only("repair", &[])?;
+    let (_log, dropped) = BrokerLog::open_repair(&log, Durability::Strict)?;
+    if dropped == 0 {
+        Ok(say(&format!("{log}: nothing to repair"))?)
+    } else {
+        Ok(say_durable(
+            &format!("{log}: repaired, dropped {dropped} byte(s) from the corrupt record on"),
+            "the log WAS truncated",
+        )?)
+    }
+}
+
+// Inspect a local log's operational counters (`REQUIREMENTS` R5).
+fn cmd_stats(cli: &Cli) -> Result<(), AsbErr> {
+    let log = cli.at(1, "log")?;
+    cli.no_more_than(2)?;
+    if cli.has("--tcp") {
+        return Err(AsbErr::Exit(usage_error(
+            "--tcp does not apply to stats (it operates on a local log file)",
+        )));
+    }
+    cli.only("stats", &[])?;
+    if !std::path::Path::new(&log).exists() {
+        return Err(AsbErr::Io(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{log}: no such log file"),
+        )));
+    }
+    // Strict, though nothing is appended: every open records the tier it serves
+    // in `<log>.id`, and a Relaxed record left by an inspection would make the
+    // first open after the next reboot move the log's generation for a run that
+    // acked nothing. (The open's own fsync makes everything durable first, so a
+    // Strict record here hides no loss.)
+    let opened = BrokerLog::open_with(&log, Durability::Strict)?;
+    let s = opened.stats();
+    Ok(say(&format!(
+        "base={} head={} records={} bytes={} subjects={} producers={} wills={} groups={} replica={}",
+        s.base.0,
+        s.head.0,
+        s.retained_records,
+        s.retained_bytes,
+        s.distinct_subjects,
+        s.bound_producers,
+        s.pending_wills,
+        s.group_commits,
+        if s.is_replica { "yes" } else { "no" }
+    ))?)
+}
+
+// Mint a capability line. Offline: it touches no broker, only the secret.
+fn cmd_mint(cli: &Cli) -> Result<(), AsbErr> {
+    let grant = cli.at(1, "grant")?;
+    cli.no_more_than(2)?;
+    cli.only(
+        "mint",
+        &["--secret-env", "--secret-file", "--legacy-unbound"],
+    )?;
+    // The mode AND the binding are the whole point of the grant string, so
+    // `mint` will not guess them. The read-write grant that names no principal
+    // IS a valid grant — the fleet-root god cap — which is exactly why minting
+    // one is opt-in: the careless command must not be the dangerous one. The
+    // gate reads the PARSED grant, because `/f/F/>` and `rw:/f/F/>` are one
+    // authority in two spellings and gating on the spelling gates on nothing.
+    let legacy = cli.has("--legacy-unbound");
+    match (unbound_god_cap_filter(&grant), legacy) {
+        (Some(filter), false) => {
+            return Err(AsbErr::Exit(usage_error(&format!(
+                "refusing to mint {grant:?}: it is the READ-WRITE, UNBOUND grant (it may publish under any producer id) — `{filter}` and `rw:{filter}` are the same authority in two spellings. Say the mode and the binding: \"ro:{filter}\" to read, \"rw,p=<principal>:{filter}\" to write as that principal — or --legacy-unbound if the god cap is really what you want"
+            ))));
+        }
+        (None, true) => {
+            return Err(AsbErr::Exit(usage_error(
+                "--legacy-unbound applies only to the READ-WRITE, UNBOUND grant (a bare filter, or `rw:` with no `,p=<principal>`); this grant is already read-only or bound to a principal",
+            )));
+        }
+        _ => {}
+    }
+    let Some(src) = cli.secret_source()? else {
+        return Err(AsbErr::Exit(usage_error(
+            "mint needs the broker's mint secret: --secret-env NAME or --secret-file PATH",
+        )));
+    };
+    let secret = load_secret(&src)?;
+    do_mint(&secret, &grant)
+}
+
+// Attenuate a parent capability line into a narrower child capability (`REQUIREMENTS` R6).
+// When `--secret-env`/`--secret-file` is omitted, attenuates offline as a bearer Macaroon
+// capability (`via=<hex-parent-grant>`); when provided, mints a fresh root capability.
+fn cmd_attenuate(cli: &Cli) -> Result<(), AsbErr> {
+    let child_grant = cli.at(1, "child-grant")?;
+    cli.no_more_than(2)?;
+    cli.only(
+        "attenuate",
+        &["--cap-file", "--secret-env", "--secret-file"],
+    )?;
+    let caps = cli.caps()?;
+    if caps.len() != 1 {
+        return Err(AsbErr::Exit(usage_error(&format!(
+            "attenuate requires exactly 1 parent capability via --cap-file (got {})",
+            caps.len()
+        ))));
+    }
+    let Some(parent) = caps.first() else {
+        return Err(AsbErr::Exit(2));
+    };
+    let secret = match cli.secret_source()? {
+        Some(src) => Some(load_secret(&src)?),
+        None => None,
+    };
+    do_attenuate(secret.as_deref(), parent, &child_grant)
+}
+
+fn cmd_serve(cli: &Cli) -> Result<(), AsbErr> {
+    let ep = cli.at(1, "endpoint")?;
+    let log = cli
+        .pos
+        .get(2)
+        .cloned()
+        .unwrap_or_else(|| format!("{ep}.log"));
+    cli.no_more_than(3)?;
+    cli.only(
+        "serve",
+        &[
+            "--tcp",
+            "--handshake",
+            "--key-env",
+            "--key-file",
+            "--secret-env",
+            "--secret-file",
+            "--revocation-file",
+            "--unix",
+            "--allow-remote",
+            "--durability",
+            "--horizon-ms",
+        ],
+    )?;
+    // Every refusal below is decided BEFORE a secret is read or the log is
+    // opened, so a usage error consumes no `--*-env` variable and leaves no
+    // file behind.
+    let tcp = cli.has("--tcp") || cli.key_source()?.is_some();
+    let beside = cli.kv.get("--unix").cloned();
+    if !tcp {
+        if beside.is_some() {
+            return Err(AsbErr::Exit(usage_error(
+                "--unix needs a TCP listener (--tcp, or a key): without one the endpoint IS the Unix socket",
+            )));
+        }
+        if cli.has("--allow-remote") {
+            return Err(AsbErr::Exit(usage_error(
+                "--allow-remote applies to a TCP listener; a Unix socket is never remote",
+            )));
+        }
+    }
+    let guard = cli.secret_source()?;
+    if guard.is_some() && !cfg!(feature = "cap") {
+        return Err(AsbErr::Exit(usage_error(
+            "serve --secret-env/--secret-file (a GUARDED broker) requires asb built with `--features cap`",
+        )));
+    }
+    let durability = serve_durability(cli)?;
+    if tcp {
+        match is_loopback_endpoint(&ep) {
+            Ok(true) => {}
+            Ok(false) if cli.has("--allow-remote") => {}
+            Ok(false) => {
+                return Err(AsbErr::Exit(usage_error(&format!(
+                    "{ep} is not a loopback address, and a broker bound there is reachable from the network: plain --tcp has no boundary at all, and a pre-shared key is one secret every host of the fleet holds — a transport boundary, not a per-host identity (only a --secret-file guard says which node may publish what). Pass --allow-remote to say that is what you mean"
+                ))));
+            }
+            Err(e) => {
+                return Err(AsbErr::Exit(usage_error(&format!(
+                    "{ep}: {e} (a <host>:<port> to bind)"
+                ))));
+            }
+        }
+    }
+    if let Some(path) = cli.kv.get("--key-file") {
+        check_private("--key-file", path)?;
+    }
+    let secret = match &guard {
+        Some(src) => Some(load_secret(src)?),
+        None => None,
+    };
+    let guarded = secret.is_some();
+    let transport = cli.transport()?;
+    if matches!(transport, Transport::Unix) {
+        refuse_live_socket(&ep)?;
+    }
+    if let Some(sock) = &beside {
+        refuse_live_socket(sock)?;
+    }
+    let created_here = !std::path::Path::new(&log).exists();
+    let broker = open_log(&log, secret, durability)?;
+    if let Some(rev_path) = cli.kv.get("--revocation-file") {
+        if let Err(e) = broker.load_revocation_file(rev_path) {
+            discard_created_log(&log, created_here, broker);
+            return Err(AsbErr::Exit(fail_exit(
+                2,
+                &format!("--revocation-file {rev_path}: {e}"),
+            )));
+        }
+    }
+    let served = match transport {
+        Transport::Sealed(key) => serve_sealed(&broker, &ep, key.as_ref())?,
+        Transport::Handshake(key) => serve_handshake(&broker, &ep, key.as_ref())?,
+        Transport::Tcp => broker.serve_tcp(&ep),
+        Transport::Unix => broker.serve(&ep),
+    };
+    let handle = match served {
+        Ok(h) => h,
+        Err(e) => {
+            return Err(AsbErr::Exit(refuse_serve(
+                &log,
+                created_here,
+                &ep,
+                &e,
+                broker,
+            )))
+        }
+    };
+    // THE SOCKET BESIDE THE PORT: one broker, one log, one guard — two
+    // acceptors.
+    let beside_handle = match beside.as_deref().map(|sock| (sock, broker.serve(sock))) {
+        None => None,
+        Some((_, Ok(h))) => Some(h),
+        Some((sock, Err(e))) => {
+            drop(handle);
+            return Err(AsbErr::Exit(refuse_serve(
+                &log,
+                created_here,
+                sock,
+                &e,
+                broker,
+            )));
+        }
+    };
+    let bound = handle.tcp_addr().map_or(ep, str::to_string);
+    // The readiness line — callers sync on this, not a sleep — so a caller
+    // that cannot read it will hang waiting for it. `say` flushes and reports
+    // the write error instead of parking forever behind a dead reader. With
+    // --unix a second line follows once that socket is bound too.
+    say(&format!("listening {bound}"))?;
+    if let Some(sock) = &beside {
+        say(&format!("listening {sock}"))?;
+    }
+    warn(&format!(
+        "asb: serving {bound}{} — {}",
+        beside
+            .as_deref()
+            .map_or_else(String::new, |sock| format!(" and {sock}")),
+        if guarded {
+            "GUARDED: an attach must carry a capability minted under the secret"
+        } else {
+            "unguarded: no capability is checked on attach"
+        }
+    ));
+    // The tier IN FORCE, as the broker decided it (and as `Hello` tells every client):
+    // never inferred from the flag, which an Ordered request served Strict would
+    // misreport.
+    let served = broker.served_durability();
+    warn(&format!(
+        "asb: durability {} — {}",
+        tier_word(served.requested),
+        if served.served == served.requested {
+            format!("served as asked{}", horizon_note(&served))
+        } else {
+            format!(
+                "served {}: {:?}, never weaker than asked",
+                tier_word(served.served),
+                served.reason
+            )
+        }
+    ));
+    // Dropping a handle shuts its acceptor down and unlinks its socket.
+    let _keep = (handle, beside_handle);
+    loop {
+        std::thread::park();
+    }
+}
+
+fn cmd_pub(cli: &Cli) -> Result<(), AsbErr> {
+    let ep = cli.at(1, "endpoint")?;
+    let subject = cli.at(2, "subject")?;
+    cli.no_more_than(3)?;
+    cli.only_net("pub", &["--id", "--seq", "--seq-file"])?;
+    let seq_file = cli.kv.get("--seq-file").cloned();
+    if seq_file.is_some() && cli.kv.contains_key("--seq") {
+        return Err(AsbErr::Exit(usage_error(
+            "--seq and --seq-file both set the producer sequence; pass one",
+        )));
+    }
+    let caps = cli.caps()?;
+    // Parse --seq HERE, not after the connect: a malformed value is a usage
+    // error (exit 2) even when the endpoint is not listening.
+    let explicit_seq = cli.num("--seq")?;
+    // Default to a UNIQUE (id, seq) per invocation, not fixed constants:
+    // the broker dedups by (producer_id, producer_seq), so two independent
+    // publishers both defaulting to (1, 0) would collide and the second
+    // publish would be silently dropped as a dup. A deliberate idempotent
+    // retry passes an explicit sequence, and a sequence is only a dedup key
+    // under an id that survives the process: a per-invocation id would make
+    // a retried `--seq` a fresh record, so either sequence flag demands one.
+    let stable_for = if seq_file.is_some() {
+        Some("--seq-file")
+    } else if explicit_seq.is_some() {
+        Some("--seq")
+    } else {
+        None
+    };
+    let id = producer_id(cli, &caps, stable_for)?;
+    // The top half of the sequence space belongs to `ack` (see ACK_SEQ_BASE),
+    // so a publish may not reach into it and collide with one.
+    if explicit_seq.is_some_and(|seq| seq >= ACK_SEQ_BASE) {
+        return Err(AsbErr::Exit(usage_error(
+            "--seq must be below 2^63: sequences at or above it are reserved for `asb ack`, which publishes under 2^63|<input offset> so that an ack and an ordinary publish under the same producer id can never share a dedup key",
+        )));
+    }
+    let mut body = Vec::new();
+    io::stdin().read_to_end(&mut body)?;
+    // A body over the record cap can never be stored, so retrying cannot
+    // help: refuse it as bad input before connecting or burning a sequence.
+    if body.len() > MAX_RECORD_PAYLOAD {
+        return Err(AsbErr::Exit(usage_error(&format!(
+            "the body is {} bytes; a record holds at most {MAX_RECORD_PAYLOAD}",
+            body.len()
+        ))));
+    }
+    let (c, _) = connect_attached(cli, &ep, &caps)?;
+    // The write-ahead lands here: after the connection is up (so an endpoint
+    // that is not there costs no sequence number) and before the Publish.
+    let seq = match &seq_file {
+        Some(path) => advance_seq_file(path)?,
+        None => explicit_seq.unwrap_or_else(now_nanos),
+    };
+    Ok(do_pub(c, id, seq, &subject, &body)?)
+}
+
+fn cmd_sub(cli: &Cli) -> Result<(), AsbErr> {
+    let ep = cli.at(1, "endpoint")?;
+    let filter = cli.at(2, "filter")?;
+    cli.no_more_than(3)?;
+    cli.only_net("sub", &["--from", "--group"])?;
+    let from = cli.num("--from")?;
+    let group = cli.kv.get("--group").cloned();
+    if group.is_some() && from.is_some() {
+        return Err(AsbErr::Exit(usage_error(
+            "--group resumes from the group's committed offset; it cannot be combined with --from",
+        )));
+    }
+    let caps = cli.caps()?;
+    let (c, _) = connect_attached(cli, &ep, &caps)?;
+    let sub = match group {
+        Some(g) => c.subscribe_group(&g, &filter)?,
+        None => c.subscribe(from.unwrap_or(0), &filter)?,
+    };
+    Ok(do_sub(sub)?)
+}
+
+// RETAINED STATE: the last record of every subject the filter matches.
+fn cmd_last(cli: &Cli) -> Result<(), AsbErr> {
+    let ep = cli.at(1, "endpoint")?;
+    let filter = cli.at(2, "filter")?;
+    cli.no_more_than(3)?;
+    cli.only_net("last", &["--after", "--max"])?;
+    let after = cli.kv.get("--after").cloned().unwrap_or_default();
+    let max = cli.num32("--max")?.unwrap_or(DEFAULT_PAGE);
+    let caps = cli.caps()?;
+    let (mut c, _) = connect_attached(cli, &ep, &caps)?;
+    // `last_all`, NOT `Client::last`: the latter drops the resume cursor, and a
+    // page the broker's own row/scan bounds cut short would be printed as if it
+    // were the whole answer. What that does NOT buy is one snapshot — see
+    // `last_all`: the MARK is the FIRST request's, and a subject superseded past
+    // a request's pinned head is omitted from its page.
+    let (records, next, head) = last_all(&mut c, &filter, &after, max)?;
+    Ok(print_page(&records, next, head)?)
+}
+
+// A BOUNDED READ that does not tail: page through history with --from.
+fn cmd_fetch(cli: &Cli) -> Result<(), AsbErr> {
+    let ep = cli.at(1, "endpoint")?;
+    let filter = cli.at(2, "filter")?;
+    cli.no_more_than(3)?;
+    cli.only_net("fetch", &["--from", "--max"])?;
+    let from = cli.num("--from")?.unwrap_or(0);
+    let max = cli.num32("--max")?.unwrap_or(DEFAULT_PAGE);
+    let caps = cli.caps()?;
+    let (mut c, _) = connect_attached(cli, &ep, &caps)?;
+    let (records, (next, head)) = c.fetch(from, &filter, max)?;
+    Ok(print_page(&records, next, head)?)
+}
+
+// A BATCH from a durable consumer group, then its commit — the shell face of
+// `client::drain`. Two connections, because a group subscription's own
+// connection is a one-way delivery stream.
+fn cmd_drain(cli: &Cli) -> Result<(), AsbErr> {
+    let ep = cli.at(1, "endpoint")?;
+    let group = cli.at(2, "group")?;
+    let filter = cli.at(3, "filter")?;
+    cli.no_more_than(4)?;
+    cli.only_net("drain", &["--max", "--idle", "--peek"])?;
+    let max = cli.num("--max")?.unwrap_or(u64::from(DEFAULT_PAGE)) as usize;
+    let idle_ms = cli.num("--idle")?.unwrap_or(DEFAULT_IDLE_MS);
+    // Range-checked HERE, before anything is connected:
+    // `set_read_timeout(Some(Duration::ZERO))` is `InvalidInput` by std's
+    // contract, and would otherwise fail only after the group subscription is
+    // registered, as an exit 1 naming neither the flag nor the verb.
+    if idle_ms == 0 {
+        return Err(AsbErr::Exit(usage_error(
+            "--idle expects a positive number of milliseconds: 0 is not a non-blocking take, it is a read timeout the OS refuses",
+        )));
+    }
+    let idle = Duration::from_millis(idle_ms);
+    let peek = cli.has("--peek");
+    let caps = cli.caps()?;
+    let (c, closer) = connect_attached(cli, &ep, &caps)?;
+    let mut committer = if peek {
+        None
+    } else {
+        let (mut c, _) = connect_attached(cli, &ep, &caps)?;
+        // The committer idles through the whole take, and the broker reaps a
+        // connection that has sent no request within its first-frame timeout:
+        // one round trip now keeps it however long the take runs. (A guarded
+        // broker reaps one with no capability accepted by then; the attach
+        // above is what keeps it there.)
+        c.hello()?;
+        Some(c)
+    };
+    let mut sub = c.subscribe_group(&group, &filter)?;
+    // Bound the wait AFTER the attach round trip, so a short --idle can never
+    // time the capability handshake out.
+    closer.set_read_timeout(Some(idle))?;
+    let records = match committer.as_mut() {
+        // The commit lands BEFORE the print. HONEST BOUNDARY: a crash between
+        // them loses that batch (the group has moved past it); `--peek` plus an
+        // explicit `asb commit` is the at-least-once shape for a sink that
+        // cannot afford that.
+        Some(committer) => astream_broker::drain(&mut sub, committer, &group, max)?,
+        None => astream_broker::take(&mut sub, max)?,
+    };
+    let mut out = stdout_buffered();
+    print_records(&mut out, &records)?;
+    let upto = records
+        .last()
+        .map_or("-".to_string(), |(offset, _, _)| offset.to_string());
+    writeln!(
+        out,
+        "DRAIN n={} upto={upto} committed={}",
+        records.len(),
+        if committer.is_some() && !records.is_empty() {
+            "yes"
+        } else {
+            "no"
+        }
+    )?;
+    Ok(out.flush()?)
+}
+
+// THE READ-PROCESS-WRITE ACK: the answer record and the cursor advance in
+// ONE durable append, deduped by the input offset.
+fn cmd_ack(cli: &Cli) -> Result<(), AsbErr> {
+    let ep = cli.at(1, "endpoint")?;
+    let group = cli.at(2, "group")?;
+    let offset = cli.pos_num(3, "offset")?;
+    let subject = cli.at(4, "subject")?;
+    let verdict = cli.at(5, "verdict")?;
+    cli.no_more_than(6)?;
+    cli.only_net("ack", &["--id"])?;
+    if !["handled", "refused", "deferred"].contains(&verdict.as_str()) {
+        return Err(AsbErr::Exit(usage_error(&format!(
+            "<verdict> is handled|refused|deferred, got {verdict:?}"
+        ))));
+    }
+    let caps = cli.caps()?;
+    // `ack`'s dedup key is (producer_id, 2^63 | input offset). A per-invocation
+    // producer id would make every retry a fresh record — the exact property
+    // this verb exists to provide — so a stable id is required, not defaulted.
+    let id = producer_id(cli, &caps, Some("ack"))?;
+    if offset >= ACK_SEQ_BASE {
+        return Err(AsbErr::Exit(usage_error(
+            "<offset> must be below 2^63: `ack` publishes under producer sequence 2^63|<input offset>, and a larger offset has no sequence left to name",
+        )));
+    }
+    // The body is DESIGN-aterm-fabric.md §4.2's `in/…` ack: the word rides
+    // `verdict=`, the one key an aterm asker decodes. (It rode `state=`, which no
+    // reader decoded, so a refusal arrived as an ack with no word.)
+    let body = format!("v=1 t={} re={offset} verdict={verdict}", now_millis());
+    let (mut c, _) = connect_attached(cli, &ep, &caps)?;
+    // `<offset>` names a record the consumer acted on, so it must name a record
+    // that EXISTS. The read-process-write advances the group past it in the same
+    // durable append, and that cursor is monotone — an out-of-range ack skipped
+    // the whole inbox permanently at exit 0. The probe reads under the OUTPUT
+    // SUBJECT, which is authorized by the same grant this publish is (see
+    // `visible_head`). A subject that is not even a valid filter is one the
+    // broker will refuse as an output subject a moment later, so skip the probe
+    // and let that refusal — exit 1, naming the subject — stand as it always has.
+    if astream_wire::Filter::new(subject.as_str()).is_ok() {
+        let head = visible_head(&mut c, &subject)?;
+        refuse_past_head("offset", offset, head)?;
+    }
+    // The `producer_seq` is `ACK_SEQ_BASE | offset` — the SAME derivation, from
+    // the SAME constant, as `astream_broker::ack`, so a retry that crosses the
+    // two faces dedups (`broker.ack-key-is-one-wire-contract`). Do not derive
+    // this key a third way. The frame is built here rather than through the
+    // helper only because the operand checks above belong to the argv face.
+    let (at, dup) = c.process_and_produce(
+        id,
+        ACK_SEQ_BASE | offset,
+        &subject,
+        body.as_bytes(),
+        &group,
+        offset,
+    )?;
+    let (what, line) = if dup {
+        (
+            "this ack was already on the log (the cursor is already past it)",
+            format!("{at} dup"),
+        )
+    } else {
+        (
+            "the ack record IS on the log and the group cursor HAS advanced",
+            format!("{at} new"),
+        )
+    };
+    Ok(say_durable(&line, what)?)
+}
+
+fn cmd_commit(cli: &Cli) -> Result<(), AsbErr> {
+    let ep = cli.at(1, "endpoint")?;
+    let group = cli.at(2, "group")?;
+    let upto = cli.pos_num(3, "upto")?;
+    cli.no_more_than(4)?;
+    cli.only_net("commit", &[])?;
+    // The head probe reads under the GROUP NAME, so it is authorized by the
+    // same grant the commit is (see `visible_head`). A group name that is not
+    // even a valid FILTER cannot be probed — and cannot be committed under a
+    // guarded broker either, since `grants_commit` needs it to parse as a
+    // SUBJECT, and every valid subject is a valid filter. Refuse it here, where
+    // the operator can still read why, rather than skip the range check.
+    if let Err(e) = astream_wire::Filter::new(group.as_str()) {
+        return Err(AsbErr::Exit(usage_error(&format!(
+            "<group> {group:?} is not a valid subject ({e}): a consumer group's name is a subject the broker authorizes commits against"
+        ))));
+    }
+    let caps = cli.caps()?;
+    let (mut c, _) = connect_attached(cli, &ep, &caps)?;
+    let head = visible_head(&mut c, &group)?;
+    refuse_past_head("upto", upto, head)?;
+    let offset = c.commit(&group, upto)?;
+    Ok(say_durable(
+        &format!("{offset} committed"),
+        "the group cursor HAS advanced (a commit is monotone: nothing lowers it)",
+    )?)
+}
+
+fn run() -> Result<(), AsbErr> {
+    let cli = parse()?;
+    match cli.pos.first().map(String::as_str) {
+        Some("repair") => cmd_repair(&cli),
+        Some("stats") => cmd_stats(&cli),
+        Some("mint") => cmd_mint(&cli),
+        Some("attenuate") => cmd_attenuate(&cli),
+        Some("serve") => cmd_serve(&cli),
+        Some("pub") => cmd_pub(&cli),
+        Some("sub") => cmd_sub(&cli),
+        Some("last") => cmd_last(&cli),
+        Some("fetch") => cmd_fetch(&cli),
+        Some("drain") => cmd_drain(&cli),
+        Some("ack") => cmd_ack(&cli),
+        Some("commit") => cmd_commit(&cli),
+        Some(other) => Err(AsbErr::Exit(usage_error(&format!(
+            "unknown verb {other:?}"
+        )))),
+        None => Err(AsbErr::Exit(usage_error("missing verb"))),
+    }
+}
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::from(0),
+        Err(AsbErr::Exit(code)) => ExitCode::from(code),
+        Err(AsbErr::Io(e)) => {
+            warn(&format!("asb: {e}"));
+            ExitCode::from(1)
+        }
     }
 }
 

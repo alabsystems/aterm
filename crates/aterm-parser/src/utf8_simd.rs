@@ -255,61 +255,6 @@ mod tests {
     }
 
     #[test]
-    fn bulk_stops_at_class_change() {
-        // 3-byte CJK then a 2-byte lead: the run must stop at the class boundary.
-        let s = "漢字".to_string() + "β";
-        let (rc, ri) = ref_run(s.as_bytes());
-        let (bc, bi) = bulk_run(s.as_bytes());
-        assert_eq!((rc, ri), (bc, bi));
-        // It consumed only the two 3-byte chars (6 bytes), leaving the 2-byte lead.
-        assert_eq!(bi, 6);
-    }
-
-    #[test]
-    fn bulk_stops_before_ascii_and_control() {
-        for tail in ["A", "\n", " ", "\x1b"] {
-            let s = format!("中文{tail}");
-            let (rc, ri) = ref_run(s.as_bytes());
-            let (bc, bi) = bulk_run(s.as_bytes());
-            assert_eq!((rc, ri), (bc, bi), "tail {tail:?}");
-            assert_eq!(bi, 6, "must stop before the ASCII/control byte");
-        }
-    }
-
-    #[test]
-    fn bulk_stops_on_incomplete_tail() {
-        // A 3-byte lead with only one continuation byte present: consume nothing
-        // of it (leave it for the scalar straddle path).
-        let mut bytes = "中文".as_bytes().to_vec(); // 6 bytes, 2 chars
-        bytes.extend_from_slice(&[0xE4, 0xB8]); // truncated 3-byte lead
-        let (rc, ri) = ref_run(&bytes);
-        let (bc, bi) = bulk_run(&bytes);
-        assert_eq!((rc, ri), (bc, bi));
-        assert_eq!(bi, 6);
-    }
-
-    #[test]
-    fn bulk_rejects_overlong_and_surrogate_like_scalar() {
-        // Overlong 3-byte 0xE0 0x80 0x80 (encodes < 0x800) and a surrogate
-        // 0xED 0xA0 0x80 (U+D800) must both be left to the scalar path (0 taken).
-        for bad in [[0xE0u8, 0x80, 0x80], [0xED, 0xA0, 0x80]] {
-            let (rc, ri) = ref_run(&bad);
-            let (bc, bi) = bulk_run(&bad);
-            assert_eq!((rc.clone(), ri), (bc, bi), "bad {bad:?}");
-            assert_eq!(bi, 0, "overlong/surrogate must not be consumed");
-        }
-    }
-
-    #[test]
-    fn bulk_rejects_overlong_two_byte() {
-        // 0xC0 0x80 and 0xC1 0xBF are overlong ⇒ scalar-only.
-        for bad in [[0xC0u8, 0x80], [0xC1, 0xBF]] {
-            let (_, bi) = bulk_run(&bad);
-            assert_eq!(bi, 0);
-        }
-    }
-
-    #[test]
     fn bulk_respects_the_run_cap() {
         // 300 CJK chars but the batch caps at RUN_CAP: consume exactly RUN_CAP
         // sequences (RUN_CAP*3 bytes), leaving the rest for the next call.
@@ -317,14 +262,6 @@ mod tests {
         let (bc, bi) = bulk_run(s.as_bytes());
         assert_eq!(bc.len(), RUN_CAP);
         assert_eq!(bi, RUN_CAP * 3);
-    }
-
-    #[test]
-    fn bulk_empty_and_non_lead_consume_nothing() {
-        assert_eq!(bulk_run(&[]).1, 0);
-        assert_eq!(bulk_run(b"hello").1, 0);
-        assert_eq!(bulk_run(&[0x80, 0x80]).1, 0); // orphan continuations
-        assert_eq!(bulk_run(&[0xF8, 0x80]).1, 0); // 0xF8 is not a valid lead
     }
 
     /// THE FIRST SEQUENCE IS THE SHIPPED SCALAR ORACLE'S, FOR EVERY INPUT

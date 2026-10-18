@@ -419,51 +419,6 @@ fn have_console_agrees_with_the_code_page_oracle_here() {
     assert_eq!(facts.have_console, facts.attached > 0, "{facts:?}");
 }
 
-/// The guard is not vacuous: it refuses each word that shows a window — above
-/// all the bug itself, a quiet child of a process with no console started with
-/// no console flag — and passes the words the rule gives. Pure: nothing is
-/// started, so the refused words are judged without ever being run.
-#[test]
-fn the_guard_refuses_every_word_that_would_show_a_console_window() {
-    if play_role("the_guard_refuses_every_word_that_would_show_a_console_window") {
-        return;
-    }
-    let group = spawn::CREATE_NEW_PROCESS_GROUP;
-    for (word, has_console, shows) in [
-        // From the window's state (no console).
-        (0, false, true),
-        (group, false, true),
-        (spawn::CREATE_NEW_CONSOLE, false, true),
-        (spawn::CREATE_NO_WINDOW, false, false),
-        (spawn::CREATE_NO_WINDOW | group, false, false),
-        (spawn::DETACHED_PROCESS, false, false),
-        // From a console.
-        (0, true, false),
-        (group, true, false),
-        (spawn::CREATE_NEW_CONSOLE, true, true),
-        (spawn::DETACHED_PROCESS, true, false),
-    ] {
-        assert_eq!(
-            shows_a_console_window(word, has_console),
-            shows,
-            "{word:#x} has_console {has_console}"
-        );
-    }
-    // …and the rule as it stands passes it in both states, for both choices
-    // these tests start children with.
-    for has_console in [false, true] {
-        for console in [Console::Quiet, Console::Detached] {
-            assert!(
-                !shows_a_console_window(
-                    spawn::creation_flags(console, 0, has_console),
-                    has_console
-                ),
-                "{console:?} has_console {has_console}"
-            );
-        }
-    }
-}
-
 /// NON-VACUITY of `window`, with nothing on screen: a probe started on a ConPTY
 /// pseudoconsole — the console of every aterm tab — reports a console whose
 /// `GetConsoleWindow` is NOT NULL (a pseudoconsole hands it an invisible

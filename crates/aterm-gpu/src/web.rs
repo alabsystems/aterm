@@ -3,20 +3,31 @@
 
 //! The browser entry: a `<canvas>` (or a worker's `OffscreenCanvas`) becomes a
 //! [`GpuContext`] plus a pending [`CanvasSurface`], with no backend type in
-//! the signature. aterm-gpu-web names only these, so the backend under them
-//! (wgpu's WebGL2 today, the first-party WebGL2 arm at
-//! docs/AUDIT-third-party-2026-10-15.md GW.4) changes without touching it.
+//! the signature. aterm-gpu-web names only these.
 //!
-//! WebGL can enumerate an adapter only against the canvas (the GL context
-//! lives on it), so the surface is created first, the context second, and the
-//! surface configured last, once the renderer knows the frame size
+//! The backend is the first-party GL arm over WebGL2 (`crate::gl`,
+//! docs/AUDIT-third-party-2026-10-15.md, wasm-platform WP.8): the canvas
+//! arrives as a JS object in the glue's table (aterm-wasm-abi's `js`), the
+//! arm makes a WebGL2 context on it through the module's `aterm_gl` imports,
+//! and every GL call goes through those imports. The context lives on the
+//! canvas, so the device is made first and the surface configured on it
+//! once the renderer knows the frame size
 //! ([`crate::GpuRenderer::configure_canvas_surface`]).
+//!
+//! Synchronous: nothing in WebGL2 bring-up waits.
 
 use crate::GpuContext;
+use crate::gl::device::GlDevice;
 
-/// The two canvas element types the browser entry accepts, re-exported so a
-/// caller names no backend crate for them.
-pub use wgpu::web_sys::{HtmlCanvasElement, OffscreenCanvas};
+aterm_wasm_abi::js_type! {
+    /// A `<canvas>` element in the document.
+    pub struct HtmlCanvasElement = "HTMLCanvasElement";
+}
+
+aterm_wasm_abi::js_type! {
+    /// An `OffscreenCanvas`, transferred to a worker.
+    pub struct OffscreenCanvas = "OffscreenCanvas";
+}
 
 /// Where the WebGL2 context lives: a document canvas, or a canvas transferred
 /// to a worker so rendering and present run off the main thread.
@@ -28,56 +39,34 @@ pub enum CanvasTarget {
     Offscreen(OffscreenCanvas),
 }
 
-/// A canvas surface created against its context but not yet configured. The
-/// one thing to do with it is [`crate::GpuRenderer::configure_canvas_surface`].
-pub struct CanvasSurface(pub(crate) wgpu::Surface<'static>);
-
-impl std::fmt::Debug for CanvasSurface {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("CanvasSurface")
-    }
-}
-
-/// An empty `RawDisplayHandle::Web` provider. wgpu requires the instance to
-/// carry a display handle before `create_surface()`; the WebGL backend reads
-/// the canvas from the window handle and ignores this one.
+/// A canvas surface made with its context but not yet configured. The one
+/// thing to do with it is [`crate::GpuRenderer::configure_canvas_surface`].
 #[derive(Debug)]
-struct WebDisplay;
-
-impl wgpu::rwh::HasDisplayHandle for WebDisplay {
-    fn display_handle(&self) -> Result<wgpu::rwh::DisplayHandle<'_>, wgpu::rwh::HandleError> {
-        let raw = wgpu::rwh::RawDisplayHandle::Web(wgpu::rwh::WebDisplayHandle::new());
-        // SAFETY: the Web display handle is an empty marker (no borrowed data),
-        // so a 'static borrow is sound — there is nothing for it to outlive.
-        Ok(unsafe { wgpu::rwh::DisplayHandle::borrow_raw(raw) })
-    }
-}
+pub struct CanvasSurface(pub(crate) GlDevice);
 
 impl GpuContext {
-    /// Acquire the GPU for `target`: a GL-backend instance (the only backend in
-    /// the wasm build), the canvas surface, then adapter and device with that
-    /// surface as the compatibility target. Errors name the step that failed.
-    pub async fn for_canvas(target: CanvasTarget) -> Result<(Self, CanvasSurface), String> {
-        // `create_surface()` requires the instance to carry some display
-        // handle; WebGL ignores it, so an empty `RawDisplayHandle::Web` marker
-        // satisfies the check.
-        let instance = wgpu::Instance::new(
-            wgpu::InstanceDescriptor {
-                backends: wgpu::Backends::GL,
-                ..wgpu::InstanceDescriptor::new_without_display_handle()
-            }
-            .with_display_handle(Box::new(WebDisplay)),
-        );
-        let target = match target {
-            CanvasTarget::Canvas(c) => wgpu::SurfaceTarget::Canvas(c),
-            CanvasTarget::Offscreen(c) => wgpu::SurfaceTarget::OffscreenCanvas(c),
+    /// Acquire the GPU for `target`: a WebGL2 context on the canvas (the
+    /// device), and the canvas as the pending surface. `Err` when the canvas
+    /// gives no WebGL2 context (unsupported, or another context already on
+    /// it), in the words of the step that failed.
+    pub fn for_canvas(target: CanvasTarget) -> Result<(Self, CanvasSurface), String> {
+        let canvas = match target {
+            CanvasTarget::Canvas(c) => c.0,
+            CanvasTarget::Offscreen(c) => c.0,
         };
-        let surface = instance
-            .create_surface(target)
+        let dev = GlDevice::on_canvas(canvas)
             .map_err(|e| format!("create canvas surface failed: {e}"))?;
-        let ctx = Self::from_instance_with_surface(instance, Some(&surface))
-            .await
-            .map_err(|e| format!("WebGL adapter/device init failed: {e}"))?;
-        Ok((ctx, CanvasSurface(surface)))
+        let caps = dev.caps().clone();
+        let ctx = Self {
+            adapter_name: caps.renderer,
+            backend: "Gl".to_owned(),
+            srgb_offscreen: caps.srgb_views,
+            device_lost: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            device_loss_msg: std::sync::Arc::default(),
+            visual_swapchain: false,
+            gl_max_texture_dim: caps.max_texture_dim,
+            gl_canvas: dev.clone(),
+        };
+        Ok((ctx, CanvasSurface(dev)))
     }
 }

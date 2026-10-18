@@ -263,3 +263,32 @@ fn a_grapheme_folded_across_a_cluster_boundary_lives_in_the_cell_it_joined() {
         "a scrollback copy of the cell copies what the cell holds"
     );
 }
+
+/// A paste is priced at the cells its echo will advance the cursor, so the host
+/// can tell its own insert from program output: the grid's count, for every
+/// sample under both ambiguous-width policies.
+#[test]
+fn the_paste_price_is_the_column_the_grid_paints() {
+    let mut wrong = Vec::new();
+    for (label, sample) in SAMPLES {
+        let painted = painted_column(sample, "|").expect("the marker is painted somewhere");
+        let priced = Terminal::paste_insert_cells(sample, false);
+        if priced != Some(painted) {
+            wrong.push(format!("{label}: grid {painted} vs price {priced:?}"));
+        }
+    }
+    for (label, sample) in AMBIGUOUS_SAMPLES.iter().chain(SAMPLES) {
+        let painted = painted_column_wide(sample, "|").expect("the marker is painted somewhere");
+        let priced = Terminal::paste_insert_cells(sample, true);
+        if priced != Some(painted) {
+            wrong.push(format!(
+                "{label} (wide): grid {painted} vs price {priced:?}"
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "`paste_insert_cells` disagrees with the grid:\n  {}",
+        wrong.join("\n  ")
+    );
+}

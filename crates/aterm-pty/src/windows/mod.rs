@@ -33,10 +33,13 @@
 //! the chars a physical chord carries under Windows Terminal — because legacy
 //! VT has no byte for those chords and conhost read the legacy Shift+Enter LF
 //! as Ctrl+Enter (measured 2026-09-22). The record outranks a kitty push the
-//! application made through conhost, which drops a CSI u written back. Every
-//! other key still flows as plain xterm VT input; conhost accepts the mixed
-//! stream. (3) conhost issues
-//! DSR/CPR queries; the existing reader-thread `take_response()` reply path
+//! application made through conhost, which drops a CSI u written back. The
+//! keys whose legacy bytes conhost holds once its parser has switched (a lone or
+//! dangling ESC: Escape, Ctrl+[, Alt+[, Alt+O, Alt+Backspace ...) and Ctrl+H
+//! (whose bare BS conhost reads as Ctrl+Backspace, measured 2026-10-16) go out as
+//! records too; `KeyboardMode::WIN32_INPUT` lists them. Every other key still
+//! flows as plain xterm VT input; conhost accepts the mixed stream. (3) conhost
+//! issues DSR/CPR queries; the existing reader-thread `take_response()` reply path
 //! answers them with zero changes. (4) A resize makes the MSYS2 runtime (Git
 //! Bash) drop the next input record — a bracketed paste then loses its ESC
 //! and bash runs `[200~…` — so the first writes after a size change lead with
@@ -47,10 +50,18 @@
 
 mod cmdline;
 mod ffi;
+mod openconsole;
 mod resize_guard;
 mod shell;
 mod winpath;
 
+// The console host a pseudoconsole runs in (conhost or OpenConsole): the
+// window states aterm.toml's `conpty` choice, `aterm doctor` and
+// `show-config` report the host a new tab gets, and the frontend keys the
+// workarounds that differ between the two hosts on a session's kind.
+pub use openconsole::{
+    console_host_report, probe_console_host, set_console_host, take_console_host_fallback,
+};
 // Published so config validation can ask the REAL resolver how a `shell` value
 // would resolve, rather than modelling it (see `ShellResolution`), and so
 // `aterm doctor` / `show-config` can name the shell a new tab spawns and the
@@ -65,7 +76,8 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use aterm_types::MutexExt;
 
-use crate::SpawnedShell;
+use crate::console_host::policy::OpenConsoleExe;
+use crate::{ConsoleHostKind, SpawnedShell};
 use cmdline::{build_command_line, build_env_block, wide_nul};
 use resize_guard::ResizeGuard;
 
@@ -82,9 +94,13 @@ struct WinSession {
     /// is no HPCON for us to hold, resize or close. The same mutex then guards
     /// [`signal`](Self::signal) instead — see [`resize`] and
     /// [`close_pseudoconsole`], which both branch on which of the two is live.
+    /// **0 for an OpenConsole session** too: there is no kernel32 HPCON, the
+    /// three handles winconpty keeps are [`signal`](Self::signal),
+    /// [`reference`](Self::reference) and [`conhost`](Self::conhost), and it
+    /// resizes and closes through the signal pipe exactly like the adopted lane.
     hpc: Mutex<isize>,
-    /// The ConPTY SIGNAL PIPE's write end, for ADOPTED sessions only (0 for a
-    /// session we spawned ourselves, which resizes through its HPCON).
+    /// The ConPTY SIGNAL PIPE's write end, for ADOPTED and OpenConsole sessions
+    /// (0 for an inbox session we spawned, which resizes through its HPCON).
     ///
     /// This is the same handle `ResizePseudoConsole`/`ClosePseudoConsole` use
     /// internally: verified by disassembling `kernelbase!ResizePseudoConsole`
@@ -103,11 +119,20 @@ struct WinSession {
     /// The `hpc` guard does NOT cover it: `close_pseudoconsole` takes the hpc
     /// lock in a `let` initializer, so that guard is dropped at the semicolon
     /// before this lock is acquired at all. What rules out a lock-order
-    /// inversion is instead that the order is consistently hpc → signal
-    /// everywhere it matters ([`resize`] holds `hpc` while taking `signal`;
-    /// [`close_pseudoconsole`] releases `hpc` first; `Drop` takes only this
-    /// one), and nothing ever takes `hpc` while holding `signal`.
+    /// inversion is instead that the order is consistently hpc → signal →
+    /// reference everywhere it matters ([`resize`] holds `hpc` while taking
+    /// `signal`; [`resync_alt_screen`] holds `signal` while taking `reference`;
+    /// [`close_pseudoconsole`] releases each before the next; `Drop` takes them
+    /// one at a time), and nothing ever takes an earlier one while holding a
+    /// later one.
     signal: Mutex<isize>,
+    /// An OpenConsole session's `\Reference` handle on its ConDrv server — the
+    /// handle a client connects through, and what keeps the host alive until
+    /// the signal pipe has closed (winconpty closes it second). 0 for every
+    /// other session. Swapped to 0 by [`close_pseudoconsole`] after the signal.
+    reference: Mutex<isize>,
+    /// Which console host serves this session.
+    host: ConsoleHostKind,
     /// Write end of the child-stdin pipe (we `WriteFile` keystrokes here).
     input: isize,
     /// Read end of the child-stdout pipe (we `ReadFile` VT output here).
@@ -115,11 +140,14 @@ struct WinSession {
     /// The child's process handle (held ⇒ the pid cannot be recycled).
     process: isize,
     /// The session's ConPTY console host (conhost.exe / OpenConsole.exe — the
-    /// VT↔INPUT_RECORD middleman), opened `PROCESS_SET_INFORMATION` at spawn
-    /// via a before/after child-diff around `CreatePseudoConsole`; 0 when
+    /// VT↔INPUT_RECORD middleman). Inbox: opened `PROCESS_SET_INFORMATION` at
+    /// spawn via a before/after child-diff around `CreatePseudoConsole`; 0 when
     /// discovery was ambiguous or failed (boost then covers the shell only).
-    /// Held ONLY for the focus-boost QoS lane ([`set_focus_boost`]) — never
-    /// waited on, read, or terminated through this handle.
+    /// OpenConsole: the process handle `CreateProcessW` returned, which is also
+    /// the third slot of its pseudoconsole. Used for the focus-boost QoS lane
+    /// ([`set_focus_boost`]) and, for OpenConsole, as that slot when a second
+    /// client attaches ([`resync_alt_screen`]) — never waited on, read, or
+    /// terminated through this handle.
     conhost: isize,
     /// Per-session Job Object (KILL_ON_JOB_CLOSE): last-handle close sweeps any
     /// orphaned descendant tree — slightly stronger than SIGHUP-to-pgid (a
@@ -146,6 +174,7 @@ impl Drop for WinSession {
         // but a session dropped before its waiter ran still owns it — take it
         // through the mutex so the close happens exactly once either way.
         let signal = std::mem::replace(&mut *self.signal.lock_or_recover(), 0);
+        let reference = std::mem::replace(&mut *self.reference.lock_or_recover(), 0);
         for h in [
             self.input,
             self.output,
@@ -154,6 +183,7 @@ impl Drop for WinSession {
             self.job,
             self.close_evt,
             signal,
+            reference,
         ] {
             if h != 0 {
                 // SAFETY: each handle is owned solely by this session entry and
@@ -287,6 +317,13 @@ fn conhost_children() -> Vec<u32> {
 /// the client, because the DefTerm client is somebody else's program (an
 /// installer mid-write, a `.bat` mid-copy) and killing it on window-close would
 /// be strictly worse than the console going away under it.
+///
+/// OpenConsole sessions take the same branch — winconpty's own
+/// `ClosePseudoConsole` is exactly these handle closes — plus the `\Reference`
+/// handle after the signal pipe. The 2026-09-29 snapshot recorded (measured
+/// 2026-09-28) that the close does not block, the shell exits `0xC000013A`
+/// within 2 ms, and the host and the shell are gone within 10 ms, so the
+/// reader's EOF follows as it does for conhost.
 fn close_pseudoconsole(s: &WinSession) {
     let hpc = std::mem::replace(&mut *s.hpc.lock_or_recover(), 0);
     if hpc != 0 {
@@ -299,6 +336,14 @@ fn close_pseudoconsole(s: &WinSession) {
     if signal != 0 {
         // SAFETY: same swap-to-0 sole-closer discipline as the HPCON above.
         unsafe { ffi::CloseHandle(signal) };
+    }
+    // OpenConsole: the reference goes SECOND, winconpty's order — the broken
+    // signal pipe lets the host tear its session down cleanly, and the
+    // reference is what kept it running until then. Never waits.
+    let reference = std::mem::replace(&mut *s.reference.lock_or_recover(), 0);
+    if reference != 0 {
+        // SAFETY: same swap-to-0 sole-closer discipline.
+        unsafe { ffi::CloseHandle(reference) };
     }
 }
 
@@ -387,9 +432,147 @@ struct AttrList {
 }
 
 impl AttrList {
+    /// An initialized list with room for `count` attributes.
+    fn new(count: u32) -> io::Result<Self> {
+        let mut size: usize = 0;
+        // SAFETY: documented size-probe form (NULL list): fails with
+        // ERROR_INSUFFICIENT_BUFFER and writes the required size.
+        unsafe {
+            ffi::InitializeProcThreadAttributeList(std::ptr::null_mut(), count, 0, &mut size)
+        };
+        if size == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut list = AttrList {
+            buf: vec![0u64; size.div_ceil(8)], // u64 elements keep it 8-aligned
+            initialized: false,
+        };
+        // SAFETY: `list.buf` is a writable block of >= size bytes.
+        if unsafe { ffi::InitializeProcThreadAttributeList(list.ptr(), count, 0, &mut size) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        list.initialized = true;
+        Ok(list)
+    }
+
     fn ptr(&mut self) -> *mut c_void {
         self.buf.as_mut_ptr().cast()
     }
+}
+
+/// The four ends of a pseudoconsole's two pipes. The HOST reads `in_read` and
+/// writes `out_write` (it gets duplicates of both, and ours are closed once it
+/// has them); the session keeps `in_write` (keystrokes in) and `out_read` (VT
+/// out). Blocking anonymous pipes map 1:1 onto the blocking read()/write
+/// contract (no overlapped I/O: the reader thread is dedicated and blocking),
+/// with advisory 64 KiB buffers — the system default is 4 KiB, which caps
+/// every ReadFile at ~4 KiB, 16x the wakeups/copies of the frontend's 64 KiB
+/// read buffer, and 64 KiB matches the Unix kernel PTY buffer.
+struct Pipes {
+    in_read: ffi::Handle,
+    in_write: ffi::Handle,
+    out_read: ffi::Handle,
+    out_write: ffi::Handle,
+}
+
+impl Pipes {
+    fn new() -> io::Result<Self> {
+        const PIPE_BUFFER_BYTES: u32 = 64 * 1024;
+        let pipe = || -> io::Result<(ffi::Handle, ffi::Handle)> {
+            let (mut read, mut write): (isize, isize) = (0, 0);
+            // SAFETY: valid out-params, NULL security attributes.
+            if unsafe {
+                ffi::CreatePipe(
+                    &mut read,
+                    &mut write,
+                    std::ptr::null_mut(),
+                    PIPE_BUFFER_BYTES,
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok((ffi::Handle::new(read), ffi::Handle::new(write)))
+        };
+        let (in_read, in_write) = pipe()?;
+        let (out_read, out_write) = pipe()?;
+        Ok(Self {
+            in_read,
+            in_write,
+            out_read,
+            out_write,
+        })
+    }
+}
+
+/// A pseudoconsole a spawn created, in one of the two hosts.
+enum Pseudoconsole {
+    /// kernel32 `CreatePseudoConsole`: the HPCON, and the conhost the
+    /// before/after child diff found (0 when it was ambiguous).
+    Inbox {
+        hpc: PconGuard,
+        conhost: ffi::Handle,
+    },
+    /// An OpenConsole this crate launched, and the file it was launched from.
+    OpenConsole {
+        host: openconsole::OpenConsoleHost,
+        exe: OpenConsoleExe,
+    },
+}
+
+/// Create the pseudoconsole a new session's shell attaches to — in the host the
+/// frontend chose ([`set_console_host`]) when `allow_openconsole`, else in the
+/// inbox host — with its pipes. An OpenConsole that cannot be launched is
+/// noted for the log and the inbox host serves this tab on FRESH pipes, so a
+/// tab always opens (one that launches but never speaks is caught after the
+/// shell starts, by the spawn's step (9b)).
+fn create_pseudoconsole(
+    size: ffi::COORD,
+    program: &OsStr,
+    allow_openconsole: bool,
+) -> io::Result<(Pseudoconsole, Pipes)> {
+    if let Some(exe) = openconsole::host_for_spawn(program).filter(|_| allow_openconsole) {
+        let pipes = Pipes::new()?;
+        match openconsole::launch(&exe, size, &pipes) {
+            Ok(host) => return Ok((Pseudoconsole::OpenConsole { host, exe }, pipes)),
+            Err(why) => openconsole::note_launch_failure(&exe, &why),
+        }
+    }
+    let pipes = Pipes::new()?;
+    // Focus-boost lane: `CreatePseudoConsole` synchronously starts the
+    // session's console host as a child of THIS process. Snapshot our
+    // console-host children before/after so the ONE new pid is this session's
+    // conhost — the second starvable middleman the boost must cover.
+    let conhost_before = conhost_children();
+    let mut hpc: isize = 0;
+    // SAFETY: live pipe handles for the child side; valid out-param for the HPCON.
+    let hr = unsafe {
+        ffi::CreatePseudoConsole(
+            size,
+            pipes.in_read.raw(),
+            pipes.out_write.raw(),
+            0,
+            &mut hpc,
+        )
+    };
+    if hr < 0 {
+        return Err(io::Error::from_raw_os_error(hr));
+    }
+    let hpc = PconGuard(hpc);
+    let new: Vec<u32> = conhost_children()
+        .into_iter()
+        .filter(|p| !conhost_before.contains(p))
+        .collect();
+    let conhost = ffi::Handle::new(match new.as_slice() {
+        // SAFETY: opening OUR OWN just-spawned child with the least right
+        // the boost needs; NULL (0) on failure is the "no conhost lane"
+        // sentinel the guard tolerates.
+        [pid] => unsafe { ffi::OpenProcess(ffi::PROCESS_SET_INFORMATION, 0, *pid) },
+        // 0 or >1 new hosts (a concurrent spawn elsewhere in the process):
+        // ambiguous — cover the shell only, never guess at a pid.
+        _ => 0,
+    });
+    Ok((Pseudoconsole::Inbox { hpc, conhost }, pipes))
 }
 
 impl Drop for AttrList {
@@ -567,6 +750,60 @@ pub fn spawn_shell_with_pid_cell_px(
     // build of the frontend keeps compiling against one call shape.
     _cell_px: Option<(u16, u16)>,
 ) -> io::Result<SpawnedShell> {
+    spawn_on_host(
+        SpawnRequest {
+            rows,
+            cols,
+            cap,
+            sandbox_cap,
+            env_add,
+            shell_override,
+            shell_args,
+            argv_override,
+            exec_command,
+            cwd,
+            sandbox_wrap,
+            limits,
+        },
+        true,
+    )
+}
+
+/// One spawn's inputs, so a spawn whose OpenConsole failed its health check can
+/// be made again on the inbox host ([`spawn_on_host`]).
+#[derive(Clone, Copy)]
+struct SpawnRequest<'a> {
+    rows: u16,
+    cols: u16,
+    cap: &'a aterm_cap::Cap<aterm_cap::effects::Spawn>,
+    sandbox_cap: &'a aterm_cap::Cap<aterm_sandbox::Sandbox>,
+    env_add: &'a [(String, String)],
+    shell_override: Option<&'a str>,
+    shell_args: Option<&'a [String]>,
+    argv_override: Option<&'a [String]>,
+    exec_command: Option<&'a [std::ffi::OsString]>,
+    cwd: Option<&'a str>,
+    sandbox_wrap: Option<&'a str>,
+    limits: aterm_sandbox::Limits,
+}
+
+/// The spawn sequence of [`spawn_shell_with_pid`], with the console host the
+/// frontend chose when `allow_openconsole` (the inbox host otherwise).
+fn spawn_on_host(req: SpawnRequest<'_>, allow_openconsole: bool) -> io::Result<SpawnedShell> {
+    let SpawnRequest {
+        rows,
+        cols,
+        cap,
+        sandbox_cap,
+        env_add,
+        shell_override,
+        shell_args,
+        argv_override,
+        exec_command,
+        cwd,
+        sandbox_wrap,
+        limits,
+    } = req;
     // (1) Spawn cap gate — identical PermissionDenied mapping to the Unix seam.
     aterm_cap::require(cap, aterm_cap::Tier::Trusted)
         .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e.to_string()))?;
@@ -629,111 +866,43 @@ pub fn spawn_shell_with_pid_cell_px(
     let mut env_block = build_env_block(&env_pairs);
     let cwd_w = resolve_cwd_wide(cwd);
 
-    // (5) Pipes + ConPTY. Blocking anonymous pipes map 1:1 onto the existing
-    // blocking read()/write contract; NO overlapped I/O in phase 1 (the reader
-    // thread is dedicated and blocking today — overlapped is only needed for
-    // the future set_nonblocking backpressure milestone). Advisory 64 KiB
-    // buffers (the system default is 4 KiB, which caps every ReadFile at ~4 KiB
-    // — 16x the wakeups/copies of the frontend's 64 KiB read buffer, and
-    // matches the ~64 KiB Unix kernel PTY buffer).
-    const PIPE_BUFFER_BYTES: u32 = 64 * 1024;
-    let mut in_read: isize = 0;
-    let mut in_write: isize = 0;
-    // SAFETY: valid out-params, NULL security attributes.
-    if unsafe {
-        ffi::CreatePipe(
-            &mut in_read,
-            &mut in_write,
-            std::ptr::null_mut(),
-            PIPE_BUFFER_BYTES,
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    let in_read = ffi::Handle::new(in_read);
-    let in_write = ffi::Handle::new(in_write);
-    let mut out_read: isize = 0;
-    let mut out_write: isize = 0;
-    // SAFETY: as above.
-    if unsafe {
-        ffi::CreatePipe(
-            &mut out_read,
-            &mut out_write,
-            std::ptr::null_mut(),
-            PIPE_BUFFER_BYTES,
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    let out_read = ffi::Handle::new(out_read);
-    let out_write = ffi::Handle::new(out_write);
-    // Focus-boost lane: `CreatePseudoConsole` synchronously starts the
-    // session's console host as a child of THIS process. Snapshot our
-    // console-host children before/after so the ONE new pid is this session's
-    // conhost — the second starvable middleman the boost must cover.
-    let conhost_before = conhost_children();
-    let mut hpc: isize = 0;
-    // SAFETY: live pipe handles for the child side; valid out-param for the HPCON.
-    let hr = unsafe {
-        ffi::CreatePseudoConsole(
-            coord(cols, rows),
-            in_read.raw(),
-            out_write.raw(),
-            0,
-            &mut hpc,
-        )
-    };
-    if hr < 0 {
-        return Err(io::Error::from_raw_os_error(hr));
-    }
-    let pcon = PconGuard(hpc);
-    let conhost = {
-        let new: Vec<u32> = conhost_children()
-            .into_iter()
-            .filter(|p| !conhost_before.contains(p))
-            .collect();
-        ffi::Handle::new(match new.as_slice() {
-            // SAFETY: opening OUR OWN just-spawned child with the least right
-            // the boost needs; NULL (0) on failure is the "no conhost lane"
-            // sentinel the guard tolerates.
-            [pid] => unsafe { ffi::OpenProcess(ffi::PROCESS_SET_INFORMATION, 0, *pid) },
-            // 0 or >1 new hosts (a concurrent spawn elsewhere in the process):
-            // ambiguous — cover the shell only, never guess at a pid.
-            _ => 0,
-        })
-    };
-    // ConPTY duplicated its two pipe ends; drop ours now. We retain in_write
+    // (5) Pipes + the pseudoconsole, in the console host the frontend chose
+    // (`create_pseudoconsole`: OpenConsole when one resolves and starts, else
+    // the inbox `CreatePseudoConsole`).
+    let (pcon, pipes) = create_pseudoconsole(coord(cols, rows), &program, allow_openconsole)?;
+    // The host duplicated its two pipe ends; drop ours now. We retain in_write
     // (keystrokes in) and out_read (VT out).
+    let Pipes {
+        in_read,
+        in_write,
+        out_read,
+        out_write,
+    } = pipes;
     drop(in_read);
     drop(out_write);
 
-    // (6) Attribute list carrying the HPCON.
-    let mut attr_size: usize = 0;
-    // SAFETY: documented size-probe form (NULL list): fails with
-    // ERROR_INSUFFICIENT_BUFFER and writes the required size.
-    unsafe { ffi::InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut attr_size) };
-    if attr_size == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let mut attr = AttrList {
-        buf: vec![0u64; attr_size.div_ceil(8)], // u64 elements keep it 8-aligned
-        initialized: false,
+    // (6) Attribute list carrying the pseudoconsole. The attribute VALUE is a
+    // pointer passed by value: the inbox HPCON itself (the documented ConPTY
+    // sample), or, for OpenConsole, the address of its three slots (winconpty's
+    // `PseudoConsole` struct, see `openconsole`) — kernelbase reads them during
+    // `CreateProcessW`, so the array lives on this frame across that call.
+    let mut attr = AttrList::new(1)?;
+    let mut slots: [isize; 3] = match &pcon {
+        Pseudoconsole::Inbox { .. } => [0; 3],
+        Pseudoconsole::OpenConsole { host, .. } => host.slots(),
     };
-    // SAFETY: `attr.buf` is a writable block of >= attr_size bytes.
-    if unsafe { ffi::InitializeProcThreadAttributeList(attr.ptr(), 1, 0, &mut attr_size) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    attr.initialized = true;
-    // SAFETY: initialized list; the attribute VALUE is the HPCON itself passed
-    // by value (cast to PVOID), per the documented ConPTY sample.
+    let value: *mut c_void = match &pcon {
+        Pseudoconsole::Inbox { hpc, .. } => hpc.0 as *mut c_void,
+        Pseudoconsole::OpenConsole { .. } => slots.as_mut_ptr().cast(),
+    };
+    // SAFETY: initialized list; `value` is the live HPCON or the address of
+    // `slots`, both valid until `attr` is dropped after CreateProcessW.
     let updated = unsafe {
         ffi::UpdateProcThreadAttribute(
             attr.ptr(),
             0,
             ffi::PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-            pcon.0 as *mut c_void,
+            value,
             std::mem::size_of::<isize>(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
@@ -864,18 +1033,51 @@ pub fn spawn_shell_with_pid_cell_px(
         return Err(fail_closed("ResumeThread failed"));
     }
     drop(h_thread); // done with the thread handle
+    // (9b) An OpenConsole proves itself only once its first client connects:
+    // it must answer the shell's connect with its first output. Until that
+    // output the shell is held inside its console connect and has run nothing
+    // of its own (`openconsole::await_started` has the snapshot's record), so a host
+    // that fails here is dropped, the shell's job with it, and the spawn is
+    // made again on the inbox host — the tab always opens.
+    let health = match &pcon {
+        Pseudoconsole::Inbox { .. } => Ok(()),
+        Pseudoconsole::OpenConsole { host, exe } => {
+            openconsole::await_started(host, out_read.raw()).map_err(|why| (exe.clone(), why))
+        }
+    };
+    if let Err((exe, why)) = health {
+        // SAFETY: the job we just created; it kills the held shell.
+        unsafe { ffi::TerminateJobObject(job.raw(), 126) };
+        // Every handle of the failed attempt goes before the retry makes its own.
+        drop((pcon, attr, job, h_process, close_evt, in_write, out_read));
+        openconsole::note_launch_failure(&exe, &why);
+        return spawn_on_host(req, false);
+    }
     // Windows pids are small multiples of 4 in practice; a DWORD above i32::MAX
     // would truncate here (theoretical, documented).
     let pid = pi.dwProcessId as i32;
+    // Inbox: we own the HPCON and resize/close through it; its signal pipe is
+    // conhost's private business. OpenConsole: no HPCON — the three slots are
+    // ours, and resize/close go through the signal pipe.
+    let (hpc, [signal, reference, conhost], host) = match pcon {
+        Pseudoconsole::Inbox { hpc, conhost } => (
+            hpc.release(),
+            [0, 0, conhost.into_raw()],
+            ConsoleHostKind::Inbox,
+        ),
+        Pseudoconsole::OpenConsole { host, .. } => {
+            (0, host.into_raw(), ConsoleHostKind::OpenConsole)
+        }
+    };
     let session = Arc::new(WinSession {
-        hpc: Mutex::new(pcon.release()),
-        // We own the HPCON, so we resize/close through it; the signal pipe is
-        // conhost's private business here (only the adopted lane touches one).
-        signal: Mutex::new(0),
+        hpc: Mutex::new(hpc),
+        signal: Mutex::new(signal),
+        reference: Mutex::new(reference),
+        host,
         input: in_write.into_raw(),
         output: out_read.into_raw(),
         process: h_process.into_raw(),
-        conhost: conhost.into_raw(),
+        conhost,
         job: job.into_raw(),
         close_evt: close_evt.into_raw(),
         pid: pi.dwProcessId,
@@ -1022,6 +1224,9 @@ pub fn adopt_handoff(
         // HPCON-shaped operation take its signal-pipe branch.
         hpc: Mutex::new(0),
         signal: Mutex::new(signal_pipe),
+        reference: Mutex::new(0),
+        // The DefTerm handoff comes from Windows' own conhost.
+        host: ConsoleHostKind::Inbox,
         input: in_pipe,
         output: out_pipe,
         process: client_process,
@@ -1606,6 +1811,56 @@ pub fn size(_master: i32) -> Option<(u16, u16)> {
     None
 }
 
+/// Make `master`'s console host LEAVE its alternate screen buffer: start a
+/// one-shot console client in the same pseudoconsole that writes `CSI ? 1049 l`
+/// and exits. The recovery for a full-screen app that died on the alternate
+/// screen: conhost keeps that buffer up with nobody behind it (nothing a
+/// terminal writes into the input pipe switches it; a console client's
+/// `?1049l` does), and an OpenConsole host then forwards the switch to the
+/// terminal verbatim ([`ConsoleHostKind::passes_screen_switches_through`]), so
+/// the terminal leaves its own alternate screen from the same bytes, in the
+/// same place in the stream, and the two stay in step. Returns once the client
+/// has been started; the switch arrives on the session's output.
+///
+/// # Errors
+/// `NotFound` for a key no live session has; `Unsupported` for an inbox
+/// session (its host repaints over the terminal instead — the frontend keeps
+/// its own recovery there); the OS error when the client cannot be started.
+pub fn resync_alt_screen(master: i32) -> io::Result<()> {
+    let Some(s) = session(master) else {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "no such session"));
+    };
+    if !s.host.passes_screen_switches_through() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the session's console host repaints over the terminal; nothing to resync",
+        ));
+    }
+    // Held across the client's CreateProcessW: the close path swaps the signal
+    // (then the reference) to 0 under these locks, so the slots stay open for
+    // as long as kernelbase reads them.
+    let signal = s.signal.lock_or_recover();
+    let reference = s.reference.lock_or_recover();
+    if *signal == 0 || *reference == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "the session's pseudoconsole is closing",
+        ));
+    }
+    let mut slots = [*signal, *reference, s.conhost];
+    let mut command = openconsole::system_command("cmd.exe", "/d /c <nul set /p =\u{1b}[?1049l");
+    openconsole::start_client(&mut slots, &mut command).map(drop)
+}
+
+/// Which console host serves `master` — `None` for a key no live session has
+/// (the same answer [`backend_is_conpty`] gives `false` for). The frontend
+/// keys the workarounds the two hosts need differently on this
+/// ([`ConsoleHostKind`] lists which do and which do not).
+#[must_use]
+pub fn conpty_host(master: i32) -> Option<ConsoleHostKind> {
+    session(master).map(|s| s.host)
+}
+
 /// Unix-seam parity for [`resize_with_cell_px`](crate::resize_with_cell_px):
 /// ConPTY resizes in CHARACTER cells (`COORD`) and has no winsize pixel fields,
 /// so `cell_px` has nowhere to land and is ignored. Kept so the frontend's one
@@ -1624,12 +1879,13 @@ pub fn resize_with_cell_px(master: i32, rows: u16, cols: u16, _cell_px: Option<(
         }
         return;
     }
-    // Adopted lane. The `signal` MUTEX — not the `hpc` guard `g` — is what keeps
-    // this write off a closed handle: `close_pseudoconsole` swaps the handle to
-    // 0 under this same lock and closes it outside, so we either hold a live
-    // handle for the whole WriteFile or read the 0 that says it is gone. `g` is
-    // still in scope only to keep the lock order hpc → signal uniform (nothing
-    // anywhere takes `hpc` while holding `signal`, so there is no inversion).
+    // Adopted and OpenConsole lane. The `signal` MUTEX — not the `hpc` guard
+    // `g` — is what keeps this write off a closed handle: `close_pseudoconsole`
+    // swaps the handle to 0 under this same lock and closes it outside, so we
+    // either hold a live handle for the whole WriteFile or read the 0 that says
+    // it is gone. `g` is still in scope only to keep the lock order hpc →
+    // signal uniform (nothing anywhere takes `hpc` while holding `signal`, so
+    // there is no inversion).
     let sig = s.signal.lock_or_recover();
     if *sig != 0 {
         let buf = encode_resize_signal(rows, cols);
@@ -1839,7 +2095,7 @@ mod tests {
     // `cmd.exe\0x` is the sharp case: `SearchPathW` reads only `cmd.exe` and
     // resolves it, so neither the program nor argv holds a NUL by the time a
     // check after resolution could look. The Windows twin of
-    // `a_shell_holding_a_nul_refuses_the_spawn_instead_of_running_another`.
+    // `unix_tests.rs`'s `a_nul_in_an_argument_or_the_shell_refuses_the_spawn`.
     #[test]
     fn a_shell_holding_a_nul_refuses_the_spawn() {
         // SAFETY: single-threaded mint; trusted-launcher contract trivially holds.

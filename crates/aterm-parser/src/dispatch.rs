@@ -3,7 +3,7 @@
 //
 // Author: Andrew Yates
 
-//! Parser dispatch engine: advance methods, state-machine byte processing, helpers.
+//! Parser dispatch engine: `advance_fast`, state-machine byte processing, helpers.
 
 use aterm_alloc::ArrayVec;
 use aterm_provenance::pty_wrap_ref;
@@ -81,6 +81,15 @@ trust_island! {
 /// The state machine's per-byte dispatch, expanded in `process_byte_inner`.
 macro_rules! process_byte_impl {
     ($self:expr, $byte:expr, $sink:expr) => {{
+        // The byte after the ESC that left a hooked DCS string decides how the
+        // string ends (`dcs_st_pending`): `\` completes the ST, so the string
+        // ends complete; any other byte breaks it off, and a broken-off string
+        // is canceled, as CAN and SUB cancel one (xterm answers or applies a DCS
+        // only at ST). The byte itself is then read in `Escape` as always.
+        if $self.dcs_st_pending {
+            $self.dcs_st_pending = false;
+            $sink.dcs_unhook($byte != b'\\');
+        }
         // Block C1 control bytes (0x80-0x9F) in non-Ground, non-string states
         // when C1 controls are disabled. The static transition table contains
         // "anywhere" entries that route 0x90→DCS, 0x9B→CSI, 0x9D→OSC, etc.
@@ -88,7 +97,7 @@ macro_rules! process_byte_impl {
         // via C1 introducers even when the parser is mid-sequence (#7556).
         //
         // Excluded states:
-        //  - Ground: handled upstream (process_byte / process_ground_special_byte)
+        //  - Ground: handled upstream (process_ground_special_byte)
         //  - the four control-string states (DcsPassthrough, DcsIgnore,
         //    OscString, SosPmApcString): their custom table overrides already
         //    map 0x80-0x9F to data actions (DcsPut / OscPut / ApcPut / Ignore),
@@ -154,17 +163,23 @@ macro_rules! process_byte_impl {
             // a DCS, OSC or APC string they end is DISCARDED, never
             // delivered: a half-decoded sixel is not rendered, a truncated
             // OSC 52 clipboard write, OSC 8 link or title is not dispatched,
-            // a truncated kitty command is not run. ESC (a real `ESC \` ST,
-            // or an ESC that breaks out), BEL (OSC) and 0x9C ST are
-            // legitimate terminators.
+            // a truncated kitty command is not run. BEL (OSC) and 0x9C ST are
+            // legitimate terminators, and so is ESC for an OSC or APC string. A
+            // DCS string an ESC leaves ends only at the next byte (above).
             let canceled = $byte == 0x18 || $byte == 0x1A;
 
-            // Handle DCS unhook when leaving DcsPassthrough.
+            // Handle DCS unhook when leaving DcsPassthrough. An ESC begins ST
+            // only when `\` follows, so it leaves the string hooked for the next
+            // byte to decide.
             if prev_state == State::DcsPassthrough && transition.next_state != State::DcsPassthrough
             {
                 if $self.dcs_active {
-                    $sink.dcs_unhook(canceled);
                     $self.dcs_active = false;
+                    if $byte == 0x1B {
+                        $self.dcs_st_pending = true;
+                    } else {
+                        $sink.dcs_unhook(canceled);
+                    }
                 }
             }
 
@@ -274,31 +289,12 @@ macro_rules! process_byte_impl {
 }
 
 impl Parser {
-    /// Process input bytes, calling sink for each action.
+    /// Process input bytes, calling sink for each action. The parser's one
+    /// entry point.
     ///
-    /// # Safety
-    ///
-    /// This function:
-    /// - Never panics for any input
-    /// - Never accesses out-of-bounds memory
-    /// - Always terminates
-    pub fn advance<S: ActionSink>(&mut self, input: &[u8], sink: &mut S) {
-        for &byte in input {
-            // Test instrumentation: count iterations for O(n) verification
-            #[cfg(test)]
-            count_parser_loop_iteration();
-
-            self.process_byte(byte, sink);
-        }
-    }
-
-    /// Process input with fast path for ground state.
-    ///
-    /// This is an optimization that uses SIMD scanning for printable text.
-    /// On typical terminal output (mostly printable text), this is 5-10x
-    /// faster than the basic `advance` method.
-    ///
-    /// Handles UTF-8 multi-byte sequences properly for non-ASCII characters.
+    /// SIMD-scans printable text in the ground state and handles UTF-8
+    /// multi-byte sequences (split across calls too). Never panics for any
+    /// input, never reads out of bounds, always terminates.
     pub fn advance_fast<S: ActionSink>(&mut self, input: &[u8], sink: &mut S) {
         // Every byte/slice access below uses the total `split_first`/`get`
         // spellings (the loop condition and the fast-path scanners guarantee
@@ -367,7 +363,12 @@ impl Parser {
                 continue;
             }
 
-            if self.state == State::Escape && remaining.first() == Some(&b'[') {
+            // Not while a hooked DCS waits on this byte: `process_byte_inner`
+            // ends that string first.
+            if self.state == State::Escape
+                && !self.dcs_st_pending
+                && remaining.first() == Some(&b'[')
+            {
                 let rest = remaining.get(1..).unwrap_or(&[]);
                 if let Some(consumed) = self.try_parse_csi_fast(rest, sink) {
                     remaining = rest.get(consumed..).unwrap_or(&[]);
@@ -453,7 +454,7 @@ impl Parser {
         // every breakpoint of every `len`:
         // `tests::string_bulk::osc_bulk_copy_agrees_with_per_byte_puts_at_every_breakpoint`), and
         // `remaining.get(n..)` then lands on the control byte, which both
-        // paths process the same way. `osc_over_capacity_truncation_parity`
+        // paths process the same way. `osc_payload_cap_parity`
         // (tests/string_bulk.rs) drives both paths across the boundary.
         if self.state == State::OscString {
             let n = if self.c1_controls_enabled {
@@ -470,7 +471,7 @@ impl Parser {
                     .extend_from_slice(remaining.get(..copy_len).unwrap_or(&[]));
                 remaining = remaining.get(n..).unwrap_or(&[]);
             }
-            // Fall through to process_byte for the C0 control byte.
+            // Fall through to process_byte_inner for the C0 control byte.
         }
 
         // DCS bulk fast path (#7864): in DcsPassthrough most bytes are DcsPut,
@@ -481,7 +482,7 @@ impl Parser {
         // ApcPut data). Reusing `find_dcs_terminator` here would bulk-copy 0x7F
         // into `dcs_put_bulk`, diverging from the byte-by-byte path which drops
         // it. So scan with `find_dcs_passthrough_boundary` (terminators + 0x7F),
-        // bulk-copy up to the boundary, then fall through to process_byte for
+        // bulk-copy up to the boundary, then fall through to process_byte_inner for
         // the boundary byte: a 0x7F is Ignored (no dcs_put, stays in
         // DcsPassthrough) and the loop re-enters this branch for the remainder.
         //
@@ -496,7 +497,7 @@ impl Parser {
                 self.string_utf8 = self.string_utf8.after(run);
                 remaining = remaining.get(n..).unwrap_or(&[]);
             }
-            // Fall through to process_byte for the boundary byte.
+            // Fall through to process_byte_inner for the boundary byte.
         }
 
         // APC bulk fast path (#7864 parity sibling): SosPmApcString uses the
@@ -523,7 +524,7 @@ impl Parser {
                 self.string_utf8 = self.string_utf8.after(run);
                 remaining = remaining.get(n..).unwrap_or(&[]);
             }
-            // Fall through to process_byte for the terminator (or for a 0x9C
+            // Fall through to process_byte_inner for the terminator (or for a 0x9C
             // inside a UTF-8 character, which stays in the string).
         }
 
@@ -556,7 +557,7 @@ impl Parser {
     /// `ActionType::Ignore` (it stays in the state and emits nothing), so the
     /// bulk copy must stop at it and let the byte-by-byte path drop it —
     /// otherwise the fast path would leak DEL into the DCS sink, diverging from
-    /// `advance`. This is distinct from APC (`SosPmApcString`), where 0x7F is
+    /// the transition table. This is distinct from APC (`SosPmApcString`), where 0x7F is
     /// `ApcPut` data and must keep flowing, so APC continues to use
     /// [`Parser::find_dcs_terminator`].
     ///
@@ -620,36 +621,6 @@ impl Parser {
         if self.intermediates.len() < MAX_INTERMEDIATES {
             self.intermediates.push(byte);
         }
-    }
-
-    /// Process a single byte through the state machine (basic method).
-    ///
-    /// Note: This is the simple byte-by-byte method. For better UTF-8 support,
-    /// use `advance_fast` instead which properly handles multi-byte sequences.
-    #[inline]
-    fn process_byte<S: ActionSink>(&mut self, byte: u8, sink: &mut S) {
-        if byte >= 0x80 && self.state == State::Ground {
-            // C1 control codes (0x80-0x9F) security check
-            // When c1_controls_enabled is false (default), treat C1 bytes as invalid
-            // UTF-8 and emit replacement character instead of processing as controls.
-            // This prevents escape sequence injection attacks in UTF-8 terminals.
-            if (0x80..=0x9F).contains(&byte) {
-                if self.c1_controls_enabled {
-                    self.process_byte_inner(byte, sink);
-                } else {
-                    sink.print(char::REPLACEMENT_CHARACTER);
-                }
-                return;
-            }
-            // Latin-1 range (0xA0-0xFF): These bytes are valid printable Latin-1
-            // characters. The transition table has no entries for them in Ground state
-            // (they'd be silently dropped). Print them as their Unicode equivalents
-            // (Latin-1 maps 1:1 to Unicode codepoints U+00A0-U+00FF).
-            // SAFETY: 0xA0-0xFF are valid Unicode scalar values.
-            sink.print(byte as char);
-            return;
-        }
-        self.process_byte_inner(byte, sink);
     }
 
     /// Parse and dispatch OSC data.

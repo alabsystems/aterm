@@ -16,7 +16,8 @@ impl Terminal {
     /// xterm.js buffer to snapshot, restore or fork a pane. Layout: SGR reset, the capped
     /// recent history (text + CRLF), `CSI H`, each visible row placed with absolute CUP +
     /// erase-line (so a full-width row cannot autowrap on replay) via the grid's
-    /// `row_ansi_text_screen`, then the cursor. `scrollback_rows`: `None` prepends all
+    /// `row_ansi_text_screen`, then the cursor (its row printed again when its wrap is
+    /// deferred, which a CUP would clear). `scrollback_rows`: `None` prepends all
     /// history, `Some(n)` the last `n`, `Some(0)` none.
     #[must_use]
     pub fn serialize_ansi(&self, rows: usize, scrollback_rows: Option<u32>) -> String {
@@ -59,7 +60,24 @@ impl Terminal {
             out.push_str("\x1b[0m");
         }
         let c = self.cursor();
-        let _ = write!(out, "\x1b[{};{}H", c.row as usize + 1, c.col as usize + 1);
+        let cols = grid.cols();
+        // A cursor on the last column with its wrap deferred (the program's output ended
+        // at the right margin) is re-armed by printing its row again, last: a CUP clears
+        // the deferral, so the replay's next glyph would overwrite that column instead of
+        // wrapping. Only a row printed out to that column re-arms it, and without DECAWM
+        // the deferral is never acted on.
+        if grid.pending_wrap()
+            && self.modes().auto_wrap
+            && c.col.saturating_add(1) == cols
+            && grid.row_at_screen(c.row).is_some_and(|r| r.len() == cols)
+            && let Some(row_ansi) = grid.row_ansi_text_screen(c.row)
+        {
+            let _ = write!(out, "\x1b[{};1H\x1b[K", c.row as usize + 1);
+            out.push_str(&row_ansi);
+            out.push_str("\x1b[0m");
+        } else {
+            let _ = write!(out, "\x1b[{};{}H", c.row as usize + 1, c.col as usize + 1);
+        }
         out
     }
 
@@ -84,5 +102,45 @@ impl Terminal {
             out.push_str("\r\n");
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Terminal;
+
+    /// The rows after `next` lands on `t`, and on a fresh terminal fed `t`'s serialization.
+    fn after_replay(rows: u16, cols: u16, input: &str, next: &str) -> (Vec<String>, Vec<String>) {
+        let mut a = Terminal::new(rows, cols);
+        a.process(input.as_bytes());
+        let mut b = Terminal::new(rows, cols);
+        b.process(a.serialize_ansi(usize::from(rows), Some(0)).as_bytes());
+        let text = |t: &mut Terminal| {
+            t.process(next.as_bytes());
+            (0..usize::from(rows))
+                .map(|r| t.row_text(r).unwrap_or_default())
+                .collect()
+        };
+        (text(&mut a), text(&mut b))
+    }
+
+    #[test]
+    fn a_replay_wraps_where_the_source_would() {
+        // Output that ended at the right margin defers its wrap: the next glyph goes
+        // on the next row, in the replay as in the source.
+        for (rows, input) in [
+            (3, "abcde"),
+            (2, "12345\r\nabcde"),
+            (3, "abc\u{4E2D}"),
+            (3, "\x1b[31mabcd\x1b[44me"),
+        ] {
+            let (source, replay) = after_replay(rows, 5, input, "Z");
+            assert_eq!(source, replay, "{input:?}");
+        }
+        // Controls: no deferred wrap, and DECAWM off (the next glyph overwrites).
+        for input in ["abcd", "\x1b[?7labcde"] {
+            let (source, replay) = after_replay(3, 5, input, "Z");
+            assert_eq!(source, replay, "{input:?}");
+        }
     }
 }

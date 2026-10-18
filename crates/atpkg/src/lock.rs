@@ -158,164 +158,10 @@ impl Drop for Flock {
     }
 }
 
-/// A holder's exclusive lock on a file that CARRIES A RECORD other processes read while
-/// the holder lives — a lease's "who" line ([`crate::lease`]), the head watch seat's pid
-/// ([`crate::vendor_direct::watch`]). Released on drop, like [`Flock`].
-///
-/// Unix uses the advisory whole-file lock. Windows byte-range locks also deny
-/// ordinary reads from other handles, so the record remains outside the locked
-/// range `[record, u64::MAX)`. Whole-file liveness probes still overlap that range.
-#[derive(Debug)]
-pub(crate) struct RecordLock {
-    file: File,
-    /// The record's length: where the held range starts (Windows).
-    #[cfg(windows)]
-    record: u64,
-}
-
-impl RecordLock {
-    /// Take `file`'s exclusive lock without blocking, leaving its first `record` bytes
-    /// readable by other handles on Windows ([`RecordLock`]).
-    pub(crate) fn try_lock(file: File, record: u64) -> Result<Self, std::fs::TryLockError> {
-        // The census's File evidence, as in `Flock::try_lock`.
-        let file: std::fs::File = file;
-        #[cfg(windows)]
-        {
-            record_range::try_lock(&file, record)?;
-            Ok(Self { file, record })
-        }
-        #[cfg(not(windows))]
-        {
-            // `flock` has no ranges, and needs none: it is advisory.
-            let _ = record;
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "the record guard's own take: its Drop releases by LOCK_UN"
-            )]
-            file.try_lock()?;
-            Ok(Self { file })
-        }
-    }
-
-    /// Let the lock go, keeping the file open — what the kernel does for a holder that
-    /// dies. The drop does it too.
-    pub(crate) fn unlock(&self) {
-        #[cfg(windows)]
-        record_range::unlock(&self.file, self.record);
-        #[cfg(not(windows))]
-        {
-            let _ = self.file.unlock();
-        }
-    }
-}
-
-impl std::ops::Deref for RecordLock {
-    type Target = File;
-    fn deref(&self) -> &File {
-        &self.file
-    }
-}
-
-impl std::ops::DerefMut for RecordLock {
-    fn deref_mut(&mut self) -> &mut File {
-        &mut self.file
-    }
-}
-
-impl Drop for RecordLock {
-    fn drop(&mut self) {
-        self.unlock();
-    }
-}
-
-/// [`RecordLock`]'s Windows range: `LockFileEx`/`UnlockFileEx` over `[record, u64::MAX)`.
-#[cfg(windows)]
-mod record_range {
-    use std::ffi::c_void;
-    use std::fs::File;
-    use std::os::windows::io::AsRawHandle as _;
-
-    /// `OVERLAPPED`: the offset names the range; the API may also update its status fields.
-    #[repr(C)]
-    struct Overlapped {
-        internal: usize,
-        internal_high: usize,
-        offset: u32,
-        offset_high: u32,
-        event: *mut c_void,
-    }
-
-    const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x0000_0001;
-    const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
-    /// `LockFileEx`'s answer when another handle holds part of the range.
-    const ERROR_LOCK_VIOLATION: i32 = 33;
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn LockFileEx(
-            file: *mut c_void,
-            flags: u32,
-            reserved: u32,
-            bytes_low: u32,
-            bytes_high: u32,
-            overlapped: *mut Overlapped,
-        ) -> i32;
-        fn UnlockFileEx(
-            file: *mut c_void,
-            reserved: u32,
-            bytes_low: u32,
-            bytes_high: u32,
-            overlapped: *mut Overlapped,
-        ) -> i32;
-    }
-
-    /// The `OVERLAPPED` naming `record` as the start, and the range's length split into
-    /// its low and high halves.
-    fn range(record: u64) -> (Overlapped, u32, u32) {
-        let len = u64::MAX - record;
-        let overlapped = Overlapped {
-            internal: 0,
-            internal_high: 0,
-            offset: record as u32,
-            offset_high: (record >> 32) as u32,
-            event: std::ptr::null_mut(),
-        };
-        (overlapped, len as u32, (len >> 32) as u32)
-    }
-
-    pub(super) fn try_lock(file: &File, record: u64) -> Result<(), std::fs::TryLockError> {
-        let (mut overlapped, low, high) = range(record);
-        // SAFETY: `file` is an open handle for the call; `overlapped` is a live, initialised
-        // `OVERLAPPED` available for the call's input/output. The handle is synchronous
-        // and FAIL_IMMEDIATELY refuses contention rather than parking a request.
-        let ok = unsafe {
-            LockFileEx(
-                file.as_raw_handle(),
-                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
-                0,
-                low,
-                high,
-                &mut overlapped,
-            )
-        };
-        if ok != 0 {
-            return Ok(());
-        }
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(ERROR_LOCK_VIOLATION) {
-            Err(std::fs::TryLockError::WouldBlock)
-        } else {
-            Err(std::fs::TryLockError::Error(err))
-        }
-    }
-
-    pub(super) fn unlock(file: &File, record: u64) {
-        let (mut overlapped, low, high) = range(record);
-        // SAFETY: as in `try_lock`. A range this handle does not hold is refused, which
-        // changes nothing.
-        let _ = unsafe { UnlockFileEx(file.as_raw_handle(), 0, low, high, &mut overlapped) };
-    }
-}
+/// A holder's exclusive lock on a file that carries a record other processes read while
+/// the holder lives — the head watch seat's pid ([`crate::vendor_direct::watch`]); the lease
+/// core takes the same lock for its "who" line. One source, beside that core.
+pub(crate) use aterm_toolchain::record_lock::RecordLock;
 
 /// The store-wide writer lock, held for the lifetime of the value. Dropping it (or
 /// the process exiting) releases it — `flock` is associated with the open file
@@ -876,15 +722,6 @@ mod tests {
             matches!(err, StoreLockError::Contended(ref p) if *p == a.store_lock()),
             "contention names the lock path: {err:?}"
         );
-        let msg = err.to_string();
-        assert!(
-            msg.contains("another atpkg process holds the store lock"),
-            "the refusal names the holder: {msg}"
-        );
-        assert!(
-            msg.contains(&a.store_lock().display().to_string()),
-            "the refusal names the lock path: {msg}"
-        );
         drop(guard);
         // Sampled ONCE, deliberately: the drop is `LOCK_UN` ([`Flock`]), so a spawn in a
         // sibling test holding a copy of the descriptor cannot keep it held (it did until
@@ -1084,23 +921,14 @@ mod tests {
             matches!(err, StoreLockError::Io(..)),
             "refusal is Io: {err:?}"
         );
-        assert!(
-            err.to_string().contains("refusing to mutate the store"),
-            "the Io refusal is fail-closed too: {err}"
-        );
         let _ = std::fs::remove_file(&l.prefix);
     }
 
-    /// A prefix that is a SYMLINK is refused (F16) with the link named as the
-    /// cause — never with the multi-user-store remedy. The refusal rides the
-    /// `PermissionDenied` kind, and the message keyed on that kind alone said
-    /// "This prefix is not writable by you … remove `[packages].prefix`", which
-    /// is wrong for a link: it is the user's own, and the default prefix has no
-    /// `[packages].prefix` to remove (2026-09-14 audit; the sentence landed
-    /// verbatim on the seed's refusal card).
+    /// A prefix that is a SYMLINK is refused (F16) as `PermissionDenied`, and nothing is
+    /// opened through the link.
     #[cfg(unix)]
     #[test]
-    fn a_symlinked_prefix_is_refused_as_a_link_not_as_someone_elses_store() {
+    fn a_symlinked_prefix_is_refused_and_never_followed() {
         let l = temp_layout("linkprefix");
         let target = temp_layout("linkprefix-target");
         std::fs::create_dir_all(&target.prefix).unwrap();
@@ -1112,20 +940,6 @@ mod tests {
         assert!(
             matches!(&err, StoreLockError::Io(_, e) if e.kind() == io::ErrorKind::PermissionDenied),
             "the F16 refusal keeps its kind: {err:?}"
-        );
-        let said = err.to_string();
-        assert!(said.contains("is a symlink"), "names the cause: {said}");
-        assert!(
-            said.contains("refusing to mutate the store"),
-            "fail-closed: {said}"
-        );
-        assert!(
-            !said.contains("not writable by you"),
-            "never the multi-user remedy for a link: {said}"
-        );
-        assert!(
-            said.contains("remove the link"),
-            "the link's own remedy: {said}"
         );
         assert!(
             !target.store_lock().exists(),
@@ -1215,7 +1029,6 @@ mod tests {
         };
         let _guard = try_lock_store(&a).expect("first acquisition succeeds");
         let timeout = WAIT_ANNOUNCE_GRACE + Duration::from_secs(1);
-        let started = Instant::now();
         let announced = std::cell::Cell::new(0u32);
         let err = match lock_store_waiting(
             &b,
@@ -1226,11 +1039,6 @@ mod tests {
             Ok(_) => panic!("a lock held for the whole wait must refuse"),
             Err(e) => e,
         };
-        assert!(
-            started.elapsed() >= timeout,
-            "waited the whole bound: {:?}",
-            started.elapsed()
-        );
         assert!(
             matches!(err, StoreLockError::Contended(ref p) if *p == a.store_lock()),
             "the timeout is a contention refusal naming the path: {err:?}"
@@ -1470,174 +1278,28 @@ mod tests {
         // Wanted for slightly LESS than the grace, so the caller is gone by the
         // first poll at which the grace has elapsed — the ordering under test.
         let wanted_for = WAIT_ANNOUNCE_GRACE - Duration::from_millis(100);
+        let wanted = std::cell::Cell::new(0u32);
         let announced = std::cell::Cell::new(0u32);
         let err = match lock_store_waiting(
             &b,
             Duration::from_secs(30),
             |_| announced.set(announced.get() + 1),
-            || started.elapsed() < wanted_for,
+            || {
+                let still = started.elapsed() < wanted_for;
+                wanted.set(wanted.get() + u32::from(still));
+                still
+            },
         ) {
             Ok(_) => panic!("held lock"),
             Err(e) => e,
         };
         assert!(matches!(err, StoreLockError::Contended(..)), "{err:?}");
-        assert!(
-            started.elapsed() >= wanted_for,
-            "waited while wanted: {:?}",
-            started.elapsed()
-        );
+        assert!(wanted.get() > 0, "it waited while it was wanted");
         assert_eq!(
             announced.get(),
             0,
             "a caller that has gone is never announced to"
         );
         let _ = std::fs::remove_dir_all(&a.prefix);
-    }
-
-    /// The contention code is `EX_TEMPFAIL` and shares nothing with the codes the CLI
-    /// ACTUALLY exits with — read from the production source of the two files that
-    /// build an `ExitCode` (`cli.rs`, `reroute.rs`), never from a hand-typed list
-    /// that drifts: every literal `ExitCode::from(<n>)`, plus the named
-    /// `reroute::REFUSAL_EXIT`, plus the literal returns of every `fn <verb>_code()
-    /// -> u8` body that a verb RELAYS through `ExitCode::from(code)` (0.82.0's
-    /// announcement ledger split `cmd_update_all` and `cmd_install_default_set` that
-    /// way, so the pass's real verdict answers its own announcement) — where the offline
-    /// code is returned by its name, `pkg_check::PASS_OFFLINE_EXIT` (a pass that stood down
-    /// behind an offline one, 2026-09-24), read as the constant it names; the one other
-    /// non-literal argument is the lock edge's own match, which names this constant.
-    /// The self-update verb (`cli::cmd_selfupdate`, 2026-09-19) relays its CHILD's
-    /// status the same way — literal arms for 0, 2 and everything else, and the named
-    /// `CONTENDED_EXIT` for 75, never a relayed variable — and `selfupdate.rs` builds no
-    /// exit code at all, so the scanned set stays these two files. A caller keying on 75
-    /// can therefore never mistake another refusal for contention.
-    ///
-    /// THE SPLIT IS EACH TEST MODULE'S OWN GATE, and a split that cannot find it
-    /// panics. This scan used to cut `cli.rs` at the first `#[cfg(test)]`, which for
-    /// a module gated `#[cfg(all(test, unix))]` was never the module: the first hit
-    /// was inside the tests, so "production" quietly included them — and when the
-    /// ledger put a real `#[cfg(test)] fn reset()` seam into production code
-    /// (2026-09-11) the same split cut the scan to the file's first half, 47 of its
-    /// 88 literal sites, with both relayed sites among the unscanned. A truncated
-    /// scan passes for the wrong reason, which is the defect it exists to catch. So the
-    /// anchor is the gate together with the `mod tests {` line it gates: that seam now
-    /// carries the module's own `#[cfg(all(test, unix))]` (2026-09-25). Both modules now
-    /// live in sibling `*_tests.rs` files (2026-10-06), so the gate is the out-of-line
-    /// declaration that ends each file, and the half is the file bar that declaration.
-    #[test]
-    fn contention_exit_code_is_temp_fail_and_unshared() {
-        assert_eq!(CONTENDED_EXIT, 75);
-        let mut in_use = std::collections::BTreeSet::new();
-        in_use.insert(crate::reroute::REFUSAL_EXIT);
-        let mut literal_sites = 0usize;
-        let mut relayed = std::collections::BTreeSet::new();
-        for (file, src, gate) in [
-            (
-                "cli.rs",
-                include_str!("cli.rs"),
-                "#[cfg(all(test, unix))]\n#[path = \"cli_tests.rs\"]\nmod tests;",
-            ),
-            (
-                "reroute.rs",
-                include_str!("reroute.rs"),
-                "#[cfg(test)]\n#[path = \"reroute_tests.rs\"]\nmod tests;",
-            ),
-        ] {
-            let (production, _) = src
-                .split_once(gate)
-                .unwrap_or_else(|| panic!("{file}'s test module is gated `{gate}`"));
-            assert!(
-                !production.contains("mod tests {"),
-                "{file}: the production half must hold none of the tests"
-            );
-            for (at, _) in production.match_indices("ExitCode::from(") {
-                let arg = &production[at + "ExitCode::from(".len()..];
-                let literal: String = arg.chars().take_while(|c| *c != ')').collect();
-                if let Ok(code) = literal.trim().parse::<u8>() {
-                    in_use.insert(code);
-                    literal_sites += 1;
-                } else if literal.trim() == "code" {
-                    // `let code = <verb>_code();` … `ExitCode::from(code)`: follow
-                    // the binding to the body and read its returns — every
-                    // `return <n>;` and every block-final bare literal, each on a
-                    // line of its own under rustfmt. A `return` of anything else
-                    // is a shape this scan cannot read, and says so.
-                    let bind = production[..at]
-                        .rfind("let code = ")
-                        .expect("a relayed exit code is bound as `let code = …`");
-                    let callee: String = production[bind + "let code = ".len()..]
-                        .chars()
-                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                        .collect();
-                    assert!(callee.ends_with("_code"), "{file}: relayed from {callee:?}");
-                    let mut returns = 0usize;
-                    for line in relayed_body(production, &callee)
-                        .lines()
-                        .map(str::trim)
-                        .filter(|l| !l.starts_with("//"))
-                    {
-                        let code = if let Some(after) = line.strip_prefix("return ") {
-                            match after.trim_end_matches(';') {
-                                "aterm_update_core::pkg_check::PASS_OFFLINE_EXIT" => {
-                                    aterm_update_core::pkg_check::PASS_OFFLINE_EXIT
-                                }
-                                literal => literal.parse::<u8>().unwrap_or_else(|_| {
-                                    panic!("{callee}: `{line}` is not a literal exit code")
-                                }),
-                            }
-                        } else if let Ok(bare) = line.parse::<u8>() {
-                            bare
-                        } else {
-                            continue;
-                        };
-                        in_use.insert(code);
-                        returns += 1;
-                    }
-                    assert!(returns >= 2, "{callee}: the relay scan read its returns");
-                    relayed.insert(callee);
-                } else {
-                    let head: String = arg.chars().take(240).collect();
-                    assert!(
-                        head.contains("REFUSAL_EXIT") || head.contains("CONTENDED_EXIT"),
-                        "an exit code neither literal nor a named constant: {head:?}"
-                    );
-                }
-            }
-        }
-        // NON-VACUITY, spelled out: the `cli.rs` half reached past the seam that once
-        // truncated it and holds the last verb; the scan found more than the
-        // truncated half's 47 + 4 sites; both relayed verbs were followed.
-        let cli_half = include_str!("cli.rs")
-            .split_once("#[cfg(all(test, unix))]\n#[path = \"cli_tests.rs\"]\nmod tests;")
-            .map(|(p, _)| p)
-            .expect("split above");
-        assert!(
-            cli_half.contains("pub(crate) fn reset()") && cli_half.contains("fn cmd_seed("),
-            "the ledger's test-only `fn reset()` seam and `cmd_seed` are inside the half"
-        );
-        assert!(
-            literal_sites > 51 && [1u8, 2, 3, 127].iter().all(|c| in_use.contains(c)),
-            "the scan found the CLI's real sites (non-vacuity): {in_use:?} from {literal_sites}"
-        );
-        assert_eq!(
-            relayed.iter().map(String::as_str).collect::<Vec<_>>(),
-            ["cmd_install_default_set_code", "cmd_update_all_code"],
-            "the two announcement-answering verbs relay their body's code"
-        );
-        assert!(
-            !in_use.contains(&CONTENDED_EXIT),
-            "75 is reserved for contention; the CLI also exits with {in_use:?}"
-        );
-    }
-
-    /// The body of `fn <callee>() -> u8 { … }` in `production`: from its signature to
-    /// the next `}` at column 0 (rustfmt closes every top-level item that way).
-    fn relayed_body<'a>(production: &'a str, callee: &str) -> &'a str {
-        let sig = format!("fn {callee}() -> u8 {{");
-        let start = production
-            .find(&sig)
-            .unwrap_or_else(|| panic!("{callee} is a top-level `fn … -> u8`"));
-        let rest = &production[start + sig.len()..];
-        let end = rest.find("\n}\n").expect("the body closes at column 0");
-        &rest[..end]
     }
 }

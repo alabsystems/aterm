@@ -408,7 +408,7 @@ pub const PRIVATE_SUBDIRS: &[&str] = &[
 /// ([`NetworkCapability::None`](crate::NetworkCapability::None), i.e.
 /// `Containment`): the profile [`profile_for_home`] builds for the current
 /// `$HOME` and the set's filesystem capability. Every other set (network
-/// `Full`: `Safety`/`User`/`Master`) returns `None`, meaning no `sandbox-exec`
+/// `Full`: `Safety`/`User`) returns `None`, meaning no `sandbox-exec`
 /// wrap, so the default spawn is unchanged.
 ///
 /// `$HOME` and `$TMPDIR` ([`std::env::temp_dir`]) are read here, in the
@@ -432,7 +432,7 @@ pub(crate) fn profile_for_scoped(caps: Capabilities, home: Option<&str>) -> Opti
         // and credential denies. Containment is `None ∧ TmpOnly`, so the full
         // set applies.
         NetworkCapability::None => Some(profile_scoped(home, Some(&std::env::temp_dir()), caps.fs)),
-        // Safety / User / Master (Full): no OS network sandbox. Spawn unchanged.
+        // Safety / User (Full): no OS network sandbox. Spawn unchanged.
         NetworkCapability::Full => None,
     }
 }
@@ -979,11 +979,7 @@ mod tests {
     fn broader_fs_tiers_get_no_write_confinement() {
         let home = aterm_tempfile::tempdir().unwrap();
         let canon_home = std::fs::canonicalize(home.path()).unwrap();
-        for fs in [
-            FsCapability::ProjectReadWrite,
-            FsCapability::HomeReadWrite,
-            FsCapability::Full,
-        ] {
+        for fs in [FsCapability::ProjectReadWrite, FsCapability::HomeReadWrite] {
             let profile = profile_for_home(canon_home.to_str(), None, fs);
             assert!(
                 !profile.contains("(allow file-write*") && !profile.contains("(deny file-write*)"),
@@ -1321,33 +1317,19 @@ mod tests {
     }
 
     #[test]
-    fn containment_caps_yield_a_network_plus_secret_profile() {
-        // profile_for reads the real $HOME. Whatever it resolves to, the result for
-        // Containment must be Some and must at least contain the base profile.
-        let caps = ContainmentPolicy::capabilities(ContainmentMode::Containment);
-        assert_eq!(caps.network, NetworkCapability::None, "precondition");
-        assert_eq!(
-            caps.fs,
-            FsCapability::TmpOnly,
-            "precondition (hostile FS tier)"
-        );
-        let profile = profile_for(&caps).expect("Containment must yield a profile");
-        assert!(
-            profile.starts_with(BASE_PROFILE),
-            "Containment profile must begin with the base profile; got {profile}"
-        );
-    }
-
-    #[test]
     fn private_data_is_gated_on_the_fs_capability_not_network() {
         // The private-data deny is keyed on `fs == TmpOnly`, not on
         // `network == None`: a hypothetical set with network denied and a
         // broader FS tier gets the credential deny only. Needs a resolvable
-        // $HOME with a private dir; skipped otherwise.
-        let Some(home) = home_dir() else { return };
-        let Ok(canon) = std::fs::canonicalize(&home) else {
-            return;
-        };
+        // $HOME: COULD NOT RUN otherwise, never a pass.
+        let home = home_dir().unwrap_or_else(|| {
+            aterm_spec::host::could_not_run("no HOME: no private-data gate check")
+        });
+        let canon = std::fs::canonicalize(&home).unwrap_or_else(|e| {
+            aterm_spec::host::could_not_run(format!(
+                "HOME {home} does not resolve ({e}): no private-data gate check"
+            ))
+        });
         // A representative private path that must never appear unless fs == TmpOnly.
         let private_marker = format!("(subpath \"{}\")", sbpl_str(&canon.join("Documents")));
         // A representative secret path that must always appear when network == None.
@@ -1382,12 +1364,8 @@ mod tests {
 
     #[test]
     fn non_containment_modes_get_no_sandbox() {
-        // User, Master and Safety have full network and are never sandboxed.
-        for mode in [
-            ContainmentMode::User,
-            ContainmentMode::Master,
-            ContainmentMode::Safety,
-        ] {
+        // User and Safety have full network and are never sandboxed.
+        for mode in [ContainmentMode::User, ContainmentMode::Safety] {
             let caps = ContainmentPolicy::capabilities(mode);
             assert_eq!(
                 profile_for(&caps),

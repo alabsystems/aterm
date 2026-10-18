@@ -266,7 +266,7 @@ pub fn main(verb: &str, cmd: &PersonCmd, cfg: &Config) -> ExitCode {
     let caps = cmd.cap_files.join(" ");
     let done = match &cmd.act {
         Act::Halt(reason) => halt(cfg, cmd, &person, reason.as_deref()),
-        Act::Inbox { peek } => inbox(cfg, cmd, &person, *peek),
+        Act::Inbox { peek } => inbox(cfg, cmd, &person, *peek, &mut io::stdout()),
         Act::Post {
             sid,
             node,
@@ -283,6 +283,11 @@ pub fn main(verb: &str, cmd: &PersonCmd, cfg: &Config) -> ExitCode {
     };
     match done {
         Ok(()) => ExitCode::SUCCESS,
+        // This side's stdout, not the broker: said without the broker's name.
+        Err(e) if e.get_ref().is_some_and(|inner| inner.is::<Unprinted>()) => {
+            eprintln!("aterm fabric {verb}: {e}");
+            ExitCode::FAILURE
+        }
         Err(e) => {
             if astream_broker::broker_refusal(&e)
                 .is_some_and(astream_broker::BrokerRefusal::is_permanent)
@@ -303,6 +308,28 @@ pub fn main(verb: &str, cmd: &PersonCmd, cfg: &Config) -> ExitCode {
         }
     }
 }
+
+/// An inbox whose mail stdout refused (the reader went away, a full disk): nothing is marked
+/// read, because the mail it could not print was not read. `peek`: a `--peek`, which marks
+/// nothing anyway, so the line does not say so.
+#[derive(Debug)]
+struct Unprinted {
+    error: io::Error,
+    peek: bool,
+}
+
+impl std::fmt::Display for Unprinted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the inbox could not be printed ({})", self.error)?;
+        if self.peek {
+            Ok(())
+        } else {
+            f.write_str(", so nothing was marked read")
+        }
+    }
+}
+
+impl std::error::Error for Unprinted {}
 
 /// The ONE person the cap files bind writes to, on `fleet`: the principal of
 /// every read-write grant whose principal is a person ([`is_person_id`]). A
@@ -456,7 +483,15 @@ fn post(
 ///   re-scan the whole bus since the person's last message, every run.
 ///   `--peek` commits nothing. A new commit connection must identify exactly
 ///   the log, including its generation, on which the snapshot was read.
-fn inbox(cfg: &Config, cmd: &PersonCmd, person: &str, peek: bool) -> io::Result<()> {
+/// * WHEN IT MARKS NOTHING: mail `out` refused ([`Unprinted`]) was not read,
+///   whether its reader went away (`| head -1`) or the disk filled.
+fn inbox(
+    cfg: &Config,
+    cmd: &PersonCmd,
+    person: &str,
+    peek: bool,
+    out: &mut dyn io::Write,
+) -> io::Result<()> {
     let group = format!("/f/{}/cur/p/{person}/inbox", cfg.fleet);
     let filter = format!("/f/{}/in/p/{person}/>", cfg.fleet);
     let (mut conn, closer) = connect(cfg, cmd)?;
@@ -531,15 +566,20 @@ fn inbox(cfg: &Config, cmd: &PersonCmd, person: &str, peek: bool) -> io::Result<
                 }
                 line.push_str("  text=");
                 line.push_str(&safe(&t.text, TEXT_CAP));
-                println!("{line}");
+                line.push('\n');
                 // The reply, spelled out, for the kinds that wait for one.
                 if matches!(t.kind.as_str(), "ask" | "task") && t.from.contains('@') {
-                    println!(
+                    line.push_str(&format!(
                         "    answer: aterm fabric post --cap-file {cap} to=@{} kind=answer \
-                         re={off} <text>",
+                         re={off} <text>\n",
                         t.from
-                    );
+                    ));
                 }
+                // Read before it is marked read: a reader that went away (`| head -1`) has
+                // not read the rest, so this ends the inbox with nothing committed.
+                out.write_all(line.as_bytes())
+                    .and_then(|()| out.flush())
+                    .map_err(|error| io::Error::new(error.kind(), Unprinted { error, peek }))?;
                 count += 1;
             }
         }
@@ -756,6 +796,7 @@ mod tests {
             token: None,
             presence: crate::presence::Mode::default(),
             receipts: true,
+            log: crate::mirror::LogMode::Off,
         }
     }
 
@@ -858,6 +899,7 @@ mod tests {
                 next,
                 head,
                 resume: String::new(),
+                durable: None,
             };
             for log in logs {
                 let (state, changed) = &*accepting;
@@ -888,6 +930,7 @@ mod tests {
                         Some(Request::Hello) => vec![Response::Nonce {
                             nonce: vec![0; 32],
                             log,
+                            ext: astream_broker::NonceExt::default(),
                         }],
                         Some(Request::IdleMarks) => vec![mark(end, end)],
                         Some(Request::Fetch { max: 0, .. }) => vec![mark(0, end)],
@@ -948,11 +991,65 @@ mod tests {
             act: Act::Inbox { peek: false },
             cap_files: Vec::new(),
         };
-        inbox(&cfg, &cmd, "h-x", false)
+        let mut out = Vec::new();
+        inbox(&cfg, &cmd, "h-x", false, &mut out)
             .expect("a delivery at the captured head completes the snapshot without another mark");
         assert_eq!(
             *commits.lock().unwrap(),
             [("/f/f/cur/p/h-x/inbox".to_string(), 9)]
+        );
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.starts_with("@7  ") && out.ends_with("  text=mail\n"),
+            "{out}"
+        );
+        assert_eq!(
+            out.lines().count(),
+            1,
+            "only the mail below the head: {out}"
+        );
+    }
+
+    /// Mail stdout refused was not read: a reader that went away (`aterm fabric inbox |
+    /// head -1`) ends the inbox with [`Unprinted`] and nothing committed. std's `println!`
+    /// panicked there; a printer that dropped the line would have marked it read.
+    #[cfg(unix)]
+    #[test]
+    fn an_inbox_whose_reader_went_away_marks_nothing_read() {
+        struct Gone;
+        impl io::Write for Gone {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let (_server, cfg, commits) = scripted_inbox(
+            10,
+            std::time::Duration::ZERO,
+            vec![astream_broker::Response::Delivery {
+                offset: 7,
+                subject: "/f/f/in/p/h-x/n-peer/note".into(),
+                body: b"v=1 t=1 text=mail".to_vec(),
+            }],
+            vec![Some(log_identity(1, 0)); 2],
+            true,
+        );
+        let cmd = PersonCmd {
+            act: Act::Inbox { peek: false },
+            cap_files: Vec::new(),
+        };
+        let e = inbox(&cfg, &cmd, "h-x", false, &mut Gone)
+            .expect_err("mail nobody read is not an inbox read");
+        assert!(
+            e.get_ref().is_some_and(|inner| inner.is::<Unprinted>()),
+            "{e}"
+        );
+        assert!(e.to_string().contains("nothing was marked read"), "{e}");
+        assert!(
+            commits.lock().unwrap().is_empty(),
+            "mail the reader never had was marked read"
         );
     }
 
@@ -966,6 +1063,7 @@ mod tests {
                 next: 14,
                 head: 14,
                 resume: String::new(),
+                durable: None,
             }],
             2,
         );
@@ -973,7 +1071,7 @@ mod tests {
             act: Act::Inbox { peek: false },
             cap_files: Vec::new(),
         };
-        inbox(&cfg, &cmd, "h-x", false).unwrap();
+        inbox(&cfg, &cmd, "h-x", false, &mut Vec::new()).unwrap();
         assert_eq!(
             *commits.lock().unwrap(),
             [("/f/f/cur/p/h-x/inbox".to_string(), 9)],
@@ -992,6 +1090,7 @@ mod tests {
                     next: 10,
                     head: 10,
                     resume: String::new(),
+                    durable: None,
                 }],
                 vec![Some(log_identity(1, 0)), Some(replacement)],
                 false,
@@ -1001,7 +1100,7 @@ mod tests {
                 cap_files: Vec::new(),
             };
             assert!(
-                inbox(&cfg, &cmd, "h-x", false).is_err(),
+                inbox(&cfg, &cmd, "h-x", false, &mut Vec::new()).is_err(),
                 "a replacement log accepted the old snapshot cursor"
             );
             assert!(
@@ -1025,6 +1124,7 @@ mod tests {
                     next: 10,
                     head: 10,
                     resume: String::new(),
+                    durable: None,
                 }],
                 logs,
                 false,
@@ -1034,7 +1134,7 @@ mod tests {
                 cap_files: Vec::new(),
             };
             assert!(
-                inbox(&cfg, &cmd, "h-x", false).is_err(),
+                inbox(&cfg, &cmd, "h-x", false, &mut Vec::new()).is_err(),
                 "unknown log identity was treated as equal"
             );
             assert!(commits.lock().unwrap().is_empty());
@@ -1063,6 +1163,7 @@ mod tests {
                     next: 4,
                     head: 10,
                     resume: String::new(),
+                    durable: None,
                 },
                 Response::Delivery {
                     offset: 7,
@@ -1073,6 +1174,7 @@ mod tests {
                     next: 10,
                     head: 10,
                     resume: String::new(),
+                    durable: None,
                 },
             ],
             2,
@@ -1081,7 +1183,7 @@ mod tests {
             act: Act::Inbox { peek: false },
             cap_files: Vec::new(),
         };
-        inbox(&cfg, &cmd, "h-x", false).expect("the inbox reads to its end");
+        inbox(&cfg, &cmd, "h-x", false, &mut Vec::new()).expect("the inbox reads to its end");
         assert_eq!(
             *commits.lock().unwrap(),
             [("/f/f/cur/p/h-x/inbox".to_string(), 9)],
@@ -1102,6 +1204,7 @@ mod tests {
                 next: 10,
                 head: 10,
                 resume: String::new(),
+                durable: None,
             }]
         };
         let cmd = PersonCmd {
@@ -1109,13 +1212,13 @@ mod tests {
             cap_files: Vec::new(),
         };
         let (_dir, cfg, commits) = stand_in(10, std::time::Duration::ZERO, end(), 2);
-        inbox(&cfg, &cmd, "h-x", false).expect("an inbox with no mail");
+        inbox(&cfg, &cmd, "h-x", false, &mut Vec::new()).expect("an inbox with no mail");
         assert_eq!(
             *commits.lock().unwrap(),
             [("/f/f/cur/p/h-x/inbox".to_string(), 9)]
         );
         let (_dir, cfg, commits) = stand_in(10, std::time::Duration::ZERO, end(), 1);
-        inbox(&cfg, &cmd, "h-x", true).expect("a peek with no mail");
+        inbox(&cfg, &cmd, "h-x", true, &mut Vec::new()).expect("a peek with no mail");
         assert!(commits.lock().unwrap().is_empty(), "--peek committed");
     }
 

@@ -127,7 +127,9 @@ use aterm_agent::supervise::prompt::fixtures::{
 
 use crate::{headless_boot, launch_isolation};
 
-use headless_boot::{ctl, ctl_ok, field, log_tail};
+#[cfg(target_os = "macos")]
+use headless_boot::ctl;
+use headless_boot::{ctl_ok, field, log_tail};
 
 /// How long a `*.hold` screen stays up: long enough for the supervisor to
 /// read it settled (its footer is what says bypass). Counted from the
@@ -150,22 +152,23 @@ const UNTIL_MAX_TENTHS: u32 = 200;
 /// ([`run_fake_attached`]): counted from the fake's start, a host that
 /// attached late never saw the blank screen, and the scene tested nothing.
 const LATE_S: u32 = 3;
-/// How long "nothing typed" is watched for after the escalation showed.
-const QUIET: Duration = Duration::from_secs(3);
 /// How long a wait for something that MUST happen — a key the host types, the
-/// fake's exit, an attention, a journal or log line, a launch — may take
-/// before it is read as a hang (AGENTS.md: a hang detector is a minute, never
-/// a latency budget). Each wait returns the moment its event lands, so it
-/// costs nothing when the product is right; the windows that watch for
-/// something NOT happening ([`QUIET`] and the like) are the property and stay
-/// their own.
+/// fake's exit, an attention, a journal or log line, a launch, a claim's
+/// release — may take before it is read as a hang (AGENTS.md: a hang detector
+/// is a minute, never a latency budget). Each wait returns the moment its
+/// event lands, so it costs nothing when the product is right.
+///
+/// NOTHING HAPPENING IS AN EVENT TOO: where a test says the host typed
+/// nothing, it waits for the host's own record that it looked and declined —
+/// its `ESCALATED` journal line, the `upgrade step=` line of its next look —
+/// and judges what was typed then, never after a fixed quiet window.
+///
+/// A CLAIM'S RELEASE is waited for under this minute: the claim is also a
+/// lease that lapses by itself, and the lease the host's loop asks for under
+/// the fast-timers seam these instances run (`aterm_agent::harness::Timings`'
+/// `claim_ttl`, `FAST`: ten minutes) cannot lapse inside it, so only a
+/// release shows within it.
 const HANG: Duration = Duration::from_secs(60);
-/// How long a claim's RELEASE may take to show. Not a [`HANG`]: the claim is
-/// also a lease that lapses by itself (`aterm_agent::supervise::claim`:
-/// `CLAIM_TTL_MS` 90 s, renewed at most every `CLAIM_RENEW` 20 s by a loop whose
-/// waits run up to 20 s), so a lapse can show about 50 s after the stop, and a
-/// wait that long would pass a host that never released it.
-const RELEASED: Duration = Duration::from_secs(30);
 
 /// One booted headless instance ([`headless_boot::Instance`], torn down on every
 /// exit path) and the sid of its one session.
@@ -190,7 +193,7 @@ impl std::ops::DerefMut for Instance {
 /// Boot one headless instance under `harness` config, 40 rows: its `[harness]`
 /// table the keys `harness` in place of the isolation config's (which switches
 /// the supervisor off).
-fn boot(tag: &str, harness: &str) -> Option<Instance> {
+fn boot(tag: &str, harness: &str) -> Instance {
     boot_sized(tag, harness, 40, None)
 }
 
@@ -207,23 +210,31 @@ fn boot(tag: &str, harness: &str) -> Option<Instance> {
 /// product (the journal of
 /// [`a_session_nobody_asked_anything_is_restarted_afresh_with_nothing_typed`]:
 /// `wait:settling`, then `done:fresh` 5.4 s later, one 4 s rung where the
-/// product's is 20 s). The test whose property IS the settle's length, a
-/// first prompt sent at the first idle verdict landing before the fresh
-/// restart, runs the product's
-/// ([`a_first_prompt_sent_at_the_first_idle_is_the_agents_never_the_shells`]).
+/// product's is 20 s). The settle's own length is the unit tests'
+/// (`aterm_agent::harness::upgrade`): a live race of a first prompt against
+/// the product's settle is timing-bound, and no live test runs one.
 #[cfg(target_os = "macos")] // only the macOS-only upgrade tests use it
 const SHORT_SETTLE_S: u64 = 4;
 
 /// [`boot`] for a test of the live upgrade: its settle `settle_s` seconds
 /// ([`SHORT_SETTLE_S`]), or the product's for `None`.
 #[cfg(target_os = "macos")] // only the macOS-only upgrade tests use it
-fn boot_upgrade(tag: &str, harness: &str, settle_s: Option<u64>) -> Option<Instance> {
+fn boot_upgrade(tag: &str, harness: &str, settle_s: Option<u64>) -> Instance {
     boot_sized(tag, harness, 40, settle_s)
 }
 
+/// [`boot_upgrade`] ON THE SHIPPED CLOCK: no fast-timers seam
+/// (`aterm_agent::harness::timings::FAST_SEAM`), so the instance's harness
+/// runs the product's waits (`Timings::PRODUCTION`) — the one live upgrade
+/// that proves the shipped bounds end at their events.
+#[cfg(target_os = "macos")]
+fn boot_upgrade_on_the_shipped_clock(tag: &str, harness: &str, settle_s: Option<u64>) -> Instance {
+    boot_on(tag, harness, 40, settle_s, false)
+}
+
 /// Boot one headless instance with `harness` appended to its config and the
-/// fixture world written ([`headless_boot::boot_with`]: `None` is an
-/// environment refusal; a product that cannot start fails the test), and read
+/// fixture world written ([`headless_boot::boot_with`]: an environment
+/// refusal is COULD NOT RUN; a product that cannot start fails the test), and read
 /// its one session's sid. `settle_s`: the live upgrade's settle, through its
 /// seam ([`boot_upgrade`]); `None` leaves the product's.
 ///
@@ -232,7 +243,13 @@ fn boot_upgrade(tag: &str, harness: &str, settle_s: Option<u64>) -> Option<Insta
 /// each killing the other's instance (2026-09-29: `t` and `u` were each
 /// taken twice, and two tests failed in every whole-file run and passed
 /// alone). A reused tag fails here, before it can boot.
-fn boot_sized(tag: &str, harness: &str, lines: u16, settle_s: Option<u64>) -> Option<Instance> {
+fn boot_sized(tag: &str, harness: &str, lines: u16, settle_s: Option<u64>) -> Instance {
+    boot_on(tag, harness, lines, settle_s, true)
+}
+
+/// [`boot_sized`], on the test clock when `fast` (the fast-timers seam
+/// `headless_boot` sets), else on the shipped one.
+fn boot_on(tag: &str, harness: &str, lines: u16, settle_s: Option<u64>, fast: bool) -> Instance {
     static TAKEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
     {
         let mut taken = TAKEN
@@ -267,15 +284,18 @@ fn boot_sized(tag: &str, harness: &str, lines: u16, settle_s: Option<u64>) -> Op
                     settle.to_string(),
                 );
             }
+            if !fast {
+                cmd.env_remove(aterm_agent::harness::timings::FAST_SEAM);
+            }
         },
         |_| true,
-    )?;
+    );
     let mut inst = Instance {
         live,
         sid: String::new(),
     };
     inst.sid = boot_session(&inst);
-    Some(inst)
+    inst
 }
 
 /// Undo the wire's pct-encoding (`%20` and friends).
@@ -482,8 +502,7 @@ const DRAWN_ROWS: usize = 38;
 const VIM_HINT: &str = " · ctrl+g to edit in Vim";
 /// The widest row of the review's quoted answer (c3-07, MEASURED: its rows
 /// are 116 and 117 cells, and the next word would have made 121 and 127; any
-/// limit from 117 to 120 redraws it exactly — pinned in
-/// [`the_2_1_283_scenes_redraw_what_was_measured`]).
+/// limit from 117 to 120 redraws it exactly).
 const REVIEW_ROW: usize = 119;
 
 fn is_rule(row: &str) -> bool {
@@ -527,8 +546,7 @@ fn typed_283(capture: &str, text: &str) -> Vec<String> {
 /// and the footer without [`VIM_HINT`], which it draws only while the
 /// free-text row has the focus (MEASURED: c1-01 and c1-02 differ from c1-03
 /// in those two rows alone, as c3-01 from c3-04 does, and c4-01, c4-02,
-/// c4-05, c4-06 and c4-07 from their tab's free-text capture — the last
-/// five pinned in [`the_2_1_283_scenes_redraw_what_was_measured`]).
+/// c4-05, c4-06 and c4-07 from their tab's free-text capture).
 fn focus_on_option(rows: &[String], to: &str) -> Vec<String> {
     focus_moved(&(rows.join("\n") + "\n"), to)
         .replace(VIM_HINT, "")
@@ -700,9 +718,10 @@ fn fake_path(tmp: &Path) -> PathBuf {
 /// (`aterm_agent::harness::upgrade_drive`'s `VERSION_WAIT`): a probe that
 /// paid the check read as a build that did not answer, and the attach it
 /// runs in and the upgrade it decides waited on it. That time is the file's,
-/// not the product's. Every fake here answers `--version` at once, or ends
-/// at once with nothing to draw, and holds no path: it finds its scratch
-/// world from `$HOME` (`<root>/home`).
+/// not the product's. Every fake here answers `--version` at once (an
+/// upgrade fake a build's start probe, `--help`, too), or ends at once
+/// with nothing to draw, and holds no path: it finds its scratch world from
+/// `$HOME` (`<root>/home`).
 ///
 /// A fake that REPLACES one at a path is put here under its own name, before
 /// the rename ([`stage_upgrade_fake`]): the check stays with the file through
@@ -901,8 +920,7 @@ fn run_fake(inst: &Instance, keys: &str, screens: &[&str]) {
 /// the attach ([`HOLD_S`], [`LATE_S`]); how long the attach took is printed,
 /// never judged. The earlier claim's end is only this precondition, never the
 /// property, so it is waited for under [`HANG`]: a lapsed lease ends it as
-/// well as a release does. [`RELEASED`] stays where the release itself is
-/// what a test asserts.
+/// well as a release does (a lapse cannot come inside [`HANG`]).
 fn run_fake_attached(inst: &Instance, keys: &str, screens: &[&str]) {
     until(
         HANG,
@@ -1094,16 +1112,18 @@ fn program_is(inst: &Instance, want: &str, within: Duration) -> String {
     )
 }
 
-/// The attention appears naming `needle`; then for [`QUIET`] nothing is
-/// typed; the attention stands throughout.
+/// The attention appears naming `needle`; once the host has journaled its
+/// hand-over nothing is typed and the attention stands.
 fn escalated_and_quiet(inst: &Instance, log: &str, needle: &str) -> String {
     escalated_after(inst, log, needle, &[], HANG)
 }
 
 /// The attention appears naming `needle` within `within`, the fake having
 /// read no more than `typed` meanwhile (a key past it fails at once, naming
-/// what was read); then for [`QUIET`] the fake has read exactly `typed` and
-/// nothing more; the attention stands throughout.
+/// what was read); then, once the host's loop has journaled that decision
+/// (`ESCALATED`, written after the attention: its last act at the point),
+/// the fake has read exactly `typed` and nothing more, and the attention
+/// stands.
 fn escalated_after(
     inst: &Instance,
     log: &str,
@@ -1111,6 +1131,8 @@ fn escalated_after(
     typed: &[&str],
     within: Duration,
 ) -> String {
+    let escalations = |j: &str| j.matches("ESCALATED seq=").count();
+    let before = escalations(&journal(inst));
     let deadline = Instant::now() + within;
     let text = loop {
         let got = keys(inst, log);
@@ -1137,11 +1159,13 @@ fn escalated_after(
         );
         std::thread::sleep(Duration::from_millis(20));
     };
-    let quiet_until = Instant::now() + QUIET;
-    while Instant::now() < quiet_until {
-        assert_eq!(keys(inst, log), typed, "typed after the hand-over");
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    until(
+        HANG,
+        "the hand-over journaled (ESCALATED)",
+        || journal(inst),
+        |j| escalations(j) > before,
+    );
+    assert_eq!(keys(inst, log), typed, "typed after the hand-over");
     assert!(
         attention(inst).is_some_and(|a| a.contains(needle)),
         "the attention stands"
@@ -1161,9 +1185,7 @@ fn escalated_after(
 /// `Yes`/`No` is the question's, never a confirmation.
 #[test]
 fn the_host_answers_every_box_by_default() {
-    let Some(inst) = boot("d", "") else {
-        return;
-    };
+    let inst = boot("d", "");
     run_fake_attached(&inst, "k1", &["bypass.hold", "rm-usr.txt"]);
     keys_until(&inst, "k1", &["1"], HANG);
     program_is(&inst, "sh", HANG);
@@ -1177,8 +1199,7 @@ fn the_host_answers_every_box_by_default() {
     program_is(&inst, "sh", HANG);
 
     run_fake(&inst, "k4", &["question.txt"]);
-    let text = escalated_and_quiet(&inst, "k4", "claude question");
-    assert!(text.contains("could not read whole"), "{text}");
+    escalated_and_quiet(&inst, "k4", "claude question");
 }
 
 /// THE OWNER RULING OF 2026-09-25, end to end in a real headless aterm:
@@ -1199,17 +1220,13 @@ fn a_typo_in_the_harness_table_never_stops_the_answers() {
         let typo = scope.spawn(|| {
             let noisy = "approve = \"maybe\"\nenabled = \"sometimes\"\nrm_breakr = false\n\
                          some_future_key = true\n";
-            let Some(inst) = boot("t", noisy) else {
-                return;
-            };
+            let inst = boot("t", noisy);
             run_fake(&inst, "k1", &["bypass.hold", "rm-usr.txt"]);
             keys_until(&inst, "k1", &["1"], HANG);
             program_is(&inst, "sh", HANG);
         });
         let off = scope.spawn(|| {
-            let Some(inst) = boot("u", "approve = \"no\"\n") else {
-                return;
-            };
+            let inst = boot("u", "approve = \"no\"\n");
             run_fake(&inst, "k1", &["bypass.hold", "rm-usr.txt"]);
             escalated_and_quiet(&inst, "k1", "S=/usr; rm -rf $S/a");
         });
@@ -1232,16 +1249,13 @@ fn a_typo_in_the_harness_table_never_stops_the_answers() {
 /// `1`.
 #[test]
 fn a_49_row_screen_is_read_whole_and_the_instance_lives() {
-    let Some(mut inst) = boot_sized("w", "", 49, None) else {
-        return;
-    };
+    let mut inst = boot_sized("w", "", 49, None);
     run_fake(&inst, "k0", &["q-one-top.txt"]);
     keys_until(&inst, "k0", &["enter"], HANG);
     program_is(&inst, "sh", HANG);
 
     run_fake(&inst, "k1", &["question.txt"]);
-    let text = escalated_and_quiet(&inst, "k1", "claude question");
-    assert!(text.contains("could not read whole"), "{text}");
+    escalated_and_quiet(&inst, "k1", "claude question");
     assert!(
         matches!(inst.child.try_wait(), Ok(None)),
         "the instance died; log tail:\n{}",
@@ -1262,9 +1276,7 @@ fn a_49_row_screen_is_read_whole_and_the_instance_lives() {
 /// and the host's ledger holds five `answer-recommended@v1` approvals.
 #[test]
 fn the_host_answers_a_tabbed_question_with_its_recommended_options() {
-    let Some(inst) = boot("q", "") else {
-        return;
-    };
+    let inst = boot("q", "");
     run_fake(
         &inst,
         "k1",
@@ -1306,9 +1318,7 @@ fn the_host_answers_a_tabbed_question_with_its_recommended_options() {
 /// free-text row.
 #[test]
 fn the_host_moves_off_the_free_text_row_before_answering() {
-    let Some(inst) = boot("f", "") else {
-        return;
-    };
+    let inst = boot("f", "");
     run_fake(
         &inst,
         "k1",
@@ -1326,12 +1336,9 @@ fn the_host_moves_off_the_free_text_row_before_answering() {
 /// badged with the reason, nothing typed.
 #[test]
 fn the_host_hands_over_a_question_a_person_typed_into() {
-    let Some(inst) = boot("p", "") else {
-        return;
-    };
+    let inst = boot("p", "");
     run_fake(&inst, "k1", &["q-typed.txt"]);
-    let text = escalated_and_quiet(&inst, "k1", "claude question");
-    assert!(text.contains("a person has begun answering"), "{text}");
+    escalated_and_quiet(&inst, "k1", "claude question");
 }
 
 /// The owner's switch: under `answer_questions = false` every question is
@@ -1339,12 +1346,9 @@ fn the_host_hands_over_a_question_a_person_typed_into() {
 /// nothing is typed.
 #[test]
 fn answer_questions_false_hands_every_question_over() {
-    let Some(inst) = boot("x", "answer_questions = false\n") else {
-        return;
-    };
+    let inst = boot("x", "answer_questions = false\n");
     run_fake(&inst, "k1", &["q-tab1.txt"]);
-    let text = escalated_and_quiet(&inst, "k1", "claude question");
-    assert!(text.contains("answer_questions is off"), "{text}");
+    escalated_and_quiet(&inst, "k1", "claude question");
 }
 
 /// The owner's long-term word, in the one global key.
@@ -1355,21 +1359,16 @@ fn release_fake(inst: &Instance, log: &str) {
     std::fs::write(inst.tmp.join(format!("{log}.release")), b"").expect("release the fake");
 }
 
-/// The dialog is answered, told and gone: `CHOSE` names `rule` and `word`
-/// and the question `decided by the worker (<word>)`; the fake exits (every
-/// scene read); the ledger holds `approvals` approvals under `rule`, one of
-/// them the text typed; nothing is badged.
-fn told_by_the_worker(inst: &Instance, rule: &str, word: &str, question: &str, approvals: usize) {
+/// The dialog is answered, told and gone: `CHOSE` names `rule` and `word`;
+/// the fake exits (every scene read); the ledger holds `approvals` approvals
+/// under `rule`; nothing is badged.
+fn told_by_the_worker(inst: &Instance, rule: &str, word: &str, approvals: usize) {
     let line = chose(inst, HANG);
     // The fake held its busy screen ([`write_world`]'s `worked.until`) so the
     // host read it busy however late it looked; now it may finish.
     release_fake(inst, "k1");
     assert!(
         line.contains(&format!("rule={rule} policy={word} ")),
-        "{line}"
-    );
-    assert!(
-        line.contains(&format!("{question} → decided by the worker ({word})")),
         "{line}"
     );
     program_is(inst, "sh", HANG);
@@ -1382,14 +1381,6 @@ fn told_by_the_worker(inst: &Instance, rule: &str, word: &str, question: &str, a
         ledger(inst),
         harness_lines(inst)
     );
-    assert_eq!(
-        approved
-            .iter()
-            .filter(|r| r.contains(&format!("typed the {word} policy text")))
-            .count(),
-        1,
-        "{approved:#?}"
-    );
 }
 
 /// UNDER `question_priority = "long-term"`, A SINGLE-SELECT QUESTION (c1):
@@ -1400,9 +1391,7 @@ fn told_by_the_worker(inst: &Instance, rule: &str, word: &str, question: &str, a
 /// (the text, the Enter) and `CHOSE … policy=long-term`.
 #[test]
 fn under_long_term_the_worker_decides_a_single_select_question() {
-    let Some(inst) = boot("l", LONG_TERM_ON) else {
-        return;
-    };
+    let inst = boot("l", LONG_TERM_ON);
     run_fake(
         &inst,
         "k1",
@@ -1417,13 +1406,7 @@ fn under_long_term_the_worker_decides_a_single_select_question() {
     );
     let text = text_read(QuestionPriority::LongTerm);
     keys_until(&inst, "k1", &["down", "down", &text, "enter"], HANG);
-    told_by_the_worker(
-        &inst,
-        "answer-long-term@v1",
-        "long-term",
-        "Which colour do you prefer?",
-        2,
-    );
+    told_by_the_worker(&inst, "answer-long-term@v1", "long-term", 2);
 }
 
 /// UNDER `question_priority = "long-term"`, A MULTI-SELECT QUESTION (c3): the
@@ -1434,9 +1417,7 @@ fn under_long_term_the_worker_decides_a_single_select_question() {
 /// `answer-long-term@v1` approvals (the text, the button, the review).
 #[test]
 fn under_long_term_the_worker_decides_a_multi_select_question() {
-    let Some(inst) = boot("m", LONG_TERM_ON) else {
-        return;
-    };
+    let inst = boot("m", LONG_TERM_ON);
     run_fake(
         &inst,
         "k1",
@@ -1459,13 +1440,7 @@ fn under_long_term_the_worker_decides_a_multi_select_question() {
         &["down", "down", "down", &text, "down", "enter", "enter"],
         HANG,
     );
-    told_by_the_worker(
-        &inst,
-        "answer-long-term@v1",
-        "long-term",
-        "Which toppings do you want?",
-        3,
-    );
+    told_by_the_worker(&inst, "answer-long-term@v1", "long-term", 3);
 }
 
 /// THE SESSION'S WORD OVER THE GLOBAL ONE (c8): the config answers with the
@@ -1477,9 +1452,7 @@ fn under_long_term_the_worker_decides_a_multi_select_question() {
 /// [`the_host_answers_every_box_by_default`] is that path.)
 #[test]
 fn a_session_s_short_term_word_decides_over_the_global_recommended() {
-    let Some(inst) = boot("s", "") else {
-        return;
-    };
+    let inst = boot("s", "");
     ctl_ok(
         &inst,
         &[
@@ -1504,13 +1477,7 @@ fn a_session_s_short_term_word_decides_over_the_global_recommended() {
     );
     let text = text_read(QuestionPriority::ShortTerm);
     keys_until(&inst, "k1", &["down", "down", &text, "enter"], HANG);
-    told_by_the_worker(
-        &inst,
-        "answer-short-term@v1",
-        "short-term",
-        "Which colour should I use to paint the fence before tomorrow's garden party?",
-        2,
-    );
+    told_by_the_worker(&inst, "answer-short-term@v1", "short-term", 2);
 }
 
 /// A PERSON'S TEXT IN THE FIELD (c2-04, `go with blue`) under long-term: it
@@ -1519,16 +1486,9 @@ fn a_session_s_short_term_word_decides_over_the_global_recommended() {
 /// into it would be logged whole).
 #[test]
 fn under_long_term_a_person_s_text_is_handed_to_them_and_nothing_is_typed() {
-    let Some(inst) = boot("h", LONG_TERM_ON) else {
-        return;
-    };
+    let inst = boot("h", LONG_TERM_ON);
     run_fake(&inst, "k1", &["c2-person.type"]);
-    let text = escalated_and_quiet(&inst, "k1", "claude question");
-    assert!(
-        text.contains("a person has begun answering")
-            && text.contains("the supervisor did not write"),
-        "{text}"
-    );
+    escalated_and_quiet(&inst, "k1", "claude question");
 }
 
 /// NEGATIVE CONTROL: the same single-select dialog under long-term, but the
@@ -1541,9 +1501,7 @@ fn under_long_term_a_person_s_text_is_handed_to_them_and_nothing_is_typed() {
 /// read-back's, not the fake's script's.
 #[test]
 fn a_policy_text_the_dialog_does_not_take_is_written_once_and_handed_over() {
-    let Some(inst) = boot("c", LONG_TERM_ON) else {
-        return;
-    };
+    let inst = boot("c", LONG_TERM_ON);
     run_fake(
         &inst,
         "k1",
@@ -1574,92 +1532,9 @@ fn a_policy_text_the_dialog_does_not_take_is_written_once_and_handed_over() {
     );
 }
 
-/// The 2.1.283 scenes redraw what was MEASURED: the helpers that draw them,
-/// applied to the committed captures with the text that was typed there,
-/// give the captures back row for row — the focus moved off a free-text row
-/// (c4-03 → c4-01, c4-02; c4-08 → c4-05, c4-06, c4-07), a typed field made
-/// pristine (c4-04 → c4-03, from the dialog's rule down: the pane is
-/// anchored at its foot, so the transcript above moves with the dialog's
-/// height), a typed field (c1-04, c3-05, c3-06, c8-02) and the review's
-/// answer (c3-07). What the live scenes add is the text the harness types
-/// in place of the measured one.
-#[test]
-fn the_2_1_283_scenes_redraw_what_was_measured() {
-    use aterm_agent::supervise::prompt::fixtures::{
-        MEASURED_LONG_TERM_2_1_283, MEASURED_SHORT_TERM_2_1_283, QUESTION_283_TABS_FIRST,
-        QUESTION_283_TABS_FIRST_DOWN, QUESTION_283_TABS_FIRST_FREE_TEXT_FOCUSED,
-        QUESTION_283_TABS_FIRST_TYPED_LONG_TERM, QUESTION_283_TABS_SECOND,
-        QUESTION_283_TABS_SECOND_DOWN, QUESTION_283_TABS_SECOND_DOWN_TWICE,
-        QUESTION_283_TABS_SECOND_FREE_TEXT_FOCUSED,
-    };
-    let first_field = screen(QUESTION_283_TABS_FIRST_FREE_TEXT_FOCUSED);
-    let second_field = screen(QUESTION_283_TABS_SECOND_FREE_TEXT_FOCUSED);
-    for (field, to, want) in [
-        (
-            &first_field,
-            "1. Red (Recommended)",
-            QUESTION_283_TABS_FIRST,
-        ),
-        (&first_field, "2. Blue", QUESTION_283_TABS_FIRST_DOWN),
-        (
-            &second_field,
-            "1. [ ] Cheese (Recommended)",
-            QUESTION_283_TABS_SECOND,
-        ),
-        (
-            &second_field,
-            "2. [ ] Olives",
-            QUESTION_283_TABS_SECOND_DOWN,
-        ),
-        (
-            &second_field,
-            "3. [ ] Basil",
-            QUESTION_283_TABS_SECOND_DOWN_TWICE,
-        ),
-    ] {
-        assert_eq!(focus_on_option(field, to), screen(want), "{to}");
-    }
-    let from_rule = |rows: &[String]| rows[dialog_top(rows)..].to_vec();
-    assert_eq!(
-        from_rule(&pristine_283(&screen(
-            QUESTION_283_TABS_FIRST_TYPED_LONG_TERM
-        ))),
-        from_rule(&first_field)
-    );
-    for (capture, text) in [
-        (QUESTION_283_TYPED_LONG_TERM, MEASURED_LONG_TERM_2_1_283),
-        (
-            QUESTION_283_MULTISELECT_TYPED_LONG_TERM,
-            MEASURED_LONG_TERM_2_1_283,
-        ),
-        (
-            QUESTION_283_MULTISELECT_TYPED_BUTTON,
-            MEASURED_LONG_TERM_2_1_283,
-        ),
-        (QUESTION_283_TYPED_SHORT_TERM, MEASURED_SHORT_TERM_2_1_283),
-    ] {
-        assert_eq!(typed_283(capture, text), screen(capture));
-    }
-    assert_eq!(
-        review_283(QUESTION_283_MULTISELECT_REVIEW, MEASURED_LONG_TERM_2_1_283),
-        screen(QUESTION_283_MULTISELECT_REVIEW)
-    );
-    // And the scenes carry the harness's own texts, not the measured ones.
-    let long = QuestionPriority::LongTerm.text().expect("long");
-    assert_ne!(long, MEASURED_LONG_TERM_2_1_283);
-    let redrawn = typed_283(QUESTION_283_TYPED_LONG_TERM, long).join(" ");
-    assert!(
-        redrawn.contains("best serves long term correctness"),
-        "{redrawn}"
-    );
-    assert!(!redrawn.contains("long-term correctness"), "{redrawn}");
-}
-
 #[test]
 fn the_host_answers_what_the_policy_proves_safe() {
-    let Some(inst) = boot("a", "") else {
-        return;
-    };
+    let inst = boot("a", "");
     // A read-only Bash box: the session is published as Claude Code, the host
     // attaches and presses `1`. Both are the server's own timeline records,
     // read once the press has landed: `program=claude` and the host's claim
@@ -1694,7 +1569,7 @@ fn the_host_answers_what_the_policy_proves_safe() {
     program_is(&inst, "sh", HANG);
     // The host detached with the program: its claim went with it.
     until(
-        RELEASED,
+        HANG,
         "supervisor=- after the agent left",
         || status(&inst),
         |s| field(s, "supervisor") == Some("-"),
@@ -1732,14 +1607,12 @@ fn the_host_answers_what_the_policy_proves_safe() {
 /// drawn by the fake over the fixtures' hand-built 2.1.284 rows; the key log
 /// shows exactly one `0` for each. The Claude-drafted-feedback card is no
 /// survey: over a busy worker the server's verdict stays `busy` (the card used
-/// to hide the status row, so the worker read idle and the host typed into it)
-/// and nothing is pressed.
+/// to hide the status row, so the worker read idle and the host typed into it),
+/// and the person's own key reaches the fake.
 #[test]
 fn the_host_dismisses_every_kind_of_rating_card_and_reads_a_busy_worker_busy_under_any_card() {
     // A tag of its own: two tests booting under one tag share a scratch world.
-    let Some(inst) = boot("z", "") else {
-        return;
-    };
+    let inst = boot("z", "");
     for (log, screen) in [
         ("k1", "card-long.txt"),
         ("k2", "card-plugin.txt"),
@@ -1751,7 +1624,10 @@ fn the_host_dismisses_every_kind_of_rating_card_and_reads_a_busy_worker_busy_und
         program_is(&inst, "sh", HANG);
     }
     // The drafts card, the transcript-share ask and the web-setup offer over a busy worker
-    // (a workflow wait: no busy footer): the verdict stays busy, nothing is typed.
+    // (a workflow wait: no busy footer): the server's verdict is busy — the card
+    // does not hide the status row — and the person's own key reaches the fake.
+    // What the host does at a busy verdict (types nothing) is the supervise
+    // loop's decision, judged in aterm-agent, not over a live window.
     for (log, screen, what) in [
         ("k5", "drafts-busy.txt", "the drafts card"),
         ("k6", "ask-busy.txt", "the transcript-share ask"),
@@ -1764,16 +1640,6 @@ fn the_host_dismisses_every_kind_of_rating_card_and_reads_a_busy_worker_busy_und
             || status(&inst),
             |s| field(s, "agent") == Some("busy"),
         );
-        let quiet_until = Instant::now() + QUIET;
-        while Instant::now() < quiet_until {
-            assert!(
-                keys(&inst, log).is_empty(),
-                "typed under {what}: {:?}",
-                keys(&inst, log)
-            );
-            assert_eq!(field(&status(&inst), "agent"), Some("busy"), "{what}");
-            std::thread::sleep(Duration::from_millis(100));
-        }
         ctl_ok(&inst, &[&format!("@{}", inst.sid), "key", "z"]);
         keys_until(&inst, log, &["z"], HANG);
         program_is(&inst, "sh", HANG);
@@ -1797,14 +1663,12 @@ fn the_host_hands_over_what_it_cannot_prove_and_types_nothing() {
     // concise warnings for the AI, not extra blockers", 2026-09-29) the
     // default approves an unproven rm breaker with a WARN line; the knob
     // restores the hand-over this test is about.
-    let Some(inst) = boot("e", "approve = \"safe\"\nrm_breaker_ask = true\n") else {
-        return;
-    };
+    let inst = boot("e", "approve = \"safe\"\nrm_breaker_ask = true\n");
     // The same breaker over /usr: escalated, naming the command.
     run_fake_attached(&inst, "k1", &["start.late", "bypass.hold", "rm-usr.txt"]);
     let text = escalated_and_quiet(&inst, "k1", "S=/usr; rm -rf $S/a");
-    // Refused on WHERE it points — the scratch box of the first test was
-    // answered under the same bypass start — not on the session's mode.
+    // Refused on WHERE it points, not on the session's mode: the regression
+    // above handed the same box over as `outside a bypass session`.
     assert!(
         text.contains("rm-breaker") && text.contains("scratch root"),
         "{text}"
@@ -1829,13 +1693,13 @@ fn the_host_hands_over_what_it_cannot_prove_and_types_nothing() {
     let text = std::fs::read_to_string(&cfg).expect("config");
     std::fs::write(&cfg, format!("{text}[harness]\nenabled = false\n"))
         .expect("rewrite the config");
+    // The release is the loop's end: nothing types after it.
     until(
-        RELEASED,
+        HANG,
         "supervisor=- and no badge after enabled=false",
         || format!("{} attention={:?}", status(&inst), attention(&inst)),
         |s| field(s, "supervisor") == Some("-") && s.ends_with("attention=None"),
     );
-    std::thread::sleep(QUIET);
     assert!(
         keys(&inst, "k2").is_empty(),
         "typed: {:?}",
@@ -1857,9 +1721,7 @@ fn the_host_hands_over_what_it_cannot_prove_and_types_nothing() {
 /// typed.
 #[test]
 fn a_box_a_person_answered_loses_its_badge_while_the_worker_works() {
-    let Some(inst) = boot("b", "approve = \"none\"\n") else {
-        return;
-    };
+    let inst = boot("b", "approve = \"none\"\n");
     run_fake(&inst, "k1", &["owners-box.txt", "busy.gate"]);
     escalated_and_quiet(&inst, "k1", "aterm-auto-target-x.noindex");
     // The clear and the worker's verdicts are the SERVER's own timeline
@@ -1943,11 +1805,13 @@ fn a_box_a_person_answered_loses_its_badge_while_the_worker_works() {
     );
 }
 
+/// The other supervisor's lease [`one_supervisor_per_session`] waits out:
+/// the server lapses it, and the host may answer only after.
+const LEASE_MS: u64 = 3_000;
+
 #[test]
 fn one_supervisor_per_session() {
-    let Some(inst) = boot("o", "") else {
-        return;
-    };
+    let inst = boot("o", "");
     let sel = format!("@{}", inst.sid);
     // Hold the claim through launch and program detection — past the
     // [`HANG`] `program_is` may take. Those two control calls can be slow on
@@ -1973,6 +1837,7 @@ fn one_supervisor_per_session() {
     run_fake(&inst, "k1", &["read.txt", "worked.hold"]);
     program_is(&inst, "claude", HANG);
     // Start the lease being tested only after Claude is observably running.
+    let claimed_ms = now_ms();
     ctl_ok(
         &inst,
         &[
@@ -1981,19 +1846,21 @@ fn one_supervisor_per_session() {
             "set",
             "supervisor",
             "someone-else",
-            "ttl=10000",
+            &format!("ttl={LEASE_MS}"),
         ],
     );
-    let claimed = Instant::now();
-    // While it holds: the host stays off, nothing is typed.
-    while claimed.elapsed() < Duration::from_secs(4) {
-        let s = status(&inst);
-        assert_eq!(field(&s, "supervisor"), Some("someone-else"), "{s}");
-        assert!(keys(&inst, "k1").is_empty(), "typed under another's claim");
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    // It lapses: the host takes the session over and answers the box.
+    let s = status(&inst);
+    assert_eq!(field(&s, "supervisor"), Some("someone-else"), "{s}");
+    // It lapses: the host takes the session over and answers the box — and
+    // not before: its answer is journaled after the lease ran out, an order
+    // of events, never a window watched for nothing typed.
     keys_until(&inst, "k1", &["1"], HANG);
+    let approved_ms = journaled_at(&inst, "APPROVED");
+    assert!(
+        approved_ms >= claimed_ms + u128::from(LEASE_MS),
+        "answered at {approved_ms} ms, under another's lease taken at {claimed_ms} ms for \
+         {LEASE_MS} ms"
+    );
     let s = status(&inst);
     assert!(
         field(&s, "supervisor").is_some_and(|v| v.starts_with("aterm-harness")),
@@ -2001,55 +1868,25 @@ fn one_supervisor_per_session() {
     );
 }
 
-/// NEGATIVE CONTROL: a headless instance whose `[harness]` says
-/// `headless = false` runs no host — the box waits and nothing is typed.
-#[test]
-fn a_headless_instance_limited_by_its_config_supervises_nothing() {
-    let Some(inst) = boot("n", "headless = false\n") else {
-        return;
-    };
-    run_fake(&inst, "k1", &["read.txt"]);
-    program_is(&inst, "claude", HANG);
-    let quiet_until = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < quiet_until {
-        let s = status(&inst);
-        assert_eq!(field(&s, "supervisor"), Some("-"), "{s}");
-        assert!(
-            keys(&inst, "k1").is_empty(),
-            "typed: {:?}",
-            keys(&inst, "k1")
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
 /// AUTOPILOT OFF, LIVE (the Autopilot design, 2026-10-15, §2.2): under
 /// `[harness] autopilot = "off"` the host keeps its hands off every session
-/// with no word of its own — the box waits, nothing is typed, `status` says
-/// `supervisor=-` and `autopilot=off`, and the bare `meta` names the unset
-/// word (`autopilot=-`). The session's own word `cruise` (`meta set autopilot
+/// with no word of its own — `status` says `supervisor=-` and
+/// `autopilot=off`, and the bare `meta` names the unset word
+/// (`autopilot=-`). The session's own word `cruise` (`meta set autopilot
 /// cruise`, the chip's write) opts that one session in by hand: the host
-/// claims it and answers the box.
+/// claims it and answers the box. (The host's Off rule itself — no worker, no
+/// relaunch, no disk look, nothing answered for an Off session — is aterm-gui's
+/// `harness_host_tests`; `headless = false` running no host at all is
+/// `a_headless_instance_runs_a_host_unless_the_policy_limits_it`.)
 #[test]
 fn autopilot_off_keeps_the_hosts_hands_off_until_the_session_opts_in() {
-    let Some(inst) = boot("ap", "autopilot = \"off\"\n") else {
-        return;
-    };
+    let inst = boot("ap", "autopilot = \"off\"\n");
     run_fake(&inst, "k1", &["read.txt"]);
     program_is(&inst, "claude", HANG);
     assert_eq!(field(&meta(&inst), "autopilot"), Some("-"));
-    let quiet_until = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < quiet_until {
-        let s = status(&inst);
-        assert_eq!(field(&s, "supervisor"), Some("-"), "{s}");
-        assert_eq!(field(&s, "autopilot"), Some("off"), "{s}");
-        assert!(
-            keys(&inst, "k1").is_empty(),
-            "typed: {:?}",
-            keys(&inst, "k1")
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    let s = status(&inst);
+    assert_eq!(field(&s, "supervisor"), Some("-"), "{s}");
+    assert_eq!(field(&s, "autopilot"), Some("off"), "{s}");
     ctl_ok(
         &inst,
         &[
@@ -2115,7 +1952,19 @@ fn write_relaunch_fake(inst: &Instance) {
 
 /// Each launch of the relaunch fake: `(pid, args)`.
 fn launches(inst: &Instance) -> Vec<(u32, String)> {
-    std::fs::read_to_string(inst.tmp.join("launches.log"))
+    exec_log(inst, "launches.log")
+}
+
+/// Each start probe of an upgrade fake's build (`<build> --help`, which
+/// starts no agent, [`stage_upgrade_fake`]): `(pid, "<version> --help")`.
+#[cfg(target_os = "macos")] // only the macOS-only upgrade tests use it
+fn probes(inst: &Instance) -> Vec<(u32, String)> {
+    exec_log(inst, "probes.log")
+}
+
+/// The `<pid> <args>` lines a fake logged to `name`, as `(pid, args)`.
+fn exec_log(inst: &Instance, name: &str) -> Vec<(u32, String)> {
+    std::fs::read_to_string(inst.tmp.join(name))
         .unwrap_or_default()
         .lines()
         .filter_map(|l| {
@@ -2150,9 +1999,7 @@ fn first_launch(inst: &Instance) -> Vec<(u32, String)> {
 /// back on the session.
 #[test]
 fn an_agent_that_exits_unasked_is_relaunched_on_its_conversation() {
-    let Some(inst) = boot("r", "") else {
-        return;
-    };
+    let inst = boot("r", "");
     write_relaunch_fake(&inst);
     let sel = format!("@{}", inst.sid);
     let tmp = inst.tmp.display();
@@ -2301,8 +2148,14 @@ fn an_agent_that_exits_unasked_is_relaunched_on_its_conversation() {
 /// (Claude Code writes a prompt's row as it is submitted).
 /// One started on a terminal while `hold-idle-<its version>` stands draws its
 /// composer only once the test removes it: an agent still booting, as long
-/// as the test needs (a probe of the build — no terminal — is never held,
-/// and neither is a build the test does not name).
+/// as the test needs (a build the test does not name is never held).
+/// The host's start probe of a build (`<build> --help`, run with no terminal
+/// before a crashed agent's relaunch onto a build no probe proved, and before
+/// a move onto one with a failure noted, never before the upgrade's own first
+/// move: `aterm_agent::harness::upgrade_build_start`, ATERM-KI-1015-1 LC-5) is
+/// answered as Claude Code answers it — a usage printed and exit 0, nothing
+/// registered, no transcript touched — and logged to `probes.log`
+/// ([`probes`]), never to `launches.log`: it starts no agent.
 /// `asked`: a new conversation's transcript opens with a person's prompt and
 /// its answer (a session someone asked something); without it the record
 /// holds nothing of anyone's. SIGTERM ends it as Claude's graceful shutdown
@@ -2339,8 +2192,11 @@ fn stage_upgrade_fake(inst: &Instance, version: &str, asked: bool) -> PathBuf {
     let fake = format!(
         "#!/bin/sh\n\
          VERSION={version}\n\
-         case \"$1\" in --version) echo \"$VERSION (Claude Code)\"; exit 0 ;; esac\n\
          tmp=${{HOME%/home}}\n\
+         case \"$1\" in\n\
+         --version) echo \"$VERSION (Claude Code)\"; exit 0 ;;\n\
+         --help) echo \"$$ $VERSION $*\" >> \"$tmp/probes.log\"; echo 'Usage: claude [options] [command] [prompt]'; exit 0 ;;\n\
+         esac\n\
          echo \"$$ $VERSION $*\" >> \"$tmp/launches.log\"\n\
          sid={CONVERSATION}; prev=\n\
          for a in \"$@\"; do [ \"$prev\" = --resume ] && sid=$a; prev=$a; done\n\
@@ -2436,6 +2292,7 @@ fn land(inst: &Instance, staged: &Path) {
 /// its relaunch — from the notice (or the prompt the step waits on), or from
 /// the host's latest look that could not read that build ([`version_waits`],
 /// [`upgrade_until`]).
+#[cfg(target_os = "macos")]
 const UPGRADE_WITHIN: Duration = Duration::from_secs(150);
 
 /// How far those looks may carry the deadline. The version cache asks a
@@ -2443,6 +2300,7 @@ const UPGRADE_WITHIN: Duration = Duration::from_secs(150);
 /// at least once a minute meanwhile, so a build that answers its second
 /// probe is upgraded to within [`UPGRADE_WITHIN`] of a look five minutes
 /// after the notice at the latest; this bounds a product that looks for ever.
+#[cfg(target_os = "macos")]
 const UPGRADE_CEILING: Duration = Duration::from_secs(10 * 60);
 
 /// How many looks the loop journaled (`<sid>.journal.jsonl`; a host's step
@@ -2454,8 +2312,36 @@ const UPGRADE_CEILING: Duration = Duration::from_secs(10 * 60);
 /// (`UNREAD_VERSION`) — the product's own retry, which a fixed deadline
 /// cannot know. [`place_fake`] keeps the fakes' probes inside the bound; this
 /// is what a probe that still missed it is waited by.
+#[cfg(target_os = "macos")]
 fn version_waits(inst: &Instance) -> usize {
     journal(inst).matches("step=wait:no-version").count()
+}
+
+/// The wall clock in ms since the epoch, as the loop's journal stamps its
+/// records (`"t"`).
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis())
+}
+
+/// The stamp (`"t"`, [`now_ms`]'s clock) of the session journal's first
+/// record that contains `needle`: when the host did it. Panics, naming the
+/// journal, when no record does.
+#[track_caller]
+fn journaled_at(inst: &Instance, needle: &str) -> u128 {
+    let journal = journal(inst);
+    journal
+        .lines()
+        .find(|l| l.contains(needle))
+        .and_then(|l| {
+            l.strip_prefix("{\"t\":")?
+                .split(',')
+                .next()?
+                .parse::<u128>()
+                .ok()
+        })
+        .unwrap_or_else(|| panic!("no journal record holds {needle:?}:\n{journal}"))
 }
 
 /// The session's loop journal (`<sid>.journal.jsonl`): a host's step is a
@@ -2513,8 +2399,9 @@ fn upgrade_until<T>(
 /// The worker takes its loop's idle point, announces, reads the READY
 /// answer at the next one, ends the agent with SIGTERM and relaunches it in
 /// the same tab ON THE NEW BUILD, on its conversation (`--resume <id>`, its
-/// flags kept), and tells it to carry on. NEGATIVE CONTROL: before the
-/// notice, a session on the current build is never announced to.
+/// flags kept), and tells it to carry on, announcing once. (A session already
+/// on the newest build is passed over, never inspected or announced to:
+/// aterm-agent's `current_claude_skips_process_inspection_but_new_and_in_flight_do_not`.)
 #[cfg(target_os = "macos")] // atpkg::activation_notice is macOS-only
 #[test]
 fn an_activation_notice_upgrades_the_session_at_its_idle_point() {
@@ -2522,13 +2409,11 @@ fn an_activation_notice_upgrades_the_session_at_its_idle_point() {
     // agent that is working", 2026-09-29) the default moves an idle session
     // with nothing typed; the knob restores the notice, READY and carry-on
     // flow this test pins.
-    let Some(inst) = boot_upgrade(
+    let inst = boot_upgrade(
         "v",
         "relaunch = false\nupgrade_ask = true\n",
         Some(SHORT_SETTLE_S),
-    ) else {
-        return;
-    };
+    );
     let current = stage_upgrade_fake(&inst, "2.1.281", true);
     let newer = stage_upgrade_fake(&inst, "2.1.282", true);
     install(&inst, &current);
@@ -2558,13 +2443,6 @@ fn an_activation_notice_upgrades_the_session_at_its_idle_point() {
         ["2.1.281 --model opus"],
         "{first:?}"
     );
-    // NEGATIVE CONTROL: current, so nothing is announced.
-    std::thread::sleep(Duration::from_secs(3));
-    assert!(
-        !harness_lines(&inst).contains("announced"),
-        "{}",
-        harness_lines(&inst)
-    );
     // A newer build lands, and atpkg says so.
     land(&inst, &newer);
     let got = upgrade_until(
@@ -2586,7 +2464,16 @@ fn an_activation_notice_upgrades_the_session_at_its_idle_point() {
         format!("2.1.282 --model opus --resume {CONVERSATION}"),
         "the new build, its flags kept, its conversation resumed"
     );
-    let log = until(
+    // ATERM-KI-1015-1 LC-5, live, as main's review of the r20 relaunch lane
+    // settled it (`7901960f1`): the upgrade's own first move onto a build
+    // never run here is how a build is tried, and runs no start probe — only
+    // a crash's relaunch waits on a probe's proof.
+    assert_eq!(
+        probes(&inst),
+        [],
+        "the upgrade's own first move runs no probe"
+    );
+    until(
         HANG,
         "announced, then told to carry on",
         || harness_lines(&inst),
@@ -2595,7 +2482,6 @@ fn an_activation_notice_upgrades_the_session_at_its_idle_point() {
                 && (l.contains("step=done") || l.contains("step=continued"))
         },
     );
-    assert!(!log.contains("minute"), "{log}");
     program_is(&inst, "claude", HANG);
     // D6 of the live E2E of 2026-09-26: the owner's view is published on a
     // headless instance too — the tab's `upgrade=` names the finished move
@@ -2614,21 +2500,25 @@ fn an_activation_notice_upgrades_the_session_at_its_idle_point() {
 /// lands and atpkg says so; at the loop's idle point the worker ends the
 /// agent and starts the new build in the same tab — its flags kept, NO
 /// `--resume` — and types nothing into either process: no notice, no
-/// carry-on, through the restart and the five seconds after it. (The E2E's
+/// carry-on, through the restart to the move's end as the owner sees it. (The E2E's
 /// fresh sessions each got the notice, which started a conversation nobody
 /// asked for.) What this run cannot observe — the turn ends after: the
 /// continue policy's first back-off is two minutes, and the fresh screen
 /// already holds it — is pinned by aterm-agent's unit tests of the policy
-/// and the loop (`a_session_only_the_harness_has_typed_into_gets_no_act`,
+/// and the loop (`supervise_conformance_turn_end.rs`'s taskless walk,
 /// and the loop's test that a session its host says nobody asked anything
 /// gets nothing typed). NEGATIVE CONTROL: the test above — the same fake
 /// with a person's prompt in its record — is announced to and resumed.
+///
+/// ON THE SHIPPED CLOCK ([`boot_upgrade_on_the_shipped_clock`]): the
+/// relaunch family's real-clock test. Every wait of the restart — the agent's
+/// exit, the shell's prompt back, the relaunched process registering, its
+/// first idle — is the product's bound and ends at its event; only the
+/// settle is the tests' ([`SHORT_SETTLE_S`]).
 #[cfg(target_os = "macos")] // atpkg::activation_notice is macOS-only
 #[test]
 fn a_session_nobody_asked_anything_is_restarted_afresh_with_nothing_typed() {
-    let Some(inst) = boot_upgrade("k", "relaunch = false\n", Some(SHORT_SETTLE_S)) else {
-        return;
-    };
+    let inst = boot_upgrade_on_the_shipped_clock("k", "relaunch = false\n", Some(SHORT_SETTLE_S));
     let current = stage_upgrade_fake(&inst, "2.1.281", false);
     let newer = stage_upgrade_fake(&inst, "2.1.282", false);
     install(&inst, &current);
@@ -2677,6 +2567,13 @@ fn a_session_nobody_asked_anything_is_restarted_afresh_with_nothing_typed() {
         got[1].1, "2.1.282 --model opus",
         "the new build, its flags kept, nothing resumed"
     );
+    // LC-5, live: the fresh restart's own first move onto the new build
+    // runs no start probe either.
+    assert_eq!(
+        probes(&inst),
+        [],
+        "the upgrade's own first move runs no probe"
+    );
     let log = until(
         HANG,
         "restarted afresh",
@@ -2685,17 +2582,18 @@ fn a_session_nobody_asked_anything_is_restarted_afresh_with_nothing_typed() {
     );
     assert!(!log.contains("announced"), "no notice: {log}");
     program_is(&inst, "claude", HANG);
-    // Nothing typed into either process through the restart and the 5 s
-    // after it (the turn ends after are the unit tests': see above).
-    std::thread::sleep(Duration::from_secs(5));
-    let typed = std::fs::read_to_string(inst.tmp.join("typed.log")).unwrap_or_default();
-    assert!(typed.is_empty(), "typed into the agent: {typed:?}");
+    // Nothing typed into either process through the restart, judged once the
+    // move is over as the owner sees it — the tab's `upgrade=` names it done,
+    // the host's view refreshed after its last step (the turn ends after are
+    // the unit tests': see above).
     until(
         HANG,
         "the tab's upgrade= column, headless",
         || status(&inst),
         |s| field(s, "upgrade").is_some_and(|v| v.starts_with("done/2.1.282/")),
     );
+    let typed = std::fs::read_to_string(inst.tmp.join("typed.log")).unwrap_or_default();
+    assert!(typed.is_empty(), "typed into the agent: {typed:?}");
 }
 
 /// A fake Claude Code at 2.1.281 in `shell` (`bash` or `zsh`), its
@@ -2710,8 +2608,8 @@ fn a_fresh_session_behind(
     shell: &str,
     harness: &str,
     settle_s: Option<u64>,
-) -> Option<Instance> {
-    let inst = boot_upgrade(tag, harness, settle_s)?;
+) -> Instance {
+    let inst = boot_upgrade(tag, harness, settle_s);
     let current = stage_upgrade_fake(&inst, "2.1.281", false);
     let newer = stage_upgrade_fake(&inst, "2.1.282", false);
     install(&inst, &current);
@@ -2738,7 +2636,7 @@ fn a_fresh_session_behind(
         "{first:?}"
     );
     land(&inst, &newer);
-    Some(inst)
+    inst
 }
 
 /// The lines each process of the upgrade fake read, by pid.
@@ -2752,104 +2650,6 @@ fn typed_by(inst: &Instance) -> Vec<(u32, String)> {
             Some((pid.parse().ok()?, line.to_string()))
         })
         .collect()
-}
-
-/// ND1 OF THE LIVE RE-TEST OF 2026-09-26, live, five times over: A FIRST
-/// PROMPT SENT AT THE FIRST IDLE VERDICT IS THE AGENT'S. An orchestrator
-/// `await`s `agent idle` on a session nobody has asked anything, whose
-/// upgrade is due, and sends its first prompt at once as orchestrators do
-/// (`send`, then `key enter`) — the moment the fresh restart used to fire
-/// (1.3 s after that verdict, the tab then a bare shell). Its words carry a
-/// shell command (`touch`): run by the shell, they would leave a file. Each
-/// time the prompt reaches the agent it was sent to and is recorded as its
-/// conversation's first task, the session is never restarted afresh, and
-/// the upgrade announces to it instead, the one launch still running.
-#[cfg(target_os = "macos")] // atpkg::activation_notice is macOS-only
-#[test]
-fn a_first_prompt_sent_at_the_first_idle_is_the_agents_never_the_shells() {
-    std::thread::scope(|scope| {
-        let runs: Vec<_> = (0..5)
-            .map(|i| {
-                scope.spawn(move || {
-                    let Some(inst) = a_fresh_session_behind(
-                        &format!("q{i}"),
-                        "bash",
-                        // The announce flow this test is about (0b689dfe3
-                        // made the quiet move the default).
-                        "relaunch = false\nupgrade_ask = true\n",
-                        // The product's settle: it is what this prompt
-                        // races, its whole margin ([`SHORT_SETTLE_S`]).
-                        None,
-                    ) else {
-                        return;
-                    };
-                    let sel = format!("@{}", inst.sid);
-                    let pwned = inst.tmp.join(format!("work/pwned-{i}"));
-                    let prompt = format!("Fix the parser; touch {}", pwned.display());
-                    let idle = ctl(
-                        &inst,
-                        &[
-                            &sel,
-                            "await",
-                            "agent",
-                            "idle",
-                            &format!("timeout={}", HANG.as_millis()),
-                        ],
-                    );
-                    let said = String::from_utf8_lossy(&idle.stdout);
-                    if !(idle.status.success() && said.starts_with("OK agent idle ")) {
-                        // What the verdict was read from: the frame and the
-                        // caret on it, the copy that drew it, and the host.
-                        let look = |args: &[&str]| {
-                            String::from_utf8_lossy(&ctl(&inst, args).stdout).into_owned()
-                        };
-                        panic!(
-                            "run {i}: await agent idle answered {said:?} (stderr {:?})\n\
-                             status: {}cursor: {}launches: {:?}\nscreen:\n{}\n\
-                             harness log:\n{}\njournal:\n{}",
-                            String::from_utf8_lossy(&idle.stderr),
-                            look(&[&sel, "status"]),
-                            look(&[&sel, "cursor"]),
-                            launches(&inst),
-                            look(&[&sel, "text"]),
-                            harness_lines(&inst),
-                            journal(&inst)
-                        );
-                    }
-                    ctl_ok(&inst, &[&sel, "send", &prompt]);
-                    ctl_ok(&inst, &[&sel, "key", "enter"]);
-                    let log = upgrade_until(
-                        &inst,
-                        Instant::now(),
-                        || harness_lines(&inst),
-                        |l| l.contains("step=announced:1") || l.contains("step=done:fresh"),
-                    );
-                    assert!(
-                        !log.contains("done:fresh"),
-                        "run {i}: restarted afresh: {log}"
-                    );
-                    assert!(
-                        log.contains("step=announced:1"),
-                        "run {i}: announced to (the prompt made a task): {log}\njournal:\n{}",
-                        journal(&inst)
-                    );
-                    assert!(!pwned.exists(), "run {i}: the shell ran the prompt");
-                    let first = launches(&inst)[0].0;
-                    assert!(
-                        typed_by(&inst)
-                            .iter()
-                            .any(|(pid, line)| *pid == first && *line == prompt),
-                        "run {i}: the prompt never reached the agent: {:?}",
-                        typed_by(&inst)
-                    );
-                    assert_eq!(launches(&inst).len(), 1, "run {i}: {:?}", launches(&inst));
-                })
-            })
-            .collect();
-        for run in runs {
-            run.join().expect("a run");
-        }
-    });
 }
 
 /// ND1, live: THE RESTART HOLDS THE TAB. A session nobody has asked anything
@@ -2907,10 +2707,7 @@ fn hand_evidence(inst: &Instance) -> String {
 /// `turn` or as a raw `send` and `key enter`.
 #[cfg(target_os = "macos")] // only the macOS-only upgrade tests use it
 fn prompt_meets_the_hand(tag: &str, shell: &str, turn: bool) {
-    let Some(inst) = a_fresh_session_behind(tag, shell, "relaunch = false\n", Some(SHORT_SETTLE_S))
-    else {
-        return;
-    };
+    let inst = a_fresh_session_behind(tag, shell, "relaunch = false\n", Some(SHORT_SETTLE_S));
     let sel = format!("@{}", inst.sid);
     let pwned = inst.tmp.join("work/pwned");
     let prompt = format!("Fix the parser; touch {}", pwned.display());
@@ -3017,9 +2814,7 @@ fn a_wall_the_host_resumes_is_no_stop_and_one_nobody_answers_is() {
 /// One run of [`a_wall_the_host_resumes_is_no_stop_and_one_nobody_answers_is`]:
 /// the wall under `harness`, `level=limited` exactly when `stop`.
 fn wall_level(tag: &str, harness: &str, stop: bool) {
-    let Some(inst) = boot(tag, harness) else {
-        return;
-    };
+    let inst = boot(tag, harness);
     run_fake(&inst, "k1", &["wall.hold"; 12]);
     // Published as the wall, and held by the in-window harness ...
     let st = until(

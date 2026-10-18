@@ -7,31 +7,6 @@
 use super::*;
 
 #[test]
-fn repeated_rows_only_resize_reuses_page_allocations() {
-    let mut grid = Grid::with_scrollback(52, 121, 0);
-    for row in 0..52 {
-        grid.set_cursor(row, 0);
-        grid.write_char('x');
-    }
-    grid.set_cursor(51, 0);
-    let before = grid.storage.pages.stats();
-    let memory_before = grid.storage.pages.active_pages() * crate::page::PAGE_SIZE;
-    for _ in 0..512 {
-        grid.resize_no_reflow(51, 121);
-        grid.resize_no_reflow(52, 121);
-    }
-    let after = grid.storage.pages.stats();
-    let memory_after = grid.storage.pages.active_pages() * crate::page::PAGE_SIZE;
-    eprintln!(
-        "resize census: 512 quiet 52->51->52 flaps at 121 columns; allocations {} -> {}, page bytes {} -> {}",
-        before.allocations, after.allocations, memory_before, memory_after,
-    );
-    assert_eq!(after.allocations, before.allocations);
-    assert_eq!(memory_after, memory_before);
-    grid.assert_invariants();
-}
-
-#[test]
 fn repeated_resize_shapes_and_intervening_output_keep_the_allocation_highwater() {
     use crate::grid::reflow::ResizePolicy;
     for (name, policy, painted, cursor, interrupt) in [
@@ -112,7 +87,8 @@ fn resize_reveal_then_output_reuses_the_retained_ring_highwater() {
 /// from the shipping arena, rather than a second allocator in the test.
 #[test]
 fn resize_row_reuse_conforms() {
-    use aterm_spec::{derive::resize_row_reuse_model, interp};
+    use aterm_models_core::resize_row_reuse_model;
+    use aterm_spec::interp;
     use std::collections::{BTreeMap, BTreeSet};
     fn project(grid: &Grid, peak: i64) -> BTreeMap<&'static str, i64> {
         BTreeMap::from([

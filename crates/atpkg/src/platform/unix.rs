@@ -276,136 +276,6 @@ pub fn exclude_from_backup(dir: &Path) {
     }
 }
 
-/// Ask Spotlight whether a file named `filename` is in the index under `scope`.
-///
-/// `Some(true)` — `mdfind` printed at least one path. `Some(false)` — the query RAN and
-/// the index answered with nothing. `None` — the question could not be asked: `mdfind`
-/// would not spawn, exited non-zero, or blew the 5 s ceiling.
-///
-/// **`None` must never be read as "not indexed."** A miss is evidence only relative to a
-/// control that WAS indexed; a question that was never asked is not a miss at all, and
-/// [`crate::noindex::decide`] lands every one of these on `Unknown` rather than on
-/// `Excluded`. Reporting a directory excluded on the strength of a query that failed is
-/// the same false success as the `.metadata_never_index` marker that `noindex` exists to
-/// stop shipping.
-///
-/// `/usr/bin/mdfind` is named absolutely, never through `PATH`, mirroring
-/// `install::run_tool`. Interpolating `filename` into the predicate bare is safe by
-/// CONSTRUCTION and not by escaping: its only caller passes
-/// [`crate::noindex::probe_token`], which is `[a-z0-9]+`.
-///
-/// Non-macOS: `None`. There is no index here to ask.
-#[must_use]
-pub fn spotlight_query(scope: &Path, filename: &str) -> Option<bool> {
-    #[cfg(target_os = "macos")]
-    {
-        let predicate = format!("kMDItemFSName == \"{filename}\"");
-        let mut cmd = aterm_uds::spawnfd::command("/usr/bin/mdfind");
-        cmd.arg("-onlyin").arg(scope.as_os_str()).arg(&predicate);
-        let stdout = bounded_stdout(&mut cmd)?;
-        // Any non-whitespace byte is a printed path. Tested byte-wise rather than with
-        // `String::from_utf8_lossy(..).trim()` because `mdfind` prints PATHS, which are
-        // bytes and need not be UTF-8 — and because the lossy decoder's inlined `unsafe`
-        // is exactly what the gate on this file cannot lower.
-        Some(stdout.iter().any(|b| !b.is_ascii_whitespace()))
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (scope, filename);
-        None
-    }
-}
-
-/// Whether Spotlight indexing is enabled for the volume holding `path`, per `mdutil -s`.
-///
-/// `mdutil` ANSWERS FOR A VOLUME, NOT FOR A DIRECTORY, so `path` is resolved to its MOUNT
-/// POINT first. Measured on macOS 26.6.2 (25G83), as a non-root user:
-///
-/// ```text
-/// mdutil -s /System/Volumes/Data        -> Indexing enabled.
-/// mdutil -s /Users                      -> Indexing enabled.
-/// mdutil -s /Users//user/proj            -> Error: unknown indexing state.
-/// ```
-///
-/// The mount point comes from `statfs(2)`'s `f_mntonname` rather than from walking up by
-/// `st_dev`: on an APFS volume group `/` and `/System/Volumes/Data` report the SAME
-/// `st_dev`, and a dev walk would answer for the read-only system volume.
-///
-/// `None` when it could not be asked — ORDINARY here: "unknown indexing state" is printed
-/// on stdout with exit 0.
-///
-/// The binary is `/usr/bin/mdutil` — NOT `/usr/sbin`, where a wrong guess would fail to
-/// spawn and answer `None` forever while looking like a working probe. Absolute, never
-/// `PATH`, mirroring `install::run_tool`.
-///
-/// This REFINES A MESSAGE and nothing more. No verdict depends on it: an unindexed volume
-/// and a saturated one both produce `Verdict::Unknown` in [`crate::noindex`], and this
-/// only lets the report say which is likelier. Never let it become the evidence — the
-/// answer that matters is the one [`spotlight_query`] measures.
-///
-/// Non-macOS: `None`.
-#[must_use]
-pub fn spotlight_index_state(path: &Path) -> Option<crate::platform::IndexState> {
-    #[cfg(target_os = "macos")]
-    {
-        spotlight_index_state_within(path, BOUNDED_CEILING)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = path;
-        None
-    }
-}
-
-/// [`spotlight_index_state`] with the caller's ceiling on `mdutil`'s answer.
-#[cfg(target_os = "macos")]
-fn spotlight_index_state_within(
-    path: &Path,
-    ceiling: std::time::Duration,
-) -> Option<crate::platform::IndexState> {
-    let volume = mount_point_of(path);
-    let asked = volume.as_deref().unwrap_or(path);
-    let mut cmd = aterm_uds::spawnfd::command("/usr/bin/mdutil");
-    cmd.arg("-s").arg(asked.as_os_str());
-    let (true, stdout) = bounded_stdout_inner(&mut cmd, ceiling)? else {
-        return None;
-    };
-    mdutil_index_state(&stdout)
-}
-
-/// What one `mdutil -s <volume>` answer says, for [`spotlight_index_state`]: is a probe that
-/// never showed up the volume's state, or a busy machine?
-///
-/// Only the status line (tab-indented, after the `<volume>:` name line) is read, so a volume
-/// named `disabled-drive` does not read as a state and an `Error:` line is no state at all.
-/// "Index is read-only." is its own state — a low-disk-space hold under which a planted probe
-/// never arrives. "disabled" matches by substring, so "Indexing and searching disabled." reads
-/// as disabled.
-#[cfg(target_os = "macos")]
-fn mdutil_index_state(stdout: &[u8]) -> Option<crate::platform::IndexState> {
-    use crate::platform::IndexState;
-    let text = String::from_utf8_lossy(stdout);
-    let status = text
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .find(|l| !l.ends_with(':'))?;
-    if status.starts_with("Error") {
-        return None;
-    }
-    let status = status.as_bytes();
-    if contains_ascii_ci(status, b"read-only") {
-        return Some(IndexState::ReadOnly);
-    }
-    if contains_ascii_ci(status, b"disabled") {
-        return Some(IndexState::Disabled);
-    }
-    if contains_ascii_ci(status, b"enabled") {
-        return Some(IndexState::Enabled);
-    }
-    None
-}
-
 /// The `defaults(1)` domain of macOS Universal Control, per-host (`-currentHost`).
 #[cfg(target_os = "macos")]
 pub const UNIVERSAL_CONTROL_DOMAIN: &str = "com.apple.universalcontrol";
@@ -418,8 +288,8 @@ pub const UNIVERSAL_CONTROL_KEYS: [&str; 2] = ["Disable", "DisableMagicEdges"];
 /// `Some(false)` when set false, `None` when the key is absent (the OS default —
 /// `defaults` exits 1 with "does not exist") or could not be asked.
 ///
-/// READ-ONLY. `/usr/bin/defaults` is named absolutely, never through `PATH`, like the
-/// Spotlight probes above. Non-macOS: `[None, None]`.
+/// READ-ONLY. `/usr/bin/defaults` is named absolutely, never through `PATH`.
+/// Non-macOS: `[None, None]`.
 #[must_use]
 pub fn universal_control_state() -> [crate::machine::KeyRead; 2] {
     #[cfg(target_os = "macos")]
@@ -487,36 +357,6 @@ pub fn universal_control_disable() -> bool {
     }
 }
 
-/// The mount point of the volume holding `path` (`statfs(2)`'s `f_mntonname`), or `None`
-/// when `statfs` failed — a path that does not exist, or a name that cannot be a
-/// `CString`. The one caller ([`spotlight_index_state`]) then falls back to `path`.
-#[cfg(target_os = "macos")]
-fn mount_point_of(path: &Path) -> Option<PathBuf> {
-    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
-    // SAFETY: `c` is a NUL-terminated C string that outlives the call, and `&mut st` is a
-    // valid, writable out-param of the exact `statfs` type the libc call expects. Mirrors
-    // `volume_free_bytes`'s `statvfs` call above.
-    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::statfs(c.as_ptr(), &mut st) };
-    if rc != 0 {
-        return None;
-    }
-    // `f_mntonname` is a fixed 1024-byte NUL-terminated field of `c_char` (i8 on Darwin).
-    // Converted byte-wise, never through `from_utf8_lossy`: a mount point is PATH bytes and
-    // need not be UTF-8.
-    let mut bytes: Vec<u8> = Vec::new();
-    for b in st.f_mntonname {
-        if b == 0 {
-            break;
-        }
-        bytes.push(u8::from_ne_bytes(b.to_ne_bytes()));
-    }
-    if bytes.is_empty() {
-        return None;
-    }
-    Some(PathBuf::from(OsStr::from_bytes(&bytes)))
-}
-
 /// [`bounded_stdout`], but keeping the child's SUCCESS bit instead of folding a nonzero
 /// exit into `None`: `defaults read` uses exit 1 with empty output to mean "this key is
 /// not set", a real answer the caller must tell apart from a read that did not happen.
@@ -541,28 +381,13 @@ const BOUNDED_CEILING: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The deadline behind [`bounded_stdout`]: `crate::doctor::output_bounded_within`, which
 /// kills and reaps the child at `ceiling` and reads its stdout while it runs, never waiting
-/// on a process the child left behind holding the pipe. A Spotlight query against a
-/// rebuilding index is exactly the wedged probe this bounds.
-///
-/// stderr is `null` because `mdfind` writes `[UserQueryParser] Loading keywords …` there
-/// on a healthy query; nulled for every caller so parser chatter never reaches a report.
+/// on a process the child left behind holding the pipe.
 #[cfg(target_os = "macos")]
 fn bounded_stdout_inner(
     cmd: &mut aterm_uds::spawnfd::Command,
     ceiling: std::time::Duration,
 ) -> Option<(bool, Vec<u8>)> {
     crate::doctor::output_bounded_within(cmd, ceiling).map(|out| (out.status.success(), out.stdout))
-}
-
-/// Case-insensitive ASCII substring test over raw bytes — enough to read `mdutil`'s
-/// status line, without a dependency. `needle` is a non-empty byte-string literal at
-/// every call site ([`mdutil_index_state`]); `windows(0)` would panic.
-#[cfg(target_os = "macos")]
-fn contains_ascii_ci(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.len() >= needle.len()
-        && haystack
-            .windows(needle.len())
-            .any(|w| w.eq_ignore_ascii_case(needle))
 }
 
 /// The system-prefix counterpart of `ensure_private_dir`'s `0700`. A root-owned store
@@ -583,7 +408,9 @@ pub fn ensure_shared_dir(dir: &Path) -> std::io::Result<()> {
             format!("{}: store directory is a symlink; refusing", dir.display()),
         ));
     }
-    std::fs::create_dir_all(dir)?;
+    // Missing ancestors `0755` whatever the umask, as `ensure_private_dir` makes them: they
+    // are on the chain `targo trust` refuses when any component is group/other-writable.
+    aterm_types::fs_restricted::create_dir_all_unshared(dir, 0o755)?;
     // Only a mode that differs is written: a same-mode `chmod(2)` still moves `st_ctime`,
     // which tippy's ancestor check reads (see `aterm_update_core::ensure_private_dir`).
     if !std::fs::symlink_metadata(dir).is_ok_and(|m| m.mode() & 0o7777 == 0o755) {
@@ -811,6 +638,32 @@ pub fn volume_free_bytes(dir: &Path) -> Option<u64> {
         st.f_bsize
     };
     Some((st.f_bavail as u64).saturating_mul(frsize as u64))
+}
+
+/// What one `statvfs` says of the volume holding `dir` (which must EXIST): the bytes
+/// free to an unprivileged user (`f_bavail`), the volume's size (`f_blocks`) and the
+/// inodes free (`f_favail`) — a volume out of inodes fails a write with `ENOSPC` as one
+/// out of blocks does. `None` on any failure.
+#[must_use]
+pub fn volume_stats(dir: &Path) -> Option<crate::freespace::VolumeStats> {
+    let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    // SAFETY: as `volume_free_bytes`: a NUL-terminated C string that outlives the call and a
+    // valid, writable out-param of the exact `statvfs` type the libc call expects.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c.as_ptr(), &mut st) };
+    if rc != 0 {
+        return None;
+    }
+    let frsize = if st.f_frsize != 0 {
+        st.f_frsize
+    } else {
+        st.f_bsize
+    } as u64;
+    Some(crate::freespace::VolumeStats {
+        free: (st.f_bavail as u64).saturating_mul(frsize),
+        total: (st.f_blocks as u64).saturating_mul(frsize),
+        files_free: Some(st.f_favail as u64),
+    })
 }
 
 /// Atomically point `link` at `target`: create a sibling temp symlink and `rename(2)` it
@@ -1072,129 +925,6 @@ pub fn exit_code_like(status: std::process::ExitStatus) -> std::process::ExitCod
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
-
-    /// The four answers `mdutil -s` gives, and the one it gives when it cannot say.
-    /// "Index is read-only." is its own state — a low-disk-space hold, not a setting. Only
-    /// the status line is read: a volume whose name carries a state word is not that state.
-    #[test]
-    fn every_mdutil_state_line_is_read() {
-        use crate::platform::IndexState;
-        assert_eq!(
-            mdutil_index_state(b"/System/Volumes/Data:\n\tIndexing enabled.\n"),
-            Some(IndexState::Enabled)
-        );
-        assert_eq!(
-            mdutil_index_state(b"/System/Volumes/Data:\n\tIndexing disabled.\n"),
-            Some(IndexState::Disabled)
-        );
-        assert_eq!(
-            mdutil_index_state(b"/System/Volumes/Data:\n\tIndexing and searching disabled.\n"),
-            Some(IndexState::Disabled)
-        );
-        assert_eq!(
-            mdutil_index_state(b"/System/Volumes/Data:\n\tIndex is read-only.\n"),
-            Some(IndexState::ReadOnly)
-        );
-        assert_eq!(
-            mdutil_index_state(b"/Users//x/aterm:\n\tError: unknown indexing state.\n"),
-            None
-        );
-        assert_eq!(
-            mdutil_index_state(b"/Volumes/disabled-drive:\n\tIndexing enabled.\n"),
-            Some(IndexState::Enabled),
-            "the echoed volume name is not the state"
-        );
-        assert_eq!(
-            mdutil_index_state(b"Error: invalid path `/Users//x/enabled-things/repo'.\n"),
-            None,
-            "an error line is no state, whatever path it quotes"
-        );
-        assert_eq!(mdutil_index_state(b""), None);
-    }
-
-    /// Why `mdutil` reports no index state for the volume at `mount` — its own words —
-    /// or `None` when it does ("Indexing enabled." / "Indexing disabled."). Read on both
-    /// streams under a one-minute hang detector: with the Spotlight server off it answers
-    /// "Spotlight server is disabled." in ~10 s, and a test runner's environment can
-    /// answer differently from a login shell.
-    fn mount_index_state_unreadable(mount: &Path) -> Option<String> {
-        let Ok(mut child) = std::process::Command::new("/usr/bin/mdutil")
-            .arg("-s")
-            .arg(mount)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-        else {
-            return Some("mdutil could not be started".to_owned());
-        };
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        while std::time::Instant::now() < deadline {
-            if let Ok(Some(_)) = child.try_wait() {
-                use std::io::Read as _;
-                let mut out = String::new();
-                if let Some(mut stdout) = child.stdout.take() {
-                    let _ = stdout.read_to_string(&mut out);
-                }
-                if let Some(mut stderr) = child.stderr.take() {
-                    let _ = stderr.read_to_string(&mut out);
-                }
-                return if out.contains("Indexing enabled") || out.contains("Indexing disabled") {
-                    None
-                } else {
-                    Some(out.split_whitespace().collect::<Vec<_>>().join(" "))
-                };
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        let _ = child.kill();
-        let _ = child.wait();
-        Some("mdutil did not answer within a minute".to_owned())
-    }
-
-    /// `mdutil` answers for a VOLUME. Handed a deep path it prints "Error: unknown
-    /// indexing state.", which would leave `noindex`'s `IndexingDisabled` refinement
-    /// unreachable on every realistic input.
-    #[test]
-    fn the_indexing_switch_is_asked_at_the_mount_point_not_at_a_deep_path() {
-        let deep = std::fs::canonicalize(std::env::temp_dir()).unwrap();
-        let mount = mount_point_of(&deep).expect("statfs of an existing dir answers");
-        assert!(
-            mount.is_absolute() && mount.is_dir(),
-            "a mount point is an absolute directory: {}",
-            mount.display()
-        );
-        assert_ne!(
-            mount, deep,
-            "a temp directory is never itself a mount point — if this is equal, nothing \
-             was resolved and `mdutil` is still being handed the deep path"
-        );
-        // `starts_with` does NOT hold on macOS: the mount point of `/private/var/folders/…/T`
-        // is `/System/Volumes/Data` (APFS firmlinks), which is why this is `statfs`, not
-        // string surgery.
-        //
-        // The property needs a mount point whose index state mdutil can report; on a Mac
-        // whose Spotlight server is off (or an environment where mdutil cannot answer) there
-        // is none, so say so with mdutil's own words and stop.
-        if let Some(why) = mount_index_state_unreadable(&mount) {
-            use std::io::Write as _;
-            let _ = writeln!(
-                std::io::stderr(),
-                "skipped here: mdutil reports no index state for {} ({why}), so there is \
-                 nothing for a deep path to read",
-                mount.display()
-            );
-            return;
-        }
-        // The production probe's 5 s ceiling is no part of this property; under load mdutil
-        // can take longer, so the test grants it the one-minute hang detector.
-        assert!(
-            spotlight_index_state_within(&deep, aterm_spec::wait::MUST_HAPPEN).is_some(),
-            "the volume's index state must be READABLE for a deep path; `None` here means \
-             the refinement is dead code again"
-        );
-        // A path that does not exist has no volume, and the caller falls back to it.
-        assert_eq!(mount_point_of(Path::new("/no/such/path/here")), None);
-    }
 
     /// A SHARED DIRECTORY ALREADY `0755` IS NOT REWRITTEN. `ensure_shared_dir` runs on
     /// every store-lock acquisition over a system prefix, and a same-mode `chmod(2)` still

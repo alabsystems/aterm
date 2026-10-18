@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-dl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "First-party dlopen tables for aterm: a system C library opened by versioned soname, its entry points read into a typed table, and a missing library or symbol reported by name"
+
+# docs/AUDIT-third-party-2026-10-15.md, linux-windowing LW.6: the loader under
+# aterm-x11, aterm-wayland and aterm-xkb (libxcb, libX11, libwayland-client,
+# libxkbcommon). It replaces dlib and the dlopen halves of x11-dl, wayland-sys,
+# xkbcommon-dl and tiny-xlib, none of which this crate depends on.
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# dlopen(3), dlsym(3) and dlerror(3) (aterm-libc, package `libc`).
+libc = { workspace = true }
+
+[lints]
+workspace = true

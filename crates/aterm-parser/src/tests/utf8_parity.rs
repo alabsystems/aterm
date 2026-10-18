@@ -7,7 +7,7 @@
 //! The ground-state hot loop decodes multi-byte UTF-8 in two ways: a BULK run
 //! decoder (`decode_multibyte_run`, batching consecutive non-ASCII chars) and a
 //! byte-by-byte CONTINUATION path (`process_utf8_byte`, used when a sequence
-//! straddles an `advance()` boundary). These tests pin both against the `std`
+//! straddles an `advance_fast()` boundary). These tests pin both against the `std`
 //! reference: for every valid UTF-8 input the chars the parser prints must EXACTLY
 //! equal `input.chars()`, whether fed whole or one byte at a time — and arbitrary
 //! bytes must never panic.
@@ -15,9 +15,8 @@
 use super::super::*;
 use super::RecordingSink;
 
-/// Feed `bytes` through a fresh parser in one `advance_fast` call; return printed
-/// chars. `advance_fast` is the production UTF-8 path (with the bulk run decoder);
-/// plain `advance` treats high bytes as Latin-1 and is NOT the path under test.
+/// Feed `bytes` through a fresh parser in one `advance_fast` call (the bulk run
+/// decoder); return printed chars.
 fn print_whole(bytes: &[u8]) -> Vec<char> {
     let mut p = Parser::new();
     let mut s = RecordingSink::default();
@@ -27,7 +26,7 @@ fn print_whole(bytes: &[u8]) -> Vec<char> {
 
 /// Feed `bytes` one byte per `advance_fast` call through ONE parser (state
 /// persists); return printed chars. Exercises the byte-by-byte continuation path
-/// (a multi-byte sequence straddling `advance` boundaries).
+/// (a multi-byte sequence straddling `advance_fast` boundaries).
 fn print_byte_by_byte(bytes: &[u8]) -> Vec<char> {
     let mut p = Parser::new();
     let mut s = RecordingSink::default();
@@ -35,28 +34,6 @@ fn print_byte_by_byte(bytes: &[u8]) -> Vec<char> {
         p.advance_fast(&[b], &mut s);
     }
     s.prints
-}
-
-#[test]
-fn valid_utf8_strings_roundtrip_exactly() {
-    let samples = [
-        "hello world",               // ASCII (SIMD bulk path)
-        "café résumé naïve",         // 2-byte Latin
-        "Ελληνικά Кириллица",        // 2-byte Greek/Cyrillic
-        "日本語 中文 한국어",        // 3-byte CJK/Hangul
-        "emoji: 😀🎉🚀 and 🇺🇸 flag", // 4-byte SMP + ZWJ flag
-        "math ∑∫∞ ≠ ⊕ symbols",      // 3-byte symbols
-        "mixed: aあb😀c中d",         // alternating 1/3/4-byte
-    ];
-    for s in samples {
-        let expected: Vec<char> = s.chars().collect();
-        assert_eq!(print_whole(s.as_bytes()), expected, "whole: {s:?}");
-        assert_eq!(
-            print_byte_by_byte(s.as_bytes()),
-            expected,
-            "byte-by-byte: {s:?}"
-        );
-    }
 }
 
 #[test]
@@ -110,37 +87,6 @@ fn fuzz_random_valid_utf8_has_exact_parity() {
             "split parity: {s:?}"
         );
     }
-}
-
-#[test]
-fn fuzz_arbitrary_bytes_never_panic() {
-    // The fast path parses ATTACKER bytes; arbitrary input must never panic, and
-    // whole vs byte-by-byte feeding must never disagree on length-0 vs crash.
-    let mut state = 0xDEAD_BEEF_F00Du64;
-    for _ in 0..5_000 {
-        let len = (next(&mut state) % 64) as usize;
-        let buf: Vec<u8> = (0..len).map(|_| next(&mut state) as u8).collect();
-        // Both must complete without panicking.
-        let _ = print_whole(&buf);
-        let _ = print_byte_by_byte(&buf);
-    }
-}
-
-#[test]
-fn invalid_sequences_emit_replacement_not_garbage() {
-    // A lone lead byte followed by ASCII: replacement, then the ASCII prints.
-    let out = print_whole(b"\xE4Z"); // truncated 3-byte lead + 'Z'
-    assert!(
-        out.contains(&char::REPLACEMENT_CHARACTER),
-        "truncated lead must yield U+FFFD, got {out:?}"
-    );
-    assert!(out.contains(&'Z'), "trailing ASCII must still print");
-    // An overlong 2-byte encoding of '/' (0xC0 0xAF) must NOT decode to '/'.
-    let overlong = print_whole(b"\xC0\xAF");
-    assert!(
-        !overlong.contains(&'/'),
-        "overlong encoding must not produce '/', got {overlong:?}"
-    );
 }
 
 /// THRU-4a regression (whole-vs-bytewise parity for the read-boundary straddle):

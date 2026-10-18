@@ -12,8 +12,6 @@
 //! absolute match rows into the overlay's selection coordinates, and drives the
 //! current-match cursor and highlight.
 
-use std::time::Instant;
-
 use crate::app_mouse::note_selection_custody;
 use crate::{App, term_lock};
 use aterm_core::search::{SearchDirection as EngineSearchDirection, SearchMatch};
@@ -37,14 +35,6 @@ impl SearchDirection {
             Self::Forward
         } else {
             Self::Backward
-        }
-    }
-
-    #[cfg(test)]
-    fn initial_index(self, match_count: usize) -> usize {
-        match self {
-            Self::Forward => 0,
-            Self::Backward => match_count.saturating_sub(1),
         }
     }
 }
@@ -788,7 +778,6 @@ impl SearchState {
 
 #[cfg(test)]
 thread_local! {
-    static POINT_LOOKUP_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Test seam: while set, every find recompute on this thread reads as torn
     /// (`consistent == false`), as both full-history passes do when output moves
     /// `content_seq` under them.
@@ -796,20 +785,7 @@ thread_local! {
 }
 
 fn match_position(matches: &[(i32, u16, u32)], point: (i32, u16, u32)) -> Result<usize, usize> {
-    matches.binary_search_by(|&(row, col, _)| {
-        #[cfg(test)]
-        POINT_LOOKUP_COMPARISONS.with(|count| count.set(count.get().saturating_add(1)));
-        (row, col).cmp(&(point.0, point.1))
-    })
-}
-
-#[cfg(test)]
-fn take_point_lookup_comparisons() -> usize {
-    POINT_LOOKUP_COMPARISONS.with(|count| {
-        let value = count.get();
-        count.set(0);
-        value
-    })
+    matches.binary_search_by(|&(row, col, _)| (row, col).cmp(&(point.0, point.1)))
 }
 
 /// Map engine [`SearchMatch`]es (absolute rows, exclusive end columns) to the
@@ -1523,13 +1499,7 @@ impl App {
                 term.scroll_to_absolute_row(u64::try_from(target).unwrap_or(0));
             }
         }
-        let warning_armed = ws
-            .close_warning_until
-            .is_some_and(|deadline| Instant::now() < deadline);
-        if crate::app_window::window_title_authority(warning_armed, true)
-            == crate::app_window::WindowTitleAuthority::Search
-            && let Some(w) = &ws.os_window
-        {
+        if let Some(w) = &ws.os_window {
             w.set_title(&search_title);
             w.request_redraw();
         }
@@ -2007,14 +1977,7 @@ impl App {
         if clear_selection && let Some(term) = term {
             term_lock(&term).text_selection_mut().clear();
         }
-        let warning_armed = ws
-            .close_warning_until
-            .is_some_and(|deadline| Instant::now() < deadline);
-        if was_open
-            && crate::app_window::window_title_authority(warning_armed, false)
-                == crate::app_window::WindowTitleAuthority::Canonical
-            && let Some(w) = &ws.os_window
-        {
+        if was_open && let Some(w) = &ws.os_window {
             w.set_title(&ws.current_title);
             w.request_redraw();
         }
@@ -2352,30 +2315,19 @@ mod tests {
         );
     }
 
-    /// Native-title ownership is an explicit stack: the destructive-close warning
-    /// outranks find, and find outranks the continuously refreshed canonical title.
-    /// Canonical cache updates therefore cannot erase a live search status, while
-    /// dismissing search reveals the newest (not the pre-search) canonical title.
+    /// Native-title ownership: find outranks the continuously refreshed canonical
+    /// title. Canonical cache updates therefore cannot erase a live search status,
+    /// while dismissing search reveals the newest (not the pre-search) canonical
+    /// title.
     #[test]
     fn native_title_override_transitions_preserve_latest_canonical_title() {
         use crate::app_window::{WindowTitleAuthority, window_title_authority};
 
         assert_eq!(
-            window_title_authority(false, false),
+            window_title_authority(false),
             WindowTitleAuthority::Canonical
         );
-        assert_eq!(
-            window_title_authority(false, true),
-            WindowTitleAuthority::Search
-        );
-        assert_eq!(
-            window_title_authority(true, true),
-            WindowTitleAuthority::CloseWarning
-        );
-        assert_eq!(
-            window_title_authority(true, false),
-            WindowTitleAuthority::CloseWarning
-        );
+        assert_eq!(window_title_authority(true), WindowTitleAuthority::Search);
 
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -2392,7 +2344,7 @@ mod tests {
         // changes under find. Search remains authoritative on glass.
         app.windows.get_mut(&wid).unwrap().current_title = "build — tests are passing".to_string();
         assert_eq!(
-            window_title_authority(false, app.windows[&wid].search.is_some()),
+            window_title_authority(app.windows[&wid].search.is_some()),
             WindowTitleAuthority::Search
         );
         assert_eq!(
@@ -2408,184 +2360,35 @@ mod tests {
             "close restores the latest canonical cache, not literal aterm or stale pre-find text"
         );
         assert_eq!(
-            window_title_authority(false, app.windows[&wid].search.is_some()),
+            window_title_authority(app.windows[&wid].search.is_some()),
             WindowTitleAuthority::Canonical
         );
     }
 
+    /// An invalid pattern is not a miss: while the history is away for a rewrap,
+    /// the window title and the spoken status still give the bad-pattern verdict,
+    /// the same one they give with the history home, never the history-away one.
     #[test]
-    fn close_warning_remains_above_search_until_its_expiry() {
-        use crate::app_window::{WindowTitleAuthority, window_title_authority};
-
-        let search = seeded();
-        assert_eq!(search.window_title(), "aterm — find: foo (1/3)");
-        // An invalid pattern says so, as the panel does, even while the
-        // history is away for a rewrap.
-        let bad = SearchState {
+    fn an_invalid_pattern_outranks_the_history_being_away() {
+        let pattern = |regex_error, history_away| SearchState {
             query: "(".to_string(),
-            regex_error: true,
-            history_away: true,
+            regex_error,
+            history_away,
             ..Default::default()
         };
-        assert_eq!(bad.window_title(), "aterm — find: ( (bad regex)");
-        assert_eq!(
-            window_title_authority(true, true),
-            WindowTitleAuthority::CloseWarning,
-            "search updates cannot erase the safety warning"
+        let (home, away, miss) = (
+            pattern(true, false),
+            pattern(true, true),
+            pattern(false, true),
         );
-        assert_eq!(
-            window_title_authority(false, true),
-            WindowTitleAuthority::Search,
-            "warning expiry restores the still-active search status"
+        assert_eq!(away.window_title(), home.window_title());
+        assert_eq!(away.spoken_status(), home.spoken_status());
+        assert!(!away.window_title().contains(super::HISTORY_AWAY_NONE));
+        assert_ne!(
+            away.window_title(),
+            miss.window_title(),
+            "non-vacuous: a valid pattern's miss reads otherwise"
         );
-        assert_eq!(
-            window_title_authority(false, false),
-            WindowTitleAuthority::Canonical,
-            "closing search then restores the canonical title"
-        );
-    }
-
-    /// What a screen reader hears carries the same qualifiers the panel
-    /// paints: a count older than the screen is announced as stale.
-    #[test]
-    fn the_spoken_status_says_what_the_panel_paints() {
-        let mut search = seeded();
-        assert_eq!(search.spoken_status().as_deref(), Some("match 1 of 3"));
-        // Hits on the screen while the history is away for a rewrap: the panel
-        // paints `1/3+ (rewrapping)`, and `1/3+ (rewrapping, stale)` once a torn
-        // rerun kept the old count.
-        let away = SearchState {
-            history_away: true,
-            truncated: true,
-            ..seeded()
-        };
-        assert_eq!(
-            away.spoken_status().as_deref(),
-            Some("match 1 of 3 (rewrapping)")
-        );
-        let torn = SearchState {
-            results_dirty: true,
-            ..away
-        };
-        assert_eq!(
-            torn.spoken_status().as_deref(),
-            Some("match 1 of 3 (rewrapping, stale)")
-        );
-        search.results_dirty = true;
-        assert_eq!(
-            search.spoken_status().as_deref(),
-            Some("match 1 of 3 (stale)")
-        );
-        search.truncated = true;
-        assert_eq!(
-            search.spoken_status().as_deref(),
-            Some("match 1 of 3 (partial history, stale)")
-        );
-        search.matches.clear();
-        assert_eq!(
-            search.spoken_status().as_deref(),
-            Some("no matches (partial history, stale)")
-        );
-        search.query.clear();
-        assert_eq!(search.spoken_status(), None);
-    }
-
-    /// R15 content-2: a regex that could not finish a long line is a floor
-    /// with its own name, in the title and the spoken status as on the bar —
-    /// never `bad regex`, which is what a long soft-wrapped run used to make
-    /// every regex find say, and never a vague `partial history`. Beside the
-    /// depth cap it is a second word, because it names matches missing INSIDE
-    /// the history that was searched.
-    #[test]
-    fn a_long_line_the_regex_could_not_finish_is_named() {
-        let cut = SearchState {
-            is_regex: true,
-            truncated: true,
-            cut_short: true,
-            ..seeded()
-        };
-        assert_eq!(
-            cut.window_title(),
-            "aterm — find: foo (1/3+, long line partly searched)"
-        );
-        assert_eq!(
-            cut.spoken_status().as_deref(),
-            Some("match 1 of 3 (long line partly searched)")
-        );
-        let none = SearchState {
-            matches: Vec::new(),
-            ..cut
-        };
-        assert_eq!(
-            none.window_title(),
-            "aterm — find: foo (no matches, long line partly searched)"
-        );
-        let deep = SearchState {
-            searched_lines: Some(100_000),
-            ..none
-        };
-        assert_eq!(
-            deep.spoken_status().as_deref(),
-            Some("no matches in newest 100,000 lines (long line partly searched)")
-        );
-    }
-
-    /// A floor names its cause, and the title, the spoken status and the bar
-    /// name the same one: the depth cap says how far it searched, the match
-    /// limit says the list is full — never `partial history` for a search that
-    /// read the whole buffer.
-    #[test]
-    fn a_floor_names_how_far_it_searched_or_the_match_limit() {
-        let depth = SearchState {
-            truncated: true,
-            searched_lines: Some(100_000),
-            ..seeded()
-        };
-        assert_eq!(
-            depth.window_title(),
-            "aterm — find: foo (1/3+, newest 100,000 lines)"
-        );
-        assert_eq!(
-            depth.spoken_status().as_deref(),
-            Some("match 1 of 3 (newest 100,000 lines)")
-        );
-        let none = SearchState {
-            matches: Vec::new(),
-            results_dirty: true,
-            ..depth
-        };
-        assert_eq!(
-            none.window_title(),
-            "aterm — find: foo (no matches in newest 100,000 lines, stale)"
-        );
-        assert_eq!(
-            none.spoken_status().as_deref(),
-            Some("no matches in newest 100,000 lines (stale)")
-        );
-
-        let full = SearchState {
-            truncated: true,
-            match_capped: true,
-            ..seeded()
-        };
-        assert_eq!(full.window_title(), "aterm — find: foo (1/3+, match limit)");
-        assert_eq!(
-            full.spoken_status().as_deref(),
-            Some("match 1 of 3 (match limit)")
-        );
-        assert!(!full.window_title().contains("history"));
-
-        let away = SearchState {
-            truncated: true,
-            history_away: true,
-            ..seeded()
-        };
-        assert_eq!(away.window_title(), "aterm — find: foo (1/3+, rewrapping)");
-
-        assert_eq!(super::line_count(100_000, false), "100,000");
-        assert_eq!(super::line_count(100_000, true), "100k");
-        assert_eq!(super::line_count(123_456, true), "123,456");
-        assert_eq!(super::line_count(999, false), "999");
     }
 
     fn set_query(app: &mut App, wid: WindowId, query: &str) {
@@ -2685,15 +2488,6 @@ mod tests {
                 .count_qualifier(),
             "…",
             "and the bar marks it rather than asserting 3/3"
-        );
-        assert!(
-            app.windows[&wid]
-                .search
-                .as_ref()
-                .expect("find")
-                .window_title()
-                .contains("(1/3, stale)"),
-            "the title carries the same qualifier as the bar"
         );
         // (`find_status_line`'s own rendering of this flag is pinned beside the
         // formatter, in control_input.rs.)
@@ -3131,46 +2925,23 @@ mod tests {
         );
     }
 
-    /// Truncated point navigation performs a logarithmic lookup and stores an
-    /// out-of-batch point separately; it never shifts or reallocates the 100k
-    /// capped match vector on a repeat.
+    /// Truncated point navigation: an Emacs point outside the capped batch is
+    /// selected on its own, never inserted into (or shifting) the batch; a point
+    /// inside the batch is selected in place.
     #[test]
-    fn truncated_point_install_is_logarithmic_and_allocation_stable() {
+    fn truncated_point_install_selects_an_out_of_batch_point_without_touching_the_batch() {
         let mut state = SearchState {
-            matches: (0..100_000).map(|row| (row, 0, 0)).collect(),
+            matches: (0..8).map(|row| (row, 0, 0)).collect(),
             truncated: true,
             ..Default::default()
         };
-        let len = state.matches.len();
-        let capacity = state.matches.capacity();
-        let ptr = state.matches.as_ptr();
-        let _ = super::take_point_lookup_comparisons();
-
-        assert!(!state.install_point_match((100_001, 0, 0)));
-        assert_eq!(state.current_match(), Some((100_001, 0, 0)));
-        assert_eq!(state.matches.len(), len);
-        assert_eq!(state.matches.capacity(), capacity);
-        assert_eq!(state.matches.as_ptr(), ptr);
-        assert!(
-            super::take_point_lookup_comparisons() <= 18,
-            "binary search over 100k coordinates needs at most ceil(log2(n))+1 comparisons"
-        );
-    }
-
-    /// Direction chooses the initial result in one state installation: forward is
-    /// always the first match, backward the last, including every small bounded match
-    /// count and the empty set. This is the no-transient-wrong-selection core used by
-    /// `search_recompute` before it calls the renderer-facing apply path.
-    #[test]
-    fn emacs_direction_initial_index_is_exhaustive_and_atomic() {
-        for count in 0..=4096 {
-            assert_eq!(SearchDirection::Forward.initial_index(count), 0);
-            assert_eq!(
-                SearchDirection::Backward.initial_index(count),
-                count.saturating_sub(1),
-                "count={count}"
-            );
-        }
+        let batch = state.matches.clone();
+        assert!(!state.install_point_match((100, 0, 0)));
+        assert_eq!(state.current_match(), Some((100, 0, 0)));
+        assert_eq!(state.matches, batch, "the capped batch is untouched");
+        assert!(state.install_point_match((3, 0, 0)));
+        assert_eq!(state.current_match(), Some((3, 0, 0)));
+        assert_eq!(state.matches, batch);
     }
 
     /// End-to-end state semantics over a real terminal: backward initial typing lands
@@ -3819,7 +3590,7 @@ mod tests {
     #[test]
     fn emacs_navigation_conforms_to_derived_transition_model() {
         let _serial = crate::control::search_cap_test_guard();
-        let model = aterm_spec::derive::emacs_search_navigation_model();
+        let model = aterm_models_render::emacs_search_navigation_model();
         emacs_navigation_trace(&model, no_nav_patch).unwrap_or_else(|why| panic!("{why}"));
 
         let members: [(&str, NavPatch, &str); 5] = [

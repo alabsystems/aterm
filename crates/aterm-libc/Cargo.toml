@@ -7,8 +7,9 @@
 # consumer's `libc = "0.2"`; the directory prefix marks it as ours.
 name = "libc"
 # NOT `version.workspace = true`: a semver contract with consumers. The
-# strictest requirement is `^0.2.182` (rustix 1.1.4); 0.2.186 meets all and
-# matches the lock's pre-swap version. A version below any requirement makes the
+# strictest requirement was `^0.2.182` (rustix 1.1.4, which left the lock at
+# linux-windowing LW.7); 0.2.186 meets all and matches the lock's pre-swap
+# version. A version below any requirement makes the
 # patch silently inert (`targo --unverified forge check` catches it).
 version = "0.2.186"
 edition.workspace = true
@@ -27,8 +28,9 @@ test = false
 # Upstream's feature table, so no parent's feature request fails to resolve.
 # Resolved (`cargo tree --target <cell> -e features -i libc`):
 # `default,extra_traits,std` on the unix cells, `default,std` on Windows and
-# wasm32. `extra_traits` is real (reached via rustix's `libc-extra-traits`) and
-# gates the PartialEq/Eq/Hash derives upstream gates.
+# wasm32. `extra_traits` is real (reached via rustix's `libc-extra-traits`
+# until rustix left at LW.7) and gates the PartialEq/Eq/Hash derives upstream
+# gates.
 default = ["std"]
 extra_traits = []
 # The rest are inert: this crate is always `no_std`; `align` and

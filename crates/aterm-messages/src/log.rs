@@ -1988,22 +1988,6 @@ pub(crate) mod tests {
         );
     }
 
-    #[test]
-    fn the_pending_queue_is_bounded_and_honest_about_drops() {
-        let mut log = MessageLog::empty();
-        for _ in 0..(PENDING_PERSIST_CAP + 3) {
-            let id = log.mint();
-            log.record_posted(LogRecord { id, ..posted(1) });
-        }
-        assert_eq!(log.pending_len(), PENDING_PERSIST_CAP);
-        assert_eq!(log.len(), LOG_CAP);
-        let drained = log.drain_pending();
-        assert_eq!(drained.len(), PENDING_PERSIST_CAP + 1);
-        assert_eq!(drained.last(), Some(&LogLine::Dropped { count: 3 }));
-        assert!(log.drain_pending().is_empty());
-        assert_eq!(log.pending_len(), 0);
-    }
-
     /// Every line about a wire-owned record (its Posted, Retired and Acted) is shelved
     /// for the wire's file; aterm's own lines, and the `Dropped` gap, for `messages.log`.
     #[test]

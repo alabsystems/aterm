@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! `ty_model!` paths the single-action ring in `macro_ring.rs` does not reach: an unguarded
-//! action, partial updates, a nested if/else and a parenthesized `>` guard. Each macro-built
-//! model must derive the same TLA+ as its hand-built `derive::*` counterpart.
+//! The `ty_model!` light-annotation surface is pure sugar: each macro-built
+//! model below derives byte-identical TLA+ to the `derive::*`-constructor model
+//! it should desugar to, over the shapes real models use:
+//!
+//!   * the bounded ring (`aterm_models_core::ring_model`, written out as `ring_hand`), cfg
+//!     and open-Init transition form too
+//!   * an action with NO `when` guard          -> the `guard: None` branch
+//!   * two actions with partial updates        -> disjunctive `Next` + `UNCHANGED`
+//!   * a nested `if/else` (else-arm is an `if`) -> `tr_else` over `Expr::If`
+//!   * the `>` operator, and `-`/`+` arithmetic in updates.
 
 use aterm_spec::derive::{
     Action, Invariant, Model, StateVar, Update, add, and_, cst, eq, gt, if_, le, or_, sub, var,
 };
 use aterm_spec::ty_model;
-use std::collections::BTreeMap;
 
 // Two actions with partial updates, one unguarded: each emits `UNCHANGED` for the other's
 // variable and `Next` is their disjunction.
@@ -77,48 +83,6 @@ fn cursor_unguarded_macro() -> Model {
     }
 }
 
-#[test]
-fn macro_unguarded_action_matches_hand_built_tla() {
-    let m = cursor_unguarded_macro();
-    let h = cursor_unguarded_hand();
-    assert_eq!(
-        m.to_tla(),
-        h.to_tla(),
-        "macro must desugar to the same TLA+"
-    );
-}
-
-#[test]
-fn macro_unguarded_action_emits_no_guard_conjunct() {
-    let tla = cursor_unguarded_macro().to_tla();
-    // The unguarded action starts with its update conjunct.
-    assert!(
-        tla.contains("Grow == seq =< MaxSeq - 1 /\\ seq' = seq + 1 /\\ UNCHANGED << cursor >>"),
-        "{tla}"
-    );
-    assert!(
-        tla.contains("Deliver == cursor' = seq /\\ UNCHANGED << seq >>"),
-        "unguarded Deliver must have no guard conjunct: {tla}"
-    );
-    assert!(tla.contains("Next == Grow \\/ Deliver"), "{tla}");
-}
-
-#[test]
-fn macro_unguarded_action_is_always_enabled_in_interpreter() {
-    let m = cursor_unguarded_macro();
-    let mut st = m.init_state();
-    assert!(m.action_enabled("Deliver", &st));
-    assert!(m.fire("Deliver", &mut st));
-    assert_eq!(
-        st[&"cursor"], 0,
-        "Deliver catches cursor up to seq (still 0)"
-    );
-    assert!(m.fire("Grow", &mut st));
-    assert!(m.fire("Deliver", &mut st));
-    assert_eq!(st[&"cursor"], 1);
-    assert!(m.check_invariant("CursorBounded", &st));
-}
-
 // A nested if/else (the else arm is an `if`, not a block) exercises `tr_else` over `Expr::If`.
 
 fn tiered_hand() -> Model {
@@ -179,82 +143,92 @@ fn tiered_macro() -> Model {
     }
 }
 
-#[test]
-fn macro_nested_if_else_matches_hand_built() {
-    assert_eq!(tiered_macro().to_tla(), tiered_hand().to_tla());
-}
+// ── The bounded ring ─────────────────────────────────────────────────────────
 
-#[test]
-fn macro_nested_if_else_renders_nested_tla() {
-    let tla = tiered_macro().to_tla();
-    assert!(
-        !tla.contains("CONSTANT"),
-        "no consts -> no CONSTANT line: {tla}"
-    );
-    // Both arms of the nested IF are parenthesized.
-    assert!(
-        tla.contains(
-            "Bump == level' = (IF n > 4 THEN 2 ELSE (IF n > 2 THEN 1 ELSE 0)) /\\ UNCHANGED << n >>"
-        ),
-        "{tla}"
-    );
-}
-
-#[test]
-fn macro_nested_if_else_interpreter_tiers() {
-    let m = tiered_macro();
-    let expect_level = |n: i64| -> i64 {
-        if n > 4 {
-            2
-        } else if n > 2 {
-            1
-        } else {
-            0
-        }
-    };
-    for steps in 0..=5usize {
-        let mut st: BTreeMap<&'static str, i64> = m.init_state();
-        for _ in 0..steps {
-            assert!(m.fire("Step", &mut st));
-        }
-        assert!(m.fire("Bump", &mut st));
-        assert_eq!(
-            st[&"level"],
-            expect_level(steps as i64),
-            "nested if/else tier wrong at n={steps}"
-        );
-        assert!(m.check_invariant("LevelBounded", &st));
+/// `aterm_models_core::ring_model`, written out with the builders: that model lives in a crate
+/// that depends on this one, so the hand-built twin is spelled here like the others.
+fn ring_hand() -> Model {
+    Model {
+        name: "Ring",
+        consts: vec![("MaxSeq", 6), ("Cap", 3), ("Buggy", 0)],
+        vars: vec![
+            StateVar {
+                name: "seq",
+                init: 0,
+            },
+            StateVar {
+                name: "lo",
+                init: 1,
+            },
+        ],
+        fn_vars: vec![],
+        actions: vec![Action {
+            name: "Push",
+            guard: Some(le(var("seq"), sub(cst("MaxSeq"), int_lit(1)))),
+            updates: vec![
+                Update {
+                    var: "seq",
+                    expr: add(var("seq"), int_lit(1)),
+                },
+                Update {
+                    var: "lo",
+                    expr: if_(
+                        gt(
+                            add(sub(add(var("seq"), int_lit(1)), var("lo")), int_lit(1)),
+                            add(cst("Cap"), cst("Buggy")),
+                        ),
+                        add(var("lo"), int_lit(1)),
+                        var("lo"),
+                    ),
+                },
+            ],
+        }],
+        invariants: vec![Invariant {
+            name: "LenBounded",
+            kind: aterm_spec::derive::InvariantKind::Claim,
+            expr: le(add(sub(var("seq"), var("lo")), int_lit(1)), cst("Cap")),
+        }],
     }
 }
 
-// A parenthesized guard exercises the `Expr::Paren` arm and `>`.
+/// The bounded event-log ring, written in the light-annotation surface.
+fn ring_macro() -> Model {
+    ty_model! {
+        Ring {
+            const MaxSeq = 6;
+            const Cap = 3;
+            const Buggy = 0;
+            var seq = 0;
+            var lo = 1;
+            action Push when (seq <= MaxSeq - 1) {
+                seq = seq + 1;
+                lo = if (seq + 1) - lo + 1 > Cap + Buggy { lo + 1 } else { lo };
+            }
+            invariant LenBounded: seq - lo + 1 <= Cap;
+        }
+    }
+}
 
 #[test]
-fn macro_paren_and_gt_in_guard() {
-    let m = ty_model! {
-        Gated {
-            var n = 0;
-            action Tick when ((n - 1) > 0) {
-                n = n + 1;
-            }
-            invariant Trivial: n <= 100;
-        }
-    };
-    let tla = m.to_tla();
-    // The macro unwraps the parens.
-    assert!(tla.contains("Tick == n - 1 > 0 /\\ n' = n + 1"), "{tla}");
-    let mut st = m.init_state();
-    assert!(
-        !m.action_enabled("Tick", &st),
-        "n=0: (n-1)>0 is -1>0 = false"
-    );
-    st.insert("n", 1);
-    assert!(
-        !m.action_enabled("Tick", &st),
-        "n=1: (n-1)>0 is 0>0 = false"
-    );
-    st.insert("n", 2);
-    assert!(m.action_enabled("Tick", &st), "n=2: (n-1)>0 is 1>0 = true");
+fn ty_model_desugars_to_the_hand_built_model() {
+    let cases: [(&str, Model, Model); 3] = [
+        ("ring", ring_macro(), ring_hand()),
+        (
+            "unguarded",
+            cursor_unguarded_macro(),
+            cursor_unguarded_hand(),
+        ),
+        ("nested if/else", tiered_macro(), tiered_hand()),
+    ];
+    for (case, macro_built, hand_built) in cases {
+        assert_eq!(macro_built.to_tla(), hand_built.to_tla(), "{case}: TLA+");
+        assert_eq!(macro_built.to_cfg(), hand_built.to_cfg(), "{case}: cfg");
+        assert_eq!(
+            macro_built.transition_spec(),
+            hand_built.transition_spec(),
+            "{case}: open-Init form"
+        );
+    }
 }
 
 // ── Grouping: an expression reads as Rust reads it ───────────────────────────

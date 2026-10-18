@@ -8,17 +8,11 @@ license.workspace = true
 repository.workspace = true
 description = "Resource sandbox for spawned children (ATERM_DESIGN WS-G): POSIX rlimits applied before exec, gated on an aterm-cap capability."
 
-[features]
-default = []
-# Compiles the `#[refines]` anchors binding `Limits::apply` to `Sandbox.tla`.
-# Off by default, so production builds carry no `aterm-spec`; the workspace
-# `spec_xref_closure` gate (aterm-gui's test build) enables it.
-spec-anchors = ["dep:aterm-spec"]
-
 [dependencies]
 aterm-cap = { workspace = true }
-# Only for `spec-anchors`.
-aterm-spec = { workspace = true, optional = true }
+# The anchor attributes' registry (std-only): `#[cfg_attr(any(test, debug_assertions),
+# aterm_spec_anchor::refines(…))]` expands in every test and debug build; release strips it.
+aterm-spec-anchor = { workspace = true }
 
 # POSIX-only: the setrlimit actuator (src/unix.rs). The Windows actuator is a
 # documented, capability-gated no-op (src/windows.rs) with zero FFI.
@@ -26,9 +20,7 @@ aterm-spec = { workspace = true, optional = true }
 libc = { workspace = true }
 
 [dev-dependencies]
-# The `#[refines]` anchor on `Limits::apply` compiles in the crate's own test
-# build (`cfg(test)`), so the test build names `aterm_spec`.
-aterm-spec = { workspace = true }
+aterm-models-core = { workspace = true }
 # Test-only: sandbox tests mint a root `Authority`; `launcher-mint` makes the sealed
 # mint nameable for this crate's own test build. The production `apply`/`restore`
 # seam receives a `Cap<Sandbox>` by argument and never mints.

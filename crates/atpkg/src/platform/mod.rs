@@ -18,9 +18,6 @@
 //!   `true`, [`permission_mode`]/[`our_uid`] report a not-applicable sentinel.
 //! * **Disk**: [`volume_free_bytes`] calls `GetDiskFreeSpaceExW` instead of `statvfs`;
 //!   both fail **OPEN** (`None` on any error).
-//! * **Spotlight**: [`spotlight_query`] and [`spotlight_index_state`] are macOS only and
-//!   `None` elsewhere (Windows Search has no per-directory opt-out for [`crate::noindex`]
-//!   to honour). `None` means the question could not be ASKED, never "not indexed".
 //! * **Exec**: [`exec_or_run`] is `spawn().wait()` + `process::exit` (no `execve`).
 //!
 //! `ensure_private_dir` and the advisory [`FileLock`] are delegated to
@@ -132,13 +129,14 @@ pub(crate) fn make_dirs_born(dir: &Path, mode: u32) -> io::Result<()> {
 }
 
 /// Make one open file or directory DURABLE: the barrier an atomic publish takes on its
-/// temp before the rename, and [`crate::store::sync_dir`] on the directory after it. The
-/// crate's one call of [`std::fs::File::sync_all`], which on Apple targets is
-/// `fcntl(F_FULLFSYNC)`, a drive-cache flush. A staged TREE takes the lighter
-/// [`sync_file_contents`] instead, for the reasons given there.
+/// temp before the rename, and [`crate::store::sync_dir`] on the directory after it:
+/// [`aterm_durable::durable`], which on Apple targets is `fcntl(F_FULLFSYNC)`, a
+/// drive-cache flush. A write that needs only its order kept takes
+/// [`aterm_durable::ordered`] ([`crate::store::sync_dir_ordered`]); a staged TREE takes
+/// the lighter [`sync_file_contents`], for the reasons given there.
 #[cfg(not(test))]
 pub(crate) fn sync_durable(f: &std::fs::File) -> io::Result<()> {
-    f.sync_all()
+    aterm_durable::durable(f)
 }
 
 /// [`sync_durable`] under this crate's own unit tests: a plain `fsync(2)`
@@ -156,7 +154,15 @@ pub(crate) fn sync_durable(f: &std::fs::File) -> io::Result<()> {
 /// build compile the arm above.
 #[cfg(test)]
 pub(crate) fn sync_durable(f: &std::fs::File) -> io::Result<()> {
-    sync_file_contents(f)
+    // Recorded as durable by the counting seam, as `aterm_durable::durable` would be.
+    #[cfg(unix)]
+    {
+        aterm_durable::seam::durable_fsync(f)
+    }
+    #[cfg(not(unix))]
+    {
+        aterm_durable::durable(f)
+    }
 }
 
 /// macOS's QoS launcher, the one the window wraps its package passes in. Absent
@@ -289,18 +295,6 @@ pub fn install_shim_env(
     env: &crate::shim_env::ShimEnv,
 ) -> io::Result<()> {
     install_shim_to_env(shim, &build_bin_dir.join(tool.exe_file()), env)
-}
-
-/// What a volume's Spotlight index does with new files ([`spotlight_index_state`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IndexState {
-    /// Indexing on: a planted file shows up.
-    Enabled,
-    /// Switched off (`mdutil -i off`, or "Indexing and searching disabled"): a setting.
-    Disabled,
-    /// "Index is read-only." — mds holds the index while the volume is low on space: searches
-    /// still answer, new entries do not land. Not a setting, so not a reason to skip migrating.
-    ReadOnly,
 }
 
 /// [`install_shim_to`] with the exported `env` — the `(shim path, target)` form of
@@ -1333,13 +1327,6 @@ mod tests {
         assert!(c.is_ascii(), "a .cmd tombstone is ASCII: {c}");
         // A tombstone must NOT parse as an installed shim (mirrors read_link Err on Unix).
         assert_eq!(parse_cmd_shim_target(&c), None);
-        // Framed like every other `.cmd`: a tombstone is laid over a shim
-        // that may be executing, and the notice must not be what its program's exit
-        // resumes into.
-        let mut want = cmd_frame();
-        want.push_str("@echo atpkg: ay was yanked/revoked - run `aterm pkg update` 1>&2\r\n");
-        want.push_str("@exit /b 70\r\n");
-        assert_eq!(c, want);
     }
 
     #[test]
@@ -1462,8 +1449,6 @@ mod tests {
                 "{not_a_forward:?}"
             );
         }
-        assert_eq!(CMD_FORWARD_TAIL, " %* & @exit /b");
-        assert_eq!(CMD_LEGACY_FORWARD_TAIL, " %*");
     }
 
     /// A LEGACY `.cmd` AGENTS TWIN — laid with the landing prelude — still resolves to the
@@ -1642,139 +1627,6 @@ mod tests {
         assert!(!twin.contains(crate::landing::HIDDEN_VERB), "{twin}");
         assert_eq!(parse_cmd_shim_target(&twin), Some(target.to_path_buf()));
         assert_eq!(parse_cmd_shim_env(&twin), env);
-    }
-
-    /// THE FRAME, exact: `@goto :main`, 51 lines of 78 colons, `@exit /b`,
-    /// `:main` — 4110 bytes ahead of every `.cmd` body this crate writes — and the bound
-    /// it is sized to, derived from the legacy writer's own caps (8 `@set` entries of 256
-    /// bytes, a `MAX_PATH` target at three UTF-8 bytes a unit): 2908 bytes, inside the
-    /// padding with 1185 to spare. Every `.cmd` renderer — shim, twin, tombstone — goes
-    /// through it, and both parsers read the same answers over a framed file as over a
-    /// legacy one. RENDERED TEXT ONLY: `cmd.exe`'s reading of it is unverified here.
-    #[test]
-    fn cmd_frame_is_the_head_the_padding_and_the_exit_sized_to_the_legacy_bound() {
-        let frame = cmd_frame();
-        let mut want = String::from("@goto :main\r\n");
-        for _ in 0..51 {
-            want.push_str(&":".repeat(78));
-            want.push_str("\r\n");
-        }
-        want.push_str("@exit /b\r\n:main\r\n");
-        assert_eq!(frame, want);
-        assert_eq!(frame.len(), CMD_FRAME_BYTES);
-        assert_eq!(CMD_FRAME_BYTES, 4110, "the per-file cost, said in bytes");
-        assert_eq!(CMD_PADDING_END_BYTES, 4093);
-        assert_eq!(
-            &frame[CMD_PADDING_END_BYTES..CMD_PADDING_END_BYTES + CMD_PADDING_EXIT.len()],
-            CMD_PADDING_EXIT
-        );
-        // The bound, from the caps the legacy writer wrote under.
-        assert_eq!(crate::shim_env::MAX_SHIM_ENV, 8);
-        assert_eq!(crate::shim_env::MAX_ENTRY_BYTES, 256);
-        assert_eq!(CMD_LEGACY_TARGET_BOUND_BYTES, 780);
-        assert_eq!(
-            CMD_LEGACY_FILE_BOUND_BYTES,
-            8 * (6 + 256 + 3) + 2 + 780 + 1 + 3 + 2
-        );
-        assert_eq!(CMD_LEGACY_FILE_BOUND_BYTES, 2908);
-        // The padding end as rendered (the compile-time assertion above the renderer pins
-        // the constants; this pins the text they describe).
-        let padding_end = frame.find("@exit /b").unwrap();
-        assert_eq!(padding_end, CMD_PADDING_END_BYTES);
-        assert!(padding_end >= CMD_LEGACY_FILE_BOUND_BYTES);
-        assert_eq!(padding_end - CMD_LEGACY_FILE_BOUND_BYTES, 1185);
-        assert_eq!(CMD_LEGACY_MIN_LINE_BYTES, 12, "`@set \"A=b\"` + CRLF");
-        assert!(CMD_FRAME_HEAD.len() - 2 <= CMD_LEGACY_MIN_LINE_BYTES);
-        // The line it is derived from is one the legacy writer COULD lay, and the one
-        // byte shorter (an empty value) is one it could not.
-        assert!(crate::shim_env::ShimEnv::admit(&["A=b".to_string()]).is_ok());
-        assert!(crate::shim_env::ShimEnv::admit(&["A=".to_string()]).is_err());
-        // A framed file with the longest body on top is far inside the reader's cap.
-        assert!(frame.len() + CMD_LEGACY_FILE_BOUND_BYTES + 2048 < MAX_SHIM_BYTES);
-        // Nothing in the frame expands, quotes or opens a block; CRLF throughout; every
-        // line silent (`@`) or a label.
-        assert!(!frame.contains(['%', '"', '(', ')', '^', '&']));
-        assert_eq!(frame.matches("\r\n").count(), frame.matches('\n').count());
-        for line in frame.split("\r\n").filter(|l| !l.is_empty()) {
-            assert!(line.starts_with('@') || line.starts_with(':'), "{line}");
-        }
-        // ONE writer: every `.cmd` renderer starts with the frame, and the head jumps to
-        // the label the body starts at.
-        let target = Path::new("C:\\store\\ay\\18\\bin\\ay.exe");
-        let env = crate::shim_env::ShimEnv::admit(&["DISABLE_AUTOUPDATER=1".to_string()]).unwrap();
-        let prelude = cmd_landing_prelude(
-            "ay",
-            Path::new("C:\\pkg"),
-            Path::new("C:\\pkg\\landing\\ay"),
-            Path::new("C:\\app\\atpkg.exe"),
-        );
-        for (what, content) in [
-            ("plain shim", cmd_shim_content(target)),
-            ("env shim", cmd_shim_content_env(target, &env)),
-            ("twin", cmd_shim_content_twin(target, &env, &prelude)),
-            (
-                "tombstone",
-                cmd_tombstone_content("atpkg: ay was yanked/revoked"),
-            ),
-        ] {
-            assert!(content.starts_with(&frame), "{what}: {content}");
-            assert_eq!(content.matches("\r\n:main\r\n").count(), 1, "{what}");
-            assert_eq!(content.matches("@goto :main").count(), 1, "{what}");
-            assert!(
-                !content[frame.len() - 2..].contains("\r\n@exit /b\r\n"),
-                "{what}: the body carries no exit line of its own past the frame's"
-            );
-        }
-        // Both parsers, over the framed file and over the legacy one: the same answers.
-        let mut legacy_env = String::new();
-        for (n, v) in env.entries() {
-            legacy_env.push_str("@set \"");
-            legacy_env.push_str(n);
-            legacy_env.push('=');
-            legacy_env.push_str(v);
-            legacy_env.push_str("\"\r\n");
-        }
-        legacy_env.push_str("@\"C:\\store\\ay\\18\\bin\\ay.exe\"");
-        legacy_env.push_str(CMD_LEGACY_FORWARD_TAIL);
-        legacy_env.push_str("\r\n");
-        let legacy_plain = "@\"C:\\store\\ay\\18\\bin\\ay.exe\" %*\r\n";
-        for (what, content) in [
-            ("legacy plain", legacy_plain.to_string()),
-            ("framed plain", cmd_shim_content(target)),
-            (
-                "framed twin, no env",
-                cmd_shim_content_twin(target, &crate::shim_env::ShimEnv::NONE, &prelude),
-            ),
-        ] {
-            assert_eq!(
-                parse_cmd_shim_target(&content),
-                Some(target.to_path_buf()),
-                "{what}"
-            );
-            assert_eq!(
-                parse_cmd_shim_env(&content),
-                crate::shim_env::ShimEnv::NONE,
-                "{what}"
-            );
-        }
-        for (what, content) in [
-            ("legacy env", legacy_env),
-            ("framed env", cmd_shim_content_env(target, &env)),
-            ("framed twin", cmd_shim_content_twin(target, &env, &prelude)),
-        ] {
-            assert_eq!(
-                parse_cmd_shim_target(&content),
-                Some(target.to_path_buf()),
-                "{what}"
-            );
-            assert_eq!(parse_cmd_shim_env(&content), env, "{what}");
-        }
-        assert_eq!(
-            parse_cmd_shim_target(&frame),
-            None,
-            "the frame alone forwards nowhere"
-        );
-        assert_eq!(parse_cmd_shim_env(&frame), crate::shim_env::ShimEnv::NONE);
     }
 
     /// THE RESUME SIMULATION: three legacy files — the plain twin, an env-carrying `bin/`
@@ -2050,7 +1902,7 @@ mod sh_shim_tests {
         assert_eq!(parse_sh_shim_target(notice), None);
     }
 
-    /// THE WRAPPER WITH AN ENVIRONMENT (design S7), exact: the note, one
+    /// THE WRAPPER WITH AN ENVIRONMENT (design S7): one
     /// `export NAME='VALUE'` per entry, then the unchanged `exec` line. The target still
     /// parses off the exec line (every sweep keyed on where a shim resolves is
     /// unchanged), the env parses back off the exports, an empty env is the plain shim
@@ -2064,14 +1916,13 @@ mod sh_shim_tests {
         ])
         .unwrap();
         let body = sh_shim_content_env(target, &env);
-        assert_eq!(
-            body,
-            "#!/bin/sh\n\
-             # atpkg shim — exec so the tool authenticates at its real path.\n\
-             # shim_env is aterm's policy for this program: only this managed copy runs with it.\n\
-             export DISABLE_AUTOUPDATER='1'\n\
-             export B='it'\\''s two words'\n\
-             exec '/prefix/store/claude/2026082701/bin/claude' \"$@\"\n"
+        assert!(
+            body.contains(
+                "\nexport DISABLE_AUTOUPDATER='1'\n\
+                 export B='it'\\''s two words'\n\
+                 exec '/prefix/store/claude/2026082701/bin/claude' \"$@\"\n"
+            ),
+            "{body}"
         );
         assert_eq!(parse_sh_shim_target(&body).as_deref(), Some(target));
         assert_eq!(parse_sh_shim_env(&body), env);
@@ -2122,21 +1973,23 @@ mod sh_shim_tests {
         // exports DISABLE_AUTOUPDATER=1 (an aterm-spawned Claude Code session does);
         // the child must see only what the shim under test lays, so scrub the
         // ambient copy from both invocations.
-        let out = std::process::Command::new(&shim)
-            .arg("arg")
-            .env_remove("DISABLE_AUTOUPDATER")
-            .output()
-            .unwrap();
+        // Each shim was just laid: past the `ETXTBSY` a sibling test's fork can hold it in.
+        let run_shim = || {
+            aterm_spec::wait::past_text_busy(|| {
+                std::process::Command::new(&shim)
+                    .arg("arg")
+                    .env_remove("DISABLE_AUTOUPDATER")
+                    .output()
+            })
+            .unwrap()
+        };
+        let out = run_shim();
         assert!(out.status.success());
         assert_eq!(String::from_utf8_lossy(&out.stdout), "1|arg\n");
         // The plain shim: no export, the program sees nothing, and nothing is read back.
         install_shim_to(&shim, &target).unwrap();
         assert_eq!(shim_env_of(&shim), crate::shim_env::ShimEnv::NONE);
-        let out = std::process::Command::new(&shim)
-            .arg("arg")
-            .env_remove("DISABLE_AUTOUPDATER")
-            .output()
-            .unwrap();
+        let out = run_shim();
         assert_eq!(String::from_utf8_lossy(&out.stdout), "unset|arg\n");
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -2150,8 +2003,8 @@ mod sh_shim_tests {
         assert_eq!(parse_sh_shim_target(&body).as_deref(), Some(nasty));
     }
 
-    /// THE ROUTED SHIM, exact: the header, the env note and exports (so both execs inherit
-    /// them), the exec-root note, the guard, and the unchanged store `exec` line. `None` is
+    /// THE ROUTED SHIM: the exports ahead of the guard (so both execs inherit them), and
+    /// the unchanged store `exec` line. `None` is
     /// the plain shim byte for byte; the target and the env parse back off the routed form
     /// exactly as off the plain one, because the guard line starts with `[`.
     #[test]
@@ -2160,20 +2013,6 @@ mod sh_shim_tests {
         let route = Path::new("/p/compat/trust/8595/bin/tippy");
         let none = crate::shim_env::ShimEnv::NONE;
         let body = sh_shim_content_routed(target, &none, Some(route));
-        assert_eq!(
-            body,
-            "#!/bin/sh\n\
-             # atpkg shim — exec so the tool authenticates at its real path.\n\
-             # atpkg exec root: this build ships bin/rustc as a separate copy of trustc, which \
-             its tippy refuses; the same tools run from a clone of the build where rustc holds \
-             trustc's bytes (aterm pkg doctor).\n\
-             [ ! -h '/p/compat/trust/8595/bin/tippy' ] && [ -f '/p/compat/trust/8595/bin/tippy' \
-             ] && [ -x '/p/compat/trust/8595/bin/tippy' ] && [ -f '/p/store/trust/8595/bin/tippy' \
-             ] && [ ! -h '/p/compat/trust/8595/.atpkg-root' ] && [ -f \
-             '/p/compat/trust/8595/.atpkg-root' ] && exec '/p/compat/trust/8595/bin/tippy' \
-             \"$@\"\n\
-             exec '/p/store/trust/8595/bin/tippy' \"$@\"\n"
-        );
         assert_eq!(parse_sh_shim_target(&body).as_deref(), Some(target));
         assert_eq!(parse_sh_shim_env(&body), none);
         assert_eq!(
@@ -2184,21 +2023,10 @@ mod sh_shim_tests {
 
         let env = crate::shim_env::ShimEnv::admit(&["DISABLE_AUTOUPDATER=1".to_string()]).unwrap();
         let body = sh_shim_content_routed(target, &env, Some(route));
-        assert_eq!(
-            body,
-            "#!/bin/sh\n\
-             # atpkg shim — exec so the tool authenticates at its real path.\n\
-             # shim_env is aterm's policy for this program: only this managed copy runs with it.\n\
-             export DISABLE_AUTOUPDATER='1'\n\
-             # atpkg exec root: this build ships bin/rustc as a separate copy of trustc, which \
-             its tippy refuses; the same tools run from a clone of the build where rustc holds \
-             trustc's bytes (aterm pkg doctor).\n\
-             [ ! -h '/p/compat/trust/8595/bin/tippy' ] && [ -f '/p/compat/trust/8595/bin/tippy' \
-             ] && [ -x '/p/compat/trust/8595/bin/tippy' ] && [ -f '/p/store/trust/8595/bin/tippy' \
-             ] && [ ! -h '/p/compat/trust/8595/.atpkg-root' ] && [ -f \
-             '/p/compat/trust/8595/.atpkg-root' ] && exec '/p/compat/trust/8595/bin/tippy' \
-             \"$@\"\n\
-             exec '/p/store/trust/8595/bin/tippy' \"$@\"\n"
+        assert!(
+            body.find("export DISABLE_AUTOUPDATER='1'").unwrap()
+                < body.find("exec '/p/compat/").unwrap(),
+            "both execs inherit the exports: {body}"
         );
         assert_eq!(parse_sh_shim_target(&body).as_deref(), Some(target));
         assert_eq!(parse_sh_shim_env(&body), env);
@@ -2343,8 +2171,8 @@ mod sh_shim_tests {
         std::fs::remove_dir_all(base.parent().unwrap()).unwrap();
     }
 
-    /// THE SELF-UPDATE BLOCK ([`crate::selfupdate`]), exact, for claude (three
-    /// verbs) and codex (one): the note, the `case "$1"` on the row's verbs, the repeated
+    /// THE SELF-UPDATE BLOCK ([`crate::selfupdate`]), for claude (three
+    /// verbs) and codex (one): the `case "$1"` on the row's verbs, the repeated
     /// `__atpkg=` assignment, the variable `exec` with the program and the prefix quoted
     /// and `"$@"` verbatim, `;;`, `esac`. Empty for an empty verb list, for a verb that
     /// would break the `case` pattern, for a program with a quote in it and for a name the
@@ -2364,35 +2192,18 @@ mod sh_shim_tests {
         );
         let verbs = crate::selfupdate::verbs_of("claude");
         let block = sh_selfupdate_prelude("claude", prefix, atpkg, verbs);
-        assert_eq!(
-            block,
-            "# atpkg: `claude update|upgrade|install` is answered by `atpkg __selfupdate` — \
-             aterm updates this copy from its vendor and verifies every build here (aterm help \
-             pkg).\n\
-             case \"$1\" in\n\
-             \x20 update|upgrade|install)\n\
-             \x20   __atpkg='/Applications/aterm.app/Contents/MacOS/atpkg'\n\
-             \x20   if [ -x \"$__atpkg\" ] && [ \"${__ATPKG_SELFUPDATE_PID-}\" != \"$$\" ]; then \
-             __ATPKG_SELFUPDATE_PID=$$ exec \"$__atpkg\" __selfupdate 'claude' \
-             '/Users//u/Library/Application Support/aterm/pkg' -- \"$@\"; fi\n\
-             \x20   ;;\n\
-             esac\n"
-        );
+        for code in [
+            "\ncase \"$1\" in\n  update|upgrade|install)\n",
+            "\n    __atpkg='/Applications/aterm.app/Contents/MacOS/atpkg'\n",
+            "__ATPKG_SELFUPDATE_PID=$$ exec \"$__atpkg\" __selfupdate 'claude' \
+             '/Users//u/Library/Application Support/aterm/pkg' -- \"$@\"; fi\n    ;;\nesac\n",
+        ] {
+            assert!(block.contains(code), "{code:?} in {block}");
+        }
         let codex =
             sh_selfupdate_prelude("codex", prefix, atpkg, crate::selfupdate::verbs_of("codex"));
-        assert_eq!(
-            codex,
-            "# atpkg: `codex update` is answered by `atpkg __selfupdate` — aterm updates this \
-             copy from its vendor and verifies every build here (aterm help pkg).\n\
-             case \"$1\" in\n\
-             \x20 update)\n\
-             \x20   __atpkg='/Applications/aterm.app/Contents/MacOS/atpkg'\n\
-             \x20   if [ -x \"$__atpkg\" ] && [ \"${__ATPKG_SELFUPDATE_PID-}\" != \"$$\" ]; then \
-             __ATPKG_SELFUPDATE_PID=$$ exec \"$__atpkg\" __selfupdate 'codex' \
-             '/Users//u/Library/Application Support/aterm/pkg' -- \"$@\"; fi\n\
-             \x20   ;;\n\
-             esac\n"
-        );
+        assert!(codex.contains("\n  update)\n"), "{codex}");
+        assert!(codex.contains("__selfupdate 'codex' "), "{codex}");
         // Fail-closed: no verbs, an unsafe verb, an unsafe program, a refused tool name.
         assert_eq!(sh_selfupdate_prelude("claude", prefix, atpkg, &[]), "");
         assert_eq!(

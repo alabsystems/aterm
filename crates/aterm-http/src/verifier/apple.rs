@@ -31,9 +31,9 @@
 //! 6. Extra anchors, test-only (see [`super::PlatformVerifier`]).
 //! 7. The stapled OCSP response, if the peer sent one.
 //! 8. `SecTrustEvaluateWithError`, which returns C `_Bool` — **not** an
-//!    `OSStatus`. A verifier that followed the `OSStatus` habit of
-//!    `crates/aterm-gui/src/net_connections/keychain.rs` and compared the result
-//!    to `errSecSuccess` (0) would read a REJECTION (`false` == 0) as success.
+//!    `OSStatus`. A verifier that followed the `OSStatus` habit of the other
+//!    `Sec*` calls and compared the result to `errSecSuccess` (0) would read a
+//!    REJECTION (`false` == 0) as success.
 //!    That mistake compiles, so the declaration below returns `bool` and the
 //!    branch is written so acceptance needs an explicit `true`.
 //!
@@ -59,8 +59,7 @@
 //! are both `CF_RETURNS_RETAINED` (+1). Leaking them would be an
 //! attacker-triggerable leak — a hostile endpoint can drive the failure path as
 //! often as it likes. Every +1 object here is wrapped in [`CfOwned`], which is
-//! the only place `CFRelease` is called, exactly once, on drop. This mirrors
-//! `crates/aterm-gui/src/net_connections/keychain.rs:218`.
+//! the only place `CFRelease` is called, exactly once, on drop.
 //!
 //! CHECKED, not asserted: `leaks --atExit` over the whole of `super::tests`
 //! (every accept case, every reject case, both real-chain runs) reports **0
@@ -131,8 +130,7 @@ const ERR_SEC_CERTIFICATE_REVOKED: CFIndex = -67820;
 /// opaque words so the type is `Sync` (an `extern` static of a
 /// raw-pointer-bearing type is not) and so the layout claim is checkable against
 /// `CFArray.h:78`. Only `&raw const` of the static is ever taken — the contents
-/// are never read by this crate. Same reasoning, same shape, as the two
-/// dictionary callback tables in `net_connections/keychain.rs:79`.
+/// are never read by this crate.
 #[repr(C)]
 struct CFArrayCallBacks {
     version: CFIndex,

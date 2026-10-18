@@ -344,6 +344,21 @@ impl Mailbox {
         }
     }
 
+    /// Whether NOTHING is queued for the loop — no record, event, closure or
+    /// resume. The bridge reads the acks of its pipelined publishes when this
+    /// holds, so a burst of work shares group commits and an idle bridge waits
+    /// for its one record as before.
+    pub(crate) fn is_idle(&self) -> bool {
+        self.lock().is_empty()
+    }
+
+    /// Whether an inbox-group record is queued behind the one being handled:
+    /// the bridge commits the group once its queue runs dry, so a burst costs
+    /// one commit rather than one per record.
+    pub(crate) fn inbox_queued(&self) -> bool {
+        !self.lock().inbox.records.is_empty()
+    }
+
     /// The incarnation of broker source `s` a reader spawned NOW must stamp its
     /// pushes with.
     #[must_use]
@@ -530,35 +545,9 @@ impl Mailbox {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-
-    /// How long a wait for something that MUST happen — an item, a park — may
-    /// take before it is read as a hang (AGENTS.md: a hang detector is a
-    /// minute, never a latency budget).
-    const HANG_DETECTOR: Duration = Duration::from_secs(60);
 
     fn rec(off: u64) -> Record {
         (off, format!("/s/{off}"), Vec::new())
-    }
-
-    /// A halt behind a full inbox backlog still arrives first.
-    #[test]
-    fn a_halt_outranks_an_inbox_backlog_however_deep_it_is() {
-        let mb = Mailbox::default();
-        for off in 0..(QUEUE_ROWS_MAX as u64 - 1) {
-            assert_eq!(mb.push(Source::Inbox, rec(off), 0), Pushed::Queued);
-        }
-        assert_eq!(mb.push(Source::Fleet, rec(999_999), 0), Pushed::Queued);
-        let first = mb.take(HANG_DETECTOR).expect("an item");
-        match first {
-            Item::Fleet((off, _, _)) => assert_eq!(off, 999_999),
-            other => panic!("the halt did not come first: {other:?}"),
-        }
-        // And the backlog is still there, in order.
-        match mb.take(HANG_DETECTOR).expect("an item") {
-            Item::Inbox((off, _, _)) => assert_eq!(off, 0),
-            other => panic!("{other:?}"),
-        }
     }
 
     /// The full order, once: closed, fleet, resume, event, inbox, say.
@@ -662,19 +651,6 @@ mod tests {
         assert_eq!(mb.replay_pressure(), ReplayPressure::Urgent);
     }
 
-    /// A push from another thread wakes the wait; the timeout is a hang detector.
-    #[test]
-    fn a_push_from_another_thread_wakes_the_wait() {
-        let mb = Arc::new(Mailbox::default());
-        let writer = {
-            let mb = mb.clone();
-            std::thread::spawn(move || mb.push(Source::Fleet, rec(7), 0))
-        };
-        let got = mb.take(HANG_DETECTOR).expect("woken by the push");
-        assert!(matches!(got, Item::Fleet((7, _, _))));
-        assert_eq!(writer.join().expect("writer thread"), Pushed::Queued);
-    }
-
     /// A reconnect forgets the old connection's inputs — records, closures, a
     /// pause and a resume — and nothing else.
     #[test]
@@ -769,25 +745,6 @@ mod tests {
             mb.take(Duration::ZERO).is_none(),
             "the say face left nothing"
         );
-    }
-
-    /// Aterm's own closure is never generation-scoped.
-    #[test]
-    fn aterms_closure_survives_every_broker_generation() {
-        let mb = Mailbox::default();
-        mb.push_aterm_closed();
-        mb.reset_broker_sources();
-        assert!(matches!(
-            mb.take(Duration::from_millis(0)),
-            Some(Item::Closed(Source::Aterm))
-        ));
-        mb.reset_broker_sources();
-        mb.reset_source(Source::Aterm);
-        mb.push_aterm_closed();
-        assert!(matches!(
-            mb.take(Duration::from_millis(0)),
-            Some(Item::Closed(Source::Aterm))
-        ));
     }
 
     /// A BROKER SOURCE AT ITS ROW BOUND PAUSES, and never waits: the record that

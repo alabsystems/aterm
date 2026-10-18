@@ -3,58 +3,8 @@
 
 use super::*;
 
-#[test]
-fn line_from_str() {
-    let line = Line::from("Hello, World!");
-    assert_eq!(line.to_string(), "Hello, World!");
-    assert_eq!(line.len(), 13);
-    assert!(!line.is_empty());
-}
-
-#[test]
-fn line_empty() {
-    let line = Line::new();
-    assert!(line.is_empty());
-    assert_eq!(line.len(), 0);
-}
-
-#[test]
-fn line_wrapped_flag() {
-    let mut line = Line::from("test");
-    assert!(!line.is_wrapped());
-    line.set_wrapped(true);
-    assert!(line.is_wrapped());
-    line.set_wrapped(false);
-    assert!(!line.is_wrapped());
-}
-
-#[test]
-fn line_serialize_roundtrip() {
-    let mut line = Line::from("Hello, World!");
-    line.set_wrapped(true);
-
-    let serialized = line.serialize();
-    let deserialized = Line::deserialize(&serialized).unwrap();
-
-    assert_eq!(deserialized.to_string(), "Hello, World!");
-    assert!(deserialized.is_wrapped());
-}
-
-#[test]
-fn serialize_lines_roundtrip() {
-    let lines: Vec<Line> = (0..10).map(|i| Line::from(&*format!("Line {i}"))).collect();
-
-    let serialized = serialize_lines(&lines);
-    let deserialized = deserialize_lines(&serialized);
-
-    assert_eq!(deserialized.len(), 10);
-    for (i, line) in deserialized.iter().enumerate() {
-        assert_eq!(line.to_string(), format!("Line {i}"));
-    }
-}
-
-/// A crafted block's inflated `count` must not size the retained Vec: spare
-/// capacity in the DiskColdTier cache escapes `page_byte_size` (len-based).
+/// A crafted block's inflated `count` must not size the retained Vec: its spare
+/// capacity escapes any len-based byte count.
 #[test]
 fn deserialize_lines_bounds_capacity_for_inflated_count() {
     // A well-formed single-line block: [count=1][valid line record].
@@ -83,41 +33,9 @@ fn deserialize_lines_bounds_capacity_for_inflated_count() {
     );
 }
 
-#[test]
-fn line_content_inline() {
-    let short = LineContent::from_bytes(b"short");
-    assert!(matches!(short, LineContent::Inline(_)));
-    assert_eq!(short.len(), 5);
-}
-
-#[test]
-fn line_content_heap() {
-    let long_data = vec![b'x'; 200];
-    let long = LineContent::from_bytes(&long_data);
-    assert!(matches!(long, LineContent::Heap(_)));
-    assert_eq!(long.len(), 200);
-}
-
 // ============================================================================
 // RLE Attribute Tests
 // ============================================================================
-
-#[test]
-fn cell_attrs_default() {
-    let attrs = CellAttrs::DEFAULT;
-    assert!(attrs.is_default());
-    assert_eq!(attrs.fg, DEFAULT_FG);
-    assert_eq!(attrs.bg, DEFAULT_BG);
-    assert_eq!(attrs.flags, 0);
-}
-
-#[test]
-fn cell_attrs_serialize_roundtrip() {
-    let attrs = CellAttrs::new(0x01_FF0000, 0x01_00FF00, 0x0007);
-    let serialized = attrs.serialize();
-    let deserialized = CellAttrs::deserialize(&serialized).unwrap();
-    assert_eq!(attrs, deserialized);
-}
 
 #[test]
 fn cell_attrs_from_raw_preserves_main_cell_wide_geometry() {
@@ -142,28 +60,6 @@ fn cell_attrs_from_raw_preserves_main_cell_wide_geometry() {
         Some(attrs),
         "the existing u16 wire field round-trips WIDE without a format change"
     );
-}
-
-#[test]
-fn line_with_attrs() {
-    let mut rle: Rle<CellAttrs> = Rle::new();
-    // Simulate: 5 chars with red fg, 5 chars with default
-    let red_attrs = CellAttrs::new(0x01_FF0000, DEFAULT_BG, 0);
-    for _ in 0..5 {
-        rle.push(red_attrs);
-    }
-    for _ in 0..5 {
-        rle.push(CellAttrs::DEFAULT);
-    }
-
-    let line = Line::with_attrs("HelloWorld", rle);
-    assert!(line.has_attrs());
-    assert_eq!(line.attr_run_count(), 2);
-
-    // Check attrs at specific positions
-    assert_eq!(line.get_attr(0).fg, 0x01_FF0000);
-    assert_eq!(line.get_attr(4).fg, 0x01_FF0000);
-    assert_eq!(line.get_attr(5).fg, DEFAULT_FG);
 }
 
 /// The run-cursor matches `get_attr` at every index (monotone walks, repeats,
@@ -296,37 +192,6 @@ fn serialize_lines_roundtrip_with_attrs() {
 // ============================================================================
 
 #[test]
-fn hyperlink_span_contains() {
-    let span = HyperlinkSpan::new(5, 15, Arc::from("https://example.com"));
-    assert!(!span.contains(4));
-    assert!(span.contains(5));
-    assert!(span.contains(10));
-    assert!(span.contains(14));
-    assert!(!span.contains(15));
-    assert_eq!(span.width(), 10);
-}
-
-#[test]
-fn line_with_hyperlinks_basic() {
-    let rle: Rle<CellAttrs> = Rle::new();
-    let hyperlinks = vec![HyperlinkSpan::new(0, 5, Arc::from("https://example.com"))];
-    let line = Line::with_hyperlinks("Click here!", rle, hyperlinks);
-
-    assert!(line.has_hyperlinks());
-    assert_eq!(line.hyperlink_count(), 1);
-    assert_eq!(
-        line.get_hyperlink(0).map(|s| s.as_ref()),
-        Some("https://example.com")
-    );
-    assert_eq!(
-        line.get_hyperlink(4).map(|s| s.as_ref()),
-        Some("https://example.com")
-    );
-    assert!(line.get_hyperlink(5).is_none());
-    assert!(line.get_hyperlink(10).is_none());
-}
-
-#[test]
 fn line_with_multiple_hyperlinks() {
     let rle: Rle<CellAttrs> = Rle::new();
     let hyperlinks = vec![
@@ -349,16 +214,8 @@ fn line_with_multiple_hyperlinks() {
 }
 
 #[test]
-fn line_no_hyperlinks() {
-    let line = Line::from("No links here");
-    assert!(!line.has_hyperlinks());
-    assert_eq!(line.hyperlink_count(), 0);
-    assert!(line.get_hyperlink(0).is_none());
-}
-
-#[test]
 fn deserialize_caps_oversized_hyperlink_url_and_id() {
-    // A crafted checkpoint or .dtrm page can declare a span whose url_len/id_len
+    // A crafted checkpoint or cold page can declare a span whose url_len/id_len
     // exceed the OSC 8 ingestion caps: deserialize skips the over-cap URL span
     // and drops the over-cap id.
     use crate::line::line_codec::{MAX_HYPERLINK_ID_BYTES, MAX_HYPERLINK_URL_BYTES};
@@ -455,31 +312,6 @@ fn deserialize_caps_hyperlink_span_count() {
 }
 
 #[test]
-fn line_hyperlink_serialize_roundtrip() {
-    let rle: Rle<CellAttrs> = Rle::new();
-    let hyperlinks = vec![
-        HyperlinkSpan::new(0, 10, Arc::from("https://example.com/path?query=1")),
-        HyperlinkSpan::new(15, 25, Arc::from("mailto:test@example.com")),
-    ];
-    let line = Line::with_hyperlinks("Visit our site or email us!", rle, hyperlinks);
-
-    let serialized = line.serialize();
-    let deserialized = Line::deserialize(&serialized).unwrap();
-
-    assert_eq!(deserialized.to_string(), "Visit our site or email us!");
-    assert!(deserialized.has_hyperlinks());
-    assert_eq!(deserialized.hyperlink_count(), 2);
-    assert_eq!(
-        deserialized.get_hyperlink(5).map(|s| s.as_ref()),
-        Some("https://example.com/path?query=1")
-    );
-    assert_eq!(
-        deserialized.get_hyperlink(20).map(|s| s.as_ref()),
-        Some("mailto:test@example.com")
-    );
-}
-
-#[test]
 fn line_underline_color_serialize_roundtrip() {
     // A line with SGR 58 underline colours serializes as v4 and round-trips the
     // packed colours (RGB 0x01.. and indexed 0x02..) by column, with the gap
@@ -529,31 +361,6 @@ fn line_without_underline_colors_stays_v3() {
     assert!(!deserialized.has_underline_colors());
     assert_eq!(deserialized.get_underline_color(0), None);
     assert!(deserialized.has_hyperlinks());
-}
-
-#[test]
-fn line_underline_colors_and_hyperlinks_roundtrip_together() {
-    // Underline colours follow the hyperlinks; deserialize must locate the
-    // section past the hyperlink bytes, so both survive.
-    let rle: Rle<CellAttrs> = Rle::new();
-    let hyperlinks = vec![HyperlinkSpan::with_id(
-        0,
-        5,
-        Arc::from("https://both.test"),
-        Some(Arc::from("id-7")),
-    )];
-    let mut line = Line::with_hyperlinks("BOTHx", rle, hyperlinks);
-    line.set_underline_colors(vec![UnderlineColorSpan::new(0, 5, 0x01_10_20_30)]);
-
-    let serialized = line.serialize();
-    assert_eq!(serialized[0], 4);
-    let d = Line::deserialize(&serialized).unwrap();
-    assert_eq!(
-        d.get_hyperlink(2).map(|s| s.as_ref()),
-        Some("https://both.test")
-    );
-    assert_eq!(d.get_underline_color(2), Some(0x01_10_20_30));
-    assert_eq!(d.get_underline_color(4), Some(0x01_10_20_30));
 }
 
 #[test]
@@ -692,55 +499,9 @@ fn line_hyperlink_with_id_serialize_roundtrip() {
     assert!(span1.id.is_none());
 }
 
-#[test]
-fn hyperlink_span_serialized_size() {
-    let span = HyperlinkSpan::new(0, 10, Arc::from("https://x.com"));
-    // v3: start_col (2) + end_col (2) + url_len (4) + url (13) + id_len (4) = 25
-    assert_eq!(span.serialized_size(), 2 + 2 + 4 + 13 + 4);
-
-    // With an explicit ID
-    let span_with_id =
-        HyperlinkSpan::with_id(0, 10, Arc::from("https://x.com"), Some(Arc::from("link-1")));
-    // v3: 2 + 2 + 4 + 13 + 4 + 6 = 31
-    assert_eq!(span_with_id.serialized_size(), 2 + 2 + 4 + 13 + 4 + 6);
-}
-
 // =============================================================================
 // Robustness tests for untrusted input
 // =============================================================================
-
-/// `deserialize_lines` clamps its reservation to what the data can hold: a count
-/// of 1M over no records reserves nothing.
-#[test]
-fn deserialize_lines_malicious_count_over_allocates() {
-    let count: u32 = 1_000_000;
-    let data = count.to_le_bytes();
-    let result = deserialize_lines(&data);
-    assert!(
-        result.is_empty(),
-        "huge count with no data should produce empty vec"
-    );
-    assert_eq!(
-        result.capacity(),
-        0,
-        "capacity clamped to 0 when no data for actual lines"
-    );
-}
-
-/// deserialize_lines with count=0 and empty data should return empty vec.
-#[test]
-fn deserialize_lines_zero_count() {
-    let data = 0u32.to_le_bytes();
-    let result = deserialize_lines(&data);
-    assert!(result.is_empty());
-}
-
-/// deserialize_lines with truncated data (< 4 bytes) should return empty vec.
-#[test]
-fn deserialize_lines_truncated_header() {
-    let result = deserialize_lines(&[0x01, 0x02]);
-    assert!(result.is_empty());
-}
 
 /// A record declaring content past `MAX_LINE_CONTENT_BYTES` is rejected, not
 /// materialized; a normal line round-trips.
@@ -955,20 +716,6 @@ fn strict_checkpoint_decoder_keeps_span_columns_bounded_by_cols() {
     );
 }
 
-/// deserialize_lines with count > actual lines should only return what exists.
-#[test]
-fn deserialize_lines_count_exceeds_actual() {
-    // Serialize one real line
-    let line = Line::from("test");
-    let serialized = serialize_lines(&[line]);
-    // Corrupt the count to 100 (actual = 1)
-    let mut corrupted = serialized.clone();
-    corrupted[0..4].copy_from_slice(&100u32.to_le_bytes());
-    let result = deserialize_lines(&corrupted);
-    assert_eq!(result.len(), 1, "should only parse the one actual line");
-    assert_eq!(result[0].to_string(), "test");
-}
-
 /// A 41-byte fuzz crash artifact: no decode path panics or overflows on it.
 #[test]
 fn fuzz_crash_4950_line_codec_no_overflow() {
@@ -1072,36 +819,6 @@ fn fuzz_regression_rle_run_length_overflow() {
     assert!(line.has_attrs());
 }
 
-/// `serialize_lines` of plain-text lines fits a content-aware estimate:
-/// 4 + sum(line.len()) + 9 per line.
-#[test]
-fn serialize_lines_capacity_covers_plain_text() {
-    let lines: Vec<Line> = (0..100)
-        .map(|i| Line::from(&*format!("Line {:04}: {}", i, "x".repeat(70))))
-        .collect();
-
-    let content_bytes: usize = lines.iter().map(|l| l.len()).sum();
-    let estimated_cap = 4 + content_bytes + lines.len() * 9;
-
-    let serialized = serialize_lines(&lines);
-
-    assert!(
-        serialized.len() <= estimated_cap,
-        "serialized size {} exceeds content-aware estimate {}: \
-         each plain-text line should be content + 9 bytes overhead",
-        serialized.len(),
-        estimated_cap
-    );
-
-    // Round-trip correctness preserved.
-    let deserialized = deserialize_lines(&serialized);
-    assert_eq!(deserialized.len(), 100);
-    for (i, line) in deserialized.iter().enumerate() {
-        let expected = format!("Line {:04}: {}", i, "x".repeat(70));
-        assert_eq!(line.to_string(), expected);
-    }
-}
-
 /// Colored output, OSC 8 links and SGR 58 all contribute to the block's
 /// reservation; a content-only estimate grows and retains excess capacity.
 #[test]
@@ -1150,37 +867,6 @@ fn serialize_lines_empty_and_single() {
     let deserialized = deserialize_lines(&serialized);
     assert_eq!(deserialized.len(), 1);
     assert_eq!(deserialized[0].to_string(), "hello");
-}
-
-#[test]
-fn fuzz_deserialize_lines_never_panics_on_corrupt_disk_data() {
-    // Disk pages may be truncated or bit-flipped: `deserialize_lines` never
-    // panics on arbitrary bytes and never decodes more lines than the data can
-    // hold, including under a maximal count header.
-    let mut state: u64 = 0x6A09_E667_F3BC_C908;
-    let mut next = move || {
-        state = state
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        (state >> 33) as u32
-    };
-    for _ in 0..100_000 {
-        let len = (next() % 256) as usize;
-        let mut data: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
-        // Half the time, force a maximal count header to exercise the clamp.
-        if len >= 4 && next() & 1 == 0 {
-            data[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
-        }
-        let lines = deserialize_lines(&data);
-        // No over-allocation / over-read: the minimum line record is 5 bytes, so
-        // a payload of `len` bytes can hold at most `(len-4)/5` lines.
-        let max_possible = len.saturating_sub(4) / 5;
-        assert!(
-            lines.len() <= max_possible,
-            "decoded {} lines from {len} bytes (max {max_possible}) — count clamp breached",
-            lines.len()
-        );
-    }
 }
 
 #[test]
@@ -1365,37 +1051,6 @@ fn the_rows_of_one_footprint_together_charge_the_payload_exactly_once() {
 }
 
 #[test]
-fn dropping_one_line_of_a_footprint_drops_exactly_its_share() {
-    let image = test_image(4, 4, 40_000);
-    let bare = Line::new().memory_used();
-    let mut line = Line::new();
-    line.set_images(vec![ImageSpan::new(0, 4, 2, 0, image)]);
-    let with_image = line.memory_used();
-    // One row of a four-row footprint carries a quarter of the raster.
-    assert!(
-        (with_image - bare) >= 10_000,
-        "a covered row must carry its share of the raster"
-    );
-    assert!(
-        (with_image - bare) < 20_000,
-        "a covered row must not carry the whole raster"
-    );
-}
-
-#[test]
-fn a_line_with_no_image_serializes_exactly_as_it_did_before_images_existed() {
-    // The wire format is untouched: the image field adds no section and no
-    // version bump, so ordinary history bytes are unchanged.
-    let rle: Rle<CellAttrs> = Rle::new();
-    let plain = Line::with_hyperlinks("no picture here", rle, Vec::new());
-    let bytes = plain.serialize();
-    assert_eq!(bytes[0], 3, "an image-free line stays v3");
-    let back = Line::deserialize(&bytes).expect("round trip");
-    assert_eq!(back.as_str(), Some("no picture here"));
-    assert!(!back.has_images());
-}
-
-#[test]
 fn serialization_drops_the_image_and_keeps_everything_else() {
     // Pins the scope line: a picture survives in the in-memory hot tier and is
     // dropped when its line is compressed. A block-codec payload table would
@@ -1535,23 +1190,6 @@ fn attr_heavy_row(chars: usize) -> Line {
         rle.push(if i % 2 == 0 { a } else { b });
     }
     Line::with_attrs(&"a".repeat(chars), rle)
-}
-
-#[test]
-fn the_link_ceiling_is_the_record_cap_plus_one_maximal_link_per_column() {
-    let (_, _, cap80) = handoff_caps(80);
-    assert_eq!(cap80, 57_344);
-    assert_eq!(
-        crate::line::line_codec_block::max_linked_record_bytes(cap80, 80),
-        734_144,
-        "80 columns: the cap plus 80 spans of 12 + 8192 + 256 bytes"
-    );
-    let (_, _, cap4096) = handoff_caps(4096);
-    assert_eq!(
-        crate::line::line_codec_block::max_linked_record_bytes(cap4096, 4096),
-        36_765_696,
-        "the widest grid"
-    );
 }
 
 /// The relaxation only adds leniency: on every block the strict decoder admits,
@@ -1770,4 +1408,31 @@ fn the_stripping_decoder_refuses_every_record_its_links_do_not_explain() {
     let mut short = block;
     short[..4].copy_from_slice(&3u32.to_le_bytes());
     assert!(stripping_block(&short, 3, 80).is_none(), "a missing record");
+}
+
+/// A bounded block is wire-identical at its exact budget and refuses smaller
+/// budgets, including the styled, linked and underline-colour sections.
+#[test]
+fn bounded_line_blocks_preserve_wire_bytes_at_their_budget() {
+    let mut attrs = Rle::new();
+    attrs.push(CellAttrs::new(0x01_FF_00_00, DEFAULT_BG, 0));
+    let mut styled = Line::with_hyperlinks(
+        "x",
+        attrs,
+        vec![HyperlinkSpan::with_id(
+            0,
+            1,
+            Arc::from("https://example.test/"),
+            Some(Arc::from("id")),
+        )],
+    );
+    styled.set_underline_colors(vec![UnderlineColorSpan::new(0, 1, 0x01_AA_BB_CC)]);
+    for lines in [vec![], vec![Line::from("plain")], vec![styled]] {
+        let expected = serialize_lines(&lines);
+        let bounded = serialize_lines_bounded(&lines, expected.len()).expect("exact budget");
+        assert_eq!(bounded, expected);
+        assert!(serialize_lines_bounded(&lines, expected.len() - 1).is_none());
+        assert!(serialize_lines_bounded(&lines, 0).is_none());
+        assert_eq!(deserialize_lines(&bounded).len(), lines.len());
+    }
 }

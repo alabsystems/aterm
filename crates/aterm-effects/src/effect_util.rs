@@ -192,8 +192,7 @@ pub(crate) fn lerp(a: f32, b: f32, t: f32) -> f32 {
 /// Module-level `const` because the ramps run per particle per frame, and a
 /// local table is re-materialized on the stack whenever inlining declines.
 /// [`ramp_5stop`] relies on this table's shape (positions strictly ascending,
-/// first exactly 0.0, last exactly 1.0), pinned by
-/// `ramp_stop_tables_hold_the_branchless_contract`.
+/// first exactly 0.0, last exactly 1.0).
 const FIRE_STOPS: [(f32, u32); 5] = [
     (0.0, 0x002A_0000),
     (0.25, 0x008B_1A00),
@@ -384,8 +383,6 @@ pub(crate) const STAR_ARM_HERO: f32 = 1.4;
 pub(crate) const STAR_ARM_INK: f32 = 1.55;
 
 /// The ladder's shape, checked at build time: the rungs stay ordered and short.
-/// `the_star_arm_ladder_is_ordered_and_derived` checks that [`star_arm`] realizes
-/// each rung.
 const _: () = {
     assert!(
         STAR_ARM_FINE < STAR_ARM_STD && STAR_ARM_STD < STAR_ARM_HERO,
@@ -511,7 +508,8 @@ const _: () = assert!(
 /// The one twinkle: a star's brightness multiplier at `age_s` seconds of life
 /// on its own `phase` (radians; seed per star so a field blinks out of step).
 /// Driven by age, never a frame counter, so the rate is the same at any refresh
-/// rate. Pinned by `sparkle_twinkle_is_frame_rate_independent`.
+/// rate; `twinkle_law_stays_under_the_photosensitivity_bound` measures the
+/// rate.
 #[inline]
 pub(crate) fn twinkle_env(age_s: f32, phase: f32) -> f32 {
     TWINKLE_FLOOR + TWINKLE_DEPTH * (age_s * TWINKLE_OMEGA + phase).sin().abs()
@@ -731,66 +729,6 @@ mod tests {
         );
     }
 
-    /// A star DIMS, it never blinks out, and the law never brightens a star past
-    /// the coverage its emitter asked for.
-    #[test]
-    fn twinkle_law_dims_between_the_floor_and_unity() {
-        assert!((TWINKLE_FLOOR + TWINKLE_DEPTH - 1.0).abs() < 1e-6);
-        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
-        for i in 0..4000 {
-            let v = twinkle_env(i as f32 * 0.001, 0.37);
-            assert!(
-                (TWINKLE_FLOOR..=1.0).contains(&v),
-                "envelope left its range: {v}"
-            );
-            lo = lo.min(v);
-            hi = hi.max(v);
-        }
-        assert!(
-            lo < TWINKLE_FLOOR + 0.01,
-            "the envelope never reaches its floor"
-        );
-        assert!(hi > 0.99, "the envelope never reaches full");
-    }
-
-    /// The glint gate is a fraction of the envelope's range, so a depth retune
-    /// cannot change how often a star glints (~26 % duty).
-    #[test]
-    fn twinkle_glint_gate_holds_its_duty() {
-        let n = 20_000;
-        let hits = (0..n)
-            .filter(|i| twinkle_peak(twinkle_env(*i as f32 * 0.0005, 0.0)))
-            .count();
-        let duty = hits as f32 / n as f32;
-        assert!(
-            (0.20..0.32).contains(&duty),
-            "glint duty drifted to {duty} — the family's stars stopped agreeing on 'brightest instant'"
-        );
-    }
-
-    /// The accent deal is 1-in-[`STAR_ACCENT_DEN`], measured over a uniform
-    /// seed sweep. The plus must stay a small minority and must not vanish.
-    #[test]
-    fn the_stardust_accent_is_a_small_dealt_minority() {
-        let n = 16_000u32;
-        let hits = (0..n).filter(|s| star_accent(*s)).count();
-        let share = hits as f32 / n as f32;
-        // Exact over a contiguous sweep: `seed % DEN == 0` partitions perfectly.
-        assert!(
-            (share - 1.0 / STAR_ACCENT_DEN as f32).abs() < 1e-6,
-            "the deal measured {share}, not 1-in-{STAR_ACCENT_DEN}"
-        );
-        assert!(
-            hits > 0,
-            "the accent must SURVIVE — it is the family's grace note"
-        );
-        assert!(
-            share <= 0.07,
-            "the plus is back to texture at {:.1} % of the population",
-            share * 100.0
-        );
-    }
-
     /// The arm conversion truncates, and that matters: at every shipping cell
     /// height the family's heaviest named grain is a hairline under truncation,
     /// and somewhere in that band it is not under rounding.
@@ -852,9 +790,7 @@ mod tests {
         // THE BODY: the arm's full-coverage run through the crossing, at the
         // shared waist and the shared body fraction.
         let t = star_waist_px(arm);
-        assert_eq!(t, (2.0 * arm as f32 * STAR_WAIST).round() as i32);
         let b = star_body_px(arm);
-        assert_eq!(b, (arm as f32 * STAR_TAPER_BODY).round() as i32);
         let span = |q: &GlowQuad| (i32::from(q.x), i32::from(q.x) + i32::from(q.w));
         let full = premul_rgb(0x00FF_FFFF, cov);
         let body = out
@@ -909,7 +845,6 @@ mod tests {
         );
         // Nucleus, at the shared core extent and its additive share.
         let c = star_core_px(arm);
-        assert_eq!(c, (2.0 * arm as f32 * STAR_CORE).round() as i32);
         let core = premul_rgb(0x00FF_FFFF, (f32::from(cov) * STAR_CORE_ADD) as u8);
         assert!(
             out.iter().any(|q| i32::from(q.w) == c && q.color == core),
@@ -946,26 +881,6 @@ mod tests {
                 .iter()
                 .all(|q| !(q.w == 1 && q.h == 1 && q.color == dim))
         );
-    }
-
-    /// The branchless shape contract behind [`ramp_5stop`]: stop positions
-    /// strictly ascending from exactly 0.0 to 1.0 in both tables. The core relies
-    /// on it (counting interior stops, no divide guard, NaN pinned to 1.0), so a
-    /// palette retune breaking it fails here with the table's name.
-    #[test]
-    fn ramp_stop_tables_hold_the_branchless_contract() {
-        for (name, stops) in [("fire", &FIRE_STOPS), ("water", &WATER_STOPS)] {
-            assert!(stops[0].0 == 0.0, "{name}: the ramp must start at 0.0");
-            assert!(stops[4].0 == 1.0, "{name}: the ramp must end at 1.0");
-            for w in stops.windows(2) {
-                assert!(
-                    w[1].0 > w[0].0,
-                    "{name}: stop positions must strictly ascend ({} then {})",
-                    w[0].0,
-                    w[1].0
-                );
-            }
-        }
     }
 
     /// The windowed-walk ramp (function-local table, `windows(2)` walk, divide

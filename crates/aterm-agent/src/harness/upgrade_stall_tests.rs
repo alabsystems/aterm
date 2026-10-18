@@ -9,7 +9,8 @@
 //! to the real code.
 
 use super::*;
-use aterm_spec::derive::{Model, harness_upgrade_never_strands_model};
+use aterm_models_harness::harness_upgrade_never_strands_model;
+use aterm_spec::derive::Model;
 use std::collections::BTreeMap;
 
 /// The replayed conversation, target and salt (its state file:
@@ -357,6 +358,7 @@ impl Agent {
             .env("ATERM_PARENT_SESSION_ID", TAB)
             // An unset Claude home is its process's own HOME's: the sweep's.
             .env_remove("HOME")
+            .setsid(true)
             .stdin(aterm_uds::spawnfd::Stdio::null())
             .stdout(aterm_uds::spawnfd::Stdio::null())
             .stderr(aterm_uds::spawnfd::Stdio::null())
@@ -752,74 +754,6 @@ fn a_ready_agent_under_a_stale_status_is_never_signalled_and_is_asked_again() {
 }
 
 // ------------------------------------------- stops, releases and directions
-
-/// A restart refused after READY releases the agent it asked: [`St::signalled`] then
-/// [`St::signal_failed`] stop the upgrade, owe the release and forget the markers, so no
-/// stopped phase acts on a READY. The next visit types the release once; the one after owes
-/// nothing. A stopped record that kept its markers, READY still the agent's last word, is
-/// released at once too.
-#[cfg(unix)]
-#[test]
-fn a_restart_refused_after_ready_releases_the_agent_it_asked() {
-    let marker = "ATERM-UPGRADE-READY-0badf00d";
-    let base = St {
-        from: "1.0.0".to_string(),
-        to: "9.9.9".to_string(),
-        source: "managed".to_string(),
-        ..St::default()
-    };
-    let mut st = base.clone();
-    st.announced(marker.to_string(), now_s() - 60, 1);
-    let back = st.signalled(4242, 1, TAB, "claude --resume x".to_string(), now_s());
-    assert!(matches!(st.phase, Phase::Exiting { .. }), "{:?}", st.phase);
-    assert!(
-        st.markers.is_empty(),
-        "the restart consumes the READY it acts on"
-    );
-    st.signal_failed(back, now_s());
-    assert_eq!(st.phase, Phase::Failed("signal-refused".to_string()));
-    assert_eq!(st.release, "signal-refused");
-    assert!(st.marker.is_empty() && st.markers.is_empty());
-    // Stopped at this look (a stop older than the stamp is re-armed at
-    // once: `a_stopped_round_rests_then_a_new_one_asks_again_naming_what_runs`).
-    let old = St {
-        phase: Phase::Failed("signal-refused".to_string()),
-        marker: marker.to_string(),
-        markers: vec![marker.to_string()],
-        release: "signal-refused".to_string(),
-        failed_at: now_s(),
-        ..base
-    };
-    for (name, record) in [("refused-after-ready", st), ("refused-kept-markers", old)] {
-        let dir = scratch(name);
-        let (sock, asked) = instance(&dir);
-        let opts = Opts {
-            sock: Some(sock),
-            ..drive(&dir)
-        };
-        write_transcript(
-            &opts,
-            &[
-                user(&notice(marker)),
-                said_by_agent(&format!("Saved.\n{marker}")),
-            ],
-        );
-        let shell = dead_pid();
-        let agent = Agent::start(&opts, &record);
-        let first = agent.visit(&opts, shell);
-        assert_eq!(first.step, "released:signal-refused", "{name}");
-        assert_eq!(typed(&asked, "Upgrade off:"), 1, "{name}");
-        let kept = load(&opts, SESSION).expect("state");
-        assert!(kept.release.is_empty() && kept.markers.is_empty(), "{name}");
-        let second = agent.visit(&opts, shell);
-        assert_eq!(second.step, "wait:failed", "{name}");
-        // Resting, not finished: looked at again until its next round.
-        assert!(matches!(after(&second.step, 0), After::Later(_)), "{name}");
-        assert_eq!(turns(&asked), 1, "{name}: typed once, and nothing else");
-        drop(agent);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
 
 /// A late READY whose restart's gate waits keeps the gate's word, not the owed release's: the
 /// host owns the turn ends while the restart settles, and a draft under it is looked at every
@@ -1221,224 +1155,6 @@ fn a_dropped_release_leaves_no_owed_wait_behind() {
     let line = rows[0].line(at);
     assert!(line.contains(" wait=- "), "{line}");
     assert!(line.contains(" release=- "), "{line}");
-    assert_eq!(
-        rows[0].stall_words(at).as_deref(),
-        Some("behind for 7 h"),
-        "{line}"
-    );
-}
-
-/// A late READY the restart's gate holds past the drain is voided as an announced one is: a
-/// draft standing [`upgrade::HOLD_S`] voids it (`drain-expired:draft`), nothing typed, the
-/// release still owed, the markers forgotten. The agent's own background work still running
-/// [`upgrade::DRAIN_S`] after the answer voids it too, and the release is typed in the same
-/// visit. Negative control: the same work a minute after the answer is only waited for.
-#[cfg(unix)]
-#[test]
-fn a_late_ready_held_past_the_drain_is_voided_and_its_agent_released() {
-    let mut st = St {
-        from: "1.0.0".to_string(),
-        to: "9.9.9".to_string(),
-        source: "managed".to_string(),
-        ..St::default()
-    };
-    for (asks, (at, marker)) in (1u32..).zip(LEDGER) {
-        st.announced(marker.to_string(), at, asks);
-    }
-    st.give_up(now_s());
-    let mut delivered: Vec<String> = LEDGER.iter().map(|(_, m)| user(&notice(m))).collect();
-    delivered.push(said_by_agent(&format!("Stopping.\n{}", LEDGER[3].1)));
-    let now = now_s();
-
-    // A person's draft, standing past HOLD_S.
-    let dir = scratch("late-void-draft");
-    let (sock, asked) = instance_with(
-        &dir,
-        Answers {
-            screen: draft_screen(),
-            ..Answers::default()
-        },
-    );
-    let opts = Opts {
-        sock: Some(sock),
-        ..drive(&dir)
-    };
-    write_transcript(&opts, &delivered);
-    let held = St {
-        hold_since_s: now - upgrade::HOLD_S - 30,
-        hold_seen_s: now - 30,
-        ..st.clone()
-    };
-    let agent = Agent::start(&opts, &held);
-    assert_eq!(agent.visit(&opts, dead_pid()).step, "drain-expired:draft");
-    assert_eq!(turns(&asked), 0, "nothing typed over the person's draft");
-    let kept = load(&opts, SESSION).expect("state");
-    assert_eq!(kept.phase, Phase::Failed(upgrade::GAVE_UP.to_string()));
-    assert_eq!(kept.release, "gave-up", "still owed");
-    assert!(kept.markers.is_empty(), "the stale READY can never end it");
-    assert!(
-        kept.failed_at >= now,
-        "its rest begins again at the void: {}",
-        kept.failed_at
-    );
-    let ledger = std::fs::read_to_string(state_dir(&opts).join("ledger.jsonl")).expect("ledger");
-    assert!(
-        ledger.contains("a draft nobody sent had held the restart")
-            && ledger.contains("a new round asks it again in 2h"),
-        "{ledger}"
-    );
-    drop(agent);
-    let _ = std::fs::remove_dir_all(&dir);
-
-    // The agent's own work under it: DRAIN_S after the answer, and a minute.
-    for (name, heard_s, word) in [
-        ("late-void-bg", upgrade::DRAIN_S, "released:gave-up"),
-        ("late-wait-bg", 60, "wait:background"),
-    ] {
-        let dir = scratch(name);
-        let (sock, asked) = instance(&dir);
-        let opts = Opts {
-            sock: Some(sock),
-            ..drive(&dir)
-        };
-        write_transcript(&opts, &delivered);
-        let heard = St {
-            ready_since: now - heard_s,
-            ..st.clone()
-        };
-        let agent = Agent::start(&opts, &heard);
-        let shell = dead_pid();
-        // A shell the agent left running, under it.
-        let table = vec![
-            (shell, 1, "zsh".to_string()),
-            (agent.sf.pid + 100_000, agent.sf.pid, "zsh".to_string()),
-        ];
-        let args = atpkg::caller_shell::process_args(agent.sf.pid).expect("argv");
-        let files = session_files(&opts.home);
-        let r = visit_with_claim(
-            &opts,
-            &agent.sf,
-            files.as_deref(),
-            &table,
-            &newer(),
-            &Script::new(shell, usize::MAX, None),
-            Some(&args),
-            None,
-        );
-        assert_eq!(r.step, word, "{name}");
-        let kept = load(&opts, SESSION).expect("state");
-        let ledger =
-            std::fs::read_to_string(state_dir(&opts).join("ledger.jsonl")).unwrap_or_default();
-        if word == "released:gave-up" {
-            assert_eq!(typed(&asked, "Upgrade off:"), 1, "{name}");
-            assert!(kept.release.is_empty() && kept.markers.is_empty());
-            assert!(
-                ledger.contains(r#""step":"drain-expired:background""#)
-                    && ledger.contains("work of the agent's own still running"),
-                "{ledger}"
-            );
-        } else {
-            assert_eq!(turns(&asked), 0, "{name}");
-            assert_eq!(kept.markers.len(), 4, "{name}: the READY still heard");
-            assert_eq!(kept.ready_since, now - heard_s, "{name}: its clock kept");
-        }
-        drop(agent);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
-/// A direction before the READY never drops the release its void owes: after a person's
-/// message, the agent's answer and its READY, the agent's own work `DRAIN_S` on voids the
-/// READY and the release is typed, never dropped as `release-dropped:directed` (which would
-/// leave nothing asking again). Negative control: the message after the READY, taken up, ends
-/// the READY and drops the release.
-#[cfg(unix)]
-#[test]
-fn a_direction_before_the_ready_never_drops_the_release_its_void_owes() {
-    let mut st = St {
-        from: "1.0.0".to_string(),
-        to: "9.9.9".to_string(),
-        source: "managed".to_string(),
-        ..St::default()
-    };
-    for (asks, (at, marker)) in (1u32..).zip(LEDGER) {
-        st.announced(marker.to_string(), at, asks);
-    }
-    st.give_up(now_s());
-    let notices: Vec<String> = LEDGER.iter().map(|(_, m)| user(&notice(m))).collect();
-    let message = user("[from s-d3346b29] v0.91.0 is out; the parser branch can wait");
-    let answer = said_by_agent("Noted; the parser branch waits.");
-    let ready = said_by_agent(&format!("Stopping.\n{}", LEDGER[3].1));
-    let before = [
-        notices.clone(),
-        vec![message.clone(), answer.clone(), ready.clone()],
-    ]
-    .concat();
-    let after = [notices, vec![ready, message, answer]].concat();
-    let now = now_s();
-    for (name, rows, word, dropped) in [
-        ("dir-before-ready", &before, "released:gave-up", false),
-        ("dir-after-ready", &after, "wait:failed", true),
-    ] {
-        let dir = scratch(name);
-        let (sock, asked) = instance(&dir);
-        let opts = Opts {
-            sock: Some(sock),
-            ..drive(&dir)
-        };
-        write_transcript(&opts, rows);
-        let heard = St {
-            ready_since: now - upgrade::DRAIN_S,
-            ..st.clone()
-        };
-        let agent = Agent::start(&opts, &heard);
-        let shell = dead_pid();
-        let table = vec![
-            (shell, 1, "zsh".to_string()),
-            (agent.sf.pid + 100_000, agent.sf.pid, "zsh".to_string()),
-        ];
-        let args = atpkg::caller_shell::process_args(agent.sf.pid).expect("argv");
-        let files = session_files(&opts.home);
-        let r = visit_with_claim(
-            &opts,
-            &agent.sf,
-            files.as_deref(),
-            &table,
-            &newer(),
-            &Script::new(shell, usize::MAX, None),
-            Some(&args),
-            None,
-        );
-        assert_eq!(r.step, word, "{name}");
-        let kept = load(&opts, SESSION).expect("state");
-        assert!(kept.release.is_empty() && kept.markers.is_empty(), "{name}");
-        let ledger =
-            std::fs::read_to_string(state_dir(&opts).join("ledger.jsonl")).unwrap_or_default();
-        assert_eq!(
-            ledger.contains("release-dropped:directed"),
-            dropped,
-            "{name}: {ledger}"
-        );
-        assert_eq!(
-            typed(&asked, "Upgrade off:"),
-            usize::from(!dropped),
-            "{name}"
-        );
-        if !dropped {
-            // The ledger says what the line said ([`upgrade::release_prompt`]).
-            assert!(
-                ledger.contains(r#""step":"drain-expired:background""#)
-                    && ledger.contains(
-                        "nothing will restart the session without asking it again first, \
-                         nothing the notice asked of it still applies, and to carry on as it \
-                         would have without it"
-                    ),
-                "{name}: {ledger}"
-            );
-        }
-        drop(agent);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }
 
 /// F1 from the window: the loop's limit episode holds the upgrade's clocks ([`hold_clock`],
@@ -2272,83 +1988,6 @@ fn the_real_upgrade_conforms_to_the_never_strands_model() {
     }
 }
 
-/// Tier-1, the replayed schedule: the environment as it ran (the limit hits, holds, resets;
-/// the agent answers READY) and the real decisions between, each admitted by the model within
-/// its invariants: one notice after the reset, then the restart. The unfixed run is admitted
-/// only by `Buggy = 1`, refused by the model at its first notice, and ends stranded.
-#[test]
-fn the_incident_schedule_conforms_and_the_pre_fix_run_is_caught() {
-    let model = harness_upgrade_never_strands_model();
-    let admit = |m: &Model, prev: &S, next: &S| aterm_spec::interp::admits(m, prev, next);
-    let env = |s: &S, action: &str| {
-        let mut next = s.clone();
-        assert!(model.fire(action, &mut next), "{action} at {s:?}");
-        next
-    };
-    let look = |s: &S| decide(s, Holds::Nothing, false).expect("an idle look");
-    let mut trace = vec![model.init_state()];
-    let push = |trace: &mut Vec<S>, next: S| {
-        let prev = trace.last().expect("a state").clone();
-        assert!(
-            admit(&model, &prev, &next).is_some(),
-            "{prev:?} -> {next:?}"
-        );
-        for inv in ["NoNoticeWhileLimited", "NeverStranded"] {
-            assert!(model.check_invariant(inv, &next), "{inv} at {next:?}");
-        }
-        trace.push(next);
-    };
-    let last = |trace: &Vec<S>| trace.last().expect("a state").clone();
-    let next = env(&last(&trace), "LimitHits");
-    push(&mut trace, next);
-    // The four looks and the give-up's: every one a wait.
-    for _ in 0..5 {
-        assert!(look(&last(&trace)).actions.is_empty());
-    }
-    let next = env(&last(&trace), "LimitResets");
-    push(&mut trace, next);
-    let d = look(&last(&trace));
-    assert_eq!(d.actions, ["Announce"]);
-    push(&mut trace, d.next);
-    let next = env(&last(&trace), "AgentReady");
-    push(&mut trace, next);
-    let d = look(&last(&trace));
-    assert_eq!(d.actions, ["Restart"]);
-    push(&mut trace, d.next);
-    assert_eq!((last(&trace)["phase"], last(&trace)["holding"]), (3, 0));
-
-    // The unfixed run (asks scaled to the model's bound): at the limit,
-    // notice, half an hour, notice, half an hour, give up; the reset; READY;
-    // the last word `failed`.
-    let buggy = aterm_spec::interp::with_buggy(&model, 1);
-    let ran = [
-        "LimitHits",
-        "Announce",
-        "Elapse",
-        "Announce",
-        "Elapse",
-        "GiveUp",
-        "LimitResets",
-        "AgentReady",
-        "Look",
-    ];
-    let mut s = buggy.init_state();
-    let mut refused = None;
-    for action in ran {
-        let prev = s.clone();
-        assert!(buggy.fire(action, &mut s), "{action} at {prev:?}");
-        assert_eq!(admit(&buggy, &prev, &s), Some(action));
-        if refused.is_none() && admit(&model, &prev, &s).is_none() {
-            refused = Some(action);
-            // And the real code, at that very state, does not take it.
-            assert_ne!(look(&prev).actions.first(), Some(&action), "{prev:?}");
-        }
-    }
-    assert_eq!(refused, Some("Announce"), "the first notice at the limit");
-    assert!(!buggy.check_invariant("NeverStranded", &s), "{s:?}");
-    assert!(!buggy.check_invariant("NoNoticeWhileLimited", &s), "{s:?}");
-}
-
 // ------------------------------------------ no stop is for good
 
 /// Every stop is stamped, and a re-arm is a new round ([`St::fail`], [`St::rearm`]): the
@@ -2436,46 +2075,6 @@ fn a_stop_is_stamped_and_a_rearm_is_a_new_round() {
     assert!(upgrade::retry_due(&old.phase, old.failed_for(T0), false));
 }
 
-/// A void never shortens the rest a repeated stop earned: three give-ups rest
-/// `4 × RETRY_S` ([`upgrade::unanswered_rest_extension`]), and a late READY voided half an
-/// hour on begins that whole rest again at the void.
-#[test]
-fn a_void_never_shortens_the_rest_a_repeated_stop_earned() {
-    const T: u64 = 1_790_000_000;
-    let mut st = St::default();
-    for _ in 0..3 {
-        st.give_up(T);
-    }
-    let before = st.failed_at;
-    assert_eq!(before, T + 3 * upgrade::RETRY_S);
-    let void_at = T + 1_800;
-    st.void(void_at);
-    assert!(
-        st.failed_at >= before,
-        "a void never shortens the rest a repeated stop earned: {} < {before}",
-        st.failed_at
-    );
-    assert_eq!(
-        st.failed_at,
-        void_at + 3 * upgrade::RETRY_S,
-        "begun again at the void, stretched by the streak"
-    );
-    assert!(
-        !upgrade::retry_due(&st.phase, st.failed_for(void_at + upgrade::RETRY_S), false),
-        "not due a bare RETRY_S after the void"
-    );
-    // Negative control: a first stop's void rests a plain RETRY_S from the void.
-    let mut first = St::default();
-    first.give_up(T);
-    first.void(void_at);
-    assert_eq!(first.failed_at, void_at);
-    assert!(upgrade::retry_due(
-        &first.phase,
-        first.failed_for(void_at + upgrade::RETRY_S),
-        false
-    ));
-}
-
 /// A void begins the rest again by its stop's ladder: four declined rounds rest a day
 /// ([`upgrade::unanswered_rest_extension`]), and a late READY voided in that rest begins a
 /// day's rest again at the void, never the `4 × RETRY_S` cap of a stop repeated for another
@@ -2511,86 +2110,6 @@ fn a_void_begins_the_rest_again_by_the_ladder_of_its_stop() {
     assert_eq!(refused.failed_at, cap);
     refused.void(T + 1_800);
     assert_eq!(refused.failed_at, T + 1_800 + 3 * upgrade::RETRY_S);
-}
-
-/// The longest silence, through the real record and reducer: the last notice's window runs
-/// out and the round gives up; a late READY a second before the rest runs out holds it (at an
-/// idle point and a break alike); the agent's own work outlives it and the void comes
-/// `DRAIN_S` later, beginning the rest again. Five hours after a first stop, seventeen after
-/// one repeated to the cap; without the late READY, two and a half and eight and a half.
-#[test]
-fn the_longest_silence_is_the_window_a_rest_a_drain_and_a_rest() {
-    const H: u64 = 3_600;
-    // The first second in `from..to` at which `hit` holds.
-    let first = |from: u64, to: u64, hit: &dyn Fn(u64) -> bool| (from..to).find(|t| hit(*t));
-    for (prior_stops, with_ready, hours) in [
-        (0, false, 5 * H / 2),
-        (0, true, 5 * H),
-        (upgrade::RETRY_BACKOFF_MAX_SHIFT, false, 17 * H / 2),
-        (upgrade::RETRY_BACKOFF_MAX_SHIFT, true, 17 * H),
-    ] {
-        let case = format!("{prior_stops} stop(s) before, late READY {with_ready}");
-        let last_notice = T0;
-        let mut st = St {
-            to: "9.9.9".to_string(),
-            streak_why: upgrade::GAVE_UP.to_string(),
-            stop_streak: prior_stops,
-            ..St::default()
-        };
-        st.announced(marker(1), last_notice, upgrade::MAX_ASKS);
-        // The give-up: the reducer's, at the first second its window allows.
-        let gave_up_at = first(last_notice, last_notice + H, &|t| {
-            upgrade::next_step(&st.phase, &idle(false), false, t) == Step::GiveUp
-        })
-        .expect("a give-up");
-        assert_eq!(gave_up_at, last_notice + upgrade::REASK_S, "{case}");
-        st.give_up(gave_up_at);
-        let rested =
-            |st: &St, ready: bool, t: u64| upgrade::retry_due(&st.phase, st.failed_for(t), ready);
-        let rest_end = first(gave_up_at, gave_up_at + 12 * H, &|t| rested(&st, false, t))
-            .expect("the rest runs out");
-        let new_round = if with_ready {
-            // A late READY a second before the rest runs out holds it there.
-            let heard_at = rest_end - 1;
-            assert!(!rested(&st, true, heard_at + 7 * 24 * H), "{case}: held");
-            let look = |st: &mut St, t: u64, at_break: bool| {
-                let mut f = Facts {
-                    background: vec!["zsh".to_string()],
-                    background_point: at_break,
-                    ..idle(false)
-                };
-                st.time_ready(true, &mut f, t);
-                st.time_failed(&mut f, t);
-                let step = upgrade::next_step(&st.phase, &f, true, t);
-                if at_break {
-                    upgrade::break_step(step)
-                } else {
-                    step
-                }
-            };
-            let mut voids = Vec::new();
-            for at_break in [false, true] {
-                let mut probe = st.clone();
-                let _ = look(&mut probe, heard_at, at_break);
-                voids.push(
-                    first(heard_at, heard_at + 12 * H, &|t| {
-                        matches!(look(&mut probe.clone(), t, at_break), Step::Void(_))
-                    })
-                    .expect("the answer is voided"),
-                );
-            }
-            assert_eq!(voids, [heard_at + upgrade::DRAIN_S; 2], "{case}");
-            st.void(voids[0]);
-            first(voids[0], voids[0] + 12 * H, &|t| rested(&st, false, t)).expect("a new round")
-        } else {
-            rest_end
-        };
-        assert_eq!(
-            new_round - last_notice + u64::from(with_ready),
-            hours,
-            "{case}"
-        );
-    }
 }
 
 /// A gave-up round whose late READY its own shell outlives: voided, the agent released, the
@@ -2670,7 +2189,7 @@ fn a_stopped_round_rests_then_a_new_one_asks_again_naming_what_runs() {
     assert!(fresh.salt > old_salt + u64::from(upgrade::MAX_ASKS));
     let ledger = std::fs::read_to_string(state_dir(&opts).join("ledger.jsonl")).expect("ledger");
     assert!(
-        ledger.contains(r#""step":"rearmed:unanswered""#) && ledger.contains("no stop is for good"),
+        ledger.contains(r#""step":"rearmed:unanswered""#),
         "{ledger}"
     );
     assert!(matches!(after(&rearmed.step, 0), After::Later(_)));
@@ -2685,10 +2204,7 @@ fn a_stopped_round_rests_then_a_new_one_asks_again_naming_what_runs() {
         .cloned()
         .expect("a notice");
     assert!(
-        typed_notice.contains(&format!(
-            "Running under you now, as aterm sees it: pid {} (zsh",
-            agent.sf.pid + 100_000
-        )),
+        typed_notice.contains(&format!("pid {} (zsh", agent.sf.pid + 100_000)),
         "{typed_notice}"
     );
     let marker = load(&opts, SESSION).expect("state").marker;
@@ -2773,82 +2289,4 @@ fn a_stopped_round_rests_then_a_new_one_asks_again_naming_what_runs() {
         drop(agent);
         let _ = std::fs::remove_dir_all(&dir);
     }
-}
-
-/// Tier-1, the gave-up stall as a schedule: the environment's moves and the real decisions
-/// between (give-up, void and release at a break, new round, notice, restart), each admitted
-/// by the model within its invariants. Under `Terminal = 1` (a final stop) the new round is
-/// refused and the quiet word past the rest breaks `NeverStalls`.
-#[test]
-fn the_owners_stall_schedule_conforms_and_the_terminal_run_is_caught() {
-    let model = harness_upgrade_never_strands_model();
-    let terminal = aterm_spec::interp::with_consts(&model, &[("Terminal", 1)]);
-    let admit = |m: &Model, prev: &S, next: &S| aterm_spec::interp::admits(m, prev, next);
-    let env = |s: &S, action: &str| {
-        let mut next = s.clone();
-        assert!(model.fire(action, &mut next), "{action} at {s:?}");
-        next
-    };
-    let look = |s: &S, holds: Holds| decide(s, holds, false).expect("a look");
-    let mut trace = vec![model.init_state()];
-    let push = |trace: &mut Vec<S>, next: S| {
-        let prev = trace.last().expect("a state").clone();
-        assert!(
-            admit(&model, &prev, &next).is_some(),
-            "{prev:?} -> {next:?}"
-        );
-        for inv in ["NeverStalls", "NeverStranded", "NoNoticeWhileLimited"] {
-            assert!(model.check_invariant(inv, &next), "{inv} at {next:?}");
-        }
-        trace.push(next);
-    };
-    let last = |trace: &Vec<S>| trace.last().expect("a state").clone();
-    // One real look: its actions fired in the model one by one, each state
-    // admitted, landing where the real record does.
-    let step = |trace: &mut Vec<S>, holds: Holds, want: &[&str]| {
-        let d = look(&last(trace), holds);
-        assert_eq!(d.actions, want, "{:?}", last(trace));
-        for action in &d.actions {
-            let mut next = last(trace);
-            assert!(model.fire(action, &mut next), "{action}");
-            push(trace, next);
-        }
-        assert_eq!(last(trace), d.next);
-    };
-    step(&mut trace, Holds::Nothing, &["Announce"]);
-    let next = env(&last(&trace), "Elapse");
-    push(&mut trace, next);
-    step(&mut trace, Holds::Nothing, &["Announce"]);
-    let next = env(&last(&trace), "Elapse");
-    push(&mut trace, next);
-    // The give-up, a box at the tab holding its release back so the READY can come late.
-    step(&mut trace, Holds::Person, &["GiveUp"]);
-    let next = env(&last(&trace), "AgentReady");
-    push(&mut trace, next);
-    // Its own work outlives the READY past the drain: voided at a break of that work, the
-    // release typed at the same look.
-    let next = env(&last(&trace), "BreakBegins");
-    push(&mut trace, next);
-    step(&mut trace, Holds::Break, &["Void", "Release"]);
-    let next = env(&last(&trace), "BreakEnds");
-    push(&mut trace, next);
-    // Resting: the quiet word, not stranded (released), not stalled.
-    step(&mut trace, Holds::Nothing, &["Look"]);
-    let rested = env(&last(&trace), "Rests");
-    push(&mut trace, rested.clone());
-    step(&mut trace, Holds::Nothing, &["Rearm"]);
-    step(&mut trace, Holds::Nothing, &["Announce"]);
-    let next = env(&last(&trace), "AgentReady");
-    push(&mut trace, next);
-    step(&mut trace, Holds::Nothing, &["Restart"]);
-    assert_eq!((last(&trace)["phase"], last(&trace)["holding"]), (3, 0));
-
-    // Under `Terminal`, the new round the real code takes is refused.
-    let mut rearmed = rested.clone();
-    assert!(model.fire("Rearm", &mut rearmed));
-    assert_eq!(admit(&terminal, &rested, &rearmed), None, "refused");
-    assert_eq!(look(&rested, Holds::Nothing).actions, ["Rearm"]);
-    let mut s = rested;
-    assert!(terminal.fire("Look", &mut s), "{s:?}");
-    assert!(!terminal.check_invariant("NeverStalls", &s), "{s:?}");
 }

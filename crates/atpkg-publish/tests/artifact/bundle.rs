@@ -327,10 +327,6 @@ fn an_exposes_list_naming_a_retired_entrypoint_is_refused() {
     }
     bundle::strip_retired(tmp.path(), &["trustc", "rustdoc"])
         .expect("rustdoc is required, not retired");
-    assert!(
-        !TRUST_EXPOSES.iter().any(|e| RETIRED_BINS.contains(e)),
-        "the trust bundle's own exposes name nothing retired"
-    );
 }
 
 #[test]
@@ -846,6 +842,50 @@ fn trust_mc_proves_its_hello_against_the_trust_sysroot_its_compiler_came_from() 
     assert!(err.to_string().contains("rustup's directory"), "{err}");
 }
 
+/// A hello sysroot that is a store build is leased beside the packed sysroot for as long
+/// as the pack lives (A16): the hello runs its compiler, and gc must not reclaim it then.
+#[test]
+fn a_store_built_hello_sysroot_is_leased_while_the_pack_lives() {
+    let w = world("bundle-hello-lease");
+    let (mut req, _) = trust_mc(&w);
+    let hs = w.ctx.pkg_prefix.join("store/trust/7");
+    fixture_toolchain(&hs);
+    std::fs::create_dir_all(hs.join("lib/rustlib")).expect("mkdir");
+    req.hello.sysroot = Some(hs);
+    let subject = atpkg::lease::Subject::build("trust", 7).expect("a store subject");
+    let in_use = || atpkg::lease::holders(&w.ctx.pkg_prefix, &subject).in_use();
+    assert!(!in_use(), "nobody holds it before the pack");
+    let tools = FakeTools::new(SEAL_TRIPLE);
+    let admitted = bundle::admit(&w.ctx, &req, &tools).expect("admitted");
+    assert!(in_use(), "the pack holds the hello sysroot it will run");
+    drop(admitted);
+    assert!(!in_use(), "and lets it go with the pack");
+}
+
+/// Fail closed: a store-built hello sysroot whose lease cannot be laid refuses the pack,
+/// saying why, rather than run its compiler unleased.
+#[test]
+fn a_store_built_hello_sysroot_that_cannot_be_leased_refuses_the_pack() {
+    let w = world("bundle-hello-unleased");
+    let (mut req, _) = trust_mc(&w);
+    let hs = w.ctx.pkg_prefix.join("store/trust/7");
+    fixture_toolchain(&hs);
+    std::fs::create_dir_all(hs.join("lib/rustlib")).expect("mkdir");
+    req.hello.sysroot = Some(hs);
+    // The lease directory is a file, so no lease can be laid there.
+    std::fs::write(w.ctx.pkg_prefix.join(atpkg::lease::DIR), b"").expect("plant");
+    let tools = FakeTools::new(SEAL_TRIPLE);
+    let Err(err) = bundle::admit(&w.ctx, &req, &tools) else {
+        panic!("a hello sysroot that cannot be leased must refuse the pack");
+    };
+    let said = err.to_string();
+    assert!(
+        said.contains("no lease on")
+            && said.contains("could reclaim it, so nothing runs on it unleased"),
+        "{said}"
+    );
+}
+
 #[test]
 fn skipping_trust_mcs_hello_keeps_its_admission_sysroot_in_either_flag_order() {
     let w = world("bundle-trust-mc-skip");
@@ -1017,63 +1057,6 @@ fn a_donor_that_is_no_trust_toolchain_and_a_relocator_refusal_stop_the_pack() {
         rd.flatten()
             .all(|e| !e.file_name().to_string_lossy().ends_with(".tar.zst"))
     }));
-}
-
-#[test]
-fn the_command_line_is_a_bundle_request() {
-    let w = world("bundle-args");
-    let args = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
-    let seal = w.seal.to_string_lossy().into_owned();
-    let mut ctx = w.ctx.clone();
-    let req = bundle::parse_args(
-        &mut ctx,
-        &args(&[
-            "trust-mc",
-            "--sysroot",
-            &seal,
-            "--hello-sysroot",
-            "/opt/trust",
-            "--donor-root",
-            "/d1",
-            "--donor-root",
-            "/d2",
-            "--keep-target",
-            "wasm32-unknown-unknown",
-            "--no-smoke",
-            "--no-strip",
-            "--allow-dirty",
-            "--unsigned",
-            "--trust-repo",
-            "/src/trust",
-        ]),
-    )
-    .expect("parsed");
-    assert_eq!(ctx.trust_repo, PathBuf::from("/src/trust"));
-    assert_eq!(
-        req.src_repo,
-        w.ctx.home.join("trust-mc"),
-        "~/<program> by default"
-    );
-    assert_eq!(req.out, w.ctx.home.join("trust-mc/dist"));
-    assert_eq!(req.hello.sysroot, Some("/opt/trust".into()));
-    assert!(req.hello.enabled);
-    assert_eq!(req.donor_roots.len(), 2);
-    assert!(!req.smoke && !req.strip && req.allow_dirty);
-    assert_eq!(req.signing, Signing::Unsigned);
-    for bad in [
-        &["--sysroot", "x"][..],
-        &["trust"][..],
-        &["trust", "--sysroot", "x", "--nope"][..],
-        &["trust", "--sysroot", "x", "--trust-repo"][..],
-    ] {
-        assert!(
-            matches!(
-                bundle::parse_args(&mut w.ctx.clone(), &args(bad)),
-                Err(Error::Usage(_))
-            ),
-            "{bad:?}"
-        );
-    }
 }
 
 fn live_switch(w: &World) {

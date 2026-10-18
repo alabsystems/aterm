@@ -424,23 +424,17 @@ fn run(shape: WrapShape) {
     );
 }
 
+/// Every observed shape of the wrap (the module doc names them) lets the
+/// streak follow the caret onto the new row, or keeps it under the moved text
+/// when the box grows up without a scroll.
 #[test]
-fn an_ink_wrap_observed_as_one_scrolled_move_lets_the_streak_follow_the_caret_down() {
-    run(WrapShape::ScrolledOneMove);
-}
-
-#[test]
-fn an_ink_wrap_of_a_one_letter_word_observed_as_one_scrolled_move_lets_the_streak_follow_the_caret_down()
- {
-    run(WrapShape::ScrolledShortWord);
-}
-
-#[test]
-fn an_ink_wrap_observed_as_two_scrolled_moves_lets_the_streak_follow_the_caret_down() {
-    run(WrapShape::ScrolledTwoMove);
-}
-
-#[test]
-fn an_ink_wrap_observed_as_a_same_row_re_anchor_keeps_the_light_under_the_text() {
-    run(WrapShape::BoxGrowsUpNoScroll);
+fn an_ink_wrap_lets_the_streak_follow_the_caret_in_every_observed_shape() {
+    for shape in [
+        WrapShape::ScrolledOneMove,
+        WrapShape::ScrolledShortWord,
+        WrapShape::ScrolledTwoMove,
+        WrapShape::BoxGrowsUpNoScroll,
+    ] {
+        run(shape);
+    }
 }

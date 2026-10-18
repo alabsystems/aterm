@@ -29,25 +29,41 @@
 //! `prose-long-term@v1`/`prose-short-term@v1` texts per question priority):
 //! the harness answers and goes on (owner, 2026-09-25).
 //!
-//! Negative controls: with a box up or a person present the real decider types
-//! nothing where the `Buggy = 1` model would; the `Buggy` model escalates a
-//! worker that reports done; a host turn not registered backs off where the
-//! model continues (`NeverBackOffForTheHarness`); and a long answer that
-//! leaves the streak standing is caught by `NeverBackOffAfterRealWork`.
+//! THE TASK'S FACE (the Autopilot design's §9.4.2): the projection also
+//! holds the face the real teller told its host — the loop's discipline,
+//! [`TurnEndState::face_moved`] asked after each point folded in and after
+//! each live read of someone else's turn ([`TurnEndState::took`]) — which
+//! must be the model's `told`, and the real [`TaskFace::of`] and
+//! [`TurnEndState::other_turn`], which must be the model's face and `other`,
+//! at every step. A continuation's reply that ends on the worker's own token
+//! (`WorkedFinished`) is a done task; a live read of someone else's turn
+//! (`OtherTurnRuns`) opens it again.
+//!
+//! Negative controls: with a box up, a person present or a draft the real
+//! decider types nothing where the `Buggy = 1` model would; without the
+//! loop's ledger the harness's own record reads as a task; a host turn not
+//! registered backs off where the model continues; and three tellers each
+//! fail the walk: one told on the journal's `DONE`/`LEFT` notes alone, one
+//! told at points alone, and one that says landed for any done task. The
+//! `Buggy` model that tells nothing at the live read is caught by
+//! `TheHostIsToldTheTasksFace`; the model's other counterexamples are the
+//! registry sweep's (`aterm-models/tests/non_vacuity.rs`).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
+use aterm_agent::harness::acts::TaskFace;
 use aterm_agent::harness::upgrade::transcript_tasked;
 use aterm_agent::supervise::approvals::Typed;
 use aterm_agent::supervise::phase::Phase;
 use aterm_agent::supervise::policy::turn_end::{
-    Composer, RULE_ANSWER, RULE_API_RETRY, RULE_CONTINUE, TurnEndAction, TurnEndReading,
-    TurnEndState, TurnEndTiming, decide_turn_end,
+    Composer, HostTurn, RULE_API_RETRY, RULE_CONTINUE, TurnEndAction, TurnEndReading, TurnEndState,
+    TurnEndTiming, decide_turn_end,
 };
 use aterm_agent::supervise::{QuestionPriority, SupervisorConfig};
+use aterm_models_harness::supervisor_turn_end_model;
 use aterm_phase::WallKind;
-use aterm_spec::derive::{Model, supervisor_turn_end_model};
+use aterm_spec::derive::Model;
 
 use crate::common::cnst;
 
@@ -59,9 +75,15 @@ const SHORT: Duration = Duration::from_secs(10);
 /// A person's keystroke well inside the grace.
 const JUST_TYPED: Duration = Duration::from_secs(1);
 
+/// Someone else's turn of real work: a job past `EXCHANGE_WORK`, never a
+/// person's own exchange (which this model does not hold).
+const JOB: Duration = Duration::from_secs(12 * 60);
+
 /// A turn that ends on a report, and one that ends on a choice.
 const REPORT: &str = "Stage done.";
 const CHOICE: &str = "Should I rewrite the parser or patch the lexer?";
+/// A turn that ends on the worker's own token: the task is done.
+const FINISHED_REPLY: &str = "Committed the parser and its tests.\nATERM-TASK-DONE";
 
 thread_local! {
     /// What this walk's turns end on ([`REPORT`], [`CHOICE`]).
@@ -117,7 +139,7 @@ fn reading(
     unanswered: bool,
     taskless: bool,
 ) -> TurnEndReading {
-    let phase = if st["pending"] == 1 || st["pending"] == 2 {
+    let phase = if st["pending"] == 1 || st["pending"] == 2 || st["other"] == 1 {
         Phase::Busy
     } else if st["box_up"] == 1 {
         Phase::Prompt
@@ -144,7 +166,11 @@ fn reading(
         } else {
             Composer::Empty
         },
-        said_tail: Some(SAID.with(std::cell::Cell::get).to_string()),
+        said_tail: Some(if st["fin"] == 1 {
+            FINISHED_REPLY.to_string()
+        } else {
+            SAID.with(std::cell::Cell::get).to_string()
+        }),
         worked,
         rules: None,
         pending_input,
@@ -154,43 +180,144 @@ fn reading(
         resume: None,
         upgrading: false,
         taskless,
+        finished_record: None,
+        finished_at_check: false,
+        check_record: None,
+        left_record: false,
+        left_work: None,
         person: (st["person"] == 1).then_some(JUST_TYPED),
         reach: Default::default(),
         login_back: false,
         auto_continue: None,
         since_limit: None,
         served_in_transcript: false,
+        notice_elsewhere: false,
         reset_clock: None,
         program: aterm_phase::Program::Claude,
-        goal: None,
-        model_field: None,
-        limits: Default::default(),
-        sandbox_fell: None,
-        thread_model: None,
-        upgrade_goal: false,
         account: None,
         autopilot: aterm_agent::supervise::Autopilot::Cruise,
         login_label: None,
         login_superseded: false,
         login_notice: None,
+        wall_remembered: false,
     }
 }
 
+/// HOW THE TASK'S FACE IS TOLD to the host: the loop's own discipline, and
+/// three that miss a move (the negative controls).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Teller {
+    /// The loop's: [`TurnEndState::face_moved`] after each point folded in
+    /// and after each live read of someone else's turn.
+    Loop,
+    /// Told only where the journal says a task's end (`DONE`, `LEFT`): the
+    /// task done where it was not.
+    OnEndNotes,
+    /// Told at points alone, never at a live read.
+    AtPointsOnly,
+    /// Landed for any done task.
+    LandedForDone,
+}
+
 /// The real side of one walk: the decider's state, the loop's clock,
-/// whether the act's `❯` row stands unanswered on the screen, and the
-/// conversation's record as the walk wrote it.
+/// whether the act's `❯` row stands unanswered on the screen, the
+/// conversation's record as the walk wrote it, and the face its host was last
+/// told, by `teller`.
 #[derive(Clone)]
 struct Real {
     st: TurnEndState,
     now: Instant,
     unanswered: bool,
     record: String,
+    told: Option<TaskFace>,
+    teller: Teller,
+    /// The task was done at the last point ([`Teller::OnEndNotes`]).
+    noted: bool,
 }
 
 impl Real {
     /// No task, by the real scan over the record and the loop's ledger.
     fn taskless(&self) -> bool {
         !transcript_tasked(&self.record, &ours())
+    }
+
+    /// A point was folded in (`busy`: no — a live read of someone else's
+    /// turn): the face told, by this walk's teller.
+    fn tell(&mut self, busy: bool) {
+        match self.teller {
+            Teller::Loop => {
+                if let Some(face) = self.st.face_moved() {
+                    self.told = Some(face);
+                }
+            }
+            Teller::AtPointsOnly => {
+                if !busy && let Some(face) = self.st.face_moved() {
+                    self.told = Some(face);
+                }
+            }
+            Teller::OnEndNotes => {
+                let done = self.st.task_done();
+                if !busy && done && !self.noted {
+                    self.told = Some(self.st.face());
+                }
+                if !busy {
+                    self.noted = done;
+                }
+            }
+            Teller::LandedForDone => {
+                self.told = Some(if self.st.task_done() {
+                    TaskFace::Landed
+                } else {
+                    self.st.face()
+                });
+            }
+        }
+    }
+}
+
+/// The model's face of `st` (`TheHostIsToldTheTasksFace`): open while
+/// someone else's turn runs, else done where the worker's token ended it.
+fn face(st: &State) -> TaskFace {
+    if st["other"] == 0 && st["fin"] == 1 {
+        TaskFace::Done
+    } else {
+        TaskFace::Open
+    }
+}
+
+/// The face the model's `told` names.
+fn told(st: &State) -> TaskFace {
+    if st["told"] == 1 {
+        TaskFace::Done
+    } else {
+        TaskFace::Open
+    }
+}
+
+/// The task's face of `real` against the model's at `st`: someone else's
+/// turn and the face itself must be the model's (a panic), and the face the
+/// host was last told too — by the walk's teller, whose miss is the error
+/// handed back.
+fn faces(real: &Real, st: &State) -> Result<(), String> {
+    assert_eq!(
+        real.st.other_turn(),
+        st["other"] == 1,
+        "someone else's turn at {st:?}"
+    );
+    assert_eq!(
+        TaskFace::of(&real.st, real.st.other_turn()),
+        face(st),
+        "the face at {st:?}"
+    );
+    if real.told == Some(told(st)) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{:?} told {:?} where the model says {:?} at {st:?}",
+            real.teller,
+            real.told,
+            told(st)
+        ))
     }
 }
 
@@ -234,8 +361,9 @@ fn expected(m: &Model, st: &State) -> Verdict {
         assert!(m.fire("DeadlineUnseen", &mut judged), "{st:?}");
         return expected(m, &judged);
     }
-    // No task: nothing ended here, and nothing is done.
-    if st["tasked"] == 0 {
+    // No task: nothing ended here, and nothing is done. Nor at a done task,
+    // nor while someone else's turn runs.
+    if st["tasked"] == 0 || st["fin"] == 1 || st["other"] == 1 {
         return Verdict::Nothing;
     }
     if m.action_enabled("SubmitDraft", st) {
@@ -284,6 +412,7 @@ fn mirror(action: &str, before: &State, after: &State, real: &mut Real, take: i6
         action,
         "WorkedShort"
             | "WorkedLong"
+            | "WorkedFinished"
             | "RetryTaken"
             | "RetryHitsTheWall"
             | "HumanWork"
@@ -308,7 +437,18 @@ fn mirror(action: &str, before: &State, after: &State, real: &mut Real, take: i6
     let seen = |st: &State, worked| reading(st, worked, unanswered, taskless);
     match action {
         "BoxAppears" | "BoxLeaves" | "PersonTypes" | "GraceEnds" | "DraftLeft" => {}
-        "WallAppears" => real.st.observe(&seen(after, Some(SHORT)), real.now),
+        // A turn of someone else's that ended on the wall: the person's
+        // keystroke the model's `person` stands for is read after it (a
+        // person's own turn split by a wall is their exchange, which this
+        // model does not hold).
+        "WallAppears" => {
+            let r = TurnEndReading {
+                person: None,
+                ..seen(after, Some(SHORT))
+            };
+            real.st.observe(&r, real.now);
+            real.tell(false);
+        }
         "WallDue" => real.now += real.st.timing.retry_backoff[0],
         "HourPasses" => real.now += real.st.timing.window + Duration::from_secs(1),
         "BackoffDue" => {
@@ -318,17 +458,28 @@ fn mirror(action: &str, before: &State, after: &State, real: &mut Real, take: i6
                 .expect("a back-off runs after a short turn");
             real.now += wait;
         }
-        "HumanWork" => real.st.observe(&seen(after, Some(LONG)), real.now),
+        "HumanWork" => {
+            real.st.observe(&seen(after, Some(JOB)), real.now);
+            real.tell(false);
+        }
+        // A live read of someone else's turn: no act of the policy's
+        // awaited.
+        "OtherTurnRuns" => {
+            real.st.took();
+            real.tell(true);
+        }
         // The host typed it (its notice, its carry-on), and it was answered
         // short: the harness's own turn.
         "HarnessTurn" => {
-            real.st.host_typed(real.now);
+            real.st.host_typed(real.now, HostTurn::Notice);
             real.st.observe(&seen(after, Some(SHORT)), real.now);
+            real.tell(false);
         }
         // …and answered with real work: the worker's own, resumed.
         "HarnessTurnLong" => {
-            real.st.host_typed(real.now);
+            real.st.host_typed(real.now, HostTurn::CarryOn);
             real.st.observe(&seen(after, Some(LONG)), real.now);
+            real.tell(false);
         }
         "Continue" | "Retry" | "SubmitDraft" => {
             let r = seen(before, None);
@@ -338,9 +489,16 @@ fn mirror(action: &str, before: &State, after: &State, real: &mut Real, take: i6
         }
         "WorkedShort" | "RetryHitsTheWall" => {
             real.st.observe(&seen(after, Some(SHORT)), real.now);
+            real.tell(false);
         }
-        "WorkedLong" | "RetryTaken" => real.st.observe(&seen(after, Some(LONG)), real.now),
-        "ReplyUnseen" | "DeadlineUnseen" => real.st.observe(&seen(after, None), real.now),
+        "WorkedLong" | "WorkedFinished" | "RetryTaken" => {
+            real.st.observe(&seen(after, Some(LONG)), real.now);
+            real.tell(false);
+        }
+        "ReplyUnseen" | "DeadlineUnseen" => {
+            real.st.observe(&seen(after, None), real.now);
+            real.tell(false);
+        }
         "TimePassesUnseen" => {
             real.now += real.st.timing.take_within / u32::try_from(take).unwrap();
         }
@@ -358,25 +516,37 @@ fn ladder(st: &TurnEndState, short: u32) -> Option<Duration> {
 }
 
 /// Walk `m` against the real decider under `cfg` (`variant`: an unseen
-/// reply is the act's row left unanswered); the reachable state count and
-/// every verdict seen.
-fn walk(
+/// reply is the act's row left unanswered), the face told by the loop's
+/// teller; every verdict seen.
+fn walk(m: &Model, cfg: &SupervisorConfig, variant: bool) -> BTreeMap<&'static str, usize> {
+    walk_telling(m, cfg, variant, Teller::Loop).unwrap_or_else(|e| panic!("the face told: {e}"))
+}
+
+/// [`walk`] with the face told by `teller`: the first state where the face
+/// the host was told is not the model's, as an error.
+fn walk_telling(
     m: &Model,
     cfg: &SupervisorConfig,
     variant: bool,
-) -> (usize, BTreeMap<&'static str, usize>) {
+    teller: Teller,
+) -> Result<BTreeMap<&'static str, usize>, String> {
     let base = Instant::now() + Duration::from_secs(3600);
     let mut init = Real {
         st: TurnEndState::new(timing()),
         now: base,
         unanswered: false,
         record: String::new(),
+        told: None,
+        teller,
+        noted: false,
     };
     // The walk starts at a point that ended a turn of real work, in a
-    // session nobody has asked anything yet.
+    // session nobody has asked anything yet — the loop's start told first.
     let s0 = m.init_state();
+    init.told = Some(init.st.face_start());
     init.st
         .observe(&reading(&s0, Some(LONG), false, true), init.now);
+    init.tell(false);
     let streak = cnst(m, "Streak");
     let take = cnst(m, "Take");
 
@@ -400,6 +570,9 @@ fn walk(
         assert_eq!(real.st.short_wait(), ladder(&real.st, short), "{st:?}");
         // The record's task is the model's: the harness's own turns are none.
         assert_eq!(real.taskless(), st["tasked"] == 0, "the task at {st:?}");
+        // The task's face: the real one is the model's, and so is the face
+        // the host was last told.
+        faces(&real, &st)?;
         let mut at = real.st.clone();
         let here = reading(&st, None, real.unanswered, real.taskless());
         at.observe(&here, real.now);
@@ -411,7 +584,12 @@ fn walk(
         );
         // No silent latch: at a free point of a session with a task the
         // real decider says something.
-        if st["tasked"] == 1 && st["box_up"] == 0 && (st["pending"] == 0 || st["pending"] == 3) {
+        if st["tasked"] == 1
+            && st["fin"] == 0
+            && st["other"] == 0
+            && st["box_up"] == 0
+            && (st["pending"] == 0 || st["pending"] == 3)
+        {
             assert_ne!(got, Verdict::Nothing, "a silent point at {st:?}");
         }
         *acts
@@ -431,16 +609,20 @@ fn walk(
             }
             let mut r = real.clone();
             mirror(action.name, &st, &next, &mut r, take, variant);
+            // Along EVERY transition, not only at a state's first visit: a
+            // state the walk reached before by another path (someone else's
+            // turn ended with or without a live read of it) is checked here
+            // on this one.
+            faces(&r, &next)?;
             queue.push_back((next, r));
         }
     }
-    (seen.len(), acts)
+    Ok(acts)
 }
 
 #[test]
 fn tier1_the_real_decider_types_exactly_where_the_model_allows() {
     let m = supervisor_turn_end_model();
-    assert_eq!(QuestionPriority::Recommended.prose_rule_id(), RULE_ANSWER);
     for (said, priority) in [
         (REPORT, QuestionPriority::Recommended),
         (CHOICE, QuestionPriority::Recommended),
@@ -454,14 +636,7 @@ fn tier1_the_real_decider_types_exactly_where_the_model_allows() {
         // Fully automatic: no cap, and nothing is ever escalated, with an
         // unseen reply and with an act never taken.
         for variant in [false, true] {
-            let (states, acts) = walk(&m, &policy(), variant);
-            // 184 before any turn of the harness's (160 with a task), and
-            // after each of its two the same 184 again — a short answer
-            // moves nothing but their count, a long one only what any turn
-            // of real work moves — plus the 24 states of a session with no
-            // task whose last turn answered was real work (a long answer to
-            // the harness's).
-            assert_eq!(states, 600, "the reachable space changed: {states}");
+            let acts = walk(&m, &policy(), variant);
             for word in ["continue", "retry", "submit", "wait", "nothing"] {
                 assert!(
                     acts.get(word).copied().unwrap_or(0) > 0,
@@ -476,7 +651,7 @@ fn tier1_the_real_decider_types_exactly_where_the_model_allows() {
             continue_per_hour: u32::try_from(cnst(&capped, "Budget")).unwrap(),
             ..policy()
         };
-        let (_, acts) = walk(&capped, &cfg, false);
+        let acts = walk(&capped, &cfg, false);
         assert!(
             acts.get("escalate").copied().unwrap_or(0) > 0,
             "{said}: {acts:?}"
@@ -485,9 +660,9 @@ fn tier1_the_real_decider_types_exactly_where_the_model_allows() {
     SAID.with(|s| s.set(REPORT));
     PRIORITY.with(|p| p.set(QuestionPriority::Recommended));
 
-    // Negative controls: a box up, or a person at the keyboard, with
+    // Negative controls: a box up, a person at the keyboard or a draft, with
     // nothing else in the way — the real decider types nothing, the Buggy
-    // model would; and the Buggy model escalates "reports done".
+    // model would.
     let base = Instant::now() + Duration::from_secs(3600);
     let mut real = TurnEndState::default();
     real.observe(&reading(&m.init_state(), Some(LONG), false, false), base);
@@ -510,125 +685,66 @@ fn tier1_the_real_decider_types_exactly_where_the_model_allows() {
             Verdict::Continue,
             "{var}"
         );
-        assert!(!m.action_enabled("Continue", &held), "{var}");
         assert!(
             buggy.action_enabled("Continue", &held),
             "{var}: the Buggy model types over it — the walk would have caught a real one"
         );
     }
-    let mut done = asked(m.init_state());
-    done.insert("short", 2);
-    done.insert("backoff", 1);
-    assert!(!m.action_enabled("Escalate", &done));
-    assert!(buggy.action_enabled("Escalate", &done));
 
-    // After the harness's own turn — its record the harness's alone —
-    // the real decider does nothing, however long the point stands, while
-    // the Buggy model (a reader that takes the harness's turn for a task)
-    // types into it and is caught.
+    // THE FACE TOLD (the Autopilot design's §9.4.2): a teller told on the
+    // journal's `DONE`/`LEFT` notes alone, one told at points alone, and one
+    // that says landed for any done task each fail the walk — the first two
+    // at someone else's live read after a done task, the third at the done
+    // task itself. And the `Buggy` model that tells nothing at that read is
+    // caught by `TheHostIsToldTheTasksFace`, which the model proper holds
+    // there.
+    for teller in [
+        Teller::OnEndNotes,
+        Teller::AtPointsOnly,
+        Teller::LandedForDone,
+    ] {
+        let failed = walk_telling(&m, &policy(), false, teller);
+        assert!(failed.is_err(), "{teller:?} passed the walk");
+    }
+    let path = ["Continue", "WorkedFinished", "OtherTurnRuns"];
+    let mut right = asked(m.init_state());
+    let mut wrong = asked(buggy.init_state());
+    for action in path {
+        assert!(m.fire(action, &mut right), "{action} at {right:?}");
+        assert!(buggy.fire(action, &mut wrong), "{action} at {wrong:?}");
+    }
+    assert!(m.check_invariant("TheHostIsToldTheTasksFace", &right));
+    assert!(!buggy.check_invariant("TheHostIsToldTheTasksFace", &wrong));
+
+    // Without the loop's ledger, its `keep going` reads as someone's turn:
+    // the ledger is what keeps the harness's own record taskless.
     let record = format!("{HARNESS}\n{ANSWER}\n{SUPERVISOR}\n{ANSWER}\n");
-    assert!(
-        !transcript_tasked(&record, &ours()),
-        "the harness's own turns are no task"
-    );
-    // Negative control: without the loop's ledger, its `keep going` reads as
-    // someone's — the ledger is what keeps the walk's record taskless.
+    assert!(!transcript_tasked(&record, &ours()));
     assert!(transcript_tasked(&record, &[]));
-    let mut after = m.init_state();
-    assert!(m.fire("HarnessTurn", &mut after));
-    let mut real = TurnEndState::default();
-    real.observe(&reading(&after, Some(SHORT), false, true), base);
-    let later = base + Duration::from_secs(24 * 3600);
-    assert_eq!(
-        verdict(&decide_turn_end(
-            &real,
-            &reading(&after, None, false, true),
-            &SupervisorConfig::default(),
-            later
-        )),
-        Verdict::Nothing
-    );
-    let mut wrong = m.init_state();
-    assert!(buggy.fire("HarnessTurn", &mut wrong));
-    assert!(buggy.fire("BackoffDue", &mut wrong));
-    assert!(buggy.fire("Continue", &mut wrong));
-    assert!(!buggy.check_invariant("NeverTypeIntoATasklessSession", &wrong));
-    // …and a person's prompt, answered, is one.
-    assert!(transcript_tasked(
-        &format!("{record}{PERSON}\n{ANSWER}\n"),
-        &ours()
-    ));
 
     // N1: after the worker's real work, the upgrade's two turns — its
     // notice's READY and its carry-on's reply, each short — leave the point
-    // free: the model continues, and so does the real decider, the host's
-    // turns registered as typed. Negative control: the same answers read as
-    // someone else's turns back the point off, and the Buggy model that
-    // counts them so is caught.
-    let mut st = asked(m.init_state());
-    for action in ["HarnessTurn", "HarnessTurn"] {
-        assert!(m.fire(action, &mut st), "{action} at {st:?}");
-    }
-    assert!(m.action_enabled("Continue", &st), "{st:?}");
-    let busy = |real: &mut TurnEndState, host: bool| {
+    // free when the host's turns are registered as typed; the same answers
+    // read as someone else's turns back the point off.
+    let st = asked(m.init_state());
+    let busy = |host: bool| {
+        let mut real = TurnEndState::new(timing());
         let mut now = base;
         real.observe(&reading(&st, Some(LONG), false, false), now);
         for _ in 0..2 {
             now += Duration::from_secs(30);
             if host {
-                real.host_typed(now);
+                real.host_typed(now, HostTurn::Notice);
             }
             real.observe(&reading(&st, Some(SHORT), false, false), now);
         }
         verdict(&decide_turn_end(
-            real,
+            &real,
             &reading(&st, None, false, false),
             &SupervisorConfig::default(),
             now,
         ))
     };
-    assert_eq!(
-        busy(&mut TurnEndState::new(timing()), true),
-        Verdict::Continue
-    );
-    assert_eq!(busy(&mut TurnEndState::new(timing()), false), Verdict::Wait);
-    let mut wrong = asked(m.init_state());
-    assert!(buggy.fire("HarnessTurn", &mut wrong));
-    assert!(!buggy.check_invariant("NeverBackOffForTheHarness", &wrong));
-
-    // The answer that is real work: after the worker's short turn started a
-    // back-off, the carry-on's long answer ends it — the model continues,
-    // and so does the real decider; the Buggy model that leaves the streak
-    // standing is caught.
-    let mut st = asked(m.init_state());
-    for action in ["Continue", "WorkedShort", "HarnessTurnLong"] {
-        assert!(m.fire(action, &mut st), "{action} at {st:?}");
-    }
-    assert!(m.action_enabled("Continue", &st), "{st:?}");
-    let mut real = TurnEndState::new(timing());
-    let mut now = base;
-    real.observe(&reading(&st, Some(LONG), false, false), now);
-    let r = reading(&st, None, false, false);
-    let a = decide_turn_end(&real, &r, &SupervisorConfig::default(), now);
-    real.acted(&a, &r, now);
-    now += Duration::from_secs(30);
-    real.observe(&reading(&st, Some(SHORT), false, false), now);
-    assert_eq!(real.short_streak(), 1);
-    now += Duration::from_secs(30);
-    real.host_typed(now);
-    real.observe(&reading(&st, Some(LONG), false, false), now);
-    assert_eq!(
-        verdict(&decide_turn_end(
-            &real,
-            &reading(&st, None, false, false),
-            &SupervisorConfig::default(),
-            now
-        )),
-        Verdict::Continue
-    );
-    let mut wrong = asked(m.init_state());
-    for action in ["Continue", "WorkedShort", "HarnessTurnLong"] {
-        assert!(buggy.fire(action, &mut wrong), "{action} at {wrong:?}");
-    }
-    assert!(!buggy.check_invariant("NeverBackOffAfterRealWork", &wrong));
+    assert_eq!(busy(true), Verdict::Continue);
+    assert_eq!(busy(false), Verdict::Wait);
 }

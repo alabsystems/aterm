@@ -15,9 +15,10 @@
 //! no copy behind.
 //!
 //! No WindowServer: every process is this binary (run by `exec`, never LaunchServices), `nc`,
-//! `codesign`, `ditto` or `launchctl`; stand-ins end by SIGKILL. Every test skips with one line
-//! where `trustd` does not answer (`aterm_uds::deadline::trust_service_silent`): the negative
-//! controls check Apple-signed code.
+//! `codesign`, `ditto` or `launchctl`; stand-ins end by SIGKILL. Each test ends COULD NOT RUN
+//! if its initial `aterm_uds::deadline::trust_service_silent` probe finds no answer. A later unavailable
+//! identity check fails with `COULD NOT RUN`; it establishes no code-identity verdict.
+//! The negative controls check Apple-signed code.
 
 #![cfg(target_vendor = "apple")]
 
@@ -217,8 +218,17 @@ fn private_dir(path: &Path) {
 
 /// `trustd` going silent after the one probe refuses every later code check
 /// through a process's gate: the machine's moment, never the code's verdict.
-const TRUSTD_SILENT: &str =
-    "COULD NOT RUN: the process trustd gate was silent — the machine's, not the code's";
+const TRUSTD_SILENT: &str = "the process trustd gate was silent — the machine's, not the code's";
+
+/// Ends a test that checks code COULD NOT RUN while `trustd` does not answer the
+/// probe (the crate's `require_trust_service`, which this crate cannot reach).
+fn require_trust_service() {
+    if trust_service_silent() {
+        aterm_spec::host::could_not_run(
+            "macOS's trustd does not answer, so no code check runs here — the machine's, not the code's",
+        );
+    }
+}
 
 /// Whether `why` is an identity check's words for a gate that refused it
 /// unanswered.
@@ -236,14 +246,16 @@ impl Scratch {
             KeeperClient::connect(&self.sock(), &own, MUST_HAPPEN).and_then(|c| c.status("test"));
         if let Err(e) = &got {
             if trustd_silent(&e.to_string()) {
-                panic!("{TRUSTD_SILENT}: {e}");
+                aterm_spec::host::could_not_run(format_args!("{TRUSTD_SILENT}: {e}"));
             }
             let log = self.log();
             if log.contains(
                 "identity could not be verified: macOS's code-signing service (trustd) is not \
                  answering",
             ) {
-                panic!("{TRUSTD_SILENT}: the keeper's check of this dial: {e}: {log}");
+                aterm_spec::host::could_not_run(format_args!(
+                    "{TRUSTD_SILENT}: the keeper's check of this dial: {e}: {log}"
+                ));
             }
         }
         got
@@ -304,9 +316,7 @@ fn ditto(from: &Path, to: &Path) {
 #[test]
 fn a_keeper_whose_build_is_deleted_is_still_this_builds() {
     play_role_if_asked();
-    if trust_service_silent() {
-        return;
-    }
+    require_trust_service();
     let mut s = Scratch::new("akswap");
     // The build the keeper starts from: this binary, so this test dials as it.
     let build = s.dir.join("build").join("aterm");
@@ -383,7 +393,7 @@ fn a_keeper_whose_build_is_deleted_is_still_this_builds() {
     let own = Identity::for_self(IdentityPolicy::Designated).expect("own requirement");
     let refused = KeeperClient::connect(&fake, &own, MUST_HAPPEN).expect_err("nc admitted");
     if trustd_silent(&refused.to_string()) {
-        panic!("{TRUSTD_SILENT}: {refused}");
+        aterm_spec::host::could_not_run(format_args!("{TRUSTD_SILENT}: {refused}"));
     }
     assert!(
         refused_identity(&refused),
@@ -398,9 +408,7 @@ fn a_keeper_whose_build_is_deleted_is_still_this_builds() {
 #[test]
 fn a_keeper_whose_app_is_deleted_is_still_that_apps() {
     play_role_if_asked();
-    if trust_service_silent() {
-        return;
-    }
+    require_trust_service();
     let mut s = Scratch::new("akswapb");
     let sock = s.sock();
     let sock_arg = sock.to_string_lossy().into_owned();
@@ -471,9 +479,7 @@ fn a_keeper_whose_app_is_deleted_is_still_that_apps() {
 #[test]
 fn a_stopped_keeper_leaves_no_copy_of_its_code() {
     play_role_if_asked();
-    if trust_service_silent() {
-        return;
-    }
+    require_trust_service();
     let mut s = Scratch::new("akstop");
     let label = format!("{}.{}.stop", job::TEST_LABEL_PREFIX, std::process::id());
     assert_eq!(job::state(&label).expect("launchctl"), JobState::Absent);

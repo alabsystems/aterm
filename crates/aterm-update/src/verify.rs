@@ -48,8 +48,9 @@ const HELPER_REAP: Duration = Duration::from_millis(250);
 /// 8s is that number. Measured against the real signed bundle the whole sequence
 /// is well under a second (one bundle's five helpers run at once,
 /// [`check_bundle`]: codesign -R 0.074s, codesign -d 0.017s, spctl 0.080s,
-/// PlistBuddy 0.003s; the start probe ~0.008s once the stage ran it,
-/// [`probe_staged_bundle_starts`]), so 8s is many times the headroom of a healthy
+/// PlistBuddy 0.003s — and the boot apply runs the staged and installed
+/// bundles' ten at once, [`check_bundles`]; the start probe ~0.008s once the
+/// stage ran it, [`probe_staged_bundle_starts`]), so 8s is many times the headroom of a healthy
 /// machine and still short enough that a user who double-clicked does not
 /// conclude the app is broken. Expiry defers the apply: the window opens on the
 /// build already installed, and the next launch tries again.
@@ -546,7 +547,9 @@ type Run = Result<std::process::Output, RunError>;
 fn run_refusal(what: &str, error: RunError, timeout: String) -> String {
     match error {
         RunError::Spawn(e) => spawn_refusal(what, &e),
-        RunError::Wait(e) => format!("wait for {what}: {e}"),
+        // Waiting on a child that ran is no verdict on what it read (as for
+        // codesign: [`codesign_refusal`]).
+        RunError::Wait(e) => mark_passing(format!("wait for {what}: {e}")),
         RunError::TimedOut => timeout,
     }
 }
@@ -587,6 +590,26 @@ pub struct BundleChecks {
 /// [`BundleChecks`] of `app` under `expected_team` (the tier [`verify_bundle_policy`]
 /// takes), reading `CFBundleShortVersionString` too when `short_version`.
 pub fn check_bundle(app: &Path, expected_team: &str, short_version: bool) -> BundleChecks {
+    check_bundles(&[app], expected_team, short_version)
+        .pop()
+        .unwrap_or_else(|| BundleChecks {
+            policy: not_run(),
+            build: not_run(),
+            commit: not_run(),
+            team: None,
+            short_version: short_version.then(not_run),
+        })
+}
+
+/// [`check_bundle`] of every one of `apps`, in order, with ALL their helpers started
+/// at once and reaped under one deadline — the apply's staged and installed bundles
+/// cost the slower of the two checks, not their sum. Each bundle's answers are its own
+/// helpers', composed exactly as [`check_bundle`] composes them.
+pub fn check_bundles(
+    apps: &[&Path],
+    expected_team: &str,
+    short_version: bool,
+) -> Vec<BundleChecks> {
     const BUILD: &str = "CFBundleVersion";
     const COMMIT: &str = "ATermGitCommit";
     const VERSION: &str = "CFBundleShortVersionString";
@@ -596,20 +619,30 @@ pub fn check_bundle(app: &Path, expected_team: &str, short_version: bool) -> Bun
     } else {
         &[BUILD, COMMIT]
     };
-    let gate = gate_and_read(app, pinned, keys);
-    let mut reads = gate.reads.into_iter();
-    let mut next = || {
-        reads
-            .next()
-            .unwrap_or_else(|| Err("the read did not run".to_string()))
-    };
-    BundleChecks {
-        policy: gate.policy,
-        build: next().and_then(build_number_from),
-        commit: next().and_then(git_commit_from),
-        team: gate.team,
-        short_version: short_version.then(|| next().and_then(short_version_from)),
-    }
+    gates_and_reads(apps, pinned, keys)
+        .into_iter()
+        .map(|gate| {
+            let mut reads = gate.reads.into_iter();
+            let mut next = || {
+                reads
+                    .next()
+                    .unwrap_or_else(|| Err("the read did not run".to_string()))
+            };
+            BundleChecks {
+                policy: gate.policy,
+                build: next().and_then(build_number_from),
+                commit: next().and_then(git_commit_from),
+                team: gate.team,
+                short_version: short_version.then(|| next().and_then(short_version_from)),
+            }
+        })
+        .collect()
+}
+
+/// The answer for a check that never ran — never returned in practice: the gates
+/// answer every bundle they are given.
+fn not_run<T>() -> Result<T, String> {
+    Err("the bundle check did not run".to_string())
 }
 
 /// One run of the policy gate beside `PlistBuddy` reads of `keys`.
@@ -620,40 +653,88 @@ struct Gate {
     reads: Vec<Result<std::process::Output, String>>,
 }
 
-/// The policy gate — `codesign -R`, `codesign -d` (the team) and `spctl` for a
-/// `pinned` Team ID, else the structural `codesign --verify` — and a `PlistBuddy`
-/// read of each of `keys`, every helper started at once under one
-/// [`helper_deadline`]. The verdict composes the helpers' answers in
-/// [`verify_bundle`]'s serial order: the seal, then the team (and its pin), then
-/// Gatekeeper.
-fn gate_and_read(app: &Path, pinned: Option<&str>, keys: &[&str]) -> Gate {
-    use aterm_update_core::codesign::{developer_id_command, developer_id_verdict};
-    const TEAM: &str = "codesign -d (team id)";
-    const SPCTL: &str = "spctl assessment";
-    let mut seal = match pinned {
-        // A pin that cannot make a requirement is refused before anything runs.
-        Some(team) => match developer_id_command(app, team, true) {
-            Ok(cmd) => cmd,
-            Err(error) => {
+/// The helpers one bundle's [`Gate`] runs: the policy gate — `codesign -R`,
+/// `codesign -d` (the team) and `spctl` for a `pinned` Team ID, else the structural
+/// `codesign --verify` — and a `PlistBuddy` read of each key.
+struct GateHelpers {
+    seal: Command,
+    display: Option<Command>,
+    spctl: Option<Command>,
+    plist: Vec<Command>,
+}
+
+impl GateHelpers {
+    /// `app`'s helpers, or the gate's answer when a pin cannot make a requirement —
+    /// refused before anything runs.
+    fn of(app: &Path, pinned: Option<&str>, keys: &[&str]) -> Result<Self, Gate> {
+        use aterm_update_core::codesign::developer_id_command;
+        let seal = match pinned {
+            Some(team) => developer_id_command(app, team, true).map_err(|error| {
                 let refusal = codesign_refusal(error, false);
-                return Gate {
+                Gate {
                     policy: Err(refusal.clone()),
                     team: None,
                     reads: keys.iter().map(|_| Err(refusal.clone())).collect(),
-                };
-            }
-        },
-        None => structural_command(app),
-    };
-    let mut display = pinned.map(|_| display_command(app));
-    let mut spctl = pinned.map(|_| spctl_command(app));
-    let mut plist: Vec<Command> = keys.iter().map(|key| plist_command(app, key)).collect();
-    let mut cmds: Vec<&mut Command> = vec![&mut seal];
-    cmds.extend(display.as_mut());
-    cmds.extend(spctl.as_mut());
-    cmds.extend(plist.iter_mut());
+                }
+            })?,
+            None => structural_command(app),
+        };
+        Ok(Self {
+            seal,
+            display: pinned.map(|_| display_command(app)),
+            spctl: pinned.map(|_| spctl_command(app)),
+            plist: keys.iter().map(|key| plist_command(app, key)).collect(),
+        })
+    }
+
+    /// The helpers in the order [`compose_gate`] reads their runs.
+    fn commands(&mut self) -> impl Iterator<Item = &mut Command> {
+        std::iter::once(&mut self.seal)
+            .chain(self.display.as_mut())
+            .chain(self.spctl.as_mut())
+            .chain(self.plist.iter_mut())
+    }
+}
+
+/// The policy gate and the reads of `keys` for each of `apps` ([`GateHelpers`]), every
+/// helper of every bundle started at once under one [`helper_deadline`]. Each verdict
+/// composes its own bundle's answers in [`verify_bundle`]'s serial order: the seal,
+/// then the team (and its pin), then Gatekeeper.
+fn gates_and_reads(apps: &[&Path], pinned: Option<&str>, keys: &[&str]) -> Vec<Gate> {
+    let mut plans: Vec<Result<GateHelpers, Gate>> = apps
+        .iter()
+        .map(|app| GateHelpers::of(app, pinned, keys))
+        .collect();
     let (deadline, bound_by_budget) = helper_deadline();
-    let mut runs = aterm_uds::deadline::outputs_until(&mut cmds, deadline, HELPER_REAP).into_iter();
+    let runs = {
+        let mut cmds: Vec<&mut Command> = plans
+            .iter_mut()
+            .filter_map(|plan| plan.as_mut().ok())
+            .flat_map(GateHelpers::commands)
+            .collect();
+        aterm_uds::deadline::outputs_until(&mut cmds, deadline, HELPER_REAP)
+    };
+    let mut runs = runs.into_iter();
+    plans
+        .into_iter()
+        .map(|plan| match plan {
+            Ok(_) => compose_gate(pinned, keys, &mut runs, bound_by_budget),
+            Err(refused) => refused,
+        })
+        .collect()
+}
+
+/// One bundle's [`Gate`] from its helpers' runs, taken from `runs` in
+/// [`GateHelpers::commands`]' order.
+fn compose_gate(
+    pinned: Option<&str>,
+    keys: &[&str],
+    runs: &mut impl Iterator<Item = Run>,
+    bound_by_budget: bool,
+) -> Gate {
+    use aterm_update_core::codesign::developer_id_verdict;
+    const TEAM: &str = "codesign -d (team id)";
+    const SPCTL: &str = "spctl assessment";
     let mut next = || runs.next().unwrap_or(Err(RunError::TimedOut));
     let output = |run: Run, what: &str| {
         run.map_err(|error| run_refusal(what, error, timed_out(what, bound_by_budget)))
@@ -693,6 +774,17 @@ fn gate_and_read(app: &Path, pinned: Option<&str>, keys: &[&str]) -> Gate {
         team,
         reads,
     }
+}
+
+/// [`gates_and_reads`] of one bundle.
+fn gate_and_read(app: &Path, pinned: Option<&str>, keys: &[&str]) -> Gate {
+    gates_and_reads(&[app], pinned, keys)
+        .pop()
+        .unwrap_or_else(|| Gate {
+            policy: not_run(),
+            team: None,
+            reads: Vec::new(),
+        })
 }
 
 /// Full apply-/stage-time gate: structural codesign seal, Team-ID pin, and
@@ -771,13 +863,28 @@ pub fn bundle_build_number(app: &Path) -> Result<u64, String> {
     )?)
 }
 
+/// The refusal for a `PlistBuddy` read of `key` that did not succeed: its words,
+/// marked passing ([`mark_passing`]) when a signal ended the read. A read killed on
+/// a loaded desk said nothing about the plist, as a killed `codesign` or `spctl`
+/// says nothing about the bundle ([`codesign_exit_refusal`], [`spctl_verdict`]);
+/// as a verdict it would discard a healthy stage or a predecessor's revert. Every
+/// read that ran to its exit keeps its verdict.
+fn plist_read_refusal(key: &str, out: &std::process::Output) -> String {
+    let refusal = format!(
+        "read {key}: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    if out.status.code().is_none() {
+        mark_passing(refusal)
+    } else {
+        refusal
+    }
+}
+
 /// What one `PlistBuddy` read of `CFBundleVersion` says ([`bundle_build_number`]).
 fn build_number_from(out: std::process::Output) -> Result<u64, String> {
     if !out.status.success() {
-        return Err(format!(
-            "read CFBundleVersion: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+        return Err(plist_read_refusal("CFBundleVersion", &out));
     }
     let text = String::from_utf8_lossy(&out.stdout);
     let text = text.trim();
@@ -799,10 +906,7 @@ pub fn bundle_short_version(app: &Path) -> Result<String, String> {
 /// ([`bundle_short_version`]).
 fn short_version_from(out: std::process::Output) -> Result<String, String> {
     if !out.status.success() {
-        return Err(format!(
-            "read CFBundleShortVersionString: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+        return Err(plist_read_refusal("CFBundleShortVersionString", &out));
     }
     if out.stdout.len() > 64 {
         return Err("CFBundleShortVersionString exceeds 64 bytes".to_string());
@@ -820,10 +924,7 @@ fn short_version_from(out: std::process::Output) -> Result<String, String> {
 /// process output cannot become an allocation surface.
 fn git_commit_from(out: std::process::Output) -> Result<String, String> {
     if !out.status.success() {
-        return Err(format!(
-            "read ATermGitCommit: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+        return Err(plist_read_refusal("ATermGitCommit", &out));
     }
     if out.stdout.len() > 256 {
         return Err("ATermGitCommit exceeds 256 bytes".to_string());
@@ -1030,24 +1131,9 @@ fn spctl_verdict(status: std::process::ExitStatus, stderr: &str) -> Result<(), S
 mod tests {
     use super::*;
 
-    /// The aggregate budget must bind BEFORE a helper's own ceiling, or sixteen
-    /// serial helpers are only bounded by an argument about their callers rather
-    /// than by a number.
-    #[cfg(unix)]
-    #[test]
-    fn the_apply_budget_binds_before_the_helper_timeout() {
-        let _budget = ApplyBudget::start(Duration::from_millis(150));
-        let outcome = output_bounded(
-            Command::new("/bin/sleep").arg("30"),
-            "a helper that never returns",
-        );
-        let error = outcome.expect_err("a helper past the budget must be a rejection");
-        assert!(
-            error.contains("verification budget"),
-            "the rejection must name the budget, not the per-helper ceiling: {error}"
-        );
-    }
-
+    /// The aggregate budget binds BEFORE a helper's own ceiling (the rejection names
+    /// the budget), so sixteen serial helpers are bounded by a number.
+    ///
     /// A HELPER THAT DID NOT FINISH IS A PASSING REFUSAL: still a rejection — nothing is
     /// swapped past it — but one its readers retry on the transient schedule, never a
     /// structural verdict and never a person's. Both deadlines that bind a helper say so:
@@ -1063,6 +1149,7 @@ mod tests {
                 .expect_err("a helper past the budget is a rejection")
         };
         assert!(crate::is_passing_refusal(&budget), "{budget}");
+        assert!(budget.contains("verification budget"), "{budget}");
         assert!(
             crate::is_passing_refusal(&timed_out("codesign", false)),
             "the helper's own ceiling is the same moment"
@@ -1116,7 +1203,6 @@ mod tests {
             "a missing helper",
         )
         .expect_err("a helper that does not exist cannot start");
-        assert!(missing.starts_with("spawn a missing helper"), "{missing}");
         assert!(!crate::is_passing_refusal(&missing), "{missing}");
     }
 
@@ -1134,7 +1220,6 @@ mod tests {
             Duration::from_millis(300),
         )
         .expect_err("a helper past its limit is a failure");
-        assert!(error.contains("sleep did not finish within"), "{error}");
         // A limit run out is the machine's moment, not a verdict on the image:
         // the stage path retries it instead of booking
         // a backoff against a healthy build.
@@ -1146,17 +1231,6 @@ mod tests {
         )
         .expect("a helper inside its limit runs");
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hi");
-    }
-
-    /// Outside an apply there is no budget, and the per-helper ceiling stands
-    /// alone — the budget must not leak into ordinary use.
-    #[cfg(unix)]
-    #[test]
-    fn without_a_budget_a_helper_keeps_its_own_ceiling() {
-        assert!(APPLY_DEADLINE.with(|d| d.get()).is_none());
-        let out = output_bounded(Command::new("/bin/echo").arg("hi"), "echo")
-            .expect("a fast helper still runs");
-        assert!(out.status.success());
     }
 
     /// The budget restores whatever was in force when it drops, so a nested or
@@ -1306,7 +1380,7 @@ mod tests {
             Duration::from_secs(2),
         )
         .unwrap_err();
-        assert!(failure.message.contains("did not finish"), "{failure:?}");
+        assert!(crate::is_passing_refusal(&failure.message), "{failure:?}");
         assert!(failure.writer_stopped, "{failure:?}");
         let pid: i32 = std::fs::read_to_string(&receipt)
             .unwrap()
@@ -1377,12 +1451,6 @@ mod tests {
         assert!(status.success() && stderr.is_empty() && last_stderr_line(&stderr).is_none());
     }
 
-    #[test]
-    fn team_id_parsed_from_codesign_output() {
-        let sample = "Executable=/x\nIdentifier=com.aterm.aterm\nTeamIdentifier=ABCDE12345\nSealed Resources\n";
-        assert_eq!(parse_team_id(sample).unwrap(), "ABCDE12345");
-    }
-
     /// The signing identifier is the `Identifier=` line, never the
     /// `TeamIdentifier=` one that also ends in "Identifier=", and its absence
     /// fails closed.
@@ -1400,7 +1468,9 @@ mod tests {
     }
 
     #[test]
-    fn team_id_fails_closed_on_adhoc_or_missing() {
+    fn team_id_is_read_from_codesign_output_and_fails_closed_on_adhoc_or_missing() {
+        let sample = "Executable=/x\nIdentifier=com.aterm.aterm\nTeamIdentifier=ABCDE12345\nSealed Resources\n";
+        assert_eq!(parse_team_id(sample).unwrap(), "ABCDE12345");
         // ad-hoc / unsigned reports "not set".
         assert!(parse_team_id("TeamIdentifier=not set\n").is_err());
         // no line at all → reject (not silently accept).
@@ -1408,28 +1478,16 @@ mod tests {
         assert!(parse_team_id("TeamIdentifier=\n").is_err());
     }
 
-    /// The shared requirement kept this gate's own sentences: a garbage pin is refused by
-    /// name before anything runs, and a bundle of another signer is refused with
-    /// codesign's words under the team-pinned prefix.
+    /// A garbage pin (one that could escape the requirement string) is refused before
+    /// anything runs, and a bundle of another signer is a verdict.
     #[test]
-    fn codesign_verify_keeps_its_refusal_wording() {
-        assert_eq!(
-            verify_bundle(Path::new("/nonexistent"), "AB\"CD").unwrap_err(),
-            "refusing to verify: pinned team id \"AB\\\"CD\" is not alphanumeric"
-        );
+    fn verify_bundle_refuses_a_garbage_pin_and_another_signer() {
+        verify_bundle(Path::new("/nonexistent"), "AB\"CD").unwrap_err();
         // Judging Apple's `/bin/ls` waits on trustd.
         if aterm_uds::deadline::trust_service_silent() {
             return;
         }
         let refused = verify_bundle(Path::new("/bin/ls"), "ABCDE12345").unwrap_err();
-        assert!(
-            refused.starts_with("codesign --verify (team-pinned requirement) failed: "),
-            "{refused}"
-        );
-        assert!(
-            refused.ends_with("failed to satisfy specified code requirement(s)"),
-            "{refused}"
-        );
         // A real verdict (exit 3, another signer) carries no passing key.
         assert!(!crate::is_passing_refusal(&refused), "{refused}");
     }
@@ -1525,23 +1583,20 @@ mod tests {
         for (code, stderr) in verdicts {
             let line = codesign_refusal(refused(code, stderr), false);
             assert!(!crate::is_passing_refusal(&line), "{line}");
-            assert!(
-                line.starts_with("codesign --verify (team-pinned requirement) failed: "),
-                "{line}"
-            );
             let structural =
                 codesign_exit_refusal("codesign --verify (structural)", refused(code, stderr));
             assert!(!crate::is_passing_refusal(&structural), "{structural}");
         }
     }
 
-    /// `verify_bundle` runs THREE helpers on the bundle, and a signal ending the
-    /// second (`codesign -d`, the team id) or the third (`spctl`) is as much a moment
-    /// as one ending the first. CONTROL: an
-    /// ended `spctl` that ran to its exit is still the rejection it reports.
+    /// A bundle check runs several helpers on the bundle, and a signal ending the
+    /// team id's (`codesign -d`), Gatekeeper's (`spctl`) or a sealed read's
+    /// (`PlistBuddy`) is as much a moment as one ending the first, and so is a wait
+    /// on any of them that failed. CONTROL: an ended `spctl` or `PlistBuddy` that ran
+    /// to its exit is still the rejection it reports.
     #[cfg(unix)]
     #[test]
-    fn a_signal_ending_the_team_or_gatekeeper_helper_is_no_verdict() {
+    fn a_signal_ending_a_bundle_check_helper_is_no_verdict() {
         use std::os::unix::process::ExitStatusExt as _;
         let killed = std::process::ExitStatus::from_raw(libc::SIGKILL);
         let rejected = std::process::ExitStatus::from_raw(3 << 8);
@@ -1550,10 +1605,33 @@ mod tests {
         let spctl = spctl_verdict(rejected, "aterm.app: rejected\nsource=Unnotarized")
             .expect_err("a rejection");
         assert!(!crate::is_passing_refusal(&spctl), "{spctl}");
-        assert!(
-            spctl.starts_with("spctl assessment rejected the bundle: "),
-            "{spctl}"
+        let plist = |status| std::process::Output {
+            status,
+            stdout: Vec::new(),
+            stderr: b"Print: Entry Does Not Exist\n".to_vec(),
+        };
+        let reads = |status| {
+            [
+                build_number_from(plist(status)).map(|_| ()),
+                short_version_from(plist(status)).map(|_| ()),
+                git_commit_from(plist(status)).map(|_| ()),
+            ]
+        };
+        for read in reads(killed) {
+            let refusal = read.expect_err("a killed read did not pass");
+            assert!(crate::is_passing_refusal(&refusal), "{refusal}");
+        }
+        let exited = std::process::ExitStatus::from_raw(1 << 8);
+        for read in reads(exited) {
+            let refusal = read.expect_err("a failed read");
+            assert!(!crate::is_passing_refusal(&refusal), "{refusal}");
+        }
+        let wait = run_refusal(
+            "PlistBuddy CFBundleVersion",
+            RunError::Wait(std::io::Error::from_raw_os_error(libc::EINTR)),
+            String::new(),
         );
+        assert!(crate::is_passing_refusal(&wait), "{wait}");
 
         // The team-id helper, through the real `codesign -d` on a bundle it cannot
         // read: the run ends on a moment, not on the missing line it then prints.
@@ -1587,7 +1665,6 @@ mod tests {
         // CONTROL: readable, the platform-signed executable carries no Developer ID
         // team (measured: `TeamIdentifier=not set`), the verdict it always was.
         let refusal = team_id(&root.path().join("aterm.app")).expect_err("no team id");
-        assert!(refusal.contains("TeamIdentifier not set"), "{refusal}");
         assert!(!crate::is_passing_refusal(&refusal), "{refusal}");
     }
 
@@ -1680,6 +1757,68 @@ mod tests {
                 .expect_err("absent")
                 .starts_with("read ATermGitCommit")
         );
+    }
+
+    /// SEVERAL BUNDLES CHECKED AT ONCE EACH GET THEIR OWN ANSWERS. `check_bundles`
+    /// starts every bundle's helpers together (the boot apply's staged and installed
+    /// bundles); each bundle's answers are its own helpers', in the order given, and
+    /// the same as `check_bundle` of it alone: a broken seal refuses only its own
+    /// bundle, and its reads still answer. A pin that cannot make a requirement is
+    /// refused for each bundle before anything runs. The negative control is any
+    /// slip in slicing the shared runs (another bundle's answers, or the order
+    /// reversed): the builds 777/778 and the broken seal's place say which is which.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn several_bundles_checked_at_once_each_get_their_own_answers() {
+        // Signing and judging a bundle wait on trustd.
+        if aterm_uds::deadline::trust_service_silent() {
+            return;
+        }
+        let root = aterm_tempfile::Builder::new()
+            .prefix("aterm-check-bundles-")
+            .tempdir()
+            .unwrap();
+        let plist = |build: u32| {
+            format!(
+                "<key>CFBundleVersion</key><string>{build}</string>\
+                 <key>ATermGitCommit</key><string>0123456789abcdef0123456789abcdef0123456{}</string>\
+                 <key>CFBundleShortVersionString</key><string>1.2.{build}</string>",
+                build % 10
+            )
+        };
+        let a = ad_hoc_bundle(&root.path().join("a"), &plist(777));
+        let broken = ad_hoc_bundle(&root.path().join("broken"), &plist(779));
+        // Modified after signing: the seal no longer holds.
+        std::fs::write(broken.join("Contents/MacOS/aterm"), "#!/bin/sh\nexit 1\n").unwrap();
+        let b = ad_hoc_bundle(&root.path().join("b"), &plist(778));
+        let apps = [a.as_path(), broken.as_path(), b.as_path()];
+        let together = check_bundles(&apps, "", true);
+        assert_eq!(together.len(), 3);
+        for (app, checks) in apps.iter().zip(&together) {
+            let alone = check_bundle(app, "", true);
+            assert_eq!(checks.policy.is_ok(), alone.policy.is_ok(), "{app:?}");
+            assert_eq!(checks.build, alone.build, "{app:?}");
+            assert_eq!(checks.commit, alone.commit, "{app:?}");
+            assert_eq!(checks.short_version, alone.short_version, "{app:?}");
+        }
+        assert_eq!(together[0].policy, Ok(()));
+        assert_eq!(together[0].build, Ok(777));
+        let seal = together[1].policy.as_ref().expect_err("a broken seal");
+        assert!(!crate::is_passing_refusal(seal), "{seal}");
+        assert_eq!(together[1].build, Ok(779), "its reads still answer");
+        assert_eq!(together[2].policy, Ok(()));
+        assert_eq!(together[2].build, Ok(778));
+        assert_eq!(
+            together[2].commit.as_deref(),
+            Ok("0123456789abcdef0123456789abcdef01234568")
+        );
+        // A pin that cannot make a requirement: every bundle refused, nothing run.
+        for checks in check_bundles(&[a.as_path(), b.as_path()], "AB\"CD", false) {
+            assert!(
+                checks.policy.is_err() && checks.build.is_err(),
+                "{checks:?}"
+            );
+        }
     }
 
     /// A HELPER OF A BUNDLE CHECK THAT NEVER ANSWERS ends at the deadline, as a

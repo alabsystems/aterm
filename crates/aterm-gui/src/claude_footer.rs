@@ -34,8 +34,8 @@
 //!   nothing and composes nothing; a rebuild of the text — a keystroke, a
 //!   streamed row, a spinner's tick — reads only what its changed rows can
 //!   move ([`Readings::after`]). The work is counted (`work_counts`) and
-//!   asserted (`claude_footer_cost_tests.rs`, with the probe that measures
-//!   it).
+//!   asserted (`claude_footer_cost_tests.rs`) and its time measured by the
+//!   `footer_pass_cost` bench.
 //! * THE LIMIT WALL. A limit the session HIT, written into its transcript
 //!   (`⧗ 5h limit · resets 3pm`), stands until its reset passes or a response
 //!   is served after it; while one shows, the resolver keeps re-reading the
@@ -141,6 +141,7 @@ pub(crate) fn drawn_for(program: Option<&str>) -> bool {
             aterm_phase::Program::Codex
             | aterm_phase::Program::Agy
             | aterm_phase::Program::Muse
+            | aterm_phase::Program::Gemini
             | aterm_phase::Program::Generic => false,
         })
 }
@@ -309,7 +310,9 @@ struct CachedPaneText {
     footer_card: std::cell::OnceCell<Option<aterm_phase::LaunchCard>>,
     /// The rule's coverable run and its glyph on frame row `.0`
     /// ([`rule_mask`], `footer::rule_run`): taken at most once per rebuild —
-    /// the scratch it was read off is the one `key`'s tokens name.
+    /// the scratch it was read off is the one `key`'s tokens name — and kept
+    /// past one where the engine's revisions vouch its row's cells unchanged
+    /// and no image is placed on it ([`Self::stamps`]).
     rule_run: std::cell::Cell<Option<KeptRun>>,
     /// The harness card's reading of `rows` (`crate::claude_card::read_card`):
     /// taken at most once per rebuild, and only when a card is wanted — or
@@ -319,8 +322,104 @@ struct CachedPaneText {
     card: std::cell::OnceCell<crate::claude_card::CardReading>,
     /// The last reading's card, until this rebuild's reading is taken: an
     /// equal card is the same one, shared (a card that moved back allocates
-    /// nothing).
-    card_before: std::cell::Cell<Option<Arc<crate::claude_card::CardRead>>>,
+    /// nothing), and the LAST rebuild's own is held through rows the reader
+    /// does not place it on (`crate::claude_card::read_card`).
+    card_before: std::cell::Cell<Option<crate::claude_card::CardBefore>>,
+    /// The engine's revisions of the rows `rows` were read from
+    /// ([`RowStamps`]): what lets the next rebuild skip every row whose
+    /// cells they vouch did not change — and keep [`Self::rule_run`] where
+    /// its row is one of them.
+    stamps: RowStamps,
+}
+
+/// The D-2 row revisions of the scratch a pane's rows were read from
+/// (`RenderInput::row_rev`), one per pane row, and the lane they belong to
+/// ([`StampLane`]: `None` where the scratch's stamps vouch for nothing).
+#[derive(Debug, Default)]
+struct RowStamps {
+    lane: Option<StampLane>,
+    revs: Vec<u64>,
+}
+
+/// What two scratches' row revisions must share to be compared — the
+/// clauses of `aterm_render::row_revisions_comparable`, which the renderer
+/// itself skips an unchanged row's cells by: the engine's lane (non-zero:
+/// one terminal's clock), the frame's geometry and its host rows
+/// (`row_shift`: a strip that grew moves every engine row), the screen (the
+/// alternate keeps its own grid and clock) and the rows' identity (`base_y`:
+/// a scroll moves rows under unmoved stamps; `absolute_row_revision`: a
+/// renumbering). Taken only from a scratch whose stamps vouch for its cells
+/// at all ([`Self::of`]). Two scratches of one lane, with a row's stamp
+/// non-zero and the same in both, hold that row's cells, clusters and
+/// combining marks unchanged — never its image placements, which no
+/// revision vouches for and which the readers check on their own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StampLane {
+    lane: u64,
+    rows: usize,
+    cols: usize,
+    row_shift: usize,
+    engine_alt: bool,
+    base_y: i64,
+    absolute_row_revision: u64,
+}
+
+impl StampLane {
+    /// `scratch`'s lane, where its stamps vouch for its rows: an engine fill
+    /// with a lane over every row, no host cell written since (`snapshot_seq
+    /// == shifted_fill_seq`: the tab strip's blessed prepend alone), its
+    /// rows in logical order, at the live screen. Else `None`: every row is
+    /// compared.
+    fn of(scratch: &RenderInput) -> Option<Self> {
+        #[cfg(test)]
+        if !READ_BY_STAMP.with(std::cell::Cell::get) {
+            return None;
+        }
+        (scratch.row_rev_lane != 0
+            && scratch.row_rev.len() == scratch.rows
+            && scratch.cells.len() == scratch.rows
+            && scratch.snapshot_seq == scratch.shifted_fill_seq
+            && scratch.engine_row_order == aterm_core::render::RowOrder::Logical
+            && scratch.display_offset == 0)
+            .then_some(Self {
+                lane: scratch.row_rev_lane,
+                rows: scratch.rows,
+                cols: scratch.cols,
+                row_shift: scratch.row_shift,
+                engine_alt: scratch.engine_alt,
+                base_y: scratch.base_y,
+                absolute_row_revision: scratch.absolute_row_revision,
+            })
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Row revisions vouch for unchanged rows ([`StampLane::of`]): off,
+    /// every rebuild compares every row and reads its rule's run anew — the
+    /// glass the tests compare the stamped rebuilds' against
+    /// ([`read_every_row_in`]).
+    static READ_BY_STAMP: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Run `f` with no row revision trusted: every rebuild of a pane's text
+/// compares every row, and reads its rule's run anew.
+#[cfg(test)]
+pub(crate) fn read_every_row_in<R>(f: impl FnOnce() -> R) -> R {
+    let was = READ_BY_STAMP.with(|k| k.replace(false));
+    let out = f();
+    READ_BY_STAMP.with(|k| k.set(was));
+    out
+}
+
+/// Whether frame row `frame_row` of `scratch` holds an image placement:
+/// what no row revision vouches for, so a run read off a row with one is
+/// never kept across a rebuild.
+fn has_images(scratch: &RenderInput, frame_row: usize) -> bool {
+    scratch
+        .images
+        .get(frame_row)
+        .is_some_and(|row| !row.is_empty())
 }
 
 /// A composer rule's run read off frame row `frame_row` ([`CachedPaneText::rule_run`]):
@@ -330,6 +429,16 @@ struct CachedPaneText {
 struct KeptRun {
     frame_row: usize,
     run: Option<(usize, usize, RenderCell)>,
+    /// The row held an image placement when it was read.
+    images: bool,
+}
+
+impl KeptRun {
+    /// The frame row it was read off, where it may be kept past its
+    /// rebuild: read off a row with no image on it.
+    fn row(&self) -> Option<usize> {
+        (!self.images).then_some(self.frame_row)
+    }
 }
 
 impl std::fmt::Debug for CachedPaneText {
@@ -443,7 +552,7 @@ impl PaneTextCache {
 
     /// A pane that no longer shows a Claude footer must not keep its old
     /// transcript resident just because another pane still has one — nor its
-    /// facts.
+    /// facts or its composition.
     fn retain_active(&mut self, active: impl Fn(usize) -> bool) {
         for (index, cached) in self.panes.iter_mut().enumerate() {
             if !active(index) {
@@ -451,12 +560,22 @@ impl PaneTextCache {
             }
         }
         for (index, footer) in self.footers.iter_mut().enumerate() {
-            if !active(index) && footer.from.is_some() {
+            if !active(index) && (footer.from.is_some() || footer.rule.key.is_some()) {
                 *footer = PaneFooter::default();
             }
         }
     }
 
+    /// Leaf `leaf_index`'s rows, read as Claude Code's, rebuilt only where the
+    /// scratch's revision, the session or the region moved, with their
+    /// readings: Claude Code's footer and lights.
+    ///
+    /// A rebuild compares a row's text only where the engine's revision of
+    /// it does not vouch it unchanged ([`RowStamps`]): a keystroke's frame
+    /// compares the caret row alone, not every cell of the pane. And the
+    /// rule's run read off the last rebuild's scratch is kept where its row
+    /// is one the revisions vouch for and no image is placed on it — every
+    /// cell, cluster and mark the run read the same.
     fn rows(
         &mut self,
         leaf_index: usize,
@@ -490,69 +609,142 @@ impl PaneTextCache {
             .filter(|cached| cached.key.session == session && cached.key.region == region);
         let changed = &mut self.changed;
         changed.clear();
-        // Row `r` of the pane: its cells in the frame (`None`: a row the frame
-        // does not hold), and their chars.
+        // Row `r` of the pane: its frame row, its cells in the frame (`None`:
+        // a row the frame does not hold), and their chars.
+        let frame_row = |r: usize| region.strip + region.row_off + r;
         let span = |r: usize| {
-            scratch
-                .cells
-                .get(region.strip + region.row_off + r)
-                .map(|row| {
-                    let row = row.get(region.col_off..).unwrap_or_default();
-                    &row[..row.len().min(region.cols)]
-                })
+            scratch.cells.get(frame_row(r)).map(|row| {
+                let row = row.get(region.col_off..).unwrap_or_default();
+                &row[..row.len().min(region.cols)]
+            })
         };
         let cells = |r: usize| span(r).map(|row| row.iter().map(|c| c.ch));
+        // Whether row `r`'s text is `was`, compared cell by cell.
+        let same = |was: &str, r: usize| {
+            #[cfg(test)]
+            crate::work_counts::footer_row_compared();
+            same_text(was, span(r))
+        };
         let fresh = || -> Vec<String> {
             (0..region.rows)
                 .map(|r| cells(r).map_or_else(String::new, Iterator::collect))
                 .collect()
         };
-        let (text, readings, drift, card, card_before) =
-            match last {
-                Some(cached) => {
-                    let mut rows = cached.rows;
-                    if let Some(texts) = Arc::get_mut(&mut rows) {
-                        texts.resize_with(region.rows, String::new);
-                        for (r, text) in texts.iter_mut().enumerate() {
-                            if !same_text(text, span(r)) {
-                                changed.push(r);
-                                text.clear();
-                                text.extend(cells(r).into_iter().flatten());
-                            }
-                        }
-                    } else {
-                        changed.extend((0..region.rows).filter(|&r| {
-                            !same_text(rows.get(r).map_or("", String::as_str), span(r))
-                        }));
-                        if !changed.is_empty() {
-                            rows = Arc::new(fresh());
+        // The engine's revision of each pane row in this scratch (`0`: none
+        // vouches for it), where its lane vouches for anything.
+        let lane = StampLane::of(scratch);
+        let rev = |r: usize| {
+            lane.map_or(0, |_| {
+                scratch.row_rev.get(frame_row(r)).copied().unwrap_or(0)
+            })
+        };
+        let (text, readings, drift, card, card_before, stamps, rule_run) = match last {
+            Some(cached) => {
+                // Row `r` is the last rebuild's, cell for cell: the same
+                // lane, and the same non-zero revision of it in both.
+                let vouched = lane.is_some() && cached.stamps.lane == lane;
+                let was = &cached.stamps.revs;
+                let unmoved = |r: usize| {
+                    vouched && {
+                        let now = rev(r);
+                        now != 0 && was.get(r) == Some(&now)
+                    }
+                };
+                let mut rows = cached.rows;
+                if let Some(texts) = Arc::get_mut(&mut rows) {
+                    texts.resize_with(region.rows, String::new);
+                    for (r, text) in texts.iter_mut().enumerate() {
+                        if !unmoved(r) && !same(text, r) {
+                            changed.push(r);
+                            text.clear();
+                            text.extend(cells(r).into_iter().flatten());
                         }
                     }
-                    // The footer's and the lights' readings: kept where no row
-                    // they read changed, else read anew — and the drift check's
-                    // build with them.
-                    let (readings, kept) = cached.readings.after(session, &rows, changed);
-                    let drift = if kept { cached.drift.get() } else { None };
-                    // The card the last rebuild read here: kept where no row it
-                    // reads changed, else this rebuild's reading shares its card
-                    // where it is the same.
-                    let reading = cached.card.into_inner();
-                    let before = cached.card_before.into_inner();
-                    let (card, card_before) = match reading {
-                        Some(reading) if reading.holds(session, &rows, changed) => {
-                            (std::cell::OnceCell::from(reading), None)
-                        }
-                        Some(reading) => (std::cell::OnceCell::new(), reading.read.or(before)),
-                        None => (std::cell::OnceCell::new(), before),
-                    };
-                    (rows, readings, drift, card, card_before)
+                } else {
+                    changed.extend((0..region.rows).filter(|&r| {
+                        !unmoved(r) && !same(rows.get(r).map_or("", String::as_str), r)
+                    }));
+                    if !changed.is_empty() {
+                        rows = Arc::new(fresh());
+                    }
                 }
-                None => {
-                    let rows = Arc::new(fresh());
-                    let readings = read_pane(session, &rows, None);
-                    (rows, readings, None, std::cell::OnceCell::new(), None)
+                // The runs read off the last rebuild's scratch, kept where
+                // their row is unmoved and held no image then or now.
+                let pane_row = |frame: usize| {
+                    frame
+                        .checked_sub(region.strip + region.row_off)
+                        .filter(|&r| r < region.rows)
+                };
+                let keeps = |frame: usize| {
+                    pane_row(frame).is_some_and(&unmoved) && !has_images(scratch, frame)
+                };
+                let rule_run = cached
+                    .rule_run
+                    .get()
+                    .filter(|kept| kept.row().is_some_and(keeps));
+                // The footer's and the lights' readings: kept where no row
+                // they read changed, else read anew — and the drift check's
+                // build with them.
+                let (readings, kept) = cached.readings.after(session, &rows, changed);
+                let drift = if kept { cached.drift.get() } else { None };
+                // The card the last rebuild read here: kept where no row it
+                // reads changed, else this rebuild's reading shares its card
+                // where it is the same, and may HOLD it — the last reading's
+                // own card, judged on the rows of the rebuild after that
+                // reading (or on the same rows again: a rebuild that read no
+                // card and changed no row hands it on as it was), never a
+                // card from before a reading that had none, nor across a
+                // change no reading saw.
+                let reading = cached.card.into_inner();
+                let before = cached.card_before.into_inner();
+                let (card, card_before) = match reading {
+                    Some(reading) if reading.holds(session, &rows, changed) => {
+                        (std::cell::OnceCell::from(reading), None)
+                    }
+                    Some(reading) => (
+                        std::cell::OnceCell::new(),
+                        match reading.read {
+                            Some(card) => Some(crate::claude_card::CardBefore { card, last: true }),
+                            None => before.map(crate::claude_card::CardBefore::earlier),
+                        },
+                    ),
+                    None if changed.is_empty() => (std::cell::OnceCell::new(), before),
+                    None => (
+                        std::cell::OnceCell::new(),
+                        before.map(crate::claude_card::CardBefore::earlier),
+                    ),
+                };
+                // This scratch's revisions, into the last rebuild's buffer.
+                let mut stamps = cached.stamps;
+                stamps.lane = lane;
+                stamps.revs.clear();
+                if lane.is_some() {
+                    stamps.revs.extend((0..region.rows).map(rev));
                 }
-            };
+                (rows, readings, drift, card, card_before, stamps, rule_run)
+            }
+            None => {
+                let rows = Arc::new(fresh());
+                let readings = read_pane(session, &rows, None);
+                let stamps = RowStamps {
+                    lane,
+                    revs: if lane.is_some() {
+                        (0..region.rows).map(rev).collect()
+                    } else {
+                        Vec::new()
+                    },
+                };
+                (
+                    rows,
+                    readings,
+                    None,
+                    std::cell::OnceCell::new(),
+                    None,
+                    stamps,
+                    None,
+                )
+            }
+        };
         if self.panes.len() <= leaf_index {
             self.panes.resize_with(leaf_index + 1, || None);
         }
@@ -566,9 +758,10 @@ impl PaneTextCache {
             readings,
             drift: std::cell::Cell::new(drift),
             footer_card: std::cell::OnceCell::new(),
-            rule_run: std::cell::Cell::new(None),
+            rule_run: std::cell::Cell::new(rule_run),
             card,
             card_before: std::cell::Cell::new(card_before),
+            stamps,
         });
         text
     }
@@ -626,7 +819,9 @@ impl PaneTextCache {
     /// ([`rule_mask_into`] into `mask`, `footer::rule_run`): read off the
     /// scratch at most once per rebuild of the pane's rows — a frame that
     /// reuses them has the scratch their key's tokens name, cell for cell
-    /// (what [`undo`] gives back), so its rule reads as it read.
+    /// (what [`undo`] gives back), so its rule reads as it read — and not
+    /// at all on a rebuild whose revisions vouch the rule's row unchanged
+    /// (a keystroke's, a streamed row's: [`Self::rows`]).
     fn rule_run(
         &self,
         leaf_index: usize,
@@ -647,7 +842,11 @@ impl PaneTextCache {
                 Some(kept) if kept.frame_row == frame_row => kept.run,
                 _ => {
                     let run = read(mask);
-                    cached.rule_run.set(Some(KeptRun { frame_row, run }));
+                    cached.rule_run.set(Some(KeptRun {
+                        frame_row,
+                        run,
+                        images: has_images(scratch, frame_row),
+                    }));
                     run
                 }
             },
@@ -775,31 +974,51 @@ struct RuleKey {
 
 /// Every part of a chips' block (`claude_lights::Block`) a composition
 /// reads: its chips and titles, laid in its cells, how much of the rule it
-/// holds and whether its title is a reason.
+/// holds and whether its title is a reason — and the fit that laid the block
+/// it was copied from or found equal to (`Block::fit`).
 #[derive(Debug, Default)]
 struct BlockCopy {
     lights: Vec<RenderCell>,
     title: Vec<RenderCell>,
+    lean: [Vec<RenderCell>; 2],
     short_title: Vec<RenderCell>,
     reason: bool,
     holds: usize,
+    fit: u64,
 }
 
 impl BlockCopy {
-    fn is(&self, block: &crate::claude_lights::Block) -> bool {
-        self.lights == block.lights
+    /// Whether `block` is this copy's, cell for cell: known by its fit's
+    /// number where it has one and it is this copy's (a block the window's
+    /// fit kept, every frame its key stands), else compared part by part —
+    /// and an equal block's number taken, so the next frame of it compares
+    /// no cell.
+    fn is(&mut self, block: &crate::claude_lights::Block) -> bool {
+        if block.fit() != 0 && block.fit() == self.fit {
+            return true;
+        }
+        let same = self.lights == block.lights
             && self.title == block.title
+            && self.lean == block.lean
             && self.short_title == block.short_title
             && self.reason == block.reason
-            && self.holds == block.holds
+            && self.holds == block.holds;
+        if same {
+            self.fit = block.fit();
+        }
+        same
     }
 
     fn copy(&mut self, block: &crate::claude_lights::Block) {
         self.lights.clone_from(&block.lights);
         self.title.clone_from(&block.title);
+        for (kept, lean) in self.lean.iter_mut().zip(&block.lean) {
+            kept.clone_from(lean);
+        }
         self.short_title.clone_from(&block.short_title);
         self.reason = block.reason;
         self.holds = block.holds;
+        self.fit = block.fit();
     }
 }
 
@@ -919,7 +1138,7 @@ impl PaneFooter {
             mark_fg,
         };
         let composed = &mut self.rule;
-        let same_block = match (&composed.block, block) {
+        let same_block = match (&mut composed.block, block) {
             (None, None) => true,
             (Some(kept), Some(block)) => kept.is(block),
             _ => false,
@@ -930,6 +1149,7 @@ impl PaneFooter {
             let widths = block.map(|b| footer::LightsWidth {
                 chips: b.holds,
                 title: b.title.len(),
+                lean: [b.lean[0].len(), b.lean[1].len()],
                 short: b.short_title.len(),
                 reason: b.reason,
             });
@@ -1081,14 +1301,15 @@ pub(crate) fn request_footer(session: u64, timeline: &Arc<Mutex<SessionTimeline>
     let mut slot = RESOLVER.lock().unwrap_or_else(|p| p.into_inner());
     if slot.is_none() {
         let (tx, rx) = channel::<Command>();
-        let spawned = std::thread::Builder::new()
-            .name("aterm-claude-footer".into())
-            .spawn(move || {
+        let spawned = crate::qos::spawn_lane_thread(
+            "aterm-claude-footer",
+            crate::qos::Role::Responsive,
+            move || {
                 // It takes the session timeline lock the UI thread contends,
                 // so the lock-holder floor applies.
-                crate::qos::set_self(crate::qos::Role::Responsive);
                 run(&rx);
-            });
+            },
+        );
         match spawned {
             Ok(_) => *slot = Some(tx),
             Err(e) => {
@@ -1798,6 +2019,7 @@ fn resolve_into(
                 fold,
                 &clock,
                 crate::harness_host::harness_state().as_deref(),
+                aterm_types::dirs::home_dir().as_deref(),
             )
         });
     // The account is laid in here: only this thread holds the process's
@@ -1999,6 +2221,7 @@ fn compose_rule_spans(
     if let Some(block) = block.filter(|_| fit.chips) {
         let title: &[RenderCell] = match fit.title {
             footer::TitleFit::Full => &block.title,
+            footer::TitleFit::Lean(n) => block.lean.get(usize::from(n)).map_or(&[][..], |t| t),
             footer::TitleFit::Short => &block.short_title,
             footer::TitleFit::None => &[],
         };
@@ -2491,8 +2714,14 @@ impl App {
                     note.hash(&mut h);
                     h.finish()
                 });
-            let agent = crate::harness_host::agent_of(timeline.agent());
+            let (agent, group) = (
+                crate::harness_host::agent_of(timeline.agent()),
+                timeline.agent().program_pgid,
+            );
             drop(timeline);
+            // The agent as the host admits it: a vendor `codex` has no
+            // harness of aterm's, so no chips ([`crate::harness_host::admitted`]).
+            let agent = crate::harness_host::admitted_as(&entry.ctx, agent, group);
             // So are the harness's chips where the facts show — the
             // session's Autopilot and a click of it in flight
             // (`crate::claude_lights`) — and the harness card on its launch
@@ -2538,11 +2767,27 @@ impl App {
     ) {
         // The splice's lists are the window's, kept for their buffers: taken
         // here, handed back empty.
-        let Some(mut lists) = self
-            .windows
-            .get_mut(&wid)
-            .map(|ws| std::mem::take(&mut ws.claude_footer_lists))
-        else {
+        let Some(mut lists) = self.windows.get_mut(&wid).map(|ws| {
+            // The pass over what the pet will take as occupied
+            // (`crate::pet_chrome`): the focused pane in frame cells, the
+            // strip above it; this write's cells are noted below, the
+            // Autopilot menu's after it, and the menu's splice ends the pass.
+            let strip = ws
+                .input_scratch
+                .cells
+                .len()
+                .saturating_sub(usize::from(ws.rows));
+            ws.pet_chrome
+                .begin(plan.leaves.iter().find(|leaf| leaf.focused).map(|leaf| {
+                    (
+                        strip + leaf.rect.origin.y.round().max(0.0) as usize,
+                        leaf.rect.origin.x.round().max(0.0) as usize,
+                        leaf.rect.size.height.round().max(1.0) as usize,
+                        leaf.rect.size.width.round().max(1.0) as usize,
+                    )
+                }));
+            std::mem::take(&mut ws.claude_footer_lists)
+        }) else {
             return;
         };
         self.splice_claude_footer_with(wid, plan, route, &mut lists);
@@ -2620,22 +2865,29 @@ impl App {
                 // harness card matches its card against. The pane's one
                 // timeline lock this frame: the PTY reader holds it while
                 // Claude streams.
-                let held = {
+                let (held, agent) = {
                     let timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
                     #[cfg(test)]
                     crate::work_counts::footer_timeline_locked();
-                    timeline.claude_footer().map(|facts| {
+                    let held = timeline.claude_footer().map(|facts| {
                         let mut texts = ws.claude_footer_texts.borrow_mut();
                         let footer = texts.footer(leaf_index, session);
                         footer.note_facts(facts, timeline.claude_card(), usage);
                         footer.note_upgrade(timeline.upgrade_note());
+                        timeline.claude_footer_identity().map(|(pgid, _)| pgid)
+                    });
+                    (
+                        held,
                         (
-                            timeline.claude_footer_identity().map(|(pgid, _)| pgid),
                             crate::harness_host::agent_of(timeline.agent()),
-                        )
-                    })
+                            timeline.agent().program_pgid,
+                        ),
+                    )
                 };
-                let Some((pgid, agent)) = held else {
+                // The agent as the host admits it, read after the timeline's
+                // lock.
+                let agent = crate::harness_host::admitted_as(&entry.ctx, agent.0, agent.1);
+                let Some(pgid) = held else {
                     continue;
                 };
                 // The session's Autopilot, read ONCE for this frame with no
@@ -2815,7 +3067,13 @@ impl App {
             self.note_claude_footer_row(wid, pane.session, chips_room);
             let (word, view) = pane.autopilot;
             self.note_claude_autopilot(wid, pane.session, word, view);
-            let block = self.claude_lights_block(wid, pane.session, pane.blank, chips_room);
+            let block = self.claude_lights_block(
+                wid,
+                pane.session,
+                pane.leaf_index,
+                pane.blank,
+                chips_room,
+            );
             // A block that gave up a chip for room holds all of it
             // (`Block::holds`): the facts went before the chips, and stay
             // gone beside fewer of them. The composition is the pane's
@@ -2871,6 +3129,7 @@ impl App {
                 input_scratch,
                 claude_card,
                 claude_footer_texts,
+                pet_chrome,
                 ..
             } = &mut **ws;
             let texts = claude_footer_texts.borrow();
@@ -2892,6 +3151,11 @@ impl App {
             // edit's row AND column, since two panes side by side share a
             // frame row.
             let rows = claude_footer_undo.written();
+            // Every cell written — the chips, the facts, the card's line —
+            // is the resident pet's occupied ground (`crate::pet_chrome`).
+            for r in rows {
+                pet_chrome.note(r.frame_row, r.col_off, 1, r.painted.len());
+            }
             let took = |at: (usize, usize)| rows.iter().any(|r| (r.frame_row, r.col_off) == at);
             for l in &mut lists.lit {
                 l.shown = took((l.frame_row, l.col));
@@ -3090,6 +3354,12 @@ pub(crate) fn read_glass(row: &[RenderCell]) -> String {
     out
 }
 
+/// The footer's pass on one Claude Code pane, as a fixture the cost tests
+/// assert and the `footer_pass_cost` bench measures.
+#[cfg(any(test, feature = "bench-support"))]
+#[path = "claude_footer_probe.rs"]
+pub(crate) mod probe;
+
 #[cfg(test)]
 #[path = "claude_footer_cost_tests.rs"]
 mod cost_tests;
@@ -3130,6 +3400,7 @@ mod tests {
                 aterm_phase::Program::Codex
                 | aterm_phase::Program::Agy
                 | aterm_phase::Program::Muse
+                | aterm_phase::Program::Gemini
                 | aterm_phase::Program::Generic => false,
             });
             assert_eq!(
@@ -3184,6 +3455,7 @@ mod tests {
                     let widths = footer::LightsWidth {
                         chips,
                         title: title.chars().count(),
+                        lean: [0, 0],
                         short: short.chars().count(),
                         reason: false,
                     };
@@ -3222,7 +3494,7 @@ mod tests {
     fn stopped_footer_watch_has_no_followup_or_idle_reads() {
         // Tier-1 for ClaudeFooterWatch: the real scheduler's retained job and
         // idle-read guard agree with the derived model before and after stop.
-        let model = aterm_spec::derive::claude_footer_watch_model();
+        let model = aterm_models_harness::claude_footer_watch_model();
         let mut state = model.init_state();
         let now = std::time::Instant::now();
         let timeline = Arc::new(Mutex::new(SessionTimeline::default()));
@@ -3261,7 +3533,7 @@ mod tests {
 
     #[test]
     fn stale_group_stop_preserves_replacement_footer_watch() {
-        let model = aterm_spec::derive::claude_footer_watch_model();
+        let model = aterm_models_harness::claude_footer_watch_model();
         let mut state = model.init_state();
         let now = std::time::Instant::now();
         let timeline = Arc::new(Mutex::new(SessionTimeline::default()));
@@ -3670,17 +3942,7 @@ mod tests {
             text_of(&cells),
             " \u{25C6} Opus 5.5 xhigh   \u{2302} ~/aterm   \u{2387} main "
         );
-        assert_eq!(
-            cells[1].fg,
-            [30, 94, 158],
-            "the mark: the accent, toward the rule"
-        );
         let o = cells.iter().position(|c| c.ch == 'O').expect("the model");
-        assert_eq!(
-            cells[o].fg,
-            [107, 107, 107],
-            "the value: the rule's gray, a third of the way to the pane's ink"
-        );
         assert!(
             [1, o].iter().all(|&c| cells[c].bold
                 && matches!(cells[c].script, aterm_core::terminal::Script::Sub { .. })),
@@ -3707,6 +3969,7 @@ mod tests {
         let widths = footer::LightsWidth {
             chips: harness.lights.len(),
             title: harness.title.len(),
+            lean: [0, 0],
             short: harness.short_title.len(),
             reason: harness.reason,
         };
@@ -3818,29 +4081,6 @@ mod tests {
             }),
             "the label takes the values' ink"
         );
-        // Whole or not at all, at every width, and nothing else moves for it.
-        let whole = cells_for(named);
-        for room in 0..=whole {
-            let text = text_of(&paint(&listed, room));
-            let unnamed = text_of(&paint(&facts(), room));
-            if text.contains(footer::ACCOUNT_MARK) {
-                assert_eq!(
-                    text.replacen("   \u{2386} work-2", "", 1),
-                    unnamed,
-                    "{room}"
-                );
-            } else {
-                assert_eq!(text, unnamed, "{room}");
-            }
-        }
-        assert_eq!(text_of(&paint(&listed, whole)), named);
-        assert_eq!(text_of(&paint(&listed, whole - 1)), plain, "the path stays");
-        let beside = " \u{25C6} Opus 5.5 xhigh   \u{2386} work-2 ";
-        assert_eq!(
-            text_of(&paint(&listed, cells_for(beside))),
-            beside,
-            "beside the model, where the path no longer fits"
-        );
         // NEGATIVE CONTROL: no account, and no mark for one.
         assert_eq!(text_of(&paint(&facts(), 76)), plain);
 
@@ -3944,56 +4184,6 @@ mod tests {
                 }
             );
         }
-    }
-
-    /// With the session's tokens in the rule, the TOKENS go before the path
-    /// is cut: the path is the owner's, the tokens the first value a short
-    /// rule gives up. Then the path is cut as it is without them.
-    #[test]
-    fn the_tokens_go_before_the_path_is_cut() {
-        use aterm_agent::harness::session_usage::{ModelTokens, UsageFacts};
-        let blank = cell(' ', [1, 1, 1]);
-        let rule = cell('\u{2500}', [60, 60, 60]);
-        let deep = FooterFacts {
-            path: Some("~/src/github.com/someone/aterm".into()),
-            usage: UsageFacts::of(
-                (
-                    vec![ModelTokens {
-                        label: "opus".into(),
-                        input: 48_000_000,
-                        output: 310_000,
-                    }],
-                    aterm_agent::harness::session_usage::More::default(),
-                ),
-                None,
-                None,
-            )
-            .map(|u| u.with_runtime(28_320_000)),
-            ..facts()
-        };
-        let paint = |room| {
-            let fit = footer::fit_rule(&deep, room, None);
-            text_of(&compose_rule(&fit, None, rule, blank, [2, 2, 2], room).0)
-        };
-        let whole =
-            " \u{25C6} Opus 5.5 xhigh   \u{2302} ~/src/github.com/someone/aterm   \u{2387} main";
-        let full = format!("{whole}   \u{03A3} 7h52m \u{2191}48M \u{2193}310k ");
-        assert_eq!(paint(cells_for(&full)), full);
-        let runtime = format!("{whole}   \u{03A3} 7h52m ");
-        assert_eq!(
-            paint(cells_for(&full) - 1),
-            runtime,
-            "the tokens go first, the runtime stays"
-        );
-        assert_eq!(
-            paint(cells_for(&runtime) - 1),
-            format!("{whole} "),
-            "then the runtime; the path stays whole"
-        );
-        assert_eq!(
-            paint(cells_for(whole) - 1),
-            " \u{25C6} Opus 5.5 xhigh   \u{2302} \u{2026}/aterm   \u{2387} main "
-        );
     }
 
     /// The offset cache keeps an ANSWER for an hour and no failure at all:

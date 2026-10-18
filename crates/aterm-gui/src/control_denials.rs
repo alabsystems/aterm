@@ -48,11 +48,6 @@
 //! blind discovery dials), and a presented token with no active terminal
 //! context to check it against as an edge.
 //!
-//! THE NETWORK DRIVE'S REFUSALS ([`NET_REFUSALS`], `crate::net_listen`) keep
-//! the same rule in runs of their own: every remote peer's refusals are ONE run
-//! there ([`AuthDenials::record_network`]), since a remote dialer can change its
-//! address at will where a local one cannot change its user.
-//!
 //! DYNAMIC, NEVER A GATE: there is no fixed window or cap. The spacing grows
 //! with the run's measured count and restarts on the run's measured quiet.
 //! Nothing is blocked or delayed — the thinning only decides which refusals are
@@ -165,11 +160,6 @@ pub(crate) struct AuthDenials {
 /// This process's runs: the control server's handshake records through it.
 pub(crate) static AUTH_DENIALS: AuthDenials = AuthDenials::new();
 
-/// The network drive listener's refusals (`crate::net_listen`), counted apart
-/// from the local socket's: a remote peer's flood is never a local program's
-/// run, nor the other way round.
-pub(crate) static NET_REFUSALS: AuthDenials = AuthDenials::new();
-
 impl AuthDenials {
     pub(crate) const fn new() -> Self {
         Self {
@@ -207,32 +197,6 @@ impl AuthDenials {
             Written::Nth { count, span } => format!(
                 "{reason} ({count} from this program in {span:.1?}, {total} since launch; {peer})"
             ),
-        })
-    }
-
-    /// Count one refusal of the network drive's listener at `now` and return
-    /// its line — `line`, the refusal's own, which names the peer and why —
-    /// when THIS one is to be written, with the run's count past the first, or
-    /// `None` when it is only counted.
-    ///
-    /// Every peer's refusals are ONE run, thinned by the rule the local
-    /// socket's are: a run per program works where the programs are this
-    /// user's, but an address is no identity a remote dialer cannot change
-    /// (one IPv6 /64 holds 2^64), and a run per address would write every new
-    /// one at once. So a flood writes its 1st, 2nd, 4th … refusal, from
-    /// whatever addresses, and a refusal after a quiet longer than twice the
-    /// run's span is written at once and starts a new run.
-    pub(crate) fn record_network(&self, line: &str, now: Instant) -> Option<String> {
-        let (written, total) = self.count(KINDS.len(), None, now)?;
-        Some(match written {
-            // One run, never dropped: a peer of its own is the first refusal.
-            Written::First | Written::Peer { .. } => line.to_owned(),
-            Written::Quiet(quiet) => {
-                format!("{line} (again after {quiet:.1?} quiet; {total} since launch)")
-            }
-            Written::Nth { count, span } => {
-                format!("{line} ({count} refused in {span:.1?}, {total} since launch)")
-            }
         })
     }
 
@@ -350,12 +314,13 @@ mod tests {
 
         let d = AuthDenials::new();
         let p = peer(7, "aterm");
-        let first = d.record(NO_TOKEN, &p, at(1)).expect("the 1st is written");
-        assert!(first.starts_with(NO_TOKEN) && first.contains("peer pid 7 program aterm"));
-        let second = d.record(NO_TOKEN, &p, at(2)).expect("the 2nd is written");
         assert!(
-            second.contains("(2 from this program in 1.0s, 2 since launch; peer pid 7"),
-            "{second}"
+            d.record(NO_TOKEN, &p, at(1)).is_some(),
+            "the 1st is written"
+        );
+        assert!(
+            d.record(NO_TOKEN, &p, at(2)).is_some(),
+            "the 2nd is written"
         );
         assert_eq!(
             d.record(NO_TOKEN, &p, at(3)),
@@ -384,17 +349,13 @@ mod tests {
         assert!(d.record(NO_TOKEN, &p, at(0)).is_some());
         assert!(d.record(NO_TOKEN, &p, at(1)).is_some());
         assert!(d.record(NO_TOKEN, &p, at(2)).is_none());
-        let fourth = d
-            .record(NO_TOKEN, &p, at(52))
-            .expect("50 s quiet after a 2 s run starts a new run");
         assert!(
-            fourth.contains("(again after 50.0s quiet; 4 since launch;"),
-            "{fourth}"
+            d.record(NO_TOKEN, &p, at(52)).is_some(),
+            "50 s quiet after a 2 s run starts a new run"
         );
-        let fifth = d.record(NO_TOKEN, &p, at(53)).expect("the new run's 2nd");
         assert!(
-            fifth.contains("(2 from this program in 1.0s, 5 since launch;"),
-            "{fifth}"
+            d.record(NO_TOKEN, &p, at(53)).is_some(),
+            "the new run's 2nd"
         );
         // Quiet no more than twice the run's span keeps thinning: the new run
         // spans 52..53 (1 s); a refusal 2 s later is its 3rd, only counted.
@@ -412,45 +373,9 @@ mod tests {
         for s in 0..4 {
             let _ = d.record(NO_TOKEN, &peer(100 + s as u32, "aterm"), at(s));
         }
-        let py = d
-            .record(NO_TOKEN, &peer(21897, "python3"), at(4))
-            .expect("a new program is written at once");
         assert!(
-            py.contains("(first from this program; 5 since launch;")
-                && py.contains("program python3"),
-            "{py}"
-        );
-    }
-
-    /// A program whose run was dropped past [`PROGRAMS_PER_KIND`] has refused
-    /// before: when it returns, its line does not call it its first.
-    #[test]
-    fn a_dropped_program_that_returns_is_not_called_first() {
-        let t0 = Instant::now();
-        let at = |s: u64| t0 + Duration::from_secs(s);
-        let d = AuthDenials::new();
-        for i in 0..PROGRAMS_PER_KIND as u32 {
-            let line = d
-                .record(NO_TOKEN, &peer(i + 1, &format!("p{i}")), at(u64::from(i)))
-                .expect("a new program is written at once");
-            assert!(
-                i == 0 || line.contains("(first from this program;"),
-                "{line}"
-            );
-        }
-        // A ninth program, still certainly new, drops p0's run, the least
-        // recently refused.
-        let ninth = d
-            .record(NO_TOKEN, &peer(50, "p8"), at(10))
-            .expect("written at once");
-        assert!(ninth.contains("(first from this program;"), "{ninth}");
-        let back = d
-            .record(NO_TOKEN, &peer(51, "p0"), at(11))
-            .expect("written at once");
-        assert!(
-            back.contains("(not among the last 8 programs refused; 10 since launch;")
-                && !back.contains("first from this program"),
-            "{back}"
+            d.record(NO_TOKEN, &peer(21897, "python3"), at(4)).is_some(),
+            "a new program is written at once"
         );
     }
 

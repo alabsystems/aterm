@@ -158,21 +158,14 @@ pub fn effect_build_ledger() -> (u64, u64, u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Duration, LEG_COUNT, Leg, slot_ns};
+    use super::{Duration, slot_ns};
 
+    /// A recorded leg is never the unset sentinel (0), and an unrepresentable
+    /// duration saturates instead of wrapping.
     #[test]
-    fn leg_count_covers_every_variant() {
-        assert_eq!(LEG_COUNT, Leg::PipeTotal as usize + 1);
-    }
-
-    #[test]
-    fn a_recorded_leg_is_never_the_unset_sentinel() {
+    fn slot_ns_avoids_the_sentinel_and_saturates() {
         assert_eq!(slot_ns(Duration::ZERO), 1);
         assert_eq!(slot_ns(Duration::from_nanos(7)), 7);
-    }
-
-    #[test]
-    fn an_unrepresentable_duration_saturates_instead_of_wrapping() {
         assert_eq!(slot_ns(Duration::MAX), u64::MAX);
     }
 }

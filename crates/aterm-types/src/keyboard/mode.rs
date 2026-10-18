@@ -50,7 +50,11 @@ bitflags! {
         /// Ctrl+Enter, and conhost reads aterm's Shift+Enter LF as Ctrl+Enter. Once conhost has
         /// read one record it also holds a lone or dangling ESC, so Escape, Ctrl+[, Alt+[,
         /// Alt+Backspace and the like go out as records too (`conhost_holds_once_switched` in
-        /// `encode.rs`).
+        /// `encode.rs`). Ctrl+H and Ctrl+Shift+H go out as the same record, the H key with
+        /// Ctrl alone: conhost reads their legacy BS as Ctrl+Backspace, which PSReadLine and
+        /// cmd.exe take as a word delete, and PSReadLine inserts a literal BS on a record that
+        /// carries Shift (measured 2026-10-16; `win32_ctrl_character_record`). Ctrl+Backspace
+        /// keeps its BS.
         ///
         /// A negotiation bit with the host, not a kitty flag, in this word only because the
         /// encoder reads one word: it is never part of the `CSI ? flags u` answer, the kitty

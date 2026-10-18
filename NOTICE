@@ -8,12 +8,11 @@ The aterm-gpu-web and aterm-wasm crates, and individual files marked with
 `SPDX-License-Identifier: MIT`, are licensed under the MIT License. See
 LICENSE-MIT.
 
-This source distribution includes modified copies of these upstream crates:
+This source distribution includes a modified copy of this upstream crate:
 
-- indexmap 2.14.0, Apache-2.0 OR MIT (`vendor/indexmap/`)
 - winit 0.30.13, Apache-2.0 (`crates/aterm-window/`)
 
-Each of these crates retains its upstream license text. The winit copy is
+It retains its upstream license text. The winit copy is
 absorbed: it is `crates/aterm-window/` (its cargo package is still named
 `winit`), a workspace member aterm owns and changes like its own code. It
 contains aterm modifications to macOS application behavior, Wayland
@@ -21,8 +20,10 @@ seat/data-device handling, and Windows modal size/move event delivery (a
 WM_TIMER pump so timed events keep flowing during caption drags and edge
 resizes); its macOS backend runs on aterm's own Objective-C layer, its Windows
 backend is ported to windows-sys 0.61, its Android, iOS, Orbital and Web
-backends are removed, its Wayland KDE blur support is an opt-in feature, and it
-defines its own key-text `SmolStr`. Its `dpi` module is derived from dpi 0.1.2
+backends are removed, its Linux X11 and Wayland backends speak through aterm's
+own aterm-x11, aterm-wayland and aterm-xkb crates and wait in a poll loop of
+its own (its Wayland KDE blur support is removed), and it defines its own
+key-text `SmolStr`. Its `dpi` module is derived from dpi 0.1.2
 (Apache-2.0, from the winit project; only the crate's Apache-2.0 part), and its
 `CursorIcon` from cursor-icon 1.2.0 by Kirill Chibisov (MIT OR Apache-2.0 OR
 Zlib, used under Apache-2.0). Modified and added files carry prominent notices.
@@ -58,6 +59,55 @@ names its upstream file. The parser underneath it,
 console_error_panic_hook 0.1.7 by Nick Fitzgerald, licensed MIT OR Apache-2.0,
 and names the file it came from. See `crates/aterm-wasm-abi/LICENSE-MIT` and
 `crates/aterm-wasm-abi/LICENSE-APACHE`.
+
+`crates/aterm-a11y/src/atspi/` is derived from accesskit_unix 0.22.0 by The
+AccessKit Authors, licensed MIT OR Apache-2.0 and used here under Apache-2.0:
+the publisher's adapter state machine, object paths, interface answers, event
+mapping and bus handshake follow accesskit_unix's, rewritten as a blocking
+client over aterm-dbus. Its `semantics/` is a modified subset of
+accesskit_atspi_common 0.19.0 by The AccessKit Authors (MIT OR Apache-2.0,
+used under Apache-2.0), and its `types.rs` of atspi-common 0.13.0 by Tait
+Hoyem and the atspi contributors (Apache-2.0 OR MIT, used under Apache-2.0).
+`crates/aterm-a11y/src/tree/` and `crates/aterm-a11y/src/text.rs` are a
+modified subset of accesskit_consumer 0.37.0 by The AccessKit Authors (MIT OR
+Apache-2.0, used under Apache-2.0), cut to the one-tree, attribute-free model
+aterm publishes. That model, `crates/aterm-a11y/src/model/`, is a modified
+subset of accesskit 0.24.1 by The AccessKit Authors (MIT OR Apache-2.0, used
+under Apache-2.0), whose geometry is derived from kurbo by The kurbo Authors
+(Apache-2.0 OR MIT, used under Apache-2.0). Parts of accesskit, accesskit_consumer and accesskit_atspi_common
+are derived from Chromium's accessibility abstraction, Copyright The Chromium
+Authors, under a BSD-style license: see `crates/aterm-a11y/LICENSE-CHROMIUM`.
+`crates/aterm-gui/src/a11y_adapter.rs` is derived from accesskit_winit 0.33.1
+by The AccessKit Authors, licensed Apache-2.0. Each derived file names the
+upstream files it came from. See `crates/aterm-a11y/LICENSE-APACHE`.
+
+`crates/aterm-wayland/protocols/` holds Wayland protocol descriptions,
+unmodified: `wayland.xml` (the Wayland core protocol, as wayland-client
+0.31.14 carries it; Copyright Kristian Høgsberg, Intel Corporation and
+Collabora, Ltd.) and the xdg-shell, xdg-decoration, xdg-activation, viewporter,
+fractional-scale, cursor-shape, text-input-v3 and primary-selection protocols
+(wayland-protocols 0.32.12; each file names its copyright holders), all MIT.
+`crates/aterm-wayland/src/protocols/` is generated from them, MIT as they are,
+each file naming its source. See `crates/aterm-wayland/protocols/COPYING.wayland`
+and `crates/aterm-wayland/protocols/COPYING.wayland-protocols`.
+`crates/aterm-wayland/src/pointer_frame.rs` is derived from
+smithay-client-toolkit 0.19.2 by Victor Berger and contributors, licensed MIT:
+a pointer's events grouped by `wl_pointer.frame` and a frame's axis events
+merged into one scroll, as the winit fork has had them through it. It names the
+upstream file it came from. See `crates/aterm-wayland/LICENSE-MIT`.
+
+`crates/aterm-xkb/src/keysym.rs` is derived from xkeysym 0.2.1 by John Nunley,
+licensed MIT OR Apache-2.0 OR Zlib and used here under Apache-2.0: the names and
+values of the keysyms aterm's key handling names (the X11 protocol's keysym
+list as xkeysym spells it). See `crates/aterm-xkb/LICENSE-APACHE`.
+
+`crates/aterm-x11/src/icccm.rs` and `crates/aterm-x11/src/xrm.rs` are derived
+from x11rb 0.13.2 (`src/properties.rs`) and x11rb-protocol 0.13.2
+(`src/resource_manager/`) by the x11rb contributors, licensed MIT OR
+Apache-2.0 and used here under Apache-2.0: the ICCCM property encodings and
+readers, and the resource database's parser and precedence rules. Each derived
+file names the upstream files it came from. See
+`crates/aterm-x11/LICENSE-APACHE`.
 
 `crates/aterm-win32/` is generated from windows-sys 0.61.2 by Microsoft
 Corporation (the windows-rs project), licensed MIT OR Apache-2.0: `src/core.rs`,
@@ -122,6 +172,12 @@ Bundled fonts and font fixtures retain their own terms:
   1.000, a CFF outline face, unmodified): SIL Open Font License 1.1 in
   `crates/aterm-render/tests/fixtures/NotoSansSunuwar.OFL.txt`. Test data
   only, never compiled into a build.
+- Cascadia Mono 2407.24 variable test fixture `CascadiaMono-Variable.ttf`
+  (the variable build of github.com/microsoft/cascadia-code, unmodified),
+  Copyright (c) 2019 - Present, Microsoft Corporation, with Reserved Font Name
+  Cascadia Code: SIL Open Font License 1.1 in
+  `crates/aterm-render/assets/test/CascadiaMono-Variable.LICENSE.txt`. Test
+  data only, never compiled into a build.
 
 The bundled terminal font stack (`crates/aterm-render/assets/bundled/`, each
 face beside its own notice) is compiled into non-macOS builds unless its entry
@@ -139,10 +195,19 @@ says otherwise:
   Microsoft group of companies.
 - Iosevka Term 34.9.0 (Regular, Bold, Italic, Bold Italic), Copyright
   2015-2026, Renzhi Li (aka. Belleve Invis): SIL Open Font License 1.1 in
-  `crates/aterm-render/assets/bundled/IosevkaTerm-*.LICENSE.txt`. A Modified
-  Version: a subset of the faces of the official unhinted release (Iosevka
-  declares no Reserved Font Name, so the subset keeps its name). Compiled into
-  every build, macOS included, and drawn only when a user names it.
+  `crates/aterm-render/assets/bundled/IosevkaTerm-{Regular,Bold,Italic,BoldItalic}.LICENSE.txt`.
+  A Modified Version: a subset of the faces of the official unhinted release
+  (Iosevka declares no Reserved Font Name, so the subset keeps its name).
+  Compiled into every build, macOS included, and drawn only when a user names
+  it.
+- Iosevka Term 34.9.0 (SemiBold, ExtraBold, SemiBold Italic, ExtraBold
+  Italic: the family aterm calls Iosevka Term Semibold), Copyright 2015-2026,
+  Renzhi Li (aka. Belleve Invis): SIL Open Font License 1.1 in
+  `crates/aterm-render/assets/bundled/IosevkaTerm-{SemiBold,ExtraBold,SemiBoldItalic,ExtraBoldItalic}.LICENSE.txt`.
+  A Modified Version: a subset of the faces of the same official unhinted
+  release, over the same code points, without the `calt` ligature feature
+  (Iosevka declares no Reserved Font Name, so the subset keeps its name).
+  Compiled into Windows builds only, where it is the default face.
 - Noto Sans Symbols 2 2.008, The Noto Project Authors: SIL Open Font License
   1.1 in `crates/aterm-render/assets/bundled/NotoSansSymbols2-Regular.LICENSE.txt`.
 - Noto Sans Math 3.000, Google LLC: SIL Open Font License 1.1 in
@@ -163,6 +228,11 @@ The bundled display faces (the `display_font` setting) live in
 Every bundled face in `assets/bundled/` and `assets/game/` ships under an OFL,
 Apache-2.0 or MIT grant; `crates/aterm-render/build.rs` fails the build
 otherwise, because compiling a face into the binary is redistribution.
+
+Colour themes: aterm's built-in ports and the community theme pack
+(contrib/themes/pack/) carry palettes from third-party projects under MIT and
+Apache-2.0. contrib/themes/pack/ATTRIBUTION.md and `aterm theme pack
+--licences` list each one with its licence.
 
 Generated Unicode segmentation, width, emoji-presentation, and compatibility
 tables derive from Unicode data. Unicode copyright and permission terms are in

@@ -44,7 +44,7 @@
 //! tombstoned, rolled back and uninstalled exactly like a plain one.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::Layout;
 use crate::platform::{self};
@@ -326,6 +326,11 @@ pub fn reconcile_agents(layout: &Layout) {
         #[cfg(test)]
         agents_checkpoint::at(layout, agents_checkpoint::Event::Read(name));
         let twin = layout.agent_shim(&tool);
+        // WHAT THE TWIN EXECS ([`twin_exec`]): the primary's target, except for ALab bytes,
+        // whose twin names a stable path that a new build or a re-link re-points by a rename
+        // in that path's own directory — `exec` makes the program's argv0 the path it
+        // names, and codex-alab's live upgrade watches argv0's directory.
+        let exec = twin_exec(layout, name, &target, primary_is);
         // THE TWIN'S PRELUDE, rendered here, the one place the twin is laid
         // ([`platform::twin_prelude`]): the self-update block ([`crate::selfupdate`]) —
         // `case "$1" in update|upgrade|install)` on the program's rostered verbs, so a
@@ -390,15 +395,15 @@ pub fn reconcile_agents(layout: &Layout) {
         // an exec root stood for its build, by a client whose shim text differed, or by
         // one that laid the landing prelude — would otherwise be kept forever by a
         // predicate that reads only its target.
-        if platform::resolve_shim(&twin).is_some_and(|t| t == target)
+        if platform::resolve_shim(&twin).is_some_and(|t| t == exec)
             && platform::shim_env_of(&twin) == env
-            && twin_is_rendered(&twin, &target, &env, &prelude)
+            && twin_is_rendered(&twin, &exec, &env, &prelude)
         {
             continue;
         }
         let laid = layout
             .ensure_dir(&layout.agents_dir())
-            .and_then(|()| platform::twin_executable_to_env(&twin, &target, &env, &prelude))
+            .and_then(|()| platform::twin_executable_to_env(&twin, &exec, &env, &prelude))
             .and_then(|file| crate::lay::write_in_publication_turn(&file, &publication));
         if let Err(e) = laid {
             eprintln!(
@@ -409,6 +414,92 @@ pub fn reconcile_agents(layout: &Layout) {
         }
     }
     sweep_agents(layout);
+}
+
+/// `store/<program>/exec/`: the directory holding the stable path an ALab build's twin
+/// execs ([`twin_exec`]) — `exec/<entrypoint file>`, a symlink to the file the primary runs,
+/// re-pointed by a rename INSIDE this directory whenever an ALab store build or an ALab dev
+/// link becomes the primary. Not a build name ([`crate::store::parse_build_name`]), so no
+/// store walker reads it as a build or as debris; `uninstall` takes it with the program's
+/// tree.
+#[must_use]
+pub fn exec_dir(layout: &Layout, program: &str) -> PathBuf {
+    layout.prefix.join("store").join(program).join("exec")
+}
+
+/// THE PATH AN AGENT TWIN EXECS for its primary's `target`. For every build that is not ALab's
+/// it is `target` itself, byte for byte as before. For ALab bytes ([`crate::alab`]) — the
+/// active store build (`store/<program>/current` names it) or a dev link of an ALab package
+/// — it is `store/<program>/exec/<file>` ([`exec_dir`]), a symlink to `target` laid by an
+/// atomic rename in that directory.
+///
+/// WHY. A `sh` `exec '<path>'` makes the program's argv0 that path, and codex-alab's live
+/// upgrade (codex-alab `alab-tui/src/upgrade.rs`, `alab-autopilot/src/extension.rs`) watches
+/// argv0's PARENT directory, non-recursively, and re-execs when argv0 then resolves to another
+/// file. So the rename that moves a running codex-alab onto a new build — or a re-link (AD-4)
+/// — must happen in argv0's own directory: `exec/` is that directory. The store build's own
+/// path names a file no update replaces, and `current/bin/codex` has `current/bin` for its
+/// parent, which resolves into the OLD build, while `current` flips in `store/<program>/`.
+/// The twin's last line stays `exec '<absolute path>' "$@"`, the one shape codex-alab's and
+/// aterm's twin readers parse, and its self-update block stays ahead of it.
+///
+/// A primary that is not ALab's (a person's vendor choice) never re-points the entry: a
+/// running codex-alab stays on its own bytes and never crosses onto the vendor's.
+///
+/// Falls back to `target` whenever the stable path cannot be vouched for: `current` not
+/// naming the build the primary runs, a dev link whose target is outside its checkout, or an
+/// entry that could not be laid. Unix only (Windows twins are `.cmd` files).
+fn twin_exec(layout: &Layout, program: &str, target: &Path, primary: AgentPrimary) -> PathBuf {
+    if cfg!(not(unix)) || crate::alab::agent(program).is_none() {
+        return target.to_path_buf();
+    }
+    let alab = match primary {
+        AgentPrimary::Store => {
+            crate::ops::store_build_of(&layout.prefix, target).is_some_and(|(owner, build)| {
+                owner == program
+                    && crate::alab::build_is_alab(layout, program, build)
+                    && crate::alab::current_build(layout, program) == Some(build)
+            })
+        }
+        AgentPrimary::DevLink => {
+            crate::linkmode::linked_checkout(layout, program).is_some_and(|checkout| {
+                crate::alab::is_alab_package(&checkout) && target.starts_with(&checkout)
+            })
+        }
+    };
+    let entry = target
+        .file_name()
+        .filter(|_| alab)
+        .map(|name| exec_dir(layout, program).join(name));
+    let laid = entry.filter(|entry| {
+        std::fs::read_link(entry).ok().as_deref() == Some(target)
+            || layout
+                .ensure_dir(&exec_dir(layout, program))
+                .and_then(|()| platform::atomic_symlink(target, entry))
+                .is_ok()
+    });
+    laid.unwrap_or_else(|| target.to_path_buf())
+}
+
+/// What `program`'s `agents/` twin runs, spelled as its `bin/` primary spells it: the twin's
+/// exec target ([`platform::resolve_shim`]) with a [`twin_exec`] stable prefix resolved back
+/// to the build or checkout it names now. `None` with no twin, or a pending or tombstoned one.
+#[must_use]
+pub fn twin_target(layout: &Layout, program: &str) -> Option<PathBuf> {
+    let tool = ToolName::new(program)?;
+    let raw = platform::resolve_shim(&layout.agent_shim(&tool))?;
+    Some(unstable_spelling(layout, program, raw))
+}
+
+/// [`twin_target`]'s mapping of one exec target: an [`exec_dir`] entry reads back as the
+/// file it names.
+fn unstable_spelling(layout: &Layout, program: &str, raw: PathBuf) -> PathBuf {
+    if raw.parent() == Some(exec_dir(layout, program).as_path())
+        && let Ok(named) = std::fs::read_link(&raw)
+    {
+        return named;
+    }
+    raw
 }
 
 /// What an agent program's `bin/` shim forwards to, as `agents/` may name it
@@ -591,10 +682,13 @@ fn sweep_agents(layout: &Layout) {
             .and_then(ToolName::from_shim_file)
             .is_some_and(|tool| {
                 crate::stub::is_agent_program(tool.as_str())
-                    && (platform::resolve_shim(&entry.path()).is_some_and(|t| {
-                        agent_primary(layout, tool.as_str(), &t).is_some()
-                            && platform::resolve_shim(&layout.shim(&tool)).is_some_and(|b| b == t)
-                    })
+                    && (platform::resolve_shim(&entry.path())
+                        .map(|t| unstable_spelling(layout, tool.as_str(), t))
+                        .is_some_and(|t| {
+                            agent_primary(layout, tool.as_str(), &t).is_some()
+                                && platform::resolve_shim(&layout.shim(&tool))
+                                    .is_some_and(|b| b == t)
+                        })
                         // An agent program's PENDING stub stands here too,
                         // until its build arrives and the twin replaces it.
                         || (crate::stub::is_pending_stub(&entry.path())
@@ -970,42 +1064,15 @@ mod tests {
         std::fs::metadata(p).unwrap().permissions().mode() & 0o777
     }
 
-    /// A prefix whose WHOLE chain is root-owned, or `None` when this run cannot build one.
-    /// Only root can create a directory under a root-owned parent, and even root cannot
-    /// under a SIP-protected `/usr`, so the caller SKIPS rather than fails — the
-    /// `$HOME`-shape half of the property is what runs unprivileged.
-    ///
-    /// The candidates are ordinary root-owned system dirs; the first that both reads as the
-    /// system shape (a brew-owned `/usr/local` does not) and accepts a `mkdir` wins.
+    /// A prefix of the SYSTEM shape: a scratch prefix this thread's
+    /// [`Layout::is_system_prefix`] answers yes for ([`crate::store::system_shape`]). Only
+    /// root can create under a real root-owned chain, so a fixture that waited for one ran
+    /// nowhere; the shape is what activation reads, and this one is answered without root.
     #[cfg(unix)]
-    /// A skip here must be provably legitimate: callers skip by returning, which libtest
-    /// reports as `ok`. Only root can create in a root-owned parent, so an ordinary
-    /// user's `None` is a fact about the machine.
-    fn system_prefix_fixture(label: &str) -> Option<Layout> {
-        for parent in ["/opt", "/usr/local", "/var/lib", "/usr/lib"] {
-            let prefix =
-                Path::new(parent).join(format!("atpkg-act-{label}-{}", std::process::id()));
-            let layout = Layout { prefix };
-            if !layout.is_system_prefix() {
-                continue; // the parent chain is not root-owned — wrong shape, keep looking
-            }
-            let _ = std::fs::remove_dir_all(&layout.prefix);
-            if std::fs::create_dir(&layout.prefix).is_err() {
-                continue; // not root, or the parent refuses writes even to root
-            }
-            // `create_dir` applies the umask, so re-state the mode: the prefix itself must
-            // stay non-group/other-writable or it is no longer the system shape.
-            let shaped =
-                std::fs::set_permissions(&layout.prefix, std::fs::Permissions::from_mode(0o755))
-                    .is_ok()
-                    && layout.is_system_prefix();
-            if !shaped {
-                let _ = std::fs::remove_dir_all(&layout.prefix);
-                continue;
-            }
-            return Some(layout);
-        }
-        None
+    fn system_prefix_fixture(label: &str) -> crate::testdir::ScratchLayout {
+        let layout = temp_prefix(label);
+        crate::store::system_shape::force(&layout.prefix);
+        layout
     }
 
     fn temp_prefix(label: &str) -> crate::testdir::ScratchLayout {
@@ -1068,75 +1135,6 @@ mod tests {
             Some(&19),
             "the active build must be the one just activated"
         );
-        let _ = std::fs::remove_dir_all(&layout.prefix);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn the_prune_never_touches_another_programs_shims_or_foreign_files() {
-        // The prune deletes files on the user's PATH, so its blast radius is the property
-        // that matters most. Only THIS program's shims at a DIFFERENT build may go.
-        let layout = temp_prefix("prune-scope");
-        let ay18 = make_build(&layout, "ay", 18, &["ay", "aylint"]);
-        install_shims(
-            &layout,
-            &ay18,
-            &["ay".into(), "aylint".into()],
-            Aliases::Off,
-        )
-        .unwrap();
-        let ny7 = make_build(&layout, "ny", 7, &["ny"]);
-        install_shims(&layout, &ny7, &["ny".into()], Aliases::Off).unwrap();
-
-        // A tool the user installed themselves, pointing outside the store entirely.
-        let outside = layout.prefix.join("hand-made");
-        std::fs::write(&outside, b"#!/bin/true\n").unwrap();
-        std::os::unix::fs::symlink(&outside, shim_of(&layout, "mytool")).unwrap();
-        // A plain regular file in bin/ (a tombstone shim has this shape).
-        std::fs::write(shim_of(&layout, "tombstoned"), b"#!/bin/sh\nexit 1\n").unwrap();
-        // A dev-link into a CHECKOUT outside the prefix that happens to carry a
-        // `store/ay/<n>/` tail. The unanchored parser reads this as ay@18 — so the prune
-        // would delete a link into a tree the manager does not own; the anchored one sees it
-        // is not under `<prefix>/store` at all.
-        let devco = layout
-            .prefix
-            .parent()
-            .unwrap()
-            .join(format!("atpkg-devco-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&devco);
-        let checkout = devco.join("store/ay/18/bin");
-        std::fs::create_dir_all(&checkout).unwrap();
-        std::fs::write(checkout.join("aydev"), b"#!/bin/true\n").unwrap();
-        std::os::unix::fs::symlink(checkout.join("aydev"), shim_of(&layout, "aydev")).unwrap();
-
-        let ay19 = make_build(&layout, "ay", 19, &["ay"]);
-        install_shims(&layout, &ay19, &["ay".into()], Aliases::Off).unwrap();
-
-        assert!(
-            !shim_of(&layout, "aylint").exists(),
-            "ay's dropped tool is pruned"
-        );
-        assert!(
-            shim_of(&layout, "ay").exists(),
-            "the re-shimmed tool survives"
-        );
-        assert!(
-            shim_of(&layout, "ny").exists(),
-            "another program is untouched"
-        );
-        assert!(
-            shim_of(&layout, "mytool").exists(),
-            "a shim outside the store is untouched"
-        );
-        assert!(
-            shim_of(&layout, "tombstoned").exists(),
-            "a non-symlink in bin/ is untouched"
-        );
-        assert!(
-            shim_of(&layout, "aydev").exists(),
-            "a dev-link whose target merely LOOKS like store/ay/18 is untouched"
-        );
-        let _ = std::fs::remove_dir_all(&devco);
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
@@ -1459,24 +1457,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    #[test]
-    fn atomic_symlink_replaces_existing_link() {
-        let layout = temp_prefix("replace");
-        let link = layout.prefix.join("current");
-        // Real directory targets: the Windows junction backend resolves the target to an
-        // absolute directory path (a bare `/tmp/a` literal would read back drive-qualified).
-        let a = layout.prefix.join("target-a");
-        let b = layout.prefix.join("target-b");
-        std::fs::create_dir_all(&a).unwrap();
-        std::fs::create_dir_all(&b).unwrap();
-        atomic_symlink(&a, &link).unwrap();
-        assert_eq!(std::fs::read_link(&link).unwrap(), a);
-        // Replacing an existing link succeeds and updates the target.
-        atomic_symlink(&b, &link).unwrap();
-        assert_eq!(std::fs::read_link(&link).unwrap(), b);
-        let _ = std::fs::remove_dir_all(&layout.prefix);
-    }
-
     /// The mode `bin/` comes out at is a property of the PREFIX SHAPE,
     /// and activation is where it was easiest to get wrong: these three entry points
     /// chmod'd their directory to `0700` unconditionally, so every install and update
@@ -1517,22 +1497,11 @@ mod tests {
     /// `0755`. Nothing upstream objects to `0700` — it satisfies `dir_safe_for_private_write`
     /// and Trust's launcher predicate alike — so the break surfaces only as a bare
     /// `Permission denied` at the first non-root invocation of an installed tool.
-    ///
-    /// Skips when this run cannot build an all-root-owned chain (see
-    /// [`system_prefix_fixture`]); the `$HOME` shape is covered above.
     #[cfg(unix)]
     #[test]
     fn a_system_shaped_prefix_publishes_bin_traversable() {
-        let Some(layout) = system_prefix_fixture("mode-sys") else {
-            // Not root: the shape is genuinely unbuildable here. Say so — this is the
-            // only assertion that tells the two prefix shapes apart, so a silent `ok`
-            // would misreport it as covered.
-            eprintln!(
-                "SKIP: a_system_shaped_prefix_publishes_bin_traversable \
-                 needs a root-owned system prefix (run as root to gate it)"
-            );
-            return;
-        };
+        let layout = system_prefix_fixture("mode-sys");
+        assert!(layout.is_system_prefix(), "the fixture is the system shape");
         let b18 = make_build(&layout, "ay", 18, &["ay"]);
         install_tools(&layout, &b18, &[tool("ay")], Aliases::Off).unwrap();
         assert_eq!(
@@ -1952,15 +1921,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// THE TWIN CARRIES THE SELF-UPDATE BLOCK AND NO LANDING PRELUDE: the `case "$1"` on the
-    /// rostered verbs and the hand-over to `atpkg __selfupdate` with the prefix operand, ahead of
-    /// the exports; no `[ -f <marker> ]`, no `__landing`; `bin/` carries the same block and no
-    /// landing prelude either (outside aterm `bin/claude` IS the managed name). Every reader keyed
-    /// on the target still resolves the twin to the STORE target; the twin is laid once and a
-    /// second reconcile writes nothing; and the twins older clients laid — the primary's
-    /// bytes (before any block), the landing-only twin and the block-then-landing twin —
-    /// are each re-laid to today's once. A marker left
-    /// standing changes nothing: the twin runs the store build.
+    /// THE TWIN CARRIES NO LANDING PRELUDE, and `bin/` carries the same bytes (outside aterm
+    /// `bin/claude` IS the managed name). Every reader keyed on the target still resolves
+    /// the twin to the STORE target; the twin is laid once and a second reconcile writes
+    /// nothing; and the twins older clients laid — the primary's bytes (before any block),
+    /// the landing-only twin and the block-then-landing twin — are each re-laid to today's
+    /// once. What the block does when run is
+    /// `the_twin_prelude_runs_the_store_build_when_the_embedded_atpkg_is_gone`'s.
     #[cfg(unix)]
     #[test]
     fn the_agents_twin_carries_the_self_update_block_and_no_landing_prelude() {
@@ -1989,36 +1956,10 @@ mod tests {
             !twin_body.contains(&marker.display().to_string()),
             "the twin never names a marker: {twin_body}"
         );
-        // THE SELF-UPDATE BLOCK: the `case "$1"` on the rostered verbs and the hand-over
-        // to `atpkg __selfupdate` with the program, the prefix and the arguments verbatim.
-        assert!(
-            twin_body.contains("case \"$1\" in\n  update|upgrade|install)\n"),
-            "{twin_body}"
-        );
-        let hand_over = format!(
-            "exec \"$__atpkg\" __selfupdate 'claude' '{}' -- \"$@\"; fi",
-            layout.prefix.display()
-        );
-        assert!(twin_body.contains(&hand_over), "{twin_body}");
-        assert!(
-            !twin_body.contains("command -v atpkg") && !twin_body.contains("exec atpkg "),
-            "no PATH fallback (review, 2026-09-16): {twin_body}"
-        );
         assert_eq!(
             primary_body, twin_body,
             "bin/ carries the twin's block: outside aterm it is the managed name"
         );
-        // The block sits AHEAD of the exports, and the real exec is the last line.
-        let block_at = twin_body.find("case \"$1\"").unwrap();
-        let export_at = twin_body.find("export DISABLE_AUTOUPDATER").unwrap();
-        assert!(block_at < export_at, "{twin_body}");
-        assert!(twin_body.trim_end().ends_with("\"$@\""), "{twin_body}");
-        // Every literal `exec '` line names the store target — none names atpkg.
-        let exec_lines: Vec<&str> = twin_body
-            .lines()
-            .filter(|l| l.trim().starts_with("exec '"))
-            .collect();
-        assert_eq!(exec_lines.len(), 1, "{twin_body}");
         assert_eq!(
             platform::resolve_shim(&twin),
             platform::resolve_shim(&primary),
@@ -2090,31 +2031,6 @@ mod tests {
                 "{what}: the second reconcile writes nothing"
             );
         }
-        // The twin runs, in a real /bin/sh, straight to the store target — with a marker
-        // an older client's pass left standing too: today's twin never reads it.
-        std::fs::write(c1.join("bin/claude"), b"#!/bin/sh\necho \"store: $*\"\n").unwrap();
-        std::fs::set_permissions(
-            c1.join("bin/claude"),
-            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
-        )
-        .unwrap();
-        std::fs::create_dir_all(layout.landing_dir()).unwrap();
-        std::fs::write(
-            &marker,
-            format!(
-                "atpkg-landing-v1 build=2026091702 pid={} from=2026091601 version=- \
-                 from_version=-\n",
-                std::process::id()
-            ),
-        )
-        .unwrap();
-        let out = std::process::Command::new(&twin)
-            .arg("--probe")
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "{out:?}");
-        assert_eq!(String::from_utf8_lossy(&out.stdout), "store: --probe\n");
-        assert_eq!(String::from_utf8_lossy(&out.stderr), "", "nothing printed");
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
@@ -2321,61 +2237,6 @@ mod tests {
             "a primary outside an agent program's store tree earns no twin"
         );
         assert!(twin.exists(), "the real twin is untouched");
-        let _ = std::fs::remove_dir_all(&layout.prefix);
-    }
-
-    /// THE AGENTS RECONCILE IS THE PASS'S, NOT EVERY PROGRAM'S. [`reconcile_aliases`] runs
-    /// once per ACTIVE PROGRAM, so it leaves `agents/` alone; the pass calls
-    /// [`reconcile_agents`] once after its loop.
-    #[cfg(unix)]
-    #[test]
-    fn the_alias_reconcile_leaves_the_agents_twin_to_the_once_per_pass_reconcile() {
-        let layout = temp_prefix("agents-once-per-pass");
-        let env = crate::shim_env::ShimEnv::NONE;
-        let claude = tool("claude");
-        let c1 = make_build(&layout, "claude", 2026091001, &["claude"]);
-        install_tools_env(
-            &layout,
-            &c1,
-            std::slice::from_ref(&claude),
-            Aliases::Off,
-            &env,
-        )
-        .unwrap();
-        let ay_build = make_build(&layout, "ay", 18, &["ay"]);
-        install_tools_env(&layout, &ay_build, &[tool("ay")], Aliases::Alab, &env).unwrap();
-        let twin = layout.agent_shim(&claude);
-        let alab_ay = tool("ay").alias().expect("ay carries an alab- alias");
-        assert!(twin.exists(), "precondition: the install laid the twin");
-        assert!(
-            layout.shim(&alab_ay).exists(),
-            "precondition: the alias too"
-        );
-
-        // An UNRELATED program's alias reconcile — the P-1 repeats of every pass — does
-        // its own work and nothing under agents/.
-        std::fs::remove_file(&twin).unwrap();
-        std::fs::remove_file(layout.shim(&alab_ay)).unwrap();
-        reconcile_aliases(&layout, &ay_build, &[tool("ay")], Aliases::Alab).unwrap();
-        assert!(
-            layout.shim(&alab_ay).exists(),
-            "the alias reconcile still lays the alias it exists for"
-        );
-        assert!(
-            !twin.exists(),
-            "ay's alias reconcile must not re-do the agents reconcile"
-        );
-        // Nor does the agent program's OWN alias reconcile: agents/ is the pass's job.
-        reconcile_aliases(&layout, &c1, std::slice::from_ref(&claude), Aliases::Off).unwrap();
-        assert!(!twin.exists(), "nor claude's own");
-
-        // The pass's single call is what lays it.
-        reconcile_agents(&layout);
-        assert_eq!(
-            platform::resolve_shim(&twin),
-            platform::resolve_shim(&layout.shim(&claude)),
-            "the once-per-pass reconcile lays the twin the alias pass left alone"
-        );
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 

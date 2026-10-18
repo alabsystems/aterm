@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! THE SESSION LOG, host side (`docs/DESIGN-session-log-2026-10-15.md`, slice
-//! 1): one [`aterm_slog::Log`] per session, a field of
+//! 1 and phase 2A): one [`aterm_slog::Log`] per session, a field of
 //! [`crate::session_timeline::SessionTimeline`] and so under its lock (design
 //! §4.1: the allowed orderings meta → timeline and fabric → timeline are
 //! unchanged, and the timeline lock stays a strict leaf — nothing here takes
@@ -11,7 +11,8 @@
 //!
 //! | Site | Records |
 //! |---|---|
-//! | `SessionStore::register` | `open - spawn\|adopt\|restore parent=<sid> epoch=<ep>` |
+//! | `SessionStore::register` | `open - spawn\|adopt\|restore parent=<sid> epoch=<ep>`, a restore's with `prev=<sid> lineage=<sid>` |
+//! | `App::carry_restored_lineage` | `amend - restore prev= lineage=` when a window's already-open bootstrap fills a restored leaf |
 //! | `SessionStore::deregister_local_as` | `close - out=<reason> by= code=` |
 //! | the status sweep's block read | `open r<n> cmd blk= detail=` at OSC 133 C; `close r<n> out= code= dur_ms=` at D (the program and agent runs under it first, at the same instant); both, `dur=wall`, for a block the sweep saw only finished; `gap why=evicted` for blocks the terminal dropped unread |
 //! | `note_foreground_group`, `set_program` | `open`/`close r<n> prog\|agent prog=`; `amend r<n> agent prog=` when a group's name confirms the agent the screen named |
@@ -19,6 +20,12 @@
 //! | `note_person` | the tracker's attribution, and `mark - human by=human` once per 30 s burst |
 //! | `cmd_turn` | the tracker's `by=` and `ledger=` for the turn the exchange opens, noted at its first byte and at each Enter |
 //! | `FailureMark`'s seen (the sweep, `note_session_seen`, a carried exit) | `mark - seen by=human`, which lifts `need=failure` |
+//! | control input (`send`, `key`, `paste`, `feed`, their binary twins; phase 3A) | the tracker's attribution by the connection's actor with its `cause=`, and `mark - input verb= by=` once per author's 30 s burst |
+//!
+//! THE WATCHERS' WAKE (phase 3A, `session_log_mark`): every producer site takes
+//! the owed wake ([`SessionLog::take_log_wake`]) in the timeline lock it holds and,
+//! once it is released, wakes the session's subscribers, so `await log` and
+//! `subscribe … log` never poll.
 //!
 //! The sweep writes the block read BEFORE the foreground move: a command's D
 //! closes the programs that ran under it at its own stamp, so no child closes
@@ -39,17 +46,35 @@
 //! entry and arms nothing; a `ctl turn` never leaves a settle armed (it closes
 //! a resting turn at once).
 //!
-//! SEAMLESS UPDATES. Slice 1 carries no records: the successor's log starts
-//! with `gap why=handoff epoch=<ep+1>` ([`Log::after_handoff`]). What it does
-//! carry is the epoch and the three node-id counters, on the session's handoff
-//! record ([`LogCarry`], `SessionRecord::log_ids`, an additive field an older
-//! or newer build skips), so `t17` names one turn for as long as the session
-//! lives. The counters are carried with a reserve, like the timeline's ids
-//! ([`LOG_ID_RESERVE`]), because the outgoing process keeps writing until its
-//! Commit; one that passes the reserve makes the Commit stand down
-//! ([`SessionLog::past_handoff_ceiling`]).
+//! SEAMLESS UPDATES. The log itself rides the session's control sidecar
+//! (`handoff_carry`, its `log` member: at most 128 KiB of carry lines cut in
+//! the eviction order, with the producers' own state, `session_log_carry`),
+//! for a successor that reads it. The successor continues it at the next
+//! epoch with `mark - handoff carried=<n> shed=<m>`, every run, turn and step
+//! still open (an agent mid-turn stays in that turn, a command running
+//! across the update closes with its real code when its D comes), and the
+//! outgoing process's readers are fenced at what it carried until it exits
+//! or the update stands down. An update that carries no log starts the
+//! successor's log with `gap why=handoff epoch=<ep+1>` ([`Log::after_handoff`]).
+//! What every update carries is the epoch, the three node-id counters and the seq count,
+//! on the session's handoff record ([`LogCarry`], `SessionRecord::log_ids`;
+//! `SessionRecord::log_seq`; additive fields an older or newer build skips),
+//! so `t17` names one turn and seq 412 one record for as long as the session
+//! lives. The counts are carried with a reserve, like the timeline's ids
+//! ([`LOG_ID_RESERVE`], [`LOG_SEQ_RESERVE`]), because the outgoing process
+//! keeps writing until its Commit; one that passes a reserve makes the Commit
+//! stand down ([`SessionLog::past_handoff_ceiling`]).
+//!
+//! MEMORY AND CLOSED SESSIONS. [`LOG_MEMORY_CAP`] is a deferred estimated-heap
+//! target for the live logs and closed-session index. The event loop's sweep
+//! ([`crate::App::sweep_session_log_memory`]) reserves the charge of logs at
+//! their configured minimum and shares the remaining target among the others.
+//! Busy timelines and retained state can exceed it. The sweep never runs
+//! inside an append or holds two locks at once. A session that closes leaves
+//! its log in the index ([`ClosedLog`], `session_log_closed`), which
+//! `log @<sid>` and `brief @<sid>` answer from.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use aterm_slog::{
     Actor, Amend, Close, Conf, Cursor, Fields, Gap, GapWhy, IdCounters, Key, Kind, Limits, Log,
@@ -62,10 +87,10 @@ use aterm_slog::{
 /// nothing of the predecessor's to [`adopted_epoch`].
 pub(crate) const FIRST_EPOCH: u32 = 1;
 
-/// The epoch of a successor told nothing of its predecessor's (a shell the
-/// PTY keeper held through a crash; an older producer's or a rollback's
-/// manifest, which carries no `log_ids`): the wall clock's Unix seconds at
-/// the adoption, never below 2.
+/// The epoch of a successor told nothing of its predecessor's (an older
+/// producer's or a rollback's manifest, which carries no `log_ids`; a crash
+/// recovery whose keeper tag names no epoch, [`crash_epoch`]): the wall
+/// clock's Unix seconds at the adoption, never below 2.
 ///
 /// Why not [`FIRST_EPOCH`]: a reader's cursor from the predecessor
 /// (`since=13 ep=1`) would match the successor's epoch, and once the new log
@@ -76,20 +101,31 @@ pub(crate) const FIRST_EPOCH: u32 = 1;
 /// adoption's chain when at least one whole second, plus one per handoff that
 /// chain made, has passed on the wall clock since; the 32 bits last until
 /// 2106.
-///
-/// NOT GUARANTEED: nothing carries the predecessor's epoch to such a
-/// successor, so two adoptions of one shell within the same wall second (an
-/// aterm that crashes as it starts and is adopted again) take the same
-/// epoch, and a wall clock stepped back can repeat or undercut an earlier
-/// chain's. A reader whose `since=<seq> ep=<e>` names the repeated epoch then
-/// reads on into the second successor's records with no `gap` once its seq
-/// passes the cursor; a cursor of a lower or other epoch is still reset.
-/// Strictly growing epochs here need the keeper's custody record to carry the
-/// last one issued.
 pub(crate) fn adopted_epoch(at: Stamp) -> u32 {
     u32::try_from(at.wall_ms / 1000)
         .unwrap_or(u32::MAX)
         .max(FIRST_EPOCH + 1)
+}
+
+/// THE EPOCH OF A CRASH RECOVERY (a shell the PTY keeper held after its
+/// window died): above the one the keeper's tag names for the crashed
+/// window's log (`tag_ep`, `keeper_link::Tag::slog_ep`), and no lower than
+/// [`adopted_epoch`]. Two recoveries of one shell within one wall second
+/// therefore take growing epochs: each window registers its own log's epoch
+/// with the keeper before it can crash.
+///
+/// Why the larger of the two, and not the tag's plus one alone: a successor
+/// that crashes after its log was readable but before its registration
+/// reached the keeper leaves its predecessor's tag in the keeper's custody,
+/// and the tag's plus one would repeat that successor's epoch whatever the
+/// time. With the seconds as a floor, a repeat needs both a registration
+/// lost that way and two recoveries in the same wall second; a window older
+/// than the tag's key (`tag_ep` `None`) is slice 1's seconds alone. A wall
+/// clock stepped back is held off by the tag.
+pub(crate) fn crash_epoch(tag_ep: Option<u32>, at: Stamp) -> u32 {
+    tag_ep
+        .map_or(0, |ep| ep.saturating_add(1))
+        .max(adopted_epoch(at))
 }
 
 /// How far past its last issued id each numbered level's counter is carried
@@ -100,7 +136,45 @@ pub(crate) fn adopted_epoch(at: Stamp) -> u32 {
 /// turn ledger's reserve (`control::TURN_ID_RESERVE`): every shell command
 /// issues a run id, so a script that runs a few hundred commands while an
 /// update stages must not keep the Commit retrying.
+#[cfg(any(unix, test))]
 pub(crate) const LOG_ID_RESERVE: u32 = 1 << 12;
+
+/// How far past its last seq a session log's seq count is carried across a
+/// seamless update (`SessionRecord::log_seq`, design §2.2): the records the
+/// outgoing process may still append between drawing the manifest and its
+/// Commit (a verdict mark at every published move, its turns and steps).
+/// Sized like the timeline's (`session_timeline::HANDOFF_ID_RESERVE`); a
+/// process that appends more refuses its Commit, a lossless retry
+/// ([`SessionLog::past_handoff_ceiling`]).
+pub(crate) const LOG_SEQ_RESERVE: u64 = 1 << 16;
+// Every count drawn ([`SessionLog::handoff_seq`]) fits the manifest's TOML.
+const _: () = assert!(aterm_slog::SEQ_LIMIT + LOG_SEQ_RESERVE <= i64::MAX as u64);
+
+/// What an adopted session's log is told of its predecessor's: the
+/// manifest's node-id counters and epoch ([`LogCarry`],
+/// `SessionRecord::log_ids`) and seq count (`SessionRecord::log_seq`, 0:
+/// none carried, an older producer's).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LogAdopt {
+    /// The epoch and node-id counters, with their reserve.
+    pub(crate) ids: Option<LogCarry>,
+    /// The seq count, with its reserve: the successor's first seq is above it.
+    pub(crate) seq: u64,
+    /// The carried log (the control sidecar's `log` member,
+    /// `handoff_carry::ControlCarry::take_log`): `None` when the update
+    /// carried none, and the log starts over.
+    pub(crate) lines: Option<Vec<String>>,
+    /// For a shell the PTY keeper held through a crash: the epoch its
+    /// crashed window's log was at, as the keeper's tag names it
+    /// (`keeper_link::Tag::slog_ep`; `None`: an older window's tag).
+    pub(crate) keeper_ep: Option<u32>,
+    /// THE BUS MIRROR's cursor and `ms` head in the predecessor's seq space,
+    /// as its export drew them under the readers' fence (the control
+    /// sidecar's `log_mirror` member, session log phase 4 ruling Q7): only
+    /// for a mirrored log the update did NOT carry, whose successor then says
+    /// the old space's tail as one exact `gap why=reset`. `None` otherwise.
+    pub(crate) mirror: Option<aterm_slog::Prior>,
+}
 
 /// The host's reading of both clocks: wall Unix ms (the clock shell blocks are
 /// stamped with, `aterm_types::current_time_ms`) and the process's
@@ -168,6 +242,7 @@ pub(crate) struct LogCarry {
 
 impl LogCarry {
     /// The handoff record's spelling.
+    #[cfg(any(unix, test))]
     pub(crate) fn row(self) -> String {
         format!(
             "{} {} {} {}",
@@ -241,9 +316,10 @@ pub(crate) struct BlockRead {
     pub(crate) through: Option<u64>,
     /// The cursor the read started from ([`SessionLog::block_cursor`]).
     pub(crate) from: Option<u64>,
-    /// Block ids from the cursor on that the terminal no longer holds: its
-    /// block history was cleared (ED 3 from `clear`, Cmd-K, RIS) or dropped
-    /// its oldest before a read reached them. Counted once: `through` covers
+    /// Block ids from the cursor on that the terminal no longer holds: a RIS
+    /// cleared its block history, an ED 3 (`clear`) or a Cmd-K erased the
+    /// history they lay wholly in, or it dropped its oldest before a read
+    /// reached them. Counted once: `through` covers
     /// them, so the next read starts at the first block still held.
     pub(crate) dropped: u64,
     /// The terminal's count of commands the shell started (each accepted OSC
@@ -332,45 +408,55 @@ struct PendingName {
 }
 
 /// What reached the session that a turn tracker attributes a turn to (a
-/// person's input, [`SessionLog::human_input`]; a `ctl turn`,
-/// [`SessionLog::ctl_turn`]): the latest of each, with when it came in the
-/// order of [`SessionLog::arrivals`]. A name waits for a block read
+/// person's input, [`SessionLog::human_input`]; control input,
+/// [`SessionLog::ctl_input`]; a `ctl turn`, [`SessionLog::ctl_turn`]): the
+/// latest of each, with when it came in the order of
+/// [`SessionLog::arrivals`]. A name waits for a block read
 /// ([`SessionLog::program_named`]), and the run it opens then is told what
-/// came after the name, in that order and at its own stamps
-/// ([`Self::replay`]), as it would have been had it opened at the name. The
-/// latest of each is all a tracker keeps: the newest input is the one a
-/// turn is attributed to, and a `ctl turn`'s ledger stands unless input
+/// came after the name — and what came after the command it runs under
+/// began (its C), though before the name: input sent once the agent drew its
+/// composer but before the status sweep named its group went to the program,
+/// never to the shell's command line — in arrival order and at its own stamps
+/// ([`Self::replay`]), as it would have been had it opened when the command
+/// began. The latest of each is all a tracker keeps: the newest input is the
+/// one a turn is attributed to, and a `ctl turn`'s ledger stands unless input
 /// from another sender came after it.
 #[derive(Clone, Copy, Debug, Default)]
 struct Typed {
-    /// A person's input: when it came, and its stamp.
-    input: Option<(u64, Stamp)>,
-    /// A `ctl turn`: when it came, its sender, its ledger id and its stamp.
-    ctl: Option<(u64, Actor, u64, Stamp)>,
+    /// The latest input — a person's, or a control verb's (phase 3A): when it
+    /// came, who sent it, what it said it acted on (`cause=`) and its stamp.
+    input: Option<(u64, Actor, Option<ShortId>, Stamp)>,
+    /// A `ctl turn`: when it came, its sender, its ledger id, its cause and
+    /// its stamp.
+    ctl: Option<(u64, Actor, u64, Option<ShortId>, Stamp)>,
 }
 
 impl Typed {
     /// Tell `tracker` (of a run just opened, its first verdict observed) what
-    /// came after arrival `after`, in arrival order. A fresh tracker has no
-    /// settle armed, so this only records: the 5 s window applies when a
-    /// turn opens.
-    fn replay(&self, after: u64, log: &mut Log, tracker: &mut TurnTracker) {
-        let input = self.input.filter(|(seq, _)| *seq > after);
-        let ctl = self.ctl.filter(|(seq, ..)| *seq > after);
+    /// came after arrival `after`, or after `began` (the wall instant the
+    /// command the run is under began, when it runs under one), in arrival
+    /// order. Input before both (the Enter that started the command, at the
+    /// shell) is not the run's. A fresh tracker has no settle armed, so this
+    /// only records: the 5 s window applies when a turn opens.
+    fn replay(&self, after: u64, began: Option<Stamp>, log: &mut Log, tracker: &mut TurnTracker) {
+        let came =
+            |seq: u64, at: Stamp| seq > after || began.is_some_and(|b| at.wall_ms > b.wall_ms);
+        let input = self.input.filter(|&(seq, _, _, at)| came(seq, at));
+        let ctl = self.ctl.filter(|&(seq, _, _, _, at)| came(seq, at));
         let input_last = match (input, ctl) {
-            (Some((i, _)), Some((c, ..))) => i > c,
+            (Some((i, ..)), Some((c, ..))) => i > c,
             _ => true,
         };
         let exchange = |log: &mut Log, tracker: &mut TurnTracker| {
-            if let Some((_, by, ledger, at)) = ctl {
-                let _ = tracker.ctl_turn(log, by, ledger, at);
+            if let Some((_, by, ledger, cause, at)) = ctl {
+                let _ = tracker.ctl_turn_caused(log, by, ledger, cause, at);
             }
         };
         if input_last {
             exchange(log, tracker);
         }
-        if let Some((_, at)) = input {
-            tracker.note_input(Actor::Human, at);
+        if let Some((_, by, cause, at)) = input {
+            tracker.note_input_caused(by, cause, at);
         }
         if !input_last {
             exchange(log, tracker);
@@ -387,6 +473,24 @@ const PENDING_NAMES_MAX: usize = 8;
 struct FgRun {
     pgid: i32,
     node: Node,
+    /// The latest name the resolver gave the group, as its fingerprint
+    /// ([`name_fp`]; 0: none): the program a successor's resolver names the
+    /// group again after a seamless update, whose run then goes on.
+    name_fp: u64,
+}
+
+/// A program name's fingerprint (64-bit FNV-1a over its bytes; 0 for none):
+/// stable across builds, so a carried run's name compares with the name the
+/// successor's resolver gives (`session_log_carry`).
+fn name_fp(name: Option<&str>) -> u64 {
+    name.map_or(0, |n| {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in n.bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h.max(1)
+    })
 }
 
 #[derive(Debug)]
@@ -405,6 +509,9 @@ struct AgentRun {
 pub(crate) struct SessionLog {
     log: Log,
     clock: Clock,
+    /// The consumer half's own state (phase 3A, `session_log_mark`): the
+    /// mark limiter, the control-input bursts and the watchers' wake.
+    consumers: mark::Consumers,
     /// How the session came to this process: `spawn`, `adopt` or `restore`.
     origin: Kind,
     /// When the session node opened here (wall ms): a block that finished
@@ -439,13 +546,55 @@ pub(crate) struct SessionLog {
     typed: Typed,
     /// The counters the last handoff manifest carried ([`Self::handoff_carry`]).
     ceiling: Option<IdCounters>,
+    /// The seq count the last handoff manifest carried ([`Self::handoff_seq`]).
+    seq_ceiling: Option<u64>,
+    /// A cold restore's new shell: the session its leaf was (`prev=` on its
+    /// `open - restore`), until the open writes it.
+    restored_from: Option<ShortId>,
+    /// THE LINEAGE: the first session of the chain of restores this one
+    /// continues (`None`: it began it). A restore leaf carries it
+    /// ([`crate::restore::TerminalLeafRestore::lineage`]), so a chain of
+    /// restores keeps naming the session it began with; a seamless update's
+    /// leaf hands it to the shell it names ([`Self::seed_lineage`]).
+    lineage: Option<ShortId>,
+    /// THE JOURNAL'S START (phase 2B, ruling R5): the carried head a seamless
+    /// update's predecessor journaled up to (its carry's `journal` host
+    /// line), which this process's journal writer starts after; `None`: from
+    /// the log's first record. Written once, at the adoption.
+    journal_start: Option<u64>,
+    /// THE BUS MIRROR's state the store shares with this log, once the store
+    /// registered the session (`session_log_mirror::Shared`), and the bus
+    /// log generation this log last synced under ([`Self::mirror_log`]).
+    mirror_shared: Option<std::sync::Arc<crate::session_log_mirror::Shared>>,
+    mirror_seen: u64,
+}
+
+/// A session ring's bounds: [`Limits::SESSION`], or, in a development build
+/// only, `ATERM_SLOG_RING=<records>,<bytes>` (`aterm_types::dev_seam!`, `None`
+/// in a release build), read once: the bus mirror's world tests reach an
+/// eviction in a handful of commands with it (session log phase 4).
+pub(crate) fn ring_limits() -> Limits {
+    static RING: std::sync::OnceLock<Limits> = std::sync::OnceLock::new();
+    *RING.get_or_init(|| {
+        aterm_types::dev_seam!("ATERM_SLOG_RING")
+            .and_then(|v| {
+                let (records, bytes) = v.to_str()?.split_once(',')?;
+                Limits::new(records.parse().ok()?, bytes.parse().ok()?)
+            })
+            .unwrap_or(Limits::SESSION)
+    })
 }
 
 impl Default for SessionLog {
     fn default() -> Self {
+        let mut log = Log::with_limits(FIRST_EPOCH, ring_limits());
+        // The journal writer's wake (ruling R6), when this process keeps a
+        // journal: every append and eviction of this log rings it.
+        log.set_notify(crate::session_log_journal::notify());
         SessionLog {
-            log: Log::new(FIRST_EPOCH),
+            log,
             clock: Clock::default(),
+            consumers: mark::Consumers::default(),
             origin: Kind::Spawn,
             opened_wall: None,
             cmd: None,
@@ -459,6 +608,12 @@ impl Default for SessionLog {
             arrivals: 0,
             typed: Typed::default(),
             ceiling: None,
+            seq_ceiling: None,
+            restored_from: None,
+            lineage: None,
+            journal_start: None,
+            mirror_shared: None,
+            mirror_seen: 0,
         }
     }
 }
@@ -476,13 +631,25 @@ const fn run_out(code: Option<i32>) -> (RunOut, Conf) {
 pub(crate) fn exit_actor(actor: &crate::session_store::ExitActor) -> Actor {
     use crate::session_store::ExitActor;
     match actor {
-        ExitActor::Sid(sid) => ShortId::new(sid).map_or(Actor::Nobody, Actor::Sid),
+        // An edge's source as `grant` took it: a session only when it reads
+        // as a minted sid (phase 3A ruling R1).
+        ExitActor::Sid(sid) => sid_actor(sid).unwrap_or(Actor::Nobody),
         ExitActor::Human => Actor::Human,
         ExitActor::Ctl => Actor::Ctl,
         #[cfg(any(unix, test))]
         ExitActor::Bridge => Actor::Bridge,
         ExitActor::Unknown => Actor::Nobody,
     }
+}
+
+/// The session `sid` names as the log's actor: a minted sid's
+/// ([`aterm_session::is_minted_sid`]), else none (phase 3A ruling R1: a name
+/// someone chose is never a session's, and never a trusted actor).
+pub(crate) fn sid_actor(sid: &str) -> Option<Actor> {
+    aterm_session::is_minted_sid(sid)
+        .then(|| ShortId::new(sid))
+        .flatten()
+        .map(Actor::sid)
 }
 
 /// The session outcome an `ExitReason` names.
@@ -517,6 +684,71 @@ impl SessionLog {
     /// The log.
     pub(crate) fn log(&self) -> &Log {
         &self.log
+    }
+
+    /// The log, for the journal writer's one write into it: installing its
+    /// wake on a log that has none (a log made before the lane published it).
+    pub(crate) fn log_mut_for_journal(&mut self) -> &mut Log {
+        &mut self.log
+    }
+
+    /// The log, for the bus mirror's take, landing and close
+    /// (`session_log_mirror`, phase 4): the writes a bridge makes into a log,
+    /// all of the mirror's own state (`aterm_slog::Log::bus_copy`,
+    /// `aterm_slog::Log::land`), under the timeline's lock — first synced
+    /// with the store's mirror state (`session_log_mirror::sync`: a replaced
+    /// bus log's cursor forgotten, the log engaged while the node mirrors).
+    pub(crate) fn mirror_log(&mut self) -> &mut Log {
+        self.sync_mirror();
+        &mut self.log
+    }
+
+    /// The log, to write records into in a test, never synced with the
+    /// mirror's state (what a session's own appends are).
+    #[cfg(test)]
+    pub(crate) fn log_mut_for_tests(&mut self) -> &mut Log {
+        &mut self.log
+    }
+
+    /// THE STORE'S MIRROR STATE, bound when the store registers the session.
+    /// The generation starts at 0, so a bus log replaced in this process
+    /// before the session registered (a carried cursor among them) is
+    /// forgotten at its first sync.
+    pub(crate) fn bind_mirror(
+        &mut self,
+        shared: std::sync::Arc<crate::session_log_mirror::Shared>,
+    ) {
+        if self
+            .mirror_shared
+            .as_ref()
+            .is_some_and(|s| std::sync::Arc::ptr_eq(s, &shared))
+        {
+            return;
+        }
+        self.mirror_shared = Some(shared);
+        self.mirror_seen = 0;
+    }
+
+    /// [`crate::session_log_mirror::sync`], when the store bound its state.
+    fn sync_mirror(&mut self) {
+        if let Some(shared) = self.mirror_shared.as_deref() {
+            crate::session_log_mirror::sync(shared, &mut self.log, &mut self.mirror_seen);
+        }
+    }
+
+    /// Where this process's journal starts this session's records (after the
+    /// predecessor's journaled head, `journal_start`), or `None`: from its
+    /// first.
+    pub(crate) fn journal_start(&self) -> Option<u64> {
+        self.journal_start
+    }
+
+    /// Put `log` in place of this one, keeping its journal wake: no path that
+    /// replaces a session's log can leave it unrung.
+    pub(crate) fn replace_log(&mut self, log: Log) {
+        let notify = self.log.notify().cloned();
+        self.log = log;
+        self.log.set_notify(notify);
     }
 
     /// The time now, on this log's clock.
@@ -557,30 +789,99 @@ impl SessionLog {
     // ---- the session -------------------------------------------------
 
     /// This session came across a seamless update (or out of the PTY keeper's
-    /// custody, `keeper`): its log starts over, as slice 1 carries no records,
-    /// with the loss said first — `gap why=handoff epoch=<ep+1>` continuing the
-    /// carried node ids, or `gap why=crash` for a shell whose window died. A
-    /// successor told nothing of the predecessor's epoch takes
-    /// [`adopted_epoch`], so no cursor of the predecessor's reads on past the
-    /// loss. Called before anything else is written.
-    pub(crate) fn adopt(&mut self, carry: Option<LogCarry>, keeper: bool, at: Stamp) {
-        self.log = match (keeper, carry) {
+    /// custody, `keeper`): its log starts over, with the loss said first —
+    /// `gap why=handoff epoch=<ep+1>` continuing the carried node ids and,
+    /// past the carried seq count, the seqs, or `gap why=crash` for a shell
+    /// whose window died. A successor told nothing of the predecessor's epoch
+    /// takes [`adopted_epoch`], so no cursor of the predecessor's reads on
+    /// past the loss. Called before anything else is written.
+    pub(crate) fn adopt(&mut self, carry: LogAdopt, keeper: bool, at: Stamp) {
+        // A seq count no log reaches (`aterm_slog::SEQ_LIMIT`: a manifest
+        // that is corrupt or another program's) is none: `Log::from_carry`
+        // refuses it, and `Log::after_handoff` starts a new seq space for it,
+        // so this process's ceiling is always above its own head.
+        // A carry that reads continues the predecessor's log as it stood.
+        if !keeper && let (Some(lines), Some(ids)) = (carry.lines.as_deref(), carry.ids) {
+            match self.adopt_carried(lines, ids, carry.seq, at) {
+                Ok(_) => return,
+                Err(why) => aterm_log::warn!(
+                    "update adopt: a session's carried log did not read ({}); it starts over \
+                     after a handoff gap",
+                    why.why()
+                ),
+            }
+        }
+        self.reset_producers();
+        let next_seq = carry.seq.saturating_add(1);
+        let log = match (keeper, carry.ids) {
             (true, _) => {
-                let mut log = Log::new(adopted_epoch(at));
+                let mut log = Log::with_limits(crash_epoch(carry.keeper_ep, at), ring_limits());
                 log.gap(GapWhy::Crash, 0, at);
                 log
             }
             (false, Some(c)) => {
-                Log::after_handoff(c.ep.saturating_add(1), Limits::SESSION, c.ids, at)
+                Log::after_handoff(c.ep.saturating_add(1), ring_limits(), c.ids, next_seq, at)
             }
             (false, None) => Log::after_handoff(
                 adopted_epoch(at),
-                Limits::SESSION,
+                ring_limits(),
                 IdCounters::default(),
+                next_seq,
                 at,
             ),
         };
+        self.replace_log(log);
+        // A mirrored log the update did not carry: its old space's tail is
+        // owed to the bus as one exact cover (ruling Q7).
+        if !keeper && let Some(prior) = carry.mirror {
+            self.log.note_prior_space(prior);
+        }
         self.origin = Kind::Adopt;
+    }
+
+    /// THE CARRIED BLOCK CURSOR MEETS ITS ENGINE: called once the adopted
+    /// session's engine is hydrated, before its reader starts, with that
+    /// engine's next block id and C count
+    /// (`aterm_core::terminal::Terminal::next_block_id`,
+    /// `started_command_seq`). A carried log's block producer (the open
+    /// `cmd` run's block, the newest block handled, the C-count snapshot)
+    /// names the predecessor's engine; when the successor's is another (its
+    /// screen did not cross, so it started blank and its ids start at 0), a
+    /// cursor at or past the engine's next id would pass every block until
+    /// the ids caught up, logging no command and no `gap`, and a carried
+    /// `cmd` run would close on a later block that happens to take its id.
+    /// So a cursor the engine cannot hold is dropped, as the uncarried path
+    /// starts: the carried command closes `out=unknown` (its block is gone),
+    /// the reads start from the engine's own blocks, finished ones before now
+    /// passed over, and one `gap why=evicted` says the blocks between the
+    /// predecessor's last read and the update went with its screen. A cursor
+    /// the engine holds (the screen crossed with its blocks) is kept whole.
+    pub(crate) fn fit_engine(&mut self, next_block: u64, started: u64, at: Stamp) {
+        let fits = self.cmd.is_none_or(|c| c.blk < next_block)
+            && self.last_blk.is_none_or(|l| l < next_block)
+            && self
+                .c_snap
+                .is_none_or(|s| s.base <= started && s.cursor.is_none_or(|c| c <= next_block));
+        if fits {
+            return;
+        }
+        aterm_log::warn!(
+            "update adopt: a session's carried block cursor is past its engine's blocks (the \
+             screen did not cross); its commands are read from the engine's own"
+        );
+        self.resync();
+        if let Some(c) = self.cmd.take() {
+            self.end_cmd(c, CmdEnd::Unknown, at);
+        }
+        self.last_blk = None;
+        self.c_snap = None;
+        self.opened_wall = Some(at.wall_ms);
+        self.log.gap(GapWhy::Evicted, 0, at);
+    }
+
+    /// The producers' state as a fresh adoption has it: nothing known of the
+    /// predecessor's.
+    fn reset_producers(&mut self) {
         self.cmd = None;
         self.fg = None;
         self.agent = None;
@@ -590,13 +891,50 @@ impl SessionLog {
         self.c_snap = None;
         self.cmd_end = None;
         self.ceiling = None;
+        self.seq_ceiling = None;
     }
 
-    /// This session is a cold restore's new shell (`open - restore`).
-    pub(crate) fn note_restored(&mut self) {
+    /// This session is a restore's new shell, standing in for `prev` (the
+    /// session its leaf was, when the leaf names one), whose chain of
+    /// restores began at `lineage` (`prev` itself when none is named). Said
+    /// before its registration opens it, the open is `open - restore
+    /// prev=<sid> lineage=<sid>`; said of a session already open (a window's
+    /// bootstrap shell filling the leaf), an `amend - restore prev= lineage=`
+    /// on the session says it, at `at`. Either way the lineage is this
+    /// session's from now on, for its own next restore.
+    pub(crate) fn note_restored(&mut self, prev: Option<&str>, lineage: Option<&str>, at: Stamp) {
+        let prev = prev.and_then(ShortId::new);
+        self.lineage = lineage.and_then(ShortId::new).or(prev);
         if self.opened_wall.is_none() {
             self.origin = Kind::Restore;
+            self.restored_from = prev;
+            return;
         }
+        let Some(prev) = prev else {
+            return;
+        };
+        let f = with(Fields::new(), Key::Prev, Some(Val::Id(prev)));
+        let f = with(f, Key::Lineage, self.lineage.map(Val::Id));
+        let _ = self.log.amend(
+            Node::SESSION,
+            Amend::new(Kind::Restore, Src::Aterm, Conf::Exact, f),
+            at,
+        );
+    }
+
+    /// The lineage a seamless update's leaf names for the shell it hands
+    /// over (the same session, so no record): kept unless this log already
+    /// has one.
+    pub(crate) fn seed_lineage(&mut self, lineage: Option<&str>) {
+        if self.lineage.is_none() {
+            self.lineage = lineage.and_then(ShortId::new);
+        }
+    }
+
+    /// The first session of the chain of restores this one continues, or
+    /// `None` when it began it.
+    pub(crate) fn lineage(&self) -> Option<ShortId> {
+        self.lineage
     }
 
     /// `open - spawn|adopt|restore parent=<sid> epoch=<ep>`: the registry took
@@ -608,6 +946,15 @@ impl SessionLog {
             parent.and_then(ShortId::new).map(Val::Id),
         );
         let f = with(f, Key::Epoch, Some(Val::U(u64::from(self.log.ep()))));
+        let f = with(f, Key::Prev, self.restored_from.take().map(Val::Id));
+        let f = with(
+            f,
+            Key::Lineage,
+            (self.origin == Kind::Restore)
+                .then_some(self.lineage)
+                .flatten()
+                .map(Val::Id),
+        );
         if self
             .log
             .open_session(self.origin, Src::Aterm, Conf::Exact, Actor::Nobody, f, at)
@@ -636,6 +983,9 @@ impl SessionLog {
         self.cmd = None;
         self.fg = None;
         self.agent = None;
+        // The close a parked `await log` waited for is written, in the same
+        // hold of this lock: nothing more is due (`note_close_due`).
+        let _ = self.take_close_due();
     }
 
     // ---- shell blocks ------------------------------------------------
@@ -1170,6 +1520,12 @@ impl SessionLog {
             return;
         }
         if let Some(fg) = self.fg.filter(|f| f.pgid == pgid) {
+            // The same group naming the program it already runs: nothing
+            // changed (a seamless update's successor, whose resolver names
+            // every group again, keeps the run, its agent and its turn).
+            if name.is_some() && fg.name_fp == name_fp(name) {
+                return;
+            }
             if self.agent.as_ref().is_some_and(|a| a.node == fg.node) {
                 self.agent = None;
             }
@@ -1201,6 +1557,9 @@ impl SessionLog {
                 Amend::new(Kind::Agent, Src::Status, Conf::Strong, f),
                 at,
             );
+            if let Some(fg) = self.fg.as_mut().filter(|f| f.pgid == pgid) {
+                fg.name_fp = name_fp(Some(name));
+            }
             return;
         }
         let f = with(Fields::new(), Key::Prog, tok(Key::Prog, name));
@@ -1217,7 +1576,11 @@ impl SessionLog {
         let Ok(node) = self.log.open(open, at) else {
             return;
         };
-        self.fg = Some(FgRun { pgid, node });
+        self.fg = Some(FgRun {
+            pgid,
+            node,
+            name_fp: name_fp(Some(name)),
+        });
         if let Some(who) = agent {
             let mut tracker = TurnTracker::new(node);
             let _ = tracker.observe(
@@ -1226,7 +1589,10 @@ impl SessionLog {
                 detail,
                 at,
             );
-            self.typed.replay(p.seq, &mut self.log, &mut tracker);
+            // What came after the command it runs under began, though the
+            // name came later, is the run's too.
+            let began = under.and_then(|c| self.opened_at(c.node));
+            self.typed.replay(p.seq, began, &mut self.log, &mut tracker);
             self.agent = Some(AgentRun {
                 pgid,
                 node,
@@ -1254,8 +1620,17 @@ impl SessionLog {
         );
         a.by_screen = false;
         let node = a.node;
-        if self.fg.is_none_or(|f| f.pgid != pgid) {
-            self.fg = Some(FgRun { pgid, node });
+        // The group's front run (the interpreter's, or this one) is the
+        // confirmed program's now: its name is the group's latest.
+        match self.fg.as_mut() {
+            Some(fg) if fg.pgid == pgid => fg.name_fp = name_fp(Some(name)),
+            _ => {
+                self.fg = Some(FgRun {
+                    pgid,
+                    node,
+                    name_fp: name_fp(Some(name)),
+                });
+            }
         }
     }
 
@@ -1308,7 +1683,8 @@ impl SessionLog {
             aterm_phase::Program::Claude
             | aterm_phase::Program::Codex
             | aterm_phase::Program::Agy
-            | aterm_phase::Program::Muse => true,
+            | aterm_phase::Program::Muse
+            | aterm_phase::Program::Gemini => true,
             aterm_phase::Program::Generic => false,
         });
         if self.agent.is_none()
@@ -1385,7 +1761,7 @@ impl SessionLog {
     pub(crate) fn human_input(&mut self, burst: bool, at: Stamp) {
         self.resync();
         self.arrivals += 1;
-        self.typed.input = Some((self.arrivals, at));
+        self.typed.input = Some((self.arrivals, Actor::Human, None, at));
         if let Some(a) = self.agent.as_mut() {
             a.tracker.note_input(Actor::Human, at);
         }
@@ -1405,14 +1781,23 @@ impl SessionLog {
     /// a waiting name opens later too, [`Typed`]); a resting turn closes now.
     /// Returns the tracker's wake (none: the exchange leaves no settle
     /// pending).
-    pub(crate) fn ctl_turn(&mut self, by: Actor, ledger: u64, at: Stamp) -> Option<u64> {
+    ///
+    /// `cause` is what the exchange said it acted on (`turn cause=`, validated
+    /// by the verb): the turn it opens names it.
+    pub(crate) fn ctl_turn(
+        &mut self,
+        by: Actor,
+        ledger: u64,
+        cause: Option<ShortId>,
+        at: Stamp,
+    ) -> Option<u64> {
         self.resync();
         self.arrivals += 1;
-        self.typed.ctl = Some((self.arrivals, by, ledger, at));
+        self.typed.ctl = Some((self.arrivals, by, ledger, cause, at));
         let Self { log, agent, .. } = self;
         agent
             .as_mut()
-            .and_then(|a| a.tracker.ctl_turn(log, by, ledger, at))
+            .and_then(|a| a.tracker.ctl_turn_caused(log, by, ledger, cause, at))
     }
 
     /// The host's settle wake: a resting word that has held closes its turn.
@@ -1427,6 +1812,7 @@ impl SessionLog {
 
     /// What the handoff manifest carries: the epoch and the node-id counters
     /// plus [`LOG_ID_RESERVE`], remembered as this process's ceiling.
+    #[cfg(any(unix, test))]
     pub(crate) fn handoff_carry(&mut self) -> LogCarry {
         let ids = self.log.id_counters();
         let reserved = IdCounters {
@@ -1441,14 +1827,267 @@ impl SessionLog {
         }
     }
 
-    /// Whether this process issued a node id past the counters the last
-    /// manifest carried: the successor would issue it again, so the Commit
-    /// stands down.
+    /// Set the log's byte budget (the instance-wide sweep's share,
+    /// [`crate::App::sweep_session_log_memory`]): it evicts level-aware to
+    /// it at once, and `usize::MAX` gives the session bound back.
+    pub(crate) fn set_log_byte_budget(&mut self, bytes: usize) {
+        self.log.set_byte_budget(bytes);
+    }
+
+    /// What the handoff manifest carries of the seq count
+    /// (`SessionRecord::log_seq`): the last seq plus [`LOG_SEQ_RESERVE`],
+    /// remembered as this process's ceiling. A head past
+    /// `aterm_slog::SEQ_LIMIT` (only a log adopted at the very limit and
+    /// written past it) carries no count and keeps no ceiling: its successor
+    /// starts a new seq space, and no Commit waits on a ceiling the manifest
+    /// could never write above the head.
+    #[cfg(any(unix, test))]
+    pub(crate) fn handoff_seq(&mut self) -> u64 {
+        let last = self.log.last_seq();
+        if last > aterm_slog::SEQ_LIMIT {
+            self.seq_ceiling = None;
+            return 0;
+        }
+        // At most `SEQ_LIMIT` plus the reserve: within what TOML writes.
+        let carried = last + LOG_SEQ_RESERVE;
+        self.seq_ceiling = Some(carried);
+        carried
+    }
+
+    /// Whether this process issued a node id or a seq past the counts the
+    /// last manifest carried: the successor would issue it again, so the
+    /// Commit stands down.
+    #[cfg(any(unix, test))]
     pub(crate) fn past_handoff_ceiling(&self) -> bool {
         self.ceiling.is_some_and(|c| {
             let now = self.log.id_counters();
             now.run > c.run || now.turn > c.turn || now.step > c.step
-        })
+        }) || self.seq_ceiling.is_some_and(|c| self.log.last_seq() > c)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The instance-wide cap on session log memory (design §5.1, phase 2A).
+// ---------------------------------------------------------------------------
+
+/// THE INSTANCE CAP: every session log's estimated heap together
+/// (`aterm_slog::Log::footprint`, about three times what its ring's encoded
+/// bytes count), the closed-session index's included.
+pub(crate) const LOG_MEMORY_CAP: usize = 64 * 1024 * 1024;
+/// How often the event loop's sweep looks: at most once a second, on a turn
+/// the loop takes anyway (it arms no deadline of its own).
+pub(crate) const SLOG_SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+/// The most logs one pass lowers while the whole is within an eighth over
+/// the cap: the rest wait for the next pass. Past that, a pass lowers every
+/// log over its share. A log that reaches its configured minimum reserves
+/// its retained charge before the next pass divides the remaining target.
+pub(crate) const SLOG_SWEEP_MAX_SHRINK: usize = 8;
+
+/// One log's charge, as the sweep last read it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Charge {
+    footprint: usize,
+    bytes: usize,
+    pinned: usize,
+    /// Whether the sweep lowered its budget (and owes it a raise once there
+    /// is room again).
+    lowered: bool,
+    /// The byte budget the sweep last set it to; an over-target sweep does
+    /// not raise it unless the aggregate has room again.
+    budget: Option<usize>,
+}
+
+/// THE SWEEP'S STATE: the cap (a test lowers it), when it looks next, and
+/// what it last read of each pooled session's log.
+#[derive(Debug)]
+pub(crate) struct MemorySweep {
+    /// The estimated-heap target for all live logs and the closed index.
+    pub(crate) cap: usize,
+    due: Option<std::time::Instant>,
+    known: BTreeMap<u64, Charge>,
+}
+
+impl Default for MemorySweep {
+    fn default() -> Self {
+        MemorySweep {
+            cap: LOG_MEMORY_CAP,
+            due: None,
+            known: BTreeMap::new(),
+        }
+    }
+}
+
+/// `budget` shared out max-min fair over `wants`: every want that fits an
+/// even share gets all of it, and what it leaves goes to the larger ones,
+/// cut alike (the control carry's `core_shares` shape).
+fn fair_shares(wants: &[usize], budget: usize) -> Vec<usize> {
+    if wants.iter().fold(0usize, |a, w| a.saturating_add(*w)) <= budget {
+        return wants.to_vec();
+    }
+    let mut order: Vec<usize> = (0..wants.len()).collect();
+    order.sort_by_key(|&i| wants[i]);
+    let mut shares = vec![0; wants.len()];
+    let mut left = budget;
+    for (k, &i) in order.iter().enumerate() {
+        let alike = left / (wants.len() - k);
+        shares[i] = wants[i].min(alike);
+        left -= shares[i];
+    }
+    shares
+}
+
+impl crate::App {
+    /// THE INSTANCE-WIDE SWEEP (design §5.1): hold every session log, and
+    /// the closed-session index, under [`MemorySweep::cap`]. At most once per
+    /// [`SLOG_SWEEP_EVERY`], on a loop turn taken anyway; never inside an
+    /// append, and never two locks at once: each timeline is taken by
+    /// `try_lock` alone, a busy one skipped (its last reading stands). Over
+    /// the cap, logs at their configured minimum reserve their observed
+    /// charge; the remaining target is shared max-min fair among the others.
+    /// Logs most over their share get a lower byte budget, which they evict
+    /// to level-aware, never below their open path: at most
+    /// [`SLOG_SWEEP_MAX_SHRINK`] a pass while the whole is within an eighth
+    /// over the cap, every one of them past that. Once the whole is an eighth
+    /// under the cap again, every lowered log gets its session bound back.
+    ///
+    /// This is a deferred estimated-heap target, not an allocator or RSS
+    /// bound. Discovering a log's configured minimum takes a pass before
+    /// its excess can be redistributed. Busy timelines, retained state
+    /// (including a handoff fence), and growth between passes can keep the
+    /// aggregate above the target. The minimum is reassessed from current
+    /// pinned bytes each pass, so closing an open path makes it shrinkable
+    /// again.
+    pub(crate) fn sweep_session_log_memory(&mut self, now: std::time::Instant) {
+        let sweep = &mut self.session_status.slog_memory;
+        if sweep.due.is_some_and(|d| now < d) {
+            return;
+        }
+        // The journal writer's word, once a turn (≤ 1 Hz): one relaxed load.
+        self.poll_session_journal();
+        let sweep = &mut self.session_status.slog_memory;
+        sweep.due = Some(now + SLOG_SWEEP_EVERY);
+        let cap = sweep.cap.saturating_sub(self.closed_log_charge());
+        let mut ids: Vec<u64> = Vec::new();
+        for session in self.pool.iter() {
+            ids.push(session.id);
+            let read = session.ctx.timeline.try_lock().ok().map(|tl| {
+                let log = tl.slog().log();
+                (log.footprint(), log.bytes(), log.pinned_bytes())
+            });
+            let entry = self
+                .session_status
+                .slog_memory
+                .known
+                .entry(session.id)
+                .or_default();
+            if let Some((footprint, bytes, pinned)) = read {
+                entry.footprint = footprint;
+                entry.bytes = bytes;
+                entry.pinned = pinned;
+            }
+        }
+        let sweep = &mut self.session_status.slog_memory;
+        sweep.known.retain(|id, _| ids.contains(id));
+        let total: usize = sweep.known.values().map(|c| c.footprint).sum();
+        if total <= cap && !sweep.known.values().any(|c| c.lowered) {
+            return;
+        }
+        let reserved: Vec<usize> = ids
+            .iter()
+            .map(|id| {
+                let c = sweep.known[id];
+                let minimum = c.pinned.saturating_add(aterm_slog::MAX_RECORD_BYTES);
+                if c.lowered && c.budget.is_some_and(|b| b <= minimum) {
+                    c.footprint
+                } else {
+                    0
+                }
+            })
+            .collect();
+        let wants: Vec<usize> = ids
+            .iter()
+            .zip(&reserved)
+            .map(|(id, floor)| sweep.known[id].footprint.saturating_sub(*floor))
+            .collect();
+        let room = cap.saturating_sub(reserved.iter().sum());
+        let shares: Vec<usize> = fair_shares(&wants, room)
+            .into_iter()
+            .zip(reserved)
+            .map(|(share, floor)| share + floor)
+            .collect();
+        let mut over: Vec<(usize, u64, usize)> = ids
+            .iter()
+            .zip(&shares)
+            .filter_map(|(id, share)| {
+                let c = sweep.known.get(id)?;
+                (c.footprint > *share).then_some((c.footprint - share, *id, *share))
+            })
+            .collect();
+        over.sort_by_key(|o| std::cmp::Reverse(o.0));
+        // Room again (an eighth of the cap free, so a raised log's regrowth
+        // does not swing straight back over): every lowered log gets its
+        // session bound back; growing past its share later is the next
+        // pass's to lower.
+        let raise: Vec<u64> = if total < cap - cap / 8 {
+            ids.iter()
+                .filter(|id| sweep.known.get(id).is_some_and(|c| c.lowered))
+                .copied()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // Far over (an eighth past the cap), lower every eligible log at
+        // once. A newly discovered minimum reserves its charge on the next
+        // pass, when the remaining target can be redistributed.
+        let shrink = if total > cap.saturating_add(cap / 8) {
+            over.len()
+        } else {
+            SLOG_SWEEP_MAX_SHRINK
+        };
+        let mut budgets: Vec<(u64, Option<usize>)> = Vec::new();
+        for (_, id, share) in over.into_iter() {
+            if budgets.len() == shrink {
+                break;
+            }
+            let c = sweep.known[&id];
+            // The share in encoded bytes: the log's own heap to bytes ratio.
+            let bytes = (c.bytes as u128 * share as u128 / c.footprint.max(1) as u128) as usize;
+            let budget = bytes.max(c.pinned.saturating_add(aterm_slog::MAX_RECORD_BYTES));
+            // Keep a lowered budget while the aggregate is still over-target.
+            if c.lowered && c.budget.is_some_and(|b| budget >= b) {
+                continue;
+            }
+            budgets.push((id, Some(budget)));
+        }
+        budgets.extend(raise.into_iter().map(|id| (id, None)));
+        for (id, budget) in budgets {
+            let Some(session) = self.pool.get(id) else {
+                continue;
+            };
+            let Ok(mut tl) = session.ctx.timeline.try_lock() else {
+                continue;
+            };
+            let log = tl.slog_mut();
+            log.set_log_byte_budget(budget.unwrap_or(usize::MAX));
+            let (footprint, bytes) = (log.log().footprint(), log.log().bytes());
+            drop(tl);
+            if let Some(c) = self.session_status.slog_memory.known.get_mut(&id) {
+                c.footprint = footprint;
+                c.bytes = bytes;
+                c.lowered = budget.is_some();
+                c.budget = budget;
+            }
+        }
+    }
+
+    /// The closed-session index's charge against the cap (its entries'
+    /// estimated heap, [`ClosedLogs::charge`]), under the store's read lock.
+    fn closed_log_charge(&self) -> usize {
+        self.store
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .closed_logs()
+            .charge()
     }
 }
 
@@ -1498,6 +2137,50 @@ impl Wakes {
 }
 
 impl crate::App {
+    /// Lift every session log's readers' fence (an update stood down after
+    /// its worker carried the logs, `SessionLog::carry_source`): each
+    /// timeline's leaf lock, one at a time.
+    #[cfg(unix)]
+    pub(crate) fn lift_session_log_fences(&mut self) {
+        // The journal writer goes on past the fences, in a new segment.
+        crate::session_log_journal::note_stood_down();
+        let mut owed = Vec::new();
+        for session in self.pool.iter() {
+            let mut timeline = session
+                .ctx
+                .timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            timeline.slog_mut().lift_read_fence();
+            // The readers see past the overlap now (ruling R9): woken once the
+            // lock is released.
+            if timeline.slog_take_wake() {
+                owed.push(session.id);
+            }
+        }
+        for id in owed {
+            self.wake_log_watchers(id, true);
+        }
+        // The bus mirror's closed sessions land again (`StoreMirror::past_draw`).
+        self.store
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .mirror()
+            .lift_commit_fence();
+    }
+
+    /// Wake session `id`'s subscribers when its log's readers are `owed` a
+    /// wake ([`SessionLog::take_log_wake`], taken under the timeline lock the
+    /// caller has released): the content-less notify the sweep sends.
+    pub(crate) fn wake_log_watchers(&self, id: u64, owed: bool) {
+        if owed && self.subscribers.any() {
+            self.subscribers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .notify(id);
+        }
+    }
+
     /// THE SESSION LOG's settle ticks: each session whose turn tracker's wake
     /// is due is ticked under its timeline's leaf lock (the lock the sweep
     /// takes on this thread), and its next wake replaces the entry. Nothing
@@ -1510,18 +2193,16 @@ impl crate::App {
         }
         let now = crate::turn_ledger::now_ms();
         for id in self.session_status.slog_wakes.due(now) {
-            let wake = self
-                .pool
-                .get(id)
-                .and_then(|s| {
-                    s.ctx
-                        .timeline
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .slog_tick()
-                })
-                .filter(|w| *w > now);
-            self.session_status.slog_wakes.note(id, wake);
+            // A settle closes a turn with no output: nothing else would wake a
+            // reader parked on it (`await log close=turn`), so the tick does.
+            let (wake, owed) = self.pool.get(id).map_or((None, false), |s| {
+                let mut timeline = s.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+                (timeline.slog_tick(), timeline.slog_take_wake())
+            });
+            self.wake_log_watchers(id, owed);
+            self.session_status
+                .slog_wakes
+                .note(id, wake.filter(|w| *w > now));
         }
     }
 
@@ -1703,31 +2384,29 @@ impl BriefQuery {
     }
 }
 
-/// Every node's parent, as far as the log still knows it: the open records in
-/// its window, and the nodes still open.
-fn parents(log: &Log) -> HashMap<Node, Node> {
-    let mut map: HashMap<Node, Node> = log
-        .window()
-        .filter_map(|r| r.par.map(|p| (r.node, p)))
-        .collect();
-    for e in log.open_nodes() {
-        map.insert(e.node, e.parent);
-    }
-    map
+/// THE `lvl=` / `class=turn` FILTER, the one the `log` verb and `subscribe …
+/// log` share (phase 3A), so the two never disagree: no record of a level
+/// deeper than `lvl`, and with `turn_class` only the turn class (what the bus
+/// mirror would carry).
+pub(crate) fn shows(r: &Rec, lvl: Option<Lvl>, turn_class: bool) -> bool {
+    lvl.is_none_or(|l| r.node.lvl <= l) && (!turn_class || r.is_turn_class())
 }
 
-/// Whether `node` lies in the subtree of `root`.
-fn in_subtree(node: Node, root: Node, parents: &HashMap<Node, Node>) -> bool {
+/// Whether `node` lies in the subtree of `root`, by the log's own index of
+/// parents ([`Log::parent_of`]): level-aware eviction takes the open records
+/// of closed nodes, which named their parents, while records under them
+/// stay, so the parents are not read from the window.
+fn in_subtree(log: &Log, node: Node, root: Node) -> bool {
     if root == Node::SESSION {
         return true;
     }
     let mut at = node;
-    for _ in 0..=aterm_slog::MAX_OPEN {
+    for _ in 0..=aterm_slog::MAX_OPEN + 2 {
         if at == root {
             return true;
         }
-        match parents.get(&at) {
-            Some(p) => at = *p,
+        match log.parent_of(at) {
+            Some(p) => at = p,
             None => return false,
         }
     }
@@ -1805,6 +2484,8 @@ pub(crate) struct LogCopy {
     more: usize,
     as_of: u64,
     ep: u32,
+    /// The seq from which the window is whole ([`Log::complete_from`]): the
+    /// open path is never evicted, so the oldest live record says little.
     oldest: u64,
     lost: u64,
 }
@@ -1815,33 +2496,42 @@ impl LogCopy {
     /// the lock-order census resolves a call by its name.)
     pub(crate) fn copied_from(log: &Log, q: &LogQuery) -> LogCopy {
         let read = log.read(q.cursor.unwrap_or(Cursor::new(log.ep(), 0)), usize::MAX);
-        let tree = (q.node != Node::SESSION).then(|| parents(log));
         let matching: Vec<&Rec> = read
             .recs
             .into_iter()
-            .filter(|r| tree.as_ref().is_none_or(|p| in_subtree(r.node, q.node, p)))
-            .filter(|r| q.lvl.is_none_or(|l| r.node.lvl <= l))
+            .filter(|r| in_subtree(log, r.node, q.node))
+            .filter(|r| shows(r, q.lvl, q.turn_class))
             .filter(|r| q.kinds.is_empty() || q.kinds.contains(&r.k))
-            .filter(|r| !q.turn_class || r.is_turn_class())
             .collect();
         let more = q.n.map_or(0, |n| matching.len().saturating_sub(n));
         LogCopy {
             recs: matching[more..].iter().map(|r| (*r).clone()).collect(),
             gap: read.gap,
             more,
-            as_of: log.last_seq(),
+            as_of: log.reader_last_seq(),
             ep: log.ep(),
-            oldest: log.oldest_seq(),
+            oldest: log.complete_from(),
             lost: log.lost(),
         }
+    }
+
+    /// The copy with its header handing out `c` (`as_of=` its seq, `ep=` its
+    /// epoch) in place of the log's head: a journal reply's
+    /// (`aterm_slog::journal::View::reply_cursor`), which names none of the
+    /// records the reply derived past the journal's head.
+    pub(crate) fn handing(mut self, c: Cursor) -> LogCopy {
+        self.as_of = c.seq;
+        self.ep = c.ep;
+        self
     }
 }
 
 /// The `log` reply from its copy: `OK <n> v=2 as_of=<seq> ep=<e>
-/// oldest=<seq>[ lost=<n>][ more=<k>]`, a gap line when the reader's cursor
-/// is behind the ring or of another epoch (`gap why= lost= resync_to=`, or
-/// under `--json` a `{"op":"gap",…}` object, so every body line is one
-/// object), then one record per line, oldest first.
+/// oldest=<seq>[ lost=<n>][ more=<k>]` (`oldest=` the seq from which the
+/// window is whole, [`Log::complete_from`]), a gap line when the read crossed
+/// records the reader will never see or names another epoch (`gap why=
+/// lost= resync_to=`, or under `--json` a `{"op":"gap",…}` object, so every
+/// body line is one object), then one record per line, oldest first.
 pub(crate) fn render_log_copy(c: &LogCopy, q: &LogQuery) -> String {
     #[cfg(test)]
     encode_probe();
@@ -1919,17 +2609,24 @@ impl BriefCopy {
     /// gap that read crossed, and the state.
     pub(crate) fn copied_from(log: &Log, node: Node, cursor: Option<Cursor>) -> BriefCopy {
         let read = log.read(cursor.unwrap_or(Cursor::new(log.ep(), 0)), usize::MAX);
-        let tree = (node != Node::SESSION).then(|| parents(log));
         BriefCopy {
             recs: read
                 .recs
                 .into_iter()
-                .filter(|r| tree.as_ref().is_none_or(|p| in_subtree(r.node, node, p)))
+                .filter(|r| in_subtree(log, r.node, node))
                 .cloned()
                 .collect(),
             gap: read.gap,
-            state: log.state().clone(),
+            state: log.reader_state().clone(),
         }
+    }
+
+    /// The copy with its header handing out `c` in place of the log's head
+    /// ([`LogCopy::handing`]).
+    pub(crate) fn handing(mut self, c: Cursor) -> BriefCopy {
+        self.state.as_of = c.seq;
+        self.state.ep = c.ep;
+        self
     }
 
     /// Its brief within `budget` tokens at `now_wall`.
@@ -2049,6 +2746,33 @@ pub(crate) fn render_brief_all(parts: &[BriefPart], budget: usize) -> String {
     format!("OK {lines} brief all sessions={n} v=2 budget={budget} used={used}\n{body}")
 }
 
+#[path = "session_log_mark.rs"]
+mod mark;
+
+#[path = "session_log_carry.rs"]
+mod carry;
+#[cfg(test)]
+pub(crate) use carry::JOURNAL_HOST_LINE;
+#[cfg(any(unix, test))]
+pub(crate) use carry::{PreparedSlogCarry, SlogCarrySource};
+#[cfg(test)]
+pub(crate) use mark::{AWAIT_LOG_USAGE, MARK_USAGE, MarkReq};
+pub(crate) use mark::{
+    CAUSE_USAGE, CauseRef, InputVerb, LogAwait, LogAwaitStep, cmd_mark, validate_cause,
+};
+
+#[path = "session_log_closed.rs"]
+mod closed;
+#[cfg(test)]
+pub(crate) use closed::ClosedSource;
+#[cfg(test)]
+pub(crate) use closed::{CLOSED_INDEX_CAP, CLOSED_SKELETONS, SKELETONS_BUILT};
+pub(crate) use closed::{ClosedKeep, ClosedLog, ClosedLogs};
+
 #[cfg(test)]
 #[path = "session_log_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "session_log_mark_tests.rs"]
+mod mark_tests;

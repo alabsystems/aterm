@@ -276,18 +276,18 @@ fn bogus_exec_command_fails_closed_no_session() {
 // resolve via the resolver's PATHEXT retry and launch through CreateProcessW
 // by its resolved full path — before the fix this spawn failed NotFound.
 // Hermetic: probes a stock System32 `.cmd` (SearchPathW always searches
-// System32); skips gracefully on a trimmed SKU without it.
+// System32); a trimmed SKU without it cannot run the test (COULD NOT RUN).
 #[test]
 fn bare_cmd_shim_resolves_via_pathext_and_launches() {
     run_with_deadline("bare_cmd_shim_resolves_via_pathext_and_launches", || {
         let Some(sysroot) = std::env::var_os("SystemRoot") else {
-            return;
+            aterm_spec::host::could_not_run("SystemRoot is not set");
         };
         let shim = std::path::Path::new(&sysroot)
             .join("System32")
             .join("winrm.cmd");
         if !shim.is_file() {
-            return;
+            aterm_spec::host::could_not_run(format_args!("{} is not on this SKU", shim.display()));
         }
         let (spawn_cap, sandbox_cap) = caps();
         let shell = aterm_pty::spawn_shell_with_pid(

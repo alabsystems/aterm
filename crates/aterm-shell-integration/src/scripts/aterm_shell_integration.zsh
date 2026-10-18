@@ -315,14 +315,13 @@ if [[ ${#__aterm_body_rev} -ne 16 || "$__aterm_body_rev" == *[^0-9a-f]* ]]; then
     __aterm_body_rev=""
 fi
 
-# Package bin directory — once per shell: an upgrade in place already has it (and
-# the shell.d hooks below already ran; the LIVE block re-sources the atpkg hook
-# whenever it changes).
-if (( __aterm_fresh_load )) && [ -d "$HOME/.aterm/bin" ]; then
-    export PATH="$HOME/.aterm/bin:$PATH"
-fi
-
-# Source package shell hooks. The `(N)` NULL_GLOB qualifier is REQUIRED: without it
+# Source package shell hooks — once per shell: an upgrade in place already ran
+# them (the LIVE block re-sources the atpkg hook whenever it changes).
+# No `~/.aterm/bin` goes on PATH: nothing creates or manages that folder, and an
+# entry there ahead of everything would let whatever lands in it shadow every
+# command in every session. atpkg's managed bin/ is APPENDED, by its own hook.
+#
+# The `(N)` NULL_GLOB qualifier is REQUIRED: without it
 # zsh's default NOMATCH raises "no matches found" the instant a glob matches nothing
 # (e.g. shell.d holds only `*.zsh` hooks and no `*.sh`) and ABORTS this whole sourced
 # script — killing every OSC 7 (cwd) / OSC 133 (command-block) hook defined below, and
@@ -1469,13 +1468,124 @@ __aterm_line_init_wire() {
     fi
 }
 
+# ─── THE START MARK and THE WARM HOLD (docs/DESIGN-warm-spare-2026-10-16.md) ───
+#
+# Every fresh integrated zsh signs ONE start record at its first prompt hook,
+# after every startup file: the final rc folder (`${ZDOTDIR:-$HOME}`, a ZDOTDIR
+# the user's .zshenv set included), the hooks that ran ahead of aterm's, pending
+# `sched` events, jobs and periodic hooks, then `cold` or `spare`. The host learns
+# from the cold ones whether an rc generation is clean enough to run hidden in a
+# warm spare. One fork-free write to /dev/tty, so an instant prompt that holds
+# stdout cannot capture it; under `emulate -L zsh`, reading nothing it cannot read
+# unset.
+__aterm_start_mark() {
+    emulate -L zsh
+    local REPLY="" __aterm_s=0 __aterm_r=0
+    local -i __aterm_pre=0 __aterm_i=${precmd_functions[(ie)__aterm_first_precmd]}
+    (( ${+functions[precmd]} )) && __aterm_pre=1
+    (( __aterm_i <= ${#precmd_functions} )) && (( __aterm_pre += __aterm_i - 1 ))
+    # The sched module is loaded once anything scheduled: no event otherwise.
+    [[ ${modules[zsh/sched]-} != loaded ]] || __aterm_s=${#zsh_scheduled_events}
+    (( ${+PERIOD} && ( ${+functions[periodic]} || ${#periodic_functions} ) )) && __aterm_r=1
+    # A folder with nothing to escape (the common case) skips the byte loop.
+    REPLY="${ZDOTDIR:-$HOME}"
+    [[ $REPLY != *[\\\;\ [:cntrl:]]* ]] || __aterm_encode_cmd "$REPLY"
+    printf '\033]633;P;AtermStartRc=%s%s\a\033]633;P;AtermStartFlags=pre:%d,s:%d,j:%d,r:%d%s\a\033]633;P;AtermStart=%s%s\a' \
+        "$REPLY" "$__aterm_id_suffix_str" $__aterm_pre $__aterm_s ${#jobstates} $__aterm_r \
+        "$__aterm_id_suffix_str" "$1" "$__aterm_id_suffix_str" >/dev/tty 2>/dev/null
+    return 0
+}
+
+# A WARM spare's hold: its startup files have run (unseen, told `run` at the
+# parked hold), and it waits here, at the top of its first prompt hook, before any
+# prompt work, clock, git segment or history-dependent expansion. A discard's
+# hang-up writes no history (SAVEHIST is 0 while held). Released by `go`, it
+# carries `$SECONDS` on from the rc's run and leaves `__aterm_spare_reload` set
+# when the history file moved meanwhile. Nothing here touches the tty, so what
+# is typed before the release waits there for zle.
+__aterm_spare_hold() {
+    : ${${(M)${(t)options}:#*special}:+${options[xtrace]::=off}}
+    emulate -L zsh
+    local __aterm_rc=$SECONDS __aterm_hs0="" __aterm_go="" __aterm_ss=${SAVEHIST-}
+    local -i __aterm_n=0 __aterm_ss_set=${+SAVEHIST}
+    local -A __aterm_h
+    # The history stamp needs zsh/stat LOADED, which a session shell defers to
+    # its first atpkg hook (`__aterm_atpkg_hook_stamp`): loaded here, in the
+    # spare's idle time, or every release would read the history file again.
+    (( __aterm_zstat_loaded )) || { zmodload -F zsh/stat b:zstat 2>/dev/null && __aterm_zstat_loaded=1 }
+    if [[ -n ${HISTFILE-} ]] && (( __aterm_zstat_loaded )) &&
+       zstat -H __aterm_h -- "$HISTFILE" 2>/dev/null; then
+        __aterm_hs0="${__aterm_h[mtime]}:${__aterm_h[size]}:${__aterm_h[inode]}"
+    fi
+    SAVEHIST=0
+    __aterm_start_mark spare
+    while :; do
+        if IFS= read -r __aterm_go < "$__aterm_spare_fifo"; then
+            [[ $__aterm_go == go ]] && break
+        elif (( ++__aterm_n >= 50 )) || [[ ! -p $__aterm_spare_fifo ]]; then
+            exit 0
+        fi
+    done 2>/dev/null
+    unset __aterm_spare_mode __aterm_spare_fifo
+    if (( __aterm_ss_set )); then SAVEHIST=$__aterm_ss; else unset SAVEHIST; fi
+    typeset -g __aterm_spare_reload=""
+    if [[ -n ${HISTFILE-} ]]; then
+        __aterm_h=()
+        if [[ -z $__aterm_hs0 ]] || ! zstat -H __aterm_h -- "$HISTFILE" 2>/dev/null ||
+           [[ "${__aterm_h[mtime]}:${__aterm_h[size]}:${__aterm_h[inode]}" != $__aterm_hs0 ]]; then
+            __aterm_spare_reload=1
+        fi
+    fi
+    # The hooks the rc put ahead of aterm's, in the order zsh ran them.
+    local -i __aterm_i=${precmd_functions[(ie)__aterm_first_precmd]}
+    typeset -ga __aterm_spare_hooks
+    __aterm_spare_hooks=( ${precmd_functions[1,__aterm_i-1]} )
+    (( ! ${+functions[precmd]} )) || __aterm_spare_hooks[1,0]=( precmd )
+    [[ ${(t)SECONDS} == *readonly* ]] || SECONDS=$__aterm_rc
+    return 0
+}
+
+# After the release, with the user's options: the history read again exactly as
+# a cold start reads it when the file moved during the hold (the stale list is
+# pushed under with SAVEHIST 0, so it is never written), then the precmd hooks
+# that ran ahead of aterm's at spare time run again, silenced, each with the `$?`
+# the rc left — what an Enter on an empty line does — so direnv, mise and their
+# like reflect the moment the tab was asked for.
+__aterm_spare_rerun() {
+    : ${${(M)${(t)options}:#*special}:+${options[xtrace]::=off}}
+    if [[ -n ${__aterm_spare_reload-} ]]; then
+        local __aterm_hf=$HISTFILE __aterm_hz=$HISTSIZE __aterm_hss=${SAVEHIST-}
+        SAVEHIST=0
+        fc -p "$__aterm_hf" "$__aterm_hz" "$__aterm_hss"
+    fi
+    unset __aterm_spare_reload
+    local __aterm_f
+    for __aterm_f in "${__aterm_spare_hooks[@]}"; do
+        if (( ! $1 )); then
+            "$__aterm_f" >/dev/null 2>&1
+        else
+            __aterm_line_init_status "$1" || "$__aterm_f" >/dev/null 2>&1
+        fi
+    done
+    unset __aterm_spare_hooks
+    return 0
+}
+
 # ─── Deferred First-Precmd Setup ───
 # Runs once on the very first precmd after the shell has fully initialized
-# and processed SIGWINCH from the initial terminal resize. Handles the prompt
-# override, then uninstalls itself. XTRACE off first (see THE TRACE); no
-# `emulate`, as the prompt override sets PROMPT_SUBST for the user.
+# and processed SIGWINCH from the initial terminal resize. Signs the start
+# record (a warm spare holds there first), handles the prompt override, then
+# uninstalls itself. XTRACE off first (see THE TRACE), in the command that takes
+# `$?`; no `emulate`, as the prompt override sets PROMPT_SUBST for the user and
+# the hooks re-run after a hold run with the user's options.
 __aterm_first_precmd() {
-    : ${${(M)${(t)options}:#*special}:+${options[xtrace]::=off}}
+    local __aterm_st=$?${${${(M)${(t)options}:#*special}:+${options[xtrace]::=off}}:+}
+    if [[ ${__aterm_spare_mode-} == warm ]]; then
+        __aterm_spare_hold
+        __aterm_spare_rerun "$__aterm_st"
+    else
+        __aterm_start_mark cold
+    fi
     # Apply prompt override if requested
     # `${…:-}`: under a user's `setopt nounset` the bare form errored at every
     # prompt and this one-shot never uninstalled itself (review note 2026-09-16).

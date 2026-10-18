@@ -50,13 +50,6 @@ pub enum GlowStyle {
     /// reached by one branch in [`CursorGlow::tick`], so no other style's output
     /// depends on it.
     Classic,
-    /// A user-generated trail pack: the look is data ([`GlowConfig::pack`]'s
-    /// [`TrailParams`]), driven by [`CursorGlow::emit_custom`]. Every
-    /// `pack:<id>` style resolves to this variant. Shared tick/spawn paths read
-    /// `cfg.pack` (heat τ/gain, crown window, ring, particle spawn), but every
-    /// such read is inert when `cfg.pack` is `None`, so built-in styles'
-    /// output is unaffected (pinned by the whole-frame golden test).
-    Custom,
 }
 
 impl GlowStyle {
@@ -212,9 +205,7 @@ impl GlowStyle {
     /// The A/B twin of the default: every other rainbow-kitty spelling draws the
     /// comet body (fattest at the hand, thinner behind) with the vivid rail under
     /// the baseline and the from-the-hand attack; this spelling draws the flat
-    /// body, pinned by
-    /// `the_flat_spelling_collapses_every_comet_branch_byte_for_byte`. Like
-    /// [`Self::style_names_underline_ribbon`] it resolves to
+    /// body. Like [`Self::style_names_underline_ribbon`] it resolves to
     /// [`GlowStyle::RainbowKitty`], draws the resident pet, and forks at
     /// [`GlowConfig::ribbon_flat`] alone. `rainbow kitty flat` is the tall flat
     /// body (owner, 2026-09-13).
@@ -248,7 +239,6 @@ impl GlowStyle {
             Self::Water => "water",
             Self::Comet => "comet",
             Self::Classic => "classic",
-            Self::Custom => "pack",
         }
     }
 
@@ -268,14 +258,6 @@ impl GlowStyle {
         // Case-insensitive without allocating (`eq_ignore_ascii_case`). The GUI
         // resolves this once per config-asset generation, not per frame.
         let s = s.trim();
-        // A `pack:<id>` spelling names a trail pack and resolves to the custom
-        // variant; the params are attached by the app-layer resolver
-        // (`glow_config`), not here.
-        if s.strip_prefix("pack:")
-            .is_some_and(|id| !id.trim().is_empty())
-        {
-            return Self::Custom;
-        }
         let any = |opts: &[&str]| opts.iter().any(|o| s.eq_ignore_ascii_case(o));
         if any(&["phaser"]) {
             Self::Phaser
@@ -322,13 +304,6 @@ impl GlowStyle {
             "rainbow flat",
             "flat rainbow",
             "nyan flat",
-            // `v2` spellings are no-op aliases of the bare spelling, so older A/B
-            // configs still load; `v1` spellings are unknown words and parse to
-            // `Lumen`.
-            "rainbow kitty v2",
-            "rainbow v2",
-            "nyan v2",
-            "kitty v2",
         ]) {
             Self::RainbowKitty
         } else if any(&["sparkle", "sparkles", "phaser-sparkle", "rainbow-sparkle"]) {
@@ -344,8 +319,7 @@ impl GlowStyle {
         } else if any(&["comet"]) {
             Self::Comet
         } else if any(&[
-            // `classic` is the picker's name; the version spellings are how a
-            // user asks for it by the release they remember.
+            // `classic` is the picker's name.
             "classic",
             "classic wake",
             // The mono face is a presentation of this style: the colour closure
@@ -353,10 +327,6 @@ impl GlowStyle {
             "classic mono",
             "classic lumen",
             "mono classic",
-            "v0.28",
-            "v028",
-            "0.28",
-            "retro",
         ]) {
             Self::Classic
         } else {
@@ -442,12 +412,6 @@ pub struct GlowConfig {
     /// (DECSCUSR bar / `cursor_style beam`), so the streak meets the bar rather
     /// than overshooting it by half a cell.
     pub head_dx: f32,
-    /// The resolved trail-pack params when `style == GlowStyle::Custom` (`None`
-    /// for built-in styles). Only the custom interpreter reads it; built-in
-    /// paths dispatch on `style`. Carried inline (`Copy`) like the resolved
-    /// `color`/`duration`/`length`; the app-layer resolver looks a `pack:<id>`
-    /// up in its registry once, off the frame path.
-    pub pack: Option<TrailParams>,
     // How much recent typing the rainbow kitty shows is not a config field: the
     // v2 mark is the set of cells the hand laid, each priced by
     // `Ribbon::cell_life` from `cfg.duration` (`cursor_trail_ms`) and floored at

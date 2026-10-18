@@ -6,7 +6,7 @@
 // renderer, every frame (hit or miss) equals a fresh render on a separate renderer, unchanged
 // frames take the gate, and changes (a cell, the cursor effect shape, rain draining) miss.
 //
-// No GPU or no system font: no-op.
+// No GPU or no font: COULD NOT RUN.
 
 use crate::common;
 
@@ -20,8 +20,8 @@ use aterm_render::{RenderInput, Theme};
 const ROWS: usize = 8;
 const COLS: usize = 24;
 
-/// A fresh GpuRenderer (or skip-marker) at the suite's px/theme, with fonts
-/// settled so a fallback landing between frames cannot read as a stale gate.
+/// A fresh GpuRenderer at the suite's px/theme (no GPU: COULD NOT RUN), with
+/// fonts settled so a fallback landing between frames cannot read as a stale gate.
 fn fresh_gpu() -> GpuRenderer {
     let mut g = common::gpu(18.0, Theme::default());
     g.debug_block_on_lazy_fallbacks();

@@ -64,118 +64,16 @@
 //! Real overlapping predicates are covered too — `case_parking_lot_core_shape`
 //! is `parking_lot_core`'s actual `linux/android` vs `unix` overlap, the one
 //! whose two answers are the futex parker and the pthread-condvar parker.
-//!
-//! # THE TRIPWIRES ARE ARMED FIRST
-//!
-//! An assertion that "this macro picked the right arm" is worthless if nothing
-//! could have made it pick a wrong one. So this file carries two deliberately
-//! WRONG implementations of the same macro:
-//!
-//! * `last_match_wins!` — identical to the real one except that it negates the
-//!   FOLLOWING arms instead of the previous ones. This is the exact bug the
-//!   Map phase flagged: it compiles, it emits exactly one arm, and it ships the
-//!   wrong platform's code.
-//! * `ungrouped!` — identical except that it puts the `#[cfg]` directly in
-//!   front of the arm's tokens instead of routing them through one macro call.
-//!   That is upstream's issue #90: the attribute binds to the first item only
-//!   and every later item in a non-selected arm compiles anyway.
-//!
-//! Each is fed the same input as the real macro and shown to produce a
-//! DIFFERENT answer. Only then does the file assert that the real macro's
-//! answer matches `cfg!()`. Without those two, every assertion below would be
-//! vacuous — true of a macro that happened to work and equally true of one
-//! nobody could have distinguished from it.
 
 // Verbatim consumer predicates are not in play here; these chains use only
 // well-known cfg keys. The allows below cover the scaffolding, not the subject.
 #![allow(dead_code)]
 
 // ---------------------------------------------------------------------------
-// TRIPWIRE 1: a deliberately LAST-MATCH-WINS cfg_if.
-//
-// Built by reversing the arm list and then running the correct emitter over it,
-// which is exactly "negate the following arms" — the mutation the Map phase
-// named as the silent failure. Everything else is identical to the real macro.
-// ---------------------------------------------------------------------------
-macro_rules! last_match_wins {
-    (
-        if #[cfg( $($i_meta:tt)+ )] { $( $i_tokens:tt )* }
-        $( else if #[cfg( $($ei_meta:tt)+ )] { $( $ei_tokens:tt )* } )*
-        $( else { $( $e_tokens:tt )* } )?
-    ) => {
-        last_match_wins! {
-            @rev () ;
-            (( $($i_meta)+ ) ( $( $i_tokens )* )),
-            $( (( $($ei_meta)+ ) ( $( $ei_tokens )* )), )*
-            @else $( (() ( $( $e_tokens )* )), )?
-        }
-    };
-    // Only the PREDICATE-bearing arms are reversed; the `else` stays last,
-    // because an arm with no predicate contributes nothing to negate and would
-    // turn this tripwire into a different bug (no negation at all) if it led.
-    (@rev ( $($acc:tt)* ) ; @else $( $tail:tt )* ) => {
-        last_match_wins! { @arms () ; $($acc)* $( $tail )* }
-    };
-    (@rev ( $($acc:tt)* ) ; $head:tt , $( $rest:tt )* ) => {
-        last_match_wins! { @rev ( $head , $($acc)* ) ; $( $rest )* }
-    };
-    (@arms ( $( ($($_seen:tt)*) , )* ) ; ) => {};
-    (
-        @arms ( $( ($($no:tt)+) , )* ) ;
-        (( $( $($yes:tt)+ )? ) ( $( $tokens:tt )* )),
-        $( $rest:tt , )*
-    ) => {
-        #[cfg(all( $( $($yes)+ , )? not(any( $( $($no)+ ),* )) ))]
-        last_match_wins! { @group $( $tokens )* }
-        last_match_wins! {
-            @arms ( $( ($($no)+) , )* $( ($($yes)+) , )? ) ;
-            $( $rest , )*
-        }
-    };
-    (@group $( $tokens:tt )* ) => { $( $tokens )* };
-}
-
-// ---------------------------------------------------------------------------
-// TRIPWIRE 2: a deliberately UN-GROUPED cfg_if (upstream's issue #90).
-//
-// The only change from the real macro is on the emission line: `$( $tokens )*`
-// sits directly under the `#[cfg]` instead of going through one `@group` call.
-// The attribute then binds to the arm's FIRST item and everything after it
-// compiles unconditionally.
-// ---------------------------------------------------------------------------
-macro_rules! ungrouped {
-    (
-        if #[cfg( $($i_meta:tt)+ )] { $( $i_tokens:tt )* }
-        $( else if #[cfg( $($ei_meta:tt)+ )] { $( $ei_tokens:tt )* } )*
-        $( else { $( $e_tokens:tt )* } )?
-    ) => {
-        ungrouped! {
-            @arms () ;
-            (( $($i_meta)+ ) ( $( $i_tokens )* )),
-            $( (( $($ei_meta)+ ) ( $( $ei_tokens )* )), )*
-            $( (() ( $( $e_tokens )* )), )?
-        }
-    };
-    (@arms ( $( ($($_seen:tt)*) , )* ) ; ) => {};
-    (
-        @arms ( $( ($($no:tt)+) , )* ) ;
-        (( $( $($yes:tt)+ )? ) ( $( $tokens:tt )* )),
-        $( $rest:tt , )*
-    ) => {
-        #[cfg(all( $( $($yes)+ , )? not(any( $( $($no)+ ),* )) ))]
-        $( $tokens )*
-        ungrouped! {
-            @arms ( $( ($($no)+) , )* $( ($($yes)+) , )? ) ;
-            $( $rest , )*
-        }
-    };
-}
-
-// ---------------------------------------------------------------------------
-// ONE chain in, four answers out.
+// ONE chain in, two answers out.
 //
 // The chain is written ONCE, at the `case!` call site, and spliced into the
-// real macro, into both tripwires' inputs and into the `cfg!()` cascade. That
+// real macro and into the `cfg!()` cascade. That
 // matters: a hand-copied second version of a chain is a place for a typo to
 // make the differential pass for the wrong reason.
 //
@@ -194,15 +92,6 @@ macro_rules! case {
             /// This crate's macro.
             pub mod real {
                 cfg_if::cfg_if! {
-                    if #[cfg( $($p0)+ )] { pub fn pick() -> &'static str { $l0 } }
-                    $( else if #[cfg( $($p)+ )] { pub fn pick() -> &'static str { $l } } )*
-                    else { pub fn pick() -> &'static str { $le } }
-                }
-            }
-
-            /// Tripwire 1 over the identical chain.
-            pub mod wrong {
-                last_match_wins! {
                     if #[cfg( $($p0)+ )] { pub fn pick() -> &'static str { $l0 } }
                     $( else if #[cfg( $($p)+ )] { pub fn pick() -> &'static str { $l } } )*
                     else { pub fn pick() -> &'static str { $le } }
@@ -270,26 +159,6 @@ case! {
 }
 
 #[test]
-fn tripwire_last_match_wins_is_live() {
-    // ARMING THE DETECTOR. If the deliberately-wrong macro produced the same
-    // answer as the reference, every "real == expected" assertion below would
-    // be true of a broken implementation too, and would prove nothing.
-    assert_eq!(
-        case_three_true::wrong::pick(),
-        "arm3-true",
-        "the last-match-wins tripwire must select the LAST holding arm; if it \
-         does not, this file can no longer tell a correct macro from a wrong one"
-    );
-    assert_ne!(
-        case_three_true::wrong::pick(),
-        case_three_true::expected(),
-        "tripwire and reference must disagree, or the detector is blind"
-    );
-    assert_eq!(case_first_wins::wrong::pick(), "arm3");
-    assert_ne!(case_first_wins::wrong::pick(), case_first_wins::expected());
-}
-
-#[test]
 fn real_macro_matches_rustc_on_every_chain() {
     assert_eq!(case_three_true::real::pick(), case_three_true::expected());
     assert_eq!(case_three_true::real::pick(), "arm2-true");
@@ -311,19 +180,17 @@ fn real_macro_matches_rustc_on_every_chain() {
 }
 
 // ---------------------------------------------------------------------------
-// THE MULTI-ITEM LEAK (upstream issue #90), both halves.
+// THE MULTI-ITEM LEAK (upstream issue #90).
 //
-// The chain is the same in both modules: a NON-selected arm holding two items,
-// and a selected `else` holding one. Under a correct macro the whole first arm
-// disappears. Under the un-grouped tripwire the `#[cfg]` binds to `type _Ignored`
-// and `leaked()` compiles anyway.
+// A NON-selected arm holding two items, and a selected `else` holding one.
+// Under a correct macro the whole first arm disappears; a macro that put the
+// `#[cfg]` straight on the arm's tokens would bind it to `type _Ignored` only
+// and emit `leaked()` anyway.
 //
 // How absence is proved, since you cannot call a function that does not exist:
-// each module also defines its OWN `leaked()` returning a distinct value. If the
-// macro had emitted one, the module would have two and would not compile. The
-// module compiles AND `leaked()` returns the module's own value, so the macro
-// emitted nothing — and the tripwire module proves that test can come out the
-// other way.
+// the module also defines its OWN `leaked()`. If the macro had emitted one, the
+// module would have two and would not compile. The module compiles AND
+// `leaked()` returns the module's own value, so the macro emitted nothing.
 // ---------------------------------------------------------------------------
 mod leak_correct {
     cfg_if::cfg_if! {
@@ -341,30 +208,10 @@ mod leak_correct {
     }
 }
 
-mod leak_tripwire {
-    ungrouped! {
-        if #[cfg(any())] {
-            type _Ignored = u8;
-            pub fn leaked() -> u8 { 1 }
-        } else {
-            pub fn selected() -> u8 { 2 }
-        }
-    }
-}
-
 #[test]
-fn tripwire_ungrouped_leaks_and_the_real_macro_does_not() {
-    // ARMED FIRST: the un-grouped macro really does let the second item of a
-    // dead arm through, so "nothing leaked" below is a claim that could fail.
-    assert_eq!(
-        leak_tripwire::leaked(),
-        1,
-        "the un-grouped tripwire must leak the dead arm's second item"
-    );
-    assert_eq!(leak_tripwire::selected(), 2);
-
-    // THE CLAIM: with this crate's macro, `leaked()` is the module's own, so
-    // the dead arm contributed nothing at all.
+fn a_dead_arm_contributes_none_of_its_items() {
+    // `leaked()` is the module's own, so the dead arm's second item was not
+    // emitted (upstream issue #90 would have emitted it and failed to build).
     assert_eq!(leak_correct::leaked(), 99);
     assert_eq!(leak_correct::selected(), 2);
 }

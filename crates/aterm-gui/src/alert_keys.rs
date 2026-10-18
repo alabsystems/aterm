@@ -346,7 +346,7 @@ mod macos {
         // carried exactly this retain.
         let monitor = unsafe {
             let add: unsafe extern "C-unwind" fn(Id, Sel, usize, BlockPtr) -> Id =
-                aterm_objc::msg();
+                aterm_objc::checked_msg();
             let token = add(
                 aterm_objc::class(c"NSEvent").as_id(),
                 sel!(addLocalMonitorForEventsMatchingMask:handler:),
@@ -391,14 +391,14 @@ mod macos {
                     let kind = appkit::send_usize(event, sel!(type));
                     if owns && kind == 1 && appkit::send_id(event, sel!(window)) == panel.id() {
                         let point: unsafe extern "C-unwind" fn(Id, Sel) -> aterm_objc::CGPoint =
-                            aterm_objc::msg();
+                            aterm_objc::checked_msg();
                         let convert: unsafe extern "C-unwind" fn(
                             Id,
                             Sel,
                             aterm_objc::CGPoint,
                             Id,
                         )
-                            -> aterm_objc::CGPoint = aterm_objc::msg();
+                            -> aterm_objc::CGPoint = aterm_objc::checked_msg();
                         let hit = convert(
                             field.id(),
                             sel!(convertPoint:fromView:),
@@ -433,7 +433,7 @@ mod macos {
         let handler = unsafe { RcBlock::new1(handler) }?;
         let monitor = unsafe {
             let add: unsafe extern "C-unwind" fn(Id, Sel, usize, BlockPtr) -> Id =
-                aterm_objc::msg();
+                aterm_objc::checked_msg();
             Obj::retain(add(
                 aterm_objc::class(c"NSEvent").as_id(),
                 sel!(addLocalMonitorForEventsMatchingMask:handler:),

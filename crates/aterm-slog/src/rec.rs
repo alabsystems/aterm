@@ -75,6 +75,34 @@ impl Rec {
         }
     }
 
+    /// THE BUS CLASS (§5.5, phase 4 ruling Q5): what the bus mirror carries.
+    /// The turn class ([`Rec::is_turn_class`], unchanged, which `log
+    /// class=turn` and `subscribe … log:class=turn` still mean), and beside
+    /// it what a remote fold needs to hold the needs a local one holds: the
+    /// opens, closes and amends of the steps a need is raised from
+    /// (`approval`, `question`, `wall`, `stall`: the fold raises those needs
+    /// only from the step's open and drops them only at its close), and the
+    /// `seen` mark that lifts `need=failure`. Tool, subagent and compact
+    /// steps and every other mark stay local; a turn's close counts them.
+    #[must_use]
+    pub fn is_bus_class(&self) -> bool {
+        match self.op {
+            Op::Open | Op::Close | Op::Amend => match self.node.lvl {
+                Lvl::Session | Lvl::Run | Lvl::Turn => true,
+                Lvl::Step => matches!(
+                    self.k,
+                    Kind::Approval | Kind::Question | Kind::Wall | Kind::Stall
+                ),
+                Lvl::Instance => false,
+            },
+            Op::Mark => matches!(
+                self.k,
+                Kind::Need | Kind::Clear | Kind::Handoff | Kind::Seen
+            ),
+            Op::Gap | Op::Snap => true,
+        }
+    }
+
     /// The `out=` word of a close, if any.
     #[must_use]
     pub fn out(&self) -> Option<&'static str> {

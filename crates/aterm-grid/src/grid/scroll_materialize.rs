@@ -503,7 +503,8 @@ impl<'a> RingCells<'a> {
     /// trip clips it, which this path does not model (rare: both come from one
     /// grid).
     fn new(row: &'a Row, extras: &'a ScrolledRowExtras, cols: u16) -> Option<Self> {
-        let len = usize::from(row.len());
+        // The cells the round trip's line holds (`row_to_line_with_stored_extras`).
+        let len = usize::from(row.written_len());
         if len > usize::from(cols) {
             return None;
         }
@@ -651,7 +652,7 @@ impl<'a> RingCells<'a> {
             (PackedColor::DEFAULT_FG.0, PackedColor::DEFAULT_BG.0)
         } else {
             let fg_raw = resolve_cell_color(
-                cell.fg_needs_overflow() || cell.uses_style_id(),
+                cell.fg_needs_overflow(),
                 cell.fg_color().map_or(PackedColor::DEFAULT_FG.0, |c| c.0),
                 &self.extras.rgb_fg,
                 &mut self.cursors.rgb_fg_idx,
@@ -659,7 +660,7 @@ impl<'a> RingCells<'a> {
                 PackedColor::DEFAULT_FG.0,
             );
             let bg_raw = resolve_cell_color(
-                cell.bg_needs_overflow() || cell.uses_style_id(),
+                cell.bg_needs_overflow(),
                 cell.bg_color().map_or(PackedColor::DEFAULT_BG.0, |c| c.0),
                 &self.extras.rgb_bg,
                 &mut self.cursors.rgb_bg_idx,
@@ -1014,24 +1015,46 @@ fn mirror_wide_spacer_extras(cells: &[crate::Cell], extras: &mut FxHashMap<u16, 
         let (Ok(lead), Ok(spacer)) = (u16::try_from(idx - 1), u16::try_from(idx)) else {
             break;
         };
-        let Some(src) = extras.get(&lead) else {
+        let Some(values) = extras.get(&lead).and_then(SpacerValues::of) else {
             continue;
         };
-        let fg = src.fg_rgb();
-        let bg = src.bg_rgb();
-        let underline = src.underline_color_u32();
-        if fg.is_none() && bg.is_none() && underline.is_none() {
-            continue;
+        values.fill(extras.entry(spacer).or_default());
+    }
+}
+
+/// The values a wide lead's continuation spacer inherits from it (see
+/// [`mirror_wide_spacer_extras`]): the truecolor fg/bg and the SGR 58 underline
+/// colour. One rule for the history readers and a revealed ring row
+/// (`Grid::inject_scrolled_extras`).
+#[derive(Clone, Copy)]
+pub(super) struct SpacerValues {
+    fg: Option<[u8; 3]>,
+    bg: Option<[u8; 3]>,
+    underline: Option<u32>,
+}
+
+impl SpacerValues {
+    /// What `lead` hands its spacer, or `None` when it carries none of them.
+    pub(super) fn of(lead: &CellExtra) -> Option<Self> {
+        let values = Self {
+            fg: lead.fg_rgb(),
+            bg: lead.bg_rgb(),
+            underline: lead.underline_color_u32(),
+        };
+        (values.fg.is_some() || values.bg.is_some() || values.underline.is_some()).then_some(values)
+    }
+
+    /// Fill the spacer's empty slots only: a span-shaped extra (a hyperlink) may
+    /// already cover it, which keeps the pass idempotent.
+    pub(super) fn fill(self, spacer: &mut CellExtra) {
+        if self.fg.is_some() && spacer.fg_rgb().is_none() {
+            spacer.set_fg_rgb(self.fg);
         }
-        let dst = extras.entry(spacer).or_default();
-        if fg.is_some() && dst.fg_rgb().is_none() {
-            dst.set_fg_rgb(fg);
+        if self.bg.is_some() && spacer.bg_rgb().is_none() {
+            spacer.set_bg_rgb(self.bg);
         }
-        if bg.is_some() && dst.bg_rgb().is_none() {
-            dst.set_bg_rgb(bg);
-        }
-        if underline.is_some() && dst.underline_color_u32().is_none() {
-            dst.set_underline_color_u32(underline);
+        if self.underline.is_some() && spacer.underline_color_u32().is_none() {
+            spacer.set_underline_color_u32(self.underline);
         }
     }
 }

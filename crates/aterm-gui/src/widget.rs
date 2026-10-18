@@ -174,9 +174,10 @@ pub(crate) struct TerminalSpecimenSpec {
     pub(crate) selection_inactive: bool,
 }
 
-/// The only constructor of [`DrawPrim::Text`]. Its size is a [`StepPx`], mintable only by
-/// [`TypeStep`](crate::type_scale::TypeStep), so every chrome text site maps to a named step
-/// of the type scale (`every_text_prim_goes_through_the_funnel` enforces it).
+/// The only constructor of [`DrawPrim::Text`]. Its size is a [`StepPx`],
+/// mintable only by [`TypeStep`](crate::type_scale::TypeStep), so every chrome
+/// text site maps to a named step of the 5-step type scale. `weight` picks the
+/// Mono bold sibling; `face` picks Mono or the Ui/UiBold face.
 pub(crate) fn text_prim(
     x: f32,
     baseline: f32,
@@ -211,24 +212,20 @@ pub(crate) enum DrawPrim {
         radius: f32,
         fill: Rgba,
     },
-    /// A concentric gauge: a faint full-circle `track` (capacity), a bold `sys` arc
-    /// (whole-machine usage) and an optional thinner `tab` arc inside (this tab's slice).
-    /// `dashed_tab` marks an unobtainable inner arc (per-tab GPU) so it reads as "—", not
-    /// a fabricated value.
+    /// A ring: a faint full-circle `track` and a bold arc filling `frac` of
+    /// the turn (clockwise from 12 o'clock) in `fill`. Its one user is the
+    /// Appearance button icon, a half-filled ring.
     Ring {
         cx: f32,
         cy: f32,
         r_outer: f32,
         thickness: f32,
         track: Rgba,
-        sys_frac: f32,
-        sys_color: Rgba,
-        tab_frac: Option<f32>,
-        tab_color: Rgba,
-        dashed_tab: bool,
+        frac: f32,
+        fill: Rgba,
     },
-    /// A horizontal rounded capacity bar (disk): `frac` of `w` filled in `fill` over a
-    /// faint `track`.
+    /// A horizontal rounded bar: `frac` of `w` filled in `fill` over a faint
+    /// `track`. It draws the Settings switch and slider tracks.
     Capsule {
         x: f32,
         y: f32,
@@ -238,7 +235,7 @@ pub(crate) enum DrawPrim {
         fill: Rgba,
         track: Rgba,
     },
-    /// A status dot (network health).
+    /// A filled disc: a switch thumb, a status or badge dot, a tab icon's dot.
     Dot {
         cx: f32,
         cy: f32,
@@ -406,61 +403,4 @@ pub(crate) struct TrayInput {
     pub prims: Vec<DrawPrim>,
     /// The card rect `(x, y, w, h)`.
     pub card: (f32, f32, f32, f32),
-}
-
-#[cfg(test)]
-mod tests {
-    /// [`text_prim`] is the only `DrawPrim::Text` constructor in the crate; with
-    /// `StepPx`'s private field (only `TypeStep` mints sizes) every chrome text site maps
-    /// to a named step. Patterns (`..`, `matches!`, `if let`, `let`) and comments are fine
-    /// anywhere; constructions only in widget.rs (the funnel body) and tray_raster.rs (the
-    /// rasterizer's match arm).
-    #[test]
-    fn every_text_prim_goes_through_the_funnel() {
-        // Built at runtime so this test's own source never contains the
-        // contiguous token it scans for.
-        let needle = format!("DrawPrim{}", ":\u{3a}Text").replace('\u{3a}', ":");
-        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut sanctioned_sites = 0usize;
-        for entry in std::fs::read_dir(&src_dir).expect("read src/") {
-            let path = entry.expect("dir entry").path();
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
-            let name = path.file_name().unwrap().to_string_lossy().into_owned();
-            let sanctioned = matches!(name.as_str(), "widget.rs" | "tray_raster.rs");
-            let content = std::fs::read_to_string(&path).expect("read source");
-            for (i, line) in content.lines().enumerate() {
-                if !line.contains(&needle) {
-                    continue;
-                }
-                let t = line.trim_start();
-                let is_comment =
-                    t.starts_with("//") || t.starts_with("///") || t.starts_with("//!");
-                // Patterns, not constructions. A `let`-else destructuring spreads its
-                // fields over the following lines, so its first line has no `..`; a
-                // construction is never the first token after `let`.
-                let is_pattern = line.contains("..")
-                    || line.contains("matches!")
-                    || line.contains("if let")
-                    || t.starts_with("let ")
-                    || t.starts_with("} = ");
-                if is_comment || is_pattern {
-                    continue;
-                }
-                assert!(
-                    sanctioned,
-                    "{name}:{}: a Text prim is constructed outside the text_prim funnel — \
-                     route it through widget::text_prim (TypeStep-sized, baseline-positioned)",
-                    i + 1
-                );
-                sanctioned_sites += 1;
-            }
-        }
-        // Exactly the funnel body + the rasterizer's match arm.
-        assert_eq!(
-            sanctioned_sites, 2,
-            "expected exactly the text_prim constructor and the tray_raster consumer"
-        );
-    }
 }

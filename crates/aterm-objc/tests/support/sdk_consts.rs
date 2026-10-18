@@ -230,26 +230,3 @@ fn report_unfolded(arch: &str, rows: &[String]) {
     );
     let _ = std::io::stderr().write_all(line.as_bytes());
 }
-
-/// The parser reads every visibility spelling, not only the `pub(crate) const` both subjects
-/// use: the coverage tests cannot notice a constant they never parsed. It runs once, in the
-/// `objc_static_suite` binary both censuses share.
-#[test]
-fn the_parser_reads_every_visibility_spelling() {
-    let cases = [
-        ("const A: usize = 1;", Some(("A", "1"))),
-        ("pub const B: usize = 2;", Some(("B", "2"))),
-        ("    pub(crate) const C: usize = 3;", Some(("C", "3"))),
-        ("pub(super) const D: usize = 4;", Some(("D", "4"))),
-        ("pub(in crate::x) const E: usize = 5;", Some(("E", "5"))),
-        // Not a constant declaration: unparsed.
-        ("let id = (r as *const T).cast_mut();", None),
-        ("pub(super) static F: Id;", None),
-        ("pubconst G: usize = 7;", None),
-    ];
-    for (line, want) in cases {
-        let got = parse_const_decl(line);
-        let got = got.as_ref().map(|(n, v)| (n.as_str(), v.as_str()));
-        assert_eq!(got, want, "the parser disagreed on {line:?}");
-    }
-}

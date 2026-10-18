@@ -32,12 +32,12 @@ use crate::headless_boot;
 
 use headless_boot::{Instance, boot_session, ctl, ctl_ok, field, status, type_line};
 
-/// Boot one headless instance ([`headless_boot::boot`]: `None` is an environment
-/// refusal; a product that cannot start fails the test). Wide enough that the
+/// Boot one headless instance ([`headless_boot::boot`]: an environment refusal
+/// is COULD NOT RUN; a product that cannot start fails the test). Wide enough that the
 /// fixture's longest row (the 529 notice) is not wrapped by the terminal: Claude
 /// Code lays out its own rows, so a terminal wrap to column 0 is not a shape it
 /// draws.
-fn boot(tag: &str) -> Option<Instance> {
+fn boot(tag: &str) -> Instance {
     headless_boot::boot(
         &format!("athp{tag}"),
         &["--lines", "40", "--columns", "200"],
@@ -105,8 +105,8 @@ fn shim_root(inst: &Instance) -> PathBuf {
 /// Start `name` — under the managed prefix ([`shim_root`]) when `managed`,
 /// else under a scratch directory of the user's own — in the boot session
 /// and wait for the screen to show the 529.
-fn run_shim(name: &str, managed: bool, tag: &str) -> Option<(Instance, String)> {
-    let inst = boot(tag)?;
+fn run_shim(name: &str, managed: bool, tag: &str) -> (Instance, String) {
+    let inst = boot(tag);
     let (_local, sid) = boot_session(&inst);
     let screen = inst.tmp.join("screen.txt");
     std::fs::write(&screen, screen_529()).expect("write the screen");
@@ -133,14 +133,12 @@ fn run_shim(name: &str, managed: bool, tag: &str) -> Option<(Instance, String)> 
         reply.starts_with("OK") && !reply.starts_with("OK timeout"),
         "the 529 screen never drew: {reply}"
     );
-    Some((inst, sid))
+    (inst, sid)
 }
 
 #[test]
 fn a_shim_before_its_exec_is_the_agent_and_its_529_is_a_wall() {
-    let Some((inst, sid)) = run_shim("agents/claude", true, "w") else {
-        return;
-    };
+    let (inst, sid) = run_shim("agents/claude", true, "w");
     let rec = status_until(
         &inst,
         &sid,
@@ -188,20 +186,11 @@ fn a_shim_before_its_exec_is_the_agent_and_its_529_is_a_wall() {
 /// running a script — `program=sh`, never an agent, whatever it draws.
 #[test]
 fn the_same_script_under_another_name_is_a_shell() {
-    let Some((inst, sid)) = run_shim("build.sh", true, "n") else {
-        return;
-    };
+    let (inst, sid) = run_shim("build.sh", true, "n");
     let rec = status_until(&inst, &sid, HANG, "program=sh", |s| {
         field(s, "program") == Some("sh")
     });
-    // Sample for a second: never an agent.
-    let until = Instant::now() + Duration::from_secs(1);
-    let mut last = rec;
-    while Instant::now() < until {
-        assert_eq!(field(&last, "agent"), Some("-"), "{last}");
-        std::thread::sleep(Duration::from_millis(200));
-        last = status(&inst, &sid);
-    }
+    assert_eq!(field(&rec, "agent"), Some("-"), "{rec}");
 }
 
 /// NEGATIVE CONTROL: a script NAMED `claude` that is not atpkg's shim — a
@@ -209,9 +198,7 @@ fn the_same_script_under_another_name_is_a_shell() {
 /// in-GUI supervisor never attaches a pressing loop to whatever it runs.
 #[test]
 fn a_wrapper_named_claude_outside_the_prefix_is_a_shell() {
-    let Some((inst, sid)) = run_shim("claude", false, "u") else {
-        return;
-    };
+    let (inst, sid) = run_shim("claude", false, "u");
     let rec = status_until(&inst, &sid, HANG, "program=sh", |s| {
         field(s, "program") == Some("sh")
     });

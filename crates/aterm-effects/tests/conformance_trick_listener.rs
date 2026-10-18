@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 of `TrickListenerPurity` (`aterm_spec::derive::trick_listener_purity_model`):
+//! Tier-1 of `TrickListenerPurity` (`aterm_models_effects::trick_listener_purity_model`):
 //! the real `TrickListener`, fed the way the host's press cascade feeds it,
 //! beside the line an editor would hold.
 //!
@@ -16,7 +16,8 @@
 //!
 //! The negative controls are the bugs the laws were written against: `site`
 //! and `npm run sit` answered as if the listener had fired, a glued run that
-//! named its own line, and the real listener under the host's old job-chord
+//! named its own line or said its guess at its own edge, and the real
+//! listener under the host's old job-chord
 //! mapping (Ctrl+Z after Esc reset a line the shell kept).
 //!
 //! The anchors are string coverage, as for every machine outside the aterm-gui
@@ -25,9 +26,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use aterm_effects::typed_tricks::{TrickEvent, TrickListener};
+use crate::typed_tricks::{TrickEvent, TrickListener};
 use aterm_lexicon::TrickLexicon;
-use aterm_spec::derive::{Model, trick_listener_purity_model};
+use aterm_models_effects::trick_listener_purity_model;
+use aterm_spec::derive::Model;
 use aterm_spec::{interp, xref};
 use aterm_time::{Duration, Instant};
 
@@ -147,6 +149,14 @@ fn trailing_token(line: &str) -> &str {
     &line[start..]
 }
 
+/// A token that begins or ends with a pet name without being one: the shape
+/// of a glued run, read off the text alone.
+fn holds_a_name(token: &str) -> bool {
+    NAMES
+        .iter()
+        .any(|name| token.len() > name.len() && (token.starts_with(name) || token.ends_with(name)))
+}
+
 /// A real listener, two sessions' editor lines, and the clock. Keys: `⏎`
 /// Enter, `⌫` Backspace, `⌃` Ctrl+U, `ʷ` Ctrl+W, `⎋` Esc, `ᶻ` Ctrl+Z, `①` /
 /// `②` a switch to that session; anything else is typed.
@@ -224,13 +234,18 @@ impl Rig {
                 } else if c.is_alphanumeric() {
                     1
                 } else if c.is_whitespace() || c == '，' {
-                    if NAMES.contains(&trailing_token(line)) {
+                    let token = trailing_token(line);
+                    if NAMES.contains(&token) {
                         4
+                    } else if holds_a_name(token) {
+                        13
                     } else {
                         3
                     }
                 } else if ".!?,".contains(c) && NAMES.contains(&trailing_token(line)) {
                     12
+                } else if ".!?,\u{2026}".contains(c) && holds_a_name(trailing_token(line)) {
+                    13
                 } else {
                     2
                 };
@@ -264,8 +279,11 @@ const TRACE: &str = concat!(
     "⌫⎋sotᶻ⏎",                  // Esc, text the listener never saw, the job chord
     "si②sit ①⌃②⏎①",             // sessions left dirty come back poisoned
     "猫咪坐下 ⏎",               // a glued run waits for Enter
+    "坐下猫咪 ⏎",               // in either order
+    "猫咪坐下.  ⏎",             // a stop parks nothing for the edges after it
     "猫咪坐下 kitty ⏎",         // or a name after it
     "猫咪 猫咪坐下 ⏎",          // never one before it
+    "猫咪 猫咪坐下. ⏎",         // whatever closes the run
     "猫咪坐下，需要注意什么 ⌃", // and prose drops it
     "猫咪玩具 ⌃",               // a thing is never half of a run
 );
@@ -298,10 +316,10 @@ fn the_real_listener_refines_the_purity_model() {
 }
 
 /// Replays `keys` on the real listener, then answers the last press as
-/// `forged` instead of what the listener said: from the same states, the
-/// model must refuse it and its `Buggy = 1` mutant admit it.
-fn caught(keys: &str, forged: impl Fn(Seen) -> Seen) {
-    let model = trick_listener_purity_model();
+/// `forged` instead of what the listener said: the model must refuse it from
+/// every state the presses before it left. Answers those states and the
+/// forged press.
+fn refused(model: &Model, keys: &str, forged: impl Fn(Seen) -> Seen) -> (Vec<State>, Seen) {
     let mut rig = Rig::new();
     let mut frontier = vec![model.init_state()];
     let mut keys = keys.chars().peekable();
@@ -309,20 +327,27 @@ fn caught(keys: &str, forged: impl Fn(Seen) -> Seen) {
         let seen = rig.press(key);
         if keys.peek().is_none() {
             let seen = forged(seen);
-            let buggy = interp::with_buggy(&model, 1);
             assert!(
-                advance(&model, &frontier, &seen).0.is_empty(),
+                advance(model, &frontier, &seen).0.is_empty(),
                 "{seen:?} is refused"
             );
-            assert!(
-                !advance(&buggy, &frontier, &seen).0.is_empty(),
-                "the mutant admits {seen:?}"
-            );
-            return;
+            return (frontier, seen);
         }
-        frontier = advance(&model, &frontier, &seen).0;
+        frontier = advance(model, &frontier, &seen).0;
         assert!(!frontier.is_empty(), "{key:?}: {seen:?}");
     }
+    unreachable!("no keys")
+}
+
+/// [`refused`], and the `Buggy = 1` mutant admits the same forged press.
+fn caught(keys: &str, forged: impl Fn(Seen) -> Seen) {
+    let model = trick_listener_purity_model();
+    let (frontier, seen) = refused(&model, keys, forged);
+    let buggy = interp::with_buggy(&model, 1);
+    assert!(
+        !advance(&buggy, &frontier, &seen).0.is_empty(),
+        "the mutant admits {seen:?}"
+    );
 }
 
 #[test]
@@ -332,8 +357,20 @@ fn a_fire_on_a_prefix_on_prose_or_on_a_glued_name_is_refused() {
     caught("sit", fired);
     // `npm run sit␣`: a word on a line that is not pet talk.
     caught("npm run sit ", fired);
-    // `猫咪坐下␣` alone, final as if the name inside it named the line.
+    // `猫咪坐下␣` alone, final as if the name inside it named the line, in
+    // either order.
     caught("猫咪坐下 ", |seen| Seen { said: 2, ..seen });
+    caught("坐下猫咪 ", |seen| Seen { said: 2, ..seen });
+    // Nor even tentative: a guess is never said at its own edge.
+    let model = trick_listener_purity_model();
+    refused(&model, "猫咪坐下 ", fired);
+    refused(&model, "坐下猫咪 ", fired);
+    // Nor at an edge after it: a stop that closed the run parked nothing,
+    // and a name before the run vouches for nothing after it.
+    refused(&model, "猫咪坐下. ", fired);
+    refused(&model, "猫咪坐下  ", fired);
+    caught("猫咪坐下. ", |seen| Seen { said: 2, ..seen });
+    caught("猫咪 猫咪坐下. ", |seen| Seen { said: 2, ..seen });
 }
 
 /// The host's old mapping: Ctrl+Z on a zero count reset the line even when

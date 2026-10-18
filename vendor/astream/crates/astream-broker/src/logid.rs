@@ -30,10 +30,17 @@
 //!
 //! In a sidecar beside the log, `<log>.id`: a CRC frame holding the identity and what
 //! the open that wrote it saw (the retention base, the head, and a fingerprint of the
-//! newest record's stored frame). It is written atomically (tmp file, fsync, rename,
-//! directory fsync) during [`BrokerLog`](crate::BrokerLog)'s open, BEFORE the open
-//! returns, so no client can be told an identity that a crash then loses; an open
-//! that cannot write it FAILS, naming it. It is not IN the log because a record there
+//! newest record's stored frame) — and, since FORMAT 2, how the run that wrote it stood
+//! with the log (serving, stopped cleanly, a flush failed, or cutting), the tier it
+//! served, its boot, whether the log was on the boot volume, the DURABLE FLOOR (a head
+//! the log is flushed in full through) and the lineage. It is written atomically (tmp
+//! file, fsync, rename, directory fsync) during [`BrokerLog`](crate::BrokerLog)'s open,
+//! BEFORE the open returns, so no client can be told an identity that a crash then
+//! loses — in two phases: before a cut that removes written bytes (the moved identity,
+//! so the cut cannot outlive its announcement) and after the open's own fsync (the run
+//! serving, the floor at the head: only then is the head durable). A clean close
+//! rewrites it once more (`Closed`, the floor raised to the head). An open that cannot
+//! write it FAILS, naming it. It is not IN the log because a record there
 //! would take an offset (every new log's first publish would move off offset 0) and
 //! would be one more hidden record retention must carry; a replica's log is the
 //! leader's spine and may not hold a record of its own either.
@@ -51,13 +58,44 @@
 //!   another sidecar format) gets a fresh random `id`, generation 0 — never a derived
 //!   one, which could be an identity the log already had: the sidecar existed, so the
 //!   log has had an identity, and only a new one is certainly not it.
-//! - Otherwise the sidecar's `id` stands, and the `generation` goes up by one when
-//!   this log's offsets may now name different records than a client was told:
-//!   [`open_repair`](crate::BrokerLog::open_repair) truncated records, the log is
-//!   SHORTER than the last open saw, its retention base went backwards, or the record
-//!   at the newest offset the last open saw is not the record it saw there (another
-//!   log was put under this name). Any of these is written to the sidecar before the
-//!   open goes on, so a crash right after a repair's truncation cannot lose the bump.
+//! - Otherwise the sidecar's `id` stands, and the `generation` goes up by one — by
+//!   one, whatever the number of causes — when this log's offsets may now name
+//!   different records than a client was told:
+//!   - [`open_repair`](crate::BrokerLog::open_repair) truncated records, or this
+//!     open's recovery cut a torn batch that held written bytes (a record of it, or a
+//!     whole-sized frame of it: the recovery cannot tell a torn write from rot in the
+//!     newest batch, so a cut that may have removed an acked record is announced);
+//!   - the last run SERVED a weak tier ([`Durability::Ordered`](crate::Durability) or
+//!     [`Durability::Relaxed`](crate::Durability); an Ordered request served Strict is
+//!     recorded as Strict) and did not stop cleanly in THIS boot: its sidecar still
+//!     says `Open` and names another boot, a boot it could not read, or a log off the
+//!     boot volume — or it says `Lossy` (a durability flush failed), or the embedder's
+//!     own prepare said so ([`Prepared::Unclean`](crate::Prepared)). A power loss may
+//!     have taken acked records the page cache held (Relaxed), or the newest batches an
+//!     ordering barrier had issued but not yet made durable (Ordered), and only a reboot
+//!     can have done that: a process crash (`kill -9`) in the same boot loses nothing
+//!     (the kernel still holds every byte, and the open's flush makes it durable) and
+//!     moves nothing — a batch it left half-written included, which the open cuts as a
+//!     write that never finished (see the recovery's same-boot rule). A Strict run never
+//!     moves the generation for stopping uncleanly: its acks were on stable media;
+//!   - the log is SHORTER than the last open saw, its retention base went backwards,
+//!     or the record at the newest offset the last open saw is not the record it saw
+//!     there (another log was put under this name).
+//!
+//!   A move caused by a cut is written to the sidecar BEFORE the cut (phase 1), so a
+//!   crash right after a truncation cannot lose it; an open that dies there and is
+//!   run again finds the cut already announced and moves nothing more for it.
+//! - LINEAGE says where two generations still agree. When the generation moves because
+//!   of an unclean stop, this open's own cut or a repair's — and the log before the cut
+//!   is neither shorter than the last open saw, nor re-based, nor missing the record it
+//!   saw last — the sidecar records `(new generation, common)`, `common` being the
+//!   recovered head: offsets below it name the same records under both generations.
+//!   [`LogIdentity::continues`] reads the chain (the newest [`Lineage::MAX`] steps), so
+//!   a reader holding offsets under an earlier generation resumes at the lower of its
+//!   cursor and every `common` since, instead of forgetting: it skips nothing and
+//!   re-reads nothing below the fork. A log found shorter, re-based or foreign may be a
+//!   restored copy or another file entirely, so it gets NO lineage, and readers forget
+//!   as before.
 //! - A REPLICA reports its leader's identity: the leader sends it with every
 //!   replicated record, and a log that is a replication target adopts it (rewriting
 //!   its sidecar) once a batch carrying it commits AND reaches the replica's newest
@@ -78,16 +116,35 @@
 //! - An identity names a LINEAGE of bytes, not a file. A log COPIED elsewhere, with or
 //!   without its sidecar, is two logs under one identity as soon as both take writes;
 //!   nothing here can tell those copies apart.
-//! - Rewriting is detected only against what the LAST OPEN saw. Records lost after it
-//!   — a Relaxed-tier log's page-cache records after a power loss, or a rollback that
-//!   ends at or above that open's head and keeps the record it saw last — reuse their
-//!   offsets under an unchanged identity. A Strict-tier log loses no acked record
-//!   that way: a torn tail it truncates was never acknowledged and never delivered.
+//! - A power loss under a weak tier is announced, not prevented: the next open after
+//!   the reboot moves the generation (with lineage), so no offset a client kept from
+//!   the lost records is trusted against the records that reuse it. Under Ordered the
+//!   loss is at most the batches acked since the last full flush (the horizon's, an
+//!   escalation's, a clean close's), never an escalated record; under Relaxed, any batch
+//!   no full flush covered (the open's, a clean close's, an escalated record's). The
+//!   rule rests on the boot id (`astream-sys`): on a host that names none, or a log off
+//!   the boot volume, every unclean weak open moves the generation, `kill -9` included
+//!   — the price of not knowing. Hibernation keeps the boot and the page cache, and
+//!   rightly moves nothing. A Strict-tier log loses no acked record to a power loss:
+//!   the torn batch it cuts was never acknowledged.
+//! - Rewriting by anything else is detected only against what the LAST OPEN (or clean
+//!   close) saw: a rollback that ends at or above that head and keeps the record it saw
+//!   last reuses the rolled-back offsets under an unchanged identity.
 //! - A log restored from a backup TOGETHER WITH its sidecar carries the backup's
 //!   identity, which is also the identity it carried while it grew past the backup:
 //!   offsets a client kept from that growth are trusted against the records that will
 //!   reuse them. Restore the log file alone — the sidecar already beside it then finds
-//!   it shorter, or different, and moves the generation.
+//!   it shorter, or different, and moves the generation. (A copy taken while the log
+//!   was written ends inside a frame; restored alone it is cut to its last whole record,
+//!   as a shorter log, never refused as damage below the floor. A copy holding records
+//!   past the sidecar's head is read whole, whichever build wrote them — but nothing
+//!   here can see that those records are not the ones clients were told about at those
+//!   offsets: the rollback residual above.)
+//! - A revert to a build that predates log identity never reads or writes `<log>.id`:
+//!   the records it appends carry no batch mark, and the next open of a sealing build
+//!   reads each as a unit of its own, so none is cut. Its runs record nothing either —
+//!   a Relaxed run of such a build that loses power is the one loss no build can
+//!   announce.
 //! - Deleting `<log>.id` makes the log read as one that predates identity: it
 //!   re-derives its id from its bytes at generation 0. That is a new identity unless
 //!   the bytes are exactly those of an EARLIER derivation — a pre-identity log that
@@ -104,13 +161,31 @@
 //!   it is a random name for the log, not a secret.
 
 use std::fmt;
-use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use astream_wire::{Frame, HEADER_SIZE};
 
-use crate::store::{create_fresh, sync_parent_dir};
+use crate::storage::Dir;
+
+#[cfg(clean_islands)]
+#[path = "logid_island.rs"]
+mod logid_island;
+#[cfg(not(clean_islands))]
+pub use crate::twins::logid_generation_advance;
+#[cfg(clean_islands)]
+pub use logid_island::logid_generation_advance;
+
+contract_fn! {
+    /// Verified check that a lineage chain entry count is within the 8-entry cap
+    /// (`entries <= 8`), linked via `clean-kernel-defeq` to `logid_lineage_within_cap_isl`.
+    #[must_use]
+    pub fn logid_lineage_within_cap(entries: usize) -> bool
+    clauses [ensures result == (entries <= 8)]
+    {
+        entries <= 8
+    }
+}
 
 /// WHICH log, and WHICH incarnation of its offsets — see the [module docs](self) for
 /// what a consumer must do when either changes.
@@ -143,11 +218,9 @@ impl LogIdentity {
 
     /// Read the wire form from the first [`WIRE_LEN`](Self::WIRE_LEN) bytes of `b`.
     pub(crate) fn from_wire(b: &[u8]) -> Option<LogIdentity> {
-        let b = b.get(..Self::WIRE_LEN)?;
-        Some(LogIdentity {
-            id: b[..16].try_into().ok()?,
-            generation: u64::from_le_bytes(b[16..].try_into().ok()?),
-        })
+        let id: [u8; 16] = b.get(..16)?.try_into().ok()?;
+        let generation = u64::from_le_bytes(b.get(16..Self::WIRE_LEN)?.try_into().ok()?);
+        Some(LogIdentity { id, generation })
     }
 
     /// Parse the [`Display`](fmt::Display) form, `<32 lowercase hex>.<generation>`.
@@ -161,9 +234,14 @@ impl LogIdentity {
         {
             return None;
         }
+        let (pairs, rem) = hex.as_bytes().as_chunks::<2>();
+        if pairs.len() != 16 || !rem.is_empty() {
+            return None;
+        }
         let mut id = [0u8; 16];
-        for (i, byte) in id.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok()?;
+        for (byte, pair) in id.iter_mut().zip(pairs.iter()) {
+            let pair_str = std::str::from_utf8(pair).ok()?;
+            *byte = u8::from_str_radix(pair_str, 16).ok()?;
         }
         Some(LogIdentity {
             id,
@@ -181,8 +259,165 @@ impl fmt::Display for LogIdentity {
     }
 }
 
-/// What `<log>.id` holds: the identity, and what the open (or adoption) that wrote it
-/// saw — the evidence the NEXT open checks the log against.
+/// Where two generations of one log agree: `(generation, common)` steps, newest last,
+/// at most [`Lineage::MAX`] of them. A step `(g, c)` says offsets below `c` name the same
+/// records under generation `g - 1` and generation `g` — recorded when the generation
+/// moved for a loss this log can bound (an unclean stop, a torn batch cut, a repair's
+/// cut), never for a log found shorter, re-based or foreign. See
+/// [`LogIdentity::continues`], which reads it, and the [module docs](self).
+///
+/// Told to clients in the answer to `Hello` (`Client::log_lineage`), beside the
+/// identity it qualifies.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct Lineage {
+    steps: Vec<(u64, u64)>,
+}
+
+impl Lineage {
+    /// The most steps kept: older ones fall off, and a reader whose generation is older
+    /// than the window forgets, as before lineage existed.
+    pub const MAX: usize = 8;
+
+    /// The steps, `(generation, common)`, oldest first.
+    #[must_use]
+    pub fn steps(&self) -> &[(u64, u64)] {
+        &self.steps
+    }
+
+    /// This lineage with the step to `generation` added (`common` the recovered head):
+    /// every older step is clamped to `common` too — the log now agrees with an older
+    /// generation at most as far as it agrees with the newest — and only the newest
+    /// [`MAX`](Self::MAX) are kept.
+    pub(crate) fn step(&self, generation: u64, common: u64) -> Lineage {
+        let mut steps: Vec<(u64, u64)> = self
+            .steps
+            .iter()
+            .map(|&(g, c)| (g, c.min(common)))
+            .collect();
+        steps.push((generation, common));
+        let excess = steps.len().saturating_sub(Self::MAX);
+        steps.drain(..excess);
+        Lineage { steps }
+    }
+
+    /// Append the wire form: `n u8`, then `n × (generation u64 LE, common u64 LE)`.
+    pub(crate) fn put(&self, out: &mut Vec<u8>) {
+        out.push(self.steps.len() as u8);
+        for (g, c) in &self.steps {
+            out.extend_from_slice(&g.to_le_bytes());
+            out.extend_from_slice(&c.to_le_bytes());
+        }
+    }
+
+    /// Read the wire form, which must fill `b` exactly; `None` for a short or long
+    /// body, more than [`MAX`](Self::MAX) steps, or generations that do not rise.
+    pub(crate) fn from_wire(b: &[u8]) -> Option<Lineage> {
+        let (&n, rest) = b.split_first()?;
+        let n = usize::from(n);
+        if n > Self::MAX || rest.len() != n * 16 {
+            return None;
+        }
+        let (chunks, _) = rest.as_chunks::<16>();
+        let steps: Vec<(u64, u64)> = chunks
+            .iter()
+            .map(|s| {
+                let (g, c) = s.split_at(8);
+                Some((
+                    u64::from_le_bytes(g.try_into().ok()?),
+                    u64::from_le_bytes(c.try_into().ok()?),
+                ))
+            })
+            .collect::<Option<_>>()?;
+        steps
+            .windows(2)
+            .all(|w| w.first().zip(w.get(1)).is_some_and(|(a, b)| a.0 < b.0))
+            .then_some(Lineage { steps })
+    }
+}
+
+impl LogIdentity {
+    /// Whether offsets a reader kept under `earlier` still name records here, and how
+    /// far: `Some(k)` means every offset below `k` names the same record under both, so
+    /// the reader resumes at `min(cursor, k)` — skipping nothing, re-reading nothing
+    /// below the fork. `Some(u64::MAX)` is the same identity (nothing moved). `None` is
+    /// another log as far as this can tell — another `id`, a generation newer than this
+    /// one, or a chain with a step missing (a move recorded without lineage, or one older
+    /// than the window) — and the reader forgets its offsets, exactly as before lineage.
+    ///
+    /// `lineage` is the one told beside `self` (the answer to the same `Hello`).
+    #[must_use]
+    pub fn continues(&self, earlier: LogIdentity, lineage: &Lineage) -> Option<u64> {
+        if earlier.id != self.id || earlier.generation > self.generation {
+            return None;
+        }
+        let mut agree = u64::MAX;
+        for generation in earlier.generation.checked_add(1)?..=self.generation {
+            let &(_, common) = lineage.steps.iter().find(|(g, _)| *g == generation)?;
+            agree = agree.min(common);
+        }
+        Some(agree)
+    }
+}
+
+/// How the run that last wrote `<log>.id` stood with the log. Only FORMAT 2 records
+/// it; a FORMAT 1 sidecar reads as `Closed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum State {
+    /// Stopped cleanly at `head`, everything below flushed in full (`close_clean`), or
+    /// written by a build that predates the field.
+    Closed,
+    /// Serving. A weak-tier run still `Open` in another boot did not stop cleanly, and
+    /// a power loss may have taken acked records: the next open moves the generation.
+    Open,
+    /// A full durability flush failed while serving, so acked records may not be on
+    /// stable media whatever the boot: the next open moves the generation.
+    Lossy,
+    /// Written by an open BEFORE a cut that removes written bytes (phase 1): the
+    /// generation already moved for a cut to `head`. An open that finds the same cut to
+    /// make (the last one died before it was durable) moves nothing more for it, and
+    /// classifies the log exactly as the one that died: the fields the boot rule reads
+    /// (tier, boot, volume) are the run's before the cut, and `unclean` carries the
+    /// verdict that open held for any other reason — the run's `Lossy` state, or the
+    /// embedder's one-shot [`Prepared::Unclean`](crate::Prepared) — which this record
+    /// replaces and which nothing else would remember.
+    Cutting { unclean: bool },
+}
+
+impl State {
+    fn code(self) -> u8 {
+        match self {
+            State::Closed => 0,
+            State::Open => 1,
+            State::Lossy => 2,
+            State::Cutting { unclean: false } => 3,
+            State::Cutting { unclean: true } => 4,
+        }
+    }
+
+    fn from_code(b: u8) -> Option<State> {
+        Some(match b {
+            0 => State::Closed,
+            1 => State::Open,
+            2 => State::Lossy,
+            3 => State::Cutting { unclean: false },
+            4 => State::Cutting { unclean: true },
+            _ => return None,
+        })
+    }
+}
+
+/// The served-tier codes `<log>.id` and the `Hello` block use: 0 Strict, 1 Ordered,
+/// 2 Relaxed. A code this build does not know reads as a weak tier (the direction that
+/// moves the generation after an unclean stop, never the one that trusts it).
+pub(crate) const SERVED_STRICT: u8 = 0;
+/// See [`SERVED_STRICT`]. An Ordered run is a weak tier for the unclean-stop rule: its
+/// acks were ordered, not durable, so a power loss can take the newest of them.
+pub(crate) const SERVED_ORDERED: u8 = 1;
+/// See [`SERVED_STRICT`].
+pub(crate) const SERVED_RELAXED: u8 = 2;
+
+/// What `<log>.id` holds: the identity, and what the open (or adoption, or clean close)
+/// that wrote it saw — the evidence the NEXT open checks the log against.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Sidecar {
     pub(crate) identity: LogIdentity,
@@ -193,14 +428,45 @@ pub(crate) struct Sidecar {
     /// Fingerprint of the stored frame at offset `head - 1`, the newest record then
     /// (all zero when there was none).
     newest: [u8; 16],
+    /// The format this was READ in (1 or 2): a FORMAT 1 record is rewritten as
+    /// FORMAT 2 at the next open, since the two never compare equal.
+    format: u8,
+    /// How the writing run stood with the log ([`State`]).
+    pub(crate) state: State,
+    /// The tier that run served ([`SERVED_STRICT`] and its siblings).
+    served: u8,
+    /// That run's boot ([`astream_sys::boot_session`]); all zero when unknown.
+    boot: [u8; 16],
+    /// Whether the log was on the boot volume, the device that loses power only
+    /// together with the kernel (so the same-boot rule can trust its page cache).
+    boot_volume: bool,
+    /// A head the log is DURABLE through: everything below it was flushed in full by an
+    /// open (after its flush) or a clean close. `None` for a FORMAT 1 record. Above a
+    /// FORMAT 2 floor recovery judges damage by the batch marks — a sealing build's
+    /// batches, or an older build's unmarked records, each a unit of its own; damage
+    /// below it is never a torn write.
+    pub(crate) floor: Option<u64>,
+    /// Where generations agree ([`Lineage`]).
+    pub(crate) lineage: Lineage,
 }
 
 const MAGIC: &[u8; 4] = b"ASID";
-/// The sidecar's own format. A sidecar this build cannot read (another format, a torn
-/// or tampered write) is treated as absent: the log takes a new identity, which is the
-/// direction that costs a consumer a re-read and never a skipped record.
-const FORMAT: u8 = 1;
-const BODY_LEN: usize = 4 + 1 + LogIdentity::WIRE_LEN + 8 + 8 + 16;
+/// The sidecar's own format: 2 adds the run's state, tier, boot and volume, the durable
+/// floor and the lineage. FORMAT 1 is still READ (as `Closed`, floor unknown, no
+/// lineage). A sidecar this build cannot read (another format, a torn or tampered
+/// write) is treated as absent: the log takes a new identity, which is the direction
+/// that costs a consumer a re-read and never a skipped record — and what an older
+/// build does with a FORMAT 2 sidecar after a revert (one log change, never a reused
+/// offset; it then writes FORMAT 1, whose unknown floor the next open reads by the
+/// rules that predate it). A build older still, from before log identity, never reads
+/// or writes the sidecar at all: what it appends above the floor carries no batch mark,
+/// which recovery reads as units of their own, never a torn batch.
+const FORMAT: u8 = 2;
+/// FORMAT 1's body: magic, format, identity, base, head, newest.
+const BODY_LEN_1: usize = 4 + 1 + LogIdentity::WIRE_LEN + 8 + 8 + 16;
+/// FORMAT 2's fixed part: FORMAT 1's, then state, served, boot, volume, floor and the
+/// lineage count.
+const BODY_LEN_2: usize = BODY_LEN_1 + 1 + 1 + 16 + 1 + 8 + 1;
 
 /// The identity sidecar's path for a log at `path`: `<log>.id`.
 pub(crate) fn sidecar_path(path: &Path) -> PathBuf {
@@ -211,30 +477,67 @@ pub(crate) fn sidecar_path(path: &Path) -> PathBuf {
 
 impl Sidecar {
     fn encode(&self) -> Vec<u8> {
-        let mut p = Vec::with_capacity(BODY_LEN);
+        let mut p = Vec::new();
         p.extend_from_slice(MAGIC);
         p.push(FORMAT);
         self.identity.put(&mut p);
         p.extend_from_slice(&self.base.to_le_bytes());
         p.extend_from_slice(&self.head.to_le_bytes());
         p.extend_from_slice(&self.newest);
+        p.push(self.state.code());
+        p.push(self.served);
+        p.extend_from_slice(&self.boot);
+        p.push(u8::from(!self.boot_volume));
+        p.extend_from_slice(&self.floor.unwrap_or(self.head).to_le_bytes());
+        self.lineage.put(&mut p);
         p
     }
 
     fn decode(bytes: &[u8]) -> Option<Sidecar> {
         let d = Frame::decode(bytes).ok()??;
         let p = d.frame.payload;
-        if d.consumed != bytes.len() || p.len() != BODY_LEN || &p[..4] != MAGIC || p[4] != FORMAT {
+        if d.consumed != bytes.len() || p.len() < BODY_LEN_1 || p.get(..4) != Some(MAGIC.as_slice())
+        {
             return None;
         }
         let at = 5 + LogIdentity::WIRE_LEN;
-        let u64_at = |i: usize| p[i..i + 8].try_into().ok().map(u64::from_le_bytes);
-        Some(Sidecar {
-            identity: LogIdentity::from_wire(&p[5..at])?,
+        let u64_at = |i: usize| {
+            p.get(i..i.checked_add(8)?)?
+                .try_into()
+                .ok()
+                .map(u64::from_le_bytes)
+        };
+        let format = *p.get(4)?;
+        let mut sidecar = Sidecar {
+            identity: LogIdentity::from_wire(p.get(5..at)?)?,
             base: u64_at(at)?,
             head: u64_at(at + 8)?,
-            newest: p[at + 16..].try_into().ok()?,
-        })
+            newest: p.get(at + 16..BODY_LEN_1)?.try_into().ok()?,
+            format,
+            state: State::Closed,
+            served: SERVED_STRICT,
+            boot: [0u8; 16],
+            boot_volume: true,
+            floor: None,
+            lineage: Lineage::default(),
+        };
+        match format {
+            1 if p.len() == BODY_LEN_1 => {}
+            2 if p.len() >= BODY_LEN_2 => {
+                sidecar.state = State::from_code(*p.get(BODY_LEN_1)?)?;
+                sidecar.served = *p.get(BODY_LEN_1 + 1)?;
+                sidecar.boot = p.get(BODY_LEN_1 + 2..BODY_LEN_1 + 18)?.try_into().ok()?;
+                sidecar.boot_volume = match *p.get(BODY_LEN_1 + 18)? {
+                    0 => true,
+                    1 => false,
+                    _ => return None,
+                };
+                sidecar.floor = Some(u64_at(BODY_LEN_1 + 19)?);
+                sidecar.lineage = Lineage::from_wire(p.get(BODY_LEN_1 + 27..)?)?;
+            }
+            _ => return None,
+        }
+        Some(sidecar)
     }
 
     /// Whether `durable` (the log's stored frames from `base`) still holds, at the
@@ -252,26 +555,133 @@ impl Sidecar {
             .nth(index)
             .is_none_or(|frame| fingerprint(frame) == self.newest)
     }
+
+    /// The lineage told beside the identity.
+    pub(crate) fn lineage(&self) -> &Lineage {
+        &self.lineage
+    }
+
+    /// This record as a CLEAN CLOSE writes it: the run stopped at `head` with every
+    /// byte below flushed in full, so the floor rises to it and the next open, in any
+    /// boot, finds nothing it must move the generation for. `kept` is the log's stored
+    /// frames from its base.
+    pub(crate) fn closed(&self, base: u64, head: u64, kept: &[u8]) -> Sidecar {
+        Sidecar {
+            base,
+            head,
+            newest: newest_of(kept),
+            format: FORMAT,
+            state: State::Closed,
+            floor: Some(head),
+            ..self.clone()
+        }
+    }
+
+    /// This record marked `Lossy`: a full durability flush failed, so the next open
+    /// moves the generation whatever the boot.
+    pub(crate) fn lossy(&self) -> Sidecar {
+        Sidecar {
+            format: FORMAT,
+            state: State::Lossy,
+            ..self.clone()
+        }
+    }
+}
+
+/// The fingerprint of the newest of `frames` (all zero when there are none).
+fn newest_of(frames_bytes: &[u8]) -> [u8; 16] {
+    frames(frames_bytes).last().map_or([0u8; 16], fingerprint)
 }
 
 /// What an open finds at `<log>.id`.
-enum Prior {
+pub(crate) enum Prior {
     /// No sidecar: a log created before log identity, or by this open.
     Absent,
     /// A file this build cannot read as a sidecar (damaged, or another format): the log
     /// HAS had an identity, and this cannot say which.
     Unreadable,
-    /// The identity the last open (or adoption) recorded, with what it saw.
+    /// The identity the last open (or adoption, or clean close) recorded, with what it
+    /// saw.
     Recorded(Sidecar),
 }
 
-/// Read `<log>.id` ([`Prior`]; a file that cannot be decoded is said on stderr, since
-/// the log then takes a new identity); an I/O error otherwise.
-fn read(log: &Path) -> io::Result<Prior> {
+impl Prior {
+    fn recorded(&self) -> Option<&Sidecar> {
+        match self {
+            Prior::Recorded(p) => Some(p),
+            Prior::Absent | Prior::Unreadable => None,
+        }
+    }
+
+    /// The durable floor recovery judges by: a FORMAT 2 record's floor, raised to the
+    /// retention base (records below it are gone); `None` — the rules that predate the
+    /// floor — for anything else.
+    pub(crate) fn floor(&self, base: u64) -> Option<u64> {
+        self.recorded()?.floor.map(|f| f.max(base))
+    }
+
+    /// Whether the last run served the Relaxed tier, whose power loss can leave holes
+    /// across batches (it issues no barrier at all).
+    pub(crate) fn served_relaxed(&self) -> bool {
+        self.recorded().is_some_and(|p| p.served == SERVED_RELAXED)
+    }
+
+    /// Why the last run may have lost acked records that this open cannot see were
+    /// lost — the UNCLEAN verdict — or `None`. `prepared` is the embedder's own verdict
+    /// ([`Prepared::Unclean`](crate::Prepared)); `boot` is this open's. Only a weak
+    /// tier's run is ever unclean by astream's own rule: a Strict run's acks were on
+    /// stable media. (Where THIS run serves matters to the next open, which reads it from
+    /// the sidecar this open writes.)
+    pub(crate) fn unclean(&self, prepared: Option<&str>, boot: Option<[u8; 16]>) -> Option<String> {
+        if let Some(why) = prepared {
+            return Some(format!("the embedder's prepare said so: {why}"));
+        }
+        let p = self.recorded()?;
+        let weak_run =
+            matches!(p.state, State::Open | State::Cutting { .. }) && p.served != SERVED_STRICT;
+        let known = |b: &[u8; 16]| *b != [0u8; 16];
+        match p.state {
+            State::Lossy => Some("a full flush failed while it served".to_string()),
+            State::Cutting { unclean: true } => Some(
+                "the open before this one held that verdict and died before its cut was durable"
+                    .to_string(),
+            ),
+            _ if !weak_run => None,
+            _ if !known(&p.boot) => Some("it served in a boot it could not name".to_string()),
+            _ if !p.boot_volume => Some(
+                "it served a log off the boot volume, whose cache a crash can lose".to_string(),
+            ),
+            _ => match boot {
+                None => Some("this host cannot name the boot it is in".to_string()),
+                Some(now) if now != p.boot => {
+                    Some("it served in another boot and did not stop cleanly".to_string())
+                }
+                Some(_) => None,
+            },
+        }
+    }
+
+    /// Whether this open is in the SAME BOOT as the run the sidecar names, with the log
+    /// on the boot volume then and now (`boot_volume`, this open's): the kernel that held
+    /// that run's page cache has run throughout, so the bytes read are exactly the ones
+    /// it wrote, and a file that ends inside its newest batch is a write its process
+    /// never finished — never a power loss, never acked. Any tier: the boot is recorded
+    /// by every open. False when either boot cannot be named.
+    pub(crate) fn same_boot(&self, boot: Option<[u8; 16]>, boot_volume: bool) -> bool {
+        self.recorded().is_some_and(|p| {
+            p.boot != [0u8; 16] && Some(p.boot) == boot && p.boot_volume && boot_volume
+        })
+    }
+}
+
+/// Read `<log>.id` through `dir` ([`Prior`]; a file that cannot be decoded is said on
+/// stderr, since the log then takes a new identity); an I/O error otherwise.
+pub(crate) fn read(dir: &Dir) -> io::Result<Prior> {
+    let log = dir.log_path();
     let path = sidecar_path(log);
-    let bytes = match std::fs::read(&path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Prior::Absent),
+    let bytes = match dir.read_id() {
+        Ok(Some(b)) => b,
+        Ok(None) => return Ok(Prior::Absent),
         Err(e) => {
             return Err(io::Error::new(
                 e.kind(),
@@ -297,115 +707,225 @@ fn read(log: &Path) -> io::Result<Prior> {
     }
 }
 
-/// Durably replace `<log>.id` with `sidecar` (tmp file, fsync, rename, directory
-/// fsync), never following a link planted at either name.
-fn write(log: &Path, sidecar: &Sidecar) -> io::Result<()> {
-    let path = sidecar_path(log);
-    let mut tmp = path.as_os_str().to_os_string();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
+/// Durably replace `<log>.id` with `sidecar` through `dir` (on disk: tmp file, fsync,
+/// rename, directory fsync, never following a link planted at either name), naming it
+/// in the error.
+pub(crate) fn write(dir: &Dir, sidecar: &Sidecar) -> io::Result<()> {
     let framed = Frame::new(sidecar.encode())
         .encode()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    {
-        let mut f = create_fresh(&tmp, &mut OpenOptions::new())?;
-        f.write_all(&framed)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, &path)?;
-    sync_parent_dir(&path)
+    dir.replace_id(&framed).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "cannot record the identity of {} in {}: {e}",
+                dir.log_path().display(),
+                sidecar_path(dir.log_path()).display()
+            ),
+        )
+    })
 }
 
-/// Settle the identity of the log at `log` as one open of it finds it — `created` by
-/// this open, `replica` when it is a replication target, `cut` when this open's repair
-/// truncated records, `durable` its intact stored frames (those [`frames`] walks) from
-/// offset `base` up to `head` — persisting any change before returning. See the module
-/// docs for the rules.
-pub(crate) fn open(
-    log: &Path,
-    created: bool,
-    replica: bool,
-    cut: bool,
-    durable: &[u8],
-    base: u64,
-    head: u64,
-) -> io::Result<Sidecar> {
-    let prior = if created { Prior::Absent } else { read(log)? };
-    let minted = || LogIdentity {
-        id: minted_id(log),
-        generation: 0,
+/// Everything one open knows about the log when it settles the identity: see
+/// [`settle`].
+pub(crate) struct Facts<'a> {
+    /// The log is a replication target.
+    pub(crate) replica: bool,
+    /// The intact frames from `base` up to the first damage (or the end), BEFORE any
+    /// cut: what the last open's evidence is checked against.
+    pub(crate) pre_cut: &'a [u8],
+    /// The head those frames reach.
+    pub(crate) pre_cut_head: u64,
+    /// The frames that survive this open's cut (all of `pre_cut` when nothing intact is
+    /// cut).
+    pub(crate) kept: &'a [u8],
+    /// The retention base.
+    pub(crate) base: u64,
+    /// The head after the cut.
+    pub(crate) kept_head: u64,
+    /// The unclean verdict ([`Prior::unclean`]), if any.
+    pub(crate) unclean: bool,
+    /// This open's recovery cut written bytes (a torn batch's records, or a whole-sized
+    /// frame of it).
+    pub(crate) cut_records: bool,
+    /// This open is a repair that truncates.
+    pub(crate) repair_cut: bool,
+    /// The crash simulation's negative control NC9: record lineage even for a log found
+    /// shorter than the last open saw (a restored copy). Never set outside it.
+    pub(crate) lineage_on_shorter: bool,
+    /// A fresh id, used when the rules call for one.
+    pub(crate) minted: [u8; 16],
+}
+
+/// The identity (and lineage) one open settles, and whether it moved.
+pub(crate) struct Settled {
+    pub(crate) identity: LogIdentity,
+    pub(crate) lineage: Lineage,
+}
+
+/// Settle the identity of a log as one open finds it — see the module docs for the
+/// rules. Pure: the caller records the result (phase 1 before a cut, phase 2 after the
+/// flush).
+pub(crate) fn settle(prior: &Prior, f: &Facts<'_>) -> Settled {
+    let minted = || Settled {
+        identity: LogIdentity {
+            id: f.minted,
+            generation: 0,
+        },
+        lineage: Lineage::default(),
     };
-    let identity = match &prior {
+    match prior {
         // Never held a record (a created log always): no client can hold an offset
         // into it, so a fresh id is always right — and a sidecar beside it can only be
         // a deleted predecessor's, or this log's own from before it held anything.
-        _ if head == 0 => minted(),
+        _ if f.kept_head == 0 => minted(),
         // Every record pruned: nothing stored to derive from but two numbers, which
         // another such log can share — a fresh id instead.
-        Prior::Absent if frames(durable).next().is_none() => minted(),
-        Prior::Absent => LogIdentity {
-            id: derived_id(durable, base, head),
-            generation: 0,
+        Prior::Absent if frames(f.kept).next().is_none() => minted(),
+        Prior::Absent => Settled {
+            identity: LogIdentity {
+                id: derived_id(f.kept, f.base, f.kept_head),
+                generation: 0,
+            },
+            lineage: Lineage::default(),
         },
         // It had an identity this cannot read: a derived id could be that very one
         // (or an earlier one), so only a fresh id is certainly a different name.
         Prior::Unreadable => minted(),
         Prior::Recorded(p) => {
-            let rewritten = cut || base < p.base || head < p.head || !p.still_names(durable, base);
-            if rewritten && replica {
+            // A cut the LAST open already announced (it wrote phase 1 and died before
+            // the cut was durable): finding the same cut again moves nothing more.
+            let announced = matches!(p.state, State::Cutting { .. }) && f.kept_head == p.head;
+            let own_loss = (f.unclean || f.cut_records || f.repair_cut) && !announced;
+            let other_log =
+                f.base < p.base || f.kept_head < p.head || !p.still_names(f.pre_cut, f.base);
+            if !(own_loss || other_log) {
+                return Settled {
+                    identity: p.identity,
+                    lineage: p.lineage.clone(),
+                };
+            }
+            if f.replica {
                 // A replica's identity is its leader's lineage, numbered by the leader
                 // alone: `generation + 1` here could be the name of a rewrite the
                 // leader makes later. A fresh id is no name the leader can give; the
                 // next replicated batch hands the leader's back.
-                minted()
+                return minted();
+            }
+            let generation = p.identity.generation.saturating_add(1);
+            // Lineage only for a loss this log can bound, judged on the bytes BEFORE
+            // this open's cut: a repair below the last open's head keeps it (the
+            // shortening is its own cut), a restored backup does not.
+            let continuous =
+                f.pre_cut_head >= p.head && f.base >= p.base && p.still_names(f.pre_cut, f.base);
+            let lineage = if (own_loss && continuous) || f.lineage_on_shorter {
+                p.lineage.step(generation, f.kept_head)
             } else {
-                LogIdentity {
+                Lineage::default()
+            };
+            Settled {
+                identity: LogIdentity {
                     id: p.identity.id,
-                    generation: p.identity.generation.saturating_add(u64::from(rewritten)),
-                }
+                    generation,
+                },
+                lineage,
             }
         }
-    };
-    let now = Sidecar {
-        identity,
-        base,
-        head,
-        newest: frames(durable).last().map_or([0u8; 16], fingerprint),
-    };
-    let recorded = match &prior {
-        Prior::Recorded(p) => Some(p),
-        Prior::Absent | Prior::Unreadable => None,
-    };
-    if recorded != Some(&now) {
-        // FAIL CLOSED: an identity told to clients but never recorded is one the next
-        // open can contradict — after a repair, by reporting the generation from
-        // before the cut, whose evidence the truncation removes. The log is refused
-        // instead (and a repair refused before a byte is cut), naming the sidecar.
-        write(log, &now).map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!(
-                    "cannot record the identity of {} in {}: {e}",
-                    log.display(),
-                    sidecar_path(log).display()
-                ),
-            )
-        })?;
     }
-    Ok(now)
+}
+
+/// What an open records about the log it settled, around its flush.
+pub(crate) struct Record<'a> {
+    pub(crate) settled: &'a Settled,
+    pub(crate) base: u64,
+    pub(crate) head: u64,
+    /// The kept frames from `base` (for the newest record's fingerprint).
+    pub(crate) kept: &'a [u8],
+    pub(crate) served: u8,
+    pub(crate) boot: Option<[u8; 16]>,
+    pub(crate) boot_volume: bool,
+}
+
+impl Record<'_> {
+    /// PHASE 2, written after the open's flush: the run is `Open` at this tier and
+    /// boot, and the log is durable through its head — the new floor.
+    pub(crate) fn serving(&self) -> Sidecar {
+        Sidecar {
+            identity: self.settled.identity,
+            base: self.base,
+            head: self.head,
+            newest: newest_of(self.kept),
+            format: FORMAT,
+            state: State::Open,
+            served: self.served,
+            boot: self.boot.unwrap_or([0u8; 16]),
+            boot_volume: self.boot_volume,
+            floor: Some(self.head),
+            lineage: self.settled.lineage.clone(),
+        }
+    }
+
+    /// PHASE 1, written BEFORE a cut that removes written bytes: the moved identity and
+    /// lineage, durable before their evidence goes, `Cutting` to `head`. The fields the
+    /// boot rule reads (tier, boot, volume) are the LAST run's, and `unclean` is this
+    /// open's verdict (from any cause), so an open that meets this record after this one
+    /// dies decides exactly as this one did — even when the verdict came from the
+    /// `Lossy` state this record replaces, or from the embedder's one-shot prepare. The
+    /// floor never rises here (nothing new is durable yet).
+    pub(crate) fn cutting(&self, prior: &Prior, unclean: bool) -> Sidecar {
+        let last = prior.recorded();
+        let floor = last
+            .and_then(|p| p.floor)
+            .map_or(self.head, |f| f.min(self.head));
+        Sidecar {
+            state: State::Cutting { unclean },
+            served: last.map_or(self.served, |p| p.served),
+            boot: last.map_or(self.boot.unwrap_or([0u8; 16]), |p| p.boot),
+            boot_volume: last.map_or(self.boot_volume, |p| p.boot_volume),
+            floor: Some(floor),
+            ..self.serving()
+        }
+    }
+}
+
+/// A FORMAT 1 sidecar as the release before FORMAT 2 wrote it, framed: the crash
+/// simulation's upgrade path starts from one.
+#[cfg(test)]
+pub(crate) fn format1_for_test(
+    identity: LogIdentity,
+    base: u64,
+    head: u64,
+    frames_bytes: &[u8],
+) -> Vec<u8> {
+    let mut p = Vec::with_capacity(BODY_LEN_1);
+    p.extend_from_slice(MAGIC);
+    p.push(1);
+    identity.put(&mut p);
+    p.extend_from_slice(&base.to_le_bytes());
+    p.extend_from_slice(&head.to_le_bytes());
+    p.extend_from_slice(&newest_of(frames_bytes));
+    Frame::new(p).encode().expect("a sidecar frames")
+}
+
+/// Whether `recorded` already says exactly what `now` would (no write needed).
+pub(crate) fn unchanged(prior: &Prior, now: &Sidecar) -> bool {
+    prior.recorded() == Some(now)
 }
 
 /// Take `leader` as this log's identity (a replica reporting its leader's), keeping
-/// what the open saw. A no-op when it already is.
-pub(crate) fn adopt(log: &Path, sidecar: &Sidecar, leader: LogIdentity) -> io::Result<Sidecar> {
+/// what the open saw. A no-op when it already is. The replica's own lineage names its
+/// own generations, not its leader's, so it is dropped.
+pub(crate) fn adopt(dir: &Dir, sidecar: &Sidecar, leader: LogIdentity) -> io::Result<Sidecar> {
     if sidecar.identity == leader {
         return Ok(sidecar.clone());
     }
     let adopted = Sidecar {
         identity: leader,
+        format: FORMAT,
+        lineage: Lineage::default(),
         ..sidecar.clone()
     };
-    write(log, &adopted)?;
+    write(dir, &adopted)?;
     Ok(adopted)
 }
 
@@ -417,12 +937,23 @@ fn frames(bytes: &[u8]) -> impl Iterator<Item = &[u8]> + '_ {
     let mut pos = 0usize;
     std::iter::from_fn(move || {
         let header = bytes.get(pos..pos.checked_add(HEADER_SIZE)?)?;
-        let len = u32::from_le_bytes(header[4..8].try_into().ok()?) as usize;
+        let len = u32::from_le_bytes(header.get(4..8)?.try_into().ok()?) as usize;
         let end = pos.checked_add(HEADER_SIZE)?.checked_add(len)?;
         let frame = bytes.get(pos..end)?;
         pos = end;
         Some(frame)
     })
+}
+
+/// Where the last of `bytes`' stored frames starts, or `None` when it holds none.
+pub(crate) fn last_frame_start(bytes: &[u8]) -> Option<usize> {
+    let mut at = None;
+    let mut pos = 0usize;
+    for frame in frames(bytes) {
+        at = Some(pos);
+        pos = pos.saturating_add(frame.len());
+    }
+    at
 }
 
 /// FNV-1a-128 over `parts`, each prefixed with its length so no two different lists
@@ -463,7 +994,7 @@ fn derived_id(durable: &[u8], base: u64, head: u64) -> [u8; 16] {
 /// independent std `RandomState`s — keyed from the OS once per thread, then stepped per
 /// construction — over a process-wide counter, the wall clock, the process id and the
 /// path. Distinct per creation; not claimed cryptographically random.
-fn minted_id(log: &Path) -> [u8; 16] {
+pub(crate) fn minted_id(log: &Path) -> [u8; 16] {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hash, Hasher};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -529,14 +1060,25 @@ mod tests {
         assert_eq!(LogIdentity::from_wire(&b[..23]), None);
     }
 
-    #[test]
-    fn a_sidecar_round_trips_and_a_damaged_one_reads_as_none() {
-        let s = Sidecar {
-            identity: ident(3, 9),
+    fn sidecar(identity: LogIdentity, lineage: Lineage) -> Sidecar {
+        Sidecar {
+            identity,
             base: 4,
             head: 11,
             newest: [5u8; 16],
-        };
+            format: FORMAT,
+            state: State::Open,
+            served: SERVED_RELAXED,
+            boot: [9u8; 16],
+            boot_volume: true,
+            floor: Some(11),
+            lineage,
+        }
+    }
+
+    #[test]
+    fn a_sidecar_round_trips_and_a_damaged_one_reads_as_none() {
+        let s = sidecar(ident(3, 9), Lineage::default().step(9, 7));
         let framed = Frame::new(s.encode()).encode().unwrap();
         assert_eq!(Sidecar::decode(&framed), Some(s.clone()));
         let mut flipped = framed.clone();
@@ -547,6 +1089,233 @@ mod tests {
         other_format[4] = FORMAT + 1;
         let framed = Frame::new(other_format).encode().unwrap();
         assert_eq!(Sidecar::decode(&framed), None, "another sidecar format");
+        let mut bad_state = s.encode();
+        bad_state[BODY_LEN_1] = 9;
+        let framed = Frame::new(bad_state).encode().unwrap();
+        assert_eq!(
+            Sidecar::decode(&framed),
+            None,
+            "a state this build does not know"
+        );
+        let mut long = s.encode();
+        long.push(0);
+        let framed = Frame::new(long).encode().unwrap();
+        assert_eq!(
+            Sidecar::decode(&framed),
+            None,
+            "a lineage longer than it says"
+        );
+    }
+
+    /// FORMAT 1 (the release before) still reads: `Closed`, the floor unknown, no
+    /// lineage — and it never compares equal to the FORMAT 2 record the next open
+    /// writes, so that open rewrites it.
+    #[test]
+    fn a_format_1_sidecar_reads_as_closed_with_no_floor() {
+        let framed = format1_for_test(ident(4, 2), 0, 3, &[]);
+        let s = Sidecar::decode(&framed).expect("FORMAT 1 reads");
+        assert_eq!(s.identity, ident(4, 2));
+        assert_eq!((s.format, s.state, s.floor), (1, State::Closed, None));
+        assert!(s.lineage.steps().is_empty());
+        let prior = Prior::Recorded(s.clone());
+        assert_eq!(prior.floor(0), None);
+        assert_eq!(prior.unclean(None, Some([1; 16])), None);
+        let rewritten = Sidecar {
+            format: FORMAT,
+            ..s
+        };
+        assert!(!unchanged(&prior, &rewritten));
+    }
+
+    /// The unclean verdict: only a weak tier's run still `Open` (or cutting) in another
+    /// boot, an unnamed boot, off the boot volume, or `Lossy` whatever the tier — and the
+    /// embedder's own verdict.
+    #[test]
+    fn the_unclean_verdict_follows_the_tier_the_boot_and_the_state() {
+        let boot = Some([9u8; 16]);
+        let other = Some([8u8; 16]);
+        let with = |f: fn(&mut Sidecar)| {
+            let mut s = sidecar(ident(1, 0), Lineage::default());
+            f(&mut s);
+            Prior::Recorded(s)
+        };
+        assert_eq!(
+            with(|_| {}).unclean(None, boot),
+            None,
+            "same boot: a process crash"
+        );
+        assert!(with(|_| {}).unclean(None, other).is_some(), "another boot");
+        assert!(
+            with(|_| {}).unclean(None, None).is_some(),
+            "this boot unnamed"
+        );
+        assert!(
+            with(|s| s.boot = [0; 16]).unclean(None, boot).is_some(),
+            "that boot unnamed"
+        );
+        assert!(
+            with(|s| s.boot_volume = false)
+                .unclean(None, boot)
+                .is_some(),
+            "off the boot volume"
+        );
+        assert!(
+            with(|s| s.state = State::Cutting { unclean: false })
+                .unclean(None, other)
+                .is_some(),
+            "a cut that died"
+        );
+        assert_eq!(
+            with(|s| s.state = State::Cutting { unclean: false }).unclean(None, boot),
+            None,
+            "a cut that died in the run's own boot, for no verdict"
+        );
+        assert!(
+            with(|s| {
+                s.served = SERVED_STRICT;
+                s.state = State::Cutting { unclean: true };
+            })
+            .unclean(None, boot)
+            .is_some(),
+            "a cut that died holding a verdict, at any tier and boot"
+        );
+        assert_eq!(
+            with(|s| s.state = State::Closed).unclean(None, other),
+            None,
+            "a clean close"
+        );
+        assert_eq!(
+            with(|s| s.served = SERVED_STRICT).unclean(None, other),
+            None,
+            "Strict never"
+        );
+        assert!(
+            with(|s| {
+                s.served = SERVED_STRICT;
+                s.state = State::Lossy;
+            })
+            .unclean(None, boot)
+            .is_some(),
+            "Lossy at any tier"
+        );
+        assert!(with(|s| s.state = State::Closed)
+            .unclean(Some("mark"), boot)
+            .is_some());
+        assert!(Prior::Absent.unclean(None, other).is_none());
+    }
+
+    /// PHASE 1 carries the verdict of the open that writes it, whatever its cause: a
+    /// `Lossy` record (which `Cutting` replaces) or the embedder's one-shot prepare
+    /// would otherwise be forgotten, and an open after a death between phase 1 and the
+    /// cut would classify the log differently from the one that died — refusing what it
+    /// cut, or moving the generation a second time.
+    #[test]
+    fn phase_1_remembers_the_verdict_it_cut_under() {
+        let boot = [9u8; 16];
+        for (prior_state, prepared) in [(State::Lossy, None), (State::Open, Some("mark"))] {
+            let prior = Prior::Recorded(Sidecar {
+                state: prior_state,
+                ..sidecar(ident(1, 0), Lineage::default())
+            });
+            let verdict = prior.unclean(prepared, Some(boot));
+            assert!(verdict.is_some(), "{prior_state:?}");
+            let settled = Settled {
+                identity: ident(1, 1),
+                lineage: Lineage::default().step(1, 11),
+            };
+            let record = Record {
+                settled: &settled,
+                base: 4,
+                head: 11,
+                kept: &[],
+                served: SERVED_RELAXED,
+                boot: Some(boot),
+                boot_volume: true,
+            };
+            let cutting = Prior::Recorded(record.cutting(&prior, verdict.is_some()));
+            assert!(
+                cutting.unclean(None, Some(boot)).is_some(),
+                "the next open, same boot, no prepare, still holds the verdict ({prior_state:?})"
+            );
+            assert_eq!(
+                cutting.floor(4),
+                Some(11),
+                "the floor never rises in phase 1"
+            );
+        }
+    }
+
+    /// The same-boot test: a named boot equal to this open's, the log on the boot
+    /// volume then and now. Anything unknown is not the same boot.
+    #[test]
+    fn the_same_boot_needs_a_named_boot_and_the_boot_volume() {
+        let boot = Some([9u8; 16]);
+        let with = |f: fn(&mut Sidecar)| {
+            let mut s = sidecar(ident(1, 0), Lineage::default());
+            f(&mut s);
+            Prior::Recorded(s)
+        };
+        assert!(with(|_| {}).same_boot(boot, true));
+        assert!(with(|s| s.served = SERVED_STRICT).same_boot(boot, true));
+        assert!(
+            !with(|_| {}).same_boot(Some([8u8; 16]), true),
+            "another boot"
+        );
+        assert!(!with(|_| {}).same_boot(None, true), "this boot unnamed");
+        assert!(!with(|s| s.boot = [0; 16]).same_boot(None, true));
+        assert!(!with(|s| s.boot_volume = false).same_boot(boot, true));
+        assert!(
+            !with(|_| {}).same_boot(boot, false),
+            "off the boot volume now"
+        );
+        assert!(!Prior::Absent.same_boot(boot, true));
+    }
+
+    /// Lineage clamps older steps to each newer common, keeps the newest eight, and
+    /// `continues` reads the chain: the same identity continues everywhere, a gap in the
+    /// chain or another id does not.
+    #[test]
+    fn lineage_clamps_keeps_eight_and_continues_reads_the_chain() {
+        let l = Lineage::default().step(1, 10).step(2, 7).step(3, 9);
+        assert_eq!(l.steps(), &[(1, 7), (2, 7), (3, 9)]);
+        let now = ident(5, 3);
+        assert_eq!(now.continues(ident(5, 3), &l), Some(u64::MAX));
+        assert_eq!(now.continues(ident(5, 2), &l), Some(9));
+        assert_eq!(now.continues(ident(5, 0), &l), Some(7));
+        assert_eq!(now.continues(ident(6, 0), &l), None, "another log");
+        assert_eq!(
+            ident(5, 2).continues(ident(5, 3), &l),
+            None,
+            "a newer generation"
+        );
+        let gap = Lineage::default().step(1, 10).step(3, 9);
+        assert_eq!(
+            now.continues(ident(5, 0), &gap),
+            None,
+            "a move without lineage"
+        );
+        let mut long = Lineage::default();
+        for g in 1..=10 {
+            long = long.step(g, 100 - g);
+        }
+        assert_eq!(long.steps().len(), Lineage::MAX);
+        assert_eq!(long.steps()[0], (3, 90));
+        assert_eq!(
+            ident(5, 10).continues(ident(5, 1), &long),
+            None,
+            "older than the window"
+        );
+        assert_eq!(ident(5, 10).continues(ident(5, 2), &long), Some(90));
+        let mut wire = Vec::new();
+        l.put(&mut wire);
+        assert_eq!(Lineage::from_wire(&wire), Some(l.clone()));
+        assert_eq!(Lineage::from_wire(&wire[..wire.len() - 1]), None);
+        let mut falling = Vec::new();
+        Lineage {
+            steps: vec![(3, 1), (2, 1)],
+        }
+        .put(&mut falling);
+        assert_eq!(Lineage::from_wire(&falling), None, "generations must rise");
     }
 
     #[test]

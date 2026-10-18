@@ -3,11 +3,7 @@
 
 //! Public-API regression for same-width full-redraw identity transfer.
 
-use std::{
-    alloc::{GlobalAlloc, Layout, System},
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use aterm_core::terminal::Terminal;
 use aterm_effects::word_decorations::{DecoConfig, EffectGeom, ProfanityStyle, WordDecorations};
@@ -17,73 +13,12 @@ use aterm_render::{GlowQuad, InkCell, RenderInput, WordDecoration};
 const ROWS: usize = 8;
 const COLS: usize = 48;
 
-/// This integration-test binary has one test, so a process-wide counter gives
-/// a deterministic public-API warm-path allocation gate without interference
-/// from sibling tests.
-struct CountingAllocator;
-
-static COUNT_ALLOCATIONS: AtomicBool = AtomicBool::new(false);
-static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
-static ALLOCATION_SIZES: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
-
-fn record_allocation(size: usize) {
-    if COUNT_ALLOCATIONS.load(Ordering::Relaxed) {
-        let index = ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        if let Some(slot) = ALLOCATION_SIZES.get(index) {
-            slot.store(size, Ordering::Relaxed);
-        }
-    }
-}
-
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: delegate the allocation unchanged to the system allocator.
-        let ptr = unsafe { System.alloc(layout) };
-        if !ptr.is_null() {
-            record_allocation(layout.size());
-        }
-        ptr
-    }
-
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: delegate the allocation unchanged to the system allocator.
-        let ptr = unsafe { System.alloc_zeroed(layout) };
-        if !ptr.is_null() {
-            record_allocation(layout.size());
-        }
-        ptr
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        // SAFETY: `ptr`, `layout`, and `new_size` are forwarded unchanged.
-        let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
-        if !new_ptr.is_null() {
-            record_allocation(new_size);
-        }
-        new_ptr
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: `ptr` and `layout` came from this delegating allocator.
-        unsafe { System.dealloc(ptr, layout) };
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: CountingAllocator = CountingAllocator;
-
-fn allocations_during(f: impl FnOnce()) -> (usize, [usize; 16]) {
-    ALLOCATIONS.store(0, Ordering::Relaxed);
-    for slot in &ALLOCATION_SIZES {
-        slot.store(0, Ordering::Relaxed);
-    }
-    COUNT_ALLOCATIONS.store(true, Ordering::Release);
-    f();
-    COUNT_ALLOCATIONS.store(false, Ordering::Release);
-    (
-        ALLOCATIONS.load(Ordering::Relaxed),
-        std::array::from_fn(|index| ALLOCATION_SIZES[index].load(Ordering::Relaxed)),
-    )
+/// How many allocations `f` makes on this thread, and the first sizes: the
+/// suite's per-thread counter (`alloc_count`), so the warm-path gate is
+/// deterministic beside every other test of `effects_suite`.
+fn allocations_during(f: impl FnOnce()) -> (usize, [usize; crate::alloc_count::SIZE_SLOTS]) {
+    let ((), count, sizes) = crate::alloc_count::allocations_during(f);
+    (count, sizes)
 }
 
 fn snapshot(lines: &[(usize, &str)]) -> RenderInput {

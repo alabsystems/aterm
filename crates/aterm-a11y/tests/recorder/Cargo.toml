@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# THE SEMANTICS ORACLE'S RECORDER (A11Y.5, docs/AUDIT-third-party-2026-10-15.md,
+# unit a11y), in ITS OWN WORKSPACE on purpose (the empty `[workspace]` below):
+# the registry AccessKit stack plays the corpus and writes the transcript, and
+# aterm-a11y's carved semantics and model are held to the committed recording
+# with none of it in the workspace graph, not even as a dev-dependency. It
+# compiles the same corpus and transcript sources the replay does
+# (`../oracle/`). Its Cargo.lock pins the stack at the versions the workspace
+# lock held when tests/recorded/ was written (main @ c1b839fd73): accesskit
+# 0.24.1, accesskit_consumer 0.37.0, accesskit_atspi_common 0.19.0,
+# atspi-common 0.13.0, hashbrown 0.16.1, phf 0.13.1.
+#
+# Nothing in the aterm workspace builds this. From this directory:
+#   targo --unverified run --release --locked --offline > ../recorded/accesskit-0.24.1-transcript.txt.new
+#   targo --unverified run --release --locked --offline -- --full > full.txt
+#   targo --unverified run --release --locked --offline -- --blank-lines > ../recorded/accesskit-0.24.1-blank-lines.txt.new
+# The first prints the recording itself, header included (events as text,
+# every other block as its digest); the second each block's text, to read
+# where a replay differs; the third the blank-line table, after a minute (the
+# registry crates' paragraph search never returns on some of its rows, and
+# those threads spin until the recorder exits).
+# Diff the rows against the committed ones: a difference is the corpus or the
+# registry crates changing, never a reason to edit the recording by hand.
+[package]
+name = "aterm-a11y-recorder"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+accesskit = "=0.24.1"
+accesskit_consumer = "=0.37.0"
+accesskit_atspi_common = "=0.19.0"
+atspi-common = { version = "=0.13.0", default-features = false }
+hashbrown = { version = "=0.16.1", default-features = false, features = ["default-hasher"] }
+phf = { version = "=0.13.1", features = ["macros"] }

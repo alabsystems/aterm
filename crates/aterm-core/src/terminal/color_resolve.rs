@@ -24,8 +24,11 @@ use std::sync::OnceLock;
 ///   keeps bold a pure weight change.
 /// * `faint_opacity` — how much of the foreground SGR 2 (dim/faint) retains,
 ///   `0.0..=1.0`. The fg is blended toward the CELL background in linear
-///   light by this fraction (see [`dim_toward_bg`]), so faint text recedes on
-///   both dark and light themes. Defaults to [`DIM_FACTOR`] (0.5).
+///   light by at least this fraction, raised where needed so faint text keeps
+///   `contrast^opacity` and a readable `9^opacity` (3:1 at the default)
+///   capped below the colour's own contrast (see [`dim_toward_bg`]). Faint
+///   text recedes on both dark and light themes. Defaults to [`DIM_FACTOR`]
+///   (0.5).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StyleResolveOpts {
     /// SGR 1 promotes indexed 0–7 to bright 8–15 (default `true`).
@@ -41,35 +44,6 @@ impl Default for StyleResolveOpts {
             faint_opacity: DIM_FACTOR,
         }
     }
-}
-
-/// Resolve the foreground RGB color for a cell, applying all style attributes.
-///
-/// Applies in order: raw lookup -> bold-to-bright -> dim -> inverse -> hidden.
-/// `extra` carries the RGB colors; `reverse_video` is DECSCNM (DECSET 5).
-#[must_use]
-#[cfg(test)]
-pub fn resolve_fg_color(
-    cell: &Cell,
-    extra: Option<&CellExtra>,
-    palette: &ColorPalette,
-    default_fg: Rgb,
-    default_bg: Rgb,
-    reverse_video: bool,
-) -> Rgb {
-    let fg_rgb = extra.and_then(CellExtra::fg_rgb);
-    let bg_rgb = extra.and_then(CellExtra::bg_rgb);
-    let (fg, _) = resolve_both(
-        *cell,
-        fg_rgb,
-        bg_rgb,
-        palette,
-        default_fg,
-        default_bg,
-        reverse_video,
-        StyleResolveOpts::default(),
-    );
-    fg
 }
 
 /// Resolve both foreground and background colors for a cell.
@@ -337,16 +311,26 @@ fn linear_to_srgb_with(tables: &TransferTables, l: f32) -> u8 {
 /// `1.0` returns `fg` unchanged, `0.0` lands on `bg` (invisible). The blend is
 /// per-channel in linear light, so the result's WCAG relative luminance is
 /// the linear interpolation `L(dim) = L(bg) + m·(L(fg) − L(bg))` (up to u8
-/// quantization), where the mix `m` is `opacity` raised, when needed, so the
-/// faint text keeps at least `opacity` of the fg's contrast in log space:
-/// `contrast(dim, bg) >= contrast(fg, bg)^opacity` ([`faint_mix`]).
+/// quantization), where the mix `m` is `opacity` raised, when needed, to
+/// reach [`faint_target`] ([`faint_mix`]). With `C = contrast(fg, bg)` and
+/// `t = opacity`, the target is the largest of two floors:
 ///
-/// The floor is what makes one opacity read alike on both polarities. A
+/// * the log-share floor `C^t`: faint keeps `t` of the contrast in log
+///   space, which dominates for body text;
+/// * the readable floor `9^t` (3:1 at the default 0.5, 1:1 at 0), capped by
+///   the recession ceiling `C^((1+t)/2)` so faint never reaches the colour's
+///   own contrast. It applies only where `C >= 1.25`; below that the pair is
+///   not legible text either way.
+///
+/// The floors are what make one opacity read alike on both polarities. A
 /// luminance lerp halves light ink on a dark ground and keeps most of its
 /// contrast (16.4:1 → 8.7:1 on Aterm Night), but on a light ground it lands
-/// dark ink in the mid-greys, where the ratio collapses (14.4:1 → 1.9:1 on
-/// Aterm Day): the floor holds that to 3.8:1. It only ever raises the mix,
-/// so a dark theme's faint ink (already above its floor) is unchanged.
+/// dark ink in the mid-greys, where the ratio collapses (14.35:1 → 1.9:1
+/// for Aterm Day's fg). At the default 0.5, Aterm Day's fg goes 14.35:1 →
+/// 3.78:1 (the log share), colour 7 goes 5.76:1 → 3.0:1 (the readable
+/// floor) and colour 8 goes 3.50:1 → 2.57:1 (the ceiling). The floors only
+/// ever raise the mix, so a dark theme's faint ink, already above them,
+/// is unchanged except on its low-contrast slots.
 ///
 /// # Invariant (proven)
 ///
@@ -384,25 +368,68 @@ pub fn dim_toward_bg(fg: Rgb, bg: Rgb, opacity: f32) -> Rgb {
     }
 }
 
+/// SGR 2's readable floor is `FAINT_FLOOR_BASE^opacity`: 3:1 at the
+/// default 0.5 (WCAG's non-text and large-text bar), 1:1 at 0.
+const FAINT_FLOOR_BASE: f32 = 9.0;
+
+/// Below this undimmed contrast the pair is not legible text, normal or
+/// faint; only the log-share floor applies. Raising such a pair's mix would
+/// only amplify cross-hue u8 quantization.
+const FAINT_FLOOR_MIN_CONTRAST: f32 = 1.25;
+
+/// The contrast SGR 2 aims for when the undimmed pair has contrast `full`
+/// (>= 1) at opacity `t` (in `0..1`): the larger of the log-share floor
+/// `full^t` and the readable floor `FAINT_FLOOR_BASE^t`, the latter capped
+/// at `full^((1+t)/2)` so faint keeps at most `(1+t)/2` of the contrast in
+/// log space and always stays fainter than the colour itself.
+fn faint_target(full: f32, t: f32) -> f32 {
+    let share = full.powf(t);
+    if full < FAINT_FLOOR_MIN_CONTRAST {
+        return share;
+    }
+    share.max(
+        FAINT_FLOOR_BASE
+            .powf(t)
+            .min(full.powf(f32::midpoint(1.0, t))),
+    )
+}
+
 /// The linear-light mix SGR 2 uses for an fg of relative luminance `lf` on
 /// a bg of `lb` at `opacity` (already in `0..=1`): `opacity`, raised to the
-/// smallest mix whose WCAG contrast reaches `contrast(fg, bg)^opacity`.
-/// Theme-independent and bounded: the result stays in `opacity..=1`, `0`
-/// stays invisible and `1` stays the fg, and since the luminance is a lerp
-/// in the mix the floor is solved exactly rather than searched.
+/// smallest mix whose WCAG contrast reaches [`faint_target`] — the larger
+/// of the log-share floor `contrast^opacity` and the readable floor
+/// `9^opacity` capped at `contrast^((1+opacity)/2)`. Theme-independent and
+/// bounded: the result stays in `opacity..=1`, `0` stays invisible and `1`
+/// stays the fg, and since the luminance is a lerp in the mix the floor is
+/// solved exactly rather than searched.
 fn faint_mix(lf: f32, lb: f32, opacity: f32) -> f32 {
-    // Endpoints need no floor. For light ink on a darker ground, the
-    // ordinary mix already has contrast 1 + t * (full - 1) >= full.powf(t)
-    // by weighted AM-GM, so keep that common path free of per-cell powf.
-    if opacity <= 0.0 || opacity >= 1.0 || lf >= lb {
+    if opacity <= 0.0 || opacity >= 1.0 {
         return opacity;
     }
     let (hi, lo) = (lf.max(lb), lf.min(lb));
-    let full = (hi + 0.05) / (lo + 0.05);
     if hi - lo <= f32::EPSILON {
         return opacity;
     }
-    let target = full.powf(opacity);
+    let full = (hi + 0.05) / (lo + 0.05);
+    // Light ink at 9:1 or more: the lerp's contrast 1 + t(full - 1) is at
+    // least 1 + 8t >= 9^t (the chord of a convex function) and at least
+    // full^t (weighted AM-GM), so it already meets the target. This keeps
+    // dark-theme body text free of per-cell powf.
+    if lf >= lb && full >= FAINT_FLOOR_BASE {
+        return opacity;
+    }
+    let target = faint_target(full, opacity);
+    // The contrast the plain mix already has. Skipping the solve when that
+    // is enough keeps light ink clear of the solve's f32 cancellation,
+    // which could otherwise nudge a channel across a quantizer boundary.
+    let at_t = if lf >= lb {
+        1.0 + opacity * (full - 1.0)
+    } else {
+        (lb + 0.05) / (lb + opacity * (lf - lb) + 0.05)
+    };
+    if at_t >= target {
+        return opacity;
+    }
     // The luminance the faint ink needs to reach `target` against `lb`.
     let needed = if lf < lb {
         (lb + 0.05) / target - 0.05
@@ -459,11 +486,15 @@ fn raw_resolve(
 ///   `contrast(fg,bg) >= 1.05`, within `+0.005` (one u8 step of luminance)
 ///   for near-iso-luminant pairs, over a dense 8³-per-color lattice.
 ///
-/// A gamma-space multiply toward black is the negative control: it raises
-/// contrast for dark-on-light text.
+/// The faint floors are checked here too: faint reaches its target (within
+/// u8 quantization), stays strictly fainter than its colour, and never mixes
+/// less than `opacity`. Each floor term has a negative control showing what
+/// goes wrong without it, and a gamma-space multiply toward black is the
+/// negative control for the law itself: it raises contrast for dark-on-light
+/// text.
 #[cfg(test)]
 mod dim_contrast_law {
-    use super::{dim_toward_bg, srgb_to_linear};
+    use super::{dim_toward_bg, faint_target, srgb_to_linear};
     use aterm_types::Rgb;
 
     fn luminance(c: Rgb) -> f32 {
@@ -476,6 +507,83 @@ mod dim_contrast_law {
     }
 
     const OPACITIES: [f32; 5] = [0.0, 0.25, 0.5, 0.75, 1.0];
+
+    /// The interior opacities the lattice tests sweep.
+    const INTERIOR: [f32; 3] = [0.25, 0.5, 0.75];
+
+    /// The 8-values-per-channel lattice: 512 colours, 262k ordered pairs.
+    fn lattice() -> Vec<Rgb> {
+        let vals: Vec<u8> = (0..8u16).map(|i| (i * 255 / 7) as u8).collect();
+        let mut colors = Vec::with_capacity(512);
+        for &r in &vals {
+            for &g in &vals {
+                for &b in &vals {
+                    colors.push(Rgb { r, g, b });
+                }
+            }
+        }
+        colors
+    }
+
+    /// The plain linear-light lerp at mix `m`, quantized like the engine.
+    fn blend(fg: Rgb, bg: Rgb, m: f32) -> Rgb {
+        let channel = |f: u8, b: u8| {
+            let (lf, lb) = (srgb_to_linear(f), srgb_to_linear(b));
+            super::linear_to_srgb(lb + (lf - lb) * m)
+        };
+        Rgb {
+            r: channel(fg.r, bg.r),
+            g: channel(fg.g, bg.g),
+            b: channel(fg.b, bg.b),
+        }
+    }
+
+    /// A reference faint ink: the engine's shape (light ink at 9:1 or more
+    /// keeps the lerp, the plain mix is kept when it already reaches the
+    /// target, else the exact solve), with the target supplied by the
+    /// caller so a control can swap one term out.
+    fn faint_with(fg: Rgb, bg: Rgb, t: f32, target: impl Fn(f32, f32) -> f32) -> Rgb {
+        let (lf, lb) = (luminance(fg), luminance(bg));
+        let (hi, lo) = (lf.max(lb), lf.min(lb));
+        if t <= 0.0 || t >= 1.0 || hi - lo <= f32::EPSILON {
+            return blend(fg, bg, t);
+        }
+        let full = (hi + 0.05) / (lo + 0.05);
+        if lf >= lb && full >= 9.0 {
+            return blend(fg, bg, t);
+        }
+        let target = target(full, t);
+        let at_t = if lf >= lb {
+            1.0 + t * (full - 1.0)
+        } else {
+            (lb + 0.05) / (lb + t * (lf - lb) + 0.05)
+        };
+        if at_t >= target {
+            return blend(fg, bg, t);
+        }
+        let needed = if lf < lb {
+            (lb + 0.05) / target - 0.05
+        } else {
+            target * (lb + 0.05) - 0.05
+        };
+        blend(fg, bg, t.max(((needed - lb) / (lf - lb)).clamp(0.0, 1.0)))
+    }
+
+    /// The faint target without the `C >= 1.25` gate (a control).
+    fn ungated_target(full: f32, t: f32) -> f32 {
+        full.powf(t)
+            .max(9f32.powf(t).min(full.powf(f32::midpoint(1.0, t))))
+    }
+
+    /// The pre-floor target: the log share alone (a control).
+    fn share_target(full: f32, t: f32) -> f32 {
+        full.powf(t)
+    }
+
+    /// A readable floor with no recession ceiling: `min(C, 3)` (a control).
+    fn naive_target(full: f32, t: f32) -> f32 {
+        full.powf(t).max(full.min(3.0))
+    }
 
     /// Grayscale: exhaustive over all 256×256 pairs × 5 opacities, exact.
     #[test]
@@ -507,21 +615,21 @@ mod dim_contrast_law {
     /// cross-hue pairs.
     #[test]
     fn dim_reduces_contrast_both_polarities_rgb_lattice() {
-        let vals: Vec<u8> = (0..8u16).map(|i| (i * 255 / 7) as u8).collect();
-        let mut colors = Vec::with_capacity(512);
-        for &r in &vals {
-            for &g in &vals {
-                for &b in &vals {
-                    colors.push(Rgb { r, g, b });
-                }
-            }
-        }
+        let colors = lattice();
         let mut dark_on_light_checked = false;
         let mut light_on_dark_checked = false;
+        let mut ungated_excess = 0u32;
         for &fg in &colors {
             for &bg in &colors {
                 let c0 = contrast(fg, bg);
-                for t in [0.25f32, 0.5] {
+                // Control for FAINT_FLOOR_MIN_CONTRAST: without the gate the
+                // readable floor drives near-iso-luminant cross-hue pairs
+                // toward the fg, where quantization breaks the tolerance.
+                if c0 < 1.25 && contrast(faint_with(fg, bg, 0.75, ungated_target), bg) > c0 + 0.005
+                {
+                    ungated_excess += 1;
+                }
+                for t in INTERIOR {
                     let c1 = contrast(dim_toward_bg(fg, bg, t), bg);
                     if c0 >= 1.05 {
                         assert!(c1 <= c0, "dim raised real contrast: {fg:?}/{bg:?} t={t}");
@@ -545,107 +653,154 @@ mod dim_contrast_law {
             dark_on_light_checked && light_on_dark_checked,
             "non-vacuity"
         );
+        assert!(
+            ungated_excess > 0,
+            "control: the ungated floor must break the quantization bound"
+        );
     }
 
-    /// Faint ink keeps a readable share of its contrast on both polarities:
-    /// at the default opacity the floor `contrast(fg)^opacity` holds for
-    /// the light signature and Default themes (3:1 or more), where the bare
-    /// linear-light lerp (the negative control) falls to under 2:1; on a
-    /// dark theme the lerp is already above the floor, so faint ink there is
-    /// exactly the lerp.
+    /// Faint ink stays readable on the light themes: at the default opacity
+    /// the fg and every palette slot reach their target (within u8
+    /// quantization), so any colour at 4.4:1 or more is at about 3:1 faint,
+    /// and each stays fainter than its colour. Controls: the bare lerp drops
+    /// the fg under 2:1, and the pre-floor log share alone leaves Aterm
+    /// Day's colour 7 under 2.5:1. On a dark theme the fg is at 9:1 or more
+    /// and keeps exactly the lerp.
     #[test]
     fn faint_keeps_its_share_of_contrast_on_light_themes() {
         use super::faint_mix;
-        let lerp = |fg: Rgb, bg: Rgb, t: f32| {
-            let mix = |f: u8, b: u8| {
-                let (lf, lb) = (srgb_to_linear(f), srgb_to_linear(b));
-                super::linear_to_srgb(lb + (lf - lb) * t)
-            };
-            Rgb {
-                r: mix(fg.r, bg.r),
-                g: mix(fg.g, bg.g),
-                b: mix(fg.b, bg.b),
-            }
-        };
         let t = aterm_types::DIM_FACTOR;
+        let mut floored = 0u32;
         for name in ["Aterm Day", "Linen", "Default Light"] {
             let scheme = aterm_types::scheme::builtin(name).expect("built-in");
             let (fg, bg) = (scheme.foreground, scheme.background);
-            let faint = contrast(dim_toward_bg(fg, bg, t), bg);
-            assert!(faint >= 3.0, "{name}: faint text at {faint}:1");
-            // Quantization may round a hair under the exact floor.
-            assert!(faint >= contrast(fg, bg).powf(t) - 0.02, "{name}: {faint}");
-            assert!(faint < contrast(fg, bg), "{name}: faint still recedes");
             assert!(
-                contrast(lerp(fg, bg, t), bg) < 2.0,
+                contrast(blend(fg, bg, t), bg) < 2.0,
                 "{name}: control, the bare lerp is what was weak"
             );
+            for (slot, ink) in std::iter::once(fg).chain(scheme.ansi).enumerate() {
+                let full = contrast(ink, bg);
+                if full < 1.25 {
+                    continue;
+                }
+                let faint = contrast(dim_toward_bg(ink, bg, t), bg);
+                let target = faint_target(full, t);
+                assert!(faint >= target * 0.98, "{name} #{slot}: {faint} < {target}");
+                assert!(faint < full, "{name} #{slot}: faint still recedes");
+                if full >= 4.4 {
+                    assert!(faint >= 2.94, "{name} #{slot}: faint at {faint}:1");
+                }
+                if target > full.powf(t) + 0.01 {
+                    floored += 1;
+                }
+            }
         }
+        assert!(
+            floored > 10,
+            "non-vacuity: the readable floor binds on palettes"
+        );
+        let day = aterm_types::scheme::builtin("Aterm Day").expect("built-in");
+        let (seven, bg) = (day.ansi[7], day.background);
+        assert!(
+            contrast(faint_with(seven, bg, t, share_target), bg) < 2.5,
+            "control: the log share alone leaves colour 7 under 2.5:1"
+        );
+        assert!(contrast(dim_toward_bg(seven, bg, t), bg) >= 2.94);
         for name in ["Aterm Night", "Hearth", "Default"] {
             let scheme = aterm_types::scheme::builtin(name).expect("built-in");
             let (fg, bg) = (scheme.foreground, scheme.background);
-            assert_eq!(dim_toward_bg(fg, bg, t), lerp(fg, bg, t), "{name}");
+            assert!(
+                luminance(fg) > luminance(bg) && contrast(fg, bg) >= 9.0,
+                "{name}"
+            );
+            assert_eq!(dim_toward_bg(fg, bg, t), blend(fg, bg, t), "{name}");
         }
         // The ends stay put: invisible at 0, the fg at 1.
         assert!(faint_mix(0.02, 0.9, 0.0).abs() < f32::EPSILON);
         assert!((faint_mix(0.02, 0.9, 1.0) - 1.0).abs() < f32::EPSILON);
     }
 
-    /// Light ink keeps the pre-floor linear-light bytes; dark ink retains
-    /// the complete contrast-floor formula. Compare actual public outputs,
-    /// including quantization, rather than merely the real-number law.
+    /// Faint is strictly fainter than its colour wherever the pair is text
+    /// (`C >= 1.25`), and the readable floor never lifts it past the
+    /// recession ceiling `C^((1+t)/2)`. Control: a floor of `min(C, 3)`
+    /// with no ceiling leaves some such pair un-dimmed.
     #[test]
-    fn faint_fast_paths_keep_their_polarity_references() {
-        let linear = |fg: Rgb, bg: Rgb, t: f32| {
-            let channel = |f: u8, b: u8| {
-                let (lf, lb) = (srgb_to_linear(f), srgb_to_linear(b));
-                super::linear_to_srgb(lb + (lf - lb) * t)
-            };
-            Rgb {
-                r: channel(fg.r, bg.r),
-                g: channel(fg.g, bg.g),
-                b: channel(fg.b, bg.b),
-            }
-        };
-        let floored = |fg: Rgb, bg: Rgb, t: f32| {
-            let (lf, lb) = (luminance(fg), luminance(bg));
-            let (hi, lo) = (lf.max(lb), lf.min(lb));
-            let mix = if hi - lo <= f32::EPSILON {
-                t
-            } else {
-                let target = ((hi + 0.05) / (lo + 0.05)).powf(t);
-                let needed = if lf < lb {
-                    (lb + 0.05) / target - 0.05
-                } else {
-                    target * (lb + 0.05) - 0.05
-                };
-                t.max(((needed - lb) / (lf - lb)).clamp(0.0, 1.0))
-            };
-            let channel = |f: u8, b: u8| {
-                let (lf, lb) = (srgb_to_linear(f), srgb_to_linear(b));
-                super::linear_to_srgb(lb + (lf - lb) * mix)
-            };
-            Rgb {
-                r: channel(fg.r, bg.r),
-                g: channel(fg.g, bg.g),
-                b: channel(fg.b, bg.b),
-            }
-        };
-        let mut colors = Vec::with_capacity(512);
-        for r in 0..8u16 {
-            for g in 0..8u16 {
-                for b in 0..8u16 {
-                    colors.push(Rgb {
-                        r: (r * 255 / 7) as u8,
-                        g: (g * 255 / 7) as u8,
-                        b: (b * 255 / 7) as u8,
-                    });
+    fn faint_stays_fainter_than_its_colour() {
+        let colors = lattice();
+        let (mut floor_binds, mut naive_undimmed) = (0u32, 0u32);
+        for &fg in &colors {
+            for &bg in &colors {
+                let full = contrast(fg, bg);
+                if full < 1.25 {
+                    continue;
+                }
+                for t in INTERIOR {
+                    let faint = contrast(dim_toward_bg(fg, bg, t), bg);
+                    assert!(faint < full, "fg={fg:?} bg={bg:?} t={t}: {faint} >= {full}");
+                    let cap = contrast(blend(fg, bg, t), bg).max(full.powf(f32::midpoint(1.0, t)));
+                    assert!(
+                        faint <= cap * 1.02,
+                        "fg={fg:?} bg={bg:?} t={t}: {faint} > {cap}"
+                    );
+                    if faint_target(full, t) > full.powf(t) + 0.01 {
+                        floor_binds += 1;
+                    }
+                    if full <= 3.0 && contrast(faint_with(fg, bg, t, naive_target), bg) >= full {
+                        naive_undimmed += 1;
+                    }
                 }
             }
         }
+        assert!(floor_binds > 10_000, "non-vacuity: {floor_binds}");
+        assert!(
+            naive_undimmed > 0,
+            "control: the ceiling must be load-bearing"
+        );
+    }
+
+    /// The faint mix is never below `opacity`, so the luminance distance it
+    /// keeps is at least `t` of the colour's (within one u8 step): the
+    /// premise of matrix rain's plain-blend bound.
+    #[test]
+    fn faint_mix_never_drops_below_opacity() {
+        let colors = lattice();
+        let mut raised = 0u32;
+        for &fg in &colors {
+            for &bg in &colors {
+                let (lf, lb) = (luminance(fg), luminance(bg));
+                for t in INTERIOR {
+                    let ld = luminance(dim_toward_bg(fg, bg, t));
+                    assert!(
+                        (ld - lb).abs() >= t * (lf - lb).abs() - 0.005,
+                        "fg={fg:?} bg={bg:?} t={t}"
+                    );
+                    if (ld - lb).abs() > t * (lf - lb).abs() + 0.01 {
+                        raised += 1;
+                    }
+                }
+            }
+        }
+        assert!(raised > 10_000, "non-vacuity: the floors raise the mix");
+    }
+
+    /// The engine's shortcuts keep their reference bytes: light ink at 9:1
+    /// or more, and any pair whose plain mix already reaches the target,
+    /// keep the linear-light lerp; every other pair gets the exact floor
+    /// solve. Compares public outputs, quantization included, against a
+    /// reference written from the rule.
+    #[test]
+    fn faint_fast_paths_keep_their_polarity_references() {
+        let rule = |full: f32, t: f32| {
+            if full < 1.25 {
+                return full.powf(t);
+            }
+            full.powf(t)
+                .max(9f32.powf(t).min(full.powf(f32::midpoint(1.0, t))))
+        };
+        let colors = lattice();
         // The old floor's f32 cancellation could push this light-ink pair
         // past a blue-channel quantizer boundary. It must remain the ordinary
-        // linear result, as it was before the light-theme floor was added.
+        // linear result, which it now reaches through the at_t shortcut.
         let fg = Rgb {
             r: 109,
             g: 255,
@@ -657,24 +812,37 @@ mod dim_contrast_law {
             b: 182,
         };
         assert!(luminance(fg) > luminance(bg));
-        assert_eq!(dim_toward_bg(fg, bg, 0.75), linear(fg, bg, 0.75));
-        let (mut light_ink, mut dark_ink) = (0, 0);
+        assert_eq!(dim_toward_bg(fg, bg, 0.75), blend(fg, bg, 0.75));
+        let (mut light_ink, mut dark_ink, mut light_floored) = (0, 0, 0);
         for &fg in &colors {
             for &bg in &colors {
                 assert_eq!(dim_toward_bg(fg, bg, 0.0), bg);
                 assert_eq!(dim_toward_bg(fg, bg, 1.0), fg);
-                let lighter = luminance(fg) >= luminance(bg);
-                for t in [0.25, 0.5, 0.75] {
-                    let expected = if lighter {
-                        linear(fg, bg, t)
+                let (lf, lb) = (luminance(fg), luminance(bg));
+                let lighter = lf >= lb;
+                let full = (lf.max(lb) + 0.05) / (lf.min(lb) + 0.05);
+                for t in INTERIOR {
+                    let at_t = if lighter {
+                        1.0 + t * (full - 1.0)
                     } else {
-                        floored(fg, bg, t)
+                        (lb + 0.05) / (lb + t * (lf - lb) + 0.05)
+                    };
+                    let plain = (lighter && full >= 9.0)
+                        || at_t >= rule(full, t)
+                        || (lf - lb).abs() <= f32::EPSILON;
+                    let expected = if plain {
+                        blend(fg, bg, t)
+                    } else {
+                        faint_with(fg, bg, t, rule)
                     };
                     assert_eq!(
                         dim_toward_bg(fg, bg, t),
                         expected,
                         "fg={fg:?} bg={bg:?} t={t}"
                     );
+                    if lighter && !plain {
+                        light_floored += 1;
+                    }
                 }
                 if lighter {
                     light_ink += 1;
@@ -686,6 +854,10 @@ mod dim_contrast_law {
         assert!(
             light_ink > 100_000 && dark_ink > 100_000,
             "non-vacuity: both full RGB lattices"
+        );
+        assert!(
+            light_floored > 0,
+            "non-vacuity: light ink can now be floored"
         );
     }
 
@@ -764,145 +936,87 @@ mod tests {
         }
     }
 
-    fn cell_with_flags(flags: CellFlags) -> Cell {
+    /// A cell with `flags` and a foreground that is the default (`None`), an
+    /// indexed color or an RGB triple, resolved through the shipping wrapper.
+    fn resolve(
+        fg: Option<Result<u8, [u8; 3]>>,
+        flags: CellFlags,
+        default_bg: Rgb,
+        reverse_video: bool,
+    ) -> (Rgb, Rgb) {
         let mut cell = Cell::default();
-        cell.set_flags(flags);
-        cell
-    }
-
-    fn cell_with_indexed_fg(index: u8, flags: CellFlags) -> Cell {
-        let mut cell = Cell::default();
-        cell.set_fg(PackedColor::indexed(index));
-        cell.set_flags(flags);
-        cell
-    }
-
-    fn cell_with_rgb_fg(r: u8, g: u8, b: u8, flags: CellFlags) -> (Cell, CellExtra) {
-        let mut cell = Cell::default();
-        cell.set_fg(PackedColor::rgb(r, g, b));
-        cell.set_flags(flags);
         let mut extra = CellExtra::default();
-        extra.set_fg_rgb(Some([r, g, b]));
-        (cell, extra)
-    }
-
-    #[test]
-    fn test_no_flags_returns_default_colors() {
-        let cell = Cell::default();
-        let pal = palette();
-        let (fg, bg) = resolve_colors(&cell, None, &pal, DEFAULT_FG, DEFAULT_BG, false);
-        assert_eq!(fg, DEFAULT_FG);
-        assert_eq!(bg, DEFAULT_BG);
-    }
-
-    #[test]
-    fn test_dim_ansi_color() {
-        let cell = cell_with_indexed_fg(1, CellFlags::DIM);
-        let pal = palette();
-        let fg = resolve_fg_color(&cell, None, &pal, DEFAULT_FG, DEFAULT_BG, false);
-        // dim is the linear-light blend toward the cell bg (the default
-        // bg here), at the default faint opacity.
-        assert_eq!(fg, dim_toward_bg(pal.get(1), DEFAULT_BG, DIM_FACTOR));
-        // On the black default bg the blend still darkens red text.
-        let raw_red = pal.get(1);
-        assert!(fg.r < raw_red.r, "dim red recedes toward black bg: {fg:?}");
-    }
-
-    #[test]
-    fn test_dim_true_rgb() {
-        let (cell, extra) = cell_with_rgb_fg(200, 100, 50, CellFlags::DIM);
-        let pal = palette();
-        let fg = resolve_fg_color(&cell, Some(&extra), &pal, DEFAULT_FG, DEFAULT_BG, false);
-        let expected = dim_toward_bg(
-            Rgb {
-                r: 200,
-                g: 100,
-                b: 50,
-            },
-            DEFAULT_BG,
-            DIM_FACTOR,
-        );
-        assert_eq!(fg, expected);
-        // Halving in linear light lands brighter than the old gamma-space
-        // multiply (100, 50, 25) — pin the polarity fix's actual output.
-        assert!(
-            fg.r > 100,
-            "linear-light dim is lighter than gamma dim: {fg:?}"
-        );
-    }
-
-    /// On a light background, dim makes text lighter (receding toward bg), not
-    /// darker, unlike a gamma-space multiply toward black.
-    #[test]
-    fn test_dim_recedes_on_light_theme() {
-        let (cell, extra) = cell_with_rgb_fg(40, 40, 40, CellFlags::DIM);
-        let pal = palette();
-        let light_bg = Rgb {
-            r: 240,
-            g: 240,
-            b: 240,
-        };
-        // The cell sets no bg, so the light default bg is what it sits on —
-        // and therefore the blend target.
-        let fg = resolve_fg_color(&cell, Some(&extra), &pal, DEFAULT_FG, light_bg, false);
-        assert!(
-            fg.r > 40 && fg.g > 40 && fg.b > 40,
-            "dim dark-on-light text must move TOWARD the light bg (got {fg:?})"
-        );
-        // And the old behavior (multiply toward black) is the negative control:
-        let old = Rgb {
-            r: 20,
-            g: 20,
-            b: 20,
-        };
-        assert_ne!(fg, old, "the gamma-multiply polarity bug must be gone");
-    }
-
-    #[test]
-    fn test_bold_promotes_ansi_to_bright() {
-        let cell = cell_with_indexed_fg(3, CellFlags::BOLD);
-        let pal = palette();
-        let fg = resolve_fg_color(&cell, None, &pal, DEFAULT_FG, DEFAULT_BG, false);
-        assert_eq!(fg, pal.get(11));
-    }
-
-    #[test]
-    fn test_bold_no_change_already_bright() {
-        let cell = cell_with_indexed_fg(10, CellFlags::BOLD);
-        let pal = palette();
-        let fg = resolve_fg_color(&cell, None, &pal, DEFAULT_FG, DEFAULT_BG, false);
-        assert_eq!(fg, pal.get(10));
-    }
-
-    #[test]
-    fn test_bold_no_change_true_rgb() {
-        let (cell, extra) = cell_with_rgb_fg(100, 200, 50, CellFlags::BOLD);
-        let pal = palette();
-        let fg = resolve_fg_color(&cell, Some(&extra), &pal, DEFAULT_FG, DEFAULT_BG, false);
-        assert_eq!(
-            fg,
-            Rgb {
-                r: 100,
-                g: 200,
-                b: 50
+        match fg {
+            None => {}
+            Some(Ok(index)) => cell.set_fg(PackedColor::indexed(index)),
+            Some(Err([r, g, b])) => {
+                cell.set_fg(PackedColor::rgb(r, g, b));
+                extra.set_fg_rgb(Some([r, g, b]));
             }
-        );
+        }
+        cell.set_flags(flags);
+        resolve_colors(
+            &cell,
+            Some(&extra),
+            &palette(),
+            DEFAULT_FG,
+            default_bg,
+            reverse_video,
+        )
     }
 
+    /// Style attributes apply in order: raw lookup, bold-to-bright, dim (a blend
+    /// toward the cell's bg), inverse, hidden; DECSCNM reverses the pair.
     #[test]
-    fn test_bold_dim_dim_wins() {
-        let cell = cell_with_indexed_fg(1, CellFlags::BOLD.union(CellFlags::DIM));
+    fn style_attributes_resolve_in_order() {
         let pal = palette();
-        let fg = resolve_fg_color(&cell, None, &pal, DEFAULT_FG, DEFAULT_BG, false);
-        let expected = dim_toward_bg(pal.get(1), DEFAULT_BG, DIM_FACTOR);
-        assert_eq!(fg, expected);
+        let light_bg = Rgb::new(240, 240, 240);
+        let rgb = Rgb::new(200, 100, 50);
+        let dim = |c: Rgb, bg: Rgb| dim_toward_bg(c, bg, DIM_FACTOR);
+        let all = CellFlags::BOLD
+            .union(CellFlags::DIM)
+            .union(CellFlags::INVERSE)
+            .union(CellFlags::HIDDEN);
+        #[rustfmt::skip]
+        let cases: [(&str, Option<Result<u8, [u8; 3]>>, CellFlags, Rgb, bool, (Rgb, Rgb)); 14] = [
+            ("plain", None, CellFlags::empty(), DEFAULT_BG, false, (DEFAULT_FG, DEFAULT_BG)),
+            ("custom bg", None, CellFlags::empty(), light_bg, false, (DEFAULT_FG, light_bg)),
+            ("dim ansi", Some(Ok(1)), CellFlags::DIM, DEFAULT_BG, false, (dim(pal.get(1), DEFAULT_BG), DEFAULT_BG)),
+            ("dim rgb", Some(Err([200, 100, 50])), CellFlags::DIM, DEFAULT_BG, false, (dim(rgb, DEFAULT_BG), DEFAULT_BG)),
+            ("dim on light", Some(Err([40, 40, 40])), CellFlags::DIM, light_bg, false, (dim(Rgb::new(40, 40, 40), light_bg), light_bg)),
+            ("bold promotes", Some(Ok(3)), CellFlags::BOLD, DEFAULT_BG, false, (pal.get(11), DEFAULT_BG)),
+            ("bold bright", Some(Ok(10)), CellFlags::BOLD, DEFAULT_BG, false, (pal.get(10), DEFAULT_BG)),
+            ("bold rgb", Some(Err([200, 100, 50])), CellFlags::BOLD, DEFAULT_BG, false, (rgb, DEFAULT_BG)),
+            ("bold+dim", Some(Ok(1)), CellFlags::BOLD.union(CellFlags::DIM), DEFAULT_BG, false, (dim(pal.get(1), DEFAULT_BG), DEFAULT_BG)),
+            ("inverse", None, CellFlags::INVERSE, DEFAULT_BG, false, (DEFAULT_BG, DEFAULT_FG)),
+            ("decscnm", None, CellFlags::empty(), DEFAULT_BG, true, (DEFAULT_BG, DEFAULT_FG)),
+            ("decscnm+inverse", None, CellFlags::INVERSE, DEFAULT_BG, true, (DEFAULT_FG, DEFAULT_BG)),
+            ("hidden", None, CellFlags::HIDDEN, DEFAULT_BG, false, (DEFAULT_BG, DEFAULT_BG)),
+            ("hidden+inverse", None, CellFlags::HIDDEN.union(CellFlags::INVERSE), DEFAULT_BG, false, (DEFAULT_FG, DEFAULT_FG)),
+        ];
+        for (name, fg, flags, bg, reverse, want) in cases {
+            assert_eq!(resolve(fg, flags, bg, reverse), want, "{name}");
+        }
+        let dimmed = dim(pal.get(2), DEFAULT_BG);
+        assert_eq!(
+            resolve(Some(Ok(2)), all, DEFAULT_BG, false),
+            (dimmed, dimmed),
+            "every flag at once"
+        );
+        let (on_light, _) = resolve(Some(Err([40, 40, 40])), CellFlags::DIM, light_bg, false);
+        assert!(
+            on_light.r > 40,
+            "dim dark-on-light text moves TOWARD the light bg, not toward black: {on_light:?}"
+        );
     }
 
     /// `bold_is_bright = false` keeps SGR 1 a pure weight change: indexed 0–7
-    /// fg is not promoted to its bright sibling. The default (true) promotes.
+    /// fg is not promoted to its bright sibling.
     #[test]
     fn test_bold_is_bright_off_keeps_base_color() {
-        let cell = cell_with_indexed_fg(3, CellFlags::BOLD);
+        let mut cell = Cell::default();
+        cell.set_fg(PackedColor::indexed(3));
+        cell.set_flags(CellFlags::BOLD);
         let pal = palette();
         let opts_off = StyleResolveOpts {
             bold_is_bright: false,
@@ -912,110 +1026,5 @@ mod tests {
             &cell, None, None, &pal, DEFAULT_FG, DEFAULT_BG, false, opts_off,
         );
         assert_eq!(fg, pal.get(3), "no promotion when the policy is off");
-        let (fg_on, _) = resolve_colors_raw_opts(
-            &cell,
-            None,
-            None,
-            &pal,
-            DEFAULT_FG,
-            DEFAULT_BG,
-            false,
-            StyleResolveOpts::default(),
-        );
-        assert_eq!(fg_on, pal.get(11), "default policy still promotes");
-    }
-
-    #[test]
-    fn test_inverse_swaps_colors() {
-        let cell = cell_with_flags(CellFlags::INVERSE);
-        let pal = palette();
-        let (fg, bg) = resolve_colors(&cell, None, &pal, DEFAULT_FG, DEFAULT_BG, false);
-        assert_eq!(fg, DEFAULT_BG);
-        assert_eq!(bg, DEFAULT_FG);
-    }
-
-    #[test]
-    fn test_decscnm_reverses() {
-        let cell = Cell::default();
-        let pal = palette();
-        let (fg, bg) = resolve_colors(&cell, None, &pal, DEFAULT_FG, DEFAULT_BG, true);
-        assert_eq!(fg, DEFAULT_BG);
-        assert_eq!(bg, DEFAULT_FG);
-    }
-
-    #[test]
-    fn test_decscnm_plus_inverse_cancel() {
-        let cell = cell_with_flags(CellFlags::INVERSE);
-        let pal = palette();
-        let (fg, bg) = resolve_colors(&cell, None, &pal, DEFAULT_FG, DEFAULT_BG, true);
-        assert_eq!(fg, DEFAULT_FG);
-        assert_eq!(bg, DEFAULT_BG);
-    }
-
-    #[test]
-    fn test_hidden_fg_equals_bg() {
-        let cell = cell_with_flags(CellFlags::HIDDEN);
-        let pal = palette();
-        let (fg, bg) = resolve_colors(&cell, None, &pal, DEFAULT_FG, DEFAULT_BG, false);
-        assert_eq!(fg, bg);
-        assert_eq!(fg, DEFAULT_BG);
-    }
-
-    #[test]
-    fn test_hidden_plus_inverse() {
-        let cell = cell_with_flags(CellFlags::HIDDEN.union(CellFlags::INVERSE));
-        let pal = palette();
-        let (fg, bg) = resolve_colors(&cell, None, &pal, DEFAULT_FG, DEFAULT_BG, false);
-        assert_eq!(fg, DEFAULT_FG);
-        assert_eq!(bg, DEFAULT_FG);
-    }
-
-    #[test]
-    fn test_all_flags_precedence() {
-        let flags = CellFlags::BOLD
-            .union(CellFlags::DIM)
-            .union(CellFlags::INVERSE)
-            .union(CellFlags::HIDDEN);
-        let cell = cell_with_indexed_fg(2, flags);
-        let pal = palette();
-        let (fg, bg) = resolve_colors(&cell, None, &pal, DEFAULT_FG, DEFAULT_BG, false);
-        let dimmed = dim_toward_bg(pal.get(2), DEFAULT_BG, DIM_FACTOR);
-        assert_eq!(fg, dimmed);
-        assert_eq!(bg, dimmed);
-    }
-
-    #[test]
-    fn test_custom_default_colors() {
-        let custom_fg = Rgb {
-            r: 200,
-            g: 200,
-            b: 200,
-        };
-        let custom_bg = Rgb {
-            r: 30,
-            g: 30,
-            b: 30,
-        };
-        let cell = Cell::default();
-        let pal = palette();
-        let (fg, bg) = resolve_colors(&cell, None, &pal, custom_fg, custom_bg, false);
-        assert_eq!(fg, custom_fg);
-        assert_eq!(bg, custom_bg);
-    }
-
-    #[test]
-    fn test_extended_palette_color() {
-        let cell = cell_with_indexed_fg(128, CellFlags::empty());
-        let pal = palette();
-        let fg = resolve_fg_color(&cell, None, &pal, DEFAULT_FG, DEFAULT_BG, false);
-        assert_eq!(fg, pal.get(128));
-        assert_eq!(
-            fg,
-            Rgb {
-                r: 175,
-                g: 0,
-                b: 215
-            }
-        );
     }
 }

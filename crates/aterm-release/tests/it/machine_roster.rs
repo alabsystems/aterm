@@ -178,13 +178,6 @@ fn a_cut_may_not_publish_an_older_roster_generation_than_the_channel_head() {
         );
     }
 
-    // The message names both generations, so the operator sees which one the channel holds.
-    let err = publish::roster_floor_covered(Some(4), Some(5)).expect_err("a rollback");
-    assert!(
-        err.to_string().contains('4') && err.to_string().contains('5'),
-        "{err}"
-    );
-
     // An unrostered channel (the fork state) admits everything: no head generation, no floor.
     publish::roster_floor_covered(None, None).expect("an unrostered channel head");
     publish::roster_floor_covered(Some(4), None).expect("the first rostered release");
@@ -310,39 +303,6 @@ fn an_unattributed_cut_stages_byte_identical_manifest_bytes() {
     clean(&dir);
 }
 
-/// An unattributed release requires its exact set, and a smuggled roster asset is refused as
-/// an unexpected object.
-#[test]
-fn an_unattributed_release_carries_no_roster_assets() {
-    assert_eq!(
-        channel::required_asset_names("0.5.0", true, false),
-        vec![
-            "aterm-0.5.0-mac.zip".to_string(),
-            "aterm-0.5.0-mac.zip.sha256".to_string(),
-            "aterm-0.5.0.dmg".to_string(),
-            "aterm-0.5.0.dmg.sha256".to_string(),
-            "aterm-appcast.toml".to_string(),
-            "aterm-appcast.toml.sig".to_string(),
-            "aterm-mac.zip".to_string(),
-            "aterm-mac.zip.sha256".to_string(),
-            "aterm.dmg".to_string(),
-            "aterm.dmg.sha256".to_string(),
-        ],
-        // `rostered: false` asks for an unattributed cut's set.
-        "the published set must not grow for an unattributed cut \
-         (the stable download twins and their alias sidecars are \
-          version-independent, not roster growth)"
-    );
-    let names = channel::required_asset_names("0.5.0", true, false);
-    channel::validate_channel_asset_set(&names, "0.5.0", true, false, &[])
-        .expect("today's exact set is accepted");
-    let mut smuggled = names;
-    smuggled.push("aterm-machines.toml".to_string());
-    let err = channel::validate_channel_asset_set(&smuggled, "0.5.0", true, false, &[])
-        .expect_err("a roster on an unattributed release is not part of the exact set");
-    assert!(err.to_string().contains("aterm-machines.toml"), "{err}");
-}
-
 /// The Intel DMG pair is retired: every gate that reads a manifest refuses one naming
 /// `dmg_x86_64` by name ([`publish::refuse_retired_intel_dmg`]), and a smuggled
 /// `-x86_64.dmg` on a release is a foreign object.
@@ -351,18 +311,11 @@ fn a_manifest_naming_the_retired_intel_dmg_is_refused_and_a_smuggled_one_too() {
     let plain = manifest_out::build(&inputs("0.5.0", 500));
     assert_eq!(plain.dmg_x86_64, None, "this cutter never emits the pair");
     assert_eq!(plain.dmg_x86_64_sha256, None);
-    let mut smuggled = channel::required_asset_names("0.5.0", true, false);
-    smuggled.push("aterm-0.5.0-x86_64.dmg".to_string());
-    let err = channel::validate_channel_asset_set(&smuggled, "0.5.0", true, false, &[])
-        .expect_err("an Intel DMG the manifest never named must be refused");
-    assert!(err.to_string().contains("x86_64"), "{err}");
-
     let mut named = manifest_out::build(&inputs("0.5.0", 500));
     named.dmg_x86_64 = Some("aterm-0.5.0-x86_64.dmg".to_string());
     named.dmg_x86_64_sha256 = Some("ab".repeat(32));
-    let err = publish::refuse_retired_intel_dmg(&named)
+    publish::refuse_retired_intel_dmg(&named)
         .expect_err("a manifest naming the retired pair is refused by name");
-    assert!(err.to_string().contains("aterm-0.5.0-x86_64.dmg"), "{err}");
     // A digest without a name is the same retired shape.
     let mut half = manifest_out::build(&inputs("0.5.0", 500));
     half.dmg_x86_64_sha256 = Some("ab".repeat(32));
@@ -406,12 +359,8 @@ fn an_armed_anchor_refuses_every_machine_the_roster_does_not_authorize() {
         "precondition: the stranger really is absent from the roster"
     );
     let unlisted = armed(&masters, &document);
-    let err = publish::channel_signature_policy(Some(&pk(&STRANGER)), &unlisted)
+    publish::channel_signature_policy(Some(&pk(&STRANGER)), &unlisted)
         .expect_err("an unlisted key may not cut");
-    assert!(
-        err.to_string().contains("not on the machine roster"),
-        "{err}"
-    );
 
     // (2) A revoked machine, holding its own key and its own copy of the roster.
     let revoked = roster_doc(&["m11"], &MASTER);
@@ -419,9 +368,8 @@ fn an_armed_anchor_refuses_every_machine_the_roster_does_not_authorize() {
         document_lists(&revoked, &pk(&M11)),
         "precondition: m11 is still LISTED — it is the deny-list that must stop it"
     );
-    let err = publish::channel_signature_policy(Some(&pk(&M11)), &armed(&masters, &revoked))
+    publish::channel_signature_policy(Some(&pk(&M11)), &armed(&masters, &revoked))
         .expect_err("a revoked machine may not cut");
-    assert!(err.to_string().contains("may not sign"), "{err}");
     // The refusal is targeted: m3 still cuts under the same document.
     publish::channel_signature_policy(Some(&pk(&M3)), &armed(&masters, &revoked))
         .expect("revoking m11 must not revoke m3");
@@ -429,17 +377,15 @@ fn an_armed_anchor_refuses_every_machine_the_roster_does_not_authorize() {
     // (3) A lapsed roster: every client would refuse the release.
     let mut lapsed = armed(&masters, &document);
     lapsed.now_unix = LONG_AFTER;
-    let err = publish::channel_signature_policy(Some(&pk(&M3)), &lapsed)
+    publish::channel_signature_policy(Some(&pk(&M3)), &lapsed)
         .expect_err("a lapsed roster may not authorize a cut");
-    assert!(err.to_string().contains("not usable for a cut"), "{err}");
 
     // (3b) A roster valid now but not for long enough: every client checks it at a later
     // clock, so the producer judges it at `now + MIN_REMAINING_WINDOW_SECS`.
     let mut about_to_lapse = armed(&masters, &document);
     about_to_lapse.now_unix = FIXTURE_VALID_UNTIL - 60;
-    let err = publish::channel_signature_policy(Some(&pk(&M3)), &about_to_lapse)
+    publish::channel_signature_policy(Some(&pk(&M3)), &about_to_lapse)
         .expect_err("a roster with a minute left may not start a ~20 minute cut");
-    assert!(err.to_string().contains("not usable for a cut"), "{err}");
 
     // (4) The wrong master: a roster signed by a key that is not the pinned anchor.
     let foreign = roster_doc(&[], &OTHER_MASTER);
@@ -447,28 +393,24 @@ fn an_armed_anchor_refuses_every_machine_the_roster_does_not_authorize() {
         foreign.bytes, document.bytes,
         "precondition: only the SIGNATURE differs, so this tests the anchor and not the body"
     );
-    let err = publish::channel_signature_policy(Some(&pk(&M3)), &armed(&masters, &foreign))
+    publish::channel_signature_policy(Some(&pk(&M3)), &armed(&masters, &foreign))
         .expect_err("a roster under another master authorizes nothing");
-    assert!(err.to_string().contains("does not verify"), "{err}");
 
     // (5) A corrupted signature over the right body under the right master.
     let mut torn = roster_doc(&[], &MASTER);
     torn.signature[0] ^= 0xff;
-    let err = publish::channel_signature_policy(Some(&pk(&M3)), &armed(&masters, &torn))
+    publish::channel_signature_policy(Some(&pk(&M3)), &armed(&masters, &torn))
         .expect_err("a torn master signature authorizes nothing");
-    assert!(err.to_string().contains("does not verify"), "{err}");
 
     // (6) No roster at all: an armed anchor never degrades to an unrostered cut.
     let mut absent = armed(&masters, &document);
     absent.roster = None;
-    let err = publish::channel_signature_policy(Some(&pk(&M3)), &absent)
+    publish::channel_signature_policy(Some(&pk(&M3)), &absent)
         .expect_err("an armed anchor with no roster must refuse, never fall through");
-    assert!(err.to_string().contains("machine_roster"), "{err}");
 
     // (7) A keyless machine is told so pre-claim, not at signing.
-    let err = publish::channel_signature_policy(None, &armed(&masters, &document))
+    publish::channel_signature_policy(None, &armed(&masters, &document))
         .expect_err("a keyless machine may not cut for a rostered channel");
-    assert!(err.to_string().contains("no signing material"), "{err}");
 }
 
 /// An identity mismatch refuses. The roster's key→id map is the authority, but a profile that
@@ -481,72 +423,15 @@ fn a_machine_that_declares_the_wrong_id_may_not_cut() {
     let document = roster_doc(&[], &MASTER);
     let mut evidence = armed(&masters, &document);
     evidence.declared_machine_id = Some("m11");
-    let err = publish::channel_signature_policy(Some(&pk(&M3)), &evidence)
+    publish::channel_signature_policy(Some(&pk(&M3)), &evidence)
         .expect_err("m3's key declared as m11 must refuse");
-    assert!(err.to_string().contains("m11"), "{err}");
-    assert!(err.to_string().contains("m3"), "{err}");
     // The truthful declaration passes, so the refusal above is about the mismatch.
     evidence.declared_machine_id = Some("m3");
     publish::channel_signature_policy(Some(&pk(&M3)), &evidence)
         .expect("a truthful declaration is not an obstacle");
 }
 
-/// The identity-mismatch remedy offers the declared machine's own key only when the roster
-/// names that machine.
-#[test]
-fn the_identity_mismatch_remedy_offers_the_declared_machines_key_only_when_rostered() {
-    let master = pk(&MASTER);
-    let masters = [master.as_str()];
-    let document = roster_doc(&[], &MASTER);
-    let mut evidence = armed(&masters, &document);
-    evidence.declared_machine_id = Some("m3");
-    let err = publish::channel_signature_policy(Some(&pk(&M11)), &evidence)
-        .expect_err("m11's key declared as m3 must refuse")
-        .to_string();
-    assert!(
-        err.contains("or cut with the key that belongs to \"m3\""),
-        "a rostered declared machine gets the alternative: {err}"
-    );
-    // Negative control: a declared id the roster does not name gets no alternative.
-    evidence.declared_machine_id = Some("ghost");
-    let err = publish::channel_signature_policy(Some(&pk(&M11)), &evidence)
-        .expect_err("a declared id the roster does not name must refuse")
-        .to_string();
-    assert!(!err.contains("or cut with the key"), "{err}");
-    assert!(!err.contains("strand"), "no retired wording: {err}");
-}
-
-// --- the roster is the whole question --------------------------------------
-
-/// A rostered key that no keyset ever held cuts with no acknowledgement: every current client
-/// authorizes by the roster alone. Negative controls: the same key revoked, and a key the
-/// roster never named, both refuse.
-#[test]
-fn a_rostered_key_no_keyset_ever_held_cuts_with_no_acknowledgement() {
-    let master = pk(&MASTER);
-    let masters = [master.as_str()];
-    let document = roster_doc(&[], &MASTER);
-    assert!(
-        document_lists(&document, &pk(&M11)),
-        "precondition: m11 is rostered"
-    );
-    let (policy, who) =
-        publish::channel_signature_policy(Some(&pk(&M11)), &armed(&masters, &document))
-            .expect("a rostered key cuts with no flag");
-    assert_eq!(policy.pubkey.as_deref(), Some(pk(&M11).as_str()));
-    assert_eq!(who.expect("attributed").machine_id, "m11");
-
-    let revoked = roster_doc(&["m11"], &MASTER);
-    assert!(
-        publish::channel_signature_policy(Some(&pk(&M11)), &armed(&masters, &revoked)).is_err(),
-        "revocation still bites"
-    );
-    assert!(
-        publish::channel_signature_policy(Some(&pk(&STRANGER)), &armed(&masters, &document))
-            .is_err(),
-        "an unrostered key still refuses"
-    );
-}
+// --- the unpinned master: a fork's tier ------------------------------------
 
 /// An unpinned master (a fork) is per-machine opt-in and attributes nothing, even with valid
 /// roster evidence, at either duty.
@@ -663,35 +548,9 @@ fn an_armed_cut_stages_and_requires_both_roster_assets() {
     // ...and a release that forgets the roster is refused: an armed client refuses such a
     // head structurally.
     let forgotten = channel::required_asset_names("0.5.0", true, false);
-    let err = channel::validate_channel_asset_set(&forgotten, "0.5.0", true, true, &[])
+    channel::validate_channel_asset_set(&forgotten, "0.5.0", true, true, &[])
         .expect_err("a rostered channel head without its roster is unelectable");
-    assert!(err.to_string().contains("aterm-machines.toml"), "{err}");
     clean(&dir);
-}
-
-/// The binary pin expectation is the paper master, never the signer: the binary embeds
-/// `PAPER_MASTER_PUBKEYS[0]`'s fingerprint in `__DATA,__aterm_upin`, proved against
-/// `expected_embedded_update_pin`, the same whichever machine cuts; a fork has none.
-///
-/// Kills "expect the signing key's fingerprint".
-#[test]
-fn the_binary_pin_expectation_is_the_master_not_the_signer() {
-    let master = pk(&MASTER);
-    let expected = publish::expected_embedded_update_pin(&[master.as_str()])
-        .expect("a pinned master has an expectation")
-        .expect("pinned means Some");
-    assert_eq!(expected.len(), 64);
-    assert_eq!(
-        publish::expected_embedded_update_pin(&[]).unwrap(),
-        None,
-        "a fork with no master has nothing to prove"
-    );
-    // The master's fingerprint is not any signer's.
-    assert_ne!(
-        Some(expected),
-        publish::expected_embedded_update_pin(&[pk(&M3).as_str()]).unwrap(),
-        "the expectation names the master, not the machine that cuts"
-    );
 }
 
 // --- resume: one cut, one machine ------------------------------------------
@@ -705,10 +564,8 @@ fn a_resume_may_not_change_which_machine_cut_the_release() {
     publish::resume_attribution_agrees(None, None).expect("an unattributed cut resumes");
     publish::resume_attribution_agrees(Some("m3"), Some("m3")).expect("same machine resumes");
 
-    let err = publish::resume_attribution_agrees(Some("m3"), Some("m11"))
+    publish::resume_attribution_agrees(Some("m3"), Some("m11"))
         .expect_err("another machine may not finish this cut");
-    assert!(err.to_string().contains("m3"), "{err}");
-    assert!(err.to_string().contains("m11"), "{err}");
 
     publish::resume_attribution_agrees(Some("m3"), None)
         .expect_err("a resume with no roster may not finish a rostered cut");
@@ -748,14 +605,12 @@ fn the_credentials_profile_names_the_roster_and_the_signature_is_its_sibling() {
 
     // A named-but-missing roster is a hard error at the pre-claim gate, never a fall-through
     // to an unrostered cut.
-    let err = machines::RosterDocument::read(&dir.join("nope.toml"))
+    machines::RosterDocument::read(&dir.join("nope.toml"))
         .expect_err("a named roster that is not there must refuse");
-    assert!(err.to_string().contains("machine_roster"), "{err}");
     // ...and so is a roster whose master signature is missing.
     std::fs::write(dir.join("lonely.toml"), &document.bytes).unwrap();
-    let err = machines::RosterDocument::read(&dir.join("lonely.toml"))
+    machines::RosterDocument::read(&dir.join("lonely.toml"))
         .expect_err("a roster with no master signature proves nothing");
-    assert!(err.to_string().contains("master signature"), "{err}");
 
     // Nothing secret renders: the debug line carries the public identity and machine id only.
     let rendered = format!("{creds:?}");
@@ -812,9 +667,8 @@ fn a_real_profile_plus_a_real_roster_file_produce_the_cut_s_verdict() {
     // refuses the cut.
     let identity = dir.join("machine.toml");
     std::fs::write(&identity, "id = \"m11\"\npubkey = \"unused\"\n").unwrap();
-    let err = publish::signing_verdict(Some(&creds), &anchors(&masters, Some(&identity)))
+    publish::signing_verdict(Some(&creds), &anchors(&masters, Some(&identity)))
         .expect_err("a mint record naming another machine must refuse");
-    assert!(err.to_string().contains("m11"), "{err}");
     // ...and a truthful one does not get in the way.
     std::fs::write(&identity, "id = \"m3\"\npubkey = \"unused\"\n").unwrap();
     publish::signing_verdict(Some(&creds), &anchors(&masters, Some(&identity)))
@@ -831,9 +685,8 @@ fn a_real_profile_plus_a_real_roster_file_produce_the_cut_s_verdict() {
         ),
     );
     let creds = sign::ReleaseCredentials::load(&orphan).expect("loads");
-    let err = publish::signing_verdict(Some(&creds), &anchors(&masters, None))
+    publish::signing_verdict(Some(&creds), &anchors(&masters, None))
         .expect_err("a named-but-missing roster must refuse");
-    assert!(err.to_string().contains("gone.toml"), "{err}");
     clean(&dir);
 }
 

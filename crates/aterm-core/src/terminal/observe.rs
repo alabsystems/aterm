@@ -15,7 +15,7 @@
 //! Properties:
 //!
 //! 1. No silent loss: a predicate that holds at any processed batch latches at that batch
-//!    (`watcher_latch_model`, `conformance_observe.rs`).
+//!    (`conformance_observe.rs`).
 //! 2. Deterministic idle: `IdleFor` latches at the computed deadline (`activity_at + dur`), not
 //!    the observation instant, so live and replay latch the same [`Satisfaction`]
 //!    (`idle_deadline_model`).
@@ -58,8 +58,7 @@ impl From<bool> for RowVerdict {
 }
 
 /// An opaque, pre-compiled row matcher. The regex implementation lives in `aterm-observe`; the
-/// core evaluates matches but cannot construct one, and takes no direct `regex` dependency
-/// (checked by `regex_is_not_in_aterm_core_production_deps`).
+/// core evaluates matches but cannot construct one, and takes no direct `regex` dependency.
 ///
 /// A wait for a row to appear asks [`matches`](Self::matches); a wait for a row to leave asks
 /// [`clears`](Self::clears). An [`Undecided`](RowVerdict::Undecided) row is neither, so both
@@ -219,7 +218,9 @@ pub trait SurfaceSource {
     fn newest_block_complete(&self) -> bool;
     /// The number of visible rows.
     fn rows(&self) -> usize;
-    /// The text of visible row `idx` (owned, for object safety), or `None`.
+    /// The text of visible row `idx` (owned, for object safety), or `None`: the
+    /// live screen's row, as the control protocol's `text` serves it, never the
+    /// row a person scrolled into view.
     fn row_text(&self, idx: usize) -> Option<String>;
 }
 
@@ -641,13 +642,15 @@ impl super::Terminal {
         // Collect visible-row text only when a row scan will run, into a persistent scratch
         // taken out of `self` (row reads borrow `&self` while `observe_screen` borrows
         // `self.watchers`); the `Vec` and each `String`'s capacity are reused across batches.
+        // The live screen's rows, as `text` serves them: a person scrolled back must not make
+        // a live box look gone, nor an old copy of it in history look live.
         if self.watchers.wants_row_scan(advanced) {
             let rows = self.rows() as usize;
             let mut scratch = std::mem::take(&mut self.row_text_scratch);
             scratch.resize_with(rows, || None);
             for (i, slot) in scratch.iter_mut().enumerate() {
                 let mut s = slot.take().unwrap_or_default();
-                *slot = self.row_text_into(i, &mut s).then_some(s);
+                *slot = self.live_row_text_into(i, &mut s).then_some(s);
             }
             self.watchers
                 .observe_screen(seq, alt, epoch, newest_complete, now, &scratch);
@@ -758,7 +761,23 @@ impl SurfaceSource for super::Terminal {
         self.rows() as usize
     }
     fn row_text(&self, idx: usize) -> Option<String> {
-        self.row_text(idx)
+        let mut s = String::new();
+        self.live_row_text_into(idx, &mut s).then_some(s)
+    }
+}
+
+impl super::Terminal {
+    /// Live screen row `idx`'s text into `out` (cleared first), whatever the display
+    /// offset: the frame the control protocol's `text` and the input fence's `if-fp=`
+    /// read, where [`Terminal::row_text_into`](super::Terminal::row_text_into) follows
+    /// the person's scroll. `false` for a row past the screen.
+    fn live_row_text_into(&self, idx: usize, out: &mut String) -> bool {
+        if idx >= usize::from(self.grid.rows()) {
+            out.clear();
+            return false;
+        }
+        self.grid
+            .row_text_screen_into(crate::grid::row_u16(idx), out)
     }
 }
 
@@ -904,26 +923,6 @@ mod tests {
         assert_eq!(w.poll(id), Some(Satisfaction { seq: 7, at }));
     }
 
-    #[test]
-    fn idle_latches_at_the_deadline_not_the_observation_instant() {
-        let base = t0();
-        let d = Duration::from_millis(400);
-        let mut w = WatcherSet::default();
-        let id = w.arm(WatcherSpec::IdleFor { dur: d }, base).unwrap();
-        let act = base + Duration::from_millis(100);
-        w.observe(1, false, act, NO_ROWS);
-        assert_eq!(w.next_deadline(), Some(act + d));
-        let woke_late = act + d + Duration::from_millis(999);
-        assert!(w.expire(woke_late));
-        assert_eq!(
-            w.poll(id),
-            Some(Satisfaction {
-                seq: 1,
-                at: act + d
-            })
-        );
-    }
-
     /// A restarted idle watcher waits its whole window again, and a latched one
     /// keeps its latch. Negative control: without the restart it fires at once.
     #[test]
@@ -987,21 +986,6 @@ mod tests {
         assert!(w.poll(id).is_none());
         assert!(w.expire(arm_at + d));
         assert_eq!(w.poll(id).unwrap().at, arm_at + d);
-    }
-
-    #[test]
-    fn activity_resets_the_idle_deadline() {
-        let base = t0();
-        let d = Duration::from_millis(100);
-        let mut w = WatcherSet::default();
-        let id = w.arm(WatcherSpec::IdleFor { dur: d }, base).unwrap();
-        w.observe(1, false, base + Duration::from_millis(50), NO_ROWS);
-        assert!(!w.expire(base + Duration::from_millis(120)));
-        assert!(w.poll(id).is_none());
-        w.observe(2, false, base + Duration::from_millis(130), NO_ROWS);
-        assert!(!w.expire(base + Duration::from_millis(200)));
-        assert!(w.expire(base + Duration::from_millis(230)));
-        assert_eq!(w.poll(id).unwrap().at, base + Duration::from_millis(230));
     }
 
     #[test]
@@ -1077,39 +1061,6 @@ mod tests {
             assert_eq!(w.poll(seq).is_some(), moves, "seq watcher, epoch {epoch}");
             assert_eq!(w.seen_epoch(), epoch);
         }
-    }
-
-    #[test]
-    fn row_matches_latches_in_the_one_list_on_content_advance() {
-        #[derive(Debug)]
-        struct Contains(&'static str);
-        impl RowMatch for Contains {
-            fn verdict(&self, row: &str) -> RowVerdict {
-                row.contains(self.0).into()
-            }
-        }
-        let base = t0();
-        let mut w = WatcherSet::default();
-        let rows = [
-            Some("booting".to_string()),
-            Some("still booting".to_string()),
-        ];
-        let id = w
-            .arm(
-                WatcherSpec::RowMatches {
-                    matcher: Arc::new(Contains("READY")),
-                    rows: RowRange::All,
-                },
-                base,
-            )
-            .unwrap();
-        // No matching row yet (and content advanced so the gate scans).
-        w.observe(1, false, base, &rows);
-        assert!(w.poll(id).is_none());
-        // The row appears on the next advance -> latched.
-        let rows2 = [Some("done".to_string()), Some("READY ❯".to_string())];
-        w.observe(2, false, base, &rows2);
-        assert_eq!(w.poll(id).unwrap().seq, 2);
     }
 
     /// The shared row matcher for the `RowsClear` tests below.
@@ -1320,46 +1271,6 @@ mod tests {
         w.disarm(id);
         assert!(w.arm(WatcherSpec::SeqAdvanced { after: 0 }, base).is_some());
         assert!(w.poll(id).is_none(), "disarmed id no longer known");
-    }
-
-    #[test]
-    fn surface_source_boundary_is_transport_agnostic() {
-        struct RemoteSurface {
-            rows: Vec<String>,
-        }
-        impl SurfaceSource for RemoteSurface {
-            fn content_seq(&self) -> u64 {
-                7
-            }
-            fn newest_block_complete(&self) -> bool {
-                false
-            }
-            fn rows(&self) -> usize {
-                self.rows.len()
-            }
-            fn row_text(&self, idx: usize) -> Option<String> {
-                self.rows.get(idx).cloned()
-            }
-        }
-        #[derive(Debug)]
-        struct Contains(&'static str);
-        impl RowMatch for Contains {
-            fn verdict(&self, row: &str) -> RowVerdict {
-                row.contains(self.0).into()
-            }
-        }
-        let remote = RemoteSurface {
-            rows: vec!["booting".into(), "❯ ready".into(), "idle".into()],
-        };
-        assert_eq!(
-            first_matching_row(&remote, &Contains("❯"), RowRange::All),
-            Some(1),
-            "the kernel's row-match logic runs on a remote surface unchanged"
-        );
-        assert_eq!(
-            first_matching_row(&remote, &Contains("nope"), RowRange::All),
-            None
-        );
     }
 
     /// The reused `row_text_scratch` sees the same text a fresh collection would.

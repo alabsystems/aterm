@@ -975,7 +975,7 @@ impl<'de> serde::de::Visitor<'de> for StrictVisitor {
 
 #[cfg(test)]
 mod tests {
-    use super::super::lane::world::{self, CLAUDE, CODEX_DL, CODEX_HEAD, Fake};
+    use super::super::lane::world::{CLAUDE, CODEX_DL, CODEX_HEAD, Fake};
     use super::*;
 
     const REAL_MANIFEST: &[u8] = include_bytes!("fixtures/claude-2.1.280-manifest.json");
@@ -1734,32 +1734,5 @@ mod tests {
             read_head(spec("claude"), &f, None),
             Head::Named { .. }
         ));
-    }
-
-    /// Which triples each vendor serves, and agy's head is this client's own platform's
-    /// manifest.
-    #[test]
-    fn each_vendor_serves_the_triples_its_documents_can_vouch_for() {
-        for triple in crate::manifest::TARGETS {
-            for program in ["claude", "codex", "agy"] {
-                assert!(spec(program).serves(triple), "{program} on {triple}");
-            }
-            assert_eq!(
-                spec("muse").serves(triple),
-                triple.ends_with("-apple-darwin")
-            );
-        }
-        for program in ["claude", "agy", "muse"] {
-            assert!(
-                !spec(program).serves("riscv64gc-unknown-linux-gnu"),
-                "{program}"
-            );
-        }
-        let (platform, ..) = agy_platform(world::triple()).unwrap();
-        let agy = spec("agy");
-        assert_eq!(
-            agy.head_url,
-            format!("{}{platform}.json", agy.url_prefixes[0])
-        );
     }
 }

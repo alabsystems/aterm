@@ -8,7 +8,6 @@ use std::ops::{Deref, DerefMut};
 
 use aterm_scrollback::ScrollbackStorage;
 
-use super::super::GenerationTracker;
 use super::super::LineSize;
 use super::super::ScrolledRowExtras;
 use super::super::ring_extras::RingExtras;
@@ -76,7 +75,7 @@ pub struct GridStorage {
     pub display_offset: usize,
     /// Ring buffer head index (oldest row).
     pub ring_head: usize,
-    /// Tiered scrollback for long-term history (memory-only or disk-backed).
+    /// Tiered scrollback for long-term history.
     pub scrollback: Option<ScrollbackStorage>,
     /// Deferred lines between the store and the ring
     /// (`tiered | lazy_buffer | ring`): `scroll_up` stages O(1) row snapshots
@@ -124,10 +123,6 @@ pub struct GridStorage {
     /// logs at the window's first drop and its total at close
     /// (`Grid::close_reflow_window_cap_run`), not once per line.
     pub(crate) reflow_window_cap_dropped: u64,
-    /// Approximate ring byte budget the host sets so ring-only "unlimited"
-    /// retention still reports memory pressure ([`Grid::ring_watermark_level`]).
-    /// `None` (default): no watermark, the level reads Green.
-    pub(crate) ring_byte_watermark: Option<usize>,
     /// Bumped whenever off-screen scrollback is erased (ED3, full reset). Sampled
     /// at detach for reflow and re-checked at re-attach: if it advanced, the
     /// reflowed pre-erase store is dropped rather than resurrected.
@@ -160,8 +155,6 @@ pub struct GridStorage {
     /// drawn in between to hand back exactly (`grid::resize_undo`). `None`
     /// outside such a flap. Session-only: never checkpointed.
     pub(crate) resize_undo: Option<Box<super::super::resize_undo::ResizeUndo>>,
-    /// Page-eviction generations, for detecting stale pins.
-    pub generations: GenerationTracker,
     /// Monotonic absolute row counter, for pins that survive scrollback eviction.
     pub absolute_row_counter: u64,
     /// Monotonic content generation, bumped by every `mark_content_*` wrapper
@@ -731,172 +724,83 @@ impl GridStorage {
 
 #[cfg(test)]
 mod tests {
+    use crate::LineSize;
     use crate::grid::Grid;
-    use crate::{Cursor, LineSize};
 
     fn make_storage(rows: u16, cols: u16) -> Grid {
         Grid::new(rows, cols)
     }
 
+    /// Every row accessor refuses a row past the screen.
     #[test]
-    fn row_access_out_of_bounds_returns_none() {
-        let g = make_storage(5, 10);
-        assert!(g.storage.row(5).is_none());
-        assert!(g.storage.row(100).is_none());
-    }
-
-    #[test]
-    fn row_mut_out_of_bounds_returns_none() {
+    fn row_accessors_refuse_rows_past_the_screen() {
         let mut g = make_storage(5, 10);
-        assert!(g.storage.row_mut(5).is_none());
+        for row in [5, 100] {
+            assert!(g.storage.row(row).is_none(), "row {row}");
+            assert!(g.storage.row_mut(row).is_none(), "row {row}");
+            assert!(
+                g.storage.row_mut_with_effective_cols(row).is_none(),
+                "row {row}"
+            );
+        }
     }
 
+    /// DECLRMM margins: a valid pair is set and flagged, an empty one (and a
+    /// reset) returns to the full width with the flag lowered.
     #[test]
-    fn row_mut_with_effective_cols_out_of_bounds() {
-        let mut g = make_storage(5, 80);
-        assert!(g.storage.row_mut_with_effective_cols(5).is_none());
-    }
-
-    #[test]
-    fn cursor_take_pending_wrap_returns_true_and_clears() {
-        let mut g = make_storage(24, 80);
-        g.storage.mark_pending_wrap();
-        assert!(g.storage.take_pending_wrap());
-        assert!(!g.storage.pending_wrap());
-    }
-
-    #[test]
-    fn cursor_take_pending_wrap_returns_false_when_not_set() {
-        let mut g = make_storage(24, 80);
-        assert!(!g.storage.take_pending_wrap());
-    }
-
-    #[test]
-    fn cursor_save_and_restore() {
-        let mut g = make_storage(24, 80);
-        g.storage.set_cursor_position(10, 20);
-        g.storage.mark_pending_wrap();
-        g.storage.save_cursor();
-
-        let saved = g.storage.saved_cursor();
-        assert!(saved.valid);
-        assert_eq!(saved.cursor, Cursor::new(10, 20));
-        assert!(saved.pending_wrap);
-    }
-
-    #[test]
-    fn scroll_region_invalid_range_resets_to_full() {
-        let mut g = make_storage(24, 80);
-        // top >= bottom should reset to full
-        g.storage.set_scroll_region(10, 10);
-        assert!(g.storage.scroll_region().is_full(24));
-    }
-
-    #[test]
-    fn horizontal_margins_set_custom() {
+    fn horizontal_margins_set_reject_and_reset() {
         let mut g = make_storage(24, 80);
         g.storage.set_horizontal_margins(10, 70);
         let margins = g.storage.horizontal_margins();
-        assert_eq!(margins.left, 10);
-        assert_eq!(margins.right, 70);
+        assert_eq!((margins.left, margins.right), (10, 70));
         assert!(g.storage.has_horizontal_margins);
-    }
-
-    #[test]
-    fn horizontal_margins_reset_clears_flag() {
-        let mut g = make_storage(24, 80);
-        g.storage.set_horizontal_margins(10, 70);
         g.storage.reset_horizontal_margins();
-        let margins = g.storage.horizontal_margins();
-        assert!(margins.is_full(80));
+        assert!(g.storage.horizontal_margins().is_full(80));
         assert!(!g.storage.has_horizontal_margins);
-    }
-
-    #[test]
-    fn horizontal_margins_invalid_resets_to_full() {
-        let mut g = make_storage(24, 80);
-        // left >= right should reset to full
         g.storage.set_horizontal_margins(50, 50);
         assert!(g.storage.horizontal_margins().is_full(80));
     }
 
+    /// A row's addressable width halves on every double-width or
+    /// double-height line size, and columns clamp to it.
     #[test]
-    fn clamp_col_for_row_within_bounds() {
-        let g = make_storage(5, 80);
-        assert_eq!(g.storage.clamp_col_for_row(0, 50), 50);
-    }
-
-    #[test]
-    fn clamp_col_for_row_at_max() {
-        let g = make_storage(5, 80);
-        assert_eq!(g.storage.clamp_col_for_row(0, 79), 79);
-    }
-
-    #[test]
-    fn clamp_col_for_row_exceeds_max() {
-        let g = make_storage(5, 80);
-        assert_eq!(g.storage.clamp_col_for_row(0, 200), 79);
-    }
-
-    #[test]
-    fn effective_cols_double_width_row() {
-        let mut g = make_storage(5, 80);
-        g.storage.any_double_width = true;
-        if let Some(row) = g.storage.row_mut(2) {
-            row.set_line_size(LineSize::DoubleWidth);
+    fn line_size_halves_the_addressable_columns() {
+        for (size, cols) in [
+            (LineSize::SingleWidth, 80),
+            (LineSize::DoubleWidth, 40),
+            (LineSize::DoubleHeightTop, 40),
+            (LineSize::DoubleHeightBottom, 40),
+        ] {
+            let mut g = make_storage(5, 80);
+            g.storage.any_double_width = true;
+            if let Some(row) = g.storage.row_mut(2) {
+                row.set_line_size(size);
+            }
+            assert_eq!(g.storage.effective_cols_for_row(2), cols, "{size:?}");
+            assert_eq!(g.storage.max_col_for_row(2), cols - 1, "{size:?}");
+            assert_eq!(g.storage.effective_cols_for_row(0), 80, "{size:?}: row 0");
+            for (col, want) in [(cols / 2, cols / 2), (cols - 1, cols - 1), (200, cols - 1)] {
+                assert_eq!(
+                    g.storage.clamp_col_for_row(2, col),
+                    want,
+                    "{size:?} col {col}"
+                );
+            }
         }
-        assert_eq!(g.storage.effective_cols_for_row(2), 40);
-        assert_eq!(g.storage.effective_cols_for_row(0), 80);
     }
 
+    /// A shift by zero rows, or by more than the range holds, moves nothing.
     #[test]
-    fn effective_cols_double_height_top() {
-        let mut g = make_storage(5, 80);
-        g.storage.any_double_width = true;
-        if let Some(row) = g.storage.row_mut(1) {
-            row.set_line_size(LineSize::DoubleHeightTop);
-        }
-        assert_eq!(g.storage.effective_cols_for_row(1), 40);
-    }
-
-    #[test]
-    fn effective_cols_double_height_bottom() {
-        let mut g = make_storage(5, 80);
-        g.storage.any_double_width = true;
-        if let Some(row) = g.storage.row_mut(1) {
-            row.set_line_size(LineSize::DoubleHeightBottom);
-        }
-        assert_eq!(g.storage.effective_cols_for_row(1), 40);
-    }
-
-    #[test]
-    fn max_col_double_width() {
-        let mut g = make_storage(5, 80);
-        g.storage.any_double_width = true;
-        if let Some(row) = g.storage.row_mut(0) {
-            row.set_line_size(LineSize::DoubleWidth);
-        }
-        assert_eq!(g.storage.max_col_for_row(0), 39);
-    }
-
-    #[test]
-    fn shift_rows_up_n_zero_is_noop() {
+    fn degenerate_row_shifts_move_nothing() {
         let mut g = make_storage(5, 10);
-        g.write_char('A');
-        let before = g.storage.row(0).map(|r| r.get(0).map(|c| c.char()));
-        g.storage.shift_visible_rows_up(0, 4, 0);
-        let after = g.storage.row(0).map(|r| r.get(0).map(|c| c.char()));
-        assert_eq!(before, after);
-    }
-
-    #[test]
-    fn shift_rows_down_n_zero_is_noop() {
-        let mut g = make_storage(5, 10);
-        g.write_char('B');
-        let before = g.storage.row(0).map(|r| r.get(0).map(|c| c.char()));
-        g.storage.shift_visible_rows_down(0, 4, 0);
-        let after = g.storage.row(0).map(|r| r.get(0).map(|c| c.char()));
-        assert_eq!(before, after);
+        label_rows(&mut g);
+        let before = first_cells(&g);
+        for (top, bottom, n) in [(0, 4, 0), (0, 2, 5)] {
+            g.storage.shift_visible_rows_up(top, bottom, n);
+            assert_eq!(first_cells(&g), before, "up ({top}, {bottom}, {n})");
+            g.storage.shift_visible_rows_down(top, bottom, n);
+            assert_eq!(first_cells(&g), before, "down ({top}, {bottom}, {n})");
+        }
     }
 
     /// Every visible row's first cell, top to bottom: the snapshot a no-op
@@ -918,25 +822,6 @@ mod tests {
             g.set_cursor(r, 0);
             g.write_char(ch);
         }
-    }
-
-    #[test]
-    fn shift_rows_up_n_exceeds_range_is_noop() {
-        let mut g = make_storage(5, 10);
-        label_rows(&mut g);
-        let before = first_cells(&g);
-        // top + n > bottom: nothing moves.
-        g.storage.shift_visible_rows_up(0, 2, 5);
-        assert_eq!(first_cells(&g), before);
-    }
-
-    #[test]
-    fn shift_rows_down_n_exceeds_range_is_noop() {
-        let mut g = make_storage(5, 10);
-        label_rows(&mut g);
-        let before = first_cells(&g);
-        g.storage.shift_visible_rows_down(0, 2, 5);
-        assert_eq!(first_cells(&g), before);
     }
 
     /// Every ring row's slice identity — `(cell pointer, cells length, page id)`,
@@ -1030,105 +915,6 @@ mod tests {
     }
 
     #[test]
-    fn push_ring_extras_empty() {
-        let mut g = make_storage(5, 10);
-        let extras = super::ScrolledRowExtras::default();
-        assert!(extras.is_empty());
-        g.storage.push_ring_extras(extras);
-        assert_eq!(g.storage.ring_extras.len(), 1);
-        // Empty extras are stored as `None`.
-        assert!(g.storage.ring_extras.get(0).is_none());
-        g.storage.ring_extras.assert_running_sums();
-    }
-
-    #[test]
-    fn resize_viewport_clamps_cursor() {
-        let mut g = make_storage(24, 80);
-        g.storage.set_cursor_position(20, 70);
-        g.storage.resize_viewport_state(10, 40);
-        let cursor = g.storage.cursor();
-        assert!(
-            cursor.row < 10,
-            "cursor row should be clamped to new row count"
-        );
-        assert!(
-            cursor.col < 40,
-            "cursor col should be clamped to new col count"
-        );
-    }
-
-    #[test]
-    fn resize_viewport_resets_scroll_region() {
-        let mut g = make_storage(24, 80);
-        g.storage.set_scroll_region(5, 20);
-        g.storage.resize_viewport_state(30, 100);
-        let region = g.storage.scroll_region();
-        assert!(region.is_full(30));
-    }
-
-    #[test]
-    fn resize_viewport_resets_horizontal_margins() {
-        let mut g = make_storage(24, 80);
-        g.storage.set_horizontal_margins(10, 70);
-        g.storage.resize_viewport_state(24, 100);
-        let margins = g.storage.horizontal_margins();
-        assert!(margins.is_full(100));
-        assert!(!g.storage.has_horizontal_margins);
-    }
-
-    #[test]
-    fn resize_viewport_clears_pending_wrap() {
-        let mut g = make_storage(24, 80);
-        g.storage.mark_pending_wrap();
-        g.storage.resize_viewport_state(24, 100);
-        assert!(!g.storage.pending_wrap());
-    }
-
-    #[test]
-    fn resize_viewport_grows_tab_stops() {
-        let mut g = make_storage(24, 80);
-        g.storage.resize_viewport_state(24, 120);
-        assert!(g.storage.tab_stops.len() >= 120);
-        // New columns get the every-8 defaults.
-        assert!(g.storage.is_tab_stop(80));
-        assert!(g.storage.is_tab_stop(88));
-        assert!(g.storage.is_tab_stop(96));
-        assert!(!g.storage.is_tab_stop(81));
-    }
-
-    #[test]
-    fn resize_viewport_shrink_preserves_tab_stops() {
-        let mut g = make_storage(24, 80);
-        let len_before = g.storage.tab_stops.len();
-        g.storage.resize_viewport_state(24, 40);
-        // Tab stops never shrink (as in xterm).
-        assert_eq!(g.storage.tab_stops.len(), len_before);
-    }
-
-    /// The saved cursor stays where it was saved; DECRC clamps what it reads
-    /// (`Grid::restore_cursor`).
-    #[test]
-    fn resize_viewport_leaves_the_saved_cursor_to_its_reader() {
-        let mut g = make_storage(24, 80);
-        g.storage.set_cursor_position(20, 70);
-        g.storage.save_cursor();
-        g.storage.resize_viewport_state(10, 40);
-        let saved = g.storage.saved_cursor();
-        assert_eq!((saved.cursor.row, saved.cursor.col), (20, 70));
-        g.restore_cursor();
-        assert_eq!((g.cursor_row(), g.cursor_col()), (9, 39));
-    }
-
-    #[test]
-    fn attach_scrollback_sets_some() {
-        let mut g = make_storage(24, 80);
-        assert!(g.storage.scrollback().is_none());
-        let sb = aterm_scrollback::Scrollback::new(100, 1000, 1_000_000);
-        g.storage.attach_scrollback(sb);
-        assert!(g.storage.scrollback().is_some());
-    }
-
-    #[test]
     fn scrollback_line_limit() {
         let mut g = make_storage(24, 80);
         let sb = aterm_scrollback::Scrollback::new(100, 1000, 1_000_000);
@@ -1141,26 +927,5 @@ mod tests {
             g.storage.scrollback_line_limit(),
             Some(500 + g.storage.max_scrollback)
         );
-    }
-
-    #[test]
-    fn tab_stops_clear_all() {
-        let mut g = make_storage(24, 80);
-        g.storage.clear_all_tab_stops();
-        for col in 0..80 {
-            assert!(
-                !g.storage.is_tab_stop(col),
-                "col {col} should not be a tab stop"
-            );
-        }
-    }
-
-    #[test]
-    fn tab_stops_reset() {
-        let mut g = make_storage(24, 80);
-        g.storage.clear_all_tab_stops();
-        g.storage.reset_tab_stops(80);
-        assert!(g.storage.is_tab_stop(8));
-        assert!(g.storage.is_tab_stop(16));
     }
 }

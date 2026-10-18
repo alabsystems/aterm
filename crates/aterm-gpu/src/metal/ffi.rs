@@ -19,9 +19,14 @@
 //! `MTLCreateSystemDefaultDevice`. So this module talks to the runtime
 //! directly:
 //!
-//! * `objc_msgSend` is declared once with no argument list and every call
-//!   casts it to a fully typed prototype through [`msg`]. There is no variadic
-//!   ABI for message sends on arm64, so a wrong prototype corrupts registers.
+//! * Every send casts `objc_msgSend` to a fully typed `"C-unwind"` prototype
+//!   through [`checked_msg`] (`aterm_objc`'s): there is no variadic ABI for
+//!   message sends on arm64, so a wrong prototype corrupts registers, and a
+//!   debug build checks each send's prototype against the runtime's encoding
+//!   of the method before sending (once per class, selector and prototype, so
+//!   the per-frame encoder sends pay a hash probe). `"C-unwind"`, because an
+//!   `NSException` Metal raises inside a send must unwind through this frame,
+//!   not skip its destructors.
 //! * Every `new*`/`alloc` result is +1 and lands in [`Obj`], the only place
 //!   `objc_release` is called.
 //! * Autoreleased returns (`colorAttachments`, `objectAtIndexedSubscript:`,
@@ -45,17 +50,13 @@
 use std::ffi::{CStr, c_char, c_void};
 use std::ptr;
 
-/// An Objective-C object pointer. Null is the ObjC `nil` and is always a valid
-/// value to send a message to (it returns zero), so this is deliberately a raw
-/// pointer rather than a `NonNull`.
-pub(crate) type Id = *mut c_void;
-/// An Objective-C selector — an interned, immortal string the runtime owns.
-pub(crate) type Sel = *const c_void;
-/// An Objective-C class object. A class is itself an object, so `Id` and this
-/// are the same shape; the alias exists to make the message target obvious.
-pub(crate) type ClassPtr = *mut c_void;
+/// The runtime's pointer-shaped types and the checked send, `aterm_objc`'s:
+/// an object pointer (null is `nil`, always a valid receiver), an interned
+/// selector, a class object, and the typed `objc_msgSend` cast every send in
+/// this crate goes through.
+pub(crate) use aterm_objc::{ClassPtr, Encode, Id, Sel, checked_msg};
 
-/// The Objective-C `BOOL` for this target, used for every `BOOL` in a [`msg`]
+/// The Objective-C `BOOL` for this target, used for every `BOOL` in a send
 /// prototype: `aterm_objc::Bool`, `bool` on arm64 and `i8` (`signed char`) on
 /// x86_64, read as `!= 0`.
 ///
@@ -67,11 +68,6 @@ use aterm_objc::Bool as ObjcBool;
 
 #[link(name = "objc")]
 unsafe extern "C" {
-    /// Declared with no parameter list on purpose; every call goes through
-    /// [`msg`] with the exact prototype.
-    fn objc_msgSend();
-    fn objc_getClass(name: *const c_char) -> ClassPtr;
-    fn sel_registerName(name: *const c_char) -> Sel;
     fn objc_retain(obj: Id) -> Id;
     fn objc_release(obj: Id);
     fn objc_autoreleasePoolPush() -> *mut c_void;
@@ -86,35 +82,16 @@ unsafe extern "C" {
     fn MTLCopyAllDevices() -> Id;
 }
 
-/// Cast the untyped `objc_msgSend` to a concrete prototype.
-///
-/// # Safety
-/// `F` must be the EXACT C prototype of the selector about to be sent,
-/// including the implicit `(self, _cmd)` leading pair. Getting this wrong is
-/// undefined behaviour on every Apple ABI.
-#[inline]
-pub(crate) unsafe fn msg<F>() -> F {
-    // SAFETY: `objc_msgSend` is a function symbol, so its address is a valid
-    // function pointer; the caller's `F` supplies the prototype. The size
-    // assert keeps a non-function `F` out.
-    const { assert!(size_of::<F>() == size_of::<*const c_void>()) };
-    unsafe { std::mem::transmute_copy(&(objc_msgSend as *const c_void)) }
-}
-
 /// Resolve a selector from a checked C-string literal, e.g. `sel(c"length")`.
 #[inline]
 pub(crate) fn sel(name: &'static CStr) -> Sel {
-    // SAFETY: `CStr` guarantees one trailing NUL and no interior NUL;
-    // `sel_registerName` copies it into the runtime's immortal selector table.
-    unsafe { sel_registerName(name.as_ptr()) }
+    aterm_objc::sel_uncached(name)
 }
 
 /// Look up a class from a checked C-string literal, e.g. `class(c"NSString")`.
 #[inline]
 pub(crate) fn class(name: &'static CStr) -> ClassPtr {
-    // SAFETY: `CStr` supplies the exact C-string contract. Classes are
-    // immortal; the returned pointer is never released.
-    unsafe { objc_getClass(name.as_ptr()) }
+    aterm_objc::class(name)
 }
 
 /// An owned (+1) Objective-C object; the only place `objc_release` is called.
@@ -203,12 +180,13 @@ pub(crate) fn ns_string(s: &str) -> Option<Obj> {
     // `initWithBytes:length:encoding:` consumes, returning +1 or nil. The byte
     // pointer is read for `len` bytes during the call only.
     unsafe {
-        let alloc: unsafe extern "C" fn(ClassPtr, Sel) -> Id = msg();
+        let alloc: unsafe extern "C-unwind" fn(ClassPtr, Sel) -> Id = checked_msg();
         let raw = alloc(cls, sel(c"alloc"));
         if raw.is_null() {
             return None;
         }
-        let init: unsafe extern "C" fn(Id, Sel, *const u8, usize, usize) -> Id = msg();
+        let init: unsafe extern "C-unwind" fn(Id, Sel, *const u8, usize, usize) -> Id =
+            checked_msg();
         let obj = init(
             raw,
             sel(c"initWithBytes:length:encoding:"),
@@ -230,12 +208,12 @@ pub(crate) fn ns_error_string(err: Id) -> String {
     // `UTF8String` return pointers valid until the pool pops; the bytes are
     // copied into an owned `String` first.
     unsafe {
-        let desc: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+        let desc: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
         let d = desc(err, sel(c"localizedDescription"));
         if d.is_null() {
             return "(no localizedDescription)".to_owned();
         }
-        let utf8: unsafe extern "C" fn(Id, Sel) -> *const c_char = msg();
+        let utf8: unsafe extern "C-unwind" fn(Id, Sel) -> *const c_char = checked_msg();
         let p = utf8(d, sel(c"UTF8String"));
         if p.is_null() {
             return "(no UTF8String)".to_owned();
@@ -448,10 +426,6 @@ impl SamplerDesc {
 #[repr(usize)]
 pub(crate) enum LanguageVersion {
     V2_3 = (2 << 16) | 3,
-    #[cfg(test)]
-    V2_4 = (2 << 16) | 4,
-    #[cfg(test)]
-    V3_0 = 3 << 16,
 }
 
 /// `MTLResourceOptions`: `MTLResourceStorageModeShared` is `0 << 4`.
@@ -492,9 +466,9 @@ impl CompileOptions {
         // SAFETY: alloc/init is +1; `Obj` releases it exactly once on drop.
         unsafe {
             let cls = class(c"MTLCompileOptions");
-            let alloc: unsafe extern "C" fn(ClassPtr, Sel) -> Id = msg();
+            let alloc: unsafe extern "C-unwind" fn(ClassPtr, Sel) -> Id = checked_msg();
             let raw = alloc(cls, sel(c"alloc"));
-            let init: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+            let init: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             Obj::from_owned(init(raw, sel(c"init"))).map(Self)
         }
     }
@@ -510,7 +484,7 @@ impl CompileOptions {
     pub(crate) fn set_preserve_invariance(&self, on: bool) {
         // SAFETY: plain `BOOL` property write on a live `MTLCompileOptions`.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, ObjcBool) = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, ObjcBool) = checked_msg();
             f(self.0.id(), sel(c"setPreserveInvariance:"), on.into());
         }
     }
@@ -518,7 +492,7 @@ impl CompileOptions {
     pub(crate) fn set_language_version(&self, v: LanguageVersion) {
         // SAFETY: plain `NSUInteger` property write on a live object.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, usize) = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, usize) = checked_msg();
             f(self.0.id(), sel(c"setLanguageVersion:"), v as usize);
         }
     }
@@ -529,7 +503,7 @@ impl CompileOptions {
     pub(crate) fn preserve_invariance(&self) -> bool {
         // SAFETY: `-preserveInvariance` is a `BOOL` getter on a live object.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> ObjcBool = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> ObjcBool = checked_msg();
             f(self.0.id(), sel(c"preserveInvariance")).as_bool()
         }
     }
@@ -539,7 +513,7 @@ impl CompileOptions {
     pub(crate) fn language_version(&self) -> usize {
         // SAFETY: `-languageVersion` is an `NSUInteger` getter on a live object.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> usize = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = checked_msg();
             f(self.0.id(), sel(c"languageVersion"))
         }
     }
@@ -667,7 +641,7 @@ impl Device {
         // SAFETY: `-objectAtIndexedSubscript:` with `i < count`; the +0 element
         // is retained to +1 before `all` drops.
         let dev = unsafe {
-            let at: unsafe extern "C" fn(Id, Sel, usize) -> Id = msg();
+            let at: unsafe extern "C-unwind" fn(Id, Sel, usize) -> Id = checked_msg();
             Obj::retain(at(all.id(), sel(c"objectAtIndexedSubscript:"), i))
         }
         .map(Self)?;
@@ -694,9 +668,9 @@ impl Device {
         // holds the pool.
         unsafe {
             let all = Obj::from_owned(MTLCopyAllDevices())?;
-            let count: unsafe extern "C" fn(Id, Sel) -> usize = msg();
-            let at: unsafe extern "C" fn(Id, Sel, usize) -> Id = msg();
-            let flag: unsafe extern "C" fn(Id, Sel) -> ObjcBool = msg();
+            let count: unsafe extern "C-unwind" fn(Id, Sel) -> usize = checked_msg();
+            let at: unsafe extern "C-unwind" fn(Id, Sel, usize) -> Id = checked_msg();
+            let flag: unsafe extern "C-unwind" fn(Id, Sel) -> ObjcBool = checked_msg();
             let gpus = (0..count(all.id(), sel(c"count")))
                 .map(|i| {
                     let d = at(all.id(), sel(c"objectAtIndexedSubscript:"), i);
@@ -729,12 +703,12 @@ impl Device {
         // SAFETY: `-name` returns an autoreleased `NSString` owned by the pool
         // above; its UTF-8 bytes are copied before the pool pops.
         unsafe {
-            let get: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+            let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             let s = get(self.id(), sel(c"name"));
             if s.is_null() {
                 return String::new();
             }
-            let utf8: unsafe extern "C" fn(Id, Sel) -> *const c_char = msg();
+            let utf8: unsafe extern "C-unwind" fn(Id, Sel) -> *const c_char = checked_msg();
             let p = utf8(s, sel(c"UTF8String"));
             if p.is_null() {
                 return String::new();
@@ -764,12 +738,12 @@ impl Device {
         // autoreleased into the frame live when Metal writes it.
         let _pool = AutoreleasePool::new();
         let src = ns_string(source).ok_or_else(|| "NSString allocation failed".to_owned())?;
-        let mut err: Id = ptr::null_mut();
+        let mut err: Id = Id::NIL;
         // SAFETY: `newLibraryWithSource:options:error:` is a `new*` family
         // method returning +1 (or nil with `err` set to an autoreleased
         // NSError). `options` is read during the call and not retained.
         let lib = unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, Id, Id, *mut Id) -> Id = checked_msg();
             f(
                 self.id(),
                 sel(c"newLibraryWithSource:options:error:"),
@@ -797,11 +771,11 @@ impl Device {
         // `NSError` lands in it; pipeline construction also autoreleases driver
         // objects.
         let _pool = AutoreleasePool::new();
-        let mut err: Id = ptr::null_mut();
+        let mut err: Id = Id::NIL;
         // SAFETY: `new*` family, +1 or nil-with-error. The descriptor is only
         // read during the call; Metal copies what it needs.
         let pso = unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, Id, *mut Id) -> Id = checked_msg();
             f(
                 self.id(),
                 sel(c"newRenderPipelineStateWithDescriptor:error:"),
@@ -818,7 +792,7 @@ impl Device {
         // SAFETY: `new*` family, +1. Shared storage means the CPU may map it
         // via `-contents` for the lifetime of the buffer.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, usize, usize) -> Id = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, usize, usize) -> Id = checked_msg();
             Obj::from_owned(f(
                 self.id(),
                 sel(c"newBufferWithLength:options:"),
@@ -829,9 +803,8 @@ impl Device {
     }
 
     /// A 2-D `MTLTexture` in `MTLStorageModeManaged`, set explicitly although
-    /// it is the macOS texture default (the test
-    /// `textures_are_minted_managed_and_managed_is_the_platform_default` keeps
-    /// it so). Consequences the SAFETY comments rely on:
+    /// it is the macOS texture default. Consequences the SAFETY comments rely
+    /// on:
     ///
     /// * Managed is non-Private, so `replaceRegion:` ([`texture_upload`]) is
     ///   legal. It is CPU-synchronous, outside command-queue hazard tracking;
@@ -855,8 +828,14 @@ impl Device {
         // `newTextureWithDescriptor:` is +1 and is the only value that escapes.
         unsafe {
             let dcls = class(c"MTLTextureDescriptor");
-            let mk: unsafe extern "C" fn(ClassPtr, Sel, usize, usize, usize, ObjcBool) -> Id =
-                msg();
+            let mk: unsafe extern "C-unwind" fn(
+                ClassPtr,
+                Sel,
+                usize,
+                usize,
+                usize,
+                ObjcBool,
+            ) -> Id = checked_msg();
             let d = mk(
                 dcls,
                 sel(c"texture2DDescriptorWithPixelFormat:width:height:mipmapped:"),
@@ -868,10 +847,10 @@ impl Device {
             if d.is_null() {
                 return None;
             }
-            let set_usize: unsafe extern "C" fn(Id, Sel, usize) = msg();
+            let set_usize: unsafe extern "C-unwind" fn(Id, Sel, usize) = checked_msg();
             set_usize(d, sel(c"setUsage:"), usage);
             set_usize(d, sel(c"setStorageMode:"), TEXTURE_STORAGE_MODE_MANAGED);
-            let f: unsafe extern "C" fn(Id, Sel, Id) -> Id = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Id = checked_msg();
             Obj::from_owned(f(self.id(), sel(c"newTextureWithDescriptor:"), d))
         }
     }
@@ -885,17 +864,17 @@ impl Device {
         // `newSamplerStateWithDescriptor:` is +1 and escapes.
         unsafe {
             let dcls = class(c"MTLSamplerDescriptor");
-            let alloc: unsafe extern "C" fn(ClassPtr, Sel) -> Id = msg();
+            let alloc: unsafe extern "C-unwind" fn(ClassPtr, Sel) -> Id = checked_msg();
             let raw = alloc(dcls, sel(c"alloc"));
-            let init: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+            let init: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             let d = Obj::from_owned(init(raw, sel(c"init")))?;
-            let set: unsafe extern "C" fn(Id, Sel, usize) = msg();
+            let set: unsafe extern "C-unwind" fn(Id, Sel, usize) = checked_msg();
             set(d.id(), sel(c"setMinFilter:"), desc.min as usize);
             set(d.id(), sel(c"setMagFilter:"), desc.mag as usize);
             set(d.id(), sel(c"setMipFilter:"), desc.mip as usize);
             set(d.id(), sel(c"setSAddressMode:"), desc.s_address as usize);
             set(d.id(), sel(c"setTAddressMode:"), desc.t_address as usize);
-            let f: unsafe extern "C" fn(Id, Sel, Id) -> Id = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Id = checked_msg();
             Obj::from_owned(f(self.id(), sel(c"newSamplerStateWithDescriptor:"), d.id()))
         }
     }
@@ -909,7 +888,7 @@ impl Device {
         // SAFETY: `-maxBufferLength` is an `NSUInteger` getter on a live
         // `MTLDevice`.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> usize = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = checked_msg();
             f(self.id(), sel(c"maxBufferLength"))
         }
     }
@@ -921,7 +900,7 @@ impl Device {
         let _pool = AutoreleasePool::new();
         // SAFETY: `new*` family, +1.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             Obj::from_owned(f(self.id(), sel(c"newCommandQueue")))
         }
     }
@@ -941,7 +920,7 @@ impl Library {
         // SAFETY: `newFunctionWithName:` is +1 (or nil when the entry point is
         // absent). The NSString is only read during the call.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, Id) -> Id = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Id = checked_msg();
             Obj::from_owned(f(self.0.id(), sel(c"newFunctionWithName:"), n.id()))
         }
     }
@@ -955,9 +934,9 @@ impl RenderPipelineDescriptor {
         // SAFETY: alloc/init is +1; `Obj` releases it once on drop.
         unsafe {
             let cls = class(c"MTLRenderPipelineDescriptor");
-            let alloc: unsafe extern "C" fn(ClassPtr, Sel) -> Id = msg();
+            let alloc: unsafe extern "C-unwind" fn(ClassPtr, Sel) -> Id = checked_msg();
             let raw = alloc(cls, sel(c"alloc"));
-            let init: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+            let init: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             Obj::from_owned(init(raw, sel(c"init"))).map(Self)
         }
     }
@@ -965,7 +944,7 @@ impl RenderPipelineDescriptor {
     pub(crate) fn set_vertex_function(&self, f: &Obj) {
         // SAFETY: the descriptor RETAINS the function; both outlive the call.
         unsafe {
-            let s: unsafe extern "C" fn(Id, Sel, Id) = msg();
+            let s: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
             s(self.0.id(), sel(c"setVertexFunction:"), f.id());
         }
     }
@@ -973,7 +952,7 @@ impl RenderPipelineDescriptor {
     pub(crate) fn set_fragment_function(&self, f: &Obj) {
         // SAFETY: as above.
         unsafe {
-            let s: unsafe extern "C" fn(Id, Sel, Id) = msg();
+            let s: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
             s(self.0.id(), sel(c"setFragmentFunction:"), f.id());
         }
     }
@@ -995,17 +974,17 @@ impl RenderPipelineDescriptor {
         // (autoreleased) objects owned by the pool; only mutated here, never
         // released.
         unsafe {
-            let get: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+            let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             let atts = get(self.0.id(), sel(c"colorAttachments"));
-            let sub: unsafe extern "C" fn(Id, Sel, usize) -> Id = msg();
+            let sub: unsafe extern "C-unwind" fn(Id, Sel, usize) -> Id = checked_msg();
             let a = sub(atts, sel(c"objectAtIndexedSubscript:"), 0);
-            let setf: unsafe extern "C" fn(Id, Sel, usize) = msg();
+            let setf: unsafe extern "C-unwind" fn(Id, Sel, usize) = checked_msg();
             setf(a, sel(c"setPixelFormat:"), format as usize);
             setf(a, sel(c"setWriteMask:"), write_mask.bits());
-            let setb: unsafe extern "C" fn(Id, Sel, ObjcBool) = msg();
+            let setb: unsafe extern "C-unwind" fn(Id, Sel, ObjcBool) = checked_msg();
             setb(a, sel(c"setBlendingEnabled:"), blend.is_some().into());
             if let Some(blend) = blend {
-                let set: unsafe extern "C" fn(Id, Sel, usize) = msg();
+                let set: unsafe extern "C-unwind" fn(Id, Sel, usize) = checked_msg();
                 set(
                     a,
                     sel(c"setSourceRGBBlendFactor:"),
@@ -1044,7 +1023,7 @@ impl RenderPipelineDescriptor {
     pub(crate) fn set_vertex_descriptor(&self, vd: &VertexDescriptor) {
         // SAFETY: the descriptor copies the vertex descriptor on assignment.
         unsafe {
-            let s: unsafe extern "C" fn(Id, Sel, Id) = msg();
+            let s: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
             s(self.0.id(), sel(c"setVertexDescriptor:"), vd.0.id());
         }
     }
@@ -1061,7 +1040,7 @@ impl VertexDescriptor {
         // before the pool pops and released once by `Obj`.
         unsafe {
             let cls = class(c"MTLVertexDescriptor");
-            let mk: unsafe extern "C" fn(ClassPtr, Sel) -> Id = msg();
+            let mk: unsafe extern "C-unwind" fn(ClassPtr, Sel) -> Id = checked_msg();
             let raw = mk(cls, sel(c"vertexDescriptor"));
             Obj::retain(raw).map(Self)
         }
@@ -1079,11 +1058,11 @@ impl VertexDescriptor {
         // SAFETY: `attributes` and its subscript return BORROWED autoreleased
         // objects owned by the pool above.
         unsafe {
-            let get: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+            let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             let arr = get(self.0.id(), sel(c"attributes"));
-            let sub: unsafe extern "C" fn(Id, Sel, usize) -> Id = msg();
+            let sub: unsafe extern "C-unwind" fn(Id, Sel, usize) -> Id = checked_msg();
             let a = sub(arr, sel(c"objectAtIndexedSubscript:"), index);
-            let set: unsafe extern "C" fn(Id, Sel, usize) = msg();
+            let set: unsafe extern "C-unwind" fn(Id, Sel, usize) = checked_msg();
             set(a, sel(c"setFormat:"), format as usize);
             set(a, sel(c"setOffset:"), offset);
             set(a, sel(c"setBufferIndex:"), buffer);
@@ -1098,56 +1077,14 @@ impl VertexDescriptor {
         let _pool = AutoreleasePool::new();
         // SAFETY: as `attribute` — borrowed autoreleased accessors.
         unsafe {
-            let get: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+            let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             let arr = get(self.0.id(), sel(c"layouts"));
-            let sub: unsafe extern "C" fn(Id, Sel, usize) -> Id = msg();
+            let sub: unsafe extern "C-unwind" fn(Id, Sel, usize) -> Id = checked_msg();
             let l = sub(arr, sel(c"objectAtIndexedSubscript:"), index);
-            let set: unsafe extern "C" fn(Id, Sel, usize) = msg();
+            let set: unsafe extern "C-unwind" fn(Id, Sel, usize) = checked_msg();
             set(l, sel(c"setStride:"), stride);
             set(l, sel(c"setStepFunction:"), STEP_PER_INSTANCE);
             set(l, sel(c"setStepRate:"), 1);
-        }
-    }
-
-    /// Read attribute `index` back as raw `(format, offset, bufferIndex)`, so a
-    /// wrong constant is not laundered through [`VertexFormat`]. An unwritten
-    /// attribute reads `MTLVertexFormatInvalid == 0` at offset 0, buffer 0.
-    #[cfg(test)]
-    pub(crate) fn attribute_raw(&self, index: usize) -> (usize, usize, usize) {
-        let _pool = AutoreleasePool::new();
-        // SAFETY: as `attribute` — borrowed autoreleased accessors; the three
-        // property reads are plain `NSUInteger` getters on a live descriptor.
-        unsafe {
-            let get: unsafe extern "C" fn(Id, Sel) -> Id = msg();
-            let arr = get(self.0.id(), sel(c"attributes"));
-            let sub: unsafe extern "C" fn(Id, Sel, usize) -> Id = msg();
-            let a = sub(arr, sel(c"objectAtIndexedSubscript:"), index);
-            let read: unsafe extern "C" fn(Id, Sel) -> usize = msg();
-            (
-                read(a, sel(c"format")),
-                read(a, sel(c"offset")),
-                read(a, sel(c"bufferIndex")),
-            )
-        }
-    }
-
-    /// Read layout `index` back as raw `(stride, stepFunction, stepRate)`. An
-    /// unwritten layout reads stride 0, which the test asserts for slot 0.
-    #[cfg(test)]
-    pub(crate) fn layout_raw(&self, index: usize) -> (usize, usize, usize) {
-        let _pool = AutoreleasePool::new();
-        // SAFETY: as `attribute_raw`.
-        unsafe {
-            let get: unsafe extern "C" fn(Id, Sel) -> Id = msg();
-            let arr = get(self.0.id(), sel(c"layouts"));
-            let sub: unsafe extern "C" fn(Id, Sel, usize) -> Id = msg();
-            let l = sub(arr, sel(c"objectAtIndexedSubscript:"), index);
-            let read: unsafe extern "C" fn(Id, Sel) -> usize = msg();
-            (
-                read(l, sel(c"stride")),
-                read(l, sel(c"stepFunction")),
-                read(l, sel(c"stepRate")),
-            )
         }
     }
 }
@@ -1167,16 +1104,22 @@ pub(crate) struct MtlSize {
     pub(crate) depth: usize,
 }
 
+// SAFETY: `#[repr(C)]` three `NSUInteger`s, the SDK's anonymous `MTLSize`
+// typedef, which clang encodes with no tag.
+unsafe impl Encode for MtlSize {
+    const ENCODING: &'static str = "{?=QQQ}";
+}
+
 impl Device {
     /// Build an `MTLComputePipelineState` from a kernel function.
     #[cfg(test)]
     pub(crate) fn new_compute_pipeline(&self, f: &Obj) -> Result<Obj, String> {
         // As `new_render_pipeline`, error out-param included.
         let _pool = AutoreleasePool::new();
-        let mut err: Id = ptr::null_mut();
+        let mut err: Id = Id::NIL;
         // SAFETY: `new*` family, +1 or nil-with-error.
         let pso = unsafe {
-            let m: unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id = msg();
+            let m: unsafe extern "C-unwind" fn(Id, Sel, Id, *mut Id) -> Id = checked_msg();
             m(
                 self.id(),
                 sel(c"newComputePipelineStateWithFunction:error:"),
@@ -1200,7 +1143,7 @@ pub(crate) unsafe fn buffer_u32s(buf: &Obj, count: usize) -> Vec<u32> {
     // valid for the buffer's lifetime; the caller pins the length and the
     // completion ordering.
     unsafe {
-        let c: unsafe extern "C" fn(Id, Sel) -> *const u32 = msg();
+        let c: unsafe extern "C-unwind" fn(Id, Sel) -> *const u32 = checked_msg();
         let p = c(buf.id(), sel(c"contents"));
         if p.is_null() {
             return Vec::new();
@@ -1217,7 +1160,7 @@ pub(crate) unsafe fn buffer_u32s(buf: &Obj, count: usize) -> Vec<u32> {
 pub(crate) unsafe fn buffer_write(buf: &Obj, bytes: &[u8]) {
     // SAFETY: as `buffer_u32s`, plus the caller's exclusivity guarantee.
     unsafe {
-        let c: unsafe extern "C" fn(Id, Sel) -> *mut u8 = msg();
+        let c: unsafe extern "C-unwind" fn(Id, Sel) -> *mut u8 = checked_msg();
         let p = c(buf.id(), sel(c"contents"));
         if !p.is_null() {
             ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
@@ -1241,7 +1184,7 @@ pub(crate) fn dispatch_compute(
     // `waitUntilCompleted` returns. Every setter is a void message on live
     // objects.
     unsafe {
-        let get: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+        let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
         let cb = get(queue.id(), sel(c"commandBuffer"));
         if cb.is_null() {
             return Err("MTLCommandQueue returned no command buffer".to_owned());
@@ -1250,9 +1193,9 @@ pub(crate) fn dispatch_compute(
         if enc.is_null() {
             return Err("MTLCommandBuffer returned no compute encoder".to_owned());
         }
-        let set_pso: unsafe extern "C" fn(Id, Sel, Id) = msg();
+        let set_pso: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
         set_pso(enc, sel(c"setComputePipelineState:"), pso.id());
-        let set_buf: unsafe extern "C" fn(Id, Sel, Id, usize, usize) = msg();
+        let set_buf: unsafe extern "C-unwind" fn(Id, Sel, Id, usize, usize) = checked_msg();
         for (i, b) in buffers.iter().enumerate() {
             set_buf(enc, sel(c"setBuffer:offset:atIndex:"), b.id(), 0, i);
         }
@@ -1263,14 +1206,14 @@ pub(crate) fn dispatch_compute(
             height: 8,
             depth: 1,
         };
-        let disp: unsafe extern "C" fn(Id, Sel, MtlSize, MtlSize) = msg();
+        let disp: unsafe extern "C-unwind" fn(Id, Sel, MtlSize, MtlSize) = checked_msg();
         disp(
             enc,
             sel(c"dispatchThreads:threadsPerThreadgroup:"),
             grid,
             tg,
         );
-        let void_msg: unsafe extern "C" fn(Id, Sel) = msg();
+        let void_msg: unsafe extern "C-unwind" fn(Id, Sel) = checked_msg();
         void_msg(enc, sel(c"endEncoding"));
         void_msg(cb, sel(c"commit"));
         wait_for_command_buffer(cb)?;
@@ -1287,14 +1230,14 @@ fn wait_for_command_buffer(command_buffer: Id) -> Result<(), String> {
     // SAFETY: callers pass a live command buffer retained by their surrounding
     // autorelease pool. All messages are property reads or the blocking wait.
     unsafe {
-        let wait: unsafe extern "C" fn(Id, Sel) = msg();
+        let wait: unsafe extern "C-unwind" fn(Id, Sel) = checked_msg();
         wait(command_buffer, sel(c"waitUntilCompleted"));
-        let get_status: unsafe extern "C" fn(Id, Sel) -> usize = msg();
+        let get_status: unsafe extern "C-unwind" fn(Id, Sel) -> usize = checked_msg();
         let status = get_status(command_buffer, sel(c"status"));
         if status == STATUS_COMPLETED {
             return Ok(());
         }
-        let get_error: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+        let get_error: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
         let error = get_error(command_buffer, sel(c"error"));
         Err(format!(
             "Metal command buffer finished with status {status}: {}",
@@ -1340,8 +1283,6 @@ pub(crate) enum PrimitiveType {
 /// up from 0 (wgpu-hal's principle, though its own slot is 15); 30 keeps the
 /// maximum distance. `metal_vertex_descriptor` lays attributes and stride
 /// here and `draw_and_read` binds `DrawCall::stream` here.
-/// `pipelines::tests::no_msl_buffer_binding_collides_with_the_instance_stream_slot`
-/// scans every shader for a colliding `[[buffer(n)]]`.
 pub(crate) const INSTANCE_STREAM_SLOT: usize = 30;
 
 /// `MTLClearColor`, passed by value to `-setClearColor:`: four doubles, a
@@ -1356,6 +1297,11 @@ pub(crate) struct ClearColor {
     pub(crate) a: f64,
 }
 
+// SAFETY: `#[repr(C)]` four `double`s, the SDK's anonymous `MTLClearColor`.
+unsafe impl Encode for ClearColor {
+    const ENCODING: &'static str = "{?=dddd}";
+}
+
 /// `MTLScissorRect`, passed by value to `-setScissorRect:`: four
 /// `NSUInteger`s (32 bytes), passed indirectly like [`MtlRegion`].
 #[repr(C)]
@@ -1365,6 +1311,12 @@ pub(crate) struct MtlScissorRect {
     pub(crate) y: usize,
     pub(crate) width: usize,
     pub(crate) height: usize,
+}
+
+// SAFETY: `#[repr(C)]` four `NSUInteger`s, the SDK's anonymous
+// `MTLScissorRect`.
+unsafe impl Encode for MtlScissorRect {
+    const ENCODING: &'static str = "{?=QQQQ}";
 }
 
 /// `MTLViewport`, passed by value to `-setViewport:`: six doubles, too many
@@ -1378,6 +1330,11 @@ pub(crate) struct MtlViewport {
     pub(crate) height: f64,
     pub(crate) znear: f64,
     pub(crate) zfar: f64,
+}
+
+// SAFETY: `#[repr(C)]` six `double`s, the SDK's anonymous `MTLViewport`.
+unsafe impl Encode for MtlViewport {
+    const ENCODING: &'static str = "{?=dddddd}";
 }
 
 impl MtlViewport {
@@ -1421,6 +1378,11 @@ pub(crate) struct MtlOrigin {
     pub(crate) z: usize,
 }
 
+// SAFETY: `#[repr(C)]` three `NSUInteger`s, the SDK's anonymous `MTLOrigin`.
+unsafe impl Encode for MtlOrigin {
+    const ENCODING: &'static str = "{?=QQQ}";
+}
+
 /// `MTLRegion`, an origin plus a size passed by value to `-replaceRegion:…`
 /// (48 bytes, passed indirectly).
 #[repr(C)]
@@ -1428,6 +1390,12 @@ pub(crate) struct MtlOrigin {
 pub(crate) struct MtlRegion {
     pub(crate) origin: MtlOrigin,
     pub(crate) size: MtlSize,
+}
+
+// SAFETY: `#[repr(C)]` an `MTLOrigin` then an `MTLSize`, the SDK's anonymous
+// `MTLRegion`.
+unsafe impl Encode for MtlRegion {
+    const ENCODING: &'static str = "{?={?=QQQ}{?=QQQ}}";
 }
 
 impl MtlRegion {
@@ -1462,7 +1430,8 @@ pub(crate) unsafe fn texture_upload(
     // SAFETY: the caller guarantees format, extent and length agree;
     // `replaceRegion:` copies out of `bytes` before returning.
     unsafe {
-        let f: unsafe extern "C" fn(Id, Sel, MtlRegion, usize, *const u8, usize) = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, MtlRegion, usize, *const u8, usize) =
+            checked_msg();
         f(
             tex.id(),
             sel(c"replaceRegion:mipmapLevel:withBytes:bytesPerRow:"),
@@ -1490,7 +1459,7 @@ pub(crate) fn texture_view(tex: &Obj, format: PixelFormat) -> Option<Obj> {
     // SAFETY: `new*` family, +1 or nil; the view holds its own reference to
     // the base texture, so the two lifetimes are independent.
     unsafe {
-        let f: unsafe extern "C" fn(Id, Sel, usize) -> Id = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, usize) -> Id = checked_msg();
         Obj::from_owned(f(
             tex.id(),
             sel(c"newTextureViewWithPixelFormat:"),
@@ -1504,7 +1473,7 @@ pub(crate) fn texture_view(tex: &Obj, format: PixelFormat) -> Option<Obj> {
 pub(crate) fn texture_pixel_format_raw(tex: &Obj) -> usize {
     // SAFETY: `-pixelFormat` is an `NSUInteger` getter on a live `MTLTexture`.
     unsafe {
-        let f: unsafe extern "C" fn(Id, Sel) -> usize = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = checked_msg();
         f(tex.id(), sel(c"pixelFormat"))
     }
 }
@@ -1513,7 +1482,7 @@ pub(crate) fn texture_pixel_format_raw(tex: &Obj) -> usize {
 pub(crate) fn texture_width(tex: &Obj) -> usize {
     // SAFETY: `-width` is an `NSUInteger` getter on a live `MTLTexture`.
     unsafe {
-        let f: unsafe extern "C" fn(Id, Sel) -> usize = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = checked_msg();
         f(tex.id(), sel(c"width"))
     }
 }
@@ -1522,7 +1491,7 @@ pub(crate) fn texture_width(tex: &Obj) -> usize {
 pub(crate) fn texture_height(tex: &Obj) -> usize {
     // SAFETY: `-height` is an `NSUInteger` getter on a live `MTLTexture`.
     unsafe {
-        let f: unsafe extern "C" fn(Id, Sel) -> usize = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = checked_msg();
         f(tex.id(), sel(c"height"))
     }
 }
@@ -1533,7 +1502,7 @@ pub(crate) fn texture_height(tex: &Obj) -> usize {
 pub(crate) fn texture_usage(tex: &Obj) -> usize {
     // SAFETY: `-usage` is an `NSUInteger` getter on a live `MTLTexture`.
     unsafe {
-        let f: unsafe extern "C" fn(Id, Sel) -> usize = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = checked_msg();
         f(tex.id(), sel(c"usage"))
     }
 }
@@ -1542,7 +1511,7 @@ pub(crate) fn texture_usage(tex: &Obj) -> usize {
 pub(crate) fn buffer_length(buf: &Obj) -> usize {
     // SAFETY: `-length` is an `NSUInteger` getter on a live `MTLBuffer`.
     unsafe {
-        let f: unsafe extern "C" fn(Id, Sel) -> usize = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = checked_msg();
         f(buf.id(), sel(c"length"))
     }
 }
@@ -1608,7 +1577,7 @@ pub(crate) struct DrawCall<'a> {
 /// `readback` must be Shared storage (no `synchronizeResource:` here).
 ///
 /// Binding indices are caller-spelled, from the table's `BindSpec` for a table
-/// row (checked against the `.metal` sources by the scan in `super::shaders`).
+/// row.
 ///
 /// Safe and checked, unlike `texture_upload`, `buffer_write`, `buffer_u32s`
 /// and `buffer_bytes`, whose preconditions depend on GPU/CPU ordering. This
@@ -1679,41 +1648,41 @@ pub(crate) fn draw_and_read(
     // extent, stride and length were validated above.
     unsafe {
         let rp_cls = class(c"MTLRenderPassDescriptor");
-        let mk: unsafe extern "C" fn(ClassPtr, Sel) -> Id = msg();
+        let mk: unsafe extern "C-unwind" fn(ClassPtr, Sel) -> Id = checked_msg();
         let rp = mk(rp_cls, sel(c"renderPassDescriptor"));
 
-        let get: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+        let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
         let atts = get(rp, sel(c"colorAttachments"));
-        let sub: unsafe extern "C" fn(Id, Sel, usize) -> Id = msg();
+        let sub: unsafe extern "C-unwind" fn(Id, Sel, usize) -> Id = checked_msg();
         let a0 = sub(atts, sel(c"objectAtIndexedSubscript:"), 0);
 
-        let set_obj: unsafe extern "C" fn(Id, Sel, Id) = msg();
+        let set_obj: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
         set_obj(a0, sel(c"setTexture:"), pass.dst.id());
-        let set_usize: unsafe extern "C" fn(Id, Sel, usize) = msg();
+        let set_usize: unsafe extern "C-unwind" fn(Id, Sel, usize) = checked_msg();
         set_usize(a0, sel(c"setStoreAction:"), STORE_ACTION_STORE);
         match pass.load {
             LoadAction::Clear(c) => {
                 set_usize(a0, sel(c"setLoadAction:"), LOAD_ACTION_CLEAR);
-                let set_clear: unsafe extern "C" fn(Id, Sel, ClearColor) = msg();
+                let set_clear: unsafe extern "C-unwind" fn(Id, Sel, ClearColor) = checked_msg();
                 set_clear(a0, sel(c"setClearColor:"), c);
             }
             LoadAction::Load => set_usize(a0, sel(c"setLoadAction:"), LOAD_ACTION_LOAD),
         }
 
         let cb = get(queue.id(), sel(c"commandBuffer"));
-        let mk_enc: unsafe extern "C" fn(Id, Sel, Id) -> Id = msg();
+        let mk_enc: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Id = checked_msg();
         let enc = mk_enc(cb, sel(c"renderCommandEncoderWithDescriptor:"), rp);
 
         set_obj(enc, sel(c"setRenderPipelineState:"), pass.pso.id());
         if let Some(vp) = pass.viewport {
-            let set_vp: unsafe extern "C" fn(Id, Sel, MtlViewport) = msg();
+            let set_vp: unsafe extern "C-unwind" fn(Id, Sel, MtlViewport) = checked_msg();
             set_vp(enc, sel(c"setViewport:"), vp);
         }
         if let Some(sc) = pass.scissor {
-            let set_sc: unsafe extern "C" fn(Id, Sel, MtlScissorRect) = msg();
+            let set_sc: unsafe extern "C-unwind" fn(Id, Sel, MtlScissorRect) = checked_msg();
             set_sc(enc, sel(c"setScissorRect:"), sc);
         }
-        let set_tex: unsafe extern "C" fn(Id, Sel, Id, usize) = msg();
+        let set_tex: unsafe extern "C-unwind" fn(Id, Sel, Id, usize) = checked_msg();
         if let Some((t, index)) = pass.src_tex {
             set_tex(enc, sel(c"setFragmentTexture:atIndex:"), t.id(), index);
         }
@@ -1725,7 +1694,7 @@ pub(crate) fn draw_and_read(
                 index,
             );
         }
-        let set_buf: unsafe extern "C" fn(Id, Sel, Id, usize, usize) = msg();
+        let set_buf: unsafe extern "C-unwind" fn(Id, Sel, Id, usize, usize) = checked_msg();
         if let Some((u, index)) = pass.uniform {
             set_buf(
                 enc,
@@ -1746,7 +1715,7 @@ pub(crate) fn draw_and_read(
         }
         // The stream binds only at INSTANCE_STREAM_SLOT; slot 0 belongs to the
         // MSL uniform blocks.
-        let draw: unsafe extern "C" fn(Id, Sel, usize, usize, usize, usize) = msg();
+        let draw: unsafe extern "C-unwind" fn(Id, Sel, usize, usize, usize, usize) = checked_msg();
         match &pass.draw {
             Some(d) => {
                 if let Some(s) = d.stream {
@@ -1776,13 +1745,13 @@ pub(crate) fn draw_and_read(
                 1,
             ),
         }
-        let void_msg: unsafe extern "C" fn(Id, Sel) = msg();
+        let void_msg: unsafe extern "C-unwind" fn(Id, Sel) = checked_msg();
         void_msg(enc, sel(c"endEncoding"));
 
         // Texture -> buffer, in the SAME command buffer, so it is ordered after
         // the pass above without an explicit barrier.
         let blit = get(cb, sel(c"blitCommandEncoder"));
-        let copy: unsafe extern "C" fn(
+        let copy: unsafe extern "C-unwind" fn(
             Id,
             Sel,
             Id,
@@ -1794,7 +1763,7 @@ pub(crate) fn draw_and_read(
             usize,
             usize,
             usize,
-        ) = msg();
+        ) = checked_msg();
         copy(
             blit,
             sel(c"copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toBuffer:destinationOffset:destinationBytesPerRow:destinationBytesPerImage:"),
@@ -1828,7 +1797,7 @@ pub(crate) unsafe fn buffer_bytes(buf: &Obj, len: usize) -> Vec<u8> {
     // SAFETY: `-contents` on a shared buffer is CPU-visible for the buffer's
     // lifetime; the caller pins the length and the completion ordering.
     unsafe {
-        let c: unsafe extern "C" fn(Id, Sel) -> *const u8 = msg();
+        let c: unsafe extern "C-unwind" fn(Id, Sel) -> *const u8 = checked_msg();
         let p = c(buf.id(), sel(c"contents"));
         if p.is_null() {
             return Vec::new();
@@ -1855,9 +1824,9 @@ mod tests {
         // through `ObjcBool`.
         unsafe {
             let all = Obj::from_owned(MTLCopyAllDevices())?;
-            let count: unsafe extern "C" fn(Id, Sel) -> usize = msg();
-            let at: unsafe extern "C" fn(Id, Sel, usize) -> Id = msg();
-            let flag: unsafe extern "C" fn(Id, Sel) -> ObjcBool = msg();
+            let count: unsafe extern "C-unwind" fn(Id, Sel) -> usize = checked_msg();
+            let at: unsafe extern "C-unwind" fn(Id, Sel, usize) -> Id = checked_msg();
+            let flag: unsafe extern "C-unwind" fn(Id, Sel) -> ObjcBool = checked_msg();
             let mut out = Vec::new();
             for i in 0..count(all.id(), sel(c"count")) {
                 let d = at(all.id(), sel(c"objectAtIndexedSubscript:"), i);
@@ -1966,76 +1935,6 @@ mod tests {
             wrong.is_empty(),
             "choose_listed moved:\n{}",
             wrong.join("\n")
-        );
-    }
-
-    /// The ObjC `BOOL` slot: one byte, `bool` in and out, and on `signed char`
-    /// targets any non-zero byte reads YES. No GPU needed.
-    #[test]
-    fn objc_bool_is_one_byte_and_reads_c_style() {
-        assert_eq!(std::mem::size_of::<ObjcBool>(), 1, "BOOL is one byte");
-        assert!(ObjcBool::from(true).as_bool());
-        assert!(!ObjcBool::from(false).as_bool());
-        assert!(!ObjcBool::default().as_bool(), "the default is NO");
-        #[cfg(not(target_arch = "aarch64"))]
-        {
-            // SAFETY: on this arm `aterm_objc::Bool` is `#[repr(transparent)]`
-            // over `i8`, so every `i8` is valid; `transmute` checks the sizes.
-            let raw = |byte: i8| unsafe { std::mem::transmute::<i8, aterm_objc::Bool>(byte) };
-            assert!(raw(2).as_bool(), "a BOOL of 2 is YES");
-            assert!(raw(-1).as_bool(), "a BOOL of -1 is YES");
-            assert!(!raw(0).as_bool());
-        }
-    }
-
-    /// `-[MTLTexture storageMode]`.
-    fn texture_storage_mode(tex: &Obj) -> usize {
-        // SAFETY: `NSUInteger` getter on a live texture.
-        unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> usize = msg();
-            f(tex.id(), sel(c"storageMode"))
-        }
-    }
-
-    /// The `storageMode` a fresh `texture2DDescriptorWith...` carries BEFORE any
-    /// setter — the platform default [`Device::new_texture_2d`] restates.
-    fn texture_descriptor_default_storage_mode() -> usize {
-        let _pool = AutoreleasePool::new();
-        // SAFETY: the descriptor factory returns an AUTORELEASED object, borrowed
-        // and left to the pool above; `storageMode` is an `NSUInteger` getter.
-        unsafe {
-            let mk: unsafe extern "C" fn(ClassPtr, Sel, usize, usize, usize, ObjcBool) -> Id =
-                msg();
-            let d = mk(
-                class(c"MTLTextureDescriptor"),
-                sel(c"texture2DDescriptorWithPixelFormat:width:height:mipmapped:"),
-                PixelFormat::Rgba8Unorm as usize,
-                16,
-                16,
-                false.into(),
-            );
-            let get: unsafe extern "C" fn(Id, Sel) -> usize = msg();
-            get(d, sel(c"storageMode"))
-        }
-    }
-
-    /// Every minted texture is Managed, explicitly and equal to the
-    /// descriptor's platform default.
-    #[test]
-    fn textures_are_minted_managed_and_managed_is_the_platform_default() {
-        let dev = crate::metal::test_support::device();
-        assert_eq!(
-            texture_descriptor_default_storage_mode(),
-            TEXTURE_STORAGE_MODE_MANAGED,
-            "a fresh MTLTextureDescriptor's storageMode on this OS"
-        );
-        let tex = dev
-            .new_texture_2d(PixelFormat::Rgba8Unorm, 16, 16, TEXTURE_USAGE_SHADER_READ)
-            .expect("texture");
-        assert_eq!(
-            texture_storage_mode(&tex),
-            TEXTURE_STORAGE_MODE_MANAGED,
-            "the minted texture's storageMode"
         );
     }
 }

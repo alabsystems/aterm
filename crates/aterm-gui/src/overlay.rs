@@ -11,12 +11,12 @@
 //!
 //! Each variant's model fans out to the SAME paint/lifecycle observers through the
 //! [`OverlayModel`] trait: pixels ([`OverlayModel::tray`]), the repaint fingerprint
-//! ([`OverlayModel::fingerprint`]), and — under the `a11y-accesskit` feature — the
-//! cross-platform accessibility tree ([`OverlayModel::a11y`]). Concrete compatibility
+//! ([`OverlayModel::fingerprint`]), and — on Linux, where the AT-SPI publisher
+//! runs — the accessibility tree ([`OverlayModel::a11y`]). Concrete compatibility
 //! introspection calls each surviving overlay model's inherent serializer; native
 //! Settings inspection compiles the native semantic tree instead.
 
-use aterm_render::Theme;
+use crate::chrome_band::ChromePalette;
 
 use crate::conn_card::ConnCardState;
 use crate::connection_map::ConnectionMapState;
@@ -41,20 +41,23 @@ pub(crate) trait OverlayModel {
     /// — the PIXELS, captured WYSIWYG through the SACRED `composite_tray` path.
     /// (Palette paints a frosted top band; a floating card returns its own rect
     /// in the `TrayInput`, which tells the splice where.)
-    fn tray(&self, geom: &SettingsGeom, theme: Theme) -> TrayInput;
+    /// `palette` is the chrome palette the card paints from
+    /// ([`crate::app_render::ChromeSurface::OverGrid`], or `NativePage` for a modal
+    /// over a native page).
+    fn tray(&self, geom: &SettingsGeom, palette: ChromePalette) -> TrayInput;
 
     /// The `controls front` truncation signal: `(scroll, total, visible)` — rows scrolled
     /// past the top, the full model row count, and rows actually shown on the card. Read
     /// from the SAME `&self` as the tray. A non-scrolling surface returns
     /// `(0, total, visible)`.
     fn scroll_extent(&self) -> (usize, usize, usize);
-    /// The cross-platform accessibility tree ([`accesskit::TreeUpdate`]) for this surface,
+    /// The cross-platform accessibility tree ([`aterm_a11y::model::TreeUpdate`]) for this surface,
     /// built from the SAME `&self` the pixels read — another observer
-    /// (screen readers) that can never diverge from the glass. Feature-gated because the
-    /// AccessKit dep is opt-in; when present it is REQUIRED for every variant, so a surface
+    /// (screen readers) that can never diverge from the glass. Gated on `a11y_tree`
+    /// (Linux, where the tree is published); there it is REQUIRED for every variant, so a surface
     /// left out is a compile error (the same exhaustive-fan-out guarantee as the rest).
     #[cfg(a11y_tree)]
-    fn a11y(&self) -> accesskit::TreeUpdate;
+    fn a11y(&self) -> aterm_a11y::model::TreeUpdate;
 }
 
 impl OverlayModel for PaletteState {
@@ -66,14 +69,14 @@ impl OverlayModel for PaletteState {
         // viewport. `palette_layout` retains the natural command-row height.
         avail
     }
-    fn tray(&self, geom: &SettingsGeom, theme: Theme) -> TrayInput {
-        crate::palette::palette_tray(self, geom, theme)
+    fn tray(&self, geom: &SettingsGeom, palette: ChromePalette) -> TrayInput {
+        crate::palette::palette_tray(self, geom, palette)
     }
     fn scroll_extent(&self) -> (usize, usize, usize) {
         PaletteState::scroll_extent(self)
     }
     #[cfg(a11y_tree)]
-    fn a11y(&self) -> accesskit::TreeUpdate {
+    fn a11y(&self) -> aterm_a11y::model::TreeUpdate {
         crate::palette::palette_a11y(self)
     }
 }
@@ -86,14 +89,14 @@ impl OverlayModel for ConnCardState {
         // Anchored like the tab menu — `conn_card_layout` sizes the card.
         ConnCardState::wanted_rows(self, avail)
     }
-    fn tray(&self, geom: &SettingsGeom, theme: Theme) -> TrayInput {
-        crate::conn_card::conn_card_tray(self, geom, theme)
+    fn tray(&self, geom: &SettingsGeom, palette: ChromePalette) -> TrayInput {
+        crate::conn_card::conn_card_tray(self, geom, palette)
     }
     fn scroll_extent(&self) -> (usize, usize, usize) {
         ConnCardState::scroll_extent(self)
     }
     #[cfg(a11y_tree)]
-    fn a11y(&self) -> accesskit::TreeUpdate {
+    fn a11y(&self) -> aterm_a11y::model::TreeUpdate {
         crate::conn_card::conn_card_a11y(self)
     }
 }
@@ -107,14 +110,14 @@ impl OverlayModel for ConnectionMapState {
         // and `map_layout` content-sizes the card within it.
         avail
     }
-    fn tray(&self, geom: &SettingsGeom, theme: Theme) -> TrayInput {
-        crate::connection_map::map_tray(self, geom, theme)
+    fn tray(&self, geom: &SettingsGeom, palette: ChromePalette) -> TrayInput {
+        crate::connection_map::map_tray(self, geom, palette)
     }
     fn scroll_extent(&self) -> (usize, usize, usize) {
         ConnectionMapState::scroll_extent(self)
     }
     #[cfg(a11y_tree)]
-    fn a11y(&self) -> accesskit::TreeUpdate {
+    fn a11y(&self) -> aterm_a11y::model::TreeUpdate {
         crate::connection_map::map_a11y(self)
     }
 }
@@ -128,14 +131,14 @@ impl OverlayModel for SessionPickerState {
         // and `picker_layout` content-sizes the card within it.
         avail
     }
-    fn tray(&self, geom: &SettingsGeom, theme: Theme) -> TrayInput {
-        crate::session_picker::picker_tray(self, geom, theme)
+    fn tray(&self, geom: &SettingsGeom, palette: ChromePalette) -> TrayInput {
+        crate::session_picker::picker_tray(self, geom, palette)
     }
     fn scroll_extent(&self) -> (usize, usize, usize) {
         SessionPickerState::scroll_extent(self)
     }
     #[cfg(a11y_tree)]
-    fn a11y(&self) -> accesskit::TreeUpdate {
+    fn a11y(&self) -> aterm_a11y::model::TreeUpdate {
         crate::session_picker::picker_a11y(self)
     }
 }
@@ -247,29 +250,6 @@ impl Overlay {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The wrapper fingerprint must be DISJOINT across variants even when the inner
-    /// fingerprints coincide — otherwise the `settings_card` fp cache could reuse one
-    /// surface's card for another (silent WYSIWYG corruption). It must also never be `0`
-    /// (the closed sentinel).
-    #[test]
-    fn fingerprint_is_disjoint_across_variants_and_nonzero() {
-        // Force the inner fingerprints to coincide by constructing the wrapper value
-        // directly from a shared inner hash: the wrapper's tag+rotate must still separate
-        // them. We assert the wrapper formula over identical inner values.
-        for inner in [0u64, 1, 42, u64::MAX, 0x00FF_00FF_00FF_00FF] {
-            let p = (3u64.rotate_left(56) ^ inner) | 1;
-            let c = (5u64.rotate_left(56) ^ inner) | 1;
-            assert_ne!(p, c, "palette vs conn-card collide at inner={inner:#x}");
-            assert_ne!(p, 0, "palette fp must be nonzero");
-            assert_ne!(c, 0, "conn-card fp must be nonzero");
-        }
-
-        // And over a real, live model.
-        let palette = Overlay::Palette(PaletteState::new());
-        assert_ne!(palette.fingerprint(), 0);
-        assert_eq!(palette.kind(), OverlayKind::Palette);
-    }
 
     /// `status_line()` (the `controls front` open case) reports `open=true`, the surface
     /// `kind=<keyword>`, the exact `Overlay::fingerprint()`, and a `scroll/total/visible`

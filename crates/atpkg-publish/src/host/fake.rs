@@ -31,6 +31,7 @@ struct State {
     fail_once: Vec<(Slug, String, String)>,
     unreachable_owners: BTreeSet<String>,
     private: BTreeSet<Slug>,
+    anonymous: bool,
     calls: Vec<String>,
 }
 
@@ -131,6 +132,13 @@ impl FakeHost {
         }
     }
 
+    /// A keyless builder: no token and no `gh` login, so every authenticated read
+    /// (`releases`, `release`, `download`) is unreachable and only the anonymous download
+    /// host answers ([`ReleaseHost::reads_anonymously`]).
+    pub fn set_anonymous_reads(&self, anonymous: bool) {
+        self.state().anonymous = anonymous;
+    }
+
     /// `clone_repo(slug)` clones this local repository.
     pub fn add_clone_source(&self, slug: &Slug, path: &Path) {
         self.state()
@@ -149,6 +157,11 @@ impl FakeHost {
     }
 
     fn reachable(&self, slug: &Slug) -> Result<(), HostError> {
+        if self.state().anonymous {
+            return Err(HostError::Unreachable(
+                "gh has no login and there is no token file on this keyless builder".into(),
+            ));
+        }
         if self.state().unreachable_owners.contains(&slug.owner) {
             Err(HostError::Unreachable(format!(
                 "{} did not answer (HTTP 500)",
@@ -339,6 +352,10 @@ impl ReleaseHost for FakeHost {
             Ok(()) => Probe::Present,
             Err(e) => Probe::Unknown(format!("write {}: {e}", dest.display())),
         }
+    }
+
+    fn reads_anonymously(&self) -> bool {
+        self.state().anonymous
     }
 
     fn clone_repo(&self, slug: &Slug, dest: &Path) -> Result<(), HostError> {

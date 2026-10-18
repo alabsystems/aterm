@@ -847,7 +847,7 @@ impl EffectsPipeline {
 
     // --- the companions' doors ------------------------------------------------
     //
-    // The pet, the flying head, the typed dog and Robi draw through these
+    // The pet, the flying head and the typed dog draw through these
     // doors into the frame's sprite channel, baked by the one word engine's
     // atlas; each route that draws them resolves their policy first.
 
@@ -1025,14 +1025,6 @@ impl EffectsPipeline {
             CanvasInk::Pane => &mut self.pane_free,
         };
         self.decos.dog_cameo(frame, free)
-    }
-
-    /// Robi, the resident robot (a single grid's chrome furniture).
-    pub fn draw_robi(
-        &mut self,
-        frame: crate::word_decorations::RobiShowFrame,
-    ) -> Option<crate::word_decorations::RobiEmission> {
-        self.decos.robi(frame, &mut self.free_scratch)
     }
 
     /// Install the window's word channels — decorations, animated ink, the
@@ -1470,7 +1462,6 @@ mod flying_head_tests {
             ring: true,
             beam: false,
             head_dx: 0.5,
-            pack: None,
         }
     }
 

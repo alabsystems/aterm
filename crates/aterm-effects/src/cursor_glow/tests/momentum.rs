@@ -90,8 +90,7 @@ fn momentum_unifies_glow_and_cat_metrics() {
 /// the caret forward +1 col every tick but arms no press hint, so the metric
 /// stays at zero and no pulse reaches the cat. The same moves with a real
 /// press build normally. The advance keys on the press hint, not candidate
-/// admission (see `classify_move` and
-/// `momentum_climbs_through_streaming_collisions_that_retire_every_candidate`).
+/// admission (see `classify_move`).
 #[test]
 fn program_output_alone_builds_no_momentum() {
     let g = geom();

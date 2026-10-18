@@ -9,8 +9,9 @@
 # CoreText instead. Its Cargo.lock pins the versions aterm's own
 # lockfile held when the corpora were recorded.
 #
-# ttf-parser is built with `gvar-alloc`, as aterm's Linux build ships it
-# (winit's `wayland-csd-adwaita` -> sctk-adwaita -> ab_glyph turns it on); the
+# ttf-parser is built with `gvar-alloc`, as aterm's Linux build shipped it
+# until LW.5 (winit's `wayland-csd-adwaita` -> sctk-adwaita -> ab_glyph turned
+# it on); the
 # workspace's macOS, Windows and wasm builds, and `-p aterm-render`, leave it
 # off. It changes only a glyph with more than 32 `gvar` tuples (drawn with it,
 # no outline without), so `replay` checking `reader.txt` here also shows that

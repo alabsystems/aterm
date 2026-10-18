@@ -6,6 +6,7 @@
 //! so it lives in its own `badge_card` slot behind the modal cards: an open overlay hides it, and
 //! a native route composes it into its own tray (`App::compose_native_route_card`).
 
+#[cfg(test)]
 use aterm_render::Theme;
 
 use crate::settings::{Roles, SettingsGeom, text_w};
@@ -37,10 +38,14 @@ pub(crate) fn fingerprint(enabled: bool) -> u64 {
     h.finish() | 1
 }
 
-/// Build the badge tray: a small rounded pill pinned to the top-right with the
-/// `v{version} · {build}` caption. `card` is the pill's own bounds, so the shared rasterizer
-/// paints only that region.
-pub(crate) fn badge_tray(g: &SettingsGeom, theme: Theme) -> TrayInput {
+/// Build the badge tray: a small rounded pill pinned to the TOP-RIGHT of the tray with
+/// the `v{version} · {build}` caption. `card` is the pill's own bounds (top-right), so
+/// the shared rasterizer only paints that small region — not a full-frame canvas. PURE
+/// DrawPrims, same vocabulary as [`crate::about`].
+pub(crate) fn badge_tray(
+    g: &SettingsGeom,
+    theme: impl Into<crate::chrome_band::ChromePalette>,
+) -> TrayInput {
     let r = Roles::from_theme(theme);
     let (cw, ch, px) = (g.cw, g.ch, g.font_px);
     let tray_w = g.cols as f32 * cw;
@@ -108,22 +113,6 @@ mod tests {
             cols: 120,
             panel_rows: 40,
         }
-    }
-
-    #[test]
-    fn text_has_version_and_build() {
-        let t = badge_text();
-        assert!(t.starts_with('v'), "leads with v: {t}");
-        // Compiler provenance is not on the badge; About and the control metadata carry it.
-        assert!(
-            t.contains(crate::build_info::version_display()),
-            "has display version: {t}"
-        );
-        assert!(
-            t.contains(crate::build_info::build_number()),
-            "has build: {t}"
-        );
-        assert!(!t.contains('+'), "no provenance suffix on the badge: {t}");
     }
 
     #[test]

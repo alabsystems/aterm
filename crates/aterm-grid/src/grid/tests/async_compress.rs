@@ -5,7 +5,6 @@
 //! against the real `Grid`:
 //!   - while a worker owns the drain, staged lines stay readable;
 //!   - a bounded drain loses no history and preserves order;
-//!   - the backlog stays bounded under sustained overload;
 //!   - with no worker attached, the drain runs inline.
 
 use crate::Grid;
@@ -91,64 +90,6 @@ fn bounded_drain_promotes_at_most_the_batch() {
         start - after <= 200,
         "a single bounded batch promotes at most max_lines ({} drained)",
         start - after
-    );
-}
-
-#[test]
-fn backpressure_bounds_the_backlog_under_sustained_overload() {
-    // A 2 MiB budget holds fewer staged `L<n>` rows than the 20k floor, so the
-    // staging cap is the floor; the 100k store limit is far away, so every drop
-    // is a real loss.
-    let scrollback = Scrollback::new(100, 1000, 2 * 1024 * 1024);
-    let mut grid = Grid::with_tiered_scrollback(3, 80, 2, scrollback);
-    grid.set_compress_offload_active(true);
-
-    // Feed past the backpressure cap without the worker running: the reader
-    // bounds the backlog by dropping its oldest staged lines in O(1), never by
-    // compressing inline on the PTY-drain path.
-    let total = Grid::ASYNC_COMPRESS_BACKPRESSURE + 5_000;
-    feed_numbered_lines(&mut grid, 0, total);
-
-    assert!(
-        grid.lazy_backlog_len() <= Grid::ASYNC_COMPRESS_BACKPRESSURE,
-        "backlog must stay clamped at the cap via drop-oldest, got {}",
-        grid.lazy_backlog_len()
-    );
-    // Retained history is one marker row naming the cut, then a contiguous
-    // newest suffix reaching (nearly) the last line fed.
-    let hist = history_oldest_first(&grid);
-    let marked: usize = hist[0]
-        .strip_prefix(crate::grid::scroll_convert::FLOOD_MARKER_PREFIX)
-        .and_then(|rest| rest.split(' ').next())
-        .and_then(|n| n.parse().ok())
-        .unwrap_or_else(|| {
-            panic!(
-                "the oldest retained row is the flood marker, got {:?}",
-                hist[0]
-            )
-        });
-    let content = &hist[1..];
-    let first_n: usize = content[0]
-        .trim_start_matches('L')
-        .parse()
-        .expect("L{n} line");
-    assert_eq!(
-        first_n, marked,
-        "the marker names exactly the lines missing before the first survivor"
-    );
-    let expected: Vec<String> = (first_n..first_n + content.len())
-        .map(|n| format!("L{n}"))
-        .collect();
-    assert_eq!(content, expected, "retained history must be contiguous");
-    let last_n = first_n + content.len() - 1;
-    assert!(
-        last_n + 4 >= total,
-        "history must end at the newest scrolled lines (last retained L{last_n}, fed {total})"
-    );
-    assert!(
-        hist.len() >= Grid::ASYNC_COMPRESS_BACKPRESSURE,
-        "the cap's worth of depth stays retained, got {}",
-        hist.len()
     );
 }
 

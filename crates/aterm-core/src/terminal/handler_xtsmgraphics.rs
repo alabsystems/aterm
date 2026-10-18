@@ -16,16 +16,24 @@
 
 use super::handler::TerminalHandler;
 
-/// aterm-sixel's color-register count for a build without `sixel`; must equal
-/// it, so both builds report the same limits.
-#[cfg(not(feature = "sixel"))]
-const MAX_COLOR_REGISTERS: usize = 1024;
-/// aterm-sixel's raster dimension limit for a build without `sixel`; must
-/// equal it, so both builds report the same limits.
-#[cfg(not(feature = "sixel"))]
-const SIXEL_MAX_DIMENSION: usize = 4096;
-#[cfg(feature = "sixel")]
 use crate::sixel::{MAX_COLOR_REGISTERS, SIXEL_MAX_DIMENSION};
+
+/// The largest sixel geometry XTSMGRAPHICS advertises on either axis: xterm's
+/// default `maxGraphicSize` (1000x1000), and an image the DCS path places
+/// whatever the encoder. Larger ones are dropped, not clipped: the decoder
+/// charges 4 bytes per pixel of its raster stride (which a column-at-a-time
+/// paint grows to the next power of two) against the DCS budget, beside the
+/// stream's own bytes, and refuses more than `SIXEL_MAX_PIXELS`. So the per-axis
+/// [`SIXEL_MAX_DIMENSION`] (4096) is a decoder clamp, not a size that places.
+const SIXEL_ADVERTISED_MAX: u16 = 1000;
+
+// The advertised square's raster fits in half the DCS budget, leaving the other
+// half for the stream's bytes, and under the decoder's per-axis clamp.
+const _: () = {
+    let side = SIXEL_ADVERTISED_MAX as usize;
+    assert!(4 * side.next_power_of_two() * side <= crate::terminal::MAX_DCS_GLOBAL_BUDGET / 2);
+    assert!(side <= SIXEL_MAX_DIMENSION);
+};
 
 /// Status codes for XTSMGRAPHICS response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,8 +123,8 @@ impl TerminalHandler<'_> {
                 // (xterm; lsix and img2sixel size output from it). That is CSI
                 // 14 t's fact, so it takes the same window-ops capability and
                 // answer; without one, or before a host reports a cell box, it
-                // answers the maximum.
-                let max_dim = u16::try_from(SIXEL_MAX_DIMENSION).unwrap_or(u16::MAX);
+                // answers the maximum. Either way capped at what places.
+                let max_dim = SIXEL_ADVERTISED_MAX;
                 let window_cap = super::window_auth::WindowMintAuthority::new()
                     .try_mint_with_engine(
                         self.policy.xtwinops_gate(14),
@@ -131,7 +139,7 @@ impl TerminalHandler<'_> {
             }
 
             (XtsmgraphicsItem::SixelGeometry, XtsmgraphicsAction::ReadMax) => {
-                let dim = u16::try_from(SIXEL_MAX_DIMENSION).unwrap_or(u16::MAX);
+                let dim = SIXEL_ADVERTISED_MAX;
                 self.send_xtsmgraphics_response(cap, pi, XtsmgraphicsStatus::Success, &[dim, dim]);
             }
 
@@ -201,11 +209,50 @@ mod tests {
             }),
             _ => None,
         });
-        assert_eq!(geometry_read(&mut term), "\x1b[?2;0;4096;4096S");
+        assert_eq!(geometry_read(&mut term), "\x1b[?2;0;1000;1000S");
 
         // Negative control: the same host is consulted once window ops are on.
         term.modes_mut().allow_window_ops = true;
         assert_eq!(geometry_read(&mut term), "\x1b[?2;0;222;111S");
+    }
+
+    /// Every geometry XTSMGRAPHICS advertises is one the DCS path places, whatever
+    /// the encoder: a solid image of the advertised maximum as one run per band
+    /// under a raster declaration, painted a column at a time with none, and as
+    /// sixteen colour passes per band.
+    #[test]
+    fn the_advertised_sixel_maximum_is_placed() {
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b[?2;4S");
+        let reply = String::from_utf8(term.take_response().expect("an answer")).unwrap();
+        let dims: Vec<usize> = reply
+            .trim_start_matches("\x1b[?2;0;")
+            .trim_end_matches('S')
+            .split(';')
+            .map(|n| n.parse().expect("a dimension"))
+            .collect();
+        let (w, h) = (dims[0], dims[1]);
+        let bands = h / 6;
+        let rle = format!(
+            "\"1;1;{w};{h}#1;2;100;0;0#1{}",
+            format!("!{w}~-").repeat(bands)
+        );
+        let columns = format!(
+            "#1;2;100;0;0#1{}",
+            format!("{}-", "~".repeat(w)).repeat(bands)
+        );
+        let pass = |c: usize| format!("#{c}{}$", "~".repeat(w));
+        let passes = (0..bands)
+            .map(|_| (1..=16).map(pass).collect::<String>() + "-")
+            .collect::<String>();
+        for (name, body) in [("rle", rle), ("columns", columns), ("passes", passes)] {
+            let mut term = Terminal::new(24, 80);
+            term.process(format!("\x1bP0;1;0q{body}\x1b\\").as_bytes());
+            assert!(
+                !term.images_row(0).is_empty(),
+                "{name}: the advertised {w}x{h} placed nothing"
+            );
+        }
     }
 
     /// Window ops alone, before any host has reported a cell box, still
@@ -214,6 +261,6 @@ mod tests {
     fn sixel_geometry_read_falls_back_without_a_cell_box() {
         let mut term = Terminal::new(24, 80);
         term.modes_mut().allow_window_ops = true;
-        assert_eq!(geometry_read(&mut term), "\x1b[?2;0;4096;4096S");
+        assert_eq!(geometry_read(&mut term), "\x1b[?2;0;1000;1000S");
     }
 }

@@ -137,6 +137,7 @@ impl LevelUp {
     /// its own instant: its cap is further off already, and its ramp runs on. A
     /// park the launched lane admitted late after an early miss would otherwise
     /// freeze the terminal on a cap counted from the first park.
+    #[cfg(any(unix, test))]
     pub(crate) fn re_anchor(&mut self, now: Instant) {
         let continued = Self::charging_continued(self.build, now, self.motion);
         self.spawned = self.spawned.max(continued.spawned);

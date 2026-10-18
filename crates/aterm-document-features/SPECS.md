@@ -3,6 +3,10 @@
 
 # aterm-document-features: spec recovery from its 1 unit tests
 
+> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 1 test it
+> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
+> were taken before.
+
 > Status 2026-10-16: this is the crate's migration worklist. The one spec below is to be
 > proved through Trust/Clean, and then the test it subsumes is deleted. No test has been
 > deleted yet. The spec is blocked by gaps 0, 1, 3, 8 and 9 (§6), and the crate retires
@@ -38,7 +42,7 @@ must handle)`, `blocking_gaps` (audit §7 numbers).
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
-docfeat-expands-to-empty-str	contract	document_features::document_features (src/lib.rs)	∀ args: TokenStream (the empty stream, upstream's `feature_label = "..."` form and any malformed token sequence included): Expand(args) returns normally (no panic, no compile_error!) ∧ Expand(args) = EmptyStrLit. The result does not depend on args. Corollary: every call site `document_features::document_features!(..)` expands to a &'static str constant equal to "". That covers `const X: &str = document_features!(..)` and the inner-attribute form `#![doc = document_features!()]` that wgpu and wgpu-core use, which adds an empty doc string.	tests/consumer_forms.rs::the_expansion_is_an_empty_string_literal	The fn runs inside rustc as a proc-macro dylib. TokenStream, TokenTree and Literal are opaque, handle-based non-scalar carriers, and TokenTree is an enum (gap 1). Literal::string and From<TokenTree> for TokenStream are calls across the proc_macro client/server bridge, an RPC to rustc that needs an assumption channel and content models (gaps 3, 8). The proc-macro crate must be admitted on strict (gap 9). The argument is ignored: no loop, no &mut, and no allocation reasoning beyond the bridge.	0, 1, 3, 8, 9
+docfeat-expands-to-empty-str	contract	document_features::document_features (src/lib.rs)	∀ args: TokenStream (the empty stream, upstream's `feature_label = "..."` form and any malformed token sequence included): Expand(args) returns normally (no panic, no compile_error!) ∧ Expand(args) = EmptyStrLit. The result does not depend on args. Corollary: every call site `document_features::document_features!(..)` expands to a &'static str constant equal to "". That covers `const X: &str = document_features!(..)` and the inner-attribute form `#![doc = document_features!()]` that wgpu and wgpu-core use, which adds an empty doc string.	-	The fn runs inside rustc as a proc-macro dylib. TokenStream, TokenTree and Literal are opaque, handle-based non-scalar carriers, and TokenTree is an enum (gap 1). Literal::string and From<TokenTree> for TokenStream are calls across the proc_macro client/server bridge, an RPC to rustc that needs an assumption channel and content models (gaps 3, 8). The proc-macro crate must be admitted on strict (gap 9). The argument is ignored: no loop, no &mut, and no allocation reasoning beyond the bridge.	0, 1, 3, 8, 9
 ```
 
 ### Distribution by kind (1)
@@ -59,7 +63,6 @@ share.
 
 ```tsv
 file	test	primary	also
-tests/consumer_forms.rs	the_expansion_is_an_empty_string_literal	docfeat-expands-to-empty-str	
 ```
 
 ## 3. Coverage

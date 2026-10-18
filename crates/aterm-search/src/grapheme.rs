@@ -866,149 +866,60 @@ mod tests {
         assert_eq!(display_columns("👩🏽‍💻"), 2);
     }
 
-    /// ColumnMap produces identical results to byte_to_column for ASCII text.
+    /// `ColumnMap::end_column` answers every byte offset as the O(G) scan
+    /// `byte_to_column` does: ASCII, wide CJK, combining marks, emoji,
+    /// controls, and a long CJK line (the O(log G) lookup path).
     #[test]
-    fn column_map_matches_byte_to_column_ascii() {
-        let text = "hello world, this is a test line!";
-        let map = ColumnMap::new(text, AmbiguousWidth::Single);
-        for offset in 0..=text.len() {
-            assert_eq!(
-                map.end_column(offset),
-                byte_to_column(text, offset),
-                "mismatch at offset {offset}"
-            );
-        }
-    }
-
-    /// ColumnMap matches byte_to_column for wide CJK characters.
-    #[test]
-    fn column_map_matches_byte_to_column_cjk() {
-        let text = "ab日本語cd";
-        let map = ColumnMap::new(text, AmbiguousWidth::Single);
-        for offset in 0..=text.len() {
-            assert_eq!(
-                map.end_column(offset),
-                byte_to_column(text, offset),
-                "mismatch at offset {offset}"
-            );
-        }
-    }
-
-    /// ColumnMap handles empty strings.
-    #[test]
-    fn column_map_empty_string() {
-        let map = ColumnMap::new("", AmbiguousWidth::Single);
-        assert_eq!(map.span(0, 0), (0, 0));
-    }
-
-    /// ColumnMap equivalence across mixed-width Unicode: combining characters,
-    /// emoji, CJK, and ASCII in a single line.
-    #[test]
-    fn column_map_matches_byte_to_column_mixed_unicode() {
+    fn column_map_matches_byte_to_column() {
+        let long: String = "日本語テスト漢字表示".chars().cycle().take(80).collect();
         let texts = [
-            "abc\u{0301}def",          // combining acute accent on 'c'
-            "\u{1F600}hello\u{1F600}", // emoji + ASCII + emoji
-            "日a本b語c",               // interleaved CJK and ASCII
-            "a\u{0308}\u{0301}b",      // stacked combining marks
-            "\t\n\r abc",              // control chars + ASCII
+            "",
+            "hello world, this is a test line!",
+            "ab日本語cd",
+            "abc\u{0301}def",
+            "\u{1F600}hello\u{1F600}",
+            "日a本b語c",
+            "a\u{0308}\u{0301}b",
+            "\t\n\r abc",
+            long.as_str(),
         ];
-        for text in &texts {
+        for text in texts {
             let map = ColumnMap::new(text, AmbiguousWidth::Single);
             for offset in 0..=text.len() {
                 assert_eq!(
                     map.end_column(offset),
                     byte_to_column(text, offset),
-                    "mismatch in {text:?} at offset {offset}"
+                    "{text:?} at offset {offset}"
                 );
             }
         }
     }
 
-    /// `ColumnMap` matches `byte_to_column` at every offset of a long CJK line.
+    /// `LowerByteMap` maps every lowered byte offset back as the O(C) scan
+    /// `map_lower_byte_to_original` does, including the Kelvin sign (3 bytes
+    /// lowered to 1), Greek, CJK, the empty line and a long mixed line.
     #[test]
-    fn column_map_long_line_all_offsets() {
-        // 80 CJK chars = 240 bytes, 160 display columns
-        let text: String = "日本語テスト漢字表示".chars().cycle().take(80).collect();
-        let map = ColumnMap::new(&text, AmbiguousWidth::Single);
-        for offset in 0..=text.len() {
-            assert_eq!(
-                map.end_column(offset),
-                byte_to_column(&text, offset),
-                "mismatch at byte offset {offset} in {}-byte CJK line",
-                text.len()
-            );
-        }
-    }
-
-    /// LowerByteMap produces identical results to map_lower_byte_to_original
-    /// for pure ASCII text where lowering preserves byte lengths.
-    #[test]
-    fn lower_byte_map_matches_ascii() {
-        let text = "Hello World Test";
-        let lowered = text.to_lowercase();
-        let map = LowerByteMap::new(text);
-        for offset in 0..=lowered.len() {
-            assert_eq!(
-                map.map_to_original(offset),
-                map_lower_byte_to_original(text, offset),
-                "mismatch at lower offset {offset}"
-            );
-        }
-    }
-
-    /// LowerByteMap handles the Kelvin sign (U+212A) which lowercases from
-    /// 3 bytes to 1 byte, causing byte-length divergence.
-    #[test]
-    fn lower_byte_map_matches_kelvin_sign() {
-        // U+212A KELVIN SIGN (3 bytes) → 'k' (1 byte)
-        let text = "a\u{212A}b";
-        let lowered = text.to_lowercase();
-        let map = LowerByteMap::new(text);
-        for offset in 0..=lowered.len() {
-            assert_eq!(
-                map.map_to_original(offset),
-                map_lower_byte_to_original(text, offset),
-                "mismatch at lower offset {offset} for Kelvin sign text"
-            );
-        }
-    }
-
-    /// LowerByteMap matches for mixed-width Unicode including CJK and emoji.
-    #[test]
-    fn lower_byte_map_matches_mixed_unicode() {
+    fn lower_byte_map_matches_map_lower_byte_to_original() {
+        let long: String = "Hello日本語World".chars().cycle().take(100).collect();
         let texts = [
-            "ABCdef",    // simple mixed case
-            "Straße",    // ß stays 2 bytes lowered
-            "ΔΕΛΤΑ",     // Greek uppercase → lowercase
-            "日本語ABC", // CJK + ASCII
-            "",          // empty
+            "Hello World Test",
+            "a\u{212A}b",
+            "ABCdef",
+            "Straße",
+            "ΔΕΛΤΑ",
+            "日本語ABC",
+            "",
+            long.as_str(),
         ];
-        for text in &texts {
-            let lowered = text.to_lowercase();
+        for text in texts {
             let map = LowerByteMap::new(text);
-            for offset in 0..=lowered.len() {
+            for offset in 0..=text.to_lowercase().len() {
                 assert_eq!(
                     map.map_to_original(offset),
                     map_lower_byte_to_original(text, offset),
-                    "mismatch in {text:?} at lower offset {offset}"
+                    "{text:?} at lower offset {offset}"
                 );
             }
-        }
-    }
-
-    /// LowerByteMap stress test on a long line with many char boundaries.
-    #[test]
-    fn lower_byte_map_long_line_all_offsets() {
-        let text: String = "Hello日本語World".chars().cycle().take(100).collect();
-        let lowered = text.to_lowercase();
-        let map = LowerByteMap::new(&text);
-        for offset in 0..=lowered.len() {
-            assert_eq!(
-                map.map_to_original(offset),
-                map_lower_byte_to_original(&text, offset),
-                "mismatch at lower offset {offset} in {}-byte line",
-                text.len()
-            );
         }
     }
 }

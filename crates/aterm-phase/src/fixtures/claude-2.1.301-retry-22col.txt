@@ -1,0 +1,41 @@
+# claude-code 2.1.301 · MEASURED 2026-10-15, `aterm ctl text` of a private headless aterm (22x40, a debug build of aterm 0.104.0 on fix/harness-integrate) running the real Claude Code (tools/real-claude-lab, `lab.sh up` with LAB_COLS=22) against a local stub of the API that answers every try with a rate limit (stub `rate-limit`) · attempt 1, the pane 22 columns wide: the vendor's retry row (uyn) with its glyph on a row of its own, the cut `API error` and the dim tail laid out as two text columns side by side, their rows interleaved
+  model. (reply 75)
+
+✻ Baked for 10s · done
+  3:17 PM
+
+❯ carry on with the
+  task
+
+⏺ Hi! I am the local
+  lab stub, not a
+  model. (reply 78)
+
+✻ Crunched for 10s ·
+  done 3:17 PM
+
+❯ carry on with the
+  task
+
+⏺ Hi! I am the local
+  lab stub, not a
+  model. (reply 81)
+
+✻ Baked for 10s · done
+  3:17 PM
+
+❯ carry on with the
+  task
+
+✻
+API     · Retrying in
+error  4s · attempt
+       1/10
+
+──────────────────────
+❯
+──────────────────────
+  ⏵⏵ auto mode on  ·
+
+
+

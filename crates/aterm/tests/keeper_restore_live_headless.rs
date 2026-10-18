@@ -1,0 +1,617 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! THE EXACT SCREEN AFTER A CRASH, on real processes (the crash-restore plan §7.3's live
+//! lane): a real keeper (`aterm keeper serve`, this build's binary, so a window's identity
+//! check admits it), a headless instance A with `[keeper] enabled = true` whose session
+//! journals into a shared-memory region the keeper holds, A SIGKILLed, and a second
+//! instance B, booted in the same scratch world, that is offered the session's master and
+//! region and restores the screen.
+//!
+//! * A's shell prints 5,000 numbered lines, enters and leaves the alternate screen, and
+//!   sets bracketed paste and the kitty keyboard flags (one command line, typed once the
+//!   shell has drawn its prompt, and the next prompt awaited); once A's journal has
+//!   caught the idle session up (`status journal_tail=0`, a one-minute hang detector on
+//!   K1's quiet keyframe, never a latency budget), its journal worker has exported the
+//!   whole history into the history ring (`journal_ring_lag=0`, the same detector), and
+//!   the keeper holds its region (`journals=1`), A is SIGKILLed by its own pid. B's
+//!   recovered session says `restore=exact` and `history_lost=0`, and its screen text,
+//!   its modes and, once its import has run after the recovery, its whole scrollback
+//!   (every one of A's history lines, read line by line at the same absolute rows) are
+//!   A's last ones.
+//! * A TAIL REPLAYED ACROSS A REAL CRASH: B runs with its keyframes held after the first
+//!   (`$ATERM_DEBUG_CRASH_JOURNAL_HOLD_KEYFRAMES`), so everything its session prints past
+//!   that keyframe rides the tail. Its shell prints a marker and then blocks in `sleep`,
+//!   so once the marker is on screen nothing more is gathered (the kill races nothing).
+//!   B is SIGKILLed in turn, and a third instance C, offered the same master and the
+//!   region B handed the keeper, replays that tail: `restore=exact` with nothing in
+//!   flight, B's screen and modes. This is the one place the whole pipeline (gather
+//!   count, parse-stage record, replay) is crossed by a real SIGKILL, and it can fail
+//!   only through a wrong restore; it also proves B's COMPANION reached the keeper, since
+//!   C would otherwise be offered A's stale region, or none. The scrollback crosses the
+//!   second crash too: B exported its history ring once its import had put A's lines
+//!   back (and keyframed the renumbering the import made), so C comes back with
+//!   `history_lost=0` and B's whole scrollback.
+//! * NEGATIVE CONTROL: the same world with A's journal off through the debug seam
+//!   (`$ATERM_DEBUG_NO_CRASH_JOURNAL`): A settles its claim with no region, and B's
+//!   recovery comes back `restore=meta restore_why=no-region`, the screen blank.
+//!
+//! Every wait is on a causal event (a ready signal, a status line, the keeper's own
+//! count, a marker or the shell's prompt on screen) under the one-minute hang detector.
+//! The keeper takes no lifeline (its CLI has no such flag): it is SIGKILLed by its guard,
+//! which a panic runs too; the instances hold lifelines (`support/launch_isolation.rs`).
+
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
+
+use crate::live_ctl::{Ctl, fields};
+use crate::{child_output, headless_boot, launch_isolation};
+
+/// A wait for something that must happen is a hang detector (AGENTS.md).
+const HANG: Duration = aterm_spec::wait::MUST_HAPPEN;
+/// How often a wait on a status line asks again.
+const GAP: Duration = Duration::from_millis(50);
+
+/// The window's journal off: the negative control's seam (`keeper_link::journal_refusal`).
+const NO_JOURNAL_SEAM: &str = "ATERM_DEBUG_NO_CRASH_JOURNAL";
+
+/// The window's keyframes held after the first, so a crash leaves a tail to replay
+/// (`crash_restore::HOLD_KEYFRAMES_SEAM`).
+const HOLD_KEYFRAMES_SEAM: &str = "ATERM_DEBUG_CRASH_JOURNAL_HOLD_KEYFRAMES";
+
+/// One scratch world the keeper and both instances share: one `$HOME`, one config with
+/// the keeper on, one `$XDG_RUNTIME_DIR` (where the keeper's socket lives, `/tmp` being no
+/// private `$TMPDIR`); removed on drop, after the keeper and every instance (declared
+/// after it, so dropped first), past the hung-up shell's last history write.
+struct World(PathBuf);
+
+impl Drop for World {
+    fn drop(&mut self) {
+        headless_boot::remove_world(&self.0);
+    }
+}
+
+/// One child process, SIGKILLed and reaped on drop.
+struct Proc {
+    child: Child,
+    _lifeline: Option<aterm_uds::lifeline::Lifeline>,
+}
+
+impl Drop for Proc {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn world(tag: &str) -> World {
+    let root = PathBuf::from(format!("/tmp/atkr-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    if root
+        .join("run/aterm/keeper-dev-00000000.sock")
+        .as_os_str()
+        .len()
+        >= headless_boot::MAX_SOCK_PATH
+        || launch_isolation::prepare(&root).is_err()
+    {
+        aterm_spec::host::could_not_run("no scratch world with a socket path short enough");
+    }
+    let config = root.join("cfg/aterm/aterm.toml");
+    let mut text = std::fs::read_to_string(&config).expect("the scratch config");
+    text.push_str("[keeper]\nenabled = true\n");
+    std::fs::write(&config, text).expect("turn the keeper on");
+    World(root)
+}
+
+/// `aterm keeper <args…>` in the world's environment, read to its end.
+fn keeper_cli(root: &Path, args: &[&str]) -> String {
+    let mut cmd = Command::new(launch_isolation::aterm_executable());
+    launch_isolation::apply(&mut cmd, root);
+    cmd.arg("keeper")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = cmd.spawn().expect("spawn aterm keeper");
+    let out = child_output::wait_and_read(child, std::time::Instant::now() + HANG * 2)
+        .unwrap_or_else(|| panic!("aterm keeper {args:?} did not exit in time"));
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// The keeper's `status` text, `key=value` words across its lines.
+fn keeper_status(root: &Path) -> String {
+    keeper_cli(root, &["status"])
+}
+
+/// Wait until the keeper's status holds `word`.
+#[track_caller]
+fn await_keeper(root: &Path, word: &str) {
+    let mut last = String::new();
+    let seen = aterm_spec::wait::within(HANG, GAP, || {
+        last = keeper_status(root);
+        last.split_whitespace().any(|w| w == word).then_some(())
+    });
+    assert!(
+        seen.is_some(),
+        "the keeper never said `{word}`; its status:\n{last}"
+    );
+}
+
+/// This build's keeper, in the foreground (`serve --no-relaunch`: no window is brought
+/// back, the next launch recovers). Answering once its status names its masters.
+fn keeper(root: &Path) -> Proc {
+    let log = std::fs::File::create(root.join("keeper.log")).expect("the keeper's log");
+    let mut cmd = Command::new(launch_isolation::aterm_executable());
+    launch_isolation::apply(&mut cmd, root);
+    cmd.args(["keeper", "serve", "--no-relaunch"])
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().expect("log"))
+        .stderr(log);
+    let child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => aterm_spec::host::could_not_run(format!("cannot launch the keeper ({e})")),
+    };
+    let keeper = Proc {
+        child,
+        _lifeline: None,
+    };
+    let mut last = String::new();
+    let answered = aterm_spec::wait::within(HANG, GAP, || {
+        last = keeper_status(root);
+        last.lines()
+            .any(|l| l.starts_with("masters="))
+            .then_some(())
+    });
+    assert!(
+        answered.is_some(),
+        "the keeper never answered; its status:\n{last}\nits log:\n{}",
+        headless_boot::log_tail(&root.join("keeper.log"))
+    );
+    keeper
+}
+
+/// One headless instance on its own socket in the world, with each debug seam in
+/// `seams` set.
+fn boot(root: &Path, tag: &str, seams: &[&str]) -> (Proc, String) {
+    let sock = root.join(format!("run/aterm/{tag}.sock"));
+    let log_path = root.join(format!("{tag}.log"));
+    let (out, err) = match std::fs::File::create(&log_path).and_then(|f| Ok((f.try_clone()?, f))) {
+        Ok(pair) => pair,
+        Err(e) => aterm_spec::host::could_not_run(format!("cannot open the instance log ({e})")),
+    };
+    let mut cmd = Command::new(launch_isolation::aterm_executable());
+    launch_isolation::apply(&mut cmd, root);
+    cmd.args(["--headless", launch_isolation::NO_REROUTE])
+        .arg("--control-sock")
+        .arg(&sock)
+        .stdin(Stdio::null())
+        .stdout(out)
+        .stderr(err);
+    for seam in seams {
+        cmd.env(seam, "1");
+    }
+    let lifeline = launch_isolation::lifeline(&mut cmd, root);
+    let mut ready = headless_boot::arm_ready(&mut cmd, root);
+    let child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => aterm_spec::host::could_not_run(format!("cannot launch aterm --headless ({e})")),
+    };
+    let mut instance = Proc {
+        child,
+        _lifeline: Some(lifeline),
+    };
+    headless_boot::await_ready(
+        &mut instance,
+        |p| &mut p.child,
+        &mut ready,
+        &log_path,
+        |_| true,
+    );
+    (instance, sock.to_string_lossy().into_owned())
+}
+
+/// Wait until the instance's session `status` has `key=value`; the last line read.
+#[track_caller]
+fn await_status(ctl: &mut Ctl, key: &str, value: &str) -> String {
+    let mut last = String::new();
+    let seen = aterm_spec::wait::within(HANG, GAP, || {
+        last = ctl.status();
+        (fields(&last).get(key) == Some(&value)).then_some(())
+    });
+    assert!(seen.is_some(), "`{key}={value}` never held; status: {last}");
+    last
+}
+
+/// What a restore must bring back: the screen text and every mode.
+fn screen_and_modes(ctl: &mut Ctl) -> (Vec<String>, BTreeMap<String, String>) {
+    (ctl.text(), ctl.modes())
+}
+
+/// The absolute row of the one line holding `marker`, and of the live screen's top
+/// (`search`'s `screen_first=`), in the numbering `line <row>` reads.
+fn located(ctl: &mut Ctl, marker: &str) -> (u64, u64) {
+    let (header, hits) = ctl.counted(&format!("search {marker}"));
+    assert_eq!(
+        hits.len(),
+        1,
+        "`{marker}` is on one line: {header} {hits:?}"
+    );
+    let row = hits[0]
+        .split_whitespace()
+        .next()
+        .and_then(|row| row.parse().ok())
+        .unwrap_or_else(|| panic!("a row in {hits:?}"));
+    let first = fields(&header)
+        .get("screen_first")
+        .and_then(|row| row.parse().ok())
+        .unwrap_or_else(|| panic!("screen_first= in {header}"));
+    (row, first)
+}
+
+/// The scrollback's line count (`lines`).
+fn scrollback_lines(ctl: &mut Ctl) -> u64 {
+    ctl.ok("lines")
+        .split_whitespace()
+        .nth(1)
+        .and_then(|n| n.parse().ok())
+        .expect("`lines` counts")
+}
+
+/// Wait until the scrollback holds `lines` lines: a recovered session's history import
+/// runs on a worker after the recovery, so its lines arrive after the screen.
+#[track_caller]
+fn await_scrollback(ctl: &mut Ctl, lines: u64) {
+    let mut last = 0;
+    let seen = aterm_spec::wait::within(HANG, GAP, || {
+        last = scrollback_lines(ctl);
+        (last == lines).then_some(())
+    });
+    assert!(
+        seen.is_some(),
+        "the scrollback never held {lines} lines; it holds {last}"
+    );
+}
+
+/// Every scrollback line above the screen's first row `first`, by absolute row (`line
+/// <row>`), `lines` of them.
+fn history(ctl: &mut Ctl, first: u64, lines: u64) -> BTreeMap<u64, String> {
+    (first - lines..first)
+        .map(|row| (row, ctl.line(&format!("line {row}"))))
+        .collect()
+}
+
+/// Whether `row` is the shell's prompt: the scratch world's `/bin/sh` draws `…$ `
+/// (`#` as root).
+fn is_prompt(row: &str) -> bool {
+    row.trim_end().ends_with(['$', '#'])
+}
+
+/// Wait until the shell reads at a prompt: the last non-blank row below the last row
+/// holding `after` (anywhere, with `None`) is a prompt. The shell's line editor takes the
+/// terminal out of canonical mode BEFORE it draws a prompt, so a line typed after this
+/// is read by the editor alone; a line typed while a command holds the terminal is
+/// echoed by the tty, and again when the editor redisplays it after the prompt, with its
+/// column off by the first echo, which strews the rows that follow.
+#[track_caller]
+fn await_prompt(ctl: &mut Ctl, after: Option<&str>) {
+    let mut last = Vec::new();
+    let seen = aterm_spec::wait::within(HANG, GAP, || {
+        last = ctl.text();
+        let from = match after {
+            Some(marker) => last.iter().rposition(|row| row.contains(marker))? + 1,
+            None => 0,
+        };
+        last[from..]
+            .iter()
+            .rfind(|row| !row.trim().is_empty())
+            .filter(|row| is_prompt(row))
+            .map(|_| ())
+    });
+    assert!(
+        seen.is_some(),
+        "the shell never drew its prompt (below {after:?}); the screen: {last:?}"
+    );
+}
+
+/// A's session: the output, then the wait for its journal to have caught up and its region
+/// to be in the keeper's custody (or, under the seam, the keeper holding its claim with no
+/// region). Its screen and modes, read last.
+fn run_a(root: &Path, ctl: &mut Ctl, seam: bool) -> (Vec<String>, BTreeMap<String, String>) {
+    if seam {
+        await_status(ctl, "journal_off", "seam");
+    } else {
+        await_status(ctl, "journal", "live");
+    }
+    // One line, typed once the shell reads at its first prompt: no keystroke reaches a
+    // terminal the shell has handed to a command.
+    await_prompt(ctl, None);
+    ctl.type_line(
+        "seq -f 'line %g' 1 5000; \
+         printf '\\033[?1049h\\033[2Jon the alternate screen\\033[?1049l'; \
+         printf '\\033[?2004h\\033[>5u'; echo ARMED-$((40+2))",
+    );
+    // The marker the output prints is not the line typed: an await on it waits for the
+    // output, never matching the command's own echo.
+    ctl.expect_on_screen("ARMED-42");
+    // Then the prompt the shell draws after it, the last thing it prints: the screen and
+    // modes read below are its last ones.
+    await_prompt(ctl, Some("ARMED-42"));
+    // The session is idle at its prompt: once the quiet keyframe has caught it up, a
+    // restore replays nothing and nothing gathered is unprocessed.
+    if !seam {
+        await_status(ctl, "journal_tail", "0");
+        // And the journal worker has exported the whole history into the ring.
+        await_status(ctl, "journal_ring_lag", "0");
+    }
+    await_keeper(root, "claimed=1");
+    await_keeper(root, if seam { "journals=0" } else { "journals=1" });
+    screen_and_modes(ctl)
+}
+
+/// A SIGKILLed by its own pid (never `pkill`), then the keeper's word that the session is
+/// an orphan, then B booted in the same world with `seams`: B's recovered session.
+fn crash_and_recover(root: &Path, a: Proc, seams: &[&str]) -> (Proc, Ctl) {
+    let mut a = a;
+    let pid = a.child.id();
+    a.child.kill().expect("SIGKILL A");
+    let status = a.child.wait().expect("reap A");
+    assert!(
+        !status.success(),
+        "A died by its signal: {status:?} (pid {pid})"
+    );
+    drop(a);
+    await_keeper(root, "orphaned=1");
+    let tag = format!("after-{pid}");
+    let (b, sock) = boot(root, &tag, seams);
+    let ctl = Ctl::connect(&sock);
+    (b, ctl)
+}
+
+#[test]
+fn a_crashed_window_s_session_comes_back_with_its_exact_screen() {
+    let world = world("x");
+    let root = world.0.clone();
+    let _keeper = keeper(&root);
+    let (a, sock) = boot(&root, "a", &[]);
+    let mut ctl = Ctl::connect(&sock);
+    let (screen, modes) = run_a(&root, &mut ctl, false);
+    assert!(
+        screen.iter().any(|row| row == "ARMED-42"),
+        "premise: A's screen holds the marker: {screen:?}"
+    );
+    assert_eq!(
+        modes.get("bracketed_paste").map(String::as_str),
+        Some("true")
+    );
+    assert_ne!(
+        modes.get("kitty_keyboard").map(String::as_str),
+        Some("none")
+    );
+    // A's scrollback, by absolute row.
+    let (marker_row, first_screen_row) = located(&mut ctl, "ARMED-42");
+    assert_eq!(
+        Some(marker_row - first_screen_row),
+        screen
+            .iter()
+            .position(|row| row == "ARMED-42")
+            .map(|row| row as u64),
+        "premise: the marker's row is its screen row"
+    );
+    let a_lines = scrollback_lines(&mut ctl);
+    assert!(
+        a_lines > 4_000,
+        "premise: A scrolled most of its 5,000 lines off: {a_lines}"
+    );
+    let a_history = history(&mut ctl, first_screen_row, a_lines);
+    assert!(
+        a_history.values().any(|line| line == "OK line 1"),
+        "premise: A's scrollback reaches its first numbered line"
+    );
+    drop(ctl);
+
+    let (b, mut ctl) = crash_and_recover(&root, a, &[HOLD_KEYFRAMES_SEAM]);
+    let status = await_status(&mut ctl, "restore", "exact");
+    let f = fields(&status);
+    for (key, want) in [
+        ("restore_why", "-"),
+        ("in_flight_lost", "0"),
+        ("tail_overflow", "0"),
+        ("marks_lost", "0"),
+        ("resizes_unjournaled", "0"),
+        ("history_lost", "0"),
+    ] {
+        assert_eq!(f.get(key), Some(&want), "{key}: {status}");
+    }
+    let (restored_screen, restored_modes) = screen_and_modes(&mut ctl);
+    assert_eq!(restored_screen, screen, "the screen is A's last one");
+    assert_eq!(restored_modes, modes, "the modes are A's last ones");
+    // The scrollback: every one of A's lines, at the same absolute rows (the restore
+    // continues A's numbering and the import lands below the restored screen's lines).
+    assert_eq!(
+        located(&mut ctl, "ARMED-42"),
+        (marker_row, first_screen_row),
+        "the same numbering"
+    );
+    await_scrollback(&mut ctl, a_lines);
+    let b_history = history(&mut ctl, first_screen_row, a_lines);
+    for (row, line) in &a_history {
+        assert_eq!(b_history.get(row), Some(line), "history row {row} is A's");
+    }
+    // Nothing older than A's history (whose oldest row may be the first there is).
+    if let Some(older) = (first_screen_row - a_lines).checked_sub(1) {
+        assert!(
+            ctl.line(&format!("line {older}")).starts_with("ERR"),
+            "nothing older than A's history"
+        );
+    }
+    assert_eq!(
+        fields(&ctl.status()).get("history_lost"),
+        Some(&"0"),
+        "the import lost nothing"
+    );
+
+    // B journals the adopted session in turn, every byte past its first keyframe in the
+    // tail (the seam): a marker, then a `sleep` that holds the terminal, so once the
+    // marker is on screen nothing more is gathered. Its journal worker has exported the
+    // history its import put back (the import's settle opened the export and keyframed
+    // the renumbering), so a second crash keeps the scrollback too.
+    await_status(&mut ctl, "journal", "live");
+    // The adopted shell still reads at the prompt A's run waited for.
+    await_prompt(&mut ctl, Some("ARMED-42"));
+    ctl.type_line("printf 'B-ONLY-%s' 43; sleep 600");
+    ctl.expect_on_screen("B-ONLY-43");
+    await_status(&mut ctl, "journal_ring_lag", "0");
+    let (b_screen, b_modes) = screen_and_modes(&mut ctl);
+    let status = ctl.status();
+    assert_ne!(
+        fields(&status).get("journal_tail"),
+        Some(&"0"),
+        "premise: B's crash leaves a tail to replay: {status}"
+    );
+    let (_, b_first) = located(&mut ctl, "B-ONLY-43");
+    let b_lines = scrollback_lines(&mut ctl);
+    let b_history = history(&mut ctl, b_first, b_lines);
+    await_keeper(&root, "journals=1");
+    drop(ctl);
+
+    let (_c, mut ctl) = crash_and_recover(&root, b, &[]);
+    let status = await_status(&mut ctl, "restore", "exact");
+    let f = fields(&status);
+    for (key, want) in [
+        ("restore_why", "-"),
+        ("in_flight_lost", "0"),
+        ("tail_overflow", "0"),
+        ("marks_lost", "0"),
+        ("resizes_unjournaled", "0"),
+        ("history_lost", "0"),
+    ] {
+        assert_eq!(f.get(key), Some(&want), "C {key}: {status}");
+    }
+    let (c_screen, c_modes) = screen_and_modes(&mut ctl);
+    assert!(
+        c_screen.iter().any(|row| row.contains("B-ONLY-43")),
+        "C's screen is B's, from the region B handed the keeper: {c_screen:?}"
+    );
+    assert_eq!(c_screen, b_screen, "the replayed tail is B's last screen");
+    assert_eq!(c_modes, b_modes, "and B's last modes");
+    await_scrollback(&mut ctl, b_lines);
+    let c_history = history(&mut ctl, b_first, b_lines);
+    assert_eq!(
+        c_history, b_history,
+        "B's whole scrollback, across a second crash"
+    );
+}
+
+/// NEGATIVE CONTROL: A's journal off by the seam, so the keeper is told A's session has
+/// no region; B's recovery takes the META rung, the screen blank.
+#[test]
+fn without_a_journal_the_recovery_comes_back_blank() {
+    let world = world("n");
+    let root = world.0.clone();
+    let _keeper = keeper(&root);
+    let (a, sock) = boot(&root, "a", &[NO_JOURNAL_SEAM]);
+    let mut ctl = Ctl::connect(&sock);
+    let (screen, _) = run_a(&root, &mut ctl, true);
+    assert!(
+        screen.iter().any(|row| row == "ARMED-42"),
+        "premise: A's screen holds the marker: {screen:?}"
+    );
+    drop(ctl);
+
+    let (_b, mut ctl) = crash_and_recover(&root, a, &[]);
+    let status = await_status(&mut ctl, "restore", "meta");
+    assert_eq!(
+        fields(&status).get("restore_why"),
+        Some(&"no-region"),
+        "{status}"
+    );
+    let blank = ctl.text();
+    assert!(
+        !blank.iter().any(|row| row.contains("ARMED-42")),
+        "the META rung brings no screen back: {blank:?}"
+    );
+}
+
+/// THE MEMORY SHED ACROSS A REAL CRASH (the crash-restore plan's increment 6): A's session
+/// journals its screen and 5,000 lines of scrollback, then memory pressure (`pressure
+/// critical`, the injection a development build takes in place of macOS's source) takes
+/// its history ring away: the session's region is replaced by a fresh one whose ring is
+/// never written (`journal_ring=shed`, fewer `journal_bytes=`), and the keeper takes the
+/// fresh region (`companions_taken=` moves while `journals=1` holds). A is SIGKILLed. B's
+/// recovery is exact, which it can only be from the FRESH region (the one it superseded
+/// says `restore_why=superseded`), with A's screen and modes, and it counts every scrollback
+/// line above the fresh keyframe's bridge lost: B's scrollback is that bridge, and
+/// `history_lost=` the rest of A's lines, exactly.
+#[test]
+fn a_session_shed_under_memory_pressure_comes_back_with_its_exact_screen() {
+    let world = world("p");
+    let root = world.0.clone();
+    let _keeper = keeper(&root);
+    let (a, sock) = boot(&root, "a", &[]);
+    let mut ctl = Ctl::connect(&sock);
+    run_a(&root, &mut ctl, false);
+    let number = |status: &str, key: &str| -> u64 {
+        fields(status)
+            .get(key)
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("`{key}=` in {status}"))
+    };
+    let before = ctl.status();
+    assert_eq!(
+        fields(&before).get("journal_ring"),
+        Some(&"live"),
+        "{before}"
+    );
+    await_keeper(&root, "companions_taken=1");
+
+    let reply = ctl.ok("pressure critical");
+    let f = fields(&reply);
+    assert_eq!(f.get("level"), Some(&"critical"), "{reply}");
+    assert_eq!(f.get("rings_shed"), Some(&"1"), "{reply}");
+    let shed = ctl.status();
+    assert_eq!(fields(&shed).get("journal_ring"), Some(&"shed"), "{shed}");
+    assert!(
+        number(&shed, "journal_bytes") < number(&before, "journal_bytes"),
+        "the ring's pages left the window: {before} / {shed}"
+    );
+    // The keeper took the fresh region in place of the old one.
+    await_keeper(&root, "companions_taken=2");
+    await_keeper(&root, "journals=1");
+    let (screen, modes) = screen_and_modes(&mut ctl);
+    let a_lines = scrollback_lines(&mut ctl);
+    assert!(a_lines > 4_000, "premise: A's scrollback: {a_lines}");
+    drop(ctl);
+
+    let (_b, mut ctl) = crash_and_recover(&root, a, &[]);
+    let status = await_status(&mut ctl, "restore", "exact");
+    let f = fields(&status);
+    for (key, want) in [
+        ("restore_why", "-"),
+        ("in_flight_lost", "0"),
+        ("tail_overflow", "0"),
+        ("marks_lost", "0"),
+        ("resizes_unjournaled", "0"),
+    ] {
+        assert_eq!(f.get(key), Some(&want), "{key}: {status}");
+    }
+    let (restored_screen, restored_modes) = screen_and_modes(&mut ctl);
+    assert_eq!(restored_screen, screen, "the screen is A's last one");
+    assert_eq!(restored_modes, modes, "the modes are A's last ones");
+    let b_lines = scrollback_lines(&mut ctl);
+    assert!(
+        b_lines > 0 && b_lines <= 512,
+        "B's scrollback is the fresh keyframe's bridge: {b_lines}"
+    );
+    assert_eq!(
+        number(&status, "history_lost"),
+        a_lines - b_lines,
+        "every line of A's above the bridge is counted lost: {status}"
+    );
+}

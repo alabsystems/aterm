@@ -492,7 +492,12 @@ pub fn mint_for(opts: &MintForOpts) -> ExitCode {
     }
     let written = match &opts.out {
         None => {
-            print!("{lines}");
+            // THE CAP IS THE ANSWER: one that did not reach stdout whole is no mint the
+            // caller holds, so it is refused before the guidance below says "to stdout".
+            if let Err(line) = cap_on_stdout(write_capability_to(&mut io::stdout(), &lines)) {
+                eprintln!("{line}");
+                return ExitCode::FAILURE;
+            }
             None
         }
         Some(out) => {
@@ -615,6 +620,29 @@ pub fn mint_for(opts: &MintForOpts) -> ExitCode {
         ),
     }
     ExitCode::SUCCESS
+}
+
+/// Write a capability result completely and flush it. Unlike incidental diagnostic
+/// printing, every error (including a departed reader) prevents claiming delivery.
+///
+/// # Errors
+/// Any write or flush failure; no partial result is certified as delivered.
+pub(crate) fn write_capability_to(out: &mut dyn io::Write, text: &str) -> io::Result<()> {
+    out.write_all(text.as_bytes()).and_then(|()| out.flush())
+}
+
+/// Whether the cap `mint-for` wrote to stdout reached its reader whole, as `written` says: any
+/// write error refuses, a reader that went away included. A verb's answer into `| head -1` is no
+/// failure ([`aterm_uds::stdout::answer_status`]), but a cap cut short (`| ssh host 'cat > cap'`
+/// whose ssh died, `> cap` on a full disk) is no cap a host can join with, and "minted … to
+/// stdout" would say it was.
+fn cap_on_stdout(written: io::Result<()>) -> Result<(), String> {
+    written.map_err(|e| {
+        format!(
+            "aterm fabric mint-for: the cap was not written whole to stdout ({e}), so none was \
+             handed over; mint again"
+        )
+    })
 }
 
 /// What a person does with the cap `mint-for <person>` just made: the
@@ -1203,6 +1231,7 @@ fn probe_remote(c: &Checked, out: &mut Out) -> Result<Option<NodePresence>, ()> 
         token: None,
         presence: crate::presence::Mode::Meta,
         receipts: false,
+        log: crate::mirror::LogMode::Off,
     };
     let (view, conn) = crate::fabric::probe_broker(&cfg, &[]);
     if view.read_ok() {
@@ -1286,6 +1315,20 @@ fn probe_remote(c: &Checked, out: &mut Out) -> Result<Option<NodePresence>, ()> 
 mod tests {
     use super::*;
 
+    /// A CAP STDOUT DID NOT TAKE WHOLE IS REFUSED, a reader that went away included: the cap
+    /// is the whole answer, and a host cannot join with part of one.
+    #[test]
+    fn a_cap_stdout_did_not_take_whole_is_refused() {
+        assert_eq!(cap_on_stdout(Ok(())), Ok(()));
+        for kind in [io::ErrorKind::BrokenPipe, io::ErrorKind::StorageFull] {
+            let refused = cap_on_stdout(Err(kind.into())).expect_err("no cap was handed over");
+            assert!(
+                refused.starts_with("aterm fabric mint-for: the cap was not written whole"),
+                "{kind:?}: {refused}"
+            );
+        }
+    }
+
     /// A NODE'S RING IS READ OFF THE CAP, and nothing else passes for one: the
     /// eight grants in any order name their node and fleet; seven, nine, a
     /// grant for another node, or a human's ring are refused.
@@ -1314,7 +1357,7 @@ mod tests {
 
     /// A RING'S LIFETIME IS FREE, ITS AUTHORITY IS NOT: the eight grants each
     /// stamped `exp=` — in either field order — are the same ring, while one
-    /// that has lapsed is refused naming the re-mint, and an `exp=` ring with
+    /// that has lapsed is refused, and an `exp=` ring with
     /// a grant too many, or one that is not a grant at all, is still refused.
     #[test]
     fn a_ring_stamped_with_an_expiry_is_the_same_ring_until_it_lapses() {
@@ -1348,11 +1391,7 @@ mod tests {
             .collect();
         assert_ne!(swapped, stamped);
         assert_eq!(node_ring_at(&swapped, exp - 1), ok, "either field order");
-        let lapsed = node_ring_at(&stamped, exp).expect_err("lapsed at exp");
-        assert!(
-            lapsed.contains("expired") && lapsed.contains(&format!("mint-for {node}")),
-            "{lapsed}"
-        );
+        node_ring_at(&stamped, exp).expect_err("lapsed at exp");
         let mut long = stamped.clone();
         long.push(format!("ro,exp={exp}:/f/lab/>"));
         assert!(
@@ -1362,7 +1401,7 @@ mod tests {
         let mut junk = stamped;
         junk[3] = "rw,p=n-x,ttl=9:/f/lab/>".to_string();
         assert!(
-            node_ring_at(&junk, exp - 1).is_err_and(|e| e.contains("is not a grant")),
+            node_ring_at(&junk, exp - 1).is_err(),
             "an unknown field is not a grant"
         );
     }

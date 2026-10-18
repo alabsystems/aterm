@@ -57,7 +57,7 @@ fn app_with_event_types() -> App {
 fn release_of_pre_overlay_press_falls_through_the_gate() {
     let mut app = app_with_event_types();
     let wid = WindowId(0);
-    let model = aterm_spec::derive::input_release_pairing_model();
+    let model = aterm_models_misc::input_release_pairing_model();
     let mut state = model.init_state();
     // The press reached the seam (WriteFailed on the -1 sink proves it encoded).
     assert_eq!(
@@ -104,7 +104,7 @@ fn release_of_pre_overlay_press_falls_through_the_gate() {
 fn press_under_overlay_release_swallowed_after_close() {
     let mut app = app_with_event_types();
     let wid = WindowId(0);
-    let model = aterm_spec::derive::input_release_pairing_model();
+    let model = aterm_models_misc::input_release_pairing_model();
     let mut state = model.init_state();
     app.palette_enter();
     pairing_step(&model, &mut state, "OpenOverlay");
@@ -167,7 +167,7 @@ fn press_under_overlay_release_swallowed_after_close() {
 fn overlay_repeat_does_not_record_and_open_overlay_release_pairs() {
     let mut app = app_with_event_types();
     let wid = WindowId(0);
-    let model = aterm_spec::derive::input_release_pairing_model();
+    let model = aterm_models_misc::input_release_pairing_model();
     let mut pre_overlay_hold = model.init_state();
     pairing_step(&model, &mut pre_overlay_hold, "ForwardPress");
     app.palette_enter();

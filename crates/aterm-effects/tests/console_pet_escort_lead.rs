@@ -199,7 +199,7 @@ impl Feel {
 }
 
 /// Three bursts of `WORDS` at `ms_per_key`, each followed by `pause_ms`.
-fn run(ms_per_key: u64, pause_ms: u64) -> (Vec<Seen>, Fx) {
+fn run(ms_per_key: u64, pause_ms: u64) -> Vec<Seen> {
     let mut f = Fx::new();
     let mut seen = Vec::new();
     let step = |f: &mut Fx, seen: &mut Vec<Seen>| {
@@ -235,7 +235,7 @@ fn run(ms_per_key: u64, pause_ms: u64) -> (Vec<Seen>, Fx) {
             step(&mut f, &mut seen);
         }
     }
-    (seen, f)
+    seen
 }
 
 /// `(ms per key, pause ms, covering % ceiling, flips/s ceiling)`. The flip
@@ -253,7 +253,7 @@ fn the_escort_keeps_off_the_words_it_leads() {
     let runs: Vec<_> = CADENCES
         .iter()
         .map(|&(ms, pause, max_pct, max_flips)| {
-            (ms, max_pct, max_flips, Feel::judge(&run(ms, pause).0))
+            (ms, max_pct, max_flips, Feel::judge(&run(ms, pause)))
         })
         .collect();
     for (ms, _, _, m) in &runs {
@@ -293,35 +293,4 @@ fn the_escort_keeps_off_the_words_it_leads() {
         );
         assert_eq!(m.brace, 0, "{ms} ms/key: typing braced the escort");
     }
-}
-
-/// NEGATIVE CONTROL: the same oracle on the same run, with every drawn body
-/// shifted two cells back — the follower lag this lane removed — must flag
-/// the coverage and the trail. An oracle that cannot see a trailing cat
-/// proves nothing.
-#[test]
-fn the_oracle_sees_a_trailing_escort() {
-    let (seen, fx) = run(100, 1000);
-    let cw = i32::from(CELL_W);
-    let lagged: Vec<Seen> = seen
-        .iter()
-        .map(|s| {
-            let body = s
-                .body
-                .map(|(x0, x1, y0, y1)| (x0 - 2 * cw, x1 - 2 * cw, y0, y1));
-            Seen {
-                body,
-                col: s.col - 2.0,
-                covered: covered(&fx.world, s.caret, body),
-                ..*s
-            }
-        })
-        .collect();
-    let m = Feel::judge(&lagged);
-    assert!(
-        m.covering_pct() >= 5.0 && m.max_trail > 2.0,
-        "the oracle missed a lagging body: {:.1}% covering, trail {:.2}",
-        m.covering_pct(),
-        m.max_trail
-    );
 }

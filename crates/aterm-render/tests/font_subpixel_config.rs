@@ -70,21 +70,6 @@ fn default_is_off_and_spellings_round_trip() {
 }
 
 #[test]
-fn same_value_is_free_change_reports_true() {
-    let mut r = renderer();
-    assert!(
-        !r.set_font_subpixel("off"),
-        "same-value set is a free no-op"
-    );
-    let changed = r.set_font_subpixel("rgb");
-    assert_eq!(
-        changed, LINUX_SEAM,
-        "a real change reports on the seam only"
-    );
-    assert!(!r.set_font_subpixel("rgb"), "and is then idempotent");
-}
-
-#[test]
 fn subpixel_fringes_appear_only_when_on_and_opaque() {
     let mut r = renderer();
     let cell = r.cell_size();

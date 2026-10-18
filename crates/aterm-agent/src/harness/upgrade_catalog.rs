@@ -397,7 +397,8 @@ pub fn baked_cached(binary: &Path, cache_dir: &Path) -> Option<Baked> {
     }
     let facts = scan_build(binary);
     let _ = std::fs::create_dir_all(cache_dir);
-    let _ = super::upgrade_models::write_atomic(&file, &render_facts(&facts));
+    // Ordered: a cache; a file that does not parse is rescanned above.
+    let _ = super::upgrade_models::write_atomic_ordered(&file, &render_facts(&facts));
     facts.baked
 }
 

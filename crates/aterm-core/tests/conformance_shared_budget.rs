@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-1 conformance for process-wide scrollback budget sharing against
-//! `aterm_spec::derive::shared_budget_model` (Tier-0 in `derived_ring_ty.rs`): once every
+//! `aterm_models_misc::shared_budget_model` (Tier-0 in `derived_ring_ty.rs`): once every
 //! live pane applied its share `min(configured, global / live_panes)`, the applied budgets
 //! sum within the global cap, and a departed pane holds no share. Every bounded action
 //! sequence over {Join, Leave, Apply1, Apply2} runs against real [`ScrollbackBudgetShare`]
@@ -18,7 +18,8 @@ use aterm_core::terminal::Terminal;
 use aterm_core::terminal::scrollback_shared_budget::{
     ScrollbackBudgetShare, set_global_scrollback_budget,
 };
-use aterm_spec::derive::{Model, shared_budget_model};
+use aterm_models_misc::shared_budget_model;
+use aterm_spec::derive::Model;
 use aterm_spec::verify;
 
 /// Bytes per model unit: model consts are tiny scaled integers; the real

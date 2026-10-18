@@ -6,15 +6,14 @@
 // The elision stores nothing a fill would change, so it is byte-identical as long as
 // the predicate is right; these fixtures pin where a naive predicate breaks:
 //
-//   1. a plain frame: the elision fires everywhere;
-//   2. an SGR background equal to the frame default: `RenderCell.bg` is a bare
+//   1. an SGR background equal to the frame default: `RenderCell.bg` is a bare
 //      `[u8; 3]`, so it must render the same pixel as a default cell;
-//   3. a live wallpaper: the base is backdrop texels, so nothing may be elided against
+//   2. a live wallpaper: the base is backdrop texels, so nothing may be elided against
 //      `frame_bg`;
-//   4. background opacity below 1: the base carries a transmittance byte, so the
-//      comparison is against `frame_bg | (bg_t << 24)`;
 //
-// plus a partial-damage repaint asserted byte-identical to a fresh full repaint.
+// (background opacity below 1, the base carrying a transmittance byte, is
+// `background_and_cursor_opacity_gpu_match_cpu` in `aterm-gpu`), plus a partial-damage
+// repaint asserted byte-identical to a fresh full repaint.
 
 use aterm_core::render::SceneAtlas;
 use aterm_core::selection::{SelectionSide, SelectionType};
@@ -66,39 +65,6 @@ fn frame(
 ) -> Vec<u32> {
     let view = r.render_input_cached(wc, input);
     view.pixels().to_vec()
-}
-
-#[test]
-fn plain_frame_default_cells_carry_the_clear_colour() {
-    let mut r = renderer();
-    let mut term = themed_term();
-    term.process(b"hello");
-    let input = term.cell_frame(ROWS, COLS);
-    let (w, _h) = r.frame_size(ROWS, COLS);
-    let mut wc = WindowCpu::new();
-    let px = frame(&mut r, &mut wc, &input);
-
-    let theme_bg = Theme::default().bg;
-    // A blank cell far from the text, and the interior of the padding band:
-    // both are the clear colour, and the elision is what leaves them that way.
-    assert_eq!(
-        cell_px(&r, &px, w, 3, 10),
-        theme_bg,
-        "a blank default-bg cell must show the frame clear colour"
-    );
-    // A blank cell on the text row past the text: the elision covers the materialized
-    // prefix as well as the tail.
-    assert_eq!(
-        cell_px(&r, &px, w, 0, COLS - 2),
-        theme_bg,
-        "a blank cell on the text row must show the frame clear colour"
-    );
-    // Non-vacuity: the frame rasterized ink somewhere.
-    assert!(
-        px.iter().any(|&p| p != theme_bg),
-        "the frame is entirely the clear colour — no glyph was rasterized, so \
-         this fixture proves nothing"
-    );
 }
 
 #[test]
@@ -209,35 +175,6 @@ fn under_a_wallpaper_nothing_is_elided_against_the_theme_background() {
         "a SELECTION band whose colour coincides with the frame default must \
          still be painted under a wallpaper — eliding it would show the \
          backdrop through the selection"
-    );
-}
-
-#[test]
-fn background_opacity_keeps_the_transmittance_byte_on_default_cells() {
-    let mut r = renderer();
-    // Below 1.0, so `bg_transmittance()` is non-zero and the band's base is
-    // `frame_bg | (bg_t << 24)`, not `frame_bg`.
-    r.set_background_opacity(0.75);
-    let theme_bg = Theme::default().bg;
-    let mut term = themed_term();
-    term.process(b"x");
-    let input = term.cell_frame(ROWS, COLS);
-    let (w, _h) = r.frame_size(ROWS, COLS);
-    let mut wc = WindowCpu::new();
-    let px = frame(&mut r, &mut wc, &input);
-
-    let blank = cell_px(&r, &px, w, 3, 10);
-    assert_eq!(
-        blank & 0x00ff_ffff,
-        theme_bg,
-        "a default-bg cell keeps the frame default's RGB under opacity"
-    );
-    assert_ne!(
-        blank >> 24,
-        0,
-        "a default-bg cell must carry the transmittance byte — if this is 0 the \
-         base and the resolved run disagree in bits 24..32 and the elision \
-         predicate is comparing the wrong value"
     );
 }
 

@@ -8,7 +8,7 @@
 // damaged path (moved multi-row rects, no ghosting, the dirty gate), settled overlays inside a
 // scissor band, and scaled-sprite texel selection.
 //
-// Skips without a GPU or font.
+// No GPU or no font: COULD NOT RUN.
 
 use crate::common;
 use std::sync::Arc;

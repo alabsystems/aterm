@@ -3,6 +3,10 @@
 
 # aterm-cfg-if: spec recovery from its 6 unit tests
 
+> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 2 tests it
+> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
+> were taken before.
+
 > Status 2026-10-16: this is the crate's migration worklist. Each of the 3 specs below is
 > to be proved through Trust/Clean, and then the tests it subsumes are deleted. No test has
 > been deleted yet. All 3 specs are blocked by gap 0, by gap 10 (the nearest audit §7 row)
@@ -69,7 +73,7 @@ must handle)`, `blocking_gaps` (audit §7 numbers, plus `N1`, the new gap in §0
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
 cfgif-first-match-selection	equivalence	cfg_if::cfg_if! (entry rule, @__arms, @__group)	∀ chain C (any n≥1, any predicates p_i, any bodies T_i, with or without T_e), in every syntactic position the macro accepts (item, statement, tail expression): E(C) is token-for-token T_{sel(C)}. When sel(C)=none, E(C) is empty: no item, no statement, no `()` and no `;`. Equivalently, in expression position E(C) behaves like `if cfg!(p_1) {T_1} else if cfg!(p_2) {T_2} … else {T_e}`. Core lemma: the guards g_i are pairwise mutually exclusive, and g_i holds ⇔ cfg(p_i) ∧ ∀j<i ¬cfg(p_j). So when several p_i hold, the FIRST one wins.	differential::real_macro_matches_rustc_on_every_chain, differential::no_arm_matches_expands_to_nothing, differential::tail_expression_produces_the_selected_arms_value	EASY propositional core (the guard algebra is a Lean lemma by induction on i). MEDIUM binding: induction over the @__arms accumulator, cfg evaluation of all/not/any, and statement/expression-position splicing with the caller's hygiene. The per-instance corollaries (const fns returning &'static str or u32) need only gap 0, but they are samples.	0, 10, N1
-cfgif-dead-arm-fully-absent	invariant	cfg_if::cfg_if! (@__arms guard, @__group splice)	∀ chain C, ∀ arm i ≠ sel(C): NO token of T_i survives cfg-stripping, whatever the number of items in T_i (k≥1). The guard g_i attaches to the single `@__group` macro-call item that carries all of T_i, never only to T_i's first item (upstream cfg-if issue #90). Corollary: a name defined only in a dead arm may be redefined beside the macro without a duplicate-definition error.	differential::tripwire_ungrouped_leaks_and_the_real_macro_does_not (the leak_correct half)	EASY once N1 models attribute binding: one structural fact about which node the cfg attribute covers, and no induction over T_i is needed.	0, 10, N1
+cfgif-dead-arm-fully-absent	invariant	cfg_if::cfg_if! (@__arms guard, @__group splice)	∀ chain C, ∀ arm i ≠ sel(C): NO token of T_i survives cfg-stripping, whatever the number of items in T_i (k≥1). The guard g_i attaches to the single `@__group` macro-call item that carries all of T_i, never only to T_i's first item (upstream cfg-if issue #90). Corollary: a name defined only in a dead arm may be redefined beside the macro without a duplicate-definition error.	-	EASY once N1 models attribute binding: one structural fact about which node the cfg attribute covers, and no induction over T_i is needed.	0, 10, N1
 cfgif-linear-recursion-depth	other	cfg_if::cfg_if!	∀ chain C with m arms (m = n, plus 1 if T_e is present): depth(C) ≤ m + c for a small constant c (one @__arms level per arm and the base case, plus the entry and @__group levels). So any chain with m + c ≤ 128 (the default recursion_limit) expands with no #![recursion_limit]. This covers getrandom's backend chain and the 40-arm sample.	differential::forty_arms_stay_inside_the_default_recursion_limit	MEDIUM: a bound on expansion depth by induction over the arm list. N1 must model rustc's recursion counter, which counts nesting depth and not the total number of expansions.	0, 10, N1
 ```
 
@@ -97,9 +101,7 @@ file	test	primary	also
 tests/differential.rs	real_macro_matches_rustc_on_every_chain	cfgif-first-match-selection	cfgif-dead-arm-fully-absent
 tests/differential.rs	no_arm_matches_expands_to_nothing	cfgif-first-match-selection	
 tests/differential.rs	tail_expression_produces_the_selected_arms_value	cfgif-first-match-selection	
-tests/differential.rs	tripwire_ungrouped_leaks_and_the_real_macro_does_not	cfgif-dead-arm-fully-absent	
 tests/differential.rs	forty_arms_stay_inside_the_default_recursion_limit	cfgif-linear-recursion-depth	cfgif-first-match-selection
-tests/differential.rs	tripwire_last_match_wins_is_live	(none: §4)	
 ```
 
 `real_macro_matches_rustc_on_every_chain` samples `cfgif-dead-arm-fully-absent` only weakly.
@@ -123,28 +125,18 @@ duplicate-definition compile error.
 
 ## 4. Tests that are not spec samples
 
-| test | why | recommendation |
-|---|---|---|
-| differential::tripwire_last_match_wins_is_live | It exercises only `last_match_wins!`, a deliberately wrong macro defined in the test file with no production caller. It is the negative control that keeps the `cfg!()` differential from being vacuous. Once `cfgif-first-match-selection` is proved, no differential is left to arm. Until then it must stay with `real_macro_matches_rustc_on_every_chain`, because deleting either one alone leaves that differential unarmed. | **delete**, in the same commit as `real_macro_matches_rustc_on_every_chain`, once `cfgif-first-match-selection` is Certified. The N1 conformance test must carry its own negative control (`crates/aterm-spec/src/derive.rs`); `last_match_wins!` is the natural mutant for it. |
-
-By action: delete 1, keep 0, become-spec 0.
-
-The `ungrouped!` tripwire half of `tripwire_ungrouped_leaks_and_the_real_macro_does_not` is the
-same kind of negative control (§5.2). It is deleted with its test, and `ungrouped!` becomes the
-N1 mutant for `cfgif-dead-arm-fully-absent`.
+Status 2026-10-16: the one test here, the last-match-wins tripwire, was deleted together with both
+deliberately wrong tripwire macros, and the leak test kept only its real-macro half (§5.2). The N1
+conformance test must carry its own negative control (`crates/aterm-spec/src/derive.rs`); the two
+tripwire mutations (last match wins, un-grouped arms) are the natural mutants for it.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
-1. **The `case!` comment is stale.** In `tests/differential.rs` it says "ONE chain in, four answers
-   out", spliced "into the real macro, into both tripwires' inputs and into the `cfg!()` cascade".
-   In fact `case!` generates three things: `real`, `wrong` (from `last_match_wins!`) and
-   `expected`. The `ungrouped!` tripwire is never fed by `case!`; it is used only by hand in
-   `leak_tripwire`.
-2. **`tripwire_ungrouped_leaks_and_the_real_macro_does_not` mixes two things.** Its first half
-   asserts how the test-only `ungrouped!` tripwire behaves. That is a negative control, not a spec
-   sample. Only the `leak_correct` half samples `cfgif-dead-arm-fully-absent`. Even there, the
-   evidence is that `leak_correct` compiles at all; the runtime asserts `(99, 2)` are nearly
-   tautological.
+1. Fixed 2026-10-16: the `case!` comment in `tests/differential.rs` now says "ONE chain in, two
+   answers out", which is what `case!` generates (`real` and `expected`).
+2. **`a_dead_arm_contributes_none_of_its_items` rests on compilation.** It samples
+   `cfgif-dead-arm-fully-absent`, and the evidence is that `leak_correct` compiles at all; the
+   runtime asserts `(99, 2)` are nearly tautological.
 3. **The host-dependent chains sample one point each.** In
    `real_macro_matches_rustc_on_every_chain`, the `parking_lot_core` and `target_family` assertions
    depend on the host by design. On any one host they check one value of `sel(C)`. The overlap
@@ -166,11 +158,10 @@ N1 mutant for `cfgif-dead-arm-fully-absent`.
 
 None of the 3 specs is blocked only by gap 0; all 3 wait on gap 10 and N1. So the first step is N1 route (a):
 a `ty_model!`/Clean model of the three rules, with a conformance test whose negative controls are
-the two tripwire macros.
+the two tripwire mutations (last match wins, un-grouped arms).
 
-1. **`cfgif-first-match-selection`**. It has the highest value: it retires 3 tests and frees
-   `tripwire_last_match_wins_is_live`, which is the whole wrong-platform-code risk that
-   `parking_lot_core`, `wgpu-hal` and `half` rely on. Its propositional core (the guards are
+1. **`cfgif-first-match-selection`**. It has the highest value: it retires 3 tests and covers the whole
+   wrong-platform-code risk that `parking_lot_core`, `wgpu-hal` and `half` rely on. Its propositional core (the guards are
    pairwise exclusive and select the first true predicate) is provable in Clean today as a lemma
    over the model, by induction on `i`.
 2. **`cfgif-dead-arm-fully-absent`**. It is the easiest once the model represents attribute

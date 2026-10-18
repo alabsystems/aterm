@@ -95,6 +95,7 @@ pub(super) fn pre_carry_parse(toml: &str) -> Option<SessionHandoff> {
                 // That build had no question policy to carry.
                 questions: None,
                 autopilot: None,
+                land_at: None,
                 control: None,
                 frozen_path: false,
                 identity: None,
@@ -116,11 +117,14 @@ pub(super) fn pre_carry_parse(toml: &str) -> Option<SessionHandoff> {
                 fabric: Default::default(),
                 timeline_id: 0,
                 log_ids: None,
+                log_seq: 0,
                 journal_key: None,
             })
             .collect(),
         roster_seq: None,
         fabric_attached: Vec::new(),
+        mirror_dropped: Vec::new(),
+        mirror_served: false,
     })
 }
 
@@ -251,7 +255,7 @@ fn outgoing(
         let guard = term.lock().unwrap();
         (
             guard.checkpoint_carry(256).expect("parser is Ground"),
-            handoff_carry::capture_head(0, &guard, term, turns, true),
+            handoff_carry::capture_head(0, &guard, term, turns, None, true),
         )
     };
     StageCarry {
@@ -475,6 +479,120 @@ fn a_report_across_a_handoff_and_a_resize_says_gap_and_loses_nothing() {
         );
     }
     assert!(!r.rows.iter().any(|row| is_chrome(row)), "{}", r.render());
+    staged.teardown();
+}
+
+/// THE SESSION LOG CROSSES THE REAL FILES (phase 2A): the worker's export
+/// for a successor that reads it puts the log in the sidecar, the manifest
+/// record carries its counts (`log_ids`, `log_seq`), `take_incoming` reads
+/// both back (the sidecar off its file, length and sha checked; the counts
+/// into `Adopted::log`), and the product's own adoption (`spawn::adopted_log`
+/// taking the lines off the sidecar, then `spawn::mark_handoff_gap`)
+/// continues it: the same records, the next epoch, the overlap's seqs above
+/// the manifest's count. NEGATIVE CONTROL: the same adoption with the
+/// sidecar's member gone starts over, `gap why=handoff`, its seq still above
+/// the count.
+#[test]
+fn the_session_log_crosses_the_real_files() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let _restore = restore_env();
+    let mut app = FakeApp::new();
+    let (term, turns) = old_session(&mut app, 30);
+    let timeline = Arc::new(Mutex::new(
+        crate::session_timeline::SessionTimeline::default(),
+    ));
+    {
+        let mut g = timeline.lock().unwrap();
+        let now = g.slog().now();
+        g.slog_mut().open_session(None, now);
+        for _ in 0..40 {
+            g.slog_mut().human_input(true, now);
+        }
+    }
+    let before: Vec<String> = timeline
+        .lock()
+        .unwrap()
+        .slog()
+        .log()
+        .window()
+        .map(|r| aterm_slog::encode(r, aterm_slog::Tier::Host).unwrap())
+        .collect();
+    // The manifest's draw, as `SessionHandoff::from_store` takes it.
+    let (ids, seq) = {
+        let mut g = timeline.lock().unwrap();
+        (g.handoff_log_ids(), g.handoff_log_seq())
+    };
+    let (checkpoint, source) = {
+        let guard = term.lock().unwrap();
+        (
+            guard.checkpoint_carry(256).expect("parser is Ground"),
+            handoff_carry::capture_head(0, &guard, &term, &turns, Some(&timeline), true),
+        )
+    };
+    let carry = StageCarry {
+        screens: vec![checkpoint],
+        controls: handoff_carry::export_for_target(
+            &[source],
+            crate::control::turn_ids_for_handoff(),
+            crate::running_build_number(),
+        ),
+        next_turn_id: None,
+        fg_holders: Vec::new(),
+        render_debts: Vec::new(),
+    };
+    let stamp = |m: &mut SessionHandoff, _: &std::path::Path, _: &str| {
+        m.sessions[0].log_ids = Some(ids.clone());
+        m.sessions[0].log_seq = seq;
+    };
+    let staged = stage_history_handoff("log-roundtrip", &carry, &stamp);
+    let mut adopted = as_successor(&staged, |_| take_incoming().adopted);
+    let a = &mut adopted[0];
+    assert_eq!(
+        (a.log.ids, a.log.seq),
+        (crate::session_log::LogCarry::parse(&ids), seq),
+        "the record's counts reach the adoption"
+    );
+    assert!(
+        a.control.as_ref().is_some_and(|c| c.log.is_some()),
+        "the sidecar crossed with the log"
+    );
+    let adopt = |log: crate::session_log::LogAdopt| -> Vec<aterm_slog::Rec> {
+        let successor = crate::session_store::test_handle(0);
+        crate::spawn::mark_handoff_gap(
+            &successor.ctx.timeline,
+            &successor.ctx.cast,
+            &successor.ctx.temporal,
+            None,
+            0,
+            log,
+            false,
+        );
+        let g = successor.ctx.timeline.lock().unwrap();
+        g.slog().log().window().cloned().collect()
+    };
+    let stripped = crate::spawn::adopted_log(&a.log, None);
+    let recs = adopt(crate::spawn::adopted_log(&a.log, a.control.as_mut()));
+    assert!(
+        a.control.as_ref().is_some_and(|c| c.log.is_none()),
+        "the lines were taken off the sidecar"
+    );
+    let after: Vec<String> = recs
+        .iter()
+        .take(before.len())
+        .map(|r| aterm_slog::encode(r, aterm_slog::Tier::Host).unwrap())
+        .collect();
+    assert_eq!(after, before, "the same records");
+    let mark = recs.last().unwrap();
+    assert_eq!(mark.k, aterm_slog::Kind::Handoff);
+    assert_eq!(mark.seq, seq + 1, "above the manifest's count");
+    // NEGATIVE CONTROL: without the member, the log starts over.
+    let fresh = adopt(stripped);
+    assert_eq!(fresh.len(), 1, "{fresh:?}");
+    assert_eq!(
+        (fresh[0].k, fresh[0].seq),
+        (aterm_slog::Kind::Gap, seq + 1),
+        "a handoff gap above the count"
+    );
     staged.teardown();
 }
 
@@ -856,6 +974,7 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
             questions: Some("recommended".to_string()),
             // Set on purpose too: an Off session stays Off across the update.
             autopilot: Some("off".to_string()),
+            land_at: None,
             control: Some(handoff_carry::stamp(b"{}")),
             frozen_path: true,
             identity: Some("worker".to_string()),
@@ -883,10 +1002,13 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
             fabric: Default::default(),
             timeline_id: 0,
             log_ids: None,
+            log_seq: 0,
             journal_key: None,
         }],
         roster_seq: None,
         fabric_attached: Vec::new(),
+        mirror_dropped: Vec::new(),
+        mirror_served: false,
     };
     let wire = new.to_toml().unwrap();
     assert!(new.roundtrips());
@@ -1255,7 +1377,7 @@ fn carried_with(
         let guard = term.lock().unwrap();
         (
             guard.checkpoint_carry(256).expect("parser is Ground"),
-            handoff_carry::capture_head(0, &guard, term, turns, differ),
+            handoff_carry::capture_head(0, &guard, term, turns, None, differ),
         )
     };
     let bytes = handoff_carry::export(&[source], crate::control::turn_ids_for_handoff())
@@ -1444,6 +1566,8 @@ fn history_on_a_halved_ledger_says_its_floor() {
         turns: vec![history_rec(minted, true)],
         unheld_below: minted,
         archive: None,
+        log: None,
+        log_mirror: None,
     };
     let h = host(
         live_engine(1),
@@ -1516,6 +1640,8 @@ fn a_since_turn_resume_after_a_dropped_ledger_is_told_of_the_loss() {
         turns: vec![history_rec(minted, true)],
         unheld_below: minted,
         archive: None,
+        log: None,
+        log_mirror: None,
     };
     let told = resume(8, handoff_carry::adopted_ledger(Some(&mut halved)));
     assert!(

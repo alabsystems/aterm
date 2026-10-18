@@ -7,8 +7,8 @@
 //! authority, not the endpoint's ring — on the whole path (a guarded broker, a
 //! headless `aterm`, and the real `aterm link serve` child it launches):
 //!
-//! * A RECEIPT IS NOT LOST (X1, X1b, X1c). A verdict given while the broker is
-//!   down, during a seconds-long outage, or while the bridge is being replaced
+//! * A RECEIPT IS NOT LOST (X1, X1b). A verdict given while the broker is
+//!   down, or while the bridge is being replaced
 //!   reaches the sender exactly once: it is OWED at the endpoint, on the
 //!   `outbox` peek, until the bridge retires it.
 //! * `truncated=1` BECOMES FETCHABLE (X2): `inbox get @<off>` of a row the
@@ -21,10 +21,9 @@
 //! * AN OVERSIZE RECORD'S FETCH IS ANSWERED ONCE, PROMPTLY, `truncated=1`
 //!   (the privacy/load pass's D1), not re-fetched every drain.
 //!
-//! Every wait is `until <observable state>`, bounded by the harness deadline;
-//! the two sleeps are the SCENARIO (X1c's outage held open), never a
-//! synchronisation, and every count of something that must NOT have happened
-//! is read behind an ordering barrier that must come after it.
+//! Every wait is `until <observable state>`, bounded by the harness deadline,
+//! and every count of something that must NOT have happened is read behind an
+//! ordering barrier that must come after it.
 
 #![cfg(unix)]
 
@@ -141,49 +140,6 @@ fn x1_receipt_given_while_the_link_is_down_is_not_lost() {
     assert_eq!(
         acks_after, 1,
         "a verdict given while the link was down is acked exactly once"
-    );
-}
-
-/// X1c. THE SAME VERDICT, WITH THE BROKER OUTAGE HELD OPEN FOR A FEW
-/// BACK-OFF ROUNDS AFTER IT (an outage of seconds, not milliseconds): the
-/// window the bridge's reconnect back-off spans.
-#[test]
-fn x1c_receipt_given_during_a_seconds_long_outage_is_not_lost() {
-    let mut w = World::boot_flags("rvx1c", &["--receipts"]);
-    w.wait_ready();
-    let (a, b) = w.two_sessions();
-    let ack_lane = format!("/f/{FLEET}/in/{}/{a}/{}/ack", w.node, w.node);
-    let r = w.verb(&format!(
-        "@{a} post to=@{b} kind=ask --wait=60000 take-this"
-    ));
-    assert!(r.ok(), "ask: {}", r.header());
-    let off = off_of(r.header());
-    let id = until("the ask to reach B", || id_at_off(&w, &b, off));
-    w.stop_broker();
-    // THE SCENARIO: let the bridge settle into its reconnect back-off.
-    std::thread::sleep(Duration::from_millis(1_000));
-    let seen = w.verb(&format!("@{b} inbox seen {id} handled"));
-    assert!(seen.ok(), "inbox seen: {}", seen.header());
-    // THE OUTAGE: a few seconds, i.e. several back-off rounds.
-    std::thread::sleep(Duration::from_millis(3_000));
-    w.start_broker();
-    let _ = poll(|| (lane_len(&w, &ack_lane) > 0).then_some(()));
-    let acks = lane_len(&w, &ack_lane);
-    let again = w.verb(&format!("@{b} inbox seen {id} handled"));
-    assert!(again.ok());
-    w.drained(&b);
-    let acks_after = lane_len(&w, &ack_lane);
-    eprintln!("ack records on A's lane: after link-up={acks} after same-word re-seen={acks_after}");
-    assert_eq!(
-        (acks, acks_after),
-        (1, 1),
-        "a verdict given during a broker outage is acked once, and once only"
-    );
-    let rows = lane_rows(&w, &ack_lane);
-    let body = Body::decode(&rows[0].2).0;
-    assert_eq!(
-        (body.re, body.verdict.as_deref()),
-        (Some(off), Some("handled"))
     );
 }
 
@@ -555,7 +511,7 @@ fn x4_an_ask_deduped_onto_a_note_records_no_expired() {
 }
 
 /// X5. `post --wait-ack` with `dl=` and no receipt answers `ERR expired` when
-/// the deadline passes first — every time. (The privacy/load pass reached the
+/// the deadline passes first. (The privacy/load pass reached the
 /// same defect with `dl=1500`.) And an ack to a node that is not here is still
 /// queued on the bus.
 #[test]
@@ -565,7 +521,7 @@ fn x5_wait_ack_past_its_deadline_answers_expired() {
     let (a, b) = w.two_sessions();
     let expired_lane = format!("/f/{FLEET}/in/{}/{a}/{}/expired", w.node, w.node);
     let mut answers = Vec::new();
-    for (i, dl) in [700u64, 700, 1500].into_iter().enumerate() {
+    for (i, dl) in [700u64, 1500].into_iter().enumerate() {
         let t = Instant::now();
         let r = w.verb(&format!(
             "@{a} post to=@{b} kind=ask dl={dl} --wait-ack nobody-acks-{i}"

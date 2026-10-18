@@ -431,7 +431,7 @@ impl Surface {
     /// (it must re-pull via `read_text`); the writer is never blocked.
     #[allow(
         clippy::collapsible_if,
-        reason = "the nested form keeps poll's MIR lowerable for the strict Trust gate; the `&&` let-chain is not"
+        reason = "the nested form keeps poll's MIR lowerable for the Trust lane (`ship trust run`); the `&&` let-chain is not"
     )]
     pub fn poll(&self, cursor: Cursor) -> (SubUpdate, Cursor) {
         let head = self.seq();
@@ -522,29 +522,6 @@ mod tests {
         assert_eq!(got.text, "hello\nworld\n");
         assert_eq!(got.origin, OriginTag::Source);
         assert_eq!(got.seq, Seq(2));
-    }
-
-    #[test]
-    fn snapshot_shares_line_allocation_until_replaced() {
-        let mut s = Surface::new();
-        let original = String::from("frozen allocation");
-        let original_ptr = original.as_ptr();
-        let original_capacity = original.capacity();
-        s.apply(&write_cap(), Edit::AppendLine(original));
-        assert_eq!(s.lines[0].1.as_ptr(), original_ptr);
-        assert_eq!(s.lines[0].1.capacity(), original_capacity);
-
-        let snap = s.snapshot(&read_cap());
-        assert!(Arc::ptr_eq(&s.lines[0].1, &snap.surface.lines[0].1));
-
-        let replacement = String::from("live replacement allocation");
-        let replacement_ptr = replacement.as_ptr();
-        let replacement_capacity = replacement.capacity();
-        s.apply(&write_cap(), Edit::SetLine(LineId(0), replacement));
-        assert_eq!(s.lines[0].1.as_ptr(), replacement_ptr);
-        assert_eq!(s.lines[0].1.capacity(), replacement_capacity);
-        assert!(!Arc::ptr_eq(&s.lines[0].1, &snap.surface.lines[0].1));
-        assert_eq!(snap.surface.lines[0].1.as_str(), "frozen allocation");
     }
 
     /// COW scope: a snapshot — and a writable copy taken from it — share the

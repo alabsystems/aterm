@@ -711,23 +711,6 @@ fn source_rect_crops_before_the_scaling_policy() {
     );
 }
 
-/// The fit arithmetic: the binding axis, and the exact-aspect identity the chrome band
-/// depends on.
-#[test]
-fn aspect_fit_box_picks_the_binding_axis() {
-    use aterm_render::aspect_fit_box;
-    // Equal aspects ⇒ the whole box, exactly (no rounding drift).
-    assert_eq!(aspect_fit_box(126, 68, 126, 68), (126, 68));
-    assert_eq!(aspect_fit_box(63, 34, 126, 68), (126, 68));
-    // Wider than the box ⇒ width binds.
-    assert_eq!(aspect_fit_box(120, 60, 126, 68), (126, 63));
-    // Taller than the box ⇒ height binds.
-    assert_eq!(aspect_fit_box(60, 120, 126, 68), (34, 68));
-    // Never larger than the box, never zero.
-    let (w, h) = aspect_fit_box(4096, 1, 10, 10);
-    assert!(w <= 10 && h >= 1);
-}
-
 /// Sixel is pixel-exact, measured on the composited framebuffer. Sixel names its size in
 /// pixels, so unlike OSC 1337 (which names cells) its raster is neither scaled to the
 /// rounded-up cell footprint nor centred in it.
@@ -764,8 +747,7 @@ fn sixel_draws_one_sixel_pixel_per_device_pixel() {
     term.process(&dcs);
     assert!(
         !term.images_row(0).is_empty(),
-        "the sixel DCS must place an inline image on row 0 (is the `sixel` \
-         feature on in this test build?)"
+        "the sixel DCS must place an inline image on row 0"
     );
     let mut input = term.cell_frame(rows, cols);
     input.cursor_visible = false; // the cursor block is not part of the picture

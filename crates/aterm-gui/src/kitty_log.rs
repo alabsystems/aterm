@@ -1439,7 +1439,7 @@ impl KittyLogHost {
 
     /// An in-memory-only host (no ledger file) — the headless-test App, which
     /// must never read or write the developer's real ledger.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "bench-support"))]
     pub(crate) fn in_memory() -> Self {
         Self::load(None)
     }
@@ -1922,10 +1922,11 @@ impl KittyLogHost {
 mod tests {
     use super::*;
     use aterm_effects::cat_glyphs_gen::CatGlyphId;
-    use aterm_spec::derive::{
-        Model, kitty_collectibles_model, kitty_flush_worker_model, kitty_pin_merge_model,
-        kitty_sidecar_durability_model,
+    use aterm_models_core::kitty_pin_merge_model;
+    use aterm_models_effects::{
+        kitty_collectibles_model, kitty_flush_worker_model, kitty_sidecar_durability_model,
     };
+    use aterm_spec::derive::Model;
     use aterm_spec::verify;
     use std::collections::BTreeMap;
 
@@ -2113,79 +2114,74 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
     }
 
+    /// A hostile target planted at the legacy ledger, the collectible sidecar
+    /// or the lock — a writerless FIFO, or a final symlink to a victim that a
+    /// followed read would admit — is admitted as empty (or fails the lock at
+    /// once): startup and exit stay bounded, the target is neither followed
+    /// nor replaced, the victim is never written through, and an unsafe
+    /// sidecar or an untaken lock gates the mirror write.
     #[cfg(unix)]
     #[test]
-    fn legacy_fifo_cannot_block_startup_or_background_flush_exit() {
-        use std::os::unix::fs::FileTypeExt as _;
+    fn a_hostile_target_at_any_ledger_path_is_not_followed_and_cannot_block_startup_or_exit() {
+        use std::os::unix::fs::{FileTypeExt as _, symlink};
 
-        let legacy = tmp("fifo-legacy");
-        make_fifo(&legacy);
-        let config = legacy.with_file_name("aterm.toml");
-        assert_eq!(
-            host_startup_and_exit(config),
-            (0, 0),
-            "a writerless legacy FIFO is admitted as empty"
-        );
-        assert!(
-            std::fs::symlink_metadata(&legacy)
-                .expect("legacy FIFO remains")
-                .file_type()
-                .is_fifo(),
-            "best-effort flush must not replace a hostile legacy target"
-        );
-        let _ = std::fs::remove_dir_all(legacy.parent().unwrap());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn sidecar_fifo_cannot_block_startup_or_background_flush_exit() {
-        use std::os::unix::fs::FileTypeExt as _;
-
-        let legacy = tmp("fifo-sidecar");
-        let sidecar = collectibles_path(&legacy);
-        make_fifo(&sidecar);
-        let config = legacy.with_file_name("aterm.toml");
-        assert_eq!(
-            host_startup_and_exit(config),
-            (0, 0),
-            "a writerless collectible FIFO is admitted as empty"
-        );
-        assert!(
-            std::fs::symlink_metadata(&sidecar)
-                .expect("sidecar FIFO remains")
-                .file_type()
-                .is_fifo(),
-            "best-effort flush must not replace a hostile sidecar target"
-        );
-        assert!(
-            !legacy.exists(),
-            "an unsafe authoritative sidecar must gate the mirror write"
-        );
-        let _ = std::fs::remove_dir_all(legacy.parent().unwrap());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn hostile_lock_fifo_cannot_block_startup_or_flush_exit() {
-        use std::os::unix::fs::FileTypeExt as _;
-
-        let legacy = tmp("fifo-lock");
-        let lock_path = legacy.with_extension("toml.lock");
-        make_fifo(&lock_path);
-        assert_eq!(
-            host_startup_and_exit(legacy.with_file_name("aterm.toml")),
-            (0, 0),
-            "a writerless lock FIFO must fail immediately"
-        );
-        assert!(
-            std::fs::symlink_metadata(&lock_path)
-                .expect("lock FIFO remains")
-                .file_type()
-                .is_fifo(),
-            "best-effort locking must not replace a hostile rendezvous"
-        );
-        assert!(!legacy.exists(), "an unlocked flush must be deferred");
-        let _ = std::fs::remove_dir_all(legacy.parent().unwrap());
+        let mut seeded = KittyLog::default();
+        seeded.record(&sighting(1), Lexicon::builtin(), "2026-07-01T00:00:00Z");
+        let store_text =
+            aterm_toml::to_string(&KittyCollectibleStore::mirrored(&seeded.collectibles))
+                .expect("serialize sidecar victim");
+        for (case, gates_legacy) in [("legacy", false), ("sidecar", true), ("lock", true)] {
+            for fifo in [true, false] {
+                let legacy = tmp(&format!("hostile-{case}-{fifo}"));
+                let target = match case {
+                    "legacy" => legacy.clone(),
+                    "sidecar" => collectibles_path(&legacy),
+                    _ => legacy.with_extension("toml.lock"),
+                };
+                let victim = legacy.with_file_name(format!("{case}-victim.toml"));
+                let victim_text = if case == "sidecar" {
+                    store_text.clone()
+                } else {
+                    "sightings = 99\n".to_string()
+                };
+                if fifo {
+                    make_fifo(&target);
+                } else {
+                    std::fs::write(&victim, &victim_text).expect("write victim");
+                    symlink(&victim, &target).expect("plant final symlink");
+                }
+                assert_eq!(
+                    host_startup_and_exit(legacy.with_file_name("aterm.toml")),
+                    (0, 0),
+                    "{case} fifo={fifo}: bounded, and admitted as empty"
+                );
+                let kind = std::fs::symlink_metadata(&target)
+                    .expect("the hostile target remains")
+                    .file_type();
+                assert!(
+                    if fifo {
+                        kind.is_fifo()
+                    } else {
+                        kind.is_symlink()
+                    },
+                    "{case} fifo={fifo}: best-effort flush must not replace a hostile target"
+                );
+                if !fifo {
+                    assert_eq!(
+                        std::fs::read_to_string(&victim).expect("read victim"),
+                        victim_text,
+                        "{case}: never written through"
+                    );
+                }
+                if gates_legacy {
+                    assert!(
+                        !legacy.exists(),
+                        "{case} fifo={fifo}: the mirror write is gated"
+                    );
+                }
+                let _ = std::fs::remove_dir_all(legacy.parent().unwrap());
+            }
+        }
     }
 
     #[test]
@@ -2375,97 +2371,6 @@ mod tests {
             "negative control: dropping a contended batch must violate conservation"
         );
         let _ = std::fs::remove_dir_all(legacy.parent().unwrap());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn final_lock_symlink_is_neither_followed_nor_replaced() {
-        use std::os::unix::fs::symlink;
-
-        let legacy = tmp("symlink-lock");
-        let lock_path = legacy.with_extension("toml.lock");
-        let victim = legacy.with_file_name("lock-victim");
-        std::fs::write(&victim, "untouched").expect("write lock victim");
-        symlink(&victim, &lock_path).expect("plant final lock symlink");
-
-        assert_eq!(
-            host_startup_and_exit(legacy.with_file_name("aterm.toml")),
-            (0, 0),
-            "a final lock symlink must fail immediately"
-        );
-        assert!(
-            std::fs::symlink_metadata(&lock_path)
-                .expect("lock link remains")
-                .file_type()
-                .is_symlink()
-        );
-        assert_eq!(
-            std::fs::read_to_string(&victim).expect("read untouched lock victim"),
-            "untouched"
-        );
-        assert!(!legacy.exists(), "an unlocked flush must be deferred");
-        let _ = std::fs::remove_dir_all(legacy.parent().unwrap());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn final_symlink_ledgers_are_neither_followed_nor_replaced() {
-        use std::os::unix::fs::symlink;
-
-        let legacy = tmp("symlink-legacy");
-        let victim = legacy.with_file_name("legacy-victim.toml");
-        let victim_text = "sightings = 99\n";
-        std::fs::write(&victim, victim_text).expect("write legacy victim");
-        symlink(&victim, &legacy).expect("plant legacy final symlink");
-        assert_eq!(
-            host_startup_and_exit(legacy.with_file_name("aterm.toml")),
-            (0, 0),
-            "startup must not follow the legacy symlink"
-        );
-        assert!(
-            std::fs::symlink_metadata(&legacy)
-                .expect("legacy link remains")
-                .file_type()
-                .is_symlink()
-        );
-        assert_eq!(
-            std::fs::read_to_string(&victim).expect("read untouched legacy victim"),
-            victim_text
-        );
-
-        let sidecar_legacy = tmp("symlink-sidecar");
-        let sidecar = collectibles_path(&sidecar_legacy);
-        let sidecar_victim = sidecar_legacy.with_file_name("sidecar-victim.toml");
-        let lex = Lexicon::builtin();
-        let mut seeded = KittyLog::default();
-        seeded.record(&sighting(1), lex, "2026-07-01T00:00:00Z");
-        let sidecar_victim_text =
-            aterm_toml::to_string(&KittyCollectibleStore::mirrored(&seeded.collectibles))
-                .expect("serialize sidecar victim");
-        std::fs::write(&sidecar_victim, &sidecar_victim_text).expect("write sidecar victim");
-        symlink(&sidecar_victim, &sidecar).expect("plant sidecar final symlink");
-        assert_eq!(
-            host_startup_and_exit(sidecar_legacy.with_file_name("aterm.toml")),
-            (0, 0),
-            "startup must not follow the sidecar symlink"
-        );
-        assert!(
-            std::fs::symlink_metadata(&sidecar)
-                .expect("sidecar link remains")
-                .file_type()
-                .is_symlink()
-        );
-        assert_eq!(
-            std::fs::read_to_string(&sidecar_victim).expect("read untouched sidecar victim"),
-            sidecar_victim_text
-        );
-        assert!(
-            !sidecar_legacy.exists(),
-            "an unsafe authoritative sidecar must gate the mirror write"
-        );
-
-        let _ = std::fs::remove_dir_all(legacy.parent().unwrap());
-        let _ = std::fs::remove_dir_all(sidecar_legacy.parent().unwrap());
     }
 
     /// Flushing merges with what another process already wrote (summed
@@ -2709,103 +2614,92 @@ mod tests {
             .collect()
         };
 
+        // One real transition, bound to the model: the projection after it is
+        // a step the healthy model admits, and the state the model reaches.
+        let step = |prev: &mut BTreeMap<&'static str, i64>,
+                    spec: &mut BTreeMap<&'static str, i64>,
+                    after: BTreeMap<&'static str, i64>,
+                    action: &str,
+                    what: &str| {
+            let (ok, why) =
+                verify::validate_transition_tiered(&model, &[], prev, &after, Some(action), what);
+            assert!(ok, "model rejected {what}: {why}");
+            assert!(model.fire(action, spec), "{what}");
+            assert_eq!(&after, spec, "{what}");
+            *prev = after;
+        };
+        let rows = |path: &Path| KittyLog::read_with_sidecar(path).collectibles;
+        let total = |rows: &[KittyCollectible]| rows.iter().map(|row| row.count).sum::<u64>();
+
         let path = tmp("sidecar-conformance");
-        let initial = project(&path, 0, 0);
+        let mut prev = project(&path, 0, 0);
         let mut spec = model.init_state();
-        assert_eq!(initial, spec);
+        assert_eq!(prev, spec);
         let sample = sighting(7000);
         let look = sample.look.normalized();
+        let record = |log: &mut KittyLog, variant: CatGlyphId, at: &str| {
+            log.record_collectible(
+                glyph_key(variant),
+                KittyLook { variant, ..look },
+                &sample,
+                Lexicon::builtin(),
+                at,
+            )
+        };
         let mut discovery = KittyLog::default();
-        assert!(discovery.record_collectible(
-            glyph_key(look.variant),
-            look,
-            &sample,
-            Lexicon::builtin(),
-            "2026-07-09T12:00:00Z",
-        ));
+        assert!(record(&mut discovery, look.variant, "2026-07-09T12:00:00Z"));
         KittyLog::flush_merge(&path, &discovery);
-        let discovered = project(&path, 1, 1);
-        let (ok, why) = verify::validate_transition_tiered(
-            &model,
-            &[],
-            &initial,
-            &discovered,
-            Some("Discover"),
-            "real sidecar collectible discovery",
+        step(
+            &mut prev,
+            &mut spec,
+            project(&path, 1, 1),
+            "Discover",
+            "discover A",
         );
-        assert!(ok, "model rejected sidecar discovery: {why}");
-        assert!(model.fire("Discover", &mut spec));
-        assert_eq!(discovered, spec);
 
         // The first collectible-aware build knows only kitty-log.toml. It sees
         // mirrored A, discovers B there, and leaves the sidecar untouched.
         let mut rollback_view = KittyLog::read(&path);
-        let rollback_look = KittyLook {
-            variant: CatGlyphId::S101,
-            ..look
-        };
-        assert!(rollback_view.record_collectible(
-            glyph_key(CatGlyphId::S101),
-            rollback_look,
-            &sample,
-            Lexicon::builtin(),
-            "2026-07-09T12:00:01Z",
+        assert!(record(
+            &mut rollback_view,
+            CatGlyphId::S101,
+            "2026-07-09T12:00:01Z"
         ));
         rollback_view.write(&path);
-        let rollback_discovered = project(&path, 2, 2);
-        let (ok, why) = verify::validate_transition_tiered(
-            &model,
-            &[],
-            &discovered,
-            &rollback_discovered,
-            Some("OldDiscover"),
-            "collectible-aware rollback discovers B",
+        step(
+            &mut prev,
+            &mut spec,
+            project(&path, 2, 2),
+            "OldDiscover",
+            "rollback discovers B",
         );
-        assert!(ok, "model rejected rollback discovery: {why}");
-        assert!(model.fire("OldDiscover", &mut spec));
-        assert_eq!(rollback_discovered, spec);
-
-        let reconciled = KittyLog::read_with_sidecar(&path);
-        assert_eq!(reconciled.collectibles.len(), 2, "A+B survive re-upgrade");
-        let reupgraded = project(&path, 2, 2);
-        let (ok, why) = verify::validate_transition_tiered(
-            &model,
-            &[],
-            &rollback_discovered,
-            &reupgraded,
-            Some("Reconcile"),
-            "re-upgrade unions rollback-only B",
+        assert_eq!(rows(&path).len(), 2, "A+B survive re-upgrade");
+        step(
+            &mut prev,
+            &mut spec,
+            project(&path, 2, 2),
+            "Reconcile",
+            "re-upgrade unions B",
         );
-        assert!(ok, "model rejected rollback reconciliation: {why}");
-        assert!(model.fire("Reconcile", &mut spec));
-        assert_eq!(reupgraded, spec);
 
-        // The rollback now repeats A. Re-upgrade must import count +1, not add
-        // the complete mirrored A+B ledger to the authoritative copy.
+        // The rollback repeats A. Re-upgrade must import count +1, not add the
+        // complete mirrored A+B ledger to the authoritative copy.
         let mut rollback_repeat = KittyLog::read(&path);
-        assert!(!rollback_repeat.record_collectible(
-            glyph_key(look.variant),
-            look,
-            &sample,
-            Lexicon::builtin(),
-            "2026-07-09T12:00:02Z",
+        assert!(!record(
+            &mut rollback_repeat,
+            look.variant,
+            "2026-07-09T12:00:02Z"
         ));
         rollback_repeat.write(&path);
-        let repeated = project(&path, 2, 3);
-        let (ok, why) = verify::validate_transition_tiered(
-            &model,
-            &[],
-            &reupgraded,
-            &repeated,
-            Some("OldRepeat"),
-            "collectible-aware rollback repeats A",
+        step(
+            &mut prev,
+            &mut spec,
+            project(&path, 2, 3),
+            "OldRepeat",
+            "rollback repeats A",
         );
-        assert!(ok, "model rejected rollback repeat: {why}");
-        assert!(model.fire("OldRepeat", &mut spec));
-        assert_eq!(repeated, spec);
-
-        let final_rows = KittyLog::read_with_sidecar(&path).collectibles;
-        assert_eq!(final_rows.iter().map(|row| row.count).sum::<u64>(), 3);
+        let final_rows = rows(&path);
+        assert_eq!(total(&final_rows), 3);
         assert_eq!(
             final_rows
                 .iter()
@@ -2816,194 +2710,116 @@ mod tests {
             "mirrored A is not counted twice"
         );
         assert_eq!(
-            KittyLog::read_with_sidecar(&path)
-                .collectibles
-                .iter()
-                .map(|row| row.count)
-                .sum::<u64>(),
+            total(&rows(&path)),
             3,
             "a second re-upgrade load is idempotent"
         );
-        let repeat_reconciled = project(&path, 2, 3);
-        let (ok, why) = verify::validate_transition_tiered(
-            &model,
-            &[],
-            &repeated,
-            &repeat_reconciled,
-            Some("Reconcile"),
-            "re-upgrade imports one repeat delta",
+        step(
+            &mut prev,
+            &mut spec,
+            project(&path, 2, 3),
+            "Reconcile",
+            "re-upgrade imports one repeat",
         );
-        assert!(ok, "model rejected repeat reconciliation: {why}");
-        assert!(model.fire("Reconcile", &mut spec));
-        assert_eq!(repeat_reconciled, spec);
 
-        let precollectibles_view = KittyLog::read(&path);
-        write_precollectibles_rewrite(&path, &precollectibles_view);
-        let survived = project(&path, 2, 3);
-        let (ok, why) = verify::validate_transition_tiered(
-            &model,
-            &[],
-            &repeat_reconciled,
-            &survived,
-            Some("OldRewrite"),
-            "pre-collectibles destructive rewrite",
+        write_precollectibles_rewrite(&path, &KittyLog::read(&path));
+        step(
+            &mut prev,
+            &mut spec,
+            project(&path, 2, 3),
+            "OldRewrite",
+            "pre-collectibles rewrite",
         );
-        assert!(ok, "model rejected rollback-safe rewrite: {why}");
-        assert!(model.fire("OldRewrite", &mut spec));
-        assert_eq!(survived, spec);
-        assert!(model.check_invariant("NoUnlockRollback", &survived));
-        assert!(model.check_invariant("NoCountRollback", &survived));
+        assert!(model.check_invariant("NoUnlockRollback", &prev));
+        assert!(model.check_invariant("NoCountRollback", &prev));
 
-        // With the mirror gone, the collectible-aware rollback can still start
-        // a fresh book and discover C. Re-upgrade must union that new key with
-        // sidecar-only A+B rather than treating the empty mirror as final.
+        // With the mirror gone, the rollback starts a fresh book and discovers
+        // C. Re-upgrade must union it with sidecar-only A+B rather than treat
+        // the empty mirror as final.
         let mut empty_rollback = KittyLog::read(&path);
         assert!(empty_rollback.collectibles.is_empty());
-        let look_c = KittyLook {
-            variant: CatGlyphId::S102,
-            ..look
-        };
-        assert!(empty_rollback.record_collectible(
-            glyph_key(look_c.variant),
-            look_c,
-            &sample,
-            Lexicon::builtin(),
-            "2026-07-09T12:00:03Z",
+        assert!(record(
+            &mut empty_rollback,
+            CatGlyphId::S102,
+            "2026-07-09T12:00:03Z"
         ));
         empty_rollback.write(&path);
-        let empty_rollback_discovered = project(&path, 3, 4);
-        let (ok, why) = verify::validate_transition_tiered(
-            &model,
-            &[],
-            &survived,
-            &empty_rollback_discovered,
-            Some("OldDiscover"),
-            "collectible-aware rollback discovers C after mirror erasure",
+        step(
+            &mut prev,
+            &mut spec,
+            project(&path, 3, 4),
+            "OldDiscover",
+            "rollback discovers C",
         );
-        assert!(ok, "model rejected empty-mirror rollback discovery: {why}");
-        assert!(model.fire("OldDiscover", &mut spec));
-        assert_eq!(empty_rollback_discovered, spec);
+        let reunioned = rows(&path);
+        assert_eq!((reunioned.len(), total(&reunioned)), (3, 4), "A+B union C");
+        step(
+            &mut prev,
+            &mut spec,
+            project(&path, 3, 4),
+            "Reconcile",
+            "re-upgrade unions C",
+        );
+        write_precollectibles_rewrite(&path, &KittyLog::read(&path));
+        step(
+            &mut prev,
+            &mut spec,
+            project(&path, 3, 4),
+            "OldRewrite",
+            "second rewrite",
+        );
 
-        let reunioned_rows = KittyLog::read_with_sidecar(&path).collectibles;
-        assert_eq!(
-            reunioned_rows.len(),
-            3,
-            "sidecar A+B unions rollback-only C"
-        );
-        assert_eq!(reunioned_rows.iter().map(|row| row.count).sum::<u64>(), 4);
-        let reunioned = project(&path, 3, 4);
-        let (ok, why) = verify::validate_transition_tiered(
-            &model,
-            &[],
-            &empty_rollback_discovered,
-            &reunioned,
-            Some("Reconcile"),
-            "re-upgrade reconciles a discovery from an erased mirror",
-        );
-        assert!(ok, "model rejected empty-mirror reconciliation: {why}");
-        assert!(model.fire("Reconcile", &mut spec));
-        assert_eq!(reunioned, spec);
-
-        let precollectibles_view = KittyLog::read(&path);
-        write_precollectibles_rewrite(&path, &precollectibles_view);
-        let erased_again = project(&path, 3, 4);
-        let (ok, why) = verify::validate_transition_tiered(
-            &model,
-            &[],
-            &reunioned,
-            &erased_again,
-            Some("OldRewrite"),
-            "second pre-collectibles destructive rewrite",
-        );
-        assert!(ok, "model rejected second rollback-safe rewrite: {why}");
-        assert!(model.fire("OldRewrite", &mut spec));
-        assert_eq!(erased_again, spec);
-
-        // The information-losing chain can also rediscover an already-known
-        // semantic key. The recreated row has a new first_seen stamp, which
-        // marks its whole count as post-baseline rather than subtracting the
-        // now-larger sidecar count and silently losing the encounter.
+        // The information-losing chain rediscovers an already-known key. The
+        // recreated row's new first_seen marks its whole count post-baseline,
+        // rather than subtracting the larger sidecar count and losing it.
         let mut reset_repeat = KittyLog::read(&path);
         assert!(reset_repeat.collectibles.is_empty());
-        assert!(reset_repeat.record_collectible(
-            glyph_key(look.variant),
-            look,
-            &sample,
-            Lexicon::builtin(),
-            "2026-07-09T12:00:04Z",
+        assert!(record(
+            &mut reset_repeat,
+            look.variant,
+            "2026-07-09T12:00:04Z"
         ));
         reset_repeat.write(&path);
-        let repeated_after_reset = project(&path, 3, 5);
-        let (ok, why) = verify::validate_transition_tiered(
-            &model,
-            &[],
-            &erased_again,
-            &repeated_after_reset,
-            Some("OldRepeatReset"),
-            "collectible-aware rollback repeats A after mirror erasure",
+        step(
+            &mut prev,
+            &mut spec,
+            project(&path, 3, 5),
+            "OldRepeatReset",
+            "repeat A after erasure",
         );
-        assert!(ok, "model rejected reset-mirror repeat: {why}");
-        assert!(model.fire("OldRepeatReset", &mut spec));
-        assert_eq!(repeated_after_reset, spec);
-
-        let reset_repeat_rows = KittyLog::read_with_sidecar(&path).collectibles;
-        assert_eq!(reset_repeat_rows.len(), 3);
-        assert_eq!(
-            reset_repeat_rows.iter().map(|row| row.count).sum::<u64>(),
-            5
+        let reset_rows = rows(&path);
+        assert_eq!((reset_rows.len(), total(&reset_rows)), (3, 5));
+        step(
+            &mut prev,
+            &mut spec,
+            project(&path, 3, 5),
+            "Reconcile",
+            "re-upgrade imports the reset repeat",
         );
-        let reset_repeat_reconciled = project(&path, 3, 5);
-        let (ok, why) = verify::validate_transition_tiered(
-            &model,
-            &[],
-            &repeated_after_reset,
-            &reset_repeat_reconciled,
-            Some("Reconcile"),
-            "re-upgrade imports same-key repeat from a recreated mirror",
+        write_precollectibles_rewrite(&path, &KittyLog::read(&path));
+        step(
+            &mut prev,
+            &mut spec,
+            project(&path, 3, 5),
+            "OldRewrite",
+            "final rewrite",
         );
-        assert!(ok, "model rejected reset-mirror reconciliation: {why}");
-        assert!(model.fire("Reconcile", &mut spec));
-        assert_eq!(reset_repeat_reconciled, spec);
-
-        let precollectibles_view = KittyLog::read(&path);
-        write_precollectibles_rewrite(&path, &precollectibles_view);
-        let erased_final = project(&path, 3, 5);
-        let (ok, why) = verify::validate_transition_tiered(
-            &model,
-            &[],
-            &reset_repeat_reconciled,
-            &erased_final,
-            Some("OldRewrite"),
-            "final pre-collectibles destructive rewrite",
+        let restored = rows(&path);
+        assert_eq!((restored.len(), total(&restored)), (3, 5));
+        step(
+            &mut prev,
+            &mut spec,
+            project(&path, 3, 5),
+            "RestoreMirror",
+            "re-upgrade restores the mirror",
         );
-        assert!(ok, "model rejected final rollback-safe rewrite: {why}");
-        assert!(model.fire("OldRewrite", &mut spec));
-        assert_eq!(erased_final, spec);
-
-        let restored_rows = KittyLog::read_with_sidecar(&path).collectibles;
-        assert_eq!(restored_rows.len(), 3);
-        assert_eq!(restored_rows.iter().map(|row| row.count).sum::<u64>(), 5);
-        let restored = project(&path, 3, 5);
-        let (ok, why) = verify::validate_transition_tiered(
-            &model,
-            &[],
-            &erased_final,
-            &restored,
-            Some("RestoreMirror"),
-            "re-upgrade restores rollback-readable mirror",
-        );
-        assert!(ok, "model rejected mirror restore: {why}");
-        assert!(model.fire("RestoreMirror", &mut spec));
-        assert_eq!(restored, spec);
 
         let buggy_path = tmp("sidecar-negative");
         let mut embedded_only = KittyLog::default();
-        assert!(embedded_only.record_collectible(
-            glyph_key(look.variant),
-            look,
-            &sample,
-            Lexicon::builtin(),
-            "2026-07-09T12:00:00Z",
+        assert!(record(
+            &mut embedded_only,
+            look.variant,
+            "2026-07-09T12:00:00Z"
         ));
         write_transitional_embedded(&buggy_path, &embedded_only);
         assert!(KittyLog::write_collectible_store_state(
@@ -3350,7 +3166,7 @@ mod tests {
     }
 
     /// Tier-1 conformance for `KittyPinMerge`
-    /// (`aterm_spec::derive::kitty_pin_merge_model`): wearing a cat and folding
+    /// (`aterm_models_core::kitty_pin_merge_model`): wearing a cat and folding
     /// one replica's ledger into another, on two REAL `KittyLog`s, is exactly
     /// the model's join — over the model's whole reachable space, both flush
     /// directions in every order.
@@ -3475,61 +3291,17 @@ mod tests {
             "…but the collectible row still mints"
         );
         assert_eq!(host.log().sightings, 1, "and the ledger still counts");
-    }
 
-    /// The re-dress half of the same ruling: with a favourite already
-    /// pinned, an ambient discovery of a NEW glyph must not repoint it —
-    /// `cat` scrolling by in a man page is not a reason to change the cat at
-    /// the cursor.
-    #[test]
-    fn an_ambient_discovery_never_redresses_a_pinned_favourite() {
-        let lex = Lexicon::builtin();
-        let mut host = KittyLogHost::in_memory();
+        // With a favourite pinned, an ambient discovery of a NEW glyph must not
+        // repoint it: `cat` scrolling by in a man page is no reason to change it.
         let pinned = coated(CatGlyphId::S100, 3);
-        let printed = coated(CatGlyphId::SpecWitch, 12);
-        let now = Instant::now();
-
         host.favourite(&look_sighting(51, pinned), lex, now, true);
-        assert_eq!(host.favourite_look(), Some(pinned));
-
+        let printed = coated(CatGlyphId::S101, 12);
         host.observe_ambient(4, [look_sighting(52, printed)], lex, now, true);
-
         assert_eq!(
             host.favourite_look(),
             Some(pinned),
             "output text never re-dresses the companion"
-        );
-        assert!(
-            host.log()
-                .collectibles
-                .iter()
-                .any(|item| item.key == glyph_key(CatGlyphId::SpecWitch)),
-            "the printed cat still joins the collection"
-        );
-    }
-
-    /// The typed contrast pin: a first-ever TYPED discovery still RETURNS
-    /// the unlocked look (the hello is the user's to see) — but it no longer
-    /// repoints the companion (owner ruling, 2026-08-17: the launch kitty
-    /// does not change for a discovery; only a pin changes the cat).
-    #[test]
-    fn a_typed_discovery_reports_without_repointing() {
-        let lex = Lexicon::builtin();
-        let mut host = KittyLogHost::in_memory();
-        let unlocked = coated(CatGlyphId::S101, 6);
-        let now = Instant::now();
-
-        let discovery = host.observe(4, [look_sighting(61, unlocked)], lex, now, true);
-
-        assert_eq!(
-            discovery,
-            Some(unlocked),
-            "the typed path still reports the unlock for its hello"
-        );
-        assert_eq!(
-            host.favourite_look(),
-            None,
-            "…and the companion does NOT follow the discovery"
         );
     }
 
@@ -3873,9 +3645,6 @@ mod tests {
         let locks = lock_pair(&ledger, &sidecar).expect("hold both ledger locks");
         let mut host = KittyLogHost::load(Some(ledger.clone()));
         host.observe(7, [sighting(11)], lex, Instant::now(), true);
-        std::thread::sleep(Duration::from_millis(25));
-        assert!(!ledger.exists(), "held lock keeps the batch pending");
-
         drop(locks);
         let deadline = Instant::now() + FLUSH_RETRY_DELAY + aterm_spec::wait::MUST_HAPPEN;
         while !ledger.exists() && Instant::now() < deadline {

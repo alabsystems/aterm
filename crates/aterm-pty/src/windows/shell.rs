@@ -260,6 +260,23 @@ pub enum ShellOrigin {
     CmdLiteral,
 }
 
+impl ShellOrigin {
+    /// The one word a report prints for this arm (`shell_origin=default:<word>`):
+    /// the program or variable that chose the shell. `override` for
+    /// [`Self::Override`], which a caller names by its own input (`--shell`,
+    /// `aterm.toml`, the tab's own shell).
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Override => "override",
+            Self::Pwsh => "pwsh",
+            Self::PowerShell => "powershell",
+            Self::Comspec => "COMSPEC",
+            Self::CmdLiteral => "cmd.exe",
+        }
+    }
+}
+
 /// Select the interactive shell. Precedence: the caller's `override_shell`
 /// (config `shell` / `--shell`) → `pwsh.exe` → `powershell.exe` → `%COMSPEC%` →
 /// literal `cmd.exe`. See the module docs for the deliberate `%SHELL%` omission;
@@ -326,6 +343,9 @@ pub(crate) fn resolve_spawn_target(
         // and splicing a `shell_args = ["-l"]` in front of it would make bash a
         // LOGIN shell, which reads `.bash_profile` INSTEAD of the `--rcfile` —
         // i.e. it would disable the very integration the override installs.
+        // bash's and pwsh's own arguments reach them anyway: the frontend puts
+        // them inside the override where each accepts them, before it gets here
+        // (`aterm_shell_integration::merge_shell_args`).
         let args = shell_args.unwrap_or(&[]);
         if args.is_empty() || !is_wsl_shell(&shell) {
             let argv = ov.iter().map(OsString::from).collect();

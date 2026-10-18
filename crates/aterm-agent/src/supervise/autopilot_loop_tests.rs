@@ -45,15 +45,12 @@ fn under(policy: SupervisorConfig) -> SuperviseOpts {
 #[test]
 fn the_sessions_land_word_types_the_land_instruction_and_a_done_reply_ends_the_task() {
     let (dir, journal) = journal_file("autopilot-land");
-    let mut m = Mock::new(
-        true,
-        vec![
-            busy_screen(),
-            worked("Fixed the parser; the suite is green."),
-            busy_screen(),
-            worked("Committed the parser and its tests. All done."),
-        ],
-    );
+    let mut m = Mock::new(vec![
+        busy_screen(),
+        worked("Fixed the parser; the suite is green."),
+        busy_screen(),
+        worked("Committed the parser and its tests. All done."),
+    ]);
     m.autopilot = Some("land");
     m.turn_releases = Some(1);
     m.vanish_after = Some(4);
@@ -99,13 +96,10 @@ fn the_sessions_land_word_types_the_land_instruction_and_a_done_reply_ends_the_t
 
     // Negative control: no word on this host — the table's Cruise, and no
     // `meta` read for it.
-    let mut m = Mock::new(
-        true,
-        vec![
-            busy_screen(),
-            worked("Fixed the parser; the suite is green."),
-        ],
-    );
+    let mut m = Mock::new(vec![
+        busy_screen(),
+        worked("Fixed the parser; the suite is green."),
+    ]);
     m.turn_releases = Some(1);
     m.vanish_after = Some(2);
     let (lines, _) = watch_lines(&mut m, &under(SupervisorConfig::default()));
@@ -142,7 +136,7 @@ fn a_persons_greeting_under_land_is_left_to_them() {
     let greeting = "Hi! What would you like me to work on?";
     let mut quick = rows(&[&format!("⏺ {greeting}"), ""]);
     quick.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
-    let timing = |s: &mut Session<'_, Mock>| {
+    let timing = |s: &mut Watched<'_, '_>| {
         s.set_turn_end_timing(TurnEndTiming {
             short_backoff: Duration::from_millis(30),
             short_backoff_max: Duration::from_millis(60),
@@ -154,7 +148,7 @@ fn a_persons_greeting_under_land_is_left_to_them() {
         ..SupervisorConfig::default()
     };
     let (dir, journal) = journal_file("autopilot-land-exchange");
-    let mut m = Mock::new(true, vec![busy_screen(), quick.clone()]);
+    let mut m = Mock::new(vec![busy_screen(), quick.clone()]);
     m.autopilot = Some("land");
     m.turn_releases = Some(1);
     m.vanish_after = Some(8);
@@ -181,7 +175,7 @@ fn a_persons_greeting_under_land_is_left_to_them() {
     let _ = std::fs::remove_dir_all(&dir);
 
     // Negative control: nobody's stamp — the land instruction.
-    let mut m = Mock::new(true, vec![busy_screen(), quick]);
+    let mut m = Mock::new(vec![busy_screen(), quick]);
     m.autopilot = Some("land");
     m.turn_releases = Some(1);
     m.vanish_after = Some(8);
@@ -268,7 +262,8 @@ fn a_loop_started_as_off_lifted_acts_on_the_point_it_finds() {
     let land_rows = [format!("❯ {first}"), format!("  {}", rest.trim_start())];
     let land_rows: Vec<&str> = land_rows.iter().map(String::as_str).collect();
     // The done check as Claude Code wraps it under its `❯`.
-    let (first, rest) = DONE_CHECK.split_at(DONE_CHECK.find(" Reply with").expect("the check"));
+    let (first, rest) =
+        DONE_CHECK.split_at(DONE_CHECK.find(" End your reply with").expect("the check"));
     let check_rows = [format!("❯ {first}"), format!("  {}", rest.trim_start())];
     let check_rows: Vec<&str> = check_rows.iter().map(String::as_str).collect();
     // A case: its name, its screen, the act the stopped loop typed (its rule
@@ -380,14 +375,11 @@ fn an_off_park_then_cruise_acts_on_the_point_it_never_saw_run() {
     let quick = answered(&["❯ hi"], greeting, None);
     let run = |hand: bool, tag: &str| {
         let (dir, journal) = journal_file(tag);
-        let mut m = Mock::new(
-            true,
-            vec![
-                busy_screen(),
-                worked("Fixed the parser; the suite is green."),
-                quick.clone(),
-            ],
-        );
+        let mut m = Mock::new(vec![
+            busy_screen(),
+            worked("Fixed the parser; the suite is green."),
+            quick.clone(),
+        ]);
         m.autopilot = Some("cruise");
         // The decision at the worked point reads `off` and parks; the
         // park's next read, `cruise`.
@@ -459,9 +451,12 @@ fn run_lifted(
         let at = crate::supervise::journal::unix_ms() - i64::try_from(ago.as_millis()).unwrap();
         std::fs::write(&ledger, row.to_json(at, None) + "\n").expect("ledger");
     }
-    let mut m = Mock::new(true, screens);
+    let mut m = Mock::new(screens);
     m.vanish_after = Some(20);
     m.stall_sleep = Some(Duration::from_millis(20));
+    // Each case is judged by the act the new loop types: the run ends at it,
+    // and a loop that leaves the point types nothing and runs to its budget.
+    m.exit_when = Some(|m| m.turns > 0);
     m.human = human.into_iter().collect();
     let opts = SuperviseOpts {
         policy: SupervisorConfig {
@@ -618,7 +613,7 @@ fn the_point_off_stood_on_read_again_is_continued_as_before_the_park() {
     drawn.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
     for (case, point) in [("3 minutes", worked(said)), ("no done row", drawn)] {
         let (dir, journal) = journal_file("autopilot-f2-park");
-        let mut m = Mock::new(true, vec![busy_screen(), point.clone(), point]);
+        let mut m = Mock::new(vec![busy_screen(), point.clone(), point]);
         m.autopilot = Some("cruise");
         m.autopilot_at = vec![(2, Some("off")), (3, Some("cruise"))];
         // The person's scroll under Off, read on the point drawn again.
@@ -685,13 +680,10 @@ fn the_table_decides_a_session_with_no_word_and_a_word_decides_over_the_table() 
         autopilot: Autopilot::Land,
         ..SupervisorConfig::default()
     };
-    let mut m = Mock::new(
-        true,
-        vec![
-            busy_screen(),
-            worked("Fixed the parser; the suite is green."),
-        ],
-    );
+    let mut m = Mock::new(vec![
+        busy_screen(),
+        worked("Fixed the parser; the suite is green."),
+    ]);
     m.turn_releases = Some(1);
     m.vanish_after = Some(2);
     let (lines, _) = watch_lines(&mut m, &under(land));
@@ -707,13 +699,10 @@ fn the_table_decides_a_session_with_no_word_and_a_word_decides_over_the_table() 
         autopilot: Autopilot::Off,
         ..SupervisorConfig::default()
     };
-    let mut m = Mock::new(
-        true,
-        vec![
-            busy_screen(),
-            worked("Fixed the parser; the suite is green."),
-        ],
-    );
+    let mut m = Mock::new(vec![
+        busy_screen(),
+        worked("Fixed the parser; the suite is green."),
+    ]);
     m.autopilot = Some("cruise");
     m.turn_releases = Some(1);
     m.vanish_after = Some(2);
@@ -763,7 +752,7 @@ fn an_autopilot_off_parks_the_loop_until_the_word_changes() {
         (lines, said)
     };
     // Off throughout: parked, the word read at each step.
-    let mut m = Mock::new(true, script());
+    let mut m = Mock::new(script());
     m.autopilot = Some("off");
     m.vanish_after = Some(3);
     let (lines, said) = run(&mut m, SupervisorConfig::default(), "autopilot-off");
@@ -793,7 +782,7 @@ fn an_autopilot_off_parks_the_loop_until_the_word_changes() {
     );
 
     // Off, then cruise at the third read: unparked, and continued.
-    let mut m = Mock::new(true, script());
+    let mut m = Mock::new(script());
     m.autopilot = Some("off");
     m.autopilot_at = vec![(3, Some("cruise"))];
     m.vanish_after = Some(4);
@@ -820,7 +809,7 @@ fn an_autopilot_off_parks_the_loop_until_the_word_changes() {
         autopilot: Autopilot::Off,
         ..SupervisorConfig::default()
     };
-    let mut m = Mock::new(true, script());
+    let mut m = Mock::new(script());
     m.vanish_after = Some(3);
     let (_, said) = run(&mut m, off, "autopilot-table-off");
     assert!(
@@ -836,7 +825,7 @@ fn an_autopilot_off_parks_the_loop_until_the_word_changes() {
     );
 
     // Negative control: cruise throughout.
-    let mut m = Mock::new(true, script());
+    let mut m = Mock::new(script());
     m.autopilot = Some("cruise");
     m.vanish_after = Some(2);
     let (_, said) = run(&mut m, SupervisorConfig::default(), "autopilot-cruise");
@@ -855,7 +844,7 @@ fn an_autopilot_off_presses_no_box() {
         journal: Some(journal.clone()),
         ..auto(30, None)
     };
-    let mut m = Mock::new(true, vec![bash_one_row(), idle_screen()]);
+    let mut m = fenced(vec![bash_one_row(), idle_screen()]);
     m.autopilot = Some("-");
     m.autopilot_at = vec![(2, Some("off"))];
     m.vanish_after = Some(2);
@@ -873,7 +862,7 @@ fn an_autopilot_off_presses_no_box() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 
-    let mut m = Mock::new(true, vec![bash_one_row(), idle_screen()]);
+    let mut m = fenced(vec![bash_one_row(), idle_screen()]);
     m.autopilot = Some("-");
     m.vanish_after = Some(2);
     let (lines, _) = watch_lines(&mut m, &auto(30, None));
@@ -895,10 +884,11 @@ fn an_autopilot_off_presses_no_box() {
 fn an_autopilot_off_dismisses_no_card_over_a_busy_worker() {
     let run = |word: &'static str| {
         let (dir, journal) = journal_file(&format!("autopilot-card-{word}"));
-        let mut m = Mock::new(
-            true,
-            vec![with_survey(busy_screen()), busy_screen(), idle_screen()],
-        );
+        let mut m = Mock::new(vec![
+            with_survey(busy_screen()),
+            busy_screen(),
+            idle_screen(),
+        ]);
         m.autopilot = Some(word);
         m.vanish_after = Some(1);
         let opts = SuperviseOpts {
@@ -942,10 +932,11 @@ fn an_autopilot_off_dismisses_no_card_over_a_busy_worker() {
 #[test]
 fn a_busy_wait_reads_a_new_off_word_before_dismissing_a_card() {
     let run = |word| {
-        let mut m = Mock::new(
-            true,
-            vec![with_survey(busy_screen()), busy_screen(), idle_screen()],
-        );
+        let mut m = Mock::new(vec![
+            with_survey(busy_screen()),
+            busy_screen(),
+            idle_screen(),
+        ]);
         m.autopilot = Some("cruise");
         m.autopilot_on.insert(0, Some(word));
         m.vanish_after = Some(1);
@@ -979,10 +970,11 @@ fn a_busy_wait_reads_a_new_off_word_before_dismissing_a_card() {
 /// on that stale Cruise reading; the next successful read confirms Off.
 #[test]
 fn a_busy_wait_with_an_unanswered_autopilot_read_touches_no_card() {
-    let mut m = Mock::new(
-        true,
-        vec![with_survey(busy_screen()), busy_screen(), idle_screen()],
-    );
+    let mut m = Mock::new(vec![
+        with_survey(busy_screen()),
+        busy_screen(),
+        idle_screen(),
+    ]);
     m.autopilot = Some("cruise");
     let first = ok(&m.meta_line());
     m.verb_replies
@@ -1018,11 +1010,11 @@ fn an_autopilot_off_park_gives_the_claim_back_and_takes_it_again() {
             worked("Fixed the parser; the suite is green."),
         ]
     };
-    let claimed = |s: &mut Session<'_, Mock>| {
+    let claimed = |s: &mut Watched<'_, '_>| {
         s.set_supervisor_name(Some("gui:7".to_string()));
         s.set_claim_timing(Duration::ZERO, 90_000);
     };
-    let mut m = Mock::new(true, script());
+    let mut m = Mock::new(script());
     m.autopilot = Some("off");
     m.autopilot_at = vec![(3, Some("cruise"))];
     m.vanish_after = Some(4);
@@ -1069,7 +1061,7 @@ fn an_autopilot_off_park_gives_the_claim_back_and_takes_it_again() {
 
     // NEGATIVE CONTROL: Cruise throughout — nothing given back (the session
     // ends gone, with no claim left to release).
-    let mut m = Mock::new(true, script());
+    let mut m = Mock::new(script());
     m.autopilot = Some("cruise");
     m.vanish_after = Some(2);
     let _ = watch_lines_with(&mut m, &under(SupervisorConfig::default()), claimed);
@@ -1115,7 +1107,7 @@ fn land_then_off_then_land_types_the_land_instruction_again() {
     };
     // The bare `meta` reads: the reconcile's, the instruction's decision,
     // the second point's decision (`off`: parked), the park's (`land`).
-    let mut m = Mock::new(true, script());
+    let mut m = Mock::new(script());
     m.autopilot = Some("land");
     m.autopilot_at = vec![(3, Some("off")), (4, Some("land"))];
     m.turn_releases = Some(1);
@@ -1136,7 +1128,7 @@ fn land_then_off_then_land_types_the_land_instruction_again() {
 
     // NEGATIVE CONTROL: Land throughout — the second point is the old
     // episode's, and gets its nudge.
-    let mut m = Mock::new(true, script());
+    let mut m = Mock::new(script());
     m.autopilot = Some("land");
     m.turn_releases = Some(1);
     m.vanish_after = Some(2);
@@ -1162,7 +1154,7 @@ fn a_refused_read_of_the_word_keeps_the_word_last_read() {
     // The reconcile's read says `off`; the park's first read is `second`;
     // every read after it, `after`.
     let run = |second: CtlReply, after: &'static str, tag: &str| {
-        let mut m = Mock::new(true, script());
+        let mut m = Mock::new(script());
         m.autopilot = Some("off");
         let first = ok(&m.meta_line());
         m.verb_replies
@@ -1195,7 +1187,7 @@ fn a_refused_read_of_the_word_keeps_the_word_last_read() {
 
     // NEGATIVE CONTROL: the same read answered, `cruise`.
     let cruise = {
-        let mut m = Mock::new(true, script());
+        let mut m = Mock::new(script());
         m.autopilot = Some("cruise");
         ok(&m.meta_line())
     };
@@ -1220,7 +1212,7 @@ fn a_managers_one_look_ignores_the_autopilot_word() {
         journal: Some(journal.clone()),
         ..auto(30, None)
     };
-    let mut m = Mock::new(true, vec![bash_one_row(), busy_screen(), write_prompt()]);
+    let mut m = fenced(vec![bash_one_row(), busy_screen(), write_prompt()]);
     m.autopilot = Some("off");
     let (out, code) = session(&mut m, None).supervise(&opts).expect("supervise");
     assert_eq!(code, 0);
@@ -1243,7 +1235,7 @@ fn a_managers_one_look_ignores_the_autopilot_word() {
         journal: Some(journal.clone()),
         ..auto(30, None)
     };
-    let mut m = Mock::new(true, vec![bash_one_row(), idle_screen()]);
+    let mut m = fenced(vec![bash_one_row(), idle_screen()]);
     m.autopilot = Some("off");
     m.vanish_after = Some(2);
     let _ = watch_lines(&mut m, &opts);
@@ -1266,15 +1258,12 @@ fn a_managers_one_look_ignores_the_autopilot_word() {
 #[test]
 fn a_token_reply_to_the_land_instruction_is_lands_done() {
     let done_lines = |word: &'static str, tag: &str, reply: &str| {
-        let mut m = Mock::new(
-            true,
-            vec![
-                busy_screen(),
-                worked("Fixed the parser; the suite is green."),
-                busy_screen(),
-                worked(reply),
-            ],
-        );
+        let mut m = Mock::new(vec![
+            busy_screen(),
+            worked("Fixed the parser; the suite is green."),
+            busy_screen(),
+            worked(reply),
+        ]);
         m.autopilot = Some(word);
         m.turn_releases = Some(1);
         m.vanish_after = Some(4);
@@ -1373,7 +1362,7 @@ fn badge_of(rows: &[String]) -> String {
 fn an_off_park_takes_the_loops_badges_down_and_the_rejudge_raises_them_again() {
     let rm = write_prompt();
     let ours = badge_of(&rm);
-    let claimed = |s: &mut Session<'_, Mock>| {
+    let claimed = |s: &mut Watched<'_, '_>| {
         s.set_supervisor_name(Some("gui:7".to_string()));
     };
     let (dir, journal) = journal_file("autopilot-off-badges");
@@ -1381,7 +1370,7 @@ fn an_off_park_takes_the_loops_badges_down_and_the_rejudge_raises_them_again() {
         journal: Some(journal.clone()),
         ..auto(30, None)
     };
-    let mut m = Mock::new(true, vec![rm.clone(), rm.clone(), rm.clone()]);
+    let mut m = Mock::new(vec![rm.clone(), rm.clone(), rm.clone()]);
     m.attention = Some(ours.clone());
     m.autopilot = Some("off");
     m.autopilot_at = vec![(3, Some("cruise"))];
@@ -1438,7 +1427,7 @@ fn an_off_park_takes_the_loops_badges_down_and_the_rejudge_raises_them_again() {
         journal: Some(journal.clone()),
         ..auto(30, None)
     };
-    let mut m = Mock::new(true, vec![rm.clone(), rm.clone(), rm]);
+    let mut m = Mock::new(vec![rm.clone(), rm.clone(), rm]);
     m.attention = Some(ours.clone());
     m.autopilot = Some("cruise");
     m.vanish_after = Some(3);
@@ -1462,14 +1451,12 @@ fn an_off_park_takes_the_loops_badges_down_and_the_rejudge_raises_them_again() {
 /// for the park's end — the turn-end text, the limit's episode — is
 /// `an_off_parks_end_sets_the_turn_end_badge_again_unless_the_worker_worked`'s
 /// and `a_limit_spanning_an_off_park_is_one_episode_one_mail_one_escalation`'s.)
-/// The note that Codex's goal runs on stays up with its switch (§7): a
-/// turn-end clear that finds it on the loop's one entry says `kept` and
-/// unsets nothing. NEGATIVE CONTROL: a loop that holds no badge sends and
+/// NEGATIVE CONTROL: a loop that holds no badge sends and
 /// says nothing.
 #[test]
 fn an_off_parks_badges_come_down_each_with_its_cleared_line() {
     let lowered = |setup: fn(&mut Session<'_, Mock>), entry: &str| {
-        let mut m = Mock::new(true, vec![idle_screen()]);
+        let mut m = Mock::new(vec![idle_screen()]);
         m.attention = Some(entry.to_string());
         let mut notes = Notes::default();
         {
@@ -1491,13 +1478,6 @@ fn an_off_parks_badges_come_down_each_with_its_cleared_line() {
     assert_eq!(notes.noted, ["CLEARED seq=101 turn-end attention=OK"]);
     assert_eq!(m.attention, None);
     assert!(notes.said.is_empty(), "journal-only: {:#?}", notes.said);
-
-    // The goal's note over it: kept, with its switch.
-    let goal = format!("codex idle: {GOAL_NOTE_HEAD} under the switch (a note)");
-    let (notes, m) = lowered(|s| s.turn_end_badge = true, &goal);
-    assert_eq!(notes.noted, ["CLEARED seq=101 turn-end attention=kept"]);
-    assert_eq!(m.attention.as_deref(), Some(goal.as_str()));
-    assert_eq!(count(&m, "meta unset"), 0, "{:#?}", m.requests);
 
     // A limit episode's badge.
     let (notes, m) = lowered(
@@ -1547,7 +1527,7 @@ fn the_loops_last_clear_of_the_turn_end_badge_is_journaled() {
     use crate::supervise::journal::JournalRecord;
     let entry = "claude idle: finish sign-in in the browser (the turn-end policy)";
     let released = |badge: bool| {
-        let mut m = Mock::new(true, vec![idle_screen()]);
+        let mut m = Mock::new(vec![idle_screen()]);
         m.attention = Some(entry.to_string());
         let mut notes = Notes::default();
         {
@@ -1602,7 +1582,7 @@ fn the_loops_last_clear_of_the_turn_end_badge_is_journaled() {
 #[test]
 fn a_parks_retake_behind_the_same_holder_says_it_once() {
     let busy = |holder: &str| err(&format!("busy supervisor={holder}"));
-    let mut m = Mock::new(true, vec![idle_screen()]);
+    let mut m = Mock::new(vec![idle_screen()]);
     m.claim_replies = [
         busy("gui%3A42"),
         busy("gui%3A42"),
@@ -1670,7 +1650,7 @@ fn an_off_parks_end_sets_the_turn_end_badge_again_unless_the_worker_worked() {
     // A park on the point at seq 100 over `screens`, its word turning
     // `cruise` at its second read.
     let parked = |screens: Vec<Vec<String>>| {
-        let mut m = Mock::new(true, screens);
+        let mut m = Mock::new(screens);
         m.attention = Some(entry.to_string());
         m.autopilot = Some("off");
         m.autopilot_at = vec![(2, Some("cruise"))];
@@ -1767,7 +1747,7 @@ fn a_limit_spanning_an_off_park_is_one_episode_one_mail_one_escalation() {
     // (`lower_badges`) or closed by the worker's answer, then the notice met
     // again at seq 102: the lines noted, the requests, the episode's seq.
     let run = |setup: fn(&mut Session<'_, Mock>), park: bool| {
-        let mut m = Mock::new(true, vec![limited_screen()]);
+        let mut m = Mock::new(vec![limited_screen()]);
         m.attention = Some(entry.clone());
         let mut notes = Notes::default();
         let seq = {
@@ -1874,7 +1854,7 @@ fn a_limit_the_worker_answered_past_in_a_park_is_a_new_episode_mailed() {
     // whose word turns `cruise` at its second read, then the notice met at
     // seq 102: what was noted, the requests, the episode's seq.
     let run = |setup: fn(&mut Session<'_, Mock>), read: Vec<String>| {
-        let mut m = Mock::new(true, vec![read]);
+        let mut m = Mock::new(vec![read]);
         m.attention = Some(entry.clone());
         m.autopilot = Some("off");
         m.autopilot_at = vec![(2, Some("cruise"))];
@@ -1936,7 +1916,7 @@ fn a_limit_after_the_worker_answered_an_adopted_one_is_mailed() {
     let notice = "You've hit your session limit · resets 7:30pm (America/Los_Angeles)";
     let run = |script: Vec<Vec<String>>, tag: &str| {
         let (dir, journal) = journal_file(tag);
-        let mut m = Mock::new(true, script);
+        let mut m = Mock::new(script);
         m.attention = Some(format!("{ATTENTION_PREFIX} {notice}"));
         m.vanish_after = Some(1);
         let opts = SuperviseOpts {
@@ -2004,13 +1984,10 @@ fn a_limit_after_the_worker_answered_an_adopted_one_is_mailed() {
 #[test]
 fn a_loop_behind_another_holder_reads_the_word_and_its_park_ends_on_it() {
     let run = |word: Option<&'static str>, tag: &str| {
-        let mut m = Mock::new(
-            true,
-            vec![
-                busy_screen(),
-                worked("Fixed the parser; the suite is green."),
-            ],
-        );
+        let mut m = Mock::new(vec![
+            busy_screen(),
+            worked("Fixed the parser; the suite is green."),
+        ]);
         m.autopilot = word;
         m.autopilot_at = vec![(3, word.map(|_| "cruise"))];
         m.vanish_after = Some(4);

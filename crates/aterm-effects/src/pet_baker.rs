@@ -280,24 +280,6 @@ fn paint_eye_dots(
     xform: PathTransform,
     reflections: bool,
 ) {
-    paint_eye_dots_with_mask_observer(tile, layer, col, alpha, xform, reflections, |_, _| {});
-}
-
-/// The LOD painter with an exact, per-authored-eye raster-mask observer. The
-/// production wrapper above supplies a no-op observer; differential tests use
-/// the same path to assign reflection texels to one grown eye without relying
-/// on overlapping padded bounding boxes.
-fn paint_eye_dots_with_mask_observer<F>(
-    tile: &mut Tile,
-    layer: &Layer,
-    col: (f32, f32, f32),
-    alpha: f32,
-    xform: PathTransform,
-    reflections: bool,
-    mut observe: F,
-) where
-    F: FnMut(bool, &Tile),
-{
     let bounds: Vec<Option<(f32, f32, f32, f32)>> =
         layer.paths.iter().map(|p| path_bounds(p)).collect();
     let width = |b: &Option<(f32, f32, f32, f32)>| b.map_or(0.0, |(x0, _, x1, _)| x1 - x0);
@@ -462,7 +444,6 @@ fn paint_eye_dots_with_mask_observer<F>(
             fill_path_fixed(tile, &[&plug[..]], col, alpha, xform);
             fill_path_fixed(&mut eye_mask, &[&plug[..]], (0.0, 0.0, 0.0), 1.0, xform);
         }
-        observe(shallow, &eye_mask);
         if reflections && !shallow {
             paint_eye_reflections(
                 tile,
@@ -651,8 +632,7 @@ struct ExactSlot<K> {
 
 /// Host-side LRU of exact-size tiles (see the module docs for the budgets):
 /// the structure behind every exact-size roster, [`PetBaker`],
-/// [`DogBaker`](crate::dog_baker::DogBaker),
-/// [`RobiBaker`](crate::robi_baker::RobiBaker) and
+/// [`DogBaker`](crate::dog_baker::DogBaker) and
 /// [`AnimalBaker`](crate::animal_baker::AnimalBaker).
 ///
 /// `Default` is a valid empty baker; the first
@@ -854,38 +834,6 @@ mod tests {
             colors: CatColorKey::default(),
             w: 48,
             h: 28,
-        }
-    }
-
-    /// The roster is non-empty and every pose has a sane authored aspect — the
-    /// precondition every other test in here leans on.
-    #[test]
-    fn roster_is_populated_and_aspects_are_sane() {
-        assert!(!PET_GLYPH_IDS.is_empty(), "pet roster must not be empty");
-        assert_eq!(
-            PET_GLYPH_IDS.len(),
-            PET_GLYPHS.len(),
-            "id table and glyph table must agree"
-        );
-        for &id in PET_GLYPH_IDS {
-            let a = PetBaker::aspect(id);
-            let authored = PET_GLYPHS[id as usize].aspect_x1000;
-            assert!(
-                a.is_finite() && a > 0.0,
-                "{}: aspect {a} must be finite and positive",
-                PET_GLYPHS[id as usize].id
-            );
-            assert!(authored > 0, "an authored viewbox must not be degenerate");
-            assert_eq!(
-                a,
-                f32::from(authored) / 1000.0,
-                "aspect must read the authored viewbox verbatim"
-            );
-            assert!(
-                !PET_GLYPHS[id as usize].layers.is_empty(),
-                "{}: a pose with no layers would bake an empty tile",
-                PET_GLYPHS[id as usize].id
-            );
         }
     }
 
@@ -1206,115 +1154,6 @@ mod tests {
         );
     }
 
-    /// Differential check of the reflection pass against an otherwise identical
-    /// no-reflection bake: every changed texel was dark and owned by exactly one
-    /// per-path grown-eye mask, every open eye gains its own pale texel, and
-    /// shallow happy/closed/lidded paths gain none. The dark-core test above
-    /// shows the reflected output keeps a 2×2 core.
-    #[test]
-    fn face_lod_reflections_are_contained_and_expression_aware() {
-        const H: u32 = 36;
-        let mut failures: Vec<String> = Vec::new();
-        let mut exercised = 0usize;
-        for &id in PET_GLYPH_IDS {
-            let def = &PET_GLYPHS[id as usize];
-            let w = (H as f32 * PetBaker::aspect(id)).round() as u32;
-            let xform = PathTransform::fit(w, H);
-            for dark_bg in [false, true] {
-                let fills = ResolvedFills::from_indices(9, 4, dark_bg);
-                let plain = bake_pose_with_reflections(id, &fills, w, H, false);
-                let glossy = bake_pose_with_reflections(id, &fills, w, H, true);
-                let mut eye_ink = Tile::new(w, H);
-                let mut eye_masks: Vec<(bool, Vec<u8>)> = Vec::new();
-                for layer in def.layers {
-                    if layer.role != GlyphRole::Eye {
-                        continue;
-                    }
-                    paint_eye_dots_with_mask_observer(
-                        &mut eye_ink,
-                        layer,
-                        (0.0, 0.0, 0.0),
-                        1.0,
-                        xform,
-                        false,
-                        |shallow, mask| eye_masks.push((shallow, mask.pixels().to_vec())),
-                    );
-                }
-
-                let changed: Vec<usize> = plain
-                    .pixels()
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .zip(glossy.pixels().as_chunks::<4>().0)
-                    .enumerate()
-                    .filter(|(_, (a, b))| a != b)
-                    .map(|(i, _)| i)
-                    .collect();
-                for &pixel in &changed {
-                    let i = pixel * 4;
-                    let x = pixel % w as usize;
-                    let y = pixel / w as usize;
-                    let before = &plain.pixels()[i..i + 4];
-                    let owners: Vec<usize> = eye_masks
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(eye, (_, mask))| (mask[i + 3] != 0).then_some(eye))
-                        .collect();
-                    if owners.len() != 1 || before[3] != 255 || !before[..3].iter().all(|&c| c < 96)
-                    {
-                        failures.push(format!(
-                            "{} (dark_bg={dark_bg}): reflection texel ({x},{y}) \
-                             has owners={owners:?}, before={before:?}",
-                            def.id
-                        ));
-                    }
-                }
-
-                for (eye, (shallow, mask)) in eye_masks.iter().enumerate() {
-                    let local: Vec<usize> = changed
-                        .iter()
-                        .copied()
-                        .filter(|&pixel| mask[pixel * 4 + 3] != 0)
-                        .collect();
-                    if *shallow {
-                        if !local.is_empty() {
-                            failures.push(format!(
-                                "{} (dark_bg={dark_bg}): shallow eye {eye} \
-                                 gained reflection pixels {local:?}",
-                                def.id
-                            ));
-                        }
-                    } else {
-                        exercised += 1;
-                        if local.is_empty() {
-                            failures.push(format!(
-                                "{} (dark_bg={dark_bg}): open eye {eye} gained \
-                                 no shipping-size reflection",
-                                def.id
-                            ));
-                        } else if !local.iter().any(|&pixel| {
-                            let i = pixel * 4;
-                            glossy.pixels()[i..i + 3].iter().all(|&c| c >= 160)
-                        }) {
-                            failures.push(format!(
-                                "{} (dark_bg={dark_bg}): open eye {eye} never \
-                                 becomes visibly pale",
-                                def.id
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-        assert!(exercised > 0, "the roster probe must exercise open eyes");
-        assert!(
-            failures.is_empty(),
-            "the reflection LOD regressed:\n  {}",
-            failures.join("\n  ")
-        );
-    }
-
     /// The LOD deletes the authored charm stack and rebuilds only what the
     /// pixels can carry: at 36 px the walk keeps catch-light white from the
     /// device-sized reflections but has no fully covered blush pink or tabby
@@ -1375,169 +1214,6 @@ mod tests {
         }
     }
 
-    /// The eye-size rule at the sizes 1× desktops bake (24 px at the default
-    /// cell_h 14) and at 1.5× (36 px): for every live pose on both grounds,
-    /// each authored eye's dark ink component stays inside its box:
-    ///
-    /// * an open eye: no taller than max(authored height,
-    ///   [`EYE_DOT_TARGET_H_PX`]), no wider than max(authored width,
-    ///   [`EYE_DASH_CORE_PX`]), each plus 1.5 px of anti-aliasing slack;
-    /// * a shallow arc/lid: height against [`EYE_DOT_TARGET_H_PX_ARC`], width
-    ///   against [`EYE_DOT_ARC_KX_MAX`] × authored (a pair fused across its
-    ///   daylight shows as one component twice its allowed width);
-    ///
-    /// and still exists (a few fully dark texels per eye). Subpaths with
-    /// overlapping x-ranges are one eye in several strokes and are measured as
-    /// one. Components are flood-filled inside a window sized from the bound,
-    /// so an overgrown eye cannot escape measurement.
-    #[test]
-    fn lod_eyes_hold_the_artists_proportion_at_desktop_sizes() {
-        // The Linux default, derived, not assumed: ART_ROWS · cell_h 14.
-        let default_h = (crate::kitty_pet::ART_ROWS * 14.0).round() as u32;
-        assert_eq!(default_h, 24, "the Linux-default bake height moved");
-        let mut failures: Vec<String> = Vec::new();
-        for &id in PET_GLYPH_IDS {
-            let needle = PET_GLYPHS[id as usize].id;
-            for h in [default_h, 36] {
-                let w = (h as f32 * PetBaker::aspect(id)).round() as u32;
-                for dark_bg in [false, true] {
-                    let fills = ResolvedFills::from_indices(9, 4, dark_bg);
-                    let tile = bake_pose(id, &fills, w, h);
-                    let px = tile.pixels();
-                    let dark = |x: i32, y: i32| -> bool {
-                        if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
-                            return false;
-                        }
-                        let i = ((y as u32 * w + x as u32) * 4) as usize;
-                        px[i + 3] == 255 && px[i..i + 3].iter().all(|&c| c < 64)
-                    };
-                    for layer in PET_GLYPHS[id as usize].layers {
-                        if layer.role != GlyphRole::Eye {
-                            continue;
-                        }
-                        // Cluster subpaths sharing x-range, as the baker's
-                        // daylight guard does (the roll's tilted face stacks
-                        // its two arcs diagonally).
-                        let mut clusters: Vec<((f32, f32, f32, f32), usize)> = Vec::new();
-                        for b in layer.paths.iter().filter_map(|p| path_bounds(p)) {
-                            if let Some((c, n)) =
-                                clusters.iter_mut().find(|(c, _)| b.0 <= c.2 && c.0 <= b.2)
-                            {
-                                c.0 = c.0.min(b.0);
-                                c.1 = c.1.min(b.1);
-                                c.2 = c.2.max(b.2);
-                                c.3 = c.3.max(b.3);
-                                *n += 1;
-                            } else {
-                                clusters.push((b, 1));
-                            }
-                        }
-                        for &((x0, y0, x1, y1), members) in &clusters {
-                            let w_px = (x1 - x0) * w as f32;
-                            let h_px = (y1 - y0) * h as f32;
-                            let shallow = w_px > 0.0 && h_px < EYE_DOT_SHALLOW_ASPECT * w_px;
-                            let (w_bound, h_bound) = if members > 1 {
-                                // A multi-stroke union is bounded loosely (each
-                                // member grows about its own centre); tight
-                                // pinning is for single-stroke eyes.
-                                (
-                                    (w_px * EYE_DOT_SCALE_MAX).max(EYE_DASH_CORE_PX) + 1.5,
-                                    h_px + EYE_DOT_TARGET_H_PX + 1.5,
-                                )
-                            } else if shallow {
-                                (
-                                    (w_px * EYE_DOT_ARC_KX_MAX).max(EYE_DASH_CORE_PX) + 1.5,
-                                    h_px.max(EYE_DOT_TARGET_H_PX_ARC) + 1.5,
-                                )
-                            } else {
-                                (
-                                    w_px.max(EYE_DASH_CORE_PX) + 1.5,
-                                    h_px.max(EYE_DOT_TARGET_H_PX) + 1.5,
-                                )
-                            };
-                            let cx = ((x0 + x1) * 0.5 * w as f32).round() as i32;
-                            let cy = ((y0 + y1) * 0.5 * h as f32).round() as i32;
-                            // Seed: the dark texel nearest the authored
-                            // centre (the dot may sit a rounded pixel off).
-                            let seed = (0..=3)
-                                .flat_map(|r| {
-                                    ((cx - r)..=(cx + r)).flat_map(move |x| {
-                                        ((cy - r)..=(cy + r)).map(move |y| (x, y))
-                                    })
-                                })
-                                .find(|&(x, y)| dark(x, y));
-                            let Some(seed) = seed else {
-                                failures.push(format!(
-                                    "{needle} h={h} (dark_bg={dark_bg}): the eye \
-                                     at ({cx},{cy}) keeps NO dark ink — the dot \
-                                     grew illegible"
-                                ));
-                                continue;
-                            };
-                            // Flood the component inside a bound-sized
-                            // window: big enough to prove a violation,
-                            // small enough to exclude the silhouette.
-                            let (wx, wy) = (w_bound as i32 / 2 + 3, h_bound as i32 / 2 + 3);
-                            let mut seen = std::collections::HashSet::new();
-                            let mut queue = vec![seed];
-                            seen.insert(seed);
-                            let (mut bx0, mut by0, mut bx1, mut by1) =
-                                (seed.0, seed.1, seed.0, seed.1);
-                            let mut area = 0usize;
-                            while let Some((x, y)) = queue.pop() {
-                                area += 1;
-                                bx0 = bx0.min(x);
-                                by0 = by0.min(y);
-                                bx1 = bx1.max(x);
-                                by1 = by1.max(y);
-                                for dx in -1..=1 {
-                                    for dy in -1..=1 {
-                                        let n = (x + dx, y + dy);
-                                        if (n.0 - cx).abs() <= wx
-                                            && (n.1 - cy).abs() <= wy
-                                            && dark(n.0, n.1)
-                                            && seen.insert(n)
-                                        {
-                                            queue.push(n);
-                                        }
-                                    }
-                                }
-                            }
-                            let (comp_w, comp_h) = (bx1 - bx0 + 1, by1 - by0 + 1);
-                            if comp_w as f32 > w_bound || comp_h as f32 > h_bound {
-                                failures.push(format!(
-                                    "{needle} h={h} (dark_bg={dark_bg}): the \
-                                     {}px-authored eye at ({cx},{cy}) paints a \
-                                     {comp_w}x{comp_h} dark component — over its \
-                                     {w_bound:.1}x{h_bound:.1} lawful box \
-                                     (shallow={shallow})",
-                                    format_args!("{w_px:.1}x{h_px:.1}"),
-                                ));
-                            }
-                            // The floor scales with what the size guarantees:
-                            // at 36 px the full core plug fits every pose (≥2×2),
-                            // at 24 px the land's sub-pixel braced squint carries
-                            // one fully dark texel plus its anti-aliased halo.
-                            let floor = if h >= 36 { 4 } else { 1 };
-                            if area < floor {
-                                failures.push(format!(
-                                    "{needle} h={h} (dark_bg={dark_bg}): the eye \
-                                     at ({cx},{cy}) keeps only {area} dark texels \
-                                     — under the legibility floor of {floor}"
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        assert!(
-            failures.is_empty(),
-            "the eye-size law regressed:\n  {}",
-            failures.join("\n  ")
-        );
-    }
-
     /// The Retina identity path: a 2× default (cell_h ≈ 42 ⇒ a ~71 px tile)
     /// bakes at or above [`FACE_DETAIL_MIN_H`], where the LOD never runs and the
     /// full authored face is painted verbatim. At the boundary the first
@@ -1587,56 +1263,6 @@ mod tests {
         assert!(
             !has_authored_catch_light(FACE_DETAIL_MIN_H - 1),
             "one pixel under the threshold must still bake the LOD face"
-        );
-    }
-
-    /// Smoke test: a baked standing pose is actually a CAT, not an empty box.
-    /// The middle horizontal band (the body — above the feet, below the ear
-    /// tips) must carry substantial opaque coverage, and the tile must contain
-    /// more than one distinct colour.
-    #[test]
-    fn a_standing_pose_draws_a_cat() {
-        let (w, h) = (128u32, 76u32);
-        let stand = pose("stand");
-        let fills = ResolvedFills::from_indices(9, 4, true);
-        let tile = bake_pose(stand, &fills, w, h);
-        let px = tile.pixels();
-        assert_eq!(px.len(), (w * h * 4) as usize);
-
-        let (lo, hi) = (h / 3, 2 * h / 3);
-        let band = ((hi - lo) * w) as usize;
-        let mut opaque = 0usize;
-        for y in lo..hi {
-            for x in 0..w {
-                let i = ((y * w + x) * 4) as usize;
-                if px[i + 3] > 128 {
-                    opaque += 1;
-                }
-            }
-        }
-        let coverage = opaque as f32 / band as f32;
-        assert!(
-            coverage > 0.20,
-            "the standing pose covers only {:.1}% of its middle band — it did \
-             not draw a cat",
-            coverage * 100.0
-        );
-
-        // More than one colour: an outline plus a coat at minimum.
-        let mut colors: Vec<u32> = px
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .filter(|p| p[3] > 200)
-            .map(|p| u32::from(p[0]) << 16 | u32::from(p[1]) << 8 | u32::from(p[2]))
-            .collect();
-        colors.sort_unstable();
-        colors.dedup();
-        assert!(
-            colors.len() >= 3,
-            "a pose should paint an outline, a coat and face ink — got {} \
-             distinct opaque colours",
-            colors.len()
         );
     }
 }

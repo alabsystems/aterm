@@ -96,7 +96,9 @@ impl Probe for SystemProbe {
     }
 
     fn connect(&self, addr: SocketAddr, within: Duration) -> io::Result<TcpStream> {
-        TcpStream::connect_timeout(&addr, within)
+        // Not std's own: a refusal on Windows takes about 2 s there, longer than
+        // a share of the budget, and would read as a timeout (aterm_http::connect).
+        aterm_http::connect::connect_timeout(&addr, within)
     }
 
     fn handshake(
@@ -310,8 +312,8 @@ impl NetProbe {
     /// Stop the thread at its next look (the host's shutdown). Nothing joins
     /// it.
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "netprobe_shutdown_park",
             action = "Stop",
             project = "harness_netprobe::tests::project_shutdown_park"
@@ -331,13 +333,14 @@ impl NetProbe {
             return;
         }
         let me = Arc::clone(self);
-        let spawned = std::thread::Builder::new()
-            .name("aterm-harness-netprobe".into())
-            .spawn(move || {
-                crate::qos::set_self(crate::qos::Role::Background);
+        let spawned = crate::qos::spawn_lane_thread(
+            "aterm-harness-netprobe",
+            crate::qos::Role::Background,
+            move || {
                 me.spawned.fetch_add(1, Ordering::SeqCst);
                 me.run();
-            });
+            },
+        );
         if let Err(e) = spawned {
             self.started.store(false, Ordering::SeqCst);
             aterm_log::warn!("harness: the API reach probe could not start: {e}");
@@ -384,8 +387,8 @@ impl NetProbe {
     }
 
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "netprobe_shutdown_park",
             action = "Park",
             project = "harness_netprobe::tests::project_shutdown_park"
@@ -663,7 +666,7 @@ mod tests {
     /// rejects exactly the old unlocked publisher's observed ordering.
     #[test]
     fn shutdown_cannot_lose_the_park_wake_or_retain_the_worker() {
-        let model = aterm_spec::derive::netprobe_shutdown_park_model();
+        let model = aterm_models_gui::netprobe_shutdown_park_model();
         let observed = shutdown_at_park_trace(ShutdownPublisher::MutexGuarded);
         assert_eq!(
             observed.iter().map(|step| step.action).collect::<Vec<_>>(),
@@ -1257,158 +1260,5 @@ mod tests {
             Route::Default
         );
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// THE ROUTE AND THE STORED LOGIN ARE READ FROM THE CHAIN CLAUDE CODE
-    /// READS (2.1.299 and 2.1.300's settings-path switch, the approval lane's
-    /// `claude_settings::sources`), not from a list of this module's own: a
-    /// document that is empty, blank or led by a byte-order mark is `{}`; a
-    /// `--project-config-root` moves the project's two files to the root it
-    /// names (and the launch directory's are then not read); the local file
-    /// of the repository's main worktree counts for an agent launched in a
-    /// linked worktree; a true `CLAUDE_CODE_USE_COWORK_PLUGINS` reads
-    /// `cowork_settings.json` in place of `settings.json`; and a relative or
-    /// empty `CLAUDE_CONFIG_DIR` is taken against the agent's directory
-    /// (`path.resolve`). Each place below is one Claude Code takes an `env`
-    /// block from, so a proxy there is a route this host does not measure.
-    /// NEGATIVE CONTROL: a `--managed-settings` (the SDK parent's policy
-    /// JSON) is not one: an interactive 2.1.300 session launched with one
-    /// naming a base URL did not take it (the real-Claude lab, 2026-10-14).
-    /// Every case is checked and the wrong ones are listed together.
-    #[test]
-    fn the_route_and_the_stored_login_are_read_where_claude_code_reads_its_settings() {
-        let proxy = "{\"env\":{\"HTTPS_PROXY\":\"http://proxy.corp:3128\"}}";
-        let quiet = "{\"model\":\"opus\"}";
-        let dir = scratch("chain");
-        let home = dir.join("home");
-        let proj = dir.join("proj");
-        let facts = |more: &[&str], argv: &[&str], cwd: &Path| {
-            let mut env = vec![format!("HOME={}", home.display()), "USER=owner".to_string()];
-            env.extend(more.iter().map(|s| (*s).to_string()));
-            let argv: Vec<String> = argv.iter().map(|s| (*s).to_string()).collect();
-            gather(
-                Some(env),
-                &argv,
-                cwd,
-                Some(&dir.join("managed")),
-                &dir.join("prefs"),
-                Some(&dir.join("home")),
-            )
-        };
-        let route =
-            |more: &[&str], argv: &[&str], cwd: &Path| netwatch::route_of(&facts(more, argv, cwd));
-        let rm = |p: &Path| std::fs::remove_file(p).expect("rm");
-        let mkfile = |p: &Path, text: &str| {
-            std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
-            write(p, text);
-        };
-        // Each case's verdict, the wrong ones listed together at the end.
-        let mut wrong: Vec<String> = Vec::new();
-        let mut expect = |case: &str, ok: bool, read: &dyn std::fmt::Debug| {
-            if !ok {
-                wrong.push(format!("{case}: read {read:?}"));
-            }
-        };
-        let custom = |r: &Route| matches!(r, Route::Custom(_));
-
-        // An empty, blank or marked document is `{}`: the default route, and
-        // the stored login left.
-        let local = proj.join(".claude/settings.local.json");
-        let user = home.join(".claude/settings.json");
-        for body in ["", " \n\t", "\u{feff}", "\u{feff}{\"model\":\"opus\"}"] {
-            for at in [&local, &user] {
-                write(at, body);
-                let case = format!("{body:?} in {}", at.display());
-                let r = route(&[], &["claude"], &proj);
-                expect(&case, !custom(&r), &r);
-                let stored = stored_login_of(&facts(&[], &["claude"], &proj), Some(&home));
-                expect(&format!("{case}, the stored login"), stored, &stored);
-                rm(at);
-            }
-        }
-        // NEGATIVE CONTROL: a marked document is still read.
-        write(&local, &format!("\u{feff}{proxy}"));
-        let r = route(&[], &["claude"], &proj);
-        expect("a marked proxy", custom(&r), &r);
-        rm(&local);
-
-        // `--project-config-root`: the root's files, not the launch
-        // directory's (an absolute root: 2.1.300 refuses to start on a
-        // relative one).
-        let root = dir.join("root");
-        let rooted = root.join(".claude/settings.local.json");
-        mkfile(&rooted, proxy);
-        let joined = format!("--project-config-root={}", root.display());
-        let spaced = [
-            "claude",
-            "--project-config-root",
-            root.to_str().expect("utf-8"),
-        ];
-        for argv in [&spaced[..], &["claude", joined.as_str()][..]] {
-            let r = route(&[], argv, &proj);
-            expect(&format!("{argv:?}"), custom(&r), &r);
-        }
-        let r = route(&[], &["claude"], &proj);
-        expect("no root", !custom(&r), &r);
-        rm(&rooted);
-        write(&proj.join(".claude/settings.json"), proxy);
-        let r = route(&[], &spaced, &proj);
-        expect(
-            "the launch directory's project file under a root",
-            !custom(&r),
-            &r,
-        );
-        rm(&proj.join(".claude/settings.json"));
-
-        // A linked worktree: the main worktree's local file counts.
-        let main = dir.join("main");
-        let gitdir = main.join(".git/worktrees/wt");
-        let wt = dir.join("wt");
-        mkfile(&gitdir.join("commondir"), "../..\n");
-        mkfile(&wt.join(".git"), &format!("gitdir: {}\n", gitdir.display()));
-        let sub = wt.join("crates/x");
-        std::fs::create_dir_all(&sub).expect("sub");
-        let r = route(&[], &["claude"], &sub);
-        expect("a quiet linked worktree", !custom(&r), &r);
-        mkfile(&main.join(".claude/settings.local.json"), proxy);
-        let r = route(&[], &["claude"], &sub);
-        expect("the main worktree's local file", custom(&r), &r);
-
-        // Cowork: `cowork_settings.json` in place of `settings.json`.
-        let cowork = ["CLAUDE_CODE_USE_COWORK_PLUGINS=1"];
-        write(&home.join(".claude/cowork_settings.json"), proxy);
-        let r = route(&cowork, &["claude"], &proj);
-        expect("cowork_settings.json", custom(&r), &r);
-        let r = route(&[], &["claude"], &proj);
-        expect("cowork off", !custom(&r), &r);
-        write(&home.join(".claude/cowork_settings.json"), quiet);
-        write(&user, proxy);
-        let r = route(&cowork, &["claude"], &proj);
-        expect("settings.json under cowork", !custom(&r), &r);
-        rm(&user);
-
-        // A relative `CLAUDE_CONFIG_DIR`, and an empty one, against the
-        // agent's directory.
-        mkfile(&proj.join("cc/settings.json"), quiet);
-        let relative = ["CLAUDE_CONFIG_DIR=cc"];
-        let r = route(&relative, &["claude"], &proj);
-        expect("a quiet relative CLAUDE_CONFIG_DIR", !custom(&r), &r);
-        write(&proj.join("cc/settings.json"), proxy);
-        let r = route(&relative, &["claude"], &proj);
-        expect("a relative CLAUDE_CONFIG_DIR", custom(&r), &r);
-        write(&proj.join("settings.json"), proxy);
-        let r = route(&["CLAUDE_CONFIG_DIR="], &["claude"], &proj);
-        expect("an empty CLAUDE_CONFIG_DIR", custom(&r), &r);
-
-        // NEGATIVE CONTROL: `--managed-settings` is not the session's.
-        let r = route(&[], &["claude", "--managed-settings", proxy], &proj);
-        expect("--managed-settings", !custom(&r), &r);
-        let _ = std::fs::remove_dir_all(&dir);
-        assert!(
-            wrong.is_empty(),
-            "{} wrong:\n{}",
-            wrong.len(),
-            wrong.join("\n")
-        );
     }
 }

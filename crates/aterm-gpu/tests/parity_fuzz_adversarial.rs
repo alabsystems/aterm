@@ -129,9 +129,8 @@ fn gpu_render_adversarial_states_never_panics_and_matches_cpu() {
         // DECDHL (dec 1/2) is excluded from parity: with the top half anchored
         // above the visible area the clip boundary does not align to the 2x
         // source grid, and GPU UV + NEAREST sampling picks a different source
-        // row than the CPU's integer clip (the aligned case is
-        // `gpu_matches_cpu::decdhl_double_height_gpu_matches_cpu`). It still
-        // renders for panic-freedom; DECDWL (dec 0) is checked.
+        // row than the CPU's integer clip (`parity_fuzz.rs` covers the aligned
+        // case). It still renders for panic-freedom; DECDWL (dec 0) is checked.
         let is_decdhl = dec == 1 || dec == 2;
         if !is_decdhl {
             let d = max_channel_delta(&cpu_frame, &gpu_frame);

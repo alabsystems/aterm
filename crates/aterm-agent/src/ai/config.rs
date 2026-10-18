@@ -5,13 +5,13 @@
 //!
 //! Only `[ai]` keys are interpreted from valid TOML; unusable values are notes and their
 //! defaults, and malformed TOML reads as defaults with a note. It is not under `[harness]`,
-//! whose keys may only take power away: a preferred CLI is a choice, not a limit. `reviewers`
-//! is the local grant for a requested cross-vendor review. These choices start nothing on
-//! their own and name no credential.
+//! whose keys may only take power away: these are choices. Batteries included: reviews are
+//! on, every CLI used on this machine reviews, at the asking agent's own permission level.
 //!
-//! The fleet document (`[ai] fleet`) carries the same choices for many machines, at its top
-//! level and under `[machine.<name>]`. It is admitted whole or refused by name, as
-//! `accounts.toml` is. Precedence, per key: this machine's `[ai]`, the document's row for
+//! The fleet document (`[ai] fleet`, a file or an `https://` URL) carries the same choices
+//! for many machines, at its top level and under `[machine.<name>]`. A URL's document is
+//! signed, and verified under the key `[ai] fleet_key` pins (`fleet.rs`); a file's is too
+//! when a key is pinned. Precedence, per key: this machine's `[ai]`, the document's row for
 //! `[ai] machine`, the document's top level, the built-in default.
 
 use std::collections::BTreeMap;
@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use aterm_toml::Value;
 
 use super::connector::{self, Connector};
+use super::permission::Choice;
 
 /// The table's name in `aterm.toml`.
 pub const TABLE: &str = "ai";
@@ -33,18 +34,22 @@ pub const REVIEW_COUNT_MAX: u8 = 4;
 pub const TIMEOUT_MIN_S: u32 = 30;
 /// A reviewer's time limit, at most.
 pub const TIMEOUT_MAX_S: u32 = 3600;
-/// The default time limit.
-pub const TIMEOUT_DEFAULT_S: u32 = 300;
-/// The default number of reviewers.
-pub const REVIEW_COUNT_DEFAULT: u8 = 1;
+/// The default time limit: a reviewer with its tools reads the repository.
+pub const TIMEOUT_DEFAULT_S: u32 = 600;
+/// The default number of reviewers: every one used here.
+pub const REVIEW_COUNT_DEFAULT: u8 = REVIEW_COUNT_MAX;
 /// The longest machine name.
 pub const MACHINE_MAX: usize = 32;
 /// The largest `aterm.toml` read (the window's admission cap).
 pub const CONFIG_MAX_BYTES: u64 = 512 * 1024;
+/// The fleet document read beside `aterm.toml` when `[ai] fleet` names none.
+pub const FLEET_FILE: &str = "ai-fleet.toml";
 
 /// The choices a fleet document may make too.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Layer {
+    /// `reviews`.
+    pub reviews: Option<bool>,
     /// `preferred`.
     pub preferred: Option<&'static str>,
     /// `reviewers`, in order.
@@ -53,8 +58,30 @@ pub struct Layer {
     pub review_count: Option<u8>,
     /// `review_timeout_s`.
     pub review_timeout_s: Option<u32>,
+    /// `review_permissions`.
+    pub review_permissions: Option<Choice>,
     /// `[<id>] use`, per connection id.
     pub uses: BTreeMap<&'static str, bool>,
+}
+
+/// Where the fleet document comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FleetSource {
+    /// A file on this machine.
+    Path(PathBuf),
+    /// An `https://` URL, fetched and verified.
+    Url(String),
+}
+
+impl FleetSource {
+    /// How it is shown.
+    #[must_use]
+    pub fn shown(&self) -> String {
+        match self {
+            FleetSource::Path(p) => p.display().to_string(),
+            FleetSource::Url(u) => u.clone(),
+        }
+    }
 }
 
 /// This machine's `[ai]` table.
@@ -65,7 +92,9 @@ pub struct Local {
     /// `machine`.
     pub machine: Option<String>,
     /// `fleet`.
-    pub fleet: Option<PathBuf>,
+    pub fleet: Option<FleetSource>,
+    /// `fleet_key`: the fleet document's signer, pinned.
+    pub fleet_key: Option<String>,
     /// The choices.
     pub layer: Layer,
 }
@@ -108,19 +137,19 @@ impl From {
 /// What became of the fleet document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FleetState {
-    /// `[ai] fleet` is not set.
+    /// No fleet document is named and none lies beside `aterm.toml`.
     None,
     /// Read and admitted; `row`: it has a row for this machine.
     Read {
-        /// Where.
-        path: PathBuf,
+        /// Where it came from.
+        source: String,
         /// Whether it has a row for this machine.
         row: bool,
     },
-    /// Not read, or refused whole; reviewers stay empty until its narrowing is known.
+    /// Not read, or refused whole; nothing in it applies.
     Refused {
-        /// Where.
-        path: PathBuf,
+        /// Where it came from.
+        source: String,
         /// Why, in one line.
         why: String,
     },
@@ -143,18 +172,26 @@ impl FleetState {
 pub struct Settings {
     /// The window's look and its messages.
     pub enabled: bool,
+    /// Whether reviews run at all.
+    pub reviews: (bool, From),
     /// This machine's main AI CLI.
     pub preferred: (&'static Connector, From),
-    /// Who reviews, in order.
+    /// Who reviews, in order: every CLI used here unless a list narrows it.
     pub reviewers: (Vec<&'static Connector>, From),
     /// Reviewers per review when none is named.
     pub review_count: (u8, From),
     /// Each reviewer's time limit.
     pub review_timeout_s: (u32, From),
+    /// The reviewers' permission level: the asker's, or a pinned one.
+    pub review_permissions: (Choice, From),
     /// Whether each CLI is used on this machine, in `VENDORS` order.
     pub uses: Vec<(&'static Connector, bool, From)>,
     /// This machine's name in the fleet document.
     pub machine: Option<String>,
+    /// Where the fleet document comes from, as shown.
+    pub fleet_source: Option<String>,
+    /// The fleet document's pinned signer.
+    pub fleet_key: Option<String>,
     /// The fleet document's fate.
     pub fleet: FleetState,
     /// What was set wrong, one line each, in reading order.
@@ -162,7 +199,7 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// Whether `id` is wanted here.
+    /// Whether `id` is used here.
     #[must_use]
     pub fn wants(&self, id: &str) -> bool {
         self.uses.iter().any(|(c, on, _)| c.id == id && *on)
@@ -190,6 +227,10 @@ fn accepted_ids() -> String {
 fn read_key(layer: &mut Layer, key: &str, value: &Value, at: &str, notes: &mut Vec<String>) {
     let mut note = |why: String| notes.push(format!("{at}{why}; ignored"));
     match key {
+        "reviews" => match value.as_bool() {
+            Some(on) => layer.reviews = Some(on),
+            None => note("`reviews` takes true or false".to_string()),
+        },
         "preferred" => match value.as_str() {
             None => note("`preferred` takes a CLI's name".to_string()),
             Some(word) => match connection_id(word) {
@@ -239,6 +280,12 @@ fn read_key(layer: &mut Layer, key: &str, value: &Value, at: &str, notes: &mut V
             None => note(format!(
                 "`review_timeout_s` takes {TIMEOUT_MIN_S} to {TIMEOUT_MAX_S} seconds"
             )),
+        },
+        "review_permissions" => match value.as_str().and_then(Choice::parse) {
+            Some(c) => layer.review_permissions = Some(c),
+            None => {
+                note("`review_permissions` takes inherit, yolo, edits, ask or plan".to_string())
+            }
         },
         other => match (connection_id(other), value.as_table()) {
             (Some(id), Some(table)) => {
@@ -309,13 +356,27 @@ pub fn read(text: &str) -> (Local, Vec<String>) {
                     "[ai] `machine` takes a name of up to {MACHINE_MAX} of a-z, 0-9 and -; ignored"
                 )),
             },
-            "fleet" => match value
+            "fleet" => match value.as_str() {
+                Some(u) if super::fleet::is_url(u) && !u.chars().any(char::is_whitespace) => {
+                    local.fleet = Some(FleetSource::Url(u.to_string()));
+                }
+                Some(p) if Path::new(p).is_absolute() => {
+                    local.fleet = Some(FleetSource::Path(PathBuf::from(p)));
+                }
+                _ => notes.push(
+                    "[ai] `fleet` takes an absolute path or an https:// URL; ignored".to_string(),
+                ),
+            },
+            "fleet_key" => match value
                 .as_str()
-                .map(PathBuf::from)
-                .filter(|p| p.is_absolute())
+                .filter(|k| super::fleet::key_bytes(k).is_some())
             {
-                Some(p) => local.fleet = Some(p),
-                None => notes.push("[ai] `fleet` takes an absolute path; ignored".to_string()),
+                Some(k) => local.fleet_key = Some(k.trim().to_string()),
+                None => notes.push(
+                    "[ai] `fleet_key` takes an Ed25519 public key in base64 \
+                     (`aterm ai fleet keygen` prints one); ignored"
+                        .to_string(),
+                ),
             },
             other => read_key(&mut local.layer, other, value, "[ai] ", &mut notes),
         }
@@ -325,7 +386,8 @@ pub fn read(text: &str) -> (Local, Vec<String>) {
 
 /// Reads a fleet document. Only text that is not TOML, or a schema this build does not
 /// read, refuses it: anything else it cannot use is a note, so a document written for a
-/// newer build still applies here.
+/// newer build still applies here. Its `seq` and `valid_until` are the fetch's
+/// ([`super::fleet::meta`]).
 ///
 /// # Errors
 ///
@@ -348,7 +410,7 @@ pub fn read_fleet(text: &str) -> Result<(Fleet, Vec<String>), String> {
     let mut notes = Vec::new();
     for (key, value) in table {
         match key.as_str() {
-            "schema" => {}
+            "schema" | "seq" | "valid_until" => {}
             "machine" => {
                 let Some(rows) = value.as_table() else {
                     notes.push(
@@ -376,17 +438,13 @@ pub fn read_fleet(text: &str) -> Result<(Fleet, Vec<String>), String> {
     Ok((fleet, notes))
 }
 
-/// Reads the fleet document at `path`, bounded; a symbolic link is followed (the owner's
-/// synced dotfiles are often one). A file another user owns, or that others may write, is
-/// refused: whoever can write it chooses this machine's CLIs.
-///
-/// # Errors
-///
-/// Why it is not read or refused, in one line.
-pub fn load_fleet(path: &Path) -> Result<(Fleet, Vec<String>), String> {
+/// The bytes of the file at `path`, opened once, its owner, mode, kind and size read from the
+/// open file. A file another user owns, or that another account may write
+/// ([`aterm_uds::shared_write`]: world-write, or group-write unless the group is the owner's
+/// private one and neither an access ACL nor a network or FUSE filesystem grants it further),
+/// is refused: whoever can write it chooses this machine's CLIs.
+fn read_private(path: &Path, max: u64) -> Result<Vec<u8>, String> {
     use std::io::Read as _;
-    // Opened once; its owner, mode, kind and size are read from the open file, and the
-    // text from that same file, so no rename between a check and the read is seen.
     let mut open = std::fs::OpenOptions::new();
     open.read(true);
     #[cfg(unix)]
@@ -413,19 +471,64 @@ pub fn load_fleet(path: &Path) -> Result<(Fleet, Vec<String>), String> {
         if meta.uid() != me {
             return Err("owned by another user".to_string());
         }
-        if meta.mode() & 0o022 != 0 {
+        // Group-write is the owner's own on their private group: Ubuntu's umask `002`
+        // makes every document its user writes `0664`. Judged on this descriptor, ACL and
+        // all, so what is read is what was judged.
+        if aterm_uds::shared_write::others_can_write(&file).map_err(|e| one(&e.to_string()))? {
             return Err("writable by others".to_string());
         }
     }
     let mut bytes = Vec::new();
-    file.take(FLEET_MAX_BYTES + 1)
+    file.take(max + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| one(&e.to_string()))?;
-    if bytes.len() as u64 > FLEET_MAX_BYTES {
-        return Err(format!("larger than {} KiB", FLEET_MAX_BYTES / 1024));
+    if bytes.len() as u64 > max {
+        return Err(format!("larger than {} KiB", max / 1024));
+    }
+    Ok(bytes)
+}
+
+/// Reads the fleet document at `path`, bounded; a symbolic link is followed (the owner's
+/// synced dotfiles are often one). With `key`, its `<path>.sig` must verify under it.
+///
+/// # Errors
+///
+/// Why it is not read or refused, in one line.
+pub fn load_fleet(path: &Path, key: Option<&str>) -> Result<(Fleet, Vec<String>), String> {
+    let bytes = read_private(path, FLEET_MAX_BYTES)?;
+    if let Some(key) = key {
+        let mut sig_path = path.as_os_str().to_owned();
+        sig_path.push(".sig");
+        let sig = read_private(Path::new(&sig_path), super::fleet::SIG_MAX)
+            .map_err(|why| format!("its signature file: {why}"))?;
+        super::fleet::verify(&bytes, &sig, key)?;
     }
     let text = String::from_utf8(bytes).map_err(|_| "not UTF-8".to_string())?;
     read_fleet(&text)
+}
+
+/// Reads the fleet document `source` names: a file as [`load_fleet`] reads it; a URL's as
+/// the cache under `ai_dir` holds it, verified again under `key` ([`super::fleet::held`]).
+///
+/// # Errors
+///
+/// Why it is not read or refused, in one line.
+pub fn load_source(
+    source: &FleetSource,
+    key: Option<&str>,
+    ai_dir: Option<&Path>,
+    now: i64,
+) -> Result<(Fleet, Vec<String>), String> {
+    match source {
+        FleetSource::Path(p) => load_fleet(p, key),
+        FleetSource::Url(url) => {
+            let key =
+                key.ok_or("a fleet document from a URL needs [ai] fleet_key to pin its signer")?;
+            let dir = ai_dir.ok_or("aterm's state directory is unknown")?;
+            let text = super::fleet::held(dir, url, key, now)?;
+            read_fleet(&text)
+        }
+    }
 }
 
 fn pick<T: Clone>(local: Option<&T>, row: Option<&T>, root: Option<&T>, default: T) -> (T, From) {
@@ -440,11 +543,10 @@ fn pick<T: Clone>(local: Option<&T>, row: Option<&T>, root: Option<&T>, default:
     }
 }
 
-/// The built-in reviewers: none. `[ai] reviewers` is the egress grant, so no CLI's vendor
-/// receives this machine's code until this machine's own table lists it.
+/// The built-in reviewers: every AI CLI, in `VENDORS` order (those not used here drop out).
 #[must_use]
 pub fn default_reviewers() -> Vec<&'static str> {
-    Vec::new()
+    connector::ids()
 }
 
 /// The built-in preferred CLI: the first connection this platform has a build of.
@@ -455,13 +557,11 @@ pub fn default_preferred() -> &'static Connector {
         .unwrap_or(&connector::CLAUDE)
 }
 
-/// The fleet document read beside `aterm.toml` when `[ai] fleet` names none.
-pub const FLEET_FILE: &str = "ai-fleet.toml";
-
-/// The named fleet document, else the sibling policy unless it is genuinely absent.
-/// A dangling entry or uncertain metadata must reach admission, which refuses it.
+/// The named fleet document, else `ai-fleet.toml` beside `aterm.toml` unless it is
+/// genuinely absent (a dangling entry or uncertain metadata reaches admission, which refuses
+/// it).
 #[must_use]
-pub fn fleet_path(local: &Local, config: Option<&Path>) -> Option<PathBuf> {
+pub fn fleet_source(local: &Local, config: Option<&Path>) -> Option<FleetSource> {
     local.fleet.clone().or_else(|| {
         config
             .and_then(Path::parent)
@@ -472,21 +572,22 @@ pub fn fleet_path(local: &Local, config: Option<&Path>) -> Option<PathBuf> {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound
                 )
             })
+            .map(FleetSource::Path)
     })
 }
 
-/// Resolves `local` over the fleet document at `fleet_path`, already read (`None`: no
+/// Resolves `local` over the fleet document `source` names, already read (`None`: no
 /// document is named and none lies beside `aterm.toml`).
 #[must_use]
 pub fn resolve(
     local: &Local,
-    fleet_path: Option<&Path>,
+    source: Option<&FleetSource>,
     fleet: Option<Result<(Fleet, Vec<String>), String>>,
     mut notes: Vec<String>,
 ) -> Settings {
-    let (doc, state) = match (fleet_path, fleet) {
+    let (doc, state) = match (source, fleet) {
         (None, _) | (Some(_), None) => (Fleet::default(), FleetState::None),
-        (Some(path), Some(Ok((doc, fleet_notes)))) => {
+        (Some(source), Some(Ok((doc, fleet_notes)))) => {
             notes.extend(fleet_notes);
             let row = local
                 .machine
@@ -495,15 +596,15 @@ pub fn resolve(
             (
                 doc,
                 FleetState::Read {
-                    path: path.to_path_buf(),
+                    source: source.shown(),
                     row,
                 },
             )
         }
-        (Some(path), Some(Err(why))) => (
+        (Some(source), Some(Err(why))) => (
             Fleet::default(),
             FleetState::Refused {
-                path: path.to_path_buf(),
+                source: source.shown(),
                 why,
             },
         ),
@@ -526,27 +627,12 @@ pub fn resolve(
         connector::connector(preferred_id.0).unwrap_or_else(default_preferred),
         preferred_id.1,
     );
-    // A fleet document may only NARROW who receives code: its list is kept in its order,
-    // less any CLI this machine's own list leaves out. With no local list there is no grant,
-    // and a fleet document cannot make one.
-    let fleet_list = row
-        .reviewers
-        .as_ref()
-        .map(|l| (l, From::FleetMachine))
-        .or_else(|| root.reviewers.as_ref().map(|l| (l, From::Fleet)));
-    let reviewer_ids: (Vec<&'static str>, From) = match (l.reviewers.as_ref(), fleet_list) {
-        _ if matches!(state, FleetState::Refused { .. }) => (Vec::new(), From::Fleet),
-        (Some(local_list), Some((fleet, from))) => (
-            fleet
-                .iter()
-                .copied()
-                .filter(|id| local_list.contains(id))
-                .collect(),
-            from,
-        ),
-        (Some(local_list), None) => (local_list.clone(), From::Local),
-        (None, _) => (default_reviewers(), From::Default),
-    };
+    let reviewer_ids = pick(
+        l.reviewers.as_ref(),
+        row.reviewers.as_ref(),
+        root.reviewers.as_ref(),
+        default_reviewers(),
+    );
     let reviewers = (
         reviewer_ids
             .0
@@ -554,18 +640,6 @@ pub fn resolve(
             .filter_map(|id: &&str| connector::connector(id))
             .collect(),
         reviewer_ids.1,
-    );
-    let review_count = pick(
-        l.review_count.as_ref(),
-        row.review_count.as_ref(),
-        root.review_count.as_ref(),
-        REVIEW_COUNT_DEFAULT,
-    );
-    let review_timeout_s = pick(
-        l.review_timeout_s.as_ref(),
-        row.review_timeout_s.as_ref(),
-        root.review_timeout_s.as_ref(),
-        TIMEOUT_DEFAULT_S,
     );
     let uses = connector::connections()
         .map(|c| {
@@ -592,31 +666,72 @@ pub fn resolve(
     }
     Settings {
         enabled: local.enabled.unwrap_or(true),
+        reviews: pick(
+            l.reviews.as_ref(),
+            row.reviews.as_ref(),
+            root.reviews.as_ref(),
+            true,
+        ),
         preferred,
         reviewers,
-        review_count,
-        review_timeout_s,
+        review_count: pick(
+            l.review_count.as_ref(),
+            row.review_count.as_ref(),
+            root.review_count.as_ref(),
+            REVIEW_COUNT_DEFAULT,
+        ),
+        review_timeout_s: pick(
+            l.review_timeout_s.as_ref(),
+            row.review_timeout_s.as_ref(),
+            root.review_timeout_s.as_ref(),
+            TIMEOUT_DEFAULT_S,
+        ),
+        review_permissions: pick(
+            l.review_permissions.as_ref(),
+            row.review_permissions.as_ref(),
+            root.review_permissions.as_ref(),
+            Choice::Inherit,
+        ),
         uses,
         machine: local.machine.clone(),
+        fleet_source: source.map(FleetSource::shown),
+        fleet_key: local.fleet_key.clone(),
         fleet: state,
         notes,
     }
 }
 
-/// Reads `aterm.toml` at `config` (absent or unreadable: every default) and the fleet
-/// document: the one `[ai] fleet` names, else `ai-fleet.toml` beside `aterm.toml` when it
-/// is not known absent.
+/// The AI store's directory under aterm's state root, where a URL's fleet document is held.
 #[must_use]
-pub fn load(config: Option<&Path>) -> Settings {
+pub fn default_ai_dir() -> Option<PathBuf> {
+    aterm_types::dirs::state_dir().map(|root| root.join(super::store::DIR))
+}
+
+/// Reads `aterm.toml` at `config` (absent or unreadable: every default) and the fleet
+/// document, as held under `ai_dir`, at `now`.
+#[must_use]
+pub fn load_with(config: Option<&Path>, ai_dir: Option<&Path>, now: i64) -> Settings {
     let text = config.and_then(|p| {
         crate::harness::accounts::read_bounded(p, CONFIG_MAX_BYTES)
             .ok()
             .flatten()
     });
     let (local, notes) = read(text.as_deref().unwrap_or_default());
-    let path = fleet_path(&local, config);
-    let fleet = path.as_deref().map(load_fleet);
-    resolve(&local, path.as_deref(), fleet, notes)
+    let source = fleet_source(&local, config);
+    let fleet = source
+        .as_ref()
+        .map(|s| load_source(s, local.fleet_key.as_deref(), ai_dir, now));
+    resolve(&local, source.as_ref(), fleet, notes)
+}
+
+/// [`load_with`] under aterm's own state directory, now.
+#[must_use]
+pub fn load(config: Option<&Path>) -> Settings {
+    load_with(
+        config,
+        default_ai_dir().as_deref(),
+        crate::supervise::limit::unix_now(),
+    )
 }
 
 #[cfg(test)]

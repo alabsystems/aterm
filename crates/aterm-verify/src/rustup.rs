@@ -4,76 +4,18 @@
 //! rustup's toolchains, for the STOCK EXCEPTION lanes: the foreign cells
 //! (`verify cells`) and the wasm perf lane. Trust carries only the host std,
 //! so a cross triple is compiled by a rustup toolchain that has its std,
-//! driven by that toolchain's own `cargo` and `rustc` by path.
+//! driven by that toolchain's own `cargo` and `rustc` by path. Where rustup
+//! is, and what its listings say, is `aterm_toolchain::rustup`'s one rule.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use aterm_uds::output::CommandOutput as _;
 use aterm_uds::spawnfd::{Command, command};
 
-use crate::is_executable_file;
-
-/// Where [`find_rustup_in`] looks after PATH, for the sentence a skip prints.
-pub const RUSTUP_LOOKED: &str = "on PATH, in $CARGO_HOME/bin, in ~/.cargo/bin and in \
-                                 Homebrew's rustup keg (/opt/homebrew/opt/rustup/bin)";
-
-/// This process's `rustup` ([`find_rustup_in`] over its own environment).
-#[must_use]
-pub fn find_rustup() -> Option<PathBuf> {
-    find_rustup_in(
-        std::env::var_os("PATH").as_deref(),
-        std::env::var_os("CARGO_HOME").as_deref(),
-        std::env::var_os("HOME").as_deref(),
-    )
-}
-
-/// The first executable `rustup` on PATH, then where rustup-init and Homebrew
-/// install it: a machine provisioned through atpkg need not have
-/// `~/.cargo/bin` on PATH. Relative PATH entries are passed over, so the
-/// answer never depends on the cwd.
-#[must_use]
-pub fn find_rustup_in(
-    path: Option<&OsStr>,
-    cargo_home: Option<&OsStr>,
-    home: Option<&OsStr>,
-) -> Option<PathBuf> {
-    let mut candidates: Vec<PathBuf> = path
-        .map(|p| {
-            std::env::split_paths(p)
-                .filter(|dir| dir.is_absolute())
-                .map(|dir| dir.join("rustup"))
-                .collect()
-        })
-        .unwrap_or_default();
-    let absolute = |v: Option<&OsStr>| v.map(PathBuf::from).filter(|p| p.is_absolute());
-    if let Some(cargo_home) = absolute(cargo_home) {
-        candidates.push(cargo_home.join("bin/rustup"));
-    }
-    if let Some(home) = absolute(home) {
-        candidates.push(home.join(".cargo/bin/rustup"));
-    }
-    candidates.push(PathBuf::from("/opt/homebrew/opt/rustup/bin/rustup"));
-    candidates.into_iter().find(|p| is_executable_file(p))
-}
-
-/// Does `listing` (`rustup target list --installed`) name exactly `target`?
-/// Line-exact: `wasm32-wasip1` is not `wasm32-unknown-unknown`.
-#[must_use]
-pub fn lists_target(listing: &str, target: &str) -> bool {
-    listing.lines().any(|l| l.trim() == target)
-}
-
-/// The toolchain names in `rustup toolchain list`, without rustup's
-/// ` (active, default)` marker.
-#[must_use]
-pub fn toolchain_names(listing: &str) -> Vec<String> {
-    listing
-        .lines()
-        .filter_map(|l| l.split_whitespace().next())
-        .map(str::to_string)
-        .collect()
-}
+pub use aterm_toolchain::rustup::{
+    RUSTUP_LOOKED, find_rustup, find_rustup_in, lists_target, toolchain_names,
+};
 
 /// Does `rustup`'s toolchain `name` carry `triple`'s std?
 #[must_use]
@@ -133,8 +75,65 @@ impl Toolchain {
         let mut cmd = command(&self.cargo);
         cmd.env("RUSTC", &self.rustc)
             .env("RUSTUP_TOOLCHAIN", &self.name);
+        if let Some((var, value)) = self.loader_env() {
+            cmd.env(var, value);
+        }
         cmd
     }
+
+    /// The library search variable a rustup proxy hands the drivers it runs:
+    /// this toolchain's `lib/` first, then what this process inherited. Its
+    /// drivers run by path here, never through a proxy, and stable 1.98's
+    /// `rust-lld` loads `@rpath/libLLVM.dylib` from there alone (its rpath is
+    /// its own `rustlib/<host>/lib` and a CI path), so without it every wasm32
+    /// link dies in dyld. `None` off unix, or when `rustc` stands outside a
+    /// `<toolchain>/bin`.
+    #[must_use]
+    pub fn loader_env(&self) -> Option<(&'static str, OsString)> {
+        let lib = self.rustc.parent()?.parent()?.join("lib");
+        let var = LOADER_VAR?;
+        Some((
+            var,
+            loader_path(
+                var,
+                &lib,
+                std::env::var_os(var).as_deref(),
+                std::env::var_os("HOME").as_deref(),
+            ),
+        ))
+    }
+}
+
+/// The variable the dynamic loader searches after a binary's own rpaths.
+const LOADER_VAR: Option<&str> = if cfg!(target_os = "macos") {
+    Some("DYLD_FALLBACK_LIBRARY_PATH")
+} else if cfg!(unix) {
+    Some("LD_LIBRARY_PATH")
+} else {
+    None
+};
+
+/// `lib` first, then `inherited`. An unset `DYLD_FALLBACK_LIBRARY_PATH` means
+/// dyld's default fallback, which setting the variable replaces, so that
+/// default follows `lib` as rustup keeps it.
+fn loader_path(var: &str, lib: &Path, inherited: Option<&OsStr>, home: Option<&OsStr>) -> OsString {
+    let mut path = OsString::from(lib);
+    match inherited.filter(|v| !v.is_empty()) {
+        Some(rest) => {
+            path.push(":");
+            path.push(rest);
+        }
+        None if var == "DYLD_FALLBACK_LIBRARY_PATH" => {
+            if let Some(home) = home {
+                path.push(":");
+                path.push(home);
+                path.push("/lib");
+            }
+            path.push(":/usr/local/lib:/usr/lib");
+        }
+        None => {}
+    }
+    path
 }
 
 /// The first installed toolchain carrying `triple`'s std, release channels
@@ -169,69 +168,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_target_is_listed_only_by_its_exact_line() {
-        let listing = "aarch64-apple-darwin\nwasm32-wasip1\nwasm32-unknown-unknown-nightly\n";
-        assert!(lists_target(listing, "aarch64-apple-darwin"));
-        assert!(!lists_target(listing, "wasm32-unknown-unknown"));
-        assert!(lists_target(
-            "  wasm32-unknown-unknown  \n",
-            "wasm32-unknown-unknown"
-        ));
-    }
-
-    #[test]
-    fn toolchain_names_drop_rustups_markers() {
-        let listing = "stable-aarch64-apple-darwin (active, default)\nnightly-2026-01-01\ntrust\n";
-        assert_eq!(
-            toolchain_names(listing),
-            ["stable-aarch64-apple-darwin", "nightly-2026-01-01", "trust"]
-        );
-    }
-
-    /// PATH first, then `$CARGO_HOME/bin`, then `~/.cargo/bin`; a relative
-    /// entry and a non-executable `rustup` are passed over.
-    #[cfg(unix)]
-    #[test]
-    fn rustup_is_found_on_path_then_where_rustup_installs_itself() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let dir = aterm_tempfile::Builder::new()
-            .prefix("atv-rustup-")
-            .tempdir()
-            .expect("scratch");
-        let exe = |p: &Path, mode: u32| {
-            std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
-            std::fs::write(p, "#!/bin/sh\n").expect("write");
-            std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    fn a_toolchains_lib_leads_the_loader_path_and_keeps_what_was_inherited() {
+        let lib = Path::new("/r/toolchains/stable/lib");
+        let joined = |var, inherited: Option<&str>, home: Option<&str>| {
+            loader_path(var, lib, inherited.map(OsStr::new), home.map(OsStr::new))
         };
-        let on_path = dir.path().join("path/rustup");
-        let cargo_home = dir.path().join("cargo-home");
-        let home = dir.path().join("home");
-        exe(&on_path, 0o644);
-        exe(&cargo_home.join("bin/rustup"), 0o755);
-        exe(&home.join(".cargo/bin/rustup"), 0o755);
-        let path =
-            std::env::join_paths([PathBuf::from("rel"), dir.path().join("path")]).expect("join");
+        let dyld = "DYLD_FALLBACK_LIBRARY_PATH";
         assert_eq!(
-            find_rustup_in(
-                Some(&path),
-                Some(cargo_home.as_os_str()),
-                Some(home.as_os_str())
-            ),
-            Some(cargo_home.join("bin/rustup")),
-            "a non-executable rustup on PATH is passed over"
+            joined(dyld, Some("/a:/b"), Some("/h")),
+            "/r/toolchains/stable/lib:/a:/b"
+        );
+        // Unset (or empty), dyld's own default stays behind the toolchain's.
+        for unset in [None, Some("")] {
+            assert_eq!(
+                joined(dyld, unset, Some("/h")),
+                "/r/toolchains/stable/lib:/h/lib:/usr/local/lib:/usr/lib"
+            );
+        }
+        assert_eq!(
+            joined(dyld, None, None),
+            "/r/toolchains/stable/lib:/usr/local/lib:/usr/lib"
+        );
+        let ld = "LD_LIBRARY_PATH";
+        assert_eq!(joined(ld, None, Some("/h")), "/r/toolchains/stable/lib");
+        assert_eq!(joined(ld, Some("/a"), None), "/r/toolchains/stable/lib:/a");
+    }
+
+    #[test]
+    fn the_loader_path_is_the_lib_beside_the_toolchains_bin() {
+        let at = |rustc: &str| Toolchain {
+            name: "stable".into(),
+            cargo: PathBuf::from("/r/toolchains/stable/bin/cargo"),
+            rustc: PathBuf::from(rustc),
+            clippy: false,
+        };
+        let Some(var) = LOADER_VAR else {
+            assert_eq!(at("/r/toolchains/stable/bin/rustc").loader_env(), None);
+            return;
+        };
+        let (named, value) = at("/r/toolchains/stable/bin/rustc")
+            .loader_env()
+            .expect("a toolchain's rustc");
+        assert_eq!(named, var);
+        assert!(
+            value
+                .to_string_lossy()
+                .starts_with("/r/toolchains/stable/lib"),
+            "{value:?}"
         );
         assert_eq!(
-            find_rustup_in(Some(&path), None, Some(home.as_os_str())),
-            Some(home.join(".cargo/bin/rustup"))
-        );
-        exe(&on_path, 0o755);
-        assert_eq!(
-            find_rustup_in(
-                Some(&path),
-                Some(cargo_home.as_os_str()),
-                Some(home.as_os_str())
-            ),
-            Some(on_path)
+            at("rustc").loader_env(),
+            None,
+            "no toolchain around a bare rustc"
         );
     }
 }

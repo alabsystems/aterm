@@ -23,11 +23,6 @@ thread_local! {
     static ROW_TO_LINE_OPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-// Counter for cells processed during row_to_line (O(cols) verification).
-thread_local! {
-    static ROW_TO_LINE_CELLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
 // Counter for reflow row processing operations.
 thread_local! {
     static REFLOW_ROW_OPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -109,11 +104,6 @@ pub(crate) fn count_row_to_line_op() {
     ROW_TO_LINE_OPS.with(|c| c.set(c.get() + 1));
 }
 
-/// Increment the cell counter (for O(cols) verification).
-pub(crate) fn count_row_to_line_cell() {
-    ROW_TO_LINE_CELLS.with(|c| c.set(c.get() + 1));
-}
-
 /// Take (read and reset) the row-to-line operation count.
 ///
 /// `pub` in a debug build because aterm-core's selection tests pin that each
@@ -121,16 +111,6 @@ pub(crate) fn count_row_to_line_cell() {
 #[cfg(any(test, debug_assertions))]
 pub fn take_row_to_line_ops() -> usize {
     ROW_TO_LINE_OPS.with(|c| {
-        let v = c.get();
-        c.set(0);
-        v
-    })
-}
-
-/// Take (read and reset) the cell count.
-#[cfg(test)]
-pub(crate) fn take_row_to_line_cells() -> usize {
-    ROW_TO_LINE_CELLS.with(|c| {
         let v = c.get();
         c.set(0);
         v

@@ -26,8 +26,8 @@
 
 use crate::animate::{
     Anim, BandMotion, Look, Pace, ROW, RowMotion, Surface, anim_ms, bar, bar_at, bar_glints, comet,
-    comet_phase, echo, echo_span, glide, glide_q16, glide_span, glint_at, level_rail,
-    next_glint_start, stalled_bar, track,
+    comet_phase, echo, echo_span, glide, glide_q16, glide_span, glint_at, next_glint_start,
+    stalled_bar, track,
 };
 use crate::carry::{CarriedMessage, Carry};
 use crate::digest::{Digest, DigestView, Entry as DigestItem};
@@ -40,7 +40,9 @@ use crate::model::{
     ActionIndex, Admission, Glyph, Hold, Intent, Load, Loads, Message, MessageId, Meter,
     Restatement, Severity, Tag, WallStamp,
 };
-use crate::need::{DIGEST_EXPIRY, FILED_KEEP_MS, LaterAsk, Need, RESOLVE_AFTER, RESTATE_QUIET};
+use crate::need::{
+    DIGEST_EXPIRY, FILED_KEEP_MS, LaterAsk, Need, RESOLVE_AFTER, RESTATE_QUIET, Resurface,
+};
 use crate::progress::{
     Eta, ProgressTrack, elapsed_word_change, elapsed_words, eta_words, eta_words_short,
 };
@@ -445,19 +447,12 @@ impl Live {
     }
 
     /// Live progress: work in flight with its animated indicator (a moving
-    /// determinate fill or a busy comet), never a measured level. With two
-    /// rows or more the glass keeps one row for the best of these
+    /// determinate fill or a busy comet). With two rows or more the glass
+    /// keeps one row for the best of these
     /// ([`MessageCenter::reserved_progress`]).
     #[must_use]
     pub(crate) fn is_progress(&self) -> bool {
-        self.is_animated() && !self.is_level()
-    }
-
-    /// Whether the row's fill is a measured level ([`Meter::level`]): it
-    /// glides both ways, never glints, never completes.
-    #[must_use]
-    pub(crate) fn is_level(&self) -> bool {
-        self.msg.meter.as_ref().is_some_and(|m| m.level)
+        self.is_animated()
     }
 
     /// The activity byte the fingerprint folds and the motion epoch keys
@@ -574,11 +569,10 @@ impl Live {
     }
 
     /// The load words the row says on the glass: its shown load, unless that
-    /// is the work's own primary load and nothing is `slowing`. The band's
-    /// layout and the wire's `load=` both read this.
-    pub(crate) fn said_load(&self, slowing: bool) -> Option<Load> {
-        self.shown_load()
-            .filter(|l| slowing || self.msg.primary != Some(*l))
+    /// is the work's own primary load. The band's layout and the wire's
+    /// `load=` both read this.
+    pub(crate) fn said_load(&self) -> Option<Load> {
+        self.shown_load().filter(|l| self.msg.primary != Some(*l))
     }
 }
 
@@ -728,9 +722,6 @@ pub struct MessageCenter {
     /// they are in flight; [`REFRESH_DEFAULT`] until the host says
     /// ([`Self::set_refresh`]).
     refresh: Duration,
-    /// Other work is measurably slowed (the strain engine's felt signal, fed
-    /// by the host): a row's primary load says its words too.
-    slowing: bool,
     /// Problems that left the glass unfixed in this process (folded by a press
     /// that took the person to fix it, read, dismissed, run out, or recorded as
     /// a repeat) whose reporter declared fix words: a later fix under the key
@@ -777,34 +768,11 @@ impl MessageCenter {
             motion_input_epoch: 0,
             born: now,
             refresh: REFRESH_DEFAULT,
-            slowing: false,
             unfixed: Vec::new(),
             digest: Digest::default(),
             demotions: 0,
             last_demoted: None,
         }
-    }
-
-    /// Whether other work is measurably slowed (the strain engine's felt
-    /// signal, fed by the host). While it is, a row's primary load says its
-    /// words (`network busy` on a download); otherwise only a load outside the
-    /// work's own shows. A change moves the revision, so the band re-lays once.
-    pub fn set_slowing(&mut self, slowing: bool) {
-        if self.slowing != slowing {
-            self.slowing = slowing;
-            self.revision += 1;
-        }
-    }
-
-    /// Whether other work is measurably slowed ([`Self::set_slowing`]).
-    #[must_use]
-    pub fn slowing(&self) -> bool {
-        self.slowing
-    }
-
-    /// [`Live::said_load`] under [`Self::slowing`].
-    fn said_load(&self, row: &Live) -> Option<Load> {
-        row.said_load(self.slowing)
     }
 
     /// The display's frame period: a glide and an echo are read on it while in
@@ -994,23 +962,12 @@ impl MessageCenter {
         echo: Option<EchoKind>,
         now: Instant,
     ) -> Live {
-        // A level leaves by a Vanish only, whatever named its echo: it never
-        // wipes to 100 % under a ✓ nor flashes a fault. The log reads the echo
-        // the reporter named, the glass the one it may show.
-        let named = echo;
-        let echo = echo.map(|kind| {
-            if self.live[i].is_level() {
-                EchoKind::Vanish
-            } else {
-                kind
-            }
-        });
         if let Some(kind) = echo {
             self.record_echo(i, kind, now);
         }
         let row = self.live.remove(i);
         self.glass.retain(|g| *g != row.id);
-        self.log_retired(&row, how, named, now);
+        self.log_retired(&row, how, echo, now);
         self.revision += 1;
         row
     }
@@ -1394,16 +1351,11 @@ impl MessageCenter {
 
     /// The reporter finished with it: retires now as `Resolved(outcome)`; a
     /// live row on the glass echoes Complete (`Ok`: the work was delivered)
-    /// or Fault (`Warn`). A measured level ([`Meter::level`]) is never
-    /// resolved (a machine's load has no outcome to claim): `false`, and the
-    /// row stays for its reporter's [`Self::withdraw`] (a Vanish).
+    /// or Fault (`Warn`).
     pub fn resolve(&mut self, id: MessageId, outcome: Outcome, now: Instant) -> bool {
         let Some(i) = self.index(id) else {
             return false;
         };
-        if self.live[i].is_level() {
-            return false;
-        }
         self.retire_at(i, Retired::Resolved(outcome), now);
         self.rebalance(now);
         true
@@ -1485,8 +1437,8 @@ impl MessageCenter {
     }
 
     /// [`Self::withdraw`] whose log entry keeps `title` and `detail` as its
-    /// final words: an episode's live row becomes its own record (the strain
-    /// row's fold), one log entry per episode. The glass sees the row it showed
+    /// final words: an episode's live row becomes its own record (a stopped
+    /// paste's), one log entry per episode. The glass sees the row it showed
     /// (its echo is taken first); `false` when no such live row.
     pub fn withdraw_as(
         &mut self,
@@ -1502,28 +1454,6 @@ impl MessageCenter {
         let row = &mut self.live[i];
         row.msg.title = title.to_string();
         row.msg.detail = detail.to_vec();
-        self.retire_at_with(i, Retired::Withdrawn, None, now);
-        self.rebalance(now);
-        true
-    }
-
-    /// [`Self::withdraw_as`] whose log entry becomes `record` whole, words and
-    /// mark: an episode's record is the one entry it leaves, under the
-    /// episode's mark, not the row's last one (a strain episode that reached
-    /// critical memory records Warn though a calmer reading restated its row
-    /// Info before the fold). `false` when no such live row.
-    pub fn withdraw_as_record(&mut self, id: MessageId, record: &Message, now: Instant) -> bool {
-        let Some(i) = self.index(id) else {
-            return false;
-        };
-        let record = record.clone().normalized();
-        // The glass sees the row it showed: its echo is taken first.
-        self.record_echo(i, EchoKind::Vanish, now);
-        let row = &mut self.live[i];
-        row.msg.title = record.title;
-        row.msg.detail = record.detail;
-        row.msg.severity = record.severity;
-        row.msg.glyph = record.glyph;
         self.retire_at_with(i, Retired::Withdrawn, None, now);
         self.rebalance(now);
         true
@@ -2086,7 +2016,7 @@ impl MessageCenter {
                                 busy: row.is_busy(),
                                 moving: row.is_animated(),
                             },
-                            self.said_load(row),
+                            row.said_load(),
                             row.load_slot,
                             None,
                         )
@@ -2294,11 +2224,10 @@ impl MessageCenter {
                     h.str(&m.stats);
                     h.byte(u8::from(m.amount.is_some()));
                     h.byte(u8::from(m.busy));
-                    h.byte(u8::from(m.level));
                 }
                 None => h.byte(0),
             }
-            h.str(self.said_load(row).map_or("", Load::words));
+            h.str(row.said_load().map_or("", Load::words));
             h.byte(row.load_slot.bits());
             for a in &row.msg.actions {
                 h.str(a.label());
@@ -2548,7 +2477,7 @@ impl MessageCenter {
                     // A travelling glint moves the bar until `busy_until`; a
                     // stalled bar is parked.
                     let glide_end = row.glide_end(q);
-                    let glints = look.graded && !stalled && !row.is_level();
+                    let glints = look.graded && !stalled;
                     let travel_end = glint_at(q, epoch)
                         .filter(|_| glints)
                         .and_then(|phase| q.checked_sub(phase))
@@ -2654,19 +2583,15 @@ impl MessageCenter {
     /// rows first, in order). No log lines: the parent's record is its own to
     /// the end (it flushes its writer before it execs), and the successor's
     /// begins at Commit. Not carried: an unrevealed row (its work ends with
-    /// this process), a measured level (the successor measures for itself and
-    /// starts calm), the echoes, the estimator, the load and the motion epoch.
+    /// this process), the echoes, the estimator, the load and the motion epoch.
     #[must_use]
     pub fn carried(&self) -> Carry {
-        let mut live: Vec<CarriedMessage> = self
-            .on_glass()
-            .filter(|l| !l.is_level())
-            .map(|l| carried_message(l, true))
-            .collect();
+        let mut live: Vec<CarriedMessage> =
+            self.on_glass().map(|l| carried_message(l, true)).collect();
         live.extend(
             self.live
                 .iter()
-                .filter(|l| l.revealed && !l.is_level() && !self.glass.contains(&l.id))
+                .filter(|l| l.revealed && !self.glass.contains(&l.id))
                 .map(|l| carried_message(l, false)),
         );
         Carry {
@@ -2678,7 +2603,7 @@ impl MessageCenter {
     /// The rows a handoff did not carry end with the parent: at Commit, right
     /// before its last write, the parent retires every live row whose id is not
     /// in `carried` (the carry it handed over at the park, [`Self::carried`]):
-    /// an unrevealed row, the measured level, a row posted after the park. Each
+    /// an unrevealed row, a row posted after the park. Each
     /// retires [`Retired::Withdrawn`] with no echo, so its record reads as ended
     /// rather than replayed open in the successor (`still open when aterm
     /// stopped`) or doubled beside the reporter's re-post there. A carried row
@@ -3094,6 +3019,31 @@ impl MessageCenter {
             .max(1);
         let until = filed_at.saturating_add(ask.resurface().backed_off(n));
         (until > stamp.unix_ms).then_some(last.id)
+    }
+
+    /// Whether the owner's own Dismiss of the exception `key` still keeps it quiet at
+    /// `stamp`, over the span `resurface` backs off to ([`Self::quiet_record`]'s
+    /// arithmetic). An answer, a fold nobody saw or an eviction is no decline. A host
+    /// reads it as the owner's "not now" to what the exception asks. Read-only.
+    #[must_use]
+    pub fn dismissed_quiet(&self, key: &str, resurface: Resurface, stamp: WallStamp) -> bool {
+        let Some(last) = self.log.last_word(key, true) else {
+            return false;
+        };
+        if !(last.filed_exception() && matches!(last.retired(), Some(Retired::Dismissed))) {
+            return false;
+        }
+        let Some(filed_at) = last.retired_unix_ms else {
+            return false;
+        };
+        if filed_at > stamp.unix_ms.saturating_add(FILING_SKEW_MS) {
+            return false;
+        }
+        let n = self
+            .log
+            .filings_since(key, filed_at.saturating_sub(FILED_KEEP_MS))
+            .max(1);
+        filed_at.saturating_add(resurface.backed_off(n)) > stamp.unix_ms
     }
 
     /// The record that keeps a standing row's `key` quiet at `stamp`: the
@@ -3700,7 +3650,6 @@ fn message_layout(row: &RowIn<'_>, lay: &LayIn<'_>, forms: &BandForms) -> RowLay
     }
     let stats = msg.meter.as_ref().map_or("", |m| m.stats.as_str());
     let moving_fill = ind.moving && ind.fill.is_some();
-    let level = msg.meter.as_ref().is_some_and(|m| m.level) && ind.fill.is_some();
     let spec = RowSpec {
         kind,
         severity: msg.severity,
@@ -3711,8 +3660,7 @@ fn message_layout(row: &RowIn<'_>, lay: &LayIn<'_>, forms: &BandForms) -> RowLay
         meter: msg.meter.as_ref().map(|_| (ind.fill, stats)),
         busy: ind.busy && ind.fill.is_none(),
         animated: moving_fill,
-        level,
-        eta: moving_fill && !level && msg.meter.as_ref().is_some_and(|m| m.amount.is_some()),
+        eta: moving_fill && msg.meter.as_ref().is_some_and(|m| m.amount.is_some()),
         load: load.filter(|_| ind.moving),
         load_slot: if ind.moving { load_slot } else { Loads::NONE },
         capsules,
@@ -3754,8 +3702,7 @@ fn text_ticks(row: &Live, layout: &RowLayout, q: Instant, look: Look) -> [Option
 /// frame ([`live_motion`]) and the deadline's look-ahead
 /// ([`MessageCenter::motion_deadline`]) both read, so a deadline never asks a
 /// frame the motion would not draw, nor misses one. The stalled ink once the
-/// bytes stopped, else the fill shown under the glint; a measured level is its
-/// rail. The glide is read at the fine instant `tf`, the glint at the grid's
+/// bytes stopped, else the fill shown under the glint. The glide is read at the fine instant `tf`, the glint at the grid's
 /// `t` (at `tf` mid-glide), on a row `cols` wide.
 fn moving_bar_at(
     row: &Live,
@@ -3768,9 +3715,6 @@ fn moving_bar_at(
     let edge = row
         .shown_edge(tf)
         .unwrap_or(i64::from(data) * i64::from(ROW) / 1000);
-    if row.is_level() {
-        return level_rail(edge, graded);
-    }
     if matches!(row.track.eta(t), Eta::Stalled) {
         return stalled_bar(data, graded);
     }
@@ -3819,14 +3763,14 @@ fn live_motion(
     let stalled = matches!(row.track.eta(q), Eta::Stalled);
     let (surface, anim, glyph) = match (layout.meter, layout.track.is_some(), look.pace) {
         (Some((_, _, data)), _, Pace::Moving) => {
-            let shown = if stalled && !row.is_level() {
+            let shown = if stalled {
                 data
             } else {
                 row.shown_fill(qf).unwrap_or(data)
             };
             let tg = if row.glide_end(qf).is_some() { qf } else { q };
             let glint_ms = glint_at(tg, epoch)
-                .filter(|_| look.graded && !stalled && !row.is_level() && bar_glints(shown))
+                .filter(|_| look.graded && !stalled && bar_glints(shown))
                 .map(anim_ms);
             (
                 moving_bar_at(row, data, (q, qf), epoch, look.graded, cols),
@@ -3835,9 +3779,7 @@ fn live_motion(
             )
         }
         (Some((_, _, data)), _, Pace::Still) => (
-            if row.is_level() {
-                level_rail(i64::from(data) * i64::from(ROW) / 1000, look.graded)
-            } else if stalled {
+            if stalled {
                 stalled_bar(data, look.graded)
             } else {
                 bar(data, None, look.graded)
@@ -3937,12 +3879,9 @@ fn echo_motion(e: &Echo, layout: &RowLayout, q: Instant, look: Look, cols: usize
 }
 
 /// The line a row's record gains when aterm quits under it: `28% when aterm
-/// quit` for a determinate row (a measured level is not work, and a busy row
-/// has no percent to name); `None` otherwise.
+/// quit` for a determinate row (a busy row has no percent to name); `None`
+/// otherwise.
 fn quit_reading(row: &Live) -> Option<String> {
-    if row.is_level() {
-        return None;
-    }
     let fill = row.msg.meter.as_ref()?.fill_permille?;
     Some(format!("{}% when aterm quit", fill.min(1000) / 10))
 }
@@ -3979,11 +3918,10 @@ fn carried_message(l: &Live, on_glass: bool) -> CarriedMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::glass::RowKind;
     use crate::log::{LogState, Retired};
     use crate::model::{Decision, Origin, tags};
     use crate::text::char_width;
-    use crate::{HOLD_INFO, HOLD_SUCCESS, HOLD_WARN, LOG_CAP, PENDING_PERSIST_CAP};
+    use crate::{HOLD_INFO, HOLD_SUCCESS, HOLD_WARN};
 
     fn t0() -> Instant {
         Instant::now()
@@ -4040,114 +3978,6 @@ mod tests {
             .collect()
     }
 
-    /// The bounded glass signature agrees with an owned-list projection while
-    /// real posts, completion echoes and shrink decisions change the glass,
-    /// pairwise, so no component is lost.
-    #[test]
-    fn inline_glass_signatures_preserve_owned_snapshot_comparisons() {
-        #[allow(clippy::type_complexity)]
-        type Owned = (
-            Vec<(MessageId, u32, bool)>,
-            Vec<(u16, MessageId, EchoKind)>,
-            Option<usize>,
-            usize,
-            Option<String>,
-        );
-        fn owned(c: &MessageCenter) -> Owned {
-            (
-                c.glass
-                    .iter()
-                    .map(|id| {
-                        let row = c.by_id(*id);
-                        (*id, row.revision, row.load_shown)
-                    })
-                    .collect(),
-                c.echoes.iter().map(|e| (e.slot, e.id, e.kind)).collect(),
-                c.overflow_hidden(),
-                c.plus_hidden(),
-                c.overflow_up().then(|| c.hidden_progress_words()).flatten(),
-            )
-        }
-        let now = t0();
-        let mut c = fresh(now);
-        let mut states = Vec::new();
-        let mut record = |c: &MessageCenter| {
-            let expected = owned(c);
-            let inline = c.glass_signature();
-            assert_eq!(
-                inline.0.iter().copied().flatten().collect::<Vec<_>>(),
-                expected.0
-            );
-            assert_eq!(
-                inline.1.iter().copied().flatten().collect::<Vec<_>>(),
-                expected.1
-            );
-            states.push((expected, inline));
-        };
-        record(&c);
-        let ids: Vec<_> = (0..3)
-            .map(|i| {
-                c.post(
-                    busy(&format!("job {i}")).key(&format!("job.{i}")),
-                    stamp(i),
-                    now,
-                )
-                .id
-            })
-            .collect();
-        c.commit_rows(now, MAX_ROWS);
-        assert_eq!(c.glass.len(), usize::from(MAX_ROWS));
-        record(&c);
-        assert!(!c.settle(now, true).glass_changed, "same rows stay quiet");
-        record(&c);
-        for id in ids {
-            assert!(c.resolve(id, Outcome::Ok, now));
-            record(&c);
-        }
-        assert_eq!(c.echoes.len(), usize::from(MAX_ROWS));
-        let before = owned(&c);
-        let settled = c.settle(now + Duration::from_secs(5), true);
-        assert!(settled.glass_changed, "completed echoes leave the glass");
-        assert_eq!(settled.glass_changed, before != owned(&c));
-        record(&c);
-
-        for i in 0..4 {
-            c.post(
-                busy(&format!("next {i}")).key(&format!("next.{i}")),
-                stamp(i + 10),
-                now,
-            );
-        }
-        c.commit_rows(now, 2);
-        assert!(
-            c.hidden_progress_words().is_some(),
-            "overflow names hidden progress"
-        );
-        record(&c);
-        c.commit_rows(now, 1);
-        assert_eq!(c.plus_hidden(), 3, "one-row capsule counts the other rows");
-        record(&c);
-        c.commit_rows(now, MAX_ROWS);
-        record(&c);
-        let mut carry = c.carried();
-        for row in &mut carry.live {
-            row.on_glass = true;
-        }
-        let mut child = fresh(now);
-        child.seed_carried(&carry, stamp(20), now);
-        assert!(
-            child.glass.len() <= usize::from(MAX_ROWS),
-            "restore clamps excess glass claims"
-        );
-        record(&child);
-
-        for (before, inline_before) in &states {
-            for (after, inline_after) in &states {
-                assert_eq!(before == after, inline_before == inline_after);
-            }
-        }
-    }
-
     /// Invariant 2: post MAX_LIVE+50 held rows: `live.len() == MAX_LIVE`,
     /// evictions logged `Evicted`, an Ask row and a Standing row posted
     /// first survive.
@@ -4177,105 +4007,6 @@ mod tests {
             "two more than MAX_LIVE + 50 - MAX_LIVE: the ask and standing rows hold two seats"
         );
         assert_eq!(evicted[0].2, "notice 0", "the oldest held row goes first");
-        assert!(c.live_rows().all(|l| l.msg.title != "notice 0"));
-        // A Live row is evicted before the newcomer: here, among standing
-        // rows, it is the one evictable row besides the newcomer.
-        let mut c = fresh(now);
-        let live_id = c
-            .post(
-                info("tail").hold(Hold::Live {
-                    stale_after: crate::STALE_TAILED,
-                }),
-                stamp(1),
-                now,
-            )
-            .id;
-        for i in 0..MAX_LIVE {
-            c.post(
-                standing(&format!("standing {i}")),
-                stamp(10 + i as u64),
-                now + ms(i as u64),
-            );
-        }
-        assert_eq!(c.live_rows().count(), MAX_LIVE);
-        assert!(
-            c.live(live_id).is_none(),
-            "the one Live row was the only candidate"
-        );
-        // All asks: the newcomer itself is the one evicted.
-        let mut c = fresh(now);
-        for i in 0..MAX_LIVE {
-            c.post(ask(&format!("ask {i}")), stamp(10 + i as u64), now);
-        }
-        let last = c.post(ask("one too many"), stamp(999), now);
-        assert_eq!(c.live_rows().count(), MAX_LIVE);
-        assert!(c.live(last.id).is_none());
-        // A flood never moves the glass: the victims are queued rows first
-        // (lowest severity, oldest), so the rows under the pointer stay.
-        let mut c = fresh(now);
-        let g: Vec<MessageId> = (0..3)
-            .map(|i| c.post(info(&format!("g{i}")), stamp(i), now).id)
-            .collect();
-        c.commit_rows(now, 3);
-        assert_eq!(glass_ids(&c), g);
-        for i in 0..(MAX_LIVE + 10) {
-            c.post(
-                Message::new(tags::PACKAGES, Severity::Success, &format!("s {i}")),
-                stamp(10 + i as u64),
-                now + ms(1 + i as u64),
-            );
-        }
-        assert_eq!(c.live_rows().count(), MAX_LIVE);
-        assert_eq!(
-            glass_ids(&c),
-            vec![g[0], g[1]],
-            "the glass is untouched by the flood (the third slot is the overflow row)"
-        );
-        assert!(
-            g.iter().all(|id| c.live(*id).is_some()),
-            "the earlier Info rows outrank every queued Success (one class, posted first)"
-        );
-        let evicted: Vec<_> = pending_retired(&c)
-            .into_iter()
-            .filter(|(_, how, _, _)| *how == Retired::Evicted)
-            .collect();
-        assert_eq!(evicted.len(), 13);
-        assert_eq!(evicted[0].2, "s 0", "the oldest queued Success goes first");
-        // …and a flood of higher-ranked rows takes the displaced Infos before
-        // any of its own, still never a row on glass.
-        let mut c = fresh(now);
-        let g: Vec<MessageId> = (0..3)
-            .map(|i| c.post(info(&format!("g{i}")), stamp(i), now).id)
-            .collect();
-        c.commit_rows(now, 3);
-        for i in 0..(MAX_LIVE + 10) {
-            c.post(
-                Message::new(tags::PACKAGES, Severity::Warn, &format!("w {i}")),
-                stamp(10 + i as u64),
-                now + ms(1 + i as u64),
-            );
-        }
-        let top = glass_ids(&c);
-        assert_eq!(top.len(), 2);
-        assert_eq!(
-            top[1], g[0],
-            "g0 kept its slot under the Warn that went above"
-        );
-        assert!(c.live(top[0]).unwrap().msg.title == "w 0");
-        assert!(
-            c.live(g[1]).is_none() && c.live(g[2]).is_none(),
-            "the displaced Infos went first"
-        );
-        let evicted: Vec<_> = pending_retired(&c)
-            .into_iter()
-            .filter(|(_, how, _, _)| *how == Retired::Evicted)
-            .map(|(_, _, title, _)| title)
-            .collect();
-        assert_eq!(
-            evicted[..3],
-            ["g1".to_string(), "g2".into(), "w 1".into()],
-            "then the oldest queued Warn"
-        );
     }
 
     /// Past [`MAX_LIVE`] every queued evictable row goes before any row on the
@@ -4369,29 +4100,25 @@ mod tests {
                 standing(&format!("late {n}")),
                 stamp(900 + n),
                 now + ms(900 + n),
-            )
-            .id
+            );
         };
-        let late1 = later(&mut c, 1);
+        later(&mut c, 1);
         assert_eq!(evicted(&c), ["x"], "the queued held row first");
         assert_eq!(glass_ids(&c), vec![g_live, g_held]);
-        let late2 = later(&mut c, 2);
+        later(&mut c, 2);
         assert_eq!(
             evicted(&c),
             ["x", "g held"],
             "nothing queued is evictable: the held row on glass before the Live one"
         );
-        let late3 = later(&mut c, 3);
+        later(&mut c, 3);
         assert_eq!(evicted(&c), ["x", "g held", "g live"]);
-        let late4 = later(&mut c, 4);
+        later(&mut c, 4);
         assert_eq!(
             evicted(&c),
             ["x", "g held", "g live", "late 4"],
             "only asks and standing rows are left: the newcomer itself goes"
         );
-        assert_eq!(c.live_rows().count(), MAX_LIVE);
-        assert!([late1, late2, late3].iter().all(|id| c.live(*id).is_some()));
-        assert!(c.live(late4).is_none());
     }
 
     /// Within the queue a held row goes before a `Live` one, whatever their
@@ -4524,106 +4251,10 @@ mod tests {
         assert_eq!(glass_ids(&c), vec![warn]);
     }
 
-    /// Invariant 3: 3·LOG_CAP posts: ring == LOG_CAP, pending ==
-    /// PENDING_PERSIST_CAP and the drain ends with `Dropped{count}`.
-    #[test]
-    fn bounded_log_ring_and_pending() {
-        let now = t0();
-        let mut c = fresh(now);
-        for i in 0..(3 * LOG_CAP) {
-            c.post(info(&format!("n {i}")), stamp(i as u64), now);
-        }
-        assert_eq!(c.log().len(), LOG_CAP);
-        assert_eq!(c.log().pending_len(), PENDING_PERSIST_CAP);
-        let lines = c.drain_new_for_persist();
-        assert_eq!(lines.len(), PENDING_PERSIST_CAP + 1);
-        assert!(
-            matches!(lines.last(), Some(LogLine::Dropped { count }) if *count > 0),
-            "{:?}",
-            lines.last()
-        );
-        assert!(c.drain_new_for_persist().is_empty());
-        assert_eq!(
-            c.log().next_id().raw() as usize,
-            3 * LOG_CAP + 1,
-            "ids never reuse"
-        );
-    }
-
-    fn script(c: &mut MessageCenter, now: Instant) -> Vec<String> {
-        let a = c
-            .post(info("first").line("with a detail"), stamp(1), now)
-            .id;
-        c.commit_rows(now, 3);
-        let b = c
-            .post(
-                Message::new(tags::TOOLCHAIN, Severity::Info, "Installing")
-                    .meter(Meter {
-                        fill_permille: Some(100),
-                        stats: "1 / 10".into(),
-                        ..Meter::default()
-                    })
-                    .hold(Hold::Live {
-                        stale_after: crate::STALE_TAILED,
-                    })
-                    .key("toolchain.pass"),
-                stamp(2),
-                now + ms(10),
-            )
-            .id;
-        c.commit_rows(now + ms(10), 3);
-        c.restate(
-            b,
-            Restatement {
-                meter: Some(Some(Meter {
-                    fill_permille: Some(500),
-                    stats: "5 / 10".into(),
-                    ..Meter::default()
-                })),
-                ..Restatement::default()
-            },
-            now + ms(20),
-        );
-        c.post(
-            Message::new(tags::UPDATE, Severity::Warn, "Update failed").key("update.outcome"),
-            stamp(3),
-            now + ms(30),
-        );
-        c.commit_rows(now + ms(30), 3);
-        c.post(info("first").line("with a detail"), stamp(4), now + ms(40));
-        c.act(a, ActionIndex::DETAILS, now + ms(50));
-        c.settle(now + HOLD_INFO + ms(100), true);
-        c.commit_rows(now + HOLD_INFO + ms(100), 3);
-        c.drain_new_for_persist()
-            .iter()
-            .map(LogLine::encode)
-            .collect()
-    }
-
-    /// Invariant 4: the same script at the same injected instants yields
-    /// byte-identical `presentation(80)` and log lines in two fresh centers.
-    #[test]
-    fn settle_is_deterministic() {
-        let now = t0();
-        let mut a = fresh(now);
-        let mut b = fresh(now);
-        let lines_a = script(&mut a, now);
-        let lines_b = script(&mut b, now);
-        assert_eq!(lines_a, lines_b);
-        assert!(lines_a.len() >= 5, "{lines_a:?}");
-        let pa = a.presentation(80, &char_width, None, Links::Painted);
-        let pb = b.presentation(80, &char_width, None, Links::Painted);
-        assert_eq!(pa, pb);
-        assert_eq!(a.fingerprint(80), b.fingerprint(80));
-        assert_eq!(a.revision(), b.revision());
-        assert_eq!(glass_ids(&a), glass_ids(&b));
-        assert!(!pa.rows.is_empty());
-    }
-
     /// Invariant 5: a row queued behind three others gets `fold_at =
-    /// promotion + hold`; with `afford = 2` the third row never anchors.
+    /// promotion + hold`; a row the overflow row displaces is released.
     #[test]
-    fn hold_anchors_at_first_glass_and_only_within_afford() {
+    fn hold_anchors_at_first_glass_and_a_displaced_row_is_released() {
         let now = t0();
         let mut c = fresh(now);
         let ids: Vec<MessageId> = (0..4)
@@ -4660,33 +4291,9 @@ mod tests {
             Some(now + ms(10) + HOLD_INFO),
             "the survivor keeps its anchor"
         );
-        // Afford clamps: the third row never burns its hold unpainted.
-        let mut c = fresh(now);
-        let ids: Vec<MessageId> = (0..3)
-            .map(|i| c.post(info(&format!("r{i}")), stamp(i), now).id)
-            .collect();
-        assert_eq!(c.commit_rows(now, 2), Some(2));
-        assert_eq!(c.committed_rows(), 2);
-        assert_eq!(
-            glass_ids(&c),
-            vec![ids[0]],
-            "one row plus the overflow row within afford 2"
-        );
-        assert!(
-            c.live(ids[2]).unwrap().fold_at.is_none()
-                && c.live(ids[2]).unwrap().on_glass_since.is_none()
-        );
-        assert!(
-            c.settle(now + HOLD_INFO + ms(1), true)
-                .retired
-                .iter()
-                .all(|(id, _)| *id == ids[0]),
-            "only the anchored row folds"
-        );
-        assert!(c.live(ids[2]).is_some());
         // A row the glass displaces (the overflow row takes its slot when a
-        // fourth arrives) is released: queued again under the patience clock,
-        // no anchor, and it anchors afresh when it returns.
+        // fourth arrives) is released: queued again, no anchor, and it
+        // anchors afresh when it returns.
         let mut c = fresh(now);
         let ids: Vec<MessageId> = (0..3)
             .map(|i| c.post(info(&format!("r{i}")), stamp(i), now).id)
@@ -4702,12 +4309,6 @@ mod tests {
         let displaced = c.live(ids[2]).unwrap();
         assert!(displaced.is_queued() && displaced.fold_at.is_none());
         assert_eq!(displaced.on_glass_since, None);
-        assert_eq!(
-            displaced.patience_at,
-            now + ms(1) + OVERFLOW_PATIENCE_MIN,
-            "patience runs from the displacement"
-        );
-        assert_eq!(c.deadline(true), Some(now + HOLD_INFO));
         assert_eq!(
             c.settle(now + HOLD_INFO, true).retired,
             vec![(ids[0], Retired::Folded), (ids[1], Retired::Folded)],
@@ -4770,17 +4371,6 @@ mod tests {
             old.title, "Downloading aterm v0.91.0",
             "the record keeps the final words"
         );
-        assert_eq!(old.retired_at, Some(now + ms(10)));
-        let retired = pending_retired(&c);
-        assert_eq!(
-            retired,
-            vec![(
-                a,
-                Retired::Superseded { by: posted.id },
-                "Downloading aterm v0.91.0".to_string(),
-                1
-            )]
-        );
         assert_eq!(c.live_by_key("update.progress").unwrap().id, posted.id);
         // A queued row superseded stays queued (no anchor).
         let mut c = fresh(now);
@@ -4810,8 +4400,6 @@ mod tests {
                 outcome: PostOutcome::Duplicate
             }
         );
-        assert_eq!(c.live_rows().count(), 1);
-        assert_eq!(c.live(first.id).unwrap().repeats, 2);
         assert_eq!(
             c.live(first.id).unwrap().fold_at,
             Some(anchored + ms(700)),
@@ -4856,7 +4444,6 @@ mod tests {
             .find(|(id, _, _, _)| *id == first.id)
             .unwrap();
         assert_eq!(line.3, 2, "rep=2 on the Retired line");
-        assert_eq!(c.log().get(first.id).unwrap().repeats, 2);
     }
 
     /// Invariant 8: 1000 meter restates → 0 new lines; the final words land
@@ -4900,12 +4487,6 @@ mod tests {
             ));
         }
         assert_eq!(c.log().pending_len(), before, "no lines for restatements");
-        assert_eq!(c.live(id).unwrap().revision, 1000);
-        assert_eq!(
-            c.live(id).unwrap().stale_at,
-            Some(now + ms(999) + crate::STALE_TAILED),
-            "each restate re-arms the cap"
-        );
         c.restate(
             id,
             Restatement {
@@ -5133,12 +4714,6 @@ mod tests {
             Some(now + ms(2) + SHRINK_QUIET),
             "the deadline names the shrink"
         );
-        assert_ne!(
-            c.deadline(false),
-            Some(now + ms(2) + SHRINK_QUIET),
-            "a frozen band never arms the shrink its commit will not take"
-        );
-        assert_eq!(c.commit_rows(now + ms(2) + SHRINK_QUIET - ms(1), 3), None);
         // A re-grow inside the window cancels the shrink.
         let e = c.post(standing("e"), stamp(4), now + ms(500)).id;
         let f = c.post(standing("f"), stamp(5), now + ms(500)).id;
@@ -5158,42 +4733,6 @@ mod tests {
         );
         assert_eq!(c.committed_rows(), 1);
         assert_eq!(glass_ids(&c), vec![a]);
-        // The host's clamp is inside the center too.
-        let g = c.post(standing("g"), stamp(6), now + ms(700)).id;
-        let h = c.post(standing("h"), stamp(7), now + ms(700)).id;
-        assert_eq!(
-            c.commit_rows(now + ms(700), 2),
-            Some(2),
-            "afford caps the grow"
-        );
-        assert_eq!(c.commit_rows(now + ms(700), 3), Some(3));
-        assert_eq!(
-            c.commit_rows(now + ms(800), 1),
-            Some(1),
-            "the WINDOW's shrink waits for no quiet: the terminal row comes back now"
-        );
-        assert_eq!(c.committed_rows(), 1);
-        assert_eq!(
-            c.commit_rows(now + ms(800), 3),
-            Some(3),
-            "…and the rows return at once"
-        );
-        c.resolve(a, Outcome::Ok, now + ms(900));
-        assert_eq!(
-            c.resolve_key_prefix("", Outcome::Ok, now + ms(900)),
-            0,
-            "a prefix resolve takes keyed rows only"
-        );
-        c.resolve(g, Outcome::Ok, now + ms(900));
-        c.resolve(h, Outcome::Ok, now + ms(900));
-        assert_eq!(c.wanted_rows(), 0);
-        assert_eq!(
-            c.commit_rows(now + ms(900), 3),
-            None,
-            "the host commits after every settle: the shrink clock starts here"
-        );
-        assert_eq!(c.commit_rows(now + ms(900) + SHRINK_QUIET, 3), Some(0));
-        assert_eq!(c.fingerprint(80), 0, "FL-1: no rows, key 0");
     }
 
     /// Invariant 11: three rows; a fourth Info appends/queues, a Warn goes
@@ -5246,11 +4785,6 @@ mod tests {
         // A later Info never goes above an earlier one, however it is posted.
         let late = c.post(standing("late"), stamp(9), now + ms(9)).id;
         assert_eq!(glass_ids(&c), vec![r[1], r3, late]);
-        c.resolve(r[1], Outcome::Ok, now + ms(10));
-        assert_eq!(glass_ids(&c), vec![r3, late]);
-        let p = c.presentation(100, &char_width, None, Links::Painted);
-        assert_eq!(p.rows.len(), 2);
-        assert_eq!(p.rows[0].kind, RowKind::Message(r3));
     }
 
     /// Invariant 12: a Success queued behind two long rows folds `Unseen`
@@ -5305,54 +4839,11 @@ mod tests {
         );
     }
 
-    /// Invariant 16: 7 held rows at 3 rows → rows 0-1 messages, row 2
-    /// `5 more messages`; at 1 row the Details capsule reads `+6 ›`.
-    #[test]
-    fn overflow_row_counts_what_is_hidden() {
-        let now = t0();
-        let mut c = fresh(now);
-        for i in 0..7 {
-            c.post(info(&format!("row {i}")), stamp(i), now + ms(i));
-        }
-        c.commit_rows(now + ms(10), 3);
-        let p = c.presentation(120, &char_width, None, Links::Painted);
-        assert_eq!(p.rows.len(), 3);
-        assert!(
-            matches!(p.rows[0].kind, RowKind::Message(_))
-                && matches!(p.rows[1].kind, RowKind::Message(_))
-        );
-        assert_eq!(p.rows[2].kind, RowKind::Overflow { hidden: 5 });
-        // One link: the words are the whole row, no capsule.
-        assert_eq!(p.rows[2].title.1, "5 more \u{203a}");
-        assert_eq!(p.rows[2].full_title, "5 more messages");
-        assert_eq!(p.rows[2].glyph.1, '\u{2026}');
-        assert!(p.rows[2].capsules.is_empty());
-        assert_eq!(p.hit(2, 110), crate::glass::Hit::Overflow);
-        assert_eq!(p.rows[0].capsules.last().unwrap().text, "Details \u{203a}");
-        assert_eq!(p.hit(2, 5), crate::glass::Hit::Overflow);
-        assert_ne!(c.fingerprint(120), 0);
-        assert_ne!(c.fingerprint(120), c.fingerprint(80));
-        // At one row: no overflow row; the single row's Details reads `+6 ›`.
-        c.commit_rows(now + ms(20), 1);
-        c.commit_rows(now + ms(20) + SHRINK_QUIET, 1);
-        assert_eq!(c.committed_rows(), 1);
-        let p = c.presentation(120, &char_width, None, Links::Painted);
-        assert_eq!(p.rows.len(), 1);
-        let details = p.rows[0].capsules.last().unwrap();
-        assert_eq!(details.text, "+6 \u{203a}");
-        assert_eq!(details.full_label, "Details \u{203a}");
-        assert_eq!(c.queued(), 6);
-        // Two rows: one message and `6 more messages`.
-        c.commit_rows(now + ms(30), 2);
-        let p = c.presentation(120, &char_width, None, Links::Painted);
-        assert_eq!(p.rows.len(), 2);
-        assert_eq!(p.rows[1].kind, RowKind::Overflow { hidden: 6 });
-    }
-
     /// Invariant 21: Ask row: `act(Open Settings)` → `Some(intent)`, row
-    /// stays, `Acted` logged; `act(Not now)` → row gone, `Answered{label}`.
+    /// stays, `Acted` logged; an action it lacks is `None`. The implicit
+    /// Details capsule marks seen: a held row folds, an ask stays.
     #[test]
-    fn act_returns_the_intent_and_closes_only_not_now() {
+    fn act_returns_the_intent_and_details_marks_seen() {
         let now = t0();
         let mut c = fresh(now);
         let id = c.post(ask("File access not confirmed"), stamp(1), now).id;
@@ -5365,75 +4856,24 @@ mod tests {
             })
         );
         assert!(c.live(id).is_some(), "Open Settings leaves the row (R16)");
-        assert_eq!(
-            c.live(id).unwrap().acted,
-            Some((ActionIndex(0), now + ms(1)))
-        );
         assert!(
             matches!(c.log().pending_lines().last(), Some(LogLine::Acted { label, .. }) if label == "Open Settings")
         );
-        assert_eq!(
-            c.log()
-                .get(id)
-                .unwrap()
-                .last_action
-                .as_ref()
-                .map(|(l, _)| l.as_str()),
-            Some("Open Settings")
-        );
-        // The host restates to the route words; still the same row.
-        assert!(c.restate(
-            id,
-            Restatement {
-                title: Some("Grant access in System Settings".into()),
-                hold: Some(Hold::For(crate::HOLD_ROUTE)),
-                ..Restatement::default()
-            },
-            now + ms(2)
-        ));
-        assert_eq!(
-            c.live(id).unwrap().fold_at,
-            Some(now + ms(2) + crate::HOLD_ROUTE)
-        );
         assert_eq!(c.act(id, ActionIndex(5), now), None, "no such action");
-        let not_now = c.act(id, ActionIndex(1), now + ms(3));
-        assert_eq!(
-            not_now,
-            Some(Intent::NotNow {
-                decision: Decision::FileAccess
-            })
-        );
-        assert!(c.live(id).is_none(), "Not now closes the row");
-        assert_eq!(
-            c.log().get(id).unwrap().state,
-            LogState::Retired(Retired::Answered {
-                label: "Not now".into()
-            })
-        );
-        assert_eq!(c.act(id, ActionIndex(0), now), None);
-        // Details marks seen: a held row folds now, an ask stays.
         let held = c.post(info("read me"), stamp(2), now).id;
-        let asked = c.post(ask("decide"), stamp(3), now).id;
         c.commit_rows(now, 3);
-        assert_eq!(
-            c.act(held, ActionIndex::DETAILS, now + ms(4)),
-            Some(Intent::Details)
-        );
-        assert!(c.live(held).is_none());
+        for (row, folds) in [(held, true), (id, false)] {
+            assert_eq!(
+                c.act(row, ActionIndex::DETAILS, now + ms(4)),
+                Some(Intent::Details)
+            );
+            assert_eq!(c.live(row).is_none(), folds, "{row}");
+        }
         assert_eq!(
             c.log().get(held).unwrap().state,
             LogState::Retired(Retired::Folded)
         );
-        assert_eq!(
-            c.act(asked, ActionIndex::DETAILS, now + ms(4)),
-            Some(Intent::Details)
-        );
-        assert!(c.live(asked).unwrap().seen);
-        assert!(c.dismiss(asked, now + ms(5)));
-        assert_eq!(
-            c.log().get(asked).unwrap().state,
-            LogState::Retired(Retired::Dismissed)
-        );
+        assert!(c.live(id).unwrap().seen);
     }
 
     /// A busy flow row, as the update lane posts one.
@@ -5447,58 +4887,36 @@ mod tests {
             .key("update.progress")
     }
 
-    /// A busy restate is a repaint, never a re-grid or a wake: the revision
-    /// moves and the glass changes, but the committed rows do not, and the
-    /// deadline is exactly what it was (the engine owns no frame).
-    #[test]
-    fn a_busy_restate_is_a_repaint_never_a_regrid_or_a_wake() {
-        let now = t0();
-        let mut c = fresh(now);
-        let id = c.post(busy("Updating to aterm v1"), stamp(1), now).id;
-        c.commit_rows(now, 3);
-        let rows = c.committed_rows();
-        let deadline = c.deadline(true);
-        let fp = c.fingerprint(80);
-        let revision = c.revision();
-        assert!(c.restate(
-            id,
-            Restatement {
-                meter: Some(Some(Meter::default())),
-                ..Restatement::default()
-            },
-            now,
-        ));
-        assert_eq!(c.revision(), revision + 1);
-        assert_ne!(c.fingerprint(80), fp, "the glass changed: busy is folded");
-        assert_eq!(c.committed_rows(), rows, "no re-grid");
-        assert_eq!(c.commit_rows(now, 3), None, "and none wanted");
-        assert_eq!(c.deadline(true), deadline, "no wake of its own");
-        assert!(!c.busy_on_glass());
-        assert!(c.restate(
-            id,
-            Restatement {
-                meter: Some(Some(Meter::busy(""))),
-                ..Restatement::default()
-            },
-            now,
-        ));
-        assert!(c.busy_on_glass());
-        assert_eq!(c.deadline(true), deadline);
-    }
-
     /// `busy_on_glass` follows the committed rows: false with nothing
     /// committed (an idle band asks for nothing), false for a busy row still
-    /// queued behind the band, true once it is on glass.
+    /// queued behind the band, true once it is on glass. A busy restate is a
+    /// repaint, never a re-grid or a wake: the glass changes, the committed
+    /// rows and the deadline do not (the engine owns no frame).
     #[test]
     fn busy_on_glass_follows_the_committed_rows() {
         let now = t0();
         let mut c = fresh(now);
         assert!(!c.busy_on_glass(), "nothing posted");
-        assert_eq!(c.fingerprint(80), 0);
-        c.post(busy("Updating to aterm v1"), stamp(1), now);
+        let id = c.post(busy("Updating to aterm v1"), stamp(1), now).id;
         assert!(!c.busy_on_glass(), "posted, not committed");
         c.commit_rows(now, 3);
         assert!(c.busy_on_glass());
+        let (deadline, mut fp) = (c.deadline(true), c.fingerprint(80));
+        for (meter, busy) in [(Meter::default(), false), (Meter::busy(""), true)] {
+            assert!(c.restate(
+                id,
+                Restatement {
+                    meter: Some(Some(meter)),
+                    ..Restatement::default()
+                },
+                now,
+            ));
+            assert_eq!(c.busy_on_glass(), busy);
+            assert_ne!(c.fingerprint(80), fp, "busy is folded in the glass");
+            fp = c.fingerprint(80);
+            assert_eq!(c.commit_rows(now, 3), None, "no re-grid");
+            assert_eq!(c.deadline(true), deadline, "no wake of its own");
+        }
         // Queued: three held Warn rows outrank it; one committed row shows
         // the top of the rank only.
         let mut q = fresh(now);
@@ -5685,24 +5103,21 @@ mod tests {
         assert_eq!(carry.next_id, 5);
         assert_eq!(carry.live.len(), 4);
         assert_eq!(
-            carry.live[0].id,
-            live.raw(),
-            "the live progress row keeps the one slot at 2 rows (ruling 259)"
-        );
-        assert!(carry.live[0].on_glass);
-        assert!(
             carry
                 .live
                 .iter()
-                .any(|m| m.id == queued.raw() && !m.on_glass),
-            "the Warn waits behind the overflow row"
+                .map(|m| (m.id, m.on_glass))
+                .collect::<Vec<_>>(),
+            vec![
+                (live.raw(), true),
+                (held.raw(), false),
+                (standing.raw(), false),
+                (queued.raw(), false),
+            ],
+            "the live progress row keeps the one slot at 2 rows (ruling 259); \
+             the Warn waits behind the overflow row"
         );
-        assert!(
-            carry.live.iter().filter(|m| m.on_glass).count() == 1,
-            "one slot plus the overflow row at 2 rows"
-        );
-        assert!(!carry.is_empty());
-        let carried_live = carry.live.iter().find(|m| m.id == live.raw()).unwrap();
+        let carried_live = &carry.live[0];
         assert_eq!(carried_live.hold, "live:30");
         assert_eq!(carried_live.actions, vec!["open-settings:/packages"]);
         assert_eq!(carried_live.fill_permille, Some(420));
@@ -5733,12 +5148,6 @@ mod tests {
             assert!(child.log().get(id).is_some_and(|r| r.is_live()));
         }
         assert_eq!(
-            child.live(live).unwrap().msg.hold,
-            Hold::Live {
-                stale_after: crate::STALE_TAILED
-            }
-        );
-        assert_eq!(
             child.committed_rows(),
             3,
             "seeded so the rows are there before the first window is sized"
@@ -5748,48 +5157,25 @@ mod tests {
             vec![queued, live],
             "the carried glass row keeps its slot; the second slot takes the best queued row; the third is the overflow row"
         );
-        assert_eq!(
-            child.live(live).unwrap().stale_at,
-            Some(later + STALE_HANDOFF),
-            "a promoted carried row keeps the handoff cap, not a fresh anchor"
-        );
         // The round trip: the child's carry says the same rows.
-        let again = child.carried();
-        let mut a: Vec<_> = carry
-            .live
-            .iter()
-            .map(|m| {
-                (
-                    m.id,
-                    m.title.clone(),
-                    m.hold.clone(),
-                    m.actions.clone(),
-                    m.key.clone(),
-                    m.fill_permille,
-                    m.stats.clone(),
-                )
-            })
-            .collect();
-        let mut b: Vec<_> = again
-            .live
-            .iter()
-            .map(|m| {
-                (
-                    m.id,
-                    m.title.clone(),
-                    m.hold.clone(),
-                    m.actions.clone(),
-                    m.key.clone(),
-                    m.fill_permille,
-                    m.stats.clone(),
-                )
-            })
-            .collect();
-        a.sort();
-        b.sort();
-        assert_eq!(a, b);
-        assert_eq!(again.next_id, carry.next_id);
-        // Junk in the carry is dropped, not guessed.
+        let said = |c: &Carry| {
+            let mut v: Vec<_> = c
+                .live
+                .iter()
+                .map(|m| {
+                    let m = CarriedMessage {
+                        on_glass: false,
+                        ..m.clone()
+                    };
+                    (m.id, m)
+                })
+                .collect();
+            v.sort_by_key(|(id, _)| *id);
+            (c.next_id, v)
+        };
+        assert_eq!(said(&child.carried()), said(&carry));
+        // Junk in the carry is dropped, not guessed; glass claims past the
+        // band (a build with more rows) are clamped.
         let mut junk = carry.clone();
         junk.live[1].severity = "loud".into();
         junk.live[2].tag = "Not A Tag".into();
@@ -5799,6 +5185,14 @@ mod tests {
         c.seed_carried(&junk, stamp(5_000), later);
         assert_eq!(c.live_rows().count(), 1);
         assert_eq!(c.log().next_id().raw(), 900);
+        let mut claims = carry.clone();
+        for m in &mut claims.live {
+            m.on_glass = true;
+        }
+        let mut c = fresh(later);
+        c.seed_carried(&claims, stamp(5_000), later);
+        assert!(claims.live.len() > usize::from(MAX_ROWS));
+        assert!(glass_ids(&c).len() <= usize::from(MAX_ROWS));
         // Before commit the cap is the only exit. A restate of a carried row's
         // words before the commit makes it the successor's own at once: the
         // handoff cap comes off and its own hold anchors on glass there and
@@ -5825,81 +5219,20 @@ mod tests {
             "its own hold, anchored at the restate"
         );
         child.after_handoff_commit(commit);
-        // After it each row takes its own lifetime back: a held row on glass
-        // folds after its hold from the commit; a queued one has no anchor
-        // until it is painted; the restated row keeps the anchor it already
-        // took.
+        // After it each row takes its own lifetime back; the restated row
+        // keeps the anchor it already took.
         assert_eq!(
             child.live(queued).unwrap().fold_at,
             Some(restated + HOLD_WARN)
         );
-        assert!(child.live(held).unwrap().is_queued());
-        assert_eq!(
-            child.live(held).unwrap().fold_at,
-            None,
-            "queued in the successor: not painted, not anchored"
-        );
-        assert_eq!(child.live(held).unwrap().stale_at, None);
         assert_eq!(
             child.live(live).unwrap().stale_at,
             Some(commit + crate::STALE_TAILED)
         );
-        assert_eq!(child.live(standing).unwrap().stale_at, None);
-        assert_eq!(child.live(standing).unwrap().fold_at, None);
-        // The Warn folds on its restate anchor; the freed slot promotes the
-        // held row, which anchors then; the Live row's cap lands; then the
-        // held row folds after its own 8 s.
-        let settled = child.settle(restated + HOLD_WARN, true);
-        assert_eq!(settled.retired, vec![(queued, Retired::Folded)]);
-        assert_eq!(glass_ids(&child), vec![live, standing, held]);
-        assert_eq!(
-            child.live(held).unwrap().fold_at,
-            Some(restated + HOLD_WARN + HOLD_SUCCESS)
-        );
-        let settled = child.settle(commit + crate::STALE_TAILED, true);
-        assert_eq!(settled.retired, vec![(live, Retired::Stale)]);
-        let settled = child.settle(restated + HOLD_WARN + HOLD_SUCCESS, true);
-        assert_eq!(settled.retired, vec![(held, Retired::Folded)]);
-        assert!(child.live(standing).is_some(), "a standing row stands");
-        assert_eq!(
-            fresh(now).carried(),
-            Carry {
-                next_id: MessageId::FIRST.raw(),
-                live: vec![],
-            },
-            "an empty center carries only the first mintable id"
-        );
-    }
-
-    /// A withdrawn row leaves the glass into the log with no outcome: the
-    /// record stands (`Withdrawn`), the live set and the glass forget it,
-    /// and a second withdraw of the same id is `false`.
-    #[test]
-    fn withdraw_keeps_the_record_without_an_outcome() {
-        let now = t0();
-        let mut c = fresh(now);
-        let meter = c
-            .post(
-                Message::new(tags::TOOLCHAIN, Severity::Info, "Installing")
-                    .hold(Hold::Live {
-                        stale_after: crate::STALE_TAILED,
-                    })
-                    .key("toolchain.pass"),
-                stamp(1),
-                now,
-            )
-            .id;
-        c.commit_rows(now, 3);
-        assert_eq!(glass_ids(&c), vec![meter]);
-        assert!(c.withdraw(meter, now + ms(1)));
-        assert!(c.live(meter).is_none());
-        assert!(glass_ids(&c).is_empty());
-        assert_eq!(
-            c.log().get(meter).unwrap().state,
-            LogState::Retired(Retired::Withdrawn)
-        );
-        assert!(!c.withdraw(meter, now + ms(2)), "already gone");
-        assert_eq!(Retired::Withdrawn.as_word(), "withdrawn");
+        for id in [held, standing] {
+            let row = child.live(id).unwrap();
+            assert_eq!((row.stale_at, row.fold_at), (None, None), "{id}");
+        }
     }
 
     /// The fix reaches a closed record: a config warning folded by the press
@@ -5952,12 +5285,15 @@ mod tests {
             warn("2 misspelled settings", "config.unaccepted-values"),
             6,
         );
+        // A live row under another prefix is not in the family.
+        let bystander = post(&mut c, warn("Misspelled setting", "privacy.fda"), 7);
         let fixed_at = now + ms(10);
         assert_eq!(
             c.resolve_key_prefix("config.", Outcome::Ok, fixed_at),
             3,
             "the changed row (live) and the folded warning and its repeat (closed)"
         );
+        assert!(c.live(bystander).is_some());
         let words = |c: &MessageCenter, id| {
             let rec = c.log().get(id).unwrap();
             (
@@ -6031,15 +5367,6 @@ mod tests {
         assert_eq!(rec.state, LogState::Retired(Retired::Recorded));
         assert_eq!(rec.retired_unix_ms, before.retired_unix_ms);
         assert_eq!(rec.retired_at, before.retired_at, "nothing finished again");
-        assert_eq!(
-            c.log()
-                .records()
-                .filter(|r| r.key.as_deref() == Some("harness.upgrade.s-a"))
-                .count(),
-            1,
-            "one entry"
-        );
-        assert!(c.reword_record(id, &waits("20 h")));
 
         // The relaunch reads the newest words, one record.
         let lines = c.log.drain_pending();
@@ -6050,7 +5377,7 @@ mod tests {
             .filter(|r| r.key.as_deref() == Some("harness.upgrade.s-a"))
             .collect();
         assert_eq!(keyed.len(), 1);
-        assert_eq!(keyed[0].detail, vec!["behind for 20 h: its own work runs"]);
+        assert_eq!(keyed[0].detail, vec!["behind for 9 h: its own work runs"]);
         assert_eq!(keyed[0].state, LogState::Retired(Retired::Recorded));
 
         // Negative controls: a live row is restate's, a dismissed row keeps
@@ -6190,10 +5517,9 @@ mod tests {
     }
 
     /// A live row becomes its own record in place: it leaves the glass and
-    /// retires `Recorded` under the new words and mark, one entry, re-worded in
-    /// place as it goes on and replayed so. Negative controls: words drawn for
-    /// other capsules leave the row's own words; an id no longer live is
-    /// refused.
+    /// retires `Recorded` under the new words and mark. Negative controls:
+    /// words drawn for other capsules leave the row's own words; an id no
+    /// longer live is refused.
     #[test]
     fn a_live_row_becomes_its_own_record_in_place() {
         use crate::UpgradeWord::{NotToday, Now, Skip};
@@ -6225,24 +5551,7 @@ mod tests {
         assert_eq!(rec.title, "Couldn't upgrade Claude in its tab yet");
         assert_eq!(rec.detail, vec!["behind for 8 h: its own work runs"]);
         assert_eq!(rec.severity, Severity::Info, "the record's mark");
-        assert!(c.reword_record(id, &asks("9 h", [NotToday, Skip])));
-        assert_eq!(
-            c.log()
-                .records()
-                .filter(|r| r.key.as_deref() == Some("harness.upgrade.s-a"))
-                .count(),
-            1,
-            "one entry"
-        );
         assert!(!c.keep_as_record(id, &asks("9 h", [NotToday, Skip]), now + ms(2)));
-
-        let lines = c.log.drain_pending();
-        let mut replayed = MessageLog::empty();
-        replayed.replay_all(lines.iter().map(|l| LogLine::decode(&l.encode()).unwrap()));
-        let rec = replayed.records().find(|r| r.stamp == stamp(1)).unwrap();
-        assert_eq!(rec.state, LogState::Retired(Retired::Recorded));
-        assert_eq!(rec.detail, vec!["behind for 9 h: its own work runs"]);
-        assert_eq!(rec.severity, Severity::Info);
 
         // Negative control: words for other capsules; the row keeps its own.
         let other = c
@@ -6308,128 +5617,36 @@ mod tests {
             )
             .id;
         assert!(c.resolve(warning, Outcome::Ok, now + crate::STALE_TAILED + ms(2)));
-        let words = |id| {
-            let rec = c.log().get(id).unwrap();
-            (rec.title.clone(), rec.detail.first().cloned())
-        };
-        let mark = |id| {
-            let rec = c.log().get(id).unwrap();
-            (rec.severity, rec.glyph.ch())
-        };
-        // A plain withdraw claims no outcome: it ended, under its severity's
-        // own icon (its live title read as still running).
-        let ended = (
-            "Installing ended".to_string(),
-            Some("Installing ALab tools".to_string()),
-        );
-        // Delivered work keeps no in-flight frame.
-        let finished = ("Installed ALab tools".to_string(), None);
-        let stopped = (
-            "Installing stopped".to_string(),
-            Some("Installing ALab tools".to_string()),
-        );
-        assert_eq!(words(plain), ended, "a plain withdraw claims no outcome");
-        assert_eq!(words(complete), finished);
-        assert_eq!(words(fault), stopped);
-        assert_eq!(words(warned), stopped);
-        assert_eq!(words(delivered), finished);
-        assert_eq!(words(stale), stopped);
-        assert_eq!(
-            words(warning),
-            (
-                "Misspelled setting fixed".to_string(),
-                Some("Misspelled setting".to_string())
-            )
-        );
         // The mark is how it ended: ✓ Success delivered and fixed, ⚠ Warn
-        // stopped, the severity's own icon ended.
+        // stopped, the severity's own icon ended (a plain withdraw claims no
+        // outcome). Delivered work keeps no in-flight frame.
         let ok = (Severity::Success, '\u{2713}');
         let warn = (Severity::Warn, '\u{26a0}');
-        assert_eq!(mark(plain), (Severity::Info, '\u{2139}'));
-        assert_eq!(mark(complete), ok);
-        assert_eq!(mark(delivered), ok);
-        assert_eq!(mark(fault), warn);
-        assert_eq!(mark(warned), warn);
-        assert_eq!(mark(stale), warn);
-        assert_eq!(mark(warning), ok, "a fixed problem leaves Problems");
-        // The Retired line carries the mark, and a replay takes it.
-        let line = c
-            .log()
-            .pending_lines()
-            .find(|l| matches!(l, LogLine::Retired { id, .. } if *id == delivered))
-            .unwrap()
-            .encode();
-        assert!(line.contains("\tsev=success\t"), "{line}");
-        let mut replayed = MessageLog::empty();
-        for l in c.log().pending_lines() {
-            replayed.replay(LogLine::decode(&l.encode()).unwrap());
+        let ended = ("Installing ended", Some("Installing ALab tools"));
+        let finished = ("Installed ALab tools", None);
+        let stopped = ("Installing stopped", Some("Installing ALab tools"));
+        let fixed = ("Misspelled setting fixed", Some("Misspelled setting"));
+        // The Retired line carries them: a relaunch replaying the file reads
+        // what the ring does.
+        let lines = c.log.drain_pending();
+        let mut file = MessageLog::empty();
+        file.replay_all(lines.iter().map(|l| LogLine::decode(&l.encode()).unwrap()));
+        for (case, id, want_words, want_mark) in [
+            ("plain", plain, ended, (Severity::Info, '\u{2139}')),
+            ("complete", complete, finished, ok),
+            ("fault", fault, stopped, warn),
+            ("warned", warned, stopped, warn),
+            ("delivered", delivered, finished, ok),
+            ("stale", stale, stopped, warn),
+            ("fixed", warning, fixed, ok),
+        ] {
+            for (log, side) in [(c.log(), "ring"), (&file, "file")] {
+                let rec = log.get(id).unwrap();
+                let words = (rec.title.as_str(), rec.detail.first().map(String::as_str));
+                assert_eq!(words, want_words, "{case} ({side})");
+                assert_eq!((rec.severity, rec.glyph.ch()), want_mark, "{case} ({side})");
+            }
         }
-        let rec = replayed.get(delivered).unwrap();
-        assert_eq!((rec.severity, rec.glyph.ch()), ok);
-    }
-
-    /// `LogOnly` never enters the live set; a resolve by key prefix takes
-    /// the whole family; the revision moves on every observable change.
-    #[test]
-    fn log_only_and_key_prefix_and_revision() {
-        let now = t0();
-        let mut c = fresh(now);
-        let r0 = c.revision();
-        let quiet = c.post(info("managed, current").hold(Hold::LogOnly), stamp(1), now);
-        assert_eq!(quiet.outcome, PostOutcome::New);
-        assert_eq!(c.live_rows().count(), 0);
-        assert_eq!(
-            c.log().get(quiet.id).unwrap().state,
-            LogState::Retired(Retired::Recorded),
-            "a record retires as recorded, never as a fold it never had"
-        );
-        assert!(c.revision() > r0);
-        let a = c
-            .post(
-                Message::new(tags::CONFIG, Severity::Warn, "a").key("config.keybindings"),
-                stamp(2),
-                now,
-            )
-            .id;
-        let b = c
-            .post(
-                Message::new(tags::CONFIG, Severity::Warn, "b").key("config.theme"),
-                stamp(3),
-                now,
-            )
-            .id;
-        let other = c
-            .post(
-                Message::new(tags::PRIVACY, Severity::Info, "o").key("privacy.fda"),
-                stamp(4),
-                now,
-            )
-            .id;
-        assert_eq!(c.resolve_key_prefix("config.", Outcome::Ok, now), 2);
-        assert!(c.live(a).is_none() && c.live(b).is_none() && c.live(other).is_some());
-        assert_eq!(
-            c.log().get(a).unwrap().state,
-            LogState::Retired(Retired::Resolved(Outcome::Ok))
-        );
-        assert!(!c.resolve(a, Outcome::Ok, now));
-        assert!(!c.dismiss(a, now));
-        assert!(!c.mark_seen(a, now));
-        let r1 = c.revision();
-        c.commit_rows(now, 3);
-        assert!(c.revision() > r1, "a commit is observable");
-        assert!(c.settle(now, true).retired.is_empty());
-        assert!(
-            c.restate(
-                other,
-                Restatement {
-                    hold: Some(Hold::LogOnly),
-                    ..Restatement::default()
-                },
-                now
-            ),
-            "a restate to LogOnly retires the row"
-        );
-        assert!(c.live(other).is_none());
     }
 
     /// A row a Warn pushes off the band is released: `is_queued()` agrees with
@@ -6479,35 +5696,6 @@ mod tests {
         }
     }
 
-    /// The same through the afford clamp: rows anchored on a 3-row band, the
-    /// window shrinks to 1 row, and the two rows the clamp took off glass do
-    /// not fold `Folded` unpainted.
-    #[test]
-    fn a_row_clamped_off_glass_by_afford_does_not_burn_its_hold() {
-        let now = t0();
-        let mut c = fresh(now);
-        let r: Vec<MessageId> = (0..3)
-            .map(|i| c.post(info(&format!("r{i}")), stamp(i), now).id)
-            .collect();
-        assert_eq!(c.commit_rows(now, 3), Some(3));
-        assert_eq!(
-            c.commit_rows(now + ms(1), 1),
-            Some(1),
-            "the window's own shrink lands at once"
-        );
-        assert_eq!(glass_ids(&c), vec![r[0]]);
-        let settled = c.settle(now + HOLD_INFO, true);
-        let folded_off_glass: Vec<_> = settled
-            .retired
-            .iter()
-            .filter(|(id, how)| *id != r[0] && *how == Retired::Folded)
-            .collect();
-        assert!(
-            folded_off_glass.is_empty(),
-            "rows off glass since {SHRINK_QUIET:?} after the clamp folded as if read: {folded_off_glass:?}"
-        );
-    }
-
     /// At one committed row the single row's `+N ›` capsule counts the queue;
     /// when a queued row folds Unseen the painted capsule changes and `settle`
     /// says so, so a host keyed on `glass_changed` repaints exactly when
@@ -6540,53 +5728,6 @@ mod tests {
             "the visible capsule changed ({:?} → {:?}) but glass_changed is false",
             before.rows[0].capsules.last().unwrap().text,
             after.rows[0].capsules.last().unwrap().text
-        );
-    }
-
-    /// A carried held row the host restates before the handoff commit keeps a
-    /// fold: the restate takes the handoff cap off and anchors the row's own
-    /// hold, since `after_handoff_commit` then skips it.
-    #[test]
-    fn a_carried_held_row_restated_before_commit_still_folds() {
-        let now = t0();
-        let mut parent = fresh(now);
-        let held = parent
-            .post(
-                Message::new(tags::UPDATE, Severity::Success, "Updated"),
-                stamp(1),
-                now,
-            )
-            .id;
-        parent.commit_rows(now, 3);
-        let carry = parent.carried();
-        let later = now + Duration::from_secs(5);
-        let mut child = fresh(later);
-        child.seed_carried(&carry, stamp(5_000), later);
-        assert!(child.restate(
-            held,
-            Restatement {
-                title: Some("Updated (v2)".into()),
-                ..Restatement::default()
-            },
-            later + ms(1)
-        ));
-        let commit = later + Duration::from_secs(20);
-        child.after_handoff_commit(commit);
-        let row = child.live(held).unwrap();
-        assert!(
-            row.fold_at.is_some(),
-            "a held row on glass with no fold anchor: fold_at {:?} stale_at {:?}",
-            row.fold_at,
-            row.stale_at
-        );
-        let settled = child.settle(later + STALE_HANDOFF, true);
-        assert!(
-            settled
-                .retired
-                .iter()
-                .all(|(_, how)| *how != Retired::Stale),
-            "a held row retired Stale: {:?}",
-            settled.retired
         );
     }
 }

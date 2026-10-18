@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>IOConsoleLocked</key>
+	<false/>
+	<key>IOConsoleUsers</key>
+	<array>
+		<dict>
+			<key>CGSSessionUniqueSessionUUID</key>
+			<string>6E12E544-0311-438D-9152-AB8B983BAD76</string>
+			<key>kCGSSessionAuditIDKey</key>
+			<integer>100002</integer>
+			<key>kCGSSessionGroupIDKey</key>
+			<integer>20</integer>
+			<key>kCGSSessionIDKey</key>
+			<integer>257</integer>
+			<key>kCGSSessionLoginwindowSafeLogin</key>
+			<false/>
+			<key>kCGSSessionOnConsoleKey</key>
+			<true/>
+			<key>kCGSSessionSystemSafeBoot</key>
+			<false/>
+			<key>kCGSSessionUserIDKey</key>
+			<integer>501</integer>
+			<key>kCGSSessionUserNameKey</key>
+			<string>admin</string>
+			<key>kCGSessionLoginDoneKey</key>
+			<true/>
+			<key>kCGSessionLongUserNameKey</key>
+			<string>Managed via Tart</string>
+			<key>kSCSecuritySessionID</key>
+			<integer>100002</integer>
+		</dict>
+	</array>
+	<key>IOKitBuildVersion</key>
+	<string>Darwin Kernel Version 27.0.0: Tue Aug 11 21:00:07 PDT 2026; root:xnu-13432.1.9~1/RELEASE_ARM64_VMAPPLE</string>
+	<key>IOKitDiagnostics</key>
+	<dict>
+		<key>Classes</key>
+		<dict>
+			<key>ACMAccessoryCacheKernelService</key>
+			<integer>1</integer>
+			<key>ACMAnalyticsKernelService</key>
+			<integer>1</integer>
+			<key>ACMBridgeKernelService</key>
+			<integer>0</integer>
+			<key>com_apple_filesystems_nfs</key>
+			<integer>1</integer>
+			<key>mDNSHandoff</key>
+			<integer>0</integer>
+			<key>mDNSOffloadUserClient</key>
+			<integer>0</integer>
+		</dict>
+		<key>Container allocation</key>
+		<integer>3055596</integer>
+		<key>IOMalloc allocation</key>
+		<integer>158050566</integer>
+		<key>Instance allocation</key>
+		<integer>2559336</integer>
+		<key>Pageable allocation</key>
+		<integer>237977744</integer>
+	</dict>
+	<key>IOObjectClass</key>
+	<string>IORegistryEntry</string>
+	<key>IOObjectRetainCount</key>
+	<integer>8</integer>
+	<key>IORegistryEntryID</key>
+	<integer>4294967552</integer>
+	<key>IORegistryEntryName</key>
+	<string>Root</string>
+	<key>IORegistryPlanes</key>
+	<dict>
+		<key>IOAccessory</key>
+		<string>IOAccessory</string>
+		<key>IODeviceTree</key>
+		<string>IODeviceTree</string>
+		<key>IOPort</key>
+		<string>IOPort</string>
+		<key>IOPower</key>
+		<string>IOPower</string>
+		<key>IOService</key>
+		<string>IOService</string>
+		<key>IOUSB</key>
+		<string>IOUSB</string>
+	</dict>
+	<key>OS Build Version</key>
+	<string>26A428</string>
+	<key>OSKernelCPUSubtype</key>
+	<integer>-1073741822</integer>
+	<key>OSKernelCPUType</key>
+	<integer>16777228</integer>
+	<key>OSPrelinkKextCount</key>
+	<integer>5</integer>
+</dict>
+</plist>

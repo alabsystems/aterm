@@ -25,7 +25,10 @@
 //! Good 0:` over `Dismiss` under its `0:` at 34; `  1: Bad2:    3:    0: Dis` over
 //! `        Fine  Good  miss` at 26, `Dismiss` broken where its box ends). Read a row at
 //! a time no row was the options row, so the card was never dismissed and its rows were
-//! read as the worker's last words. The options are read as that one row of boxes
+//! read as the worker's last words: the harness typed `keep going` into the standing
+//! card, and a card whose question wrapped too hid a live spinner above it, so a running
+//! turn read idle (five boxes on the plugin and memory cards, `4: Unsure` among them,
+//! wrap the same way). The options are read as that one row of boxes
 //! ([`options_line`], [`crate::wrap::rejoined_cells`]) and the question as the line Ink
 //! wrapped ([`crate::wrap`]): one card, its kind named by its whole question.
 
@@ -71,9 +74,11 @@ pub struct SurveyBlock {
     pub kind: SurveyKind,
     /// The `●` question row.
     pub head: usize,
-    /// The options row (`1: Bad … 0: Dismiss`), the block's last row.
+    /// The options row (`1: Bad … 0: Dismiss`), the block's last row; where Ink
+    /// wrapped the options' boxes, the last row of those boxes ([`options_line`]).
     pub options: usize,
-    /// The `key if=` guard for the head row as observed: `^●.` and its first words,
+    /// The `key if=` guard for a row of the card as observed: Claude Code's head row,
+    /// `^●.` and its first words; agy's options row whole ([`crate::agy::survey`]) —
     /// spaces as `.`, every metacharacter escaped. Empty when the row holds anything a
     /// wire token cannot carry — the caller then has no guard and presses nothing.
     pub guard: String,
@@ -585,35 +590,6 @@ mod tests {
         "  ⎿  Tip: Use /btw to ask a quick side question",
     ];
 
-    #[test]
-    fn every_kind_is_found_from_its_options_row_and_named() {
-        for (card, kind, guard) in [
-            (&SESSION[..], SurveyKind::Session, "^●.How.is.Claude.doing"),
-            (&LONG[..], SurveyKind::LongContext, "^●.How.well.is.Claude"),
-            (&PLUGIN[..], SurveyKind::Plugin, "^●.How.helpful.has.the"),
-            (
-                &MEMORY[..],
-                SurveyKind::Memory,
-                "^●.Claude.recalled.a.memory:",
-            ),
-            (
-                &MEMORY_PLAIN[..],
-                SurveyKind::Memory,
-                "^●.How.well.did.Claude",
-            ),
-        ] {
-            for body in [&DONE[..], &WAITING[..], &SPINNER[..]] {
-                let rows = with(body, card);
-                let b = survey_block(&rows).unwrap_or_else(|| panic!("{card:?} over {body:?}"));
-                assert_eq!(b.kind, kind, "{card:?}");
-                assert_eq!(b.guard, guard, "{card:?}");
-                assert!(rows[b.head].starts_with('●'));
-                assert!(is_options_row(&rows[b.options]));
-                assert!(survey_open(&rows));
-            }
-        }
-    }
-
     /// No card, recognised or not, hides the status row: a BUSY worker never reads idle.
     #[test]
     fn no_card_turns_a_busy_worker_idle() {
@@ -899,6 +875,19 @@ mod tests {
                 "⏺ text",
                 "  1: Bad    2: Fine   3: Good   0: Dismiss",
             ]),
+            // the worker's own `⏺` message that reads as the question
+            r(&[
+                "⏺ How is Claude doing this session? (optional)",
+                "  1: Bad    2: Fine   3: Good   0: Dismiss",
+            ]),
+            // the card above a done row: history
+            r(&[
+                SESSION[1],
+                SESSION[2],
+                "",
+                "✻ Cogitated for 4s · done 2:41 PM",
+                "",
+            ]),
         ] {
             let rows = screen(&above.iter().map(String::as_str).collect::<Vec<_>>());
             assert!(survey_block(&rows).is_none(), "{above:?}");
@@ -906,19 +895,130 @@ mod tests {
         }
     }
 
+    /// A CARD INK WRAPPED IS STILL THE CARD (module header, "IN A NARROW PANE"; KI
+    /// S2R-F2). Under 42 columns the options break inside their boxes (`… 0:` over a
+    /// `Dismiss` against the right edge), and read a row at a time the card was none: an
+    /// idle card took `keep going`, and a card whose question wrapped too (`● How is
+    /// Claude doing this` over `session? (optional)`) hid the spinner above it, so a
+    /// running turn read idle; so did a plugin card's, its `4: Unsure` broken as well.
+    /// Each is the card, parked whole. NEGATIVE CONTROLS: the same option rows under a
+    /// `⏺` lead-in (no `●` head) are no card; a block with no `0:` and `Dismiss` is none;
+    /// the worker's words under a whole options row are no wrap of it.
     #[test]
-    fn a_banner_and_blank_rows_under_the_card_are_parked() {
-        let banner = format!(
-            "{:>width$}",
-            "✔ Update installed · Restart to update",
-            width = RULE.chars().count() - 2
+    fn a_card_ink_wrapped_is_still_the_card() {
+        let narrow = |above: &[&str], width: usize, footer: &str| {
+            let rule = "─".repeat(width);
+            let mut v = r(above);
+            v.extend(r(&[&rule, "❯", &rule, footer]));
+            v
+        };
+        let idle = narrow(
+            &[
+                "⏺ Done with the change.",
+                "",
+                "● How is Claude doing this session?",
+                "  (optional)",
+                "  1: Bad  2: Fine 3: Good 0:",
+                "                          Dismiss",
+                "",
+            ],
+            36,
+            "  ⏵⏵ auto mode on (shift+tab to",
         );
-        let rows = with(
-            &DONE,
-            &[SESSION[0], SESSION[1], SESSION[2], "", banner.as_str()],
+        let b = survey_block(&idle).expect("the 36-column card");
+        assert_eq!(
+            (b.kind, b.head, b.options, b.dismissable),
+            (SurveyKind::Session, 2, 5, true)
         );
-        assert!(survey_block(&rows).is_some());
-        assert_eq!(worker_phase(&rows), Phase::Idle);
+        assert_eq!(b.guard, "^●.How.is.Claude.doing");
+        assert!(survey_open(&idle));
+        assert_eq!(last_said_row(&idle), Some("⏺ Done with the change."));
+
+        let busy = narrow(
+            &[
+                "⏺ Working.",
+                "",
+                "✶ Deliberating… (12s)",
+                "",
+                "● How is Claude doing this",
+                "  session? (optional)",
+                "  1: Bad 2: Fine3: Good0:",
+                "                       Dismiss",
+                "",
+            ],
+            30,
+            "  ⏵⏵ auto mode on (shift+tab",
+        );
+        assert!(survey_open(&busy));
+        assert_eq!(
+            survey_block(&busy).map(|b| b.kind),
+            Some(SurveyKind::Session)
+        );
+        assert_eq!(worker_phase(&busy), Phase::Busy);
+        assert_eq!(
+            busy_signal(&busy).map(|s| s.to_string()),
+            Some("status row: spinner".to_string())
+        );
+
+        let plugin = narrow(
+            &[
+                "⏺ Working.",
+                "",
+                "✶ Deliberating… (12s)",
+                "",
+                "● How helpful has the lab plugin been?",
+                "  (optional)",
+                "  Used this session: lab-tool",
+                "  1: Bad  2: Fine 3: Good 4:     0:",
+                "                          Unsure Dismiss",
+                "",
+            ],
+            40,
+            "  ⏵⏵ auto mode on (shift+tab to cycle)",
+        );
+        assert_eq!(
+            survey_block(&plugin).map(|b| b.kind),
+            Some(SurveyKind::Plugin)
+        );
+        assert_eq!(worker_phase(&plugin), Phase::Busy);
+
+        // NEGATIVE CONTROLS.
+        let quoted = narrow(
+            &[
+                "⏺ The card reads:",
+                "  1: Bad  2: Fine 3: Good 0:",
+                "                          Dismiss",
+                "",
+            ],
+            36,
+            "  ⏵⏵ auto mode on (shift+tab to",
+        );
+        assert!(survey_block(&quoted).is_none());
+        assert!(!survey_open(&quoted));
+        let no_dismiss = narrow(
+            &[
+                "⏺ Done.",
+                "",
+                "● How is Claude doing this session?",
+                "  (optional)",
+                "  1: Bad  2: Fine",
+                "",
+            ],
+            36,
+            "  ⏵⏵ auto mode on (shift+tab to",
+        );
+        assert!(survey_block(&no_dismiss).is_none());
+        let said_under = narrow(
+            &[
+                "",
+                "● How is Claude doing this session? (optional)",
+                "  1: Bad    2: Fine   3: Good   0: Dismiss",
+                "  I left it for you to answer.",
+            ],
+            82,
+            FOOTER,
+        );
+        assert!(survey_block(&said_under).is_none());
     }
 
     /// A worker QUOTING the drafts card (or an ask) in its message — its rows continue at

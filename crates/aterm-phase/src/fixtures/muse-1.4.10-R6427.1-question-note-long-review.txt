@@ -1,0 +1,47 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab) · the one-question call answered `None of the above` with the harness's 276-byte long-term policy text as its note (two Downs, Tab, the text, Enter): the review, its answer row wrapped between words, the continuation rows indented four like it · the lab's random project dir is spelled /private/tmp/at.lab0 here
+  (Recommended)"},{"id":"size","selected_label":"Small (Recommended)"}]}
+
+❯ toolstart
+
+  Questions 0/1 answered (interrupted)
+  Which checks should the probe run? (unanswered)
+  interrupted with 1 unanswered
+
+◆ Interrupted · Report issues with /feedback
+
+❯ toolstart
+
+◆ Backgrounded · Wait in the background · 3.2s · ctrl+o
+
+◆ Tool call done. Result: { "chunk_id": "exec-3-1", "execution_state": "background_running", "session_id": 3, "work_id":
+  "work.v2.managed_bash.sha256.ee604ea74c24964fcafa5eedd1192c7eabb2dd521c8247e9879b11b1fb23c640", ~
+
+❯ carry on with the task
+
+◆ Finished · Wait in the background · ✓ · ctrl+o
+
+◆ tick 1 tick 2 tick 3 tick 4 tick 5 tick 6 tick 7 tick 8 tick 9 tick 10 tick 11 tick 12 tick 13 tick 14 tick 15 tick 16 tick 17 tick 18 tick 19
+  tick 20 tick 21 tick 22 tick 23 tick 24 tick 25 tick 26 tick 27 tick 28 tick 29 tick 30
+
+◆ tick 1 tick 2 tick 3 tick 4 tick 5 tick 6 tick 7 tick 8 tick 9 tick 10 tick 11 tick 12 tick 13 tick 14 tick 15 tick 16 tick 17 tick 18 tick 19
+  tick 20 tick 21 tick 22 tick 23 tick 24 tick 25 tick 26 tick 27 tick 28 tick 29 tick 30
+
+◆ Worked for 1m 01s · 6:29 PM · 16/Oct
+
+◆ Recap: ok
+
+❯ toolstart
+
+◈ Request user input Color — running (14s)
+
+  Review answers before submit · Enter to edit or submit · ↑/↓ to move · Esc to go back
+    Color: None of the above; note: Decide yourself: choose the option that best serves long term correctness and total value even at the cost
+    of short term deliverables. Say which you chose and why in one line and continue without asking again. (Answered by the aterm harness by
+    policy. The user was not asked.)
+  ⟩ Submit answers
+    Interrupt turn
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  lab-stub · high · /private/tmp/at.lab0/proj · Auto-review

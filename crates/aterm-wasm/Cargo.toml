@@ -11,10 +11,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 # aterm engine + pure-Rust CPU rasterizer (fonts via `aterm_render::font` over
 # aterm-font, shaping via aterm-font's shaper), all wasm32-safe.
-# default-features = false drops the disk-tier cold scrollback (libc mmap), which
-# cannot target wasm32; a renderer needs only the RAM/LZ4 tiers.
-# "sixel" adds aterm-sixel (pure Rust, no libc/C) for Sixel DCS images.
-aterm-core = { path = "../aterm-core", default-features = false, features = ["sixel"] }
+aterm-core = { path = "../aterm-core", default-features = false }
 aterm-render = { path = "../aterm-render", default-features = false }
 # The cursor-wake + sparkle-words engines the native app runs; wasm32-clean.
 aterm-effects = { path = "../aterm-effects" }
@@ -31,7 +28,9 @@ aterm-messages = { workspace = true }
 # REAL time (the glitch-expiry self-heal), unlike the deterministic effects clock.
 aterm-time = { workspace = true }
 # aterm_types::Appearance for the set_color_scheme binding (aterm-core does not
-# re-export it). default-features = false pins out serde/winit -> wasm32-clean.
+# re-export it), plus the theme catalog, selector and parser theme_api.rs
+# draws through (the same ones aterm-gui uses). default-features = false pins
+# out serde/winit -> wasm32-clean.
 aterm-types = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -60,6 +59,9 @@ aterm-wasm-abi = { workspace = true, features = ["export"] }
 # Dev-dependencies never enter the shipped wasm32 graph (resolver 2), and the
 # wasm census's derived closure excludes them.
 aterm-control = { workspace = true }
+# TEST-ONLY: `aterm_spec::host::could_not_run`, so a test the host cannot run
+# (no system font, no GPU) ends COULD NOT RUN, never a silent pass.
+aterm-spec = { workspace = true }
 
 [lints]
 workspace = true

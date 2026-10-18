@@ -89,7 +89,8 @@ impl Row {
     ///   These callers pass `orphan = Cell::EMPTY`.
     ///
     /// The selective erases (DECSEL / DECSED) use `selective_clear_range`,
-    /// which writes `Cell::EMPTY` orphans without BCE, unlike xterm.
+    /// which gives every cell it clears, a cleared pair's halves included, the
+    /// BCE blank, as xterm's `ClearCells` does.
     ///
     /// `orphan` is therefore `Cell::EMPTY` or `fill`; the `len` bookkeeping
     /// below relies on that (a blank fill implies a blank orphan).
@@ -287,10 +288,30 @@ impl Row {
         col > 0 && self.cells[col - 1].flags().contains(CellFlags::WIDE)
     }
 
-    /// Selectively clear cells from `start` to `end` (exclusive), skipping
-    /// DECSCA-protected cells (context-aware, so wide pairs are handled).
+    /// Selectively clear cells from `start` to `end` (exclusive) to `fill`,
+    /// skipping DECSCA-protected cells (context-aware, so wide pairs are
+    /// handled).
+    ///
+    /// `fill` is the erase's BCE blank: xterm's protected erases reach the same
+    /// `ClearCells` as EL/ED (`ClearInLine2` only skips the protected
+    /// segments), which writes the current colour pair, and Ghostty's
+    /// `clearUnprotectedCells` likewise clears each unprotected run with the
+    /// blank cell. A cleared wide pair's halves (inside the span, or bisected
+    /// by its left edge) get it too, as `ClearCells` widens its range over a
+    /// hidden half.
+    ///
+    /// Returns the columns written, `[start, end)` widened by one on a side
+    /// where a wide pair was cleared across the edge, so the caller can keep the
+    /// truecolor side table in step for exactly the cleared cells: inside the
+    /// returned range, a cell that is not protected afterwards was cleared (the
+    /// fill is never protected).
     #[inline]
-    pub(crate) fn selective_clear_range(&mut self, start: u16, end: u16) {
+    pub(crate) fn selective_clear_range(
+        &mut self,
+        start: u16,
+        end: u16,
+        fill: Cell,
+    ) -> core::ops::Range<u16> {
         debug_assert!(
             (self.len as usize) <= self.cells.len(),
             "Row::selective_clear_range: self.len ({}) > cells.len() ({})",
@@ -299,9 +320,11 @@ impl Row {
         );
         let start_usize = start as usize;
         let end_usize = (end as usize).min(self.cells.len());
+        let mut written = start..start;
         if start_usize < end_usize {
             let old_len = self.len as usize;
             let mut any_erased = false;
+            written = super::u16_from_usize(start_usize)..super::u16_from_usize(end_usize);
 
             // Left boundary fixup: if the first cell is the continuation of an
             // unprotected WIDE cell outside the range, clear the WIDE cell too
@@ -315,13 +338,14 @@ impl Row {
                     .contains(CellFlags::WIDE)
                 && !self.is_cell_protected((start_usize - 1) as u16)
             {
-                self.cells[start_usize - 1] = Cell::EMPTY;
+                self.cells[start_usize - 1] = fill;
                 // Clearing the lead's WIDE flag would make the continuation at
                 // `start_usize` read as a standalone PROTECTED cell (shared bit
                 // 10), so the loop would skip it and orphan the spacer; clear it
                 // here.
-                self.cells[start_usize] = Cell::EMPTY;
+                self.cells[start_usize] = fill;
                 any_erased = true;
+                written.start = super::u16_from_usize(start_usize - 1);
             }
 
             for col in start_usize..end_usize {
@@ -332,25 +356,37 @@ impl Row {
                     if self.cells[col].flags().contains(CellFlags::WIDE)
                         && col + 1 < self.cells.len()
                     {
-                        self.cells[col + 1] = Cell::EMPTY;
+                        self.cells[col + 1] = fill;
+                        if col + 1 == end_usize {
+                            written.end = super::u16_from_usize(end_usize + 1);
+                        }
                     }
-                    self.cells[col] = Cell::EMPTY;
+                    self.cells[col] = fill;
                     any_erased = true;
                 }
             }
             if any_erased {
                 self.flags |= RowFlags::DIRTY;
-                // Not gated on `end_usize >= old_len`: the WIDE-head co-clear
-                // above wipes cells[col+1], which for col == end-1 is cells[end],
-                // one past the range; when that was the tail content
-                // (old_len == end + 1), that gate would leave len stale-high.
-                // recalculate_len_up_to(old_len) rescans the prefix and never
-                // over-shrinks.
-                if start_usize < old_len && self.cells[old_len - 1].is_empty() {
-                    self.recalculate_len_up_to(old_len);
+                if fill.is_empty() {
+                    // Not gated on `end_usize >= old_len`: the WIDE-head co-clear
+                    // above wipes cells[col+1], which for col == end-1 is
+                    // cells[end], one past the range; when that was the tail
+                    // content (old_len == end + 1), that gate would leave len
+                    // stale-high. recalculate_len_up_to(old_len) rescans the
+                    // prefix and never over-shrinks.
+                    if start_usize < old_len && self.cells[old_len - 1].is_empty() {
+                        self.recalculate_len_up_to(old_len);
+                    }
+                } else {
+                    // A BCE blank is content, possibly past the old end and
+                    // possibly not through the span's end (a protected cell
+                    // there survives as whatever it was): rescan for the tight
+                    // len. DECSEL/DECSED are rare; the O(cols) scan is not.
+                    self.recompute_len();
                 }
             }
         }
+        written
     }
 
     /// Selectively wipe characters from `start` to `end` (exclusive), keeping
@@ -364,9 +400,9 @@ impl Row {
     ///
     /// Protected cells are skipped; a wiped wide character becomes two narrow
     /// spaces (`set_char` clears COMPLEX/WIDE/WIDE_CONTINUATION but keeps SGR
-    /// flags, colors and any style id). Each wiped column is pushed onto
-    /// `wiped`, so the caller can scrub stale combining marks and complex-char
-    /// strings from the extras while keeping their truecolor.
+    /// flags and colors). Each wiped column is pushed onto `wiped`, so the
+    /// caller can scrub stale combining marks and complex-char strings from the
+    /// extras while keeping their truecolor.
     #[inline]
     pub(crate) fn selective_wipe_range(&mut self, start: u16, end: u16, wiped: &mut Vec<u16>) {
         debug_assert!(
@@ -432,10 +468,12 @@ impl Row {
         }
     }
 
-    /// Selectively clear the whole row, skipping DECSCA-protected cells
-    /// (context-aware, so wide pairs are handled).
+    /// Selectively clear the whole row to `fill`, skipping DECSCA-protected
+    /// cells (context-aware, so wide pairs are handled). `fill` is the BCE
+    /// blank, as for [`Row::selective_clear_range`]; afterwards every cell
+    /// that is not protected was cleared.
     #[inline]
-    pub(crate) fn selective_clear(&mut self) {
+    pub(crate) fn selective_clear(&mut self, fill: Cell) {
         debug_assert!(
             (self.len as usize) <= self.cells.len(),
             "Row::selective_clear: self.len ({}) > cells.len() ({})",
@@ -449,16 +487,21 @@ impl Row {
             if !self.is_cell_protected(col as u16) {
                 // A cleared WIDE head takes its continuation with it.
                 if self.cells[col].flags().contains(CellFlags::WIDE) && col + 1 < cols {
-                    self.cells[col + 1] = Cell::EMPTY;
+                    self.cells[col + 1] = fill;
                 }
-                self.cells[col] = Cell::EMPTY;
+                self.cells[col] = fill;
                 any_erased = true;
             }
         }
         if any_erased {
             self.flags |= RowFlags::DIRTY;
-            if old_len > 0 && self.cells[old_len - 1].is_empty() {
-                self.recalculate_len_up_to(old_len);
+            if fill.is_empty() {
+                if old_len > 0 && self.cells[old_len - 1].is_empty() {
+                    self.recalculate_len_up_to(old_len);
+                }
+            } else {
+                // As in `selective_clear_range`: a BCE blank is content.
+                self.recompute_len();
             }
         }
     }

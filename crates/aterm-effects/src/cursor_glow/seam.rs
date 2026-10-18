@@ -241,16 +241,7 @@ impl CursorGlow {
             && (pr != cr || pc != cc)
         {
             let dist = (cr.abs_diff(pr)).max(cc.abs_diff(pc));
-            self.crown_window_ms = if let Some(p) = cfg.pack.as_ref() {
-                // Trail Pack: the crown windows are the pack's
-                // `crown.typing_window_ms`/`jump_window_ms` (Custom only);
-                // built-ins keep the shared `CROWN_*` windows.
-                if dist <= 1 {
-                    p.crown.typing_window_ms as u64
-                } else {
-                    p.crown.jump_window_ms as u64
-                }
-            } else if dist <= 1 {
+            self.crown_window_ms = if dist <= 1 {
                 Self::CROWN_TYPING_MS
             } else if matches!(cfg.style, GlowStyle::Fire) {
                 // The crown must survive the meteor's flight (≤320 ms) so the
@@ -287,7 +278,19 @@ impl CursorGlow {
                         .bank(key.pressed_at, 1, Some(key.glyph));
                 }
             }
-            let admitted = self.spawn(pr, pc, cr, cc, now, cfg, geom, SpawnLane::Visible);
+            let correction = if orphans.is_none() && matches!(cfg.style, GlowStyle::RainbowKitty) {
+                self.judging_on_rows(pr, cr, |glow| {
+                    glow.merged_correction((pr, pc), (cr, cc), now)
+                })
+            } else {
+                None
+            };
+            let admitted = match correction {
+                Some((mid, slot)) => {
+                    self.judge_merged_correction(pr, (pc, mid, cc), slot, now, cfg, geom)
+                }
+                None => self.spawn(pr, pc, cr, cc, now, cfg, geom, SpawnLane::Visible),
+            };
             if let Some(claimed) = orphans {
                 for key in claimed.into_iter().flatten() {
                     self.type_press_ring.revoke_at(key.pressed_at);
@@ -507,6 +510,7 @@ impl CursorGlow {
         if let Some(c) = cur {
             self.last_visible = Some((c, now));
             self.hide_bridge_shown = None;
+            self.row_shown_meta = None;
         }
     }
 
@@ -532,8 +536,7 @@ impl CursorGlow {
     ///
     /// A scripted preview is licensed by the same terms:
     /// [`Self::note_synthetic_move`] stamps `user_gesture_hint` and
-    /// [`Self::note_synthetic_typed`] stamps `type_hint`
-    /// (`a_synthetic_note_licenses_its_own_move`).
+    /// [`Self::note_synthetic_typed`] stamps `type_hint`.
     #[must_use]
     pub fn move_licensed(&self, now: Instant) -> bool {
         self.type_hint.any_fresh(now, Self::TYPE_HINT_FRESH) || self.one_shot_licensed(now)
@@ -784,6 +787,152 @@ impl CursorGlow {
             .then_some(slot)
     }
 
+    /// A Backspace whose retreat is still owed and the keys typed since it,
+    /// rendered as one repaint: an app lagging behind the hand draws the state
+    /// after `s⌫␣` (Claude Code's composer, the owner's `the▯subtrees`,
+    /// 2026-10-16). The caret moves `j − k` for the `k` cells the erases owe
+    /// and `j` keys typed since, so a balanced correction leaves it where it
+    /// was, and the `j` cells before it spell those keys. Bytes are processed
+    /// in order, so the repaint is the erases' retreat and then the keys'
+    /// advance ([`Self::judge_merged_correction`]); a typed Space is its
+    /// blank. Requires every press typed before the erase paid, the keys
+    /// exact one-cell presses, this frame's probe of the row and the last
+    /// frame's at the source caret (after a torn repaint, the last that showed
+    /// the caret, [`Self::row_shown`]), and a cell among the `j` changed since:
+    /// an erase the app has not processed leaves the row as it was, and a lone
+    /// Backspace's echo can read like a correction that retyped the glyph it
+    /// erased, whose cell keeps its light. Returns the column the retreat
+    /// lands on and the slot of the first key.
+    pub(super) fn merged_correction(
+        &self,
+        (pr, pc): (u16, u16),
+        (cr, cc): (u16, u16),
+        now: Instant,
+    ) -> Option<(u16, usize)> {
+        let erase = self.last_erase.filter(|erase| erase.owed_at(now))?;
+        if cr != pr {
+            return None;
+        }
+        let keys = i32::from(erase.owed) + i32::from(cc) - i32::from(pc);
+        let keys = usize::try_from(keys)
+            .ok()
+            .filter(|keys| (1..=EXACT_COALESCED_PREFIX_MAX).contains(keys))?;
+        let mid = cc.checked_sub(keys as u16)?;
+        let source = |m: &RowProbe| m.row == pr && m.caret == pc && m.at < now;
+        let (prev, _) = match self
+            .row_shown_meta
+            .filter(|m| self.last.is_none() && source(m))
+        {
+            Some(meta) => (&self.row_shown, meta),
+            None => (&self.row_prev, self.row_prev_meta.filter(source)?),
+        };
+        if !self
+            .row_cur_meta
+            .is_some_and(|m| m.row == pr && m.caret == cc && m.at == now)
+        {
+            return None;
+        }
+        let mut glyphs = [' '; EXACT_COALESCED_PREFIX_MAX];
+        let mut changed = false;
+        for (i, col) in (mid..cc).enumerate() {
+            let new = self.row_cur.get(usize::from(col)).copied().unwrap_or(' ');
+            if new == '\0' {
+                return None;
+            }
+            changed |= prev.get(usize::from(col)).copied().unwrap_or(' ') != new;
+            glyphs[i] = new;
+        }
+        if !changed {
+            return None;
+        }
+        let slot = self
+            .type_press_ring
+            .exact_run_after(now, erase.at, &glyphs[..keys])?;
+        Some((mid, slot))
+    }
+
+    /// Judge a [`Self::merged_correction`] as the two echoes it holds: the
+    /// erases' retreat `from -> mid`, then the retyped keys' advance
+    /// `mid -> to`, which their presses pay. A refused advance puts the
+    /// presses back.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the row, the correction's three columns and its slot, plus the judge's clock, config and geometry"
+    )]
+    pub(super) fn judge_merged_correction(
+        &mut self,
+        row: u16,
+        (from, mid, to): (u16, u16, u16),
+        slot: usize,
+        now: Instant,
+        cfg: &GlowConfig,
+        geom: Geom,
+    ) -> bool {
+        let credits = self.type_press_ring;
+        self.type_press_ring.retire_before_slot(slot);
+        let retreat = self.spawn(row, from, row, mid, now, cfg, geom, SpawnLane::Visible);
+        let advance = retreat && self.spawn(row, mid, row, to, now, cfg, geom, SpawnLane::Visible);
+        if !advance {
+            self.type_press_ring = credits;
+        }
+        retreat || advance
+    }
+
+    /// What the observed move `(pr, pc) -> (cr, cc)` is to Rainbow Kitty's
+    /// Backspace whose retreat is still owed ([`EraseWitness`], [`EraseHop`]),
+    /// `None` for other styles or with no such erase. Their ordinary hint
+    /// window stays in lockstep with the classic trail. Bytes are processed
+    /// in order: a key typed and erased inside one echo lag (`thes⌫`, `s` unseen
+    /// at the Backspace) still prints before
+    /// the erase's retreat, and the keys typed since wait behind it. So a
+    /// forward hop the presses typed before the erase pay is theirs; past
+    /// them, cells printing the retired keys' glyphs are those keys' late
+    /// echo, paid by no press; and the erases' own retreat is their echo
+    /// however late, never Ink's park while the next key is in flight. A
+    /// hop the keys typed since pay (`abc⌫d` drained as `+2`, then `d`) shows
+    /// the erase past.
+    pub(super) fn erase_hop(
+        &self,
+        (pr, pc): (u16, u16),
+        (cr, cc): (u16, u16),
+        now: Instant,
+        cfg: &GlowConfig,
+    ) -> Option<EraseHop> {
+        if !matches!(cfg.style, GlowStyle::RainbowKitty) {
+            return None;
+        }
+        let erase = self.last_erase.filter(|erase| erase.owed_at(now))?;
+        if cr != pr || cc == pc {
+            return Some(EraseHop::Past);
+        }
+        if cc < pc {
+            return Some(if pc - cc <= erase.owed {
+                EraseHop::Retreat(pc - cc)
+            } else {
+                EraseHop::Past
+            });
+        }
+        let hop = usize::from(cc - pc);
+        let before = self.type_press_ring.cells_where(now, |t| t <= erase.at);
+        if hop <= before {
+            return Some(EraseHop::Ahead);
+        }
+        let late = hop - before;
+        let retired = erase.retired();
+        let spelled = late <= retired.len()
+            && self
+                .row_cur_meta
+                .is_some_and(|m| m.row == pr && m.at == now)
+            && retired[..late].iter().enumerate().all(|(i, &glyph)| {
+                self.row_cur.get(usize::from(cc) - late + i).copied() == Some(glyph)
+            });
+        Some(if spelled {
+            EraseHop::Late(late as u16)
+        } else {
+            EraseHop::Past
+        })
+    }
+
     /// A slipped host frame can coalesce Codex's first wrapped-row `a`
     /// with later keys. Re-lay only that exact glyph before judging the
     /// observed forward hop, which retains its original source and licence.
@@ -881,6 +1030,12 @@ impl CursorGlow {
     /// in-flight unpaid key with its exact glyph, a new PTY print generation,
     /// and that glyph replacing a blank right behind the unchanged caret. The
     /// usual `spawn` licence then spends that one key.
+    ///
+    /// A balanced correction leaves the caret where it was too: the erase and
+    /// the keys typed since, rendered as one repaint
+    /// ([`Self::merged_correction`]), judged first. So does one repainted torn:
+    /// the caret, withheld through the torn frames, comes back to the cell it
+    /// was last shown on, where only a correction is judged.
     pub(super) fn same_caret_typed_echo(
         &mut self,
         cur: Option<(u16, u16)>,
@@ -890,8 +1045,20 @@ impl CursorGlow {
         geom: Geom,
     ) -> bool {
         let Some((row, col)) = cur else { return false };
-        if !matches!(cfg.style, GlowStyle::RainbowKitty) || cursor_move_observed || self.last != cur
+        let reappeared =
+            self.last.is_none() && self.last_visible.is_some_and(|(cell, _)| cur == Some(cell));
+        if !matches!(cfg.style, GlowStyle::RainbowKitty)
+            || cursor_move_observed
+            || (self.last != cur && !reappeared)
         {
+            return false;
+        }
+        if let Some((mid, slot)) = self.judging_on_rows(row, row, |glow| {
+            glow.merged_correction((row, col), (row, col), now)
+        }) {
+            return self.judge_merged_correction(row, (col, mid, col), slot, now, cfg, geom);
+        }
+        if reappeared {
             return false;
         }
         let Some(press_slot) = self.judging_on_rows(row, row, |glow| {
@@ -1616,8 +1783,16 @@ impl CursorGlow {
         }
         if cr == pr {
             // A lifted word is the composer's re-wrap, not Ink's park; no
-            // return follows ([`Self::lifted_word`]).
-            if cc >= pc || self.lifted_word(pr, pc, cr, cc).is_some() {
+            // return follows ([`Self::lifted_word`]). A retreat the
+            // Backspaces still owe is their echo, however late
+            // ([`Self::erase_hop`]).
+            if cc >= pc
+                || self.lifted_word(pr, pc, cr, cc).is_some()
+                || matches!(
+                    self.erase_hop((pr, pc), (cr, cc), now, cfg),
+                    Some(EraseHop::Retreat(_))
+                )
+            {
                 return false;
             }
         } else if pr.abs_diff(cr) != 1
@@ -2320,7 +2495,15 @@ impl CursorGlow {
                 .extend(self.row_prev.iter().take(usize::from(pc) + 1));
             self.park_source_cells.resize(usize::from(pc) + 1, ' ');
         }
-        if !self.seam_licensed(now, cfg) && !self.unpaid_typed_echo(pr, pc, cr, cc, now, cfg, geom)
+        // A Backspace still owed licenses its own retreat and its erased keys'
+        // late echo ([`Self::erase_hop`]).
+        let erase_licensed = matches!(
+            self.erase_hop((pr, pc), (cr, cc), now, cfg),
+            Some(EraseHop::Retreat(_) | EraseHop::Late(_))
+        );
+        if !self.seam_licensed(now, cfg)
+            && !erase_licensed
+            && !self.unpaid_typed_echo(pr, pc, cr, cc, now, cfg, geom)
         {
             if cr == pr && cc > pc {
                 // A refused same-row forward hop is remembered for one delivery
@@ -2539,7 +2722,6 @@ impl CursorGlow {
         self.spawn_lightning(&mv);
         self.spawn_landing_ring(&mv, fire_meteor);
         self.spawn_burst_particles(&mv, fire_meteor);
-        self.spawn_pack_particles(&mv, fire_meteor);
         if self.particles.len() > Self::MAX_PARTICLES {
             let drop = self.particles.len() - Self::MAX_PARTICLES;
             self.particles.drain(0..drop);
@@ -2549,8 +2731,8 @@ impl CursorGlow {
         self.spawns += 1;
         if self.born_geometry_census() == born_before {
             // Licensed and classified, but the style's shape gates minted
-            // nothing (a landing-only re-anchor, a declined zoom, a Trail Pack
-            // with no matching arm). The ring names which dark cause it was.
+            // nothing (a landing-only re-anchor, a declined zoom). The ring
+            // names which dark cause it was.
             self.log_decline(
                 now,
                 (pr, pc),
@@ -2633,6 +2815,13 @@ impl CursorGlow {
         let raw_dist = dr_abs.max(dc_abs) as f32;
         // A same-row forward hop — the one shape a key's echo takes.
         let fwd = cr == pr && cc > pc;
+        // What the move is to a Backspace still owed ([`Self::erase_hop`]): the
+        // late echo of the keys it erased is paid by no press.
+        let erase_hop = self.erase_hop((pr, pc), (cr, cc), now, cfg);
+        let late_erased = match erase_hop {
+            Some(EraseHop::Late(cells)) => usize::from(cells),
+            _ => 0,
+        };
         // A typing wrap (the cursor spilling from the last column to the next
         // row's start because a glyph filled the line) is continued typing, not
         // a jump; otherwise every wrap would fire a meteor across the line.
@@ -2694,7 +2883,10 @@ impl CursorGlow {
         // short arm. The typed classifier is consumed once, after the spend;
         // the quench classifier is peeked (the deletion arm consumes it).
         let typed_pair = typed_at.is_some();
-        let bs_pair = hint_fresh(self.quench_hint, now, Self::QUENCH_HINT_FRESH);
+        // The Backspace's licence: its fresh hint, or the retreat the erases
+        // still owe however late their echo.
+        let owed_retreat = matches!(erase_hop, Some(EraseHop::Retreat(_)));
+        let bs_pair = hint_fresh(self.quench_hint, now, Self::QUENCH_HINT_FRESH) || owed_retreat;
         // A Backspace's echo is a retreat and never explains a same-row forward
         // hop. The fresh quench hint vetoes the typed arms for backward and
         // cross-row shapes, but a forward hop in its window is the survivors'
@@ -2915,10 +3107,12 @@ impl CursorGlow {
             // the key's glyph at the origin ([`Self::soft_wrapped_caret`]);
             // spending the fold's full count would spend presses still to come.
             let credits = self.typed_credits_within(now);
+            // A late erased echo's cells are paid by no press; the rest are the
+            // presses typed before the erase, the oldest.
             let laid = if re_anchor_lays_landing || soft_wrap.is_some() {
                 1
             } else {
-                fold_cells.unwrap_or(dc_abs as usize)
+                fold_cells.unwrap_or(dc_abs as usize - late_erased)
             };
             let cells = laid.min(credits);
             if fold_cells.is_some() {
@@ -2962,9 +3156,31 @@ impl CursorGlow {
         // quench hint is consumed by it anyway: the erase is already in the
         // drained row, and a standing one-shot would license every keyless
         // `+1` until it expired. One hint, one echo, whatever the shape,
-        // including a jump; `typing` gates only the deletion class.
-        let quench_taken =
-            take_hint_fresh(&mut self.quench_hint, now, Self::QUENCH_HINT_FRESH).is_some();
+        // including a jump; `typing` gates only the deletion class. The one
+        // forward hop that leaves it is the late echo of a key the Backspace
+        // erased before that key echoed: the erase's retreat is still to come.
+        // The owed retreat itself spends it, however late.
+        let quench_taken = late_erased == 0
+            && (take_hint_fresh(&mut self.quench_hint, now, Self::QUENCH_HINT_FRESH).is_some()
+                || owed_retreat);
+        if let (Some(hop), Some(erase)) = (erase_hop, &mut self.last_erase) {
+            match hop {
+                EraseHop::Late(cells) => {
+                    erase.retired.copy_within(usize::from(cells).., 0);
+                    erase.retired_n -= cells as u8;
+                }
+                EraseHop::Ahead => {}
+                // Every retired key's late echo precedes any retreat.
+                EraseHop::Retreat(cells) => {
+                    erase.retired_n = 0;
+                    erase.owed -= cells;
+                }
+                EraseHop::Past => {
+                    erase.retired_n = 0;
+                    erase.owed = 0;
+                }
+            }
+        }
         let deletion = typing && quench_taken && !fwd;
         // Navigation classification: a move paired with a fresh nav hint
         // ([`Self::note_navigation`] / [`Self::note_motion`]) is scrubbing, not

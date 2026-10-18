@@ -16,30 +16,30 @@
 //! no WindowServer preflight, and one `aterm ctl chrome` against it drew one,
 //! from this read reached through `read_native_chrome`.
 //!
-//! So the AppKit reader is private, [`reader`] hands it out only to a windowed
-//! launch, and a unit-test build has no AppKit reader at all: the selection
-//! holds by construction.
+//! So the AppKit reader is private, [`reader`] hands it out only for a
+//! [`Windowed`] proof, which only a windowed launch mints, and a unit-test build
+//! has no AppKit reader at all: the selection holds by construction.
 
 use crate::appkit::MainThread;
+use crate::platform::Windowed;
 
 /// What an `App` reads the menu bar with ([`crate::App`]'s `app_menu_bar`).
 pub(crate) type MenuBarReader = fn(MainThread) -> Vec<String>;
 
-/// The reader a launch gets: AppKit's when windowed, [`no_app_menu_bar`] when
-/// headless.
+/// The reader a launch gets: AppKit's with the [`Windowed`] proof the windowed
+/// launch minted, [`no_app_menu_bar`] without one (headless).
 #[cfg(not(test))]
-pub(crate) fn reader(headless: bool) -> MenuBarReader {
-    if headless {
-        no_app_menu_bar
-    } else {
-        read_app_menu_bar
+pub(crate) fn reader(windowed: Option<Windowed>) -> MenuBarReader {
+    match windowed {
+        Some(_) => read_app_menu_bar,
+        None => no_app_menu_bar,
     }
 }
 
-/// A unit-test build reads no AppKit menu bar, whatever it asks for: every
+/// A unit-test build reads no AppKit menu bar, whatever it is handed: every
 /// `App` it builds answers `menu (none)`.
 #[cfg(test)]
-pub(crate) fn reader(_headless: bool) -> MenuBarReader {
+pub(crate) fn reader(_windowed: Option<Windowed>) -> MenuBarReader {
     no_app_menu_bar
 }
 
@@ -83,6 +83,11 @@ fn read_app_menu_bar(mtm: MainThread) -> Vec<String> {
 
     use crate::appkit;
 
+    // `reader` hands this function out only with the proof; holding it here as
+    // well keeps the `+sharedApplication` below beside its own answer.
+    let Some(_windowed) = Windowed::get() else {
+        return vec!["menu (none)".to_string()];
+    };
     let mut out: Vec<String> = Vec::new();
     // Every object read here is borrowed (+0) for this pool; only `String`s
     // escape it (`read_native_chrome`'s reason for its own pool, unchanged).
@@ -134,8 +139,7 @@ fn read_app_menu_bar(mtm: MainThread) -> Vec<String> {
                     // exactly as the model serialiser prints it
                     // (`menu::menu_chrome_lines`): `<label> ▸` in this line,
                     // then the submenu as its own `menu "<parent> ▸ <label>"`
-                    // line right after — byte-matched by
-                    // `chrome_lines_render_titled_sections`' golden off macOS.
+                    // line right after.
                     let mut names: Vec<String> = Vec::with_capacity(kn);
                     let mut nested: Vec<String> = Vec::new();
                     for j in 0..kn {

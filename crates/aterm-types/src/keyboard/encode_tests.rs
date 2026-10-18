@@ -660,7 +660,7 @@ fn kitty_flags_suppress_modify_other_keys() {
     let mok_only = KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL2;
     assert_eq!(
         encode_key(&Key::Character('a'), Modifiers::SHIFT, mok_only),
-        b"\x1b[27;2;97~"
+        b"\x1b[27;2;65~"
     );
 }
 
@@ -1710,12 +1710,165 @@ fn win32_escape_records_outrank_kitty_and_modify_other_keys() {
 }
 
 #[test]
+fn win32_ctrl_h_is_a_record_of_the_h_key() {
+    // The regression: conhost decodes a bare BS as Ctrl+Backspace (`ReadKey`:
+    // `Backspace MODS=Control CHAR=0x7F`), so Ctrl+H at a PowerShell prompt ran
+    // PSReadLine's BackwardKillWord and cmd.exe deleted a word, where readline's
+    // C-h deletes one character. The H key's record arrives as
+    // `H MODS=Control CHAR=0x08` (measured 2026-10-16, conhost 10.0.26200):
+    // BackwardDeleteChar in PSReadLine 2.4.5 and 2.0.0, Windows and Emacs modes,
+    // and one character in cmd.exe and Git Bash.
+    let h = Key::Character('h');
+    let ctrl = Modifiers::CTRL;
+    let rec = |key: &Key, mods: Modifiers, base: Option<char>| {
+        encode_key_with_layout(key, mods, WIN32, KeyEventType::Press, base)
+    };
+    // VK_H (0x48), scan 0x23, char BS, LEFT_CTRL_PRESSED: the bytes measured.
+    assert_eq!(
+        rec(&h, ctrl, Some('h')),
+        b"\x1b[72;35;8;1;8;1_\x1b[72;35;8;0;8;1_"
+    );
+    // A controller's `key ctrl+h` names no physical key: the letter's own.
+    assert_eq!(rec(&h, ctrl, None), win32_pair(72, 35, 8, 0x08));
+    // Ctrl+Shift+H is the same record, Shift left out, as BS carries none. With
+    // SHIFT_PRESSED (`ESC[72;35;8;1;24;1_…`, Windows Terminal's record) it
+    // reached `ReadKey` as `H MODS=Shift+Control CHAR=0x08`, a chord PSReadLine
+    // 2.4.5 and 2.0.0 bind in neither mode, so they inserted a literal BS
+    // (measured 2026-10-16), where the legacy BS had deleted a word (Windows
+    // mode) or one character (Emacs mode).
+    assert_eq!(
+        rec(&h, ctrl | Modifiers::SHIFT, Some('h')),
+        b"\x1b[72;35;8;1;8;1_\x1b[72;35;8;0;8;1_"
+    );
+    // A controller's `key ctrl+H` (the shifted glyph, no physical key), and
+    // Caps Lock's H on the H key: the same record.
+    assert_eq!(
+        rec(&Key::Character('H'), ctrl, None),
+        win32_pair(72, 35, 8, 0x08)
+    );
+    assert_eq!(
+        rec(&Key::Character('H'), ctrl | Modifiers::CAPS_LOCK, Some('h')),
+        win32_pair(72, 35, 8, 0x08)
+    );
+    assert_eq!(
+        rec(&Key::Character('H'), ctrl | Modifiers::SHIFT, None),
+        win32_pair(72, 35, 8, 0x08)
+    );
+    // Lock state is not a chord modifier.
+    assert_eq!(
+        rec(
+            &h,
+            ctrl | Modifiers::CAPS_LOCK | Modifiers::NUM_LOCK,
+            Some('h')
+        ),
+        win32_pair(72, 35, 8, 0x08)
+    );
+    // Russian Ctrl+р on the H key writes the US letter's BS (the Ctrl twin),
+    // so conhost misread it the same way: the same record.
+    assert_eq!(
+        rec(&Key::Character('р'), ctrl, Some('h')),
+        win32_pair(72, 35, 8, 0x08)
+    );
+    // Dvorak's h sits on the US J key: the scan code is that key's (0x24), the
+    // VK the letter's, as a Windows Dvorak layout reports it.
+    assert_eq!(rec(&h, ctrl, Some('j')), win32_pair(72, 36, 8, 0x08));
+    // The pair carries its own key-up: the Release adds nothing, a Repeat is
+    // another pair.
+    assert!(encode_key_with_event(&h, ctrl, WIN32, KeyEventType::Release).is_empty());
+    assert_eq!(
+        encode_key_with_event(&h, ctrl, WIN32, KeyEventType::Repeat),
+        win32_pair(72, 35, 8, 0x08)
+    );
+    // What stays: Ctrl+Backspace keeps BS, the Windows word delete conhost
+    // reads it as; Ctrl+C keeps ETX; Alt+Ctrl+H keeps `ESC BS`, the bytes of
+    // Ctrl+Alt+Backspace, which conhost reads it as (readline's M-C-h).
+    assert_eq!(
+        encode_key(&Key::Named(NamedKey::Backspace), ctrl, WIN32),
+        b"\x08"
+    );
+    assert_eq!(encode_key(&Key::Character('c'), ctrl, WIN32), b"\x03");
+    assert_eq!(encode_key(&h, ctrl | Modifiers::ALT, WIN32), b"\x1b\x08");
+    // The record is the H key's, not every lone BS: a BS character (no letter,
+    // so no H key to name) keeps its byte.
+    assert_eq!(encode_key(&Key::Character('\u{8}'), ctrl, WIN32), b"\x08");
+    // With altSendsEscape reset Alt+Ctrl+H is Ctrl+H's lone BS, so it is
+    // Ctrl+H's record: no ESC prefix, no ALT bit.
+    assert_eq!(
+        encode_key(&h, ctrl | Modifiers::ALT, WIN32 | KeyboardMode::ALT_NO_ESC),
+        win32_pair(72, 35, 8, 0x08)
+    );
+    // Without 9001 (Unix, and a conhost that never asked) every one is its
+    // legacy byte.
+    let legacy = KeyboardMode::empty();
+    assert_eq!(encode_key(&h, ctrl, legacy), b"\x08");
+    assert_eq!(encode_key(&h, ctrl | Modifiers::SHIFT, legacy), b"\x08");
+    assert_eq!(encode_key(&Key::Character('H'), ctrl, legacy), b"\x08");
+    assert_eq!(
+        encode_key_with_layout(
+            &Key::Character('р'),
+            ctrl,
+            legacy,
+            KeyEventType::Press,
+            Some('h')
+        ),
+        b"\x08"
+    );
+}
+
+#[test]
+fn win32_ctrl_h_record_outranks_kitty_and_modify_other_keys() {
+    // conhost drops the protocol spellings of a Ctrl chord (measured
+    // 2026-09-27: `CSI 99;5 u`, kitty's Ctrl+c, reached `ReadKey` as nothing),
+    // so under 9001 Ctrl+H's record goes first, as the other records do.
+    let h = Key::Character('h');
+    for mode in [
+        KeyboardMode::DISAMBIGUATE_ESC_CODES,
+        KeyboardMode::REPORT_ALL_KEYS_AS_ESC,
+        KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL1,
+        KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL2,
+        KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL2 | KeyboardMode::XTERM_FORMAT_OTHER_KEYS,
+    ] {
+        assert_eq!(
+            encode_key(&h, Modifiers::CTRL, WIN32 | mode),
+            win32_pair(72, 35, 8, 0x08),
+            "{mode:?}"
+        );
+    }
+    // A release stays silent where kitty would have reported one.
+    let events = WIN32 | KeyboardMode::REPORT_EVENT_TYPES | KeyboardMode::DISAMBIGUATE_ESC_CODES;
+    assert!(encode_key_with_event(&h, Modifiers::CTRL, events, KeyEventType::Release).is_empty());
+    // Without 9001 the protocols answer exactly as before.
+    assert_eq!(
+        encode_key(&h, Modifiers::CTRL, KeyboardMode::DISAMBIGUATE_ESC_CODES),
+        b"\x1b[104;5u"
+    );
+    assert_eq!(
+        encode_key(
+            &h,
+            Modifiers::CTRL,
+            KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL2
+        ),
+        b"\x1b[27;5;104~"
+    );
+    assert_eq!(
+        encode_key(
+            &h,
+            Modifiers::CTRL,
+            KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL1
+        ),
+        b"\x08"
+    );
+}
+
+#[test]
 fn win32_changes_only_the_held_forms_across_the_whole_ascii_keyboard() {
     // The sweep behind the rule: for every printable character key and every
     // named key, under every Shift/Ctrl/Alt combination, 9001 either leaves
     // the legacy bytes alone or — exactly when conhost would hold them —
-    // replaces them with ONE well-formed down/up record pair. (Enter chords
-    // are their own family, pinned above.)
+    // replaces them with ONE well-formed down/up record pair. The one other
+    // change is Ctrl(+Shift)+h, whose BS conhost reads as Ctrl+Backspace: it
+    // becomes the H key's Ctrl record, Shift or not, and no other key does.
+    // (Enter chords are their own family, pinned above.)
     let mods_list = [
         Modifiers::empty(),
         Modifiers::SHIFT,
@@ -1745,10 +1898,22 @@ fn win32_changes_only_the_held_forms_across_the_whole_ascii_keyboard() {
         .map(Key::Named),
     );
     let mut routed = 0;
+    let mut ctrl_h = 0;
     for key in &keys {
         for mods in mods_list {
             let legacy = encode_key(key, mods, KeyboardMode::empty());
             let win = encode_key(key, mods, WIN32);
+            // Ctrl+h, Ctrl+H, Ctrl+Shift+h and Ctrl+Shift+H, named here from the
+            // keys rather than from the encoder's own predicate.
+            if matches!(key, Key::Character('h' | 'H'))
+                && mods.contains(Modifiers::CTRL)
+                && !mods.contains(Modifiers::ALT)
+            {
+                ctrl_h += 1;
+                assert_eq!(legacy, b"\x08", "{key:?}+{mods:?}: legacy BS");
+                assert_eq!(win, win32_pair(72, 35, 8, 0x08), "{key:?}+{mods:?}");
+                continue;
+            }
             if !conhost_holds_once_switched(&legacy) {
                 assert_eq!(win, legacy, "{key:?}+{mods:?} must keep its bytes");
                 continue;
@@ -1783,6 +1948,8 @@ fn win32_changes_only_the_held_forms_across_the_whole_ascii_keyboard() {
     // Escape ×8, Backspace+Alt ×2, and the character chords that dangle —
     // non-zero is the non-vacuity check; the exact count is not the contract.
     assert!(routed > 20, "only {routed} keys were routed");
+    // The carve-out is exactly the four Ctrl+H chords, each of them reached.
+    assert_eq!(ctrl_h, 4, "Ctrl(+Shift)+h/H");
 }
 
 #[test]

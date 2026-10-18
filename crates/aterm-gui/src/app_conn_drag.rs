@@ -410,12 +410,12 @@ impl App {
     /// Rasterize the drag WIRE (§3.2) into this window's paint-only
     /// `conn_wire_card`: an accent line from the pressed tab's connector cell
     /// to the cursor, with a plug dot at each end. Composited with priority
-    /// over the bubble/badge cards, under a modal `settings_card`
+    /// over the badge card, under a modal `settings_card`
     /// (which cannot be open mid-drag). No-op ⇒ `conn_wire_card = None`
     /// whenever [`Self::conn_wire_fingerprint`] is `0` — no drag here, armed
     /// only, native origin, or the cursor has left the source window (beyond
     /// it the pushed highlights + the OS cursor carry the signal). Mirrors
-    /// `splice_robi_bubble`'s rasterize/composite shape.
+    /// `splice_build_badge`'s rasterize/composite shape.
     pub(crate) fn splice_conn_wire(&mut self, wid: WindowId) {
         let fp = self.conn_wire_fingerprint(wid);
         if fp == 0 {
@@ -495,8 +495,8 @@ impl App {
                 color,
             },
         ];
-        // Crop the raster to the wire's bounds (plus the dot/AA margin), like
-        // Robi's bubble card — never a full-frame, mostly-transparent buffer.
+        // Crop the raster to the wire's bounds (plus the dot/AA margin) —
+        // never a full-frame, mostly-transparent buffer.
         const PAINT_MARGIN: f32 = 5.0;
         let tray_w = (cols * cw) as f32;
         let tray_h = ((rows + strip) * ch) as f32;

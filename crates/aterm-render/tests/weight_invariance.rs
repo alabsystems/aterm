@@ -27,8 +27,8 @@
 //! `*` / `/` / `pow`). Per the repo's box-drawing-rounding precedent, the
 //! machine check for such an arithmetic law is an exhaustive/dense lattice test
 //! under plain `targo --unverified test`. The BOOLEAN gate that turns the remap on (`Linear`
-//! vs `LinearCorrected`, endpoint exactness) is the part carried by `ty`
-//! (`text_blend_gate_model`); this file carries the SCALING invariant.
+//! vs `LinearCorrected`, endpoint exactness) is `tests/text_blending.rs`'s; this
+//! file carries the SCALING invariant.
 
 use aterm_render::blend_text;
 
@@ -104,39 +104,4 @@ fn corrected_perceived_weight_is_polarity_invariant() {
     }
     assert!(mid_weight_seen, "non-vacuity control never fired");
     assert!(checked >= 1000, "lattice must be dense ({checked})");
-}
-
-/// NEGATIVE CONTROL — the pre-W2 defect. The UNCORRECTED linear-light pipeline
-/// (`corrected = false`) is polarity-ASYMMETRIC at mid coverage: the identical
-/// 50% texel reads far bolder on dark than on light. Reproduce that gap, then
-/// show the corrected pipeline collapses it — so the test genuinely discriminates
-/// the fix from the bug.
-#[test]
-fn uncorrected_pipeline_is_polarity_asymmetric() {
-    let (lo, hi) = (0u32, 255u32);
-    let t = 128u8;
-
-    // Uncorrected: physical linear-light midpoint re-encodes to ~sRGB 188 in
-    // both polarities, so the perceived weights sit on opposite sides of 0.5.
-    let dark_lin = chan(blend_text(gray(lo), gray(hi), gray(lo), t, false));
-    let light_lin = chan(blend_text(gray(hi), gray(lo), gray(hi), t, false));
-    let gap_lin = (perceived_weight(dark_lin, lo, hi) - perceived_weight(light_lin, hi, lo)).abs();
-    assert!(
-        gap_lin > 0.30,
-        "the pre-fix defect must be reproduced: uncorrected polarity gap {gap_lin:.4} \
-         should be large (dark={dark_lin} light={light_lin})"
-    );
-
-    // Corrected: the same swap is invariant — the gap all but vanishes.
-    let dark_c = chan(blend_text(gray(lo), gray(hi), gray(lo), t, true));
-    let light_c = chan(blend_text(gray(hi), gray(lo), gray(hi), t, true));
-    let gap_c = (perceived_weight(dark_c, lo, hi) - perceived_weight(light_c, hi, lo)).abs();
-    assert!(
-        gap_c < 0.02,
-        "corrected polarity gap {gap_c:.4} must be near zero (dark={dark_c} light={light_c})"
-    );
-    assert!(
-        gap_c < gap_lin,
-        "the correction must strictly reduce the polarity gap ({gap_c:.4} vs {gap_lin:.4})"
-    );
 }

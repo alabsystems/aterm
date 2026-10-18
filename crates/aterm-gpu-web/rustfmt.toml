@@ -3,14 +3,8 @@
 #
 # THIS CRATE IS NOT AT THE WORKSPACE EDITION, and `rustfmt` learns a file's
 # edition from the nearest `rustfmt.toml` — never from `Cargo.toml`. Without
-# this file every spelling of the formatter EXCEPT `verify fmt` (which reads
-# the manifest: crates/aterm-verify/src/fmt.rs `Editions`) formats these
-# sources at the workspace's 2024: `trustfmt <path>` by hand, format-on-save,
-# rust-analyzer, and `targo-fmt -- <paths>`. That invents drift `verify fmt`
-# does not see and, for a file using `gen` as an identifier, does not parse at
-# all — so the file's real drift is never reported either.
-#
-# `verify fmt` compares the two resolutions for every tracked file and fails if
-# they disagree, so this file cannot silently go missing or go stale against
-# the manifest beside it.
+# this file `trustfmt <path>` by hand, `targo-fmt -- <paths>`, format-on-save
+# and rust-analyzer format these sources at the workspace's 2024, which invents
+# drift and, for a file using `gen` as an identifier, does not parse at all.
+# Keep it equal to the manifest's edition.
 edition = "2021"

@@ -9,7 +9,8 @@ use crate::{
     CaptureAfterPresentDecision, NATIVE_CAPTURE_PRESENT_ATTEMPT_LIMIT,
     capture_after_present_decision, run_capture_present_barrier,
 };
-use aterm_spec::derive::{Model, capture_after_present_model};
+use aterm_models_misc::capture_after_present_model;
+use aterm_spec::derive::Model;
 use aterm_spec::interp::{State, admits};
 
 fn bit(value: bool) -> i64 {

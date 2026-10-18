@@ -3,8 +3,8 @@
 
 //! Tier-1 conformance: the shipping [`TurnTracker`] (over a real [`Log`])
 //! against the derived `TurnTracker` model
-//! (`aterm_spec::derive::turn_tracker_model`, checked at Tier-0 in
-//! `aterm-spec/tests/derived_ring_ty.rs`).
+//! (`aterm_models_session::turn_tracker_model`, checked at Tier-0 in
+//! `aterm-models/tests/derived_ring_ty.rs`).
 //!
 //! Seeded random host schedules, and the hand-written replays of
 //! `turn_replays.rs`, drive the real tracker the way the host does: one call
@@ -23,11 +23,12 @@
 //! wake that closes, a turn closed on `unknown`, and a projection that
 //! forgets a step's parent are each rejected.
 
+use aterm_models_session::turn_tracker_model;
 use aterm_slog::{
     Actor, BoxWord, Cursor, LastClose, Log, Lvl, Node, Op, Rec, ScreenStep, SettleCause, Stamp,
     TurnTracker, Verdict, WallKind,
 };
-use aterm_spec::derive::{Model, turn_tracker_model};
+use aterm_spec::derive::Model;
 use aterm_spec::interp::{State, with_buggy};
 use aterm_spec::rng::XorShift;
 use aterm_spec::verify;

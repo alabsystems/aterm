@@ -1,0 +1,20 @@
+# claude-code 2.1.301 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the Settings Error dialog Claude Code draws at launch over a project `.claude/settings.json` its validator rejects (`{"permissions":{"allow":"not-an-array"}}`), the folder trusted beforehand (LAB_TRUST=1), a lease held so the harness pressed nothing: numbered `Fix with Claude` / `Exit and fix manually` / `Continue without these settings` (that last goes on for this session without the skipped file and saves nothing; Esc exits, 2.1.301 bundle), cursor on the first · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Settings Error
+
+  /private/tmp/at.lab0/proj/.claude/settings.json
+  └ permissions.allow: Expected array, but received string
+
+  Permission rules must be in an array. Format: ["Tool(specifier)"]. Examples: ["Bash(npm run build)", "Edit(docs/**)", "Read(~/.zshrc)"]. Use
+  * for wildcards.
+  Learn more: https://code.claude.com/docs/en/iam#configuring-permissions
+
+
+  Files with errors are skipped entirely, not just the invalid settings.
+
+  ❯ 1. Fix with Claude
+    2. Exit and fix manually
+    3. Continue without these settings
+
+  Enter to confirm · Esc to cancel

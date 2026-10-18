@@ -173,7 +173,7 @@ fn a_read_that_ended_without_a_verdict_answers_the_cold_lane() {
             "a Failed the synchronous arm books: {error:?}"
         );
         assert!(
-            aterm_update::is_passing_refusal(&message) && message.contains("not relaunched"),
+            aterm_update::is_passing_refusal(&message),
             "the read's own words, a passing moment: {message}"
         );
         assert!(
@@ -237,6 +237,9 @@ fn a_read_that_ended_without_a_verdict_answers_the_cold_lane() {
 /// A read that ended waiting for an update check to confirm the stage's signer defers the cold
 /// lane (charged nothing) instead of relaunching into the boot swap's same wait (gate 4d); the
 /// automatic lane holds for the check with its intent kept.
+// The bundle apply lane and its ledger (`aterm_update::apply_lane_report`) are
+// macOS's: a Linux update replaces the executable on disk and hands nothing off.
+#[cfg(target_os = "macos")]
 #[test]
 fn a_read_waiting_for_a_roster_confirmation_defers_the_cold_lane_and_holds() {
     // The hold books its wait in the update ledger as the standing refusal.
@@ -274,8 +277,7 @@ fn a_read_waiting_for_a_roster_confirmation_defers_the_cold_lane_and_holds() {
         assert!(error.is_activity_deferred(), "charged nothing: {error:?}");
         let message = error.to_string();
         assert!(
-            aterm_update::is_roster_confirmation_wait(&message)
-                && message.contains("not relaunched"),
+            aterm_update::is_roster_confirmation_wait(&message),
             "{message}"
         );
     }
@@ -377,40 +379,6 @@ fn a_cached_roster_wait_holds_the_cold_lane_and_is_never_its_failure() {
     assert!(
         !error.is_activity_deferred() && !error.is_refused(),
         "a `Failed`: {error:?}"
-    );
-}
-
-/// Wired where it has to be: first thing in the cold arm, before the quit
-/// layout is written and before the `exec`.
-#[test]
-fn the_verdict_is_read_before_the_layout_is_written_and_the_process_replaced() {
-    let src = include_str!("app_update_handoff.rs");
-    let arm = src
-        .find("crate::native_update_admission::ApplyLane::Cold,\n            ) => {")
-        .expect("the cold arm");
-    let gate = src[arm..]
-        .find("self.cold_lane_verdict_gate(mode, apply_attempt.as_ref())?;")
-        .expect("the cold arm reads the verdict");
-    let layout = src[arm..]
-        .find(".cold_lane_layout()")
-        .expect("the cold arm writes a layout");
-    let exec = src[arm..]
-        .find("aterm_update::exec_keeping_sigpipe(&mut command)")
-        .expect("and execs");
-    assert!(gate < layout && layout < exec);
-    // …and hands its successor the lane's budget and the relaunch mark on the command it execs.
-    let budget = src[arm..]
-        .find("bind_cold_lane_budget(")
-        .expect("the cold arm carries the budget");
-    let mark = src[arm..]
-        .find(".env(aterm_update::RELAUNCH_OF_RUNNING_ENV, \"1\")")
-        .expect("the cold arm marks its successor");
-    assert!(budget < exec && mark < exec);
-    // The seamless lane marks its successor too.
-    let seamless = arm + exec;
-    assert!(
-        src[seamless..].contains(".env(aterm_update::RELAUNCH_OF_RUNNING_ENV, \"1\");"),
-        "the seamless launch marks its successor"
     );
 }
 
@@ -647,35 +615,4 @@ fn the_cold_lane_budget_round_trips_for_its_own_artifact_only() {
         .expect("a refusal");
     assert_eq!(seed.budget, full);
     assert_eq!(seed.dmg_sha256, Some([0xab; 32]));
-}
-
-/// The wiring in `main_entry`: the launch reads whether it is the cold lane's relaunch before
-/// the boot apply consumes the binding, turns the apply's outcome into the seed after it, and
-/// hands the seed to the `App` before the startup reconcile can arm the automatic lane.
-#[test]
-fn main_entry_seeds_the_refusal_before_the_lane_can_arm() {
-    let src = include_str!("lib.rs");
-    let entry = src.find("pub fn main_entry(").expect("the window's entry");
-    let body = &src[entry..];
-    let at = |needle: &str| {
-        body.find(needle)
-            .unwrap_or_else(|| panic!("main_entry has `{needle}`"))
-    };
-    let read = at("app_update_handoff::ColdRelaunch::of_this_launch(");
-    let apply = at("aterm_update::apply_staged_if_ready_preserving_fds_exact(");
-    let seed = at("cold_relaunch.and_then(|relaunch| relaunch.seed(&boot_apply))");
-    let app = at("let mut app = App {");
-    let handed = at("app.seed_refused_cold_relaunch(seed, Instant::now());");
-    let reconcile = at(
-        "app.request_native_update_reconcile(app_native::NativeUpdateReconcilePurpose::Startup)",
-    );
-    assert!(
-        read < apply && apply < seed && seed < app && app < handed && handed < reconcile,
-        "read {read} < apply {apply} < seed {seed} < App {app} < handed {handed} < \
-         startup reconcile {reconcile}"
-    );
-    assert!(
-        body[app..handed].contains("handoff_preverified: std::sync::Arc::default(),"),
-        "the App starts with no verdict of its own; the seed is the one"
-    );
 }

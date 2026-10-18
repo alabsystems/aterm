@@ -328,7 +328,9 @@ fn an_index_hook_is_a_hazard() {
 #[test]
 fn a_clean_repository_loads_nothing_that_runs() {
     let r = repo("clean");
-    let v = isolated().view(r.0.path(), &|_| false).expect("git config");
+    let v = isolated()
+        .raw_git_view(r.0.path(), &|_| false)
+        .expect("git config");
     assert!(
         v.config
             .iter()
@@ -339,7 +341,7 @@ fn a_clean_repository_loads_nothing_that_runs() {
     // Outside any repository: nothing either.
     let plain = Scratch::new("plain");
     let v = isolated()
-        .view(plain.0.path(), &|_| false)
+        .raw_git_view(plain.0.path(), &|_| false)
         .expect("git config");
     assert_eq!(v.index_hook, None);
     assert_eq!(hazard(&v, &reads_in(plain.0.path())), None, "{v:?}");
@@ -364,13 +366,21 @@ fn each_dangerous_key_in_the_repository_is_seen() {
             r.0.path(),
             &["config", key, "touch /tmp/aterm-git-config-pwn"],
         );
-        let v = isolated().view(r.0.path(), &|_| false).expect("git config");
+        let v = isolated()
+            .raw_git_view(r.0.path(), &|_| false)
+            .expect("git config");
         let why = hazard(&v, &reads_in(r.0.path())).unwrap_or_else(|| panic!("{key}: {v:?}"));
         assert!(why.contains(key), "{why}");
         // A subdirectory of the worktree sees the same configuration.
         let sub = r.0.path().join("sub");
         std::fs::create_dir_all(&sub).unwrap();
-        assert!(hazard(&isolated().view(&sub, &|_| false).unwrap(), &reads_in(&sub)).is_some());
+        assert!(
+            hazard(
+                &isolated().raw_git_view(&sub, &|_| false).unwrap(),
+                &reads_in(&sub)
+            )
+            .is_some()
+        );
     }
 }
 
@@ -385,7 +395,7 @@ fn an_included_file_and_the_global_config_are_seen() {
         &["config", "include.path", inc.to_str().unwrap()],
     );
     let why = hazard(
-        &isolated().view(r.0.path(), &|_| false).unwrap(),
+        &isolated().raw_git_view(r.0.path(), &|_| false).unwrap(),
         &reads_in(r.0.path()),
     )
     .expect("included");
@@ -397,7 +407,7 @@ fn an_included_file_and_the_global_config_are_seen() {
     std::fs::write(&global, "[diff]\n\texternal = /tmp/evil\n").unwrap();
     let probe = WorkerEnv::hermetic(Some(&global));
     let why = hazard(
-        &probe.view(clean.0.path(), &|_| false).unwrap(),
+        &probe.raw_git_view(clean.0.path(), &|_| false).unwrap(),
         &reads_in(clean.0.path()),
     )
     .expect("global");
@@ -417,11 +427,14 @@ fn an_executable_post_index_change_hook_is_seen() {
     // Not executable: git would not run it.
     std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o644)).unwrap();
     assert_eq!(
-        isolated().view(r.0.path(), &|_| false).unwrap().index_hook,
+        isolated()
+            .raw_git_view(r.0.path(), &|_| false)
+            .unwrap()
+            .index_hook,
         None
     );
     std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let v = isolated().view(r.0.path(), &|_| false).unwrap();
+    let v = isolated().raw_git_view(r.0.path(), &|_| false).unwrap();
     assert!(hazard(&v, &reads_in(r.0.path())).is_some_and(|w| w.contains("post-index-change")));
     // core.hooksPath moves it.
     let r = repo("hookspath");
@@ -432,7 +445,7 @@ fn an_executable_post_index_change_hook_is_seen() {
     git(r.0.path(), &["config", "core.hooksPath", "h"]);
     assert!(
         isolated()
-            .view(r.0.path(), &|_| false)
+            .raw_git_view(r.0.path(), &|_| false)
             .unwrap()
             .index_hook
             .is_some()
@@ -446,7 +459,7 @@ fn a_directory_that_does_not_exist_is_read_at_its_nearest_ancestor() {
     let missing = r.0.path().join("not/yet");
     assert!(
         hazard(
-            &isolated().view(&missing, &|_| false).unwrap(),
+            &isolated().raw_git_view(&missing, &|_| false).unwrap(),
             &reads_in(&missing)
         )
         .is_some()
@@ -499,7 +512,7 @@ fn a_submodules_own_config_is_seen() {
     let sup = repo("super");
     add_submodule(sup.0.path(), from.0.path(), "sub");
     let v = isolated()
-        .view(sup.0.path(), &|_| false)
+        .raw_git_view(sup.0.path(), &|_| false)
         .expect("git config");
     assert_eq!(v.submodules.len(), 1, "{v:?}");
     assert_eq!(hazard(&v, &reads_in(sup.0.path())), None, "clean: {v:?}");
@@ -515,7 +528,7 @@ fn a_submodules_own_config_is_seen() {
     );
     // The superproject's own config is clean.
     let own = isolated()
-        .view(sup.0.path(), &|_| false)
+        .raw_git_view(sup.0.path(), &|_| false)
         .expect("git config");
     assert!(
         !own.config.iter().any(|(_, k, _)| k == "core.fsmonitor"),
@@ -558,7 +571,7 @@ fn a_submodules_own_config_is_seen() {
     );
     assert_eq!(
         hazard(
-            &isolated().view(top.0.path(), &|_| false).unwrap(),
+            &isolated().raw_git_view(top.0.path(), &|_| false).unwrap(),
             &reads_in(top.0.path())
         ),
         None
@@ -568,7 +581,7 @@ fn a_submodules_own_config_is_seen() {
         &["config", "diff.external", "/tmp/evil"],
     );
     let why = hazard(
-        &isolated().view(top.0.path(), &|_| false).unwrap(),
+        &isolated().raw_git_view(top.0.path(), &|_| false).unwrap(),
         &reads_in(top.0.path()),
     )
     .expect("nested");
@@ -589,7 +602,9 @@ fn a_filter_driver_counts_only_where_the_attributes_select_it() {
     )
     .unwrap();
     let probe = WorkerEnv::hermetic(Some(&global));
-    let v = probe.view(r.0.path(), &|_| false).expect("git config");
+    let v = probe
+        .raw_git_view(r.0.path(), &|_| false)
+        .expect("git config");
     assert_eq!(v.filters_selected, Some(Vec::new()), "{v:?}");
     assert_eq!(
         hazard(&v, &reads_in(r.0.path())),
@@ -598,7 +613,9 @@ fn a_filter_driver_counts_only_where_the_attributes_select_it() {
     );
 
     std::fs::write(r.0.path().join(".gitattributes"), "*.bin filter=lfs\n").unwrap();
-    let v = probe.view(r.0.path(), &|_| false).expect("git config");
+    let v = probe
+        .raw_git_view(r.0.path(), &|_| false)
+        .expect("git config");
     assert_eq!(v.filters_selected, Some(vec!["lfs".to_string()]), "{v:?}");
     let why = hazard(&v, &reads_in(r.0.path())).expect("selected");
     assert!(why.contains("filter.lfs."), "{why}");
@@ -619,7 +636,9 @@ fn a_filter_driver_counts_only_where_the_attributes_select_it() {
     );
     assert_eq!(
         hazard(
-            &isolated().view(only_other.0.path(), &|_| false).unwrap(),
+            &isolated()
+                .raw_git_view(only_other.0.path(), &|_| false)
+                .unwrap(),
             &reads_in(only_other.0.path())
         ),
         None
@@ -630,7 +649,9 @@ fn a_filter_driver_counts_only_where_the_attributes_select_it() {
     );
     assert!(
         hazard(
-            &isolated().view(only_other.0.path(), &|_| false).unwrap(),
+            &isolated()
+                .raw_git_view(only_other.0.path(), &|_| false)
+                .unwrap(),
             &reads_in(only_other.0.path())
         )
         .is_some_and(|w| w.contains("filter.other.clean"))
@@ -656,7 +677,9 @@ fn the_check_never_runs_the_fsmonitor_it_finds() {
     );
     // A configured filter too, so the attribute read would be wanted.
     git(r.0.path(), &["config", "filter.x.clean", "cat"]);
-    let v = isolated().view(r.0.path(), &|_| false).expect("git config");
+    let v = isolated()
+        .raw_git_view(r.0.path(), &|_| false)
+        .expect("git config");
     assert!(hazard(&v, &reads_in(r.0.path())).is_some_and(|w| w.contains("core.fsmonitor")));
     assert!(
         !ran.exists(),
@@ -680,7 +703,7 @@ fn the_workers_git_config_variables_are_seen() {
     let r = repo("worker-env");
     assert_eq!(
         hazard(
-            &isolated().view(r.0.path(), &|_| false).unwrap(),
+            &isolated().raw_git_view(r.0.path(), &|_| false).unwrap(),
             &reads_in(r.0.path())
         ),
         None
@@ -690,7 +713,7 @@ fn the_workers_git_config_variables_are_seen() {
         .with("GIT_CONFIG_KEY_0=core.fsmonitor")
         .with("GIT_CONFIG_COUNT=1");
     let why = hazard(
-        &worker.view(r.0.path(), &|_| false).unwrap(),
+        &worker.raw_git_view(r.0.path(), &|_| false).unwrap(),
         &reads_in(r.0.path()),
     )
     .expect("the worker's fsmonitor");
@@ -707,7 +730,7 @@ fn the_workers_external_diff_is_a_hazard() {
     let r = repo("ext-diff");
     let worker = isolated().with("GIT_EXTERNAL_DIFF=/tmp/evil");
     let why = hazard(
-        &worker.view(r.0.path(), &|_| false).unwrap(),
+        &worker.raw_git_view(r.0.path(), &|_| false).unwrap(),
         &reads_in(r.0.path()),
     )
     .expect("a hazard");
@@ -715,7 +738,7 @@ fn the_workers_external_diff_is_a_hazard() {
     let worker = isolated().with("GIT_EXTERNAL_DIFF=");
     assert_eq!(
         hazard(
-            &worker.view(r.0.path(), &|_| false).unwrap(),
+            &worker.raw_git_view(r.0.path(), &|_| false).unwrap(),
             &reads_in(r.0.path())
         ),
         None
@@ -748,7 +771,7 @@ fn what_only_git_config_reads_does_not_hide_the_effective_config() {
         .with(&format!("GIT_TRACE={}", trace.display()));
     assert!(
         hazard(
-            &worker.view(r.0.path(), &|_| false).unwrap(),
+            &worker.raw_git_view(r.0.path(), &|_| false).unwrap(),
             &reads_in(r.0.path())
         )
         .is_some_and(|w| w.contains("core.fsmonitor"))
@@ -784,14 +807,17 @@ fn the_git_on_the_workers_path_is_the_one_read() {
         std::env::var("PATH").unwrap_or_default()
     );
     let why = hazard(
-        &isolated().with(&path).view(r.0.path(), &|_| false).unwrap(),
+        &isolated()
+            .with(&path)
+            .raw_git_view(r.0.path(), &|_| false)
+            .unwrap(),
         &reads_in(r.0.path()),
     )
     .expect("the worker's git");
     assert!(why.contains("core.fsmonitor"), "{why}");
     assert_eq!(
         hazard(
-            &isolated().view(r.0.path(), &|_| false).unwrap(),
+            &isolated().raw_git_view(r.0.path(), &|_| false).unwrap(),
             &reads_in(r.0.path())
         ),
         None
@@ -809,12 +835,17 @@ fn a_worker_path_that_cannot_name_the_git_is_refused() {
         "PATH=/nonexistent-aterm-git-dir",
     ] {
         assert!(
-            isolated().with(path).view(r.0.path(), &|_| false).is_err(),
+            isolated()
+                .with(path)
+                .raw_git_view(r.0.path(), &|_| false)
+                .is_err(),
             "{path}"
         );
     }
     assert!(
-        WorkerEnv::default().view(r.0.path(), &|_| false).is_err(),
+        WorkerEnv::default()
+            .raw_git_view(r.0.path(), &|_| false)
+            .is_err(),
         "no PATH"
     );
 }
@@ -863,4 +894,259 @@ fn the_claude_code_directory_is_resolved_as_claude_code_resolves_it() {
             .expect_err("no home anywhere")
             .contains("no home for its account")
     );
+}
+
+// -- the projection a harness tape keeps ----------------------------------------
+
+/// Every combination of what a read does beyond reading that `hazard` reads:
+/// a signature display of its own, and a `log`-like read that
+/// `log.showSignature` turns into one.
+fn every_read() -> Vec<GitReads> {
+    let mut out = Vec::new();
+    for signatures in [false, true] {
+        for log_like in [false, true] {
+            out.push(GitReads {
+                dirs: vec![PathBuf::from("/w")],
+                signatures,
+                log_like,
+                remote: None,
+            });
+        }
+    }
+    out
+}
+
+/// The keys a generated view draws from: every kind `hazard` reads, and keys
+/// it never reads — a URL in a key's own name, a credential helper, an extra
+/// header carrying a token, a pager, a name.
+const KEY_POOL: &[&str] = &[
+    "core.fsmonitor",
+    "diff.external",
+    "diff.pdf.textconv",
+    "diff.pdf.command",
+    "diff.textconv",
+    "filter.lfs.clean",
+    "filter.lfs.smudge",
+    "filter.crypt.process",
+    "filter.lfs.required",
+    "extensions.partialclone",
+    "remote.origin.promisor",
+    "remote.origin.url",
+    "gpg.program",
+    "gpg.ssh.program",
+    "gpg.format",
+    "log.showsignature",
+    "url.https://planted-user:planted-token@example.com/.insteadof",
+    "http.https://example.com/.extraheader",
+    "credential.helper",
+    "core.pager",
+    "pager.log",
+    "user.name",
+];
+
+/// The values a generated entry draws from: bare, git's spellings of true and
+/// false (the empty value among the false), and programs and secrets.
+const VALUE_POOL: &[Option<&str>] = &[
+    None,
+    Some("true"),
+    Some("TRUE"),
+    Some("yes"),
+    Some("On"),
+    Some("1"),
+    Some("false"),
+    Some("no"),
+    Some("OFF"),
+    Some("0"),
+    Some(""),
+    Some("fsmonitor-watchman"),
+    Some("/tmp/planted-program"),
+    Some("Authorization: Bearer planted-token"),
+    Some("origin"),
+];
+
+/// A generated view, `depth` submodule levels down at most.
+fn generated(rng: &mut aterm_spec::rng::XorShift, depth: usize) -> GitView {
+    let scopes = ["system", "global", "local", "worktree", "command"];
+    let config = (0..rng.range(0, 7))
+        .map(|_| {
+            (
+                rng.pick(&scopes).to_string(),
+                rng.pick(KEY_POOL).to_string(),
+                rng.pick(VALUE_POOL).map(str::to_string),
+            )
+        })
+        .collect();
+    let drivers = ["lfs", "crypt", "other"];
+    GitView {
+        config,
+        index_hook: (rng.below(5) == 0).then(|| PathBuf::from("/w/.git/hooks/post-index-change")),
+        filters_selected: match rng.below(3) {
+            0 => None,
+            1 => Some(Vec::new()),
+            _ => Some(vec![rng.pick(&drivers).to_string()]),
+        },
+        submodules: if depth == 0 {
+            Vec::new()
+        } else {
+            (0..rng.range(0, 2))
+                .map(|i| {
+                    (
+                        PathBuf::from(format!("/w/sub{i}")),
+                        generated(rng, depth - 1),
+                    )
+                })
+                .collect()
+        },
+        external_diff: (rng.below(6) == 0).then(|| "/tmp/planted-difftool".to_string()),
+    }
+}
+
+/// The fixtures of the hazard tests above, each a one-entry view.
+fn fixture_views() -> Vec<GitView> {
+    let mut out: Vec<GitView> = [
+        ("local", "core.fsmonitor", Some("touch /tmp/p")),
+        ("local", "diff.external", Some("touch /tmp/p")),
+        ("local", "diff.pdf.textconv", Some("touch /tmp/p")),
+        ("local", "diff.pdf.command", Some("touch /tmp/p")),
+        ("local", "filter.x.clean", Some("touch /tmp/p")),
+        ("local", "filter.x.smudge", Some("touch /tmp/p")),
+        ("local", "filter.x.process", Some("touch /tmp/p")),
+        ("local", "extensions.partialclone", Some("origin")),
+        ("local", "remote.origin.promisor", Some("true")),
+        ("local", "remote.origin.promisor", None),
+        ("local", "remote.origin.promisor", Some("false")),
+        ("global", "core.fsmonitor", Some("true")),
+        ("global", "core.fsmonitor", Some("false")),
+        ("global", "core.fsmonitor", None),
+        ("global", "core.pager", Some("sh -c 'touch /tmp/p'")),
+        ("global", "pager.log", Some("sh -c 'touch /tmp/p'")),
+        ("global", "gpg.program", Some("/tmp/evil")),
+        ("global", "gpg.ssh.program", Some("/tmp/evil")),
+        ("global", "user.name", Some("x")),
+        ("global", "credential.helper", Some("osxkeychain")),
+    ]
+    .iter()
+    .map(|e| view(&[*e]))
+    .collect();
+    out.push(view(&[
+        ("local", "gpg.program", Some("/tmp/evil")),
+        ("local", "log.showsignature", Some("true")),
+    ]));
+    out.push(GitView {
+        index_hook: Some(PathBuf::from("/w/.git/hooks/post-index-change")),
+        ..GitView::default()
+    });
+    out
+}
+
+/// `project` judged the way `hazard` judges: `None` when, over the fixtures
+/// and a thousand generated views (submodules two deep), every read judges
+/// the projection exactly as it judges the view — the same reason, word for
+/// word — else the first view and read that differ.
+fn projection_holds(project: impl Fn(&GitView) -> GitView) -> Option<(GitView, GitReads)> {
+    let mut rng = aterm_spec::rng::XorShift::new(0x7a9e_0005);
+    let views = fixture_views()
+        .into_iter()
+        .chain((0..1000).map(|_| generated(&mut rng, 2)));
+    for v in views {
+        let p = project(&v);
+        for r in every_read() {
+            if hazard(&v, &r) != hazard(&p, &r) {
+                return Some((v, r));
+            }
+        }
+    }
+    None
+}
+
+/// THE PROJECTION A TAPE KEEPS JUDGES AS THE VIEW DID: `hazard(v, r) ==
+/// hazard(v.project(), r)` for every fixture and generated view and every
+/// combination of what a read does — so the policy, which judges the
+/// projection in every mode, judges as it did before the probe.
+/// Negative control: a projection that also drops `log.showsignature` is
+/// caught (a `git log` that the key turns into a signature display, over a
+/// signing program, judges otherwise).
+#[test]
+fn hazard_judges_the_projection_as_it_judges_the_view() {
+    assert_eq!(projection_holds(GitView::project), None);
+    let dropping = |v: &GitView| {
+        let mut p = v.project();
+        p.config.retain(|(_, k, _)| k != "log.showsignature");
+        p
+    };
+    let (v, r) = projection_holds(dropping).expect("the control is caught");
+    assert!(r.log_like && !r.signatures, "{v:?} {r:?}");
+}
+
+/// THE PROJECTION KEEPS NOTHING `hazard` DOES NOT READ: no key it never reads
+/// (a URL in a key's name, a credential helper, an extra header), no value
+/// but a class, the worker's `GIT_EXTERNAL_DIFF` as its presence — over a
+/// view that plants a secret in each, down a submodule too.
+#[test]
+fn the_projection_keeps_only_what_hazard_reads() {
+    let secrets = [
+        "planted-user",
+        "planted-token",
+        "osxkeychain",
+        "/tmp/planted-program",
+        "/tmp/planted-difftool",
+        "example.com",
+    ];
+    let planted = GitView {
+        config: vec![
+            (
+                "global".to_string(),
+                "url.https://planted-user:planted-token@example.com/.insteadof".to_string(),
+                Some("https://example.com/".to_string()),
+            ),
+            (
+                "global".to_string(),
+                "http.https://example.com/.extraheader".to_string(),
+                Some("Authorization: Bearer planted-token".to_string()),
+            ),
+            (
+                "global".to_string(),
+                "credential.helper".to_string(),
+                Some("osxkeychain".to_string()),
+            ),
+            (
+                "local".to_string(),
+                "core.fsmonitor".to_string(),
+                Some("/tmp/planted-program".to_string()),
+            ),
+        ],
+        external_diff: Some("/tmp/planted-difftool".to_string()),
+        ..GitView::default()
+    };
+    let view = GitView {
+        submodules: vec![(PathBuf::from("/w/sub"), planted.clone())],
+        ..planted
+    };
+    let projected = format!("{:?}", view.project());
+    for secret in secrets {
+        assert!(!projected.contains(secret), "{secret} kept: {projected}");
+    }
+    // Negative control: the view itself holds every one of them.
+    let whole = format!("{view:?}");
+    for secret in secrets {
+        assert!(whole.contains(secret), "{secret} was not planted");
+    }
+    // What `hazard` reads is kept: the fsmonitor key, a program by class.
+    assert!(
+        view.project()
+            .config
+            .iter()
+            .any(|(_, k, v)| k == "core.fsmonitor" && v.as_deref() == Some(VALUE_SET))
+    );
+}
+
+/// Each value class answers git's boolean readers as every value in it does.
+#[test]
+fn a_value_class_reads_as_its_values() {
+    for v in VALUE_POOL {
+        let class = value_class(*v);
+        assert_eq!(is_bool(class.as_deref()), is_bool(*v), "{v:?}");
+        assert_eq!(is_false(class.as_deref()), is_false(*v), "{v:?}");
+        assert_eq!(is_true(class.as_deref()), is_true(*v), "{v:?}");
+    }
 }

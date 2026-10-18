@@ -16,8 +16,8 @@ impl CursorStateHandler<'_> {
     /// Save cursor state (DECSC) for the current screen: position, pending
     /// wrap, SGR and underline colour, origin mode, auto-wrap and charsets.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             reason = "TLA+ SaveModes saves all 13 mode variables; DECSC only saves cursor + origin_mode + auto_wrap + charset + style"
         )
     )]
@@ -45,8 +45,8 @@ impl CursorStateHandler<'_> {
     /// The saved position is absolute; when origin mode is restored as
     /// enabled it is clamped to the current scroll region (VT510).
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             reason = "TLA+ RestoreModes restores all 13 mode variables; DECRC only restores cursor + origin_mode + charset + style"
         )
     )]
@@ -388,16 +388,16 @@ impl CursorStateHandler<'_> {
     // The parameter decides which: a shape other than the host's is
     // `SetCursorStyle`, the host's own shape `RestoreCursorStyle`.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "SetCursorStyle",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "terminal_modes",
             action = "RestoreCursorStyle",
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"

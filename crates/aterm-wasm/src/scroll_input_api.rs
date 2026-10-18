@@ -283,21 +283,19 @@ mod tests {
 
     // ---- wasm-export smoke: the exported surface end to end ----------------
 
-    /// A terminal with scrollback, or `None` without a system font.
-    fn terminal_with_history() -> Option<WebTerminal> {
-        let mut t = WebTerminal::new_from_system(4, 20, 16.0)?;
+    /// A terminal with scrollback; COULD NOT RUN without a system font
+    /// ([`crate::system_font_terminal`]).
+    fn terminal_with_history() -> WebTerminal {
+        let mut t = crate::system_font_terminal(4, 20, 16.0);
         for i in 0..12 {
             t.process(format!("line {i}\r\n").as_bytes());
         }
-        Some(t)
+        t
     }
 
     #[test]
     fn scroll_px_accumulates_and_flips_through_the_export() {
-        let Some(mut t) = terminal_with_history() else {
-            eprintln!("no system font; skipping export smoke");
-            return;
-        };
+        let mut t = terminal_with_history();
         assert_eq!(t.display_offset(), 0);
         // Half a cell of pixels: banks, no flip. (x/2)/x divides exactly.
         let half = t.cell_height() as f64 / 2.0;
@@ -320,9 +318,7 @@ mod tests {
 
     #[test]
     fn whole_row_navigation_resets_the_residual() {
-        let Some(mut t) = terminal_with_history() else {
-            return;
-        };
+        let mut t = terminal_with_history();
         t.scroll_lines_frac(1.5);
         assert!(t.scroll_frac_rows() > 0.0);
         t.scroll_to_bottom();
@@ -337,9 +333,7 @@ mod tests {
 
     #[test]
     fn history_ends_clamp_the_residual_through_the_export() {
-        let Some(mut t) = terminal_with_history() else {
-            return;
-        };
+        let mut t = terminal_with_history();
         // At the live bottom, scrolling toward newer banks nothing.
         t.scroll_lines_frac(-0.7);
         assert_eq!((t.display_offset(), t.scroll_frac_rows()), (0, 0.0));
@@ -349,9 +343,7 @@ mod tests {
         t.scroll_lines_frac(0.7);
         assert_eq!((t.display_offset(), t.scroll_frac_rows()), (top, 0.0));
         // A fresh terminal (no history at all) never banks.
-        let Some(mut fresh) = WebTerminal::new_from_system(4, 20, 16.0) else {
-            return;
-        };
+        let mut fresh = crate::system_font_terminal(4, 20, 16.0);
         fresh.scroll_lines_frac(0.7);
         assert_eq!(fresh.scroll_frac_rows(), 0.0);
     }

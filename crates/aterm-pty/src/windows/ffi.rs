@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The ConPTY backend's kernel32 FFI: direct `extern "system"` declarations (std already
-//! links kernel32). Handles are plain `isize`, so the session registry is `Send + Sync`
-//! without unsafe impls; struct layouts are transcribed from the Windows SDK.
+//! The ConPTY backend's FFI: direct `extern "system"` declarations against kernel32 (std
+//! already links it), ntdll (`NtOpenFile`, the ConDrv opens the OpenConsole launch needs)
+//! and version.dll (an OpenConsole's file version, for the host report), all three system
+//! DLLs. Handles are plain `isize`, so the session registry is `Send + Sync` without unsafe
+//! impls; struct layouts are transcribed from the Windows SDK.
 
 // Win32 ABI names are kept verbatim (PascalCase fields, SCREAMING struct names)
 // so they can be checked against the SDK headers line by line.
@@ -60,6 +62,76 @@ pub(crate) const PROCESS_POWER_THROTTLING_EXECUTION_SPEED: u32 = 0x1;
 pub(crate) const PROCESS_SET_INFORMATION: u32 = 0x0200;
 /// `CreateToolhelp32Snapshot` flag: snapshot every process in the system.
 pub(crate) const TH32CS_SNAPPROCESS: u32 = 0x2;
+/// `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` — the ONLY inheritable handles a child
+/// created with `bInheritHandles = TRUE` receives (the OpenConsole launch hands
+/// it exactly four).
+pub(crate) const PROC_THREAD_ATTRIBUTE_HANDLE_LIST: usize = 0x0002_0002;
+/// `SetHandleInformation` mask/flag: the handle is inherited by children.
+pub(crate) const HANDLE_FLAG_INHERIT: u32 = 0x1;
+/// `DuplicateHandle` option: the duplicate keeps the source's access rights.
+pub(crate) const DUPLICATE_SAME_ACCESS: u32 = 0x2;
+/// `OBJECT_ATTRIBUTES.Attributes`: the opened handle is inheritable.
+pub(crate) const OBJ_INHERIT: u32 = 0x2;
+/// `OBJECT_ATTRIBUTES.Attributes`: case-insensitive object-name lookup.
+pub(crate) const OBJ_CASE_INSENSITIVE: u32 = 0x40;
+/// Access rights for the ConDrv opens (winconpty's own masks).
+pub(crate) const GENERIC_ALL: u32 = 0x1000_0000;
+pub(crate) const GENERIC_READ: u32 = 0x8000_0000;
+pub(crate) const GENERIC_WRITE: u32 = 0x4000_0000;
+pub(crate) const SYNCHRONIZE: u32 = 0x0010_0000;
+/// `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`.
+pub(crate) const FILE_SHARE_ALL: u32 = 0x7;
+/// `NtOpenFile` option: synchronous I/O, not alertable (the `\Reference` open).
+pub(crate) const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x20;
+/// `GetPackagesByPackageFamily` / `GetPackagePathByFullName`: the size probe's
+/// "buffer too small" answer (a Win32 error code, returned, not set).
+pub(crate) const ERROR_INSUFFICIENT_BUFFER: i32 = 122;
+
+/// `UNICODE_STRING` — the counted (NOT NUL-terminated) name `NtOpenFile` takes.
+/// Lengths are in BYTES.
+#[repr(C)]
+pub(crate) struct UNICODE_STRING {
+    pub Length: u16,
+    pub MaximumLength: u16,
+    pub Buffer: *mut u16,
+}
+
+/// `OBJECT_ATTRIBUTES` — the object name, the directory it is relative to, and
+/// the handle attributes (`OBJ_*`).
+#[repr(C)]
+pub(crate) struct OBJECT_ATTRIBUTES {
+    pub Length: u32,
+    pub RootDirectory: HANDLE,
+    pub ObjectName: *mut UNICODE_STRING,
+    pub Attributes: u32,
+    pub SecurityDescriptor: *mut c_void,
+    pub SecurityQualityOfService: *mut c_void,
+}
+
+/// `IO_STATUS_BLOCK` (64-bit layout: the NTSTATUS/PVOID union is pointer-sized).
+#[repr(C)]
+pub(crate) struct IO_STATUS_BLOCK {
+    pub Status: isize,
+    pub Information: usize,
+}
+
+/// `VS_FIXEDFILEINFO` — the numeric version block of a PE version resource.
+#[repr(C)]
+pub(crate) struct VS_FIXEDFILEINFO {
+    pub dwSignature: u32,
+    pub dwStrucVersion: u32,
+    pub dwFileVersionMS: u32,
+    pub dwFileVersionLS: u32,
+    pub dwProductVersionMS: u32,
+    pub dwProductVersionLS: u32,
+    pub dwFileFlagsMask: u32,
+    pub dwFileFlags: u32,
+    pub dwFileOS: u32,
+    pub dwFileType: u32,
+    pub dwFileSubtype: u32,
+    pub dwFileDateMS: u32,
+    pub dwFileDateLS: u32,
+}
 
 /// `COORD` — ConPTY size in character cells.
 #[repr(C)]
@@ -288,6 +360,76 @@ unsafe extern "system" {
         lpBuffer: *mut u16,
         lpFilePart: *mut *mut u16,
     ) -> u32;
+    pub(crate) fn SetHandleInformation(hObject: HANDLE, dwMask: u32, dwFlags: u32) -> i32;
+    pub(crate) fn DuplicateHandle(
+        hSourceProcessHandle: HANDLE,
+        hSourceHandle: HANDLE,
+        hTargetProcessHandle: HANDLE,
+        lpTargetHandle: *mut HANDLE,
+        dwDesiredAccess: u32,
+        bInheritHandle: i32,
+        dwOptions: u32,
+    ) -> i32;
+    pub(crate) fn GetCurrentProcess() -> HANDLE;
+    /// Bytes waiting in a pipe, WITHOUT consuming them (the OpenConsole health
+    /// check reads the host's first output this way and leaves it for the
+    /// session reader).
+    pub(crate) fn PeekNamedPipe(
+        hNamedPipe: HANDLE,
+        lpBuffer: *mut u8,
+        nBufferSize: u32,
+        lpBytesRead: *mut u32,
+        lpTotalBytesAvail: *mut u32,
+        lpBytesLeftThisMessage: *mut u32,
+    ) -> i32;
+    /// appmodel.h: the full names of every installed package of a family.
+    /// Returns a Win32 error code (0 = success).
+    pub(crate) fn GetPackagesByPackageFamily(
+        packageFamilyName: *const u16,
+        count: *mut u32,
+        packageFullNames: *mut *mut u16,
+        bufferLength: *mut u32,
+        buffer: *mut u16,
+    ) -> i32;
+    /// appmodel.h: the install folder of one package. Returns a Win32 error
+    /// code (0 = success).
+    pub(crate) fn GetPackagePathByFullName(
+        packageFullName: *const u16,
+        pathLength: *mut u32,
+        path: *mut u16,
+    ) -> i32;
+}
+
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    /// Opens `\Device\ConDrv\Server` and its `\Reference` for the OpenConsole
+    /// launch — the two handles winconpty opens the same way. Returns an
+    /// NTSTATUS (negative = failure).
+    pub(crate) fn NtOpenFile(
+        FileHandle: *mut HANDLE,
+        DesiredAccess: u32,
+        ObjectAttributes: *mut OBJECT_ATTRIBUTES,
+        IoStatusBlock: *mut IO_STATUS_BLOCK,
+        ShareAccess: u32,
+        OpenOptions: u32,
+    ) -> i32;
+}
+
+#[link(name = "version")]
+unsafe extern "system" {
+    pub(crate) fn GetFileVersionInfoSizeW(lptstrFilename: *const u16, lpdwHandle: *mut u32) -> u32;
+    pub(crate) fn GetFileVersionInfoW(
+        lptstrFilename: *const u16,
+        dwHandle: u32,
+        dwLen: u32,
+        lpData: *mut c_void,
+    ) -> i32;
+    pub(crate) fn VerQueryValueW(
+        pBlock: *const c_void,
+        lpSubBlock: *const u16,
+        lplpBuffer: *mut *mut c_void,
+        puLen: *mut u32,
+    ) -> i32;
 }
 
 /// RAII guard around a raw kernel HANDLE: closes on drop unless released via

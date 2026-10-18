@@ -4,10 +4,10 @@
 //! The `wasm` lane: build the two SHIPPED renderer modules (`aterm-wasm` on
 //! the CPU canvas path, `aterm-gpu-web` on the WebGL path) for
 //! `wasm32-unknown-unknown` with the shipping `+simd128` flag, bind them for
-//! node (the CPU module with `verify glue`'s generator, the GPU module with
-//! the pinned wasm-bindgen), apply the shipping `wasm-opt -O3` pass, and
-//! drive their real exports with `crates/aterm-verify/perf/wasm/bench.mjs`
-//! under node.
+//! node with `verify glue`'s generator (neither module has wasm-bindgen:
+//! docs/AUDIT-third-party-2026-10-15.md, wasm-platform WP.7 and WP.8), apply
+//! the shipping `wasm-opt -O3` pass, and drive their real exports with
+//! `crates/aterm-verify/perf/wasm/bench.mjs` under node.
 //!
 //! STOCK EXCEPTION (Trust lacks a wasm32 std: error[E0463] can't find crate
 //! for `core`): the build rides rustup's `stable`, resolved to its own
@@ -15,8 +15,8 @@
 //! ignores `RUSTUP_TOOLCHAIN`. It runs from a neutral cwd so no repo
 //! config (vendored source replacement, Trust `-Z` flags) applies.
 //!
-//! A box without node, the stable wasm32 target, `wasm-opt` or the pinned
-//! `wasm-bindgen` SKIPs with the fix; a failure on an equipped box fails.
+//! A box without node, the stable wasm32 target or `wasm-opt` SKIPs with the
+//! fix; a failure on an equipped box fails.
 //!
 //! Honest seams, on purpose: the GPU scenarios time the wasm-side frame build
 //! only (node has no WebGL, and bench.mjs asserts the seam is where it
@@ -32,14 +32,9 @@ use aterm_uds::spawnfd::command;
 use super::LaneRun;
 use super::floors::{self, FloorLane};
 use super::workspace_root;
-
-/// The wasm-bindgen CLI this lane binds the GPU module (`aterm-gpu-web`)
-/// with; the CPU module has no wasm-bindgen and binds with `verify glue`'s generator
-/// (docs/AUDIT-third-party-2026-10-15.md, wasm-platform WP.7). The CLI refuses
-/// a crate built against another version, so it must equal the
-/// `wasm-bindgen` version `Cargo.lock` builds aterm-gpu-web against; the lane
-/// checks that before it builds anything.
-pub(crate) const WASM_BINDGEN_PIN: &str = "0.2.108";
+// The shipping `wasm-opt` pass: pre-opt numbers are not the product's, so the
+// lane never measures without it.
+use crate::wasm_glue::WASM_OPT_FLAGS;
 
 pub(crate) const WASM_LANE: FloorLane = FloorLane {
     lane: "wasm",
@@ -75,19 +70,6 @@ pub(crate) const WASM_LANE: FloorLane = FloorLane {
 /// decision 5). A trip is the owner's raise-or-shrink call, never a re-record.
 pub(crate) const WASM_CPU_MODULE_BYTES_CAP: f64 = 5_886_685.0;
 
-/// The `wasm-opt` pass the shipping pipeline applies: `-O3` (speed, matching
-/// the cargo opt-3 build) with the shipping feature flags. Pre-opt numbers are
-/// not the product's, so the lane never measures without it.
-const WASM_OPT_FLAGS: [&str; 7] = [
-    "-O3",
-    "--enable-bulk-memory",
-    "--enable-nontrapping-float-to-int",
-    "--enable-sign-ext",
-    "--enable-mutable-globals",
-    "--enable-reference-types",
-    "--enable-simd",
-];
-
 /// The node driver, beside this crate.
 fn bench_script() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("perf/wasm/bench.mjs")
@@ -101,62 +83,23 @@ fn answers(program: &Path, args: &[&str]) -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
-/// The version `wasm-bindgen --version` reports (`wasm-bindgen 0.2.108`'s
-/// second field), compared exactly: a substring test reads 0.2.1080 as 0.2.108.
-fn bindgen_version(program: &Path, path_env: Option<&std::ffi::OsStr>) -> Option<String> {
-    let mut cmd = command(program);
-    cmd.arg("--version");
-    if let Some(p) = path_env {
-        cmd.env("PATH", p);
-    }
-    let out = cmd.output_owned().ok().filter(|o| o.status.success())?;
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .next()?
-        .split_whitespace()
-        .nth(1)
-        .map(str::to_string)
-}
-
-/// The `wasm-bindgen` version `Cargo.lock` builds the modules against.
-pub(crate) fn locked_bindgen_version(lockfile: &str) -> Option<String> {
-    let lock: aterm_toml::Value = aterm_toml::from_str(lockfile).ok()?;
-    lock.get("package")?
-        .as_array()?
-        .iter()
-        .find(|p| p.get("name").and_then(aterm_toml::Value::as_str) == Some("wasm-bindgen"))?
-        .get("version")?
-        .as_str()
-        .map(str::to_string)
-}
-
-/// The pinned wasm-bindgen: on PATH (with rustup's directory appended, where
-/// a `cargo install`ed one lands) at exactly the pin, else in this repo's
-/// tooling cache.
-fn find_bindgen(root: &Path, path_env: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
-    let on_path = std::env::split_paths(path_env.unwrap_or_default())
-        .map(|d| d.join("wasm-bindgen"))
-        .find(|p| p.is_file());
-    let cache = root.join(format!(
-        "target/tooling/wasm-bindgen-{WASM_BINDGEN_PIN}/bin/wasm-bindgen"
-    ));
-    on_path
-        .into_iter()
-        .chain([cache])
-        .find(|p| bindgen_version(p, path_env).as_deref() == Some(WASM_BINDGEN_PIN))
-}
-
-/// What a wasm lane needs before it builds, found or refused: rustup (whose
-/// `stable` carries the wasm32 std) and the pinned wasm-bindgen. Node is
-/// checked too, and `wasm-opt` when `wasm_opt` asks for it. `Err` is the
-/// lane's verdict: a SKIP with the fix, or a FAIL on a lock off the pin.
-pub(crate) fn lane_tools(root: &Path, wasm_opt: bool) -> Result<(PathBuf, PathBuf), LaneRun> {
+/// What a wasm lane needs before it builds, found or refused: node, then
+/// [`build_tools`]. `Err` is the lane's verdict: a SKIP with the fix.
+pub(crate) fn lane_tools(wasm_opt: bool) -> Result<PathBuf, LaneRun> {
     if !answers(Path::new("node"), &["--version"]) {
         return Err(LaneRun::skip(
             "node not found; the lane runs the wasm under node",
-            "install node (brew install node)",
+            crate::install_fix("node", "node", "nodejs"),
         ));
     }
+    build_tools(wasm_opt)
+}
+
+/// What building the two modules needs, found or refused: rustup (whose
+/// `stable` carries the wasm32 std), and `wasm-opt` when `wasm_opt` asks for
+/// it: rustup's path, or a SKIP with the fix. Binding needs nothing more:
+/// `verify glue`'s generator runs in process.
+pub(crate) fn build_tools(wasm_opt: bool) -> Result<PathBuf, LaneRun> {
     let Some(rustup) = crate::rustup::find_rustup() else {
         return Err(LaneRun::skip(
             format!("no rustup ({})", crate::rustup::RUSTUP_LOOKED),
@@ -182,53 +125,21 @@ pub(crate) fn lane_tools(root: &Path, wasm_opt: bool) -> Result<(PathBuf, PathBu
         return Err(LaneRun::skip(
             "wasm-opt not found; the lane applies the shipping -O3 pass and never measures \
              pre-opt modules",
-            "install binaryen (brew install binaryen)",
+            crate::install_fix("binaryen", "binaryen", "binaryen"),
         ));
     }
-    let lock = std::fs::read_to_string(root.join("Cargo.lock")).unwrap_or_default();
-    match locked_bindgen_version(&lock) {
-        Some(v) if v == WASM_BINDGEN_PIN => {}
-        other => {
-            return Err(LaneRun::fail(format!(
-                "Cargo.lock builds wasm-bindgen {}, WASM_BINDGEN_PIN is {WASM_BINDGEN_PIN}: \
-                 move the const (crates/aterm-verify/src/perf/wasm.rs) to the locked version",
-                other.as_deref().unwrap_or("<none>")
-            )));
-        }
-    }
-    let mut path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).collect())
-        .unwrap_or_default();
-    if let Some(dir) = rustup.parent() {
-        path_dirs.push(dir.to_path_buf());
-    }
-    let path_env = std::env::join_paths(path_dirs).ok();
-    let Some(bindgen) = find_bindgen(root, path_env.as_deref()) else {
-        let tooling = root.join(format!("target/tooling/wasm-bindgen-{WASM_BINDGEN_PIN}"));
-        return Err(LaneRun::skip(
-            format!(
-                "wasm-bindgen {WASM_BINDGEN_PIN} is not on PATH, beside rustup or in target/tooling"
-            ),
-            format!(
-                "cd / && targo --unverified install wasm-bindgen-cli --version \
-                 {WASM_BINDGEN_PIN} --locked --root '{}'",
-                tooling.display()
-            ),
-        ));
-    };
-    Ok((rustup, bindgen))
+    Ok(rustup)
 }
 
 /// WASM floors: the shipped modules under node, every gated key against its
 /// floor, plus the module-size ceiling.
 pub(crate) fn gate_wasm(record: bool) -> LaneRun {
     let root = workspace_root();
-    let (rustup, bindgen) = match lane_tools(&root, true) {
-        Ok(tools) => tools,
+    let rustup = match lane_tools(true) {
+        Ok(rustup) => rustup,
         Err(verdict) => return verdict,
     };
-    eprintln!("  wasm-bindgen: {} ({WASM_BINDGEN_PIN})", bindgen.display());
-    let json = match build_and_bench(&root, &rustup, &bindgen) {
+    let json = match build_and_bench(&root, &rustup) {
         Ok(json) => json,
         Err(e) => return LaneRun::fail(e),
     };
@@ -246,14 +157,14 @@ pub(crate) fn gate_wasm(record: bool) -> LaneRun {
 /// rewrites the answers and checks them back. Progress goes to `log`.
 pub(crate) fn record_replay(log: &mut String) -> LaneRun {
     let root = workspace_root();
-    let (rustup, bindgen) = match lane_tools(&root, false) {
-        Ok(tools) => tools,
+    let rustup = match lane_tools(false) {
+        Ok(rustup) => rustup,
         Err(verdict) => return verdict,
     };
     let mut record = || -> Result<(), String> {
         let built = build_modules(&root, &rustup, "dev", None)?;
         let out = root.join("target/wasm-smoke");
-        bind_modules(&bindgen, &built, &out, false)?;
+        bind_modules(&built, &out, false)?;
         bind_cpu_web(&built, &out)?;
         replay(&root, &out, true, log)
     };
@@ -441,28 +352,17 @@ fn build_modules(
     Ok(root.join("target/wasm32-unknown-unknown").join(dir))
 }
 
-/// Bind both modules for node (CommonJS) into `out/cpu` and `out/gpu`, the
-/// CPU module with `verify glue`'s generator and the GPU module with
-/// wasm-bindgen (`--target nodejs`), then apply the shipping `wasm-opt` pass
-/// when `optimise`.
-pub(crate) fn bind_modules(
-    bindgen: &Path,
-    built: &Path,
-    out: &Path,
-    optimise: bool,
-) -> Result<(), String> {
-    crate::wasm_glue::bind(
-        &built.join("aterm_wasm.wasm"),
-        &out.join("cpu"),
-        crate::wasm_glue::Flavor::Nodejs,
-    )?;
-    run_step(
-        command(bindgen)
-            .args(["--target", "nodejs", "--out-dir"])
-            .arg(out.join("gpu"))
-            .arg(built.join("aterm_gpu_web.wasm")),
-        "wasm-bindgen",
-    )?;
+/// Bind both modules for node (CommonJS) into `out/cpu` and `out/gpu` with
+/// `verify glue`'s generator, then apply the shipping `wasm-opt` pass when
+/// `optimise`.
+pub(crate) fn bind_modules(built: &Path, out: &Path, optimise: bool) -> Result<(), String> {
+    for (module, dir) in [("aterm_wasm.wasm", "cpu"), ("aterm_gpu_web.wasm", "gpu")] {
+        crate::wasm_glue::bind(
+            &built.join(module),
+            &out.join(dir),
+            crate::wasm_glue::Flavor::Nodejs,
+        )?;
+    }
     if optimise {
         for bound in [
             out.join("cpu/aterm_wasm_bg.wasm"),
@@ -482,10 +382,10 @@ pub(crate) fn bind_modules(
 }
 
 /// Build, bind, optimise and bench; the bench's JSON report.
-fn build_and_bench(root: &Path, rustup: &Path, bindgen: &Path) -> Result<Value, String> {
+fn build_and_bench(root: &Path, rustup: &Path) -> Result<Value, String> {
     let built = build_modules(root, rustup, "release", Some("-C target-feature=+simd128"))?;
     let out = root.join("target/wasm-bench");
-    bind_modules(bindgen, &built, &out, true)?;
+    bind_modules(&built, &out, true)?;
     // --expose-gc: the bench collects before its heap reads, so the search
     // memory proxy is not dominated by dead JS garbage.
     let bench = command("node")
@@ -570,46 +470,5 @@ mod tests {
         assert_eq!(hash, format!("1{}", &a[1..]));
         assert_eq!(planted, text.replacen(&a, &hash, 1));
         assert!(plant_frame_hash("{\"answers\": []}").is_none());
-    }
-
-    #[test]
-    fn the_locked_version_is_read_from_the_lockfile_table() {
-        let lock = "version = 4\n\n[[package]]\nname = \"wasm-bindgen-macro\"\nversion = \"9.9.9\"\n\n\
-                    [[package]]\nname = \"wasm-bindgen\"\nversion = \"0.2.108\"\n";
-        assert_eq!(locked_bindgen_version(lock).as_deref(), Some("0.2.108"));
-        assert_eq!(locked_bindgen_version("version = 4\n"), None);
-    }
-
-    /// Only a wasm-bindgen that answers exactly the pin is found: a version
-    /// the pin is a prefix of, and one that does not answer, are not.
-    #[cfg(unix)]
-    #[test]
-    fn only_a_bindgen_answering_exactly_the_pin_is_found() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let dir = aterm_tempfile::Builder::new()
-            .prefix("atv-wasm-")
-            .tempdir()
-            .expect("scratch");
-        let cache = dir.path().join(format!(
-            "target/tooling/wasm-bindgen-{WASM_BINDGEN_PIN}/bin/wasm-bindgen"
-        ));
-        std::fs::create_dir_all(cache.parent().expect("parent")).expect("mkdir");
-        let no_path = Some(std::ffi::OsStr::new(""));
-        for (body, found) in [
-            (format!("echo 'wasm-bindgen {WASM_BINDGEN_PIN}0'"), false),
-            ("exit 1".to_string(), false),
-            (format!("echo 'wasm-bindgen {WASM_BINDGEN_PIN}'"), true),
-        ] {
-            // Replaced, not rewritten in place: a running text file is busy.
-            let _ = std::fs::remove_file(&cache);
-            std::fs::write(&cache, format!("#!/bin/sh\n{body}\n")).expect("stub");
-            std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod");
-            assert_eq!(
-                find_bindgen(dir.path(), no_path),
-                found.then(|| cache.clone()),
-                "{body}"
-            );
-        }
     }
 }

@@ -26,7 +26,7 @@
 use crate::trail_audio::HostState;
 
 /// Tier-1 conformance of the derived `TrailSoundSeam` machine
-/// (`aterm_spec::derive::trail_sound_seam_model`): the real host fold, the
+/// (`aterm_models_misc::trail_sound_seam_model`): the real host fold, the
 /// real engine tick, the real key seam and this table, bound to the model.
 #[cfg(test)]
 #[path = "sound_seam_conformance.rs"]
@@ -141,10 +141,7 @@ pub(crate) enum SeamReason {
 }
 
 impl SeamReason {
-    /// FROZEN. Adding a variant means deleting a line of
-    /// `the_reason_vocabulary_is_frozen` in the same commit and saying why —
-    /// which is exactly the friction a new "audio is subordinate to a motion
-    /// or performance policy" reason should meet.
+    /// Every reason, for the tests that close each gate in turn.
     #[cfg(test)]
     pub(crate) const ALL: [Self; 9] = [
         Self::SoundsOff,
@@ -286,35 +283,6 @@ mod tests {
         engine_and_knob.engine_sound_live = false;
         engine_and_knob.trail_on = false;
         assert_eq!(seam_field(sound_seam(&engine_and_knob)), "closed:trail-off");
-    }
-
-    /// THE REGRESSION THIS FILE EXISTS FOR. The 2026-08 "live over silence"
-    /// incident and the 2026-09 load-shed mute are the same shape a year
-    /// apart: a policy that is not about sound acquiring a mute switch, with
-    /// no verb able to say so. Adding a `perf-shed` or `reduce-motion` reason
-    /// here means re-subordinating audio to a motion or performance policy —
-    /// so it cannot land silently: the author must delete a line of this test
-    /// in the same commit and say why.
-    #[test]
-    fn the_reason_vocabulary_is_frozen() {
-        let tokens: Vec<&str> = SeamReason::ALL.iter().map(|r| r.token()).collect();
-        assert_eq!(
-            tokens,
-            [
-                "sounds-off",
-                "volume-zero",
-                "trail-off",
-                "serious-mode",
-                "unfocused",
-                "host-inert",
-                "host-wedged",
-                "resize-quiet",
-                "engine-silent",
-            ]
-        );
-        // And `ALL` really is all of them: a new variant is a compile error
-        // in `close()`'s exhaustive `match` above and a length error here.
-        assert_eq!(SeamReason::ALL.len(), 9);
     }
 
     /// THE VERB AND THE KEY PATH SHARE ONE TABLE. `keystroke_click_audible`

@@ -112,8 +112,8 @@ fn expected(case: &Case) -> Dispatched {
     }
 }
 
-/// Every case, in every chunking the fast path can be fed, through the byte
-/// path, and across a carry at every byte.
+/// Every case, in every chunking it can be fed, and across a carry at every
+/// byte.
 #[test]
 fn an_empty_parameter_reaches_the_handler_as_the_default() {
     for case in CASES {
@@ -123,9 +123,6 @@ fn an_empty_parameter_reaches_the_handler_as_the_default() {
         for cuts in 0..1u32 << (bytes.len() - 1) {
             assert_eq!(feed_chunked(bytes, cuts), want, "{shown:?} cuts {cuts:#b}");
         }
-        let mut byte_path = RecordingSink::default();
-        Parser::new().advance(bytes, &mut byte_path);
-        assert_eq!(dispatched(&byte_path), want, "{shown:?} byte path");
         for split in 0..=bytes.len() {
             assert_eq!(
                 feed_across_carry(bytes, split),

@@ -22,12 +22,41 @@
 //     (`Send`, `Sync`), stands in this crate unless each seal names the trait
 //     as trusted (`retained::ClassType`, which
 //     `aterm_objc::declare_class!` implements for the window's Objective-C
-//     classes), on the same word. That rule is Trust's review 14, not yet on
-//     Trust's main; a seal check without it reads the entry as nothing.
+//     classes), on the same word. That rule is Trust's review 14, on Trust's
+//     main since trust `ebfd92f24d` (2026-10-16).
 // Read together: the policy the window runs changes only in `offer`, each
 // change consumes one stamp, and a stamp comes only from the watcher's read.
 // No arm, no thread and no pointer is named, and no pointer analysis is
 // behind it. Safe code only.
+//
+// WHERE IT IS CHECKED: on the seal lane only (`--cfg trust_seals`,
+// harness_policy_cell.rs); the installed seal, trust `321aaeda7`, has no
+// `Trust.Protocol.Seal`. All four rules are on Trust's main as of trust
+// `ebfd92f24d`. A toolchain seal promoted from it or later checks each of
+// them against every body of this crate in every native build that compiles
+// the dependencies, once harness_policy_cell.rs mounts this island without
+// the cfg; no promoted seal contains it yet. Measured 2026-10-16 with a
+// stage-1 trustc of `ebfd92f24d` (`targo --unverified rustc -p aterm-gui
+// --lib`): the three seals hold, the `ClassType` entry answering for its
+// `unsafe impl` at 12 types (58,867 bodies, 278,164 instances read). A check
+// build (`--profile check`) builds the dependencies without MIR, so the
+// check cannot read their bodies: since trust `537da4cd8c` (2026-10-16, the
+// fix `332dfad2ee`; fixtures `clean_island_seal_check_build_drop_glue`,
+// `_clone_shim`, `_std_call`, `_std_vtable`, `_std_fn_pointer`,
+// `_dep_coroutine` and `_dep_const_fn_pointer`, each beside a `_holds` twin)
+// it refuses all three seals, each note saying "the check could not read the
+// body of" one of them, where `ebfd92f24d` stopped with `missing optimized
+// MIR` for winit's `EventLoopProxy<Wake>` drop and no word of a seal. Each
+// refusal also says a type too large to read was taken to hold one, which is
+// false here (trust known gap `cb_n1_f1_unread_body_carries_cut_note`).
+// Measured 2026-10-17 with a stage-1 trustc of `537da4cd8c`: that check
+// build refuses the three seals, and the full build holds all three (58,933
+// bodies, 263,075 instances read). On aterm `21a2393efb` the full build
+// refused `cell` at one newer statement: the session journal's `list`, then a
+// provided method of `JournalFs`, called `scan` at its own `Self` with a
+// `&mut dyn FnMut`, which the check took to hold a cell; `list` is now a fn
+// of `&dyn JournalFs` (session_log_journal_fs.rs), whose `scan` is read
+// where each `dyn` is made.
 //
 // WHAT IT DOES NOT SAY: that `config.harness`, the mirror Settings reads, is
 // written nowhere else (`adopt_harness_policy` and the config lane copy the
@@ -38,7 +67,12 @@
 // `config_watcher::spawn` would mint from 1 again, and the join would drop its
 // posts until they passed the first watcher's: one call site today, in
 // `main_entry`). And a seal is a claim about safe code of THIS crate, on the
-// word of its `trusts` list for the fns of other crates named there.
+// word of its `trusts` list for the fns of other crates named there. At
+// `ebfd92f24d` Trust's `docs/USING_TRUST.md` lists 22 KNOWN GAPS of the
+// check, recorded and not fixed, 8 of them false passes (the seal holds and
+// code of the crate puts one holder's value over another's). Its reading of
+// generic code is where Trust says a seal is weakest: a seal that holds is
+// evidence, not a proof.
 clean {
     import Trust.Binding
     namespace HarnessPolicySeal

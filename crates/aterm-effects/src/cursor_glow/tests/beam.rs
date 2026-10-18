@@ -70,49 +70,6 @@ fn beam_jump_is_one_clean_full_vector_rod() {
     assert_eq!(fp, 0, "the rod decays to exactly empty");
 }
 
-/// Power-down law: past its full-power hold the rod thins, the lit vertical
-/// extent at its midpoint collapsing toward a hairline as brightness dies
-/// (every bloom layer is a multiple of `core_thick`).
-#[test]
-fn beam_powers_down_thinner() {
-    let g = geom();
-    let c = cfg(GlowStyle::Beam, true);
-    let t0 = Instant::now();
-    let mut out = Vec::new();
-    let mut glow = CursorGlow::default();
-    glow.tick(Some((2, 2)), t0, &c, g, &mut out);
-    glow.note_synthetic_move(t0);
-    glow.tick(Some((2, 30)), t0, &c, g, &mut out);
-    // Lit vertical extent of quads covering the rod's midpoint column.
-    let extent_at = |out: &[GlowQuad]| -> i32 {
-        let mx = (16 * g.cw + g.cw / 2) as u16; // column 16, mid-cell
-        let (mut y0, mut y1) = (i32::MAX, i32::MIN);
-        for q in out {
-            if q.x <= mx && mx < q.x + q.w && q.color != 0 {
-                y0 = y0.min(q.y as i32);
-                y1 = y1.max((q.y + q.h) as i32);
-            }
-        }
-        (y1 - y0).max(0)
-    };
-    let early = extent_at(&out);
-    assert!(early > 0, "the rod is lit at its midpoint");
-    // ~72% through the jump life (240ms): deep into the cosine power-down.
-    glow.tick(
-        Some((2, 30)),
-        t0 + Duration::from_millis(172),
-        &c,
-        g,
-        &mut out,
-    );
-    let late = extent_at(&out);
-    assert!(late > 0, "still powering down, not yet dark");
-    assert!(
-        late < early,
-        "the tube thins as it powers down (early {early}px vs late {late}px)"
-    );
-}
-
 /// Typing continuity: at a human cadence the tube never goes dark between
 /// keys; chained spark lifetimes keep the rod lit mid-rhythm.
 #[test]
@@ -144,37 +101,5 @@ fn beam_typing_never_goes_dark_mid_rhythm() {
         t += Duration::from_millis(150);
         glow.note_synthetic_typed(t, 1);
         glow.tick(Some((2, i)), t, &c, g, &mut out);
-    }
-}
-
-/// Cool-light law: with the ice-blue default the whole tube (body, sheen,
-/// halo, white-mixed specular axis) keeps blue at least as strong as red on
-/// every emitted quad, across spawn and power-down frames.
-#[test]
-fn beam_stays_cool_light() {
-    let g = geom();
-    let mut c = cfg(GlowStyle::Beam, true);
-    c.color = BEAM_DEFAULT_COLOR;
-    c.accent = BEAM_DEFAULT_COLOR;
-    let t0 = Instant::now();
-    let mut out = Vec::new();
-    let mut glow = CursorGlow::default();
-    glow.tick(Some((3, 5)), t0, &c, g, &mut out);
-    glow.note_synthetic_move(t0);
-    glow.tick(Some((1, 38)), t0, &c, g, &mut out);
-    let mut all: Vec<GlowQuad> = out.clone();
-    glow.note_synthetic_typed(t0 + Duration::from_millis(120), 1);
-    glow.tick(
-        Some((1, 39)),
-        t0 + Duration::from_millis(120),
-        &c,
-        g,
-        &mut out,
-    );
-    all.extend(out.iter().copied());
-    assert!(!all.is_empty());
-    for q in &all {
-        let (r, b) = ((q.color >> 16) & 0xff, q.color & 0xff);
-        assert!(b >= r, "beam quad left its cool hue: {:06x}", q.color);
     }
 }

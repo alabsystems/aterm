@@ -8,20 +8,20 @@
 //! for one window, resize its backing store to the raw window size in physical
 //! pixels, acquire a `[u32]` frame buffer (0x00RRGGBB, the `aterm-render`
 //! framebuffer's word layout), ask how old the buffer's contents are, and commit
-//! it whole or damage-bounded. `softbuffer`'s `Context`/`Surface` split stays
-//! private to its backend.
+//! it whole or damage-bounded.
 //!
-//! macOS gets [`mac::MacCpuPresenter`] (CoreGraphics + CoreAnimation, no
-//! `softbuffer`); every other cell gets
-//! [`softbuffer_surface::SoftbufferPresenter`]. The `cfg`-selected [`CpuSurface`]
-//! alias resolves to one concrete type per cell, so the per-frame path has no
-//! vtable; the traits make a method added to one backend and not the other a
-//! compile error.
+//! macOS gets [`mac::MacCpuPresenter`] (CoreGraphics + CoreAnimation); Linux
+//! gets [`linux::LinuxPresenter`] (MIT-SHM on X11, `wl_shm` on Wayland,
+//! first-party since LW.6 of docs/AUDIT-third-party-2026-10-15.md); Windows gets
+//! [`softbuffer_surface::SoftbufferPresenter`] until its GDI presenter (LW.3).
+//! The `cfg`-selected [`CpuSurface`] alias resolves to one concrete type per
+//! cell, so the per-frame path has no vtable; the traits make a method added to
+//! one backend and not the other a compile error.
 //!
 //! This is the fail-soft arm for GPU device loss and for surfaces that will not
-//! create (`aterm_gpu::surface_attach_fallback`): every error here is a typed
-//! failure the caller turns into a dropped frame plus a re-arm, never a panic or
-//! a silently skipped commit that would leave a black window.
+//! create: every error here is a typed failure the caller turns into a dropped
+//! frame plus a re-arm, never a panic or a silently skipped commit that would
+//! leave a black window.
 
 use std::num::NonZeroU32;
 use std::ops::DerefMut;
@@ -29,18 +29,29 @@ use std::sync::Arc;
 
 use winit::window::Window;
 
+#[cfg(target_os = "linux")]
+pub(crate) mod linux;
 #[cfg(target_os = "macos")]
 pub(crate) mod mac;
 #[cfg(test)]
 pub(crate) mod scripted;
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+mod shm_mem;
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub(crate) mod softbuffer_surface;
+#[cfg(target_os = "linux")]
+pub(crate) mod wayland;
+#[cfg(target_os = "linux")]
+pub(crate) mod x11;
 
 /// The CPU present backend for this cell: the first-party CoreGraphics presenter.
 #[cfg(all(target_os = "macos", not(test)))]
 pub(crate) type CpuSurface = mac::MacCpuPresenter;
+/// The CPU present backend for this cell: X11 or Wayland, by the window's server.
+#[cfg(all(target_os = "linux", not(test)))]
+pub(crate) type CpuSurface = linux::LinuxPresenter;
 /// The CPU present backend for this cell: `softbuffer`.
-#[cfg(all(not(target_os = "macos"), not(test)))]
+#[cfg(all(not(any(target_os = "macos", target_os = "linux")), not(test)))]
 pub(crate) type CpuSurface = softbuffer_surface::SoftbufferPresenter;
 /// The test build's CPU surface: the platform presenter, or a scripted one a
 /// headless test installs to drive the real present path ([`scripted`]).

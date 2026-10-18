@@ -1,0 +1,46 @@
+targo trust: hardened profile `unix_hardened` enabled
+targo trust: using native compiler at /home/u/toolchains-gb10/trust-41d79979/bin/trustc (sibling trustc next to `targo-trust`)
+targo trust: using codegen backend `llvm`
+warning: verified tool launcher `/home/u/toolchains-gb10/trust-41d79979/bin/targo` carries CALLER-OWNED (unsealed) pathname authority: no other principal can substitute it and its content is pinned for this run, but immutable injected search directories do not bind `/home/u/toolchains-gb10/trust-41d79979/bin/targo`'s embedded RPATH/RUNPATH/install-name closure or the OS default loader cache/shared libraries; release authority requires a sealed handle-bound launcher and authenticated runtime image. Proof verdicts are unaffected; the toolchain binary's sealed release provenance is not proven. Set TRUST_REQUIRE_SEALED_LAUNCHER=1 to demand the release-grade closure instead.
+warning: verified tool launcher `/home/u/toolchains-gb10/trust-41d79979/bin/trustc` carries CALLER-OWNED (unsealed) pathname authority: no other principal can substitute it and its content is pinned for this run, but immutable injected search directories do not bind `/home/u/toolchains-gb10/trust-41d79979/bin/trustc`'s embedded RPATH/RUNPATH/install-name closure or the OS default loader cache/shared libraries; release authority requires a sealed handle-bound launcher and authenticated runtime image. Proof verdicts are unaffected; the toolchain binary's sealed release provenance is not proven. Set TRUST_REQUIRE_SEALED_LAUNCHER=1 to demand the release-grade closure instead.
+    Checking libc v0.2.186 (/home/u/work/crates/aterm-libc)
+error: verified runtime-library directory path component `/home/u/.cache/aterm-judge-fixture.wGWg0z/g` is group- or world-writable (uid=1000, mode=0o775); any local principal could substitute the executed object between authorization and execution
+
+=== Trust Verification Report ===
+Level: L2 | Duration: 5345ms
+Budget profile: c870797a6939 (builtin) backstop=1000 effort=384 schema=4; not in the id: vc_clock_ms=5000 function_clock_ms=120000 worker_threads=0 frontend_threads=1 (pinned)
+
+  [UNKNOWN] [transport:missing-json] missing structured Trust JSON transport (targo-trust)
+
+COULD NOT RUN: verification did not run to a measurement: targo-trust found 1 transport defect(s) and reports each as a row of its own, which has no stable key, so the unit's verdicts cannot be compared: `transport:missing-json`: native verification requested -Z trust-verify-output=json but the compiler emitted no TRUST_JSON transport rows; human-readable Trust diagnostics cannot prove obligations (filed under <transport>), so this run has no counts
+Stop causes: unclassified=1 — COULD NOT RUN: resource admission refused the solver, or a row carried no stable key, so this run is not a measurement
+Publication boundary: 0 obligation(s) passed the compiler, all 0 published (0 withheld)
+Coverage: unknown (compiler emitted no coverage_summary transport row; older toolchain?)
+Cargo proof scope: INCOMPLETE — 1 active Unit(s) excluded from the authenticated proof frontier
+  Excluded Cargo Unit: package_id="path+file:///home/u/work/crates/aterm-libc#libc@0.2.186" package_name="libc" target="libc" target_kinds=["lib"] compile_target="aarch64-unknown-linux-gnu" compile_target_spec_sha256=None unit_index=1 mode="check" proof_role="excluded" graph_role="dependency" reason="dependency-policy-excluded"
+Result: FAIL
+=================================
+
+  <transport> [INCONCLUSIVE] (1 obligations: 0 proved, 0 runtime-checked, 0 failed, 1 unknown; 0ms; max level: L0 safety)
+    unknown by kind: assertion=1
+    [assertion] assertion: transport:missing-json UNKNOWN (targo-trust: `#[trust(static)]` requires a static proof, but the solver returned unknown: native verification requested -Z trust-verify-output=json but the compiler emitted no TRUST_JSON transport rows; human-readable Trust diagnostics cannot prove obligations)
+
+  1 functions, 0 proved, 0 runtime-checked, 0 failed, 1 unknown
+  unknown by kind: assertion=1
+  Trust Surface (reported verification obligations):
+  Trust reported 1 obligation
+  additionally proved=0 (certified=0, smt-backed=0), runtime-checked=0, left unknown=1, rests on assumed/trusted=0 (contract-assumed=0, fully-trusted=0)
+  Verdict: INCONCLUSIVE
+  Gate: FAIL [advisory lane, exit 2] (0 proved, 0 failed, 0 runtime-checked, 0 assumed, 0 mandated, 0 contract-panic, 1 unknown / 1 total)
+
+  Dependency and foundational trust base:
+    Conditional  alloc  (standard-library crate `alloc` remains a foundational TCB component; local-subject verification checks selected obligations, but all proofs remain conditional on uncovered std/compiler/runtime semantics)
+    Conditional  cargo-target(package_id="path+file:///home/u/work/crates/aterm-libc#libc@0.2.186",package="libc",kind=["lib"],target="libc",compile_target="aarch64-unknown-linux-gnu",compile_mode="check",compile_kind="host",unit_identity_sha256="91cd84e36baf97f2c08649f8fc573dbaf764ab38857078cc4b5ef9bb2d1dcc50",compile_target_spec_sha256=None,proof_unit_index=1,proof_unit_mode="check",proof_unit_role="excluded",semantics_sha256="497849ff30529d3beefec9cd71ae7eae97765262a758f973fdc04ee00607d135");graph_role="dependency"  (graph_role="dependency"; exclusion_reason="dependency-policy-excluded"; active compiler-capable Cargo unit was excluded by the explicit dependency policy; proof is conditional on this exact unit's correctness)
+    Trusted      core  (standard-library crate `core` remains a foundational TCB component; local-subject verification checks selected obligations, but all proofs remain conditional on uncovered std/compiler/runtime semantics)
+    Conditional  std  (standard-library crate `std` remains a foundational TCB component; local-subject verification checks selected obligations, but all proofs remain conditional on uncovered std/compiler/runtime semantics)
+targo trust: error: verification did not run: no per-function TRUST_JSON transport row, authenticated coverage summary, or terminal Cargo target inventory was collected
+Likely causes:
+- the unique `-Z trust-verify-session` compiler-session rustflag did not reach the compiler or an authenticated primary target
+- the linked Trust Cargo frontend (sibling `targo` next to trustc) is missing or was bypassed
+- the selected source or Cargo targets did not invoke trustc
+Note: targo-trust injects a unique compiler-session rustflag and rejects selected `fresh=true` artifacts; a warm Cargo cache is not accepted as proof evidence.

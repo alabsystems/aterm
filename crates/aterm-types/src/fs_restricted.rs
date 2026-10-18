@@ -21,6 +21,57 @@ pub fn create_dir_restricted(path: &Path) -> io::Result<()> {
     }
 }
 
+/// The mode a missing ancestor of one of aterm's own directories is born with
+/// ([`create_dir_all_unshared`]): what a `022` umask gives it, and never the group or
+/// other write bit a plain `create_dir_all` leaves under `002` (a user-private-group
+/// login's default) or `000`.
+pub const ANCESTOR_DIR_MODE: u32 = 0o755;
+
+/// Create `dir` and its missing ancestors so that no directory this call makes is group-
+/// or other-writable, whatever the umask: each missing ancestor is born
+/// [`ANCESTOR_DIR_MODE`] and `dir` itself `leaf_mode`, both narrowed further by the umask
+/// (a tighter umask stays tighter). A directory that already exists is left exactly as it
+/// is, mode and `st_ctime` included; an existing `0775` ancestor stays `0775`. Follows a
+/// link as `create_dir_all` does, so a caller that refuses one checks before and after.
+///
+/// `create_dir_all` makes every missing component `0777 & ~umask`: under umask `002` the
+/// first atpkg pass made `~/.local/share/aterm` `0775` on the way to its `0700` prefix,
+/// and `targo trust` refuses every toolchain installed below a group-writable directory.
+/// Non-Unix: `create_dir_all` (no mode to ask for).
+pub fn create_dir_all_unshared(dir: &Path, leaf_mode: u32) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::fs::DirBuilder;
+        use std::os::unix::fs::DirBuilderExt;
+        if dir.as_os_str().is_empty() {
+            return Ok(());
+        }
+        // `create_dir_all`'s own order: the leaf first, so an existing directory costs one
+        // `mkdir`; its ancestors only when the leaf's parent is missing.
+        match DirBuilder::new().mode(leaf_mode).create(dir) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(_) if dir.is_dir() => return Ok(()),
+            Err(e) => return Err(e),
+        }
+        if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+            DirBuilder::new()
+                .recursive(true)
+                .mode(ANCESTOR_DIR_MODE)
+                .create(parent)?;
+        }
+        match DirBuilder::new().mode(leaf_mode).create(dir) {
+            Err(_) if dir.is_dir() => Ok(()),
+            made => made,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = leaf_mode;
+        std::fs::create_dir_all(dir)
+    }
+}
+
 /// Create `dir` (and parents) if absent, force mode `0700`, and verify it is ours and not
 /// group/other-writable: the control socket's private-dir rule, shared by the session-identity
 /// tree. Forcing the mode alone is not enough, because a directory another user pre-created
@@ -77,19 +128,27 @@ pub fn dir_safe_for_private_write(uid: u32, owner_uid: u32, mode: u32) -> bool {
 mod tests {
     use super::*;
 
+    /// Only a directory we own that nobody else can write is safe; group or
+    /// other READ is the caller's choice.
     #[test]
-    fn private_write_accepts_owned_unwritable_by_others() {
-        assert!(dir_safe_for_private_write(501, 501, 0o040700));
-        // Group/other read is the caller's choice; only write is fatal.
-        assert!(dir_safe_for_private_write(501, 501, 0o040755));
-        assert!(dir_safe_for_private_write(0, 0, 0o040700));
-    }
-
-    #[test]
-    fn private_write_rejects_foreign_owner() {
-        // /tmp: root-owned, sticky, world-writable — refused on both counts.
-        assert!(!dir_safe_for_private_write(501, 0, 0o041777));
-        assert!(!dir_safe_for_private_write(501, 502, 0o040700));
+    fn private_write_needs_our_ownership_and_no_foreign_write_bit() {
+        for (uid, owner, mode, safe) in [
+            (501, 501, 0o040700, true),
+            (501, 501, 0o040755, true),
+            (0, 0, 0o040700, true),
+            // /tmp: root-owned, sticky, world-writable — refused on both counts.
+            (501, 0, 0o041777, false),
+            (501, 502, 0o040700, false),
+            (501, 501, 0o040775, false),
+            (501, 501, 0o040757, false),
+            (501, 501, 0o040722, false),
+        ] {
+            assert_eq!(
+                dir_safe_for_private_write(uid, owner, mode),
+                safe,
+                "uid {uid} owner {owner} mode {mode:o}"
+            );
+        }
     }
 
     /// `ensure_private_dir` creates 0700 (parents included), tightens a looser dir of ours, and
@@ -118,13 +177,6 @@ mod tests {
         ensure_private_dir(&dir).expect("an existing dir of ours is tightened, not refused");
         assert_eq!(mode(&dir), 0o700);
         let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn private_write_rejects_group_or_other_writable() {
-        assert!(!dir_safe_for_private_write(501, 501, 0o040775));
-        assert!(!dir_safe_for_private_write(501, 501, 0o040757));
-        assert!(!dir_safe_for_private_write(501, 501, 0o040722));
     }
 
     /// An already-`0700` directory of ours gets no `chmod(2)`, so its `st_ctime` holds; a

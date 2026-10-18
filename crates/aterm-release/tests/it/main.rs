@@ -62,6 +62,9 @@ mod gates;
 #[path = "../../src/hook.rs"]
 #[allow(dead_code)]
 mod hook;
+#[path = "../../src/interrupt.rs"]
+#[allow(dead_code)]
+mod interrupt;
 #[path = "../../src/ledger.rs"]
 #[allow(dead_code)]
 mod ledger;
@@ -92,15 +95,15 @@ mod site;
 #[path = "../../src/snapshot.rs"]
 #[allow(dead_code)]
 mod snapshot;
+#[path = "../../src/tap.rs"]
+#[allow(dead_code)]
+mod tap;
 #[path = "../../src/transforms.rs"]
 #[allow(dead_code)]
 mod transforms;
 #[path = "../../src/trust_candidate.rs"]
 #[allow(dead_code)]
 mod trust_candidate;
-#[path = "../../src/trust_closure.rs"]
-#[allow(dead_code)]
-mod trust_closure;
 #[path = "../../src/trust_compare.rs"]
 #[allow(dead_code)]
 mod trust_compare;
@@ -120,6 +123,7 @@ mod verify;
 mod apple_tier;
 mod build_once;
 mod candidate_replay;
+mod changelog_golden;
 mod channel_floor_model;
 mod channel_latest;
 mod claim_landing_model;
@@ -130,7 +134,6 @@ mod handoff_policy_bundle;
 mod hooks;
 mod journal_prefix_model;
 mod ledger_race;
-mod linux_release_arch;
 mod machine_roster;
 mod plist_stamp;
 mod publisher_fence_liveness;
@@ -142,5 +145,4 @@ mod resume;
 mod signconf;
 mod site_sync;
 mod snapshot_take;
-mod transcript_grid;
 mod trust_facts_model;

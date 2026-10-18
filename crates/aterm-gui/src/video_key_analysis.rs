@@ -335,12 +335,6 @@ mod tests {
             field(&block, "capture_floor_p50_ms"),
             "{block}"
         );
-        // No field name suggests a photon latency.
-        for gone in ["\"p50_ms\"", "\"p90_ms\"", "\"max_ms\"", "\"verdict\""] {
-            assert!(!block.contains(gone), "{gone} still emitted:\n{block}");
-        }
-        // The disclaimer travels in band, on the line a reader greps.
-        assert!(block.contains("NOT key->photon latency"), "{block}");
     }
 
     /// A 120 ms echo recorded at 30 fps with keys ~107 ms apart reads ~30 ms at

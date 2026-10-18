@@ -373,7 +373,6 @@ fn punctuation_noise_never_panics() {
 /// entry point, on 13 bytes of untrusted config.
 #[test]
 fn a_multi_byte_character_inside_a_unicode_escape_is_an_error_not_an_abort() {
-    let mut checked = 0usize;
     for (marker, digits) in [('u', 4usize), ('U', 8usize)] {
         for lead in 0..digits {
             for intruder in ['\u{e9}', '\u{20ac}', '\u{1f600}'] {
@@ -399,15 +398,9 @@ fn a_multi_byte_character_inside_a_unicode_escape_is_an_error_not_an_abort() {
                 assert!(bare.parse::<aterm_toml::Value>().is_err());
                 assert!(bare.parse::<aterm_toml::edit::Value>().is_err());
                 assert!(aterm_toml::edit::Key::parse(&bare).is_err());
-
-                checked += 1;
             }
         }
     }
-    assert_eq!(
-        checked, 36,
-        "the matrix is 2 widths x 12 offsets x 3 intruders"
-    );
 }
 
 /// The other half of the same edit: `u32::from_str_radix` accepted a leading

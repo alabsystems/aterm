@@ -22,8 +22,8 @@ path = "src/lib.rs"
 # enlarge it. `aterm-toml`'s comment-preserving document model reads the policy
 # file, whose comments carry the fork reasons.
 aterm-toml = { workspace = true }
-# The shared source walk and `REVIEWED_VENDORED_CRATES`, read directly so the
-# vendor registry has one definition.
+# The shared source walk, the [patch] classification and the census review
+# (`reviewed_forks`, read from vendor/forge.toml), so each has one definition.
 aterm-census = { workspace = true }
 # Parses cargo's metadata JSON.
 aterm-json = { workspace = true }

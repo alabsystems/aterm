@@ -6,8 +6,9 @@
 use std::collections::BTreeMap;
 
 use aterm_grid::{AbsoluteRowUpdate, Grid};
+use aterm_models_misc::top_anchored_scroll_history_model;
 use aterm_selection::{SelectionSide, SelectionType, TextSelection};
-use aterm_spec::derive::{Model, top_anchored_scroll_history_model};
+use aterm_spec::derive::Model;
 use aterm_spec::verify;
 
 const ROWS: u16 = 5;

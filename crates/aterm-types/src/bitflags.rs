@@ -306,41 +306,26 @@ mod tests {
     }
 
     #[test]
-    fn test_contains() {
-        let f = TestFlags::A | TestFlags::B;
-        assert!(f.contains(TestFlags::A));
-        assert!(f.contains(TestFlags::B));
-        assert!(!f.contains(TestFlags::C));
-        assert!(f.contains(TestFlags::AB));
-    }
-
-    #[test]
-    fn test_intersects() {
-        let f = TestFlags::A | TestFlags::C;
-        assert!(f.intersects(TestFlags::A));
-        assert!(!f.intersects(TestFlags::B));
-        assert!(f.intersects(TestFlags::AB));
-    }
-
-    #[test]
-    fn test_insert_remove_toggle() {
-        let mut f = TestFlags::empty();
-        f.insert(TestFlags::A);
-        assert!(f.contains(TestFlags::A));
-        f.remove(TestFlags::A);
-        assert!(!f.contains(TestFlags::A));
-        f.toggle(TestFlags::B);
-        assert!(f.contains(TestFlags::B));
-        f.toggle(TestFlags::B);
-        assert!(!f.contains(TestFlags::B));
-    }
-
-    #[test]
-    fn test_set() {
-        let mut f = TestFlags::empty();
-        f.set(TestFlags::C, true);
-        assert!(f.contains(TestFlags::C));
-        f.set(TestFlags::C, false);
-        assert!(!f.contains(TestFlags::C));
+    fn predicates_and_mutators() {
+        use TestFlags as F;
+        let f = F::A | F::B;
+        assert!(f.contains(F::A) && f.contains(F::B) && f.contains(F::AB));
+        assert!(!f.contains(F::C));
+        let f = F::A | F::C;
+        assert!(f.intersects(F::A) && f.intersects(F::AB));
+        assert!(!f.intersects(F::B));
+        let mut f = F::empty();
+        f.insert(F::A);
+        assert_eq!(f, F::A);
+        f.remove(F::A);
+        assert!(f.is_empty());
+        f.toggle(F::B);
+        assert_eq!(f, F::B);
+        f.toggle(F::B);
+        assert!(f.is_empty());
+        f.set(F::C, true);
+        assert_eq!(f, F::C);
+        f.set(F::C, false);
+        assert!(f.is_empty());
     }
 }

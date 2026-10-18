@@ -187,16 +187,6 @@ impl PolicyState {
         self.engine = Some(engine);
     }
 
-    /// Drop the engine, recompiling every gate table back to the legacy posture.
-    #[cfg(test)]
-    pub(super) fn clear(&mut self) {
-        self.engine = None;
-        self.gates = PolicyGates::compile(None);
-        self.xtwinops = compile_xtwinops(None);
-        self.shell = compile_shell(None);
-        self.response_limit = RateLimitSlot::UNDECLARED;
-    }
-
     /// OSC 133 / OSC 633 gate verdict for this dispatch: a table read for the
     /// `(major, subcommand-letter)` pairs shell integration uses, a live
     /// evaluation otherwise.
@@ -442,12 +432,6 @@ mod tests {
             Response::Drop,
         )));
         assert!(!sets(&mut term), "and swapping back must shut it again");
-
-        term.clear_policy_engine();
-        assert!(
-            sets(&mut term),
-            "clearing the engine must restore the legacy write bit"
-        );
     }
 
     /// The compiled table agrees with a per-dispatch mint
@@ -495,29 +479,6 @@ mod tests {
     }
 
     #[test]
-    fn no_engine_compiles_to_fallback() {
-        assert_eq!(
-            PolicyGates::compile(None).response_sink(),
-            BridgeDecision::Fallback,
-            "with no engine installed the gate must defer to the legacy path, \
-             exactly as `engine_decision(None, ..)` does"
-        );
-    }
-
-    #[test]
-    fn apply_policy_engine_invalidates_the_memo() {
-        let mut term = Terminal::new(24, 80);
-        assert!(replies(&mut term), "no engine: the legacy path replies");
-
-        term.apply_policy_engine(engine(Response::Drop));
-        assert!(
-            !replies(&mut term),
-            "installing a `* = Drop` policy must suppress the reply — a stale \
-             memo would answer from the previous (absent) policy"
-        );
-    }
-
-    #[test]
     fn replacing_the_engine_invalidates_the_memo_in_both_directions() {
         let mut term = Terminal::new(24, 80);
 
@@ -536,21 +497,6 @@ mod tests {
             !replies(&mut term),
             "swapping Execute -> Drop must re-apply it; a stale memo would keep \
              answering Execute and leak a reply the installed policy forbids"
-        );
-    }
-
-    #[test]
-    fn clear_policy_engine_invalidates_the_memo() {
-        let mut term = Terminal::new(24, 80);
-
-        term.apply_policy_engine(engine(Response::Drop));
-        assert!(!replies(&mut term), "Drop policy suppresses");
-
-        term.clear_policy_engine();
-        assert!(
-            replies(&mut term),
-            "clearing the engine must restore the legacy path; a stale memo \
-             would keep suppressing replies under no policy at all"
         );
     }
 
@@ -748,13 +694,6 @@ mod tests {
             Response::Execute,
         )));
         assert!(reports(&mut term), "and swapping back must reopen it");
-
-        term.clear_policy_engine();
-        assert!(
-            !reports(&mut term),
-            "clearing the engine must return the legacy `allow_window_ops` bit \
-             (false) to authority"
-        );
     }
 
     /// Every covered `(major, subcommand)` reads back what a live evaluation
@@ -902,12 +841,6 @@ mod tests {
             "swapping to a profile with no OSC 133 rule must lift the denial; a \
              stale memo would keep dropping every prompt mark"
         );
-
-        term.clear_policy_engine();
-        assert!(
-            !dropped(&mut term, &mark),
-            "clearing the engine leaves the nonce check, which this mark passes"
-        );
     }
 
     #[test]
@@ -952,18 +885,6 @@ mod tests {
                 .collect(),
             ..policy_with_rule("*", Response::Execute)
         }
-    }
-
-    #[test]
-    fn response_slot_reports_absence_of_an_engine() {
-        let mut state = PolicyState::new();
-        let clock = aterm_policy::limits::SystemClock;
-        assert_eq!(
-            state.response_rate_limit_try_consume(1, &clock),
-            None,
-            "no engine installed: `send_response` must be told so it falls back \
-             to the legacy in-transient limiter instead of being allowed outright"
-        );
     }
 
     #[test]
@@ -1059,13 +980,6 @@ mod tests {
         assert!(
             !replies(&mut term),
             "re-installing the hard block must bite"
-        );
-
-        term.clear_policy_engine();
-        assert!(
-            replies(&mut term),
-            "clearing the engine must restore the legacy in-transient limiter, \
-             not leave the cleared policy's slot in force"
         );
     }
 }

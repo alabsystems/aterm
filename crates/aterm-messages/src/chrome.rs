@@ -150,30 +150,4 @@ mod tests {
         assert_eq!(f.last_rise(), Some(t0 + ms(300)), "a stale rise");
         assert!(fall_allowed(f.floor(), t0 + ms(700)));
     }
-
-    #[test]
-    fn the_band_waits_the_latest_floor_of_its_windows() {
-        let t0 = Instant::now();
-        assert_eq!(latest([None, None]), None);
-        assert_eq!(
-            latest([Some(t0 + ms(10)), None, Some(t0 + ms(20))]),
-            Some(t0 + ms(20))
-        );
-    }
-
-    #[test]
-    fn only_a_growing_row_count_is_a_rise() {
-        assert!(is_rise(0, 1));
-        assert!(is_rise(1, 3));
-        assert!(!is_rise(1, 1));
-        assert!(!is_rise(2, 1));
-    }
-
-    #[test]
-    fn the_settle_sits_between_the_run_gap_and_the_sources_quiet() {
-        assert_eq!(CHROME_REGROW_SETTLE, ms(400));
-        assert!(CHROME_REGROW_SETTLE > ms(250));
-        assert!(CHROME_REGROW_SETTLE < crate::SHRINK_QUIET);
-        assert!(CHROME_REGROW_SETTLE < crate::presence::FOLD_QUIET);
-    }
 }

@@ -6,7 +6,7 @@
 //! continuation row, with nothing in the blank indent.
 //!
 //! Every take is real Claude Code (v2.1.280, fullscreen composer on the alternate screen)
-//! recorded with `docs/design/repro/ptyrec.py` in a headless aterm at 40×120 (7×14 px cells),
+//! recorded with `targo --unverified lab ptyrec` in a headless aterm at 40×120 (7×14 px cells),
 //! keys via `aterm ctl key`, nothing submitted. The line is typed, the caret walked back (Left,
 //! or Alt+Left/Alt+Right word hops), and ` already been runnignin` typed at 8–12 cps:
 //!
@@ -315,7 +315,8 @@ impl Host {
         self.glow
             .observe_row_with_trust(c.row, c.col, &self.row_buf, self.now, trust);
         observe_neighbor_rows(&self.term, &mut self.glow, &mut self.nbrs, c.row, ROWS);
-        self.glow.observe_print_anchor(self.term.print_anchor());
+        self.glow
+            .observe_print_anchor(aterm_effects::host::motion_print_anchor(&self.term).0);
         self.glow.observe_ribbon_row(c.row, &self.row_buf);
         observe_ribbon_rows_where::<WITNESS_ROWS>(
             &self.term,

@@ -54,7 +54,7 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
             // A signal is recorded, never fatal: the commit's cutter (in this process
             // group, so a terminal's Ctrl-C reaches it too) ends, the worktree goes, and
             // the hook exits as the signal would have it.
-            crate::release_steps::interrupt::install();
+            crate::interrupt::install();
             let facts = PrePromote::from_process();
             let mut check = |asked: Asked<'_>, full: &str| {
                 let args = ["check", "--commit", full, "--cut"];
@@ -77,7 +77,7 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
                 &mut std::io::stdout(),
                 &mut std::io::stderr(),
             );
-            crate::release_steps::interrupt::caught().map_or(code, |sig| 128 + sig)
+            crate::interrupt::caught().map_or(code, |sig| 128 + sig)
         }
         Some("post-promote") => match toplevel(cwd, &[]) {
             Some(root) => crate::site::run_cli(rest, &root),

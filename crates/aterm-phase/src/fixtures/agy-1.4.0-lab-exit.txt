@@ -1,0 +1,51 @@
+# agy 1.4.0 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Antigravity CLI, launched by path with a scratch `HOME` whose settings name the Gemini API provider, its Google hosts black-holed, a fake `GEMINI_API_KEY` and `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:<port>` (a local stub of the Gemini API, crates/aterm-lab) · `/quit` typed and sent: the agent exits to the lab's shell (`lab$`), the resume hint it prints above it
+
+> an ordinary turn 2
+
+  Hi! I am the local lab stub, not a model. (reply 12)
+
+────────────────────────────────────────────────────────────
+> an ordinary turn 3
+
+  Hi! I am the local lab stub, not a model. (reply 13)
+
+────────────────────────────────────────────────────────────
+> an ordinary turn 4
+
+  Hi! I am the local lab stub, not a model. (reply 14)
+
+────────────────────────────────────────────────────────────
+> an ordinary turn 5
+
+  Hi! I am the local lab stub, not a model. (reply 15)
+
+────────────────────────────────────────────────────────────
+> an ordinary turn 6
+
+  Hi! I am the local lab stub, not a model. (reply 16)
+
+────────────────────────────────────────────────────────────
+> an ordinary turn 7
+
+  Hi! I am the local lab stub, not a model. (reply 17)
+
+────────────────────────────────────────────────────────────
+> an ordinary turn 8
+
+  Hi! I am the local lab stub, not a model. (reply 18)
+
+────────────────────────────────────────────────────────────
+> carry on after error 1
+
+⚠ agent executor error: generating and executing: Error 401, Message: Request had invalid authentication credentials. Expected OAuth 2 access
+token, login cookie or other valid authentication credential. See https://developers.google.com/identity/sign-in/web/devconsole-project.,
+Status: UNAUTHENTICATED, Details: []
+Error ID: 5c8b47e7-e136-4419-b0ee-79f4dee6e2e6-37
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+Resume with -c (or command below):
+agy --conversation=1a60f456-9d99-48a6-8dd5-e110e10b16d6
+lab$

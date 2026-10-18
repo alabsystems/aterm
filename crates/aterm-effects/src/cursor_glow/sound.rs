@@ -114,7 +114,7 @@ impl CursorGlow {
     /// Timbre: the cue carries the heat this keystroke is about to produce. Heat
     /// scales the synth's level as `0.55 + 0.45·heat` and its ember layer as
     /// `0.1 + 0.28·heat`, so one missing [`Self::HEAT_GAIN`] step is audible
-    /// (pinned by `one_keystroke_of_heat_lag_is_audible` in `trail_sound`). This
+    /// (about 0.8 dB). This
     /// cools the standing heat/flare by the gap since the last tick (`heat_at`)
     /// and adds the same cadence credit the echo will, off the key clock (under
     /// a flood, key intervals are the true rhythm). `self.heat` is not written:
@@ -345,7 +345,7 @@ impl CursorGlow {
     /// that never read `intensity`). Every tick that may open the key seam calls
     /// this first.
     pub(super) fn store_key_timbre(&mut self, cfg: &GlowConfig) {
-        self.heat_gain_live = Self::heat_gain(cfg, matches!(cfg.style, GlowStyle::Fire));
+        self.heat_gain_live = Self::heat_gain(matches!(cfg.style, GlowStyle::Fire));
         self.heat_tau_live = Self::heat_tau(cfg);
     }
 }

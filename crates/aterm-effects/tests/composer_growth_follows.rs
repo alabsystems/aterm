@@ -33,7 +33,7 @@ use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig};
 use aterm_effects::rainbow_kitty::TypedClass;
 use aterm_effects::rainbow_kitty::meteor::tri;
 use aterm_effects::rainbow_kitty::ribbon::{FLOW_TOTAL_S, RETIRE_MELT_S, walk_t};
-use aterm_spec::derive::rainbow_short_wrap_park_model;
+use aterm_models_effects::rainbow_short_wrap_park_model;
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
@@ -1155,39 +1155,39 @@ fn a_line_whose_first_glyph_twins_above_and_below_follows_whole() {
     }
 }
 
-/// A wrap that moves more than it keeps: at 20 columns wrap 5 keeps `this` (4)
-/// and moves `confirmatio` (11). The moved records are holes a row up only
-/// because the wrap relaid them, and must not refuse the follow. The line
-/// follows and flows; the hand stops at the wrap because the next wrap would
-/// fall inside the window.
+/// The kept line follows its text and flows whatever the wrap's proportions,
+/// the hand stopped at the wrap: a wrap that moves more than it keeps (20
+/// columns, wrap 5 keeps `this` and moves `confirmatio`: the moved records are
+/// holes a row up only because the wrap relaid them, and must not refuse the
+/// follow), a long path carried down under a short line (`see` at 60 columns),
+/// and a wrap that keeps only one or two cells.
 #[test]
-fn a_narrow_composer_s_wrap_that_moves_more_than_it_keeps_follows() {
-    let text = fit(NATURAL, NARROW_20.cols - 4);
-    let wraps = run_census(NARROW_20, &text, &[5], Hand::Stops);
-    let sr = &wraps[0];
-    assert!(
-        sr.kept == 4 && sr.moved == "confirmatio",
-        "premise: wrap 5 keeps `this` and moves `confirmatio`: kept {}, moved `{}`",
-        sr.kept,
-        sr.moved
-    );
-    assert_follows_and_flows(sr, "the owner's text at 20 columns, wrap 5");
-}
-
-/// At 60 columns, `see` and a 61-letter path at 130 ms: the wrap keeps `see` and moves 52
-/// letters; the kept cells follow and flow.
-#[test]
-fn a_wrap_that_carries_a_long_path_down_keeps_its_short_line_following() {
-    let text = "see crates/aterm-effects/src/rainbow_kitty/witness_follow_runs.rs";
-    let wraps = run_census(GLASS_60, text, &[1], Hand::Stops);
-    let sr = &wraps[0];
-    assert!(
-        sr.kept == 3 && sr.w == 52,
-        "premise: the wrap keeps `see` and moves 52 letters: kept {}, w {}",
-        sr.kept,
-        sr.w
-    );
-    assert_follows_and_flows(sr, "`see` and a path at 60 columns");
+fn every_wrap_proportion_s_kept_line_follows_and_flows() {
+    let narrow = fit(NATURAL, NARROW_20.cols - 4);
+    let cases: [(&str, Shape, &str, usize, usize, usize); 4] = [
+        ("20 cols, wrap 5", NARROW_20, &narrow, 5, 4, 11),
+        ("`see` and a path, 60 cols", GLASS_60, PATH_60, 1, 3, 52),
+        ("keeps 1, 20 cols", NARROW_20, KEPT_1, 1, 1, 14),
+        ("keeps 2, 20 cols", NARROW_20, KEPT_2, 1, 2, 13),
+    ];
+    crate::common::par_map(&cases, |&(what, shape, text, wrap, kept, w)| {
+        let wraps = run_census(shape, text, &[wrap], Hand::Stops);
+        let sr = &wraps[0];
+        assert!(
+            sr.kept == kept && sr.w == w,
+            "{what}: premise: kept {} w {} (moved `{}`)",
+            sr.kept,
+            sr.w,
+            sr.moved
+        );
+        assert!(
+            sr.followed() >= kept as u64,
+            "{what}: ribbon_followed= grew {} — the kept line did not follow its text: {}",
+            sr.followed(),
+            sr.curve()
+        );
+        assert_follows_and_flows(sr, what);
+    });
 }
 
 /// `see` and a 61-letter path at 60 columns, 130 ms keys: the wrap keeps `see`
@@ -1198,132 +1198,6 @@ const PATH_60: &str = "see crates/aterm-effects/src/rainbow_kitty/witness_follow
 /// keeps 11 and moves 74 letters.
 const PATH_90: &str = "please read crates/aterm-effects/src/rainbow_kitty/witness_follow_runs_and_the_relaid_suffix.rs now";
 
-/// A wrap that moves a word at least as long as the line it keeps: the relaid
-/// word covers the column of the eaten Space, which the follow split leaves on
-/// the caret row in the old line's run. The new row must still continue the
-/// moved word's walk rather than being laid into that run from its anchor, and
-/// with the hand stopped the relay (at the park flush, ≤ 0.25 s) must still find
-/// its origin after the old cells melt at 0.12 s.
-#[test]
-fn a_long_word_s_wrap_continues_the_old_row_s_walk_when_the_hand_stops() {
-    let nr = read_new_row(GLASS_60, PATH_60, 1, Then::Stops);
-    assert!(
-        nr.kept == 3 && nr.w == 52,
-        "premise: kept {} w {}",
-        nr.kept,
-        nr.w
-    );
-    assert_new_row_continues(&nr, "`see` and a path at 60 columns, the hand stopped");
-}
-
-/// The same wrap, typing three keys on: the eaten Space's cell and later keys
-/// continue the relay's walk, not the old run's stops.
-#[test]
-fn a_long_word_s_wrap_continues_the_old_row_s_walk_as_the_hand_types_on() {
-    let nr = read_new_row(GLASS_60, PATH_60, 1, Then::TypesOn(3));
-    assert!(
-        nr.kept == 3 && nr.w == 52,
-        "premise: kept {} w {}",
-        nr.kept,
-        nr.w
-    );
-    assert_new_row_continues(&nr, "`see` and a path at 60 columns, typed on");
-}
-
-/// The narrow composer (20 columns, 130 ms): wrap 5 keeps `this` (4) and moves
-/// `confirmatio` (11); the eaten Space at column 6 must not survive.
-#[test]
-fn a_narrow_wrap_continues_the_old_row_s_walk_when_the_hand_stops() {
-    let text = fit(NATURAL, NARROW_20.cols - 4);
-    let nr = read_new_row(NARROW_20, &text, 5, Then::Stops);
-    assert!(
-        nr.kept == 4 && nr.w == 11,
-        "premise: kept {} w {}",
-        nr.kept,
-        nr.w
-    );
-    assert_new_row_continues(
-        &nr,
-        "the owner's text at 20 columns, wrap 5, the hand stopped",
-    );
-}
-
-/// The same, typing ` mes` on (the line fills to 16 cells, no wrap).
-#[test]
-fn a_narrow_wrap_continues_the_old_row_s_walk_as_the_hand_types_on() {
-    let text = fit(NATURAL, NARROW_20.cols - 4);
-    let nr = read_new_row(NARROW_20, &text, 5, Then::TypesOn(4));
-    assert!(
-        nr.kept == 4 && nr.w == 11,
-        "premise: kept {} w {}",
-        nr.kept,
-        nr.w
-    );
-    assert_new_row_continues(&nr, "the owner's text at 20 columns, wrap 5, typed on");
-}
-
-/// 90 columns, 60 ms: `please read` and 74 moved letters of a path; the eaten
-/// Space's column must not survive.
-#[test]
-fn a_path_s_wrap_at_the_owner_s_width_continues_the_old_row_s_walk_when_the_hand_stops() {
-    let nr = read_new_row(OWNER_90, PATH_90, 1, Then::Stops);
-    assert!(
-        nr.kept == 11 && nr.w == 74,
-        "premise: kept {} w {}",
-        nr.kept,
-        nr.w
-    );
-    assert_new_row_continues(
-        &nr,
-        "`please read` and a path at 90 columns, the hand stopped",
-    );
-}
-
-/// The same, typing three keys on.
-#[test]
-fn a_path_s_wrap_at_the_owner_s_width_continues_the_old_row_s_walk_as_the_hand_types_on() {
-    let nr = read_new_row(OWNER_90, PATH_90, 1, Then::TypesOn(3));
-    assert!(
-        nr.kept == 11 && nr.w == 74,
-        "premise: kept {} w {}",
-        nr.kept,
-        nr.w
-    );
-    assert_new_row_continues(&nr, "`please read` and a path at 90 columns, typed on");
-}
-
-/// Control: a wrap that keeps more than it moves (`…AUDIT WH|Y` at 90 columns,
-/// kept 84, w 2); the relaid word never reaches the eaten Space's column. Both
-/// hands.
-#[test]
-fn the_control_a_wrap_that_keeps_more_than_it_moves_continues_the_walk() {
-    for then in [Then::Stops, Then::TypesOn(12)] {
-        let nr = read_new_row(OWNER_90, NATURAL, 1, then);
-        assert!(nr.kept > nr.w, "premise: kept {} > w {}", nr.kept, nr.w);
-        assert_new_row_continues(&nr, &format!("the owner's capture at 90 columns, {then:?}"));
-    }
-}
-
-/// Two Spaces before the moved word (`see`, two Spaces, a path at 60 columns,
-/// hand stopped): the carried copy ends two cells short of the moved word, and
-/// the relay at the park flush must read the split run's walk off that copy,
-/// not the freshest run, so no letter lags a step behind.
-#[test]
-fn two_spaces_before_the_moved_word_continue_the_walk_when_the_hand_stops() {
-    let text = PATH_60.replacen(' ', "  ", 1);
-    let nr = read_new_row(GLASS_60, &text, 1, Then::Stops);
-    assert!(
-        nr.kept == 4 && nr.w == 51,
-        "premise: kept {} w {}",
-        nr.kept,
-        nr.w
-    );
-    assert_new_row_continues(
-        &nr,
-        "`see`, two Spaces and a path at 60 columns, the hand stopped",
-    );
-}
-
 /// A narrow pane of odd width: 21 columns, 17 text cells, 130 ms keys.
 const NARROW_21: Shape = Shape {
     rows: 30,
@@ -1333,129 +1207,82 @@ const NARROW_21: Shape = Shape {
     key_ms: 130,
 };
 
-/// A wrap that moves exactly as much as it keeps (`friendly` / `neighbor` at an
-/// odd width): no relaid letter covers the eaten Space, and the wrap key's own
-/// glyph landing there continues the moved word's walk.
-#[test]
-fn a_wrap_that_moves_exactly_as_much_as_it_keeps_continues_the_walk() {
-    for then in [Then::Stops, Then::TypesOn(3)] {
-        let nr = read_new_row(NARROW_21, "friendly neighbors wave", 1, then);
-        assert!(
-            nr.kept == 8 && nr.w == 8,
-            "premise: kept {} w {}",
-            nr.kept,
-            nr.w
-        );
-        assert_new_row_continues(
-            &nr,
-            &format!("`friendly neighbor|s` at 21 columns, {then:?}"),
-        );
-    }
-}
-
 /// [`NARROW_21`] with 60 ms keys.
 const NARROW_21_60: Shape = Shape {
     key_ms: 60,
     ..NARROW_21
 };
 
-/// The new line never heals into the dead remnant of the old one. The follow
-/// split leaves the old cohort on the caret row (eaten Space and moved word's
-/// old cells), resident for `RETIRE_MELT_S`. A new line reaching it must not be
-/// merged by `Ribbon::heal_seams` onto the remnant's older origin. At 60 ms
-/// keys it reaches the remnant on the relay (`kept == w`) or one or two keys on.
+/// The new row continues the moved word's walk, whatever the wrap's shape and
+/// whether the hand stops at the wrap (the relay arrives at the park flush,
+/// ≤ 0.25 s, and must still find its origin after the old cells melt at
+/// 0.12 s) or types on (the eaten Space's cell and later keys continue the
+/// relay's walk, not the old run's stops):
+///
+/// * a moved word at least as long as the line it keeps covers the eaten
+///   Space's column, which the follow split leaves on the caret row in the old
+///   line's run (a long path at 60 and 90 columns, the narrow composer);
+/// * the control: a wrap that keeps more than it moves never reaches it;
+/// * two Spaces before the moved word: the relay reads the split run's walk
+///   off the carried copy, not the freshest run;
+/// * a wrap that moves exactly as much as it keeps: the wrap key's own glyph
+///   lands on the eaten Space;
+/// * the new line reaching the old line's melting remnant (resident for
+///   `RETIRE_MELT_S`) on the relay or a few keys on is never healed onto the
+///   remnant's older origin (`Ribbon::heal_seams`);
+/// * a wrap that keeps one or two cells (a same-row caret move below
+///   `RE_ANCHOR_MIN_CELLS`) still relays the moved word.
 #[test]
-fn a_new_line_that_reaches_the_old_line_s_melting_remnant_keeps_its_own_walk() {
-    let nr = read_new_row(NARROW_21_60, "friendly neighbors wave", 1, Then::TypesOn(3));
-    assert!(
-        nr.kept == 8 && nr.w == 8,
-        "premise: kept {} w {}",
-        nr.kept,
-        nr.w
-    );
-    assert_new_row_continues(&nr, "`friendly neighbor|s` at 21 columns, 60 ms, typed on");
-}
-
-/// At 24 columns, `hello there wonderfu|l` (kept 11, w 8): the second key after
-/// the wrap reaches the remnant.
-#[test]
-fn a_new_line_two_keys_short_of_the_remnant_keeps_its_own_walk() {
-    let s = Shape {
+fn every_wrap_shape_s_new_row_continues_the_old_row_s_walk() {
+    let n20 = fit(NATURAL, NARROW_20.cols - 4);
+    let n21 = fit(NATURAL, NARROW_21.cols - 4);
+    let two_sp = PATH_60.replacen(' ', "  ", 1);
+    let cols = |cols| Shape {
         rows: 30,
-        cols: 24,
+        cols,
         cw: 15,
         ch: 28,
         key_ms: 60,
     };
-    let nr = read_new_row(
-        s,
-        "hello there wonderful day to you all",
-        1,
-        Then::TypesOn(6),
-    );
-    assert!(
-        nr.kept == 11 && nr.w == 8,
-        "premise: kept {} w {}",
-        nr.kept,
-        nr.w
-    );
-    assert_new_row_continues(
-        &nr,
-        "`hello there wonderfu|l` at 24 columns, 60 ms, typed on",
-    );
-}
-
-/// At 40 columns, English (kept 19, w 16).
-#[test]
-fn a_new_line_three_keys_short_of_the_remnant_at_forty_columns_keeps_its_own_walk() {
-    let s = Shape {
-        rows: 30,
-        cols: 40,
-        cw: 15,
-        ch: 28,
-        key_ms: 60,
-    };
-    let nr = read_new_row(
-        s,
-        "please use the apis internationalization now",
-        1,
-        Then::TypesOn(6),
-    );
-    assert!(
-        nr.kept == 19 && nr.w == 16,
-        "premise: kept {} w {}",
-        nr.kept,
-        nr.w
-    );
-    assert_new_row_continues(&nr, "kept 19 / moved 16 at 40 columns, 60 ms, typed on");
-}
-
-/// At 90 columns, 60 ms, a path (kept 44, w 41).
-#[test]
-fn a_new_line_three_keys_short_of_the_remnant_at_the_owner_s_width_keeps_its_own_walk() {
-    let text = "please read the whole of this long file nows crates/aterm-effects/src/rainbow_kitty/ribbon_follow_the_text.rs now";
-    let nr = read_new_row(OWNER_90, text, 1, Then::TypesOn(4));
-    assert!(
-        nr.kept == 44 && nr.w == 41,
-        "premise: kept {} w {}",
-        nr.kept,
-        nr.w
-    );
-    assert_new_row_continues(&nr, "kept 44 / moved 41 at 90 columns, 60 ms, typed on");
-}
-
-/// At 130 ms, 21 columns, wrap 4 (`got this` / `confirma`, kept == w).
-#[test]
-fn the_owner_s_text_at_21_columns_keeps_its_own_walk_past_the_remnant() {
-    let text = fit(NATURAL, NARROW_21.cols - 4);
-    let nr = read_new_row(NARROW_21, &text, 4, Then::TypesOn(2));
-    assert!(
-        nr.kept == 8 && nr.w == 8,
-        "premise: kept {} w {}",
-        nr.kept,
-        nr.w
-    );
-    assert_new_row_continues(&nr, "the owner's text at 21 columns, wrap 4, typed on");
+    let cd = "cd crates/aterm-effects/src/rainbow_kitty/witness_follow_runs_and_the_relaid_suffix_of_every_wrap.rs now";
+    let long_90 = "please read the whole of this long file nows crates/aterm-effects/src/rainbow_kitty/ribbon_follow_the_text.rs now";
+    let friendly = "friendly neighbors wave";
+    let hello = "hello there wonderful day to you all";
+    let apis = "please use the apis internationalization now";
+    let (stops, on) = (Then::Stops, Then::TypesOn);
+    let cases: Vec<(&str, Shape, &str, usize, Then, usize, usize)> = vec![
+        ("long word, 60 cols", GLASS_60, PATH_60, 1, stops, 3, 52),
+        ("long word, 60 cols", GLASS_60, PATH_60, 1, on(3), 3, 52),
+        ("owner's text, 20 cols", NARROW_20, &n20, 5, stops, 4, 11),
+        ("owner's text, 20 cols", NARROW_20, &n20, 5, on(4), 4, 11),
+        ("path, 90 cols", OWNER_90, PATH_90, 1, stops, 11, 74),
+        ("path, 90 cols", OWNER_90, PATH_90, 1, on(3), 11, 74),
+        ("control: keeps more", OWNER_90, NATURAL, 1, stops, 83, 2),
+        ("control: keeps more", OWNER_90, NATURAL, 1, on(12), 83, 2),
+        ("two Spaces, 60 cols", GLASS_60, &two_sp, 1, stops, 4, 51),
+        ("kept == w, 21 cols", NARROW_21, friendly, 1, stops, 8, 8),
+        ("kept == w, 21 cols", NARROW_21, friendly, 1, on(3), 8, 8),
+        ("remnant, 60 ms", NARROW_21_60, friendly, 1, on(3), 8, 8),
+        ("remnant, 24 cols", cols(24), hello, 1, on(6), 11, 8),
+        ("remnant, 40 cols", cols(40), apis, 1, on(6), 19, 16),
+        ("remnant, 90 cols", OWNER_90, long_90, 1, on(4), 44, 41),
+        ("remnant, owner, 21 cols", NARROW_21, &n21, 4, on(2), 8, 8),
+        ("keeps 2, 20 cols", NARROW_20, KEPT_2, 1, stops, 2, 13),
+        ("keeps 2, 20 cols", NARROW_20, KEPT_2, 1, on(1), 2, 13),
+        ("keeps 2, path, 90 cols", OWNER_90, cd, 1, on(2), 2, 83),
+        ("keeps 1, 20 cols", NARROW_20, KEPT_1, 1, stops, 1, 14),
+        ("keeps 1, 20 cols", NARROW_20, KEPT_1, 1, on(1), 1, 14),
+    ];
+    crate::common::par_map(&cases, |&(what, shape, text, wrap, then, kept, w)| {
+        let nr = read_new_row(shape, text, wrap, then);
+        assert!(
+            nr.kept == kept && nr.w == w,
+            "{what}, {then:?}: premise: kept {} w {}",
+            nr.kept,
+            nr.w
+        );
+        assert_new_row_continues(&nr, &format!("{what}, {then:?}"));
+    });
 }
 
 /// A Space typed before the wrap's echo is not the word's Space: at 90 columns
@@ -1538,49 +1365,6 @@ const KEPT_2: &str = "to introspections are fun";
 /// `I introspections|s` at 20 columns: the wrap keeps one cell.
 const KEPT_1: &str = "I introspectionss are fun";
 
-/// A wrap that keeps one or two cells is still a wrap: the composer's same-row
-/// caret move is `kept` cells back, below the ribbon's `RE_ANCHOR_MIN_CELLS`,
-/// and must still relay the moved word onto the new row.
-#[test]
-fn a_wrap_that_keeps_two_cells_relays_the_moved_word() {
-    for then in [Then::Stops, Then::TypesOn(1)] {
-        let nr = read_new_row(NARROW_20, KEPT_2, 1, then);
-        assert!(
-            nr.kept == 2 && nr.w == 13,
-            "premise: kept {} w {}",
-            nr.kept,
-            nr.w
-        );
-        assert_new_row_continues(
-            &nr,
-            &format!("`to introspection|s` at 20 columns, {then:?}"),
-        );
-    }
-    let text = "cd crates/aterm-effects/src/rainbow_kitty/witness_follow_runs_and_the_relaid_suffix_of_every_wrap.rs now";
-    let nr = read_new_row(OWNER_90, text, 1, Then::TypesOn(2));
-    assert!(nr.kept == 2, "premise: kept {} w {}", nr.kept, nr.w);
-    assert_new_row_continues(&nr, "`cd` and a path at 90 columns, typed on");
-}
-
-/// One kept cell (`I introspections|s` keeps `I`): the line follows with a
-/// single found record and the new row lights.
-#[test]
-fn a_wrap_that_keeps_one_cell_relays_the_moved_word() {
-    for then in [Then::Stops, Then::TypesOn(1)] {
-        let nr = read_new_row(NARROW_20, KEPT_1, 1, then);
-        assert!(
-            nr.kept == 1 && nr.w == 14,
-            "premise: kept {} w {}",
-            nr.kept,
-            nr.w
-        );
-        assert_new_row_continues(
-            &nr,
-            &format!("`I introspections|s` at 20 columns, {then:?}"),
-        );
-    }
-}
-
 /// The repaint may arrive 120 ms after its key, just before the next key's
 /// 130 ms press. The content proof must still reach the held park and its
 /// delayed flush, including when that next key types onto the new row.
@@ -1592,28 +1376,6 @@ fn a_short_wrap_relay_survives_a_delayed_echo() {
             assert_eq!(nr.kept, kept);
             assert_new_row_continues(&nr, &format!("kept {kept}, 120 ms lag, {then:?}"));
         }
-    }
-}
-
-/// The kept line follows and flows with one or two cells
-/// ([`assert_follows_and_flows`], hand stopped at the wrap).
-#[test]
-fn a_wrap_that_keeps_one_or_two_cells_follows_and_flows() {
-    for (text, kept) in [(KEPT_1, 1), (KEPT_2, 2)] {
-        let wraps = run_census(NARROW_20, text, &[1], Hand::Stops);
-        let sr = &wraps[0];
-        assert!(
-            sr.kept == kept,
-            "premise: the wrap keeps {kept}: kept {}",
-            sr.kept
-        );
-        assert!(
-            sr.followed() >= kept as u64,
-            "kept {kept}: ribbon_followed= grew {} — the kept line did not follow its text: {}",
-            sr.followed(),
-            sr.curve()
-        );
-        assert_follows_and_flows(sr, &format!("a wrap that keeps {kept} at 20 columns"));
     }
 }
 

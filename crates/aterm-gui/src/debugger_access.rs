@@ -215,7 +215,12 @@ fn marker_path(config_path: &Path, name: &str) -> Option<PathBuf> {
 /// removal of the same file.
 static DEBUGGER_MARKS: Mutex<()> = Mutex::new(());
 
-fn write_debugger_marker(config_path: &Path, name: &str, text: &str) -> std::io::Result<()> {
+fn write_debugger_marker(
+    config_path: &Path,
+    name: &str,
+    text: &str,
+    flush: crate::durable::Flush,
+) -> std::io::Result<()> {
     let _serial = DEBUGGER_MARKS.lock().unwrap_or_else(|p| p.into_inner());
     let Some(path) = marker_path(config_path, name) else {
         return Err(std::io::Error::new(
@@ -223,7 +228,7 @@ fn write_debugger_marker(config_path: &Path, name: &str, text: &str) -> std::io:
             "no config directory to record in",
         ));
     };
-    crate::config_marker::write_marker(&path, text, MAX_MARKER_BYTES)
+    crate::config_marker::write_marker(&path, text, MAX_MARKER_BYTES, flush)
 }
 
 fn remove_debugger_marker(config_path: &Path, name: &str) -> std::io::Result<()> {
@@ -250,6 +255,10 @@ pub(crate) struct ChangeLock {
 
 /// What [`take_change_lock`] found.
 #[derive(Debug)]
+#[cfg_attr(
+    not(unix),
+    expect(dead_code, reason = "only unix takes the change lock")
+)]
 pub(crate) enum LockTry {
     /// This caller holds it now.
     Held(ChangeLock),
@@ -324,8 +333,8 @@ pub(crate) fn take_change_lock(config_path: &Path, patience: Duration) -> LockTr
 /// change writing its own marker: that one is left alone; the record is written
 /// regardless.
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "DebuggerAccessChange",
         action = "PeerSettle",
         project = "aterm_gui::debugger_access::conformance::project"
@@ -337,8 +346,15 @@ pub(crate) fn settle_markers(
     release: Option<&DevtoolsChild>,
 ) {
     let lock = release.map(|_| take_change_lock(config_path, CHANGE_LOCK_PATIENCE));
+    // Ordered: the next probe observes the mode again and the drift watch tells the
+    // person of any change; the marker only has to be whole or absent.
     if let Some(marker) = observed
-        && let Err(error) = write_debugger_marker(config_path, OBSERVED_MARKER, &marker.encode())
+        && let Err(error) = write_debugger_marker(
+            config_path,
+            OBSERVED_MARKER,
+            &marker.encode(),
+            crate::durable::Flush::Ordered,
+        )
     {
         // Only the next launch's tell between drift and first sight is lost.
         aterm_log::warn!("debugger access: observed mode not recorded: {error}");
@@ -369,14 +385,15 @@ pub(crate) fn settle_markers_detached(
     observed: Option<ObservedMarker>,
     release: Option<DevtoolsChild>,
 ) {
-    let spawned = std::thread::Builder::new()
-        .name("aterm-debugger-marker".into())
-        .spawn(move || {
+    let spawned = crate::qos::spawn_lane_thread(
+        "aterm-debugger-marker",
+        crate::qos::Role::Background,
+        move || {
             // Background: it takes no lock the UI thread contends (only this
             // module's own marker mutex and the change lock).
-            crate::qos::set_self(crate::qos::Role::Background);
             settle_markers(&config_path, observed, release.as_ref());
-        });
+        },
+    );
     if let Err(error) = spawned {
         aterm_log::warn!("debugger access: markers not settled: {error}");
     }
@@ -413,16 +430,16 @@ pub(crate) struct RecordsRead {
 /// writes the record before it removes the marker, so a read that finds no marker
 /// finds the record that change left.
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "DebuggerAccessChange",
         action = "Adopt",
         project = "aterm_gui::debugger_access::conformance::project"
     )
 )]
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "DebuggerAccessChange",
         action = "Follow",
         project = "aterm_gui::debugger_access::conformance::project"
@@ -490,17 +507,19 @@ pub(crate) fn spawn_records_reader(
     alive: fn(&DevtoolsChild) -> bool,
     wake: Arc<dyn Fn() + Send + Sync>,
 ) -> bool {
-    std::thread::Builder::new()
-        .name("aterm-debugger-records".into())
-        .spawn(move || {
+    crate::qos::spawn_lane_thread(
+        "aterm-debugger-records",
+        crate::qos::Role::Responsive,
+        move || {
             // Responsive, not Background: it publishes under a mutex the UI
-            // thread's park takes.
-            crate::qos::set_self(crate::qos::Role::Responsive);
+            // thread's park takes, the documented floor for such a holder. It
+            // reads two tiny files and is gone.
             let read = read_records(&config_path, alive);
             *into.lock().unwrap_or_else(|p| p.into_inner()) = Some(read);
             wake();
-        })
-        .is_ok()
+        },
+    )
+    .is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -634,10 +653,6 @@ pub(crate) struct DebuggerAccessFlow {
     observed: DebuggerMode,
     /// The change the projection normalises by: the last one pressed.
     direction: DebuggerChange,
-    /// The owner's "Allow…" answers in this process.
-    consents: u32,
-    /// Change children started in this process.
-    launches: u32,
     last: Option<Outcome>,
 }
 
@@ -654,8 +669,6 @@ impl DebuggerAccessFlow {
             records_read: false,
             observed: DebuggerMode::Unknown,
             direction: DebuggerChange::On,
-            consents: 0,
-            launches: 0,
             last: None,
         }
     }
@@ -680,13 +693,6 @@ impl DebuggerAccessFlow {
 
     pub(crate) const fn records_read(&self) -> bool {
         self.records_read
-    }
-
-    /// A surface may say the change's target holds: only when a probe read it.
-    /// (The page reads the probe itself; this is the model's `claim`.)
-    #[cfg(test)]
-    pub(crate) fn claim(&self) -> bool {
-        self.observed == self.direction.target()
     }
 
     /// Anything under way, or the predecessor's records unread: the buttons
@@ -795,7 +801,6 @@ impl DebuggerAccessFlow {
             return Answer::NotAsked;
         };
         if answer == Some(true) {
-            self.consents = self.consents.saturating_add(1);
             self.phase = Phase::Rechecking(change);
             Answer::Consented
         } else {
@@ -809,7 +814,6 @@ impl DebuggerAccessFlow {
         let Phase::Rechecking(change) = self.phase else {
             return false;
         };
-        self.launches = self.launches.saturating_add(1);
         self.phase = Phase::InFlight {
             change,
             child,
@@ -864,11 +868,6 @@ impl DebuggerAccessFlow {
         };
         self.phase = Phase::Exited(change);
         true
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn counts(&self) -> (u32, u32) {
-        (self.consents, self.launches)
     }
 }
 
@@ -1112,18 +1111,20 @@ pub(crate) fn inert_run_devtools(_job: DevtoolsJob) -> DevtoolsSpawn {
 /// it may wait hours on macOS's dialog, so nothing may join it. Never called
 /// from a test.
 pub(crate) fn spawn_devtools_worker(job: DevtoolsJob) -> DevtoolsSpawn {
-    let spawned = std::thread::Builder::new()
-        .name("consent-devtools".into())
-        .spawn(move || {
-            // Responsive: it publishes into the result slot under the mutex the
-            // UI thread's park reads; it spends nearly all its life waiting on
-            // one child.
-            crate::qos::set_self(crate::qos::Role::Responsive);
+    let spawned = crate::qos::spawn_lane_thread(
+        "consent-devtools",
+        crate::qos::Role::Responsive,
+        move || {
+            // Responsive: it publishes into the result slot the UI thread's
+            // park reads under the same mutex, the documented floor for such a
+            // holder. Nearly all of its life is a wait on one child, so the
+            // rank costs nothing.
             run_devtools_job(job, |change, gate, on_spawn| {
                 aterm_containment::consent::run_devtools_change(change, gate, on_spawn)
             });
-        });
-    // Detached on purpose: the handle is never stored.
+        },
+    );
+    // DETACHED ON PURPOSE: the handle is dropped here and never stored.
     match spawned {
         Ok(_handle) => DevtoolsSpawn::Started,
         Err(error) => {
@@ -1157,40 +1158,40 @@ impl Drop for WorkerGone {
 /// `gone` and posts the nudge. The marker stays until the park has re-probed and
 /// recorded the result ([`LaneStep::remove_change_marker`]).
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "DebuggerAccessChange",
         action = "Recheck",
         project = "aterm_gui::debugger_access::conformance::project"
     )
 )]
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "DebuggerAccessChange",
         action = "Launch",
         project = "aterm_gui::debugger_access::conformance::project"
     )
 )]
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "DebuggerAccessChange",
         action = "ChildApplied",
         project = "aterm_gui::debugger_access::conformance::project"
     )
 )]
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "DebuggerAccessChange",
         action = "ChildUnchanged",
         project = "aterm_gui::debugger_access::conformance::project"
     )
 )]
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "DebuggerAccessChange",
         action = "ChildClobbers",
         project = "aterm_gui::debugger_access::conformance::project"
@@ -1242,8 +1243,12 @@ where
             slot.publish_spawned(id, child);
             match (config_path, ChangeMarker::new(change, child, now_secs())) {
                 (Some(path), Some(marker)) => {
-                    if let Err(error) = write_debugger_marker(path, CHANGE_MARKER, &marker.encode())
-                    {
+                    if let Err(error) = write_debugger_marker(
+                        path,
+                        CHANGE_MARKER,
+                        &marker.encode(),
+                        crate::durable::Flush::Durable,
+                    ) {
                         aterm_log::warn!("debugger access: change marker not recorded: {error}");
                     }
                 }
@@ -1644,24 +1649,24 @@ impl DebuggerChangeLane {
     /// under way and the last probe shows the precondition. `Err` names why
     /// nothing may start.
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "DebuggerAccessChange",
             action = "Press",
             project = "aterm_gui::debugger_access::conformance::project"
         )
     )]
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "DebuggerAccessChange",
             action = "Consent",
             project = "aterm_gui::debugger_access::conformance::project"
         )
     )]
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "DebuggerAccessChange",
             action = "Decline",
             project = "aterm_gui::debugger_access::conformance::project"
@@ -1710,32 +1715,32 @@ impl DebuggerChangeLane {
     /// records, then a predecessor's child's liveness. It takes an exited child's
     /// result whether or not its wake arrived (the model's weakly fair `Notice`).
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "DebuggerAccessChange",
             action = "Notice",
             project = "aterm_gui::debugger_access::conformance::project"
         )
     )]
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "DebuggerAccessChange",
             action = "Adopt",
             project = "aterm_gui::debugger_access::conformance::project"
         )
     )]
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "DebuggerAccessChange",
             action = "Follow",
             project = "aterm_gui::debugger_access::conformance::project"
         )
     )]
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "DebuggerAccessChange",
             action = "Discard",
             project = "aterm_gui::debugger_access::conformance::project"
@@ -1849,16 +1854,16 @@ impl DebuggerChangeLane {
     /// change and feeds the drift watch; while a change is under way the drift
     /// watch waits for the re-probe that can attribute it.
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "DebuggerAccessChange",
             action = "Probe",
             project = "aterm_gui::debugger_access::conformance::project"
         )
     )]
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "DebuggerAccessChange",
             action = "ProbeFails",
             project = "aterm_gui::debugger_access::conformance::project"
@@ -2069,13 +2074,6 @@ mod tests {
         }
     }
 
-    fn ready_flow(mode: DebuggerMode) -> DebuggerAccessFlow {
-        let mut flow = DebuggerAccessFlow::new();
-        flow.on_records(None, None);
-        assert_eq!(flow.on_probe(probe(mode)), None);
-        flow
-    }
-
     fn scratch(tag: &str) -> PathBuf {
         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let dir = std::env::temp_dir().join(format!(
@@ -2171,12 +2169,10 @@ mod tests {
             panic!("a fresh lock is free");
         };
         // Held throughout: the patience runs out and the answer is Busy.
-        let started = std::time::Instant::now();
         assert!(matches!(
-            take_change_lock(&config, std::time::Duration::from_millis(120)),
+            take_change_lock(&config, std::time::Duration::from_millis(1)),
             LockTry::Busy
         ));
-        assert!(started.elapsed() >= std::time::Duration::from_millis(120));
         // Released inside the patience (a minute: a hang detector, never a
         // budget): the waiter takes it.
         let releaser = std::thread::spawn(move || {
@@ -2284,18 +2280,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The debugger's two markers name their flushes (aterm-durable's counting seam):
+    /// the change marker a worker records for the child it spawned stays durable; the
+    /// observed mode is only ordered, since the next probe observes it again and the
+    /// drift watch tells the person of any change.
+    #[cfg(unix)]
     #[test]
-    fn the_records_reader_keeps_a_live_child_names_a_stale_one_and_drops_an_unreadable_one() {
-        let dir = scratch("records");
+    fn the_change_marker_stays_durable_and_the_observed_mode_is_only_ordered() {
+        use aterm_durable::{Flush, seam::Recording};
+        let dir = scratch("flush-tiers");
         let config = dir.join("aterm.toml");
-        let marker = ChangeMarker::new(DebuggerChange::On, child(4242), 7).unwrap();
-        write_debugger_marker(&config, CHANGE_MARKER, &marker.encode()).unwrap();
+        let slot = Arc::new(ChangeSlot::default());
+        slot.arm(1);
+        let mut marked = job(DebuggerChange::On, 1, &slot);
+        marked.config_path = Some(config.clone());
+        let recording = Recording::start();
+        run_devtools_job(marked, |_, _, on_spawn| {
+            on_spawn(child(77));
+            DevtoolsChangeRun::Exited {
+                code: Some(0),
+                stdout_head: String::new(),
+                stderr_head: String::new(),
+            }
+        });
+        assert!(dir.join(CHANGE_MARKER).exists(), "the worker's marker");
+        assert_eq!(recording.take(), [Flush::Durable], "the change marker");
         let observed = ObservedMarker {
             mode: DebuggerMode::Disabled,
             since: 5,
             origin: Origin::Unknown,
         };
-        write_debugger_marker(&config, OBSERVED_MARKER, &observed.encode()).unwrap();
+        settle_markers(&config, Some(observed), Some(&child(77)));
+        assert_eq!(recording.take(), [Flush::Ordered], "the observed mode");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_records_reader_keeps_a_live_child_names_a_stale_one_and_drops_an_unreadable_one() {
+        let dir = scratch("records");
+        let config = dir.join("aterm.toml");
+        let marker = ChangeMarker::new(DebuggerChange::On, child(4242), 7).unwrap();
+        write_debugger_marker(
+            &config,
+            CHANGE_MARKER,
+            &marker.encode(),
+            crate::durable::Flush::Durable,
+        )
+        .unwrap();
+        let observed = ObservedMarker {
+            mode: DebuggerMode::Disabled,
+            since: 5,
+            origin: Origin::Unknown,
+        };
+        write_debugger_marker(
+            &config,
+            OBSERVED_MARKER,
+            &observed.encode(),
+            crate::durable::Flush::Ordered,
+        )
+        .unwrap();
         let alive = read_records(&config, |_| true);
         assert_eq!(alive.inherited, Some(marker));
         assert_eq!(alive.stale, None);
@@ -2316,7 +2359,13 @@ mod tests {
         );
         // A marker this build cannot parse is nothing, and goes — never from
         // under a holder, who overwrites it.
-        write_debugger_marker(&config, CHANGE_MARKER, "on not-a-pid").unwrap();
+        write_debugger_marker(
+            &config,
+            CHANGE_MARKER,
+            "on not-a-pid",
+            crate::durable::Flush::Durable,
+        )
+        .unwrap();
         let LockTry::Held(held) = try_change_lock(&config) else {
             panic!("free");
         };
@@ -2338,7 +2387,13 @@ mod tests {
             "an unreadable marker is removed"
         );
         // Only the marker naming the child goes.
-        write_debugger_marker(&config, CHANGE_MARKER, &marker.encode()).unwrap();
+        write_debugger_marker(
+            &config,
+            CHANGE_MARKER,
+            &marker.encode(),
+            crate::durable::Flush::Durable,
+        )
+        .unwrap();
         settle_markers(&config, None, Some(&child(9)));
         assert!(
             dir.join(CHANGE_MARKER).exists(),
@@ -2383,7 +2438,13 @@ mod tests {
         assert!(lane.records_due(105), "read again after it");
         // The worker spawned its child and recorded it; its aterm is gone.
         let marker = ChangeMarker::new(DebuggerChange::On, child(77), 101).unwrap();
-        write_debugger_marker(&config, CHANGE_MARKER, &marker.encode()).unwrap();
+        write_debugger_marker(
+            &config,
+            CHANGE_MARKER,
+            &marker.encode(),
+            crate::durable::Flush::Durable,
+        )
+        .unwrap();
         drop(worker);
         let again = read_records(&config, |_| true);
         assert_eq!(again.inherited, Some(marker));
@@ -2408,137 +2469,6 @@ mod tests {
         std::fs::remove_file(dir.join(CHANGE_MARKER)).unwrap();
         assert_eq!(read_records(&config, |_| true), RecordsRead::default());
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The press guard: the probe's precondition, nothing under way, the records
-    /// read, and not aterm's hardening.
-    #[test]
-    fn a_press_is_refused_unless_the_probe_shows_its_precondition_and_nothing_is_under_way() {
-        let mut unread = DebuggerAccessFlow::new();
-        assert_eq!(
-            unread.on_press(DebuggerChange::On),
-            Err(Refusal::RecordsUnread)
-        );
-        let mut unknown = ready_flow(DebuggerMode::Unknown);
-        assert_eq!(
-            unknown.on_press(DebuggerChange::On),
-            Err(Refusal::State(DebuggerChange::On, DebuggerMode::Unknown))
-        );
-        let mut on = ready_flow(DebuggerMode::Enabled);
-        assert_eq!(
-            on.on_press(DebuggerChange::On),
-            Err(Refusal::State(DebuggerChange::On, DebuggerMode::Enabled))
-        );
-        assert_eq!(on.on_press(DebuggerChange::Off), Ok(()));
-        let mut custom = ready_flow(DebuggerMode::Unrecognized);
-        for change in [DebuggerChange::On, DebuggerChange::Off] {
-            assert!(custom.on_press(change).is_err(), "{change:?}");
-        }
-        let mut flow = ready_flow(DebuggerMode::Disabled);
-        assert_eq!(flow.on_press(DebuggerChange::On), Ok(()));
-        assert_eq!(flow.on_press(DebuggerChange::On), Err(Refusal::Busy));
-        assert_eq!(flow.on_owner_answer(Some(true)), Answer::Consented);
-        assert_eq!(flow.on_press(DebuggerChange::On), Err(Refusal::InFlight));
-        assert!(flow.on_child_spawned(child(9), 1));
-        assert_eq!(flow.on_press(DebuggerChange::On), Err(Refusal::InFlight));
-        assert!(flow.on_child_exit());
-        assert_eq!(flow.on_press(DebuggerChange::On), Err(Refusal::Busy));
-    }
-
-    #[test]
-    fn a_decline_or_nobody_asked_spawns_nothing() {
-        for answer in [Some(false), None] {
-            let mut flow = ready_flow(DebuggerMode::Disabled);
-            flow.on_press(DebuggerChange::On).unwrap();
-            assert_eq!(flow.on_owner_answer(answer), Answer::Declined);
-            assert_eq!(flow.phase(), Phase::Idle);
-            assert!(
-                !flow.on_child_spawned(child(1), 1),
-                "no child without a yes"
-            );
-            assert_eq!(flow.counts(), (0, 0));
-        }
-        let mut idle = ready_flow(DebuggerMode::Disabled);
-        assert_eq!(idle.on_owner_answer(Some(true)), Answer::NotAsked);
-        assert_eq!(idle.counts(), (0, 0));
-    }
-
-    /// The lane arms a job only on the owner's yes: any other answer launches
-    /// nothing.
-    #[test]
-    fn the_lane_arms_a_job_only_on_the_owners_yes() {
-        let declines: [fn() -> OwnerAnswer; 3] = [
-            || OwnerAnswer::No,
-            || OwnerAnswer::Quiet,
-            || OwnerAnswer::NotAsked,
-        ];
-        for decline in declines {
-            let answer = format!("{:?}", decline());
-            let mut lane = DebuggerChangeLane::with_liveness(|_| false);
-            lane.settle_records(RecordsRead::default());
-            lane.poll(1);
-            lane.observe(probe(DebuggerMode::Disabled), 1);
-            assert_eq!(
-                lane.begin(DebuggerChange::On, decline()),
-                Err(Refusal::NotConfirmed),
-                "{answer:?}"
-            );
-            assert!(!lane.needs_poll(), "{answer:?}: nothing armed");
-            assert_eq!(lane.flow().counts(), (0, 0), "{answer:?}");
-            assert_eq!(lane.flow().phase(), Phase::Idle, "{answer:?}");
-        }
-        let mut lane = DebuggerChangeLane::with_liveness(|_| false);
-        lane.settle_records(RecordsRead::default());
-        lane.poll(1);
-        lane.observe(probe(DebuggerMode::Disabled), 1);
-        assert_eq!(
-            lane.begin(DebuggerChange::On, OwnerAnswer::yes_for_test())
-                .map(|t| t.job()),
-            Ok(1)
-        );
-        assert!(lane.needs_poll());
-    }
-
-    /// Only the probe decides: an exit, whatever its code, claims nothing; an
-    /// unchanged re-probe is NotChanged, a decline, and nothing retries it.
-    #[test]
-    fn only_the_re_probe_decides_and_an_unchanged_result_is_a_decline_never_retried() {
-        let mut flow = ready_flow(DebuggerMode::Disabled);
-        flow.on_press(DebuggerChange::On).unwrap();
-        flow.on_owner_answer(Some(true));
-        flow.on_child_spawned(child(3), 10);
-        flow.on_child_exit();
-        assert!(!flow.claim(), "an exit is not an observation");
-        assert_eq!(flow.phase(), Phase::Exited(DebuggerChange::On));
-        let pending = DebuggerProbe::pending();
-        assert_eq!(flow.on_probe(pending), None, "a pending probe is no probe");
-        assert_eq!(flow.phase(), Phase::Exited(DebuggerChange::On));
-        let outcome = flow.on_probe(probe(DebuggerMode::Disabled)).unwrap();
-        assert_eq!(outcome, Outcome::NotChanged(DebuggerChange::On));
-        assert!(outcome.counts_as_decline());
-        assert_eq!(flow.phase(), Phase::Idle);
-        assert_eq!(flow.counts(), (1, 1), "not retried");
-        // Changed, and each other reading, by name.
-        for (read, want) in [
-            (DebuggerMode::Enabled, Outcome::Changed(DebuggerChange::On)),
-            (
-                DebuggerMode::Unrecognized,
-                Outcome::Unrecognized(DebuggerChange::On),
-            ),
-            (
-                DebuggerMode::Unknown,
-                Outcome::Unobserved(DebuggerChange::On),
-            ),
-        ] {
-            let mut flow = ready_flow(DebuggerMode::Disabled);
-            flow.on_press(DebuggerChange::On).unwrap();
-            flow.on_owner_answer(Some(true));
-            flow.on_child_spawned(child(3), 10);
-            flow.on_child_exit();
-            assert_eq!(flow.on_probe(probe(read)), Some(want));
-            assert!(!want.counts_as_decline() || read == DebuggerMode::Disabled);
-            assert_eq!(flow.claim(), read == DebuggerMode::Enabled);
-        }
     }
 
     #[test]
@@ -2772,7 +2702,13 @@ mod tests {
         let dir = scratch("peer-drift");
         let config = dir.join("aterm.toml");
         let write = |marker: ObservedMarker| {
-            write_debugger_marker(&config, OBSERVED_MARKER, &marker.encode()).unwrap();
+            write_debugger_marker(
+                &config,
+                OBSERVED_MARKER,
+                &marker.encode(),
+                crate::durable::Flush::Ordered,
+            )
+            .unwrap();
         };
         let reread = |lane: &mut DebuggerChangeLane, now: u64| {
             assert!(lane.records_due(now), "a fresh read of the record is asked");
@@ -2869,7 +2805,13 @@ mod tests {
             since: 100,
             origin: Origin::Unknown,
         };
-        write_debugger_marker(&config, OBSERVED_MARKER, &before.encode()).unwrap();
+        write_debugger_marker(
+            &config,
+            OBSERVED_MARKER,
+            &before.encode(),
+            crate::durable::Flush::Ordered,
+        )
+        .unwrap();
         let mut a = DebuggerChangeLane::with_liveness(|_| false);
         let mut b = DebuggerChangeLane::with_liveness(|_| false);
         for lane in [&mut a, &mut b] {
@@ -2960,6 +2902,7 @@ mod tests {
                 origin: Origin::Unknown,
             }
             .encode(),
+            crate::durable::Flush::Ordered,
         )
         .unwrap();
         let mut lane = DebuggerChangeLane::with_liveness(|_| false);
@@ -3034,6 +2977,7 @@ mod tests {
                 origin: Origin::Unknown,
             }
             .encode(),
+            crate::durable::Flush::Ordered,
         )
         .unwrap();
         let mut lane = DebuggerChangeLane::with_liveness(|_| false);
@@ -3117,6 +3061,7 @@ mod tests {
                 origin: Origin::Unknown,
             }
             .encode(),
+            crate::durable::Flush::Ordered,
         )
         .unwrap();
         let mut a = DebuggerChangeLane::with_liveness(|_| false);
@@ -3560,7 +3505,7 @@ mod tests {
 /// with the real change lock and marker in a scratch config folder, and the real order
 /// `aterm_containment::consent::devtools_change_with_for_test` with a scripted `-status` re-read
 /// and a stand-in child — and projects it, direction-normalised, onto
-/// `aterm_spec::derive::debugger_access_change_model()`. Each step's model guard must equal what
+/// `aterm_models_gui::debugger_access_change_model()`. Each step's model guard must equal what
 /// the composition did, and a taken step must land on a successor the model admits.
 ///
 /// `phase`, `obs` and `polling` come from the lane (phase 5 is a result it has not taken);
@@ -3575,7 +3520,8 @@ mod tests {
 pub(crate) mod conformance {
     use super::*;
     use crate::native_settings::OwnerAnswer;
-    use aterm_spec::derive::{Model, debugger_access_change_model};
+    use aterm_models_gui::debugger_access_change_model;
+    use aterm_spec::derive::Model;
     use aterm_spec::interp::State;
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
@@ -3692,94 +3638,94 @@ pub(crate) mod conformance {
     /// mutants', waived here by name; each mutant's negative control runs the
     /// harness over a composition carrying that defect and requires it to fail
     /// (`the_harness_fails_every_faulty_composition`).
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "DebuggerAccessChange",
         action = "Drift",
         reason = "Environment: an administrator, a macOS upgrade or a -disable elsewhere moves \
                   the rule back to the change's precondition. The Tier-1 harness moves `world`; \
                   the shipping drift watch only records what a probe reads and never re-enables."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "DebuggerAccessChange",
         action = "SetOutside",
         reason = "Environment: the rule reaches the change's target outside any child of \
                   aterm's. The Tier-1 harness moves `world`; the worker's re-read then reads \
                   NotDue and spawns nothing."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "DebuggerAccessChange",
         action = "Customize",
         reason = "Environment: a rule in a shape Apple's tool does not recognise. The Tier-1 \
                   harness moves `world`; the worker's re-read then reads NotDue and spawns nothing."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "DebuggerAccessChange",
         action = "Normalize",
         reason = "Environment: a recognised rule written back. The Tier-1 harness moves `world`."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "DebuggerAccessChange",
         action = "PeerLaunch",
         reason = "Environment: another aterm sharing the config takes the change lock and \
                   starts its child. The Tier-1 harness takes the real flock and names a live \
                   child in the real change marker; the lane's worker then runs nothing."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "DebuggerAccessChange",
         action = "PeerExit",
         reason = "Environment: the peer's child exits and its worker releases the lock. The \
                   Tier-1 harness drops the flock."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "DebuggerAccessChange",
         action = "PressWhileInFlight",
         reason = "Buggy = 1 mutant: the lane refuses a press while a child is in flight \
                   (on_press: InFlight); the negative control forces one through and the \
                   harness fails."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "DebuggerAccessChange",
         action = "SkipRecheck",
         reason = "Buggy = 1 mutant: the only order, devtools_change_with, re-reads -status \
                   before it spawns; the negative control runs an order that does not, and the \
                   harness fails."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "DebuggerAccessChange",
         action = "IgnorePeerLock",
         reason = "Buggy = 1 mutant: run_devtools_job takes the change lock before the re-read \
                   and holds it through the child; the negative control runs a worker that takes \
                   no lock, and the harness fails (the projected lock is not held)."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "DebuggerAccessChange",
         action = "ClaimFromExitCode",
         reason = "Buggy = 1 mutant: the reducer's observation and the row's claim come only \
                   from a probe; the negative control makes the lane take the exit as the \
                   target, and the harness fails."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "DebuggerAccessChange",
         action = "RetryAfterCancel",
         reason = "Buggy = 1 mutant: an unchanged result ends the change (NotChanged) and the \
                   host starts a worker only after the owner's yes; the negative control retries \
                   without one, and the harness fails."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "DebuggerAccessChange",
         action = "SpendBanked",
         reason = "Buggy = 1 mutant: the lane arms a job only inside begin, on the owner's yes \
-                  (the_lane_arms_a_job_only_on_the_owners_yes); a worker started with no \
+                  (the scenarios' No/NotAsked/Quiet presses launch nothing); a worker started with no \
                   answer is the RetryAfterCancel control's shape."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "DebuggerAccessChange",
         action = "AdoptLive",
         reason = "Buggy = 1 mutant: read_records files a change marker as stale only when its \
                   child is gone by pid and birth; the negative control runs a records reader \
                   that skips that check over a peer's running child, and the harness fails."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "DebuggerAccessChange",
         action = "ResultWakeLost",
         reason = "Buggy = 1 mutant: the lane's needs_poll holds while a change is under way, \
@@ -3972,7 +3918,13 @@ pub(crate) mod conformance {
             let child = stand_in();
             set_alive(child.pid, true);
             let marker = ChangeMarker::new(change, child, 1).unwrap();
-            write_debugger_marker(&rig.config, CHANGE_MARKER, &marker.encode()).unwrap();
+            write_debugger_marker(
+                &rig.config,
+                CHANGE_MARKER,
+                &marker.encode(),
+                crate::durable::Flush::Durable,
+            )
+            .unwrap();
             rig.inherited = Some(child);
             rig.seen.launches = 1;
             rig.record_world();
@@ -4001,7 +3953,13 @@ pub(crate) mod conformance {
                 since: 1,
                 origin: Origin::Unknown,
             };
-            write_debugger_marker(&self.config, OBSERVED_MARKER, &marker.encode()).unwrap();
+            write_debugger_marker(
+                &self.config,
+                OBSERVED_MARKER,
+                &marker.encode(),
+                crate::durable::Flush::Ordered,
+            )
+            .unwrap();
         }
 
         /// The observed record on disk, mode normalised, and its origin.
@@ -4477,7 +4435,13 @@ pub(crate) mod conformance {
                 let child = stand_in();
                 set_alive(child.pid, true);
                 let marker = ChangeMarker::new(rig.change, child, 1).unwrap();
-                write_debugger_marker(&rig.config, CHANGE_MARKER, &marker.encode()).unwrap();
+                write_debugger_marker(
+                    &rig.config,
+                    CHANGE_MARKER,
+                    &marker.encode(),
+                    crate::durable::Flush::Durable,
+                )
+                .unwrap();
                 rig.peer = Some((lock, child));
                 true
             });

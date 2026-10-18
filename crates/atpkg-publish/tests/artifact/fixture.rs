@@ -370,7 +370,7 @@ impl Tools for FakeTools {
         &self,
         stage: &Path,
         donors: &[PathBuf],
-    ) -> Result<atpkg::relocate::Report, String> {
+    ) -> Result<atpkg_publish::artifact::relocate::Report, String> {
         self.note(format!(
             "relocate {} donors={}",
             stage.display(),
@@ -378,7 +378,7 @@ impl Tools for FakeTools {
         ));
         match &self.relocate_refusal {
             Some(why) => Err(why.clone()),
-            None => Ok(atpkg::relocate::Report::default()),
+            None => Ok(atpkg_publish::artifact::relocate::Report::default()),
         }
     }
 }

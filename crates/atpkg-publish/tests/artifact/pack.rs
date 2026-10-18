@@ -88,7 +88,7 @@ impl World {
     }
 
     fn written(&self, suffix: &str) -> Vec<PathBuf> {
-        atpkg::relocate::walk_files(&self.root.join("out"))
+        atpkg_publish::artifact::relocate::walk_files(&self.root.join("out"))
             .unwrap_or_default()
             .into_iter()
             .filter(|p| p.to_string_lossy().ends_with(suffix))
@@ -606,84 +606,7 @@ fn preflight_refuses_bytes_that_no_longer_match_the_signed_row() {
         "{err}"
     );
     assert_eq!(upload::tag("ay", 9), "atpkg-ay-9");
-    assert_eq!(pkgdoc::file_name("ay", 9), "pkg-ay-9.toml");
-}
-
-#[test]
-fn the_command_line_is_a_request_and_the_triple_defaults_to_the_compilers_host() {
-    let w = world("pack-args");
-    let t = FakeTools::new("x86_64-unknown-linux-gnu");
-    let args = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
-    let checkout = w.checkout.to_string_lossy().into_owned();
-    let bin = w.bin.to_string_lossy().into_owned();
-    let mut ctx = w.ctx.clone();
-    let req = pack::parse_args(
-        &mut ctx,
-        &args(&[
-            "ay",
-            "--checkout",
-            &checkout,
-            "--toolchain",
-            &bin,
-            "--build",
-            "12",
-            "--unsigned",
-        ]),
-        &t,
-    )
-    .expect("parsed");
-    assert_eq!(
-        ctx.trust_repo,
-        w.ctx.home.join("trust"),
-        "$HOME/trust unless named"
-    );
-    assert_eq!(
-        req.triple, X86_64_UNKNOWN_LINUX_GNU,
-        "from the compiler's -vV host"
-    );
-    assert_eq!(req.build, Some(12));
-    assert_eq!(req.signing, Signing::Unsigned);
-    assert_eq!(req.out, w.checkout.join("target/atpkg-pack"));
-    let req = pack::parse_args(
-        &mut ctx,
-        &args(&[
-            "ay",
-            "--checkout",
-            &checkout,
-            "--triple",
-            "aarch64-apple-darwin",
-            "--trust-repo",
-            "/src/trust",
-            "--upload",
-        ]),
-        &t,
-    )
-    .expect("parsed");
-    assert_eq!(req.triple, AARCH64_APPLE_DARWIN);
-    assert!(req.upload);
-    assert_eq!(ctx.trust_repo, PathBuf::from("/src/trust"));
-    for bad in [
-        &["--checkout", "x"][..],
-        &["ay"][..],
-        &["ay", "--checkout", "x", "--bogus"][..],
-        &["ay", "--checkout", "x", "--build", "nine"][..],
-        &["ay", "--checkout", "x", "--trust-repo"][..],
-        &[
-            "ay",
-            "--checkout",
-            "x",
-            "--triple",
-            "riscv64gc-unknown-none-elf",
-        ][..],
-    ] {
-        assert!(
-            matches!(
-                pack::parse_args(&mut w.ctx.clone(), &args(bad), &t),
-                Err(Error::Usage(_))
-            ),
-            "{bad:?}"
-        );
-    }
+    assert_eq!(pkgdoc::manifest_name("ay", 9), "pkg-ay-9.toml");
 }
 
 #[test]

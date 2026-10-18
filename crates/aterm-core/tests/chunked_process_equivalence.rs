@@ -369,6 +369,35 @@ fn ascii_run_entering_decslrm_from_outside_wraps_at_the_right_margin() {
     }
 }
 
+/// SU/SD move rows, not the cursor, so a double-width row can scroll under a cursor
+/// past its half. The next glyph wraps first, whichever writer takes it (a run, a
+/// non-ASCII glyph, ASCII under IRM or a locking shift), and the row's hidden half
+/// stays blank for DECSWL to reveal.
+#[test]
+fn a_glyph_past_a_double_width_rows_half_wraps_on_every_writer() {
+    // (what is typed, the glyph it prints)
+    for (typed, glyph) in [
+        ("e", "e"),
+        ("\u{e9}", "\u{e9}"),
+        ("\x1b[4he", "e"),
+        ("\x1b)B\x0ee", "e"),
+    ] {
+        let input = format!("\x1b#6\x1bE\t\x1b[T{typed}\x1b[2;1H\x1b#5");
+        let t = assert_chunk_invariant(4, 10, input.as_bytes());
+        let rows = row_texts(&t);
+        assert_eq!(
+            rows[1].trim_end(),
+            "",
+            "{typed:?}: the hidden half: {rows:?}"
+        );
+        assert_eq!(
+            rows[2].trim_end(),
+            glyph,
+            "{typed:?}: no wrap first: {rows:?}"
+        );
+    }
+}
+
 /// A cell an operation blanks or overwrites outside the writers' stale-entry probe drops
 /// its extras with it, so a later extras-style write at that column never adopts an old
 /// combining mark, skin tone or link; every grid keeps each extras entry claimed.

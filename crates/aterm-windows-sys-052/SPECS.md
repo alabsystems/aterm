@@ -17,8 +17,9 @@ Result: **1 spec**, covering **1 test**. **0 tests are not spec samples** (§4).
 
 - `PF` := `windows_sys::Win32::System::Threading::PF_ARM_V8_CRYPTO_INSTRUCTIONS_AVAILABLE`. It is declared in
   `src/lib.rs` as `pub const PF: PROCESSOR_FEATURE_ID = 30u32`, where `PROCESSOR_FEATURE_ID = u32`.
-- `RECORDED` := the answers windows-sys 0.52.0 gave the oracle (`tests/oracle/run.sh`,
-  x86_64- and aarch64-pc-windows-msvc, recorded 2026-10-15).
+- `RECORDED` := the answers windows-sys 0.52.0 gave the oracle (`tests/oracle/PROVENANCE.md`;
+  `targo --unverified run -p aterm-win32-oracle -- oracle-052` runs it; x86_64- and
+  aarch64-pc-windows-msvc, recorded 2026-10-15).
 - `tests/recorded.rs` holds the other three recorded declarations as `const _` items, so the
   compiler checks them on every build: `BOOL = i32`, `PROCESSOR_FEATURE_ID = u32`, and
   `IsProcessorFeaturePresent : unsafe extern "system" fn(u32) -> i32`. They are not tests and need no spec.

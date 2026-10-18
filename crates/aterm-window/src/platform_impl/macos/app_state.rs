@@ -48,7 +48,7 @@ use super::aterm_objc_seam::consts::NS_APPLICATION_ACTIVATION_POLICY_REGULAR;
 use super::event_handler::EventHandler;
 use super::event_loop::{notify_windows_of_exit, stop_app_immediately, ActiveEventLoop, PanicInfo};
 use super::observer::{EventLoopWaker, RunLoop};
-use super::{menu, WindowId};
+use super::{menu, wake_queue, WindowId};
 use crate::event::{Event, StartCause, WindowEvent};
 use crate::event_loop::{ActiveEventLoop as RootActiveEventLoop, ControlFlow};
 use crate::window::WindowId as RootWindowId;
@@ -76,6 +76,9 @@ pub(super) struct AppState {
     start_time: Cell<Option<Instant>>,
     wait_timeout: Cell<Option<Instant>>,
     pending_redraw: RefCell<Vec<WindowId>>,
+    /// LOCAL PATCH (aterm), 2026-10-17: the proxies' wake flag, read at the
+    /// end of each `cleared` (`wake_queue.rs`, COALESCED WAKES).
+    wake_armed: wake_queue::Armed,
     // NOTE: This is strongly referenced by our `NSWindowDelegate` and our `NSView` subclass, and
     // as such should be careful to not add fields that, in turn, strongly reference those.
 }
@@ -177,6 +180,7 @@ impl ApplicationDelegate {
         mtm: MainThread,
         activation_policy: Option<isize>,
         activate_ignoring_other_apps: bool,
+        wake_armed: wake_queue::Armed,
     ) -> aterm_objc::Retained<Self> {
         // LOCAL PATCH (aterm): `alloc_init` is `+alloc`, store the ivars,
         // `-init` — the same three steps and the same ORDER as the objc2 pair
@@ -202,6 +206,7 @@ impl ApplicationDelegate {
             start_time: Cell::new(None),
             wait_timeout: Cell::new(None),
             pending_redraw: RefCell::new(vec![]),
+            wake_armed,
         })
         .expect("couldn't create `WinitApplicationDelegate`")
     }
@@ -325,7 +330,7 @@ impl ApplicationDelegate {
                 Id,
                 aterm_objc::Sel,
                 aterm_objc::ClassPtr,
-            ) -> Bool = aterm_objc::msg();
+            ) -> Bool = aterm_objc::checked_msg();
             send(
                 delegate,
                 aterm_objc::sel!(isKindOfClass:),
@@ -402,7 +407,7 @@ impl ApplicationDelegate {
                         Id,
                         aterm_objc::Sel,
                         aterm_objc::ProtocolPtr,
-                    ) -> Bool = aterm_objc::msg();
+                    ) -> Bool = aterm_objc::checked_msg();
                     f(id, sel!(conformsToProtocol:), aterm_objc::protocol(c"NSApplicationDelegate"))
                         .as_bool()
                 }
@@ -686,6 +691,18 @@ impl ApplicationDelegate {
             ControlFlow::WaitUntil(instant) => Some(instant),
         };
         self.ivars().waker.borrow_mut().start_at(min_timeout(wait_timeout, app_timeout));
+
+        // LOCAL PATCH (aterm), 2026-10-17: a send that armed the proxies' wake
+        // after this turn's drain signalled once, and the sends behind it do
+        // not; if a nested run loop in a later handler (an app-modal dialog)
+        // handled that signal, nothing would bring the drain it is owed. So a
+        // set flag here wakes the loop once more, and the next `BeforeWaiting`
+        // drains (`wake_queue.rs`, COALESCED WAKES). A wake-up sent here is
+        // honoured, so the sleep that follows returns at once: CoreFoundation
+        // ignores them only from a wake until its next pass begins.
+        if self.ivars().wake_armed.is_set() {
+            self.ivars().run_loop.wakeup();
+        }
     }
 }
 

@@ -48,6 +48,8 @@ aterm-time = { workspace = true }
 # swap best-effort (`mlock`), and protected from core dumps (`setrlimit(RLIMIT_CORE, 0)`).
 # Four narrow syscalls with no safe std wrapper; POSIX-only, like the rest of this tool.
 libc = { workspace = true }
+# How each write is finished: durable (F_FULLFSYNC) or ordered (F_BARRIERFSYNC).
+aterm-durable = { workspace = true }
 
 [dev-dependencies]
 # Prove the producer↔client contract: sign here, verify + INSTALL with the ACTUAL client.
@@ -55,6 +57,8 @@ atpkg = { path = "../atpkg" }
 # Tier-1 binds the real roster pair redo/snapshot-CAS filesystem transaction to
 # the same derived model that `cargo test -p aterm-spec` proves exhaustively.
 aterm-spec = { workspace = true }
+# The models its tests drive (a model edit rebuilds only their tests).
+aterm-models-release = { workspace = true }
 # The owner→client integration test builds a real `.tar.zst` to drive the client install:
 # one raw-block zstd frame from the first-party writer (docs/AUDIT-third-party-2026-10-15.md
 # ZC.3), which atpkg's extractor decodes.

@@ -24,7 +24,7 @@
 //!   inside aterm) while that twin execs an ALab build; the line ends
 //!   `resume <sessionId>`, `sessionId` a UUID; the elements between are,
 //!   in order and all of them, the root flags the live process ran with as
-//!   the Codex lane reads them ([`upgrade_codex::rewrite_argv`]: its prompt,
+//!   the Codex lane reads them ([`codex_alab::rewrite_argv`]: its prompt,
 //!   images, subcommand and session dropped, every flag kept with its value
 //!   — a flag that lane does not know relaunches nothing); `env` names
 //!   `CODEX_HOME` alone, equal to the live process's own; a `cwd` it names is
@@ -33,8 +33,11 @@
 //!   nothing: a line read from a writable file is never typed into a shell
 //!   unless the agent itself ran it.
 //! * **The verdict** ([`verdict`]): an exit whose copy saw the record removed
-//!   is orderly (`/exit`, `/quit`, archive, the tab's hangup) and is left
-//!   alone; one whose record stood with no exit word, or standing as
+//!   — read standing once, then gone ([`fold`]) — is orderly (`/exit`,
+//!   `/quit`, archive, the tab's hangup) and is left alone; one whose copy
+//!   never saw a record (killed before codex-alab's first write) is a CRASH,
+//!   relaunched only on the line aterm's own crash rule typed for that very
+//!   process ([`inherited`]); one whose record stood with no exit word, or standing as
 //!   `upgrading` (an `execve` that failed), is a CRASH; one the agent wrote
 //!   down as `exit: "signal:<n>"` is a crash only where aterm sent that
 //!   signal itself (its explicit restart's stamp: the stall's remedy).
@@ -47,7 +50,7 @@ use std::path::{Path, PathBuf};
 
 use aterm_json::Value;
 
-use super::upgrade_codex;
+use super::codex_alab;
 
 /// The record's schema version this reader takes.
 pub const RECORD_VERSION: u64 = 1;
@@ -79,6 +82,12 @@ pub struct Record {
     pub exit: Option<String>,
     /// The directory it ran in.
     pub cwd: Option<String>,
+    /// `draftEmpty`: whether the TUI's composer held no draft of a person's
+    /// when it wrote the record. It decides only the watch-only worker's
+    /// idle point ([`idle_point`]), never the crash rule: a value that is not
+    /// a boolean reads as unknown (`None`, never idle) rather than refusing
+    /// the record the exit is decided from.
+    pub draft_empty: Option<bool>,
 }
 
 /// Why a record or its line is refused (one word, said in the ledger and
@@ -135,7 +144,62 @@ pub fn parse(text: &str) -> Result<Record, Refusal> {
         status: opt_str("status")?,
         exit: opt_str("exit")?,
         cwd: opt_str("cwd")?,
+        draft_empty: v.get("draftEmpty").and_then(Value::as_bool),
     })
+}
+
+/// THE WATCH-ONLY WORKER'S IDLE POINT (the contract, §4; the Codex screen
+/// lane's retirement): the agent itself says, in its own record, that it is
+/// at rest — `status: "idle"` with `draftEmpty: true` and no word of an end.
+/// Anything else is no idle point: `busy`, `waiting`, `upgrading`, `exited`,
+/// a draft in the composer, a draft not named, a status not named.
+#[must_use]
+pub fn idle_point(record: &Record) -> bool {
+    record.status.as_deref() == Some("idle")
+        && record.draft_empty == Some(true)
+        && record.exit.is_none()
+}
+
+/// The live process `pid`'s `$CODEX_HOME` (canonical) and its own facts,
+/// from its exec record; `None` where that cannot be read.
+fn live_of(pid: u32) -> Option<(PathBuf, Live)> {
+    let args = atpkg::caller_shell::process_args(pid)?;
+    let live = Live {
+        exec_path: args.exec_path.clone(),
+        image: aterm_sysprobe::process_path(pid),
+        argv: args.argv.clone(),
+        codex_home: args.env_var("CODEX_HOME").map(str::to_owned),
+        cwd: aterm_sysprobe::process_cwd(pid),
+        twin: None,
+    };
+    let home = codex_home_of(live.codex_home.as_deref(), args.env_var("HOME"))?;
+    Some((home, live))
+}
+
+/// WHETHER THE PROCESS `pid` STARTED AT `start` IS AT ITS IDLE POINT NOW, by
+/// its own record read LIVE ([`idle_point`]): read only while that very
+/// process runs, looked at before the read and again after it, the record
+/// naming that pid. The watch-only worker beside a proven self-claim asks it
+/// at decision time — before the memory ceiling's restart (the stall's
+/// explicit restart reads no rest: a frozen TUI's record never rests) — in
+/// place of any screen reader. `false` (fail closed:
+/// wait) for a process gone or another identity of its pid, an exec record
+/// that cannot be read, a record removed, unreadable or of another pid, and
+/// any record that is not at rest.
+#[must_use]
+pub fn read_idle(pid: u32, start: &str) -> bool {
+    use super::restart_stamp::alive_as;
+    if !alive_as(pid, start) {
+        return false;
+    }
+    let Some((home, _)) = live_of(pid) else {
+        return false;
+    };
+    let idle = match read_record(&record_path(&home, pid)) {
+        Seen::Present(record) => record.pid == pid && idle_point(&record),
+        Seen::Removed | Seen::Never | Seen::Unreadable(_) => false,
+    };
+    idle && alive_as(pid, start)
 }
 
 /// Whether `id` is a UUID in its one textual form (8-4-4-4-12 hex digits).
@@ -224,7 +288,7 @@ pub fn validate(record: &Record, pid: u32, live: &Live) -> Result<Resume, Refusa
     }
     // The root flags between, exactly as the live process ran them: in
     // order, every one with its value, its prompt and images dropped.
-    let root = upgrade_codex::rewrite_argv(&live.argv, None).map_err(|_| "live-argv")?;
+    let root = codex_alab::rewrite_argv(&live.argv, None).map_err(|_| "live-argv")?;
     if argv[1..at] != root[..] {
         return Err("foreign-argv");
     }
@@ -258,9 +322,13 @@ pub fn validate(record: &Record, pid: u32, live: &Live) -> Result<Resume, Refusa
 pub enum Seen {
     /// It stood, as parsed.
     Present(Record),
-    /// It was not there: codex-alab removed it (an orderly end), or had not
-    /// written it yet.
+    /// It was read standing at an earlier read of this identity and is gone
+    /// now: codex-alab removed it (an orderly end). Only [`fold`] makes it.
     Removed,
+    /// No read of this identity has found it yet: codex-alab had not written
+    /// it (a process ended before its record writer's first write is no
+    /// orderly end: the end-to-end run of 2026-10-16, AD-3).
+    Never,
     /// It stood and could not be read as a record (the word why).
     Unreadable(Refusal),
 }
@@ -278,8 +346,9 @@ pub struct Copy {
     /// What the read found.
     pub seen: Seen,
     /// The record's line, validated against the live process at that read
-    /// ([`validate`]); `Err` names why it relaunches nothing. A record not
-    /// there or not readable is `Err("no-record")`.
+    /// ([`validate`]); `Err` names why it relaunches nothing. A record removed
+    /// or not readable is `Err("no-record")`; one never written yet is the
+    /// line [`inherited`] from aterm's own relaunch, else `Err("no-record-yet")`.
     pub resume: Result<Resume, Refusal>,
 }
 
@@ -306,30 +375,95 @@ fn codex_home_of(codex_home: Option<&str>, home: Option<&str>) -> Option<PathBuf
 }
 
 /// atpkg's managed Codex twin, where one is configured and the build it execs
-/// is ALab's ([`upgrade_codex::alab_bytes`]).
+/// is ALab's ([`codex_alab::alab_bytes`]).
 fn managed_alab_twin() -> Option<PathBuf> {
     let twin = atpkg::store::resolve_configured()?
         .agents_dir()
         .join("codex");
     let exe = super::upgrade_catalog::twin_binary(&std::fs::read_to_string(&twin).ok()?)?;
-    upgrade_codex::alab_bytes(&exe).then_some(twin)
+    codex_alab::alab_bytes(&exe).then_some(twin)
 }
 
 /// Make the copy from what was read: the record's text (`None`: no such
-/// file) and the live facts (pure).
+/// file, never yet written as far as this read knows: [`fold`] tells a
+/// removal) and the live facts (pure). `typed`: the line aterm's own crash
+/// rule last typed in the tab ([`inherited`]).
 #[must_use]
-pub fn copy_of(pid: u32, start: &str, home: PathBuf, text: Option<&str>, live: &Live) -> Copy {
+pub fn copy_of(
+    pid: u32,
+    start: &str,
+    home: PathBuf,
+    text: Option<&str>,
+    live: &Live,
+    typed: Option<&Resume>,
+) -> Copy {
     let seen = match text.map(parse) {
-        None => Seen::Removed,
+        None => Seen::Never,
         Some(Ok(record)) => Seen::Present(record),
         Some(Err(why)) => Seen::Unreadable(why),
     };
-    copy_seen(pid, start, home, seen, live)
+    copy_seen(pid, start, home, seen, live, typed)
 }
 
-fn copy_seen(pid: u32, start: &str, home: PathBuf, seen: Seen, live: &Live) -> Copy {
+/// THE LINE A NEVER-WRITTEN RECORD INHERITS: `typed`, the line aterm's own
+/// crash rule typed in the tab, when the live process runs exactly it — its
+/// launch path, `resume <session>` of that line's conversation, its root
+/// flags, its `CODEX_HOME` ([`validate`] of that line as a record of `pid`):
+/// the relaunch that started this very process. Any other process (one a
+/// person started, another conversation) inherits nothing.
+///
+/// # Errors
+/// `no-record-yet` with no typed line; else the word [`validate`] refused it
+/// by, or `not-the-typed-line` when the live process resumes another thread.
+pub fn inherited(typed: Option<&Resume>, pid: u32, live: &Live) -> Result<Resume, Refusal> {
+    let typed = typed.ok_or("no-record-yet")?;
+    if codex_alab::resumed_thread(&live.argv).as_deref() != Some(typed.session.as_str()) {
+        return Err("not-the-typed-line");
+    }
+    let record = Record {
+        pid,
+        session_id: Some(typed.session.clone()),
+        resume_argv: Some(typed.argv.clone()),
+        env: typed
+            .codex_home
+            .iter()
+            .map(|h| ("CODEX_HOME".to_string(), h.clone()))
+            .collect(),
+        status: None,
+        exit: None,
+        cwd: typed.cwd.clone(),
+        draft_empty: None,
+    };
+    validate(&record, pid, live)
+}
+
+/// THE COPY KEPT ACROSS READS: `read` (this read's copy) over `before` (the
+/// copy kept until now). A record this read did not find that an earlier
+/// read of the SAME identity saw (standing, or unreadable but there) was
+/// REMOVED; one no read of it ever found stays [`Seen::Never`].
+#[must_use]
+pub fn fold(before: Option<&Copy>, mut read: Copy) -> Copy {
+    let seen_before = before.is_some_and(|b| {
+        (b.pid, b.start.as_str()) == (read.pid, read.start.as_str()) && b.seen != Seen::Never
+    });
+    if read.seen == Seen::Never && seen_before {
+        read.seen = Seen::Removed;
+        read.resume = Err("no-record");
+    }
+    read
+}
+
+fn copy_seen(
+    pid: u32,
+    start: &str,
+    home: PathBuf,
+    seen: Seen,
+    live: &Live,
+    typed: Option<&Resume>,
+) -> Copy {
     let resume = match &seen {
         Seen::Present(record) => validate(record, pid, live),
+        Seen::Never => inherited(typed, pid, live),
         Seen::Removed | Seen::Unreadable(_) => Err("no-record"),
     };
     Copy {
@@ -347,7 +481,7 @@ fn read_record(path: &Path) -> Seen {
             Ok(record) => Seen::Present(record),
             Err(why) => Seen::Unreadable(why),
         },
-        Ok(None) => Seen::Removed,
+        Ok(None) => Seen::Never,
         Err(e) if e.kind() == std::io::ErrorKind::FileTooLarge => {
             Seen::Unreadable("record-too-large")
         }
@@ -359,28 +493,22 @@ fn read_record(path: &Path) -> Seen {
 /// `start`, with the live process's own facts — read only while that very
 /// process runs, looked at before the read and again after it. `None` when it
 /// does not run (before or after), or its exec record cannot be read: nothing
-/// is kept from a read that cannot be vouched for.
+/// is kept from a read that cannot be vouched for. `typed`: the line aterm's
+/// crash rule last typed in the tab ([`inherited`]); [`fold`] it over the
+/// copy kept before.
 #[must_use]
-pub fn read_copy(pid: u32, start: &str) -> Option<Copy> {
+pub fn read_copy(pid: u32, start: &str, typed: Option<&Resume>) -> Option<Copy> {
     use super::restart_stamp::alive_as;
     if !alive_as(pid, start) {
         return None;
     }
-    let args = atpkg::caller_shell::process_args(pid)?;
-    let live = Live {
-        exec_path: args.exec_path.clone(),
-        image: aterm_sysprobe::process_path(pid),
-        argv: args.argv.clone(),
-        codex_home: args.env_var("CODEX_HOME").map(str::to_owned),
-        cwd: aterm_sysprobe::process_cwd(pid),
-        twin: managed_alab_twin(),
-    };
-    let home = codex_home_of(live.codex_home.as_deref(), args.env_var("HOME"))?;
+    let (home, mut live) = live_of(pid)?;
+    live.twin = managed_alab_twin();
     let seen = read_record(&record_path(&home, pid));
     if !alive_as(pid, start) {
         return None;
     }
-    Some(copy_seen(pid, start, home, seen, &live))
+    Some(copy_seen(pid, start, home, seen, &live, typed))
 }
 
 /// How an exit is decided from the copy ([`verdict`]).
@@ -399,6 +527,8 @@ pub enum Verdict {
 pub fn verdict(copy: &Copy, asked: bool) -> Verdict {
     let record = match &copy.seen {
         Seen::Removed => return Verdict::Orderly("removed"),
+        // Ended before its record's first write: no word of an end at all.
+        Seen::Never => return Verdict::Crash,
         Seen::Unreadable(why) => return Verdict::Orderly(why),
         Seen::Present(record) => record,
     };
@@ -430,7 +560,7 @@ pub fn verdict(copy: &Copy, asked: bool) -> Verdict {
 pub fn shows_end(copy: &Copy) -> bool {
     match &copy.seen {
         Seen::Removed => true,
-        Seen::Unreadable(_) => false,
+        Seen::Never | Seen::Unreadable(_) => false,
         Seen::Present(record) => {
             record.exit.is_some() || record.status.as_deref() == Some("exited")
         }

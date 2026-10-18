@@ -50,117 +50,35 @@ fn term_with(bytes: &[u8]) -> Terminal {
     t
 }
 
+/// DECSCUSR bytes drive the painted shape end-to-end: every cursor-coloured
+/// pixel lies in the style's rect, and the rect is filled exactly — the whole
+/// cell for a block, the bottom `max(2, cell_h/8)` rows for an underline, the
+/// left `max(2, cell_w/8)` columns for a bar.
 #[test]
-fn cursor_rect_visitor_preserves_order_and_degenerate_geometry() {
-    // Literal geometry pins the visitor. In particular, retain zero-area strips
-    // and overlapping tiny hollow edges: the painters, not this shared
-    // generator, own their clipping/blending.
-    let check = |style, w, h, expected: &[[usize; 4]]| {
-        let mut actual = [[0; 4]; 128];
-        let mut len = 0;
-        for_each_cursor_rect(style, 7, 11, w, h, |rect| {
-            actual[len] = rect;
-            len += 1;
-        });
-        assert_eq!(&actual[..len], expected, "{style:?}, {w}x{h}");
-    };
-    for style in [CursorStyle::BlinkingBlock, CursorStyle::SteadyBlock] {
-        check(style, 13, 32, &[[7, 11, 13, 32]]);
-        check(style, 0, 0, &[[7, 11, 0, 0]]);
-    }
-    for style in [CursorStyle::BlinkingUnderline, CursorStyle::SteadyUnderline] {
-        check(style, 13, 32, &[[7, 39, 13, 4]]);
-        check(style, 1, 1, &[[7, 11, 1, 1]]);
-        check(style, 13, 0, &[[7, 11, 13, 0]]);
-    }
-    for style in [CursorStyle::BlinkingBar, CursorStyle::SteadyBar] {
-        check(style, 13, 32, &[[7, 11, 2, 32]]);
-        check(style, 1, 1, &[[7, 11, 1, 1]]);
-        check(style, 0, 32, &[[7, 11, 0, 32]]);
-    }
-    check(
-        CursorStyle::HollowBlock,
-        13,
-        32,
-        &[
-            [7, 11, 13, 2],
-            [7, 41, 13, 2],
-            [7, 13, 2, 28],
-            [18, 13, 2, 28],
-        ],
-    );
-    check(
-        CursorStyle::HollowBlock,
-        1,
-        1,
-        &[[7, 11, 1, 1], [7, 11, 1, 1], [7, 12, 1, 0], [7, 12, 1, 0]],
-    );
-    check(
-        CursorStyle::Bolt,
-        4,
-        4,
-        &[[8, 11, 3, 1], [8, 12, 2, 1], [8, 13, 2, 1], [7, 14, 2, 1]],
-    );
-    check(CursorStyle::Bolt, 0, 2, &[[7, 11, 1, 1], [7, 12, 1, 1]]);
-    check(CursorStyle::Bolt, 13, 0, &[]);
-    check(CursorStyle::Hidden, 13, 32, &[]);
-}
-
-#[test]
-fn steady_block_fills_whole_cursor_cell() {
+fn steady_cursor_styles_fill_exactly_their_rect() {
     let mut r = renderer();
     let (cw, ch) = r.cell_size();
-    let mut term = term_with(b"\x1b[2 q"); // DECSCUSR 2 = steady block
-    let f = r.render_input(&term.cell_frame(2, 4));
-    let pos = cursor_positions(&f);
-    // Every pixel of cell (0,0) is the cursor colour and nothing else is.
-    assert_eq!(
-        pos.len(),
-        cw * ch,
-        "block cursor should fill the whole cell"
-    );
-    assert!(
-        pos.iter().all(|&(x, y)| x < cw && y < ch),
-        "cursor pixels outside the cursor cell"
-    );
-}
-
-#[test]
-fn underline_cursor_fills_only_bottom_strip() {
-    let mut r = renderer();
-    let (cw, ch) = r.cell_size();
-    let mut term = term_with(b"\x1b[4 q"); // DECSCUSR 4 = steady underline
-    let f = r.render_input(&term.cell_frame(2, 4));
-    let t = (ch / 8).max(2);
-    let pos = cursor_positions(&f);
-    assert_eq!(
-        pos.len(),
-        cw * t,
-        "underline cursor should fill exactly the bottom strip"
-    );
-    assert!(
-        pos.iter().all(|&(x, y)| x < cw && y >= ch - t && y < ch),
-        "underline cursor pixels outside the bottom strip of the cursor cell"
-    );
-}
-
-#[test]
-fn bar_cursor_fills_only_left_strip() {
-    let mut r = renderer();
-    let (cw, ch) = r.cell_size();
-    let mut term = term_with(b"\x1b[6 q"); // DECSCUSR 6 = steady bar
-    let f = r.render_input(&term.cell_frame(2, 4));
-    let t = (cw / 8).max(2);
-    let pos = cursor_positions(&f);
-    assert_eq!(
-        pos.len(),
-        t * ch,
-        "bar cursor should fill exactly the left strip"
-    );
-    assert!(
-        pos.iter().all(|&(x, y)| x < t && y < ch),
-        "bar cursor pixels outside the left strip of the cursor cell"
-    );
+    let (ut, bt) = ((ch / 8).max(2), (cw / 8).max(2));
+    // (style, DECSCUSR bytes, [x0, y0, x1, y1) of the painted rect)
+    let cases: [(&str, &[u8], [usize; 4]); 3] = [
+        ("block", b"\x1b[2 q", [0, 0, cw, ch]),
+        ("underline", b"\x1b[4 q", [0, ch - ut, cw, ch]),
+        ("bar", b"\x1b[6 q", [0, 0, bt, ch]),
+    ];
+    for (style, bytes, [x0, y0, x1, y1]) in cases {
+        let mut term = term_with(bytes);
+        let pos = cursor_positions(&r.render_input(&term.cell_frame(2, 4)));
+        assert_eq!(
+            pos.len(),
+            (x1 - x0) * (y1 - y0),
+            "{style}: the rect must be filled exactly"
+        );
+        assert!(
+            pos.iter()
+                .all(|&(x, y)| (x0..x1).contains(&x) && (y0..y1).contains(&y)),
+            "{style}: cursor pixels outside its rect"
+        );
+    }
 }
 
 #[test]

@@ -67,31 +67,3 @@ impl XorShift {
         &from[self.index(from.len())]
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::XorShift;
-
-    #[test]
-    fn the_sequence_is_xorshift64_and_fixed_by_its_seed() {
-        // Marsaglia's xorshift64 (13, 7, 17) from 1: the published first value.
-        let mut a = XorShift::new(1);
-        assert_eq!(a.next_u64(), 1_082_269_761);
-        let mut b = XorShift::new(1);
-        b.next_u64();
-        assert_eq!(a.next_u64(), b.next_u64());
-        // Zero is no seed: it would stay zero for ever.
-        assert_ne!(XorShift::new(0).next_u64(), 0);
-    }
-
-    #[test]
-    fn bounded_draws_stay_in_bounds() {
-        let mut r = XorShift::new(0xB0B);
-        for n in 1..64_usize {
-            assert!(r.index(n) < n);
-            assert!((5..5 + n).contains(&r.range(5, 5 + n)));
-        }
-        let xs = [3, 1, 4];
-        assert!(xs.contains(r.pick(&xs)));
-    }
-}

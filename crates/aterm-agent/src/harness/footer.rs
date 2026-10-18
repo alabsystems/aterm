@@ -276,6 +276,10 @@ pub struct LaunchFacts {
     /// The conversation the launch resumed (`--resume`, `--continue`), when
     /// it resumed one ([`LaunchResume`]).
     pub resume: Option<LaunchResume>,
+    /// The `CLAUDE_CONFIG_DIR` the process's environment at exec named, raw
+    /// (set and empty is `Some("")`): the Claude home its resume line
+    /// carries ([`super::resume::home_env`]).
+    pub config: Option<String>,
 }
 
 /// The conversation a process's launch resumed
@@ -323,10 +327,16 @@ pub fn launch_facts_of(argv: &[String], env: &[String]) -> LaunchFacts {
         .map(|m| model_display(&m));
     let resume = crate::harness::upgrade::launch_resume(argv)
         .map(|id| id.map_or(LaunchResume::Unnamed, LaunchResume::Session));
+    let config = env.iter().find_map(|kv| {
+        kv.split_once('=')
+            .filter(|(key, _)| *key == crate::harness::accounts::HOME_ENV)
+            .map(|(_, value)| value.to_string())
+    });
     LaunchFacts {
         model,
         pinned,
         resume,
+        config,
     }
 }
 
@@ -538,10 +548,12 @@ pub fn read_tail_facts(path: &Path, since: Option<u64>) -> Option<TailFacts> {
 
 /// The most bytes one refresh reads as an append to a transcript it has read
 /// before ([`TailCache`]'s carry); a larger append is read as a fresh tail.
+#[cfg(unix)]
 const MAX_APPEND_BYTES: u64 = 16 * 1024 * 1024;
 
 /// How many bytes before the carried end are checked unchanged before an
 /// append is read on top of what was read before.
+#[cfg(unix)]
 const GUARD_BYTES: u64 = 4096;
 
 /// How far back from its end a transcript is read afresh for a fact the
@@ -732,8 +744,8 @@ impl TailCache {
     /// and identifying this exact regular file. A read that races a writer is
     /// returned for this refresh but never remembered; the next one retries.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "ClaudeFooterModel",
             action = "Read",
             project = "conformance_footer_model::project"
@@ -1000,8 +1012,8 @@ impl TailCache {
     /// as the process's decision, and [`Switch::now`] as when it was last seen
     /// in `session`.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "ClaudeFooterModel",
             action = "Read",
             project = "conformance_footer_model::project"
@@ -1836,8 +1848,8 @@ fn effort_result(content: &str) -> Option<Said> {
 /// the effort. Returns whether a readable model was named, so [`scan`] can
 /// pair a `/model` command row with its own result.
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "ClaudeFooterModel",
         action = "Read",
         project = "conformance_footer_model::project"
@@ -1893,8 +1905,8 @@ pub fn tail_facts(body: &[u8], since: Option<u64>) -> TailFacts {
 
 /// [`tail_facts`], and whether the scan stopped at a row before the floor.
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "ClaudeFooterModel",
         action = "Read",
         project = "conformance_footer_model::project"
@@ -2232,8 +2244,8 @@ pub fn facts_for_entry_at(
 /// ([`transcript_path`]), shared with the usage fold so both read one file.
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "ClaudeFooterModel",
         action = "Read",
         project = "conformance_footer_model::project"
@@ -2464,8 +2476,13 @@ pub struct ReadClock<'a> {
 /// the usage folded on in `fold` (at most [`FOLD_BUDGET`] bytes per call; the
 /// limit wall stands while its reset is ahead of `clock.now` and nothing was
 /// served since) and the resume line ([`super::resume::of_entry`], under the
-/// conversation's model record in the harness's state root `state`). `launch`
-/// is asked once with the registry entry for its launch facts and argv.
+/// conversation's model record in the harness's state root `state`), with
+/// the Claude home the process ran under in front of it where that is not
+/// the shell's of a user whose home is `user_home`
+/// ([`super::resume::home_env`]: its `CLAUDE_CONFIG_DIR`, or the `HOME` that
+/// holds `claude_dir`; ATERM-KI-1015-1 LC-4 — the line every other surface
+/// tells for it). `launch` is asked once with the registry entry for its
+/// launch facts and argv.
 ///
 /// One registry read feeds all of it, so model, usage and resume line always
 /// describe one conversation. A read landing mid-write yields no facts (the
@@ -2480,6 +2497,7 @@ pub fn read_pid(
     fold: &mut FooterCache,
     clock: &ReadClock<'_>,
     state: Option<&Path>,
+    user_home: Option<&Path>,
 ) -> Option<FooterFacts> {
     let Some(entry) = session_of_pid(claude_dir, pid, started) else {
         tail.clear();
@@ -2499,7 +2517,12 @@ pub fn read_pid(
         clock.read_at,
     );
     facts.usage = fold.usage(transcript, clock.now, clock.offset_at);
-    facts.resume = super::resume::of_entry(&argv, &entry, started, state);
+    let home = user_home.map_or_else(Vec::new, |user_home| {
+        super::resume::home_env(user_home, launch.config.as_deref(), Some(claude_dir))
+    });
+    let home: Vec<(&str, &str)> = home.iter().map(|(n, v)| (*n, v.as_str())).collect();
+    facts.resume = super::resume::of_entry(&argv, &entry, started, state)
+        .and_then(|line| super::resume::with_env(&home, &line));
     Some(facts)
 }
 
@@ -2927,14 +2950,23 @@ pub fn rule_room(run: &std::ops::Range<usize>) -> usize {
     run.len().saturating_sub(RULE_LEAD + 1)
 }
 
-/// The widths of the lights' block (`claude_lights`): chips, whole and short
-/// titles (each including its two-cell gap), and whether the title is a reason.
+/// The widths of the lights' block (`claude_lights`): chips, whole, leaner and
+/// short titles (each including its two-cell gap), and whether the title is a
+/// reason. A title with no short form (`short` 0: the act ticker's label, `✓
+/// approved`) is drawn whole or not at all, beside the facts as they fit
+/// without it ([`fit_rule`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LightsWidth {
     /// The chips, one blank apart.
     pub chips: usize,
     /// `Light: what  `.
     pub title: usize,
+    /// The whole title with parts given up, widest first, each still more
+    /// than the short form (0: no such form): Autopilot's without its trail of
+    /// acts, then without its menu's line too — v1's words (design
+    /// `docs/DESIGN-harness-autopilot-2026-10-15.md` §9.2.1), so a rule where
+    /// v1's whole title fit still shows it.
+    pub lean: [usize; 2],
     /// `what  `.
     pub short: usize,
     /// The title says why (a stopped mode return, a refusal, a switch note)
@@ -2948,6 +2980,8 @@ pub struct LightsWidth {
 pub enum TitleFit {
     /// `Light: what`.
     Full,
+    /// The `n`th of the whole title's leaner forms ([`LightsWidth::lean`]).
+    Lean(u8),
     /// `what` alone.
     Short,
     /// None.
@@ -2991,6 +3025,7 @@ fn rule_width(
         Some(l) => {
             let title = match title {
                 TitleFit::Full => l.title,
+                TitleFit::Lean(n) => l.lean.get(usize::from(n)).copied().unwrap_or(0),
                 TitleFit::Short => l.short,
                 TitleFit::None => 0,
             };
@@ -3153,8 +3188,16 @@ fn plain_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
 /// Order of giving way:
 ///
 /// * a transient title (what the pointer, the keyboard selection or a toggle
-///   in flight shows) goes first, whole then short then gone, so the facts
-///   stay whole at 80 columns while a light is hovered;
+///   in flight shows) goes first, whole, then each of its leaner forms
+///   ([`LightsWidth::lean`]), then short, then gone, so the facts stay whole
+///   at 80 columns while a light is hovered; a transient title
+///   with NO short form — the act ticker's label beside the Autopilot chip
+///   (design `docs/DESIGN-harness-autopilot-2026-10-15.md` §9.2.1), whose
+///   lone glyph would read as a stray mark — is drawn whole or not at all.
+///   Either is laid beside the facts AS THEY FIT WITHOUT IT: never the cause
+///   of a fact giving way, but where the facts already fell for want of room
+///   (a split pane's long path cut to `…/<dir>`), the room they leave is the
+///   title's (design §9.2.7);
 /// * a light's reason ([`LightsWidth::reason`]: where a mode return stopped, a
 ///   refusal) goes whole, then, short, takes the tokens', account's, branch's
 ///   and path's room (never the effort's, the model's or a limit wall's); a
@@ -3176,10 +3219,30 @@ pub fn fit_rule(facts: &FooterFacts, room: usize, lights: Option<LightsWidth>) -
     let chips = lights.is_some();
     let reason = lights.is_some_and(|l| l.reason);
     let whole = ladder[0].as_slice();
-    let titled = [TitleFit::Full, TitleFit::Short]
-        .into_iter()
-        .filter(|_| chips)
-        .map(|title| (whole, title, chips));
+    // The facts as they fit with no title: the rung a transient title is laid
+    // beside. A title never makes a fact give way, but the room the facts
+    // leave is its own however far they fell for want of room — a split
+    // pane's long working directory cut to `…/<dir>` leaves most of the rule
+    // free (design §9.2.7).
+    let alone = ladder
+        .iter()
+        .map(Vec::as_slice)
+        .find(|rung| rule_width(rung, TitleFit::None, chips, lights) <= room);
+    let has = |title: TitleFit| match (title, lights) {
+        (TitleFit::Full, _) => true,
+        (TitleFit::Lean(n), Some(l)) => l.lean.get(usize::from(n)).is_some_and(|w| *w > 0),
+        (TitleFit::Short, Some(l)) => l.short > 0,
+        _ => false,
+    };
+    let titled = [
+        TitleFit::Full,
+        TitleFit::Lean(0),
+        TitleFit::Lean(1),
+        TitleFit::Short,
+    ]
+    .into_iter()
+    .filter(|title| chips && has(*title))
+    .filter_map(|title| Some((alone?, title, chips)));
     let reasons = ladder[1..]
         .iter()
         .filter(|rung| reason && top_of(rung).eq(top_of(whole)))
@@ -3221,94 +3284,94 @@ pub fn chips_room(facts: &FooterFacts, room: usize) -> usize {
 }
 
 /// The environment actions of `ClaudeFooterModel`
-/// (`aterm_spec::derive::claude_footer_model_model`): everything but `Read` is
+/// (`aterm_models_harness::claude_footer_model_model`): everything but `Read` is
 /// Claude Code's or a person's, and is waived here; `Read` is bound where the
 /// reader runs. The Tier-1 bind (`tests/conformance_footer_model.rs`) performs
 /// each on disk. Proof and test builds only.
-#[cfg(any(test, feature = "spec-anchors"))]
+#[cfg(any(test, debug_assertions))]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::spec_unmodeled(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
         machine = "ClaudeFooterModel",
         action = "Flag",
         reason = "The process's own `--model` at its launch: Claude Code's argv, which the reader reads (`launch_facts`) and never writes. The Tier-1 bind launches with it exactly there."
     )
 )]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::spec_unmodeled(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
         machine = "ClaudeFooterModel",
         action = "LaunchResume",
         reason = "A launch with `--resume <conversation>`, which Claude restores its model from: Claude Code's step. The Tier-1 bind launches so and writes the conversation on disk exactly there."
     )
 )]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::spec_unmodeled(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
         machine = "ClaudeFooterModel",
         action = "DrawCard",
         reason = "Claude Code drawing its launch card on the pane: the vendor's screen, which the host reads (`launch_card`). The Tier-1 bind draws a measured 2.1.283 card exactly there."
     )
 )]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::spec_unmodeled(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
         machine = "ClaudeFooterModel",
         action = "Answer",
         reason = "An answer Claude Code writes into the transcript: the vendor's row. The Tier-1 bind appends one in 2.1.283's shape exactly there."
     )
 )]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::spec_unmodeled(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
         machine = "ClaudeFooterModel",
         action = "ChooseA",
         reason = "A person's `/model` choice and the result row Claude Code writes for it: the vendor's step. The Tier-1 bind appends the command and a readable result exactly there."
     )
 )]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::spec_unmodeled(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
         machine = "ClaudeFooterModel",
         action = "ChooseB",
         reason = "A person's `/model` choice of the other model, and its result row: the vendor's step. The Tier-1 bind appends the command and a readable result exactly there."
     )
 )]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::spec_unmodeled(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
         machine = "ClaudeFooterModel",
         action = "ChooseUnread",
         reason = "A `/model` choice whose result this build cannot read: the vendor's step. The Tier-1 bind appends the command and an unquoted result exactly there."
     )
 )]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::spec_unmodeled(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
         machine = "ClaudeFooterModel",
         action = "Flood",
         reason = "A row larger than the reader's tail window (a pasted image): the vendor's step. The Tier-1 bind appends a 600 KiB image prompt exactly there."
     )
 )]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::spec_unmodeled(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
         machine = "ClaudeFooterModel",
         action = "Clear",
         reason = "`/clear`: Claude Code rewrites `sessions/<pid>.json` with a new session id under the same process. The Tier-1 bind rewrites the registry exactly there."
     )
 )]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::spec_unmodeled(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
         machine = "ClaudeFooterModel",
         action = "Resume",
         reason = "An in-REPL `/resume` into the next conversation, restored by Claude unless pinned: the vendor's step. The Tier-1 bind rewrites the registry exactly there."
     )
 )]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::spec_unmodeled(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
         machine = "ClaudeFooterModel",
         action = "ResumeLate",
         reason = "A first `/resume` into a conversation another process began since this one started: the vendor's step. The Tier-1 bind writes D and rewrites the registry exactly there."

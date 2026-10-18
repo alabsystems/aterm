@@ -4,10 +4,13 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/util/cookie.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
+// Modified by the aterm project in 2026; see the repository NOTICE. (aterm-x11's Xlib
+// declarations, where upstream used x11-dl's.)
+
 use std::ffi::c_int;
 use std::sync::Arc;
 
-use x11_dl::xlib::{self, XEvent, XGenericEventCookie};
+use super::ffi::{self, XEvent, XGenericEventCookie};
 
 use crate::platform_impl::x11::XConnection;
 
@@ -22,8 +25,8 @@ pub struct GenericEventCookie {
 impl GenericEventCookie {
     pub fn from_event(xconn: Arc<XConnection>, event: XEvent) -> Option<GenericEventCookie> {
         unsafe {
-            let mut cookie: XGenericEventCookie = From::from(event);
-            if (xconn.xlib.XGetEventData)(xconn.display, &mut cookie) == xlib::True {
+            let mut cookie: XGenericEventCookie = event.generic_event_cookie;
+            if (xconn.xlib.XGetEventData)(xconn.display, &mut cookie) == ffi::TRUE {
                 Some(GenericEventCookie { cookie, xconn })
             } else {
                 None

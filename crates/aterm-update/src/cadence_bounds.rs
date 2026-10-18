@@ -78,7 +78,8 @@ pub(crate) const INTERVAL_SECS: u64 = 2 * 60;
 /// ceiling and not jittered, and an `cadence::OFFLINE_RETRY` or `cadence::IN_FLIGHT_RETRY` rung is
 /// never longer than the ladder, so none of them can exceed it. 18 min 3 s today (the
 /// 15-minute [`MAX_BACKOFF`] floor is the ceiling at a two-minute base); pinned
-/// against the real `cadence::Cadence::delay_at` by `no_wait_exceeds_the_longest_wait`.
+/// against the real `cadence::Cadence::delay_at` by
+/// `max_wait_bounds_every_delay_the_schedule_can_take`.
 pub(crate) const LONGEST_WAIT: Duration = {
     let base = INTERVAL_SECS * MAX_BACKOFF_INTERVALS as u64;
     let ceiling = if base > MAX_BACKOFF.as_secs() {

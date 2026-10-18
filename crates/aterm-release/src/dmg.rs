@@ -60,8 +60,8 @@ pub fn create(app: &Path, out_dir: &Path, short_version: &str) -> Result<Package
 
     // Stage the app and an /Applications symlink (the drag-to-install gesture) under
     // dist/, on the same filesystem, removed on every exit path. The dot-name keeps the
-    // stage out of Spotlight (a `.metadata_never_index` marker is inert;
-    // crates/atpkg/src/noindex.rs).
+    // stage out of Spotlight (MEASURED: a `.metadata_never_index` marker is inert, by
+    // atpkg's since-deleted noindex probe).
     let stage = out_dir.join(format!(".dmg-stage-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&stage);
     std::fs::create_dir_all(&stage).map_err(|e| format!("create {}: {e}", stage.display()))?;

@@ -21,7 +21,8 @@ use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::Terminal;
 use aterm_effects::kitty_pet::{PetBrain, PetFrame, PetInputKind, PetSense};
 use aterm_effects::pet_world::{PetPane, PetRect, PetWorld, PetWorldFacts};
-use aterm_spec::derive::{Model, console_pet_z_order_model};
+use aterm_models_effects::console_pet_z_order_model;
+use aterm_spec::derive::Model;
 
 const ROWS: u16 = 24;
 const COLS: u16 = 80;

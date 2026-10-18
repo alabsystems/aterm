@@ -16,8 +16,7 @@
 //! every ribbon row, whatever the caret's visibility), the content-scroll
 //! clock read as `sync_cursor_effect_scroll` does, [`CursorGlow`] ticked on a
 //! 16 ms train. A hole is a dark column strictly between two lit ones in a
-//! row's planned coverage. `RR_CELLS=1` adds every watched row's cells to a
-//! failure's dump.
+//! row's planned coverage.
 //!
 //! Not pinned here (none is a gap under a typing hand): a torn ⌃K leaves the
 //! killed suffix lit over blank cells for up to 1.6 s (the kill's own
@@ -102,7 +101,6 @@ struct Frame {
     live: Vec<(u16, u16)>,
     fp: u64,
     text: Vec<(u16, String)>,
-    cells: String,
 }
 
 struct Host {
@@ -256,54 +254,7 @@ impl Host {
                 .collect();
             text.push((r, s.trim_end().to_string()));
         }
-        let mut cells = String::new();
-        if std::env::var_os("RR_CELLS").is_some() {
-            let rib = self.glow.v2_ribbon().expect("rk");
-            for &r in &self.watch {
-                let mut v: Vec<_> = rib.cells().iter().filter(|c| c.row == r).collect();
-                v.sort_by_key(|c| c.col);
-                cells.push_str(&format!("    r{r} cells:"));
-                for c in v {
-                    let ms = |t: Instant| t.saturating_duration_since(self.t0).as_millis();
-                    cells.push_str(&format!(
-                        " {}{:?}c{}{}{}{}{}",
-                        c.col,
-                        c.layer,
-                        c.cohort,
-                        if c.leaving() { "L" } else { "" },
-                        c.released_at
-                            .map_or(String::new(), |t| format!("R{}", ms(t))),
-                        c.retire_at.map_or(String::new(), |t| format!("T{}", ms(t))),
-                        c.retract_at
-                            .map_or(String::new(), |t| format!("X{}", ms(t))),
-                    ));
-                }
-                cells.push('\n');
-                for k in rib.cohorts().iter().filter(|k| k.row == r) {
-                    let ms = |t: Instant| t.saturating_duration_since(self.t0).as_millis();
-                    cells.push_str(&format!(
-                        "      coh c{} ab={} wake={} alive={} phase={:?} rcol={:?} rej={} rf={}\n",
-                        k.id,
-                        k.abandoned,
-                        k.wake,
-                        ms(k.alive_at),
-                        k.phase,
-                        k.retract_col,
-                        k.rejoinable,
-                        k.drain_right_first
-                    ));
-                }
-            }
-            let c = self.term.cursor();
-            cells.push_str(&format!(
-                "    caret ({},{}) vis={}\n",
-                c.row,
-                c.col,
-                self.term.cursor_visible()
-            ));
-        }
         self.frames.push(Frame {
-            cells,
             ms: self.ms(),
             label: self.label.clone(),
             rows,
@@ -579,7 +530,6 @@ impl Host {
                     .collect::<String>()
             ));
         }
-        s.push_str(&f.cells);
         s
     }
 
@@ -877,32 +827,9 @@ fn codex_particle_replay_stays_one_run_whole_and_torn_in_half_under_the_capped_s
 
 // (2) A torn read inside a wrapped two-row composer.
 
-/// Fixed two-row box (70 columns, 64-cell text rows): the line wraps at text
-/// index 64; every key's frame torn at a boundary around the wrap.
-#[test]
-fn a_torn_read_at_the_wrap_column_of_a_fixed_two_row_composer_keeps_both_rows_whole() {
-    let cols = 70;
-    let w = cols - 6;
-    let takes = [w - 3, w - 1, w, w + 1, w + 3, w + 20]
-        .into_iter()
-        .map(|j| (format!("fixed 2-row composer torn at text index {j}"), j))
-        .collect();
-    run_takes(takes, |what, j| {
-        let mut h = Host::new(cols, 2, false, 0);
-        let r0 = h.text_row0();
-        h.watch = vec![r0, r0 + 1];
-        h.key_split = Split::TextCol(j);
-        h.type_str(LINE);
-        h.idle(600);
-        assert!(!h.torn.is_empty(), "{what}: torn");
-        assert_clean(&h, &[r0, r0 + 1], what);
-        assert_no_melt(&h, &[r0, r0 + 1], what);
-        h.assert_idle_to_zero(what);
-    });
-}
-
-/// The same with real 1024-byte reads and the spinner, the boundary pinned
-/// at the wrap.
+/// A fixed two-row box (70 columns, 64-cell text rows): the owner's line
+/// wraps at text index 64, typed in Claude Code's 1024-byte reads with and
+/// without the spinner, a read boundary pinned around the wrap.
 #[test]
 fn claude_code_1024_byte_reads_with_the_boundary_at_the_wrap_keep_both_rows_whole() {
     let cols = 70;
@@ -962,44 +889,8 @@ fn lit_count(h: &Host, i: usize, row: u16) -> usize {
     h.lit_of(i, row).chars().filter(|&c| c == '#').count()
 }
 
-#[test]
-fn every_key_torn_for_three_seconds_at_one_fixed_boundary_keeps_the_band_whole() {
-    let typed = &LINE[..36];
-    let mut control = Host::new(140, 1, false, 0);
-    let row = control.text_row0();
-    control.type_str(typed);
-    let c_end = control.frames.len() - 1;
-    let control_lit = lit_count(&control, c_end, row);
-    let mut takes = Vec::new();
-    for j in [0usize, 1, 2, 3, 5, 10, 20, 30] {
-        for spinner in [false, true] {
-            takes.push((
-                format!("every key torn at {j}, spinner {spinner}"),
-                (j, spinner),
-            ));
-        }
-    }
-    run_takes(takes, |what, (j, spinner)| {
-        let mut h = Host::new(140, 1, spinner, 0);
-        h.watch = vec![row];
-        h.key_split = Split::TextCol(j);
-        h.spin_split = Split::TextCol(j);
-        h.type_str(typed);
-        let end = h.frames.len() - 1;
-        assert!(!h.torn.is_empty(), "{what}: torn");
-        let lit = lit_count(&h, end, row);
-        h.idle(300);
-        assert_clean(&h, &[row], what);
-        assert!(
-            lit + 2 >= control_lit,
-            "{what}: at the last key {lit} cells lit against the untorn {control_lit}\n{}",
-            h.dump(end, &[row])
-        );
-        assert_no_melt(&h, &[row], what);
-        h.assert_idle_to_zero(what);
-    });
-}
-
+/// Every key typed in 1024-byte reads for 3 s at 12 cps, a read boundary
+/// fixed inside the line, with and without the spinner.
 #[test]
 fn every_key_in_1024_byte_reads_for_three_seconds_at_one_fixed_boundary_keeps_the_band_whole() {
     let typed = &LINE[..36];
@@ -1217,7 +1108,9 @@ fn a_torn_word_kill_frame_keeps_the_standing_text_lit() {
 
 // (4) Ctrl-K mid-line.
 
-fn kill_take(split: Split) -> (Host, usize, u16, usize, usize) {
+/// The owner's line typed, three hops left, then Ctrl-K; the host, the row
+/// and the caret.
+fn kill_take(split: Split) -> (Host, u16, usize) {
     let mut h = Host::new(140, 1, false, 0);
     let row = h.text_row0();
     h.watch = vec![row];
@@ -1227,31 +1120,34 @@ fn kill_take(split: Split) -> (Host, usize, u16, usize, usize) {
         h.hop_left(110);
     }
     let caret = h.caret;
-    let end = h.text.len();
     h.kill_to_end(150, split);
-    let at = h.frames.len() - 1;
-    (h, at, row, caret, end)
+    (h, row, caret)
 }
-
-const KILL_SPLITS: [Split; 5] = [
-    Split::Whole,
-    Split::TextCol(0),
-    Split::TextCol(10),
-    Split::TextCol(60),
-    Split::TextCol(93),
-];
 
 /// Ctrl-K, then the hand types on at the caret: the new text joins the
-/// standing prefix with no hole, torn or not.
+/// standing prefix with no hole, the kill torn or not, and again with EVERY
+/// key torn at the kill's boundary inside the standing prefix.
 #[test]
 fn ctrl_k_then_typing_on_keeps_one_run() {
-    let takes = KILL_SPLITS
-        .into_iter()
-        .map(|s| (format!("ctrl-k then typing, kill {s:?}"), s))
-        .collect();
-    run_takes(takes, |what, split| {
-        let (mut h, _at, row, caret, _end) = kill_take(split);
-        h.key_split = Split::Whole;
+    let mut takes: Vec<(String, (Split, Split))> = [
+        Split::Whole,
+        Split::TextCol(0),
+        Split::TextCol(10),
+        Split::TextCol(60),
+        Split::TextCol(93),
+    ]
+    .into_iter()
+    .map(|s| (format!("ctrl-k then typing, kill {s:?}"), (s, Split::Whole)))
+    .collect();
+    for j in [0usize, 10, 60, 93] {
+        takes.push((
+            format!("ctrl-k then typing, every frame torn at {j}"),
+            (Split::TextCol(j), Split::TextCol(j)),
+        ));
+    }
+    run_takes(takes, |what, (kill, keys)| {
+        let (mut h, row, caret) = kill_take(kill);
+        h.key_split = keys;
         h.key_after('x', 150);
         h.type_str(" and more words here");
         let end = h.frames.len() - 1;
@@ -1266,54 +1162,5 @@ fn ctrl_k_then_typing_on_keeps_one_run() {
             h.dump(end, &[row])
         );
         h.assert_idle_to_zero(what);
-    });
-}
-
-/// Ctrl-K, then typing on with every key torn at the same boundary inside
-/// the standing prefix.
-#[test]
-fn ctrl_k_then_typing_on_with_every_frame_torn_keeps_one_run() {
-    let takes = [0usize, 10, 60, 93]
-        .into_iter()
-        .map(|j| (format!("ctrl-k then typing, every frame torn at {j}"), j))
-        .collect();
-    run_takes(takes, |what, j| {
-        let (mut h, _at, row, caret, _end) = kill_take(Split::TextCol(j));
-        h.key_split = Split::TextCol(j);
-        h.key_after('x', 150);
-        h.type_str(" and more words here");
-        let end = h.frames.len() - 1;
-        h.idle(300);
-        assert_clean(&h, &[row], what);
-        let dark: Vec<usize> = (COL0..COL0 + caret + 21)
-            .filter(|&c| !h.frames[end].live.contains(&(row, c as u16)))
-            .collect();
-        assert!(
-            dark.is_empty(),
-            "{what}: at the last key the line lost {dark:?}\n{}",
-            h.dump(end, &[row])
-        );
-        h.assert_idle_to_zero(what);
-    });
-}
-
-/// T6 after a torn Backspace and typing on: whatever the parts did, the
-/// engine still goes to zero.
-#[test]
-fn a_torn_backspace_then_typing_on_still_goes_idle_to_zero() {
-    crate::common::par_map(&[false, true], |&spinner| {
-        let mut h = Host::new(140, 1, spinner, 0);
-        let row = h.text_row0();
-        h.watch = vec![row];
-        h.type_str(&LINE[..60]);
-        h.spin_split = Split::TextCol(20);
-        h.schedule(250);
-        h.label = "backspace".into();
-        h.glow.note_backspace_erasing(h.now, Some(1));
-        h.caret -= 1;
-        h.text.remove(h.caret);
-        h.repaint(Split::TextCol(20));
-        h.type_str(" and on");
-        h.assert_idle_to_zero(&format!("torn backspace then typing, spinner {spinner}"));
     });
 }

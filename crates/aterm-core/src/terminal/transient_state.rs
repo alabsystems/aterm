@@ -40,8 +40,9 @@ pub(super) enum Vt52CursorState {
 /// (`response_buffer`) and their rate limiter; the monotonic counts and serials, which never
 /// rewind (`sync_end_seq`, `full_clears`, `screen_mutations`, `kitty_serial`,
 /// `print_anchor_seq`); the per-batch clocks, which each batch overwrites before any reader
-/// runs; and `kitty_last_assigned_id`, where the next `I=` id's search starts. New
-/// resettable fields go here and in `reset`.
+/// runs; `kitty_last_assigned_id`, where the next `I=` id's search starts; and
+/// `host_resyncs_alt_screen`, the embedder's host policy. New resettable fields go here
+/// and in `reset`.
 #[allow(
     clippy::struct_excessive_bools,
     reason = "independent terminal flags, not a state machine"
@@ -169,8 +170,9 @@ pub(super) struct TransientState {
     /// The current alternate screen was entered by `?47h`/`?1047h` (no cursor
     /// save) rather than `?1049h`. Read only by the orphaned-screen leave, which
     /// then keeps the alt cursor instead of restoring a main slot that may hold
-    /// an earlier app's save. Not checkpointed: a restored session takes the
-    /// 1049 exit.
+    /// an earlier app's save. Not checkpointed: a restored session judges by the
+    /// main slot alone, taking the 1047 exit when it is empty (no `?1049h` entered)
+    /// and the 1049 exit when it holds a save, which may be an earlier app's.
     pub(super) alt_entered_without_cursor_save: bool,
     /// An orphaned alternate screen was left while a Windows console host sits between us
     /// and the app (`win32_input_active`): our screen is primary again but conhost's
@@ -181,6 +183,26 @@ pub(super) struct TransientState {
     /// events, which first moves the screen's rows into the scrollback
     /// (`TerminalHandler::keep_screen_from_conhost_repaint`).
     pub(super) conhost_alt_screen_left_up: bool,
+    /// HOST POLICY (the embedder's, set by `Terminal::set_host_resyncs_alt_screen`; kept
+    /// across RIS, which `reset` leaves it out of): the console host between us and the app
+    /// forwards an application's alternate-screen switches verbatim and never repaints the
+    /// buffer it switches to, as Windows Terminal's OpenConsole does. Under such a host a
+    /// LOCAL leave of an orphaned alternate screen puts us out of step with the host, which
+    /// stays on its dead buffer. The 2026-09-29 snapshot recorded it (OpenConsole 1.24,
+    /// measured 2026-09-28): the next full-screen app's `?1049l` returned the host to its
+    /// primary buffer with the dead app's saved cursor and emitted only those 8 bytes, while
+    /// a local leave had left our cursor elsewhere, so every absolute move the shell's line
+    /// editor made afterwards landed on the wrong row. So a prompt on the alternate screen
+    /// REQUESTS a host resync ([`Self::alt_screen_resync_requested`]) instead of leaving:
+    /// the host's own `?1049l`, forwarded, then leaves both screens from the same bytes.
+    /// Off by default, which is the local leave every other host gets.
+    pub(super) host_resyncs_alt_screen: bool,
+    /// A resync the embedder has not taken yet (`Terminal::take_alt_screen_resync_request`).
+    pub(super) alt_screen_resync_requested: bool,
+    /// [`Self::screen_replaced`] when the last resync was requested: one request per stuck
+    /// screen. A resync that never arrives leaves the screen up (as Windows Terminal leaves
+    /// it), and later prompts on it do not ask again.
+    pub(super) alt_screen_resync_screen: Option<u64>,
     /// XTSAVE (`CSI ? Ps s`) saved DEC private mode values, restored by
     /// XTRESTORE (`CSI ? Ps r`). Cleared on reset.
     pub(super) xtsave_modes: XtsaveModesMap,
@@ -259,6 +281,15 @@ pub(super) struct TransientState {
     /// an unchanged end position still reads as new output. Never reset (a
     /// replayed old seq could alias a stale sample).
     pub(super) print_anchor_seq: u64,
+    /// Monotonic count of kitty-graphics APC strings that ended (complete or cut short by
+    /// CAN/SUB), every one counted whatever it did. Never reset. The crash-restore
+    /// journal's recovery reads it around its replay
+    /// ([`super::Terminal::kitty_graphics_commands`]).
+    pub(super) kitty_commands: u64,
+    /// Monotonic count of Kitty unscrolls (`CSI n + T`) run on the main screen, where
+    /// they pull history onto it; never reset. Read by the crash-restore journal's
+    /// recovery around its replay ([`super::Terminal::kitty_unscrolls`]).
+    pub(super) kitty_unscrolls: u64,
 }
 
 impl TransientState {
@@ -298,6 +329,9 @@ impl TransientState {
             host_leave_alternate_screen: false,
             alt_entered_without_cursor_save: false,
             conhost_alt_screen_left_up: false,
+            host_resyncs_alt_screen: false,
+            alt_screen_resync_requested: false,
+            alt_screen_resync_screen: None,
             xtsave_modes: XtsaveModesMap::default(),
             last_osc_bel_terminated: false,
             kitty_images: HashMap::new(),
@@ -316,6 +350,8 @@ impl TransientState {
             osc_events: OscEventQueue::default(),
             print_anchor: None,
             print_anchor_seq: 0,
+            kitty_commands: 0,
+            kitty_unscrolls: 0,
         }
     }
 
@@ -359,6 +395,10 @@ impl TransientState {
         self.host_leave_alternate_screen = false;
         self.alt_entered_without_cursor_save = false;
         self.conhost_alt_screen_left_up = false;
+        // A reset leaves the alternate screen: a pending resync is moot.
+        // `host_resyncs_alt_screen` is host policy and stays.
+        self.alt_screen_resync_requested = false;
+        self.alt_screen_resync_screen = None;
         self.xtsave_modes.clear();
         self.last_osc_bel_terminated = false;
         self.bell_pending = false;

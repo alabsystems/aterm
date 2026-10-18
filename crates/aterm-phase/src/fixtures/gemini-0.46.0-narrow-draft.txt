@@ -1,0 +1,24 @@
+# gemini-cli 0.46.0 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (72x50, aterm 0.105.0) running the real Gemini CLI, launched by path with a scratch `HOME` whose settings select the API-key auth, a fake `GEMINI_API_KEY` and `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:<port>` (a local stub of the Gemini API, crates/aterm-lab) · the pane at 72 columns with a GEMINI.md loaded: a typed, unsent draft
+
+ ▝▜▄     Gemini CLI v0.46.0
+   ▝▜▄
+  ▗▟▀    Authenticated with gemini-api-key /auth
+ ▝▀
+
+
+Tips for getting started:
+1. /help for more information
+2. Ask coding questions, edit code or run commands
+3. Be specific for the best results
+
+
+
+────────────────────────────────────────────────────────────────────────
+ Shift+Tab to accept edits
+
+  1 GEMINI.md file
+▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+ > count in a narrow pane
+▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+ workspace (/directory)                  sandbox                 /model
+ /private/tmp/at.V9ar/proj               no sandbox                Auto

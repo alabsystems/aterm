@@ -3,7 +3,7 @@
 
 //! Tier-1 conformance of where the layout rebuild runs and what the adoption
 //! proof waits for, against
-//! `aterm_spec::derive::native_update_successor_attach_model`
+//! `aterm_models_update::native_update_successor_attach_model`
 //! (`NativeUpdateSuccessorAttach`).
 //!
 //! Every reachable model state is projected onto the shipping decisions: a
@@ -23,7 +23,8 @@
 
 use std::collections::BTreeSet;
 
-use aterm_spec::derive::{Model, native_update_successor_attach_model};
+use aterm_models_update::native_update_successor_attach_model;
+use aterm_spec::derive::Model;
 use aterm_spec::interp::{self, State};
 
 use crate::{

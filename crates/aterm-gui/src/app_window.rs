@@ -254,24 +254,18 @@ fn cascade_anchor_of(
 
 /// Authority currently owning the native window title.
 ///
-/// The close warning outranks the temporary find status, which outranks the
-/// canonical Title/Description. The canonical cache keeps advancing under either
-/// override so it is current when the override leaves.
+/// The temporary find status outranks the canonical Title/Description. The
+/// canonical cache keeps advancing under the override so it is current when the
+/// override leaves.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WindowTitleAuthority {
-    CloseWarning,
     Search,
     Canonical,
 }
 
 #[must_use]
-pub(crate) const fn window_title_authority(
-    close_warning_armed: bool,
-    search_active: bool,
-) -> WindowTitleAuthority {
-    if close_warning_armed {
-        WindowTitleAuthority::CloseWarning
-    } else if search_active {
+pub(crate) const fn window_title_authority(search_active: bool) -> WindowTitleAuthority {
+    if search_active {
         WindowTitleAuthority::Search
     } else {
         WindowTitleAuthority::Canonical
@@ -320,7 +314,7 @@ fn present_target_install_outcome(
 /// the dialog is only for Cmd-W, Cmd-Q, the close button and the strip's ✕.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(crate) enum CloseConfirm {
-    /// A human gesture: the native dialog, or the titlebar-warning fallback where
+    /// A human gesture: the native dialog, or the in-window confirm banner where
     /// there is none.
     #[default]
     Interactive,
@@ -437,21 +431,26 @@ impl App {
     /// post-join mismatch check in `attach_os_window`.
     ///
     /// An UNCONFIGURED font keys on the build's default primary identity where
-    /// it has one (`bundled:Cascadia Mono PL` on Windows, `bundled:JetBrains
-    /// Mono` on Linux; empty on macOS, where the key is unchanged), so the
-    /// release that changed that default reads as a cache miss rather than
-    /// early-revealing the previous default's metrics.
+    /// it has one (`bundled:Iosevka Term Semibold` on Windows,
+    /// `bundled:JetBrains Mono` on Linux; empty on macOS, where the key is
+    /// unchanged), so the release that changed that default reads as a cache
+    /// miss rather than early-revealing the previous default's metrics — as
+    /// does the line height, part of the key (`lh=1.1` on Windows since
+    /// 2026-10-16).
     fn cell_metrics_font_key(&self) -> String {
+        // The face the window draws, the theme's typography included: a theme
+        // that names a family or a line height keys its own metrics.
+        let view = self.font_view();
         format!(
             "{}|lh={}",
-            self.config.font_family_request().unwrap_or_else(|| {
+            view.font_family_request().unwrap_or_else(|| {
                 aterm_render::bundled::default_primary_candidates()
                     .first()
                     .copied()
                     .unwrap_or_default()
                     .to_string()
             }),
-            self.config.line_height_or_default(),
+            view.line_height_or_default(),
         )
     }
 
@@ -484,9 +483,10 @@ impl App {
     /// and the titlebar matches the terminal because those platforms paint it the
     /// theme's background.
     ///
-    /// Linux's fallback chrome (sctk-adwaita CSD on Wayland, `_GTK_THEME_VARIANT`
-    /// on X11) only has a light/dark variant, and winit's Wayland backend never
-    /// delivers `ThemeChanged`. So on Linux `Auto` resolves to the active terminal
+    /// Linux's window-system chrome (`_GTK_THEME_VARIANT` on X11; on Wayland the
+    /// compositor's own frame, or aterm's header where it leaves the window
+    /// undecorated, `crate::client_frame`) only has a light/dark variant, and
+    /// winit's Wayland backend never delivers `ThemeChanged`. So on Linux `Auto` resolves to the active terminal
     /// theme's darkness ([`crate::tab_bar::theme_is_dark`]); explicit Light/Dark
     /// still override. `apply_theme_live` re-pushes it on Linux.
     pub(crate) fn chrome_theme_for_apprt(&self) -> crate::app_config::WindowTheme {
@@ -646,9 +646,8 @@ impl App {
     ) {
         let sid = session.id;
         // Clone the active-tab mirror Arcs before the pool takes the session.
-        let (term, session_vi_active, master, sink, ui_waiting) = (
+        let (term, master, sink, ui_waiting) = (
             session.term.clone(),
-            session.vi_active.clone(),
             session.master,
             session.ctx.sink.clone(),
             session.ctx.ui_waiting.clone(),
@@ -662,11 +661,10 @@ impl App {
         let layout = pane::PaneTree::new(sid);
         let tab = crate::register_terminal_tab(&mut self.tab_ids, &mut self.view_store, &layout)
             .expect("tab/view identity space");
-        self.pool.insert(session);
+        self.pool_insert(session);
         let metrics = self.unattached_window_metrics();
         let ws = WindowState::new_terminal(
             term,
-            session_vi_active,
             master,
             sink,
             ui_waiting,
@@ -706,8 +704,8 @@ impl App {
     /// (lib.rs) → `<<win_count, frontmost, next_id, exited>>`, with the +1 remap.
     #[cfg(test)]
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "window_routing",
             action = "CreateWindow",
             project = "aterm_gui::App::project_window_routing"
@@ -1210,17 +1208,31 @@ impl App {
         // grouping and launcher matching, so keep it `"aterm"`. The minimum is
         // the smallest legal grid (20 cols × 5 rows at the 12 px base font plus
         // strip row and padding), in logical px.
+        //
+        // On X11 the window also carries the app icon (`_NET_WM_ICON`), which panels
+        // and window switchers that read the window property show; Wayland has no
+        // window icon, and its compositor takes the icon from the desktop entry the
+        // app_id names. The first window presents the launcher's startup token
+        // (`startup_token`), which ends the launch's busy cursor or spinner.
         #[cfg(target_os = "linux")]
         let attrs = {
-            use winit::platform::wayland::WindowAttributesExtWayland;
-            attrs
+            use winit::platform::wayland::{
+                ActiveEventLoopExtWayland as _, WindowAttributesExtWayland,
+            };
+            let wayland = el.is_wayland();
+            let attrs = attrs
                 .with_name("aterm", "aterm")
-                .with_min_inner_size(winit::dpi::LogicalSize::new(164.0, 98.0))
+                .with_min_inner_size(winit::dpi::LogicalSize::new(164.0, 98.0));
+            let attrs = if wayland {
+                attrs
+            } else {
+                attrs.with_window_icon(crate::desktop_files::window_icon())
+            };
+            match crate::startup_token::take_for_first_window(wayland) {
+                Some(token) => attrs.with_activation_token(token),
+                None => attrs,
+            }
         };
-        // AccessKit must attach before the window is first shown, so create it
-        // hidden and reveal it after the adapter is built (feature-gated).
-        #[cfg(a11y_tree)]
-        let attrs = attrs.with_visible(false);
         // Overlap handoff: every window of a handoff boot is created hidden and
         // revealed after its first real content present (`app_render`), so the
         // parked parent's frozen frame is never covered by a background-only
@@ -1244,20 +1256,22 @@ impl App {
             }
         };
         let startup_after_window_create = Instant::now();
-        // Attach this window's AccessKit adapter (events arrive as
-        // `Wake::Accessibility`), then show the window.
+        // Meta mode's Option is an Alt from the window's first key event: without it
+        // AppKit composes Option+a into "å" and starts a dead key on Option+e, which
+        // the encoder never sees as Meta. A new view's Option composes, so the window
+        // is told now and its record follows (`sync_option_as_alt` keeps both after).
+        let option_is_alt = self.option_is_alt(wid);
+        crate::platform::set_option_as_alt(&window, option_is_alt);
+        if let Some(ws) = self.windows.get(&wid) {
+            ws.option_as_alt.set(option_is_alt);
+        }
+        // Attach this window's AT-SPI adapter; its events arrive as
+        // `Wake::Accessibility`.
         #[cfg(a11y_tree)]
         let a11y_adapter = self
             .proxy
             .clone()
-            .map(|proxy| accesskit_winit::Adapter::with_event_loop_proxy(el, &window, proxy));
-        // Deferred-join first window stays hidden past the adapter attach; it is
-        // shown by the warm early reveal or the post-join size correction, both
-        // after this point, as AccessKit requires.
-        #[cfg(a11y_tree)]
-        if !pending_join && !defer_reveal {
-            window.set_visible(true);
-        }
+            .map(|proxy| crate::a11y_adapter::Adapter::new(&window, proxy));
         // A non-deferred window with a Ready backend is on glass here. Offer the
         // process-wide first-reveal stamp (first write wins).
         if !pending_join && !defer_reveal {
@@ -1370,7 +1384,8 @@ impl App {
             // target, or the explicit size); deterministic, so a cache hit means
             // the joined backend activates the cached size.
             let target_font_px =
-                hidpi_target_font_px(self.font_px_explicit, scale).unwrap_or(self.font_px);
+                hidpi_target_font_px(self.font_px_explicit, scale, self.font_size_scale_milli)
+                    .unwrap_or(self.font_px);
             let cached = (!restore_maximized)
                 .then(|| {
                     crate::restore::load_cell_metrics(
@@ -1425,8 +1440,7 @@ impl App {
                 self.apprt.window_set_background_color(&window, backdrop);
                 self.apprt
                     .window_set_appearance(&window, self.window_theme_for_chrome());
-                // Reveal. The AccessKit adapter attached above, strictly before
-                // this — the invariant holds on every show path.
+                // Reveal.
                 window.set_visible(true);
                 crate::metrics::mark_first_window_visible();
                 // The event loop is about to block in the join, so paint the themed
@@ -1465,9 +1479,11 @@ impl App {
             // colours resolve against the theme-coloured titlebar, not the OS
             // appearance. Re-synced on theme change.
             crate::toolbar::set_strip_dark(&handle, crate::tab_bar::theme_is_dark(self.theme.bg));
-            // Pin the user's selected-tab color override (config `active_tab_color`)
+            // Pin the authored selected-tab colour and accent (theme or config)
             // at install too, so a fresh window's strip matches the live config.
-            crate::toolbar::set_active_tab_color(&handle, self.config.active_tab_color_rgb());
+            let (authored, strip_accent) = self.native_strip_chrome();
+            crate::toolbar::set_active_tab_color(&handle, authored.active_tab);
+            crate::toolbar::set_strip_accent(&handle, strip_accent);
             self._toolbars.insert(wid, handle);
         }
         // Measure the band after the mask and toolbar: `contentLayoutRect` now
@@ -1503,7 +1519,9 @@ impl App {
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.scale = scale;
         }
-        if let Some(scaled) = hidpi_target_font_px(self.font_px_explicit, scale) {
+        if let Some(scaled) =
+            hidpi_target_font_px(self.font_px_explicit, scale, self.font_size_scale_milli)
+        {
             // Switch only on a real change. Faces and shaping config are unchanged
             // by a size switch. Cmd-0 resets to this scaled default.
             if (scaled - self.font_px).abs() >= 0.5 {
@@ -1781,6 +1799,10 @@ impl App {
                     };
                     if present_installed {
                         self.adopt_attached_window_focus(wid);
+                        // A configure that beat the attach already settled the
+                        // decoration mode; later ones arrive as `Resized`.
+                        #[cfg(target_os = "linux")]
+                        self.fit_client_frame_at_attach(wid);
                     }
                     let (attached, startup_milestones) = present_target_install_outcome(
                         present_installed,
@@ -1818,6 +1840,11 @@ impl App {
                     crate::logging::stderr_line!(
                         "aterm-gui: GPU surface creation failed: {e}; falling back to the CPU renderer"
                     );
+                    // The file log's copy: it already holds the worker's "GPU rendering
+                    // on …", which this run then did not do.
+                    aterm_log::warn!(
+                        "GPU surface creation failed: {e}; falling back to the CPU renderer"
+                    );
                     match self
                         .backend
                         .cpu_renderer_from_admitted(self.font_px, self.theme)
@@ -1844,8 +1871,8 @@ impl App {
                 }
             }
         }
-        // CPU present path (CoreGraphics on macOS, `softbuffer` elsewhere; see
-        // `crate::present`). A surface failure drops the window and returns false
+        // CPU present path (CoreGraphics on macOS, MIT-SHM / wl_shm on Linux,
+        // `softbuffer` on Windows; see `crate::present`). A surface failure drops the window and returns false
         // so only this window is declined.
         let surface = match crate::present::CpuSurface::new(window.clone()) {
             Ok(s) => s,
@@ -1873,6 +1900,9 @@ impl App {
         };
         if present_installed {
             self.adopt_attached_window_focus(wid);
+            // As on the GPU path: the decoration mode a configure already settled.
+            #[cfg(target_os = "linux")]
+            self.fit_client_frame_at_attach(wid);
         }
         let (attached, startup_milestones) = present_target_install_outcome(
             present_installed,
@@ -2096,8 +2126,8 @@ impl App {
     /// nondeterministic frontmost re-point. Projection:
     /// `window_routing_conformance::project` (lib.rs).
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "window_routing",
             action = "CloseWindow",
             project = "aterm_gui::App::project_window_routing"
@@ -2128,13 +2158,21 @@ impl App {
         // Abort a recording that owns this window's tap while the tap is still
         // reachable, so its client is not stranded until the deadline.
         let _ = self.video_abort_window_close(wid);
+        // The last window closing ends the warm spare with it (`crate::spare`);
+        // any other close moves where a spare should be.
+        if self.exits_app_when_closing(wid) {
+            self.retire_spare("closed", None);
+        } else {
+            self.spare_poke();
+        }
         let Some(ws) = self.windows.get(&wid) else {
             return CloseOutcome::Stay;
         };
         // If this close ends the app, capture the layout manifest now while tabs,
         // panes and sessions are intact. The post-loop writer in `main` persists
         // it; this stash is memory-only.
-        if self.config.restore_session_or_default() && self.exits_app_when_closing(wid) {
+        let exits_app = self.exits_app_when_closing(wid);
+        if self.config.restore_session_or_default() && exits_app {
             self.quit_capture = Some(self.capture_restore_manifest());
         }
         // Snapshot every terminal-view edge before mutating. The `layouts`
@@ -2151,9 +2189,16 @@ impl App {
         // the last view), and deregister from the registry only when the detach
         // dropped the session; a session shared with another window keeps its
         // entry.
-        for id in ids {
+        // THE CLOSED-SESSION INDEX: a close that ends the app keeps nothing
+        // (nobody is left to read it), and a window of many tabs builds the
+        // skeletons of its last closes only, the ones the index will keep,
+        // counted by the closes this batch makes, not by its views.
+        let plan = crate::session_log::ClosedKeep::plan(&self.pool.drops_of(&ids));
+        for (id, planned) in ids.into_iter().zip(plan) {
             if self.detach_session_view(id) {
-                self.retire_session_registration(id);
+                let keep = (!exits_app)
+                    .then(|| planned.unwrap_or(crate::session_log::ClosedKeep::Skeleton));
+                self.retire_session_registration_keeping(id, keep);
             }
         }
         for view in view_ids {
@@ -2289,6 +2334,115 @@ impl App {
         }
     }
 
+    /// Re-read the frame window `wid` must draw itself ([`crate::client_frame`]) from
+    /// its OS window: at attach, and on every `Resized`, which is how the fork reports
+    /// a change of decoration mode, of the compositor's capabilities or of the
+    /// maximized, fullscreen or tiled state. The strip lays its buttons out from it on
+    /// the next splice (the slot and the frame are strip cache-key and fingerprint
+    /// terms); losing the frame drops what only it could hold.
+    ///
+    /// `true` when the strip's rows moved with it ([`Self::sync_strip_header_row`]):
+    /// `wid`'s grid is then the caller's to fit.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn sync_client_frame(&mut self, wid: WindowId) -> bool {
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return false;
+        };
+        let frame = ws
+            .os_window
+            .as_deref()
+            .and_then(crate::client_frame::ClientFrame::of_window);
+        if ws.client_frame == frame {
+            return false;
+        }
+        ws.client_frame = frame;
+        if frame.is_none_or(|frame| !frame.edges) {
+            ws.frame_edge = None;
+        }
+        if frame.is_none_or(|frame| !frame.header) {
+            ws.caption_move = None;
+            ws.strip_hover_caption = None;
+        }
+        self.sync_strip_header_row(wid)
+    }
+
+    /// The strip rows for the `configured` `tab_strip_rows`: one at least while any
+    /// window draws its own frame and needs its header
+    /// ([`crate::client_frame::strip_rows_with_header`]). The config reload and
+    /// [`Self::sync_strip_header_row`] both resolve through it, so the header's row
+    /// comes and goes with the frames that need it.
+    pub(crate) fn strip_rows_for(&self, configured: u16) -> u16 {
+        let header = self.windows.values().any(|ws| {
+            ws.client_frame
+                .is_some_and(crate::client_frame::ClientFrame::has_header)
+        });
+        crate::client_frame::strip_rows_with_header(configured, header)
+    }
+
+    /// Re-resolve the strip's rows ([`Self::strip_rows_for`] of the live config) after
+    /// window `settling`'s frame changed; `true` when they moved. Every other window
+    /// re-grids as for a Settings edit of the rows; `settling`'s grid is its caller's
+    /// to fit (the `Resized` handler's own fit, or at attach
+    /// [`Self::apply_window_resized_grid`]). Fitting it there runs the initial-frame
+    /// settle first, so a header row that arrives with the first configure is added
+    /// to the window rather than taken from the terminal, and the PTY sees one size,
+    /// not the net-zero pair the settle exists to prevent.
+    #[cfg(any(test, target_os = "linux"))]
+    pub(crate) fn sync_strip_header_row(&mut self, settling: WindowId) -> bool {
+        let rows = self.strip_rows_for(crate::app_config::resolve_tab_strip_rows(&self.config));
+        if rows == self.tab_strip_rows {
+            return false;
+        }
+        // A rise is noted like the reload's, so no presence fold or band shrink
+        // re-grids inside it.
+        if aterm_messages::chrome::is_rise(self.tab_strip_rows, rows) {
+            self.note_chrome_rise_everywhere(Instant::now());
+        }
+        self.tab_strip_rows = rows;
+        self.regrid_for_chrome_rows_but(settling);
+        true
+    }
+
+    /// [`Self::sync_client_frame`] at attach, where no `Resized` fit follows: a header
+    /// row it added (or dropped) is fitted here as a `Resized` of the window's size
+    /// would be, the initial-frame settle first.
+    #[cfg(target_os = "linux")]
+    fn fit_client_frame_at_attach(&mut self, wid: WindowId) {
+        if !self.sync_client_frame(wid) {
+            return;
+        }
+        let size = self
+            .windows
+            .get(&wid)
+            .and_then(|ws| ws.os_window.as_ref())
+            .map(|w| w.inner_size());
+        if let Some(size) = size {
+            self.apply_window_resized_grid(wid, size);
+        }
+    }
+
+    /// Run a press on a window's own close button (`WindowState::caption_close`,
+    /// set where the mouse handler has no `ActiveEventLoop`) as the window system's
+    /// close: `CloseRequested`'s attribution and path, its confirmation included.
+    pub(crate) fn escalate_caption_close(&mut self, el: &ActiveEventLoop) {
+        let flagged: Vec<WindowId> = self
+            .windows
+            .iter()
+            .filter(|(_, ws)| ws.caption_close)
+            .map(|(w, _)| *w)
+            .collect();
+        for wid in flagged {
+            if let Some(ws) = self.windows.get_mut(&wid) {
+                ws.caption_close = false;
+            }
+            let _closing = crate::session_store::CloseAttribution::enter(
+                crate::session_store::ExitReason::WindowClose,
+                crate::session_store::ExitActor::Human,
+            );
+            self.on_close_requested(el, wid);
+        }
+    }
+
     /// Close any window whose last-tab close set `pending_close` (those paths have
     /// no `ActiveEventLoop`). The flag may be on the frontmost or the clicked
     /// window, so scan for it. It is cleared first to avoid a re-trigger.
@@ -2374,28 +2528,15 @@ impl App {
         self.pool.iter().any(Self::session_busy)
     }
 
-    /// Arm the ~2 s close/quit confirm window on `wid` and show the warning in its
-    /// titlebar — the quit's words when the gesture was a quit (`apply_title`
-    /// suppresses overwriting it while armed; `new_events` restores the live
-    /// title at expiry).
-    fn arm_close_warning(&mut self, wid: WindowId, quit_gesture: bool) {
-        if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.close_warning_until =
-                Some(Instant::now() + crate::quit_safety::CLOSE_CONFIRM_WINDOW);
-            if let Some(w) = ws.os_window.as_ref() {
-                w.set_title(crate::quit_safety::warning_title(quit_gesture));
-            }
-        }
-    }
-
     /// Confirm a destructive close/quit gesture for window `wid`, returning `true` to
     /// proceed. `exits_app`: the gesture quits the whole program (Cmd-Q, app-menu
     /// Quit, or closing the last window); `busy`: closing now would SIGHUP a
     /// foreground job.
     ///
     /// macOS shows the native `NSAlert`: always for a whole-app quit, and for a
-    /// window/tab close only while a job runs. Linux uses the ~2 s titlebar-warning
-    /// confirm: the gesture is refused once and proceeds on a repeat.
+    /// window/tab close only while a job runs. Linux asks in the window, through
+    /// the same banner as Windows (below), and only while a job runs: an idle
+    /// close or quit is instant there, as in GNOME Terminal.
     ///
     /// Non-interactive closes never reach a dialog: headless always proceeds, and a
     /// control-socket close answers by its [`CloseConfirm`] policy. The `close` and
@@ -2404,10 +2545,11 @@ impl App {
     /// instruction ([`CloseConfirm::Programmatic`]) proceeds regardless. A wire close
     /// never blocks on a human click.
     ///
-    /// Windows asks through the in-window banner, not a dialog: a task-modal dialog
-    /// would park the event loop and every control verb with it. The gesture is
-    /// refused now (`false`) and its question parked on `close_banner` (see
-    /// [`crate::close_confirm`]); Enter replays it under
+    /// Windows and Linux ask through the in-window banner, not a dialog: a
+    /// task-modal dialog would park the event loop and every control verb with it,
+    /// and a titlebar hint is invisible on a tiling or titlebar-less session. The
+    /// gesture is refused now (`false`) and its question parked on `close_banner`
+    /// (see [`crate::close_confirm`]); Enter replays it under
     /// [`CloseConfirm::Programmatic`], so it is never asked twice.
     ///
     /// The gesture here is a window close (a last-tab close, Alt+F4, the caption ✕),
@@ -2428,11 +2570,9 @@ impl App {
     }
 
     /// [`Self::confirm_destructive_close`] with the gesture's REPLAY named: what
-    /// Enter re-runs once the Windows banner is answered (a window close, or the
-    /// whole-app quit whose barriers a window close does not run). macOS answers
-    /// synchronously through the alert; Linux arms the titlebar warning, worded
-    /// for the gesture the replay names (a close that ends the last window still
-    /// says "close").
+    /// Enter re-runs once the banner is answered (a window, tab or pane close, or
+    /// the whole-app quit whose barriers a window close does not run). macOS
+    /// answers synchronously through the alert.
     pub(crate) fn confirm_destructive_gesture(
         &mut self,
         wid: WindowId,
@@ -2465,6 +2605,14 @@ impl App {
         // to one tab, so it stays instant while idle under both policies.
         // A quit with restore on loses the shells, not the layout: the copy says so.
         let reopens = self.config.restore_session_or_default();
+        // A tab or pane close leaves its window standing: it asks only while a job
+        // runs, in its own words, on every platform's policy.
+        let view_close = match replay {
+            crate::close_confirm::CloseReplay::Tab { .. } => Some(false),
+            crate::close_confirm::CloseReplay::Pane { .. } => Some(true),
+            crate::close_confirm::CloseReplay::Window(_)
+            | crate::close_confirm::CloseReplay::Quit => None,
+        };
         #[cfg(windows)]
         let prompt = {
             let tabs_closing: usize = if exits_app {
@@ -2476,6 +2624,10 @@ impl App {
         };
         #[cfg(not(windows))]
         let prompt = crate::quit_safety::confirm_prompt(exits_app, busy, reopens);
+        let prompt = match view_close {
+            Some(pane) => busy.then(|| crate::quit_safety::busy_view_close_prompt(pane)),
+            None => prompt,
+        };
         let Some(prompt) = prompt else {
             // Nothing worth interrupting for (macOS: app keeps running and nothing
             // is busy; Windows: also a single idle tab): the close needs no confirm.
@@ -2493,24 +2645,12 @@ impl App {
         {
             return proceed;
         }
-        // Off macOS and Windows: the titlebar-warning fallback. `close_decision`
-        // gates on `busy` only, so an idle quit closes immediately; a busy gesture
-        // is refused once and confirmed by a repeat within the armed window.
-        let armed = self
-            .windows
-            .get(&wid)
-            .and_then(|ws| ws.close_warning_until)
-            .is_some_and(|t| Instant::now() < t);
-        match crate::quit_safety::close_decision(busy, armed) {
-            crate::quit_safety::CloseDecision::Close => true,
-            crate::quit_safety::CloseDecision::Warn => {
-                self.arm_close_warning(
-                    wid,
-                    matches!(replay, crate::close_confirm::CloseReplay::Quit),
-                );
-                false
-            }
+        // No native dialog (Linux): only a gesture that would end a job asks, and
+        // it asks in the window. The always-ask quit above is macOS's ⌘Q rule.
+        if !busy {
+            return true;
         }
+        self.present_close_banner(wid, prompt, replay)
     }
 
     /// Park a destructive question on the in-window banner over `wid` and refuse
@@ -2639,20 +2779,70 @@ impl App {
                 }
             }
             crate::close_confirm::CloseReplay::Quit => self.on_quit_requested(el),
+            crate::close_confirm::CloseReplay::Tab { .. }
+            | crate::close_confirm::CloseReplay::Pane { .. } => {
+                if let Some(wid) = self.replay_confirmed_view_close(replay) {
+                    self.close_window(el, wid);
+                }
+            }
         }
         self.close_confirm = policy;
+    }
+
+    /// The tab or pane close a banner stood for, re-run under the caller's
+    /// policy: `Some(window)` when the close emptied that window (it became the
+    /// last while the question stood), which the caller then closes as the
+    /// gesture would have. A tab or pane already gone replays nothing.
+    ///
+    /// The replay runs a turn after the gesture, with no attribution scope open,
+    /// so it re-enters the one [`Self::present_close_banner`] stashed on the
+    /// window, and takes it: a tab or pane close leaves the window standing, so
+    /// [`Self::close_window_logical`] (the stash's other consumer) never runs to
+    /// clear it. Left behind, the stash would name the window's NEXT scope-less
+    /// close (its last shell exiting on its own read `ui-close by=human`), and a
+    /// question `invoke CloseTab` raised would be journalled under the
+    /// `ui-close by=human` scope `close_tab_at` opens for itself, not
+    /// `ctl-close by=ctl`. If the replay empties the window, `close_tab_at`
+    /// stashes this same attribution again for the teardown.
+    pub(crate) fn replay_confirmed_view_close(
+        &mut self,
+        replay: crate::close_confirm::CloseReplay,
+    ) -> Option<WindowId> {
+        let asker = match replay {
+            crate::close_confirm::CloseReplay::Tab { wid, .. }
+            | crate::close_confirm::CloseReplay::Pane { wid, .. } => self
+                .windows
+                .get_mut(&wid)
+                .and_then(|ws| ws.pending_close_attribution.take()),
+            crate::close_confirm::CloseReplay::Window(_)
+            | crate::close_confirm::CloseReplay::Quit => None,
+        };
+        let _asked = asker
+            .map(|(reason, actor)| crate::session_store::CloseAttribution::enter(reason, actor));
+        match replay {
+            crate::close_confirm::CloseReplay::Tab { wid, tab } => self
+                .replay_deferred_handoff_tab_close(wid, tab)
+                .then_some(wid),
+            crate::close_confirm::CloseReplay::Pane { wid, tab, view } => {
+                self.replay_deferred_handoff_view_close(wid, tab, view)
+            }
+            crate::close_confirm::CloseReplay::Window(_)
+            | crate::close_confirm::CloseReplay::Quit => None,
+        }
     }
 
     /// The `controls front` line for the close/quit confirm: the pending question
     /// and the wire way to answer it, or `confirm open=false`. Reported for the
     /// instance regardless of which window the banner is over.
     ///
-    /// `None` off Windows while nothing is pending, which is always: macOS and
-    /// Linux never park a close question.
+    /// `None` on macOS, which never parks a close question (its `NSAlert`
+    /// answers inside the gesture).
     pub(crate) fn close_confirm_controls_line(&self) -> Option<String> {
         match self.close_banner.as_ref() {
             Some(pending) => Some(pending.controls_line()),
-            None if cfg!(windows) => Some(crate::close_confirm::CONTROLS_CLOSED.to_string()),
+            None if cfg!(not(target_os = "macos")) => {
+                Some(crate::close_confirm::CONTROLS_CLOSED.to_string())
+            }
             None => None,
         }
     }
@@ -2666,7 +2856,7 @@ impl App {
     ///
     /// Given `exits_window`, return `true` to proceed or `false` to cancel via
     /// [`Self::confirm_destructive_close`]. A non-exiting close always returns
-    /// `true`.
+    /// `true`: [`Self::view_close_allowed`] guards that one.
     pub(crate) fn window_exit_close_allowed(&mut self, wid: WindowId, exits_window: bool) -> bool {
         if !exits_window {
             return true;
@@ -2676,6 +2866,31 @@ impl App {
         let exits_app = self.exits_app_when_closing(wid);
         let busy = self.window_has_foreground_job(wid);
         self.confirm_destructive_close(wid, exits_app, busy)
+    }
+
+    /// Quit-safety for a tab or pane close that leaves window `wid` standing:
+    /// Ctrl+Shift+W on a split or a non-last tab, the strip ✕, a middle click, the
+    /// tab menu. `busy`: the close would hang up a job only this tab or pane holds
+    /// (`pane_close_hangs_up_a_job` / `tab_close_hangs_up_a_job`, so a co-viewed
+    /// session or a sibling pane's job never counts). A busy close asks first,
+    /// through the same confirm as the window's last close, and `replay` is the
+    /// close the answer re-runs; an idle one is instant. GNOME Terminal and
+    /// Terminal.app ask the same question; before, one slip of Ctrl+Shift+W hung
+    /// up vim, a build or an ssh session in a background tab.
+    ///
+    /// macOS keeps aterm's documented choice for a person at the window (Cmd-W
+    /// closes such a tab or pane without a dialog: a human is watching); the wire
+    /// policies still refuse or proceed there as everywhere.
+    pub(crate) fn view_close_allowed(
+        &mut self,
+        wid: WindowId,
+        busy: bool,
+        replay: crate::close_confirm::CloseReplay,
+    ) -> bool {
+        if !busy || (cfg!(target_os = "macos") && self.close_confirm == CloseConfirm::Interactive) {
+            return true;
+        }
+        self.confirm_destructive_gesture(wid, false, true, replay)
     }
 
     /// Whether closing window `wid` quits the app: no other mixed-tab host survives.
@@ -3007,17 +3222,12 @@ impl App {
             crate::chrome_label::ChromeSurface::WindowTitle,
             &mut scratch,
         );
-        // No tab counter in the title; the tab strip shows the tabs. Temporary
-        // title owners take precedence: close warning > find status > canonical
-        // title. `current_title` keeps tracking under either override, but
-        // canonical writes are suppressed.
-        let (warning_armed, search_active) = self.windows.get(&id).map_or((false, false), |ws| {
-            (
-                ws.close_warning_until.is_some_and(|t| Instant::now() < t),
-                ws.search.is_some(),
-            )
-        });
-        let title_authority = window_title_authority(warning_armed, search_active);
+        // No tab counter in the title; the tab strip shows the tabs. The find
+        // status, while open, takes precedence over the canonical title.
+        // `current_title` keeps tracking under it, but canonical writes are
+        // suppressed.
+        let search_active = self.windows.get(&id).is_some_and(|ws| ws.search.is_some());
+        let title_authority = window_title_authority(search_active);
         let title_changed = {
             // Compare against the presented scratch directly to avoid a per-frame
             // allocation.
@@ -3526,11 +3736,20 @@ pub(crate) mod placement {
 /// explicit size is set or the display is 1×. Deterministic, so callers can
 /// compare with `==` to skip a rebuild. Also used by `first_window_prewarm_px`,
 /// so the worker's glyph warm and the attach agree.
-pub(crate) fn hidpi_target_font_px(font_px_explicit: bool, scale: f64) -> Option<f32> {
+/// `scale_milli` is the text size scale (`font_size_scale`, `1000` for
+/// none), applied to the derived default.
+pub(crate) fn hidpi_target_font_px(
+    font_px_explicit: bool,
+    scale: f64,
+    scale_milli: u16,
+) -> Option<f32> {
     (!font_px_explicit && scale > 1.0).then(|| {
-        (FONT_PX * scale as f32)
-            .round()
-            .clamp(FONT_PX_MIN, FONT_PX_MAX)
+        crate::scaled_font_px(
+            (FONT_PX * scale as f32)
+                .round()
+                .clamp(FONT_PX_MIN, FONT_PX_MAX),
+            scale_milli,
+        )
     })
 }
 
@@ -4051,14 +4270,15 @@ mod tests {
         }
     }
 
-    /// Forcing a side always moves the chrome, including for neutral backgrounds
-    /// (`#979797`..`#ADADAD`) where Rec.601 luma and WCAG relative luminance
-    /// disagree: `chrome_palette_theme` and `native_appearance::roles` read the
+    /// Forcing a side always moves the chrome, including across both former
+    /// classifier bands: `#767676`..`#969696`, where the old Rec. 601 luma rule
+    /// and the WCAG pole disagree, and `#979797`..`#ADADAD`, where the old render
+    /// rule did. `chrome_palette_theme` and `native_appearance::roles` read the
     /// same predicate, so the pages build the side the operator asked for.
     #[test]
     fn forcing_a_side_moves_the_pages_across_the_former_classifier_band() {
         let mut app = App::headless_for_test();
-        for gray in [0x97_u32, 0xA0, 0xA6, 0xAD] {
+        for gray in [0x76_u32, 0x80, 0x93, 0x96, 0x97, 0xA0, 0xA6, 0xAD] {
             let bg = (gray << 16) | (gray << 8) | gray;
             app.theme.bg = bg;
             for (window_theme, want_dark) in [
@@ -4093,7 +4313,7 @@ mod tests {
         let mut app = App::headless_for_test();
         let rgba: Arc<[u8]> = Arc::from([0xff, 0x22, 0xaa, 0xff]);
         let assets = Arc::new(crate::app_config::ConfigAssetCatalog {
-            trail_packs: crate::app_config::TrailPackCatalog::empty(),
+            trail_style: crate::app_config::TrailStyleCache::empty(),
             wallpaper: crate::app_config::WallpaperAsset::None,
             kitty_sprite: crate::app_config::KittySpriteAsset::Ready {
                 source_id: Arc::from("test.png"),
@@ -4118,48 +4338,31 @@ mod tests {
         ));
     }
 
-    /// An explicit font size is never auto-scaled — on ANY display.
+    /// An explicit font size is never auto-scaled, a 1× (or sub-1×) display
+    /// keeps the built-in default, and the Retina target is
+    /// `round(FONT_PX × scale)` clamped to the zoom ceiling.
     #[test]
-    fn explicit_font_px_never_scaled() {
-        assert_eq!(hidpi_target_font_px(true, 1.0), None);
-        assert_eq!(hidpi_target_font_px(true, 2.0), None);
-        assert_eq!(hidpi_target_font_px(true, 3.0), None);
-    }
-
-    /// A 1× (or sub-1×) display keeps the built-in default untouched.
-    #[test]
-    fn one_x_display_keeps_default() {
-        assert_eq!(hidpi_target_font_px(false, 1.0), None);
-        assert_eq!(hidpi_target_font_px(false, 0.75), None);
-    }
-
-    /// The Retina target is `round(FONT_PX × scale)` clamped to the zoom bounds.
-    #[test]
-    fn retina_target_is_rounded_and_clamped() {
+    fn hidpi_target_font_px_scales_only_the_default_on_a_dense_display() {
+        for scale in [1.0, 2.0, 3.0] {
+            assert_eq!(
+                hidpi_target_font_px(true, scale, 1000),
+                None,
+                "explicit at {scale}"
+            );
+        }
+        assert_eq!(hidpi_target_font_px(false, 1.0, 1000), None);
+        assert_eq!(hidpi_target_font_px(false, 0.75, 1000), None);
         assert_eq!(
-            hidpi_target_font_px(false, 2.0),
+            hidpi_target_font_px(false, 2.0, 1000),
             Some((FONT_PX * 2.0).round())
         );
-        // Fractional (Linux-style 1.25×) scale rounds to a whole px.
-        let frac = hidpi_target_font_px(false, 1.25).unwrap();
-        assert_eq!(frac, frac.round());
-        // An absurd scale clamps at the zoom ceiling rather than overflowing it.
-        assert_eq!(hidpi_target_font_px(false, 1000.0), Some(FONT_PX_MAX));
-    }
-
-    /// A second window on the same display computes a bit-identical target, so
-    /// `scaled == self.font_px` skips the redundant rebuild; a different-scale
-    /// display yields a different target.
-    #[test]
-    fn same_display_target_is_bit_stable_across_windows() {
-        let first = hidpi_target_font_px(false, 2.0).unwrap();
-        let second = hidpi_target_font_px(false, 2.0).unwrap();
-        assert!(second == first, "same scale must be bit-identical");
-        let other_display = hidpi_target_font_px(false, 1.5).unwrap();
-        assert!(
-            other_display != first,
-            "different scale must still trigger a rebuild"
+        let frac = hidpi_target_font_px(false, 1.25, 1000).unwrap();
+        assert_eq!(
+            frac,
+            frac.round(),
+            "a fractional scale rounds to a whole px"
         );
+        assert_eq!(hidpi_target_font_px(false, 1000.0, 1000), Some(FONT_PX_MAX));
     }
 
     #[test]
@@ -4602,8 +4805,9 @@ mod tests {
             .initial_frame_settle
             .as_mut()
             .unwrap()
-            .deadline = Instant::now();
-        std::thread::sleep(std::time::Duration::from_millis(2));
+            .deadline = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("the machine has been up a second");
 
         app.settle_initial_frame(wid, PhysicalSize::new(intended.width, intended.height - 35));
         assert!(
@@ -4613,10 +4817,10 @@ mod tests {
     }
 
     /// A window attached with a running session gets the intended frame, then
-    /// GNOME's activation configure echoes the pre-CSD geometry (−35 px, three
-    /// rows), then the correction lands. The echo must never reach the engine or
-    /// PTY, or an alternate-screen app sees a net-zero SIGWINCH pair and never
-    /// repaints its top row.
+    /// GNOME's activation configure echoes the pre-CSD geometry (−35 px: three
+    /// rows of macOS's face, two of Linux's), then the correction lands. The echo
+    /// must never reach the engine or PTY, or an alternate-screen app sees a
+    /// net-zero SIGWINCH pair and never repaints its top row.
     #[test]
     fn initial_frame_settle_keeps_the_csd_echo_off_the_engine_and_pty() {
         let mut app = App::headless_for_test();
@@ -4634,10 +4838,11 @@ mod tests {
             )
         };
         let echo = PhysicalSize::new(intended.width, intended.height - 35);
-        assert_eq!(
-            app.grid_dims_for(wid, echo),
-            (21, 80),
-            "negative control: the echo is a real three-row grid change"
+        // As many rows as 35 px holds of this platform's face.
+        let (echo_rows, echo_cols) = app.grid_dims_for(wid, echo);
+        assert!(
+            echo_rows < 24 && echo_cols == 80,
+            "negative control: the echo is a real grid change: {echo_rows}x{echo_cols}"
         );
 
         let mut seen = Vec::new();
@@ -4687,6 +4892,11 @@ mod tests {
         let wid = WindowId(0);
         let intended = arm_settle(&mut app, 24, 80, 3);
         let echo = PhysicalSize::new(intended.width, intended.height - 35);
+        let (echo_rows, _) = app.grid_dims_for(wid, echo);
+        assert!(
+            echo_rows < 24,
+            "PRECONDITION: the echo is a real grid change"
+        );
         app.apply_window_resized_grid(wid, intended);
         app.apply_window_resized_grid(wid, echo);
         assert_eq!(
@@ -4705,7 +4915,7 @@ mod tests {
         app.flush_pending_resize(wid);
         assert_eq!(
             app.windows.get(&wid).expect("window 0").rows,
-            21,
+            echo_rows,
             "no correction arrived: the window's real size is the truth"
         );
     }
@@ -5052,14 +5262,15 @@ mod close_confirm_tests {
     }
 
     /// `controls front` reports what stands and how to answer it. With nothing
-    /// pending, Windows prints `confirm open=false`; macOS/Linux print only the
-    /// `overlay` line.
+    /// pending, Windows and Linux (which ask in the window) print
+    /// `confirm open=false`; macOS (whose `NSAlert` asks inside the gesture)
+    /// prints only the `overlay` line.
     #[test]
     fn controls_front_reports_the_pending_confirm() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         let lines = app.read_aux_controls(crate::app_introspect::AuxTarget::Front);
-        if cfg!(windows) {
+        if cfg!(not(target_os = "macos")) {
             assert_eq!(
                 app.close_confirm_controls_line().as_deref(),
                 Some("confirm open=false")
@@ -5067,7 +5278,7 @@ mod close_confirm_tests {
             assert_eq!(lines, ["overlay open=false", "confirm open=false"]);
         } else {
             assert_eq!(app.close_confirm_controls_line(), None);
-            assert_eq!(lines, ["overlay open=false"], "unix stays byte-identical");
+            assert_eq!(lines, ["overlay open=false"]);
         }
         // Raised on the wire: `invoke CloseTab` runs inside the caller's
         // `ctl-close` scope (`App::invoke_attributed`).
@@ -5101,7 +5312,7 @@ mod close_confirm_tests {
         assert_eq!(app.answer_close_banner(false), None);
         assert_eq!(
             app.close_confirm_controls_line().is_some(),
-            cfg!(windows),
+            cfg!(not(target_os = "macos")),
             "closed again"
         );
     }
@@ -5286,16 +5497,16 @@ mod close_confirm_tests {
         assert!(app.close_banner.is_none());
     }
 
-    /// On Windows the interactive confirm uses the banner, never a dialog, and the
+    /// Off macOS the interactive confirm uses the banner, never a dialog, and the
     /// loop is never parked. On every host the wire policies answer before any
     /// banner and a single idle tab closes unasked. The routing is a `cfg!` branch,
-    /// so only the half that would open a real `NSAlert` is skipped off Windows.
+    /// so only the half that would open a real `NSAlert` is skipped on macOS.
     #[test]
     fn an_interactive_busy_close_parks_the_banner_instead_of_a_dialog() {
         let mut app = App::headless_for_test();
         app.headless = false;
         let wid = WindowId(0);
-        if cfg!(windows) {
+        if cfg!(not(target_os = "macos")) {
             app.close_confirm = CloseConfirm::Interactive;
             assert!(!app.confirm_destructive_close(wid, true, true));
             let pending = app.close_banner.as_ref().expect("the question is parked");

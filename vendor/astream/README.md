@@ -1,11 +1,14 @@
 # vendor/astream
 
-The astream crates aterm's fabric bridge (crates/aterm-link) builds against —
-`astream-aead`, `astream-broker`, `astream-cap`, `astream-digest`, `astream-wire` — as plain
-files from astream commit `6aab5d26a40560b686f6a5f93e4189ce7567eb9b`: each crate's `Cargo.toml` and `src/`,
-and astream's root `Cargo.toml`, whose workspace fields they inherit. Apache-2.0
-(`LICENSE`). The root `Cargo.toml` excludes this directory from aterm's
-workspace, so the crates build as dependencies and nothing else.
+The astream crates aterm builds against (the fabric bridge, crates/aterm-link,
+and the conformance suite's differential VT oracle) —
+`astream-aead`, `astream-broker`, `astream-cap`, `astream-digest`, `astream-effects`, `astream-sys`, `astream-term`, `astream-wire` — as plain
+files from astream commit `080780382102b76c78580e0f9deb0eb8a38bbbe5`: each crate's tree but its `tests/`,
+`examples/` and `benches/`, and astream's root `Cargo.toml`, whose workspace
+fields they inherit, with its member list emptied (it names crates not copied
+here). Apache-2.0 (`LICENSE`).
+aterm's root `Cargo.toml` excludes this directory from aterm's workspace, so the
+crates build as dependencies and nothing else.
 
 That commit is on astream's development line. https://github.com/alabsystems/astream
 carries astream's own releases, each published as a snapshot commit of its own, so

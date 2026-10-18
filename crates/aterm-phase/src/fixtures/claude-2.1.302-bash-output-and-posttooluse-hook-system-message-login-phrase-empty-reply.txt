@@ -1,0 +1,21 @@
+# claude-code 2.1.302 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a Bash call printing 'Not logged in · Please run /login' and a context-limit line, a PostToolUse hook on Bash printing {"systemMessage": "Not logged in · Please run /login"}, the reply after them EMPTY (a custom stub mode streaming no text)
+ ▐▛███▛█   Claude Code v2.1.302
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ /clear
+
+❯ toolstart
+
+⏺ Bash(sleep 5; printf "Not logged in · Please run /login\nContext limit reached · /compact or /clear to continue\n" | tee notes.txt)
+  ⎿  Not logged in · Please run /login
+     Context limit reached · /compact or /clear to continue
+  ⎿  PostToolUse:Bash says: Not logged in · Please run /login
+
+✻ Churned for 5s · done 7:05 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts

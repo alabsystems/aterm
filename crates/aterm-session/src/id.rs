@@ -37,6 +37,29 @@ impl SessionId {
         id.push_str(&hex(&b));
         Self(id)
     }
+
+    /// Whether this id has the shape [`SessionId::generate`] mints
+    /// ([`is_minted_sid`]).
+    #[must_use]
+    pub fn is_minted(&self) -> bool {
+        is_minted_sid(&self.0)
+    }
+}
+
+/// Whether `s` has the shape [`SessionId::generate`] mints: `s-` and 20
+/// lowercase hex digits. THE parser of a minted sid: a name someone chose
+/// (an edge's `src=`, which `grant` takes as given) is a session only when
+/// it reads as one, so a session log never attributes a record to a word
+/// that was never a session's (phase 3A ruling R1).
+#[must_use]
+pub fn is_minted_sid(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 22
+        && b[0] == b's'
+        && b[1] == b'-'
+        && b[2..]
+            .iter()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
 }
 
 impl std::fmt::Display for SessionId {
@@ -92,6 +115,27 @@ impl LaunchNonce {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_minted_sid_parses_and_a_chosen_name_does_not() {
+        for _ in 0..64 {
+            assert!(SessionId::generate().is_minted());
+        }
+        for chosen in [
+            "harness",
+            "ctl",
+            "human",
+            "s-1",
+            "s-boss",
+            "s-0123456789ABCDEF0123",
+            "s-0123456789abcdef01234",
+            "x-0123456789abcdef0123",
+            "",
+        ] {
+            assert!(!is_minted_sid(chosen), "{chosen}");
+        }
+        assert!(is_minted_sid("s-0123456789abcdef0123"));
+    }
 
     #[test]
     fn session_id_generate_is_prefixed_and_distinct() {

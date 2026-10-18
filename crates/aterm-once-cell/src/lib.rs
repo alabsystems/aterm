@@ -6,7 +6,7 @@
 //!
 //! Upstream predates `std`'s `OnceLock`; this crate expresses the same cells over
 //! [`std::sync::OnceLock`], [`std::sync::Mutex`] and [`core::cell::Cell`], with
-//! no dependencies and no `unsafe`. All twelve consumers are third-party, so
+//! no dependencies and no `unsafe`. All eleven consumers are third-party, so
 //! the `[patch.crates-io]` row is the only thing that reaches them.
 //!
 //! # Liveness per consumer
@@ -22,26 +22,33 @@
 //!                                         `std` from `wgsl-in`, which is ON
 //!
 //! LIVE  (called on the cells named)
-//!   wgpu-core 29.0.3     sync::OnceCell   linux win wasm-gpu   get_or_try_init
-//!   x11-dl 2.21.0        sync::OnceCell   linux            get_or_try_init
-//!   xkbcommon-dl 0.4.2   sync::OnceCell   linux            get_or_init
-//!   wayland-sys 0.31.11  sync::Lazy       linux            8 statics, Deref
-//!   x11rb 0.13.2         sync::Lazy       linux            force, Deref
+//!   wgpu-core 29.0.3     sync::OnceCell   win              get_or_try_init
 //!   wgpu-hal 29.0.3      sync::Lazy       win              Deref, Debug
-//!   js-sys 0.3.85        unsync::Lazy     wasm-gpu         Deref
-//!   wasm-bindgen 0.2.108 unsync::Lazy     wasm-gpu         force, Deref
-//!   wasm-bindgen-futures unsync::Lazy     wasm-gpu         Deref
+//!
+//! LOCK-ONLY  (no shipped cell compiles them: the wasm pair since
+//! wasm-platform WP.8, wayland-sys since LW.7)
+//!   js-sys 0.3.85        unsync::Lazy     Deref
+//!   wasm-bindgen 0.2.108 unsync::Lazy     force, Deref
+//!   wayland-sys 0.31.11  sync::Lazy       8 statics, Deref (only wgpu-hal
+//!                                         names it)
 //!
 //! DEV-ONLY (outside every `targo --unverified forge` cell, but `cargo test` builds them)
 //!   tempfile 3.27.0      sync::OnceCell   get_or_init, get
 //! ```
 //!
-//! On mac-arm, whose sole parent is `rustls`, the package is dead weight; on
-//! linux, win and wasm-gpu it is running code. wasm-cpu no longer resolves
-//! it: its one parent there was `wasm-bindgen`, which the CPU module left at
-//! wasm-platform WP.7 (docs/AUDIT-third-party-2026-10-15.md; re-measured
-//! 2026-10-16). `race::OnceBox` has no live caller: `ahash` left the graph at
-//! winit-core step 2 and `read-fonts` at text-fonts TF.4.
+//! On mac-arm and linux, whose sole parent is `rustls`, the package is dead
+//! weight; on win it is running code (forge blame, re-measured 2026-10-17).
+//! Neither wasm cell resolves it: its parents there were `wasm-bindgen`,
+//! which the CPU module left at wasm-platform WP.7, and `wgpu-core`, `js-sys`
+//! and `wasm-bindgen`, which the GPU module left at WP.8
+//! (docs/AUDIT-third-party-2026-10-15.md; re-measured 2026-10-17);
+//! `wasm-bindgen-futures` left the lock at WP.5, when the GPU module's init
+//! became synchronous. `race::OnceBox` has no live caller: `ahash` left the
+//! graph at winit-core step 2 and `read-fonts` at text-fonts TF.4. `x11-dl`
+//! and `x11rb` left linux with LW.7's X11 part, when the winit fork's X11
+//! backend moved onto first-party aterm-x11, `xkbcommon-dl` when its key
+//! handling moved onto aterm-xkb, and `wayland-sys` with its Wayland part;
+//! `wgpu-core` had left linux before.
 //!
 //! ## The contract that has teeth
 //!

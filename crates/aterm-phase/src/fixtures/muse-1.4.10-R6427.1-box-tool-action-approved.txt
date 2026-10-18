@@ -1,0 +1,16 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Muse Code outside the lab's jail, against a local fake backend: launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a scripted stand-in for Meta's model API, which the proxy variables also pointed at and which refused every request for another host; an lsof sampler over the process tree saw no endpoint but loopback), so Muse Code's own managed sandbox applied · the stand-in's call `mcp__probe__ping {text: "hi"}` (namespace `mcp__probe`) of a local stdio MCP server `probe` named in the scratch HOME's `settings.json` (its tool `ping` carries no annotations; a `readOnlyHint` tool of it ran unasked): the tool-action box after Up and Enter on `Yes, proceed`: the tool ran once (`◆ ping(hi) · probe · ✓`, the server logged its `tools/call`), the turn ended on the stand-in's reply
+
+  Muse Code 1.4.10
+
+❯ use the probe
+
+◆ I will call mcp__probe__ping.
+
+◆ ping(hi) · probe · ✓ · 2.1s · ctrl+o
+
+◆ Done. Tool result: probe ping ran
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  fake-model · high · ~/proj · Auto-review

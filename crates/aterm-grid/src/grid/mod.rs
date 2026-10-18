@@ -5,7 +5,6 @@
 //! Terminal grid with O(1) display scrolling and O(n × cols) content scrolling.
 
 mod accessors;
-mod buffer_access;
 mod checkpoint_lines;
 mod construct;
 mod content_queries;
@@ -27,7 +26,6 @@ mod scroll_unscroll;
 mod scrollback_access;
 mod scrollback_offload;
 mod scrollback_reflow;
-mod search_content;
 pub mod state;
 mod tab_ops;
 mod viewport_row_cache;
@@ -45,11 +43,12 @@ mod test_support;
 mod write_test_helpers;
 
 // Crate types re-exported so grid submodules can use `super::X`.
-pub(in crate::grid) use crate::GenerationTracker;
+pub(in crate::grid) use crate::Cursor;
+#[cfg(test)]
+pub(in crate::grid) use crate::PackedColor;
 pub(in crate::grid) use crate::row_u16;
-pub(in crate::grid) use crate::{Cell, CellFlags, PackedColor, PackedColors};
+pub(in crate::grid) use crate::{Cell, CellFlags, PackedColors};
 pub(in crate::grid) use crate::{CellCoord, CellExtra, CellExtras};
-pub(in crate::grid) use crate::{ColorType, Cursor, ExtendedStyle, StyleId};
 pub(in crate::grid) use crate::{HorizontalMargins, PAGE_SIZE, PageStore, ScrollRegion};
 pub(in crate::grid) use crate::{LineSize, Row};
 
@@ -57,8 +56,8 @@ pub(in crate::grid) use crate::{LineSize, Row};
 #[cfg(any(test, debug_assertions))]
 pub(in crate::grid) use crate::test_counters::{
     count_reflow_passthrough_lines, count_reflow_row_op, count_ring_fast_materialize,
-    count_row_to_line_cell, count_row_to_line_op, count_rows_only_resize_migrated_rows,
-    count_scrollback_reflow_sync_lines, count_viewport_row_materialize,
+    count_row_to_line_op, count_rows_only_resize_migrated_rows, count_scrollback_reflow_sync_lines,
+    count_viewport_row_materialize,
 };
 
 // Scrollback re-exports for the grid tests.
@@ -71,7 +70,7 @@ pub(in crate::grid) use aterm_scrollback::{CellAttrs, HyperlinkSpan, Line, Rle};
 #[cfg(test)]
 pub(in crate::grid) use crate::test_counters::{
     take_extras_clear_ops, take_extras_shift_ops, take_reflow_cell_ops, take_reflow_row_ops,
-    take_row_to_line_cells, take_row_to_line_ops,
+    take_row_to_line_ops,
 };
 
 pub use history_carry::{
@@ -84,7 +83,7 @@ pub use scrollback_offload::{PendingScrollbackReflow, ReflowStep, ReflowedScroll
 pub use visible_row_view::{CellDataView, VisibleRowView};
 
 /// Convert an i32 to u16 after clamping to non-negative (cursor math).
-#[cfg(any(test, feature = "fuzz", fuzzing))]
+#[cfg(test)]
 #[inline]
 fn clamp_u16(val: i32) -> u16 {
     val.max(0).try_into().unwrap_or(u16::MAX)
@@ -97,7 +96,7 @@ pub(in crate::grid) use viewport_row_cache::{HistoryEpoch, ViewportRowCache};
 /// the part of history shown.
 #[derive(Debug)]
 pub struct Grid {
-    /// All grid state: rows, cursor, damage, extras, styles, scrollback.
+    /// All grid state: rows, cursor, damage, extras, scrollback.
     pub(crate) storage: GridStorage,
     /// Derived state: the memo of materialized history rows a scrolled-back
     /// viewport reads. Rebuildable from `storage` alone, which is why it may be

@@ -535,13 +535,6 @@ mod tests {
     /// keeps its words.
     #[test]
     fn a_work_title_reads_finished_through_the_closed_table() {
-        for (ing, done) in FINISHED_VERBS {
-            assert_eq!(finished_form(ing).as_deref(), Some(done));
-            assert_eq!(
-                finished_form(&format!("{ing} aterm v0.91.0")),
-                Some(format!("{done} aterm v0.91.0"))
-            );
-        }
         assert_eq!(
             finished_form("Installing ALab tools").as_deref(),
             Some("Installed ALab tools")

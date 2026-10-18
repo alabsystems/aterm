@@ -1,7 +1,7 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-arrayvec: spec recovery from its 7 unit tests
+# aterm-arrayvec: spec recovery from its 6 unit tests
 
 > Status 2026-10-16: this file is the crate's migration worklist. The 10 specs below
 > are proved through Trust/Clean about the compiled functions in `aterm-alloc`, and then
@@ -14,13 +14,15 @@ ArrayVecIntoIter as IntoIter, CapacityError}`. Every spec below is therefore a c
 of `crates/aterm-alloc/src/array_vec.rs` and is proved **there**. That `arrayvec::X` is
 `aterm_alloc::X` is a type-system fact, not a spec.
 
-The tests are the 7 `#[test]` fns in `tests/consumer_forms.rs`: `naga_forms`,
-`wgpu_forms`, `wgpu_core_forms`, `wgpu_hal_forms`, `tiny_skia_forms`,
-`deref_sites_forms` and `iterator_types_are_nameable`. (A `#[test]` substring count
-gives 8; the eighth hit is the doc comment on line 28.) Nothing was compiled or run. The
-claims below come from reading the code.
+The tests are the 6 `#[test]` fns in `tests/consumer_forms.rs`: `naga_forms`,
+`wgpu_forms`, `wgpu_core_forms`, `wgpu_hal_forms`, `deref_sites_forms` and
+`iterator_types_are_nameable`. (A `#[test]` substring count gives 7; the seventh hit is
+the doc comment on line 29.) Nothing was compiled or run. The claims below come from
+reading the code. `tiny_skia_forms` and its `mod tiny_skia` left on 2026-10-17 with
+tiny-skia itself (linux-windowing LW.5); every spec it sampled is still sampled by
+another test.
 
-Result: **10 specs**, covering **all 7 tests**. **0 tests are non-spec samples** (§4).
+Result: **10 specs**, covering **all 6 tests**. **0 tests are non-spec samples** (§4).
 Every test is a multi-spec smoke test, so each one is retired only when every spec it
 maps to in §2 is Certified.
 
@@ -47,16 +49,16 @@ Columns: `id`, `kind`, `functions` (all in `aterm_alloc`), `statement`, `subsume
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking gaps
-AV-EMPTY	contract	ArrayVec::{new,new_const,clear,is_empty,len}, <ArrayVec as Default>::default	∀ T,N: view(new()) = view(new_const()) = view(default()) = []. After av.clear(): view(av') = [] and every element of view(av) is dropped exactly once (Own). av.is_empty() ⇔ av.len() = 0 ⇔ view(av) = []. av.len() = |view(av)|.	wgpu_core_forms, wgpu_hal_forms, tiny_skia_forms	EASY: const generics, MaybeUninit array, &mut self, element drop glue (clear is trust::skip today)	0, 1, 2, 8, 11
+AV-EMPTY	contract	ArrayVec::{new,new_const,clear,is_empty,len}, <ArrayVec as Default>::default	∀ T,N: view(new()) = view(new_const()) = view(default()) = []. After av.clear(): view(av') = [] and every element of view(av) is dropped exactly once (Own). av.is_empty() ⇔ av.len() = 0 ⇔ view(av) = []. av.len() = |view(av)|.	wgpu_core_forms, wgpu_hal_forms	EASY: const generics, MaybeUninit array, &mut self, element drop glue (clear is trust::skip today)	0, 1, 2, 8, 11
 AV-PUSH	contract	ArrayVec::{push,try_push,pop}, CapacityError::element	If |view(av)| < N: push(x) and try_push(x) give view(av') = view(av) ++ [x], and try_push returns Ok(()). If |view(av)| = N: push panics("ArrayVec overflow"), and try_push returns Err(e) with e.element() = x and view(av') = view(av). pop: view(av) = [] ⇒ None and view unchanged; view(av) = s ++ [y] ⇒ Some(y) and view(av') = s.	naga_forms, wgpu_core_forms, wgpu_hal_forms, iterator_types_are_nameable	EASY-MEDIUM: two-state &mut self, Result/Option of generic T, panic contract (push already carries contract_panic), MaybeUninit write / assume_init_read (pop is trust::skip)	0, 1, 2, 8, 11
-AV-DEREF-VIEW	contract	<ArrayVec as Deref>::deref, <ArrayVec as DerefMut>::deref_mut, ArrayVec::{as_slice,as_mut_slice}	&*av = av.as_slice() denotes exactly view(av): length len, never N. &mut *av = av.as_mut_slice() denotes the same len slots, and any in-place slice mutation m through it (sort, get_mut, in-bounds get_unchecked_mut, last_mut) gives view(av') = m(view(av)) with len unchanged.	deref_sites_forms, wgpu_core_forms, wgpu_hal_forms, tiny_skia_forms	EASY: slice from the MaybeUninit prefix (unsafe from_raw_parts; both fns are trust::skip), &mut self	0, 1, 2, 8, 11
+AV-DEREF-VIEW	contract	<ArrayVec as Deref>::deref, <ArrayVec as DerefMut>::deref_mut, ArrayVec::{as_slice,as_mut_slice}	&*av = av.as_slice() denotes exactly view(av): length len, never N. &mut *av = av.as_mut_slice() denotes the same len slots, and any in-place slice mutation m through it (sort, get_mut, in-bounds get_unchecked_mut, last_mut) gives view(av') = m(view(av)) with len unchanged.	deref_sites_forms, wgpu_core_forms, wgpu_hal_forms	EASY: slice from the MaybeUninit prefix (unsafe from_raw_parts; both fns are trust::skip), &mut self	0, 1, 2, 8, 11
 AV-INTO-INNER	contract	ArrayVec::{into_inner,into_inner_unchecked}	av.into_inner() = Ok(a) with a (as a Seq) = view(av) iff |view(av)| = N; otherwise Err(b) with view(b) = view(av). No element is dropped or duplicated in either arm (Own). into_inner_unchecked: requires len = N, ensures the same as the Ok arm.	naga_forms	EASY for the len comparison; MEDIUM for the unsafe ptr::read of [MaybeUninit<T>;N] as [T;N] under ManuallyDrop (both fns are trust::skip)	0, 1, 8, 11
 AV-EQ-HASH	equivalence	<ArrayVec as PartialEq>::eq, <ArrayVec as Hash>::hash	(a == b) ⇔ view(a) == view(b) as slices. ∀ H: Hasher, a.hash(h) makes exactly the writes <[T] as Hash>::hash(view(a), h) makes. Hence a == b ⇒ hash(a) = hash(b) for any T whose Eq and Hash agree, which the consumers' HashMap-key derives rely on (AttachmentData, ProgramCacheKey, RenderPassKey, FramebufferKey).	wgpu_core_forms, wgpu_hal_forms	EASY once delegation to the slice impls is expressible: trait-generic T: PartialEq/Hash and H: Hasher (higher-order over the hasher)	0, 1, 11, 13
-AV-REF-ITER	contract	<&ArrayVec as IntoIterator>::into_iter, <&mut ArrayVec as IntoIterator>::into_iter, ArrayVec::{iter,iter_mut}	(&av).into_iter() and av.iter() yield references to exactly view(av), in order, and never to slots [len,N). (&mut av).into_iter() and av.iter_mut() yield exactly len mutable references, in order, so applying f through each gives view(av') = map f (view(av)) with |view(av')| = |view(av)|.	naga_forms, wgpu_hal_forms, tiny_skia_forms	EASY given AV-DEREF-VIEW plus a slice-iterator model; &mut aliasing; the loop is in the caller	0, 1, 2, 7, 11
-AV-INTO-ITER	contract	<ArrayVec as IntoIterator>::into_iter, <IntoIter as Iterator>::{next,size_hint}, <IntoIter as DoubleEndedIterator>::next_back, IntoIter::as_slice	it = av.into_iter() yields exactly view(av) in order (next) or in reverse (next_back), then None. At every point it.as_slice() is the not-yet-yielded remainder and it.len() = size_hint().0 = size_hint().1 = |it.as_slice()|. Own: a yielded element is moved out once; an un-yielded one is dropped once when it is dropped (no leak, no double drop; Arc::strong_count returns to its pre-push value).	naga_forms, wgpu_core_forms, wgpu_hal_forms, tiny_skia_forms, iterator_types_are_nameable	MEDIUM: Iterator impl over owned state; next is remove(0) and next_back is pop, so it composes their contracts (both trust::skip); drop reasoning without an impl Drop	0, 1, 2, 3, 4, 7, 8, 11
+AV-REF-ITER	contract	<&ArrayVec as IntoIterator>::into_iter, <&mut ArrayVec as IntoIterator>::into_iter, ArrayVec::{iter,iter_mut}	(&av).into_iter() and av.iter() yield references to exactly view(av), in order, and never to slots [len,N). (&mut av).into_iter() and av.iter_mut() yield exactly len mutable references, in order, so applying f through each gives view(av') = map f (view(av)) with |view(av')| = |view(av)|.	naga_forms, wgpu_hal_forms	EASY given AV-DEREF-VIEW plus a slice-iterator model; &mut aliasing; the loop is in the caller	0, 1, 2, 7, 11
+AV-INTO-ITER	contract	<ArrayVec as IntoIterator>::into_iter, <IntoIter as Iterator>::{next,size_hint}, <IntoIter as DoubleEndedIterator>::next_back, IntoIter::as_slice	it = av.into_iter() yields exactly view(av) in order (next) or in reverse (next_back), then None. At every point it.as_slice() is the not-yet-yielded remainder and it.len() = size_hint().0 = size_hint().1 = |it.as_slice()|. Own: a yielded element is moved out once; an un-yielded one is dropped once when it is dropped (no leak, no double drop; Arc::strong_count returns to its pre-push value).	naga_forms, wgpu_core_forms, wgpu_hal_forms, iterator_types_are_nameable	MEDIUM: Iterator impl over owned state; next is remove(0) and next_back is pop, so it composes their contracts (both trust::skip); drop reasoning without an impl Drop	0, 1, 2, 3, 4, 7, 8, 11
 AV-DRAIN	contract	ArrayVec::drain, <Drain as Iterator>::next, <Drain as DoubleEndedIterator>::next_back, <Drain as Drop>::drop	For a range R resolving to [s,e): s > e or e > len ⇒ drain panics. Otherwise d = av.drain(R) has d.len() = e − s, yields view(av)[s..e) in order (next) or in reverse (next_back), and once d is dropped, whether fully, partly or not consumed, view(av') = view(av)[..s] ++ view(av)[e..], with each un-yielded element of [s,e) dropped exactly once (also when one of their destructors panics). If d is forgotten, the un-yielded elements stay in the vec.	wgpu_hal_forms, iterator_types_are_nameable	MEDIUM-HARD: RangeBounds generic and a Bound match with saturating_add, an &mut borrow held by the iterator, remove-based next, Drop with rotate + truncate, an unannotated panic contract (§5)	0, 1, 2, 3, 4, 7, 8, 11
-AV-CLONE	contract	<ArrayVec as Clone>::{clone,clone_from}	∀ T: Clone: view(av.clone()) = map clone (view(av)) and view(av) is unchanged. After self.clone_from(&src): view(self') = map clone (view(src)) (pointwise under T's Clone), and self's surplus tail when |self| > |src| is dropped exactly once.	wgpu_core_forms, wgpu_hal_forms, tiny_skia_forms	MEDIUM: calls the user's Clone (higher-order through a trait bound), loops, truncate / extend_from_slice, &mut self	0, 1, 2, 3, 7, 11, 13
-AV-FROM-ITER-EXTEND	contract	<ArrayVec as FromIterator>::from_iter, <ArrayVec as Extend>::extend	For any it with finite xs(it): from_iter(it) returns av with view(av) = xs(it) when |xs(it)| ≤ N, and panics("ArrayVec overflow") otherwise; it never truncates. av.extend(it) gives view(av') = view(av) ++ xs(it) when |view(av)| + |xs(it)| ≤ N; otherwise it panics at the first element past capacity, with the elements before it already pushed. Sampled instances: collect from slice iterators, ranges, arrays, Option (0 or 1 element) and mapped iterators.	naga_forms, wgpu_forms, wgpu_core_forms, wgpu_hal_forms, tiny_skia_forms, deref_sites_forms, iterator_types_are_nameable	HARD: a for loop over a caller-chosen generic IntoIterator (higher-order), a quantified statement over its sequence, a panic contract; both impls are trust::skip	0, 1, 2, 5, 7, 11, 13
+AV-CLONE	contract	<ArrayVec as Clone>::{clone,clone_from}	∀ T: Clone: view(av.clone()) = map clone (view(av)) and view(av) is unchanged. After self.clone_from(&src): view(self') = map clone (view(src)) (pointwise under T's Clone), and self's surplus tail when |self| > |src| is dropped exactly once.	wgpu_core_forms, wgpu_hal_forms	MEDIUM: calls the user's Clone (higher-order through a trait bound), loops, truncate / extend_from_slice, &mut self	0, 1, 2, 3, 7, 11, 13
+AV-FROM-ITER-EXTEND	contract	<ArrayVec as FromIterator>::from_iter, <ArrayVec as Extend>::extend	For any it with finite xs(it): from_iter(it) returns av with view(av) = xs(it) when |xs(it)| ≤ N, and panics("ArrayVec overflow") otherwise; it never truncates. av.extend(it) gives view(av') = view(av) ++ xs(it) when |view(av)| + |xs(it)| ≤ N; otherwise it panics at the first element past capacity, with the elements before it already pushed. Sampled instances: collect from slice iterators, ranges, arrays, Option (0 or 1 element) and mapped iterators.	naga_forms, wgpu_forms, wgpu_core_forms, wgpu_hal_forms, deref_sites_forms, iterator_types_are_nameable	HARD: a for loop over a caller-chosen generic IntoIterator (higher-order), a quantified statement over its sequence, a panic contract; both impls are trust::skip	0, 1, 2, 5, 7, 11, 13
 ```
 
 ### Distribution by kind (10)
@@ -85,7 +87,7 @@ No spec is blocked by gap 0 alone. Gaps 1 and 11 block all ten, so the cheapest 
 is a **monomorphised, length-only** slice of a spec (concrete `T` and `N`; Vec-style
 carriers are length-only today, audit §7 row 1), which needs gaps 0 and 2 only.
 
-## 2. Test → spec map (TSV; all 7)
+## 2. Test → spec map (TSV; all 6)
 
 `primary` is the spec that only this test (or this test most directly) samples. `also`
 lists the other specs it samples. Each test is deleted only when its primary and every
@@ -97,15 +99,14 @@ tests/consumer_forms.rs	naga_forms	AV-INTO-INNER	AV-PUSH, AV-FROM-ITER-EXTEND, A
 tests/consumer_forms.rs	wgpu_forms	AV-FROM-ITER-EXTEND	
 tests/consumer_forms.rs	wgpu_core_forms	AV-EQ-HASH	AV-EMPTY, AV-PUSH, AV-FROM-ITER-EXTEND, AV-INTO-ITER, AV-CLONE, AV-DEREF-VIEW
 tests/consumer_forms.rs	wgpu_hal_forms	AV-DRAIN	AV-EMPTY, AV-PUSH, AV-FROM-ITER-EXTEND, AV-INTO-ITER, AV-REF-ITER, AV-CLONE, AV-EQ-HASH, AV-DEREF-VIEW
-tests/consumer_forms.rs	tiny_skia_forms	AV-REF-ITER	AV-EMPTY, AV-FROM-ITER-EXTEND, AV-INTO-ITER, AV-CLONE, AV-DEREF-VIEW
 tests/consumer_forms.rs	deref_sites_forms	AV-DEREF-VIEW	AV-FROM-ITER-EXTEND
 tests/consumer_forms.rs	iterator_types_are_nameable	AV-INTO-ITER	AV-PUSH, AV-FROM-ITER-EXTEND, AV-DRAIN
 ```
 
 ## 3. Coverage
 
-- 7 tests read. All 7 map to the 10 specs. None is a non-spec sample.
-- `AV-FROM-ITER-EXTEND` is sampled by all 7 tests and is the hardest spec (§6), so it
+- 6 tests read. All 6 map to the 10 specs. None is a non-spec sample.
+- `AV-FROM-ITER-EXTEND` is sampled by all 6 tests and is the hardest spec (§6), so it
   decides when this file's tests can go. Until it is Certified, no test here can be deleted,
   even if all the other nine are.
 - `wgpu_forms` is the only test retired by a single spec (`AV-FROM-ITER-EXTEND`).
@@ -120,7 +121,7 @@ tests/consumer_forms.rs	iterator_types_are_nameable	AV-INTO-ITER	AV-PUSH, AV-FRO
 | (none) | Every `#[test]` samples at least one spec. | — |
 
 Not a test, and not subsumed by any spec: the compile-time half of
-`tests/consumer_forms.rs` (the `mod naga`, `wgpu`, `wgpu_core`, `wgpu_hal`, `tiny_skia`,
+`tests/consumer_forms.rs` (the `mod naga`, `wgpu`, `wgpu_core`, `wgpu_hal`,
 `deref_sites` items, which type-check every consumer invocation form verbatim). It is the
 crate's stated deliverable (file header, lines 7-32), a check of the *surface*, not of
 behaviour. **Keep it.** When the runtime `#[test]` bodies are deleted, the `pub` items
@@ -182,5 +183,5 @@ close.
    Prove `remove` first, in `aterm-alloc`.
 8. **`AV-CLONE`**. Loops plus the user's `Clone`.
 9. **`AV-FROM-ITER-EXTEND`** last. It is the hardest (a loop over a caller-chosen
-   iterator, a quantified statement, gaps 5, 7 and 13), and it is sampled by all 7 tests,
+   iterator, a quantified statement, gaps 5, 7 and 13), and it is sampled by all 6 tests,
    so the file's tests are deleted together when it is Certified.

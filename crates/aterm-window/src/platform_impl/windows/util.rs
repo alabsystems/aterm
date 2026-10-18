@@ -177,8 +177,16 @@ pub(crate) fn to_windows_cursor(cursor: CursorIcon) -> PCWSTR {
         CursorIcon::Pointer => IDC_HAND,
         CursorIcon::Text => IDC_IBEAM,
         CursorIcon::Grabbing => IDC_SIZEALL,
-        CursorIcon::ColResize => IDC_SIZEWE,
-        CursorIcon::RowResize => IDC_SIZENS,
+        // LOCAL PATCH (aterm), LW.5: the edge-resize icons, which aterm sets only on its own
+        // Wayland frame (Windows draws its own). The edges map as upstream's did; the corners
+        // would need `IDC_SIZENESW`/`IDC_SIZENWSE`, which the generated windows-sys facade does
+        // not declare while nothing on Windows sets them, so they are the arrow.
+        CursorIcon::ColResize | CursorIcon::EResize | CursorIcon::WResize => IDC_SIZEWE,
+        CursorIcon::RowResize | CursorIcon::NResize | CursorIcon::SResize => IDC_SIZENS,
+        CursorIcon::NeResize
+        | CursorIcon::SwResize
+        | CursorIcon::NwResize
+        | CursorIcon::SeResize => IDC_ARROW,
     }
 }
 

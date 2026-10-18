@@ -1,0 +1,19 @@
+# claude-code 2.1.300 · HAND-BUILT 2026-10-15 (no live capture yet): a skill box on the measured permission frame (`Oa`: the `─` rule from column 0, the title at column 1, a plain Text with no wrap prop) in a 44-column pane: `Use skill "anthropic-skills:built-in-browser"?` wraps after `Use skill`, the subtitle and option 2's label wrap too · read on main as kind `other`, whose `3. No` full power pressed (`decline@v1`)
+⏺ Loading the skill.
+
+────────────────────────────────────────────
+ Use skill
+ "anthropic-skills:built-in-browser"?
+ Claude may use instructions, code, or
+ files from this Skill.
+
+   Read this skill before the first step
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don't ask again for
+      anthropic-skills:built-in-browser in
+      ~/aterm
+   3. No
+
+ Esc to cancel · Tab to amend

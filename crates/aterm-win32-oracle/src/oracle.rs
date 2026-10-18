@@ -37,10 +37,10 @@ impl Runner for System {
         run_status(p, args, cwd, rustc)
     }
 }
-fn words(args: &[&str]) -> Vec<String> {
+pub fn words(args: &[&str]) -> Vec<String> {
     args.iter().map(|s| (*s).to_string()).collect()
 }
-fn tail(bytes: &[u8]) -> String {
+pub fn tail(bytes: &[u8]) -> String {
     let s = String::from_utf8_lossy(bytes);
     s.chars()
         .rev()
@@ -50,7 +50,7 @@ fn tail(bytes: &[u8]) -> String {
         .rev()
         .collect()
 }
-fn required(out: Output, label: &str) -> Result<Output> {
+pub fn required(out: Output, label: &str) -> Result<Output> {
     if !out.status.success() {
         return Err(format!(
             "{label} failed: {}{}",
@@ -60,6 +60,11 @@ fn required(out: Output, label: &str) -> Result<Output> {
     }
     Ok(out)
 }
+/// The flags every oracle Cargo command carries, the clean before a build
+/// included: the reference workspace answers from its committed `Cargo.lock`
+/// and the local cache, so lock drift is could-not-run. An unlocked clean
+/// re-resolves and rewrites the lock, and the `--locked` build after it passes.
+pub const FROZEN: [&str; 2] = ["--locked", "--offline"];
 pub fn cargo(
     runner: &mut impl Runner,
     tools: &Tools,
@@ -79,10 +84,9 @@ pub fn cargo(
         "aterm-win32-under-test",
         "-p",
         "aterm-win32-conformance",
-        "--offline",
-        "--target-dir",
-        target,
     ]);
+    clean.extend(words(&FROZEN));
+    clean.extend(words(&["--target-dir", target]));
     if let Some(t) = args
         .iter()
         .find(|a| a.starts_with("x86_64-") || a.starts_with("aarch64-"))
@@ -94,7 +98,8 @@ pub fn cargo(
         "clean oracle units",
     )?;
     let mut args = words(args);
-    args.extend(words(&["--locked", "--offline", "--target-dir", target]));
+    args.extend(words(&FROZEN));
+    args.extend(words(&["--target-dir", target]));
     runner.output(cargo, &args, workspace, Some(rustc))
 }
 pub fn artifacts(messages: &[u8]) -> Result<BTreeMap<String, PathBuf>> {
@@ -125,7 +130,7 @@ pub fn artifacts(messages: &[u8]) -> Result<BTreeMap<String, PathBuf>> {
     }
     Ok(out)
 }
-fn nm(runner: &mut impl Runner, tools: &Tools, args: &[String], cwd: &Path) -> Result<String> {
+pub fn nm(runner: &mut impl Runner, tools: &Tools, args: &[String], cwd: &Path) -> Result<String> {
     let out = required(runner.output(&tools.nm, args, cwd, None)?, "nm inspection")?;
     String::from_utf8(out.stdout).map_err(|e| e.to_string())
 }
@@ -279,7 +284,20 @@ fn checked(
     } else {
         "facade"
     };
-    let diagnosed = String::from_utf8_lossy(&out.stdout).lines().any(|line| {
+    if !rejected_by(&out.stdout, target_name) {
+        return Err(format!(
+            "{package} did not produce a subject compiler diagnostic: {}{}",
+            tail(&out.stdout),
+            tail(&out.stderr)
+        ));
+    }
+    Ok(false)
+}
+/// Whether cargo's JSON `messages` hold an error from library target
+/// `target_name`'s own compiler unit: a subject's rejection, as against a
+/// dependency or a compiler that failed.
+pub fn rejected_by(messages: &[u8], target_name: &str) -> bool {
+    String::from_utf8_lossy(messages).lines().any(|line| {
         let Ok(v) = aterm_json::from_str::<Value>(line) else {
             return false;
         };
@@ -292,15 +310,7 @@ fn checked(
                 .and_then(|m| m.get("level"))
                 .and_then(Value::as_str)
                 == Some("error")
-    });
-    if !diagnosed {
-        return Err(format!(
-            "{package} did not produce a subject compiler diagnostic: {}{}",
-            tail(&out.stdout),
-            tail(&out.stderr)
-        ));
-    }
-    Ok(false)
+    })
 }
 pub fn copy_tree(from: &Path, to: &Path) -> Result<()> {
     std::fs::create_dir_all(to).map_err(|e| e.to_string())?;

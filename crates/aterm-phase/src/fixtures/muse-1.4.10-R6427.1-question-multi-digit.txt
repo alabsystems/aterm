@@ -1,0 +1,25 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab) · the second question after the digit `2`: the cursor moved onto option 2, nothing answered · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+  Muse Code 1.4.10
+
+❯ carry on with the task
+
+◆ Hi! I am the local lab stub, not a model. (reply 1)
+
+❯ toolstart
+
+◈ Request user input Color, Size — running (1m 12s)
+
+  How big should the probe be?
+
+    1. Small (Recommended)  Quick to draw.
+  ⟩ 2. Large                Easy to see.
+    3. None of the above    Optionally, add details in notes (tab).
+
+  2 of 2
+  Enter to select · ↑/↓ to move · ←/→ to switch question · Tab for an optional note · Esc to interrupt
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  lab-stub · high · /private/tmp/at.lab0/proj · Auto-review

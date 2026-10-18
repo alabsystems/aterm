@@ -7,149 +7,44 @@
 
 use super::*;
 
-/// scroll_display up by small delta marks only top N rows dirty.
+/// `scroll_display` damages exactly the rows the move exposes: the top rows
+/// scrolling into history, the bottom rows scrolling back toward live, the
+/// whole screen once the move covers it, and nothing when the offset does not
+/// change (a zero delta, or a clamp at the top of history).
 #[test]
-fn scroll_display_up_marks_top_rows_dirty() {
-    let mut grid = Grid::with_scrollback(10, 10, 50);
-
-    for _ in 0..20 {
-        grid.set_cursor(9, 0);
-        grid.write_char('X');
-        grid.line_feed();
+fn scroll_display_damages_exactly_the_exposed_rows() {
+    // (name, offset before, delta, offset after, damaged rows; None = full)
+    #[expect(clippy::type_complexity, reason = "a test's case table")]
+    let cases: &[(&str, usize, i32, usize, Option<&[u16]>)] = &[
+        ("up 3", 0, 3, 3, Some(&[0, 1, 2])),
+        ("down 3", 5, -3, 2, Some(&[7, 8, 9])),
+        ("up past the screen", 0, 10, 10, None),
+        ("zero", 3, 0, 3, Some(&[])),
+        ("clamped at the top", 20, 100, 20, Some(&[])),
+    ];
+    for &(name, before, delta, after, damaged) in cases {
+        let mut grid = Grid::with_scrollback(10, 10, 20);
+        for _ in 0..40 {
+            grid.set_cursor(9, 0);
+            grid.write_char('X');
+            grid.line_feed();
+        }
+        assert_eq!(grid.scrollback_lines(), 20, "{name}: precondition");
+        grid.scroll_display(i32::try_from(before).expect("small"));
+        grid.clear_damage();
+        grid.scroll_display(delta);
+        assert_eq!(grid.display_offset(), after, "{name}");
+        match damaged {
+            None => assert!(grid.damage().is_full(), "{name}"),
+            Some(rows) => {
+                assert!(!grid.damage().is_full(), "{name}");
+                let got: Vec<u16> = (0..10)
+                    .filter(|&r| grid.damage().is_row_damaged(r))
+                    .collect();
+                assert_eq!(got, rows, "{name}");
+            }
+        }
     }
-    assert!(grid.scrollback_lines() >= 3);
-
-    grid.clear_damage();
-    grid.scroll_display(3); // scroll up = show older content
-    assert_eq!(grid.display_offset(), 3);
-
-    assert!(grid.damage().has_damage());
-    assert!(
-        !grid.damage().is_full(),
-        "scroll_display(3) on a 10-row grid should use targeted damage"
-    );
-
-    // Top 3 rows (0, 1, 2) should be dirty — these show newly exposed scrollback
-    for row in 0..3u16 {
-        assert!(
-            grid.damage().is_row_damaged(row),
-            "row {row} should be dirty after scroll_display up by 3"
-        );
-    }
-    for row in 3..10u16 {
-        assert!(
-            !grid.damage().is_row_damaged(row),
-            "row {row} should NOT be dirty after scroll_display up by 3"
-        );
-    }
-}
-
-/// scroll_display down by small delta marks only bottom N rows dirty.
-#[test]
-fn scroll_display_down_marks_bottom_rows_dirty() {
-    let mut grid = Grid::with_scrollback(10, 10, 50);
-
-    for _ in 0..20 {
-        grid.set_cursor(9, 0);
-        grid.write_char('X');
-        grid.line_feed();
-    }
-
-    // First scroll up, then scroll back down
-    grid.scroll_display(5);
-    assert_eq!(grid.display_offset(), 5);
-
-    grid.clear_damage();
-    grid.scroll_display(-3); // scroll down = show newer content
-    assert_eq!(grid.display_offset(), 2);
-
-    assert!(grid.damage().has_damage());
-    assert!(
-        !grid.damage().is_full(),
-        "scroll_display(-3) on a 10-row grid should use targeted damage"
-    );
-
-    // Bottom 3 rows (7, 8, 9) should be dirty — newly exposed live content
-    for row in 7..10u16 {
-        assert!(
-            grid.damage().is_row_damaged(row),
-            "row {row} should be dirty after scroll_display down by 3"
-        );
-    }
-    for row in 0..7u16 {
-        assert!(
-            !grid.damage().is_row_damaged(row),
-            "row {row} should NOT be dirty after scroll_display down by 3"
-        );
-    }
-}
-
-/// scroll_display with delta >= visible_rows falls back to full damage.
-#[test]
-fn scroll_display_large_delta_marks_full_damage() {
-    let mut grid = Grid::with_scrollback(5, 10, 100);
-
-    for _ in 0..30 {
-        grid.set_cursor(4, 0);
-        grid.write_char('X');
-        grid.line_feed();
-    }
-
-    grid.clear_damage();
-    grid.scroll_display(10); // delta >= rows(5) → full damage
-
-    assert!(grid.damage().has_damage());
-    assert!(
-        grid.damage().is_full(),
-        "scroll_display with delta >= visible_rows should mark_full"
-    );
-}
-
-/// scroll_display clamped to bounds produces no damage when already at limit.
-#[test]
-fn scroll_display_clamped_no_damage() {
-    let mut grid = Grid::with_scrollback(5, 10, 50);
-
-    for _ in 0..10 {
-        grid.set_cursor(4, 0);
-        grid.write_char('X');
-        grid.line_feed();
-    }
-
-    grid.scroll_to_top();
-    let max = grid.display_offset();
-
-    grid.clear_damage();
-    // Try to scroll further up — clamped, no actual movement
-    grid.scroll_display(100);
-    assert_eq!(grid.display_offset(), max);
-
-    // No damage because offset didn't change
-    assert!(
-        !grid.damage().has_damage(),
-        "scroll_display clamped at max should produce no damage"
-    );
-}
-
-/// scroll_display with delta=0 produces no damage.
-#[test]
-fn scroll_display_zero_delta_no_damage() {
-    let mut grid = Grid::with_scrollback(5, 10, 50);
-
-    for _ in 0..10 {
-        grid.set_cursor(4, 0);
-        grid.write_char('X');
-        grid.line_feed();
-    }
-
-    grid.scroll_display(3);
-    grid.clear_damage();
-    grid.scroll_display(0);
-
-    assert!(
-        !grid.damage().has_damage(),
-        "scroll_display(0) should produce no damage"
-    );
 }
 
 /// content_scroll_delta is set by scroll_up and consumed by take.

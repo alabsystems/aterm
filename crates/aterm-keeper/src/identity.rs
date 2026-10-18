@@ -16,13 +16,13 @@
 //!   at the floor (`crate::client`): it would offer an orphaned master to any same-uid process.
 //!
 //! What the code check does not bind: on Darwin the audit token names the process that last
-//! used the connection, read live, not the one that connected (`aterm_uds::peer`'s
-//! `the_peer_is_the_connections_last_user_read_live`), and each side reads it once, at accept or
-//! dial. A same-uid process can keep a copy of a connection in a second process and `exec` a
-//! genuine aterm at its own pid before the check, and the copy then speaks for genuine code. So
-//! against a same-uid process that knows this, the gate is the same-uid floor. The fix, a binding
-//! to the connecting process no later use can move, is a transport decision shared with the
-//! update's launched-lane rendezvous (`docs/AUDIT-update-robustness-r8-2026-09-30.md`, #904).
+//! used the connection, read live, not the one that connected (`aterm_uds::peer::AuditToken`),
+//! and each side reads it once, at accept or dial. A same-uid process can keep a copy of a
+//! connection in a second process and `exec` a genuine aterm at its own pid before the check,
+//! and the copy then speaks for genuine code. So against a same-uid process that knows this, the
+//! gate is the same-uid floor. The fix, a binding to the connecting process no later use can
+//! move, is a transport decision shared with the update's launched-lane rendezvous
+//! (`docs/AUDIT-update-robustness-r8-2026-09-30.md`, #904).
 //!
 //! That rendezvous checks its dialer with this machinery against a requirement that need not be
 //! this build's: a release's ([`Identity::for_requirement`]) or the launched code's
@@ -321,7 +321,7 @@ impl Identity {
         }
         #[cfg(not(unix))]
         {
-            let _ = (stream, token);
+            let _ = (stream, token, within);
             return Err(CheckError::Unchecked("the keeper is Unix-only".to_string()));
         }
         #[cfg(target_vendor = "apple")]
@@ -340,7 +340,7 @@ impl Identity {
             })??;
         }
         // Off Apple nothing judges the code, so neither the deadline nor the token is read.
-        #[cfg(not(target_vendor = "apple"))]
+        #[cfg(all(unix, not(target_vendor = "apple")))]
         let _ = (within, token);
         #[allow(unreachable_code)]
         Ok(())
@@ -656,8 +656,6 @@ mod sec {
 
 #[cfg(all(test, target_vendor = "apple"))]
 mod tests {
-    use aterm_uds::deadline::trust_service_silent;
-
     use super::*;
 
     /// A peer check's deadline here: a hang detector, not a budget.
@@ -693,9 +691,7 @@ mod tests {
     #[test]
     fn a_process_satisfies_its_own_requirement() {
         // An ad-hoc build's check needs no `trustd`, but every check shares the gate.
-        if trust_service_silent() {
-            return;
-        }
+        crate::require_trust_service();
         let id = Identity::for_self(IdentityPolicy::Designated).expect("own requirement");
         assert!(
             id.describe().starts_with("designated requirement: "),
@@ -715,9 +711,7 @@ mod tests {
     /// same pid) and no token at all are `Unchecked`, never a pass, under a requirement.
     #[test]
     fn a_held_token_is_checked_as_the_process_it_named() {
-        if trust_service_silent() {
-            return;
-        }
+        crate::require_trust_service();
         let id = Identity::for_self(IdentityPolicy::Designated).expect("own requirement");
         let (a, _b) = CtlStream::pair().expect("pair");
         let token = aterm_uds::peer::peer_audit_token(&a).expect("the kernel names the peer");
@@ -746,9 +740,7 @@ mod tests {
     /// one byte changed do not; the same-uid floor admits any.
     #[test]
     fn code_on_disk_is_checked_against_the_requirement() {
-        if trust_service_silent() {
-            return;
-        }
+        crate::require_trust_service();
         let id = Identity::for_self(IdentityPolicy::Designated).expect("own requirement");
         let exe = std::env::current_exe().expect("test binary");
         answered(id.admits_code_at(&exe)).expect("this binary meets its own requirement");
@@ -776,9 +768,7 @@ mod tests {
     /// unchecked, and text that is no requirement is refused when compiled.
     #[test]
     fn a_stated_requirement_refuses_code_that_does_not_meet_it() {
-        if trust_service_silent() {
-            return;
-        }
+        crate::require_trust_service();
         let id = Identity::for_requirement(
             "anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and \
              certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate \
@@ -805,9 +795,7 @@ mod tests {
     /// same process against `/usr/bin/true`'s code is refused. Unsigned code has no requirement.
     #[test]
     fn the_code_at_a_path_admits_exactly_its_own_processes() {
-        if trust_service_silent() {
-            return;
-        }
+        crate::require_trust_service();
         let exe = std::env::current_exe().expect("test binary");
         let own = Identity::for_code_at(&exe).expect("this binary's requirement");
         assert!(
@@ -838,9 +826,7 @@ mod tests {
     /// check and passes the floor.
     #[test]
     fn another_program_fails_the_designated_check() {
-        if trust_service_silent() {
-            return;
-        }
+        crate::require_trust_service();
         let dir = std::env::temp_dir().join(format!("akid-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
         let path = dir.join("s");

@@ -62,10 +62,7 @@
 //! certificates that `webpki` legitimately refuses. So:
 //!
 //! * parsing uses [`crate::pem::decode_certificates_lossy`], which skips a block
-//!   it does not understand instead of failing the file. The STRICT
-//!   [`crate::pem::decode_certificates`] stays strict and stays the parser for
-//!   an operator's [`crate::Trust::Roots`] override, where loud failure is the
-//!   documented contract;
+//!   it does not understand instead of failing the file;
 //! * roots go in through `RootCertStore::add_parsable_certificates`, which drops
 //!   the ones webpki rejects rather than refusing the whole store.
 //!
@@ -396,14 +393,12 @@ mod tests {
         // Discovery, the tolerant PEM path, and `add_parsable_certificates`,
         // over whatever multi-hundred-certificate OpenSSL bundle this host
         // actually has. On macOS that is `/etc/ssl/cert.pem`; on Linux it is
-        // whichever of `CERTIFICATE_FILES` the distro ships. If the host has
-        // neither, there is nothing to assert and the test says so rather than
-        // failing.
+        // whichever of `CERTIFICATE_FILES` the distro ships. A host with
+        // neither has nothing to assert: COULD NOT RUN, never a pass.
         let file = bundle_file(None);
         let dirs = bundle_dirs(None);
         if file.is_none() && dirs.is_empty() {
-            eprintln!("SKIP: this host has no OpenSSL-shaped CA store");
-            return;
+            aterm_spec::host::could_not_run("this host has no OpenSSL-shaped CA store");
         }
         let ders = collect_ders(file.as_deref(), &dirs);
         assert!(
@@ -434,11 +429,10 @@ mod tests {
             )
             .is_ok();
         if !accepted {
-            eprintln!(
-                "SKIP (hard assertion only): this host's OpenSSL bundle does not carry the \
-                 anchor for the captured github.com chain"
+            aterm_spec::host::could_not_run(
+                "this host's OpenSSL bundle does not carry the anchor for the captured \
+                 github.com chain",
             );
-            return;
         }
         // The arming twin: the SAME store must refuse the SAME chain for a name
         // it does not carry, so the acceptance above is not "accepts everything".
@@ -465,7 +459,7 @@ mod tests {
                     error.to_string().contains("system trust store"),
                     "unexpected failure: {error}"
                 );
-                eprintln!("SKIP: this host has no OpenSSL-shaped CA store");
+                aterm_spec::host::could_not_run("this host has no OpenSSL-shaped CA store");
             }
         }
     }

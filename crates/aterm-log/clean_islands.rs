@@ -17,18 +17,16 @@ pub fn emit() {
 /// Does `RUSTC`, the compiler itself (a lint driver arrives as a separate wrapper), say it
 /// is a Trust build: a `trust:` line in its `-vV`? Not `CARGO_CFG_TRUST_VERIFY`: Trust
 /// prints that cfg only while it verifies, so a lint driver's target cfg lacks it.
-#[expect(
-    clippy::disallowed_types,
-    reason = "a build script, never linked into the shipped binary: one `-vV` of the compiler"
-)]
 fn trust_compiler() -> bool {
     let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
-    std::process::Command::new(rustc)
-        .arg("-vV")
-        .output()
-        .is_ok_and(|out| {
-            out.stdout
-                .split(|&byte| byte == b'\n')
-                .any(|line| line.starts_with(b"trust:"))
-        })
+    #[expect(
+        clippy::disallowed_types,
+        reason = "a build script, never linked into the shipped binary: one `-vV` of the compiler"
+    )]
+    let mut probe = std::process::Command::new(rustc);
+    probe.arg("-vV").output().is_ok_and(|out| {
+        out.stdout
+            .split(|&byte| byte == b'\n')
+            .any(|line| line.starts_with(b"trust:"))
+    })
 }

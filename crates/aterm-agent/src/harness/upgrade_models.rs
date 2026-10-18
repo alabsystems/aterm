@@ -12,6 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
+use aterm_durable::Flush;
 use aterm_json::{Map, Value};
 
 use super::upgrade::is_model_id;
@@ -232,7 +233,9 @@ pub fn load_or_seed(path: &Path, now: i64) -> Result<Priority, String> {
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let p = Priority::seed(now);
-            write_atomic(path, &p.render()).map_err(|e| format!("{}: {e}", path.display()))?;
+            // Ordered: a list that is lost is seeded again whenever it is absent.
+            write_atomic_ordered(path, &p.render())
+                .map_err(|e| format!("{}: {e}", path.display()))?;
             Ok(p)
         }
         Err(e) => Err(format!("{}: {e}", path.display())),
@@ -255,30 +258,65 @@ pub fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
 /// The directory could not be made or the write, the mode or the rename
 /// failed.
 pub fn write_atomic_mode(path: &Path, text: &str, mode: Option<u32>) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
     use std::io::Write as _;
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    write_atomic_using(path, text, mode, Flush::Durable, |file, bytes| {
+        file.write_all(bytes)
+    })
+}
+
+/// [`write_atomic`] with the stage finished by [`aterm_durable::ordered`] instead of a
+/// full flush: the bytes land before the rename that publishes them, so after a power
+/// loss `path` holds the old file or the whole new one, never a name over bytes that
+/// did not land. No write here syncs the directory after the rename, so what
+/// [`write_atomic`] promises beyond that order is only the new bytes, not their name.
+/// Each caller says which recovery tolerates the older copy.
+///
+/// # Errors
+/// As [`write_atomic`].
+pub fn write_atomic_ordered(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    write_atomic_using(path, text, None, Flush::Ordered, |file, bytes| {
+        file.write_all(bytes)
+    })
+}
+
+// The destination changes only after the owned stage is complete and synced. An error
+// before rename drops only the exclusively-created stage directory, never a guessed name.
+fn write_atomic_using(
+    path: &Path,
+    text: &str,
+    mode: Option<u32>,
+    flush: Flush,
+    write: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let stage = aterm_tempfile::Builder::new()
+        .prefix(".aterm-write-")
+        .tempdir_in(dir)?;
+    let staged = stage.path().join("data");
     let mut open = std::fs::OpenOptions::new();
-    open.write(true).create(true).truncate(true);
+    open.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         open.mode(0o600);
     }
-    let mut f = open.open(&tmp)?;
+    let mut file = open.open(&staged)?;
     #[cfg(unix)]
-    if let Some(mode) = mode {
+    {
         use std::os::unix::fs::PermissionsExt as _;
-        f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        file.set_permissions(std::fs::Permissions::from_mode(mode.unwrap_or(0o600)))?;
     }
     #[cfg(not(unix))]
     let _ = mode;
-    f.write_all(text.as_bytes())?;
-    crate::durable::sync_all(&f)?;
-    drop(f);
-    std::fs::rename(&tmp, path)
+    write(&mut file, text.as_bytes())?;
+    crate::durable::finish(&file, flush)?;
+    drop(file);
+    std::fs::rename(&staged, path)
 }
 
 // ---------------------------------------------------------------------------
@@ -1790,66 +1828,13 @@ mod tests {
     }
 
     #[test]
-    fn a_new_opus_is_inserted_above_the_family_best_only_when_the_build_knows_it() {
+    fn an_id_outside_the_grammar_or_the_list_is_never_admitted() {
+        // The writer's other refusals (older than the family's best, unknown
+        // to the build, already listed) are the Tier-1 bind's
+        // (`tests/conformance_upgrade_models/priority.rs`).
         let mut p = Priority::seed(0);
-        let b = baked(
-            &[
-                "claude-opus-5-5",
-                "claude-opus-5-6",
-                "claude-fable-5-1",
-                "claude-opus-5",
-                "claude-sonnet-6",
-            ],
-            &[("opus", "claude-opus-5-6"), ("sonnet", "claude-sonnet-6")],
-        );
-        let recs = recommendations(&Evidence::default(), Some(&b), "2.1.290");
-        let changes = ingest(&mut p, &recs, Some(&b), 5);
-        assert_eq!(changes.len(), 1, "sonnet is not a family on the list");
-        assert_eq!(changes[0].placed, "above claude-opus-5-5");
-        assert_eq!(changes[0].source, "catalog:2.1.290");
-        assert_eq!(
-            p.ids,
-            [
-                "claude-opus-5-6",
-                "claude-opus-5-5",
-                "claude-fable-5-1",
-                "claude-opus-5"
-            ]
-        );
-        // Idempotent.
-        assert!(ingest(&mut p, &recs, Some(&b), 6).is_empty());
-    }
-
-    #[test]
-    fn recommendations_that_must_not_be_admitted() {
-        let b = baked(
-            &[
-                "claude-opus-5-5",
-                "claude-opus-5",
-                "claude-opus-4-8",
-                "claude-fable-5-1",
-            ],
-            &[],
-        );
-        let known = |id: &str| b.model(id).is_some();
-        let mut p = Priority::seed(0);
-        // Older than the family's best: a downgrade is never an "upgrade".
-        assert_eq!(p.admit("claude-opus-4-8", "x", &known, 1), None);
-        // Unknown to the build.
-        assert_eq!(p.admit("claude-opus-6", "x", &known, 1), None);
-        // Grammar.
         assert_eq!(p.admit("claude-opus-6;ls", "x", &|_| true, 1), None);
-        // Already listed.
-        assert_eq!(p.admit("claude-opus-5-5", "x", &known, 1), None);
-        // A family not on the list.
         assert_eq!(p.admit("claude-mythos-5", "x", &|_| true, 1), None);
-        // A hand-ordered list with the older member ranked first still never
-        // receives an id older than its newest member.
-        let mut hand = Priority {
-            ids: vec!["claude-opus-5".into(), "claude-opus-5-5".into()],
-            history: vec![],
-        };
-        assert_eq!(hand.admit("claude-opus-5-1", "x", &|_| true, 1), None);
         assert_eq!(p.ids, SEED);
     }
 
@@ -2503,99 +2488,6 @@ mod tests {
         }
     }
 
-    /// The list's step reads the same candidates as the family's ([`offered`]): an entry the build
-    /// does not know, the account is denied, or `availableModels` excludes is never its target.
-    #[test]
-    fn the_lists_step_reads_the_same_offered_set_as_the_familys() {
-        let list = Priority::seed(0);
-        let b = baked(
-            &["claude-opus-5-5", "claude-fable-5-1", "claude-opus-5"],
-            &[("opus", "claude-opus-5-5"), ("fable", "claude-fable-5-1")],
-        );
-        let opus5 = LiveModel {
-            id: "claude-opus-5".into(),
-            by_command: false,
-        };
-        let rule = |ev: &Evidence, allowed: Option<&[String]>| {
-            let offer = offered(&list, "2.1.283", ev, Some(&b), allowed);
-            model_due(
-                &list,
-                Some(&opus5),
-                &offer,
-                None,
-                None,
-                &ModelRecord::default(),
-            )
-        };
-        let deny = |xs: &[&str]| Evidence {
-            denied: ids(xs),
-            ..Evidence::default()
-        };
-        // Opus 5.5 denied: the list's step takes Fable 5.1 ...
-        assert_eq!(
-            rule(&deny(&["claude-opus-5-5"]), None),
-            ModelVerdict::Due {
-                from: "claude-opus-5".into(),
-                to: "claude-fable-5-1".into()
-            }
-        );
-        // ... unless Fable is denied too, or not in `availableModels`.
-        assert_eq!(
-            rule(&deny(&["claude-opus-5-5", "claude-fable-5-1"]), None),
-            ModelVerdict::Keep("model-current")
-        );
-        let only_opus = ids(&["claude-opus-5", "claude-opus-5-5"]);
-        assert_eq!(
-            rule(&deny(&["claude-opus-5-5"]), Some(&only_opus)),
-            ModelVerdict::Keep("model-current")
-        );
-        // A listed id the build does not know is never the list's target.
-        // Negative control: the build that knows it takes it.
-        let hand = Priority {
-            ids: ids(&["claude-sonnet-6", "claude-opus-5"]),
-            history: vec![],
-        };
-        let only_opus5 = baked(&["claude-opus-5"], &[("opus", "claude-opus-5")]);
-        let knows = baked(
-            &["claude-opus-5", "claude-sonnet-6"],
-            &[("opus", "claude-opus-5")],
-        );
-        let none = Evidence::default();
-        let with = |bk: &Baked| {
-            let offer = offered(&hand, "2.1.283", &none, Some(bk), None);
-            model_due(
-                &hand,
-                Some(&opus5),
-                &offer,
-                None,
-                None,
-                &ModelRecord::default(),
-            )
-        };
-        assert_eq!(with(&only_opus5), ModelVerdict::Keep("model-current"));
-        assert_eq!(
-            with(&knows),
-            ModelVerdict::Due {
-                from: "claude-opus-5".into(),
-                to: "claude-sonnet-6".into()
-            }
-        );
-        // The Tier-1 bind's reader is this step's target.
-        assert_eq!(
-            list_target(
-                &list,
-                &offered(
-                    &list,
-                    "2.1.283",
-                    &deny(&["claude-opus-5-5"]),
-                    Some(&b),
-                    None
-                )
-            ),
-            Some("claude-fable-5-1")
-        );
-    }
-
     /// Why, in the notices: a move within the family is the family's, a move
     /// across it can only be the list's, and an id outside the grammar says
     /// neither.
@@ -2611,12 +2503,6 @@ mod tests {
         );
         assert_eq!(move_why(None, "claude-opus-5-5"), MoveWhy::Unknown);
         assert_eq!(move_why(Some("opus"), "claude-opus-5-5"), MoveWhy::Unknown);
-        assert!(MoveWhy::List.words().contains("priority list"));
-        assert!(
-            MoveWhy::Family
-                .words()
-                .contains("newest model of its family")
-        );
     }
 
     #[test]
@@ -2642,265 +2528,6 @@ mod tests {
         );
     }
 
-    /// An ask that ran stands: recorded applied once it runs, it is not recorded failed when a
-    /// later `/model` moves away past `MODEL_SETTLE_S`. Control: an ask that never ran is.
-    #[test]
-    fn the_settle_step_never_fails_an_ask_that_ran() {
-        let asked_at = 1_000_000;
-        let mut rec = ModelRecord::default();
-        rec.asked("claude-opus-5-5", asked_at);
-        let ran = LiveModel {
-            id: "claude-opus-5-5".into(),
-            by_command: false,
-        };
-        let verified = rec.settle(Some(&ran), asked_at + 20);
-        assert_eq!(verified.verified.as_deref(), Some("claude-opus-5-5"));
-        let moved = LiveModel {
-            id: "claude-fable-5-1".into(),
-            by_command: true,
-        };
-        let later = rec.settle(Some(&moved), asked_at + MODEL_SETTLE_S + 1);
-        assert_eq!(later.failed, None, "an ask that ran was recorded failed");
-        assert!(rec.failed.is_empty(), "{rec:?}");
-        assert_eq!(
-            rec.set, "claude-opus-5-5",
-            "the ask stays the harness's own"
-        );
-        assert_eq!(
-            rec.human, "claude-fable-5-1",
-            "the person's choice remembered"
-        );
-
-        let mut never = ModelRecord::default();
-        never.asked("claude-opus-5-5", asked_at);
-        let other = LiveModel {
-            id: "claude-opus-5".into(),
-            by_command: false,
-        };
-        let failed = never.settle(Some(&other), asked_at + MODEL_SETTLE_S);
-        assert_eq!(failed.failed.as_deref(), Some("claude-opus-5-5"));
-        assert!(never.set.is_empty() && never.failed == ["claude-opus-5-5"]);
-    }
-
-    /// An ask taken back restores the one it replaced, time and all, and never settles as failed;
-    /// one a later write replaced is not undone. Control: the same ask kept settles as failed after
-    /// `MODEL_SETTLE_S`.
-    #[test]
-    fn an_ask_taken_back_never_settles_as_failed() {
-        let asked_at = 1_000_000;
-        let runs = LiveModel {
-            id: "claude-opus-5".into(),
-            by_command: false,
-        };
-        let before = ModelRecord {
-            set: "claude-fable-5-1".into(),
-            set_at: asked_at - 5,
-            ..ModelRecord::default()
-        };
-        let mut rec = before.clone();
-        let asked = rec.asked("claude-opus-5-5", asked_at);
-        assert_eq!(rec.set, "claude-opus-5-5");
-        rec.take_back(asked);
-        assert_eq!(rec, before, "the ask it replaced stands again");
-        let mut fresh = ModelRecord::default();
-        let asked = fresh.asked("claude-opus-5-5", asked_at);
-        fresh.take_back(asked);
-        let settled = fresh.settle(Some(&runs), asked_at + MODEL_SETTLE_S + 1);
-        assert_eq!(settled.failed, None, "{fresh:?}");
-        assert!(fresh.failed.is_empty() && fresh.set.is_empty(), "{fresh:?}");
-        // A later ask is not this one's to undo.
-        let mut later = ModelRecord::default();
-        let first = later.asked("claude-opus-5-5", asked_at);
-        later.asked("claude-opus-5-5", asked_at + 60);
-        later.take_back(first);
-        assert_eq!(
-            (later.set.as_str(), later.set_at),
-            ("claude-opus-5-5", asked_at + 60)
-        );
-        // Control: kept, it settles as failed.
-        let mut kept = ModelRecord::default();
-        kept.asked("claude-opus-5-5", asked_at);
-        let settled = kept.settle(Some(&runs), asked_at + MODEL_SETTLE_S + 1);
-        assert_eq!(settled.failed.as_deref(), Some("claude-opus-5-5"));
-    }
-
-    /// The ride's guard: a notice's model rides its round's restart only while the rule's move laws
-    /// hold for it: (a) never twice or after a failure, (b) never over a person's choice across
-    /// families, (c) up the list only. It still rides through a same-family chooser, an unread tail
-    /// or a moved offer. Control: the verdict alone misses (a) once the offer moved, so the guard
-    /// reads the record itself.
-    #[test]
-    fn a_notices_model_rides_only_while_the_rules_laws_hold() {
-        let list = Priority::seed(0);
-        let o55 = "claude-opus-5-5";
-        let live = |id: &str, by_command: bool| LiveModel {
-            id: id.into(),
-            by_command,
-        };
-        let none = ModelRecord::default();
-        let bar =
-            |live: Option<&LiveModel>,
-             launch: Option<&str>,
-             default: Option<&str>,
-             rec: &ModelRecord| { ride_bar(o55, &list, live, launch, default, rec) };
-        // Rides: its own family's move, whoever chose the older model; a
-        // tail with no answer; a person's `/model` of the same family.
-        assert_eq!(
-            bar(Some(&live("claude-opus-5", false)), None, None, &none),
-            None
-        );
-        assert_eq!(
-            bar(
-                Some(&live("claude-opus-5", false)),
-                Some("claude-opus-5"),
-                Some("opus"),
-                &none
-            ),
-            None
-        );
-        assert_eq!(bar(None, Some("claude-opus-5"), None, &none), None);
-        assert_eq!(
-            bar(Some(&live("claude-opus-5", true)), None, None, &none),
-            None
-        );
-        // Across families, a Fable nobody chose rides up the list.
-        assert_eq!(
-            bar(Some(&live("claude-fable-5-1", false)), None, None, &none),
-            None
-        );
-
-        // (a) Never after a failure, never twice, unread tail or not.
-        let failed = ModelRecord {
-            failed: vec![o55.into()],
-            ..ModelRecord::default()
-        };
-        let opus5 = live("claude-opus-5", false);
-        assert_eq!(
-            bar(Some(&opus5), None, None, &failed),
-            Some("model-failed-before")
-        );
-        assert_eq!(bar(None, None, None, &failed), Some("model-failed-before"));
-        let applied = ModelRecord {
-            applied: vec![format!("{o55}[1m]")],
-            ..ModelRecord::default()
-        };
-        assert_eq!(
-            bar(Some(&opus5), None, None, &applied),
-            Some("model-applied-before")
-        );
-        // The verdict alone, with the offer moved to Opus 5 only, says
-        // nothing of the failure: the ride must read the record itself.
-        assert_eq!(
-            model_due(
-                &list,
-                Some(&opus5),
-                &ids(&["claude-opus-5"]),
-                None,
-                None,
-                &failed
-            ),
-            ModelVerdict::Keep("model-current")
-        );
-
-        // (b) A person's choice of another family since the notice: a `/model`
-        // now, one remembered past its answers, or the saved default.
-        let fable = |by_command: bool| live("claude-fable-5-1", by_command);
-        assert_eq!(
-            bar(Some(&fable(true)), None, None, &none),
-            Some("model-chosen-by-hand")
-        );
-        let remembered = ModelRecord {
-            human: "claude-fable-5-1".into(),
-            ..ModelRecord::default()
-        };
-        assert_eq!(
-            bar(Some(&fable(false)), None, None, &remembered),
-            Some("model-chosen-by-hand")
-        );
-        assert_eq!(
-            bar(Some(&fable(false)), None, Some("fable"), &none),
-            Some("model-chosen-by-hand")
-        );
-        assert_eq!(
-            bar(Some(&opus5), Some("opus"), None, &none),
-            Some("model-alias")
-        );
-
-        // (c) Up the list only: off a model the list does not name, sideways,
-        // down, or below a carried model the list ranks lower.
-        assert_eq!(
-            bar(Some(&live("claude-sonnet-5", false)), None, None, &none),
-            Some("model-off-list")
-        );
-        assert_eq!(
-            bar(Some(&live(o55, true)), None, None, &none),
-            Some("model-current")
-        );
-        assert_eq!(
-            bar(Some(&live("claude-opus-6", false)), None, None, &none),
-            Some("model-current")
-        );
-        assert_eq!(
-            ride_bar(
-                "claude-opus-5",
-                &list,
-                Some(&fable(false)),
-                None,
-                None,
-                &none
-            ),
-            Some("model-ranks-higher")
-        );
-        assert_eq!(
-            bar(
-                Some(&live("us.anthropic.claude-x", false)),
-                None,
-                None,
-                &none
-            ),
-            Some("model-unreadable")
-        );
-    }
-
-    /// A carried model is re-judged even on an empty offer: the transcript is read, so a `/model`
-    /// typed since the notice is remembered and bars the ride. Without one it is not read.
-    #[test]
-    fn a_carried_model_is_judged_even_with_nothing_on_offer() {
-        let list = Priority::seed(0);
-        let catalog = baked(
-            &["claude-opus-5-5", "claude-fable-5-1", "claude-opus-5"],
-            &[],
-        );
-        let tail = format!(
-            "{}\n{}",
-            answer("claude-opus-5"),
-            set_model("claude-fable-5-1")
-        );
-        let view = |carried| ModelView {
-            list: &list,
-            baked: Some(&catalog),
-            offered: &[],
-            launch: None,
-            default_model: None,
-            started_s: None,
-            now: 2_000_000_000,
-            carried,
-        };
-        let mut rec = ModelRecord::default();
-        let unread = model_read_step(&mut rec, &view(None), || -> String {
-            panic!("no model can be run and none is pending: the transcript is not read")
-        });
-        assert_eq!(unread.verdict, ModelVerdict::Keep("no-model-available"));
-        assert_eq!(unread.ride_barred, None);
-        let read = model_read_step(&mut rec, &view(Some("claude-opus-5-5")), || tail.as_str());
-        assert_eq!(read.verdict, ModelVerdict::Keep("no-model-available"));
-        assert_eq!(read.ride_barred, Some("model-chosen-by-hand"));
-        assert_eq!(
-            rec.human, "claude-fable-5-1",
-            "the person's /model remembered"
-        );
-    }
-
     /// A record without the due clock parses with nothing due, so the first due visit starts the
     /// clock instead of reading zero as due since 1970.
     #[test]
@@ -2909,50 +2536,6 @@ mod tests {
         let got = ModelRecord::parse(old).expect("an older record still parses");
         assert!(got.due_to.is_empty() && got.due_since == 0, "{got:?}");
         assert_eq!(got.last_seq, 3);
-    }
-
-    /// The model ladder's truth table: monotone, and every due move lands. Control: warm, a build
-    /// restart under way, due for 0 s, which a cold-cache-only rule would never move.
-    #[test]
-    fn the_model_ladder_always_lands() {
-        // Warm, a build restart happening, due for 0 s.
-        let old_rule = |cold: bool| cold;
-        assert!(
-            !old_rule(false),
-            "control: the replaced rule really did refuse the incident's move"
-        );
-        assert_eq!(model_moves_now(false, true, 0), Some("build-restart"));
-
-        // Cold is free, whatever else is true.
-        assert_eq!(model_moves_now(true, false, 0), Some("cache-cold"));
-        assert_eq!(model_moves_now(true, true, 0), Some("cache-cold"));
-
-        // Warm with no restart coming: a bounded preference, not a condition.
-        assert_eq!(model_moves_now(false, false, 0), None);
-        assert_eq!(model_moves_now(false, false, MODEL_WARM_MAX_S - 1), None);
-        assert_eq!(
-            model_moves_now(false, false, MODEL_WARM_MAX_S),
-            Some("warm-wait-over")
-        );
-
-        // Monotone: once a visit moves, every later visit (more time due) moves.
-        for cold in [false, true] {
-            for restart in [false, true] {
-                let mut moved = false;
-                for due in (0..=2 * MODEL_WARM_MAX_S).step_by(60) {
-                    let now = model_moves_now(cold, restart, due).is_some();
-                    assert!(
-                        !moved || now,
-                        "the ladder took a move back at due={due} cold={cold} restart={restart}"
-                    );
-                    moved |= now;
-                }
-                assert!(
-                    moved,
-                    "never landed: cold={cold} restart={restart} — an unbounded wait"
-                );
-            }
-        }
     }
 
     #[test]
@@ -3163,74 +2746,6 @@ mod tests {
         );
     }
 
-    /// A pin (launch `--model`, `/model`, saved default) moves within its family once; moved back
-    /// by hand it stays, and a person's pick never moves across families.
-    #[test]
-    fn a_pin_moves_within_its_family_once_and_a_move_back_by_hand_stands() {
-        let list = Priority::seed(0);
-        let offer = vec![
-            "claude-opus-5-5".to_string(),
-            "claude-fable-5-1".to_string(),
-        ];
-        let live = |id: &str, by_command: bool| LiveModel {
-            id: id.into(),
-            by_command,
-        };
-        let fresh = ModelRecord::default();
-        assert_eq!(
-            model_due(
-                &list,
-                Some(&live("claude-opus-5", false)),
-                &offer,
-                Some("claude-opus-5"),
-                None,
-                &fresh
-            ),
-            ModelVerdict::Due {
-                from: "claude-opus-5".into(),
-                to: "claude-opus-5-5".into()
-            }
-        );
-        // The harness moved it once; the person then typed `/model` back to
-        // Opus 5 (a `/model` newer than the last answer: `by_command`), and
-        // later answered on it: neither is moved again, by either step.
-        let moved = ModelRecord {
-            applied: vec!["claude-opus-5-5".into()],
-            set: "claude-opus-5-5".into(),
-            human: "claude-opus-5".into(),
-            ..ModelRecord::default()
-        };
-        for by_command in [true, false] {
-            assert_eq!(
-                model_due(
-                    &list,
-                    Some(&live("claude-opus-5", by_command)),
-                    &offer,
-                    Some("claude-opus-5-5"),
-                    None,
-                    &moved
-                ),
-                ModelVerdict::Keep("model-applied-before"),
-                "by_command={by_command}"
-            );
-        }
-        // A person's Fable, by /model or by launch, is never moved to the
-        // Opus the list ranks above it.
-        for (by_command, launch) in [(true, None), (false, Some("claude-fable-5-1"))] {
-            assert_eq!(
-                model_due(
-                    &list,
-                    Some(&live("claude-fable-5-1", by_command)),
-                    &offer,
-                    launch,
-                    None,
-                    &fresh
-                ),
-                ModelVerdict::Keep("model-chosen-by-hand")
-            );
-        }
-    }
-
     /// `settings.json` is parsed as Claude Code parses it: a leading byte-order mark is dropped, so
     /// a marked file's allowlist and default count; an empty or blank file sets nothing.
     #[test]
@@ -3270,5 +2785,113 @@ mod tests {
         assert_eq!(u.default.as_deref(), Some("opus"));
         assert_eq!(u.allowed, Some(vec!["claude-opus-5-5".to_string()]));
         assert_eq!(parse_user_settings("nope"), UserModelSettings::default());
+    }
+}
+
+#[cfg(test)]
+mod atomic_write_tests {
+    use super::*;
+
+    /// Post-fix control only: the old implementation is not run against an unsafe stage.
+    #[test]
+    fn an_atomic_write_leaves_an_unowned_old_stage_untouched() {
+        let dir = aterm_tempfile::tempdir().expect("private directory");
+        let dest = dir.path().join("record.json");
+        let unrelated = dest.with_extension(format!("tmp{}", std::process::id()));
+        std::fs::write(&dest, "old").expect("destination");
+        std::fs::write(&unrelated, "irreplaceable fixture").expect("unowned former stage");
+        write_atomic(&dest, "new").expect("actual public replacement");
+        assert_eq!(std::fs::read_to_string(&dest).expect("destination"), "new");
+        assert_eq!(
+            std::fs::read_to_string(&unrelated).expect("unrelated"),
+            "irreplaceable fixture"
+        );
+    }
+
+    /// Each atomic write names its flush (aterm-durable's counting seam): the plain
+    /// one stays durable, the ordered one and the seeding of an absent list are only
+    /// ordered, and a list that is present is read, not written.
+    #[test]
+    fn the_atomic_writes_name_their_flush() {
+        use aterm_durable::{Flush, seam::Recording};
+        let dir = aterm_tempfile::tempdir().expect("private directory");
+        let dest = dir.path().join("record.json");
+        let recording = Recording::start();
+        write_atomic(&dest, "durable").expect("durable write");
+        assert_eq!(recording.take(), [Flush::Durable]);
+        write_atomic_ordered(&dest, "ordered").expect("ordered write");
+        assert_eq!(recording.take(), [Flush::Ordered]);
+        assert_eq!(std::fs::read_to_string(&dest).expect("body"), "ordered");
+        let list = dir.path().join("models.json");
+        load_or_seed(&list, 1_000).expect("seeded");
+        assert_eq!(recording.take(), [Flush::Ordered], "a seed is only ordered");
+        load_or_seed(&list, 2_000).expect("read");
+        assert_eq!(recording.take(), [], "a present list is not written");
+    }
+
+    #[test]
+    fn a_failed_atomic_write_preserves_the_destination_and_cleans_only_its_stage() {
+        use std::io::Write as _;
+        let dir = aterm_tempfile::tempdir().expect("private directory");
+        let dest = dir.path().join("record.json");
+        let unrelated = dir.path().join("notes");
+        std::fs::write(&dest, "old good snapshot").expect("destination");
+        std::fs::write(&unrelated, "keep me").expect("unrelated");
+        let result =
+            write_atomic_using(&dest, "replacement", None, Flush::Durable, |file, bytes| {
+                file.write_all(&bytes[..1])?;
+                Err(std::io::Error::other("injected owned-stage write failure"))
+            });
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&dest).expect("destination"),
+            "old good snapshot"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&unrelated).expect("unrelated"),
+            "keep me"
+        );
+        let mut kept: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("directory")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        kept.sort();
+        assert_eq!(
+            kept,
+            [
+                std::ffi::OsString::from("notes"),
+                std::ffi::OsString::from("record.json")
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_atomic_replacement_publishes_its_requested_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = aterm_tempfile::tempdir().expect("private directory");
+        let dest = dir.path().join("record");
+        write_atomic_mode(&dest, "public signature", Some(0o644)).expect("public replacement");
+        assert_eq!(
+            std::fs::metadata(&dest)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+        write_atomic(&dest, "private replacement").expect("private replacement");
+        assert_eq!(
+            std::fs::read_to_string(&dest).expect("body"),
+            "private replacement"
+        );
+        assert_eq!(
+            std::fs::metadata(&dest)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 }

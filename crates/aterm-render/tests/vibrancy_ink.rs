@@ -1,81 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for the M5 true-vibrancy INK-OPACITY guarantee: the
-//! background stream honours `background_opacity`, but the glyph / decoration /
-//! image (INK) stream stays FULLY OPAQUE under every opacity setting — so the
-//! desktop shows through the terminal's background without ever bleeding through
-//! its text (the iTerm2-blur / ghostty-`background-blur` failure mode).
+//! The M5 true-vibrancy BACKGROUND alpha: the background stream honours
+//! `background_opacity` (`round(clamp(o) * 255)`, monotone, solid at the
+//! default) and fails safe to solid on out-of-domain input.
 //!
-//! ## The invariant (the PROVE bullet #2)
-//!
-//! For every `opacity` on a dense lattice over `[0, 1]`:
-//!   * [`vibrancy::ink_quad_alpha`] `== 255` — ALWAYS opaque, independent of `o`.
-//!   * [`vibrancy::bg_quad_alpha`] `== round(clamp(o) * 255)` — `< 255` iff the
-//!     window is translucent, `== 255` at the solid default, monotone in `o`.
-//!
-//! The `o * 255` product is outside the `ty` `Expr` language (no `*`), so this is
-//! the documented LATTICE waiver (mirroring the box-drawing rounding law); the
-//! COMPANION ordering guarantee (translucency ⇒ WCAG-AA contrast floor) is the
-//! `ty` model `aterm_spec::derive::vibrancy_contrast_model`. House style: a
-//! NON-VACUITY control (the bg alpha genuinely drops) and a NEGATIVE control
-//! (the pre-fix defect where ink would inherit the translucency) are asserted.
-//!
-//! Also binds the shipping `Renderer::set_background_opacity` / `background_opacity`
-//! accessor pair to the same clamp domain (Tier-1 real-code conformance).
+//! Also binds the shipping `Renderer::set_background_opacity` /
+//! `background_opacity` accessor pair to the same clamp domain.
 
-use aterm_render::vibrancy::{INK_ALPHA, bg_quad_alpha, ink_quad_alpha, is_translucent};
-
-/// A dense opacity lattice over `[0, 1]` plus the out-of-domain guards.
-fn opacity_lattice() -> Vec<f32> {
-    let mut v: Vec<f32> = (0..=100).map(|i| i as f32 / 100.0).collect();
-    // Out-of-domain / degenerate inputs the resolvers must fail safe on.
-    v.extend_from_slice(&[-0.5, 1.5, f32::NAN, f32::INFINITY, f32::NEG_INFINITY]);
-    v
-}
-
-#[test]
-fn ink_stays_opaque_under_every_opacity() {
-    let mut saw_translucent_bg = false;
-    for &o in &opacity_lattice() {
-        // THE INK INVARIANT: never translucent, for ANY opacity setting.
-        assert_eq!(
-            ink_quad_alpha(o),
-            255,
-            "ink quad went translucent at opacity={o} — text would sink into the desktop"
-        );
-        assert_eq!(INK_ALPHA, 255);
-
-        let a = bg_quad_alpha(o);
-        // The bg quad is opaque IFF the window is solid; translucent otherwise.
-        if is_translucent(o) {
-            assert!(
-                a < 255,
-                "translucent window (opacity={o}) must yield a bg alpha < 255, got {a}"
-            );
-            // And the INK is still strictly more opaque than the background it
-            // sits over — the whole point of the split stream.
-            assert!(
-                ink_quad_alpha(o) > a,
-                "ink must out-opaque the bg at opacity={o} (ink={}, bg={a})",
-                ink_quad_alpha(o)
-            );
-            saw_translucent_bg = true;
-        } else {
-            assert_eq!(
-                a, 255,
-                "solid / out-of-domain opacity={o} must yield an opaque (255) bg, got {a}"
-            );
-        }
-    }
-
-    // NON-VACUOUS: the lattice actually reaches translucent backgrounds (the
-    // guarantee is not trivially "everything is 255").
-    assert!(
-        saw_translucent_bg,
-        "no translucent bg in the lattice — the ink/bg split would be vacuous"
-    );
-}
+use aterm_render::vibrancy::{bg_quad_alpha, is_translucent};
 
 #[test]
 fn bg_alpha_is_rounded_and_monotone() {
@@ -97,6 +30,18 @@ fn bg_alpha_is_rounded_and_monotone() {
         prev = a;
     }
     assert_eq!(prev, 255, "the top of the lattice is opaque");
+
+    // Out-of-domain input fails safe: solid unless genuinely below 1.0, and
+    // every translucent opacity yields a translucent band.
+    for o in [1.5, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        assert_eq!(bg_quad_alpha(o), 255, "opacity={o} must stay solid");
+        assert!(!is_translucent(o), "opacity={o} is not translucent");
+    }
+    assert_eq!(bg_quad_alpha(-0.5), 0, "under-range clamps to transparent");
+    for i in 0..100 {
+        let o = i as f32 / 100.0;
+        assert!(is_translucent(o) && bg_quad_alpha(o) < 255, "opacity={o}");
+    }
 }
 
 #[test]

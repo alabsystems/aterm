@@ -37,9 +37,8 @@ fn prompt_kinds() -> Vec<PromptKind> {
         P::ReadOutsideSetting,
         P::UsageLimit,
         P::ModelSwitch,
-        P::RateNudge,
-        P::ModelPick,
-        P::GoalResume,
+        P::AutocompactOffer,
+        P::McpServer,
         P::Other,
     ];
     for k in all {
@@ -68,9 +67,8 @@ fn prompt_kinds() -> Vec<PromptKind> {
             | P::ReadOutsideSetting
             | P::UsageLimit
             | P::ModelSwitch
-            | P::RateNudge
-            | P::ModelPick
-            | P::GoalResume
+            | P::AutocompactOffer
+            | P::McpServer
             | P::Other => {}
         }
     }
@@ -113,13 +111,29 @@ fn walls() -> Vec<PhaseWall> {
 fn vocab_mirrors_the_screen_reader() {
     for k in prompt_kinds() {
         assert!(BOX_WORDS.contains(&k.name()), "box word {:?}", k.name());
-        assert_eq!(BoxWord::from_detail(k.name()).word(), k.name());
+        let word = BoxWord::from_detail(k.name());
+        assert_eq!(word.word(), k.name());
+        let need = if word.is_question() {
+            "question".to_string()
+        } else {
+            format!("approval:{}", k.name())
+        };
+        assert_eq!(word.need(), need);
     }
     for v in ["bash:read-only", "bash:not-read-only"] {
         assert_eq!(BoxWord::from_detail(v).kind(), "bash");
         assert_eq!(BoxWord::from_detail(v).need(), "approval:bash");
     }
-    assert_eq!(BOX_WORDS.len(), prompt_kinds().len() + 2);
+    // The kinds the screen reader no longer names stay words, so a log
+    // written before their reader's retirement still decodes: Codex's boxes
+    // (aterm's Codex screen lane, retired 2026-10-16).
+    let retired = ["rate-nudge", "model-pick", "goal-resume"];
+    for w in retired {
+        assert!(BOX_WORDS.contains(&w), "{w}");
+        assert!(prompt_kinds().iter().all(|k| k.name() != w), "{w}");
+        assert_eq!(BoxWord::from_wire(w).word(), w);
+    }
+    assert_eq!(BOX_WORDS.len(), prompt_kinds().len() + 2 + retired.len());
     let ours: Vec<&str> = WallKind::ALL.iter().map(|k| k.name()).collect();
     for w in walls() {
         assert!(WALL_WORDS.contains(&w.name()), "wall word {:?}", w.name());

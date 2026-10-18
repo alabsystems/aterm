@@ -1,0 +1,14 @@
+[package]
+name = "astream-sys"
+description = "astream's OS cordon for the durable log: an ordering-only flush (`barrier_sync`, F_BARRIERFSYNC on Apple) and the kernel's boot session id (`boot_session`). Zero dependencies; the only unsafe is one cfg(target_vendor = \"apple\") module of two FFI calls, compiler-enforced by deny(unsafe_code) at the root."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+# Zero dependencies, by design: no libc. The two Apple calls (`fcntl`,
+# `sysctlbyname`) are declared by hand inside the cordoned `apple` module, so the
+# broker that depends on this crate still pulls no third-party code.
+[dependencies]

@@ -182,12 +182,6 @@ impl CursorGlow {
                 // Beam: steady light has one brightness, so the first keys of a
                 // run do not read as a dim smear.
                 GlowStyle::Beam => 1.0,
-                // Trail pack: the pack's own `heat.bright_floor +
-                // bright_slope·heat` ramp.
-                GlowStyle::Custom => cfg.pack.as_ref().map_or_else(
-                    || self.typing_boost(),
-                    |p| p.heat.bright_floor + p.heat.bright_slope * self.heat,
-                ),
                 _ => self.typing_boost(),
             }
         } else {
@@ -263,29 +257,6 @@ impl CursorGlow {
                         charge_life.max((gap + Self::CHAIN_MARGIN).min(Self::CHAIN_LIFE_MAX))
                     } else {
                         charge_life
-                    }
-                }
-                // Trail pack: the pack's heat curve
-                // (`full_life·life_base_mul · (1 + life_a·h + life_b·h²)`),
-                // chained to cadence from data (`chain_keys·gap + margin`, capped
-                // at `chain_life_max`, inside `chain_gap_max`) and clamped to the
-                // engine's particle-life ceiling.
-                GlowStyle::Custom => {
-                    let h = self.heat;
-                    let (hp, chain) = cfg
-                        .pack
-                        .as_ref()
-                        .map(|p| (p.heat, true))
-                        .unwrap_or_else(|| (TrailParams::defaults().heat, false));
-                    let heat_life = (full_life * hp.life_base_mul)
-                        .clamp(0.02, Self::MAX_TRAIL_SPARK_LIFE)
-                        * (1.0 + hp.life_a * h + hp.life_b * h * h);
-                    let heat_life = heat_life.min(Self::MAX_TRAIL_SPARK_LIFE);
-                    if chain && gap <= hp.chain_gap_max {
-                        heat_life
-                            .max((hp.chain_keys * gap + Self::CHAIN_MARGIN).min(hp.chain_life_max))
-                    } else {
-                        heat_life
                     }
                 }
                 _ => {
@@ -540,16 +511,6 @@ impl CursorGlow {
                         // render over; the drama is the curtain above the line
                         // (`emit_flames`) and the ember populations.
                         GlowStyle::Fire => ((20.0 + 78.0 * pos) * boost).min(122.0) as u8,
-                        // Trail pack birth coverage from the pack's ramp
-                        // (`cov_base + cov_slope·pos`, × 255), clamped to the
-                        // structural legibility ceiling.
-                        GlowStyle::Custom => {
-                            let (base, slope) = cfg
-                                .pack
-                                .as_ref()
-                                .map_or((0.16, 0.69), |p| (p.beam.cov_base, p.beam.cov_slope));
-                            (((base + slope * pos) * 255.0 * boost).min(Self::CUSTOM_COV_CAP)) as u8
-                        }
                         _ => ((40.0 + 175.0 * pos) * boost).min(255.0) as u8,
                     };
                     self.sparks.push(Spark {
@@ -675,20 +636,15 @@ impl CursorGlow {
             ..
         } = mv;
         // Landing ring on a real jump (>1 cell), if enabled; fire meteors ring
-        // at arrival instead (see `tick`). A trail pack owns its ring
-        // (`p.ring.enabled`, `p.ring.life_ms`); built-ins use `cfg.ring` and a
-        // 0.18 s life.
-        let (ring_on, ring_life) = cfg.pack.as_ref().map_or((cfg.ring, 0.18), |p| {
-            (p.ring.enabled, p.ring.life_ms as f32 / 1000.0)
-        });
-        if ring_on && dist >= 2.0 && !fire_meteor && !navigation {
+        // at arrival instead (see `tick`).
+        if cfg.ring && dist >= 2.0 && !fire_meteor && !navigation {
             let (cx, cy) = geom.cell_center(cr, cc);
             let scale = crate::rainbow_kitty::timing::impact(dist);
             self.ring = Some(Ring {
                 cx,
                 cy,
                 born: now,
-                life: classic_ring_life(ring_life, scale),
+                life: classic_ring_life(0.18, scale),
                 scale,
             });
         }
@@ -1087,87 +1043,6 @@ impl CursorGlow {
                     }
                 };
                 self.particles.push(p);
-            }
-        }
-    }
-
-    /// Trail Pack particles: the pack's ≤3 ballistic populations, reached only
-    /// when a pack is resolved (every built-in skips it entirely).
-    pub(super) fn spawn_pack_particles(&mut self, mv: &MoveCtx, fire_meteor: bool) {
-        let &MoveCtx {
-            pr,
-            pc,
-            cr,
-            cc,
-            now,
-            cfg,
-            geom,
-            dist,
-            navigation,
-            ..
-        } = mv;
-        // Trail pack particles, only when a pack is resolved: up to three
-        // ballistic populations spawned into the shared collection (same
-        // `Particle` shape, `MAX_PARTICLES` cap and life prune), drawn by
-        // `emit_custom` from `p.ramp`. `cov_scale` carries the population's dot
-        // size and `hue` its ramp seed.
-        if let Some(p) = cfg.pack.as_ref()
-            && p.particle_count > 0
-            && !fire_meteor
-            && !navigation
-        {
-            let jump = dist >= 2.0;
-            let heat = self.heat;
-            let cw = geom.cw as f32;
-            let cell = geom.ch as f32;
-            let (ox, oy) = geom.cell_center(cr, cc);
-            let (fx, fy) = geom.cell_center(pr, pc);
-            for idx in 0..p.particle_count as usize {
-                let pop = p.particles[idx];
-                let base = if jump {
-                    (pop.jump_burst_max as f32) * (0.35 + 0.65 * (dist / 12.0).min(1.0))
-                } else {
-                    (pop.typing_burst_max as f32) * heat
-                };
-                // `spawn_weight` scales this population's contribution: 0 silences it,
-                // <1 thins it, >1 makes it denser. The pack's compiled per-population
-                // max — itself scaled by the weight — bounds one move; MAX_PARTICLES
-                // (checked in the loop) bounds the resident total.
-                let cap = ((pop.jump_burst_max.max(pop.typing_burst_max) as f32) * pop.spawn_weight)
-                    .ceil() as usize;
-                let burst = ((base * pop.spawn_weight) as usize).min(cap);
-                for _ in 0..burst {
-                    if self.particles.len() >= Self::MAX_PARTICLES {
-                        break;
-                    }
-                    let r0 = self.frand();
-                    let r1 = self.frand();
-                    let r2 = self.frand();
-                    let r3 = self.frand();
-                    let r4 = self.frand();
-                    let (bx, by) = if jump {
-                        (
-                            fx + (ox - fx) * r0,
-                            fy + (oy - fy) * r0 + (r4 - 0.5) * 0.5 * cell,
-                        )
-                    } else {
-                        (ox + (r0 - 0.5) * cw, oy + (r4 - 0.5) * 0.4 * cell)
-                    };
-                    let vx = (pop.vx.0 + (pop.vx.1 - pop.vx.0) * r1) * cell;
-                    let vy = (pop.vy.0 + (pop.vy.1 - pop.vy.0) * r2) * cell;
-                    let life = (pop.life.0 + (pop.life.1 - pop.life.0) * r3).max(0.02);
-                    self.particles.push(Particle {
-                        x0: bx,
-                        y0: by,
-                        vx,
-                        vy,
-                        gy: pop.gravity * cell,
-                        life,
-                        hue: r4, // per-particle ramp seed (resolved in `emit_custom`)
-                        cov_scale: pop.size, // dot-size scale for the custom draw
-                        born: now,
-                    });
-                }
             }
         }
     }

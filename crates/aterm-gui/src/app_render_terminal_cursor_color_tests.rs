@@ -19,8 +19,7 @@ fn osc21_dynamic_cursor_tracks_osc10_in_main_frame_pixels_and_wake() {
     assert_eq!(terminal_cursor_rgb(&term), [0xfe, 0x01, 0x7f]);
 
     let Some(mut renderer) = aterm_render::Renderer::from_system(16.0, Theme::default()) else {
-        crate::logging::stderr_line!("SKIP: no system monospace font");
-        return;
+        aterm_spec::host::could_not_run("no system monospace font on this host");
     };
     let (cw, ch) = renderer.cell_size();
     let mut input = term.cell_frame(2, 4);
@@ -59,133 +58,65 @@ fn osc21_dynamic_cursor_tracks_osc10_in_main_frame_pixels_and_wake() {
 
 /// The default cursor wears the cursor colour too: `draw_cursor` (and its GPU twin) paints
 /// `cursor_fill_override` instead of `frame_cursor(input)` whenever the host sets one, so a
-/// body effect must bloom from the cursor colour or it eats OSC 12 and `cursor_color`.
+/// body effect (the rainbow block and the `phaser` emitter) must bloom from the cursor colour
+/// or it eats OSC 12 and `cursor_color`. A settled caret (no keystrokes) freezes the hue phase,
+/// so only the base can move the fill between ticks.
 #[test]
 fn osc12_recolours_the_effect_owned_block_cursor_not_only_the_plain_one() {
-    let mut app = App::headless_for_test();
-    app.config.motion = Some("full".into());
-    app.config.cursor_trail = Some(true);
-    // The shipped default's block-owning half (the `pet`/`kitty` words add
-    // companions, not a different fill).
-    app.config.cursor_trail_style = Some("rainbow kitty".into());
-    app.config.trail_sounds = Some(false);
-    // No pinned trail colour: the cursor colour is what the effects follow.
-    app.config.cursor_trail_color = None;
-    let wid = WindowId(0);
-    app.windows.get_mut(&wid).expect("fixture window").focused = true;
+    use crate::cursor_glow::BlockFillOwner;
+    for (style, owner, hi, lo) in [
+        ("rainbow kitty", BlockFillOwner::Rainbow, 200, 110),
+        ("phaser", BlockFillOwner::Phaser, 180, 130),
+    ] {
+        let mut app = App::headless_for_test();
+        app.config.motion = Some("full".into());
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some(style.into());
+        app.config.trail_sounds = Some(false);
+        // No pinned trail colour: the cursor colour is what the effects follow.
+        app.config.cursor_trail_color = None;
+        let wid = WindowId(0);
+        app.windows.get_mut(&wid).expect("fixture window").focused = true;
 
-    let t0 = Instant::now();
-    // A settled caret (no keystrokes) freezes the hue phase, so only the base can move
-    // the fill between ticks.
-    let mut fill_at = |rgb: [u8; 3], now| {
-        app.cursor_frame(
-            wid,
-            CursorFxInputs {
-                live_cursor_rgb: rgb,
-                // A pinned colour (OSC 12 or a configured `cursor_color`).
-                cursor_color_pinned: true,
-                ..CursorFxInputs::sample_for_test(now)
-            },
-        )
-        .expect("fixture window")
-        .block_fill
-        .filter(|owned| owned.owner == crate::cursor_glow::BlockFillOwner::Rainbow)
-        .expect("the default cursor style owns the canonical block fill")
-        .fill
-    };
-    let red = fill_at([0xFF, 0x00, 0x00], t0);
-    let blue = fill_at([0x00, 0x00, 0xFF], t0 + Duration::from_millis(16));
-    let theme = fill_at([0x50, 0xFA, 0x7B], t0 + Duration::from_millis(32));
+        let t0 = Instant::now();
+        let mut fill_at = |rgb: [u8; 3], now| {
+            app.cursor_frame(
+                wid,
+                CursorFxInputs {
+                    live_cursor_rgb: rgb,
+                    // A pinned colour (OSC 12 or a configured `cursor_color`).
+                    cursor_color_pinned: true,
+                    ..CursorFxInputs::sample_for_test(now)
+                },
+            )
+            .expect("fixture window")
+            .block_fill
+            .filter(|owned| owned.owner == owner)
+            .unwrap_or_else(|| panic!("{style}: the style owns the canonical block fill"))
+            .fill
+        };
+        let red = fill_at([0xFF, 0x00, 0x00], t0);
+        let blue = fill_at([0x00, 0x00, 0xFF], t0 + Duration::from_millis(16));
+        let theme = fill_at([0x50, 0xFA, 0x7B], t0 + Duration::from_millis(32));
 
-    let chans = |c: u32| {
-        (
-            ((c >> 16) & 0xff) as u8,
-            ((c >> 8) & 0xff) as u8,
-            (c & 0xff) as u8,
-        )
-    };
-    let (rr, rg, rb) = chans(red);
-    assert!(
-        rr > 200 && rg < 110 && rb < 110,
-        "OSC 12 #FF0000 must reach the effect-owned block, got {red:#08x}"
-    );
-    let (br, bg, bb) = chans(blue);
-    assert!(
-        bb > 200 && br < 110 && bg < 110,
-        "OSC 12 #0000FF must reach the effect-owned block, got {blue:#08x}"
-    );
-    // The theme cursor arrives through the same channel when no OSC 12 is in force.
-    let (tr, tg, tb) = chans(theme);
-    assert!(
-        tg > 200 && tg > tr && tg > tb,
-        "the theme cursor colour must reach it too, got {theme:#08x}"
-    );
-    assert_ne!(
-        red, blue,
-        "two different cursor colours must not paint one identical block"
-    );
-}
-
-/// The same law for the `phaser` emitter block, which blooms its beam hue
-/// over the same `cursor_fill_override` seam. A settled emitter with a
-/// frozen beam hue, so only the base can move the fill between ticks.
-#[test]
-fn osc12_recolours_the_phaser_emitter_block_too() {
-    let mut app = App::headless_for_test();
-    app.config.motion = Some("full".into());
-    app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("phaser".into());
-    app.config.trail_sounds = Some(false);
-    app.config.cursor_trail_color = None;
-    let wid = WindowId(0);
-    app.windows.get_mut(&wid).expect("fixture window").focused = true;
-
-    let t0 = Instant::now();
-    let mut fill_at = |rgb: [u8; 3], now| {
-        app.cursor_frame(
-            wid,
-            CursorFxInputs {
-                live_cursor_rgb: rgb,
-                cursor_color_pinned: true,
-                ..CursorFxInputs::sample_for_test(now)
-            },
-        )
-        .expect("fixture window")
-        .block_fill
-        .filter(|owned| owned.owner == crate::cursor_glow::BlockFillOwner::Phaser)
-        .expect("the phaser style owns the canonical block fill")
-        .fill
-    };
-    let red = fill_at([0xFF, 0x00, 0x00], t0);
-    let blue = fill_at([0x00, 0x00, 0xFF], t0 + Duration::from_millis(16));
-    let theme = fill_at([0x50, 0xFA, 0x7B], t0 + Duration::from_millis(32));
-
-    let chans = |c: u32| {
-        (
-            ((c >> 16) & 0xff) as u8,
-            ((c >> 8) & 0xff) as u8,
-            (c & 0xff) as u8,
-        )
-    };
-    let (rr, rg, rb) = chans(red);
-    assert!(
-        rr > 180 && rg < 130 && rb < 130,
-        "OSC 12 #FF0000 must reach the phaser's emitter block, got {red:#08x}"
-    );
-    let (br, bg, bb) = chans(blue);
-    assert!(
-        bb > 180 && br < 130 && bg < 130,
-        "OSC 12 #0000FF must reach the phaser's emitter block, got {blue:#08x}"
-    );
-    let (tr, tg, tb) = chans(theme);
-    assert!(
-        tg > 180 && tg > tr && tg > tb,
-        "the theme cursor colour must reach it too, got {theme:#08x}"
-    );
-    assert_ne!(
-        red, blue,
-        "two different cursor colours must not paint one identical emitter"
-    );
+        let chans = |c: u32| ((c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff);
+        let (rr, rg, rb) = chans(red);
+        assert!(
+            rr > hi && rg < lo && rb < lo,
+            "{style}: OSC 12 #FF0000 must reach the block, got {red:#08x}"
+        );
+        let (br, bg, bb) = chans(blue);
+        assert!(
+            bb > hi && br < lo && bg < lo,
+            "{style}: OSC 12 #0000FF must reach the block, got {blue:#08x}"
+        );
+        // The theme cursor arrives through the same channel when no OSC 12 is in force.
+        let (tr, tg, tb) = chans(theme);
+        assert!(
+            tg > hi && tg > tr && tg > tb,
+            "{style}: the theme cursor colour must reach it too, got {theme:#08x}"
+        );
+    }
 }
 
 /// `trail status` reports who owns the block fill and from what base: the

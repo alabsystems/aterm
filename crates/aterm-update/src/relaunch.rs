@@ -81,6 +81,10 @@ pub fn window_successor_args(
 /// unix-only (a test pins the two spellings together).
 const LIFELINE_FLAG: &str = "--lifeline-fd";
 
+/// The flag that names a harness's ready signal: the write end of a pipe a headless
+/// instance writes one byte to once its control socket listens (aterm-gui's `--ready-fd`).
+const READY_FLAG: &str = "--ready-fd";
+
 /// The environment variable that marks a launch as an UPDATE'S RELAUNCH OF A
 /// WINDOW ALREADY RUNNING (round eight, #7's review): set by both GUI successor
 /// lanes — the cold `exec` and the seamless launch — on the image they start, and
@@ -114,6 +118,9 @@ pub const RELAUNCH_OF_RUNNING_ENV: &str = "ATERM_RELAUNCH_OF_RUNNING";
 ///   the successor was told to adopt `/dev/null` or a closed number and exited 2.
 ///   `lifeline_fd` is the descriptor the caller hands the successor instead (the cold
 ///   `exec` keeps one open across it); `None` drops the flag.
+/// * NO STALE READY SIGNAL. `--ready-fd <n>` names the pipe the first image already
+///   wrote and closed when its socket listened; the successor would be told a closed
+///   number, or another descriptor that took it. The flag and its number go.
 ///
 /// THE `-e` COMMAND STAYS (#7's review): it is not only the first tab's — the window's
 /// session factory runs it for EVERY tab and split it opens, so a successor cut at
@@ -149,6 +156,9 @@ pub fn running_window_successor_args(
                     successor.push(std::ffi::OsString::from(fd.to_string()));
                 }
             }
+            Some(READY_FLAG) => {
+                let _said = tokens.next();
+            }
             _ => successor.push(arg),
         }
     }
@@ -159,51 +169,27 @@ pub fn running_window_successor_args(
 mod tests {
     use super::{reexec_forwarded_args, running_window_successor_args, window_successor_args};
 
-    #[test]
-    fn a_window_successor_keeps_exactly_one_window_pin() {
-        assert_eq!(
-            window_successor_args(args(&["--window"]).into_iter()),
-            args(&["--window"]),
-            "the person's own `aterm --window` stays a window"
-        );
-        assert_eq!(
-            window_successor_args(args(&[]).into_iter()),
-            args(&["--window"]),
-            "a LaunchServices window (no argv) is pinned too"
-        );
-        let once = window_successor_args(args(&["--window", "--window", "-e", "vim"]).into_iter());
-        assert_eq!(once, args(&["--window", "-e", "vim"]));
-        assert_eq!(
-            window_successor_args(once.clone().into_iter()),
-            once,
-            "a fixed point"
-        );
-        assert_eq!(
-            window_successor_args(args(&["--headless", "--columns", "80"]).into_iter()),
-            args(&["--window", "--headless", "--columns", "80"])
-        );
-    }
-
     fn args(list: &[&str]) -> Vec<std::ffi::OsString> {
         list.iter().map(std::ffi::OsString::from).collect()
     }
 
+    /// The field case: accumulated pins collapse to none forwarded, the strip is a
+    /// fixed point, and it never reaches past the first non-pin token, so a later
+    /// `--window` (the person's, or inside an `-e` payload) survives verbatim.
     #[test]
     fn stripping_the_leading_pins_is_a_fixed_point() {
-        let once = reexec_forwarded_args(args(&["--window", "--window", "-e", "bash"]).into_iter());
-        assert_eq!(once, args(&["-e", "bash"]));
+        assert_eq!(
+            reexec_forwarded_args(args(&["--window"; 6]).into_iter()),
+            args(&[])
+        );
+        let once = reexec_forwarded_args(
+            args(&["--window", "--window", "-e", "sh", "-c", "--window"]).into_iter(),
+        );
+        assert_eq!(once, args(&["-e", "sh", "-c", "--window"]));
         let twice = reexec_forwarded_args(once.clone().into_iter());
         assert_eq!(twice, once, "applying it twice equals applying it once");
     }
 
-    #[test]
-    fn a_later_window_flag_is_the_users_and_survives() {
-        assert_eq!(
-            reexec_forwarded_args(args(&["--window", "-e", "bash", "--window"]).into_iter()),
-            args(&["-e", "bash", "--window"]),
-            "only the LEADING run is boot-swap residue"
-        );
-    }
     /// Round eight, #6: the boot swap's re-exec of a verb's launch is the verb,
     /// unpinned — the router routes it to the window it asked for, where a pin sent
     /// the bare word to the window parser's exit 2. Every other launch keeps its pin.
@@ -222,9 +208,12 @@ mod tests {
                 "a pin an earlier build put in front of the verb is stripped"
             );
         }
+        let pinned = window_successor_args(args(&["-d", "/tmp"]).into_iter());
+        assert_eq!(pinned, args(&["--window", "-d", "/tmp"]));
         assert_eq!(
-            window_successor_args(args(&["-d", "/tmp"]).into_iter()),
-            args(&["--window", "-d", "/tmp"])
+            window_successor_args(pinned.clone().into_iter()),
+            pinned,
+            "a fixed point"
         );
     }
 
@@ -304,6 +293,15 @@ mod tests {
         assert_eq!(
             running_window_successor_args(handed.clone().into_iter(), Some(7)),
             handed,
+            "a fixed point"
+        );
+        // The ready signal was the first image's to give: it goes, with its number.
+        let readied = args(&["--headless", "--ready-fd", "5", "--columns", "80"]);
+        let told = running_window_successor_args(readied.into_iter(), None);
+        assert_eq!(told, args(&["--window", "--headless", "--columns", "80"]));
+        assert_eq!(
+            running_window_successor_args(told.clone().into_iter(), None),
+            told,
             "a fixed point"
         );
         // Everything a window runs with rides along.

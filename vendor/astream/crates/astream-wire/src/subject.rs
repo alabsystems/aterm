@@ -13,12 +13,38 @@
 
 use std::fmt;
 
+// The Clean island, out of line: only a Trust compiler lexes it, so it mounts under
+// `cfg(clean_islands)` (build.rs) and a stock compiler never opens the file.
+#[cfg(clean_islands)]
+#[path = "subject_island.rs"]
+mod subject_island;
+#[cfg(not(clean_islands))]
+pub use crate::twins::segment_depth_advance;
+#[cfg(clean_islands)]
+pub use subject_island::segment_depth_advance;
+
+contract_fn! {
+    /// Whether a filter prefix of depth `filter_prefix_depth` can match or contain a
+    /// subject/filter of depth `subject_depth` (`filter_prefix_depth <= subject_depth`).
+    ///
+    /// Verified against `Astream.Wire.TlaSubjectFilter.filter_depth_contains_isl` by
+    /// `clean-kernel-defeq`.
+    pub fn filter_depth_contains(filter_prefix_depth: u64, subject_depth: u64) -> bool
+    clauses [ensures result == (filter_prefix_depth <= subject_depth)]
+    {
+        filter_prefix_depth <= subject_depth
+    }
+}
+
 /// Iterate the segments of a `/`-rooted path, dropping the leading empty piece:
 /// exactly `path.split('/').skip(1)`, as a plain byte scan (the matcher's hot
 /// loop re-splits both the filter and the subject on every call).
 fn segments(path: &str) -> Segments<'_> {
     Segments {
-        rest: path.find('/').map(|i| &path[i + 1..]),
+        rest: path
+            .find('/')
+            .and_then(|i| i.checked_add(1))
+            .and_then(|next| path.get(next..)),
     }
 }
 
@@ -35,8 +61,8 @@ impl<'a> Iterator for Segments<'a> {
         // `/` is ASCII, so both slice points are char boundaries.
         match rest.bytes().position(|b| b == b'/') {
             Some(i) => {
-                self.rest = Some(&rest[i + 1..]);
-                Some(&rest[..i])
+                self.rest = i.checked_add(1).and_then(|next| rest.get(next..));
+                rest.get(..i)
             }
             None => {
                 self.rest = None;
@@ -136,7 +162,8 @@ impl std::error::Error for FilterError {}
 
 /// Check every segment of a `/`-rooted pattern, reporting the first failure in
 /// document order.
-/// The [`Subject::new`] grammar, checked in place with no allocation.
+/// The [`Subject::new`] grammar, checked in place with no allocation and a single
+/// byte scan per segment.
 fn validate_subject(s: &str) -> Result<(), SubjectError> {
     if s.is_empty() {
         return Err(SubjectError::Empty);
@@ -148,10 +175,16 @@ fn validate_subject(s: &str) -> Result<(), SubjectError> {
         if seg.is_empty() {
             return Err(SubjectError::EmptySegment);
         }
-        if seg.contains('*') || seg.contains('>') {
-            return Err(SubjectError::ContainsWildcard);
+        let mut has_ctrl = false;
+        for b in seg.bytes() {
+            if b == b'*' || b == b'>' {
+                return Err(SubjectError::ContainsWildcard);
+            }
+            if b < 0x20 || b == 0x7f {
+                has_ctrl = true;
+            }
         }
-        if seg.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        if has_ctrl {
             return Err(SubjectError::ControlByte);
         }
     }
@@ -172,10 +205,16 @@ fn validate_filter_segments(path: &str) -> Result<(), FilterError> {
                 }
             }
             lit => {
-                if lit.contains('*') || lit.contains('>') {
-                    return Err(FilterError::PartialWildcard);
+                let mut has_ctrl = false;
+                for b in lit.bytes() {
+                    if b == b'*' || b == b'>' {
+                        return Err(FilterError::PartialWildcard);
+                    }
+                    if b < 0x20 || b == 0x7f {
+                        has_ctrl = true;
+                    }
                 }
-                if lit.bytes().any(|b| b < 0x20 || b == 0x7f) {
+                if has_ctrl {
                     return Err(FilterError::ControlByte);
                 }
             }
@@ -234,8 +273,13 @@ impl Filter {
     /// Whether `subject` is a well-formed subject this filter matches: exactly
     /// `Subject::new(subject).is_ok_and(|s| self.matches(&s))`, without allocating
     /// a [`Subject`]. For scanning stored subject strings under a lock.
+    ///
+    /// Checks segment matching first so non-matching subjects short-circuit on the
+    /// first mismatched literal segment without scanning the rest of `subject`.
     pub fn matches_str(&self, subject: &str) -> bool {
-        validate_subject(subject).is_ok() && self.matches_segments(segments(subject))
+        subject.starts_with('/')
+            && self.matches_segments(segments(subject))
+            && validate_subject(subject).is_ok()
     }
 
     fn matches_segments<'a>(&self, mut subj: impl Iterator<Item = &'a str>) -> bool {
@@ -431,5 +475,15 @@ mod tests {
         assert!(f.matches(&Subject::new("/a/b").unwrap()));
         assert!(!f.matches(&Subject::new("/a").unwrap()));
         assert!(!f.matches(&Subject::new("/a/b/c").unwrap()));
+    }
+
+    #[test]
+    fn clean_origin_segment_depth_and_containment_guards() {
+        assert_eq!(segment_depth_advance(3, 1), 3);
+        assert_eq!(segment_depth_advance(3, 3), 3);
+        assert_eq!(segment_depth_advance(3, 5), 5);
+        assert!(filter_depth_contains(2, 2));
+        assert!(filter_depth_contains(2, 4));
+        assert!(!filter_depth_contains(4, 2));
     }
 }

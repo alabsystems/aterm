@@ -540,3 +540,53 @@ fn an_alias_fails_only_a_line_that_may_run_it() {
         assert!(state.admits(line).is_err(), "{line:?}");
     }
 }
+
+/// A `.zshenv`'s verdict names the line by its number and what failed it by
+/// the check's own word, never by the line's text: the line can carry a key
+/// (`alias deploy='AWS_SECRET_ACCESS_KEY=… ./deploy'`), and the verdict is a
+/// reason a journal row and a harness tape hold. The same for a snapshot's
+/// line of a shape the check does not read.
+#[test]
+fn a_startup_verdict_names_a_line_by_its_number_never_its_text() {
+    let secret = "planted-zshenv-0005"; // gitleaks:allow
+    for (text, verdict) in [
+        (
+            format!("export A=1\nalias deploy='AWS_SECRET_ACCESS_KEY={secret} ./deploy'\n"),
+            "its line 2 runs `alias`",
+        ),
+        (
+            format!("# {secret}\nexport B=2\nk() {{ echo {secret} }}\n"),
+            "its line 3 defines a function",
+        ),
+        (
+            format!("eval \"$(tool --token {secret} init zsh)\""),
+            "its line 1 runs `eval`",
+        ),
+    ] {
+        assert_eq!(zshenv_hazard(&text).as_deref(), Some(verdict), "{text}");
+    }
+    let s = Scratch::new("zshenv-number");
+    s.snapshot("zsh", 1, &zsh_snapshot("", "", ""));
+    std::fs::write(
+        s.home().join(".zshenv"),
+        format!("alias k='K={secret} k'\n"),
+    )
+    .expect("zshenv");
+    let why = s.read(&s.worker("/bin/zsh", &[])).expect_err("an alias");
+    assert!(why.contains("its line 1 runs `alias`"), "{why}");
+    assert!(!why.contains(secret), "{why}");
+    let s = Scratch::new("snapshot-line");
+    s.snapshot(
+        "zsh",
+        1,
+        &zsh_snapshot("", &format!("setopt {secret} on\n"), ""),
+    );
+    let why = s
+        .read(&s.worker("/bin/zsh", &[]))
+        .expect_err("a setopt row");
+    assert!(
+        why.contains("a `setopt` line this check does not read"),
+        "{why}"
+    );
+    assert!(!why.contains(secret), "{why}");
+}

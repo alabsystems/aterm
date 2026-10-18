@@ -9,7 +9,7 @@
 // streams). `cpu_too` rows also run every leg on the CPU; the CPU table is aterm-render's
 // `tests/empty_channels.rs`.
 //
-// No GPU or no font: no-op.
+// No GPU or no font: COULD NOT RUN.
 
 use std::sync::Arc;
 

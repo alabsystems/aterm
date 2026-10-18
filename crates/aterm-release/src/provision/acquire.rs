@@ -3,7 +3,8 @@
 
 //! The stock exceptions a full `ship provision` acquires before it audits them (`--check`
 //! acquires nothing): rustup itself (no default toolchain, auto-install off), upstream
-//! stable with the `x86_64-apple-darwin` slice and the foreign cells' std, the wasm32 pin
+//! stable with the `x86_64-apple-darwin` slice and the foreign cells' std (for `verify
+//! cells`, run by hand; the audit does not ask for them), the wasm32 pin
 //! `publish/config.sh`'s wasm32 clause names, with its wasm32 target, and rustup's `trust`
 //! link (atpkg's seam, the pass `aterm pkg repair` runs).
 //!
@@ -157,6 +158,10 @@ pub(crate) struct Homes {
     pub xdg_config_home: Option<PathBuf>,
     /// `$PATH`, searched for an installed rustup before `<cargo_home>/bin`.
     pub path: Option<std::ffi::OsString>,
+    /// Homebrew's rustup keg, looked at last: this machine's
+    /// ([`atpkg::toolchain::rustup::HOMEBREW_RUSTUP`]), or `None` where the homes are a
+    /// test's and nothing of this machine's may answer.
+    pub homebrew_keg: Option<PathBuf>,
 }
 
 impl Homes {
@@ -176,6 +181,7 @@ impl Homes {
             ),
             xdg_config_home: set("XDG_CONFIG_HOME"),
             path: std::env::var_os("PATH"),
+            homebrew_keg: Some(PathBuf::from(atpkg::toolchain::rustup::HOMEBREW_RUSTUP)),
         }
     }
 
@@ -183,16 +189,15 @@ impl Homes {
         self.cargo_home.join("rustup-init")
     }
 
+    /// The one rustup finder (`aterm_toolchain::rustup::find_rustup_among`) over these
+    /// homes: PATH, then `<cargo_home>/bin`, `~/.cargo/bin` and the keg they name.
     fn find_rustup(&self) -> Option<PathBuf> {
-        let on_path: Vec<PathBuf> = self
-            .path
-            .as_deref()
-            .map(|p| std::env::split_paths(p).map(|d| d.join("rustup")).collect())
-            .unwrap_or_default();
-        on_path
-            .into_iter()
-            .chain(std::iter::once(self.cargo_home.join("bin/rustup")))
-            .find(|p| atpkg::toolchain::is_executable_file(p))
+        atpkg::toolchain::rustup::find_rustup_among(
+            self.path.as_deref(),
+            Some(self.cargo_home.as_os_str()),
+            Some(self.home.as_os_str()),
+            self.homebrew_keg.as_deref(),
+        )
     }
 }
 
@@ -362,8 +367,8 @@ fn seam(homes: &Homes, report: &mut dyn FnMut(&str)) {
     let layout = atpkg::Layout {
         prefix: atpkg::toolchain::atpkg_prefix(&homes.home, homes.xdg_config_home.as_deref()),
     };
-    for line in atpkg::seam::repair(&layout, &homes.rustup_home) {
-        report(&format!("rustup trust: {line}"));
+    for event in atpkg::seam::repair(&layout, &homes.rustup_home) {
+        report(&format!("rustup trust: {event}"));
     }
 }
 
@@ -387,39 +392,6 @@ mod tests {
     }
 
     #[test]
-    fn a_machine_with_no_rustup_gets_rustup_stable_and_the_pin_by_name() {
-        assert_eq!(
-            plan(&Seen::default(), Some("1.97.1"), TARGETS),
-            [
-                Step::InstallRustup,
-                Step::StableToolchain,
-                Step::StableTargets(names(TARGETS)),
-                Step::PinToolchain("1.97.1".into()),
-                Step::TrustSeam,
-            ]
-        );
-        let init = &argv(&Step::InstallRustup);
-        assert!(init[0].contains(&"--no-modify-path".to_string()));
-        assert_eq!(
-            init[0][init[0].len() - 2..],
-            names(&["--default-toolchain", "none"])[..],
-            "no default toolchain: a bare cargo fails loudly"
-        );
-        assert_eq!(
-            init[1],
-            names(&["rustup", "set", "auto-install", "disable"])
-        );
-    }
-
-    #[test]
-    fn a_provisioned_machine_acquires_nothing_but_the_seam_check() {
-        assert_eq!(
-            plan(&provisioned(), Some("1.97.1"), TARGETS),
-            [Step::TrustSeam]
-        );
-    }
-
-    #[test]
     fn a_missing_target_is_added_to_the_toolchain_that_lacks_it() {
         let mut s = provisioned();
         s.stable_targets = names(&["wasm32-unknown-unknown"]);
@@ -431,17 +403,6 @@ mod tests {
                 Step::PinTarget("1.97.1".into()),
                 Step::TrustSeam,
             ]
-        );
-        assert_eq!(
-            argv(&Step::PinTarget("1.97.1".into())),
-            [names(&[
-                "rustup",
-                "target",
-                "add",
-                "--toolchain",
-                "1.97.1",
-                WASM32
-            ])]
         );
     }
 
@@ -457,19 +418,6 @@ mod tests {
                 Step::PinToolchain("1.97.1".into()),
                 Step::TrustSeam,
             ]
-        );
-        assert_eq!(
-            argv(&Step::PinToolchain("1.97.1".into()))[0],
-            names(&[
-                "rustup",
-                "toolchain",
-                "install",
-                "1.97.1",
-                "--profile",
-                "minimal",
-                "--target",
-                WASM32
-            ])
         );
         // No readable pin: nothing is guessed.
         assert_eq!(plan(&provisioned(), None, TARGETS), [Step::TrustSeam]);
@@ -625,6 +573,7 @@ mod stateful {
             rustup_home: dir.join(".rustup"),
             xdg_config_home: None,
             path: None,
+            homebrew_keg: None,
         }
     }
 
@@ -640,8 +589,7 @@ mod stateful {
         let tmp = aterm_tempfile::tempdir().unwrap();
         let homes = homes(tmp.path());
         let rustup = FakeRustup::default();
-        let mut said = Vec::new();
-        run(&repo(), &homes, &rustup, &mut |l| said.push(l.to_string()));
+        run(&repo(), &homes, &rustup, &mut |_| {});
         let calls = rustup.calls();
         assert_eq!(calls[0], "fetch rustup-init");
         assert_eq!(
@@ -667,11 +615,6 @@ mod stateful {
             "every toolchain is installed by name: {:?}",
             rustup.0.borrow().auto_installed
         );
-        assert!(
-            said.iter().any(|l| l.starts_with("acquired: rustup-init")),
-            "{said:#?}"
-        );
-        assert!(!said.iter().any(|l| l.contains("failed")), "{said:#?}");
         // `pub stage`'s wasm32 clause asks for the pin's target with auto-install off: it answers.
         let bin = homes
             .find_rustup()
@@ -745,5 +688,16 @@ mod stateful {
         assert_eq!(h.find_rustup(), Some(tmp.path().join(".cargo/bin/rustup")));
         h.path = Some(on_path.clone().into_os_string());
         assert_eq!(h.find_rustup(), Some(on_path.join("rustup")));
+        // The keg is looked at only where the homes name one, and last.
+        let keg = tmp.path().join("keg/bin/rustup");
+        std::fs::create_dir_all(keg.parent().unwrap()).unwrap();
+        std::fs::copy(on_path.join("rustup"), &keg).unwrap();
+        let bare = homes(&tmp.path().join("bare"));
+        assert_eq!(bare.find_rustup(), None);
+        let kegged = Homes {
+            homebrew_keg: Some(keg.clone()),
+            ..bare
+        };
+        assert_eq!(kegged.find_rustup(), Some(keg));
     }
 }

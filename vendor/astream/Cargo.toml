@@ -1,6 +1,6 @@
 # astream — a small, reproducibly-buildable, agent-native message bus.
 # The gate (astream-wire + astream-evidence) is the
-# foundation; the 14 members below are the built system — see README "Layout".
+# foundation; the 15 members below are the built system — see README "Layout".
 #
 # HARD INVARIANT: zero private / git dependencies. Everything resolves from
 # crates.io with a committed Cargo.lock so `targo --unverified build --locked`
@@ -9,22 +9,7 @@
 
 [workspace]
 resolver = "2"
-members = [
-    "crates/astream-wire",
-    "crates/astream-digest",
-    "crates/astream-evidence",
-    "crates/astream-term",
-    "crates/astream-engine",
-    "crates/astream-host",
-    "crates/astream-effects",
-    "crates/astream-agent",
-    "crates/astream-live",
-    "crates/astream-broker",
-    "crates/astream-cap",
-    "crates/astream-kafka",
-    "crates/astream-pump",
-    "crates/astream-aead",
-]
+members = []
 # NOTE: a `verify/` workspace will live in a SEPARATE workspace and must never
 # appear in these members — the evidence gate enforces this (see gate.rs).
 
@@ -48,6 +33,9 @@ astream-digest = { path = "crates/astream-digest", version = "0.2.0" }
 # `astream-aead = "^0.1.0"` against a 0.2.0 crate, so `pub bump` undid itself).
 astream-cap = { path = "crates/astream-cap", version = "0.2.0" }
 astream-aead = { path = "crates/astream-aead", version = "0.2.0" }
+# The durable log's OS cordon (F_BARRIERFSYNC, the boot session id): zero dependencies,
+# its only unsafe confined to one cfg(target_vendor = "apple") module.
+astream-sys = { path = "crates/astream-sys", version = "0.2.0" }
 # Third-party (crates.io only — no git, no path-to-private):
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"

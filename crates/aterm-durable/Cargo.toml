@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-durable"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "How aterm finishes a write: durable (on stable media at return, F_FULLFSYNC on Apple) or ordered (ahead of every later write on the device, F_BARRIERFSYNC on Apple), with a counting seam that tells a test which one each operation took."
+
+# Std-only apart from the barrier itself, so a dependency-free crate (aterm-primer)
+# can finish its writes here and still pull no third-party code: astream-sys has no
+# dependencies, and its one cordoned module of two FFI calls is the only `unsafe`
+# the barrier needs. Only Apple targets have an ordering-only flush, so only they
+# compile it.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+astream-sys = { path = "../../vendor/astream/crates/astream-sys" }
+
+[dev-dependencies]
+aterm-tempfile = { workspace = true }
+
+[lints]
+workspace = true

@@ -51,15 +51,16 @@ pub(crate) struct HostDiagnosticsLane {
 impl HostDiagnosticsLane {
     pub(crate) fn spawn(proxy: EventLoopProxy<Wake>) -> Result<Self, String> {
         let (request_tx, request_rx) = sync_channel(REQUEST_CAPACITY);
-        std::thread::Builder::new()
-            .name("aterm-config-diagnostics".into())
-            .spawn(move || {
+        crate::qos::spawn_lane_thread(
+            "aterm-config-diagnostics",
+            crate::qos::Role::Background,
+            move || {
                 // QoS (port of 61a6c8b62): Manual diagnostics are read on a
                 // settings screen; they answer through the proxy, hold no lock.
-                crate::qos::set_self(crate::qos::Role::Background);
                 worker_loop(request_rx, proxy);
-            })
-            .map_err(|error| format!("could not start Manual diagnostics worker: {error}"))?;
+            },
+        )
+        .map_err(|error| format!("could not start Manual diagnostics worker: {error}"))?;
         Ok(Self {
             request_tx,
             pending: None,
@@ -142,7 +143,6 @@ fn worker_loop(request_rx: Receiver<Request>, proxy: EventLoopProxy<Wake>) {
                     &request.source,
                     request.backend_gpu,
                     &request.assets,
-                    crate::net_listen::launched_inside_aterm(),
                 );
                 let _ = analysis.merge_host_diagnostics(diagnostics);
             }
@@ -243,7 +243,6 @@ impl App {
                 &snapshot.text,
                 backend_gpu,
                 &config_assets,
-                crate::net_listen::launched_inside_aterm(),
             );
             let _ = analysis.merge_host_diagnostics(diagnostics);
         }
@@ -303,10 +302,9 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document_store::DocumentStore;
 
     fn document() -> DocumentId {
-        let mut store = DocumentStore::for_test();
+        let mut store = crate::test_document_store();
         store.open(
             "document:test".to_string(),
             "manual diagnostics".to_string(),
@@ -321,7 +319,7 @@ mod tests {
     fn shipping_lane_conforms_to_latest_revision_model() {
         let document = document();
         let (mut lane, receiver) = HostDiagnosticsLane::test_pair();
-        let model = aterm_spec::derive::manual_config_diagnostics_lane_model();
+        let model = aterm_models_misc::manual_config_diagnostics_lane_model();
         let mut state = model.init_state();
 
         // Abstract generation 1: document 1 under host environment 1.

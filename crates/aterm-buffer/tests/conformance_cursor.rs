@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 //
 //! Tier-1 conformance: binds the real subscription cursor to the derived
-//! `Cursor` model (`aterm_spec::derive::cursor_model()`). `Grow` advances the
+//! `Cursor` model (`aterm_models_core::cursor_model()`). `Grow` advances the
 //! writer's `seq`; `Deliver` (enabled while the reader is behind) catches
 //! `cursor` up to `seq`; `CursorBounded` says the reader never passes the
 //! writer. `Buggy = 1` is an off-by-one delivery that parks the cursor one past
@@ -17,7 +17,7 @@
 
 use crate::support::{read_cap, write_cap};
 use aterm_buffer::{Cursor, Edit, SubUpdate, Surface};
-use aterm_spec::derive::cursor_model;
+use aterm_models_core::cursor_model;
 use aterm_spec::{interp, verify};
 use std::collections::BTreeMap;
 

@@ -1,66 +1,40 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE PATH-USER SCAN: which live processes of this uid are USING a path under
-//! one of a set of directories — as their working directory, as their
-//! executable, or through an open descriptor.
+//! The path-user scan: which live processes of this uid use a path under one of a set of
+//! directories, as their working directory, their executable, or through an open descriptor.
 //!
-//! The disk watch removes a build directory WHOLE only when its owner is gone
-//! (`aterm_agent::harness::disk`). Cargo takes no lock while tests run, and a
-//! binary run from `deps/` holds none either, so "the owner is gone" is
-//! checked against what is RUNNING too: a process whose working directory,
-//! executable or open file lies under the directory (or under the owner's own
-//! folder) keeps it. Measured 2026-10-01 by the review's probe: a process
-//! with its working directory in `target/debug/deps` and an `.rlib` held open
-//! saw that directory deleted before this scan existed.
+//! The disk watch removes a build directory whole only when its owner is gone
+//! (`aterm_agent::harness::disk`). Cargo takes no lock while tests run, and a binary run from
+//! `deps/` holds none either, so "gone" is also checked against what is running: a process
+//! whose working directory, executable or open file lies under the directory (or the owner's
+//! own folder) keeps it.
 //!
-//! macOS reads it through libproc, as the rdev scan beside it does: per
-//! process `proc_pidinfo(PROC_PIDVNODEPATHINFO)` (the working directory),
-//! `proc_pidpath` (the executable) and, per vnode descriptor,
-//! `proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO)`. Linux reads `/proc/<pid>/cwd`,
-//! `exe` and `fd/*`. A process that EXITED holds nothing (`ESRCH`, or its
-//! `/proc` entry gone), whether it exited before the listing named it or
-//! between its reads; a descriptor that closed mid-read is gone, and so is
-//! one on a DEAD vnode — revoked, its read answering `ENOENT` (the holder
-//! scan's module docs) — which names no path; a process with no descriptor
-//! at all is read.
+//! macOS reads it through libproc, as the rdev scan beside it does: per process
+//! `proc_pidinfo(PROC_PIDVNODEPATHINFO)` (the working directory), `proc_pidpath` (the
+//! executable) and, per vnode descriptor, `proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO)`. Linux
+//! reads `/proc/<pid>/cwd`, `exe` and `fd/*`. A process that exited holds nothing (`ESRCH`, or
+//! its `/proc` entry gone), whenever it exited; a descriptor closed mid-read, or on a dead
+//! vnode (the holder scan's module docs), names no path; a process with no descriptor is read.
 //!
-//! So is a process whose WORKING DIRECTORY is a dead vnode: it works in no
-//! path, so in none under the directories, and its executable and
-//! descriptors still say what it uses. In xnu (xnu-12377.121.6,
-//! `bsd/kern/proc_info.c`), `PROC_PIDVNODEPATHINFO` (`proc_pidvnodepathinfo`)
-//! takes the working directory's vnode with `vnode_getwithvid`, as a
-//! descriptor's read takes its vnode, and answers its `ENOENT` — the vnode
-//! reclaimed (`VL_DEAD`) or its id moved because it was — before reading
-//! anything else. A directory is never revoked (`revoke(2)` takes devices
-//! alone, `ENOTSUP` for anything else), so a working directory dies with its
-//! volume: a forced unmount (`hdiutil detach -force`, `diskutil unmount
-//! force`, a disk pulled out). Measured 2026-10-01: a child working at the
-//! root of a disk image read `ENOENT` for good once the image was
-//! force-detached; read as unknown, such a process kept every gone owner's
-//! build directory from the disk watch for its whole life
-//! (`aterm_agent::harness::disk_discover::unused`). After the vnode is
-//! taken, a refusal — the MAC and same-uid checks, the filesystem's getattr
-//! (`fill_vnodeinfo`) — leaves the process unreadable, and the one `ENOENT`
-//! a getattr can give is a filesystem saying the directory no longer
-//! exists, which names no path either. The same `ENOENT` answers a dead
-//! ROOT directory, read after the working directory: a root is set by
-//! `chroot(2)` alone, which xnu grants the superuser alone (a fork inherits
-//! it), so the one process read as working nowhere when it is not is one the
-//! superuser confined to a chroot, working outside it on another volume,
-//! after the chroot's own volume was force-unmounted. An `ENOENT` listing a
-//! table stays unknown.
+//! So is a process whose working directory is a dead vnode: it works in no path, and its
+//! executable and descriptors still say what it uses (read as unknown, it would keep every
+//! gone owner's build directory, `aterm_agent::harness::disk_discover::unused`). A directory
+//! is never revoked (`revoke(2)` takes devices alone), so a working directory dies with its
+//! volume's forced unmount. In xnu (xnu-12377.121.6, `bsd/kern/proc_info.c`)
+//! `PROC_PIDVNODEPATHINFO` answers `vnode_getwithvid`'s `ENOENT` (reclaimed, or its vid moved)
+//! before reading anything else; a later refusal (MAC, same-uid, getattr) leaves the process
+//! unreadable, and a getattr `ENOENT` is a directory that no longer exists. A dead root
+//! directory answers the same `ENOENT`, which misreads only a superuser's `chroot(2)` on a
+//! force-unmounted volume. An `ENOENT` listing a table stays unknown.
 //!
-//! Linux has no such failure to tell apart: a hung-up terminal (`vhangup`,
-//! its controlling process's exit) keeps its path, which `/proc/<pid>/fd/<n>`
-//! reads like any other (`__tty_hangup` swaps only the file's operations),
-//! and a deleted target, a working directory among them, reads as its path
-//! and ` (deleted)`. A process whose answers could not be read otherwise is
-//! [`PathScan::unreadable`], never a non-user: the caller decides what that
-//! means. Paths are compared as the kernel writes them, with the directories
-//! given CANONICAL; a kernel path under `/System/Volumes/Data` (the data
-//! volume's firmlinked form) is compared without that prefix too.
-//! Memory-mapped files that hold no descriptor are not seen.
+//! Linux has no such failure to tell apart: a hung-up terminal keeps its path in
+//! `/proc/<pid>/fd/<n>` (`__tty_hangup` swaps only the file's operations), and a deleted
+//! target reads as its path and ` (deleted)`. A process whose answers could not be read
+//! otherwise is [`PathScan::unreadable`], never a non-user. Paths are compared as the kernel
+//! writes them, with the directories given canonical; a kernel path under
+//! `/System/Volumes/Data` (the data volume's firmlinked form) is compared without that prefix
+//! too. Memory-mapped files that hold no descriptor are not seen.
 //!
 //! Other platforms answer `Unsupported`.
 
@@ -86,12 +60,10 @@ pub struct PathScan {
     /// Each process found using a path under one of the directories (the
     /// first such use of each).
     pub users: Vec<PathUse>,
-    /// Processes scanned (by the full scan, this uid's) whose working
-    /// directory, executable or descriptors could not be read (not because
-    /// they exited), each with its executable when that much could be read.
-    /// Measured 2026-10-01 on macOS 26: 8 of 335 — `lsd`, `UserEventAgent`,
-    /// `routined`, `nsurlsessiond` and other platform agents refuse the
-    /// working directory or the descriptor list to a same-uid reader.
+    /// Processes scanned whose working directory, executable or descriptors could not be read
+    /// (not because they exited), each with its executable when that much could be read. On
+    /// macOS some platform agents (`lsd`, `UserEventAgent`, `routined`, `nsurlsessiond`)
+    /// refuse a same-uid reader.
     pub unreadable: Vec<(u32, Option<PathBuf>)>,
     /// How many processes were scanned.
     pub scanned: usize,
@@ -111,7 +83,9 @@ fn under(path: &Path, dirs: &[PathBuf]) -> bool {
 /// (each canonical). A child of a `skip`ped process that still runs its
 /// parent's executable — a fork that has not exec'd yet, holding copies of
 /// every descriptor its parent had — is skipped with it: what it holds is
-/// the parent's.
+/// the parent's. That executable must be this process's own, run
+/// untranslated: under a translator every program it runs has the same one
+/// (`unexeced_fork`).
 ///
 /// # Errors
 ///
@@ -124,15 +98,11 @@ pub fn scan_path_users(dirs: &[PathBuf], skip: &[u32]) -> io::Result<PathScan> {
     scan_path_users_of(&super::uid_pids()?, dirs, skip)
 }
 
-/// [`scan_path_users`] over the processes `pids` alone, each read as that
-/// scan reads it — the process universe, NAMED: the full scan is this over
-/// every process of the uid, and a test names the processes it started, so
-/// what else the machine runs (a process another session starts, one that
-/// cannot be read) never reaches its verdict. A pid no process has is one
-/// that exited: it uses nothing. Every pid named is read, whatever its uid,
-/// on both platforms — the uid is the full scan's LISTING, never this
-/// reader's filter — so another uid's process is read like any other, and
-/// is mostly [`PathScan::unreadable`]: the kernel refuses its reads.
+/// [`scan_path_users`] over the processes `pids` alone, each read as that scan reads it: the
+/// full scan is this over every process of the uid, and a test names the processes it started
+/// so nothing else the machine runs reaches its verdict. A pid that names no process has
+/// exited and uses nothing. Every pid named is read whatever its uid (the uid filters only the
+/// full scan's listing), so another uid's process is mostly [`PathScan::unreadable`].
 ///
 /// # Errors
 ///
@@ -160,18 +130,95 @@ pub fn scan_path_users_of(pids: &[u32], dirs: &[PathBuf], skip: &[u32]) -> io::R
 }
 
 /// Is `pid` a child of one of `parents` still running that parent's
-/// executable (a fork that has not exec'd)?
+/// executable (a fork that has not exec'd)? An equal executable proves that
+/// only when it names a program, not an interpreter that runs others: this
+/// process's own, read untranslated ([`own_program`]). Any other proves
+/// nothing, and the child is a user, the keep this scan exists for: it is
+/// asked before a build directory is deleted.
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
 fn unexeced_fork(pid: u32, parents: &[u32]) -> bool {
     let Some(ppid) = parent_of(pid) else {
         return false;
     };
     parents.contains(&ppid)
-        && match (executable(pid), executable(ppid)) {
-            (Some(child), Some(parent)) => child == parent,
+        && match (executable(pid), executable(ppid), own_program()) {
+            (Some(child), Some(parent), Some(own)) => child == parent && parent == own,
             _ => false,
         }
 }
+
+/// The executable that names the program this process runs: the kernel's
+/// answer. macOS has no `binfmt_misc` to hand a process to an interpreter, so
+/// the kernel names the image it loaded.
+#[cfg(target_vendor = "apple")]
+fn own_program() -> Option<PathBuf> {
+    executable(std::process::id())
+}
+
+/// See the macOS twin. On Linux a translated process's executable is its
+/// interpreter (`binfmt_misc`): under Rosetta this process, its un-exec'd
+/// fork and every other x86_64 program it has exec'd all read as
+/// `/mnt/lima-rosetta/rosetta` ([`exe_of`], measured 2026-10-17), so an equal
+/// executable cannot tell a fork from a child running another program. This
+/// process's executable names its program only when no translator runs it,
+/// and either of two reads says when one does: a translator rewrites this
+/// process's path read of its own link to the program it translates, and the
+/// image the kernel runs is built for another architecture than this code
+/// ([`own_image_machine`]). Under Rosetta each alone answers `None` (measured
+/// 2026-10-17). `None` too when either cannot be read.
+#[cfg(target_os = "linux")]
+fn own_program() -> Option<PathBuf> {
+    let kernel = executable(std::process::id())?;
+    let untranslated =
+        std::fs::read_link("/proc/self/exe").ok()? == kernel && own_image_machine()? == ELF_MACHINE;
+    untranslated.then_some(kernel)
+}
+
+/// The `e_machine` of the ELF image the kernel runs as this process, read
+/// through the opened `/proc/<pid>` directory as [`exe_of`] reads its link: a
+/// translator rewrites an open of this process's own `/proc/self/exe` to the
+/// program it translates (Rosetta does), not one through the directory.
+#[cfg(target_os = "linux")]
+fn own_image_machine() -> Option<u16> {
+    use std::io::Read as _;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    let dir = std::fs::File::open(format!("/proc/{}", std::process::id())).ok()?;
+    // SAFETY: `dir` is open for the call and the name is NUL-terminated.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            c"exe".as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: `openat` just returned `fd`, which nothing else owns.
+    let mut image = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    let mut head = [0u8; 20];
+    image.read_exact(&mut head).ok()?;
+    let [0x7f, b'E', b'L', b'F', _, data, .., m0, m1] = head else {
+        return None;
+    };
+    match data {
+        1 => Some(u16::from_le_bytes([m0, m1])),
+        2 => Some(u16::from_be_bytes([m0, m1])),
+        _ => None,
+    }
+}
+
+/// This code's architecture as an ELF header's `e_machine` names it
+/// (`EM_X86_64`, `EM_AARCH64`); `EM_NONE` on any other, where
+/// [`own_program`] names nothing and no fork is skipped.
+#[cfg(target_os = "linux")]
+const ELF_MACHINE: u16 = if cfg!(target_arch = "x86_64") {
+    62
+} else if cfg!(target_arch = "aarch64") {
+    183
+} else {
+    0
+};
 
 /// The parent of `pid` (`proc_pidinfo(PROC_PIDT_SHORTBSDINFO)`'s
 /// `pbsi_ppid`).
@@ -203,17 +250,16 @@ fn parent_of(pid: u32) -> Option<u32> {
 pub enum Exe {
     /// The path it runs, as the kernel holds it.
     At(PathBuf),
-    /// It RUNS, and what it runs has no path to name: unlinked since its
-    /// exec (a rebuilt binary, a replaced app), or the read refused.
+    /// It runs, and what it runs has no path to name: unlinked since its exec (a rebuilt
+    /// binary, a replaced app), or the read refused.
     Unnamed,
     /// It has exited (`ESRCH`, which a zombie answers too; on Linux, its
     /// `exe` gone): it runs nothing.
     Exited,
 }
 
-/// The executable of `pid`, as the kernel holds it — told apart from a
-/// process that has EXITED, which is not one whose executable cannot be
-/// named: that one still runs.
+/// The executable of `pid`, as the kernel holds it, told apart from a process that has exited
+/// (one whose executable cannot be named still runs).
 #[cfg(target_vendor = "apple")]
 #[must_use]
 pub fn exe_of(pid: u32) -> Exe {
@@ -244,13 +290,50 @@ fn parent_of(pid: u32) -> Option<u32> {
 /// See the macOS twin: `/proc/<pid>/exe`, gone once the process exited
 /// (a zombie's too). An executable unlinked since the exec reads as its
 /// path and ` (deleted)`.
+///
+/// It is read through the opened `/proc/<pid>` directory (`readlinkat`), the
+/// kernel's own answer for every pid, this process's included. A binary
+/// translator rewrites the path read of its own process's link: under Rosetta
+/// `readlink("/proc/<own pid>/exe")` names the translated binary, while every
+/// other pid's link names the translator (`/mnt/lima-rosetta/rosetta`), and
+/// `readlinkat` names the translator for this process too (measured
+/// 2026-10-17). [`own_program`] reads the difference.
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn exe_of(pid: u32) -> Exe {
-    match std::fs::read_link(format!("/proc/{pid}/exe")) {
-        Ok(path) => Exe::At(path),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Exe::Exited,
-        Err(_) => Exe::Unnamed,
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStringExt as _;
+    let gone = |e: &io::Error| matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ESRCH));
+    let dir = match std::fs::File::open(format!("/proc/{pid}")) {
+        Ok(dir) => dir,
+        Err(e) if gone(&e) => return Exe::Exited,
+        Err(_) => return Exe::Unnamed,
+    };
+    // The kernel writes at most `PATH_MAX` bytes; a full buffer would be a
+    // path cut short, which names nothing.
+    let mut buf = [0u8; 4096];
+    // SAFETY: `dir` is open for the call, the name is NUL-terminated, and the
+    // kernel writes at most `buf.len()` bytes into `buf`.
+    let n = unsafe {
+        libc::readlinkat(
+            dir.as_raw_fd(),
+            c"exe".as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    let Ok(len) = usize::try_from(n) else {
+        return if gone(&io::Error::last_os_error()) {
+            Exe::Exited
+        } else {
+            Exe::Unnamed
+        };
+    };
+    match buf.get(..len) {
+        Some(path) if len < buf.len() => {
+            Exe::At(PathBuf::from(std::ffi::OsString::from_vec(path.to_vec())))
+        }
+        _ => Exe::Unnamed,
     }
 }
 
@@ -309,11 +392,9 @@ mod mac {
         // SAFETY: `buf` is `size` writable bytes; the call writes at most that.
         let got = unsafe { ffi::proc_pidpath(pid, buf.as_mut_ptr().cast(), size) };
         if got <= 0 {
-            // An executable unlinked since the exec has no path left to report,
-            // which is no failure to read the process: its working directory and
-            // descriptors still say what it uses. Counted unreadable, one such
-            // process (a debug build whose worktree was deleted, 2026-10-01) kept
-            // every build directory on the machine from being reclaimed.
+            // An executable unlinked since the exec has no path left to report, which is no
+            // failure to read the process: its working directory and descriptors still say
+            // what it uses.
             let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
             if errno == Failed::ENOENT {
                 return Ok(None);
@@ -543,17 +624,15 @@ mod tests {
         }
     }
 
-    /// A CHILD WHOSE WORKING DIRECTORY IS UNDER THE DIRECTORY USES IT, and
-    /// one that holds a file there open does too; NEGATIVE CONTROL, a
-    /// directory nobody is in has no user, and this process is skipped.
+    /// A child working under the directory uses it, and so does one holding a file there
+    /// open. Negative control: a directory nobody is in has no user, and this process is
+    /// skipped.
     #[test]
     fn a_child_working_or_holding_a_file_under_the_directory_uses_it() {
         let dir = fresh("cwd");
         let deep = dir.join("debug/deps");
         std::fs::create_dir_all(&deep).expect("deps");
-        // `spawnfd`'s, every child of these scans: each holds its stdio and
-        // nothing else of this process, not another test thread's pipe for as
-        // long as it lives.
+        // Every child here is `spawnfd`'s, so it holds no other test thread's pipe.
         let mut sleeper = crate::spawnfd::command("/bin/sleep")
             .arg("120")
             .current_dir(&deep)
@@ -589,17 +668,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&empty);
     }
 
-    /// A PROCESS WHOSE EXECUTABLE WAS DELETED IS STILL READ: `proc_pidpath`
-    /// answers `ENOENT` for it, and its working directory under the directory
-    /// still makes it a user — never an unreadable process that rules nothing
-    /// out. The copy of `cat` is signed ad hoc, or the kernel kills it, and is
-    /// deleted only once the child has echoed a line back — its own fact that
-    /// its launch is done. The kernel names the executable before the launch
-    /// is done, and a fresh executable deleted before then gets its process
-    /// killed (the system's scan of the file fails to open it): measured
-    /// 2026-10-01, a copy deleted right after its spawn was killed 20 times
-    /// of 20, one deleted after its echo 0 of 20. The child ends at its EOF,
-    /// so a failed assertion leaves nothing running.
+    /// A process whose executable was deleted (`proc_pidpath` answers `ENOENT`) is still read,
+    /// and its working directory makes it a user. The copy of `cat` is signed ad hoc, or the
+    /// kernel kills it, and deleted only once the child has echoed a line back: a fresh
+    /// executable deleted before its launch is done gets its process killed. The child ends at
+    /// its EOF.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn a_process_whose_executable_was_deleted_is_read_through_its_working_directory() {
@@ -653,10 +726,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A FORK OF THIS PROCESS THAT HAS NOT EXEC'D IS THIS PROCESS: it holds
-    /// copies of every descriptor this process had at the fork (the disk
-    /// watch's own handles among them), so it is skipped with it.
-    /// NEGATIVE CONTROL: unskipped, the same fork reads as a user.
+    /// Why a translator leaves the fork test's skip undecided, for its `NOT RUN` line.
+    const FORK_UNDER_A_TRANSLATOR: &str = "the kernel names the translator as the executable \
+        of this process, of its un-exec'd fork and of every program the translator runs \
+        (binfmt_misc), so a fork cannot be told from a child that exec'd another program; the \
+        fork is kept as a user instead (asserted), and a real x86_64 CPU decides the skip";
+
+    /// A fork of this process that has not exec'd holds copies of every descriptor this
+    /// process had, so it is skipped with it. Negative control: unskipped, it is a user.
+    /// Under a translator ([`crate::spawnfd::tests::translator`]) the skip cannot be decided
+    /// ([`FORK_UNDER_A_TRANSLATOR`]): the fork must be kept as a user, and the test says the
+    /// skip did not run.
     #[test]
     fn a_fork_of_this_process_that_has_not_execd_is_skipped_with_it() {
         unsafe extern "C" {
@@ -688,17 +768,88 @@ mod tests {
             waitpid(child, std::ptr::null_mut(), 0);
         }
         drop(held);
-        assert!(
-            !skipped.users.iter().any(|u| u.pid == child_pid),
-            "{:?}",
-            skipped.users
-        );
+        let kept = skipped.users.iter().any(|u| u.pid == child_pid);
+        if let Some(translator) = crate::spawnfd::tests::translator() {
+            assert!(
+                kept,
+                "under {translator} the fork is kept: {:?}",
+                skipped.users
+            );
+            println!(
+                "NOT RUN under {translator}: holders::paths::tests::\
+                 a_fork_of_this_process_that_has_not_execd_is_skipped_with_it: the skip: \
+                 {FORK_UNDER_A_TRANSLATOR}"
+            );
+        } else {
+            assert!(!kept, "{:?}", skipped.users);
+        }
         assert!(
             unskipped.users.iter().any(|u| u.pid == child_pid),
             "{:?}",
             unskipped.users
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Present in the environment of the next test's child: hold until stdin closes.
+    const PARK_ENV: &str = "ATERM_UDS_PATHS_PARK";
+
+    /// A child of this process that exec'd another program and works in the directory is a
+    /// user with this process skipped: what it holds is its own. The program is a copy of
+    /// this test binary at another path, run parked ([`PARK_ENV`]). Natively it is another
+    /// executable; under a translator it is the translator, as this process's executable is
+    /// (PRECONDITION: the case only [`super::own_program`] tells from an un-exec'd fork;
+    /// with an equal executable taken as proof, the scan skipped this child, measured
+    /// 2026-10-17). Negative control: the fork test above, where the same skip leaves a
+    /// child out.
+    #[test]
+    fn a_child_that_execd_another_program_is_a_user_with_this_process_skipped() {
+        const NAME: &str = "holders::paths::tests::\
+            a_child_that_execd_another_program_is_a_user_with_this_process_skipped";
+        if std::env::var_os(PARK_ENV).is_some() {
+            let _ = std::io::Read::read(&mut std::io::stdin(), &mut [0u8; 1]);
+            return;
+        }
+        let dir = fresh("execd");
+        let bin_dir = fresh("execd-bin");
+        let bin = bin_dir.join("other");
+        std::fs::copy(std::env::current_exe().expect("the test binary"), &bin)
+            .expect("a copy of the test binary");
+        let mut other = crate::spawnfd::command(&bin)
+            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+            .env(PARK_ENV, "1")
+            .current_dir(&dir)
+            .stdin(crate::spawnfd::Stdio::piped())
+            .stdout(crate::spawnfd::Stdio::null())
+            .stderr(crate::spawnfd::Stdio::null())
+            .spawn()
+            .expect("the copy");
+        let how = until(std::slice::from_ref(&dir), other.id(), |h| h.is_some());
+        let (mine, its) = (
+            super::executable(std::process::id()),
+            super::executable(other.id()),
+        );
+        drop(other.stdin.take());
+        let _ = other.kill();
+        let _ = other.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&bin_dir);
+        if let Some(translator) = crate::spawnfd::tests::translator() {
+            assert_eq!(
+                mine, its,
+                "PRECONDITION: under {translator} both run the translator"
+            );
+        } else {
+            assert_ne!(
+                mine, its,
+                "PRECONDITION: natively the copy is another executable"
+            );
+        }
+        assert_eq!(
+            how.as_deref(),
+            Some("cwd"),
+            "this process's {mine:?}, its {its:?}"
+        );
     }
 
     /// A child's pid once the kernel shows it running `/bin/sleep`: its
@@ -721,18 +872,12 @@ mod tests {
         }
         pid
     }
-    /// A child with NO descriptor at all, working in `cwd`, STOPPED, and its
-    /// pid once the stop is reported: a shell spawned with nothing but its
-    /// stdio (`spawnfd::command`), which closes those three and stops itself,
-    /// so nothing it runs can open one again. SIGKILL it and reap it with
-    /// [`reap`].
+    /// A child with no descriptor at all, working in `cwd`, stopped, and its pid once the stop
+    /// is reported: a shell spawned with only its stdio (`spawnfd::command`) that closes those
+    /// three and stops itself. SIGKILL and reap it with [`reap`].
     ///
-    /// SPAWNED, NOT FORKED. A raw `fork` of this multithreaded test binary
-    /// dies before its first line of code now and then: libSystem's atfork
-    /// child handler (`_notify_fork_child`) meets an `os_once` another test's
-    /// thread is inside at the fork, and aborts the child
-    /// (`_os_once_gate_corruption_abort`, a SIGKILL and a crash report each
-    /// time) — `stopped, not exited: 0x9`, 2 of 40 whole-binary runs.
+    /// Spawned, not forked: a raw `fork` of this multithreaded binary can die in libSystem's
+    /// atfork child handler (`_notify_fork_child` meeting an `os_once` another thread was in).
     #[cfg(target_vendor = "apple")]
     fn bare_child(cwd: &std::path::Path) -> (crate::spawnfd::Child, i32) {
         const WUNTRACED: i32 = 2;
@@ -795,18 +940,11 @@ mod tests {
         (master, PathBuf::from(slave))
     }
 
-    /// A DESCRIPTOR ON A REVOKED TERMINAL HOLDS NOTHING, and its process is
-    /// still read. A child holds a PTY slave open; `revoke(2)` on the slave's
-    /// path reclaims the vnode under the child's descriptor — what a
-    /// terminal's controlling process does to it at its exit — and the
-    /// descriptor's read answers `ENOENT` from then on. Scanned for the very
-    /// path that descriptor named, the child is no user and not unreadable,
-    /// and it holds no device: before, ONE such descriptor made its process
-    /// unknown for its whole life, and the disk watch kept every gone
-    /// owner's build directory while it ran. Before the revoke, both scans
-    /// find it through that descriptor. NEGATIVE CONTROL: the same reads,
-    /// classified as before a dead vnode was told apart, make it unknown to
-    /// both scans.
+    /// A child holds a PTY slave open; `revoke(2)` on the slave's path (what a terminal's
+    /// controlling process's exit does) reclaims the vnode under it, and the descriptor reads
+    /// `ENOENT`. Scanned for that path, the child is then no user, not unreadable, and holds
+    /// no device; before the revoke both scans find it. Negative control: with dead vnodes read
+    /// as unknown, it is unknown to both scans.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn a_descriptor_on_a_revoked_terminal_holds_nothing() {
@@ -817,8 +955,7 @@ mod tests {
         let (master, slave) = a_pty();
         let rdev = std::fs::metadata(&slave).expect("stat the slave").rdev();
         let dirs = std::slice::from_ref(&slave);
-        // The slave on descriptor 3, from a working directory and an
-        // executable that are not it.
+        // The slave on descriptor 3, from a working directory and executable that are not it.
         let mut child = crate::spawnfd::command("/bin/sh")
             .arg("-c")
             .arg("exec 3<>\"$1\"; exec /bin/sleep 600")
@@ -891,7 +1028,6 @@ mod tests {
         assert_eq!(old.1, None, "the old reading: unknown");
     }
 
-    /// `hdiutil`'s path.
     #[cfg(target_vendor = "apple")]
     const HDIUTIL: &str = "/usr/bin/hdiutil";
 
@@ -905,10 +1041,8 @@ mod tests {
             .expect("hdiutil detach")
     }
 
-    /// A VOLUME OF THIS TEST'S: a fresh disk image's, attached at a mount
-    /// point — no privilege needed, hidden from the Finder — and detached by
-    /// force when it is dropped still attached, so a failed assertion leaves
-    /// no mount behind.
+    /// A fresh disk image attached at a mount point (no privilege needed, hidden from the
+    /// Finder), detached by force when dropped still attached.
     #[cfg(target_vendor = "apple")]
     struct Volume {
         /// Its device (`/dev/diskN`); empty once detached.
@@ -917,10 +1051,9 @@ mod tests {
 
     #[cfg(target_vendor = "apple")]
     impl Volume {
-        /// A 2 MB HFS+ image created at `image` and attached at `mnt`;
-        /// `None`, after one line on stderr, when macOS's disk-image service
-        /// did not answer (`crate::deadline::disk_image_service_silent`). Not
-        /// `-quiet`: that would hide the `Operation timed out` the judgment reads.
+        /// A 2 MB HFS+ image created at `image` and attached at `mnt`; `None`, after one line on
+        /// stderr, when macOS's disk-image service did not answer. Not `-quiet`: that would hide
+        /// the `Operation timed out` the judgment reads.
         fn attach(image: &std::path::Path, mnt: &std::path::Path) -> Option<Self> {
             use std::process::Stdio;
             let created = std::process::Command::new(HDIUTIL)
@@ -956,8 +1089,7 @@ mod tests {
             })
         }
 
-        /// Detach it by force — what pulling out a disk does to its volume:
-        /// every vnode on it reclaimed under whatever still holds one.
+        /// Detach it by force: every vnode on it is reclaimed under whatever still holds one.
         fn detach_by_force(&mut self) -> std::process::Output {
             let out = detach(&self.dev);
             if out.status.success() {
@@ -976,21 +1108,11 @@ mod tests {
         }
     }
 
-    /// A DEAD WORKING DIRECTORY IS NO WORKING DIRECTORY, and its process is
-    /// still read. A child works at the root of a disk image's volume and
-    /// holds a file elsewhere open; `hdiutil detach -force` unmounts the
-    /// volume from under it — what pulling out a disk does — and the kernel
-    /// reclaims the vnode its working directory is, whose read answers
-    /// `ENOENT` from then on. Scanned for the volume's mount point, the child
-    /// is then no user and not unreadable; scanned for the directory of the
-    /// file it holds, it is a user through that descriptor — read on past
-    /// the dead directory. Before the detach, it used the mount point as its
-    /// working directory. NEGATIVE CONTROL: the same reads, classified as
-    /// before a dead vnode was told apart, make it unreadable — and the disk
-    /// watch kept every gone owner's build directory while it ran. No
-    /// privilege is needed; the volume is detached even when an assertion
-    /// fails, the mount point is its parent's device again after, and the
-    /// child ends at its stdin's EOF.
+    /// A child works at the root of a disk image's volume and holds a file elsewhere open;
+    /// `hdiutil detach -force` reclaims its working directory's vnode (`ENOENT` from then on).
+    /// Scanned for the mount point it is then no user and not unreadable; scanned for the held
+    /// file's directory it is a user through that descriptor. Negative control: with dead
+    /// vnodes read as unknown, it is unreadable.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn a_dead_working_directory_is_no_working_directory() {
@@ -1008,8 +1130,8 @@ mod tests {
             return;
         };
         let mounted = device(&mnt) != device(&base);
-        // At the volume's root, the file on descriptor 3; `cat` ends when this
-        // test's end of its stdin closes, a panic's unwinding among the ways.
+        // At the volume's root, the file on descriptor 3; `cat` ends when this test's end of
+        // its stdin closes, unwinding included.
         let mut child = crate::spawnfd::command("/bin/sh")
             .arg("-c")
             .arg("exec 3<\"$1\"; exec /bin/cat")
@@ -1075,15 +1197,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// A PROCESS WITH NO DESCRIPTOR AT ALL IS READ, and holds nothing: libproc
-    /// answers its empty table with 0 and no `errno` — an answer, not a
-    /// refusal. A test harness's process-group anchor (a Python that
-    /// `closerange`s every descriptor and waits, another session's) once read as
-    /// unreadable, and its every appearance kept every gone owner's build
-    /// directory on the machine. Its working directory is still
-    /// read: from inside the directory it is a user. NEGATIVE CONTROL: a table
-    /// the kernel refuses (launchd's, read because it is named, whatever its
-    /// uid) is still unreadable.
+    /// A process with no descriptor at all is read and holds nothing, and its working directory
+    /// still counts. Negative control: a table the kernel refuses (launchd's, read because it
+    /// is named) is unreadable.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn a_process_with_no_descriptor_is_read_and_holds_nothing() {
@@ -1125,11 +1241,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A PROCESS THAT EXITED AFTER A LISTING NAMED IT USES NOTHING, and is
-    /// never unreadable: every read of it answers `ESRCH` — killed and not
-    /// yet reaped (a zombie the listing still names), reaped, or killed
-    /// between its descriptors' listing and their reads. Each was a user
-    /// first: working in the directory, or holding a file of it open.
+    /// A process that exited after a listing named it (a zombie, reaped, or killed between its
+    /// descriptors' listing and their reads) uses nothing and is never unreadable. Each was a
+    /// user first.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn a_process_that_exited_after_the_listing_uses_nothing() {

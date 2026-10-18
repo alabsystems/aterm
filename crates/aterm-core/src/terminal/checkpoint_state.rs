@@ -360,12 +360,23 @@ pub struct TitleRepr {
     pub icon: String,
     /// The title stack, bottom first, as `(icon name, window title)` pairs —
     /// the engine's own order. An entry pushed for one of the two holds an
-    /// empty string for the other, which a pop leaves alone.
+    /// empty string for the other, read back as a slot that push did not save
+    /// when reading the legacy form without [`Self::stack_saved`].
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "Vec::is_empty")
     )]
     pub stack: Vec<(String, String)>,
+    /// Presence of the icon and window slots in each stack entry, bottom first.
+    /// Emitted only when the stack contains a saved empty title, which the legacy
+    /// string pairs cannot distinguish from an unsaved slot. A missing entry uses
+    /// the legacy rule (a sanitized nonempty string means saved). Older consumers
+    /// can still read `stack`, with their original ambiguity for saved empties.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Vec::is_empty")
+    )]
+    pub stack_saved: Vec<(bool, bool)>,
 }
 
 impl TitleRepr {
@@ -427,6 +438,18 @@ pub struct OutputBlockRepr {
     pub state: u8,
     /// Whether the user collapsed it.
     pub collapsed: bool,
+    /// A full clear blanked rows it reads its text from after its command
+    /// finished (`OutputBlock::text_cleared`). Absent from a predecessor that
+    /// did not record it, and left out when false, so that state re-encodes as
+    /// it was written.
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_false"))]
+    pub text_cleared: bool,
+    /// Its command rows were lost while it was being built: a full clear
+    /// blanked them or a scrollback erase took them
+    /// (`OutputBlock::command_text_cleared`). Absent from a predecessor that
+    /// did not record it, and left out when false, as `text_cleared` is.
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_false"))]
+    pub command_text_cleared: bool,
     /// Rows, times and text.
     pub span: ShellSpanRepr,
 }
@@ -487,6 +510,15 @@ pub struct ShellRepr {
 )]
 fn is_zero_seq(n: &u64) -> bool {
     *n == 0
+}
+
+#[cfg(feature = "serde")]
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if hands the predicate a reference"
+)]
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl ShellRepr {
@@ -550,6 +582,8 @@ impl OutputBlockRepr {
             id: b.id,
             state,
             collapsed: b.collapsed,
+            text_cleared: b.text_cleared,
+            command_text_cleared: b.command_text_cleared,
             span: ShellSpanRepr {
                 prompt_start_row: b.prompt_start_row,
                 prompt_start_col: b.prompt_start_col,
@@ -578,6 +612,8 @@ impl OutputBlockRepr {
             _ => BlockState::Complete,
         };
         b.collapsed = self.collapsed;
+        b.text_cleared = self.text_cleared;
+        b.command_text_cleared = self.command_text_cleared;
         b.command_start_row = s.command_start_row;
         b.command_start_col = s.command_start_col;
         b.output_start_row = s.output_start_row;
@@ -663,10 +699,10 @@ impl Terminal {
     }
 
     /// Apply a carried [`ColorRepr`] over this terminal's configured colours, taking
-    /// the OSC mutation's authority and damage path (and host callback) for the
-    /// restored foreground, background, cursor and palette.
+    /// the OSC mutation's authority and damage path for the restored foreground,
+    /// background, cursor and palette.
     pub(super) fn apply_color_repr(&mut self, repr: &ColorRepr) {
-        use super::{ColorChangeOp, ColorTarget};
+        use super::ColorTarget;
         self.apply_color_overrides(&repr.overrides());
         // A parent that predates `stack_overrides` sent whole entries; they become
         // diffs from this terminal's baseline.
@@ -685,29 +721,33 @@ impl Terminal {
         self.color.stack = stack.into_iter().skip(keep).collect::<VecDeque<_>>();
 
         let (_parser, mut handler) = self.split_for_process();
-        if let Some(fg) = repr.foreground {
-            handler.fire_color_change_callback(ColorTarget::Foreground, fg, ColorChangeOp::Set);
+        if repr.foreground.is_some() {
+            handler.note_color_change(ColorTarget::Foreground);
         }
-        if let Some(bg) = repr.background {
-            handler.fire_color_change_callback(ColorTarget::Background, bg, ColorChangeOp::Set);
+        if repr.background.is_some() {
+            handler.note_color_change(ColorTarget::Background);
         }
-        if let Some(slot) = repr.cursor {
-            let shown = slot.rgb.unwrap_or(handler.color.default_foreground);
-            handler.fire_color_change_callback(ColorTarget::Cursor, shown, ColorChangeOp::Set);
+        if repr.cursor.is_some() {
+            handler.note_color_change(ColorTarget::Cursor);
         }
         if !repr.palette.is_empty() {
-            handler.fire_color_change_callback(
-                ColorTarget::Palette,
-                Rgb { r: 0, g: 0, b: 0 },
-                ColorChangeOp::Set,
-            );
+            handler.note_color_change(ColorTarget::Palette);
         }
     }
 
     /// Project the shell-integration state (see [`ShellRepr`]). Completed marks
-    /// and blocks whose prompt row is older than `oldest_carried_row` name
-    /// lines the carry does not hold, so they are left behind; the in-progress
-    /// mark and block always travel (a running command must still complete).
+    /// and blocks every row of which is older than `oldest_carried_row` name
+    /// only lines the carry does not hold, so they are left behind, oldest
+    /// first up to the first one that names a line it holds: the ids carried
+    /// stay one run, by the rule `forget_erased_history` keeps them by
+    /// ([`super::handler::block_rows_end`]). It goes by the last row each
+    /// names, not its prompt row, which a full clear can move above the
+    /// previous block's (a `clear` moves the rows of the block it caught
+    /// running to the cleared screen's top, and Ctrl-L restarts the prompt
+    /// there). One whose earlier rows the carry does not hold reads them as
+    /// `BlockText::Evicted`, as the live terminal does once the ring evicts
+    /// them. The in-progress mark and block always travel (a running command
+    /// must still complete).
     pub(super) fn capture_shell_repr(&self, oldest_carried_row: u64) -> ShellRepr {
         let s = &self.shell;
         ShellRepr {
@@ -717,14 +757,14 @@ impl Terminal {
             command_marks: s
                 .command_marks
                 .iter()
-                .filter(|m| m.prompt_start_row >= oldest_carried_row)
+                .skip_while(|m| super::handler::mark_rows_end(m) <= oldest_carried_row)
                 .map(ShellSpanRepr::capture_mark)
                 .collect(),
             current_block: s.current_block.as_ref().map(OutputBlockRepr::capture),
             output_blocks: s
                 .output_blocks
                 .iter()
-                .filter(|b| b.prompt_start_row >= oldest_carried_row)
+                .skip_while(|b| super::handler::block_rows_end(b) <= oldest_carried_row)
                 .map(OutputBlockRepr::capture)
                 .collect(),
             next_block_id: s.next_block_id,
@@ -735,6 +775,20 @@ impl Terminal {
 
     /// Project the titles a program set (see [`TitleRepr`]).
     pub(super) fn capture_title_repr(&self) -> TitleRepr {
+        let has_saved_empty = self
+            .title
+            .stack
+            .iter()
+            .any(|(icon, window)| icon.as_deref() == Some("") || window.as_deref() == Some(""));
+        let stack_saved = if has_saved_empty {
+            self.title
+                .stack
+                .iter()
+                .map(|(icon, window)| (icon.is_some(), window.is_some()))
+                .collect()
+        } else {
+            Vec::new()
+        };
         TitleRepr {
             window: self.title.window.to_string(),
             icon: self.title.icon.to_string(),
@@ -742,8 +796,14 @@ impl Terminal {
                 .title
                 .stack
                 .iter()
-                .map(|(icon, window)| (icon.to_string(), window.to_string()))
+                .map(|(icon, window)| {
+                    let wire = |slot: &Option<std::sync::Arc<str>>| {
+                        slot.as_deref().unwrap_or("").to_string()
+                    };
+                    (wire(icon), wire(window))
+                })
                 .collect(),
+            stack_saved,
         }
     }
 
@@ -767,7 +827,20 @@ impl Terminal {
             .stack
             .iter()
             .take(TITLE_STACK_MAX_DEPTH)
-            .map(|(icon, window)| (carried_title(icon).into(), carried_title(window).into()))
+            .enumerate()
+            .map(|(index, (icon, window))| {
+                let saved = repr.stack_saved.get(index);
+                let slot = |s: &str, saved: Option<bool>| {
+                    let s = carried_title(s);
+                    saved
+                        .unwrap_or(!s.is_empty())
+                        .then(|| std::sync::Arc::<str>::from(s))
+                };
+                (
+                    slot(icon, saved.map(|s| s.0)),
+                    slot(window, saved.map(|s| s.1)),
+                )
+            })
             .collect();
     }
 
@@ -800,5 +873,18 @@ impl Terminal {
         s.next_block_id = s.next_block_id.max(repr.next_block_id);
         s.completed_seq = s.completed_seq.max(repr.completed_seq);
         s.started_seq = s.started_seq.max(repr.started_seq);
+        // A held OSC 7 belongs to the previous prompt, not this installed
+        // shell projection. It is never part of a checkpoint's carry.
+        s.held_cwd = None;
+        // Nor is the stored cwd's host: the restore installs the carried cwd,
+        // which this engine's host never qualified. The shell's next OSC 7
+        // names it again.
+        s.cwd_host = None;
+        // The cwd installed beside this projection is the carry's: no report
+        // this engine counted stands behind it (`Terminal::reported_cwd_seq`).
+        s.cwd_carried = true;
+        // Nor is the last D's copy: a block id it names may belong to this
+        // terminal's own blocks rather than the carried ones.
+        s.last_finished = None;
     }
 }

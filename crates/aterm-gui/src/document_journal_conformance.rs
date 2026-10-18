@@ -6,7 +6,8 @@
 #![cfg(test)]
 
 use aterm_buffer::Seq;
-use aterm_spec::derive::{Model, native_draft_journal_model};
+use aterm_models_native::native_draft_journal_model;
+use aterm_spec::derive::Model;
 use aterm_spec::interp::{State, admits};
 
 use crate::conformance_support::assert_transition;
@@ -97,7 +98,7 @@ fn production_serializer_conforms_and_negative_controls_are_rejected() {
         std::env::temp_dir().join(format!("aterm-journal-conformance-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let mut journals = DocumentJournalStore::for_test(root.clone()).unwrap();
-    let mut store = DocumentStore::for_test();
+    let mut store = crate::test_document_store();
     let uri = "file:///tmp/journal-conformance.md";
     let document = store.open(uri.to_string(), "base".to_string());
     let disk = store.snapshot(document).unwrap();

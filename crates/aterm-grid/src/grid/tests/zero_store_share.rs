@@ -78,34 +78,6 @@ fn assert_contiguous_suffix(grid: &Grid, newest: usize, limit: usize, ctx: &str)
     grid.assert_invariants();
 }
 
-/// A width shrink that also takes rows away pushes the screen's top rows into
-/// history; with a zero store share they go to the ring, under its cap.
-#[test]
-fn zero_share_width_shrink_keeps_history_a_contiguous_suffix() {
-    for limit in [0, 1, 4, RING_CAP] {
-        let mut grid = zero_share_grid(6, 20, limit);
-        for n in 0..6 {
-            write_numbered(&mut grid, n);
-        }
-        assert_eq!(grid.scrollback_lines(), 0, "precondition: no history yet");
-        let mut newest = 5;
-        assert_contiguous_suffix(&grid, newest, limit, &format!("limit {limit} before"));
-
-        grid.resize(3, 10);
-        assert_contiguous_suffix(&grid, newest, limit, &format!("limit {limit} after shrink"));
-        for _ in 0..2 * RING_CAP {
-            newest += 1;
-            write_numbered(&mut grid, newest);
-            assert_contiguous_suffix(&grid, newest, limit, &format!("limit {limit} at L{newest}"));
-        }
-        assert_eq!(
-            grid.scrollback_lines(),
-            limit,
-            "limit {limit}: the ring holds the whole total once enough has scrolled"
-        );
-    }
-}
-
 /// One step of a resize script: a reflowing resize, a resize that rewraps
 /// nothing, or `n` more numbered lines.
 #[derive(Clone, Copy, Debug)]

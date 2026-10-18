@@ -34,6 +34,11 @@ pub const VERBS: &[Verb] = &[
         does: "stage, prove, relocate, gate and sign a sysroot bundle (trust, trust-mc)",
     },
     Verb {
+        name: "pack-package",
+        synopsis: artifact::package::SYNOPSIS,
+        does: "pack a prebuilt package tree whole (codex-alab), gate it as a client stages it, and sign it",
+    },
+    Verb {
         name: "build-local",
         synopsis: "build-local <program> <checkout> [--plan] [--policy repository|unverified] [--profile release|dev] [--jobs N] [--toolchain BIN] [--out DIR] [--link]",
         does: "the development build of a program, with no pack or signature",
@@ -45,7 +50,7 @@ pub const VERBS: &[Verb] = &[
     },
     Verb {
         name: "index",
-        synopsis: "index [--baseline QUAD-DIR | --first CHANNEL --index-build N] [--pin P=B]… [--target-pin T:P=B[,…]]… [--yank …] [--unyank …] [--min-build N [--lower-min-build]] [--retire P]… [--retire-target T[:P]]… [--allow-triple-drop P=T --reason …] [--valid-until TS] [--out DIR] [--upload]",
+        synopsis: "index [--baseline QUAD-DIR | --first CHANNEL --index-build N] [--pin P=B]… [--target-pin T:P=B[,…]]… [--yank …] [--unyank …] [--min-build N [--lower-min-build]] [--retire P]… [--retire-target T[:P]]… [--allow-triple-drop P=T --reason …] [--valid-until TS] [--out DIR] [--pack-dir DIR | --upload]",
         does: "publish the next signed index: a typed delta over the verified head",
     },
     Verb {
@@ -109,6 +114,7 @@ pub fn dispatch(ctx: &Ctx, verb: &str, rest: &[String]) -> Result<()> {
     match verb {
         "pack" => artifact::pack::run(ctx, rest),
         "pack-bundle" => artifact::bundle::run(ctx, rest),
+        "pack-package" => artifact::package::run(ctx, rest),
         "build-local" => artifact::build_local::run(ctx, rest),
         "sign" => artifact::sign::run(ctx, rest),
         "index" => channel::index::run(ctx, rest),

@@ -2,8 +2,6 @@ aterm-trust plan 1
 driver /x/Library/Application Support/aterm/pkg/rustup/trust/bin/targo
 driver-id targo 1.99.0-dev (321aaeda7 2026-09-17) (targo 0.1.0)
 only 
-per-commit 0
-scope-file /x/aterm-run/tools/trust-gate-scope.tsv
 logdir /x/aterm-run/target-trust-seal/logs
 ratchet /x/aterm-run/tools/trust-gate-ratchet.tsv
 memory-file /x/aterm-run/tools/trust-gate-memory.tsv

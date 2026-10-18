@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>arr</key>
+	<array>
+		<integer>1</integer>
+		<string>x</string>
+		<true/>
+	</array>
+	<key>data</key>
+	<data>
+	AAEC/w==
+	</data>
+	<key>date</key>
+	<date>2026-10-16T22:40:34Z</date>
+	<key>dict</key>
+	<dict>
+		<key>a</key>
+		<dict>
+			<key>n</key>
+			<array>
+				<real>0.25</real>
+			</array>
+		</dict>
+		<key>b</key>
+		<integer>2</integer>
+	</dict>
+	<key>emptyarr</key>
+	<array/>
+	<key>emptydict</key>
+	<dict/>
+	<key>emptystr</key>
+	<string></string>
+	<key>emptystr2</key>
+	<string></string>
+	<key>f</key>
+	<false/>
+	<key>int</key>
+	<integer>5</integer>
+	<key>neg</key>
+	<integer>-30064771129</integer>
+	<key>real</key>
+	<real>1.5</real>
+	<key>str</key>
+	<string>a &amp; b &lt;c&gt; "q" 's' é ☺</string>
+	<key>t</key>
+	<true/>
+	<key>ws</key>
+	<dict>
+		<key>k</key>
+		<integer>1</integer>
+	</dict>
+</dict>
+</plist>

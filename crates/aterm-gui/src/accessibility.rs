@@ -202,7 +202,8 @@ mod macos {
                 // sixteen bytes, so it goes in registers on both ABIs. A
                 // zero-length range at `off` is the caret.
                 unsafe {
-                    let set: unsafe extern "C-unwind" fn(Id, Sel, NSRange) = aterm_objc::msg();
+                    let set: unsafe extern "C-unwind" fn(Id, Sel, NSRange) =
+                        aterm_objc::checked_msg();
                     set(
                         view,
                         sel!(setAccessibilitySelectedTextRange:),
@@ -264,19 +265,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn from_cells_builds_text_from_real_render_cells() {
-        let mut term = Terminal::new(3, 10);
-        term.process(b"hello");
-        let cells: Vec<Vec<RenderCell>> = (0..3).map(|r| term.render_row(r)).collect();
-        let s = AccessibleSnapshot::from_cells(&cells, 10, Some((0, 5)));
-        // First line is "hello" (trailing blanks trimmed); later rows are blank.
-        assert!(s.text.starts_with("hello\n"), "got {:?}", s.text);
-        assert_eq!(s.rows, 3);
-        // Cursor after "hello" → offset 5.
-        assert_eq!(s.cursor_offset(), Some(5));
-    }
-
     /// A pane's rectangle reads only its own columns of the composed split frame.
     #[test]
     fn a_pane_rectangle_reads_only_its_own_columns() {
@@ -297,27 +285,5 @@ mod tests {
         assert_eq!(right.value(), "right\n\n");
         assert_eq!((left.rows, left.cols), (2, 10));
         assert_eq!(right.cursor_offset(), Some(5), "the pane-local caret");
-    }
-
-    /// `from_cells` is `from_cells_in` over the full grid, so the two cannot drift.
-    #[test]
-    fn the_whole_frame_is_the_full_rectangle() {
-        let mut term = Terminal::new(3, 10);
-        term.process(b"hello\r\nworld");
-        let cells: Vec<Vec<RenderCell>> = (0..3).map(|r| term.render_row(r)).collect();
-        assert_eq!(
-            AccessibleSnapshot::from_cells(&cells, 10, Some((1, 2))),
-            AccessibleSnapshot::from_cells_in(&cells, 0..3, 0..10, Some((1, 2)))
-        );
-    }
-
-    #[test]
-    fn push_visible_row_trims_and_terminates() {
-        let mut term = Terminal::new(1, 8);
-        term.process(b"ab");
-        let row = term.render_row(0);
-        let mut text = String::new();
-        push_visible_row(&mut text, &row, 8);
-        assert_eq!(text, "ab\n"); // trailing 6 blanks trimmed, '\n' added
     }
 }

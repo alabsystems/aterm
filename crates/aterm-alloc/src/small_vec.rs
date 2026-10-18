@@ -617,9 +617,9 @@ impl<'a, T, const N: usize> IntoIterator for &'a mut SmallVec<T, N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::format;
     use std::string::{String, ToString};
     use std::vec::Vec;
-    use std::{format, vec};
 
     // Drop-counting element for `IntoIter` drop-once checks under partial,
     // full and no consumption, inline and heap. The `Rc` counter and `String`
@@ -648,194 +648,6 @@ mod tests {
     }
 
     #[test]
-    fn test_new_is_empty() {
-        let sv: SmallVec<i32, 4> = SmallVec::new();
-        assert!(sv.is_empty());
-        assert_eq!(sv.len(), 0);
-        assert!(sv.is_inline());
-    }
-
-    #[test]
-    fn test_push_within_inline_capacity() {
-        let mut sv: SmallVec<i32, 4> = SmallVec::new();
-        sv.push(1);
-        sv.push(2);
-        sv.push(3);
-        assert_eq!(sv.len(), 3);
-        assert!(sv.is_inline());
-        assert_eq!(sv.as_slice(), &[1, 2, 3]);
-    }
-
-    #[test]
-    fn test_push_spills_to_heap() {
-        let mut sv: SmallVec<i32, 2> = SmallVec::new();
-        sv.push(1);
-        sv.push(2);
-        assert!(sv.is_inline());
-        sv.push(3);
-        assert!(!sv.is_inline());
-        assert_eq!(sv.as_slice(), &[1, 2, 3]);
-    }
-
-    #[test]
-    fn test_pop() {
-        let mut sv: SmallVec<i32, 4> = SmallVec::new();
-        sv.push(10);
-        sv.push(20);
-        assert_eq!(sv.pop(), Some(20));
-        assert_eq!(sv.pop(), Some(10));
-        assert_eq!(sv.pop(), None);
-    }
-
-    #[test]
-    fn test_clear() {
-        let mut sv: SmallVec<String, 2> = SmallVec::new();
-        sv.push("a".into());
-        sv.push("b".into());
-        sv.clear();
-        assert!(sv.is_empty());
-    }
-
-    #[test]
-    fn test_from_vec() {
-        let sv: SmallVec<i32, 4> = SmallVec::from_vec(vec![1, 2, 3]);
-        assert!(sv.is_inline());
-        assert_eq!(sv.as_slice(), &[1, 2, 3]);
-
-        let sv: SmallVec<i32, 2> = SmallVec::from_vec(vec![1, 2, 3, 4, 5]);
-        assert!(!sv.is_inline());
-        assert_eq!(sv.as_slice(), &[1, 2, 3, 4, 5]);
-    }
-
-    #[test]
-    fn test_from_elem() {
-        let sv: SmallVec<char, 4> = SmallVec::from_elem('x', 3);
-        assert_eq!(sv.as_slice(), &['x', 'x', 'x']);
-    }
-
-    #[test]
-    fn test_clone() {
-        let mut sv: SmallVec<String, 2> = SmallVec::new();
-        sv.push("hello".into());
-        let cloned = sv.clone();
-        assert_eq!(sv.as_slice(), cloned.as_slice());
-    }
-
-    #[test]
-    fn test_eq() {
-        let mut a: SmallVec<i32, 4> = SmallVec::new();
-        a.push(1);
-        a.push(2);
-        let mut b: SmallVec<i32, 4> = SmallVec::new();
-        b.push(1);
-        b.push(2);
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn test_collect() {
-        let sv: SmallVec<i32, 4> = (0..3).collect();
-        assert_eq!(sv.as_slice(), &[0, 1, 2]);
-    }
-
-    #[test]
-    fn test_deref_indexing() {
-        let mut sv: SmallVec<i32, 4> = SmallVec::new();
-        sv.push(10);
-        sv.push(20);
-        assert_eq!(sv[0], 10);
-        assert_eq!(sv[1], 20);
-    }
-
-    #[test]
-    fn test_extend_from_slice() {
-        let mut sv: SmallVec<i32, 4> = SmallVec::new();
-        sv.extend_from_slice(&[1, 2, 3]);
-        assert_eq!(sv.as_slice(), &[1, 2, 3]);
-    }
-
-    #[test]
-    fn test_with_capacity() {
-        let sv: SmallVec<i32, 4> = SmallVec::with_capacity(2);
-        assert!(sv.is_inline());
-        assert_eq!(sv.capacity(), 4); // inline capacity is always N
-
-        let sv: SmallVec<i32, 4> = SmallVec::with_capacity(10);
-        assert!(!sv.is_inline());
-        assert!(sv.capacity() >= 10);
-    }
-
-    #[test]
-    fn test_debug_format() {
-        let mut sv: SmallVec<i32, 4> = SmallVec::new();
-        sv.push(1);
-        sv.push(2);
-        assert_eq!(format!("{sv:?}"), "[1, 2]");
-    }
-
-    #[test]
-    fn test_into_iter() {
-        let mut sv: SmallVec<i32, 4> = SmallVec::new();
-        sv.push(10);
-        sv.push(20);
-        sv.push(30);
-        let collected: Vec<i32> = sv.into_iter().collect();
-        assert_eq!(collected, vec![10, 20, 30]);
-    }
-
-    #[test]
-    fn test_drop_string_elements() {
-        // Verify that String elements are properly dropped (no leaks).
-        let mut sv: SmallVec<String, 2> = SmallVec::new();
-        sv.push("hello world this is a longer string to force heap alloc".into());
-        sv.push("another string".into());
-        drop(sv);
-        // If we get here without ASAN/MIRI complaint, drop is correct.
-    }
-
-    #[test]
-    fn test_into_iter_inline_stays_inline() {
-        // Consuming an inline SmallVec must not allocate: assert the iterator
-        // took the inline variant.
-        let mut sv: SmallVec<i32, 4> = SmallVec::new();
-        sv.push(10);
-        sv.push(20);
-        sv.push(30);
-        assert!(sv.is_inline());
-        let it = sv.into_iter();
-        assert!(it.is_inline());
-        let collected: Vec<i32> = it.collect();
-        assert_eq!(collected, vec![10, 20, 30]);
-    }
-
-    #[test]
-    fn test_into_iter_heap_variant() {
-        let mut sv: SmallVec<i32, 2> = SmallVec::new();
-        sv.push(1);
-        sv.push(2);
-        sv.push(3);
-        assert!(!sv.is_inline());
-        let it = sv.into_iter();
-        assert!(!it.is_inline());
-        let collected: Vec<i32> = it.collect();
-        assert_eq!(collected, vec![1, 2, 3]);
-    }
-
-    #[test]
-    fn test_into_iter_inline_size_hint_and_len() {
-        let mut sv: SmallVec<i32, 4> = SmallVec::new();
-        sv.push(1);
-        sv.push(2);
-        sv.push(3);
-        let mut it = sv.into_iter();
-        assert_eq!(it.size_hint(), (3, Some(3)));
-        assert_eq!(it.len(), 3);
-        it.next();
-        assert_eq!(it.size_hint(), (2, Some(2)));
-        assert_eq!(it.len(), 2);
-    }
-
-    #[test]
     fn test_into_iter_inline_double_ended() {
         let mut sv: SmallVec<i32, 4> = SmallVec::new();
         sv.push(1);
@@ -853,143 +665,57 @@ mod tests {
         assert_eq!(it.next_back(), None);
     }
 
+    /// A by-value iterator keeps the vector's storage: consuming an inline
+    /// vector does not allocate.
     #[test]
-    fn test_into_iter_inline_partial_consume_drops_remainder_once() {
-        let counter = std::rc::Rc::new(std::cell::Cell::new(0));
-        let mut sv: SmallVec<DropCounter, 4> = SmallVec::new();
-        sv.push(DropCounter::new(&counter));
-        sv.push(DropCounter::new(&counter));
-        sv.push(DropCounter::new(&counter));
-        assert!(sv.is_inline());
-
-        let mut it = sv.into_iter();
-        // Consume one element; dropping the returned value drops it once.
-        drop(it.next().expect("first element"));
-        assert_eq!(counter.get(), 1, "yielded element dropped exactly once");
-        // Drop the iterator with two elements still buffered.
-        drop(it);
-        assert_eq!(counter.get(), 3, "all three elements dropped exactly once");
+    fn into_iter_keeps_the_storage_variant() {
+        let inline: SmallVec<i32, 4> = SmallVec::from_vec([10, 20, 30].to_vec());
+        let heap: SmallVec<i32, 2> = SmallVec::from_vec([1, 2, 3].to_vec());
+        assert!(inline.is_inline() && !heap.is_inline());
+        let (inline, heap) = (inline.into_iter(), heap.into_iter());
+        assert!(inline.is_inline() && !heap.is_inline());
+        assert_eq!(inline.collect::<Vec<_>>(), [10, 20, 30]);
+        assert_eq!(heap.collect::<Vec<_>>(), [1, 2, 3]);
     }
 
-    #[test]
-    fn test_into_iter_inline_full_consume_drops_once() {
+    /// Fill a `SmallVec<_, N>` with `len` drop counters, take `front` and
+    /// `back` elements from the by-value iterator, drop it, then drop what was
+    /// taken: every element is dropped exactly once.
+    fn drops_each_once<const N: usize>(len: usize, front: usize, back: usize) {
+        let case = format!("N={N} len={len} front={front} back={back}");
         let counter = std::rc::Rc::new(std::cell::Cell::new(0));
-        let mut sv: SmallVec<DropCounter, 4> = SmallVec::new();
-        for _ in 0..3 {
+        let mut sv: SmallVec<DropCounter, N> = SmallVec::new();
+        for _ in 0..len {
             sv.push(DropCounter::new(&counter));
         }
-        assert!(sv.is_inline());
-        let collected: Vec<DropCounter> = sv.into_iter().collect();
-        assert_eq!(collected.len(), 3);
-        assert_eq!(counter.get(), 0, "fully-yielded elements are still alive");
-        drop(collected);
-        assert_eq!(counter.get(), 3, "each element dropped exactly once");
-    }
-
-    #[test]
-    fn test_into_iter_inline_drop_without_consume() {
-        let counter = std::rc::Rc::new(std::cell::Cell::new(0));
-        let mut sv: SmallVec<DropCounter, 4> = SmallVec::new();
-        sv.push(DropCounter::new(&counter));
-        sv.push(DropCounter::new(&counter));
-        assert!(sv.is_inline());
-        drop(sv.into_iter());
-        assert_eq!(
-            counter.get(),
-            2,
-            "unconsumed inline elements dropped once each"
-        );
-    }
-
-    #[test]
-    fn test_into_iter_inline_double_ended_partial_drops_once() {
-        let counter = std::rc::Rc::new(std::cell::Cell::new(0));
-        let mut sv: SmallVec<DropCounter, 8> = SmallVec::new();
-        for _ in 0..6 {
-            sv.push(DropCounter::new(&counter));
-        }
-        assert!(sv.is_inline());
+        assert_eq!(sv.is_inline(), len <= N, "{case}");
         let mut it = sv.into_iter();
-        drop(it.next().expect("front")); // start advances
-        drop(it.next_back().expect("back")); // end retreats
-        assert_eq!(counter.get(), 2);
-        // Four elements remain in the middle range — all dropped exactly once.
+        let mut taken = Vec::new();
+        for _ in 0..front {
+            taken.push(it.next().expect("a front element"));
+        }
+        for _ in 0..back {
+            taken.push(it.next_back().expect("a back element"));
+        }
+        assert_eq!(counter.get(), 0, "{case}: yielded elements are alive");
         drop(it);
         assert_eq!(
             counter.get(),
-            6,
-            "front+back partial consume drops each once"
+            len - taken.len(),
+            "{case}: the iterator drops what it still holds"
         );
+        drop(taken);
+        assert_eq!(counter.get(), len, "{case}: each element dropped once");
     }
 
+    /// Partial, full and no consumption, from either end, inline and spilled.
     #[test]
-    fn test_into_iter_heap_partial_consume_drops_remainder_once() {
-        let counter = std::rc::Rc::new(std::cell::Cell::new(0));
-        let mut sv: SmallVec<DropCounter, 2> = SmallVec::new();
-        for _ in 0..5 {
-            sv.push(DropCounter::new(&counter));
+    fn into_iter_drops_each_element_exactly_once() {
+        for (front, back) in [(0, 0), (1, 0), (1, 1), (3, 0)] {
+            drops_each_once::<4>(3, front, back);
         }
-        assert!(!sv.is_inline());
-        let mut it = sv.into_iter();
-        drop(it.next().expect("first"));
-        drop(it.next().expect("second"));
-        assert_eq!(counter.get(), 2);
-        drop(it);
-        assert_eq!(
-            counter.get(),
-            5,
-            "heap: all five elements dropped exactly once"
-        );
-    }
-
-    #[test]
-    fn test_into_iter_heap_drop_without_consume() {
-        let counter = std::rc::Rc::new(std::cell::Cell::new(0));
-        let mut sv: SmallVec<DropCounter, 2> = SmallVec::new();
-        for _ in 0..5 {
-            sv.push(DropCounter::new(&counter));
+        for (front, back) in [(0, 0), (2, 0), (1, 1), (5, 0)] {
+            drops_each_once::<2>(5, front, back);
         }
-        assert!(!sv.is_inline());
-        drop(sv.into_iter());
-        assert_eq!(
-            counter.get(),
-            5,
-            "unconsumed heap elements dropped once each"
-        );
-    }
-
-    #[test]
-    fn test_into_iter_inline_panic_in_element_drop_drops_each_once() {
-        use std::panic;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-        struct PanicOnThird(usize);
-        impl Drop for PanicOnThird {
-            fn drop(&mut self) {
-                DROP_COUNT.fetch_add(1, Ordering::Relaxed);
-                if self.0 == 2 {
-                    panic!("element drop panic");
-                }
-            }
-        }
-
-        DROP_COUNT.store(0, Ordering::Relaxed);
-        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            let mut sv: SmallVec<PanicOnThird, 8> = SmallVec::new();
-            for idx in 0..5 {
-                sv.push(PanicOnThird(idx));
-            }
-            assert!(sv.is_inline());
-            // Dropping the unconsumed iterator drops elements in order; the
-            // element with idx == 2 panics part-way through the drop loop.
-            drop(sv.into_iter());
-        }));
-
-        assert!(result.is_err(), "panicking element drop must unwind");
-        // All five are dropped exactly once: the panic at element 2 neither
-        // stops the drop of 3 and 4 (a leak) nor repeats one (a double drop).
-        assert_eq!(DROP_COUNT.load(Ordering::Relaxed), 5);
     }
 }

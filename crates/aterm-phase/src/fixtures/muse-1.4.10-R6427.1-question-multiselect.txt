@@ -1,0 +1,35 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab) · the stub's call `muse.request_user_input` with ONE multi-select question (`selection: {mode: multiple, min_selections: 1, max_selections: 2}`, three options, the first `(Recommended)`): before any key — each option a `[ ]` box, `None of the above` one too, then `5. Submit answer (0 checked)`, and the key row `Enter to toggle · Submit row to continue · …` · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+  Muse Code 1.4.10
+
+❯ carry on with the task
+
+◆ Hi! I am the local lab stub, not a model. (reply 1)
+
+❯ toolstart
+
+  Structured user input answered — Color: None of the above (note: the policy text goes here); Size: Large
+
+◆ Tool call done. Result: {"status":"answered","answers":[{"id":"color","free_text":"None of the above","note":"the policy text goes
+  here"},{"id":"size","selected_label":"Large"}]}
+
+◆ Worked for 1m 36s · 6:15 PM · 16/Oct
+
+❯ toolstart
+
+◈ Request user input Checks — running (11s)
+
+  Which checks should the probe run?
+
+  ⟩ 1. [ ] Lint (Recommended)  Fast and cheap.
+    2. [ ] Tests               Slow but sure.
+    3. [ ] Bench               Measures speed.
+    4. [ ] None of the above   Optionally, add details in notes (tab).
+    5. Submit answer (0 checked)
+
+  Enter to toggle · Submit row to continue · ↑/↓ to move · Tab for an optional note · Esc to interrupt
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  lab-stub · high · /private/tmp/at.lab0/proj · Auto-review

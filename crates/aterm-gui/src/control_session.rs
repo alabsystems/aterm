@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use aterm_control::host::SessionPlacement;
 use aterm_core::terminal::Terminal;
-use aterm_session::{ConnectionKind, EdgeToken, Op, SessionId};
+use aterm_session::{ConnectionKind, EdgeTable, EdgeToken, Op, SessionId};
 use winit::event_loop::EventLoopProxy;
 
 use super::{Scope, json_ok, json_str_field, pct_encode};
@@ -21,7 +21,7 @@ use crate::input::InputEvent;
 use crate::session_edge_audit::{self, EdgeAction};
 use crate::session_store::{ExitActor, SessionHandle, SessionState, Store};
 use crate::session_timeline::{
-    AUTOPILOT_USAGE, MetaEdit, MetaField, MetaWriteError, QUESTIONS_USAGE, apply_meta_value,
+    AUTOPILOT_USAGE, MetaEdit, MetaField, MetaWriteError, apply_meta_value, questions_usage,
     write_session_meta,
 };
 use crate::{SessionCtx, term_lock};
@@ -393,15 +393,21 @@ pub(crate) fn sessions_lines(
         // the carried mark — and the owner's columns after `autopilot=`
         // (`path_evidence= copy= upgrade=`, gap audit 2026-09-24), which
         // `land_at= task=` follow.
-        let (agent, (path, owner), supervised_agent, face) = {
+        let (agent, (path, owner), (supervised_agent, group), face) = {
             let timeline = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             (
                 timeline.agent().wire_fields(),
                 timeline.owner_columns(frozen_path(h.local_id), crate::upgrade_host::now_s()),
-                crate::harness_host::agent_of(timeline.agent()),
+                (
+                    crate::harness_host::agent_of(timeline.agent()),
+                    timeline.agent().program_pgid,
+                ),
                 timeline.task_face().map(|(face, _)| face),
             )
         };
+        // The agent the host admits (never a vendor `codex`, whose `autopilot=`
+        // is `-`), read after the timeline's leaf lock.
+        let supervised_agent = crate::harness_host::admitted_as(&h.ctx, supervised_agent, group);
         let autopilot = crate::autopilot::wire_field(posture, word, supervised_agent);
         // `land_at= task=` (design §9.3.5, §9.4.1), appended last: a timed
         // Cruise's instant and the task's face for an agent session, from
@@ -545,12 +551,14 @@ fn lease_status(ctx: &SessionCtx) -> String {
             holder,
             expires_us,
             hard,
+            holder_pid,
             ..
         }) if *expires_us > now => {
             format!(
-                "OK lease holder={holder} expires_in_ms={}{}\n",
+                "OK lease holder={holder} expires_in_ms={}{}{}\n",
                 (*expires_us - now) / 1000,
-                if *hard { " hard=1" } else { "" }
+                if *hard { " hard=1" } else { "" },
+                holder_pid.map_or_else(String::new, |pid| format!(" pid={pid}"))
             )
         }
         _ => "OK lease none\n".to_string(),
@@ -612,6 +620,10 @@ fn lease_acquire<'a>(ctx: &SessionCtx, args: impl Iterator<Item = &'a str>) -> S
         expires_us: now + ttl_ms.saturating_mul(1000),
         conn: super::serving_connection(),
         hard,
+        // Who took it, as the kernel says: read now, while this connection's
+        // own request is served (Darwin's `LOCAL_PEERPID` names its last
+        // writer). Never the `holder=` text.
+        holder_pid: super::serving_peer_pid(),
     });
     drop(lease);
     // The presence rim follows the lease (round 19): one wake per change of hand.
@@ -1092,8 +1104,8 @@ pub(crate) fn cmd_ready(
 ///
 /// This is the L1 exposure of the core primitive. The CORRECTNESS — no-silent-
 /// loss for content/match/block, and a deterministic idle deadline — lives in the
-/// kernel (`observe_at` at the `post_process` seam, model-checked by
-/// `watcher_latch_model` / `idle_deadline_model`). This verb only *waits*, and it
+/// kernel (`observe_at` at the `post_process` seam; the deadline is
+/// model-checked by `idle_deadline_model`). This verb only *waits*, and it
 /// is **event-driven**: it registers a subscriber and parks on its wake, so it
 /// sleeps until a REAL event arrives —
 ///   * an output burst   (`Wake::Output` → `Subscribers::notify`) for content/
@@ -1124,7 +1136,8 @@ pub(crate) fn cmd_await(
 
     const USAGE: &str = "ERR usage: await <idle <ms>|seq [<n>]|match <re> [rows <a> <b>]|\
                          gone <re> [rows <a> <b>]|block|inbox since=<id> [kinds=<k,...>]|\
-                         agent <word>[,<word>...]> \
+                         agent <word>[,<word>...]|log need|open=<lvl>|close=<lvl>|kind=<k> \
+                         [since=<seq> ep=<e>]> \
                          [timeout <ms>] | await consent [kind=debugger] [timeout=<ms>] | await momentum <floor 0..=1> [timeout <ms>]\n";
 
     // Split off an optional `timeout <ms>` anywhere in the args; the rest is the
@@ -1174,6 +1187,16 @@ pub(crate) fn cmd_await(
             return USAGE.to_string();
         };
         return await_agent(store, session, ctx, &words, timeout_ms, subscribers);
+    }
+
+    // `await log need|open=<lvl>|close=<lvl>|kind=<k> [since=<seq> ep=<e>]` parks on
+    // the SESSION LOG (phase 3A), woken by every producer's notify (no watcher
+    // armed, no terminal lock taken).
+    if kind == "log" {
+        return match crate::session_log::LogAwait::parse(&args[1..]) {
+            Ok(wait) => await_log(store, session, ctx, wait, timeout_ms, subscribers),
+            Err(usage) => usage.to_string(),
+        };
     }
 
     let now0 = Instant::now();
@@ -1430,6 +1453,124 @@ fn await_agent(
     }
 }
 
+/// `await log` (phase 3A, design §7.2; ruling R2): answer the first record past
+/// the cursor that satisfies the wait — `OK seq=<n> ep=<e>[ gap=<why>:<lost>]
+/// <record>` — or a gap with no match (`OK gap why= lost= resync_to= ep=`, whose
+/// `resync_to` a wait re-armed there reads past), `OK timeout` at the deadline,
+/// `ERR exited` once the session ended and its close record is read. With no
+/// `since=`, `need` latches on the observed needs the fold holds open and every
+/// other wait starts at the head. Parks on the session's subscriber slot, which
+/// every session-log producer notifies (`take_log_wake`): no poll. The waiter
+/// holds the session's `ctx`, so it reads the closed session's own log after the
+/// store forgot it. Each check takes the timeline's leaf lock alone.
+///
+/// A SHELL THAT EXITED ON ITS OWN is `Exited` at once (`exit_session_logical`)
+/// but its log's close (`close - spawn out=shell-exit code=`) is written by the
+/// retire's deregister, which comes after and wakes this waiter. So once the
+/// session ended, the waiter takes ONE LOOK under the timeline's lock
+/// (`SessionLog::await_look`): the log past the cursor and whether the close is
+/// still due. The exit path sets that before `Exited`; the close clears it, and
+/// so does the end of the exit handling, which wakes the waiters (for an exit
+/// an update handoff deferred, the end of the attempt's replay).
+/// While it is due the waiter parks on for that close rather than answer `ERR
+/// exited` over the record the wait asked for; otherwise it answers at once —
+/// the close is already in what it read, or none is coming (a kept pane, a
+/// held pane restored across an update). No second read follows the look, so
+/// a retire landing after it cannot slip between two of them.
+fn await_log(
+    store: &Store,
+    session: u64,
+    ctx: &SessionCtx,
+    wait: crate::session_log::LogAwait,
+    timeout_ms: u64,
+    subscribers: &crate::subscribe::Subscribers,
+) -> String {
+    await_log_seamed(store, session, ctx, wait, timeout_ms, subscribers, || {})
+}
+
+/// [`await_log`], running `after_look` the instant after each look it takes
+/// at an ended session and before it decides (production passes nothing):
+/// the seam a test lands a retire on, to pin that the look is the waiter's
+/// only observation.
+pub(crate) fn await_log_seamed(
+    store: &Store,
+    session: u64,
+    ctx: &SessionCtx,
+    wait: crate::session_log::LogAwait,
+    timeout_ms: u64,
+    subscribers: &crate::subscribe::Subscribers,
+    mut after_look: impl FnMut(),
+) -> String {
+    use std::time::{Duration, Instant};
+
+    use crate::session_log::LogAwaitStep;
+    use crate::subscribe::SubscriberSet;
+
+    let overall = Instant::now() + Duration::from_millis(timeout_ms);
+    let sub = SubscriberSet::register(subscribers, &[session]);
+    let exited = exit_probe(store, session);
+    let mut cursor = match wait.since {
+        Some(since) => since,
+        None => match ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .slog()
+            .await_start(wait.what)
+        {
+            LogAwaitStep::Answer(reply) => return reply,
+            LogAwaitStep::Wait(head) => head,
+        },
+    };
+    let check = |cursor: aterm_slog::Cursor| {
+        ctx.timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .slog()
+            .await_check(wait.what, cursor)
+    };
+    loop {
+        match check(cursor) {
+            LogAwaitStep::Answer(reply) => return reply,
+            LogAwaitStep::Wait(next) => cursor = next,
+        }
+        if exited(store) {
+            // ONE LOOK (`SessionLog::await_look`): the close and the flag it
+            // clears are written in one hold of the timeline's lock, and the
+            // look reads both in one, so a look that finds the close not due
+            // has the close in what it read, if it was ever written.
+            let (step, due) = ctx
+                .timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .slog()
+                .await_look(wait.what, cursor);
+            after_look();
+            match step {
+                LogAwaitStep::Answer(reply) => return reply,
+                LogAwaitStep::Wait(next) => cursor = next,
+            }
+            // Due: the retire (or the end of the exit handling) wakes this
+            // waiter, its notify latched since it registered.
+            if !due {
+                return "ERR exited\n".to_string();
+            }
+        }
+        if crate::control::caller_hung_up() {
+            return crate::control::HUNG_UP_REPLY.to_string();
+        }
+        let now = Instant::now();
+        if now >= overall {
+            return "OK timeout\n".to_string();
+        }
+        let _ = sub.wait(crate::control::hangup_park(
+            overall
+                .saturating_duration_since(now)
+                .max(Duration::from_millis(1)),
+        ));
+    }
+}
+
 /// Process-wide `turn` id mint: every turn gets a unique id, reported on the
 /// reply status line (`id=<n>`) and named by the lease's `ERR busy turn=<n>` so
 /// a refused writer can tell WHICH exchange it collided with. It holds the last
@@ -1524,7 +1665,7 @@ pub(crate) struct TurnIo<'a> {
     /// semantics (control bytes stripped by `format_paste`; bracketed-paste
     /// framing only when the app itself enabled the mode).
     /// `false` means the bounded egress did not accept the complete paste; the
-    /// turn stops before submit and the durable operator marks its intent in-doubt.
+    /// turn stops before submit.
     pub paste: &'a dyn Fn(&str) -> bool,
     /// Press a named key (the `key` verb vocabulary, e.g. "enter"). `false`
     /// means the name did not parse — reported as a usage error.
@@ -1546,12 +1687,23 @@ pub(crate) struct TurnIo<'a> {
     /// WHO is driving: the session the connection's edge token was granted to
     /// (`EdgeTable::src_of` on the resolved target's table — the one that
     /// authorized this request), or `None` for an Owner-class caller (the
-    /// per-instance token, the bridge) and the embedded operator, none of
-    /// which is a session. Recorded in [`crate::Lease::Turn`] for the length
-    /// of the turn; the presence band's hand slot and `status hand=` name the
+    /// per-instance token, the bridge), neither of which is a session. Recorded
+    /// in [`crate::Lease::Turn`] for the length of the turn; the presence band's hand slot and `status hand=` name the
     /// driver from it. Resolved by the dispatch site like the routes above,
     /// because only the dispatch has the scope.
     pub driver: Option<aterm_session::SessionId>,
+    /// THE SESSION LOG'S `by=` for the turn this exchange opens: the
+    /// connection's ([`log_actor`]: `harness`, `ctl`, `bridge`, an edge's
+    /// minted sid, else `-`), never a parameter. Resolved by the dispatch,
+    /// which has the scope; `ctl` for the routes with no connection (the
+    /// keyed replay path).
+    pub actor: aterm_slog::Actor,
+    /// A leading `cause=` the dispatch took and checked (phase 3A): the
+    /// turn this exchange opens names it. `cmd_turn` takes one among its own
+    /// options too, and refuses a second.
+    pub cause: Option<aterm_slog::ShortId>,
+    /// Shared receipt observer for the actual production routes; bool alone is not byte evidence.
+    pub mark: Option<&'a crate::control_input_ack::InputMark>,
 }
 
 /// The end of turn `id`'s INPUT: its lease stops saying the driver may type
@@ -1582,9 +1734,10 @@ pub(crate) fn end_turn_input(
 
 impl TurnIo<'static> {
     /// The two routes a plain `turn` needs and none of the even-hand ones: a
-    /// base for `..TurnIo::paste_only()` at a site that pastes and presses only
-    /// (the durable operator, the keyed replay path). `typed=1` and `yield=`
-    /// against it answer `ERR`, never a silent downgrade to a paste.
+    /// base for `..TurnIo::paste_only()` at a test site that pastes and presses
+    /// only. `typed=1` and `yield=` against it answer `ERR`, never a silent
+    /// downgrade to a paste.
+    #[cfg(test)]
     pub(crate) fn paste_only() -> Self {
         fn no_paste(_: &str) -> bool {
             false
@@ -1601,6 +1754,9 @@ impl TurnIo<'static> {
             key: &no_key,
             momentum: &no_momentum,
             driver: None,
+            actor: aterm_slog::Actor::Ctl,
+            cause: None,
+            mark: None,
         }
     }
 }
@@ -2285,6 +2441,330 @@ pub(crate) fn cmd_await_momentum(
     }
 }
 
+/// What one `submit=guarded:<re>` press decided.
+enum GuardedSubmit {
+    /// The guard matched and Enter was written in full.
+    Pressed,
+    /// The cursor's row did not match the guard: nothing was written.
+    Missed,
+    /// The write itself failed — the verb's reply, already worded.
+    Failed(String),
+}
+
+/// One guarded submit press: Enter, only while the CURSOR's row matches
+/// `guard`, through [`super::control_input::input_if_fenced_observed`] (check and write
+/// under one terminal lock hold, the immediate non-parking write). The cursor
+/// row, not any row: Claude Code draws every earlier prompt in its transcript
+/// with the composer's `❯` at column 0, so an any-row `^❯` still matched with
+/// an approval box up and its Enter chose the focused `❯ 1. Yes` (measured live
+/// on a private headless aterm). A composer holds the cursor; the box does not.
+/// A sink that takes zero bytes right now (the typed text's own paste still
+/// draining ahead of it) is retried every few milliseconds until `window` — the
+/// press has not happened yet, so a retry cannot double it; the guard is asked
+/// again each time.
+///
+/// ORDERING, stated rather than enforced: the text went through the App input
+/// seam (`PasteFraming::AtDrain`) and this Enter goes straight to the target's
+/// sink on the control thread. It follows the text because the caller presses
+/// only after the echo settled (the text was on screen, so its bytes were
+/// written), and because the immediate write refuses — `BusyZero`, retried
+/// here — while any spilled frame is still queued ahead of it. The one gap is
+/// the echo CAP: a target that never goes echo-quiet within it is pressed
+/// anyway, and if the seam had not yet written the text by then, this Enter
+/// would precede it. The guard still decides on the live screen either way.
+fn guarded_submit(
+    term: &Arc<Mutex<Terminal>>,
+    ctx: &SessionCtx,
+    guard: &dyn aterm_core::terminal::RowMatch,
+    window: std::time::Instant,
+    mark: Option<&crate::control_input_ack::InputMark>,
+) -> GuardedSubmit {
+    use super::control_input::GuardedInput;
+    use crate::input::Delivery;
+    const BUSY_RETRY: std::time::Duration = std::time::Duration::from_millis(5);
+    loop {
+        let Some(enter) = crate::control::parse_key("enter") else {
+            return GuardedSubmit::Failed("ERR internal: `enter` did not parse\n".to_string());
+        };
+        let fence = super::control_input::InputFence {
+            guard: Some(guard),
+            guard_at_cursor: true,
+            ..super::control_input::InputFence::default()
+        };
+        match super::control_input::input_if_fenced_observed(
+            term,
+            ctx,
+            enter,
+            &fence,
+            mark.map(|m| m.completion()),
+        ) {
+            GuardedInput::Pressed(Delivery::Full) => {
+                return GuardedSubmit::Pressed;
+            }
+            GuardedInput::Skipped | GuardedInput::Changed | GuardedInput::Person => {
+                return GuardedSubmit::Missed;
+            }
+            GuardedInput::Pressed(Delivery::BusyZero) if std::time::Instant::now() < window => {
+                std::thread::sleep(BUSY_RETRY);
+            }
+            decision @ GuardedInput::Pressed(_) => {
+                return GuardedSubmit::Failed(super::control_input::guarded_input_reply(decision));
+            }
+        }
+    }
+}
+
+/// `turn`'s usage line.
+pub(crate) const TURN_USAGE: &str = "ERR usage: turn [idle=<ms>] [timeout=<ms>] [submit=<key|none|guarded:<re>>] [settle=match:<re>|gone:<re>] [submit_window=<ms>] [presses=<n>] [submit_verify=<auto|seq|block>] [trim=<0|1>] [typed=<0|1>] [cadence=<ms>] [cap=<n>] [yield=<floor>] [if-gen=<epoch>.<seq>] [if-rows=<first>-<last>:<hex16>] [cause=@<off>|<seq>] <text>\n";
+
+/// `turn`'s options as parsed ([`turn_options`]): every leading `k=v`, and the
+/// message after them, verbatim.
+pub(crate) struct TurnOptions<'a> {
+    idle_ms: u64,
+    timeout_ms: u64,
+    submit: String,
+    submit_guard: Option<String>,
+    submit_window_ms: u64,
+    presses: u32,
+    submit_verify: Option<bool>,
+    settle_match: Option<(bool, String)>,
+    trim: bool,
+    typed: bool,
+    cadence_ms: u64,
+    typed_cap: usize,
+    yield_floor: Option<f32>,
+    if_gen: Option<crate::control::ScreenGen>,
+    if_rows: Option<aterm_types::control_verbs::RowsFence>,
+    /// A `cause=` among the options, unchecked ([`turn_preflight`] checks it).
+    pub(crate) cause: Option<crate::session_log::CauseRef>,
+    text: &'a str,
+}
+
+/// PARSE `turn`'s options (pure: no lock, no session): the leading `k=v`
+/// options, the message after them verbatim, and every refusal of their shape
+/// — a bad value, a repeated `cause=`, a turn with no text that still submits.
+/// Shared by [`cmd_turn`] and [`turn_preflight`], so the dispatch's
+/// check before the exactly-once claim and the turn itself read one grammar.
+///
+/// # Errors
+///
+/// The reply: [`TURN_USAGE`], or `cause=`'s own usage.
+pub(crate) fn turn_options(rest: &str) -> Result<TurnOptions<'_>, String> {
+    const USAGE: &str = TURN_USAGE;
+    // ── grammar: leading k=v options, the remainder verbatim is the message ──
+    let mut idle_ms = 1_500u64;
+    let mut timeout_ms = 240_000u64;
+    let mut submit = "enter".to_string();
+    // `submit=guarded:<re>`: the submit is Enter, pressed only while the
+    // cursor's row still matches `<re>` — checked and written under one
+    // terminal lock hold (`control_input::input_if_fenced`). None => an
+    // ordinary press.
+    let mut submit_guard: Option<String> = None;
+    // Submit-verification knobs: `submit_window` is how long one press has to move
+    // `content_seq` before a re-press; `presses` is the max total presses.
+    // `presses=1` disables re-press for slow/high-latency links where a duplicate
+    // Enter would be harmful (e.g. auto-confirming a following prompt).
+    let mut submit_window_ms = 2_000u64;
+    let mut presses = 3u32;
+    // `submit_verify` chooses the submit-verification signal. `block` verifies the
+    // submit against the OSC-133 command-start transition (ambient-repaint-immune);
+    // `seq` uses a bare `content_seq` advance. DEFAULT (None) is AUTO: `block` when
+    // the target is at a shell prompt (a submit will start a command — the sound
+    // choice), else `seq` (a TUI or no shell integration has no press-attributable
+    // signal, so seq is the best available). So a shell drive is sound by default.
+    let mut submit_verify: Option<bool> = None;
+    // `settle=match:<re>` keys phase-3 settle on a screen PATTERN instead of global
+    // idle, `settle=gone:<re>` on that pattern LEAVING the screen (the `gone` flag);
+    // None => the default idle settle. Compiled below, before any input.
+    let mut settle_match: Option<(bool, String)> = None;
+    // `trim=1` drops the settled screen's trailing blank rows from the reply (the
+    // `text trim` rule); off by default so a script that counts rows sees the grid.
+    let mut trim = false;
+    // THE EVEN HAND: `typed=1` presses one key per grapheme at `cadence=` ms
+    // (absolute schedule); `yield=<floor>` parks before typing until the
+    // target's typing momentum has exhaled to the floor.
+    let mut typed = false;
+    let mut cadence_ms = TYPED_CADENCE_MS;
+    let mut typed_cap = TYPED_CAP;
+    let mut yield_floor: Option<f32> = None;
+    // `if-gen=<epoch>.<seq>`: type only while the screen is still the
+    // generation the caller judged — checked after the yield, immediately
+    // before the paste. None => no precondition.
+    let mut if_gen: Option<crate::control::ScreenGen> = None;
+    // `if-rows=<first>-<last>:<hex16>`: the NARROW fence — type only while
+    // those rows still hash to the value (a spinner or a timer elsewhere may
+    // move). Checked with `if-gen=`, under the same lock hold.
+    let mut if_rows: Option<aterm_types::control_verbs::RowsFence> = None;
+    // `cause=@<off>|<seq>` (phase 3A, ruling R6): in any position among the
+    // options, once (with a leading one too, the dispatch refuses the pair),
+    // checked against what this session holds before any byte is typed.
+    let mut cause_opt: Option<crate::session_log::CauseRef> = None;
+    let mut text = rest.trim_start();
+    loop {
+        let (tok, tail) = match text.split_once(char::is_whitespace) {
+            Some((t, rest)) => (t, rest.trim_start()),
+            None => (text, ""),
+        };
+        if tok == "--" {
+            text = tail;
+            break;
+        }
+        let Some((k, v)) = tok.split_once('=') else {
+            break;
+        };
+        match k {
+            "idle" => match v.parse::<u64>() {
+                Ok(ms) => idle_ms = ms.clamp(1, 600_000),
+                Err(_) => return Err(USAGE.to_string()),
+            },
+            "timeout" => match v.parse::<u64>() {
+                Ok(ms) => timeout_ms = ms,
+                Err(_) => return Err(USAGE.to_string()),
+            },
+            "submit" => match v.strip_prefix("guarded:") {
+                Some("") => return Err(USAGE.to_string()),
+                Some(pat) => {
+                    submit = "enter".to_string();
+                    submit_guard = Some(pat.to_string());
+                }
+                None => {
+                    submit = v.to_string();
+                    submit_guard = None;
+                }
+            },
+            "submit_window" => match v.parse::<u64>() {
+                Ok(ms) => submit_window_ms = ms.clamp(1, 600_000),
+                Err(_) => return Err(USAGE.to_string()),
+            },
+            "presses" => match v.parse::<u32>() {
+                Ok(n) if n >= 1 => presses = n.min(10),
+                _ => return Err(USAGE.to_string()),
+            },
+            "submit_verify" => match v {
+                "seq" => submit_verify = Some(false),
+                "block" => submit_verify = Some(true),
+                "auto" => submit_verify = None,
+                _ => return Err(USAGE.to_string()),
+            },
+            "settle" => match v.split_once(':') {
+                Some(("match", pat)) if !pat.is_empty() => {
+                    settle_match = Some((false, pat.to_string()));
+                }
+                Some(("gone", pat)) if !pat.is_empty() => {
+                    settle_match = Some((true, pat.to_string()));
+                }
+                _ => return Err(USAGE.to_string()),
+            },
+            "trim" => match v {
+                "1" => trim = true,
+                "0" => trim = false,
+                _ => return Err(USAGE.to_string()),
+            },
+            "typed" => match v {
+                "1" => typed = true,
+                "0" => typed = false,
+                _ => return Err(USAGE.to_string()),
+            },
+            "cadence" => match v.parse::<u64>() {
+                Ok(ms) => cadence_ms = ms.clamp(1, 2_000),
+                Err(_) => return Err(USAGE.to_string()),
+            },
+            "cap" => match v.parse::<usize>() {
+                Ok(n) if n >= 1 => typed_cap = n.min(TYPED_CAP_MAX),
+                _ => return Err(USAGE.to_string()),
+            },
+            "yield" => match v.parse::<f32>() {
+                Ok(f) if f.is_finite() && (0.0..=1.0).contains(&f) => yield_floor = Some(f),
+                _ => return Err(USAGE.to_string()),
+            },
+            "if-gen" => match crate::control::ScreenGen::parse(v) {
+                Some(generation) => if_gen = Some(generation),
+                None => return Err(USAGE.to_string()),
+            },
+            "if-rows" => match aterm_types::control_verbs::RowsFence::parse(v) {
+                Some(fence) => if_rows = Some(fence),
+                None => return Err(USAGE.to_string()),
+            },
+            "cause" => match crate::session_log::CauseRef::parse(v) {
+                Some(c) if cause_opt.is_none() => cause_opt = Some(c),
+                _ => return Err(crate::session_log::CAUSE_USAGE.to_string()),
+            },
+            _ => break, // not an option: the message itself starts with `word=…`
+        }
+        text = tail;
+    }
+    let timeout_ms = timeout_ms.min(600_000);
+    // A turn with NO TEXT submits nothing a person typed: a bare `ctl turn` used to
+    // skip the typing and still press Enter into the live session (audit D-3). A
+    // lone Enter is `key enter`; an empty turn is a usage error unless it submits
+    // nothing either (`submit=none` — a settle read, the one empty form with a use).
+    if text.trim().is_empty() && submit != "none" {
+        return Err(USAGE.to_string());
+    }
+    Ok(TurnOptions {
+        idle_ms,
+        timeout_ms,
+        submit,
+        submit_guard,
+        submit_window_ms,
+        presses,
+        submit_verify,
+        settle_match,
+        trim,
+        typed,
+        cadence_ms,
+        typed_cap,
+        yield_floor,
+        if_gen,
+        if_rows,
+        cause: cause_opt,
+        text,
+    })
+}
+
+/// The patterns a turn's options name (`settle=match:|gone:<re>`,
+/// `submit=guarded:<re>`), compiled (untrusted regexes, bounded by
+/// `row_matcher`): `ERR badregex` before anything is typed.
+type TurnMatchers = (
+    Option<(bool, Arc<dyn aterm_core::terminal::RowMatch>)>,
+    Option<Arc<dyn aterm_core::terminal::RowMatch>>,
+);
+
+fn turn_matchers(o: &TurnOptions<'_>) -> Result<TurnMatchers, String> {
+    // Compile a `settle=match:<re>`/`settle=gone:<re>` pattern up front (untrusted
+    // regex, bounded by `row_matcher`) OUTSIDE the terminal lock and BEFORE the
+    // lease/paste, so a bad pattern fails fast without ever typing into the target
+    // or holding the lease.
+    let settle_matcher = match &o.settle_match {
+        Some((gone, pat)) => match aterm_observe::row_matcher(pat) {
+            Ok(m) => Some((*gone, m)),
+            Err(_) => return Err("ERR badregex\n".to_string()),
+        },
+        None => None,
+    };
+    // The `submit=guarded:<re>` guard, compiled on the same terms and for the
+    // same reason: a bad pattern must fail before anything is typed.
+    let submit_matcher = super::control_input::compile_guard(o.submit_guard.as_deref())?;
+    Ok((settle_matcher, submit_matcher))
+}
+
+/// EVERY REFUSAL A `turn` CAN MAKE OF ITS OWN WORDS, made BEFORE the
+/// exactly-once claim (`pty_idem::guarded`): the options' grammar, a bad
+/// pattern, and the `cause=` among them. Only an attempt that reached the PTY
+/// seam may consume an `id=` sequence: a refused turn whose key was claimed
+/// would answer its corrected retry `ERR in-doubt`, though nothing was typed.
+/// Returns the `cause=` among the options, unchecked: the dispatch checks it
+/// (authority, then what the session holds) beside a leading one.
+///
+/// # Errors
+///
+/// The reply the turn itself would have answered.
+pub(crate) fn turn_preflight(rest: &str) -> Result<Option<crate::session_log::CauseRef>, String> {
+    let o = turn_options(rest)?;
+    turn_matchers(&o)?;
+    Ok(o.cause)
+}
+
 /// `turn [idle=<ms>] [timeout=<ms>] [submit=<key|none|guarded:<re>>] [settle=match:<re>|gone:<re>]
 /// [submit_window=<ms>] [presses=<n>] [trim=<0|1>] [typed=<0|1>] [cadence=<ms>] [cap=<n>]
 /// [yield=<floor>] <text>` — one complete HUMAN
@@ -2333,9 +2813,7 @@ pub(crate) fn cmd_await_momentum(
 /// a PTY holds a conversation through the exact surface a human uses. For an
 /// ordinary interactive `turn`, a human typing INTO the target mid-turn simply
 /// extends the same content stream: the settle watcher keeps resetting, and the
-/// returned screen contains whatever both parties produced. The durable operator
-/// uses the guarded twin below, which instead aborts before submit when any
-/// foreign PTY input attempt interjects.
+/// returned screen contains whatever both parties produced.
 ///
 /// SETTLE (phase 3) defaults to GLOBAL idle — no content change for `idle_ms` —
 /// which assumes the app STOPS painting when done. A periodically-repainting TUI
@@ -2414,116 +2892,13 @@ pub(crate) fn cmd_turn(
     ctx: &SessionCtx,
     io: &TurnIo<'_>,
 ) -> String {
-    let mut allow_preflight = || Ok(());
-    let mut allow_submit = || Ok(());
-    cmd_turn_guarded(
-        term,
-        store,
-        session,
-        rest,
-        subscribers,
-        ctx,
-        io,
-        &mut allow_preflight,
-        &mut allow_submit,
-        None,
-    )
-}
-
-/// What one `submit=guarded:<re>` press decided.
-enum GuardedSubmit {
-    /// The guard matched and Enter was written in full.
-    Pressed,
-    /// The cursor's row did not match the guard: nothing was written.
-    Missed,
-    /// The write itself failed — the verb's reply, already worded.
-    Failed(String),
-}
-
-/// One guarded submit press: Enter, only while the CURSOR's row matches
-/// `guard`, through [`super::control_input::input_if_fenced`] (check and write
-/// under one terminal lock hold, the immediate non-parking write). The cursor
-/// row, not any row: Claude Code draws every earlier prompt in its transcript
-/// with the composer's `❯` at column 0, so an any-row `^❯` still matched with
-/// an approval box up and its Enter chose the focused `❯ 1. Yes` (measured live
-/// on a private headless aterm). A composer holds the cursor; the box does not.
-/// A sink that takes zero bytes right now (the typed text's own paste still
-/// draining ahead of it) is retried every few milliseconds until `window` — the
-/// press has not happened yet, so a retry cannot double it; the guard is asked
-/// again each time.
-///
-/// ORDERING, stated rather than enforced: the text went through the App input
-/// seam (`PasteFraming::AtDrain`) and this Enter goes straight to the target's
-/// sink on the control thread. It follows the text because the caller presses
-/// only after the echo settled (the text was on screen, so its bytes were
-/// written), and because the immediate write refuses — `BusyZero`, retried
-/// here — while any spilled frame is still queued ahead of it. The one gap is
-/// the echo CAP: a target that never goes echo-quiet within it is pressed
-/// anyway, and if the seam had not yet written the text by then, this Enter
-/// would precede it. The guard still decides on the live screen either way.
-fn guarded_submit(
-    term: &Arc<Mutex<Terminal>>,
-    ctx: &SessionCtx,
-    guard: &dyn aterm_core::terminal::RowMatch,
-    window: std::time::Instant,
-) -> GuardedSubmit {
-    use super::control_input::GuardedInput;
-    use crate::input::Delivery;
-    const BUSY_RETRY: std::time::Duration = std::time::Duration::from_millis(5);
-    loop {
-        let Some(enter) = crate::control::parse_key("enter") else {
-            return GuardedSubmit::Failed("ERR internal: `enter` did not parse\n".to_string());
-        };
-        let fence = super::control_input::InputFence {
-            guard: Some(guard),
-            guard_at_cursor: true,
-            ..super::control_input::InputFence::default()
-        };
-        match super::control_input::input_if_fenced(term, ctx, enter, &fence) {
-            GuardedInput::Pressed(Delivery::Full | Delivery::FullAt { .. }) => {
-                return GuardedSubmit::Pressed;
-            }
-            GuardedInput::Skipped | GuardedInput::Changed | GuardedInput::Person => {
-                return GuardedSubmit::Missed;
-            }
-            GuardedInput::Pressed(Delivery::BusyZero | Delivery::ConflictZero)
-                if std::time::Instant::now() < window =>
-            {
-                std::thread::sleep(BUSY_RETRY);
-            }
-            decision @ GuardedInput::Pressed(_) => {
-                return GuardedSubmit::Failed(super::control_input::guarded_input_reply(decision));
-            }
-        }
-    }
-}
-
-/// `turn` with last-moment validation hooks. `preflight` runs after the exclusive
-/// turn lease is held and before any watcher is armed or input is emitted.
-/// `pre_submit` runs after paste echo-settle and immediately before every submit
-/// press. The embedded operator uses both plus its sink epoch to prevent a human
-/// or raw controller interjection from turning a previously-safe paste into an
-/// unsafe Enter.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn cmd_turn_guarded(
-    term: &Arc<Mutex<Terminal>>,
-    store: &Store,
-    session: u64,
-    rest: &str,
-    subscribers: &crate::subscribe::Subscribers,
-    ctx: &SessionCtx,
-    io: &TurnIo<'_>,
-    preflight: &mut dyn FnMut() -> Result<(), String>,
-    pre_submit: &mut dyn FnMut() -> Result<(), String>,
-    ledger_text_override: Option<&str>,
-) -> String {
     use std::time::{Duration, Instant};
 
     use aterm_core::terminal::{BlockState, WatcherSpec};
 
     use crate::subscribe::SubscriberSet;
 
-    const USAGE: &str = "ERR usage: turn [idle=<ms>] [timeout=<ms>] [submit=<key|none|guarded:<re>>] [settle=match:<re>|gone:<re>] [submit_window=<ms>] [presses=<n>] [submit_verify=<auto|seq|block>] [trim=<0|1>] [typed=<0|1>] [cadence=<ms>] [cap=<n>] [yield=<floor>] [if-gen=<epoch>.<seq>] [if-rows=<first>-<last>:<hex16>] <text>\n";
+    const USAGE: &str = TURN_USAGE;
     /// Echo-settle window: the paste burst has been ingested and painted.
     const ECHO_SETTLE: Duration = Duration::from_millis(150);
     /// Echo phase cap — a busy app (spinner mid-turn) may never go echo-quiet;
@@ -2531,165 +2906,44 @@ pub(crate) fn cmd_turn_guarded(
     const ECHO_CAP: Duration = Duration::from_secs(5);
 
     // ── grammar: leading k=v options, the remainder verbatim is the message ──
-    let mut idle_ms = 1_500u64;
-    let mut timeout_ms = 240_000u64;
-    let mut submit = "enter".to_string();
-    // `submit=guarded:<re>`: the submit is Enter, pressed only while the
-    // cursor's row still matches `<re>` — checked and written under one
-    // terminal lock hold (`control_input::input_if_fenced`). None => an
-    // ordinary press.
-    let mut submit_guard: Option<String> = None;
-    // Submit-verification knobs: `submit_window` is how long one press has to move
-    // `content_seq` before a re-press; `presses` is the max total presses.
-    // `presses=1` disables re-press for slow/high-latency links where a duplicate
-    // Enter would be harmful (e.g. auto-confirming a following prompt).
-    let mut submit_window_ms = 2_000u64;
-    let mut presses = 3u32;
-    // `submit_verify` chooses the submit-verification signal. `block` verifies the
-    // submit against the OSC-133 command-start transition (ambient-repaint-immune);
-    // `seq` uses a bare `content_seq` advance. DEFAULT (None) is AUTO: `block` when
-    // the target is at a shell prompt (a submit will start a command — the sound
-    // choice), else `seq` (a TUI or no shell integration has no press-attributable
-    // signal, so seq is the best available). So a shell drive is sound by default.
-    let mut submit_verify: Option<bool> = None;
-    // `settle=match:<re>` keys phase-3 settle on a screen PATTERN instead of global
-    // idle, `settle=gone:<re>` on that pattern LEAVING the screen (the `gone` flag);
-    // None => the default idle settle. Compiled below, before any input.
-    let mut settle_match: Option<(bool, String)> = None;
-    // `trim=1` drops the settled screen's trailing blank rows from the reply (the
-    // `text trim` rule); off by default so a script that counts rows sees the grid.
-    let mut trim = false;
-    // THE EVEN HAND: `typed=1` presses one key per grapheme at `cadence=` ms
-    // (absolute schedule); `yield=<floor>` parks before typing until the
-    // target's typing momentum has exhaled to the floor.
-    let mut typed = false;
-    let mut cadence_ms = TYPED_CADENCE_MS;
-    let mut typed_cap = TYPED_CAP;
-    let mut yield_floor: Option<f32> = None;
-    // `if-gen=<epoch>.<seq>`: type only while the screen is still the
-    // generation the caller judged — checked after the yield, immediately
-    // before the paste. None => no precondition.
-    let mut if_gen: Option<crate::control::ScreenGen> = None;
-    // `if-rows=<first>-<last>:<hex16>`: the NARROW fence — type only while
-    // those rows still hash to the value (a spinner or a timer elsewhere may
-    // move). Checked with `if-gen=`, under the same lock hold.
-    let mut if_rows: Option<aterm_types::control_verbs::RowsFence> = None;
-    let mut text = rest.trim_start();
-    loop {
-        let (tok, tail) = match text.split_once(char::is_whitespace) {
-            Some((t, rest)) => (t, rest.trim_start()),
-            None => (text, ""),
-        };
-        if tok == "--" {
-            text = tail;
-            break;
-        }
-        let Some((k, v)) = tok.split_once('=') else {
-            break;
-        };
-        match k {
-            "idle" => match v.parse::<u64>() {
-                Ok(ms) => idle_ms = ms.clamp(1, 600_000),
-                Err(_) => return USAGE.to_string(),
-            },
-            "timeout" => match v.parse::<u64>() {
-                Ok(ms) => timeout_ms = ms,
-                Err(_) => return USAGE.to_string(),
-            },
-            "submit" => match v.strip_prefix("guarded:") {
-                Some("") => return USAGE.to_string(),
-                Some(pat) => {
-                    submit = "enter".to_string();
-                    submit_guard = Some(pat.to_string());
-                }
-                None => {
-                    submit = v.to_string();
-                    submit_guard = None;
-                }
-            },
-            "submit_window" => match v.parse::<u64>() {
-                Ok(ms) => submit_window_ms = ms.clamp(1, 600_000),
-                Err(_) => return USAGE.to_string(),
-            },
-            "presses" => match v.parse::<u32>() {
-                Ok(n) if n >= 1 => presses = n.min(10),
-                _ => return USAGE.to_string(),
-            },
-            "submit_verify" => match v {
-                "seq" => submit_verify = Some(false),
-                "block" => submit_verify = Some(true),
-                "auto" => submit_verify = None,
-                _ => return USAGE.to_string(),
-            },
-            "settle" => match v.split_once(':') {
-                Some(("match", pat)) if !pat.is_empty() => {
-                    settle_match = Some((false, pat.to_string()));
-                }
-                Some(("gone", pat)) if !pat.is_empty() => {
-                    settle_match = Some((true, pat.to_string()));
-                }
-                _ => return USAGE.to_string(),
-            },
-            "trim" => match v {
-                "1" => trim = true,
-                "0" => trim = false,
-                _ => return USAGE.to_string(),
-            },
-            "typed" => match v {
-                "1" => typed = true,
-                "0" => typed = false,
-                _ => return USAGE.to_string(),
-            },
-            "cadence" => match v.parse::<u64>() {
-                Ok(ms) => cadence_ms = ms.clamp(1, 2_000),
-                Err(_) => return USAGE.to_string(),
-            },
-            "cap" => match v.parse::<usize>() {
-                Ok(n) if n >= 1 => typed_cap = n.min(TYPED_CAP_MAX),
-                _ => return USAGE.to_string(),
-            },
-            "yield" => match v.parse::<f32>() {
-                Ok(f) if f.is_finite() && (0.0..=1.0).contains(&f) => yield_floor = Some(f),
-                _ => return USAGE.to_string(),
-            },
-            "if-gen" => match crate::control::ScreenGen::parse(v) {
-                Some(generation) => if_gen = Some(generation),
-                None => return USAGE.to_string(),
-            },
-            "if-rows" => match aterm_types::control_verbs::RowsFence::parse(v) {
-                Some(fence) => if_rows = Some(fence),
-                None => return USAGE.to_string(),
-            },
-            _ => break, // not an option: the message itself starts with `word=…`
-        }
-        text = tail;
-    }
-    let timeout_ms = timeout_ms.min(600_000);
-    // A turn with NO TEXT submits nothing a person typed: a bare `ctl turn` used to
-    // skip the typing and still press Enter into the live session (audit D-3). A
-    // lone Enter is `key enter`; an empty turn is a usage error unless it submits
-    // nothing either (`submit=none` — a settle read, the one empty form with a use).
-    if text.trim().is_empty() && submit != "none" {
-        return USAGE.to_string();
-    }
-
-    // Compile a `settle=match:<re>`/`settle=gone:<re>` pattern up front (untrusted
-    // regex, bounded by `row_matcher`) OUTSIDE the terminal lock and BEFORE the
-    // lease/paste, so a bad pattern fails fast without ever typing into the target
-    // or holding the lease.
-    let settle_matcher = match &settle_match {
-        Some((gone, pat)) => match aterm_observe::row_matcher(pat) {
-            Ok(m) => Some((*gone, m)),
-            Err(_) => return "ERR badregex\n".to_string(),
-        },
-        None => None,
+    // ([`turn_options`], the grammar the dispatch's pre-claim check reads too).
+    let o = match turn_options(rest) {
+        Ok(o) => o,
+        Err(refusal) => return refusal,
     };
-    // The `submit=guarded:<re>` guard, compiled on the same terms and for the
-    // same reason: a bad pattern must fail before anything is typed.
-    let submit_matcher = match super::control_input::compile_guard(submit_guard.as_deref()) {
+    // `cause=`: a leading one or one among the options, which the dispatch
+    // took and checked before the exactly-once claim (`io.cause`); one only
+    // among the options of a caller that checked nothing is checked here,
+    // before any byte is typed.
+    let cause = match (io.cause, o.cause) {
+        (Some(id), _) => Some(id),
+        (None, Some(c)) => match crate::session_log::validate_cause(ctx, c) {
+            Ok(id) => Some(id),
+            Err(refusal) => return refusal,
+        },
+        (None, None) => None,
+    };
+    let (settle_matcher, submit_matcher) = match turn_matchers(&o) {
         Ok(m) => m,
         Err(reply) => return reply,
     };
+    let TurnOptions {
+        idle_ms,
+        timeout_ms,
+        submit,
+        submit_window_ms,
+        presses,
+        submit_verify,
+        trim,
+        typed,
+        cadence_ms,
+        typed_cap,
+        yield_floor,
+        if_gen,
+        if_rows,
+        text,
+        ..
+    } = o;
 
     // ── turn LEASE: one driver per session at a time. Acquire-or-busy under the
     // lock (the dispatch-level check is the fast fail; THIS is authoritative), and
@@ -2805,12 +3059,8 @@ pub(crate) fn cmd_turn_guarded(
         crate::presence::post_lease_changed(driver, false);
     }
 
-    if let Err(error) = preflight() {
-        let error = error.trim_end_matches(['\r', '\n']);
-        return format!("ERR {error}\n");
-    }
-    // THE SESSION LOG: the turn this exchange opens carries `by=` (the driving
-    // session, else `ctl`) and `ledger=<id>`; a turn at rest closes. Noted when
+    // ATTRIBUTION BEFORE DELIVERY: the turn this exchange opens carries `by=` (the
+    // connection's, `TurnIo::actor`) and `ledger=<id>`; a turn at rest closes. Noted when
     // the exchange's input is handed to the seam — its first key or paste,
     // after the yield and the `if-gen=`/`if-rows=` check, and again at each
     // Enter, its last byte — so the tracker's 5 s attribution window runs
@@ -2819,15 +3069,19 @@ pub(crate) fn cmd_turn_guarded(
     // as this exchange's. The timeline's leaf lock is taken there with no other
     // held (the ledger and lease locks above are released, and no terminal
     // guard lives across a delivery): it is held under none.
-    let slog_by = io
-        .driver
-        .as_ref()
-        .and_then(|sid| aterm_slog::ShortId::new(sid.as_str()))
-        .map_or(aterm_slog::Actor::Ctl, aterm_slog::Actor::Sid);
+    let slog_by = io.actor;
     let note_ctl_input = || {
-        let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-        let at = timeline.slog().now();
-        let _ = timeline.slog_mut().ctl_turn(slog_by, turn_id, at);
+        let owed = {
+            let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            let at = timeline.slog().now();
+            let _ = timeline.slog_mut().ctl_turn(slog_by, turn_id, cause, at);
+            timeline.slog_take_wake()
+        };
+        // Wake only after releasing the leaf (the resting turn may have closed).
+        // The separate Input mark comes only from an accepted nonempty receipt.
+        if owed {
+            super::wake_watchers(subscribers, session);
+        }
     };
 
     let now0 = Instant::now();
@@ -3102,15 +3356,6 @@ pub(crate) fn cmd_turn_guarded(
             let Some(mut id) = arm(WatcherSpec::SeqAdvanced { after }) else {
                 return format!("ERR {WAITS_FULL}\n");
             };
-            // The watcher must be armed before input, but the guard remains the
-            // final operation before the press. For the durable operator this
-            // re-reads live non-approval state and checks its attempted-input
-            // epoch; generic turns pass an allow hook and retain their behavior.
-            if let Err(error) = pre_submit() {
-                term_lock(term).watch_disarm(id);
-                let error = error.trim_end_matches(['\r', '\n']);
-                return format!("ERR {error}\n");
-            }
             // The Enter is the exchange's last byte: the turn it starts is
             // attributed from here (the session log, above).
             note_ctl_input();
@@ -3119,7 +3364,7 @@ pub(crate) fn cmd_turn_guarded(
                 // decided and written under one terminal lock hold, on the
                 // control thread against this target's own `(term, sink)` —
                 // the `key if=` arm's delivery, whichever route typed the text.
-                match guarded_submit(term, ctx, guard, window) {
+                match guarded_submit(term, ctx, guard, window, io.mark) {
                     GuardedSubmit::Pressed => guarded_presses += 1,
                     GuardedSubmit::Missed => {
                         term_lock(term).watch_disarm(id);
@@ -3331,10 +3576,7 @@ pub(crate) fn cmd_turn_guarded(
             dur_ms,
             submitted,
             status,
-            // Durable operator proposals may contain sensitive model/context
-            // text. Their caller supplies a fixed redaction marker; ordinary
-            // interactive turns retain the historical submitted-text ledger.
-            text: crate::turn_ledger::clamp_text(ledger_text_override.unwrap_or(text)),
+            text: crate::turn_ledger::clamp_text(text),
             screen_hash,
             seq,
             arch,
@@ -3351,10 +3593,6 @@ pub(crate) fn cmd_turn_guarded(
             .unwrap_or_else(|p| p.into_inner())
             .notify(session);
     }
-    // A `status=hangup` verdict still goes out whole: no socket caller is left
-    // to read it, but an in-process one is — the durable operator
-    // (`run_operator_proposal`) records its action as acted from this line's
-    // `submitted=1`, exactly as for a settled turn.
     // `trim=1` drops the settled screen's trailing blank rows and closes the verdict
     // with `trimmed=<k>` — the same rule and framing as `text trim`, through the one
     // shared framer. `screen_hash` above was taken over the UNTRIMMED screen on
@@ -3494,7 +3732,7 @@ pub(crate) fn cmd_history(ctx: &SessionCtx, rest: &str) -> String {
 ///   answers it with its recommended option, `long-term` / `short-term` by
 ///   the worker's own choice under that policy); any other value is `ERR
 ///   usage: meta set questions …`
-///   ([`QUESTIONS_USAGE`]). Writing it is Owner-only
+///   ([`questions_usage`]). Writing it is Owner-only
 ///   ([`meta_questions_denied`], answered before this handler). `autopilot` is
 ///   the other CLOSED set: `cruise|land|off` (the owner's words `forever`,
 ///   `infinity`, `wrap-up`, `wrapup` and `wrap` admitted, case folded, stored
@@ -3543,6 +3781,14 @@ pub(crate) fn cmd_meta(
             // KEYED ATTENTION: `meta set attention owner=<k> <text>` writes only
             // owner `<k>`'s entry. The owner LEADS, like every option on this
             // wire, so a bare text that merely contains `owner=` stays text.
+            // A TIMED CRUISE (§9.3.5): `cruise until=<when>` writes the word
+            // and its instant as one; any other autopilot value is a hand
+            // write of the word, which drops a timer, the same word included.
+            if typed == MetaField::Autopilot
+                && let Some(reply) = meta_set_autopilot_until(ctx, value)
+            {
+                return reply;
+            }
             if typed == MetaField::Attention
                 && let Some((owner, text)) = leading_attention_owner(value)
             {
@@ -3563,10 +3809,10 @@ pub(crate) fn cmd_meta(
                 // clear: clearing has its own explicit `meta unset` form. A
                 // bare `meta set questions` names its own closed set.
                 Err(MetaWriteError::NotAQuestionsPolicy) => {
-                    (format!("ERR {QUESTIONS_USAGE}\n"), false)
+                    (format!("ERR {}\n", questions_usage()), false)
                 }
                 Err(MetaWriteError::Empty) if typed == MetaField::Questions => {
-                    (format!("ERR {QUESTIONS_USAGE}\n"), false)
+                    (format!("ERR {}\n", questions_usage()), false)
                 }
                 // …and so does a bare `meta set autopilot`.
                 Err(MetaWriteError::NotAnAutopilot) => (format!("ERR {AUTOPILOT_USAGE}\n"), false),
@@ -3621,6 +3867,79 @@ pub(crate) fn cmd_meta(
             false,
         ),
     }
+}
+
+/// `meta set autopilot <word> until=<when>` (§9.3.5), or `None` where the
+/// value carries no `until=` (the plain word's write, [`cmd_meta`]'s own).
+///
+/// * `<when>` is `HH:MM` (local: the earliest instant strictly after now
+///   whose local reading it is, today else tomorrow; a time a spring-forward
+///   skips on the day it would fall is refused with the reason) or
+///   `+<n>h`, `+<n>m`, `+<n>h<n>m` (1 minute to 24 hours of elapsed time):
+///   `crate::autopilot_timers::resolve`.
+/// * Only Cruise takes a time: `until=` with `land`, `off` or no word is
+///   `ERR until= goes with cruise only: usage: …`. The owner's own words for
+///   Cruise (`forever`, `infinity`) are Cruise. A malformed `<when>`, or two
+///   `until=`, is the usage line ([`AUTOPILOT_USAGE`]).
+/// * The word and the instant are stored as ONE write under the meta guard
+///   (`session_timeline::apply_autopilot`), and the reply names the instant,
+///   `OK land_at=<unix s> local=<date>T<HH:MM><offset>`, the `OK` token
+///   leading as on every `meta set` (each in-tree reader tests that token
+///   alone). `changed` is whether the stored pair moved; the dispatch arm's
+///   `Wake::MetaChanged` indexes the timer in the App.
+///
+/// Owner-only by the field's gate ([`meta_questions_denied`], answered
+/// before this): `until=` rides the `autopilot` field.
+fn meta_set_autopilot_until(ctx: &SessionCtx, value: &str) -> Option<(String, bool)> {
+    use crate::autopilot_timers::{local_offset_at, parse_when, resolve, wall_ms};
+    let mut until: Vec<&str> = Vec::new();
+    let mut word: Vec<&str> = Vec::new();
+    for token in value.split_whitespace() {
+        match token.strip_prefix("until=") {
+            Some(when) => until.push(when),
+            None => word.push(token),
+        }
+    }
+    if until.is_empty() {
+        return None;
+    }
+    let refuse = |reason: Option<String>| {
+        let reason = reason.map_or_else(String::new, |r| format!("{r}: "));
+        Some((
+            format!(
+                "ERR {reason}{AUTOPILOT_USAGE}
+"
+            ),
+            false,
+        ))
+    };
+    let [when] = until[..] else {
+        return refuse(None);
+    };
+    match crate::session_timeline::normalize_autopilot_value(&word.join(" ")) {
+        Some(stored) if stored == aterm_agent::supervise::Autopilot::Cruise.word() => {}
+        _ => return refuse(Some("until= goes with cruise only".to_string())),
+    }
+    let Some(when) = parse_when(when) else {
+        return refuse(None);
+    };
+    let resolved = match resolve(when, wall_ms(), &local_offset_at) {
+        Ok(resolved) => resolved,
+        Err(refused) => return refuse(refused.reason()),
+    };
+    let write = crate::session_timeline::apply_autopilot(
+        ctx,
+        Some(aterm_agent::supervise::Autopilot::Cruise.word().to_string()),
+        Some(resolved.at_ms),
+    );
+    Some((
+        format!(
+            "OK {}
+",
+            resolved.reply()
+        ),
+        write.moved,
+    ))
 }
 
 /// `ERR usage: meta set <field> <text...>`, naming the closed field list
@@ -4076,6 +4395,69 @@ pub(crate) fn cmd_log_json(ctx: &SessionCtx, rest: &str) -> String {
     cmd_log(ctx, &format!("{rest} --json"))
 }
 
+/// `log` of a session that has closed in this process ([`cmd_log`]'s reply,
+/// `json` spelled either way, over the closed-session index's copy of its
+/// log, `session_log::ClosedLog::source`): no lock is held.
+pub(crate) fn cmd_log_closed(log: &aterm_slog::Log, rest: &str) -> String {
+    let rest = match crate::control::take_json_flag(rest) {
+        (true, body) => format!("{body} --json"),
+        (false, _) => rest.to_string(),
+    };
+    let query = match crate::session_log::LogQuery::parse(&rest) {
+        Ok(q) => q,
+        Err(usage) => return usage.to_string(),
+    };
+    crate::session_log::render_log_copy(
+        &crate::session_log::LogCopy::copied_from(log, &query),
+        &query,
+    )
+}
+
+/// `brief` of a session that has closed in this process ([`cmd_brief`]'s
+/// reply over the closed-session index's copy of its log, as of the wall
+/// clock now); `brief all` is the instance's, as from a live session.
+pub(crate) fn cmd_brief_closed(
+    log: &aterm_slog::Log,
+    sid: &str,
+    store: &Store,
+    rest: &str,
+) -> String {
+    let query = match crate::session_log::BriefQuery::parse(rest) {
+        Ok(q) => q,
+        Err(usage) => return usage.to_string(),
+    };
+    cmd_brief_closed_query(log, sid, store, &query, None)
+}
+
+/// [`cmd_brief_closed`] of a parsed `query` (the journal's reader places its
+/// cursor first), its header handing out `hand` in place of the log's head
+/// when given (a journal reply's, `aterm_slog::journal::View::reply_cursor`).
+pub(crate) fn cmd_brief_closed_query(
+    log: &aterm_slog::Log,
+    sid: &str,
+    store: &Store,
+    query: &crate::session_log::BriefQuery,
+    hand: Option<aterm_slog::Cursor>,
+) -> String {
+    if query.all {
+        return brief_all(store, query.budget);
+    }
+    let copy = crate::session_log::BriefCopy::copied_from(log, query.node, query.cursor);
+    let copy = match hand {
+        Some(c) => copy.handing(c),
+        None => copy,
+    };
+    let mut text = copy
+        .brief(
+            sid,
+            query.budget.unwrap_or(aterm_slog::DEFAULT_BUDGET),
+            crate::session_log::host_stamp().wall_ms,
+        )
+        .text;
+    text.push('\n');
+    text
+}
+
 /// `brief [<node>] [budget=<tokens>] [since=<seq> ep=<epoch>]`: the target
 /// session's token-budgeted rollup for an AI reader (design §7.4), from its
 /// session log; `brief all [budget=]` is the instance's, every session's in
@@ -4088,24 +4470,7 @@ pub(crate) fn cmd_brief(ctx: &SessionCtx, store: &Store, rest: &str) -> String {
         Err(usage) => return usage.to_string(),
     };
     if query.all {
-        let handles = store.read().unwrap_or_else(|p| p.into_inner()).snapshot();
-        let budget = query.budget.unwrap_or(aterm_slog::INSTANCE_BUDGET);
-        let parts: Vec<crate::session_log::BriefPart> = handles
-            .iter()
-            .map(|h| {
-                let tl = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-                crate::session_log::BriefPart {
-                    sid: h.sid.as_str().to_string(),
-                    copy: crate::session_log::BriefCopy::copied_from(
-                        tl.slog().log(),
-                        aterm_slog::Node::SESSION,
-                        None,
-                    ),
-                    now_wall: tl.slog().now().wall_ms,
-                }
-            })
-            .collect();
-        return crate::session_log::render_brief_all(&parts, budget);
+        return brief_all(store, query.budget);
     }
     let (copy, now) = {
         let tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
@@ -4123,6 +4488,30 @@ pub(crate) fn cmd_brief(ctx: &SessionCtx, store: &Store, rest: &str) -> String {
         .text;
     text.push('\n');
     text
+}
+
+/// `brief all [budget=]`: every live session's brief in turn within one
+/// budget. The store guard is dropped before any timeline is locked, and each
+/// timeline's lock is held only to copy what its brief reads.
+fn brief_all(store: &Store, budget: Option<usize>) -> String {
+    let handles = store.read().unwrap_or_else(|p| p.into_inner()).snapshot();
+    let budget = budget.unwrap_or(aterm_slog::INSTANCE_BUDGET);
+    let parts: Vec<crate::session_log::BriefPart> = handles
+        .iter()
+        .map(|h| {
+            let tl = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            crate::session_log::BriefPart {
+                sid: h.sid.as_str().to_string(),
+                copy: crate::session_log::BriefCopy::copied_from(
+                    tl.slog().log(),
+                    aterm_slog::Node::SESSION,
+                    None,
+                ),
+                now_wall: tl.slog().now().wall_ms,
+            }
+        })
+        .collect();
+    crate::session_log::render_brief_all(&parts, budget)
 }
 
 /// `cast` -> `OK <nbytes>\n` then the session's full asciicast v2 recording as
@@ -4524,6 +4913,9 @@ pub(crate) fn cmd_grant(ctx: &SessionCtx, scope: Scope, rest: &str) -> String {
     let Some(op) = Op::parse(op_s) else {
         return GRANT_UNKNOWN_OP.to_string();
     };
+    if let Some(refusal) = reserved_src(src) {
+        return refusal;
+    }
     let src = SessionId::new(src);
     let tok = {
         let mut edges = ctx.edges.lock().unwrap_or_else(|p| p.into_inner());
@@ -4533,6 +4925,21 @@ pub(crate) fn cmd_grant(ctx: &SessionCtx, scope: Scope, rest: &str) -> String {
     // mutex and must never nest inside `ctx.edges`.
     session_edge_audit::emit(EdgeAction::Grant, "wire", &src, &ctx.self_id, op.as_str());
     format!("OK {}\n", tok.to_hex())
+}
+
+/// The refusal of an edge source that is one of the session log's actor
+/// words (`human ctl harness bridge aterm vendor -`; phase 3A ruling R1):
+/// `grant` and `connect` take a source as given, and no session is named
+/// after an actor, so a grant under one could only be a try at being read
+/// as that actor. The log never would (it attributes an edge only to a
+/// minted sid, [`log_actor`]); the refusal says so where it was asked.
+fn reserved_src(src: &str) -> Option<String> {
+    aterm_slog::is_reserved_actor_word(src).then(|| {
+        format!(
+            "ERR reserved: src={src} is a session log actor (human ctl harness bridge aterm \
+             vendor -), never a session\n"
+        )
+    })
 }
 
 /// `revoke <edge-hex>` -> remove one edge by its bearer token. `revoke
@@ -4546,30 +4953,76 @@ pub(crate) fn cmd_revoke(ctx: &SessionCtx, scope: Scope, rest: &str) -> String {
     if !scope.is_owner_class() {
         return "ERR denied\n".to_string();
     }
+    revoke_in(&ctx.edges, &ctx.self_id, rest)
+}
+
+/// THE `revoke` VERB: [`cmd_revoke`] on the connection's own session, and a
+/// `revoke <edge-hex>` it finds no row for goes on to the read grants the
+/// closed-session index keeps (`session_log::ClosedLog`): a grant a session
+/// closed with is revoked by its token as a live one is, from any owner
+/// connection (the session it was on has no shell left to ask). A token is
+/// one row in one table, so the first table holding it is the one. Each
+/// table is taken out under the store's read lock and locked after it. A
+/// closed session's grants by source go with `disconnect dst=<it> src=` and
+/// with the source's own close.
+pub(crate) fn cmd_revoke_with_closed(
+    ctx: &SessionCtx,
+    store: &Store,
+    scope: Scope,
+    rest: &str,
+) -> String {
+    const NO_SUCH_EDGE: &str = "ERR no such edge\n";
+    let live = cmd_revoke(ctx, scope, rest);
+    if live != NO_SUCH_EDGE {
+        return live;
+    }
+    if EdgeToken::from_hex(rest.trim()).is_none() {
+        return live;
+    }
+    let closed = store
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .closed_logs()
+        .read_tables();
+    for (sid, reads) in closed {
+        let reply = revoke_in(&reads, &sid, rest);
+        if reply != NO_SUCH_EDGE {
+            return reply;
+        }
+    }
+    live
+}
+
+/// `revoke`'s body against `edges`, the table of session `dst` (a live
+/// session's, or the read grants a closed one keeps in the closed-session
+/// index): `revoke <edge-hex>` removes that row, `revoke src=<sid>` every row
+/// `<sid>` holds. Mutation is under the table lock, and the audit is emitted
+/// after it: the logger must never nest inside an authority table lock.
+fn revoke_in(edges: &Mutex<EdgeTable>, dst: &SessionId, rest: &str) -> String {
     let rest = rest.trim();
     if let Some(src) = rest.strip_prefix("src=") {
         if src.is_empty() {
             return "ERR usage: revoke <edge-hex> | revoke src=<sid>\n".to_string();
         }
         let src = SessionId::new(src);
-        let removed = {
-            let mut edges = ctx.edges.lock().unwrap_or_else(|p| p.into_inner());
-            edges.revoke_src(&src)
-        };
+        let removed = edges
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .revoke_src(&src);
         if removed == 0 {
             return "ERR no such edge\n".to_string();
         }
         // ONE event for the whole sweep: `op=*` (every op the source held).
-        session_edge_audit::emit(EdgeAction::RevokeSrc, "wire", &src, &ctx.self_id, "*");
+        session_edge_audit::emit(EdgeAction::RevokeSrc, "wire", &src, dst, "*");
         return format!("OK {removed}\n");
     }
     let Some(tok) = EdgeToken::from_hex(rest) else {
         return "ERR bad token\n".to_string();
     };
+    // Read the row's (src, dst, op) identity BEFORE removal — the audit
+    // event describes the edge, and after `revoke` the row is gone.
     let removed = {
-        let mut edges = ctx.edges.lock().unwrap_or_else(|p| p.into_inner());
-        // Read the row's (src, dst, op) identity BEFORE removal — the audit
-        // event describes the edge, and after `revoke` the row is gone.
+        let mut edges = edges.lock().unwrap_or_else(|p| p.into_inner());
         let row = edges.edge_of(&tok);
         if edges.revoke(&tok) { row } else { None }
     };
@@ -4654,6 +5107,9 @@ pub(crate) fn cmd_connect_in(
     let Ok((dst, src, kind)) = parse_connection_args(rest) else {
         return "ERR usage: connect dst=<sid> src=<sid> [kind=pull|push|both]\n".to_string();
     };
+    if let Some(refusal) = reserved_src(src.as_str()) {
+        return refusal;
+    }
     let kind = kind.unwrap_or(ConnectionKind::Both);
     if src == dst {
         return "ERR self-loop\n".to_string();
@@ -4729,14 +5185,22 @@ pub(crate) fn cmd_disconnect_in(
         // fallback sweep from eating raw self-granted rows by accident.
         return "ERR self-loop\n".to_string();
     }
-    let dst_ctx = {
+    // A live dst's table, or the read grants a closed one keeps in the
+    // closed-session index (dissolution needs no liveness, §1.4#4): taken
+    // out under the store's read lock, locked after it.
+    let dst_edges = {
         let g = store.read().unwrap_or_else(|p| p.into_inner());
         match g.by_sid(&dst) {
-            Some(h) => h.ctx.clone(),
-            None => return "ERR no such session\n".to_string(),
+            Some(h) => Arc::clone(&h.ctx.edges),
+            None => match g.closed_logs().by_sid(&dst) {
+                Some(closed) => closed.reads(),
+                None => return "ERR no such session\n".to_string(),
+            },
         }
     };
-    match crate::connections::disconnect_kind_in(conn, &src, &dst, &dst_ctx.edges, kind, "wire") {
+    let revoked =
+        crate::connections::disconnect_kind_in(conn, &src, &dst, &dst_edges, kind, "wire");
+    match revoked {
         Some(n) => format!("OK {n}\n"),
         None => "ERR no such connection\n".to_string(),
     }
@@ -4969,6 +5433,38 @@ pub(crate) fn caller_actor_of(scope: Scope, target: Option<&SessionCtx>) -> Exit
     }
 }
 
+/// THE SESSION LOG'S `by=` for a request on `scope` against `target` (design
+/// §2.5, phase 3A ruling R1): who the CONNECTION is, never a parameter.
+///
+/// - An Owner connection is `harness` when it presented the harness's
+///   in-memory token ([`crate::control::Principal::Harness`]), else `ctl`
+///   (every other in-session client: no finer label would be honest).
+/// - The bridge's connection is `bridge`.
+/// - An edge is the session its token was granted from, read from the
+///   target's own table (the one that authorized the request) — and only
+///   when that name is a sid this build mints
+///   ([`aterm_session::is_minted_sid`]): `grant` takes its source as given,
+///   so any other name (`harness`, `human`, …) is nobody, `-`. No path turns
+///   a chosen word into a trusted actor.
+pub(crate) fn log_actor(scope: Scope, target: &SessionCtx) -> aterm_slog::Actor {
+    use aterm_slog::Actor;
+    match scope {
+        Scope::Owner => match crate::control::serving_principal() {
+            crate::control::Principal::Harness => Actor::Harness,
+            crate::control::Principal::Instance => Actor::Ctl,
+        },
+        #[cfg(any(unix, test))]
+        Scope::Bridge => Actor::Bridge,
+        Scope::Edge(presented) => target
+            .edges
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .src_of(&presented)
+            .and_then(|src| crate::session_log::sid_actor(src.as_str()))
+            .unwrap_or(Actor::Nobody),
+    }
+}
+
 /// `whoami` -> report this session's fabric id + nonce + the connection's EFFECTIVE
 /// scope against the session active RIGHT NOW. For an edge, the op is re-derived from
 /// the presented token via `authorize` (the same per-request authority the gate uses)
@@ -5039,22 +5535,6 @@ mod tests {
     }
     use super::*;
     use aterm_session::{EdgeTable, LaunchNonce};
-
-    /// `grant`'s unknown-op refusal lists exactly the words `Op::parse` takes,
-    /// so the list a person copies from is never one the verb then refuses.
-    #[test]
-    fn grant_unknown_op_lists_the_words_op_parse_takes() {
-        let list = GRANT_UNKNOWN_OP
-            .strip_prefix("ERR unknown op (")
-            .and_then(|rest| rest.strip_suffix(")\n"))
-            .expect("ERR unknown op (<a>|<b>…)");
-        let words: Vec<&str> = list.split('|').collect();
-        assert_eq!(words.len(), 6, "{words:?}");
-        for word in words {
-            assert_eq!(Op::parse(word).map(Op::as_str), Some(word), "{word}");
-        }
-        assert!(Op::parse("write").is_none(), "negative control");
-    }
 
     #[test]
     fn history_and_timeline_limits_match_retained_wire_rows() {
@@ -5148,7 +5628,7 @@ mod tests {
     fn momentum_wait_read_guards_conform_and_catch_expired_reparking() {
         use std::time::{Duration, Instant};
 
-        let model = aterm_spec::derive::momentum_wait_read_model();
+        let model = aterm_models_session::momentum_wait_read_model();
         let now = Instant::now();
         for (value, floor) in [(0.0, 0.0), (0.000_75, 0.0), (0.000_75, 0.000_7)] {
             for expired in [false, true] {
@@ -5310,7 +5790,7 @@ mod tests {
             output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
             modes: crate::mode_mirror_of(term),
             ui_waiting: Arc::default(),
-            edges: std::sync::Mutex::new(EdgeTable::new()),
+            edges: std::sync::Arc::new(std::sync::Mutex::new(EdgeTable::new())),
             turn_lease: std::sync::Mutex::new(None),
             self_id: sid.clone(),
             nonce,
@@ -5329,11 +5809,15 @@ mod tests {
                 crate::session_timeline::SessionTimeline::default(),
             )),
             fabric: std::sync::Arc::default(),
+            idem: Default::default(),
             rewrap_gauge: std::sync::Arc::default(),
             human_input: Default::default(),
+            launch: Default::default(),
             generation_look: Default::default(),
             reset_lane: Default::default(),
+            crash_journal: Default::default(),
             update_parked: Default::default(),
+            witness: Default::default(),
             fenced_writes: Default::default(),
         });
         SessionHandle {
@@ -5631,7 +6115,7 @@ mod tests {
             "{line}"
         );
         // …and once one has, the row says how long ago.
-        crate::app_input::note_person(&h.ctx);
+        crate::app_input::note_person(&h.ctx, crate::human_input::Gesture::Other);
         let out = sessions_lines(
             std::slice::from_ref(&h),
             Err("no event loop"),
@@ -6135,33 +6619,6 @@ mod tests {
         );
     }
 
-    /// The verb over a real store with no event loop to ask: the roster prints
-    /// with the window columns unset, and an empty store is still `OK 0` (no
-    /// hop is attempted for nothing).
-    #[test]
-    fn cmd_sessions_store_without_an_event_loop_prints_dashes_not_guesses() {
-        let store = crate::session_store::new_store();
-        assert_eq!(cmd_sessions_store(&store, None), "OK 0\n");
-        let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
-        store.write().unwrap().register(handle(4, &term));
-        let out = cmd_sessions_store(&store, None);
-        let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines[0], "OK 1");
-        assert_eq!(
-            tail(lines[1]),
-            "4 - alive tab-4 meta=0 window=- active=- wfocus=- detail=- identity=- path=live"
-        );
-        // The placement fold agrees with the line: no row is DETACHED.
-        let p = placement_of(&handle(4, &term), &[]);
-        assert_eq!(
-            p,
-            SessionPlacement {
-                sid: 4,
-                ..SessionPlacement::default()
-            }
-        );
-    }
-
     /// A minimal `SessionCtx` for the `temporal` verb: only the recorder is
     /// exercised, the rest is the same neutral shape [`handle`] builds.
     fn temporal_ctx() -> crate::SessionCtx {
@@ -6170,7 +6627,7 @@ mod tests {
             output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
             modes: Arc::default(),
             ui_waiting: Arc::default(),
-            edges: std::sync::Mutex::new(EdgeTable::new()),
+            edges: std::sync::Arc::new(std::sync::Mutex::new(EdgeTable::new())),
             turn_lease: std::sync::Mutex::new(None),
             self_id: SessionId::generate(),
             nonce: LaunchNonce::generate(),
@@ -6189,11 +6646,15 @@ mod tests {
                 crate::session_timeline::SessionTimeline::default(),
             )),
             fabric: std::sync::Arc::default(),
+            idem: Default::default(),
             rewrap_gauge: std::sync::Arc::default(),
             human_input: Default::default(),
+            launch: Default::default(),
             generation_look: Default::default(),
             reset_lane: Default::default(),
+            crash_journal: Default::default(),
             update_parked: Default::default(),
+            witness: Default::default(),
             fenced_writes: Default::default(),
         }
     }
@@ -6730,6 +7191,100 @@ mod exits_tests {
     }
 }
 
+/// THE SESSION LOG'S `by=` (design §2.5, phase 3A ruling R1): who the
+/// connection is, never a name anyone chose.
+#[cfg(test)]
+mod log_actor_tests {
+    use super::{cmd_grant, log_actor};
+    use crate::control::{Principal, Scope, ServingPrincipal};
+    use crate::session_store::test_handle;
+    use aterm_session::{EdgeToken, Op, SessionId};
+    use aterm_slog::Actor;
+
+    /// Owner is `ctl`, the harness's token `harness`, the bridge `bridge`, an
+    /// edge its minted source sid; an edge whose source is no minted sid —
+    /// `harness` among them, granted around `grant`'s refusal — and a token
+    /// the target never issued are nobody (`-`).
+    #[test]
+    fn log_actor_matrix() {
+        let caller = test_handle(1);
+        let target = test_handle(2);
+        assert_eq!(log_actor(Scope::Owner, &target.ctx), Actor::Ctl);
+        {
+            let _harness = ServingPrincipal::enter(Principal::Harness);
+            assert_eq!(log_actor(Scope::Owner, &target.ctx), Actor::Harness);
+            assert_eq!(
+                log_actor(Scope::Bridge, &target.ctx),
+                Actor::Bridge,
+                "the principal labels an Owner connection only"
+            );
+        }
+        assert_eq!(log_actor(Scope::Owner, &target.ctx), Actor::Ctl, "restored");
+        let grant = |src: &str| {
+            target
+                .ctx
+                .edges
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .grant(
+                    SessionId::new(src),
+                    target.sid.clone(),
+                    Op::WriteInput,
+                    target.ctx.nonce,
+                )
+        };
+        let minted = grant(caller.sid.as_str());
+        assert_eq!(
+            log_actor(Scope::Edge(minted), &target.ctx).word(),
+            caller.sid.as_str()
+        );
+        for chosen in [
+            "harness", "human", "ctl", "bridge", "aterm", "s-boss", "s-1",
+        ] {
+            let tok = grant(chosen);
+            assert_eq!(
+                log_actor(Scope::Edge(tok), &target.ctx),
+                Actor::Nobody,
+                "an edge granted as {chosen:?} is nobody"
+            );
+        }
+        assert_eq!(
+            log_actor(Scope::Edge(EdgeToken::generate()), &target.ctx),
+            Actor::Nobody
+        );
+    }
+
+    /// R1: `grant` (and `connect`) refuse a source that is one of the log's
+    /// actor words, naming it; a sid is granted as before.
+    #[test]
+    fn grant_refuses_a_reserved_source() {
+        let target = test_handle(3);
+        for word in aterm_slog::RESERVED_ACTOR_WORDS {
+            let reply = cmd_grant(&target.ctx, Scope::Owner, &format!("{word} write-input"));
+            assert!(
+                reply.starts_with(&format!("ERR reserved: src={word} ")),
+                "{word}: {reply}"
+            );
+        }
+        let ok = cmd_grant(
+            &target.ctx,
+            Scope::Owner,
+            "s-0123456789abcdef0123 write-input",
+        );
+        assert!(ok.starts_with("OK "), "{ok}");
+        let store = crate::session_store::new_store();
+        store.write().unwrap().register(target);
+        let conn = std::sync::Arc::new(crate::connections::ConnectionTable::default());
+        let reply = super::cmd_connect_in(
+            &conn,
+            &store,
+            Scope::Owner,
+            &format!("dst={} src=harness", "s-x"),
+        );
+        assert!(reply.starts_with("ERR reserved: src=harness "), "{reply}");
+    }
+}
+
 /// ROUND SEVEN OF THE UPDATE AUDIT, FINDINGS 29, 49 AND 50: the per-instance
 /// counters a driver pages or waits by keep their meaning across a seamless
 /// update — the exit ledger's and the timeline's ids go on above the old
@@ -6830,10 +7385,16 @@ mod update_anchor_tests {
             &adopted.ctx.temporal,
             Some(7),
             read.sessions[0].timeline_id,
-            read.sessions[0]
-                .log_ids
-                .as_deref()
-                .and_then(crate::session_log::LogCarry::parse),
+            crate::session_log::LogAdopt {
+                ids: read.sessions[0]
+                    .log_ids
+                    .as_deref()
+                    .and_then(crate::session_log::LogCarry::parse),
+                seq: read.sessions[0].log_seq,
+                lines: None,
+                keeper_ep: None,
+                mirror: None,
+            },
             false,
         );
         adopted

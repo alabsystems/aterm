@@ -466,7 +466,6 @@ mod moment_tests {
             return;
         }
         let watch = watch.expect("watch a live child");
-        std::thread::sleep(Duration::from_millis(50));
         assert_eq!(watch.get(), None, "alive: nothing stamped");
         let killed = Instant::now();
         child.kill().expect("SIGKILL");

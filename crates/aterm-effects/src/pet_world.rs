@@ -997,14 +997,6 @@ impl PetWorld {
         at(r1, c1) + at(r0, c0) - at(r1, c0) - at(r0, c1)
     }
 
-    /// Conservative swept rectangle: it can refuse a diagonal whose corners
-    /// happen to be free, but cannot skip ink between sampled waypoints.
-    #[must_use]
-    #[cfg(test)]
-    pub fn corridor_clear(&self, from: PetRect, to: PetRect, margin: f32) -> bool {
-        from.valid() && to.valid() && self.clear(from.union(to), margin)
-    }
-
     /// The swept-body test for a resident travelling behind text, for a body
     /// leaving the caret's escort seat.
     ///
@@ -1095,8 +1087,9 @@ impl PetWorld {
     }
 
     /// `target` is an attention location `(row, col)`, not a fabricated caret.
-    /// The returned destination is clear; travel must separately pass
-    /// `corridor_clear` from the current body.
+    /// The returned destination is clear; travel must separately clear the
+    /// corridor from the current body ([`Self::clear`] over the union of the
+    /// two bodies).
     #[must_use]
     pub fn perch_near(
         &self,
@@ -1691,34 +1684,6 @@ mod tests {
     }
 
     #[test]
-    fn both_prefix_planes_reset_correctly_when_the_scan_shrinks_and_grows() {
-        let mut world = PetWorld::default();
-        for (rows, cols, ink) in [(57, 151, true), (8, 20, false), (57, 151, false)] {
-            let mut term = Terminal::new(rows, cols);
-            term.process(b"\x1b[?25l");
-            if ink {
-                term.process(&vec![b'x'; usize::from(rows) * usize::from(cols)]);
-                term.text_selection_mut().start_selection(
-                    0,
-                    0,
-                    SelectionSide::Left,
-                    SelectionType::Simple,
-                );
-                term.text_selection_mut().update_selection(
-                    i32::from(rows - 1),
-                    cols - 1,
-                    SelectionSide::Right,
-                );
-            }
-            let (input, facts) = snapshot(&mut term);
-            assert!(world.observe(&input, &facts, PetPane::full(&input)));
-            let rect = PetRect::new(1.0, 1.0, f32::from(rows) - 2.0, f32::from(cols) - 2.0);
-            assert_eq!(world.clear(rect, 0.0), !ink);
-            assert_eq!(world.under_text_clear(rect, 0.0), !ink);
-        }
-    }
-
-    #[test]
     fn reused_observations_match_fresh_maps_after_coverage_changes() {
         let mut reused = PetWorld::default();
         // Seed the whole backing buffer with ink, shrink to blank, then move
@@ -1999,6 +1964,62 @@ mod tests {
         let alt = observe(&mut term);
         assert!(alt.anchors().iter().all(Option::is_none));
         assert!(alt.resolve(anchor).is_none());
+    }
+
+    /// A FULL CLEAR WHILE A COMMAND RUNS (`clear; make` from a prompt low on
+    /// the screen): the clear blanked every row of the running block, which
+    /// moves them to the cleared screen's top row (`aterm-core`'s
+    /// `note_full_clear`), so the cat's anchor is the last glyph the command
+    /// wrote after the clear, rows above where its output had started; an
+    /// anchor never starts above a block's output row, so the old rows could
+    /// not name it. After its D and the next prompt at the screen's top, no
+    /// block the facts carry runs backwards and the finished block anchors on
+    /// its own last line. CONTROL: before the clear the anchor is the output
+    /// line it had.
+    #[test]
+    fn a_full_clear_moves_the_running_blocks_anchor_onto_what_followed_it() {
+        let mut term = Terminal::new(12, 50);
+        term.process(
+            b"\x1b[?25l\x1b[9;1H\x1b]133;A\x07$ \x1b]133;B\x07make\r\n\x1b]133;C\x07compiling\r\n",
+        );
+        let running = |world: &PetWorld| {
+            world
+                .anchors()
+                .iter()
+                .flatten()
+                .find(|a| a.state == BlockState::Executing)
+                .map(|a| (a.block_id, a.absolute_row, a.col))
+        };
+        let id = term.current_block().expect("running").id;
+        let output_row = term
+            .current_block()
+            .and_then(|b| b.output_start_row)
+            .expect("output started");
+        assert_eq!(
+            running(&observe(&mut term)),
+            Some((id, output_row, 9.0)),
+            "CONTROL: the output line it had"
+        );
+        term.process(b"\x1b[H\x1b[2Jafter-1\r\nafter-2");
+        let (block, row, col) = running(&observe(&mut term)).expect("still running");
+        assert_eq!((block, row, col), (id, 1, 7.0));
+        assert!(row < output_row, "above where its output had started");
+        term.process(b"\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        let (_, facts) = snapshot(&mut term);
+        for block in facts.blocks.iter().flatten() {
+            let output = block.output_row.unwrap_or(block.start_row);
+            assert!(
+                block.start_row <= output && output <= block.end_row,
+                "a forward range: {block:?}"
+            );
+        }
+        let finished = observe(&mut term)
+            .anchors()
+            .iter()
+            .flatten()
+            .find(|a| a.block_id == id)
+            .map(|a| (a.state, a.exit_code, a.absolute_row, a.col));
+        assert_eq!(finished, Some((BlockState::Complete, Some(0), 1, 7.0)));
     }
 
     #[test]

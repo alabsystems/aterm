@@ -25,6 +25,8 @@ aterm-containment = { workspace = true }
 # diagnostic subcommand that prints and exits before any PTY spawn.
 aterm-render = { workspace = true }
 aterm-types = { workspace = true }
+# `aterm theme pack | install`: the community theme pack, embedded (no network).
+aterm-theme-pack = { workspace = true }
 # `aterm help rust` calls the REAL toolchain discovery (`atpkg::toolchain`) rather
 # than restating it. The one `aterm` binary links atpkg already.
 atpkg = { workspace = true }
@@ -86,6 +88,12 @@ libc = { workspace = true }
 workspace = true
 
 [dev-dependencies]
+aterm-tempfile = { workspace = true }
 # The tests' scratch-directory stamp: the workspace's one epoch-clock read, already
 # in the graph via aterm-types.
 aterm-time = { workspace = true }
+# `aterm_spec::host::could_not_run`: a test this host cannot run (as root, no
+# zsh, no font) ends COULD NOT RUN, never a silent pass; and
+# `wait::past_text_busy`: the shim tests exec files they just wrote while sibling
+# test threads fork (Linux's ETXTBSY).
+aterm-spec = { workspace = true }

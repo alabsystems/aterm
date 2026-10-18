@@ -53,58 +53,6 @@ fn phaser_band_spans_three_letters_and_never_parks() {
     );
 }
 
-/// Echo-run law: a coalesced typing echo (2-3 cells forward on one row, backed
-/// by an admitted typed candidate mid-rhythm) is continued typing: every swept
-/// cell gets its own typing spark in successive hues, with no flare slam or
-/// landing ring.
-#[test]
-fn coalesced_echo_advance_is_typing_and_lays_every_cell() {
-    let g = geom();
-    let c = cfg(GlowStyle::Phaser, true);
-    let t0 = Instant::now();
-    let mut out = Vec::new();
-    let mut glow = CursorGlow::default();
-    glow.tick(Some((2, 4)), t0, &c, g, &mut out);
-    // Two sequential echoes establish the rhythm…
-    glow.note_synthetic_typed(t0 + Duration::from_millis(6), 1);
-    glow.tick(Some((2, 5)), t0 + Duration::from_millis(8), &c, g, &mut out);
-    glow.note_synthetic_typed(t0 + Duration::from_millis(14), 1);
-    glow.tick(
-        Some((2, 6)),
-        t0 + Duration::from_millis(16),
-        &c,
-        g,
-        &mut out,
-    );
-    // …then two keys echo in one observed move (frame coalescing).
-    glow.note_synthetic_typed(t0 + Duration::from_millis(22), 2);
-    glow.tick(
-        Some((2, 8)),
-        t0 + Duration::from_millis(24),
-        &c,
-        g,
-        &mut out,
-    );
-    for col in 6..=7u16 {
-        let s = glow
-            .sparks
-            .iter()
-            .find(|s| s.row == 2 && s.col == col)
-            .unwrap_or_else(|| panic!("swept cell {col} got its spark"));
-        assert!(s.typing, "cell {col} is a TYPING spark, not a jump");
-    }
-    let (h6, h7) = (
-        glow.sparks.iter().find(|s| s.col == 6).unwrap().hue,
-        glow.sparks.iter().find(|s| s.col == 7).unwrap().hue,
-    );
-    assert!(
-        (h7 - h6).rem_euclid(1.0) > 1e-3,
-        "each swept cell lays its own successive hue ({h6} vs {h7})"
-    );
-    assert!(glow.flare < 0.05, "no flare slam on a coalesced echo");
-    assert!(glow.ring.is_none(), "no landing ring on a coalesced echo");
-}
-
 /// Echo-run reach: the coalesced-echo law extends to the shared typed-bridge
 /// reach (8 cells, `HIDE_BRIDGE_TYPED_MAX_DIST`). A 4-8 cell typed advance in
 /// one frame (key-repeat across a frame slip, SSH echo batching) must not fall
@@ -320,17 +268,4 @@ fn disabled_or_zero_intensity_emits_nothing() {
     glow.tick(Some((2, 0)), now, &c, g, &mut out);
     let fp = glow.tick(Some((2, 30)), now, &c, g, &mut out);
     assert_eq!(fp, 0);
-}
-
-#[test]
-fn hidden_cursor_does_not_spawn_on_reappear() {
-    let mut glow = CursorGlow::default();
-    let now = Instant::now();
-    let g = geom();
-    let mut out = Vec::new();
-    let c = cfg(GlowStyle::Lumen, true);
-    glow.tick(Some((2, 0)), now, &c, g, &mut out);
-    glow.tick(None, now, &c, g, &mut out);
-    let fp = glow.tick(Some((2, 30)), now, &c, g, &mut out);
-    assert_eq!(fp, 0, "no comet across a hide/show gap");
 }

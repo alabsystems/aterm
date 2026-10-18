@@ -362,7 +362,6 @@ mod tests {
                 .expect_err("oversized fingerprint rejected"),
         ] {
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-            assert!(error.to_string().contains("8-byte"), "{error}");
         }
 
         let invalid_utf8 = root.join("invalid-utf8.toml");

@@ -4,33 +4,6 @@
 use super::*;
 
 #[test]
-fn redraw_layout_resolver_builds_one_plan() {
-    let app = App::headless_for_test();
-    let wid = WindowId(0);
-
-    reset_visible_leaf_plan_builds();
-    let (plan, route) = app.active_visible_frame_layout(wid).expect("frame layout");
-    assert_eq!(plan.leaves.len(), 1, "negative-control fixture shape");
-    assert_eq!(route, VisibleContentRoute::Terminal { composed: false });
-    assert_eq!(
-        visible_leaf_plan_builds(),
-        1,
-        "one frame layout owns one plan build"
-    );
-
-    // Negative control: building the route and then the geometry separately must be
-    // seen as two builds, or the positive assertion could pass vacuously.
-    reset_visible_leaf_plan_builds();
-    assert!(app.active_visible_content_route(wid).is_some());
-    assert!(app.active_visible_leaf_plan(wid).is_some());
-    assert_eq!(
-        visible_leaf_plan_builds(),
-        2,
-        "old spelling rebuilt the plan"
-    );
-}
-
-#[test]
 fn route_follows_zoom_aware_visible_content_not_hidden_root_membership() {
     let wid = WindowId(0);
 
@@ -434,49 +407,5 @@ fn output_wake_redraw_admission_is_o_visible_windows_at_any_session_count() {
             0,
             "{background} background sessions: by a retry of it alone"
         );
-    }
-}
-
-/// `ActiveEventLoop` cannot be manufactured in a headless unit test. Pin
-/// the event arm's sequencing directly: a future cleanup must not move
-/// optional work back in front of redraw admission, or move subscriber
-/// notification ahead of the status it is meant to publish.
-#[test]
-fn output_wake_admits_redraw_before_bookkeeping_and_preserves_publication_order() {
-    let source = include_str!("lib.rs");
-    let arm = source
-        .split_once("Wake::Output { session, window } => {")
-        .expect("output wake arm")
-        .1
-        .split_once("Wake::ClaudeFooter { session } => {")
-        .expect("next wake arm")
-        .0;
-    assert!(
-        arm.contains("self.on_output_wake(session, Instant::now())"),
-        "the event arm delegates to the headless-drivable body"
-    );
-    let body = source
-        .split_once("fn on_output_wake(&mut self, session: u64, now: Instant) {")
-        .expect("output wake body")
-        .1
-        .split_once("\n    }\n")
-        .expect("end of the output wake body")
-        .0;
-    let stages = [
-        "s.output_wake_pending.store(0, Ordering::Relaxed)",
-        "self.admit_output_redraws(session, now)",
-        "self.observe_session_statuses(now)",
-        "self.subscribers.any()",
-        "self.search_refresh_for_output(session)",
-        "self.observe_title_drift(session, now)",
-    ];
-    for pair in stages.windows(2) {
-        let before = body
-            .find(pair[0])
-            .unwrap_or_else(|| panic!("missing {}", pair[0]));
-        let after = body
-            .find(pair[1])
-            .unwrap_or_else(|| panic!("missing {}", pair[1]));
-        assert!(before < after, "{} must precede {}", pair[0], pair[1]);
     }
 }

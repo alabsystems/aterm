@@ -231,15 +231,6 @@ mod tests {
     }
 
     #[test]
-    fn lookup_basic_colors() {
-        assert_eq!(lookup("red"), Some(Rgb::new(255, 0, 0)));
-        assert_eq!(lookup("green"), Some(Rgb::new(0, 128, 0)));
-        assert_eq!(lookup("blue"), Some(Rgb::new(0, 0, 255)));
-        assert_eq!(lookup("black"), Some(Rgb::new(0, 0, 0)));
-        assert_eq!(lookup("white"), Some(Rgb::new(255, 255, 255)));
-    }
-
-    #[test]
     fn lookup_case_insensitive() {
         assert_eq!(lookup("Red"), Some(Rgb::new(255, 0, 0)));
         assert_eq!(lookup("RED"), Some(Rgb::new(255, 0, 0)));
@@ -262,10 +253,6 @@ mod tests {
         assert_eq!(lookup("notacolor"), None);
         assert_eq!(lookup(""), None);
         assert_eq!(lookup("redd"), None);
-    }
-
-    #[test]
-    fn lookup_non_ascii_returns_none() {
         assert_eq!(lookup("r\u{00e9}d"), None);
     }
 }

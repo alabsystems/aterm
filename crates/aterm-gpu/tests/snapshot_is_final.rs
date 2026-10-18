@@ -13,7 +13,7 @@
 // The renderer under test is deliberately not font-settled; a settled CPU
 // renderer is the oracle for which glyphs route off the primary face.
 //
-// No GPU or no system font: no-op.
+// No GPU or no font: COULD NOT RUN.
 
 use aterm_core::terminal::Terminal;
 use aterm_render::{FaceId, Theme};

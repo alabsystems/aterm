@@ -1,73 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **A REPLACED BUS LOG LIFTS NO HALT** — the broker comes back on a fresh
-//! bus.log (deleted, or moved aside after the broker refused it) while a
-//! human's fleet halt stands.
-//!
-//! The halt is a retained row on the log, so the new log carries none, and an
-//! attach that read "no row" as "nobody is halting" wrote `hold off` to every
-//! session in the middle of the emergency the halt was for. The bridge now
-//! judges the new log another one (its head is below the one it saw), keeps
-//! the halt, says so on the new log, and only the human's own row there lifts
-//! it.
+//! **A REPLACED BUS LOG'S OFFSETS ARE ANOTHER LOG'S** (r2-01) — the broker
+//! comes back on a fresh bus.log (deleted, or moved aside after the broker
+//! refused it), whose records are numbered from 0 again. Nothing kept against
+//! the old log's offsets may answer for the new log's records: not the
+//! endpoint's delivery dedup, and not a receipt owed for an old row.
 //!
 //! Every wait is an `until`, a one-minute hang detector; nothing is timed.
 
 use crate::harness;
 
 use harness::{FLEET, World, id_at_off, off_of, until};
-
-/// Negative control: before the keep, the re-attach's apply wrote `hold
-/// <sid> off origin=fleet`, and the session read `hold=0` by the time its
-/// presence row was back on the new log.
-#[test]
-fn a_broker_restarted_on_a_fresh_log_keeps_the_halt_until_its_human_lifts_it() {
-    let mut w = World::boot("replaced-log", &[]);
-    w.wait_ready();
-    let (a, _b) = w.two_sessions();
-    let halt = format!("/f/{FLEET}/fleet/h-x/halt");
-    w.god()
-        .publish(5_300, 1, &halt, b"v=1 t=1 state=on reason=stop")
-        .expect("publish the halt");
-    until("the halt to reach the endpoint", || {
-        let reply = w.verb(&format!("@{a} send hi"));
-        reply.header().starts_with("ERR halted").then_some(())
-    });
-
-    replace_the_log(&mut w);
-
-    // THE BRIDGE IS BACK ON THE NEW LOG: a session's presence row is published
-    // after the attach has applied the halts, so this orders the check after
-    // the decision without a sleep.
-    until("the session's presence row on the new log", || {
-        harness::presence_body(&w, &a)
-    });
-    let reply = w.verb(&format!("@{a} send hi"));
-    assert!(
-        reply.header().starts_with("ERR halted") && reply.header().contains("reason=stop"),
-        "a fresh log lifted the halt: {} — log:\n{}",
-        reply.header(),
-        w.log_tail()
-    );
-    let ev = w.ev();
-    assert!(
-        ev.iter().any(|e| e.starts_with("log-replaced head="))
-            && ev.iter().any(|e| e == "halt-kept by=h-x"),
-        "the new log is not told why the node is held: {ev:#?}"
-    );
-
-    // THE HUMAN'S OWN ROW ON THE NEW LOG LIFTS IT.
-    w.god()
-        .publish(5_300, 1, &halt, b"v=1 t=2 state=off")
-        .expect("lift the halt on the new log");
-    until("the human's lift to reach the endpoint", || {
-        w.verb(&format!("@{a} status"))
-            .header()
-            .contains("hold=0")
-            .then_some(())
-    });
-}
 
 /// THE LOG GOES: the broker stops, its bus.log is moved aside, and it comes
 /// back on an empty one at the same path and socket — a log of another

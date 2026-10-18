@@ -517,11 +517,26 @@ pub fn collect(
             }
         }
     }
-    let untracked_list = git
-        .run(&["ls-files", "--others", "--exclude-standard", "-z"], &[])
-        .map_err(Refused)?;
+    let untracked_args: &[&str] = if base_rev.is_some() {
+        &["ls-files", "--others", "--exclude-standard", "-z"]
+    } else {
+        &[
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ]
+    };
+    let untracked_list = git.run(untracked_args, &[]).map_err(Refused)?;
     let mut untracked = Vec::new();
     for name in untracked_list.split('\0').filter(|n| !n.is_empty()) {
+        if untracked.iter().any(|u| u == name)
+            || held_back.iter().any(|h| h == name)
+            || links.iter().any(|l| l == name)
+        {
+            continue;
+        }
         let link = root_path
             .join(name)
             .symlink_metadata()
@@ -555,9 +570,11 @@ pub fn collect(
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         diff = git.run(&refs, &[]).map_err(Refused)?;
     }
+    let mut untracked_files = 0usize;
     for name in &untracked {
         if let Some(hunk) = new_file_hunk(&root_path, name) {
             diff.push_str(&hunk);
+            untracked_files += 1;
         }
         if diff.len() > CHANGE_MAX {
             break;
@@ -578,7 +595,7 @@ pub fn collect(
         root: root_path,
         describes,
         diff,
-        files: tracked.len() + untracked.len(),
+        files: tracked.len() + untracked_files,
         held_back,
         links,
     })

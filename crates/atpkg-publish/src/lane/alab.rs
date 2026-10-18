@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The Apple lane: keep the ALab programs' pins at each repo's newest signed source
-//! release, unattended, on a rostered Mac (launchd, every 6 h).
+//! release, unattended, on a rostered Mac (launchd, every 6 h). A package row
+//! ([`Shape::Package`], codex-alab) is never read here: a person packs and pins it.
 //!
 //! Per run, over the verified channel head (a head or pin below what this lane last saw
 //! refuses the run): a pure [`decide`] per program row (plain → tracked, bundle → human
@@ -27,6 +28,7 @@ use super::report::{self, Notifier, Transcript};
 use super::rows::{self, Fetched};
 use super::state::{LaneState, Lock};
 use crate::api::{Baseline, Build, Delta, IndexRequest, Indexer, PackRequest, Packer, Signing};
+use crate::artifact::{pkgdoc, upload};
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
 use crate::host::{Probe, Release};
@@ -320,7 +322,7 @@ impl Row {
             Decision::Index => format!(
                 "INDEX: {tag} (build {build}) is already on {staging} as {} — publishing the \
                  index is what remains",
-                rows::tag(self.program.name, build)
+                upload::tag(self.program.name, build)
             ),
             Decision::HumanLane { missing, .. } => format!(
                 "HUMAN-LANE: {tag} (build {build}) > pin {} — a sysroot bundle; its pack \
@@ -467,6 +469,15 @@ fn locked(
     let slug = ctx.index_slug();
     let (n, head) = match quad::fetch_head(ctx, &slug, &work.join("head")) {
         Ok(h) => h,
+        // A dry run is a person asking what the lane would do: a channel it cannot read
+        // answers that question with COULD NOT RUN (exit 3), never `nothing to decide`.
+        // The unattended run keeps exit 0 and its failure counter.
+        Err(Error::CannotRun(why)) if opts.dry_run => {
+            return Err(Error::cannot_run(format!(
+                "could not read an atpkg-index-N release on {slug} ({why}) — the dry run \
+                 has no channel head to decide against"
+            )));
+        }
         Err(Error::CannotRun(why)) => {
             let fails = state.bump_head_failures(opts.dry_run);
             tx.say(format!(
@@ -510,6 +521,8 @@ fn locked(
         // Every pack and the index are signed by this key: one the head's roster does not
         // list as live signs documents no client accepts.
         crate::identity::signer_for(ctx, &head.roster)?;
+        // The packs below sign under the generation this head elects: read once, here.
+        crate::artifact::sign::elect_from_head(ctx, &head);
     }
     let horizon = horizon_note(ctx, &head)?;
     if let Some(h) = &horizon {
@@ -536,7 +549,9 @@ fn locked(
         .collect();
     let mut rows = Vec::new();
     let mut required_of: BTreeMap<&str, BTreeSet<Triple>> = BTreeMap::new();
-    for def in programs::PROGRAMS {
+    // A package row (codex-alab) is a person's to pack and pin: the lane never reads it, and
+    // the index carries its head pin and block as they stand.
+    for def in programs::PROGRAMS.iter().filter(|d| d.lane_tracked()) {
         let facts = gather(ctx, opts, state, &head, &pins, &work, &mut clones, def, tx);
         if let Staging::Known { required, .. } = &facts.staging {
             required_of.insert(def.name, required.clone());
@@ -752,6 +767,7 @@ fn locked(
                 delta,
                 out: state.dir.join("index-out"),
                 upload: true,
+                pack_dir: None,
             },
         )
         .map_err(|e| {
@@ -964,7 +980,7 @@ fn gather(
                 "{}: {} on {} lacks target row(s): {} — a half-packed release (a leg failed \
                  after an earlier one uploaded) is never pinned",
                 def.name,
-                rows::tag(def.name, rel.build),
+                upload::tag(def.name, rel.build),
                 ctx.accounts.staging,
                 super::state::names(&missing)
             ));
@@ -1187,14 +1203,14 @@ fn staging_of(
             return Staging::Unknown(format!(
                 "{} unreachable — the pinned manifest {} could not be read ({why})",
                 ctx.accounts.staging,
-                rows::manifest_name(def.name, pin)
+                pkgdoc::manifest_name(def.name, pin)
             ));
         }
         Fetched::Invalid(why) => {
             return Staging::Unknown(format!(
                 "the pinned manifest {} does not verify ({why}) — the rows a new build must \
                  carry are unknown",
-                rows::manifest_name(def.name, pin)
+                pkgdoc::manifest_name(def.name, pin)
             ));
         }
     }
@@ -1210,11 +1226,11 @@ fn staging_of(
         Fetched::Unreachable(why) => Staging::Unknown(format!(
             "{} unreachable — {} could not be looked up ({why})",
             ctx.accounts.staging,
-            rows::tag(def.name, build)
+            upload::tag(def.name, build)
         )),
         Fetched::Invalid(why) => Staging::Unknown(format!(
             "{} on {} does not verify ({why}) — never pinned, and never re-packed over",
-            rows::tag(def.name, build),
+            upload::tag(def.name, build),
             ctx.accounts.staging
         )),
     }
@@ -1344,14 +1360,14 @@ fn pack(
             "the packed manifest lacks target row(s): {} — a dropped platform is never pinned \
              (release {} stays on staging, unpinned)",
             super::state::names(&lost),
-            rows::tag(name, build)
+            upload::tag(name, build)
         ));
     }
     state.clear_attempts(name, build);
     tx.say(format!(
         "[{name} {}] staged {} on {} ({})",
         rel.tag,
-        rows::tag(name, build),
+        upload::tag(name, build),
         ctx.staging_slug(def.repo),
         super::state::names(def.darwin_triples())
     ));
@@ -1510,7 +1526,7 @@ pub fn bundle_command(row: &Row) -> Vec<String> {
             _ => b.darwin.to_vec(),
         };
         let dir = format!("<out dir>/pack-{name}-{build}");
-        let manifest = format!("{dir}/{}", rows::manifest_name(name, build));
+        let manifest = format!("{dir}/{}", pkgdoc::manifest_name(name, build));
         let merge_base = format!("{dir}/merge-base-{name}-{build}.toml");
         out.push(
             "# build + stage the sysroot of each target as docs/RUNBOOK-atpkg-republish.md \
@@ -1540,7 +1556,7 @@ pub fn bundle_command(row: &Row) -> Vec<String> {
     out.push(format!(
         "# then re-run this lane (or `launchctl kickstart` it): the staging release {} is what \
          it waits for",
-        rows::tag(name, build)
+        upload::tag(name, build)
     ));
     out
 }

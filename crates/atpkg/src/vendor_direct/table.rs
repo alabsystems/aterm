@@ -40,18 +40,6 @@ pub enum Anchor {
 }
 
 impl Anchor {
-    /// The spelling a `.vendor` record carries.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::AnthropicOpenPgp => "anthropic-openpgp",
-            Self::OpenAiTwoHost => "openai-two-host",
-            Self::GoogleTwoHost => "google-two-host",
-            Self::MetaDeveloperId => "meta-developer-id",
-        }
-    }
-
     /// Whether the documents vouch for the payload digest before a byte is fetched. muse's
     /// come from the host that serves the bytes, so its digest is vouched for only once the
     /// Developer ID team pin passed the bytes it names.
@@ -286,7 +274,7 @@ const AGY_HEAD: &str = agy_manifests!();
 /// decided like any read build. Only while that read fails is it kept (`LegacyUnread`), and
 /// the next pass reads again. Raising the ceiling means raising the floors with it — never
 /// one without the other.
-const LEGACY_CEILING: u64 = 2_026_092_401;
+pub(crate) const LEGACY_CEILING: u64 = 2_026_092_401;
 
 /// The [`VendorSpec::legacy_ceiling`] of a program no ALab index ever pinned: no legacy
 /// build of it is vouched for by its floor, so a non-vendor build in its store is kept,
@@ -513,28 +501,6 @@ pub fn served_here(program: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// The authority host of an `https://host/...` URL.
-    fn host(url: &str) -> &str {
-        let rest = url.strip_prefix("https://").expect("https");
-        rest.split('/').next().unwrap()
-    }
-
-    /// Every row's legacy ceiling is the newest of the final legacy pins (index 46: claude
-    /// 2026092401, codex 2026092301) or, for a program no index pinned, none: an index
-    /// build, never a vendor one. Each floor is in its program's grammar.
-    #[test]
-    fn the_legacy_ceiling_is_an_index_build() {
-        for s in VENDORS {
-            assert!(
-                [LEGACY_CEILING, NEVER_INDEX_PINNED].contains(&s.legacy_ceiling),
-                "{}",
-                s.program
-            );
-            assert!(!super::super::is_vendor_build(s.legacy_ceiling));
-            assert_eq!(s.floor.has_revision(), s.revision_versions, "{}", s.program);
-        }
-    }
-
     /// THE WARM NEVER STARTS A TURN: claude's warm is print mode over a stdin
     /// the warm never writes — never `--bare` or `--init-only`, which skip or race the
     /// fetches it exists for — with no transcript and no hooks; and no warm argv carries a
@@ -560,69 +526,23 @@ mod tests {
         }
     }
 
-    /// Every pin is an admissible https URL or host. The vendor-direct lane's host pins are
-    /// these compiled prefixes, never `vendor::VENDOR_HOSTS` (the index rows' list): a
-    /// multi-tenant host is pinned here by its path, which that list cannot say.
+    /// The `anchor` key of a `.vendor` record an earlier client wrote: each spelling is
+    /// an on-disk contract, and a record whose anchor no longer parses is refused.
     #[test]
-    fn every_pin_is_an_admissible_https_url() {
-        let admissible = |h: &str| crate::vendor::https_host(&format!("https://{h}/")) == Some(h);
-        for s in VENDORS {
-            assert!(
-                s.url_prefixes.iter().any(|p| s.head_url.starts_with(p)),
-                "{}: the head is fetched under a pinned prefix",
-                s.program
-            );
-            for p in s.url_prefixes {
-                assert!(p.starts_with("https://") && p.ends_with('/'), "{p}");
-                assert!(admissible(host(p)), "{p}");
-            }
-            for (i, pin) in s.digest_docs.iter().enumerate() {
-                assert!(
-                    s.url_prefixes.iter().any(|p| pin.prefix.starts_with(p)),
-                    "{}: a digest document is fetched under a pinned prefix",
-                    pin.prefix
-                );
-                for other in &s.digest_docs[i + 1..] {
-                    assert!(
-                        !pin.prefix.starts_with(other.prefix)
-                            && !other.prefix.starts_with(pin.prefix),
-                        "{} and {} overlap",
-                        pin.prefix,
-                        other.prefix
-                    );
-                }
-                for h in pin.redirect_hosts {
-                    assert!(admissible(h), "{h}");
-                }
-            }
-            let team = s.apple_team;
-            assert_eq!(team.len(), 10);
-            assert!(
-                team.bytes()
-                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
-            );
-            for tool in s.exposes {
-                assert!(crate::store::shim_allowed(tool), "{tool}");
-            }
-            assert_eq!(
-                s.shim_env().entries().len(),
-                s.shim_env.len(),
-                "{}",
-                s.program
-            );
-            // A compiled updater switch is one that turns the updater off.
-            for (name, value) in s.shim_env().entries() {
-                if crate::shim_env::SELF_UPDATE_SWITCHES
-                    .iter()
-                    .any(|(n, _)| n == name)
-                {
-                    assert!(
-                        crate::shim_env::turns_updater_off(name, value),
-                        "{}: {name}={value}",
-                        s.program
-                    );
-                }
-            }
+    fn anchors_spell_as_their_record_strings() {
+        #[derive(Serialize, Deserialize)]
+        struct Row {
+            a: Anchor,
+        }
+        for (a, spelled) in [
+            (Anchor::AnthropicOpenPgp, "anthropic-openpgp"),
+            (Anchor::OpenAiTwoHost, "openai-two-host"),
+            (Anchor::GoogleTwoHost, "google-two-host"),
+            (Anchor::MetaDeveloperId, "meta-developer-id"),
+        ] {
+            let text = aterm_toml::to_string(&Row { a }).unwrap();
+            assert_eq!(text.trim(), format!("a = \"{spelled}\""));
+            assert_eq!(aterm_toml::from_str::<Row>(&text).unwrap().a, a);
         }
     }
 
@@ -687,24 +607,6 @@ mod tests {
         ] {
             assert!(row.digest_doc_admitted(doc, doc), "{doc}");
             assert!(!row.digest_doc_admitted(doc, other), "{doc} from {other}");
-        }
-    }
-
-    #[test]
-    fn anchors_spell_as_their_record_strings() {
-        #[derive(Serialize, Deserialize)]
-        struct Row {
-            a: Anchor,
-        }
-        for a in [
-            Anchor::AnthropicOpenPgp,
-            Anchor::OpenAiTwoHost,
-            Anchor::GoogleTwoHost,
-            Anchor::MetaDeveloperId,
-        ] {
-            let text = aterm_toml::to_string(&Row { a }).unwrap();
-            assert_eq!(text.trim(), format!("a = \"{}\"", a.as_str()));
-            assert_eq!(aterm_toml::from_str::<Row>(&text).unwrap().a, a);
         }
     }
 }

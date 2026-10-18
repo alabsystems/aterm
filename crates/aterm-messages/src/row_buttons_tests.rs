@@ -1,17 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Decision buttons and the comet: a row's decision buttons pinned to the
-//! right edge with `Details ›` last at every width, and a moving comet that
-//! leaves the glyph cell to the row's own glyph.
+//! Decision buttons: a row's decision buttons pinned to the right edge with
+//! `Details ›` last at every width.
 
-use crate::animate::{Anim, Look};
 use crate::center::MessageCenter;
 use crate::glass::{Links, Presentation};
 use crate::log::MessageLog;
 use crate::model::{Decision, Hold, Intent, Message, Meter, Severity, WallStamp, tags};
 use crate::text::char_width;
-use crate::{Duration, HOLD_ASK, Instant, MARGIN, STALE_TAILED, STALE_UPDATE};
+use crate::{HOLD_ASK, Instant, MARGIN, STALE_TAILED, STALE_UPDATE};
 
 fn stamp() -> WallStamp {
     WallStamp { unix_ms: 1 }
@@ -96,26 +94,6 @@ fn a_rows_buttons_are_pinned_right_with_details_last_at_every_width() {
                     msg.title
                 );
             }
-        }
-    }
-}
-
-/// A moving comet leaves the glyph cell to the row's own glyph, on every
-/// width and at every frame of a crossing: the comet already says the work
-/// moves, and the painter draws that glyph as an icon.
-#[test]
-fn a_moving_comet_keeps_the_rows_own_glyph() {
-    let now = Instant::now();
-    let mut c = MessageCenter::new(MessageLog::empty(), now);
-    c.post(rows_with_buttons().remove(2), stamp(), now);
-    c.commit_rows(now, 3);
-    for cols in [60usize, 80, 120, 160] {
-        let p = present(&c, cols);
-        for k in 0..60u64 {
-            let at = now + Duration::from_millis(33 * k + 1);
-            let m = c.motion(&p, at, Look::MOVING);
-            assert!(matches!(m.rows[0].anim, Anim::Comet { .. }), "{cols}/{k}");
-            assert_eq!(m.rows[0].glyph, None, "{cols}/{k}: no spinner");
         }
     }
 }

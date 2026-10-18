@@ -17,6 +17,8 @@ use crate::{App, WindowId, restore};
 fn leaf(title: &str) -> restore::RestoredSplitTree {
     restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(
         restore::TerminalLeafRestore {
+            sid: None,
+            lineage: None,
             cwd: Some("/tmp".to_string()),
             title: title.to_string(),
             profile: None,
@@ -28,7 +30,9 @@ fn leaf(title: &str) -> restore::RestoredSplitTree {
             attention: None,
             questions: None,
             autopilot: None,
+            land_at: None,
             identity: None,
+            theme: None,
             agent: None,
             supervised: None,
             held: false,
@@ -389,4 +393,404 @@ fn tabs_landing_behind_the_front_one_leave_its_find_bar_open() {
         app.windows[&wid].search.is_some(),
         "find stays open while B and C land"
     );
+}
+
+/// An agent a leaf carries, as an earlier crash's or restart's layout names
+/// it: its conversation `session`.
+fn carried_agent(session: &str) -> Box<restore::AgentRestore> {
+    Box::new(restore::AgentRestore {
+        pid: 4242,
+        start: "Sat Sep 27 01:02:03 2026".to_string(),
+        program: "/opt/claude/bin/claude".to_string(),
+        argv: vec!["/opt/claude/bin/claude".to_string()],
+        session: Some(session.to_string()),
+        cwd: "/tmp".to_string(),
+        version: None,
+        home: None,
+        login: None,
+        run: None,
+        word: String::new(),
+        cause: None,
+        tab: None,
+    })
+}
+
+/// Tab `at` of `wl` as the previous launch's layout wrote it: its pool id
+/// then, the owner's hold and the agent it carries.
+fn written_as(
+    wl: &mut restore::WindowLayout,
+    at: usize,
+    id: u64,
+    hold: Option<&str>,
+    agent: Option<Box<restore::AgentRestore>>,
+) {
+    let restore::RestoredSplitTree::Leaf {
+        view: restore::RestoredView::Terminal(leaf),
+    } = &mut wl.restored_tabs[at].root
+    else {
+        panic!("a one-pane terminal tab");
+    };
+    leaf.local_id = Some(id);
+    leaf.holds = hold.map(str::to_string).into_iter().collect();
+    leaf.agent = agent;
+}
+
+/// Each tab of `wl`: its title, pool id, its holds (`,`-joined, none: `None`)
+/// and its agent's conversation.
+type Carried = (String, Option<u64>, Option<String>, Option<String>);
+
+fn carried(wl: &restore::WindowLayout) -> Vec<Carried> {
+    wl.restored_tabs
+        .iter()
+        .map(|tab| match &tab.root {
+            restore::RestoredSplitTree::Leaf {
+                view: restore::RestoredView::Terminal(leaf),
+            } => (
+                leaf.user_title.clone().unwrap_or_default(),
+                leaf.local_id,
+                (!leaf.holds.is_empty()).then(|| leaf.holds.join(",")),
+                leaf.agent.as_ref().and_then(|agent| agent.session.clone()),
+            ),
+            other => panic!("a one-pane terminal tab: {other:?}"),
+        })
+        .collect()
+}
+
+/// A TAB THE DRAIN STILL OWES KEEPS ITS OWN AGENT AND THE OWNER'S HOLD
+/// THROUGH A RESTART'S QUIT, AND TAKES NO LIVE TAB'S (RV-SURV-1). Its leaf
+/// names the previous launch's pool id, which this launch mints again from
+/// 0, so the fills that read a leaf's session by its id
+/// (`RestoreManifest::fill_agents`, `fill_holds`) took the owed tab's own
+/// agent and hold off it — and where that id named a live tab of this
+/// launch, put that tab's on it: two leaves naming one conversation, the
+/// wrong tab reopened held. So did every leaf of a window not begun. The
+/// owed leaves name no id of this launch's, and keep what they carry.
+/// NEGATIVE CONTROLS: the live tab keeps its own hold and agent, read off
+/// its session as before.
+#[test]
+fn a_system_quit_inside_the_drain_keeps_each_owed_tabs_own_agent_and_hold() {
+    const C_AGENT: &str = "0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c";
+    const X_AGENT: &str = "7a1d2e3f-4b5c-4d6e-8f70-112233445566";
+    const B_AGENT: &str = "11111111-2222-4333-8444-555555555555";
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let mut first = window(&["A", "B", "C", "D"], 0);
+    written_as(&mut first, 0, 10, None, None);
+    written_as(&mut first, 1, 11, None, None);
+    written_as(
+        &mut first,
+        2,
+        12,
+        Some("local pause"),
+        Some(carried_agent(C_AGENT)),
+    );
+    // D's old id is the one B's live shell gets in this launch.
+    written_as(&mut first, 3, 1, None, None);
+    // A window not begun, its old id A's live bootstrap's.
+    let mut second = window(&["X"], 0);
+    written_as(
+        &mut second,
+        0,
+        0,
+        Some("local mine-too"),
+        Some(carried_agent(X_AGENT)),
+    );
+    app.pending_restore = Some(restore::RestoreManifest::new(vec![first, second]));
+    assert!(!slice(&mut app));
+    assert!(!slice(&mut app));
+    assert_eq!(titles(&app, wid), ["A", "B"]);
+    assert_eq!(app.windows.len(), 1, "X is not begun");
+    // B's live shell: the owner's hold on it, and the agent its host
+    // publishes.
+    let b = app
+        .view_store
+        .get(app.windows[&wid].tab_set.tabs()[1].focus)
+        .copied()
+        .and_then(crate::tab_model::View::terminal_session)
+        .expect("B's shell");
+    assert_eq!(b, 1, "D's old id names B's live shell");
+    {
+        let session = app.pool.get(b).expect("live");
+        session.ctx.fabric.seed_holds(
+            crate::fabric::parse_holds(["local mine"]),
+            &session.ctx.timeline,
+        );
+    }
+    let sid = app.session_sid(b).expect("B's sid");
+    let published = aterm_agent::harness::relaunch::Snapshot {
+        stored_login: false,
+        tab: sid.clone(),
+        pid: 5151,
+        start: "Sat Sep 27 02:02:03 2026".into(),
+        shell: 4343,
+        program: std::path::PathBuf::from("/opt/claude/bin/claude"),
+        argv: vec!["/opt/claude/bin/claude".into()],
+        session: Some(B_AGENT.into()),
+        cwd: "/tmp".into(),
+        version: None,
+        run: aterm_agent::harness::relaunch::AgentRun::Claude,
+        dialect: None,
+        login: None,
+        home: None,
+        claude_dir: None,
+    };
+    crate::harness_host::publish_snapshot_for_test(&sid, Some(&published));
+
+    let mut layout = app.capture_restore_manifest();
+    app.quit_agents(&mut layout, true);
+    crate::harness_host::publish_snapshot_for_test(&sid, None);
+
+    let first = carried(&layout.windows[0]);
+    let mine = |s: &str| Some(s.to_string());
+    assert_eq!(
+        first[1],
+        ("B".into(), Some(b), mine("local mine"), mine(B_AGENT)),
+        "the live tab's own"
+    );
+    assert_eq!(
+        first[2],
+        ("C".into(), None, mine("local pause"), mine(C_AGENT)),
+        "an owed tab keeps its own"
+    );
+    assert_eq!(
+        first[3],
+        ("D".into(), None, None, None),
+        "an owed tab takes no live tab's"
+    );
+    assert_eq!(
+        carried(&layout.windows[1]),
+        [("X".into(), None, mine("local mine-too"), mine(X_AGENT))],
+        "a window not begun keeps its own"
+    );
+}
+
+/// A PERSON'S OWN QUIT INSIDE THE DRAIN KEEPS NO AGENT AND NO HOLD
+/// (RV-SURV-1): an owed tab carried the agent and the owner's hold its
+/// earlier layout — a crash's, a restart's — named, and the quit wrote them
+/// on, so the next launch relaunched an agent the person's own quit had
+/// ended. Both fields' rule: a person's own quit writes neither.
+#[test]
+fn a_persons_own_quit_inside_the_drain_keeps_no_agent_and_no_hold() {
+    const C_AGENT: &str = "0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c";
+    let mut app = App::headless_for_test();
+    let mut wl = window(&["A", "B", "C"], 0);
+    written_as(
+        &mut wl,
+        2,
+        12,
+        Some("local pause"),
+        Some(carried_agent(C_AGENT)),
+    );
+    app.pending_restore = Some(restore::RestoreManifest::new(vec![wl]));
+    assert!(!slice(&mut app));
+    assert!(!slice(&mut app));
+    assert_eq!(titles(&app, WindowId(0)), ["A", "B"]);
+
+    let mut layout = app.capture_restore_manifest();
+    app.quit_agents(&mut layout, false);
+    for (title, _, hold, agent) in carried(&layout.windows[0]) {
+        assert_eq!((hold, agent), (None, None), "{title}");
+    }
+    // The next launch relaunches nothing from it.
+    let wire = layout.to_toml().expect("the layout writes");
+    let back = restore::RestoreManifest::from_toml(&wire).expect("the layout parses back");
+    let mut next = App::headless_for_test();
+    next.restore_into_window(WindowId(0), back.windows[0].clone());
+    for (&id, pooled) in next.pool.sessions.iter_mut() {
+        pooled.session.pid = 40_000 + i32::try_from(id).expect("a small id");
+    }
+    let handed = next.take_restored_agents();
+    assert!(
+        handed.is_empty(),
+        "{:?}",
+        handed
+            .iter()
+            .map(|(sid, snap, ..)| (sid.clone(), snap.session.clone()))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// A LANDED HELD TAB KEEPS ITS AGENT DOWN THROUGH A RESTART INSIDE THE
+/// DRAIN, WHATEVER PUT ITS HOLD BACK (the merge review's GUI-M7-1; ruling 23
+/// (ii)). The drain holds a landed held tab's agent (`App::restored_held`)
+/// until its last slice, and a restart's quit names it on the tab's leaf
+/// (`App::unhanded_restored_agent`). The hold that kept it down is often not
+/// on the session: a FLEET row is never put back on a fresh or bootstrap
+/// shell, and the owner's is refused while an update commits the session.
+/// Read off the session alone, the leaf named the agent with no hold, and
+/// the next launch relaunched it into the tab. The leaf now carries the rows
+/// the restore could not put back (`App::unhanded_restored_holds`), and the
+/// next launch keeps the agent the holder's. NEGATIVE CONTROLS: the owner's
+/// hold put back rides the session's own rows; put back and then lifted by
+/// the owner, it stays lifted (theirs to lift), and that tab's agent is owed
+/// its relaunch as an unheld tab's is; the unheld tab's agent is owed its
+/// relaunch throughout.
+#[test]
+fn a_restart_inside_the_drain_keeps_a_landed_held_tabs_agent_down() {
+    use crate::fabric::apply_hold_for_test;
+    const X: &str = "0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c";
+    const Y: &str = "7a1d2e3f-4b5c-4d6e-8f70-112233445566";
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Then {
+        Fenced,
+        Lifted,
+        Nothing,
+    }
+    let mine = |s: &str| Some(s.to_string());
+    for (case, row, then, held_next) in [
+        ("a fleet row", "fleet fabric-lost", Then::Nothing, true),
+        ("the owner's, fenced", "local pause", Then::Fenced, true),
+        (
+            "control: the owner's, put back",
+            "local pause",
+            Then::Nothing,
+            true,
+        ),
+        (
+            "control: the owner's, lifted",
+            "local pause",
+            Then::Lifted,
+            false,
+        ),
+    ] {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        // The window's bootstrap shell is the first tab's (session 0).
+        let bootstrap = std::sync::Arc::clone(&app.pool.get(0).expect("the bootstrap").ctx);
+        if then == Then::Fenced {
+            let _ = bootstrap.fabric.fence_hold(true);
+        }
+        let mut wl = window(&["A", "B"], 0);
+        written_as(&mut wl, 0, 0, Some(row), Some(carried_agent(X)));
+        // Another process than X's: one agent two leaves name is relaunched
+        // once.
+        let mut y = carried_agent(Y);
+        y.pid = 4343;
+        written_as(&mut wl, 1, 1, None, Some(y));
+        app.pending_restore = Some(restore::RestoreManifest::new(vec![wl]));
+        assert!(!slice(&mut app), "{case}");
+        assert_eq!(titles(&app, wid), ["A"], "{case}: B is owed");
+        assert_eq!(
+            app.restored_held
+                .iter()
+                .map(|(id, agent, ..)| (*id, agent.session.clone()))
+                .collect::<Vec<_>>(),
+            vec![(0, mine(X))],
+            "{case}: A's agent is the holder's"
+        );
+        if then == Then::Fenced {
+            bootstrap.fabric.lift_hold_fence();
+        }
+        if then == Then::Lifted {
+            assert!(apply_hold_for_test(&bootstrap, None), "{case}: lifted");
+        }
+        let mut layout = app.capture_restore_manifest();
+        app.quit_agents(&mut layout, true);
+        let kept = carried(&layout.windows[0]);
+        assert_eq!(
+            kept[0],
+            (
+                "A".into(),
+                Some(0),
+                held_next.then(|| row.to_string()),
+                mine(X)
+            ),
+            "{case}: the leaf names the agent beside what keeps it down"
+        );
+        assert_eq!(
+            kept[1],
+            ("B".into(), None, None, mine(Y)),
+            "{case}: the owed tab keeps its own"
+        );
+        // The next launch: the held tab's agent is said again, never handed.
+        let wire = layout.to_toml().expect("the layout writes");
+        let back = restore::RestoreManifest::from_toml(&wire).expect("the layout parses back");
+        let mut next = App::headless_for_test();
+        next.restore_into_window(WindowId(0), back.windows[0].clone());
+        for (&id, pooled) in next.pool.sessions.iter_mut() {
+            pooled.session.pid = 40_000 + i32::try_from(id).expect("a small id");
+        }
+        let held: Vec<Option<String>> = next
+            .restored_held
+            .iter()
+            .map(|(_, agent, ..)| agent.session.clone())
+            .collect();
+        let handed: Vec<Option<String>> = next
+            .take_restored_agents()
+            .into_iter()
+            .map(|(_, snap, ..)| snap.session)
+            .collect();
+        if held_next {
+            assert_eq!(held, vec![mine(X)], "{case}: still the holder's");
+            assert_eq!(handed, vec![mine(Y)], "{case}: X is not handed");
+        } else {
+            assert!(held.is_empty(), "{case}: {held:?}");
+            assert_eq!(handed, vec![mine(X), mine(Y)], "{case}: both owed");
+        }
+    }
+}
+
+/// THE TABS THE DRAIN HAS LANDED KEEP THEIR AGENTS THROUGH A RESTART'S QUIT
+/// TOO (F1): each one's agent waits in the restore's own list
+/// (`App::restored_agents`) until the drain's last slice hands it to the
+/// host, so neither the host's queue nor an agent it publishes names it
+/// yet, and the quit's fill (`App::fill_desk_agents`) wrote no agent on
+/// any landed tab — a restart in a cold drain's first instants relaunched
+/// none of the desk's agents at the next launch. The owner's hold on a
+/// landed tab is read off its session, where the restore put it back.
+/// NEGATIVE CONTROLS: the owed tabs keep their own (RV-SURV-1), and no
+/// leaf names another's agent.
+#[test]
+fn a_system_quit_inside_the_drain_keeps_the_landed_tabs_agents_not_yet_handed() {
+    let agents = [
+        "11111111-1111-4111-8111-111111111111",
+        "22222222-2222-4222-8222-222222222222",
+        "33333333-3333-4333-8333-333333333333",
+        "44444444-4444-4444-8444-444444444444",
+    ];
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let mut wl = window(&["A", "B", "C", "D"], 2);
+    for (at, agent) in agents.iter().enumerate() {
+        // The earlier launch's pool ids: 0 to 3, this launch's own.
+        let hold = matches!(at, 0 | 1).then_some("local -");
+        let id = u64::try_from(at).expect("a small index");
+        let mut agent = carried_agent(agent);
+        // A cause no durable layout should carry: never written on.
+        agent.cause = (at == 0).then(|| "asked".to_string());
+        written_as(&mut wl, at, id, hold, Some(agent));
+    }
+    app.pending_restore = Some(restore::RestoreManifest::new(vec![wl]));
+    assert!(!slice(&mut app));
+    assert!(!slice(&mut app));
+    assert_eq!(titles(&app, wid), ["A", "C"], "B and D are owed");
+
+    let mut layout = app.capture_restore_manifest();
+    app.quit_agents(&mut layout, true);
+
+    let kept: Vec<_> = carried(&layout.windows[0])
+        .into_iter()
+        .map(|(title, _, hold, agent)| (title, hold, agent))
+        .collect();
+    let mine = |s: &str| Some(s.to_string());
+    assert_eq!(
+        kept,
+        [
+            ("A".into(), mine("local -"), mine(agents[0])),
+            ("B".into(), mine("local -"), mine(agents[1])),
+            ("C".into(), None, mine(agents[2])),
+            ("D".into(), None, mine(agents[3])),
+        ]
+    );
+    // An explicit restart's cause rides a handoff's layout alone.
+    for window in &layout.windows {
+        for tab in &window.restored_tabs {
+            if let restore::RestoredSplitTree::Leaf {
+                view: restore::RestoredView::Terminal(leaf),
+            } = &tab.root
+            {
+                assert!(leaf.agent.as_ref().is_none_or(|a| a.cause.is_none()));
+            }
+        }
+    }
 }

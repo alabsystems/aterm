@@ -16,19 +16,25 @@
 //!   REPL read `idle` NOT authoritatively; and read where the terminal's
 //!   cursor is known ([`read_at`]), only at the box that HOLDS the cursor,
 //!   never at a box an earlier run left on the screen;
-//! * [`CodexReader`] — Codex's grammar ([`crate::codex`], measured on codex
-//!   0.156.1): its boxes with their roles, the status row and the streaming
-//!   answer as busy, a turn's end row as idle or a question, its `■` walls
-//!   and interrupt. A screen whose last message's head has scrolled away
-//!   with no end in sight is `idle` NOT authoritatively;
+//! * [`CodexReader`] — Codex by NAME only: it reads nothing on Codex's
+//!   screen (aterm's Codex screen lane was retired on 2026-10-16), so every
+//!   reading is `idle` NOT authoritatively and the server publishes
+//!   `agent=unknown`. A Codex's own state is its OSC 7501 report, shown and
+//!   never decided on;
 //! * [`AgyReader`] — agy's grammar ([`crate::agy`], Google's Antigravity
 //!   CLI, measured on 1.4.0): its boxes with their roles, the spinner row as
 //!   busy, its footer's `? for shortcuts` as idle, its sign-in wall and
 //!   interrupt;
 //! * [`MuseReader`] — Muse Code's grammar ([`crate::muse`], measured on
-//!   1.4.9-R6297.1): its trust box, the status row as busy, a reply as the
-//!   last thing drawn as idle, its sign-in wall. Its approval and question
-//!   boxes are not measured, and nothing reads one;
+//!   1.4.9-R6297.1 and 1.4.10-R6427.1): its trust box, approval boxes and
+//!   question with their roles, the status row as busy, a reply as the last
+//!   thing drawn as idle, its walls (a refused key, the usage wall, a failed
+//!   model call) and its interrupt;
+//! * [`GeminiReader`] — Gemini CLI's grammar ([`crate::gemini`], Google's
+//!   Gemini CLI, measured on 0.46.0): its boxes with their roles (its
+//!   usage-limit dialog and its folder trust among them), the spinner on its
+//!   status row as busy, `? for shortcuts` there as idle, its API error rows
+//!   as walls and its cancel as the person's;
 //! * [`GenericReader`] — any other program: never a prompt, a question or a
 //!   wall, always `idle`, never authoritative. The screen alone says
 //!   nothing program-neutral about whether a build or a REPL is working;
@@ -46,13 +52,13 @@ use crate::phase::{
     Phase, busy_signal, composer_draft, context_left, has_composer_frame, has_shell_mode_frame,
     prompt_box_holds, worker_phase,
 };
-use crate::prompt::{PromptKind, PromptV2, parse_prompt_v2};
+use crate::prompt::{CancelEffect, PromptKind, PromptV2, parse_prompt_v2};
 use crate::turn::{continuation_suggestion, goal_active, interrupted, said_tail};
 use crate::wall::{Wall, memory_wall, wall};
-use crate::{agy, codex, muse};
+use crate::{agy, gemini, muse};
 
 /// The program a reader is for. Every variant is in [`Program::ALL`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Program {
     Claude,
     Codex,
@@ -60,20 +66,52 @@ pub enum Program {
     Agy,
     /// Meta's Muse Code.
     Muse,
+    /// Google's Gemini CLI.
+    Gemini,
     /// Anything else, or nothing named.
     Generic,
 }
 
+/// Each program's successor in declaration order, `None` after the last: an
+/// exhaustive match, so a variant added to [`Program`] does not compile until
+/// it is placed here, and the walk below holds [`Program::ALL`] to this chain.
+const fn next_program(p: Program) -> Option<Program> {
+    match p {
+        Program::Claude => Some(Program::Codex),
+        Program::Codex => Some(Program::Agy),
+        Program::Agy => Some(Program::Muse),
+        Program::Muse => Some(Program::Gemini),
+        Program::Gemini => Some(Program::Generic),
+        Program::Generic => None,
+    }
+}
+
+// [`Program::ALL`] is exactly the chain [`next_program`] walks from the first
+// declared variant, each at its own discriminant: checked at compile time.
+const _: () = {
+    let mut at = 0;
+    let mut next = Some(Program::ALL[0]);
+    while let Some(p) = next {
+        assert!(at < Program::ALL.len() && p as usize == at && Program::ALL[at] as usize == at);
+        at += 1;
+        next = next_program(p);
+    }
+    assert!(at == Program::ALL.len());
+};
+
 impl Program {
     /// Every program, in declaration order: what must cover each one (the
     /// panic sweeps, the host's admission, a settings row per supervisable
-    /// agent) iterates this, never a list of its own. `all_is_every_program`
-    /// reads the enum's declaration, so a variant that is not here fails it.
-    pub const ALL: [Program; 5] = [
+    /// agent) iterates this, never a list of its own. Every variant is here BY
+    /// CONSTRUCTION: [`next_program`] places each one (an exhaustive match, so
+    /// a new variant does not compile until it is placed), and a compile-time
+    /// walk of that chain holds this list to it.
+    pub const ALL: [Program; 6] = [
         Program::Claude,
         Program::Codex,
         Program::Agy,
         Program::Muse,
+        Program::Gemini,
         Program::Generic,
     ];
 
@@ -85,16 +123,17 @@ impl Program {
             Program::Codex => "codex",
             Program::Agy => "agy",
             Program::Muse => "muse",
+            Program::Gemini => "gemini",
             Program::Generic => "generic",
         }
     }
 
     /// The product's name as the harness's own surfaces print it ("Claude
     /// Code", "Codex", "Antigravity CLI", "Muse Code" — atpkg's spellings of
-    /// the last two; "the program" for any other, so a sentence that names
-    /// it still reads) — the one display name there, so a message, a status
-    /// line and a settings row name an agent alike. The primer and atpkg
-    /// keep their own "Codex CLI".
+    /// those two — "Gemini CLI", the primer's; "the program" for any other,
+    /// so a sentence that names it still reads) — the one display name
+    /// there, so a message, a status line and a settings row name an agent
+    /// alike. The primer and atpkg keep their own "Codex CLI".
     #[must_use]
     pub const fn product(self) -> &'static str {
         match self {
@@ -102,22 +141,44 @@ impl Program {
             Program::Codex => "Codex",
             Program::Agy => "Antigravity CLI",
             Program::Muse => "Muse Code",
+            Program::Gemini => "Gemini CLI",
             Program::Generic => "the program",
         }
     }
 
-    /// Whether the supervisor hosts this program: one whose reader is
-    /// MEASURED — Claude Code, Codex since its reader passed its captures
-    /// ([`crate::codex::fixtures`]), agy since its reader passed its own
-    /// ([`crate::agy::fixtures`]). Not Muse Code: its approval and question
-    /// boxes are not measured, and its composer may stay on the screen under
-    /// one, so its reader cannot say a box is up ([`crate::muse`]). Never the
-    /// generic reader.
+    /// Whether the supervisor's screen policy acts on this program: one whose
+    /// reader is MEASURED and whose supervisor arms are written — Claude Code,
+    /// agy since its reader passed its captures ([`crate::agy::fixtures`]), Muse Code
+    /// since its boxes, question and walls were measured on 1.4.10-R6427.1
+    /// ([`crate::muse::fixtures`]) and each is answered by the cursor and
+    /// Enter it takes, and Gemini CLI since its reader passed its own
+    /// ([`crate::gemini::fixtures`]) and a supervised session's press and
+    /// typed line landed in its 0.46.0 under the lab. Never the generic
+    /// reader, and never Codex: aterm's Codex screen lane was retired on
+    /// 2026-10-16 (the owner: "retire the codex harness"), so a vendor `codex`
+    /// is shown, never supervised, and codex-alab supervises itself, the
+    /// window watching beside it. What has a `[harness.<agent>]` table is
+    /// [`Program::harness_table`].
     #[must_use]
     pub fn supervisable(self) -> bool {
         match self {
-            Program::Claude | Program::Codex | Program::Agy => true,
-            Program::Muse | Program::Generic => false,
+            Program::Claude | Program::Agy | Program::Muse | Program::Gemini => true,
+            Program::Codex | Program::Generic => false,
+        }
+    }
+
+    /// Whether this program has a `[harness.<agent>]` table and a row on
+    /// Settings ▸ Harness: every agent the supervisor acts on
+    /// ([`Program::supervisable`]) and Codex, whose table codex-alab reads as
+    /// its own policy (`harness policy`'s `agent-off`) while the window
+    /// watches beside it. Never the generic reader.
+    #[must_use]
+    pub fn harness_table(self) -> bool {
+        match self {
+            Program::Claude | Program::Codex | Program::Agy | Program::Muse | Program::Gemini => {
+                true
+            }
+            Program::Generic => false,
         }
     }
 
@@ -129,6 +190,7 @@ impl Program {
             Program::Codex => &CodexReader,
             Program::Agy => &AgyReader,
             Program::Muse => &MuseReader,
+            Program::Gemini => &GeminiReader,
             Program::Generic => &GenericReader,
         }
     }
@@ -140,8 +202,7 @@ pub struct Reading {
     pub program: Program,
     pub phase: Phase,
     /// Whether [`Self::phase`] is the reader's evidence rather than its
-    /// default: `false` for the generic reader always, for the Codex
-    /// reader where nothing on the screen says whether a turn runs, for
+    /// default: `false` for the generic reader and the Codex reader always, for
     /// agy's and Muse Code's off their measured shapes ([`crate::agy::phase`],
     /// [`crate::muse::phase`]), and for
     /// Claude Code's `idle` with no composer frame drawn (its launch, before
@@ -171,18 +232,20 @@ pub struct Reading {
     /// The worker's last words ([`crate::turn::said_tail`]).
     pub said_tail: Option<String>,
     /// A PERSON stopped the last turn (Esc): the next message is theirs
-    /// ([`crate::turn::interrupted`], [`crate::codex::interrupted`]).
+    /// ([`crate::turn::interrupted`]).
     pub interrupted: bool,
-    /// No turn yet ([`ScreenReader::fresh`]: [`crate::turn::fresh`],
-    /// [`crate::codex::fresh`]): an idle point here ended nothing — a
+    /// No turn yet ([`ScreenReader::fresh`]: [`crate::turn::fresh`]): an idle point here ended nothing — a
     /// session nobody has asked anything is not a worker stopped short.
     pub fresh: bool,
     /// The composer as `(caret row, lines)`, the caret row's text first —
     /// typed text or the dim placeholder, which only the cursor tells apart
-    /// (at column 2 of the caret row: the placeholder, for Claude Code and
-    /// Codex; agy and Muse Code draw none, and their empty composer's text is
-    /// empty: [`ScreenReader::placeholder`]); `None` with no composer on the
-    /// screen (a box, a shell).
+    /// (at column 2 of the caret row: the placeholder, for Claude Code,
+    /// and Muse Code's prompt hint, by its colour; agy draws none but
+    /// its permission mode's hint, which its reader reads as no text, and its
+    /// empty composer's text is empty: [`ScreenReader::placeholder`]; Gemini
+    /// CLI's reader takes its placeholder out by its text, so its empty
+    /// composer's is empty too); `None` with no composer on the screen (a
+    /// box, a shell).
     pub composer: Option<(usize, Vec<String>)>,
     /// Usage credits carry the session, by the program's own notice
     /// ([`ScreenReader::credits`]). FOR THE RECORD: it is no wall, and no
@@ -205,6 +268,13 @@ pub trait ScreenReader: Sync {
     fn phase(&self, rows: &[String]) -> Phase;
     fn prompt(&self, _rows: &[String]) -> Option<PromptV2> {
         None
+    }
+    /// WHAT ESC DOES on `prompt`, a box [`Self::prompt`] read: the Esc its
+    /// footer or options name ([`PromptV2::cancel`]), else what this
+    /// program's Esc is known to do on a box that names none; `None` where
+    /// nothing says (`aterm drive phase` then prints no Esc line).
+    fn esc(&self, prompt: &PromptV2) -> Option<CancelEffect> {
+        prompt.cancel.as_ref().map(|c| c.effect)
     }
     fn wall(&self, _rows: &[String]) -> Option<Wall> {
         None
@@ -231,8 +301,7 @@ pub trait ScreenReader: Sync {
     }
     /// THE AGENT'S OWN BACKGROUND WORK, AND NOTHING ELSE, KEEPS THIS SCREEN
     /// BUSY: its turn is over, the composer drawn, and what runs on is work
-    /// it started (a dynamic workflow, a background agent, a shell, a Codex
-    /// background terminal) — `Some(what runs)`. `None` for a live turn, an
+    /// it started (a dynamic workflow, a background agent, a shell) — `Some(what runs)`. `None` for a live turn, an
     /// idle screen, a box, or a program with no such read (the default).
     fn background_wait(&self, _rows: &[String]) -> Option<&'static str> {
         None
@@ -287,30 +356,49 @@ pub trait ScreenReader: Sync {
         None
     }
     /// The glyph the composer's caret row starts with (`❯` Claude Code and
-    /// Muse Code, `›` Codex, `>` agy): what a guard on typed text anchors to.
-    /// `None`: no composer.
+    /// Muse Code, `>` agy and Gemini CLI): what a guard on typed
+    /// text anchors to. `None`: no composer.
     fn caret(&self) -> Option<char> {
         None
     }
+    /// The column [`Self::caret`] is drawn in: `0` — the caret row starts
+    /// with it — for every program but Gemini CLI, whose composer pads it one
+    /// column in (` > text`). A guard on typed text anchors that many blanks
+    /// before the caret.
+    fn caret_column(&self) -> usize {
+        0
+    }
     /// The glyph the composer's caret row starts with ON `rows` — what a guard
-    /// on text typed into THAT screen anchors to. [`Self::caret`] by default;
-    /// Codex draws its input line with one of two marks (`›`, and `»` on
-    /// 0.158.0: [`crate::codex::CARETS`]), so its reader reads the one drawn,
-    /// and a guard spelled with the other is never pressed under.
+    /// on text typed into THAT screen anchors to. [`Self::caret`] by default:
+    /// a reader whose program draws its input line with more than one mark
+    /// reads the one drawn, so a guard spelled with the other is never
+    /// pressed under.
     fn caret_on(&self, _rows: &[String]) -> Option<char> {
         self.caret()
     }
     /// Whether the composer, EMPTY, still shows text on its caret row — a
-    /// dim placeholder (Claude Code's suggestion or stock hint, Codex's `Ask
-    /// Codex to do anything`) that only the cursor's column and the cell's
-    /// dim tell from a person's draft. `false` by default: every word a
-    /// composer without one holds was typed (agy and Muse Code draw none,
-    /// measured), so none is ever taken for the placeholder and typed over.
+    /// dim placeholder (Claude Code's suggestion or stock hint, Muse Code's prompt hint `/export saves the
+    /// conversation to a text file`) that only the cursor's column and the
+    /// cell there tell from a person's draft. `false` by default: every word
+    /// a composer without one holds was typed (agy draws none but its
+    /// permission mode's hint, which [`AgyReader`] reads as no text), so none
+    /// is ever taken for the placeholder and typed over. Gemini CLI draws one
+    /// where neither the cursor's column nor a dim cell tells it
+    /// ([`crate::gemini`]): its reader takes it out of the composer itself,
+    /// and says `false` here.
     fn placeholder(&self) -> bool {
         false
     }
+    /// The colour a [`Self::placeholder`] is drawn in where it carries no
+    /// `dim` attribute (`rrggbb`, as `cell` prints it): Muse Code draws its
+    /// prompt hint in its dim grey, `676c74`, a typed draft in `ccd3db`
+    /// (measured on 1.4.10, its default theme). `None`: the `dim` attribute
+    /// alone marks it.
+    fn placeholder_fg(&self) -> Option<&'static str> {
+        None
+    }
     /// An Enter that arrives within a burst of typed text is taken as a
-    /// NEWLINE, not a submit (Codex's paste guard, measured): typed text is
+    /// NEWLINE, not a submit (a paste guard, measured): typed text is
     /// submitted by a `turn` that settles first, never by an Enter right
     /// behind the text.
     fn paste_guard(&self) -> bool {
@@ -321,6 +409,13 @@ pub trait ScreenReader: Sync {
     /// gone`). `None`: nothing on this program's screen says a turn runs.
     fn busy_guard(&self) -> Option<String> {
         None
+    }
+    /// Whether the row [`Self::busy_guard`] matches STAYS while an approval
+    /// box is up, so a wait on it leaving does not end when a box is drawn.
+    /// `false` by default: Claude Code's busy footer leaves for a box
+    /// (measured); Muse Code's status row does not.
+    fn busy_row_outlives_boxes(&self) -> bool {
+        false
     }
     /// The first row a running turn's busy row can be on — the top of the
     /// live zone: a wait on [`Self::busy_guard`] is armed over this row and
@@ -422,6 +517,18 @@ impl ScreenReader for ClaudeReader {
     }
     fn prompt(&self, rows: &[String]) -> Option<PromptV2> {
         parse_prompt_v2(rows)
+    }
+    /// Esc leaves every box Claude Code draws: a footed one names what it
+    /// does in its `Esc to …` footer (the trust dialog's quits the program,
+    /// [`CancelEffect::Exit`]), a footerless one marks its refusal ` (esc)`
+    /// or answers Esc with its select's cancel.
+    fn esc(&self, prompt: &PromptV2) -> Option<CancelEffect> {
+        Some(
+            prompt
+                .cancel
+                .as_ref()
+                .map_or(CancelEffect::Back, |c| c.effect),
+        )
     }
     fn wall(&self, rows: &[String]) -> Option<Wall> {
         wall(rows)
@@ -536,7 +643,11 @@ impl ScreenReader for ClaudeReader {
     }
 }
 
-/// Codex: [`crate::codex`]'s grammar (module header).
+/// Codex: identity only. aterm reads no Codex screen (its Codex screen lane
+/// was retired on 2026-10-16, the owner: "retire the codex harness"): no
+/// box, wall, composer, busy row or paste guard, every trait method but these
+/// two at its default. Its own state is its OSC 7501 report, which the window
+/// shows (`status program_state=`, the presence row) and nothing decides on.
 #[derive(Debug, Clone, Copy)]
 pub struct CodexReader;
 
@@ -544,72 +655,12 @@ impl ScreenReader for CodexReader {
     fn program(&self) -> Program {
         Program::Codex
     }
-    fn phase(&self, rows: &[String]) -> Phase {
-        codex::phase(rows).0
-    }
-    fn prompt(&self, rows: &[String]) -> Option<PromptV2> {
-        codex::prompt(rows)
-    }
-    fn wall(&self, rows: &[String]) -> Option<Wall> {
-        codex::wall(rows)
-    }
-    fn background_wait(&self, rows: &[String]) -> Option<&'static str> {
-        codex::background_wait(rows)
-    }
-    fn context(&self, rows: &[String]) -> Option<u8> {
-        codex::context_left(rows)
-    }
-    /// Codex draws no suggestion for the next message: its composer's dim
-    /// text is a stock placeholder (`Ask Codex to do anything`), measured.
-    fn suggestion(&self, _: &[String], _: usize) -> Option<String> {
-        None
-    }
-    /// The footer's `Pursuing goal (…)` ([`codex::goal_state`]): Codex runs
-    /// its goal's next turn itself.
-    fn goal_active(&self, rows: &[String]) -> bool {
-        codex::goal_state(rows) == Some(codex::CodexGoal::Pursuing)
-    }
-    fn said_tail(&self, rows: &[String]) -> Option<String> {
-        codex::said_tail(rows)
-    }
-    fn interrupted(&self, rows: &[String]) -> bool {
-        codex::interrupted(rows)
-    }
-    fn fresh(&self, rows: &[String]) -> bool {
-        codex::fresh(rows)
-    }
-    fn composer(&self, rows: &[String]) -> Option<(usize, Vec<String>)> {
-        codex::composer_draft(rows)
-    }
-    fn transcript_end(&self, rows: &[String]) -> usize {
-        codex::transcript_end(rows)
-    }
-    fn caret(&self) -> Option<char> {
-        Some('›')
-    }
-    /// The mark the input line is drawn with now (`»` on 0.158.0), or `›`
-    /// with no composer on the screen.
-    fn caret_on(&self, rows: &[String]) -> Option<char> {
-        codex::caret_on(rows).or_else(|| self.caret())
-    }
-    fn placeholder(&self) -> bool {
-        true
-    }
-    /// Measured on 0.156.1 ([`crate::codex`], "TYPING INTO THE COMPOSER").
-    fn paste_guard(&self) -> bool {
-        true
-    }
-    /// The status row's tail, `esc to interrupt)` (`• Working (6s • esc to
-    /// interrupt)`): the question dialog's footer names the same hint with
-    /// no parenthesis, and must not read as a turn running.
-    fn busy_guard(&self) -> Option<String> {
-        Some(format!(
-            "{}\\)",
-            guard_regex(const { crate::anchors::anchor_text("codex.busy.interrupt") })
-        ))
-    }
-    fn phase_authoritative(&self, rows: &[String], _: &Phase) -> bool {
-        codex::phase(rows).1
+    /// No evidence: every reading is `idle` NOT authoritatively (the trait's
+    /// default [`ScreenReader::phase_authoritative`]), so the server
+    /// publishes `agent=unknown`, and `aterm drive phase`, `await-turn` and
+    /// `answer` read nothing on a Codex.
+    fn phase(&self, _rows: &[String]) -> Phase {
+        Phase::Idle
     }
 }
 
@@ -627,8 +678,16 @@ impl ScreenReader for AgyReader {
     fn prompt(&self, rows: &[String]) -> Option<PromptV2> {
         agy::prompt(rows)
     }
+    fn esc(&self, prompt: &PromptV2) -> Option<CancelEffect> {
+        agy::esc(prompt)
+    }
     fn wall(&self, rows: &[String]) -> Option<Wall> {
         agy::wall(rows)
+    }
+    /// agy's feedback survey, drawn in its composer's place
+    /// ([`crate::agy::survey`]).
+    fn survey_block(&self, rows: &[String]) -> Option<crate::survey::SurveyBlock> {
+        agy::survey(rows)
     }
     fn said_tail(&self, rows: &[String]) -> Option<String> {
         agy::said_tail(rows)
@@ -644,6 +703,13 @@ impl ScreenReader for AgyReader {
     }
     fn caret(&self) -> Option<char> {
         Some('>')
+    }
+    /// None: agy's empty composer draws nothing after its caret (measured)
+    /// but, while a permission mode is on, the mode's hint — whole or cut
+    /// with `...` — which [`agy::composer_draft`] reads as the empty draft
+    /// itself, so no text it reads is ever typed over.
+    fn placeholder(&self) -> bool {
+        false
     }
     /// An Enter sent in the same burst as the text submits it (measured on
     /// 1.4.0): no paste guard.
@@ -680,6 +746,9 @@ impl ScreenReader for MuseReader {
     fn said_tail(&self, rows: &[String]) -> Option<String> {
         muse::said_tail(rows)
     }
+    fn interrupted(&self, rows: &[String]) -> bool {
+        muse::interrupted(rows)
+    }
     fn fresh(&self, rows: &[String]) -> bool {
         muse::fresh(rows)
     }
@@ -689,8 +758,18 @@ impl ScreenReader for MuseReader {
     fn caret(&self) -> Option<char> {
         Some('❯')
     }
+    /// Its prompt hint (one contextual tip in the idle composer, measured on
+    /// 1.4.10: `❯ /export saves the conversation to a text file`, the cursor
+    /// at column 2, drawn in its dim grey with no `dim` attribute) is no
+    /// draft: the cursor's column and the cell's colour tell it from one.
+    fn placeholder(&self) -> bool {
+        true
+    }
+    fn placeholder_fg(&self) -> Option<&'static str> {
+        Some("676c74")
+    }
     /// An Enter in the same burst as the text is taken as a newline (measured
-    /// on 1.4.9-R6297.1, [`crate::muse`]).
+    /// on 1.4.9-R6297.1 and 1.4.10-R6427.1, [`crate::muse`]).
     fn paste_guard(&self) -> bool {
         true
     }
@@ -702,8 +781,74 @@ impl ScreenReader for MuseReader {
             guard_regex(const { crate::anchors::anchor_text("muse.busy.interrupt") })
         ))
     }
+    /// `◆ Calling tools (2s · esc to interrupt)` stays above an approval box's
+    /// frame (measured on 1.4.10, [`crate::muse::fixtures::BOX_SHELL`]).
+    fn busy_row_outlives_boxes(&self) -> bool {
+        true
+    }
+    fn busy_zone_start(&self, rows: &[String]) -> usize {
+        muse::busy_zone_start(rows)
+    }
     fn phase_authoritative(&self, rows: &[String], _: &Phase) -> bool {
         muse::phase(rows).1
+    }
+}
+
+/// Gemini CLI: [`crate::gemini`]'s grammar (module header).
+#[derive(Debug, Clone, Copy)]
+pub struct GeminiReader;
+
+impl ScreenReader for GeminiReader {
+    fn program(&self) -> Program {
+        Program::Gemini
+    }
+    fn phase(&self, rows: &[String]) -> Phase {
+        gemini::phase(rows).0
+    }
+    fn prompt(&self, rows: &[String]) -> Option<PromptV2> {
+        gemini::prompt(rows)
+    }
+    fn esc(&self, prompt: &PromptV2) -> Option<CancelEffect> {
+        gemini::esc(prompt)
+    }
+    fn wall(&self, rows: &[String]) -> Option<Wall> {
+        gemini::wall(rows)
+    }
+    fn said_tail(&self, rows: &[String]) -> Option<String> {
+        gemini::said_tail(rows)
+    }
+    fn interrupted(&self, rows: &[String]) -> bool {
+        gemini::interrupted(rows)
+    }
+    fn fresh(&self, rows: &[String]) -> bool {
+        gemini::fresh(rows)
+    }
+    /// Its placeholder read as an empty draft ([`gemini::composer_draft`]).
+    fn composer(&self, rows: &[String]) -> Option<(usize, Vec<String>)> {
+        gemini::composer_draft(rows)
+    }
+    fn caret(&self) -> Option<char> {
+        Some('>')
+    }
+    /// `*` while YOLO is on; nothing in shell mode ([`gemini::caret_on`]).
+    fn caret_on(&self, rows: &[String]) -> Option<char> {
+        gemini::caret_on(rows)
+    }
+    fn caret_column(&self) -> usize {
+        1
+    }
+    /// An Enter within 30 ms of a typed key is a newline (READ in the
+    /// 0.46.0 bundle, [`crate::gemini`]).
+    fn paste_guard(&self) -> bool {
+        true
+    }
+    /// The spinner on the status row: `esc to cancel` is drawn there only
+    /// beside it, and the row's `? for shortcuts` stays while a turn runs.
+    fn busy_guard(&self) -> Option<String> {
+        Some(gemini::busy_guard())
+    }
+    fn phase_authoritative(&self, rows: &[String], _: &Phase) -> bool {
+        gemini::phase(rows).1
     }
 }
 
@@ -732,20 +877,24 @@ const NOT_AGENTS: &[&str] = &[
 /// The reader for a session. The PROGRAM NAME first — the basename of the
 /// first word of `program` (a `status` `program=`/`detail=` value), a login
 /// shell's leading `-` dropped: an agent's name ([`program_of`]: `claude`,
-/// `codex`, `agy`, `muse`) → that program's reader ([`Program::reader`]), a
+/// `codex`, `agy`, `muse`, `gemini`) → that program's reader ([`Program::reader`]), a
 /// shell, a pager, a viewer or an editor ([`NOT_AGENTS`]) → Generic. Then,
 /// for no name or any other one (a Claude Code started as `node`, `ssh` to a
 /// host running one, a session adopted with no name), the screen, the most
-/// specific test first: Muse Code's composer under its labelled rule, its
-/// trust box or its sign-in wall (`muse::is_muse_screen`) → Muse — FIRST,
+/// specific test first: Muse Code's composer under its labelled rule, an
+/// approval box in that frame, its trust box or its sign-in wall
+/// (`muse::is_muse_screen`) → Muse — FIRST,
 /// because its composer is Claude Code's frame to the rule (its caret is
 /// `❯`), and Claude Code's test claims it; agy's composer over a footer it
 /// draws, one of its boxes or its sign-in wall (`agy::is_agy_screen`) →
-/// Agy; Claude Code's composer frame or one of its boxes (the trust dialog
-/// replaces the frame) → Claude; a Codex choice box, or Codex's composer
-/// empty or under its status row (`codex::is_codex_screen`) → Codex; else
-/// Generic. A Codex with no name and a draft in its composer, no turn
-/// running, reads Generic until it next runs or shows a box.
+/// Agy; Gemini CLI's composer band under its rule or one of its named boxes
+/// (`gemini::is_gemini_screen`; it runs as `node`, so its name is never
+/// `gemini` on the wire) → Gemini; Claude Code's composer frame or one of its boxes (the trust dialog
+/// replaces the frame) → Claude; else Generic. Codex is named by its name
+/// alone: aterm reads no Codex screen (its screen lane was retired on
+/// 2026-10-16), so a Codex with no name — a vendor `codex` npm started as
+/// `node` — reads Generic, and the window shows it by its own OSC 7501
+/// report.
 ///
 /// `program` must name the session's FOREGROUND process — the one drawing
 /// the screen. The session's root shell names every Claude Code started
@@ -757,7 +906,7 @@ pub fn identify(program: Option<&str>, rows: &[String]) -> &'static dyn ScreenRe
     }
     if program
         .map(program_word)
-        .is_some_and(|name| NOT_AGENTS.contains(&name.as_str()))
+        .is_some_and(|name| NOT_AGENTS.iter().any(|not| name.eq_ignore_ascii_case(not)))
     {
         return &GenericReader;
     }
@@ -770,10 +919,10 @@ pub fn identify(program: Option<&str>, rows: &[String]) -> &'static dyn ScreenRe
         &MuseReader
     } else if agy::is_agy_screen(rows) {
         &AgyReader
+    } else if gemini::is_gemini_screen(rows) {
+        &GeminiReader
     } else if has_composer_frame(rows) || parse_prompt_v2(rows).is_some_and(names_claude) {
         &ClaudeReader
-    } else if codex::codex_box(rows).is_some() || codex::is_codex_screen(rows) {
-        &CodexReader
     } else {
         &GenericReader
     }
@@ -914,53 +1063,81 @@ pub const BLANK_GAP: usize = 4;
 /// THE ONE NAME TABLE: the agent a program name is, by its name alone —
 /// the basename of its first word, a login shell's `-` dropped: `claude` and
 /// `claude-code` are Claude Code, `codex` is Codex, `agy` is agy, `muse` is
-/// Muse Code, anything else is no agent BY NAME (it may still be one by its screen: [`identify`],
+/// Muse Code and so is `muse-bin-<version>` (Meta's own installer's launcher
+/// execs its build so named: `muse-bin-1.4.10-R6427.1`, measured), `gemini`
+/// is Gemini CLI (a name its own process never carries: it runs as `node`),
+/// anything else is no agent BY NAME (it may still be one by its screen:
+/// [`identify`],
 /// [`may_host_agent`]). The server's agent verdict and the in-GUI supervisor
 /// host ask this, never a table of their own. Which programs atpkg installs
 /// and shims is atpkg's roster (`atpkg::stub::AGENT_PROGRAMS`); the GUI's
 /// program shim rule and `copy=` ask that.
 #[must_use]
 pub fn program_of(program: &str) -> Option<Program> {
-    match program_word(program).as_str() {
-        "claude" | "claude-code" => Some(Program::Claude),
-        "codex" => Some(Program::Codex),
-        "agy" => Some(Program::Agy),
-        "muse" => Some(Program::Muse),
-        _ => None,
+    let word = program_word(program);
+    let is = |name: &str| word.eq_ignore_ascii_case(name);
+    if is("claude") || is("claude-code") {
+        Some(Program::Claude)
+    } else if is("codex") {
+        Some(Program::Codex)
+    } else if is("agy") {
+        Some(Program::Agy)
+    } else if is("muse") || is_muse_build(word) {
+        Some(Program::Muse)
+    } else if is("gemini") {
+        Some(Program::Gemini)
+    } else {
+        None
     }
+}
+
+/// `muse-bin-1.4.10-R6427.1`: the build Meta's installer's launcher execs
+/// (`muse-bin-` and a version that opens on a digit), case aside.
+fn is_muse_build(word: &str) -> bool {
+    word.get(..9)
+        .is_some_and(|p| p.eq_ignore_ascii_case("muse-bin-"))
+        && word[9..].starts_with(|c: char| c.is_ascii_digit())
 }
 
 /// The script runtimes an agent runs AS without renaming itself — an
 /// npm/bun install of Claude Code starts under `node` or `bun`: a program so
 /// named may be identified as an agent by its SCREEN (Claude Code's frame, a
-/// Codex, agy or Muse Code box or composer: [`identify`]). A shell, a pager or `cat` showing a
+/// Codex, agy, Muse Code or Gemini CLI box or composer: [`identify`]); Gemini
+/// CLI always runs so. A shell, a pager or `cat` showing a
 /// captured screen may not.
 pub const AGENT_RUNTIMES: &[&str] = &["node", "bun", "deno"];
 
 /// Whether `program` is one of [`AGENT_RUNTIMES`].
 #[must_use]
 pub fn may_host_agent(program: &str) -> bool {
-    AGENT_RUNTIMES.contains(&program_word(program).as_str())
+    let word = program_word(program);
+    AGENT_RUNTIMES
+        .iter()
+        .any(|runtime| word.eq_ignore_ascii_case(runtime))
 }
 
 /// The program word of a `program=` / `detail=` value: the basename of its
-/// first word, lowercased, a login shell's `-` dropped.
-fn program_word(program: &str) -> String {
+/// first word, a login shell's `-` dropped — borrowed, and matched against
+/// the tables without regard to case ([`program_of`], [`may_host_agent`],
+/// [`NOT_AGENTS`]; every name in them is ASCII), never lowercased into a new
+/// string: the GUI asks it of every pane's program on every frame
+/// (`harness_host::agent_of`), so it allocates nothing.
+fn program_word(program: &str) -> &str {
     let head = program.split_whitespace().next().unwrap_or(program);
     let base = head.rsplit('/').next().unwrap_or(head);
-    base.trim_start_matches('-').to_lowercase()
+    base.trim_start_matches('-')
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prompt::PromptKind;
     use crate::prompt::fixtures::{
         API_ERROR_ENOTFOUND, API_RETRYING_DRAFT_MEASURED, API_RETRYING_MEASURED,
         API_RETRYING_QUEUED_80_MEASURED, API_RETRYING_QUEUED_DRAFT_MEASURED,
-        API_RETRYING_QUEUED_MEASURED, BOX_BASH_TOUCH, CODEX_TRUST, END_529, GOAL_ACTIVE_SUGGESTION,
+        API_RETRYING_QUEUED_MEASURED, BOX_BASH_TOUCH, END_529, GOAL_ACTIVE_SUGGESTION,
         MEMORY_BANNER_BUSY, MEMORY_BANNER_IDLE, TRUST, bash_one_row, composer, rows, screen,
     };
-    use crate::prompt::{CancelEffect, PromptKind, Role, Select};
     use crate::wall::WallKind;
 
     /// codex 0.155.1's trust gate, MEASURED (carried over from the
@@ -987,29 +1164,57 @@ mod tests {
         ])
     }
 
-    /// [`Program::ALL`] is every variant the enum DECLARES, in its order, each
-    /// at its own discriminant (read from this file's source, so a variant
-    /// added anywhere and left out of `ALL` fails here). Each name is its own
-    /// and [`program_of`] reads it back.
+    /// A program word is matched without regard to case, from its path and
+    /// past a login shell's `-` — and borrowed, never rebuilt: the GUI asks
+    /// it of every pane on every frame. `CODEX` is Codex, `/usr/local/bin/
+    /// Claude --resume` Claude Code, `-ZSH` a shell, `Node` a runtime.
+    ///
+    /// NEGATIVE CONTROLS: a name that only starts like one (`codexx`,
+    /// `claude-codes`) names nothing, and neither does a runtime's.
     #[test]
-    fn all_is_every_program() {
-        let source = include_str!("reader.rs");
-        let body = source
-            .split_once("pub enum Program {")
-            .and_then(|(_, rest)| rest.split_once("\n}"))
-            .expect("the declaration")
-            .0;
-        let declared: Vec<&str> = body
-            .lines()
-            .map(str::trim)
-            .filter(|l| l.starts_with(|c: char| c.is_ascii_uppercase()))
-            .map(|l| l.trim_end_matches(','))
-            .collect();
-        let all: Vec<String> = Program::ALL.iter().map(|p| format!("{p:?}")).collect();
-        assert_eq!(declared, all);
-        for (at, p) in Program::ALL.into_iter().enumerate() {
-            assert_eq!(p as usize, at, "{p:?}");
+    fn program_words_match_without_case_from_a_path_and_a_login_dash() {
+        for (program, want) in [
+            ("codex", Some(Program::Codex)),
+            ("CODEX", Some(Program::Codex)),
+            ("/usr/local/bin/Claude --resume", Some(Program::Claude)),
+            ("-Claude-Code", Some(Program::Claude)),
+            ("Agy", Some(Program::Agy)),
+            ("MUSE x", Some(Program::Muse)),
+            // Meta's installer's launcher execs its build by its versioned
+            // name (measured: muse 1.4.10's `program=muse-bin-1.4.10-R6427.1`);
+            // a name that only begins so is no build of it.
+            (
+                "/Users//x/.local/bin/muse-bin-1.4.10-R6427.1",
+                Some(Program::Muse),
+            ),
+            ("muse-bin-", None),
+            ("muse-bin-latest", None),
+            ("muse-binary", None),
+            ("codexx", None),
+            ("claude-codes", None),
+            ("node", None),
+            ("", None),
+        ] {
+            assert_eq!(program_of(program), want, "{program:?}");
         }
+        assert!(may_host_agent("Node"));
+        assert!(may_host_agent("/opt/homebrew/bin/BUN run x"));
+        assert!(!may_host_agent("nodes"));
+        assert!(!may_host_agent("codex"));
+        let rows = composer("");
+        assert_eq!(identify(Some("-ZSH"), &rows).program(), Program::Generic);
+        assert_eq!(
+            identify(Some("/bin/Less"), &rows).program(),
+            Program::Generic
+        );
+        assert_eq!(identify(Some("node"), &rows).program(), Program::Claude);
+    }
+
+    /// [`Program::ALL`] is every variant by construction (`next_program` and
+    /// the compile-time walk beside it); each name is its own and
+    /// [`program_of`] reads it back.
+    #[test]
+    fn every_programs_name_reads_back() {
         for p in Program::ALL {
             let named = program_of(p.name());
             if p == Program::Generic {
@@ -1021,9 +1226,11 @@ mod tests {
     }
 
     /// The program name decides first; with none (or one that names no
-    /// agent), the screen does — Claude Code's frame or one of its boxes, a
-    /// Codex choice box, else the generic reader. A shell's name wins over
-    /// a Claude-looking screen it is merely printing.
+    /// agent), the screen does — Claude Code's frame or one of its boxes,
+    /// else the generic reader. A shell's name wins over a Claude-looking
+    /// screen it is merely printing. Codex is named by its name alone: its
+    /// trust gate (codex 0.155.1's, measured) with no name reads Generic
+    /// (aterm's Codex screen lane, retired on 2026-10-16, read it as Codex).
     #[test]
     fn identify_takes_the_program_name_then_the_screen() {
         let framed = {
@@ -1039,6 +1246,10 @@ mod tests {
         );
         assert_eq!(p(Some("agy"), &framed), Program::Agy);
         assert_eq!(
+            p(Some("/opt/homebrew/bin/gemini --resume x"), &framed),
+            Program::Gemini
+        );
+        assert_eq!(
             p(Some("/usr/local/bin/muse resume x"), &framed),
             Program::Muse
         );
@@ -1048,8 +1259,8 @@ mod tests {
         assert_eq!(p(Some("node"), &framed), Program::Claude);
         assert_eq!(p(None, &screen(TRUST)), Program::Claude, "a box, no frame");
         assert_eq!(p(None, &screen(BOX_BASH_TOUCH)), Program::Claude);
-        assert_eq!(p(None, &screen(CODEX_TRUST)), Program::Codex);
-        assert_eq!(p(None, &codex_0_155_trust()), Program::Codex);
+        assert_eq!(p(None, &codex_0_155_trust()), Program::Generic);
+        assert_eq!(p(Some("codex"), &codex_0_155_trust()), Program::Codex);
         assert_eq!(p(None, &shell_asking()), Program::Generic);
         assert_eq!(p(Some("python3"), &shell_asking()), Program::Generic);
         // A pager or an editor showing a saved Claude screen is not Claude.
@@ -1070,17 +1281,18 @@ mod tests {
     /// THE SNIFF'S ORDER, PROVED OVER EVERY CAPTURE: read with no program
     /// name, no capture of one agent is ever named another's — Claude Code's
     /// (its own named `claude-…`, and the unprefixed and hand-built ones),
-    /// Codex's, agy's and Muse Code's each read as their own program or as
-    /// none, and each is named at least once.
+    /// agy's, Muse Code's and Gemini CLI's each read as their own program or
+    /// as none, and each is named at least once; Codex never is (the screen
+    /// names no Codex).
     #[test]
     fn every_capture_is_identified_as_its_own_program_or_as_none() {
-        let mut named = [0usize; 5];
+        let mut named = [0usize; 6];
         for (name, text) in crate::text::fixture_files() {
             let rows = screen(&text);
             let want = match name.split('-').next() {
-                Some("codex") => Program::Codex,
                 Some("agy") => Program::Agy,
                 Some("muse") => Program::Muse,
+                Some("gemini") => Program::Gemini,
                 _ => Program::Claude,
             };
             let got = identify(None, &rows).program();
@@ -1090,30 +1302,27 @@ mod tests {
             );
             named[got as usize] += 1;
         }
-        assert!(
-            named.iter().take(4).all(|&n| n > 0),
-            "every agent named at least once: {named:?}"
-        );
+        for agent in [
+            Program::Claude,
+            Program::Agy,
+            Program::Muse,
+            Program::Gemini,
+        ] {
+            assert!(
+                named[agent as usize] > 0,
+                "every agent named at least once: {named:?}"
+            );
+        }
+        assert_eq!(named[Program::Codex as usize], 0, "{named:?}");
     }
 
     /// A reader's default is not evidence: the generic reader's `idle` and
-    /// the Codex reader's `idle` where nothing says whether a turn runs (the
-    /// last message's head scrolled away, no end row) are not
-    /// authoritative; the Codex box, its status row and Claude Code's idle
-    /// at its composer are (its idle with no composer:
+    /// the Codex reader's every `idle` (it reads no Codex screen: a running
+    /// turn's status row and its trust gate alike) are not authoritative;
+    /// Claude Code's idle at its composer is (its idle with no composer:
     /// [`claude_codes_idle_is_read_at_its_composer`]).
     #[test]
     fn a_default_idle_is_not_authoritative() {
-        let headless = rows(&[
-            "  the tail of an answer whose head scrolled away",
-            "",
-            "› Ask Codex to do anything",
-            "",
-            "  gpt-5 · ~/src",
-        ]);
-        let r = read(Some("codex"), &headless, None);
-        assert_eq!(r.phase, Phase::Idle);
-        assert!(!r.phase_authoritative);
         let working = rows(&[
             "• Working (12s • esc to interrupt)",
             "",
@@ -1121,9 +1330,10 @@ mod tests {
             "",
             "  gpt-5 · ~/src",
         ]);
-        let r = read(Some("codex"), &working, None);
-        assert_eq!((r.phase, r.phase_authoritative), (Phase::Busy, true));
-        assert!(read(Some("codex"), &screen(CODEX_TRUST), None).phase_authoritative);
+        for r in [working, codex_0_155_trust()] {
+            let r = read(Some("codex"), &r, None);
+            assert_eq!((r.phase, r.phase_authoritative), (Phase::Idle, false));
+        }
         let g = read(Some("zsh"), &shell_asking(), None);
         assert_eq!(g.phase, Phase::Idle);
         assert!(!g.phase_authoritative);
@@ -1152,65 +1362,61 @@ mod tests {
         );
     }
 
-    /// Codex's trust gate (both measured builds) is a trust prompt: its
-    /// folder, `Trust and continue` / `Yes, continue` as the trust and
-    /// `Quit` / `No, quit` as the exit, the cursor on the first, and `esc
-    /// quit` read as an exit. Claude Code's reader on the same screen sees
-    /// nothing — why the dispatch.
+    /// THE CODEX READER READS NOTHING (aterm's Codex screen lane, retired on
+    /// 2026-10-16): on its trust gate and on a running turn it names no box,
+    /// wall, composer, question or busy row, and has no caret or paste
+    /// guard, so nothing acts on a Codex's screen and `aterm drive` waits on
+    /// nothing there. NEGATIVE CONTROL: Claude Code's reader, the same
+    /// machinery, reads its own trust dialog's box and its busy row.
     #[test]
-    fn the_codex_reader_reads_its_trust_gate_by_role() {
-        let r = screen(CODEX_TRUST);
-        let reading = read(Some("codex"), &r, None);
-        assert_eq!(reading.phase, Phase::Prompt);
-        let p = reading.prompt.expect("the box");
-        assert_eq!(p.kind, PromptKind::Trust);
-        assert_eq!(p.title, "Folder access");
-        assert!(p.path.as_deref().is_some_and(|f| f.ends_with("/lv/work3")));
-        let labels: Vec<&str> = p.options.iter().map(|o| o.label.as_str()).collect();
-        assert_eq!(labels, vec!["Trust and continue", "Quit"]);
-        let roles: Vec<Role> = p.options.iter().map(|o| o.role).collect();
-        assert_eq!(roles, vec![Role::Trust, Role::Exit]);
-        assert!(p.options[0].focused && !p.options[1].focused);
-        // Its cursor and Enter choose (`enter continue`); a digit changes
-        // nothing on it (measured under the host, 2026-09-24).
-        assert_eq!(p.select, Select::ArrowsEnter);
-        assert_eq!(p.cancel.map(|c| c.effect), Some(CancelEffect::Exit));
-
-        let old = codex_0_155_trust();
-        let p = CodexReader.prompt(&old).expect("the 0.155.1 box");
-        assert_eq!(p.kind, PromptKind::Trust);
-        assert!(
-            p.title.starts_with("Do you trust the contents"),
-            "{}",
-            p.title
+    fn the_codex_reader_reads_nothing() {
+        let working = rows(&[
+            "• Working (12s • esc to interrupt)",
+            "",
+            "› Ask Codex to do anything",
+            "",
+            "  gpt-5 · ~/src",
+        ]);
+        let codex = Program::Codex.reader();
+        assert_eq!(codex.program(), Program::Codex);
+        for r in [codex_0_155_trust(), working, shell_asking()] {
+            let reading = read(Some("codex"), &r, None);
+            assert_eq!(reading.phase, Phase::Idle);
+            assert!(!reading.phase_authoritative);
+            assert_eq!(
+                (reading.prompt, reading.wall, reading.composer),
+                (None, None, None)
+            );
+            assert!(!reading.interrupted && !reading.goal_active && !reading.fresh);
+            assert_eq!(codex.prompt(&r), None);
+            assert_eq!(codex.background_wait(&r), None);
+        }
+        assert_eq!(
+            (codex.caret(), codex.busy_guard(), codex.paste_guard()),
+            (None, None, false)
         );
-        let roles: Vec<Role> = p.options.iter().map(|o| o.role).collect();
-        assert_eq!(roles, vec![Role::Trust, Role::Exit]);
-        assert_eq!(p.cancel, None, "`Press enter to continue` names no Esc");
-
-        assert_eq!(CodexReader.phase(&shell_asking()), Phase::Idle);
-        // Claude's own reader reads the Codex gate as idle: why the dispatch.
-        assert_eq!(ClaudeReader.phase(&r), Phase::Idle, "the control");
+        let claude = read(Some("claude"), &screen(TRUST), None);
+        assert_eq!(claude.phase, Phase::Prompt, "the control");
+        assert!(claude.prompt.is_some(), "the control");
+        assert!(
+            Program::Claude.reader().busy_guard().is_some(),
+            "the control"
+        );
     }
 
     /// What a supervisor TYPING into a program needs of its reader: the
     /// composer on the screen (Claude Code's only inside its frame — a `❯`
     /// row under a box is the transcript's) and the row whose leaving ends a
-    /// turn — Codex's status row, never its question footer's same hint.
-    /// NEGATIVE CONTROLS: the generic reader has no caret, busy row or paste
-    /// guard; `Program::reader` is each one.
+    /// turn. NEGATIVE CONTROLS: the generic reader has no caret, busy row or
+    /// paste guard; `Program::reader` is each one.
     #[test]
     fn each_reader_says_how_to_type_into_its_program() {
-        use crate::codex::fixtures as cx;
-        let matches = |guard: &str, row: &str| {
-            let re = guard.replace("\\)", ")").replace('.', " ");
-            row.contains(&re)
-        };
         let claude = Program::Claude.reader();
-        let codex = Program::Codex.reader();
         assert_eq!(claude.program(), Program::Claude);
-        assert_eq!(codex.program(), Program::Codex);
         assert_eq!(Program::Generic.reader().program(), Program::Generic);
+        for p in Program::ALL {
+            assert_eq!(p.reader().program(), p);
+        }
         let idle = {
             let mut r = rows(&["⏺ Done.", ""]);
             r.extend(composer("  ? for shortcuts"));
@@ -1221,20 +1427,6 @@ mod tests {
             claude.composer(&screen(BOX_BASH_TOUCH)),
             None,
             "a box replaces the frame: no composer"
-        );
-        let busy = codex.busy_guard().expect("codex's busy row");
-        let status_row = screen(cx::BUSY)
-            .into_iter()
-            .find(|r| r.starts_with("• ") && r.contains("esc to interrupt"))
-            .expect("the status row");
-        assert!(matches(&busy, &status_row), "{busy} / {status_row}");
-        let question_footer = screen(cx::QUESTION)
-            .into_iter()
-            .rfind(|r| r.contains("esc to interrupt"))
-            .expect("the question's footer");
-        assert!(
-            !matches(&busy, &question_footer),
-            "the question's footer is no running turn: {question_footer}"
         );
         assert!(claude.busy_guard().is_some());
         let g = GenericReader;
@@ -1566,26 +1758,13 @@ mod tests {
             "the control: {ready:?}"
         );
         assert!(ready.composer.is_some() && ready.fresh, "{ready:?}");
-        // The other readings with no composer frame on the screen.
-        let spinning = rows(&["% claude", "", "✶ Deliberating… (3s · thinking)"]);
-        let asking = shell_asking();
+        // The other readings with no composer frame on the screen stand:
+        // [`claude_codes_idle_is_the_prompt_box_that_holds_the_cursor`].
         let end = screen(END_529);
         let top = end
             .iter()
             .position(|r| r.starts_with('─'))
             .expect("the rule");
-        let walled = end[..top].to_vec();
-        for (name, r, phase) in [
-            ("trust dialog", screen(TRUST), Phase::Prompt),
-            ("spinner", spinning, Phase::Busy),
-            ("question", asking, Phase::Question),
-            ("wall", walled, Phase::Idle),
-        ] {
-            assert!(!has_composer_frame(&r), "{name}");
-            let reading = read(Some("claude"), &r, None);
-            assert_eq!(reading.phase, phase, "{name}");
-            assert!(reading.phase_authoritative, "{name}: {reading:?}");
-        }
         assert_eq!(
             read(Some("claude"), &end[..top], None).wall.map(|w| w.kind),
             Some(WallKind::Overloaded),
@@ -2083,7 +2262,7 @@ mod tests {
             );
         }
         for program in [Some("codex"), None] {
-            let codex = screen(crate::codex::fixtures::IDLE);
+            let codex = codex_0_155_trust();
             assert_eq!(
                 read_at(program, &codex, None, None),
                 read(program, &codex, None),

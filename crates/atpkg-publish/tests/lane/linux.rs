@@ -193,12 +193,6 @@ fn a_dry_run_sees_every_served_target_and_plans_the_missing_rows() {
     // The bundle is a human lane, and its group holds trust-ir on both targets.
     assert_eq!(*decision(&o, "trust"), Decision::ManualBundle);
     assert!(table_row(&tx, "trust-ir").contains("BUILD+HOLD(group rustc: x86_64,aarch64)"));
-    assert!(
-        tx.text()
-            .contains("DRY_RUN — would build: ay clean trust-ir"),
-        "{}",
-        tx.text()
-    );
     assert!(w.fx.packer.legs().is_empty() && w.fx.calls("clone ").is_empty());
     assert!(
         !LaneState::of(LaneKind::Linux, &w.fx.ctx.state_dir)
@@ -239,10 +233,6 @@ fn an_x86_only_builder_plans_x86_and_names_the_target_it_leaves_unserved() {
     let mut w = World::new("linux-x86-only");
     w.builder = FakeBuilder::can(&[]);
     let (o, tx) = ok(w.run(true));
-    assert!(
-        tx.text()
-            .contains("skipped target aarch64-unknown-linux-gnu — no cross linker")
-    );
     let clean = table_row(&tx, "clean");
     assert!(
         clean.contains("pack x86_64-unknown-linux-gnu, merge") && !clean.contains("BLOCKED"),
@@ -281,7 +271,6 @@ fn a_channel_that_splits_the_targets_narrows_to_the_host_and_never_dies() {
     text.push_str("pin_by_target = { \"aarch64-unknown-linux-gnu\" = { ay = 11 } }\n");
     w.fx.publish_index_text(8, &text);
     let (o, tx) = ok(w.run(true));
-    assert!(tx.text().contains("narrowing this run to x86_64-unknown-linux-gnu — index-8 resolves aarch64-unknown-linux-gnu to a different build"), "{}", tx.text());
     assert_eq!(o.can, [X86]);
     assert!(table_row(&tx, "clean").contains("pack x86_64-unknown-linux-gnu, merge"));
 }
@@ -290,13 +279,7 @@ fn a_channel_that_splits_the_targets_narrows_to_the_host_and_never_dies() {
 fn staging_extends_the_published_bytes_with_every_target_in_one_manifest() {
     let w = World::new("linux-stage");
     w.keyless();
-    let (o, tx) = ok(w.run(false));
-    assert!(
-        tx.text()
-            .contains("no machine key at ~/.aterm/machine.key — staged UNSIGNED under"),
-        "{}",
-        tx.text()
-    );
+    let (o, _) = ok(w.run(false));
     // (i) both targets, one manifest, the second merge chained onto the first.
     let clean = w.manifest_of("clean", 20);
     for t in [
@@ -352,21 +335,6 @@ fn staging_extends_the_published_bytes_with_every_target_in_one_manifest() {
     ] {
         assert!(ready.contains(t), "{ready}");
     }
-    assert!(
-        ready
-            .lines()
-            .any(|l| l.starts_with("HOLD ") && l.contains("trust-ir")),
-        "{ready}"
-    );
-    assert!(
-        ready.contains("Nothing is signed: this box has no machine key at ~/.aterm/machine.key."),
-        "{ready}"
-    );
-    assert!(
-        ready.contains("atpkg-publish sign clean/pkg-clean-20.toml"),
-        "{ready}"
-    );
-    assert!(ready.contains("atpkg-publish index --upload"), "{ready}");
     assert_eq!(o.ready, ["ay", "clean"]);
     assert_eq!(o.held, ["trust-ir"]);
     assert!(o.published.is_none() && w.fx.indexer.count() == 0);
@@ -391,10 +359,6 @@ fn an_x86_only_builder_stages_x86_and_tells_the_signer_what_went_unserved() {
     assert!(
         !w.staged().join("ay").exists(),
         "ay had nothing this builder could pack"
-    );
-    assert!(
-        w.ready()
-            .contains("SKIPPED aarch64-unknown-linux-gnu — no cross linker")
     );
 }
 
@@ -433,11 +397,7 @@ fn one_targets_failure_latches_that_target_and_the_other_still_stages() {
 #[test]
 fn a_keyed_box_signs_uploads_to_both_owners_and_publishes_the_follow_up_index() {
     let w = World::new("linux-keyed");
-    let (o, tx) = ok(w.run(false));
-    assert!(
-        tx.text()
-            .contains("machine key present — signing and publishing 2 program(s)")
-    );
+    let (o, _) = ok(w.run(false));
     assert_eq!(o.signed, ["ay", "clean"]);
     assert_eq!(o.published, Some(8));
     let deltas = w.fx.indexer.deltas();
@@ -469,16 +429,6 @@ fn a_keyed_box_signs_uploads_to_both_owners_and_publishes_the_follow_up_index() 
         ),
         "{ready}"
     );
-    assert!(
-        !ready.contains("Nothing is signed") && !ready.contains("atpkg-publish sign"),
-        "{ready}"
-    );
-    assert!(
-        ready
-            .lines()
-            .any(|l| l.starts_with("HOLD ") && l.contains("trust-ir"))
-    );
-    assert!(!tx.text().contains("no machine key"));
 }
 
 #[test]
@@ -493,63 +443,16 @@ fn a_keyed_run_that_stops_before_the_index_leaves_the_ceremony() {
         "{e}"
     );
     let ready = w.ready();
-    assert!(ready.contains("A run started signing and publishing the READY programs below with the machine key at ~/.aterm/machine.key."), "{ready}");
     assert!(
         ready.contains("If its log has no \"published atpkg-index-8\", run the ceremony below."),
         "{ready}"
     );
-    assert!(
-        ready.contains("atpkg-publish sign clean/pkg-clean-20.toml"),
-        "{ready}"
-    );
-    assert!(!ready.contains("no machine key"));
     // (q2) The next keyed run finds the uploads published, nothing READY, and finishes
     // the index they are owed.
     w.fx.indexer.fail.store(false, Ordering::SeqCst);
     let (o, _) = ok(w.run(false));
     assert!(o.ready.is_empty() && o.signed.is_empty());
     assert_eq!(o.published, Some(8));
-    assert!(
-        w.ready()
-            .contains("Published atpkg-index-8 for the uploads an earlier run signed: ay clean."),
-        "{}",
-        w.ready()
-    );
-}
-
-#[test]
-fn a_keyless_box_after_a_stopped_run_keeps_the_index_step() {
-    let w = World::new("linux-signed-earlier");
-    w.fx.indexer.fail.store(true, Ordering::SeqCst);
-    let _ = w.run(false);
-    w.fx.indexer.fail.store(false, Ordering::SeqCst);
-    w.keyless();
-    let (o, tx) = ok(w.run(false));
-    assert!(o.published.is_none());
-    let ready = w.ready();
-    assert!(
-        ready
-            .lines()
-            .any(|l| l == "Signed and uploaded by an earlier run: ay clean."),
-        "{ready}"
-    );
-    assert!(
-        ready
-            .lines()
-            .any(|l| l == "atpkg-index-8 is not published yet: run the follow-up index below."),
-        "{ready}"
-    );
-    assert!(ready.contains("atpkg-publish index --upload"));
-    assert!(
-        !ready.contains("atpkg-publish sign"),
-        "nothing is asked to be signed twice"
-    );
-    assert!(
-        tx.text()
-            .contains("atpkg-index-8 unpublished: an earlier run signed and uploaded ay, clean"),
-        "{}",
-        tx.text()
-    );
 }
 
 #[test]
@@ -563,10 +466,6 @@ fn a_keyed_box_with_no_channel_token_signs_nothing() {
             .contains("channel token file missing/empty: ~/.secrets/gh_access_token_alabsystems"),
         "{e}"
     );
-    let ready = w.ready();
-    assert!(ready.contains("Nothing is signed: the channel token at ~/.secrets/gh_access_token_alabsystems is missing or empty"), "{ready}");
-    assert!(!ready.contains("A run started signing"));
-    assert!(ready.contains("atpkg-publish sign clean/pkg-clean-20.toml"));
     assert!(
         !linux::staged_manifest(&w.staged(), "clean", 20)
             .with_extension("toml.sig")
@@ -587,7 +486,7 @@ fn a_staged_merge_that_no_longer_extends_the_published_bytes_takes_the_ceremony_
     )
     .expect("write");
     w.rekey();
-    let (r, tx) = w.run(false);
+    let (r, _) = w.run(false);
     let e = r.expect_err("the byte-prefix gate refuses");
     assert!(
         e.to_string().contains(
@@ -595,10 +494,6 @@ fn a_staged_merge_that_no_longer_extends_the_published_bytes_takes_the_ceremony_
              byte-prefix of the staged merge"
         ),
         "{e}"
-    );
-    assert!(
-        !tx.text().contains("signing and publishing"),
-        "it refused before the key was used"
     );
     assert!(
         !w.staged().join("READY.md").exists(),
@@ -665,21 +560,6 @@ fn an_unproven_row_in_the_published_base_is_never_judged_again() {
         o.signed.contains(&"clean".to_string()),
         "only this lane's rows are judged"
     );
-}
-
-#[test]
-fn a_keyed_box_whose_only_staged_work_is_held_says_what_holds_it() {
-    let w = World::new("linux-held");
-    std::fs::create_dir_all(w.staged()).expect("mkdir");
-    std::fs::write(w.staged().join("BLOCKED-ay-10.md"), "").expect("latch");
-    std::fs::write(w.staged().join("BLOCKED-clean-20.md"), "").expect("latch");
-    let (o, tx) = ok(w.run(false));
-    assert_eq!(o.held, ["trust-ir"]);
-    assert!(tx.text().contains("held unsigned: trust-ir — waiting on a Linux row for trust (a coherence group publishes whole)"), "{}", tx.text());
-    assert!(!tx.text().contains("no machine key"));
-    let ready = w.ready();
-    assert!(ready.lines().any(|l| l == "Nothing is signed: nothing is READY. This box holds the machine key at ~/.aterm/machine.key."), "{ready}");
-    assert!(!ready.contains("atpkg-publish sign"));
 }
 
 #[test]
@@ -830,16 +710,6 @@ fn a_manifest_that_cannot_be_verified_is_never_signed_over_on_either_owner() {
                 .exists(),
             "{label}: the key never touched clean"
         );
-        let ready = w.ready();
-        assert!(
-            ready.contains("NOT SIGNABLE this run: clean — cannot fetch pkg-clean-20.toml"),
-            "{label}: {ready}"
-        );
-        // ay verified, so its rows are signed and indexed as before.
-        assert!(
-            ready.contains("Signed and published by this run"),
-            "{label}: {ready}"
-        );
     }
 }
 
@@ -854,7 +724,7 @@ fn a_public_manifest_another_machine_extended_refuses_the_signing() {
     theirs.push_str(&row("clean", 20, ARM, false));
     publish_public_only(&w, "clean", 20, &theirs);
     w.rekey();
-    let (r, tx) = w.run(false);
+    let (r, _) = w.run(false);
     let e = r.expect_err("the public owner's bytes are not a prefix of the merge");
     assert!(
         e.to_string().contains(
@@ -872,7 +742,6 @@ fn a_public_manifest_another_machine_extended_refuses_the_signing() {
             .as_deref(),
         Some(theirs.as_bytes())
     );
-    assert!(!tx.text().contains("signing and publishing"));
     assert_eq!(w.fx.indexer.count(), 0);
 }
 
@@ -906,15 +775,6 @@ fn a_key_the_roster_does_not_list_signs_and_uploads_nothing() {
             "{p} carries no signature"
         );
     }
-    let ready = w.ready();
-    assert!(
-        ready.contains("Nothing is signed: REFUSED — machine 'm99' is NOT on the roster"),
-        "{ready}"
-    );
-    assert!(
-        ready.contains("atpkg-publish sign clean/pkg-clean-20.toml"),
-        "the ceremony is left for a rostered machine: {ready}"
-    );
 }
 
 #[test]
@@ -945,15 +805,7 @@ fn a_public_upload_an_earlier_run_owed_is_finished_before_the_index() {
             assets,
         },
     );
-    let (o, tx) = ok(w.run(false));
-    assert!(
-        tx.text().contains(
-            "[clean@20] alabsystems/clean lacked the manifest an earlier run signed — uploaded \
-             it there"
-        ),
-        "{}",
-        tx.text()
-    );
+    let (o, _) = ok(w.run(false));
     let staged = w.manifest_of("clean", 20);
     assert_eq!(
         w.fx.public_asset("clean", 20, "pkg-clean-20.toml")

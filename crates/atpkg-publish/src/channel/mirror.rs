@@ -29,6 +29,7 @@ use std::time::Duration;
 use atpkg::net::MANIFEST_CAP;
 
 use super::{Log, download_retried, flag_value, host_error};
+use crate::artifact::{pkgdoc, upload};
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
 use crate::host::{HostError, Probe, Replace};
@@ -116,9 +117,9 @@ pub fn check_staged(
     program: &str,
     build: u64,
 ) -> Result<Vec<String>> {
-    let tag = format!("atpkg-{program}-{build}");
-    let mf = format!("pkg-{program}-{build}.toml");
-    let sig = format!("{mf}.sig");
+    let tag = upload::tag(program, build);
+    let mf = pkgdoc::manifest_name(program, build);
+    let sig = pkgdoc::sig_name(program, build);
     let (Ok(bytes), Ok(sig_bytes)) = (std::fs::read(dir.join(&mf)), std::fs::read(dir.join(&sig)))
     else {
         return Err(Error::refused(format!(
@@ -249,9 +250,9 @@ fn one(
     build: u64,
     report: &mut MirrorReport,
 ) -> Result<()> {
-    let tag = format!("atpkg-{program}-{build}");
-    let mf = format!("pkg-{program}-{build}.toml");
-    let sig = format!("{mf}.sig");
+    let tag = upload::tag(program, build);
+    let mf = pkgdoc::manifest_name(program, build);
+    let sig = pkgdoc::sig_name(program, build);
     let public = ctx.public_slug(repo);
     let staging = ctx.staging_slug(repo);
     let channel = &*ctx.hosts.channel;

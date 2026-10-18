@@ -183,6 +183,35 @@ fn a_post_crosses_two_nodes_over_the_sealed_wire_and_ls_sees_both() {
         "the answer must resolve to A's OWN post id: {back}"
     );
     assert!(id > 0);
+
+    // AND A SECOND BARE POST. The first one's walk asked A's bridge for its
+    // live presence view (`aterm_link::presence_view`), and this one is routed
+    // through it if it is up — one read of what landed since — or by the walk
+    // if it is not. Nothing out here can tell which: the claim is only that
+    // the route is the same either way, over the sealed wire. That the view
+    // goes live under a node's own ring on a guarded broker, sealed or not, and
+    // that its confirming read passes the guard, is proved where the view can
+    // be seen: aterm-link's
+    // `the_presence_view_goes_live_under_a_nodes_ring_on_a_guarded_broker` and
+    // `..._over_the_sealed_wire`.
+    let again = a.verb(&format!(
+        "@{sid_a} post to=@{sid_b} kind=note --wait A5 again"
+    ));
+    assert!(
+        again.ok(),
+        "the second bare post: {} / {}",
+        again.header(),
+        a.log_tail()
+    );
+    let row = until("the second post to land in B's inbox", || {
+        b.inbox(&sid_b)
+            .into_iter()
+            .find(|r| r.contains("kind=note"))
+    });
+    assert!(
+        row.contains(&format!("from={sid_a}@{}", a.node)),
+        "B must see A's SESSION again: {row}"
+    );
 }
 
 /// **Two nodes advertising ONE sid: `post` answers `ERR ambiguous` and delivers

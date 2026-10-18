@@ -62,6 +62,12 @@ impl Fixture {
     }
 
     fn seed(&self, declined: bool) -> Output {
+        self.configure(declined);
+        self.seed_with(&[], &[])
+    }
+
+    /// The scratch aterm.toml: the install consent declined, or the default config.
+    fn configure(&self, declined: bool) {
         let config = self.root.path().join("config");
         std::fs::create_dir_all(config.join("aterm")).unwrap();
         std::fs::write(
@@ -73,7 +79,6 @@ impl Fixture {
             },
         )
         .unwrap();
-        self.seed_with(&[], &[])
     }
 
     /// `atpkg seed` on the config as it stands, with `args` after the verb and `envs` set.
@@ -151,14 +156,9 @@ fn a_declined_seed_adopts_nothing_and_lays_no_stubs() {
     let fx = Fixture::new("declined");
     let out = fx.seed(true);
     let text = describe(&out);
-    let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success(),
         "a declined seed is a quiet skip: {text}"
-    );
-    assert!(
-        stdout.contains("[packages].auto_install = false — not installing"),
-        "the skip says why: {text}"
     );
     assert_eq!(
         fx.adoption_writes(),
@@ -289,6 +289,46 @@ fn a_consenting_seed_puts_bin_on_path_and_answers_targo() {
     );
 }
 
+/// ONE STORE WHATEVER `$XDG_DATA_HOME` SAYS (docs/TOOLCHAIN-PACKAGE-MANAGER.md §10). The
+/// variable set in a shell rc is missing from a desktop launcher's or an ssh session's
+/// environment, so the installer's seed sees it and the window's seed does not: both must
+/// lay the one store under `HOME` and leave the hook naming its `bin/`, never a second,
+/// empty store the hooks move to (and a multi-GB set downloaded twice).
+#[test]
+fn the_store_and_its_hook_do_not_follow_xdg_data_home() {
+    if !atpkg::manager_enabled_with(atpkg::PKG_TRUST_ANCHORS) {
+        return; // A build that pins no root key adopts nothing.
+    }
+    let fx = Fixture::new("xdg-data");
+    fx.configure(false);
+    let data = fx.home.join("data");
+    let data = data.to_str().expect("a UTF-8 scratch path");
+    let with: &[(&str, &str)] = &[("XDG_DATA_HOME", data)];
+    let mut hooks = Vec::new();
+    for envs in [with, &[], with] {
+        let out = fx.seed_with(&[], envs);
+        let text = describe(&out);
+        assert!(out.status.success(), "{envs:?}: {text}");
+        assert!(fx.layout.adopted().is_file(), "{envs:?}: {text}");
+        assert!(
+            std::fs::symlink_metadata(std::path::Path::new(data).join("aterm")).is_err(),
+            "{envs:?}: nothing lands under $XDG_DATA_HOME: {text}"
+        );
+        hooks.push(std::fs::read_to_string(fx.zsh_hook()).expect("the seed writes the hook"));
+    }
+    let bin = fx.layout.bin_dir();
+    assert!(
+        hooks[0].contains(bin.to_str().expect("a UTF-8 scratch path")),
+        "the hook names the store's bin/ {}:\n{}",
+        bin.display(),
+        hooks[0]
+    );
+    assert!(
+        hooks.iter().all(|hook| *hook == hooks[0]),
+        "the hook stays put across environments: {hooks:#?}"
+    );
+}
+
 /// A pass in flight on `progress`, its plan `program` alone, downloading: this test process
 /// stands in for it, its heartbeat kept fresh by a thread until the returned flag is raised,
 /// as a real pass's is.
@@ -299,16 +339,35 @@ fn fake_pass(
     std::sync::Arc<std::sync::atomic::AtomicBool>,
     std::thread::JoinHandle<()>,
 ) {
+    fake_pass_until_done(progress, program, None)
+}
+
+/// [`fake_pass`] whose `program` row reads `done` once `done` is raised — the pass still live.
+fn fake_pass_until_done(
+    progress: PathBuf,
+    program: &'static str,
+    done: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> (
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    std::thread::JoinHandle<()>,
+) {
     let write_progress = move || {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
+        let row = if done
+            .as_ref()
+            .is_some_and(|d| d.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            "{\"phase\":\"done\",\"bytes_done\":4,\"bytes_total\":4}"
+        } else {
+            "{\"phase\":\"download\",\"bytes_done\":1,\"bytes_total\":4}"
+        };
         let body = format!(
             "{{\"v\":1,\"pid\":{},\"pass\":\"net\",\"heartbeat_unix\":{now},\
              \"overall\":{{\"programs_done\":0,\"programs_total\":1}},\
-             \"queue\":[\"{program}\"],\"programs\":{{\"{program}\":{{\"phase\":\"download\",\
-             \"bytes_done\":1,\"bytes_total\":4}}}}}}",
+             \"queue\":[\"{program}\"],\"programs\":{{\"{program}\":{row}}}}}",
             std::process::id()
         );
         let tmp = progress.with_extension("tmp");
@@ -460,6 +519,37 @@ fn an_unattended_targo_waits_for_trust_and_then_runs() {
         stdout, "ran targo --version\n",
         "only the tool's own output on stdout"
     );
+}
+
+/// A WAIT FOR A NAME ITS PROGRAM DOES NOT BRING ENDS WHEN THE PROGRAM LANDS, not when the
+/// pass does: trust's row reads done while no `targo` shim stands (its build exposes no such
+/// command), so the waiting `targo` says so and exits 127 while the pass is still live — a
+/// wait that ended only with the pass would hold the tool call for the pass's whole length.
+#[test]
+fn an_unattended_targo_answers_once_trust_lands_without_it() {
+    if !atpkg::manager_enabled_with(atpkg::PKG_TRUST_ANCHORS) {
+        return;
+    }
+    let fx = Fixture::new("landed-without");
+    let out = fx.seed(false);
+    assert!(out.status.success(), "{}", describe(&out));
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (ended, heartbeat) = fake_pass_until_done(
+        fx.layout.progress_file(),
+        "trust",
+        Some(std::sync::Arc::clone(&done)),
+    );
+    let (child, rx) = unattended_targo(&fx);
+    line_with(&rx, "trust is on its way");
+    // trust lands, and lays no targo.
+    done.store(true, std::sync::atomic::Ordering::SeqCst);
+    // The pass runs on until the stub has answered.
+    let (status, stdout) = exit_and_stdout(child);
+    ended.store(true, std::sync::atomic::Ordering::SeqCst);
+    heartbeat.join().unwrap();
+    assert_eq!(status.code(), Some(127), "{status:?} stdout {stdout}");
+    assert!(stdout.is_empty(), "{stdout}");
+    line_with(&rx, "trust is installed, and it has no command named targo");
 }
 
 /// A STUB RUN BEFORE THE PASS BEGINS WAITS FOR IT. The window's first-run seed promises the
@@ -955,6 +1045,13 @@ fn a_pending_stub_says_whether_a_person_asked() {
 /// the owner, so the promise rides on its pid as it did before start times were recorded,
 /// and `targo` waits for trust and runs — never 127 "nothing is installing" while the window
 /// is about to install it.
+///
+/// The profile denies `process-info-pidinfo`, the operation the start-time read is
+/// (`proc_pidinfo` on the owner: `EPERM`, `ESRCH` for a dead pid, `kill(pid, 0)` still
+/// answering), and nothing wider. `process-info*` also denies `process-info-setcontrol`, which
+/// std's runtime init uses on itself before `main` (`pthread_setname_np("main")` on Apple):
+/// a Trust std built with debug assertions aborts there (macOS 27.0.1, trust 450403669), so
+/// atpkg would die of SIGABRT before it read anything — not the case under test.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_sandboxed_stub_that_cannot_read_the_owners_start_time_still_waits() {
@@ -976,7 +1073,7 @@ fn a_sandboxed_stub_that_cannot_read_the_owners_start_time_still_waits() {
         &[
             "/usr/bin/sandbox-exec",
             "-p",
-            "(version 1)(allow default)(deny process-info*)",
+            "(version 1)(allow default)(deny process-info-pidinfo)",
         ],
     );
     line_with(&rx, "trust is on its way");

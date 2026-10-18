@@ -21,45 +21,6 @@ use aterm_hash::{FNV64_OFFSET, FNV64_PRIME};
 /// Number of hash functions (optimal for ~1% FPR at m/n ~= 10).
 const K: usize = 7;
 
-// Bit-operation counters: the tests pin O(1) lookup and insert.
-#[cfg(test)]
-thread_local! {
-    static BLOOM_GET_BIT_OPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static BLOOM_SET_BIT_OPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// Increment the get_bit operation counter.
-#[cfg(test)]
-fn count_get_bit_op() {
-    BLOOM_GET_BIT_OPS.with(|c| c.set(c.get() + 1));
-}
-
-/// Increment the set_bit operation counter.
-#[cfg(test)]
-fn count_set_bit_op() {
-    BLOOM_SET_BIT_OPS.with(|c| c.set(c.get() + 1));
-}
-
-/// Take (read and reset) the get_bit operation count.
-#[cfg(test)]
-fn take_get_bit_ops() -> usize {
-    BLOOM_GET_BIT_OPS.with(|c| {
-        let v = c.get();
-        c.set(0);
-        v
-    })
-}
-
-/// Take (read and reset) the set_bit operation count.
-#[cfg(test)]
-fn take_set_bit_ops() -> usize {
-    BLOOM_SET_BIT_OPS.with(|c| {
-        let v = c.get();
-        c.set(0);
-        v
-    })
-}
-
 /// Bloom filter: false positives are possible, false negatives are not.
 #[derive(Debug, Clone)]
 pub struct BloomFilter {
@@ -307,9 +268,6 @@ impl BloomFilter {
     /// Set a bit in the filter.
     #[inline]
     fn set_bit(&mut self, bit_idx: usize) {
-        #[cfg(test)]
-        count_set_bit_op();
-
         let word_idx = bit_idx / 64;
         let bit_pos = bit_idx % 64;
         self.bits[word_idx] |= 1u64 << bit_pos;
@@ -318,18 +276,9 @@ impl BloomFilter {
     /// Get a bit from the filter.
     #[inline]
     fn get_bit(&self, bit_idx: usize) -> bool {
-        #[cfg(test)]
-        count_get_bit_op();
-
         let word_idx = bit_idx / 64;
         let bit_pos = bit_idx % 64;
         (self.bits[word_idx] & (1u64 << bit_pos)) != 0
-    }
-}
-
-impl Default for BloomFilter {
-    fn default() -> Self {
-        Self::with_capacity(10_000)
     }
 }
 

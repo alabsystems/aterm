@@ -16,8 +16,8 @@
 //! [`dev_seam!`](crate::dev_seam) is the ONE reader. It expands IN THE CALLING CRATE,
 //! so `feature = "dev-seams"` is that crate's own feature: every crate that reads a
 //! seam declares `dev-seams` in its manifest and forwards it to the crates it depends
-//! on. A release build compiles every read through this macro to `None`, so no seam
-//! ships.
+//! on. A seam's name may be read only through this macro, and a release build
+//! compiles every read through it to `None`, so no seam ships.
 
 /// Read the development seam `$name` — `Some(value)` only in a build that compiles
 /// seams (`debug_assertions`, or the calling crate's `dev-seams` feature) and only
@@ -37,15 +37,4 @@ macro_rules! dev_seam {
         };
         seam
     }};
-}
-
-#[cfg(test)]
-mod tests {
-    /// A test build is a debug build, so the seam reads the environment.
-    #[test]
-    fn a_test_build_reads_the_seam() {
-        const NAME: &str = "ATERM_DEV_SEAM_TEST_PROBE_UNSET";
-        assert_eq!(crate::dev_seam!(NAME), None, "unset reads as None");
-        assert_eq!(crate::dev_seam!("PATH"), std::env::var_os("PATH"));
-    }
 }

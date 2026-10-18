@@ -278,635 +278,505 @@ impl CellExtras {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::collections::HashMap;
 
     use super::*;
 
-    /// An extra whose fg RGB makes `has_data()` true.
-    fn extra_with_fg(r: u8, g: u8, b: u8) -> CellExtra {
-        let mut e = CellExtra::default();
-        e.set_fg_rgb(Some([r, g, b]));
-        e
+    const ROWS: u16 = 24;
+    const COLS: u16 = 24;
+    const RING_COLS: u16 = 80;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Shift {
+        RowsUp {
+            start: u16,
+            n: u16,
+        },
+        RegionUp {
+            top: u16,
+            bottom: u16,
+            n: u16,
+        },
+        RegionDown {
+            top: u16,
+            bottom: u16,
+            n: u16,
+        },
+        RectUp {
+            top: u16,
+            bottom: u16,
+            left: u16,
+            right: u16,
+            n: u16,
+        },
+        RectDown {
+            top: u16,
+            bottom: u16,
+            left: u16,
+            right: u16,
+            n: u16,
+        },
+        ColsRight {
+            row: u16,
+            start: u16,
+            n: u16,
+            max: u16,
+        },
+        ColsLeft {
+            row: u16,
+            start: u16,
+            n: u16,
+            max: u16,
+        },
     }
 
-    fn extra_with_hyperlink(url: &str) -> CellExtra {
-        let mut e = CellExtra::default();
-        e.set_hyperlink(Some(Arc::from(url)));
-        e
-    }
-
-    fn insert(extras: &mut CellExtras, row: u16, col: u16, extra: CellExtra) {
-        extras.set(CellCoord::new(row, col), extra);
-    }
-
-    fn has_fg_at(extras: &CellExtras, row: u16, col: u16) -> bool {
-        extras
-            .get(CellCoord::new(row, col))
-            .and_then(|e| e.fg_rgb())
-            .is_some()
-    }
-
-    fn fg_at(extras: &CellExtras, row: u16, col: u16) -> Option<[u8; 3]> {
-        extras
-            .get(CellCoord::new(row, col))
-            .and_then(|e| e.fg_rgb())
-    }
-
-    // shift_region_up_by
-
-    #[test]
-    fn test_shift_region_up_full_screen() {
-        let mut extras = CellExtras::new();
-        for r in 0..5u16 {
-            insert(&mut extras, r, 0, extra_with_fg(r as u8, 0, 0));
-        }
-        extras.shift_region_up_by(0, 23, 3);
-        assert_eq!(extras.len(), 2);
-        assert_eq!(fg_at(&extras, 0, 0), Some([3, 0, 0]));
-        assert_eq!(fg_at(&extras, 1, 0), Some([4, 0, 0]));
-    }
-
-    #[test]
-    fn test_shift_region_up_with_accumulated_offset() {
-        let mut extras = CellExtras::new();
-        insert(&mut extras, 5, 0, extra_with_fg(50, 0, 0));
-        insert(&mut extras, 10, 0, extra_with_fg(100, 0, 0));
-
-        // Accumulate a row offset.
-        extras.shift_rows_up_by(0, 2);
-        // Then insert at external row 3 (internal 3 + offset).
-        insert(&mut extras, 3, 1, extra_with_fg(30, 0, 0));
-
-        extras.shift_region_up_by(0, 23, 1);
-        assert_eq!(fg_at(&extras, 2, 1), Some([30, 0, 0]));
-    }
-
-    // shift_region_down_by
-
-    #[test]
-    fn test_shift_region_down_drops_bottom_rows() {
-        let mut extras = CellExtras::new();
-        insert(&mut extras, 8, 0, extra_with_fg(80, 0, 0));
-        insert(&mut extras, 9, 0, extra_with_fg(90, 0, 0));
-        insert(&mut extras, 5, 0, extra_with_fg(50, 0, 0));
-
-        extras.shift_region_down_by(0, 9, 2);
-        assert_eq!(fg_at(&extras, 7, 0), Some([50, 0, 0]));
-        assert!(!has_fg_at(&extras, 8, 0), "bottom rows should be dropped");
-        assert!(!has_fg_at(&extras, 9, 0), "bottom rows should be dropped");
-    }
-
-    #[test]
-    fn test_shift_region_down_single_row_shift() {
-        let mut extras = CellExtras::new();
-        insert(&mut extras, 0, 0, extra_with_fg(1, 0, 0));
-        insert(&mut extras, 9, 0, extra_with_fg(9, 0, 0));
-
-        extras.shift_region_down_by(0, 9, 1);
-        assert_eq!(fg_at(&extras, 1, 0), Some([1, 0, 0]));
-        assert!(!has_fg_at(&extras, 9, 0) || fg_at(&extras, 9, 0) != Some([9, 0, 0]));
-    }
-
-    // shift_rect_up_by
-
-    #[test]
-    fn test_shift_rect_up_zero_n_is_noop() {
-        let mut extras = CellExtras::new();
-        insert(&mut extras, 3, 10, extra_with_fg(30, 0, 0));
-        extras.shift_rect_up_by(0, 9, 5, 15, 0);
-        assert!(has_fg_at(&extras, 3, 10));
-    }
-
-    #[test]
-    fn test_shift_rect_up_only_affects_column_range() {
-        let mut extras = CellExtras::new();
-        insert(&mut extras, 4, 10, extra_with_fg(40, 10, 0));
-        insert(&mut extras, 4, 2, extra_with_fg(40, 2, 0));
-        insert(&mut extras, 4, 20, extra_with_fg(40, 20, 0));
-
-        extras.shift_rect_up_by(2, 8, 5, 15, 2);
-        assert_eq!(
-            fg_at(&extras, 2, 10),
-            Some([40, 10, 0]),
-            "inside rect shifted up"
-        );
-        assert_eq!(
-            fg_at(&extras, 4, 2),
-            Some([40, 2, 0]),
-            "outside col range preserved"
-        );
-        assert_eq!(
-            fg_at(&extras, 4, 20),
-            Some([40, 20, 0]),
-            "outside col range preserved"
-        );
-    }
-
-    #[test]
-    fn test_shift_rect_up_deletes_top_rows_in_rect() {
-        let mut extras = CellExtras::new();
-        insert(&mut extras, 2, 10, extra_with_fg(20, 0, 0));
-        insert(&mut extras, 5, 10, extra_with_fg(50, 0, 0));
-
-        extras.shift_rect_up_by(2, 8, 5, 15, 2);
-        assert!(
-            !has_fg_at(&extras, 2, 10),
-            "top row in rect should be deleted"
-        );
-        assert_eq!(
-            fg_at(&extras, 3, 10),
-            Some([50, 0, 0]),
-            "shifted up within rect"
-        );
-    }
-
-    #[test]
-    fn test_shift_rect_up_preserves_outside_row_range() {
-        let mut extras = CellExtras::new();
-        insert(&mut extras, 0, 10, extra_with_fg(1, 0, 0));
-        insert(&mut extras, 15, 10, extra_with_fg(150, 0, 0));
-
-        extras.shift_rect_up_by(2, 8, 5, 15, 1);
-        assert_eq!(fg_at(&extras, 0, 10), Some([1, 0, 0]));
-        assert_eq!(fg_at(&extras, 15, 10), Some([150, 0, 0]));
-    }
-
-    // shift_rect_down_by
-
-    #[test]
-    fn test_shift_rect_down_zero_n_is_noop() {
-        let mut extras = CellExtras::new();
-        insert(&mut extras, 3, 10, extra_with_fg(30, 0, 0));
-        extras.shift_rect_down_by(0, 9, 5, 15, 0);
-        assert!(has_fg_at(&extras, 3, 10));
-    }
-
-    #[test]
-    fn test_shift_rect_down_only_affects_column_range() {
-        let mut extras = CellExtras::new();
-        insert(&mut extras, 3, 10, extra_with_fg(30, 10, 0));
-        insert(&mut extras, 3, 2, extra_with_fg(30, 2, 0));
-        insert(&mut extras, 3, 20, extra_with_fg(30, 20, 0));
-
-        extras.shift_rect_down_by(2, 8, 5, 15, 2);
-        assert_eq!(
-            fg_at(&extras, 5, 10),
-            Some([30, 10, 0]),
-            "inside rect shifted down"
-        );
-        assert_eq!(
-            fg_at(&extras, 3, 2),
-            Some([30, 2, 0]),
-            "outside col range preserved"
-        );
-        assert_eq!(
-            fg_at(&extras, 3, 20),
-            Some([30, 20, 0]),
-            "outside col range preserved"
-        );
-    }
-
-    #[test]
-    fn test_shift_rect_down_drops_bottom_rows_in_rect() {
-        let mut extras = CellExtras::new();
-        insert(&mut extras, 8, 10, extra_with_fg(80, 0, 0));
-        insert(&mut extras, 2, 10, extra_with_fg(20, 0, 0));
-
-        extras.shift_rect_down_by(2, 8, 5, 15, 2);
-        assert!(!has_fg_at(&extras, 8, 10), "bottom row in rect dropped");
-        assert_eq!(
-            fg_at(&extras, 4, 10),
-            Some([20, 0, 0]),
-            "shifted down within rect"
-        );
-    }
-
-    // shift_cols_right (ICH)
-
-    #[test]
-    fn test_shift_cols_right_drops_past_max_col() {
-        let mut extras = CellExtras::new();
-        insert(&mut extras, 0, 78, extra_with_fg(78, 0, 0));
-
-        extras.shift_cols_right(0, 0, 5, 80);
-        assert!(
-            !has_fg_at(&extras, 0, 78),
-            "shifted past max_col should be dropped"
-        );
-        assert_eq!(extras.len(), 0);
-    }
-
-    #[test]
-    fn test_shift_cols_right_preserves_cols_before_start() {
-        let mut extras = CellExtras::new();
-        insert(&mut extras, 0, 2, extra_with_fg(20, 0, 0));
-        insert(&mut extras, 0, 10, extra_with_fg(100, 0, 0));
-
-        extras.shift_cols_right(0, 5, 3, 80);
-        assert_eq!(
-            fg_at(&extras, 0, 2),
-            Some([20, 0, 0]),
-            "below start preserved"
-        );
-        assert_eq!(
-            fg_at(&extras, 0, 13),
-            Some([100, 0, 0]),
-            "at/above start shifted"
-        );
-    }
-
-    #[test]
-    fn test_shift_cols_right_preserves_beyond_max_col() {
-        let mut extras = CellExtras::new();
-        // Col 70 is past a DECLRMM right margin at col 49.
-        insert(&mut extras, 0, 70, extra_with_fg(70, 0, 0));
-        insert(&mut extras, 0, 10, extra_with_fg(100, 0, 0));
-
-        extras.shift_cols_right(0, 5, 3, 50);
-        assert_eq!(
-            fg_at(&extras, 0, 70),
-            Some([70, 0, 0]),
-            "beyond max_col preserved"
-        );
-        assert_eq!(fg_at(&extras, 0, 13), Some([100, 0, 0]));
-    }
-
-    // shift_cols_left (DCH)
-
-    #[test]
-    fn test_shift_cols_left_deletes_range() {
-        let mut extras = CellExtras::new();
-        insert(&mut extras, 0, 5, extra_with_fg(50, 0, 0));
-        insert(&mut extras, 0, 6, extra_with_fg(60, 0, 0));
-        insert(&mut extras, 0, 7, extra_with_fg(70, 0, 0));
-
-        extras.shift_cols_left(0, 5, 3, 80);
-        assert!(!has_fg_at(&extras, 0, 5));
-        assert!(!has_fg_at(&extras, 0, 6));
-        assert!(!has_fg_at(&extras, 0, 7));
-        assert_eq!(extras.len(), 0);
-    }
-
-    #[test]
-    fn test_shift_cols_left_preserves_cols_before_start() {
-        let mut extras = CellExtras::new();
-        insert(&mut extras, 0, 2, extra_with_fg(20, 0, 0));
-        insert(&mut extras, 0, 10, extra_with_fg(100, 0, 0));
-
-        extras.shift_cols_left(0, 5, 3, 80);
-        assert_eq!(
-            fg_at(&extras, 0, 2),
-            Some([20, 0, 0]),
-            "before start preserved"
-        );
-        assert_eq!(fg_at(&extras, 0, 7), Some([100, 0, 0]));
-    }
-
-    #[test]
-    fn test_shift_cols_left_preserves_beyond_max_col() {
-        let mut extras = CellExtras::new();
-        insert(&mut extras, 0, 85, extra_with_fg(85, 0, 0));
-        insert(&mut extras, 0, 10, extra_with_fg(100, 0, 0));
-
-        extras.shift_cols_left(0, 5, 3, 80);
-        assert_eq!(
-            fg_at(&extras, 0, 85),
-            Some([85, 0, 0]),
-            "beyond max_col preserved"
-        );
-        assert_eq!(fg_at(&extras, 0, 7), Some([100, 0, 0]));
-    }
-
-    // Boundary coordinates
-
-    #[test]
-    fn test_shift_region_up_boundary_at_top_equals_n() {
-        let mut extras = CellExtras::new();
-        insert(&mut extras, 5, 0, extra_with_fg(50, 0, 0));
-        insert(&mut extras, 6, 0, extra_with_fg(60, 0, 0));
-
-        extras.shift_region_up_by(5, 6, 2);
-        assert_eq!(
-            extras.len(),
-            0,
-            "all entries in region deleted when n covers whole region"
-        );
-    }
-
-    #[test]
-    fn test_shift_region_down_n_equals_region_size() {
-        let mut extras = CellExtras::new();
-        insert(&mut extras, 0, 0, extra_with_fg(1, 0, 0));
-        insert(&mut extras, 1, 0, extra_with_fg(2, 0, 0));
-        insert(&mut extras, 2, 0, extra_with_fg(3, 0, 0));
-
-        extras.shift_region_down_by(0, 2, 3);
-        assert_eq!(extras.len(), 0, "all dropped when n covers whole region");
-    }
-
-    #[test]
-    fn test_shift_region_up_single_entry_at_boundary() {
-        let mut extras = CellExtras::new();
-        insert(&mut extras, 10, 0, extra_with_fg(100, 0, 0));
-
-        extras.shift_region_up_by(5, 10, 3);
-        assert_eq!(fg_at(&extras, 7, 0), Some([100, 0, 0]));
-    }
-
-    #[test]
-    fn test_shift_cols_right_at_max_col_boundary() {
-        let mut extras = CellExtras::new();
-        insert(&mut extras, 0, 79, extra_with_fg(79, 0, 0));
-
-        extras.shift_cols_right(0, 79, 1, 80);
-        assert_eq!(
-            extras.len(),
-            0,
-            "entry at max_col-1 dropped when shifted by 1"
-        );
-    }
-
-    #[test]
-    fn test_shift_cols_left_delete_everything_on_row() {
-        let mut extras = CellExtras::new();
-        for col in 0..10u16 {
-            insert(&mut extras, 0, col, extra_with_fg(col as u8, 0, 0));
+    impl Shift {
+        fn apply(self, extras: &mut CellExtras) {
+            match self {
+                Self::RowsUp { start, n } => extras.shift_rows_up_by(start, n),
+                Self::RegionUp { top, bottom, n } => extras.shift_region_up_by(top, bottom, n),
+                Self::RegionDown { top, bottom, n } => extras.shift_region_down_by(top, bottom, n),
+                Self::RectUp {
+                    top,
+                    bottom,
+                    left,
+                    right,
+                    n,
+                } => {
+                    extras.shift_rect_up_by(top, bottom, left, right, n);
+                }
+                Self::RectDown {
+                    top,
+                    bottom,
+                    left,
+                    right,
+                    n,
+                } => {
+                    extras.shift_rect_down_by(top, bottom, left, right, n);
+                }
+                Self::ColsRight { row, start, n, max } => {
+                    extras.shift_cols_right(row, start, n, max)
+                }
+                Self::ColsLeft { row, start, n, max } => extras.shift_cols_left(row, start, n, max),
+            }
         }
 
-        extras.shift_cols_left(0, 0, 10, 80);
-        assert_eq!(extras.len(), 0);
+        /// The documented contract: where the entry at `(row, col)` lands, or
+        /// `None` when the shift drops it.
+        fn model(self, row: u16, col: u16) -> Option<(u16, u16)> {
+            let (r, c) = (u32::from(row), u32::from(col));
+            let up = |top: u16, bottom: u16, left: u16, right: u16, n: u16| {
+                if n == 0 || row < top || row > bottom || col < left || col > right {
+                    Some((row, col))
+                } else if r >= u32::from(top) + u32::from(n) {
+                    Some((row - n, col))
+                } else {
+                    None
+                }
+            };
+            let down = |top: u16, bottom: u16, left: u16, right: u16, n: u16| {
+                if n == 0 || row < top || row > bottom || col < left || col > right {
+                    Some((row, col))
+                } else if r + u32::from(n) <= u32::from(bottom) {
+                    Some((row + n, col))
+                } else {
+                    None
+                }
+            };
+            match self {
+                Self::RowsUp { start, n } => up(start, u16::MAX, 0, u16::MAX, n),
+                Self::RegionUp { top, bottom, n } => up(top, bottom, 0, u16::MAX, n),
+                Self::RegionDown { top, bottom, n } => down(top, bottom, 0, u16::MAX, n),
+                Self::RectUp {
+                    top,
+                    bottom,
+                    left,
+                    right,
+                    n,
+                } => up(top, bottom, left, right, n),
+                Self::RectDown {
+                    top,
+                    bottom,
+                    left,
+                    right,
+                    n,
+                } => down(top, bottom, left, right, n),
+                Self::ColsRight {
+                    row: at,
+                    start,
+                    n,
+                    max,
+                } => {
+                    if row != at || n == 0 || col < start || col >= max {
+                        Some((row, col))
+                    } else if c + u32::from(n) < u32::from(max) {
+                        Some((row, col + n))
+                    } else {
+                        None
+                    }
+                }
+                Self::ColsLeft {
+                    row: at,
+                    start,
+                    n,
+                    max,
+                } => {
+                    if row != at || n == 0 || col < start || col >= max {
+                        Some((row, col))
+                    } else if c >= u32::from(start) + u32::from(n) {
+                        Some((row, col - n))
+                    } else {
+                        None
+                    }
+                }
+            }
+        }
     }
 
-    // Data preservation
+    fn fg(row: u16, col: u16) -> [u8; 3] {
+        [row as u8, col as u8, 1]
+    }
 
+    fn bg(row: u16, col: u16) -> [u8; 3] {
+        [row as u8, col as u8, 2]
+    }
+
+    fn complex(row: u16, col: u16) -> char {
+        char::from_u32(0x1F000 + u32::from(row) * 64 + u32::from(col)).expect("valid char")
+    }
+
+    /// EVERY SHIFT MOVES EVERY STORE BY THE SAME CONTRACT. Each scenario fills
+    /// a 24x24 grid (densely, then sparsely so `take_row_range` takes both its
+    /// probe and its scan branch) in all three stores: a HashMap entry
+    /// carrying an fg RGB, an RGB-ring bg and a complex-ring codepoint, each
+    /// naming its origin cell. After the shifts every store must hold exactly
+    /// what the model moves where — nothing lost, nothing duplicated, nothing
+    /// left behind — including rows outside a region (ORACLE BUG A: a
+    /// truecolor cell above an SU region kept its bg), columns outside a
+    /// DECLRMM rect or past an ICH/DCH margin, and an accumulated full-screen
+    /// row offset.
     #[test]
-    fn test_shift_region_up_preserves_extra_data() {
-        let mut extras = CellExtras::new();
-        insert(
-            &mut extras,
-            5,
-            3,
-            extra_with_hyperlink("https://example.com"),
-        );
+    fn every_shift_moves_every_store_by_the_model() {
+        use Shift::*;
+        let scenarios: &[(&str, &[Shift])] = &[
+            (
+                "full-screen SU",
+                &[RegionUp {
+                    top: 0,
+                    bottom: 23,
+                    n: 3,
+                }],
+            ),
+            (
+                "SU in margins",
+                &[RegionUp {
+                    top: 5,
+                    bottom: 15,
+                    n: 1,
+                }],
+            ),
+            (
+                "SU leaves rows above (bug A)",
+                &[RegionUp {
+                    top: 12,
+                    bottom: 17,
+                    n: 4,
+                }],
+            ),
+            (
+                "SU single-row region",
+                &[RegionUp {
+                    top: 5,
+                    bottom: 5,
+                    n: 1,
+                }],
+            ),
+            (
+                "SU n == region",
+                &[RegionUp {
+                    top: 2,
+                    bottom: 5,
+                    n: 4,
+                }],
+            ),
+            (
+                "SU n > region",
+                &[RegionUp {
+                    top: 5,
+                    bottom: 6,
+                    n: 9,
+                }],
+            ),
+            (
+                "SU n == 0",
+                &[RegionUp {
+                    top: 1,
+                    bottom: 3,
+                    n: 0,
+                }],
+            ),
+            (
+                "SD in margins",
+                &[RegionDown {
+                    top: 5,
+                    bottom: 15,
+                    n: 1,
+                }],
+            ),
+            (
+                "SD drops bottom",
+                &[RegionDown {
+                    top: 0,
+                    bottom: 9,
+                    n: 2,
+                }],
+            ),
+            (
+                "SD n == region",
+                &[RegionDown {
+                    top: 0,
+                    bottom: 2,
+                    n: 3,
+                }],
+            ),
+            (
+                "SD n > region",
+                &[RegionDown {
+                    top: 1,
+                    bottom: 3,
+                    n: 5,
+                }],
+            ),
+            (
+                "SD n == 0",
+                &[RegionDown {
+                    top: 1,
+                    bottom: 3,
+                    n: 0,
+                }],
+            ),
+            (
+                "SD single-row region",
+                &[RegionDown {
+                    top: 5,
+                    bottom: 5,
+                    n: 1,
+                }],
+            ),
+            (
+                "rect up",
+                &[RectUp {
+                    top: 2,
+                    bottom: 8,
+                    left: 5,
+                    right: 15,
+                    n: 2,
+                }],
+            ),
+            (
+                "rect up past grid",
+                &[RectUp {
+                    top: 2,
+                    bottom: 8,
+                    left: 10,
+                    right: 30,
+                    n: 1,
+                }],
+            ),
+            (
+                "rect up n == 0",
+                &[RectUp {
+                    top: 0,
+                    bottom: 9,
+                    left: 5,
+                    right: 15,
+                    n: 0,
+                }],
+            ),
+            (
+                "rect down",
+                &[RectDown {
+                    top: 2,
+                    bottom: 8,
+                    left: 5,
+                    right: 15,
+                    n: 2,
+                }],
+            ),
+            (
+                "rect down past grid",
+                &[RectDown {
+                    top: 2,
+                    bottom: 8,
+                    left: 10,
+                    right: 30,
+                    n: 1,
+                }],
+            ),
+            (
+                "ICH",
+                &[ColsRight {
+                    row: 5,
+                    start: 10,
+                    n: 3,
+                    max: 24,
+                }],
+            ),
+            (
+                "ICH from col 0",
+                &[ColsRight {
+                    row: 0,
+                    start: 0,
+                    n: 5,
+                    max: 80,
+                }],
+            ),
+            (
+                "ICH at the margin",
+                &[ColsRight {
+                    row: 3,
+                    start: 23,
+                    n: 1,
+                    max: 24,
+                }],
+            ),
+            (
+                "ICH inside DECLRMM",
+                &[ColsRight {
+                    row: 0,
+                    start: 5,
+                    n: 3,
+                    max: 12,
+                }],
+            ),
+            (
+                "ICH n == 0",
+                &[ColsRight {
+                    row: 0,
+                    start: 3,
+                    n: 0,
+                    max: 24,
+                }],
+            ),
+            (
+                "DCH",
+                &[ColsLeft {
+                    row: 3,
+                    start: 5,
+                    n: 3,
+                    max: 24,
+                }],
+            ),
+            (
+                "DCH whole row",
+                &[ColsLeft {
+                    row: 0,
+                    start: 0,
+                    n: 24,
+                    max: 24,
+                }],
+            ),
+            (
+                "DCH inside DECLRMM",
+                &[ColsLeft {
+                    row: 0,
+                    start: 3,
+                    n: 2,
+                    max: 10,
+                }],
+            ),
+            (
+                "DCH n == 0",
+                &[ColsLeft {
+                    row: 0,
+                    start: 3,
+                    n: 0,
+                    max: 24,
+                }],
+            ),
+            (
+                "SU after a full-screen offset",
+                &[
+                    RowsUp { start: 0, n: 2 },
+                    RegionUp {
+                        top: 0,
+                        bottom: 23,
+                        n: 1,
+                    },
+                ],
+            ),
+            (
+                "ICH after a full-screen offset",
+                &[
+                    RowsUp { start: 0, n: 3 },
+                    ColsRight {
+                        row: 4,
+                        start: 2,
+                        n: 2,
+                        max: 24,
+                    },
+                ],
+            ),
+            ("partial-screen scroll", &[RowsUp { start: 1, n: 1 }]),
+        ];
+        for (name, shifts) in scenarios {
+            // A partial-screen `shift_rows_up_by` wipes both rings instead of
+            // moving them; only the map follows the model there.
+            let rings_follow = !shifts
+                .iter()
+                .any(|s| matches!(s, RowsUp { start, .. } if *start > 0));
+            for dense in [true, false] {
+                let cells: Vec<(u16, u16)> = (0..ROWS)
+                    .flat_map(|r| (0..COLS).map(move |c| (r, c)))
+                    .filter(|&(r, c)| dense || (r * COLS + c).is_multiple_of(7))
+                    .collect();
+                let mut extras = CellExtras::new();
+                let mut want = HashMap::new();
+                for &(r, c) in &cells {
+                    let mut extra = CellExtra::default();
+                    extra.set_fg_rgb(Some(fg(r, c)));
+                    extras.set(CellCoord::new(r, c), extra);
+                    extras.set_rgb_ring_range(r, c, c + 1, None, Some(bg(r, c)), ROWS, RING_COLS);
+                    extras.set_complex_char_ring(r, c, complex(r, c), ROWS, RING_COLS);
+                    let dest = shifts
+                        .iter()
+                        .try_fold((r, c), |(row, col), s| s.model(row, col));
+                    if let Some(dest) = dest {
+                        want.insert(dest, (r, c));
+                    }
+                }
+                for shift in *shifts {
+                    shift.apply(&mut extras);
+                }
 
-        extras.shift_region_up_by(0, 23, 3);
-        let entry = extras.get(CellCoord::new(2, 3));
-        assert!(entry.is_some(), "shifted entry should exist");
-        let url = entry.unwrap().hyperlink().unwrap();
-        assert_eq!(&**url, "https://example.com", "hyperlink data preserved");
-    }
+                let got: HashMap<(u16, u16), [u8; 3]> = extras
+                    .iter()
+                    .map(|(coord, e)| ((coord.row, coord.col), e.fg_rgb().expect("fg")))
+                    .collect();
+                let want_map: HashMap<(u16, u16), [u8; 3]> =
+                    want.iter().map(|(&at, &(r, c))| (at, fg(r, c))).collect();
+                assert_eq!(got, want_map, "{name} (dense: {dense}): map");
+                assert_eq!(extras.len(), want.len(), "{name} (dense: {dense}): len");
 
-    #[test]
-    fn test_shift_cols_right_preserves_extra_data() {
-        let mut extras = CellExtras::new();
-        insert(&mut extras, 0, 5, extra_with_hyperlink("https://test.dev"));
-
-        extras.shift_cols_right(0, 5, 2, 80);
-        let entry = extras.get(CellCoord::new(0, 7));
-        assert!(entry.is_some());
-        let url = entry.unwrap().hyperlink().unwrap();
-        assert_eq!(&**url, "https://test.dev");
-    }
-
-    // Scroll region (DECSTBM)
-
-    #[test]
-    fn test_decstbm_scroll_up_within_margins() {
-        let mut extras = CellExtras::new();
-        insert(&mut extras, 3, 0, extra_with_fg(30, 0, 0)); // above region
-        insert(&mut extras, 5, 0, extra_with_fg(50, 0, 0)); // at top (will be deleted)
-        insert(&mut extras, 10, 0, extra_with_fg(100, 0, 0)); // middle
-        insert(&mut extras, 15, 0, extra_with_fg(150, 0, 0)); // at bottom
-        insert(&mut extras, 20, 0, extra_with_fg(200, 0, 0)); // below region
-
-        extras.shift_region_up_by(5, 15, 1);
-
-        assert_eq!(
-            fg_at(&extras, 3, 0),
-            Some([30, 0, 0]),
-            "above region untouched"
-        );
-        assert!(
-            !has_fg_at(&extras, 5, 0) || fg_at(&extras, 5, 0) != Some([50, 0, 0]),
-            "top row should be gone or overwritten"
-        );
-        assert_eq!(fg_at(&extras, 9, 0), Some([100, 0, 0]), "row 10 -> 9");
-        assert_eq!(fg_at(&extras, 14, 0), Some([150, 0, 0]), "row 15 -> 14");
-        assert_eq!(
-            fg_at(&extras, 20, 0),
-            Some([200, 0, 0]),
-            "below region untouched"
-        );
-    }
-
-    #[test]
-    fn test_decstbm_scroll_down_within_margins() {
-        let mut extras = CellExtras::new();
-        insert(&mut extras, 3, 0, extra_with_fg(30, 0, 0)); // above region
-        insert(&mut extras, 5, 0, extra_with_fg(50, 0, 0)); // at top
-        insert(&mut extras, 10, 0, extra_with_fg(100, 0, 0)); // middle
-        insert(&mut extras, 15, 0, extra_with_fg(150, 0, 0)); // at bottom (will be dropped)
-        insert(&mut extras, 20, 0, extra_with_fg(200, 0, 0)); // below region
-
-        extras.shift_region_down_by(5, 15, 1);
-
-        assert_eq!(
-            fg_at(&extras, 3, 0),
-            Some([30, 0, 0]),
-            "above region untouched"
-        );
-        assert_eq!(fg_at(&extras, 6, 0), Some([50, 0, 0]), "row 5 -> 6");
-        assert_eq!(fg_at(&extras, 11, 0), Some([100, 0, 0]), "row 10 -> 11");
-        assert!(
-            !has_fg_at(&extras, 15, 0) || fg_at(&extras, 15, 0) != Some([150, 0, 0]),
-            "bottom row should be gone or overwritten"
-        );
-        assert_eq!(
-            fg_at(&extras, 20, 0),
-            Some([200, 0, 0]),
-            "below region untouched"
-        );
-    }
-
-    // DECLRMM rectangular scroll
-
-    #[test]
-    fn test_declrmm_rect_scroll_up() {
-        let mut extras = CellExtras::new();
-        insert(&mut extras, 2, 15, extra_with_fg(21, 5, 0)); // top row, in col range (deleted)
-        insert(&mut extras, 5, 15, extra_with_fg(51, 5, 0)); // mid, in col range (shifted)
-        insert(&mut extras, 5, 5, extra_with_fg(55, 0, 0)); // mid, outside col range (preserved)
-
-        extras.shift_rect_up_by(2, 8, 10, 30, 1);
-        assert!(!has_fg_at(&extras, 2, 15), "top row in rect deleted");
-        assert_eq!(
-            fg_at(&extras, 4, 15),
-            Some([51, 5, 0]),
-            "row 5 -> 4 in rect"
-        );
-        assert_eq!(
-            fg_at(&extras, 5, 5),
-            Some([55, 0, 0]),
-            "outside col range preserved"
-        );
-    }
-
-    #[test]
-    fn test_declrmm_rect_scroll_down() {
-        let mut extras = CellExtras::new();
-        insert(&mut extras, 2, 15, extra_with_fg(21, 50, 0)); // top, in rect (shifted)
-        insert(&mut extras, 8, 15, extra_with_fg(81, 50, 0)); // bottom, in rect (dropped)
-        insert(&mut extras, 5, 5, extra_with_fg(55, 0, 0)); // outside col range (preserved)
-
-        extras.shift_rect_down_by(2, 8, 10, 30, 1);
-        assert_eq!(
-            fg_at(&extras, 3, 15),
-            Some([21, 50, 0]),
-            "row 2 -> 3 in rect"
-        );
-        assert!(
-            !has_fg_at(&extras, 8, 15) || fg_at(&extras, 8, 15) != Some([81, 50, 0]),
-            "bottom row in rect dropped"
-        );
-        assert_eq!(
-            fg_at(&extras, 5, 5),
-            Some([55, 0, 0]),
-            "outside col range preserved"
-        );
-    }
-
-    // RGB-ring shifts: `set_rgb_ring_range` truecolor lives only in the dense
-    // ring; a shift moves or clears only the affected ring cells.
-
-    /// Writes a bg RGB into the dense ring at (row, col).
-    fn set_ring_bg(extras: &mut CellExtras, row: u16, col: u16, rgb: [u8; 3]) {
-        extras.set_rgb_ring_range(row, col, col + 1, None, Some(rgb), 24, 80);
-    }
-
-    #[test]
-    fn test_region_up_preserves_out_of_region_ring_bg() {
-        let mut extras = CellExtras::new();
-        set_ring_bg(&mut extras, 0, 0, [75, 255, 115]); // above region
-        set_ring_bg(&mut extras, 14, 3, [1, 2, 3]); // inside region
-
-        extras.shift_region_up_by(12, 17, 4);
-
-        assert_eq!(
-            extras.bg_rgb_for(0, 0),
-            Some([75, 255, 115]),
-            "out-of-region truecolor bg must survive the in-region scroll",
-        );
-    }
-
-    #[test]
-    fn test_region_up_shifts_in_region_ring_bg() {
-        let mut extras = CellExtras::new();
-        set_ring_bg(&mut extras, 7, 0, [10, 20, 30]); // inside, below deleted rows
-        extras.shift_region_up_by(5, 20, 2);
-        assert_eq!(extras.bg_rgb_for(5, 0), Some([10, 20, 30]), "row 7 -> 5");
-        assert_eq!(extras.bg_rgb_for(7, 0), None, "old position cleared/moved");
-    }
-
-    #[test]
-    fn test_region_down_shifts_and_preserves_ring_bg() {
-        let mut extras = CellExtras::new();
-        set_ring_bg(&mut extras, 22, 0, [9, 9, 9]); // below region (preserved)
-        set_ring_bg(&mut extras, 3, 1, [4, 5, 6]); // inside region
-        extras.shift_region_down_by(0, 10, 2);
-        assert_eq!(extras.bg_rgb_for(5, 1), Some([4, 5, 6]), "row 3 -> 5");
-        assert_eq!(extras.bg_rgb_for(22, 0), Some([9, 9, 9]), "below preserved");
-    }
-
-    #[test]
-    fn test_cols_right_shifts_and_preserves_ring_bg() {
-        let mut extras = CellExtras::new();
-        set_ring_bg(&mut extras, 0, 5, [50, 0, 0]);
-        set_ring_bg(&mut extras, 0, 10, [100, 0, 0]);
-        set_ring_bg(&mut extras, 1, 5, [15, 0, 0]); // other row untouched
-        extras.shift_cols_right(0, 5, 3, 80);
-        assert_eq!(extras.bg_rgb_for(0, 8), Some([50, 0, 0]));
-        assert_eq!(extras.bg_rgb_for(0, 13), Some([100, 0, 0]));
-        assert_eq!(extras.bg_rgb_for(0, 5), None, "inserted blank");
-        assert_eq!(extras.bg_rgb_for(1, 5), Some([15, 0, 0]), "other row kept");
-    }
-
-    #[test]
-    fn test_cols_left_shifts_and_preserves_ring_bg() {
-        let mut extras = CellExtras::new();
-        set_ring_bg(&mut extras, 0, 5, [50, 0, 0]); // deleted
-        set_ring_bg(&mut extras, 0, 10, [100, 0, 0]); // -> 7
-        set_ring_bg(&mut extras, 2, 10, [210, 0, 0]); // other row untouched
-        extras.shift_cols_left(0, 5, 3, 80);
-        assert_eq!(extras.bg_rgb_for(0, 5), None, "deleted col blank");
-        assert_eq!(extras.bg_rgb_for(0, 7), Some([100, 0, 0]), "col 10 -> 7");
-        assert_eq!(
-            extras.bg_rgb_for(2, 10),
-            Some([210, 0, 0]),
-            "other row kept"
-        );
-    }
-
-    #[test]
-    fn test_rect_up_only_affects_rect_ring_bg() {
-        let mut extras = CellExtras::new();
-        set_ring_bg(&mut extras, 5, 12, [40, 10, 0]); // inside rect
-        set_ring_bg(&mut extras, 5, 2, [40, 2, 0]); // outside col range
-        extras.shift_rect_up_by(2, 8, 10, 30, 2);
-        assert_eq!(
-            extras.bg_rgb_for(3, 12),
-            Some([40, 10, 0]),
-            "in-rect shifted"
-        );
-        assert_eq!(
-            extras.bg_rgb_for(5, 2),
-            Some([40, 2, 0]),
-            "outside col kept"
-        );
-    }
-
-    #[test]
-    fn test_shift_region_up_multiple_cols_same_row() {
-        let mut extras = CellExtras::new();
-        insert(&mut extras, 5, 0, extra_with_fg(50, 0, 0));
-        insert(&mut extras, 5, 10, extra_with_fg(50, 10, 0));
-        insert(&mut extras, 5, 79, extra_with_fg(50, 79, 0));
-
-        extras.shift_region_up_by(0, 23, 3);
-        assert_eq!(fg_at(&extras, 2, 0), Some([50, 0, 0]));
-        assert_eq!(fg_at(&extras, 2, 10), Some([50, 10, 0]));
-        assert_eq!(fg_at(&extras, 2, 79), Some([50, 79, 0]));
-    }
-
-    #[test]
-    fn test_shift_region_out_of_region_extras_skip_drain_rebuild() {
-        let mut extras = CellExtras::new();
-        insert(
-            &mut extras,
-            0,
-            0,
-            extra_with_hyperlink("https://status-top.example"),
-        );
-        insert(
-            &mut extras,
-            23,
-            0,
-            extra_with_hyperlink("https://status-bottom.example"),
-        );
-
-        // The fast path leaves the map untouched, so the entry keeps its address.
-        let before_ptr = extras.get(CellCoord::new(0, 0)).unwrap() as *const CellExtra;
-        extras.shift_region_up_by(2, 20, 3);
-        let after_up_ptr = extras.get(CellCoord::new(0, 0)).unwrap() as *const CellExtra;
-        assert_eq!(
-            before_ptr, after_up_ptr,
-            "up shift outside region must not reallocate"
-        );
-
-        extras.shift_region_down_by(2, 20, 3);
-        let after_down_ptr = extras.get(CellCoord::new(0, 0)).unwrap() as *const CellExtra;
-        assert_eq!(
-            before_ptr, after_down_ptr,
-            "down shift outside region must not reallocate"
-        );
+                if !rings_follow {
+                    continue;
+                }
+                for row in 0..ROWS {
+                    for col in 0..COLS + 8 {
+                        let origin = want.get(&(row, col)).copied();
+                        assert_eq!(
+                            extras.bg_rgb_for(row, col),
+                            origin.map(|(r, c)| bg(r, c)),
+                            "{name} (dense: {dense}): rgb ring at ({row}, {col})"
+                        );
+                        assert_eq!(
+                            extras.complex_codepoint_for(row, col),
+                            origin.map(|(r, c)| complex(r, c)),
+                            "{name} (dense: {dense}): complex ring at ({row}, {col})"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

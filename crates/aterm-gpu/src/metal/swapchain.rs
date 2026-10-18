@@ -2,16 +2,14 @@
 // Copyright 2026 Andrew Yates
 
 //! The swapchain: `CAMetalLayer`, reached by class name through the runtime.
-//! The QuartzCore link and every drawable selector live here; `ffi.rs` owns no
-//! swapchain surface.
+//! The QuartzCore link and every drawable selector live here.
 //!
-//! # What one Swapchain is
-//!
-//! A `CAMetalLayer` configured like the wgpu surface it replaces, either
-//! standalone (a layer with a `device` and `drawableSize` vends drawables with
-//! no window; every test here uses this) or attached as a sublayer of an
-//! existing `CALayer`. Attach never touches the parent's other sublayers, so a
-//! sibling wgpu layer (which wgpu teardown leaves parented) is tolerated.
+//! A [`Swapchain`] is a `CAMetalLayer` configured like the wgpu surface it
+//! replaces, either standalone (a layer with a `device` and `drawableSize`
+//! vends drawables with no window; every test here uses this) or attached as a
+//! sublayer of an existing `CALayer`. Attach never touches the parent's other
+//! sublayers, so a sibling wgpu layer (which wgpu teardown leaves parented) is
+//! tolerated.
 //!
 //! # Configured axes (compared with wgpu-hal's `metal/surface.rs`)
 //!
@@ -22,75 +20,59 @@
 //! | `drawableSize` | explicit `width`x`height` | never derived from bounds |
 //! | `framebufferOnly` | config; `true` in `aterm_present` | production usage is `RENDER_ATTACHMENT`-only; the video tap flips it on demand; readback tests need `false` |
 //! | `displaySyncEnabled` | config; `false` in `aterm_present` | the macOS present mode is `Immediate` |
-//! | `maximumDrawableCount` | config; `3` in `aterm_present` | frame latency 2 + 1 (see `renderer.rs` `frame_latency_for`); the legal range `[2, 3]` is validated in Rust |
+//! | `maximumDrawableCount` | config; `3` in `aterm_present` | frame latency 2 + 1 (`renderer.rs` `default_frame_latency`); the legal range `[2, 3]` is validated in Rust |
 //! | `opaque` | config; `true` in `aterm_present` | `NO` for the translucent present |
 //! | `wantsExtendedDynamicRangeContent` | `format == Rgba16Float` | the HDR present |
 //! | `colorspace` | SDR `kCGColorSpaceSRGB`, EDR `kCGColorSpaceExtendedLinearSRGB` | see below |
 //! | `allowsNextDrawableTimeout` | `YES`, explicitly | wgpu-hal sets `NO`; see below |
 //!
-//! **Format.** `CAMetalLayer` does not accept `Rgba8Unorm`, so
-//! [`SwapchainConfig`] admits exactly `Bgra8Unorm` and `Rgba16Float` and
-//! rejects the rest in Rust rather than letting the layer throw.
+//! `CAMetalLayer` does not accept `Rgba8Unorm`, so [`SwapchainConfig`] admits
+//! exactly `Bgra8Unorm` and `Rgba16Float` and rejects the rest in Rust rather
+//! than letting the layer throw.
 //!
-//! **Colorspace.** `setPixelFormat:` installs sRGB on a fresh layer, but on a
-//! live layer flipping from f16 back to `Bgra8Unorm` leaves the extended space
-//! in place, so `configure` names both arms' spaces explicitly. The EDR arm
-//! declares scRGB (`renderer.rs::tag_swapchain_scrgb` returns `true` on
-//! macOS). Headless tests pin the property on the layer; how WindowServer
-//! interprets it needs a composited window.
+//! `setPixelFormat:` installs sRGB on a fresh layer, but flipping a live layer
+//! from f16 back to `Bgra8Unorm` keeps the extended space, and the compositor
+//! misreads an SDR present tagged scRGB, so `configure` names both arms'
+//! spaces. Headless tests pin the property; how WindowServer interprets it
+//! needs a composited window.
 //!
-//! **Bounded wait.** With `allowsNextDrawableTimeout = YES`, `nextDrawable`
-//! returns nil after about a second instead of blocking forever, so
-//! [`Swapchain::acquire`] maps nil to a bounded `Err` rather than parking the
-//! event loop. An unparented layer's pool never exhausts, so headless tests
-//! reach the nil arm only with a layer that cannot vend at all (a deviceless
-//! layer); the 1 s bound itself rides the pinned timeout readback.
+//! With `allowsNextDrawableTimeout = YES`, `nextDrawable` returns nil after
+//! about a second instead of blocking forever, so [`Swapchain::acquire`] maps
+//! nil to a bounded `Err` rather than parking the event loop. An unparented
+//! layer's pool never exhausts, so headless tests reach the nil arm only with a
+//! deviceless layer.
 //!
-//! # Drawable ownership
+//! # Ownership and the frame boundary
 //!
-//! `-nextDrawable` returns an autoreleased (+0) drawable. [`Swapchain::acquire`]
-//! pushes a pool, calls, retains the drawable and its `texture` to +1 [`Obj`]s,
-//! and pops the pool, so they outlive the call.
-//!
-//! # The frame boundary as a type
-//!
-//! [`Frame`] holds `&mut Swapchain`, so only one drawable is live at a time.
-//! [`Frame::present`] consumes it (present plus commit); dropping it discards
-//! the drawable back to the pool. `mem::forget` or never resolving a frame is
-//! not prevented by the type; the exhaustion test shows it costs a bounded,
-//! named error rather than a hang.
+//! `-nextDrawable` returns an autoreleased (+0) drawable; the acquire retains
+//! it and its `texture` to +1 [`Obj`]s under its own pool. [`Frame`] holds
+//! `&mut Swapchain`, so one drawable is live at a time; [`Frame::present`]
+//! consumes it and dropping it discards the drawable back to the pool. A
+//! forgotten or never-resolved frame costs a bounded, named acquire error, not
+//! a hang.
 //!
 //! # The loss latch
 //!
-//! Every swapchain holds the process `Arc<`[`loss::LossLatch`]`>`:
+//! Every swapchain holds the process `Arc<`[`loss::LossLatch`]`>`. Acquire,
+//! reconfigure and present refuse before any FFI once it is lost;
+//! [`PresentTicket::wait_outcome`] feeds it (via [`PresentTicket::settle`], also
+//! the test injection seam). `Retryable` outcomes do not latch.
 //!
-//! * [`Swapchain::acquire`] refuses fast once the latch is lost, before any
-//!   FFI call.
-//! * [`Frame::present`] refuses the same way for a frame acquired before the
-//!   loss; the dropped frame discards its drawable.
-//! * [`PresentTicket::wait_outcome`] feeds the latch itself (via
-//!   [`PresentTicket::settle`], also the test injection seam). `Retryable`
-//!   outcomes do not latch.
-//!
-//! # Present ordering
-//!
-//! [`Frame::present`] follows wgpu-hal: a fresh command buffer from the
-//! caller's queue with `presentDrawable:` registered before `commit`, so
-//! presentation cannot fire before the frame's rendering is scheduled. Not
-//! implemented: `presentsWithTransaction` and
-//! `presentDrawable:afterMinimumDuration:`.
+//! [`Frame::present`] follows wgpu-hal: `presentDrawable:` is registered on a
+//! fresh command buffer before `commit`. `presentsWithTransaction` and
+//! `presentDrawable:afterMinimumDuration:` are not used.
 
 use std::ffi::c_void;
 use std::sync::Arc;
 
 use aterm_objc::Bool as ObjcBool;
 
-use super::ffi::{AutoreleasePool, ClassPtr, Device, Id, Obj, PixelFormat, Sel, class, msg, sel};
+use super::ffi::{
+    AutoreleasePool, ClassPtr, Device, Id, Obj, PixelFormat, Sel, checked_msg, class, sel,
+};
 use super::{encoder, loss};
 
 // QuartzCore linkage, beside the only code that resolves QuartzCore classes.
-// `CACurrentMediaTime` is used by the exhaustion test to measure the acquire
-// bound.
 #[link(name = "QuartzCore", kind = "framework")]
 unsafe extern "C" {
     /// Mach absolute time in seconds — the clock CoreAnimation itself uses.
@@ -111,8 +93,8 @@ unsafe extern "C" {
     /// primaries, unclamped components. The macOS f16 present's space.
     static kCGColorSpaceExtendedLinearSRGB: *const c_void;
     /// `kCGColorSpaceSRGB`, the SDR present's space. Set explicitly because an
-    /// EDR-to-SDR flip on a live layer does not restore it (see
-    /// [`Swapchain::reconfigure`]).
+    /// EDR-to-SDR flip on a live layer does not restore it (see the module
+    /// header).
     static kCGColorSpaceSRGB: *const c_void;
 }
 
@@ -123,6 +105,11 @@ unsafe extern "C" {
 struct CgSize {
     width: f64,
     height: f64,
+}
+
+// SAFETY: `#[repr(C)]` two `double`s, `CGSize`.
+unsafe impl aterm_objc::Encode for CgSize {
+    const ENCODING: &'static str = "{CGSize=dd}";
 }
 
 /// `CGPoint`/`CGRect`, the `setFrame:` argument.
@@ -145,6 +132,11 @@ struct CgRect {
     size: CgSize,
 }
 
+// SAFETY: `#[repr(C)]` a `CGPoint` then a `CGSize`, `CGRect`.
+unsafe impl aterm_objc::Encode for CgRect {
+    const ENCODING: &'static str = "{CGRect={CGPoint=dd}{CGSize=dd}}";
+}
+
 /// Everything one swapchain configure sets. `Self::aterm_present` builds the
 /// production values; tests build others to prove every setter is live.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,8 +154,8 @@ pub(crate) struct SwapchainConfig {
     /// `displaySyncEnabled`. `false` is wgpu's `Immediate`, the shipped macOS
     /// choice; `true` is `Fifo` (`wgpu-hal surface.rs:74-78`).
     pub(crate) display_sync: bool,
-    /// `maximumDrawableCount`. Legal range `[2, 3]` (`CAMetalLayer.h:104-108`
-    /// — out-of-range values THROW); the shipped value is 3.
+    /// `maximumDrawableCount`. Legal range `[2, 3]` (`CAMetalLayer.h:104-108`;
+    /// out-of-range values throw); the shipped value is 3.
     pub(crate) maximum_drawables: usize,
     /// `CALayer.opaque`. `false` for the `PostMultiplied` translucent
     /// present.
@@ -274,7 +266,7 @@ impl Swapchain {
         // SAFETY: `addSublayer:` is a void message on the live parent; it
         // retains the sublayer, and our +1 stays ours for drop to balance.
         unsafe {
-            let add: unsafe extern "C" fn(Id, Sel, Id) = msg();
+            let add: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
             add(parent.id(), sel(c"addSublayer:"), layer.id());
         }
         let mut sc = Self {
@@ -291,16 +283,12 @@ impl Swapchain {
         Ok(sc)
     }
 
-    /// Adopt the parent layer's `contentsScale`, so a device pixel in the
-    /// drawable is a device pixel on the display. A fresh `CAMetalLayer`
-    /// defaults to 1.0, which on a 2x display draws the grid at twice its size
-    /// and soft. `drawableSize` stays explicit (already device pixels).
-    ///
-    /// Called at attach and from every per-present reconcile, since moving a
-    /// window between displays changes the parent's scale with no resize.
-    /// Change-gated: a steady present costs one property read. The standalone
-    /// shape has no parent and is left alone, so standalone tests cannot catch
-    /// a missing scale.
+    /// Adopt the parent layer's `contentsScale`, so a drawable pixel is a
+    /// display pixel; a fresh `CAMetalLayer` defaults to 1.0, which on a 2x
+    /// display draws the grid at twice its size and soft. Called at attach and
+    /// from every reconcile, since moving a window between displays changes the
+    /// parent's scale with no resize. Change-gated. The standalone shape has no
+    /// parent and is left alone.
     pub(crate) fn sync_layer_geometry(&mut self) {
         if !self.is_attached {
             return;
@@ -311,12 +299,12 @@ impl Swapchain {
         // `setContentsScale:` takes one by value; both are scalar on every
         // target, so no `objc_msgSend_stret` is needed.
         unsafe {
-            let superlayer: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+            let superlayer: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             let parent = superlayer(self.layer.id(), sel(c"superlayer"));
             if parent.is_null() {
                 return;
             }
-            let get_scale: unsafe extern "C" fn(Id, Sel) -> f64 = msg();
+            let get_scale: unsafe extern "C-unwind" fn(Id, Sel) -> f64 = checked_msg();
             let scale = get_scale(parent, sel(c"contentsScale"));
             // Positive only (also rejects NaN): a zero or negative scale would
             // blank the window, so keep the layer's current value instead.
@@ -324,17 +312,17 @@ impl Swapchain {
                 // An action-free transaction keeps the scale change from
                 // animating (as `MacCpuPresenter::sync_layer_geometry` requires).
                 let txn = class(c"CATransaction");
-                let cls_void: unsafe extern "C" fn(ClassPtr, Sel) = msg();
-                let cls_bool: unsafe extern "C" fn(ClassPtr, Sel, ObjcBool) = msg();
+                let cls_void: unsafe extern "C-unwind" fn(ClassPtr, Sel) = checked_msg();
+                let cls_bool: unsafe extern "C-unwind" fn(ClassPtr, Sel, ObjcBool) = checked_msg();
                 cls_void(txn, sel(c"begin"));
                 cls_bool(txn, sel(c"setDisableActions:"), true.into());
-                let set_scale: unsafe extern "C" fn(Id, Sel, f64) = msg();
+                let set_scale: unsafe extern "C-unwind" fn(Id, Sel, f64) = checked_msg();
                 set_scale(self.layer.id(), sel(c"setContentsScale:"), scale);
                 // Give the layer the bounds its contents occupy; an attached
                 // layer is otherwise left at `CGRectZero`, a trap for anything
                 // that consults bounds. Keeps
                 // `bounds x contentsScale == drawableSize` by construction.
-                let set_frame: unsafe extern "C" fn(Id, Sel, CgRect) = msg();
+                let set_frame: unsafe extern "C-unwind" fn(Id, Sel, CgRect) = checked_msg();
                 set_frame(
                     self.layer.id(),
                     sel(c"setFrame:"),
@@ -366,7 +354,7 @@ impl Swapchain {
         let _pool = AutoreleasePool::new();
         // SAFETY: scalar `CGFloat` getter on our live +1 layer.
         unsafe {
-            let get_scale: unsafe extern "C" fn(Id, Sel) -> f64 = msg();
+            let get_scale: unsafe extern "C-unwind" fn(Id, Sel) -> f64 = checked_msg();
             get_scale(self.layer.id(), sel(c"contentsScale"))
         }
     }
@@ -385,9 +373,9 @@ impl Swapchain {
         // SAFETY: `alloc` returns a +1 uninitialized instance; `init` consumes
         // it and returns the initialized +1 object (or nil, mapped to Err).
         unsafe {
-            let alloc: unsafe extern "C" fn(ClassPtr, Sel) -> Id = msg();
+            let alloc: unsafe extern "C-unwind" fn(ClassPtr, Sel) -> Id = checked_msg();
             let raw = alloc(cls, sel(c"alloc"));
-            let init: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+            let init: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             Obj::from_owned(init(raw, sel(c"init")))
                 .ok_or_else(|| "CAMetalLayer init returned nil".to_owned())
         }
@@ -402,17 +390,16 @@ impl Swapchain {
         // `CGSize` by value, `CGColorSpaceRef`). The colorspace is created at
         // +1 and released after `setColorspace:`, which retains it.
         unsafe {
-            let set_obj: unsafe extern "C" fn(Id, Sel, Id) = msg();
-            let set_usize: unsafe extern "C" fn(Id, Sel, usize) = msg();
-            let set_bool: unsafe extern "C" fn(Id, Sel, ObjcBool) = msg();
-            let set_size: unsafe extern "C" fn(Id, Sel, CgSize) = msg();
+            let set_obj: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
+            let set_usize: unsafe extern "C-unwind" fn(Id, Sel, usize) = checked_msg();
+            let set_bool: unsafe extern "C-unwind" fn(Id, Sel, ObjcBool) = checked_msg();
+            let set_size: unsafe extern "C-unwind" fn(Id, Sel, CgSize) = checked_msg();
 
-            // EDR iff the format is f16, as in wgpu-hal. The colorspace object
-            // is created here, before the first layer write, so every failure
-            // point precedes any setter and a refused configure leaves the layer
-            // untouched (`reconcile` and `upgrade_surface_for_screen` rely on
-            // this). The set itself comes after `setPixelFormat:`, which would
-            // otherwise overwrite it on a fresh layer.
+            // EDR iff the format is f16, as in wgpu-hal. The colorspace is
+            // created before the first layer write, so a refused configure
+            // leaves the layer untouched (`reconcile` and
+            // `upgrade_surface_for_screen` rely on this); it is set after
+            // `setPixelFormat:`, which would otherwise overwrite it.
             let wants_edr = config.format == PixelFormat::Rgba16Float;
             let space_name = if wants_edr {
                 kCGColorSpaceExtendedLinearSRGB
@@ -455,15 +442,13 @@ impl Swapchain {
                 config.maximum_drawables,
             );
             set_bool(layer.id(), sel(c"setOpaque:"), config.opaque.into());
-            // Explicit although it is the OS default: the bounded-wait
-            // contract (wgpu-hal sets `NO`).
+            // Explicit although it is the OS default (wgpu-hal sets `NO`).
             set_bool(
                 layer.id(),
                 sel(c"setAllowsNextDrawableTimeout:"),
                 true.into(),
             );
 
-            // The EDR arm (`wants_edr`, decided above with the colorspace).
             set_bool(
                 layer.id(),
                 sel(c"setWantsExtendedDynamicRangeContent:"),
@@ -472,28 +457,19 @@ impl Swapchain {
             // Both arms name their colorspace: on a live layer holding scRGB,
             // flipping back to `Bgra8Unorm` keeps the extended space, and an SDR
             // present tagged scRGB is misread by the compositor.
-            let set_space: unsafe extern "C" fn(Id, Sel, *mut c_void) = msg();
+            let set_space: unsafe extern "C-unwind" fn(Id, Sel, *mut c_void) = checked_msg();
             set_space(layer.id(), sel(c"setColorspace:"), space);
             CGColorSpaceRelease(space);
         }
         Ok(())
     }
 
-    /// Apply a new config to the live layer: size, format
-    /// (`Bgra8Unorm`/`Rgba16Float`), `opaque`, `framebufferOnly`,
-    /// `displaySyncEnabled` and `maximumDrawableCount`. The renderer's
-    /// per-present reconcile, resize, HDR flip and `COPY_SRC` arming use this
-    /// instead of rebuilding the `Swapchain`.
-    ///
-    /// Metal permits every axis live on one layer. The layer rebuilds its
-    /// drawable pool itself: drawables vended before keep the old config,
-    /// those after carry the new one (the storm test pins extent and format).
-    /// The colorspace is the exception (see [`Self::configure`]).
-    ///
-    /// Unresolved frames cannot present onto a stale config: [`Frame`] holds
-    /// `&mut Swapchain`, so this cannot be called while one is live.
-    ///
-    /// Refuses when the loss latch is set, before touching the layer.
+    /// Apply a new config to the live layer instead of rebuilding the
+    /// `Swapchain` (resize, HDR flip, `COPY_SRC` arming). Metal permits every
+    /// axis live; drawables vended before keep the old config, those after
+    /// carry the new one. [`Frame`] holds `&mut Swapchain`, so no live frame
+    /// can present onto a stale config. Refuses when the loss latch is set,
+    /// before touching the layer.
     pub(crate) fn reconfigure(
         &mut self,
         device: &Device,
@@ -547,8 +523,7 @@ impl Swapchain {
     }
 
     /// The raw acquire: `nextDrawable` under a pool, both objects retained to
-    /// +1. Private; the exhaustion test uses it because the public shape cannot
-    /// hold two drawables.
+    /// +1.
     fn raw_next_drawable(&self) -> Option<(Obj, Obj)> {
         acquire_drawable(&self.layer).map(OwnedDrawable::into_parts)
     }
@@ -575,16 +550,15 @@ impl Swapchain {
         })
     }
 
-    // -- readback getters ---------------------------------------------------
-    // One per configured axis via the property's own getter, so tests compare
-    // the layer's actual state against their own constants.
+    // Readback getters: one per configured axis, through the property's own
+    // getter, so tests compare the layer's actual state with their constants.
 
     /// The raw `MTLPixelFormat` off the layer.
     #[cfg(test)]
     pub(crate) fn raw_pixel_format(&self) -> usize {
         // SAFETY: `NSUInteger` getter on the live layer.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> usize = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = checked_msg();
             f(self.layer.id(), sel(c"pixelFormat"))
         }
     }
@@ -593,7 +567,7 @@ impl Swapchain {
     pub(crate) fn drawable_size(&self) -> (f64, f64) {
         // SAFETY: `drawableSize` returns CGSize by value (HFA in v0/v1).
         let s = unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> CgSize = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> CgSize = checked_msg();
             f(self.layer.id(), sel(c"drawableSize"))
         };
         (s.width, s.height)
@@ -603,7 +577,7 @@ impl Swapchain {
     pub(crate) fn framebuffer_only(&self) -> bool {
         // SAFETY: BOOL getter on the live layer.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> ObjcBool = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> ObjcBool = checked_msg();
             f(self.layer.id(), sel(c"framebufferOnly")).as_bool()
         }
     }
@@ -612,7 +586,7 @@ impl Swapchain {
     pub(crate) fn display_sync_enabled(&self) -> bool {
         // SAFETY: BOOL getter on the live layer.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> ObjcBool = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> ObjcBool = checked_msg();
             f(self.layer.id(), sel(c"displaySyncEnabled")).as_bool()
         }
     }
@@ -620,7 +594,7 @@ impl Swapchain {
     pub(crate) fn maximum_drawable_count(&self) -> usize {
         // SAFETY: `NSUInteger` getter on the live layer.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> usize = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = checked_msg();
             f(self.layer.id(), sel(c"maximumDrawableCount"))
         }
     }
@@ -629,17 +603,8 @@ impl Swapchain {
     pub(crate) fn wants_extended_dynamic_range(&self) -> bool {
         // SAFETY: BOOL getter on the live layer.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> ObjcBool = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> ObjcBool = checked_msg();
             f(self.layer.id(), sel(c"wantsExtendedDynamicRangeContent")).as_bool()
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn allows_next_drawable_timeout(&self) -> bool {
-        // SAFETY: BOOL getter on the live layer.
-        unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> ObjcBool = msg();
-            f(self.layer.id(), sel(c"allowsNextDrawableTimeout")).as_bool()
         }
     }
 
@@ -647,18 +612,8 @@ impl Swapchain {
     pub(crate) fn is_opaque(&self) -> bool {
         // SAFETY: BOOL getter on the live layer.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> ObjcBool = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> ObjcBool = checked_msg();
             f(self.layer.id(), sel(c"isOpaque")).as_bool()
-        }
-    }
-
-    /// The layer's configured device, for pointer-identity checks.
-    #[cfg(test)]
-    pub(crate) fn device_ptr(&self) -> Id {
-        // SAFETY: object getter (+0 borrow, compared by pointer only).
-        unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> Id = msg();
-            f(self.layer.id(), sel(c"device"))
         }
     }
 
@@ -669,7 +624,7 @@ impl Swapchain {
         // `CGColorSpaceGetName` borrows a toll-free-bridged CFString, copied
         // into an owned `String`. Nothing is retained or released.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> *mut c_void = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> *mut c_void = checked_msg();
             let space = f(self.layer.id(), sel(c"colorspace"));
             if space.is_null() {
                 return None;
@@ -678,8 +633,9 @@ impl Swapchain {
             if name.is_null() {
                 return None;
             }
-            let utf8: unsafe extern "C" fn(Id, Sel) -> *const std::ffi::c_char = msg();
-            let p = utf8(name.cast_mut().cast(), sel(c"UTF8String"));
+            let utf8: unsafe extern "C-unwind" fn(Id, Sel) -> *const std::ffi::c_char =
+                checked_msg();
+            let p = utf8(Id::from_ptr(name.cast_mut().cast()), sel(c"UTF8String"));
             if p.is_null() {
                 return None;
             }
@@ -691,21 +647,6 @@ impl Swapchain {
     #[cfg(test)]
     pub(crate) fn layer_ptr(&self) -> Id {
         self.layer.id()
-    }
-
-    /// The layer's parent, or null when standalone.
-    #[cfg(test)]
-    pub(crate) fn superlayer_ptr(&self) -> Id {
-        // SAFETY: object getter (+0 borrow, compared by pointer only).
-        unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> Id = msg();
-            f(self.layer.id(), sel(c"superlayer"))
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn format(&self) -> PixelFormat {
-        self.format
     }
 
     /// The device-loss latch this swapchain answers to.
@@ -721,7 +662,7 @@ impl Drop for Swapchain {
             // layer already released by its parent. The parent's retain drops
             // here; our +1 drops with `Obj`.
             unsafe {
-                let f: unsafe extern "C" fn(Id, Sel) = msg();
+                let f: unsafe extern "C-unwind" fn(Id, Sel) = checked_msg();
                 f(self.layer.id(), sel(c"removeFromSuperlayer"));
             }
         }
@@ -797,7 +738,7 @@ fn acquire_drawable(layer: &Obj) -> Option<OwnedDrawable> {
     // before the pool drains; nil refuses. The caller serializes this with
     // layer mutation and other acquisitions.
     unsafe {
-        let get: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+        let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
         let drawable = Obj::retain(get(layer.id(), sel(c"nextDrawable")))?;
         let texture = Obj::retain(get(drawable.id(), sel(c"texture")))?;
         Some(OwnedDrawable {
@@ -818,7 +759,7 @@ pub(crate) struct Frame<'sc> {
     /// +1 on the drawable's texture — the colour attachment this frame
     /// renders into.
     texture: Obj,
-    /// The exclusive borrow that IS the frame boundary.
+    /// The exclusive borrow that is the frame boundary.
     swapchain: &'sc mut Swapchain,
 }
 
@@ -853,7 +794,7 @@ impl Frame<'_> {
     pub(crate) fn drawable_layer_ptr(&self) -> Id {
         // SAFETY: object getter (+0 borrow, compared by pointer only).
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             f(self.drawable.id(), sel(c"layer"))
         }
     }
@@ -862,15 +803,12 @@ impl Frame<'_> {
     /// `presentDrawable:` registered before `commit` (wgpu-hal's shape), so
     /// presentation cannot fire before the drawable's rendering is scheduled.
     ///
-    /// That ordering needs one queue; taking the [`encoder::EncodeSession`]
-    /// that owns it makes a second queue unconstructible on the encode path.
-    /// `EncodeSession::new` refuses a latch already bound, render targets are
-    /// sealed to their loss domain, and the latch check below refuses a
-    /// session from another domain. Submission is lock-stepped with the window
-    /// server servicing the present, which frame pacing must expect.
-    ///
-    /// Consumes the frame; our +1 is released after the present is registered.
-    /// The returned [`PresentTicket`] is the frame's command-buffer handle.
+    /// That ordering needs one queue. Taking the [`encoder::EncodeSession`]
+    /// that owns it (`EncodeSession::new` refuses a latch already bound),
+    /// sealed render targets, and the latch check below leave no way to present
+    /// behind a second queue. Submission is lock-stepped with the window server
+    /// servicing the present, which frame pacing must expect. Consumes the
+    /// frame; the returned [`PresentTicket`] is its command-buffer handle.
     pub(crate) fn present(self, session: &encoder::EncodeSession) -> Result<PresentTicket, String> {
         // The loss may land between acquire and present. Refuse before touching
         // the queue; dropping `self` discards the drawable.
@@ -896,7 +834,7 @@ impl Frame<'_> {
         // so callers can wait after the pool pops. `presentDrawable:` then
         // `commit`, in that order.
         unsafe {
-            let get: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+            let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             let raw = get(session.one_shot_queue().id(), sel(c"commandBuffer"));
             let cb = Obj::retain(raw)
                 .ok_or_else(|| "commandBuffer returned nil for the present".to_owned())?;
@@ -905,9 +843,9 @@ impl Frame<'_> {
             if crate::present_glass::sink_installed() {
                 register_presented_handler(self.drawable.id());
             }
-            let present: unsafe extern "C" fn(Id, Sel, Id) = msg();
+            let present: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
             present(cb.id(), sel(c"presentDrawable:"), self.drawable.id());
-            let commit: unsafe extern "C" fn(Id, Sel) = msg();
+            let commit: unsafe extern "C-unwind" fn(Id, Sel) = checked_msg();
             commit(cb.id(), sel(c"commit"));
             Ok(PresentTicket {
                 cb,
@@ -933,14 +871,14 @@ unsafe fn register_presented_handler(drawable: Id) {
     // Serial and pacing tag for this registration, decided now so the handler
     // reports its own present.
     let (serial, tag) = crate::present_glass::registration_begin(registered_s);
-    // The handler itself, defined OUTSIDE any `unsafe` block so its one real
-    // unsafe operation — the `presentedTime` message — carries its own scope.
+    // Defined outside any `unsafe` block so its one unsafe operation, the
+    // `presentedTime` message, carries its own scope.
     let handler = move |presented: Id| {
         // SAFETY: Metal passes the live drawable being reported;
         // `presentedTime` is a `CFTimeInterval` (double) getter, 0 when the
         // drawable was never shown.
         let presented_s = unsafe {
-            let get: unsafe extern "C" fn(Id, Sel) -> f64 = msg();
+            let get: unsafe extern "C-unwind" fn(Id, Sel) -> f64 = checked_msg();
             get(presented, sel(c"presentedTime"))
         };
         crate::present_glass::deliver_report(
@@ -959,7 +897,7 @@ unsafe fn register_presented_handler(drawable: Id) {
     // SAFETY: `addPresentedHandler:` copies (retains) the block, so ours is
     // released independently when `block` drops.
     unsafe {
-        let add: unsafe extern "C" fn(Id, Sel, aterm_objc::BlockPtr) = msg();
+        let add: unsafe extern "C-unwind" fn(Id, Sel, aterm_objc::BlockPtr) = checked_msg();
         add(drawable, sel(c"addPresentedHandler:"), block.as_block_ptr());
     }
 }
@@ -989,7 +927,7 @@ impl PresentTicket {
         // SAFETY: `waitUntilCompleted` is a void message on the owned +1
         // command buffer; it returns once the status is terminal.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) = checked_msg();
             f(self.cb.id(), sel(c"waitUntilCompleted"));
         }
         self.settle_terminal(loss::outcome_of(self.cb.id()))
@@ -1009,7 +947,7 @@ impl PresentTicket {
         }
     }
 
-    /// Record the ONE terminal outcome: feed the latch, fill the cache.
+    /// Record the terminal outcome once: feed the latch, fill the cache.
     fn settle_terminal(&self, outcome: loss::CbOutcome) -> loss::CbOutcome {
         self.settled.set(Some(outcome));
         self.settle(outcome)
@@ -1033,15 +971,15 @@ mod tests {
         CellUniforms, as_bytes, device, plain_calayer, sublayer_count,
     };
 
-    /// PURE: the config refuses exactly what CAMetalLayer would throw on (or
-    /// silently never vend a drawable for), with the reason in the message.
+    /// The config refuses exactly what `CAMetalLayer` would throw on (or never
+    /// vend a drawable for), with the reason in the message.
     #[test]
     fn the_config_rejects_what_the_layer_would_throw_on() {
         let ok = SwapchainConfig::aterm_present(PixelFormat::Bgra8Unorm, 16, 16);
         assert!(ok.validate().is_ok());
 
-        // Not a layer format — pick_surface_format's fallback is for other
-        // backends (renderer.rs:7496-7513), never reachable on Metal.
+        // Not a layer format: pick_surface_format's Rgba8Unorm fallback is for
+        // other backends, never reachable on Metal.
         let mut bad = ok;
         bad.format = PixelFormat::Rgba8Unorm;
         let err = bad
@@ -1061,213 +999,6 @@ mod tests {
         let mut bad = ok;
         bad.width = 0;
         assert!(bad.validate().is_err());
-    }
-
-    /// Every configured axis read back off the live layer via its own getter,
-    /// against constants the test spells. Values are non-default where the OS
-    /// has a default, so a dropped setter fails. `pixelFormat` and
-    /// `allowsNextDrawableTimeout` equal their defaults and are also covered by
-    /// the EDR test and the exhaustion test.
-    #[test]
-    fn the_swapchain_states_every_axis_the_wgpu_configure_sets() {
-        let dev = device();
-        let config = SwapchainConfig {
-            format: PixelFormat::Bgra8Unorm,
-            width: 16,
-            height: 16,
-            framebuffer_only: false,
-            display_sync: false,
-            maximum_drawables: 2,
-            opaque: true,
-        };
-        let sc = Swapchain::standalone(&dev, &config, Arc::new(loss::LossLatch::new()))
-            .expect("standalone swapchain");
-
-        assert_eq!(sc.raw_pixel_format(), 80, "MTLPixelFormatBGRA8Unorm");
-        assert_eq!(sc.drawable_size(), (16.0, 16.0));
-        assert!(!sc.framebuffer_only(), "configured false (default is YES)");
-        assert!(
-            !sc.display_sync_enabled(),
-            "Immediate — the shipped macOS present mode (default is YES)"
-        );
-        assert_eq!(
-            sc.maximum_drawable_count(),
-            2,
-            "configured 2 (default is 3) — a dropped setter reads back 3"
-        );
-        assert!(sc.is_opaque(), "configured true (CALayer default is NO)");
-        assert_eq!(
-            sc.device_ptr(),
-            dev.id(),
-            "the layer must vend drawables off the device it was handed"
-        );
-        assert!(
-            !sc.wants_extended_dynamic_range(),
-            "the SDR arm must not opt into EDR"
-        );
-        assert_eq!(
-            sc.colorspace_name().as_deref(),
-            Some("kCGColorSpaceSRGB"),
-            "the SDR arm leaves the implicit space setPixelFormat: installs \
-             (measured — the header's documented nil default is not what a \
-             configured layer, wgpu's included, actually carries)"
-        );
-        assert!(
-            sc.allows_next_drawable_timeout(),
-            "the bounded-wait contract: YES, never wgpu's block-forever NO"
-        );
-        assert_eq!(sc.superlayer_ptr(), std::ptr::null_mut(), "standalone");
-    }
-
-    /// The EDR arm: `Rgba16Float` sets the extended-range opt-in and the scRGB
-    /// colorspace. The reconfigure storm distinguishes the setter from the
-    /// OS's fresh-layer default.
-    #[test]
-    fn the_edr_arm_opts_into_extended_range_and_names_its_colorspace() {
-        let dev = device();
-        let config = SwapchainConfig::aterm_present(PixelFormat::Rgba16Float, 8, 8);
-        let sc = Swapchain::standalone(&dev, &config, Arc::new(loss::LossLatch::new()))
-            .expect("EDR swapchain");
-
-        assert_eq!(sc.raw_pixel_format(), 115, "MTLPixelFormatRGBA16Float");
-        assert!(
-            sc.wants_extended_dynamic_range(),
-            "the f16 present is the EDR crown's surface"
-        );
-        assert_eq!(
-            sc.colorspace_name().as_deref(),
-            Some("kCGColorSpaceExtendedLinearSRGB"),
-            "the EDR colorspace is the scRGB declaration tag_swapchain_scrgb \
-             makes on this platform — overriding the implicit sRGB space the \
-             SDR arm keeps"
-        );
-        // And the shipped defaults hold on this arm too.
-        assert!(sc.framebuffer_only());
-        assert_eq!(sc.maximum_drawable_count(), 3);
-    }
-
-    /// A leftover wgpu layer survives attach and the swapchain still vends
-    /// beside it; dropping the swapchain unparents only its own layer.
-    #[test]
-    fn a_leftover_wgpu_layer_survives_attach_and_detach() {
-        let dev = device();
-        // Dropping Metal objects autoreleases, so the test owns a pool.
-        let _test_pool = AutoreleasePool::new();
-        let parent = plain_calayer();
-        // The stand-in for wgpu's abandoned layer: parented FIRST.
-        let leftover = plain_calayer();
-        // SAFETY: `addSublayer:` retains `leftover`; both objects are live.
-        unsafe {
-            let add: unsafe extern "C" fn(Id, Sel, Id) = msg();
-            add(parent.id(), sel(c"addSublayer:"), leftover.id());
-        }
-        assert_eq!(sublayer_count(&parent), 1);
-
-        let config = SwapchainConfig {
-            format: PixelFormat::Bgra8Unorm,
-            width: 8,
-            height: 8,
-            framebuffer_only: false,
-            display_sync: false,
-            maximum_drawables: 2,
-            opaque: true,
-        };
-        {
-            let mut sc =
-                Swapchain::attached(&dev, &parent, &config, Arc::new(loss::LossLatch::new()))
-                    .expect("attached swapchain");
-            assert_eq!(
-                sublayer_count(&parent),
-                2,
-                "attach must ADD a sublayer — replacing the array would evict \
-                 the leftover wgpu layer the CPU-fallback audit relies on"
-            );
-            assert_eq!(sc.superlayer_ptr(), parent.id());
-
-            // The swapchain works with the sibling present.
-            let frame = sc.acquire().expect("acquire beside a sibling layer");
-            assert_eq!(
-                ffi::texture_width(frame.texture()),
-                8,
-                "the drawable's texture has the configured extent"
-            );
-            drop(frame); // discard: the release returns it to the pool
-        }
-        // Drop unparents OUR layer only.
-        assert_eq!(
-            sublayer_count(&parent),
-            1,
-            "Swapchain::drop removes its own layer and only its own"
-        );
-    }
-    /// Force a `CALayer`'s `contentsScale`, standing in for a Retina display
-    /// headlessly.
-    fn set_contents_scale(layer: &Obj, scale: f64) {
-        let _pool = AutoreleasePool::new();
-        // SAFETY: scalar `CGFloat` setter on a live +1 `CALayer`.
-        unsafe {
-            let set: unsafe extern "C" fn(Id, Sel, f64) = msg();
-            set(layer.id(), sel(c"setContentsScale:"), scale);
-        }
-    }
-
-    /// An attached layer adopts its parent's non-1.0 `contentsScale`, and
-    /// follows it when it changes with no resize (a display drag). A fresh
-    /// `CAMetalLayer` defaults to 1.0, which on a 2x display draws the grid
-    /// oversized and soft.
-    #[test]
-    fn attach_adopts_the_parents_contents_scale_and_follows_it() {
-        let dev = device();
-        let _test_pool = AutoreleasePool::new();
-        let parent = plain_calayer();
-        // A Retina parent.
-        set_contents_scale(&parent, 2.0);
-
-        let config = SwapchainConfig {
-            format: PixelFormat::Bgra8Unorm,
-            width: 16,
-            height: 16,
-            framebuffer_only: false,
-            display_sync: false,
-            maximum_drawables: 2,
-            opaque: true,
-        };
-        let mut sc = Swapchain::attached(&dev, &parent, &config, Arc::new(loss::LossLatch::new()))
-            .expect("attached swapchain");
-        assert!(
-            (sc.contents_scale() - 2.0).abs() < f64::EPSILON,
-            "attach must ADOPT the parent's contentsScale — got {}, the 1.0 \
-             default means the drawable's device pixels composite as POINTS \
-             and the grid draws 2x oversized and cropped (v0.69.0)",
-            sc.contents_scale()
-        );
-
-        // A display drag changes the parent's scale with no resize or
-        // reconfigure; only the poll sees it.
-        set_contents_scale(&parent, 1.0);
-        sc.sync_layer_geometry();
-        assert!(
-            (sc.contents_scale() - 1.0).abs() < f64::EPSILON,
-            "the per-present poll must FOLLOW the parent down to 1x — got {}",
-            sc.contents_scale()
-        );
-        set_contents_scale(&parent, 3.0);
-        sc.sync_layer_geometry();
-        assert!(
-            (sc.contents_scale() - 3.0).abs() < f64::EPSILON,
-            "…and back up to 3x — got {}",
-            sc.contents_scale()
-        );
-
-        // A non-positive parent scale is refused; the last good scale stays.
-        set_contents_scale(&parent, 0.0);
-        sc.sync_layer_geometry();
-        assert!(
-            (sc.contents_scale() - 3.0).abs() < f64::EPSILON,
-            "a zero parent scale must be refused, leaving the last good 3.0 \
-             in place — got {}",
-            sc.contents_scale()
-        );
     }
 
     /// The standalone shape has no parent, so the sync is a no-op and must not
@@ -1295,71 +1026,9 @@ mod tests {
         assert!(sc.acquire().is_ok(), "and still vends after the no-op sync");
     }
 
-    /// Bounded failure: a layer that cannot vend (device stripped) makes
-    /// `acquire` return a named `Err` rather than hang, and restoring the device
-    /// makes the next acquire succeed. This is the nil arm reachable headless;
-    /// the ~1 s timeout arm needs a compositor and is covered by the
-    /// `allowsNextDrawableTimeout == YES` readback.
-    #[test]
-    fn acquire_fails_bounded_and_named_when_the_layer_cannot_vend() {
-        let dev = device();
-        // As in the attach test: the pool `Obj::drop` says every caller owes.
-        let _test_pool = AutoreleasePool::new();
-        let config = SwapchainConfig {
-            format: PixelFormat::Bgra8Unorm,
-            width: 8,
-            height: 8,
-            framebuffer_only: false,
-            display_sync: false,
-            maximum_drawables: 2,
-            opaque: true,
-        };
-        let mut sc = Swapchain::standalone(&dev, &config, Arc::new(loss::LossLatch::new()))
-            .expect("swapchain");
-
-        // A healthy layer vends.
-        drop(sc.acquire().expect("a configured layer vends a drawable"));
-
-        // Strip the device so the pool cannot serve this acquire.
-        // SAFETY: `setDevice:` accepts nil; the layer stays live.
-        unsafe {
-            let set_obj: unsafe extern "C" fn(Id, Sel, Id) = msg();
-            set_obj(sc.layer.id(), sel(c"setDevice:"), std::ptr::null_mut());
-        }
-
-        // SAFETY: reading a monotonic clock.
-        let t0 = unsafe { CACurrentMediaTime() };
-        let starved = sc.acquire();
-        // SAFETY: as above.
-        let waited = unsafe { CACurrentMediaTime() } - t0;
-        let err = starved.expect_err("a deviceless layer must not vend");
-        assert!(
-            err.contains("nextDrawable returned nil"),
-            "the failure is named, not swallowed: {err}"
-        );
-        // Hang detector: the nil arm returns in microseconds; a parked thread
-        // never returns.
-        assert!(
-            waited < 60.0,
-            "the failure is BOUNDED — {waited:.2}s is not a parked thread \
-             (wgpu-hal's allowsNextDrawableTimeout=NO would sit here forever)"
-        );
-
-        // Recovery: give the device back and the next acquire succeeds.
-        // SAFETY: as the strip above, with the real device.
-        unsafe {
-            let set_obj: unsafe extern "C" fn(Id, Sel, Id) = msg();
-            set_obj(sc.layer.id(), sel(c"setDevice:"), dev.id());
-        }
-        let frame = sc
-            .acquire()
-            .expect("restoring the device must make acquire succeed again");
-        drop(frame);
-    }
-
     /// The 112-byte `Blit` uniform (`shaders/blit.metal`'s `struct Blit`) as
     /// `repr(C)`; size checked against
-    /// [`crate::metal::blit::MetalBlit::UNIFORM_BYTES`] at the fill site.
+    /// [`crate::metal::blit::UNIFORM_BYTES`] at the fill site.
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct BlitUniformBytes {
@@ -1382,348 +1051,6 @@ mod tests {
         premult: f32,
         chrome_y0: f32,
         chrome_pad: [f32; 3],
-    }
-
-    /// The frame cycle, six frames on a 3-drawable pool: acquire, render the bg
-    /// row into the offscreen, blit it into the drawable's texture through
-    /// `Pipeline::Blit`, read the drawable back, present, wait, feed the latch.
-    ///
-    /// The bg row targets the offscreen's sRGB view and the layer vends
-    /// `Bgra8Unorm`, so this runs the production shape: bg into the sRGB view
-    /// of an `Rgba8Unorm` texture, blit from its Unorm view to the swapchain.
-    /// Expected bytes are the instances' sRGB bytes (±1 LSB), swizzled to BGRA.
-    ///
-    /// Colours change every frame, so a recycled drawable replaying a stale
-    /// frame shows as a byte diff.
-    #[test]
-    fn six_frames_render_present_and_recycle_through_the_pool() {
-        use crate::metal::loss::{CbOutcome, LossLatch};
-        use crate::pipeline_table::Pipeline;
-
-        let dev = device();
-        let _test_pool = AutoreleasePool::new();
-
-        const W: usize = 16;
-        const H: usize = 16;
-        const FRAMES: usize = 6;
-
-        let latch = Arc::new(LossLatch::new());
-        // One session owns the queue, so the whole cycle runs on one queue.
-        let session = encoder::EncodeSession::new(&dev, Arc::clone(&latch)).expect("session");
-        let queue = session.one_shot_queue();
-        let mut sc = Swapchain::standalone(
-            &dev,
-            &SwapchainConfig {
-                format: PixelFormat::Bgra8Unorm,
-                width: W,
-                height: H,
-                // Readback needs blit access to the drawable's texture.
-                framebuffer_only: false,
-                display_sync: false,
-                maximum_drawables: 3,
-                opaque: true,
-            },
-            Arc::clone(&latch),
-        )
-        .expect("swapchain");
-
-        // The cycle's two table rows.
-        let bg_spec = Pipeline::Bg.spec();
-        let bg_lib = crate::metal::pipelines::compile(&dev, bg_spec).expect("cell.metal");
-        let bg_pso =
-            crate::metal::pipelines::build(&dev, &bg_lib, bg_spec, PixelFormat::Bgra8Unorm)
-                .expect("bg row");
-        assert_eq!(
-            crate::metal::pipelines::metal_format(bg_spec.target, PixelFormat::Bgra8Unorm),
-            PixelFormat::Rgba8UnormSrgb,
-            "bg attaches the offscreen's sRGB view, never the drawable"
-        );
-        let blit_spec = Pipeline::Blit.spec();
-        let blit_lib = crate::metal::pipelines::compile(&dev, blit_spec).expect("blit.metal");
-        let blit_pso =
-            crate::metal::pipelines::build(&dev, &blit_lib, blit_spec, PixelFormat::Bgra8Unorm)
-                .expect("blit row");
-
-        // The offscreen pair: Unorm storage, sRGB view — production's shape.
-        let offscreen = dev
-            .new_texture_2d(
-                PixelFormat::Rgba8Unorm,
-                W,
-                H,
-                ffi::TEXTURE_USAGE_RENDER_TARGET
-                    | ffi::TEXTURE_USAGE_SHADER_READ
-                    | ffi::TEXTURE_USAGE_PIXEL_FORMAT_VIEW,
-            )
-            .expect("offscreen");
-        let srgb_view =
-            ffi::texture_view(&offscreen, PixelFormat::Rgba8UnormSrgb).expect("sRGB view");
-
-        let sampler = dev
-            .new_sampler(ffi::SamplerDesc::NEAREST_CLAMP)
-            .expect("sampler");
-        let ibuf = dev.new_buffer(2 * 12).expect("instance stream");
-        let cell_ubuf = dev
-            .new_buffer(size_of::<CellUniforms>())
-            .expect("cell uniforms");
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "16-texel extents are exact in f32"
-        )]
-        let cell_uniforms = CellUniforms {
-            screen: [W as f32, H as f32],
-            text_blend: 0.0,
-            pad: 0.0,
-        };
-        // SAFETY: `repr(C)` into an exactly-sized fresh shared buffer.
-        unsafe { ffi::buffer_write(&cell_ubuf, as_bytes(&cell_uniforms)) };
-
-        // Exact-fit passthrough: every drawable pixel reads its offscreen
-        // texel; the red band colour can only appear if placement breaks.
-        assert_eq!(
-            size_of::<BlitUniformBytes>(),
-            crate::metal::blit::MetalBlit::UNIFORM_BYTES,
-            "the repr(C) restatement must be the 112 bytes blit.metal declares"
-        );
-        #[expect(clippy::cast_precision_loss, reason = "as above")]
-        let blit_uniform = BlitUniformBytes {
-            flag: 0,
-            overlay: 0,
-            border_px: 0.0,
-            encode_srgb: 0.0,
-            accent: [0.0; 3],
-            chrome_y1: 0.0,
-            dims: [W as f32, H as f32],
-            wash_a: 0.0,
-            border_a: 0.0,
-            band: [1.0, 0.0, 0.0, 1.0],
-            content_off: [0.0, 0.0],
-            hdr: 0.0,
-            translucent: 0.0,
-            sdr_white_scale: 1.0,
-            visible_y: 0.0,
-            visible_h: H as f32,
-            premult: 0.0,
-            chrome_y0: 0.0,
-            chrome_pad: [0.0; 3],
-        };
-        let blit_ubuf = dev
-            .new_buffer(crate::metal::blit::MetalBlit::UNIFORM_BYTES)
-            .expect("blit uniform");
-        // SAFETY: `repr(C)`, size asserted equal to the buffer's above.
-        unsafe { ffi::buffer_write(&blit_ubuf, as_bytes(&blit_uniform)) };
-
-        let row = W * PixelFormat::Rgba8UnormSrgb.bytes_per_texel();
-        let scratch = dev.new_buffer(row * H).expect("bg scratch readback");
-        let present_row = W * PixelFormat::Bgra8Unorm.bytes_per_texel();
-        let readback = dev.new_buffer(present_row * H).expect("drawable readback");
-
-        let close = |g: u8, w: u8| (i16::from(g) - i16::from(w)).unsigned_abs() <= 1;
-        let mut presented = 0usize;
-
-        for frame in 0..FRAMES {
-            // The P4 fixture's two mid-range quads, colour-shifted per frame
-            // so a stale (recycled, un-redrawn) drawable cannot pass.
-            let shift = u8::try_from(10 * frame).expect("frame < 26");
-            let c0: [u8; 4] = [200, 40 + shift, 120, 255];
-            let c1: [u8; 4] = [40, 200 - shift, 90, 255];
-            let mut stream: Vec<u8> = Vec::new();
-            for (rect, colour) in [([0u16, 0, 8, 8], c0), ([8u16, 8, 8, 8], c1)] {
-                for v in rect {
-                    stream.extend_from_slice(&v.to_le_bytes());
-                }
-                stream.extend_from_slice(&colour);
-            }
-            // SAFETY: exactly-sized shared buffer; the previous frame's
-            // command buffers were waited on before this point.
-            unsafe { ffi::buffer_write(&ibuf, &stream) };
-
-            let frame_obj = sc
-                .acquire()
-                .unwrap_or_else(|e| panic!("frame {frame}: acquire failed: {e}"));
-
-            // bg -> offscreen (sRGB view), the P4 harness draw.
-            ffi::draw_and_read(
-                queue,
-                &ffi::Pass {
-                    pso: &bg_pso,
-                    dst: &srgb_view,
-                    dst_w: W,
-                    dst_h: H,
-                    load: ffi::LoadAction::Clear(ffi::ClearColor {
-                        r: 0.0,
-                        g: 0.0,
-                        b: 0.0,
-                        a: 1.0,
-                    }),
-                    viewport: None,
-                    scissor: None,
-                    src_tex: None,
-                    sampler: None,
-                    uniform: None,
-                    vertex_uniform: Some((
-                        &cell_ubuf,
-                        bg_spec
-                            .binds
-                            .vertex_uniform
-                            .expect("the bg row has a vertex uniform")
-                            as usize,
-                    )),
-                    draw: Some(ffi::DrawCall {
-                        primitive: crate::metal::pipelines::metal_primitive_type(bg_spec.topology),
-                        vertices: 6,
-                        instances: 2,
-                        stream: Some(&ibuf),
-                    }),
-                },
-                &scratch,
-                row,
-            )
-            .unwrap_or_else(|e| panic!("frame {frame}: bg draw failed: {e}"));
-
-            // blit: offscreen's Unorm view -> the drawable's texture.
-            ffi::draw_and_read(
-                queue,
-                &ffi::Pass {
-                    pso: &blit_pso,
-                    dst: frame_obj.texture(),
-                    dst_w: W,
-                    dst_h: H,
-                    load: ffi::LoadAction::Clear(ffi::ClearColor {
-                        r: 0.0,
-                        g: 0.0,
-                        b: 0.0,
-                        a: 1.0,
-                    }),
-                    viewport: None,
-                    scissor: None,
-                    src_tex: Some((&offscreen, blit_spec.binds.fragment_textures[0] as usize)),
-                    sampler: Some((&sampler, blit_spec.binds.fragment_samplers[0] as usize)),
-                    uniform: Some((&blit_ubuf, blit_spec.binds.fragment_buffers[0] as usize)),
-                    vertex_uniform: None,
-                    draw: None,
-                },
-                &readback,
-                present_row,
-            )
-            .unwrap_or_else(|e| panic!("frame {frame}: blit into the drawable failed: {e}"));
-
-            // Every drawable byte, against this frame's colours.
-            // SAFETY: shared storage, written before draw_and_read returned.
-            let got = unsafe { ffi::buffer_bytes(&readback, present_row * H) };
-            for (i, texel) in got.as_chunks::<4>().0.iter().enumerate() {
-                let (px, py) = (i % W, i / W);
-                let want_rgba = if px < 8 && py < 8 {
-                    c0
-                } else if px >= 8 && py >= 8 {
-                    c1
-                } else {
-                    [0, 0, 0, 255]
-                };
-                let want = [want_rgba[2], want_rgba[1], want_rgba[0], 255];
-                assert!(
-                    texel.iter().zip(want).all(|(g, w)| close(*g, w)),
-                    "frame {frame} ({px},{py}): got {texel:?}, want ~{want:?} (BGRA) — \
-                     a stale recycled drawable replays an old frame's colours here, \
-                     a sRGB-view blit source shifts every mid-range byte, red means \
-                     the band path fired inside the content rect"
-                );
-            }
-
-            // Present and wait — `wait_outcome` feeds the latch ITSELF now,
-            // so the cycle's loss discipline has no manual `record` to forget.
-            let ticket = frame_obj
-                .present(&session)
-                .unwrap_or_else(|e| panic!("frame {frame}: present failed: {e}"));
-            // Every waited ticket must bump the debug feed counter by one, so a
-            // skipped `settle` is caught even though Completed records nothing.
-            #[cfg(debug_assertions)]
-            let fed_before = latch.fed_count();
-            let outcome = ticket.wait_outcome();
-            #[cfg(debug_assertions)]
-            assert_eq!(
-                latch.fed_count(),
-                fed_before + 1,
-                "frame {frame}: wait_outcome must feed the latch even on a \
-                 Completed outcome — if this is red, `settle` was skipped and \
-                 a real device loss would never latch through the wait path"
-            );
-            assert_eq!(
-                outcome,
-                CbOutcome::Completed,
-                "frame {frame}: the present command buffer must complete"
-            );
-            assert!(
-                !latch.is_lost(),
-                "frame {frame}: six healthy presents never latch"
-            );
-            presented += 1;
-        }
-
-        assert_eq!(presented, FRAMES);
-        crate::stderr_line!(
-            "frame cycle on {}: {FRAMES} frames x {} texels rendered, verified, \
-             presented and recycled through a 3-drawable pool; latch clean",
-            dev.name(),
-            W * H
-        );
-    }
-
-    /// Deliberate exhaustion: `maximumDrawableCount = 2`, then five raw acquires
-    /// held un-presented, each timed. An unparented layer's pool never
-    /// exhausts, so every acquire vends quickly; if an OS update starts pacing
-    /// headless layers this fails and the module header needs updating.
-    ///
-    /// Uses [`Swapchain::raw_next_drawable`] because two live [`Frame`]s do not
-    /// compile.
-    #[test]
-    fn deliberate_exhaustion_stays_bounded_and_headless_pools_never_starve() {
-        let dev = device();
-        let _test_pool = AutoreleasePool::new();
-        let config = SwapchainConfig {
-            format: PixelFormat::Bgra8Unorm,
-            width: 16,
-            height: 16,
-            framebuffer_only: false,
-            display_sync: false,
-            maximum_drawables: 2,
-            opaque: true,
-        };
-        let mut sc = Swapchain::standalone(&dev, &config, Arc::new(loss::LossLatch::new()))
-            .expect("swapchain");
-
-        let mut held: Vec<(Obj, Obj)> = Vec::new();
-        for i in 0..5 {
-            // SAFETY: reading a monotonic clock.
-            let t0 = unsafe { CACurrentMediaTime() };
-            let got = sc.raw_next_drawable();
-            // SAFETY: as above.
-            let waited = unsafe { CACurrentMediaTime() } - t0;
-            // A hang detector (a vend is milliseconds, a nil is Apple's ~1 s
-            // timeout, a parked thread is forever), not a latency budget.
-            assert!(
-                waited < 60.0,
-                "acquire {i} took {waited:.2}s — the bounded-wait contract is dead"
-            );
-            let pair = got.unwrap_or_else(|| {
-                panic!(
-                    "acquire {i} returned nil after {waited:.2}s on a healthy \
-                     unparented layer; the module header's never-exhausts \
-                     claim fails on this OS: re-measure and rewrite the header"
-                )
-            });
-            assert!(
-                !held.iter().any(|(d, _)| d.id() == pair.0.id()),
-                "acquire {i} re-vended a drawable still held un-presented"
-            );
-            held.push(pair);
-        }
-        drop(held);
-
-        // And the public path still vends after the abuse.
-        drop(
-            sc.acquire()
-                .expect("the layer recovers once the holds drop"),
-        );
     }
 
     /// Injected loss end to end through production plumbing: a real present's
@@ -1788,7 +1115,7 @@ mod tests {
              not inflate the per-present feed count"
         );
 
-        // RETRYABLE does not latch, and the swapchain keeps serving.
+        // Retryable does not latch, and the swapchain keeps serving.
         let outcome = ticket.settle(classify(STATUS_ERROR, Some(ERROR_TIMEOUT)));
         assert!(matches!(outcome, CbOutcome::Retryable { .. }));
         assert!(!latch.is_lost(), "Retryable must never latch");
@@ -1797,8 +1124,8 @@ mod tests {
                 .expect("a retryable failure must not stop acquire"),
         );
 
-        // Acquire a frame while healthy, THEN lose the device mid-frame —
-        // the injected PageFault, through the ticket's own seam.
+        // Acquire while healthy, then inject a `PageFault` mid-frame through
+        // the ticket's seam.
         let frame = sc.acquire().expect("acquired before the loss lands");
         let outcome = ticket.settle(classify(STATUS_ERROR, Some(ERROR_PAGE_FAULT)));
         assert!(matches!(outcome, CbOutcome::Lost { .. }));
@@ -1819,8 +1146,7 @@ mod tests {
             "the present refusal minted a command buffer — it must not touch the queue"
         );
 
-        // Reconfigure refuses the same way — the fourth face of the refusal
-        // pattern, before any layer property is touched.
+        // Reconfigure refuses too, before touching any layer property.
         let err = sc
             .reconfigure(&dev, &config)
             .expect_err("reconfigure after the loss must refuse");
@@ -1848,15 +1174,12 @@ mod tests {
         }
     }
 
-    /// Reconfigure storm: one live layer driven through every axis the renderer
-    /// reconfigures (sizes, both formats, `opaque`, `framebufferOnly`,
-    /// `displaySyncEnabled`, `maximumDrawableCount`) twice, 12 reconfigures,
-    /// with an acquire and present after each.
-    ///
-    /// Each step reads back every axis via its getter, the colorspace name (an
-    /// EDR-to-SDR flip must return to `kCGColorSpaceSRGB`), and the acquired
-    /// drawable's extent and pixel format, proving the pool follows the config.
-    /// The body pool absorbs this thread's autoreleases.
+    /// Reconfigure storm: every axis the renderer reconfigures (sizes, both
+    /// formats, `opaque`, `framebufferOnly`, `displaySyncEnabled`,
+    /// `maximumDrawableCount`), 12 reconfigures of one live layer with an
+    /// acquire and present after each. Each step reads every axis back, the
+    /// colorspace (an EDR-to-SDR flip must return to `kCGColorSpaceSRGB`), and
+    /// the vended drawable's extent and format.
     #[test]
     fn a_reconfigure_storm_lands_every_axis_live_and_the_pool_follows() {
         use crate::metal::encoder::EncodeSession;
@@ -2015,18 +1338,13 @@ mod tests {
         );
     }
 
-    /// The two-submit frame, six times through a 3-drawable pool, on one queue:
-    ///
-    /// * Submit A renders the bg row into the offscreen's sRGB view, commits and
-    ///   is not waited on.
-    /// * Submit B blits the offscreen onto the drawable's texture through
-    ///   `Pipeline::Blit`, appends the tap copy, commits and is waited on; B
-    ///   completing proves A completed (checked via
-    ///   [`encoder::Submitted::try_outcome`]).
-    /// * `Frame::present(&session)` registers the present behind both.
-    ///
-    /// Bytes are checked per frame, and A's poll, B's wait and the ticket's
-    /// wait each feed the latch exactly once.
+    /// The two-submit frame, six times through a 3-drawable pool on one queue.
+    /// Submit A renders the bg row into the offscreen's sRGB view and is not
+    /// waited on; Submit B blits onto the drawable through `Pipeline::Blit`,
+    /// appends the tap copy and is waited on, which proves A completed (checked
+    /// with [`encoder::Submitted::try_outcome`]); `Frame::present(&session)`
+    /// registers the present behind both. Bytes are checked per frame, and A's
+    /// poll, B's wait and the ticket's wait each feed the latch exactly once.
     #[test]
     fn six_two_submit_frames_encode_compose_present_and_verify() {
         use crate::metal::encoder::{
@@ -2050,7 +1368,7 @@ mod tests {
                 format: PixelFormat::Bgra8Unorm,
                 width: W,
                 height: H,
-                framebuffer_only: false, // readback, as in T3
+                framebuffer_only: false, // readback
                 display_sync: false,
                 maximum_drawables: 3,
                 opaque: true,
@@ -2104,7 +1422,7 @@ mod tests {
 
         assert_eq!(
             size_of::<BlitUniformBytes>(),
-            crate::metal::blit::MetalBlit::UNIFORM_BYTES,
+            crate::metal::blit::UNIFORM_BYTES,
             "the repr(C) restatement must be the 112 bytes blit.metal declares"
         );
         #[expect(clippy::cast_precision_loss, reason = "as above")]
@@ -2130,7 +1448,7 @@ mod tests {
             chrome_pad: [0.0; 3],
         };
         let blit_ubuf = dev
-            .new_buffer(crate::metal::blit::MetalBlit::UNIFORM_BYTES)
+            .new_buffer(crate::metal::blit::UNIFORM_BYTES)
             .expect("blit uniform");
         // SAFETY: `repr(C)`, size asserted equal to the buffer's above.
         unsafe { ffi::buffer_write(&blit_ubuf, as_bytes(&blit_uniform)) };
@@ -2154,7 +1472,7 @@ mod tests {
             // command buffers were all waited on before this point.
             unsafe { ffi::buffer_write(&ibuf, &stream) };
 
-            // SUBMIT A: encode the frame. Committed, NOT waited.
+            // Submit A: encode the frame; committed, not waited on.
             let mut cb_a: CommandBuffer<'_> = session.begin().expect("cb A");
             {
                 let pass = cb_a
@@ -2189,7 +1507,7 @@ mod tests {
                 .acquire()
                 .unwrap_or_else(|e| panic!("frame {frame}: acquire failed: {e}"));
 
-            // SUBMIT B: compose onto the drawable + the tap-shaped readback.
+            // Submit B: compose onto the drawable + the tap-shaped readback.
             let mut cb_b = session.begin().expect("cb B");
             {
                 let pass = cb_b
@@ -2240,7 +1558,7 @@ mod tests {
                  latch exactly once"
             );
 
-            // Byte-verify the drawable (BGRA store order, T3's contract).
+            // Byte-verify the drawable (BGRA store order).
             // SAFETY: shared storage; submit B completed above.
             let got = unsafe { ffi::buffer_bytes(&readback, present_row * H) };
             for (i, texel) in got.as_chunks::<4>().0.iter().enumerate() {
@@ -2261,7 +1579,7 @@ mod tests {
                 );
             }
 
-            // PRESENT, behind A and B on the one queue the session owns.
+            // Present, behind A and B on the session's one queue.
             #[cfg(debug_assertions)]
             let fed_before_present = latch.fed_count();
             let outcome = frame_obj
@@ -2285,47 +1603,6 @@ mod tests {
              compose-submit + present on ONE session queue, byte-verified, \
              A harvested by polling every frame",
             dev.name()
-        );
-    }
-
-    /// A session on a different latch than the swapchain's is refused at
-    /// present.
-    #[test]
-    fn present_refuses_a_session_wired_to_a_different_loss_latch() {
-        use crate::metal::loss::LossLatch;
-
-        let dev = device();
-        let _test_pool = AutoreleasePool::new();
-        let sc_latch = Arc::new(LossLatch::new());
-        let foreign_latch = Arc::new(LossLatch::new());
-        let foreign_session =
-            encoder::EncodeSession::new(&dev, Arc::clone(&foreign_latch)).expect("session");
-        let mut sc = Swapchain::standalone(
-            &dev,
-            &SwapchainConfig {
-                format: PixelFormat::Bgra8Unorm,
-                width: 8,
-                height: 8,
-                framebuffer_only: false,
-                display_sync: false,
-                maximum_drawables: 2,
-                opaque: true,
-            },
-            Arc::clone(&sc_latch),
-        )
-        .expect("swapchain");
-
-        let frame = sc.acquire().expect("acquire");
-        let err = frame
-            .present(&foreign_session)
-            .expect_err("a cross-latch present must refuse");
-        assert!(
-            err.contains("loss domain") || err.contains("latch"),
-            "the refusal names the wiring bug: {err}"
-        );
-        assert!(
-            !sc_latch.is_lost() && !foreign_latch.is_lost(),
-            "a refused present is a wiring error, not a device loss"
         );
     }
 
@@ -2365,8 +1642,7 @@ mod tests {
         )
         .expect("swapchain");
 
-        // Domain 2: the rogue pair — a second latch and its session, exactly
-        // as the probe built them.
+        // Domain 2: a second latch, its session and a texture minted in it.
         let latch2 = Arc::new(LossLatch::new());
         let session2 = EncodeSession::new(&dev, Arc::clone(&latch2)).expect("session 2");
         let mint2 = MetalResourceDevice::new(&dev, Arc::clone(&latch2));
@@ -2473,13 +1749,13 @@ mod tests {
         // SAFETY: alloc/init is +1; the setters are documented property
         // setters on the live layer, prototypes written per selector.
         unsafe {
-            let alloc: unsafe extern "C" fn(ClassPtr, Sel) -> Id = msg();
+            let alloc: unsafe extern "C-unwind" fn(ClassPtr, Sel) -> Id = checked_msg();
             let raw = alloc(class(c"CAMetalLayer"), sel(c"alloc"));
-            let init: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+            let init: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             let layer = Obj::from_owned(init(raw, sel(c"init"))).expect("CAMetalLayer init");
-            let set_obj: unsafe extern "C" fn(Id, Sel, Id) = msg();
+            let set_obj: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
             set_obj(layer.id(), sel(c"setDevice:"), dev.id());
-            let set_size: unsafe extern "C" fn(Id, Sel, CgSize) = msg();
+            let set_size: unsafe extern "C-unwind" fn(Id, Sel, CgSize) = checked_msg();
             #[expect(
                 clippy::cast_precision_loss,
                 reason = "16-texel extents are exact in f64"
@@ -2492,7 +1768,7 @@ mod tests {
                     height: h as f64,
                 },
             );
-            let set_bool: unsafe extern "C" fn(Id, Sel, ObjcBool) = msg();
+            let set_bool: unsafe extern "C-unwind" fn(Id, Sel, ObjcBool) = checked_msg();
             set_bool(layer.id(), sel(c"setFramebufferOnly:"), false.into());
             layer
         }
@@ -2519,10 +1795,10 @@ mod tests {
         const H: usize = 16;
         let parent = plain_calayer();
         let foreign = foreign_metal_layer(&dev, W, H);
-        // The leftover parents FIRST, exactly as a dead wgpu surface would be.
+        // The leftover is parented first, as a dead wgpu surface's layer is.
         // SAFETY: `addSublayer:` retains `foreign`; both objects are live.
         unsafe {
-            let add: unsafe extern "C" fn(Id, Sel, Id) = msg();
+            let add: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
             add(parent.id(), sel(c"addSublayer:"), foreign.id());
         }
 
@@ -2539,7 +1815,7 @@ mod tests {
             .new_sampler(ffi::SamplerDesc::NEAREST_CLAMP)
             .expect("sampler");
         let blit_ubuf = dev
-            .new_buffer(crate::metal::blit::MetalBlit::UNIFORM_BYTES)
+            .new_buffer(crate::metal::blit::UNIFORM_BYTES)
             .expect("blit uniform");
         #[expect(clippy::cast_precision_loss, reason = "16-texel extents")]
         let blit_uniform = BlitUniformBytes {
@@ -2566,7 +1842,7 @@ mod tests {
         // SAFETY: `repr(C)`, size-asserted layout into a fresh shared buffer.
         unsafe { ffi::buffer_write(&blit_ubuf, as_bytes(&blit_uniform)) };
 
-        // Two solid source textures with DIFFERENT colours (RGBA memory).
+        // Two solid source textures with different colours (RGBA memory).
         const OURS: [u8; 4] = [10, 200, 60, 255];
         const THEIRS: [u8; 4] = [255, 128, 0, 255];
         let make_src = |c: [u8; 4]| {
@@ -2596,7 +1872,7 @@ mod tests {
         // +1 as `raw_next_drawable` does.
         let (foreign_drawable, foreign_tex) = unsafe {
             let _pool = AutoreleasePool::new();
-            let get: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+            let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             let d = Obj::retain(get(foreign.id(), sel(c"nextDrawable")))
                 .expect("the foreign layer vends");
             let t = Obj::retain(get(d.id(), sel(c"texture"))).expect("its texture");
@@ -2649,8 +1925,8 @@ mod tests {
             );
 
             let frame = sc.acquire().expect("acquire beside a live sibling");
-            // The drawable's own back-pointer: OUR layer, not the sibling's,
-            // not the parent's.
+            // The drawable's own back-pointer: our layer, not the sibling's or
+            // the parent's.
             let came_from = frame.drawable_layer_ptr();
             assert_eq!(
                 came_from,
@@ -2665,7 +1941,7 @@ mod tests {
                 "our attachment is not the sibling's texture"
             );
 
-            // Render OUR colour into OUR drawable and hold every byte.
+            // Render our colour into our drawable and check every byte.
             blit_into(frame.texture(), &ours_src, &blit_bgra).expect("our render");
             // SAFETY: shared storage, written before draw_and_read returned.
             let got = unsafe { ffi::buffer_bytes(&readback, row * H) };
@@ -2682,8 +1958,8 @@ mod tests {
             assert_eq!(outcome, crate::metal::loss::CbOutcome::Completed);
             assert!(!latch.is_lost());
 
-            // The sibling's drawable, AFTER our present: its bytes, intact.
-            // (Read through a scratch target so nothing re-renders into it.)
+            // The sibling's drawable after our present keeps its bytes (read
+            // through a scratch target so nothing re-renders into it).
             let scratch = dev
                 .new_texture_2d(
                     PixelFormat::Rgba8Unorm,
@@ -2703,7 +1979,7 @@ mod tests {
                 );
             }
         }
-        // Teardown symmetry with a LIVE sibling: only our layer left.
+        // Teardown beside a live sibling: only the sibling remains.
         assert_eq!(sublayer_count(&parent), 1, "drop unparents ours alone");
         assert_eq!(
             first_sublayer(&parent),
@@ -2720,271 +1996,16 @@ mod tests {
         // pool; `objectAtIndex:` returns a +0 element, compared by pointer
         // before the pool pops.
         unsafe {
-            let get: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+            let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             let arr = get(layer.id(), sel(c"sublayers"));
             if arr.is_null() {
-                return std::ptr::null_mut();
+                return Id::NIL;
             }
-            let at: unsafe extern "C" fn(Id, Sel, usize) -> Id = msg();
+            let at: unsafe extern "C-unwind" fn(Id, Sel, usize) -> Id = checked_msg();
             at(arr, sel(c"objectAtIndex:"), 0)
         }
     }
 
-    /// IEEE 754 binary16 -> f32, for the EDR readback.
-    fn f16_to_f32(bits: u16) -> f32 {
-        let sign = if bits & 0x8000 == 0 { 1.0f32 } else { -1.0 };
-        let exp = i32::from((bits >> 10) & 0x1f);
-        let mantissa = f32::from(bits & 0x3ff);
-        if exp == 0 {
-            sign * mantissa * (2.0f32).powi(-24)
-        } else if exp == 31 {
-            if mantissa == 0.0 {
-                sign * f32::INFINITY
-            } else {
-                f32::NAN
-            }
-        } else {
-            sign * (1.0 + mantissa / 1024.0) * (2.0f32).powi(exp - 15)
-        }
-    }
-
-    /// An EDR frame: `Rgba16Float` with wantsEDR, the bg row through the
-    /// offscreen pair and `Pipeline::Blit` into the f16 drawable, every channel
-    /// decoded and checked, then present, wait, clean latch.
-    ///
-    /// The blit's attachment format comes from
-    /// `metal_format(TargetRole::Present, sc.format())` and is checked equal to
-    /// the layer's actual pixel format; the Edr role is the same f16.
-    #[test]
-    fn an_edr_frame_renders_through_the_table_formats_and_presents() {
-        use crate::metal::loss::{CbOutcome, LossLatch};
-        use crate::pipeline_table::{Pipeline, TargetRole};
-
-        let dev = device();
-        let _test_pool = AutoreleasePool::new();
-
-        const W: usize = 16;
-        const H: usize = 16;
-        let latch = Arc::new(LossLatch::new());
-        let session = encoder::EncodeSession::new(&dev, Arc::clone(&latch)).expect("session");
-        let queue = session.one_shot_queue();
-        let mut sc = Swapchain::standalone(
-            &dev,
-            &SwapchainConfig {
-                format: PixelFormat::Rgba16Float,
-                width: W,
-                height: H,
-                framebuffer_only: false, // readback, as in T3
-                display_sync: false,
-                maximum_drawables: 3,
-                opaque: true,
-            },
-            Arc::clone(&latch),
-        )
-        .expect("EDR swapchain");
-        assert!(sc.wants_extended_dynamic_range());
-
-        // The table's Present arm resolves to the layer's own format, and the
-        // Edr role uses the same f16.
-        let blit_spec = Pipeline::Blit.spec();
-        let present_format = crate::metal::pipelines::metal_format(blit_spec.target, sc.format());
-        assert_eq!(
-            Some(present_format),
-            PixelFormat::from_raw(sc.raw_pixel_format()),
-            "the Present-role resolution must equal the layer's actual pixelFormat"
-        );
-        assert_eq!(
-            crate::metal::pipelines::metal_format(TargetRole::Edr, sc.format()),
-            PixelFormat::Rgba16Float,
-            "the Edr offscreen and the EDR present share the f16 format"
-        );
-
-        // The bg row still writes the offscreen sRGB view, EDR or not.
-        let bg_spec = Pipeline::Bg.spec();
-        assert_eq!(
-            crate::metal::pipelines::metal_format(bg_spec.target, sc.format()),
-            PixelFormat::Rgba8UnormSrgb,
-            "bg attaches the offscreen's sRGB view on the EDR arm too"
-        );
-        let bg_lib = crate::metal::pipelines::compile(&dev, bg_spec).expect("cell.metal");
-        let bg_pso =
-            crate::metal::pipelines::build(&dev, &bg_lib, bg_spec, sc.format()).expect("bg row");
-        let blit_lib = crate::metal::pipelines::compile(&dev, blit_spec).expect("blit.metal");
-        let blit_pso = crate::metal::pipelines::build(&dev, &blit_lib, blit_spec, sc.format())
-            .expect("blit row against the f16 drawable");
-
-        let offscreen = dev
-            .new_texture_2d(
-                PixelFormat::Rgba8Unorm,
-                W,
-                H,
-                ffi::TEXTURE_USAGE_RENDER_TARGET
-                    | ffi::TEXTURE_USAGE_SHADER_READ
-                    | ffi::TEXTURE_USAGE_PIXEL_FORMAT_VIEW,
-            )
-            .expect("offscreen");
-        let srgb_view =
-            ffi::texture_view(&offscreen, PixelFormat::Rgba8UnormSrgb).expect("sRGB view");
-        let sampler = dev
-            .new_sampler(ffi::SamplerDesc::NEAREST_CLAMP)
-            .expect("sampler");
-
-        // The P4 fixture's two quads.
-        const C0: [u8; 4] = [200, 40, 120, 255];
-        const C1: [u8; 4] = [40, 200, 90, 255];
-        let mut stream: Vec<u8> = Vec::new();
-        for (rect, colour) in [([0u16, 0, 8, 8], C0), ([8u16, 8, 8, 8], C1)] {
-            for v in rect {
-                stream.extend_from_slice(&v.to_le_bytes());
-            }
-            stream.extend_from_slice(&colour);
-        }
-        let ibuf = dev.new_buffer(stream.len()).expect("instance stream");
-        // SAFETY: exactly-sized fresh shared buffer, no command in flight.
-        unsafe { ffi::buffer_write(&ibuf, &stream) };
-        let cell_ubuf = dev
-            .new_buffer(size_of::<CellUniforms>())
-            .expect("cell uniforms");
-        #[expect(clippy::cast_precision_loss, reason = "16-texel extents")]
-        let cell_uniforms = CellUniforms {
-            screen: [W as f32, H as f32],
-            text_blend: 0.0,
-            pad: 0.0,
-        };
-        // SAFETY: `repr(C)` into an exactly-sized fresh shared buffer.
-        unsafe { ffi::buffer_write(&cell_ubuf, as_bytes(&cell_uniforms)) };
-
-        let blit_ubuf = dev
-            .new_buffer(crate::metal::blit::MetalBlit::UNIFORM_BYTES)
-            .expect("blit uniform");
-        #[expect(clippy::cast_precision_loss, reason = "16-texel extents")]
-        let blit_uniform = BlitUniformBytes {
-            flag: 0,
-            overlay: 0,
-            border_px: 0.0,
-            encode_srgb: 0.0,
-            accent: [0.0; 3],
-            chrome_y1: 0.0,
-            dims: [W as f32, H as f32],
-            wash_a: 0.0,
-            border_a: 0.0,
-            band: [1.0, 0.0, 0.0, 1.0],
-            content_off: [0.0, 0.0],
-            hdr: 0.0,
-            translucent: 0.0,
-            sdr_white_scale: 1.0,
-            visible_y: 0.0,
-            visible_h: H as f32,
-            premult: 0.0,
-            chrome_y0: 0.0,
-            chrome_pad: [0.0; 3],
-        };
-        // SAFETY: `repr(C)`, size-asserted at T3's fill site already.
-        unsafe { ffi::buffer_write(&blit_ubuf, as_bytes(&blit_uniform)) };
-
-        let srgb_row = W * PixelFormat::Rgba8UnormSrgb.bytes_per_texel();
-        let scratch = dev.new_buffer(srgb_row * H).expect("bg scratch");
-        let f16_row = W * PixelFormat::Rgba16Float.bytes_per_texel();
-        let readback = dev.new_buffer(f16_row * H).expect("f16 readback");
-
-        let frame = sc.acquire().expect("EDR acquire");
-        ffi::draw_and_read(
-            queue,
-            &ffi::Pass {
-                pso: &bg_pso,
-                dst: &srgb_view,
-                dst_w: W,
-                dst_h: H,
-                load: ffi::LoadAction::Clear(ffi::ClearColor {
-                    r: 0.0,
-                    g: 0.0,
-                    b: 0.0,
-                    a: 1.0,
-                }),
-                viewport: None,
-                scissor: None,
-                src_tex: None,
-                sampler: None,
-                uniform: None,
-                vertex_uniform: Some((
-                    &cell_ubuf,
-                    bg_spec
-                        .binds
-                        .vertex_uniform
-                        .expect("the bg row has a vertex uniform") as usize,
-                )),
-                draw: Some(ffi::DrawCall {
-                    primitive: crate::metal::pipelines::metal_primitive_type(bg_spec.topology),
-                    vertices: 6,
-                    instances: 2,
-                    stream: Some(&ibuf),
-                }),
-            },
-            &scratch,
-            srgb_row,
-        )
-        .expect("bg -> offscreen");
-
-        ffi::draw_and_read(
-            queue,
-            &ffi::Pass {
-                pso: &blit_pso,
-                dst: frame.texture(),
-                dst_w: W,
-                dst_h: H,
-                load: ffi::LoadAction::Clear(ffi::ClearColor {
-                    r: 0.0,
-                    g: 0.0,
-                    b: 0.0,
-                    a: 1.0,
-                }),
-                viewport: None,
-                scissor: None,
-                src_tex: Some((&offscreen, blit_spec.binds.fragment_textures[0] as usize)),
-                sampler: Some((&sampler, blit_spec.binds.fragment_samplers[0] as usize)),
-                uniform: Some((&blit_ubuf, blit_spec.binds.fragment_buffers[0] as usize)),
-                vertex_uniform: None,
-                draw: None,
-            },
-            &readback,
-            f16_row,
-        )
-        .expect("blit -> the f16 drawable");
-
-        // Every texel decoded from binary16: the passthrough blit writes the
-        // offscreen's bytes as b/255.
-        // SAFETY: shared storage, written before draw_and_read returned.
-        let got = unsafe { ffi::buffer_bytes(&readback, f16_row * H) };
-        let halves: Vec<u16> = got
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|b| u16::from_le_bytes(*b))
-            .collect();
-        for (i, texel) in halves.as_chunks::<4>().0.iter().enumerate() {
-            let (px, py) = (i % W, i / W);
-            let want_rgba = if px < 8 && py < 8 {
-                C0
-            } else if px >= 8 && py >= 8 {
-                C1
-            } else {
-                [0, 0, 0, 255]
-            };
-            for (c, (&half, &byte)) in texel.iter().zip(&want_rgba).enumerate() {
-                let got_f = f16_to_f32(half);
-                let want_f = f32::from(byte) / 255.0;
-                assert!(
-                    (got_f - want_f).abs() <= 2.0 / 255.0,
-                    "texel ({px},{py}) channel {c}: got {got_f} want ~{want_f} — \
-                     the f16 present must carry the offscreen's bytes linearly"
-                );
-            }
-        }
-
-        let outcome = frame.present(&session).expect("EDR present").wait_outcome();
-        assert_eq!(outcome, CbOutcome::Completed, "the f16 present completes");
-        assert!(!latch.is_lost());
-    }
     /// One present ticket feeds the latch exactly once across wait and poll,
     /// however mixed; the injection seam stays uncached. Twin of the encoder's
     /// test.
@@ -3111,7 +2132,7 @@ mod tests {
         // SAFETY: a scalar object-property read on the independently retained
         // child. The result is compared, never dereferenced or released here.
         let parent_of = || unsafe {
-            let get: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+            let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             get(child.id(), sel(c"superlayer"))
         };
         assert_eq!(

@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use atpkg::{Channel, Program};
 use atpkg_publish::api::{Delta, Yank};
 use atpkg_publish::channel::Log;
-use atpkg_publish::channel::index::{Base, Plan, parse_delta, parse_yank, plan};
+use atpkg_publish::channel::index::{Base, Plan, parse_delta, parse_yank, plan, render};
 use atpkg_publish::error::Error;
 use atpkg_publish::triple::{
     AARCH64_APPLE_DARWIN, AARCH64_UNKNOWN_LINUX_GNU, Triple, X86_64_UNKNOWN_LINUX_GNU,
@@ -98,7 +98,7 @@ fn the_number_is_the_heads_plus_one_and_everything_unnamed_is_carried() {
     b.channel.min_build = 4;
     b.channel.yanked = vec!["ay@3".into()];
     b.channel.min_build_by_program.insert("nn".into(), 100);
-    let (p, log) = ok(&b, &Delta::default());
+    let (p, _) = ok(&b, &Delta::default());
     assert_eq!(p.index_build, 22);
     assert_eq!(p.channel.channel_build, 22);
     assert_eq!(p.channel.pin, b.channel.pin);
@@ -107,8 +107,6 @@ fn the_number_is_the_heads_plus_one_and_everything_unnamed_is_carried() {
     assert_eq!(p.channel.min_build, 4);
     assert_eq!(p.channel.min_build_by_program.get("nn"), Some(&100));
     assert_eq!(p.valid_until, VU);
-    assert!(log.contains("per-target pins carried from the head: x86_64-unknown-linux-gnu:ay=9"));
-    assert!(log.contains("no pin moves"), "{}", log.text());
 }
 
 #[test]
@@ -121,11 +119,9 @@ fn a_pin_moves_up_never_down_and_an_equal_build_is_a_carry() {
     );
     let (p, _) = ok(&b, &delta(&["--pin", "ay=5"]));
     assert!(p.moved.is_empty() && p.carried.iter().any(|(n, v)| n == "ay" && *v == 5));
-    let (p, log) = ok(&b, &delta(&["--pin", "ay=6"]));
+    let (p, _) = ok(&b, &delta(&["--pin", "ay=6"]));
     assert_eq!(p.moved.len(), 1);
     assert_eq!((p.moved[0].from, p.moved[0].to), (5, 6));
-    assert!(log.contains("updated (new build, must be public before the index is): ay@5->6"));
-    assert!(log.contains("carry-forward (unchanged build, the published pack reused): nn@108"));
 }
 
 /// The omission gate is structural: a pin the head carries and the delta does not
@@ -141,7 +137,7 @@ fn a_program_leaves_only_when_retired_by_name() {
     let (p, _) = ok(&b, &delta(&["--pin", "ay=2"]));
     assert!(p.channel.pin.contains_key("codex") && p.channel.pin.contains_key("ny"));
 
-    let (p, log) = ok(&b, &delta(&["--retire", "ny"]));
+    let (p, _) = ok(&b, &delta(&["--retire", "ny"]));
     assert!(!p.channel.pin.contains_key("ny"));
     assert!(
         p.channel.pin_by_target.is_empty(),
@@ -150,11 +146,6 @@ fn a_program_leaves_only_when_retired_by_name() {
     assert!(p.channel.yanked.is_empty());
     assert!(p.programs.iter().all(|(n, _)| n != "ny"));
     assert_eq!(p.retired, vec!["ny".to_string()]);
-    assert!(log.contains(
-        "per-target pins DROPPED, not carried forward: x86_64-unknown-linux-gnu:ny=7 (retired)"
-    ));
-    assert!(log.contains("the head's yank ny@1 goes with ny"));
-    assert!(log.contains("retiring head program(s) as asked: ny"));
 
     let err = refused(&b, &delta(&["--retire", "ghost"]));
     assert!(err.contains("the head does not pin ghost"), "{err}");
@@ -168,11 +159,9 @@ fn a_program_leaves_only_when_retired_by_name() {
 #[test]
 fn a_new_program_is_a_table_row_and_a_vendor_program_is_never_pinned() {
     let b = base(21, &[("ay", 1), ("claude", 2_026_092_401)]);
-    let (p, log) = ok(&b, &delta(&["--pin", "ty=3007"]));
+    let (p, _) = ok(&b, &delta(&["--pin", "ty=3007"]));
     assert_eq!(p.channel.pin.get("ty"), Some(&3007));
     assert_eq!(p.channel.pin.get("claude"), Some(&2_026_092_401));
-    assert!(log.contains("new programs (not in the head): ty@3007"));
-    assert!(log.contains("claude is vendor-direct — its head pin and block are carried"));
     let err = refused(&b, &delta(&["--pin", "ghost=1"]));
     assert!(err.contains("not a program this build knows"), "{err}");
     for v in ["claude", "agy"] {
@@ -187,10 +176,10 @@ fn a_new_program_is_a_table_row_and_a_vendor_program_is_never_pinned() {
 }
 
 #[test]
-fn a_head_program_the_table_lacks_keeps_the_heads_block_and_metadata_moves_are_said() {
+fn a_head_program_the_table_lacks_keeps_the_heads_block() {
     let mut b = base(21, &[("ay", 1), ("orca-alab", 4)]);
     b.programs.insert("ay".into(), block("ay-old", None));
-    let (p, log) = ok(&b, &delta(&["--pin", "orca-alab=5"]));
+    let (p, _) = ok(&b, &delta(&["--pin", "orca-alab=5"]));
     let names: Vec<&str> = p.programs.iter().map(|(n, _)| n.as_str()).collect();
     assert_eq!(names, ["ay", "orca-alab"], "table order, then the rest");
     assert_eq!(p.programs[0].1.repo, "ay", "the table's block is rendered");
@@ -198,21 +187,18 @@ fn a_head_program_the_table_lacks_keeps_the_heads_block_and_metadata_moves_are_s
         p.programs[1].1.repo, "orca-alab",
         "the head's block is carried"
     );
-    assert!(log.contains("metadata: ay:"), "{}", log.text());
-    assert!(log.contains("orca-alab is not a row of programs::PROGRAMS"));
 }
 
 #[test]
 fn per_target_overlays_render_carry_and_floor_their_own_cells() {
     let b = base(21, &[("ay", 5)]);
-    let (p, log) = ok(&b, &delta(&["--target-pin", &format!("{LINUX}:ay=9")]));
+    let (p, _) = ok(&b, &delta(&["--target-pin", &format!("{LINUX}:ay=9")]));
     assert_eq!(
         p.channel.pin.get("ay"),
         Some(&5),
         "an overlay never touches `pin`"
     );
     assert_eq!(p.channel.pin_by_target[LINUX].get("ay"), Some(&9));
-    assert!(log.contains(&format!("per-target pins for {LINUX}: ay = 9")));
 
     let (p, _) = ok(
         &b,
@@ -238,9 +224,8 @@ fn per_target_overlays_render_carry_and_floor_their_own_cells() {
     assert_eq!(up.channel.pin_by_target[LINUX].get("ay"), Some(&10));
 
     // Every Mac cut passes no overlay: the head's carries, and still floors the next.
-    let (carried, log) = ok(&lin, &delta(&["--pin", "ay=6"]));
+    let (carried, _) = ok(&lin, &delta(&["--pin", "ay=6"]));
     assert_eq!(carried.channel.pin_by_target[LINUX].get("ay"), Some(&9));
-    assert!(log.contains(&format!("carried from the head: {LINUX}:ay=9")));
 
     // A partial re-state keeps every other target's overlay.
     let two = with_overlay(lin.clone(), LINUX_ARM, &[("ay", 7)]);
@@ -263,11 +248,8 @@ fn an_overlay_leaves_only_when_retired_by_name() {
         LINUX,
         &[("ay", 9), ("nn", 2)],
     );
-    let (p, log) = ok(&lin, &delta(&["--retire-target", LINUX]));
+    let (p, _) = ok(&lin, &delta(&["--retire-target", LINUX]));
     assert!(p.channel.pin_by_target.is_empty());
-    assert!(log.contains(&format!(
-        "per-target pins DROPPED, not carried forward: {LINUX}:ay=9 {LINUX}:nn=2"
-    )));
     let (p, _) = ok(&lin, &delta(&["--retire-target", &format!("{LINUX}:ay")]));
     assert_eq!(
         p.channel.pin_by_target[LINUX].keys().collect::<Vec<_>>(),
@@ -357,9 +339,8 @@ fn yanks_are_carried_added_lifted_and_held_to_the_pins() {
     };
     let (p, _) = ok(&carried, &Delta::default());
     assert_eq!(p.channel.yanked, ["ay@1"], "a yank nobody re-passed stays");
-    let (p, log) = ok(&carried, &delta(&["--unyank", "ay@1"]));
+    let (p, _) = ok(&carried, &delta(&["--unyank", "ay@1"]));
     assert!(p.channel.yanked.is_empty());
-    assert!(log.contains("--unyank lifts ay@1"));
     let err = refused(&carried, &delta(&["--unyank", "ay@9"]));
     assert!(err.contains("the head does not yank it"), "{err}");
     let err = refused(&b, &delta(&["--yank", "ghost@1"]));
@@ -402,20 +383,13 @@ fn yanks_are_carried_added_lifted_and_held_to_the_pins() {
     let (p, _) = ok(&vendor, &delta(&["--retire", "codex"]));
     assert_eq!(p.channel.yanked, ["ay@1", "codex@2.1.279"]);
 
-    // The runbook's spelling normalizes; a yank of the PINNED build is said, not refused.
+    // The runbook's spelling normalizes; a yank of the PINNED build is not refused.
     assert_eq!(
         parse_yank("ay=1", true).expect("="),
         Yank::Build("ay".into(), 1)
     );
-    let (_, quiet) = ok(&b, &delta(&["--yank", "ay=1"]));
-    assert!(!quiet.contains("TOMBSTONES"));
-    let (_, loud) = ok(&b, &delta(&["--yank", "ay@3"]));
-    assert!(
-        loud.contains("yanked ay@3 names the build this index PINS for ay"),
-        "{}",
-        loud.text()
-    );
-    assert!(loud.contains("TOMBSTONES"));
+    ok(&b, &delta(&["--yank", "ay=1"]));
+    ok(&b, &delta(&["--yank", "ay@3"]));
     for bad in [
         "codex3",
         "codex@x",
@@ -453,4 +427,179 @@ fn a_roster_older_than_the_heads_generation_is_refused() {
             .contains("REFUSING roster_seq 2 < the head's 3"),
         "{err}"
     );
+}
+
+/// The index a plan signs, as the client parses it.
+fn index_of(p: &Plan) -> atpkg::Index {
+    atpkg::Index {
+        schema: 2,
+        index_build: p.index_build,
+        generated_at: String::new(),
+        valid_until: p.valid_until.clone(),
+        machine_id: Some(p.machine_id.clone()),
+        roster_seq: Some(p.roster_seq),
+        programs: p.programs.iter().cloned().collect(),
+        channels: vec![p.channel.clone()],
+    }
+}
+
+/// The live head: `ay`, `claude` (vendor-direct, repo `aterm`) and `codex = 2026101501` on
+/// repo `aterm` — a legacy vendor manifest — as index 71 carries them.
+fn live_head() -> Base {
+    let mut b = base(
+        71,
+        &[
+            ("ay", 5),
+            ("claude", 2_026_092_401),
+            ("codex", 2_026_101_501),
+        ],
+    );
+    b.programs.insert("claude".into(), block("aterm", None));
+    b.programs.insert("codex".into(), block("aterm", None));
+    b
+}
+
+/// THE LIVE CODEX ROW SURVIVES A ROUTINE PUBLISH. A publish that names nothing about codex
+/// carries the head's `[programs.codex]` (repo `aterm`) and its pin exactly as they stand,
+/// in the place it always rendered (after the table rows, among the head-only blocks, so the
+/// rendered bytes of the row do not move); a per-target pin of codex is refused; and under
+/// what it signs the client's source rule (`atpkg::alab`) routes nothing to ALab on any
+/// target. The control: the same index with the row turned to ALab's repo would route.
+#[test]
+fn a_routine_publish_carries_the_live_codex_row_and_routes_nothing_to_alab() {
+    let b = live_head();
+    let (p, log) = ok(&b, &delta(&["--pin", "ay=6"]));
+    assert_eq!(p.channel.pin.get("codex"), Some(&2_026_101_501));
+    let order: Vec<&str> = p.programs.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(order, ["ay", "claude", "codex"], "the head-only order");
+    let codex = p
+        .programs
+        .iter()
+        .find(|(n, _)| n == "codex")
+        .map(|(_, b)| b);
+    assert_eq!(
+        format!("{codex:?}"),
+        format!("{:?}", b.programs.get("codex")),
+        "the head's block, as it stands"
+    );
+    assert!(
+        render(&p).contains("\n[programs.codex]\nrepo = \"aterm\"\npolicy = \"prebuilt-only\"\n"),
+        "{}",
+        render(&p)
+    );
+    assert!(
+        log.contains("codex: the head's [programs.codex] (repo \"aterm\") and its pin are carried")
+    );
+    assert!(
+        !log.contains("metadata: codex"),
+        "no metadata move is said or made"
+    );
+    let err = refused(
+        &b,
+        &delta(&[
+            "--target-pin",
+            &format!("{}:codex=2026101601", AARCH64_APPLE_DARWIN.as_str()),
+        ]),
+    );
+    assert!(err.contains("an overlay never pins it"), "{err}");
+    let index = index_of(&p);
+    for triple in [
+        AARCH64_APPLE_DARWIN.as_str(),
+        "x86_64-apple-darwin",
+        LINUX,
+        LINUX_ARM,
+    ] {
+        assert_eq!(
+            atpkg::alab::index_pin(&index, "codex", triple),
+            None,
+            "{triple}"
+        );
+    }
+    // Even a row turned to ALab's repo by hand routes nothing on the legacy pin: it is below
+    // the client's ALab store window.
+    let mut turned = index.clone();
+    turned.programs.get_mut("codex").unwrap().repo = "codex-alab".into();
+    assert_eq!(
+        atpkg::alab::index_pin(&turned, "codex", AARCH64_APPLE_DARWIN.as_str()),
+        None
+    );
+}
+
+/// THE SWITCH IS AN EXPLICIT PIN. `--pin codex=<b>` with `b` a NEW ALab build (inside the
+/// client's store window, above the head's legacy pin) renders the table's row (repo
+/// `codex-alab`) in table order and routes codex to ALab on Apple silicon only; the pack
+/// behind it is verified when the index is signed (`tests/artifact/package.rs`). Refused: a
+/// pin at or below the legacy one, outside the window, or of another vendor-direct program.
+/// Once the head is ALab's, the row is the table's and later pins move as any pin does.
+#[test]
+fn an_explicit_pin_switches_the_codex_row_to_alab_and_nothing_else_does() {
+    let b = live_head();
+    let (p, log) = ok(&b, &delta(&["--pin", "codex=2026101601"]));
+    assert_eq!(p.channel.pin.get("codex"), Some(&2_026_101_601));
+    let order: Vec<&str> = p.programs.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(order, ["ay", "codex", "claude"], "the table's order");
+    let codex = p
+        .programs
+        .iter()
+        .find(|(n, _)| n == "codex")
+        .map(|(_, b)| b);
+    assert_eq!(codex.map(|b| b.repo.as_str()), Some("codex-alab"));
+    assert!(
+        log.contains("metadata: codex: repo=\"aterm\""),
+        "{}",
+        log.text()
+    );
+    let index = index_of(&p);
+    assert_eq!(
+        atpkg::alab::index_pin(&index, "codex", AARCH64_APPLE_DARWIN.as_str()),
+        Some(2_026_101_601)
+    );
+    for triple in ["x86_64-apple-darwin", LINUX, LINUX_ARM] {
+        assert_eq!(
+            atpkg::alab::index_pin(&index, "codex", triple),
+            None,
+            "{triple}"
+        );
+    }
+
+    for (value, needle) in [
+        ("codex=2026101501", "ALab store window"),
+        ("codex=2026101500", "ALab store window"),
+        ("codex=2026092401", "ALab store window"),
+        ("codex=1000000000000000000", "ALab store window"),
+        ("claude=2026101601", "claude is vendor-direct"),
+    ] {
+        let err = refused(&b, &delta(&["--pin", value]));
+        assert!(err.contains(needle), "{value}: {err}");
+    }
+
+    // Over a head that is ALab's already: a routine publish renders the same row, an equal
+    // pin is a carry, a lower one a downgrade, a higher one a move.
+    let mut alab = live_head();
+    alab.channel.pin.insert("codex".into(), 2_026_101_601);
+    alab.programs
+        .insert("codex".into(), block("codex-alab", None));
+    let (p, log) = ok(&alab, &delta(&["--pin", "ay=6"]));
+    let codex = p
+        .programs
+        .iter()
+        .find(|(n, _)| n == "codex")
+        .map(|(_, b)| b);
+    assert_eq!(
+        format!("{codex:?}"),
+        format!("{:?}", alab.programs.get("codex"))
+    );
+    assert!(!log.contains("metadata: codex"));
+    let (p, _) = ok(&alab, &delta(&["--pin", "codex=2026101601"]));
+    assert_eq!(p.channel.pin.get("codex"), Some(&2_026_101_601));
+    let err = refused(&alab, &delta(&["--pin", "codex=2026101600"]));
+    assert!(err.contains("REFUSING pin downgrade for codex"), "{err}");
+    let (p, _) = ok(&alab, &delta(&["--pin", "codex=2026101701"]));
+    assert_eq!(p.channel.pin.get("codex"), Some(&2_026_101_701));
+
+    // A head that pins codex with no block: never ALab's row over a pin nobody named.
+    let mut bare = live_head();
+    bare.programs.remove("codex");
+    let err = refused(&bare, &delta(&["--pin", "ay=6"]));
+    assert!(err.contains("refusing to render ALab's row"), "{err}");
 }

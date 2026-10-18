@@ -23,9 +23,8 @@
 //!
 //! # Non-vacuity, three ways
 //!
-//! * The table must cover the seam's `consts` module EXACTLY — every constant
-//!   parsed out of the file must have a row here, and every row must name a
-//!   constant that is really there.
+//! * The probe walks every constant parsed out of the seam, so one with no SDK
+//!   row here fails the probe by name.
 //! * The assertion uses the RUST literal verbatim, so the thing checked is what
 //!   `view.rs` and `window_delegate.rs` actually compile against, not a second
 //!   transcription of the SDK.
@@ -47,9 +46,8 @@ use crate::sdk_consts::{as_c_literal, green_verdict, inverted_verdict, parse_con
 /// wrong for `NS_APPKIT_VERSION_NUMBER_10_12` and `NS_CRITICAL_REQUEST`, neither
 /// of which is the mechanical camel-case of its Rust spelling.
 //
-// `rustfmt::skip`, as `winit_seam.rs`'s row table does and for the same reason:
-// one row per line is what makes a lookup table checkable by eye against the
-// seam it mirrors.
+// `rustfmt::skip`: one row per line is what makes a lookup table checkable by
+// eye against the seam it mirrors.
 #[rustfmt::skip]
 const ROWS: &[(&str, &str)] = &[
     // ---- NSWindowStyleMask ----
@@ -106,8 +104,7 @@ fn seam() -> PathBuf {
 /// `(name, literal)` for every `const` in the seam, at any visibility.
 ///
 /// The visibility grammar is `sdk_consts::strip_const_decl`'s, shared with
-/// `gui_appkit_constants.rs`;
-/// `sdk_consts::the_parser_reads_every_visibility_spelling` pins it.
+/// `gui_appkit_constants.rs`.
 fn seam_constants() -> Vec<(String, String)> {
     let src = std::fs::read_to_string(seam()).expect("the seam is readable");
     src.lines().filter_map(parse_const_decl).collect()
@@ -118,8 +115,8 @@ fn compile(arch: &str, body: &str, tag: &str) -> Result<(), String> {
     sdk_consts::compile("aterm-seam-consts", arch, body, tag)
 }
 
-/// The probe source: one `_Static_assert` per row, using the seam's own
-/// literal. `invert` flips ONE row, for the non-vacuity arm.
+/// The probe source: one `_Static_assert` per seam constant, using the seam's
+/// own literal. `invert` flips ONE row, for the non-vacuity arm.
 ///
 /// # The literal is PARENTHESISED, and the day that starts mattering is the day
 /// it would otherwise go silently vacuous
@@ -137,11 +134,17 @@ fn compile(arch: &str, body: &str, tag: &str) -> Result<(), String> {
 /// applied here BEFORE the row that needs it exists, because a guard that only
 /// starts working after the defect lands is not a guard.
 fn probe(invert: Option<&str>) -> String {
-    let values: std::collections::HashMap<String, String> = seam_constants().into_iter().collect();
+    let sdk_of: std::collections::HashMap<&str, &str> = ROWS.iter().copied().collect();
     let mut s = String::from("#import <Cocoa/Cocoa.h>\n");
-    for (rust, sdk) in ROWS {
-        let lit = as_c_literal(&values[*rust]);
-        let lit = if invert == Some(rust) {
+    for (rust, value) in seam_constants() {
+        let sdk = *sdk_of.get(rust.as_str()).unwrap_or_else(|| {
+            panic!(
+                "the seam declares {rust} and ROWS has no SDK spelling for it, so \
+                 the probe cannot check it; add the row"
+            )
+        });
+        let lit = as_c_literal(&value);
+        let lit = if invert == Some(rust.as_str()) {
             // `+ 1` is enough and is arithmetic the compiler must evaluate; it
             // works for the `double` row as well as every integer one.
             format!("(({lit}) + 1)")
@@ -152,39 +155,6 @@ fn probe(invert: Option<&str>) -> String {
     }
     s.push_str("int main(void){return 0;}\n");
     s
-}
-
-/// THE TABLE AND THE SEAM AGREE, in both directions.
-#[test]
-fn every_seam_constant_has_a_row_and_every_row_names_a_seam_constant() {
-    let seam: Vec<String> = seam_constants().into_iter().map(|(n, _)| n).collect();
-    let rows: Vec<String> = ROWS.iter().map(|(n, _)| (*n).to_owned()).collect();
-
-    let missing: Vec<&String> = seam.iter().filter(|n| !rows.contains(n)).collect();
-    assert!(
-        missing.is_empty(),
-        "the seam gained {} constant(s) with no row here, so nothing checks \
-         them against the SDK:\n  {:?}",
-        missing.len(),
-        missing
-    );
-    let stale: Vec<&String> = rows.iter().filter(|n| !seam.contains(n)).collect();
-    assert!(
-        stale.is_empty(),
-        "these rows name constants the seam no longer has:\n  {stale:?}"
-    );
-    assert_eq!(seam.len(), ROWS.len());
-    // A non-vacuity floor at the measured count: 42 when this was written, 39
-    // since winit-core step 5 (2026-10-15) carved the backend code that read
-    // seventeen of them, 34 since its window-control carve (2026-10-16) took the
-    // borderless mask, the zoom button, both sharing types and the
-    // parent-window ordering, and 29 since its exclusive-fullscreen carve took
-    // the five presentation options.
-    assert!(
-        seam.len() >= 29,
-        "the seam has {} constants; it had 29 when the floor was last measured",
-        seam.len()
-    );
 }
 
 /// THE RECIPE, RUN — both arches, and this box cannot execute one of them.

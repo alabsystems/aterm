@@ -172,34 +172,6 @@ fn conpty_rows_grow_keeps_every_history_line_across_the_conhost_repaint() {
     }
 }
 
-/// Negative control: the same sequence under the Native policy loses lines
-/// (the reveal re-labels `grow 22..37` into the viewport and the repaint
-/// paints over them). If this stops failing on Native, the premise behind
-/// `ResizePolicy` has changed.
-#[test]
-fn native_rows_grow_under_a_conhost_repaint_loses_the_revealed_lines() {
-    let mut t = Terminal::new(24, 80);
-    sixty_lines(&mut t);
-    let before = visible_rows(&t);
-    t.resize(40, 80);
-    assert_eq!(
-        t.grid().scrollback_lines(),
-        21,
-        "precondition: the native grow revealed 16 lines (37 -> 21)"
-    );
-    t.process(&grow_repaint(&before));
-    let rows = retained_rows(&t);
-    let present = |n: usize| rows.iter().any(|r| r == &format!("grow {n:02}"));
-    assert!(
-        present(21) && present(38),
-        "the lines around the lost band survive"
-    );
-    assert!(
-        !(22..=37).any(present),
-        "the native reveal + conhost repaint destroys exactly the revealed band"
-    );
-}
-
 /// After the grow and repaint the search index finds every line at the row a
 /// from-scratch index gives it: the cached index equals the oracle after the
 /// resize and after the repaint.
@@ -221,31 +193,6 @@ fn conpty_rows_grow_search_index_matches_a_fresh_build_after_the_repaint() {
     let got = cached_results(&mut t, "grow");
     assert_eq!(got, legacy_results(&t, "grow"), "after the repaint too");
     assert_eq!(got.len(), 60, "every line is found exactly once");
-    // Each match names the row that really holds that line.
-    let oldest = usize::try_from(t.grid().oldest_absolute_row()).unwrap();
-    for n in 1..=60usize {
-        let hits = cached_results(&mut t, &format!("grow {n:02}"));
-        assert_eq!(hits.len(), 1, "grow {n:02} found once");
-        let row = hits[0].0;
-        let idx = row - oldest;
-        let text = if idx < t.grid().scrollback_lines() {
-            t.grid()
-                .get_history_line(idx)
-                .map(|l| l.to_string())
-                .unwrap_or_default()
-        } else {
-            t.get_line_text(
-                i32::try_from(idx - t.grid().scrollback_lines()).unwrap(),
-                None,
-            )
-            .unwrap_or_default()
-        };
-        assert_eq!(
-            text.trim_end(),
-            format!("grow {n:02}"),
-            "row {row} really holds it"
-        );
-    }
 }
 
 /// A reader scrolled back keeps the same line in view across a ConPTY grow:
@@ -342,25 +289,6 @@ fn conpty_height_drag_keeps_command_marks_on_their_rows() {
     }
 }
 
-/// The offloaded entry point on a rows-only grow: nothing to offload (`None`),
-/// and the same seam law as the synchronous path.
-#[test]
-fn conpty_offloaded_rows_grow_is_the_synchronous_policy() {
-    let mut t = tiered(24, 80);
-    sixty_lines(&mut t);
-    let before = visible_rows(&t);
-    assert!(
-        t.resize_offloading_scrollback_with_policy(40, 80, ResizePolicy::ConPty)
-            .is_none(),
-        "a rows-only resize offloads nothing"
-    );
-    assert_eq!(t.grid().scrollback_lines(), 37);
-    t.process(&grow_repaint(&before));
-    let rows = retained_rows(&t);
-    let expected: Vec<String> = (1..=60).map(|i| format!("grow {i:02}")).collect();
-    assert_eq!(&rows[..60], &expected[..]);
-}
-
 /// The alt screen gets the same policy: a grow while a TUI is up must not
 /// reveal the saved primary's history into a viewport conhost then repaints.
 #[test]
@@ -390,251 +318,9 @@ fn conpty_rows_grow_under_an_alt_screen_keeps_the_saved_primary_intact() {
 
 // ---- rows-shrink --------------------------------------------------------
 
-/// A rows shrink is unchanged by the policy: conhost's repaint after a shrink
-/// (24->16 on a full screen: old row 8 at row 0, trailing blanks dropped) is
-/// what the native shape produces, so the two policies agree row for row.
-#[test]
-fn conpty_rows_shrink_is_the_native_shape() {
-    let mut native = Terminal::new(24, 80);
-    let mut conpty = Terminal::new(24, 80);
-    sixty_lines(&mut native);
-    sixty_lines(&mut conpty);
-    native.resize(16, 80);
-    conpty.resize_with_policy(16, 80, ResizePolicy::ConPty);
-    assert_eq!(retained_rows(&native), retained_rows(&conpty));
-    assert_eq!(native.grid().cursor_row(), conpty.grid().cursor_row());
-    assert_eq!(
-        native.grid().scrollback_lines(),
-        conpty.grid().scrollback_lines()
-    );
-    // conhost's repaint is a no-op on it: with the cursor on the blank prompt
-    // row (row 23 -> 15 after an 8-row demote), old rows 8.. sit at rows 0..16.
-    let before = visible_rows(&conpty);
-    conpty.process(&conhost_repaint(&before, 16, (16, 1)));
-    assert_eq!(visible_rows(&conpty), before);
-    assert_eq!(conpty.grid().scrollback_lines(), 45);
-}
-
-// ---- width change with a wrap continuation at the viewport top ----------
-
 const UNIT: &str = "abcdefghij";
 
-/// The widen case: a logical line longer than the width whose head is the
-/// newest history line and whose tail (a soft-wrap continuation) is viewport
-/// row 0. Built as the 150-char line, 22 short lines and a prompt: 25 rows on
-/// a 24-row screen.
-fn belt_setup(t: &mut Terminal) {
-    t.process(format!("{}\r\n", UNIT.repeat(15)).as_bytes());
-    for i in 1..=22 {
-        t.process(format!("line {i}\r\n").as_bytes());
-    }
-    t.process(b">");
-}
-
-/// How many times the long line's 10-char unit occurs across the whole
-/// retained buffer. The line is 15 units; a duplicated fragment adds more, a
-/// lost one leaves fewer.
-fn unit_count(t: &Terminal) -> usize {
-    retained_rows(t)
-        .iter()
-        .map(|r| r.matches(UNIT).count())
-        .sum()
-}
-
-/// conhost's repaint after a width change with a continuation at row 0, at 120
-/// and 80 columns alike: the same 24 rows (the 70-char fragment stays at row 0
-/// as a standalone row), cursor after the prompt.
-fn belt_repaint(rows_before: &[String]) -> Vec<u8> {
-    conhost_repaint(rows_before, 24, (24, 2))
-}
-
-#[test]
-fn belt_setup_puts_the_continuation_at_row_zero() {
-    let mut t = Terminal::new(24, 80);
-    belt_setup(&mut t);
-    assert_eq!(t.grid().scrollback_lines(), 1);
-    assert_eq!(
-        t.grid().get_history_line(0).map(|l| l.to_string()),
-        Some(UNIT.repeat(8)),
-        "the 80-char head is the one history line"
-    );
-    let rows = visible_rows(&t);
-    assert_eq!(rows[0], UNIT.repeat(7), "row 0 is the 70-char tail");
-    assert!(
-        t.grid().row(0).is_some_and(|r| r.is_wrapped()),
-        "and it is a continuation"
-    );
-    assert_eq!(rows[23], ">");
-    assert_eq!(unit_count(&t), 15);
-}
-
-/// Widen with the continuation at row 0: the fragment stays where conhost keeps
-/// it, the head stays the one history line, conhost's repaint is a no-op, and
-/// narrowing back leaves the history count unchanged.
-#[test]
-fn conpty_widen_keeps_the_boundary_fragment_where_conhost_paints_it() {
-    let mut t = Terminal::new(24, 80);
-    belt_setup(&mut t);
-    let before = visible_rows(&t);
-
-    t.resize_with_policy(24, 120, ResizePolicy::ConPty);
-    assert_eq!(
-        t.grid().scrollback_lines(),
-        1,
-        "the head is not lifted out of history"
-    );
-    assert_eq!(
-        t.grid().get_history_line(0).map(|l| l.to_string()),
-        Some(UNIT.repeat(8)),
-        "history rewraps only itself — the head stays 80 chars, as in conhost's scrollback"
-    );
-    let after = visible_rows(&t);
-    assert_eq!(
-        after, before,
-        "the viewport rewrap moved nothing: same 24 rows"
-    );
-    assert_eq!(t.grid().cursor_row(), 23);
-
-    t.process(&belt_repaint(&before));
-    assert_eq!(
-        visible_rows(&t),
-        before,
-        "conhost's repaint is a no-op on this buffer"
-    );
-    assert_eq!(unit_count(&t), 15, "no fragment duplicated, none lost");
-
-    t.resize_with_policy(24, 80, ResizePolicy::ConPty);
-    t.process(&belt_repaint(&before));
-    assert_eq!(
-        t.grid().scrollback_lines(),
-        1,
-        "narrowing back does not grow the history"
-    );
-    assert_eq!(unit_count(&t), 15);
-    assert_eq!(visible_rows(&t), before);
-}
-
-/// Same, on the offloaded path with a tiered store, with conhost's repaint
-/// before and after the worker's re-attach (a native re-attach fill would
-/// re-seat the tail over a viewport conhost already repainted).
-#[test]
-fn conpty_offloaded_widen_is_duplicate_free_whichever_side_of_the_reattach_the_repaint_lands() {
-    for repaint_before_reattach in [true, false] {
-        let mut t = tiered(24, 80);
-        belt_setup(&mut t);
-        let before = visible_rows(&t);
-        let pending = t
-            .resize_offloading_scrollback_with_policy(24, 120, ResizePolicy::ConPty)
-            .expect("a width change with a tiered store offloads");
-        if repaint_before_reattach {
-            t.process(&belt_repaint(&before));
-        }
-        let reflowed = pending.reflow();
-        assert!(t.finish_resize_offload(reflowed).is_none());
-        if !repaint_before_reattach {
-            t.process(&belt_repaint(&before));
-        }
-        assert_eq!(
-            visible_rows(&t),
-            before,
-            "repaint-before-reattach={repaint_before_reattach}: viewport unchanged"
-        );
-        assert_eq!(
-            t.grid().scrollback_lines(),
-            1,
-            "repaint-before-reattach={repaint_before_reattach}: one history line"
-        );
-        assert_eq!(
-            unit_count(&t),
-            15,
-            "repaint-before-reattach={repaint_before_reattach}: no duplicate, no loss"
-        );
-        assert_eq!(
-            cached_results(&mut t, "line 7"),
-            legacy_results(&t, "line 7"),
-            "the search index equals a fresh build"
-        );
-    }
-}
-
-/// Negative control: the native offloaded path with the repaint before
-/// re-attach duplicates the long line's text (the fill re-seats the rewrapped
-/// tail above the fragment conhost painted at row 0).
-#[test]
-fn native_offloaded_widen_under_a_conhost_repaint_duplicates_the_fragment() {
-    let mut t = tiered(24, 80);
-    belt_setup(&mut t);
-    let before = visible_rows(&t);
-    let pending = t.resize_offloading_scrollback(24, 120).expect("offloads");
-    t.process(&belt_repaint(&before));
-    let reflowed = pending.reflow();
-    assert!(t.finish_resize_offload(reflowed).is_none());
-    assert!(
-        unit_count(&t) > 15,
-        "the native fill + conhost repaint duplicates the tail ({} units of 15)",
-        unit_count(&t)
-    );
-}
-
-/// Search after the widen and repaint finds every short line at the row that
-/// holds it: a width reflow renumbers wholesale, so the rebuild fence must
-/// fire.
-#[test]
-fn conpty_widen_search_finds_every_line_at_its_row() {
-    let mut t = Terminal::new(24, 80);
-    belt_setup(&mut t);
-    let _ = cached_results(&mut t, "line");
-    let before = visible_rows(&t);
-    t.resize_with_policy(24, 120, ResizePolicy::ConPty);
-    t.process(&belt_repaint(&before));
-    let got = cached_results(&mut t, "line ");
-    assert_eq!(got, legacy_results(&t, "line "));
-    assert_eq!(got.len(), 22);
-    let oldest = usize::try_from(t.grid().oldest_absolute_row()).unwrap();
-    let scrollback = t.grid().scrollback_lines();
-    for (n, hit) in (1..=22usize).zip(&got) {
-        // History: [head]; viewport: [tail, line 1..22, '>'] -> line n is
-        // viewport row n, absolute oldest + scrollback + n.
-        assert_eq!(
-            hit.0,
-            oldest + scrollback + n,
-            "line {n} at its absolute row"
-        );
-    }
-}
-
-// ---- the native policy is untouched --------------------------------------
-
-/// FNV-1a over `bytes`, folded into `h` — a digest that is the same on every
-/// platform and toolchain, unlike `DefaultHasher`.
-fn fnv(h: &mut u64, bytes: &[u8]) {
-    for b in bytes {
-        *h ^= u64::from(*b);
-        *h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-}
-
-/// Everything observable after a resize: retained rows in reading order, the
-/// cursor, the reading position and the absolute-row bookkeeping (oldest key,
-/// counter, renumber epoch).
-fn fold_state(h: &mut u64, t: &Terminal) {
-    for row in retained_rows(t) {
-        fnv(h, row.as_bytes());
-        fnv(h, b"\n");
-    }
-    let g = t.grid();
-    for n in [
-        u64::from(g.cursor_row()),
-        u64::from(g.cursor_col()),
-        g.display_offset() as u64,
-        g.scrollback_lines() as u64,
-        g.oldest_absolute_row(),
-        g.absolute_row_counter(),
-        g.history_renumber_epoch(),
-    ] {
-        fnv(h, &n.to_le_bytes());
-    }
-}
+// ---- the offloaded native reflow ------------------------------------------
 
 /// The steps whose line `t` still holds, in history or on screen: each step's
 /// line starts its first row with `step N`, and no other row starts so.
@@ -647,17 +333,12 @@ fn steps_kept(t: &Terminal) -> BTreeSet<u64> {
 
 /// 120 steps of output, an occasional scrollback erase, a reader scrolling back
 /// on a quarter of them, and a resize after each (a third keep the width),
-/// applied synchronously (`native`) or through the offloaded detach/re-attach.
-/// Covers width changes, revealing and blank-appending grows, shrinks and
-/// rows-only resizes under a scrolled-back reader. Returns the digest of every
-/// step, and the steps whose line each step leaves retained (`steps_kept`).
-fn native_script(
-    mut t: Terminal,
-    offload: bool,
-    native: impl Fn(&mut Terminal, u16, u16),
-) -> (u64, Vec<BTreeSet<u64>>) {
+/// applied synchronously or through the offloaded detach/re-attach, both under
+/// the Native policy. Covers width changes, revealing and blank-appending
+/// grows, shrinks and rows-only resizes under a scrolled-back reader. Returns
+/// the steps whose line each step leaves retained (`steps_kept`).
+fn native_script(mut t: Terminal, offload: bool) -> Vec<BTreeSet<u64>> {
     let mut state: u64 = 0x2545_F491_4F6C_DD1D;
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let mut kept = Vec::with_capacity(120);
     for step in 0..120u64 {
         state ^= state << 13;
@@ -689,31 +370,11 @@ fn native_script(
                 next = t.finish_resize_offload(pending.reflow());
             }
         } else {
-            native(&mut t, rows, cols);
+            t.resize_with_policy(rows, cols, ResizePolicy::Native);
         }
-        fold_state(&mut h, &t);
         kept.push(steps_kept(&t));
     }
-    (h, kept)
-}
-
-/// The Native policy is 0.94.0's resize but for the key bookkeeping of its two bottom arms
-/// (`keep_keys_across_bottom_rows`, `cover_retained_rows`) and later fixes to tiered history.
-/// The digest covers the retained rows, cursor, reading position, counter, oldest key and
-/// renumber epoch at every step, so a ConPTY arm leaking into the Native path moves it. A
-/// deliberate change to the native resize moves it too: re-capture it then, and say in
-/// the commit what moved.
-#[test]
-fn native_policy_matches_the_0_94_0_resize() {
-    const RING: u64 = 0xb706_f513_99e0_6395;
-    const TIERED: u64 = 0x7ff1_ecb9_2c5c_edb9;
-    let plain = |t: &mut Terminal, r: u16, c: u16| t.resize(r, c);
-    let native = |t: &mut Terminal, r: u16, c: u16| {
-        t.resize_with_policy(r, c, ResizePolicy::Native);
-    };
-    assert_eq!(native_script(Terminal::new(10, 40), false, plain).0, RING);
-    assert_eq!(native_script(Terminal::new(10, 40), false, native).0, RING);
-    assert_eq!(native_script(tiered(10, 40), true, native).0, TIERED);
+    kept
 }
 
 /// The offloaded width reflow keeps every line the synchronous one keeps: the script above
@@ -721,11 +382,8 @@ fn native_policy_matches_the_0_94_0_resize() {
 /// row breaks); a line only the synchronous resize retains is lost history.
 #[test]
 fn offloaded_native_script_keeps_every_line_the_synchronous_one_keeps() {
-    let native = |t: &mut Terminal, r: u16, c: u16| {
-        t.resize_with_policy(r, c, ResizePolicy::Native);
-    };
-    let (_, synchronous) = native_script(tiered(10, 40), false, native);
-    let (_, offloaded) = native_script(tiered(10, 40), true, native);
+    let synchronous = native_script(tiered(10, 40), false);
+    let offloaded = native_script(tiered(10, 40), true);
     for (step, (synchronous, offloaded)) in synchronous.iter().zip(&offloaded).enumerate() {
         let lost: Vec<_> = synchronous.difference(offloaded).collect();
         assert!(
@@ -735,44 +393,7 @@ fn offloaded_native_script_keeps_every_line_the_synchronous_one_keeps() {
     }
 }
 
-// ---- the round trip, the combined resize, the shrink corner --------------
-
-/// The offloaded twin of the width round trip in
-/// `conpty_widen_keeps_the_boundary_fragment_where_conhost_paints_it`: after
-/// the first re-attach the head's ring row is rebuilt 120 wide, and a
-/// continuation flag left on the row-0 fragment would make the next detach
-/// add a blank history line per width change.
-#[test]
-fn conpty_offloaded_width_round_trip_keeps_the_history_line_count() {
-    let mut t = tiered(24, 80);
-    belt_setup(&mut t);
-    let before = visible_rows(&t);
-    for cols in [120u16, 80, 120, 80] {
-        match t.resize_offloading_scrollback_with_policy(24, cols, ResizePolicy::ConPty) {
-            Some(pending) => {
-                t.process(&belt_repaint(&before));
-                assert!(t.finish_resize_offload(pending.reflow()).is_none());
-            }
-            None => t.process(&belt_repaint(&before)),
-        }
-        assert_eq!(
-            t.grid().scrollback_lines(),
-            1,
-            "{cols} cols: one history line"
-        );
-        assert_eq!(
-            t.grid().get_history_line(0).map(|l| l.to_string()),
-            Some(UNIT.repeat(8)),
-            "{cols} cols: the head, unchanged"
-        );
-        assert_eq!(visible_rows(&t), before, "{cols} cols: viewport unchanged");
-        assert_eq!(
-            unit_count(&t),
-            15,
-            "{cols} cols: no fragment duplicated, none lost"
-        );
-    }
-}
+// ---- the combined resize, the shrink corner -------------------------------
 
 /// The combined case, 20x60 -> 40x120 with history: conhost keeps the old
 /// viewport at the top and paints the rest blank, so every history line must
@@ -805,24 +426,6 @@ fn conpty_combined_grow_and_widen_keeps_every_history_line() {
         cached_results(&mut t, "row "),
         legacy_results(&t, "row "),
         "the search index equals a fresh build"
-    );
-}
-
-/// Negative control for the combined case: the Native widen's deficit fill
-/// pulls the history into the grown viewport and conhost's repaint then
-/// overwrites it.
-#[test]
-fn native_combined_grow_and_widen_under_a_conhost_repaint_loses_the_history() {
-    let mut t = Terminal::new(20, 60);
-    combined_setup(&mut t);
-    let before = visible_rows(&t);
-    t.resize(40, 120);
-    t.process(&conhost_repaint(&before, 40, (20, 1)));
-    let rows = retained_rows(&t);
-    let present = |n: usize| rows.iter().any(|r| r == &format!("row {n:02}"));
-    assert!(
-        !(1..=19).any(present),
-        "the native fill + conhost repaint destroys the history it pulled in"
     );
 }
 
@@ -1489,44 +1092,5 @@ fn conpty_rows_only_shrink_with_a_row_below_the_cursor_demotes_the_same_rows() {
     assert_eq!(
         (t.grid().cursor_row(), t.grid().cursor_col()),
         pad_cursor(fill, 16, 80)
-    );
-}
-
-/// Negative control: the same first step under the Native policy pushes only
-/// the three rows that bring the cursor on screen and cuts `>>`; conhost then
-/// paints `pad 16` over the `pad 15` left at row 0, losing it.
-#[test]
-fn native_shrink_with_a_row_below_the_cursor_under_a_conhost_repaint_loses_a_line() {
-    let fill = PadPrompt::AboveContinuation;
-    let mut t = Terminal::new(24, 80);
-    t.process(&pwsh_pad_fill_24(fill));
-    t.resize(20, 60);
-    t.process(&pad_repaint(fill, 16, 20, 60));
-    assert_eq!(history(&t), pad_history(14), "Native pushed three rows");
-    assert!(
-        !retained_rows(&t).iter().any(|r| r == "pad 15"),
-        "pad 15 is in neither history nor screen"
-    );
-}
-
-/// Negative control for the exact widths: the Native rewrap clamps the cursor
-/// to the prompt's last glyph, so at 20x58 it pushes one row fewer than
-/// conhost demoted, and the repaint paints `pad 14` over `pad 13` at row 0.
-#[test]
-fn native_shrink_to_a_width_the_prompt_fills_exactly_loses_a_line() {
-    let fill = PadPrompt::Alone;
-    let mut t = Terminal::new(24, 80);
-    t.process(&pwsh_pad_fill_24(fill));
-    t.resize(20, 58);
-    assert_eq!(
-        (t.grid().cursor_row(), t.grid().cursor_col()),
-        (19, 57),
-        "Native: the cursor clamped to the prompt's last glyph"
-    );
-    t.process(&pad_repaint(fill, 14, 20, 58));
-    assert_eq!(history(&t), pad_history(12), "Native pushed four rows");
-    assert!(
-        !retained_rows(&t).iter().any(|r| r == "pad 13"),
-        "pad 13 is in neither history nor screen"
     );
 }

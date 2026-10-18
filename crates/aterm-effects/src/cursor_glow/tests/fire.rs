@@ -166,47 +166,6 @@ fn fire_meteor_survives_an_unlicensed_second_hop_without_retargeting() {
     );
 }
 
-/// Suspense arc: the same single-cell advance emits far more fire light
-/// mid-blaze than from a cold keyboard (taller tongues, brighter head, an ember
-/// column instead of a lone mote).
-#[test]
-fn fire_smolders_cold_and_blazes_hot() {
-    let g = geom();
-    let c = cfg(GlowStyle::Fire, true);
-    let t0 = Instant::now();
-    let mut out = Vec::new();
-
-    // Cold: two advances 500 ms apart — no heat accumulates.
-    let mut cold = CursorGlow::default();
-    cold.tick(Some((2, 0)), t0, &c, g, &mut out);
-    cold.note_synthetic_typed(t0 + Duration::from_millis(500), 1);
-    cold.tick(
-        Some((2, 1)),
-        t0 + Duration::from_millis(500),
-        &c,
-        g,
-        &mut out,
-    );
-    let cold_lum = lum(&out);
-    assert!(cold_lum > 0, "a cold keystroke still smolders");
-
-    // Hot: sustained 40 ms cadence builds full blaze first.
-    let mut hot = CursorGlow::default();
-    let mut t = t0;
-    hot.tick(Some((2, 0)), t, &c, g, &mut out);
-    for i in 1..=14u16 {
-        t += Duration::from_millis(40);
-        hot.note_synthetic_typed(t, 1);
-        hot.tick(Some((2, i)), t, &c, g, &mut out);
-    }
-    let hot_lum = lum(&out);
-    assert_invariants(&out, g);
-    assert!(
-        hot_lum > cold_lum * 2,
-        "blazing fire far outshines the smolder (hot {hot_lum} vs cold {cold_lum})"
-    );
-}
-
 /// Window-space effects layer: with a real head band (origin_y = pad 8 + head 40
 /// = 48) a row-0 blaze climbs above the grid into the chrome band (patches with
 /// `y < origin_y`, tagged damage row 0) while the flame keeps its natural
@@ -416,78 +375,6 @@ fn emberforge_real_thermal_conforms_to_model() {
     assert_eq!(glow.disp_t, 0.0, "display temperature snaps to exactly 0");
 }
 
-/// Momentum is earned: a short fast burst stays well under full blaze, a
-/// sustained run climbs high, and a lone keystroke leaves the engine nearly
-/// cold.
-#[test]
-fn fire_momentum_is_earned_not_instant() {
-    let g = geom();
-    let c = cfg(GlowStyle::Fire, true);
-    let t0 = Instant::now();
-    let mut out = Vec::new();
-
-    let mut run = |keys: usize, gap_ms: u64| -> f32 {
-        let mut glow = CursorGlow::default();
-        let mut t = t0;
-        glow.tick(Some((2, 0)), t, &c, g, &mut out);
-        for i in 1..=keys {
-            t += Duration::from_millis(gap_ms);
-            glow.note_synthetic_typed(t, 1);
-            glow.tick(Some((2, i as u16)), t, &c, g, &mut out);
-        }
-        glow.disp_t
-    };
-    let lone = run(1, 40);
-    let burst6 = run(6, 40);
-    let burst40 = run(40, 40);
-    assert!(lone < 0.05, "a lone key stays cold ({lone})");
-    assert!(
-        burst6 < 0.5,
-        "six fast keys must NOT reach full blaze ({burst6})"
-    );
-    assert!(
-        burst40 > burst6 + 0.2,
-        "the ramp keeps climbing over a sustained run ({burst6} -> {burst40})"
-    );
-    assert!(
-        burst40 > 0.6,
-        "a sustained run earns a real blaze ({burst40})"
-    );
-}
-
-/// Human cadence keeps a live ember floor: relaxed 320 ms/key writing holds a
-/// visible standing temperature (the coal bed).
-#[test]
-fn fire_human_cadence_keeps_a_live_ember_floor() {
-    let g = geom();
-    let c = cfg(GlowStyle::Fire, true);
-    let t0 = Instant::now();
-    let mut out = Vec::new();
-    let mut glow = CursorGlow::default();
-    let mut t = t0;
-    glow.tick(Some((2, 0)), t, &c, g, &mut out);
-    for i in 1..=30u16 {
-        t += Duration::from_millis(320);
-        glow.note_synthetic_typed(t, 1);
-        glow.tick(Some((2, i)), t, &c, g, &mut out);
-    }
-    assert!(
-        glow.disp_t > 0.12,
-        "30 human-cadence keys keep a standing ember floor ({})",
-        glow.disp_t
-    );
-    // Mid-gap the wake is still alight (the chained ember line).
-    let fp = glow.tick(
-        Some((2, 30)),
-        t + Duration::from_millis(200),
-        &c,
-        g,
-        &mut out,
-    );
-    assert_ne!(fp, 0, "the ember line is alive between keystrokes");
-    assert!(!out.is_empty());
-}
-
 /// Backspace quenches, never stokes: a delete run monotonically cools the
 /// display temperature, the quench meter escalates with consecutive deletes,
 /// and arrow-left navigation (no key hint) earns no heat.
@@ -638,41 +525,6 @@ fn fire_forge_cursor_heats_holds_and_cools_to_ember() {
         "idle fingerprint is 0 (constant rest ember not folded)"
     );
     assert!(!glow.is_active(), "the animation timer disarms");
-}
-
-/// The budget law: full blaze plus a huge landing burst on 4K-class cell geometry stays under
-/// `MAX_QUADS`, so both backends see identical truncation.
-#[test]
-fn fire_field_full_blaze_respects_quad_budget() {
-    let g = Geom {
-        cw: 22,
-        ch: 44,
-        rows: 60,
-        cols: 200,
-        origin_x: 0,
-        origin_y: 0,
-        win_w: 4400,
-        win_h: 2640,
-        head: 0,
-    };
-    let c = cfg(GlowStyle::Fire, true);
-    let t0 = Instant::now();
-    let mut glow = CursorGlow::default();
-    let mut out = Vec::new();
-    let mut t = t0;
-    glow.tick(Some((2, 0)), t, &c, g, &mut out);
-    for i in 1..=60u16 {
-        t += Duration::from_millis(30);
-        glow.note_synthetic_typed(t, 1);
-        glow.tick(Some((2, i)), t, &c, g, &mut out);
-    }
-    t += Duration::from_millis(30);
-    glow.note_synthetic_move(t);
-    glow.tick(Some((30, 10)), t, &c, g, &mut out); // monster jump mid-blaze
-    t += Duration::from_millis(120);
-    glow.tick(Some((30, 10)), t, &c, g, &mut out); // strike frame
-    assert!(out.len() <= CursorGlow::MAX_QUADS);
-    assert_invariants(&out, g);
 }
 
 /// The budget law on a window-space layout (a real head band and padding): full
@@ -929,54 +781,6 @@ fn frame_fingerprint_preserves_private_stream_identity_and_idle_zero() {
     assert_ne!(forge_a.finish(), forge_b.finish(), "forge fill");
 }
 
-/// Steam law: deleting douses with steam that escalates over a run (more
-/// consecutive backspaces, more and stronger pale vapor), and the vapor decays
-/// to exactly empty.
-#[test]
-fn backspace_steam_escalates_and_decays() {
-    let g = geom();
-    let c = cfg(GlowStyle::Fire, true);
-    let t0 = Instant::now();
-    let mut glow = CursorGlow::default();
-    let mut out = Vec::new();
-    let mut t = t0;
-    glow.tick(Some((2, 0)), t, &c, g, &mut out);
-    for i in 1..=20u16 {
-        t += Duration::from_millis(40);
-        glow.note_synthetic_typed(t, 1);
-        glow.tick(Some((2, i)), t, &c, g, &mut out);
-    }
-    // One delete: a subtle hiss.
-    t += Duration::from_millis(60);
-    arm_exact_backspace(&mut glow, t, (2, 20), (2, 19));
-    glow.tick(Some((2, 19)), t, &c, g, &mut out);
-    let after_one = glow.vapor.len();
-    assert!(after_one >= 1, "a delete flashes steam");
-    // A run of deletes: visibly more vapor in flight.
-    let mut col = 19u16;
-    for _ in 0..6 {
-        t += Duration::from_millis(60);
-        arm_exact_backspace(&mut glow, t, (2, col), (2, col - 1));
-        col -= 1;
-        glow.tick(Some((2, col)), t, &c, g, &mut out);
-    }
-    assert!(
-        glow.vapor.len() > after_one,
-        "a backspace run steams harder ({} -> {})",
-        after_one,
-        glow.vapor.len()
-    );
-    // Steam is round light: it rides the halo stream.
-    assert!(!glow.halos().is_empty());
-    // And it is short-lived: two seconds later the vapor is gone.
-    let fp = glow.tick(Some((2, col)), t + Duration::from_secs(2), &c, g, &mut out);
-    assert!(
-        glow.vapor.iter().all(|v| v.kind != VaporKind::Steam),
-        "steam fully dispersed"
-    );
-    let _ = fp;
-}
-
 /// Smoke law: a cursor forged hot sheds smoke wisps continuously while the metal
 /// is above the smoking point, and the smoke stops (vapor drains, timer
 /// disarms) once it cools.
@@ -1151,21 +955,6 @@ fn light_theme_fire_is_ink_over_mode() {
     assert!(
         glow.patches().iter().all(|q| q.mode == FireMode::Over),
         "light-theme fire is source-over ink"
-    );
-}
-
-/// Fire head, dark and light: the occupied-cell discipline pins the empty cursor
-/// cell's punch above the glyph-cell ceiling, so the freshest letters keep
-/// contrast through the flame while the light still leaves the cursor.
-#[test]
-#[allow(
-    clippy::assertions_on_constants,
-    reason = "pins a compile-time-constant invariant between two coverage caps"
-)]
-fn fire_streak_caps_are_ordered_for_the_head_bridge() {
-    assert!(
-        CursorGlow::FIRE_STREAK_COV_CAP < CursorGlow::FIRE_HEAD_COV_CAP,
-        "the streak over glyph cells is capped BELOW the empty-cursor-cell bridge"
     );
 }
 

@@ -16,6 +16,8 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+pub use aterm_durable::Flush;
+
 /// The process that made one counted launch: its pid and the kernel's start time
 /// for it (seconds, microseconds). A reused pid never carries the start time of
 /// the process it replaced, so the pair names exactly one launch.
@@ -40,19 +42,47 @@ const MAX_NAMED_LAUNCHES: usize = 32;
 /// drops them leaves those launches counted, which keeps the crash signal.
 pub struct Sentinel {
     path: PathBuf,
+    /// How [`Self::arm`], the launch counts and [`Self::forgive_launch`] finish their
+    /// write ([`Self::new`]: durable; [`Self::ordered`]: ordered).
+    flush: Flush,
 }
 
 impl Sentinel {
     /// A sentinel backed by `path` (typically under the hardened private dir).
     #[must_use]
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            flush: Flush::Durable,
+        }
+    }
+
+    /// A sentinel-shaped counter backed by `path` whose every write is only ORDERED
+    /// ([`aterm_durable::ordered`]): for a count whose older copy is the conservative one
+    /// (the budget for escaping a wedged foreign trial, which an older count restarts).
+    #[must_use]
+    pub fn ordered(path: PathBuf) -> Self {
+        Self {
+            path,
+            flush: Flush::Ordered,
+        }
     }
 
     /// Arm the sentinel just before applying a swap to `build`: records `build` with zero
     /// attempts, overwriting any stale sentinel.
     pub fn arm(&self, build: u64) -> io::Result<()> {
-        self.write_record(build, 0, &[])
+        self.write_record(build, 0, &[], self.flush)
+    }
+
+    /// [`Self::arm`], finished with `flush` whatever this sentinel's own: the swap's caller
+    /// arms with [`Flush::Ordered`] when the swap it precedes lands on this sentinel's device
+    /// ([`Flush::ordered_if_same_device`]), so the barrier keeps a swapped bundle from
+    /// persisting ahead of its armed sentinel.
+    ///
+    /// # Errors
+    /// The write, the flush or the rename failed.
+    pub fn arm_with(&self, build: u64, flush: Flush) -> io::Result<()> {
+        self.write_record(build, 0, &[], flush)
     }
 
     /// The armed `(build, attempts)`, or `None` if absent or unparseable: a corrupt sentinel
@@ -64,6 +94,24 @@ impl Sentinel {
     pub fn read_state(&self) -> Option<(u64, u32)> {
         self.read_record()
             .map(|(build, attempts, _)| (build, attempts))
+    }
+
+    /// Whether a sentinel FILE is present that [`Self::read_state`] cannot read — a corrupt
+    /// or unreadable marker, which `read_state` answers as no trial at all. The boot lane
+    /// keeps that answer (a corrupt file counts no launch and forces no revert); a
+    /// confirmation must not, or a healthy build that reached its checkpoint is told its
+    /// trial is done while the trial stays on disk (ATERM-KI-1015-2, U55).
+    ///
+    /// Only a regular file: a directory or a link at the path is no marker any writer
+    /// made, and no confirmation could remove it, so counted as one it ran the recovery
+    /// proof at every retry for as long as the build ran (the review of U55). It is no
+    /// trial, as `read_state` says.
+    #[must_use]
+    // Skip: as `read_state`, plus a `symlink_metadata` of the same confined path.
+    #[cfg_attr(trust_verify, trust::skip)]
+    pub fn unreadable(&self) -> bool {
+        std::fs::symlink_metadata(&self.path).is_ok_and(|meta| meta.is_file())
+            && self.read_record().is_none()
     }
 
     /// The named launches of `running_build` still on the count (see
@@ -132,7 +180,7 @@ impl Sentinel {
             Some((b, attempts, mut names)) if b == running_build => {
                 let next = attempts.saturating_add(1);
                 names.extend(name);
-                self.write_record(b, next, &names)?;
+                self.write_record(b, next, &names, self.flush)?;
                 Ok(next)
             }
             Some(_) => Ok(0),
@@ -154,7 +202,7 @@ impl Sentinel {
             Some((b, attempts, names)) if b == running_build => {
                 let next = attempts.saturating_sub(1);
                 if next != attempts {
-                    self.write_record(b, next, &names)?;
+                    self.write_record(b, next, &names, self.flush)?;
                 }
                 Ok(next)
             }
@@ -187,7 +235,9 @@ impl Sentinel {
         };
         names.remove(at);
         let next = attempts.saturating_sub(1);
-        self.write_record(b, next, &names)?;
+        // Ordered: a give-back lost to a power loss leaves one launch counted, the safe
+        // direction, and the history stays a consistent prefix.
+        self.write_record(b, next, &names, Flush::Ordered)?;
         Ok(Some(next))
     }
 
@@ -200,16 +250,24 @@ impl Sentinel {
         matches!(self.read_state(), Some((b, attempts)) if b == running_build && attempts >= max_attempts)
     }
 
-    /// Atomic and durable write of `"<build> <attempts>"` and the newest
-    /// [`MAX_NAMED_LAUNCHES`] launch names via a `0600` temp + rename.
+    /// Atomic write of `"<build> <attempts>"` and the newest [`MAX_NAMED_LAUNCHES`] launch
+    /// names via a `0600` temp + rename, the temp and the directory finished with `flush`.
     ///
     /// This file is the swap's commit marker, and the crash it guards against is the one that
     /// would eat an unflushed payload: rename orders only metadata, an unwritten inode reads as
     /// zeros, `read_state` parses that as `None`, and the machine crash-loops on the bad build
-    /// with the retained old bundle unused. Hence the fsyncs.
+    /// with the retained old bundle unused. Hence the flush before the rename: durable, or
+    /// ordered where the writes that depend on the record land on its own device, which a
+    /// barrier keeps behind the payload.
     // Skip: the path-based write-then-rename inside the 0700 private dir.
     #[cfg_attr(trust_verify, trust::skip)]
-    fn write_record(&self, build: u64, attempts: u32, names: &[LaunchName]) -> io::Result<()> {
+    fn write_record(
+        &self,
+        build: u64,
+        attempts: u32,
+        names: &[LaunchName],
+        flush: Flush,
+    ) -> io::Result<()> {
         use std::io::Write as _;
         let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
         let tmp = parent.join(format!(".boot-sentinel.tmp-{}", std::process::id()));
@@ -231,11 +289,12 @@ impl Sentinel {
                 write!(f, " {pid}:{seconds}:{micros}")?;
             }
             // Before the handle drops and the rename publishes the name. A refusal is not a
-            // failure: on Apple targets `sync_all` is a bare `F_FULLFSYNC`, which a network
+            // failure: on Apple targets the full flush is a bare `F_FULLFSYNC` (and the barrier
+            // falls back to it where refused), which a network
             // home or some FUSE volumes answer ENOTSUP/EINVAL, and failing `arm()` there would
             // defer every apply for a guarantee the volume cannot give. A real I/O error
             // (ENOSPC, EIO) still aborts the apply.
-            match crate::durable::sync_all(&f) {
+            match crate::durable::finish(&f, flush) {
                 Ok(()) => {}
                 Err(e)
                     if matches!(
@@ -246,9 +305,9 @@ impl Sentinel {
             }
         }
         std::fs::rename(&tmp, &self.path)?;
-        // Best effort: a directory `F_FULLFSYNC` can be refused the same way, and failing
+        // Best effort: a directory flush can be refused the same way, and failing
         // `arm()` would defer the whole apply.
-        let _ = crate::durable::sync_dir(parent);
+        let _ = crate::durable::sync_dir(parent, flush);
         Ok(())
     }
 }
@@ -265,14 +324,36 @@ mod tests {
         (Sentinel::new(dir.join("boot.sentinel")), dir)
     }
 
+    /// Which flush each sentinel write takes (aterm-durable's counting seam): the boot
+    /// sentinel's arm and launch counts stay durable unless the caller orders the arm; a
+    /// named give-back is only ordered; an ordered counter orders every write.
     #[test]
-    fn arm_read_confirm_round_trip() {
-        let (s, dir) = sentinel("rt");
-        assert_eq!(s.read_state(), None);
-        s.arm(1235).unwrap();
-        assert_eq!(s.read_state(), Some((1235, 0)));
-        s.confirm().unwrap();
-        assert_eq!(s.read_state(), None);
+    fn each_sentinel_write_names_its_flush() {
+        use aterm_durable::seam::Recording;
+        const O: Flush = Flush::Ordered;
+        const D: Flush = Flush::Durable;
+        let (s, dir) = sentinel("flush-tiers");
+        let me = LaunchName {
+            pid: 7,
+            started: (1, 2),
+        };
+        let recording = Recording::start();
+        s.arm(9).unwrap();
+        assert_eq!(
+            recording.take(),
+            [D, D],
+            "a durable arm: the file, the entry"
+        );
+        s.arm_with(9, O).unwrap();
+        assert_eq!(recording.take(), [O, O], "an ordered arm");
+        assert_eq!(s.observe_launch_by(9, Some(me)).unwrap(), 1);
+        assert_eq!(recording.take(), [D, D], "a launch count");
+        assert_eq!(s.forgive_launch_of(9, 7, Some((1, 2))).unwrap(), Some(0));
+        assert_eq!(recording.take(), [O, O], "a named give-back");
+        let counter = Sentinel::ordered(dir.join("foreign-trial"));
+        counter.arm(9).unwrap();
+        assert_eq!(counter.observe_launch(9).unwrap(), 1);
+        assert_eq!(recording.take(), [O, O, O, O], "an ordered counter");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -349,6 +430,30 @@ mod tests {
         assert!(
             !s.should_revert(1235, 1),
             "garbage never forces the disruptive revert"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_a_present_marker_that_does_not_read_is_unreadable() {
+        let (s, dir) = sentinel("unreadable");
+        assert!(
+            !s.unreadable(),
+            "no marker is no trial, not an unreadable one"
+        );
+        s.arm(1235).unwrap();
+        assert!(!s.unreadable(), "an armed marker reads");
+        std::fs::write(&s.path, [0u8; 16]).unwrap();
+        assert!(
+            s.unreadable(),
+            "a zero-filled marker (a cut write) does not"
+        );
+        s.confirm().unwrap();
+        assert!(!s.unreadable(), "a confirmed marker is gone");
+        std::fs::create_dir(&s.path).unwrap();
+        assert!(
+            !s.unreadable(),
+            "a directory at the path is no marker that does not read"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

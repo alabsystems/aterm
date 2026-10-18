@@ -30,7 +30,7 @@ use answers::Corpus;
 use aterm_core::terminal::CheckpointMeta;
 
 use crate::app_config::Config;
-use crate::native_config_language::tests::reader_fields;
+use crate::native_config_language::reader_fields;
 use crate::restore::{CellMetricsCache, RestoreManifest};
 use crate::session_store::SessionHandoff;
 
@@ -82,7 +82,7 @@ scrollback_lines = 20000
 cursor_style = "bar"
 palette = ["#000000", "#ffffff"]
 fallback_fonts = "Menlo, , Symbols Nerd Font "
-game_font = "Press Start 2P"
+display_font = "Press Start 2P"
 columns = 120
 lines = 40
 adjust_baseline = -2
@@ -105,14 +105,6 @@ jitter = -3
 [[sparkle_words.custom]]
 words = ["shipit"]
 ink = { colorway = "rainbow" }
-
-[net]
-listen = "127.0.0.1:7777"
-
-[[net.connections]]
-name = "lab"
-host = "lab.example:7777"
-fingerprint = "sha256:abcd"
 
 [harness]
 max_sessions = 4
@@ -139,35 +131,14 @@ fn config_documents_answer_as_recorded() {
         ),
         ("unknown-key/rust-name", &[("loop = true", "loop_ = true")]),
         (
-            "unknown-key/connection",
-            &[(
-                "fingerprint = \"sha256:abcd\"\n",
-                "fingerprint = \"sha256:abcd\"\nport = 1\n",
-            )],
+            "unknown-key/record",
+            &[("words = [\"shipit\"]\n", "words = [\"shipit\"]\nport = 1\n")],
         ),
         ("unknown-key/table-header", &[("[render]", "[renderer]")]),
-        // The alias, and the alias beside its own name.
-        ("alias/canonical", &[("game_font", "display_font")]),
-        (
-            "alias/both",
-            &[(
-                "game_font = \"Press Start 2P\"\n",
-                "game_font = \"Press Start 2P\"\ndisplay_font = \"Silkscreen\"\n",
-            )],
-        ),
         // The skipped field: the reader never sees `[harness]`.
         (
             "skip/harness-scalar",
             &[("[harness]\nmax_sessions = 4\n", "")],
-        ),
-        // A required key inside an optional table.
-        (
-            "missing-key/connection-host",
-            &[("host = \"lab.example:7777\"\n", "")],
-        ),
-        (
-            "missing-key/connection-defaulted-sid",
-            &[("name = \"lab\"\n", "name = \"lab\"\nsid = \"s-1\"\n")],
         ),
         // FontList: a string or a list, and nothing else.
         (
@@ -246,8 +217,8 @@ fn config_documents_answer_as_recorded() {
             )],
         ),
         (
-            "table-for-array/connections",
-            &[("[[net.connections]]", "[net.connections]")],
+            "table-for-array/custom",
+            &[("[[sparkle_words.custom]]", "[sparkle_words.custom]")],
         ),
         // Integers at and past each width.
         (

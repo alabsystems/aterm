@@ -14,8 +14,16 @@
 //! shorter than its kind's fixed fields is refused. Kinds are never renumbered; an unknown kind
 //! is refused by name.
 //!
-//! This module is pure bytes. The descriptor a REGISTER or an OFFER carries travels beside the
-//! header (`fdpass`); the codec only says which kinds may carry one ([`Kind::carries_fd`]).
+//! This module is pure bytes. The descriptor a REGISTER, an OFFER, a COMPANION or a COMPANION_OFFER
+//! carries travels beside the header (`fdpass`); the codec only says which kinds may carry one
+//! ([`Kind::carries_fd`]).
+//!
+//! The crash-restore journal (the crash-restore plan §5) grew the wire by the same rule: a window
+//! that journals says [`CAP_JOURNAL`] in its HELLO, a keeper that takes regions in custody says it
+//! in a trailing caps byte of its WELCOME, and only between two such peers does anything new flow
+//! (an OFFER's trailing `attempts` and `companions`, and the three companion kinds, 14 to 16). An
+//! older window's strict offer loop refuses any frame but an OFFER, and an older decoder refuses
+//! an unknown kind, so a COMPANION_OFFER sent to one would cost it its whole recovery.
 
 use crate::identity::IdentityPolicy;
 
@@ -49,6 +57,14 @@ pub const CAP_SENDS_BYE: u8 = 0x01;
 /// HELLO capability bit: a window's link (re)connecting to register what it holds, not a launch.
 /// It is offered nothing and does not reset the relaunch brake; the boot HELLO omits it.
 pub const CAP_LINK: u8 = 0x02;
+/// HELLO capability bit (and WELCOME's trailing caps byte, from a keeper): this peer speaks the
+/// crash-restore journal's frames. A window that states it journals its sessions into read-only
+/// regions it registers beside their masters (COMPANION, COMPANION_RELEASE) and reads the regions
+/// it is offered (an OFFER's trailing `attempts` and `companions`, then COMPANION_OFFER). A keeper
+/// sends those only to a HELLO that stated it; a window sends its own only to a WELCOME that did.
+pub const CAP_JOURNAL: u8 = 0x04;
+/// The one companion kind this build knows: a crash-restore journal region (`aterm-restore`).
+pub const COMPANION_JOURNAL: u8 = 1;
 
 /// The frame kinds. Numbers are the wire's and never change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,6 +95,15 @@ pub enum Kind {
     Adopt = 12,
     /// K→W: a frame was refused (a reason code and the rdev it named).
     Refused = 13,
+    /// W→K, with a read-only POSIX shared-memory descriptor: the journal region of a master this
+    /// connection claims (the rdev, the kind, the region's length).
+    Companion = 14,
+    /// K→W', with a duplicate of the companion's descriptor: sent right after an OFFER that said
+    /// `companions = 1`, for that OFFER's master.
+    CompanionOffer = 15,
+    /// W→K: drop this claim's companion and end its poison window (a window with no journal for
+    /// the master: its region could not be made, or memory pressure shed it).
+    CompanionRelease = 16,
 }
 
 impl Kind {
@@ -99,6 +124,9 @@ impl Kind {
             11 => Kind::RestartWhenSafe,
             12 => Kind::Adopt,
             13 => Kind::Refused,
+            14 => Kind::Companion,
+            15 => Kind::CompanionOffer,
+            16 => Kind::CompanionRelease,
             _ => return None,
         })
     }
@@ -108,7 +136,10 @@ impl Kind {
     /// error (closed, and the connection dropped).
     #[must_use]
     pub fn carries_fd(self) -> bool {
-        matches!(self, Kind::Register | Kind::Offer)
+        matches!(
+            self,
+            Kind::Register | Kind::Offer | Kind::Companion | Kind::CompanionOffer
+        )
     }
 }
 
@@ -285,6 +316,10 @@ pub enum Frame {
         /// with a keeper that does not state `Designated` (§5.7): a keeper at the same-uid floor
         /// offers a crashed window's masters to any same-uid process.
         identity: Option<IdentityPolicy>,
+        /// The keeper's capabilities ([`CAP_JOURNAL`]); `None` when an older keeper's WELCOME
+        /// ends before it. It follows the policy byte, which a keeper that states caps always
+        /// writes (as 0 when it has no policy to state).
+        caps: Option<u8>,
     },
     Register {
         header: MasterHeader,
@@ -305,6 +340,10 @@ pub enum Frame {
         header: MasterHeader,
         tag: Vec<u8>,
         meta: Vec<u8>,
+        /// The crash-restore journal's trailing fields, written only to a HELLO that stated
+        /// [`CAP_JOURNAL`]; `None` when the body ends before them (an older keeper's OFFER, or
+        /// one to a window that does not journal).
+        journal: Option<JournalOffer>,
     },
     Orphans {
         n: u16,
@@ -318,6 +357,38 @@ pub enum Frame {
         code: RefuseCode,
         rdev: u64,
     },
+    /// The journal region of a master the sender claims; its read-only descriptor rides the
+    /// header.
+    Companion {
+        rdev: u64,
+        kind: u8,
+        len: u64,
+    },
+    /// The region offered with the OFFER of `rdev` just before it; a duplicate of its descriptor
+    /// rides the header.
+    CompanionOffer {
+        rdev: u64,
+        kind: u8,
+        len: u64,
+    },
+    /// The sender's claim on `rdev` has no journal of `kind` (any more).
+    CompanionRelease {
+        rdev: u64,
+        kind: u8,
+    },
+}
+
+/// An OFFER's trailing crash-restore fields (the crash-restore plan §5).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JournalOffer {
+    /// The keeper's poison brake: how many recovering windows died, since the offered region
+    /// was written, before their own COMPANION. At 0 the region is the dead reader's own and a
+    /// restore may replay its tail; at 1 it replays the keyframe alone (the tail may be what
+    /// killed the last window, which may also have read output the region never saw); from 2
+    /// the keeper offers no region.
+    pub attempts: u8,
+    /// How many COMPANION_OFFERs follow this OFFER (0 or 1).
+    pub companions: u8,
 }
 
 /// Why the keeper refused a frame.
@@ -333,8 +404,13 @@ pub enum RefuseCode {
     NotClaimant = 4,
     /// The frame is not one this peer's class may send.
     WrongClass = 5,
-    /// A REGISTER arrived without its descriptor.
+    /// A REGISTER or COMPANION arrived without its descriptor.
     NoDescriptor = 6,
+    /// A COMPANION whose descriptor is not a read-only POSIX shared-memory object of the kind
+    /// and length it claims, within the keeper's bounds.
+    NotAJournal = 7,
+    /// A COMPANION or COMPANION_RELEASE named a master the keeper holds no record of.
+    NoSuchRecord = 8,
     /// A code this build does not know (a newer keeper).
     Other = 255,
 }
@@ -348,6 +424,8 @@ impl RefuseCode {
             4 => RefuseCode::NotClaimant,
             5 => RefuseCode::WrongClass,
             6 => RefuseCode::NoDescriptor,
+            7 => RefuseCode::NotAJournal,
+            8 => RefuseCode::NoSuchRecord,
             _ => RefuseCode::Other,
         }
     }
@@ -371,6 +449,9 @@ impl Frame {
             Frame::RestartWhenSafe => Kind::RestartWhenSafe,
             Frame::Adopt => Kind::Adopt,
             Frame::Refused { .. } => Kind::Refused,
+            Frame::Companion { .. } => Kind::Companion,
+            Frame::CompanionOffer { .. } => Kind::CompanionOffer,
+            Frame::CompanionRelease { .. } => Kind::CompanionRelease,
         }
     }
 
@@ -404,12 +485,18 @@ impl Frame {
                 offers,
                 version,
                 identity,
+                caps,
             } => {
                 body.extend_from_slice(&proto.to_be_bytes());
                 body.extend_from_slice(&offers.to_be_bytes());
                 put_short(&mut body, version.as_bytes(), MAX_LABEL, kind)?;
-                if let Some(policy) = identity {
-                    body.push(policy_byte(*policy));
+                // The policy byte goes whenever anything follows it: a reader takes the fields
+                // in order, and 0 names no policy.
+                if identity.is_some() || caps.is_some() {
+                    body.push(identity.map_or(0, policy_byte));
+                }
+                if let Some(caps) = caps {
+                    body.push(*caps);
                 }
             }
             Frame::Register { header, tag } => {
@@ -423,16 +510,43 @@ impl Frame {
             Frame::Release { rdev } => body.extend_from_slice(&rdev.to_be_bytes()),
             Frame::Pending { pid } => body.extend_from_slice(&pid.to_be_bytes()),
             Frame::Bye | Frame::RestartWhenSafe | Frame::Adopt => {}
-            Frame::Offer { header, tag, meta } => {
+            Frame::Offer {
+                header,
+                tag,
+                meta,
+                journal,
+            } => {
                 put_header(&mut body, header);
                 put_long(&mut body, tag, MAX_TAG, kind)?;
                 put_long(&mut body, meta, MAX_META, kind)?;
+                if let Some(j) = journal {
+                    body.push(j.attempts);
+                    body.push(j.companions);
+                }
             }
             Frame::Orphans { n } => body.extend_from_slice(&n.to_be_bytes()),
             Frame::Status { text } => put_long(&mut body, text.as_bytes(), MAX_STATUS, kind)?,
             Frame::Refused { code, rdev } => {
                 body.push(*code as u8);
                 body.extend_from_slice(&rdev.to_be_bytes());
+            }
+            Frame::Companion {
+                rdev,
+                kind: region,
+                len,
+            }
+            | Frame::CompanionOffer {
+                rdev,
+                kind: region,
+                len,
+            } => {
+                body.extend_from_slice(&rdev.to_be_bytes());
+                body.push(*region);
+                body.extend_from_slice(&len.to_be_bytes());
+            }
+            Frame::CompanionRelease { rdev, kind: region } => {
+                body.extend_from_slice(&rdev.to_be_bytes());
+                body.push(*region);
             }
         }
         let mut out = encode_header(kind, body.len())?.to_vec();
@@ -490,6 +604,12 @@ impl Frame {
                 } else {
                     None
                 },
+                // …and one that ends after the policy byte, an older keeper's, states no caps.
+                caps: if r.at < body.len() {
+                    Some(r.u8()?)
+                } else {
+                    None
+                },
             },
             Kind::Register => Frame::Register {
                 header: r.master_header()?,
@@ -506,6 +626,16 @@ impl Frame {
                 header: r.master_header()?,
                 tag: r.long(MAX_TAG)?,
                 meta: r.long(MAX_META)?,
+                // The growth rule: an OFFER that ends here is an older keeper's, or one to a
+                // window that did not state CAP_JOURNAL.
+                journal: if r.at < body.len() {
+                    Some(JournalOffer {
+                        attempts: r.u8()?,
+                        companions: r.u8()?,
+                    })
+                } else {
+                    None
+                },
             },
             Kind::Orphans => Frame::Orphans { n: r.u16()? },
             Kind::Status => {
@@ -526,6 +656,20 @@ impl Frame {
             Kind::Refused => Frame::Refused {
                 code: RefuseCode::from_byte(r.u8()?),
                 rdev: r.u64()?,
+            },
+            Kind::Companion => Frame::Companion {
+                rdev: r.u64()?,
+                kind: r.u8()?,
+                len: r.u64()?,
+            },
+            Kind::CompanionOffer => Frame::CompanionOffer {
+                rdev: r.u64()?,
+                kind: r.u8()?,
+                len: r.u64()?,
+            },
+            Kind::CompanionRelease => Frame::CompanionRelease {
+                rdev: r.u64()?,
+                kind: r.u8()?,
             },
         })
     }
@@ -670,12 +814,22 @@ mod tests {
             offers: 3,
             version: "0.98.0".into(),
             identity: Some(IdentityPolicy::Designated),
+            caps: Some(CAP_JOURNAL),
         });
         round(Frame::Welcome {
             proto: PROTO,
             offers: 0,
             version: "0.98.0".into(),
             identity: Some(IdentityPolicy::SameUid),
+            caps: None,
+        });
+        // A keeper that states caps but no policy this build names.
+        round(Frame::Welcome {
+            proto: PROTO,
+            offers: 0,
+            version: "0.98.0".into(),
+            identity: None,
+            caps: Some(0),
         });
         // An older keeper's WELCOME: no policy byte.
         round(Frame::Welcome {
@@ -683,6 +837,7 @@ mod tests {
             offers: 0,
             version: "0.98.0".into(),
             identity: None,
+            caps: None,
         });
         round(Frame::Register {
             header: header(),
@@ -699,6 +854,16 @@ mod tests {
             header: header(),
             tag: vec![2; MAX_TAG],
             meta: vec![3; 10],
+            journal: None,
+        });
+        round(Frame::Offer {
+            header: header(),
+            tag: b"sid=s-1".to_vec(),
+            meta: vec![3; MAX_META],
+            journal: Some(JournalOffer {
+                attempts: 1,
+                companions: 1,
+            }),
         });
         round(Frame::Orphans { n: 2 });
         round(Frame::Status {
@@ -709,10 +874,123 @@ mod tests {
         });
         round(Frame::RestartWhenSafe);
         round(Frame::Adopt);
-        round(Frame::Refused {
-            code: RefuseCode::RdevMismatch,
-            rdev: 5,
+        for code in [
+            RefuseCode::RdevMismatch,
+            RefuseCode::NotAJournal,
+            RefuseCode::NoSuchRecord,
+        ] {
+            round(Frame::Refused { code, rdev: 5 });
+        }
+        round(Frame::Companion {
+            rdev: 0x0f00_000a,
+            kind: COMPANION_JOURNAL,
+            len: 8 << 20,
         });
+        round(Frame::CompanionOffer {
+            rdev: 0x0f00_000a,
+            kind: COMPANION_JOURNAL,
+            len: u64::MAX,
+        });
+        round(Frame::CompanionRelease {
+            rdev: 0x0f00_000a,
+            kind: COMPANION_JOURNAL,
+        });
+    }
+
+    /// Decode `bytes` (a whole frame) as a reader would.
+    fn decode_whole(bytes: &[u8]) -> Result<Frame, WireError> {
+        let mut h = [0u8; HEADER_LEN];
+        h.copy_from_slice(&bytes[..HEADER_LEN]);
+        Frame::decode(&decode_header(&h)?, &bytes[HEADER_LEN..])
+    }
+
+    /// The crash-restore fields only grow the wire. A journal OFFER and a WELCOME stating caps
+    /// are the older frame plus trailing bytes, so an older window reads them as before (the
+    /// growth rule) and its strict offer loop still meets an OFFER; and the older frames, whose
+    /// bodies end before those fields, decode as stating none.
+    #[test]
+    fn the_journal_fields_only_grow_the_wire() {
+        let offer = |journal| Frame::Offer {
+            header: header(),
+            tag: b"sid=s-1".to_vec(),
+            meta: vec![7; 12],
+            journal,
+        };
+        let plain = offer(None);
+        let journal = offer(Some(JournalOffer {
+            attempts: 2,
+            companions: 0,
+        }));
+        let (old, new) = (plain.encode().expect("old"), journal.encode().expect("new"));
+        assert_eq!(&new[HEADER_LEN..new.len() - 2], &old[HEADER_LEN..]);
+        assert_eq!(&new[new.len() - 2..], [2, 0]);
+        assert_eq!(decode_whole(&old), Ok(plain));
+
+        // An older keeper's WELCOME ends before the policy byte; a newer one's runs on to the
+        // caps after it, which an older window never reads.
+        let welcome = |caps| Frame::Welcome {
+            proto: PROTO,
+            offers: 1,
+            version: "0.97.0".into(),
+            identity: Some(IdentityPolicy::Designated),
+            caps,
+        };
+        let older = welcome(None);
+        let stated = welcome(Some(CAP_JOURNAL));
+        let (old, new) = (older.encode().expect("old"), stated.encode().expect("new"));
+        assert_eq!(&new[HEADER_LEN..new.len() - 1], &old[HEADER_LEN..]);
+        assert_eq!(new[new.len() - 1], CAP_JOURNAL);
+        assert_eq!(decode_whole(&old), Ok(older));
+
+        // A body cut inside the trailing pair is refused, never read as half a field.
+        let mut cut = Frame::Offer {
+            header: header(),
+            tag: Vec::new(),
+            meta: Vec::new(),
+            journal: Some(JournalOffer {
+                attempts: 0,
+                companions: 1,
+            }),
+        }
+        .encode()
+        .expect("encode");
+        cut.pop();
+        let len = u16::try_from(cut.len() - HEADER_LEN).expect("short");
+        cut[6..8].copy_from_slice(&len.to_be_bytes());
+        assert_eq!(decode_whole(&cut), Err(WireError::Short(Kind::Offer)));
+    }
+
+    /// The companion kinds are numbered 14 to 16, never renumbered, and carry a descriptor
+    /// exactly where the plan says (COMPANION and COMPANION_OFFER, not COMPANION_RELEASE); a
+    /// decoder from before them refuses them as unknown kinds, which is why the keeper sends one
+    /// only to a window that stated CAP_JOURNAL.
+    #[test]
+    fn the_companion_kinds_are_numbered_and_carry_their_descriptors() {
+        for (byte, kind, fd) in [
+            (14, Kind::Companion, true),
+            (15, Kind::CompanionOffer, true),
+            (16, Kind::CompanionRelease, false),
+        ] {
+            assert_eq!(Kind::from_byte(byte), Some(kind));
+            assert_eq!(kind as u8, byte);
+            assert_eq!(kind.carries_fd(), fd, "{kind:?}");
+        }
+        assert_eq!(Kind::from_byte(17), None, "the next number is unassigned");
+        assert_eq!(
+            CAP_JOURNAL & (CAP_SENDS_BYE | CAP_LINK),
+            0,
+            "a bit of its own"
+        );
+        assert_eq!(
+            Frame::CompanionRelease {
+                rdev: 1,
+                kind: COMPANION_JOURNAL
+            }
+            .encode()
+            .expect("encode")
+            .len(),
+            HEADER_LEN + 9
+        );
     }
 
     #[test]

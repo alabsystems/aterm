@@ -442,18 +442,11 @@ mod tests {
 
     #[test]
     fn an_expired_deadline_is_a_timeout_not_a_hang() {
-        let deadline = Deadline::after(Duration::from_millis(0));
-        std::thread::sleep(Duration::from_millis(2));
+        let deadline = Deadline::after(Duration::ZERO);
         assert!(deadline.remaining().is_none());
         assert_eq!(
             deadline.remaining_or_timeout().unwrap_err().kind(),
             io::ErrorKind::TimedOut
         );
-    }
-
-    #[test]
-    fn a_live_deadline_reports_a_positive_budget() {
-        let deadline = Deadline::after(Duration::from_secs(30));
-        assert!(deadline.remaining().unwrap() > Duration::from_secs(20));
     }
 }

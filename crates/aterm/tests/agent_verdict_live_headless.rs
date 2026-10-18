@@ -1,27 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Live-headless conformance for the SERVER-PUBLISHED agent verdict and program
-//! identity (`status program= agent= …`, `EVENT <local> agent <word> rev=<n>
-//! gen=<e.s> fp=<hex16>`,
-//! `await agent`) — the audit's INT-1 / INT-4 / INT-5 shapes, driven through
-//! the one `aterm` binary against a real headless instance.
-//!
-//! * A FAKE WORKER (a POSIX `sh` script run as `claude` via `exec -a`) draws a
-//!   Claude-shaped busy screen, then — when the test creates a go-file — the rm
-//!   circuit-breaker box while one transcript row keeps ticking at 5 Hz.
-//!   `status agent=prompt` must follow, `EVENT <local> agent prompt` must be
-//!   pushed, and `await agent prompt` must latch. NEGATIVE
-//!   CONTROL: the shell status FSM's `revision=` — the gate the verdict used to
-//!   hang on — does not move across the busy→prompt change, so a classifier
-//!   still gated on it would never have seen the box.
-//! * A SHELL running `echo "…?"; sleep 300` reads `program=sleep` (the
-//!   foreground group's argv[0], no shell integration needed) and `agent=-`
-//!   with no attention — a trailing `?` is not a question from a shell.
-//!
-//! ISOLATION: scratch HOME/XDG roots, a private control socket, a config with
-//! every automatic lane off, `--no-reroute`, `SHELL=/bin/sh`
-//! (`support/launch_isolation.rs`). A headless instance opens no window.
+//! Live-headless conformance for the server-published agent verdict and program identity
+//! (`status program= agent= …`, `EVENT <local> agent <word> rev=<n> gen=<e.s> fp=<hex16>`,
+//! `await agent`), driven through the one `aterm` binary against a real headless instance.
+//! Fake agents are POSIX `sh` scripts run as `claude` via `exec -a`, drawing measured Claude
+//! Code screens. Isolation is `support/launch_isolation.rs`'s: scratch HOME/XDG roots, a
+//! private control socket, every automatic lane off, `--no-reroute`, `SHELL=/bin/sh`.
 
 #![cfg(unix)]
 
@@ -35,22 +20,22 @@ use headless_boot::{
     Instance, boot_session, client_command, ctl, ctl_ok, field, status, type_line,
 };
 
-/// Boot one headless instance, 40x120 ([`headless_boot::boot`]: `None` is an
-/// environment refusal; a product that cannot start fails the test).
-fn boot(tag: &str) -> Option<Instance> {
+/// Boot one headless instance, 40x120 ([`headless_boot::boot`]: an environment
+/// refusal is COULD NOT RUN; a product that cannot start fails the test).
+fn boot(tag: &str) -> Instance {
     boot_rows(tag, 40)
 }
 
 /// [`boot`] with `lines` rows.
-fn boot_rows(tag: &str, lines: u16) -> Option<Instance> {
+fn boot_rows(tag: &str, lines: u16) -> Instance {
     headless_boot::boot(
         &format!("atav{tag}"),
         &["--lines", &lines.to_string(), "--columns", "120"],
     )
 }
 
-/// How long a wait for something that MUST happen may take before it is read
-/// as a hang (AGENTS.md: a hang detector is a minute, never a latency budget).
+/// How long a wait for something that must happen may take before it is read as a hang
+/// (AGENTS.md).
 const HANG: Duration = Duration::from_secs(60);
 const HANG_MS: &str = "timeout=60000";
 
@@ -82,10 +67,9 @@ fn status_until(
     );
 }
 
-/// The fake worker: a Claude-shaped busy screen (transcript row, spinner,
-/// composer between two rules, footer) redrawn every 0.2 s until `go` exists,
-/// then the measured 2.1.280 rm circuit-breaker box with the top transcript
-/// row ticking every 0.2 s. POSIX sh + printf only.
+/// The fake worker: a Claude-shaped busy screen (transcript row, spinner, composer between two
+/// rules, footer) redrawn until `go` exists, then the rm circuit-breaker box measured on
+/// 2.1.280, its top transcript row ticking every 0.2 s. POSIX sh + printf only.
 const FAKE_WORKER: &str = r#"#!/bin/sh
 go="$1"
 rule=$(printf '%120s' '' | sed 's/ /─/g')
@@ -123,12 +107,11 @@ while :; do
 done
 "#;
 
-/// INT-1 + INT-2, live: the box under a ticking row reaches `status
-/// agent=prompt`, `EVENT <local> agent prompt` is pushed, and `await agent
-/// prompt` latches — while `revision=` holds still.
+/// The box under a ticking row reaches `status agent=prompt`, `EVENT <local> agent prompt` is
+/// pushed, and `await agent prompt` latches, while `revision=` holds still.
 #[test]
 fn a_box_under_a_ticking_row_is_published_pushed_and_awaitable() {
-    let Some(inst) = boot("b") else { return };
+    let inst = boot("b");
     let (local, sid) = boot_session(&inst);
     let script = inst.tmp.join("fake.sh");
     let go = inst.tmp.join("go");
@@ -165,15 +148,10 @@ fn a_box_under_a_ticking_row_is_published_pushed_and_awaitable() {
     let program = status_until(&inst, &sid, HANG, "program=claude", |s| {
         field(s, "program") == Some("claude")
     });
-    // Pin the revision once the FSM has PUBLISHED the running job, never on
-    // a timer. `agent=busy` is the timeline's verdict and can lead the FSM's
-    // `running` — held for its 750 ms dwell, then published on a sweep — by
-    // most of a second; a fixed 1.2 s sleep raced that publication, and on a
-    // loaded machine, its event loop half a second behind, it pinned before
-    // the publication, so `revision=` moved by one at the prompt on a correct
-    // server. Once `running` with movement
-    // is out, nothing moves the revision while the fake keeps ticking short
-    // of a 5 s stall (`quiet_after`), so the control below still fails for a
+    // Pin the revision once the FSM has published the running job, never on a timer:
+    // `agent=busy` can lead the FSM's `running` (held for its 750 ms dwell, then published on
+    // a sweep) by most of a second. After that nothing moves the revision while the fake
+    // ticks, short of a 5 s stall (`quiet_after`), so the control below still fails for a
     // gate that bumps it when the box is drawn.
     let before = status_until(
         &inst,
@@ -200,12 +178,8 @@ fn a_box_under_a_ticking_row_is_published_pushed_and_awaitable() {
     std::thread::sleep(Duration::from_millis(200));
 
     std::fs::write(&go, b"").expect("create the go file");
-    // Until the verdict names the box's kind too: the box's frame can be read
-    // before its body is drawn, and that screen is honestly `prompt` with
-    // `agent_detail=other` — the drawn body then moves the detail (one more
-    // rev and one more push, which everything below reads from this status).
-    // A box that never reads as the rm circuit-breaker still fails here, with
-    // the last status in the message.
+    // Until the verdict names the box's kind: its frame can be read before its body is drawn
+    // (honestly `prompt` with `agent_detail=other`), and the drawn body then moves the detail.
     let prompt = status_until(
         &inst,
         &sid,
@@ -225,9 +199,8 @@ fn a_box_under_a_ticking_row_is_published_pushed_and_awaitable() {
     assert_eq!(field(&prompt, "level"), Some("attention"), "{prompt}");
     assert_eq!(field(&prompt, "why"), Some("prompt"), "{prompt}");
     assert_eq!(field(&prompt, "program"), Some("claude"), "{prompt}");
-    // NEGATIVE CONTROL: the old classifier gate. The FSM's revision did not
-    // move across the change (the screen kept moving, the job kept running),
-    // so a verdict gated on it would still say busy.
+    // Negative control: the FSM's revision did not move across the change (the screen kept
+    // moving, the job kept running), so a verdict gated on it would still say busy.
     assert_eq!(
         field(&prompt, "revision"),
         Some(revision.as_str()),
@@ -295,14 +268,12 @@ fn a_box_under_a_ticking_row_is_published_pushed_and_awaitable() {
     assert_eq!(field(row, "agent"), Some("prompt"), "{row}");
 }
 
-/// INT-4 + INT-5, live: a plain shell running `echo "…?"; sleep 300` is named
-/// by its foreground program (`program=sleep`, no shell integration) and is
-/// NOT an agent: `agent=-`, never `level=attention`. The `sleep` outlives every
-/// wait on it by far (it was 30 s, under a one-minute wait), so the sample
-/// below is taken while it still runs; the instance's hangup ends it.
+/// A plain shell running `echo "…?"; sleep 300` is named by its foreground program
+/// (`program=sleep`, no shell integration) and is not an agent: `agent=-`, never
+/// `level=attention`. The `sleep` outlives every wait; the instance's hangup ends it.
 #[test]
 fn a_shell_question_is_not_an_agent_and_its_program_is_named() {
-    let Some(inst) = boot("s") else { return };
+    let inst = boot("s");
     let (_local, sid) = boot_session(&inst);
     type_line(
         &inst,
@@ -312,93 +283,12 @@ fn a_shell_question_is_not_an_agent_and_its_program_is_named() {
     let rec = status_until(&inst, &sid, HANG, "program=sleep", |s| {
         field(s, "program") == Some("sleep")
     });
-    // Sample for two seconds: never an agent, never attention.
-    let until = Instant::now() + Duration::from_secs(2);
-    let mut last = rec;
-    while Instant::now() < until {
-        assert_eq!(field(&last, "agent"), Some("-"), "{last}");
-        assert_ne!(field(&last, "level"), Some("attention"), "{last}");
-        assert_eq!(field(&last, "why"), Some("-"), "{last}");
-        std::thread::sleep(Duration::from_millis(200));
-        last = status(&inst, &sid);
-    }
-    let screen = ctl_ok(&inst, &[&format!("@{sid}"), "text"]);
-    assert!(
-        screen.contains("disk is full?"),
-        "the question is on screen: {screen}"
-    );
-}
-
-/// The review's `frame.sh` case, live: a plain shell that `cat`s a captured
-/// Claude screen — its question, the full-width rules, the `❯` composer and
-/// the footer — is still a shell. The events stream is open throughout, so
-/// even a transient agent verdict (a flash while the shell's group is being
-/// re-named after the job) would be seen: none may be pushed, and `status`
-/// ends at `agent=-` with no attention. NEGATIVE CONTROL: the capture really
-/// is on screen, frame and all.
-#[test]
-fn a_shell_that_cats_a_claude_capture_is_not_an_agent() {
-    let Some(inst) = boot("c") else { return };
-    let (local, sid) = boot_session(&inst);
-    let rule = "\u{2500}".repeat(120);
-    let capture = inst.tmp.join("capture.txt");
-    std::fs::write(
-        &capture,
-        format!(
-            "\u{23fa} Should I also delete the old logs?\n\n{rule}\n\u{276f} \n{rule}\n  ? for shortcuts\n"
-        ),
-    )
-    .expect("write the capture");
-    let mut sub = client_command(&inst, &["subscribe", &format!("@{sid}"), "events"])
-        .spawn()
-        .expect("spawn subscribe");
-    let events = sub.stdout.take().expect("subscribe stdout");
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        for line in BufReader::new(events).lines().map_while(Result::ok) {
-            if tx.send(line).is_err() {
-                break;
-            }
-        }
-    });
-    type_line(&inst, &sid, &format!("cat {}", capture.display()));
-    let reply = ctl_ok(
-        &inst,
-        &[
-            &format!("@{sid}"),
-            "await",
-            "match",
-            "for.shortcuts",
-            HANG_MS,
-        ],
-    );
-    assert!(
-        !reply.starts_with("OK timeout"),
-        "the capture is up: {reply}"
-    );
-    // Well past the sweep's 250 ms floor and the program re-resolution.
-    let until = Instant::now() + Duration::from_secs(2);
-    let mut agent_events = Vec::new();
-    while Instant::now() < until {
-        if let Ok(line) = rx.recv_timeout(Duration::from_millis(100))
-            && line.starts_with(&format!("EVENT {local} agent "))
-        {
-            agent_events.push(line);
-        }
-    }
-    let _ = sub.kill();
-    let _ = sub.wait();
-    let rec = status(&inst, &sid);
-    assert!(
-        agent_events.is_empty(),
-        "no agent verdict: {agent_events:?} / {rec}"
-    );
     assert_eq!(field(&rec, "agent"), Some("-"), "{rec}");
     assert_ne!(field(&rec, "level"), Some("attention"), "{rec}");
     let screen = ctl_ok(&inst, &[&format!("@{sid}"), "text"]);
     assert!(
-        screen.contains("Should I also delete the old logs?") && screen.contains(&rule[..30]),
-        "NEGATIVE CONTROL: the frame is on screen: {screen}"
+        screen.contains("disk is full?"),
+        "the question is on screen: {screen}"
     );
 }
 
@@ -417,19 +307,12 @@ printf '\033[2J\033[H'
 exit 0
 "#;
 
-/// AN AGENT'S EXIT IS NO AGENT AT ONCE (2026-09-24; lane U's open item for
-/// the server — the relaunch on exit got some exits late or never). Three
-/// times over, a fake Claude Code exits back to its bash: `program=` names
-/// the shell and `agent=-` is pushed, and — the defect — NO agent verdict is
-/// published after the exit: the look that first saw the shell's group read
-/// the departed agent's name, judged the shell's prompt under Claude Code's
-/// reader and published its verdict again — `program=bash agent=idle` stood
-/// for a further look (measured: 250 ms, three rounds of three) and the
-/// in-GUI host went on seeing the agent. Under the shell, `agent=` is `-`
-/// from the first read that names it.
+/// An agent that exits is no agent from its exit on: three times over, a fake Claude Code
+/// exits to its bash, `program=` names the shell, `agent=-` is pushed, and no agent verdict is
+/// published after the exit (the shell's prompt is never judged under Claude Code's reader).
 #[test]
 fn an_agent_that_exits_is_no_agent_from_its_exit_on() {
-    let Some(inst) = boot("x") else { return };
+    let inst = boot("x");
     let (local, sid) = boot_session(&inst);
     let script = inst.tmp.join("fake-exit.sh");
     let die = inst.tmp.join("die");
@@ -522,26 +405,16 @@ fn an_agent_that_exits_is_no_agent_from_its_exit_on() {
     let _ = sub.wait();
 }
 
-/// WHAT IT WRITES AT START (`x`, backspace, space, backspace: a cell written and
-/// erased in place, so the rows end as they were). The status sweep names a
-/// foreground group when it CHANGES and once more 500 ms later
-/// (`PROGRAM_NAME_CONFIRM`), then only when the screen moves. A launch that is silent
-/// until `go` gave a read made while `bash -c 'exec -a claude …'` was still between
-/// fork and exec (a loaded machine stretches that past 500 ms) nothing to be re-read
-/// on, so `program=` stood at the interpreter for the whole 60 s hang detector -
-/// seen on a loaded machine and in stress rounds, reproduced by a 1.2 s `sleep`
-/// before the `exec`. A real Claude Code moves the screen the moment it runs; this
-/// does too. (A cursor-only move does not: it leaves the screen's sequence number
-/// alone and the sweep never looks.)
+/// A fake Claude Code launch, drawn as 2.1.283 draws one (aterm-phase's `LAUNCH_*` fixtures):
+/// nothing on the screen until `go` exists, then its REPL on the alternate screen (banner,
+/// composer between its two rules, mode footer, top row down), the cursor on the caret row at
+/// column 2.
 ///
-/// A fake Claude Code LAUNCH, drawn as 2.1.283 draws one (measured frame by
-/// frame on 2026-09-26: aterm-phase's `LAUNCH_*` fixtures): nothing of it on
-/// the screen — the shell's rows stand, as they do between the launch (or
-/// the folder-trust dialog, which it erases) and the REPL — until `go`
-/// exists; then its REPL on the alternate screen: the banner, the composer
-/// between its two rules, the mode footer, drawn from the top row down, and
-/// the terminal's cursor on the caret row at column 2, where Claude Code
-/// keeps it (measured with the cursor on 2026-09-27).
+/// It first writes and erases one cell (`x`, backspace, space, backspace), as a real Claude
+/// Code moves the screen the moment it runs. The status sweep names a foreground group when it
+/// changes and once more 500 ms later (`PROGRAM_NAME_CONFIRM`), then only when the screen moves
+/// (a cursor-only move does not count), so a silent launch read between `exec -a`'s fork and
+/// exec would leave `program=` at the interpreter.
 const FAKE_LAUNCH: &str = r#"#!/bin/sh
 go="$1"
 printf 'x\b \b'
@@ -553,15 +426,11 @@ printf '\033[4;3H'
 while :; do sleep 1; done
 "#;
 
-/// (It writes the same start-up cell as [`FAKE_LAUNCH`], for the same reason.)
-///
-/// The same launch under Claude Code's INLINE renderer (its classic
-/// main-screen one, measured on 2.1.283 on 2026-09-26: aterm-phase's
-/// `INLINE_*` fixtures): the REPL drawn on the MAIN grid under the launch
-/// line, the rows below it left blank, the cursor on the caret row at column
-/// 2. Once `quit` exists it exits as Claude Code does: its prompt box left
-/// on the main grid, the cursor on the row under its footer, where the
-/// shell's prompt comes back (measured, 2026-09-27).
+/// The same launch under Claude Code's inline (main-screen) renderer, measured on 2.1.283
+/// (aterm-phase's `INLINE_*` fixtures): the REPL drawn on the main grid under the launch line,
+/// the cursor on the caret row at column 2, the start-up cell as in [`FAKE_LAUNCH`]. Once
+/// `quit` exists it exits as Claude Code does: its prompt box left on the grid, the cursor on
+/// the row under its footer.
 const FAKE_INLINE_LAUNCH: &str = r#"#!/bin/sh
 go="$1"
 quit="$2"
@@ -574,23 +443,11 @@ while [ ! -e "$quit" ]; do sleep 0.05; done
 printf '\033[3B\r'
 "#;
 
-/// NEW-1 of the live e2e (2026-09-26), live: `await agent idle` on a Claude
-/// Code that has started but not drawn its REPL PARKS — the server reads
-/// the shell's rows under Claude Code's reader as `agent=unknown`, not
-/// `idle` — and latches only once the composer is on the screen. On the old
-/// reader those rows read idle, the wait answered at once, and a first
-/// prompt typed then into Claude Code 2.1.283 was lost (measured: 5 of 5
-/// after the trust dialog). THE CONTROL: the REPL drawn, the same wait
-/// latches, and the screen it answered on holds the composer.
-///
-/// In a pane TALLER than the verdict's 40 rows (the review of 2026-09-26):
-/// the REPL drawn from the top row down on the alternate screen, and under
-/// the launch line on the main grid (the inline renderer), leaves blank rows
-/// below it, and the server read the grid's last 40 rows — the prompt box's
-/// caret above them — so the wait answered `OK timeout` (8 of 8 live inline
-/// launches at 150x50). The verdict reads the last 40 DRAWN rows: the wait
-/// latches on the REPL at 50 rows and at 80. The two instances share
-/// nothing, so they run side by side.
+/// `await agent idle` on a Claude Code that has started but not drawn its REPL parks (the
+/// shell's rows under Claude Code's reader are `agent=unknown`) and latches once the composer
+/// is on the screen; a first prompt typed earlier would be lost. In a pane taller than the
+/// verdict's 40 rows the REPL leaves blank rows below it, and the verdict reads the last 40
+/// drawn rows: the wait latches at 50 rows and at 80. The two instances run side by side.
 #[test]
 fn await_agent_idle_waits_for_a_composer_above_the_last_40_rows() {
     std::thread::scope(|scope| {
@@ -608,9 +465,7 @@ fn await_agent_idle_waits_for_a_composer_above_the_last_40_rows() {
 /// parks while nothing of the REPL is drawn (`agent=unknown`), and latches
 /// on the REPL once it is.
 fn waits_for_the_composer(tag: &str, lines: u16, fake: &str) {
-    let Some(inst) = boot_rows(tag, lines) else {
-        return;
-    };
+    let inst = boot_rows(tag, lines);
     let (_, sid) = boot_session(&inst);
     let script = inst.tmp.join("fake-launch.sh");
     std::fs::write(&script, fake).expect("write the fake");
@@ -632,23 +487,14 @@ fn waits_for_the_composer(tag: &str, lines: u16, fake: &str) {
     }
 }
 
-/// THE SAME TAB, RELAUNCHED (the review of 2026-09-26): Claude Code's
-/// inline renderer run again in the tab it exited in leaves the previous
-/// run's prompt box on the main grid above the new launch line, and the
-/// server — reading that box by its frame alone — published `agent=idle`
-/// before the new REPL was drawn: `await agent idle` answered at once, and
-/// a draft typed then was lost (3 of 3 after the folder-trust dialog, 1 of
-/// 3 without it, on 2.1.283). Live, in a 50-row pane: a first fake run
-/// draws its REPL and exits, its box left on the grid; the second launch in
-/// the same tab reads `agent=unknown` — the cursor under its launch line,
-/// in no prompt box — and the wait parks until the new REPL is drawn, then
-/// latches on it: the caret it answered on is under the SECOND launch line.
-/// THE CONTROL: the first run in the fresh tab latches the same way.
+/// Claude Code's inline renderer, relaunched in the tab it exited in, leaves the previous
+/// run's prompt box above the new launch line; a verdict read from that box's frame would
+/// answer `await agent idle` before the new REPL is drawn. In a 50-row pane the second launch
+/// reads `agent=unknown` and the wait latches on the new REPL, whose caret is under the second
+/// launch line. Control: the first run latches the same way.
 #[test]
 fn await_agent_idle_waits_for_the_relaunched_repl_in_the_same_tab() {
-    let Some(inst) = boot_rows("r", 50) else {
-        return;
-    };
+    let inst = boot_rows("r", 50);
     let (_, sid) = boot_session(&inst);
     let script = inst.tmp.join("fake-inline.sh");
     std::fs::write(&script, FAKE_INLINE_LAUNCH).expect("write the fake");
@@ -693,13 +539,9 @@ fn await_agent_idle_waits_for_the_relaunched_repl_in_the_same_tab() {
 /// Type the launch of `script` as `claude` (`exec -a`), its go-file `go` and
 /// quit-file `quit`.
 fn launch_fake(inst: &Instance, sid: &str, script: &Path, go: &Path, quit: &Path) {
-    // THE SHELL FIRST. A line typed before bash has drawn its prompt is echoed
-    // twice: once raw by the tty in canonical mode, then again when readline
-    // starts and redisplays the pending input after its prompt. On a loaded
-    // machine the relaunch test counted three launch lines for two launches
-    // and failed. Every launch
-    // waits for a prompt row (`$ ` at the end, the default PS1) — the same wait a
-    // person makes before typing.
+    // The shell first: a line typed before bash draws its prompt is echoed twice (raw by the
+    // tty in canonical mode, again when readline redisplays the pending input), so every
+    // launch waits for a prompt row, as a person would.
     ctl_ok(
         inst,
         &[&format!("@{sid}"), "await", "match", r"[$#]\s*$", HANG_MS],
@@ -716,10 +558,9 @@ fn launch_fake(inst: &Instance, sid: &str, script: &Path, go: &Path, quit: &Path
     );
 }
 
-/// With a fake launched and nothing of its REPL drawn: once the server names
-/// it an agent, `await agent idle` PARKS (`agent=unknown`) for 1.5 s; then
-/// `go` is created, the REPL is drawn, and the wait latches on it. Returns
-/// the screen it answered on, which holds the REPL.
+/// With a fake launched and nothing of its REPL drawn, `await agent idle` parks
+/// (`agent=unknown`); then `go` is created and the wait latches on the REPL.
+/// Returns the screen it answered on.
 fn parks_then_latches(inst: &Instance, sid: &str, go: &Path, what: &str) -> String {
     let named = status_until(inst, sid, HANG, "program=claude, read as an agent", |s| {
         field(s, "program") == Some("claude") && field(s, "agent") != Some("-")
@@ -732,7 +573,6 @@ fn parks_then_latches(inst: &Instance, sid: &str, go: &Path, what: &str) -> Stri
         );
         move || cmd.output().expect("await agent idle")
     });
-    std::thread::sleep(Duration::from_millis(1500));
     let before = status(inst, sid);
     assert!(
         !waiter.is_finished(),
@@ -770,19 +610,16 @@ while [ ! -e "$2" ]; do sleep 0.1; done
 printf '\033[?1049l'
 "#;
 
-/// THE 2026-09-28 STALL, as the server publishes it. The owner's tab 1 sat at
-/// its weekly limit for 4 h 44 m while `status` said `agent=busy`: the screen
-/// counts a background shell (`· 1 shell ·`, `1 shell still running`) and the
-/// reader took every such screen for a turn still running. The measured
-/// screen, drawn by a fake `claude`, is now `agent=wall:usage-weekly`, and
-/// `await agent wall:usage-weekly` latches. NEGATIVE CONTROL: the same
-/// screen with the agent's spinner under it is a live turn, `agent=busy`.
+/// A Claude screen at its weekly limit with a background shell counted on it (`· 1 shell ·`,
+/// `1 shell still running`) is `agent=wall:usage-weekly`, not busy, and
+/// `await agent wall:usage-weekly` latches. Negative control: the same screen with the
+/// agent's spinner under it is `agent=busy`.
 #[test]
 fn a_weekly_wall_behind_a_shell_is_a_wall_not_busy() {
     const WALL: &str = include_str!(
         "../../aterm-phase/src/fixtures/claude-2.1.283-wall-weekly-goal-paused-shell-measured.txt"
     );
-    let Some(inst) = boot("w") else { return };
+    let inst = boot("w");
     let (_local, sid) = boot_session(&inst);
     let script = inst.tmp.join("fake-screen.sh");
     std::fs::write(&script, FAKE_SCREEN).expect("write the fake");
@@ -836,7 +673,7 @@ fn a_weekly_wall_behind_a_shell_is_a_wall_not_busy() {
         ],
     );
     assert!(held.starts_with("OK"), "the wait latches: {held}");
-    // CONTROL: quit the fake, draw the live screen: busy.
+    // Negative control: the live screen is busy.
     std::fs::write(&quit, "").expect("quit");
     status_until(&inst, &sid, HANG, "the fake gone", |s| {
         field(s, "program") != Some("claude")

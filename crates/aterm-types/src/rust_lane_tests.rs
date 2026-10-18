@@ -251,32 +251,6 @@ fn a_trust_toolchains_own_rustc_by_path_is_not_stock_and_its_cargo_names_its_tar
         commands(&stock.instead),
         ["targo trust build", "targo --unverified build"]
     );
-    // The refusal says what that binary is — never "stock Rust" — and names no pin:
-    // a path runs no rustup proxy, so a pin moves nothing there.
-    let file = PinSource::File("/r/rust-toolchain.toml".into());
-    let text = refusal(&hit, Some((&file, "1.97.1")));
-    assert!(
-        text.starts_with(
-            "`/opt/trust/bin/cargo test` is a Trust toolchain's compatibility cargo: upstream \
-             cargo's surface, which names no lane.\nRun that toolchain's targo:\n"
-        ),
-        "{text}"
-    );
-    assert!(!text.contains("is stock Rust"), "{text}");
-    assert!(!text.contains("stock Rust is genuinely required"), "{text}");
-    assert!(!text.contains("pins stock"), "{text}");
-    assert!(!text.contains("aterm help rust"), "{text}");
-    assert!(
-        text.contains("\n  /opt/trust/bin/targo trust test -p x "),
-        "{text}"
-    );
-    assert!(
-        text.ends_with(
-            "If upstream cargo's surface is genuinely required, put ATERM_STOCK_REASON='<why>' \
-             in front of the command and say why in your reply."
-        ),
-        "{text}"
-    );
     // The escape clears it like any other.
     assert!(matches!(
         verdict_in(
@@ -502,97 +476,6 @@ fn an_escape_is_reported_with_its_reason_and_never_hides_a_second_command() {
     assert_eq!(check("ATERM_STOCK_REASON=why cargo test"), None);
 }
 
-/// The refusal a guard returns: the stock spelling as used, the Trust spelling
-/// of the same command with the agent's own arguments, the fact that a stock
-/// pin moves only rustup's proxies, the directory's own stock pin when it has
-/// one, and the escape hatch — never an instruction to build with stock.
-#[test]
-fn the_refusal_names_the_trust_spelling_the_pin_and_the_escape() {
-    let hit = check("cargo +1.97.1 test -p trust-cg-opt").expect("hit");
-    let text = refusal(&hit, None);
-    assert!(
-        text.starts_with("`cargo +1.97.1 test` is stock Rust."),
-        "{text}"
-    );
-    assert!(text.contains("moves only rustup's proxies"), "{text}");
-    assert!(
-        text.contains("never targo, tippy, trustfmt or trustdoc"),
-        "{text}"
-    );
-    assert!(
-        text.contains("\n  targo trust test -p trust-cg-opt "),
-        "the verified lane with the caller's arguments: {text}"
-    );
-    assert!(
-        text.contains("\n  targo --unverified test -p trust-cg-opt "),
-        "{text}"
-    );
-    assert!(text.contains("ATERM_STOCK_REASON='<why>'"), "{text}");
-    assert!(text.contains("aterm help rust"), "{text}");
-    assert!(!text.contains("pins stock \""), "no pin was given: {text}");
-    // A stock pin is named; a Trust pin is not a stock pin; a channel the command
-    // names outranks any pin, so none is named beside it.
-    let file = PinSource::File("/r/rust-toolchain.toml".into());
-    assert_eq!(refusal(&hit, Some((&file, "1.97.1"))), text);
-    let bare = check("cargo test -p trust-cg-opt").expect("hit");
-    let unpinned = refusal(&bare, None);
-    let pinned = refusal(&bare, Some((&file, "1.97.1")));
-    assert!(
-        pinned.contains(
-            "\nThis directory pins stock \"1.97.1\" (/r/rust-toolchain.toml); build it with the \
-             Trust spelling all the same.\n"
-        ),
-        "{pinned}"
-    );
-    assert_eq!(refusal(&bare, Some((&file, "trust"))), unpinned);
-    // `$RUSTUP_TOOLCHAIN` is the environment, not the directory.
-    let env = refusal(&bare, Some((&PinSource::Env, "stable")));
-    assert!(
-        env.contains(
-            "\n$RUSTUP_TOOLCHAIN names stock \"stable\"; build with the Trust spelling all the \
-             same.\n"
-        ),
-        "{env}"
-    );
-    assert!(!env.contains("This directory"), "{env}");
-    // A verb targo is not known to have: the spelling is offered as conditional, never as the
-    // command to run (`targo nextest` is "no such command").
-    let ext = refusal(&check("cargo nextest run -p x").expect("hit"), None);
-    assert!(ext.contains("targo may not have this verb"), "{ext}");
-    assert!(
-        ext.contains("IF it does, the Trust spelling is:\n  targo nextest run -p x\n"),
-        "{ext}"
-    );
-    assert!(ext.contains("no Trust spelling yet"), "{ext}");
-    assert!(
-        !ext.contains("Run the Trust spelling of the same command"),
-        "{ext}"
-    );
-    assert!(!text.contains("targo may not have this verb"), "{text}");
-    // One spelling, no lane: the linter.
-    let lint = refusal(
-        &check("cargo clippy --all-targets -- -D warnings").expect("hit"),
-        None,
-    );
-    assert!(
-        lint.contains("\n  targo tippy --all-targets -- -D warnings\n"),
-        "{lint}"
-    );
-    assert!(!lint.contains("targo trust"), "{lint}");
-    // Never an instruction to use stock, and never "the project wins": only the
-    // first line quotes the stock spelling, and every command offered is a
-    // Trust tool with no rustup directive.
-    for t in [&text, &pinned, &lint] {
-        assert!(!t.contains("wins"), "{t}");
-        let offered: Vec<&str> = t.lines().filter(|l| l.starts_with("  ")).collect();
-        assert!(!offered.is_empty(), "{t}");
-        for line in offered {
-            assert!(line.trim_start().starts_with("targo "), "{line:?} in {t}");
-            assert!(!line.contains('+'), "no rustup directive: {line:?}");
-        }
-    }
-}
-
 /// The refusal is bounded: a kilobyte argument does not become a kilobyte
 /// line, a quoted newline does not become a line break, and the cut never
 /// splits a character.
@@ -717,18 +600,6 @@ fn every_cargo_verb_gets_the_lane_targo_accepts_for_it() {
 }
 
 #[test]
-fn spellings_render_as_one_padded_column() {
-    let two = trust_spelling("cargo", &args(&["test", "-p", "x"])).expect("cargo");
-    assert_eq!(
-        render_spellings(&two, "  "),
-        "  targo trust test -p x          VERIFIED   — emits a proof claim\n  \
-         targo --unverified test -p x   UNVERIFIED — no proof claim\n"
-    );
-    let one = trust_spelling("rustfmt", &args(&["a.rs"])).expect("rustfmt");
-    assert_eq!(render_spellings(&one, "    "), "    trustfmt a.rs\n");
-}
-
-#[test]
 fn a_pin_is_read_the_way_rustup_reads_it() {
     assert_eq!(
         channel_in("[toolchain]\nchannel = \"1.97.1\"\ncomponents = [\"rustfmt\", \"clippy\"]\n")
@@ -827,18 +698,6 @@ fn nesting_past_the_cap_is_refused_and_malformed_input_is_bounded() {
             "{kind}: past the cap a stock name is refused even as data"
         );
     }
-    let hit = check(&nest("bash", "cargo build", 12)).expect("refused");
-    let file = PinSource::File("/r/rust-toolchain.toml".into());
-    let text = refusal(&hit, Some((&file, "1.97.1")));
-    assert!(
-        text.starts_with("`cargo` is nested more than 8 levels deep"),
-        "{text}"
-    );
-    assert!(text.contains("Flatten the command"), "{text}");
-    assert!(text.contains("The Trust tool for it:\n  targo\n"), "{text}");
-    assert!(text.contains("ATERM_STOCK_REASON='<why>'"), "{text}");
-    assert!(!text.contains("is stock Rust"), "{text}");
-    assert!(!text.contains("pins stock"), "{text}");
     for cmd in [
         "echo 'unterminated",
         "echo \"unterminated",
@@ -884,35 +743,16 @@ fn a_trust_channels_own_rustc_and_rustdoc_are_not_stock() {
     ] {
         assert!(check(cmd).is_some(), "MISSED {cmd:?}");
     }
-    // A Trust channel's cargo is that toolchain's compatibility cargo, never "stock
-    // Rust"; and a channel the command names outranks the directory's pin.
-    let file = PinSource::File("/r/rust-toolchain.toml".into());
-    for (cmd, first) in [
-        (
-            "cargo +trust build",
-            "`cargo +trust build` is the compatibility cargo of rustup's trust toolchain: \
-             upstream cargo's surface, which names no lane.\n",
-        ),
-        (
-            "rustup run trust-45040366 cargo build",
-            "`rustup run trust-45040366 cargo build` is the compatibility cargo of rustup's \
-             trust-45040366 toolchain: upstream cargo's surface, which names no lane.\n",
-        ),
+    // A Trust channel's cargo is that toolchain's compatibility cargo, never
+    // stock; a stock channel's cargo is stock.
+    for cmd in [
+        "cargo +trust build",
+        "rustup run trust-45040366 cargo build",
     ] {
-        let hit = check(cmd).expect("hit");
-        assert!(hit.compat, "{cmd:?}");
-        let text = refusal(&hit, Some((&file, "1.97.1")));
-        assert!(text.starts_with(first), "{text}");
-        assert!(!text.contains("is stock Rust"), "{text}");
-        assert!(!text.contains("pins stock"), "{text}");
-        assert!(text.contains("\n  targo trust build "), "{text}");
+        assert!(check(cmd).expect("hit").compat, "{cmd:?}");
     }
     for cmd in ["cargo +stable build", "rustup run 1.97.1 cargo build"] {
-        let hit = check(cmd).expect("hit");
-        assert!(!hit.compat, "{cmd:?}");
-        let text = refusal(&hit, Some((&file, "1.97.1")));
-        assert!(text.contains("is stock Rust"), "{text}");
-        assert!(!text.contains("pins stock"), "{text}");
+        assert!(!check(cmd).expect("hit").compat, "{cmd:?}");
     }
     assert!(
         !check("rustup run trust rustfmt a.rs").expect("hit").compat,

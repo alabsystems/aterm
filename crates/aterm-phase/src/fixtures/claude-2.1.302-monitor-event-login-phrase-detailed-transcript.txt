@@ -1,0 +1,25 @@
+# claude-code 2.1.302 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a Monitor whose command printed 'Not logged in · Please run /login', the reply to the event EMPTY, then ctrl+o: the detailed transcript draws the event's body under its row at column 2
+ ▐▛███▛█   Claude Code v2.1.302
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ /clear
+
+❯ toolstart
+
+⏺ Monitor(login watch)
+  ⎿  Monitor started · task bt12jvxw2 · timeout 60s
+
+                                                                                                                07:06 PM claude-opus-5-5
+⏺ Tool call done.
+
+✻ Churned for 0s · done 7:06 PM · 1 monitor still running
+
+⏺ Monitor event: "login watch"
+  Not logged in · Please run /login
+
+✻ Baked for 0s · done 7:06 PM · 1 monitor still running
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Showing detailed transcript · ctrl+o to toggle · ctrl+e to show all                                                                   verbose

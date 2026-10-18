@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-xkb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "First-party libxkbcommon declarations for aterm: keymaps, states, compose and the X11 keymap, read at run time, and the keysyms aterm's key handling names"
+
+# docs/AUDIT-third-party-2026-10-15.md, linux-windowing LW.6. No
+# xkbcommon-dl or xkeysym here, not even as dev-dependencies: xkeysym's values,
+# recorded once by tests/recorder (its own workspace) into tests/recorded/,
+# and libxkbcommon itself (tests/live_xkb.rs, in the Linux lane) are the
+# oracles.
+
+[dependencies]
+# libxkbcommon and libxkbcommon-x11, opened at run time.
+aterm-dl = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# tests/live_xkb.rs's X server connection for libxkbcommon-x11.
+aterm-x11 = { workspace = true }
+
+[lints]
+workspace = true

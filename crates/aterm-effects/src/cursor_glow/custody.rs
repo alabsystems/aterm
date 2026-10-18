@@ -590,6 +590,37 @@ impl PressCredits {
         None
     }
 
+    /// The slot of the oldest payable press when the payable presses begin,
+    /// oldest-first, with exactly `glyphs`: one cell each, every one pressed
+    /// after `after` ([`CursorGlow::merged_correction`]).
+    pub(super) fn exact_run_after(
+        &self,
+        now: Instant,
+        after: Instant,
+        glyphs: &[char],
+    ) -> Option<usize> {
+        let mut first = None;
+        let mut n = 0;
+        for k in 0..TYPED_STAMP_DEPTH {
+            if n == glyphs.len() {
+                break;
+            }
+            let i = (self.head + k) % TYPED_STAMP_DEPTH;
+            let Some((at, credits, glyph)) = self.slots[i] else {
+                continue;
+            };
+            if !self.payable(at, credits, now) {
+                continue;
+            }
+            if at <= after || credits != 1 || glyph != Some(glyphs[n]) {
+                return None;
+            }
+            first.get_or_insert(i);
+            n += 1;
+        }
+        first.filter(|_| n == glyphs.len() && n > 0)
+    }
+
     /// A later exact content echo proves earlier same-stream keys already
     /// appeared or were suppressed: drop their unpaid credits so they cannot
     /// fund unrelated program output. The slot is identified by ring
@@ -936,6 +967,62 @@ pub(super) struct TornLay {
     /// A print since the lay ended on another row: the program wrote
     /// elsewhere. Without it nothing is recalled.
     pub(super) printed_off_row: bool,
+}
+
+/// The most presses an [`EraseWitness`] remembers retiring.
+pub(super) const ERASE_RETIRED_MAX: usize = 4;
+
+/// The last Backspace ([`CursorGlow::note_backspace_erasing`]) and what its
+/// echo still owes. Bytes are processed in order: the keys typed before the
+/// Backspace echo ahead of its retreat, a key it retired before that key
+/// echoed included, and no key typed after it echoes before it. So until a
+/// caret move shows the erase, the erase licenses its own retreat however
+/// late, and a forward hop printing a retired key's glyph is that key's late
+/// echo, which no press pays ([`CursorGlow::erase_hop`]). In that time the
+/// erase and the keys typed since can also echo as one repaint
+/// ([`CursorGlow::merged_correction`]).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct EraseWitness {
+    /// The latest Backspace's press.
+    pub(super) at: Instant,
+    /// The glyphs of the presses Backspaces retired before they echoed, in
+    /// typing order, their late echoes still to land.
+    pub(super) retired: [char; ERASE_RETIRED_MAX],
+    pub(super) retired_n: u8,
+    /// The retreat cells the Backspaces since the last shown erase still owe
+    /// (an unpriced erase owes one).
+    pub(super) owed: u16,
+}
+
+impl EraseWitness {
+    /// Whether a retreat is still owed at `now`, within the press patience.
+    pub(super) fn owed_at(&self, now: Instant) -> bool {
+        self.owed > 0
+            && now.saturating_duration_since(self.at).as_secs_f32() <= IN_FLIGHT_PATIENCE_S
+    }
+
+    /// The retired glyphs still to echo.
+    pub(super) fn retired(&self) -> &[char] {
+        &self.retired[..usize::from(self.retired_n)]
+    }
+}
+
+/// What an observed move is to an owed [`EraseWitness`]
+/// ([`CursorGlow::erase_hop`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum EraseHop {
+    /// A same-row retreat no wider than the erases owe: their echo, which
+    /// they license.
+    Retreat(u16),
+    /// A same-row forward hop the presses typed before the erase pay: theirs,
+    /// echoed ahead of it. The erase stays owed.
+    Ahead,
+    /// A same-row forward hop whose last `n` cells, past what those presses
+    /// pay, print the retired keys' glyphs: their late echo, which no press
+    /// pays and the erase licenses. The erase stays owed.
+    Late(u16),
+    /// Any other move: the erase is past.
+    Past,
 }
 
 /// The park: Ink repaints the input row by parking the caret left (a same-row
@@ -1373,11 +1460,34 @@ impl CursorGlow {
         // retired and the rest keep waiting (`abc⌫d` echoes as three cells for
         // `a`, `b`, `d`). Not a forget: the row is still the hand's. An IME
         // press gives back only the erased glyph's cells when priced.
+        let newest = self.type_press_ring.newest();
+        let newest_press = newest.and_then(|i| self.type_press_ring.slots[i]);
         match cells {
             Some(cells) => self
                 .type_press_ring
                 .retire_newest_cells(u8::try_from(cells).unwrap_or(u8::MAX)),
             None => self.type_press_ring.retire_newest(),
+        }
+        // A press retired whole had not echoed yet, and its echo may still
+        // land ahead of this erase's retreat ([`EraseWitness`]). An earlier
+        // Backspace's retired presses stay owed while its retreat is unseen;
+        // this one retired the newest press left, typed before theirs.
+        let retired = newest
+            .filter(|&i| self.type_press_ring.slots[i].is_none())
+            .and(newest_press)
+            .and_then(|(_, _, glyph)| glyph);
+        let mut owed = self
+            .last_erase
+            .filter(|erase| erase.owed_at(now))
+            .map_or(([' '; ERASE_RETIRED_MAX], 0, 0), |erase| {
+                (erase.retired, erase.retired_n, erase.owed)
+            });
+        if let Some(glyph) = retired
+            && usize::from(owed.1) < ERASE_RETIRED_MAX
+        {
+            owed.0.copy_within(..usize::from(owed.1), 1);
+            owed.0[0] = glyph;
+            owed.1 += 1;
         }
         // The two poof licences are one pending authority: a newer Backspace
         // must not borrow an unanswered kill's clause-scale fallback or swoosh.
@@ -1394,6 +1504,12 @@ impl CursorGlow {
         // erase is one advance of [`Self::erase_mom`].
         self.erase_mom.advance(now);
         self.quench_hint = Some(now);
+        self.last_erase = Some(EraseWitness {
+            at: now,
+            retired: owed.0,
+            retired_n: owed.1,
+            owed: owed.2.saturating_add(cells.unwrap_or(1)),
+        });
         // Schedule the plain-Backspace poof: `poof_scan` ORs this into the
         // `fresh_kill` gate, and the full-trust span/fallback machinery covers
         // the erase (a ContentOnly probe licenses nothing, see [`ProbeTrust`]).

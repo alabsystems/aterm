@@ -52,8 +52,8 @@
 //! * It reads strictly forward: every skip is a bounded `read` loop into a fixed stack
 //!   buffer, so a huge declared size costs time, which the caller's budget also caps.
 //! * It does not interpret paths: `..`, absolute paths, symlink targets and disallowed
-//!   kinds are the extractor's `vet_entry` / `vet_hardlink` decision, handed the exact
-//!   bytes the archive carried.
+//!   kinds are the extractor's `vet_entry` / `vet_hardlink_stripped` decision, handed
+//!   the exact bytes the archive carried.
 //!
 //! `tests/tar_corpus.rs` pins accept-or-reject and every field the extractor reads, over
 //! hand-built adversarial headers and tens of thousands of mutated archives, recorded when
@@ -622,8 +622,9 @@ impl<'a, R: Read> Entries<'a, R> {
                     let path_bytes = gnu_path.or(pax.path).unwrap_or_else(|| header.path_bytes());
                     // An override that exists but is empty is still an override
                     // (`Some("")`); only the header's own `linkname` collapses empty to
-                    // "no link target". Flattening the two would give `vet_hardlink`
-                    // different inputs from one archive in two readers.
+                    // "no link target". Flattening the two would give
+                    // `vet_hardlink_stripped` different inputs from one archive in two
+                    // readers.
                     let link_bytes = gnu_link.or(pax.link).or_else(|| {
                         let raw = header.link_bytes();
                         (!raw.is_empty()).then_some(raw)

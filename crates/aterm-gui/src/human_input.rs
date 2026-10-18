@@ -38,7 +38,7 @@
 //! own after a person's click) is never stamped: that is the whole point.
 //!
 //! **What it never does**: gate a PERSON's byte. The seam records `src` for
-//! audit and never branches its egress on it (`bytes_human_eq_controller`);
+//! audit and never branches its egress on it (`seam_egress` takes no source);
 //! this stamp is such a record, read by the `status` and `text --json` verbs
 //! and by a CONTROLLER's own fence: `key|send
 //! if-human=<n>` (`crate::control_input::InputFence`) asks, under the terminal
@@ -66,12 +66,20 @@
 //! fence does close is the round trip it replaces: a controller that read the
 //! count on one request and wrote on the next.
 //!
+//! **The plain-Enter marker** ([`HumanInputStamp::probe`], 2026-10-16): the
+//! number of the last gesture that was a plain Enter key press
+//! ([`Gesture::PlainEnter`]). Equal to the count, the LAST gesture counted was
+//! that Enter — what the launch witness (`crate::launch_witness`) asks at the
+//! shell's command-start mark: the key that accepted the command line, with
+//! nothing typed after it.
+//!
 //! Lock-free: one monotonic clock read ([`crate::metrics::now_us`]), one
 //! relaxed atomic store and one release add per person gesture — the stamp
 //! before the count, so a read of the count (an acquire) and then the age
 //! never pairs a counted gesture with an age from before it — one load per
-//! read. The stamp lives in this process: a session adopted across a
-//! seamless update reads "never" until a person keys it again.
+//! read, and for a plain Enter one release store more. The stamp lives in
+//! this process: a session adopted across a seamless update reads "never"
+//! until a person keys it again.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -85,13 +93,62 @@ use crate::input::InputEvent;
 pub(crate) struct HumanInputStamp {
     at: AtomicU64,
     count: AtomicU64,
+    /// The number of the last gesture that was [`Gesture::PlainEnter`]; `0`
+    /// for none.
+    last_plain_enter: AtomicU64,
+}
+
+/// What kind of gesture [`HumanInputStamp::note`] counts, for the
+/// plain-Enter marker. Passed down from the seam that saw the event
+/// (`crate::app_input::note_person`), never guessed from bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Gesture {
+    /// A press of the named Enter key with no modifier held: not a repeat,
+    /// not keypad Enter, not committed text, a paste or a `[key_sequences]`
+    /// chord that carries a CR. A lock key's state (Caps Lock, Num Lock),
+    /// which a windowed key press carries in its modifiers, is no modifier
+    /// held: it does not change which key accepted the line (as
+    /// `crate::app_input`'s plain Enter reads it).
+    PlainEnter,
+    /// Every other gesture.
+    Other,
+}
+
+impl Gesture {
+    /// The class of `ev`, a person's gesture ([`is_person_gesture`]).
+    pub(crate) fn of(ev: &InputEvent) -> Self {
+        use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
+        match ev {
+            InputEvent::Key {
+                key: Key::Named(NamedKey::Enter),
+                mods,
+                event_type: KeyEventType::Press,
+                ..
+            } if mods
+                .difference(Modifiers::CAPS_LOCK | Modifiers::NUM_LOCK)
+                .is_empty() =>
+            {
+                Self::PlainEnter
+            }
+            _ => Self::Other,
+        }
+    }
+}
+
+/// The person count with what its last gesture was ([`HumanInputStamp::probe`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PersonProbe {
+    /// [`HumanInputStamp::seq`].
+    pub(crate) seq: u64,
+    /// Gesture `seq` was a [`Gesture::PlainEnter`] (never for `seq` 0).
+    pub(crate) plain_enter: bool,
 }
 
 impl HumanInputStamp {
-    /// A person's gesture reached the session at `now_us`. `true` when it
-    /// opens a burst: the first ever, or the first after
+    /// A person's gesture of kind `gesture` reached the session at `now_us`.
+    /// `true` when it opens a burst: the first ever, or the first after
     /// [`crate::session_timeline::HUMAN_BURST_GAP_MS`] without one.
-    pub(crate) fn note(&self, now_us: u64) -> bool {
+    pub(crate) fn note(&self, now_us: u64, gesture: Gesture) -> bool {
         // THE STAMP BEFORE THE COUNT, the count's add a Release and
         // [`Self::seq`]'s load an Acquire: a reader that sees this gesture
         // counted sees its stamp too. Counted first (as it was until
@@ -99,7 +156,14 @@ impl HumanInputStamp {
         // count with the OLD age — "quiet" — and a key fenced on that count
         // passed the fence the gesture should have moved.
         let before = self.at.swap(now_us.saturating_add(1), Ordering::Relaxed);
-        self.count.fetch_add(1, Ordering::Release);
+        let n = self.count.fetch_add(1, Ordering::Release).wrapping_add(1);
+        // The marker takes the number THIS add returned, after it: equal to
+        // the count only when gesture `n` itself was a plain Enter, however
+        // two notes interleave. A probe between the add and this store sees
+        // the older marker, and says "not a plain Enter".
+        if gesture == Gesture::PlainEnter {
+            self.last_plain_enter.store(n, Ordering::Release);
+        }
         before.checked_sub(1).is_none_or(|at| {
             now_us.saturating_sub(at) / 1000 >= crate::session_timeline::HUMAN_BURST_GAP_MS
         })
@@ -122,6 +186,20 @@ impl HumanInputStamp {
     /// a gesture the count already holds ([`Self::note`]).
     pub(crate) fn seq(&self) -> u64 {
         self.count.load(Ordering::Acquire)
+    }
+
+    /// [`Self::seq`] and whether its last gesture was a plain Enter: the
+    /// count first, then the marker, both acquires. Equal, gesture `seq` was
+    /// a [`Gesture::PlainEnter`] (the marker only ever holds the number of a
+    /// plain Enter); a probe racing a note reads them unequal, never a false
+    /// "plain Enter".
+    pub(crate) fn probe(&self) -> PersonProbe {
+        let seq = self.count.load(Ordering::Acquire);
+        let enter = self.last_plain_enter.load(Ordering::Acquire);
+        PersonProbe {
+            seq,
+            plain_enter: seq > 0 && enter == seq,
+        }
     }
 
     /// Milliseconds from the last person's gesture to `now_us`; `None` when
@@ -184,14 +262,14 @@ mod tests {
         let s = HumanInputStamp::default();
         assert_eq!(s.ms_since(5_000_000), None);
         assert_eq!(s.wire(5_000_000), "-");
-        s.note(5_000_000);
+        s.note(5_000_000, Gesture::Other);
         assert_eq!(s.ms_since(5_000_000), Some(0));
         assert_eq!(s.ms_since(17_345_678), Some(12_345));
         assert_eq!(s.wire(17_345_678), "12345");
         assert_eq!(s.ms_since(15_000_000), Some(10_000));
         assert_eq!(s.ms_since(4_000_000), Some(0), "a racing read never wraps");
         // A stamp at the clock's origin is still a stamp, not "never".
-        s.note(0);
+        s.note(0, Gesture::Other);
         assert_eq!(s.ms_since(2_000), Some(2));
     }
 
@@ -218,7 +296,7 @@ mod tests {
             let done = Arc::clone(&done);
             std::thread::spawn(move || {
                 for k in 1..=GESTURES {
-                    stamp.note(k * 1000);
+                    stamp.note(k * 1000, Gesture::Other);
                 }
                 done.store(true, Ordering::Release);
             })
@@ -250,10 +328,13 @@ mod tests {
         let gap_us = crate::session_timeline::HUMAN_BURST_GAP_MS * 1000;
         let s = HumanInputStamp::default();
         assert_eq!(s.wire(5_000_000), "-");
-        assert!(s.note(5_000_000), "the first gesture opens a burst");
-        assert!(!s.note(5_400_000), "inside the burst");
         assert!(
-            !s.note(5_400_000 + gap_us - 1_000),
+            s.note(5_000_000, Gesture::Other),
+            "the first gesture opens a burst"
+        );
+        assert!(!s.note(5_400_000, Gesture::Other), "inside the burst");
+        assert!(
+            !s.note(5_400_000 + gap_us - 1_000, Gesture::Other),
             "a gesture just inside the gap after the last is inside it"
         );
         // A slow typist — a key every few seconds for ten minutes — is still
@@ -261,17 +342,17 @@ mod tests {
         let mut t = 5_400_000 + gap_us - 1_000;
         for _ in 0..200 {
             t += 3_000_000;
-            assert!(!s.note(t), "at {t}");
+            assert!(!s.note(t, Gesture::Other), "at {t}");
         }
         assert!(
-            s.note(t + gap_us),
+            s.note(t + gap_us, Gesture::Other),
             "a full gap without input opens the next"
         );
         assert_eq!(s.ms_since(t + gap_us + 101_000), Some(101));
         // The clock's first microsecond is still a stamp, not "never".
         let early = HumanInputStamp::default();
-        assert!(early.note(0));
-        assert!(!early.note(3_000));
+        assert!(early.note(0, Gesture::Other));
+        assert!(!early.note(3_000, Gesture::Other));
     }
 
     /// THE SEAM STAMPS A PERSON AND NEVER A CONTROLLER: the same arrow from a
@@ -308,6 +389,90 @@ mod tests {
             "the person's arrow stamped the session: {:?}",
             stamp(&app)
         );
+    }
+
+    fn enter(mods: Modifiers, event_type: KeyEventType) -> InputEvent {
+        InputEvent::Key {
+            key: Key::Named(NamedKey::Enter),
+            mods,
+            base_layout: None,
+            layout_text: None,
+            event_type,
+        }
+    }
+
+    /// THE PLAIN-ENTER MARKER, through the real App input seam
+    /// ([`crate::App::input`], the headless App's session 0): a person's
+    /// Enter press marks the count's last gesture as a plain Enter. Each
+    /// gesture that may carry a CR another way — Shift+Enter, a held Enter's
+    /// repeat, keypad Enter, committed text, a paste, a `[key_sequences]`
+    /// chord — and a letter is counted after a plain Enter and leaves the
+    /// probe saying "not a plain Enter"; a controller's Enter neither counts
+    /// nor marks. A lock key's state (Caps Lock, Num Lock: a windowed press
+    /// carries it in its modifiers) leaves an Enter plain, and Shift+Enter
+    /// not.
+    #[test]
+    fn only_a_persons_plain_enter_press_marks_the_count() {
+        use crate::input::{PasteFraming, Source};
+        use crate::{App, WindowId};
+        let mut app = App::headless_for_test();
+        let probe = |app: &App| app.pool.get(0).expect("session 0").ctx.human_input.probe();
+        let at = |seq, plain_enter| PersonProbe { seq, plain_enter };
+        let plain = enter(Modifiers::empty(), KeyEventType::Press);
+        let letter = InputEvent::Key {
+            key: Key::Character('a'),
+            mods: Modifiers::empty(),
+            base_layout: None,
+            layout_text: None,
+            event_type: KeyEventType::Press,
+        };
+        assert_eq!(probe(&app), at(0, false), "a fresh session");
+        let _ = app.input(WindowId(0), plain.clone(), Source::Controller);
+        assert_eq!(probe(&app), at(0, false), "a control verb's Enter");
+        let _ = app.input(WindowId(0), plain.clone(), Source::Human);
+        assert_eq!(probe(&app), at(1, true), "the person's Enter");
+        let mut seq = 1;
+        for (what, lock) in [
+            ("Caps Lock", Modifiers::CAPS_LOCK),
+            ("Num Lock", Modifiers::NUM_LOCK),
+        ] {
+            let _ = app.input(WindowId(0), letter.clone(), Source::Human);
+            let _ = app.input(WindowId(0), enter(lock, KeyEventType::Press), Source::Human);
+            seq += 2;
+            assert_eq!(probe(&app), at(seq, true), "Enter with {what} on");
+        }
+        let others = [
+            ("Shift+Enter", enter(Modifiers::SHIFT, KeyEventType::Press)),
+            (
+                "Shift+Enter with Caps Lock on",
+                enter(Modifiers::SHIFT | Modifiers::CAPS_LOCK, KeyEventType::Press),
+            ),
+            ("a repeat", enter(Modifiers::empty(), KeyEventType::Repeat)),
+            (
+                "keypad Enter",
+                InputEvent::Key {
+                    key: Key::Named(NamedKey::NumpadEnter),
+                    mods: Modifiers::empty(),
+                    base_layout: None,
+                    layout_text: None,
+                    event_type: KeyEventType::Press,
+                },
+            ),
+            ("text", InputEvent::Text("\r".into())),
+            (
+                "a paste",
+                InputEvent::Paste("claude\r".into(), PasteFraming::AtDrain),
+            ),
+            ("a chord", InputEvent::KeySequence(b"\r".to_vec())),
+            ("a letter", letter),
+        ];
+        for (what, ev) in others {
+            let _ = app.input(WindowId(0), plain.clone(), Source::Human);
+            assert_eq!(probe(&app), at(seq + 1, true), "the Enter before {what}");
+            let _ = app.input(WindowId(0), ev, Source::Human);
+            seq += 2;
+            assert_eq!(probe(&app), at(seq, false), "{what}");
+        }
     }
 
     /// An arrow, a digit, Enter and a paste are a person's gesture — the

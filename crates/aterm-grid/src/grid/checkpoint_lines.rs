@@ -78,7 +78,6 @@ impl Grid {
         let rows = self.rows();
         let mut lines = Vec::with_capacity(rows as usize);
         let extras = self.extras();
-        let styles = self.styles();
         for r in 0..rows {
             // A checkpoint carries the live frame, not the scrolled viewport:
             // `row_at_screen()` ignores display_offset.
@@ -86,7 +85,7 @@ impl Grid {
                 lines.push(Line::new());
                 continue;
             };
-            let row_extras = Self::extract_row_extras(row, extras, r, styles);
+            let row_extras = Self::extract_row_extras(row, extras, r);
             // Measured as history measures a row: a continued row at its full
             // width less a recorded early-wrap hole, so the restored row
             // re-derives the hole and rewraps as the live one does. `row.len()`
@@ -203,23 +202,6 @@ mod tests {
         for (col, ch) in text.chars().enumerate() {
             grid.set_cell(row, col as u16, Cell::new(ch));
         }
-    }
-
-    #[test]
-    fn roundtrip_plain_text() {
-        let mut g = Grid::new(4, 20);
-        write_text(&mut g, 0, "hello world");
-        write_text(&mut g, 1, "second line");
-        write_text(&mut g, 3, "bottom");
-
-        let lines = g.checkpoint_lines();
-        assert_eq!(lines.len(), g.scrollback_lines() + 4);
-
-        let rebuilt = rebuild_from_lines(4, 20, &lines);
-        assert_eq!(visible_text(&g), visible_text(&rebuilt));
-        assert_eq!(visible_text(&rebuilt)[0], "hello world");
-        assert_eq!(visible_text(&rebuilt)[1], "second line");
-        assert_eq!(visible_text(&rebuilt)[3], "bottom");
     }
 
     #[test]

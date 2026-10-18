@@ -13,8 +13,11 @@ use std::time::Instant;
 
 use aterm_uds::CtlStream;
 
+#[cfg(target_os = "macos")]
+use super::ServeDisposition;
+#[cfg(target_os = "macos")]
 use super::control_lanes::{LaneLimits, LaneReader, LaneService, Lanes};
-use super::{Scope, ServeDisposition, ServingFd, serving_peer_pid};
+use super::{Scope, ServingFd, serving_peer_pid};
 use crate::self_claim::Proven;
 use crate::session_timeline::{
     ClaimRule, claim_rule, claim_supervisor_as, release_proven_if_gone, release_supervisor,
@@ -406,6 +409,17 @@ fn the_peer_pid_is_read_only_on_a_direct_connection() {
     );
     let direct = super::DirectPeer::enter();
     assert_eq!(serving_peer_pid(), Some(std::process::id()));
+    // A nested serve, including one that unwinds, cannot erase the outer
+    // request's peer context or leave its descriptor on a reusable thread.
+    let nested = std::panic::catch_unwind(|| {
+        let (_nested_client, nested_server) = CtlStream::pair().expect("nested pair");
+        let _serving = ServingFd::enter(&nested_server);
+        let _direct = super::DirectPeer::enter();
+        assert_eq!(serving_peer_pid(), Some(std::process::id()));
+        panic!("the nested request unwound");
+    });
+    assert!(nested.is_err());
+    assert_eq!(serving_peer_pid(), Some(std::process::id()));
     drop(direct);
     drop(serving);
     assert_eq!(serving_peer_pid(), None);
@@ -418,6 +432,7 @@ fn the_peer_pid_is_read_only_on_a_direct_connection() {
 /// `alab_image` is the image fact: the real one
 /// ([`crate::self_claim::runs_alab_build`]), or a stand-in that takes the
 /// claimant's `perl` for an ALab build.
+#[cfg(target_os = "macos")]
 struct MetaService {
     ctx: Arc<crate::SessionCtx>,
     master: i32,
@@ -425,13 +440,18 @@ struct MetaService {
     replies: Mutex<Vec<String>>,
 }
 
+#[cfg(target_os = "macos")]
 impl LaneService for MetaService {
     fn authenticate(
         &self,
         _stream: &CtlStream,
         reader: &mut LaneReader<'_>,
-    ) -> Option<(Scope, Option<String>)> {
-        (super::read_request_line(reader)? == "AUTH ok").then_some((Scope::Owner, None))
+    ) -> Option<(Scope, crate::control::Principal, Option<String>)> {
+        (super::read_request_line(reader)? == "AUTH ok").then_some((
+            Scope::Owner,
+            crate::control::Principal::Instance,
+            None,
+        ))
     }
 
     fn serve_line(
@@ -741,4 +761,119 @@ fn a_claim_is_proven_by_its_connections_peer_leading_the_foreground() {
             }
         }
     }
+}
+
+/// A frame header resolves before its full payload and before ordinary
+/// dispatch. Its real direct peer still counts against an unstarted shell.
+#[test]
+fn a_startup_binary_header_is_counted_from_the_current_direct_peer() {
+    let store = crate::session_store::new_store();
+    let handle = crate::session_store::test_handle(907);
+    let witness = Arc::clone(&handle.ctx.witness);
+    // SAFETY: getsid(0) reads this test process's own session identity.
+    let leader = unsafe { libc::getsid(0) };
+    assert!(leader > 0);
+    witness.shell.set((leader, None)).expect("unobserved shell");
+    store.write().unwrap().register(handle);
+    let active: super::ActiveHandle = Arc::new(Mutex::new(None));
+    let (_client, server) = CtlStream::pair().expect("socket pair");
+    let serving = ServingFd::enter(&server);
+    let header = |out: &mut Vec<u8>| {
+        super::feed_bin_header(
+            "@907 feed-bin 1",
+            "feed-bin",
+            super::FeedBinRoute {
+                active: &active,
+                store: &store,
+                scope: Scope::Owner,
+                subscribers: None,
+            },
+            &mut |_| "OK\n".to_owned(),
+            out,
+        )
+    };
+    assert!(header(&mut Vec::new()));
+    assert_eq!(
+        witness
+            .early_control
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "an inherited/undirected fd establishes no local lineage"
+    );
+    {
+        let _direct = super::DirectPeer::enter();
+        assert!(header(&mut Vec::new()));
+        assert_eq!(
+            witness
+                .early_control
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the header's direct peer is counted before ordinary dispatch"
+        );
+    }
+    drop(serving);
+    assert!(header(&mut Vec::new()));
+    assert_eq!(
+        witness
+            .early_control
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the released worker leaves no old peer behind"
+    );
+}
+
+/// A subscription resolves on its new worker. The same scoped socket peer
+/// counts there, while a subscription with no direct lineage counts nothing.
+#[test]
+fn a_startup_subscription_resolution_uses_its_scoped_peer() {
+    let store = crate::session_store::new_store();
+    let handle = crate::session_store::test_handle(908);
+    let witness = Arc::clone(&handle.ctx.witness);
+    // SAFETY: getsid(0) reads only this test process's own session identity.
+    let leader = unsafe { libc::getsid(0) };
+    assert!(leader > 0);
+    witness.shell.set((leader, None)).expect("unobserved shell");
+    store.write().unwrap().register(handle);
+    let active: super::ActiveHandle = Arc::new(Mutex::new(None));
+    let subscribers = crate::subscribe::new_registry();
+    let subscribe = || {
+        let mut out = Vec::new();
+        super::run_subscribe_with_peer_probe(
+            "subscribe @908 screen",
+            &active,
+            &store,
+            &subscribers,
+            Scope::Owner,
+            &mut out,
+            || true,
+        );
+        assert!(String::from_utf8(out).unwrap().starts_with("OK subscribe "));
+    };
+    subscribe();
+    assert_eq!(
+        witness
+            .early_control
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    {
+        let (_client, server) = CtlStream::pair().expect("socket pair");
+        let _serving = ServingFd::enter(&server);
+        let _direct = super::DirectPeer::enter();
+        subscribe();
+        assert_eq!(
+            witness
+                .early_control
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+    subscribe();
+    assert_eq!(
+        witness
+            .early_control
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "a subsequent undirected request cannot inherit the old peer"
+    );
 }

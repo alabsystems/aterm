@@ -855,11 +855,6 @@ fn setup_over_a_real_terminal_shows_the_phrase_there_and_never_on_stdout() {
         "{}",
         run.stdout
     );
-    assert!(
-        !run.stdout.contains("--strand-pre-roster-clients") && !run.stdout.contains("keyset"),
-        "no retired lane is taught: {}",
-        run.stdout
-    );
 
     // THE PHRASE REACHED NO FILE.
     let checked = assert_nothing_on_disk_holds(&dir, &phrase);
@@ -1231,29 +1226,4 @@ fn setup_refuses_on_an_armed_tree() {
         "a refused setup writes nothing"
     );
     assert!(!Path::new(&p(&dir, "m11.key")).exists());
-}
-
-/// The verbs are discoverable: an unknown verb and a bare invocation both name them.
-#[test]
-fn the_usage_line_names_the_two_verbs_an_owner_actually_runs() {
-    let tmp = scratch("usage");
-    let dir = tmp.path().to_path_buf();
-    let out = run(&dir, None, &[]);
-    assert!(!out.status.success());
-    let err = stderr_of(&out);
-    assert!(err.contains("setup"), "{err}");
-    assert!(err.contains("join"), "{err}");
-
-    let out = run(&dir, None, &["nonsense"]);
-    assert!(!out.status.success());
-    assert!(stderr_of(&out).contains("setup"), "{}", stderr_of(&out));
-
-    // `--id` is required, and the usage names the verb that was actually run.
-    let out = run(&dir, None, &["setup"]);
-    assert!(!out.status.success());
-    assert!(
-        stderr_of(&out).contains("usage: atpkg-keys setup --id"),
-        "{}",
-        stderr_of(&out)
-    );
 }

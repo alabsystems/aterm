@@ -1,0 +1,26 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Muse Code outside the lab's jail, against a local fake backend: launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a scripted stand-in for Meta's model API, which the proxy variables also pointed at and which refused every request for another host; an lsof sampler over the process tree saw no endpoint but loopback), so Muse Code's own managed sandbox applied · the stand-in's call `muse.bash {command: "printf 'ping' | /usr/bin/nc -U -w 2 /private/tmp/at.muse-sock/b6.sock", unix_socket_paths: ["/private/tmp/at.muse-sock/b6.sock"]}` (a Unix socket a local listener held; the default `proxy-only` sandbox network), called again in the next turn and answered with Esc: `◆ Ran … — failed` over `└ Unix socket access was not approved: "<path>"`; the listener got no connection
+
+  Muse Code 1.4.10
+
+❯ scenario:sock
+
+◆ I will talk to the socket.
+
+◆ Ran command · Ping the local socket · ✓ · 44s · ctrl+o
+
+◆ Done. Tool result: { "chunk_id": "exec-1-1", "exit_code": 0, "terminal_status": "completed", "output": "pong\n", "original_output_bytes": 5,
+  "original_output_tokens": 2, "truncated": false }
+
+❯ scenario:sock
+
+◆ I will talk to the socket.
+
+◆ Ran printf 'ping' | /usr/bin/nc -U -w 2 /private/tmp/at.muse-sock/b6.sock — failed
+  └ Unix socket access was not approved: "/private/tmp/at.muse-sock/b6.sock"
+
+◆ Done. Tool result: tool failed: Unix socket access was not approved: "/private/tmp/at.muse-sock/b6.sock"
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  fake-model · high · ~/proj · Auto-review

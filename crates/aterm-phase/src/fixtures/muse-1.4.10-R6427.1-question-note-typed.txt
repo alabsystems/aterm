@@ -1,0 +1,40 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab) · the same with a note typed into the open field · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+  Muse Code 1.4.10
+
+❯ carry on with the task
+
+◆ Hi! I am the local lab stub, not a model. (reply 1)
+
+❯ toolstart
+
+  Structured user input answered — Color: None of the above (note: the policy text goes here); Size: Large
+
+◆ Tool call done. Result: {"status":"answered","answers":[{"id":"color","free_text":"None of the above","note":"the policy text goes
+  here"},{"id":"size","selected_label":"Large"}]}
+
+◆ Worked for 1m 36s · 6:15 PM · 16/Oct
+
+❯ toolstart
+
+  Structured user input answered — Checks: Lint (Recommended)
+
+◆ Tool call done. Result: {"status":"answered","answers":[{"id":"checks","selected_labels":["Lint (Recommended)"]}]}
+
+❯ toolstart
+
+◇ Request user input Color — running (16s)
+
+  Which color should the probe use?
+
+    1. Red (Recommended)  Warm and loud.
+    2. Blue               Cool and calm.
+  ⟩ 3. None of the above  Optionally, add details in notes (tab).
+      Note (optional): Decide yourself: choose the option that best serves long term correctness.▌
+
+  Enter to select · ↑/↓ to move · Tab for an optional note · Esc to interrupt
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  lab-stub · high · /private/tmp/at.lab0/proj · Auto-review

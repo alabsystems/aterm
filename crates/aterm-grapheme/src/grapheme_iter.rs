@@ -173,15 +173,17 @@ impl<'a> Iterator for Graphemes<'a> {
 // stock rustc (the cross cells of `verify cells`, the x86_64-apple-darwin
 // compat slice) parses a cfg'd-out module's body all the same, so the island's
 // module goes through this macro, which drops its tokens there and emits them
-// unchanged under `cfg(trust_verify)`.
-#[cfg(trust_verify)]
+// unchanged under `cfg(clean_islands)`: set by this crate's build script
+// whenever the compiler is Trust (crates/aterm-log/clean_islands.rs), so the
+// island is kernel-checked at every Trust build, not only the verify lane.
+#[cfg(clean_islands)]
 macro_rules! verify_island {
     ($($tt:tt)*) => {
         $($tt)*
     };
 }
 
-#[cfg(not(trust_verify))]
+#[cfg(not(clean_islands))]
 macro_rules! verify_island {
     ($($tt:tt)*) => {};
 }
@@ -445,7 +447,7 @@ mod tests {
     /// model's faulty first-character-only decision, rejected by the same check.
     #[test]
     fn ascii_boundaries_refine_the_derived_fast_path_model() {
-        let model = aterm_spec::derive::ascii_grapheme_fast_path_model();
+        let model = aterm_models_core::ascii_grapheme_fast_path_model();
         for (text, actions) in [
             ("ab", &[][..]),
             ("a\u{0301}", &["SecondIsCombiningMark"][..]),

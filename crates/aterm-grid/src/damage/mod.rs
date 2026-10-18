@@ -34,13 +34,6 @@ pub use iter::{BitsetRowIterator, DamageBoundsIterator, DamagedRowIterator};
 pub use rect::LineDamageBounds;
 pub use tracker::{DamageTracker, RowDamageBounds};
 
-#[cfg(any(test, debug_assertions))]
-pub use iter::MergedDamageIterator;
-#[cfg(any(test, debug_assertions))]
-pub use rect::DamageRect;
-
-#[cfg(test)]
-mod property_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -189,11 +182,5 @@ impl Damage {
             Damage::Full => true,
             Damage::Partial(tracker) => tracker.row_bits.iter().any(|&w| w != 0),
         }
-    }
-
-    /// Iterate over merged damage rectangles (fewer GPU draw calls).
-    #[cfg(test)]
-    pub fn iter_merged(&self, rows: u16, cols: u16) -> MergedDamageIterator<'_> {
-        MergedDamageIterator::new(self, rows, cols)
     }
 }

@@ -18,9 +18,8 @@
 //!
 //! 1. [`WeakObj`] owns a `Box<`[`WeakSlot`]`>`; moving the handle moves the box
 //!    pointer and the registered address stays put. This is the safe API.
-//! 2. Storage that must move goes through the runtime: [`WeakSlot::move_from`]
-//!    (`objc_moveWeak`) and [`WeakSlot::copy_from`] (`objc_copyWeak`), both
-//!    `unsafe`.
+//! 2. A second registered address comes from the runtime:
+//!    [`WeakSlot::copy_from`] (`objc_copyWeak`), `unsafe`.
 //!
 //! [`WeakSlot`] has no safe constructor that could be moved while registered.
 //! `tests/weak.rs` demonstrates the `memcpy` hazard on a real object, and
@@ -49,8 +48,7 @@
 //! `objc_autorelease(objc_loadWeakRetained(location))`.
 //!
 //! The rule: a `&`[`crate::AutoreleasePool`] parameter may gate an operation
-//! but never mint a lifetime. `tests/weak.rs`'s
-//! `a_pool_parameter_never_mints_a_lifetime` enforces it on the source.
+//! but never mint a lifetime.
 //!
 //! # Threads
 //!
@@ -88,10 +86,6 @@ unsafe extern "C" {
     /// `void objc_copyWeak(id *to, id *from)` — register `to` at whatever
     /// `from` names. `to` uninitialised, `from` initialised; both stay valid.
     fn objc_copyWeak(to: *mut Id, from: *mut Id);
-    /// `void objc_moveWeak(id *to, id *from)` — register `to` and unregister
-    /// `from` without touching the target's reference count: the runtime's
-    /// move of a weak reference to a new address.
-    fn objc_moveWeak(to: *mut Id, from: *mut Id);
 }
 
 /// One weak-reference storage location. Its identity is its address.
@@ -109,8 +103,8 @@ pub struct WeakSlot(UnsafeCell<Id>);
 
 impl WeakSlot {
     /// An uninitialised slot holding nil. Nothing is registered until
-    /// [`WeakSlot::init`], [`WeakSlot::copy_from`] or [`WeakSlot::move_from`];
-    /// until then it is just a pointer-sized value.
+    /// [`WeakSlot::init`] or [`WeakSlot::copy_from`]; until then it is just a
+    /// pointer-sized value.
     #[must_use]
     pub const fn uninit() -> Self {
         Self(UnsafeCell::new(Id::NIL))
@@ -190,20 +184,6 @@ impl WeakSlot {
         // SAFETY: `self` uninitialised, `from` initialised; `objc_copyWeak`
         // registers `self`'s address with `from`'s target under the weak lock.
         unsafe { objc_copyWeak(self.addr(), from.addr()) };
-    }
-
-    /// Move the registration from `from` to this slot (`objc_moveWeak`): what a
-    /// Rust move of a weak reference would have to be. Afterwards `from` is
-    /// unregistered and `self` registered; no reference count changes.
-    ///
-    /// # Safety
-    /// `self` must be uninitialised and `from` initialised. `from` must not be
-    /// [`WeakSlot::destroy`]ed afterwards; `self` must be.
-    pub unsafe fn move_from(&self, from: &Self) {
-        // SAFETY: `self` uninitialised, `from` initialised; `objc_moveWeak`
-        // swaps the registered address under the weak lock, with no window in
-        // which the runtime holds a stale address.
-        unsafe { objc_moveWeak(self.addr(), from.addr()) };
     }
 
     /// Unregister this slot (`objc_destroyWeak`). Destroying a nil-initialised

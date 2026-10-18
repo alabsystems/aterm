@@ -1,0 +1,43 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab) · a network box (`…/lab-probe-approved`) given the digit `1` twice: the first went in before the box was drawn and stands as a draft `1` in the composer, the second, with the box up, ran it (`◆ Fetched <url> — 404`, the stub's GET logged) · the lab's random project dir is spelled /private/tmp/at.lab0 here
+  Read /etc/hosts
+
+◆ Tool call done. Result: Read text file /etc/hosts. 1|## 2|# Host Database 3|# (more lines below)
+
+❯ toolstart
+
+  (↓ to view monitors)
+
+◆ Monitor Watch the lab socket — failed
+└ network access denied
+
+◆ Tool call done. Result: tool failed: network access denied
+
+❯ toolstart
+
+◆ Invalid work ID — rejected · ctrl+o
+
+◆ Stopped terminal tool operation — failed
+└ unified exec session 424242 is not live
+
+◆ Scheduled 7 3 * * *: lab probe
+└ 109c3489 · Every day at 3:07 AM · once
+
+◆ Tool call done. Result: Scheduled 109c3489 (Every day at 3:07 AM, once)
+
+❯ toolstart
+
+◆ Unscheduled 109c3489
+└ Removed scheduled job 109c3489.
+
+◆ Tool call done. Result: Removed scheduled job 109c3489.
+
+❯ toolstart
+
+◆ Fetched http://127.0.0.1:50581/lab-probe-approved — 404
+
+◆ Tool call done. Result: tool failed: web_fetch failed: HTTP 404 Not Found
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 1
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  lab-stub · high · /private/tmp/at.lab0/proj · Auto-review

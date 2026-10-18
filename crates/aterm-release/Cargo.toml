@@ -22,9 +22,6 @@ description = "aterm — the one-command release cutter behind the `targo --unve
 # What that costs, on purpose:
 #  - `targo --unverified test --bin aterm-release` runs nothing; the inline tests
 #    are in `it`, which `-p aterm-release` and `--tests` both run.
-#  - tests/changelog.rs keeps its own binary and path, because publish/manifest.txt
-#    withholds it from the public export BY that path. It mounts only changelog.rs
-#    and ledger.rs, so changelog.rs's inline tests run twice.
 #  - `it` reaches `pub(crate)` items through the mounts, which carry
 #    `#[allow(dead_code)]`; the dead-code line is this binary's build, not the tests'.
 # A lib target would run each inline test once without any mounts, but every `pub`
@@ -39,6 +36,8 @@ test = false
 # The shared RFC3339 / Howard-Hinnant civil-calendar math (`aterm_types::rfc3339`);
 # already in the dependency graph via aterm-update-core.
 aterm-types = { workspace = true }
+# How each write is finished: durable (F_FULLFSYNC) or ordered (F_BARRIERFSYNC).
+aterm-durable = { workspace = true }
 # The shared serde `Manifest` type (release spec §4) lives in aterm-update-core
 # so publisher and updater client agree by compilation, not by convention — the
 # publish-time byte round-trip through the CLIENT's parser is the bridge proof.
@@ -75,15 +74,28 @@ aterm-codec = { workspace = true }
 # This edge unifies ring's default features (RNG) into THIS binary's graph —
 # deliberate: the cutter is owner-only; shipped clients keep their own graphs.
 atpkg-keys = { workspace = true }
+# The candidate gate's ADMISSION rule (`channel::candidate`: the receipt, which one
+# governs, and every reason it admits nothing) is the producer's, answered there
+# in-process for the `rustc` group's publish; `ship trust candidate` writes the receipt
+# it reads and asks the same rule under `--admits`. Std-only on that side.
+atpkg-publish = { workspace = true }
+# `ship site` builds alab.systems' `/terminal` engine itself (site/engine.rs): the
+# CPU module's JS glue comes from `verify glue`'s generator in process, the shipping
+# wasm-opt flags are the ones the wasm perf lane runs, and the wasm32 pin's rustup is
+# found the way the STOCK EXCEPTION lanes find it. First-party, no cycle: nothing
+# links this binary-only crate.
+aterm-verify = { workspace = true }
+
+# Same-filesystem clock stamps own an exclusive scratch directory in the slot;
+# they never remove a fixed pre-existing marker merely to read its mtime.
+aterm-tempfile = { workspace = true }
 
 [dev-dependencies]
 # Tier-1 binds the real release-floor resolver and late guard to their derived
 # lifecycle model; production release binaries retain no spec dependency.
 aterm-spec = { workspace = true }
-# Test scratch directories removed on drop. (The two production private
-# directories, `buildplan::PrivateSliceDir` and `publish::PrivateTempDir`, keep
-# their own code: library code this crate's Trust lane verifies.)
-aterm-tempfile = { workspace = true }
+# The models its tests drive (a model edit rebuilds only their tests).
+aterm-models-release = { workspace = true }
 # The wire `ship release` asks the owner through (`notice ask`): its tests hold every
 # ask the release can raise to the wire's own parse, so none is refused at the door.
 aterm-messages = { workspace = true }

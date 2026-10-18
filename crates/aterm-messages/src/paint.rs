@@ -348,8 +348,6 @@ pub(crate) enum Fill {
 pub(crate) enum RowSurface {
     /// No surface: the band's own inks.
     Plain,
-    /// A measured level: the rail under the words, which sit on the band's own ground.
-    Rail,
     /// A busy row's comet (not under a forced palette): every word floored
     /// once against the hottest tone the comet reaches and its track.
     Busy {
@@ -421,9 +419,9 @@ pub(crate) struct RowPaint<'a> {
     pub span: MeterSpan,
     /// The frame's surface.
     pub(crate) surface: &'a Surface,
-    /// Each column's tone and side; `None` on a plain row and on a rail row.
+    /// Each column's tone and side; `None` on a plain row.
     pub columns: Option<Vec<Column>>,
-    /// The ground is drawn pixel by pixel (a graded surface, not a rail).
+    /// The ground is drawn pixel by pixel (a graded surface).
     pub raster_ground: bool,
     /// The fill's edge in window pixels, on a drawn-to-the-pixel bar.
     pub edge_px: Option<u64>,
@@ -503,7 +501,6 @@ static STILL: RowMotion = RowMotion {
         stops: Vec::new(),
         flat: false,
         edge: None,
-        rail: false,
     },
     readout: None,
     eta: None,
@@ -714,8 +711,6 @@ fn paint_row<'a>(
         (Ink::Value, Ink::Accent)
     };
     let surface = &rm.surface;
-    // A measured level is a rail: its words sit on the band's own ground.
-    let rail = surface.rail && !surface.is_empty();
     let fill = if forced || !alarm {
         Fill::Meter
     } else {
@@ -723,12 +718,12 @@ fn paint_row<'a>(
     };
     let busy = l.track.is_some();
     // A busy row off a forced palette keeps its words' side under its comet.
-    let comet_side = busy && !forced && !rail;
+    let comet_side = busy && !forced;
     let span = MeterSpan { geom, cols };
     let win_w = span.win_w();
-    // Every graded surface but a rail's is drawn pixel by pixel; the flat
-    // look keeps whole-cell tones.
-    let raster_ground = !surface.is_empty() && !surface.flat && !rail && cols > 0;
+    // Every graded surface is drawn pixel by pixel; the flat look keeps whole-cell
+    // tones.
+    let raster_ground = !surface.is_empty() && !surface.flat && cols > 0;
     // The fill's edge in window pixels, and the one cell whose glyph it splits.
     let edge_px = surface
         .edge
@@ -753,7 +748,7 @@ fn paint_row<'a>(
                 && e < span.px(gcol + 1).1
         })
         .map(|_| gcol);
-    let columns: Option<Vec<Column>> = (!surface.is_empty() && cols > 0 && !rail).then(|| {
+    let columns: Option<Vec<Column>> = (!surface.is_empty() && cols > 0).then(|| {
         (0..cols)
             .map(|x| {
                 let tone = span.fine(surface, x);
@@ -772,9 +767,7 @@ fn paint_row<'a>(
             })
             .collect()
     });
-    let kind = if rail {
-        RowSurface::Rail
-    } else if surface.is_empty() {
+    let kind = if surface.is_empty() {
         RowSurface::Plain
     } else if comet_side {
         RowSurface::Busy {
@@ -796,15 +789,15 @@ fn paint_row<'a>(
         }
     );
     // The glyph cell: the engine's glyph for this frame (an echo's ✓ / ⚠, a Fault echo's
-    // ⚠ in warn whatever the row's severity was), else the row's own; a rail row's wears
-    // the rail's warn. Its character stays in the cell; the renderer draws its icon.
+    // ⚠ in warn whatever the row's severity was), else the row's own. Its character stays
+    // in the cell; the renderer draws its icon.
     let mut icon = None;
     if gcol < cols {
         let glyph = rm.glyph.unwrap_or(gch);
         icon = Icon::for_char(glyph);
         cells.cells[gcol] = Cell {
             ch: glyph,
-            face: Face::Word(if fault || rail { Ink::Warn } else { accent }),
+            face: Face::Word(if fault { Ink::Warn } else { accent }),
             bold: !overflow,
             text_presentation: true,
         };
@@ -910,7 +903,7 @@ mod tests {
     use crate::center::{MessageCenter, Outcome};
     use crate::glass::Links;
     use crate::log::MessageLog;
-    use crate::model::{Hold, Intent, Load, Message, Meter, WallStamp, tags};
+    use crate::model::{Hold, Intent, Message, Meter, WallStamp, tags};
     use crate::text::char_width;
     use crate::{Duration, Instant};
 
@@ -941,18 +934,6 @@ mod tests {
             .meter(Meter::busy("~3 GB"))
             .hold(Hold::Live {
                 stale_after: crate::STALE_TAILED,
-            })
-    }
-
-    fn level(pm: u16) -> Message {
-        Message::new(tags::SYSTEM, Severity::Info, "Typing slowed by 'yes'")
-            .key(crate::STRAIN_KEY)
-            .hold(Hold::Live {
-                stale_after: crate::STALE_STRAIN,
-            })
-            .meter(Meter {
-                load: Some(Load::Cpu),
-                ..Meter::level(pm, "6 of 8 cores")
             })
     }
 
@@ -1012,7 +993,6 @@ mod tests {
             vec![bar(0)],
             vec![bar(1000)],
             vec![busy("Installing Homebrew").action(Intent::NewWindow)],
-            vec![level(640)],
             vec![Message::new(tags::CONFIG, Severity::Warn, "Misspelled setting").line("x")],
             vec![
                 with_capsules(bar(333)),
@@ -1247,10 +1227,10 @@ mod tests {
         assert!(seen > 0, "no paint in the sweep carried a split");
     }
 
-    /// A plain row and a rail row have no columns; a busy row's columns are
-    /// never on the fill's side off a forced palette.
+    /// A plain row has no columns; a busy row's columns are never on the
+    /// fill's side off a forced palette.
     #[test]
-    fn columns_are_absent_on_plain_and_rail_rows_and_busy_never_rides_the_fill() {
+    fn columns_are_absent_on_plain_rows_and_busy_never_rides_the_fill() {
         painted(
             vec![Message::new(tags::CONFIG, Severity::Warn, "W")],
             80,
@@ -1260,17 +1240,6 @@ mod tests {
             |_, rows| {
                 assert!(rows[0].columns.is_none());
                 assert_eq!(rows[0].kind, RowSurface::Plain);
-            },
-        );
-        painted(
-            vec![level(700)],
-            80,
-            Look::MOVING,
-            None,
-            false,
-            |_, rows| {
-                assert!(rows[0].columns.is_none());
-                assert_eq!(rows[0].kind, RowSurface::Rail);
             },
         );
         let now = Instant::now();
@@ -1317,22 +1286,13 @@ mod tests {
         }
     }
 
-    /// The icon set is the band's closed glyph set.
+    /// Every glyph a message may carry has a drawn icon: the glyph cell never
+    /// paints a font fallback.
     #[test]
-    fn icons_are_exactly_the_bands_glyph_set() {
-        let set = [
-            '\u{2139}', '\u{2713}', '\u{2714}', '\u{26a0}', '\u{2715}', '\u{2716}', '\u{2717}',
-            '\u{21e3}', '\u{2193}', '\u{21bb}', '\u{2191}', '\u{23f8}', '\u{2726}', '!',
-            '\u{00b7}', '\u{2026}', '\u{2296}',
-        ];
-        for ch in set {
+    fn every_band_glyph_has_a_drawn_icon() {
+        for &ch in crate::model::Glyph::ALLOWED {
             assert!(Icon::for_char(ch).is_some(), "{ch:?}");
         }
-        let n = (0..=0x10_ffffu32)
-            .filter_map(char::from_u32)
-            .filter(|&c| Icon::for_char(c).is_some())
-            .count();
-        assert_eq!(n, set.len());
     }
 
     /// An echo's fade is handed through, and a Fault echo's glyph wears warn.

@@ -3,39 +3,46 @@
 
 //! THE ONE BOOT of a real `aterm --headless` for the live integration tests.
 //!
-//! Eight test files carried a copy of this function, and every copy turned the
-//! two ways the PRODUCT can fail to start — the child exits before its control
-//! socket listens, or the socket never listens — into `SKIP` and a green test:
-//! `targo --unverified test -p aterm` reported green on exactly the startup crash
-//! `verify smoke` (`aterm-verify` `smoke_stages.rs` `bring_up`) reports red. Here
-//! both PANIC with the log tail, as the smoke fails them.
+//! The two ways the PRODUCT can fail to start — the child exits before its
+//! control socket listens, or the socket never listens — both PANIC here with
+//! the log tail: a startup crash is never a `SKIP` and a green test.
+//!
+//! READINESS IS THE INSTANCE'S OWN WORD (`--ready-fd`, `aterm_agent::ready`):
+//! the instance writes one byte down a pipe once its control listener is bound,
+//! and this boot blocks on that byte under the hang detector instead of polling
+//! the socket. End-of-file with nothing written is a startup failure (the
+//! instance exited, or runs with no socket), read off its exit status and log.
 //!
 //! A headless instance opens no window, and it is no WindowServer client. Until
 //! 2026-09-26 it was one on macOS: `--headless` built the real AppKit event
 //! loop, and an idle instance drew a WindowServer preflight within three
-//! seconds (AGENTS.md) — so for that while a login with NO GUI session
-//! (an ssh shell, a CI box) made AppKit log its refusal to connect, and a child
-//! that exited with that in its log was a `SKIP`. Headless now runs winit's
-//! display-free loop (`crates/aterm-window/src/platform_impl/macos/headless.rs`: no
-//! `NSApplication`, no connection), so that refusal in a child's log means the
-//! instance ASKED for the connection — a door reopened
-//! ([`window_server_refused`]) — and the boot FAILS naming it, never skips.
+//! seconds (AGENTS.md). Headless now runs winit's display-free loop
+//! (`crates/aterm-window/src/platform_impl/macos/headless.rs`: no
+//! `NSApplication`, no connection), so CoreGraphics' refusal of a connection in
+//! a child's log means the instance ASKED for one — a door reopened
+//! ([`window_server_refused`]) — and the boot FAILS naming it.
 //! `window_server_census_live_headless.rs` reads the same fact out of tccd's
 //! log wherever a GUI session exists.
 //!
-//! A `SKIP` (`None`, announced on stderr) is kept for refusals that happen
-//! before or around the launch and say nothing about the product: no scratch
-//! base short enough for `sun_path`, a log file that cannot be created, a
-//! `spawn` that fails, and a control-socket `bind` the OS refuses with
-//! `EPERM`/`EACCES` (a sandboxed runner). A lane held to "a skip is not a
-//! pass" boots with [`boot_or_refuse`], which turns the same refusals into
-//! `verify`'s COULD NOT RUN.
+//! A refusal that happens before or around the launch and says nothing about
+//! the product — no scratch base short enough for `sun_path`, a log file that
+//! cannot be created, a `spawn` that fails, a control-socket `bind` the OS
+//! refuses with `EPERM`/`EACCES` (a sandboxed runner) — ends the test as COULD
+//! NOT RUN (`aterm_spec::host::could_not_run`), never as a pass.
+//!
+//! THE CLOCK. Every instance booted here runs its harness's and hosts' waits at
+//! their test values: the fast-timers development seam
+//! (`aterm_agent::harness::timings::FAST_SEAM`) is set before `configure`
+//! runs, so a test whose property IS a production clock takes it out there
+//! (`cmd.env_remove(..)`).
 //!
 //! Each file keeps its own scratch prefix (so parallel test binaries never
 //! share a directory), its own launch arguments and its own readiness extras;
-//! [`boot_with`] takes them. The `aterm ctl` client helpers ([`ctl`],
-//! [`ctl_ok`], [`field`], …) are here once for every live file. The file that
-//! includes this module includes `support/launch_isolation.rs` as
+//! [`boot_with`] takes them. A test that launches its instances itself (several
+//! sharing one scratch world, an explicit socket path) arms each with
+//! [`arm_ready`] and waits with [`await_ready`]. The `aterm ctl` client helpers
+//! ([`ctl`], [`ctl_ok`], [`field`], …) are here once for every live file. The
+//! file that includes this module includes `support/launch_isolation.rs` as
 //! `launch_isolation` and `support/child_output.rs` as `child_output` too.
 
 #![allow(dead_code)]
@@ -48,13 +55,16 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use aterm_agent::ready::{Ready, Signal};
+use aterm_spec::host::could_not_run;
+use aterm_spec::wait::MUST_HAPPEN;
+
 use crate::{child_output, launch_isolation};
 
-/// The socket-bind budget, a minute of [`POLL_GAP`]s: a hang detector
-/// (AGENTS.md), never a latency budget — it only turns a wedged boot into a
-/// named failure instead of a hung run, and a boot that listens ends it at once.
-pub const SOCKET_POLLS: usize = 600;
-pub const POLL_GAP: Duration = Duration::from_millis(100);
+/// How often a readiness EXTRA ([`boot_with`]'s `ready`: a token file, a
+/// journal line) is asked once the instance has said its socket listens. The
+/// socket itself is never polled: the instance says so ([`arm_ready`]).
+pub const POLL_GAP: Duration = Duration::from_millis(20);
 
 /// `sockaddr_un.sun_path` is ~104 bytes on macOS/BSD; a base that would
 /// overflow it (with margin) is refused instead of failing deep in `bind`.
@@ -79,17 +89,22 @@ impl Drop for Instance {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        // The session's shell outlives the instance by a moment — its PTY's
-        // hangup — and writes `home/.bash_history` as it goes: a file made
-        // after the walk began leaves the scratch world behind (measured:
-        // two of about 130 boots, 2026-09-26). Removed again until it is
-        // gone, bounded; once `home/` is gone nothing can write under it.
-        for _ in 0..40 {
-            if std::fs::remove_dir_all(&self.tmp).is_ok() || !self.tmp.exists() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(50));
+        remove_world(&self.tmp);
+    }
+}
+
+/// Remove a scratch world whose instances (and keeper) are dead. A session's
+/// shell outlives the last holder of its PTY's master by a moment — the
+/// hangup — and writes `home/.bash_history` as it goes: a file made after the
+/// walk began leaves the scratch world behind (measured: two of about 130
+/// boots, 2026-09-26). Removed again until it is gone, bounded; once `home/` is
+/// gone nothing can write under it.
+pub fn remove_world(root: &Path) {
+    for _ in 0..40 {
+        if std::fs::remove_dir_all(root).is_ok() || !root.exists() {
+            return;
         }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -143,8 +158,7 @@ pub fn log_tail(log: &Path) -> String {
     lines[start..].join("\n")
 }
 
-/// Whether `path` exists as a unix socket or a symlink (the `latest` alias) —
-/// the verify smoke's readiness probe.
+/// Whether `path` exists as a unix socket or a symlink (the `latest` alias).
 pub fn is_socket_or_symlink(path: &Path) -> bool {
     use std::os::unix::fs::FileTypeExt;
     std::fs::symlink_metadata(path)
@@ -152,24 +166,32 @@ pub fn is_socket_or_symlink(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// A scratch base whose socket path fits `sun_path`: `$TMPDIR` (via
-/// `temp_dir`), else `/tmp`, prepared by [`launch_isolation::prepare`]. `None`
-/// when neither fits — an environment refusal.
-pub fn scratch_root(prefix: &str) -> Option<PathBuf> {
-    let name = format!("{prefix}-{}", std::process::id());
+/// A fresh exclusively created scratch root whose socket path fits `sun_path`:
+/// `$TMPDIR` (via `temp_dir`), else `/tmp`, prepared by
+/// [`launch_isolation::prepare`]. A failed attempt drops only the directory this
+/// call created; a standing path is never adopted or removed. The returned path
+/// transfers that ownership to its caller (an [`Instance`] removes it). When no
+/// base can be created, fits or can be prepared, the test is COULD NOT RUN: an
+/// environment refusal.
+#[track_caller]
+pub fn scratch_root(prefix: &str) -> PathBuf {
     for base in [std::env::temp_dir(), PathBuf::from("/tmp")] {
-        let tmp = base.join(&name);
-        let sock = tmp.join("run/aterm/aterm.sock");
+        let Ok(root) = aterm_tempfile::Builder::new()
+            .prefix(&format!("{prefix}-"))
+            .tempdir_in(base)
+        else {
+            continue;
+        };
+        let sock = root.path().join("run/aterm/aterm.sock");
         if sock.as_os_str().len() >= MAX_SOCK_PATH {
             continue;
         }
-        if launch_isolation::prepare(&tmp).is_err() {
-            let _ = std::fs::remove_dir_all(&tmp);
+        if launch_isolation::prepare(root.path()).is_err() {
             continue;
         }
-        return Some(tmp);
+        return root.keep();
     }
-    None
+    could_not_run("no scratch base with a socket path short enough for sun_path")
 }
 
 /// Whether the log shows the OS refusing the control socket's `bind` — a
@@ -204,7 +226,7 @@ fn fail_if_it_asked_for_the_window_server(log: &Path, tail: &str) {
     );
 }
 
-/// The environment refusal a dead or never-ready child's log names, if any:
+/// The environment refusal a dead or socketless child's log names, if any:
 /// the OS refusing the socket's `bind`.
 fn environment_refusal(tail: &str) -> Option<&'static str> {
     bind_refused_by_the_os(tail).then_some("the OS refused the control socket's bind")
@@ -212,7 +234,8 @@ fn environment_refusal(tail: &str) -> Option<&'static str> {
 
 /// [`boot_with`] with `args` as the extra launch arguments and no readiness
 /// extras.
-pub fn boot(prefix: &str, args: &[&str]) -> Option<Instance> {
+#[track_caller]
+pub fn boot(prefix: &str, args: &[&str]) -> Instance {
     boot_with(
         prefix,
         |_, cmd| {
@@ -222,56 +245,70 @@ pub fn boot(prefix: &str, args: &[&str]) -> Option<Instance> {
     )
 }
 
+/// Arm `cmd` — a `--headless` launch, before any `-e` payload — with its ready
+/// signal (`--ready-fd`, the FIFO in `dir`): the instance says once that its
+/// control socket listens, and [`await_ready`] waits on that word.
+///
+/// # Panics
+/// The FIFO could not be made in `dir`: a scratch world this test cannot write
+/// to is a broken fixture.
+pub fn arm_ready(cmd: &mut Command, dir: &Path) -> Ready {
+    let ready = Ready::open(dir)
+        .unwrap_or_else(|e| panic!("arm the instance's ready signal in {}: {e}", dir.display()));
+    ready.hand(cmd);
+    ready
+}
+
 /// Boot one headless instance under a fresh scratch world named `prefix`.
 ///
 /// `configure` runs after the isolation environment, the base arguments
-/// (`--headless --no-reroute --control-sock <sock>`) and the lifeline are set
-/// and before the launch (so an `-e` payload it adds comes last): it may write into the scratch root (a config table, fixtures) and
-/// add arguments or development-seam variables. `ready` is asked each poll
-/// once the socket listens (a token file, say); the instance is returned when
-/// it holds.
+/// (`--headless --no-reroute --control-sock <sock>`), the lifeline, the ready
+/// signal and the fast-timers seam are set and before the launch (so an `-e`
+/// payload it adds comes last): it may write into the scratch root (a config
+/// table, fixtures), add arguments or development-seam variables, or take the
+/// fast clock out. `ready` is asked once the instance has said its socket
+/// listens (a token file, say), and again every [`POLL_GAP`] until it holds;
+/// the instance is returned then.
 ///
-/// `None` only for an environment refusal (module doc), announced as `SKIP`.
-/// A child that exits before it is ready, or one that is not ready within the
-/// budget, PANICS with the log tail.
+/// An environment refusal (module doc) is COULD NOT RUN. A child that exits
+/// before it is ready, one that closes its ready signal with nothing said, or
+/// one that is not ready within the hang detector PANICS with the log tail.
+#[track_caller]
 pub fn boot_with(
     prefix: &str,
     configure: impl FnOnce(&Path, &mut Command),
     ready: impl Fn(&Instance) -> bool,
-) -> Option<Instance> {
-    let Some(tmp) = scratch_root(prefix) else {
-        eprintln!("SKIP: no scratch base with a short enough socket path");
-        return None;
-    };
+) -> Instance {
+    let tmp = scratch_root(prefix);
     let log = tmp.join("gui.log");
     let (out, err) = match std::fs::File::create(&log).and_then(|f| Ok((f.try_clone()?, f))) {
         Ok(pair) => pair,
         Err(e) => {
-            eprintln!("SKIP: cannot open the instance log ({e})");
             let _ = std::fs::remove_dir_all(&tmp);
-            return None;
+            could_not_run(format!("cannot open the instance log ({e})"))
         }
     };
-    let aterm = Path::new(env!("CARGO_BIN_EXE_aterm"));
-    // The system's first-exec wait, paid here and not on the socket wait below
+    let aterm = launch_isolation::aterm_executable();
+    // The system's first-exec wait, paid here and not on the ready wait below
     // ([`aterm_spec::wait::first_exec`]); `--help` is answered above the mode
     // fork, before any setup.
-    aterm_spec::wait::first_exec(aterm, &["--help"]);
-    let mut cmd = Command::new(aterm);
+    aterm_spec::wait::first_exec(&aterm, &["--help"]);
+    let mut cmd = Command::new(&aterm);
     launch_isolation::apply(&mut cmd, &tmp);
     cmd.args(["--headless", launch_isolation::NO_REROUTE])
         .args(launch_isolation::control_sock(&tmp))
+        .env(aterm_agent::harness::timings::FAST_SEAM, "1")
         .stdin(Stdio::null())
         .stdout(out)
         .stderr(err);
     let lifeline = launch_isolation::lifeline(&mut cmd, &tmp);
+    let mut signal = arm_ready(&mut cmd, &tmp);
     configure(&tmp, &mut cmd);
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("SKIP: cannot launch aterm --headless ({e})");
             let _ = std::fs::remove_dir_all(&tmp);
-            return None;
+            could_not_run(format!("cannot launch aterm --headless ({e})"))
         }
     };
     let sock_path = tmp.join("run/aterm/aterm.sock");
@@ -283,76 +320,74 @@ pub fn boot_with(
         log,
     };
     let log = inst.log.clone();
-    await_ready(&mut inst, |i| &mut i.child, &sock_path, &log, ready).then_some(inst)
+    await_ready(&mut inst, |i| &mut i.child, &mut signal, &log, ready);
+    inst
 }
 
-/// [`boot_with`] for a lane held to "a skip is not a pass": an environment
-/// refusal ends the test as COULD NOT RUN (`aterm_spec::host::could_not_run`),
-/// so `verify` records the lane as not run instead of green. The `SKIP:` line
-/// above names why.
+/// Wait for a spawned headless instance — `inst`, whose child `child` reaches,
+/// armed with `signal` ([`arm_ready`]) — to say its control socket listens,
+/// then for `ready` to hold. A child that exits first, closes its signal with
+/// nothing said, or says nothing within the hang detector PANICS with the tail
+/// of `log` — the product failed to start (module doc), and one whose log shows
+/// it asked for a WindowServer connection says so; an environment refusal in
+/// the log is COULD NOT RUN. `inst`'s own drop reaps it.
 #[track_caller]
-pub fn boot_or_refuse(
-    prefix: &str,
-    configure: impl FnOnce(&Path, &mut Command),
-    ready: impl Fn(&Instance) -> bool,
-) -> Instance {
-    boot_with(prefix, configure, ready).unwrap_or_else(|| {
-        aterm_spec::host::could_not_run(
-            "this machine refused the headless instance (the SKIP line above names why); \
-             nothing was decided",
-        )
-    })
-}
-
-/// Wait for a spawned headless instance — `inst`, whose child `child` reaches —
-/// to listen on `sock` and satisfy `ready`: `true` once it does, `false`
-/// (announced `SKIP`) when its log names an environment refusal (the OS refused
-/// the socket's `bind`). A child that exits first, or one not ready within the
-/// budget, PANICS with the tail of `log` — the product failed to start (module
-/// doc), and one whose log shows it asked for a WindowServer connection says so
-/// — and `inst`'s own drop reaps it. For a test that launches its instances
-/// itself (several sharing one scratch world, an explicit socket path);
-/// [`boot_with`] uses it too.
 pub fn await_ready<T>(
     inst: &mut T,
     child: impl Fn(&mut T) -> &mut Child,
-    sock: &Path,
+    signal: &mut Ready,
     log: &Path,
     ready: impl Fn(&T) -> bool,
-) -> bool {
-    for _ in 0..SOCKET_POLLS {
-        match child(inst).try_wait() {
-            Ok(Some(status)) => {
-                let tail = log_tail(log);
-                fail_if_it_asked_for_the_window_server(log, &tail);
-                if let Some(why) = environment_refusal(&tail) {
-                    eprintln!("SKIP: {why}; log tail:\n{tail}");
-                    return false;
-                }
-                panic!(
+) {
+    match signal.wait(MUST_HAPPEN) {
+        Signal::Ready => {}
+        Signal::Closed => {
+            // Closed: it exited, or it runs with no socket. An environment
+            // refusal in the log (a sandbox's `EPERM` on the bind, which leaves
+            // the instance running) is said at once; otherwise its exit, if it
+            // is on its way out, is waited for — bounded — so the verdict names it.
+            let tail = log_tail(log);
+            fail_if_it_asked_for_the_window_server(log, &tail);
+            if let Some(why) = environment_refusal(&tail) {
+                could_not_run(format!("{why}; log tail:\n{tail}"));
+            }
+            let status = aterm_spec::wait::within(MUST_HAPPEN, POLL_GAP, || {
+                child(inst).try_wait().ok().flatten()
+            });
+            let tail = log_tail(log);
+            if let Some(why) = environment_refusal(&tail) {
+                could_not_run(format!("{why}; log tail:\n{tail}"));
+            }
+            match status {
+                Some(status) => panic!(
                     "aterm --headless exited ({status}) before its control socket listened — a \
                      startup failure, not an environment refusal; log tail:\n{tail}"
-                );
+                ),
+                None => panic!(
+                    "aterm --headless closed its ready signal with nothing said and is still \
+                     running: it has no control socket; log tail:\n{tail}"
+                ),
             }
-            Ok(None) => {}
-            Err(e) => panic!("could not poll the aterm --headless child: {e}"),
         }
-        if is_socket_or_symlink(sock) && launch_isolation::control_listening(sock) && ready(inst) {
-            return true;
+        Signal::TimedOut => {
+            let tail = log_tail(log);
+            fail_if_it_asked_for_the_window_server(log, &tail);
+            if let Some(why) = environment_refusal(&tail) {
+                could_not_run(format!("{why}; log tail:\n{tail}"));
+            }
+            panic!(
+                "aterm --headless did not say its control socket listens within {MUST_HAPPEN:?}; \
+                 log tail:\n{tail}"
+            );
         }
-        std::thread::sleep(POLL_GAP);
+        Signal::Failed(e) => panic!("could not read the instance's ready signal: {e}"),
     }
-    let tail = log_tail(log);
-    fail_if_it_asked_for_the_window_server(log, &tail);
-    if let Some(why) = environment_refusal(&tail) {
-        eprintln!("SKIP: {why}; log tail:\n{tail}");
-        return false;
-    }
-    panic!(
-        "aterm --headless was not ready within {:?} (its control socket never listened at {}); \
-         log tail:\n{tail}",
-        POLL_GAP * SOCKET_POLLS as u32,
-        sock.display()
+    let extras = aterm_spec::wait::within(MUST_HAPPEN, POLL_GAP, || ready(inst).then_some(()));
+    assert!(
+        extras.is_some(),
+        "aterm --headless listens, but its readiness extras did not hold within \
+         {MUST_HAPPEN:?}; log tail:\n{}",
+        log_tail(log)
     );
 }
 
@@ -364,11 +399,11 @@ pub const CLIENT_EXIT_DEADLINE: Duration = Duration::from_secs(120);
 /// `aterm ctl --sock <sock> <args…>` against `inst`, in its scratch world,
 /// stdout and stderr piped — not yet spawned.
 pub fn client_command(inst: &Instance, args: &[&str]) -> Command {
-    let aterm = Path::new(env!("CARGO_BIN_EXE_aterm"));
+    let aterm = launch_isolation::aterm_executable();
     // The file [`boot_with`] ran before its launch, so one lookup; a file cargo
     // has put there since is run here, before the client's clock.
-    aterm_spec::wait::first_exec(aterm, &["--help"]);
-    let mut cmd = Command::new(aterm);
+    aterm_spec::wait::first_exec(&aterm, &["--help"]);
+    let mut cmd = Command::new(&aterm);
     cmd.arg("ctl")
         .arg("--sock")
         .arg(&inst.sock)

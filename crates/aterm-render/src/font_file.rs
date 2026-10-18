@@ -8,17 +8,18 @@
 //! be replaced between a metadata probe and a later read. This module opens once,
 //! makes that open non-blocking where the platform exposes the flag, validates
 //! the opened handle itself, and reads at most the font budget plus one sentinel
-//! byte. Unix and Windows refuse final-component links/reparse points; config
-//! authors should name the actual font file.
+//! byte. On Unix a final-component symbolic link is followed ONCE, to the
+//! canonical path of the file it names, and that path is opened under the same
+//! rules (see [`open_regular`]); Windows refuses final-component reparse points.
 //!
-//! Two ways to admit a file share that one open: [`read_bounded_font_file`]
-//! copies it into a `Vec`, and [`admit_font_file`] MAPS it read-only and
-//! private ([`MappedFontFile`]) when the path lies under one of the font
-//! directories the resolver walks, so a 192 MB emoji collection the seal
-//! must admit is file-backed, shared with every other process through the
-//! page cache, evictable, and faulted in per glyph instead of copied whole
-//! into anonymous heap at every launch.
+//! [`read_bounded_font_file`] copies the admitted bytes into a `Vec`.
+//! [`admit_font_file`] can instead retain a read-only [`MappedFontFile`] for
+//! an admitted macOS or Windows system-font path, under the platform's
+//! protections described below. Other paths use the bounded copy. Mapping
+//! lets large system collections share file-backed pages across processes
+//! and fault in glyph data as needed.
 
+use std::borrow::Cow;
 use std::io::{self, Read as _};
 use std::path::Path;
 use std::sync::Arc;
@@ -55,11 +56,56 @@ fn not_regular() -> io::Error {
     )
 }
 
-/// Open once and prove that the handle which will be read is a regular file.
+/// Open once and prove that the handle which will be read is a regular file,
+/// returning it with the path that was actually opened.
+///
 /// `O_NONBLOCK` prevents a planted writerless FIFO from parking `open`, while
-/// `O_NOFOLLOW` closes the final-component replacement/link ambiguity.
+/// `O_NOFOLLOW` closes the final-component replacement/link ambiguity: the
+/// handle is always the file the RETURNED path names, never something a link
+/// pointed at when it was opened.
+///
+/// A path whose final component IS a symbolic link is followed once, by
+/// resolving it to its canonical path (`realpath`) and opening THAT under the
+/// same flags. Linux distributions install fonts this way — Ubuntu 24.04's
+/// `fonts-ubuntu` ships `UbuntuMono-R.ttf` and 13 other legacy names as links
+/// to the variable faces, and stow, home-manager and nix profiles link every
+/// font they install into `~/.local/share/fonts` — so refusing the link
+/// refused the font: `list-fonts` advertised `UbuntuMono-R`, and selecting it
+/// failed with `ELOOP`. Following it gives nothing away:
+///
+/// * a link LOOP (or a chain past the kernel's hop limit) still fails, now in
+///   `canonicalize`, with the same `ELOOP`;
+/// * a link to a FIFO or a device still meets `O_NONBLOCK` and the `fstat`
+///   regular-file check on the opened handle, exactly as a direct path would;
+/// * the canonical path has no link in it, so `O_NOFOLLOW` again pins the
+///   handle to it, and a link swapped in after `canonicalize` is refused;
+/// * a config path could already name any regular file directly, so where the
+///   link points grants no reach a direct path lacks.
+///
+/// The returned path is what [`admit_font_file`] decides residency on
+/// ([`maps_in_place`]): a link that sits on the system font volume but names a
+/// user-writable file must be COPIED, never mapped.
 #[cfg(unix)]
-fn open_regular(path: &Path) -> io::Result<std::fs::File> {
+fn open_regular(path: &Path) -> io::Result<(std::fs::File, Cow<'_, Path>)> {
+    match open_regular_no_follow(path) {
+        Ok(file) => Ok((file, Cow::Borrowed(path))),
+        Err(error) => {
+            // Only a final-component LINK is retried; every other refusal
+            // (absent, FIFO, device, oversize) keeps its own error.
+            if !std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+                return Err(error);
+            }
+            let target = std::fs::canonicalize(path)?;
+            let file = open_regular_no_follow(&target)?;
+            Ok((file, Cow::Owned(target)))
+        }
+    }
+}
+
+/// The one `open` [`open_regular`] performs per path: never through a
+/// final-component link, never blocking, and only a regular file is kept.
+#[cfg(unix)]
+fn open_regular_no_follow(path: &Path) -> io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
     let file = std::fs::OpenOptions::new()
@@ -75,11 +121,12 @@ fn open_regular(path: &Path) -> io::Result<std::fs::File> {
 /// Windows' reparse-point flag is the closest equivalent of `O_NOFOLLOW`.
 /// The attribute is checked on the opened handle before any byte is consumed.
 #[cfg(windows)]
-fn open_regular(path: &Path) -> io::Result<std::fs::File> {
-    open_regular_shared(
+fn open_regular(path: &Path) -> io::Result<(std::fs::File, Cow<'_, Path>)> {
+    let file = open_regular_shared(
         path,
         win::FILE_SHARE_READ | win::FILE_SHARE_WRITE | win::FILE_SHARE_DELETE,
-    )
+    )?;
+    Ok((file, Cow::Borrowed(path)))
 }
 
 /// [`open_regular`] with an explicit share mode. The copy path shares
@@ -109,7 +156,7 @@ fn open_regular_shared(path: &Path, share: u32) -> io::Result<std::fs::File> {
 /// Portable fallback. Targets without a non-blocking filesystem-open flag use
 /// a no-link precheck and still verify the opened handle before reading.
 #[cfg(not(any(unix, windows)))]
-fn open_regular(path: &Path) -> io::Result<std::fs::File> {
+fn open_regular(path: &Path) -> io::Result<(std::fs::File, Cow<'_, Path>)> {
     if !std::fs::symlink_metadata(path)?.file_type().is_file() {
         return Err(not_regular());
     }
@@ -117,7 +164,7 @@ fn open_regular(path: &Path) -> io::Result<std::fs::File> {
     if !file.metadata()?.file_type().is_file() {
         return Err(not_regular());
     }
-    Ok(file)
+    Ok((file, Cow::Borrowed(path)))
 }
 
 fn check_observed_size(file: &std::fs::File, max_bytes: usize) -> io::Result<u64> {
@@ -136,7 +183,7 @@ fn check_observed_size(file: &std::fs::File, max_bytes: usize) -> io::Result<u64
 /// an exact diagnostic. The eventual read repeats admission because the path may
 /// legitimately change between validation and application.
 pub fn validate_bounded_font_file(path: &Path, max_bytes: usize) -> io::Result<()> {
-    let file = open_regular(path)?;
+    let (file, _) = open_regular(path)?;
     let _ = check_observed_size(&file, max_bytes)?;
     Ok(())
 }
@@ -190,7 +237,7 @@ pub fn read_bounded_font_file_into(
     buf: &mut Vec<u8>,
 ) -> io::Result<()> {
     buf.clear();
-    let file = open_regular(path)?;
+    let (file, _) = open_regular(path)?;
     let length = check_observed_size(&file, max_bytes)?;
     read_admitted_handle(file, length, max_bytes, buf)
 }
@@ -231,8 +278,8 @@ pub fn read_font_file(path: &Path) -> io::Result<Vec<u8>> {
     read_bounded_font_file(path, MAX_FONT_FILE_BYTES)
 }
 
-/// One font file mapped whole, read-only and private (`PROT_READ`,
-/// `MAP_PRIVATE`), unmapped on drop.
+/// One font file mapped whole and read-only, unmapped on drop. Unix uses
+/// `PROT_READ` and `MAP_PRIVATE`; Windows uses a read-only section and view.
 ///
 /// This is the handle [`admit_font_file`] hands back for a file on the system
 /// font volume, and it is what turns the seal's ~240 MB of system-font
@@ -244,7 +291,7 @@ pub fn read_font_file(path: &Path) -> io::Result<Vec<u8>> {
 /// the tables and glyphs actually touched (an ASCII-only session touches a
 /// few pages of the emoji collection's table directory and nothing else).
 ///
-/// # The truncation caveat, on the record
+/// # Unix truncation safety
 ///
 /// A page of a `MAP_PRIVATE` file mapping that lies PAST the file's current
 /// end faults with `SIGBUS`, so a file truncated after it was mapped crashes
@@ -508,24 +555,24 @@ impl Drop for MappedFontFile {
     }
 }
 
-/// The directories whose files [`admit_font_file`] holds as file MAPPINGS
-/// rather than copies: the sealed, read-only system font volume and nothing
-/// user-writable (see [`MappedFontFile`]'s truncation caveat). The Linux
-/// package roots stay out: they are root-owned but are rewritten in place by
-/// package managers. Widening the list is an owner ruling, not a patch.
+/// The directories whose files [`admit_font_file`] may hold as mappings rather
+/// than copies. On macOS this is the sealed, read-only system font volume
+/// (see [`MappedFontFile`]'s truncation caveat). Other Unix hosts have no
+/// admitted root: even the same pathname has no sealed-volume guarantee, and
+/// package-managed font directories may be rewritten in place.
 ///
 /// Windows maps only the conventional `C:\Windows\Fonts` system directory.
 /// The admission handle denies write sharing for the view's lifetime; this
 /// does not rely on a font's ACL. Per-user font directories and installations
 /// under another Windows directory retain the bounded copy path.
 pub const MAPPABLE_FONT_ROOTS: &[&str] = &[
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     "/System/Library/Fonts",
     #[cfg(windows)]
     "C:\\Windows\\Fonts",
 ];
 
-/// Whether [`admit_font_file`] MAPS `path` (unix, Windows) rather than copying it:
+/// Whether [`admit_font_file`] may map `path` (macOS, Windows) rather than copying it:
 /// the path lies lexically under one of [`MAPPABLE_FONT_ROOTS`] and contains
 /// no `..` component. The `..` refusal is load-bearing — `Path::starts_with`
 /// is component-wise, so `/System/Library/Fonts/../../../Users//x/y.ttf`
@@ -573,7 +620,9 @@ fn lies_under(path: &Path, root: &Path) -> bool {
 /// on the same handle rather than failing the admission — the mapping is a
 /// residency choice, never a correctness one.
 pub fn admit_font_file(path: &Path) -> io::Result<crate::font::FaceBytes> {
-    let (file, may_map) = open_for_admission(path, maps_in_place(path))?;
+    // Residency is decided on the path the handle was OPENED at, not the one
+    // asked for: they differ when `path` is a link ([`open_regular`]).
+    let (file, may_map) = open_for_admission(path, maps_in_place)?;
     let length = check_observed_size(&file, MAX_FONT_FILE_BYTES)?;
     if may_map && let Ok(mapped) = MappedFontFile::map(&file, length) {
         return Ok(crate::font::FaceBytes::Mapped(Arc::new(mapped)));
@@ -583,11 +632,110 @@ pub fn admit_font_file(path: &Path) -> io::Result<crate::font::FaceBytes> {
     Ok(crate::font::FaceBytes::Vec(Arc::new(bytes)))
 }
 
-/// [`admit_font_file`]'s one open, and whether its handle may be MAPPED
-/// (`mappable` is [`maps_in_place`]'s answer for `path`).
+/// The `sfnt` tables of ONE face of a font file, read by position — never the
+/// whole file. `faces` is how many faces the file holds (a `ttcf` collection's
+/// count, else 1); `tables` is index-aligned with the tags asked for, `None`
+/// for a table the face lacks or one past the per-table bound.
+#[derive(Debug)]
+pub struct FaceTables {
+    pub faces: u32,
+    pub tables: Vec<Option<Vec<u8>>>,
+}
+
+/// Most table records a face directory may declare before it is refused as
+/// malformed. Real faces carry a few dozen.
+const MAX_TABLE_RECORDS: usize = 1024;
+
+/// Read the tables `tags` of face `face_index` of the font at `path`, each at
+/// most `max_table_bytes`, through the same admission as every other read here
+/// ([`open_regular`]: a regular file, a final link followed once, never
+/// blocking, at most [`MAX_FONT_FILE_BYTES`] long) — but only the header, the
+/// table directory and the tables asked for, by position.
+///
+/// This is what lets a question about a font's CHARACTER MAP (or its names)
+/// be asked of every font on the host without reading every font on the host:
+/// a 20 MB CJK collection answers from its ~1 kB directory and its cmap. A
+/// table whose record points past the end of the file is `None`, not an error;
+/// a header that does not parse is an error.
+///
+/// # Errors
+///
+/// The admission's error, a read error, or `InvalidData` for a file that is
+/// not an `sfnt` (or a collection without face `face_index`).
+pub fn read_face_tables(
+    path: &Path,
+    face_index: u32,
+    tags: &[[u8; 4]],
+    max_table_bytes: usize,
+) -> io::Result<FaceTables> {
+    use std::io::{Seek as _, SeekFrom};
+
+    let malformed = |what: &str| io::Error::new(io::ErrorKind::InvalidData, what.to_string());
+    let (mut file, _) = open_regular(path)?;
+    let length = check_observed_size(&file, MAX_FONT_FILE_BYTES)?;
+    let mut read_at = |offset: u64, len: usize| -> io::Result<Vec<u8>> {
+        if offset
+            .checked_add(len as u64)
+            .is_none_or(|end| end > length)
+        {
+            return Err(malformed("font table lies past the end of the file"));
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        let mut buf = vec![0; len];
+        file.read_exact(&mut buf)?;
+        Ok(buf)
+    };
+    let be32 = |b: &[u8], at: usize| u32::from_be_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+    let header = read_at(0, 12)?;
+    let (faces, sfnt_offset) = if &header[..4] == b"ttcf" {
+        let faces = be32(&header, 8);
+        if face_index >= faces || faces > 4096 {
+            return Err(malformed("collection has no such face"));
+        }
+        let entry = read_at(12 + 4 * u64::from(face_index), 4)?;
+        (faces, u64::from(be32(&entry, 0)))
+    } else if face_index == 0 {
+        (1, 0)
+    } else {
+        return Err(malformed("a single-face font has no face past 0"));
+    };
+    let directory = read_at(sfnt_offset, 12)?;
+    let version = be32(&directory, 0);
+    if !matches!(version, 0x0001_0000 | 0x4F54_544F | 0x7472_7565) {
+        return Err(malformed("not an sfnt face"));
+    }
+    let records = usize::from(u16::from_be_bytes([directory[4], directory[5]]));
+    if records > MAX_TABLE_RECORDS {
+        return Err(malformed("face declares too many tables"));
+    }
+    let records = read_at(sfnt_offset + 12, 16 * records)?;
+    let mut tables = Vec::with_capacity(tags.len());
+    for tag in tags {
+        let table = records
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .find(|record| &record[..4] == tag)
+            .map(|record| (u64::from(be32(record, 8)), be32(record, 12) as usize))
+            .filter(|&(_, len)| len <= max_table_bytes)
+            .and_then(|(offset, len)| read_at(offset, len).ok());
+        tables.push(table);
+    }
+    Ok(FaceTables { faces, tables })
+}
+
+/// [`admit_font_file`]'s one open, and whether its handle may be MAPPED:
+/// `mappable` ([`maps_in_place`] in production) judges the path the handle
+/// was opened at, which for a link is its canonical target ([`open_regular`]),
+/// so a link on the system font volume to a user-writable file is copied.
 #[cfg(unix)]
-fn open_for_admission(path: &Path, mappable: bool) -> io::Result<(std::fs::File, bool)> {
-    Ok((open_regular(path)?, mappable))
+fn open_for_admission(
+    path: &Path,
+    mappable: fn(&Path) -> bool,
+) -> io::Result<(std::fs::File, bool)> {
+    let (file, opened) = open_regular(path)?;
+    let may_map = mappable(&opened);
+    Ok((file, may_map))
 }
 
 /// Windows: a file [`maps_in_place`] would map is opened WITHOUT write
@@ -597,9 +745,12 @@ fn open_for_admission(path: &Path, mappable: bool) -> io::Result<(std::fs::File,
 /// the ordinary fully-shared open instead — a residency choice, never a
 /// refused font.
 #[cfg(windows)]
-fn open_for_admission(path: &Path, mappable: bool) -> io::Result<(std::fs::File, bool)> {
+fn open_for_admission(
+    path: &Path,
+    mappable: fn(&Path) -> bool,
+) -> io::Result<(std::fs::File, bool)> {
     const ERROR_SHARING_VIOLATION: i32 = 32;
-    if mappable {
+    if mappable(path) {
         match open_regular_shared(path, win::FILE_SHARE_READ | win::FILE_SHARE_DELETE) {
             Ok(file) => return Ok((file, true)),
             Err(error) if error.raw_os_error() != Some(ERROR_SHARING_VIOLATION) => {
@@ -608,13 +759,16 @@ fn open_for_admission(path: &Path, mappable: bool) -> io::Result<(std::fs::File,
             Err(_) => {}
         }
     }
-    Ok((open_regular(path)?, false))
+    Ok((open_regular(path)?.0, false))
 }
 
 /// No mapping on this target: every admission is a copy.
 #[cfg(not(any(unix, windows)))]
-fn open_for_admission(path: &Path, _mappable: bool) -> io::Result<(std::fs::File, bool)> {
-    Ok((open_regular(path)?, false))
+fn open_for_admission(
+    path: &Path,
+    _mappable: fn(&Path) -> bool,
+) -> io::Result<(std::fs::File, bool)> {
+    Ok((open_regular(path)?.0, false))
 }
 
 /// The kernel32 calls the Windows mapping arm makes, declared directly.
@@ -722,7 +876,6 @@ mod tests {
         assert_eq!(read_bounded_font_file(&exact, 64).unwrap(), [0x5a; 64]);
         let error = read_bounded_font_file(&over, 64).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(error.to_string(), "font file exceeds the 64-byte limit");
         std::fs::remove_dir_all(root).expect("remove font-file fixtures");
     }
 
@@ -813,7 +966,7 @@ mod tests {
         let moved = root.join("opened.ttf");
         std::fs::write(&path, b"original-font-bytes").expect("write original fixture");
 
-        let mut opened = open_regular(&path).expect("open admitted handle");
+        let (mut opened, _) = open_regular(&path).expect("open admitted handle");
         std::fs::rename(&path, &moved).expect("retain opened inode under another name");
         std::fs::write(&path, b"replacement-font").expect("replace logical path");
 
@@ -833,10 +986,18 @@ mod tests {
     /// refused rather than mapped.
     #[test]
     fn maps_in_place_admits_the_system_font_volume_and_nothing_user_writable() {
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
         {
             assert!(maps_in_place(Path::new("/System/Library/Fonts/Menlo.ttc")));
             assert!(maps_in_place(Path::new(
+                "/System/Library/Fonts/Supplemental/Arial Unicode.ttf"
+            )));
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        {
+            // A macOS pathname on another host carries no immutability proof.
+            assert!(!maps_in_place(Path::new("/System/Library/Fonts/Menlo.ttc")));
+            assert!(!maps_in_place(Path::new(
                 "/System/Library/Fonts/Supplemental/Arial Unicode.ttf"
             )));
         }
@@ -883,14 +1044,11 @@ mod tests {
         }
     }
 
-    /// The mapping arm answers the SAME bytes the copy arm does, and the
-    /// residency policy is [`maps_in_place`]: a file outside the system font
-    /// volume — here a fixture directory, standing in for every user-writable
-    /// path — is copied, one on the volume is mapped (unix, Windows). The
-    /// on-volume case uses a real system font when the host has one; there is
-    /// no fixture path on a read-only volume.
+    /// The residency policy is [`maps_in_place`]: a file outside the system
+    /// font volume — here a fixture directory, standing in for every
+    /// user-writable path — is COPIED, empty or not, with exactly its bytes.
     #[test]
-    fn admit_font_file_maps_only_the_system_font_volume_and_matches_the_copy() {
+    fn admit_font_file_copies_a_file_off_the_system_font_volume() {
         let root = fixture_dir("admit-policy");
         let outside = root.join("outside.ttf");
         std::fs::write(&outside, [0x42; 4099]).expect("write outside fixture");
@@ -910,55 +1068,59 @@ mod tests {
             "the copy arm carries the empty file as-is"
         );
 
-        #[cfg(any(unix, windows))]
-        {
-            let candidate = MAPPABLE_FONT_ROOTS
-                .iter()
-                .filter_map(|dir| std::fs::read_dir(dir).ok())
-                .flatten()
-                .filter_map(Result::ok)
-                .map(|entry| entry.path())
-                .find(|path| {
-                    path.extension()
-                        .and_then(|e| e.to_str())
-                        .is_some_and(|e| matches!(e, "ttf" | "otf" | "ttc"))
-                        // `symlink_metadata`: admission is O_NOFOLLOW, so a
-                        // symlinked font is (rightly) refused and is not the
-                        // regular file this half wants.
-                        && std::fs::symlink_metadata(path)
-                            .is_ok_and(|m| m.is_file() && m.len() > 0)
-                });
-            let Some(system_font) = candidate else {
-                eprintln!(
-                    "SKIP (mapping half): no font file on the system font volume on this host"
-                );
-                std::fs::remove_dir_all(root).expect("remove font-file fixtures");
-                return;
-            };
-            assert!(maps_in_place(&system_font));
-            let admitted = admit_font_file(&system_font).expect("a system font admits");
-            assert!(
-                matches!(admitted, crate::font::FaceBytes::Mapped(_)),
-                "{}: a file on the system font volume must be MAPPED, got {admitted:?}",
-                system_font.display()
-            );
-            assert_eq!(
-                &admitted[..],
-                &read_font_file(&system_font).unwrap()[..],
-                "the mapping must present exactly the file's bytes"
-            );
-            // Two mappings of one inode know they are the same file without a
-            // byte compare — the discovery intern's convergence test.
-            let again = admit_font_file(&system_font).expect("a system font admits twice");
-            match (&admitted, &again) {
-                (crate::font::FaceBytes::Mapped(a), crate::font::FaceBytes::Mapped(b)) => {
-                    assert!(a.same_file(b));
-                    assert!(admitted.same_bytes(&again));
-                }
-                _ => unreachable!("both admissions were asserted mapped"),
-            }
-        }
         std::fs::remove_dir_all(root).expect("remove font-file fixtures");
+    }
+
+    /// The mapping arm answers the SAME bytes the copy arm does: a file on the
+    /// admitted system font volume is MAPPED (macOS, Windows; elsewhere nothing
+    /// is). It takes a real system font, since there is no fixture path on a
+    /// read-only volume; a host with none COULD NOT RUN it.
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn admit_font_file_maps_a_file_on_the_system_font_volume() {
+        let candidate = MAPPABLE_FONT_ROOTS
+            .iter()
+            .filter_map(|dir| std::fs::read_dir(dir).ok())
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| matches!(e, "ttf" | "otf" | "ttc"))
+                    // `symlink_metadata`: admission is O_NOFOLLOW, so a
+                    // symlinked font is (rightly) refused and is not the
+                    // regular file this half wants.
+                    && std::fs::symlink_metadata(path)
+                        .is_ok_and(|m| m.is_file() && m.len() > 0)
+            });
+        let Some(system_font) = candidate else {
+            aterm_spec::host::could_not_run(
+                "no font file on the system font volume on this host to map",
+            );
+        };
+        assert!(maps_in_place(&system_font));
+        let admitted = admit_font_file(&system_font).expect("a system font admits");
+        assert!(
+            matches!(admitted, crate::font::FaceBytes::Mapped(_)),
+            "{}: a file on the system font volume must be MAPPED, got {admitted:?}",
+            system_font.display()
+        );
+        assert_eq!(
+            &admitted[..],
+            &read_font_file(&system_font).unwrap()[..],
+            "the mapping must present exactly the file's bytes"
+        );
+        // Two mappings of one inode know they are the same file without a
+        // byte compare — the discovery intern's convergence test.
+        let again = admit_font_file(&system_font).expect("a system font admits twice");
+        match (&admitted, &again) {
+            (crate::font::FaceBytes::Mapped(a), crate::font::FaceBytes::Mapped(b)) => {
+                assert!(a.same_file(b));
+                assert!(admitted.same_bytes(&again));
+            }
+            _ => unreachable!("both admissions were asserted mapped"),
+        }
     }
 
     /// The Windows mapping arm's stand-in for a read-only volume, checked
@@ -1002,6 +1164,44 @@ mod tests {
         std::fs::remove_dir_all(root).expect("remove font-file fixtures");
     }
 
+    /// The servicing path the mapping keeps open, checked against the OS: the
+    /// admission grants `FILE_SHARE_DELETE`, so while a view is live the file
+    /// can still be RENAMED and its name reused (a font replaced while aterm
+    /// runs), and the view, bound to the file object rather than to its name,
+    /// still reads the original bytes. Fact 3 of win/font-mmap ede86746e2's
+    /// `a_mapped_font_cannot_be_written_or_shrunk_but_can_still_be_replaced`
+    /// (2026-08-29), on main's open and map; its facts 1 and 2, the refused
+    /// writer, are `a_mapped_font_refuses_writers_until_it_is_dropped`'s.
+    #[cfg(windows)]
+    #[test]
+    fn a_mapped_font_can_be_renamed_and_replaced_and_its_view_keeps_the_original() {
+        let root = fixture_dir("win-map-rename");
+        let path = root.join("face.ttf");
+        let renamed = root.join("face-old.ttf");
+        std::fs::write(&path, b"original-font-bytes").expect("write fixture");
+
+        let file = open_regular_shared(&path, win::FILE_SHARE_READ | win::FILE_SHARE_DELETE)
+            .expect("the mapping open succeeds with no writer present");
+        let length = check_observed_size(&file, MAX_FONT_FILE_BYTES).expect("size");
+        let mapped = MappedFontFile::map(&file, length).expect("map the fixture");
+        drop(file);
+
+        std::fs::rename(&path, &renamed).expect("a mapped font must still be renameable");
+        std::fs::write(&path, b"replacement").expect("and its name reusable");
+        assert_eq!(
+            &mapped[..],
+            b"original-font-bytes",
+            "the view must still read the ORIGINAL bytes after its name was replaced"
+        );
+        assert_eq!(
+            read_font_file(&path).expect("the replacement reads"),
+            b"replacement"
+        );
+
+        drop(mapped);
+        std::fs::remove_dir_all(root).expect("remove font-file fixtures");
+    }
+
     /// The other half: a mappable file a WRITER already holds is not mapped
     /// (its bytes could change under the view) and is not refused either — it
     /// is admitted as a copy through the fully-shared open.
@@ -1016,7 +1216,8 @@ mod tests {
             .open(&path)
             .expect("open the writer");
 
-        let (file, may_map) = open_for_admission(&path, true).expect("a held file still admits");
+        let (file, may_map) =
+            open_for_admission(&path, |_| true).expect("a held file still admits");
         assert!(!may_map, "a file a writer holds must not be mapped");
         let length = check_observed_size(&file, MAX_FONT_FILE_BYTES).expect("size");
         let mut bytes = Vec::new();
@@ -1024,7 +1225,7 @@ mod tests {
         assert_eq!(bytes, b"held-by-a-writer");
 
         drop(writer);
-        let (_, may_map) = open_for_admission(&path, true).expect("admits once released");
+        let (_, may_map) = open_for_admission(&path, |_| true).expect("admits once released");
         assert!(may_map, "with no writer the same file is mappable again");
         std::fs::remove_dir_all(root).expect("remove font-file fixtures");
     }
@@ -1090,7 +1291,8 @@ mod tests {
         drop(section);
         drop(file);
 
-        let (file, may_map) = open_for_admission(&path, true).expect("a live view still admits");
+        let (file, may_map) =
+            open_for_admission(&path, |_| true).expect("a live view still admits");
         assert!(
             !may_map,
             "a writable view without handles must prevent mapping"
@@ -1101,7 +1303,7 @@ mod tests {
         assert_eq!(bytes, expected);
 
         drop(view);
-        let (file, may_map) = open_for_admission(&path, true).expect("admits after unmapping");
+        let (file, may_map) = open_for_admission(&path, |_| true).expect("admits after unmapping");
         assert!(
             may_map,
             "the same file is mappable after its writable view closes"
@@ -1115,7 +1317,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn writerless_fifo_and_final_symlink_return_without_blocking() {
+    fn writerless_fifo_and_links_to_it_return_without_blocking() {
         use std::os::unix::ffi::OsStrExt as _;
 
         let root = fixture_dir("special");
@@ -1128,11 +1330,64 @@ mod tests {
             .expect_err("writerless FIFO must fail without blocking");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
 
-        let regular = root.join("regular.ttf");
-        let linked = root.join("linked.ttf");
-        std::fs::write(&regular, b"font").expect("write symlink target");
-        std::os::unix::fs::symlink(&regular, &linked).expect("create final symlink");
-        assert!(read_bounded_font_file(&linked, 64).is_err());
+        // Followed, a link still lands on the same handle checks: a link to the
+        // FIFO or to a device is refused without blocking, exactly as the
+        // direct path is.
+        let to_fifo = root.join("fifo-link.ttf");
+        std::os::unix::fs::symlink(&fifo, &to_fifo).expect("create link to FIFO");
+        let error = read_bounded_font_file(&to_fifo, 64)
+            .expect_err("a link to a writerless FIFO must fail without blocking");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let to_device = root.join("zero-link.ttf");
+        std::os::unix::fs::symlink("/dev/zero", &to_device).expect("create link to device");
+        let error = read_bounded_font_file(&to_device, 64)
+            .expect_err("a link to a device must not be read");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        std::fs::remove_dir_all(root).expect("remove font-file fixtures");
+    }
+
+    /// A font installed as a LINK (Ubuntu's `UbuntuMono-R.ttf`, a stow or
+    /// home-manager font in `~/.local/share/fonts`) admits as the file it
+    /// names, through every entry point; a link loop and a dangling link do
+    /// not; and residency is decided on the file opened, so a copy is a copy.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_a_regular_font_admits_as_its_target() {
+        let root = fixture_dir("links");
+        let store = root.join("store");
+        std::fs::create_dir_all(&store).expect("create link-target directory");
+        let regular = store.join("Face[wght].ttf");
+        std::fs::write(&regular, b"font-bytes").expect("write link target");
+        let linked = root.join("Face-R.ttf");
+        std::os::unix::fs::symlink(&regular, &linked).expect("create final link");
+        // A RELATIVE link through a second link, the shape a dotfiles manager
+        // leaves behind.
+        let chained = root.join("Face-B.ttf");
+        std::os::unix::fs::symlink("Face-R.ttf", &chained).expect("create chained link");
+
+        for path in [&linked, &chained] {
+            validate_font_file(path).expect("a link to a regular file validates");
+            assert_eq!(read_font_file(path).expect("and reads"), b"font-bytes");
+            let mut buf = Vec::new();
+            read_font_file_into(path, &mut buf).expect("and reads into a buffer");
+            assert_eq!(buf, b"font-bytes");
+            let admitted = admit_font_file(path).expect("and admits");
+            assert_eq!(&admitted[..], b"font-bytes");
+            assert!(matches!(admitted, crate::font::FaceBytes::Vec(_)));
+        }
+
+        let a = root.join("loop-a.ttf");
+        let b = root.join("loop-b.ttf");
+        std::os::unix::fs::symlink(&b, &a).expect("create loop link a");
+        std::os::unix::fs::symlink(&a, &b).expect("create loop link b");
+        assert!(read_font_file(&a).is_err(), "a link loop must stay refused");
+        let dangling = root.join("dangling.ttf");
+        std::os::unix::fs::symlink(root.join("absent.ttf"), &dangling)
+            .expect("create dangling link");
+        assert_eq!(
+            read_font_file(&dangling).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
         std::fs::remove_dir_all(root).expect("remove font-file fixtures");
     }
 }

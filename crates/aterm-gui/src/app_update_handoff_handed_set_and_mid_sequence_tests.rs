@@ -4,8 +4,8 @@
 use super::{
     CaptureFailure, ParkAttempt, ParkGate, ParkGateFacts, classify_capture_failure,
     handed_sessions_only, handoff_masters_closed, handoff_masters_have_activity,
-    hold_cap_stand_down_detail, prelaunch_hold_cap, prelaunch_park_admitted, stamp_fg_holders,
-    stamp_journal_keys, stamp_render_debts,
+    prelaunch_hold_cap, prelaunch_park_admitted, stamp_fg_holders, stamp_journal_keys,
+    stamp_render_debts,
 };
 use crate::native_update_auto_intent::{ActivityFacts, ApplyPhase};
 use crate::native_updater_service::ApplyMode;
@@ -489,62 +489,6 @@ fn an_open_link_past_the_free_reparks_is_carried_not_missed() {
     aterm_pty::close_fd(master);
 }
 
-/// A graphics stream does not hold the update: the parser is inside a kitty-graphics APC at
-/// almost every batch edge, so on the fork lane, and once the launched lane's free re-parks are
-/// spent, the screen is carried and the in-flight frame dropped. Negative controls: with a free
-/// re-park left it misses, and an OSC 52 clipboard write, which nothing replaces, always does.
-#[test]
-fn a_graphics_stream_past_the_free_reparks_is_carried_not_missed() {
-    let mut app = crate::App::headless_for_test();
-    let (master, slave) = openpty();
-    set_master(&mut app, 0, master);
-    let term = app.pool.get(0).expect("session 0").term.clone();
-    crate::term_lock(&term).process(b"\x1b_Ga=T,f=100,m=1;AAAA");
-    write_all(slave, b"AAAA\x1b\\\x1b_Gm=1;BBBB");
-    assert_eq!(capture(&mut app), Ok(vec![0]), "the fork lane carries it");
-    let (mut prelaunch, ..) =
-        super::late_park_record_tests::prelaunch_record(1, ApplyMode::AutomaticPastGrace);
-    prelaunch.park_mid_sequence_reparks = super::PRELAUNCH_MAX_MID_SEQUENCE_REPARKS - 1;
-    app.update_handoff_prelaunch = Some(prelaunch);
-    assert_eq!(
-        capture(&mut app),
-        Err(CaptureFailure::MidSequence {
-            local_id: 0,
-            state: "SosPmApcString"
-        }),
-        "a free re-park is left: the frame may end at the next boundary"
-    );
-    if let Some(prelaunch) = app.update_handoff_prelaunch.as_mut() {
-        prelaunch.park_mid_sequence_reparks = super::PRELAUNCH_MAX_MID_SEQUENCE_REPARKS;
-    }
-    assert_eq!(
-        capture(&mut app),
-        Ok(vec![0]),
-        "the free re-parks are spent: carried, not a miss the ladder charges"
-    );
-    drain(master);
-    crate::term_lock(&term).process(b"\x18");
-    let mut clipboard = b"\x1b]52;c;".to_vec();
-    clipboard.extend(std::iter::repeat_n(b'A', 5000));
-    crate::term_lock(&term).process(&clipboard);
-    write_all(slave, b"QUFBQQ==\x07");
-    assert_eq!(
-        capture(&mut app),
-        Err(CaptureFailure::MidSequence {
-            local_id: 0,
-            state: "OscString"
-        }),
-        "a clipboard write is never carried away over its own tail"
-    );
-    drain(master);
-    app.update_handoff_prelaunch = None;
-
-    set_master(&mut app, 0, -1);
-    drop(app);
-    aterm_pty::close_fd(slave);
-    aterm_pty::close_fd(master);
-}
-
 fn calm_land(live: &[(u64, i32, i32)]) -> ParkGateFacts {
     ParkGateFacts {
         mode: ApplyMode::AutomaticPastGrace,
@@ -853,23 +797,74 @@ fn a_session_that_owes_rows_carries_its_render_debt_and_the_others_carry_none() 
     assert_eq!(other.sessions[0].render_debt, None);
 }
 
-/// A hold-cap stand-down says what held the park, so an exited pane's master is not blamed on
-/// the user.
+/// THE PRODUCT'S LOG CARRY AT THE PARK AND AT A STAND-DOWN (phase 2A; the
+/// review found every carry test fed the export or the adoption by hand):
+/// the park's capture hands each handed session's timeline to the export,
+/// whose sidecar for a successor that reads logs carries the session's log;
+/// the export's take fences the log's readers at what it carried; and
+/// `rollback_overlap` (the update stood down) lifts the fence, so `log`
+/// reads the records written after the take. NEGATIVE CONTROLS: the same
+/// park exported for a successor older than this build writes no member,
+/// and until the rollback the read stops at the fence.
 #[test]
-fn a_hold_cap_stand_down_names_what_held_the_park() {
-    let held_for = std::time::Duration::from_secs(120);
-    assert_eq!(
-        hold_cap_stand_down_detail(
-            "the terminal never offered a moment to pause in within the hold cap",
-            held_for,
-            Some("a session has output waiting that its reader has not taken"),
-        ),
-        "the terminal never offered a moment to pause in within the hold cap (120 s after \
-         the successor dialled; the park was last held back because a session has output \
-         waiting that its reader has not taken)"
+fn the_park_hands_its_logs_to_the_export_and_a_stand_down_lifts_the_fence() {
+    let mut app = crate::App::headless_for_test();
+    let ctx = std::sync::Arc::clone(&app.pool.get(0).expect("session 0").ctx);
+    let written = |n: usize| {
+        let mut tl = ctx.timeline.lock().unwrap();
+        let now = tl.slog().now();
+        for _ in 0..n {
+            tl.slog_mut().human_input(true, now);
+        }
+        tl.slog().log().last_seq()
+    };
+    let fenced = written(5);
+    let live = app.handoff_live_sessions();
+    let window = std::time::Duration::from_secs(30);
+    let parked = app
+        .capture_parked_screens(
+            &live,
+            std::time::Instant::now() + window,
+            window.as_millis(),
+            window / 2,
+            crate::seamless::WireCaps::current(),
+            aterm_update_core::handoff_policy::CarryCeiling::Full,
+        )
+        .unwrap_or_else(|failure| panic!("the desk parks: {failure}"));
+    assert_eq!(parked.carries.len(), live.len(), "every handed session");
+    let ceiling = crate::control::turn_ids_for_handoff();
+    let build = crate::running_build_number();
+    // NEGATIVE CONTROL: an older successor's sidecars carry no log.
+    for (_, bytes) in crate::handoff_carry::export_for_target(&parked.carries, ceiling, build - 1) {
+        let carry = crate::handoff_carry::decode(&bytes).expect("a sidecar");
+        assert!(carry.log.is_none(), "no member for an older successor");
+    }
+    let controls = crate::handoff_carry::export_for_target(&parked.carries, ceiling, build);
+    assert_eq!(controls.len(), live.len());
+    for (id, bytes) in &controls {
+        let mut carry = crate::handoff_carry::decode(bytes).expect("a sidecar");
+        let lines = carry
+            .take_log()
+            .unwrap_or_else(|| panic!("session {id}'s log rides its sidecar"));
+        assert!(lines[0].starts_with("slog-carry v=1 "), "{}", lines[0]);
+        assert!(
+            lines[0].contains(&format!(" last={fenced} ")),
+            "the log as the take found it: {}",
+            lines[0]
+        );
+    }
+    // The overlap: this process writes on, its readers fenced at the take.
+    let after = written(3);
+    assert!(after > fenced);
+    let reply = crate::control::cmd_log(&ctx, "");
+    assert!(
+        reply.contains(&format!(" as_of={fenced} ")),
+        "fenced until the update commits or stands down: {reply}"
     );
-    assert_eq!(
-        hold_cap_stand_down_detail("capped", held_for, None),
-        "capped (120 s after the successor dialled)"
+    app.rollback_overlap(None, &[]);
+    let reply = crate::control::cmd_log(&ctx, "");
+    assert!(
+        reply.contains(&format!(" as_of={after} ")),
+        "the stand-down lifted the fence: {reply}"
     );
 }

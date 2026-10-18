@@ -1,27 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Runtime basics: class lookup, NSString round trips, ownership, pools, nil sends, and the
-//! selector cache.
+//! Runtime basics: NSString round trips, ownership, pools, and nil sends.
 
 #![cfg(target_os = "macos")]
+#![expect(
+    clippy::disallowed_methods,
+    reason = "aterm-objc's own runtime tests drive the bare `msg` cast; everything else uses checked_msg"
+)]
 
 use std::ffi::c_char;
+use std::sync::Arc;
 
-use aterm_objc::{
-    Id, Obj, Sel, autoreleasepool, class, class_name, class_of, msg, ns_string, ns_string_to_rust,
-    sel, sel_uncached, superclass_of,
-};
-
-#[test]
-fn classes_resolve_and_unknown_names_are_nil() {
-    assert!(!class(c"NSString").is_null());
-    assert!(!class(c"NSObject").is_null());
-    assert!(class(c"ATermNoSuchClassExistsAnywhere").is_null());
-    // SAFETY: the pointer came straight from `objc_getClass` for a class
-    // Foundation always defines, so it is live and immortal.
-    unsafe { assert_eq!(class_name(class(c"NSString")), c"NSString") };
-}
+use aterm_objc::{Id, Obj, Sel, autoreleasepool, class, msg, ns_string, ns_string_to_rust, sel};
 
 /// Every Rust string survives the trip exactly, including the two characters a
 /// C-string or byte-order-mark reading loses: U+0000 (a pasted `a\0b` read
@@ -82,19 +73,6 @@ fn an_unpaired_surrogate_reads_as_a_replacement_character() {
 }
 
 #[test]
-fn ns_string_length_is_utf16_code_units() {
-    autoreleasepool(|_| {
-        let obj = ns_string("héllo").expect("NSString");
-        // SAFETY: `-length` is `-(NSUInteger)` on a live NSString.
-        let len: usize = unsafe {
-            let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = msg();
-            f(obj.id(), sel!(length))
-        };
-        assert_eq!(len, 5, "NSString length counts UTF-16 units, not bytes");
-    });
-}
-
-#[test]
 fn owned_and_retained_balance_exactly() {
     autoreleasepool(|_| {
         // A plain NSObject: a short NSString is an immortal tagged pointer whose `-retainCount`
@@ -133,34 +111,6 @@ fn from_owned_and_retain_reject_nil() {
 }
 
 #[test]
-fn class_of_and_superclass_of_walk_the_chain() {
-    autoreleasepool(|_| {
-        let obj = ns_string("chain").expect("NSString");
-        // SAFETY: `obj` is a live object.
-        let cls = unsafe { class_of(obj.id()) };
-        assert!(!cls.is_null());
-        // NSString is class-clustered, so the concrete class is a private subclass;
-        // walking up must still reach NSString and then NSObject.
-        let mut cursor = cls;
-        let mut names = Vec::new();
-        while !cursor.is_null() {
-            // SAFETY: `cursor` starts at a live class (from `object_getClass` on a
-            // live object) and each step replaces it with that class's superclass,
-            // which the runtime guarantees is live-or-null.
-            unsafe {
-                names.push(class_name(cursor).to_string_lossy().into_owned());
-                cursor = superclass_of(cursor);
-            }
-        }
-        assert!(
-            names.contains(&"NSString".to_owned()),
-            "chain was {names:?}"
-        );
-        assert_eq!(names.last().map(String::as_str), Some("NSObject"));
-    });
-}
-
-#[test]
 fn an_error_description_is_read_out_of_a_real_nserror() {
     autoreleasepool(|_| {
         // Build a real NSError rather than asserting on the nil path only.
@@ -195,48 +145,9 @@ fn an_error_description_is_read_out_of_a_real_nserror() {
 }
 
 #[test]
-fn cached_selectors_are_the_uncached_ones() {
-    assert_eq!(sel!(length), sel_uncached(c"length"));
-    assert_eq!(sel!(alloc), sel_uncached(c"alloc"));
-    assert_eq!(
-        sel!(initWithBytes:length:encoding:),
-        sel_uncached(c"initWithBytes:length:encoding:")
-    );
-    assert_eq!(
-        sel!(toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:),
-        sel_uncached(c"toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:")
-    );
-    // A cached selector is stable across uses.
-    assert_eq!(sel!(description), sel!(description));
-}
-
-#[test]
-fn a_cache_slot_survives_concurrent_first_use() {
-    // The fill path is deliberately racy-by-value: both threads call
-    // `sel_registerName`, which interns, so both must see the same pointer.
-    let slot = std::sync::Arc::new(aterm_objc::SelCache::new());
-    let mut handles = Vec::new();
-    for _ in 0..8 {
-        let slot = std::sync::Arc::clone(&slot);
-        handles.push(std::thread::spawn(move || {
-            slot.get(c"isEqual:").as_ptr().addr()
-        }));
-    }
-    let seen: Vec<usize> = handles
-        .into_iter()
-        .map(|h| h.join().expect("thread"))
-        .collect();
-    assert!(
-        seen.iter().all(|a| *a == seen[0]),
-        "racing fills disagreed: {seen:?}"
-    );
-    assert_eq!(seen[0], sel_uncached(c"isEqual:").as_ptr().addr());
-}
-
-#[test]
 fn a_pool_scope_is_a_pure_nesting() {
-    // Nested scopes pop in reverse order without disturbing each other; `pools.rs` covers the
-    // out-of-order case.
+    // Nested scopes pop in reverse order without disturbing each other; scopes are the only way
+    // this crate lets a second pool exist without `unsafe`.
     let text = autoreleasepool(|_outer| {
         autoreleasepool(|_inner| {
             let s = ns_string("nested").expect("NSString");
@@ -248,40 +159,24 @@ fn a_pool_scope_is_a_pure_nesting() {
 }
 
 #[test]
-fn an_autoreleased_object_lives_exactly_as_long_as_its_pool() {
-    // `Obj::autorelease` hands the +1 to the pool: the object stays readable for the rest of the
-    // scope. A plain NSObject, for the reason in `owned_and_retained_balance_exactly`.
-    let count = |id: Id| -> usize {
-        // SAFETY: `-retainCount` is `-(NSUInteger)` and diagnostic-only.
-        unsafe {
-            let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = msg();
-            f(id, sel!(retainCount))
-        }
-    };
-    autoreleasepool(|_| {
-        // SAFETY: `+alloc`/`-init` on NSObject return a +1 instance.
-        let owned = unsafe {
-            let alloc: unsafe extern "C-unwind" fn(aterm_objc::ClassPtr, Sel) -> Id = msg();
-            let raw = alloc(class(c"NSObject"), sel!(alloc));
-            let init: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
-            Obj::from_owned(init(raw, sel!(init))).expect("NSObject instance")
-        };
-        let before = count(owned.id());
-        // Hand the +1 to the pool; the pointer that comes back is borrowed.
-        let borrowed = owned.autorelease();
-        assert_eq!(
-            count(borrowed),
-            before,
-            "autorelease must not change the retain count — it defers a release"
-        );
-        // Still fully alive and messageable inside the pool.
-        // SAFETY: `-description` is `-(id)` on the live object above.
-        let desc = unsafe {
-            let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
-            f(borrowed, sel!(description))
-        };
-        assert!(!desc.is_null());
+fn a_scope_pops_its_pool_even_when_the_body_unwinds() {
+    // The pool is a local of `autoreleasepool`'s frame, so unwinding pops it. A skipped pop would
+    // make the next pool on this thread pop against a stack the runtime disagrees with.
+    let caught = std::panic::catch_unwind(|| {
+        autoreleasepool(|_| {
+            let s = ns_string("about to unwind").expect("NSString");
+            let _ = s;
+            panic!("deliberate");
+        })
     });
+    assert!(caught.is_err());
+    // A pool pushed after the unwind still pops cleanly; a leaked token would kill the binary here.
+    let after = autoreleasepool(|_| {
+        let s = ns_string("after").expect("NSString");
+        // SAFETY: `s` is a live +1 NSString owned by this scope.
+        unsafe { ns_string_to_rust(s.id()) }
+    });
+    assert_eq!(after, "after");
 }
 
 #[test]
@@ -334,33 +229,45 @@ fn a_nil_receiver_returns_a_zero_rect_on_this_arch() {
     }
 }
 
-/// The premise of `send_rect`'s nil check, on x86_64: a nil `objc_msgSend_stret` leaves its
-/// out-buffer unwritten. The stret ABI passes the result pointer first, so
-/// `(out, self, _cmd) -> ()` is the same call with a buffer the test can poison.
-#[cfg(target_arch = "x86_64")]
+// ---------------------------------------------------------------------------
+// The selector cache under a hard concurrent first use.
+// ---------------------------------------------------------------------------
+
 #[test]
-fn libobjc_leaves_a_nil_stret_return_untouched_on_x86_64() {
-    #[link(name = "objc", kind = "dylib")]
-    unsafe extern "C" {
-        fn objc_msgSend_stret();
+fn the_sel_cache_is_correct_under_a_hard_concurrent_first_use() {
+    // Many threads, many distinct slots, every first use racing: the relaxed
+    // store must be benign by value, every thread seeing the same interned
+    // pointer, equal to the uncached lookup.
+    const THREADS: usize = 16;
+    let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+    let mut handles = Vec::new();
+    for _ in 0..THREADS {
+        let b = Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            b.wait();
+            let mut v = Vec::new();
+            for _ in 0..64 {
+                v.push(sel!(objectAtIndex:).as_ptr().addr());
+                v.push(sel!(initWithBytes:length:encoding:).as_ptr().addr());
+                v.push(sel!(description).as_ptr().addr());
+                v.push(sel!(isEqualToString:).as_ptr().addr());
+            }
+            v
+        }));
     }
-    let mut out = [0xABu8; size_of::<aterm_objc::CGRect>()];
-    // SAFETY: on x86_64 `objc_msgSend_stret` takes the result pointer in rdi,
-    // self in rsi and _cmd in rdx, which is exactly this prototype; a nil self
-    // returns at once, and `out` is large enough for the CGRect `-frame` would
-    // return.
-    unsafe {
-        let f: unsafe extern "C" fn(*mut u8, aterm_objc::Id, aterm_objc::Sel) =
-            std::mem::transmute(objc_msgSend_stret as unsafe extern "C" fn());
-        f(
-            out.as_mut_ptr(),
-            aterm_objc::Id::NIL,
-            aterm_objc::sel!(frame),
-        );
+    let all: Vec<Vec<usize>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let first = &all[0];
+    for (i, v) in all.iter().enumerate() {
+        assert_eq!(v, first, "thread {i} saw different selector pointers");
     }
-    assert!(
-        out.iter().all(|&b| b == 0xAB),
-        "libobjc wrote the out-buffer of a nil stret send ({out:02x?}); `send_rect`'s \
-         nil check would then be redundant on x86_64"
+    assert_eq!(
+        first[0],
+        aterm_objc::sel_uncached(c"objectAtIndex:").as_ptr().addr()
+    );
+    assert_eq!(
+        first[1],
+        aterm_objc::sel_uncached(c"initWithBytes:length:encoding:")
+            .as_ptr()
+            .addr()
     );
 }

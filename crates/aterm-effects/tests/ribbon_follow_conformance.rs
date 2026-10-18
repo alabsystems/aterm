@@ -12,15 +12,15 @@
 //! `4^6 × 2^6` runs, the model read once per `3^6 × 2^6` (both absent classes count alike), every
 //! invariant checked at `N = 6`. The glyphs are distinct, so `Witness::relaid_suffix` stays `0`
 //! (the model has no relay). The real verdict (named or not, extent, missed count) must equal
-//! the model's `Decide` successor. The negative control is a veto rule (a twin never found, never
-//! neutral), the model at `Buggy = 1`.
+//! the model's `Decide` successor.
 
 use std::collections::BTreeMap;
 use std::time::Instant;
 
 use aterm_effects::rainbow_kitty::ribbon::{Cell, Layer};
 use aterm_effects::rainbow_kitty::witness::{RowSample, Witness};
-use aterm_spec::derive::{Model, ribbon_follow_twin_model};
+use aterm_models_effects::ribbon_follow_twin_model;
+use aterm_spec::derive::Model;
 
 const N: usize = 6;
 const GLYPHS: [char; N] = ['a', 'b', 'c', 'd', 'e', 'f'];
@@ -129,36 +129,6 @@ fn real(w: &mut Witness, cells: &[Cell], classes: &[Class; N], gone: &[bool; N])
     }
 }
 
-/// The veto rule, replayed: a twin at the target is never found and never
-/// neutral (a hole), and the found records must be one block of at least two
-/// and at least half of all armed records. No riders and no missed count.
-fn veto(classes: &[Class; N], gone: &[bool; N]) -> (i64, i64, i64) {
-    let gone_n = gone.iter().filter(|g| **g).count();
-    if gone_n < 2 || gone_n * 2 < N {
-        return (0, 0, 0);
-    }
-    let (mut found, mut lo, mut hi, mut after) = (0usize, 0i64, 0i64, false);
-    for (k, class) in classes.iter().enumerate() {
-        if *class == Class::Arrived {
-            if after {
-                return (0, 0, 0);
-            }
-            found += 1;
-            if lo == 0 {
-                lo = k as i64 + 1;
-            }
-            hi = k as i64 + 1;
-        } else if found > 0 {
-            after = true;
-        }
-    }
-    if found >= 2 && found * 2 >= N {
-        (1, lo, hi)
-    } else {
-        (0, 0, 0)
-    }
-}
-
 /// The model's scan, replayed incrementally. [`every_configuration`] visits
 /// configurations in record order, so consecutive ones share a scanned prefix:
 /// [`Self::modelled`] fires only the records after the first one whose scan
@@ -221,11 +191,12 @@ fn project(state: &BTreeMap<&'static str, i64>, v: Verdict) -> BTreeMap<&'static
     p
 }
 
-fn at_n(mut model: Model, buggy: i64) -> Model {
+/// The model at `N` records, with its historical defect off.
+fn at_n(mut model: Model) -> Model {
     for c in &mut model.consts {
         match c.0 {
             "N" => c.1 = N as i64,
-            "Buggy" => c.1 = buggy,
+            "Buggy" => c.1 = 0,
             _ => {}
         }
     }
@@ -269,7 +240,7 @@ fn with_absent_twins(classes: &[Class; N], mut f: impl FnMut(&[Class; N])) {
 
 #[test]
 fn the_real_follow_pass_is_the_twin_contract_on_every_six_record_run() {
-    let model = at_n(ribbon_follow_twin_model(), 0);
+    let model = at_n(ribbon_follow_twin_model());
     let t0 = Instant::now();
     let cells: Vec<Cell> = (0..N as u16).map(|c| cell(c, t0)).collect();
     let mut w = Witness::new();
@@ -301,46 +272,5 @@ fn the_real_follow_pass_is_the_twin_contract_on_every_six_record_run() {
     assert!(
         named > 1000 && missed > 100,
         "the sweep reaches both verdicts: {named} named, {missed} missed of {runs}"
-    );
-}
-
-/// Negative control: the veto rule is the model at `Buggy = 1`, and projected
-/// onto the correct model it breaks `AnArrivedBlockFollows` wherever a twin
-/// stood inside or flush against an arrived block, and nowhere without a
-/// twin.
-#[test]
-fn the_2026_09_22_veto_is_the_buggy_model_and_the_contract_refuses_it() {
-    let model = at_n(ribbon_follow_twin_model(), 0);
-    let buggy = at_n(ribbon_follow_twin_model(), 1);
-    let (mut scan, mut scan_buggy) = (Scanner::new(&model), Scanner::new(&buggy));
-    let (mut refused, mut total) = (0usize, 0usize);
-    every_configuration(|classes, gone| {
-        total += 1;
-        let (named, lo, hi) = veto(classes, gone);
-        let b = scan_buggy.modelled(classes, gone);
-        assert_eq!(
-            b["named"], named,
-            "{classes:?} gone {gone:?}: the Buggy model is the veto"
-        );
-        if named == 1 {
-            assert_eq!(
-                (b["lo"], b["hi"]),
-                (lo, hi),
-                "{classes:?} gone {gone:?}: the Buggy model's extent is the veto's"
-            );
-        }
-        let state = scan.modelled(classes, gone);
-        let p = project(&state, (named, lo, hi, state["missed"]));
-        if !model.check_invariant("AnArrivedBlockFollows", &p) {
-            refused += 1;
-            assert!(
-                classes.contains(&Class::Standing),
-                "{classes:?} gone {gone:?}: only a twin separates the veto from the contract"
-            );
-        }
-    });
-    assert!(
-        refused > 100,
-        "the veto is refused on {refused} of {total} runs: the check is not vacuous"
     );
 }

@@ -9,10 +9,9 @@ them are public test data: never install or trust any of them.
 
 Every local fixture chains to `root.der`, a throwaway P-256 CA in no trust
 store. No private keys are committed (the tests only verify), so nothing here
-can sign. `mint.sh` regenerates the local set from fresh keys; run it from this
-directory with OpenSSL 3. Its header states the two rules the corpus keeps: no
-leaf valid for more than ~398 days, and no `authorityInformationAccess` or
-`crlDistributionPoints` anywhere.
+can sign. `PROVENANCE.md` records how the local set was minted (OpenSSL 3) and
+the two rules the corpus keeps: no leaf valid for more than ~398 days, and no
+`authorityInformationAccess` or `crlDistributionPoints` anywhere.
 
 | file | what it is | why it exists |
 | --- | --- | --- |

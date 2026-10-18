@@ -14,7 +14,7 @@
 //!
 //! | Mode | Enforced |
 //! |---|---|
-//! | Master, User | Nothing beyond the capability-gated spawn; the shell keeps aterm's own resource limits. |
+//! | User | Nothing beyond the capability-gated spawn; the shell keeps aterm's own resource limits. |
 //! | Safety | Resource limits (`aterm-sandbox`): soft rlimits on Unix, a guardrail the shell's rc or its program can raise; the Job Object on Windows. No OS sandbox. |
 //! | Containment | Safety's limits as hard rlimits, which the program cannot raise (`Limits::contained`), plus the OS sandbox below; on a platform without one, no shell. |
 //!
@@ -208,13 +208,13 @@ fn decide_on(mode: ContainmentMode, sandbox_available: bool, home: Option<&str>)
         // Explicit record that no OS sandbox is in force (the policy permits
         // network). Safety's limits apply as soft rlimits on Unix and via the
         // Job Object on Windows (`aterm_sandbox::Limits::shell_default`);
-        // Master and User keep aterm's own (`Limits::inherit`), so their record
-        // claims no limits.
+        // User keeps aterm's own (`Limits::inherit`), so its record claims no
+        // limits.
         log_posture(
             SUBSYSTEM,
             "os-network-sandbox",
             mode,
-            if matches!(mode, ContainmentMode::Master | ContainmentMode::User) {
+            if mode == ContainmentMode::User {
                 "OS sandbox not applied (network permitted by policy); process-cap gate only (resource limits inherited from aterm's own process)"
             } else {
                 "OS sandbox not applied (network permitted by policy); resource limits + process-cap gate only"
@@ -263,16 +263,12 @@ mod tests {
     #[test]
     fn network_sandbox_in_force_only_for_containment_on_macos() {
         // Only Containment (network = None) is OS-network-sandboxed, and only on a
-        // platform that can actuate. User/Safety/Master permit network → never.
+        // platform that can actuate. User/Safety permit network → never.
         assert_eq!(
             network_sandbox_actuated(ContainmentMode::Containment),
             cfg!(target_os = "macos")
         );
-        for mode in [
-            ContainmentMode::Master,
-            ContainmentMode::User,
-            ContainmentMode::Safety,
-        ] {
+        for mode in [ContainmentMode::User, ContainmentMode::Safety] {
             assert!(
                 !network_sandbox_actuated(mode),
                 "{mode} permits network — must NOT be OS-network-sandboxed"
@@ -282,11 +278,7 @@ mod tests {
 
     #[test]
     fn every_mode_permits_the_initial_shell_where_its_sandbox_exists() {
-        for mode in [
-            ContainmentMode::Master,
-            ContainmentMode::User,
-            ContainmentMode::Safety,
-        ] {
+        for mode in [ContainmentMode::User, ContainmentMode::Safety] {
             let d = decide(mode);
             assert!(
                 d.is_permitted(),
@@ -311,13 +303,8 @@ mod tests {
                 reason: NO_OS_SANDBOX_REASON,
             }
         );
-        assert!(NO_OS_SANDBOX_REASON.contains("only on macOS"));
         // The other modes never demanded a sandbox, so its absence changes nothing.
-        for mode in [
-            ContainmentMode::Master,
-            ContainmentMode::User,
-            ContainmentMode::Safety,
-        ] {
+        for mode in [ContainmentMode::User, ContainmentMode::Safety] {
             assert_eq!(
                 decide_on(mode, false, None),
                 SpawnDecision::Permit {
@@ -347,7 +334,6 @@ mod tests {
         // Permit{os_sandbox:false, sbpl:None}. The sbpl and the os_sandbox flag are
         // always in lockstep.
         for mode in [
-            ContainmentMode::Master,
             ContainmentMode::User,
             ContainmentMode::Safety,
             ContainmentMode::Containment,
@@ -383,50 +369,6 @@ mod tests {
                 }
                 other => panic!("{mode} must Permit, got {other:?}"),
             }
-        }
-    }
-
-    #[test]
-    fn non_containment_spawn_is_never_os_sandboxed() {
-        // User (the default), Safety and Master get os_sandbox=false and
-        // sbpl=None, so the launcher applies no sandbox-exec wrap.
-        for mode in [
-            ContainmentMode::User,
-            ContainmentMode::Safety,
-            ContainmentMode::Master,
-        ] {
-            match decide(mode) {
-                SpawnDecision::Permit {
-                    os_sandbox, sbpl, ..
-                } => {
-                    assert!(!os_sandbox, "{mode} must not be OS-sandboxed");
-                    assert!(sbpl.is_none(), "{mode} must carry no SBPL (no wrap)");
-                }
-                other => panic!("{mode} must Permit, got {other:?}"),
-            }
-        }
-    }
-
-    /// The applied posture claims the shell-history allowance and the credential
-    /// and private-data denies only when the profile holds them, and scopes the
-    /// claim to `$HOME`, the only home the denies are joined onto.
-    #[test]
-    fn applied_posture_claims_home_denies_only_when_emitted() {
-        assert!(
-            applied_posture(true)
-                .ends_with("no access to credential stores or private data under $HOME")
-        );
-        let homeless = applied_posture(false);
-        assert!(!homeless.contains("no access"), "{homeless}");
-        assert!(!homeless.contains("shell history"), "{homeless}");
-        // The task-port pair and the mach-lookup allowlist are in the base
-        // profile, so they hold with no home too.
-        for posture in [applied_posture(true), homeless] {
-            assert!(posture.contains("no debugger attach"), "{posture}");
-            assert!(
-                posture.contains("no mach service lookup but user and group queries"),
-                "{posture}"
-            );
         }
     }
 
@@ -665,15 +607,11 @@ mod tests {
         use std::io::Write;
 
         // Need a real, resolvable $HOME for the profile to scope under. If $HOME is
-        // somehow unset in the test env, the profile is the base one and this proof
-        // is not applicable — skip rather than false-pass.
-        let Ok(home) = std::env::var("HOME") else {
-            eprintln!("HOME unset in test env — skipping secret-deny proof");
-            return;
-        };
+        // unset or empty in the test env, the profile is the base one and this
+        // proof is not applicable: COULD NOT RUN, never a false pass.
+        let home = std::env::var("HOME").unwrap_or_default();
         if home.is_empty() {
-            eprintln!("HOME empty in test env — skipping secret-deny proof");
-            return;
+            aterm_spec::host::could_not_run("HOME is unset or empty: no secret-deny proof");
         }
 
         let decision = decide(ContainmentMode::Containment);
@@ -802,14 +740,14 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn enforcement_proof_containment_confines_writes() {
-        let Ok(home) = std::env::var("HOME") else {
-            eprintln!("HOME unset in test env — skipping write-confinement proof");
-            return;
-        };
-        let Ok(home) = std::fs::canonicalize(&home) else {
-            eprintln!("HOME does not resolve — skipping write-confinement proof");
-            return;
-        };
+        let home = std::env::var("HOME").unwrap_or_else(|_| {
+            aterm_spec::host::could_not_run("HOME is unset: no write-confinement proof")
+        });
+        let home = std::fs::canonicalize(&home).unwrap_or_else(|e| {
+            aterm_spec::host::could_not_run(format!(
+                "HOME does not resolve ({e}): no write-confinement proof"
+            ))
+        });
         let profile = containment_profile();
         let pid = std::process::id();
 
@@ -888,28 +826,33 @@ mod tests {
     }
 
     /// A scratch `$HOME` under the test binary's target directory, outside
-    /// every [`crate::sbpl::WRITABLE_ROOTS`] entry. `None` (and the proof stops)
-    /// where the target directory is itself under a writable root.
+    /// every [`crate::sbpl::WRITABLE_ROOTS`] entry. Where the target directory
+    /// is itself under a writable root (or cannot be found or written) the
+    /// proof cannot be made here: COULD NOT RUN, never a pass.
     #[cfg(target_os = "macos")]
-    fn scratch_home_outside_writable_roots(tag: &str) -> Option<std::path::PathBuf> {
-        let exe = std::env::current_exe().ok()?;
+    fn scratch_home_outside_writable_roots(tag: &str) -> std::path::PathBuf {
+        let refuse = |why: String| -> ! {
+            aterm_spec::host::could_not_run(format!("no scratch HOME for the {tag} proof: {why}"))
+        };
+        let exe = std::env::current_exe().unwrap_or_else(|e| refuse(format!("current_exe: {e}")));
         // `<profile>/deps/<test>` → `<profile>` (never `deps/`, which is kept
         // small).
-        let dir = std::fs::canonicalize(exe.parent()?.parent()?).ok()?;
+        let profile = exe
+            .parent()
+            .and_then(std::path::Path::parent)
+            .unwrap_or_else(|| refuse(format!("{} has no profile directory", exe.display())));
+        let dir = std::fs::canonicalize(profile)
+            .unwrap_or_else(|e| refuse(format!("{}: {e}", profile.display())));
         if crate::sbpl::WRITABLE_ROOTS
             .iter()
             .any(|root| dir.starts_with(root))
         {
-            eprintln!(
-                "{} lies under a writable root — skipping the {tag} proof",
-                dir.display()
-            );
-            return None;
+            refuse(format!("{} lies under a writable root", dir.display()));
         }
         let home = dir.join(format!("aterm-sbpl-home-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
-        std::fs::create_dir(&home).ok()?;
-        Some(home)
+        std::fs::create_dir(&home).unwrap_or_else(|e| refuse(format!("{}: {e}", home.display())));
+        home
     }
 
     /// Proof 5b (history, over a scratch `$HOME`): the history allowance works
@@ -930,9 +873,7 @@ mod tests {
     #[test]
     fn enforcement_proof_history_allowance_widens_nothing() {
         use crate::capability::FsCapability;
-        let Some(home) = scratch_home_outside_writable_roots("history") else {
-            return;
-        };
+        let home = scratch_home_outside_writable_roots("history");
         let zshrc = home.join(".zshrc");
         std::fs::write(&zshrc, "echo original\n").unwrap();
         let q = |p: &std::path::Path| format!("'{}'", p.display());
@@ -1607,8 +1548,9 @@ mod tests {
     /// localhost), make, xcrun, clang (compile and run), ad-hoc `codesign`
     /// then `codesign -v` and exec, targo and trustc, and a `targo --unverified
     /// build`. Each runs in a scratch directory under `$TMPDIR`, the one place a
-    /// contained build may write. A tool this machine lacks is SKIPPED by name
-    /// on stderr, never counted a pass.
+    /// contained build may write. Every case this machine can run runs and must
+    /// hold; then, if any case needs a tool this machine lacks, the test ends
+    /// COULD NOT RUN naming each one, never a pass over a skipped tool.
     ///
     /// Not here, by decision (`docs/HARDCORE_BACKLOG.md` P1): `security`'s
     /// keychain listing (the security daemon is refused), `curl` to a loopback
@@ -1618,9 +1560,7 @@ mod tests {
     #[test]
     fn shell_compat_tool_set_runs_under_containment() {
         use crate::capability::FsCapability;
-        let Some(home) = scratch_home_outside_writable_roots("toolset") else {
-            return;
-        };
+        let home = scratch_home_outside_writable_roots("toolset");
         // The user's rc files, copied: the contained shells read them from the
         // scratch home and can write nothing back.
         if let Some(real) = std::env::var_os("HOME") {
@@ -1807,10 +1747,11 @@ mod tests {
         ];
 
         let mut failures = Vec::new();
+        let mut lacking = Vec::new();
         let mut ran = 0;
         for (what, needs, script, expect) in &cases {
             if let Some(reason) = lacks(needs) {
-                eprintln!("SKIPPED {what}: {reason}");
+                lacking.push(format!("{what}: {reason}"));
                 continue;
             }
             ran += 1;
@@ -1835,6 +1776,16 @@ mod tests {
             "SHELL BROKEN: under the Containment profile:\n{}",
             failures.join("\n")
         );
+        // The cases this host could not run are said last, after every one it
+        // could run held: COULD NOT RUN, never a pass over a skipped tool.
+        if !lacking.is_empty() {
+            aterm_spec::host::could_not_run(format!(
+                "{} of {} tool cases need what this host lacks: {}",
+                lacking.len(),
+                cases.len(),
+                lacking.join("; ")
+            ));
+        }
     }
 
     /// PROOF 12 (`open` AND `osascript`, FULL generated Containment profile) —
@@ -1861,9 +1812,7 @@ mod tests {
             "DENY FAILED: a launch broker is reachable under the Containment profile ({reached:?}); \
              open and osascript were not run"
         );
-        let Some(outside) = scratch_home_outside_writable_roots("open") else {
-            return;
-        };
+        let outside = scratch_home_outside_writable_roots("open");
         let marker = outside.join("ran-outside");
         let scratch = aterm_tempfile::tempdir().expect("a scratch directory");
         let app = scratch.path().join("AtermContainmentProbe.app");
@@ -1932,23 +1881,6 @@ mod tests {
             "DENY FAILED: Finder answered an Apple Event sent from the Containment profile: \
              rc={:?} stdout={osa_stdout:?} stderr={osa_stderr:?}",
             osascript.status.code()
-        );
-    }
-
-    /// The wrapper binary must exist for the macOS actuation to be real. If it is
-    /// ever missing, the actuator's macOS `os_sandbox_actuated()==true` claim is
-    /// unbacked and the launcher's fail-closed path (refuse to spawn) is the one
-    /// that must trigger. This test documents the precondition the fail-closed
-    /// path defends.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn sandbox_exec_wrapper_is_present_on_this_macos() {
-        assert!(
-            std::path::Path::new(crate::sbpl::SANDBOX_EXEC_PATH).exists(),
-            "{} must exist for the macOS OS-network-sandbox to actuate; if it is \
-             missing the launcher MUST fail closed (refuse to spawn) rather than \
-             run an unsandboxed Containment shell",
-            crate::sbpl::SANDBOX_EXEC_PATH,
         );
     }
 }

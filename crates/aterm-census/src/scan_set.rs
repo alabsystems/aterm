@@ -25,14 +25,14 @@
 //!     `default-features = false`, unified across edges as cargo does).
 //!   * Proc-macro crates are classified out (they run inside rustc) and their
 //!     deps are not followed; each exclusion is reported.
-//!   * Vendored `[patch.*]` forks are classified by [`REVIEWED_VENDORED_CRATES`].
+//!   * Vendored `[patch.*]` forks are classified by their `[[fork]]` block in
+//!     the fork ledger, [`FORK_LEDGER`] ([`reviewed_forks`]): the one record
+//!     of what aterm vendored, which forge's `[OB-17]` holds to the tree.
 //!     Forks that link into the GUI process are scanned in vendored-identity
-//!     mode: lock identities live in a per-crate namespace (`winit::…`), and
-//!     per-platform subtrees the macOS GUI does not compile are labeled
-//!     platform slices (counted, never graphed). The registry is
-//!     fail-closed both ways: an unregistered patch entry, or a registered
-//!     entry missing from the patch table, from disk, or with missing slice
-//!     paths, is a hard error. Every classification is printed.
+//!     mode: lock identities live in a per-crate namespace (`indexmap::…`).
+//!     The review is fail-closed both ways: a vendored patch entry with no
+//!     block, or a block whose package is missing from the patch table or from
+//!     disk, is a hard error. Every classification is printed.
 //!   * First-party `[patch.*]` targets (under `crates/`, with no evidence of
 //!     redistribution) owe no review row; they are scanned unnamespaced if they
 //!     link into the process. ABSORBED targets — upstream source aterm now owns
@@ -82,51 +82,118 @@ pub struct PlatformSlice {
     pub paths: &'static [&'static str],
 }
 
-/// How a reviewed vendored `[patch.*]` crate participates in the census.
-pub enum VendoredMode {
-    /// Links into the GUI process: scanned, with every lock identity in the
-    /// per-crate `namespace` (`winit::…`).
-    Scanned {
-        /// The identity namespace prefix (unique across entries; `::` cannot
-        /// appear in a lexical receiver name, so no collision is possible).
-        namespace: &'static str,
-        /// Per-platform subtrees not compiled into the shipped macOS binary:
-        /// counted and labeled, never graphed. Empty for platform-independent
-        /// crates.
-        platform_slices: &'static [PlatformSlice],
-        /// The review note: what the crate is and what its lock surface
-        /// looked like when registered.
-        audit: &'static str,
-    },
+/// The fork ledger, repo-relative: one `[[fork]]` block per vendored
+/// `[patch.crates-io]` entry, edited by hand, its comment block the review
+/// note. Forge reads it whole (`aterm_forge::policy`, `[OB-17]` holds every
+/// field to the tree); the census reads the review: `name`, `path` and the
+/// `census.mode`/`census.namespace` keys ([`reviewed_forks`]).
+pub const FORK_LEDGER: &str = "vendor/forge.toml";
+
+/// A vendored `[patch.*]` fork, REVIEWED and classified by its `[[fork]]`
+/// block in [`FORK_LEDGER`]. Its one census mode is `scanned`: it links into
+/// the GUI process, every lock identity in its own `namespace`. A vendored fork
+/// has no platform slices (the one crate that needed them, winit, is ABSORBED:
+/// [`ABSORBED_CRATES`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewedFork {
+    /// The crates-io package being replaced (the block's `name`).
+    pub package: String,
+    /// The replacement path, repo-relative (must match the patch table and
+    /// exist on disk).
+    pub path: String,
+    /// The identity namespace prefix (`census.namespace`; unique across every
+    /// scanned crate, and `::` cannot appear in a lexical receiver name, so no
+    /// collision is possible).
+    pub namespace: &'static str,
 }
 
-/// A vendored `[patch.*]` fork, REVIEWED and classified. See the module doc;
-/// every entry is existence-checked both ways every run.
-pub struct VendoredCrate {
-    /// The patch table key (the crates-io package being replaced).
-    pub package: &'static str,
-    /// The declared replacement path, repo-relative (must match the patch
-    /// table and exist on disk).
-    pub path: &'static str,
-    /// Scanned, with its identity namespace.
-    pub mode: VendoredMode,
+/// Every `[[fork]]` block of the ledger at `root`, as the census reads it. A
+/// missing ledger reviews nothing (every vendored patch entry is then
+/// unreviewed, which the derivation refuses); a block without a `name`, a
+/// `path`, `census.mode = "scanned"` or a non-empty `census.namespace` is an
+/// error naming it. Other keys are forge's, which refuses unknown ones.
+pub fn reviewed_forks(root: &Path) -> Result<Vec<ReviewedFork>, String> {
+    let text = match std::fs::read_to_string(root.join(FORK_LEDGER)) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("cannot read {FORK_LEDGER}: {e} (fail-closed)")),
+    };
+    let doc = parse_doc(&text, FORK_LEDGER)?;
+    // Each `[[fork]]` block, with a `[fork.census]` table folded into the
+    // block it follows as dotted keys.
+    let mut blocks: Vec<Vec<(String, Value)>> = Vec::new();
+    for (header, entries) in &doc.sections {
+        match header.as_str() {
+            "fork" => blocks.push(entries.clone()),
+            "fork.census" => {
+                let Some(block) = blocks.last_mut() else {
+                    return Err(format!(
+                        "{FORK_LEDGER}: a [fork.census] table before any [[fork]] block"
+                    ));
+                };
+                block.extend(
+                    entries
+                        .iter()
+                        .map(|(k, v)| (format!("census.{k}"), v.clone())),
+                );
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::with_capacity(blocks.len());
+    for (i, block) in blocks.iter().enumerate() {
+        let get = |key: &str| {
+            block.iter().find_map(|(k, v)| match v {
+                Value::Str(s) if k == key => Some(s.as_str()),
+                _ => None,
+            })
+        };
+        let at = format!("{FORK_LEDGER}: [[fork]] block {}", i + 1);
+        let (Some(package), Some(path)) = (get("name"), get("path")) else {
+            return Err(format!(
+                "{at} has no `name` or no `path` string, so the census cannot tell which \
+                 [patch] entry it reviews (fail-closed)"
+            ));
+        };
+        if get("census.mode") != Some("scanned") {
+            return Err(format!(
+                "{at} (`{package}`) has census.mode {:?}; the census scans every vendored \
+                 fork (`census.mode = \"scanned\"`, fail-closed)",
+                get("census.mode")
+            ));
+        }
+        let namespace = get("census.namespace").unwrap_or("").trim();
+        if namespace.is_empty() {
+            return Err(format!(
+                "{at} (`{package}`) has no census.namespace: a scanned fork's lock \
+                 identities must live in its own namespace (fail-closed)"
+            ));
+        }
+        out.push(ReviewedFork {
+            package: package.to_string(),
+            path: path.to_string(),
+            namespace: intern(namespace),
+        });
+    }
+    Ok(out)
 }
 
-/// The reviewed vendored-fork registry (see [`VendoredCrate`]). A `[patch.*]`
-/// path entry not registered here is a hard error; an entry no longer in the
-/// patch table, or whose path or slice paths are gone, is a stale review and a
-/// hard error.
-pub const REVIEWED_VENDORED_CRATES: &[VendoredCrate] = &[VendoredCrate {
-    package: "indexmap",
-    path: "vendor/indexmap",
-    mode: VendoredMode::Scanned {
-        namespace: "indexmap",
-        platform_slices: &[],
-        audit: "aterm-trust fork of upstream indexmap (index-panic fix): one \
-                    zero-arg `.read()` (extract.rs) that is core::ptr::read, \
-                    categorized by the propagated raw-pointer evidence; no locks",
-    },
-}];
+/// `s` for the life of the process, once per distinct string: the lock-order
+/// census carries namespaces as `&'static str`, and the ledger names a handful.
+fn intern(s: &str) -> &'static str {
+    static NAMES: std::sync::OnceLock<std::sync::Mutex<BTreeSet<&'static str>>> =
+        std::sync::OnceLock::new();
+    let mut names = NAMES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(found) = names.get(s) {
+        return found;
+    }
+    let leaked: &'static str = Box::leak(s.to_string().into_boxed_str());
+    names.insert(leaked);
+    leaked
+}
 
 /// An ABSORBED `[patch.*]` crate ([`PatchTargetKind::Absorbed`]) as the
 /// lock-order census scans it. It is a workspace member, so the path-dependency
@@ -191,8 +258,9 @@ pub const ABSORBED_CRATES: &[AbsorbedCrate] = &[AbsorbedCrate {
 /// workspace members. Any other location is unclassifiable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PatchTargetKind {
-    /// Under `vendor/`: third-party source, owes a [`REVIEWED_VENDORED_CRATES`]
-    /// row and the whole provenance family (`targo --unverified forge attest`).
+    /// Under `vendor/`: third-party source, owes a `[[fork]]` block in
+    /// [`FORK_LEDGER`] and the whole provenance family (`targo --unverified
+    /// forge attest`).
     Vendored,
     /// Under `crates/` with no marks of redistribution: code aterm wrote. Owes
     /// no review row, NOTICE line or `vendor/forge.toml` block.
@@ -298,7 +366,7 @@ pub fn classify_patch_target(
 }
 
 /// One vendored or absorbed crate the census SCANS namespaced (resolved from
-/// [`REVIEWED_VENDORED_CRATES`] or [`ABSORBED_CRATES`] against the tree): the
+/// [`reviewed_forks`] or [`ABSORBED_CRATES`] against the tree): the
 /// walker's vendored-identity-mode input.
 #[derive(Debug)]
 pub struct ScannedVendored {
@@ -810,17 +878,153 @@ fn load_manifest(root: &Path, dir: &str) -> Result<Manifest, String> {
     Ok(m)
 }
 
-/// The package name of every normal dependency `<root>/<dir>/Cargo.toml`
-/// declares (`[dependencies]` and the `[target.…]` tables; dev and build
-/// excluded), external and optional ones included. A renamed dependency
-/// answers with the package it names, not its key, so `gui = { package =
-/// "winit", … }` is still `winit`.
-pub(crate) fn normal_dependency_names(root: &Path, dir: &str) -> Result<Vec<String>, String> {
+/// The package name of every normal dependency of `<root>/<dir>/Cargo.toml`
+/// (`[dependencies]` and the `[target.…]` tables; dev and build excluded,
+/// optional ones included) that is not a path dependency (directly, or through
+/// a `workspace = true` row with a path): what `Cargo.lock` must answer for,
+/// since the closure walk follows the path ones itself. A renamed dependency
+/// answers with the package it names, so `gui = { package = "winit", … }` is
+/// still `winit`.
+pub(crate) fn external_dependency_names(root: &Path, dir: &str) -> Result<Vec<String>, String> {
+    let tables = load_root_tables(root)?;
     Ok(load_manifest(root, dir)?
         .deps
         .into_iter()
+        .filter(|edge| {
+            edge.path.is_none()
+                && !(edge.workspace
+                    && tables
+                        .ws_deps
+                        .get(&edge.key)
+                        .is_some_and(|ws| ws.dir.is_some()))
+        })
         .map(|edge| edge.package.unwrap_or(edge.key))
         .collect())
+}
+
+/// The workspace members (`crates/…`) the crate at `dir` reaches through its normal
+/// dependencies, transitively, each with the chain of crate names from `dir`. Optional
+/// dependencies are followed and features ignored, so the reach is an upper bound of any
+/// build's closure. A vendored crate (outside `crates/`) is a leaf: it belongs to another
+/// workspace, which no crate of this one sits below. Fail-closed on a manifest it cannot
+/// read or a `workspace = true` the root table does not answer.
+pub(crate) fn member_reach(
+    root: &Path,
+    dir: &str,
+) -> Result<BTreeMap<String, Vec<String>>, String> {
+    let tables = load_root_tables(root)?;
+    let mut reach: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut queue = std::collections::VecDeque::from([(dir.to_string(), Vec::new())]);
+    while let Some((at, chain)) = queue.pop_front() {
+        let manifest = load_manifest(root, &at)?;
+        for edge in &manifest.deps {
+            let child = if edge.workspace {
+                let Some(ws) = tables.ws_deps.get(&edge.key) else {
+                    return Err(format!(
+                        "{at}/Cargo.toml: `{}` says `workspace = true` but the root \
+                         [workspace.dependencies] has no such entry (fail-closed)",
+                        edge.key
+                    ));
+                };
+                ws.dir.clone()
+            } else {
+                edge.path
+                    .as_deref()
+                    .map(|p| normalize_rel(&at, p))
+                    .transpose()?
+            };
+            let Some(child) = child.filter(|c| c.starts_with("crates/")) else {
+                continue;
+            };
+            if child == dir || reach.contains_key(&child) {
+                continue;
+            }
+            let mut through = chain.clone();
+            through.push(edge.package.clone().unwrap_or_else(|| edge.key.clone()));
+            reach.insert(child.clone(), through.clone());
+            queue.push_back((child, through));
+        }
+    }
+    Ok(reach)
+}
+
+/// Every `[patch]` target that is a workspace member (under `crates/`):
+/// package → repo-relative path. `Cargo.lock` lists a member's dev-dependencies
+/// beside its normal ones, so a walk that reaches one reads its manifest.
+pub(crate) fn member_patch_targets(root: &Path) -> Result<BTreeMap<String, String>, String> {
+    Ok(load_root_tables(root)?
+        .patches
+        .into_values()
+        .filter(|(_, path)| path.starts_with("crates/"))
+        .collect())
+}
+
+/// One `[[package]]` of `Cargo.lock`.
+#[derive(Clone, Debug)]
+pub(crate) struct LockPackage {
+    pub(crate) name: String,
+    pub(crate) version: String,
+    /// `None` for a path package (a workspace member or a `[patch]` target).
+    pub(crate) source: Option<String>,
+    /// Each dependency as the lock spells it: the name, and the version when
+    /// the lock holds more than one of that name.
+    pub(crate) deps: Vec<(String, Option<String>)>,
+}
+
+/// The checkout's `Cargo.lock`, read with the manifest reader. Unreadable or
+/// malformed is an error (fail-closed): the walks it serves cannot vouch for a
+/// closure they cannot see.
+pub(crate) fn read_lock(root: &Path) -> Result<Vec<LockPackage>, String> {
+    let file = "Cargo.lock";
+    let text = std::fs::read_to_string(root.join(file))
+        .map_err(|e| format!("cannot read {file}: {e} (fail-closed)"))?;
+    let doc = parse_doc(&text, file)?;
+    let mut out = Vec::new();
+    for (header, entries) in doc.sections.iter().filter(|(h, _)| h == "package") {
+        let get = |key: &str| {
+            entries.iter().find_map(|(k, v)| match v {
+                Value::Str(s) if k == key => Some(s.clone()),
+                _ => None,
+            })
+        };
+        let (Some(name), Some(version)) = (get("name"), get("version")) else {
+            return Err(format!(
+                "{file}: a [[{header}]] with no name or version (fail-closed)"
+            ));
+        };
+        let mut deps = Vec::new();
+        match entries
+            .iter()
+            .find(|(k, _)| k == "dependencies")
+            .map(|(_, v)| v)
+        {
+            None => {}
+            Some(Value::Array(items)) => {
+                for item in items {
+                    let Value::Str(spec) = item else {
+                        return Err(format!(
+                            "{file}: `{name}`'s dependencies hold a non-string (fail-closed)"
+                        ));
+                    };
+                    let mut words = spec.split_whitespace();
+                    let dep = words.next().unwrap_or("").to_string();
+                    deps.push((dep, words.next().map(str::to_string)));
+                }
+            }
+            Some(_) => {
+                return Err(format!(
+                    "{file}: `{name}`'s dependencies are not an array (fail-closed)"
+                ));
+            }
+        }
+        out.push(LockPackage {
+            source: get("source"),
+            name,
+            version,
+            deps,
+        });
+    }
+    Ok(out)
 }
 
 /// Where the manifest `text` (at `file`) turns on `dep`'s `feature` for a
@@ -1107,6 +1311,7 @@ pub fn derive_gui_scan_set(root: &Path) -> Result<ScanSet, String> {
 /// [`derive_gui_scan_set`] is this with the single [`GUI_ROOT_CRATE`] seed.
 pub fn derive_process_scan_set(root: &Path, root_crates: &[&str]) -> Result<ScanSet, String> {
     let tables = load_root_tables(root)?;
+    let reviewed = reviewed_forks(root)?;
 
     // ---- Fixpoint over (crate dir -> unified feature state). ----
     let mut manifests: BTreeMap<String, Manifest> = BTreeMap::new();
@@ -1245,8 +1450,8 @@ pub fn derive_process_scan_set(root: &Path, root_crates: &[&str]) -> Result<Scan
         }
     }
 
-    // ---- Vendored [patch.*] forks: reviewed classifications, fail-closed
-    // both ways.
+    // ---- Vendored [patch.*] forks: the ledger's review, fail-closed both
+    // ways.
     let mut vendored_scanned: Vec<ScannedVendored> = Vec::new();
     let mut first_party_patches: Vec<(String, String)> = Vec::new();
     let mut absorbed_patches: Vec<(String, String)> = Vec::new();
@@ -1261,12 +1466,12 @@ pub fn derive_process_scan_set(root: &Path, root_crates: &[&str]) -> Result<Scan
             } else {
                 "first-party"
             };
-            if REVIEWED_VENDORED_CRATES.iter().any(|r| r.package == pkg) {
+            if reviewed.iter().any(|r| r.package == *pkg) {
                 return Err(format!(
                     "[patch] entry `{pkg}` points at {what} `{path}` but ALSO has a \
-                     REVIEWED_VENDORED_CRATES row — that registry records vendored \
+                     `[[fork]]` block in {FORK_LEDGER} — the ledger records vendored \
                      third-party code this repository must keep reviewing, and a \
-                     workspace member is not that. Remove the row (fail-closed: a false \
+                     workspace member is not that. Remove the block (fail-closed: a false \
                      provenance claim is as wrong as a missing one)"
                 ));
             }
@@ -1323,68 +1528,36 @@ pub fn derive_process_scan_set(root: &Path, root_crates: &[&str]) -> Result<Scan
             }
             continue;
         }
-        let Some(reviewed) = REVIEWED_VENDORED_CRATES.iter().find(|r| r.package == pkg) else {
+        let Some(fork) = reviewed.iter().find(|r| r.package == *pkg) else {
             return Err(format!(
-                "[patch] entry `{pkg}` (path `{path}`) is NOT in \
-                 REVIEWED_VENDORED_CRATES — a vendored fork links into the process \
-                 unclassified, so a human must review it: register it as Scanned \
-                 (vendored-identity mode) with its audit note \
-                 (crates/aterm-census/src/scan_set.rs) \
+                "[patch] entry `{pkg}` (path `{path}`) has NO `[[fork]]` block in \
+                 {FORK_LEDGER} — a vendored fork links into the process unreviewed, so a \
+                 human must review it: add its block, the review note in the comment \
+                 above it and `census.mode = \"scanned\"` with its `census.namespace` \
                  (fail-closed, never silent)"
             ));
         };
-        if reviewed.path != path {
+        if fork.path != *path {
             return Err(format!(
-                "REVIEWED_VENDORED_CRATES entry `{pkg}` is registered at path \
-                 `{}` but the [patch] table now says `{path}` — the review is STALE; \
-                 re-audit and update the entry",
-                reviewed.path
+                "{FORK_LEDGER} reviews `{pkg}` at path `{}` but the [patch] table now \
+                 says `{path}` — the review is STALE; re-audit and update the block",
+                fork.path
             ));
         }
-        match &reviewed.mode {
-            VendoredMode::Scanned {
-                namespace,
-                platform_slices,
-                audit,
-            } => {
-                if namespace.is_empty() || audit.trim().is_empty() {
-                    return Err(format!(
-                        "REVIEWED_VENDORED_CRATES entry `{pkg}` (Scanned) has an empty \
-                         namespace or audit note — every scanned vendored crate must \
-                         carry both (fail-closed)"
-                    ));
-                }
-                let scan_dir = format!("{path}/src");
-                if !root.join(&scan_dir).is_dir() {
-                    return Err(format!(
-                        "scanned vendored crate `{pkg}` has no `{scan_dir}` directory \
-                         on disk — the registration and the tree have drifted \
-                         (fail-closed)"
-                    ));
-                }
-                for slice in *platform_slices {
-                    for p in slice.paths {
-                        if !root.join(path).join(p).exists() {
-                            return Err(format!(
-                                "REVIEWED_VENDORED_CRATES entry `{pkg}` registers \
-                                 platform slice `{}` path `{p}`, which no longer \
-                                 exists under `{path}` — the review is STALE \
-                                 (an upstream layout change must be re-audited, \
-                                 fail-closed)",
-                                slice.label
-                            ));
-                        }
-                    }
-                }
-                vendored_scanned.push(ScannedVendored {
-                    package: pkg.clone(),
-                    namespace,
-                    crate_dir: path.clone(),
-                    scan_dir,
-                    platform_slices,
-                });
-            }
+        let scan_dir = format!("{path}/src");
+        if !root.join(&scan_dir).is_dir() {
+            return Err(format!(
+                "scanned vendored crate `{pkg}` has no `{scan_dir}` directory on disk — \
+                 the review and the tree have drifted (fail-closed)"
+            ));
         }
+        vendored_scanned.push(ScannedVendored {
+            package: pkg.clone(),
+            namespace: fork.namespace,
+            crate_dir: path.clone(),
+            scan_dir,
+            platform_slices: &[],
+        });
     }
     // Namespace uniqueness: two crates sharing a namespace would merge their
     // identities.
@@ -1400,19 +1573,19 @@ pub fn derive_process_scan_set(root: &Path, root_crates: &[&str]) -> Result<Scan
             }
         }
     }
-    for r in REVIEWED_VENDORED_CRATES {
-        if !tables.patches.values().any(|(pkg, _)| pkg == r.package) {
+    for r in &reviewed {
+        if !tables.patches.values().any(|(pkg, _)| *pkg == r.package) {
             return Err(format!(
-                "REVIEWED_VENDORED_CRATES entry `{}` is no longer in the root \
-                 [patch] table — a STALE review cannot keep describing the tree; \
-                 remove or update the entry (fail-closed)",
+                "{FORK_LEDGER}'s `[[fork]] {}` is no longer in the root [patch] table — a \
+                 STALE review cannot keep describing the tree; remove or update the block \
+                 (fail-closed)",
                 r.package
             ));
         }
-        if !root.join(r.path).join("Cargo.toml").is_file() {
+        if !root.join(&r.path).join("Cargo.toml").is_file() {
             return Err(format!(
-                "REVIEWED_VENDORED_CRATES entry `{}` points at `{}`, which has no \
-                 Cargo.toml on disk — the review is STALE (fail-closed)",
+                "{FORK_LEDGER}'s `[[fork]] {}` points at `{}`, which has no Cargo.toml on \
+                 disk — the review is STALE (fail-closed)",
                 r.package, r.path
             ));
         }
@@ -1487,7 +1660,7 @@ pub fn render_scan_set(set: &ScanSet) -> String {
         let _ = writeln!(
             out,
             "      vendored and absorbed [patch] crate(s) SCANNED in vendored-identity \
-             mode (REVIEWED_VENDORED_CRATES and ABSORBED_CRATES, fail-closed both \
+             mode (vendor/forge.toml's [[fork]] blocks and ABSORBED_CRATES, fail-closed both \
              ways) — upstream process code, each crate's lock identities in its own \
              `<crate>::…` namespace so foreign receiver names can never merge with \
              aterm identities or each other: {}",
@@ -1540,7 +1713,25 @@ pub(crate) mod test_fixtures {
 
     use std::path::{Path, PathBuf};
 
-    use super::{ABSORBED_CRATES, REVIEWED_VENDORED_CRATES, VendoredMode};
+    use super::{ABSORBED_CRATES, FORK_LEDGER};
+
+    /// The vendored fork every fixture reviews: (package, path, namespace).
+    pub(crate) const FIXTURE_FORK: (&str, &str, &str) = ("indexmap", "vendor/indexmap", "indexmap");
+
+    /// A fork ledger reviewing `forks` (package, path, namespace), in the
+    /// shape `vendor/forge.toml` writes them.
+    pub(crate) fn ledger(forks: &[(&str, &str, &str)]) -> String {
+        let mut text = String::from("[forge]\nloc_method = \"x\"\n");
+        for (package, path, namespace) in forks {
+            text.push_str(&format!(
+                "\n# census review: a fixture fork\n[[fork]]\nname = \"{package}\"\n\
+                 version = \"1.0.0\"\npath = \"{path}\"\nlicense = \"MIT\"\n\
+                 apache_notice = false\ncensus.mode = \"scanned\"\n\
+                 census.namespace = \"{namespace}\"\n"
+            ));
+        }
+        text
+    }
 
     /// This checkout's root (aterm-census lives two levels under it).
     pub(crate) fn repo_root() -> PathBuf {
@@ -1567,34 +1758,22 @@ pub(crate) mod test_fixtures {
     }
 
     /// The `[patch.crates-io]` table and vendor stub trees that satisfy the
-    /// reviewed-classification checks: every registered entry present, scanned
-    /// entries with a stub `src/`, and every platform-slice path existing. Each
-    /// absorbed crate is a `crates/` stub with both absorption records (a
-    /// LICENSE in its root and a NOTICE line naming it).
+    /// reviewed-classification checks: [`FIXTURE_FORK`] patched in, reviewed by
+    /// a ledger and with a stub `src/`. Each absorbed crate is a `crates/` stub
+    /// with both absorption records (a LICENSE in its root and a NOTICE line
+    /// naming it) and every platform-slice path existing.
     pub(crate) fn patch_fixture() -> (String, Vec<(String, String)>) {
         let mut table = String::from("[patch.crates-io]\n");
-        let mut stubs = Vec::new();
-        for r in REVIEWED_VENDORED_CRATES {
-            table.push_str(&format!("{} = {{ path = \"{}\" }}\n", r.package, r.path));
-            stubs.push((
-                format!("{}/Cargo.toml", r.path),
-                format!("[package]\nname = \"{}\"\n", r.package),
-            ));
-            let VendoredMode::Scanned {
-                platform_slices, ..
-            } = &r.mode;
-            stubs.push((format!("{}/src/lib.rs", r.path), "// stub\n".to_string()));
-            for slice in *platform_slices {
-                for p in slice.paths {
-                    let rel = if p.ends_with(".rs") {
-                        format!("{}/{p}", r.path)
-                    } else {
-                        format!("{}/{p}/stub.rs", r.path)
-                    };
-                    stubs.push((rel, "// stub\n".to_string()));
-                }
-            }
-        }
+        let (package, path, _) = FIXTURE_FORK;
+        table.push_str(&format!("{package} = {{ path = \"{path}\" }}\n"));
+        let mut stubs = vec![
+            (
+                format!("{path}/Cargo.toml"),
+                format!("[package]\nname = \"{package}\"\n"),
+            ),
+            (format!("{path}/src/lib.rs"), "// stub\n".to_string()),
+            (FORK_LEDGER.to_string(), ledger(&[FIXTURE_FORK])),
+        ];
         let mut notice = String::from("NOTICE\n");
         for a in ABSORBED_CRATES {
             table.push_str(&format!("{} = {{ path = \"{}\" }}\n", a.package, a.path));
@@ -1857,20 +2036,20 @@ mod tests {
     /// registry is a FALSE provenance claim, and is refused by name.
     #[test]
     fn a_review_row_for_a_first_party_patch_target_is_refused() {
-        let reviewed = &REVIEWED_VENDORED_CRATES[0];
+        let (package, path, _) = test_fixtures::FIXTURE_FORK;
         let mut files = test_fixtures::workspace_manifests(&[("aterm-shim", "")]);
-        for (path, contents) in files.iter_mut() {
-            if path == "Cargo.toml" {
+        for (rel, contents) in files.iter_mut() {
+            if rel == "Cargo.toml" {
                 *contents = contents.replace(
-                    &format!("{} = {{ path = \"{}\" }}", reviewed.package, reviewed.path),
-                    &format!("{} = {{ path = \"crates/aterm-shim\" }}", reviewed.package),
+                    &format!("{package} = {{ path = \"{path}\" }}"),
+                    &format!("{package} = {{ path = \"crates/aterm-shim\" }}"),
                 );
             }
         }
         let err = derive("misfiled", with_src(files)).expect_err("must fail");
         assert!(
-            err.contains(&format!("`{}` points at first-party", reviewed.package))
-                && err.contains("ALSO has a REVIEWED_VENDORED_CRATES row"),
+            err.contains(&format!("`{package}` points at first-party"))
+                && err.contains("ALSO has a `[[fork]]` block"),
             "err: {err}"
         );
     }
@@ -2134,7 +2313,7 @@ mod tests {
     fn optional_deps_follow_default_feature_activation() {
         // Mirrors the real graph: gui's default feature forwards to a dep
         // feature (the `aterm-core/sixel` shape) which `dep:`-activates an
-        // optional path dep; an unactivated optional dep (`spec-anchors`) stays
+        // optional path dep; an unactivated optional dep (a feature left off) stays
         // out; an edge `features = [...]` list (`bidi`) activates a third.
         let (patch_table, mut files) = test_fixtures::patch_fixture();
         let mut root = String::from("[workspace]\nmembers = [\"crates/*\"]\n");
@@ -2180,7 +2359,7 @@ mod tests {
         );
         assert!(
             !set.scan_dirs.contains(&"crates/aterm-off/src".to_string()),
-            "an unactivated optional dep (the spec-anchors shape) must stay OUT: {:?}",
+            "an unactivated optional dep (a feature left off) must stay OUT: {:?}",
             set.scan_dirs
         );
     }
@@ -2256,6 +2435,65 @@ mod tests {
         );
     }
 
+    /// The review is read off the real ledger, and every shape it accepts or
+    /// refuses is the one `aterm_forge::policy` writes.
+    #[test]
+    fn the_review_set_is_the_fork_ledger() {
+        // The real ledger reviews no fork since indexmap, the last one, went back to
+        // the registry; any block it holds again names a crate the tree has.
+        let repo = test_fixtures::repo_root();
+        for fork in reviewed_forks(&repo).expect("the real ledger reads") {
+            assert!(
+                repo.join(&fork.path).join("Cargo.toml").is_file(),
+                "{fork:?}"
+            );
+        }
+        let read = |name: &str, ledger: &str| {
+            let root = synth_tree(
+                "aterm-scan-set",
+                name,
+                &[(FORK_LEDGER.to_string(), ledger.to_string())],
+            );
+            let out = reviewed_forks(&root);
+            let _ = std::fs::remove_dir_all(&root);
+            out
+        };
+        let table = "[[fork]]\nname = \"a\"\npath = \"vendor/a\"\n\
+                     [fork.census]\nmode = \"scanned\"\nnamespace = \"a_ns\"\n";
+        assert_eq!(
+            read("ledger-table", table).expect("a [fork.census] table reads"),
+            [ReviewedFork {
+                package: "a".to_string(),
+                path: "vendor/a".to_string(),
+                namespace: "a_ns",
+            }]
+        );
+        let good = test_fixtures::ledger(&[("a", "vendor/a", "a_ns")]);
+        for (name, ledger, says) in [
+            (
+                "ledger-no-ns",
+                good.replace("census.namespace = \"a_ns\"\n", ""),
+                "no census.namespace",
+            ),
+            (
+                "ledger-mode",
+                good.replace("\"scanned\"", "\"build-dep-only\""),
+                "census.mode Some(\"build-dep-only\")",
+            ),
+            (
+                "ledger-no-path",
+                good.replace("path = \"vendor/a\"\n", ""),
+                "no `name` or no `path`",
+            ),
+        ] {
+            let err = read(name, &ledger).expect_err("must fail");
+            assert!(err.contains(says), "{name}: {err}");
+        }
+        let root = synth_tree("aterm-scan-set", "ledger-absent", &[]);
+        assert_eq!(reviewed_forks(&root), Ok(Vec::new()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn exclusion_list_is_fail_closed_both_ways() {
         // (a) REVERSE: an UNREGISTERED [patch] path entry must hard-error
@@ -2272,7 +2510,7 @@ mod tests {
         ));
         let err = derive("unreviewed", with_src(files)).expect_err("must fail");
         assert!(
-            err.contains("NOT in REVIEWED_VENDORED_CRATES"),
+            err.contains("has NO `[[fork]]` block in vendor/forge.toml"),
             "err: {err}"
         );
         // (b) FORWARD: a registered exclusion missing from the patch table is

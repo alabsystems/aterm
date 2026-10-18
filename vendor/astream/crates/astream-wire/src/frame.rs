@@ -15,6 +15,28 @@
 
 use crate::hash::crc32_ieee;
 
+// The Clean island, out of line: only a Trust compiler lexes it, so it mounts under
+// `cfg(clean_islands)` (build.rs) and a stock compiler never opens the file.
+#[cfg(clean_islands)]
+#[path = "frame_island.rs"]
+mod frame_island;
+#[cfg(not(clean_islands))]
+pub use crate::twins::frame_clamp_payload_len;
+#[cfg(clean_islands)]
+pub use frame_island::frame_clamp_payload_len;
+
+contract_fn! {
+    /// Kernel-certified payload-cap check (`len <= cap`), backed by the Clean
+    /// `payload_within_cap_isl` specification (`clean-kernel-defeq`) and the
+    /// Clean-origin [`frame_clamp_payload_len`] (`min(len, cap)`).
+    #[must_use]
+    pub fn payload_within_cap(len: u64, cap: u64) -> bool
+    clauses [ensures result == (len <= cap)]
+    {
+        len <= cap
+    }
+}
+
 /// Frame magic: identifies an astream frame (`0xA5 0x71`).
 pub const MAGIC: [u8; 2] = [0xA5, 0x71];
 /// Current frame format version.
@@ -94,13 +116,14 @@ impl Frame {
     /// payload exceeds the [`MAX_PAYLOAD_LEN`] policy cap (16 MiB) or the `u32`
     /// length field.
     pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
-        let len = u32::try_from(self.payload.len()).map_err(|_| FrameError::TooLarge)?;
         if self.payload.len() > MAX_PAYLOAD_LEN {
             return Err(FrameError::TooLarge);
         }
+        // `MAX_PAYLOAD_LEN` is 16 MiB, which always fits in `u32`.
+        let len = self.payload.len() as u32;
         let crc = crc32_ieee(&self.payload);
 
-        let mut out = Vec::with_capacity(HEADER_SIZE + self.payload.len());
+        let mut out = Vec::with_capacity(HEADER_SIZE + 256);
         out.extend_from_slice(&MAGIC);
         out.push(VERSION);
         out.push(0u8); // flags: reserved
@@ -121,31 +144,44 @@ impl Frame {
             return Ok(None);
         }
         // All fixed-offset reads below are within the 12-byte header.
-        if buf[0] != MAGIC[0] || buf[1] != MAGIC[1] {
+        let b0 = buf[0];
+        let b1 = buf[1];
+        let b2 = buf[2];
+        let b3 = buf[3];
+        let b4 = buf[4];
+        let b5 = buf[5];
+        let b6 = buf[6];
+        let b7 = buf[7];
+        let b8 = buf[8];
+        let b9 = buf[9];
+        let b10 = buf[10];
+        let b11 = buf[11];
+
+        if b0 != MAGIC[0] || b1 != MAGIC[1] {
             return Err(FrameError::BadMagic);
         }
-        if buf[2] != VERSION {
+        if b2 != VERSION {
             return Err(FrameError::BadVersion);
         }
         // Reserved flag bits MUST be zero; reject unknown bits rather than
         // silently ignoring them (forward-compat guard).
-        if buf[3] & !KNOWN_FLAGS != 0 {
+        if b3 & !KNOWN_FLAGS != 0 {
             return Err(FrameError::UnknownFlags);
         }
-        let len = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
-        let crc = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        let len = u32::from_le_bytes([b4, b5, b6, b7]) as usize;
+        let crc = u32::from_le_bytes([b8, b9, b10, b11]);
 
         // Cap how much we will commit to before the bytes are even present: an
         // absurd-but-representable length is rejected, never buffered toward.
         if len > MAX_PAYLOAD_LEN {
             return Err(FrameError::TooLarge);
         }
-        // Checked (defense-in-depth); cannot overflow given the cap above.
-        let total = HEADER_SIZE.checked_add(len).ok_or(FrameError::TooLarge)?;
-        if buf.len() < total {
+        // Cannot saturate or overflow given the 16 MiB cap above; `total >= HEADER_SIZE`,
+        // so `buf.get(HEADER_SIZE..total)` is `None` iff `buf.len() < total`.
+        let total = HEADER_SIZE.saturating_add(len);
+        let Some(payload) = buf.get(HEADER_SIZE..total) else {
             return Ok(None);
-        }
-        let payload = &buf[HEADER_SIZE..total];
+        };
         if crc32_ieee(payload) != crc {
             return Err(FrameError::ChecksumMismatch);
         }
@@ -298,5 +334,16 @@ mod tests {
         bytes.extend_from_slice(b"leftover");
         let decoded = Frame::decode(&bytes).unwrap().unwrap();
         assert_eq!(decoded.consumed, first_len);
+    }
+
+    #[test]
+    fn clean_origin_frame_clamp_and_payload_within_cap_match_policy_cap() {
+        let cap = MAX_PAYLOAD_LEN as u64;
+        assert!(payload_within_cap(0, cap));
+        assert!(payload_within_cap(cap, cap));
+        assert!(!payload_within_cap(cap + 1, cap));
+        assert_eq!(frame_clamp_payload_len(0, cap), 0);
+        assert_eq!(frame_clamp_payload_len(cap, cap), cap);
+        assert_eq!(frame_clamp_payload_len(cap + 4096, cap), cap);
     }
 }

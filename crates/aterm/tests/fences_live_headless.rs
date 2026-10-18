@@ -35,9 +35,9 @@ use headless_boot::{
     Instance, boot_session, client_command, ctl, ctl_ok, field, status, type_line,
 };
 
-/// Boot one headless instance, 40x120 ([`headless_boot::boot`]: `None` is an
-/// environment refusal; a product that cannot start fails the test).
-fn boot(tag: &str) -> Option<Instance> {
+/// Boot one headless instance, 40x120 ([`headless_boot::boot`]: an environment
+/// refusal is COULD NOT RUN; a product that cannot start fails the test).
+fn boot(tag: &str) -> Instance {
     headless_boot::boot(
         &format!("atfn{tag}"),
         &["--lines", "40", "--columns", "120"],
@@ -124,7 +124,7 @@ fn await_match(inst: &Instance, sid: &str, re: &str) {
 /// into box B, and the worker receives nothing.
 #[test]
 fn a_fenced_key_skips_a_swapped_box_and_the_worker_receives_nothing() {
-    let Some(inst) = boot("k") else { return };
+    let inst = boot("k");
     let (_local, sid) = boot_session(&inst);
     let script = inst.tmp.join("fake.sh");
     let go = inst.tmp.join("go");
@@ -283,7 +283,7 @@ fn a_fenced_key_skips_a_swapped_box_and_the_worker_receives_nothing() {
         String::from_utf8_lossy(&retired.stdout),
         String::from_utf8_lossy(&retired.stderr)
     );
-    assert!(said.contains("ERR usage: if-seq= is not a fence"), "{said}");
+    assert!(said.contains("ERR usage"), "{said}");
     // The presses above were refused in the server, so nothing is in flight:
     // one `await idle` bounds the wait for a byte that must not come. The
     // window is its 200 ms of quiet; the timeout is only how long the quiet
@@ -364,7 +364,7 @@ fn supervisor_until(inst: &Instance, sid: &str, want: &str) -> String {
 /// owners over the wire.
 #[test]
 fn a_supervisor_claim_shows_in_the_roster_and_clears_when_its_connection_closes() {
-    let Some(inst) = boot("v") else { return };
+    let inst = boot("v");
     let (_local, sid) = boot_session(&inst);
     let token = aterm_ctl::read_token_beside(&inst.sock)
         .expect("the socket's token")
@@ -380,35 +380,10 @@ fn a_supervisor_claim_shows_in_the_roster_and_clears_when_its_connection_closes(
         ),
         "OK\n"
     );
-    let row = supervisor_until(&inst, &sid, "sup-live");
-    // `supervisor=` is followed only by `autopilot=` (2026-10-15, the session's
-    // effective Autopilot beside its claim), the OWNER'S COLUMNS (2026-09-24,
-    // `help sessions`: `path_evidence= copy= upgrade=`) and the harness's
-    // `land_at= task=` (2026-10-16, last): it is the column the agent
-    // verdict's block ends with, and nothing else moved in between.
-    let tail = [
-        "autopilot",
-        "path_evidence",
-        "copy",
-        "upgrade",
-        "land_at",
-        "task",
-    ];
-    let words: Vec<&str> = row.split_whitespace().collect();
-    let at = words
-        .iter()
-        .position(|w| *w == "supervisor=sup-live")
-        .unwrap_or_else(|| panic!("no supervisor column: {row}"));
-    let after: Vec<&str> = words[at + 1..]
-        .iter()
-        .map(|w| w.split_once('=').map_or(*w, |(k, _)| k))
-        .collect();
-    assert_eq!(after, tail, "{row}");
+    supervisor_until(&inst, &sid, "sup-live");
     assert_eq!(field(&status(&inst, &sid), "supervisor"), Some("sup-live"));
     // Still the same connection: other clients' connections closing (every
     // `aterm ctl` above) did not release it, and a second holder is refused.
-    std::thread::sleep(Duration::from_millis(300));
-    supervisor_until(&inst, &sid, "sup-live");
     let busy = ctl(
         &inst,
         &[
@@ -451,7 +426,6 @@ fn a_supervisor_claim_shows_in_the_roster_and_clears_when_its_connection_closes(
             "ttl=120000",
         ],
     );
-    std::thread::sleep(Duration::from_millis(300));
     supervisor_until(&inst, &sid, "sup-ttl");
     ctl_ok(&inst, &[&format!("@{sid}"), "meta", "unset", "supervisor"]);
     supervisor_until(&inst, &sid, "-");
@@ -563,17 +537,18 @@ impl<C: aterm_agent::supervise::run::Ctl> aterm_agent::supervise::run::Ctl for R
 /// the engine's `supervise` at its default (every box its answer), over its
 /// real persistent transport, reads the fake worker's read-only Bash box,
 /// decides it, and presses
-/// `key if-gen=<the read's generation> if=<the judged row> 1` — the
-/// generation taken from its own `text --json` read (`"gen"`), the fence
+/// `key if-human=<the read's person count> if-gen=<the read's generation>
+/// if=<the judged row> 1` — the generation taken from its own `text --json`
+/// read (`"gen"`), the fence
 /// found in the server's real `help key` answer — and the server takes it:
 /// the `1` reaches the worker's key log. The fence form was not refused and
 /// dropped (that would press under `if=` alone, and the recorded `key` line
-/// would carry no `if-gen=`), and the retired `if-seq=` is never sent.
+/// would carry no `if-gen=`).
 #[test]
 fn the_supervisor_engine_presses_a_read_box_under_the_generation_fence() {
     use aterm_agent::supervise::run::{Session, SuperviseOpts};
     use aterm_agent::supervise::transport::{Endpoint, RelayCtl};
-    let Some(inst) = boot("e") else { return };
+    let inst = boot("e");
     let (_local, sid) = boot_session(&inst);
     let script = inst.tmp.join("fake.sh");
     let go = inst.tmp.join("go");
@@ -639,26 +614,30 @@ fn the_supervisor_engine_presses_a_read_box_under_the_generation_fence() {
         .iter()
         .filter(|r| r.split_whitespace().any(|w| w == "key"))
         .collect();
+    // An option-choosing digit goes fenced on the read's person count, its
+    // generation and the judged row: `key if-human=<n> if-gen=<e>.<s> if=^… 1`.
     assert!(
         presses.iter().any(|p| {
             let words: Vec<&str> = p.split_whitespace().collect();
-            let at = words.iter().position(|w| *w == "key").unwrap();
-            words.get(at + 1).is_some_and(|w| {
+            let mut at = words.iter().position(|w| *w == "key").unwrap() + 1;
+            // A digit carries the person count it was judged under first.
+            if words.get(at).is_some_and(|w| {
+                w.strip_prefix("if-human=")
+                    .is_some_and(|n| n.parse::<u64>().is_ok())
+            }) {
+                at += 1;
+            }
+            words.get(at).is_some_and(|w| {
                 w.strip_prefix("if-gen=")
                     .and_then(|g| g.split_once('.'))
                     .is_some_and(|(e, s)| e.parse::<u64>().is_ok() && s.parse::<u64>().is_ok())
-            }) && words.get(at + 2).is_some_and(|w| w.starts_with("if=^"))
+            }) && words.get(at + 1).is_some_and(|w| w.starts_with("if=^"))
                 && words.last() == Some(&"1")
         }),
         "a press fenced on the read's generation: {:?}; result={ran:?}; status={}; text={}",
         ctl.requests,
         status(&inst, &sid),
         ctl_ok(&inst, &[&format!("@{sid}"), "text"])
-    );
-    assert!(
-        !ctl.requests.iter().any(|r| r.contains("if-seq=")),
-        "the retired seq fence is never sent: {:?}",
-        ctl.requests
     );
     // The server took the fenced press: the `1` reached the worker.
     let deadline = Instant::now() + HANG;

@@ -1,0 +1,51 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (60x50, aterm 0.105.0) running the real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab) · the stub's call `muse.bash {command: "touch probe-with-a-long-name-<50 b>.txt && echo two words here", sandbox_permissions: "require_escalated"}` in a 60-column tab: the shell box, a minute before any key — the command wrapped between words, its rows indented four, the word longer than the row broken at its edge; `└ last event 1m 01s ago` under the status row · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+◆ Recap: ok
+
+❯ keep going
+
+◆ Hi! I am the local lab stub, not a model. (reply 26)
+
+❯ one more thing
+
+◆ your API key from META_API_KEY was rejected — update or
+  unset it
+
+◆ Recap: ok
+
+❯ do the long work
+
+◆ Long work finished; the next step is the tests.
+
+◆ Worked for 2m 10s · 3:11 PM · 16/Oct
+
+❯ keep going
+
+◆ Hi! I am the local lab stub, not a model. (reply 29)
+
+❯ toolstart
+
+◆ Ran command · Create the long probe · ✓ · 3.2s · ctrl+o
+
+◆ Tool call done. Result: { "chunk_id": "exec-4-1",
+  "exit_code": 0, "terminal_status": "completed", "output":
+  "", "original_output_bytes": 0, "original_output_tokens":
+  0, "truncated": false }
+
+❯ toolstart
+
+◆ Calling tools (1m 02s · esc to interrupt)
+└ last event 1m 01s ago
+
+── Voice input (⌥ + v to start) ────────────────────────────
+Would you like to run the following command?
+
+  $ touch
+    probe-with-a-long-name-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    bbbbbbbbbbbbbbbbb.txt && echo two words here
+
+⟩ 1. Yes, proceed (y)
+  2. No, and tell Muse Code what to do differently (esc)
+Change approval defaults in /permissions
+────────────────────────────────────────────────────────────
+  lab-stub · high · /private/tmp/at.lab0/proj · Auto-review

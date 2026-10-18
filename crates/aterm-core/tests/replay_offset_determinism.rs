@@ -2,29 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Replay / lash-mirror determinism: **the screen is a pure function of the
-//! ordered output-byte log.** A session is an ordered list of output records
-//! (the bytes a PTY emitted, the `BYTES` frames an aterm `subscribe` stream
-//! carries), fed through the injected-clock seam ([`Terminal::process_at`] +
-//! a fixed [`ClockReading`]) so wall-clock pacing cannot matter.
-//!
-//! Two things are proven, both bit-exact:
-//!
-//! 1. **Offset-addressed replay == live.** For every prefix offset N, a fresh
-//!    engine fed the first N records reproduces the live engine's full captured
-//!    projection ([`Terminal::checkpoint`]) and rendered text
-//!    ([`Terminal::visible_content`]). The Nth state is a pure function of
-//!    records[0..N] alone — nothing else leaks in. This is also the correctness
-//!    of a *lashed* viewer: a viewer engine fed the host's output log mirrors it.
-//!
-//! 2. **Coalescing-independence.** The same bytes split at any boundaries —
-//!    one shot, per original record, per single byte, or mid-escape-sequence —
-//!    fold to the identical final state. A lash relay may re-chunk the host's
-//!    output (coalesce or fragment `BYTES` frames) and the mirror is unchanged.
-//!
-//! A pinned FNV-1a hash of the final rendered text demonstrates drift detection
-//! (machine-independent: text only), and a negative control (drop one record)
-//! must diverge, so the determinism assertions are non-vacuous.
+//! Replay / lash-mirror reattach: a viewer that hydrates from a host's
+//! checkpoint mid-stream and is fed the rest of the ordered output-byte log
+//! lands on the live host's state, bit-exact. The log is fed through the
+//! injected-clock seam ([`Terminal::process_at`] + a fixed [`ClockReading`]) so
+//! wall-clock pacing cannot matter. (Chunk-boundary independence and fold
+//! stability are pinned over the adversarial corpora in
+//! `replay_corpus_probe.rs`.)
 
 use aterm_core::terminal::{ClockReading, Terminal};
 
@@ -75,84 +59,6 @@ fn feed(term: &mut Terminal, chunks: &[&[u8]], clock: ClockReading) {
     for c in chunks {
         term.process_at(c, clock);
     }
-}
-
-#[test]
-fn replay_from_zero_mirrors_live_at_every_offset() {
-    let clock = fixed_clock();
-
-    // The live host: one engine fed the records one at a time. Capture its full
-    // projection after each record.
-    let mut live = fresh();
-    let mut live_states = Vec::new();
-    for rec in SESSION {
-        live.process_at(rec, clock);
-        live_states.push(live.checkpoint());
-    }
-
-    // For every offset N, a fresh replay engine fed records[0..N] must reproduce
-    // the live host's state at N — exactly. The state at N is a pure function of
-    // the first N records and nothing else.
-    for n in 1..=SESSION.len() {
-        let mut replay = fresh();
-        feed(&mut replay, &SESSION[..n], clock);
-        assert_eq!(
-            replay.checkpoint(),
-            live_states[n - 1],
-            "replay of the first {n} records must mirror the live projection at offset {n}"
-        );
-    }
-
-    // And the rendered text agrees at head (human-readable cross-check).
-    let mut replay_full = fresh();
-    feed(&mut replay_full, SESSION, clock);
-    assert_eq!(replay_full.visible_content(), live.visible_content());
-}
-
-#[test]
-fn coalescing_chunk_boundaries_do_not_change_state() {
-    let clock = fixed_clock();
-
-    // Reference: the original record boundaries.
-    let mut by_record = fresh();
-    feed(&mut by_record, SESSION, clock);
-    let reference = by_record.checkpoint();
-
-    let flat: Vec<u8> = SESSION.iter().flat_map(|r| r.iter().copied()).collect();
-
-    // (a) one shot — the whole log in a single process call.
-    let mut one_shot = fresh();
-    one_shot.process_at(&flat, clock);
-    assert_eq!(
-        one_shot.checkpoint(),
-        reference,
-        "feeding the whole log at once must match the per-record fold"
-    );
-
-    // (b) one byte at a time — the finest possible fragmentation, splitting
-    // many escape sequences mid-stream; the streaming parser must carry state
-    // across calls and still land identically.
-    let mut per_byte = fresh();
-    for b in &flat {
-        per_byte.process_at(std::slice::from_ref(b), clock);
-    }
-    assert_eq!(
-        per_byte.checkpoint(),
-        reference,
-        "byte-at-a-time fragmentation must match the per-record fold"
-    );
-
-    // (c) an adversarial fixed split at offset 7 (lands inside the first SGR
-    // sequence) then the remainder — a relay re-chunking output.
-    let cut = 7.min(flat.len());
-    let mut split = fresh();
-    split.process_at(&flat[..cut], clock);
-    split.process_at(&flat[cut..], clock);
-    assert_eq!(
-        split.checkpoint(),
-        reference,
-        "a mid-sequence re-chunk must match the per-record fold"
-    );
 }
 
 #[test]

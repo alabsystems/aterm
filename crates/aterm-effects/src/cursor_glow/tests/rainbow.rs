@@ -460,50 +460,6 @@ fn every_kitty_spelling_draws_the_resident_and_flying_stays_reachable() {
     }
 }
 
-/// Hot rainbow kitty samples bank up and down as a coherent travelling ribbon:
-/// the six stripes stay ordered and contained, and the motion is visible after
-/// integer rounding.
-#[test]
-fn rainbow_hot_ribbon_has_visible_travelling_wave() {
-    let g = geom();
-    let mut c = cfg(GlowStyle::RainbowKitty, true);
-    // On the default tall body.
-    c.ribbon_tall = true;
-    c.intensity = 1.0;
-    c.radius = 0.0;
-    c.ring = false;
-    let mut glow = CursorGlow::default();
-    let mut out = Vec::new();
-    let mut t = Instant::now();
-    glow.tick(Some((3, 2)), t, &c, g, &mut out);
-    for col in 3..=20u16 {
-        t += Duration::from_millis(18);
-        glow.note_synthetic_typed(t, 1);
-        glow.tick(Some((3, col)), t, &c, g, &mut out);
-    }
-    assert!(glow.heat > 0.9);
-    out.extend_from_slice(glow.under_quads()); // ribbon body rides the under-ink stream
-    assert_invariants(&out, g);
-
-    // The green stripe is the only band with B=0 and G>R. Hot bands emit as
-    // device-row beam slabs, so accept any width ≥ 2 (star arms are 1px) and
-    // track its Y across cells.
-    let green_ys: std::collections::BTreeSet<u16> = out
-        .iter()
-        .filter(|q| {
-            q.row == 3
-                && is_ribbon_quad(q.color)
-                && ((q.color >> 8) & 0xff) > ((q.color >> 16) & 0xff)
-        })
-        .map(|q| q.y)
-        .collect();
-    assert!(
-        green_ys.len() >= 2,
-        "hot ribbon must visibly bank across its run: {green_ys:?}"
-    );
-    assert!(out.len() <= CursorGlow::MAX_QUADS);
-}
-
 /// Momentum: a sustained fast run makes the ribbon brighter than a lone slow move
 /// (typing heat rides through to the band coverage).
 #[test]
@@ -549,52 +505,34 @@ fn rainbow_ribbon_brightens_with_typing_momentum() {
     );
 }
 
-/// Four-letter guarantee: even at ~2.5 cps the ribbon spans at least the last
-/// four typed cells when a key lands; spark life chains to the observed
-/// cadence, not the clock.
+/// Four-letter guarantee: at a thoughtful ~2.5 cps and at hunt-and-peck
+/// ~0.55 cps alike, the ribbon spans at least the last four typed cells when a
+/// key lands; spark life chains to the observed cadence, not the clock.
 #[test]
 fn rainbow_ribbon_spans_four_letters_at_any_rhythm() {
     let g = geom();
     let c = cfg(GlowStyle::RainbowKitty, true);
-    let mut glow = CursorGlow::default();
-    let mut out = Vec::new();
-    let mut t = Instant::now();
-    glow.tick(Some((3, 2)), t, &c, g, &mut out);
-    for col in 3..=10u16 {
-        t += Duration::from_millis(400); // slow, thoughtful typing
-        glow.note_synthetic_typed(t, 1);
-        glow.tick(Some((3, col)), t, &c, g, &mut out);
+    for (gap_ms, last_col) in [(400u64, 10u16), (1800, 9)] {
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        let mut t = Instant::now();
+        glow.tick(Some((3, 2)), t, &c, g, &mut out);
+        for col in 3..=last_col {
+            t += Duration::from_millis(gap_ms);
+            glow.note_synthetic_typed(t, 1);
+            glow.tick(Some((3, col)), t, &c, g, &mut out);
+        }
+        assert!(
+            glow.heat < 0.05,
+            "{gap_ms} ms: a slow cadence must stay cold"
+        );
+        out.extend_from_slice(glow.under_quads()); // ribbon rides the under-ink stream
+        let cols = ribbon_cols(&out, 3, g);
+        assert!(
+            cols.len() >= 4,
+            "{gap_ms} ms: ribbon spans at least four letters at any rhythm: {cols:?}"
+        );
     }
-    assert!(glow.heat < 0.05, "a 400ms cadence must stay cold");
-    out.extend_from_slice(glow.under_quads()); // ribbon rides the under-ink stream
-    let cols = ribbon_cols(&out, 3, g);
-    assert!(
-        cols.len() >= 4,
-        "ribbon spans at least four letters at any rhythm: {cols:?}"
-    );
-}
-
-/// The four-letter guarantee holds at a glacial rhythm too (~0.55 cps): the
-/// chain window covers any plausible typing cadence, not just brisk ones.
-#[test]
-fn rainbow_ribbon_four_letters_even_glacial() {
-    let g = geom();
-    let c = cfg(GlowStyle::RainbowKitty, true);
-    let mut glow = CursorGlow::default();
-    let mut out = Vec::new();
-    let mut t = Instant::now();
-    glow.tick(Some((3, 2)), t, &c, g, &mut out);
-    for col in 3..=9u16 {
-        t += Duration::from_millis(1800); // hunt-and-peck
-        glow.note_synthetic_typed(t, 1);
-        glow.tick(Some((3, col)), t, &c, g, &mut out);
-    }
-    out.extend_from_slice(glow.under_quads()); // ribbon rides the under-ink stream
-    let cols = ribbon_cols(&out, 3, g);
-    assert!(
-        cols.len() >= 4,
-        "ribbon spans four letters even at hunt-and-peck: {cols:?}"
-    );
 }
 
 /// Continuity: a typed echo that hops several columns in one observed move (PTY
@@ -670,39 +608,6 @@ fn a_late_repaint_lays_every_cell_the_hand_typed() {
     }
 }
 
-/// A repaint that lands after the hand has paused still owes the keys it
-/// swallowed: a debounced app can repaint half a second after the last key.
-/// The licence is the ledger (an unpaid press is a real key whose glyph has
-/// not landed), not `TYPE_HINT_FRESH`. Program output banks no credits, so it
-/// cannot take this path.
-#[test]
-fn a_repaint_that_lands_after_the_hand_pauses_still_lays_the_keys_it_owes() {
-    let g = geom();
-    let c = cfg(GlowStyle::RainbowKitty, true);
-    let mut out = Vec::new();
-    let mut glow = CursorGlow::default();
-    let t0 = Instant::now();
-    glow.tick(Some((3, 2)), t0, &c, g, &mut out);
-    for i in 0..7u64 {
-        glow.note_typed_cells(t0 + Duration::from_millis(i * 100), 1);
-    }
-    // The hand stopped at +600 ms; the box repaints at +1000 ms, 400 ms
-    // past every banked stamp's freshness.
-    glow.tick(
-        Some((3, 9)),
-        t0 + Duration::from_millis(1000),
-        &c,
-        g,
-        &mut out,
-    );
-    let cols = v2_cols(&glow, 3);
-    let dark: Vec<u16> = (2..9u16).filter(|col| !cols.contains(col)).collect();
-    assert!(
-        dark.is_empty(),
-        "the repaint owed seven cells and left {dark:?} unlit; lit: {cols:?}"
-    );
-}
-
 /// Refutation control for the gate above: with every press's glyph already on
 /// glass, a caret that advances on its own is program output and is refused.
 #[test]
@@ -744,62 +649,9 @@ fn a_caret_that_advances_with_no_unpaid_press_still_buys_nothing() {
 /// Refutation control for [`a_late_repaint_lays_every_cell_the_hand_typed`]:
 /// vim's `w` is one press that hops a word, and one key must not paint a ribbon
 /// over it. Five 1-cell echoes spend their credits as they land, so the lone
-/// `w` finds an empty pool and its swept cells stay dark.
-#[test]
-fn one_press_still_cannot_buy_a_word_wide_hop() {
-    let g = geom();
-    let c = cfg(GlowStyle::RainbowKitty, true);
-    let mut out = Vec::new();
-    let mut glow = CursorGlow::default();
-    let t0 = Instant::now();
-    glow.tick(Some((3, 2)), t0, &c, g, &mut out);
-
-    // Five ordinary typed echoes, one cell each, each observed on its own
-    // frame: the everyday case, and the one that drains the pool.
-    for i in 1..=5u16 {
-        let at = t0 + Duration::from_millis(u64::from(i) * 40);
-        glow.note_typed_cells(at, 1);
-        glow.tick(
-            Some((3, 2 + i)),
-            at + Duration::from_millis(4),
-            &c,
-            g,
-            &mut out,
-        );
-    }
-
-    // One press, and the caret jumps five columns: vim's `w`.
-    let at = t0 + Duration::from_millis(260);
-    glow.note_typed_cells(at, 1);
-    glow.tick(
-        Some((3, 12)),
-        at + Duration::from_millis(8),
-        &c,
-        g,
-        &mut out,
-    );
-
-    // The skimmed cells stay dark. The landing cell (11, behind the caret at
-    // 12) is the re-anchor's single spark; `join_cohort` admits only cells
-    // adjacent to or inside a live cohort, so it mints its own mark rather than
-    // extending the typed run at 2..=6: unclaimed ground between marks, not a
-    // hole in one.
-    let cols = v2_cols(&glow, 3);
-    let bought: Vec<u16> = (7..=10u16).filter(|col| cols.contains(col)).collect();
-    assert!(
-        bought.is_empty(),
-        "one press bought the skimmed cells {bought:?}; lit: {cols:?}"
-    );
-    assert!(
-        (2..=6u16).all(|col| cols.contains(&col)),
-        "the five real echoes keep their own band: {cols:?}"
-    );
-}
-
-/// A Rainbow Kitty sweep refused by the credit budget is recorded as a refusal
-/// naming `no-credits`. Drives the shape
-/// `one_press_still_cannot_buy_a_word_wide_hop` keeps dark and checks only the
-/// ring; control: ordinary admitted typing reads `licensed`.
+/// `w` finds an empty pool: its swept cells stay dark and the refusal is
+/// recorded naming `no-credits`; control: ordinary admitted typing reads
+/// `licensed` and keeps its own band.
 #[test]
 fn a_refused_rainbow_sweep_names_the_credit_budget_that_refused_it() {
     let g = geom();
@@ -859,6 +711,10 @@ fn a_refused_rainbow_sweep_names_the_credit_budget_that_refused_it() {
     assert!(
         bought.is_empty(),
         "recording the decline must not admit the skim: {bought:?}"
+    );
+    assert!(
+        (2..=6u16).all(|col| cols.contains(&col)),
+        "the five real echoes keep their own band: {cols:?}"
     );
 }
 

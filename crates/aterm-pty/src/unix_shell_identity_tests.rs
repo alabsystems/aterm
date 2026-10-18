@@ -67,9 +67,30 @@ fn end(mut child: aterm_uds::spawnfd::Child) {
     let _ = child.wait();
 }
 
+/// A bystander born after `birth`, as the holder of a reissued pid always is: the kernel
+/// hands a pid out again only after cycling through the rest. Linux's start time is in
+/// clock ticks (`/proc/<pid>/stat` field 22, 10 ms at USER_HZ 100), so a bystander spawned
+/// in the dead shell's own tick carries its start time and stands in for a reissue that
+/// cannot happen (measured on aarch64 Linux: 5 runs in 25). One born in that tick, or whose
+/// birth does not read, is ended and another spawned; the next tick is one clock period
+/// away, so the bound is a hang detector.
+fn setsid_sleep_born_after(birth: Option<u64>) -> aterm_uds::spawnfd::Child {
+    let deadline = Instant::now() + HANG_DETECTOR;
+    loop {
+        let child = setsid_sleep();
+        let pid = i32::try_from(child.id()).expect("pid fits i32");
+        let born = process_birth(pid);
+        if (born.is_some() && born != birth) || Instant::now() >= deadline {
+            return child;
+        }
+        end(child);
+    }
+}
+
 /// An adopted shell is recorded, exits and is reaped elsewhere; its pid comes back as a
 /// `setsid`'d `sleep`; the tab closes. Teardown sends the bystander neither SIGHUP nor
-/// SIGKILL, and gives up at once.
+/// SIGKILL (counted: the reap loop takes no poll wait, so it never reaches the kill
+/// tick), and gives up at once.
 #[test]
 fn teardown_leaves_a_setsid_sleep_holding_the_recycled_pid_alive() {
     let sh = parked_session("printf 'UP\\n'; exec sleep 30");
@@ -86,13 +107,19 @@ fn teardown_leaves_a_setsid_sleep_holding_the_recycled_pid_alive() {
         libc::waitpid(sh.pid, std::ptr::null_mut(), 0);
     }
 
-    let mut bystander = setsid_sleep();
+    let mut bystander = setsid_sleep_born_after(recorded.birth);
     let bystander_pid = i32::try_from(bystander.id()).expect("pid fits i32");
     // SAFETY: read-only identity probe of the test's own child.
     let pgid = unsafe { libc::getpgid(bystander_pid) };
     assert_eq!(
         pgid, bystander_pid,
         "NON-VACUITY: the bystander must pass the OLD guard (a group leader)"
+    );
+    let bystander_birth = process_birth(bystander_pid);
+    assert!(
+        bystander_birth.is_some() && bystander_birth != recorded.birth,
+        "PRECONDITION: the bystander reads a birth after the shell's, as a reissued pid's \
+         holder does ({bystander_birth:?}, the shell's {recorded:?})"
     );
     // The pid is reissued: the recorded birth now sits beside the bystander's pid.
     let stale = ShellIdentity::from_parts(bystander_pid, recorded.birth, false);
@@ -102,8 +129,6 @@ fn teardown_leaves_a_setsid_sleep_holding_the_recycled_pid_alive() {
     let polls_before = reap_polls();
     reap_shell(stale);
     let reap_polls_taken = reap_polls() - polls_before;
-    // Past the SIGKILL tick (250 ms), with margin.
-    std::thread::sleep(Duration::from_millis(400));
     let still_running = matches!(bystander.try_wait(), Ok(None));
     // SAFETY: closing the master this test owns.
     unsafe { libc::close(sh.master) };

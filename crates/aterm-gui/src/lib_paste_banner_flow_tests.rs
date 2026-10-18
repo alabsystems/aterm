@@ -236,3 +236,32 @@ fn middle_click_primary_paste_runs_the_same_guard() {
     assert_eq!(drain(rx), b"hello");
     crate::control::PRIMARY_STUB.with(|s| *s.borrow_mut() = None);
 }
+
+/// Shift+Insert, the seeded `paste_selection` chord, pastes the PRIMARY
+/// selection on Linux — as xterm, VTE (GNOME Terminal), kitty and foot do —
+/// through the same delivery as the middle click. Before, it pasted the
+/// clipboard and nothing reached PRIMARY from the keyboard.
+#[cfg(target_os = "linux")]
+#[test]
+fn shift_insert_pastes_the_primary_selection() {
+    use winit::event::{ElementState, KeyEvent};
+    use winit::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey};
+    let (mut app, rx) = app_with_pty_observer();
+    let wid = WindowId(0);
+    app.keybindings = crate::keybinding::Keybindings::platform_defaults();
+    crate::control::PRIMARY_STUB.with(|s| *s.borrow_mut() = Some("PRIM-X".to_string()));
+    app.windows.get_mut(&wid).unwrap().mods = ModifiersState::SHIFT;
+    app.on_key(
+        wid,
+        KeyEvent::synthetic_for_test(
+            PhysicalKey::Code(KeyCode::Insert),
+            Key::Named(NamedKey::Insert),
+            None,
+            KeyLocation::Standard,
+            ElementState::Pressed,
+            false,
+        ),
+    );
+    assert_eq!(drain(rx), b"PRIM-X");
+    crate::control::PRIMARY_STUB.with(|s| *s.borrow_mut() = None);
+}

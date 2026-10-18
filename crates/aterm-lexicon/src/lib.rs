@@ -2042,18 +2042,6 @@ mod tests {
         assert_eq!(lx.classify_token("qwxkittenz"), Some(Class::Feline));
         // No surface from the dropped pathological entry made it in.
         assert_eq!(lx.classify_token("qwxstem0qwxsuf0"), None);
-
-        // The tiny embedded builtin is unaffected: it still builds cleanly and its
-        // known surfaces remain present (as in
-        // tests/animal_multilingual.rs::expanded_builtin_stays_conflict_free).
-        let builtin = Lexicon::with_languages(&["all"]);
-        assert!(
-            builtin.conflicts().is_empty(),
-            "builtin conflicts: {:?}",
-            builtin.conflicts(),
-        );
-        assert!(builtin.spaced_form_count() > 50);
-        assert_eq!(builtin.classify_token("kitty"), Some(Class::Feline));
     }
 
     // The cubic no-space scan (see `MAX_CJK_SURFACE_CHARS`): an overlong

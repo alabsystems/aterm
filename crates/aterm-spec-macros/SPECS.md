@@ -3,17 +3,21 @@
 
 # aterm-spec-macros: spec recovery from its 9 unit tests
 
+> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 4 tests it
+> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
+> were taken before.
+
 > Status 2026-10-16: this is the crate's migration worklist. Each of the 7 specs below is
 > proved through Trust/Clean about the compiled Rust functions, and then the tests it
 > subsumes are deleted. No test has been deleted yet.
 
 Source: `crates/aterm-spec-macros` (read only). All 9 `#[test]` fns are in
 `crates/aterm-spec-macros/tests/derive_and_attrs.rs`; `src/lib.rs` has none. The macro side is
-`crates/aterm-spec-macros/src/lib.rs` (`refines`, `spec_invariant`, `spec_unmodeled`,
+`crates/aterm-spec-macros/src/lib.rs` (`refines`, `spec_unmodeled`,
 `inject_entry_probe`, `entry_id_for`, `item_fn_ident`, `sanitize_ident`), with the fn reader
 `FnItem` in `src/item.rs`; since SP.8 (docs/AUDIT-third-party-2026-10-15.md §7) both read std
 `proc_macro` tokens through `aterm-macro-support`, not syn. The runtime side is
-`crates/aterm-spec/src/xref.rs` and `crates/aterm-spec/src/registry.rs`. Nothing was compiled or
+`crates/aterm-spec-anchor/src/xref.rs` and `crates/aterm-spec-anchor/src/registry.rs`. Nothing was compiled or
 run. The claims below come from reading the code.
 
 Result: **7 specs**, covering **all 9 tests**. **0 tests are not spec samples** (§4).
@@ -24,8 +28,8 @@ Gap numbers in this file are the rows of the gap table in
 ## 0. Notation used in the statements
 
 - `Expand_R(M,A,P,F)`: the token output of `#[refines(machine=M, action=A, project=P)]` on item `F`.
-  `Expand_I` and `Expand_U` are the same for `#[spec_invariant]` and `#[spec_unmodeled]`.
-- `Probe(id)`: the statement `::aterm_spec::xref::note_entered(id);`.
+  `Expand_U` is the same for `#[spec_unmodeled]`.
+- `Probe(id)`: the statement `::aterm_spec_anchor::xref::note_entered(id);`.
 - `Probeable(F)`: `F` is a fn with a `{ .. }` body and no `const` (`FnItem::fn_with_body` returns
   `Some(false)`). Before SP.8 this was: `F` parses as `syn::ImplItemFn` or `syn::ItemFn`, and
   `sig.constness` is `None`.
@@ -38,7 +42,7 @@ Gap numbers in this file are the rows of the gap table in
 - `Live(t)`: the TLS slots of `t` are not destroyed and no borrow of `ENTERED_ANCHORS` is outstanding.
 - `Sem(F)(args, σ)`: what a call to `F` does that the caller can observe (return value, effects on
   `self` and `&mut` arguments, panic, divergence), leaving `W_t` out.
-- `Reg_T(B)`: the multiset of `T` records (`RefinementAnchor`, `Waiver`, `InvariantAnchor`) that
+- `Reg_T(B)`: the multiset of `T` records (`RefinementAnchor`, `Waiver`) that
   `registry::iter::<T>()` yields in binary `B`. `Sub_T(B)`: the multiset of `registry::submit!{T => ..}`
   expansions linked into `B`.
 
@@ -50,11 +54,11 @@ Columns: `id`, `kind`, `functions`, `statement`, `subsumes (primary tests; secon
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
 anchor-entry-id	contract	aterm_spec_macros::{refines,entry_id_for,inject_entry_probe}	∀ M,A,P,F with fn ident f: the RefinementAnchor that Expand_R submits has machine=M, action=A, rust_method=f, project=P. Its entry_id is Eid(M,A,f) when Probeable(F), and is the very literal passed to the injected Probe; otherwise entry_id = "" and no probe is injected. Corollaries: a probed anchor's entry_id ends with " @ f"; an anchor with entry_id "" records nothing when F is called.	probe_records_the_anchor_id_the_record_carries, a_const_fn_anchor_reports_itself_unprobed_rather_than_lying	EASY-MEDIUM: String format!, Option match, q! literal interpolation; lives in a proc-macro crate	0, 1, 9
-macro-expansion-shape	contract	aterm_spec_macros::{refines,inject_entry_probe,spec_invariant,spec_unmodeled,item_fn_ident}	∀ M,A,P and every item token stream F: inject_entry_probe(F,id) = Some(Prepend(F,Probe(id))) when Probeable(F), None otherwise. So the item part of Expand_R(M,A,P,F) is Prepend(F,Probe(Eid(M,A,f))) when Probeable(F), and F verbatim otherwise. Expand_I and Expand_U emit F verbatim. Every expansion adds exactly one uniquely named associated const of type () holding one registry submit, and no other item. (spec_invariant breaks the uniqueness clause today; §5.5.)	attribute_macros_preserve_the_annotated_item	MEDIUM: proc_macro::TokenStream token trees (FnItem::fn_with_body scans the item; item::prepend splices the probe into the body group after its inner attributes, every other token passed through), q!, format!; needs a token-tree model (no syn parse/print round-trip since SP.8)	0, 1, 3, 9
-evidence-window-state-machine	invariant	aterm_spec::xref::{note_entered,reset_entered_anchors,disarm_entered_anchors,entered_anchor_ids,entered_anchor_count,window_is_armed}	∀ t with Live(t), ∀ W_t=(a,S): note_entered(id) moves W_t to (a, a ? S∪{id} : S). reset_entered_anchors() moves W_t to (true, ∅) and returns true. disarm_entered_anchors() moves W_t to (false, S); idempotent, keeps S. entered_anchor_ids() returns S; entered_anchor_count() returns Some(|S|); window_is_armed() returns Some(a); readers leave W_t unchanged. When ¬Live(t): reset returns false, entered_anchor_count and window_is_armed return None. No function panics in either case. (The doc comment's "one bool load when unarmed" is a cost claim, not part of this spec.)	the_record_reports_its_size_rather_than_only_its_contents, an_unarmed_probe_records_nothing	MEDIUM: thread_local! Cell<bool> and RefCell<BTreeSet<&'static str>>, LocalKey::try_with closures, try_borrow/try_borrow_mut, BTreeSet clear/insert/len/clone; a two-state ghost view of TLS. All six fns carry #[cfg_attr(trust_verify, trust::skip)] today	0, 1, 2, 5, 8, 13
+macro-expansion-shape	contract	aterm_spec_macros::{refines,inject_entry_probe,spec_unmodeled,item_fn_ident}	∀ M,A,P and every item token stream F: inject_entry_probe(F,id) = Some(Prepend(F,Probe(id))) when Probeable(F), None otherwise. So the item part of Expand_R(M,A,P,F) is Prepend(F,Probe(Eid(M,A,f))) when Probeable(F), and F verbatim otherwise. Expand_U emits F verbatim. Every expansion adds exactly one uniquely named associated const of type () holding one registry submit, and no other item.	-	MEDIUM: proc_macro::TokenStream token trees (FnItem::fn_with_body scans the item; item::prepend splices the probe into the body group after its inner attributes, every other token passed through), q!, format!; needs a token-tree model (no syn parse/print round-trip since SP.8)	0, 1, 3, 9
+evidence-window-state-machine	invariant	aterm_spec::xref::{note_entered,reset_entered_anchors,disarm_entered_anchors,entered_anchor_ids,entered_anchor_count,window_is_armed}	∀ t with Live(t), ∀ W_t=(a,S): note_entered(id) moves W_t to (a, a ? S∪{id} : S). reset_entered_anchors() moves W_t to (true, ∅) and returns true. disarm_entered_anchors() moves W_t to (false, S); idempotent, keeps S. entered_anchor_ids() returns S; entered_anchor_count() returns Some(|S|); window_is_armed() returns Some(a); readers leave W_t unchanged. When ¬Live(t): reset returns false, entered_anchor_count and window_is_armed return None. No function panics in either case. (The doc comment's "one bool load when unarmed" is a cost claim, not part of this spec.)	-	MEDIUM: thread_local! Cell<bool> and RefCell<BTreeSet<&'static str>>, LocalKey::try_with closures, try_borrow/try_borrow_mut, BTreeSet clear/insert/len/clone; a two-state ghost view of TLS. All six fns carry #[cfg_attr(trust_verify, trust::skip)] today	0, 1, 2, 5, 8, 13
 probed-call-records-its-anchors	contract	aterm_spec_macros::refines, aterm_spec::xref::note_entered	∀ probeable F carrying k ≥ 1 refines anchors with ids I = {Eid(M_i,A_i,f)}, ∀ t with Live(t) and W_t=(a,S): a call to F that reaches its body leaves W_t' = (a, a ? S∪I : S), for every k (stacked expansions each prepend their own probe, outside-in). Before F is called no id in I is added. This is the composition of macro-expansion-shape, anchor-entry-id and evidence-window-state-machine.	every_anchor_of_a_multi_anchored_fn_is_recorded_by_one_call	MEDIUM given its three lemmas: callee-ensures composition across a macro expansion, TLS state, a &mut self method	0, 1, 2, 4, 8, 9
 step-evidence-refuses-nesting	contract	aterm_spec::xref::StepEvidence::step	∀ machine m, action, drive closure d, with Live(t): step(action,d) runs reset; panics unless reset returned true and entered_anchor_count()=Some(0); runs d. It panics with a message containing "was CLOSED while this step ran" iff window_is_armed() ≠ Some(true) after d returns. Otherwise it pushes StepRecord{action, entered: S after d}, leaves armed=false and returns d's value. Corollary: any d that calls StepEvidence::step or disarm_entered_anchors and returns normally makes the outer step panic.	a_nested_window_panics_instead_of_lending_the_outer_step_its_evidence	MEDIUM-HARD: generic FnOnce parameter, panic as the specified outcome (should_panic → requires, audit §8), &mut self Vec::push, TLS, re-entry through a closure	0, 1, 2, 4, 8, 11, 13
-registry-collects-each-submit-once	invariant	aterm_spec::registry::{submit,iter}, aterm_spec::xref::{refinements,waivers,invariant_anchors}	∀ binary B on a supported target (Mach-O, ELF, Windows), ∀ T ∈ {RefinementAnchor, Waiver, InvariantAnchor}: once main starts, iter::<T>() yields Reg_T(B) = Sub_T(B) as multisets. Every submitted record appears exactly once and nothing else appears. The test samples B = the derive_and_attrs test binary (|Sub| = 15: 12 refines, 1 unmodeled, 2 invariant), with field contents fixed by anchor-entry-id; its golden FNV digest is the sample, not the spec.	the_registry_collects_every_record_this_file_submits_exactly_once	HARD: unsafe link_section load-time constructors (__mod_init_func/.init_array/.CRT$XCU), AtomicPtr intrusive list with Acquire/Release, generic T: Collect, raw-pointer as_ref; a whole-program linker property	0, 1, 8, 11, 13
+registry-collects-each-submit-once	invariant	aterm_spec::registry::{submit,iter}, aterm_spec::xref::{refinements,waivers}	∀ binary B on a supported target (Mach-O, ELF, Windows), ∀ T ∈ {RefinementAnchor, Waiver}: once main starts, iter::<T>() yields Reg_T(B) = Sub_T(B) as multisets. Every submitted record appears exactly once and nothing else appears.	-	HARD: unsafe link_section load-time constructors (__mod_init_func/.init_array/.CRT$XCU), AtomicPtr intrusive list with Acquire/Release, generic T: Collect, raw-pointer as_ref; a whole-program linker property	0, 1, 8, 11, 13
 probe-preserves-semantics	refinement	aterm_spec_macros::refines, aterm_spec::xref::note_entered	∀ fn F that type-checks, ∀ M,A,P, args, caller state σ: Sem(Expand_R(M,A,P,F))(args,σ) = Sem(F)(args,σ). Covers early return, generics, recursion, self by value, &mut self, inner attributes, diverging bodies and n-fold stacking of refines on one fn. Proof sketch: Prepend inserts only Probe(id), and note_entered (a) never panics or diverges, for any W_t and whether or not Live(t), and (b) writes only W_t. For a const fn Expand_R leaves F verbatim, so F stays const-evaluable. This is the semantic half of macro-expansion-shape.	probe_preserves_behaviour_of_every_awkward_fn_shape	VERY HARD: a statement over the semantics of all Rust fns, quantified over syntax (needs a kernel Rust semantics, proven-core SemR); thread_local!, LocalKey::try_with closures, RefCell::try_borrow_mut, BTreeSet::insert, panic-freedom	0, 1, 2, 3, 4, 8, 9, 11, 13
 ```
 
@@ -90,8 +94,7 @@ is `&str`, `String`, token streams or a `BTreeSet`.
 `evidence-window-state-machine` is the runtime-side lemma. `probed-call-records-its-anchors`
 composes all three. `step-evidence-refuses-nesting` uses `evidence-window-state-machine`.
 `probe-preserves-semantics` uses `macro-expansion-shape` plus the panic-freedom half of
-`evidence-window-state-machine`. `registry-collects-each-submit-once` is independent of the rest,
-except that its sample's field contents come from `anchor-entry-id`.
+`evidence-window-state-machine`. `registry-collects-each-submit-once` is independent of the rest.
 
 ## 2. Test → spec map (TSV; all 9)
 
@@ -100,15 +103,11 @@ All paths are under `crates/aterm-spec-macros/`.
 
 ```tsv
 file	test	primary	also
-tests/derive_and_attrs.rs	attribute_macros_preserve_the_annotated_item	macro-expansion-shape	probe-preserves-semantics
 tests/derive_and_attrs.rs	probe_preserves_behaviour_of_every_awkward_fn_shape	probe-preserves-semantics	macro-expansion-shape
 tests/derive_and_attrs.rs	probe_records_the_anchor_id_the_record_carries	anchor-entry-id	evidence-window-state-machine, probed-call-records-its-anchors
 tests/derive_and_attrs.rs	every_anchor_of_a_multi_anchored_fn_is_recorded_by_one_call	probed-call-records-its-anchors	anchor-entry-id
 tests/derive_and_attrs.rs	a_const_fn_anchor_reports_itself_unprobed_rather_than_lying	anchor-entry-id	macro-expansion-shape
 tests/derive_and_attrs.rs	a_nested_window_panics_instead_of_lending_the_outer_step_its_evidence	step-evidence-refuses-nesting	evidence-window-state-machine
-tests/derive_and_attrs.rs	the_record_reports_its_size_rather_than_only_its_contents	evidence-window-state-machine	
-tests/derive_and_attrs.rs	an_unarmed_probe_records_nothing	evidence-window-state-machine	probed-call-records-its-anchors
-tests/derive_and_attrs.rs	the_registry_collects_every_record_this_file_submits_exactly_once	registry-collects-each-submit-once	anchor-entry-id
 ```
 
 ## 3. Coverage
@@ -117,11 +116,9 @@ tests/derive_and_attrs.rs	the_registry_collects_every_record_this_file_submits_e
 - The spec recovery input reported 10 tests. The file has 9 `#[test]` fns; a plain grep finds a
   tenth `#[test]` inside the comment at `tests/derive_and_attrs.rs:75`. This table counts 9.
 - `probe-preserves-semantics` has 1 primary test but is the most general spec here: it is the
-  property both pass-through tests stand for, and the one the file's stale "unchanged" wording (§5.2)
-  should name.
-- The test helpers (`push_impl`, `check_len`, `no_loss`, `platform_fast_path`, `early_return`,
-  `generic_identity`, `recursive_sum`, `inner_attr_body`, `open_window`, `anchor_entry_id`,
-  `records_digest`) are the annotated fixtures and the harness, not tests.
+  property the stale "unchanged" wording in `src/lib.rs` (§5.2) should name.
+- The test helpers (`early_return`, `generic_identity`, `recursive_sum`, `inner_attr_body`,
+  `open_window`, `anchor_entry_id`) are the annotated fixtures and the harness, not tests.
 
 ## 4. Tests that are not spec samples
 
@@ -139,24 +136,10 @@ None. Every test samples one of the specs above.
    `assert!(entered_anchor_ids().is_empty())`. That is the form the file's own `open_window` comment
    rejects: it also passes on a destroyed TLS slot or an outstanding borrow. It should assert
    `entered_anchor_count() == Some(0)`, which is what `evidence-window-state-machine` states.
-2. **Stale "unchanged" wording.** The module doc and the section "Attribute macros are pass-throughs"
-   in `tests/derive_and_attrs.rs` still say the attribute macros "leave the annotated item unchanged".
-   That is false for `refines`, which now prepends a `note_entered` probe to every non-const fn body.
-   Only `spec_invariant` and `spec_unmodeled` are token pass-throughs. The spec is "semantics
-   preserved" (`probe-preserves-semantics`), not "tokens unchanged".
-3. **A golden digest pins a snapshot, not a property.**
-   `the_registry_collects_every_record_this_file_submits_exactly_once` compares an FNV-1a digest
-   (`388d1c9f0d7b4c66`) of the record strings. Any edit to an anchor in the file changes it with no
-   bug present. The property is `Reg_T(B) = Sub_T(B)` as multisets
-   (`registry-collects-each-submit-once`).
-4. **An unverified cost claim.** `an_unarmed_probe_records_nothing` documents a cost contract (one TLS
-   bool load, no `RefCell` borrow). The test observes only "records nothing". The cost claim belongs to
-   a perf check, not to this spec.
-5. **An untested name collision (not a test; found while reading).** `spec_invariant` in `src/lib.rs:199`
-   names its const `__aterm_spec_invariant_<fn>` with no id suffix, unlike `refines` and
-   `spec_unmodeled`. Two `#[spec_invariant]` on one fn, or on two same-named methods in one impl,
-   would collide at compile time. `macro-expansion-shape` says "uniquely named", which this breaks.
-   Fix the macro (add the sanitized id suffix) before proving that clause.
+2. **Stale "unchanged" wording.** The anchor-emitter comment in `src/lib.rs` still says the
+   annotated item "is left 100% unchanged at runtime". That is false for `refines`, which prepends a
+   `note_entered` probe to every non-const fn body. Only `spec_unmodeled` is a token pass-through.
+   The spec is "semantics preserved" (`probe-preserves-semantics`), not "tokens unchanged".
 
 ## 6. Proof order (easiest, high value first)
 
@@ -171,11 +154,11 @@ No spec is blocked by gap 0 alone, so the order goes by the fewest and smallest 
    and a TLS effect model. It retires 2 tests and is the lemma for three other specs.
 3. **`macro-expansion-shape`** (gaps 0, 1, 3, 9). Syntactic and finite: one splice into the body
    group after its inner attributes (`item::prepend`). It needs a token-tree model. It retires 1 test
-   and is the syntactic half of `probe-preserves-semantics`. Fix §5.5 first.
+   and is the syntactic half of `probe-preserves-semantics`.
 4. **`probed-call-records-its-anchors`** (gaps 0, 1, 2, 4, 8, 9). Composition only, once 1–3 hold.
 5. **`step-evidence-refuses-nesting`** (gaps 0, 1, 2, 4, 8, 11, 13). Restate the `should_panic` as a
    `requires` on `step` (audit §8).
 6. **`registry-collects-each-submit-once`** (gaps 0, 1, 8, 11, 13). A whole-program linker property
-   over unsafe load-time constructors. Keep the test, minus the golden digest (§5.3), until gap 8 lands.
+   over unsafe load-time constructors.
 7. **`probe-preserves-semantics`** (gaps 0, 1, 2, 3, 4, 8, 9, 11, 13). Quantifies over the semantics of
    every Rust fn, so it waits on proven-core SemR. Until then, keep its test.

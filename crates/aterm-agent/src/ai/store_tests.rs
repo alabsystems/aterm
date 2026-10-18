@@ -19,9 +19,15 @@ fn an_absent_store_reads_empty_and_writes_nothing_until_a_note() {
 #[test]
 fn a_note_writes_the_record_and_the_wake() {
     let (_dir, store) = store();
+    let recording = aterm_durable::seam::Recording::start();
     store
         .note("codex", How::Login, Outcome::Worked, 100)
         .expect("note");
+    assert_eq!(
+        recording.take(),
+        [aterm_durable::Flush::Ordered, aterm_durable::Flush::Ordered],
+        "the record and its wake marker are only ordered"
+    );
     let r = store.load().expect("load").of("codex");
     assert_eq!((r.used_at, r.used_how), (Some(100), Some(How::Login)));
     assert!(!r.ended());

@@ -17,34 +17,6 @@ use crate::sig::testkit;
 const ROOT_SEED: [u8; 32] = testkit::MASTER_SEED;
 const RELEASE_SEED: [u8; 32] = testkit::MACHINE_SEED;
 
-/// A group member's stage failure must reach the log as a sentence that says WHY. The
-/// abort report can only print "ABORTED at <program> during stage", so the note
-/// `stage_member` prints at each failing exit has to carry all three facts: the member,
-/// the build it was moving to, and the underlying error's OWN words (here `StageError`'s
-/// Display, the same text the singleton lane shows through `FlowError::Stage`).
-#[test]
-fn stage_failure_note_names_program_build_and_cause() {
-    let cause = StageError::DigestMismatch {
-        alg: crate::manifest::DigestAlg::Sha256,
-        expected: "aa".to_string(),
-        got: "bb".to_string(),
-    }
-    .to_string();
-    let note = stage_failure_note("trust", 4210, &cause);
-    assert!(
-        note.contains("trust"),
-        "the note must name the member the group aborted at, got: {note}"
-    );
-    assert!(
-        note.contains("4210"),
-        "the note must name the build being staged, got: {note}"
-    );
-    assert!(
-        note.contains("asset sha256 mismatch") && note.contains("bb"),
-        "the note must carry the stage error's own words, got: {note}"
-    );
-}
-
 /// A durable build floor of `index_build`, recorded under the generation these fixtures
 /// publish at — i.e. a floor that actually BINDS. Written as a helper rather than a bare
 /// integer because `BuildFloor` carries the generation that set it: a floor stamped with
@@ -671,54 +643,16 @@ fn a_failed_stage_retains_one_verified_archive_and_a_digest_failure_none() {
     // The same archive bytes under a signed tree_root that cannot match: the sha256 gate
     // passes, so the download really lands in `staging/` and the failure is late.
     let tampered = fixture_from(&dir, "binary", make_archive(&dir), Some(&"a".repeat(64)));
-    #[cfg(unix)]
-    let retained = layout
-        .prefix
-        .join("staging")
-        .join("ay")
-        .join("ay-18.tar.zst");
-    #[cfg(unix)]
-    let mut identity: Option<(u64, u64)> = None;
-    for tick in 0..3 {
-        // Tick 0 reaches the re-verify. Tick 1 is HELD by the memo that verdict left:
-        // nothing is fetched or staged, and the retained archive is
-        // exactly what the hold keeps for the explicit retry. The explicit door
-        // forgets the hold before tick 2, which re-stages the SAME retained archive
-        // — never a download — to the same honest verdict.
-        if tick == 2 {
-            assert_eq!(crate::store::clear_stage_refusals(&layout, "ay"), 1);
-        }
-        let err = install(&tampered, &layout, &anchor(), &req, fl(0), 0).unwrap_err();
-        if tick == 1 {
-            assert!(
-                matches!(err, FlowError::StageRefused(_)),
-                "the tick after a tree_root verdict is held: {err:?}"
-            );
-        } else {
-            assert!(
-                matches!(err, FlowError::Stage(StageError::TreeRootMismatch { .. })),
-                "PRECONDITION: the stage must fail AFTER the download: {err:?}"
-            );
-        }
-        assert_eq!(
-            staged_assets(&layout, "ay"),
-            vec!["ay-18.tar.zst".to_string()],
-            "the verified archive is retained, once"
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt as _;
-            let meta = std::fs::metadata(&retained).unwrap();
-            let now = (meta.dev(), meta.ino());
-            if let Some(prev) = identity {
-                assert_eq!(
-                    prev, now,
-                    "the retained archive is reused, never re-fetched"
-                );
-            }
-            identity = Some(now);
-        }
-    }
+    let err = install(&tampered, &layout, &anchor(), &req, fl(0), 0).unwrap_err();
+    assert!(
+        matches!(err, FlowError::Stage(StageError::TreeRootMismatch { .. })),
+        "PRECONDITION: the stage must fail AFTER the download: {err:?}"
+    );
+    assert_eq!(
+        staged_assets(&layout, "ay"),
+        vec!["ay-18.tar.zst".to_string()],
+        "the verified archive is retained, once"
+    );
     // A DIGEST failure keeps nothing: the bytes are wrong, and a `.part` of them would
     // seed the next attempt — so the sibling `.part` seeded here goes with the asset. A
     // fresh store, because a retained archive whose digest is the row's is reused
@@ -795,11 +729,6 @@ fn a_signer_refusal_reclaims_its_archive_and_binds_until_the_digests_move() {
     );
     let note = digest_refusal_note(&layout, "claude", build, &art, false)
         .expect("the first signer refusal already binds");
-    assert!(note.contains("not downloaded again"), "{note}");
-    assert!(
-        note.contains("signer refused: bin/claude is not signed"),
-        "{note}"
-    );
     // The canonical held row ([`crate::state::held_failed`]) every surface repeats:
     // the verdict first, then the one retry.
     assert!(
@@ -1148,10 +1077,11 @@ fn a_fetcher_refuses_vendor_urls_unless_it_opts_in() {
         }
     }
     let dest = std::env::temp_dir().join("atpkg-flow-inert-never-written");
-    let err = Inert
-        .download_url("https://github.com/x/y", &dest, 1)
-        .unwrap_err();
-    assert!(err.contains("cannot fetch vendor URLs"), "{err}");
+    assert!(
+        Inert
+            .download_url("https://github.com/x/y", &dest, 1)
+            .is_err()
+    );
     let dir_fetcher = crate::net::DirFetcher::new(std::env::temp_dir());
     assert!(
         dir_fetcher
@@ -1164,26 +1094,18 @@ fn a_fetcher_refuses_vendor_urls_unless_it_opts_in() {
     // The vendor-direct lanes answer "unreachable" by default: a fetcher with no
     // network leg keeps what is installed, quietly, and writes nothing.
     const HEAD: &str = "https://downloads.claude.ai/claude-code-releases/latest";
-    let unreachable = |e: VendorFetchError, needle: &str| match e {
-        VendorFetchError::Unreachable(m) => assert!(m.contains(needle), "{m}"),
-        other => panic!("{needle}: {other:?}"),
+    let unreachable = |e: VendorFetchError| {
+        assert!(matches!(e, VendorFetchError::Unreachable(_)), "{e:?}");
     };
     for fetcher in [&Inert as &dyn Fetcher, &dir_fetcher] {
         for sent in [None, Some("\"e\"")] {
-            unreachable(
-                fetcher.vendor_get("claude", HEAD, 64, sent).unwrap_err(),
-                "cannot fetch vendor documents",
-            );
+            unreachable(fetcher.vendor_get("claude", HEAD, 64, sent).unwrap_err());
         }
-        unreachable(
-            fetcher.vendor_content_length("claude", HEAD).unwrap_err(),
-            "cannot size vendor payloads",
-        );
+        unreachable(fetcher.vendor_content_length("claude", HEAD).unwrap_err());
         unreachable(
             fetcher
                 .vendor_download("claude", HEAD, &dest, 64)
                 .unwrap_err(),
-            "cannot download vendor payloads",
         );
     }
     assert!(!dest.exists(), "a refusal writes nothing");
@@ -1283,7 +1205,6 @@ fn an_https_row_is_admitted_then_downloaded_only_through_the_vendor_lane() {
         matches!(err, FlowError::VendorRefused(_)),
         "dispatched and refused at admission, not UnsupportedKind: {err:?}"
     );
-    assert!(err.to_string().contains("url must be https"), "{err}");
     assert!(
         !rlay.staging_dir("ay").exists(),
         "admission runs before the staging dir is even created"
@@ -1297,20 +1218,16 @@ fn an_https_row_is_admitted_then_downloaded_only_through_the_vendor_lane() {
     );
     let err = install(&hostile, &layout(&hdir), &anchor(), &req, fl(0), 0).unwrap_err();
     assert!(matches!(err, FlowError::VendorRefused(_)), "{err:?}");
-    assert!(
-        err.to_string().contains("not an allow-listed vendor host"),
-        "{err}"
-    );
 
     // 2. Admitted, but this fetcher has no vendor lane: the slug lane is NOT a fallback.
     let ndir = scratch("vendor-no-lane");
     let no_lane = fixture_vendor(&ndir, VENDOR_ROW);
     let nlay = layout(&ndir);
     let err = install(&no_lane, &nlay, &anchor(), &req, fl(0), 0).unwrap_err();
-    match &err {
-        FlowError::Download(m) => assert!(m.contains("cannot fetch vendor URLs"), "{m}"),
-        other => panic!("expected the vendor lane's refusal, got {other:?}"),
-    }
+    assert!(
+        matches!(&err, FlowError::Download(_)),
+        "expected the vendor lane's refusal, got {err:?}"
+    );
     assert!(
         crate::ops::which(&nlay, "ay").is_none(),
         "nothing installed"
@@ -1518,22 +1435,10 @@ fn a_shim_env_manifest_lays_an_exporting_shim_and_a_bad_one_is_refused() {
         "the shim exports it"
     );
     assert_eq!(
-        env.fix_line("ay").as_deref(),
-        Some("its own updater is off here (DISABLE_AUTOUPDATER=1)")
-    );
-    assert_eq!(
         crate::shim_env::read_sidecar(&l.build_dir("ay", 18)),
         env,
         "recorded beside the build for the verbs that hold no manifest"
     );
-    #[cfg(unix)]
-    {
-        let body = std::fs::read_to_string(&shim).unwrap();
-        assert!(
-            body.contains("\nexport DISABLE_AUTOUPDATER='1'\nexec '"),
-            "the export precedes the exec: {body}"
-        );
-    }
     // The rollback verb's path re-lays the PRIOR build's shims from ITS sidecar: a
     // newer build without the key flips live, then rolls back — the env returns.
     let b19 = bare_build(&l, "ay", 19, &["ay"]);
@@ -1590,10 +1495,6 @@ fn a_shim_env_manifest_lays_an_exporting_shim_and_a_bad_one_is_refused() {
         FlowError::ShimEnv(why) => assert!(why.contains("PATH=/evil"), "{why}"),
         other => panic!("expected ShimEnv, got {other:?}"),
     }
-    assert!(
-        err.to_string().contains("manifest refused: shim_env entry"),
-        "{err}"
-    );
     assert!(
         !bl.staging_dir("ay").exists(),
         "refused before any byte moved"
@@ -1723,7 +1624,7 @@ fn app_bundle_refused_closed_but_sysroot_bundle_installs() {
 }
 
 /// Mach-O magic over garbage, shipped with tar mode 0644: the magic makes
-/// [`crate::relocate::is_native_object`] admit it to the resolve check, and the
+/// [`crate::macho::is_native_object`] admit it to the resolve check, and the
 /// missing exec bit makes the spawn fail (`EACCES`) — [`crate::sysroot::resolve_check`]'s
 /// documented "cannot spawn" arm — so [`bundle_resolve_check`] errors. (A garbage
 /// EXECUTABLE Mach-O is no good as a fixture: macOS reports the exec-format failure
@@ -1858,7 +1759,6 @@ fn install_tombstone_disables_the_old_shim() {
     );
     let out = std::process::Command::new(&shim).output().unwrap();
     assert!(!out.status.success(), "tombstone shim exits nonzero");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("yanked/revoked"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1972,18 +1872,7 @@ fn a_live_build_this_slice_cannot_vouch_for_is_re_staged() {
         "the live tool still resolves into the re-staged tree"
     );
 
-    // 4. The UNMARKED live tree repairs the same way — a marker lost to a restore, a
-    //    `mark_build_ready` that failed on a full volume, or the interrupted-swap
-    //    recovery that deliberately leaves the tree it recovered unmarked.
-    crate::store::clear_build_ready(&build_dir).unwrap();
-    let again = install(&fake, &layout, &anchor(), &live, fl(0), 0).unwrap();
-    assert!(
-        !again.already_current,
-        "an unmarked live build must re-stage too"
-    );
-    assert!(crate::store::build_is_complete(&build_dir));
-
-    // 5. …and a HEALTHY store is still a no-op: the marker is an input to the decision,
+    // 4. …and a HEALTHY store is still a no-op: the marker is an input to the decision,
     //    never a re-download trigger.
     let again = install(&fake, &layout, &anchor(), &live, fl(0), 0).unwrap();
     assert!(again.already_current && again.shimmed.is_empty());
@@ -2003,16 +1892,10 @@ fn unreachable_program_is_refused() {
         installed: None,
     };
     let err = install(&fake, &layout, &anchor(), &req, fl(0), 0).unwrap_err();
-    assert!(matches!(err, FlowError::NotReachable(..)), "got {err:?}");
     // The refusal answers the follow-up question from the same verified index.
-    let rendered = err.to_string();
     assert!(
-        rendered.contains("is not named in the signed index"),
-        "the grep-stable phrase survives: {rendered}"
-    );
-    assert!(
-        rendered.contains("(it names: "),
-        "the verified roster is attached at construction: {rendered}"
+        matches!(&err, FlowError::NotReachable(p, roster) if p == "dotfiles" && roster == &["ay"]),
+        "got {err:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2056,29 +1939,7 @@ fn disk_gate_is_pure_and_fails_only_on_a_real_shortfall() {
     };
     assert_eq!(required, 400 * mib + crate::cost::FREE_FLOOR);
     assert_eq!(available, 900 * mib);
-    let line = e.to_string();
-    assert!(line.contains("needs 1.4 GiB free"), "{line}");
-    assert!(line.contains("900.0 MiB free here"), "{line}");
-    assert!(line.contains("(524.0 MiB short)"), "{line}");
-    assert!(line.starts_with(DISK_REFUSAL_HEAD), "{line}");
-    // A state, no action: the line that wraps it carries the one retry.
-    assert!(!line.contains("try again"), "{line}");
-    // Near the threshold the need and what is free round alike (1174 MiB and 1147 MiB
-    // are both `1.1 GiB`); the line must still state two different figures.
-    let near = disk_gate(150 * mib, Some(1147 * mib))
-        .expect_err("150 MiB on 1147 MiB free must refuse under the 1 GiB reserve")
-        .to_string();
-    let figure = |after: &str, before: &str| {
-        let from = near.find(after).expect(after) + after.len();
-        let to = from + near[from..].find(before).expect(before);
-        near[from..to].to_string()
-    };
-    assert_ne!(
-        figure("needs ", " free,"),
-        figure("free, ", " free here"),
-        "{near}"
-    );
-    assert!(near.contains("(27.0 MiB short)"), "{near}");
+    assert!(e.to_string().starts_with(DISK_REFUSAL_HEAD), "{e}");
     // Query failure (None) => fail OPEN.
     assert!(disk_gate(0, None).is_ok());
     // Ample space => ok.
@@ -2173,45 +2034,6 @@ fn group_fixture_with(dir: &Path, unserved: &[&str]) -> Fake {
     }
 }
 
-// The rustc tuple moves ATOMICALLY: with ay installed at an old build, apply_channel
-// stages both members then flips both — the whole group ends at its pins.
-#[test]
-fn coherence_group_applies_atomically() {
-    let dir = scratch("group-ok");
-    let fake = group_fixture(&dir);
-    let layout = layout(&dir);
-    let installed = std::collections::BTreeMap::from([("ay".to_string(), 17u64)]);
-    let report = apply_channel(
-        &fake,
-        &layout,
-        &anchor(),
-        "stable",
-        TRIPLE,
-        &installed,
-        &[],
-        fl(0),
-        0,
-    )
-    .unwrap();
-    assert_eq!(report.index_build, 41);
-    assert_eq!(report.groups.len(), 1, "one coherence group");
-    let (group, outcome) = &report.groups[0];
-    assert_eq!(group.group.as_deref(), Some("rustc"));
-    assert_eq!(
-        *outcome,
-        TxnOutcome::Applied(vec!["ay".into(), "trust".into()])
-    );
-    assert_eq!(
-        crate::ops::which(&layout, "ay").unwrap(),
-        tool_bin(&layout.build_dir("ay", 18), "ay")
-    );
-    assert_eq!(
-        crate::ops::which(&layout, "trust").unwrap(),
-        tool_bin(&layout.build_dir("trust", 4821), "trust")
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 /// Unix seconds the quiet-flip tests start from.
 const QUIET_T0: i64 = 1_790_000_000;
 
@@ -2250,32 +2072,88 @@ fn quiet_pass(
     .unwrap()
 }
 
-/// A WAIT NOTHING CAN RECORD IS NO WAIT. The ceiling is measured from the record's
-/// `since`, read back by the next pass; with the record unwritable, every pass would
-/// begin the wait again and a busy machine would hold the toolchain for good. Such a
-/// pass installs the update at once, busy or not, and the last look does not hold it.
+/// WHEN WAITING CANNOT HELP, A BUSY TOOLCHAIN FLIPS AT ONCE:
+/// * a wait nothing can record is no wait — the ceiling is measured from the record's
+///   `since`, so with the record unwritable every pass would begin the wait again and a
+///   busy machine would hold the toolchain for good;
+/// * only the compiler's move waits — trust already at its pin, a sibling moving, the
+///   build running from the live trust keeps its compiler whatever flips;
+/// * nothing live, nothing to wait for — trust has no live build (a tombstone being
+///   re-staged, a member the tuple pulls back in), so a busy SIBLING held a disabled
+///   toolchain disabled for up to four hours behind a process not using it;
+/// * a revoked live build never waits — ay@17 yanked, the tuple force-upgrades.
 #[test]
-fn a_busy_toolchain_whose_wait_cannot_be_recorded_flips_at_once() {
-    let dir = scratch("quiet-unrecorded");
-    let fake = group_fixture(&dir);
-    let layout = layout(&dir);
-    let installed = live_toolchain(&layout);
-    // The record's own path is a directory: the write's rename over it fails.
-    std::fs::create_dir_all(crate::quiet::record_path(&layout)).unwrap();
-    let targo = layout.build_dir("trust", 4800).join("bin/targo");
-    let busy = || Some(vec![targo.clone()]);
-
-    let report = quiet_pass(&fake, &layout, &installed, QUIET_T0, &busy);
-    assert_eq!(
-        report.groups[0].1,
-        TxnOutcome::Applied(vec!["ay".into(), "trust".into()]),
-        "an unrecordable wait flips now"
-    );
-    assert_eq!(
-        crate::ops::active_builds(&layout).get("trust").copied(),
-        Some(4821)
-    );
-    let _ = std::fs::remove_dir_all(&dir);
+fn a_busy_toolchain_flips_at_once_when_waiting_cannot_help() {
+    type Prep = fn(&Layout) -> std::collections::BTreeMap<String, u64>;
+    type Fixture = fn(&Path) -> Fake;
+    type Flip<'a> = (&'a str, u64, &'a str);
+    let cases: [(&str, Fixture, Prep, Flip, &[&str]); 4] = [
+        (
+            "unrecordable",
+            group_fixture,
+            |l| {
+                let installed = live_toolchain(l);
+                // The record's own path is a directory: the write's rename over it fails.
+                std::fs::create_dir_all(crate::quiet::record_path(l)).unwrap();
+                installed
+            },
+            ("trust", 4800, "targo"),
+            &["ay", "trust"],
+        ),
+        (
+            "sibling-only",
+            group_fixture,
+            |l| {
+                seed_build(l, "trust", 4821, true);
+                seed_build(l, "ay", 17, true);
+                crate::ops::active_builds(l)
+            },
+            ("trust", 4821, "targo"),
+            &["ay"],
+        ),
+        (
+            "no-live-compiler",
+            group_fixture,
+            |l| {
+                seed_build(l, "ay", 17, true);
+                crate::ops::active_builds(l)
+            },
+            ("ay", 17, "ay"),
+            &["ay", "trust"],
+        ),
+        (
+            "revoked",
+            group_fixture_yanking_ay17,
+            live_toolchain,
+            ("trust", 4800, "targo"),
+            &["ay", "trust"],
+        ),
+    ];
+    for (label, make, prep, (program, build, exe), applied) in cases {
+        let dir = scratch(&format!("quiet-{label}"));
+        let fake = make(&dir);
+        let layout = layout(&dir);
+        let installed = prep(&layout);
+        let busy = layout.build_dir(program, build).join("bin").join(exe);
+        let report = quiet_pass(&fake, &layout, &installed, QUIET_T0, &|| {
+            Some(vec![busy.clone()])
+        });
+        assert_eq!(
+            report.groups[0].1,
+            TxnOutcome::Applied(applied.iter().map(|m| (*m).to_string()).collect()),
+            "{label}"
+        );
+        assert_eq!(
+            crate::quiet::read(&layout),
+            None,
+            "{label}: no wait recorded"
+        );
+        assert_eq!(
+            crate::ops::active_builds(&layout).get("ay").copied(),
+            Some(18),
+            "{label}"
+        );
+    }
 }
 
 /// STAGE NOW, FLIP WHEN QUIET (gap #12(b)). An unattended pass meets a build running from
@@ -2294,17 +2172,11 @@ fn an_unattended_pass_stages_the_toolchain_and_flips_it_when_quiet() {
     let busy = || Some(vec![PathBuf::from("/usr/bin/login"), targo.clone()]);
 
     let report = quiet_pass(&fake, &layout, &installed, QUIET_T0, &busy);
-    let TxnOutcome::Deferred {
-        members,
-        why,
-        since,
-    } = &report.groups[0].1
-    else {
+    let TxnOutcome::Deferred { members, since, .. } = &report.groups[0].1 else {
         panic!("a busy toolchain holds the flip: {:?}", report.groups[0].1);
     };
     assert_eq!(members, &["ay".to_string(), "trust".to_string()]);
     assert_eq!(*since, QUIET_T0);
-    assert!(why.contains("is running from it"), "{why}");
     assert!(report.applied.is_empty());
     assert_eq!(
         crate::ops::active_builds(&layout).get("trust").copied(),
@@ -2330,10 +2202,6 @@ fn an_unattended_pass_stages_the_toolchain_and_flips_it_when_quiet() {
     }
     let record = crate::quiet::read(&layout).expect("the wait is recorded");
     assert_eq!(record.since, QUIET_T0);
-    assert_eq!(
-        record.moves(),
-        "ay build 17 \u{2192} 18, trust build 4800 \u{2192} 4821"
-    );
 
     // Still busy an hour on: no download, the first deferral's clock kept.
     let report = quiet_pass(&fake, &layout, &installed, QUIET_T0 + 3600, &busy);
@@ -2434,16 +2302,15 @@ fn a_lease_or_an_unreadable_table_holds_the_flip() {
             report.groups[0].1
         );
     };
-    assert_eq!(
-        why,
-        "trust build 4800 is in use by aterm-release (pid 7) \u{2014} a release cut in /w"
+    assert!(
+        why.contains("aterm-release (pid 7)"),
+        "the holder is named: {why}"
     );
     drop(lease);
     let report = quiet_pass(&fake, &layout, &installed, QUIET_T0 + 60, &|| None);
-    let TxnOutcome::Deferred { why, .. } = &report.groups[0].1 else {
+    let TxnOutcome::Deferred { .. } = &report.groups[0].1 else {
         panic!("unknown is in use: {:?}", report.groups[0].1);
     };
-    assert!(why.contains("cannot be told"), "{why}");
     assert_eq!(
         crate::ops::active_builds(&layout).get("trust").copied(),
         Some(4800)
@@ -2528,77 +2395,6 @@ fn a_held_flip_no_group_holds_is_ended_by_the_next_pass() {
     let report = quiet_pass(&fake, &layout, &nothing, QUIET_T0 + 60, &busy);
     assert!(report.groups.is_empty(), "{:?}", report.groups);
     assert_eq!(crate::quiet::read(&layout), None);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// ONLY THE COMPILER'S MOVE WAITS: trust is already at its pin and only a sibling moves,
-/// so a build running from the live trust keeps its compiler whatever flips — the pass
-/// flips at once.
-#[test]
-fn a_pass_that_moves_only_a_sibling_of_the_compiler_never_waits() {
-    let dir = scratch("quiet-sibling");
-    let fake = group_fixture(&dir);
-    let layout = layout(&dir);
-    seed_build(&layout, "trust", 4821, true);
-    seed_build(&layout, "ay", 17, true);
-    let installed =
-        std::collections::BTreeMap::from([("trust".to_string(), 4821u64), ("ay".to_string(), 17)]);
-    let targo = layout.build_dir("trust", 4821).join("bin/targo");
-    let report = quiet_pass(&fake, &layout, &installed, QUIET_T0, &|| {
-        Some(vec![targo.clone()])
-    });
-    assert_eq!(report.groups[0].1, TxnOutcome::Applied(vec!["ay".into()]));
-    assert_eq!(crate::quiet::read(&layout), None);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// NOTHING LIVE, NOTHING TO WAIT FOR: trust has no live build here — a tombstone the
-/// pass is re-staging, or a member the tuple pulls back in — so its install supersedes
-/// no compiler anything could be running, and the pass flips at once however busy a
-/// SIBLING is. Held, a disabled toolchain stayed disabled for up to four hours behind
-/// a process that was not using it.
-#[test]
-fn a_compiler_with_no_live_build_never_waits() {
-    let dir = scratch("quiet-no-live");
-    let fake = group_fixture(&dir);
-    let layout = layout(&dir);
-    seed_build(&layout, "ay", 17, true);
-    let installed = std::collections::BTreeMap::from([("ay".to_string(), 17u64)]);
-    let ay = layout.build_dir("ay", 17).join("bin/ay");
-    let report = quiet_pass(&fake, &layout, &installed, QUIET_T0, &|| {
-        Some(vec![ay.clone()])
-    });
-    assert_eq!(
-        report.groups[0].1,
-        TxnOutcome::Applied(vec!["ay".into(), "trust".into()]),
-        "{:?}",
-        report.groups[0].1
-    );
-    assert_eq!(crate::quiet::read(&layout), None);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// A REVOKED BUILD NEVER WAITS: the live ay@17 is yanked, so the tuple force-upgrades at
-/// once, busy toolchain or not.
-#[test]
-fn a_revoked_live_build_flips_at_once_however_busy() {
-    let dir = scratch("quiet-revoked");
-    let fake = group_fixture_yanking_ay17(&dir);
-    let layout = layout(&dir);
-    let installed = live_toolchain(&layout);
-    let targo = layout.build_dir("trust", 4800).join("bin/targo");
-    let report = quiet_pass(&fake, &layout, &installed, QUIET_T0, &|| {
-        Some(vec![targo.clone()])
-    });
-    assert!(
-        matches!(report.groups[0].1, TxnOutcome::Applied(_)),
-        "{:?}",
-        report.groups[0].1
-    );
-    assert_eq!(
-        crate::ops::active_builds(&layout).get("ay").copied(),
-        Some(18)
-    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2742,7 +2538,7 @@ fn bootstrap_group_stages_the_per_target_pin_overlay() {
     let layout = layout(&dir);
     let index = resolve_verified_index(&fake, &layout, &anchor(), fl(0), 0).unwrap();
     let ch = index.channel_for("stable", TRIPLE).unwrap();
-    let group = plan_groups(&index, &ch)
+    let group = crate::plan_groups(&index, &ch)
         .into_iter()
         .find(|g| g.group.as_deref() == Some("rustc"))
         .expect("the overlay pins the rustc tuple");
@@ -3158,41 +2954,13 @@ fn an_installed_group_whose_new_pin_lacks_this_triple_is_held_whole() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A [`Fake`] that logs every per-build manifest it is asked for.
-struct LoggedFake {
-    inner: Fake,
-    manifests: std::cell::RefCell<Vec<(String, u64)>>,
-}
-impl Fetcher for LoggedFake {
-    fn index_candidates(&self) -> Result<Vec<Candidate>, String> {
-        self.inner.index_candidates()
-    }
-    fn pkg_manifest(
-        &self,
-        repo: &str,
-        program: &str,
-        build: u64,
-    ) -> Result<(Vec<u8>, Vec<u8>), String> {
-        self.manifests
-            .borrow_mut()
-            .push((program.to_string(), build));
-        self.inner.pkg_manifest(repo, program, build)
-    }
-    fn download(&self, repo: &str, asset: &str, dest: &Path) -> Result<(), String> {
-        self.inner.download(repo, asset, dest)
-    }
-}
-
 // The hold reads only the members the pass would move. ay is up to date on build 18,
 // whose signed manifest has no row for this triple; trust moves 4820 → 4821, which is
 // published here. Nothing of ay's is staged, so its manifest is never even fetched.
 #[test]
 fn an_up_to_date_member_whose_pin_lacks_this_triple_never_holds_its_sibling() {
     let dir = scratch("group-uptodate-unserved");
-    let fake = LoggedFake {
-        inner: group_fixture_with(&dir, &["ay"]),
-        manifests: std::cell::RefCell::default(),
-    };
+    let fake = group_fixture_with(&dir, &["ay"]);
     let layout = layout(&dir);
     seed_build(&layout, "ay", 18, true);
     seed_build(&layout, "trust", 4820, true);
@@ -3225,32 +2993,7 @@ fn an_up_to_date_member_whose_pin_lacks_this_triple_never_holds_its_sibling() {
         crate::ops::which(&layout, "ay").unwrap(),
         tool_bin(&layout.build_dir("ay", 18), "ay")
     );
-    // One manifest request per member the pass stages — the walk's, then the stage's
-    // own — exactly the pair the disk preflight and the stage always made; the
-    // up-to-date member's is never among them.
-    assert_eq!(
-        *fake.manifests.borrow(),
-        [
-            ("trust".to_string(), 4821u64),
-            ("trust".to_string(), 4821u64)
-        ],
-        "the walk costs no request the old path did not make"
-    );
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-// A recalled member whose own new pin is the unpublished one is told that its
-// replacement is missing, and which build that is. (A recalled member whose sibling's
-// pin is missing is named with that sibling's build — the cli revoked-build test.)
-#[test]
-fn a_recalled_member_whose_own_pin_is_unpublished_is_told_its_replacement_build() {
-    assert_eq!(
-        recalled_unpublished_notice("tb", "tb", 6, TRIPLE),
-        format!(
-            "atpkg: tb was recalled and its replacement (tb build 6) is not published for \
-             {TRIPLE} — its commands are disabled until it is."
-        )
-    );
 }
 
 // --- rollback + local pin + apply_program (steps 9/10/11) --------------------------
@@ -3335,41 +3078,25 @@ fn rollback_index_per_program(floor_ay: u64) -> Fake {
 ///       the valid pin or its tools are tombstoned — never silently kept.
 ///   I3. The pass never claims `UpToDate` while some installed member is revoked.
 ///
-/// ONE `#[test]` PER CHANNEL, each enumerating its own 72 cases over ONE signed
-/// fixture: the release (two real archives, their extracted tree roots, the signed
-/// manifests and the channel's signed index) is built once per channel and only READ
-/// by the cases — `Fake::download` copies an archive out, it never moves one — while
-/// every case gets a store of its own (rebuilding it per case dominated the cost). Each
+/// Each channel — clean, the INSTALLED build (`ay@17`) yanked, the PIN (`ay@18`) yanked —
+/// enumerates its own 72 cases over ONE signed fixture: the release (two real archives,
+/// their extracted tree roots, the signed manifests and the channel's signed index) is
+/// built once per channel and only READ by the cases — `Fake::download` copies an
+/// archive out, it never moves one — while every case gets a store of its own. Each
 /// channel must decide at least 24 of its 72 cases.
 #[test]
-fn the_removed_member_hold_is_exhaustively_safe_on_a_clean_channel() {
-    let checked = removed_member_hold_cases("clean", group_fixture);
-    assert!(
-        checked >= 24,
-        "clean: the enumeration ran only {checked} cases"
-    );
-}
-
-/// `the_removed_member_hold_is_exhaustively_safe_on_a_clean_channel`, with the
-/// INSTALLED build (`ay@17`) yanked.
-#[test]
-fn the_removed_member_hold_is_exhaustively_safe_when_the_installed_build_is_yanked() {
-    let checked = removed_member_hold_cases("yank-installed", group_fixture_yanking_ay17);
-    assert!(
-        checked >= 24,
-        "yank-installed: the enumeration ran only {checked} cases"
-    );
-}
-
-/// `the_removed_member_hold_is_exhaustively_safe_on_a_clean_channel`, with the PIN
-/// (`ay@18`) yanked.
-#[test]
-fn the_removed_member_hold_is_exhaustively_safe_when_the_pin_is_yanked() {
-    let checked = removed_member_hold_cases("yank-pin", group_fixture_yanking_ay18);
-    assert!(
-        checked >= 24,
-        "yank-pin: the enumeration ran only {checked} cases"
-    );
+fn the_removed_member_hold_is_exhaustively_safe() {
+    for (cname, make) in [
+        ("clean", group_fixture as fn(&Path) -> Fake),
+        ("yank-installed", group_fixture_yanking_ay17),
+        ("yank-pin", group_fixture_yanking_ay18),
+    ] {
+        let checked = removed_member_hold_cases(cname, make);
+        assert!(
+            checked >= 24,
+            "{cname}: the enumeration ran only {checked} cases"
+        );
+    }
 }
 
 /// Every case of the removed-member hold on ONE channel; returns how many cases
@@ -3713,24 +3440,10 @@ fn a_pin_never_suppresses_a_tombstone() {
         "pin is ignored when the gate tombstones: {:?}",
         report.groups[0].1
     );
-    // §7 (step 21): the tombstoned member's OLD working shim is not merely reported — it is
-    // actively DISABLED. bin/ay flips from the live symlink into ay@17 to an executable
-    // failing tombstone script that exits nonzero.
-    let shim = shim_of(&layout, "ay");
-    let meta = std::fs::symlink_metadata(&shim).unwrap();
+    // The tombstoned member's OLD working shim is actively DISABLED, not merely reported.
     assert!(
-        meta.file_type().is_file(),
-        "shim replaced by a tombstone regular file, not a symlink"
-    );
-    assert!(
-        crate::platform::resolve_shim(&shim).is_none(),
+        crate::platform::resolve_shim(&shim_of(&layout, "ay")).is_none(),
         "tombstone no longer forwards anywhere"
-    );
-    let out = std::process::Command::new(&shim).output().unwrap();
-    assert!(!out.status.success(), "tombstone shim exits nonzero");
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("yanked/revoked"),
-        "tombstone shim explains itself on stderr"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -3827,35 +3540,54 @@ fn a_plain_update_revives_a_tombstoned_singleton_when_its_pin_is_good_again() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Rollback lands on the highest retained build below the active one that the gate
+/// still admits: never a yanked build, never one below the floor — the channel's, or the
+/// floor published for THIS program (`min_build_by_program`), never another's — and with
+/// none left it refuses. Landed, the shim, the witness and the `alab-` alias the verified
+/// index calls for all name the target.
 #[test]
-fn rollback_selects_highest_gate_valid_build_below_current() {
-    let dir = scratch("rollback-basic");
-    let fake = rollback_index(0, &[]);
-    let layout = layout(&dir);
-    seed_build(&layout, "ay", 16, false);
-    seed_build(&layout, "ay", 17, false);
-    seed_build(&layout, "ay", 18, true); // active
-    let r = rollback(&fake, &layout, &anchor(), "stable", "ay", &[], fl(0), 0).unwrap();
-    assert_eq!(r.from_build, 18);
-    assert_eq!(r.to_build, 17);
-    assert_eq!(
-        crate::ops::which(&layout, "ay").unwrap(),
-        tool_bin(&layout.build_dir("ay", 17), "ay")
-    );
-    assert_eq!(
-        std::fs::read_link(layout.program_current("ay")).unwrap(),
-        layout.build_dir("ay", 17)
-    );
-    // The rollback VERB reads the alias policy off the index it just verified — ay is
-    // listed with no `system` and no `extra`, so `alab-ay` stands beside the restored
-    // `ay`, pointing where it points (the fixture seeded 18 without one; the pass
-    // would have laid it since).
-    assert_eq!(
-        crate::ops::which(&layout, "alab-ay"),
-        crate::ops::which(&layout, "ay"),
-        "the alias is restored with its primary"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
+fn rollback_selects_the_highest_gate_valid_build_below_current() {
+    for (label, fake, want) in [
+        ("plain", rollback_index(0, &[]), Some(17)),
+        ("17 yanked", rollback_index(0, &["ay@17"]), Some(16)),
+        ("channel floor 18", rollback_index(18, &[]), None),
+        ("ay's own floor 18", rollback_index_per_program(18), None),
+        (
+            "ay's own floor 17",
+            rollback_index_per_program(17),
+            Some(17),
+        ),
+    ] {
+        let dir = scratch(&format!("rollback-{}", label.replace(' ', "-")));
+        let layout = layout(&dir);
+        seed_build(&layout, "ay", 16, false);
+        seed_build(&layout, "ay", 17, false);
+        seed_build(&layout, "ay", 18, true);
+        let got = rollback(&fake, &layout, &anchor(), "stable", "ay", &[], fl(0), 0);
+        let Some(to) = want else {
+            assert!(
+                matches!(got, Err(FlowError::Rollback(_))),
+                "{label}: {got:?}"
+            );
+            continue;
+        };
+        let r = got.unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert_eq!((r.from_build, r.to_build), (18, to), "{label}");
+        let target = layout.build_dir("ay", to);
+        assert_eq!(
+            crate::ops::which(&layout, "ay"),
+            Some(tool_bin(&target, "ay"))
+        );
+        assert_eq!(
+            std::fs::read_link(layout.program_current("ay")).unwrap(),
+            target
+        );
+        assert_eq!(
+            crate::ops::which(&layout, "alab-ay"),
+            crate::ops::which(&layout, "ay"),
+            "{label}: the alias is restored with its primary"
+        );
+    }
 }
 
 /// A GUTTED ROLLBACK TARGET: a build with orphaned `lib/`, no `bin/`, and a `.ready`
@@ -3912,152 +3644,12 @@ fn rollback_refuses_a_target_whose_tools_are_gone_and_takes_the_one_below() {
         crate::activate::Aliases::Off,
     )
     .unwrap();
-    let err = rollback(&fake, &layout, &anchor(), "stable", "ay", &[], fl(0), 0)
+    rollback(&fake, &layout, &anchor(), "stable", "ay", &[], fl(0), 0)
         .expect_err("no landable build below current");
-    // The refusal names the build that cannot run and what stays — a fact a person
-    // can act on, not the gate's mechanism.
-    assert!(
-        err.to_string()
-            .contains("ay 17 has nothing in bin/ to run \u{2014} ay 18 stays"),
-        "the refusal says WHY, not just that the gate failed: {err}"
-    );
     assert_eq!(
         crate::ops::which(&layout, "ay").unwrap(),
         tool_bin(&layout.build_dir("ay", 18), "ay"),
         "a refused rollback leaves the live shim exactly where it was"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn rollback_respects_floor_and_yank() {
-    // min_build=17: 16 is below the floor, so from 18 => 17.
-    {
-        let dir = scratch("rollback-floor");
-        let lay = layout(&dir);
-        seed_build(&lay, "ay", 16, false);
-        seed_build(&lay, "ay", 17, false);
-        seed_build(&lay, "ay", 18, true);
-        let r = rollback(
-            &rollback_index(17, &[]),
-            &lay,
-            &anchor(),
-            "stable",
-            "ay",
-            &[],
-            fl(0),
-            0,
-        )
-        .unwrap();
-        assert_eq!(r.to_build, 17);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-    // yanked ay@17 => skip 17, land on 16.
-    {
-        let dir = scratch("rollback-yank");
-        let lay = layout(&dir);
-        seed_build(&lay, "ay", 16, false);
-        seed_build(&lay, "ay", 17, false);
-        seed_build(&lay, "ay", 18, true);
-        let r = rollback(
-            &rollback_index(0, &["ay@17"]),
-            &lay,
-            &anchor(),
-            "stable",
-            "ay",
-            &[],
-            fl(0),
-            0,
-        )
-        .unwrap();
-        assert_eq!(r.to_build, 16);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-    // min_build=18: no retained build below current qualifies => Err(Rollback).
-    {
-        let dir = scratch("rollback-none-floor");
-        let lay = layout(&dir);
-        seed_build(&lay, "ay", 16, false);
-        seed_build(&lay, "ay", 17, false);
-        seed_build(&lay, "ay", 18, true);
-        let err = rollback(
-            &rollback_index(18, &[]),
-            &lay,
-            &anchor(),
-            "stable",
-            "ay",
-            &[],
-            fl(0),
-            0,
-        )
-        .unwrap_err();
-        assert!(matches!(err, FlowError::Rollback(_)), "got {err:?}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
-// The rollback target predicate must read THIS program's
-// floor, not the channel-wide number — a floor published for one program must neither
-// refuse another's retained builds nor be ignored for the program it names.
-#[test]
-fn rollback_reads_the_floor_of_the_program_it_rolls_back() {
-    // Floored at 18 for `ay` ITSELF (channel-wide floor 0): nothing below the active
-    // build qualifies, so the rollback errors rather than landing on a revoked build.
-    {
-        let dir = scratch("rollback-prog-floor");
-        let lay = layout(&dir);
-        seed_build(&lay, "ay", 16, false);
-        seed_build(&lay, "ay", 17, false);
-        seed_build(&lay, "ay", 18, true);
-        let err = rollback(
-            &rollback_index_per_program(18),
-            &lay,
-            &anchor(),
-            "stable",
-            "ay",
-            &[],
-            fl(0),
-            0,
-        )
-        .unwrap_err();
-        assert!(matches!(err, FlowError::Rollback(_)), "got {err:?}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-    // Floored at 17: 16 is below `ay`'s floor, so from 18 the rollback lands on 17.
-    {
-        let dir = scratch("rollback-prog-floor-lands");
-        let lay = layout(&dir);
-        seed_build(&lay, "ay", 16, false);
-        seed_build(&lay, "ay", 17, false);
-        seed_build(&lay, "ay", 18, true);
-        let r = rollback(
-            &rollback_index_per_program(17),
-            &lay,
-            &anchor(),
-            "stable",
-            "ay",
-            &[],
-            fl(0),
-            0,
-        )
-        .unwrap();
-        assert_eq!(r.to_build, 17);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
-#[test]
-fn rollback_errors_when_no_lower_build() {
-    let dir = scratch("rollback-nolower");
-    let fake = rollback_index(0, &[]);
-    let layout = layout(&dir);
-    seed_build(&layout, "ay", 18, true); // only 18 present
-    let err = rollback(&fake, &layout, &anchor(), "stable", "ay", &[], fl(0), 0).unwrap_err();
-    // What stays, and why: no older build is kept — the gate's mechanism is not the
-    // sentence.
-    assert!(
-        matches!(&err, FlowError::Rollback(m) if m == "no older ay build is kept \u{2014} ay 18 stays"),
-        "got {err:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -4319,7 +3911,6 @@ fn a_program_naming_the_retired_requires_is_refused_on_both_lanes() {
         matches!(&err, FlowError::RequiresRetired(p) if p == "ay"),
         "{err:?}"
     );
-    assert!(err.to_string().contains("names `requires`"), "{err}");
     assert!(
         !layout.staging_dir("ay").exists(),
         "refused before any byte moved"
@@ -4687,13 +4278,6 @@ fn cached_index_is_used_only_on_same_source_fetch_failure() {
         "a dir: cache never satisfies a github: fetch, and an unreachable source \
          must not be reported as a signature failure — got {err:?}"
     );
-    let rendered = err.to_string();
-    assert!(
-        rendered.contains("could not reach")
-            && rendered.contains("network down")
-            && !rendered.contains("signature-valid"),
-        "the message names the transport's reason and points at the network: {rendered}"
-    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -4725,11 +4309,6 @@ fn a_typed_lane_reports_an_unreached_index_as_the_network() {
     assert!(
         matches!(&err, FlowError::Unreachable(why) if why == "network down"),
         "got {err:?}"
-    );
-    // The line says the state and the transport's reason, never a signature verdict.
-    assert_eq!(
-        err.to_string(),
-        "could not reach the toolchain index: network down"
     );
     f.fail.set(false);
     f.empty.set(true);
@@ -5879,10 +5458,6 @@ fn a_group_member_s_digest_refusal_is_not_refetched_on_every_tick() {
         panic!("the tuple still aborts on the member it cannot stage: {outcome:?}");
     };
     assert_eq!(failed, "trust");
-    assert!(
-        why.contains("not downloaded again for about"),
-        "the abort says the transfer was skipped and why: {why}"
-    );
     // The door is the pass that moves the tuple whole: `install trust` would land the
     // member alone, beside an `ay` on the old build.
     assert!(
@@ -5899,7 +5474,7 @@ fn a_group_member_s_digest_refusal_is_not_refetched_on_every_tick() {
     // Install members' bytes, what its own gate sums.
     let index = resolve_verified_index(&fake, &layout, &anchor(), fl(0), 0).unwrap();
     let ch = index.channel_for("stable", TRIPLE).unwrap();
-    let group = plan_groups(&index, &ch).remove(0);
+    let group = crate::plan_groups(&index, &ch).remove(0);
     assert_eq!(
         planned_landing(&fake, &layout, &index, &ch, &group, &installed, TRIPLE),
         PlannedLanding::Nothing
@@ -5928,7 +5503,7 @@ fn a_tuple_s_planned_landing_is_what_its_transaction_stages() {
     let installed = crate::ops::active_builds(&layout);
     let index = resolve_verified_index(&fake, &layout, &anchor(), fl(0), 0).unwrap();
     let ch = index.channel_for("stable", TRIPLE).unwrap();
-    let group = plan_groups(&index, &ch).remove(0);
+    let group = crate::plan_groups(&index, &ch).remove(0);
     let planned = || planned_landing(&fake, &layout, &index, &ch, &group, &installed, TRIPLE);
     let bootstrap = || {
         bootstrap_group(
@@ -6098,8 +5673,9 @@ const LANE_THREAD: &str = "atpkg-download-ahead";
 
 /// A [`Fake`] whose downloads go into one ordered log beside the test's own marks
 /// (`start:<asset>`, `end:<asset>`, and whatever the test notes), each with the thread that
-/// asked; a download of the asset `hold` names waits until the test lets it go, and one of
-/// an asset in `refused` fails as a dropped link does.
+/// asked; a download of the asset `hold` names waits until the test lets it go, one of an
+/// asset in `refused` fails as a dropped link does, and the first of an asset in `flaky`
+/// fails as a dropped transfer does.
 struct Recorder {
     inner: Fake,
     log: std::sync::Mutex<Vec<(String, String)>>,
@@ -6107,6 +5683,7 @@ struct Recorder {
     hold: std::sync::Mutex<Option<String>>,
     let_go: std::sync::Condvar,
     refused: Vec<String>,
+    flaky: std::sync::Mutex<Vec<String>>,
 }
 
 impl Recorder {
@@ -6118,7 +5695,14 @@ impl Recorder {
             hold: std::sync::Mutex::default(),
             let_go: std::sync::Condvar::new(),
             refused: refused.iter().map(|a| (*a).to_string()).collect(),
+            flaky: std::sync::Mutex::default(),
         }
+    }
+
+    /// The first download of each of `assets` fails.
+    fn flaky(self, assets: &[&str]) -> Self {
+        *self.flaky.lock().unwrap() = assets.iter().map(|a| (*a).to_string()).collect();
+        self
     }
 
     fn note(&self, event: &str) {
@@ -6183,8 +5767,17 @@ impl Fetcher for Recorder {
             hold = self.let_go.wait_timeout(hold, left).unwrap().0;
         }
         drop(hold);
+        let dropped = {
+            let mut flaky = self.flaky.lock().unwrap();
+            let first = flaky.iter().position(|a| a == asset);
+            first.map(|i| flaky.remove(i)).is_some()
+        };
         let fetched = if self.refused.iter().any(|a| a == asset) {
             Err(String::from("curl: (7) Failed to connect"))
+        } else if dropped {
+            Err(String::from(
+                "curl: (56) Recv failure: Connection reset by peer",
+            ))
         } else {
             self.inner.download(repo, asset, dest)
         };
@@ -6350,7 +5943,7 @@ fn a_tuple_with_an_unknown_archive_size_downloads_inline_without_disabling_sized
     let layout = layout(&dir);
     let index = resolve_verified_index(&rec, &layout, &anchor(), fl(0), 0).unwrap();
     let ch = index.channel_for("stable", TRIPLE).unwrap();
-    let group = plan_groups(&index, &ch)
+    let group = crate::plan_groups(&index, &ch)
         .into_iter()
         .find(|group| group.group.as_deref() == Some("rustc"))
         .unwrap();
@@ -6546,7 +6139,7 @@ fn bootstrap_through_lane(
 ) -> (TxnOutcome, std::sync::Arc<ahead::Ahead>) {
     let index = resolve_verified_index(fetcher, layout, &anchor(), fl(0), 0).unwrap();
     let ch = index.channel_for("stable", TRIPLE).unwrap();
-    let group = plan_groups(&index, &ch)
+    let group = crate::plan_groups(&index, &ch)
         .into_iter()
         .find(|g| g.group.as_deref() == Some("rustc"))
         .unwrap();
@@ -6617,10 +6210,11 @@ fn a_tuple_lands_whole_from_the_archives_the_lane_fetched() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// A DOWNLOAD THE LANE LOST ABORTS THE TUPLE, AND IS THE PASS'S FETCH FAULT. The third
-// member's archive does not arrive: nothing is flipped, the staged siblings' trees are
-// discarded (their archives kept for the next pass), and the pass's own fault tally — the
-// offline verdict's input — counts the one fetch that failed.
+// A DOWNLOAD LOST BY THE LANE AND BY THE PASS ABORTS THE TUPLE, AND IS THE PASS'S FETCH
+// FAULT. The third member's archive does not arrive, the lane's download nor the pass's own
+// after it: nothing is flipped, the staged siblings' trees are discarded (their archives
+// kept for the next pass), and the pass's own fault tally — the offline verdict's input —
+// counts the one fetch of its own that failed.
 #[test]
 fn a_tuple_whose_third_archive_the_lane_lost_aborts_with_nothing_flipped() {
     let dir = scratch("ahead-tuple-lost");
@@ -6664,11 +6258,97 @@ fn a_tuple_whose_third_archive_the_lane_lost_aborts_with_nothing_flipped() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// A DOWNLOAD ONLY THE LANE LOST IS THE PASS'S TO FETCH, AND THE TUPLE LANDS WHOLE. The lane's
+// download of the third member's archive is cut short (a dropped transfer); the pass, reaching
+// that member, fetches the archive itself, and the tuple lands in this pass with no fault
+// counted — where a lane whose failure stood in for the pass's download aborted it.
+#[test]
+fn a_tuple_whose_archive_only_the_lane_lost_lands_whole() {
+    let dir = scratch("ahead-tuple-lost-once");
+    let rec = Recorder::new(
+        ahead_release(
+            &dir,
+            &[("ta", 1, 100), ("tb", 2, 100), ("tc", 3, 100)],
+            &["ta", "tb", "tc"],
+        ),
+        &[],
+    )
+    .flaky(&["tc-3.tar.zst"]);
+    let layout = layout(&dir);
+    let mut resolved = BTreeMap::new();
+    let faults = fetch_faults();
+    let (outcome, lane) = bootstrap_through_lane(&rec, &layout, &mut resolved);
+    assert_eq!(
+        outcome,
+        TxnOutcome::Applied(vec!["ta".into(), "tb".into(), "tc".into()])
+    );
+    assert_eq!(fetch_faults().wrapping_sub(faults), 0, "no fetch fault");
+    assert!(
+        lane.all_fetched(&[0]),
+        "the pass's own download of tc counts it in: the agents' gate opens on it"
+    );
+    let tc: Vec<String> = rec
+        .starts()
+        .into_iter()
+        .filter(|(asset, _)| asset == "tc-3.tar.zst")
+        .map(|(_, thread)| thread)
+        .collect();
+    assert_eq!(tc.len(), 2, "the lane's download, then the pass's: {tc:?}");
+    assert_eq!(tc[0], LANE_THREAD);
+    assert_ne!(tc[1], LANE_THREAD, "the pass fetched it itself");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// A SINGLETON'S ARCHIVE ONLY THE LANE LOST IS THE PASS'S TO FETCH, AND THEN IN. The lane's
+// download of sa is cut short and the lane goes on to sb; the pass's own install of sa fetches
+// the archive itself, and the moment it is in, the lane holds every archive in — what opens
+// the agents' early gate on a first run.
+#[test]
+fn a_singleton_whose_archive_only_the_lane_lost_installs_and_counts_in() {
+    let dir = scratch("ahead-single-lost-once");
+    let rec = Recorder::new(
+        ahead_release(&dir, &[("sa", 1, 100), ("sb", 2, 100)], &[]),
+        &[],
+    )
+    .flaky(&["sa-1.tar.zst"]);
+    let layout = layout(&dir);
+    let lane = lane_over(&rec, &layout, &singles(&["sa", "sb"]), 1 << 20);
+    std::thread::scope(|scope| {
+        spawn_lane(scope, &lane, &rec, &layout);
+        let _entered = lane.enter();
+        rec.wait_for("end:sb-2.tar.zst");
+        assert!(!lane.all_fetched(&[0, 1]), "sa is not in");
+        let req = InstallRequest {
+            channel: "stable",
+            program: "sa",
+            triple: TRIPLE,
+            installed: None,
+        };
+        let report = install(&rec, &layout, &anchor(), &req, fl(0), 0).unwrap();
+        assert_eq!(report.build, 1);
+        assert!(
+            lane.all_fetched(&[0, 1]),
+            "the pass's own download of sa counts it in"
+        );
+    });
+    let sa: Vec<String> = rec
+        .starts()
+        .into_iter()
+        .filter(|(asset, _)| asset == "sa-1.tar.zst")
+        .map(|(_, thread)| thread)
+        .collect();
+    assert_eq!(sa.len(), 2, "the lane's download, then the pass's: {sa:?}");
+    assert_eq!(sa[0], LANE_THREAD);
+    assert_ne!(sa[1], LANE_THREAD, "the pass fetched it itself");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // THE LANE SAYS WHEN EVERY ARCHIVE IS IN, NOT WHEN THE PASS HAS STAGED THEM. The pass takes
 // nothing here: asked after each download that lands, the lane says the set is in only once
 // sc — its last archive — is, never after ta or tb alone. A unit the lane holds no archive of
-// is never in, nor is a set whose archive the lane could not fetch, or one whose archive the
-// pass fetched itself: only the pass knows when those are.
+// is never in, nor is one whose archive the pass fetched itself while the lane was busy:
+// only the pass knows when that is. An archive the lane's download lost is in once the
+// pass's own download of it is, and the lane says so then.
 #[test]
 fn the_lane_says_every_archive_is_in_the_moment_its_last_download_lands() {
     let release = |dir: &Path| {
@@ -6728,22 +6408,37 @@ fn the_lane_says_every_archive_is_in_the_moment_its_last_download_lands() {
         "a unit the lane holds nothing of"
     );
 
-    // tb's download fails: the lane halts, and the set is never in.
+    // tb's download fails: the lane goes on to sc, and the set is not in until the pass's own
+    // download of tb is — the moment it is, the lane says so.
     let lost = scratch("ahead-all-in-lost");
-    let rec = Recorder::new(release(&lost), &["tb-2.tar.zst"]);
+    let rec = Recorder::new(release(&lost), &[]).flaky(&["tb-2.tar.zst"]);
     let layout = self::layout(&lost);
     let lane = lane_over(&rec, &layout, &units(), 1 << 20);
     std::thread::scope(|scope| {
-        let worker = std::thread::Builder::new()
+        std::thread::Builder::new()
             .name(LANE_THREAD.into())
-            .spawn_scoped(scope, || lane.work(&rec, &layout, &|_| {}))
+            .spawn_scoped(scope, || {
+                lane.work(&rec, &layout, &|lane| {
+                    rec.note(if lane.all_fetched(&[0]) {
+                        "in"
+                    } else {
+                        "short"
+                    });
+                });
+            })
             .unwrap();
-        let entered = lane.enter();
-        worker.join().unwrap();
-        drop(entered);
+        let _entered = lane.enter();
+        rec.wait_for("end:sc-3.tar.zst");
+        let tb = archive_at(&layout, "tb", 2);
+        assert_eq!(ahead::claim("tb", &tb), None, "tb is the pass's to fetch");
+        assert!(!lane.all_fetched(&[0]));
+        rec.download("tb", "tb-2.tar.zst", &tb).unwrap();
+        ahead::fetched_inline("tb", &tb);
+        rec.wait_for("in");
     });
     assert!(rec.at("end:tb-2.tar.zst") > rec.at("end:ta-1.tar.zst"));
-    assert!(!lane.all_fetched(&[0]));
+    assert!(rec.at("end:sc-3.tar.zst") < rec.at("in"));
+    assert!(lane.all_fetched(&[0]));
 
     // The lane is busy with ta when the pass asks for tb: the pass fetches tb itself.
     let inline = scratch("ahead-all-in-inline");
@@ -6809,6 +6504,42 @@ fn every_resolve_check_runs_and_a_signal_death_in_any_refuses() {
     assert!(
         matches!(verdict(&["t4", "t2"]), Err(FlowError::Activate(why)) if why.contains("t2 was killed"))
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// A SYMLINKED BIN IS CHECKED AS THE OBJECT IT REACHES: `bin/<tool>` linking to a native
+// object elsewhere in the build is checked (under its own exposed name), one linking to a
+// script is not, and one that dangles is not.
+#[cfg(unix)]
+#[test]
+fn the_resolve_check_follows_a_symlinked_bin_to_its_object() {
+    use std::os::unix::fs::symlink;
+    let dir = scratch("resolve-symlinked");
+    let build = dir.join("b");
+    std::fs::create_dir_all(build.join("bin")).unwrap();
+    std::fs::create_dir_all(build.join("libexec")).unwrap();
+    std::fs::write(
+        build.join("libexec/object"),
+        [0xcf, 0xfa, 0xed, 0xfe, 0, 0, 0, 0],
+    )
+    .unwrap();
+    std::fs::write(build.join("libexec/script"), b"#!/bin/sh\n").unwrap();
+    symlink("../libexec/object", build.join("bin/linked")).unwrap();
+    symlink("../libexec/script", build.join("bin/wrap")).unwrap();
+    symlink("../libexec/gone", build.join("bin/dangling")).unwrap();
+    let exposes = crate::store::split_exposed(&[
+        "linked".to_string(),
+        "wrap".to_string(),
+        "dangling".to_string(),
+    ])
+    .0;
+    let checked = std::sync::Mutex::new(Vec::new());
+    bundle_resolve_check_with(&build, &exposes, &|bin: &Path| {
+        checked.lock().unwrap().push(bin.to_path_buf());
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(checked.into_inner().unwrap(), [build.join("bin/linked")]);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

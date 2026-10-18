@@ -194,9 +194,7 @@ fn dropping_an_adopted_session_before_commit_leaves_the_predecessors_rekey_and_b
 
 /// THE LATCH `spawn_session` HANDS A SESSION decides that drop (round seven,
 /// item 20): built through `spawn::adopted_handoff_commit` — the one
-/// expression `spawn_session` sets `handoff_commit` with (pinned by
-/// `spawn::adoption_wiring_tests::spawn_session_hands_an_adopted_session_the_handoff_s_commit_latch`)
-/// — over a factory whose `rekey_deferred` is an overlap handoff's
+/// expression `spawn_session` sets `handoff_commit` with — over a factory whose `rekey_deferred` is an overlap handoff's
 /// `Deferred::holding()`, an ADOPTED session's drop leaves its shell to the
 /// predecessor. NEGATIVE CONTROLS, each hung up as before: a fresh spawn, a
 /// shell the PTY keeper kept (`recovered`), and an adoption with no overlap

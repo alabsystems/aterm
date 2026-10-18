@@ -4,27 +4,27 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/event_processor.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-// Modified by the aterm project in 2026; see the repository NOTICE.
+// Modified by the aterm project in 2026; see the repository NOTICE. (Events are read through
+// aterm-x11's Xlib and XInput 2 declarations, and the requests are its encoders, where
+// upstream used x11-dl and x11rb: docs/AUDIT-third-party-2026-10-15.md, LW.7.)
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::os::raw::{c_char, c_int, c_long, c_ulong};
 use std::slice;
 use std::sync::{Arc, Mutex};
 
-use x11_dl::xinput2::{
-    self, XIDeviceEvent, XIEnterEvent, XIFocusInEvent, XIFocusOutEvent, XIHierarchyEvent,
-    XILeaveEvent, XIModifierState, XIRawEvent,
+use aterm_x11::proto::event::ClientMessage;
+use aterm_x11::proto::xproto::{self, QueryExtensionReply};
+use aterm_x11::proto::{atom, xinput};
+use aterm_xkb::ModMask as xkb_mod_mask_t;
+
+use super::ffi::{
+    self, event_type, xi, xkb_event, Display as XDisplay, Window as XWindow, XClientMessageEvent,
+    XConfigureEvent, XDestroyWindowEvent, XEvent, XExposeEvent, XIDeviceEvent, XIEnterEvent,
+    XIFocusInEvent, XIFocusOutEvent, XIHierarchyEvent, XILeaveEvent, XIModifierState, XIRawEvent,
+    XKeyEvent, XMapEvent, XPropertyEvent, XReparentEvent, XSelectionEvent, XVisibilityEvent,
+    XkbAnyEvent, XkbStateRec,
 };
-use x11_dl::xlib::{
-    self, Display as XDisplay, Window as XWindow, XAnyEvent, XClientMessageEvent, XConfigureEvent,
-    XDestroyWindowEvent, XEvent, XExposeEvent, XKeyEvent, XMapEvent, XPropertyEvent,
-    XReparentEvent, XSelectionEvent, XVisibilityEvent, XkbAnyEvent, XkbStateRec,
-};
-use x11rb::protocol::xinput;
-use x11rb::protocol::xkb::ID as XkbId;
-use x11rb::protocol::xproto::{self, ConnectionExt as _, ModMask};
-use x11rb::x11_utils::{ExtensionInformation, Serialize};
-use xkbcommon_dl::xkb_mod_mask_t;
 
 use crate::dpi::{PhysicalPosition, PhysicalSize};
 use crate::event::{
@@ -45,6 +45,34 @@ use crate::platform_impl::x11::{
     ScrollOrientation, UnownedWindow, WindowId,
 };
 
+/// The core protocol's modifier bits in a key event's state (`KeyButMask`).
+mod mod_mask {
+    pub const SHIFT: u16 = 1 << 0;
+    pub const LOCK: u16 = 1 << 1;
+    pub const CONTROL: u16 = 1 << 2;
+    pub const M1: u16 = 1 << 3;
+    pub const M2: u16 = 1 << 4;
+    pub const M3: u16 = 1 << 5;
+    pub const M4: u16 = 1 << 6;
+    pub const M5: u16 = 1 << 7;
+}
+
+/// The core pointer buttons (`X11/X.h`).
+const BUTTON1: u32 = 1;
+const BUTTON2: u32 = 2;
+const BUTTON3: u32 = 3;
+
+/// `XIPointerEmulated`, a device event's flag for a pointer event emulated from touch.
+const XI_POINTER_EMULATED: c_int = 1 << 16;
+
+/// `XIMaskIsSet`: whether bit `bit` of an XI2 mask is set.
+fn xi_mask_is_set(mask: &[u8], bit: c_int) -> bool {
+    usize::try_from(bit)
+        .ok()
+        .and_then(|bit| mask.get(bit >> 3).map(|byte| byte & (1 << (bit & 7)) != 0))
+        .unwrap_or(false)
+}
+
 /// The maximum amount of X modifiers to replay.
 pub const MAX_MOD_REPLAY_LEN: usize = 32;
 
@@ -57,8 +85,8 @@ pub struct EventProcessor {
     pub ime_event_receiver: ImeEventReceiver,
     pub randr_event_offset: u8,
     pub devices: RefCell<HashMap<DeviceId, Device>>,
-    pub xi2ext: ExtensionInformation,
-    pub xkbext: ExtensionInformation,
+    pub xi2ext: QueryExtensionReply,
+    pub xkbext: QueryExtensionReply,
     pub target: RootAEL,
     pub xkb_context: Context,
     // Number of touch events currently in progress
@@ -143,10 +171,8 @@ impl EventProcessor {
     fn filter_event(&mut self, xev: &mut XEvent) -> bool {
         let wt = Self::window_target(&self.target);
         unsafe {
-            (wt.xconn.xlib.XFilterEvent)(xev, {
-                let xev: &XAnyEvent = xev.as_ref();
-                xev.window
-            }) == xlib::True
+            let window = xev.any.window;
+            (wt.xconn.xlib.XFilterEvent)(xev, window) == ffi::TRUE
         }
     }
 
@@ -154,64 +180,78 @@ impl EventProcessor {
     where
         F: FnMut(&RootAEL, Event<T>),
     {
-        let event_type = xev.get_type();
+        let event_type = unsafe { xev.type_ };
 
         // If we have IME disabled, don't try to `filter_event`, since only IME can consume them
         // and forward back. This is not desired for e.g. games since some IMEs may delay the input
         // and game can toggle IME back when e.g. typing into some field where latency won't really
         // matter.
-        let filtered = if event_type == xlib::KeyPress || event_type == xlib::KeyRelease {
-            let wt = Self::window_target(&self.target);
-            let ime = wt.ime.as_ref();
-            let window = self.active_window.map(|window| window as XWindow);
-            let forward_to_ime = ime
-                .and_then(|ime| window.map(|window| ime.borrow().is_ime_allowed(window)))
-                .unwrap_or(false);
+        let filtered =
+            if event_type == event_type::KEY_PRESS || event_type == event_type::KEY_RELEASE {
+                let wt = Self::window_target(&self.target);
+                let ime = wt.ime.as_ref();
+                let window = self.active_window.map(|window| window as XWindow);
+                let forward_to_ime = ime
+                    .and_then(|ime| window.map(|window| ime.borrow().is_ime_allowed(window)))
+                    .unwrap_or(false);
 
-            let filtered = forward_to_ime && self.filter_event(xev);
-            if filtered {
-                let xev: &XKeyEvent = xev.as_ref();
-                if self.xmodmap.is_modifier(xev.keycode as u8) {
-                    // Don't grow the buffer past the `MAX_MOD_REPLAY_LEN`. This could happen
-                    // when the modifiers are consumed entirely.
-                    if self.xfiltered_modifiers.len() == MAX_MOD_REPLAY_LEN {
-                        self.xfiltered_modifiers.pop_back();
+                let filtered = forward_to_ime && self.filter_event(xev);
+                if filtered {
+                    let xev: &XKeyEvent = unsafe { &xev.key };
+                    if self.xmodmap.is_modifier(xev.keycode as u8) {
+                        // Don't grow the buffer past the `MAX_MOD_REPLAY_LEN`. This could happen
+                        // when the modifiers are consumed entirely.
+                        if self.xfiltered_modifiers.len() == MAX_MOD_REPLAY_LEN {
+                            self.xfiltered_modifiers.pop_back();
+                        }
+                        self.xfiltered_modifiers.push_front(xev.keycode as u8);
                     }
-                    self.xfiltered_modifiers.push_front(xev.keycode as u8);
                 }
-            }
 
-            filtered
-        } else {
-            self.filter_event(xev)
-        };
+                filtered
+            } else {
+                self.filter_event(xev)
+            };
 
         // Don't process event if it was filtered.
         if filtered {
             return;
         }
 
+        // SAFETY (each arm's union read): Xlib wrote the member that `event_type` names.
         match event_type {
-            xlib::ClientMessage => self.client_message(xev.as_ref(), &mut callback),
-            xlib::SelectionNotify => self.selection_notify(xev.as_ref(), &mut callback),
-            xlib::ConfigureNotify => self.configure_notify(xev.as_ref(), &mut callback),
-            xlib::ReparentNotify => self.reparent_notify(xev.as_ref()),
-            xlib::MapNotify => self.map_notify(xev.as_ref(), &mut callback),
-            xlib::DestroyNotify => self.destroy_notify(xev.as_ref(), &mut callback),
-            xlib::PropertyNotify => self.property_notify(xev.as_ref(), &mut callback),
-            xlib::VisibilityNotify => self.visibility_notify(xev.as_ref(), &mut callback),
-            xlib::Expose => self.expose(xev.as_ref(), &mut callback),
+            event_type::CLIENT_MESSAGE => {
+                self.client_message(unsafe { &xev.client_message }, &mut callback)
+            },
+            event_type::SELECTION_NOTIFY => {
+                self.selection_notify(unsafe { &xev.selection }, &mut callback)
+            },
+            event_type::CONFIGURE_NOTIFY => {
+                self.configure_notify(unsafe { &xev.configure }, &mut callback)
+            },
+            event_type::REPARENT_NOTIFY => self.reparent_notify(unsafe { &xev.reparent }),
+            event_type::MAP_NOTIFY => self.map_notify(unsafe { &xev.map }, &mut callback),
+            event_type::DESTROY_NOTIFY => {
+                self.destroy_notify(unsafe { &xev.destroy_window }, &mut callback)
+            },
+            event_type::PROPERTY_NOTIFY => {
+                self.property_notify(unsafe { &xev.property }, &mut callback)
+            },
+            event_type::VISIBILITY_NOTIFY => {
+                self.visibility_notify(unsafe { &xev.visibility }, &mut callback)
+            },
+            event_type::EXPOSE => self.expose(unsafe { &xev.expose }, &mut callback),
             // Note that in compose/pre-edit sequences, we'll always receive KeyRelease events.
-            ty @ xlib::KeyPress | ty @ xlib::KeyRelease => {
-                let state = if ty == xlib::KeyPress {
+            ty @ event_type::KEY_PRESS | ty @ event_type::KEY_RELEASE => {
+                let state = if ty == event_type::KEY_PRESS {
                     ElementState::Pressed
                 } else {
                     ElementState::Released
                 };
 
-                self.xinput_key_input(xev.as_mut(), state, &mut callback);
+                self.xinput_key_input(unsafe { &mut xev.key }, state, &mut callback);
             },
-            xlib::GenericEvent => {
+            event_type::GENERIC_EVENT => {
                 let wt = Self::window_target(&self.target);
                 let xev: GenericEventCookie =
                     match GenericEventCookie::from_event(wt.xconn.clone(), *xev) {
@@ -222,8 +262,8 @@ impl EventProcessor {
                 let evtype = xev.evtype();
 
                 match evtype {
-                    ty @ xinput2::XI_ButtonPress | ty @ xinput2::XI_ButtonRelease => {
-                        let state = if ty == xinput2::XI_ButtonPress {
+                    ty @ xi::BUTTON_PRESS | ty @ xi::BUTTON_RELEASE => {
+                        let state = if ty == xi::BUTTON_PRESS {
                             ElementState::Pressed
                         } else {
                             ElementState::Released
@@ -238,7 +278,7 @@ impl EventProcessor {
                         );
                         self.xinput2_button_input(xev, state, &mut callback);
                     },
-                    xinput2::XI_Motion => {
+                    xi::MOTION => {
                         let xev: &XIDeviceEvent = unsafe { xev.as_event() };
                         self.update_mods_from_xinput2_event(
                             &xev.mods,
@@ -248,11 +288,11 @@ impl EventProcessor {
                         );
                         self.xinput2_mouse_motion(xev, &mut callback);
                     },
-                    xinput2::XI_Enter => {
+                    xi::ENTER => {
                         let xev: &XIEnterEvent = unsafe { xev.as_event() };
                         self.xinput2_mouse_enter(xev, &mut callback);
                     },
-                    xinput2::XI_Leave => {
+                    xi::LEAVE => {
                         let xev: &XILeaveEvent = unsafe { xev.as_event() };
                         self.update_mods_from_xinput2_event(
                             &xev.mods,
@@ -262,51 +302,51 @@ impl EventProcessor {
                         );
                         self.xinput2_mouse_left(xev, &mut callback);
                     },
-                    xinput2::XI_FocusIn => {
+                    xi::FOCUS_IN => {
                         let xev: &XIFocusInEvent = unsafe { xev.as_event() };
                         self.xinput2_focused(xev, &mut callback);
                     },
-                    xinput2::XI_FocusOut => {
+                    xi::FOCUS_OUT => {
                         let xev: &XIFocusOutEvent = unsafe { xev.as_event() };
                         self.xinput2_unfocused(xev, &mut callback);
                     },
-                    xinput2::XI_TouchBegin | xinput2::XI_TouchUpdate | xinput2::XI_TouchEnd => {
+                    xi::TOUCH_BEGIN | xi::TOUCH_UPDATE | xi::TOUCH_END => {
                         let phase = match evtype {
-                            xinput2::XI_TouchBegin => TouchPhase::Started,
-                            xinput2::XI_TouchUpdate => TouchPhase::Moved,
-                            xinput2::XI_TouchEnd => TouchPhase::Ended,
+                            xi::TOUCH_BEGIN => TouchPhase::Started,
+                            xi::TOUCH_UPDATE => TouchPhase::Moved,
+                            xi::TOUCH_END => TouchPhase::Ended,
                             _ => unreachable!(),
                         };
 
                         let xev: &XIDeviceEvent = unsafe { xev.as_event() };
                         self.xinput2_touch(xev, phase, &mut callback);
                     },
-                    xinput2::XI_RawButtonPress | xinput2::XI_RawButtonRelease => {
+                    xi::RAW_BUTTON_PRESS | xi::RAW_BUTTON_RELEASE => {
                         let state = match evtype {
-                            xinput2::XI_RawButtonPress => ElementState::Pressed,
-                            xinput2::XI_RawButtonRelease => ElementState::Released,
+                            xi::RAW_BUTTON_PRESS => ElementState::Pressed,
+                            xi::RAW_BUTTON_RELEASE => ElementState::Released,
                             _ => unreachable!(),
                         };
 
                         let xev: &XIRawEvent = unsafe { xev.as_event() };
                         self.xinput2_raw_button_input(xev, state, &mut callback);
                     },
-                    xinput2::XI_RawMotion => {
+                    xi::RAW_MOTION => {
                         let xev: &XIRawEvent = unsafe { xev.as_event() };
                         self.xinput2_raw_mouse_motion(xev, &mut callback);
                     },
-                    xinput2::XI_RawKeyPress | xinput2::XI_RawKeyRelease => {
+                    xi::RAW_KEY_PRESS | xi::RAW_KEY_RELEASE => {
                         let state = match evtype {
-                            xinput2::XI_RawKeyPress => ElementState::Pressed,
-                            xinput2::XI_RawKeyRelease => ElementState::Released,
+                            xi::RAW_KEY_PRESS => ElementState::Pressed,
+                            xi::RAW_KEY_RELEASE => ElementState::Released,
                             _ => unreachable!(),
                         };
 
-                        let xev: &xinput2::XIRawEvent = unsafe { xev.as_event() };
+                        let xev: &XIRawEvent = unsafe { xev.as_event() };
                         self.xinput2_raw_key_input(xev, state, &mut callback);
                     },
 
-                    xinput2::XI_HierarchyChanged => {
+                    xi::HIERARCHY_CHANGED => {
                         let xev: &XIHierarchyEvent = unsafe { xev.as_event() };
                         self.xinput2_hierarchy_changed(xev, &mut callback);
                     },
@@ -315,7 +355,9 @@ impl EventProcessor {
             },
             _ => {
                 if event_type == self.xkbext.first_event as _ {
-                    let xev: &XkbAnyEvent = unsafe { &*(xev as *const _ as *const XkbAnyEvent) };
+                    // SAFETY: an XKB event; `XEvent`'s padding covers every XKB event struct.
+                    let xev: &XkbAnyEvent =
+                        unsafe { &*(xev as *const XEvent).cast::<XkbAnyEvent>() };
                     self.xkb_event(xev, &mut callback);
                 }
                 if event_type == self.randr_event_offset as c_int {
@@ -426,49 +468,44 @@ impl EventProcessor {
         let window = xev.window as xproto::Window;
         let window_id = mkwid(window);
 
-        if xev.data.get_long(0) as xproto::Atom == wt.wm_delete_window {
+        if client_long(xev, 0) as xproto::Atom == wt.wm_delete_window {
             let event = Event::WindowEvent { window_id, event: WindowEvent::CloseRequested };
             callback(&self.target, event);
             return;
         }
 
-        if xev.data.get_long(0) as xproto::Atom == wt.net_wm_ping {
-            let client_msg = xproto::ClientMessageEvent {
-                response_type: xproto::CLIENT_MESSAGE_EVENT,
-                format: xev.format as _,
-                sequence: xev.serial as _,
-                window: wt.root,
-                type_: xev.message_type as _,
-                data: xproto::ClientMessageData::from({
-                    let [a, b, c, d, e]: [c_long; 5] = xev.data.as_longs().try_into().unwrap();
-                    [a as u32, b as u32, c as u32, d as u32, e as u32]
-                }),
-            };
+        if client_long(xev, 0) as xproto::Atom == wt.net_wm_ping {
+            let mut client_msg = ClientMessage::new32(
+                wt.root,
+                xev.message_type as _,
+                std::array::from_fn(|i| client_long(xev, i) as u32),
+            );
+            client_msg.format = xev.format as _;
+            client_msg.sequence = xev.serial as _;
 
             wt.xconn
-                .xcb_connection()
-                .send_event(
+                .send_void(xproto::send_event(
                     false,
                     wt.root,
-                    xproto::EventMask::SUBSTRUCTURE_NOTIFY
-                        | xproto::EventMask::SUBSTRUCTURE_REDIRECT,
-                    client_msg.serialize(),
-                )
+                    xproto::event_mask::SUBSTRUCTURE_NOTIFY
+                        | xproto::event_mask::SUBSTRUCTURE_REDIRECT,
+                    &client_msg.to_bytes(),
+                ))
                 .expect_then_ignore_error("Failed to send `ClientMessage` event.");
             return;
         }
 
         if xev.message_type == atoms[XdndEnter] as c_ulong {
-            let source_window = xev.data.get_long(0) as xproto::Window;
-            let flags = xev.data.get_long(1);
+            let source_window = client_long(xev, 0) as xproto::Window;
+            let flags = client_long(xev, 1);
             let version = flags >> 24;
             self.dnd.version = Some(version);
             let has_more_types = flags - (flags & (c_long::MAX - 1)) == 1;
             if !has_more_types {
                 let type_list = vec![
-                    xev.data.get_long(2) as xproto::Atom,
-                    xev.data.get_long(3) as xproto::Atom,
-                    xev.data.get_long(4) as xproto::Atom,
+                    client_long(xev, 2) as xproto::Atom,
+                    client_long(xev, 3) as xproto::Atom,
+                    client_long(xev, 4) as xproto::Atom,
                 ];
                 self.dnd.type_list = Some(type_list);
             } else if let Ok(more_types) = unsafe { self.dnd.get_type_list(source_window) } {
@@ -486,13 +523,13 @@ impl EventProcessor {
             // supply position updates with `HoveredFile` or another event, implementing
             // that here would be trivial.
 
-            let source_window = xev.data.get_long(0) as xproto::Window;
+            let source_window = client_long(xev, 0) as xproto::Window;
 
             // Equivalent to `(x << shift) | y`
             // where `shift = mem::size_of::<c_short>() * 8`
             // Note that coordinates are in "desktop space", not "window space"
             // (in X11 parlance, they're root window coordinates)
-            // let packed_coordinates = xev.data.get_long(2);
+            // let packed_coordinates = client_long(xev, 2);
             // let shift = mem::size_of::<libc::c_short>() * 8;
             // let x = packed_coordinates >> shift;
             // let y = packed_coordinates & !(x << shift);
@@ -501,7 +538,7 @@ impl EventProcessor {
             let version = self.dnd.version.unwrap_or(5);
 
             // Action is specified in versions 2 and up, though we don't need it anyway.
-            // let action = xev.data.get_long(4);
+            // let action = client_long(xev, 4);
 
             let accepted = if let Some(ref type_list) = self.dnd.type_list {
                 type_list.contains(&atoms[TextUriList])
@@ -522,10 +559,10 @@ impl EventProcessor {
             self.dnd.source_window = Some(source_window);
             if self.dnd.result.is_none() {
                 let time = if version >= 1 {
-                    xev.data.get_long(3) as xproto::Timestamp
+                    client_long(xev, 3) as xproto::Timestamp
                 } else {
                     // In version 0, time isn't specified
-                    x11rb::CURRENT_TIME
+                    aterm_x11::proto::CURRENT_TIME
                 };
 
                 // This results in the `SelectionNotify` event below
@@ -557,7 +594,7 @@ impl EventProcessor {
             } else {
                 // `source_window` won't be part of our DND state if we already rejected the drop in
                 // our `XdndPosition` handler.
-                let source_window = xev.data.get_long(0) as xproto::Window;
+                let source_window = client_long(xev, 0) as xproto::Window;
                 (source_window, DndState::Rejected)
             };
 
@@ -630,7 +667,7 @@ impl EventProcessor {
         // We don't want to send `Moved` when this is false, since then every `Resized`
         // (whether the window moved or not) is accompanied by an extraneous `Moved` event
         // that has a position relative to the parent window.
-        let is_synthetic = xev.send_event == xlib::True;
+        let is_synthetic = xev.send_event == ffi::TRUE;
 
         // These are both in physical space.
         let new_inner_size = (xev.width as u32, xev.height as u32);
@@ -752,9 +789,8 @@ impl EventProcessor {
 
         // NOTE: Ensure that the lock is dropped before handling the resized and
         // sending the event back to user.
-        let hittest = {
+        {
             let mut shared_state_lock = window.shared_state_lock();
-            let hittest = shared_state_lock.cursor_hittest;
 
             // This is a hack to ensure that the DPI adjusted resize is actually
             // applied on all WMs. KWin doesn't need this, but Xfwm does. The hack
@@ -772,13 +808,6 @@ impl EventProcessor {
                     window.request_inner_size_physical(adjusted_size.0, adjusted_size.1);
                 }
             }
-
-            hittest
-        };
-
-        // Reload hittest.
-        if hittest.unwrap_or(false) {
-            let _ = window.set_cursor_hittest(true);
         }
 
         if resized {
@@ -854,9 +883,7 @@ impl EventProcessor {
         let atoms = wt.x_connection().atoms();
         let atom = xev.atom as xproto::Atom;
 
-        if atom == xproto::Atom::from(xproto::AtomEnum::RESOURCE_MANAGER)
-            || atom == atoms[_XSETTINGS_SETTINGS]
-        {
+        if atom == atom::RESOURCE_MANAGER || atom == atoms[_XSETTINGS_SETTINGS] {
             self.process_dpi_change(&mut callback);
         }
     }
@@ -869,7 +896,7 @@ impl EventProcessor {
 
         let event = Event::WindowEvent {
             window_id: mkwid(xwindow),
-            event: WindowEvent::Occluded(xev.state == xlib::VisibilityFullyObscured),
+            event: WindowEvent::Occluded(xev.state == ffi::VISIBILITY_FULLY_OBSCURED),
         };
         callback(&self.target, event);
 
@@ -1026,7 +1053,7 @@ impl EventProcessor {
         };
 
         let wt = Self::window_target(&self.target);
-        let xcb = wt.xconn.xcb_connection().get_raw_xcb_connection();
+        let xcb = wt.xconn.xcb_connection().as_raw().as_ptr();
 
         // Use synthetic state since we're replaying the modifier. The user modifier state
         // will be restored later.
@@ -1057,26 +1084,26 @@ impl EventProcessor {
         let device_id = mkdid(event.deviceid as xinput::DeviceId);
 
         // Deliver multi-touch events instead of emulated mouse events.
-        if (event.flags & xinput2::XIPointerEmulated) != 0 {
+        if (event.flags & XI_POINTER_EMULATED) != 0 {
             return;
         }
 
         let event = match event.detail as u32 {
-            xlib::Button1 => {
-                WindowEvent::MouseInput { device_id, state, button: MouseButton::Left }
-            },
-            xlib::Button2 => {
-                WindowEvent::MouseInput { device_id, state, button: MouseButton::Middle }
-            },
+            BUTTON1 => WindowEvent::MouseInput { device_id, state, button: MouseButton::Left },
+            BUTTON2 => WindowEvent::MouseInput { device_id, state, button: MouseButton::Middle },
 
-            xlib::Button3 => {
-                WindowEvent::MouseInput { device_id, state, button: MouseButton::Right }
-            },
+            BUTTON3 => WindowEvent::MouseInput { device_id, state, button: MouseButton::Right },
 
             // Suppress emulated scroll wheel clicks, since we handle the real motion events for
             // those. In practice, even clicky scroll wheels appear to be reported by
             // evdev (and XInput2 in turn) as axis motion, so we don't otherwise
             // special-case these button presses.
+            //
+            // LOCAL PATCH (aterm): a wheel button that is NOT emulated (a source
+            // with no scroll valuator: XTEST, so xdotool, x11vnc, Barrier/Input
+            // Leap/Synergy) sends a press AND a release per notch, and both reach
+            // here; one notch is one step, so the release is dropped.
+            4..=7 if state == ElementState::Released => return,
             4..=7 => WindowEvent::MouseWheel {
                 device_id,
                 delta: match event.detail {
@@ -1137,7 +1164,7 @@ impl EventProcessor {
         let mut events = Vec::new();
         let mut value = event.valuators.values;
         for i in 0..event.valuators.mask_len * 8 {
-            if !xinput2::XIMaskIsSet(mask, i) {
+            if !xi_mask_is_set(mask, i) {
                 continue;
             }
 
@@ -1386,7 +1413,7 @@ impl EventProcessor {
     ) where
         F: FnMut(&RootAEL, Event<T>),
     {
-        if xev.flags & xinput2::XIPointerEmulated == 0 {
+        if xev.flags & XI_POINTER_EMULATED == 0 {
             let event = Event::DeviceEvent {
                 device_id: mkdid(xev.deviceid as xinput::DeviceId),
                 event: DeviceEvent::Button { state, button: xev.detail as u32 },
@@ -1407,7 +1434,7 @@ impl EventProcessor {
         let mut mouse_delta = util::Delta::default();
         let mut scroll_delta = util::Delta::default();
         for i in 0..xev.valuators.mask_len * 8 {
-            if !xinput2::XIMaskIsSet(mask, i) {
+            if !xi_mask_is_set(mask, i) {
                 continue;
             }
             let x = unsafe { value.read_unaligned() };
@@ -1477,13 +1504,13 @@ impl EventProcessor {
     {
         let infos = unsafe { slice::from_raw_parts(xev.info, xev.num_info as usize) };
         for info in infos {
-            if 0 != info.flags & (xinput2::XISlaveAdded | xinput2::XIMasterAdded) {
+            if 0 != info.flags & (xi::SLAVE_ADDED | xi::MASTER_ADDED) {
                 self.init_device(info.deviceid as xinput::DeviceId);
                 callback(&self.target, Event::DeviceEvent {
                     device_id: mkdid(info.deviceid as xinput::DeviceId),
                     event: DeviceEvent::Added,
                 });
-            } else if 0 != info.flags & (xinput2::XISlaveRemoved | xinput2::XIMasterRemoved) {
+            } else if 0 != info.flags & (xi::SLAVE_REMOVED | xi::MASTER_REMOVED) {
                 callback(&self.target, Event::DeviceEvent {
                     device_id: mkdid(info.deviceid as xinput::DeviceId),
                     event: DeviceEvent::Removed,
@@ -1500,8 +1527,10 @@ impl EventProcessor {
     {
         let wt = Self::window_target(&self.target);
         match xev.xkb_type {
-            xlib::XkbNewKeyboardNotify => {
-                let xev = unsafe { &*(xev as *const _ as *const xlib::XkbNewKeyboardNotifyEvent) };
+            xkb_event::NEW_KEYBOARD_NOTIFY => {
+                let xev = unsafe {
+                    &*(xev as *const XkbAnyEvent).cast::<ffi::XkbNewKeyboardNotifyEvent>()
+                };
 
                 let keycodes_changed_flag = 0x1;
                 let geometry_changed_flag = 0x1 << 1;
@@ -1512,7 +1541,7 @@ impl EventProcessor {
                 if xev.device == self.xkb_context.core_keyboard_id
                     && (keycodes_changed || geometry_changed)
                 {
-                    let xcb = wt.xconn.xcb_connection().get_raw_xcb_connection();
+                    let xcb = wt.xconn.xcb_connection().as_raw().as_ptr();
                     self.xkb_context.set_keymap_from_x11(xcb);
                     self.xmodmap.reload_from_x_connection(&wt.xconn);
 
@@ -1527,8 +1556,8 @@ impl EventProcessor {
                     }
                 }
             },
-            xlib::XkbMapNotify => {
-                let xcb = wt.xconn.xcb_connection().get_raw_xcb_connection();
+            xkb_event::MAP_NOTIFY => {
+                let xcb = wt.xconn.xcb_connection().as_raw().as_ptr();
                 self.xkb_context.set_keymap_from_x11(xcb);
                 self.xmodmap.reload_from_x_connection(&wt.xconn);
                 let window_id = match self.active_window.map(super::mkwid) {
@@ -1541,8 +1570,9 @@ impl EventProcessor {
                     self.send_modifiers(window_id, mods, true, &mut callback);
                 }
             },
-            xlib::XkbStateNotify => {
-                let xev = unsafe { &*(xev as *const _ as *const xlib::XkbStateNotifyEvent) };
+            xkb_event::STATE_NOTIFY => {
+                let xev =
+                    unsafe { &*(xev as *const XkbAnyEvent).cast::<ffi::XkbStateNotifyEvent>() };
 
                 if let Some(state) = self.xkb_context.state_mut() {
                     state.update_modifiers(
@@ -1614,8 +1644,8 @@ impl EventProcessor {
 
         unsafe {
             let mut state: XkbStateRec = std::mem::zeroed();
-            if (wt.xconn.xlib.XkbGetState)(wt.xconn.display, XkbId::USE_CORE_KBD.into(), &mut state)
-                == xlib::True
+            if (wt.xconn.xlib.XkbGetState)(wt.xconn.display, ffi::XKB_USE_CORE_KBD, &mut state)
+                == ffi::TRUE
             {
                 xkb_state.update_modifiers(
                     state.base_mods as u32,
@@ -1679,28 +1709,28 @@ impl EventProcessor {
 
         // Build the XKB modifiers from the regular state.
         let mut depressed = 0u32;
-        if let Some(shift) = mods_indices.shift.filter(|_| ModMask::SHIFT.intersects(state)) {
+        if let Some(shift) = mods_indices.shift.filter(|_| state & mod_mask::SHIFT != 0) {
             depressed |= 1 << shift;
         }
-        if let Some(caps) = mods_indices.caps.filter(|_| ModMask::LOCK.intersects(state)) {
+        if let Some(caps) = mods_indices.caps.filter(|_| state & mod_mask::LOCK != 0) {
             depressed |= 1 << caps;
         }
-        if let Some(ctrl) = mods_indices.ctrl.filter(|_| ModMask::CONTROL.intersects(state)) {
+        if let Some(ctrl) = mods_indices.ctrl.filter(|_| state & mod_mask::CONTROL != 0) {
             depressed |= 1 << ctrl;
         }
-        if let Some(alt) = mods_indices.alt.filter(|_| ModMask::M1.intersects(state)) {
+        if let Some(alt) = mods_indices.alt.filter(|_| state & mod_mask::M1 != 0) {
             depressed |= 1 << alt;
         }
-        if let Some(num) = mods_indices.num.filter(|_| ModMask::M2.intersects(state)) {
+        if let Some(num) = mods_indices.num.filter(|_| state & mod_mask::M2 != 0) {
             depressed |= 1 << num;
         }
-        if let Some(mod3) = mods_indices.mod3.filter(|_| ModMask::M3.intersects(state)) {
+        if let Some(mod3) = mods_indices.mod3.filter(|_| state & mod_mask::M3 != 0) {
             depressed |= 1 << mod3;
         }
-        if let Some(logo) = mods_indices.logo.filter(|_| ModMask::M4.intersects(state)) {
+        if let Some(logo) = mods_indices.logo.filter(|_| state & mod_mask::M4 != 0) {
             depressed |= 1 << logo;
         }
-        if let Some(mod5) = mods_indices.mod5.filter(|_| ModMask::M5.intersects(state)) {
+        if let Some(mod5) = mods_indices.mod5.filter(|_| state & mod_mask::M5 != 0) {
             depressed |= 1 << mod5;
         }
 
@@ -1742,7 +1772,7 @@ impl EventProcessor {
 
         // Update modifiers state and emit key events based on which keys are currently pressed.
         let window_target = Self::window_target(target);
-        let xcb = window_target.xconn.xcb_connection().get_raw_xcb_connection();
+        let xcb = window_target.xconn.xcb_connection().as_raw().as_ptr();
 
         let keymap = match xkb_context.keymap_mut() {
             Some(keymap) => keymap,
@@ -1829,4 +1859,11 @@ fn is_first_touch(first: &mut Option<u64>, num: &mut u32, id: u64, phase: TouchP
     }
 
     *first == Some(id)
+}
+
+/// The `i`th of a format-32 client message's five values.
+fn client_long(xev: &XClientMessageEvent, i: usize) -> c_long {
+    // SAFETY: every member of the data union is plain bytes; a format-32 message's are
+    // five longs, and any other format's are read as Xlib would.
+    unsafe { xev.data.l[i] }
 }

@@ -2,97 +2,54 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use std::collections::BTreeMap;
 
+/// Partial marks never promote to Full; `mark_full` does, every later mark
+/// keeps it Full, and `reset` returns either state to an empty Partial.
 #[test]
-fn damage_full() {
+fn state_machine_cycle() {
     let mut damage = Damage::new(24);
     assert!(!damage.is_full());
-    damage.mark_full();
-    assert!(damage.is_full());
-    assert!(damage.is_row_damaged(0));
-    assert!(damage.is_row_damaged(23));
-}
+    assert!(!damage.has_damage());
 
-#[test]
-fn damage_partial_row() {
-    let mut damage = Damage::new(24);
     damage.mark_row(5);
-    assert!(damage.is_row_damaged(5));
-    assert!(!damage.is_row_damaged(4));
-    assert!(!damage.is_row_damaged(6));
-}
+    damage.mark_rows(7, 9);
+    damage.mark_cell(12, 3);
+    assert!(!damage.is_full());
+    assert!(damage.has_damage());
 
-#[test]
-fn damage_row_bounds_clamped_to_cols() {
-    let mut damage = Damage::new(10);
-    damage.mark_row(3);
-    assert_eq!(damage.row_damage_bounds(3, 80), Some((0, 80)));
-}
-
-#[test]
-fn damage_partial_cell() {
-    let mut damage = Damage::new(24);
-    damage.mark_cell(5, 10);
-    damage.mark_cell(5, 20);
-    assert!(damage.is_row_damaged(5));
-    let bounds = damage.row_damage_bounds(5, 80);
-    assert_eq!(bounds, Some((10, 21)));
-}
-
-#[test]
-fn damage_reset() {
-    let mut damage = Damage::new(24);
     damage.mark_full();
+    damage.mark_row(5);
+    damage.mark_cell(5, 0);
     assert!(damage.is_full());
+    assert!(damage.has_damage());
+
     damage.reset(24);
     assert!(!damage.is_full());
-    assert!(!damage.is_row_damaged(0));
-}
-
-#[test]
-fn damage_iterator() {
-    let mut damage = Damage::new(24);
-    damage.mark_row(3);
-    damage.mark_row(7);
-    damage.mark_row(15);
-
-    let damaged: Vec<_> = damage.damaged_rows(24).collect();
-    assert_eq!(damaged, vec![3, 7, 15]);
-}
-
-#[test]
-fn tracker_many_rows() {
-    let mut tracker = DamageTracker::new(200);
-    tracker.mark_row(150);
-    assert!(tracker.is_row_damaged(150));
-    assert!(!tracker.is_row_damaged(149));
-    assert!(!tracker.is_row_damaged(151));
-}
-
-#[test]
-fn damage_iterator_full() {
-    let damage = Damage::Full;
-    let damaged: Vec<_> = damage.damaged_rows(5).collect();
-    assert_eq!(damaged, vec![0, 1, 2, 3, 4]);
-}
-
-#[test]
-fn damage_iterator_sparse() {
-    let mut damage = Damage::new(100);
+    assert!(!damage.has_damage());
     damage.mark_row(0);
-    damage.mark_row(63); // End of first word
-    damage.mark_row(64); // Start of second word
-    damage.mark_row(99);
-
-    let damaged: Vec<_> = damage.damaged_rows(100).collect();
-    assert_eq!(damaged, vec![0, 63, 64, 99]);
+    assert_eq!(damage.damaged_rows(24).collect::<Vec<_>>(), vec![0]);
 }
 
+/// Full damage covers every row at the full width, whatever the size asked.
 #[test]
-fn damage_iterator_empty() {
-    let damage = Damage::new(24);
-    let damaged: Vec<_> = damage.damaged_rows(24).collect();
-    assert!(damaged.is_empty());
+fn full_damage_covers_every_row_and_column() {
+    let damage = Damage::Full;
+    assert_eq!(
+        damage.damaged_rows(5).collect::<Vec<_>>(),
+        vec![0, 1, 2, 3, 4]
+    );
+    assert!((0..100).all(|row| damage.is_row_damaged(row)));
+    assert_eq!(damage.row_damage_bounds(5, 80), Some((0, 80)));
+    assert_eq!(damage.row_damage_bounds(0, 200), Some((0, 200)));
+    assert_eq!(
+        damage.iter_bounds(3, 80).collect::<Vec<_>>(),
+        vec![
+            LineDamageBounds::new(0, 0, 80),
+            LineDamageBounds::new(1, 0, 80),
+            LineDamageBounds::new(2, 0, 80),
+        ]
+    );
 }
 
 /// size_hint() does not panic after exhaustion.
@@ -102,219 +59,14 @@ fn damage_iterator_size_hint_after_exhaustion() {
     damage.mark_row(5);
 
     let mut iter = damage.damaged_rows(24);
-
-    let (_, upper) = iter.size_hint();
-    assert!(
-        upper.unwrap() <= 24,
-        "upper bound should not exceed total rows"
-    );
-
+    assert!(iter.size_hint().1.unwrap() <= 24);
     assert_eq!(iter.next(), Some(5));
-    assert_eq!(
-        iter.next(),
-        None,
-        "iterator should be exhausted after single damaged row"
-    );
-
-    let (lower, upper) = iter.size_hint();
-    assert_eq!(lower, 0);
-    assert_eq!(upper, Some(0));
+    assert_eq!(iter.next(), None);
+    assert_eq!(iter.size_hint(), (0, Some(0)));
 }
 
-#[test]
-fn damage_has_damage() {
-    let mut damage = Damage::new(24);
-    assert!(!damage.has_damage());
-
-    damage.mark_cell(5, 10);
-    assert!(damage.has_damage());
-
-    damage.reset(24);
-    assert!(!damage.has_damage());
-
-    damage.mark_full();
-    assert!(damage.has_damage());
-}
-
-#[test]
-fn damage_iter_bounds() {
-    let mut damage = Damage::new(24);
-    damage.mark_cell(3, 10);
-    damage.mark_cell(3, 20);
-    damage.mark_row(7);
-    damage.mark_cell(15, 5);
-
-    let bounds: Vec<_> = damage.iter_bounds(24, 80).collect();
-    assert_eq!(
-        bounds,
-        vec![
-            LineDamageBounds::new(3, 10, 21),
-            LineDamageBounds::new(7, 0, 80),
-            LineDamageBounds::new(15, 5, 6),
-        ]
-    );
-}
-
-#[test]
-fn bitset_iterator_single_word() {
-    let bits = vec![0b10101010u64]; // Bits 1, 3, 5, 7 set
-    let iter = BitsetRowIterator::new(&bits, 64);
-    let rows: Vec<_> = iter.collect();
-    assert_eq!(rows, vec![1, 3, 5, 7]);
-}
-
-#[test]
-fn bitset_iterator_multi_word() {
-    let mut bits = vec![0u64; 3];
-    bits[0] = 1; // Row 0
-    bits[1] = 1 << 5; // Row 69 (64 + 5)
-    bits[2] = 1 << 10; // Row 138 (128 + 10)
-
-    let iter = BitsetRowIterator::new(&bits, 200);
-    let rows: Vec<_> = iter.collect();
-    assert_eq!(rows, vec![0, 69, 138]);
-}
-
-#[test]
-fn bitset_iterator_respects_max() {
-    let bits = vec![u64::MAX]; // All 64 bits set
-    let iter = BitsetRowIterator::new(&bits, 10); // Only want first 10
-    let rows: Vec<_> = iter.collect();
-    assert_eq!(rows, vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
-}
-
-// State machine tests
-
-#[test]
-fn state_new_creates_partial() {
-    let damage = Damage::new(24);
-    assert!(!damage.is_full());
-    assert!(!damage.has_damage());
-}
-
-#[test]
-fn state_mark_full_transitions() {
-    let mut damage = Damage::new(24);
-    assert!(!damage.is_full());
-    damage.mark_full();
-    assert!(damage.is_full());
-    assert!(damage.has_damage());
-}
-
-#[test]
-fn state_reset_transitions_full_to_partial() {
-    let mut damage = Damage::new(24);
-    damage.mark_full();
-    assert!(damage.is_full());
-    damage.reset(24);
-    assert!(!damage.is_full());
-    assert!(!damage.has_damage());
-}
-
-#[test]
-fn state_mark_row_preserves_partial() {
-    let mut damage = Damage::new(24);
-    damage.mark_row(5);
-    assert!(!damage.is_full());
-    assert!(damage.has_damage(), "marking should record damage");
-    assert!(damage.is_row_damaged(5), "marked row should be damaged");
-}
-
-#[test]
-fn state_mark_rows_preserves_partial() {
-    let mut damage = Damage::new(24);
-    damage.mark_rows(3, 10);
-    assert!(!damage.is_full());
-    assert!(damage.has_damage(), "marking should record damage");
-    assert!(damage.is_row_damaged(5), "row in range should be damaged");
-    assert!(
-        !damage.is_row_damaged(2),
-        "row before range should not be damaged"
-    );
-}
-
-#[test]
-fn state_mark_cell_preserves_partial() {
-    let mut damage = Damage::new(24);
-    damage.mark_cell(5, 10);
-    assert!(!damage.is_full());
-    assert!(damage.has_damage(), "marking should record damage");
-    assert!(
-        damage.is_row_damaged(5),
-        "row with marked cell should be damaged"
-    );
-}
-
-#[test]
-fn state_full_operations_idempotent() {
-    let mut damage = Damage::new(24);
-    damage.mark_full();
-
-    assert!(damage.is_row_damaged(5));
-    damage.mark_row(5);
-    assert!(damage.is_full());
-    damage.mark_cell(5, 0);
-    assert!(damage.is_full());
-    damage.mark_full();
-    assert!(damage.is_full());
-}
-
-#[test]
-fn state_full_all_rows_damaged() {
-    let damage = Damage::Full;
-    for row in 0..100 {
-        assert!(damage.is_row_damaged(row));
-    }
-}
-
-#[test]
-fn state_full_row_bounds_full_width() {
-    let damage = Damage::Full;
-    assert_eq!(damage.row_damage_bounds(5, 80), Some((0, 80)));
-    assert_eq!(damage.row_damage_bounds(0, 200), Some((0, 200)));
-}
-
-#[test]
-fn state_machine_cycle() {
-    let mut damage = Damage::new(24);
-    assert!(!damage.is_full());
-    assert!(!damage.has_damage());
-
-    damage.mark_row(5);
-    assert!(!damage.is_full());
-    assert!(damage.has_damage());
-
-    damage.mark_full();
-    assert!(damage.is_full());
-    assert!(damage.has_damage());
-
-    damage.reset(24);
-    assert!(!damage.is_full());
-    assert!(!damage.has_damage());
-}
-
-#[test]
-fn state_partial_marked_is_damaged() {
-    let mut damage = Damage::new(24);
-    damage.mark_row(10);
-    assert!(damage.is_row_damaged(10));
-}
-
-// DamageBoundsIterator correctness
-
-/// DamageBoundsIterator skips rows whose column bounds fall entirely outside
-/// the visible range (`mark_cell` with col >= cols) instead of ending early.
-#[test]
-fn damage_bounds_iterator_skips_out_of_range_row() {
-    let mut damage = Damage::new(10);
-    damage.mark_cell(3, 50); // Col 50 is beyond cols=20 → bounds clamp to None
-    damage.mark_cell(5, 10); // Col 10 is within cols=20
-
-    let bounds: Vec<_> = damage.iter_bounds(10, 20).collect();
-    assert_eq!(bounds, vec![LineDamageBounds::new(5, 10, 11)]);
-}
-
-/// Multiple out-of-range rows interspersed with valid ones.
+/// Rows whose bounds fall wholly past the visible columns are skipped, not
+/// taken as the end of the iteration.
 #[test]
 fn damage_bounds_iterator_skips_multiple_out_of_range() {
     let mut damage = Damage::new(10);
@@ -334,143 +86,58 @@ fn damage_bounds_iterator_skips_multiple_out_of_range() {
     );
 }
 
-// Out-of-bounds access safety tests
-
+/// Row bounds clamp to the visible width and saturate at the `u16` edge.
 #[test]
-fn tracker_out_of_bounds_mark_row_is_safe() {
-    let mut tracker = DamageTracker::new(10);
-    tracker.mark_row(100); // Beyond capacity
-    assert!(!tracker.is_row_damaged(100));
-    assert_eq!(tracker.damaged_row_count(), 0);
-}
-
-#[test]
-fn tracker_out_of_bounds_mark_cell_is_safe() {
-    let mut tracker = DamageTracker::new(10);
-    tracker.mark_cell(100, 5); // Row beyond capacity
-    assert!(!tracker.is_row_damaged(100));
-}
-
-#[test]
-fn tracker_out_of_bounds_is_row_damaged_returns_false() {
-    let tracker = DamageTracker::new(10);
-    assert!(!tracker.is_row_damaged(10)); // Exactly at capacity
-    assert!(!tracker.is_row_damaged(100)); // Way beyond
-}
-
-#[test]
-fn tracker_out_of_bounds_row_damage_bounds_returns_none() {
-    let tracker = DamageTracker::new(10);
-    assert_eq!(tracker.row_damage_bounds(10), None);
-    assert_eq!(tracker.row_damage_bounds(100), None);
-}
-
-#[test]
-fn mark_rows_range_behavior() {
-    let mut damage = Damage::new(24);
-    damage.mark_rows(5, 10);
-
-    for row in 0..5 {
-        assert!(
-            !damage.is_row_damaged(row),
-            "row {row} should not be damaged"
-        );
-    }
-    for row in 5..10 {
-        assert!(damage.is_row_damaged(row), "row {row} should be damaged");
-    }
-    for row in 10..24 {
-        assert!(
-            !damage.is_row_damaged(row),
-            "row {row} should not be damaged"
-        );
-    }
-}
-
-#[test]
-fn mark_rows_empty_range() {
-    let mut damage = Damage::new(24);
-    damage.mark_rows(5, 5); // empty range
-    assert!(!damage.has_damage());
-}
-
-#[test]
-fn row_damage_bounds_small_cols_clamps_to_none() {
+fn row_damage_bounds_clamp_and_saturate() {
     let mut damage = Damage::new(10);
-    damage.mark_cell(3, 50); // cell at column 50
-    assert_eq!(damage.row_damage_bounds(3, 10), None);
-}
-
-#[test]
-fn row_damage_bounds_partial_clamp() {
-    let mut damage = Damage::new(10);
-    damage.mark_cell(3, 5);
-    damage.mark_cell(3, 50); // beyond cols
-    assert_eq!(damage.row_damage_bounds(3, 20), Some((5, 20)));
-}
-
-#[test]
-fn row_damage_bounds_near_u16_max_boundary() {
-    let mut damage = Damage::new(4);
+    damage.mark_row(3);
+    assert_eq!(damage.row_damage_bounds(3, 80), Some((0, 80)), "whole row");
+    damage.mark_cell(4, 5);
+    damage.mark_cell(4, 50);
+    assert_eq!(
+        damage.row_damage_bounds(4, 20),
+        Some((5, 20)),
+        "partial clamp"
+    );
+    damage.mark_cell(2, u16::MAX - 2);
     damage.mark_cell(2, u16::MAX - 1);
     assert_eq!(
         damage.row_damage_bounds(2, u16::MAX),
-        Some((u16::MAX - 1, u16::MAX))
+        Some((u16::MAX - 2, u16::MAX)),
+        "near u16::MAX"
     );
-}
 
-#[test]
-fn row_damage_bounds_merge_near_u16_max_boundary() {
-    let mut damage = Damage::new(4);
-    damage.mark_cell(1, u16::MAX - 2);
-    damage.mark_cell(1, u16::MAX - 1);
-    assert_eq!(
-        damage.row_damage_bounds(1, u16::MAX),
-        Some((u16::MAX - 2, u16::MAX))
-    );
-}
-
-#[test]
-fn tracker_mark_cell_u16_max_saturates_right_bound() {
     let mut tracker = DamageTracker::new(2);
     tracker.mark_cell(1, u16::MAX);
     assert_eq!(tracker.row_damage_bounds(1), Some((u16::MAX, u16::MAX)));
 }
 
 #[test]
-fn damaged_row_count() {
-    let mut tracker = DamageTracker::new(100);
-    assert_eq!(tracker.damaged_row_count(), 0);
-
-    tracker.mark_row(5);
-    tracker.mark_row(50);
-    tracker.mark_row(99);
-    assert_eq!(tracker.damaged_row_count(), 3);
-
-    // Marking same row again doesn't change count
-    tracker.mark_row(5);
-    assert_eq!(tracker.damaged_row_count(), 3);
+fn mark_rows_range_behavior() {
+    let mut damage = Damage::new(24);
+    damage.mark_rows(5, 5); // empty range
+    assert!(!damage.has_damage());
+    damage.mark_rows(5, 10);
+    for row in 0..24 {
+        assert_eq!(
+            damage.is_row_damaged(row),
+            (5..10).contains(&row),
+            "row {row}"
+        );
+    }
 }
 
-// DamageTracker::clear() behavioral equivalence
-
-/// clear() produces the same observable state as constructing a fresh tracker.
+/// Marks and queries past the tracker's rows are ignored, never a panic.
 #[test]
-fn tracker_clear_equivalent_to_new_same_size() {
-    let mut tracker = DamageTracker::new(100);
-    tracker.mark_row(5);
-    tracker.mark_row(50);
-    tracker.mark_cell(99, 42);
-
-    tracker.clear(100);
-    let fresh = DamageTracker::new(100);
-
-    assert_eq!(tracker.row_bits, fresh.row_bits);
+fn tracker_ignores_rows_past_its_capacity() {
+    let mut tracker = DamageTracker::new(10);
+    tracker.mark_row(100);
+    tracker.mark_cell(100, 5);
     assert_eq!(tracker.damaged_row_count(), 0);
-    assert!(!tracker.is_row_damaged(5));
-    assert!(!tracker.is_row_damaged(50));
-    assert!(!tracker.is_row_damaged(99));
-    assert_eq!(tracker.row_damage_bounds(99), None);
+    for row in [10, 100] {
+        assert!(!tracker.is_row_damaged(row));
+        assert_eq!(tracker.row_damage_bounds(row), None);
+    }
 }
 
 /// clear() with a different row count resizes correctly.
@@ -490,54 +157,22 @@ fn tracker_clear_resizes_on_row_count_change() {
     assert!(tracker.is_row_damaged(99));
 }
 
-/// Damage::reset reuses allocations in the Partial→Partial path.
+/// Damage::reset reuses allocations in the Partial→Partial path without
+/// carrying stale rows or column bounds.
 #[test]
 fn damage_reset_reuses_allocation_partial_to_partial() {
     let mut damage = Damage::new(24);
     damage.mark_row(5);
     damage.mark_cell(10, 30);
+    damage.mark_cell(3, 70);
 
     damage.reset(24);
-    assert!(!damage.is_full());
     assert!(!damage.has_damage());
     assert!(!damage.is_row_damaged(5));
     assert!(!damage.is_row_damaged(10));
 
     damage.mark_cell(3, 7);
-    assert!(damage.has_damage());
-    assert!(damage.is_row_damaged(3));
     assert_eq!(damage.row_damage_bounds(3, 80), Some((7, 8)));
-}
-
-/// Damage::reset from Full state creates fresh tracker.
-#[test]
-fn damage_reset_from_full_creates_fresh() {
-    let mut damage = Damage::Full;
-    assert!(damage.is_full());
-
-    damage.reset(24);
-    assert!(!damage.is_full());
-    assert!(!damage.has_damage());
-
-    damage.mark_row(0);
-    assert!(damage.has_damage());
-    assert!(damage.is_row_damaged(0));
-}
-
-/// Repeated reset cycles don't accumulate stale state.
-#[test]
-fn damage_reset_repeated_cycles() {
-    let mut damage = Damage::new(24);
-    for cycle in 0..100u16 {
-        let row = cycle % 24;
-        damage.mark_row(row);
-        assert!(damage.is_row_damaged(row));
-        damage.reset(24);
-        assert!(
-            !damage.has_damage(),
-            "cycle {cycle}: damage should be clear after reset"
-        );
-    }
 }
 
 /// The row and bounds iterators are exact: `BitsetRowIterator` yields exactly
@@ -595,5 +230,42 @@ fn bitset_and_bounds_iterators_are_exact() {
                 }
             }
         }
+    }
+}
+
+/// Random cell marks: the damaged rows and per-row column bounds are exactly
+/// the rows marked and the min/max column marked in each.
+#[test]
+fn mark_random_cells_tracks_expected_rows_and_bounds() {
+    const ROWS: u16 = 64;
+    const COLS: u16 = 128;
+    let mut rng = aterm_spec::rng::XorShift::new(0xDA3A_6E00_0BAD_F00D);
+    let mut next = move |n: u64| rng.below(n);
+    for _ in 0..256 {
+        let mut damage = Damage::new(ROWS);
+        let mut expected = BTreeMap::<u16, (u16, u16)>::new();
+        for _ in 0..next(256) {
+            let (row, col) = (next(64) as u16, next(128) as u16);
+            damage.mark_cell(row, col);
+            expected
+                .entry(row)
+                .and_modify(|(left, right)| {
+                    *left = (*left).min(col);
+                    *right = (*right).max(col.saturating_add(1));
+                })
+                .or_insert((col, col.saturating_add(1)));
+        }
+
+        let expected_rows: Vec<_> = expected.keys().copied().collect();
+        let actual_rows: Vec<_> = damage.damaged_rows(ROWS).collect();
+        assert_eq!(actual_rows, expected_rows);
+
+        let expected_bounds: Vec<_> = expected
+            .iter()
+            .map(|(&line, &(left, right))| LineDamageBounds::new(line, left, right.min(COLS)))
+            .filter(|bounds| !bounds.is_empty())
+            .collect();
+        let actual_bounds: Vec<_> = damage.iter_bounds(ROWS, COLS).collect();
+        assert_eq!(actual_bounds, expected_bounds);
     }
 }

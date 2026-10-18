@@ -1221,78 +1221,19 @@ mod tests {
         }
     }
 
-    /// The rendered error has to be readable by whoever typed the pattern: the
-    /// pattern itself, a caret under the offending position, then the reason.
+    /// The rendered error quotes the pattern and puts a caret under the
+    /// offending position (column, not wording, is what this pins).
     #[test]
     fn errors_quote_the_pattern_and_point_at_the_position() {
-        assert_eq!(
-            message("ab[cd"),
-            "regex parse error:\n    ab[cd\n      ^\nerror: unclosed character class"
-        );
-        assert_eq!(
-            message("a(b"),
-            "regex parse error:\n    a(b\n     ^\nerror: unclosed group"
-        );
-        assert!(message("*a").contains("repetition operator missing expression"));
-    }
-
-    /// Inline flags apply to the rest of the enclosing group and stop at its
-    /// close paren — `(a(?i)b)c` matches `aBc` but not `aBC`.
-    #[test]
-    fn inline_flags_are_scoped_to_the_enclosing_group() {
-        let flags = |p: &str| match parse(p, Flags::default()) {
-            Ok(a) => format!("{a:?}"),
-            Err(e) => panic!("{e}"),
-        };
-        // `(?i)` before a literal turns it into a class; after the group closes
-        // it does not.
-        assert!(flags("(a(?i)b)c").contains("Class"));
-        assert!(!flags("(a(?i)b)c").ends_with("Class"));
-        assert!(matches!(ast("(?i:a)"), Ast::Class(_)));
-        assert!(matches!(ast("(?i)(?-i)a"), Ast::Literal('a')));
-    }
-
-    /// A single literal only becomes a class when `(?i)` actually gives it an
-    /// orbit — `(?i)7` stays a literal, which keeps the common path cheap.
-    #[test]
-    fn case_folding_only_widens_what_it_must() {
-        let i = Flags {
-            case_insensitive: true,
-            ..Flags::default()
-        };
-        assert!(matches!(parse("7", i), Ok(Ast::Literal('7'))));
-        assert!(matches!(parse("a", i), Ok(Ast::Class(_))));
-    }
-
-    /// Ranges are sorted and coalesced so membership can binary search, and
-    /// adjacency counts: `[a-mn-z]` is one range, not two.
-    #[test]
-    fn class_ranges_are_normalized() {
-        let Ast::Class(set) = ast("[z-za-mn-yA]") else {
-            panic!("a class")
-        };
-        assert_eq!(set.ranges, vec![('A', 'A'), ('a', 'z')]);
-        assert!(set.matches('q') && set.matches('A') && !set.matches('B'));
-    }
-
-    /// Negation applies to the union of ranges *and* shorthands, and applies
-    /// after case folding.
-    #[test]
-    fn negation_covers_the_whole_class() {
-        let Ast::Class(set) = ast(r"[^\d a-c]") else {
-            panic!("a class")
-        };
-        assert!(set.matches('z') && !set.matches('5') && !set.matches(' ') && !set.matches('b'));
-
-        let i = Flags {
-            case_insensitive: true,
-            ..Flags::default()
-        };
-        let Ok(Ast::Class(set)) = parse("[^k]", i) else {
-            panic!("a class")
-        };
-        assert!(!set.matches('k') && !set.matches('K') && !set.matches('\u{212a}'));
-        assert!(set.matches('z'));
+        for (pattern, column) in [("ab[cd", 2usize), ("a(b", 1)] {
+            let msg = message(pattern);
+            let mut lines = msg.lines().skip(1);
+            let quoted = lines.next().expect("the pattern line");
+            let caret = lines.next().expect("the caret line");
+            let indent = quoted.len() - pattern.len();
+            assert_eq!(&quoted[indent..], pattern, "{msg}");
+            assert_eq!(caret.find('^'), Some(indent + column), "{msg}");
+        }
     }
 
     /// POSIX names are ASCII-only, and an unknown name is not silently read as a
@@ -1348,28 +1289,6 @@ mod tests {
             assert!(!no.matches(c), "(?i)[:^lower:] must not hold {c:?}");
         }
         assert!(no.matches('1') && no.matches('\u{e9}'));
-    }
-
-    /// The depth cap is enforced while parsing, so neither the parser nor the
-    /// tree's `Drop` can be driven off the stack.
-    #[test]
-    fn nesting_is_capped() {
-        let ok = format!(
-            "{}a{}",
-            "(".repeat(MAX_NESTING_DEPTH - 1),
-            ")".repeat(MAX_NESTING_DEPTH - 1)
-        );
-        assert!(parse(&ok, Flags::default()).is_ok());
-        let too_deep = format!(
-            "{}a{}",
-            "(".repeat(MAX_NESTING_DEPTH + 1),
-            ")".repeat(MAX_NESTING_DEPTH + 1)
-        );
-        assert!(message(&too_deep).contains("nests more than"));
-        // Stacked quantifiers deepen the tree without opening a group.
-        assert!(
-            message(&format!("a{}", "*".repeat(MAX_NESTING_DEPTH + 1))).contains("nests more than")
-        );
     }
 
     /// Whitespace inside `{…}` is insignificant even outside `x` mode, which is

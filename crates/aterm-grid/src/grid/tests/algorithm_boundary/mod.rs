@@ -8,7 +8,6 @@
 use super::super::*;
 use crate::grid::test_support::write_marker_line;
 
-mod erase;
 mod history_extras;
 mod pending_wrap;
 mod resize_and_invariants;

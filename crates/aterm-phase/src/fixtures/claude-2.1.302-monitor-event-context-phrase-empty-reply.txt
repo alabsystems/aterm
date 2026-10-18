@@ -1,0 +1,25 @@
+# claude-code 2.1.302 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a Monitor whose command printed 'Context limit reached · /compact or /clear to continue', its event row the last thing said: the reply to the event EMPTY (a custom stub mode streaming no text), the monitor still running
+ ▐▛███▛█   Claude Code v2.1.302
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ /clear
+
+❯ toolstart
+
+⏺ Monitor(context watch)
+  ⎿  Monitor started · task bsmnr56u2 · timeout 1800s
+
+⏺ Tool call done.
+
+✻ Cogitated for 0s · done 7:11 PM · 1 monitor still running
+
+⏺ Monitor event: Context limit reached · /compact or /clear to continue · context watch
+
+✻ Brewed for 0s · done 7:11 PM · 1 monitor still running
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · 1 monitor · ↓ to manage

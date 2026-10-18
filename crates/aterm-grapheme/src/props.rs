@@ -192,6 +192,22 @@ pub fn script(c: char) -> Script {
         .map_or(Script::UNKNOWN, Script)
 }
 
+/// The `Script` property as the runs it is stored in: `(first, script)` for
+/// each run, ascending from U+0000, a run ending where the next begins and the
+/// last at U+10FFFF, so [`script`] of a code point is the script of the last
+/// run that starts at or below it. For a caller that counts which of many code
+/// points carry a script (a font's cmap) without a lookup per code point.
+pub fn script_runs() -> impl Iterator<Item = (u32, Script)> {
+    SCRIPT_RUNS.iter().map(|&e| {
+        let index = usize::from((e & 0xFF) as u8);
+        let script = SCRIPT_CODES
+            .get(index)
+            .copied()
+            .map_or(Script::UNKNOWN, Script);
+        (e >> 8, script)
+    })
+}
+
 /// The `General_Category` property of `c`.
 #[must_use]
 pub fn general_category(c: char) -> GeneralCategory {
@@ -240,6 +256,24 @@ mod tests {
         assert_eq!(general_category('\0'), G::Control);
         assert!(G::SpacingMark.is_mark() && !G::Format.is_mark());
         assert!(G::ModifierLetter.is_letter() && !G::LetterNumber.is_letter());
+    }
+
+    /// [`script_runs`] is [`script`] run by run: every code point of a run,
+    /// both ends included, has the run's script, and runs are contiguous from
+    /// U+0000.
+    #[test]
+    fn script_runs_answer_what_script_answers() {
+        let runs: Vec<(u32, Script)> = script_runs().collect();
+        assert_eq!(runs.first().map(|r| r.0), Some(0));
+        let mut checked = 0u32;
+        for (i, &(first, run_script)) in runs.iter().enumerate() {
+            let end = runs.get(i + 1).map_or(0x11_0000, |r| r.0);
+            for cp in (first..end).filter_map(char::from_u32) {
+                assert_eq!(script(cp), run_script, "U+{:04X}", u32::from(cp));
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 0x11_0000 - 0x800, "every scalar value, once");
     }
 
     /// Every run table is sorted by start, its first run starts at U+0000, and

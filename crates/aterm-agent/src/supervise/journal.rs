@@ -16,14 +16,17 @@
 //!  "phase":"idle|question|prompt|limited|survey|context|compacted|turn|idle-no-report|
 //!           <rule id>|resumed|still-limited|rebriefed|rebrief-failed|-",
 //!  "seq":<n>|null,"complete":0|1|null,"rows":<n>|null,"summary":"<the line's free-text tail>",
-//!  "line":"<the exact line>","turn":<id>|null,"report":<id>|null}
+//!  "line":"<the exact line>","turn":<id>|null,"report":<id>|null[,"mark":"<16 hex>"]}
 //! ```
 //!
 //! read from the line itself ([`JournalRecord::of_line`]), so record and line cannot disagree.
 //! An `EVENT`'s phase is its second word; a policy line's is its `rule=<id>` where it names
 //! one. `turn` is the ledger turn the point's report was counted from (`watch --report`);
 //! `report` is the inbox row id of the report `watch --mail` folded into an `EVENT turn`
-//! line, whose `rows=` is that body's row count.
+//! line, whose `rows=` is that body's row count. `mark`, on a review point's `EVENT` alone and
+//! only where the worker's last words were read there, is their mark
+//! (`policy::turn_end::said_mark`): what the next loop compares a landing's point with
+//! (`run.rs`'s `landed_before`), never printed.
 //!
 //! Some lines are journal-only, never printed (`Review::note`): `ESCALATED`, `CLEARED`,
 //! `WAITING`, `UNVERIFIED`, most `SKIPPED`, `UNPROVEN` (after a full-power `APPROVED`: why no
@@ -61,7 +64,8 @@ pub const CLEARED_BOX: &str = "box";
 /// once the worker works again.
 pub const CLEARED_TURN_END: &str = "turn-end";
 /// … `CLEARED seq=<n> goal attention=<reply>`: the note that Codex's goal
-/// runs on under a save-then-wait switch.
+/// runs on under a save-then-wait switch, written by older loops (the Codex
+/// harness is retired) and still read in their journals.
 pub const CLEARED_GOAL: &str = "goal";
 /// … `CLEARED seq=<n> memory attention=<reply>: …`: the memory measure's,
 /// no longer acted on.
@@ -125,7 +129,7 @@ pub const MAIL_ADOPTED: &str = "skipped: adopted from a previous watcher";
 /// Off park ends (`lifecycle.rs`'s `raise_parked_badge`): the badge the park
 /// took down, up again with no second ask of its own — `mail=skipped: set
 /// again after an off park`. Most such badges no point raises again
-/// (`/login`'s, a switch's note, a sandbox fall); one an act's own miss
+/// (`/login`'s); one an act's own miss
 /// raised (a text not written or left typed, a draft with no fenced Enter)
 /// may be escalated again after this line, by its act decided afresh and
 /// missing again — its own `ESCALATED` line and ask.
@@ -159,6 +163,10 @@ pub struct JournalRecord {
     pub turn: Option<u64>,
     /// The inbox row id of the report folded into an `EVENT turn` line.
     pub report: Option<u64>,
+    /// The mark of the worker's last words at a review point
+    /// (`policy::turn_end::said_mark`), `None` on every other line and where
+    /// no words were read.
+    pub mark: Option<u64>,
 }
 
 /// The first word of `s` and the rest after one space.
@@ -191,6 +199,7 @@ impl JournalRecord {
             line: line.to_string(),
             turn,
             report: None,
+            mark: None,
         };
         let (word, rest) = split_word(line);
         let mut tail = rest;
@@ -273,13 +282,17 @@ impl JournalRecord {
         rec
     }
 
-    /// One JSON object, no newline, keys in the order the module doc lists.
+    /// One JSON object, no newline, keys in the order the module doc lists
+    /// (`mark` only where there is one).
     pub fn to_json(&self) -> String {
         let opt_str = |s: &Option<String>| s.as_deref().map_or("null".to_string(), json_str);
         let opt_num = |n: Option<u64>| n.map_or("null".to_string(), |n| n.to_string());
+        let mark = self
+            .mark
+            .map_or_else(String::new, |m| format!(",\"mark\":\"{m:016x}\""));
         format!(
             "{{\"t\":{},\"sid\":{},\"kind\":{},\"phase\":{},\"seq\":{},\"complete\":{},\
-             \"rows\":{},\"summary\":{},\"line\":{},\"turn\":{},\"report\":{}}}",
+             \"rows\":{},\"summary\":{},\"line\":{},\"turn\":{},\"report\":{}{mark}}}",
             self.t,
             opt_str(&self.sid),
             json_str(&self.kind),
@@ -316,6 +329,7 @@ impl JournalRecord {
             line: s("line").ok_or("no \"line\"")?,
             turn: n("turn"),
             report: n("report"),
+            mark: s("mark").and_then(|h| u64::from_str_radix(&h, 16).ok()),
         })
     }
 }
@@ -358,6 +372,21 @@ impl Journal {
         }
     }
 
+    /// A journal at `path` for a loop on `sid` that is NAMED and never
+    /// opened: [`Self::record`] returns each row it would write and writes
+    /// none, and nothing is said. What a REPLAY's loop keeps
+    /// (`supervise::tape::replay`): its rows are outputs it compares with the
+    /// recorded ones, and the directory the path names does not exist.
+    #[must_use]
+    pub fn named(path: Option<&Path>, sid: Option<&str>) -> Self {
+        let mut j = Self::off();
+        if let Some(path) = path {
+            j.path = Some(path.to_path_buf());
+            j.sid = sid.map(str::to_string);
+        }
+        j
+    }
+
     /// Open `path` append-only (created `0600` when missing) for a loop on
     /// `sid`; no path is no journal. A failure to open it is said once, to
     /// `warn`, and the loop goes on without one.
@@ -377,28 +406,58 @@ impl Journal {
         }
         match o.open(path) {
             Ok(f) => j.file = Some(f),
-            Err(e) => j.warn(&format!("cannot open it: {e}"), warn),
+            Err(e) => j.failed(&e, "cannot open it", warn),
         }
         j
     }
 
-    /// Append the record of `line` (see [`JournalRecord::of_line`]). A write
-    /// that fails is said once, to `warn`; the next line is tried all the
-    /// same.
-    pub fn record(&mut self, line: &str, turn: Option<u64>, warn: &mut dyn Write) {
-        if self.path.is_none() {
-            return;
-        }
-        let rec = JournalRecord::of_line(unix_ms(), self.sid.as_deref(), line, turn);
+    /// Append the record of `line` (see [`JournalRecord::of_line`]), stamped
+    /// `t_ms` (Unix milliseconds, from the caller's clock: the supervising
+    /// loop's stamp clock, `Fx::stamp_ms` behind its crate-private clock door
+    /// `supervise::fx`; [`unix_ms`] elsewhere). A write that
+    /// fails is said once, to `warn`; the next line is tried all the same.
+    /// Returns the row it wrote (its newline included) — or would have
+    /// written, to a file it could not open — for a journal it was given;
+    /// `None` with none: what a harness tape holds of the journal.
+    pub fn record(
+        &mut self,
+        t_ms: i64,
+        line: &str,
+        turn: Option<u64>,
+        warn: &mut dyn Write,
+    ) -> Option<String> {
+        self.record_marked(t_ms, line, turn, None, warn)
+    }
+
+    /// [`Self::record`] of a review point's line, with the mark of the
+    /// worker's last words there ([`JournalRecord::mark`]).
+    pub fn record_marked(
+        &mut self,
+        t_ms: i64,
+        line: &str,
+        turn: Option<u64>,
+        mark: Option<u64>,
+        warn: &mut dyn Write,
+    ) -> Option<String> {
+        self.path.as_ref()?;
+        let mut rec = JournalRecord::of_line(t_ms, self.sid.as_deref(), line, turn);
+        rec.mark = mark;
         let mut text = rec.to_json();
         text.push('\n');
         let res = match self.file.as_mut() {
             Some(f) => f.write_all(text.as_bytes()).and_then(|()| f.flush()),
-            None => return,
+            None => return Some(text),
         };
         if let Err(e) = res {
-            self.warn(&format!("cannot append to it: {e}"), warn);
+            self.failed(&e, "cannot append to it", warn);
         }
+        Some(text)
+    }
+
+    /// Whether a journal was given (a file named, opened or not).
+    #[must_use]
+    pub fn is_on(&self) -> bool {
+        self.path.is_some()
     }
 
     /// Append one line that is already a JSON object (the approval ledger's rows,
@@ -414,10 +473,27 @@ impl Journal {
             None => return false,
         };
         if let Err(e) = res {
-            self.warn(&format!("cannot append to it: {e}"), warn);
+            self.failed(&e, "cannot append to it", warn);
             return false;
         }
         true
+    }
+
+    /// A write that failed: said once ([`Self::warn`]), and when the file
+    /// system is out of space or quota, the window's disk watch is asked to
+    /// look now ([`crate::harness::disk::poke`]) — aterm's own failing write
+    /// is a sighting of the full disk like an agent's screen.
+    fn failed(&mut self, e: &std::io::Error, what: &str, warn: &mut dyn Write) {
+        if crate::harness::disk::poke::is_out_of_space(e) {
+            let path = self
+                .path
+                .as_deref()
+                .map_or_else(String::new, |p| p.display().to_string());
+            crate::harness::disk::poke::poke_now(crate::harness::disk::poke::Cause::Write(
+                format!("journal {path}: {e}"),
+            ));
+        }
+        self.warn(&format!("{what}: {e}"), warn);
     }
 
     fn warn(&mut self, why: &str, warn: &mut dyn Write) {
@@ -455,243 +531,193 @@ pub fn read_journal(path: &Path) -> Result<(Vec<JournalRecord>, usize), String> 
 mod tests {
     use super::*;
 
-    /// Every kind of line the loops print, read into its record.
+    /// Every kind of line the loops print, read into its kind, phase, `seq=`
+    /// and free-text tail: one row per arm of the reader. A `rule=` is the
+    /// phase; a word nothing here knows (or a lowercase one) is `other`, its
+    /// line whole.
     #[test]
     fn each_printed_line_is_read_into_its_fields() {
         let rec = |line: &str| JournalRecord::of_line(7, Some("@s-1"), line, None);
-        let r = rec("EVENT idle seq=106 complete=1 rows=689 ⏺ Done.");
-        assert_eq!(
+        for (line, kind, phase, seq, summary) in [
             (
-                r.kind.as_str(),
-                r.phase.as_str(),
-                r.seq,
-                r.complete,
-                r.rows,
-                r.summary.as_str()
-            ),
-            ("event", "idle", Some(106), Some(true), Some(689), "⏺ Done.")
-        );
-        assert_eq!(r.sid.as_deref(), Some("s-1"));
-        let r = rec("EVENT question seq=104 ⏺ Keep the harness or rewrite it?");
-        assert_eq!(
-            (
-                r.phase.as_str(),
-                r.seq,
-                r.complete,
-                r.rows,
-                r.summary.as_str()
+                "EVENT idle seq=106 complete=1 rows=689 ⏺ Done.",
+                "event",
+                "idle",
+                Some(106),
+                "⏺ Done.",
             ),
             (
+                "EVENT question seq=104 ⏺ Keep it?",
+                "event",
                 "question",
                 Some(104),
-                None,
-                None,
-                "⏺ Keep the harness or rewrite it?"
-            )
-        );
-        let r = rec("EVENT prompt seq=101 kind=bash classify=not-read-only:rm command=rm -rf x");
-        assert_eq!(
-            (r.phase.as_str(), r.summary.as_str()),
-            (
-                "prompt",
-                "kind=bash classify=not-read-only:rm command=rm -rf x"
-            )
-        );
-        let r = rec("EVENT context seq=101 9% until auto-compact");
-        assert_eq!(
-            (r.phase.as_str(), r.summary.as_str()),
-            ("context", "9% until auto-compact")
-        );
-        let r = rec("EVENT compacted seq=102");
-        assert_eq!(
-            (r.phase.as_str(), r.seq, r.summary.as_str()),
-            ("compacted", Some(102), "")
-        );
-        let r = rec(
-            "EVENT survey seq=9 dismiss with: aterm ctl @s-1 key 'if=^●.How.is.Claude.doing' 0",
-        );
-        assert_eq!(r.phase, "survey");
-        assert!(r.summary.starts_with("dismiss with: aterm ctl @s-1"));
-        let r = rec("APPROVED seq=102 git log --oneline -5");
-        assert_eq!(
-            (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
-            ("approved", "prompt", Some(102), "git log --oneline -5")
-        );
-        let r = rec("DISMISSED survey seq=31");
-        assert_eq!(
-            (r.kind.as_str(), r.phase.as_str(), r.seq),
-            ("dismissed", "survey", Some(31))
-        );
-        let r = rec("RECONNECT await seq 7 failed: server closed the connection");
-        assert_eq!(
-            (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
-            (
-                "reconnect",
-                "-",
-                None,
-                "await seq 7 failed: server closed the connection"
-            )
-        );
-        let r = rec("RECONNECTED after 1834 ms");
-        assert_eq!(
-            (r.kind.as_str(), r.summary.as_str()),
-            ("reconnect", "after 1834 ms")
-        );
-        let r = rec("TIMEOUT");
-        assert_eq!(
-            (r.kind.as_str(), r.phase.as_str(), r.summary.as_str()),
-            ("timeout", "-", "")
-        );
-        let r = rec("EXIT session gone (await seq 106 failed: aterm-ctl: ERR exited)");
-        assert_eq!(
-            (r.kind.as_str(), r.summary.as_str()),
-            (
-                "exit",
-                "session gone (await seq 106 failed: aterm-ctl: ERR exited)"
-            )
-        );
-        // `watch --mail`'s lines: a delivery, a turn with its report folded in, an idle with none.
-        let r = rec("MAIL id=5 off=91 from=s-1@n-1 kind=report len=2048 re=88");
-        assert_eq!(
-            (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
-            (
-                "mail",
-                "-",
-                None,
-                "id=5 off=91 from=s-1@n-1 kind=report len=2048 re=88"
-            )
-        );
-        let r = rec("EVENT turn seq=106 report=5 rows=12 ⏺ Done.");
-        assert_eq!(
-            (
-                r.kind.as_str(),
-                r.phase.as_str(),
-                r.seq,
-                r.report,
-                r.rows,
-                r.complete,
-                r.summary.as_str()
+                "⏺ Keep it?",
             ),
             (
+                "EVENT compacted seq=102",
+                "event",
+                "compacted",
+                Some(102),
+                "",
+            ),
+            (
+                "EVENT turn seq=106 report=5 rows=12 ⏺ Done.",
                 "event",
                 "turn",
                 Some(106),
-                Some(5),
-                Some(12),
-                None,
-                "⏺ Done."
-            )
-        );
-        let r = rec("EVENT idle-no-report seq=106 complete=1 rows=689 ⏺ Done.");
-        assert_eq!(
-            (r.phase.as_str(), r.report, r.complete, r.rows),
-            ("idle-no-report", None, Some(true), Some(689))
-        );
-        // The limit episode's lines: printed and journal-only.
-        let r = rec("EXTEND until=2026-09-19T18:10:00Z reset=Sep 19 at 11am (America/Los_Angeles)");
-        assert_eq!(
-            (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
+                "⏺ Done.",
+            ),
             (
+                "APPROVED seq=102 git log --oneline -5",
+                "approved",
+                "prompt",
+                Some(102),
+                "git log --oneline -5",
+            ),
+            (
+                "DISMISSED survey seq=31",
+                "dismissed",
+                "survey",
+                Some(31),
+                "",
+            ),
+            (
+                "RECONNECT await seq 7 failed: closed",
+                "reconnect",
+                "-",
+                None,
+                "await seq 7 failed: closed",
+            ),
+            (
+                "RECONNECTED after 1834 ms",
+                "reconnect",
+                "-",
+                None,
+                "after 1834 ms",
+            ),
+            ("TIMEOUT", "timeout", "-", None, ""),
+            ("EXIT session gone", "exit", "-", None, "session gone"),
+            (
+                "MAIL id=5 off=91 kind=report",
+                "mail",
+                "-",
+                None,
+                "id=5 off=91 kind=report",
+            ),
+            (
+                "EXTEND until=2026-09-19T18:10:00Z",
                 "extend",
                 "-",
                 None,
-                "until=2026-09-19T18:10:00Z reset=Sep 19 at 11am (America/Los_Angeles)"
-            )
-        );
-        let r = rec("ESCALATED seq=102 attention=OK mail=OK 7 off=91");
-        assert_eq!(
-            (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
-            ("escalated", "-", Some(102), "attention=OK mail=OK 7 off=91")
-        );
-        let r = rec("CLEARED seq=104 attention=OK resumed");
-        assert_eq!(
-            (r.kind.as_str(), r.seq, r.summary.as_str()),
-            ("cleared", Some(104), "attention=OK resumed")
-        );
-        // The turn-end policy's lines: the rule id is the phase.
-        let r = rec("CONTINUED seq=102 rule=usage-resume@v1 keep going");
-        assert_eq!(
-            (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
-            ("continued", "usage-resume@v1", Some(102), "keep going")
-        );
-        let r = rec("UNPROVEN seq=12 rule=allow-once@v1 unproven: not read-only: touch");
-        assert_eq!(
-            (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
+                "until=2026-09-19T18:10:00Z",
+            ),
             (
-                "unproven",
-                "allow-once@v1",
-                Some(12),
-                "unproven: not read-only: touch"
-            )
-        );
-        let r =
-            rec("CHOSE seq=40 rule=answer-recommended@v1 policy=recommended Which colour? → Blue");
-        assert_eq!(
-            (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
-            (
-                "chose",
-                "answer-recommended@v1",
-                Some(40),
-                "policy=recommended Which colour? → Blue"
-            )
-        );
-        // The accounts probe's line. Controls: the legacy `PROBE …` is still `probe`; an unknown
-        // word is `other`, its line whole.
-        let r = rec("PROBED seq=102 rule=usage-probe@v1 /usage session=1% week=10%");
-        assert_eq!(
-            (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
-            (
-                "probed",
-                "usage-probe@v1",
+                "ESCALATED seq=102 attention=OK",
+                "escalated",
+                "-",
                 Some(102),
-                "/usage session=1% week=10%"
-            )
-        );
-        let r = rec("PROBED seq=102 rule=usage-probe@v1 /usage no sample (fold)");
-        assert_eq!(
-            (r.kind.as_str(), r.phase.as_str(), r.summary.as_str()),
-            ("probed", "usage-probe@v1", "/usage no sample (fold)")
-        );
-        // A limit reset's lines, and a reset passed over as a `skipped`. Control: the lowercase
-        // word is `other`.
-        for (line, summary) in [
+                "attention=OK",
+            ),
             (
-                "RESET seq=41 rule=limit-reset@v1 confirmed (Refills your weekly limit now)",
-                "confirmed (Refills your weekly limit now)",
+                "CLEARED seq=91 exception=spend",
+                "cleared",
+                "-",
+                Some(91),
+                "exception=spend",
+            ),
+            (
+                "EXCEPTION seq=88 kind=spend when=later x",
+                "exception",
+                "-",
+                Some(88),
+                "kind=spend when=later x",
+            ),
+            (
+                "CONTINUED seq=102 rule=usage-resume@v1 keep going",
+                "continued",
+                "usage-resume@v1",
+                Some(102),
+                "keep going",
             ),
             (
                 "RESET seq=41 rule=limit-reset@v1 used (1 left)",
+                "reset",
+                "limit-reset@v1",
+                Some(41),
                 "used (1 left)",
             ),
             (
-                "RESET seq=41 rule=limit-reset@v1 kept (inexact-early)",
-                "kept (inexact-early)",
+                "WAITING seq=9 until=2026-09-19T18:10:00Z overloaded",
+                "waiting",
+                "-",
+                Some(9),
+                "until=2026-09-19T18:10:00Z overloaded",
             ),
-            ("RESET seq=41 rule=limit-reset@v1 unread", "unread"),
+            (
+                "PROBE deferred seq=102 text is typed",
+                "probe",
+                "deferred",
+                Some(102),
+                "text is typed",
+            ),
+            (
+                "PROBE skipped gate=not-live",
+                "probe",
+                "skipped",
+                None,
+                "gate=not-live",
+            ),
+            (
+                "PROBING seq=102 rule=usage-probe@v1 /usage",
+                "other",
+                "-",
+                None,
+                "PROBING seq=102 rule=usage-probe@v1 /usage",
+            ),
+            (
+                "reset seq=41 rule=limit-reset@v1 unread",
+                "other",
+                "-",
+                None,
+                "reset seq=41 rule=limit-reset@v1 unread",
+            ),
         ] {
             let r = rec(line);
             assert_eq!(
                 (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
-                ("reset", "limit-reset@v1", Some(41), summary)
+                (kind, phase, seq, summary),
+                "{line}"
+            );
+            assert_eq!(r.sid.as_deref(), Some("s-1"));
+        }
+        let r = rec("EVENT idle seq=106 complete=1 rows=689 ⏺ Done.");
+        assert_eq!(
+            (r.complete, r.rows, r.report),
+            (Some(true), Some(689), None)
+        );
+        let r = rec("EVENT turn seq=106 report=5 rows=12 ⏺ Done.");
+        assert_eq!((r.complete, r.rows, r.report), (None, Some(12), Some(5)));
+        // Every word the loops print with a `rule=` is its own kind, the rule
+        // its phase: a word dropped from the reader would read as `other`.
+        for word in [
+            "TYPED",
+            "RESTARTED",
+            "UNVERIFIED",
+            "LIMITED",
+            "UNPROVEN",
+            "DIALOG",
+            "DECLINED",
+            "CHOSE",
+            "PROBED",
+        ] {
+            let r = rec(&format!("{word} seq=5 rule=a-rule@v1 x"));
+            assert_eq!(
+                (r.kind, r.phase.as_str(), r.seq, r.summary.as_str()),
+                (word.to_ascii_lowercase(), "a-rule@v1", Some(5), "x"),
+                "{word}"
             );
         }
-        let r = rec("SKIPPED seq=41 rule=limit-reset@v1 host=attempted");
-        assert_eq!(
-            (r.kind.as_str(), r.phase.as_str(), r.summary.as_str()),
-            ("skipped", "limit-reset@v1", "host=attempted")
-        );
-        assert_eq!(rec("reset seq=41 rule=limit-reset@v1 unread").kind, "other");
-        // A due probe not run: the gate that shut it (and the host's word) is the summary.
-        let r = rec("SKIPPED seq=102 rule=usage-probe@v1 gate=not-live");
-        assert_eq!(
-            (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
-            ("skipped", "usage-probe@v1", Some(102), "gate=not-live")
-        );
-        let r = rec("SKIPPED seq=102 rule=usage-probe@v1 gate=claim host=not-early");
-        assert_eq!(
-            (r.kind.as_str(), r.phase.as_str(), r.summary.as_str()),
-            ("skipped", "usage-probe@v1", "gate=claim host=not-early")
-        );
+        // Every gate's word reads as the probe's `skipped`.
         for gate in crate::supervise::policy::turn_end::ProbeGate::ALL {
             let line = format!("SKIPPED seq=7 rule=usage-probe@v1 gate={}", gate.word());
             let r = rec(&line);
@@ -706,122 +732,6 @@ mod tests {
                 "{line}"
             );
         }
-        // Control: `PROBE skipped gate=…` would read as the legacy limit probe, which is why the
-        // line is spelled `SKIPPED`.
-        let r = rec("PROBE skipped gate=not-live");
-        assert_eq!(
-            (r.kind.as_str(), r.phase.as_str(), r.seq),
-            ("probe", "skipped", None)
-        );
-        let r = rec("PROBE sent seq=9 keep going");
-        assert_eq!((r.kind.as_str(), r.phase.as_str()), ("probe", "sent"));
-        let r = rec("PROBING seq=102 rule=usage-probe@v1 /usage");
-        assert_eq!(
-            (r.kind.as_str(), r.summary.as_str()),
-            ("other", "PROBING seq=102 rule=usage-probe@v1 /usage")
-        );
-        let r = rec("TYPED seq=7 rule=context-compact@v1 /compact");
-        assert_eq!(
-            (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
-            ("typed", "context-compact@v1", Some(7), "/compact")
-        );
-        let r = rec("RESTARTED seq=8 rule=model-fallback@v1 relaunch --model opus");
-        assert_eq!(
-            (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
-            (
-                "restarted",
-                "model-fallback@v1",
-                Some(8),
-                "relaunch --model opus"
-            )
-        );
-        let r = rec("DECLINED seq=105 rule=a-rule@v1 a box => aterm harness (not the user): …");
-        assert_eq!(
-            (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
-            (
-                "declined",
-                "a-rule@v1",
-                Some(105),
-                "a box => aterm harness (not the user): …"
-            )
-        );
-        let r = rec("WAITING seq=9 until=2026-09-19T18:10:00Z overloaded retry 1 of 3");
-        assert_eq!(
-            (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
-            (
-                "waiting",
-                "-",
-                Some(9),
-                "until=2026-09-19T18:10:00Z overloaded retry 1 of 3"
-            )
-        );
-        // A question decision's rows are the summary.
-        let r = rec("DIALOG seq=31 rule=answer-recommended@v1 ──── ⏎  ☐ Colors ⏎ ❯ 1. Dark");
-        assert_eq!(
-            (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
-            (
-                "dialog",
-                "answer-recommended@v1",
-                Some(31),
-                "──── ⏎  ☐ Colors ⏎ ❯ 1. Dark"
-            )
-        );
-        let r = rec("SKIPPED seq=9 rule=continue@v1 not submitted: skipped");
-        assert_eq!(
-            (r.kind.as_str(), r.phase.as_str(), r.summary.as_str()),
-            ("skipped", "continue@v1", "not submitted: skipped")
-        );
-        // The legacy `PROBE` lines still read.
-        let r = rec("PROBE sent seq=102");
-        assert_eq!(
-            (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
-            ("probe", "sent", Some(102), "")
-        );
-        let r = rec("PROBE deferred seq=102 text is typed in the composer");
-        assert_eq!(
-            (r.phase.as_str(), r.seq, r.summary.as_str()),
-            ("deferred", Some(102), "text is typed in the composer")
-        );
-        for (line, phase) in [
-            ("EVENT resumed seq=103 ⏺ Yes: the A/B is done.", "resumed"),
-            (
-                "EVENT still-limited seq=103 no answer within 120 s",
-                "still-limited",
-            ),
-            ("EVENT rebriefed seq=104", "rebriefed"),
-        ] {
-            let r = rec(line);
-            assert_eq!(
-                (r.kind.as_str(), r.phase.as_str()),
-                ("event", phase),
-                "{line}"
-            );
-            assert_eq!(r.seq, Some(if phase == "rebriefed" { 104 } else { 103 }));
-        }
-    }
-
-    /// An `EXCEPTION` line is its own kind, and its end a `cleared`.
-    #[test]
-    fn an_exception_line_is_its_own_kind() {
-        let rec = |line: &str| JournalRecord::of_line(1_789_407_079_123, Some("@s-1"), line, None);
-        let r = rec(
-            "EXCEPTION seq=88 kind=spend when=later Its usage credits are used up, and no time \
-             window ends that. => Add usage credits in claude.ai settings.",
-        );
-        assert_eq!((r.kind.as_str(), r.seq), ("exception", Some(88)));
-        assert!(
-            r.summary
-                .starts_with("kind=spend when=later Its usage credits"),
-            "{}",
-            r.summary
-        );
-        assert!(
-            r.summary
-                .ends_with("=> Add usage credits in claude.ai settings.")
-        );
-        let r = rec("CLEARED seq=91 exception=spend after=1422s the agent working");
-        assert_eq!((r.kind.as_str(), r.seq), ("cleared", Some(91)));
-        assert_eq!(r.summary, "exception=spend after=1422s the agent working");
     }
 
     /// The JSON round-trips, escapes what it must, and prints `null` for what
@@ -860,8 +770,51 @@ mod tests {
             "{\"t\":1,\"kind\":\"event\",\"phase\":\"idle\",\"line\":\"EVENT idle seq=1 x\"}",
         )
         .expect("an older record");
-        assert_eq!((old.report, old.turn), (None, None));
+        assert_eq!((old.report, old.turn, old.mark), (None, None, None));
+        // A point's mark: written only where there is one, read back whole
+        // (16 hex digits, past what a JSON number holds exactly).
+        let mut r =
+            JournalRecord::of_line(3, Some("s-1"), "EVENT idle seq=4 ATERM-TASK-DONE", None);
+        r.mark = Some(0xfeed_0000_0000_beef);
+        let json = r.to_json();
+        assert!(
+            json.ends_with(",\"report\":null,\"mark\":\"feed00000000beef\"}"),
+            "{json}"
+        );
+        assert_eq!(JournalRecord::from_json(&json), Ok(r));
         assert!(JournalRecord::from_json("{\"kind\":\"event\"}").is_err());
         assert!(JournalRecord::from_json("{\"t\":1,\"kind\":\"event\",\"line\":").is_err());
+    }
+
+    /// AN OUT-OF-SPACE WRITE ASKS THE DISK WATCH TO LOOK: a journal write
+    /// that fails with `ENOSPC` or `EDQUOT` pokes the watch
+    /// ([`crate::harness::disk::poke`]) naming the journal; NEGATIVE CONTROL:
+    /// any other failure (a permission denied) pokes nothing. Each failure
+    /// is still said once.
+    #[test]
+    fn a_journal_write_out_of_space_pokes_the_disk_watch() {
+        use crate::harness::disk::poke::{Cause, last};
+        use std::io::{Error, ErrorKind};
+        let named = |tag: &str| {
+            last().is_some_and(|(c, _)| matches!(c, Cause::Write(w) if w.contains(tag)))
+        };
+        let denied = format!("journal-denied-{}", std::process::id());
+        let mut j = Journal::off();
+        j.path = Some(PathBuf::from(&denied));
+        let mut warn = Vec::new();
+        j.failed(
+            &Error::from(ErrorKind::PermissionDenied),
+            "cannot append to it",
+            &mut warn,
+        );
+        assert!(!named(&denied), "no full disk, no poke");
+        assert!(!warn.is_empty(), "said");
+        for kind in [ErrorKind::StorageFull, ErrorKind::QuotaExceeded] {
+            let full = format!("journal-full-{kind:?}-{}", std::process::id());
+            let mut j = Journal::off();
+            j.path = Some(PathBuf::from(&full));
+            j.failed(&Error::from(kind), "cannot append to it", &mut Vec::new());
+            assert!(named(&full), "{kind:?} pokes the watch");
+        }
     }
 }

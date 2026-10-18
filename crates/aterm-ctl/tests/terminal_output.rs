@@ -4,7 +4,7 @@
 //! What the CLI puts on a REAL TERMINAL (round fifteen, OUT-1 and OUT-3): the
 //! binary runs with its stdout, or its stderr, on the slave of a pty built
 //! here, against a private protocol peer whose reply is hostile — a fabric
-//! peer's mail body, a `dial`ed remote's error. The master side reads exactly
+//! peer's mail body, a server's error. The master side reads exactly
 //! what a terminal emulator would have been given, and it must hold no byte a
 //! terminal acts on. The other stream stays a pipe and gets the bytes as they
 //! came (`inbox_metadata.rs` holds the pipe branch for every framing).
@@ -216,14 +216,14 @@ fn a_mail_body_on_a_terminal_is_shown_not_obeyed() {
     );
 }
 
-/// A `dial`ed remote's refusal on a terminal (OUT-3): the clipboard write,
+/// A server's refusal on a terminal (OUT-3): the clipboard write,
 /// the retitle and the erase that would wipe the `aterm-ctl:` prefix are
 /// shown, and the refusal's second line too.
 #[test]
 fn a_servers_error_on_a_terminal_is_shown_not_obeyed() {
     let seen = run(
         Tty::Stderr,
-        &["dial", "work", "text"],
+        &["text"],
         b"ERR \x1b]52;c;ZWNobyBwd25lZAo=\x07\x1b]0;PWNED\x07\x1b[2K\rfake error\n  \
           \x1b]8;;http://evil.example\x07click\n",
     );
@@ -241,14 +241,14 @@ fn a_servers_error_on_a_terminal_is_shown_not_obeyed() {
     assert!(seen.pipe.is_empty(), "{:?}", seen.pipe);
 }
 
-/// A status line and line-framed rows on a terminal (OUT-3): a remote's
+/// A status line and line-framed rows on a terminal (OUT-3): a server's
 /// `cursor` answer and `text` rows carry no instruction to the reader's
 /// terminal; the local server's own encoded words come through unchanged.
 #[test]
 fn status_lines_and_rows_on_a_terminal_are_shown_not_obeyed() {
     let seen = run(
         Tty::Stdout,
-        &["dial", "work", "cursor"],
+        &["cursor"],
         b"OK row=1 \x1b]52;c;ZWNobyBoaQ==\x07 col=2\n",
     );
     assert_eq!(
@@ -257,7 +257,7 @@ fn status_lines_and_rows_on_a_terminal_are_shown_not_obeyed() {
     );
     let seen = run(
         Tty::Stdout,
-        &["dial", "work", "text"],
+        &["text"],
         "OK 2\n\u{1b}]0;PWNED\u{7}\u{1b}[1A\u{1b}[2Kforged row\n\u{9b}31mred \u{202e}evil\n"
             .as_bytes(),
     );

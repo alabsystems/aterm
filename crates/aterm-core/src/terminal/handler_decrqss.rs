@@ -11,9 +11,10 @@ use crate::grid::{CellFlags, PackedColor};
 use super::CursorStyle;
 use super::handler::TerminalHandler;
 
-/// DECSCL's second parameter for 7-bit C1 transmission (S7C1T; `1` is S8C1T). aterm has no
-/// C1 switch (`handle_decscl` ignores the request) and never emits 8-bit C1.
-const DECSCL_C1_TRANSMISSION_7BIT: u8 = 2;
+/// DECSCL's second parameter for 7-bit C1 transmission (S7C1T; `0` and `2` are S8C1T, per
+/// the VT510 and xterm, whose report says `;1` in 7-bit mode). aterm has no C1 switch
+/// (`handle_decscl` ignores the request) and never emits 8-bit C1.
+const DECSCL_C1_TRANSMISSION_7BIT: u8 = 1;
 
 /// How a DECRQSS answer is assembled: settings answer parameters then the mnemonic
 /// (`"0"` + `"m"` -> `"0m"`), DEC private modes a body already ending in `h`/`l`.
@@ -124,18 +125,8 @@ impl TerminalHandler<'_> {
             params.push("3".to_string());
         }
 
-        // The composite underline styles first: DASHED is DOUBLE | CURLY, DOTTED is
-        // UNDERLINE | CURLY.
-        if self.style.flags.contains(CellFlags::DASHED_UNDERLINE) {
-            params.push("4:5".to_string());
-        } else if self.style.flags.contains(CellFlags::DOTTED_UNDERLINE) {
-            params.push("4:4".to_string());
-        } else if self.style.flags.contains(CellFlags::CURLY_UNDERLINE) {
-            params.push("4:3".to_string());
-        } else if self.style.flags.contains(CellFlags::DOUBLE_UNDERLINE) {
-            params.push("4:2".to_string());
-        } else if self.style.flags.contains(CellFlags::UNDERLINE) {
-            params.push("4".to_string());
+        if let Some(underline) = self.style.flags.underline_sgr() {
+            params.push(underline.to_string());
         }
 
         if self.style.flags.contains(CellFlags::BLINK) {
@@ -151,27 +142,12 @@ impl TerminalHandler<'_> {
             params.push("9".to_string());
         }
 
-        // OVERLINE is SUPERSCRIPT | SUBSCRIPT, so it is checked first.
-        if self.style.flags.contains(CellFlags::OVERLINE) {
-            params.push("53".to_string());
-        } else if self.style.flags.contains(CellFlags::SUPERSCRIPT) {
-            params.push("73".to_string());
-        } else if self.style.flags.contains(CellFlags::SUBSCRIPT) {
-            params.push("74".to_string());
+        if let Some(line) = self.style.flags.overline_or_script_sgr() {
+            params.push(line.to_string());
         }
 
-        // Underline colour (SGR 58) is stored as 0x02_0000NN indexed, 0x01_RRGGBB RGB.
         if let Some(color) = self.transient.current_underline_color {
-            let type_byte = (color >> 24) & 0xFF;
-            if type_byte == 0x02 {
-                let index = color & 0xFF;
-                params.push(format!("58:5:{index}"));
-            } else {
-                let r = (color >> 16) & 0xFF;
-                let g = (color >> 8) & 0xFF;
-                let b = color & 0xFF;
-                params.push(format!("58:2::{r}:{g}:{b}"));
-            }
+            params.push(aterm_grid::underline_color_sgr(color));
         }
 
         push_color_sgr(&mut params, self.style.fg, 30);

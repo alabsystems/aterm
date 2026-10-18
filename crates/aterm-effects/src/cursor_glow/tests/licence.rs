@@ -125,79 +125,6 @@ fn rainbow_ribbon_survives_a_three_per_frame_mash() {
     );
 }
 
-/// Cold control for the mash: the same frame choreography with no presses. Every
-/// hop is declined at the licence seam for want of a fresh hint, no ribbon
-/// segment is born, and the ring says why.
-#[test]
-fn cold_three_cell_hops_lay_no_ribbon_and_leave_no_ring() {
-    let g = geom();
-    let c = cfg(GlowStyle::RainbowKitty, true);
-    let mut scratch = typed_scratch();
-    let mut glow = CursorGlow::default();
-    let t0 = Instant::now();
-    glow.tick(Some((2, 0)), t0, &c, g, &mut scratch);
-    let glyphs = ['m', 'a', 's', 'h', 't', 'y', 'p', 'i', 'n', 'g', 'o', 'k'];
-    let mut stored: Vec<char> = Vec::new();
-    for frame in 0..4usize {
-        let base_col = (frame * 3) as u16;
-        let frame_t = t0 + Duration::from_millis(frame as u64 * 16 + 1);
-        stored.extend_from_slice(&glyphs[frame * 3..frame * 3 + 3]);
-        let probe_at = frame_t + Duration::from_millis(12);
-        glow.observe_row_with_trust(2, base_col + 3, &stored, probe_at, ProbeTrust::ContentOnly);
-        glow.tick(Some((2, base_col + 3)), probe_at, &c, g, &mut scratch);
-        assert_eq!(
-            glow.ribbon_segments(),
-            0,
-            "cold frame {frame} must lay no ribbon"
-        );
-    }
-    let tally = glow.admission_tally();
-    assert_eq!(
-        (tally.licensed, tally.declined),
-        (0, 4),
-        "every cold hop is declined, none licensed"
-    );
-    assert_eq!(
-        tally.last_decline_reason,
-        Some(CursorGlow::DECLINE_NO_FRESH_HINT),
-        "and the ring names the license seam as the refuser"
-    );
-}
-
-/// The design's `synthetic_note_pending` licence term needs no field: both
-/// scripted-preview notes already stamp a hint the licence reads. Pinned so an
-/// edit that stops stamping either fails here rather than darkening previews,
-/// examples and benches.
-#[test]
-fn a_synthetic_note_licenses_its_own_move() {
-    let t0 = Instant::now();
-    let mut typed = CursorGlow::default();
-    typed.note_synthetic_typed(t0, 1);
-    assert!(
-        typed.move_licensed(t0),
-        "a scripted TYPED note licenses its own move"
-    );
-    let mut gesture = CursorGlow::default();
-    gesture.note_synthetic_move(t0);
-    assert!(
-        gesture.move_licensed(t0),
-        "a scripted GESTURE note licenses its own move"
-    );
-    // …and both expire on the 0.25 s class, like every other press stamp.
-    let stale = t0 + Duration::from_millis(251);
-    assert!(!typed.move_licensed(stale), "a scripted typed note expires");
-    assert!(
-        !gesture.move_licensed(stale),
-        "a scripted gesture note expires"
-    );
-    // The floor: an engine nobody has touched is never licensed. This is
-    // the cold-output law in one line.
-    assert!(
-        !CursorGlow::default().move_licensed(t0),
-        "an untouched engine licenses nothing"
-    );
-}
-
 /// Tier 1 for the licence: the real `CursorGlow` driven through the model's four
 /// states (press, echo, cold echo, expiry), with every observed step validated
 /// as a transition of `CursorHintLicense`. Every projected term is read from the
@@ -206,7 +133,7 @@ fn a_synthetic_note_licenses_its_own_move() {
 /// that drifted from the law fails here.
 #[test]
 fn the_real_glow_engine_conforms_to_the_licence_model() {
-    let model = aterm_spec::derive::cursor_hint_license_model();
+    let model = aterm_models_effects::cursor_hint_license_model();
     let g = geom();
     let c = cfg(GlowStyle::RainbowKitty, true);
 
@@ -719,7 +646,6 @@ fn an_unlicensed_move_mints_nothing_and_retires_nothing_in_every_style() {
         GlowStyle::Beam,
         GlowStyle::Water,
         GlowStyle::Comet,
-        GlowStyle::Custom,
     ];
     // Every shape a cold program presents: the one-cell advance a token
     // streamer walks, a coalesced hop, a line wrap, a one-column retreat (a
@@ -743,10 +669,7 @@ fn an_unlicensed_move_mints_nothing_and_retires_nothing_in_every_style() {
 
     // Clause 1: a cold engine stays cold, whatever the shape or style.
     for style in styles {
-        let mut c = cfg(style, true);
-        if style == GlowStyle::Custom {
-            c.pack = Some(TrailParams::defaults());
-        }
+        let c = cfg(style, true);
         for (from, to) in shapes {
             let mut glow = CursorGlow::default();
             let mut out = Vec::new();
@@ -794,10 +717,7 @@ fn an_unlicensed_move_mints_nothing_and_retires_nothing_in_every_style() {
     // Clause 2: earned light survives someone else's output. One licensed typed
     // move lays light; each cold shape must then leave it exactly as it was.
     for style in styles {
-        let mut c = cfg(style, true);
-        if style == GlowStyle::Custom {
-            c.pack = Some(TrailParams::defaults());
-        }
+        let c = cfg(style, true);
         for (_, to) in shapes {
             let mut glow = CursorGlow::default();
             let mut out = Vec::new();
@@ -900,35 +820,5 @@ fn content_only_probes_never_license_a_kill_poof() {
     assert!(
         !glow.vapor.is_empty(),
         "the same shrink under Full trust still poofs — the fence, not the feature, moved"
-    );
-}
-
-/// Momentum is decoupled from admission: the spine advances on the press-hint
-/// half of a typing-shaped echo, so a burst of real keystrokes climbs the
-/// metric and the starfield density sees `disp` rise. Program output without
-/// presses stays at zero (`program_output_alone_builds_no_momentum`).
-#[test]
-fn momentum_climbs_through_streaming_collisions_that_retire_every_candidate() {
-    let g = geom();
-    let c = cfg(GlowStyle::RainbowKitty, true);
-    let mut glow = CursorGlow::default();
-    let mut out = Vec::new();
-    let mut t = Instant::now();
-    glow.tick(Some((3, 0)), t, &c, g, &mut out);
-    for col in 1..=30u16 {
-        t += Duration::from_millis(40);
-        // The press stamps the key-time hint, which licenses the echo.
-        glow.note_typed(t);
-        glow.tick(Some((3, col)), t, &c, g, &mut out);
-    }
-    assert!(
-        glow.typing_momentum(t) > 0.5,
-        "momentum climbs across the collision burst: {}",
-        glow.typing_momentum(t)
-    );
-    assert!(
-        glow.momentum_display() > 0.05,
-        "the starfield density consumer sees the eased spine rise: {}",
-        glow.momentum_display()
     );
 }

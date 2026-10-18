@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# THE X11 ORACLE'S RECORDER (LW.6, docs/AUDIT-third-party-2026-10-15.md,
+# linux-windowing), in ITS OWN WORKSPACE on purpose (the empty `[workspace]`
+# below): registry x11rb-protocol and x11rb write the bytes, and aterm-x11 is
+# held to the committed recordings with neither in the workspace graph, not
+# even as a dev-dependency, so its tests outlive their leaving the lock at
+# LW.7. Its Cargo.lock pins x11rb-protocol 0.13.2 and x11rb 0.13.2, the
+# versions the workspace lock held when tests/recorded/ was written
+# (main @ b5c95a4003).
+#
+# Nothing in the aterm workspace builds this. From this directory:
+#   targo --unverified run --release --locked -- requests > ../recorded/x11rb-protocol-0.13.2-requests.tsv.new
+#   targo --unverified run --release --locked -- replies  > ../recorded/x11rb-protocol-0.13.2-replies.tsv.new
+#   targo --unverified run --release --locked -- events   > ../recorded/x11rb-protocol-0.13.2-events.tsv.new
+#   targo --unverified run --release --locked -- icccm    > ../recorded/x11rb-0.13.2-icccm.tsv.new
+#   targo --unverified run --release --locked -- xrm      > ../recorded/x11rb-protocol-0.13.2-xrm.tsv.new
+# Each prints rows only; the committed TSVs add the `#` header that says what
+# the rows are. Diff the rows against the committed ones: a difference is
+# x11rb changing, never a reason to edit the corpus by hand. `--release`
+# matters for one row family: x11rb-protocol's Xrm octal escape wraps above
+# \377 in a release build and panics in a debug one.
+[package]
+name = "aterm-x11-recorder"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+x11rb-protocol = { version = "=0.13.2", default-features = false, features = ["std", "shm", "resource_manager", "randr", "xinput"] }
+x11rb = { version = "=0.13.2", default-features = false }

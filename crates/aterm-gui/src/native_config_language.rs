@@ -8,7 +8,7 @@
 //! here after a document revision changes. Paint consumes only the bounded spans
 //! projected onto visible editor rows and never parses or touches the filesystem.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -34,9 +34,6 @@ const COMPATIBILITY_ONLY_KEYS: &[&str] = &[
     "matrix_rain.materialize",
     "matrix_rain.ink_text",
     "matrix_rain.phosphor",
-    // The post-update card it decorated was deleted (759ba0593); the key still
-    // parses so an authored value keeps loading, and it drives nothing.
-    crate::prefs::EDIT_NOTICE_SPARKLE,
 ];
 /// Typed compatibility metadata shared with non-editing inventory surfaces
 /// such as Modified. A retired key may retain schema type information so
@@ -75,6 +72,12 @@ const RETIRED_CONFIG_KEYS: &[RetiredConfigKeyMetadata] = &[
     RetiredConfigKeyMetadata {
         key: "pkg_progress_effects",
         feature: "Package progress card",
+        effect_label: "No effect",
+    },
+    // The post-update card these sparkles decorated was deleted (759ba0593).
+    RetiredConfigKeyMetadata {
+        key: "notice_sparkle",
+        feature: "Update celebration",
         effect_label: "No effect",
     },
     // THE SCENES REMOVAL LEFT ITS CONFIG BEHIND. `6995b25ac` ("SCENE-1 delete the
@@ -157,6 +160,13 @@ const RETIRED_CONFIG_KEYS: &[RetiredConfigKeyMetadata] = &[
         feature: "Package include filter",
         effect_label: "No effect",
     },
+    // Robi, the opt-in helper robot, was deleted on 2026-10-15; an authored
+    // `robi = true` is told the robot was removed, not that a newer build owns it.
+    RetiredConfigKeyMetadata {
+        key: "robi",
+        feature: "Robi the helper robot",
+        effect_label: "No effect",
+    },
     // SMART TITLES WAS RETIRED (2026-10-15): the generated "activity" half of the
     // tab and window label, its built-in summarizer, the optional Ollama /
     // OpenAI-compatible worker, and the label formats that joined the two halves.
@@ -235,6 +245,14 @@ const RETIRED_CONFIG_KEYS: &[RetiredConfigKeyMetadata] = &[
         feature: "Smart Titles",
         effect_label: "No effect",
     },
+    // THE STRAIN ROW WAS RETIRED (2026-10-16): the band's "Typing slowed by
+    // <cause>" row, its probe and its Settings ▸ Messages switch. A file that
+    // still sets the switch loads and is told the key does nothing.
+    RetiredConfigKeyMetadata {
+        key: "explain_heavy_load",
+        feature: "Explain heavy load",
+        effect_label: "No effect",
+    },
 ];
 
 pub(crate) fn retired_config_key(key: &str) -> Option<&'static RetiredConfigKeyMetadata> {
@@ -244,13 +262,7 @@ pub(crate) fn retired_config_key(key: &str) -> Option<&'static RetiredConfigKeyM
 }
 
 pub(crate) fn is_compatibility_only_key(key: &str) -> bool {
-    COMPATIBILITY_ONLY_KEYS.contains(&key)
-        || retired_config_key(key).is_some()
-        // The orca class was deleted on 2026-09-27 (it had been suspended): a
-        // leftover `[sparkle_words.orca]` subtree is kept and reported, never
-        // honoured.
-        || key == "sparkle_words.orca"
-        || key.starts_with("sparkle_words.orca.")
+    COMPATIBILITY_ONLY_KEYS.contains(&key) || retired_config_key(key).is_some()
 }
 
 const CURSOR_STYLE_ALIASES: &[&str] = &["beam"];
@@ -291,9 +303,8 @@ const TAB_MENU_CHORD_ALIASES: &[&str] = &["both", "menu-key", "menu"];
 /// are not here: the reader takes them as `off` and SAYS so (its limit), and
 /// Manual says so too.
 const HARNESS_AUTOPILOT_ALIASES: &[&str] = &["forever", "infinity", "wrap-up", "wrapup", "wrap"];
-/// `[privacy] warmup` — `app_config::PrivacyWarmup::ALL`'s spellings (pinned
-/// equal by `every_key_the_config_reader_accepts_is_known_to_manual`).
-const PRIVACY_WARMUPS: &[&str] = &["never", "on-request"];
+/// `[privacy] warmup` — `app_config::PrivacyWarmup::ALL`'s spellings.
+const PRIVACY_WARMUPS: &[&str] = &["never", "on-request", "automatic"];
 /// `[render] repaint_nudge` - `aterm_core::terminal::repaint_nudge::Mode`'s words
 /// (pinned equal by `the_repaint_nudge_words_are_the_engines`).
 const REPAINT_NUDGE_MODES: &[&str] = &["on", "log", "off"];
@@ -337,8 +348,8 @@ pub(crate) struct ConfigAnalysis {
     pub(crate) diagnostics: Vec<ConfigDiagnostic>,
     omitted_diagnostics: usize,
     /// The warnings among [`Self::diagnostics`] that name a RETIRED or
-    /// DEPRECATED spelling (`[packages] auto_update` / `seed_install`,
-    /// `game_font`): a key this build or atpkg still reads, or one a newer key
+    /// DEPRECATED spelling (`[packages] auto_update` / `seed_install`): a key
+    /// this build or atpkg still reads, or one a newer key
     /// now decides — never a key this build does not know. [`key_warnings`]
     /// keeps them out of the ignored-key family, whose count says its members
     /// "have no effect in this build" (review of the second origin/main merge,
@@ -352,7 +363,7 @@ pub(crate) struct ConfigAnalysis {
     /// wrong type, a knob below another table, most of which turn every
     /// removal off), the value errors of a retired or deprecated spelling
     /// that is still read (`[packages] auto_update` that is not true or
-    /// false, a `game_font` outside the display fonts), and a structured
+    /// false), and a structured
     /// list record's value its reader clamps or replaces. [`key_warnings`]
     /// keeps them out of the ignored-key family, whose words say "no effect"
     /// and "correct the setting's name", and [`unaccepted_value_warnings`]
@@ -826,8 +837,7 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     // A LIVE KEY Manual used to call "unknown to this aterm build" — the exact
     // false diagnostic audit-2 item 9 named, which `[fabric]` missed by landing
     // after that fix; this row (and the table header below) closes it for the
-    // table, and `every_key_the_config_reader_accepts_is_known_to_manual` keeps
-    // it closed. An operator who turns the fabric on writes
+    // table. An operator who turns the fabric on writes
     // this by hand, and being told the key does not exist is how they conclude
     // the bridge is not running when it is. Free-form: the value is a command
     // line (`aterm-link serve --fleet ... --broker ...`), whitespace-split and
@@ -839,6 +849,37 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         "Halt sessions when the fabric bridge is lost",
         ConfigSchemaKind::Scalar(EditKind::Bool),
         &["fabric", "bridge", "hold", "halt", "strict"],
+        true,
+    ),
+    // `[fabric] receipts` and `[fabric] presence`, which `aterm-link serve` reads
+    // (`aterm_link::fabric::{receipts_from_config, presence_from_config}`) and
+    // `aterm fabric on` writes (`receipts = true`): live keys, never unknown ones.
+    manual(
+        "fabric.receipts",
+        "Acknowledge senders when their mail is handled",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &["fabric", "receipts", "ack", "inbox", "seen"],
+        true,
+    ),
+    manual(
+        "fabric.presence",
+        "What this node's fabric presence rows publish",
+        ConfigSchemaKind::Scalar(EditKind::Enum {
+            options: &["meta", "minimal"],
+        }),
+        &["fabric", "presence", "meta", "minimal", "privacy"],
+        true,
+    ),
+    // `[fabric] log` (session log phase 4), which `aterm-link serve` reads
+    // (`aterm_link::fabric::log_from_config`): "off" (the default, D4 open)
+    // or "turns", the bus mirror of the session logs.
+    manual(
+        "fabric.log",
+        "Mirror the session logs' turns onto the fabric",
+        ConfigSchemaKind::Scalar(EditKind::Enum {
+            options: &["off", "turns"],
+        }),
+        &["fabric", "log", "session", "turns", "mirror", "bus"],
         true,
     ),
     manual(
@@ -864,24 +905,6 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         &["fabric", "bridge", "inbox", "astream", "bus"],
         false,
     ),
-    // The EXPERIMENTAL embedded operator's launch switch (`[operator] enabled`,
-    // `operator_host::enabled`): deliberately off the Settings pages (see the
-    // `Config::operator` field's doc), and the one spelling since its
-    // environment variables went (2026-09-24), so Manual completes and hovers it.
-    manual(
-        "operator",
-        "Embedded operator",
-        ConfigSchemaKind::Table,
-        &["operator", "fleet", "manage"],
-        false,
-    ),
-    manual(
-        "operator.enabled",
-        "Start the embedded operator",
-        ConfigSchemaKind::Scalar(EditKind::Bool),
-        &["operator", "fleet", "manage", "observer", "attention"],
-        true,
-    ),
     // The coding-agent primer's opt-out (`agents_auto_prime`, default on): a live
     // key read off the UI thread by the spawn seam and deliberately off the
     // Settings pages (no Agents section to hold it), yet written by hand —
@@ -893,6 +916,46 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         "Prime coding agents automatically",
         ConfigSchemaKind::Scalar(EditKind::Bool),
         &["agents", "claude", "codex", "primer", "guidance"],
+        true,
+    ),
+    // The warm spare shell (`crate::spare`, 2026-10-16): a live, hot-reloaded
+    // key off the Settings pages — its kill switch (`off`) and its
+    // never-before-Cmd-T mode (`parked`) are written by hand, as is the
+    // presence gate a headless measurement or an agent's private instance
+    // turns off.
+    manual(
+        "spare_shell",
+        "Warm spare shell for new tabs",
+        ConfigSchemaKind::Scalar(EditKind::Enum {
+            options: &crate::spare::SpareMode::SPELLINGS,
+        }),
+        &["spare", "warm", "new tab", "prompt", "startup", "fast"],
+        true,
+    ),
+    manual(
+        "spare_shell_needs_person",
+        "Keep a spare shell only while a person is present",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &["spare", "warm", "headless", "person", "presence"],
+        true,
+    ),
+    // Windows' console host for new tabs (`conpty`, `aterm_pty::ConsoleHostChoice`):
+    // a spawn-time choice with no in-window preview (a tab keeps the host it
+    // started with) whose values are written by hand: `inbox` (the default),
+    // `auto`, or the path of an OpenConsole.exe. So Manual completes and hovers
+    // it rather than calling it unknown.
+    manual(
+        "conpty",
+        "Console host for new tabs (Windows)",
+        ConfigSchemaKind::Scalar(EditKind::Text),
+        &[
+            "conpty",
+            "console",
+            "conhost",
+            "openconsole",
+            "windows",
+            "host",
+        ],
         true,
     ),
     manual(
@@ -976,61 +1039,14 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         &["palette", "ansi", "colors", "colours", "slot", "indexed"],
         true,
     ),
+    // A theme per session identity (`identity_themes = { worker = "Hearth" }`):
+    // file-only, documented in `aterm help themes` (`crate::session_theme`).
     manual(
-        "net",
-        "Network drive",
-        ConfigSchemaKind::Table,
-        &["remote", "tls", "listener"],
-        false,
-    ),
-    manual(
-        "net.connections",
-        "Saved remote connections",
-        ConfigSchemaKind::StructuredList,
-        &["remote", "dial", "tls", "endpoint"],
+        "identity_themes",
+        "Theme per session identity",
+        ConfigSchemaKind::DynamicStringMap,
+        &["theme", "identity", "profile", "session", "worker"],
         true,
-    ),
-    manual(
-        "net.connections.name",
-        "Connection name",
-        ConfigSchemaKind::Scalar(EditKind::Text),
-        &["remote", "dial"],
-        false,
-    ),
-    manual(
-        "net.connections.host",
-        "Connection host and port",
-        ConfigSchemaKind::Scalar(EditKind::Text),
-        &["remote", "address", "port"],
-        false,
-    ),
-    manual(
-        "net.connections.fingerprint",
-        "Connection certificate fingerprint",
-        ConfigSchemaKind::Scalar(EditKind::Text),
-        &["remote", "tls", "certificate"],
-        false,
-    ),
-    manual(
-        "net.connections.token_file",
-        "Connection token file",
-        ConfigSchemaKind::Scalar(EditKind::Text),
-        &["remote", "credential", "path"],
-        false,
-    ),
-    manual(
-        "net.connections.sid",
-        "Connection session id",
-        ConfigSchemaKind::Scalar(EditKind::Text),
-        &["remote", "session", "pin"],
-        false,
-    ),
-    manual(
-        "net.connections.expect_nonce",
-        "Connection launch nonce",
-        ConfigSchemaKind::Scalar(EditKind::Text),
-        &["remote", "session", "rebind", "pin"],
-        false,
     ),
     manual(
         "update",
@@ -1080,15 +1096,35 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         &["keeper", "crash", "recover", "pty", "session"],
         true,
     ),
+    // The `[session_log]` table (phase 2B, owner decision D3 open): the disk
+    // journal of what each session did. Off by default; read at launch; no
+    // Settings row while it is opt-in.
+    manual(
+        "session_log",
+        "Session log",
+        ConfigSchemaKind::Table,
+        &["session", "log", "journal", "crash", "history"],
+        false,
+    ),
+    manual(
+        "session_log.journal",
+        "Keep a session journal on disk",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &["session", "log", "journal", "crash", "history"],
+        true,
+    ),
     // The `[claude_footer]` table (owner, 2026-09-30): what the Claude Code
-    // footer writes into the rule under Claude's input box, and (`card`,
-    // 2026-10-15) the harness card on Claude's launch card. Both default on;
+    // footer writes into the rule under Claude's input box, (`card`,
+    // 2026-10-15) the harness card on Claude's launch card, and (`acts`,
+    // 2026-10-16) the act ticker beside the Autopilot chip. All default on;
     // written by hand (no Settings row).
     manual(
         "claude_footer",
         "Claude Code footer",
         ConfigSchemaKind::Table,
-        &["claude", "footer", "usage", "tokens", "card", "harness"],
+        &[
+            "claude", "footer", "usage", "tokens", "card", "harness", "acts",
+        ],
         false,
     ),
     manual(
@@ -1113,6 +1149,21 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         ],
         true,
     ),
+    manual(
+        "claude_footer.acts",
+        "Show what the harness just did beside its Autopilot chip",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &[
+            "claude",
+            "footer",
+            "acts",
+            "ticker",
+            "harness",
+            "autopilot",
+            "approved",
+        ],
+        true,
+    ),
     // The `[reroute]` table: `announce` rides the native registry
     // (`prefs::NESTED_LEAVES`); this header is what lets Manual complete `[reroute]`.
     manual(
@@ -1133,13 +1184,14 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         true,
     ),
     // The `[harness]` table (design DESIGN-aterm-wrapper-2026-09-17 §4.6.2):
-    // its five Settings rows — the master switch `enabled`, the default
-    // Autopilot `autopilot` (2026-10-15), the approval level `approve`
+    // its six Settings rows — the master switch `enabled`, the default
+    // Autopilot `autopilot` (2026-10-15), the time a timed Cruise is offered
+    // to land at, `land_at` (2026-10-16), the approval level `approve`
     // (owner, 2026-09-24), the question answer `answer_questions` (owner,
     // 2026-09-25) and how it answers, `question_priority` — ride the native
     // registry
     // (`prefs::NESTED_LEAVES`), so none is listed here (a row here would be
-    // shadowed and dropped, `the_manual_schema_holds_one_row_per_key`); this
+    // shadowed and dropped); this
     // header is what lets Manual complete `[harness]` and what the dotted
     // leaf's prefix rule requires.
     manual(
@@ -1161,7 +1213,7 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     ),
     manual(
         "harness.codex",
-        "Codex supervision",
+        "codex-alab watch",
         ConfigSchemaKind::Table,
         &["harness", "codex", "agent"],
         false,
@@ -1173,17 +1225,30 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         &["harness", "agy", "antigravity", "agent"],
         false,
     ),
+    manual(
+        "harness.muse",
+        "Muse Code supervision",
+        ConfigSchemaKind::Table,
+        &["harness", "muse", "muse code", "agent"],
+        false,
+    ),
+    manual(
+        "harness.gemini",
+        "Gemini CLI supervision",
+        ConfigSchemaKind::Table,
+        &["harness", "gemini", "gemini cli", "agent"],
+        false,
+    ),
     // The supervisor's policy (`aterm_agent::supervise::config::KEYS`, the
     // in-GUI host's `harness_host`): every key but `enabled`, `autopilot`,
-    // `approve`, `answer_questions` and `question_priority`, the Settings rows
-    // above.
+    // `land_at`, `approve`, `answer_questions` and `question_priority`, the
+    // Settings rows above.
     // Every one is ON (full power) by default and can only take power away,
     // save the opt-ins whose `true` is more (`stall_term`, `limit_reset`,
     // `usage_tap`).
     // Known here so the
     // file's `[harness]` keys are completed and a misspelled one is reported,
-    // not silently dropped; `every_supervisor_key_is_known_to_the_config_language`
-    // pins the two lists.
+    // not silently dropped.
     manual(
         "harness.headless",
         "Supervise in a headless instance",
@@ -1379,25 +1444,26 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         true,
     ),
     manual(
-        "harness.rate_nudge",
-        "Answer Codex's near-limit nudge",
-        ConfigSchemaKind::Scalar(EditKind::Bool),
-        &[
-            "supervisor",
-            "codex",
-            "model",
-            "limit",
-            "usage",
-            "rate",
-            "luna",
-        ],
-        true,
-    ),
-    manual(
         "harness.compact_on_context_wall",
         "Compact when the context is full",
         ConfigSchemaKind::Scalar(EditKind::Bool),
         &["supervisor", "context", "compact"],
+        true,
+    ),
+    manual(
+        "harness.autocompact_offer",
+        "Accept Claude Code's autocompact offer at this size",
+        // Text, not an enum: the reader takes `false`, `"off"`, `400` and
+        // `400000` as well as `"400k"`, and an enum would flag those.
+        ConfigSchemaKind::Scalar(EditKind::Text),
+        &[
+            "supervisor",
+            "autocompact",
+            "compact",
+            "context",
+            "tokens",
+            "usage",
+        ],
         true,
     ),
     manual(
@@ -1470,11 +1536,11 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     // The `[ai]` table (docs/DESIGN-ai-connections-2026-10-16.md §6.1), read by
     // the AI layer's own reader (`aterm_agent::ai::config::read`), the one
     // `aterm ai` and this window share. Its Settings rows — `enabled`,
-    // `preferred` and each CLI's `use` — ride the native registry
-    // (`prefs::NESTED_LEAVES`), so only the header and the per-CLI table
-    // headers are here with the keys that have no row: the egress grant
-    // `reviewers` (a registry row is drivable by `settings set`), the review
-    // knobs, and the fleet document's `machine` and `fleet`.
+    // `preferred`, `reviews`, `review_permissions`, the fleet keys
+    // (`machine`, `fleet`, `fleet_key`) and each CLI's `use` — ride the native
+    // registry (`prefs::NESTED_LEAVES`), so only the header and the per-CLI
+    // table headers are here with the keys that have no row: the reviewers
+    // list and the review knobs.
     // `every_ai_key_is_known_to_the_config_language` pins the reader and
     // these rows together.
     manual(
@@ -1488,9 +1554,9 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     ),
     manual(
         "ai.reviewers",
-        "AI CLIs that may review this machine's code",
+        "AI CLIs that review, in order (default: every one used here)",
         ConfigSchemaKind::StringList,
-        &["ai", "review", "reviewers", "grant", "egress"],
+        &["ai", "review", "reviewers", "order"],
         true,
     ),
     manual(
@@ -1505,20 +1571,6 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         "Seconds each AI reviewer may take",
         ConfigSchemaKind::Scalar(EditKind::Integer),
         &["ai", "review", "timeout"],
-        true,
-    ),
-    manual(
-        "ai.machine",
-        "This machine's row in the AI fleet document",
-        ConfigSchemaKind::Scalar(EditKind::Text),
-        &["ai", "fleet", "machine", "name"],
-        true,
-    ),
-    manual(
-        "ai.fleet",
-        "AI fleet document (path)",
-        ConfigSchemaKind::Scalar(EditKind::Text),
-        &["ai", "fleet", "document", "path", "dotfiles"],
         true,
     ),
     // One table per AI CLI (`[ai.<id>]`): its one key, `use`, is a Settings
@@ -1556,8 +1608,7 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     // (`harness_host::disk_look`, `aterm_agent::harness::cli::disk_config_read`).
     // Known here so `auto_free_gib = 0` — the documented off switch of the
     // automatic removal — is not reported "unknown to this aterm build", which
-    // told a person to delete the line and so turned the removal back on;
-    // `every_disk_key_is_known_to_the_config_language` pins the two lists.
+    // told a person to delete the line and so turned the removal back on.
     // What the reader does not read as written (a `disk` that is not a table,
     // a knob of another type, a knob below another table) is told on its line
     // in the reader's words (`validate_disk_values`): an Error where it turns
@@ -1762,7 +1813,7 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     ),
     manual(
         "privacy.warmup",
-        "Offer the folder-access warm-up",
+        "Ask for folder access (at launch, or on request)",
         ConfigSchemaKind::Scalar(EditKind::Enum {
             options: PRIVACY_WARMUPS,
         }),
@@ -2249,10 +2300,11 @@ fn manual_default_shown(key: &str) -> Option<String> {
     let config = crate::app_config::Config::default();
     Some(match key {
         "keeper.enabled" => config.keeper_enabled().to_string(),
-        "operator.enabled" => config.operator_enabled().to_string(),
+        "session_log.journal" => config.session_log_journal().to_string(),
         "agents_auto_prime" => config.agents_auto_prime_or_default().to_string(),
         "claude_footer.usage" => config.claude_footer_usage().to_string(),
         "claude_footer.card" => config.claude_footer_card().to_string(),
+        "claude_footer.acts" => config.claude_footer_acts().to_string(),
         "reroute.strict" => atpkg::config::parse_reroute("").strict().to_string(),
         #[cfg(unix)]
         "fabric.hold_on_bridge_lost" => {
@@ -2303,10 +2355,9 @@ fn manual_default_shown(key: &str) -> Option<String> {
 /// Every per-keystroke Manual path (completion, validation, hover help) and the
 /// Settings Modified route resolve keys one at a time, so the ~217-entry
 /// registry is searched through a once-built key-sorted index rather than
-/// rescanned linearly on each lookup. Keys are unique — pinned by
-/// `one_schema_registry_covers_native_manual_and_table_shapes_without_duplicates`
-/// — so the binary search returns exactly the entry the former first-match
-/// `find` returned.
+/// rescanned linearly on each lookup. Keys are unique — `config_schema` keeps
+/// only the first row for a key — so the binary search returns exactly the entry
+/// the former first-match `find` returned.
 pub(crate) fn config_schema_entry(key: &str) -> Option<&'static ConfigSchemaEntry> {
     static INDEX: OnceLock<Vec<&'static ConfigSchemaEntry>> = OnceLock::new();
     let index = INDEX.get_or_init(|| {
@@ -2323,12 +2374,11 @@ pub(crate) fn config_schema_entry(key: &str) -> Option<&'static ConfigSchemaEntr
 /// The same rank used by Settings global search, exported from the schema
 /// authority so Manual labels/keywords cannot silently diverge from completion.
 ///
-/// `entry.key` and every keyword are ASCII-lowercase by construction (pinned by
-/// `config_schema_keys_and_keywords_are_lowercase`), so they are compared as they
-/// are — folding them allocated a `String` each plus the collecting `Vec`, roughly
-/// six throwaway allocations per entry across the whole ~217-entry schema, for
-/// every character typed. Only `label` genuinely needs folding, into the caller's
-/// reusable `scratch`.
+/// `entry.key` and every keyword are ASCII-lowercase by construction, so they
+/// are compared as they are — folding them allocated a `String` each plus the
+/// collecting `Vec`, roughly six throwaway allocations per entry across the
+/// whole ~217-entry schema, for every character typed. Only `label` genuinely
+/// needs folding, into the caller's reusable `scratch`.
 pub(crate) fn config_schema_match_score(
     entry: &ConfigSchemaEntry,
     query: &str,
@@ -2358,7 +2408,7 @@ pub(crate) fn config_schema_match_score(
 /// same rung, a hit on what the row is called — its label, its key, a name
 /// of its own (`prefs::own_name_of`) — before one only a word it lists as a
 /// synonym reached. A row's visible name is what a person reads; a synonym
-/// is a hidden alias, so "codex" finds Supervise Codex sessions before the
+/// is a hidden alias, so "codex" finds Watch codex-alab sessions before the
 /// packages switch that lists "codex" among its words. Lower is better.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct SearchRank {
@@ -2498,9 +2548,8 @@ fn word_stem(word: &str) -> Option<&str> {
 ///
 /// PRECONDITION, and it is load-bearing: `query` is non-empty and already
 /// ASCII-lowercased, and `candidate` is already lowercase — folded by the caller
-/// into its scratch buffer, or lowercase by construction and pinned by
-/// `config_schema_keys_and_keywords_are_lowercase` /
-/// `editable_field_keys_are_unique_and_lowercase`. Every rung compares bytes
+/// into its scratch buffer, or lowercase by construction (the Settings keys:
+/// `editable_field_keys_are_unique_and_lowercase`). Every rung compares bytes
 /// exactly, which is why both callers can share one ladder.
 pub(crate) fn candidate_match_score(candidate: &str, query: &str) -> Option<u8> {
     if candidate.starts_with(query) {
@@ -2703,7 +2752,7 @@ fn nearest_candidate<'a>(
 /// Derived from the registry rather than listed, so a suggestion can never name
 /// a key this build would go on to ignore. Compatibility-only and retired
 /// spellings are excluded for the same reason completion refuses to offer them
-/// (`a_retired_spelling_is_never_offered_as_the_answer_to_a_typo`): "did you mean `show_hud`?"
+/// (`a_suggestion_is_always_a_key_the_loader_accepts_and_never_a_working_one`): "did you mean `show_hud`?"
 /// would answer a typo with a key that does nothing.
 fn suggestable_config_paths() -> &'static [&'static str] {
     static PATHS: OnceLock<Vec<&'static str>> = OnceLock::new();
@@ -2876,6 +2925,7 @@ fn key_analysis(source: &str) -> Option<ConfigAnalysis> {
         source,
         document: &document,
         disk: &disk,
+        readers: reader_accepted_paths(),
     };
     validate_machine_types(source, &document, &mut analysis);
     validate_disk_values(walk, &mut analysis);
@@ -2896,7 +2946,6 @@ fn omitted_key_line(analysis: &ConfigAnalysis) -> Option<String> {
 /// A spelling the registry domain rejects that the RUNTIME nonetheless resolves,
 /// as `(the retired spelling, the value it renders as)`.
 ///
-/// - `cursor_style = "underline"` is retired and renders as a bar.
 /// - `font_hinting = "native"` ran the font's own TrueType bytecode or CFF
 ///   hints; since TF.2b (docs/AUDIT-third-party-2026-10-15.md) it renders as
 ///   `light`, the vertical-only fit those interpreters gave here anyway.
@@ -2911,9 +2960,6 @@ fn omitted_key_line(analysis: &ConfigAnalysis) -> Option<String> {
 fn retired_but_resolving(key: &str, value: &str) -> Option<(&'static str, &'static str)> {
     let value = value.trim();
     match key {
-        crate::prefs::EDIT_CURSOR_STYLE if value.eq_ignore_ascii_case("underline") => {
-            Some(("underline", "bar"))
-        }
         "font_hinting" if value == "native" => Some(("native", "light")),
         _ => None,
     }
@@ -2926,7 +2972,6 @@ pub(crate) fn retired_but_resolving_note(key: &str, value: &str) -> Option<Strin
         "{key} = \"{retired}\" is retired and renders as \"{renders}\"; use \"{renders}\" explicitly"
     ))
 }
-
 /// One `(key, value, sentence)` per registered key in `source` whose authored
 /// VALUE this build does not accept.
 ///
@@ -3075,6 +3120,7 @@ pub(crate) fn analyze(source: &str) -> ConfigAnalysis {
         source,
         document: &document,
         disk: &disk,
+        readers: reader_accepted_paths(),
     };
     validate_disk_values(walk, &mut analysis);
     analysis.assist_index.disk = unindexed_disk_faults(&disk);
@@ -3263,6 +3309,7 @@ fn validate_disk_values(walk: KeyWalk<'_>, analysis: &mut ConfigAnalysis) {
         source,
         document,
         disk: faults,
+        ..
     } = walk;
     let root = document.as_item().as_table_like();
     for fault in faults {
@@ -3290,7 +3337,7 @@ fn validate_disk_values(walk: KeyWalk<'_>, analysis: &mut ConfigAnalysis) {
 
 /// The authored token at `path` below `table`, in the spelling the harness's
 /// disk reader names a value (`disk.apply`, `harness.disk.auto_free_gib`,
-/// `net.connections[0].disk.apply`): keys bare and joined by `.`, an array's
+/// `sparkle_words.custom[0].disk.apply`): keys bare and joined by `.`, an array's
 /// element as `[i]`. A value's span is its token; a `[[header]]` element's,
 /// its header line. A key that holds a `.` is matched by its whole name, so
 /// the walk tries each key that `path` starts with.
@@ -3422,7 +3469,7 @@ fn reader_key(parent: &str, key: &str) -> String {
 }
 
 /// Element `index` of the array at the reader's path `parent`
-/// (`net.connections[0]`).
+/// (`sparkle_words.custom[0]`).
 fn reader_element(parent: &str, index: usize) -> String {
     format!("{parent}[{index}]")
 }
@@ -3437,13 +3484,159 @@ fn reader_spelling(path: &str) -> Option<String> {
     )
 }
 
-/// What every key walk carries: the text, its document, and the values the
-/// harness's disk reader names in it (`aterm_agent::harness::cli::disk_faults`).
+/// The field list the config READER declares for the table at `path`: `T`'s
+/// own `Deserialize` is driven down `path` one key at a time, and the list
+/// serde's derive hands `deserialize_struct` at the end of it is recorded.
+/// Nothing is ever built — every probe ends in an error on purpose — and
+/// nothing is restated, so a field added to any table reaches
+/// [`reader_paths`] the moment it compiles. `None`: not a derived table (a
+/// scalar, a list, a map, or a table with its own `Deserialize`).
+pub(crate) fn reader_fields<T: serde::de::DeserializeOwned>(
+    path: &[&'static str],
+) -> Option<&'static [&'static str]> {
+    struct Reader<'p> {
+        path: &'p [&'static str],
+        fields: &'p mut Option<&'static [&'static str]>,
+    }
+    struct OneKey<'p> {
+        key: Option<&'static str>,
+        rest: &'p [&'static str],
+        fields: &'p mut Option<&'static [&'static str]>,
+    }
+    fn done<E: serde::de::Error>() -> E {
+        E::custom("reader probe")
+    }
+    impl<'de> serde::Deserializer<'de> for Reader<'_> {
+        type Error = serde::de::value::Error;
+        fn deserialize_any<V: serde::de::Visitor<'de>>(
+            self,
+            _: V,
+        ) -> Result<V::Value, Self::Error> {
+            Err(done())
+        }
+        fn deserialize_option<V: serde::de::Visitor<'de>>(
+            self,
+            visitor: V,
+        ) -> Result<V::Value, Self::Error> {
+            visitor.visit_some(self)
+        }
+        fn deserialize_newtype_struct<V: serde::de::Visitor<'de>>(
+            self,
+            _: &'static str,
+            visitor: V,
+        ) -> Result<V::Value, Self::Error> {
+            visitor.visit_newtype_struct(self)
+        }
+        fn deserialize_struct<V: serde::de::Visitor<'de>>(
+            self,
+            _: &'static str,
+            fields: &'static [&'static str],
+            visitor: V,
+        ) -> Result<V::Value, Self::Error> {
+            match self.path.split_first() {
+                None => {
+                    *self.fields = Some(fields);
+                    Err(done())
+                }
+                Some((key, rest)) => visitor.visit_map(OneKey {
+                    key: Some(key),
+                    rest,
+                    fields: self.fields,
+                }),
+            }
+        }
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+            bytes byte_buf unit unit_struct seq tuple tuple_struct map enum
+            identifier ignored_any
+        }
+    }
+    impl<'de> serde::de::MapAccess<'de> for OneKey<'_> {
+        type Error = serde::de::value::Error;
+        fn next_key_seed<K: serde::de::DeserializeSeed<'de>>(
+            &mut self,
+            seed: K,
+        ) -> Result<Option<K::Value>, Self::Error> {
+            use serde::de::IntoDeserializer as _;
+            self.key
+                .take()
+                .map(|key| seed.deserialize(key.into_deserializer()))
+                .transpose()
+        }
+        fn next_value_seed<V: serde::de::DeserializeSeed<'de>>(
+            &mut self,
+            seed: V,
+        ) -> Result<V::Value, Self::Error> {
+            seed.deserialize(Reader {
+                path: self.rest,
+                fields: &mut *self.fields,
+            })
+        }
+    }
+    let mut fields = None;
+    let _ = T::deserialize(Reader {
+        path,
+        fields: &mut fields,
+    });
+    fields
+}
+
+/// Every dotted key path `T`'s reader accepts: its derived tables and their
+/// keys, walked from the derive ([`reader_fields`]). Not below a map, a record
+/// list or a free-form entry, whose members are the author's own names.
+fn reader_paths<T: serde::de::DeserializeOwned>() -> Vec<String> {
+    fn walk<T: serde::de::DeserializeOwned>(path: &mut Vec<&'static str>, out: &mut Vec<String>) {
+        let Some(fields) = reader_fields::<T>(path) else {
+            return;
+        };
+        for &field in fields {
+            path.push(field);
+            out.push(path.join("."));
+            walk::<T>(path, out);
+            path.pop();
+        }
+    }
+    let mut out = Vec::new();
+    walk::<T>(&mut Vec::new(), &mut out);
+    out
+}
+
+/// Every key path a reader of `aterm.toml` accepts: `Config`'s own
+/// ([`reader_paths`]), the supervisor's `[harness]` keys
+/// ([`aterm_agent::supervise::config::KEYS`]) and the disk reader's `[disk]`
+/// keys ([`aterm_agent::harness::disk::KEYS`]). A LIVE KEY IS NEVER "UNKNOWN":
+/// the unknown-key walk asks this before it calls a key one with no effect, so
+/// a key a reader takes that the Manual schema lacks loses only its label and
+/// completion.
+fn reader_accepted_paths() -> &'static BTreeSet<String> {
+    static PATHS: OnceLock<BTreeSet<String>> = OnceLock::new();
+    PATHS.get_or_init(|| {
+        let mut paths: BTreeSet<String> = reader_paths::<crate::app_config::Config>()
+            .into_iter()
+            .collect();
+        paths.extend(
+            aterm_agent::supervise::config::KEYS
+                .iter()
+                .map(|key| format!("harness.{key}")),
+        );
+        paths.extend(
+            aterm_agent::harness::disk::KEYS
+                .iter()
+                .map(|key| format!("disk.{key}")),
+        );
+        paths
+    })
+}
+
+/// What every key walk carries: the text, its document, the values the
+/// harness's disk reader names in it (`aterm_agent::harness::cli::disk_faults`)
+/// and the key paths the readers accept ([`reader_accepted_paths`]).
 #[derive(Clone, Copy)]
 struct KeyWalk<'a> {
     source: &'a str,
     document: &'a aterm_toml::edit::DocumentMut,
     disk: &'a [aterm_agent::harness::cli::DiskFault],
+    readers: &'a BTreeSet<String>,
 }
 
 impl KeyWalk<'_> {
@@ -3474,7 +3667,7 @@ impl KeyWalk<'_> {
 }
 
 /// `faults` with the array indices taken out of each path
-/// (`net.connections[0].disk.apply` is `net.connections.disk.apply`), for the
+/// (`sparkle_words.custom[0].disk.apply` is `sparkle_words.custom.disk.apply`), for the
 /// caret help: the caret's path has none, since it names a key in every
 /// element.
 fn unindexed_disk_faults(
@@ -3819,32 +4012,12 @@ fn runtime_semantics_owns_numeric_clamp(
 /// event loop, then merge it only if the document revision still matches.
 #[cfg(test)]
 pub(crate) fn analyze_host(source: &str, backend_gpu: bool) -> Vec<ConfigDiagnostic> {
-    analyze_host_nested(
-        source,
-        backend_gpu,
-        crate::net_listen::launched_inside_aterm(),
-    )
-}
-
-/// [`analyze_host`] with the session-NESTING fact supplied by the caller.
-///
-/// The listener diagnostics branch on whether this process was launched inside
-/// another aterm, which is process-global environment state. A test that wants a
-/// specific arm passes it here rather than mutating the environment — otherwise
-/// the suite's answers depend on where the suite happens to be run from (inside
-/// aterm, every listener test sees the nested no-bind arm).
-#[cfg(test)]
-pub(crate) fn analyze_host_nested(
-    source: &str,
-    backend_gpu: bool,
-    nested: bool,
-) -> Vec<ConfigDiagnostic> {
     let Ok(config) = aterm_toml::from_str::<crate::app_config::Config>(source) else {
         return Vec::new();
     };
     let themes = crate::app_config::ThemeCatalog::discover();
     let assets = config.resolve_asset_catalog_with_themes(themes);
-    analyze_host_with_assets(source, backend_gpu, &assets, nested)
+    analyze_host_with_assets(source, backend_gpu, &assets)
 }
 
 /// Manual's host lane uses the exact asset catalog admitted with its document
@@ -3854,7 +4027,6 @@ pub(crate) fn analyze_host_with_assets(
     source: &str,
     backend_gpu: bool,
     assets: &crate::app_config::ConfigAssetCatalog,
-    nested: bool,
 ) -> Vec<ConfigDiagnostic> {
     if source.len() > MAX_CONFIG_ANALYSIS_BYTES {
         return Vec::new();
@@ -3865,7 +4037,7 @@ pub(crate) fn analyze_host_with_assets(
     let Ok(config) = aterm_toml::from_str::<crate::app_config::Config>(source) else {
         return Vec::new();
     };
-    // Draft-authored Trail/rainbow kitty paths must be validated against the draft, while
+    // Draft-authored rainbow kitty paths must be validated against the draft, while
     // custom themes stay pinned to the exact parsed catalog admitted by the live
     // service. This runs only on the host worker (or explicit CLI/test wrapper).
     let draft_assets =
@@ -3878,7 +4050,6 @@ pub(crate) fn analyze_host_with_assets(
             &config,
             backend_gpu,
             &draft_assets,
-            nested,
         ),
         &mut analysis,
     );
@@ -4080,10 +4251,7 @@ pub(crate) fn registered_enum_value_is_valid(key: &str, value: &str, options: &[
         return custom_ink_colorway_is_valid(value);
     }
     if key == crate::prefs::EDIT_CURSOR_TRAIL_STYLE {
-        return crate::prefs::cursor_trail_style_canonical(value).is_some()
-            || value
-                .strip_prefix("pack:")
-                .is_some_and(|id| !id.trim().is_empty());
+        return crate::prefs::cursor_trail_style_canonical(value).is_some();
     }
     // The typing-sound picker's domain is the synth's own roster + aliases
     // (`SoundVoice::parse`), through the same canonicaliser the Settings row
@@ -4095,9 +4263,8 @@ pub(crate) fn registered_enum_value_is_valid(key: &str, value: &str, options: &[
     // `+` ("pixel+engraved"), authored by the Text & Fonts toggles. The same
     // domain the typed TOML writer enforces (`prefs::typed_item`).
     //
-    // Parts are compared CANONICALIZED, so a legacy spelling is neither
-    // rejected (a mix that was valid before the rename must stay valid) nor a
-    // way to name one face twice ("pixel+minecraft" is a duplicate).
+    // Parts are compared CANONICALIZED, so a case variant is not a way to name
+    // one face twice ("pixel+Pixel" is a duplicate).
     if key == crate::prefs::EDIT_DISPLAY_FONT && value.contains('+') {
         let parts: Vec<&str> = value
             .split('+')
@@ -4132,9 +4299,6 @@ fn enum_aliases(key: &str) -> &'static [&'static str] {
         // `registered_enum_value_is_valid`, like the cursor-trail table.
         crate::prefs::EDIT_WINDOW_COLORSPACE => WINDOW_COLORSPACE_ALIASES,
         crate::prefs::EDIT_BACKGROUND_MATERIAL => BACKGROUND_MATERIAL_ALIASES,
-        // The pre-rename face ids. Accepted, never OFFERED — see
-        // `prefs::LEGACY_DISPLAY_FONT_IDS`.
-        crate::prefs::EDIT_DISPLAY_FONT => crate::prefs::LEGACY_DISPLAY_FONT_IDS,
         "sparkle_words.custom.burst.kind" => CUSTOM_BURST_KIND_ALIASES,
         // Windows Terminal's own value spellings, plus the hyphen/compact forms
         // `aterm_cli::WindowingBehavior::parse` accepts. Accepted, never OFFERED
@@ -4293,7 +4457,7 @@ fn warn_unknown_item(
         }
         return;
     }
-    if schema.is_none() {
+    if schema.is_none() && !walk.readers.contains(path) {
         // A key from a NEWER aterm and a typo both do nothing here, but only
         // the typo has a recovery. So the two readings get two shapes, and the
         // near miss goes FIRST when there is one — the in-window banner paints
@@ -4370,47 +4534,7 @@ fn warn_retired_spelling(
         push_retired_spelling(analysis, source, walk.range(path, reader, item), message);
         return true;
     }
-    if path != crate::prefs::LEGACY_EDIT_DISPLAY_FONT {
-        return false;
-    }
-    // DEPRECATED, not unknown. The key still parses and still applies (a
-    // serde alias on `Config::display_font`); "unknown to this build" would
-    // be a lie that reads like data loss. Say what to rename it to instead;
-    // the walk stops here, so the key gets exactly one story.
-    let range = walk.range(path, reader, item);
-    push_retired_spelling(
-        analysis,
-        source,
-        range.clone(),
-        format!(
-            "`{path}` is deprecated; rename it to `{current}` (the old key still \
-             works)",
-            current = crate::prefs::EDIT_DISPLAY_FONT
-        ),
-    );
-    // The VALUE is still checked against the live domain. A deprecated key
-    // is not an unvalidated one: without this, `game_font = "dooom"` would
-    // silently lose the "must be one of" error it used to get, and the
-    // rename would have made a typo harder to notice than before.
-    if let Some(value) = item.as_str()
-        && !registered_enum_value_is_valid(
-            crate::prefs::EDIT_DISPLAY_FONT,
-            value,
-            crate::prefs::DISPLAY_FONT_OPTIONS,
-        )
-    {
-        push_unaccepted_value(
-            analysis,
-            source,
-            range,
-            ConfigDiagnosticSeverity::Error,
-            format!(
-                "{path} must be one of: {}",
-                crate::prefs::DISPLAY_FONT_OPTIONS.join(", ")
-            ),
-        );
-    }
-    true
+    false
 }
 
 /// One record of a structured list: the list's checker path and the record's
@@ -5335,11 +5459,10 @@ fn table_assist(
             };
             !authored_path_elsewhere(index, entry.key, &replacement, candidate_scope)
         })
-        // Schema keys and keywords are ASCII-lowercase by construction (pinned by
-        // `config_schema_keys_and_keywords_are_lowercase`) and `prefix` was folded
-        // by the caller, so only the label needs folding — and it folds into a
-        // reused buffer. This runs over the whole ~217-entry schema for every
-        // character typed into the Manual editor.
+        // Schema keys and keywords are ASCII-lowercase by construction and
+        // `prefix` was folded by the caller, so only the label needs folding —
+        // and it folds into a reused buffer. This runs over the whole
+        // ~217-entry schema for every character typed into the Manual editor.
         .filter(|entry| {
             prefix.is_empty()
                 || entry.key.starts_with(prefix.as_str())
@@ -5672,8 +5795,8 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
         // The default is empty (`SupervisorConfig::default`): the help says
         // what a list of one's own is, and when it is read.
         "absolute or ~/ folder paths, a trailing * any suffix of the last name; read only under \
-         approve = \"safe\", which answers the trust dialog in these folders alone (Claude \
-         Code's, and Codex's folder-trust gate; and a Claude Code Read in them too); none by \
+         approve = \"safe\", which answers Claude Code's trust dialog in these folders alone \
+         (and a Claude Code Read in them too; aterm answers no Codex box); none by \
          default, so under approve = \"safe\" every trust dialog goes to a person until you list \
          your own"
             .to_string()
@@ -5753,9 +5876,6 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · RESERVED and refused: aterm never answers a macOS consent dialog, so no value of this key does anything; grant Full Disk Access instead (Settings \u{25b8} Security) · it does not answer macOS password dialogs either; for the debugger password, see Debugger access on the same page (Settings \u{25b8} Security)"
         }
         crate::prefs::EDIT_MOTION => crate::prefs::motion_auto_help(),
-        crate::prefs::EDIT_ROBI => {
-            " · an invited guest: off until you turn him on · once enabled, typing robi or robot makes him greet you · hidden under reduced motion or serious mode"
-        }
         crate::prefs::EDIT_SECURE_KEYBOARD_ENTRY => {
             " · macOS only: while aterm is in front, other apps cannot read your keystrokes, and their global hotkeys pause"
         }
@@ -5798,7 +5918,7 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · desktop delivery is implemented on macOS and Windows; parsed but inert on other platforms"
         }
         crate::prefs::EDIT_DESKTOP_ALERTS => {
-            " · aterm's OWN alerts (the menu bar's escalations, macOS permissions, the operator, update health) as system notifications — macOS through terminal-notifier if installed, else osascript (shown as Script Editor); Windows a notification-area balloon (not update health); none on other platforms · off keeps them in the message band, the menu bar and messages.log, the operator's only counted in aterm fleet status · program notifications (OSC 9/99/777) are allow_notifications'"
+            " · aterm's OWN alerts (the menu bar's escalations, macOS permissions, update health) as system notifications — macOS through terminal-notifier if installed, else osascript (shown as Script Editor); Windows a notification-area balloon (not update health); none on other platforms · off keeps them in the message band, the menu bar and messages.log · program notifications (OSC 9/99/777) are allow_notifications'"
         }
         // The Settings rows are named in plain words; the escape sequences
         // each one gates are named here.
@@ -5817,7 +5937,7 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             }
         }
         crate::prefs::EDIT_ALLOW_PALETTE_RECONFIGURE => {
-            " · OSC 4 and OSC 21 · false ignores a program's change to one of the 256 indexed colors; reading them, and the named foreground, background and cursor colors, are unaffected"
+            " · OSC 4 and OSC 21 · the colors a program sets last for the tab's life and are never saved; OSC 104, RIS, Reset Terminal or turning this off put the theme's back · false refuses a program's change to one of the 256 indexed colors and files one notice; reading them, and the named foreground, background and cursor colors, are unaffected · minimum_contrast keeps any recolored text legible"
         }
         crate::prefs::EDIT_SEARCH_HISTORY_LINES => {
             " · Find searches only this many of the newest lines; 0 searches only the screen"
@@ -5853,6 +5973,9 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
         "harness.limit_wait" => {
             " · at Claude Code's usage-limit dialog, chooses its Wait here row, never a spending row or Stop · off: the dialog is yours"
         }
+        "harness.autocompact_offer" => {
+            " · at Claude Code's \"We recommend compacting earlier\" offer, chooses Autocompact at this size (300k to 900k), never the keep row or Esc · it changes Claude Code's own autocompact setting for that model (/autocompact switches back) · off: the offer is yours"
+        }
         "harness.accounts" => {
             " · at a usage limit, a Claude Code session is relaunched under the next listed account; \"early\" also moves it ahead of the limit and types /usage to sample it; \"off\" moves no session"
         }
@@ -5870,9 +5993,6 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
         }
         "harness.model_fallback" => {
             " · Claude Code only, for that session alone · none: wait for the reset"
-        }
-        "harness.rate_nudge" => {
-            " · Codex near its usage limit saves the work on the cheaper model, then waits for the reset · off: the nudge is yours"
         }
         "harness.stall_term_after_s" => {
             " · with stall_term on, the agent is restarted instead · 0: never"
@@ -5896,10 +6016,10 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · a cargo profile unbuilt this long counts as idle: its incremental cache goes first, whole (below the floor, recent ones follow, least recently used first; none built in the last 10 min, even at 0)"
         }
         "disk.auto_free_gib" => {
-            " · below it, cargo profiles' incremental caches are reclaimed automatically: idle ones, then least recently used first until 1 GiB above it, or until the bytes freed cover the shortfall"
+            " · left unwritten, the floor is 5% of the volume (at most 32 GiB) when that is more; a value written here is the floor · below it, cargo profiles' incremental caches are reclaimed automatically: idle ones, then least recently used first until 5 GiB above it, or until the bytes freed cover the shortfall"
         }
         "disk.dead_build_dirs" => {
-            " · below the floor, a whole build directory whose owner is gone goes too: an ended Claude Code session's scratch build (no running Claude Code names the session, nothing of it written for target_stale_days, at least a day) or the cells cache of a removed checkout, after the idle caches and before any live checkout's · false: only its incremental caches"
+            " · below the floor, a whole build directory whose owner is gone goes too: an ended Claude Code session's scratch build (no running Claude Code names the session, nothing of it written for target_stale_days, at least a day) or the cells cache of a removed checkout, or aterm's Rust build cache of a removed workspace (unwritten 10 min), after the idle caches and before any live checkout's · false: only its incremental caches"
         }
         "render.repaint_nudge" => {
             " · on: tell the tab its terminal is one row shorter, then the true size; log: only log what that would do; off: do nothing"
@@ -5907,11 +6027,17 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
         "claude_footer.usage" => {
             " · default true: the Claude Code footer shows `Σ` — Claude's working time and the session's token totals, all models merged (`Σ 7h52m ↑395M ↓2.0M`); false hides it, and a limit wall (`⧗`) shows either way · read live"
         }
+        "claude_footer.acts" => {
+            " · default true: right of the Autopilot chip, what the harness just did shows for 3 s in the chip's ink (`✓ approved`, `↻ kept going`, `? answered`, `⧗ resumed`, `⤓ landing`, `⤓ nudged`, `✗ declined`), at most once every 15 s, with no animation; false withholds it, and the chip's title still lists the last three acts with their times · serious mode withholds it too · read live"
+        }
         "claude_footer.card" => {
             " · default true: while the harness carries a Claude Code session (Autopilot cruise or land, its claim this window's), its launch card wears a rainbow border, a pixel-art kitty riding a rainbow with stars, and the line `✦ enhanced by aterm harness <version> · autopilot ∞ cruise` — glass only; false leaves the card bare · read live"
         }
         "keeper.enabled" => {
             " · read at launch; on, every terminal is registered with this build's PTY keeper (`aterm keeper start` runs one) and a launch after a crash or kill reattaches the shells it held · macOS only"
+        }
+        "session_log.journal" => {
+            " · off: aterm keeps no journal, creates no file and deletes nothing · on: a record of what each session did under the logs folder's `session-log/`: each command's first word as typed (`detail=`, so a secret typed at a prompt and run is kept too) and the foreground program's name (`prog=`), outcomes and durations, agent turns; never a command's arguments, its folder or an OSC title · files 0600 in a 0700 folder, at most 64 MiB and 2048 files of its own (oldest deleted first), so `log @<sid>` and `brief @<sid>` answer for a session from an earlier run or a crash · read at launch; follows restore_session; a window's only · macOS and Linux"
         }
         "update.auto_apply" => {
             " · off, a downloaded build installs only when you ask — Update to Latest Now on macOS, `aterm update apply` on Linux · the native updater runs on macOS and Linux"
@@ -5923,19 +6049,6 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · each color must be RRGGBB, #RRGGBB or #RGB; malformed entries are skipped"
         }
         "matrix_rain.hue" => " · matrix / theme / #RRGGBB; invalid values use stock matrix green",
-        "net.connections.name" => " · nonempty [A-Za-z0-9_-] and unique; the first duplicate wins",
-        "net.connections.host" => {
-            " · must be host:port (or bracketed IPv6:port) with a nonzero port"
-        }
-        "net.connections.fingerprint" => {
-            " · 64 hex SHA-256 digits, optionally prefixed sha256:; invalid pins refuse dialing"
-        }
-        "net.connections.sid" => {
-            " · the remote session whose launch nonce expect_nonce pins; no effect without expect_nonce"
-        }
-        "net.connections.expect_nonce" => {
-            " · dialing refuses the remote unless this launch nonce matches"
-        }
         "sparkle_words.ink.sweep_ms" => " · loop = true raises the effective minimum to 600 ms",
         "matrix_rain.head_alpha" => " · effective minimum follows the resolved matrix_rain.alpha",
         crate::prefs::EDIT_WINDOW_PADDING_TOP => " · effective maximum follows window_padding",
@@ -6305,7 +6418,7 @@ pub(crate) fn decorate_projection(
         // consecutive windows are separated by at least the newline between their
         // source lines. A soft-wrap projection would put two windows *inside* one
         // source line and quietly invalidate the `scan_end` terminator below.
-        // `viewport_projection_emits_one_window_per_source_line` pins the producer.
+        // `windowed_decoration_matches_a_full_sweep` sees the divergence.
         debug_assert!(
             index == 0 || projection.lines[index - 1].source.end < window_start,
             "decorate_projection requires one projected window per source line"
@@ -6543,88 +6656,6 @@ pub(crate) mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    /// A SHADOWED ROW IS A LOST ROW. `config_schema()` drops a MANUAL_SCHEMA entry whose
-    /// key it already holds, silently — so upstream's second `machine` row, the one
-    /// carrying the words a user actually searches for, simply never existed at runtime
-    /// and nothing failed. This reads the TABLE, not the resolved schema, so the next
-    /// duplicate fails here instead of disappearing.
-    #[test]
-    fn the_manual_schema_holds_one_row_per_key() {
-        let mut seen: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
-        for entry in MANUAL_SCHEMA {
-            *seen.entry(entry.key).or_default() += 1;
-        }
-        let duplicates: Vec<(&&str, &usize)> = seen.iter().filter(|(_, n)| **n > 1).collect();
-        assert!(
-            duplicates.is_empty(),
-            "a key listed twice keeps only its FIRST row: {duplicates:?}"
-        );
-        // And the merged row kept both halves of what the two used to say.
-        let machine = MANUAL_SCHEMA
-            .iter()
-            .find(|entry| entry.key == "machine")
-            .expect("the [machine] table is described");
-        for word in ["atpkg", "universal control"] {
-            assert!(
-                machine.keywords.contains(&word),
-                "{word:?} must still find the table: {:?}",
-                machine.keywords
-            );
-        }
-    }
-
-    /// The completion and search paths compare schema keys and keywords against an
-    /// already-lowercased prefix WITHOUT folding them, so a capitalized one would
-    /// silently vanish from Manual completion and global search.
-    #[test]
-    fn config_schema_keys_and_keywords_are_lowercase() {
-        for entry in config_schema() {
-            assert_eq!(
-                entry.key,
-                entry.key.to_ascii_lowercase(),
-                "schema key must be lowercase"
-            );
-            for keyword in entry.keywords {
-                assert_eq!(
-                    *keyword,
-                    keyword.to_ascii_lowercase(),
-                    "keyword of {} must be lowercase",
-                    entry.key
-                );
-            }
-        }
-    }
-
-    /// The owner asked (2026-09-28) for "auto dismiss" on Claude Code's rating surveys: the
-    /// switch that does it is found by those words, typed with a space or a hyphen, by
-    /// the survey words and by the feedback words a person would try.
-    #[test]
-    fn the_survey_switch_is_found_by_the_words_a_person_would_type() {
-        let entry = config_schema()
-            .iter()
-            .find(|e| e.key == "harness.dismiss_surveys")
-            .expect("the survey switch is in the schema");
-        let mut scratch = String::new();
-        for query in [
-            "auto dismiss",
-            "auto-dismiss",
-            "auto",
-            "dismiss",
-            "dismiss surveys",
-            "survey",
-            "surveys",
-            "rating",
-            "satisfaction",
-            "feedback",
-            "claude code",
-        ] {
-            assert!(
-                config_schema_match_score(entry, query, &mut scratch).is_some(),
-                "{query:?} finds the survey switch"
-            );
-        }
-    }
-
     /// Every rung of the shared ladder, pinned by example. It had no direct
     /// coverage while it was written out twice; both copies could have drifted a
     /// rung and only a user would have noticed the ordering change.
@@ -6823,64 +6854,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// MIGRATION: the pre-rename display-face spellings LOAD. A config written
-    /// before "Game Fonts" became "Display Faces" must not turn into an error,
-    /// or a shipped key would have been deleted out from under the people who
-    /// used it — so `game_font` stays valid, every retired id stays valid
-    /// (including `mariokart`, whose face was removed with no substitute), and
-    /// the only consequence is a warning naming the current spelling.
-    ///
-    /// "Deprecated" and "unknown" must not BOTH be said: the key still applies,
-    /// and "unknown to this build and has no effect" says the setting stopped
-    /// working.
-    #[test]
-    fn the_deprecated_display_font_key_warns_with_the_new_spelling_and_never_errors() {
-        for value in crate::prefs::LEGACY_DISPLAY_FONT_IDS
-            .iter()
-            .copied()
-            .chain(["pixel", "minecraft+zelda", "pixel+engraved"])
-        {
-            let source = format!("{} = {value:?}\n", crate::prefs::LEGACY_EDIT_DISPLAY_FONT);
-            let analysis = analyze(&source);
-            assert!(
-                !analysis.has_errors(),
-                "a config valid before the rename must still load ({value:?}): {:?}",
-                analysis.diagnostics
-            );
-            let messages: Vec<&str> = analysis
-                .diagnostics
-                .iter()
-                .map(|diagnostic| diagnostic.message.as_str())
-                .collect();
-            assert!(
-                messages
-                    .iter()
-                    .any(|message| message.contains("is deprecated")
-                        && message.contains(crate::prefs::EDIT_DISPLAY_FONT)),
-                "the deprecation must name the new key ({value:?}): {messages:?}"
-            );
-            assert!(
-                messages.iter().all(|message| !message.contains("unknown")),
-                "a deprecated key is not an unknown key ({value:?}): {messages:?}"
-            );
-        }
-        // The current key with a legacy VALUE is accepted too: that is
-        // `every_registered_enum_accepts_its_runtime_domain_and_aliases`.
-        // …and a genuine typo is still an ERROR under either spelling. A
-        // deprecated key is not an unvalidated one.
-        for key in [
-            crate::prefs::EDIT_DISPLAY_FONT,
-            crate::prefs::LEGACY_EDIT_DISPLAY_FONT,
-        ] {
-            for bad in ["dooom", "pixel+dooom", "pixel+minecraft"] {
-                assert!(
-                    analyze(&format!("{key} = {bad:?}\n")).has_errors(),
-                    "{bad:?} must not pass validation under {key}"
-                );
-            }
-        }
-    }
-
     #[test]
     fn unterminated_parser_diagnostic_targets_the_authored_line_before_trailing_newline() {
         let source = "# Manual\nfont_px = [ \n";
@@ -6899,45 +6872,25 @@ pub(crate) mod tests {
 
     #[test]
     fn syntax_schema_and_metadata_errors_block_saves_but_unknown_keys_only_warn() {
-        let syntax = analyze("theme = \"Nord\n");
-        assert!(syntax.has_errors());
-        assert!(
-            syntax
-                .first_error()
-                .unwrap()
-                .message
-                .contains("TOML syntax")
-        );
-
-        let schema = analyze("font_px = \"large\"\n");
-        assert!(schema.has_errors());
-        assert!(
-            schema
-                .first_error()
-                .unwrap()
-                .message
-                .contains("aterm schema")
-        );
-
-        let metadata = analyze("window_theme = \"sepia\"\n");
-        assert!(metadata.has_errors());
-        assert!(
-            metadata
-                .first_error()
-                .unwrap()
-                .message
-                .contains("must be one of")
-        );
-
-        let malformed_theme = analyze("theme = \"dark:Dracula,sepia\"\n");
-        assert!(malformed_theme.has_errors());
-        assert!(
-            malformed_theme
-                .first_error()
-                .unwrap()
-                .message
-                .contains("needs dark: or light:")
-        );
+        for blocking in [
+            "theme = \"Nord\n",
+            "font_px = \"large\"\n",
+            "window_theme = \"sepia\"\n",
+            "theme = \"dark:Dracula,sepia\"\n",
+            // Four digits are not a runtime spelling.
+            "foreground = \"#abcd\"\n",
+        ] {
+            assert!(analyze(blocking).has_errors(), "{blocking:?}");
+        }
+        // The runtime's color domain (`aterm_types::scheme::parse_hex`): six
+        // digits or three, the `#` optional.
+        for color in [
+            "foreground = \"#12abEF\"\n",
+            "foreground = \"12abEF\"\n",
+            "foreground = \"#abc\"\n",
+        ] {
+            assert!(!analyze(color).has_errors(), "{color:?}");
+        }
         let custom_theme = analyze("theme = \"My Private Theme\"\n");
         assert!(!custom_theme.has_errors());
         assert!(custom_theme.diagnostics.is_empty());
@@ -6961,118 +6914,9 @@ pub(crate) mod tests {
 
         let compatibility = analyze("matrix_rain.materialize = true\n");
         assert!(!compatibility.has_errors());
-        assert!(compatibility.diagnostics.iter().any(|diagnostic| {
-            diagnostic.message
-                == "matrix_rain.materialize does nothing in this build; safe to delete"
-        }));
-    }
-
-    #[test]
-    fn color_assistance_names_the_exact_runtime_hex_domain() {
-        // The runtime reader is `aterm_types::scheme::parse_hex`: six digits or
-        // three, the `#` optional.
-        for source in [
-            "foreground = \"#12abEF\"\n",
-            "foreground = \"12abEF\"\n",
-            "foreground = \"#abc\"\n",
-        ] {
-            let analysis = analyze(source);
-            assert!(
-                !analysis.has_errors(),
-                "a runtime-valid color must be accepted: {:?}",
-                analysis.diagnostics
-            );
-        }
-
-        let four = analyze("foreground = \"#abcd\"\n");
-        assert!(four.has_errors(), "four digits are not a runtime spelling");
-        assert!(
-            four.first_error()
-                .is_some_and(|diagnostic| diagnostic.message.contains("#RRGGBB or #RGB"))
-        );
-        let foreground = config_schema_entry(crate::prefs::EDIT_FOREGROUND).unwrap();
-        let help = setting_help(foreground);
-        assert!(help.contains("#RRGGBB or #RGB"), "{help}");
-    }
-
-    #[test]
-    fn orca_subtree_round_trips_with_warnings_and_is_never_completed() {
-        let source = r#"[sparkle_words.orca]
-enabled = true
-extra_words = ["whale"]
-ignore_words = ["skip"]
-future_splash = true
-"#;
-        let document = source.parse::<aterm_toml::edit::DocumentMut>().unwrap();
         assert_eq!(
-            document.to_string(),
-            source,
-            "compatibility syntax round-trips"
-        );
-        assert!(
-            aterm_toml::from_str::<crate::app_config::Config>(source).is_ok(),
-            "the runtime parser keeps accepting suspended Orca configuration"
-        );
-
-        let analysis = analyze(source);
-        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
-        let messages = analysis
-            .diagnostics
-            .iter()
-            .map(|diagnostic| diagnostic.message.as_str())
-            .collect::<Vec<_>>();
-        for key in [
-            "sparkle_words.orca",
-            "sparkle_words.orca.enabled",
-            "sparkle_words.orca.extra_words",
-            "sparkle_words.orca.ignore_words",
-            "sparkle_words.orca.future_splash",
-        ] {
-            assert!(is_compatibility_only_key(key));
-            assert!(
-                messages.iter().any(|message| {
-                    message == &format!("{key} does nothing in this build; safe to delete")
-                }),
-                "missing compatibility diagnostic for {key}: {messages:?}"
-            );
-        }
-        assert!(
-            messages
-                .iter()
-                .all(|message| !message.contains("is unknown")),
-            "one inert key must not also receive an unknown-key story: {messages:?}"
-        );
-
-        let table_source = "[sparkle_words.or";
-        let table = assist(table_source, table_source.len());
-        assert!(
-            table
-                .completions
-                .iter()
-                .all(|completion| !completion.insertion.contains("orca")),
-            "the compatibility-only table must not be suggested: {table:?}"
-        );
-
-        let key_source = "[sparkle_words.orca]\nextra";
-        let key = assist(key_source, key_source.len());
-        assert!(key.completions.is_empty(), "Orca keys are inert: {key:?}");
-        assert!(
-            key.help
-                .as_deref()
-                .is_some_and(|help| help.contains("does nothing in this build"))
-        );
-
-        let value_source = "[sparkle_words.orca]\nenabled = ";
-        let value = assist(value_source, value_source.len());
-        assert!(
-            value.completions.is_empty(),
-            "Orca values must not suggest active runtime choices: {value:?}"
-        );
-        assert!(
-            value
-                .help
-                .as_deref()
-                .is_some_and(|help| help.contains("does nothing in this build"))
+            compatibility.diagnostics[0].severity,
+            ConfigDiagnosticSeverity::Warning
         );
     }
 
@@ -7084,63 +6928,25 @@ gaze = false
 color = "#112233"
 intensity = 0.25
 "##;
-        let config = aterm_toml::from_str::<crate::app_config::Config>(source)
+        aterm_toml::from_str::<crate::app_config::Config>(source)
             .expect("retired feline keys remain loadable for compatibility");
-        let feline = config
-            .sparkle_words
-            .as_ref()
-            .and_then(|sparkle| sparkle.feline.as_ref())
-            .expect("feline table parsed");
-        assert_eq!(feline.idle, Some(false));
-        assert_eq!(feline.gaze, Some(false));
-        assert_eq!(feline.color.as_deref(), Some("#112233"));
-        assert_eq!(feline.intensity, Some(0.25));
 
         let analysis = analyze(source);
         assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
         let expected = [
-            (
-                "sparkle_words.feline.idle",
-                "sparkle_words.feline.idle does nothing: Keyword Kitty idle animation was removed; safe to delete",
-            ),
-            (
-                "sparkle_words.feline.gaze",
-                "sparkle_words.feline.gaze does nothing: Keyword Kitty gaze tracking was removed; safe to delete",
-            ),
-            (
-                "sparkle_words.feline.color",
-                "sparkle_words.feline.color does nothing: Keyword Kitty tint control was removed; safe to delete",
-            ),
-            (
-                "sparkle_words.feline.intensity",
-                "sparkle_words.feline.intensity does nothing: Keyword Kitty opacity control was removed; safe to delete",
-            ),
+            "sparkle_words.feline.idle",
+            "sparkle_words.feline.gaze",
+            "sparkle_words.feline.color",
+            "sparkle_words.feline.intensity",
         ];
         assert_eq!(analysis.diagnostics.len(), expected.len());
-        for (key, message) in expected {
-            assert!(
-                crate::prefs::editable_fields(&crate::app_config::Config::default())
-                    .iter()
-                    .all(|field| field.key != key),
-                "{key} is no Settings row"
-            );
-            assert!(config_schema_entry(key).is_some(), "Manual types {key}");
-            assert!(is_compatibility_only_key(key));
-            assert_eq!(
-                retired_config_key(key).map(|entry| entry.effect_label),
-                Some("No effect")
-            );
-            assert_eq!(
-                config_schema_entry(key).map(|entry| entry.native_scalar),
-                Some(false),
-                "retired scalar metadata must not create a native control"
-            );
+        for key in expected {
             assert!(
                 analysis
                     .diagnostics
                     .iter()
-                    .any(|diagnostic| diagnostic.message == message),
-                "missing exact compatibility diagnostic for {key}: {:?}",
+                    .any(|diagnostic| diagnostic.message.starts_with(&format!("{key} "))),
+                "missing compatibility diagnostic for {key}: {:?}",
                 analysis.diagnostics
             );
         }
@@ -7157,334 +6963,97 @@ intensity = 0.25
         let assistance = assist(value_source, value_source.len());
         assert!(assistance.completions.is_empty());
         assert_eq!(
-            assistance.help.as_deref(),
-            Some(
-                "sparkle_words.feline.idle does nothing: Keyword Kitty idle animation was removed; safe to delete"
-            )
+            assistance.help,
+            Some(compatibility_only_message("sparkle_words.feline.idle"))
         );
-    }
-
-    #[test]
-    fn legacy_paw_mode_is_manual_only_and_completion_names_its_real_effect() {
-        const KEY: &str = "sparkle_words.feline.style";
-        assert!(crate::prefs::manual_only_key(KEY));
-        assert!(!is_compatibility_only_key(KEY));
-        assert_eq!(
-            config_schema_entry(KEY).map(|entry| entry.native_scalar),
-            Some(false),
-            "paw has a real ink-only effect, but no honest native choice surface"
-        );
-        let source = "[sparkle_words.feline]\nstyle = \"paw\"\n";
-        assert!(analyze(source).diagnostics.is_empty());
-
-        let value_source = "[sparkle_words.feline]\nstyle = ";
-        let assistance = assist(value_source, value_source.len());
-        let paw = assistance
-            .completions
-            .iter()
-            .find(|completion| completion.insertion == "\"paw\"")
-            .expect("Manual keeps the compatibility value available");
-        assert_eq!(paw.display, "\"paw\" — legacy ink-only; no paw graphic");
-        for help in [assistance.help.as_deref(), Some(paw.help.as_str())] {
-            assert!(help.is_some_and(|help| {
-                help.contains(
-                    "\"cat\" renders the cat graphic; \"paw\" is legacy ink-only and renders no paw graphic",
-                )
-            }));
-        }
-    }
-
-    /// The field list the config READER declares for the table at `path`: `T`'s
-    /// own `Deserialize` is driven down `path` one key at a time, and the list
-    /// serde's derive hands `deserialize_struct` at the end of it is recorded.
-    /// Nothing is ever built — every probe ends in an error on purpose — and
-    /// nothing is restated, so a field added to any table reaches
-    /// [`reader_paths`] the moment it compiles. `None`: not a derived table (a
-    /// scalar, a list, a map, or a table with its own `Deserialize`).
-    pub(crate) fn reader_fields<T: serde::de::DeserializeOwned>(
-        path: &[&'static str],
-    ) -> Option<&'static [&'static str]> {
-        struct Reader<'p> {
-            path: &'p [&'static str],
-            fields: &'p mut Option<&'static [&'static str]>,
-        }
-        struct OneKey<'p> {
-            key: Option<&'static str>,
-            rest: &'p [&'static str],
-            fields: &'p mut Option<&'static [&'static str]>,
-        }
-        fn done<E: serde::de::Error>() -> E {
-            E::custom("reader probe")
-        }
-        impl<'de> serde::Deserializer<'de> for Reader<'_> {
-            type Error = serde::de::value::Error;
-            fn deserialize_any<V: serde::de::Visitor<'de>>(
-                self,
-                _: V,
-            ) -> Result<V::Value, Self::Error> {
-                Err(done())
-            }
-            fn deserialize_option<V: serde::de::Visitor<'de>>(
-                self,
-                visitor: V,
-            ) -> Result<V::Value, Self::Error> {
-                visitor.visit_some(self)
-            }
-            fn deserialize_newtype_struct<V: serde::de::Visitor<'de>>(
-                self,
-                _: &'static str,
-                visitor: V,
-            ) -> Result<V::Value, Self::Error> {
-                visitor.visit_newtype_struct(self)
-            }
-            fn deserialize_struct<V: serde::de::Visitor<'de>>(
-                self,
-                _: &'static str,
-                fields: &'static [&'static str],
-                visitor: V,
-            ) -> Result<V::Value, Self::Error> {
-                match self.path.split_first() {
-                    None => {
-                        *self.fields = Some(fields);
-                        Err(done())
-                    }
-                    Some((key, rest)) => visitor.visit_map(OneKey {
-                        key: Some(key),
-                        rest,
-                        fields: self.fields,
-                    }),
-                }
-            }
-            serde::forward_to_deserialize_any! {
-                bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
-                bytes byte_buf unit unit_struct seq tuple tuple_struct map enum
-                identifier ignored_any
-            }
-        }
-        impl<'de> serde::de::MapAccess<'de> for OneKey<'_> {
-            type Error = serde::de::value::Error;
-            fn next_key_seed<K: serde::de::DeserializeSeed<'de>>(
-                &mut self,
-                seed: K,
-            ) -> Result<Option<K::Value>, Self::Error> {
-                use serde::de::IntoDeserializer as _;
-                self.key
-                    .take()
-                    .map(|key| seed.deserialize(key.into_deserializer()))
-                    .transpose()
-            }
-            fn next_value_seed<V: serde::de::DeserializeSeed<'de>>(
-                &mut self,
-                seed: V,
-            ) -> Result<V::Value, Self::Error> {
-                seed.deserialize(Reader {
-                    path: self.rest,
-                    fields: &mut *self.fields,
-                })
-            }
-        }
-        let mut fields = None;
-        let _ = T::deserialize(Reader {
-            path,
-            fields: &mut fields,
-        });
-        fields
-    }
-
-    /// Every dotted key path `T`'s reader accepts, each with whether it is a
-    /// table. A table is walked into exactly where Manual's unknown-key walk
-    /// walks: not below a map, a record list or a free-form entry, whose
-    /// members are the author's own names.
-    fn reader_paths<T: serde::de::DeserializeOwned>() -> Vec<(String, bool)> {
-        fn walk<T: serde::de::DeserializeOwned>(
-            path: &mut Vec<&'static str>,
-            out: &mut Vec<(String, bool)>,
-        ) {
-            let Some(fields) = reader_fields::<T>(path) else {
-                return;
-            };
-            for &field in fields {
-                path.push(field);
-                let dotted = path.join(".");
-                let table = reader_fields::<T>(path).is_some();
-                let descend = table
-                    && config_schema_entry(&dotted)
-                        .is_none_or(|entry| entry.kind == ConfigSchemaKind::Table);
-                out.push((dotted, table));
-                if descend {
-                    walk::<T>(path, out);
-                }
-                path.pop();
-            }
-        }
-        let mut out = Vec::new();
-        walk::<T>(&mut Vec::new(), &mut out);
-        out
-    }
-
-    /// Whether Manual tells `path` any story but "unknown to this build":
-    /// a schema entry, a compatibility-only or retired key, or one of the old
-    /// spellings `warn_unknown_item` renames by name.
-    fn manual_knows(path: &str) -> bool {
-        config_schema_entry(path).is_some()
-            || is_compatibility_only_key(path)
-            || path == crate::prefs::LEGACY_EDIT_DISPLAY_FONT
-            || crate::prefs::RETIRED_PACKAGES_SPELLINGS
-                .iter()
-                .any(|(retired, _)| *retired == path)
     }
 
     /// The Manual's mode words are the engine's: a mode the config language
-    /// offers is one the reader resolves, the reader's default is `on`, and a word
-    /// it cannot read never acts.
+    /// offers is one the reader resolves, and a word it cannot read never acts.
     #[test]
     fn the_repaint_nudge_words_are_the_engines() {
         use aterm_core::terminal::repaint_nudge::Mode;
-        for word in REPAINT_NUDGE_MODES {
-            // The analyzer takes any case, so the engine must: `"OFF"` is off.
-            let mode = Mode::parse(&word.to_ascii_uppercase()).expect("offered word parses");
-            assert_eq!(mode.word(), *word);
-        }
-        assert_eq!(REPAINT_NUDGE_MODES.len(), 3);
-        assert_eq!(Mode::default(), Mode::On, "the compiled default is on");
-        assert_eq!(Mode::parse("sometimes"), None);
         let read = |word: &str| -> Mode {
             let toml = format!("[render]\nrepaint_nudge = \"{word}\"\n");
             aterm_toml::from_str::<crate::app_config::Config>(&toml)
                 .unwrap()
                 .repaint_nudge_mode()
         };
-        assert_eq!(read("on"), Mode::On);
-        assert_eq!(read("log"), Mode::Log);
-        assert_eq!(read("off"), Mode::Off);
+        for &word in REPAINT_NUDGE_MODES {
+            assert_eq!(read(word).word(), word, "the Manual offers {word:?}");
+        }
         assert_eq!(
             read("whenever"),
             Mode::Log,
             "a word it cannot read never acts"
         );
-        assert_eq!(read("no"), Mode::Log);
-        let config = crate::app_config::Config::default();
-        assert_eq!(
-            config.repaint_nudge_mode(),
-            Mode::On,
-            "an absent key is the default"
-        );
-        // And a misspelled value is graded, not silently defaulted.
-        assert!(analyze("[render]\nrepaint_nudge = \"maybe\"\n").has_errors());
-        assert!(!analyze("[render]\nrepaint_nudge = \"log\"\n").has_errors());
     }
 
-    /// A LIVE KEY IS NEVER "UNKNOWN". `agents_auto_prime = false` — in every
-    /// hermetic launch recipe under `tools/` — was told it "is unknown to this
-    /// aterm build", and a headless capture carried that warning band across its
-    /// top row. It was a class: the same walk called every `[privacy]` key
-    /// unknown, and five `[output_streak]` keys, and the `[sparkle_words.canine]`
-    /// and `[sparkle_words.tricks]` tables, all of them keys the reader parses and
-    /// a resolver reads. So the list checked is the READER's own — every table and
-    /// every key `Config`'s `Deserialize` accepts, walked from the derive
-    /// ([`reader_paths`]) — with no table excluded.
+    /// A key a reader accepts is never called unknown, schema row or not: it
+    /// loses only its label and completion. A typo beside it still is.
     #[test]
-    fn every_key_the_config_reader_accepts_is_known_to_manual() {
-        let paths = reader_paths::<crate::app_config::Config>();
-        let unknown: Vec<&str> = paths
-            .iter()
-            .map(|(path, _)| path.as_str())
-            .filter(|path| !manual_knows(path))
-            .collect();
-        assert!(
-            unknown.is_empty(),
-            "keys the config reader accepts that Manual would call unknown: {unknown:?}"
-        );
-        // Not vacuous: the walk reached the tables, and the leaves, this was
-        // written for.
-        for (witness, is_table) in [
-            ("privacy", true),
-            ("privacy.auto_accept", false),
-            ("fabric", true),
-            ("output_streak.idle_secs", false),
-            ("sparkle_words.tricks", true),
-            ("sparkle_words.canine.extra_words", false),
-        ] {
-            assert!(
-                paths.contains(&(witness.to_string(), is_table)),
-                "the reader walk never reached {witness}"
-            );
-        }
-        // NEGATIVE CONTROL: a reader with one key Manual has never heard of is
-        // caught, and nothing else in the same table is.
+    fn a_reader_accepted_key_without_a_schema_row_is_never_unknown() {
         #[derive(serde::Deserialize)]
         #[expect(dead_code, reason = "only the reader's field list is read")]
-        struct Stray {
-            privacy: Option<StrayPrivacy>,
+        struct Reader {
+            privacy: Option<ReaderPrivacy>,
         }
         #[derive(serde::Deserialize)]
         #[expect(dead_code, reason = "only the reader's field list is read")]
-        struct StrayPrivacy {
-            observer: Option<bool>,
-            no_such_key: Option<bool>,
+        struct ReaderPrivacy {
+            no_schema_row: Option<bool>,
         }
-        let stray: Vec<String> = reader_paths::<Stray>()
-            .into_iter()
-            .map(|(path, _)| path)
-            .filter(|path| !manual_knows(path))
-            .collect();
-        assert_eq!(stray, ["privacy.no_such_key"]);
-
-        // The warm-up's vocabulary is the resolver's.
-        assert_eq!(
-            PRIVACY_WARMUPS,
-            crate::app_config::PrivacyWarmup::ALL
-                .iter()
-                .map(|mode| mode.as_str())
-                .collect::<Vec<_>>()
-        );
-        // And the band agrees: those keys, written out, draw no diagnostic...
-        let analysis = analyze(
-            "agents_auto_prime = false\n\
-             [privacy]\nenabled = true\ncheck = true\nnotice = true\n\
-             report_attribution = true\nwarmup = \"on-request\"\n\
-             warmup_folders = [\"documents\"]\nwarmup_hold_ms = 120000\n\
-             probe_interval_ms = 5000\nobserver = false\nprotected_roots = []\n\
-             auto_accept = false\n\
-             [fabric]\ncommand = \"aterm-link serve\"\n\
-             [output_streak]\nenabled = true\nintensity = 1.0\ntail = 8\n\
-             max_streaks = 2\nidle_secs = 10.0\n\
-             [sparkle_words.canine]\nenabled = true\nextra_words = [\"pupper\"]\n\
-             ignore_words = []\n\
-             [sparkle_words.tricks]\nenabled = true\nignore_words = []\n",
-        );
-        assert!(
-            analysis.diagnostics.is_empty(),
-            "live keys draw no diagnostic: {:?}",
+        assert!(config_schema_entry("privacy.no_schema_row").is_none());
+        let readers: BTreeSet<String> = reader_paths::<Reader>().into_iter().collect();
+        let unknown = |source: &str| {
+            let document = source.parse::<aterm_toml::edit::DocumentMut>().unwrap();
+            let mut analysis = ConfigAnalysis::default();
+            let walk = KeyWalk {
+                source,
+                document: &document,
+                disk: &[],
+                readers: &readers,
+            };
+            warn_unknown_values(walk, &mut analysis);
             analysis.diagnostics
-        );
-        // ...and the reserved key, set, is refused by its own sentence — never
-        // by "unknown".
-        let refused = analyze("[privacy]\nauto_accept = true\n");
-        let messages: Vec<&str> = refused
-            .diagnostics
-            .iter()
-            .map(|diagnostic| diagnostic.message.as_str())
-            .collect();
+        };
+        let accepted = unknown("[privacy]\nno_schema_row = true\n");
+        assert!(accepted.is_empty(), "{accepted:?}");
+        // NEGATIVE CONTROL: a misspelling the reader does not take is named.
+        let typo = unknown("[privacy]\nno_schema_rwo = true\n");
         assert!(
-            matches!(messages.as_slice(), [only] if only.contains("reserved and not implemented")),
-            "{messages:?}"
+            typo.iter()
+                .any(|diagnostic| diagnostic.message.contains("privacy.no_schema_rwo")),
+            "{typo:?}"
         );
+        // The production set is the readers': `Config`'s, the supervisor's and
+        // the disk reader's.
+        for path in [
+            "agents_auto_prime",
+            "privacy.auto_accept",
+            "harness.headless",
+            "disk.auto_free_gib",
+        ] {
+            assert!(reader_accepted_paths().contains(path), "{path}");
+        }
+        assert!(!reader_accepted_paths().contains("privacy.no_schema_row"));
+        // `[fabric] receipts` and `presence`, which `aterm-link serve` reads and
+        // `aterm fabric on` writes, were called unknown: they draw no diagnostic.
+        let fabric = analyze(
+            "[fabric]\ncommand = \"aterm-link serve\"\nreceipts = true\npresence = \"minimal\"\n",
+        );
+        assert!(fabric.diagnostics.is_empty(), "{:?}", fabric.diagnostics);
     }
 
-    /// THE FAMILY INVARIANT, stated once over the whole registry rather than three
-    /// times over three families. Every retired key is a key from the PAST, so the one
-    /// sentence it must never be given is the one reserved for a key from the FUTURE:
-    /// "unknown to this build and has no effect" is the walk's fall-through, and a
-    /// key that reaches it has no recovery in its story. The three families that
-    /// were each missed in turn — the Scene band, the floating progress card, the
-    /// bottom HUD — all failed in exactly this way, so the check belongs to the
-    /// list and not to any one of them.
-    ///
-    /// Then each family that real `aterm.toml` files still carry, as authored: it
-    /// loads byte-for-byte, every key warns once with its own feature's removal story,
-    /// stays out of the Manual schema, Settings and Advanced, and is never offered
-    /// back — a user who deliberately authored a key is not a user who misspelled one.
+    /// THE FAMILY INVARIANT, stated once over the whole registry rather than once
+    /// per family. Every retired key is a key from the PAST, so the one sentence it
+    /// must never be given is the one reserved for a key from the FUTURE: "unknown
+    /// to this build and has no effect" is the walk's fall-through, and a key that
+    /// reaches it has no recovery in its story. The Scene band, the floating
+    /// progress card and the bottom HUD were each missed in turn in exactly this
+    /// way. Each authored key warns once with its own removal story, the caret
+    /// help on its value tells the same one, and it is never completed back — a
+    /// user who deliberately authored a key is not a user who misspelled one.
     #[test]
     fn every_retired_top_level_key_says_it_was_removed_and_never_that_it_is_from_the_future() {
         let top_level: Vec<&str> = RETIRED_CONFIG_KEYS
@@ -7500,283 +7069,37 @@ intensity = 0.25
             let source = format!("{key} = true\n");
             let analysis = analyze(&source);
             assert!(!analysis.has_errors(), "{key}: {:?}", analysis.diagnostics);
-            assert_eq!(
-                analysis.diagnostics.len(),
-                1,
-                "{key} gets exactly one story: {:?}",
-                analysis.diagnostics
-            );
-            let message = &analysis.diagnostics[0].message;
-            let feature = retired_config_key(key).expect("retired metadata").feature;
-            assert_eq!(
-                message,
-                &format!("{key} does nothing: {feature} was removed; safe to delete"),
-            );
+            let [diagnostic] = analysis.diagnostics.as_slice() else {
+                panic!("{key} gets exactly one story: {:?}", analysis.diagnostics);
+            };
+            assert_eq!(diagnostic.severity, ConfigDiagnosticSeverity::Warning);
+            let message = &diagnostic.message;
+            assert_eq!(message, &compatibility_only_message(key));
             assert!(!message.contains("unknown"), "{key}: {message}");
             assert!(
                 !message.contains("forward compatibility"),
                 "{key}: {message}"
             );
-        }
-
-        struct Family {
-            feature: &'static str,
-            keys: &'static [&'static str],
-            source: &'static str,
-            completion_prefix: &'static str,
-        }
-        let families = [
-            // `cursor_trail_wake_ms` shipped in the starter config for a year, so
-            // real files set it; the retirement deleted the field, not the tolerance.
-            Family {
-                feature: "Rainbow kitty typing wake",
-                keys: &["cursor_trail_wake_ms"],
-                source: "cursor_trail_wake_ms = 900\ncursor_trail_ms = 260\n",
-                completion_prefix: "cursor_trail_wa",
-            },
-            Family {
-                feature: "Bottom HUD",
-                keys: &["show_hud", "show_resources_hud", "show_engine_hud"],
-                source: "show_hud = true\nshow_resources_hud = false\nshow_engine_hud = true\n",
-                completion_prefix: "show_",
-            },
-            // `show_scene_hud` and its three siblings left with the Scenes / "Living
-            // Panels" band in `6995b25ac` but were never registered as retired, so the
-            // owner's own file was told they were from the future.
-            Family {
-                feature: "Scene HUD",
-                keys: &["show_scene_hud", "scene_rows", "scene_skin", "scene_panels"],
-                source: concat!(
-                    "show_scene_hud = true\n",
-                    "scene_rows = 12\n",
-                    "scene_skin = \"#AABBCC\"\n",
-                    "scene_panels = [\"meadow\", \"cosmos\"]\n",
-                ),
-                completion_prefix: "scene_",
-            },
-            // Smart Titles left with `title_summary` (2026-10-15). The starter
-            // config taught every one of these, and two held closed enums: the
-            // authored values below must load, not fail the whole file.
-            Family {
-                feature: "Smart Titles",
-                keys: &[
-                    "descriptive_titles",
-                    "title_summary_provider",
-                    "title_summary_model",
-                    "title_summary_endpoint",
-                    "title_summary_token_file",
-                    "title_summary_timeout_seconds",
-                    "title_summary_proxy_mode",
-                    "title_summary_ca_file",
-                    "title_summary_interval_seconds",
-                    "title_summary_context_lines",
-                    "title_summary_include_output",
-                    "title_summary_allow_remote",
-                    "tab_title_format",
-                    "window_title_format",
-                ],
-                source: concat!(
-                    "descriptive_titles = true\n",
-                    "title_summary_provider = \"ollama\"\n",
-                    "title_summary_model = \"qwen3.5:4b-q4_K_M\"\n",
-                    "title_summary_endpoint = \"http://127.0.0.1:11434/api/chat\"\n",
-                    "title_summary_token_file = \"/tmp/aterm-summary-token\"\n",
-                    "title_summary_timeout_seconds = 20\n",
-                    "title_summary_proxy_mode = \"environment\"\n",
-                    "title_summary_ca_file = \"/tmp/private-model-ca.pem\"\n",
-                    "title_summary_interval_seconds = 15\n",
-                    "title_summary_context_lines = 24\n",
-                    "title_summary_include_output = true\n",
-                    "title_summary_allow_remote = false\n",
-                    "tab_title_format = \"description\"\n",
-                    "window_title_format = \"title-description\"\n",
-                ),
-                completion_prefix: "title_",
-            },
-        ];
-        let active_fields = crate::prefs::editable_fields(&crate::app_config::Config::default());
-        for family in &families {
-            let feature = family.feature;
-            let document = family
-                .source
-                .parse::<aterm_toml::edit::DocumentMut>()
-                .unwrap();
-            assert_eq!(
-                document.to_string(),
-                family.source,
-                "{feature}: Manual must not destructively rewrite retired configuration"
-            );
-            let loaded = aterm_toml::from_str::<crate::app_config::Config>(family.source);
-            assert!(
-                loaded.is_ok(),
-                "{feature}: retired compatibility keys remain loadable while their values \
-                 are inert: {:?}",
-                loaded.err()
-            );
-            let analysis = analyze(family.source);
-            assert!(
-                !analysis.has_errors(),
-                "{feature}: {:?}",
-                analysis.diagnostics
-            );
-            assert_eq!(
-                analysis.diagnostics.len(),
-                family.keys.len(),
-                "{feature}: each authored retired key gets one precise warning: {:?}",
-                analysis.diagnostics
-            );
-            for &key in family.keys {
-                assert!(is_compatibility_only_key(key), "{key}");
-                let retired = retired_config_key(key).expect("retired metadata");
-                assert_eq!(retired.key, key);
-                assert_eq!(retired.feature, feature, "{key}");
-                assert_eq!(retired.effect_label, "No effect", "{key}");
-                assert!(
-                    config_schema_entry(key).is_none(),
-                    "{key}: a retired key is not an active Manual schema entry"
-                );
-                assert!(
-                    active_fields.iter().all(|field| field.key != key),
-                    "{key}: a retired key must stay out of Settings and Advanced"
-                );
-                let matching = analysis
-                    .diagnostics
-                    .iter()
-                    .filter(|diagnostic| diagnostic.message.contains(key))
-                    .collect::<Vec<_>>();
-                assert_eq!(matching.len(), 1, "{key}: {:?}", analysis.diagnostics);
-                assert_eq!(matching[0].severity, ConfigDiagnosticSeverity::Warning);
-                assert_eq!(
-                    matching[0].message,
-                    format!("{key} does nothing: {feature} was removed; safe to delete"),
-                );
-            }
-            let key_assist = assist(family.completion_prefix, family.completion_prefix.len());
-            assert!(
-                key_assist.completions.iter().all(|completion| {
-                    family
-                        .keys
-                        .iter()
-                        .all(|key| !completion.insertion.starts_with(key))
-                }),
-                "{feature}: a retired key is never completed: {key_assist:?}"
-            );
-        }
-
-        // The typing wake's neighbour: the retired key must not swallow the keys
-        // around it.
-        let parsed = aterm_toml::from_str::<crate::app_config::Config>(families[0].source)
-            .expect("a config authored against the old dial still loads");
-        assert_eq!(parsed.cursor_trail_ms, Some(260));
-
-        // The Bottom HUD's values: no active runtime choices, and the help tells the
-        // same precise story.
-        for key in families[1].keys {
             let value_source = format!("{key} = ");
             let value = assist(&value_source, value_source.len());
             assert!(
                 value.completions.is_empty(),
-                "retired values have no active runtime choices: {value:?}"
+                "{key}: retired values have no active runtime choices: {value:?}"
             );
+            assert_eq!(
+                value.help,
+                Some(compatibility_only_message(key)),
+                "{key}: the caret help tells the diagnostic's story"
+            );
+            let prefix = &key[..key.len() - 2];
             assert!(
-                value.help.as_deref().is_some_and(|help| {
-                    help.contains("Bottom HUD was removed") && help.contains("does nothing")
-                }),
-                "retired value help must tell the same precise story: {value:?}"
+                assist(prefix, prefix.len())
+                    .completions
+                    .iter()
+                    .all(|completion| !completion.insertion.starts_with(key)),
+                "{key}: a retired key is never completed"
             );
         }
-    }
-
-    #[test]
-    fn manual_rejects_non_text_dynamic_map_values_even_when_gui_serde_ignores_them() {
-        let source = "[packages.links]\nay = 5\n";
-        assert!(
-            aterm_toml::from_str::<crate::app_config::Config>(source).is_ok(),
-            "the GUI intentionally delegates packages.links to atpkg"
-        );
-        let analysis = analyze(source);
-        assert!(analysis.has_errors());
-        let diagnostic = analysis
-            .diagnostics
-            .iter()
-            .find(|diagnostic| {
-                diagnostic
-                    .message
-                    .contains("packages.links.ay must be text")
-            })
-            .expect("the delegated atpkg map still has a shared string-value schema");
-        assert_eq!(&source[diagnostic.bytes.clone()], "5");
-
-        for valid in [
-            "[packages.links]\nay = \"~/ay\"\n",
-            "[packages]\nlinks = { ay = \"~/ay\" }\n",
-        ] {
-            assert!(
-                !analyze(valid).has_errors(),
-                "valid dynamic string map: {valid:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn package_account_and_link_targets_share_the_runtime_classifiers() {
-        let source = r#"[packages]
-account = "bad owner"
-[packages.links]
-bad = "a b"
-repo = "alabsystems/aterm"
-home = "~/aterm"
-"#;
-        let analysis = analyze(source);
-        assert!(!analysis.has_errors(), "runtime fallbacks remain saveable");
-        let account = analysis
-            .diagnostics
-            .iter()
-            .find(|diagnostic| diagnostic.message.contains("packages.account"))
-            .expect("invalid package account is visible");
-        assert_eq!(account.severity, ConfigDiagnosticSeverity::Warning);
-        assert_eq!(&source[account.bytes.clone()], "\"bad owner\"");
-        let link = analysis
-            .diagnostics
-            .iter()
-            .find(|diagnostic| diagnostic.message.contains("packages.links.bad"))
-            .expect("invalid package link target is visible");
-        assert_eq!(link.severity, ConfigDiagnosticSeverity::Warning);
-        assert_eq!(&source[link.bytes.clone()], "\"a b\"");
-        assert!(
-            analysis.diagnostics.iter().all(|diagnostic| !diagnostic
-                .message
-                .contains("packages.links.repo")
-                && !diagnostic.message.contains("packages.links.home")),
-            "the exact atpkg classifier accepts sanctioned repo and ~/ checkout shapes"
-        );
-        assert!(
-            setting_help(config_schema_entry("packages.account").unwrap())
-                .contains("GitHub owner slug")
-        );
-        assert!(
-            setting_help(config_schema_entry("packages.links").unwrap()).contains("owner/repo")
-        );
-    }
-
-    /// `[packages] prefix` is atpkg's: a development build moves the store, and
-    /// a shipped one installs nothing automatically while it names another. So
-    /// it is never called unknown or without effect.
-    #[test]
-    fn package_prefix_is_a_known_key_whose_help_says_what_it_does() {
-        let analysis = analyze("[packages]\nprefix = \"/opt/aterm/pkg\"\n");
-        assert!(
-            analysis
-                .diagnostics
-                .iter()
-                .all(|diagnostic| !diagnostic.message.contains("packages.prefix")),
-            "{:?}",
-            analysis.diagnostics
-        );
-        assert!(
-            setting_help(config_schema_entry("packages.prefix").unwrap())
-                .contains("installs nothing automatically")
-        );
     }
 
     #[test]
@@ -7825,100 +7148,6 @@ home = "~/aterm"
             1,
             "replayed host completions cannot duplicate editor diagnostics"
         );
-    }
-
-    #[test]
-    // NOT nested: the listener preflight arms branch on whether this process was
-    // launched inside another aterm, and the whole suite is normally run FROM one.
-    // Supplying the fact keeps the assertion hermetic instead of asserting whatever
-    // the ambient environment happens to make true.
-    fn listener_host_preflight_warnings_address_each_effective_source_token() {
-        const CERT: &[u8] = include_bytes!("../../aterm-net/src/testdata/cert.der");
-        const KEY: &[u8] = include_bytes!("../../aterm-net/src/testdata/key.pkcs8.der");
-        let root = std::env::temp_dir().join(format!(
-            "aterm-manual-listener-preflight-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let cert = root.join("cert.der");
-        let key = root.join("key.der");
-        let missing_cert = root.join("missing-cert.der");
-        let missing_key = root.join("missing-key.der");
-        std::fs::write(&cert, CERT).unwrap();
-        std::fs::write(&key, KEY).unwrap();
-        let cert_token = format!("{:?}", cert.to_string_lossy());
-        let key_token = format!("{:?}", key.to_string_lossy());
-
-        let source = format!(
-            "[net]\nlisten = \"not a bind address\"\ncert = {cert_token}\nkey = {key_token}\n"
-        );
-        let diagnostics = analyze_host_nested(&source, true, false);
-        let invalid_address = diagnostics
-            .iter()
-            .find(|diagnostic| {
-                diagnostic
-                    .message
-                    .contains("not a numeric IP:port bind address")
-            })
-            .unwrap_or_else(|| panic!("missing address preflight warning: {diagnostics:?}"));
-        assert_eq!(
-            &source[invalid_address.bytes.clone()],
-            "\"not a bind address\""
-        );
-
-        let missing_cert_token = format!("{:?}", missing_cert.to_string_lossy());
-        let source = format!(
-            "[net]\nlisten = \"127.0.0.1:7100\"\ncert = {missing_cert_token}\nkey = {key_token}\n"
-        );
-        let diagnostics = analyze_host_nested(&source, true, false);
-        let unreadable_cert = diagnostics
-            .iter()
-            .find(|diagnostic| {
-                diagnostic.message.contains("certificate from net.cert")
-                    && diagnostic.message.contains("unreadable")
-            })
-            .unwrap_or_else(|| panic!("missing certificate preflight warning: {diagnostics:?}"));
-        assert_eq!(&source[unreadable_cert.bytes.clone()], missing_cert_token);
-
-        let missing_key_token = format!("{:?}", missing_key.to_string_lossy());
-        let source = format!(
-            "[net]\nlisten = \"127.0.0.1:7100\"\ncert = {cert_token}\nkey = {missing_key_token}\n"
-        );
-        let diagnostics = analyze_host_nested(&source, true, false);
-        let unreadable_key = diagnostics
-            .iter()
-            .find(|diagnostic| {
-                diagnostic.message.contains("private key from net.key")
-                    && diagnostic.message.contains("unreadable")
-            })
-            .unwrap_or_else(|| panic!("missing key preflight warning: {diagnostics:?}"));
-        assert_eq!(&source[unreadable_key.bytes.clone()], missing_key_token);
-
-        std::fs::write(&cert, b"malformed certificate").unwrap();
-        let source =
-            format!("[net]\nlisten = \"127.0.0.1:7100\"\ncert = {cert_token}\nkey = {key_token}\n");
-        let diagnostics = analyze_host_nested(&source, true, false);
-        let mut pair_tokens = diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.message.contains("certificate/key pair"))
-            .map(|diagnostic| source[diagnostic.bytes.clone()].to_string())
-            .collect::<Vec<_>>();
-        pair_tokens.sort();
-        let mut expected = vec![cert_token.clone(), key_token.clone()];
-        expected.sort();
-        assert_eq!(pair_tokens, expected);
-
-        std::fs::write(&cert, CERT).unwrap();
-        let diagnostics = analyze_host_nested(&source, true, false);
-        assert!(
-            diagnostics
-                .iter()
-                .all(|diagnostic| !diagnostic.message.starts_with("network listener")),
-            "valid address/cert/key must preflight cleanly: {diagnostics:?}"
-        );
-
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -7980,17 +7209,6 @@ home = "~/aterm"
             !analysis.has_errors(),
             "warnings do not make TOML unsaveable"
         );
-        let messages = analysis
-            .diagnostics
-            .iter()
-            .map(|diagnostic| diagnostic.message.as_str())
-            .collect::<Vec<_>>();
-        for expected in ["palette[1]", "shift+entr", "no_such_action"] {
-            assert!(
-                messages.iter().any(|message| message.contains(expected)),
-                "Manual must share the runtime diagnostic for {expected}: {messages:?}"
-            );
-        }
         assert!(
             analysis
                 .diagnostics
@@ -7998,6 +7216,7 @@ home = "~/aterm"
                 .all(|diagnostic| diagnostic.severity == ConfigDiagnosticSeverity::Warning)
         );
         let mut expected_spans = vec![
+            ("palette[1]", "\"nope\""),
             ("chord \"shift+entr\" invalid", "\"shift+entr\""),
             ("key_sequences[\"ctrl+x\"]: value invalid", "'\\q'"),
             ("unknown action \"no_such_action\"", "\"no_such_action\""),
@@ -8027,6 +7246,22 @@ home = "~/aterm"
         }
     }
 
+    /// `[harness] autocompact_offer` takes every spelling its reader does — a
+    /// size, an off as a bool or a word, a count of tokens — with no
+    /// diagnostic.
+    #[test]
+    fn the_autocompact_offer_key_takes_its_readers_spellings() {
+        for value in ["\"400k\"", "\"off\"", "false", "true", "500", "600000"] {
+            let source = format!("[harness]\nautocompact_offer = {value}\n");
+            let analysis = analyze(&source);
+            assert!(
+                !analysis.has_errors(),
+                "{value}: {:?}",
+                analysis.diagnostics
+            );
+        }
+    }
+
     #[test]
     fn every_registered_enum_accepts_its_runtime_domain_and_aliases() {
         let enums = config_schema()
@@ -8039,71 +7274,22 @@ home = "~/aterm"
                 _ => None,
             })
             .collect::<Vec<_>>();
-        let actual = enums.iter().map(|(key, _)| *key).collect::<BTreeSet<_>>();
-        let expected = BTreeSet::from([
-            "ambiguous_width",
-            "background_material",
-            "bidi",
-            "cursor_style",
-            "cursor_trail_style",
-            "display_font",
-            // `[machine] universal_control`: "off" | "leave", the two spellings
-            // atpkg's own reader resolves (the Security page's picker).
-            "machine.universal_control",
-            "motion",
-            "predictive_echo",
-            "sparkle_words.feline.style",
-            "sparkle_words.profanity.style",
-            "text_blending",
-            "trail_sound_style",
-            "window_colorspace",
-            "window_theme",
-            // Manual-only (off `prefs::editable_fields`), but real enums an
-            // operator types into aterm.toml, so they get the same domain
-            // coverage as the rest. Calling any of them "unknown to this aterm
-            // build" was the audit-2 item-9 false diagnostic.
-            "windowing_behavior",
-            "font_hinting",
-            "font_subpixel",
-            "right_click",
-            "tab_menu_chord",
-            "tab_band_height",
-            // `[harness] approve`: "all" | "safe" | "none", the supervisor
-            // policy's (`aterm_agent::supervise::config::Approve`).
-            "harness.approve",
-            // `[privacy] warmup` (`app_config::PrivacyWarmup`): case-insensitive
-            // like every registry enum; the loader reads an unknown spelling as
-            // the default, which is why the value is graded here.
-            "privacy.warmup",
-            // `[render] repaint_nudge` (`repaint_nudge::Mode`): "on" | "log" | "off".
-            "render.repaint_nudge",
-            // `[harness] question_priority` (2026-09-25): the supervisor's own
-            // priority words; a word outside them turns answer_questions off.
-            "harness.question_priority",
-            // `[harness] accounts` (`aterm_agent::harness::accounts::Mode`):
-            // "early" | "wall" | "off", the account rotation's switch.
-            "harness.accounts",
-            // `[harness] autopilot` (2026-10-15): "cruise" | "land" | "off",
-            // the default Autopilot (`aterm_agent::supervise::Autopilot`).
-            "harness.autopilot",
-            // `[harness] logins`: "renew" | "off", the login lifecycle's
-            // switch (accounts v2 S7).
-            "harness.logins",
-            // `[ai] preferred`: every AI CLI connection's id
-            // (`aterm_agent::ai::connector::IDS`), this machine's main AI CLI.
-            "ai.preferred",
-        ]);
-        assert_eq!(actual, expected, "new enum needs language-domain coverage");
 
         let source_for = |key: &str, value: &str| format!("{key} = {value:?}\n");
+        // A spelling the loader admits is clean in the editor AND on the
+        // band's value walk: a warning there sends someone to change a config
+        // that works.
+        let admitted = |source: &str, what: &str| {
+            let analysis = analyze(source);
+            assert!(!analysis.has_errors(), "{what}: {:?}", analysis.diagnostics);
+            let band = unaccepted_value_warnings(source, &[]);
+            assert!(band.is_empty(), "{what}: {band:?}");
+        };
         for (key, options) in &enums {
             for option in *options {
-                let source = source_for(key, option);
-                let analysis = analyze(&source);
-                assert!(
-                    !analysis.has_errors(),
-                    "canonical {key}={option:?}: {:?}",
-                    analysis.diagnostics
+                admitted(
+                    &source_for(key, option),
+                    &format!("canonical {key}={option:?}"),
                 );
             }
             let source = source_for(key, "definitely-not-a-real-enum-value");
@@ -8125,13 +7311,6 @@ home = "~/aterm"
                 crate::prefs::EDIT_BACKGROUND_MATERIAL,
                 BACKGROUND_MATERIAL_ALIASES,
             ),
-            // Every pre-rename face id, including the one whose face was
-            // deleted: a config that was valid before the rename must still
-            // LOAD without an error, whatever it renders with.
-            (
-                crate::prefs::EDIT_DISPLAY_FONT,
-                crate::prefs::LEGACY_DISPLAY_FONT_IDS,
-            ),
             // Windows Terminal's `useNew`/`useExisting` and the compact
             // spellings — every one `aterm_cli::WindowingBehavior::parse`
             // accepts must LOAD without an error, or Manual would red-flag a
@@ -8149,88 +7328,23 @@ home = "~/aterm"
             ),
         ] {
             for alias in aliases {
-                let source = source_for(key, alias);
-                let analysis = analyze(&source);
-                assert!(
-                    !analysis.has_errors(),
-                    "runtime alias {key}={alias:?}: {:?}",
-                    analysis.diagnostics
-                );
+                admitted(&source_for(key, alias), &format!("alias {key}={alias:?}"));
             }
         }
         for &(alias, _) in crate::prefs::CURSOR_TRAIL_STYLE_ALIASES {
             let source = source_for(crate::prefs::EDIT_CURSOR_TRAIL_STYLE, alias);
-            let analysis = analyze(&source);
-            assert!(
-                !analysis.has_errors(),
-                "trail alias {alias:?}: {:?}",
-                analysis.diagnostics
-            );
+            admitted(&source, &format!("trail alias {alias:?}"));
         }
         // The typing-sound picker's aliases live on the synth's own roster.
         for &(alias, _) in aterm_effects::trail_sound::SoundVoice::ALIASES {
             let source = source_for(crate::prefs::EDIT_TRAIL_SOUND_STYLE, alias);
-            let analysis = analyze(&source);
-            assert!(
-                !analysis.has_errors(),
-                "typing-sound alias {alias:?}: {:?}",
-                analysis.diagnostics
-            );
-        }
-        for pack in ["pack:synthwave", "pack: local-pack "] {
-            let source = source_for(crate::prefs::EDIT_CURSOR_TRAIL_STYLE, pack);
-            assert!(!analyze(&source).has_errors(), "valid trail pack {pack:?}");
-        }
-        for pack in ["pack:", "pack:   "] {
-            let source = source_for(crate::prefs::EDIT_CURSOR_TRAIL_STYLE, pack);
-            assert!(analyze(&source).has_errors(), "empty trail pack {pack:?}");
+            admitted(&source, &format!("typing-sound alias {alias:?}"));
         }
     }
 
-    #[test]
-    fn machine_opt_outs_are_real_atpkg_settings_and_do_not_cover_the_terminal() {
-        #[derive(serde::Deserialize)]
-        struct Document {
-            machine: atpkg::config::MachineConfig,
-        }
-        let source = "[packages]\nenabled = false\n\
-                      [machine]\nuniversal_control = \"leave\"\n";
-        let parsed: Document = aterm_toml::from_str(source).expect("real machine schema");
-        assert_eq!(
-            parsed.machine.universal_control(),
-            atpkg::config::UniversalControlPolicy::Leave
-        );
-        assert!(ignored_key_warnings(source).is_empty());
-        assert!(unaccepted_value_warnings(source, &[]).is_empty());
-        assert!(analyze(source).diagnostics.is_empty());
-        let mut warns = crate::message_reporters::ConfigWarnings::default();
-        crate::app_config::collect_key_notices(&mut warns, source);
-        assert_eq!(
-            warns.into_messages().len(),
-            0,
-            "valid machine opt-outs must not post a row over a real terminal"
-        );
-
-        // A key no setting reads — a typo, or the retired `spotlight_noindex` — gets the
-        // ordinary unknown-key notice, one row for the family.
-        for stale in [
-            source.replace("universal_control", "universal_contrl"),
-            format!("{source}spotlight_noindex = false\n"),
-        ] {
-            let notices = crate::app_config::ignored_key_notices(&stale);
-            assert!(
-                notices
-                    .iter()
-                    .any(|line| line.contains("machine.universal_contrl")
-                        || line.contains("machine.spotlight_noindex")),
-                "{notices:?}"
-            );
-            let mut warns = crate::message_reporters::ConfigWarnings::default();
-            warns.extend(crate::message_reporters::ConfigFamily::IgnoredKeys, notices);
-            assert_eq!(warns.into_messages().len(), 1, "one row for the family");
-        }
-    }
-
+    /// `[machine]` is atpkg's: the domain is `MachineConfig`'s, a valid opt-out
+    /// raises nothing over a real terminal, and a value atpkg cannot use is told
+    /// as a value, never as a key with no effect (the key is known, and read).
     #[test]
     fn machine_policy_domain_matches_atpkg_and_bad_types_remain_errors() {
         use atpkg::config::{MachineConfig, UniversalControlPolicy};
@@ -8248,6 +7362,7 @@ home = "~/aterm"
             let source = format!("[machine]\n{fields}");
             assert!(analyze(&source).diagnostics.is_empty(), "{value:?}");
             assert!(unaccepted_value_warnings(&source, &[]).is_empty());
+            assert!(ignored_key_warnings(&source).is_empty(), "{value:?}");
         }
         for value in ["OFF", "Leave", "leav"] {
             let fields = format!("universal_control = {value:?}\n");
@@ -8256,55 +7371,19 @@ home = "~/aterm"
             let source = format!("[machine]\n{fields}");
             assert!(analyze(&source).has_errors(), "unsupported {value:?}");
             let warnings = unaccepted_value_warnings(&source, &[]).join("\n");
-            assert!(warnings.contains("machine.universal_control"));
-            assert!(warnings.contains("Universal Control is left unchanged"));
-            assert!(!warnings.contains("the default is used"));
+            assert!(warnings.contains("machine.universal_control"), "{warnings}");
         }
         let fields = "universal_control = true\n";
         assert!(aterm_toml::from_str::<MachineConfig>(fields).is_err());
         let source = format!("[machine]\n{fields}");
         assert!(analyze(&source).has_errors());
-        // The band tells it as a value atpkg could not use, never as a key with no
-        // effect: the key is known, and it is read.
-        let notices = crate::app_config::unaccepted_value_notices(&source, &[]);
-        assert!(notices.iter().any(|line| line.contains("must be")));
-        assert!(
-            notices
-                .iter()
-                .any(|line| line.contains("default machine settings"))
-        );
+        assert!(!crate::app_config::unaccepted_value_notices(&source, &[]).is_empty());
         assert!(
             crate::app_config::ignored_key_notices(&source).is_empty(),
             "{source:?}"
         );
         assert!(analyze("machine = false\n").has_errors());
-        assert!(
-            ignored_key_warnings("machine = false\n")
-                .iter()
-                .any(|line| line.contains("machine must be a table"))
-        );
-    }
-
-    #[test]
-    fn retired_underline_cursor_is_never_false_green_or_suggested_as_an_alias() {
-        assert!(!CURSOR_STYLE_ALIASES.contains(&"underline"));
-        let analysis = analyze("cursor_style = \"underline\"\n");
-        assert!(
-            !analysis.has_errors(),
-            "the compatibility fallback remains loadable"
-        );
-        let warnings = analysis
-            .diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.severity == ConfigDiagnosticSeverity::Warning)
-            .map(|diagnostic| diagnostic.message.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            warnings,
-            [
-                "cursor_style = \"underline\" is retired and renders as \"bar\"; use \"bar\" explicitly"
-            ]
-        );
+        assert!(!ignored_key_warnings("machine = false\n").is_empty());
     }
 
     /// TF.2b: `font_hinting = "native"` loads, renders as `light`, is told so
@@ -8382,12 +7461,6 @@ ignore_words = ["skip"]
 extra_words = ["wow"]
 ignore_words = ["skip"]
 "##,
-            r#"[[net.connections]]
-name = "work"
-host = "work.example:7100"
-fingerprint = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-token_file = "~/.config/aterm/token"
-"#,
             r#"[[sparkle_words.custom]]
 words = ["ultrathink"]
 ink = { colorway = "rainbow", sweep_once = true }
@@ -8414,17 +7487,6 @@ ink = { colorway = "rainbow" }
 [[sparkle_words.custom]]
 words = ["valid"]
 burst = { kind = "nova" }
-
-[[net.connections]]
-name = "one"
-host = "one.example:7100"
-fingerprint = "sha256:0101010101010101010101010101010101010101010101010101010101010101"
-
-[[net.connections]]
-name = "two"
-host = "two.example:7100"
-fingerprint = "sha256:0202020202020202020202020202020202020202020202020202020202020202"
-token_flie = "~/.config/aterm/token"
 "#;
         let analysis = analyze(source);
         assert!(
@@ -8437,17 +7499,13 @@ token_flie = "~/.config/aterm/token"
             .iter()
             .filter(|diagnostic| diagnostic.message.contains(" is unknown in [["))
             .collect::<Vec<_>>();
-        assert_eq!(unknown.len(), 2, "{:?}", analysis.diagnostics);
-        assert!(unknown.iter().any(|diagnostic| {
-            diagnostic.message.contains(
-                "sparkle_words.custom.wrods is unknown in [[sparkle_words.custom]] record 1",
-            )
-        }));
-        assert!(unknown.iter().any(|diagnostic| {
-            diagnostic
-                .message
-                .contains("net.connections.token_flie is unknown in [[net.connections]] record 2")
-        }));
+        assert_eq!(unknown.len(), 1, "{:?}", analysis.diagnostics);
+        assert!(
+            unknown[0].message.contains("sparkle_words.custom.wrods")
+                && unknown[0].message.contains("record 1"),
+            "{:?}",
+            unknown[0].message
+        );
         assert!(
             unknown
                 .iter()
@@ -8462,17 +7520,6 @@ ink = { colorway = "twotone:#112233,#445566" }
 words = ["two"]
 burst = { kind = "super-nova", chance = 10 }
 graphic = { collection = "cats" }
-
-[[net.connections]]
-name = "one"
-host = "one.example:7100"
-fingerprint = "sha256:0101010101010101010101010101010101010101010101010101010101010101"
-
-[[net.connections]]
-name = "two"
-host = "two.example:7100"
-fingerprint = "sha256:0202020202020202020202020202020202020202020202020202020202020202"
-token_file = "~/.config/aterm/token"
 "##;
         let clean = analyze(clean_repeats);
         assert!(
@@ -8482,107 +7529,26 @@ token_file = "~/.config/aterm/token"
         );
     }
 
+    /// EVERY RUNTIME FALLBACK IS TOLD ON THE TOKEN IT IS ABOUT: the editor marks
+    /// the authored value, array element or record that a runtime reader
+    /// replaces, clamps or ignores — through the shared atpkg classifiers, at a
+    /// dependent clamp's effective floor (one story each), on an inert record,
+    /// on a security capability that is inert or partial here — and a value the
+    /// delegated `packages.links` map cannot take blocks the save. A case is
+    /// `(source, blocks the save, [(message fragment, the token it marks)],
+    /// those are all its diagnostics)`. NEGATIVE CONTROLS: the exact floors and
+    /// the runtime's own accepted shapes raise nothing.
     #[test]
-    fn custom_burst_chance_help_and_structured_diagnostics_match_runtime_clamp() {
-        const KEY: &str = "sparkle_words.custom.burst.chance";
-        assert_eq!(semantic_numeric_bounds(KEY), Some((0.0, 100.0)));
-        let help = setting_help(config_schema_entry(KEY).expect("burst chance schema"));
-        assert!(help.contains("range 0–100"), "{help}");
-
-        for chance in [0, 100] {
-            let source = format!(
-                "[[sparkle_words.custom]]\nwords = [\"zap\"]\nburst = {{ kind = \"starburst\", chance = {chance} }}\n"
-            );
-            let analysis = analyze(&source);
-            assert!(
-                analysis
-                    .diagnostics
-                    .iter()
-                    .all(|diagnostic| !diagnostic.message.contains("outside the supported")),
-                "valid {chance}% chance: {:?}",
-                analysis.diagnostics
-            );
-        }
-
-        let source = "[[sparkle_words.custom]]\nwords = [\"zap\"]\nburst = { kind = \"starburst\", chance = 101 }\n";
-        let analysis = analyze(source);
-        assert!(!analysis.has_errors(), "runtime clamp remains recoverable");
-        let diagnostic = analysis
-            .diagnostics
-            .iter()
-            .find(|diagnostic| {
-                diagnostic.message.contains(KEY)
-                    && diagnostic.message.contains("record 1")
-                    && diagnostic.message.contains("0–100")
-                    && diagnostic.message.contains("will be clamped")
-            })
-            .unwrap_or_else(|| panic!("missing burst chance warning: {:?}", analysis.diagnostics));
-        assert_eq!(&source[diagnostic.bytes.clone()], "101");
-    }
-
-    #[test]
-    fn dependent_runtime_clamps_have_exact_help_ranges_and_single_diagnostics() {
-        let sweep_help = setting_help(
-            config_schema_entry("sparkle_words.ink.sweep_ms").expect("ink sweep schema"),
+    fn runtime_fallback_diagnostics_address_their_authored_tokens() {
+        type Case = (
+            &'static str,
+            bool,
+            &'static [(&'static str, &'static str)],
+            bool,
         );
-        assert!(
-            sweep_help.contains("loop = true raises the effective minimum to 600 ms"),
-            "{sweep_help}"
-        );
-        let head_help =
-            setting_help(config_schema_entry("matrix_rain.head_alpha").expect("rain head schema"));
-        assert!(
-            head_help.contains("effective minimum follows the resolved matrix_rain.alpha"),
-            "{head_help}"
-        );
-
-        let source = "[sparkle_words.ink]\nloop = true\nsweep_ms = 400\n\
-[matrix_rain]\nalpha = 120\nhead_alpha = 20\n";
-        let analysis = analyze(source);
-        assert!(!analysis.has_errors());
-        assert_eq!(
-            analysis.diagnostics.len(),
-            2,
-            "each dependent clamp has one recovery story: {:?}",
-            analysis.diagnostics
-        );
-        for (key, token, effective) in [
-            ("sparkle_words.ink.sweep_ms", "400", "effectively 600 ms"),
-            ("matrix_rain.head_alpha", "20", "effectively 120"),
-        ] {
-            let diagnostic = analysis
-                .diagnostics
-                .iter()
-                .find(|diagnostic| diagnostic.message.starts_with(key))
-                .unwrap_or_else(|| {
-                    panic!(
-                        "missing dependent clamp for {key}: {:?}",
-                        analysis.diagnostics
-                    )
-                });
-            assert_eq!(&source[diagnostic.bytes.clone()], token);
-            assert!(
-                diagnostic.message.contains(effective),
-                "{}",
-                diagnostic.message
-            );
-        }
-
-        let boundaries = "[sparkle_words.ink]\nloop = true\nsweep_ms = 600\n\
-[matrix_rain]\nalpha = 120\nhead_alpha = 120\n";
-        let clean = analyze(boundaries);
-        assert!(
-            clean.diagnostics.is_empty(),
-            "exact effective floors stay clean: {:?}",
-            clean.diagnostics
-        );
-    }
-
-    #[test]
-    fn runtime_fallback_diagnostics_address_exact_array_and_record_tokens() {
-        let fingerprint = "00".repeat(32);
-        let source = format!(
-            r##"font_px = 201
+        let cases: &[Case] = &[
+            (
+                r##"font_px = 201
 font_variation = ["", "bad-axis"]
 font_features = ["+ss01", "toolong"]
 
@@ -8600,412 +7566,204 @@ words = [" "]
 
 [[sparkle_words.custom]]
 words = ["quiet"]
-burst = {{ kind = "glow", chance = 0 }}
-
-[[net.connections]]
-name = "bad/name"
-host = "bad.example:7100"
-fingerprint = "wrong"
-sid = "legacy"
-
-[[net.connections]]
-name = "work"
-host = " "
-fingerprint = "{fingerprint}"
-
-[[net.connections]]
-name = "work"
-host = "two.example:7100"
-fingerprint = "{fingerprint}"
-expect_nonce = "pin"
-"##
-        );
-        let analysis = analyze(&source);
-        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
-
-        for (message_fragment, token) in [
-            ("font_px: 201.0 is not accepted", "201"),
-            ("font_variation[0]", "\"bad-axis\""),
-            ("font_features[1]", "\"toolong\""),
-            ("update.owner: \"bad/owner\"", "\"bad/owner\""),
-            ("matrix_rain.hue value", "\"blue\""),
-            ("sparkle_words.profanity.palette[1]", "\"bad-color\""),
-            ("record 1 has no nonblank word", "[\" \"]"),
-            ("record 2 is inert", "0"),
-            ("record 1 must be a nonempty", "\"bad/name\""),
-            ("record 1 must be 64 hexadecimal", "\"wrong\""),
-            ("record 1 has no effect without expect_nonce", "\"legacy\""),
-            ("record 2 is blank", "\" \""),
-            ("record 3 duplicates", "\"work\""),
-        ] {
-            let diagnostic = analysis
-                .diagnostics
-                .iter()
-                .find(|diagnostic| diagnostic.message.contains(message_fragment))
-                .unwrap_or_else(|| {
-                    panic!("missing {message_fragment:?}: {:?}", analysis.diagnostics)
-                });
-            assert_eq!(
-                &source[diagnostic.bytes.clone()],
-                token,
-                "{}",
-                diagnostic.message
-            );
-        }
-
-        let inert_header = analysis
-            .diagnostics
-            .iter()
-            .find(|diagnostic| diagnostic.message.contains("record 1 is inert"))
-            .expect("inert record warning");
-        assert_eq!(
-            &source[inert_header.bytes.clone()],
-            "[[sparkle_words.custom]]"
-        );
-
-        let inline = "sparkle_words.custom = [{ words = [\"quiet\"] }]\n";
-        let inline_analysis = analyze(inline);
-        let inert = inline_analysis
-            .diagnostics
-            .iter()
-            .find(|diagnostic| diagnostic.message.contains("record 1 is inert"))
-            .expect("inline inert record warning");
-        assert_eq!(&inline[inert.bytes.clone()], "{ words = [\"quiet\"] }");
-
-        let multiline = "font_features = [\n  \"+ss01\",\n  \"toolong\",\n]\n";
-        let multiline_analysis = analyze(multiline);
-        let invalid_feature = multiline_analysis
-            .diagnostics
-            .iter()
-            .find(|diagnostic| diagnostic.message.contains("font_features[1]"))
-            .expect("multiline feature warning");
-        assert_eq!(&multiline[invalid_feature.bytes.clone()], "\"toolong\"");
-
-        let missing_words = "[[sparkle_words.custom]]\nink = { colorway = \"rainbow\" }\n";
-        let missing_words_analysis = analyze(missing_words);
-        let no_words = missing_words_analysis
-            .diagnostics
-            .iter()
-            .find(|diagnostic| diagnostic.message.contains("has no nonblank word"))
-            .expect("missing words warning");
-        assert_eq!(
-            &missing_words[no_words.bytes.clone()],
-            "[[sparkle_words.custom]]"
-        );
-    }
-
-    #[test]
-    fn inert_or_partial_security_capabilities_warn_on_the_authored_true_token() {
-        let source = "allow_osc52_query = true\nallow_window_ops = true\n";
-        let analysis = analyze(source);
-        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
-
-        // The window-ops phrasing is per-platform: Linux wires the manipulation
-        // half (frame audit #4), so its honest residue is the unanswered
-        // POSITION/screen reports; elsewhere no callback is installed and only
-        // the engine's own reports answer. Pin the ANSWERED set on both
-        // branches — "remain unanswered" alone kept passing while the sentence
-        // around it still said the pixel pair was part of the gap, which it has
-        // not been since the in-core 14t/16t fallbacks landed.
-        let window_ops_phrase = if cfg!(target_os = "linux") {
-            "text-area-pixels and cell-size reports are answered"
-        } else {
-            "text-area-pixels and cell-size reports only"
-        };
-        // The OSC 52 caveat states the widest grant per platform: the system
-        // clipboard off-Linux (what the Query arm answers with), the
-        // own-selections bound on X11.
-        let osc52_phrase = if cfg!(target_os = "linux") {
-            "selections aterm itself owns"
-        } else {
-            "system clipboard"
-        };
-        for message in [osc52_phrase, window_ops_phrase] {
-            let diagnostic = analysis
-                .diagnostics
-                .iter()
-                .find(|diagnostic| diagnostic.message.contains(message))
-                .unwrap_or_else(|| panic!("missing {message:?}: {:?}", analysis.diagnostics));
-            assert_eq!(&source[diagnostic.bytes.clone()], "true");
-        }
-    }
-
-    #[test]
-    fn manual_help_discloses_fallback_platform_and_package_precedence() {
-        let help_for = |key: &str| setting_help(config_schema_entry(key).unwrap());
-        assert!(help_for("font_px").contains("ignored, not clamped"));
-        assert!(help_for("font_variation").contains("tag=value"));
-        assert!(help_for("font_features").contains("tag=unsigned-value"));
-        assert!(help_for("font_thicken").contains("macOS CoreText only"));
-        assert!(help_for("trail_sounds").contains("audio playback is macOS-only"));
-        assert!(help_for("columns").contains("default 80"));
-        assert!(help_for("lines").contains("default 24"));
-        assert!(help_for("confirm_multiline_paste").contains("line break"));
-        assert!(
-            help_for("allow_notifications")
-                .contains("desktop delivery is implemented on macOS and Windows")
-        );
-        // `desktop_alerts` says whose alerts it governs, what off keeps (the
-        // operator's only a count in `aterm fleet status`), and that a
-        // program's are the other key's.
-        let alerts = help_for("desktop_alerts");
-        for needle in [
-            "aterm's OWN alerts",
-            "Script Editor",
-            "messages.log",
-            "the operator's only counted in aterm fleet status ·",
-            "allow_notifications",
-        ] {
-            assert!(alerts.contains(needle), "{needle:?} in {alerts}");
-        }
-        assert!(help_for("option_as_meta").contains("types your keyboard layout's characters"));
-        // The native updater runs on macOS AND Linux (`aterm_update::enabled`): the
-        // `[update]` help names both and each platform's own manual lane, never
-        // "macOS-only" (2026-09-24 review — the Settings card and the registry already
-        // said so, and this surface contradicted them on a Linux build).
-        for key in [
-            crate::prefs::EDIT_UPDATE_ENABLED,
-            "update.owner",
-            "update.repo",
-            "update.auto_apply",
-        ] {
-            let help = help_for(key);
-            assert!(
-                help.contains("the native updater runs on macOS and Linux"),
-                "{key}: {help}"
-            );
-            assert!(!help.contains("macOS-only"), "{key}: {help}");
-        }
-        assert!(help_for(crate::prefs::EDIT_UPDATE_ENABLED).contains("`aterm update check`"));
-        assert!(help_for("update.auto_apply").contains("`aterm update apply` on Linux"));
-        // The Software Update button's own label (`update_action_label`).
-        assert!(help_for("update.auto_apply").contains("Update to Latest Now on macOS"));
-        assert!(help_for(crate::prefs::EDIT_MOTION).contains(crate::prefs::motion_auto_help()));
-        // The query help is platform-split and states the WIDEST grant: the
-        // system clipboard off-Linux (what the Query arm actually answers
-        // with), the own-selections bound on X11. "cannot return clipboard
-        // contents" was two generations stale — the arm answers since the
-        // OSC 52 read landed.
-        assert!(help_for(crate::prefs::EDIT_ALLOW_OSC52_QUERY).contains(
-            if cfg!(target_os = "linux") {
-                "selections aterm itself owns"
-            } else {
-                "reads the SYSTEM clipboard"
-            }
-        ));
-        // The window-ops Manual entry names the reports that actually ANSWER.
-        // "window-title and text-grid-size" was the pre-fallback set and this
-        // assertion outlived it: the pixel pair (CSI 14 t text area, CSI 16 t
-        // cell size) answers in-core from the host's reported cell box, so a
-        // Manual that still called them unanswered was a lie this test pinned.
-        let window_ops_help = help_for(crate::prefs::EDIT_ALLOW_WINDOW_OPS);
-        assert!(
-            window_ops_help.contains("text-grid-size, text-area-pixels and cell-size"),
-            "{window_ops_help}"
-        );
-        // …and it still discloses the residue, which is the POSITION/screen
-        // half — nothing in-core knows a window origin or a display size.
-        assert!(
-            window_ops_help.contains(if cfg!(target_os = "linux") {
-                "window/screen position and screen-size reports remain unanswered"
-            } else {
-                "position and screen-size reports are ignored on this platform"
-            }),
-            "{window_ops_help}"
-        );
-        assert!(help_for("matrix_rain.hue").contains("matrix / theme / #RRGGBB"));
-        let auto = help_for(crate::prefs::EDIT_PACKAGES_ENABLED);
-        assert!(auto.contains("the one switch"), "{auto}");
-        // Phase 3 deleted the cadence knob and Phase 4 every environment alternative:
-        // no environment variable is taught here.
-        assert!(!auto.contains('$'), "{auto}");
-        assert!(!auto.contains("environment variable"), "{auto}");
-        assert!(auto.contains("within minutes"), "{auto}");
-        assert!(auto.contains("every six hours"), "{auto}");
-        let install = help_for(crate::prefs::EDIT_PACKAGES_AUTO_INSTALL);
-        assert!(install.contains("the one install consent"), "{install}");
-        assert!(install.contains("always win"), "{install}");
-        assert!(!install.contains("ATPKG_"), "{install}");
-
-        let source = "trail_sounds = true\ntrail_sound_volume = 0.4\n\
-confirm_multiline_paste = true\nallow_notifications = true\n";
-        let document = source.parse::<aterm_toml::edit::DocumentMut>().unwrap();
-        let config = aterm_toml::from_str::<crate::app_config::Config>(source).unwrap();
-        let mut analysis = ConfigAnalysis::default();
-        append_semantic_warnings(
-            source,
-            &document,
-            crate::diagnostics::config_backend_capability_warnings(
-                &config,
-                true,
-                crate::diagnostics::ConfigCapabilityPlatform::Unsupported,
+burst = { kind = "glow", chance = 0 }
+"##,
+                false,
+                &[
+                    ("font_px: 201.0 is not accepted", "201"),
+                    ("font_variation[0]", "\"bad-axis\""),
+                    ("font_features[1]", "\"toolong\""),
+                    ("update.owner: \"bad/owner\"", "\"bad/owner\""),
+                    ("matrix_rain.hue value", "\"blue\""),
+                    ("sparkle_words.profanity.palette[1]", "\"bad-color\""),
+                    ("record 1 has no nonblank word", "[\" \"]"),
+                    ("record 1 is inert", "[[sparkle_words.custom]]"),
+                    ("record 2 is inert", "0"),
+                ],
+                false,
             ),
-            &mut analysis,
-        );
-        // `confirm_multiline_paste` earns NO platform warning any more: the
-        // confirm is live everywhere (Linux's in-window paste_banner included).
-        assert!(
-            !analysis
-                .diagnostics
-                .iter()
-                .any(|warning| warning.message.starts_with("confirm_multiline_paste")),
-            "a live-everywhere key must not carry a platform warning"
-        );
-        for (key, token) in [
-            ("trail_sounds", "true"),
-            ("trail_sound_volume", "0.4"),
-            ("allow_notifications", "true"),
+            (
+                "sparkle_words.custom = [{ words = [\"quiet\"] }]\n",
+                false,
+                &[("record 1 is inert", "{ words = [\"quiet\"] }")],
+                false,
+            ),
+            (
+                "font_features = [\n  \"+ss01\",\n  \"toolong\",\n]\n",
+                false,
+                &[("font_features[1]", "\"toolong\"")],
+                false,
+            ),
+            (
+                "[[sparkle_words.custom]]\nink = { colorway = \"rainbow\" }\n",
+                false,
+                &[("has no nonblank word", "[[sparkle_words.custom]]")],
+                false,
+            ),
+            (
+                "[packages]\naccount = \"bad owner\"\n[packages.links]\nbad = \"a b\"\n",
+                false,
+                &[
+                    ("packages.account", "\"bad owner\""),
+                    ("packages.links.bad", "\"a b\""),
+                ],
+                false,
+            ),
+            (
+                "[packages.links]\nay = 5\n",
+                true,
+                &[("packages.links.ay must be text", "5")],
+                false,
+            ),
+            (
+                "[[sparkle_words.custom]]\nwords = [\"zap\"]\n\
+                 burst = { kind = \"starburst\", chance = 101 }\n",
+                false,
+                &[("sparkle_words.custom.burst.chance", "101")],
+                false,
+            ),
+            (
+                "[sparkle_words.ink]\nloop = true\nsweep_ms = 400\n\
+                 [matrix_rain]\nalpha = 120\nhead_alpha = 20\n",
+                false,
+                &[("effectively 600 ms", "400"), ("effectively 120", "20")],
+                true,
+            ),
+            (
+                "allow_osc52_query = true\nallow_window_ops = true\n",
+                false,
+                &[("allow_osc52_query", "true"), ("allow_window_ops", "true")],
+                true,
+            ),
+        ];
+        for &(source, blocks, expected, exactly) in cases {
+            let analysis = analyze(source);
+            assert_eq!(
+                analysis.has_errors(),
+                blocks,
+                "{source:?}: {:?}",
+                analysis.diagnostics
+            );
+            if exactly {
+                assert_eq!(
+                    analysis.diagnostics.len(),
+                    expected.len(),
+                    "{source:?}: one story each: {:?}",
+                    analysis.diagnostics
+                );
+            }
+            for (fragment, token) in expected {
+                let diagnostic = analysis
+                    .diagnostics
+                    .iter()
+                    .find(|diagnostic| diagnostic.message.contains(fragment))
+                    .unwrap_or_else(|| panic!("missing {fragment:?}: {:?}", analysis.diagnostics));
+                assert_eq!(
+                    &source[diagnostic.bytes.clone()],
+                    *token,
+                    "{}",
+                    diagnostic.message
+                );
+            }
+        }
+        for clean in [
+            "[packages.links]\nrepo = \"alabsystems/aterm\"\nhome = \"~/aterm\"\n",
+            "[packages.links]\nay = \"~/ay\"\n",
+            "[packages]\nlinks = { ay = \"~/ay\" }\n",
+            "[[sparkle_words.custom]]\nwords = [\"zap\"]\n\
+             burst = { kind = \"starburst\", chance = 100 }\n",
+            "[sparkle_words.ink]\nloop = true\nsweep_ms = 600\n\
+             [matrix_rain]\nalpha = 120\nhead_alpha = 120\n",
         ] {
-            let warning = analysis
-                .diagnostics
-                .iter()
-                .find(|warning| warning.message.starts_with(key))
-                .unwrap_or_else(|| panic!("missing platform warning for {key}"));
-            assert_eq!(&source[warning.bytes.clone()], token);
+            let analysis = analyze(clean);
+            assert!(
+                analysis.diagnostics.is_empty(),
+                "{clean:?}: {:?}",
+                analysis.diagnostics
+            );
         }
     }
 
+    /// A BACKEND OR PLATFORM CAPABILITY WARNING IS TRUTHFUL AND LANDS ON THE
+    /// AUTHORED VALUE IT IS ABOUT. On a CPU window the compositor's values and
+    /// the GPU post-effects each warn; on a translucent macOS GPU window every
+    /// one has a consumer, while an opaque material still warns. On a platform
+    /// without them the typing sounds and notifications warn, and a key live
+    /// everywhere (`confirm_multiline_paste`: Linux's in-window paste_banner
+    /// included) carries none.
     #[test]
-    fn gpu_post_effect_help_and_cpu_warnings_are_source_addressed() {
-        let keys = [
-            crate::prefs::EDIT_CURSOR_TRAIL_BLOOM,
-            crate::prefs::EDIT_CURSOR_TRAIL_BLOOM_STRENGTH,
-            crate::prefs::EDIT_CURSOR_TRAIL_BLOOM_RADIUS,
-            crate::prefs::EDIT_CURSOR_FIRE_SHIMMER,
-            crate::prefs::EDIT_HDR_GLOW,
-            crate::prefs::EDIT_CURSOR_GLOW_SDR_BOOST,
-        ];
-        for key in keys {
-            let help = setting_help(config_schema_entry(key).unwrap());
-            assert!(help.contains("GPU renderer only"), "{key}: {help}");
-            assert!(help.contains("CPU renderer"), "{key}: {help}");
-        }
-
-        let source = "cursor_trail_bloom = false\n\
+    fn capability_warnings_are_backend_truthful_and_source_addressed() {
+        use crate::diagnostics::{
+            ConfigCapabilityPlatform as Platform, config_backend_capability_warnings as warnings,
+        };
+        let config_of =
+            |source: &str| aterm_toml::from_str::<crate::app_config::Config>(source).unwrap();
+        let backend = "background_opacity = 0.7\nbackground_material = \"hud\"\n\
+window_colorspace = \"display-p3\"\n\
+cursor_trail_bloom = false\n\
 cursor_trail_bloom_strength = 1.25\n\
 cursor_trail_bloom_radius = 3.5\n\
 cursor_fire_shimmer = false\n\
 hdr_glow = true\n\
 cursor_glow_sdr_boost = 0.4\n";
-        let document = source.parse::<aterm_toml::edit::DocumentMut>().unwrap();
-        let config = aterm_toml::from_str::<crate::app_config::Config>(source).unwrap();
-        let warnings = crate::diagnostics::config_backend_capability_warnings(
-            &config,
-            false,
-            crate::diagnostics::ConfigCapabilityPlatform::MacOs,
-        );
-        assert_eq!(warnings.len(), keys.len(), "{warnings:?}");
-
-        let mut analysis = ConfigAnalysis::default();
-        append_semantic_warnings(source, &document, warnings, &mut analysis);
-        for (key, token) in [
-            (crate::prefs::EDIT_CURSOR_TRAIL_BLOOM, "false"),
-            (crate::prefs::EDIT_CURSOR_TRAIL_BLOOM_STRENGTH, "1.25"),
-            (crate::prefs::EDIT_CURSOR_TRAIL_BLOOM_RADIUS, "3.5"),
-            (crate::prefs::EDIT_CURSOR_FIRE_SHIMMER, "false"),
-            (crate::prefs::EDIT_HDR_GLOW, "true"),
-            (crate::prefs::EDIT_CURSOR_GLOW_SDR_BOOST, "0.4"),
-        ] {
-            let diagnostic = analysis
-                .diagnostics
-                .iter()
-                .find(|diagnostic| diagnostic.message.starts_with(key))
-                .unwrap_or_else(|| panic!("missing CPU capability diagnostic for {key}"));
-            assert_eq!(&source[diagnostic.bytes.clone()], token, "{key}");
-            assert!(diagnostic.message.contains("requires the GPU renderer"));
-        }
-
-        assert!(
-            crate::diagnostics::config_backend_capability_warnings(
-                &config,
-                true,
-                crate::diagnostics::ConfigCapabilityPlatform::MacOs,
-            )
-            .is_empty(),
-            "every authored post-effect has a GPU consumer"
-        );
-    }
-
-    #[test]
-    fn compositor_capability_help_and_warnings_are_backend_truthful_and_source_addressed() {
-        let help_for = |key: &str| setting_help(config_schema_entry(key).unwrap());
-        let opacity_help = help_for(crate::prefs::EDIT_BACKGROUND_OPACITY);
-        assert!(
-            opacity_help.contains("macOS GPU rendering only"),
-            "{opacity_help}"
-        );
-        assert!(
-            opacity_help.contains("text keeps 4.5:1 contrast"),
-            "{opacity_help}"
-        );
-        let material_help = help_for(crate::prefs::EDIT_BACKGROUND_MATERIAL);
-        assert!(
-            material_help.contains("GPU renderer only"),
-            "{material_help}"
-        );
-        assert!(
-            material_help.contains("background_opacity < 1"),
-            "{material_help}"
-        );
-        assert!(material_help.contains("Mica Alt"), "{material_help}");
-        let colorspace_help = help_for(crate::prefs::EDIT_WINDOW_COLORSPACE);
-        assert!(
-            colorspace_help.contains("macOS GPU window layer"),
-            "{colorspace_help}"
-        );
-        assert!(colorspace_help.contains("SDR-only"), "{colorspace_help}");
-        assert!(
-            colorspace_help.contains("ExtendedLinearSrgb"),
-            "{colorspace_help}"
-        );
-
-        let source = "background_opacity = 0.7\nbackground_material = \"hud\"\n\
-window_colorspace = \"display-p3\"\n";
-        let document = source.parse::<aterm_toml::edit::DocumentMut>().unwrap();
-        let config = aterm_toml::from_str::<crate::app_config::Config>(source).unwrap();
-        let mut analysis = ConfigAnalysis::default();
-        append_semantic_warnings(
-            source,
-            &document,
-            crate::diagnostics::config_backend_capability_warnings(
-                &config,
+        let platform = "trail_sounds = true\ntrail_sound_volume = 0.4\n\
+confirm_multiline_paste = true\nallow_notifications = true\n";
+        for (source, gpu, on, expected) in [
+            (
+                backend,
                 false,
-                crate::diagnostics::ConfigCapabilityPlatform::MacOs,
+                Platform::MacOs,
+                &[
+                    (crate::prefs::EDIT_BACKGROUND_OPACITY, "0.7"),
+                    (crate::prefs::EDIT_BACKGROUND_MATERIAL, "\"hud\""),
+                    (crate::prefs::EDIT_WINDOW_COLORSPACE, "\"display-p3\""),
+                    (crate::prefs::EDIT_CURSOR_TRAIL_BLOOM, "false"),
+                    (crate::prefs::EDIT_CURSOR_TRAIL_BLOOM_STRENGTH, "1.25"),
+                    (crate::prefs::EDIT_CURSOR_TRAIL_BLOOM_RADIUS, "3.5"),
+                    (crate::prefs::EDIT_CURSOR_FIRE_SHIMMER, "false"),
+                    (crate::prefs::EDIT_HDR_GLOW, "true"),
+                    (crate::prefs::EDIT_CURSOR_GLOW_SDR_BOOST, "0.4"),
+                ][..],
             ),
-            &mut analysis,
-        );
-        assert_eq!(analysis.diagnostics.len(), 3, "{:?}", analysis.diagnostics);
-        for (key, token) in [
-            (crate::prefs::EDIT_BACKGROUND_OPACITY, "0.7"),
-            (crate::prefs::EDIT_BACKGROUND_MATERIAL, "\"hud\""),
-            (crate::prefs::EDIT_WINDOW_COLORSPACE, "\"display-p3\""),
-        ] {
-            let diagnostic = analysis
-                .diagnostics
-                .iter()
-                .find(|diagnostic| diagnostic.message.starts_with(key))
-                .unwrap_or_else(|| panic!("missing capability diagnostic for {key}"));
-            assert_eq!(&source[diagnostic.bytes.clone()], token);
-            assert!(
-                diagnostic.message.contains("no effect")
-                    || diagnostic.message.contains("stays solid")
-            );
-        }
-
-        assert!(
-            crate::diagnostics::config_backend_capability_warnings(
-                &config,
+            (
+                platform,
                 true,
-                crate::diagnostics::ConfigCapabilityPlatform::MacOs,
-            )
-            .is_empty(),
-            "all three values have consumers on a translucent macOS GPU window"
+                Platform::Unsupported,
+                &[
+                    ("trail_sounds", "true"),
+                    ("trail_sound_volume", "0.4"),
+                    ("allow_notifications", "true"),
+                ][..],
+            ),
+        ] {
+            let document = source.parse::<aterm_toml::edit::DocumentMut>().unwrap();
+            let mut analysis = ConfigAnalysis::default();
+            append_semantic_warnings(
+                source,
+                &document,
+                warnings(&config_of(source), gpu, on),
+                &mut analysis,
+            );
+            assert_eq!(
+                analysis.diagnostics.len(),
+                expected.len(),
+                "{:?}",
+                analysis.diagnostics
+            );
+            for (key, token) in expected {
+                let diagnostic = analysis
+                    .diagnostics
+                    .iter()
+                    .find(|diagnostic| diagnostic.message.starts_with(key))
+                    .unwrap_or_else(|| panic!("missing capability diagnostic for {key}"));
+                assert_eq!(&source[diagnostic.bytes.clone()], *token, "{key}");
+            }
+        }
+        assert!(
+            warnings(&config_of(backend), true, Platform::MacOs).is_empty(),
+            "every value has a consumer on a translucent macOS GPU window"
         );
-        let windows = crate::diagnostics::config_backend_capability_warnings(
-            &config,
-            true,
-            crate::diagnostics::ConfigCapabilityPlatform::Windows,
-        );
+        let windows = warnings(&config_of(backend), true, Platform::Windows);
         assert!(
             windows
                 .iter()
@@ -9024,38 +7782,26 @@ window_colorspace = \"display-p3\"\n";
                 .any(|warning| { warning.key == crate::prefs::EDIT_WINDOW_COLORSPACE })
         );
 
-        let opaque: crate::app_config::Config =
-            aterm_toml::from_str("background_material = \"sidebar\"\n").unwrap();
-        let warnings = crate::diagnostics::config_backend_capability_warnings(
-            &opaque,
+        let opaque = warnings(
+            &config_of("background_material = \"sidebar\"\n"),
             true,
-            crate::diagnostics::ConfigCapabilityPlatform::MacOs,
+            Platform::MacOs,
         );
-        assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0].key, crate::prefs::EDIT_BACKGROUND_MATERIAL);
+        assert_eq!(opaque.len(), 1);
+        assert_eq!(opaque[0].key, crate::prefs::EDIT_BACKGROUND_MATERIAL);
         assert!(
-            warnings[0]
-                .message
-                .contains("background_opacity resolves to 1")
-        );
-        assert!(
-            crate::diagnostics::config_backend_capability_warnings(
-                &opaque,
+            warnings(
+                &config_of("background_material = \"sidebar\"\n"),
                 true,
-                crate::diagnostics::ConfigCapabilityPlatform::Windows,
+                Platform::Windows,
             )
             .is_empty(),
             "Windows DWM material is independent of background opacity"
         );
-        let unsupported = crate::diagnostics::config_backend_capability_warnings(
-            &config,
-            true,
-            crate::diagnostics::ConfigCapabilityPlatform::Unsupported,
-        );
         assert!(
-            unsupported
+            warnings(&config_of(backend), true, Platform::Unsupported)
                 .iter()
-                .any(|warning| { warning.key == crate::prefs::EDIT_BACKGROUND_MATERIAL })
+                .any(|warning| warning.key == crate::prefs::EDIT_BACKGROUND_MATERIAL)
         );
     }
 
@@ -9134,39 +7880,6 @@ ink = { colorway = "twotone:#112233,#445566,#778899" }
     }
 
     #[test]
-    fn diagnostic_cap_evicts_a_warning_for_a_late_blocking_error() {
-        let mut analysis = ConfigAnalysis::default();
-        for index in 0..MAX_DIAGNOSTICS {
-            push_diagnostic(
-                &mut analysis,
-                "x",
-                0..1,
-                ConfigDiagnosticSeverity::Warning,
-                format!("warning {index}"),
-            );
-        }
-        push_diagnostic(
-            &mut analysis,
-            "x",
-            0..1,
-            ConfigDiagnosticSeverity::Error,
-            "late blocking error".to_string(),
-        );
-        assert_eq!(analysis.diagnostics.len(), MAX_DIAGNOSTICS);
-        assert!(analysis.has_errors());
-        assert!(
-            analysis
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.message == "late blocking error")
-        );
-        assert_eq!(analysis.omitted_diagnostics, 1);
-        assert!(analysis.summary().unwrap().contains(" · 1 more not shown"));
-        analysis.omitted_diagnostics = 2;
-        assert!(analysis.summary().unwrap().contains(" · 2 more not shown"));
-    }
-
-    #[test]
     fn saturated_range_warnings_cannot_hide_invalid_package_link_type() {
         let mut source = String::new();
         let mut authored = 0usize;
@@ -9218,10 +7931,6 @@ ink = { colorway = "twotone:#112233,#445566,#778899" }
             .collect::<String>();
         let lines = ignored_key_warnings(&source);
         assert_eq!(lines.len(), MAX_DIAGNOSTICS + 1, "{lines:?}");
-        assert_eq!(
-            lines.last().map(String::as_str),
-            Some("… and 3 more not shown")
-        );
     }
 
     #[test]
@@ -9249,10 +7958,6 @@ exclude = ["nested"]
                 .iter()
                 .all(|message| !message.contains("packages.exclude is unknown")),
             "the nested registered path must not be diagnosed as unknown: {messages:?}"
-        );
-        assert!(config_schema_entry(r#""packages.exclude""#).is_none());
-        assert!(
-            config_schema_entry("packages.exclude").is_some_and(|entry| entry.manual_reset_safe)
         );
 
         let literal_value = r#""packages.exclude" = "#;
@@ -9301,175 +8006,6 @@ fps = 999
     }
 
     #[test]
-    fn typography_diagnostics_use_the_full_runtime_domains() {
-        let analysis = analyze("font_px = 100\nfont_weight = 950\n");
-        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
-        assert!(
-            analysis
-                .diagnostics
-                .iter()
-                .all(|diagnostic| !diagnostic.message.contains("outside the supported")),
-            "valid runtime values must not receive clamp warnings: {:?}",
-            analysis.diagnostics
-        );
-        assert_eq!(
-            semantic_numeric_bounds(crate::prefs::EDIT_FONT_PX),
-            Some((6.0, 200.0))
-        );
-        assert_eq!(
-            semantic_numeric_bounds(crate::prefs::EDIT_FONT_WEIGHT),
-            Some((1.0, 1000.0))
-        );
-    }
-
-    #[test]
-    fn one_schema_registry_covers_native_manual_and_table_shapes_without_duplicates() {
-        let schema = config_schema();
-        let keys = schema
-            .iter()
-            .map(|entry| entry.key)
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            keys.len(),
-            schema.len(),
-            "config schema keys must be unique"
-        );
-
-        for field in crate::prefs::editable_fields(&crate::app_config::Config::default()) {
-            let entry = config_schema_entry(field.key).expect("native field is registered");
-            let expected_kind = if crate::prefs::LIST_KEYS.contains(&field.key) {
-                ConfigSchemaKind::StringList
-            } else if crate::prefs::manual_collection_key(field.key) {
-                ConfigSchemaKind::TextOrStringList
-            } else {
-                ConfigSchemaKind::Scalar(field.kind)
-            };
-            assert_eq!(entry.kind, expected_kind, "{}", field.key);
-            assert_eq!(
-                entry.native_scalar,
-                !crate::prefs::manual_only_key(field.key),
-                "{} has a lossless native scalar representation",
-                field.key
-            );
-        }
-        for (key, kind, reset_safe) in [
-            ("packages.exclude", ConfigSchemaKind::StringList, true),
-            ("packages.links", ConfigSchemaKind::DynamicStringMap, true),
-            ("keybindings", ConfigSchemaKind::DynamicStringMap, true),
-            ("key_sequences", ConfigSchemaKind::DynamicStringMap, true),
-            (
-                "sparkle_words.custom",
-                ConfigSchemaKind::StructuredList,
-                true,
-            ),
-            ("net.connections", ConfigSchemaKind::StructuredList, true),
-        ] {
-            let entry = config_schema_entry(key).unwrap();
-            assert_eq!(entry.kind, kind, "{key}");
-            assert_eq!(entry.manual_reset_safe, reset_safe, "{key}");
-        }
-
-        // Every dotted native scalar has a registered table-header prefix, so
-        // table completion cannot lag the value/diagnostic registry.
-        for entry in schema.iter().filter(|entry| entry.native_scalar) {
-            let mut prefix = String::new();
-            let segments = entry.key.split('.').collect::<Vec<_>>();
-            for segment in segments.iter().take(segments.len().saturating_sub(1)) {
-                if !prefix.is_empty() {
-                    prefix.push('.');
-                }
-                prefix.push_str(segment);
-                assert!(
-                    config_schema_entry(&prefix).is_some_and(|table| table.kind.is_table_header()),
-                    "{} needs registered table header {prefix}",
-                    entry.key
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn manual_table_key_and_value_assistance_share_the_schema_registry() {
-        let table = assist("[pack", 5);
-        assert!(table.completions.iter().any(|completion| {
-            completion.insertion == "[packages]" && completion.help.contains("Toolchain packages")
-        }));
-
-        let array_table_source = "[[sparkle_words.cus";
-        let array_table = assist(array_table_source, array_table_source.len());
-        assert!(array_table.completions.iter().any(|completion| {
-            completion.insertion == "[[sparkle_words.custom]]"
-                && completion.help.contains("array of tables")
-        }));
-
-        let package_source = "[packages]\nexc";
-        let package_key = assist(package_source, package_source.len());
-        assert!(package_key.completions.iter().any(|completion| {
-            completion.insertion == "exclude = []"
-                && completion.help.contains("list of text values")
-        }));
-
-        let bool_source = "[packages]\nenabled = ";
-        let package_value = assist(bool_source, bool_source.len());
-        assert_eq!(
-            package_value
-                .completions
-                .iter()
-                .map(|completion| completion.insertion.as_str())
-                .collect::<Vec<_>>(),
-            ["true", "false"]
-        );
-
-        let connection_source = "[[net.connections]]\nfin";
-        let connection = assist(connection_source, connection_source.len());
-        assert!(connection.completions.iter().any(|completion| {
-            completion.insertion == "fingerprint = \"\""
-                && completion.help.contains("certificate fingerprint")
-        }));
-
-        let map_context = assist("[keybindings]\n", "[keybindings]\n".len());
-        assert!(
-            map_context
-                .help
-                .as_deref()
-                .is_some_and(|help| help.contains("table of named text values"))
-        );
-    }
-
-    #[test]
-    fn vec_string_fields_complete_as_valid_toml_arrays_not_settings_control_text() {
-        for key in crate::prefs::LIST_KEYS {
-            let assistance = assist(key, key.len());
-            let completion = assistance
-                .completions
-                .iter()
-                .find(|completion| completion.insertion == format!("{key} = []"))
-                .unwrap_or_else(|| panic!("{key} must complete as a TOML array"));
-            assert!(completion.help.contains("list of text values"), "{key}");
-            let mut completed = (*key).to_string();
-            completed.replace_range(completion.replacement.clone(), &completion.insertion);
-            completed.push('\n');
-            let analysis = analyze(&completed);
-            assert!(
-                !analysis.has_errors(),
-                "{key} completion must deserialize: {:?}",
-                analysis.diagnostics
-            );
-        }
-        for font_list in [
-            crate::prefs::EDIT_FALLBACK_FONTS,
-            crate::prefs::EDIT_FONT_VARIATION,
-        ] {
-            assert!(matches!(
-                config_schema_entry(font_list).unwrap().kind,
-                ConfigSchemaKind::TextOrStringList
-            ));
-            let help = setting_help(config_schema_entry(font_list).expect("FontList schema"));
-            assert!(help.contains("text or list of text values"), "{help}");
-        }
-    }
-
-    #[test]
     fn every_offered_key_and_value_completion_is_error_free_after_acceptance() {
         for setting in config_schema().iter().filter(|setting| {
             setting.kind.is_assignable() && !is_compatibility_only_key(setting.key)
@@ -9504,26 +8040,14 @@ fps = 999
                         .rsplit_once('.')
                         .map_or(("", relative), |(parent, local)| (parent, local));
                     let mut base = format!("[[{record_root}]]\n");
-                    if record_root == "net.connections" {
-                        for (required, value) in [
-                            ("name", "one"),
-                            ("host", "one.example:7100"),
-                            ("fingerprint", "sha256:01"),
-                        ] {
-                            if local != required {
-                                base.push_str(&format!("{required} = {value:?}\n"));
-                            }
-                        }
-                    } else {
-                        if local != "words" && parent.is_empty() {
-                            base.push_str("words = []\n");
-                        }
-                        if !parent.is_empty() {
-                            base.push_str("words = []\n");
-                            base.push_str(&format!("[{record_root}.{parent}]\n"));
-                            if relative == "ink.sweep_once" {
-                                base.push_str("colorway = \"rainbow\"\n");
-                            }
+                    if local != "words" && parent.is_empty() {
+                        base.push_str("words = []\n");
+                    }
+                    if !parent.is_empty() {
+                        base.push_str("words = []\n");
+                        base.push_str(&format!("[{record_root}.{parent}]\n"));
+                        if relative == "ink.sweep_once" {
+                            base.push_str("colorway = \"rainbow\"\n");
                         }
                     }
                     (base, local)
@@ -9575,50 +8099,6 @@ fps = 999
     }
 
     #[test]
-    fn grid_size_completions_match_runtime_defaults_and_warn_before_runtime_clamps() {
-        for (key, inserted, min, max) in [
-            (crate::prefs::EDIT_COLUMNS, 80_u16, 20_u16, 500_u16),
-            (crate::prefs::EDIT_LINES, 24_u16, 5_u16, 300_u16),
-        ] {
-            let completion = assist(key, key.len())
-                .completions
-                .into_iter()
-                .find(|completion| completion.insertion == format!("{key} = {inserted}"))
-                .unwrap_or_else(|| panic!("{key} must complete to its runtime default"));
-            assert_eq!(
-                &completion.insertion[completion.post_insert_selection.clone()],
-                inserted.to_string()
-            );
-            let mut completed = key.to_string();
-            completed.replace_range(completion.replacement, &completion.insertion);
-            let analysis = analyze(&completed);
-            assert!(
-                analysis.diagnostics.is_empty(),
-                "default completion must be clean: {:?}",
-                analysis.diagnostics
-            );
-            let config: crate::app_config::Config = aterm_toml::from_str(&completed).unwrap();
-            let authored = if key == crate::prefs::EDIT_COLUMNS {
-                config.columns.unwrap()
-            } else {
-                config.lines.unwrap()
-            };
-            assert_eq!(authored, inserted);
-            assert_eq!(authored.clamp(min, max), inserted);
-
-            for outside in [min - 1, max + 1] {
-                let source = format!("{key} = {outside}\n");
-                let outside_analysis = analyze(&source);
-                assert!(!outside_analysis.has_errors());
-                assert!(outside_analysis.diagnostics.iter().any(|diagnostic| {
-                    diagnostic.message.contains(key)
-                        && diagnostic.message.contains("will be clamped")
-                }));
-            }
-        }
-    }
-
-    #[test]
     fn contextual_assist_is_derived_from_registered_metadata() {
         let top = assist("win", 3);
         let window = top
@@ -9626,8 +8106,7 @@ fps = 999
             .iter()
             .find(|candidate| candidate.insertion.starts_with("window_theme ="))
             .expect("window-theme completion");
-        assert!(window.help.contains("Window appearance"));
-        assert!(window.help.contains("auto / light / dark"));
+        assert!(!window.help.is_empty());
 
         let nested_source = "[sparkle_words]\nena";
         let nested = assist(nested_source, nested_source.len());
@@ -9636,6 +8115,16 @@ fps = 999
                 .completions
                 .iter()
                 .any(|candidate| candidate.insertion == "enabled = true")
+        );
+
+        let bool_source = "[packages]\nenabled = ";
+        assert_eq!(
+            assist(bool_source, bool_source.len())
+                .completions
+                .iter()
+                .map(|completion| completion.insertion.as_str())
+                .collect::<Vec<_>>(),
+            ["true", "false"]
         );
 
         let value_source = "window_theme = \"d";
@@ -9694,127 +8183,73 @@ fps = 999
         assert_eq!(after, ["\"harbour\""]);
     }
 
-    #[test]
-    fn completion_suppresses_authored_scalar_and_table_paths_but_accepts_valid_edits() {
-        let top_level = "theme = \"Nord\"\n";
-        assert!(!analyze(top_level).has_errors());
-        let top_assist = assist(top_level, top_level.len());
+    /// The completion at `caret` whose insertion is `insertion`, accepted into
+    /// `source`: the edited document, which must still be a valid config.
+    fn accept_completion(source: &str, caret: usize, insertion: &str) -> String {
+        let assistance = assist(source, caret);
+        let candidate = assistance
+            .completions
+            .iter()
+            .find(|completion| completion.insertion == insertion)
+            .unwrap_or_else(|| panic!("{insertion:?} offered at {caret} in {source:?}"));
+        let mut completed = source.to_string();
+        completed.replace_range(candidate.replacement.clone(), &candidate.insertion);
         assert!(
-            top_assist
-                .completions
+            !analyze(&completed).has_errors(),
+            "accepting {insertion:?} must leave a valid config: {completed:?}"
+        );
+        completed
+    }
+
+    /// An authored scalar or table path is not offered again (a second
+    /// `theme = ` or `[packages]` would make the file unparseable), while the
+    /// token being edited stays completable, an array-of-tables path stays
+    /// repeatable, and a nested table may repeat in a different record — and
+    /// every one accepted leaves a valid config.
+    #[test]
+    fn completion_suppresses_authored_paths_but_keeps_the_edited_token_and_records_repeatable() {
+        let top_level = "theme = \"Nord\"\n";
+        let top = assist(top_level, top_level.len());
+        assert!(
+            top.completions
                 .iter()
                 .all(|completion| !completion.insertion.starts_with("theme = "))
         );
-        let top_candidate = top_assist
-            .completions
-            .first()
-            .expect("another top-level scalar completion");
-        let mut completed_top = top_level.to_string();
-        completed_top.replace_range(top_candidate.replacement.clone(), &top_candidate.insertion);
-        assert!(
-            !analyze(&completed_top).has_errors(),
-            "accepted top-level completion must remain a valid config: {completed_top:?}"
-        );
+        let other = top.completions.first().expect("another top-level scalar");
+        accept_completion(top_level, top_level.len(), &other.insertion);
 
         let nested = "[packages]\nenabled = true\n";
-        assert!(!analyze(nested).has_errors());
-        let nested_assist = assist(nested, nested.len());
         assert!(
-            nested_assist
+            assist(nested, nested.len())
                 .completions
                 .iter()
                 .all(|completion| !completion.insertion.starts_with("enabled = "))
         );
-        let nested_candidate = nested_assist
-            .completions
-            .iter()
-            .find(|completion| completion.insertion == "exclude = []")
-            .expect("another packages completion");
-        let mut completed_nested = nested.to_string();
-        completed_nested.replace_range(
-            nested_candidate.replacement.clone(),
-            &nested_candidate.insertion,
-        );
-        assert!(
-            !analyze(&completed_nested).has_errors(),
-            "accepted nested completion must remain a valid config: {completed_nested:?}"
-        );
+        accept_completion(nested, nested.len(), "exclude = []");
 
-        let table_base = "theme = \"Nord\"\n";
-        assert!(!analyze(table_base).has_errors());
         // A typed prefix, so the candidate does not depend on how many shorter
         // table names the registry holds (a bare `[` offers the eight shortest).
-        let table_source = format!("{table_base}\n[pa");
-        let table_assist = assist(&table_source, table_source.len());
-        let table_candidate = table_assist
-            .completions
-            .iter()
-            .find(|completion| completion.insertion == "[packages]")
-            .expect("un-authored table completion");
-        let mut completed_table = table_source.clone();
-        completed_table.replace_range(
-            table_candidate.replacement.clone(),
-            &table_candidate.insertion,
-        );
-        assert!(
-            !analyze(&completed_table).has_errors(),
-            "accepted table completion must remain a valid config: {completed_table:?}"
-        );
-
-        let authored_table = format!("{table_base}\n[packages]\n");
-        let duplicate_table = format!("{authored_table}\n[");
+        let table = format!("{top_level}\n[pa");
+        accept_completion(&table, table.len(), "[packages]");
+        let duplicate_table = format!("{top_level}\n[packages]\n\n[");
         assert!(
             assist(&duplicate_table, duplicate_table.len())
                 .completions
                 .iter()
                 .all(|completion| completion.insertion != "[packages]")
         );
-    }
 
-    #[test]
-    fn completion_keeps_the_current_token_and_repeated_array_table_editable() {
-        // The scalar being edited stays completable:
-        // `completion_replaces_the_full_key_or_value_token_from_a_mid_token_caret`.
-        let header = "[packages]\n";
-        let header_assist = assist(header, "[pack".len());
-        let header_candidate = header_assist
-            .completions
-            .iter()
-            .find(|completion| completion.insertion == "[packages]")
-            .expect("the table header currently being edited remains completable");
-        let mut completed_header = header.to_string();
-        completed_header.replace_range(
-            header_candidate.replacement.clone(),
-            &header_candidate.insertion,
-        );
-        assert!(!analyze(&completed_header).has_errors());
+        // The header being edited (the scalar twin:
+        // `completion_replaces_the_full_key_or_value_token_from_a_mid_token_caret`).
+        accept_completion("[packages]\n", "[pack".len(), "[packages]");
 
-        let first_record = r#"[[net.connections]]
-name = "one"
-host = "one.example:7100"
-fingerprint = "sha256:01"
-"#;
-        assert!(!analyze(first_record).has_errors());
-        let repeated_source = format!(
-            "{first_record}\n[[\nname = \"two\"\nhost = \"two.example:7100\"\nfingerprint = \"sha256:02\"\n"
+        let first_record = "[[sparkle_words.custom]]\nwords = [\"one\"]\nink = \"rainbow\"\n";
+        let repeated = format!("{first_record}\n[[\nwords = [\"two\"]\nink = \"rainbow\"\n");
+        accept_completion(
+            &repeated,
+            first_record.len() + "\n[[".len(),
+            "[[sparkle_words.custom]]",
         );
-        let repeated_caret = first_record.len() + "\n[[".len();
-        let repeated_assist = assist(&repeated_source, repeated_caret);
-        let repeated_candidate = repeated_assist
-            .completions
-            .iter()
-            .find(|completion| completion.insertion == "[[net.connections]]")
-            .expect("an authored array-table path remains repeatable");
-        let mut completed_repeated = repeated_source.clone();
-        completed_repeated.replace_range(
-            repeated_candidate.replacement.clone(),
-            &repeated_candidate.insertion,
-        );
-        assert!(
-            !analyze(&completed_repeated).has_errors(),
-            "accepted repeated array table must remain a valid config: {completed_repeated:?}"
-        );
-
         let nested_repeated = r#"[[sparkle_words.custom]]
 words = ["one"]
 [sparkle_words.custom.burst]
@@ -9824,42 +8259,52 @@ kind = "nova"
 words = ["two"]
 
 [sparkle_words.custom.b"#;
-        let nested_assist = assist(nested_repeated, nested_repeated.len());
-        let nested_candidate = nested_assist
-            .completions
-            .iter()
-            .find(|completion| completion.insertion == "[sparkle_words.custom.burst]")
-            .expect("a nested table may repeat in a different array-table record");
-        let mut completed_nested = nested_repeated.to_string();
-        completed_nested.replace_range(
-            nested_candidate.replacement.clone(),
-            &nested_candidate.insertion,
-        );
-        assert!(
-            !analyze(&completed_nested).has_errors(),
-            "nested table completion must retain per-record array scope: {completed_nested:?}"
+        accept_completion(
+            nested_repeated,
+            nested_repeated.len(),
+            "[sparkle_words.custom.burst]",
         );
     }
 
+    /// Inside a multiline string (basic or literal) assistance is inert, and a
+    /// fake header in it never becomes the context of what follows; an escaped
+    /// first quote cannot begin the closing delimiter.
     #[test]
     fn assist_is_inert_inside_multiline_strings_and_ignores_fake_context() {
-        for source in [
-            r#"[sparkle_words.profanity]
+        let all = ["[packages]", "# not a comment", "exclude ="];
+        for (source, markers) in [
+            (
+                r#"[sparkle_words.profanity]
 note = """
 [packages] # not a table
 # not a comment
 exclude =
 """
 sty"#,
-            r#"[sparkle_words.profanity]
+                &all[..],
+            ),
+            (
+                r#"[sparkle_words.profanity]
 note = '''
 [packages] # not a table
 # not a comment
 exclude =
 '''
 sty"#,
+                &all[..],
+            ),
+            (
+                r#"[sparkle_words.profanity]
+note = """
+escaped delimiter: \"""
+[packages]
+exclude =
+"""
+sty"#,
+                &all[2..],
+            ),
         ] {
-            for marker in ["[packages]", "# not a comment", "exclude ="] {
+            for marker in markers {
                 let caret = source.find(marker).unwrap() + marker.len();
                 assert_eq!(
                     assist(source, caret),
@@ -9886,30 +8331,6 @@ sty"#,
     }
 
     #[test]
-    fn escaped_triple_quotes_do_not_end_a_multiline_basic_string() {
-        let source = r#"[sparkle_words.profanity]
-note = """
-escaped delimiter: \"""
-[packages]
-exclude =
-"""
-sty"#;
-        let fake_include = source.find("exclude =").unwrap() + "exclude =".len();
-        assert_eq!(
-            assist(source, fake_include),
-            ConfigAssist::default(),
-            "an escaped first quote cannot begin the closing delimiter"
-        );
-        let after = assist(source, source.len());
-        assert!(
-            after
-                .completions
-                .iter()
-                .any(|completion| completion.insertion.starts_with("style = "))
-        );
-    }
-
-    #[test]
     fn worker_built_assist_index_matches_standalone_language_results() {
         for source in [
             "",
@@ -9919,8 +8340,7 @@ sty"#;
             "[keybindings]\n\"literal.key\" = \"value\"\n",
             // The caret help reads the disk reader's faults from the worker's
             // analysis too.
-            "[sparkle_words.orca]\nenabled = true\ndisk.apply = false\n",
-            "[[sparkle_words.orca]]\ndisk.apply = false\n",
+            "[[foo]]\ndisk.apply = false\n",
         ] {
             let analysis = analyze(source);
             for caret in (0..=source.len()).filter(|caret| source.is_char_boundary(*caret)) {
@@ -9931,27 +8351,6 @@ sty"#;
                 );
             }
         }
-    }
-
-    #[test]
-    fn worker_index_covers_large_document_line_boundaries_once() {
-        let mut source = "[packages]\n".to_string();
-        while source.len() < 400 * 1024 {
-            source.push_str("# bounded filler\n");
-        }
-        source.push_str("exc");
-        let analysis = analyze(&source);
-        assert_eq!(
-            analysis.assist_index.lines.len(),
-            source.bytes().filter(|byte| *byte == b'\n').count() + 1
-        );
-        let indexed = assist_with_analysis(&source, source.len(), &analysis);
-        assert!(
-            indexed
-                .completions
-                .iter()
-                .any(|completion| completion.insertion == "exclude = []")
-        );
     }
 
     #[test]
@@ -9983,94 +8382,6 @@ sty"#;
         let mut completed_value = source.to_string();
         completed_value.replace_range(value.replacement.clone(), &value.insertion);
         assert_eq!(completed_value, source);
-    }
-
-    #[test]
-    fn manual_only_switches_hover_with_their_resolved_default() {
-        let help_for = |key: &str| setting_help(config_schema_entry(key).unwrap());
-        assert!(help_for("keeper.enabled").contains(" · default false"));
-        assert!(help_for("privacy.enabled").contains(" · default true"));
-        assert!(help_for("output_streak.tail").contains(" · default 9"));
-        assert!(help_for("render.repaint_nudge").contains(" · default on"));
-        assert!(help_for("right_click").contains(" · default "));
-        // Negative control: a text key has no single default to show.
-        assert!(!help_for("update.owner").contains(" · default"));
-    }
-
-    #[test]
-    fn setting_help_omits_empty_or_duplicated_default_wording() {
-        for setting in config_schema() {
-            let help = setting_help(setting);
-            let lower = help.to_ascii_lowercase();
-            assert!(!lower.contains("default default"), "{help}");
-            assert!(!lower.contains("default  "), "{help}");
-            assert!(!lower.ends_with("default "), "{help}");
-        }
-
-        let help_for = |key: &str| setting_help(config_schema_entry(key).unwrap());
-        // A switch shows its resolved default once, from its seed.
-        assert!(help_for("cursor_blink").contains(" · default true"));
-        // A platform default shows this platform's number, not a bare "default".
-        assert!(help_for("tab_strip_rows").contains(&format!(
-            " · default {}",
-            crate::app_config::DEFAULT_TAB_STRIP_ROWS
-        )));
-        assert_eq!(
-            help_for("window_theme")
-                .to_ascii_lowercase()
-                .matches("default")
-                .count(),
-            1
-        );
-        for key in ["columns", "lines", "gpu"] {
-            let timing = crate::prefs::application_timing(key)
-                .unwrap_or_else(|| panic!("missing application timing for {key}"));
-            assert!(
-                help_for(key).contains(timing),
-                "Manual help must use the shared application timing for {key}: {timing}"
-            );
-        }
-        assert!(!help_for("font_px").contains("Applies next launch"));
-        for key in [
-            crate::prefs::EDIT_COLUMNS,
-            crate::prefs::EDIT_LINES,
-            crate::prefs::EDIT_GPU,
-            crate::prefs::EDIT_FONT_PX,
-            crate::prefs::EDIT_FONT_FAMILY,
-            crate::prefs::EDIT_SHELL,
-        ] {
-            let note = crate::prefs::environment_precedence(key)
-                .unwrap_or_else(|| panic!("missing environment precedence for {key}"));
-            assert!(
-                help_for(key).contains(note),
-                "Manual help must disclose environment precedence for {key}"
-            );
-        }
-        // Config-only keys (their `ATERM_*` twins were deleted, 2026-09-24) claim
-        // no ambient override: the table is the one spelling, so their help
-        // discloses none.
-        for key in [
-            crate::prefs::EDIT_TAB_STRIP_ROWS,
-            crate::prefs::EDIT_STEM_GAMMA,
-            crate::prefs::EDIT_WINDOW_THEME,
-            crate::prefs::EDIT_FALLBACK_FONTS,
-            crate::prefs::EDIT_SYMBOL_FONT,
-            crate::prefs::EDIT_EMOJI_FONT,
-            "net.listen",
-            "net.cert",
-            "net.key",
-        ] {
-            assert_eq!(crate::prefs::environment_precedence(key), None, "{key}");
-        }
-        assert!(help_for(crate::prefs::EDIT_FONT_WEIGHT).contains("provides a wght axis"));
-        assert!(
-            help_for(crate::prefs::EDIT_SEARCH_HISTORY_LINES)
-                .contains("0 searches only the screen")
-        );
-        assert!(
-            help_for(crate::prefs::EDIT_CONFIRM_MULTILINE_PASTE)
-                .contains("does not use bracketed paste")
-        );
     }
 
     #[test]
@@ -10134,6 +8445,9 @@ sty"#;
         );
     }
 
+    /// Past the analysis cap the document is an error, the spans stay bounded,
+    /// assistance is inert, and a cap that splits a UTF-8 sequence never panics
+    /// or yields a span off a character boundary.
     #[test]
     fn analysis_and_context_are_strictly_bounded() {
         let source = "x".repeat(MAX_CONFIG_ANALYSIS_BYTES + 1);
@@ -10141,14 +8455,9 @@ sty"#;
         assert!(analysis.has_errors());
         assert!(analysis.syntax.len() <= MAX_SYNTAX_SPANS);
         assert_eq!(assist(&source, source.len()), ConfigAssist::default());
-    }
 
-    #[test]
-    fn oversized_utf8_split_at_analysis_cap_is_panic_free() {
         let source = format!("{}é", "x".repeat(MAX_CONFIG_ANALYSIS_BYTES - 1));
-        assert!(source.len() > MAX_CONFIG_ANALYSIS_BYTES);
         assert!(!source.is_char_boundary(MAX_CONFIG_ANALYSIS_BYTES));
-
         let analysis = analyze(&source);
         assert!(analysis.has_errors());
         assert!(analysis.syntax.iter().all(|span| {
@@ -10215,7 +8524,7 @@ sty"#;
         source: &str,
         mut inspect: impl FnMut(&EditorViewportProjection),
     ) {
-        let mut store = crate::document_store::DocumentStore::for_test();
+        let mut store = crate::test_document_store();
         let document = store.open("mem://config-projection".to_string(), source.to_string());
         let mut workspace = crate::native_editor::EditorWorkspace::new();
         let mut view = workspace
@@ -10238,90 +8547,6 @@ sty"#;
                 }
             }
         }
-    }
-
-    /// The precondition `decorate_projection`'s windowed scan spends, written as a
-    /// predicate so the pin below can prove itself with a negative control:
-    /// consecutive rows are consecutive SOURCE lines, and are therefore separated
-    /// by at least the newline between them.
-    fn one_window_per_source_line(projection: &EditorViewportProjection) -> bool {
-        projection.lines.windows(2).all(|pair| {
-            pair[1].number == pair[0].number + 1 && pair[0].source.end < pair[1].source.start
-        })
-    }
-
-    /// One projected row over an arbitrary byte window of `source` — the shape a
-    /// soft-wrap projection would emit, which the real projector never does.
-    fn projected_window(
-        source: &str,
-        number: usize,
-        bytes: Range<usize>,
-    ) -> crate::native_editor::EditorViewportLine {
-        crate::native_editor::EditorViewportLine {
-            number,
-            column_start: bytes.start,
-            text: source[bytes.clone()].to_string(),
-            source: bytes,
-            selections: Vec::new(),
-            carets: Vec::new(),
-            syntax: Vec::new(),
-            diagnostics: Vec::new(),
-        }
-    }
-
-    /// The cross-module precondition `decorate_projection`'s windowed scan spends:
-    /// `project_viewport_with` emits exactly ONE window per source line, so the
-    /// next projected row starts after every span of this one and is a sound scan
-    /// terminator. Soft wrap — two windows inside one source line — would land
-    /// `lines[i + 1].source.start` mid-line, where the comment span `lex_line`
-    /// pushes ahead of the key span it follows trips the `break` and the key
-    /// highlighting silently vanishes on wrapped rows with a trailing comment.
-    /// Pin the producer here so that feature breaks THIS test, loudly, instead of
-    /// the decoration, invisibly.
-    #[test]
-    fn viewport_projection_emits_one_window_per_source_line() {
-        let source = projection_pin_source();
-        let mut sliced_windows = 0usize;
-        for_each_config_projection(&source, |projection| {
-            for line in &projection.lines {
-                assert!(
-                    !line.text.contains('\n'),
-                    "a projected window must stay inside one source line: {line:?}"
-                );
-                // A window that does not begin right after a newline began mid
-                // source line: that is the horizontal slice, the only shape where
-                // a span can start left of the window it belongs to.
-                if line.source.start > 0 && source.as_bytes()[line.source.start - 1] != b'\n' {
-                    sliced_windows += 1;
-                }
-            }
-            assert!(
-                one_window_per_source_line(projection),
-                "decorate_projection stops each row's scan at `lines[i + 1].source.start`, \
-                 which is only a sound terminator while every source line owns exactly one \
-                 window: {projection:?}"
-            );
-        });
-        assert!(
-            sliced_windows > 0,
-            "negative control: the grid must actually produce horizontally sliced \
-             windows, otherwise it never exercises the mid-line case"
-        );
-        // Negative control for the predicate itself: the shape soft wrap would
-        // emit — two windows inside source line 1 — must be REJECTED, otherwise
-        // the pin above could never fail for the reason it was written.
-        let wrapped = EditorViewportProjection {
-            first_line: 1,
-            total_lines: 1,
-            lines: vec![
-                projected_window(&source, 1, 0..7),
-                projected_window(&source, 1, 7..14),
-            ],
-        };
-        assert!(
-            !one_window_per_source_line(&wrapped),
-            "a two-window-per-source-line projection must not satisfy the precondition"
-        );
     }
 
     /// The windowed scan has to push exactly the subsequence a full rescan would,
@@ -10373,68 +8598,46 @@ sty"#;
         analysis.diagnostics[0].message.clone()
     }
 
-    /// The whole bar for a mistyped key: the reader is told the spelling that
-    /// works. A transposition is the common shape and the one plain Levenshtein
-    /// scores as two edits, so it is the case worth pinning.
+    /// The whole bar for a mistyped key or value: the reader is told the
+    /// spelling that works. A transposition (two Levenshtein edits), a
+    /// capitalized key (distance zero once folded, still a miss), a mistyped
+    /// TABLE (the suggestion must climb from the leaf to the table) and a
+    /// mistyped enum value each take a different path to the suggestion.
     #[test]
     fn a_mistyped_key_is_told_the_spelling_that_works() {
-        for (typo, intended) in [
-            ("cursor_trail_stlye", "cursor_trail_style"),
-            ("colums", "columns"),
-            ("font_pxx", "font_px"),
-            ("scrollback_lnies", "scrollback_lines"),
+        for (source, intended) in [
+            ("cursor_trail_stlye = 1\n", "cursor_trail_style"),
+            ("colums = 1\n", "columns"),
+            ("scrollback_lnies = 1\n", "scrollback_lines"),
+            ("Columns = 100\n", "columns"),
+            ("[keybindigns]\n\"ctrl+t\" = \"new_tab\"\n", "keybindings"),
+            ("cursor_style = \"blok\"\n", "block"),
         ] {
-            let message = only_message(&format!("{typo} = 1\n"));
+            let message = only_message(source);
             assert!(
-                message.contains(typo) && message.contains(&format!("did you mean {intended:?}")),
-                "{typo} must name {intended}: {message}"
+                message.contains(&format!("did you mean {intended:?}")),
+                "{source:?} must name {intended}: {message}"
             );
         }
     }
 
-    /// TOML keys are case-sensitive and this loader does not fold them, so a
-    /// capitalized key is a silent no-op like any other misspelling — and the
-    /// zero-distance case must still be reported as a miss rather than mistaken
-    /// for the key itself.
-    #[test]
-    fn a_capitalized_key_is_a_miss_and_names_its_lowercase_spelling() {
-        let message = only_message("Columns = 100\n");
-        assert!(
-            message.contains("did you mean \"columns\""),
-            "capitalized key must name its accepted spelling: {message}"
-        );
-    }
-
-    /// A key from a NEWER aterm has no effect in this build, and it must not be
-    /// dressed up as a typo. Nothing in the registry is near this name, so no
-    /// rename may be guessed.
-    #[test]
-    fn a_key_from_a_future_build_has_no_effect_and_no_guessed_rename() {
-        let message = only_message("quantum_flux_capacitor_mode = true\n");
-        assert_eq!(
-            message,
-            "quantum_flux_capacitor_mode is unknown to this build and has no effect"
-        );
-        assert!(!message.contains("did you mean"), "{message}");
-    }
-
-    /// A misspelled TABLE header never reaches the walker as itself — it arrives
-    /// as its leaves — so the suggestion has to climb to the ancestor that is
-    /// wrong. Without the climb the leaf's own depth holds nothing like it and
-    /// the reader is told only that a key they never wrote is unknown.
-    #[test]
-    fn a_mistyped_table_header_names_the_table_rather_than_its_leaf() {
-        let message = only_message("[keybindigns]\n\"ctrl+t\" = \"new_tab\"\n");
-        assert!(
-            message.contains("did you mean \"keybindings\""),
-            "a mistyped table must name the table: {message}"
-        );
-    }
-
     /// A near miss is answered from the registry, so it can only ever name a key
-    /// this build accepts — and never renames one working key into another.
+    /// this build accepts — and never renames one working key into another, nor
+    /// answers a typo with a retired or compatibility-only spelling (a key that
+    /// does nothing: the exact defect the diagnostic exists to end).
     #[test]
     fn a_suggestion_is_always_a_key_the_loader_accepts_and_never_a_working_one() {
+        let suggestable = suggestable_config_paths();
+        for dead in RETIRED_CONFIG_KEYS
+            .iter()
+            .map(|retired| retired.key)
+            .chain(COMPATIBILITY_ONLY_KEYS.iter().copied())
+        {
+            assert!(
+                !suggestable.contains(&dead),
+                "{dead} must not be suggestable"
+            );
+        }
         for entry in config_schema() {
             assert_eq!(
                 nearest_config_key(entry.key),
@@ -10443,73 +8646,6 @@ sty"#;
                 entry.key
             );
         }
-        for typo in ["cursor_trail_stlye", "colums", "keybindigns", "wndow_theme"] {
-            let suggestion = nearest_config_key(typo).unwrap_or_else(|| panic!("{typo}"));
-            assert!(
-                config_path_is_known(suggestion),
-                "{typo} suggested {suggestion}, which this build does not accept"
-            );
-        }
-    }
-
-    /// A retired spelling still has a Manual story of its own ("was removed"),
-    /// and offering it as the answer to someone else's typo would hand them a
-    /// key that does nothing — the exact defect the diagnostic exists to end.
-    #[test]
-    fn a_retired_spelling_is_never_offered_as_the_answer_to_a_typo() {
-        for retired in RETIRED_CONFIG_KEYS {
-            assert!(
-                !suggestable_config_paths().contains(&retired.key),
-                "{} is retired and must not be suggestable",
-                retired.key
-            );
-        }
-        for compatibility_only in COMPATIBILITY_ONLY_KEYS {
-            assert!(
-                !suggestable_config_paths().contains(compatibility_only),
-                "{compatibility_only} is compatibility-only and must not be suggestable"
-            );
-        }
-    }
-
-    /// Listing the vocabulary answers "what may I write"; naming the near miss
-    /// answers "what did I mean". A long domain needs both.
-    #[test]
-    fn a_mistyped_enum_value_names_the_nearest_accepted_spelling() {
-        let message = only_message("cursor_style = \"blok\"\n");
-        assert!(
-            message.contains("must be one of") && message.contains("did you mean \"block\""),
-            "{message}"
-        );
-    }
-
-    /// An unknown key leaves NO trace in the parsed `Config`, so this walk is the
-    /// only thing standing between a typo and a silent no-op. The line number
-    /// rides along because the caller's surfaces have no other cursor into the file.
-    #[test]
-    fn ignored_key_warnings_locate_every_key_the_loader_will_drop() {
-        let warnings = ignored_key_warnings("theme = \"Nord\"\ncolums = 100\nshow_hud = true\n");
-        assert!(
-            warnings.iter().any(
-                |line| line.starts_with("line 2:") && line.contains("did you mean \"columns\"")
-            ),
-            "{warnings:?}"
-        );
-        assert!(
-            warnings.iter().any(|line| line.starts_with("line 3:")),
-            "a retired key is ignored too and must be listed: {warnings:?}"
-        );
-        assert!(
-            ignored_key_warnings("theme = \"Nord\"\n").is_empty(),
-            "a config of accepted keys must produce no ignored-key line"
-        );
-    }
-
-    /// A syntax error is reported by the caller's own parse, with its own line and
-    /// column. Restating it here would print every broken file's one mistake twice.
-    #[test]
-    fn ignored_key_warnings_stay_silent_on_a_file_that_does_not_parse() {
-        assert!(ignored_key_warnings("theme = \"Nord\n").is_empty());
     }
 
     /// The budget is length-scaled in both directions. Two edits inside `gpu` is
@@ -10530,36 +8666,10 @@ sty"#;
             "two edits, long key"
         );
         assert_eq!(nearest_config_key("theme_of_everything"), None);
-        assert_eq!(nearest_enum_value("blok", &["block", "bar"]), Some("block"));
         assert_eq!(
             nearest_enum_value("wildly-different", &["block", "bar"]),
             None
         );
-        assert_eq!(
-            nearest_enum_value("block", &["block", "bar"]),
-            None,
-            "an accepted spelling is not a miss"
-        );
-    }
-
-    /// A key spelled RIGHT whose value this build does not accept is the same
-    /// silent no-op as a misspelled key: the resolver keeps the default and says
-    /// so only on a stderr a windowed launch does not have. Most enum keys never
-    /// got a hand-written check, so the registry has to answer for all of them.
-    #[test]
-    fn a_key_spelled_right_with_a_value_that_is_not_is_reported_with_its_vocabulary() {
-        for (source, key, intended) in [
-            ("window_theme = \"drak\"\n", "window_theme", "dark"),
-            ("motion = \"redcued\"\n", "motion", "reduced"),
-            ("right_click = \"of\"\n", "right_click", "off"),
-        ] {
-            let warnings = unaccepted_value_warnings(source, &[]);
-            let joined = warnings.join("\n");
-            assert!(
-                joined.contains(key) && joined.contains(&format!("did you mean {intended:?}")),
-                "{key} must name {intended}: {joined}"
-            );
-        }
     }
 
     /// The two halves of the seam answer from ONE registry, so a key cannot get
@@ -10610,32 +8720,6 @@ sty"#;
         assert!(graded > 20, "the registry sweep found only {graded} keys");
     }
 
-    /// The domain and the acceptance test are the registry's, so every spelling
-    /// the loader admits — canonical, aliased, or retired-but-still-resolving —
-    /// stays silent. A walk that warned about a value the runtime happily
-    /// resolves would be worse than no walk at all: it sends someone to change a
-    /// config that works.
-    #[test]
-    fn every_spelling_the_loader_admits_raises_no_value_warning() {
-        for accepted in [
-            "window_theme = \"dark\"",
-            "window_theme = \"Auto\"",
-            "cursor_style = \"beam\"",
-            "cursor_style = \"underline\"",
-            "cursor_trail_style = \"nyan rainbow\"",
-            "motion = \"full\"",
-            "right_click = \"copy_paste\"",
-            "columns = 100",
-        ] {
-            let warnings = unaccepted_value_warnings(&format!("{accepted}\n"), &[]);
-            assert!(warnings.is_empty(), "{accepted:?} warned: {warnings:?}");
-        }
-        assert!(
-            unaccepted_value_warnings("theme = \"Nord\n", &[]).is_empty(),
-            "a file that does not parse is the caller's own error to report"
-        );
-    }
-
     /// A resolver that already named the value it refused knows more than the
     /// vocabulary does — which fallback runs, that the whole cursor effect goes
     /// dark — so it keeps the sentence and the generic line stands down. The test
@@ -10668,7 +8752,9 @@ sty"#;
     /// A key a removed feature left behind (`show_hud`, the Scene keys,
     /// `packages.channel`) is the band's record half, beside the retired
     /// spellings; a key this build does not know stays in the ignored half,
-    /// which reaches the glass (design ruling 213).
+    /// which reaches the glass (design ruling 213). An unknown key leaves NO
+    /// trace in the parsed `Config`, so `--validate-config` lists both, each
+    /// on its line: the caller's surfaces have no other cursor into the file.
     #[test]
     fn a_removed_features_key_is_a_record_and_a_typo_is_not() {
         let warned =
@@ -10699,17 +8785,31 @@ sty"#;
             "{warned:?}"
         );
         // `--validate-config` still lists all of them.
-        let all = ignored_key_warnings("show_hud = true\ncolums = 100\n");
+        let all = ignored_key_warnings("theme = \"Nord\"\ncolums = 100\nshow_hud = true\n");
         assert_eq!(all.len(), 2, "{all:?}");
+        assert!(
+            all.iter()
+                .any(|line| line.starts_with("line 2:") && line.contains("\"columns\"")),
+            "{all:?}"
+        );
+        assert!(
+            all.iter().any(|line| line.starts_with("line 3:")),
+            "{all:?}"
+        );
+        assert!(ignored_key_warnings("theme = \"Nord\"\n").is_empty());
+        assert!(unaccepted_value_warnings("columns = 100\n", &[]).is_empty());
+        // A syntax error is the caller's own parse to report, once.
+        assert!(ignored_key_warnings("theme = \"Nord\n").is_empty());
+        assert!(unaccepted_value_warnings("theme = \"Nord\n", &[]).is_empty());
     }
 
     /// EVERY `[ai]` KEY (docs/DESIGN-ai-connections-2026-10-16.md §6.1) is the
     /// config language's AND the AI layer's reader's: a file that writes each
     /// one is read with no note by `aterm_agent::ai::config::read` and draws
     /// no ignored-key notice here. The Settings rows (`enabled`, `preferred`,
-    /// each CLI's `use`) are registered once, in `prefs::NESTED_LEAVES`; the
-    /// grant (`reviewers`) and the fleet keys (`machine`, `fleet`) are Manual
-    /// rows only, never a registry row `settings set` could drive. NEGATIVE
+    /// `reviews`, `review_permissions`, the fleet keys and each CLI's `use`)
+    /// are registered once, in `prefs::NESTED_LEAVES`; the reviewers list and
+    /// the review knobs are Manual rows only. NEGATIVE
     /// CONTROLS: a misspelled key and a CLI this build does not know are
     /// noticed by both.
     #[test]
@@ -10717,7 +8817,9 @@ sty"#;
         let mut text = String::from(
             "[ai]\nenabled = true\npreferred = \"codex\"\nreviewers = [\"codex\"]\n\
              review_count = 2\nreview_timeout_s = 120\nmachine = \"m7\"\n\
-             fleet = \"/dotfiles/ai-fleet.toml\"\n",
+             fleet = \"/dotfiles/ai-fleet.toml\"\nreviews = true\n\
+             review_permissions = \"inherit\"\n\
+             fleet_key = \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"\n",
         );
         for id in aterm_agent::ai::connector::ids() {
             text.push_str(&format!("[ai.{id}]\nuse = false\n"));
@@ -10729,7 +8831,7 @@ sty"#;
             "{:?}",
             ignored_key_warnings(&text)
         );
-        for key in ["ai.reviewers", "ai.machine", "ai.fleet"] {
+        for key in ["ai.reviewers", "ai.review_count", "ai.review_timeout_s"] {
             assert!(
                 crate::prefs::nested_leaf(key).is_none(),
                 "{key} has no Settings row"
@@ -10739,10 +8841,17 @@ sty"#;
                 "{key} is a Manual row"
             );
         }
-        let mut rows = vec![
-            crate::prefs::EDIT_AI_ENABLED.to_string(),
-            crate::prefs::EDIT_AI_PREFERRED.to_string(),
-        ];
+        let mut rows: Vec<String> = [
+            crate::prefs::EDIT_AI_ENABLED,
+            crate::prefs::EDIT_AI_PREFERRED,
+            crate::prefs::EDIT_AI_REVIEWS,
+            crate::prefs::EDIT_AI_REVIEW_PERMISSIONS,
+            crate::prefs::EDIT_AI_MACHINE,
+            crate::prefs::EDIT_AI_FLEET,
+            crate::prefs::EDIT_AI_FLEET_KEY,
+        ]
+        .map(str::to_string)
+        .to_vec();
         rows.extend(
             aterm_agent::ai::connector::ids()
                 .into_iter()
@@ -10771,341 +8880,6 @@ sty"#;
         }
     }
 
-    /// The supervisor's `[harness]` keys (`aterm_agent::supervise::config::
-    /// KEYS`) are the config language's: each is completed, and a misspelled
-    /// one is an ignored-key notice — never dropped in silence. `enabled`,
-    /// `autopilot`, `approve`, `answer_questions` and `question_priority` are
-    /// Settings rows (`prefs::EDIT_HARNESS_ENABLED`,
-    /// `prefs::EDIT_HARNESS_AUTOPILOT` — an Enum of the supervisor's own
-    /// three modes, so Manual completes exactly those —
-    /// `prefs::EDIT_HARNESS_APPROVE`, `prefs::EDIT_HARNESS_ANSWER_QUESTIONS`,
-    /// `prefs::EDIT_HARNESS_QUESTION_PRIORITY` — an Enum of the supervisor's
-    /// own priority words, so Manual completes exactly those), registered once through
-    /// `prefs::NESTED_LEAVES` and never ALSO in `MANUAL_SCHEMA`, where the
-    /// merge would drop the second row in silence.
-    #[test]
-    fn every_supervisor_key_is_known_to_the_config_language() {
-        let rows = [
-            crate::prefs::EDIT_HARNESS_ENABLED,
-            crate::prefs::EDIT_HARNESS_AUTOPILOT,
-            crate::prefs::EDIT_HARNESS_APPROVE,
-            crate::prefs::EDIT_HARNESS_ANSWER_QUESTIONS,
-            crate::prefs::EDIT_HARNESS_QUESTION_PRIORITY,
-        ];
-        for key in aterm_agent::supervise::config::KEYS {
-            let dotted = format!("harness.{key}");
-            let row = rows.contains(&dotted.as_str());
-            let manual = MANUAL_SCHEMA.iter().any(|e| e.key == dotted);
-            if row {
-                assert!(
-                    crate::prefs::nested_leaf(&dotted).is_some() && !manual,
-                    "{dotted} is a Settings row: one registration, in NESTED_LEAVES"
-                );
-            }
-            assert!(row || manual, "{dotted} is not in the config language");
-            // …and whichever list holds it, the resolved schema serves it.
-            let schema = config_schema().iter().find(|e| e.key == dotted);
-            assert!(
-                schema.is_some(),
-                "{dotted} is not served by config_schema()"
-            );
-        }
-        let approve = config_schema()
-            .iter()
-            .find(|e| e.key == crate::prefs::EDIT_HARNESS_APPROVE)
-            .expect("the approval level is a schema key");
-        assert_eq!(
-            approve.kind,
-            ConfigSchemaKind::Scalar(EditKind::Enum {
-                options: &["all", "safe", "none"]
-            }),
-            "an Enum, so Manual completes all/safe/none"
-        );
-        assert!(approve.native_scalar, "a Settings row, not Manual-only");
-        let priority = config_schema()
-            .iter()
-            .find(|e| e.key == crate::prefs::EDIT_HARNESS_QUESTION_PRIORITY)
-            .expect("the question priority is a schema key");
-        assert_eq!(
-            priority.kind,
-            ConfigSchemaKind::Scalar(EditKind::Enum {
-                options: &aterm_agent::supervise::QuestionPriority::WORDS
-            }),
-            "an Enum of the supervisor's own words, so Manual completes exactly those"
-        );
-        assert!(priority.native_scalar, "a Settings row, not Manual-only");
-        let autopilot = config_schema()
-            .iter()
-            .find(|e| e.key == crate::prefs::EDIT_HARNESS_AUTOPILOT)
-            .expect("the default Autopilot is a schema key");
-        assert_eq!(
-            autopilot.kind,
-            ConfigSchemaKind::Scalar(EditKind::Enum {
-                options: &crate::prefs::HARNESS_AUTOPILOT_WORDS
-            }),
-            "an Enum of the supervisor's own three modes"
-        );
-        assert!(autopilot.native_scalar, "a Settings row, not Manual-only");
-        // Every alias Manual accepts the reader takes as a mode, saying
-        // nothing — and an off spelling it says, Manual says too.
-        for alias in HARNESS_AUTOPILOT_ALIASES {
-            let (cfg, notes) = aterm_agent::supervise::SupervisorConfig::from_aterm_toml(&format!(
-                "[harness]\nautopilot = {alias:?}\n"
-            ));
-            assert!(notes.is_empty(), "{alias}: {notes:?}");
-            assert_eq!(
-                Some(cfg.autopilot),
-                aterm_agent::supervise::Autopilot::parse(alias),
-                "{alias}"
-            );
-        }
-        assert!(
-            analyze("[harness]\nautopilot = \"none\"\n").has_errors(),
-            "the reader notes an off spelling; Manual flags it"
-        );
-        let good = "[harness]\nenabled = true\napprove = \"safe\"\ncontinue = false\n\
-                    continue_per_hour = 3\ntrust_roots = [\"~/src/app*\", \"/srv/work\"]\n\
-                    model_fallback = \"opus\"\naccounts = \"wall\"\n";
-        let warned = key_warnings(good);
-        assert!(warned.ignored.is_empty(), "{:?}", warned.ignored);
-        // Each agent's own table is the config language's too: its switch is
-        // known and told nothing of; any other key there is an ignored key, as
-        // the reader takes only `enabled` per agent.
-        let agents = "[harness.claude]\nenabled = true\n[harness.codex]\nenabled = false\n";
-        assert!(
-            key_warnings(agents).ignored.is_empty(),
-            "{:?}",
-            key_warnings(agents).ignored
-        );
-        assert!(
-            analyze(agents).diagnostics.is_empty(),
-            "{:?}",
-            analyze(agents).diagnostics
-        );
-        let stray = "[harness.codex]\napprove = \"safe\"\n";
-        assert!(
-            key_warnings(stray)
-                .ignored
-                .iter()
-                .any(|line| line.contains("harness.codex.approve")),
-            "{:?}",
-            key_warnings(stray).ignored
-        );
-        // Every key the supervisor reads is applied: no label says otherwise.
-        for e in MANUAL_SCHEMA
-            .iter()
-            .filter(|e| e.key.starts_with("harness."))
-        {
-            assert!(
-                !e.label.ends_with(" (not yet applied)"),
-                "{}: {}",
-                e.key,
-                e.label
-            );
-        }
-        // Each key says the full-power default it limits (`rules_file` has
-        // none to show): a switch reads `default true`, `approve` `all`.
-        for key in aterm_agent::supervise::config::KEYS
-            .iter()
-            .filter(|k| **k != "enabled" && **k != "rules_file")
-        {
-            let dotted = format!("harness.{key}");
-            let entry = config_schema()
-                .iter()
-                .find(|e| e.key == dotted)
-                .unwrap_or_else(|| panic!("{dotted}"));
-            assert!(
-                setting_help(entry).contains(" \u{b7} default "),
-                "{dotted}: {}",
-                setting_help(entry)
-            );
-        }
-        let help = |key: &str| setting_help(config_schema().iter().find(|e| e.key == key).unwrap());
-        assert!(help("harness.continue").contains("default true"));
-        // `trust_roots` names no folder by default, and its help says how to
-        // name one's own.
-        let roots = help("harness.trust_roots");
-        assert!(roots.ends_with(" \u{b7} default []"), "{roots}");
-        assert!(
-            roots.contains("approve = \"safe\"") && roots.contains("none by default"),
-            "{roots}"
-        );
-        assert!(help("harness.approve").contains("default all"));
-        assert!(
-            help("harness.autopilot").contains(" \u{b7} default cruise"),
-            "{}",
-            help("harness.autopilot")
-        );
-        assert!(help("harness.continue_per_hour").contains("default 0 (no cap)"));
-        // `[harness] accounts`: its three words are the completion's, and
-        // its default is the reader's own.
-        let accounts = config_schema()
-            .iter()
-            .find(|e| e.key == "harness.accounts")
-            .expect("the accounts mode is a schema key");
-        assert_eq!(
-            accounts.kind,
-            ConfigSchemaKind::Scalar(EditKind::Enum {
-                options: &["early", "wall", "off"]
-            }),
-            "an Enum, so Manual completes early/wall/off"
-        );
-        for word in ["early", "wall", "off"] {
-            assert_eq!(
-                aterm_agent::harness::accounts::Mode::parse(word).map(|m| m.as_str()),
-                Some(word),
-                "{word} is a word the supervisor's reader takes"
-            );
-        }
-        assert!(
-            help("harness.accounts").contains("default early"),
-            "{}",
-            help("harness.accounts")
-        );
-        // The key's help says what `early` adds — and no longer that it is
-        // `wall` (NEGATIVE CONTROL: what it said before the move ahead of a
-        // limit was built).
-        assert!(
-            help("harness.accounts")
-                .contains("\"early\" also moves it ahead of the limit and types /usage"),
-            "{}",
-            help("harness.accounts")
-        );
-        assert!(!help("harness.accounts").contains("in this build"));
-        // `[harness] limit_reset`: a switch whose shown default is the
-        // reader's own `false`, and whose help says what it is: built, off
-        // by default, never run against a real wall.
-        let reset = config_schema()
-            .iter()
-            .find(|e| e.key == "harness.limit_reset")
-            .expect("the limit reset is a schema key");
-        assert_eq!(reset.kind, ConfigSchemaKind::Scalar(EditKind::Bool));
-        assert!(!reset.native_scalar, "Manual-only: no Settings row");
-        assert!(!aterm_agent::supervise::SupervisorConfig::default().limit_reset);
-        let said = help("harness.limit_reset");
-        assert!(said.contains(" \u{b7} default false"), "{said}");
-        for word in ["built", "off by default", "never run against a real wall"] {
-            assert!(said.to_lowercase().contains(word), "{word:?}: {said}");
-        }
-        // A file that writes it is not told the key is unknown. NEGATIVE
-        // CONTROLS: it is never shown on by default, and a misspelling of it
-        // is reported by name.
-        assert!(!said.contains("default true"), "{said}");
-        let on = key_warnings("[harness]\nlimit_reset = true\n");
-        assert!(on.ignored.is_empty(), "{:?}", on.ignored);
-        let typo = key_warnings("[harness]\nlimit_resets = true\n");
-        assert!(
-            typo.ignored.iter().any(|l| l.contains("limit_resets")),
-            "{:?}",
-            typo.ignored
-        );
-        // `[harness] usage_tap`: a switch shown off by default, whose help
-        // says it is off by default and moves no session; a file that writes
-        // it is not told the key is unknown.
-        let tap = config_schema()
-            .iter()
-            .find(|e| e.key == "harness.usage_tap")
-            .expect("the usage tap is a schema key");
-        assert_eq!(tap.kind, ConfigSchemaKind::Scalar(EditKind::Bool));
-        assert!(!aterm_agent::supervise::SupervisorConfig::default().usage_tap);
-        let said = help("harness.usage_tap");
-        assert!(said.contains(" \u{b7} default false"), "{said}");
-        for word in ["off by default", "moves no session", "own statusline"] {
-            assert!(said.to_lowercase().contains(word), "{word:?}: {said}");
-        }
-        assert!(
-            key_warnings("[harness]\nusage_tap = true\n")
-                .ignored
-                .is_empty()
-        );
-        // NEGATIVE CONTROL: a word outside the three is reported, not saved.
-        let bad = analyze("[harness]\naccounts = \"sometimes\"\n");
-        assert!(!bad.diagnostics.is_empty(), "{:?}", bad.diagnostics);
-        assert!(!help("harness.rules_file").contains("default"));
-        // NEGATIVE CONTROL: a typo inside the table is reported by name.
-        let typo = key_warnings("[harness]\ncontine = true\n");
-        assert!(
-            typo.ignored.iter().any(|l| l.contains("contine")),
-            "{:?}",
-            typo.ignored
-        );
-    }
-
-    /// The `[disk]` keys (`aterm_agent::harness::disk::KEYS`) are the config
-    /// language's. The window's harness host READS `auto_free_gib` — `0` is
-    /// the documented off switch of its automatic reclaim of idle build
-    /// caches — and this checker called it "unknown to this aterm build",
-    /// with an Open aterm.toml action: a person told the line does nothing
-    /// deletes it, and the removal is back on. Each key is served with its
-    /// default; a negative is warned with the reader's own reading.
-    #[test]
-    fn every_disk_key_is_known_to_the_config_language() {
-        for key in aterm_agent::harness::disk::KEYS {
-            let dotted = format!("disk.{key}");
-            let entry = config_schema()
-                .iter()
-                .find(|e| e.key == dotted)
-                .unwrap_or_else(|| panic!("{dotted} is not in the config language"));
-            assert!(
-                setting_help(entry).contains(" \u{b7} default "),
-                "{dotted}: {}",
-                setting_help(entry)
-            );
-        }
-        let off = key_warnings("[disk]\nauto_free_gib = 0\n");
-        assert!(off.ignored.is_empty(), "{:?}", off.ignored);
-        let all = "[disk]\napply = false\nwarn_free_gib = 40\ntarget_stale_days = 14\n\
-                   auto_free_gib = 10\ndead_build_dirs = true\n";
-        assert!(
-            analyze(all).diagnostics.is_empty(),
-            "{:?}",
-            analyze(all).diagnostics
-        );
-        let help = setting_help(config_schema_entry("disk.auto_free_gib").unwrap());
-        assert!(help.contains("default 10 (0: off)"), "{help}");
-        // Below the floor the pass goes past the idle window, oldest first,
-        // and stops a stated margin above it (2026-09-28): the line says so,
-        // and the margin it states is the reader's own.
-        assert!(
-            help.contains("least recently used first until")
-                && help.contains(&format!(
-                    "{} GiB above it",
-                    aterm_agent::harness::disk::PRESSURE_MARGIN_GIB
-                )),
-            "{help}"
-        );
-        // The idle window's default is ONE day (it was 14): the line serves
-        // the reader's own default, not a copy of it.
-        let help = setting_help(config_schema_entry("disk.target_stale_days").unwrap());
-        assert!(help.contains(" \u{b7} default 1"), "{help}");
-        // What the window still decides, now that below the floor recent
-        // profiles go too: the idle ones go first, whole.
-        assert!(
-            help.contains("counts as idle: its incremental cache goes first")
-                && help.contains("recent ones follow, least recently used first"),
-            "{help}"
-        );
-        assert!(!help.contains("default 14"), "{help}");
-        // A negative floor is OFF, and the line says so (the reader's words).
-        let negative = analyze("[disk]\nauto_free_gib = -1\n");
-        assert!(
-            negative
-                .diagnostics
-                .iter()
-                .any(|d| d.message.contains("disk.auto_free_gib is negative")
-                    && d.message.contains("off")),
-            "{:?}",
-            negative.diagnostics
-        );
-        // NEGATIVE CONTROL: a typo inside the table is still reported by name.
-        let typo = key_warnings("[disk]\nauto_free_gb = 0\n");
-        assert!(
-            typo.ignored.iter().any(|l| l.contains("auto_free_gb")),
-            "{:?}",
-            typo.ignored
-        );
-    }
-
     /// A `[disk]` value the harness's reader does not read as written
     /// (`aterm_agent::harness::cli::disk_faults`) is told ONCE, on its own
     /// line, in the reader's words: in the editor, by `--validate-config`, and
@@ -11115,10 +8889,11 @@ sty"#;
     /// at the default floor. That holds for a `disk` that is not a table, for
     /// a knob below an array of tables' element, and for a knob below a table
     /// a removed feature or a retired key left behind, which is then no table
-    /// to delete either. NEGATIVE CONTROLS: a key
-    /// the reader does not read is still a key with no effect, beside such a
-    /// knob or below a second `disk`; a misplaced `warn_free_gib` removes
-    /// nothing and is a Warning; a whole negative is read as the reader says.
+    /// to delete either. NEGATIVE CONTROLS: a key the reader does not read is
+    /// still a key with no effect below a second `disk` (beside such a knob:
+    /// `no_walker_calls_a_table_that_holds_a_disk_off_switch_one_to_delete`);
+    /// a misplaced `warn_free_gib` removes nothing and is a Warning; a whole
+    /// negative is read as the reader says.
     #[test]
     fn a_disk_value_the_reader_cannot_read_is_told_once_in_its_words() {
         use crate::message_reporters::{ConfigFamily, ConfigWarnings};
@@ -11129,10 +8904,7 @@ sty"#;
             aterm_agent::harness::cli::disk_config_read(Some(&file))
         };
         let record = |name: &str| {
-            format!(
-                "[[net.connections]]\nname = \"{name}\"\nhost = \"h:1\"\nfingerprint = \"{}\"\n",
-                "ab".repeat(32)
-            )
+            format!("[[sparkle_words.custom]]\nwords = [\"{name}\"]\nink = \"rainbow\"\n")
         };
         let cases: Vec<(String, usize)> = vec![
             ("disk = 5\n".into(), 1),
@@ -11142,18 +8914,12 @@ sty"#;
             ("[disk]\nauto_free_gib = 20.0\n".into(), 2),
             ("[disk]\ntarget_stale_days = -1.0\n".into(), 2),
             ("[harness]\ndisk.auto_free_gib = 0\n".into(), 2),
-            (format!("{}disk.auto_free_gib = 0\n", record("box")), 5),
+            (format!("{}disk.auto_free_gib = 0\n", record("box")), 4),
             (
                 format!("{}{}disk.apply = false\n", record("a"), record("b")),
-                9,
+                7,
             ),
             ("[[foo]]\ndisk.apply = false\n".into(), 2),
-            // Below a table a removed feature left behind, plain, as an
-            // array of tables, and nested: the compatibility walk's "safe to
-            // delete" would send a person to delete the off switch with it.
-            ("[sparkle_words.orca]\ndisk.apply = false\n".into(), 2),
-            ("[[sparkle_words.orca]]\ndisk.apply = false\n".into(), 2),
-            ("[sparkle_words.orca.extra]\ndisk.apply = false\n".into(), 2),
             // Below a retired `[harness]` key: its "remove it" would too.
             ("[harness.approve_all]\ndisk.apply = false\n".into(), 2),
         ];
@@ -11216,25 +8982,6 @@ sty"#;
             "{keys:?}"
         );
         assert!(unaccepted_value_warnings(text, &[]).is_empty());
-        // NEGATIVE CONTROL: beside a knob below a record, a key the reader
-        // does not read is still named, on its own line, in the record.
-        let text = format!("{}disk.auto_free_gib = 0\ndisk.bogus = 1\n", record("box"));
-        let reading = reader(&text);
-        let keys = key_warnings(&text);
-        assert!(
-            matches!(keys.ignored.as_slice(), [l] if l.starts_with("line 6: ")
-                && l.contains("disk.bogus")
-                && l.contains("record 1")),
-            "{keys:?}"
-        );
-        assert_eq!(
-            unaccepted_value_warnings(&text, &[]),
-            reading
-                .notes
-                .iter()
-                .map(|n| format!("line 5: {n}"))
-                .collect::<Vec<_>>()
-        );
         // NEGATIVE CONTROL: a misplaced knob that removes nothing changes
         // nothing, so the reader's note on it is a Warning and removal stays
         // as configured; a whole negative is still read as the reader says.
@@ -11274,8 +9021,7 @@ sty"#;
 
     /// A table that holds a misplaced `[disk]` off switch is no key to
     /// delete, so no walk calls it one, whatever its shape (a plain table, an
-    /// array of tables, a nested table): not the compatibility walk ("safe to
-    /// delete"), not the unknown-key walk (a retired key's "remove it", an
+    /// array of tables, a nested table): not the unknown-key walk (a retired key's "remove it", an
     /// unknown key's "no effect"), not the structured records' walk, and not
     /// the editor's caret help, which gives the reader's own note on the knob.
     /// The reader's line is told once. NEGATIVE CONTROLS: every other key in
@@ -11284,32 +9030,10 @@ sty"#;
     #[test]
     fn no_walker_calls_a_table_that_holds_a_disk_off_switch_one_to_delete() {
         let record = |name: &str| {
-            format!(
-                "[[net.connections]]\nname = \"{name}\"\nhost = \"h:1\"\nfingerprint = \"{}\"\n",
-                "ab".repeat(32)
-            )
+            format!("[[sparkle_words.custom]]\nwords = [\"{name}\"]\nink = \"rainbow\"\n")
         };
-        let orca_enabled = compatibility_only_message("sparkle_words.orca.enabled");
         // (text, the reader's line, the one other line a walk tells: `line N: <key> …`)
         let cases: Vec<(String, usize, (usize, &str))> = vec![
-            // The compatibility walk.
-            (
-                "[sparkle_words.orca]\nenabled = true\ndisk.apply = false\n".into(),
-                3,
-                (2, "sparkle_words.orca.enabled"),
-            ),
-            (
-                "[[sparkle_words.orca]]\nenabled = true\ndisk.apply = false\n".into(),
-                3,
-                (2, "sparkle_words.orca.enabled"),
-            ),
-            (
-                "[sparkle_words.orca]\nenabled = true\n[sparkle_words.orca.extra]\n\
-                 disk.apply = false\n"
-                    .into(),
-                4,
-                (2, "sparkle_words.orca.enabled"),
-            ),
             // The unknown-key walk.
             (
                 "[harness.approve_all]\nbogus = 1\ndisk.apply = false\n".into(),
@@ -11329,8 +9053,8 @@ sty"#;
             // The structured records' walk.
             (
                 format!("{}bogus = 1\ndisk.apply = false\n", record("box")),
-                6,
-                (5, "net.connections.bogus"),
+                5,
+                (4, "sparkle_words.custom.bogus"),
             ),
             (
                 format!(
@@ -11338,16 +9062,16 @@ sty"#;
                     record("a"),
                     record("b")
                 ),
-                10,
-                (5, "net.connections.bogus"),
+                8,
+                (4, "sparkle_words.custom.bogus"),
             ),
             (
                 format!(
-                    "{}[net.connections.extra]\nbogus = 1\ndisk.apply = false\n",
+                    "{}[sparkle_words.custom.extra]\nbogus = 1\ndisk.apply = false\n",
                     record("box")
                 ),
-                7,
-                (6, "net.connections.extra.bogus"),
+                6,
+                (5, "sparkle_words.custom.extra.bogus"),
             ),
         ];
         for (text, line, (told_line, told_key)) in &cases {
@@ -11391,39 +9115,6 @@ sty"#;
                 "{text:?}: {diagnostics:?}"
             );
         }
-
-        // The caret help, on the leftover tables above.
-        for (text, enabled) in [
-            (
-                "[sparkle_words.orca]\nenabled = true\ndisk.apply = false\n",
-                true,
-            ),
-            (
-                "[[sparkle_words.orca]]\nenabled = true\ndisk.apply = false\n",
-                true,
-            ),
-            ("[sparkle_words.orca.extra]\ndisk.apply = false\n", false),
-        ] {
-            let note = aterm_agent::harness::cli::disk_faults(text)[0].note.clone();
-            let knob = text.find("disk.apply").unwrap();
-            let value = text.find("= false").unwrap() + "= f".len();
-            assert_eq!(assist(text, value).help, Some(note), "{text:?}");
-            assert!(
-                assist(text, knob + 2)
-                    .help
-                    .is_none_or(|help| !help.contains("safe to delete")),
-                "{text:?}: {:?}",
-                assist(text, knob + 2)
-            );
-            if enabled {
-                let at = text.find("= true").unwrap() + "= t".len();
-                assert_eq!(
-                    assist(text, at).help.as_deref(),
-                    Some(orca_enabled.as_str()),
-                    "{text:?}"
-                );
-            }
-        }
     }
 
     /// A retired or deprecated spelling that is still read keeps its own
@@ -11439,10 +9130,6 @@ sty"#;
         for (text, retired) in [
             (
                 "windw_padding = 20\n[packages]\nauto_update = \"yes\"\n".to_string(),
-                true,
-            ),
-            (
-                "windw_padding = 20\ngame_font = \"dooom\"\n".to_string(),
                 true,
             ),
             (

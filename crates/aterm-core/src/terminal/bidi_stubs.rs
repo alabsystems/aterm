@@ -4,7 +4,7 @@
 
 //! The engine's BiDi invalidation hooks.
 //!
-//! BiDi reordering runs at snapshot time (`bidi_reorder.rs`, feature `bidi`),
+//! BiDi reordering runs at snapshot time (`bidi_reorder.rs`),
 //! so a policy change dirties the whole presented grid. `sync_bidi_from_damage`
 //! is where a render-side resolver cache would attach.
 
@@ -22,13 +22,4 @@ impl Terminal {
 
     /// No-op: no resolver cache to sync.
     pub(super) fn sync_bidi_from_damage(&mut self) {}
-
-    /// Without the `bidi` feature no row is reordered, so a pointer's viewport
-    /// cell is its logical cell (the feature's version maps it through the
-    /// row's permutation).
-    #[cfg(not(feature = "bidi"))]
-    #[must_use]
-    pub fn viewport_cell_logical(&self, _row: u16, col: u16) -> (u16, bool) {
-        (col, false)
-    }
 }

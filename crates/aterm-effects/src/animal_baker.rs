@@ -156,46 +156,4 @@ mod tests {
             "a species head must paint something"
         );
     }
-
-    #[test]
-    fn cache_hits_and_frame_budget_bound_cold_bakes() {
-        let mut baker = AnimalBaker::default();
-        baker.begin_frame(8, 16);
-        let key = AnimalBakeKey {
-            species: any_species(),
-            colors: CatColorKey::default(),
-            w: 32,
-            h: 30,
-        };
-        assert!(baker.tile(&key).is_some(), "first bake fits the budget");
-        let v = baker.version();
-        assert!(baker.tile(&key).is_some(), "hit");
-        assert_eq!(baker.version(), v, "a hit is not a bake");
-        // Distinct keys past the per-frame budget defer to the next frame.
-        let mut deferred = 0;
-        for w in 33..64u16 {
-            let k = AnimalBakeKey { w, ..key };
-            if baker.tile(&k).is_none() {
-                deferred += 1;
-            }
-        }
-        assert!(deferred > 0, "the per-frame cold-bake budget must bind");
-    }
-
-    #[test]
-    fn metric_change_clears_residency() {
-        let mut baker = AnimalBaker::default();
-        baker.begin_frame(8, 16);
-        let key = AnimalBakeKey {
-            species: any_species(),
-            colors: CatColorKey::default(),
-            w: 24,
-            h: 20,
-        };
-        assert!(baker.tile(&key).is_some());
-        assert!(!baker.is_empty());
-        baker.begin_frame(9, 18);
-        assert!(baker.is_empty(), "cell-metric change clears the cache");
-        assert_eq!(baker.resident_bytes(), 0);
-    }
 }

@@ -10,7 +10,7 @@
 use aterm_types::keyboard::{Key, Modifiers, encode_key};
 use aterm_types::mouse::{MouseEncoding, MouseMode};
 
-use super::super::Terminal;
+use super::super::{ColorOverridesRepr, Terminal};
 use crate::config::TerminalConfig;
 
 fn ctrl7(t: &Terminal) -> Vec<u8> {
@@ -50,6 +50,7 @@ fn projection(t: &Terminal) -> impl PartialEq + core::fmt::Debug + use<> {
         (t.grid().cursor_row(), t.grid().cursor_col()),
         (region.top, region.bottom),
         t.parser_is_ground(),
+        t.program_color_overrides(),
     )
 }
 
@@ -544,10 +545,23 @@ fn manual_handback_hands_the_stuck_prompt_back_without_clearing_anything() {
 /// reaches the live state (the host records them as `RawIn`).
 #[test]
 fn manual_handback_is_idempotent_and_replays_to_the_live_state() {
-    let (mut live, _) = stuck_live_prompt();
+    // The stuck prompt also wears a program's palette entry and background.
+    let coloured = || {
+        let (mut t, _) = stuck_live_prompt();
+        t.set_allow_palette_reconfigure(true);
+        t.process(b"\x1b]4;3;rgb:12/34/56\x1b\\\x1b]11;rgb:01/02/03\x1b\\");
+        t
+    };
+    let mut live = coloured();
+    assert_ne!(
+        live.program_color_overrides(),
+        ColorOverridesRepr::default(),
+        "precondition: the program's colours are set"
+    );
     let h = live.manual_handback();
     assert!(!h.bytes.is_empty());
-    let (mut replay, _) = stuck_live_prompt();
+    assert!(h.reverted.contains(&"colors"), "{:?}", h.reverted);
+    let mut replay = coloured();
     replay.process(&h.bytes);
     assert_eq!(projection(&replay), projection(&live));
 
@@ -564,6 +578,80 @@ fn manual_handback_is_idempotent_and_replays_to_the_live_state() {
         fresh.manual_handback().bytes.is_empty(),
         "a fresh terminal is at its defaults"
     );
+}
+
+/// A manual reset puts back every theme colour a program set (palette,
+/// background, cursor) with exactly the OSC resets that clear them, and keeps
+/// the colour stack, whose later pop is the program's own business. A second
+/// reset finds nothing, and the bytes replay to the same colours. Negative
+/// control: the automatic handback, on the same coloured terminal with a
+/// program owning modes, never touches colours.
+#[test]
+fn manual_handback_puts_program_colours_back_and_keeps_the_stack() {
+    const PUSHED_P1: aterm_types::Rgb = aterm_types::Rgb::new(0x11, 0x22, 0x33);
+    const THEME_P1: aterm_types::Rgb = aterm_types::Rgb::new(0x80, 0x10, 0x10);
+    let coloured = || {
+        let mut t = Terminal::new(24, 80);
+        let mut theme = aterm_types::ColorPalette::default();
+        theme.set(1, THEME_P1);
+        let mut cfg = TerminalConfig::default();
+        cfg.allow_palette_reconfigure = true;
+        cfg.custom_palette = Some(theme);
+        t.apply_config(&cfg);
+        t.process(
+            b"\x1b]4;1;rgb:11/22/33\x1b\\\x1b]11;rgb:01/02/03\x1b\\\x1b]12;rgb:aa/bb/cc\x1b\\",
+        );
+        // Push the colours, then set another palette entry over the push.
+        t.process(b"\x1b]30001\x1b\\\x1b]4;2;rgb:44/55/66\x1b\\");
+        t
+    };
+    let mut t = coloured();
+    let before = t.program_color_overrides();
+    assert_eq!(before.palette.len(), 2, "precondition: {before:?}");
+    let h = t.manual_handback();
+    assert_eq!(h.reverted, vec!["colors"], "{h:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&h.bytes),
+        "\x1b]104\x1b\\\x1b]111\x1b\\\x1b]112\x1b\\",
+        "exactly the resets that clear what was set"
+    );
+    assert_eq!(t.program_color_overrides(), ColorOverridesRepr::default());
+    assert_eq!(
+        t.palette_color(1),
+        THEME_P1,
+        "the theme's entry, not xterm's"
+    );
+
+    // Idempotent: nothing left to put back.
+    let again = t.manual_handback();
+    assert!(again.bytes.is_empty(), "{again:?}");
+    assert!(again.reverted.is_empty());
+
+    // Replay: the bytes alone reach the same colours.
+    let mut replay = coloured();
+    replay.process(&h.bytes);
+    assert_eq!(
+        replay.program_color_overrides(),
+        t.program_color_overrides()
+    );
+
+    // The stack was kept: the program's pop restores what it pushed.
+    t.process(b"\x1b]30101\x1b\\");
+    assert_eq!(t.palette_color(1), PUSHED_P1, "the push survived the reset");
+
+    // Negative control: the automatic handback leaves colours alone.
+    let mut auto = coloured();
+    auto.process(b"\x1b[?1049h\x1b[?1003h");
+    assert!(
+        auto.program_owns_terminal(),
+        "precondition: modes are owned"
+    );
+    let before = auto.program_color_overrides();
+    let h = auto
+        .foreground_handback_scoped(true)
+        .expect("the owned modes go back");
+    assert!(!h.reverted.contains(&"colors"), "{:?}", h.reverted);
+    assert_eq!(auto.program_color_overrides(), before);
 }
 
 /// Every setter of an evidence bit is reported, even over a mode already in

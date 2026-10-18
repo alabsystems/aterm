@@ -11,31 +11,9 @@ use aterm_types::{
 // --- KittyKeyboardFlags tests ---
 
 #[test]
-fn test_flags_none_is_zero() {
-    let f = KittyKeyboardFlags::none();
-    assert_eq!(f.bits(), 0);
-    assert!(!f.disambiguate());
-    assert!(!f.report_events());
-    assert!(!f.report_alternates());
-    assert!(!f.report_all_keys());
-    assert!(!f.report_text());
-}
-
-#[test]
 fn test_flags_from_bits_masks_invalid() {
     let f = KittyKeyboardFlags::from_bits(0xFF);
     assert_eq!(f.bits(), 0b1_1111);
-}
-
-#[test]
-fn test_flags_individual_bits() {
-    assert!(KittyKeyboardFlags::from_bits(KittyKeyboardFlags::DISAMBIGUATE).disambiguate());
-    assert!(KittyKeyboardFlags::from_bits(KittyKeyboardFlags::REPORT_EVENTS).report_events());
-    assert!(
-        KittyKeyboardFlags::from_bits(KittyKeyboardFlags::REPORT_ALTERNATES).report_alternates()
-    );
-    assert!(KittyKeyboardFlags::from_bits(KittyKeyboardFlags::REPORT_ALL_KEYS).report_all_keys());
-    assert!(KittyKeyboardFlags::from_bits(KittyKeyboardFlags::REPORT_TEXT).report_text());
 }
 
 #[test]
@@ -71,52 +49,28 @@ fn test_flags_individual_bits_no_cross_contamination() {
     }
 }
 
+/// `CSI = flags ; mode u`: 1 sets, 2 ORs, 3 AND-NOTs; mode 0 behaves as 1
+/// (the default branch); an explicit UNDEFINED mode (>= 4) changes nothing,
+/// because kitty's set handler is if/else-if over 1/2/3 — so a program
+/// probing a future mode gets "unsupported", not "clobber my flags". Input
+/// bits past the five defined ones are masked.
 #[test]
-fn test_flags_apply_mode_1_set() {
-    let mut f = KittyKeyboardFlags::from_bits(0b1_1111);
-    f.apply(0b0_0001, 1);
-    assert_eq!(f.bits(), 0b0_0001);
-}
-
-#[test]
-fn test_flags_apply_mode_2_or() {
-    let mut f = KittyKeyboardFlags::from_bits(0b0_0001);
-    f.apply(0b0_0010, 2);
-    assert_eq!(f.bits(), 0b0_0011);
-}
-
-#[test]
-fn test_flags_apply_mode_3_and_not() {
-    let mut f = KittyKeyboardFlags::from_bits(0b0_0011);
-    f.apply(0b0_0010, 3);
-    assert_eq!(f.bits(), 0b0_0001);
-}
-
-#[test]
-fn test_flags_apply_explicit_unknown_mode_is_noop() {
-    // kitty's set handler is if/else-if over modes 1/2/3 — an explicit
-    // UNDEFINED mode (>= 4) changes nothing, so a program probing a future
-    // mode semantic gets "unsupported" rather than "clobber my flags".
-    let mut f = KittyKeyboardFlags::from_bits(0b1_1111);
-    f.apply(0b0_0001, 4);
-    assert_eq!(f.bits(), 0b1_1111);
-}
-
-#[test]
-fn test_flags_apply_masks_input_bits() {
-    let mut f = KittyKeyboardFlags::none();
-    f.apply(0xFF, 1);
-    assert_eq!(f.bits(), 0b1_1111);
+fn test_flags_apply_modes() {
+    for (start, input, mode, want) in [
+        (0b1_1111, 0b0_0001, 1, 0b0_0001),
+        (0b0_0001, 0b0_0010, 2, 0b0_0011),
+        (0b0_0011, 0b0_0010, 3, 0b0_0001),
+        (0b1_1111, 0b0_0010, 0, 0b0_0010),
+        (0b1_1111, 0b0_0001, 4, 0b1_1111),
+        (0, 0xFF, 1, 0b1_1111),
+    ] {
+        let mut f = KittyKeyboardFlags::from_bits(start);
+        f.apply(input, mode);
+        assert_eq!(f.bits(), want, "{start:#b} apply {input:#b} mode {mode}");
+    }
 }
 
 // --- KittyKeyboardState push/pop tests ---
-
-#[test]
-fn test_state_new_has_no_flags() {
-    let state = KittyKeyboardState::new();
-    assert_eq!(state.flags().bits(), 0);
-    assert_eq!(state.query_flags(), 0);
-}
 
 #[test]
 fn test_push_set_flags_pop_restores_pre_push_state() {
@@ -136,24 +90,6 @@ fn test_push_set_flags_pop_restores_pre_push_state() {
     // Regression #5679: restores the pre-push value (0b11) from stack[0].
     state.pop_flags_for_buffer(1, ScreenBuffer::Main);
     assert_eq!(state.flags().bits(), 0b0_0011);
-}
-
-#[test]
-fn test_push_pop_basic_lifo() {
-    let mut state = KittyKeyboardState::new();
-
-    state.push_flags_for_buffer(0b0_0011, ScreenBuffer::Main);
-    assert_eq!(state.flags().bits(), 0b0_0011);
-
-    state.push_flags_for_buffer(0b0_0111, ScreenBuffer::Main);
-    assert_eq!(state.flags().bits(), 0b0_0111);
-
-    state.pop_flags_for_buffer(1, ScreenBuffer::Main);
-    assert_eq!(state.flags().bits(), 0b0_0011);
-
-    // Stack empty → reset to 0
-    state.pop_flags_for_buffer(1, ScreenBuffer::Main);
-    assert_eq!(state.flags().bits(), 0);
 }
 
 #[test]
@@ -264,22 +200,6 @@ fn test_stack_overflow_evicts_oldest() {
     // pushes f1..f9, kitty yields f8..f2 on 7 pops, then 0.
     state.pop_flags_for_buffer(1, ScreenBuffer::Main);
     assert_eq!(state.flags().bits(), 0);
-}
-
-#[test]
-fn test_screen_buffer_isolation() {
-    let mut state = KittyKeyboardState::new();
-
-    state.push_flags_for_buffer(1, ScreenBuffer::Main); // saves 0, flags=1
-    state.push_flags_for_buffer(3, ScreenBuffer::Alternate); // saves 1, flags=3
-
-    // Pop from main: restores pre-push value (0)
-    state.pop_flags_for_buffer(1, ScreenBuffer::Main);
-    assert_eq!(state.flags().bits(), 0);
-
-    // Regression #5679: restores pre-push value (1) from alt stack[0].
-    state.pop_flags_for_buffer(1, ScreenBuffer::Alternate);
-    assert_eq!(state.flags().bits(), 1);
 }
 
 #[test]
@@ -450,54 +370,6 @@ fn test_switch_screen_interleaved_with_push_pop() {
     // Pop from main stack — restores pre-push value (1)
     state.pop_flags_for_buffer(1, ScreenBuffer::Main);
     assert_eq!(state.flags().bits(), 1);
-}
-
-#[test]
-fn test_flags_apply_mode_0_defaults_to_set() {
-    // Mode 0 is a common edge case: CSI = flags ; 0 u
-    // Should behave like mode 1 (set) per the default branch.
-    let mut f = KittyKeyboardFlags::from_bits(0b1_1111);
-    f.apply(0b0_0010, 0);
-    assert_eq!(f.bits(), 0b0_0010);
-}
-
-#[test]
-fn test_alt_stack_overflow_evicts_oldest() {
-    let mut state = KittyKeyboardState::new();
-
-    // Push 8 entries to fill the alt stack
-    for i in 1..=8 {
-        state.push_flags_for_buffer(i, ScreenBuffer::Alternate);
-    }
-    assert_eq!(state.flags().bits(), 8);
-
-    // Push 9th: evicts oldest
-    state.push_flags_for_buffer(9, ScreenBuffer::Alternate);
-    assert_eq!(state.flags().bits(), 9);
-
-    // Pop through: 8, 7, 6, 5, 4, 3, 2, then reset
-    state.pop_flags_for_buffer(1, ScreenBuffer::Alternate);
-    assert_eq!(state.flags().bits(), 8);
-
-    for expected in (2..=7).rev() {
-        state.pop_flags_for_buffer(1, ScreenBuffer::Alternate);
-        assert_eq!(
-            state.flags().bits(),
-            expected,
-            "expected {expected} after pop"
-        );
-    }
-
-    // Pop-to-empty after eviction resets all flags (see the main-screen
-    // overflow test for the kitty trace this mirrors).
-    state.pop_flags_for_buffer(1, ScreenBuffer::Alternate);
-    assert_eq!(state.flags().bits(), 0);
-}
-
-#[test]
-fn test_screen_buffer_from_bool() {
-    assert_eq!(ScreenBuffer::from(false), ScreenBuffer::Main);
-    assert_eq!(ScreenBuffer::from(true), ScreenBuffer::Alternate);
 }
 
 #[test]

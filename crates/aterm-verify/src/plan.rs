@@ -10,9 +10,6 @@ use std::path::PathBuf;
 use crate::Ctx;
 use crate::scope::Scope;
 
-/// One GiB, in bytes.
-pub const GIB: u64 = 1 << 30;
-
 /// A contended resource. Two stages in one lane run in declared order; lanes
 /// overlap freely. A lane is a cargo target directory, which two cargo
 /// invocations would queue on anyway.
@@ -20,28 +17,36 @@ pub const GIB: u64 = 1 << 30;
 pub enum Lane {
     /// Touches no target directory.
     Pure,
-    /// The caller's target dir: the test compile and the test run.
+    /// The caller's target dir, shared with plain `targo` (and its build cache,
+    /// [`crate::Ctx::main_build_dir`]): the test compile and the test run, the
+    /// measuring rows, and what `appkit` and `codex-alab` build and drive.
     MainTarget,
-    /// The same directory, for the cargo runs that reuse the test compile's
-    /// build (the doctests, `spec-check`): they await it
+    /// The same directory, for the cargo runs that start once the test compile
+    /// is done (the doctests, `spec-check`): they await it
     /// ([`StageSpec::after_stages`]) and then run beside the test run, which
-    /// compiles nothing more.
+    /// compiles nothing more. Beside it, not after it: a whole `verify --all`
+    /// measured shorter that way (the commit that set it carries the figures).
     AfterCompile,
     /// `<target>/verify/tippy`: the lint. Its check-mode units share no
     /// artifact with the test build, so a dir of its own lets the two compile
     /// at once instead of queueing on cargo's lock.
     TippyTarget,
-    /// `<target>/verify/drivers`: every binary a stage drives (the smokes'
-    /// aterm-gui, the redraw harness, the objc drivers, the Codex lane's
-    /// aterm), so the test build never relinks one under a stage driving it.
-    DriverTarget,
-    /// `<target>/verify/trust`: the release tools (aterm-release) the Trust
-    /// lane and `ship check --export` run and, under `slots/`, the Trust
-    /// lane's checks, built with flags no other lane shares.
+    /// `<target>/verify/sealed`: the sealed rung, the one feature build of the
+    /// shipped binary (`--features sealed`), kept out of the main cache so it
+    /// never relinks the `aterm` a plain build made.
+    SealedTarget,
+    /// `<target>/verify/checkers`: the workspace's tests under
+    /// `--features aterm-spec/checkers`, a feature build the main cache never holds.
+    CheckersTarget,
+    /// `<target>/verify/gpu-oracle`: aterm-gpu's tests under `--features
+    /// wgpu-oracle`, a feature build the main cache never holds.
+    GpuOracleTarget,
+    /// `<target>/verify/trust`: the release tools (aterm-release) that
+    /// `ship check --export` runs.
     TrustTarget,
     /// `<target>/verify/cells`: the `cells` check, one directory per cell,
-    /// and the `wasm-smoke` and `wasm-glue` modules, each built by a rustup
-    /// toolchain no other lane uses.
+    /// and the `wasm-smoke`, `wasm-glue` and `browser` modules, each built by
+    /// a rustup toolchain no other lane uses.
     CellsTarget,
     /// `<root>/libc-oracle/target`: the libc oracle's own workspace and its
     /// gate. One per checkout, never under a shared target dir: the oracle's
@@ -59,33 +64,37 @@ pub enum StageId {
     Test,
     Doctests,
     /// The sealed cross-host rung of the fabric bridge (`--features sealed`),
-    /// in the driver lane: its suites boot the `aterm` it builds first.
+    /// in its own lane: its suites boot the `aterm` it builds first.
     SealedLane,
     Tippy,
     Formatting,
-    /// The source guards (`aterm-census --guards`).
-    Guards,
     /// The publication engine's export guards (`ship check --export`).
     Export,
-    /// The Trust verification lane over the selection's libraries.
-    TrustAdvisory,
     LibcOracle,
-    /// The L0 censuses ([`crate::stages::L0_CENSUSES`]).
+    /// The source guards and the five L0 censuses, in process
+    /// ([`crate::stages::CENSUS_WALKS`]).
     Census,
     /// The Trust checkers over every registered formal model (`spec-check`).
     SpecCheck,
-    /// The hand-written specs' Tier-1 conformances, which only `ty` can
-    /// discharge ([`crate::stages::TY_ONLY_CONFORMANCES`]), in the main lane
-    /// after the test run so they reuse its build.
-    TyConformances,
-    /// The smokes' `aterm-gui`/`aterm-ctl`, prebuilt in the driver lane.
-    DriverBuilds,
-    /// What only the rows behind the first barrier drive, prebuilt; nothing
-    /// before the barrier waits for it ([`NOT_AWAITED`]).
-    TailDriverBuilds,
+    /// The `wgpu-oracle` feature build's compile (`--no-run`), in its own lane
+    /// beside the test run.
+    GpuOracleCompile,
+    /// aterm-gpu's tests with `wgpu-oracle` on: the renderer against wgpu. After
+    /// the test run, which drives the same GPU.
+    GpuOracle,
+    /// The `checkers` feature build's compile (`--no-run`), in its own lane
+    /// beside the test run.
+    CheckersCompile,
+    /// The workspace's tests with `aterm-spec/checkers` on: the tiered tests'
+    /// per-step `ty` agreement. After the test run and the gpu oracle's, never
+    /// beside either: test suites run at once judge each other's load, and
+    /// both hold aterm-gpu's GPU suites.
+    SpecCheckers,
+    /// The measuring rows' compile (`--no-run`), before the barrier, so the
+    /// exclusive stage that runs them compiles nothing.
+    MeasurePrebuild,
     /// The paint and spin matrices over the handed release bundle, run alone.
     MeasuringTests,
-    ControlSocketSmoke,
     GuiSmoke,
     RedrawConformance,
     /// The objc drivers (`stages::OBJC_DRIVES`), one row each, on macOS.
@@ -98,15 +107,17 @@ pub enum StageId {
     /// The JS glue generator on aterm-wasm-abi's toy module
     /// ([`crate::wasm_glue`]).
     WasmGlue,
+    /// Both web modules in headless Chromium: a WebGL2 boot, GPU vs CPU
+    /// pixels (`crate::browser`).
+    BrowserLane,
     Forge,
-    /// The Codex live upgrade: reads this machine's managed store, run alone.
-    CodexLiveUpgrade,
+    /// The codex-alab native harness end to end (`lab codex-alab-proof`): the
+    /// real package in a private headless aterm, run alone.
+    CodexAlabProof,
+    /// The Linux runtime lane (`lab linux proof`): a lima VM on this Mac,
+    /// run alone.
+    LinuxLane,
 }
-
-/// The rows an after-lanes stage does not wait for: compile-only, last in
-/// their lane before the first barrier, and everything they build is driven
-/// behind that barrier.
-pub const NOT_AWAITED: [StageId; 1] = [StageId::TailDriverBuilds];
 
 /// The stages that put a window on the desktop, each with the name its
 /// `--no-windows` skip carries. Every other stage drives a headless instance,
@@ -120,9 +131,8 @@ pub const WINDOWED: [(StageId, &str); 3] = [
 /// The stages whose verdicts read the machine's timing: two runs of them on
 /// one machine at once would judge each other. They take a machine-wide
 /// advisory lock while they run ([`crate::default_timing_lock`]).
-pub const TIMED: [StageId; 5] = [
+pub const TIMED: [StageId; 4] = [
     StageId::MeasuringTests,
-    StageId::ControlSocketSmoke,
     StageId::GuiSmoke,
     StageId::RedrawConformance,
     StageId::ObjcDrives,
@@ -144,13 +154,6 @@ impl StageId {
             })
     }
 
-    /// Whether a stage whose [`StageSpec::after_lanes`] names this stage's lane
-    /// waits for it: every stage but the [`NOT_AWAITED`] ones.
-    #[must_use]
-    pub fn awaited(self) -> bool {
-        !NOT_AWAITED.contains(&self)
-    }
-
     /// Does this stage judge timings ([`TIMED`])?
     #[must_use]
     pub fn timed(self) -> bool {
@@ -166,107 +169,11 @@ pub struct StageSpec {
     pub title: String,
     pub lane: Lane,
     /// Runs with nothing else in flight: the stages whose verdict depends on
-    /// how busy the machine is.
+    /// how busy the machine is, and the lab lanes, which load it.
     pub exclusive: bool,
-    /// Lanes whose stages must all have finished before this one starts
-    /// (barring later barriers and [`NOT_AWAITED`] rows; `crate::sched`).
-    pub after_lanes: Vec<Lane>,
-    /// Stages that must have finished before this one starts.
+    /// Stages declared EARLIER that must have FINISHED before this one starts
+    /// ([`crate::sched::check_waits`] refuses any other).
     pub after_stages: Vec<StageId>,
-}
-
-/// The rows that compile at workspace scale: each builds the `aterm-gui` graph.
-pub const WORKSPACE_BUILDS: [StageId; 4] = [
-    StageId::TestCompile,
-    StageId::Tippy,
-    StageId::DriverBuilds,
-    StageId::TailDriverBuilds,
-];
-
-/// The memory one concurrent workspace build needs at its peak.
-pub const WORKSPACE_BUILD_BYTES: u64 = 2 * GIB;
-
-/// What the host keeps for everything that is not a build.
-pub const HOST_RESERVE_BYTES: u64 = 2 * GIB;
-
-/// How many workspace builds `ram` bytes hold at once.
-#[must_use]
-pub fn builds_held(ram: u64) -> u64 {
-    ram.saturating_sub(HOST_RESERVE_BYTES) / WORKSPACE_BUILD_BYTES
-}
-
-/// The rows that can compile while the test run runs: the lint, the driver
-/// lane's builds (the sealed rung's among them) and the doctests, each counted
-/// as one build (the fail-closed figure).
-#[must_use]
-pub fn builds_beside_tests(plan: &[StageSpec]) -> usize {
-    plan.iter()
-        .filter(|s| {
-            matches!(
-                s.id,
-                StageId::Tippy
-                    | StageId::DriverBuilds
-                    | StageId::SealedLane
-                    | StageId::TailDriverBuilds
-                    | StageId::Doctests
-            )
-        })
-        .count()
-}
-
-/// The trust lane waits for the workspace builds, the test runs and the
-/// doctests in every plan that has them: the verifier's verdict budgets are
-/// wall-clock budgets, so beside those builds it loses proofs it keeps alone.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TrustOverlap {
-    /// No trust lane, or nothing to hold it behind.
-    Overlaps,
-    /// The trust lane waits.
-    AfterTests,
-}
-
-/// Decide [`TrustOverlap`] for `plan`.
-#[must_use]
-pub fn trust_overlap(plan: &[StageSpec]) -> TrustOverlap {
-    let builds = plan.iter().any(|s| {
-        WORKSPACE_BUILDS.contains(&s.id)
-            || matches!(s.id, StageId::Doctests | StageId::TyConformances)
-    });
-    if builds && plan.iter().any(|s| s.id == StageId::TrustAdvisory) {
-        TrustOverlap::AfterTests
-    } else {
-        TrustOverlap::Overlaps
-    }
-}
-
-impl TrustOverlap {
-    /// Hold the trust lane behind every workspace build, the test runs, the
-    /// doctests, and whatever the test run itself awaits (which
-    /// [`crate::sched::check_after_lanes`] requires).
-    pub fn apply(self, plan: &mut [StageSpec]) {
-        if self == TrustOverlap::Overlaps {
-            return;
-        }
-        let run = plan.iter().position(|s| s.id == StageId::Test);
-        let waits: Vec<StageId> = plan
-            .iter()
-            .enumerate()
-            .filter(|&(j, s)| {
-                WORKSPACE_BUILDS.contains(&s.id)
-                    || matches!(
-                        s.id,
-                        StageId::Test | StageId::Doctests | StageId::TyConformances
-                    )
-                    || run.is_some_and(|t| crate::sched::awaited(plan, t).any(|a| a == j))
-            })
-            .map(|(_, s)| s.id)
-            .collect();
-        for s in plan.iter_mut() {
-            if s.id == StageId::TrustAdvisory {
-                s.after_stages.clone_from(&waits);
-            }
-        }
-    }
 }
 
 /// The target directory a lane's cargo children use; `None` for [`Lane::Pure`].
@@ -278,7 +185,9 @@ pub fn lane_dir(ctx: &Ctx, lane: Lane) -> Option<PathBuf> {
         Lane::Pure => None,
         Lane::MainTarget | Lane::AfterCompile => Some(ctx.target_dir.clone()),
         Lane::TippyTarget => side("tippy"),
-        Lane::DriverTarget => side("drivers"),
+        Lane::SealedTarget => side("sealed"),
+        Lane::CheckersTarget => side("checkers"),
+        Lane::GpuOracleTarget => side("gpu-oracle"),
         Lane::TrustTarget => side("trust"),
         Lane::CellsTarget => side("cells"),
         Lane::LibcOracleTarget => Some(ctx.root.join("libc-oracle/target")),
@@ -287,7 +196,7 @@ pub fn lane_dir(ctx: &Ctx, lane: Lane) -> Option<PathBuf> {
 
 /// The run's stages: every declared stage the selected checks need
 /// ([`crate::checks::stages_of`]), in declared order, waiting only on stages
-/// that are planned; then the trust lane's hold ([`trust_overlap`]).
+/// that are planned.
 #[must_use]
 pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     let mut wanted = crate::checks::stages_of(&ctx.checks);
@@ -303,17 +212,16 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     for s in &mut v {
         s.after_stages.retain(|id| present.contains(id));
     }
-    trust_overlap(&v).apply(&mut v);
     v
 }
 
 /// Every stage, in the order the log prints them.
 ///
 /// The exclusive stages are barriers: everything declared before one finishes
-/// first, and the driver-lane rows behind it run after it. In the driver lane
-/// the sealed rung precedes the tail driver builds: it relinks
-/// `<drivers>/debug/aterm` with `--features sealed`, and the tail relinks the
-/// plain one the Codex lane drives.
+/// first, and everything behind it starts after it. The measuring rows' compile
+/// is the main lane's last row before the first barrier, so the stage that runs
+/// them alone compiles nothing; the Linux lane is the last barrier, so it has
+/// the machine to itself whatever else the run planned.
 #[must_use]
 pub fn declared(scope: &Scope) -> Vec<StageSpec> {
     let label = scope.label();
@@ -339,33 +247,53 @@ pub fn declared(scope: &Scope) -> Vec<StageSpec> {
         ),
         spec(
             StageId::Formatting,
-            "formatting (trustfmt over every tracked .rs, at its crate's edition)",
+            "formatting (trustfmt over every tracked or cargo-built .rs, at its crate's edition)",
             Lane::Pure,
         ),
-        spec(StageId::Guards, "source guards (aterm-census)", Lane::Pure),
-        spec(StageId::Census, "L0 censuses (aterm-census)", Lane::Pure),
+        spec(
+            StageId::Census,
+            "source guards and L0 censuses (aterm-census)",
+            Lane::Pure,
+        ),
         StageSpec {
             after_stages: vec![StageId::TestCompile],
             ..spec(
                 StageId::SpecCheck,
-                "spec checkers (spec-check: ty, ay, trust-ir over every registered model)",
+                "spec checkers (spec-check: ty over every registered model, the ay bundles)",
                 Lane::AfterCompile,
             )
         },
         spec(
-            StageId::TyConformances,
-            "ty-only conformances (the hand-written specs' Tier-1 tests, under ty)",
-            Lane::MainTarget,
+            StageId::GpuOracleCompile,
+            "gpu oracle compile (aterm-gpu's tests with wgpu-oracle, --no-run)",
+            Lane::GpuOracleTarget,
         ),
+        StageSpec {
+            after_stages: vec![StageId::Test],
+            ..spec(
+                StageId::GpuOracle,
+                "gpu oracle (aterm-gpu's tests with wgpu-oracle: the renderer against wgpu; \
+                 after the test run)",
+                Lane::GpuOracleTarget,
+            )
+        },
+        spec(
+            StageId::CheckersCompile,
+            "checkers compile (the workspace's tests with aterm-spec/checkers, --no-run)",
+            Lane::CheckersTarget,
+        ),
+        StageSpec {
+            after_stages: vec![StageId::Test, StageId::GpuOracle],
+            ..spec(
+                StageId::SpecCheckers,
+                "checkers (the workspace's tests with aterm-spec/checkers: per-step ty \
+                 agreement; after the test run and the gpu oracle's)",
+                Lane::CheckersTarget,
+            )
+        },
         spec(
             StageId::Export,
             "export guards (ship check --export: the publication engine's dry run)",
-            Lane::TrustTarget,
-        ),
-        spec(
-            StageId::TrustAdvisory,
-            "trust lane (ship trust run: targo trust check --lib over the selection's libraries, \
-             held to their floors)",
             Lane::TrustTarget,
         ),
         spec(
@@ -394,50 +322,46 @@ pub fn declared(scope: &Scope) -> Vec<StageSpec> {
             Lane::CellsTarget,
         ),
         spec(
-            StageId::DriverBuilds,
-            "driver builds (the smokes' aterm-gui and aterm-ctl)",
-            Lane::DriverTarget,
+            StageId::BrowserLane,
+            "browser lane (both web modules in headless Chromium: WebGL2, GPU vs CPU pixels)",
+            Lane::CellsTarget,
         ),
         spec(
             StageId::SealedLane,
             "sealed fabric lane (aterm --features sealed)",
-            Lane::DriverTarget,
+            Lane::SealedTarget,
         ),
         spec(
-            StageId::TailDriverBuilds,
-            "tail driver builds (what the rows behind the barrier drive)",
-            Lane::DriverTarget,
+            StageId::MeasurePrebuild,
+            "measuring rows' compile (paint and spin, --no-run)",
+            Lane::MainTarget,
         ),
         exclusive(
             StageId::MeasuringTests,
             "measuring tests (paint and spin over the handed bundle; run alone)",
             Lane::MainTarget,
         ),
-        exclusive(
-            StageId::ControlSocketSmoke,
-            "control-socket smoke",
-            Lane::DriverTarget,
-        ),
-        exclusive(
-            StageId::GuiSmoke,
-            "gui typing-pacing smoke",
-            Lane::DriverTarget,
-        ),
+        exclusive(StageId::GuiSmoke, "gui typing-pacing smoke", Lane::Pure),
         spec(
             StageId::RedrawConformance,
             "control redraw conformance (a select repaints a real window)",
-            Lane::DriverTarget,
+            Lane::MainTarget,
         ),
         spec(
             StageId::ObjcDrives,
             "objc drives (live-class audit, IME, toolbar, window and event, on a real AppKit)",
-            Lane::DriverTarget,
+            Lane::MainTarget,
         ),
         exclusive(
-            StageId::CodexLiveUpgrade,
-            "Codex live upgrade (the managed store's older Codex moved onto its current one; \
-             run alone)",
-            Lane::DriverTarget,
+            StageId::CodexAlabProof,
+            "codex-alab proof (the native harness end to end on the real package; run alone)",
+            Lane::MainTarget,
+        ),
+        exclusive(
+            StageId::LinuxLane,
+            "Linux runtime lane (a lima VM: tests on aarch64 and x86_64, aterm-gui under four \
+             display servers; run alone)",
+            Lane::MainTarget,
         ),
     ]
 }
@@ -448,7 +372,6 @@ fn spec(id: StageId, title: impl Into<String>, lane: Lane) -> StageSpec {
         title: title.into(),
         lane,
         exclusive: false,
-        after_lanes: Vec::new(),
         after_stages: Vec::new(),
     }
 }
@@ -485,8 +408,8 @@ mod tests {
         CHECKS.iter().map(|s| s.check).collect()
     }
 
-    /// Each check plans its own stages and its helpers, nothing else; every
-    /// combination the CLI offers is deadlock-free.
+    /// Each check plans its own stages, nothing else; every combination the
+    /// CLI offers waits only on earlier stages.
     #[test]
     fn a_selection_plans_exactly_its_checks_stages_and_never_deadlocks() {
         assert_eq!(
@@ -510,7 +433,7 @@ mod tests {
         selections.extend([DEV.to_vec(), RELEASE.to_vec(), every_check()]);
         for checks in selections {
             let p = plan(&ctx(&checks, Scope::workspace()));
-            crate::sched::check_after_lanes(&p)
+            crate::sched::check_waits(&p)
                 .unwrap_or_else(|e| panic!("{checks:?} could deadlock: {e}"));
             let mut want = crate::checks::stages_of(&checks);
             want.sort_by_key(|id| *id as u8);
@@ -521,26 +444,10 @@ mod tests {
     }
 
     /// The test compile starts at t0 and the test run as soon as it ends: no
-    /// other lane holds either.
+    /// other lane holds either. The doctests await exactly the test compile,
+    /// then run beside the test run.
     #[test]
     fn the_test_run_follows_its_compile_and_waits_for_nothing_else() {
-        let p = plan(&ctx(&RELEASE, Scope::workspace()));
-        let at = |id| p.iter().position(|s| s.id == id).expect("planned");
-        let (compile, test) = (at(StageId::TestCompile), at(StageId::Test));
-        assert!(compile < test);
-        assert!(p[compile].after_lanes.is_empty() && p[test].after_lanes.is_empty());
-        let nothing = vec![false; p.len()];
-        assert!(crate::sched::ready(&p, &nothing, &nothing, 0, compile));
-        assert!(!crate::sched::ready(&p, &nothing, &nothing, 0, test));
-        let mut done = nothing.clone();
-        done[compile] = true;
-        assert!(crate::sched::ready(&p, &done, &done, 0, test));
-    }
-
-    /// The doctests await exactly the test compile, then run beside the test
-    /// run.
-    #[test]
-    fn the_doctests_start_when_the_test_compile_ends_and_run_beside_the_test_run() {
         use crate::sched::{awaited, ready};
         let c = ctx(&RELEASE, Scope::workspace());
         let p = plan(&c);
@@ -557,6 +464,15 @@ mod tests {
         assert_eq!(awaited(&p, doc).collect::<Vec<_>>(), [compile]);
         let none = vec![false; p.len()];
         assert!(!ready(&p, &none, &none, 0, doc));
+        assert!(
+            ready(&p, &none, &none, 0, compile),
+            "the compile starts at t0"
+        );
+        assert!(p[compile].after_stages.is_empty() && p[test].after_stages.is_empty());
+        assert!(
+            !ready(&p, &none, &none, 0, test),
+            "the test run follows its compile"
+        );
         let mut done = none.clone();
         done[compile] = true;
         let mut started = done.clone();
@@ -566,143 +482,75 @@ mod tests {
         assert!(ready(&p, &started, &done, 1, doc));
     }
 
-    /// The tail driver builds are the driver lane's last row before the first
-    /// barrier and follow the sealed rung, so the plain `aterm` the Codex lane
-    /// drives is the last one linked.
+    /// The measuring rows compile in the main lane before the first barrier,
+    /// so the exclusive stage that runs them compiles nothing; appkit's rows
+    /// build and drive from the main lane behind it.
     #[test]
-    fn the_tail_driver_builds_follow_the_sealed_rung_and_the_barrier_waits_for_them() {
+    fn the_measuring_compile_precedes_the_barrier_and_appkit_drives_the_main_target() {
         let p = plan(&ctx(&RELEASE, Scope::workspace()));
         let at = |id| p.iter().position(|s| s.id == id).expect("planned");
-        let tail = at(StageId::TailDriverBuilds);
+        let prebuild = at(StageId::MeasurePrebuild);
         let barrier = p.iter().position(|s| s.exclusive).expect("a barrier");
-        assert!(tail < barrier);
-        assert!(
-            p[tail + 1..barrier]
-                .iter()
-                .all(|s| s.lane != Lane::DriverTarget)
-        );
-        let sealed = at(StageId::SealedLane);
-        assert_eq!(p[sealed].lane, p[tail].lane);
-        assert!(
-            sealed < tail,
-            "the plain aterm is relinked after the sealed one"
-        );
+        assert_eq!(p[barrier].id, StageId::MeasuringTests);
+        assert!(prebuild < barrier && !p[prebuild].exclusive);
+        assert_eq!(p[prebuild].lane, Lane::MainTarget);
+        assert_eq!(p[barrier].lane, Lane::MainTarget);
         for id in [StageId::RedrawConformance, StageId::ObjcDrives] {
-            assert!(barrier < at(id), "{id:?} drives what the tail built");
+            assert!(barrier < at(id), "{id:?} runs behind the barrier");
+            assert_eq!(p[at(id)].lane, Lane::MainTarget, "{id:?}");
         }
-    }
-
-    /// Only the stages that judge timings own the machine; the Codex upgrade
-    /// is last, so nothing waits behind it.
-    #[test]
-    fn only_the_stages_that_judge_timings_are_exclusive() {
-        let p = plan(&ctx(&every_check(), Scope::workspace()));
-        let exclusive: Vec<StageId> = p.iter().filter(|s| s.exclusive).map(|s| s.id).collect();
         assert_eq!(
-            exclusive,
+            ids(&ctx(&[Check::Measure], Scope::workspace())),
             [
+                StageId::MeasurePrebuild,
                 StageId::MeasuringTests,
-                StageId::ControlSocketSmoke,
-                StageId::GuiSmoke,
-                StageId::CodexLiveUpgrade,
+                StageId::GuiSmoke
             ]
-        );
-        assert_eq!(p.last().map(|s| s.id), Some(StageId::CodexLiveUpgrade));
-        assert!(
-            ids(&ctx(&DEV, Scope::workspace()))
-                .iter()
-                .all(|id| !id.timed()),
-            "the dev set takes no machine-wide lock"
         );
     }
 
-    /// Every lane lives in the run's target dir (the caller's own, or
-    /// `<root>/target`), the side lanes under its `verify/`; the libc oracle's
-    /// in its own checkout, whatever the caller's target dir.
+    /// The release's feature builds compile beside the test run and run their
+    /// tests after it, one suite at a time: the gpu oracle's, then the
+    /// checkers'. Alone, each runs straight after its compile.
     #[test]
-    fn each_cargo_lane_lives_under_the_runs_target_dir() {
-        let c = ctx(&DEV, Scope::workspace());
-        let dir = |c: &Ctx, l| lane_dir(c, l).map(|p| p.display().to_string());
-        assert_eq!(dir(&c, Lane::Pure), None);
-        for l in [Lane::MainTarget, Lane::AfterCompile] {
-            assert_eq!(dir(&c, l).as_deref(), Some("/repo/target"), "{l:?}");
+    fn the_feature_builds_compile_beside_the_test_run_and_test_after_it() {
+        use crate::sched::{awaited, ready};
+        let p = plan(&ctx(&RELEASE, Scope::workspace()));
+        let at = |id| p.iter().position(|s| s.id == id).expect("planned");
+        let none = vec![false; p.len()];
+        for compile in [StageId::GpuOracleCompile, StageId::CheckersCompile] {
+            assert!(ready(&p, &none, &none, 0, at(compile)), "{compile:?} at t0");
         }
-        assert_eq!(
-            dir(&c, Lane::TippyTarget).as_deref(),
-            Some("/repo/target/verify/tippy")
+        let (test, oracle, checkers) = (
+            at(StageId::Test),
+            at(StageId::GpuOracle),
+            at(StageId::SpecCheckers),
         );
-        assert_eq!(
-            dir(&c, Lane::DriverTarget).as_deref(),
-            Some("/repo/target/verify/drivers")
+        assert_eq!(awaited(&p, oracle).collect::<Vec<_>>(), [test]);
+        assert_eq!(awaited(&p, checkers).collect::<Vec<_>>(), [test, oracle]);
+        let mut done = none.clone();
+        for id in [
+            StageId::TestCompile,
+            StageId::GpuOracleCompile,
+            StageId::CheckersCompile,
+        ] {
+            done[at(id)] = true;
+        }
+        assert!(
+            !ready(&p, &done, &done, 0, oracle),
+            "the oracle waits for the test run"
         );
-        assert_eq!(
-            dir(&c, Lane::TrustTarget).as_deref(),
-            Some("/repo/target/verify/trust")
+        done[test] = true;
+        assert!(ready(&p, &done, &done, 0, oracle));
+        assert!(
+            !ready(&p, &done, &done, 0, checkers),
+            "the checkers wait for the oracle"
         );
-        assert_eq!(
-            dir(&c, Lane::CellsTarget).as_deref(),
-            Some("/repo/target/verify/cells")
-        );
-        assert_eq!(
-            dir(&c, Lane::LibcOracleTarget).as_deref(),
-            Some("/repo/libc-oracle/target")
-        );
-        let theirs = Ctx::new(
-            PathBuf::from("/repo"),
-            Scope::workspace(),
-            EnvSnapshot {
-                cargo_target_dir: Some(PathBuf::from("/fast/tgt")),
-                ..EnvSnapshot::default()
-            },
-            PathBuf::from("/tmp"),
-        );
-        assert_eq!(dir(&theirs, Lane::MainTarget).as_deref(), Some("/fast/tgt"));
-        assert_eq!(
-            dir(&theirs, Lane::DriverTarget).as_deref(),
-            Some("/fast/tgt/verify/drivers")
-        );
-        assert_eq!(
-            dir(&theirs, Lane::LibcOracleTarget).as_deref(),
-            Some("/repo/libc-oracle/target")
-        );
-    }
-
-    /// The trust lane waits for the builds, the test runs and the doctests, and
-    /// for what the test run itself awaits; with nothing to wait for it starts
-    /// at t0.
-    #[test]
-    fn the_trust_lane_verifies_after_the_tests_and_alone_starts_at_once() {
-        let p = plan(&ctx(
-            &[Check::Test, Check::Doc, Check::Lint, Check::Trust],
-            Scope::workspace(),
-        ));
-        assert_eq!(trust_overlap(&p), TrustOverlap::AfterTests);
-        let trust = p
-            .iter()
-            .position(|s| s.id == StageId::TrustAdvisory)
-            .expect("planned");
-        let mut held: Vec<StageId> = crate::sched::awaited(&p, trust).map(|j| p[j].id).collect();
-        held.sort_by_key(|id| *id as u8);
-        assert_eq!(
-            held,
-            [
-                StageId::TestCompile,
-                StageId::Test,
-                StageId::Doctests,
-                StageId::Tippy
-            ]
-        );
-        crate::sched::check_after_lanes(&p).expect("deadlock-free");
-        let spec = plan(&ctx(&[Check::Spec, Check::Trust], Scope::workspace()));
-        assert_eq!(trust_overlap(&spec), TrustOverlap::AfterTests);
-        let trust = spec
-            .iter()
-            .position(|s| s.id == StageId::TrustAdvisory)
-            .expect("planned");
-        assert!(crate::sched::awaited(&spec, trust).any(|j| spec[j].id == StageId::TyConformances));
-        crate::sched::check_after_lanes(&spec).expect("deadlock-free");
-        let alone = plan(&ctx(&[Check::Trust], Scope::workspace()));
-        assert_eq!(trust_overlap(&alone), TrustOverlap::Overlaps);
-        assert!(alone[0].after_stages.is_empty());
+        done[oracle] = true;
+        assert!(ready(&p, &done, &done, 0, checkers));
+        for alone in [Check::Checkers, Check::GpuOracle] {
+            let p = plan(&ctx(&[alone], Scope::workspace()));
+            assert!(p.iter().all(|s| s.after_stages.is_empty()), "{alone:?}");
+        }
     }
 }

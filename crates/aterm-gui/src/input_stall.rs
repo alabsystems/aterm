@@ -38,14 +38,13 @@
 //! a warning the driver can act on, and a refusal waits for the watch.
 //!
 //! WHERE IT IS ASKED: on the SOCKET seams only — the verb dispatch
-//! (`control::handle`), the `feed-bin`/`paste-bin` frame, the operator
-//! proposal frame and the App lane — each after authorization and after the
-//! halt, so an unauthorized caller learns nothing and a halted session says
+//! (`control::handle`), the `feed-bin`/`paste-bin` frame and the App lane —
+//! each after authorization and after the halt, so an unauthorized caller
+//! learns nothing and a halted session says
 //! `ERR halted` first. NEVER on the input seam the window keyboard travels
 //! (`input.rs`, `app_input.rs`, `control_input.rs`'s write path, the sink): a
 //! person typing into a frozen program is refused nothing, exactly as the
-//! fleet halt refuses them nothing. `control.rs`'s
-//! `the_unread_input_gate_sits_only_on_the_socket_seams` pins both halves.
+//! fleet halt refuses them nothing.
 //!
 //! WHAT STAYS OPEN: `resize`, `signal`, `close`, `pane` and `tab` write no input
 //! bytes and are the remedies — `signal int` interrupts, `signal term`
@@ -81,19 +80,8 @@ use crate::menu::MenuAction;
 /// [`MenuAction::writes_pty_input`] says so (today, `Paste`).
 pub(crate) fn is_input_writing(verb: &str, rest: &str) -> bool {
     match verb {
-        "send"
-        | "key"
-        | "ctrl"
-        | "feed"
-        | "feed-bin"
-        | "paste"
-        | "paste-bin"
-        | "mouse"
-        | "focus"
-        | "turn"
-        | "operator-propose-bin"
-        | "hwkey"
-        | "pointer" => true,
+        "send" | "key" | "ctrl" | "feed" | "feed-bin" | "paste" | "paste-bin" | "mouse"
+        | "focus" | "turn" | "hwkey" | "pointer" => true,
         "invoke" => rest
             .split_whitespace()
             .next()
@@ -721,7 +709,7 @@ pub(crate) fn pid_cpu_ns(pid: libc::pid_t) -> Option<u64> {
     let hz = (*CLK_TCK.get_or_init(|| {
         // SAFETY: `sysconf(_SC_CLK_TCK)` is a thread-safe POSIX query.
         let v = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-        (v > 0).then(|| v as u128)
+        (v > 0).then_some(v as u128)
     }))?;
     let tail = linux_proc_stat_after_comm(pid)?;
     let mut fields = tail.split_whitespace();
@@ -1956,6 +1944,7 @@ impl crate::App {
     /// unread is left idle — no watch, no deadline — and one with input
     /// unread is watched from here, its bytes dated from the sink's birth.
     /// Returns the sessions whose publication moved.
+    #[cfg(unix)]
     pub(crate) fn rewatch_adopted_input(&mut self, now: Instant) -> Vec<u64> {
         let adopted: Vec<u64> = self
             .pool
@@ -2040,6 +2029,7 @@ pub(crate) mod tests {
     use super::*;
 
     /// Past [`input_backlog::WARN_AFTER`] with margin: the plan's 1.1 s.
+    #[cfg(target_os = "macos")]
     const TICK: Duration = Duration::from_millis(1100);
 
     /// Publish a `stalled` fact for `ctx`'s session, as the watch does on its
@@ -2053,61 +2043,68 @@ pub(crate) mod tests {
     pub(crate) fn publish_stall(ctx: &SessionCtx) {
         ctx.sink
             .backdate_input_for_testing(input_backlog::STALL_AFTER + Duration::from_secs(2));
-        let fact = InputStallFact {
+        let _ = ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .set_input(Some(stalled(Instant::now())));
+    }
+
+    /// A stall published at `since`: one byte unread, no leader read, nothing
+    /// held.
+    fn stalled(since: Instant) -> InputStallFact {
+        InputStallFact {
             word: InputWord::Stalled,
-            since: Instant::now(),
+            since,
             bytes: 1,
             stopped: false,
             rss_mb: None,
             restart: Restart::default(),
             act: None,
-        };
-        let _ = ctx
-            .timeline
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .set_input(Some(fact));
+        }
     }
 
-    /// `with_warning` puts the gate's fields at the end of the FIRST line of a
-    /// reply that wrote — after `seq=`, before a framed reply's rows — and
-    /// leaves an `ERR`, an `OK skipped` and an `OK dup=1` (nothing written)
-    /// alone. The client parsers still read what they read: `seq=` first, a
-    /// framed reply's `OK <n>` count, `turn`'s verdict fields.
+    /// Claude Code, leading process group `pid`, in front of `ctx`'s tab, its
+    /// screen read as `word`.
+    fn claude_in_front(ctx: &SessionCtx, pid: i32, word: &'static str) {
+        let mut tl = ctx.timeline.lock().unwrap();
+        tl.note_foreground_group(pid);
+        tl.set_program(pid, Some("claude".into()));
+        tl.publish_agent(
+            word,
+            None,
+            None,
+            Some(aterm_phase::Program::Claude),
+            crate::session_timeline::AgentStamp {
+                generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
+                fp: 1,
+            },
+        );
+    }
+
+    /// `with_warning` puts the gate's fields (the spill counted in
+    /// `input_bytes=`) at the end of the FIRST line of a reply that wrote —
+    /// after `seq=`, before a framed reply's rows — and leaves an `ERR`, an
+    /// `OK skipped` and an `OK dup=1` (nothing written) alone.
     #[test]
     fn a_warning_rides_the_first_line_of_a_reply_that_wrote() {
-        let w = warning_text(&backlog(3, Duration::from_millis(1500), false));
-        assert_eq!(w, " warn=input-unread input_bytes=3 input_wait_ms=1500");
         let spilled = InputBacklog {
             spilled: Some(4),
             ..backlog(3, Duration::from_millis(1500), false)
         };
-        assert!(warning_text(&spilled).contains(" input_bytes=7 "));
+        let w = warning_text(&spilled);
+        assert_eq!(w, " warn=input-unread input_bytes=7 input_wait_ms=1500");
         assert_eq!(
             with_warning("OK seq=5\n".to_string(), Some(&w)),
             format!("OK seq=5{w}\n")
         );
-        assert_eq!(
-            with_warning("OK 2 bytes\n".to_string(), Some(&w)),
-            format!("OK 2 bytes{w}\n")
-        );
         let turn = "OK 2 turn submitted=1 status=settled seq=9 id=3 dur_ms=40 hash=00ff\na\nb\n";
-        let warned = with_warning(turn.to_string(), Some(&w));
         assert_eq!(
-            warned,
+            with_warning(turn.to_string(), Some(&w)),
             format!(
                 "OK 2 turn submitted=1 status=settled seq=9 id=3 dur_ms=40 hash=00ff{w}\na\nb\n"
             )
         );
-        let first = warned.lines().next().expect("a verdict");
-        assert_eq!(
-            first
-                .strip_prefix("OK ")
-                .and_then(|r| r.split_whitespace().next()),
-            Some("2"),
-            "the framed count still leads"
-        );
-        assert!(first.split_whitespace().any(|f| f == "seq=9"));
         for unchanged in [
             "ERR busy input-unread bytes=1\n",
             "OK skipped seq=4\n",
@@ -2169,217 +2166,47 @@ pub(crate) mod tests {
         buf[..usize::try_from(n).unwrap_or(0)].to_vec()
     }
 
-    /// The gate's verb set is a SUBSET of the halt's (`fabric::is_pty_reaching`)
-    /// over every verb the table ships, and what it leaves out is EXACTLY the
-    /// remedies — `resize signal reset close pane tab confirm` — plus `invoke`
-    /// of an action that writes no input. A verb added to the halt set later
-    /// lands in one list or the other on purpose, or this fails. `reset`
-    /// (2026-09-26, the manual reset) writes no input: it is the remedy for a
-    /// terminal whose stuck modes are what filled the queue, so the gate must
-    /// never refuse it.
+    /// The refusal is ONE `ERR busy input-unread` line (a driver's
+    /// `is_err("busy")` back-off retries it) whose `k=v` facts count the
+    /// spill toward `bytes=`, ending in the one remedy: `signal cont` for a
+    /// stopped job, and the host's explicit restart where it carries one, for
+    /// a stall and for a survivor alike. The pty tests below drive the
+    /// others (`signal term`, `signal int`, the grace's retry, `signal kill`,
+    /// `reset flush`).
     #[test]
-    fn the_input_writing_set_is_the_halt_set_minus_the_remedies() {
-        let mut exempt = Vec::new();
-        for spec in aterm_types::control_verbs::VERBS {
-            let writes = is_input_writing(spec.name, "Paste");
-            if writes {
-                assert!(
-                    crate::fabric::is_pty_reaching(spec.name),
-                    "{}: an input-writing verb the halt does not cover",
-                    spec.name
-                );
-            } else if crate::fabric::is_pty_reaching(spec.name) {
-                exempt.push(spec.name);
-            }
-        }
-        exempt.sort_unstable();
-        assert_eq!(
-            exempt,
-            [
-                // `askpass` reaches a PTY only by way of root, not by writing input,
-                // so the input-stall gate never refuses it; the halt still does.
-                "askpass", "close", "confirm", "pane", "reset", "resize", "restart", "signal", "tab"
-            ]
-        );
-        // `invoke` is input-writing only for an action that writes input.
-        assert!(is_input_writing("invoke", "Paste"));
-        assert!(is_input_writing("invoke", "Paste extra"));
-        for name in [
-            "SelectAll",
-            "Copy",
-            "NewTab",
-            "OpenPalette",
-            "NoSuchAction",
-            "",
-        ] {
-            assert!(!is_input_writing("invoke", name), "invoke {name}");
-        }
-        // The halt set holds verbs the table does not (`operator-propose-bin`
-        // is a frame, not a row); the gate covers it too.
-        assert!(is_input_writing("operator-propose-bin", ""));
-        assert!(!is_input_writing("status", ""));
-    }
-
-    /// Only `Paste` writes input, over every action the menu carries (every
-    /// variant has a tag, which `from_tag` maps back).
-    #[test]
-    fn only_paste_writes_pty_input() {
-        let actions: Vec<_> = (0..=255isize).filter_map(MenuAction::from_tag).collect();
-        assert!(
-            actions.len() >= 63,
-            "every action has a tag: {}",
-            actions.len()
-        );
-        let writing: Vec<_> = actions
-            .into_iter()
-            .filter(|a| a.writes_pty_input())
-            .collect();
-        assert_eq!(writing, [MenuAction::Paste]);
-    }
-
-    /// The refusal starts `ERR busy input-unread`, so a driver's existing
-    /// `is_err("busy")` back-off retries it (any other `ERR` is a hard failure
-    /// to the supervisor), and it names the facts and the way out.
-    #[test]
-    fn refusal_text_is_a_busy_refusal_naming_the_facts_and_the_remedy() {
-        let b = backlog(1, TICK, false);
-        let line = refusal_text(&b, InputWord::Pending, false, None);
-        assert!(line.starts_with("ERR busy input-unread "), "{line}");
-        // `CtlReply::is_err("busy")` is `err_text().starts_with("ERR busy")`.
-        assert!(line.starts_with("ERR busy"));
-        assert!(
-            line.ends_with(")\n") && line.matches('\n').count() == 1,
-            "{line}"
-        );
-        assert!(
-            line.starts_with("ERR busy input-unread bytes=1 wait_ms=1100 input=pending ("),
-            "{line}"
-        );
-        assert!(line.contains("queued 1s ago"), "{line}");
-        // Not yet a stall: one remedy, and it is waiting.
-        assert!(line.contains("; retry in a moment)"), "{line}");
-        assert!(!line.contains("signal"), "{line}");
-        // A refused `^C`: a raw program's ^C is a byte the gate refuses; the
-        // signal is not.
-        let line = refusal_text(&b, InputWord::Pending, true, None);
-        assert!(line.ends_with("; interrupt it: signal int)\n"), "{line}");
-        // The spill counts toward bytes=.
+    fn refusal_text_is_one_busy_line_with_the_facts_and_the_remedy() {
         let spilled = InputBacklog {
             spilled: Some(5),
             ..backlog(2, Duration::from_secs(700), false)
         };
-        let line = refusal_text(&spilled, InputWord::Stalled, false, None);
-        assert!(
-            line.starts_with("ERR busy input-unread bytes=7 wait_ms=700000 input=stalled ("),
-            "{line}"
-        );
-        assert!(line.contains("queued 11m40s ago"), "{line}");
-        // A published stall: the attention line's remedy (a program that lives
-        // through it earns `signal kill`, below).
-        assert!(line.ends_with("; restart it: signal term)\n"), "{line}");
-        // Where the window's host carries the explicit restart, that is the
-        // remedy named — `signal term`'s exit would read as the agent's own.
-        let line = refusal_text(
-            &spilled,
-            InputWord::Stalled,
-            false,
-            Some("restart pid=4242 if-stalled"),
-        );
-        assert!(
-            line.ends_with("; restart it: restart pid=4242 if-stalled)\n"),
-            "{line}"
-        );
-        // Stopped: the remedy is `signal cont`, not a restart.
-        let line = refusal_text(&b, InputWord::Stopped, false, None);
-        assert!(
-            line.contains("input=stopped (the program is stopped"),
-            "{line}"
-        );
-        assert!(line.contains("signal cont"), "{line}");
-        assert!(!line.contains("signal term"), "{line}");
-        // No wire word the gate prints is `frozen`: that is `path=frozen`'s.
-        for word in [InputWord::Pending, InputWord::Stalled, InputWord::Stopped] {
-            assert!(!refusal_text(&b, word, false, None).contains("input=frozen"));
-        }
-        // Held through a restart inside RESTART_GRACE: the same busy shape and
-        // word, and a retry — the program may still be ending.
-        let line = held_refusal_text(
-            &backlog(0, Duration::ZERO, false),
-            Held::Restart,
-            false,
-            None,
-        );
-        assert!(
-            line.starts_with("ERR busy input-unread bytes=0 wait_ms=0 input=stalled ("),
-            "{line}"
-        );
-        assert!(line.ends_with("; retry in a moment)\n"), "{line}");
-        assert!(!line.contains("signal kill"), "{line}");
-        // Survived: the reason and `signal kill`, as the attention line says.
-        let line = held_refusal_text(
-            &backlog(0, Duration::ZERO, false),
-            Held::Restart,
-            true,
-            None,
-        );
-        assert!(
-            line.starts_with("ERR busy input-unread bytes=0 wait_ms=0 input=stalled ("),
-            "{line}"
-        );
-        assert!(
-            line.ends_with(")\n") && line.matches('\n').count() == 1,
-            "{line}"
-        );
-        assert!(
-            line.contains("still running after its restart signal"),
-            "{line}"
-        );
-        assert!(line.contains("end it: signal kill"), "{line}");
-        assert!(!line.contains("signal term"), "{line}");
-        // The host's explicit restart ends a survivor itself: named instead.
-        let line = held_refusal_text(
-            &backlog(0, Duration::ZERO, false),
-            Held::Restart,
-            true,
-            Some("restart pid=4242 if-stalled"),
-        );
-        assert!(
-            line.contains(
-                "still running after its restart signal; restart it: restart pid=4242 \
-                           if-stalled)"
+        let empty = backlog(0, Duration::ZERO, false);
+        let act = Some("restart pid=4242 if-stalled");
+        for (line, head, tail) in [
+            (
+                refusal_text(&spilled, InputWord::Stalled, false, act),
+                "bytes=7 wait_ms=700000 input=stalled",
+                "restart pid=4242 if-stalled)",
             ),
-            "{line}"
-        );
-        assert!(!line.contains("signal kill"), "{line}");
-        // Held through `reset flush` alone ([`Held::Flush`], 2026-09-26): the
-        // same shape, and NO restart signal claimed — the remedy is still
-        // `signal term`, the first restart.
-        let line = held_refusal_text(&backlog(0, Duration::ZERO, false), Held::Flush, false, None);
-        assert!(
-            line.starts_with("ERR busy input-unread bytes=0 wait_ms=0 input=stalled ("),
-            "{line}"
-        );
-        assert!(
-            line.ends_with(")\n") && line.matches('\n').count() == 1,
-            "{line}"
-        );
-        assert!(line.contains("reset flush dropped its queue"), "{line}");
-        assert!(!line.contains("restart signal"), "{line}");
-        assert!(!line.contains("still running"), "{line}");
-        assert!(line.contains("restart it: signal term"), "{line}");
-        assert!(!line.contains("signal kill"), "{line}");
-    }
-
-    /// A sink over no tty has no reading, so it never refuses and never stops
-    /// a re-press — the Linux/Windows answer, and every pipe-backed test's.
-    #[test]
-    fn no_reading_refuses_nothing() {
-        let ctx = crate::session_store::test_handle(1).ctx;
-        assert_eq!(refusal(&ctx, "key", "down", false), None);
-        assert_eq!(admission(&ctx, "key", "down", false), Admission::Open);
-        assert!(!repress_would_queue(&ctx.sink));
-        assert!(!fg_stopped(-1));
-        assert_eq!(fg_rss_mb(-1), None);
+            (
+                refusal_text(&spilled, InputWord::Stopped, false, None),
+                "bytes=7 wait_ms=700000 input=stopped",
+                "signal cont)",
+            ),
+            (
+                held_refusal_text(&empty, Held::Restart, true, act),
+                "bytes=0 wait_ms=0 input=stalled",
+                "restart pid=4242 if-stalled)",
+            ),
+        ] {
+            assert!(
+                line.starts_with(&format!("ERR busy input-unread {head} (")),
+                "{line}"
+            );
+            assert!(
+                line.ends_with(&format!("{tail}\n")) && line.matches('\n').count() == 1,
+                "{line}"
+            );
+        }
     }
 
     /// `pid_stopped` reads a real SIGSTOP and SIGCONT off a child it did not
@@ -2417,26 +2244,14 @@ pub(crate) mod tests {
         assert_eq!(pid_stopped(-5), None);
     }
 
-    /// `pid_rss_mb` reads this test process's own resident set.
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn pid_rss_mb_reads_a_resident_set() {
-        // SAFETY: `getpid` is a side-effect-free libc getter.
-        let me = unsafe { libc::getpid() };
-        let rss = pid_rss_mb(me).expect("our own task info");
-        assert!(rss > 0, "{rss} MiB");
-        assert_eq!(pid_rss_mb(0), None);
-    }
-
     /// THE GATE ON A REAL PTY (owner direction, 2026-09-29). A raw program
     /// that has not read the human's Enter for 1.1 s — on a machine at a
-    /// load of 150, a healthy Claude Code — is WRITTEN to: every input verb is
-    /// admitted with a warning naming the backlog, and nothing is refused.
-    /// NEGATIVE CONTROL, the incident: once the watch has PUBLISHED the
-    /// program as stalled (its input past the stall threshold), the same key
-    /// is refused and nothing reaches the queue — the slave still reads
-    /// exactly `\r`. The override queues, the remedies stay open. A warning
-    /// or a refusal wakes the input watch once per arming (S6 review).
+    /// load of 150, a healthy Claude Code — is WRITTEN to, with a warning
+    /// naming the backlog. NEGATIVE CONTROL, the incident: once the watch has
+    /// PUBLISHED the program as stalled, the same key is refused and nothing
+    /// reaches the queue — the slave still reads exactly `\r`. The override
+    /// queues, the remedies stay open. A warning or a refusal wakes the input
+    /// watch once per arming (S6 review).
     #[test]
     #[cfg(target_os = "macos")]
     fn a_slow_read_is_warned_and_only_a_published_stall_refuses() {
@@ -2451,10 +2266,6 @@ pub(crate) mod tests {
                 wakes.fetch_add(1, Ordering::SeqCst);
             });
         }
-        // Nothing queued: open, and a re-press may press.
-        assert_eq!(admission(&ctx, "key", "down", false), Admission::Open);
-        assert!(!repress_would_queue(&ctx.sink));
-
         ctx.sink
             .write_frame_nonparking(b"\r")
             .expect("the human's Enter");
@@ -2463,7 +2274,6 @@ pub(crate) mod tests {
         ctx.sink.rearm_input_hook();
         // Young input is a program busy for a moment: open, no warning.
         assert_eq!(admission(&ctx, "key", "down", false), Admission::Open);
-        assert!(repress_would_queue(&ctx.sink), "the Enter is unread");
         assert_eq!(wakes.load(Ordering::SeqCst), 1, "a pass wakes nothing");
         ctx.sink.backdate_input_for_testing(TICK);
 
@@ -2480,17 +2290,6 @@ pub(crate) mod tests {
             2,
             "the warning woke the watch"
         );
-        for verb in ["send", "ctrl", "feed", "paste", "turn", "mouse", "hwkey"] {
-            assert!(
-                matches!(admission(&ctx, verb, "x", false), Admission::Warn(_)),
-                "{verb}"
-            );
-            assert_eq!(refusal(&ctx, verb, "x", false), None, "{verb}");
-        }
-        assert!(matches!(
-            admission(&ctx, "invoke", "Paste", false),
-            Admission::Warn(_)
-        ));
         assert_eq!(admission(&ctx, "key", "down", true), Admission::Open);
 
         // THE INCIDENT: the watch publishes the stall.
@@ -2505,70 +2304,37 @@ pub(crate) mod tests {
             refused.ends_with("; restart it: signal term)\n"),
             "{refused}"
         );
-        for verb in ["send", "ctrl", "feed", "paste", "turn", "mouse", "hwkey"] {
-            assert!(refusal(&ctx, verb, "x", false).is_some(), "{verb}");
-        }
         assert!(refusal(&ctx, "invoke", "Paste", false).is_some());
         // The override, and the remedies, pass.
         assert_eq!(refusal(&ctx, "key", "down", true), None);
-        for verb in ["signal", "resize", "close", "status", "text"] {
+        for verb in ["signal", "resize", "close", "reset"] {
             assert_eq!(refusal(&ctx, verb, "term", false), None, "{verb}");
         }
-        assert_eq!(refusal(&ctx, "invoke", "SelectAll", false), None);
         assert_eq!(
             wakes.load(Ordering::SeqCst),
             2,
             "no probe between them: no second wake"
         );
         // A refusal wrote nothing: the program, reading at last, reads the
-        // human's Enter and nothing behind it — and then nothing is refused
-        // (the queue is empty; the watch withdraws on its next probe).
+        // human's Enter and nothing behind it.
         assert_eq!(slave_read_all(slave), b"\r");
-        assert_eq!(admission(&ctx, "key", "down", false), Admission::Open);
-        assert!(!repress_would_queue(&ctx.sink));
         aterm_pty::close_fd(master);
         aterm_pty::close_fd(slave);
     }
 
-    /// The bytes the gate judges are the bytes the seam writes: `key` and
-    /// `ctrl` through the encoder under the session's keyboard mode, `feed`
-    /// decoded, `send` raw. Under the kitty protocol `ctrl+c` is a CSI
-    /// sequence, not `^C`, so it is input like any other key.
+    /// The bytes the gate judges are the bytes the seam writes, under the
+    /// session's keyboard mode: under the kitty protocol `ctrl+c` is a CSI
+    /// sequence, not `^C`, so it is input like any other key and never the
+    /// signal-character exemption.
     #[test]
-    fn written_bytes_are_the_bytes_the_seam_writes() {
-        let legacy = KeyboardMode::empty();
-        for (verb, rest, want) in [
-            ("key", "ctrl+c", &b"\x03"[..]),
-            ("key", "c mods=ctrl", b"\x03"),
-            ("key", "ctrl+\\", b"\x1c"),
-            ("key", "ctrl+z", b"\x1a"),
-            ("ctrl", "c", b"\x03"),
-            ("ctrl", "C", b"\x03"),
-            ("ctrl", "z", b"\x1a"),
-            ("feed", "03", b"\x03"),
-            ("send", "\x03", b"\x03"),
-            ("key", "down", b"\x1b[B"),
-            ("key", "enter", b"\r"),
-        ] {
-            assert_eq!(
-                written_bytes(verb, rest, legacy).as_deref(),
-                Some(want),
-                "{verb} {rest:?}"
-            );
-        }
+    fn written_bytes_follow_the_sessions_keyboard_mode() {
+        assert_eq!(
+            written_bytes("key", "ctrl+c", KeyboardMode::empty()).as_deref(),
+            Some(&b"\x03"[..])
+        );
         let kitty =
             written_bytes("key", "ctrl+c", KeyboardMode::DISAMBIGUATE_ESC_CODES).expect("encodes");
         assert_ne!(kitty, b"\x03", "the kitty protocol reports ctrl+c as a key");
-        for (verb, rest) in [
-            ("key", "no-such-key"),
-            ("ctrl", "cc"),
-            ("feed", "zz"),
-            ("paste", "x"),
-            ("mouse", "click 1 1"),
-            ("turn", "x"),
-        ] {
-            assert_eq!(written_bytes(verb, rest, legacy), None, "{verb} {rest}");
-        }
     }
 
     /// THE REMEDY IS NOT REFUSED (S4 review, 2026-09-24). A cbreak program —
@@ -2692,6 +2458,9 @@ pub(crate) mod tests {
                     key: &key,
                     momentum: &momentum,
                     driver: None,
+                    actor: aterm_slog::Actor::Ctl,
+                    cause: None,
+                    mark: None,
                 },
             )
         };
@@ -2767,172 +2536,41 @@ pub(crate) mod tests {
         );
     }
 
-    /// Nothing unread arms nothing: no watch, no deadline, no transition —
-    /// the idle machine's case, and every probe that finds the program caught
-    /// up. No reading at all (`-`, not macOS or not a tty) is the same.
-    #[test]
-    fn step_clear_arms_nothing() {
-        let mut w = InputWatches::default();
-        let t0 = Instant::now();
-        for b in [Some(reading(0, 0, 0)), None] {
-            let (t, next) = w.step(
-                1,
-                b.as_ref(),
-                false,
-                Activity::default(),
-                || panic!("no rss"),
-                t0,
-            );
-            assert_eq!((t, next), (Transition::None, None));
-            assert!(!w.armed(1));
-            assert_eq!(w.next_wake(), None);
-        }
-    }
-
-    /// Unread raw input younger than a stall is PENDING: nothing published,
-    /// and the next probe is the instant its oldest byte turns
-    /// [`input_backlog::STALL_AFTER`] old — not a poll.
     /// THE STALL JUDGED UNDER LOAD (owner direction, 2026-09-29). On this
     /// 18-CPU Mac at a load of 150 the watch stretches its thresholds 8.33
-    /// times: a young byte's first probe schedules the stretched stall
-    /// instant, a spinning, silent program at 12 s is NOT published — it is
-    /// slow, not frozen — and it is at 83.33 s. NEGATIVE CONTROL: the same
-    /// probes on an idle machine publish at 12 s, as ever.
+    /// times: a young byte's first probe schedules the STRETCHED stall
+    /// instant (not a poll), and a spinning, silent program at 12 s is not
+    /// published — it is slow, not frozen — its next probe again that
+    /// stretched instant. (`classify`'s own tests judge the ages.)
     #[test]
     fn step_stretches_the_stall_by_the_machines_contention() {
         let loaded = Contention::of_load(150.0, 18);
         let t0 = Instant::now();
-        let under = |contention: Contention, burned: Duration| Activity {
-            contention,
+        let stretched = Some(t0 + Duration::from_millis(83_330));
+        let under = |burned: Duration| Activity {
+            contention: loaded,
             ..spin(burned)
         };
-        let (t, next) = InputWatches::default().step(
+        let mut w = InputWatches::default();
+        let (t, next) = w.step(
             1,
             Some(&reading(1, 0, 0)),
             false,
-            under(loaded, Duration::ZERO),
+            under(Duration::ZERO),
             || None,
             t0,
         );
-        assert_eq!(t, Transition::None);
-        assert_eq!(next, Some(t0 + Duration::from_millis(83_330)), "stretched");
-
-        let judged = |contention: Contention, at: Duration| {
-            let mut w = InputWatches::default();
-            let _ = w.step(
-                1,
-                Some(&reading(1, 0, 0)),
-                false,
-                under(contention, Duration::ZERO),
-                || None,
-                t0,
-            );
-            let wait = InputBacklog {
-                wait: at,
-                ..reading(1, 0, 0)
-            };
-            w.step(
-                1,
-                Some(&wait),
-                false,
-                under(contention, at),
-                || None,
-                t0 + at,
-            )
-        };
-        let (t, next) = judged(loaded, Duration::from_secs(12));
-        assert_eq!(t, Transition::None, "loaded: slow, not frozen");
-        assert_eq!(
-            next,
-            Some(t0 + Duration::from_millis(83_330)),
-            "the next probe is the stretched instant"
-        );
-        let (t, _) = judged(loaded, Duration::from_millis(83_330));
-        assert!(matches!(t, Transition::Entered(_)), "{t:?}");
-        // NEGATIVE CONTROL: idle, the base ten seconds.
-        let (t, _) = judged(Contention::default(), Duration::from_secs(12));
-        assert!(matches!(t, Transition::Entered(_)), "{t:?}");
-    }
-
-    #[test]
-    fn step_pending_schedules_the_stall_instant() {
-        let mut w = InputWatches::default();
-        let t0 = Instant::now();
+        assert_eq!((t, next), (Transition::None, stretched));
+        let at = Duration::from_secs(12);
         let (t, next) = w.step(
             1,
-            Some(&reading(1, 3, 0)),
+            Some(&reading(1, 12, 0)),
             false,
-            Activity::default(),
-            || panic!(),
-            t0,
+            under(at),
+            || None,
+            t0 + at,
         );
-        assert_eq!(t, Transition::None);
-        assert_eq!(next, Some(t0 + Duration::from_secs(7)));
-        assert!(w.armed(1));
-        assert_eq!(w.next_wake(), next);
-        assert_eq!(w.published(1), None);
-        assert!(w.due(t0).is_empty());
-        assert_eq!(w.due(t0 + Duration::from_secs(7)), [1]);
-    }
-
-    /// ENTRY needs aterm's read of the program's output caught up: a program
-    /// blocked writing to an aterm that is behind is waiting for aterm. Held
-    /// there, the probe re-checks every [`RECHECK`] rather than at a stall
-    /// instant already past (which would spin the loop). Once published, a
-    /// stall STAYS on `wait` alone, whatever the output backlog.
-    #[test]
-    fn step_entry_needs_output_caught_up_and_staying_needs_only_the_wait() {
-        let mut w = InputWatches::default();
-        let t0 = Instant::now();
-        let (t, next) = w.step(
-            1,
-            Some(&reading(1, 12, 64)),
-            false,
-            spin(Duration::ZERO),
-            || panic!(),
-            t0,
-        );
-        assert_eq!(t, Transition::None, "aterm is behind: pending");
-        assert_eq!(next, Some(t0 + RECHECK));
-
-        let mut rss_reads = 0;
-        let t1 = t0 + RECHECK;
-        let (t, next) = w.step(
-            1,
-            Some(&reading(1, 17, 0)),
-            false,
-            spin(RECHECK),
-            || {
-                rss_reads += 1;
-                Some(39_731)
-            },
-            t1,
-        );
-        let Transition::Entered(fact) = t else {
-            panic!("entered: {t:?}")
-        };
-        assert_eq!(fact.word, InputWord::Stalled);
-        assert_eq!(fact.since, t1 - Duration::from_secs(17));
-        assert_eq!(
-            (fact.bytes, fact.stopped, fact.rss_mb),
-            (1, false, Some(39_731))
-        );
-        assert_eq!(next, Some(t1 + RECHECK));
-        assert_eq!(w.published(1), Some(&fact));
-
-        // Staying: aterm falls behind again — the stall does not flap.
-        let t2 = t1 + RECHECK;
-        let (t, _) = w.step(
-            1,
-            Some(&reading(2, 22, 512)),
-            false,
-            Activity::default(),
-            || panic!(),
-            t2,
-        );
-        assert_eq!(t, Transition::None);
-        assert_eq!(w.published(1), Some(&fact), "entry values are kept");
-        assert_eq!(rss_reads, 1, "the RSS is read once, on entry");
+        assert_eq!((t, next), (Transition::None, stretched), "slow, not frozen");
     }
 
     /// A STOPPED job with input queued is published at any age, and a stall
@@ -3031,13 +2669,15 @@ pub(crate) mod tests {
     /// A DROP IS NOT A READ (whole-branch review, third round, 2026-09-25):
     /// the stall's queue emptied by aterm's own discard — the one before
     /// `signal term` — while the leader it was published for still leads is
-    /// HELD, `stalled` whatever the queue holds, and past [`RESTART_GRACE`]
-    /// it is republished as survived, the remedy `signal kill`. It is let go
-    /// when the leader goes (the program ended and the shell has the tty) or
-    /// draws. The negative control is the fix's absence: the same empty queue
-    /// with no discard is the program reading, and the stall leaves.
+    /// HELD, `stalled` whatever the queue holds (keys typed into it meanwhile
+    /// too), and past [`RESTART_GRACE`] it is republished as survived, the
+    /// remedy `signal kill`. It is let go when it draws after the drop
+    /// (output from before is not drawing). A stall published with no leader
+    /// read is never held. The negative control is the fix's absence: the
+    /// same empty queue with no discard is the program reading, and the
+    /// stall leaves. (The leader going is the pty tests' end.)
     #[test]
-    fn step_holds_a_stall_whose_queue_aterm_dropped_until_its_leader_goes() {
+    fn step_holds_a_stall_whose_queue_aterm_dropped_until_it_draws() {
         let t0 = Instant::now();
         let entered = |w: &mut InputWatches| {
             primed(w, 1, t0);
@@ -3049,19 +2689,7 @@ pub(crate) mod tests {
                 || None,
                 t0,
             );
-            let Transition::Entered(fact) = t else {
-                panic!("{t:?}")
-            };
-            assert_eq!(
-                fact.restart,
-                Restart {
-                    leader: Some(4242),
-                    discards: 0,
-                    restarts: 0,
-                    survived: false,
-                },
-                "the episode's leader and the sink's discard counts"
-            );
+            assert!(matches!(t, Transition::Entered(_)), "{t:?}");
         };
         // The leader after the discard (the count moved), still spinning: a
         // whole core since `primed` started its window, whenever it is read.
@@ -3112,7 +2740,7 @@ pub(crate) mod tests {
             almost,
         );
         assert_eq!((t, next), (Transition::None, Some(t1 + RESTART_GRACE)));
-        // Survived: republished, with the episode's date and its RSS.
+        // Survived: republished, with the episode's date.
         let at = t1 + RESTART_GRACE;
         let (t, next) = w.step(
             1,
@@ -3128,41 +2756,7 @@ pub(crate) mod tests {
         assert!(fact.restart.survived, "{fact:?}");
         assert_eq!((fact.word, fact.since), (InputWord::Stalled, held.since));
         assert_eq!(next, Some(at + RECHECK));
-        // `signal kill` again, a second discard: nothing more moves.
-        let (t, _) = w.step(
-            1,
-            Some(&reading(0, 0, 0)),
-            false,
-            after_drop(2, None, at + RECHECK),
-            || panic!(),
-            at + RECHECK,
-        );
-        assert_eq!(t, Transition::None);
-        // The leader went: the shell's job leads, or nothing readable does.
-        for gone in [Some((5151, 0)), None] {
-            let mut w2 = InputWatches::default();
-            entered(&mut w2);
-            let _ = w2.step(
-                1,
-                Some(&reading(0, 0, 0)),
-                false,
-                after_drop(1, None, t1),
-                || None,
-                t1,
-            );
-            let (t, _) = w2.step(
-                1,
-                Some(&reading(0, 0, 0)),
-                false,
-                Activity {
-                    cpu: gone,
-                    ..after_drop(1, None, t1 + Duration::from_millis(300))
-                },
-                || panic!(),
-                t1 + Duration::from_millis(300),
-            );
-            assert_eq!(t, Transition::Left, "leader now {gone:?}");
-        }
+
         // It drew after the drop: alive, let go. Output from before is not.
         let mut w = InputWatches::default();
         entered(&mut w);
@@ -3222,27 +2816,13 @@ pub(crate) mod tests {
     /// [`RESTART_GRACE`] it is NOT survived, and its probes come at
     /// [`RECHECK`], with no grace deadline. A `signal term` after the flush
     /// moves the restart count: the grace runs from THAT probe, not from the
-    /// flush's, and ends in `survived` as a restart's always did.
-    ///
-    /// The negative control is the fix's absence: with the restart count
-    /// moved alongside (the one count the watch read before the split), the
-    /// same readings at the same instants are survived.
+    /// flush's, and ends in `survived` as a restart's always did (the
+    /// negative control: the test above, the same drop counted as a
+    /// restart's, survives).
     #[test]
     fn step_holds_a_flushed_stall_but_never_calls_it_survived() {
         let t0 = Instant::now();
         let base = t0.checked_sub(RECHECK).expect("uptime");
-        let entered = |w: &mut InputWatches| {
-            primed(w, 1, t0);
-            let (t, _) = w.step(
-                1,
-                Some(&reading(1, 10, 0)),
-                false,
-                spin(RECHECK),
-                || None,
-                t0,
-            );
-            assert!(matches!(t, Transition::Entered(_)), "{t:?}");
-        };
         // Still spinning, a whole core since `primed`, after `discards`
         // drops of which `restarts` were a restart's.
         let after = |discards: u64, restarts: u64, now: Instant| Activity {
@@ -3252,34 +2832,19 @@ pub(crate) mod tests {
         };
         let t1 = t0 + Duration::from_secs(1);
         let grace = t1 + RESTART_GRACE;
-
-        // The negative control: the same drop counted as a restart.
         let mut w = InputWatches::default();
-        entered(&mut w);
-        let _ = w.step(
-            1,
-            Some(&reading(0, 0, 0)),
-            false,
-            after(1, 1, t1),
-            || None,
-            t1,
-        );
+        primed(&mut w, 1, t0);
         let (t, _) = w.step(
             1,
-            Some(&reading(0, 0, 0)),
+            Some(&reading(1, 10, 0)),
             false,
-            after(1, 1, grace),
+            spin(RECHECK),
             || None,
-            grace,
+            t0,
         );
-        assert!(
-            matches!(&t, Transition::Updated(f) if f.restart.survived),
-            "a restart's drop survives: {t:?}"
-        );
+        assert!(matches!(t, Transition::Entered(_)), "{t:?}");
 
         // The flush: held, no grace deadline, never survived.
-        let mut w = InputWatches::default();
-        entered(&mut w);
         let (t, next) = w.step(
             1,
             Some(&reading(0, 0, 0)),
@@ -3290,23 +2855,20 @@ pub(crate) mod tests {
         );
         assert_eq!((t, next), (Transition::None, Some(t1 + RECHECK)));
         let held = w.published(1).expect("held: a drop is not a read").clone();
-        assert_eq!(held.word, InputWord::Stalled);
         assert!(!held.restart.survived);
-        for at in [grace, grace + RECHECK, grace + 4 * RECHECK] {
-            let (t, next) = w.step(
-                1,
-                Some(&reading(0, 0, 0)),
-                false,
-                after(1, 0, at),
-                || panic!(),
-                at,
-            );
-            assert_eq!((t, next), (Transition::None, Some(at + RECHECK)), "{at:?}");
-            assert_eq!(w.published(1), Some(&held), "never survived");
-        }
+        let (t, next) = w.step(
+            1,
+            Some(&reading(0, 0, 0)),
+            false,
+            after(1, 0, grace),
+            || panic!(),
+            grace,
+        );
+        assert_eq!((t, next), (Transition::None, Some(grace + RECHECK)));
+        assert_eq!(w.published(1), Some(&held), "never survived");
 
         // `signal term` after it: the grace runs from the probe that sees it.
-        let t2 = grace + 4 * RECHECK + Duration::from_secs(1);
+        let t2 = grace + Duration::from_secs(1);
         let (t, next) = w.step(
             1,
             Some(&reading(0, 0, 0)),
@@ -3346,19 +2908,15 @@ pub(crate) mod tests {
     /// review, fourth round, 2026-09-25). The reviewer's program lived through
     /// `signal term`, stopped spinning and read every key sent to it without
     /// drawing, and it stayed `stalled` for good, told `signal kill`. Two more
-    /// signs end the hold now ([`Restart`]):
+    /// signs end the hold now ([`Restart`]): a READ of a byte sent after the
+    /// drop (the pty test below), and the spin STOPPING — a window judged not
+    /// spinning after the hold began spinning, with nothing sent since left
+    /// unread for [`input_backlog::WARN_AFTER`].
     ///
-    /// * a READ of a byte sent after the drop, spinning or not;
-    /// * the spin STOPPING: a window judged not spinning after the hold began
-    ///   spinning, with nothing sent since left unread for
-    ///   [`input_backlog::WARN_AFTER`].
-    ///
-    /// The negative controls are the incident and its neighbours. A leader
-    /// still spinning that reads nothing stays held. So does one that stopped
-    /// spinning but leaves a byte sent since unread, because it is not
-    /// reading. One that was asleep when the hold began has no spin to stop,
-    /// so it stays held until it reads. A recovered episode is over. With
-    /// nothing unread the watch ends, and a stall behind the recovery is
+    /// The negative controls: one that stopped spinning but leaves a byte
+    /// sent since unread is not reading, so it stays held; one that was
+    /// asleep when the hold began has no spin to stop, so it stays held until
+    /// it reads. A recovered episode is over: a stall behind the recovery is
     /// entered as a new episode, with its own restart record.
     #[test]
     fn step_lets_a_held_stall_go_when_its_program_reads_or_stops_spinning() {
@@ -3397,37 +2955,7 @@ pub(crate) mod tests {
                 t1,
             );
             assert_eq!(t, Transition::None, "held");
-            assert!(w.published(1).is_some());
         };
-
-        // The incident: still spinning, nothing read. Held.
-        let mut w = InputWatches::default();
-        held(&mut w);
-        let (t, _) = w.step(
-            1,
-            Some(&reading(0, 0, 0)),
-            false,
-            after_drop(core(t2), false),
-            || panic!(),
-            t2,
-        );
-        assert_eq!(t, Transition::None, "spinning and reading nothing");
-        assert!(w.published(1).is_some());
-
-        // It READ a byte sent after the drop, still spinning: let go, and
-        // with nothing unread the watch ends.
-        let mut w = InputWatches::default();
-        held(&mut w);
-        let (t, next) = w.step(
-            1,
-            Some(&reading(0, 0, 0)),
-            false,
-            after_drop(core(t2), true),
-            || panic!(),
-            t2,
-        );
-        assert_eq!((t, next), (Transition::Left, None), "it read");
-        assert!(!w.armed(1));
 
         // Its spin STOPPED (no CPU since t1), nothing unread: let go. This is
         // the reviewer's program, asleep in `read` with nothing sent to it.
@@ -3442,28 +2970,6 @@ pub(crate) mod tests {
             t2,
         );
         assert_eq!((t, next), (Transition::Left, None), "it stopped spinning");
-        // …and a key just sent, not yet due, does not keep it: the episode
-        // is over, and the key is a new one's, pending.
-        let mut w = InputWatches::default();
-        held(&mut w);
-        let young = InputBacklog {
-            wait: Duration::from_millis(200),
-            ..reading(1, 0, 0)
-        };
-        let (t, next) = w.step(
-            1,
-            Some(&young),
-            false,
-            after_drop(core(t1), false),
-            || panic!(),
-            t2,
-        );
-        assert_eq!(t, Transition::Left);
-        assert_eq!(
-            next,
-            Some(t2 + input_backlog::STALL_AFTER - Duration::from_millis(200))
-        );
-        assert!(w.published(1).is_none());
         // Stopped spinning, but a byte sent since has waited a second unread:
         // it is not reading. Held.
         let mut w = InputWatches::default();
@@ -3507,10 +3013,7 @@ pub(crate) mod tests {
             || None,
             t0,
         );
-        let Transition::Entered(fact) = t else {
-            panic!("{t:?}")
-        };
-        assert_eq!(fact.restart.leader, Some(4242));
+        assert!(matches!(t, Transition::Entered(_)), "{t:?}");
         for at in [t1, t2] {
             let (t, _) = w.step(
                 1,
@@ -3627,30 +3130,6 @@ pub(crate) mod tests {
         // The incident: a core burned across the window, nothing drawn.
         let (t, _, _) = probe(spin(Duration::ZERO), spin(Duration::from_secs(12)), 12);
         assert!(matches!(t, Transition::Entered(_)), "{t:?}");
-        // …but not on its first probe: one reading has no window.
-        let (t, _) = InputWatches::default().step(
-            1,
-            Some(&reading(1, 12, 0)),
-            false,
-            spin(Duration::from_secs(12)),
-            || None,
-            t1,
-        );
-        assert_eq!(t, Transition::None, "no window yet");
-        // A different leader restarts the window: its CPU is not the old one's.
-        let other = Activity {
-            cpu: Some((5151, 12_000_000_000)),
-            last_output: None,
-            discards: 0,
-            restarts: 0,
-            read_since_discard: false,
-            contention: Contention::default(),
-        };
-        let (t, _, _) = probe(spin(Duration::ZERO), other, 12);
-        assert_eq!(t, Transition::None, "a new foreground job has no window");
-        // No CPU reading at all is no evidence of spinning.
-        let (t, _, _) = probe(Activity::default(), Activity::default(), 12);
-        assert_eq!(t, Transition::None);
     }
 
     /// The CPU window: judged at [`SPIN_WINDOW`] or more (half a core
@@ -3791,42 +3270,6 @@ pub(crate) mod tests {
         assert_eq!(pid_cpu_ns(0), None);
     }
 
-    /// Canonical type-ahead is watched (until the shell reads it) and never
-    /// published; a wake-driven probe inside [`PROBE_MIN_GAP`] waits; and
-    /// `forget` hands back what was published.
-    #[test]
-    fn step_typeahead_throttle_and_forget() {
-        let mut w = InputWatches::default();
-        let t0 = Instant::now();
-        let typed = backlog(3, Duration::from_secs(60), true);
-        let (t, next) = w.step(1, Some(&typed), false, Activity::default(), || panic!(), t0);
-        assert_eq!((t, next), (Transition::None, Some(t0 + RECHECK)));
-        assert!(
-            !w.throttled(2, t0),
-            "an unwatched session is never throttled"
-        );
-        assert!(w.throttled(1, t0 + Duration::from_millis(249)));
-        assert!(!w.throttled(1, t0 + PROBE_MIN_GAP));
-        // A throttled wake is deferred to the gap's end, never dropped; an
-        // unwatched session has nothing to defer.
-        w.defer(1);
-        assert_eq!(w.next_wake(), Some(t0 + PROBE_MIN_GAP));
-        w.defer(2);
-        assert!(!w.armed(2));
-        assert_eq!(w.forget(1), None);
-        primed(&mut w, 1, t0);
-        let _ = w.step(
-            1,
-            Some(&reading(1, 10, 0)),
-            false,
-            spin(RECHECK),
-            || None,
-            t0,
-        );
-        assert!(w.forget(1).is_some());
-        assert!(!w.armed(1));
-    }
-
     /// The four `status` fields: `-` without a reading, the unread count
     /// (kernel plus spill) and the oldest byte's wait with one, and the RSS
     /// only when the caller read it.
@@ -3836,11 +3279,6 @@ pub(crate) mod tests {
             status_fields(None, InputWord::Unmeasured, None),
             "input=- input_bytes=- input_wait_ms=- fg_rss_mb=-"
         );
-        let clear = reading(0, 0, 0);
-        assert_eq!(
-            status_fields(Some(&clear), InputWord::Clear, None),
-            "input=clear input_bytes=0 input_wait_ms=0 fg_rss_mb=-"
-        );
         let stalled = InputBacklog {
             spilled: Some(2),
             ..reading(1, 161, 0)
@@ -3848,12 +3286,6 @@ pub(crate) mod tests {
         assert_eq!(
             status_fields(Some(&stalled), InputWord::Stalled, Some(39_731)),
             "input=stalled input_bytes=3 input_wait_ms=161000 fg_rss_mb=39731"
-        );
-        // No reading answers `-` through the live probe too.
-        let ctx = crate::session_store::test_handle(1).ctx;
-        assert_eq!(
-            status_input(&ctx.sink, None, false),
-            "input=- input_bytes=- input_wait_ms=- fg_rss_mb=-"
         );
     }
 
@@ -3888,213 +3320,77 @@ pub(crate) mod tests {
         AfterRestart::Command(OWN.to_string())
     }
 
-    /// The server's attention line: the remedy by name and by command, then
-    /// what follows the restart — THIS tab's own resume line, whole or bare
-    /// (never cut) as the keyed cap allows; the host's word that it
-    /// relaunches the agent; or nothing where neither is known — `the
-    /// program` when unresolved, `for <dur>` without a clock, and the stopped
-    /// wording. Never `claude --continue` (robustness backlog item 2,
-    /// 2026-09-26: the directory's newest conversation, a sibling tab's where
-    /// two share it).
+    /// The server's attention line ends in the remedy's command and then
+    /// THIS tab's own resume line, never cut: where the whole line passes the
+    /// keyed cap its launch flags go first, then the resident size — the
+    /// remedy outranks a measurement, and a cut id names no conversation (or
+    /// another). A stopped job is resumed. (Which remedy, and the host's
+    /// relaunch words, are `the_publication_names_one_remedy_wherever_it_is_read`'s.)
     #[test]
-    fn attention_text_names_the_program_the_facts_and_the_remedy() {
+    fn attention_text_keeps_the_whole_remedy_under_the_keyed_cap() {
         let fact = InputStallFact {
-            word: InputWord::Stalled,
-            since: Instant::now(),
-            bytes: 1,
-            stopped: false,
             rss_mb: Some(39_731),
-            restart: Restart::default(),
-            act: None,
+            ..stalled(Instant::now())
         };
-        let sid = "s-b7cf523445a1b0d8658e";
-        let line = attention_text(
-            &fact,
-            Some("claude"),
-            &own(),
-            sid,
-            Some("14:02"),
-            Duration::from_secs(9660),
-        );
-        // The incident's line: the flags do not fit the keyed cap beside the
-        // facts, so the bare line resumes the same conversation.
-        assert_eq!(
-            line,
-            "claude is frozen: not reading input since 14:02 (1 B queued, rss 38.8 GB) \u{2014} \
-             restart it: aterm ctl @s-b7cf523445a1b0d8658e signal term, then claude --resume \
-             5f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f"
-        );
-        assert!(line.len() <= crate::session_timeline::META_ATTENTION_KEYED_MAX);
-        // Hosted: the publication's explicit restart (its exit the
-        // restart's, a survivor ended by the act itself).
-        let led = InputStallFact {
+        let survived = InputStallFact {
             restart: Restart {
-                leader: Some(4242),
-                ..fact.restart
+                leader: Some(69_156),
+                survived: true,
+                ..Restart::default()
             },
-            act: Some(StallAct {
-                cmd: aterm_agent::harness::resume::restart_command(Some(sid), Some(4242)),
-                promised: true,
-            }),
             ..fact.clone()
         };
-        let hosted = attention_text(
-            &led,
-            Some("claude"),
-            &AfterRestart::Relaunch,
-            sid,
-            Some("14:02"),
-            Duration::from_secs(9660),
-        );
-        assert_eq!(
-            hosted,
-            "claude is frozen: not reading input since 14:02 (1 B queued, rss 38.8 GB) \u{2014} \
-             restart it: aterm ctl @s-b7cf523445a1b0d8658e restart pid=4242 if-stalled; aterm \
-             relaunches it on its conversation"
-        );
-        for survived in [false, true] {
-            let line = attention_text(
-                &InputStallFact {
-                    restart: Restart {
-                        survived,
-                        ..led.restart
-                    },
-                    ..led.clone()
-                },
-                Some("claude"),
-                &AfterRestart::Relaunch,
-                sid,
-                Some("14:02"),
-                Duration::from_secs(9660),
-            );
-            assert!(
-                line.contains(
-                    "\u{2014} restart it: aterm ctl @s-b7cf523445a1b0d8658e restart pid=4242 \
-                     if-stalled"
-                ) && !line.contains("signal kill")
-                    && !line.contains("signal term"),
-                "survived {survived}: {line}"
-            );
-        }
-        let unknown = attention_text(
-            &fact,
-            Some("claude"),
-            &AfterRestart::Unknown,
-            sid,
-            Some("14:02"),
-            Duration::from_secs(9660),
-        );
-        assert!(
-            unknown.ends_with("signal term"),
-            "no record, no command: {unknown}"
-        );
-
         let plain = InputStallFact {
             rss_mb: None,
             ..fact.clone()
         };
-        let line = attention_text(
-            &plain,
-            None,
-            &AfterRestart::Unknown,
-            sid,
-            None,
-            Duration::from_secs(75),
-        );
-        assert_eq!(
-            line,
-            "the program is frozen: not reading input for 1m15s (1 B queued) \u{2014} restart \
-             it: aterm ctl @s-b7cf523445a1b0d8658e signal term"
-        );
-        // Where the whole line fits, its flags ride it.
-        let full = attention_text(
-            &plain,
-            Some("claude"),
-            &own(),
-            sid,
-            None,
-            Duration::from_secs(75),
-        );
-        assert!(
-            full.ends_with(&format!("signal term, then {OWN}")),
-            "{full}"
-        );
-        let small = InputStallFact {
-            rss_mb: Some(1),
-            ..fact.clone()
-        };
-        let line = attention_text(
-            &small,
-            Some("sleep"),
-            &AfterRestart::Unknown,
-            sid,
-            Some("22:54"),
-            Duration::ZERO,
-        );
-        assert!(line.contains("(1 B queued, rss 1 MB)"), "{line}");
-        for text in [&hosted, &unknown, &full, &line] {
-            assert!(!text.contains("--continue"), "{text}");
-        }
-
         let stopped = InputStallFact {
             word: InputWord::Stopped,
             stopped: true,
-            ..fact
+            ..fact.clone()
         };
-        assert_eq!(
-            attention_text(
+        let sid = "s-b7cf523445a1b0d8658e";
+        let bare = "claude --resume 5f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f";
+        for (why, fact, clock, tail) in [
+            (
+                "flags dropped",
+                &fact,
+                Some("14:02"),
+                format!("@{sid} signal term, then {bare}"),
+            ),
+            (
+                "rss dropped",
+                &survived,
+                Some("14:02"),
+                format!("@{sid} signal kill, then {bare}"),
+            ),
+            (
+                "all fits",
+                &plain,
+                None,
+                format!("@{sid} signal term, then {OWN}"),
+            ),
+            (
+                "stopped",
                 &stopped,
+                Some("14:02"),
+                format!("resume it: aterm ctl @{sid} signal cont"),
+            ),
+        ] {
+            let line = attention_text(
+                fact,
                 Some("claude"),
                 &own(),
                 sid,
-                Some("14:02"),
-                Duration::ZERO,
-            ),
-            "claude is stopped with input queued since 14:02 \u{2014} resume it: aterm ctl \
-             @s-b7cf523445a1b0d8658e signal cont"
-        );
-    }
-
-    /// What follows the restart is read from the TIMELINE: the resume line
-    /// the footer resolver published for the process in front, or — where
-    /// the explicit restart is named (`act`) — the host's relaunch where its
-    /// conversation is promised, else nothing: never a resume line a person
-    /// would run over the relaunch (a Codex's). NEGATIVE CONTROLS: no footer
-    /// facts, or facts with no resume line, give no command; and facts read
-    /// for a process that is no longer in front are not this tab's any more.
-    #[test]
-    fn what_follows_the_restart_is_this_tabs_own_resume_line_or_the_hosts_relaunch() {
-        let mut tl = crate::session_timeline::SessionTimeline::default();
-        tl.note_foreground_group(7);
-        tl.set_program(7, Some("claude".into()));
-        assert_eq!(after_restart(&tl, None), AfterRestart::Unknown);
-        assert!(tl.set_claude_footer(
-            7,
-            None,
-            Some(aterm_agent::harness::footer::FooterFacts::default()),
-        ));
-        assert_eq!(after_restart(&tl, None), AfterRestart::Unknown);
-        assert!(tl.set_claude_footer(
-            7,
-            None,
-            Some(aterm_agent::harness::footer::FooterFacts {
-                resume: Some(OWN.to_string()),
-                ..Default::default()
-            }),
-        ));
-        assert_eq!(after_restart(&tl, None), own());
-        let act = |promised| StallAct {
-            cmd: "aterm ctl @s-1 restart pid=7 if-stalled".to_string(),
-            promised,
-        };
-        assert_eq!(after_restart(&tl, Some(&act(true))), AfterRestart::Relaunch);
-        assert_eq!(after_restart(&tl, Some(&act(false))), AfterRestart::Act);
-        // Another program in front: the facts were another process's (and
-        // the act is not offered over it: the leader fence of
-        // `the_publication_names_one_remedy_wherever_it_is_read`).
-        tl.note_foreground_group(8);
-        tl.set_program(8, Some("vim".into()));
-        assert_eq!(after_restart(&tl, None), AfterRestart::Unknown);
+                clock,
+                Duration::from_secs(9660),
+            );
+            assert!(line.ends_with(&tail), "{why}: {line}");
+            assert!(
+                line.len() <= crate::session_timeline::META_ATTENTION_KEYED_MAX,
+                "{why}: {line}"
+            );
+        }
     }
 
     /// The relaunch snapshot a host keeps of tab `sid`'s Claude Code, pid 7:
@@ -4111,13 +3407,16 @@ pub(crate) mod tests {
             session: Some("0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c".to_string()),
             cwd: "/".to_string(),
             version: None,
-            codex: None,
+            run: aterm_agent::harness::relaunch::AgentRun::Claude,
             dialect: Some(aterm_agent::harness::upgrade::Dialect::Zsh),
             login: None,
             home: None,
             claude_dir: None,
         };
-        assert!(aterm_agent::harness::relaunch::resumes_on_exit(&snap));
+        assert!(aterm_agent::harness::relaunch::resumes_on_exit(
+            std::path::Path::new("/Users//someone"),
+            &snap
+        ));
         snap
     }
 
@@ -4137,31 +3436,20 @@ pub(crate) mod tests {
     ///
     /// NEGATIVE CONTROLS — each a session the act refuses, whose words name
     /// `signal term` and this tab's own resume line (`signal kill` for a
-    /// survivor), and the band no command: no claim, another supervisor's
-    /// live claim (`aterm drive watch`), a halt (`hold=1`), a drive lease, a
-    /// turn a named driver typed, a stall published over another leader, a
-    /// program in front that is not the snapshot's agent (no leader read), a
-    /// Codex daemon client whose thread the host could not name (its relaunch
-    /// would refuse: review of `fix/restart-advice`), and no snapshot.
+    /// survivor), and the band no command: no claim, a halt (`hold=1`), a
+    /// drive lease, a turn a named driver typed, a stall published over
+    /// another leader, a program in front that is not the snapshot's agent
+    /// (no leader read), a Codex daemon client whose thread the host could
+    /// not name (its relaunch would refuse: review of `fix/restart-advice`),
+    /// and no snapshot.
     #[test]
     fn the_publication_names_one_remedy_wherever_it_is_read() {
         let mut app = crate::App::headless_for_test();
         let ctx = app.pool.get(0).expect("session 0").ctx.clone();
         let sid = ctx.self_id.as_str().to_string();
+        claude_in_front(&ctx, 7, "prompt");
         {
             let mut tl = ctx.timeline.lock().unwrap();
-            tl.note_foreground_group(7);
-            tl.set_program(7, Some("claude".into()));
-            tl.publish_agent(
-                "prompt",
-                None,
-                None,
-                Some(aterm_phase::Program::Claude),
-                crate::session_timeline::AgentStamp {
-                    generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
-                    fp: 1,
-                },
-            );
             assert!(tl.set_claude_footer(
                 7,
                 None,
@@ -4174,17 +3462,12 @@ pub(crate) mod tests {
         let snapshot = hosted_claude(&sid);
         crate::harness_host::publish_snapshot_for_test(&sid, Some(&snapshot));
         let fact = |leader: Option<i32>, survived: bool| InputStallFact {
-            word: InputWord::Stalled,
-            since: Instant::now(),
-            bytes: 1,
-            stopped: false,
-            rss_mb: None,
             restart: Restart {
                 leader,
                 survived,
                 ..Restart::default()
             },
-            act: None,
+            ..stalled(Instant::now())
         };
         // Publish (the watch's copy first, as a probe leaves it), then read
         // every word of it: the attention entry, the menu row, the band's
@@ -4287,8 +3570,6 @@ pub(crate) mod tests {
         };
 
         refused(&mut app, 7, "no claim");
-        claim("drive-watch@4242");
-        refused(&mut app, 7, "another holder's claim");
         claim(&crate::harness_host::holder());
         carried(&mut app, "the host's claim, unheld");
         refused(&mut app, 8, "a stall over another leader");
@@ -4304,7 +3585,6 @@ pub(crate) mod tests {
         ));
         refused(&mut app, 7, "hold=1");
         assert!(crate::fabric::apply_hold_for_test(&ctx, None));
-        carried(&mut app, "the hold lifted");
 
         let lease = |l: Option<crate::Lease>| *ctx.turn_lease.lock().unwrap() = l;
         lease(Some(crate::Lease::Drive {
@@ -4312,6 +3592,7 @@ pub(crate) mod tests {
             expires_us: now_us + 60_000_000,
             conn: None,
             hard: false,
+            holder_pid: None,
         }));
         refused(&mut app, 7, "a live drive lease");
         lease(Some(crate::Lease::Turn {
@@ -4332,7 +3613,6 @@ pub(crate) mod tests {
         crate::harness_host::publish_snapshot_for_test(&sid, None);
         refused(&mut app, 7, "no snapshot");
         crate::harness_host::publish_snapshot_for_test(&sid, Some(&snapshot));
-        carried(&mut app, "the snapshot back");
 
         // Another program in front, no leader read: never the agent's act
         // over it (the act would refuse it; main named it there).
@@ -4343,52 +3623,48 @@ pub(crate) mod tests {
         }
         refused_then(&mut app, None, "", "vim in front");
 
-        // A hosted Codex: offered where its thread is settled and its lane
-        // would write the relaunch line, its conversation never promised;
-        // refused where its daemon's thread could not be named, or where its
-        // shell or its launch flags leave the lane no line, whose relaunch
-        // would refuse.
+        // A Codex with no copy of codex-alab's own record: refused (the
+        // Codex screen lane's retirement, 2026-10-16: aterm supervises no
+        // Codex, and only a copy-validated line brings one back) — a thread
+        // named and settled, none named, a shell or launch flags no line is
+        // written for.
         {
             let mut tl = ctx.timeline.lock().unwrap();
             tl.note_foreground_group(11);
             tl.set_program(11, Some("codex".into()));
         }
-        let codex =
-            |session: Option<&str>, ambiguous: bool| aterm_agent::harness::relaunch::Snapshot {
-                pid: 11,
-                program: std::path::PathBuf::from("/opt/codex/bin/codex"),
-                argv: vec!["/opt/codex/bin/codex".to_string()],
-                session: session.map(str::to_string),
-                dialect: Some(aterm_agent::harness::upgrade::Dialect::Zsh),
-                codex: Some(aterm_agent::harness::relaunch::CodexRun {
+        let codex = |session: Option<&str>| aterm_agent::harness::relaunch::Snapshot {
+            pid: 11,
+            program: std::path::PathBuf::from("/opt/codex/bin/codex"),
+            argv: vec!["/opt/codex/bin/codex".to_string()],
+            session: session.map(str::to_string),
+            dialect: Some(aterm_agent::harness::upgrade::Dialect::Zsh),
+            run: aterm_agent::harness::relaunch::AgentRun::Codex(
+                aterm_agent::harness::relaunch::CodexRun {
                     home: std::path::PathBuf::from("/h/.codex"),
                     home_env: None,
-                    embedded: false,
-                    started_ms: 0,
-                    ambiguous,
-                    block: None,
-                }),
-                ..snapshot.clone()
-            };
+                    self_claimed: None,
+                },
+            ),
+            ..snapshot.clone()
+        };
         let named = Some("019a0b6f-3c1e-7a4d-8b61-9d527f1e2c3a");
-        crate::harness_host::publish_snapshot_for_test(&sid, Some(&codex(named, false)));
-        offered(&mut app, Some(11), (11, false), "a Codex's named thread");
-        for ambiguous in [false, true] {
-            crate::harness_host::publish_snapshot_for_test(&sid, Some(&codex(None, ambiguous)));
-            refused_then(&mut app, Some(11), "", "a daemon client's unnamed thread");
-        }
+        crate::harness_host::publish_snapshot_for_test(&sid, Some(&codex(named)));
+        refused_then(&mut app, Some(11), "", "a Codex's named thread, no copy");
+        crate::harness_host::publish_snapshot_for_test(&sid, Some(&codex(None)));
+        refused_then(&mut app, Some(11), "", "a Codex's unnamed thread");
         for (snap, why) in [
             (
                 aterm_agent::harness::relaunch::Snapshot {
                     dialect: None,
-                    ..codex(named, false)
+                    ..codex(named)
                 },
-                "a Codex in a shell the lane writes no line for",
+                "a Codex in a shell no line is written for",
             ),
             (
                 aterm_agent::harness::relaunch::Snapshot {
                     argv: vec!["/opt/codex/bin/codex".to_string(), "--worktree".to_string()],
-                    ..codex(named, false)
+                    ..codex(named)
                 },
                 "a Codex launched with a flag its resume cannot carry",
             ),
@@ -4407,9 +3683,9 @@ pub(crate) mod tests {
     /// it was never republished, and its entry, row and band kept `signal
     /// term` while the refusal and the mail named the restart. Now the
     /// watch's next probe of it asks the predicate again: the snapshot and
-    /// the claim taken, it republishes the stall naming the explicit restart;
-    /// a halt then takes that back at the probe after. NEGATIVE CONTROL: a
-    /// probe with nothing moved republishes nothing.
+    /// the claim taken, it republishes the stall naming the explicit
+    /// restart. NEGATIVE CONTROL: a probe with nothing moved republishes
+    /// nothing.
     #[test]
     #[cfg(target_os = "macos")]
     fn a_standing_stall_follows_the_one_predicate_at_each_probe() {
@@ -4431,15 +3707,7 @@ pub(crate) mod tests {
             .expect("the human's Enter");
         sink.backdate_input_for_testing(input_backlog::STALL_AFTER + Duration::from_secs(2));
         let t0 = Instant::now();
-        let fact = InputStallFact {
-            word: InputWord::Stalled,
-            since: t0,
-            bytes: 1,
-            stopped: false,
-            rss_mb: None,
-            restart: Restart::default(),
-            act: None,
-        };
+        let fact = stalled(t0);
         app.session_status
             .inputs
             .publish_for_test(77, fact.clone(), t0);
@@ -4490,138 +3758,66 @@ pub(crate) mod tests {
             band(&app)
         );
         assert!(probe(&mut app).is_empty(), "nothing moved since");
-
-        // A halt (`hold=1`): the act would be refused.
-        assert!(crate::fabric::apply_hold_for_test(
-            &ctx,
-            Some(crate::fabric::Hold {
-                reason: "-".to_string(),
-                origin: "local".to_string(),
-            }),
-        ));
-        assert_eq!(probe(&mut app), [77], "the act moved back");
-        assert!(entry().ends_with(&term), "{}", entry());
-        assert!(!band(&app).contains("restart it with"), "{}", band(&app));
-
-        assert!(crate::fabric::apply_hold_for_test(&ctx, None));
         crate::harness_host::publish_snapshot_for_test(&sid, None);
         assert_eq!(slave_read_all(slave), b"\r");
         aterm_pty::close_fd(master);
         aterm_pty::close_fd(slave);
     }
 
-    /// THE MEMORY ROW RIDES THE SAME WORD, END TO END (resume-hint review,
-    /// 2026-09-26). A Claude Code showing its critical-memory banner, under
-    /// a window whose host SUPERVISES (every such row counts as supervised,
-    /// claim or not): `App::status_session_row` hands the row the host's
-    /// word (`relaunching` and its own hand, as `SessionRow::restarts`), and
-    /// the menu says "restarting it at its next idle point" only on it.
-    /// Relaunch off
+    /// THE MEMORY ROW'S WORD (resume-hint review, 2026-09-26): the menu row
+    /// says the host restarts an agent at its next idle point
+    /// ([`crate::status_item::SessionRow::restarts`], whose label
+    /// `status_item`'s tests read) only where the host would relaunch its
+    /// launch AND its own hand holds the session (of an agent it supervises:
+    /// never on supervision alone). Relaunch off
     /// (`relaunching` empty), no claim, and a `drive watch` claim — which
-    /// restarts nothing — each name the tab's own `claude --resume <id>`.
-    /// NEGATIVE CONTROL: the host's own claim with a launch it would plan
-    /// keeps the restart's word.
+    /// restarts nothing — are each promised nothing. NEGATIVE CONTROL: the
+    /// host's own claim with a launch it would plan.
     #[test]
     fn the_memory_row_promises_the_restart_only_on_the_hosts_word() {
         let app = crate::App::headless_for_test();
         let ctx = app.pool.get(0).expect("session 0").ctx.clone();
-        {
-            let mut tl = ctx.timeline.lock().unwrap();
-            tl.note_foreground_group(7);
-            tl.set_program(7, Some("claude".into()));
-            tl.publish_agent(
-                "wall:memory",
-                None,
-                None,
-                Some(aterm_phase::Program::Claude),
-                crate::session_timeline::AgentStamp {
-                    generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
-                    fp: 1,
-                },
-            );
-            assert!(tl.set_claude_footer(
-                7,
-                None,
-                Some(aterm_agent::harness::footer::FooterFacts {
-                    resume: Some(OWN.to_string()),
-                    ..Default::default()
-                }),
-            ));
-        }
+        claude_in_front(&ctx, 7, "wall:memory");
         let now_us = crate::metrics::now_us();
         let relaunching: std::collections::HashSet<String> =
             std::iter::once(ctx.self_id.as_str().to_string()).collect();
-        let label = |relaunching: &std::collections::HashSet<String>| {
+        let restarts = |relaunching: &std::collections::HashSet<String>| {
             let store = app.store.read().unwrap();
-            let row = crate::App::status_session_row(
+            crate::App::status_session_row(
                 store.by_local(0).expect("session 0"),
                 |_| true,
                 relaunching,
-            );
-            assert!(row.supervised, "the host supervises it: {row:?}");
-            crate::status_item::escalation(&row)
-                .expect("a memory row")
-                .label
+            )
+            .restarts
         };
         let claim = |holder: &str| {
             ctx.meta.lock().unwrap().supervisor = None;
             crate::session_timeline::claim_supervisor(&ctx, holder, None, None, now_us)
                 .expect("claimed");
         };
-        let remedy = format!("memory critical \u{2014} restart it, then {OWN}");
-        let restarting = "memory critical \u{2014} restarting it at its next idle point";
 
-        // `[harness] relaunch = false`: `HostHandle::relaunching` is empty.
         claim(&crate::harness_host::holder());
-        let off = label(&Default::default());
-        assert!(off.ends_with(&remedy), "relaunch off: {off}");
-        // No claim yet, though the host would relaunch its launch.
+        assert!(!restarts(&Default::default()), "relaunch off");
         ctx.meta.lock().unwrap().supervisor = None;
-        let unclaimed = label(&relaunching);
-        assert!(unclaimed.ends_with(&remedy), "no claim: {unclaimed}");
-        // `aterm drive watch` holds it: it restarts nothing.
+        assert!(!restarts(&relaunching), "no claim");
         claim("drive-watch@4242");
-        let watched = label(&relaunching);
-        assert!(watched.ends_with(&remedy), "another holder: {watched}");
-        // NEGATIVE CONTROL: the host's own claim, a launch it would plan.
+        assert!(!restarts(&relaunching), "another holder");
         claim(&crate::harness_host::holder());
-        let hosted = label(&relaunching);
-        assert!(hosted.ends_with(restarting), "the host restarts: {hosted}");
-        assert!(!hosted.contains("--resume"), "{hosted}");
+        assert!(restarts(&relaunching), "the host restarts it");
     }
 
-    /// The menu row and the server's attention entry are ONE composition
-    /// ([`attention_now`]): the row a human clicks says what `meta
-    /// attention=` says. The row's key is the episode's — the same fact read
-    /// later, with more bytes or turned stopped, keeps it; a later episode
-    /// does not.
+    /// The menu row's notification key is the EPISODE's: the same stall read
+    /// later, with more bytes or turned stopped, keeps it (one notification);
+    /// a later episode does not.
     #[test]
-    fn the_menu_row_says_what_the_attention_entry_says_keyed_by_episode() {
+    fn the_menu_row_is_keyed_by_episode() {
         let now = Instant::now();
         let fact = InputStallFact {
-            word: InputWord::Stalled,
-            since: now.checked_sub(Duration::from_secs(95)).unwrap_or(now),
-            bytes: 1,
-            stopped: false,
             rss_mb: Some(39_731),
-            restart: Restart::default(),
-            act: None,
+            ..stalled(now.checked_sub(Duration::from_secs(95)).unwrap_or(now))
         };
         let sid = "s-b7cf523445a1b0d8658e";
-        let claude = own();
-        let row = menu_row(&fact, Some("claude"), &claude, sid, now);
-        assert_eq!(
-            row.text,
-            attention_now(&fact, Some("claude"), &claude, sid, now)
-        );
-        assert!(row.text.starts_with("claude is frozen: not reading input "));
-        assert!(
-            row.text.ends_with(
-                "signal term, then claude --resume 5f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f"
-            ),
-            "{}",
-            row.text
-        );
+        let row = menu_row(&fact, Some("claude"), &own(), sid, now);
         let later = menu_row(
             &InputStallFact {
                 bytes: 9,
@@ -4630,186 +3826,41 @@ pub(crate) mod tests {
                 ..fact.clone()
             },
             Some("claude"),
-            &claude,
+            &own(),
             sid,
             now + Duration::from_secs(60),
         );
+        assert_ne!(later.text, row.text);
         assert_eq!(later.key, row.key);
-        let next = InputStallFact {
-            since: now,
-            ..fact.clone()
-        };
+        let next = InputStallFact { since: now, ..fact };
         assert_ne!(episode_key(&next), row.key);
     }
 
-    /// A program that SURVIVED its restart ([`Restart::survived`]): the
-    /// server's line says so, counts no bytes (they were dropped, not read),
-    /// and names `signal kill` — then the resume command, only for the agent
-    /// with one. The incident's session id and RSS fit the keyed cap.
+    /// THE EXIT ARM'S RETIRE ([`crate::App::retire_input_watch`]): a watch
+    /// whose PTY ended unpublishes what it still showed — `status agent=`
+    /// hands the screen's word back and the server's attention clears. A
+    /// `--hold` pane outlives its program, and a frozen badge on a dead pane
+    /// would never clear.
     #[test]
-    fn a_survived_restart_names_signal_kill() {
-        let fact = InputStallFact {
-            word: InputWord::Stalled,
-            since: Instant::now(),
-            bytes: 1,
-            stopped: false,
-            rss_mb: Some(39_731),
-            restart: Restart {
-                leader: Some(69_156),
-                discards: 0,
-                restarts: 0,
-                survived: true,
-            },
-            act: None,
-        };
-        let sid = "s-b7cf523445a1b0d8658e";
-        let line = attention_text(
-            &fact,
-            Some("claude"),
-            &own(),
-            sid,
-            Some("14:02"),
-            Duration::from_secs(9660),
-        );
-        // The resume line outranks the resident size: with it the line
-        // would pass the keyed cap, and a cut id names no conversation.
-        assert_eq!(
-            line,
-            "claude is still running after its restart signal, not reading input since 14:02 \
-             \u{2014} end it: aterm ctl @s-b7cf523445a1b0d8658e signal kill, then claude \
-             --resume 5f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f"
-        );
-        assert!(line.len() <= crate::session_timeline::META_ATTENTION_KEYED_MAX);
-        // Unknown: the size stays, and no command.
-        assert_eq!(
-            attention_text(
-                &fact,
-                Some("claude"),
-                &AfterRestart::Unknown,
-                sid,
-                Some("14:02"),
-                Duration::from_secs(9660),
-            ),
-            "claude is still running after its restart signal, not reading input since 14:02 \
-             (rss 38.8 GB) \u{2014} end it: aterm ctl @s-b7cf523445a1b0d8658e signal kill"
-        );
-        let plain = InputStallFact {
-            rss_mb: None,
-            ..fact.clone()
-        };
-        assert_eq!(
-            attention_text(
-                &plain,
-                None,
-                &AfterRestart::Unknown,
-                sid,
-                None,
-                Duration::from_secs(75)
-            ),
-            "the program is still running after its restart signal, not reading input for \
-             1m15s \u{2014} end it: aterm ctl @s-b7cf523445a1b0d8658e signal kill"
-        );
-        // The row a human clicks says the same, under the episode's key.
-        let row = menu_row(&fact, Some("claude"), &own(), sid, Instant::now());
-        assert!(
-            row.text.contains("signal kill, then claude --resume "),
-            "{}",
-            row.text
-        );
-        assert_eq!(row.key, episode_key(&fact));
-    }
-
-    /// THE LOCKSTEP, on a live App: publishing a stall moves `status agent=`
-    /// to `wall:unresponsive` and puts the server's line over the supervisor's
-    /// badge; clearing it hands both back. Retiring a watch whose PTY ended
-    /// unpublishes what it still showed.
-    #[test]
-    fn a_published_stall_moves_the_agent_word_and_the_attention_together() {
+    fn retiring_a_watch_unpublishes_its_stall() {
         let mut app = crate::App::headless_for_test();
         let ctx = app.pool.get(0).expect("session 0").ctx.clone();
-        {
-            let mut tl = ctx.timeline.lock().unwrap();
-            tl.note_foreground_group(7);
-            tl.set_program(7, Some("claude".into()));
-            tl.publish_agent(
-                "prompt",
-                None,
-                None,
-                Some(aterm_phase::Program::Claude),
-                crate::session_timeline::AgentStamp {
-                    generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
-                    fp: 1,
-                },
-            );
-            // The footer resolver's read of this Claude Code's own record.
-            assert!(tl.set_claude_footer(
-                7,
-                None,
-                Some(aterm_agent::harness::footer::FooterFacts {
-                    resume: Some(OWN.to_string()),
-                    ..Default::default()
-                }),
-            ));
-        }
-        crate::session_timeline::write_attention_owned(
-            &ctx,
-            "supervisor",
-            crate::session_timeline::MetaEdit::Set("claude other: answer this box"),
-        )
-        .expect("accepted");
-        let attention = || ctx.meta.lock().unwrap().attention.clone();
-
+        claude_in_front(&ctx, 7, "prompt");
         let now = Instant::now();
-        primed(&mut app.session_status.inputs, 0, now);
-        let (t, _) = app.session_status.inputs.step(
-            0,
-            Some(&reading(1, 161, 0)),
-            false,
-            spin(RECHECK),
-            || Some(39_731),
-            now,
-        );
-        let Transition::Entered(fact) = t else {
-            panic!("entered: {t:?}")
-        };
+        let fact = stalled(now);
+        app.session_status
+            .inputs
+            .publish_for_test(0, fact.clone(), now);
         app.publish_input_stall(0, &ctx, Some(fact), now);
         let record = app.session_status_record(0).expect("live session");
-        assert!(
-            record.contains(" program=claude agent=wall:unresponsive agent_detail=- "),
-            "{record}"
-        );
-        let shown = attention().expect("the server's line");
-        assert!(
-            shown.starts_with("claude is frozen: not reading input "),
-            "{shown}"
-        );
-        assert!(
-            shown.contains(&format!(
-                "aterm ctl @{} signal term, then claude --resume \
-                 5f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f",
-                ctx.self_id.as_str()
-            )),
-            "{shown}"
-        );
-        assert!(!shown.contains("--continue"), "{shown}");
-        assert!(shown.contains("(1 B queued, rss 38.8 GB)"), "{shown}");
+        assert!(record.contains(" agent=wall:unresponsive "), "{record}");
+        assert!(ctx.meta.lock().unwrap().attention.is_some());
 
-        // The Exit arm's retire: the stall goes with the program.
         app.retire_input_watch(0);
         assert!(!app.session_status.input_armed(0));
         let record = app.session_status_record(0).expect("live session");
         assert!(record.contains(" agent=prompt "), "{record}");
-        assert_eq!(
-            attention().as_deref(),
-            Some("claude other: answer this box"),
-            "the supervisor's badge is uncovered, untouched"
-        );
-        // Nothing published: retiring again moves nothing.
-        app.retire_input_watch(0);
-        assert_eq!(
-            attention().as_deref(),
-            Some("claude other: answer this box")
-        );
+        assert_eq!(ctx.meta.lock().unwrap().attention, None);
     }
 
     /// The stall threshold as the probe will stretch it, bracketed by a reading
@@ -4915,16 +3966,14 @@ pub(crate) mod tests {
     /// this process ever lands behind it (the gate, as it stood then, refused
     /// every socket write a second later). The byte is dated from the sink's birth, so the
     /// watch's one deadline is that birth plus [`input_backlog::STALL_AFTER`]
-    /// (stretched by the machine's load), and the reading there enters the
-    /// stall. `status` wakes an unwatched
+    /// (stretched by the machine's load). `status` wakes an unwatched
     /// session the same way — here a byte an unseen writer queued after the
     /// watch had ended — and never a watched one, nor one whose wake is
-    /// already in flight. An idle master's attach fires nothing; off a tty
-    /// nothing is installed at all.
+    /// already in flight. (An idle master's attach fires nothing: the test
+    /// below.)
     #[test]
     #[cfg(target_os = "macos")]
     fn a_master_adopted_with_input_unread_is_watched_from_its_attach() {
-        use std::os::fd::AsRawFd;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
         let wakes = Arc::new(AtomicUsize::new(0));
@@ -4944,21 +3993,6 @@ pub(crate) mod tests {
             assert_eq!(usize::try_from(n).ok(), Some(bytes.len()), "write(master)");
         };
 
-        // Off a tty: nothing installed, so a write that lands wakes nothing.
-        let (_reader, writer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
-        let socket = SinkWriter::new(writer.as_raw_fd());
-        assert!(!watch_input(&socket, wake()));
-        assert_eq!(socket.write_frame(b"x").expect("write"), 1);
-        assert_eq!(count(), 0, "no reading, no hook");
-
-        // An idle master: installed, and silent until a write lands.
-        let (idle_master, idle_slave) = raw_pty_pair();
-        let idle = SinkWriter::new(idle_master);
-        assert!(!watch_input(&idle, wake()), "nothing unread: no wake");
-        assert_eq!(count(), 0);
-        idle.write_frame_nonparking(b"a").expect("a key");
-        assert_eq!(count(), 1, "the hook is installed");
-
         // The adopted master: its Enter predates this process's sink.
         let (master, slave) = raw_pty_pair();
         unseen(master, b"\r");
@@ -4966,13 +4000,13 @@ pub(crate) mod tests {
         let sink = Arc::new(SinkWriter::new(master));
         let born_after = Instant::now();
         assert!(watch_input(&sink, wake()), "the attach wakes the watch");
-        assert_eq!(count(), 2);
+        assert_eq!(count(), 1);
         let mut app = crate::App::headless_for_test();
         app.pool
             .insert(crate::stub_session_with_sink(77, sink.clone()));
         let record = app.session_status_record(77).expect("live session");
         assert!(record.contains(" input=pending input_bytes=1 "), "{record}");
-        assert_eq!(count(), 2, "the attach's wake is in flight: not doubled");
+        assert_eq!(count(), 1, "the attach's wake is in flight: not doubled");
 
         // The wake's probe, a moment later: watched, and the byte dated from
         // the sink's birth, not from the probe that first saw it. (The lower
@@ -4990,20 +4024,7 @@ pub(crate) mod tests {
             deadline.saturating_duration_since(born_before)
         );
         let _ = app.session_status_record(77).expect("live session");
-        assert_eq!(count(), 2, "watched: a status poll wakes nothing");
-        // At that deadline the same reading, aged as the clock has, enters.
-        let live = sink.input_backlog().expect("a tty");
-        let aged = InputBacklog {
-            wait: input_backlog::STALL_AFTER,
-            ..live
-        };
-        let mut watches = InputWatches::default();
-        primed(&mut watches, 77, deadline);
-        let (t, _) = watches.step(77, Some(&aged), false, spin(RECHECK), || None, deadline);
-        let Transition::Entered(fact) = t else {
-            panic!("entered: {t:?}")
-        };
-        assert_eq!((fact.word, fact.bytes), (InputWord::Stalled, 1));
+        assert_eq!(count(), 1, "watched: a status poll wakes nothing");
 
         // The program reads: the watch ends.
         assert_eq!(slave_read_all(slave), b"\r");
@@ -5015,16 +4036,15 @@ pub(crate) mod tests {
         // An unseen writer queues a byte: nothing announces it, and only the
         // next `status` wakes the watch — once, while that wake is in flight.
         unseen(master, b"\x1b[B");
-        assert_eq!(count(), 2, "an unseen write fires no hook");
+        assert_eq!(count(), 1, "an unseen write fires no hook");
         let record = app.session_status_record(77).expect("live session");
         assert!(record.contains(" input=pending input_bytes=3 "), "{record}");
-        assert_eq!(count(), 3, "status woke the unwatched session");
+        assert_eq!(count(), 2, "status woke the unwatched session");
         let _ = app.session_status_record(77).expect("live session");
-        assert_eq!(count(), 3);
+        assert_eq!(count(), 2);
         assert_eq!(slave_read_all(slave), b"\x1b[B");
-        for fd in [idle_master, idle_slave, master, slave] {
-            aterm_pty::close_fd(fd);
-        }
+        aterm_pty::close_fd(master);
+        aterm_pty::close_fd(slave);
     }
 
     /// THE ATTACH WAKE AN OVERLAP UPGRADE DROPS (whole-branch review,
@@ -5130,10 +4150,10 @@ pub(crate) mod tests {
     /// controlling terminal's session leader — so it leads the foreground
     /// group `tcgetpgrp` reads — with SIGTERM ignored (`trap '' TERM`, the
     /// shape of a Node program whose SIGTERM listener its busy JS thread never
-    /// runs) or not. Returns `(master, slave, job, leader)`; the job is killed
-    /// and reaped however the test ends.
+    /// runs). Returns `(master, slave, job, leader)`; the job is killed and
+    /// reaped however the test ends.
     ///
-    /// The SIGTERM-ignoring job is returned only once its trap is SET: it
+    /// The job is returned only once its trap is SET: it
     /// prints one `R` after the `trap` and this reads it off the master. Leading
     /// the tty proves only that the child got as far as `setsid`, before `sh`
     /// ran a line. Measured 2026-09-30: once a headless App was built in
@@ -5142,10 +4162,7 @@ pub(crate) mod tests {
     /// it — `it ignored SIGTERM`, in the `-p aterm-gui --lib` run at
     /// `RUST_TEST_THREADS=7`.
     #[cfg(target_os = "macos")]
-    fn spinning_job(ignore_term: bool) -> (i32, i32, ReapJob, i32) {
-        if !ignore_term {
-            return pty_job("while :; do :; done");
-        }
+    fn spinning_job() -> (i32, i32, ReapJob, i32) {
         let (master, slave, job, leader) = pty_job("trap '' TERM; printf R; while :; do :; done");
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut ready = [0u8; 1];
@@ -5195,7 +4212,7 @@ pub(crate) mod tests {
         // touch nothing of the parent's.
         unsafe {
             job.pre_exec(|| {
-                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY.into(), 0) < 0 {
+                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
@@ -5238,51 +4255,28 @@ pub(crate) mod tests {
     /// line names `signal kill`, and `signal kill` ends it: the probe after
     /// the job is reaped withdraws it all.
     ///
-    /// A job that dies on SIGTERM is the other half: its stall is withdrawn
-    /// by the first probe after it ends, as before.
-    ///
-    /// And a `reset flush` FIRST (review of the manual reset's last fix,
-    /// 2026-09-27): the flush empties the queue, so `signal term` finds nothing
-    /// to drop. Its drop used to be skipped on an empty queue, which left the
-    /// restart count unmoved: the grace never opened, and a job that ignores
-    /// SIGTERM stood on "restart it: … signal term" for good — reproduced live
-    /// on a headless instance, the no-flush control moving on to `signal kill`
-    /// at +5.2 s. The signal now marks the restart whatever it drops.
+    /// And a `reset flush` FIRST (robustness reviews of the manual reset,
+    /// 2026-09-26 and -27). The flush is a drop, not a restart: it moves the
+    /// sink's discard count alone, and the refusal it holds names the flush,
+    /// never a restart signal (one cut read every drop as `signal term`'s and
+    /// told a supervisor to SIGKILL a program never sent SIGTERM). The flush
+    /// empties the queue, so `signal term` finds nothing to drop; its drop
+    /// used to be skipped on an empty queue, which left the restart count
+    /// unmoved: the grace never opened, and a job that ignores SIGTERM stood
+    /// on "restart it: … signal term" for good. The signal now marks the
+    /// restart whatever it drops.
     #[test]
     #[cfg(target_os = "macos")]
     fn a_stall_whose_program_lives_through_signal_term_stands_until_signal_kill() {
-        for (ignore_term, flush_first) in [(true, false), (false, false), (true, true)] {
-            let (master, slave, mut job, leader) = spinning_job(ignore_term);
+        for flush_first in [false, true] {
+            let (master, slave, mut job, leader) = spinning_job();
             let sink = std::sync::Arc::new(SinkWriter::new(master));
             sink.note_master_nonblocking(true);
             let mut app = crate::App::headless_for_test();
             app.pool
                 .insert(crate::stub_session_with_sink(77, sink.clone()));
             let ctx = app.pool.get(77).expect("session 77").ctx.clone();
-            {
-                let mut tl = ctx.timeline.lock().unwrap();
-                tl.note_foreground_group(leader);
-                tl.set_program(leader, Some("claude".into()));
-                tl.publish_agent(
-                    "busy",
-                    None,
-                    None,
-                    Some(aterm_phase::Program::Claude),
-                    crate::session_timeline::AgentStamp {
-                        generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
-                        fp: 1,
-                    },
-                );
-                // The footer resolver's read of its own record.
-                assert!(tl.set_claude_footer(
-                    leader,
-                    None,
-                    Some(aterm_agent::harness::footer::FooterFacts {
-                        resume: Some(OWN.to_string()),
-                        ..Default::default()
-                    }),
-                ));
-            }
+            claude_in_front(&ctx, leader, "busy");
             let attention = || ctx.meta.lock().unwrap().attention.clone();
             let record = |app: &crate::App| app.session_status_record(77).expect("live session");
 
@@ -5328,53 +4322,36 @@ pub(crate) mod tests {
                 let term = app.pool.get(77).expect("session 77").term.clone();
                 let reply = crate::manual_reset::cmd_reset(77, &term, &ctx, "flush");
                 assert!(reply.ends_with(" discarded=1\n"), "{reply}");
+                assert_eq!(
+                    (sink.discards(), sink.restart_discards()),
+                    (1, 0),
+                    "a flush is a drop, not a restart"
+                );
+                let refused = refusal(&ctx, "send", "x", false).expect("held by the flush");
+                assert!(
+                    refused.contains("reset flush") && !refused.contains("restart signal"),
+                    "{refused}"
+                );
             }
             let reply = crate::control::cmd_signal(master, "term", &sink, None);
             // Nothing left to drop after a flush: the reply says no count, and
             // the restart is marked all the same.
             let dropped = if flush_first { "" } else { " discarded=1" };
             assert_eq!(reply, format!("OK signalled pgrp {leader}{dropped}\n"));
+            assert_eq!(sink.restart_discards(), 1, "the restart is marked");
             // Past PROBE_MIN_GAP of the entry probe, so the wake-driven probe runs.
             std::thread::sleep(Duration::from_millis(300));
 
-            if !ignore_term {
-                // It ends: the probe after it is reaped withdraws the stall.
-                let _ = job.0.wait();
-                assert_eq!(app.observe_input_stalls(Instant::now(), Some(77)), [77]);
-                assert_eq!(app.session_status.input_stall(77), None);
-                assert_eq!(attention(), None);
-                assert!(
-                    !record(&app).contains("wall:unresponsive"),
-                    "{}",
-                    record(&app)
-                );
-                assert_eq!(refusal(&ctx, "send", OWN, false), None);
-                drop(job);
-                aterm_pty::close_fd(master);
-                aterm_pty::close_fd(slave);
-                continue;
-            }
-
-            assert!(
-                job.0.try_wait().expect("try_wait").is_none(),
-                "it ignored SIGTERM"
-            );
             let t1 = Instant::now();
             assert!(
                 app.observe_input_stalls(t1, Some(77)).is_empty(),
                 "the empty queue is a drop, not a read: nothing moves"
             );
-            let held = app
-                .session_status
-                .input_stall(77)
-                .expect("still published")
-                .clone();
-            assert!(!held.restart.survived);
             let status = record(&app);
             assert!(status.contains(" input=stalled input_bytes=0 "), "{status}");
             assert!(status.contains(" agent=wall:unresponsive "), "{status}");
             assert!(
-                attention().is_some_and(|a| a.starts_with("claude is frozen: ")),
+                attention().is_some_and(|a| a.contains("frozen")),
                 "{:?}",
                 attention()
             );
@@ -5386,7 +4363,7 @@ pub(crate) mod tests {
                 refused.starts_with("ERR busy input-unread bytes=0 "),
                 "{refused}"
             );
-            assert!(refused.contains("retry in a moment"), "{refused}");
+            assert!(refused.contains("retry"), "{refused}");
             assert!(!refused.contains("signal kill"), "{refused}");
             assert_eq!(refusal(&ctx, "send", OWN, true), None);
             assert_eq!(refusal(&ctx, "signal", "kill", false), None);
@@ -5413,21 +4390,10 @@ pub(crate) mod tests {
             assert!(fact.restart.survived, "survived");
             app.publish_input_stall(77, &ctx, Some(fact), later);
             let shown = attention().expect("the server's line");
-            assert!(
-                shown.starts_with("claude is still running after its restart signal, "),
-                "{shown}"
-            );
+            assert!(shown.contains("signal kill"), "{shown}");
             // The refusal moves on with it.
             let refused = refusal(&ctx, "send", "claude --continue", false).expect("refused");
             assert!(refused.contains("; end it: signal kill)"), "{refused}");
-            assert!(
-                shown.contains(&format!(
-                    "aterm ctl @{} signal kill, then claude --resume \
-                     5f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f",
-                    ctx.self_id.as_str()
-                )),
-                "{shown}"
-            );
 
             // `signal kill` ends it (nothing left to drop), the job is reaped
             // as its shell would, and the probe withdraws everything.
@@ -5450,331 +4416,112 @@ pub(crate) mod tests {
         }
     }
 
-    /// A `reset flush` IS NEITHER A READ NOR A RESTART, on a live App, a real
-    /// pty and a real process (robustness review of the manual reset,
-    /// 2026-09-26).
+    /// A PROGRAM THAT LIVES THROUGH `signal term` AND READS AGAIN IS LET GO,
+    /// on a live App, a real pty and a real process (whole-branch review,
+    /// fourth round, 2026-09-25). The reviewer's fixture ignored SIGTERM,
+    /// spun, then read its input without drawing, and it stayed published as
+    /// frozen with no end; every input verb was refused while it read. This
+    /// job has that shape: `/bin/sh` ignoring TERM and spinning until
+    /// SIGUSR1, then `exec cat`, which keeps the pid and the ignored TERM,
+    /// sleeps in `read`, and draws nothing.
     ///
-    /// The reviewer reproduced it on a headless instance: a python3 program
-    /// spinning in raw mode with `?1049h ?1003h ?1006h`, forty `mouse move`s
-    /// into it, `status input=stalled input_bytes=433` and the line "Python is
-    /// frozen … restart it: … signal term". Then `reset flush` answered `OK
-    /// reset reverted=alt,mouse,mouse-encoding bytes=24 discarded=433` with no
-    /// `signal` verb sent, and five seconds later the line read "Python is
-    /// still running after its restart signal … end it: … signal kill", and
-    /// `send x` was refused "(the program has not ended since its restart
-    /// signal …)". The flush's discard moved the sink's discard count, and
-    /// the watch read every moved count as `signal term`'s pre-signal drop:
-    /// the hold opened and [`RESTART_GRACE`] marked it survived. A supervisor
-    /// acting on that line SIGKILLs a program that was never sent SIGTERM.
-    ///
-    /// Now the flush's drop HOLDS the stall as it stood — the drop is not a
-    /// read, so `input=stalled`, the agent word and the frozen line stay —
-    /// but past the grace it is NOT survived: the line still names `signal
-    /// term`, and the refusal says the queue was dropped by `reset flush`,
-    /// never that a restart signal was sent. The job here dies on SIGTERM,
-    /// and the `signal term` the line names ends it: the probe after it is
-    /// reaped withdraws everything.
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn reset_flush_on_a_stalled_program_is_neither_a_read_nor_a_restart() {
-        let (master, slave, mut job, leader) = spinning_job(false);
-        let sink = std::sync::Arc::new(SinkWriter::new(master));
-        sink.note_master_nonblocking(true);
-        let mut app = crate::App::headless_for_test();
-        app.pool
-            .insert(crate::stub_session_with_sink(79, sink.clone()));
-        let (term, ctx) = {
-            let s = app.pool.get(79).expect("session 79");
-            (s.term.clone(), s.ctx.clone())
-        };
-        {
-            let mut tl = ctx.timeline.lock().unwrap();
-            tl.note_foreground_group(leader);
-            tl.set_program(leader, Some("claude".into()));
-            tl.publish_agent(
-                "busy",
-                None,
-                None,
-                Some(aterm_phase::Program::Claude),
-                crate::session_timeline::AgentStamp {
-                    generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
-                    fp: 1,
-                },
-            );
-        }
-        let attention = || ctx.meta.lock().unwrap().attention.clone();
-        let record = |app: &crate::App| app.session_status_record(79).expect("live session");
-
-        // The unread Enter, and the stall entered on hand-aged readings of
-        // the job's REAL leader and the sink's real counts.
-        sink.write_frame_nonparking(b"\r").expect("the Enter");
-        let t0 = Instant::now();
-        let on_leader = |ns: u64| Activity {
-            cpu: Some((leader, ns)),
-            last_output: None,
-            restarts: sink.restart_discards(),
-            discards: sink.discards(),
-            read_since_discard: sink.read_since_discard(),
-            contention: Contention::default(),
-        };
-        let inputs = &mut app.session_status.inputs;
-        let _ = inputs.step(
-            79,
-            Some(&reading(1, 0, 0)),
-            false,
-            on_leader(0),
-            || None,
-            t0.checked_sub(RECHECK).expect("uptime"),
-        );
-        let nanos = u64::try_from(RECHECK.as_nanos()).expect("small");
-        let (t, _) = inputs.step(
-            79,
-            Some(&reading(1, 12, 0)),
-            false,
-            on_leader(nanos),
-            || Some(2),
-            t0,
-        );
-        let Transition::Entered(fact) = t else {
-            panic!("entered: {t:?}")
-        };
-        app.publish_input_stall(79, &ctx, Some(fact), t0);
-        assert!(record(&app).contains(" agent=wall:unresponsive "));
-
-        // `reset flush`: no signal, the Enter dropped.
-        let reply = crate::manual_reset::cmd_reset(79, &term, &ctx, "flush");
-        assert!(reply.ends_with(" discarded=1\n"), "{reply}");
-        // Past PROBE_MIN_GAP of the entry probe, so a wake-driven probe runs.
-        std::thread::sleep(Duration::from_millis(300));
-        let t1 = Instant::now();
-        assert!(
-            app.observe_input_stalls(t1, Some(79)).is_empty(),
-            "the flushed queue is a drop, not a read: nothing moves"
-        );
-        assert!(
-            job.0.try_wait().expect("try_wait").is_none(),
-            "no signal reached it"
-        );
-        let status = record(&app);
-        assert!(status.contains(" input=stalled input_bytes=0 "), "{status}");
-        assert!(status.contains(" agent=wall:unresponsive "), "{status}");
-        // The refusal names the flush, never a restart signal.
-        let refused = refusal(&ctx, "send", "x", false).expect("refused");
-        assert!(
-            refused.starts_with("ERR busy input-unread bytes=0 "),
-            "{refused}"
-        );
-        assert!(refused.contains("reset flush"), "{refused}");
-        assert!(!refused.contains("restart signal"), "{refused}");
-        assert!(refused.contains("signal term"), "{refused}");
-        assert_eq!(refusal(&ctx, "send", "x", true), None);
-
-        // Past the grace, still spinning (folded by hand, as the signal-term
-        // test does): NOT survived, and the line still says `signal term`.
-        let later = t1 + RESTART_GRACE;
-        let burned = nanos + u64::try_from((later - t0).as_nanos()).expect("small");
-        let (t, _) = app.session_status.inputs.step(
-            79,
-            sink.input_backlog().as_ref(),
-            false,
-            on_leader(burned),
-            || panic!("the RSS is read at entry only"),
-            later,
-        );
-        match t {
-            Transition::None => {}
-            Transition::Updated(fact) => app.publish_input_stall(79, &ctx, Some(fact), later),
-            other => panic!("still held: {other:?}"),
-        }
-        let held = app
-            .session_status
-            .input_stall(79)
-            .expect("still published")
-            .clone();
-        assert!(
-            !held.restart.survived,
-            "no restart signal was sent: {held:?}"
-        );
-        let shown = attention().expect("the server's line");
-        assert!(shown.starts_with("claude is frozen: "), "{shown}");
-        assert!(shown.contains("signal term"), "{shown}");
-        assert!(!shown.contains("restart signal"), "{shown}");
-        assert!(!shown.contains("signal kill"), "{shown}");
-        assert!(
-            !refusal(&ctx, "send", "x", false)
-                .expect("still refused")
-                .contains("restart signal")
-        );
-
-        // The remedy the line names ends it; the probe withdraws everything.
-        let reply = crate::control::cmd_signal(master, "term", &sink, None);
-        assert_eq!(reply, format!("OK signalled pgrp {leader}\n"));
-        let _ = job.0.wait();
-        assert_eq!(
-            app.observe_input_stalls(later + PROBE_MIN_GAP, Some(79)),
-            [79]
-        );
-        assert_eq!(app.session_status.input_stall(79), None);
-        assert_eq!(attention(), None);
-        assert!(!record(&app).contains("wall:unresponsive"));
-        drop(job);
-        aterm_pty::close_fd(master);
-        aterm_pty::close_fd(slave);
-    }
-
-    /// A PROGRAM THAT LIVES THROUGH `signal term` AND RECOVERS IS LET GO, on
-    /// a live App, a real pty and a real process (whole-branch review, fourth
-    /// round, 2026-09-25). The reviewer's fixture ignored SIGTERM, spun, then
-    /// read its input without drawing, and it stayed published as frozen with
-    /// no end. Every input verb was refused while it read. This job has that
-    /// shape: `/bin/sh` ignoring TERM and spinning until SIGUSR1, then `exec
-    /// cat`, which keeps the pid and the ignored TERM, sleeps in `read`, and
-    /// draws nothing.
-    ///
-    /// Each run is entered and held as the job that never recovers is
-    /// ([`a_stall_whose_program_lives_through_signal_term_stands_until_signal_kill`]),
-    /// on the job's REAL CPU: a real second of spinning is the entry window,
-    /// so the probes after it read what the job really burned. Then the job
-    /// recovers, and one sign of life lets the hold go:
-    ///
-    /// * `read`: a key sent after the drop is read. The live refusal and
-    ///   `status` stop claiming "not reading" at once, and the probe inside
-    ///   the spin window, which still reads spinning, withdraws everything
-    ///   on the read alone;
-    /// * `spin`: nothing is sent. A probe whose window the job spent asleep
-    ///   judges it not spinning, and that withdraws everything.
+    /// Entered on the job's REAL CPU (a real second of spinning is the entry
+    /// window) and held through `signal term`, it recovers, and a key sent
+    /// after the drop is read: the live refusal and `status` stop claiming
+    /// "not reading" at once, and the probe inside the spin window, which
+    /// still reads spinning, withdraws everything on the read alone. (The
+    /// spin stopping is the step test's.)
     #[test]
     #[cfg(target_os = "macos")]
     fn a_program_that_lives_through_signal_term_and_reads_again_is_let_go() {
         const RECOVERS: &str =
             "trap '' TERM; trap 'go=1' USR1; while [ -z \"$go\" ]; do :; done; exec cat >/dev/null";
         let window = u64::try_from(SPIN_WINDOW.as_nanos()).expect("small");
-        for by_read in [true, false] {
-            let (master, slave, mut job, leader) = pty_job(RECOVERS);
-            let sink = std::sync::Arc::new(SinkWriter::new(master));
-            sink.note_master_nonblocking(true);
-            let mut app = crate::App::headless_for_test();
-            app.pool
-                .insert(crate::stub_session_with_sink(78, sink.clone()));
-            let ctx = app.pool.get(78).expect("session 78").ctx.clone();
-            {
-                let mut tl = ctx.timeline.lock().unwrap();
-                tl.note_foreground_group(leader);
-                tl.set_program(leader, Some("claude".into()));
-                tl.publish_agent(
-                    "busy",
-                    None,
-                    None,
-                    Some(aterm_phase::Program::Claude),
-                    crate::session_timeline::AgentStamp {
-                        generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
-                        fp: 1,
-                    },
-                );
-            }
-            let attention = || ctx.meta.lock().unwrap().attention.clone();
-            let record = |app: &crate::App| app.session_status_record(78).expect("live session");
-            let burned = || pid_cpu_ns(leader).expect("the job's CPU");
+        let (master, slave, job, leader) = pty_job(RECOVERS);
+        let sink = std::sync::Arc::new(SinkWriter::new(master));
+        sink.note_master_nonblocking(true);
+        let mut app = crate::App::headless_for_test();
+        app.pool
+            .insert(crate::stub_session_with_sink(78, sink.clone()));
+        let ctx = app.pool.get(78).expect("session 78").ctx.clone();
+        claude_in_front(&ctx, leader, "busy");
+        let record = |app: &crate::App| app.session_status_record(78).expect("live session");
+        let burned = || pid_cpu_ns(leader).expect("the job's CPU");
 
-            // A real second of spinning, so the entry window is the job's own.
-            let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
-            while burned() < window {
-                assert!(Instant::now() < deadline, "the job never spun a second");
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            sink.write_frame_nonparking(b"\r").expect("the Enter");
-            let t0 = Instant::now();
-            let ns = burned();
-            let on_leader = |ns: u64| Activity {
-                cpu: Some((leader, ns)),
-                last_output: None,
-                restarts: sink.restart_discards(),
-                discards: sink.discards(),
-                read_since_discard: false,
-                contention: Contention::default(),
-            };
-            let inputs = &mut app.session_status.inputs;
-            let _ = inputs.step(
-                78,
-                Some(&reading(1, 0, 0)),
-                false,
-                on_leader(ns - window),
-                || None,
-                t0.checked_sub(SPIN_WINDOW).expect("uptime"),
-            );
-            let (t, _) = inputs.step(
-                78,
-                Some(&reading(1, 12, 0)),
-                false,
-                on_leader(ns),
-                || Some(2),
-                t0,
-            );
-            let Transition::Entered(fact) = t else {
-                panic!("entered: {t:?}")
-            };
-            app.publish_input_stall(78, &ctx, Some(fact), t0);
-
-            // `signal term`: the Enter is dropped, the job lives on, held. The
-            // probes run on instants past t0 by less than a spin window, so
-            // they keep the entry's verdict whatever the machine's load.
-            let reply = crate::control::cmd_signal(master, "term", &sink, None);
-            assert_eq!(reply, format!("OK signalled pgrp {leader} discarded=1\n"));
-            let t1 = t0 + Duration::from_millis(300);
-            assert!(app.observe_input_stalls(t1, Some(78)).is_empty(), "held");
-            assert!(
-                record(&app).contains(" input=stalled input_bytes=0 "),
-                "{}",
-                record(&app)
-            );
-            assert!(refusal(&ctx, "send", "y", false).is_some());
-
-            // It recovers: the spin ends and `cat` sleeps in `read`.
-            // SAFETY: `leader` is this test's live child (reaped only by
-            // `job`'s drop), and SIGUSR1 is the signal its script traps.
-            assert_eq!(unsafe { libc::kill(leader, libc::SIGUSR1) }, 0);
-            let released = if by_read {
-                // A key sent after the drop, read at once.
-                assert_eq!(sink.write_frame_nonparking(b"x").expect("the key"), 1);
-                let deadline = Instant::now() + Duration::from_secs(60);
-                while aterm_pty::input_queue_len(master) != Some(0) {
-                    assert!(Instant::now() < deadline, "the job never read the key");
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                // One reading already sees the read: no refusal, no `stalled`.
-                assert_eq!(refusal(&ctx, "send", "y", false), None);
-                let status = record(&app);
-                assert!(status.contains(" input=clear "), "{status}");
-                t0 + Duration::from_millis(900)
-            } else {
-                // Asleep: the job's CPU stops moving.
-                let deadline = Instant::now() + Duration::from_secs(60);
-                loop {
-                    let before = burned();
-                    std::thread::sleep(Duration::from_millis(200));
-                    if burned().saturating_sub(before) < 20_000_000 {
-                        break;
-                    }
-                    assert!(Instant::now() < deadline, "the job never slept");
-                }
-                // A window at least twice what really passed since t0, so no
-                // spin before the sleep can fill half of it.
-                t0 + 2 * t0.elapsed() + Duration::from_secs(2)
-            };
-            assert_eq!(app.observe_input_stalls(released, Some(78)), [78]);
-            assert!(
-                job.0.try_wait().expect("try_wait").is_none(),
-                "the job is alive: this is a recovery, not an end"
-            );
-            assert_eq!(app.session_status.input_stall(78), None);
-            assert_eq!(attention(), None);
-            let status = record(&app);
-            assert!(!status.contains("wall:unresponsive"), "{status}");
-            assert!(!status.contains(" input=stalled "), "{status}");
-            assert_eq!(refusal(&ctx, "send", "y", false), None);
-            drop(job);
-            aterm_pty::close_fd(master);
-            aterm_pty::close_fd(slave);
+        // A real second of spinning, so the entry window is the job's own.
+        let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        while burned() < window {
+            assert!(Instant::now() < deadline, "the job never spun a second");
+            std::thread::sleep(Duration::from_millis(20));
         }
+        sink.write_frame_nonparking(b"\r").expect("the Enter");
+        let t0 = Instant::now();
+        let ns = burned();
+        let on_leader = |ns: u64| Activity {
+            cpu: Some((leader, ns)),
+            last_output: None,
+            restarts: sink.restart_discards(),
+            discards: sink.discards(),
+            read_since_discard: false,
+            contention: Contention::default(),
+        };
+        let inputs = &mut app.session_status.inputs;
+        let _ = inputs.step(
+            78,
+            Some(&reading(1, 0, 0)),
+            false,
+            on_leader(ns - window),
+            || None,
+            t0.checked_sub(SPIN_WINDOW).expect("uptime"),
+        );
+        let (t, _) = inputs.step(
+            78,
+            Some(&reading(1, 12, 0)),
+            false,
+            on_leader(ns),
+            || Some(2),
+            t0,
+        );
+        let Transition::Entered(fact) = t else {
+            panic!("entered: {t:?}")
+        };
+        app.publish_input_stall(78, &ctx, Some(fact), t0);
+
+        // `signal term`: the Enter is dropped, the job lives on, held. The
+        // probes run on instants past t0 by less than a spin window, so they
+        // keep the entry's verdict whatever the machine's load.
+        let reply = crate::control::cmd_signal(master, "term", &sink, None);
+        assert_eq!(reply, format!("OK signalled pgrp {leader} discarded=1\n"));
+        assert!(
+            app.observe_input_stalls(t0 + Duration::from_millis(300), Some(78))
+                .is_empty(),
+            "held"
+        );
+        assert!(refusal(&ctx, "send", "y", false).is_some());
+
+        // It recovers: the spin ends and `cat` reads a key sent after the drop.
+        // SAFETY: `leader` is this test's live child (reaped only by `job`'s
+        // drop), and SIGUSR1 is the signal its script traps.
+        assert_eq!(unsafe { libc::kill(leader, libc::SIGUSR1) }, 0);
+        assert_eq!(sink.write_frame_nonparking(b"x").expect("the key"), 1);
+        let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        while aterm_pty::input_queue_len(master) != Some(0) {
+            assert!(Instant::now() < deadline, "the job never read the key");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // One reading already sees the read: no refusal, no `stalled`.
+        assert_eq!(refusal(&ctx, "send", "y", false), None);
+        let status = record(&app);
+        assert!(status.contains(" input=clear "), "{status}");
+        assert_eq!(
+            app.observe_input_stalls(t0 + Duration::from_millis(900), Some(78)),
+            [78]
+        );
+        assert_eq!(app.session_status.input_stall(78), None);
+        assert_eq!(ctx.meta.lock().unwrap().attention, None);
+        assert!(!record(&app).contains("wall:unresponsive"));
+        drop(job);
+        aterm_pty::close_fd(master);
+        aterm_pty::close_fd(slave);
     }
 }

@@ -299,7 +299,6 @@ fn free_z_under_text_over_legacy_and_over_text() {
         version,
     };
     let red = 0x00C8_2020u32;
-    let blue = 0x0020_20C8u32;
 
     // A multi-row red free sprite over cells (0,0)..(1,1); a blue cat quad under it at
     // row 0, cell 1.
@@ -349,7 +348,6 @@ fn free_z_under_text_over_legacy_and_over_text() {
         px(1, 0).iter().all(|&p| p == red) && px(1, 1).iter().all(|&p| p == red),
         "the sprite's second band must not be clobbered by that row's bg"
     );
-    let _ = blue; // (blue must be fully covered — asserted via the red checks)
 
     // OverText: the same sprite in the over-text slot.
     let mut input_over = input.clone();

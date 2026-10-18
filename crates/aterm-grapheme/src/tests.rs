@@ -5,169 +5,148 @@
 use super::*;
 use aterm_types::text_shaping::{AmbiguousWidth, TextShapingConfig};
 
+const FAMILY: &str = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
+
+/// `grapheme_width` over a string: clusters, cells, code points and the
+/// emoji / combining / wide flags.
 #[test]
-fn test_ascii_graphemes() {
-    let info = grapheme_width("Hello");
-    assert_eq!(info.grapheme_count, 5);
-    assert_eq!(info.display_width, 5);
-    assert_eq!(info.codepoint_count, 5);
-    assert!(!info.has_emoji);
-    assert!(!info.has_combining);
-    assert!(!info.has_wide);
+#[rustfmt::skip]
+fn grapheme_width_aggregates_clusters_and_cells() {
+    // (case, text, clusters, cells, code points, has_emoji, has_combining, has_wide)
+    for (case, text, clusters, cells, codepoints, emoji, combining, wide) in [
+        ("ascii", "Hello", 5, 5, 5, false, false, false),
+        ("empty", "", 0, 0, 0, false, false, false),
+        ("cjk", "\u{4E2D}\u{6587}", 2, 4, 2, false, false, true),
+        ("emoji", "\u{1F600}", 1, 2, 1, true, false, true),
+        ("zwj family", FAMILY, 1, 2, 7, true, false, true),
+        ("combining", "e\u{0301}", 1, 1, 2, false, true, false),
+        ("stacked marks", "a\u{0300}\u{0301}\u{0302}\u{0303}", 1, 1, 5, false, true, false),
+        ("flag", "\u{1F1FA}\u{1F1F8}", 1, 2, 2, true, false, true),
+        ("skin tone", "\u{1F44B}\u{1F3FD}", 1, 2, 2, true, false, true),
+        ("mixed", "Hello \u{4E16}\u{754C} \u{1F44B}", 10, 13, 10, true, false, true),
+        ("vs16 heart", "I \u{2764}\u{FE0F} \u{65E5}\u{672C}", 6, 9, 7, true, false, true),
+        ("CJK Extension G and I", "\u{30000}\u{30001}\u{2EBF0}", 3, 6, 3, false, false, true),
+    ] {
+        let info = grapheme_width(text);
+        assert_eq!(
+            (
+                info.grapheme_count,
+                info.display_width,
+                info.codepoint_count,
+                info.byte_count
+            ),
+            (clusters, cells, codepoints, text.len()),
+            "{case}"
+        );
+        assert_eq!(
+            (info.has_emoji, info.has_combining, info.has_wide),
+            (emoji, combining, wide),
+            "{case}"
+        );
+    }
 }
 
+/// One grapheme cluster each and the cells a terminal gives it, after
+/// jquast/ucs-detect's WIDE, ZERO, ZWJ and VS16 categories (Unicode TR11 and
+/// TR51). A lone C0 control or DEL is one cell, where ucs-detect says zero:
+/// terminals advance past a rendered control.
 #[test]
-fn test_cjk_graphemes() {
-    // CJK characters are 2 cells wide
-    let info = grapheme_width("中文");
-    assert_eq!(info.grapheme_count, 2);
-    assert_eq!(info.display_width, 4);
-    assert!(!info.has_emoji);
-    assert!(info.has_wide);
+fn single_cluster_widths() {
+    for (case, cluster, cells) in [
+        ("CJK ideograph", "\u{4E2D}", 2),
+        ("CJK block start", "\u{4E00}", 2),
+        ("CJK block end", "\u{9FFF}", 2),
+        ("hiragana", "\u{3042}", 2),
+        ("katakana", "\u{30A2}", 2),
+        ("hangul syllable", "\u{AC00}", 2),
+        ("fullwidth A", "\u{FF21}", 2),
+        ("fullwidth !", "\u{FF01}", 2),
+        ("CJK Extension G end", "\u{3134A}", 2),
+        ("CJK Extension H middle", "\u{31A00}", 2),
+        ("CJK Extension I middle", "\u{2F000}", 2),
+        ("past CJK Extension H", "\u{323B0}", 1),
+        ("lone ZWJ", "\u{200D}", 0),
+        ("lone ZWNJ", "\u{200C}", 0),
+        ("e + acute", "e\u{0301}", 1),
+        ("zwj family", FAMILY, 2),
+        ("astronaut", "\u{1F468}\u{200D}\u{1F680}", 2),
+        ("sun + VS16", "\u{2600}\u{FE0F}", 2),
+        ("keycap", "0\u{FE0F}\u{20E3}", 2),
+        ("US flag", "\u{1F1FA}\u{1F1F8}", 2),
+        ("wave + light skin", "\u{1F44B}\u{1F3FB}", 2),
+        ("grinning face", "\u{1F600}", 2),
+        ("rocket", "\u{1F680}", 2),
+        ("airplane, text by default", "\u{2708}", 1),
+        ("airplane + VS16", "\u{2708}\u{FE0F}", 2),
+        ("star", "\u{2B50}", 2),
+        ("black large square (wide since Unicode 9)", "\u{2B1B}", 2),
+        ("white large square", "\u{2B1C}", 2),
+        ("ascii", "a", 1),
+        ("space", " ", 1),
+        ("precomposed e-acute", "\u{00E9}", 1),
+        ("box drawing", "\u{253C}", 1),
+        ("full block", "\u{2588}", 1),
+        ("NUL", "\x00", 1),
+        ("ESC", "\x1B", 1),
+        ("DEL", "\x7F", 1),
+        ("section sign (ambiguous)", "\u{00A7}", 1),
+        ("copyright (ambiguous)", "\u{00A9}", 1),
+    ] {
+        assert_eq!(grapheme_width(cluster).grapheme_count, 1, "{case}");
+        assert_eq!(grapheme_display_width(cluster), cells, "{case}");
+    }
 }
 
+/// `column_to_char_index` and `byte_to_column` count grid cells: a wide
+/// grapheme covers two columns, marks and joined emoji share their base's
+/// cells, and a zero-width grapheme the grid folds into the cell before it
+/// covers none, so a column at or past it names the grapheme after it.
 #[test]
-fn test_emoji_graphemes() {
-    // Simple emoji
-    let info = grapheme_width("\u{1F600}");
-    assert_eq!(info.grapheme_count, 1);
-    assert_eq!(info.display_width, 2);
-    assert!(info.has_emoji);
-}
-
-#[test]
-fn test_emoji_zwj_sequence() {
-    // Family emoji: man + ZWJ + woman + ZWJ + girl + ZWJ + boy
-    let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
-    let info = grapheme_width(family);
-    assert_eq!(info.grapheme_count, 1); // Single grapheme cluster
-    assert!(info.has_emoji);
-    assert!(info.codepoint_count > 1); // Multiple codepoints
-}
-
-#[test]
-fn test_combining_characters() {
-    // e + combining acute accent
-    let text = "e\u{0301}";
-    let info = grapheme_width(text);
-    assert_eq!(info.grapheme_count, 1);
-    assert_eq!(info.display_width, 1);
-    assert_eq!(info.codepoint_count, 2);
-    assert!(info.has_combining);
-}
-
-#[test]
-fn test_regional_indicators() {
-    // US flag: regional indicator U + regional indicator S
-    let flag = "\u{1F1FA}\u{1F1F8}";
-    let info = grapheme_width(flag);
-    assert_eq!(info.grapheme_count, 1);
-    assert!(info.has_emoji);
-}
-
-#[test]
-fn test_skin_tone_grapheme() {
-    // Wave + medium skin tone
-    let wave = "\u{1F44B}\u{1F3FD}";
-    let info = grapheme_width(wave);
-    assert_eq!(info.grapheme_count, 1);
-    assert!(info.has_emoji);
-    assert!(info.codepoint_count >= 2);
-}
-
-#[test]
-fn test_mixed_text() {
-    let text = "Hello \u{4E16}\u{754C} \u{1F44B}";
-    let info = grapheme_width(text);
-    assert_eq!(info.grapheme_count, 10); // H e l l o ' ' 世 界 ' ' 👋
-    assert!(info.has_wide);
-    assert!(info.has_emoji);
-}
-
-#[test]
-fn test_split_graphemes() {
-    let text = "Hello";
-    let graphemes: Vec<_> = split_graphemes(text).collect();
-    assert_eq!(graphemes.len(), 5);
-    assert_eq!(graphemes[0].text, "H");
-    assert_eq!(graphemes[0].byte_offset, 0);
-    assert_eq!(graphemes[0].width, 1);
-    assert!(graphemes[0].is_ascii());
-}
-
-#[test]
-fn test_byte_to_column() {
-    let text = "Hello \u{4E16}\u{754C}";
-
-    assert_eq!(byte_to_column(text, 0), 0); // 'H'
-    assert_eq!(byte_to_column(text, 5), 5); // space
-    assert_eq!(byte_to_column(text, 6), 6); // '世'
-    assert_eq!(byte_to_column(text, 9), 8); // '界' (after 世's 3 bytes)
-}
-
-#[test]
-fn test_column_to_char_index_ascii() {
-    let text = "Hello World";
-    assert_eq!(column_to_char_index(text, 0), 0);
-    assert_eq!(column_to_char_index(text, 5), 5);
-    assert_eq!(column_to_char_index(text, 10), 10);
-    assert_eq!(column_to_char_index(text, 15), 11); // past end
-}
-
-#[test]
-fn test_column_to_char_index_wide_chars() {
-    // CJK characters: "你好world" - each CJK char is 2 columns wide
-    let text = "\u{4F60}\u{597D}world";
-    assert_eq!(column_to_char_index(text, 0), 0);
-    assert_eq!(column_to_char_index(text, 1), 0);
-    assert_eq!(column_to_char_index(text, 2), 1);
-    assert_eq!(column_to_char_index(text, 3), 1);
-    assert_eq!(column_to_char_index(text, 4), 2);
-    assert_eq!(column_to_char_index(text, 5), 3);
-}
-
-#[test]
-fn test_column_to_char_index_combining() {
-    let text = "e\u{0301}x"; // e + combining acute + x
-    assert_eq!(column_to_char_index(text, 0), 0);
-    assert_eq!(column_to_char_index(text, 1), 2);
-}
-
-#[test]
-fn test_column_to_char_index_zwj_sequence() {
-    let emoji = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
-    let text = format!("{emoji}x");
-    let emoji_chars = emoji.chars().count();
-    assert_eq!(column_to_char_index(&text, 0), 0);
-    assert_eq!(column_to_char_index(&text, 1), 0);
-    assert_eq!(column_to_char_index(&text, 2), emoji_chars);
-}
-
-#[test]
-fn test_byte_to_column_combining() {
-    let text = "e\u{0301}x";
-    let indices: Vec<usize> = text.char_indices().map(|(idx, _)| idx).collect();
-    let byte_combining = indices[1];
-    let byte_after_combining = indices[2];
-    assert_eq!(byte_to_column(text, byte_combining), 1);
-    assert_eq!(byte_to_column(text, byte_after_combining), 1);
-}
-
-/// `is_emoji_modifier_base` is exactly Unicode 16.0.0 `Emoji_Modifier_Base`
-/// (134 code points). The hand-kept subset it replaced left out U+1F977 NINJA,
-/// so the fully-qualified `🥷🏽` drew as a ninja and a separate swatch over four
-/// cells, and took in U+1F90D/U+1F90E (white and brown heart), which are not
-/// bases.
-#[test]
-fn emoji_modifier_base_is_exactly_the_ucd_property() {
-    let count = (0..=0x10_FFFFu32)
-        .filter_map(char::from_u32)
-        .filter(|&c| is_emoji_modifier_base(c))
-        .count();
-    assert_eq!(count, 134);
-    assert!(is_emoji_modifier_base('\u{1F977}'));
-    assert!(!is_emoji_modifier_base('\u{1F90D}'));
-    assert!(!is_emoji_modifier_base('\u{1F90E}'));
+fn column_and_byte_conversions_count_grid_cells() {
+    let family_x = format!("{FAMILY}x");
+    // (text, [(column, char index)])
+    let columns: [(&str, &[(usize, usize)]); 10] = [
+        ("Hello World", &[(0, 0), (5, 5), (10, 10), (15, 11)]),
+        (
+            "\u{4F60}\u{597D}world",
+            &[(0, 0), (1, 0), (2, 1), (3, 1), (4, 2), (5, 3)],
+        ),
+        ("e\u{0301}x", &[(0, 0), (1, 2)]),
+        (&family_x, &[(0, 0), (1, 0), (2, 7)]),
+        ("\u{200D}x", &[(0, 1), (1, 2)]),
+        ("a\u{200C}b", &[(0, 0), (1, 2)]),
+        ("\u{0301}x", &[(0, 1), (1, 2)]),
+        ("\u{200C}\u{200D}a", &[(0, 2), (1, 3)]),
+        (
+            "\u{4E16}\u{200B}\u{754C}",
+            &[(0, 0), (1, 0), (2, 2), (3, 2), (4, 3)],
+        ),
+        ("ab\u{200B}", &[(0, 0), (1, 1), (2, 3)]),
+    ];
+    for (text, pairs) in columns {
+        for &(column, index) in pairs {
+            assert_eq!(
+                column_to_char_index(text, column),
+                index,
+                "{text:?} column {column}"
+            );
+        }
+    }
+    // (text, [(byte offset, column)]); an offset inside a grapheme maps to
+    // the column after it.
+    let bytes: [(&str, &[(usize, usize)]); 3] = [
+        ("Hello \u{4E16}\u{754C}", &[(0, 0), (5, 5), (6, 6), (9, 8)]),
+        ("e\u{0301}x", &[(1, 1), (3, 1)]),
+        (
+            &family_x,
+            &[(0, 0), (4, 2), (FAMILY.len(), 2), (FAMILY.len() + 1, 3)],
+        ),
+    ];
+    for (text, pairs) in bytes {
+        for &(byte, column) in pairs {
+            assert_eq!(byte_to_column(text, byte), column, "{text:?} byte {byte}");
+        }
+    }
 }
 
 /// A skin-tone modifier folds into its base's cell only when the grid folds
@@ -302,18 +281,6 @@ fn grid_columns_carry_fold_state_across_cluster_boundaries() {
     }
 }
 
-#[test]
-fn test_byte_to_column_zwj_sequence() {
-    let emoji = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
-    let text = format!("{emoji}x");
-    let byte_inside = text.char_indices().nth(1).map(|(idx, _)| idx).unwrap();
-    let byte_x = text.find('x').unwrap();
-    assert_eq!(byte_to_column(&text, 0), 0);
-    assert_eq!(byte_to_column(&text, byte_inside), 2);
-    assert_eq!(byte_to_column(&text, byte_x), 2);
-    assert_eq!(byte_to_column(&text, text.len()), 3);
-}
-
 /// The two public position converters count GRID cells, the unit every caller
 /// measures in: the soft-wrap join pads each row out to the grid width, the
 /// double-click word walk asks whether a clicked cell lies past the text, and
@@ -361,96 +328,6 @@ fn position_converters_count_grid_cells() {
         assert_eq!(column_to_char_index(s, column), chars, "{s:?} past the end");
     }
 }
-
-#[test]
-fn test_skin_tone_modifier() {
-    assert!(is_skin_tone_modifier('\u{1F3FB}')); // Light
-    assert!(is_skin_tone_modifier('\u{1F3FD}')); // Medium
-    assert!(is_skin_tone_modifier('\u{1F3FF}')); // Dark
-    assert!(!is_skin_tone_modifier('A'));
-    assert!(!is_skin_tone_modifier('\u{1F600}'));
-}
-
-#[test]
-fn test_regional_indicator() {
-    assert!(is_regional_indicator('\u{1F1FA}')); // U
-    assert!(is_regional_indicator('\u{1F1F8}')); // S
-    assert!(!is_regional_indicator('A'));
-    assert!(!is_regional_indicator('\u{1F600}'));
-}
-
-#[test]
-fn test_empty_string() {
-    let info = grapheme_width("");
-    assert_eq!(info.grapheme_count, 0);
-    assert_eq!(info.display_width, 0);
-
-    assert_eq!(truncate_to_width("", 10), "");
-    assert_eq!(pad_to_width("", 5), "     ");
-}
-
-// Zero-width grapheme column mapping tests. `column_to_char_index` counts GRID
-// cells, and the grid gives a zero-width grapheme no cell of its own (it folds
-// into the cell before it), so such a grapheme covers no column: a column at
-// or past it names the grapheme after it.
-
-#[test]
-fn test_column_to_char_index_standalone_zwj() {
-    // "\u{200D}x" = 2 graphemes: a lone ZWJ (no cell) and `x` (column 0).
-    let text = "\u{200D}x";
-    assert_eq!(column_to_char_index(text, 0), 1); // x at column 0
-    assert_eq!(column_to_char_index(text, 1), 2); // past end
-}
-
-#[test]
-fn test_column_to_char_index_zwnj_clusters_with_base() {
-    // ZWNJ (U+200C) clusters with the preceding character per UAX #29.
-    // "a\u{200C}b" = 2 graphemes: "a\u{200C}" (width 1, 2 chars) + "b" (width 1, 1 char)
-    let text = "a\u{200C}b";
-    assert_eq!(column_to_char_index(text, 0), 0); // 'a'+ZWNJ cluster
-    assert_eq!(column_to_char_index(text, 1), 2); // 'b' (char index 2, after 'a' and ZWNJ)
-}
-
-#[test]
-fn test_column_to_char_index_leading_combining_mark() {
-    // A standalone combining mark at the start of a string (no base character)
-    // is its own grapheme cluster with no cell; `x` is at column 0.
-    let text = "\u{0301}x"; // combining acute accent + x
-    assert_eq!(column_to_char_index(text, 0), 1); // x at column 0
-    assert_eq!(column_to_char_index(text, 1), 2); // past end
-}
-
-#[test]
-fn test_column_to_char_index_multiple_zero_width() {
-    // ZWNJ + ZWJ cluster into one grapheme per UAX #29.
-    // "\u{200C}\u{200D}a" = 2 graphemes: "\u{200C}\u{200D}" (no cell, 2 chars) + "a".
-    let text = "\u{200C}\u{200D}a";
-    assert_eq!(column_to_char_index(text, 0), 2); // 'a' (char index 2, after ZWNJ and ZWJ)
-    assert_eq!(column_to_char_index(text, 1), 3); // past end
-}
-
-#[test]
-fn test_column_to_char_index_zero_width_between_cjk() {
-    // Zero-width grapheme between CJK characters: the grid folds the ZWSP into
-    // 世's cell, so 界 starts at column 2.
-    let text = "\u{4E16}\u{200B}\u{754C}"; // 世 + ZWSP + 界
-    assert_eq!(column_to_char_index(text, 0), 0); // 世 (column 0)
-    assert_eq!(column_to_char_index(text, 1), 0); // 世 (column 1, second cell)
-    assert_eq!(column_to_char_index(text, 2), 2); // 界 at column 2
-    assert_eq!(column_to_char_index(text, 3), 2); // 界 (second cell)
-    assert_eq!(column_to_char_index(text, 4), 3); // past end
-}
-
-#[test]
-fn test_column_to_char_index_trailing_zero_width() {
-    // Trailing zero-width grapheme: no cell, so column 2 is already past the text.
-    let text = "ab\u{200B}";
-    assert_eq!(column_to_char_index(text, 0), 0); // 'a'
-    assert_eq!(column_to_char_index(text, 1), 1); // 'b'
-    assert_eq!(column_to_char_index(text, 2), 3); // past end
-}
-
-// Width table verification tests
 
 /// Well-known ambiguous-width characters are wide in CJK mode.
 #[test]
@@ -545,18 +422,7 @@ fn test_char_width_table_boundaries() {
 /// stops at U+2FFFF, so 🏴 plus six tags occupies one cell.
 #[test]
 fn plane14_default_ignorables_are_zero_width() {
-    for cp in [
-        0xE0000_u32,
-        0xE0001,
-        0xE001F,
-        0xE0020,
-        0xE007F,
-        0xE0080,
-        0xE0100,
-        0xE01EF,
-        0xE01F0,
-        0xE0FFF,
-    ] {
+    for cp in 0xE0000_u32..=0xE0FFF {
         let c = char::from_u32(cp).expect("plane 14 scalar");
         assert_eq!(
             crate::tables::width::char_width(c),
@@ -582,17 +448,6 @@ fn plane14_default_ignorables_are_zero_width() {
         ),
         2
     );
-}
-
-/// Plane 14 (tags, variation selectors supplement, unassigned) is zero-width
-/// in both ambiguous-width modes — the table catch-all's answer for the plane.
-#[test]
-fn test_char_width_plane14_is_zero() {
-    for cp in 0xE0000_u32..=0xE0FFF {
-        let c = char::from_u32(cp).expect("plane 14 scalar");
-        assert_eq!(crate::tables::width::char_width(c), 0, "U+{cp:05X}");
-        assert_eq!(crate::tables::width::char_width_cjk(c), 0, "U+{cp:05X} CJK");
-    }
 }
 
 /// Every conjoining vowel and final jamo (`Hangul_Syllable_Type` V and T) is
@@ -623,93 +478,6 @@ fn hangul_vowel_and_final_jamo_are_zero_width() {
     );
 }
 
-// CJK aggregate functions
-
-#[test]
-fn test_grapheme_width_with_config_single() {
-    // Default (single width) mode: same as grapheme_width
-    let config = TextShapingConfig::default();
-    let text = "Hello \u{4E16}\u{754C}!";
-    let info_basic = grapheme_width(text);
-    let info_config = grapheme_width_with_config(text, &config);
-    assert_eq!(info_basic, info_config);
-}
-
-#[test]
-fn test_grapheme_width_with_config_double() {
-    // CJK (double width) mode: ambiguous characters become 2 cells
-    let config = TextShapingConfig {
-        ambiguous_width: AmbiguousWidth::Double,
-        ..Default::default()
-    };
-    // Degree sign (U+00B0) is ambiguous-width
-    let text = "\u{00B0}test";
-    let info = grapheme_width_with_config(text, &config);
-    // degree(2) + t(1) + e(1) + s(1) + t(1) = 6
-    assert_eq!(info.display_width, 6);
-    assert_eq!(info.grapheme_count, 5);
-    assert!(info.has_wide); // degree sign becomes wide in CJK mode
-}
-
-#[test]
-fn test_grapheme_width_with_config_cjk_unchanged() {
-    // CJK ideographs are always 2 cells regardless of config
-    let single = TextShapingConfig::default();
-    let double = TextShapingConfig {
-        ambiguous_width: AmbiguousWidth::Double,
-        ..Default::default()
-    };
-    let text = "\u{4E2D}\u{6587}"; // 中文
-    assert_eq!(grapheme_width_with_config(text, &single).display_width, 4);
-    assert_eq!(grapheme_width_with_config(text, &double).display_width, 4);
-}
-
-#[test]
-fn test_grapheme_width_with_config_multiple_ambiguous() {
-    // Multiple ambiguous-width characters in a row.
-    // Note: not all symbols are ambiguous per unicode-width's tables.
-    // U+00A7 (section sign) and U+00AE (registered) are ambiguous; U+00B0 (degree) too.
-    let double = TextShapingConfig {
-        ambiguous_width: AmbiguousWidth::Double,
-        ..Default::default()
-    };
-    // Section sign + registered + degree sign (all actually ambiguous in unicode-width)
-    let text = "\u{00A7}\u{00AE}\u{00B0}";
-    let info_single = grapheme_width(text); // default = single
-    let info_double = grapheme_width_with_config(text, &double);
-    assert_eq!(info_single.display_width, 3); // each 1 cell
-    assert_eq!(info_double.display_width, 6); // each 2 cells in CJK mode
-}
-
-#[test]
-fn test_split_graphemes_with_config_basic() {
-    let config = TextShapingConfig::default();
-    let text = "a\u{4E2D}b";
-    let graphemes: Vec<_> = split_graphemes_with_config(text, &config).collect();
-    assert_eq!(graphemes.len(), 3);
-    assert_eq!(graphemes[0].text, "a");
-    assert_eq!(graphemes[0].width, 1);
-    assert_eq!(graphemes[1].text, "\u{4E2D}");
-    assert_eq!(graphemes[1].width, 2);
-    assert_eq!(graphemes[2].text, "b");
-    assert_eq!(graphemes[2].width, 1);
-}
-
-#[test]
-fn test_split_graphemes_with_config_ambiguous_double() {
-    let double = TextShapingConfig {
-        ambiguous_width: AmbiguousWidth::Double,
-        ..Default::default()
-    };
-    let text = "a\u{00B0}b"; // a + degree sign + b
-    let graphemes: Vec<_> = split_graphemes_with_config(text, &double).collect();
-    assert_eq!(graphemes.len(), 3);
-    assert_eq!(graphemes[0].width, 1); // 'a'
-    assert_eq!(graphemes[1].width, 2); // degree sign in CJK mode
-    assert_eq!(graphemes[1].text, "\u{00B0}");
-    assert_eq!(graphemes[2].width, 1); // 'b'
-}
-
 #[test]
 fn test_split_graphemes_with_config_matches_aggregate() {
     // Verify split_graphemes_with_config produces widths consistent with
@@ -729,54 +497,47 @@ fn test_split_graphemes_with_config_matches_aggregate() {
     assert_eq!(split_codepoints, aggregate.codepoint_count);
 }
 
-// CJK ambiguous-width tests
-
+/// Under `AmbiguousWidth::Double` an East Asian Ambiguous character is two
+/// cells through every config entry point; a CJK ideograph is two and ASCII
+/// one in either mode, and the default config is the plain functions.
 #[test]
-fn test_ambiguous_width_degree_sign() {
-    // Degree sign (deg, U+00B0) is ambiguous-width
+fn ambiguous_double_widens_only_ambiguous_characters() {
     let single = TextShapingConfig::default();
     let double = TextShapingConfig {
         ambiguous_width: AmbiguousWidth::Double,
         ..Default::default()
     };
-    assert_eq!(grapheme_display_width_with_config("\u{00B0}", &single), 1);
-    assert_eq!(grapheme_display_width_with_config("\u{00B0}", &double), 2);
-}
-
-#[test]
-fn test_ambiguous_width_cjk_unchanged() {
-    // CJK ideographs are always 2 cells regardless of mode
-    let single = TextShapingConfig::default();
-    let double = TextShapingConfig {
-        ambiguous_width: AmbiguousWidth::Double,
-        ..Default::default()
-    };
-    assert_eq!(grapheme_display_width_with_config("\u{4E2D}", &single), 2);
-    assert_eq!(grapheme_display_width_with_config("\u{4E2D}", &double), 2);
-}
-
-#[test]
-fn test_ambiguous_width_ascii_unchanged() {
-    // ASCII is always 1 cell regardless of mode
-    let single = TextShapingConfig::default();
-    let double = TextShapingConfig {
-        ambiguous_width: AmbiguousWidth::Double,
-        ..Default::default()
-    };
-    assert_eq!(grapheme_display_width_with_config("a", &single), 1);
-    assert_eq!(grapheme_display_width_with_config("a", &double), 1);
-}
-
-#[test]
-fn test_config_default_matches_basic() {
-    // Default config should match the simple function
-    let config = TextShapingConfig::default();
+    for (cluster, single_cells, double_cells) in [
+        ("\u{00B0}", 1, 2),
+        ("\u{00A7}", 1, 2),
+        ("\u{00AE}", 1, 2),
+        ("\u{4E2D}", 2, 2),
+        ("a", 1, 1),
+    ] {
+        assert_eq!(grapheme_display_width(cluster), single_cells, "{cluster:?}");
+        assert_eq!(
+            grapheme_display_width_with_config(cluster, &single),
+            single_cells,
+            "{cluster:?} single"
+        );
+        assert_eq!(
+            grapheme_display_width_with_config(cluster, &double),
+            double_cells,
+            "{cluster:?} double"
+        );
+    }
+    let info = grapheme_width_with_config("\u{00B0}test", &double);
     assert_eq!(
-        grapheme_display_width_with_config("a", &config),
-        grapheme_display_width("a")
+        (info.display_width, info.grapheme_count, info.has_wide),
+        (6, 5, true)
     );
+    let widths: Vec<usize> = split_graphemes_with_config("a\u{00B0}b", &double)
+        .map(|g| g.width)
+        .collect();
+    assert_eq!(widths, [1, 2, 1]);
+    let text = "Hello \u{4E16}\u{754C}!";
     assert_eq!(
-        grapheme_display_width_with_config("\u{4E2D}", &config),
-        grapheme_display_width("\u{4E2D}")
+        grapheme_width_with_config(text, &single),
+        grapheme_width(text)
     );
 }

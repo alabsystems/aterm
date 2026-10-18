@@ -28,8 +28,7 @@
 //!                     journal's `commit-gates`, which the cut reads), then the REAL `pub
 //!                     stage aterm --commit R --repo-path <this clone>` — every export
 //!                     guard, the public-clone gate with its wasm32 clause, the private
-//!                     staging tier — with the handoff fixture guard and the L0 censuses
-//!                     beside it (fail-fast copies of checks `verify release` runs again)
+//!                     staging tier
 //!  5 build            BUILD ONCE: reserve the release's identity (`ledger::reserve`:
 //!                     build n and the release commit C, made from objects, claimed
 //!                     nowhere), then `ship build` — both slices at once from the
@@ -73,8 +72,8 @@
 //! re-run resumes and never chases main's moving tip, nor rebuilds what it built: the
 //! READY candidate is kept, and only `--commit` replaces it, out loud, while it is
 //! unpublished. What depends only on R's tree is judged ONCE, in this journal — R's
-//! commit-only gates (`commit-gates`), the fixture guard and the censuses at step 4,
-//! and every check of the `release` set at `verify` — and the cut reads those facts,
+//! commit-only gates (`commit-gates`) at step 4, and every check of the `release` set
+//! at `verify` — and the cut reads those facts,
 //! refusing without them, instead of judging R's tree again.
 //!
 //! PREPARE, THEN RELEASE. `--prepare` runs the same machine and stops after `ready`
@@ -125,7 +124,7 @@
 //! session and process group), so a run killed outright leaves no step running unseen:
 //! while that child lives, the next run is refused naming it. The run re-executes
 //! itself as R's own cutter once the clone is at R (`gates::own_cutter`), so every
-//! judgment it makes of R — the records, the pre-claim gates, the fixture guard — is
+//! judgment it makes of R — the records, the pre-claim gates — is
 //! R's; `exec` keeps the pid and its start time, so the claim is the same run's. Every
 //! relative path flag is anchored once, where the release started
 //! ([`ReleaseOptions::anchored`]), for the steps and the re-exec, which run from the
@@ -238,12 +237,6 @@ fn is_child_note(name: &str) -> bool {
 /// (`publish::verified_release_bundle`), which refuses without it: what depends only on
 /// R's tree is judged once, and never re-derived at the claim.
 pub const COMMIT_GATES: &str = "commit-gates";
-
-/// The journal's fact that the handoff fixture guard passed for R.
-pub const FIXTURE_GUARD: &str = "fixture-guard";
-
-/// The journal's fact that the L0 censuses (`aterm-census --all`) passed over R's tree.
-pub const CENSUS: &str = "census";
 
 /// The journal's fact that the release's own handoff fixtures are staged in the release
 /// cache for the journal's reservation: written beside the build, dropped with
@@ -523,8 +516,8 @@ pub struct Journal {
     pub started: u64,
     #[serde(default)]
     pub linux: LinuxDecl,
-    /// Facts only this journal holds for R: [`COMMIT_GATES`], [`FIXTURE_GUARD`],
-    /// [`CENSUS`], [`FIXTURES_STAGED`], `after-cut`, `site-deferred`, `check`.
+    /// Facts only this journal holds for R: [`COMMIT_GATES`], [`FIXTURES_STAGED`],
+    /// `after-cut`, `site-deferred`, `check`.
     #[serde(default)]
     pub done: Vec<String>,
     /// The owner asks DELIVERED and not yet resolved, by key — carried over when the
@@ -1008,25 +1001,6 @@ pub struct Ran {
     pub detail: Vec<String>,
 }
 
-/// What step 4 runs beside each other, each only while its fact is missing.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Beside {
-    /// `pub stage` (R not staged, or staged by an engine whose code moved since).
-    pub stage: bool,
-    /// The handoff fixture guard ([`FIXTURE_GUARD`] not journaled for R).
-    pub guard: bool,
-    /// The L0 censuses ([`CENSUS`] not journaled for R).
-    pub census: bool,
-}
-
-/// What each of them answered; `None` for one not run.
-#[derive(Debug, Default)]
-pub struct Besides {
-    pub stage: Option<Result<Ran, Refusal>>,
-    pub guard: Option<Result<String, Refusal>>,
-    pub census: Option<Result<String, Refusal>>,
-}
-
 /// What the build step's child answered, and the release's own handoff fixtures staged
 /// beside it (`None`: not asked for).
 #[derive(Debug)]
@@ -1143,11 +1117,6 @@ pub trait Backend {
     /// publish (or the fresh cut it does not publish for), so a refusal leaves nothing
     /// (more) public.
     fn cut_gates(&mut self, c: &Candidate, creds: &Path) -> Vec<Refusal>;
-    /// Step 4's heavy half, what `beside` names of it, each beside the others: `pub
-    /// stage` (the engine synced before and after it), the handoff fixture guard and the
-    /// L0 censuses over the clone at R (`gates::census_gate`), each with the prover's
-    /// `targo` and a target directory of its own.
-    fn stage_beside(&mut self, c: &Candidate, prover: &Prover, beside: Beside) -> Besides;
     /// Write the release's own handoff fixtures for its reserved identity into the
     /// release cache, with the in-tree generator in the clone, unless they are staged
     /// already (`fixtures::stage`): what was done, or the refusal.
@@ -1200,9 +1169,8 @@ pub trait Backend {
         artifact: &Artifact,
     ) -> Result<Ran, Refusal>;
     /// `pub stage`, the engine synced before and after it; `Err` when either sync failed
-    /// (the audit rows it kept are named). Step 4 runs it beside the guard and the
-    /// censuses ([`Backend::stage_beside`]); the publish alone, when the engine that
-    /// staged R moved since.
+    /// (the audit rows it kept are named). Step 4 runs it, and the publish again when
+    /// the engine that staged R moved since.
     fn stage(&mut self, c: &Candidate, prover: &Prover) -> Result<Ran, Refusal>;
     /// `pub publish`, the engine synced before it; `Err` when that sync failed.
     fn publish(&mut self, prover: &Prover) -> Result<Ran, Refusal>;
@@ -3129,23 +3097,15 @@ impl Run<'_> {
         })
     }
 
-    /// Step 4 is done when R is staged (or published) and its preflight, the fixture
-    /// guard and the censuses passed for it (this release's journal), or the cut is
-    /// claimed.
+    /// Step 4 is done when R is staged (or published) and its preflight passed for it
+    /// (this release's journal), or the cut is claimed.
     fn stage_done(&self) -> Option<String> {
         if let Some(why) = self.claimed_words() {
             return Some(why);
         }
         let staged = self.skip_stage()?;
-        [COMMIT_GATES, FIXTURE_GUARD, CENSUS]
-            .iter()
-            .all(|fact| self.journal_has(fact))
-            .then(|| {
-                format!(
-                    "{staged}; its preflight, the handoff fixture guard and the L0 censuses \
-                     passed for it (this release's journal)"
-                )
-            })
+        self.journal_has(COMMIT_GATES)
+            .then(|| format!("{staged}; its preflight passed for it (this release's journal)"))
     }
 
     fn skip_publish(&self) -> Option<String> {
@@ -3302,12 +3262,8 @@ impl Run<'_> {
     /// only the commit and the engine's readiness, seconds — refuses before anything
     /// else, and its pass is journaled for R ([`COMMIT_GATES`]: the fact the cut reads
     /// instead of judging R's tree again); a judge of the records that could not answer
-    /// stops here too. Then, BESIDE EACH OTHER, the real `pub stage` (every export guard,
-    /// the public-clone gate with its wasm32 clause, the private staging tier), the
-    /// handoff fixture guard and the L0 censuses, each only while its fact is missing:
-    /// the guard and the censuses are fail-fast copies of checks `verify release` runs
-    /// again at `verify`, kept so their refusal precedes the build. Every pass is
-    /// journaled before any refusal is said, so a re-run runs only what refused.
+    /// stops here too. Then the real `pub stage` (every export guard, the public-clone
+    /// gate with its wasm32 clause, the private staging tier), unless R is staged.
     fn stage(&mut self) -> Flow {
         let (Some(c), Some(p)) = (self.cand.clone(), self.prover.clone()) else {
             return Ok(());
@@ -3321,41 +3277,27 @@ impl Run<'_> {
             return Ok(());
         }
         let mut words = vec![self.commit_gates(&c)?];
-        let beside = Beside {
-            stage: self.skip_stage().is_none(),
-            guard: !self.journal_has(FIXTURE_GUARD),
-            census: !self.journal_has(CENSUS),
-        };
-        if self.dry {
-            words.push(self.beside_plan(&c, beside));
-            self.finish(&words.join("; "));
-            return Ok(());
-        }
-        words.extend(self.beside_done(beside));
-        if beside.stage {
-            let log = self.b.log_path(Step::Stage);
-            self.say(&format!("        log: {}", log.display()));
-        }
-        let ran = self.b.stage_beside(&c, &p, beside);
-        let mut refused: Vec<Refusal> = Vec::new();
-        for (fact, outcome) in [(FIXTURE_GUARD, ran.guard), (CENSUS, ran.census)] {
-            match outcome {
-                Some(Ok(note)) => {
-                    self.journal_add(fact)?;
-                    words.push(note);
+        match self.skip_stage() {
+            Some(why) => words.push(why),
+            None if self.dry => words.push(format!(
+                "would run pub stage aterm --commit {} --repo-path <this clone>",
+                if c.bump_from.is_some() {
+                    "<the bump commit>"
+                } else {
+                    c.commit.as_str()
                 }
-                Some(Err(r)) => refused.push(r),
-                None => {}
+            )),
+            None => {
+                let log = self.b.log_path(Step::Stage);
+                self.say(&format!("        log: {}", log.display()));
+                let ran = self.b.stage(&c, &p);
+                self.refresh();
+                match self.stage_verdict(&c, ran) {
+                    Ok(note) => words.push(note),
+                    Err(refusal) => return self.refuse(refusal),
+                }
             }
         }
-        if let Some(staged) = ran.stage {
-            self.refresh();
-            match self.stage_verdict(&c, staged) {
-                Ok(note) => words.push(note),
-                Err(r) => refused.push(r),
-            }
-        }
-        self.refuse_all("step 4", refused)?;
         self.finish(&words.join("; "));
         Ok(())
     }
@@ -3402,62 +3344,6 @@ impl Run<'_> {
             )
             .could_not_run(),
         )
-    }
-
-    /// A dry run's words for step 4's heavy half: what would run beside each other, and
-    /// what is done already.
-    fn beside_plan(&self, c: &Candidate, beside: Beside) -> String {
-        let r = if c.bump_from.is_some() {
-            "<the bump commit>".to_string()
-        } else {
-            c.commit.clone()
-        };
-        let mut run = Vec::new();
-        if beside.stage {
-            run.push(format!(
-                "pub stage aterm --commit {r} --repo-path <this clone>"
-            ));
-        }
-        if beside.guard {
-            run.push(format!(
-                "the handoff fixture guard (targo --unverified test -p aterm-gui --lib -- {})",
-                crate::gates::HANDOFF_FIXTURE_GUARD_FILTER
-            ));
-        }
-        if beside.census {
-            run.push(format!(
-                "the L0 censuses (targo {} <this clone>)",
-                crate::gates::CENSUS_ARGS.join(" ")
-            ));
-        }
-        let mut words = Vec::new();
-        if !run.is_empty() {
-            words.push(format!("would run, beside each other: {}", run.join("; ")));
-        }
-        words.extend(self.beside_done(beside));
-        words.join("; ")
-    }
-
-    /// What of step 4's heavy half is done already, by its facts.
-    fn beside_done(&self, beside: Beside) -> Vec<String> {
-        let r = short(&self.commit_r()).to_string();
-        let mut done = Vec::new();
-        if !beside.stage
-            && let Some(why) = self.skip_stage()
-        {
-            done.push(why);
-        }
-        if !beside.guard {
-            done.push(format!(
-                "the handoff fixture guard passed for {r} (this release's journal)"
-            ));
-        }
-        if !beside.census {
-            done.push(format!(
-                "the L0 censuses passed over {r} (this release's journal)"
-            ));
-        }
-        done
     }
 
     /// What `pub stage` ending with `ran` means for R, the facts read again after it: the

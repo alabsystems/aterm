@@ -142,7 +142,6 @@ fn clamp_cells(cells: u32) -> u16 {
 /// Narrow a `usize` cell span to `u32`, saturating. Used by the sixel placement
 /// path so a span (already bounded by the decoder's dimension cap) feeds
 /// `clamp_cells` without a truncating cast.
-#[cfg(feature = "sixel")]
 fn clamp_u32(v: usize) -> u32 {
     u32::try_from(v).unwrap_or(u32::MAX)
 }
@@ -574,7 +573,6 @@ impl TerminalHandler<'_> {
     /// as an [`ImageFormat::RawRgba8`] [`ImageData`]. With DECSDM (mode 80)
     /// reset the cursor ends on the line below the image; with it set the cursor
     /// is restored.
-    #[cfg(feature = "sixel")]
     pub(super) fn place_sixel_image(&mut self, image: &crate::sixel::SixelImage) {
         let (cell_w, cell_h) = self.iterm2.cell_px;
         let (cell_w, cell_h) = (cell_w.max(1), cell_h.max(1));

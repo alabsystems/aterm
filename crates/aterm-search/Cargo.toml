@@ -12,12 +12,6 @@ license.workspace = true
 repository.workspace = true
 description = "Search primitives for aterm terminal content"
 
-[features]
-default = []
-# Compile the streaming-search `#[refines]` anchors into the library so aterm-gui's
-# `spec_xref_closure` test can collect them via `aterm_spec::registry`. Off by default.
-spec-anchors = ["dep:aterm-spec"]
-
 [dependencies]
 aterm-types = { workspace = true }
 aterm-hash = { workspace = true }
@@ -26,13 +20,9 @@ aterm-log = { workspace = true }
 aterm-grapheme = { workspace = true }
 # Regex-mode search (`is_regex = true`).
 aterm-regex = { workspace = true }
-# Library dependency only under `spec-anchors` (the anchors emit
-# `::aterm_spec::registry::submit!`).
-aterm-spec = { workspace = true, optional = true }
 
 [dev-dependencies]
-# The spec anchors expand in the unit-test build; tests/conformance_streaming.rs
-# drives the derived StreamingSearch model.
+# The seeded `XorShift` tests/search_vs_bruteforce.rs draws from.
 aterm-spec = { workspace = true }
 
 [lints]

@@ -4,48 +4,7 @@
 //! Hyperlink, underline color, CWD, color palette, and BiDi config accessors.
 
 use super::{ColorPalette, Rgb, Terminal};
-use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-
-/// Mutable host-configuration view of the indexed palette.
-///
-/// Direct palette edits are mirrored into the OSC 104/RIS reset baseline on
-/// drop. The before/after comparison updates only slots the caller actually
-/// changed, so an unrelated program-issued OSC 4 override can never leak into
-/// the host baseline.
-pub struct ColorPaletteMut<'a> {
-    palette: &'a mut ColorPalette,
-    configured_palette: &'a mut Option<ColorPalette>,
-    before: ColorPalette,
-}
-
-impl Deref for ColorPaletteMut<'_> {
-    type Target = ColorPalette;
-
-    fn deref(&self) -> &Self::Target {
-        self.palette
-    }
-}
-
-impl DerefMut for ColorPaletteMut<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.palette
-    }
-}
-
-impl Drop for ColorPaletteMut<'_> {
-    fn drop(&mut self) {
-        let configured = self
-            .configured_palette
-            .get_or_insert_with(ColorPalette::new);
-        for index in u8::MIN..=u8::MAX {
-            let color = self.palette.get(index);
-            if color != self.before.get(index) {
-                configured.set(index, color);
-            }
-        }
-    }
-}
 
 impl Terminal {
     /// The OSC 8 hyperlink URL applied to newly printed characters.
@@ -109,43 +68,41 @@ impl Terminal {
         self.current_working_directory.as_deref()
     }
 
+    /// The host the report that set [`Self::current_working_directory`]
+    /// named: an OSC 7 `file://<host>/…`'s host, verbatim (never
+    /// percent-decoded). `None` for an empty host or `localhost`, for a cwd
+    /// the shell's own `633;P;Cwd=` set, with no cwd, and on an engine
+    /// restored from a checkpoint until its shell reports again. The engine
+    /// cannot know its own name, so whether a named host is this machine is
+    /// the embedder's call: a shell reporting its own hostname is common.
+    #[must_use]
+    pub fn reported_cwd_host(&self) -> Option<&str> {
+        self.shell.cwd_host.as_deref()
+    }
+
+    /// Which report the stored cwd and its host
+    /// ([`Self::reported_cwd_host`]) came from: `Some(n)` after the `n`th
+    /// report this engine stored (OSC 7 or `633;P;Cwd=`, a clear included;
+    /// `Some(0)` before any), `None` while the cwd is a checkpoint's carry
+    /// that no report since has replaced. Monotonic across a RIS and an
+    /// in-place restore, so an embedder can note which process group was in
+    /// front when it first saw report `n` and know a later report by its new
+    /// number.
+    #[must_use]
+    pub fn reported_cwd_seq(&self) -> Option<u64> {
+        (!self.shell.cwd_carried).then_some(self.shell.cwd_reports)
+    }
+
     /// The indexed (0-255) color palette.
     #[must_use]
     pub fn color_palette(&self) -> &ColorPalette {
         self.color.palette()
     }
 
-    /// Mutate the host-configured color palette.
-    ///
-    /// Changed slots become both the live colors and their OSC 104/RIS reset
-    /// baseline, matching [`Self::set_palette_color`].
-    #[cfg(test)]
-    pub fn color_palette_mut(&mut self) -> ColorPaletteMut<'_> {
-        // A mutable palette borrow can recolor already-painted indexed cells
-        // without touching grid content. Mark before handing the borrow out so
-        // every damage-keyed frontend observes the possible visual mutation.
-        self.grid.damage_mut().mark_full();
-        let before = self.color.palette().clone();
-        let (palette, configured_palette) = self.color.palette_and_configured_mut();
-        ColorPaletteMut {
-            palette,
-            configured_palette,
-            before,
-        }
-    }
-
     /// The RGB value for an indexed color.
     #[must_use]
     pub fn palette_color(&self, index: u8) -> Rgb {
         self.color.palette().get(index)
-    }
-
-    /// Indexed color as primitive RGB components.
-    #[must_use]
-    #[cfg(test)]
-    pub fn palette_color_components(&self, index: u8) -> (u8, u8, u8) {
-        let color = self.palette_color(index);
-        (color.r, color.g, color.b)
     }
 
     /// Set a host-configured indexed color in the palette.
@@ -167,21 +124,6 @@ impl Terminal {
     /// Set indexed color from primitive RGB components.
     pub fn set_palette_color_components(&mut self, index: u8, r: u8, g: u8, b: u8) {
         self.set_palette_color(index, Rgb { r, g, b });
-    }
-
-    /// Reset the live and host-configured color palette to built-in defaults.
-    #[cfg(test)]
-    pub fn reset_color_palette(&mut self) {
-        self.color.palette_mut().reset();
-        self.color.configured_palette = None;
-        self.grid.damage_mut().mark_full();
-    }
-
-    /// Reset a single palette slot to the built-in default color.
-    #[cfg(test)]
-    pub fn reset_palette_color_to_default(&mut self, index: u8) {
-        let default_palette = ColorPalette::new();
-        self.set_palette_color(index, default_palette.get(index));
     }
 
     /// Get the default foreground color.
@@ -222,6 +164,7 @@ impl Terminal {
         self.color.configured_background = color;
         self.color.frame_background_authoritative = true;
         self.grid.damage_mut().mark_full();
+        let _ = self.reconcile_color_scheme();
     }
 
     /// Set the host-configured cursor color.
@@ -356,14 +299,6 @@ mod tests {
         assert_host_color_mutation_marks_damage(noop, |term| {
             term.set_palette_color(1, Rgb::new(0x11, 0x22, 0x33));
         });
-        assert_host_color_mutation_marks_damage(
-            |term| term.set_palette_color(1, Rgb::new(0x11, 0x22, 0x33)),
-            Terminal::reset_color_palette,
-        );
-        assert_host_color_mutation_marks_damage(
-            |term| term.set_palette_color(1, Rgb::new(0x11, 0x22, 0x33)),
-            |term| term.reset_palette_color_to_default(1),
-        );
         assert_host_color_mutation_marks_damage(noop, |term| {
             term.set_default_foreground(Rgb::new(0x11, 0x22, 0x33));
         });
@@ -378,9 +313,6 @@ mod tests {
         });
         assert_host_color_mutation_marks_damage(noop, |term| {
             term.set_default_selection_foreground(Some(Rgb::new(0x99, 0x66, 0x33)));
-        });
-        assert_host_color_mutation_marks_damage(noop, |term| {
-            term.color_palette_mut().set(2, Rgb::new(0x77, 0x88, 0x99));
         });
     }
 
@@ -444,52 +376,6 @@ mod tests {
             term.palette_color(1),
             configured,
             "RIS restores the same host-configured palette baseline"
-        );
-    }
-
-    #[test]
-    fn mutable_palette_view_updates_only_changed_reset_slots() {
-        let mut term = Terminal::new(2, 8);
-        term.set_allow_palette_reconfigure(true);
-        let configured = Rgb::new(0x11, 0x22, 0x33);
-        let transient = Rgb::new(0xaa, 0xbb, 0xcc);
-        let built_in_two = ColorPalette::new().get(2);
-
-        term.process(b"\x1b]4;2;rgb:aa/bb/cc\x07");
-        {
-            let mut palette = term.color_palette_mut();
-            palette.set(1, configured);
-        }
-        assert_eq!(term.palette_color(2), transient);
-
-        term.process(b"\x1b]4;1;rgb:aa/bb/cc\x07\x1b]104\x07");
-        assert_eq!(
-            term.palette_color(1),
-            configured,
-            "changed slot becomes a durable host reset baseline"
-        );
-        assert_eq!(
-            term.palette_color(2),
-            built_in_two,
-            "an unrelated OSC 4 override is not captured into that baseline"
-        );
-    }
-
-    #[test]
-    fn public_palette_reset_durably_restores_built_in_baseline() {
-        let mut term = Terminal::new(2, 8);
-        term.set_allow_palette_reconfigure(true);
-        let built_in = ColorPalette::new().get(1);
-        term.set_palette_color_components(1, 0x11, 0x22, 0x33);
-        term.reset_color_palette();
-        assert_eq!(term.palette_color(1), built_in);
-
-        term.process(b"\x1b]4;1;rgb:aa/bb/cc\x07");
-        term.process(b"\x1b]104;1\x07");
-        assert_eq!(
-            term.palette_color(1),
-            built_in,
-            "OSC 104 must not resurrect the cleared host palette"
         );
     }
 }

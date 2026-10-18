@@ -1648,7 +1648,7 @@ mod tests {
     /// For any schedule of step budgets the stepped rewrap matches the one-shot
     /// [`PendingScrollbackReflow::reflow`] line for line (full Debug rendering),
     /// over mixed content plus a lazy-staged tail. The per-line model is
-    /// `rewrap_round_trip_is_content_stable`.
+    /// `rewrap_resplits_each_logical_line_at_the_new_width`.
     #[test]
     fn reflow_step_any_schedule_matches_one_shot() {
         for seed in [1u64, 7, 42, 0x00C0_FFEE] {

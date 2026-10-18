@@ -575,16 +575,16 @@ frame	shrink	Catppuccin Latte	120	still	2700	n=1	w=1452	top=f3bc7cf6540f7b25	ble
 frame	record	Solarized Light	60	moving	100	n=0	w=732	top=9de9278ba2b0b815	bleed=669b18c6d2d9c95b	||
 frame	warn	Solarized Light	60	moving	100	n=1	w=732	top=0e4298706b7f6f25	bleed=6eff488e781db647	r0=94fac400d6911534:df5973974583bee7:92e01f263ef1b1ba	| ⚠ Disk nearly full · 2 GB left on /|
 frame	error	Solarized Light	60	moving	100	n=1	w=732	top=0e4298706b7f6f25	bleed=6eff488e781db647	r0=5791eca75196a525:150ad23d45047e87:35cb3c5ddb044a68	| ✕ Deploy failed · exit 1|
-frame	bar0	Solarized Light	60	moving	2500	n=1	w=732	top=0e4298706b7f6f25	bleed=8af2c3aa78d9cde9	r0=7867dbc59f448df8:b62705438cd3701a:c8f2128feb57921b	| ↻ Downloading assets    0%|
+frame	bar0	Solarized Light	60	moving	2500	n=1	w=732	top=0e4298706b7f6f25	bleed=8af2c3aa78d9cde9	r0=6b1973b5828c64e4:b62705438cd3701a:c6721dce9bf9ac3c	| ↻ Downloading assets    0%|
 frame	bar25	Solarized Light	60	moving	2500	n=1	w=732	top=0e4298706b7f6f25	bleed=9a25f15d6631b087	r0=8fd9b8bb52a62da7:8955f70113417c59:2dfd435618fa1f60	| ↻ Downloading assets   25%|
 frame	bar50	Solarized Light	60	moving	2500	n=1	w=732	top=0e4298706b7f6f25	bleed=9a25f15d6631b087	r0=7ac79b62b3355689:a1f9aa3caa4b47e2:105fc8741ee65880	| ↻ Downloading assets   50%|
 frame	bar999	Solarized Light	60	moving	2500	n=1	w=732	top=0e4298706b7f6f25	bleed=48dc231d29470ac4	r0=ff68cd389002feb3:dd328d16b1f90615:0fcd86887b183da4	| ↻ Downloading assets   99%|
 frame	bar100	Solarized Light	60	moving	2500	n=1	w=732	top=0e4298706b7f6f25	bleed=843047236f907531	r0=a3b8f26c7babce65:ea6d6a4ee77dd68a:73191601d2302777	| ↻ Downloading assets  100%|
 frame	amount	Solarized Light	60	moving	2600	n=1	w=732	top=0e4298706b7f6f25	bleed=9a25f15d6631b087	r0=2694f764811b5eb1:5e1c51aa18f44301:10ef924f2f4ac09b	| ↻ Copying files   70%|
 frame	amount	Solarized Light	60	moving	3000	n=1	w=732	top=0e4298706b7f6f25	bleed=9a25f15d6631b087	r0=2694f764811b5eb1:5e1c51aa18f44301:10ef924f2f4ac09b	| ↻ Copying files   70%|
-frame	busy	Solarized Light	60	moving	2600	n=1	w=732	top=0e4298706b7f6f25	bleed=e291a3550cd4182d	r0=31be07906cd87330:86a8fcbd48103992:da84351246ff0281	| ↻ Indexing the tree|
-frame	busy	Solarized Light	60	moving	3400	n=1	w=732	top=0e4298706b7f6f25	bleed=e291a3550cd4182d	r0=397f41cf5a552ece:136113fcf2e6daf2:c92a314e379f751e	| ↻ Indexing the tree|
-frame	busy	Solarized Light	60	moving	4700	n=1	w=732	top=0e4298706b7f6f25	bleed=e291a3550cd4182d	r0=b331e33425a96a1e:c87d14bac3af368f:2e1effbd94845257	| ↻ Indexing the tree|
+frame	busy	Solarized Light	60	moving	2600	n=1	w=732	top=0e4298706b7f6f25	bleed=e291a3550cd4182d	r0=7bb7bf6282f4bfc4:86a8fcbd48103992:b10d8c75e41a4225	| ↻ Indexing the tree|
+frame	busy	Solarized Light	60	moving	3400	n=1	w=732	top=0e4298706b7f6f25	bleed=e291a3550cd4182d	r0=1a3be7233e817082:136113fcf2e6daf2:ec9e0a45189156e2	| ↻ Indexing the tree|
+frame	busy	Solarized Light	60	moving	4700	n=1	w=732	top=0e4298706b7f6f25	bleed=e291a3550cd4182d	r0=f858552df5a59d32:c87d14bac3af368f:97493a6f335b554f	| ↻ Indexing the tree|
 frame	stall	Solarized Light	60	moving	2500	n=1	w=732	top=0e4298706b7f6f25	bleed=9a25f15d6631b087	r0=9da2af52ec34d113:b09e195e80b7d987:b99ab0df6a6da457	| ↻ Uploading logs   40%|
 frame	stall	Solarized Light	60	moving	13000	n=1	w=732	top=0e4298706b7f6f25	bleed=9a25f15d6631b087	r0=cf29075df04321e9:8f67372ac0607275:54764f494d0f7873	| ↻ Uploading logs   40%|
 frame	complete	Solarized Light	60	moving	2500	n=1	w=732	top=0e4298706b7f6f25	bleed=9a25f15d6631b087	r0=6d3db505b2f70995:a1f9aa3caa4b47e2:3ab55b03ab97a11e	| ↻ Building   50%|
@@ -603,16 +603,16 @@ frame	shrink	Solarized Light	60	moving	2700	n=1	w=732	top=0e4298706b7f6f25	bleed
 frame	record	Solarized Light	60	still	100	n=0	w=732	top=9de9278ba2b0b815	bleed=669b18c6d2d9c95b	||
 frame	warn	Solarized Light	60	still	100	n=1	w=732	top=0e4298706b7f6f25	bleed=6eff488e781db647	r0=94fac400d6911534:df5973974583bee7:92e01f263ef1b1ba	| ⚠ Disk nearly full · 2 GB left on /|
 frame	error	Solarized Light	60	still	100	n=1	w=732	top=0e4298706b7f6f25	bleed=6eff488e781db647	r0=5791eca75196a525:150ad23d45047e87:35cb3c5ddb044a68	| ✕ Deploy failed · exit 1|
-frame	bar0	Solarized Light	60	still	2500	n=1	w=732	top=0e4298706b7f6f25	bleed=8af2c3aa78d9cde9	r0=7867dbc59f448df8:b62705438cd3701a:c8f2128feb57921b	| ↻ Downloading assets    0%|
+frame	bar0	Solarized Light	60	still	2500	n=1	w=732	top=0e4298706b7f6f25	bleed=8af2c3aa78d9cde9	r0=6b1973b5828c64e4:b62705438cd3701a:c6721dce9bf9ac3c	| ↻ Downloading assets    0%|
 frame	bar25	Solarized Light	60	still	2500	n=1	w=732	top=0e4298706b7f6f25	bleed=9a25f15d6631b087	r0=8fd9b8bb52a62da7:8955f70113417c59:2dfd435618fa1f60	| ↻ Downloading assets   25%|
 frame	bar50	Solarized Light	60	still	2500	n=1	w=732	top=0e4298706b7f6f25	bleed=9a25f15d6631b087	r0=7ac79b62b3355689:a1f9aa3caa4b47e2:105fc8741ee65880	| ↻ Downloading assets   50%|
 frame	bar999	Solarized Light	60	still	2500	n=1	w=732	top=0e4298706b7f6f25	bleed=48dc231d29470ac4	r0=ff68cd389002feb3:dd328d16b1f90615:0fcd86887b183da4	| ↻ Downloading assets   99%|
 frame	bar100	Solarized Light	60	still	2500	n=1	w=732	top=0e4298706b7f6f25	bleed=843047236f907531	r0=a3b8f26c7babce65:ea6d6a4ee77dd68a:73191601d2302777	| ↻ Downloading assets  100%|
 frame	amount	Solarized Light	60	still	2600	n=1	w=732	top=0e4298706b7f6f25	bleed=9a25f15d6631b087	r0=2694f764811b5eb1:5e1c51aa18f44301:10ef924f2f4ac09b	| ↻ Copying files   70%|
 frame	amount	Solarized Light	60	still	3000	n=1	w=732	top=0e4298706b7f6f25	bleed=9a25f15d6631b087	r0=2694f764811b5eb1:5e1c51aa18f44301:10ef924f2f4ac09b	| ↻ Copying files   70%|
-frame	busy	Solarized Light	60	still	2600	n=1	w=732	top=0e4298706b7f6f25	bleed=e291a3550cd4182d	r0=8566ac701031da10:86a8fcbd48103992:f9f88b2a32b8c8b8	| ↻ Indexing the tree|
-frame	busy	Solarized Light	60	still	3400	n=1	w=732	top=0e4298706b7f6f25	bleed=e291a3550cd4182d	r0=8566ac701031da10:86a8fcbd48103992:f9f88b2a32b8c8b8	| ↻ Indexing the tree|
-frame	busy	Solarized Light	60	still	4700	n=1	w=732	top=0e4298706b7f6f25	bleed=e291a3550cd4182d	r0=8566ac701031da10:86a8fcbd48103992:f9f88b2a32b8c8b8	| ↻ Indexing the tree|
+frame	busy	Solarized Light	60	still	2600	n=1	w=732	top=0e4298706b7f6f25	bleed=e291a3550cd4182d	r0=085ffa7bef8e668e:86a8fcbd48103992:2d3ed95583ad6e6d	| ↻ Indexing the tree|
+frame	busy	Solarized Light	60	still	3400	n=1	w=732	top=0e4298706b7f6f25	bleed=e291a3550cd4182d	r0=085ffa7bef8e668e:86a8fcbd48103992:2d3ed95583ad6e6d	| ↻ Indexing the tree|
+frame	busy	Solarized Light	60	still	4700	n=1	w=732	top=0e4298706b7f6f25	bleed=e291a3550cd4182d	r0=085ffa7bef8e668e:86a8fcbd48103992:2d3ed95583ad6e6d	| ↻ Indexing the tree|
 frame	stall	Solarized Light	60	still	2500	n=1	w=732	top=0e4298706b7f6f25	bleed=9a25f15d6631b087	r0=9da2af52ec34d113:b09e195e80b7d987:b99ab0df6a6da457	| ↻ Uploading logs   40%|
 frame	stall	Solarized Light	60	still	13000	n=1	w=732	top=0e4298706b7f6f25	bleed=9a25f15d6631b087	r0=9da2af52ec34d113:b09e195e80b7d987:b99ab0df6a6da457	| ↻ Uploading logs   40%|
 frame	complete	Solarized Light	60	still	2500	n=1	w=732	top=0e4298706b7f6f25	bleed=9a25f15d6631b087	r0=6d3db505b2f70995:a1f9aa3caa4b47e2:3ab55b03ab97a11e	| ↻ Building   50%|
@@ -631,16 +631,16 @@ frame	shrink	Solarized Light	60	still	2700	n=1	w=732	top=0e4298706b7f6f25	bleed=
 frame	record	Solarized Light	80	moving	100	n=0	w=972	top=afa198c44f3567d5	bleed=669b18c6d2d9c95b	||
 frame	warn	Solarized Light	80	moving	100	n=1	w=972	top=a26dca56a26c1f25	bleed=6eff488e781db647	r0=da75217485f6aef4:8133addeeb5380f7:f0b7d877af3d481a	| ⚠ Disk nearly full · 2 GB left on /|
 frame	error	Solarized Light	80	moving	100	n=1	w=972	top=a26dca56a26c1f25	bleed=6eff488e781db647	r0=b465bc2771722fe5:7eaf6ef2be94ad17:addc3575379afd48	| ✕ Deploy failed · exit 1|
-frame	bar0	Solarized Light	80	moving	2500	n=1	w=972	top=a26dca56a26c1f25	bleed=8af2c3aa78d9cde9	r0=06c1f2fb51e1bdd8:92b11d4859b90a8a:414c7373e8642a3b	| ↻ Downloading assets    0%|
+frame	bar0	Solarized Light	80	moving	2500	n=1	w=972	top=a26dca56a26c1f25	bleed=8af2c3aa78d9cde9	r0=87a3c1713429fbe4:92b11d4859b90a8a:342cf0625cc4a41c	| ↻ Downloading assets    0%|
 frame	bar25	Solarized Light	80	moving	2500	n=1	w=972	top=a26dca56a26c1f25	bleed=9a25f15d6631b087	r0=8c80504a8e1a0b8e:1b64ac94c1babf0b:277a11a8fb5adef3	| ↻ Downloading assets   25%|
 frame	bar50	Solarized Light	80	moving	2500	n=1	w=972	top=a26dca56a26c1f25	bleed=9a25f15d6631b087	r0=8d3b73ce1eebffba:f9873ef8a36f38b2:35875effb386ec80	| ↻ Downloading assets   50%|
 frame	bar999	Solarized Light	80	moving	2500	n=1	w=972	top=a26dca56a26c1f25	bleed=c2cdfd07c2c63b23	r0=f419c735de6bdf86:265973ee51cf26cb:8f5f06b0362d8f8d	| ↻ Downloading assets   99%|
 frame	bar100	Solarized Light	80	moving	2500	n=1	w=972	top=a26dca56a26c1f25	bleed=843047236f907531	r0=ca04bb1ed9793409:eccd74ccc76210fa:712f3477ee11e3d7	| ↻ Downloading assets  100%|
 frame	amount	Solarized Light	80	moving	2600	n=1	w=972	top=a26dca56a26c1f25	bleed=9a25f15d6631b087	r0=5f5343b621f02b8b:c69f2e226fdc8aa2:3203456b1771c352	| ↻ Copying files   70%|
 frame	amount	Solarized Light	80	moving	3000	n=1	w=972	top=a26dca56a26c1f25	bleed=9a25f15d6631b087	r0=5f5343b621f02b8b:c69f2e226fdc8aa2:3203456b1771c352	| ↻ Copying files   70%|
-frame	busy	Solarized Light	80	moving	2600	n=1	w=972	top=a26dca56a26c1f25	bleed=e291a3550cd4182d	r0=8943a6a3512f82b0:db2150b6b5a28e62:60ee3774a8d4fa41	| ↻ Indexing the tree|
-frame	busy	Solarized Light	80	moving	3400	n=1	w=972	top=a26dca56a26c1f25	bleed=e291a3550cd4182d	r0=f24cbc374fd93d44:65fe57bc6e9ce384:b804fd99120e98cd	| ↻ Indexing the tree|
-frame	busy	Solarized Light	80	moving	4700	n=1	w=972	top=a26dca56a26c1f25	bleed=e291a3550cd4182d	r0=a892aa48e97ef8b7:c777da664e03cef3:2f0b3d3e8eae9eae	| ↻ Indexing the tree|
+frame	busy	Solarized Light	80	moving	2600	n=1	w=972	top=a26dca56a26c1f25	bleed=e291a3550cd4182d	r0=76b7eccad8880184:db2150b6b5a28e62:6bcaf5838cc3a225	| ↻ Indexing the tree|
+frame	busy	Solarized Light	80	moving	3400	n=1	w=972	top=a26dca56a26c1f25	bleed=e291a3550cd4182d	r0=d8add050b1d49a50:65fe57bc6e9ce384:d70f17e904ee7e95	| ↻ Indexing the tree|
+frame	busy	Solarized Light	80	moving	4700	n=1	w=972	top=a26dca56a26c1f25	bleed=e291a3550cd4182d	r0=3be0520b802c9c93:c777da664e03cef3:594540a542dacf62	| ↻ Indexing the tree|
 frame	stall	Solarized Light	80	moving	2500	n=1	w=972	top=a26dca56a26c1f25	bleed=9a25f15d6631b087	r0=63f442d85a35bca0:eb04454ba41f7a66:dbc958b09daa9f92	| ↻ Uploading logs   40%|
 frame	stall	Solarized Light	80	moving	13000	n=1	w=972	top=a26dca56a26c1f25	bleed=9a25f15d6631b087	r0=20e5036f6ff03296:d623d360f502c3c8:4d480eeb94dd0317	| ↻ Uploading logs   40%|
 frame	complete	Solarized Light	80	moving	2500	n=1	w=972	top=a26dca56a26c1f25	bleed=9a25f15d6631b087	r0=f46737116b76e0df:f9873ef8a36f38b2:83142e4a03521b1e	| ↻ Building   50%|
@@ -659,16 +659,16 @@ frame	shrink	Solarized Light	80	moving	2700	n=1	w=972	top=a26dca56a26c1f25	bleed
 frame	record	Solarized Light	80	still	100	n=0	w=972	top=afa198c44f3567d5	bleed=669b18c6d2d9c95b	||
 frame	warn	Solarized Light	80	still	100	n=1	w=972	top=a26dca56a26c1f25	bleed=6eff488e781db647	r0=da75217485f6aef4:8133addeeb5380f7:f0b7d877af3d481a	| ⚠ Disk nearly full · 2 GB left on /|
 frame	error	Solarized Light	80	still	100	n=1	w=972	top=a26dca56a26c1f25	bleed=6eff488e781db647	r0=b465bc2771722fe5:7eaf6ef2be94ad17:addc3575379afd48	| ✕ Deploy failed · exit 1|
-frame	bar0	Solarized Light	80	still	2500	n=1	w=972	top=a26dca56a26c1f25	bleed=8af2c3aa78d9cde9	r0=06c1f2fb51e1bdd8:92b11d4859b90a8a:414c7373e8642a3b	| ↻ Downloading assets    0%|
+frame	bar0	Solarized Light	80	still	2500	n=1	w=972	top=a26dca56a26c1f25	bleed=8af2c3aa78d9cde9	r0=87a3c1713429fbe4:92b11d4859b90a8a:342cf0625cc4a41c	| ↻ Downloading assets    0%|
 frame	bar25	Solarized Light	80	still	2500	n=1	w=972	top=a26dca56a26c1f25	bleed=9a25f15d6631b087	r0=8c80504a8e1a0b8e:1b64ac94c1babf0b:277a11a8fb5adef3	| ↻ Downloading assets   25%|
 frame	bar50	Solarized Light	80	still	2500	n=1	w=972	top=a26dca56a26c1f25	bleed=9a25f15d6631b087	r0=8d3b73ce1eebffba:f9873ef8a36f38b2:35875effb386ec80	| ↻ Downloading assets   50%|
 frame	bar999	Solarized Light	80	still	2500	n=1	w=972	top=a26dca56a26c1f25	bleed=c2cdfd07c2c63b23	r0=f419c735de6bdf86:265973ee51cf26cb:8f5f06b0362d8f8d	| ↻ Downloading assets   99%|
 frame	bar100	Solarized Light	80	still	2500	n=1	w=972	top=a26dca56a26c1f25	bleed=843047236f907531	r0=ca04bb1ed9793409:eccd74ccc76210fa:712f3477ee11e3d7	| ↻ Downloading assets  100%|
 frame	amount	Solarized Light	80	still	2600	n=1	w=972	top=a26dca56a26c1f25	bleed=9a25f15d6631b087	r0=5f5343b621f02b8b:c69f2e226fdc8aa2:3203456b1771c352	| ↻ Copying files   70%|
 frame	amount	Solarized Light	80	still	3000	n=1	w=972	top=a26dca56a26c1f25	bleed=9a25f15d6631b087	r0=5f5343b621f02b8b:c69f2e226fdc8aa2:3203456b1771c352	| ↻ Copying files   70%|
-frame	busy	Solarized Light	80	still	2600	n=1	w=972	top=a26dca56a26c1f25	bleed=e291a3550cd4182d	r0=a660202fd60ebd90:db2150b6b5a28e62:2539bddb8869a338	| ↻ Indexing the tree|
-frame	busy	Solarized Light	80	still	3400	n=1	w=972	top=a26dca56a26c1f25	bleed=e291a3550cd4182d	r0=a660202fd60ebd90:db2150b6b5a28e62:2539bddb8869a338	| ↻ Indexing the tree|
-frame	busy	Solarized Light	80	still	4700	n=1	w=972	top=a26dca56a26c1f25	bleed=e291a3550cd4182d	r0=a660202fd60ebd90:db2150b6b5a28e62:2539bddb8869a338	| ↻ Indexing the tree|
+frame	busy	Solarized Light	80	still	2600	n=1	w=972	top=a26dca56a26c1f25	bleed=e291a3550cd4182d	r0=fc70f4fc947ae37e:db2150b6b5a28e62:1e1fe2ff55b7576d	| ↻ Indexing the tree|
+frame	busy	Solarized Light	80	still	3400	n=1	w=972	top=a26dca56a26c1f25	bleed=e291a3550cd4182d	r0=fc70f4fc947ae37e:db2150b6b5a28e62:1e1fe2ff55b7576d	| ↻ Indexing the tree|
+frame	busy	Solarized Light	80	still	4700	n=1	w=972	top=a26dca56a26c1f25	bleed=e291a3550cd4182d	r0=fc70f4fc947ae37e:db2150b6b5a28e62:1e1fe2ff55b7576d	| ↻ Indexing the tree|
 frame	stall	Solarized Light	80	still	2500	n=1	w=972	top=a26dca56a26c1f25	bleed=9a25f15d6631b087	r0=63f442d85a35bca0:eb04454ba41f7a66:dbc958b09daa9f92	| ↻ Uploading logs   40%|
 frame	stall	Solarized Light	80	still	13000	n=1	w=972	top=a26dca56a26c1f25	bleed=9a25f15d6631b087	r0=63f442d85a35bca0:eb04454ba41f7a66:dbc958b09daa9f92	| ↻ Uploading logs   40%|
 frame	complete	Solarized Light	80	still	2500	n=1	w=972	top=a26dca56a26c1f25	bleed=9a25f15d6631b087	r0=f46737116b76e0df:f9873ef8a36f38b2:83142e4a03521b1e	| ↻ Building   50%|
@@ -687,16 +687,16 @@ frame	shrink	Solarized Light	80	still	2700	n=1	w=972	top=a26dca56a26c1f25	bleed=
 frame	record	Solarized Light	120	moving	100	n=0	w=1452	top=00042d33a7444d55	bleed=669b18c6d2d9c95b	||
 frame	warn	Solarized Light	120	moving	100	n=1	w=1452	top=a3349e7279e57f25	bleed=6eff488e781db647	r0=23538c8f3a53fd74:a6d43272dde4fa17:4ba656bf40fa825a	| ⚠ Disk nearly full · 2 GB left on /|
 frame	error	Solarized Light	120	moving	100	n=1	w=1452	top=a3349e7279e57f25	bleed=6eff488e781db647	r0=2a55fd4a6689df65:2b7701dba62f04b7:b683eb870b968708	| ✕ Deploy failed · exit 1|
-frame	bar0	Solarized Light	120	moving	2500	n=1	w=1452	top=a3349e7279e57f25	bleed=8af2c3aa78d9cde9	r0=4e83ac1783e1ae18:3503afef2c4976aa:79be1b387889967b	| ↻ Downloading assets    0%|
+frame	bar0	Solarized Light	120	moving	2500	n=1	w=1452	top=a3349e7279e57f25	bleed=8af2c3aa78d9cde9	r0=2bf7e99ed66749e4:3503afef2c4976aa:da056c6511b3d7dc	| ↻ Downloading assets    0%|
 frame	bar25	Solarized Light	120	moving	2500	n=1	w=1452	top=a3349e7279e57f25	bleed=9a25f15d6631b087	r0=528b3ed000d5584c:23ce317f35282c05:5003410b612f5a7a	| ↻ Downloading assets   25%|
 frame	bar50	Solarized Light	120	moving	2500	n=1	w=1452	top=a3349e7279e57f25	bleed=9a25f15d6631b087	r0=57052ae5b8220676:cf63dff68f4e9012:20eda99595141000	| ↻ Downloading assets   50%|
 frame	bar999	Solarized Light	120	moving	2500	n=1	w=1452	top=a3349e7279e57f25	bleed=3fd7d011f0f8df96	r0=2e1a35a1c2c1772a:14499ba6f651c7b0:cb01639f23787b79	| ↻ Downloading assets   99%|
 frame	bar100	Solarized Light	120	moving	2500	n=1	w=1452	top=a3349e7279e57f25	bleed=843047236f907531	r0=dbb1c20128ed19b1:a37cfefd45d3879a:4d163fe96623af97	| ↻ Downloading assets  100%|
 frame	amount	Solarized Light	120	moving	2600	n=1	w=1452	top=a3349e7279e57f25	bleed=9a25f15d6631b087	r0=88f4114d01b538c7:61a46ddc511ab5cd:78e044b7b92247d2	| ↻ Copying files   70%|
 frame	amount	Solarized Light	120	moving	3000	n=1	w=1452	top=a3349e7279e57f25	bleed=9a25f15d6631b087	r0=88f4114d01b538c7:61a46ddc511ab5cd:78e044b7b92247d2	| ↻ Copying files   70%|
-frame	busy	Solarized Light	120	moving	2600	n=1	w=1452	top=a3349e7279e57f25	bleed=e291a3550cd4182d	r0=4df5c994136231b0:a47a8bbdd69181c2:8a9f96e27ac31241	| ↻ Indexing the tree|
-frame	busy	Solarized Light	120	moving	3400	n=1	w=1452	top=a3349e7279e57f25	bleed=e291a3550cd4182d	r0=c9a1774bdb13dc17:3780329b22e38cd7:d517b3fe343bde87	| ↻ Indexing the tree|
-frame	busy	Solarized Light	120	moving	4700	n=1	w=1452	top=a3349e7279e57f25	bleed=e291a3550cd4182d	r0=cf010d4dc91c230b:0bc6dee398e602f9:38793f44baee459c	| ↻ Indexing the tree|
+frame	busy	Solarized Light	120	moving	2600	n=1	w=1452	top=a3349e7279e57f25	bleed=e291a3550cd4182d	r0=c1e7388b390a2904:a47a8bbdd69181c2:cdc06a9aa11ebe25	| ↻ Indexing the tree|
+frame	busy	Solarized Light	120	moving	3400	n=1	w=1452	top=a3349e7279e57f25	bleed=e291a3550cd4182d	r0=0d7f0ec1067f9c33:3780329b22e38cd7:8b0dc43b543de8ab	| ↻ Indexing the tree|
+frame	busy	Solarized Light	120	moving	4700	n=1	w=1452	top=a3349e7279e57f25	bleed=e291a3550cd4182d	r0=b9131138e6d2a507:0bc6dee398e602f9:0c0e52566e4d34b8	| ↻ Indexing the tree|
 frame	stall	Solarized Light	120	moving	2500	n=1	w=1452	top=a3349e7279e57f25	bleed=9a25f15d6631b087	r0=c015cdef010e3314:a2da7211d3e5127f:711660783fcf3052	| ↻ Uploading logs   40%|
 frame	stall	Solarized Light	120	moving	13000	n=1	w=1452	top=a3349e7279e57f25	bleed=9a25f15d6631b087	r0=4f1e0a3034c8a469:2ea1bf5734db09eb:e5342fa179432bdc	| ↻ Uploading logs   40%|
 frame	complete	Solarized Light	120	moving	2500	n=1	w=1452	top=a3349e7279e57f25	bleed=9a25f15d6631b087	r0=b4e14311e45edbd3:cf63dff68f4e9012:6c8783f3484d7a1e	| ↻ Building   50%|
@@ -715,16 +715,16 @@ frame	shrink	Solarized Light	120	moving	2700	n=1	w=1452	top=a3349e7279e57f25	ble
 frame	record	Solarized Light	120	still	100	n=0	w=1452	top=00042d33a7444d55	bleed=669b18c6d2d9c95b	||
 frame	warn	Solarized Light	120	still	100	n=1	w=1452	top=a3349e7279e57f25	bleed=6eff488e781db647	r0=23538c8f3a53fd74:a6d43272dde4fa17:4ba656bf40fa825a	| ⚠ Disk nearly full · 2 GB left on /|
 frame	error	Solarized Light	120	still	100	n=1	w=1452	top=a3349e7279e57f25	bleed=6eff488e781db647	r0=2a55fd4a6689df65:2b7701dba62f04b7:b683eb870b968708	| ✕ Deploy failed · exit 1|
-frame	bar0	Solarized Light	120	still	2500	n=1	w=1452	top=a3349e7279e57f25	bleed=8af2c3aa78d9cde9	r0=4e83ac1783e1ae18:3503afef2c4976aa:79be1b387889967b	| ↻ Downloading assets    0%|
+frame	bar0	Solarized Light	120	still	2500	n=1	w=1452	top=a3349e7279e57f25	bleed=8af2c3aa78d9cde9	r0=2bf7e99ed66749e4:3503afef2c4976aa:da056c6511b3d7dc	| ↻ Downloading assets    0%|
 frame	bar25	Solarized Light	120	still	2500	n=1	w=1452	top=a3349e7279e57f25	bleed=9a25f15d6631b087	r0=528b3ed000d5584c:23ce317f35282c05:5003410b612f5a7a	| ↻ Downloading assets   25%|
 frame	bar50	Solarized Light	120	still	2500	n=1	w=1452	top=a3349e7279e57f25	bleed=9a25f15d6631b087	r0=57052ae5b8220676:cf63dff68f4e9012:20eda99595141000	| ↻ Downloading assets   50%|
 frame	bar999	Solarized Light	120	still	2500	n=1	w=1452	top=a3349e7279e57f25	bleed=3fd7d011f0f8df96	r0=2e1a35a1c2c1772a:14499ba6f651c7b0:cb01639f23787b79	| ↻ Downloading assets   99%|
 frame	bar100	Solarized Light	120	still	2500	n=1	w=1452	top=a3349e7279e57f25	bleed=843047236f907531	r0=dbb1c20128ed19b1:a37cfefd45d3879a:4d163fe96623af97	| ↻ Downloading assets  100%|
 frame	amount	Solarized Light	120	still	2600	n=1	w=1452	top=a3349e7279e57f25	bleed=9a25f15d6631b087	r0=88f4114d01b538c7:61a46ddc511ab5cd:78e044b7b92247d2	| ↻ Copying files   70%|
 frame	amount	Solarized Light	120	still	3000	n=1	w=1452	top=a3349e7279e57f25	bleed=9a25f15d6631b087	r0=88f4114d01b538c7:61a46ddc511ab5cd:78e044b7b92247d2	| ↻ Copying files   70%|
-frame	busy	Solarized Light	120	still	2600	n=1	w=1452	top=a3349e7279e57f25	bleed=e291a3550cd4182d	r0=36a39295bf4e9490:a47a8bbdd69181c2:209c2b52b4398d38	| ↻ Indexing the tree|
-frame	busy	Solarized Light	120	still	3400	n=1	w=1452	top=a3349e7279e57f25	bleed=e291a3550cd4182d	r0=36a39295bf4e9490:a47a8bbdd69181c2:209c2b52b4398d38	| ↻ Indexing the tree|
-frame	busy	Solarized Light	120	still	4700	n=1	w=1452	top=a3349e7279e57f25	bleed=e291a3550cd4182d	r0=36a39295bf4e9490:a47a8bbdd69181c2:209c2b52b4398d38	| ↻ Indexing the tree|
+frame	busy	Solarized Light	120	still	2600	n=1	w=1452	top=a3349e7279e57f25	bleed=e291a3550cd4182d	r0=6ef9e6ddc4056f5e:a47a8bbdd69181c2:95c7b4f5cf9a656d	| ↻ Indexing the tree|
+frame	busy	Solarized Light	120	still	3400	n=1	w=1452	top=a3349e7279e57f25	bleed=e291a3550cd4182d	r0=6ef9e6ddc4056f5e:a47a8bbdd69181c2:95c7b4f5cf9a656d	| ↻ Indexing the tree|
+frame	busy	Solarized Light	120	still	4700	n=1	w=1452	top=a3349e7279e57f25	bleed=e291a3550cd4182d	r0=6ef9e6ddc4056f5e:a47a8bbdd69181c2:95c7b4f5cf9a656d	| ↻ Indexing the tree|
 frame	stall	Solarized Light	120	still	2500	n=1	w=1452	top=a3349e7279e57f25	bleed=9a25f15d6631b087	r0=c015cdef010e3314:a2da7211d3e5127f:711660783fcf3052	| ↻ Uploading logs   40%|
 frame	stall	Solarized Light	120	still	13000	n=1	w=1452	top=a3349e7279e57f25	bleed=9a25f15d6631b087	r0=c015cdef010e3314:a2da7211d3e5127f:711660783fcf3052	| ↻ Uploading logs   40%|
 frame	complete	Solarized Light	120	still	2500	n=1	w=1452	top=a3349e7279e57f25	bleed=9a25f15d6631b087	r0=b4e14311e45edbd3:cf63dff68f4e9012:6c8783f3484d7a1e	| ↻ Building   50%|

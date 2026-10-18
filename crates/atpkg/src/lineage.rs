@@ -1,25 +1,46 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Which compiler built a toolchain or a payload, decided by content, never by a name (a `#!`
-//! wrapper can be called `trustc`; rustup's `librustc_driver` can be vendored). Two independent
-//! halves:
+//! LINEAGE — which compiler built a toolchain or a payload, decided by CONTENT and
+//! never by a name (owner order 2026-09-29: "NO STOCK RUST IN THE TOOLCHAIN FOR TRUST").
+//!
+//! Every name a stock toolchain can wear has been worn on this project. The genesis
+//! stage0 was a directory of POSIX shell scripts called `trustc` and `targo` that exec'd
+//! rustup's stable and renamed its `--version`; `ay` 8256 was packed by stock rustc
+//! 1.97.1; `trust-mc` 20065 shipped rustup's nightly `librustc_driver`, which
+//! the pack-time relocation had vendored because vendoring from `~/.rustup` was its design
+//! (stock-rust audit 2026-09-29: TP-3, TP-4, TP-7, M7). Nothing in the packing lanes
+//! looked at what the bytes were. This module does, in two independent halves:
 //!
 //! 1. **Compiler admission** ([`check_compiler`]). `trustc`, `targo` and the one
-//!    `librustc_driver` must be native objects (Mach-O or ELF), none may resolve into rustup's
-//!    directory, `~/.cargo` or Homebrew, `trustc -vV` must carry a Trust identity, and the
-//!    three files must pass the payload scan. Then lineage: the root carries `LINEAGE`
-//!    ([`stamp`], naming the shipped bytes) or the trust repo's `SEED-MINT` receipt (built from
-//!    the committed stage0 pin and double-compiled), checked against the actual bytes. With
-//!    neither the toolchain is refused, or admitted as `unproven` under
-//!    [`LineagePolicy::Dormant`].
-//! 2. **Payload scan** ([`scan_tree`]). Every compiled object in a staged tree is read for
-//!    evidence of another compiler: a `/rustc/<40-hex>/` std path (stock std embeds its
-//!    commit, Trust's none), a crate-metadata header, an LLVM producer or ELF `.comment` line,
-//!    a wasm `producers` entry, or a path into a rustup toolchain. The scan refuses evidence
-//!    but never proves its absence (a stock `#![no_std]` `.o` without debuginfo names no
-//!    compiler), so admission decides who compiled a pack: the packers build only with the
-//!    admitted compiler, `RUSTC` set to its `trustc`.
+//!    `librustc_driver` must be native objects (Mach-O or ELF; a `#!` script is a
+//!    wrapper around some other compiler), none may resolve into rustup's directory,
+//!    `~/.cargo` or Homebrew, `trustc -vV` must carry a Trust identity (`binary:
+//!    trustc`, a `trust:` line, a 40-hex `commit-hash`), and the three files' own bytes
+//!    must carry no other compiler's evidence (the payload scan below, run over them).
+//!    Then LINEAGE: the toolchain root carries either `LINEAGE` (written by the
+//!    producer's stamp, `atpkg-publish`'s `artifact::lineage::stamp_with`, inside a
+//!    signed bundle, after strip and relocate, naming the shipped bytes) or the trust
+//!    repo's pack-cut receipt `SEED-MINT` (`trust-seed-mint-v1`:
+//!    built from the committed stage0 pin, double-compiled byte-identically against
+//!    another compiler, re-pinned), checked against the ACTUAL bytes. A toolchain with
+//!    neither is refused, or — only under [`LineagePolicy::Dormant`], the switch the
+//!    lanes flip until the trust repo's first minted re-pin lands — admitted with its
+//!    lineage recorded as `unproven`.
+//! 2. **Payload scan** ([`scan_object`]; the producer's `artifact::lineage::scan_tree`
+//!    walks a staged tree with it). Every Mach-O, ELF, PE, wasm, rlib, rmeta and
+//!    static archive in a staged tree is read for compiler evidence, and any that names
+//!    a compiler other than the admitted one is refused: a `/rustc/<40-hex>/` std path
+//!    (stock std embeds its commit there; Trust's std embeds none — measured on the
+//!    7d5533b2 seal, store trust 9192 and the rustc-private sysroots), a crate-metadata
+//!    header, an LLVM producer or ELF `.comment` line, or a wasm `producers` entry
+//!    naming another commit, and any path into a rustup toolchain directory.
+//!    The scan refuses evidence; it never proves there is none. An object that names
+//!    no compiler passes it: measured 2026-10-01, rustup 1.97.1's `#![no_std]` `.o`
+//!    without debuginfo carries none, while its rlib is refused for its metadata and
+//!    producer. So the compiler admission decides who compiled a pack: the packers
+//!    build only with the admitted compiler, with `RUSTC` set to its sibling `trustc`.
+//!    The scan catches bytes that came from elsewhere and say so.
 //!
 //! A toolchain bootstrapped from a stock stage0 can pass the scan and still fail lineage.
 //!
@@ -34,7 +55,7 @@ use std::path::{Path, PathBuf};
 
 use aterm_digest::Sha256;
 
-/// The receipt a signed bundle carries beside its compiler ([`stamp`] writes it).
+/// The receipt a signed bundle carries beside its compiler (the producer's stamp writes it).
 pub const LINEAGE_FILE: &str = "LINEAGE";
 /// The trust repo's pack-cut receipt (scripts/promote-toolchain.sh seals it).
 pub const SEED_MINT_FILE: &str = "SEED-MINT";
@@ -570,8 +591,7 @@ fn read_receipt(path: &Path) -> Option<Receipt> {
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
-        // Split as the trust repo's shell reader (`read -r want rel`) does: the first word,
-        // then the rest, trimmed.
+        // The first word, then the rest, trimmed.
         let pair = || {
             let v = value.trim_start();
             let (a, b) = v.split_once(char::is_whitespace).unwrap_or((v, ""));
@@ -601,9 +621,10 @@ fn inside(root: &Path, rel: &str) -> Option<PathBuf> {
 }
 
 /// The seal's SEED-MINT refusals, one line each; empty when `<seal>/SEED-MINT` is a
-/// double-compile-backed re-pin receipt of `commit` whose every compared file and link is in
-/// `<seal>` as compared. `atpkg-publish publish-group` and `atpkg lineage seed-mint` both call
-/// it.
+/// double-compile-backed re-pin receipt of `commit` whose every compared file and link
+/// is in `<seal>` as compared — so it describes THIS seal. The one implementation:
+/// [`check_compiler_with`] applies it to a toolchain's own receipt, and `atpkg-publish
+/// publish-group` to the seal it is about to pack.
 #[must_use]
 pub fn seed_mint_refusals(seal: &Path, commit: &str) -> Vec<String> {
     seed_mint_refusals_inner(seal, commit, true)
@@ -780,99 +801,9 @@ fn lineage_record_refusals(c: &CompilerContent) -> Result<(String, String), Vec<
     }
 }
 
-/// Write `LINEAGE` into a staged toolchain tree after its last byte-changing pass (strip,
-/// relocate, re-sign), so a later [`check_compiler`] admits the signed tree against the
-/// shipped bytes.
-///
-/// `source` must be admitted with its lineage proven (a SEED-MINT checked against the
-/// unstripped seal, or a store build's own LINEAGE); the staged compiler must be the same
-/// commit, and the staged tree's SEED-MINT the source's.
-///
-/// # Errors
-/// Every refusal, one line each; nothing is written then.
-pub fn stamp(stage_root: &Path, source_bin: &Path) -> Result<String, Vec<String>> {
-    stamp_with(stage_root, source_bin, &probe_version)
-}
-
-/// [`stamp`] with the `-vV` probe injected.
-pub fn stamp_with(
-    stage_root: &Path,
-    source_bin: &Path,
-    probe: &dyn Fn(&Path) -> Result<String, String>,
-) -> Result<String, Vec<String>> {
-    let source = check_compiler_with(source_bin, LineagePolicy::Require, probe)?;
-    let (receipt_sha256, relation) = match &source.lineage {
-        LineageProof::Lineage {
-            receipt_sha256,
-            relation,
-        }
-        | LineageProof::SeedMint {
-            receipt_sha256,
-            relation,
-        } => (receipt_sha256.clone(), relation.clone()),
-        LineageProof::Unproven => {
-            return Err(vec![
-                "the source's lineage is unproven: nothing to stamp".to_string(),
-            ]);
-        }
-    };
-    let staged = admit_content_with(&stage_root.join("bin"), probe).map_err(|lines| {
-        lines
-            .into_iter()
-            .map(|l| format!("the staged tree: {l}"))
-            .collect::<Vec<_>>()
-    })?;
-    let mut refusals = Vec::new();
-    if staged.version.commit != source.content.version.commit {
-        refusals.push(format!(
-            "the staged bin/trustc reports {}, the source {}",
-            staged.version.commit, source.content.version.commit
-        ));
-    }
-    match read_receipt(&staged.root.join(SEED_MINT_FILE)) {
-        Some(mint) if mint.sha256 == receipt_sha256 => {}
-        Some(mint) => refusals.push(format!(
-            "the staged SEED-MINT is {}, not the source's {receipt_sha256}",
-            mint.sha256
-        )),
-        None => refusals.push("the staged tree carries no SEED-MINT".to_string()),
-    }
-    if !refusals.is_empty() {
-        return Err(refusals);
-    }
-    let text = format!(
-        "# {LINEAGE_FILE}: the compiler this tree ships and the pack-cut receipt that proves \
-         its lineage,\n\
-         # written after strip and relocate by atpkg lineage stamp (atpkg-publish pack-bundle);\n\
-         # the signed tree_root covers it. `atpkg lineage check-compiler <root>/bin` checks it.\n\
-         schema={LINEAGE_SCHEMA}\n\
-         compiler_commit={}\n\
-         compiler_release={}\n\
-         lineage_receipt={SEED_MINT_FILE}\n\
-         lineage_receipt_sha256={receipt_sha256}\n\
-         ddc_seed_relation={relation}\n\
-         trustc_sha256={}\n\
-         targo_sha256={}\n\
-         driver={} {}\n",
-        staged.version.commit,
-        staged.version.release,
-        staged.trustc_sha256,
-        staged.targo_sha256,
-        staged.driver_sha256,
-        staged.driver_rel,
-    );
-    let dest = staged.root.join(LINEAGE_FILE);
-    let tmp = staged.root.join(format!(".{LINEAGE_FILE}.atpkg-stamp"));
-    std::fs::write(&tmp, &text)
-        .and_then(|()| std::fs::rename(&tmp, &dest))
-        .map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            vec![format!("write {}: {e}", dest.display())]
-        })?;
-    Ok(text)
-}
-
-// The payload scan.
+// ---------------------------------------------------------------------------------------
+// THE PAYLOAD SCAN
+// ---------------------------------------------------------------------------------------
 
 /// One kind of compiler evidence found in a payload.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -928,66 +859,22 @@ impl Finding {
     }
 }
 
-/// What [`scan_tree`] read.
-#[derive(Debug, Default)]
-pub struct ScanReport {
-    /// Compiled objects read.
-    pub objects: usize,
-    /// Evidence of any compiler but the admitted one. Empty ⇒ the tree passes.
-    pub findings: Vec<Finding>,
-}
-
-/// Whether `path` is compiled output the scan reads: by head (Mach-O, ELF, PE, wasm, an
-/// ar archive, crate metadata) or by name (`.rlib`/`.rmeta`/`.a`/`.o`/`.so`/`.dylib`/
-/// `.dll`/`.wasm`).
-fn is_compiled_output(path: &Path) -> bool {
-    let named = path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
-        matches!(
-            e,
-            "rlib" | "rmeta" | "a" | "o" | "so" | "dylib" | "dll" | "wasm"
-        )
-    }) || path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n.contains(".so."));
-    if named {
-        return true;
-    }
-    let Ok(head) = crate::metadata_io::read_head(path, 8) else {
-        return false;
-    };
-    crate::macho::is_macho_header(&head)
-        || head.starts_with(b"\x7fELF")
-        || head.starts_with(b"MZ")
-        || head.starts_with(b"\0asm")
-        || head.starts_with(b"!<arch>\n")
-        || head.starts_with(b"rust\0\0\0")
-}
-
-/// Scan every compiled object under `root` (regular files only, no symlink followed)
-/// for evidence of any compiler but the one whose commit-hash is `admitted`.
+/// The evidence of any compiler but the one whose commit-hash is `admitted` in the object
+/// at `path`, read streamed: the client's payload scan of one file, which the producer's
+/// tree scan (`atpkg-publish`'s `artifact::lineage::scan_tree`) runs over every compiled
+/// object it packs, and [`admit_content`] over a compiler's own bytes.
 ///
 /// # Errors
-/// A directory or file that cannot be read — never a silent skip.
-pub fn scan_tree(root: &Path, admitted: &str) -> Result<ScanReport, String> {
-    let mut report = ScanReport::default();
-    for rel in crate::relocate::walk_files(root)? {
-        let path = root.join(&rel);
-        if !is_compiled_output(&path) {
-            continue;
-        }
-        report.objects += 1;
-        let (hits, _) =
-            scan_file(&path, admitted, false).map_err(|e| format!("{}: {e}", rel.display()))?;
-        for (evidence, count) in hits {
-            report.findings.push(Finding {
-                file: rel.to_string_lossy().into_owned(),
-                evidence,
-                count,
-            });
-        }
-    }
-    Ok(report)
+/// The file cannot be read.
+pub fn scan_object(path: &Path, admitted: &str) -> std::io::Result<BTreeMap<Evidence, usize>> {
+    scan_file(path, admitted, false).map(|(hits, _)| hits)
+}
+
+/// The sha256 of the receipt at `path` (a `SEED-MINT`), as a `LINEAGE` record names it:
+/// `None` when it is not a readable regular file of at most the receipt limit.
+#[must_use]
+pub fn receipt_sha256(path: &Path) -> Option<String> {
+    read_receipt(path).map(|r| r.sha256)
 }
 
 /// The window read past an anchor: the longest structure examined is a crate-metadata

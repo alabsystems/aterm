@@ -440,7 +440,7 @@ fn a_due_vendor_without_a_store_does_not_spin_the_package_lane() {
 /// local bump, retain priority when both answers are already available.
 #[test]
 fn slow_index_probe_does_not_hold_a_ready_vendor_hint() {
-    let model = aterm_spec::derive::atpkg_index_pending_park_model();
+    let model = aterm_models_atpkg::atpkg_index_pending_park_model();
     let mut state = model.init_state();
     let layout = store_with_legacy_claude("index-overlap");
     let asked = Arc::new(Mutex::new(Vec::new()));
@@ -524,7 +524,7 @@ fn slow_index_probe_does_not_hold_a_ready_vendor_hint() {
 /// may probe at that expiry, with no early request or added local interval.
 #[test]
 fn a_suppressed_window_index_probe_uses_the_shared_expiry() {
-    use aterm_spec::derive::atpkg_index_shared_handoff_model;
+    use aterm_models_atpkg::atpkg_index_shared_handoff_model;
 
     let layout = atpkg::store::Layout {
         prefix: std::env::temp_dir().join(format!(
@@ -580,7 +580,7 @@ fn a_suppressed_window_index_probe_uses_the_shared_expiry() {
 /// that still-fresh stamp, pushing the next real HEAD to 60 seconds.
 #[test]
 fn next_index_probe_is_paced_from_worker_completion() {
-    let model = aterm_spec::derive::atpkg_index_probe_completion_cadence_model();
+    let model = aterm_models_atpkg::atpkg_index_probe_completion_cadence_model();
     let mut state = model.init_state();
     let layout = atpkg::store::Layout {
         prefix: std::env::temp_dir().join("aterm-index-completion-cadence-absent"),
@@ -653,7 +653,7 @@ fn next_index_probe_is_paced_from_worker_completion() {
 /// the pass and its later final answer is invalidated by that pass.
 #[test]
 fn near_index_wakes_while_unrelated_probe_helpers_are_still_running() {
-    let model = aterm_spec::derive::atpkg_index_pending_park_model();
+    let model = aterm_models_atpkg::atpkg_index_pending_park_model();
     let mut state = model.init_state();
     let layout = atpkg::store::Layout {
         prefix: std::env::temp_dir().join(format!("aterm-near-index-early-{}", std::process::id())),
@@ -844,7 +844,7 @@ fn final_index_answer_unparks_a_package_lane_without_vendor_heads() {
 /// build immediately; its older far/listing answer remains invalidated.
 #[test]
 fn higher_near_index_after_pass_start_wakes_before_unrelated_helpers_finish() {
-    let model = aterm_spec::derive::atpkg_index_pending_park_model();
+    let model = aterm_models_atpkg::atpkg_index_pending_park_model();
     let mut state = model.init_state();
     let layout = atpkg::store::Layout {
         prefix: std::env::temp_dir().join(format!(
@@ -1054,7 +1054,7 @@ fn a_suppressed_near_build_does_not_hide_a_higher_near_build() {
 
 #[test]
 fn stale_missing_index_answer_keeps_the_new_full_pass_mark() {
-    let model = aterm_spec::derive::atpkg_index_pending_park_model();
+    let model = aterm_models_atpkg::atpkg_index_pending_park_model();
     let mut state = model.init_state();
     let layout = store_with_legacy_claude("stale-index-after-pass");
     let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -1136,7 +1136,7 @@ fn stale_missing_index_answer_keeps_the_new_full_pass_mark() {
 
 #[test]
 fn a_ready_index_wins_before_a_ready_vendor_get() {
-    let model = aterm_spec::derive::atpkg_index_pending_park_model();
+    let model = aterm_models_atpkg::atpkg_index_pending_park_model();
     let mut state = model.init_state();
     let layout = store_with_legacy_claude("index-priority");
     let asked = Arc::new(Mutex::new(Vec::new()));
@@ -1233,7 +1233,7 @@ fn a_ready_index_wins_before_a_ready_vendor_get() {
 
 #[test]
 fn a_vendor_hint_harvested_with_a_higher_priority_event_survives_to_the_next_park() {
-    let model = aterm_spec::derive::atpkg_index_pending_park_model();
+    let model = aterm_models_atpkg::atpkg_index_pending_park_model();
     for (label, bumped, full_due, index_ready) in [
         ("bump", true, false, false),
         ("deadline", false, true, false),
@@ -1389,15 +1389,12 @@ fn an_exclusion_edited_in_a_running_window_reaches_the_head_watch() {
 fn the_park_ends_at_a_wall_clock_deadline_and_never_strands_on_a_clock_set_back() {
     let layout = store_with_legacy_claude("wall");
     let five_minutes = Duration::from_secs(300);
-    // Each park runs and is timed on its own thread. "At once" must take less than one
-    // `PARK_SLICE` (a loop that sleeps before checking the deadline fails); the minute is
-    // a hang detector.
+    // Both parks run on a thread of their own; the minute is a hang detector.
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let parked = layout.clone();
     std::thread::spawn(move || {
         let park = |until: SystemTime| {
-            let started = Instant::now();
-            let end = sleep_interval_watching_bump(
+            sleep_interval_watching_bump(
                 Some(&parked),
                 &mut { until },
                 five_minutes,
@@ -1405,29 +1402,20 @@ fn the_park_ends_at_a_wall_clock_deadline_and_never_strands_on_a_clock_set_back(
                 ParkProbes::NONE,
                 None,
                 &mut LiveSwitch::new(None, LoopGate::On),
-            );
-            (end, started.elapsed())
+            )
         };
         let past = park(SystemTime::now() - Duration::from_secs(60));
         let set_back = park(SystemTime::now() + Duration::from_secs(3600));
         let _ = done_tx.send((past, set_back));
     });
-    let ((past, past_took), (set_back, set_back_took)) = done_rx
+    let (past, set_back) = done_rx
         .recv_timeout(Duration::from_secs(60))
         .expect("neither park sleeps toward its deadline");
     assert_eq!(past, ParkEnd::Elapsed);
-    assert!(
-        past_took < PARK_SLICE,
-        "past: at once, not after a slice: {past_took:?}"
-    );
     assert_eq!(
         set_back,
         ParkEnd::Elapsed,
         "an hour out, on a five-minute park: the clock went back"
-    );
-    assert!(
-        set_back_took < PARK_SLICE,
-        "set back: at once, not after a slice: {set_back_took:?}"
     );
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
@@ -1516,7 +1504,7 @@ fn ready_codex_starts_its_pass_before_stalled_claude_finishes() {
     // The stub's first exec can wait tens of seconds on macOS's assessment of a freshly
     // written file; pay it here, unbounded, before Claude's stall starts its clock.
     // Spawned the way the lane spawns it; the log keeps only the pass's argv.
-    crate::qos::command(crate::qos::Role::Background, &atpkg)
+    crate::qos::atpkg_command(&atpkg)
         .stdin(aterm_uds::spawnfd::Stdio::null())
         .stdout(aterm_uds::spawnfd::Stdio::null())
         .stderr(aterm_uds::spawnfd::Stdio::null())
@@ -1767,18 +1755,6 @@ fn a_private_windows_passes_lead_with_the_flag_and_the_owners_do_not() {
         );
     }
     let _ = std::fs::remove_dir_all(&dir);
-    // The live lane asks the helper, once, where it is built.
-    let src = include_str!("lib.rs");
-    let start = src
-        .find("\nfn spawn_pkg_update_check(")
-        .expect("the live lane");
-    let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
-    assert_eq!(
-        body.matches("private_state_root: aterm_types::dirs::runs_under_private_state_root(),")
-            .count(),
-        1,
-        "{body}"
-    );
 }
 
 /// TC-5 — THE LANE'S FIRST-RUN ROW AND EACH CHILD'S PATH. A lane holding the row

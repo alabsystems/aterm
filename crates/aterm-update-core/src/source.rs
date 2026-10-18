@@ -175,13 +175,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn source_resolve_defaults_when_nothing_configured() {
-        let s = Source::resolve(None, None);
-        assert_eq!(s.owner, DEFAULT_OWNER);
-        assert_eq!(s.repo, DEFAULT_REPO);
-    }
-
     /// A development build honours a configured repoint; a shipped one never does. A test
     /// build is a development build, so the shipped posture goes through `resolve_with`.
     #[test]

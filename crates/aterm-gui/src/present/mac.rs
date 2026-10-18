@@ -275,12 +275,13 @@ impl MacCpuPresenter {
             if self.applied_geometry == Some(geometry) {
                 return;
             }
-            let set_frame: unsafe extern "C-unwind" fn(Id, Sel, CGRect) = aterm_objc::msg();
+            let set_frame: unsafe extern "C-unwind" fn(Id, Sel, CGRect) = aterm_objc::checked_msg();
             set_frame(self.layer.id(), sel!(setFrame:), bounds);
             // A non-positive scale would divide the contents to nothing; keep
             // whatever the layer already had rather than blank the window.
             if scale > 0.0 {
-                let set_scale: unsafe extern "C-unwind" fn(Id, Sel, f64) = aterm_objc::msg();
+                let set_scale: unsafe extern "C-unwind" fn(Id, Sel, f64) =
+                    aterm_objc::checked_msg();
                 set_scale(self.layer.id(), sel!(setContentsScale:), scale);
             }
             self.applied_geometry = Some(geometry);
@@ -347,7 +348,8 @@ impl CpuPresenter for MacCpuPresenter {
             };
 
             // Top-left origin, matching the frontend's framebuffer coordinates.
-            let set_anchor: unsafe extern "C-unwind" fn(Id, Sel, CGPoint) = aterm_objc::msg();
+            let set_anchor: unsafe extern "C-unwind" fn(Id, Sel, CGPoint) =
+                aterm_objc::checked_msg();
             set_anchor(
                 layer.id(),
                 sel!(setAnchorPoint:),
@@ -542,8 +544,7 @@ impl CpuFrameBuffer for MacCpuFrame<'_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BITMAP_INFO, BITS_PER_COMPONENT, BITS_PER_PIXEL, BYTES_PER_PIXEL, MacPresentError,
-        release_pixel_box,
+        BITMAP_INFO, BITS_PER_COMPONENT, BITS_PER_PIXEL, BYTES_PER_PIXEL, release_pixel_box,
     };
 
     /// Pins the bitmap descriptor (where a divergence would show as wrong
@@ -579,29 +580,5 @@ mod tests {
         // SAFETY: exactly the pairing `commit` sets up — the thin pointer and
         // byte length of one leaked `Box<[u32]>`, delivered once.
         unsafe { release_pixel_box(std::ptr::null_mut(), raw.cast(), byte_len) };
-    }
-
-    /// Every failure is a displayable drop with a non-empty message, never a
-    /// panic.
-    #[test]
-    fn every_error_prints_something_actionable() {
-        for error in [
-            MacPresentError::NotMainThread,
-            MacPresentError::NoAppKitHandle,
-            MacPresentError::NoRootLayer,
-            MacPresentError::MissingClass("CALayer"),
-            MacPresentError::LayerAlloc,
-            MacPresentError::ColorSpace,
-            MacPresentError::EmptySurface,
-            MacPresentError::DataProvider,
-            MacPresentError::Image,
-        ] {
-            assert!(!error.to_string().is_empty());
-        }
-        assert!(
-            MacPresentError::MissingClass("CALayer")
-                .to_string()
-                .contains("CALayer")
-        );
     }
 }

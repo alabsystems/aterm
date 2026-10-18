@@ -14,9 +14,7 @@ description = "aterm VT conformance tests (feed -> read screen -> assert, the en
 autotests = false
 
 [dependencies]
-# `sixel` compiles the decode + inline-image placement path and advertises DA1
-# code 4, so the sixel tests assert real rendering, not consume-only.
-aterm-core = { workspace = true, features = ["sixel"] }
+aterm-core = { workspace = true }
 # The paint scanner decodes captured frames with the workspace's one PNG
 # decoder, and reads a recording's index.json with its one JSON parser.
 aterm-png = { workspace = true }
@@ -32,8 +30,19 @@ aterm-tempfile = { workspace = true }
 
 [dev-dependencies]
 aterm-types = { workspace = true }
+# `aterm_spec::host::could_not_run`: the one spelling of the COULD NOT RUN
+# sentinel the verify gate reads (paint and spin's undecided takes).
+aterm-spec = { workspace = true }
 # Scratch directories for the scanner's end-to-end PNG test.
 aterm-tempfile = { workspace = true }
+# THE DIFFERENTIAL VT ORACLE (tests/vt_oracle/): astream's pure, zero-dependency
+# screen fold, an engine written independently of aterm-core, fed the same bytes
+# and compared cell by cell inside the subset it models. A dev edge, so no
+# shipped build compiles it; it comes from the pinned submodule like
+# aterm-link's broker, and the edge is what puts this crate in the change cone
+# when the fold changes (`targo tree --invert` carries dev edges), so an
+# astream-term edit or a pin bump runs the oracle under a bare `verify`.
+astream-term = { path = "../../vendor/astream/crates/astream-term" }
 
 [lints]
 workspace = true

@@ -26,6 +26,7 @@ pub use record::{
     RECORD_SCHEMA, RECORD_SUFFIX, VendorRecord, complete_record, read_record, record_path,
 };
 pub use stamp::{ProgramStamp, stamp_path};
+pub(crate) use table::LEGACY_CEILING;
 pub use table::{
     AccountState, Anchor, DocPin, NEVER_INDEX_PINNED, VENDORS, VendorSpec, Warm, is_vendor,
     served_here, spec,
@@ -88,23 +89,4 @@ pub fn build_label(build: u64) -> String {
 /// 64 lowercase hex digits: a sha256 as every vendor file spells it.
 fn is_hex64(s: &str) -> bool {
     aterm_codec::hex::is_lower(s, 64)
-}
-
-#[cfg(test)]
-mod wording_tests {
-    use super::*;
-
-    /// The display words render a vendor build as its version and an index build as
-    /// its number.
-    #[test]
-    fn the_display_words_render_versions() {
-        let id = Version::parse("2.1.280").unwrap().build_id();
-        assert_eq!(build_label(id), "2.1.280");
-        assert_eq!(build_words(id), "2.1.280");
-        assert_eq!(build_words(4790), "build 4790");
-        assert_eq!(display_build("claude", id), "claude 2.1.280");
-        assert_eq!(display_build("trust", 4790), "trust build 4790");
-        let muse = Version::parse("1.4.9-R6297.1").unwrap().build_id();
-        assert_eq!(display_build("muse", muse), "muse 1.4.9-R6297.1");
-    }
 }

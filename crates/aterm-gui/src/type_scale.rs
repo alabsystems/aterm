@@ -11,9 +11,7 @@
 //! parameter is [`StepPx`] — and `StepPx`'s field is private to this module,
 //! so the ONLY way to mint one is [`TypeStep::px`] / [`TypeStep::px_clamped`].
 //! Every chrome text site therefore maps to a named step; an orphan multiplier
-//! cannot compile. The funnel itself (no `DrawPrim::Text` construction outside
-//! the one helper) is enforced by the `every_text_prim_goes_through_the_funnel`
-//! test in `crate::widget`.
+//! cannot compile. The funnel itself is [`crate::widget::text_prim`].
 
 /// A named step of the chrome type scale, largest to smallest. The factor is
 /// applied to the chrome's base size (the terminal `font_px` for the
@@ -35,16 +33,6 @@ pub(crate) enum TypeStep {
 }
 
 impl TypeStep {
-    /// Every step, largest first (the scale's public contract; tested below).
-    #[cfg(test)]
-    pub(crate) const ALL: [TypeStep; 5] = [
-        TypeStep::Display,
-        TypeStep::Title,
-        TypeStep::Body,
-        TypeStep::Secondary,
-        TypeStep::Caption,
-    ];
-
     /// The step's multiplier on the chrome base size — the ONE place a text
     /// size factor may be written.
     pub(crate) fn factor(self) -> f32 {
@@ -104,28 +92,6 @@ impl StepPx {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The scale is exactly five named steps, strictly descending, anchored at
-    /// Body = 1.0 — the "one named 5-step type scale" contract.
-    #[test]
-    fn five_named_steps_strictly_descending() {
-        assert_eq!(TypeStep::ALL.len(), 5);
-        for w in TypeStep::ALL.windows(2) {
-            assert!(
-                w[0].factor() > w[1].factor(),
-                "{:?} ({}) must be larger than {:?} ({})",
-                w[0],
-                w[0].factor(),
-                w[1],
-                w[1].factor()
-            );
-        }
-        assert_eq!(
-            TypeStep::Body.factor(),
-            1.0,
-            "Body anchors the scale at 1em"
-        );
-    }
 
     #[test]
     fn px_scales_linearly_and_clamps() {

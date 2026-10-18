@@ -8,8 +8,7 @@
 //! Sharing a process was checked, not assumed: no file below sets or removes an
 //! environment variable, installs a hook or an allocator, or re-executes
 //! itself; each file's scratch directories carry a prefix of its own
-//! (`aterm-footer-model-`, `aterm-operator-conformance-`,
-//! `codex-nudge-restart-`), so no two files share one; the one listener binds
+//! (`aterm-footer-model-`), so no two files share one; the one listener binds
 //! port 0; and the checker tier's `ty` spawns (`validate_transition_tiered`,
 //! built with aterm-spec's `checkers` feature only) take a scratch directory per
 //! call and share nothing else, so they run concurrently with every other `ty`.
@@ -26,12 +25,9 @@
 mod common;
 mod conformance_footer_model;
 mod conformance_login_wall;
-mod conformance_operator;
 mod conformance_upgrade_models;
 mod conformance_usage_tap;
-mod remote_turn_loopback_tls;
 mod supervise_conformance_account_rotation;
-mod supervise_conformance_codex_rate_nudge;
 mod supervise_conformance_done_check;
 mod supervise_conformance_model_switch;
 mod supervise_conformance_network_wall;

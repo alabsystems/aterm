@@ -11,11 +11,24 @@
 mod support;
 
 mod brief_budget;
+mod carry;
+mod claims;
+mod conformance_claims;
+mod conformance_cursor;
+mod conformance_journal;
+mod conformance_quota;
 mod conformance_ring;
 mod conformance_turn;
 mod discipline;
 mod fold_laws;
+mod journal_codec;
+mod journal_view;
+mod kept_copy;
 mod line_codec;
+mod mark_quota;
+mod measure;
+mod mirror;
 mod ring_bounds;
+mod turn_cause;
 mod turn_replays;
 mod vocab_mirror;

@@ -95,21 +95,15 @@ fn web_cpu_gpu_rgba8_parity() {
     let theme = web_theme();
 
     // GPU side, built EXACTLY as aterm-gpu-web::init does: a GpuContext + a
-    // from_bytes CPU face handed to from_parts. Gate: no GPU -> skip cleanly.
+    // from_bytes CPU face handed to from_parts. No GPU: COULD NOT RUN.
     let ctx = match GpuContext::new() {
         Ok(c) => c,
-        Err(e) => {
-            eprintln!("SKIP: no GPU: {e}");
-            return;
-        }
+        Err(e) => aterm_spec::host::could_not_run(format!("no GPU: {e}")),
     };
     let gpu_face = Renderer::from_bytes(FONT, PX, theme).expect("bundled font loads (gpu face)");
     let mut gpu = match GpuRenderer::from_parts(ctx, gpu_face, None, theme) {
         Ok(g) => g,
-        Err(e) => {
-            eprintln!("SKIP: gpu renderer unavailable: {e}");
-            return;
-        }
+        Err(e) => aterm_spec::host::could_not_run(format!("gpu renderer unavailable: {e}")),
     };
 
     // CPU side, built as aterm-wasm does: from_bytes at the same px/theme.

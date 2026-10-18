@@ -19,10 +19,6 @@ mod measuring {
     /// The ceiling: far above a healthy zero, far below a spin.
     const MAX_ARMS: u64 = 100;
 
-    /// Opens every take that decided nothing, so the verify gate records the
-    /// machine (COULD NOT RUN), not a spin finding.
-    const COULD_NOT_RUN: &str = "aterm-gate: COULD NOT RUN";
-
     fn run(row: SpinRow) {
         let rig = Rig::release(
             &["ATERM_SPIN_BIN", "ATERM_PAINT_BIN"],
@@ -30,10 +26,12 @@ mod measuring {
         );
         let report = match measure(&rig, &row) {
             Ok(report) => report,
-            Err(why) => panic!(
-                "{COULD_NOT_RUN} — SPIN COULD NOT RUN [{:?}]: the probe decided nothing, which is not a pass: {why}",
+            // A probe that decided nothing ends COULD NOT RUN, so the verify gate
+            // records the machine, not a spin finding.
+            Err(why) => aterm_spec::host::could_not_run(format!(
+                "SPIN COULD NOT RUN [{:?}]: the probe decided nothing, which is not a pass: {why}",
                 row.scene
-            ),
+            )),
         };
         assert_eq!(
             report.verdict,

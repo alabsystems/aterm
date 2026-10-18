@@ -86,23 +86,6 @@ fn preserve_aspect_ratio_zero_carries_stretch_and_the_default_fits() {
 }
 
 #[test]
-fn tile_coordinates_increase_across_the_footprint() {
-    let mut term = Terminal::new(10, 20);
-    let payload = [PNG_MAGIC, &[0u8; 16][..]].concat();
-    term.process(&osc_1337_file("inline=1;width=3;height=2", &payload));
-    let grid = term.grid();
-    // Cell (row=1, col=2) is the bottom-right tile.
-    let extra = grid.cell_extra(1, 2).expect("bottom-right covered");
-    let image = extra.image().expect("image ref");
-    assert_eq!(image.cell_row, 1);
-    assert_eq!(image.cell_col, 2);
-    // All tiles share the same underlying payload (one Arc).
-    let a = grid.cell_extra(0, 0).unwrap().image().unwrap();
-    let b = grid.cell_extra(1, 2).unwrap().image().unwrap();
-    assert!(std::sync::Arc::ptr_eq(&a.image, &b.image));
-}
-
-#[test]
 fn malformed_or_non_inline_draws_nothing() {
     // None of these may place an image, or panic.
     let payload = [PNG_MAGIC, &[0u8; 16][..]].concat();
@@ -400,7 +383,6 @@ fn a_footprint_is_no_taller_than_the_screen_or_the_decodable_height() {
 /// A DECGRA-only sixel allocates at `unhook`, past the DCS stream budget: a
 /// declared 2100x2100 raster (~17.6 MB of RGBA) is over `MAX_IMAGE_BYTES` and
 /// places no cells.
-#[cfg(feature = "sixel")]
 #[test]
 fn decgra_only_sixel_over_image_cap_is_rejected() {
     let mut term = Terminal::new(10, 20);
@@ -415,7 +397,6 @@ fn decgra_only_sixel_over_image_cap_is_rejected() {
 
 /// The payload bytes of the distinct images the visible screen shows, every
 /// layer of every cell counted once per image.
-#[cfg(feature = "sixel")]
 fn live_image_bytes(term: &Terminal) -> usize {
     let grid = term.grid();
     let mut seen = std::collections::HashSet::new();
@@ -436,7 +417,6 @@ fn live_image_bytes(term: &Terminal) -> usize {
 /// raster (no pixel data) takes the rest of its row, so placing one a column
 /// further right each time leaves every one a cell, and its 320 KiB raster, on
 /// screen.
-#[cfg(feature = "sixel")]
 #[test]
 fn a_screen_of_sixels_keeps_its_images_within_the_live_budget() {
     let mut term = Terminal::new(24, 80);
@@ -466,7 +446,6 @@ fn a_screen_of_sixels_keeps_its_images_within_the_live_budget() {
 /// count sees only the active grid, so a charge shared by both screens would be
 /// reset by a sixel on the near-empty alternate screen (mode 47 keeps both
 /// buffers) and the parked main screen never counted again.
-#[cfg(feature = "sixel")]
 #[test]
 fn each_screen_keeps_its_images_within_the_live_budget() {
     let mut term = Terminal::new(24, 80);

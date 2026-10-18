@@ -10,10 +10,7 @@
 //!
 //! Under `Reduced` every governed amplitude is exactly 0. A new [`MotionEffect`]
 //! variant does not compile until `amplitude` decides its reduced value, and
-//! `reduced_motion_totality` fails unless that value is 0. The ty model
-//! `aterm_spec::derive::motion_policy_model()` carries the same invariant
-//! (checked in aterm-spec's `tests/derived_ring_ty.rs`; its `Buggy=1` twin
-//! ignores the OS flag).
+//! `reduced_motion_totality` fails unless that value is 0.
 //!
 //! The host's `App::motion_policy` adds a fourth input, the load-shed latch
 //! (`perf_reduced`), which forces `Reduced` while presents run over budget.
@@ -80,21 +77,10 @@ pub enum MotionEffect {
     /// The scroll-pill fade ramp (`scroll_motion::pill_alpha`): at 0 the pill
     /// still shows (it is information) but hides at once at the hold boundary.
     ScrollPill,
-    /// The "ink that dries" stream fade (the host's `stream_fade`): 0 makes
-    /// `fade_permitted` force the instant path, byte-identical to no fade.
-    StreamFade,
     /// The matrix rain (`MatrixRain::set_reduced_motion`, fed at the render
     /// tick): 0 means the engine emits nothing (empty channels, fp 0, timers
     /// disarmed), the final state rather than a freeze.
     MatrixRain,
-    /// Robi's tip bubble slide (`robi_bubble::layout` scales `RobiBubble::rise`
-    /// by it): at 0 the bubble holds its rest position and only the alpha ramp
-    /// remains; it still shows.
-    NoticePill,
-    /// Robi's show (`aterm_effects::robi`, gated in the redraw's Robi block): at 0
-    /// no show starts and a live one stops (no robot drawn); his tips return
-    /// with the next show once motion returns.
-    Robi,
     /// Prism wake's output streak (`OutputStreak::tick` reads it as
     /// `StreakConfig::intensity`): at 0 the engine resets and emits nothing (no
     /// quads, no cue, fp 0). A pin rather than an ease: an effect answering
@@ -126,15 +112,12 @@ impl MotionEffect {
     /// The complete governed-effect set, which the totality proof iterates.
     /// Test-only; production gates via [`MotionPolicy`].
     #[cfg(test)]
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 10] = [
         Self::CursorGlow,
         Self::WordSparkles,
         Self::SmoothScroll,
         Self::ScrollPill,
-        Self::StreamFade,
         Self::MatrixRain,
-        Self::NoticePill,
-        Self::Robi,
         Self::OutputStreak,
         Self::UpgradeSurge,
         Self::PresenceRipple,
@@ -155,10 +138,7 @@ impl MotionEffect {
             Self::SmoothScroll | Self::ScrollPill => true,
             Self::CursorGlow
             | Self::WordSparkles
-            | Self::StreamFade
             | Self::MatrixRain
-            | Self::NoticePill
-            | Self::Robi
             | Self::OutputStreak
             | Self::UpgradeSurge
             | Self::PresenceRipple
@@ -192,11 +172,9 @@ pub enum SeriousEffect {
     CursorCat,
     WordDecorations,
     MatrixRain,
-    StreamFade,
     LevelUp,
     SettingsPreview,
     GpuPostFx,
-    Robi,
     /// The presence rim's turn-submit ripple: decoration on a rim that
     /// otherwise moves only with a fact.
     PresenceRipple,
@@ -208,6 +186,11 @@ pub enum SeriousEffect {
     /// serious mode keeps a static border, so the session still shows as
     /// wrapped.
     HarnessCard,
+    /// The act ticker's label on the Autopilot chip (`✓ approved` for 3 s,
+    /// design `docs/DESIGN-harness-autopilot-2026-10-15.md` §9.2.1): serious
+    /// mode withholds it. The chip, its title's trail of the last acts and
+    /// Settings ▸ Harness's counts stay.
+    HarnessTicker,
     /// Prism wake's comet over new program output: decoration, so serious mode
     /// takes it with the rest (its pip goes with [`Self::TerminalSound`]).
     OutputStreak,
@@ -215,7 +198,7 @@ pub enum SeriousEffect {
 
 impl SeriousEffect {
     #[cfg(test)]
-    const ALL: [Self; 16] = [
+    const ALL: [Self; 15] = [
         Self::TerminalSound,
         Self::CursorTrail,
         Self::CursorGlow,
@@ -223,14 +206,13 @@ impl SeriousEffect {
         Self::CursorCat,
         Self::WordDecorations,
         Self::MatrixRain,
-        Self::StreamFade,
         Self::LevelUp,
         Self::SettingsPreview,
         Self::GpuPostFx,
-        Self::Robi,
         Self::PresenceRipple,
         Self::BandProgress,
         Self::HarnessCard,
+        Self::HarnessTicker,
         Self::OutputStreak,
     ];
 }
@@ -259,14 +241,13 @@ impl SeriousModePolicy {
             | SeriousEffect::CursorCat
             | SeriousEffect::WordDecorations
             | SeriousEffect::MatrixRain
-            | SeriousEffect::StreamFade
             | SeriousEffect::LevelUp
             | SeriousEffect::SettingsPreview
             | SeriousEffect::GpuPostFx
-            | SeriousEffect::Robi
             | SeriousEffect::PresenceRipple
             | SeriousEffect::BandProgress
             | SeriousEffect::HarnessCard
+            | SeriousEffect::HarnessTicker
             | SeriousEffect::OutputStreak => !self.serious,
         }
     }
@@ -304,10 +285,7 @@ impl MotionPolicy {
                 | MotionEffect::WordSparkles
                 | MotionEffect::SmoothScroll
                 | MotionEffect::ScrollPill
-                | MotionEffect::StreamFade
                 | MotionEffect::MatrixRain
-                | MotionEffect::NoticePill
-                | MotionEffect::Robi
                 | MotionEffect::OutputStreak
                 | MotionEffect::UpgradeSurge
                 | MotionEffect::PresenceRipple
@@ -327,9 +305,9 @@ impl MotionPolicy {
 
 #[cfg(test)]
 mod tests {
-    //! These tests enumerate the invariant the ty model `motion_policy_model()`
-    //! carries over the shipping `MotionPolicy`. The domain is finite (3 modes ×
-    //! 2 system flags × 2 focus states × every effect), so the enumeration is a
+    //! These tests enumerate the invariant over the shipping `MotionPolicy`.
+    //! The domain is finite (3 modes × 2 system flags × 2 focus states × every
+    //! effect), so the enumeration is a
     //! complete proof.
 
     use super::{MotionEffect, MotionMode, MotionPolicy, SeriousEffect, SeriousModePolicy};
@@ -373,7 +351,6 @@ mod tests {
             ring: true,
             beam: false,
             head_dx: 0.5,
-            pack: None,
         };
         let t0 = Instant::now();
         let mut seen_dark_and_heard = false;
@@ -511,20 +488,6 @@ mod tests {
         );
     }
 
-    /// An unfocused window is Reduced under every mode/flag combination.
-    #[test]
-    fn unfocused_windows_demote_to_static() {
-        for mode in [MotionMode::Auto, MotionMode::Full, MotionMode::Reduced] {
-            for sys in [false, true] {
-                assert_eq!(
-                    MotionPolicy::resolve(mode, sys, false),
-                    MotionPolicy::Reduced,
-                    "unfocused must demote under ({mode:?}, sys={sys})"
-                );
-            }
-        }
-    }
-
     /// Config parsing: the three documented spellings map to their modes
     /// (case-insensitively); anything else — including empty — is `Auto`.
     #[test]
@@ -562,7 +525,7 @@ mod tests {
     /// latest request, not a stale startup snapshot.
     #[test]
     fn serious_mode_policy_conforms_to_derived_transition_model() {
-        let model = aterm_spec::derive::serious_mode_model();
+        let model = aterm_models_render::serious_mode_model();
         let mut state = model.init_state();
 
         let assert_projection = |state: &aterm_spec::interp::State| {
@@ -573,7 +536,6 @@ mod tests {
                 ("bell", "want_bell", SeriousEffect::TerminalSound),
                 ("sparkle", "want_sparkle", SeriousEffect::WordDecorations),
                 ("rain", "want_rain", SeriousEffect::MatrixRain),
-                ("fade", "want_fade", SeriousEffect::StreamFade),
                 ("celebration", "want_celebration", SeriousEffect::LevelUp),
                 ("notice", "want_celebration", SeriousEffect::LevelUp),
                 ("preview", "want_preview", SeriousEffect::SettingsPreview),

@@ -6,15 +6,19 @@
 # under which license, and how the lock-order census classifies it.
 #
 # THE COMMENTS ARE THE RECORD. A fork's reason to exist is not a key here — it is the
-# comment block above it. Nothing in forge writes this file; it is edited by hand. Unknown
-# KEYS are refused by name (fail-closed, the way aterm-census's vendored-crate registry is).
+# comment block above it, and its `census review:` line says what the lock-order census's
+# reviewer read; no tool checks that prose, so it is kept with the fork. Nothing in forge
+# writes this file; it is edited by hand. Unknown KEYS are refused by name (fail-closed).
 #
-# `cargo forge check` holds this file to the tree ([OB-17]): the [forge] cells must be the
-# matrix forge measures, and every [[fork]] block must match its vendored manifest's path,
-# version and license — no block missing, none stale — with apache_notice as attest's
-# [OB-7] reads that license and census.* as aterm-census's REVIEWED_VENDORED_CRATES
-# classifies the fork. Patch LIVENESS (a vendored version that drifts from the
-# requirement the graph asks for silently un-uses the patch) is [OB-12]'s.
+# THIS FILE IS THE CENSUS REVIEW. aterm-census reads each block's name, path and census.*
+# keys (`aterm_census::scan_set::reviewed_forks`): a vendored [patch] entry with no block
+# is unreviewed, and the census refuses it.
+#
+# `targo --unverified forge check` holds this file to the tree ([OB-17]): every [[fork]]
+# block must match its vendored manifest's path, version and license — no block missing,
+# none stale — with apache_notice as attest's [OB-7] reads that license. Patch LIVENESS (a
+# vendored version that drifts from the requirement the graph asks for silently un-uses
+# the patch) is [OB-12]'s.
 
 [forge]
 # The methods every number in a forge report was produced by, recorded so a report can be
@@ -29,41 +33,13 @@
 #   workspace member and over-counts the macOS root by 28%.
 loc_method = "rs-physical-all-files-v1"
 graph_method = "cargo-tree-normal-no-dedupe-locked-offline-v1"
-# The measurement matrix: resolution needs no toolchain, so every cell is mandatory and
-# offline. A cell that cannot resolve is named and skipped, never passed.
-# ALL SIX SHIPPED TRIPLES ARE CELLS: `atpkg::manifest::TARGETS` names six targets the index
-# can serve, and a triple with no cell here is one nothing measures or compiles. atpkg's
-# `every_published_triple_is_a_forge_cell` holds each shipped triple to a cell.
-# EVERY CELL IS ROOTED AT SOMETHING ATERM SHIPS FOR THAT TARGET. The six native cells
-# are rooted at the `aterm` binary. The two wasm cells are NOT, and the correction is
-# recorded here because this file is the record: `aterm` is a [[bin]]
-# (crates/aterm/Cargo.toml) that nothing compiles for wasm32, and until 2026-08-30 the
-# single wasm cell was rooted at it anyway. cargo tree resolves it for that triple
-# regardless, so the cell reported a configuration nothing builds — wrong in both
-# directions, measured: it counted zstd (a C library, default-features'd OUT of both web
-# crates), winit, rustls and the whole updater, and it MISSED console_error_panic_hook,
-# which both shipped modules then declared (aterm-wasm-abi's carved hook replaced it at
-# WP.3) and the `aterm` root never reaches. There are two wasm rows and not one because
-# aterm ships two separate .wasm artifacts — `verify cells --cell wasm-cpu|wasm-gpu`
-# checks each, and the `wasm` lane of `verify perf` builds `-p aterm-wasm -p aterm-gpu-web` — and they
-# are not the same surface: 27 third-party packages / 255,826 lines against 64 / 984,913,
-# a 37-package gap inside wgpu's subtree (dom(wgpu) there: 33 / 523,700 -- web-sys was
-# then direct; since WP.2 aterm-gpu-web takes it through wgpu::web_sys).
-cells = [
-    { name = "mac-arm", triple = "aarch64-apple-darwin", package = "aterm" },
-    { name = "linux", triple = "x86_64-unknown-linux-gnu", package = "aterm" },
-    { name = "win", triple = "x86_64-pc-windows-msvc", package = "aterm" },
-    { name = "wasm-cpu", triple = "wasm32-unknown-unknown", package = "aterm-wasm" },
-    { name = "wasm-gpu", triple = "wasm32-unknown-unknown", package = "aterm-gpu-web" },
-    { name = "mac-x64", triple = "x86_64-apple-darwin", package = "aterm" },
-    { name = "linux-arm", triple = "aarch64-unknown-linux-gnu", package = "aterm" },
-    { name = "win-arm", triple = "aarch64-pc-windows-msvc", package = "aterm" },
-]
+# The measurement matrix is `aterm_forge::resolve::default_cells()`, declared there once.
 
 # --- winit 0.30.13: ABSORBED, no longer a fork ------------------------------
 # Re-homed 2026-10-15 as crates/aterm-window, a workspace member
 # (docs/AUDIT-third-party-2026-10-15.md, winit-core step 4); its package keeps the
-# name `winit` while accesskit_winit requires one. Its [[fork]] block retired with
+# name `winit`, which accesskit_winit required until A11Y.4 retired it; the rename is
+# winit-core step 7. Its [[fork]] block retired with
 # the move: the root [patch.crates-io] row now points at an ABSORBED target, whose
 # NOTICE line, retained LICENSE and Apache-2.0 §4(b) notices `targo --unverified
 # forge attest` holds ([OB-5]/[OB-6]/[OB-7]/[OB-9]), and which aterm-census scans
@@ -92,18 +68,18 @@ reason = "aterm ships no Redox GUI; the backend held orbclient and redox_syscall
 path = "crates/aterm-window/src/platform_impl/web"
 reason = "the wasm cells do not compile winit; the backend held pin-project and web-time"
 
-# --- indexmap 2.14.0 ----------------------------------------------------------
-# census review: aterm-trust fork of upstream indexmap (index-panic fix; PLUS a dependency-requirement change 2026-08-31: hashbrown pinned to 0.16 so one version serves the whole graph -- retiring this fork to the registry copy silently restores hashbrown 0.17.1 on four cells, 100,944 lines): one zero-arg
-#   `.read()` (extract.rs) that is core::ptr::read, categorized by the propagated
-#   raw-pointer evidence; no locks
-# LICENSE: Apache-2.0 OR MIT — dual-licensed, so a copy distributed under the non-Apache
-#   option carries no §4(b) modification-notice obligation. Set apache_notice = true here
-#   the day that election changes.
-[[fork]]
-name = "indexmap"
-version = "2.14.0"
-path = "vendor/indexmap"
-license = "Apache-2.0 OR MIT"
-apache_notice = false
-census.mode = "scanned"
-census.namespace = "indexmap"
+# --- indexmap 2.14.0: RETIRED to the registry's 2.13.0, no longer a fork -------
+# Retired 2026-10-16 (docs/AUDIT-third-party-2026-10-15.md, "The last fork"): the
+# [patch.crates-io] row and vendor/indexmap are gone. The fork carried two edits:
+# checked slice-range indexing (the `aterm-trust` index-panic fix, which the trust lane
+# never verified: QUEUED_FORKS held it) and a hashbrown 0.17 -> 0.16 requirement pin.
+# The lock now resolves the registry's indexmap 2.13.0 (`targo update -p indexmap
+# --precise 2.13.0`): the 2.13 releases ask for hashbrown ^0.16.1 and every parent
+# allows them (naga and wgpu-core ^2.11.4, toml_edit ^2.13.0), so the one hashbrown
+# 0.16.1 still serves the whole graph and no cell gains a package. A plain resolve picks
+# 2.14.x and brings hashbrown 0.17.1 back (+1 package / +25,236 lines and a duplicate
+# name in every cell that compiles indexmap); the forge-budget ratchet turns that RED.
+# indexmap leaves the graph with wgpu (win, win-arm, wasm-gpu: GW.5, WP.8) and with the
+# host-only proc-macro-crate -> toml_edit edge under zvariant_derive (linux: A11Y.5a;
+# zbus_macros's path to it left at A11Y.4). With this block gone the ledger holds no [[fork]]: vendor/ holds
+# only the first-party astream submodule.

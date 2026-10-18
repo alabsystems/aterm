@@ -139,83 +139,48 @@ fn vertical_stacks_are_row_uniform() {
     }
 }
 
-/// The full light box-drawing junction set, assembled the way tmux assembles
-/// pane borders: every interior seam must be exact.
+/// The light, heavy and double junction sets, each assembled the way tmux
+/// assembles pane borders: every interior seam must be exact (for the double
+/// set, both rails).
 #[test]
-fn light_box_grid_seams_are_exact() {
+fn box_grid_seams_are_exact() {
     #[rustfmt::skip]
-    let rows: &[&[char]] = &[
-        &['┌', '─', '┬', '─', '┐'],
-        &['│', ' ', '│', ' ', '│'],
-        &['├', '─', '┼', '─', '┤'],
-        &['│', ' ', '│', ' ', '│'],
-        &['└', '─', '┴', '─', '┘'],
+    let sets: [(&str, &[&[char]]); 3] = [
+        ("light", &[
+            &['┌', '─', '┬', '─', '┐'],
+            &['│', ' ', '│', ' ', '│'],
+            &['├', '─', '┼', '─', '┤'],
+            &['│', ' ', '│', ' ', '│'],
+            &['└', '─', '┴', '─', '┘'],
+        ]),
+        ("heavy", &[
+            &['┏', '━', '┳', '━', '┓'],
+            &['┃', ' ', '┃', ' ', '┃'],
+            &['┣', '━', '╋', '━', '┫'],
+            &['┃', ' ', '┃', ' ', '┃'],
+            &['┗', '━', '┻', '━', '┛'],
+        ]),
+        ("double", &[
+            &['╔', '═', '╦', '═', '╗'],
+            &['║', ' ', '║', ' ', '║'],
+            &['╠', '═', '╬', '═', '╣'],
+            &['║', ' ', '║', ' ', '║'],
+            &['╚', '═', '╩', '═', '╝'],
+        ]),
     ];
-    for &(cw, ch) in SIZES {
-        let g = compose(rows, cw, ch);
-        let what = format!("light box at {cw}x{ch}");
-        for r in [0, 2, 4] {
-            for c in 0..4 {
-                g.assert_h_seam(r, c, &what);
+    for (name, rows) in sets {
+        for &(cw, ch) in SIZES {
+            let g = compose(rows, cw, ch);
+            let what = format!("{name} box at {cw}x{ch}");
+            for r in [0, 2, 4] {
+                for c in 0..4 {
+                    g.assert_h_seam(r, c, &what);
+                }
             }
-        }
-        for c in [0, 2, 4] {
-            for r in 0..4 {
-                g.assert_v_seam(r, c, &what);
-            }
-        }
-    }
-}
-
-/// The heavy junction set under the same assembly.
-#[test]
-fn heavy_box_grid_seams_are_exact() {
-    #[rustfmt::skip]
-    let rows: &[&[char]] = &[
-        &['┏', '━', '┳', '━', '┓'],
-        &['┃', ' ', '┃', ' ', '┃'],
-        &['┣', '━', '╋', '━', '┫'],
-        &['┃', ' ', '┃', ' ', '┃'],
-        &['┗', '━', '┻', '━', '┛'],
-    ];
-    for &(cw, ch) in SIZES {
-        let g = compose(rows, cw, ch);
-        let what = format!("heavy box at {cw}x{ch}");
-        for r in [0, 2, 4] {
-            for c in 0..4 {
-                g.assert_h_seam(r, c, &what);
-            }
-        }
-        for c in [0, 2, 4] {
-            for r in 0..4 {
-                g.assert_v_seam(r, c, &what);
-            }
-        }
-    }
-}
-
-/// The double-line junction set: both rails must continue exactly.
-#[test]
-fn double_box_grid_seams_are_exact() {
-    #[rustfmt::skip]
-    let rows: &[&[char]] = &[
-        &['╔', '═', '╦', '═', '╗'],
-        &['║', ' ', '║', ' ', '║'],
-        &['╠', '═', '╬', '═', '╣'],
-        &['║', ' ', '║', ' ', '║'],
-        &['╚', '═', '╩', '═', '╝'],
-    ];
-    for &(cw, ch) in SIZES {
-        let g = compose(rows, cw, ch);
-        let what = format!("double box at {cw}x{ch}");
-        for r in [0, 2, 4] {
-            for c in 0..4 {
-                g.assert_h_seam(r, c, &what);
-            }
-        }
-        for c in [0, 2, 4] {
-            for r in 0..4 {
-                g.assert_v_seam(r, c, &what);
+            for c in [0, 2, 4] {
+                for r in 0..4 {
+                    g.assert_v_seam(r, c, &what);
+                }
             }
         }
     }

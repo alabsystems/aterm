@@ -3,6 +3,10 @@
 
 # aterm-observe: spec recovery from its 11 unit tests
 
+> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 3 tests it
+> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
+> were taken before.
+
 > Status 2026-10-16: this file is the crate's migration worklist. Each of the 5 specs below is to be
 > proved through Trust/Clean about the compiled Rust function, and then the tests it subsumes are
 > deleted. No test has been deleted yet. No spec here is Certified, and every one is blocked by more
@@ -56,8 +60,8 @@ Gap 0 (the installed seal publishes no Lean-discharged row) blocks every row, so
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
-observe-row-matcher-admission	contract	aterm_observe::{row_matcher, bounded_regex}; aterm_regex::RegexBuilder::{new, size_limit, dfa_size_limit, step_limit, build}	∀ p: &str: row_matcher(p).is_ok() ⇔ Adm(p), and it never panics. (a) Length gate: |p| > 1024 ⇒ Err(aterm_regex::Error::Syntax(_)), and RegexBuilder is never reached, because the gate comes before parsing. (b) |p| <= 1024 ⇒ the result is RegexBuilder::new(p).size_limit(131072).dfa_size_limit(2^20).step_limit(2^22).build(), wrapped in Arc<RegexRowMatch> as Arc<dyn RowMatch>. Corollaries: (c) a pattern outside the grammar, e.g. "(unclosed", is Err and does not panic; (d) a pure literal of n <= 1024 bytes compiles to n+1 instructions, 64·(n+1) <= 65600 <= 131072, so it is admitted (the at-cap 1024-byte literal is Ok); (e) a short pattern with progsize > 131072, e.g. (a{200}){200}, is Err even though the 10 MiB default accepts it. Negative controls: drop the .size_limit call, or raise MAX_REGEX_PATTERN_LEN, and the spec fails.	bad_pattern_is_a_clean_error_not_a_panic, row_matcher_rejects_overlong_pattern, row_matcher_bounds_compiled_size	MEDIUM: &str len (clause (a) observes only the length), an enum error carrying a format!-built String, the ? operator, a by-value builder chain into another crate, Arc<dyn RowMatch> unsizing. It cites aterm-regex builder-knobs, parse-refusals, compile-inst-count and compile-size-ceiling, whose parser and compiler loops build a Vec program.	0, 1, 3, 4, 5, 7, 12
-observe-verdict-trichotomy	refinement	aterm_observe::RegexRowMatch::verdict; aterm_core::terminal::RowMatch::{matches, clears}; RowVerdict::from(bool); aterm_regex::Regex::try_is_match	∀ m: RegexRowMatch, ∀ row: &str: V(m,row) = Match ⇔ m.re.try_is_match(row) = Ok(true); V = NoMatch ⇔ it is Ok(false); V = Undecided ⇔ it is Err(StepLimitExceeded). With the RowMatch defaults, matches(row) ⇔ V = Match and clears(row) ⇔ V = NoMatch. Hence ¬(matches ∧ clears) for every row, and a row the budget refused is neither a match nor clear: fail closed, so a refusal is never read as a match or as a non-match. The budget refuses the input, not the pattern: the same m still answers a row whose work fits.	row_matcher_fails_closed_when_a_row_exhausts_the_scan_budget	MEDIUM (this crate's part): a &self trait-impl method, a match on Result, From<bool> for an enum, default trait methods compared by enum PartialEq, dyn dispatch through Arc. It composes with the aterm-regex try_is_match contract (regex-step-budget-exact).	0, 1, 2, 3, 4, 11, 12
+observe-row-matcher-admission	contract	aterm_observe::{row_matcher, bounded_regex}; aterm_regex::RegexBuilder::{new, size_limit, dfa_size_limit, step_limit, build}	∀ p: &str: row_matcher(p).is_ok() ⇔ Adm(p), and it never panics. (a) Length gate: |p| > 1024 ⇒ Err(aterm_regex::Error::Syntax(_)), and RegexBuilder is never reached, because the gate comes before parsing. (b) |p| <= 1024 ⇒ the result is RegexBuilder::new(p).size_limit(131072).dfa_size_limit(2^20).step_limit(2^22).build(), wrapped in Arc<RegexRowMatch> as Arc<dyn RowMatch>. Corollaries: (c) a pattern outside the grammar, e.g. "(unclosed", is Err and does not panic; (d) a pure literal of n <= 1024 bytes compiles to n+1 instructions, 64·(n+1) <= 65600 <= 131072, so it is admitted (the at-cap 1024-byte literal is Ok); (e) a short pattern with progsize > 131072, e.g. (a{200}){200}, is Err even though the 10 MiB default accepts it. Negative controls: drop the .size_limit call, or raise MAX_REGEX_PATTERN_LEN, and the spec fails.	row_matcher_rejects_overlong_pattern, row_matcher_bounds_compiled_size	MEDIUM: &str len (clause (a) observes only the length), an enum error carrying a format!-built String, the ? operator, a by-value builder chain into another crate, Arc<dyn RowMatch> unsizing. It cites aterm-regex builder-knobs, parse-refusals, compile-inst-count and compile-size-ceiling, whose parser and compiler loops build a Vec program.	0, 1, 3, 4, 5, 7, 12
+observe-verdict-trichotomy	refinement	aterm_observe::RegexRowMatch::verdict; aterm_core::terminal::RowMatch::{matches, clears}; RowVerdict::from(bool); aterm_regex::Regex::try_is_match	∀ m: RegexRowMatch, ∀ row: &str: V(m,row) = Match ⇔ m.re.try_is_match(row) = Ok(true); V = NoMatch ⇔ it is Ok(false); V = Undecided ⇔ it is Err(StepLimitExceeded). With the RowMatch defaults, matches(row) ⇔ V = Match and clears(row) ⇔ V = NoMatch. Hence ¬(matches ∧ clears) for every row, and a row the budget refused is neither a match nor clear: fail closed, so a refusal is never read as a match or as a non-match. The budget refuses the input, not the pattern: the same m still answers a row whose work fits.	-	MEDIUM (this crate's part): a &self trait-impl method, a match on Result, From<bool> for an enum, default trait methods compared by enum PartialEq, dyn dispatch through Arc. It composes with the aterm-regex try_is_match contract (regex-step-budget-exact).	0, 1, 2, 3, 4, 11, 12
 regex-step-budget-exact	contract	aterm_regex::Regex::{try_is_match, search, step_limit_exceeded, clone}	∀ r: Regex built with step_limit L, ∀ text: r.try_is_match(text) = Err(_) ⇔ work(prog,text) > L, and Ok(b) ⇒ b = Lang(prog,text). After an Err, r.step_limit_exceeded() is true, and so is the flag on every clone sharing r's cut_short (sticky and shared). Upper bound: work(prog,text) <= (|text|+2)·(4·insts+2) + |text| (aterm-regex pikevm-linear-cost). Corollary for observe: ∀ p with Adm(p), ∀ row with (|row|+2)·(4·insts(p)+2) + |row| <= 2^22, V(row_matcher(p), row) ∈ {Match, NoMatch} and equals Lang. That is the ordinary-pattern case (the four sample patterns over the 4,200-byte row are instances). Witness: (?:x?){1020}z is 13 bytes, passes the length and size gates, and over 4,096 'x' has work > 2^22 (a checked evaluation of the VM, aterm-regex step-cost-lower-bound), so it gives Undecided and sets the flag; over "xxxz" it gives Match.	ordinary_patterns_never_reach_the_scan_budget	HARD: Pike VM loops over &str bytes and the instruction Vec, a &mut u64 budget threaded through the loop, Option/Result, a shared Arc<AtomicBool> sticky flag across Clone, and a Lean inductive regex-language model. Owned by aterm-regex; this crate cites it.	0, 1, 2, 3, 5, 7, 12, 13
 watch-rows-match-latch	refinement	aterm_core::terminal::Terminal::{watch_rows, watch_poll, process_at}; observe::WatcherSet::{observe_screen, is_advance}; observe::any_row_matches; RowRange::contains	∀ t: Terminal, m, r: RowRange, arm time: after id = t.watch_rows(m,r,now) and any sequence of process_at calls, t.watch_poll(id) = Some(sat) ⇔ ∃ e ∈ Eval(t) with Hit(m,r,e). Then sat.seq = cseq_e for the first such e, and once latched it stays latched with the same seq. Arm is an evaluation point, so a surface that already matches latches at arm (level-triggered). Output that advances content without a Hit does not latch. With observe-verdict-trichotomy, a row the budget refused never makes a Hit. Any e reached by processing a byte that changed content has cseq_e >= 1.	row_matcher_latches_on_real_engine_output, row_matcher_latches_immediately_if_already_matching	VERY HARD: &mut self on Terminal and WatcherSet (two-state), a Vec of watchers with a fresh flag, Vec<Option<String>> row texts, iterator any/enumerate loops, Arc<dyn RowMatch> dispatch, the content_seq/alt/epoch clock, and the parser and grid specs that fix row_text after process_at (cross-crate). Instant/ClockReading arguments are opaque.	0, 1, 2, 3, 4, 5, 7, 10, 11, 12
 watch-rows-gone-latch	refinement	aterm_core::terminal::Terminal::{watch_rows_gone, watch_poll, process_at}; observe::WatcherSet::{observe_screen, is_advance}; observe::every_row_clear; RowRange::{contains, covers_any}	∀ t, m, r: after id = t.watch_rows_gone(m,r,now) and any sequence of process_at calls, t.watch_poll(id) = Some(sat) ⇔ ∃ e ∈ Eval(t) with Clear(m,r,e). Then sat.seq = cseq_e for the first such e, and the latch is sticky. Consequences: (a) a surface with no matching row latches at arm; (b) while some visible in-range row matches, or is Undecided because the budget refused it, every evaluation point fails Clear, so the watcher stays pending across repaints; (c) the first advancing paint after which every in-range row with text clears latches; (d) an empty range (¬covers_any) never latches.	row_gone_latches_immediately_if_nothing_matches, row_gone_waits_for_the_matching_row_to_leave, row_gone_waits_while_a_visible_row_exhausts_the_scan_budget	VERY HARD: as watch-rows-match-latch, plus a universal over the row Vec (iterator all), Option::is_none_or, and covers_any on an enum match. The Undecided case composes observe-verdict-trichotomy with regex-step-budget-exact.	0, 1, 2, 3, 4, 5, 7, 10, 11, 12
@@ -90,12 +94,9 @@ crates/aterm-observe/src/lib.rs	row_matcher_latches_immediately_if_already_match
 crates/aterm-observe/src/lib.rs	row_gone_latches_immediately_if_nothing_matches	watch-rows-gone-latch	observe-verdict-trichotomy
 crates/aterm-observe/src/lib.rs	row_gone_waits_for_the_matching_row_to_leave	watch-rows-gone-latch	observe-verdict-trichotomy
 crates/aterm-observe/src/lib.rs	row_gone_waits_while_a_visible_row_exhausts_the_scan_budget	watch-rows-gone-latch	watch-rows-match-latch, observe-verdict-trichotomy, regex-step-budget-exact
-crates/aterm-observe/src/lib.rs	bad_pattern_is_a_clean_error_not_a_panic	observe-row-matcher-admission	
 crates/aterm-observe/src/lib.rs	row_matcher_rejects_overlong_pattern	observe-row-matcher-admission	
 crates/aterm-observe/src/lib.rs	row_matcher_bounds_compiled_size	observe-row-matcher-admission	
-crates/aterm-observe/src/lib.rs	row_matcher_fails_closed_when_a_row_exhausts_the_scan_budget	observe-verdict-trichotomy	regex-step-budget-exact, observe-row-matcher-admission
 crates/aterm-observe/src/lib.rs	ordinary_patterns_never_reach_the_scan_budget	regex-step-budget-exact	observe-verdict-trichotomy
-crates/aterm-observe/src/lib.rs	regex_is_not_in_aterm_core_production_deps	(none; §4: move-to-bench)	
 ```
 
 ## 3. Coverage
@@ -112,43 +113,25 @@ crates/aterm-observe/src/lib.rs	regex_is_not_in_aterm_core_production_deps	(none
 
 ## 4. Tests that are not spec samples
 
-| test | why | action |
-|---|---|---|
-| `regex_is_not_in_aterm_core_production_deps` | A workspace-manifest guard, not a property of any compiled Rust function. It reads `aterm-core/Cargo.toml` as text and looks for a regex engine under `[dependencies]` (RFC R2 purity). AGENTS.md puts a rule no lint can name in an `aterm-census` guard (`verify guards`). | **move-to-bench**, meaning move it out of the unit tests into a census guard (not into `aterm-bench`; no listed action fits exactly). The guard should read the resolved non-dev dependency graph from `cargo metadata`. Then delete the test, and update the two docs that cite it by name (§5.1). |
+None. The one test this section listed, a workspace-manifest guard, is deleted.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
-1. **`regex_is_not_in_aterm_core_production_deps` checks less than it claims.** It slices only the text
-   after a literal `"\n[dependencies]\n"`, up to the next `"\n["`. So these pass unseen: a
-   `[dependencies.regex]` table, a `[target.'cfg(..)'.dependencies]` section, a renamed dependency
-   (`foo = { package = "aterm-regex" }`), and CRLF line endings. A manifest with no `[dependencies]`
-   header also passes, because the slice falls back to `""`. In the other direction,
-   `starts_with("regex")` also matches `regex-lite` or `regex-syntax`, which may be intended, but nothing
-   says so. The crate doc in `src/lib.rs` and the `RowMatch` doc in
-   `crates/aterm-core/src/terminal/observe.rs` both cite this test by name as the enforcement of R2. The
-   intra-doc link to `tests::regex_is_not_in_aterm_core_production_deps` in the crate doc points at a
-   `#[cfg(test)]` item, so it does not resolve in a normal doc build. Both docs go stale when the test moves.
-2. **`ordinary_patterns_never_reach_the_scan_budget` checks less than its doc says.** The doc says
+1. **`ordinary_patterns_never_reach_the_scan_budget` checks less than its doc says.** The doc says
    ordinary patterns "never touch the budget", but the test checks only `V = Match`. A match found before
    the budget runs out returns early, so the test cannot tell "never reached the budget" from "reached it
    and still matched". It never checks that `step_limit_exceeded()` is false. The four patterns are
    illustrative, not aterm's shipped vocabulary. The general spec is the work-bound corollary of
    `regex-step-budget-exact`, not this list.
-3. **The budget witnesses rest on unstated numbers.** `row_matcher_fails_closed_when_a_row_exhausts_the_scan_budget`
-   and `row_gone_waits_while_a_visible_row_exhausts_the_scan_budget` depend on `REGEX_STEP_LIMIT = 2^22`
-   and about 16.7M units for `(?:x?){1020}z` over a 4,096-column row. Those numbers come from comments
-   ("measured on the m21 box"), not from a stated work function. A VM change in how work is charged could
-   silently make the witness decidable. The spec defines `work()` in aterm-regex and makes the witness a
-   checked evaluation.
-4. **Hidden state in the verdict path.** `row_matcher_fails_closed_when_a_row_exhausts_the_scan_budget`
-   reads the cause of the refusal through `re.step_limit_exceeded()` on a clone. That works only because
-   clones share a sticky `Arc<AtomicBool>` inside `aterm_regex::Regex`, so `verdict(&self, ..)` is
-   observably stateful. `observe-verdict-trichotomy` does not need the flag. Its semantics are in
-   `regex-step-budget-exact` (aterm-regex `cut-short-sticky-shared`).
-5. **Part of a test is about another crate.** The "sanity" assertion in `row_matcher_bounds_compiled_size`,
+2. **The budget witness rests on unstated numbers.** `row_gone_waits_while_a_visible_row_exhausts_the_scan_budget`
+   depends on `REGEX_STEP_LIMIT = 2^22` and about 16.7M units for `(?:x?){1020}z` over a 4,096-column
+   row. Those numbers come from comments ("measured on the m21 box"), not from a stated work function. A
+   VM change in how work is charged could silently make the witness decidable. The spec defines `work()`
+   in aterm-regex and makes the witness a checked evaluation.
+3. **Part of a test is about another crate.** The "sanity" assertion in `row_matcher_bounds_compiled_size`,
    that the 10 MiB default accepts `(a{200}){200}`, tests `aterm_regex::RegexBuilder`, not aterm-observe
    code. It belongs to aterm-regex `compile-size-ceiling`.
-6. **`REGEX_DFA_SIZE_LIMIT` is inert, but the doc counts it.** `src/lib.rs` documents it as having no
+4. **`REGEX_DFA_SIZE_LIMIT` is inert, but the doc counts it.** `src/lib.rs` documents it as having no
    effect (aterm-regex has no lazy DFA), yet `row_matcher`'s doc says the compile is "held to
    REGEX_SIZE_LIMIT/REGEX_DFA_SIZE_LIMIT". No test or spec can observe it (aterm-regex `builder-knobs`:
    `dfa_size_limit` is the identity). Either delete the constant and the call, or fix the doc.

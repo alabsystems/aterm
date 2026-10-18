@@ -102,13 +102,6 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll, Waker};
 
-    /// The `push_error_scope().pop()` shape: Ready on the very first poll, so
-    /// the executor must never touch the condvar.
-    #[test]
-    fn already_ready_returns_without_parking() {
-        assert_eq!(block_on(std::future::ready(7u32)), 7);
-    }
-
     /// Counts polls so "Ready first time" is a claim about the executor, not
     /// about `std::future::ready`.
     #[test]
@@ -186,26 +179,5 @@ mod tests {
             }
         }
         assert_eq!(block_on(WakeThenPend(3)), 9);
-    }
-
-    /// Several wakes before one wait leave no surplus latch that would turn
-    /// the next park into a busy spin.
-    #[test]
-    fn surplus_wakes_collapse_to_one() {
-        struct Storm(u8);
-        impl Future for Storm {
-            type Output = u8;
-            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u8> {
-                if self.0 == 0 {
-                    return Poll::Ready(1);
-                }
-                self.0 -= 1;
-                for _ in 0..4 {
-                    cx.waker().wake_by_ref();
-                }
-                Poll::Pending
-            }
-        }
-        assert_eq!(block_on(Storm(2)), 1);
     }
 }

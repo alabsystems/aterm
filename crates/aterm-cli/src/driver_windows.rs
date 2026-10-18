@@ -232,7 +232,7 @@ impl WindowShell {
         match &self.source {
             ShellSource::Tab => "tab".to_string(),
             ShellSource::Config(_) => "aterm.toml".to_string(),
-            ShellSource::Default(origin, _) => format!("default:{}", default_word(*origin)),
+            ShellSource::Default(origin, _) => format!("default:{}", origin.word()),
         }
     }
 
@@ -271,17 +271,6 @@ impl WindowShell {
     }
 }
 
-/// The `default:<word>` token per platform-default arm.
-fn default_word(origin: aterm_pty::ShellOrigin) -> &'static str {
-    match origin {
-        aterm_pty::ShellOrigin::Override => "override",
-        aterm_pty::ShellOrigin::Pwsh => "pwsh",
-        aterm_pty::ShellOrigin::PowerShell => "powershell",
-        aterm_pty::ShellOrigin::Comspec => "COMSPEC",
-        aterm_pty::ShellOrigin::CmdLiteral => "cmd.exe",
-    }
-}
-
 /// aterm.toml's `shell`, from the file the window loads
 /// (`aterm_types::dirs::aterm_config_path`). A missing file is [`ConfigShell::Absent`];
 /// any other read failure is [`ConfigShell::Unusable`], as it is for the window.
@@ -312,6 +301,15 @@ pub(crate) fn config_shell_from_text(text: &str) -> ConfigShell {
             None => ConfigShell::Unusable("`shell` is not a string".to_string()),
         },
     }
+}
+
+/// aterm.toml's top-level `conpty` (the console host a new window's tabs run
+/// in), from the file the window loads, read as the window reads it
+/// ([`crate::config_conpty_from_text`]); `None` when the file is missing or
+/// unreadable, which the window's default (the inbox host) then answers.
+pub(crate) fn config_conpty() -> Option<String> {
+    let path = aterm_types::dirs::aterm_config_path()?;
+    crate::config_conpty_from_text(&std::fs::read_to_string(path).ok()?)
 }
 
 /// RAII console raw-mode guard: switches stdin/stdout to the VT passthrough

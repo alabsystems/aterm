@@ -15,8 +15,9 @@
 //!   is a fixture, which no random master is;
 //! * a key file: the machine key is binary pkcs8 with no text marker, so its
 //!   name gives it away (`machine|master|release|signing|root.key`, `*.pkcs8`),
-//!   anywhere in the checkout but build output and dot directories
-//!   ([`super::walk`]).
+//!   anywhere in the checkout but `.git`, build output and the directories
+//!   `.gitignore` keeps out (no commit takes those without `-f`), dot
+//!   directories included (`.cargo/machine.key`; [`super::walk`]).
 
 use super::{Finding, Rule, Tree};
 
@@ -288,7 +289,9 @@ mod tests {
             ("target/release.key".to_string(), String::new()),
             ("target-trust/x/machine.key".to_string(), String::new()),
             ("target.noindex/master.key".to_string(), String::new()),
-            (".scratch/root.key".to_string(), String::new()),
+            (".cargo/machine.key".to_string(), String::new()),
+            ("crates/x/.scratch/root.key".to_string(), String::new()),
+            (".git/signing.key".to_string(), String::new()),
         ]);
         let root = synth_tree("aterm-census-guards", "key-material", &files);
         let corpus = super::super::Corpus::read(&root).expect("the synth tree reads");
@@ -307,9 +310,11 @@ mod tests {
         assert_eq!(
             spots,
             [
+                ".cargo/machine.key:0",
                 "crates/aterm-release/fixtures/machine.key:0",
                 "crates/aterm-update-core/src/pins.rs:0",
                 "crates/atpkg-keys/src/new.rs:2",
+                "crates/x/.scratch/root.key:0",
                 "docs/RELEASE-KEYS.md:3",
                 "tools/owner.pkcs8:0",
             ],

@@ -89,13 +89,32 @@ impl<V: Host> Table<V> {
             .collect()
     }
 
-    /// The earliest lease or supervisor lapse, never before `now`.
-    fn deadline(&self, now: Instant) -> Option<Instant> {
+    /// The earliest lease or supervisor lapse, never before `now`. A
+    /// supervisor's is the later of the lapse last read into the table and
+    /// the claim's live one (`live`, [`Desk::supervisor_lapse`]): a renewal
+    /// is no change (`meta set supervisor` by the holder it names posts no
+    /// wake), so a deadline held at the lapse read before it woke the loop
+    /// once a lease only to find the claim renewed — every 70 to 90 s for
+    /// each supervised tab of a quiet desktop (the Together run, 2026-10-16).
+    /// One whose holder died fires at its last renewal's lapse, and the tick
+    /// re-reads it from the table's copy, which is never later.
+    ///
+    /// Read live AT EACH TURN of the host's loop, which is when it folds this
+    /// deadline: a renewal moves the armed timer only at the next turn after
+    /// it. aterm's own harness turns the loop every step (its `status` read
+    /// of the tab, every 20 s, well inside a lease), so a claim it keeps
+    /// renewed never fires. A holder that renews with no turn between two
+    /// renewals still has its timer fire once a lease, at the lapse last
+    /// read; the tick finds the claim renewed (the host's lapse re-checks the
+    /// live expiry), lapses nothing, and re-arms — one wake that renders
+    /// nothing.
+    fn deadline(&self, now: Instant, live: impl Fn(u64) -> Option<Instant>) -> Option<Instant> {
         let leases = self.slots.values().filter_map(|slot| slot.lease_until);
-        leases
-            .chain(self.supervisor_until.values().copied())
-            .map(|d| d.max(now))
-            .min()
+        let supervisors = self
+            .supervisor_until
+            .iter()
+            .map(|(session, at)| live(*session).map_or(*at, |lapse| lapse.max(*at)));
+        leases.chain(supervisors).map(|d| d.max(now)).min()
     }
 }
 
@@ -129,7 +148,8 @@ pub trait Desk {
     /// Read `session`'s facts (`None`: the host no longer holds it).
     fn sense(&self, session: u64) -> Option<Facts<Self::V>>;
     /// When `session`'s `ttl=` supervisor claim lapses on this clock, if it
-    /// has one.
+    /// has one. Read at every refresh and by every [`deadline`] (once per
+    /// supervised session): one leaf read, no lock held across it.
     fn supervisor_lapse(&self, session: u64, now: Instant) -> Option<Instant>;
     /// Whether a window's band is on screen (not occluded, minimized or
     /// headless): the row's `since` text arms a deadline only then.
@@ -231,8 +251,10 @@ fn windows<D: Desk>(d: &D) -> Vec<D::Win> {
 /// keypress — the ripple's edge.
 pub fn refresh_session<D: Desk>(d: &mut D, session: u64, submitted: bool) {
     let now = d.clock();
-    // Read at every refresh — a `meta set supervisor` refreshes — so a
-    // renewal moves the deadline and a cleared claim drops it.
+    // Read at every refresh — a `meta set supervisor` that changes the
+    // claim refreshes — so a cleared claim drops the deadline. A renewal
+    // refreshes nothing; the deadline reads its lapse live
+    // ([`Table::deadline`]).
     match d.supervisor_lapse(session, now) {
         Some(at) => {
             d.table_mut().supervisor_until.insert(session, at);
@@ -693,7 +715,10 @@ pub fn deadline<D: Desk>(d: &D, now: Instant) -> Option<Instant> {
         }
     });
     // Neither a lease's lapse nor a supervisor's posts a wake of its own.
-    if let Some(x) = d.table().deadline(now) {
+    if let Some(x) = d
+        .table()
+        .deadline(now, |session| d.supervisor_lapse(session, now))
+    {
         fold(x);
     }
     if let Some(x) = d.herald_deadline(now) {
@@ -809,21 +834,23 @@ pub fn session_level<D: Desk>(d: &D, session: u64) -> Level {
         .map_or(Level::Quiet, |slot| slot.level(read_mark(d, session)))
 }
 
-/// The additive presence `status` fields: `hand=<token> level=<level>
-/// story=<n> why=<causes>` ([`Slot::why`]), plain reads of the slot the
-/// refreshes keep current; `hand=- level=quiet story=0 why=-` for a session
-/// no refresh has touched yet.
+/// The additive presence `status` fields: `hand=<token> hand_pid=<pid|->
+/// level=<level> story=<n> why=<causes>` ([`Slot::why`]), plain reads of the
+/// slot the refreshes keep current; `hand=- hand_pid=- level=quiet story=0
+/// why=-` for a session no refresh has touched yet. `hand_pid=` is the
+/// kernel-attested pid of a drive lease's taker ([`Hand::pid_wire`]).
 #[must_use]
 pub fn status_tail<D: Desk>(d: &D, session: u64) -> String {
     let level = session_level(d, session).wire();
     match d.table().slot(session) {
         Some(slot) => format!(
-            "hand={} level={level} story={} why={}",
+            "hand={} hand_pid={} level={level} story={} why={}",
             slot.hand.wire::<D::V>(),
+            slot.hand.pid_wire(),
             slot.story_seq,
             slot.why(read_mark(d, session))
         ),
-        None => format!("hand=- level={level} story=0 why=-"),
+        None => format!("hand=- hand_pid=- level={level} story=0 why=-"),
     }
 }
 

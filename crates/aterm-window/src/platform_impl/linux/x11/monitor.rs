@@ -4,12 +4,13 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/monitor.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-use super::{util, X11Error, XConnection};
+// Modified by the aterm project in 2026; see the repository NOTICE. (RandR's requests are
+// aterm-x11's encoders, where upstream used x11rb's.)
+
+use super::{util, IgnoreError as _, X11Error, XConnection};
 use crate::dpi::{PhysicalPosition, PhysicalSize};
 use crate::platform_impl::VideoModeHandle as PlatformVideoModeHandle;
-use x11rb::connection::RequestConnection;
-use x11rb::protocol::randr::{self, ConnectionExt as _};
-use x11rb::protocol::xproto;
+use aterm_x11::proto::{randr, xproto};
 
 // Used for testing. This should always be committed as false.
 const DISABLE_MONITOR_LIST_CACHING: bool = false;
@@ -234,18 +235,21 @@ impl XConnection {
 
     fn query_monitor_list(&self) -> Result<Vec<MonitorHandle>, X11Error> {
         let root = self.default_root();
-        let resources =
-            ScreenResources::from_connection(self.xcb_connection(), root, self.randr_version())?;
+        let major = self.randr_major();
+        let resources = ScreenResources::from_connection(self, root, self.randr_version())?;
 
         // Pipeline all of the get-crtc requests.
         let mut crtc_cookies = Vec::with_capacity(resources.crtcs().len());
         for &crtc in resources.crtcs() {
-            crtc_cookies
-                .push(self.xcb_connection().randr_get_crtc_info(crtc, x11rb::CURRENT_TIME)?);
+            crtc_cookies.push(self.xcb_connection().send(randr::get_crtc_info(
+                major,
+                crtc,
+                aterm_x11::proto::CURRENT_TIME,
+            ))?);
         }
 
         // Do this here so we do all of our requests in one shot.
-        let primary = self.xcb_connection().randr_get_output_primary(root.root)?.reply()?.output;
+        let primary = self.request(randr::get_output_primary(major, root.root))?.output;
 
         let mut crtc_infos = Vec::with_capacity(crtc_cookies.len());
         for cookie in crtc_cookies {
@@ -301,18 +305,18 @@ impl XConnection {
     }
 
     pub fn select_xrandr_input(&self, root: xproto::Window) -> Result<u8, X11Error> {
-        use randr::NotifyMask;
+        use randr::notify_mask;
 
         // Get extension info.
         let info = self
             .xcb_connection()
-            .extension_information(randr::X11_EXTENSION_NAME)?
-            .ok_or(X11Error::MissingExtension(randr::X11_EXTENSION_NAME))?;
+            .extension(randr::NAME)?
+            .ok_or(X11Error::MissingExtension("RANDR"))?;
 
         // Select input data.
         let event_mask =
-            NotifyMask::CRTC_CHANGE | NotifyMask::OUTPUT_PROPERTY | NotifyMask::SCREEN_CHANGE;
-        self.xcb_connection().randr_select_input(root, event_mask)?;
+            notify_mask::CRTC_CHANGE | notify_mask::OUTPUT_PROPERTY | notify_mask::SCREEN_CHANGE;
+        self.send_void(randr::select_input(info.major_opcode, root, event_mask))?.ignore_error();
 
         Ok(info.first_event)
     }
@@ -336,26 +340,21 @@ impl ScreenResources {
     }
 
     pub(crate) fn from_connection(
-        conn: &impl x11rb::connection::Connection,
-        root: &x11rb::protocol::xproto::Screen,
+        conn: &XConnection,
+        root: &xproto::Screen,
         (major_version, minor_version): (u32, u32),
     ) -> Result<Self, X11Error> {
-        if (major_version == 1 && minor_version >= 3) || major_version > 1 {
-            let reply = conn.randr_get_screen_resources_current(root.root)?.reply()?;
-            Ok(Self::from_get_screen_resources_current_reply(reply))
+        let major = conn.randr_major();
+        let reply = if (major_version == 1 && minor_version >= 3) || major_version > 1 {
+            conn.request(randr::get_screen_resources_current(major, root.root))?
         } else {
-            let reply = conn.randr_get_screen_resources(root.root)?.reply()?;
-            Ok(Self::from_get_screen_resources_reply(reply))
-        }
+            conn.request(randr::get_screen_resources(major, root.root))?
+        };
+        Ok(Self::from_screen_resources_reply(reply))
     }
 
-    pub(crate) fn from_get_screen_resources_reply(reply: randr::GetScreenResourcesReply) -> Self {
-        Self { modes: reply.modes, crtcs: reply.crtcs }
-    }
-
-    pub(crate) fn from_get_screen_resources_current_reply(
-        reply: randr::GetScreenResourcesCurrentReply,
-    ) -> Self {
+    /// GetScreenResources' and GetScreenResourcesCurrent's reply, one layout.
+    pub(crate) fn from_screen_resources_reply(reply: randr::ScreenResourcesReply) -> Self {
         Self { modes: reply.modes, crtcs: reply.crtcs }
     }
 }

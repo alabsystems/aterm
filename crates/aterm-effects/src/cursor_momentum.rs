@@ -674,8 +674,7 @@ mod tests {
     /// Siting: the halo joins the window-absolute `cursor_glow_add` stream, so in
     /// a real window (cell 15×28, pad 24, head 80, origin (24, 84)) its bounding
     /// box surrounds the caret cell on every side with its centre of light at
-    /// the cell's centre. At origin (0,0), head 0, the window form equals the
-    /// grid form.
+    /// the cell's centre.
     #[test]
     fn halo_surrounds_the_caret_in_a_padded_headed_window() {
         let t0 = Instant::now();
@@ -731,38 +730,6 @@ mod tests {
             assert!(i32::from(q.x) >= real.fx_left() && i32::from(q.x + q.w) <= real.fx_right());
             assert!(i32::from(q.y) >= real.fx_top() && i32::from(q.y + q.h) <= real.fx_bot());
         }
-
-        // Identity at origin (0,0): the window form produces the grid form's
-        // bytes.
-        let g0 = geom();
-        let mut grid_form = Vec::new();
-        let mut h = MomentumGlow::default();
-        for _ in 0..40 {
-            h.on_key(t0, TAU);
-        }
-        h.tick(
-            Some((10, 40)),
-            t0,
-            g0,
-            &on(0x00FF_FFFF, true),
-            &mut grid_form,
-        );
-        let cx = (40.0 + 0.5) * g0.cw as f32;
-        let gx0 = grid_form
-            .iter()
-            .map(|q| f32::from(q.x))
-            .fold(f32::MAX, f32::min);
-        let gx1 = grid_form
-            .iter()
-            .map(|q| f32::from(q.x + q.w))
-            .fold(f32::MIN, f32::max);
-        assert!(((gx0 + gx1) * 0.5 - cx).abs() <= 2.0);
-        assert!(
-            grid_form
-                .iter()
-                .all(|q| u32::from(q.y) / g0.ch as u32 == u32::from(q.row)),
-            "row tags are y / ch at the origin"
-        );
     }
 
     /// The lane releases when the light stops changing, not when the value

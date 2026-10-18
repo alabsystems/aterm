@@ -435,31 +435,6 @@ fn the_paint_key_moves_with_every_term_it_paints_from() {
         &hc,
     );
     assert_eq!(after, fresh, "the drive paints what a fresh paint draws");
-    // Negative control: a theme key (bg/fg/cursor in place of the inks) is the same on
-    // both sides of the toggle, so a cache on it would present `before`, not `fresh`.
-    let theme_key = |t: ThemeInks| {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        t.bg.hash(&mut h);
-        t.fg.hash(&mut h);
-        t.cursor.hash(&mut h);
-        h.finish()
-    };
-    let old_key = |_forced: bool| {
-        (
-            center.fingerprint(80),
-            80usize,
-            theme_key(DARK),
-            None::<Hover>,
-            g,
-            view.motion_fp(),
-        )
-    };
-    assert_eq!(
-        old_key(false),
-        old_key(true),
-        "the old key misses the toggle"
-    );
     assert_ne!(before, fresh, "and the stale rows are not the forced ones");
     // Motion: a busy row's comet moves the key frame to frame.
     let mut center = MessageCenter::new(MessageLog::default(), t0);

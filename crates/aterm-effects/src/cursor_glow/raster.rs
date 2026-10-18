@@ -17,23 +17,22 @@ pub(super) const COMET_GLINT_COV: f32 = 0.5;
 /// (`0x00RRGGBB`): canonical ROYGBIV (red, orange, yellow, green, blue,
 /// indigo, violet) in spectral order (owner, 2026-08-27).
 ///
-/// `@generated` from [`crate::spectrum`]; do not edit by hand. Each entry is
-/// `spectrum_stop(i)`, transcribed so it can stay a `const`;
-/// `rainbow_bands_are_the_spectrum_stops` keeps the copy honest.
+/// Each entry is [`crate::spectrum::spectrum_stop`]`(i)`, read from the same
+/// table at compile time so it can stay a `const`.
 ///
 /// Cyan is not a band (owner, 2026-08-27). Green and blue are adjacent stops on
 /// a continuous ramp, so the arc crosses the cyan wedge between them at full
 /// chroma and value (owner, 2026-09-15) without any authored cyan stripe or
 /// neutralized handoff.
-pub(super) const RAINBOW_BANDS: [u32; SPECTRUM_STOPS] = [
-    0x00FF_0000, // red
-    0x00FF_7F00, // orange
-    0x00FF_FF00, // yellow
-    0x0000_FF00, // green
-    0x0000_00FF, // blue
-    0x004B_0082, // indigo
-    0x0094_00D3, // violet
-];
+pub(super) const RAINBOW_BANDS: [u32; SPECTRUM_STOPS] = {
+    let mut bands = [0u32; SPECTRUM_STOPS];
+    let mut i = 0;
+    while i < SPECTRUM_STOPS {
+        bands[i] = crate::spectrum::SPECTRUM_LUT[crate::spectrum::SPECTRUM_ANCHOR_AT[i]];
+        i += 1;
+    }
+    bands
+};
 
 // Additive-light budget over text (the legibility bound).
 //
@@ -884,8 +883,7 @@ pub(super) fn classic_ring_radius_factor(scale: f32) -> f32 {
 }
 
 /// A ring's life in seconds: `base` graded by impact `scale` — `base` itself at
-/// impact 1, `base · 1.667` at the cap (0.18 s → 0.30 s for the built-ins; a
-/// Trail Pack's own `ring.life_ms` grades the same way from its own base).
+/// impact 1, `base · 1.667` at the cap (0.18 s → 0.30 s).
 pub(super) fn classic_ring_life(base: f32, scale: f32) -> f32 {
     if !scale.is_finite() {
         return base;
@@ -938,9 +936,6 @@ pub fn style_comet_color(style: GlowStyle, color: u32, accent: u32, hue: f32, po
         // head; the beam layers' specular axis supplies the highlight.
         GlowStyle::Beam => lerp_rgb(0x0000_0000, color, 0.60 + 0.40 * pos),
         GlowStyle::Water => water_ramp(pos), // deep-blue tail → bright-cyan crest
-        // Exhaustiveness only: a pack resolves colour through its own ramp
-        // (`custom_ramp_color`), so this fallback is never emitted live.
-        GlowStyle::Custom => lerp_rgb(accent, color, pos),
     }
 }
 

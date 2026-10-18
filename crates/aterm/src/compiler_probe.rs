@@ -139,6 +139,15 @@ mod tests {
         assert_eq!(p.trust_version, "", "upstream rustc has no Trust version");
     }
 
+    #[test]
+    fn parse_degrades_to_unknown_not_panic() {
+        let p = parse_rustc_vv("");
+        assert_eq!(p.version_line, "unknown");
+        assert_eq!(p.commit, "unknown");
+        assert_eq!(p.host, "unknown");
+        assert_eq!(p.trust_version, "");
+    }
+
     /// Trust's version comes from the `trust:` line, else the `(trustc <v>)` parenthetical; the
     /// release token stays `1.99.0-dev` either way.
     #[test]
@@ -163,117 +172,104 @@ mod tests {
         );
     }
 
-    /// Under the `rustc` name cargo drives (no parenthetical, `binary: rustc`,
-    /// no env hint) the `trust:` line alone classifies the compiler as Trust.
+    /// `detect_flavor` over every kind of evidence: the `-vV` self-name (a
+    /// non-empty `trust:` line, `binary: trustc`, a first-line `(trustc…)`),
+    /// the `RUSTC` path, `RUSTUP_TOOLCHAIN`, and the cases that are NOT
+    /// evidence (an empty `trust:`, a marker off its line, a `-dev` release).
     #[test]
-    fn flavor_trust_from_the_trust_line_under_the_rustc_name() {
-        assert_eq!(detect_flavor(TRUST_VV_RUSTC_NAME, "rustc", None), "t");
-        // An empty `trust:` value is not a claim.
-        let empty = "rustc 1.99.0-dev (3a3e781fe 2026-09-14)\nbinary: rustc\ntrust:";
-        assert_eq!(detect_flavor(empty, "rustc", None), "r");
-    }
-
-    #[test]
-    fn parses_trust_vv() {
-        let p = parse_rustc_vv(TRUST_VV);
-        assert_eq!(p.version_line, "rustc 1.96.0-dev (58b453c80 2026-06-27)");
-        assert_eq!(p.commit, "58b453c80b3a2d5a005ecb7f98f8a2491c03e598");
-        assert_eq!(p.host, "aarch64-apple-darwin");
-    }
-
-    #[test]
-    fn parse_degrades_to_unknown_not_panic() {
-        let p = parse_rustc_vv("");
-        assert_eq!(p.version_line, "unknown");
-        assert_eq!(p.commit, "unknown");
-        assert_eq!(p.host, "unknown");
-        assert_eq!(
-            p.trust_version, "",
-            "no Trust version is the empty string, not a word"
-        );
-    }
-
-    #[test]
-    fn flavor_defaults_to_r() {
-        // Stock cargo, no trust toolchain.
-        assert_eq!(
-            detect_flavor(UPSTREAM_VV, "/opt/homebrew/bin/rustc", None),
-            "r"
-        );
-        assert_eq!(detect_flavor(UPSTREAM_VV, "rustc", Some("stable")), "r");
-    }
-
-    #[test]
-    fn flavor_trust_from_rustc_path_or_toolchain() {
-        assert_eq!(
-            detect_flavor(
+    fn detect_flavor_reads_only_real_evidence() {
+        let sealed_linux = "rustc 1.99.0-dev (ec2b5c59f 2026-09-01)\nbinary: rustc\n\
+            host: aarch64-unknown-linux-gnu\nrelease: 1.99.0-dev\ntrust: 0.1.0";
+        let cases: [(&str, &str, &str, Option<&str>, &str); 14] = [
+            (
+                "upstream",
+                UPSTREAM_VV,
+                "/opt/homebrew/bin/rustc",
+                None,
+                "r",
+            ),
+            (
+                "upstream stable toolchain",
+                UPSTREAM_VV,
+                "rustc",
+                Some("stable"),
+                "r",
+            ),
+            (
+                "trust: line under the rustc name",
+                TRUST_VV_RUSTC_NAME,
+                "rustc",
+                None,
+                "t",
+            ),
+            ("sealed linux trust: line", sealed_linux, "rustc", None, "t"),
+            (
+                "empty trust: line",
+                "rustc 1.99.0-dev\nbinary: rustc\ntrust:",
+                "rustc",
+                None,
+                "r",
+            ),
+            (
+                "trust: not at line start",
+                "rustc 1.99.0-dev\nnote: trust: 0.1.0",
+                "rustc",
+                None,
+                "r",
+            ),
+            ("both markers", TRUST_VV_MARKED, "rustc", None, "t"),
+            (
+                "first-line parenthetical only",
+                "rustc 1.96.0-dev (7e631b2a4 2026-07-04) (trustc)\nbinary: rustc",
+                "rustc",
+                None,
+                "t",
+            ),
+            (
+                "binary: trustc only",
+                "rustc 1.96.0-dev (7e631b2a4 2026-07-04)\nbinary: trustc",
+                "rustc",
+                None,
+                "t",
+            ),
+            (
+                "versioned parenthetical",
+                "rustc 1.99.0-dev (2b118046a 2026-07-29) (trustc 0.1.0)\nbinary: rustc",
+                "rustc",
+                None,
+                "t",
+            ),
+            (
+                "(trustc) past the first line",
+                "rustc 1.96.0 (ac68faa20 2026-05-25) (Homebrew)\nbinary: rustc\nnote: (trustc)",
+                "rustc",
+                None,
+                "r",
+            ),
+            (
+                "pre-marker trust by path",
                 TRUST_VV,
                 "/Users//example/trust/build/host/stage2/bin/rustc",
-                None
+                None,
+                "t",
             ),
-            "t"
-        );
-        assert_eq!(detect_flavor(TRUST_VV, "rustc", Some("trust")), "t");
-    }
-
-    /// A self-identifying trustc classifies 't' with no env evidence at all
-    /// (bare `rustc` via PATH, no RUSTC, no RUSTUP_TOOLCHAIN).
-    #[test]
-    fn flavor_trust_from_vv_self_identification() {
-        assert_eq!(detect_flavor(TRUST_VV_MARKED, "rustc", None), "t");
-        // Either marker alone suffices: version-line parenthetical…
-        let line_only = "rustc 1.96.0-dev (7e631b2a4 2026-07-04) (trustc)\nbinary: rustc";
-        assert_eq!(detect_flavor(line_only, "rustc", None), "t");
-        // …or the `binary: trustc` field.
-        let field_only = "rustc 1.96.0-dev (7e631b2a4 2026-07-04)\nbinary: trustc";
-        assert_eq!(detect_flavor(field_only, "rustc", None), "t");
-        // …or the versioned parenthetical (`(trustc <trust-version>)`).
-        let versioned = "rustc 1.99.0-dev (2b118046a 2026-07-29) (trustc 0.1.0)\nbinary: rustc";
-        assert_eq!(detect_flavor(versioned, "rustc", None), "t");
-        // "(trustc)" past the first line is not the marker: only the version
-        // line's parenthetical is the compiler's self-name.
-        let stray = "rustc 1.96.0 (ac68faa20 2026-05-25) (Homebrew)\nbinary: rustc\nnote: (trustc)";
-        assert_eq!(detect_flavor(stray, "rustc", None), "r");
-    }
-
-    #[test]
-    fn sealed_linux_trust_identifies_via_its_explicit_version_field() {
-        let native = "rustc 1.99.0-dev (ec2b5c59f 2026-09-01)\nbinary: rustc\n\
-            commit-hash: ec2b5c59f7ae81dc57dac2a3346cb4c0ef9fad0d\n\
-            host: aarch64-unknown-linux-gnu\nrelease: 1.99.0-dev\ntrust: 0.1.0\nLLVM version: 22.1.2";
-        assert_eq!(detect_flavor(native, "rustc", None), "t");
-        assert_eq!(
-            detect_flavor("rustc 1.99.0-dev\ntrust:", "rustc", None),
-            "r"
-        );
-        assert_eq!(
-            detect_flavor("rustc 1.99.0-dev\nnote: trust: 0.1.0", "rustc", None),
-            "r"
-        );
-    }
-
-    /// Provenance is evidence only: no environment override moves it in either
-    /// direction.
-    #[test]
-    fn flavor_is_evidence_only_and_cannot_be_overridden() {
-        // Trust evidence classifies 't' whatever the environment says.
-        assert_eq!(
-            detect_flavor(TRUST_VV_MARKED, "/x/trust/bin/rustc", Some("trust")),
-            "t"
-        );
-        // An upstream compiler at an upstream path stays 'r'.
-        assert_eq!(
-            detect_flavor(UPSTREAM_VV, "/opt/homebrew/bin/rustc", None),
-            "r"
-        );
-    }
-
-    #[test]
-    fn dev_release_alone_is_not_trust() {
-        // "-dev" with an upstream-looking path, no trust toolchain and no -vV
-        // marker stays 'r': -dev is any local build, not Trust.
-        let p = parse_rustc_vv(TRUST_VV);
-        assert!(p.version_line.contains("-dev"));
-        assert_eq!(detect_flavor(TRUST_VV, "/usr/local/bin/rustc", None), "r");
+            (
+                "pre-marker trust by toolchain",
+                TRUST_VV,
+                "rustc",
+                Some("trust"),
+                "t",
+            ),
+            (
+                "a -dev release alone",
+                TRUST_VV,
+                "/usr/local/bin/rustc",
+                None,
+                "r",
+            ),
+        ];
+        for (name, vv, path, toolchain, want) in cases {
+            assert_eq!(detect_flavor(vv, path, toolchain), want, "{name}");
+        }
     }
 }

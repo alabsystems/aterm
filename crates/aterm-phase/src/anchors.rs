@@ -11,24 +11,25 @@
 //! release they were read on, and whether they are one literal in the
 //! vendor's binary or composed at run time from key hints.
 //!
-//! Each other agent's strings are a table of its own — [`CODEX_ANCHORS`]
-//! (ids `codex.…`), [`AGY_ANCHORS`] (`agy.…`), [`MUSE_ANCHORS`] (`muse.…`);
-//! [`anchor`] and [`anchor_text`] read them all.
+//! Each other agent's strings are a table of its own — [`AGY_ANCHORS`]
+//! (ids `agy.…`), [`MUSE_ANCHORS`] (`muse.…`), [`GEMINI_ANCHORS`]
+//! (`gemini.…`); [`anchor`] and [`anchor_text`] read them all. Codex has none:
+//! aterm reads no Codex screen (its screen lane was retired on 2026-10-16).
 //!
 //! The tests `every_literal_anchor_is_in_the_store_claude`,
-//! `every_literal_codex_anchor_is_in_the_store_codex`,
 //! `every_literal_agy_anchor_is_in_the_store_agy` and
 //! `every_literal_muse_anchor_is_in_the_store_muse` grep the store's
-//! binaries for every [`AnchorKind::Literal`] row (the Codex one for every
-//! [`crate::codex::WALLS`] phrase and [`crate::codex::TOOL_HEADS`] head too)
-//! and name the misses — the drift canaries. They RUN in the suite (`verify
+//! binaries for every [`AnchorKind::Literal`] row and name the misses — the drift canaries. They RUN in the suite (`verify
 //! test` included) wherever a store binary is found (`$ATERM_CLAUDE_BIN`,
-//! `$ATERM_CODEX_BIN`, `$ATERM_AGY_BIN`, `$ATERM_MUSE_BIN`, else `aterm pkg
+//! `$ATERM_AGY_BIN`, `$ATERM_MUSE_BIN`, else `aterm pkg
 //! which <program>`), so a new build the vendor's auto-updater or `aterm pkg
 //! update` brought is judged by the next test run, and say so loudly and
 //! return where there is none — a canary that could not look has not passed,
 //! and is not counted as having. None is `#[ignore]`d: an ignored test is run
-//! by nobody.
+//! by nobody. Gemini CLI is no store binary but an npm package of JavaScript
+//! files: `every_literal_gemini_anchor_is_in_its_bundle` reads the bundle
+//! that `$ATERM_GEMINI_BIN` (else the first `gemini` on PATH, else
+//! Homebrew's link) resolves into, every `.js` file beside its `gemini.js`.
 
 /// How an anchor's text reaches the screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,8 +42,9 @@ pub enum AnchorKind {
     /// in the binary carries it, and a rebinding changes the key word.
     KeyHint,
     /// Assembled at run time from parts (`Do you want to ` + `make this edit
-    /// to` + the file name; the rm breaker's warning from a template): the
-    /// canary cannot look for it whole.
+    /// to` + the file name; the rm breaker's warning from a template), or
+    /// written by the API and only passed on (`API Error: <its message>`):
+    /// the canary cannot look for it whole.
     Composed,
 }
 
@@ -276,6 +278,52 @@ pub const ANCHORS: &[Anchor] = &[
         "A PreModelSwitch hook asked you to confirm",
         "2.1.283",
     ),
+    // The approval of a project's `.mcp.json` servers, drawn at launch once
+    // the folder is trusted: one new server's title (its name follows), its
+    // three unnumbered options (the cursor starts on the last), and the title
+    // and submit row of the dialog for several (`<n> new MCP servers found in
+    // this project`, a checkbox row per server). EVERY answer, Esc's too, is
+    // saved for good in the project's `.claude/settings.local.json`. MEASURED
+    // on 2.1.301 (2026-10-16, the real-Claude lab); the same literals in
+    // 2.1.295.
+    lit(
+        "mcp.title",
+        "New MCP server found in this project:",
+        "2.1.295",
+    ),
+    lit("mcp.use", "Use this MCP server", "2.1.295"),
+    lit(
+        "mcp.use_all",
+        "Use this and all future MCP servers in this project",
+        "2.1.295",
+    ),
+    lit(
+        "mcp.skip",
+        "Continue without using this MCP server",
+        "2.1.295",
+    ),
+    lit(
+        "mcp.title_many",
+        "new MCP servers found in this project",
+        "2.1.295",
+    ),
+    lit("mcp.submit", "Enable selected", "2.1.295"),
+    // The Chrome setup panel's consent in its connected phase (est() in the
+    // 2.1.301 bundle, `Setting up Claude in Chrome`): it turns the browser
+    // tools on for every later session too (`claudeInChromeDefaultEnabled`
+    // in the global config), so it is kept for good. Its `Continue without
+    // browser tools` saves nothing.
+    lit(
+        "setup.chrome_continue",
+        "Continue with browser tools",
+        "2.1.301",
+    ),
+    // The launch dialog over a settings file the validator rejects with an
+    // error: its Esc EXITS Claude Code (`Settings Warning`'s, the same
+    // dialog over warnings alone, goes on). MEASURED on 2.1.301
+    // ([`crate::prompt::fixtures::SETTINGS_ERROR`]), its Esc read in the
+    // bundle.
+    lit("settings.error", "Settings Error", "2.1.301"),
     // The question dialog (AskUserQuestion): its free-text option's
     // placeholder (`Type something.`; `Type something` when several answers
     // may be picked), its `Chat about this` row, and its footer's `Enter to
@@ -430,6 +478,29 @@ pub const ANCHORS: &[Anchor] = &[
         "limit.wait",
         "Wait here, then continue automatically",
         "2.1.282",
+    ),
+    // The autocompact offer (the 2.1.302 binary's `dbe`, title `G8e`, footer
+    // `Q8e`): Claude Code's own dialog offering to autocompact earlier than
+    // its default. Its question, its accept row's words (the size between
+    // `‹ ` and ` ›` is the stepper's), its outcome line once saved, and its
+    // footer — drawn from `↑`/`\xB7` escapes, so composed for the canary.
+    lit(
+        "autocompact.title",
+        "We recommend compacting earlier",
+        "2.1.302",
+    ),
+    lit("autocompact.question", "Want to autocompact at", "2.1.302"),
+    lit("autocompact.accept", "Autocompact at", "2.1.302"),
+    lit("autocompact.saved", "Autocompact set to ", "2.1.302"),
+    composed(
+        "autocompact.footer",
+        "↑/↓ choose · ←/→ change size · enter confirm · esc not now",
+        "2.1.302",
+    ),
+    lit(
+        "autocompact.more_above",
+        "More text above: scroll up, or enlarge the terminal",
+        "2.1.302",
     ),
     // The live zone.
     lit("busy.interrupt", "esc to interrupt", "2.1.267"),
@@ -731,6 +802,105 @@ pub const ANCHORS: &[Anchor] = &[
     // The head of the vendor's word that a `/compact` could not lower the context (`Compaction failed · conversation
     // could not be reduced below the context limit`); the wall table reads the same row (`wall::PHRASES`).
     lit("wall.compaction_failed", "Compaction failed", "2.1.286"),
+    // The vendor's other words that a `/compact` cannot help: a context that is
+    // one exchange (`Prompt is too long · … A single-exchange conversation
+    // cannot be compacted; reduce attached files/tools or start with less
+    // context.`, 2.1.300), and `/compact`'s own answer on one, plain text with
+    // no error level (`⎿  Not enough messages to compact.`, measured on
+    // 2.1.286). The turn-end policy latches its full context's track on them
+    // (`policy/turn_end.rs`, `compaction_exhausted_row`).
+    lit("wall.cannot_be_compacted", "cannot be compacted", "2.1.300"),
+    lit(
+        "wall.not_enough_to_compact",
+        "Not enough messages to compact",
+        "2.1.286",
+    ),
+    // The remedy of 2.1.300's notice that an image is past the many-image
+    // request's size (`An image in the conversation exceeds the dimension
+    // limit for many-image requests (2000px). Run /compact to remove old
+    // images from context, or start a new session.`, drawn only where
+    // `/compact` is on): aterm-agent reads such a notice as the full
+    // context's wall, which the turn-end policy's `/compact` answers
+    // (`supervise/wall_confirm.rs`, `notice_wall`).
+    lit(
+        "wall.compact_images",
+        "Run /compact to remove old images",
+        "2.1.300",
+    ),
+    // The same remedy on 2.1.300's notice that the request is past the API's
+    // size because of the images and attachments it carries (`Request too
+    // large (max 32 MB; …). Accumulated images and attachments in the
+    // conversation pushed the request over the limit. Run /compact, or double
+    // press esc to go back and remove attachments.`): read the same way. Its
+    // form for a conversation no compaction makes fit (`… so removing
+    // attachments or compacting cannot make it fit.`) names no `/compact`.
+    lit(
+        "wall.compact_attachments",
+        "pushed the request over the limit. Run /compact",
+        "2.1.300",
+    ),
+    // The heads of the vendor's own refusals of a request (`wall::PHRASES`'
+    // `Tag::Refused` rows, 2.1.300's error builder): sent again unchanged, each
+    // is refused again.
+    lit("wall.refused.cant_help", "can't help with this", "2.1.300"),
+    lit("wall.refused.safeguards", "safeguards flagged", "2.1.300"),
+    lit("wall.refused.rewind", "Run /rewind", "2.1.300"),
+    lit(
+        "wall.refused.thinking",
+        "isn't available with thinking",
+        "2.1.300",
+    ),
+    lit(
+        "wall.refused.advisor",
+        "advisor model is not compatible",
+        "2.1.300",
+    ),
+    lit(
+        "wall.refused.model_support",
+        "does not support this model",
+        "2.1.300",
+    ),
+    lit(
+        "wall.refused.selected_model",
+        "issue with the selected model",
+        "2.1.300",
+    ),
+    lit(
+        "wall.refused.pick_model",
+        "to pick a different model",
+        "2.1.300",
+    ),
+    lit(
+        "wall.refused.deployment",
+        "not available on your",
+        "2.1.300",
+    ),
+    lit("wall.refused.on_hold", "account is on hold", "2.1.300"),
+    lit(
+        "wall.refused.pro_plan",
+        "not available with the Claude Pro plan",
+        "2.1.300",
+    ),
+    // Two refusals whose words are the API's own, which Claude Code passes on
+    // as `API Error: <its message>` (an identity check's 403, an
+    // organization's data-loss-prevention 400): no build carries them, so the
+    // canary cannot look for them.
+    composed("wall.refused.identity", "Verify your identity", "2.1.300"),
+    composed("wall.refused.dlp", "data loss prevention", "2.1.300"),
+    // The long context's entitlement as 2.1.300 words it (`API Error: Usage
+    // credits required for 1M context · run /model to switch to standard
+    // context`), read as the older `Extra usage is required for long context`
+    // is: an account limit no reset ends.
+    lit(
+        "wall.usage_credits_required",
+        "Usage credits required",
+        "2.1.300",
+    ),
+    // The high load the transcript writes as `Opus is experiencing high load,
+    // …` and 2.1.300 draws under the gutter as `We are experiencing high
+    // demand for Opus 4.` (its renderer's own case); `Switched to Sonnet due to
+    // high demand for Opus` is its model fallback, which goes on.
+    lit("wall.high_demand", "high demand", "2.1.300"),
     // Claude Code's critical-memory banner, right-aligned on its own row
     // between the spinner and the composer's top rule (`<anchor> (140.4GB) —
     // restart and resume with claude --continue`, measured 2026-09-24 on the
@@ -738,6 +908,41 @@ pub const ANCHORS: &[Anchor] = &[
     // for 2h41m). Placed by `wall::memory_wall`, never by `PHRASES`: a
     // composer draft quoting it carries the same words.
     lit("wall.memory", "Critical memory usage", "2.1.280"),
+    // The disk is full (2.1.302's bundle, read 2026-10-16 after two incidents
+    // in one day): the pinned `transcript-writer-degraded` notification, a
+    // tool's lost output, and a goal the vendor ended on it. Placed by
+    // `disk_full::disk_full`, never by `PHRASES`: a draft can quote them.
+    lit(
+        "wall.disk_full",
+        "Transcript writes are failing (",
+        "2.1.302",
+    ),
+    lit(
+        "wall.disk_full.tool",
+        "Command output was lost: the temp filesystem at",
+        "2.1.302",
+    ),
+    lit(
+        "wall.disk_full.goal",
+        "Goal cleared after an unrecoverable error (",
+        "2.1.302",
+    ),
+    // The rows of Claude Code's own that a HOOK'S WORDS stand under (2.1.302,
+    // measured in the lab, ATERM-KI-1015-14; `phase::block_is_vendors`): the
+    // stop-hook summary, `⏺ Ran 1 stop hook (ctrl+o to expand)` (`Ran `, the
+    // count, then `stop hook` or `stop hooks`, joined at draw time), whose
+    // first rows are the hooks' commands and `stopReason`; and the row a hook's
+    // error opens on, `<hook> hook error` (the next row its stderr, behind
+    // `Failed with non-blocking status code: `) or `<hook> hook returned
+    // blocking error` (the next row its reason, or `Blocked by hook`).
+    lit("hook.ran", "Ran ", "2.1.294"),
+    composed("hook.ran.stop", "stop hook", "2.1.294"),
+    lit("hook.error", " hook error", "2.1.294"),
+    lit(
+        "hook.blocking_error",
+        " hook returned blocking error",
+        "2.1.302",
+    ),
     // Usage credits carry the session (the 2.1.300 bundle's own list of these
     // notices, measured in the lab): the footer's lasting item, the
     // notification as they start, and the same two under an admin's
@@ -773,176 +978,6 @@ pub const ANCHORS: &[Anchor] = &[
     lit("login.renew_hint", "run /login to renew", "2.1.300"),
 ];
 
-/// Every string aterm guards on in Codex's screen (codex 0.156.1 to
-/// 0.163.0: the captures in [`crate::codex::fixtures`] and the binary).
-pub const CODEX_ANCHORS: &[Anchor] = &[
-    // The approval boxes.
-    lit(
-        "codex.box.exec",
-        "Would you like to run the following command?",
-        "0.156.1",
-    ),
-    lit(
-        "codex.box.patch",
-        "Would you like to make the following edits?",
-        "0.156.1",
-    ),
-    lit("codex.box.once", "Yes, proceed", "0.156.1"),
-    lit(
-        "codex.box.persist",
-        "Yes, and don't ask again for commands that start with",
-        "0.156.1",
-    ),
-    lit(
-        "codex.box.session",
-        "Yes, and don't ask again for these files",
-        "0.156.1",
-    ),
-    lit(
-        "codex.box.deny",
-        "No, and tell Codex what to do differently",
-        "0.156.1",
-    ),
-    hint(
-        "codex.box.confirm",
-        "Press enter to confirm or esc to cancel",
-        "0.156.1",
-    ),
-    // The exec box's Reason row when an owner's prompt rule sent it
-    // (`prefix_rule(…, decision="prompt")`, MEASURED on 0.163.0): `` `<the
-    // shell-wrapped command>` requires approval by policy``, or `` … requires
-    // approval: <the rule's justification>`` — `PromptV2::owner_review`.
-    lit("codex.box.policy", "requires approval by policy", "0.163.0"),
-    lit("codex.box.policy_why", "requires approval: ", "0.163.0"),
-    // The `Usage limit reached` banner a workspace member is drawn under the
-    // out-of-credits and spend-cap walls (MEASURED on 0.162.1 and 0.163.0):
-    // its `Yes` asks the workspace's owner for a limit increase, and no rule
-    // presses it.
-    lit("codex.banner.request", "Request increase?", "0.162.1"),
-    // The session card's title, `>_ OpenAI Codex (v<version>)`; the `(v`
-    // is the literal's, the version the build's.
-    lit("codex.card.title", "OpenAI Codex (v", "0.156.1"),
-    // The folder-trust gate.
-    lit("codex.trust.title", "Folder access", "0.156.1"),
-    lit("codex.trust.yes", "Trust and continue", "0.156.1"),
-    // Plan mode.
-    lit("codex.plan.title", "Implement this plan?", "0.156.1"),
-    lit("codex.plan.yes", "Yes, implement this plan", "0.156.1"),
-    lit("codex.question.recommended", "(Recommended)", "0.156.1"),
-    lit("codex.question.none", "None of the above", "0.156.1"),
-    // The question's NOTES FIELD (MEASURED on 0.163.0): Tab on `None of the
-    // above` opens it, drawn `  › Add notes` while empty, the dialog's
-    // footer offering it (`tab to add notes | …`) and, open, its clearing
-    // (`tab or esc to clear notes | …`).
-    lit("codex.question.notes", "Add notes", "0.163.0"),
-    hint("codex.question.notes.tab", "tab to add notes", "0.163.0"),
-    hint(
-        "codex.question.notes.open",
-        "tab or esc to clear notes",
-        "0.163.0",
-    ),
-    // The live zone and the turn's end.
-    hint("codex.busy.interrupt", "esc to interrupt", "0.156.1"),
-    lit(
-        "codex.composer.placeholder",
-        "Ask Codex to do anything",
-        "0.156.1",
-    ),
-    lit("codex.turn.worked", "Worked for", "0.156.1"),
-    // The head of the Esc row, which is all 0.156.1 and 0.159.0 share: the
-    // first went on `tell the model what to do differently.`, the second
-    // (its binary's strings) on `use /feedback if something went wrong`.
-    lit(
-        "codex.turn.interrupted",
-        "Conversation interrupted - ",
-        "0.156.1",
-    ),
-    lit("codex.context.left", "% context left", "0.156.1"),
-    // The tip 0.157.0 draws right-aligned between a turn's end and the
-    // composer.
-    lit("codex.tip", "Tip: ", "0.157.0"),
-    // What a TUI prints on the main screen as it LEAVES, which the live
-    // upgrade takes the thread it relaunches from (`aterm-agent`'s
-    // `upgrade_codex::parse_exit_hint`): the heading over an embedded
-    // session's `  codex resume <id>` row, that row's words and the token
-    // tally printed with it (MEASURED after `/quit`,
-    // [`crate::codex::fixtures::EXIT`]); the daemon-mode hint's last line
-    // (0.157.0) and, from 0.159, its heading over the same row (the 0.159.3
-    // and 0.160.0 strings). 0.157's one-line `Reconnect: codex resume <id>`
-    // is in no build since, so it is no anchor: the upgrade reads it as
-    // history. A reworded one leaves a daemon-mode client's thread unnamed
-    // after `/exit` was typed, and the upgrade fails `no-resume-hint` at a
-    // shell.
-    lit("codex.exit.continue", "To continue this session", "0.156.1"),
-    lit("codex.exit.resume", "codex resume ", "0.156.1"),
-    lit("codex.exit.tokens", "Token usage", "0.156.1"),
-    lit("codex.exit.stop", "Stop the current turn:", "0.157.0"),
-    lit("codex.exit.reconnect", "To reconnect", "0.159.3"),
-    // The walls' reset (`codex::WALLS` is their phrases, canaried beside
-    // this table).
-    lit("codex.wall.retry_at", "Try again at", "0.156.1"),
-    // The rate-limit model nudge (view `rate-limit-switch-prompt`, the same
-    // strings in the 0.157.1 and 0.158.0 binaries): its title and its two
-    // keeps. Its switch (`Switch to <model>`) is composed at run time and
-    // matched by its label's words in the decider, never anchored here. The
-    // never-show-again keep writes `[notice] hide_rate_limit_model_nudge =
-    // true` into Codex's own config.
-    lit("codex.nudge.title", "Approaching rate limits", "0.157.1"),
-    lit("codex.nudge.keep", "Keep current model", "0.157.1"),
-    lit(
-        "codex.nudge.never",
-        "Keep current model (never show again)",
-        "0.157.1",
-    ),
-    // The `/model` picker (MEASURED 2026-09-28 on 0.158.0, a private
-    // headless aterm): the model box, the effort box (titled with the model
-    // it sets), its `More reasoning…` row (composed: the ellipsis is drawn
-    // after the words) and the advanced box it opens. The effort boxes'
-    // footer offers `s session` beside `enter default`: Enter SAVES the
-    // choice as Codex's default, `s` applies it to this conversation only.
-    // The hint is anchored with the footer's tail (`… · s session · esc
-    // back`, under `enter default` and `enter apply` alike): the two words
-    // alone are a substring of every `this session` in the tree.
-    lit("codex.pick.model", "Select Model and Effort", "0.158.0"),
-    lit("codex.pick.effort", "Select Reasoning Level for", "0.158.0"),
-    lit("codex.pick.advanced", "Advanced Reasoning", "0.158.0"),
-    composed("codex.pick.more", "More reasoning…", "0.158.0"),
-    hint("codex.pick.session", "s session · esc back", "0.158.0"),
-    // The footer's goal states (the 0.157.1 and 0.158.0 binaries; `Pursuing
-    // goal (10d 3h 2m)` MEASURED on a live 0.158.0 tab, read only).
-    lit("codex.goal.pursuing", "Pursuing goal (", "0.157.1"),
-    lit("codex.goal.paused", "Goal paused (/goal resume)", "0.157.1"),
-    lit(
-        "codex.goal.limited",
-        "Goal hit usage limits (/goal resume)",
-        "0.157.1",
-    ),
-    lit(
-        "codex.goal.stalled",
-        "Goal stalled (/goal resume)",
-        "0.157.1",
-    ),
-    // A goal that ENDED (read from the vendor's source at rust-v0.157.1 and
-    // rust-v0.158.0, `tui/src/bottom_pane/footer.rs`
-    // `goal_status_indicator_line`: `Complete` → `Goal achieved (<usage>)` or
-    // `Goal achieved`, `BudgetLimited` → `Goal unmet (<usage>)` or `Goal
-    // abandoned`; every string in both store binaries): the positive reading
-    // of a goal no longer paused nor pursued.
-    lit("codex.goal.achieved", "Goal achieved", "0.157.1"),
-    lit("codex.goal.unmet", "Goal unmet (", "0.157.1"),
-    lit("codex.goal.abandoned", "Goal abandoned", "0.157.1"),
-    // The box `codex resume` draws over a PAUSED goal (the 0.157.1 and
-    // 0.158.0 binaries; openai/codex `tui/src/chatwidget/goal_menu.rs`
-    // `show_resume_paused_goal_prompt`, drawn by `app/startup.rs` for a
-    // `codex resume <thread>` with no prompt whose goal is paused, blocked or
-    // usage-limited): its title, and its two options — the first focused,
-    // which sends the same `thread/goal/set … active` as `/goal resume`, and
-    // the one that leaves it paused.
-    lit("codex.goal.resume.title", "Resume paused goal?", "0.157.1"),
-    lit("codex.goal.resume.yes", "Resume goal", "0.157.1"),
-    lit("codex.goal.resume.leave", "Leave paused", "0.157.1"),
-];
-
 /// Every string aterm guards on in agy's screen (agy 1.4.0: the captures in
 /// [`crate::agy::fixtures`] and the binary).
 pub const AGY_ANCHORS: &[Anchor] = &[
@@ -950,12 +985,74 @@ pub const AGY_ANCHORS: &[Anchor] = &[
     // and `Navigate` are two strings in the binary).
     lit("agy.footer.idle", "? for shortcuts", "1.4.0"),
     lit("agy.footer.cancel", "esc to cancel", "1.4.0"),
+    // An exit pending: one ctrl+c at the idle composer, empty or over a held
+    // draft (the draft stays), or one ctrl+d at the EMPTY idle composer (a
+    // ctrl+d on a draft deletes forward), and the next press of that key ends
+    // agy. The binary's `press %s again to exit`, its key filled in at run
+    // time: the two screen texts are hints, and the words after the key the
+    // literal the reader matches by (`agy::footer_of`). Measured signed in
+    // (`agy-1.4.0-exit-confirm`) and in the lab
+    // (`agy-1.4.0-lab-exit-confirm-ctrl-d`, `agy-1.4.0-lab-ctrl-c-draft`).
     hint("agy.footer.exit", "press ctrl+c again to exit", "1.4.0"),
+    hint(
+        "agy.footer.exit_ctrl_d",
+        "press ctrl+d again to exit",
+        "1.4.0",
+    ),
+    lit("agy.footer.exit_again", "again to exit", "1.4.0"),
     hint("agy.keys.navigate", "↑/↓ Navigate", "1.4.0"),
+    // The footer's hint while messages wait behind a running turn (`Press ↑
+    // to edit queued messages`: the binary's `Press %s to edit queued
+    // messages`, its key filled in at run time).
+    lit("agy.footer.queued", "to edit queued messages", "1.4.0"),
+    // The permission modes' hints, drawn in the EMPTY composer while one is
+    // on (shift+tab cycles them).
+    lit(
+        "agy.mode.hint.accept_edits",
+        "Accept-edits mode: file edits auto-approved (shift+tab to cycle)",
+        "1.4.0",
+    ),
+    lit(
+        "agy.mode.hint.auto",
+        "Auto mode: edits & safe commands auto-approved (shift+tab to cycle)",
+        "1.4.0",
+    ),
+    lit(
+        "agy.mode.hint.plan",
+        "Plan mode: research & plan only (shift+tab to cycle)",
+        "1.4.0",
+    ),
+    lit(
+        "agy.mode.hint.best_of_n",
+        "Best-of-N mode: fork into parallel arms and pick a winner (shift+tab to cycle)",
+        "1.4.0",
+    ),
     // The logo row naming the build, and the turn's end after an Esc or a
     // refused box.
     lit("agy.banner", "Antigravity CLI", "1.4.0"),
     lit("agy.turn.interrupted", "Interrupted · What should", "1.4.0"),
+    // A failed turn's id row, and the failures it names that are walls: the
+    // service overloaded, the model's quota spent, the AI credits run out.
+    lit("agy.turn.error_id", "Error ID:", "1.4.0"),
+    lit(
+        "agy.wall.overloaded",
+        "Our servers are experiencing high traffic",
+        "1.4.0",
+    ),
+    lit(
+        "agy.wall.quota",
+        "You have exhausted your quota on this model",
+        "1.4.0",
+    ),
+    lit(
+        "agy.wall.credits",
+        "Your AI credits balance is too low to continue",
+        "1.4.0",
+    ),
+    // A subagent's alert in the turn (`<agent> needs approval for <tool>`,
+    // `<agent> has a question`): the subagent waits on a person.
+    lit("agy.subagent.approval", " needs approval for ", "1.4.0"),
+    lit("agy.subagent.question", " has a question", "1.4.0"),
     // The sign-in wall: no option of its menu is ever pressed (its first
     // opens a browser).
     lit(
@@ -1006,12 +1103,59 @@ pub const AGY_ANCHORS: &[Anchor] = &[
     lit("agy.create.deny", "No, deny creation", "1.4.0"),
     lit("agy.edit.once", "Yes, accept this change", "1.4.0"),
     lit("agy.edit.deny", "No, reject this change", "1.4.0"),
+    // The pending edit's word after an Esc, which does nothing there.
+    lit(
+        "agy.edit.esc_disabled",
+        "Esc disabled during file edits",
+        "1.4.0",
+    ),
     // The question's row for the person's own words.
     lit("agy.question.write_in", "Write-in...", "1.4.0"),
+    // The mark on the answer the model recommends: agy's ask-the-user tool
+    // tells the model to PREFIX the option with it, where Codex's and Claude
+    // Code's dialogs draw it last.
+    lit("agy.question.recommended", "(Recommended)", "1.4.0"),
+    // A question no digit answers: a multi-select's checkboxes (a digit only
+    // toggles one), and the person's own answer kept on its write-in row.
+    lit("agy.question.unchecked", "[ ] ", "1.4.0"),
+    lit("agy.question.checked", "[x] ", "1.4.0"),
+    lit("agy.question.written", "✓ ", "1.4.0"),
+    // agy's suffixes on every answer it keeps (its binary's labels): saved
+    // to settings.json, or kept for the conversation.
+    lit("agy.box.persisted", "(Persist to settings.json)", "1.4.0"),
+    lit("agy.box.conversation", "in this conversation", "1.4.0"),
+    // The row that closes a failed turn's `⚠` block (its id).
+    lit("agy.error.id", "Error ID:", "1.4.0"),
+    // The feedback survey agy draws unasked in place of its composer (the
+    // lab's captures): one literal for its question, and options composed
+    // from a `[%d] %s` template, of which `[0] Skip` is the one a press
+    // writes.
+    lit(
+        "agy.survey.question",
+        "How's the CLI experience so far? Help us improve:",
+        "1.4.0",
+    ),
+    composed("agy.survey.skip", "[0] Skip", "1.4.0"),
+    // The first run's onboarding screens with no sign-in (the Gemini API
+    // provider seeded): the colour scheme, then the terms and data use.
+    lit(
+        "agy.onboarding.scheme",
+        "Choose your color scheme:",
+        "1.4.0",
+    ),
+    lit(
+        "agy.onboarding.terms",
+        "Terms of Service & Data Use",
+        "1.4.0",
+    ),
+    // The terms screen's button back to the colour scheme, the way its Esc
+    // goes too (measured in the lab, 2026-10-16).
+    lit("agy.onboarding.previous", "[Previous]", "1.4.0"),
 ];
 
-/// Every string aterm guards on in Muse Code's screen (muse 1.4.9-R6297.1:
-/// the captures in [`crate::muse::fixtures`] and the binary).
+/// Every string aterm guards on in Muse Code's screen (muse 1.4.9-R6297.1
+/// and 1.4.10-R6427.1: the captures in [`crate::muse::fixtures`] and the
+/// binary).
 pub const MUSE_ANCHORS: &[Anchor] = &[
     // The composer's labelled top rule, the status row's hint, the banner.
     lit(
@@ -1043,6 +1187,422 @@ pub const MUSE_ANCHORS: &[Anchor] = &[
     lit("muse.trust.yes", "Trust and continue", "1.4.9-R6297.1"),
     lit("muse.trust.quit", "Quit", "1.4.9-R6297.1"),
     lit("muse.trust.keys", "Esc quits.", "1.4.9-R6297.1"),
+    // The approval boxes, drawn in the composer's frame (1.4.10, the lab's
+    // captures): the shell box's and the file box's titles, the file box's
+    // path row (`write` and ` path: ` are two strings), the one-shot allow,
+    // the refusal (the product's name put between two strings) and the hint
+    // under the options.
+    lit(
+        "muse.box.shell",
+        "Would you like to run the following command?",
+        "1.4.10-R6427.1",
+    ),
+    lit(
+        "muse.box.file",
+        "Would you like to allow this file access?",
+        "1.4.10-R6427.1",
+    ),
+    composed("muse.box.write_path", "write path: ", "1.4.10-R6427.1"),
+    lit("muse.box.once", "Yes, proceed", "1.4.10-R6427.1"),
+    composed(
+        "muse.box.deny",
+        "No, and tell Muse Code what to do differently",
+        "1.4.10-R6427.1",
+    ),
+    lit(
+        "muse.box.permissions",
+        "Change approval defaults in /permissions",
+        "1.4.10-R6427.1",
+    ),
+    // The network box (the lab's capture `box-network`: a web fetch and a
+    // monitor's WebSocket): its title, its two body rows, its session grant
+    // and its always grant; and the tool-action box (the capture
+    // `box-tool-action`, an MCP server's tool, drawn outside the lab's
+    // jail): its title, its body row and its always grant.
+    lit(
+        "muse.box.network",
+        "Would you like to allow this network access?",
+        "1.4.10-R6427.1",
+    ),
+    lit("muse.box.network_row", "network: ", "1.4.10-R6427.1"),
+    lit("muse.box.full_url", "full URL: ", "1.4.10-R6427.1"),
+    lit(
+        "muse.box.session",
+        "Yes, don't ask again this session",
+        "1.4.10-R6427.1",
+    ),
+    lit(
+        "muse.box.always",
+        "Always allow this network destination",
+        "1.4.10-R6427.1",
+    ),
+    lit(
+        "muse.box.tool",
+        "Would you like to allow this tool action?",
+        "1.4.10-R6427.1",
+    ),
+    lit("muse.box.tool_row", "tool action: ", "1.4.10-R6427.1"),
+    lit(
+        "muse.box.always_tool",
+        "Always allow this MCP tool",
+        "1.4.10-R6427.1",
+    ),
+    // The refusal of the box a shell call naming a Unix socket draws (the
+    // capture `box-unix-socket`: the network title over `requested by:`,
+    // `Allow once (y)` and `Reject (esc)`). The canary cannot guard `Reject`
+    // itself: the 1.4.10 binary holds it hundreds of times, so a build that
+    // dropped the label would still pass. What the box's refusal answers the
+    // model, held in one place in that binary, stands guard for it (the
+    // capture `box-unix-socket-denied`).
+    lit("muse.box.reject", "Reject", "1.4.10-R6427.1"),
+    lit(
+        "muse.box.socket_refused",
+        "Unix socket access was not approved",
+        "1.4.10-R6427.1",
+    ),
+    // The background-work panel under the composer's bottom rule (the lab's
+    // captures `end-of-turn-work-panel`, `end-of-turn-work-running`).
+    lit("muse.panel.select", "↓ to select", "1.4.10-R6427.1"),
+    // The transcript's pointer to that panel, `(↓ to view terminals)` (the
+    // binary holds ` to view ` and puts the rest together; the lab's capture
+    // `end-of-turn-work-hint`).
+    composed("muse.panel.view", "(↓ to view ", "1.4.10-R6427.1"),
+    // The warning a resumed session opens with after a run that recorded no
+    // clean shutdown (SIGHUP, SIGKILL): `warning: the previous run of this
+    // session ended abnormally around <time> …` (the harness's relaunch on
+    // exit, the lab's capture `resumed-after-crash`).
+    lit(
+        "muse.resume.abnormal",
+        "the previous run of this session ended abnormally",
+        "1.4.10-R6427.1",
+    ),
+    // The shell box asking for one stage of a pipeline (the lab's capture
+    // `box-shell-stage`): its one-shot allow and its refusal, and the rows
+    // under the command that name the stages (`Stage 3/3` is put together
+    // from its numbers).
+    lit(
+        "muse.box.stage_once",
+        "Allow this stage once",
+        "1.4.10-R6427.1",
+    ),
+    lit(
+        "muse.box.stage_abort",
+        "Abort the entire command",
+        "1.4.10-R6427.1",
+    ),
+    lit("muse.box.stage_skipped", "Skipped Stage", "1.4.10-R6427.1"),
+    composed("muse.box.stage", "Stage ", "1.4.10-R6427.1"),
+    lit("muse.box.stage_argv", "Current argv", "1.4.10-R6427.1"),
+    // The question: its head, its key row (one literal of four; the other
+    // three switch questions or toggle answers), the key row's Esc, the row
+    // Muse Code adds, and the suffix the tool tells the model to put on its
+    // recommended option.
+    lit(
+        "muse.question.title",
+        "Request user input",
+        "1.4.10-R6427.1",
+    ),
+    lit(
+        "muse.question.keys",
+        "Enter to select · ↑/↓ to move · Tab for an optional note · Esc to interrupt",
+        "1.4.10-R6427.1",
+    ),
+    lit(
+        "muse.question.keys_multi",
+        "Enter to select · ↑/↓ to move · ←/→ to switch question · Tab for an optional note · Esc to interrupt",
+        "1.4.10-R6427.1",
+    ),
+    lit(
+        "muse.question.keys_toggle",
+        "Enter to toggle · Submit row to continue · ↑/↓ to move · Tab for an optional note · Esc to interrupt",
+        "1.4.10-R6427.1",
+    ),
+    lit("muse.question.esc", "Esc to interrupt", "1.4.10-R6427.1"),
+    lit("muse.question.none", "None of the above", "1.4.10-R6427.1"),
+    // The question's note field (Tab), and the review its answers go to:
+    // its key row's head and end, its two options (the lab's captures
+    // `question-note-*`, `question-multi-review`).
+    lit("muse.question.note", "Note (optional): ", "1.4.10-R6427.1"),
+    lit(
+        "muse.question.review",
+        "Review answers before submit",
+        "1.4.10-R6427.1",
+    ),
+    lit(
+        "muse.question.review.back",
+        "Esc to go back",
+        "1.4.10-R6427.1",
+    ),
+    composed("muse.question.review.note", "; note: ", "1.4.10-R6427.1"),
+    lit("muse.question.submit", "Submit answers", "1.4.10-R6427.1"),
+    lit(
+        "muse.question.interrupt",
+        "Interrupt turn",
+        "1.4.10-R6427.1",
+    ),
+    lit(
+        "muse.question.recommended",
+        "(Recommended)",
+        "1.4.10-R6427.1",
+    ),
+    // A model's turn stopped with Esc, and the footer while the run stops.
+    lit(
+        "muse.turn.interrupted",
+        "Interrupted · Report issues with /feedback",
+        "1.4.10-R6427.1",
+    ),
+    lit(
+        "muse.footer.interrupting",
+        "interrupting run",
+        "1.4.10-R6427.1",
+    ),
+    // Its own rows under a turn's end: the away recap, drawn when a key is
+    // typed after a pause, and the time a long turn took (the lab's captures
+    // `end-of-turn-finished`, `end-of-turn-worked-recap`).
+    lit("muse.recap", "Recap: ", "1.4.10-R6427.1"),
+    lit("muse.worked", "Worked for ", "1.4.10-R6427.1"),
+    // The heads of its own tool rows.
+    lit("muse.tool.ran", "Ran ", "1.4.10-R6427.1"),
+    lit("muse.tool.wrote", "Wrote ", "1.4.10-R6427.1"),
+    lit("muse.tool.edited", "Edited ", "1.4.10-R6427.1"),
+    // The walls: the key refused (measured) and its two siblings in the
+    // binary; the usage wall's pieces (its URL and its time put between
+    // them); a model call that failed, and its status.
+    lit(
+        "muse.wall.key",
+        "your API key from META_API_KEY was rejected — update or unset it",
+        "1.4.10-R6427.1",
+    ),
+    lit(
+        "muse.wall.saved_key",
+        "your saved API key was rejected — run `muse login` or add a new key",
+        "1.4.10-R6427.1",
+    ),
+    lit(
+        "muse.wall.no_login",
+        "no login to refresh a key from; run `muse login` or set META_API_KEY",
+        "1.4.10-R6427.1",
+    ),
+    // A Meta account's walls (the binary's strings; the lab never logs in, so
+    // none was drawn).
+    lit(
+        "muse.wall.payment_api",
+        "Model API requires a payment method on your account — add one at https://dev.meta.ai, then log in again.",
+        "1.4.10-R6427.1",
+    ),
+    lit(
+        "muse.wall.payment_muse",
+        "Muse Code requires a payment method — subscribe at https://accountscenter.meta.com/muse_code/?ep=no_payg, then log in again.",
+        "1.4.10-R6427.1",
+    ),
+    lit(
+        "muse.wall.onboarding",
+        "your Meta account isn't set up for Model API yet — finish onboarding at https://dev.meta.ai, then log in again.",
+        "1.4.10-R6427.1",
+    ),
+    lit("muse.wall.usage", "Usage limit reached", "1.4.10-R6427.1"),
+    lit("muse.wall.usage.upgrade", " · /upgrade (", "1.4.10-R6427.1"),
+    lit(
+        "muse.wall.usage.more",
+        ") for increased limits",
+        "1.4.10-R6427.1",
+    ),
+    lit(
+        "muse.wall.usage.reset",
+        "wait for usage to reset at",
+        "1.4.10-R6427.1",
+    ),
+    lit("muse.wall.model_failed", "model failed: ", "1.4.10-R6427.1"),
+    lit("muse.wall.api_error", "API error ", "1.4.10-R6427.1"),
+    // The row under the status row while a failed request is retried.
+    lit("muse.retry.api", "Meta Model API ", "1.4.10-R6427.1"),
+    lit("muse.retry.in", " · retrying in ", "1.4.10-R6427.1"),
+    lit("muse.retry.attempt", " · attempt ", "1.4.10-R6427.1"),
+    // Strings of the binary, found by the dogfood runs of 2026-10-16 (muse
+    // 1.4.10 reviewing this reader of its own screens) and unmeasured on a
+    // screen. The composer's top-rule labels past `Voice input (…)`: voice
+    // input's other states, and the side chat's (its footer too).
+    lit(
+        "muse.composer.voice_prefix",
+        "Voice input (",
+        "1.4.10-R6427.1",
+    ),
+    lit("muse.composer.talk", "to talk", "1.4.10-R6427.1"),
+    lit("muse.composer.recording", "Recording", "1.4.10-R6427.1"),
+    lit(
+        "muse.composer.transcribing",
+        "Transcribing",
+        "1.4.10-R6427.1",
+    ),
+    lit("muse.composer.offline", "Voice offline", "1.4.10-R6427.1"),
+    lit("muse.composer.error", "Voice error", "1.4.10-R6427.1"),
+    lit("muse.sidechat.label", "Side Chat", "1.4.10-R6427.1"),
+    lit("muse.sidechat.footer", "Side chat mode", "1.4.10-R6427.1"),
+    // The standing grants that do not begin `Yes, …` (`Always allow in this
+    // workspace: ls ... (p)` measured on 1.4.9's staged box, `Always allow
+    // this network destination` on 1.4.10's network box, `muse.box.always`).
+    // The review after several questions' answers, measured on 1.4.9 too, is
+    // `muse.question.review`.
+    lit("muse.box.always_prefix", "Always allow ", "1.4.10-R6427.1"),
+    // The notices its background work leaves under a reply.
+    lit("muse.notice.finished", "Finished ", "1.4.10-R6427.1"),
+    lit("muse.notice.message", "Message from ", "1.4.10-R6427.1"),
+    // The turn failures: a login gone (a sign-in wall), a quota spent (a
+    // usage wall), and the faults only a person can fix.
+    lit(
+        "muse.wall.invalid",
+        "Your saved Meta credentials are invalid",
+        "1.4.10-R6427.1",
+    ),
+    lit(
+        "muse.wall.missing",
+        "No Meta credentials were found",
+        "1.4.10-R6427.1",
+    ),
+    lit(
+        "muse.wall.denied",
+        "macOS denied Muse Code access to your saved Meta credentials",
+        "1.4.10-R6427.1",
+    ),
+    lit(
+        "muse.wall.canceled",
+        "macOS Keychain access was canceled",
+        "1.4.10-R6427.1",
+    ),
+    lit(
+        "muse.wall.unreachable",
+        "Muse Code couldn't access your Meta credentials",
+        "1.4.10-R6427.1",
+    ),
+    lit("muse.wall.quota", "You've used your", "1.4.10-R6427.1"),
+    lit(
+        "muse.fault.config",
+        "A configuration problem stopped this turn.",
+        "1.4.10-R6427.1",
+    ),
+    lit(
+        "muse.fault.prepare",
+        "This turn could not prepare the conversation.",
+        "1.4.10-R6427.1",
+    ),
+    lit(
+        "muse.fault.state",
+        "A problem accessing saved state",
+        "1.4.10-R6427.1",
+    ),
+];
+
+/// Every string aterm guards on in Gemini CLI's screen (gemini-cli 0.46.0:
+/// the captures in [`crate::gemini::fixtures`] and its bundle).
+pub const GEMINI_ANCHORS: &[Anchor] = &[
+    // The logo row naming the build, the status row's idle hint, the
+    // composer's placeholder and the footer's first item.
+    lit("gemini.banner", "Gemini CLI", "0.46.0"),
+    lit("gemini.status.shortcuts", "? for shortcuts", "0.46.0"),
+    lit("gemini.status.cancel", "(esc to cancel, ", "0.46.0"),
+    // The status row's hint with the UI details hidden, and the approval
+    // modes it names at its left there (`● YOLO`).
+    lit(
+        "gemini.status.details",
+        "press tab twice for more",
+        "0.46.0",
+    ),
+    lit("gemini.mode.yolo", "YOLO", "0.46.0"),
+    lit("gemini.mode.auto_edit", "auto edit", "0.46.0"),
+    lit("gemini.mode.plan", "plan", "0.46.0"),
+    lit(
+        "gemini.composer.placeholder",
+        "Type your message or @path/to/file",
+        "0.46.0",
+    ),
+    lit(
+        "gemini.footer.workspace",
+        "workspace (/directory)",
+        "0.46.0",
+    ),
+    // A turn's ends: Esc, and an API error with the notice under it.
+    lit("gemini.turn.cancelled", "Request cancelled.", "0.46.0"),
+    lit("gemini.error.api", "[API Error:", "0.46.0"),
+    lit("gemini.error.failed", "This request failed", "0.46.0"),
+    // The approval boxes: their questions (the shell's tool name is drawn
+    // as `[Shell]` after it), the write tool's title and their options.
+    lit("gemini.box.exec.ask", "Allow execution of", "0.46.0"),
+    // The warning the shell box draws under its question for a command
+    // with a redirection (`Redirection detected. To auto-accept, press …`).
+    lit("gemini.box.redirection", "Redirection detected.", "0.46.0"),
+    lit("gemini.box.change.ask", "Apply this change?", "0.46.0"),
+    lit("gemini.box.writing", "Writing to ", "0.46.0"),
+    lit("gemini.box.once", "Allow once", "0.46.0"),
+    lit("gemini.box.session", "Allow for this session", "0.46.0"),
+    // The MCP box's standing grants: `Allow tool for this session`, `Allow
+    // all server tools for this session`.
+    lit("gemini.box.session.tail", "for this session", "0.46.0"),
+    // The MCP and fetch boxes' head, the fetch box's question, and the
+    // sandbox expansion's (`To run [Shell], allow access to the following?`,
+    // drawn from parts: `To run`, a blank, the bracketed names).
+    lit("gemini.box.action", "Action Required", "0.46.0"),
+    lit("gemini.box.proceed", "Do you want to proceed?", "0.46.0"),
+    lit("gemini.box.expansion.head", "To run", "0.46.0"),
+    lit(
+        "gemini.box.expansion.ask",
+        ", allow access to the following?",
+        "0.46.0",
+    ),
+    lit("gemini.box.saved", "all future sessions", "0.46.0"),
+    lit("gemini.box.editor", "Modify with external editor", "0.46.0"),
+    lit("gemini.box.deny", "No, suggest changes (esc)", "0.46.0"),
+    // The question dialog.
+    lit("gemini.question.title", "Answer Questions", "0.46.0"),
+    lit("gemini.question.custom", "Enter a custom value", "0.46.0"),
+    hint("gemini.question.keys", "Enter to select", "0.46.0"),
+    // Several questions: the review tab's head and its key row.
+    lit("gemini.question.review", "Review your answers:", "0.46.0"),
+    hint("gemini.question.submit", "Enter to submit", "0.46.0"),
+    // The per-day quota's dialog: neither option is pressed.
+    lit("gemini.usage.title", "Usage limit reached for", "0.46.0"),
+    lit("gemini.usage.retry", "Keep trying", "0.46.0"),
+    // The messages typed while the agent worked, over the status row (and
+    // under a box kept over the composer) — drawn from a `\u2191` escape, so
+    // composed for the canary.
+    composed("gemini.queued", "Queued (press ↑ to edit):", "0.46.0"),
+    // The same dialog's other first rows (bundle: `ProQuotaDialog`): a 404
+    // for a model the key cannot reach (measured), a model it does not know
+    // (`Model "<m>" was not found or is invalid.`), and the service's demand.
+    lit(
+        "gemini.fallback.no_access",
+        "It seems like you don't have access to ",
+        "0.46.0",
+    ),
+    lit(
+        "gemini.fallback.not_found",
+        "was not found or is invalid.",
+        "0.46.0",
+    ),
+    lit(
+        "gemini.fallback.demand",
+        "We are currently experiencing high demand.",
+        "0.46.0",
+    ),
+    // The folder-trust dialog: its options name the folder after these.
+    lit(
+        "gemini.trust.title",
+        "Do you trust the files in this folder?",
+        "0.46.0",
+    ),
+    lit("gemini.trust.folder", "Trust folder (", "0.46.0"),
+    lit("gemini.trust.parent", "Trust parent folder (", "0.46.0"),
+    lit("gemini.trust.no", "Don't trust", "0.46.0"),
+    // Leaving: the farewell box's head and its resume line.
+    lit(
+        "gemini.exit.farewell",
+        "Agent powering down. Goodbye!",
+        "0.46.0",
+    ),
+    lit(
+        "gemini.exit.resume",
+        "To resume this session: gemini --resume",
+        "0.46.0",
+    ),
 ];
 
 /// The text of the anchor `id`. Panics on an id the table does not have —
@@ -1052,9 +1612,9 @@ pub const MUSE_ANCHORS: &[Anchor] = &[
 pub fn anchor(id: &str) -> &'static str {
     match ANCHORS
         .iter()
-        .chain(CODEX_ANCHORS)
         .chain(AGY_ANCHORS)
         .chain(MUSE_ANCHORS)
+        .chain(GEMINI_ANCHORS)
         .find(|a| a.id == id)
     {
         Some(a) => a.text,
@@ -1089,13 +1649,6 @@ pub const fn anchor_text(id: &str) -> &'static str {
         i += 1;
     }
     let mut i = 0;
-    while i < CODEX_ANCHORS.len() {
-        if same(CODEX_ANCHORS[i].id, id) {
-            return CODEX_ANCHORS[i].text;
-        }
-        i += 1;
-    }
-    let mut i = 0;
     while i < AGY_ANCHORS.len() {
         if same(AGY_ANCHORS[i].id, id) {
             return AGY_ANCHORS[i].text;
@@ -1106,6 +1659,13 @@ pub const fn anchor_text(id: &str) -> &'static str {
     while i < MUSE_ANCHORS.len() {
         if same(MUSE_ANCHORS[i].id, id) {
             return MUSE_ANCHORS[i].text;
+        }
+        i += 1;
+    }
+    let mut i = 0;
+    while i < GEMINI_ANCHORS.len() {
+        if same(GEMINI_ANCHORS[i].id, id) {
+            return GEMINI_ANCHORS[i].text;
         }
         i += 1;
     }
@@ -1277,122 +1837,6 @@ pub(crate) fn canary_binary(program: &str, env: &str) -> Option<std::path::PathB
 mod tests {
     use super::*;
 
-    /// THE CANARIES READ THE MANAGED BUILD, whatever copy stands ahead on
-    /// PATH: the first line of `aterm pkg which` names the store's binary only
-    /// when it says `managed` AND its head ends in the store. Behind a brew
-    /// cask's `claude` it says SHADOWED and names THAT copy; in a shell outside
-    /// aterm whose reroute stub passes through (or that has none) it says
-    /// `managed …` and then `not what runs outside aterm`, its head the shell's
-    /// own copy. NEGATIVE
-    /// CONTROLS: with no managed copy where the store keeps one, a shadowed,
-    /// outside-aterm or system line names nothing to read.
-    #[test]
-    fn the_canaries_read_the_managed_build_whatever_stands_ahead_on_path() {
-        let managed = "claude \u{2192} /p/reroute/claude \u{2192} /p/agents/claude \u{2192} \
-                       /p/store/claude/1000002000001000286/bin/claude \u{2014} managed 2.1.286 \
-                       \u{2014} Anthropic latest";
-        let shadowed = "claude \u{2192} /opt/homebrew/bin/claude \u{2014} managed 2.1.286 \u{2014} \
-                        SHADOWED in this shell by /opt/homebrew/bin/claude: its PATH has /p/agents \
-                        behind /opt/homebrew/bin";
-        let system =
-            "claude \u{2192} /usr/local/bin/claude \u{2014} system copy (not managed by aterm)";
-        // atpkg `state.rs` agent_passed_through / agent_own_copy_outside_aterm.
-        let passed_through = "claude \u{2192} /opt/homebrew/bin/claude \u{2014} managed 2.1.286 \
-                              \u{2014} not what runs outside aterm: /p/reroute/claude passes \
-                              through to /opt/homebrew/bin/claude, this shell's own copy (the \
-                              managed copy leads inside aterm only; aterm help reroute)";
-        let own_copy = "claude \u{2192} /opt/homebrew/bin/claude \u{2014} managed 2.1.286 \
-                        \u{2014} not what runs outside aterm: /opt/homebrew/bin/claude runs \
-                        here, this shell's own copy (the managed copy leads inside aterm only; \
-                        aterm help reroute)";
-        assert_eq!(
-            canary_path(managed, None),
-            Some("/p/store/claude/1000002000001000286/bin/claude".into()),
-            "a managed line ends in the store's binary"
-        );
-        let home = std::env::temp_dir().join(format!("aterm-phase-canary-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&home);
-        let current = canary_prefix(&home).join("store/claude/current/bin");
-        std::fs::create_dir_all(&current).expect("a store directory");
-        std::fs::write(current.join("claude"), b"a build").expect("a binary");
-        for line in [shadowed, passed_through, own_copy, system] {
-            assert_eq!(
-                canary_path(line, Some(&home)),
-                Some(current.join("claude")),
-                "{line}"
-            );
-            assert_eq!(
-                canary_path(line, Some(&home.join("nowhere"))),
-                None,
-                "{line}"
-            );
-            assert_eq!(canary_path(line, None), None, "{line}");
-        }
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn ids_are_unique_and_every_text_is_non_empty() {
-        let all: Vec<&Anchor> = ANCHORS
-            .iter()
-            .chain(CODEX_ANCHORS)
-            .chain(AGY_ANCHORS)
-            .chain(MUSE_ANCHORS)
-            .collect();
-        for (i, a) in all.iter().enumerate() {
-            assert!(!a.text.trim().is_empty(), "{}", a.id);
-            assert!(
-                all[i + 1..].iter().all(|b| b.id != a.id),
-                "duplicate id {}",
-                a.id
-            );
-        }
-        // Each agent's ids are namespaced, and both accessors read its
-        // table.
-        for (space, table) in [
-            ("codex.", CODEX_ANCHORS),
-            ("agy.", AGY_ANCHORS),
-            ("muse.", MUSE_ANCHORS),
-        ] {
-            for a in table {
-                assert!(a.id.starts_with(space), "{}", a.id);
-                assert_eq!(anchor(a.id), a.text);
-                assert_eq!(anchor_text(a.id), a.text);
-            }
-        }
-        assert!(ANCHORS.iter().all(|a| {
-            !["codex.", "agy.", "muse."]
-                .iter()
-                .any(|space| a.id.starts_with(space))
-        }));
-        assert_eq!(anchor("prompt.proceed"), "Do you want to proceed?");
-        // The compile-time accessor reads the same table.
-        const PROCEED: &str = anchor_text("prompt.proceed");
-        assert_eq!(PROCEED, anchor("prompt.proceed"));
-        for a in ANCHORS {
-            assert_eq!(anchor_text(a.id), a.text, "{}", a.id);
-        }
-        assert_eq!(
-            ANCHORS
-                .iter()
-                .find(|a| a.id == "wall.memory")
-                .map(|a| a.kind),
-            Some(AnchorKind::Literal)
-        );
-    }
-
-    #[test]
-    fn a_guard_prefix_is_the_leading_words_as_a_guard() {
-        assert_eq!(guard_prefix("survey.question", 4), "How.is.Claude.doing");
-        assert_eq!(guard_prefix("busy.interrupt", 3), "esc.to.interrupt");
-        // More words than the anchor has is the whole anchor, never a panic.
-        assert_eq!(guard_prefix("busy.interrupt", 9), "esc.to.interrupt");
-        assert_eq!(
-            guard_prefix("prompt.proceed", 5),
-            "Do.you.want.to.proceed\\?"
-        );
-    }
-
     #[test]
     #[should_panic(expected = "no anchor")]
     fn an_unknown_id_panics() {
@@ -1430,14 +1874,82 @@ mod tests {
         Some((path, bytes))
     }
 
-    /// The version `<path> --version` prints, or `None` when it cannot be
-    /// read ([`version_in`]).
+    /// The version atpkg's record beside the build names (`<build>.vendor`'s
+    /// `version = "…"`: the build of the binary's directory, reached through
+    /// a `current` link, else of the file a link from outside the store
+    /// names), or `None` where there is no record ([`version_in`]). The binary is never
+    /// run, as the Gemini canary reads its `package.json`: a vendor build the
+    /// suite starts runs with the owner's HOME, and its `--version` is no
+    /// pure read there (measured 2026-10-17 in a scratch HOME: Muse Code
+    /// 1.4.10's takes `~/.config/muse/.auth.json.lock`, Codex 0.163.0's makes
+    /// its PATH-alias helpers under `~/.codex`).
     fn build_version(path: &str) -> Option<String> {
-        let out = std::process::Command::new(path)
-            .arg("--version")
-            .output()
-            .ok()?;
-        version_in(&String::from_utf8_lossy(&out.stdout))
+        use std::path::{Path, PathBuf};
+        let path = Path::new(path);
+        let build_of = |bin_dir: Option<PathBuf>| bin_dir?.parent().map(Path::to_path_buf);
+        let record = [
+            build_of(path.parent().and_then(|d| d.canonicalize().ok())),
+            build_of(
+                path.canonicalize()
+                    .ok()
+                    .and_then(|f| f.parent().map(Path::to_path_buf)),
+            ),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(|build| std::fs::read_to_string(format!("{}.vendor", build.display())).ok())?;
+        let version = record
+            .lines()
+            .filter_map(|l| l.split_once('='))
+            .find(|(k, _)| k.trim() == "version")?
+            .1;
+        version_in(version.trim().trim_matches('"'))
+    }
+
+    /// The canary's version is the store record's, read through a `current`
+    /// link, and the build is never started: its stand-in would leave a
+    /// mark if it ran. NEGATIVE CONTROLS: a build with no record, and a
+    /// record with no `version`, name none (every anchor is then owed).
+    #[cfg(unix)]
+    #[test]
+    fn the_canary_reads_the_build_record_and_never_runs_the_build() {
+        let root = aterm_tempfile::TempDir::new().expect("a private store");
+        let root = root.path();
+        let build = root.join("store/agy/1000001000004000000");
+        std::fs::create_dir_all(build.join("bin")).expect("a bin directory");
+        let mark = root.join("ran");
+        let bin = build.join("bin/agy");
+        std::fs::write(&bin, format!("#!/bin/sh\ntouch '{}'\n", mark.display())).expect("a build");
+        std::fs::set_permissions(&bin, {
+            let mut p = std::fs::metadata(&bin).expect("its mode").permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut p, 0o755);
+            p
+        })
+        .expect("executable");
+        let record = root.join("store/agy/1000001000004000000.vendor");
+        std::fs::write(
+            &record,
+            "schema = 1\nprogram = \"agy\"\nversion = \"1.4.0\"\n",
+        )
+        .expect("a record");
+        std::os::unix::fs::symlink(&build, root.join("store/agy/current")).expect("a link");
+        let via_link = root.join("store/agy/current/bin/agy");
+        assert_eq!(
+            build_version(&via_link.to_string_lossy()).as_deref(),
+            Some("1.4.0")
+        );
+        assert!(!mark.exists(), "the build was never started");
+        let outside = root.join("agy");
+        std::os::unix::fs::symlink(&bin, &outside).expect("a link from outside the store");
+        assert_eq!(
+            build_version(&outside.to_string_lossy()).as_deref(),
+            Some("1.4.0")
+        );
+        std::fs::write(&record, "schema = 1\nprogram = \"agy\"\n").expect("a record");
+        assert_eq!(build_version(&bin.to_string_lossy()), None);
+        std::fs::remove_file(&record).expect("removed");
+        assert_eq!(build_version(&bin.to_string_lossy()), None);
+        assert!(!mark.exists(), "the build was never started");
     }
 
     /// The version a `--version` line names: a dotted one (`2.1.286 (Claude
@@ -1477,20 +1989,6 @@ mod tests {
         parts(a) > parts(b)
     }
 
-    #[test]
-    fn an_anchor_newer_than_the_build_is_not_owed_and_versions_compare_by_number() {
-        assert!(newer_than("2.1.291", "2.1.286"));
-        assert!(!newer_than("2.1.286", "2.1.286"));
-        assert!(!newer_than("2.1.9", "2.1.10"), "by number, not by text");
-        assert!(newer_than("0.130.0", "0.99.0"));
-        // Muse Code's revisions, by number after the version.
-        assert!(!newer_than("1.4.9-R6297.1", "1.4.9-R6297.1"));
-        assert!(newer_than("1.4.9-R6297.2", "1.4.9-R6297.1"));
-        assert!(newer_than("1.4.9-R6300.0", "1.4.9-R6297.9"));
-        assert!(newer_than("1.4.10-R1.0", "1.4.9-R6297.1"));
-        assert!(!newer_than("1.4.9-R6297.1", "1.4.10-R1.0"));
-    }
-
     /// MUSE CODE'S VERSION IS READ WITH ITS REVISION: `muse --version` prints
     /// `Muse Code 1.4.9 (1.4.9-R6297.1)` (measured), and the build is the
     /// revision its anchors carry — read as the dotted `1.4.9` alone, every
@@ -1510,6 +2008,18 @@ mod tests {
             &version_in("Muse Code 1.4.9 (1.4.9-R6297.1)").unwrap()
         ));
         assert!(newer_than(since, "1.4.9"), "why the revision is read");
+        // 1.4.10's anchors are owed by 1.4.10 (measured: `Muse Code 1.4.10
+        // (1.4.10-R6427.1)`) and by no 1.4.9 build.
+        let boxes = MUSE_ANCHORS
+            .iter()
+            .find(|a| a.id == "muse.box.shell")
+            .map(|a| a.since)
+            .expect("the shell box's anchor");
+        let built = version_in("Muse Code 1.4.10 (1.4.10-R6427.1)").unwrap();
+        assert_eq!(built, "1.4.10-R6427.1");
+        assert!(!newer_than(boxes, &built));
+        assert!(!newer_than(since, &built));
+        assert!(newer_than(boxes, "1.4.9-R6297.1"));
         for (line, want) in [
             ("2.1.286 (Claude Code)", "2.1.286"),
             ("codex-cli 0.130.0", "0.130.0"),
@@ -1525,126 +2035,18 @@ mod tests {
         super::contains_bytes(bytes, needle.as_bytes())
     }
 
-    /// The literal anchors of `table` missing from `bytes`, and for Codex
-    /// (`codex`) the [`crate::codex::WALLS`] phrases — which are read
-    /// lowercased — missing from them lowercased, and the
-    /// [`crate::codex::TOOL_HEADS`] missing from them, each less its trailing
-    /// space (the vendor draws the head and the space after it as two spans).
-    /// A head the build no longer spells is an agent's last words read for a
-    /// tool row's, or a tool row's for the agent's: 0.163.0 draws `Viewed
-    /// image`, and the table said `Viewed Image`.
-    fn missing(bytes: &[u8], table: &[Anchor], codex: bool) -> Vec<&'static str> {
-        let mut out: Vec<&'static str> = table
+    /// The literal anchors of `table` missing from `bytes`: a row whose
+    /// parts (split at ` · `) are not all in them.
+    fn missing(bytes: &[u8], table: &[Anchor]) -> Vec<&'static str> {
+        table
             .iter()
             .filter(|a| a.kind == AnchorKind::Literal)
             .filter(|a| !a.text.split(" · ").all(|part| contains(bytes, part)))
             .map(|a| a.id)
-            .collect();
-        if codex {
-            let lower = bytes.to_ascii_lowercase();
-            out.extend(
-                crate::codex::WALLS
-                    .iter()
-                    .map(|(phrase, _)| *phrase)
-                    .filter(|phrase| !contains(&lower, phrase)),
-            );
-            out.extend(
-                crate::codex::TOOL_HEADS
-                    .iter()
-                    .copied()
-                    .filter(|head| !contains(bytes, head.trim_end())),
-            );
-        }
-        out
+            .collect()
     }
 
-    /// The scan finds a needle wherever it stands — first bytes, last bytes,
-    /// after a near miss — and not one that is absent.
-    #[test]
-    fn the_scan_finds_a_needle_wherever_it_stands() {
-        let hay = b"xxabcabdabcabcxx";
-        for needle in [&b"abcabc"[..], b"xx", b"abd", b"cxx", b"x"] {
-            assert!(
-                super::contains_bytes(hay, needle),
-                "{}",
-                String::from_utf8_lossy(needle)
-            );
-        }
-        for needle in [&b"abcabx"[..], b"xxx", b"dabd", b"abcabcxxx"] {
-            assert!(
-                !super::contains_bytes(hay, needle),
-                "{}",
-                String::from_utf8_lossy(needle)
-            );
-        }
-        assert!(
-            super::contains_bytes(b"a", b"a")
-                && !super::contains_bytes(b"", b"a")
-                && super::contains_bytes(b"", b"")
-        );
-    }
-
-    /// A reroute stub is no build: the canaries skip it (`CANARY NOT RUN`)
-    /// instead of naming every anchor missing from a few lines of shell.
-    /// NEGATIVE CONTROLS: a Mach-O or ELF header, and a file of several
-    /// megabytes, are builds.
-    #[test]
-    fn a_stub_script_is_no_build() {
-        assert!(!super::looks_like_a_build(
-            b"#!/bin/sh\nexec aterm pkg run claude \"$@\"\n"
-        ));
-        assert!(!super::looks_like_a_build(b""));
-        assert!(super::looks_like_a_build(&[
-            0xcf, 0xfa, 0xed, 0xfe, 7, 0, 0, 1
-        ]));
-        assert!(super::looks_like_a_build(b"\x7fELF\x02\x01\x01"));
-        assert!(super::looks_like_a_build(&vec![
-            b'#';
-            super::MIN_BUILD_BYTES
-        ]));
-    }
-
-    /// The canary's matcher on a stand-in binary. NEGATIVE CONTROL: a wall
-    /// phrase or an anchor the bytes lack is named.
-    #[test]
-    fn the_canary_names_what_a_binary_lacks() {
-        let every: String = CODEX_ANCHORS
-            .iter()
-            .map(|a| a.text.to_string())
-            .chain(crate::codex::WALLS.iter().map(|(p, _)| p.to_uppercase()))
-            .chain(
-                crate::codex::TOOL_HEADS
-                    .iter()
-                    .map(|h| h.trim_end().to_string()),
-            )
-            .collect::<Vec<_>>()
-            .join("\0");
-        assert!(missing(every.as_bytes(), CODEX_ANCHORS, true).is_empty());
-        let short = every.replace("SPEND CAP", "").replace("Folder access", "");
-        assert_eq!(
-            missing(short.as_bytes(), CODEX_ANCHORS, true),
-            vec!["codex.trust.title", "spend cap"]
-        );
-        // A tool head the build spells otherwise is named: a binary with
-        // 0.156.1's `Viewed Image` and not 0.163.0's `Viewed image`.
-        let old_heads = every.replace("Viewed image", "Viewed Image");
-        assert_eq!(
-            missing(old_heads.as_bytes(), CODEX_ANCHORS, true),
-            vec!["Viewed image"]
-        );
-        // Claude's canary asks nothing of Codex's tables.
-        assert!(missing(b"", &[], false).is_empty());
-        // The exit hint's words are looked for too: a build that prints
-        // 0.157's `Reconnect: codex resume <id>` line and no `To reconnect`
-        // heading is named.
-        let old = every.replace("To reconnect", "Reconnect: codex resume ");
-        assert_eq!(
-            missing(old.as_bytes(), CODEX_ANCHORS, true),
-            vec!["codex.exit.reconnect"]
-        );
-    }
-
-    fn literal_anchors_are_in_the_store(program: &str, env: &str, table: &[Anchor], walls: bool) {
+    fn literal_anchors_are_in_the_store(program: &str, env: &str, table: &[Anchor]) {
         let Some((path, bytes)) = store_binary(program, env) else {
             eprintln!(
                 "CANARY NOT RUN: no {program} binary (set {env} or `aterm pkg install \
@@ -1669,18 +2071,23 @@ mod tests {
                 newer.iter().map(|a| a.id).collect::<Vec<_>>()
             );
         }
-        let missing = missing(&bytes, &owed, walls);
+        let missing = missing(&bytes, &owed);
         assert!(
             missing.is_empty(),
-            "{path}: {} literal anchors, wall phrases or tool heads missing: {missing:?}",
+            "{path}: {} literal anchors missing: {missing:?}",
             missing.len()
         );
-        eprintln!("{path}: every literal anchor (and wall phrase and tool head) is present");
+        eprintln!(
+            "{path} ({}): every literal anchor is present",
+            version
+                .as_deref()
+                .unwrap_or("no store record: every anchor owed")
+        );
     }
 
     #[test]
     fn every_literal_anchor_is_in_the_store_claude() {
-        literal_anchors_are_in_the_store("claude", "ATERM_CLAUDE_BIN", ANCHORS, false);
+        literal_anchors_are_in_the_store("claude", "ATERM_CLAUDE_BIN", ANCHORS);
     }
 
     /// THE LIMIT RESET'S TEMPLATES, WHOLE, as the bundle spells them — a `·`
@@ -1738,50 +2145,6 @@ mod tests {
             .collect()
     }
 
-    /// The templates' matcher on a stand-in binary: one that carries each is
-    /// missing none. NEGATIVE CONTROL, and why the templates are looked for
-    /// whole: with the confirmation's detail reworded and the footer
-    /// notice's `{resets} left \xB7 use by {date}` still there, the table's
-    /// own canary finds every side of every reset row and names nothing,
-    /// and this one names the row.
-    #[test]
-    fn a_reworded_reset_template_is_named_though_its_sides_remain() {
-        let table: Vec<Anchor> = ANCHORS
-            .iter()
-            .filter(|a| a.id.starts_with("reset."))
-            .copied()
-            .collect();
-        let notice = "/limit-reset to refill your limits \\xB7 {resets} left \\xB7 use by {date}";
-        let every = table
-            .iter()
-            .map(|a| a.text.to_string())
-            .chain(reset_templates().into_iter().map(|(_, template)| template))
-            .chain([notice.to_string()])
-            .collect::<Vec<_>>()
-            .join("\0");
-        assert!(missing(every.as_bytes(), &table, false).is_empty());
-        assert_eq!(missing_templates(every.as_bytes()), Vec::<&str>::new());
-        let reworded = every.replace(
-            "{resets} left \\xB7 use by {deadline}",
-            "{resets} remaining \\xB7 expires {deadline}",
-        );
-        assert_ne!(reworded, every);
-        assert!(missing(reworded.as_bytes(), &table, false).is_empty());
-        assert_eq!(
-            missing_templates(reworded.as_bytes()),
-            vec!["reset.confirm.use_by"]
-        );
-        let reworded = every.replace(
-            "now \\xB7 your weekly reset day stays {week}",
-            "today \\xB7 your weekly reset day stays {week}",
-        );
-        assert!(missing(reworded.as_bytes(), &table, false).is_empty());
-        assert_eq!(
-            missing_templates(reworded.as_bytes()),
-            vec!["reset.confirm.stays"]
-        );
-    }
-
     /// The drift canary for [`reset_templates`], run and skipped as the
     /// table's own is ([`store_binary`]).
     #[test]
@@ -1804,17 +2167,129 @@ mod tests {
     }
 
     #[test]
-    fn every_literal_codex_anchor_is_in_the_store_codex() {
-        literal_anchors_are_in_the_store("codex", "ATERM_CODEX_BIN", CODEX_ANCHORS, true);
-    }
-
-    #[test]
     fn every_literal_agy_anchor_is_in_the_store_agy() {
-        literal_anchors_are_in_the_store("agy", "ATERM_AGY_BIN", AGY_ANCHORS, false);
+        literal_anchors_are_in_the_store("agy", "ATERM_AGY_BIN", AGY_ANCHORS);
     }
 
     #[test]
     fn every_literal_muse_anchor_is_in_the_store_muse() {
-        literal_anchors_are_in_the_store("muse", "ATERM_MUSE_BIN", MUSE_ANCHORS, false);
+        literal_anchors_are_in_the_store("muse", "ATERM_MUSE_BIN", MUSE_ANCHORS);
+    }
+
+    /// Gemini CLI's npm bundle, found from `bin` (a `gemini` on PATH, a
+    /// Homebrew link or the script itself): the directory the script
+    /// resolves into, every `.js` file in it (joined, NUL between), and the
+    /// version its package's `package.json` (one up) names. `None` where
+    /// `bin` leads to no `@google/gemini-cli` package: a stub, another
+    /// program of that name.
+    fn gemini_bundle(bin: &std::path::Path) -> Option<(String, Vec<u8>, Option<String>)> {
+        let script = std::fs::canonicalize(bin).ok()?;
+        let dir = script.parent()?;
+        let package = std::fs::read_to_string(dir.parent()?.join("package.json")).ok()?;
+        if !package.contains("\"@google/gemini-cli\"") {
+            return None;
+        }
+        let version = package
+            .split_once("\"version\"")
+            .and_then(|(_, rest)| rest.split('"').nth(1))
+            .map(str::to_string);
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .ok()?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "js"))
+            .collect();
+        files.sort();
+        let mut bytes = Vec::new();
+        for file in files {
+            bytes.extend(std::fs::read(file).ok()?);
+            bytes.push(0);
+        }
+        Some((dir.display().to_string(), bytes, version))
+    }
+
+    /// Where the Gemini CLI canary looks: `$ATERM_GEMINI_BIN`, else the first
+    /// `gemini` on PATH, else Homebrew's link.
+    fn gemini_bin() -> Option<std::path::PathBuf> {
+        if let Some(path) = std::env::var_os("ATERM_GEMINI_BIN") {
+            return Some(path.into());
+        }
+        std::env::var_os("PATH")
+            .iter()
+            .flat_map(std::env::split_paths)
+            .map(|d| d.join("gemini"))
+            .chain(["/opt/homebrew/bin/gemini", "/usr/local/bin/gemini"].map(Into::into))
+            .find(|p| p.is_file())
+    }
+
+    /// The bundle finder on a stand-in package: the version its
+    /// `package.json` names and every `.js` file of the script's directory,
+    /// found through a link. NEGATIVE CONTROLS: a package of another name,
+    /// and a script with no package over it, are no bundle. Unix only: the
+    /// stand-in's link is a symlink.
+    #[cfg(unix)]
+    #[test]
+    fn the_gemini_canary_reads_the_bundle_its_script_resolves_into() {
+        let root = aterm_tempfile::TempDir::new().expect("a private Gemini bundle");
+        let root = root.path();
+        let bundle = root.join("lib/node_modules/@google/gemini-cli/bundle");
+        std::fs::create_dir_all(&bundle).expect("a bundle directory");
+        std::fs::write(bundle.join("gemini.js"), b"import './chunk-A.js';").expect("a script");
+        std::fs::write(bundle.join("chunk-A.js"), b"Allow once").expect("a chunk");
+        std::fs::write(bundle.join("notes.txt"), b"Keep trying").expect("a file");
+        let package = bundle.parent().expect("the package").join("package.json");
+        std::fs::write(
+            &package,
+            b"{\n  \"name\": \"@google/gemini-cli\",\n  \"version\": \"0.46.0\"\n}",
+        )
+        .expect("a package.json");
+        std::fs::create_dir_all(root.join("bin")).expect("a bin directory");
+        let link = root.join("bin/gemini");
+        std::os::unix::fs::symlink(bundle.join("gemini.js"), &link).expect("a link");
+        let (_, bytes, version) = gemini_bundle(&link).expect("the bundle");
+        assert_eq!(version.as_deref(), Some("0.46.0"));
+        assert!(contains(&bytes, "Allow once") && contains(&bytes, "chunk-A.js"));
+        assert!(!contains(&bytes, "Keep trying"), "only its .js files");
+        std::fs::write(&package, b"{\"name\": \"another-gemini\"}").expect("a package.json");
+        assert!(gemini_bundle(&link).is_none(), "another package");
+        std::fs::remove_file(&package).expect("removed");
+        assert!(gemini_bundle(&link).is_none(), "no package");
+    }
+
+    /// The drift canary for [`GEMINI_ANCHORS`], run and skipped as the
+    /// store's are ([`literal_anchors_are_in_the_store`]), over the npm
+    /// bundle ([`gemini_bundle`]).
+    #[test]
+    fn every_literal_gemini_anchor_is_in_its_bundle() {
+        let Some((dir, bytes, version)) = gemini_bin().as_deref().and_then(gemini_bundle) else {
+            eprintln!(
+                "CANARY NOT RUN: no Gemini CLI bundle (set ATERM_GEMINI_BIN to its `gemini`, or \
+                 `brew install gemini-cli`); anchors not checked"
+            );
+            return;
+        };
+        let (owed, newer): (Vec<Anchor>, Vec<Anchor>) = GEMINI_ANCHORS
+            .iter()
+            .copied()
+            .partition(|a| version.as_deref().is_none_or(|v| !newer_than(a.since, v)));
+        if !newer.is_empty() {
+            eprintln!(
+                "{dir}: {} anchor(s) are for builds newer than {}, not checked: {:?}",
+                newer.len(),
+                version.as_deref().unwrap_or("?"),
+                newer.iter().map(|a| a.id).collect::<Vec<_>>()
+            );
+        }
+        let missing = missing(&bytes, &owed);
+        assert!(
+            missing.is_empty(),
+            "{dir}: {} literal anchors missing: {missing:?}",
+            missing.len()
+        );
+        eprintln!(
+            "{dir} ({}): every literal Gemini CLI anchor is present",
+            version
+                .as_deref()
+                .unwrap_or("no package version: every anchor owed")
+        );
     }
 }

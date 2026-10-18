@@ -11,8 +11,6 @@
 
 use std::sync::Arc;
 
-#[cfg(test)]
-use super::StyleId;
 use super::write::StaleExtras;
 use super::{Cell, CellFlags, Grid, PackedColors};
 
@@ -212,6 +210,17 @@ impl Grid {
         max_col
     }
 
+    /// Wrap first when the cursor sits past its row's last printable column, as the run
+    /// writers do when nothing fits (`to_write == 0`): SU/SD move rows, not the cursor, so
+    /// a DECDWL row scrolled under it leaves the cursor in the row's hidden half.
+    #[inline]
+    pub fn wrap_if_past_print_edge(&mut self) {
+        let (row, col) = (self.storage.cursor.row, self.storage.cursor.col);
+        if self.storage.any_double_width && col > self.last_print_col(row, col) {
+            self.advance_autowrap_line();
+        }
+    }
+
     /// Get effective columns clamped by DECLRMM right margin.
     #[inline]
     fn margin_clamped_ecols(&self, row: u16) -> u16 {
@@ -388,6 +397,7 @@ impl Grid {
         if self.storage.take_pending_wrap() {
             self.advance_autowrap_line();
         }
+        self.wrap_if_past_print_edge();
 
         let cursor_row = self.storage.cursor.row;
         let cursor_col = self.storage.cursor.col;
@@ -759,33 +769,6 @@ impl Grid {
                 self.storage.cursor.col = end_col;
             }
         }
-    }
-
-    /// Write a wide character with autowrap using a style ID. Test-only; production uses
-    /// `pre_wrap_wide_ecols` + `write_wide_char_at_cursor_packed_ecols` +
-    /// `advance_cursor_wide_wrap_ecols`.
-    #[cfg(test)]
-    pub(crate) fn write_wide_char_wrap_with_style_id(
-        &mut self,
-        c: char,
-        style_id: StyleId,
-        extra_flags: CellFlags,
-    ) -> bool {
-        let (fg, bg, flags) = self.resolve_style_to_colors(style_id, extra_flags);
-        self.write_wide_char_wrap_styled(c, fg, bg, flags)
-    }
-
-    /// Write a wide character without autowrap using a style ID. Test-only; production uses
-    /// `write_wide_char_at_cursor_packed_ecols` + `advance_cursor_wide_no_wrap_ecols`.
-    #[cfg(test)]
-    pub fn write_wide_char_with_style_id(
-        &mut self,
-        c: char,
-        style_id: StyleId,
-        extra_flags: CellFlags,
-    ) -> bool {
-        let (fg, bg, flags) = self.resolve_style_to_colors(style_id, extra_flags);
-        self.write_wide_char_styled(c, fg, bg, flags)
     }
 
     /// Write styled ASCII bytes whose style needs `CellExtras` (truecolor RGB, hyperlinks,

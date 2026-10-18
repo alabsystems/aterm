@@ -6,10 +6,10 @@
 //!
 //! It also counts, machine-wide, how many completed checks in a row have found the
 //! channel head's APP BUILD IN FLIGHT (a release published source-first:
-//! `github::app_build_in_flight`) — the count the check loop's quick re-check ladder
-//! (`cadence::IN_FLIGHT_RETRY`) and every sibling's dedup window
-//! (`checker_skip_for`) key on, so whichever process checks next, the machine walks
-//! one ladder.
+//! `github::app_build_in_flight`) — the count the check loop's quick re-checks
+//! (`cadence::IN_FLIGHT_RETRY`, for `cadence::IN_FLIGHT_CHECKS` of them) and every
+//! sibling's dedup window (`checker_skip_for`) key on, so whichever process checks
+//! next, the machine walks one ladder.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -173,7 +173,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::status::clear_check_note();
         let staging = Staging::scratch("check-receipt-provenance");
-        let model = aterm_spec::derive::native_update_check_receipt_model();
+        let model = aterm_models_update::native_update_check_receipt_model();
         let now = crate::unix_now_secs();
         let base = Duration::from_secs(3); // 70% freshness = two seconds.
         for age in 0..=2 {
@@ -223,47 +223,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&staging.root);
     }
 
-    /// A deferral recorded by a completed check survives every later apply/status
-    /// write, and widens every sibling's window; a malformed or legacy record
-    /// authorizes no skip.
-    #[test]
-    fn apply_writes_cannot_clear_a_completed_checks_deferral() {
-        let _guard = crate::STRANDED_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::status::clear_check_note();
-        let staging = Staging::scratch("check-receipt-deferral");
-        let source = source("one");
-        let now = crate::unix_now_secs();
-        let base = Duration::from_secs(1800);
-        // 25 minutes old: past the base window (21 min), inside the widened one (42).
-        record_at(&staging, 42, &source, true, None, now - 25 * 60);
-        crate::status::record(&staging, 42, "update apply refused: live terminals");
-        let (reason, _) = crate::checker_skip_for(&staging, 42, &source, base, now).unwrap();
-        assert!(reason.contains("deferred"), "{reason}");
-        // Negative control: the same age as a completed check skips nothing.
-        record_at(&staging, 42, &source, false, None, now - 25 * 60);
-        assert!(crate::checker_skip_for(&staging, 42, &source, base, now).is_none());
-        // Receipt failures do not wedge: malformed/legacy records authorize no skip.
-        std::fs::write(
-            path(&staging),
-            "schema = 1\nupdated_at = \"2026-09-14T00:00:00Z\"\n",
-        )
-        .unwrap();
-        assert!(crate::checker_skip_for(&staging, 42, &source, base, now).is_none());
-        let _ = std::fs::remove_dir_all(&staging.root);
-    }
-
-    /// THE DEDUP WINDOW MAY NOT OUTLAST THE QUICK LADDER. A completed check 100 s
-    /// ago skips every checker on a 10-minute base (the 7-minute window; the
-    /// negative control: sized on the base, the checker's own 2-minute re-check would
-    /// read its own stamp as a sibling's and wait out the window). A base longer than
-    /// the rungs, where the ladder shows: at the shipped two-minute base every rung is
-    /// the base and every window its 84 s. The same receipt
-    /// carrying a head in flight sizes the window on the rung its count names (84 s
-    /// for the 2-minute rung, 168 s for the 4-minute one, 336 s for the 8-minute
-    /// one), and once the rungs are spent, or on a deferral, the ordinary window
-    /// stands.
+    /// THE DEDUP WINDOW MAY NOT OUTLAST THE QUICK WAIT. At the shipped two-minute base
+    /// a completed check 60 s ago skips every checker (the 84 s window). The same
+    /// receipt carrying a head in flight sizes the window on the one-minute wait (42 s,
+    /// over at 60 s; the negative control: sized on the base, the checker's own
+    /// one-minute re-check would read its own stamp as a sibling's and wait out the
+    /// window), for every count up to `cadence::IN_FLIGHT_CHECKS`; once those are
+    /// spent, or on a deferral, the ordinary window stands.
     #[test]
     fn a_head_in_flight_shrinks_the_dedup_window_to_its_quick_rung() {
         let _guard = crate::STRANDED_TEST_LOCK
@@ -272,29 +238,36 @@ mod tests {
         crate::status::clear_check_note();
         let staging = Staging::scratch("check-receipt-in-flight");
         let source = source("one");
-        let base = Duration::from_secs(10 * 60);
+        let base = Duration::from_secs(crate::cadence::INTERVAL_SECS);
         let now = crate::unix_now_secs();
         let skip = || crate::checker_skip_for(&staging, 42, &source, base, now);
 
-        record_at(&staging, 42, &source, false, None, now - 100);
+        record_at(&staging, 42, &source, false, None, now - 60);
         assert!(skip().is_some(), "no head in flight: the base window skips");
 
         let head = Some("v0.92.0");
-        assert_eq!(record_at(&staging, 42, &source, false, None, now - 100), 0);
-        assert_eq!(record_at(&staging, 42, &source, false, head, now - 100), 1);
-        assert!(skip().is_none(), "rung 1: an 84 s window is over at 100 s");
-        assert_eq!(record_at(&staging, 42, &source, false, head, now - 100), 2);
+        assert_eq!(record_at(&staging, 42, &source, false, None, now - 60), 0);
+        assert_eq!(record_at(&staging, 42, &source, false, head, now - 60), 1);
+        assert!(skip().is_none(), "check 1: a 42 s window is over at 60 s");
+        assert_eq!(record_at(&staging, 42, &source, false, head, now - 30), 2);
         assert_eq!(
             skip().map(|(_, until)| until),
-            Some(now - 100 + 168),
-            "rung 2: the 168 s window still holds at 100 s"
+            Some(now - 30 + 42),
+            "check 2: the 42 s window still holds at 30 s"
         );
-        assert_eq!(record_at(&staging, 42, &source, false, head, now - 400), 3);
-        assert!(skip().is_none(), "rung 3: a 336 s window is over at 400 s");
-        assert_eq!(record_at(&staging, 42, &source, false, head, now - 400), 4);
+        let spent = crate::cadence::IN_FLIGHT_CHECKS;
+        let mut count = 2;
+        while count < spent {
+            count = record_at(&staging, 42, &source, false, head, now - 60);
+        }
+        assert!(skip().is_none(), "check {count}: still the 42 s window");
+        assert_eq!(
+            record_at(&staging, 42, &source, false, head, now - 60),
+            spent + 1
+        );
         assert!(
             skip().is_some(),
-            "the rungs are spent: the base window again"
+            "the quick waits are spent: the base window again"
         );
 
         // A deferral's widened window is never shortened by a head in flight.
@@ -312,9 +285,10 @@ mod tests {
     }
 
     /// TWO BUILDS CHECKING WALK ONE LADDER. The count is the source's and the
-    /// head's: interleaved checks of builds 42 and 41 count 1, 2, 3, 4, and the
-    /// fourth has spent the quick rungs. Negative controls: a different source, a
-    /// different head, and a completed check that found none each restart the run.
+    /// head's: interleaved checks of builds 42 and 41 count 1, 2, 3, …, and the one
+    /// past `cadence::IN_FLIGHT_CHECKS` has spent the quick waits. Negative controls: a
+    /// different source, a different head, and a completed check that found none each
+    /// restart the run.
     #[test]
     fn two_builds_checking_one_head_in_flight_share_one_ladder() {
         let _guard = crate::STRANDED_TEST_LOCK
@@ -323,15 +297,18 @@ mod tests {
         let staging = Staging::scratch("check-receipt-two-builds");
         let now = crate::unix_now_secs();
         let head = Some("v0.93.0");
-        let counts: Vec<u32> = [42, 41, 42, 41]
+        let spent = crate::cadence::IN_FLIGHT_CHECKS;
+        let counts: Vec<u32> = [42, 41]
             .into_iter()
+            .cycle()
+            .take(spent as usize + 1)
             .map(|build| record_at(&staging, build, &source("one"), false, head, now))
             .collect();
-        assert_eq!(counts, [1, 2, 3, 4]);
-        assert!(crate::cadence::in_flight_retry(3).is_some());
+        assert_eq!(counts, (1..=spent + 1).collect::<Vec<_>>());
+        assert!(crate::cadence::in_flight_retry(spent).is_some());
         assert!(
-            crate::cadence::in_flight_retry(4).is_none(),
-            "the quick rungs are spent"
+            crate::cadence::in_flight_retry(spent + 1).is_none(),
+            "the quick waits are spent"
         );
         assert_eq!(
             record_at(&staging, 41, &source("two"), false, head, now),

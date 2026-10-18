@@ -66,12 +66,18 @@ pub(super) const SHOWCASE_PALETTE_SLOT: &str = "settings/showcase/palette-slot";
 pub(super) const SHOWCASE_KEEP: &str = "settings/showcase/keep";
 /// Revert the tried theme.
 pub(super) const SHOWCASE_REVERT: &str = "settings/showcase/revert";
+/// Keep the tried theme's colours and pin the current type settings.
+pub(super) const SHOWCASE_KEEP_COLOURS: &str = "settings/showcase/keep-colours";
+/// Save as theme's "Include type settings" checkbox.
+pub(super) const SHOWCASE_SAVE_TYPE: &str = "settings/showcase/save-type";
 /// Open the Save as theme row.
 pub(super) const SHOWCASE_SAVE_AS: &str = "settings/showcase/save-as";
 /// A card: `settings/showcase/card/<slug>`.
 const CARD_PREFIX: &str = "settings/showcase/card/";
 /// A chip: `settings/showcase/chip/<all|dark|light|yours>`.
 const CHIP_PREFIX: &str = "settings/showcase/chip/";
+/// The footer's Get More: the More chip's filter, from the footer.
+const FOOTER_GET_MORE: &str = "settings/showcase/footer/get-more";
 const VIEW_GALLERY: &str = "settings/showcase/view/gallery";
 const VIEW_CUSTOMIZE: &str = "settings/showcase/view/customize";
 const SAVE_CONFIRM: &str = "settings/showcase/save";
@@ -117,19 +123,22 @@ pub(super) const SHOWCASE_COLOR_KEYS: [&str; 5] = [
 ];
 
 /// The look settings the Customize view edits beside the colours: they
-/// change how any theme reads, and a theme file does not carry them, so Save
-/// as theme neither writes nor clears them.
-pub(super) const SHOWCASE_LOOK_KEYS: [&str; 3] = [
+/// change how any theme reads, so Save as theme neither writes nor clears
+/// them (a theme file may carry `bold_is_bright` or `palette_generate`, but
+/// these rows stay the person's own settings).
+pub(super) const SHOWCASE_LOOK_KEYS: [&str; 4] = [
     prefs::EDIT_MINIMUM_CONTRAST,
     prefs::EDIT_BOLD_IS_BRIGHT,
+    prefs::EDIT_PALETTE_GENERATE,
     prefs::EDIT_BACKGROUND_OPACITY,
 ];
 
 /// The type settings the Customize view edits. `font_weight` is a real key
 /// (it acts on a font with a `wght` axis), so it is listed.
-pub(super) const SHOWCASE_TYPE_KEYS: [&str; 5] = [
+pub(super) const SHOWCASE_TYPE_KEYS: [&str; 6] = [
     prefs::EDIT_FONT_FAMILY,
     prefs::EDIT_FONT_PX,
+    prefs::EDIT_FONT_SIZE_SCALE,
     prefs::EDIT_LINE_HEIGHT,
     prefs::EDIT_LIGATURES,
     prefs::EDIT_FONT_WEIGHT,
@@ -143,10 +152,19 @@ pub(crate) enum ShowcaseChip {
     Dark,
     Light,
     Yours,
+    /// The community pack's themes not yet in the themes folder.
+    More,
 }
 
 impl ShowcaseChip {
-    pub(crate) const ALL: [Self; 4] = [Self::All, Self::Dark, Self::Light, Self::Yours];
+    pub(crate) const ALL: [Self; 5] = [Self::All, Self::Dark, Self::Light, Self::Yours, Self::More];
+
+    /// The filter chips every toolbar seats. Get More joins them where the
+    /// row has room ([`toolbar_chips`]); it is always in the footer, beside
+    /// Import… and the themes folder. A fifth chip on a narrow row would
+    /// push the chips onto a row of their own, and a small window's first
+    /// screen would then hold no card.
+    pub(crate) const TOOLBAR: [Self; 4] = [Self::All, Self::Dark, Self::Light, Self::Yours];
 
     const fn word(self) -> &'static str {
         match self {
@@ -154,6 +172,7 @@ impl ShowcaseChip {
             Self::Dark => "dark",
             Self::Light => "light",
             Self::Yours => "yours",
+            Self::More => "more",
         }
     }
 
@@ -163,6 +182,7 @@ impl ShowcaseChip {
             Self::Dark => "Dark",
             Self::Light => "Light",
             Self::Yours => "Yours",
+            Self::More => "Get More",
         }
     }
 
@@ -170,13 +190,16 @@ impl ShowcaseChip {
         Self::ALL.into_iter().find(|chip| chip.word() == word)
     }
 
-    /// Whether the chip admits `card`.
+    /// Whether the chip admits `card`. The pack's cards are only under
+    /// Get More: every other chip shows what can be drawn now.
     pub(crate) fn admits(self, card: &ShowcaseCard) -> bool {
+        let pack = card.tier == ShowcaseTier::Pack;
         match self {
-            Self::All => true,
-            Self::Dark => card.appearance == aterm_types::Appearance::Dark,
-            Self::Light => card.appearance == aterm_types::Appearance::Light,
+            Self::All => !pack,
+            Self::Dark => !pack && card.appearance == aterm_types::Appearance::Dark,
+            Self::Light => !pack && card.appearance == aterm_types::Appearance::Light,
             Self::Yours => card.tier == ShowcaseTier::Yours,
+            Self::More => pack,
         }
     }
 }
@@ -202,7 +225,21 @@ pub(crate) struct SaveAsState {
     /// Why the typed name cannot be saved, as it is typed (or why the last
     /// write failed).
     pub(crate) error: Option<String>,
+    /// "Include type settings": the file also carries the Customize view's
+    /// type rows (family, line height, ligatures, weight, size scale; never
+    /// `font_px`). Off by default.
+    pub(crate) include_type: bool,
 }
+
+/// The type rows Save as theme can carry ("Include type settings"):
+/// Customize's type settings a theme file has a key for (never `font_px`).
+pub(super) const SAVE_TYPE_KEYS: [&str; 5] = [
+    prefs::EDIT_FONT_FAMILY,
+    prefs::EDIT_LINE_HEIGHT,
+    prefs::EDIT_LIGATURES,
+    prefs::EDIT_FONT_WEIGHT,
+    prefs::EDIT_FONT_SIZE_SCALE,
+];
 
 /// The drafts a saved theme carries, as they were when it was saved: they
 /// stay drafts until the theme is selected, then go (each only while it
@@ -260,6 +297,10 @@ pub(crate) struct ShowcaseState {
     pub(crate) slot: Option<SlotEditor>,
     pub(crate) save: Option<SaveAsState>,
     pub(crate) pending_select: Option<PendingSelect>,
+    /// A Get More card's add: the themes request, the pack id, and whether
+    /// the file is written. Once written and listed by the catalog, the
+    /// theme is tried (never kept: that is still Keep's).
+    pub(crate) pending_try: Option<(OperationId, String, bool)>,
     /// The select patch a save sent, and the drafts it carries: they go
     /// when it lands.
     selecting: Option<(OperationId, CarriedDrafts)>,
@@ -281,6 +322,7 @@ impl ShowcaseState {
             slot: None,
             save: None,
             pending_select: None,
+            pending_try: None,
             selecting: None,
             trash_armed: None,
             drawn: RefCell::new(Vec::new()),
@@ -388,6 +430,7 @@ impl SettingsViewState {
         self.showcase.slot = None;
         self.showcase.save = None;
         self.showcase.pending_select = None;
+        self.showcase.pending_try = None;
         self.showcase.trash_armed = None;
     }
 
@@ -412,6 +455,10 @@ impl SettingsViewState {
         }
         if self.showcase.pending_select.take().is_some() {
             self.feedback = Some("The saved theme will not be selected automatically".to_string());
+            return true;
+        }
+        if self.showcase.pending_try.take().is_some() {
+            self.feedback = Some("The added theme will not be tried automatically".to_string());
             return true;
         }
         if matches!(self.showcase.trial, ShowcaseTrial::Trying { .. }) {
@@ -533,14 +580,15 @@ impl SettingsViewState {
     }
 
     /// The value Keep writes for `id`, by the rule every theme picker shares
-    /// ([`prefs::theme_choice_value`]): over a plain name, the name; over a
-    /// Follow-system split, the split with only the side the page shows
-    /// replaced; over an unset theme, a split that keeps following the OS
-    /// (`None`, no key, where a choice leaves the pair an unset theme draws).
+    /// ([`prefs::theme_choice_value`]): over a plain name or an unset theme,
+    /// the name; over a Follow-system split, the split with only the side the
+    /// page shows replaced.
     fn keep_value(&self, id: &str) -> (Option<String>, Option<aterm_types::Appearance>) {
         let raw = self.raw_value(prefs::EDIT_THEME);
         let side = theme_visible_side(self, self.presented_motion.get().system_dark);
-        prefs::theme_choice_value(raw.as_deref(), side, id, &self.assets.themes)
+        let (value, side) =
+            prefs::theme_choice_value(raw.as_deref(), side, id, &self.assets.themes);
+        (Some(value), side)
     }
 
     /// The colours the page's stage draws with nothing hovered: the trial
@@ -548,6 +596,27 @@ impl SettingsViewState {
     fn showcase_colors(&self) -> crate::resolved_colors::ResolvedColors {
         let system_dark = self.presented_motion.get().system_dark;
         preview_resolved_colors_with(self, system_dark, self.showcase.trial_id())
+    }
+
+    /// The type settings the saved `theme` names for the side the page shows
+    /// (never a trial: Try is colour-only). Resolved over the theme alone, so
+    /// `declared` and `applied` agree; a row the config sets beats it there.
+    pub(crate) fn theme_typography(&self) -> crate::resolved_typography::ResolvedTypography {
+        let side = theme_visible_side(self, self.presented_motion.get().system_dark);
+        let config = Config {
+            theme: self.raw_value(prefs::EDIT_THEME),
+            ..Config::default()
+        };
+        config.resolved_typography_with_flag(side, &self.assets.themes, None)
+    }
+
+    /// The text size scale the saved theme applies where the config sets none
+    /// (`1.0` when it applies none).
+    pub(crate) fn theme_typography_scale(&self) -> f32 {
+        self.theme_typography()
+            .applied
+            .font_size_scale_milli
+            .map_or(1.0, |milli| f32::from(milli) / 1000.0)
     }
 
     /// The theme's own sixteen colours under the stage, without any palette
@@ -784,6 +853,7 @@ pub(super) fn save_as_text(
     resolved: &crate::resolved_colors::ResolvedColors,
     name: &str,
     from_label: &str,
+    typography: &aterm_types::scheme::ThemeTypography,
 ) -> Result<String, String> {
     let mut scheme = resolved.scheme.clone();
     // The name as the file spells it (`aterm theme new` and import do the
@@ -792,19 +862,51 @@ pub(super) fn save_as_text(
     // still named by the id the person typed.
     scheme.name = aterm_types::scheme_import::sanitize_text(name).unwrap_or_default();
     scheme.appearance = resolved.reported;
-    let description = format!("Saved from {from_label} with your colour settings");
-    let text = aterm_types::scheme_import::to_native_conf(
-        &scheme,
+    let description = if typography.is_empty() {
+        format!("Saved from {from_label} with your colour settings")
+    } else {
+        format!("Saved from {from_label} with your colour and type settings")
+    };
+    let mut theme = aterm_types::scheme::ParsedTheme::colours_only(
+        scheme,
         true,
-        Some(&description),
+        aterm_types::scheme_import::sanitize_text(&description),
         None,
+    );
+    theme.typography = typography.clone();
+    let text = aterm_types::scheme_import::to_native_conf_package(
+        &theme,
         &["Saved by Settings \u{25b8} Themes \u{25b8} Save as theme"],
     );
     let parsed = aterm_types::scheme::parse_theme_str(&text).map_err(|error| error.to_string())?;
-    if parsed.scheme != scheme {
+    if parsed != theme {
         return Err("the theme did not read back as written".to_string());
     }
     Ok(text)
+}
+
+impl SettingsViewState {
+    /// The type settings "Include type settings" writes: each of
+    /// [`SAVE_TYPE_KEYS`] as the page shows it in force (a draft, the saved
+    /// value, else the current theme's), when a theme file can carry it
+    /// (a font named by family, not a path; a number in the theme's range).
+    pub(super) fn save_typography(&self) -> aterm_types::scheme::ThemeTypography {
+        let mut typography = aterm_types::scheme::ThemeTypography::NONE;
+        for key in SAVE_TYPE_KEYS {
+            let drafted = preview_field_text(self, key, "");
+            let value = Some(drafted.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .or_else(|| self.theme_fallback_for(key).map(|(value, _)| value));
+            let Some(value) = value else { continue };
+            // One key at a time through the theme reader, so a value a theme
+            // cannot carry drops alone.
+            let probe = format!("fg = #ffffff\nbg = #000000\n{key} = {value}\n");
+            if let Ok(parsed) = aterm_types::scheme::parse_theme_str(&probe) {
+                typography.fill_from(&parsed.typography);
+            }
+        }
+        typography
+    }
 }
 
 /// The config keys a theme saved from `resolved` now carries: every colour
@@ -812,6 +914,7 @@ pub(super) fn save_as_text(
 /// once each for all their slots.
 pub(super) fn carried_override_keys(
     resolved: &crate::resolved_colors::ResolvedColors,
+    typography: &aterm_types::scheme::ThemeTypography,
 ) -> Vec<String> {
     let overrides = format!("{}.", prefs::EDIT_PALETTE_OVERRIDES);
     let source_keys = resolved.config_keys();
@@ -859,6 +962,14 @@ pub(super) fn carried_override_keys(
             keys.push(key);
         }
     }
+    // The type settings the file carries too, so selecting it lets them go.
+    keys.extend(
+        typography
+            .keys()
+            .into_iter()
+            .filter(|key| SAVE_TYPE_KEYS.contains(key))
+            .map(str::to_string),
+    );
     keys
 }
 
@@ -919,6 +1030,17 @@ pub(super) fn showcase_commands(view: &SettingsViewState) -> Vec<Command> {
             enabled: trying,
         },
         Command {
+            id: ActionId::new(SHOWCASE_KEEP_COLOURS),
+            title: "Themes: Keep Colours Only".to_string(),
+            shortcut: None,
+            // Only while the tried theme would change the face, and every
+            // change can be kept apart.
+            enabled: match &view.showcase.trial {
+                ShowcaseTrial::Trying { id } => view.trial_typography(id).keeps_colours_only(),
+                _ => false,
+            },
+        },
+        Command {
             id: ActionId::new(SHOWCASE_SAVE_AS),
             title: "Themes: Save as Theme\u{2026}".to_string(),
             shortcut: None,
@@ -951,13 +1073,19 @@ impl SettingsApp {
             }
         } else if action == SHOWCASE_KEEP {
             self.keep_trial(view, cx);
+        } else if action == SHOWCASE_KEEP_COLOURS {
+            self.keep_colours_only(view, cx);
         } else if action == SHOWCASE_REVERT {
             view.showcase.pending_select = None;
+            view.showcase.pending_try = None;
             if matches!(view.showcase.trial, ShowcaseTrial::Trying { .. }) {
                 view.showcase.trial = ShowcaseTrial::Idle;
                 view.feedback = Some("Reverted".to_string());
             }
-        } else if let Some(word) = action.strip_prefix(CHIP_PREFIX) {
+        } else if let Some(word) = action
+            .strip_prefix(CHIP_PREFIX)
+            .or((action == FOOTER_GET_MORE).then_some(ShowcaseChip::More.word()))
+        {
             let Some(chip) = ShowcaseChip::from_word(word) else {
                 return EventResult::Handled;
             };
@@ -1001,6 +1129,7 @@ impl SettingsApp {
             view.showcase.save = Some(SaveAsState {
                 name: input,
                 error: None,
+                include_type: false,
             });
             view.showcase.customize = true;
             view.invalidate_result_page_limit();
@@ -1016,6 +1145,14 @@ impl SettingsApp {
             view.common.last_focus = Some(UiKey::new(SHOWCASE_SAVE_NAME));
         } else if action == SAVE_CONFIRM {
             self.save_as_theme(view, cx);
+        } else if action == SHOWCASE_SAVE_TYPE {
+            if let Some(save) = view.showcase.save.as_mut() {
+                save.include_type = match value {
+                    Some(SemanticInput::Bool(wanted)) => *wanted,
+                    _ => !save.include_type,
+                };
+            }
+            view.common.last_focus = Some(UiKey::new(SHOWCASE_SAVE_TYPE));
         } else if action == SAVE_CANCEL {
             view.showcase.save = None;
             view.invalidate_result_page_limit();
@@ -1086,7 +1223,21 @@ impl SettingsApp {
             return;
         };
         view.showcase.pending_select = None;
+        view.showcase.pending_try = None;
         view.common.last_focus = Some(UiKey::new(format!("{CARD_PREFIX}{slug}")));
+        if card.tier == ShowcaseTier::Pack {
+            if themes_busy(view) {
+                view.feedback = Some("Working on the themes folder\u{2026}".to_string());
+                return;
+            }
+            let operation = cx.themes(ThemesRequest::AddPack {
+                id: card.id.clone(),
+            });
+            view.pending.insert(operation, PendingAction::Themes);
+            view.showcase.pending_try = Some((operation, card.id.clone(), false));
+            view.feedback = Some(format!("Adding {}\u{2026}", card.label));
+            return;
+        }
         match &view.showcase.trial {
             ShowcaseTrial::Trying { id } if id.eq_ignore_ascii_case(&card.id) => {
                 self.keep_trial(view, cx);
@@ -1228,6 +1379,58 @@ impl SettingsApp {
         view.showcase.trial = ShowcaseTrial::Keeping { id, operation };
     }
 
+    /// Keep the tried theme's colours and the type settings in force now:
+    /// ONE patch writes `theme` (as Keep does) and pins each type setting the
+    /// theme would change at its current value, so the face stays. Where a
+    /// change has no aterm.toml value that keeps the current face (aterm's own
+    /// `font_weight`, the font's own weight), nothing is written and the
+    /// feedback says why: the button is drawn disabled then, so this is the
+    /// palette or a stale press.
+    fn keep_colours_only(&mut self, view: &mut SettingsViewState, cx: &mut UpdateCx<'_>) {
+        let ShowcaseTrial::Trying { id } = view.showcase.trial.clone() else {
+            return;
+        };
+        let trial = view.trial_typography(&id);
+        if !trial.keeps_colours_only() {
+            if let Some(why) = trial.why_not_colours_only(view) {
+                view.feedback = Some(why);
+            }
+            return;
+        }
+        if Self::reject_pending_key(view, prefs::EDIT_THEME, cx) {
+            return;
+        }
+        let (value, _) = view.keep_value(&id);
+        let mut edits = vec![ConfigEdit {
+            key: prefs::EDIT_THEME.to_string(),
+            expected: ExpectedConfigValue::Exact(view.raw_value(prefs::EDIT_THEME)),
+            value,
+        }];
+        for change in &trial.changes {
+            if let Some(pin) = &change.pin {
+                edits.push(ConfigEdit {
+                    key: change.key.to_string(),
+                    expected: ExpectedConfigValue::Exact(view.raw_value(change.key)),
+                    value: Some(pin.clone()),
+                });
+            }
+        }
+        let patch = ConfigPatch {
+            base_revision: self.config_revision,
+            edits,
+        };
+        let operation = cx.config_patch(patch.clone());
+        view.pend_config(operation, patch);
+        let label = view
+            .showcase
+            .card(&id)
+            .map_or_else(|| id.clone(), |card| card.label.clone());
+        view.feedback = Some(format!(
+            "Keeping {label}'s colours and your type settings\u{2026}"
+        ));
+        view.showcase.trial = ShowcaseTrial::Keeping { id, operation };
+    }
+
     /// A config patch finished. A Keep (or a save's select) that landed
     /// ends the trial (the reload draws the kept theme); one that did not
     /// goes back to trying. A save's select that landed also lets go of the
@@ -1293,7 +1496,17 @@ impl SettingsApp {
             .themes
             .meta(&resolved.id)
             .map_or_else(|| resolved.id.clone(), |meta| meta.display_name);
-        let text = match save_as_text(&resolved, &name, &from) {
+        let typography = if view
+            .showcase
+            .save
+            .as_ref()
+            .is_some_and(|save| save.include_type)
+        {
+            view.save_typography()
+        } else {
+            aterm_types::scheme::ThemeTypography::NONE
+        };
+        let text = match save_as_text(&resolved, &name, &from, &typography) {
             Ok(text) => text,
             Err(why) => {
                 if let Some(save) = view.showcase.save.as_mut() {
@@ -1302,7 +1515,7 @@ impl SettingsApp {
                 return;
             }
         };
-        let carried = carried_override_keys(&resolved);
+        let carried = carried_override_keys(&resolved, &typography);
         let fields = carried
             .iter()
             .filter(|key| view.field_has_unsaved_draft(key))
@@ -1385,6 +1598,28 @@ impl SettingsApp {
         view: &mut SettingsViewState,
         cx: &mut UpdateCx<'_>,
     ) {
+        // A Get More add whose file is written and now listed: try it, with
+        // the keyboard on Keep. Nothing is written to aterm.toml until Keep.
+        if let Some((_, id, true)) = &view.showcase.pending_try
+            && view.assets.themes.resolve(id).is_ok()
+        {
+            let id = id.clone();
+            view.showcase.pending_try = None;
+            if id.eq_ignore_ascii_case(&view.configured_theme_id()) {
+                // aterm.toml already names it: it is drawn now, not tried.
+                view.feedback = Some(format!("Added {id} \u{b7} it is the theme in use"));
+            } else {
+                view.feedback = None;
+                view.showcase.trial = ShowcaseTrial::Trying { id };
+                view.common.last_focus = Some(UiKey::new(SHOWCASE_KEEP));
+                // Get More no longer lists it: show it among your themes.
+                if view.showcase.chip == ShowcaseChip::More {
+                    view.showcase.chip = ShowcaseChip::Yours;
+                    view.reduce_page_scroll(0, SettingsPageScrollCommand::Absolute(0));
+                }
+            }
+            view.invalidate_result_page_limit();
+        }
         let Some(select) = view.showcase.pending_select.as_ref() else {
             return;
         };
@@ -1481,6 +1716,7 @@ impl SettingsApp {
         view.showcase.save = Some(SaveAsState {
             name: crate::native_text_input::TextInputState::new(select.id),
             error: Some(reason),
+            include_type: false,
         });
         view.showcase.customize = true;
         view.common.last_focus = Some(UiKey::new(SHOWCASE_SAVE_NAME));
@@ -1986,12 +2222,334 @@ fn control_row(key: &str, label: &str, children: Vec<UiNode>) -> (UiNode, f32) {
 /// (what is tried, with Keep and Revert), and over the gallery the note that
 /// the person's colour settings draw on top of every theme, with the way to
 /// them. Nothing while neither applies (the cards mark the theme in use).
+/// One type setting a tried theme would change once kept: its key, the
+/// theme's value, and the value in force now with who sets it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct TypeChange {
+    pub(super) key: &'static str,
+    pub(super) theme: String,
+    pub(super) current: String,
+    /// `default`, or `theme <label>` when the current theme names it.
+    pub(super) origin: String,
+    /// What "Keep colours only" writes to keep the current value, `None`
+    /// when no setting keeps it (aterm's own `font_weight`).
+    pub(super) pin: Option<String>,
+}
+
+/// What a tried theme's typography would do once kept.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct TrialTypography {
+    /// The theme's type settings that would apply, in table order.
+    pub(super) changes: Vec<TypeChange>,
+    /// The theme's type settings something of yours beats.
+    pub(super) kept: Vec<TypeKept>,
+}
+
+/// One of the tried theme's type settings that your own setting beats.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct TypeKept {
+    /// The theme key it would set (`font_family`).
+    pub(super) key: &'static str,
+    /// What wins, as a person would look for it: the aterm.toml key
+    /// (`font_family`, `display_font`) or the flag (`--font`).
+    pub(super) by: &'static str,
+    /// The value that stays, in the delta's words (empty when unknown).
+    pub(super) value: String,
+}
+
+impl TrialTypography {
+    /// Whether "Keep colours only" can keep the face exactly: the theme
+    /// changes some type setting, and every change has a value that pins it.
+    pub(super) fn keeps_colours_only(&self) -> bool {
+        !self.changes.is_empty() && self.changes.iter().all(|change| change.pin.is_some())
+    }
+
+    /// Why "Keep colours only" is not offered for a theme that changes the
+    /// face: the settings no aterm.toml value keeps as they are now.
+    fn why_not_colours_only(&self, state: &SettingsViewState) -> Option<String> {
+        let unpinned: Vec<String> = self
+            .changes
+            .iter()
+            .filter(|change| change.pin.is_none())
+            .map(|change| type_label(state, change.key))
+            .collect();
+        (!unpinned.is_empty()).then(|| {
+            format!(
+                "Keep colours only is unavailable: no setting keeps the font's own {} \
+                 apart from this theme",
+                unpinned.join(", ").to_lowercase()
+            )
+        })
+    }
+}
+
+impl SettingsViewState {
+    /// A config that sets exactly the typography keys aterm.toml sets (with
+    /// stand-in values: only whether each is set matters to the resolver),
+    /// and `theme`.
+    fn typography_presence_config(&self, theme: Option<String>) -> Config {
+        let mut config = Config {
+            theme,
+            ..Config::default()
+        };
+        let set = |key: &str| self.is_explicit(key);
+        if set(prefs::EDIT_FONT_FAMILY) {
+            config.font_family = Some(String::new());
+        }
+        let text = |key: &str| set(key).then(String::new);
+        config.font_family_bold = text(prefs::EDIT_FONT_FAMILY_BOLD);
+        config.font_family_italic = text(prefs::EDIT_FONT_FAMILY_ITALIC);
+        config.font_family_bold_italic = text(prefs::EDIT_FONT_FAMILY_BOLD_ITALIC);
+        config.symbol_font = text(prefs::EDIT_SYMBOL_FONT);
+        config.emoji_font = text(prefs::EDIT_EMOJI_FONT);
+        config.display_font = self.raw_value("display_font");
+        if set(prefs::EDIT_FALLBACK_FONTS) {
+            config.fallback_fonts = Some(crate::app_config::FontList(Vec::new()));
+        }
+        if set(prefs::EDIT_FONT_FEATURES) {
+            config.font_features = Some(Vec::new());
+        }
+        config.line_height = set(prefs::EDIT_LINE_HEIGHT).then_some(1.0);
+        config.font_size_scale = set(prefs::EDIT_FONT_SIZE_SCALE).then_some(1.0);
+        config.ligatures = set(prefs::EDIT_LIGATURES).then_some(true);
+        config.font_synthetic_style = set(prefs::EDIT_FONT_SYNTHETIC_STYLE).then_some(true);
+        config.font_weight = set(prefs::EDIT_FONT_WEIGHT).then_some(400);
+        config
+    }
+
+    /// The value in force now for the typography key `key` (aterm.toml
+    /// leaves it unset): the current theme's, else aterm's default, with
+    /// who sets it and what keeps it.
+    fn current_type_value(&self, key: &'static str) -> (String, String, Option<String>) {
+        if let Some((value, label)) = self.theme_fallback_for(key) {
+            let pin = Some(value.clone());
+            return (value, format!("theme {label}"), pin);
+        }
+        let field = self.field_by_key(key);
+        let shown = field.map_or_else(String::new, |field| {
+            field
+                .seed
+                .clone()
+                .unwrap_or_else(|| field.placeholder.clone())
+        });
+        let shown = shown
+            .strip_suffix(" (default)")
+            .unwrap_or(&shown)
+            .trim()
+            .to_string();
+        let default = "default".to_string();
+        match key {
+            prefs::EDIT_FONT_FAMILY => {
+                let name = self
+                    .font_families
+                    .as_deref()
+                    .and_then(|families| families.automatic.clone())
+                    .unwrap_or_else(|| "aterm's own face".to_string());
+                // A blank family is aterm's own choice and outranks a theme.
+                (name, default, Some(String::new()))
+            }
+            prefs::EDIT_FONT_FAMILY_BOLD
+            | prefs::EDIT_FONT_FAMILY_ITALIC
+            | prefs::EDIT_FONT_FAMILY_BOLD_ITALIC
+            | prefs::EDIT_SYMBOL_FONT
+            | prefs::EDIT_EMOJI_FONT
+            | prefs::EDIT_FALLBACK_FONTS => (
+                "aterm's own choice".to_string(),
+                default,
+                Some(String::new()),
+            ),
+            prefs::EDIT_FONT_FEATURES => ("none".to_string(), default, Some("[]".to_string())),
+            prefs::EDIT_LIGATURES | prefs::EDIT_FONT_SYNTHETIC_STYLE => {
+                let on = shown.parse::<bool>().unwrap_or(true);
+                let word = if on { "on" } else { "off" };
+                (word.to_string(), default, Some(on.to_string()))
+            }
+            prefs::EDIT_FONT_WEIGHT => ("the font's own".to_string(), default, None),
+            _ => {
+                let number = shown
+                    .split_whitespace()
+                    .next()
+                    .filter(|n| n.parse::<f64>().is_ok())
+                    .unwrap_or("1.0")
+                    .to_string();
+                (number.clone(), default, Some(number))
+            }
+        }
+    }
+
+    /// What trying `id` would change in the type once kept: computed against
+    /// the value Keep would write, the side the page shows, and the keys
+    /// aterm.toml sets (and `--font`). Empty for a colours-only theme.
+    pub(super) fn trial_typography(&self, id: &str) -> TrialTypography {
+        let (value, _) = self.keep_value(id);
+        let side = theme_visible_side(self, self.presented_motion.get().system_dark);
+        let flag = self
+            .environment_override(prefs::EDIT_FONT_FAMILY)
+            .map(|active| active.effective.clone());
+        let config = self.typography_presence_config(value);
+        let typo = config.resolved_typography_with_flag(side, &self.assets.themes, flag.as_deref());
+        let mut out = TrialTypography::default();
+        for spec in aterm_types::scheme::THEME_KEYS
+            .iter()
+            .filter(|spec| spec.group == aterm_types::scheme::ThemeKeyGroup::Typography)
+        {
+            if let Some(theme) = typo.applied.value_text(spec.key) {
+                let theme = type_value_words(spec.name, &theme);
+                let (current, origin, pin) = self.current_type_value(spec.name);
+                if current != theme {
+                    out.changes.push(TypeChange {
+                        key: spec.name,
+                        theme,
+                        current,
+                        origin,
+                        pin,
+                    });
+                }
+            } else if let Some(shadow) = typo.shadowed.iter().find(|shadow| shadow.key == spec.name)
+            {
+                // The setting that actually wins, and its value.
+                let value = if shadow.origin == crate::resolved_typography::TypeOrigin::Flag {
+                    flag.clone()
+                } else {
+                    self.raw_value(shadow.by)
+                }
+                .map(|value| type_value_words(spec.name, &value))
+                .unwrap_or_default();
+                out.kept.push(TypeKept {
+                    key: spec.name,
+                    by: shadow.by,
+                    value,
+                });
+            }
+        }
+        out
+    }
+}
+
+/// A typography value in the delta's words, the same on both sides of a
+/// line: a switch reads `on`/`off`, anything else as written.
+fn type_value_words(key: &str, value: &str) -> String {
+    match (key, value.trim()) {
+        (prefs::EDIT_LIGATURES | prefs::EDIT_FONT_SYNTHETIC_STYLE, "true") => "on".to_string(),
+        (prefs::EDIT_LIGATURES | prefs::EDIT_FONT_SYNTHETIC_STYLE, "false") => "off".to_string(),
+        (_, value) => value.to_string(),
+    }
+}
+
+/// A typography key's field label (`Font family`), else the key.
+fn type_label(state: &SettingsViewState, key: &str) -> String {
+    state
+        .field_by_key(key)
+        .map_or_else(|| key.to_string(), |field| field.label.to_string())
+}
+
+/// One delta line, in field labels: `Font family: Berkeley Mono replaces SF
+/// Mono (default)`.
+fn type_change_line(state: &SettingsViewState, change: &TypeChange) -> String {
+    format!(
+        "{}: {} replaces {} ({})",
+        type_label(state, change.key),
+        change.theme,
+        change.current,
+        change.origin
+    )
+}
+
+/// One kept line, naming what wins: `Font family stays pixel (your
+/// display_font)`.
+fn type_kept_line(state: &SettingsViewState, kept: &TypeKept) -> String {
+    let label = type_label(state, kept.key);
+    if kept.value.is_empty() {
+        format!("{label} stays as your {} sets it", kept.by)
+    } else {
+        format!("{label} stays {} (your {})", kept.value, kept.by)
+    }
+}
+
+/// The height of one delta line: a line of text, not a control.
+fn delta_line_height() -> f32 {
+    20.0_f32.max(18.0 * settings_text_scale())
+}
+
+/// The bar's typography delta while a typography theme is tried: what its
+/// font settings would change once kept, and what aterm.toml keeps.
+fn typography_delta_row(
+    state: &SettingsViewState,
+    trial: &TrialTypography,
+    page_width: f32,
+) -> (UiNode, f32) {
+    let height = delta_line_height();
+    // What Try draws now, on a line of its own so it is never cut off.
+    let mut lines = vec![
+        if trial.keeps_colours_only() {
+            "Trying shows colours only. Keep theme also changes:"
+        } else {
+            "Trying shows colours only. Keeping it also changes:"
+        }
+        .to_string(),
+    ];
+    lines.extend(
+        trial
+            .changes
+            .iter()
+            .map(|change| type_change_line(state, change)),
+    );
+    lines.extend(trial.kept.iter().map(|kept| type_kept_line(state, kept)));
+    if let Some(why) = trial.why_not_colours_only(state) {
+        lines.push(why);
+    }
+    let rows = lines.len().max(1);
+    let children = lines
+        .iter()
+        .enumerate()
+        .map(|(index, text)| {
+            line(
+                format!("settings/top/showcase-typography/{index}"),
+                text,
+                SemanticRole::Text,
+                StyleRef::Quiet,
+                (page_width - 24.0).max(0.0),
+                height,
+            )
+        })
+        .collect();
+    let total = height * rows as f32;
+    (
+        UiNode::new(
+            "settings/top/showcase-typography",
+            UiContent::Group(GroupSpec {
+                label: Some(lines.join("; ")),
+                role: SemanticRole::Status,
+                style: StyleRef::Secondary,
+            }),
+        )
+        .layout(
+            Layout::column()
+                .height(Length::Fixed(total))
+                .padding(Insets {
+                    top: 0.0,
+                    right: 0.0,
+                    bottom: 0.0,
+                    left: 12.0,
+                }),
+        )
+        .children(children),
+        total,
+    )
+}
+
 fn trial_bar(
     state: &SettingsViewState,
     width: SettingsWidth,
     page_width: f32,
 ) -> Vec<(UiNode, f32)> {
     let mut rows: Vec<(UiNode, f32)> = trial_row(state, width, page_width).into_iter().collect();
+    if let ShowcaseTrial::Trying { id } = &state.showcase.trial {
+        let trial = state.trial_typography(id);
+        if !trial.changes.is_empty() {
+            rows.push(typography_delta_row(state, &trial, page_width));
+        }
+    }
     if !state.showcase.customize
         && let Some(note) = override_note(&state.showcase_colors())
     {
@@ -2081,29 +2639,57 @@ fn trial_row(
     let (status, mut controls): (String, Vec<UiNode>) = match &showcase.trial {
         ShowcaseTrial::Trying { id } => {
             let label = label_of(id);
-            let keep = action_width("Keep");
+            // A theme that would change the face: Try is colours only, and
+            // the bar offers to keep the colours alone.
+            let typed = !state.trial_typography(id).changes.is_empty();
+            let keep_word = if typed { "Keep theme" } else { "Keep" };
+            let keep = action_width(keep_word);
             let revert = action_width("Revert");
+            // The typed case says "colours only" on the delta's own line.
             let hint = if compact {
                 format!("Trying {label}")
             } else {
                 format!("Trying {label} \u{2014} Return keeps, Esc reverts")
             };
+            let mut buttons = vec![button(
+                SHOWCASE_KEEP,
+                &if typed {
+                    format!("Keep theme: keep {label}, colours and type settings")
+                } else {
+                    format!("Keep {label}")
+                },
+                keep_word,
+                StyleRef::Primary,
+                ControlState {
+                    enabled: !pending,
+                    focused: focused(state, SHOWCASE_KEEP),
+                    ..ControlState::default()
+                },
+                Some(keep),
+            )];
+            if typed {
+                let colours = action_width("Keep colours only");
+                let pinnable = state.trial_typography(id).keeps_colours_only();
+                buttons.push(button(
+                    SHOWCASE_KEEP_COLOURS,
+                    &format!(
+                        "Keep colours only: {label}'s colours with your current type settings"
+                    ),
+                    "Keep colours only",
+                    StyleRef::Secondary,
+                    ControlState {
+                        enabled: !pending && pinnable,
+                        focused: focused(state, SHOWCASE_KEEP_COLOURS),
+                        ..ControlState::default()
+                    },
+                    Some(colours),
+                ));
+            }
             (
                 hint,
-                vec![
-                    button(
-                        SHOWCASE_KEEP,
-                        &format!("Keep {label}"),
-                        "Keep",
-                        StyleRef::Primary,
-                        ControlState {
-                            enabled: !pending,
-                            focused: focused(state, SHOWCASE_KEEP),
-                            ..ControlState::default()
-                        },
-                        Some(keep),
-                    ),
-                    button(
+                buttons
+                    .into_iter()
+                    .chain([button(
                         SHOWCASE_REVERT,
                         &format!("Revert {label}"),
                         "Revert",
@@ -2113,8 +2699,8 @@ fn trial_row(
                             ..ControlState::default()
                         },
                         Some(revert),
-                    ),
-                ],
+                    )])
+                    .collect(),
             )
         }
         ShowcaseTrial::Keeping { id, .. } => (
@@ -2191,8 +2777,8 @@ fn trial_row(
     ))
 }
 
-/// The gallery's footer: how many theme files loaded, Import… and the
-/// themes folder.
+/// The gallery's footer: how many theme files loaded (and how many more
+/// the community pack offers), Import…, Get More and the themes folder.
 fn gallery_footer(state: &SettingsViewState, column_width: f32) -> (UiNode, f32) {
     let themes = &state.assets.themes;
     let loaded = themes.ready_names().count();
@@ -2205,9 +2791,24 @@ fn gallery_footer(state: &SettingsViewState, column_width: f32) -> (UiNode, f32)
         ),
         (loaded, files) => format!("{loaded} of {files} theme files loaded"),
     };
+    // Get More shows the community pack's themes not yet in the folder;
+    // the status says how many there are while another chip is on.
+    let more = state
+        .showcase
+        .cards
+        .iter()
+        .filter(|card| card.tier == ShowcaseTier::Pack)
+        .count();
+    let status = if more > 0 && state.showcase.chip != ShowcaseChip::More {
+        format!("{status} \u{b7} {more} more in the pack")
+    } else {
+        status
+    };
+    let get_more_key = FOOTER_GET_MORE;
     let import = hug_width("Import\u{2026}");
+    let get_more = hug_width(ShowcaseChip::More.label());
     let folder = hug_width("Themes Folder");
-    let text_width = (column_width - import - folder - 12.0).max(0.0);
+    let text_width = (column_width - import - get_more - folder - 18.0).max(0.0);
     control_row(
         "settings/showcase/footer",
         "Theme files",
@@ -2231,6 +2832,18 @@ fn gallery_footer(state: &SettingsViewState, column_width: f32) -> (UiNode, f32)
                     ..ControlState::default()
                 },
                 Some(import),
+            ),
+            button(
+                get_more_key,
+                "Get More: community pack themes you can add",
+                ShowcaseChip::More.label(),
+                StyleRef::Quiet,
+                ControlState {
+                    selected: state.showcase.chip == ShowcaseChip::More,
+                    focused: focused(state, get_more_key),
+                    ..ControlState::default()
+                },
+                Some(get_more),
             ),
             button(
                 OPEN_FOLDER,
@@ -2257,18 +2870,35 @@ fn filter_minimum_width() -> f32 {
 /// the view segment while the filter keeps [`filter_minimum_width`]. A row
 /// too narrow for them gives the chips a row of their own.
 pub(super) fn gallery_toolbar_fits_chips(row_width: f32) -> bool {
+    toolbar_fits(&ShowcaseChip::TOOLBAR, row_width)
+}
+
+/// The chips a toolbar of `shape`, `row_width` wide, seats: every chip on a
+/// row of their own or where they all fit beside the filter, else the four
+/// filter chips (Get More stays in the footer).
+fn toolbar_chips(shape: ToolbarShape, row_width: f32) -> &'static [ShowcaseChip] {
+    if shape == ToolbarShape::ChipsBelow || toolbar_fits(&ShowcaseChip::ALL, row_width) {
+        &ShowcaseChip::ALL
+    } else {
+        &ShowcaseChip::TOOLBAR
+    }
+}
+
+/// Whether `chips` fit beside the view segment and the filter on a row
+/// `row_width` wide.
+fn toolbar_fits(chips: &[ShowcaseChip], row_width: f32) -> bool {
     const ROW_GAP: f32 = 6.0;
     let segments: f32 = ["Gallery", "Customize"]
         .iter()
         .map(|visual| hug_width(visual).max(72.0))
         .sum();
-    let chips: f32 = ShowcaseChip::ALL
+    let widths: f32 = chips
         .iter()
         .map(|chip| hug_width(chip.label()).max(56.0))
         .sum();
     // The segment's two buttons and the filter, with their gaps.
     let base = segments + filter_minimum_width() + 2.0 * ROW_GAP;
-    base + chips + ShowcaseChip::ALL.len() as f32 * ROW_GAP <= row_width
+    base + widths + chips.len() as f32 * ROW_GAP <= row_width
 }
 
 /// How the toolbar lays out its controls.
@@ -2281,11 +2911,12 @@ enum ToolbarShape {
 }
 
 impl ToolbarShape {
-    /// The shape a page of `width` gives a toolbar `row_width` wide: a
-    /// Compact row too narrow for the chips beside the filter
-    /// ([`gallery_toolbar_fits_chips`]) puts them on a row of their own.
-    fn for_row(width: SettingsWidth, row_width: f32) -> Self {
-        if width == SettingsWidth::Compact && !gallery_toolbar_fits_chips(row_width) {
+    /// The shape a toolbar `row_width` wide takes: a row too narrow for the
+    /// chips beside the filter ([`gallery_toolbar_fits_chips`]) puts them on
+    /// a row of their own, at any page width — a Medium page at large type
+    /// is as narrow, in its own type, as a Compact one.
+    fn for_row(row_width: f32) -> Self {
+        if !gallery_toolbar_fits_chips(row_width) {
             Self::ChipsBelow
         } else {
             Self::Row
@@ -2363,8 +2994,9 @@ fn toolbar_rows(
         ));
         return rows;
     }
-    let chips: Vec<UiNode> = ShowcaseChip::ALL
-        .into_iter()
+    let chips: Vec<UiNode> = toolbar_chips(shape, page_width)
+        .iter()
+        .copied()
         .map(|chip| {
             let key = format!("{CHIP_PREFIX}{}", chip.word());
             let visual = chip.label();
@@ -2372,10 +3004,14 @@ fn toolbar_rows(
                 key.clone(),
                 UiContent::Button(
                     Control::new(
+                        // Each name starts with the chip's visible words.
                         ButtonSpec::new(match chip {
-                            ShowcaseChip::All => "Show every theme".to_string(),
-                            ShowcaseChip::Yours => "Show your own themes".to_string(),
-                            _ => format!("Show {} themes", chip.word()),
+                            ShowcaseChip::All => "All: show every theme".to_string(),
+                            ShowcaseChip::Yours => "Yours: show your own themes".to_string(),
+                            ShowcaseChip::More => {
+                                "Get More: community pack themes you can add".to_string()
+                            }
+                            _ => format!("{}: show {} themes", visual, chip.word()),
                         })
                         .visual_label(visual),
                         ActionId::new(key.clone()),
@@ -2462,6 +3098,13 @@ fn card_meta(card: &ShowcaseCard) -> String {
     if !card.description.is_empty() {
         description.push(card.description.clone());
     }
+    // The type settings the theme names, after what it looks like.
+    if let Some(typography) = &card.typography {
+        description.push(format!("Aa {typography}"));
+    }
+    if card.partial {
+        description.push("Some settings need a newer aterm".to_string());
+    }
     description.join(" \u{b7} ")
 }
 
@@ -2512,13 +3155,20 @@ fn card_node(
         .showcase
         .trial_id()
         .is_some_and(|id| id.eq_ignore_ascii_case(&card.id));
-    let current = card.id.eq_ignore_ascii_case(configured);
+    // A pack card is a theme not yet in the folder: it is never tried or in
+    // use as drawn, and pressing it adds it first.
+    let pack = card.tier == ShowcaseTier::Pack;
+    let tried = tried && !pack;
+    let current = !pack && card.id.eq_ignore_ascii_case(configured);
     // A Yours card's Open and Trash take a row of their own under its name
     // and line: beside them, at three cards a row, they left the name no
     // room at all ("…  IN USE").
     let yours = card.tier == ShowcaseTier::Yours;
     let inner = (card_width - 2.0 * CARD_PAD).max(0.0);
-    let kicker = if tried {
+    // A pack card says to the eye what a press does: it adds the theme.
+    let kicker = if pack {
+        "+ ADD"
+    } else if tried {
         "TRYING"
     } else if current {
         "IN USE"
@@ -2536,6 +3186,24 @@ fn card_node(
     // The kicker is paint: assistive technology hears the same state in the
     // description, the theme in use included while another is tried.
     let spoken = match (tried, current) {
+        _ if pack => {
+            let appearance = if card.appearance == aterm_types::Appearance::Dark {
+                "Dark"
+            } else {
+                "Light"
+            };
+            if card.description.is_empty() {
+                format!(
+                    "Add {} to your themes and try it. {appearance}.",
+                    card.label
+                )
+            } else {
+                format!(
+                    "Add {} to your themes and try it. {appearance}, {}",
+                    card.label, card.description
+                )
+            }
+        }
         (true, _) => format!("Trying \u{b7} {meta}"),
         (false, true) => format!("In use \u{b7} {meta}"),
         (false, false) => meta.clone(),
@@ -2821,7 +3489,9 @@ fn gallery_blocks(
     let visible = showcase.visible();
     if visible.is_empty() {
         let query = showcase.filter.value().trim();
-        let text = if query.is_empty() {
+        let text = if query.is_empty() && showcase.chip == ShowcaseChip::More {
+            "Every pack theme is in your themes folder".to_string()
+        } else if query.is_empty() {
             format!(
                 "No {} themes",
                 showcase
@@ -3309,6 +3979,33 @@ fn save_blocks(state: &SettingsViewState, column_width: f32) -> Vec<(UiNode, f32
         },
         Some(hug_width("Cancel")),
     );
+    let include_type = UiNode::new(
+        SHOWCASE_SAVE_TYPE,
+        UiContent::Switch(
+            Control::new(
+                SwitchSpec {
+                    label: "Include type settings".to_string(),
+                    description: Some(
+                        "Also write the font, line height, ligatures, weight and size scale \
+                         shown in Customize"
+                            .to_string(),
+                    ),
+                },
+                ActionId::new(SHOWCASE_SAVE_TYPE),
+            )
+            .value(SemanticValue::Bool(save.include_type))
+            .state(ControlState {
+                focused: focused(state, SHOWCASE_SAVE_TYPE),
+                ..ControlState::default()
+            })
+            .style(StyleRef::Setting),
+        ),
+    )
+    .layout(
+        Layout::default()
+            .width(Length::Fixed(104.0 * settings_text_scale().min(1.4)))
+            .height(Length::Fill),
+    );
     let mut blocks = vec![with_heading(
         "settings/showcase/save-section",
         "SAVE AS THEME",
@@ -3319,8 +4016,31 @@ fn save_blocks(state: &SettingsViewState, column_width: f32) -> Vec<(UiNode, f32
         ),
         column_width,
     )];
+    // The switch's own words, drawn beside it: the Setting switch paints
+    // only On/Off.
+    blocks.push(control_row(
+        "settings/showcase/save-type-row",
+        "Include type settings",
+        vec![
+            line(
+                "settings/showcase/save-type-label",
+                "Include type settings",
+                SemanticRole::Text,
+                StyleRef::Plain,
+                (column_width - 104.0 * settings_text_scale().min(1.4) - 6.0).max(0.0),
+                scaled_control_height(),
+            )
+            .paint_only(),
+            include_type,
+        ],
+    ));
     let note = problem.unwrap_or_else(|| {
-        "Writes the colours shown to your themes folder, then uses it".to_string()
+        if save.include_type {
+            "Writes the colours and type settings shown to your themes folder, then uses it"
+        } else {
+            "Writes the colours shown to your themes folder, then uses it"
+        }
+        .to_string()
     });
     let height = 20.0_f32.max(18.0 * settings_text_scale());
     blocks.push((
@@ -3423,17 +4143,20 @@ pub(super) fn theme_showcase_page(
     } else {
         page_width
     };
-    let sticky_rows = |gutter: f32| -> Vec<(UiNode, f32)> {
-        let row_width = (page_width - gutter).max(0.0);
+    // The trial bar and toolbar are built for the width they are placed in:
+    // pinned over the page, the page's; moved into a list that stands
+    // beside the stage, the gallery column's.
+    let sticky_rows = |base: f32, gutter: f32| -> Vec<(UiNode, f32)> {
+        let row_width = (base - gutter).max(0.0);
         let mut sticky: Vec<(UiNode, f32)> = trial_bar(state, width, row_width);
         sticky.extend(toolbar_rows(
             state,
-            ToolbarShape::for_row(width, row_width),
+            ToolbarShape::for_row(row_width),
             row_width,
         ));
         sticky
     };
-    let mut sticky = sticky_rows(0.0);
+    let mut sticky = sticky_rows(page_width, 0.0);
     // A short page draws the shorter specimen, so a screen holds two rows.
     let short = compact || body < 640.0;
     // The trial bar and the toolbar stay pinned over the list while it keeps
@@ -3500,6 +4223,10 @@ pub(super) fn theme_showcase_page(
     if !moved {
         used += sticky_height;
     }
+    let sticky_base = if moved { column_width } else { page_width };
+    if moved && stage_beside {
+        sticky = sticky_rows(sticky_base, 0.0);
+    }
     // THE THUMB'S GUTTER: a list that scrolls draws its thumb at its trailing
     // edge (`paint_messages_scroll`, 3pt at 7pt in), and the gallery's rows
     // run to that edge (the Filter field, the chips, the last card's frame),
@@ -3520,7 +4247,7 @@ pub(super) fn theme_showcase_page(
     if scrolls {
         blocks = list_blocks(gutter);
         if moved {
-            sticky = sticky_rows(gutter);
+            sticky = sticky_rows(sticky_base, gutter);
         }
     }
     let clear_of_thumb = |mut node: UiNode| {

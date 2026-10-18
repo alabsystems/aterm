@@ -4,6 +4,10 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/util/randr.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
+// Modified by the aterm project in 2026; see the repository NOTICE. (RandR's requests are
+// aterm-x11's encoders, and `Xft.dpi` comes from aterm-x11's resource database, where
+// upstream used x11rb's.)
+
 use std::str::FromStr;
 use std::{env, str};
 
@@ -11,8 +15,8 @@ use super::*;
 use crate::dpi::validate_scale_factor;
 use crate::platform_impl::platform::x11::{monitor, VideoModeHandle};
 
+use aterm_x11::proto::randr;
 use tracing::warn;
-use x11rb::protocol::randr::{self, ConnectionExt as _};
 
 /// Represents values of `WINIT_HIDPI_FACTOR`.
 pub enum EnvVarDPI {
@@ -64,12 +68,11 @@ impl XConnection {
         resources: &monitor::ScreenResources,
         crtc: &randr::GetCrtcInfoReply,
     ) -> Option<(String, f64, Vec<VideoModeHandle>)> {
-        let output_info = match self
-            .xcb_connection()
-            .randr_get_output_info(crtc.outputs[0], x11rb::CURRENT_TIME)
-            .map_err(X11Error::from)
-            .and_then(|r| r.reply().map_err(X11Error::from))
-        {
+        let output_info = match self.request(randr::get_output_info(
+            self.randr_major(),
+            crtc.outputs[0],
+            aterm_x11::proto::CURRENT_TIME,
+        )) {
             Ok(output_info) => output_info,
             Err(_err) => {
                 warn!("Failed to get output info: {:?}", _err);
@@ -167,26 +170,31 @@ impl XConnection {
         crtc_id: randr::Crtc,
         mode_id: randr::Mode,
     ) -> Result<(), X11Error> {
+        let major = self.randr_major();
         let crtc =
-            self.xcb_connection().randr_get_crtc_info(crtc_id, x11rb::CURRENT_TIME)?.reply()?;
+            self.request(randr::get_crtc_info(major, crtc_id, aterm_x11::proto::CURRENT_TIME))?;
 
-        self.xcb_connection()
-            .randr_set_crtc_config(
-                crtc_id,
-                crtc.timestamp,
-                x11rb::CURRENT_TIME,
-                crtc.x,
-                crtc.y,
-                mode_id,
-                crtc.rotation,
-                &crtc.outputs,
-            )?
-            .reply()
-            .map(|_| ())
-            .map_err(Into::into)
+        self.request(randr::set_crtc_config(
+            major,
+            crtc_id,
+            crtc.timestamp,
+            aterm_x11::proto::CURRENT_TIME,
+            crtc.x,
+            crtc.y,
+            mode_id,
+            crtc.rotation,
+            &crtc.outputs,
+        ))
+        .map(|_| ())
     }
 
     pub fn get_crtc_mode(&self, crtc_id: randr::Crtc) -> Result<randr::Mode, X11Error> {
-        Ok(self.xcb_connection().randr_get_crtc_info(crtc_id, x11rb::CURRENT_TIME)?.reply()?.mode)
+        Ok(self
+            .request(randr::get_crtc_info(
+                self.randr_major(),
+                crtc_id,
+                aterm_x11::proto::CURRENT_TIME,
+            ))?
+            .mode)
     }
 }

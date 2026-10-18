@@ -53,7 +53,9 @@
 //!
 //! What this module answers is a record (design §8.2): it reads and
 //! decides nothing, and nothing that decides — no supervisor, no rotation —
-//! reads it.
+//! reads it. Its [`AccountKey`] and [`Word`] types are shared: the Codex
+//! rollout reader (`ai::codex_limits`) keys each usage reading by the
+//! account its rollout names, and keeps the vendor's words, in them.
 
 use std::fmt;
 use std::io::Read as _;

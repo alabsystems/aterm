@@ -32,7 +32,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use aterm_spec::derive::{Model, harness_upgrade_progress_model};
+use aterm_models_harness::harness_upgrade_progress_model;
+use aterm_spec::derive::Model;
 use aterm_spec::interp::{self, State};
 
 use super::*;
@@ -43,8 +44,7 @@ use crate::harness::upgrade_drive::{WATCH_GAP, at_point};
 /// The target the reducer is asked about.
 const TARGET: &str = "2.1.284";
 
-/// The committed machine at `Buggy = 0` with its gap latch clear (as `aterm-spec`'s
-/// `derived_harness_upgrade_progress_gaps_are_closed_on_main` builds it).
+/// The committed machine at `Buggy = 0` with its gap latch clear.
 fn main_today() -> Model {
     interp::with_buggy(&harness_upgrade_progress_model(), 0)
 }
@@ -211,7 +211,7 @@ fn dry_word(step: &Step, f: &Facts) -> String {
 fn class(word: &str) -> i64 {
     match wait_class(word) {
         WaitClass::OwnWork => 0,
-        WaitClass::Person | WaitClass::GoalLeftPaused => 1,
+        WaitClass::Person => 1,
         WaitClass::Limit => 2,
         _ => 3,
     }

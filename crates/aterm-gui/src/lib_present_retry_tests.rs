@@ -213,7 +213,7 @@ fn project(
 
 #[test]
 fn failed_present_device_loss_route_conforms_to_derived_model() {
-    let model = aterm_spec::derive::gpu_loss_route_model();
+    let model = aterm_models_core::gpu_loss_route_model();
     let mut state = model.init_state();
 
     assert!(model.fire("FailHealthy", &mut state));
@@ -245,7 +245,7 @@ fn failed_present_device_loss_route_conforms_to_derived_model() {
 /// the source target and updates its `PresentRetry`.
 #[test]
 fn successful_gpu_recovery_classifies_source_ready_only_after_redraw_request() {
-    let model = aterm_spec::derive::gpu_loss_recovery_model();
+    let model = aterm_models_core::gpu_loss_recovery_model();
     let wid = WindowId(0);
     for (failed_reason, action, expected_drops, expected_reason) in [
         (None, "SucceedFallbackAfterPresent", 0, 0),
@@ -384,7 +384,7 @@ fn recovery_reason_code(reason: PresentDropReason) -> i64 {
 /// both notification entry paths, then deliver its real future deadline.
 #[test]
 fn failed_gpu_recovery_retries_both_entry_paths_and_counts_once() {
-    let model = aterm_spec::derive::gpu_loss_recovery_model();
+    let model = aterm_models_core::gpu_loss_recovery_model();
     let wid = WindowId(0);
 
     // A successful present resets any prior surface retry history before
@@ -558,7 +558,7 @@ fn failed_gpu_recovery_retries_both_entry_paths_and_counts_once() {
 
 #[test]
 fn unresolved_recovery_stimulus_delivers_redraw_and_conforms() {
-    let model = aterm_spec::derive::recovery_redraw_model();
+    let model = aterm_models_core::recovery_redraw_model();
     let mut state = model.init_state();
     let mut retry = PresentRetry::default();
     retry.on_drop(PresentDropReason::GpuOccluded, Instant::now());
@@ -670,7 +670,7 @@ fn assert_matches(
 /// retry, consumes its permit, and a second result parks.
 #[test]
 fn bootstrap_occlusion_gets_exactly_one_future_retry() {
-    let model = aterm_spec::derive::present_retry_model();
+    let model = aterm_models_core::present_retry_model();
     let mut model_state = model.init_state();
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
@@ -719,7 +719,7 @@ fn bootstrap_occlusion_gets_exactly_one_future_retry() {
 /// replenish it or reclassify an occlusion as a startup retry.
 #[test]
 fn successful_present_permanently_closes_bootstrap_retry() {
-    let model = aterm_spec::derive::present_retry_model();
+    let model = aterm_models_core::present_retry_model();
     let mut model_state = model.init_state();
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
@@ -760,7 +760,7 @@ fn successful_present_permanently_closes_bootstrap_retry() {
 /// outstanding until present/drop acknowledges it.
 #[test]
 fn synchronous_stimulus_preserves_but_never_replenishes_bootstrap_retry() {
-    let model = aterm_spec::derive::present_retry_model();
+    let model = aterm_models_core::present_retry_model();
     let mut model_state = model.init_state();
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
@@ -845,7 +845,7 @@ fn synchronous_stimulus_preserves_but_never_replenishes_bootstrap_retry() {
 /// resets to idle.
 #[test]
 fn bounded_present_retry_conforms_to_derived_model() {
-    let model = aterm_spec::derive::present_retry_model();
+    let model = aterm_models_core::present_retry_model();
     let mut model_state = model.init_state();
     let mut retry = PresentRetry::default();
     let mut now = Instant::now();
@@ -961,7 +961,7 @@ fn bounded_present_retry_conforms_to_derived_model() {
 #[test]
 fn persistent_drop_parks_and_past_deadline_is_rejected() {
     let now = Instant::now();
-    let model = aterm_spec::derive::present_retry_model();
+    let model = aterm_models_core::present_retry_model();
     // Every transient production reason, including CPU-target construction
     // after GPU fallback, must take the model's bounded Drop route.
     for reason in [

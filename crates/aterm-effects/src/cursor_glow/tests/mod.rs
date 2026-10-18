@@ -7,7 +7,7 @@
 
 use super::*;
 // The parts the hub does not re-export (their items are the engine's own).
-use super::{emit::*, seam::*, spawn::*};
+use super::{seam::*, spawn::*};
 use crate::cursor_trail::{CursorTrail, TrailConfig};
 
 mod band_move;
@@ -16,7 +16,6 @@ mod cold_motion;
 mod comet;
 mod erase;
 mod fire;
-mod goldens;
 mod heat_and_laser;
 mod ink_wrap_seam;
 mod insert;
@@ -40,7 +39,6 @@ mod status;
 mod stray;
 mod style_switch;
 mod tint;
-mod trail_pack;
 mod typed_stamps;
 mod unknown_insert;
 mod v2_seam;
@@ -121,7 +119,7 @@ fn geom() -> Geom {
 fn cfg(style: GlowStyle, enabled: bool) -> GlowConfig {
     GlowConfig {
         enabled,
-        // The spectrum face, which the whole-frame golden pins for `classic`.
+        // The spectrum face for `classic`.
         classic_mono: false,
         dark_theme: true,
         // The default dark palette: a coherent pair, never 0/0 (`fg == bg` reads as a
@@ -141,7 +139,6 @@ fn cfg(style: GlowStyle, enabled: bool) -> GlowConfig {
         // continuous body); every other enum style shows its beam.
         beam: !matches!(style, GlowStyle::Water | GlowStyle::RainbowKitty),
         head_dx: 0.5,
-        pack: None,
         // No raw spelling to resolve here, so start on the default tall
         // presentation; spelling tests use `cfg_for_style_name`.
         ribbon_tall: true,
@@ -406,8 +403,8 @@ fn ribbon_cols(out: &[GlowQuad], row: u16, g: Geom) -> std::collections::BTreeSe
         .collect()
 }
 
-/// Every built-in style; the tenth entry repeats `Lumen` as padding.
-const BUILTINS: [GlowStyle; 10] = [
+/// Every built-in style.
+const BUILTINS: [GlowStyle; 9] = [
     GlowStyle::Lumen,
     GlowStyle::Phaser,
     GlowStyle::RainbowKitty,
@@ -417,199 +414,11 @@ const BUILTINS: [GlowStyle; 10] = [
     GlowStyle::Beam,
     GlowStyle::Water,
     GlowStyle::Comet,
-    GlowStyle::Lumen, // padding
 ];
 
 fn typed_scratch() -> Vec<GlowQuad> {
     Vec::new()
 }
-
-/// The deletion oracle's script (`docs/design/RAINBOW-KITTY-V2.md` §17.2, D14): one session
-/// reaching every v2 producer (stardust, typing, flings, backspaces, a kill, a Return, a word hop
-/// and a decay tail to 5 s), folding every observable the host reads each frame into one hash.
-/// `reduced` drives the posture seam. Deterministic given the relative schedule.
-fn deletion_script(cfg: &GlowConfig, g: Geom, reduced: bool) -> u64 {
-    let mut glow = CursorGlow::default();
-    glow.set_reduced_motion(reduced);
-    let t0 = Instant::now();
-    let mut out = Vec::new();
-    let mut acc: u64 = 0;
-    let blank = [' '; 40];
-    let mut row_2 = [' '; 40];
-    let mut row_3 = [' '; 40];
-    let mut step = |glow: &mut CursorGlow,
-                    at: Instant,
-                    cell: (u16, u16),
-                    row_2: &[char; 40],
-                    row_3: &[char; 40]| {
-        let (row, caret) = cell;
-        let cols: &[char; 40] = if row == 2 { row_2 } else { row_3 };
-        glow.observe_row(row, caret, cols, at);
-        glow.observe_neighbor_rows(Some(&blank), Some(&blank));
-        let fp = glow.tick(Some(cell), at, cfg, g, &mut out);
-        acc = fnv_mix_u64(acc, fp);
-        for q in out.iter().chain(glow.under_quads()) {
-            for w in q.damage_words() {
-                acc = fnv_mix_u64(acc, w);
-            }
-        }
-        for h in glow.halos() {
-            for w in [
-                u64::from(h.row),
-                u64::from(h.x),
-                u64::from(h.y),
-                u64::from(h.w),
-                u64::from(h.h),
-                u64::from(h.color),
-                u64::from(h.cx),
-                u64::from(h.cy),
-                u64::from(h.rx),
-                u64::from(h.ry),
-                u64::from(matches!(h.mode, aterm_core::render::HaloMode::Over)),
-            ] {
-                acc = fnv_mix_u64(acc, w);
-            }
-        }
-        acc = fnv_mix_u64(acc, glow.sound_cues.len() as u64);
-        for cue in glow.drain_sound_cues() {
-            for b in format!("{cue:?}").bytes() {
-                acc = fnv_mix_u64(acc, u64::from(b));
-            }
-        }
-        acc = fnv_mix_u64(acc, u64::from(glow.caret_paint(at).to_bits()));
-        acc = fnv_mix_u64(
-            acc,
-            glow.caret_flare_at().map_or(u64::MAX, |f| {
-                at.saturating_duration_since(f).as_micros() as u64
-            }),
-        );
-        acc = fnv_mix_u64(acc, u64::from(glow.rainbow_field().to_bits()));
-        acc = fnv_mix_u64(
-            acc,
-            u64::from(glow.rainbow_head_rgb(cfg).unwrap_or(u32::MAX)),
-        );
-        acc = fnv_mix_u64(acc, u64::from(glow.momentum_display().to_bits()));
-        acc = fnv_mix_u64(acc, u64::from(glow.rainbow_phase().to_bits()));
-        acc = fnv_mix_u64(acc, u64::from(glow.typing_momentum(at).to_bits()));
-        acc = fnv_mix_u64(acc, u64::from(glow.needs_frame_cadence()));
-        acc = fnv_mix_u64(
-            acc,
-            glow.next_change_deadline(at, Duration::from_millis(8))
-                .map_or(u64::MAX, |d| {
-                    d.saturating_duration_since(at).as_micros() as u64
-                }),
-        );
-        acc = fnv_mix_u64(acc, u64::from(glow.is_active()));
-        acc = fnv_mix_u64(
-            acc,
-            match glow.take_companion_impulse() {
-                None => 0,
-                Some(CompanionImpulse::Land) => 1,
-                Some(CompanionImpulse::Wince) => 2,
-                Some(CompanionImpulse::Delight) => 3,
-                Some(CompanionImpulse::Meteor { dir, t0, t_flight }) => {
-                    let age = at.saturating_duration_since(t0).as_micros() as u64;
-                    fnv_mix_u64(
-                        fnv_mix_u64(fnv_mix_u64(4, dir as u64), age),
-                        t_flight.as_micros() as u64,
-                    )
-                }
-            },
-        );
-        for b in format!("{:?}", glow.take_cursor_cat_motion_pulse().map(|p| p.kind)).bytes() {
-            acc = fnv_mix_u64(acc, u64::from(b));
-        }
-        if let Some(st) = glow.v2_status() {
-            for w in [
-                u64::from(st.quads),
-                u64::from(st.halos),
-                u64::from(st.stars),
-                u64::from(st.meteors),
-                u64::from(st.cells),
-                u64::from(st.disp.to_bits()),
-                u64::from(st.tokens.to_bits()),
-                st.fp,
-            ] {
-                acc = fnv_mix_u64(acc, w);
-            }
-        }
-    };
-    let ms = |m: u64| t0 + Duration::from_millis(m);
-    step(&mut glow, t0, (2, 4), &row_2, &row_3);
-    for k in 1..=10u64 {
-        glow.note_synthetic_typed(ms(80 * k), 1);
-        row_2[3 + k as usize] = 'a';
-        step(&mut glow, ms(80 * k), (2, 4 + k as u16), &row_2, &row_3);
-    }
-    glow.note_motion(ms(1000));
-    step(&mut glow, ms(1000), (2, 34), &row_2, &row_3);
-    for (k, at) in [1100u64, 1180, 1260].into_iter().enumerate() {
-        glow.note_synthetic_typed(ms(at), 1);
-        row_2[34 + k] = 'b';
-        step(&mut glow, ms(at), (2, 35 + k as u16), &row_2, &row_3);
-    }
-    glow.note_backspace(ms(1400));
-    row_2[36] = ' ';
-    step(&mut glow, ms(1400), (2, 36), &row_2, &row_3);
-    glow.note_backspace(ms(1480));
-    row_2[35] = ' ';
-    step(&mut glow, ms(1480), (2, 35), &row_2, &row_3);
-    glow.note_kill(ms(1600), true);
-    row_2[34] = ' ';
-    step(&mut glow, ms(1600), (2, 20), &row_2, &row_3);
-    glow.note_motion(ms(1700));
-    step(&mut glow, ms(1700), (2, 0), &row_2, &row_3);
-    glow.note_return(ms(1800));
-    step(&mut glow, ms(1800), (3, 0), &row_2, &row_3);
-    for k in 1..=4u64 {
-        glow.note_synthetic_typed(ms(1800 + 80 * k), 1);
-        row_3[k as usize - 1] = 'c';
-        step(&mut glow, ms(1800 + 80 * k), (3, k as u16), &row_2, &row_3);
-    }
-    glow.note_motion(ms(2300));
-    step(&mut glow, ms(2300), (3, 9), &row_2, &row_3);
-    for at in [2400u64, 2500, 2700, 3000, 3500, 4200, 5000] {
-        step(&mut glow, ms(at), (3, 9), &row_2, &row_3);
-    }
-    acc
-}
-
-/// The deletion goldens: [`deletion_script`]'s fold for every variant (the nine built-ins dark,
-/// then rainbow kitty light, underline and reduced motion). v2 does not engage for the eight
-/// non-kitty styles, so their rows never move; any drift in a kitty row is a decision, and any
-/// change to `crate::spectrum`'s table moves all four.
-///
-/// Re-baking: a v2 change that moves a kitty byte re-reads exactly the kitty rows it moves (and
-/// their [`FLAT_GOLDENS`] twins), with the non-kitty rows as the control and, where the change
-/// has a switch, the clause toggled back reproducing every previous number. Which rows move is
-/// itself a claim: light has no rail and no hot edge (L6) and reduced has no wipe and no flight
-/// (§6.11), so a change confined to one of those holds that row.
-const DELETION_GOLDENS: [(&str, u64); 12] = [
-    ("Lumen dark", 1_264_411_311_373_267_895),
-    ("Phaser dark", 2_726_566_909_586_900_035),
-    ("RainbowKitty dark", 383_721_728_202_092_274),
-    ("Sparkle dark", 14_969_905_489_495_276_903),
-    ("Fire dark", 12_618_090_056_209_866_428),
-    ("Laser dark", 1_955_324_598_530_313_952),
-    ("Beam dark", 15_086_158_732_367_022_435),
-    ("Water dark", 482_165_703_607_766_578),
-    ("Comet dark", 14_523_124_226_784_523_753),
-    ("RainbowKitty light", 5_202_336_454_404_496_754),
-    ("RainbowKitty underline", 544_488_007_139_041_733),
-    ("RainbowKitty reduced", 8_179_550_295_111_973_776),
-];
-
-/// The flat spelling's goldens: the four kitty rows of [`DELETION_GOLDENS`] under `rainbow kitty
-/// flat` (`GlowConfig::ribbon_flat`), where every comet branch in `ribbon.rs` (comet profile,
-/// vivid rail, from-the-hand wipe) collapses to the flat expression. They move with
-/// [`DELETION_GOLDENS`] on any change outside a comet branch and hold when only a comet branch
-/// changes: re-read them whenever the kitty rows are re-baked.
-const FLAT_GOLDENS: [(&str, u64); 4] = [
-    ("RainbowKitty dark", 17_890_278_511_770_188_755),
-    ("RainbowKitty light", 6_430_388_712_169_283_571),
-    ("RainbowKitty underline", 15_379_506_098_573_732_577),
-    ("RainbowKitty reduced", 12_943_034_956_261_997_624),
-];
 
 /// One beat past the park window: a held park ([`HeldPark`]) is judged on the
 /// first tick more than [`CursorGlow::TYPE_HINT_FRESH`] after it, so a verdict

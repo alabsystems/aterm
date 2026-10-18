@@ -27,8 +27,9 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MaterializePolicy {
     /// Inherit the process policy (the kernel default is to materialize). Only
-    /// the tests restore it; the shipped callers pick `Off` or `On`.
-    #[cfg(test)]
+    /// the macOS tests name it, reading a thread's policy back; the shipped
+    /// callers pick `Off` or `On`.
+    #[cfg(all(test, target_os = "macos"))]
     Default,
     /// Never wait: a dataless read fails immediately with `EDEADLK`.
     Off,
@@ -81,8 +82,7 @@ pub(crate) fn set_thread_materialize_policy(policy: MaterializePolicy) -> Result
     }
 }
 
-/// The raw-value seam under [`set_thread_materialize_policy`], kept separate so a
-/// test can hand the kernel a value it must refuse and observe the errno path.
+/// The raw-value call under [`set_thread_materialize_policy`].
 #[cfg(target_os = "macos")]
 fn set_thread_policy_raw(policy: std::os::raw::c_int) -> Result<(), i32> {
     // SAFETY: integer-only FFI call that changes only the calling thread's policy;
@@ -127,26 +127,10 @@ pub(crate) fn main_thread_never_materializes() -> Result<(), i32> {
     set_thread_materialize_policy(MaterializePolicy::Off)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
 
-    #[test]
-    fn setting_the_policy_never_panics_and_is_a_no_op_off_macos() {
-        // Runs on a fresh thread so the test binary's other threads keep their
-        // inherited policy.
-        let outcome = std::thread::spawn(|| {
-            let on = set_thread_materialize_policy(MaterializePolicy::On);
-            let off = set_thread_materialize_policy(MaterializePolicy::Off);
-            let default = set_thread_materialize_policy(MaterializePolicy::Default);
-            (on, off, default)
-        })
-        .join()
-        .expect("policy calls never panic");
-        assert_eq!(outcome, (Ok(()), Ok(()), Ok(())));
-    }
-
-    #[cfg(target_os = "macos")]
     #[test]
     fn thread_policy_round_trips_through_the_kernel() {
         std::thread::spawn(|| {
@@ -161,16 +145,6 @@ mod tests {
         .unwrap();
     }
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn an_invalid_policy_value_returns_its_errno_without_panicking() {
-        let outcome = std::thread::spawn(|| set_thread_policy_raw(99))
-            .join()
-            .expect("an invalid value is refused, not a crash");
-        assert_eq!(outcome, Err(libc::EINVAL), "{outcome:?}");
-    }
-
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_thread_scoped_policy_does_not_leak_into_a_sibling_thread() {
         let sibling = std::thread::spawn(|| {

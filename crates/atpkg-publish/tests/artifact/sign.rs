@@ -37,7 +37,7 @@ fn channel(keys: &Keys, home: &Path) -> (Ctx, Arc<FakeHost>) {
 }
 
 fn staged(dir: &Path, r: &Row) -> PathBuf {
-    let pkg = dir.join(pkgdoc::file_name("ay", 9));
+    let pkg = dir.join(pkgdoc::manifest_name("ay", 9));
     put(&pkg, pkgdoc::fresh(&header(), r).expect("render").bytes());
     pkg
 }
@@ -165,7 +165,7 @@ fn the_ceremony_re_checks_every_row_and_the_version_before_it_signs() {
             "never signed",
         ),
     ] {
-        let pkg = tmp.path().join(what).join(pkgdoc::file_name("ay", 9));
+        let pkg = tmp.path().join(what).join(pkgdoc::manifest_name("ay", 9));
         put(&pkg, text.as_bytes());
         let err = sign::sign_all(&ctx, std::slice::from_ref(&pkg)).expect_err(what);
         assert!(err.to_string().contains(want), "{what}: {err}");
@@ -247,26 +247,6 @@ fn two_rosters_at_one_generation_are_a_fork_and_nothing_is_signed() {
 }
 
 #[test]
-fn the_verb_names_its_operands_and_its_flags() {
-    let tmp = scratch("sign-verb");
-    let keys = Keys::mint("m3", &[]);
-    let (ctx, _) = channel(&keys, tmp.path());
-    assert!(matches!(sign::run(&ctx, &[]), Err(Error::Usage(_))));
-    assert!(matches!(
-        sign::run(&ctx, &["--bogus".into()]),
-        Err(Error::Usage(_))
-    ));
-    let pkg = staged(tmp.path(), &row(AARCH64_APPLE_DARWIN, Kind::Binary));
-    let shown = pkg.to_string_lossy().into_owned();
-    assert!(matches!(
-        sign::run(&ctx, &[shown.clone(), "--trust-repo".into()]),
-        Err(Error::Usage(_))
-    ));
-    sign::run(&ctx, &[shown]).expect("signed through the verb");
-    client_verifies(&ctx, &pkg, &sign::sig_path(&pkg)).expect("verifies");
-}
-
-#[test]
 fn the_verb_reads_the_switch_from_the_trust_repo_it_names() {
     let tmp = scratch("sign-verb-trust");
     let keys = Keys::mint("m3", &[]);
@@ -290,4 +270,63 @@ fn the_verb_reads_the_switch_from_the_trust_repo_it_names() {
         ],
     )
     .expect("dormant where the verb was pointed");
+}
+
+/// THE ROSTER IS ELECTED ONCE PER PROCESS (A9): every pack of a lane or a group loads a
+/// signer, and each used to list the channel and download the head's roster pair again.
+/// The context remembers the elected generation, so its clones (the group's per-publish
+/// context, the lanes' packs) read the head once — and every signature is still verified
+/// under it.
+#[test]
+fn packs_of_one_run_read_the_channel_head_once() {
+    let tmp = scratch("sign-once");
+    let keys = Keys::mint("m3", &[]);
+    let (ctx, host) = channel(&keys, tmp.path());
+    let head_reads = || {
+        let listing = format!("releases {}", ctx.index_slug());
+        host.calls().iter().filter(|c| **c == listing).count()
+    };
+    let packs = 3;
+    let clone = ctx.clone();
+    for _ in 0..packs {
+        atpkg_publish::artifact::pack::Signer::load(&clone).expect("a signer per pack");
+    }
+    eprintln!(
+        "M2: {} channel-head read(s) for {packs} packs",
+        head_reads()
+    );
+    assert_eq!(head_reads(), 1, "{:?}", host.calls());
+
+    // A lane or a group elects from the head it already verified: its packs read none.
+    let tmp = scratch("sign-once-lane");
+    let (ctx, host) = channel(&keys, tmp.path());
+    let (_, head) =
+        atpkg_publish::quad::fetch_head(&ctx, &ctx.index_slug(), &tmp.path().join("head"))
+            .expect("the lane's baseline");
+    sign::elect_from_head(&ctx, &head);
+    let lane_reads = || {
+        let listing = format!("releases {}", ctx.index_slug());
+        host.calls().iter().filter(|c| **c == listing).count()
+    };
+    for _ in 0..packs {
+        let signer = atpkg_publish::artifact::pack::Signer::load(&ctx).expect("signer");
+        drop(signer);
+    }
+    eprintln!(
+        "M2: {} channel-head read(s) for a lane's {packs} packs",
+        lane_reads()
+    );
+    assert_eq!(lane_reads(), 1, "{:?}", host.calls());
+    let pkg = staged(tmp.path(), &row(AARCH64_APPLE_DARWIN, Kind::Binary));
+    let authority = sign::elected(&ctx).expect("elected");
+    let bytes = std::fs::read(&pkg).expect("pkg");
+    let key = std::fs::read(&ctx.identity.key).expect("key");
+    let sig = atpkg_keys::sign(&key, &bytes).expect("signs");
+    authority
+        .verify_pkg(&bytes, &sig)
+        .expect("every signature is still checked by the client's chain");
+    assert!(
+        authority.verify_pkg(&bytes, b"not a signature").is_err(),
+        "and a bad one is refused"
+    );
 }

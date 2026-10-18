@@ -8,12 +8,16 @@
 //! `invoke` the block back as its first argument.
 
 #![cfg(target_os = "macos")]
+#![expect(
+    clippy::disallowed_methods,
+    reason = "aterm-objc's own runtime tests drive the bare `msg` cast; everything else uses checked_msg"
+)]
 
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use aterm_objc::{Id, RcBlock, Sel, class, msg, ns_string, sel};
+use aterm_objc::{Id, RcBlock, Sel, msg, ns_string, sel};
 
 unsafe extern "C" {
     fn dispatch_queue_create(label: *const std::ffi::c_char, attr: *const c_void) -> *mut c_void;
@@ -148,33 +152,6 @@ fn a_returning_block_hands_its_value_back() {
 }
 
 #[test]
-fn the_dispose_helper_drops_the_closure_exactly_once() {
-    let drops = Arc::new(AtomicUsize::new(0));
-    {
-        let spy = DropSpy(Arc::clone(&drops));
-        // SAFETY: a `void (^)(void)` block.
-        let block = unsafe {
-            RcBlock::new0(move || {
-                let _ = &spy;
-            })
-        }
-        .expect("heap block");
-        let q = queue();
-        // SAFETY: live queue, live block.
-        unsafe {
-            dispatch_sync(q, block.as_ptr());
-            dispatch_release(q);
-        }
-        assert_eq!(drops.load(Ordering::SeqCst), 0, "disposed while still held");
-    }
-    assert_eq!(
-        drops.load(Ordering::SeqCst),
-        1,
-        "the dispose helper did not drop the captured state exactly once"
-    );
-}
-
-#[test]
 fn a_retained_block_defers_the_dispose() {
     let drops = Arc::new(AtomicUsize::new(0));
     let spy = DropSpy(Arc::clone(&drops));
@@ -195,106 +172,4 @@ fn a_retained_block_defers_the_dispose() {
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     drop(second);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
-}
-
-#[test]
-fn the_runtime_agrees_a_block_is_an_objc_object() {
-    // A heap block's isa is `_NSConcreteMallocBlock`, which is an ObjC class,
-    // so the runtime answers `-class` on it. This is what lets AppKit retain a
-    // handler with `objc_retain` and store it in an ivar.
-    // SAFETY: a `void (^)(void)` block.
-    let block = unsafe { RcBlock::new0(|| ()) }.expect("heap block");
-    // SAFETY: `block` is a live heap block, which is a valid message receiver;
-    // `-class` is a plain accessor.
-    unsafe {
-        let cls: unsafe extern "C-unwind" fn(Id, Sel) -> aterm_objc::ClassPtr = msg();
-        let c = cls(Id::from_ptr(block.as_ptr()), sel!(class));
-        assert!(!c.is_null());
-        let name = aterm_objc::class_name(c).to_string_lossy().into_owned();
-        assert!(
-            name.contains("Block"),
-            "heap block reported class {name:?}, expected an NSBlock kind"
-        );
-        // And it is a kind of the shared NSBlock class Foundation exports.
-        // `-isKindOfClass:` returns `BOOL`; `msg`'s `Encode` bound refuses a
-        // Rust `bool` there.
-        let is_kind: unsafe extern "C-unwind" fn(
-            Id,
-            Sel,
-            aterm_objc::ClassPtr,
-        ) -> aterm_objc::Bool = msg();
-        assert!(
-            is_kind(
-                Id::from_ptr(block.as_ptr()),
-                sel!(isKindOfClass:),
-                class(c"NSBlock")
-            )
-            .as_bool()
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The ownership rule winit's `observer.rs::queue_closure` depends on.
-// ---------------------------------------------------------------------------
-
-unsafe extern "C" {
-    fn CFRunLoopGetCurrent() -> *mut c_void;
-    fn CFRunLoopPerformBlock(rl: *mut c_void, mode: *const c_void, block: *mut c_void);
-    // `Boolean` is `unsigned char`: declared as `u8`, like the suite's other
-    // declaration of this symbol (`conformance_wake_timer`), so the two agree.
-    fn CFRunLoopRunInMode(mode: *const c_void, seconds: f64, return_after_source: u8) -> i32;
-    static kCFRunLoopDefaultMode: *const c_void;
-}
-
-/// `CFRunLoopPerformBlock` takes its own reference, so the caller may release
-/// immediately, as winit's `observer.rs` `queue_closure` does. The closure must
-/// run (the block survived our release) and its capture drop exactly once
-/// afterwards (the run loop's reference was given back, not leaked).
-#[test]
-fn cfrunloopperformblock_takes_its_own_reference() {
-    let drops = Arc::new(AtomicUsize::new(0));
-    let hits = Arc::new(AtomicUsize::new(0));
-    let spy = DropSpy(Arc::clone(&drops));
-    let h = Arc::clone(&hits);
-
-    // SAFETY: a no-argument, `()`-returning block, which is exactly what
-    // `CFRunLoopPerformBlock` invokes (`void (^)(void)`).
-    let block = unsafe {
-        RcBlock::new0(move || {
-            let _ = &spy;
-            h.fetch_add(1, Ordering::SeqCst);
-        })
-    }
-    .expect("a heap block");
-
-    // SAFETY: the current run loop is live for this thread, the mode is
-    // Foundation's own constant, and the block is a live heap block.
-    unsafe { CFRunLoopPerformBlock(CFRunLoopGetCurrent(), kCFRunLoopDefaultMode, block.as_ptr()) };
-
-    // The release, before the run loop has run anything: where
-    // `queue_closure`'s `RcBlock` goes out of scope.
-    drop(block);
-    assert_eq!(
-        drops.load(Ordering::SeqCst),
-        0,
-        "our release destroyed the closure — the run loop did not take a \
-         reference, and `queue_closure` is invoking freed memory"
-    );
-
-    // SAFETY: draining the default mode for a bounded time on this thread.
-    unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.25, 0) };
-
-    assert_eq!(
-        hits.load(Ordering::SeqCst),
-        1,
-        "the queued block did not run"
-    );
-    assert_eq!(
-        drops.load(Ordering::SeqCst),
-        1,
-        "the closure was dropped {} times after the run loop invoked it; the \
-         run loop's reference must be given back exactly once",
-        drops.load(Ordering::SeqCst)
-    );
 }

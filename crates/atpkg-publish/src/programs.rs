@@ -66,6 +66,23 @@ pub enum Shape {
     /// A whole sysroot (bin/ + lib/), packed from a staged toolchain. A person cuts it;
     /// the lanes only say what is owed.
     Bundle(BundleDef),
+    /// A prebuilt PACKAGE TREE another pipeline built, signed and smoke-tested (layout v1:
+    /// `codex-package.json` + `alab-build.json` at its root), packed whole by
+    /// `atpkg-publish pack-package` with no rebuild and no restrip. Today one: codex-alab,
+    /// ALab's drop-in codex (`alab/package.sh` in its repo). The row's program is an
+    /// ALab-built agent program of the client (`atpkg::alab::ALAB_AGENTS`), vendor-direct
+    /// everywhere ALab does not build it; no lane reads it, and the index switches its block
+    /// to this row only on an explicit `--pin` (`channel::index::plan`).
+    Package(PackageDef),
+}
+
+/// How a prebuilt package tree is packed.
+#[derive(Clone, Copy, Debug)]
+pub struct PackageDef {
+    /// The tools it shims: the package's entrypoint is `bin/<the one tool>`.
+    pub exposes: &'static [&'static str],
+    /// The Apple targets one build carries (the client's `AlabAgent::targets`).
+    pub darwin: &'static [Triple],
 }
 
 /// How a sysroot bundle is packed and proven.
@@ -114,7 +131,9 @@ const fn plain(
 
 /// Every program the channel pins, in the order the index lists them. A vendor-direct
 /// program (`atpkg::vendor_direct::is_vendor`) has no row: its client follows its vendor,
-/// so neither `--pin`, `--target-pin` nor a lane ever pins it.
+/// so neither `--pin`, `--target-pin` nor a lane ever pins it — except an ALab-built agent
+/// program (`atpkg::alab::agent`), whose [`Shape::Package`] row is what an explicit `--pin`
+/// of it publishes for the targets ALab builds it for.
 pub static PROGRAMS: &[ProgramDef] = &[
     plain("ay", None, DUAL_DARWIN),
     plain("clean", None, DUAL_DARWIN),
@@ -154,6 +173,17 @@ pub static PROGRAMS: &[ProgramDef] = &[
             main_gap: true,
         }),
     },
+    ProgramDef {
+        name: "codex",
+        repo: "codex-alab",
+        group: None,
+        system: None,
+        unavailable_hint: None,
+        shape: Shape::Package(PackageDef {
+            exposes: &["codex"],
+            darwin: ARM_DARWIN,
+        }),
+    },
 ];
 
 /// The program named `name`.
@@ -174,6 +204,7 @@ impl ProgramDef {
         match self.shape {
             Shape::Plain { darwin } => darwin,
             Shape::Bundle(b) => b.darwin,
+            Shape::Package(p) => p.darwin,
         }
     }
 
@@ -182,4 +213,22 @@ impl ProgramDef {
     pub fn is_plain(&self) -> bool {
         matches!(self.shape, Shape::Plain { .. })
     }
+
+    /// Whether the unattended lanes read it at all: a [`Shape::Package`] row is packed and
+    /// pinned only by a person (`pack-package`, then `index --pin`), so no lane looks for
+    /// its releases, reports it owed or pins it.
+    #[must_use]
+    pub fn lane_tracked(&self) -> bool {
+        !matches!(self.shape, Shape::Package(_))
+    }
+}
+
+/// `name`'s row when it is the PACKAGE ROW of an ALab-built agent program: a
+/// [`Shape::Package`] row whose repo is the one the client routes from
+/// (`atpkg::alab::AlabAgent::repo`). `None` for every other program, and for a row the
+/// client would never route (so no index this writer signs names a repo the client ignores).
+#[must_use]
+pub fn alab_package(name: &str) -> Option<&'static ProgramDef> {
+    let agent = atpkg::alab::agent(name)?;
+    get(name).filter(|d| matches!(d.shape, Shape::Package(_)) && d.repo == agent.repo)
 }

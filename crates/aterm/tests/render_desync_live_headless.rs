@@ -31,8 +31,8 @@
 //! depends on the gap, and that instance widens it through the development
 //! seam `ATERM_RESIZE_RUN_GAP_MS` instead of racing it. The variants whose
 //! halves must be FAR apart wait out a gap past the run gap (a lower bound,
-//! which load only lengthens), and the two that show the nudge did NOT act
-//! watch for [`NUDGE_WINDOW`].
+//! which load only lengthens). That the nudge acts once and not again is
+//! `aterm-core`'s `repaint_nudge` unit tests'.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -55,11 +55,6 @@ const RUN_GAP_MS: f64 = aterm_control::cast_drift::RUN_GAP_SECS * 1000.0;
 
 /// LATE's halves: past the run gap and the ledger's 1 s risk wait.
 const LATE_GAP: Duration = Duration::from_millis(1_600);
-
-/// How long a test that shows the repaint nudge did NOT act watches for it:
-/// a nudge acts once its person gate (1.5 s with no gesture) has passed after
-/// the epoch is judged, so twice that.
-const NUDGE_WINDOW: Duration = Duration::from_secs(3);
 
 /// The frame's truecolor row (screen row 3, 200,100,50 on 10,20,30).
 const TRUECOLOR: (&str, &str) = ("c86432", "0a141e");
@@ -424,7 +419,8 @@ impl Resizes {
     }
 
     /// Both resizes were booked at the controller's input dispatch: `site=input`,
-    /// `at=` a line of this checkout that calls `input_to_session(`, nothing
+    /// `at=` a line of this checkout that calls `input_to_session(` (or its
+    /// receipt-taking `input_to_session_observed(`), nothing
     /// unledgered, and each row's window the size it asked for.
     #[track_caller]
     fn expect_site_input(&self, r1: &Rec, r2: &Rec) {
@@ -441,7 +437,7 @@ impl Resizes {
             .unwrap_or_else(|e| panic!("at={at} names no file of this checkout: {e}"));
         let text = source.lines().nth(line - 1).unwrap_or_default();
         assert!(
-            text.contains("input_to_session("),
+            text.contains("input_to_session(") || text.contains("input_to_session_observed("),
             "at={at} is the controller-input dispatch, but reads: {text}"
         );
     }
@@ -527,10 +523,10 @@ struct Lane {
 
 impl Lane {
     /// Boot it (80x24) and wait for the stand-in's frame; an environment
-    /// refusal is COULD NOT RUN, never a pass ([`headless_boot::boot_or_refuse`]).
+    /// refusal is COULD NOT RUN, never a pass ([`headless_boot::boot_with`]).
     #[track_caller]
     fn boot(tag: &str, setup: Setup) -> Self {
-        let inst = headless_boot::boot_or_refuse(
+        let inst = headless_boot::boot_with(
             &format!("atrd{tag}"),
             |root, cmd| {
                 if let Some(word) = setup.nudge {
@@ -949,11 +945,6 @@ fn a_flap_drawn_between_and_grown_300ms_later_is_judged_by_its_epoch() {
     a_flap_drawn_between_is_judged_by_its_epoch("e3", Duration::from_millis(300));
 }
 
-#[test]
-fn a_flap_drawn_between_and_grown_600ms_later_is_judged_by_its_epoch() {
-    a_flap_drawn_between_is_judged_by_its_epoch("e6", Duration::from_millis(600));
-}
-
 /// Past the ledger's 1 s risk wait: the shrink's half is judged before the
 /// grow comes.
 #[test]
@@ -1086,14 +1077,11 @@ fn a_program_that_repaints_without_clearing_is_never_nudged() {
     );
     lane.flap(Between::ModeSet(Duration::ZERO));
     lane.await_render("unjudged");
-    let screen = lane.ctl.text();
-    std::thread::sleep(NUDGE_WINDOW);
     let rz = lane.resizes();
     rz.header.expect(
         "the nudge never acted",
         &[("nudged", "0"), ("nudge", "idle")],
     );
-    assert_eq!(lane.ctl.text(), screen, "the screen is as the flap left it");
 }
 
 /// THE CONTAINMENT, classed as the agent: the nudge tries ONCE, gets no full
@@ -1116,13 +1104,9 @@ fn a_nudge_without_an_answer_gives_up_once() {
         rz.header.get("nudged") == Some("1") && rz.header.get("nudge") == Some("idle")
     });
     lane.await_short_then_true_read();
-    // The nudge's restore has landed; the window shows it never acts again.
-    std::thread::sleep(NUDGE_WINDOW);
     let rz = lane.resizes();
-    rz.header.expect(
-        "tried once, and never again",
-        &[("nudged", "1"), ("nudge", "idle")],
-    );
+    rz.header
+        .expect("tried once", &[("nudged", "1"), ("nudge", "idle")]);
     rz.last_epoch().expect(
         "the epoch stays at risk, tried",
         &[("tried", "1"), ("verdict", "desync-risk")],

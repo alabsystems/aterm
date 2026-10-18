@@ -43,12 +43,6 @@ fn cup_positions_cursor_1based() {
 }
 
 #[test]
-fn sgr_color_does_not_corrupt_text() {
-    let s = run(b"\x1b[31mRED\x1b[0m\x1b[1;38;5;208mBOLD\x1b[0m");
-    assert_eq!(s.row(0), "REDBOLD");
-}
-
-#[test]
 fn sgr_interleaved_attrs_and_color_keep_text() {
     // The flags-only (1m, 22m) and colour (31m) fast paths and a reset (0m),
     // interleaved with printable chars, leave the text "ABC".

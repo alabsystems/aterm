@@ -162,7 +162,6 @@ fn transcript_projections_answer_as_recorded() {
             format!("{id}/conversation"),
             written(super::conversation(&row)),
         );
-        corpus.record(format!("{id}/codex"), written(super::codex_metadata(&row)));
     }
     corpus.finish();
 }

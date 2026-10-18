@@ -13,8 +13,5 @@ description = "VT terminal escape sequence parser with SIMD fast-path"
 aterm-alloc = { workspace = true }
 aterm-provenance = { workspace = true }
 
-[dev-dependencies]
-aterm-spec = { workspace = true }
-
 [lints]
 workspace = true

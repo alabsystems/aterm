@@ -2,13 +2,13 @@
 using namespace metal;
 
 // VERIFICATION ONLY. No shipping pipeline compiles this file; it exists so the
-// PIPELINE AND ENCODER STATE in `src/metal/ffi.rs` — the colour write mask, the
-// scissor rect, the viewport and the sampler's filters — can be proven with a
-// GPU readback instead of asserted from the selector name. A selector that is
-// declared but never honoured is exactly the defect these probes catch: Metal's
-// default write mask is ALL, its default scissor is the whole attachment and
-// its default filter is nearest, so every one of those setters is INVISIBLE to
-// a test that only checks the pass ran.
+// PIPELINE STATE in `src/metal/ffi.rs` — the colour write mask and the
+// sampler's filters — can be proven with a GPU readback instead of asserted
+// from the selector name. A selector that is declared but never honoured is
+// exactly the defect these probes catch: Metal's default write mask is ALL and
+// its default filter is nearest, so both setters are INVISIBLE to a test that
+// only checks the pass ran. (Scissor and viewport are proven by the scissored
+// and letterboxed Metal-vs-wgpu differentials.)
 //
 // Kept beside the shipped `.metal` files rather than inline in Rust for the
 // reason `shaders.rs` gives for all of them: a `.metal` file is what an editor
@@ -20,8 +20,7 @@ struct ProbeOut {
 };
 
 // The SAME oversized triangle `vs_blit` uses, so the probes rasterize exactly
-// the geometry the shipped fullscreen pass does — including how it interacts
-// with a viewport, which is the point of the viewport probe.
+// the geometry the shipped fullscreen pass does.
 vertex ProbeOut vs_probe(uint vi [[vertex_id]]) {
     const float2 uv[3] = { float2(0.0, 0.0), float2(2.0, 0.0), float2(0.0, 2.0) };
     ProbeOut o;

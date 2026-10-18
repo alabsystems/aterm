@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-use crate::input::PixelOffset;
 use crate::{App, WindowId, term_lock};
 
 /// The engine's headless placeholder cell box (`Terminal::set_cell_pixel_size`
@@ -58,84 +57,11 @@ fn a_never_resized_window_reports_its_real_cell_box_to_every_session() {
     }
 }
 
-/// DEC 1016: a press in cell (3, 2) at sub-cell offset (4, 7) on a fresh tab
-/// resolves to `col*cell_w + 4`, `row*cell_h + 7` from the real font.
-#[test]
-fn dec_1016_on_a_fresh_tab_reports_pixels_from_the_real_font() {
-    let mut app = App::headless_for_test();
-    let wid = WindowId(0);
-    let (cw, ch) = window_with_a_big_cell(&mut app, wid);
-    app.apply_window_scale(wid);
-
-    let term = app.pool.get(0).expect("session 0").term.clone();
-    {
-        let mut t = term_lock(&term);
-        t.process(b"\x1b[?1000h"); // normal mouse tracking
-        t.process(b"\x1b[?1016h"); // SGR-pixel (DEC 1016)
-    }
-    let t = term_lock(&term);
-    let off = PixelOffset { x: 4, y: 7 };
-    assert_eq!(
-        crate::input::report_coords(&t, 3, 2, off),
-        (3 * cw + 4, 2 * ch + 7),
-        "a 1016 report on a never-resized tab must carry real device pixels"
-    );
-    assert_ne!(
-        crate::input::report_coords(&t, 3, 2, off),
-        (3 * PLACEHOLDER.0 + 4, 2 * PLACEHOLDER.1 + 7),
-        "...and must not be the 8x16 placeholder's answer"
-    );
-}
-
-/// OSC 1337: an image sized in pixels on a fresh tab occupies the footprint
-/// the real font implies (`ceil(px / cell)`); sized at 4x3 real cells.
-#[test]
-fn osc_1337_pixel_sizing_on_a_fresh_tab_uses_the_real_cell_box() {
-    let mut app = App::headless_for_test();
-    let wid = WindowId(0);
-    let (cw, ch) = window_with_a_big_cell(&mut app, wid);
-    app.apply_window_scale(wid);
-
-    let (want_cols, want_rows) = (4u16, 3u16);
-    let (px_w, px_h) = (u32::from(cw) * 4, u32::from(ch) * 3);
-    // A pixel-sized request never decodes the payload (only Auto sizing reads the PNG
-    // header), so any non-empty body exercises the same math.
-    let b64 = aterm_codec::base64::encode(b"cell-px-1").expect("base64");
-    let mut seq = format!("\x1b]1337;File=inline=1;width={px_w}px;height={px_h}px:").into_bytes();
-    seq.extend_from_slice(b64.as_bytes());
-    seq.extend_from_slice(b"\x1b\\");
-
-    let term = app.pool.get(0).expect("session 0").term.clone();
-    let mut t = term_lock(&term);
-    t.process(&seq);
-    assert_eq!(
-        t.images_row(0).len(),
-        usize::from(want_cols),
-        "the image must be {want_cols} REAL cells wide ({px_w}px / {cw}px per cell)"
-    );
-    assert_eq!(
-        t.images_row(usize::from(want_rows) - 1).len(),
-        usize::from(want_cols),
-        "...and its last row must be full width"
-    );
-    assert!(
-        t.images_row(usize::from(want_rows)).is_empty(),
-        "...and exactly {want_rows} real cells tall ({px_h}px / {ch}px per cell)"
-    );
-    assert_ne!(
-        usize::from(want_cols),
-        (px_w as usize).div_ceil(usize::from(PLACEHOLDER.0)),
-        "the placeholder must imply a DIFFERENT footprint, or this proves nothing"
-    );
-}
-
 /// A session is seeded with the cell box at construction (`spawn_session`),
 /// before any frame is drawn.
 #[test]
 fn a_newborn_live_engine_carries_the_owning_windows_cell_box() {
-    let build = |cell_px| {
-        crate::spawn::new_live_terminal(24, 80, None, aterm_types::Appearance::Dark, cell_px)
-    };
+    let build = |cell_px| crate::spawn::new_live_terminal(24, 80, None, cell_px);
     assert_eq!(build(Some((11, 23))).cell_pixel_size(), (11, 23));
     // `None` (the boot session, whose backend is still building) keeps the
     // placeholder — `sync_cell_pixel_size` corrects it at the first raster seam.
@@ -362,68 +288,6 @@ fn the_backend_join_does_not_end_an_adoption_pulse_hold_early() {
         libc::close(master);
         libc::close(slave);
     }
-}
-
-/// `spawn_session`'s `cell_px` accepts `None`, which keeps the 8x16 placeholder. Only the boot
-/// session (spawned before the backend build is joined) may pass it; every other spawn hands
-/// over its window's real cell box. Read from the sources: a headless harness cannot fork the
-/// PTYs these sites need.
-#[test]
-fn every_non_boot_spawn_site_hands_over_a_real_cell_box() {
-    let sources = [
-        ("app_tabs.rs", include_str!("app_tabs.rs")),
-        ("app_window.rs", include_str!("app_window.rs")),
-        ("app_restore.rs", include_str!("app_restore.rs")),
-        ("lib.rs", include_str!("lib.rs")),
-        // Every tab and split spawns here, on the spawner thread.
-        ("tab_spawn.rs", include_str!("tab_spawn.rs")),
-    ];
-    // The one justification a bare `None` may carry, written at the call.
-    const BOOT_MARKER: &str = "CELL-PX-1: the BOOT session has no metrics to be seeded from";
-    let mut wired = Vec::new();
-    let mut exempt = Vec::new();
-    let mut unwired = Vec::new();
-    for (file, src) in sources {
-        let lines: Vec<&str> = src.lines().collect();
-        for (n, line) in lines.iter().enumerate() {
-            if !line.trim_end().ends_with("spawn_session(") {
-                continue; // a mention in prose, not a call
-            }
-            // The argument list: `id, window, rows, cols, <cell_px>, ...`.
-            let args = lines[n..(n + 14).min(lines.len())].join("\n");
-            let site = format!("{file}:{}", n + 1);
-            // Both wired spellings: a hoisted `let cell_px` and `self.spawn_cell_px(wid)`.
-            if args.contains("cell_px") {
-                wired.push(site);
-            } else if args.contains(BOOT_MARKER) {
-                exempt.push(site);
-            } else {
-                unwired.push(site);
-            }
-        }
-    }
-    assert!(
-        unwired.is_empty(),
-        "a `spawn_session` call passes no `cell_px` and claims no boot \
-         exemption, so its newborn keeps the 8x16 placeholder: {unwired:?}"
-    );
-    assert!(
-        wired.len() >= 5,
-        "every tab / split / window / restore spawn must pass the owning \
-         window's cell box; only these do: {wired:?}"
-    );
-    // Exactly one bare `None`: the boot spawn in `main_entry`.
-    assert_eq!(
-        exempt.len(),
-        1,
-        "only the BOOT session may keep the placeholder (its backend is still \
-         building); these sites claim that exemption: {exempt:?}"
-    );
-    assert!(
-        exempt[0].starts_with("lib.rs:"),
-        "the boot exemption belongs to `main_entry` in lib.rs, not {:?}",
-        exempt[0]
-    );
 }
 
 /// The per-window memo avoids locks and never gates correctness: it keys on the resolved

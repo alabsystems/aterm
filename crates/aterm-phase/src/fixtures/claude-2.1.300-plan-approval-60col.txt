@@ -1,0 +1,22 @@
+# claude-code 2.1.300 · HAND-BUILT 2026-10-15 (no live capture yet): plan mode's approval as the 2.1.300 bundle's inline renderer draws it (the default: the managed launcher sets no CLAUDE_CODE_NO_FLICKER) in a 60-column pane — the `─` rule from column 0 (`Oa`), the question box `borderStyle:round` with only its top border and `paddingX:1`, so the 80-character `plan.proceed` question wraps after `execute.` at column 1, and the `ctrl+g to edit in Vim · <plan file>` hint wraps before the path; option 3's label wraps at the Select's label column · the sweep of 2026-10-15 (KI F3) read this screen idle
+⏺ Working on it.
+  ⎿  (tool output)
+
+────────────────────────────────────────────────────────────
+ Ready to code?
+
+ Here is Claude's plan:
+
+   1. Do the thing
+
+────────────────────────────────────────────────────────────
+ Claude has written up a plan and is ready to execute.
+ Would you like to proceed?
+
+ ❯ 1. Yes, and use auto mode
+   2. Yes, manually approve edits
+   3. No, keep planning · shift+tab to approve with this
+      feedback
+
+ ctrl+g to edit in Vim ·
+ ~/.claude/plans/staged-sniffing-newell.md

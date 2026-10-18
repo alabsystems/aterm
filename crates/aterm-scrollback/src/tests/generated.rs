@@ -7,25 +7,6 @@
 
 use super::*;
 
-/// Lines added to scrollback keep their relative order.
-#[test]
-fn scrollback_order_preserved() {
-    for line_count in 10usize..100 {
-        let mut sb = Scrollback::new(1000, 10000, 10_000_000);
-        for i in 0..line_count {
-            sb.push_str(&format!("Line_{i:04}"));
-        }
-        for i in 0..line_count {
-            let line = sb.get_line(i).unwrap();
-            assert_eq!(
-                line.map(|l| l.to_string()),
-                Some(format!("Line_{i:04}")),
-                "line {i} of {line_count}"
-            );
-        }
-    }
-}
-
 /// Content survives the hot -> warm -> cold transitions, and every line is
 /// found with its marker in whichever tier it landed.
 #[test]

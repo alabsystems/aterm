@@ -26,18 +26,13 @@ use crate::conn_card::{ConnCardHit, ConnCardState, PairKinds};
 
 impl App {
     /// The session's display title by sid: user meta title ▸ registry title
-    /// (the fleet-glance rung), or `None` for an unregistered sid.
+    /// (the fleet-glance rung, without an agent's spinner frame:
+    /// [`crate::session_store::SessionHandle::display_title`]), or `None` for
+    /// an unregistered sid.
     pub(crate) fn session_title_by_sid(&self, sid: &SessionId) -> Option<String> {
         let g = self.store.read().unwrap_or_else(|p| p.into_inner());
-        g.by_sid(sid).map(|h| {
-            h.ctx
-                .meta
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .get("title")
-                .map(str::to_string)
-                .unwrap_or_else(|| h.title.clone())
-        })
+        g.by_sid(sid)
+            .map(crate::session_store::SessionHandle::display_title)
     }
 
     /// The strip column of the tab chip hosting session `sid` in `wid`, the
@@ -448,6 +443,38 @@ mod tests {
             (snap[0].sid.clone(), snap[1].sid.clone())
         };
         (app, wid, a, b)
+    }
+
+    /// A SESSION'S NAME ON A CARD OR A PICKER DROPS AN AGENT'S SPINNER FRAME
+    /// (the Together run's D7, checked where else a title is snapshotted):
+    /// the registry's title `⠦ Add tested …` names the session `Add tested
+    /// …`. NEGATIVE CONTROL: a title the person set is theirs, whole.
+    #[test]
+    fn a_sessions_name_drops_an_agents_spinner_frame() {
+        let (app, _wid, a, _b) = app_with_pair();
+        let local = app.store.read().unwrap().by_sid(&a).unwrap().local_id;
+        app.store
+            .write()
+            .unwrap()
+            .set_title(local, "\u{2826} Add tested calculator functions");
+        assert_eq!(
+            app.session_title_by_sid(&a).as_deref(),
+            Some("Add tested calculator functions")
+        );
+        app.store
+            .read()
+            .unwrap()
+            .by_sid(&a)
+            .unwrap()
+            .ctx
+            .meta
+            .lock()
+            .unwrap()
+            .set("title", Some("\u{2826} deploy".to_string()));
+        assert_eq!(
+            app.session_title_by_sid(&a).as_deref(),
+            Some("\u{2826} deploy")
+        );
     }
 
     /// Opening seeds the default (S→T, both) and a self-pair is refused before

@@ -216,6 +216,33 @@ pub fn hidden_caret_withheld(term: &Terminal) -> bool {
     term.sync_frame_unfinished() || (!term.cursor_visible() && cursor_row_empty(term))
 }
 
+/// The echo anchor the motion engines may judge: [`Terminal::print_anchor`] and
+/// the glyph its run ended on ([`Terminal::print_anchor_glyph`]), or neither
+/// where [`motion_caret`] withholds the caret for the same reason: a hidden
+/// cursor on a frame the program has not finished
+/// ([`Terminal::sync_frame_unfinished`]). Read under the same lock as the
+/// caret.
+///
+/// The anchor is the other half of a write position. On a frame the program
+/// left half-written behind a hidden cursor, its last print run ended wherever
+/// the write stopped, as the cursor did. Claude Code's echo reprints the text
+/// after the caret, so a torn echo's run ends at the line's end, where no key
+/// was typed. The hidden-caret lane would spend the key in flight there, and
+/// the key's own cell would never be laid. Withheld, the engine keeps its
+/// previous sample and the lane idles; the finished frame hands over the
+/// anchor its write ended on, beside the caret it shows. A drawn caret is the
+/// program's account of where it typed whatever the frame's state (an
+/// unfinished latch outlives a program that died mid-frame), so its anchor
+/// passes, as the caret does.
+#[must_use]
+pub fn motion_print_anchor(term: &Terminal) -> (Option<(u16, u16, u64)>, Option<char>) {
+    if term.sync_frame_unfinished() && !term.cursor_visible() {
+        (None, None)
+    } else {
+        (term.print_anchor(), term.print_anchor_glyph())
+    }
+}
+
 fn cursor_row_empty(term: &Terminal) -> bool {
     let grid = term.grid();
     let row = term.cursor().row;
@@ -224,9 +251,7 @@ fn cursor_row_empty(term: &Terminal) -> bool {
 
 /// Whether `cell` puts anything on the glass: a glyph, a background, or a
 /// decoration a space still shows (inverse, a line under, through or over it).
-/// A foreground colour, bold, dim, italic or blink on a space draws nothing. A
-/// cell whose colours live in the style table counts, since its background
-/// cannot be read here.
+/// A foreground colour, bold, dim, italic or blink on a space draws nothing.
 fn draws_ink(cell: &aterm_core::grid::Cell) -> bool {
     use aterm_core::grid::CellFlags;
     let flags = cell.flags();
@@ -234,7 +259,7 @@ fn draws_ink(cell: &aterm_core::grid::Cell) -> bool {
         .union(CellFlags::ALL_UNDERLINES)
         .union(CellFlags::STRIKETHROUGH);
     cell.char_data() != u16::from(b' ')
-        || flags.intersects(CellFlags::COMPLEX.union(CellFlags::USES_STYLE_ID))
+        || flags.contains(CellFlags::COMPLEX)
         || !cell.colors().bg_is_default()
         || flags.intersects(shows_on_a_space)
         // OVERLINE is SUPERSCRIPT | SUBSCRIPT: only both bits draw a line; a
@@ -266,8 +291,6 @@ pub struct SingFacts {
 pub enum PressOutcome {
     Pass = 0,
     Pet = 1,
-    Robi = 2,
-    RobiBubble = 3,
 }
 
 /// One scheduling verdict: `Frames` == `is_active()` (a frame-cadence lane);
@@ -415,6 +438,55 @@ mod tests {
 
         // History still withdraws the caret from everyone.
         assert_eq!(motion_caret(None, true, false), None);
+    }
+
+    /// Claude Code's mid-line echo torn before its parking CUP: the print run
+    /// ends at the reprinted tail's end, a write position, so no anchor is
+    /// handed over. Controls: the finished echo's anchor passes, and so do the
+    /// anchor of a frame closed and reopened with nothing written and the
+    /// anchor beside a drawn caret on an unfinished frame (a program that died
+    /// mid-frame leaves the latch set under the shell's prompt).
+    #[test]
+    fn an_unfinished_frames_print_anchor_is_no_echo_for_the_motion_engines() {
+        let mut term = Terminal::new(10, 40);
+        term.process(b"\x1b[8;1H> the tail.\x1b[8;6H");
+        let finished = motion_print_anchor(&term);
+        assert!(
+            finished.0.is_some(),
+            "a finished frame hands its anchor over"
+        );
+        assert_eq!(finished, (term.print_anchor(), term.print_anchor_glyph()));
+
+        // The Space's echo, cut before its park: the tail reprinted from the
+        // landing column, the caret still hidden.
+        term.process(b"\x1b[?2026h\x1b[?25l\x1b[H\r\x1b[6C\x1b[7B the tail.");
+        assert!(term.sync_frame_unfinished());
+        assert!(
+            term.print_anchor().is_some(),
+            "control: the run ended somewhere"
+        );
+        assert_eq!(motion_print_anchor(&term), (None, None), "a write position");
+
+        // The rest lands: the frame is finished and its anchor passes.
+        term.process(b"\x1b[10;1H\x1b[8;7H\x1b[?25h\x1b[?2026l");
+        let after = motion_print_anchor(&term);
+        assert_eq!(after, (term.print_anchor(), term.print_anchor_glyph()));
+        assert!(
+            after
+                .0
+                .is_some_and(|(_, _, seq)| finished.0.is_some_and(|(_, _, s0)| seq > s0))
+        );
+
+        // Reopened with nothing written: the grid is the finished frame.
+        term.process(b"\x1b[?2026h");
+        assert_eq!(motion_print_anchor(&term), after);
+
+        // Written into with the caret drawn: the anchor passes beside it.
+        term.process(b"\x1b[9;1H$ ls");
+        assert!(term.sync_frame_unfinished() && term.cursor_visible());
+        let drawn = motion_print_anchor(&term);
+        assert_eq!(drawn, (term.print_anchor(), term.print_anchor_glyph()));
+        assert!(drawn.0.is_some_and(|(row, _, _)| row == 8));
     }
 
     /// Claude Code's question dialog on its last option: the hidden cursor moves

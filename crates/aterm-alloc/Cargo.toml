@@ -12,10 +12,5 @@ description = "Inline-optimized collections for aterm: SmallVec + ArrayVec with 
 [dependencies]
 # None — `#![no_std]`, core + alloc only
 
-[dev-dependencies]
-# The patch target, so `tests/arrayvec_differential.rs` can check it names this
-# crate's `ArrayVec`.
-arrayvec_shim = { package = "arrayvec", path = "../aterm-arrayvec" }
-
 [lints]
 workspace = true

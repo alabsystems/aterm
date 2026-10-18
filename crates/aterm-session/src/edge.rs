@@ -324,6 +324,16 @@ impl EdgeTable {
         }
     }
 
+    /// Retain only grants for `op` in this table. Hosts can retire write
+    /// authority while sharing the same read grants with closed-log readers
+    /// and already-resolved revokers; no row moves to a second table.
+    // Skip: `HashMap::retain` does not allocate and the derived Op equality
+    // is panic-free. Same audited tier as `revoke_src_ops`.
+    #[cfg_attr(trust_verify, trust::skip)]
+    pub fn keep_only(&mut self, op: Op) {
+        self.rows.retain(|_, e| e.op == op);
+    }
+
     /// The source bound to a token, for audit (`who injected into whom`).
     #[must_use]
     pub fn src_of(&self, token: &EdgeToken) -> Option<&SessionId> {
@@ -438,6 +448,27 @@ mod tests {
             "an unknown op must not parse"
         );
         assert_eq!(Op::parse(""), None);
+    }
+
+    /// Retained grants keep their token identity and remain revocable;
+    /// grants for other operations are removed from the same table.
+    #[test]
+    fn retaining_an_op_preserves_its_grants_and_removes_others() {
+        let (a, b, nonce) = ids();
+        let mut tbl = EdgeTable::new();
+        let read = tbl.grant(a.clone(), b.clone(), Op::ReadScreen, nonce);
+        let write = tbl.grant(a.clone(), b.clone(), Op::WriteInput, nonce);
+        assert!(
+            decide_edge(&tbl, &write, &b, Op::WriteInput, &nonce).is_permitted(),
+            "positive control: the write was granted"
+        );
+        tbl.keep_only(Op::ReadScreen);
+        assert_eq!(tbl.len(), 1);
+        assert!(decide_edge(&tbl, &read, &b, Op::ReadScreen, &nonce).is_permitted());
+        assert!(!decide_edge(&tbl, &write, &b, Op::WriteInput, &nonce).is_permitted());
+        assert!(!tbl.revoke(&write), "the write grant was removed");
+        assert_eq!(tbl.revoke_src(&a), 1);
+        assert!(!decide_edge(&tbl, &read, &b, Op::ReadScreen, &nonce).is_permitted());
     }
 
     #[test]

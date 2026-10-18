@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Predictive echo never paints a keystroke the program will not echo.
+//! Predictive echo never paints a keystroke the program will not echo, nor a
+//! guess or a cursor where the echo will not land.
 //!
 //! Driven end to end on a headless App: presses go through [`App::input`] (the
 //! press path that arms guesses), the program's output goes into the focused
@@ -427,4 +428,78 @@ fn a_tty_that_will_not_echo_is_never_predicted() {
         libc::close(slave);
         libc::close(master);
     }
+}
+
+// --- Where a guess is placed and where the cursor is drawn ---------------------
+
+/// Under `ambiguous_width = "wide"` the grid writes `é` two cells wide, so the
+/// press path tells the predictor (`set_ambiguous_width_double`, read off the
+/// focused terminal at the key) and `é` is declined like CJK rather than guessed
+/// one cell where its echo takes two. Under the narrow policy the same press is
+/// a guess (the control), so the wide refusal is the call's doing.
+#[test]
+fn the_press_path_measures_a_glyph_with_the_terminals_ambiguous_width() {
+    for wide in [false, true] {
+        let mut rig = Rig::new("always");
+        if wide {
+            let config = aterm_core::config::TerminalConfig {
+                ambiguous_width_double: true,
+                ..aterm_core::config::TerminalConfig::default()
+            };
+            let term = rig.app.pool.get(rig.focus).expect("focus").term.clone();
+            term_lock(&term).apply_config(&config);
+        }
+        rig.key(glyph('é'));
+        let pending = rig.app.windows[&rig.wid].predictor.pending().count();
+        assert_eq!(
+            pending,
+            usize::from(!wide),
+            "wide={wide}: `é` is a guess exactly when the grid writes it one cell wide"
+        );
+    }
+}
+
+/// The composed present draws the cursor one past the newest guess it PAINTED.
+/// The program left `" 日"` after the prompt and the cursor back on the blank;
+/// `b` is guessed on the blank, `c` on `日`'s lead, which the painter refuses.
+/// One past `c` would be `日`'s right half, under a block cursor; the cursor goes
+/// one past `b` instead, onto the cell `c` will echo on.
+#[test]
+fn the_composed_cursor_never_covers_half_of_a_wide_glyph() {
+    let mut rig = Rig::new("always");
+    rig.feed(" 日\x1b[3D");
+    assert_eq!(rig.cursor(), (rig.bottom, 2), "fixture: back on the blank");
+    rig.key(glyph('b'));
+    rig.key(glyph('c'));
+    assert_eq!(
+        rig.app.windows[&rig.wid].predictor.pending().count(),
+        2,
+        "fixture: both glyphs are guessed"
+    );
+    rig.present(Instant::now());
+    assert_eq!(
+        rig.on_glass(rig.bottom, 2),
+        'b',
+        "the blank takes its ghost"
+    );
+    assert_eq!(
+        rig.on_glass(rig.bottom, 3),
+        '日',
+        "the wide glyph refuses one"
+    );
+    let ws = rig.app.windows.get(&rig.wid).expect("window");
+    let tree = &ws.layouts[ws.tabs.active];
+    let rect = *tree
+        .compute_layout(ws.rows, ws.cols)
+        .iter()
+        .find(|r| r.session == rig.focus)
+        .expect("focused leaf");
+    assert_eq!(
+        (ws.input_scratch.cursor_row, ws.input_scratch.cursor_col),
+        (
+            usize::from(rect.row_off) + rig.bottom,
+            usize::from(rect.col_off) + 3
+        ),
+        "one past `b`, on `日`'s lead — not one past the refused `c`, on its right half"
+    );
 }

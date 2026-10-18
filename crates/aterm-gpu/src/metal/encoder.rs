@@ -43,7 +43,7 @@ use std::sync::Arc;
 use super::ffi::{
     AutoreleasePool, ClassPtr, Device, Id, LOAD_ACTION_CLEAR, LOAD_ACTION_LOAD, LoadAction,
     MtlOrigin, MtlScissorRect, MtlSize, MtlViewport, Obj, PixelFormat, PrimitiveType,
-    STORE_ACTION_STORE, Sel, class, msg, sel, texture_height, texture_pixel_format_raw,
+    STORE_ACTION_STORE, Sel, checked_msg, class, sel, texture_height, texture_pixel_format_raw,
     texture_width,
 };
 use super::loss;
@@ -159,7 +159,7 @@ impl EncodeSession {
         // SAFETY: `commandBuffer` returns a +0 buffer owned by the pool; it is
         // retained to +1 to outlive the pop.
         let cb = unsafe {
-            let get: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+            let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             let raw = get(self.queue.id(), sel(c"commandBuffer"));
             Obj::retain(raw).ok_or_else(|| "commandBuffer returned nil".to_owned())?
         };
@@ -233,28 +233,29 @@ impl<'s> CommandBuffer<'s> {
         // prototype written out.
         let enc = unsafe {
             let rp_cls = class(c"MTLRenderPassDescriptor");
-            let mk: unsafe extern "C" fn(ClassPtr, Sel) -> Id = msg();
+            let mk: unsafe extern "C-unwind" fn(ClassPtr, Sel) -> Id = checked_msg();
             let rp = mk(rp_cls, sel(c"renderPassDescriptor"));
 
-            let get: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+            let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             let atts = get(rp, sel(c"colorAttachments"));
-            let sub: unsafe extern "C" fn(Id, Sel, usize) -> Id = msg();
+            let sub: unsafe extern "C-unwind" fn(Id, Sel, usize) -> Id = checked_msg();
             let a0 = sub(atts, sel(c"objectAtIndexedSubscript:"), 0);
 
-            let set_obj: unsafe extern "C" fn(Id, Sel, Id) = msg();
+            let set_obj: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
             set_obj(a0, sel(c"setTexture:"), target.id());
-            let set_usize: unsafe extern "C" fn(Id, Sel, usize) = msg();
+            let set_usize: unsafe extern "C-unwind" fn(Id, Sel, usize) = checked_msg();
             set_usize(a0, sel(c"setStoreAction:"), STORE_ACTION_STORE);
             match desc.load {
                 LoadAction::Clear(c) => {
                     set_usize(a0, sel(c"setLoadAction:"), LOAD_ACTION_CLEAR);
-                    let set_clear: unsafe extern "C" fn(Id, Sel, super::ffi::ClearColor) = msg();
+                    let set_clear: unsafe extern "C-unwind" fn(Id, Sel, super::ffi::ClearColor) =
+                        checked_msg();
                     set_clear(a0, sel(c"setClearColor:"), c);
                 }
                 LoadAction::Load => set_usize(a0, sel(c"setLoadAction:"), LOAD_ACTION_LOAD),
             }
 
-            let mk_enc: unsafe extern "C" fn(Id, Sel, Id) -> Id = msg();
+            let mk_enc: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Id = checked_msg();
             let raw = mk_enc(
                 self.cb.id(),
                 sel(c"renderCommandEncoderWithDescriptor:"),
@@ -360,9 +361,9 @@ impl<'s> CommandBuffer<'s> {
         // SAFETY: `blitCommandEncoder` returns an autoreleased encoder owned by
         // the pool through `endEncoding`. The rects were validated above.
         unsafe {
-            let get: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+            let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             let blit = get(self.cb.id(), sel(c"blitCommandEncoder"));
-            let copy: unsafe extern "C" fn(
+            let copy: unsafe extern "C-unwind" fn(
                 Id,
                 Sel,
                 Id,
@@ -374,7 +375,7 @@ impl<'s> CommandBuffer<'s> {
                 usize,
                 usize,
                 MtlOrigin,
-            ) = msg();
+            ) = checked_msg();
             copy(
                 blit,
                 sel(
@@ -395,7 +396,7 @@ toTexture:destinationSlice:destinationLevel:destinationOrigin:",
                 0,
                 MtlOrigin { x: dx, y: dy, z: 0 },
             );
-            let void_msg: unsafe extern "C" fn(Id, Sel) = msg();
+            let void_msg: unsafe extern "C-unwind" fn(Id, Sel) = checked_msg();
             void_msg(blit, sel(c"endEncoding"));
         }
         Ok(())
@@ -461,9 +462,9 @@ toTexture:destinationSlice:destinationLevel:destinationOrigin:",
         // SAFETY: as `copy_texture_sub_rect` — pooled autoreleased blit
         // encoder; the copy's stride/extent/length were validated above.
         unsafe {
-            let get: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+            let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             let blit = get(self.cb.id(), sel(c"blitCommandEncoder"));
-            let copy: unsafe extern "C" fn(
+            let copy: unsafe extern "C-unwind" fn(
                 Id,
                 Sel,
                 Id,
@@ -475,7 +476,7 @@ toTexture:destinationSlice:destinationLevel:destinationOrigin:",
                 usize,
                 usize,
                 usize,
-            ) = msg();
+            ) = checked_msg();
             copy(
                 blit,
                 sel(c"copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toBuffer:destinationOffset:destinationBytesPerRow:destinationBytesPerImage:"),
@@ -493,7 +494,7 @@ toTexture:destinationSlice:destinationLevel:destinationOrigin:",
                 bytes_per_row,
                 need,
             );
-            let void_msg: unsafe extern "C" fn(Id, Sel) = msg();
+            let void_msg: unsafe extern "C-unwind" fn(Id, Sel) = checked_msg();
             void_msg(blit, sel(c"endEncoding"));
         }
         Ok(())
@@ -505,7 +506,7 @@ toTexture:destinationSlice:destinationLevel:destinationOrigin:",
         // SAFETY: `commit` is a void message on the owned command buffer; all
         // encoders are ended (the `&mut` borrow rule) barring `mem::forget`.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) = checked_msg();
             f(self.cb.id(), sel(c"commit"));
         }
         Submitted {
@@ -552,7 +553,7 @@ impl PassEncoder<'_, '_> {
         self.pipeline_set.set(true);
         // SAFETY: plain object-argument message on the live encoder.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, Id) = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
             f(self.enc.id(), sel(c"setRenderPipelineState:"), pso.id());
         }
     }
@@ -562,7 +563,7 @@ impl PassEncoder<'_, '_> {
         // SAFETY: plain message on the live encoder; the encoder retains what
         // it needs for the pass.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, Id, usize) = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, Id, usize) = checked_msg();
             f(
                 self.enc.id(),
                 sel(c"setFragmentTexture:atIndex:"),
@@ -576,7 +577,7 @@ impl PassEncoder<'_, '_> {
     pub(crate) fn set_fragment_sampler(&self, sampler: &Obj, index: usize) {
         // SAFETY: as `set_fragment_texture`.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, Id, usize) = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, Id, usize) = checked_msg();
             f(
                 self.enc.id(),
                 sel(c"setFragmentSamplerState:atIndex:"),
@@ -590,7 +591,7 @@ impl PassEncoder<'_, '_> {
     pub(crate) fn set_fragment_buffer(&self, buf: &Obj, index: usize) {
         // SAFETY: as `set_fragment_texture`.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, Id, usize, usize) = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, Id, usize, usize) = checked_msg();
             f(
                 self.enc.id(),
                 sel(c"setFragmentBuffer:offset:atIndex:"),
@@ -613,7 +614,7 @@ impl PassEncoder<'_, '_> {
         }
         // SAFETY: as `set_fragment_buffer`.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, Id, usize, usize) = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, Id, usize, usize) = checked_msg();
             f(
                 self.enc.id(),
                 sel(c"setVertexBuffer:offset:atIndex:"),
@@ -626,7 +627,7 @@ impl PassEncoder<'_, '_> {
     }
 
     /// Bind the per-instance stream at [`super::ffi::INSTANCE_STREAM_SLOT`], the
-    /// slot the MSL scan keeps clear. Any other index lands on the uniforms.
+    /// slot no MSL uniform block uses. Any other index lands on the uniforms.
     pub(crate) fn set_instance_stream(&self, stream: &Obj) {
         self.set_instance_stream_at(stream, 0);
     }
@@ -638,7 +639,7 @@ impl PassEncoder<'_, '_> {
         self.stream_set.set(true);
         // SAFETY: as `set_fragment_buffer`.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, Id, usize, usize) = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, Id, usize, usize) = checked_msg();
             f(
                 self.enc.id(),
                 sel(c"setVertexBuffer:offset:atIndex:"),
@@ -654,7 +655,7 @@ impl PassEncoder<'_, '_> {
         // SAFETY: `MTLScissorRect` travels indirectly per its ffi doc; plain
         // message on the live encoder.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, MtlScissorRect) = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, MtlScissorRect) = checked_msg();
             f(self.enc.id(), sel(c"setScissorRect:"), sc);
         }
     }
@@ -663,7 +664,7 @@ impl PassEncoder<'_, '_> {
     pub(crate) fn set_viewport(&self, vp: MtlViewport) {
         // SAFETY: `MTLViewport` travels indirectly per its ffi doc.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, MtlViewport) = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, MtlViewport) = checked_msg();
             f(self.enc.id(), sel(c"setViewport:"), vp);
         }
     }
@@ -719,7 +720,7 @@ impl PassEncoder<'_, '_> {
         }
         // SAFETY: plain message on the live encoder; four NSUInteger args.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, usize, usize, usize, usize) = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, usize, usize, usize, usize) = checked_msg();
             f(
                 self.enc.id(),
                 sel(c"drawPrimitives:vertexStart:vertexCount:instanceCount:"),
@@ -737,7 +738,7 @@ impl Drop for PassEncoder<'_, '_> {
     fn drop(&mut self) {
         // SAFETY: `endEncoding` is sent exactly once, from drop.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) = checked_msg();
             f(self.enc.id(), sel(c"endEncoding"));
         }
     }
@@ -774,7 +775,7 @@ impl CbProbe {
         // SAFETY: `waitUntilCompleted` is a void message on the owned +1
         // command buffer; it returns once the status is terminal.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) = checked_msg();
             f(self.cb.id(), sel(c"waitUntilCompleted"));
         }
         loss::outcome_of(self.cb.id())
@@ -809,7 +810,7 @@ impl Submitted {
         // SAFETY: `waitUntilCompleted` is a void message on the owned +1
         // command buffer; it returns once the status is terminal.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) = checked_msg();
             f(self.cb.id(), sel(c"waitUntilCompleted"));
         }
         self.settle_terminal(loss::outcome_of(self.cb.id()))
@@ -846,65 +847,11 @@ impl Submitted {
 mod tests {
     use super::*;
     use crate::metal::ffi::{
-        self, ClearColor, SamplerDesc, TEXTURE_USAGE_PIXEL_FORMAT_VIEW,
-        TEXTURE_USAGE_RENDER_TARGET, TEXTURE_USAGE_SHADER_READ,
+        self, ClearColor, TEXTURE_USAGE_PIXEL_FORMAT_VIEW, TEXTURE_USAGE_RENDER_TARGET,
+        TEXTURE_USAGE_SHADER_READ,
     };
     use crate::metal::pipelines;
-    use crate::metal::test_support::{CellUniforms, as_bytes, device};
-    use crate::pipeline_table::Pipeline;
-
-    /// Pack `BgInstance`s (tight 12 bytes: `[u16;4]` rect + `[u8;4]` colour).
-    fn bg_stream(instances: &[([u16; 4], [u8; 4])]) -> Vec<u8> {
-        let mut out = Vec::new();
-        for (rect, colour) in instances {
-            for v in rect {
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-            out.extend_from_slice(colour);
-        }
-        out
-    }
-
-    /// Pack FLAT `GlowInstance`s (tight 16 bytes: `[u16;4]` rect + the
-    /// `[u8;4]` colour at BOTH ends of the ramp) for the glow-family rows.
-    fn glow_stream(instances: &[([u16; 4], [u8; 4])]) -> Vec<u8> {
-        let mut out = Vec::new();
-        for (rect, colour) in instances {
-            for v in rect {
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-            out.extend_from_slice(colour);
-            out.extend_from_slice(colour);
-        }
-        out
-    }
-
-    /// One `GlyphInstance` fixture: rect, uv, colour, bg.
-    type GlyphFixture = ([f32; 4], [f32; 4], [u8; 4], [u8; 4]);
-
-    /// Pack `GlyphInstance`s (40 bytes: `f32x4` rect + `f32x4` uv + colour +
-    /// bg, both `Unorm8x4`).
-    fn glyph_stream(instances: &[GlyphFixture]) -> Vec<u8> {
-        let mut out = Vec::new();
-        for (rect, uv, colour, bg) in instances {
-            for v in rect {
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-            for v in uv {
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-            out.extend_from_slice(colour);
-            out.extend_from_slice(bg);
-        }
-        out
-    }
-
-    fn shared_buffer(dev: &Device, bytes: &[u8]) -> Obj {
-        let buf = dev.new_buffer(bytes.len()).expect("buffer");
-        // SAFETY: fresh exactly-sized shared buffer; no GPU work in flight.
-        unsafe { ffi::buffer_write(&buf, bytes) };
-        buf
-    }
+    use crate::metal::test_support::device;
 
     /// An `Rgba8Unorm` texture holding `bytes` (tight stride), sealed in
     /// `mint`'s loss domain.
@@ -921,572 +868,6 @@ mod tests {
         // stride.
         unsafe { tex.upload(ffi::MtlRegion::full_2d(w, h), bytes, w * 4) };
         tex
-    }
-
-    const BLACK: LoadAction = LoadAction::Clear(ClearColor {
-        r: 0.0,
-        g: 0.0,
-        b: 0.0,
-        a: 1.0,
-    });
-
-    /// A multi-pass, multi-draw scene through one command buffer byte-matches
-    /// the same content drawn by repeated one-shot [`ffi::draw_and_read`] calls.
-    ///
-    /// * Two passes on the two views of one offscreen: pass 1 on the sRGB view
-    ///   (Clear, with its own scissor that clips content), pass 2 on the Unorm
-    ///   base (Load, a glow scissored to a rect that extends past pass 1's).
-    /// * Pipeline switches inside pass 1 (bg, color_glyph, cursor_blend,
-    ///   color_glyph) and atlas switches (A, B, A).
-    /// * Passes 3 and 4 on an aux target: an opaque cover, then `Clear(MID)`
-    ///   plus a small quad, so a Clear encoded as Load fails on known bytes.
-    /// * Decoy binds one slot over the real ones (texture, sampler, vertex
-    ///   buffer), which clobber the real bind if indices are ignored or
-    ///   transposed.
-    ///
-    /// The reference arm reads back after every step and checks each draw
-    /// changed only its own rect. Equality is exact.
-    #[test]
-    fn a_multi_pass_multi_draw_scene_matches_repeated_one_shot_draws() {
-        let dev = device();
-        let _test_pool = AutoreleasePool::new();
-        let latch = Arc::new(loss::LossLatch::new());
-        let session = EncodeSession::new(&dev, Arc::clone(&latch)).expect("session");
-        let mint = super::super::resources::MetalResourceDevice::new(&dev, Arc::clone(&latch));
-
-        const W: usize = 16;
-        const H: usize = 16;
-
-        // The four table rows of the scene.
-        let cell = pipelines::compile_library(&dev, crate::pipeline_table::ShaderLibrary::Cell)
-            .expect("cell.metal");
-        let present = PixelFormat::Bgra8Unorm; // irrelevant to offscreen rows
-        let build = |p: Pipeline| {
-            pipelines::build(&dev, &cell, p.spec(), present)
-                .unwrap_or_else(|e| panic!("{} build: {e}", p.name()))
-        };
-        let bg = build(Pipeline::Bg);
-        let color_glyph = build(Pipeline::ColorGlyph);
-        let cursor = build(Pipeline::CursorBlend);
-        let glow = build(Pipeline::GlowAdd);
-        assert_eq!(
-            pipelines::metal_format(Pipeline::ColorGlyph.spec().target, present),
-            PixelFormat::Rgba8UnormSrgb,
-            "the glyph draws attach the sRGB view"
-        );
-        assert_eq!(
-            pipelines::metal_format(Pipeline::GlowAdd.spec().target, present),
-            PixelFormat::Rgba8Unorm,
-            "the glow pass attaches the Unorm base"
-        );
-
-        // Two DIFFERENT atlases, so a dropped rebind is a byte diff.
-        let pattern_a: Vec<u8> = (0..8usize * 8)
-            .flat_map(|i| {
-                let (x, y) = (i % 8, i / 8);
-                [(x * 31) as u8, (y * 29) as u8, 200, 255]
-            })
-            .collect();
-        let pattern_b: Vec<u8> = (0..8usize * 8)
-            .flat_map(|i| {
-                let (x, y) = (i % 8, i / 8);
-                [40, (x * 23 + 7) as u8, (y * 27 + 11) as u8, 255]
-            })
-            .collect();
-        assert_ne!(pattern_a, pattern_b, "the two atlases must differ");
-        let atlas_a = uploaded_texture(&mint, 8, 8, &pattern_a);
-        let atlas_b = uploaded_texture(&mint, 8, 8, &pattern_b);
-        let sampler = dev
-            .new_sampler(SamplerDesc::NEAREST_CLAMP)
-            .expect("sampler");
-        // Decoy sampler: linear, so if it clobbers slot 0 the glyph bytes
-        // change.
-        let decoy_sampler = dev
-            .new_sampler(SamplerDesc::LINEAR_CLAMP)
-            .expect("decoy sampler");
-
-        #[expect(clippy::cast_precision_loss, reason = "16-texel extents")]
-        let uniforms = CellUniforms {
-            screen: [W as f32, H as f32],
-            text_blend: 0.0,
-            pad: 0.0,
-        };
-        // SAFETY: `repr(C)` into an exactly-sized fresh shared buffer.
-        let ubuf = shared_buffer(&dev, unsafe { as_bytes(&uniforms) });
-        // Decoy uniforms: a half-size screen, so clobbering slot 0 doubles every
-        // quad.
-        let wrong_uniforms = CellUniforms {
-            screen: [8.0, 8.0],
-            text_blend: 0.0,
-            pad: 0.0,
-        };
-        // SAFETY: as above.
-        let wrong_ubuf = shared_buffer(&dev, unsafe { as_bytes(&wrong_uniforms) });
-
-        // One stream per draw, so the reference arm can rebind the identical
-        // buffer per one-shot call.
-        let s_bg = shared_buffer(
-            &dev,
-            &bg_stream(&[
-                ([0, 0, 8, 8], [200, 40, 120, 255]),
-                ([8, 8, 8, 8], [40, 200, 90, 255]),
-            ]),
-        );
-        let s_glyph_a1 = shared_buffer(
-            &dev,
-            &glyph_stream(&[(
-                [1.0, 1.0, 4.0, 4.0],
-                [0.0, 0.0, 1.0, 1.0],
-                [255, 255, 255, 255],
-                [0, 0, 0, 255],
-            )]),
-        );
-        let s_cursor = shared_buffer(&dev, &bg_stream(&[([10, 2, 4, 4], [230, 180, 40, 140])]));
-        let s_glyph_b = shared_buffer(
-            &dev,
-            &glyph_stream(&[(
-                [9.0, 1.0, 4.0, 4.0],
-                [0.0, 0.0, 1.0, 1.0],
-                [255, 255, 255, 255],
-                [0, 0, 0, 255],
-            )]),
-        );
-        let s_glyph_a2 = shared_buffer(
-            &dev,
-            &glyph_stream(&[(
-                [2.0, 9.0, 4.0, 4.0],
-                [0.25, 0.25, 0.5, 0.5],
-                [255, 255, 255, 255],
-                [0, 0, 0, 255],
-            )]),
-        );
-        let s_glow = shared_buffer(
-            &dev,
-            &glow_stream(&[
-                ([0, 0, 16, 16], [30, 60, 20, 255]),
-                ([6, 6, 6, 6], [90, 10, 50, 180]),
-            ]),
-        );
-        const GLOW_SCISSOR: MtlScissorRect = MtlScissorRect {
-            x: 4,
-            y: 4,
-            width: 8,
-            height: 8,
-        };
-        // Pass 1's scissor clips at y = 10, inside the second bg quad and the
-        // last glyph, and above the bottom rows of GLOW_SCISSOR, so pass 1's
-        // clipping is observable and pass 2 escapes it.
-        const PASS1_SCISSOR: MtlScissorRect = MtlScissorRect {
-            x: 0,
-            y: 0,
-            width: 16,
-            height: 10,
-        };
-        // Aux-target fixtures for the Clear-erases proof (passes 3 and 4).
-        const COVER: [u8; 4] = [210, 120, 60, 255];
-        const SMALL: [u8; 4] = [10, 240, 10, 255];
-        const SMALL_RECT: [u16; 4] = [1, 1, 3, 3];
-        const MID_CLEAR: LoadAction = LoadAction::Clear(ClearColor {
-            r: 0.5,
-            g: 0.25,
-            b: 0.75,
-            a: 1.0,
-        });
-        let s_cover = shared_buffer(&dev, &bg_stream(&[([0, 0, 16, 16], COVER)]));
-        let s_small = shared_buffer(&dev, &bg_stream(&[(SMALL_RECT, SMALL)]));
-
-        let offscreen = |dev: &Device| {
-            dev.new_texture_2d(
-                PixelFormat::Rgba8Unorm,
-                W,
-                H,
-                TEXTURE_USAGE_RENDER_TARGET
-                    | TEXTURE_USAGE_SHADER_READ
-                    | TEXTURE_USAGE_PIXEL_FORMAT_VIEW,
-            )
-            .expect("offscreen")
-        };
-
-        let row = W * PixelFormat::Rgba8Unorm.bytes_per_texel();
-        let quad6 = super::super::pipelines::metal_primitive_type(Pipeline::Bg.spec().topology);
-        // Binding slots come from the table's `BindSpec`; the decoys sit one
-        // slot over the real ones.
-        let vu = Pipeline::Bg
-            .spec()
-            .binds
-            .vertex_uniform
-            .expect("the cell rows have a vertex uniform") as usize;
-        let glyph_binds = Pipeline::ColorGlyph.spec().binds;
-        let (atlas_tex_slot, atlas_samp_slot) = (
-            glyph_binds.fragment_textures[0] as usize,
-            glyph_binds.fragment_samplers[0] as usize,
-        );
-
-        // ---- Reference arm: repeated one-shot draw_and_read ------------
-        let one_tex = offscreen(&dev);
-        let one_srgb = ffi::texture_view(&one_tex, PixelFormat::Rgba8UnormSrgb).expect("view");
-        let rb = dev.new_buffer(row * H).expect("readback");
-        let mut steps: Vec<Vec<u8>> = Vec::new();
-        let mut one_shot = |pso: &Obj,
-                            dst: &Obj,
-                            load: LoadAction,
-                            scissor: Option<MtlScissorRect>,
-                            tex: Option<&Obj>,
-                            stream: &Obj,
-                            instances: usize| {
-            ffi::draw_and_read(
-                session.one_shot_queue(),
-                &ffi::Pass {
-                    pso,
-                    dst,
-                    dst_w: W,
-                    dst_h: H,
-                    load,
-                    viewport: None,
-                    scissor,
-                    src_tex: tex.map(|t| (t, atlas_tex_slot)),
-                    sampler: tex.map(|_| (&sampler, atlas_samp_slot)),
-                    uniform: None,
-                    vertex_uniform: Some((&ubuf, vu)),
-                    draw: Some(ffi::DrawCall {
-                        primitive: quad6,
-                        vertices: 6,
-                        instances,
-                        stream: Some(stream),
-                    }),
-                },
-                &rb,
-                row,
-            )
-            .expect("one-shot draw");
-            // SAFETY: shared storage, written before draw_and_read returned.
-            steps.push(unsafe { ffi::buffer_bytes(&rb, row * H) });
-        };
-        one_shot(&bg, &one_srgb, BLACK, Some(PASS1_SCISSOR), None, &s_bg, 2);
-        one_shot(
-            &color_glyph,
-            &one_srgb,
-            LoadAction::Load,
-            Some(PASS1_SCISSOR),
-            Some(atlas_a.obj()),
-            &s_glyph_a1,
-            1,
-        );
-        one_shot(
-            &cursor,
-            &one_srgb,
-            LoadAction::Load,
-            Some(PASS1_SCISSOR),
-            None,
-            &s_cursor,
-            1,
-        );
-        one_shot(
-            &color_glyph,
-            &one_srgb,
-            LoadAction::Load,
-            Some(PASS1_SCISSOR),
-            Some(atlas_b.obj()),
-            &s_glyph_b,
-            1,
-        );
-        one_shot(
-            &color_glyph,
-            &one_srgb,
-            LoadAction::Load,
-            Some(PASS1_SCISSOR),
-            Some(atlas_a.obj()),
-            &s_glyph_a2,
-            1,
-        );
-        one_shot(
-            &glow,
-            &one_tex,
-            LoadAction::Load,
-            Some(GLOW_SCISSOR),
-            None,
-            &s_glow,
-            2,
-        );
-        // The aux reference: full opaque cover, then Clear(MID) + small quad —
-        // the deterministic content the Clear-erases proof stands on.
-        let aux_ref = offscreen(&dev);
-        let aux_ref_srgb = ffi::texture_view(&aux_ref, PixelFormat::Rgba8UnormSrgb).expect("view");
-        one_shot(&bg, &aux_ref_srgb, BLACK, None, None, &s_cover, 1);
-        one_shot(&bg, &aux_ref_srgb, MID_CLEAR, None, None, &s_small, 1);
-        let expected = steps[5].clone();
-        let aux_expected = steps[7].clone();
-
-        // Each step's diff from the previous is non-empty and inside that
-        // draw's rect, so the final equality is not vacuous.
-        let confined = |before: &[u8], after: &[u8], rect: [usize; 4], what: &str| {
-            let mut diffs = 0usize;
-            for (i, (b, a)) in before
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .zip(after.as_chunks::<4>().0)
-                .enumerate()
-            {
-                let (px, py) = (i % W, i / W);
-                if b != a {
-                    diffs += 1;
-                    assert!(
-                        px >= rect[0]
-                            && px < rect[0] + rect[2]
-                            && py >= rect[1]
-                            && py < rect[1] + rect[3],
-                        "{what}: ({px},{py}) changed outside its own {rect:?} rect"
-                    );
-                }
-            }
-            assert!(diffs > 0, "{what}: the draw changed nothing — a dead arm");
-        };
-        let clear_frame = vec![[0u8, 0, 0, 255]; W * H].concat();
-        // Pass-1 rects are their draw rects CLIPPED by PASS1_SCISSOR — a
-        // change at y >= 10 in any of them means the scissor was dropped.
-        confined(
-            &clear_frame,
-            &steps[0],
-            [0, 0, 16, 10],
-            "bg (scissor-clipped)",
-        );
-        assert_ne!(steps[0], clear_frame, "bg must paint over the clear");
-        // The second bg quad's surviving band (y 8..10) is painted.
-        assert!(
-            (8..10).any(|y| (8..16).any(|x| {
-                let i = (y * W + x) * 4;
-                steps[0][i..i + 4] != clear_frame[i..i + 4]
-            })),
-            "the bg quad's band above the pass-1 scissor edge must be painted"
-        );
-        confined(&steps[0], &steps[1], [1, 1, 4, 4], "glyph atlas A #1");
-        confined(&steps[1], &steps[2], [10, 2, 4, 4], "cursor");
-        confined(&steps[2], &steps[3], [9, 1, 4, 4], "glyph atlas B");
-        confined(
-            &steps[3],
-            &steps[4],
-            [2, 9, 4, 1],
-            "glyph atlas A #2 (scissor-clipped)",
-        );
-        confined(&steps[4], &steps[5], [4, 4, 8, 8], "scissored glow");
-        // Pass 2's glow writes rows 10-11, inside its scissor and outside pass
-        // 1's; a leaked pass-1 scissor would clip them.
-        assert!(
-            (10..12).any(|y| (4..12).any(|x| {
-                let i = (y * W + x) * 4;
-                steps[5][i..i + 4] != steps[4][i..i + 4]
-            })),
-            "the glow must write below y=10: pass 1's scissor does not apply to pass 2"
-        );
-
-        // The cover is total and visible, and the MID clear erased it.
-        let cover_texel: [u8; 4] = steps[6][0..4].try_into().expect("4 bytes");
-        assert_ne!(cover_texel, [0, 0, 0, 255], "the cover differs from black");
-        assert!(
-            steps[6]
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .all(|t| *t == cover_texel),
-            "the opaque cover quad must paint every aux texel"
-        );
-        let mid_texel: [u8; 4] = steps[7][(15 * W + 15) * 4..(15 * W + 15) * 4 + 4]
-            .try_into()
-            .expect("4 bytes");
-        assert_ne!(
-            mid_texel, cover_texel,
-            "the MID clear's bytes must differ from the cover's, or erasure is invisible"
-        );
-        for (i, texel) in steps[7].as_chunks::<4>().0.iter().enumerate() {
-            let (x, y) = (i % W, i / W);
-            let inside = x >= usize::from(SMALL_RECT[0])
-                && x < usize::from(SMALL_RECT[0] + SMALL_RECT[2])
-                && y >= usize::from(SMALL_RECT[1])
-                && y < usize::from(SMALL_RECT[1] + SMALL_RECT[3]);
-            if !inside {
-                assert_eq!(
-                    *texel, mid_texel,
-                    "({x},{y}): outside the small quad the MID clear must have \
-                     erased the cover — a Clear encoded as Load lands exactly here"
-                );
-            }
-        }
-        assert_ne!(
-            steps[7][(2 * W + 2) * 4..(2 * W + 2) * 4 + 4],
-            mid_texel[..],
-            "the small quad must be visible over the MID clear"
-        );
-
-        // ---- Encoder arm: one command buffer, two passes ---------------
-        let sealed_offscreen = || {
-            mint.texture_2d(
-                PixelFormat::Rgba8Unorm,
-                W,
-                H,
-                TEXTURE_USAGE_RENDER_TARGET
-                    | TEXTURE_USAGE_SHADER_READ
-                    | TEXTURE_USAGE_PIXEL_FORMAT_VIEW,
-            )
-            .expect("offscreen")
-        };
-        let enc_tex = sealed_offscreen();
-        let enc_srgb = enc_tex
-            .alias_view(PixelFormat::Rgba8UnormSrgb)
-            .expect("view");
-        let rb2 = dev.new_buffer(row * H).expect("readback 2");
-
-        let aux_tex = sealed_offscreen();
-        let aux_srgb = aux_tex
-            .alias_view(PixelFormat::Rgba8UnormSrgb)
-            .expect("view");
-        let rb3 = dev.new_buffer(row * H).expect("readback 3");
-
-        let mut cb = session.begin().expect("command buffer");
-        {
-            let pass = cb
-                .render_pass(&RenderPassDesc {
-                    target: &enc_srgb,
-                    load: BLACK,
-                    store: StoreAction::Store,
-                    viewport: None,
-                    scissor: Some(PASS1_SCISSOR),
-                })
-                .expect("pass 1");
-            pass.set_vertex_buffer(&ubuf, vu)
-                .expect("uniforms at the tabled slot");
-            // DECOY one slot over (unread by the MSL): inert now, but an
-            // ignored index or a transposed pair lets it clobber slot 0.
-            pass.set_vertex_buffer(&wrong_ubuf, vu + 1)
-                .expect("decoy one over");
-            pass.set_pipeline(&bg);
-            pass.set_instance_stream(&s_bg);
-            pass.draw_instanced(quad6, 6, 2)
-                .expect("armed draw: pipeline and stream are set in this fixture");
-            pass.set_pipeline(&color_glyph); // switch 1
-            pass.set_fragment_texture(atlas_a.obj(), atlas_tex_slot);
-            pass.set_fragment_sampler(&sampler, atlas_samp_slot);
-            pass.set_instance_stream(&s_glyph_a1);
-            pass.draw_instanced(quad6, 6, 1)
-                .expect("armed draw: pipeline and stream are set in this fixture");
-            pass.set_pipeline(&cursor); // switch 2
-            pass.set_instance_stream(&s_cursor);
-            pass.draw_instanced(quad6, 6, 1)
-                .expect("armed draw: pipeline and stream are set in this fixture");
-            pass.set_pipeline(&color_glyph); // switch 3
-            pass.set_fragment_texture(atlas_b.obj(), atlas_tex_slot); // atlas switch 1
-            pass.set_fragment_texture(atlas_a.obj(), atlas_tex_slot + 1); // decoy pair, unread slot
-            pass.set_fragment_sampler(&decoy_sampler, atlas_samp_slot + 1); // decoy pair
-            pass.set_instance_stream(&s_glyph_b);
-            pass.draw_instanced(quad6, 6, 1)
-                .expect("armed draw: pipeline and stream are set in this fixture");
-            pass.set_fragment_texture(atlas_a.obj(), atlas_tex_slot); // atlas switch 2
-            pass.set_instance_stream(&s_glyph_a2);
-            pass.draw_instanced(quad6, 6, 1)
-                .expect("armed draw: pipeline and stream are set in this fixture");
-        } // endEncoding
-        {
-            let pass = cb
-                .render_pass(&RenderPassDesc {
-                    target: &enc_tex,
-                    load: LoadAction::Load,
-                    store: StoreAction::Store,
-                    viewport: None,
-                    scissor: Some(GLOW_SCISSOR),
-                })
-                .expect("pass 2");
-            pass.set_vertex_buffer(&ubuf, vu)
-                .expect("uniforms at the tabled slot");
-            pass.set_pipeline(&glow);
-            pass.set_instance_stream(&s_glow);
-            pass.draw_instanced(quad6, 6, 2)
-                .expect("armed draw: pipeline and stream are set in this fixture");
-        } // endEncoding
-        // Passes 3 and 4: the Clear-erases proof, same command buffer.
-        {
-            let pass = cb
-                .render_pass(&RenderPassDesc {
-                    target: &aux_srgb,
-                    load: BLACK,
-                    store: StoreAction::Store,
-                    viewport: None,
-                    scissor: None,
-                })
-                .expect("pass 3");
-            pass.set_vertex_buffer(&ubuf, vu)
-                .expect("uniforms at the tabled slot");
-            pass.set_pipeline(&bg);
-            pass.set_instance_stream(&s_cover);
-            pass.draw_instanced(quad6, 6, 1)
-                .expect("armed draw: pipeline and stream are set in this fixture");
-        } // endEncoding
-        {
-            let pass = cb
-                .render_pass(&RenderPassDesc {
-                    target: &aux_srgb,
-                    load: MID_CLEAR,
-                    store: StoreAction::Store,
-                    viewport: None,
-                    scissor: None,
-                })
-                .expect("pass 4");
-            pass.set_vertex_buffer(&ubuf, vu)
-                .expect("uniforms at the tabled slot");
-            pass.set_pipeline(&bg);
-            pass.set_instance_stream(&s_small);
-            pass.draw_instanced(quad6, 6, 1)
-                .expect("armed draw: pipeline and stream are set in this fixture");
-        } // endEncoding
-        cb.copy_texture_to_buffer(&enc_tex, W, H, &rb2, row)
-            .expect("readback copy");
-        cb.copy_texture_to_buffer(&aux_tex, W, H, &rb3, row)
-            .expect("aux readback copy");
-        let outcome = cb.commit().wait_outcome();
-        assert_eq!(outcome, loss::CbOutcome::Completed, "the scene completes");
-        assert!(!latch.is_lost());
-
-        // SAFETY: shared storage; the command buffer completed above.
-        let actual = unsafe { ffi::buffer_bytes(&rb2, row * H) };
-        if actual != expected {
-            let mut diffs = 0usize;
-            let mut first = None;
-            for (i, (e, a)) in expected
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .zip(actual.as_chunks::<4>().0)
-                .enumerate()
-            {
-                if e != a {
-                    diffs += 1;
-                    if first.is_none() {
-                        first = Some((i % W, i / W, *e, *a));
-                    }
-                }
-            }
-            let (x, y, e, a) = first.expect("some texel differs");
-            panic!(
-                "THE ENCODER ARM IS NOT BYTE-IDENTICAL TO THE ONE-SHOT ARM: {diffs} of \
-                 {} texels differ; first at ({x},{y}): one-shot {e:02x?} != encoder \
-                 {a:02x?} — a dropped pipeline switch, a stale atlas bind, a stream at \
-                 the wrong slot, a Load turned Clear or an ignored scissor lands here",
-                W * H
-            );
-        }
-        // SAFETY: shared storage; the command buffer completed above.
-        let aux_actual = unsafe { ffi::buffer_bytes(&rb3, row * H) };
-        assert_eq!(
-            aux_actual, aux_expected,
-            "THE AUX TARGET DIVERGED: a mid-command-buffer Clear that failed to \
-             erase pass 3's cover (or an erased small quad) lands here"
-        );
-        crate::stderr_line!(
-            "multi-pass proof on {}: 4 passes / 9 draws / 7 pipeline sets / 2 atlas \
-             switches / decoy binds at slot 1 byte-identical to 8 one-shot draws \
-             over 2x{} texels",
-            dev.name(),
-            W * H
-        );
     }
 
     /// Read a texture back through the session (begin, copy, commit, wait),
@@ -1608,7 +989,7 @@ mod tests {
     }
 
     /// The copy validators refuse, with a reason, out-of-bounds rects, empty
-    /// regions, incompatible format pairs, an understated readback stride and
+    /// regions, overlapping same-texture rects, incompatible format pairs, an understated readback stride and
     /// a short readback buffer, before any encoder exists, so the command buffer
     /// stays committable (the final commit proves it).
     #[test]
@@ -1646,6 +1027,12 @@ mod tests {
             .copy_texture_sub_rect(&t16, (0, 0), &t16, (0, 0), 0, 4)
             .expect_err("empty region");
         assert!(err.contains("empty"), "got: {err}");
+        // The scroll band shift's hazard: a same-texture copy whose rects
+        // overlap is undefined in Metal and passes validation silently.
+        let err = cb
+            .copy_texture_sub_rect(&t16, (0, 3), &t16, (0, 0), 16, 8)
+            .expect_err("overlapping same-texture band");
+        assert!(err.contains("overlapping"), "got: {err}");
         let err = cb
             .copy_texture_to_texture(&t16, &f16)
             .expect_err("4-byte -> 8-byte texels");
@@ -1683,139 +1070,6 @@ mod tests {
             !latch.is_lost(),
             "refused copies are caller errors, not losses"
         );
-    }
-
-    /// Non-blocking completion via [`Submitted::try_outcome`]. Command buffer A
-    /// carries a heavy fill and B commits behind it on the same queue:
-    ///
-    /// * the first poll of B is `None` and feeds nothing;
-    /// * after `A.wait_outcome()`, polling B yields `Some(Completed)` with
-    ///   exactly one feed;
-    /// * B waited after A observes A terminal (commit order on one queue).
-    #[test]
-    fn try_outcome_polls_without_blocking_and_feeds_the_latch_once_terminal() {
-        let dev = device();
-        let _test_pool = AutoreleasePool::new();
-        let latch = Arc::new(loss::LossLatch::new());
-        let session = EncodeSession::new(&dev, Arc::clone(&latch)).expect("session");
-
-        const W: usize = 512;
-        const H: usize = 512;
-        let cell = pipelines::compile_library(&dev, crate::pipeline_table::ShaderLibrary::Cell)
-            .expect("cell.metal");
-        let bg_spec = Pipeline::Bg.spec();
-        let bg = pipelines::build(&dev, &cell, bg_spec, PixelFormat::Bgra8Unorm).expect("bg");
-        let mint = super::super::resources::MetalResourceDevice::new(&dev, Arc::clone(&latch));
-        let target = mint
-            .texture_2d(
-                PixelFormat::Rgba8UnormSrgb,
-                W,
-                H,
-                TEXTURE_USAGE_RENDER_TARGET,
-            )
-            .expect("target");
-        #[expect(clippy::cast_precision_loss, reason = "512-texel extents")]
-        let uniforms = CellUniforms {
-            screen: [W as f32, H as f32],
-            text_blend: 0.0,
-            pad: 0.0,
-        };
-        // SAFETY: `repr(C)` into an exactly-sized fresh shared buffer.
-        let ubuf = shared_buffer(&dev, unsafe { as_bytes(&uniforms) });
-        let stream = shared_buffer(
-            &dev,
-            &bg_stream(&[([0, 0, W as u16, H as u16], [200, 40, 120, 255])]),
-        );
-
-        // A take proves the `None` poll only if this thread reached it while A
-        // was still running; a take where preemption outlasted the fill is
-        // drained and repeated. A blocking `try_outcome` fails every take.
-        const TAKES: usize = 5;
-        let mut polled = None;
-        for _ in 0..TAKES {
-            // A: the heavy submit.
-            let mut cb_a = session.begin().expect("cb A");
-            {
-                let pass = cb_a
-                    .render_pass(&RenderPassDesc {
-                        target: &target,
-                        load: BLACK,
-                        store: StoreAction::Store,
-                        viewport: None,
-                        scissor: None,
-                    })
-                    .expect("heavy pass");
-                let vu = bg_spec
-                    .binds
-                    .vertex_uniform
-                    .expect("the bg row has a vertex uniform") as usize;
-                pass.set_vertex_buffer(&ubuf, vu).expect("uniforms");
-                pass.set_pipeline(&bg);
-                pass.set_instance_stream(&stream);
-                pass.draw_instanced(pipelines::metal_primitive_type(bg_spec.topology), 6, 4_000)
-                    .expect("armed draw: pipeline and stream are set in this fixture");
-            }
-            let a = cb_a.commit();
-
-            // B: empty, committed behind A on the same queue.
-            let b = session.begin().expect("cb B").commit();
-
-            #[cfg(debug_assertions)]
-            let fed_before = latch.fed_count();
-            if b.try_outcome().is_some() {
-                assert_eq!(a.wait_outcome(), loss::CbOutcome::Completed, "A completes");
-                continue;
-            }
-            #[cfg(debug_assertions)]
-            assert_eq!(
-                latch.fed_count(),
-                fed_before,
-                "a None poll must feed the latch NOTHING"
-            );
-            polled = Some((a, b));
-            break;
-        }
-        let (a, b) = polled.expect(
-            "B polled terminal at the first poll on every take — the heavy submit \
-             finished before this thread could poll, which contradicts the \
-             512x512 x 4000-instance fill, or `try_outcome` waits for the outcome",
-        );
-
-        assert_eq!(a.wait_outcome(), loss::CbOutcome::Completed, "A completes");
-
-        // Poll B to completion, wall-clock bounded, never parking.
-        #[cfg(debug_assertions)]
-        let fed_before_b = latch.fed_count();
-        let started = std::time::Instant::now();
-        let outcome = loop {
-            if let Some(o) = b.try_outcome() {
-                break o;
-            }
-            // A hang detector: B's completion is the GPU's, and the loop
-            // breaks the moment the status poll sees it.
-            assert!(
-                started.elapsed() < std::time::Duration::from_secs(60),
-                "B never turned terminal — status polling is broken"
-            );
-            std::hint::spin_loop();
-        };
-        assert_eq!(outcome, loss::CbOutcome::Completed, "B completes behind A");
-        #[cfg(debug_assertions)]
-        assert_eq!(
-            latch.fed_count(),
-            fed_before_b + 1,
-            "the ONE terminal poll must feed the latch exactly once — if this is \
-             red, try_outcome stopped settling and a polled-only caller would \
-             never latch a real loss"
-        );
-
-        // In-order: A was already terminal when B turned terminal.
-        assert_eq!(
-            a.try_outcome(),
-            Some(loss::CbOutcome::Completed),
-            "one queue commits in order: B terminal implies A terminal"
-        );
-        assert!(!latch.is_lost());
     }
 
     /// An injected `PageFault` through [`Submitted::settle`] latches, and every

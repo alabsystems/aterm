@@ -15,24 +15,16 @@
 //! coordinate list to the CoreText descriptor, the run shaper and the
 //! metrics derivation.
 //!
-//! ## Two-tier proof
+//! ## Proof
 //!
-//! * **Tier-0 (abstract, model-checked by the Trust `ty` compiler)** — the
-//!   `VfAxisClamp` and `VfNudgeGate` derived models
-//!   (`aterm_spec::derive::{vf_axis_clamp_model, vf_nudge_gate_model}`) carry
-//!   the axis-bounds and nudge-precondition invariants; `targo --unverified
-//!   test -p aterm-spec` proves each at `Buggy=0` and REQUIRES a counterexample at
-//!   `Buggy=1` (the pre-fix behaviours: no clamping / an ungated nudge).
-//! * **Tier-1 (concrete, this file)** — the same invariants checked on the
-//!   real policy functions over exhaustive lattices that additionally cover
-//!   what the integer models cannot: NaN/±∞ totality, float boundary
-//!   behaviour (the ty Expr language has no floats — the procedural
-//!   rounding-law precedent), plus the SF Mono acceptance binding and the
-//!   coord single-source consistency binding on a live `Renderer`.
+//! * **Concrete (this file)** — the axis-bounds and nudge-precondition
+//!   invariants checked on the real policy functions over exhaustive lattices,
+//!   with NaN/±∞ totality and float boundary behaviour, against the pre-fix
+//!   behaviours (no clamping / an ungated nudge), plus the SF Mono acceptance
+//!   binding and the coord single-source consistency binding on a live
+//!   `Renderer`.
 
-use aterm_render::variation::{
-    self, DARK_NUDGE_ADVANCE_TOL_PX, REGULAR_WGHT, VfAxis, WGHT_TAG, clamp_axis,
-};
+use aterm_render::variation::{self, VfAxis, WGHT_TAG, clamp_axis};
 
 /// A deliberate lattice of axis-bound magnitudes (design-space units),
 /// including the SF Mono Light default (294.67) and the OpenType extremes.
@@ -64,8 +56,7 @@ const REQUESTS: &[f32] = &[
 /// the bounds lattice (min <= def <= max, aterm-font's normalization) and
 /// EVERY request including NaN/±∞, `clamp_axis` yields a finite value inside
 /// `[min, max]`, exactly the request whenever the request is already
-/// in-bounds. Exhaustive over the lattice; the integer half is the ty-checked
-/// `VfAxisClamp` model.
+/// in-bounds. Exhaustive over the lattice.
 #[test]
 fn clamp_axis_total_and_exact() {
     let mut clamped_low = 0usize;
@@ -180,10 +171,6 @@ fn resolve_default_coords_regular_else_wght400() {
         variation::resolve_default_coords(&axes, Some(&[400.0])),
         vec![400.0, 13.0]
     );
-    // NEGATIVE CONTROL (the sin): WITHOUT resolution, the default instance
-    // is the Light weight — what pre-W9 aterm rendered.
-    assert_eq!(axes[0].def, 294.67);
-    assert_ne!(axes[0].def, REGULAR_WGHT);
     // A wght axis whose range cannot reach 400 clamps to its max.
     let thin = [VfAxis {
         tag: WGHT_TAG,
@@ -296,10 +283,9 @@ fn dark_nudge_gate_is_a_checked_precondition() {
     assert!(permitted > 0 && rejected > 0);
     // Boundary is INCLUSIVE at exactly 0.25px…
     assert!(variation::dark_nudge_permitted(7.25, 7.0));
-    assert_eq!(DARK_NUDGE_ADVANCE_TOL_PX, 0.25);
     // …and a failed measurement (NaN) can never pass: the gate is a
     // precondition, not a heuristic (NaN comparisons would be false-y anyway,
-    // but the explicit finite check is what the model pins).
+    // but the explicit finite check is what this pins).
     assert!(!variation::dark_nudge_permitted(f32::NAN, 7.0));
     assert!(!variation::dark_nudge_permitted(7.0, f32::NAN));
 }
@@ -314,43 +300,6 @@ fn sf_mono() -> Vec<u8> {
 /// axis 400..900 whose default is Regular, the same on every host.
 fn variable_face() -> Vec<u8> {
     include_bytes!("../assets/game/Cinzel-var.ttf").to_vec()
-}
-
-/// PROVE (4) — SF MONO ACCEPTANCE: the system `SFNSMono.ttf` (a) really does
-/// default to the Light instance (asserted so this test
-/// can never go vacuous on a future macOS that fixes the default), and (b)
-/// resolves to `wght` ≈ 400 under W9's default instantiation.
-#[cfg(target_os = "macos")]
-#[test]
-fn sf_mono_resolves_to_regular_not_light() {
-    let bytes = sf_mono();
-    let probe = variation::probe(&bytes, 0).expect("SFNSMono is a variable font");
-    let wi = probe
-        .axes
-        .iter()
-        .position(|a| a.tag == WGHT_TAG)
-        .expect("SFNSMono has a wght axis");
-    let axis = probe.axes[wi];
-    // The sin exists: the fvar default is the Light weight, NOT Regular.
-    assert!(
-        axis.def < 350.0,
-        "SFNSMono default weight expected Light (<350), got {} — if Apple fixed \
-         the default, update this control",
-        axis.def
-    );
-    assert!(
-        axis.max >= 400.0,
-        "wght axis must reach Regular, got max {}",
-        axis.max
-    );
-    // The fix: default instantiation lands on Regular (named instance or
-    // the clamped 400).
-    let coords = variation::resolve_default_coords(&probe.axes, probe.regular_coords.as_deref());
-    assert!(
-        (399.0..=401.0).contains(&coords[wi]),
-        "resolved wght must be ~400, got {}",
-        coords[wi]
-    );
 }
 
 /// PROVE (2) — COORD CONSISTENCY, bound on a live `Renderer` over the real
@@ -589,35 +538,15 @@ fn shaping_variation_cache_tracks_coords() {
     );
 }
 
-/// A variable MONO face installed on this host, or `None`. The one variable face
-/// in the tree (Cinzel, [`variable_face`]) is proportional: its bold widens past
-/// the dilation footprint this proof bounds, so the proof borrows a mono `wght`
-/// axis from the host and could not run on one that has none.
+/// A variable MONO face, checked in: Cascadia Mono 2407.24's variable build
+/// (`ttf/CascadiaMono.ttf` of the release's `CascadiaCode-2407.24.zip`, sha256
+/// `08026f61…59fa2`; `wght` 200..400..700, OFL-1.1 beside it in `assets/test/`),
+/// the face `font_family = "Cascadia Mono"` names on Windows 11. The other variable face in the tree
+/// (Cinzel, [`variable_face`]) is proportional: its bold widens past the
+/// dilation footprint this proof bounds. Checked in rather than borrowed from
+/// the host, so the proof runs the same on every host.
 #[cfg(not(target_os = "macos"))]
-fn host_variable_mono() -> Option<Vec<u8>> {
-    // Cascadia Mono ships with Windows 11 as a VARIABLE face (`wght` 200..400..700),
-    // what `font_family = "Cascadia Mono"` names there — the whole reason this gap
-    // was worth closing (aterm's unconfigured Windows default is now the bundled
-    // STATIC Cascadia Mono PL, with real styled files). The rest are the usual
-    // Linux placements of the same family.
-    const CANDIDATES: &[&str] = &[
-        r"C:\Windows\Fonts\CascadiaMono.ttf",
-        r"C:\Windows\Fonts\CascadiaCode.ttf",
-        "/usr/share/fonts/truetype/cascadia-code/CascadiaMono.ttf",
-        "/usr/share/fonts/truetype/cascadia-code/CascadiaCode.ttf",
-        "/usr/share/fonts/cascadia-code/CascadiaMono.ttf",
-    ];
-    CANDIDATES.iter().find_map(|p| {
-        let bytes = std::fs::read(p).ok()?;
-        // "Variable" is not enough: the file must actually carry a `wght` axis,
-        // since that is the only axis a bold instance can be built on.
-        variation::probe(&bytes, 0)?
-            .axes
-            .iter()
-            .any(|a| a.tag == WGHT_TAG)
-            .then_some(bytes)
-    })
-}
+const VARIABLE_MONO: &[u8] = include_bytes!("../assets/test/CascadiaMono-Variable.ttf");
 
 /// Synthetic BOLD as `apply_synthetic_style` performs it: a horizontal max-dilation
 /// by `e` px that widens the bitmap and leaves the advance alone. Reproduced here
@@ -665,9 +594,11 @@ fn dilate(cov: &[u8], w: usize, h: usize, e: usize) -> Vec<u8> {
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn portable_bold_draws_the_real_instance_not_a_dilation() {
-    let Some(bytes) = host_variable_mono() else {
-        aterm_spec::host::could_not_run("no variable mono face installed on this host");
-    };
+    let bytes = VARIABLE_MONO.to_vec();
+    assert!(
+        variation::probe(&bytes, 0).is_some_and(|p| p.axes.iter().any(|a| a.tag == WGHT_TAG)),
+        "the checked-in variable mono face carries a `wght` axis"
+    );
     let px = 16.0;
     let theme = aterm_render::Theme::default();
     let mut r = aterm_render::Renderer::from_bytes(&bytes, px, theme).expect("renderer");

@@ -15,7 +15,7 @@ fn parse_c1_csi() {
     let mut sink = RecordingSink::default();
 
     // 8-bit CSI (0x9B) followed by params
-    parser.advance(b"\x9b31m", &mut sink);
+    parser.advance_fast(b"\x9b31m", &mut sink);
 
     assert_eq!(sink.csi_dispatches.len(), 1);
     assert_eq!(sink.csi_dispatches[0].0, vec![31]);
@@ -28,7 +28,7 @@ fn parse_c1_osc() {
     let mut sink = RecordingSink::default();
 
     // 8-bit OSC (0x9D) followed by data
-    parser.advance(b"\x9d0;Title\x07", &mut sink);
+    parser.advance_fast(b"\x9d0;Title\x07", &mut sink);
 
     assert_eq!(sink.osc_dispatches.len(), 1);
     assert_eq!(
@@ -47,7 +47,7 @@ fn osc_payload_preserves_non_st_c1_bytes() {
     input.extend_from_slice(&payload);
     input.push(0x07);
 
-    parser.advance(&input, &mut sink);
+    parser.advance_fast(&input, &mut sink);
 
     assert_eq!(sink.osc_dispatches.len(), 1);
     assert_eq!(
@@ -66,7 +66,7 @@ fn osc_string_c1_st_byte_is_data_not_terminator() {
     // 0x9C is treated as data in OscString state (not ST terminator).
     // Required for UTF-8 correctness: 0x9C is a valid continuation byte
     // in CJK characters (e.g., 本 = E6 9C AC). Terminate with BEL. (#3745)
-    parser.advance(b"\x1b]0;Title\x9cX\x07", &mut sink);
+    parser.advance_fast(b"\x1b]0;Title\x9cX\x07", &mut sink);
 
     assert_eq!(sink.osc_dispatches.len(), 1);
     let expected_payload: Vec<u8> = b"Title\x9cX".to_vec();
@@ -87,7 +87,7 @@ fn c1_disabled_by_default() {
 
     // 8-bit CSI (0x9B) should NOT be interpreted as CSI when C1 disabled
     // Instead: 0x9B -> replacement char, "31m" -> printed as regular chars
-    parser.advance(b"\x9b31m", &mut sink);
+    parser.advance_fast(b"\x9b31m", &mut sink);
 
     // Should NOT produce a CSI dispatch
     assert_eq!(sink.csi_dispatches.len(), 0);
@@ -112,7 +112,7 @@ fn dcs_passthrough_preserves_non_st_high_bytes() {
     input.extend_from_slice(&payload);
     input.extend_from_slice(b"\x1b\\"); // ST
 
-    parser.advance(&input, &mut sink);
+    parser.advance_fast(&input, &mut sink);
 
     assert_eq!(sink.dcs_hooks.len(), 1, "DCS hook should fire once");
     assert_eq!(
@@ -134,7 +134,7 @@ fn dcs_passthrough_st_c1_byte_terminates_sequence() {
     input.push(0x9C); // ST via C1
     input.push(b'X'); // should be printed as regular char
 
-    parser.advance(&input, &mut sink);
+    parser.advance_fast(&input, &mut sink);
 
     assert_eq!(sink.dcs_hooks.len(), 1);
     assert_eq!(sink.dcs_puts, b"data".to_vec());
@@ -173,7 +173,7 @@ fn apc_payload_preserves_non_st_c1_bytes() {
     input.extend_from_slice(&payload);
     input.extend_from_slice(b"\x1b\\"); // ST
 
-    parser.advance(&input, &mut sink);
+    parser.advance_fast(&input, &mut sink);
 
     assert_eq!(sink.apc_starts, 1, "APC start should fire once");
     assert_eq!(
@@ -195,7 +195,7 @@ fn apc_st_c1_byte_terminates_sequence() {
     input.push(0x9C); // ST via C1
     input.push(b'X'); // should be printed as regular char
 
-    parser.advance(&input, &mut sink);
+    parser.advance_fast(&input, &mut sink);
 
     assert_eq!(sink.apc_starts, 1);
     assert_eq!(sink.apc_data, b"data".to_vec());
@@ -211,35 +211,13 @@ fn parse_c1_osc_with_c1_st() {
     let mut sink = RecordingSink::default();
 
     // C1 OSC (0x9D) + data + C1 ST (0x9C)
-    parser.advance(b"\x9d0;Title\x9c", &mut sink);
+    parser.advance_fast(b"\x9d0;Title\x9c", &mut sink);
 
     assert_eq!(sink.osc_dispatches.len(), 1);
     assert_eq!(
         sink.osc_dispatches[0],
         vec![b"0".to_vec(), b"Title".to_vec()],
         "C1 OSC with C1 ST terminator should parse correctly when C1 enabled"
-    );
-    assert_eq!(parser.state(), State::Ground);
-}
-
-#[test]
-fn parse_c1_osc_with_c1_st_advance_fast() {
-    // Same test but exercises the advance_fast (SIMD) path
-    let mut parser = Parser::with_c1_controls();
-    let mut sink = RecordingSink::default();
-
-    // Build a longer payload to exercise advance_fast
-    let mut input = vec![0x9D, b'0', b';'];
-    input.extend_from_slice(b"A Long Window Title For Testing");
-    input.push(0x9C);
-
-    parser.advance(&input, &mut sink);
-
-    assert_eq!(sink.osc_dispatches.len(), 1);
-    assert_eq!(
-        sink.osc_dispatches[0],
-        vec![b"0".to_vec(), b"A Long Window Title For Testing".to_vec(),],
-        "C1 OSC with C1 ST should work via advance_fast path"
     );
     assert_eq!(parser.state(), State::Ground);
 }
@@ -263,7 +241,7 @@ fn c1_disabled_blocks_injection_in_csi_param_state() {
     // After 0x9B is dropped, "31m" continues as params+final for the
     // original CSI, producing CSI 1;31 m (a valid SGR sequence with
     // params adjusted by the state machine).
-    parser.advance(b"\x1b[1\x9b31m", &mut sink);
+    parser.advance_fast(b"\x1b[1\x9b31m", &mut sink);
 
     // The 0x9B should NOT have started a new CSI sequence.
     // We should get exactly 1 CSI dispatch (the original \x1b[..m).
@@ -283,7 +261,7 @@ fn c1_disabled_blocks_injection_in_escape_state() {
     // Put parser into Escape state with ESC, then send 0x9B.
     // Without fix: 0x9B transitions to CsiEntry (new sequence).
     // With fix: 0x9B is dropped in Escape state.
-    parser.advance(b"\x1b\x9b31m", &mut sink);
+    parser.advance_fast(b"\x1b\x9b31m", &mut sink);
 
     // The 0x9B should NOT have produced a CSI dispatch via C1
     assert_eq!(
@@ -301,36 +279,18 @@ fn c1_disabled_blocks_dcs_osc_injection_mid_sequence() {
 
     // Start a CSI, inject C1 DCS (0x90) and C1 OSC (0x9D).
     // Both should be dropped, not start new DCS/OSC sequences.
-    parser.advance(b"\x1b[1\x90q", &mut sink);
+    parser.advance_fast(b"\x1b[1\x90q", &mut sink);
     assert_eq!(
         sink.dcs_hooks.len(),
         0,
         "C1 DCS (0x90) mid-CSI should be dropped when C1 disabled"
     );
 
-    parser.advance(b"\x1b[1\x9d0;Title\x07", &mut sink);
+    parser.advance_fast(b"\x1b[1\x9d0;Title\x07", &mut sink);
     assert_eq!(
         sink.osc_dispatches.len(),
         0,
         "C1 OSC (0x9D) mid-CSI should be dropped when C1 disabled"
-    );
-}
-
-/// When C1 controls ARE enabled, injection mid-sequence is allowed (per DEC spec).
-#[test]
-fn c1_enabled_allows_injection_mid_sequence() {
-    let mut parser = Parser::with_c1_controls();
-    let mut sink = RecordingSink::default();
-
-    // With C1 enabled, 0x9B in CsiParam should start a new CSI (per spec).
-    parser.advance(b"\x1b[1\x9b31m", &mut sink);
-
-    // The 0x9B should have interrupted the first CSI and started a new one.
-    // Only the second CSI (from 0x9B) completes with final byte 'm'.
-    assert_eq!(
-        sink.csi_dispatches.len(),
-        1,
-        "C1 CSI mid-sequence should work when C1 is enabled"
     );
 }
 
@@ -345,8 +305,8 @@ fn c1_enabled_allows_injection_mid_sequence() {
 ///
 /// The table, entry by entry: the ignored string stays in itself exactly where
 /// the hooked one does, and where either leaves, both go to the same state.
-/// Then the parsers, fed every one- and two-byte tail, C1 off and on, through
-/// the byte path and the fast path, agree on everything outside the hook.
+/// Then the parsers, fed every one- and two-byte tail, C1 off and on, agree on
+/// everything outside the hook.
 #[test]
 fn an_ignored_dcs_reads_every_byte_as_a_hooked_one() {
     for byte in 0..=u8::MAX {
@@ -391,34 +351,27 @@ fn an_ignored_dcs_reads_every_byte_as_a_hooked_one() {
             }
         };
         let mut hooked = fresh();
-        hooked.advance(b"\x1bP1000p%", &mut RecordingSink::default());
+        hooked.advance_fast(b"\x1bP1000p%", &mut RecordingSink::default());
         assert_eq!(hooked.state(), State::DcsPassthrough);
         let mut ignored = fresh();
-        ignored.advance(b"\x1bP1:%", &mut RecordingSink::default());
+        ignored.advance_fast(b"\x1bP1:%", &mut RecordingSink::default());
         assert_eq!(ignored.state(), State::DcsIgnore);
-        for fast in [false, true] {
-            for tail in &tails {
-                let (mut live, mut dropped) = (hooked.clone(), ignored.clone());
-                let (mut live_sink, mut dropped_sink) =
-                    (RecordingSink::default(), RecordingSink::default());
-                if fast {
-                    live.advance_fast(tail, &mut live_sink);
-                    dropped.advance_fast(tail, &mut dropped_sink);
-                } else {
-                    live.advance(tail, &mut live_sink);
-                    dropped.advance(tail, &mut dropped_sink);
-                }
-                assert_eq!(
-                    outside_the_hook(&dropped_sink),
-                    outside_the_hook(&live_sink),
-                    "c1={c1} fast={fast} tail={tail:02x?}"
-                );
-                assert_eq!(
-                    dropped.state() == State::DcsIgnore,
-                    live.state() == State::DcsPassthrough,
-                    "c1={c1} fast={fast} tail={tail:02x?}: in the string alike"
-                );
-            }
+        for tail in &tails {
+            let (mut live, mut dropped) = (hooked.clone(), ignored.clone());
+            let (mut live_sink, mut dropped_sink) =
+                (RecordingSink::default(), RecordingSink::default());
+            live.advance_fast(tail, &mut live_sink);
+            dropped.advance_fast(tail, &mut dropped_sink);
+            assert_eq!(
+                outside_the_hook(&dropped_sink),
+                outside_the_hook(&live_sink),
+                "c1={c1} tail={tail:02x?}"
+            );
+            assert_eq!(
+                dropped.state() == State::DcsIgnore,
+                live.state() == State::DcsPassthrough,
+                "c1={c1} tail={tail:02x?}: in the string alike"
+            );
         }
     }
 
@@ -446,7 +399,7 @@ fn an_ignored_dcs_reads_every_byte_as_a_hooked_one() {
 /// character, after a lead it cannot follow (`E0`, `F4`), after a broken
 /// prefix. With C1 controls on, a raw `0x9C` is the 8-bit ST wherever it falls.
 ///
-/// Every string state, the byte path, the fast path and one byte per read.
+/// Every string state, whole and one byte per read.
 #[test]
 fn a_0x9c_inside_a_utf8_character_does_not_end_the_string() {
     // 0x9C as the second, third and fourth byte, after the leads whose second
@@ -460,8 +413,7 @@ fn a_0x9c_inside_a_utf8_character_does_not_end_the_string() {
         (b"\x1bX", "SOS"),
         (b"\x1b^", "PM"),
     ];
-    let feeds: [(&str, fn(&mut Parser, &[u8], &mut RecordingSink)); 3] = [
-        ("advance", |p, b, s| p.advance(b, s)),
+    let feeds: [(&str, fn(&mut Parser, &[u8], &mut RecordingSink)); 2] = [
         ("advance_fast", |p, b, s| p.advance_fast(b, s)),
         ("one byte per read", |p, b, s| {
             for byte in b {
@@ -542,8 +494,8 @@ fn a_0x9c_inside_a_utf8_character_does_not_end_the_string() {
 /// The table, entry by entry: every GR byte stays in each header state and
 /// does nothing, and `0x80..=0x9F` keep the C1 entries every other sequence
 /// state has. Then a string with GR bytes in each header state, fed whole,
-/// one byte per read and split in two at every byte, through the byte path
-/// and the fast path, C1 controls off and on: each hooks its string, delivers
+/// one byte per read and split in two at every byte, C1 controls off and on:
+/// each hooks its string, delivers
 /// the payload and prints only `after`. With C1 controls off a character
 /// holding `0x9C` (本, `E6 9C AC`) in the header keeps the string too: the C1
 /// guard drops its `0x9C`.
@@ -605,10 +557,8 @@ fn a_gr_byte_in_a_dcs_header_keeps_the_string() {
             true,
         ),
     ];
-    let feeds: [(&str, fn(&mut Parser, &[u8], &mut RecordingSink)); 2] = [
-        ("advance", |p, b, s| p.advance(b, s)),
-        ("advance_fast", |p, b, s| p.advance_fast(b, s)),
-    ];
+    let feeds: [(&str, fn(&mut Parser, &[u8], &mut RecordingSink)); 1] =
+        [("advance_fast", |p, b, s| p.advance_fast(b, s))];
     for (stream, hook, payload, c1_off_only) in strings {
         for c1 in [false, true] {
             if c1 && c1_off_only {

@@ -1,0 +1,19 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab) · the first backgrounded shell of a fresh session (`sleep 40`, escalated, `yield_time_ms: 1000`, approved by the harness at full power): the turn's end with `  (↓ to view terminals)` drawn as a block of its own UNDER the reply, a moment after it, and the background-work panel under the bottom rule · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+  Muse Code 1.4.10
+
+❯ toolstart
+
+◆ Backgrounded · Wait in the background · 4.6s · ctrl+o
+
+◆ Tool call done. Result: { "chunk_id": "exec-1-1", "execution_state": "background_running", "session_id": 1, "work_id":
+  "work.v2.managed_bash.sha256.7630681ecd763650c0dd2462e5e5e53297948da76dfb08658cab19e8fd821a65", ~
+
+  (↓ to view terminals)
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+main · ↓ to select
+└ ◈ Wait in the background  running                                                                                                           2s
+  lab-stub · high · /private/tmp/at.lab0/proj · Auto-review

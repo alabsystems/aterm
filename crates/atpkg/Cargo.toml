@@ -63,6 +63,8 @@ aterm-hash = { workspace = true }
 # getuid() for the 0600, owned-by-uid durable high-water floor file (mirrors
 # aterm-update-core's privatedir hardening). Already a workspace dependency.
 libc = { workspace = true }
+# How each write is finished: durable (F_FULLFSYNC) or ordered (F_BARRIERFSYNC).
+aterm-durable = { workspace = true }
 # The shared, platform-free ownership predicate (dir_safe_for_private_write) reused
 # for the floor file's directory, so atpkg and the updater cannot drift on what
 # "private" means.
@@ -70,6 +72,9 @@ aterm-types = { workspace = true }
 # The workspace's one epoch-clock read (`aterm_time::unix_secs` and kin). Already in
 # the graph via aterm-types.
 aterm-time = { workspace = true }
+# THE toolchain's discovery, rustup's home, the build-cache rule, the gone-checkout rule
+# and the lease core, std only; `toolchain`, `build_cache` and `lease` re-export them.
+aterm-toolchain = { workspace = true }
 # The shared advisory file lock (flock LOCK_EX) — the SAME primitive aterm-update uses
 # for its apply/stage critical sections — serializes the high-water floor's
 # read->compare->write so a racing advance across concurrent atpkg processes cannot be
@@ -132,6 +137,8 @@ aterm-containment = { workspace = true }
 # Tier-1 conformance drives the real index-probe stamp/lock against the derived
 # bounded model; this edge exists only while compiling tests, never in atpkg.
 aterm-spec = { workspace = true }
+# The models its tests drive (a model edit rebuilds only their tests).
+aterm-models-atpkg = { workspace = true }
 # Test fixtures SIGN: deterministic Ed25519 manifests (Ed25519KeyPair::from_seed_unchecked
 # + .sign) and the `openpgp` RSA vectors (RsaKeyPair::sign under a committed test key).
 # Re-declaring ring here with DEFAULT features adds the rest of ring's defaults to the

@@ -225,9 +225,12 @@ pub trait ActionSink {
     /// End of a DCS sequence.
     ///
     /// `canceled` is `true` when the string was aborted by CAN (0x18) or SUB
-    /// (0x1A) rather than terminated by ST / `ESC \`: the sink should DISCARD
-    /// any accumulated payload (e.g. drop a half-decoded Sixel image) instead of
-    /// finalizing it. `false` for a legitimate terminator.
+    /// (0x1A), or broken off by an ESC that does not begin ST (`ESC [`, a second
+    /// ESC, ...), rather than terminated by ST (`ESC \` or 0x9C): the sink should
+    /// DISCARD any accumulated payload (e.g. drop a half-decoded Sixel image,
+    /// leave a query unanswered) instead of finalizing it. `false` for ST. An
+    /// ESC's verdict waits for the byte after it, so the call comes with that
+    /// byte, before whatever it dispatches.
     ///
     /// Default: no-op.
     fn dcs_unhook(&mut self, _canceled: bool) {}

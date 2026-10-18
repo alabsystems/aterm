@@ -20,23 +20,43 @@
 //!
 //! A module without the section, with records of another version, or whose
 //! exports disagree with its records is refused: nothing is written.
+//!
+//! [`glue`] is also a library entry: `ship site` (aterm-release) binds the
+//! `/terminal` engine with it in process.
 
 use std::path::{Path, PathBuf};
 
 mod js;
 mod model;
+pub(crate) mod oracle;
 mod templates;
 pub(crate) mod toy;
 mod wasm;
+mod webgl;
 
-pub(crate) use js::Flavor;
+pub use js::Flavor;
+
+/// The pass the shipping pipeline applies to a bound `<stem>_bg.wasm`, never
+/// before binding: `-O3` (speed, matching the cargo opt-3 build) with the
+/// shipping feature flags. The `wasm` perf lane and `ship site`'s `/terminal`
+/// engine both run it.
+pub const WASM_OPT_FLAGS: [&str; 7] = [
+    "-O3",
+    "--enable-bulk-memory",
+    "--enable-nontrapping-float-to-int",
+    "--enable-sign-ext",
+    "--enable-mutable-globals",
+    "--enable-reference-types",
+    "--enable-simd",
+];
 
 /// The files for `bytes`, a module named `stem`: (name, contents) pairs.
-pub(crate) fn glue(
-    bytes: &[u8],
-    stem: &str,
-    flavor: Flavor,
-) -> Result<Vec<(String, Vec<u8>)>, String> {
+///
+/// # Errors
+/// A stem that is not one filename component, or a module the generator
+/// refuses (no `aterm_abi` section, records of another version, exports that
+/// disagree with the records).
+pub fn glue(bytes: &[u8], stem: &str, flavor: Flavor) -> Result<Vec<(String, Vec<u8>)>, String> {
     if stem.is_empty() || Path::new(stem).file_name().and_then(|s| s.to_str()) != Some(stem) {
         return Err("the module stem must be one filename component".to_string());
     }
@@ -424,9 +444,9 @@ mod tests {
             .output()
             .unwrap_or_else(|e| {
                 panic!(
-                    "{}: node runs the generated glue and could not start ({e}); install node \
-                     (brew install node)",
-                    crate::libtest::COULD_NOT_RUN_SENTINEL
+                    "{}: node runs the generated glue and could not start ({e}); {}",
+                    crate::libtest::COULD_NOT_RUN_SENTINEL,
+                    crate::install_fix("node", "node", "nodejs")
                 )
             });
         assert!(

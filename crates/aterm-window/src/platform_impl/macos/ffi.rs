@@ -22,8 +22,8 @@
 
 use std::ffi::c_void;
 
+use aterm_cg::CGDirectDisplayID;
 use aterm_objc::cf::{Boolean, CFStringRef, CFUUIDRef};
-use aterm_objc::cg::CGDirectDisplayID;
 
 pub const TRUE: Boolean = 1;
 

@@ -11,11 +11,11 @@
 
 #![cfg(test)]
 
-use aterm_spec::derive::{
-    Model, config_file_commit_cas_model, manual_config_completion_model,
-    manual_config_handoff_model, manual_config_problem_navigation_model,
-    native_config_transaction_model,
+use aterm_models_native::{
+    config_file_commit_cas_model, manual_config_completion_model, manual_config_handoff_model,
+    manual_config_problem_navigation_model, native_config_transaction_model,
 };
+use aterm_spec::derive::Model;
 use aterm_spec::interp::{State, admits};
 
 use crate::conformance_support::assert_sole_transition as assert_transition;
@@ -726,15 +726,7 @@ fn real_config_commit_cas_conforms_for_both_winners_and_rejects_blind_publish() 
     let _ = std::fs::remove_dir_all(root);
 }
 
-pub(crate) fn trail_pack_asset(name: &str) -> String {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../aterm-effects/assets/trail-packs")
-        .join(name)
-        .to_string_lossy()
-        .into_owned()
-}
-
-fn trail_config(path: &str, id: &str, theme: &str, kitty_sprite: &str) -> String {
+fn trail_config(style: &str, theme: &str, kitty_sprite: &str) -> String {
     let sparkle = if theme == "Dracula" {
         concat!(
             "[[sparkle_words.custom]]\n",
@@ -745,10 +737,8 @@ fn trail_config(path: &str, id: &str, theme: &str, kitty_sprite: &str) -> String
         ""
     };
     format!(
-        "theme = {theme:?}\ncursor_trail_style = {:?}\ncursor_trail_packs = [{:?}]\n\
+        "theme = {theme:?}\ncursor_trail_style = {style:?}\n\
          cursor_nyan_sprite = {kitty_sprite:?}\n{sparkle}",
-        format!("pack:{id}"),
-        path,
     )
 }
 
@@ -840,10 +830,9 @@ fn snapshot_catalog_is_generation_consistent(snapshot: &ConfigSnapshot) -> bool 
     let Ok(config) = aterm_toml::from_str::<crate::app_config::Config>(&snapshot.text) else {
         return false;
     };
-    let resolved = crate::app_config::resolve_trail_style(
-        config.cursor_trail_style_raw(),
-        &snapshot.assets.trail_packs,
-    );
+    let resolved = crate::app_config::resolve_trail_style(config.cursor_trail_style_raw());
+    let trail_consistent = *snapshot.assets.trail_style
+        == crate::app_config::TrailStyleCache::for_style(config.cursor_trail_style_raw());
     let kitty_consistent = match &snapshot.assets.kitty_sprite {
         crate::app_config::KittySpriteAsset::Ready { source_id, .. } => config
             .cursor_nyan_sprite
@@ -866,17 +855,7 @@ fn snapshot_catalog_is_generation_consistent(snapshot: &ConfigSnapshot) -> bool 
                     .prepare_sparkle_runtime()
                     .consumer_capabilities()
         });
-    kitty_consistent
-        && resolved.issue.is_none()
-        && sparkle_consistent
-        && resolved.pack.is_some_and(|pack| {
-            snapshot
-                .assets
-                .trail_packs
-                .packs
-                .values()
-                .any(|p| *p == pack)
-        })
+    kitty_consistent && !resolved.unknown && sparkle_consistent && trail_consistent
 }
 
 #[derive(Clone, Copy, Default)]
@@ -911,7 +890,7 @@ fn config_catalog_projection(
     let trail_generation = catalogs
         .iter()
         .rposition(|candidate| {
-            std::sync::Arc::ptr_eq(&candidate.trail_packs, &snapshot.assets.trail_packs)
+            std::sync::Arc::ptr_eq(&candidate.trail_style, &snapshot.assets.trail_style)
         })
         .map_or(-1, |index| index as i64);
     let kitty_generation = catalogs
@@ -967,8 +946,8 @@ fn config_catalog_projection(
 
 /// Tier-1 binding for the revisioned snapshot/catalog protocol through the config
 /// reducer, Settings runtime, live host/window installer and capture preparation. Every
-/// consumer receives the same outer Arc; stale-Trail and stale-rainbow kitty negative
-/// controls keep the path-asset aggregate non-vacuous. Theme-directory staleness has
+/// consumer receives the same outer Arc; stale-trail-style and stale-rainbow kitty
+/// negative controls keep the asset aggregate non-vacuous. Theme-directory staleness has
 /// its own test below, since config edits retain that catalog.
 #[test]
 fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delivery() {
@@ -979,11 +958,9 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
     use crate::tab_model::ViewStore;
     use crate::update_screen::UpdateState;
 
-    let synthwave = trail_pack_asset("synthwave.toml");
-    let emberfall = trail_pack_asset("emberfall.toml");
     let sprites = KittyFixtures::new();
-    let model = aterm_spec::derive::config_catalog_snapshot_model();
-    let initial_text = trail_config(&synthwave, "synthwave", "Default", &sprites.sources[0]);
+    let model = aterm_models_native::config_catalog_snapshot_model();
+    let initial_text = trail_config("comet", "Default", &sprites.sources[0]);
     let mut service = VersionedConfigService::new(initial_text).expect("valid initial config");
     let mut initial = service.snapshot();
     let initial_consumers = Arc::new(
@@ -993,14 +970,13 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
             .consumer_capabilities(),
     );
     initial.assets = Arc::new(crate::app_config::ConfigAssetCatalog {
-        trail_packs: Arc::clone(&initial.assets.trail_packs),
+        trail_style: Arc::clone(&initial.assets.trail_style),
         kitty_sprite: initial.assets.kitty_sprite.clone(),
         wallpaper: initial.assets.wallpaper.clone(),
         themes: Arc::clone(&initial.assets.themes),
         sparkle_spec_consumers: Some(Arc::clone(&initial_consumers)),
     });
     assert!(snapshot_catalog_is_generation_consistent(&initial));
-    assert_eq!(initial.assets.trail_packs.ids, ["synthwave"]);
     let initial_state = config_catalog_projection(
         &model,
         &initial,
@@ -1022,7 +998,7 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
         result => panic!("patch must admit a complete generation: {result:?}"),
     };
     patched.assets = Arc::new(crate::app_config::ConfigAssetCatalog {
-        trail_packs: Arc::clone(&patched.assets.trail_packs),
+        trail_style: Arc::clone(&patched.assets.trail_style),
         kitty_sprite: patched.assets.kitty_sprite.clone(),
         wallpaper: patched.assets.wallpaper.clone(),
         themes: Arc::clone(&patched.assets.themes),
@@ -1030,7 +1006,6 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
     });
     assert_eq!(patched.revision, initial.revision + 1);
     assert!(snapshot_catalog_is_generation_consistent(&patched));
-    assert_eq!(patched.assets.trail_packs.ids, ["synthwave"]);
     assert!(
         Arc::ptr_eq(
             initial
@@ -1047,8 +1022,8 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
         "a patch with unchanged sparkle sources reuses the exact admitted projection"
     );
     assert!(Arc::ptr_eq(
-        &initial.assets.trail_packs,
-        &patched.assets.trail_packs
+        &initial.assets.trail_style,
+        &patched.assets.trail_style
     ));
     assert!(
         Arc::ptr_eq(&initial.assets.themes, &patched.assets.themes),
@@ -1069,12 +1044,7 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
     assert_transition(&model, &initial_state, &patched_state, "AdmitPatch");
 
     let mut external = service
-        .replace_external(trail_config(
-            &emberfall,
-            "emberfall",
-            "Dracula",
-            &sprites.sources[2],
-        ))
+        .replace_external(trail_config("fire", "Dracula", &sprites.sources[2]))
         .expect("valid external generation");
     let external_consumers = Arc::new(
         external
@@ -1083,7 +1053,7 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
             .consumer_capabilities(),
     );
     external.assets = Arc::new(crate::app_config::ConfigAssetCatalog {
-        trail_packs: Arc::clone(&external.assets.trail_packs),
+        trail_style: Arc::clone(&external.assets.trail_style),
         kitty_sprite: external.assets.kitty_sprite.clone(),
         wallpaper: external.assets.wallpaper.clone(),
         themes: Arc::clone(&external.assets.themes),
@@ -1091,7 +1061,6 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
     });
     assert_eq!(external.revision, patched.revision + 1);
     assert!(snapshot_catalog_is_generation_consistent(&external));
-    assert_eq!(external.assets.trail_packs.ids, ["emberfall"]);
     let catalogs = [&initial.assets, &patched.assets, &external.assets];
     let external_state = config_catalog_projection(
         &model,
@@ -1146,11 +1115,6 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
                 .as_ref()
                 .expect("external exact sparkle projection")
         ));
-        assert!(Arc::ptr_eq(
-            state.trail_pack_catalog(),
-            &external.assets.trail_packs
-        ));
-        assert_eq!(state.legacy.trail_pack_ids, ["emberfall"]);
         if view == first {
             first_assets = Some(Arc::clone(state.config_assets()));
         } else {
@@ -1313,7 +1277,7 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
     assert_transition(&model, &after_live, &after_capture, "PublishCapture");
 
     // Independent negative control 1: external text/rainbow kitty paired with the stale
-    // initial Trail generation must be rejected.
+    // initial trail-style generation must be rejected.
     let stale_trail = ConfigSnapshot {
         revision: external.revision,
         analysis_generation: external.analysis_generation,
@@ -1322,7 +1286,7 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
         semantic_values: Arc::clone(&external.semantic_values),
         disk_faults: Arc::clone(&external.disk_faults),
         assets: Arc::new(crate::app_config::ConfigAssetCatalog {
-            trail_packs: Arc::clone(&initial.assets.trail_packs),
+            trail_style: Arc::clone(&initial.assets.trail_style),
             kitty_sprite: external.assets.kitty_sprite.clone(),
             wallpaper: external.assets.wallpaper.clone(),
             themes: Arc::clone(&external.assets.themes),
@@ -1344,7 +1308,7 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
     assert_eq!(admits(&model, &patched_state, &stale_trail_state), None);
     assert!(!model.check_invariant("SnapshotAtomic", &stale_trail_state));
 
-    // Independent negative control 2: external text/Trail paired with the stale
+    // Independent negative control 2: external text/trail style paired with the stale
     // initial rainbow kitty generation must also be rejected.
     let stale_kitty = ConfigSnapshot {
         revision: external.revision,
@@ -1354,7 +1318,7 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
         semantic_values: Arc::clone(&external.semantic_values),
         disk_faults: Arc::clone(&external.disk_faults),
         assets: Arc::new(crate::app_config::ConfigAssetCatalog {
-            trail_packs: Arc::clone(&external.assets.trail_packs),
+            trail_style: Arc::clone(&external.assets.trail_style),
             kitty_sprite: initial.assets.kitty_sprite.clone(),
             wallpaper: initial.assets.wallpaper.clone(),
             themes: Arc::clone(&external.assets.themes),
@@ -1386,7 +1350,7 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
         semantic_values: Arc::clone(&external.semantic_values),
         disk_faults: Arc::clone(&external.disk_faults),
         assets: Arc::new(crate::app_config::ConfigAssetCatalog {
-            trail_packs: Arc::clone(&external.assets.trail_packs),
+            trail_style: Arc::clone(&external.assets.trail_style),
             kitty_sprite: external.assets.kitty_sprite.clone(),
             wallpaper: external.assets.wallpaper.clone(),
             themes: Arc::clone(&external.assets.themes),
@@ -1409,7 +1373,7 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
     assert!(!model.check_invariant("SnapshotAtomic", &stale_sparkle_state));
 }
 
-/// Tier-1 binding for the byte-identical external refresh: a referenced manifest
+/// Tier-1 binding for the byte-identical external refresh: a referenced sprite
 /// changes while `aterm.toml` does not, and the service publishes a new snapshot.
 #[test]
 fn byte_equal_external_refresh_conforms_to_atomic_catalog_model() {
@@ -1422,30 +1386,32 @@ fn byte_equal_external_refresh_conforms_to_atomic_catalog_model() {
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&root).unwrap();
-    let manifest = root.join("trail-pack.toml");
-    let first = include_str!("../../aterm-effects/assets/trail-packs/synthwave.toml");
-    std::fs::write(&manifest, first).unwrap();
+    let sprite = root.join("nyan.png");
+    let png = |rgba: &[u8]| crate::app_introspect::encode_rgba8_png(rgba, 2, 1).unwrap();
+    std::fs::write(
+        &sprite,
+        png(&[0xf0, 0x33, 0x55, 0xff, 0xf0, 0x33, 0x55, 0xff]),
+    )
+    .unwrap();
     let text = format!(
-        "theme = \"Default\"\ncursor_trail_style = \"pack:synthwave\"\n\
-         cursor_trail_packs = [{:?}]\n",
-        manifest.to_string_lossy()
+        "theme = \"Default\"\ncursor_nyan_sprite = {:?}\n",
+        sprite.to_string_lossy()
     );
     let mut service = VersionedConfigService::new(text.clone()).unwrap();
     let initial = service.snapshot();
-    let initial_pack = initial.assets.trail_packs.packs["synthwave"];
+    let initial_fp = initial.assets.kitty_sprite.fingerprint();
 
-    let second = first.replace("span_deg = 300.0", "span_deg = 240.0");
-    assert_ne!(second, first, "fixture mutation must be effective");
-    std::fs::write(&manifest, second).unwrap();
+    std::fs::write(
+        &sprite,
+        png(&[0x33, 0xf0, 0x88, 0xff, 0x33, 0xf0, 0x88, 0xff]),
+    )
+    .unwrap();
     let refreshed = service.replace_external(text).unwrap();
     assert_eq!(refreshed.text, initial.text);
     assert_eq!(refreshed.revision, initial.revision + 1);
-    assert_ne!(
-        refreshed.assets.trail_packs.packs["synthwave"],
-        initial_pack
-    );
+    assert_ne!(refreshed.assets.kitty_sprite.fingerprint(), initial_fp);
 
-    let model = aterm_spec::derive::config_catalog_snapshot_model();
+    let model = aterm_models_native::config_catalog_snapshot_model();
     let mut projected = model.init_state();
     for key in [
         "revision",
@@ -1461,10 +1427,10 @@ fn byte_equal_external_refresh_conforms_to_atomic_catalog_model() {
     assert_transition(&model, &model.init_state(), &projected, "RefreshAssets");
     assert!(model.check_invariant("SnapshotAtomic", &projected));
 
-    // Negative control: retaining the genuine initial Trail catalog would be
-    // the stale mixed-generation state forbidden by the model.
+    // Negative control: retaining the genuine initial sprite would be the
+    // stale mixed-generation state forbidden by the model.
     let mut stale = projected;
-    stale.insert("trail_generation", 0);
+    stale.insert("kitty_generation", 0);
     assert!(!model.check_invariant("SnapshotAtomic", &stale));
     let _ = std::fs::remove_dir_all(root);
 }
@@ -1485,8 +1451,8 @@ fn parsed_theme_catalog_refresh_conforms_to_atomic_catalog_model() {
     assert_eq!(refreshed.revision, initial.revision + 1);
     assert!(!Arc::ptr_eq(&refreshed.assets, &initial.assets));
     assert!(Arc::ptr_eq(
-        &refreshed.assets.trail_packs,
-        &initial.assets.trail_packs
+        &refreshed.assets.trail_style,
+        &initial.assets.trail_style
     ));
     assert_eq!(
         refreshed.assets.kitty_sprite.fingerprint(),
@@ -1494,7 +1460,7 @@ fn parsed_theme_catalog_refresh_conforms_to_atomic_catalog_model() {
     );
     assert_eq!(refreshed.assets.themes.resolve("Work"), Ok(scheme));
 
-    let model = aterm_spec::derive::config_catalog_snapshot_model();
+    let model = aterm_models_native::config_catalog_snapshot_model();
     let mut projected = model.init_state();
     for key in [
         "revision",

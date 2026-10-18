@@ -10,7 +10,7 @@
 //! - [`width`] — East Asian Width / zero-width classification (UAX #11).
 //! - [`gcb`] — Grapheme_Cluster_Break property + UAX #29 break matrix.
 //! - [`props`] — `Script` and `General_Category` run tables
-//!   (`tables/gen_props.py`, read through [`crate::script`] and
+//!   (`examples/unicode_tables.rs props`, read through [`crate::script`] and
 //!   [`crate::general_category`]).
 //!
 //! Only `width`'s API is exported from the crate; `gcb` is `pub(crate)` because

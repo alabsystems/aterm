@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-wayland"
+version.workspace = true
+edition.workspace = true
+license = "Apache-2.0 AND MIT"
+repository.workspace = true
+description = "First-party Wayland client for aterm: generated protocol tables held to wayland-scanner's, and a runtime over the system's libwayland-client opened at run time"
+
+# docs/AUDIT-third-party-2026-10-15.md, linux-windowing LW.6. No
+# wayland-client, wayland-backend, wayland-sys or wayland-scanner here, not
+# even as dev-dependencies: wayland-scanner's tables, recorded once by
+# tests/recorder (its own workspace) into tests/recorded/, are the oracle.
+# The generated protocol modules (src/protocols/) are MIT, as the protocol
+# descriptions under protocols/ they come from; src/pointer_frame.rs is MIT,
+# derived from smithay-client-toolkit 0.19.2 (LICENSE-MIT). No
+# smithay-client-toolkit here either: tests/live_seat.rs drives the seat and
+# selection helpers through Mutter.
+
+[dependencies]
+# libwayland-client, opened at run time.
+aterm-dl = { workspace = true }
+# A dispatcher closure's panic, caught at the C boundary, is logged.
+aterm-log = { workspace = true }
+
+[dev-dependencies]
+# tests/generated.rs's negative control writes a changed protocol file here.
+aterm-tempfile = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# tests/live_wayland.rs's memfd for a pool.
+libc = { workspace = true }
+# tests/cursor_layout.rs's C probe: its compiler.
+aterm-uds = { workspace = true }
+
+[lints]
+workspace = true

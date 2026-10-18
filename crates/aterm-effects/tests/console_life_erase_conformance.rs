@@ -176,7 +176,7 @@ fn ed2_clears_selected_occupancy_without_retiring_live_coordinates_or_input() {
 }
 
 #[test]
-fn ed3_discards_history_and_block_metadata_without_relocating_live_cells_or_pet() {
+fn ed3_discards_history_without_relocating_live_cells_the_running_block_or_pet() {
     let mut s = Scene::new(true);
     s.work();
     let before = s.warm();
@@ -197,17 +197,15 @@ fn ed3_discards_history_and_block_metadata_without_relocating_live_cells_or_pet(
     assert_eq!(next.uniform_up_rows, stamp.uniform_up_rows);
     assert_ne!(next.content_seq, stamp.content_seq);
     assert_eq!(world.ink_at(8, 2), Some(true));
-    // The terminal's ED3 handler separately clears shell integration metadata
-    // (handler_csi, #7667). Stable live coordinates cannot authorize a phantom
-    // block after that explicit retirement; pixels and semantic ownership are
-    // independent observations.
-    assert!(s.term.all_blocks().next().is_none());
-    assert!(world.anchors().iter().all(Option::is_none));
-    assert!(world.resolve(anchor).is_none());
-    assert_eq!(s.brain.console_anchor_id(), None);
-    // Losing work interest may change the pose and its breathing scale. The
-    // actual location must stay put; identical art bounds would prohibit that
-    // legitimate posture change rather than detect a coordinate relocation.
+    // ED3 takes only the shell integration metadata wholly in the erased
+    // history (handler_csi). The running block is on the screen, so it, its
+    // anchor and the pet's interest in it stay as they were.
+    assert_eq!(
+        s.term.all_blocks().map(|b| b.id).collect::<Vec<_>>(),
+        [anchor.block_id]
+    );
+    assert!(world.resolve(anchor).is_some());
+    assert_eq!(s.brain.console_anchor_id(), Some(anchor.block_id));
     assert_eq!(
         (after.col, after.row, after.lift),
         (before.col, before.row, before.lift),

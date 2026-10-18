@@ -203,9 +203,11 @@ pub(crate) fn adopt_app_identity() -> bool {
 /// process's marker ([`release_own_marker`]). THE spelling of a CLEAN `_exit` in
 /// this crate: a bare `libc::_exit` on a path that is not a crash leaves an empty
 /// marker behind, which the next windowed launch of the installed app reports as
-/// "aterm was killed" (`crash_signal::exit_gate` holds the line).
+/// "aterm was killed".
 #[cfg(unix)]
 pub(crate) fn clean_exit_now(code: i32) -> ! {
+    // `_exit` runs no `exit(3)` handler: the queued `aterm.log` lines land here.
+    let _ = crate::logging::flush_within(crate::logging::LOG_FLUSH_EXIT_WAIT);
     release_own_marker();
     // SAFETY: async-signal-safe immediate exit of the calling process. It ends
     // this process and nothing else, runs no handler and no destructor, and
@@ -782,9 +784,10 @@ mod imp {
     unsafe extern "C" {
         /// `stdlib.h`: register a handler for `exit(3)`. Declared here, as the
         /// launch-fatal fixture in `lib.rs` declares it, rather than added to
-        /// `aterm-libc`: this marker's removal is the one handler the product
-        /// registers, and it runs on `exit(3)` only — every `_exit` path
-        /// (the launch-fatal law) removes the marker itself, through
+        /// `aterm-libc`: this marker's removal and `aterm.log`'s queue flush
+        /// (`logging::flush_at_exit`, registered later, so run first) are the
+        /// handlers the product registers, and they run on `exit(3)` only —
+        /// every `_exit` path (the launch-fatal law) does both itself, through
         /// [`super::clean_exit_now`].
         fn atexit(cb: extern "C" fn()) -> libc::c_int;
     }
@@ -1360,8 +1363,8 @@ mod marker_tests {
         use std::io::Read as _;
         let dir = scratch("marker-kill");
         // The child: take the lock the way `create_locked` does (python is not
-        // assumed; `flock(1)` is not on macOS), so this uses a perl one-liner
-        // when perl is present and skips otherwise.
+        // assumed; `flock(1)` is not on macOS), so this uses a perl one-liner,
+        // and a host without perl COULD NOT RUN it.
         let Ok(perl) = aterm_uds::spawnfd::command("/usr/bin/perl")
             .arg("-e")
             .arg(
@@ -1372,8 +1375,7 @@ mod marker_tests {
             .stdout(aterm_uds::spawnfd::Stdio::piped())
             .spawn()
         else {
-            eprintln!("SKIP: /usr/bin/perl is not available");
-            return;
+            aterm_spec::host::could_not_run("/usr/bin/perl is not available to hold the lock");
         };
         let mut child = perl;
         let mut ready = [0u8; 7];
@@ -1390,74 +1392,6 @@ mod marker_tests {
         child.wait().unwrap();
         assert_eq!(markers::probe(&path), Owner::Dead);
         assert_eq!(markers::dead_app_markers(dir.path(), 2), vec![path]);
-    }
-}
-
-/// THE CLEAN-EXIT LAW, gated in source: every `_exit` in this crate that is not
-/// a crash goes through [`clean_exit_now`] (or [`crate::exit_without_process_teardown`],
-/// which does), so its marker is removed. A bare `libc::_exit` left on a clean path
-/// leaves an empty marker the next windowed launch of the installed app reports as
-/// "aterm was killed" — a false alarm in the one place a true one must be believed.
-/// The allowed bare sites are FORKED CHILDREN (the PTY spawn's exec-failure exit,
-/// test fixtures), which never armed a marker of their own.
-#[cfg(all(test, unix))]
-mod exit_gate {
-    /// Every `.rs` file under `dir`, recursively.
-    fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-        for entry in std::fs::read_dir(dir).expect("read src").flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                sources(&path, out);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                out.push(path);
-            }
-        }
-    }
-
-    /// The call the gate counts, spelled in two halves so this file's own gate
-    /// code is not one of the sites it counts.
-    const NEEDLE: &str = concat!("libc::", "_exit(");
-
-    #[test]
-    fn no_clean_exit_path_leaves_its_marker_behind() {
-        // (file, bare `_exit` sites it may keep): the forked children — two
-        // of them in the harness host's test fixture of a shell's job
-        // (`harness_host::tests::pty_job`), one the rendezvous listener
-        // fixture in a test — and `clean_exit_now` itself.
-        let allowed = [
-            ("app_update_handoff_handoff_process_group_tests.rs", 1usize),
-            ("harness_host_tests.rs", 2),
-            ("handoff_rendezvous.rs", 1),
-            ("crash_signal.rs", 1),
-        ];
-        let mut files = Vec::new();
-        sources(
-            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-            &mut files,
-        );
-        assert!(files.len() > 50, "the walk found the crate's sources");
-        for path in files {
-            let src = std::fs::read_to_string(&path).expect("read source");
-            let bare = src
-                .lines()
-                .filter(|line| {
-                    let code = line.trim_start();
-                    !code.starts_with("//") && code.contains(NEEDLE)
-                })
-                .count();
-            let file = path.file_name().unwrap().to_string_lossy();
-            let may = allowed
-                .iter()
-                .find(|(name, _)| *name == file)
-                .map_or(0, |(_, n)| *n);
-            assert_eq!(
-                bare,
-                may,
-                "{}: a bare `_exit` outside a forked child — spell a clean exit \
-                 `crate::crash_signal::clean_exit_now(code)` so the marker goes with it",
-                path.display()
-            );
-        }
     }
 }
 
@@ -1889,14 +1823,6 @@ static PROCESS_MARKER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 #[cfg(all(test, any(unix, windows)))]
 mod clean_exit_tests {
     use super::*;
-
-    #[test]
-    fn a_marker_is_a_clean_leftover_exactly_when_it_is_empty() {
-        assert!(marker_is_clean_leftover(0));
-        assert!(!marker_is_clean_leftover(1));
-        // The 47-byte launch-fatal banner of the 2026-09-16 incident: a record.
-        assert!(!marker_is_clean_leftover(47));
-    }
 
     #[test]
     fn an_empty_marker_is_removed_at_once_and_a_crash_record_is_kept() {

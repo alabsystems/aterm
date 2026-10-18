@@ -10,15 +10,16 @@
 //! sampled as `app_render.rs`'s frame hold samples them, fed to `CursorGlow` on a
 //! 16 ms frame train) aimed at that gesture: four phrases at 12 cps with 0.3–3 s
 //! pauses, the boundary space as the last key before the pause or the first after
-//! it, through zsh and an Ink-shaped composer (`docs/design/repro/inkish.py`), plus
+//! it, through zsh and an Ink-shaped composer (this file's `Composer::Ink`), plus
 //! what a real Ink composer adds: its own inverse-video cursor cell, keys coalesced
 //! into one repaint, repaints during a pause with no content change, and a space's
 //! repaint landing past the typed hint's quarter-second freshness.
 //!
-//! [`Composer::ClaudeCode`] writes the frames `ptyrec.py` recorded from Claude Code
-//! mid-turn: a letter is one DEC 2026 bracket (hide, home, CR, CUF to the column,
-//! CUD to the row, one glyph, park at the last row, CUP back after the glyph, show),
-//! a space is a bracket with only the CUP, and ~0.95 s into a pause one frame erases
+//! [`Composer::ClaudeCode`] writes the frames a `targo --unverified lab ptyrec`
+//! take (agent-live) recorded from Claude Code mid-turn: a letter is one DEC 2026
+//! bracket (hide, home, CR, CUF to the column, CUD to the row, one glyph, park at
+//! the last row, CUP back after the glyph, show), a space is a bracket with only
+//! the CUP, and ~0.95 s into a pause one frame erases
 //! part of a status row. Its dials ([`CcShape`]): the spinner frame every 100 ms on
 //! `ROW - 3`, keys coalesced into one frame, PTY-sized chunks with the host's present
 //! rule between, and a key's frame up to half a second after its key. The present
@@ -54,7 +55,7 @@ const BURSTS: [&str; 4] = ["Adding", "Fable.", "HEY!", "zoom out. git pull"];
 /// 12 cps.
 const KEY_MS: u64 = 83;
 const FRAME_MS: u64 = 16;
-/// `inkish.py`'s split between the redraw's head and its tail.
+/// The Ink-shaped composer's split between the redraw's head and its tail.
 const INK_SPLIT_MS: u64 = 30;
 /// The thinking pauses swept, ms — either side of the 900 ms phrase rest.
 const PAUSES: [u64; 7] = [300, 700, 950, 1200, 1500, 2000, 3000];
@@ -102,7 +103,8 @@ fn line() -> String {
     BURSTS.join(" ")
 }
 
-/// What an Ink composer does beyond `inkish.py`.
+/// What an Ink composer does beyond the plain Ink-shaped redraw
+/// (`Shape::default()`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Shape {
     /// Draw an inverse-video SPACE cell right after the text — Claude Code's
@@ -376,7 +378,7 @@ impl Host {
         match composer {
             // The shell's prompt, two cells, on the composer's row.
             Composer::Zsh => term.process(format!("\x1b[{};1H% ", ROW + 1).as_bytes()),
-            // `inkish.py`'s entry: the alt screen, cleared.
+            // The Ink-shaped composer's entry: the alt screen, cleared.
             Composer::Ink(_) => term.process(b"\x1b[?1049h\x1b[2J"),
             // Claude Code's: the alt screen, the empty composer a bare `❯`, the
             // caret two cells in.
@@ -1155,16 +1157,18 @@ fn mark(t: &Take) -> &'static str {
     }
 }
 
-/// The sweep for one composer and seam: both placements, every pause, every take
-/// printed with its [`mark`].
-fn sweep(composer: Composer, seam: Seam) -> Vec<Take> {
+/// The sweep for each `(composer, seam)`: both placements, every pause, every
+/// take printed with its [`mark`].
+fn sweep(runs: &[(Composer, Seam)]) -> Vec<Take> {
     let mut grid = Vec::new();
-    for placement in [Placement::SpaceBeforePause, Placement::SpaceAfterPause] {
-        for &pause in &PAUSES {
-            grid.push((placement, pause));
+    for &(composer, seam) in runs {
+        for placement in [Placement::SpaceBeforePause, Placement::SpaceAfterPause] {
+            for &pause in &PAUSES {
+                grid.push((composer, seam, placement, pause));
+            }
         }
     }
-    let takes = run_takes(&grid, |&(placement, pause)| {
+    let takes = run_takes(&grid, |&(composer, seam, placement, pause)| {
         take(composer, seam, placement, pause)
     });
     for t in &takes {
@@ -1205,50 +1209,85 @@ fn ink(shape: Shape) -> Composer {
     Composer::Ink(shape)
 }
 
-// ---- (1) the bare gesture through both composers, both seams ----------
-
+/// (1) The bare gesture through zsh and the plain Ink-shaped redraw
+/// (`Shape::default()`), both seams.
+///
+/// (2) What a real Ink composer does that the plain Ink shape does not, each with
+/// Claude Code's own inverse-video cursor cell after the text, redrawn with
+/// the whole line on every key (the DEC caret shown at the caret):
+///
+/// * (i) the cursor cell alone;
+/// * (ii) keys coalesced into one repaint under load — two, and the three the
+///   owner's ring showed licensed as one key;
+/// * (iii) a content-free repaint half-way through every pause;
+/// * (iv) the space's repaint landing late, either side of the typed hint's
+///   250 ms freshness, with nothing after it at a burst's end;
+/// * (v) the row sampled mid-rewrite with one letter blank and the next
+///   burst's first key 50 ms later, inside the partial release's melt, then
+///   the rewrite completing. The witness must not take the run's never-armed
+///   spaces onto the retract with the blanked glyph, and the identical
+///   redraw's restore (`Ribbon::restore_releases`) must survive the new key
+///   changing the cohort's cell count.
 #[test]
-fn phrases_typed_in_bursts_through_zsh_keep_every_boundary_space_lit() {
-    let mut takes = sweep(Composer::Zsh, Seam::Plain);
-    takes.extend(sweep(Composer::Zsh, Seam::Classed));
-    assert_takes(&takes);
-}
-
-#[test]
-fn phrases_typed_in_bursts_through_an_ink_repaint_keep_every_boundary_space_lit() {
-    let mut takes = sweep(ink(Shape::default()), Seam::Plain);
-    takes.extend(sweep(ink(Shape::default()), Seam::Classed));
-    assert_takes(&takes);
-}
-
-// ---- (2) what a real Ink composer does that inkish.py does not ----------
-
-/// (i) Claude Code's own inverse-video cursor cell after the text, redrawn
-/// with the whole line on every key — the DEC caret shown at the caret.
-#[test]
-fn an_ink_composer_with_its_own_cursor_cell_keeps_every_boundary_space_lit() {
-    let takes = sweep(
-        ink(Shape {
-            cursor_cell: true,
-            ..Shape::default()
-        }),
-        Seam::Classed,
-    );
-    assert_takes(&takes);
+fn phrases_typed_in_bursts_keep_every_boundary_space_lit() {
+    let cell = Shape {
+        cursor_cell: true,
+        ..Shape::default()
+    };
+    let mut runs = vec![
+        (Composer::Zsh, Seam::Plain),
+        (Composer::Zsh, Seam::Classed),
+        (ink(Shape::default()), Seam::Plain),
+        (ink(Shape::default()), Seam::Classed),
+        (ink(cell), Seam::Classed),
+        (
+            ink(Shape {
+                idle_repaint: true,
+                ..cell
+            }),
+            Seam::Classed,
+        ),
+        (
+            ink(Shape {
+                mid_rewrite_blank: true,
+                ..cell
+            }),
+            Seam::Classed,
+        ),
+    ];
+    for n in [2, 3] {
+        runs.push((
+            ink(Shape {
+                coalesce: n,
+                ..cell
+            }),
+            Seam::Classed,
+        ));
+    }
+    for late in [150, 240, 300, 500, 800] {
+        runs.push((
+            ink(Shape {
+                late_space_ms: late,
+                ..cell
+            }),
+            Seam::Classed,
+        ));
+    }
+    assert_takes(&sweep(&runs));
 }
 
 /// (i′) …and with the DEC caret never shown again: the cursor cell is the
 /// only caret on glass.
 #[test]
 fn an_ink_composer_with_a_hidden_caret_keeps_every_boundary_space_lit() {
-    let takes = sweep(
+    let takes = sweep(&[(
         ink(Shape {
             cursor_cell: true,
             hidden_caret: true,
             ..Shape::default()
         }),
         Seam::Classed,
-    );
+    )]);
     // A caret never shown licenses nothing: the whole line stays dark on every
     // take, which is not a hole. Lighting part of it under a hidden caret would
     // be a licence with no caret. Asserted so the sweep cannot pass vacuously.
@@ -1275,99 +1314,33 @@ fn an_ink_composer_with_a_hidden_caret_keeps_every_boundary_space_lit() {
     );
 }
 
-/// (ii) two or three keys coalesced into one repaint under load.
-#[test]
-fn an_ink_composer_coalescing_keys_into_one_repaint_keeps_every_boundary_space_lit() {
-    let mut takes = Vec::new();
-    for n in [2, 3] {
-        takes.extend(sweep(
-            ink(Shape {
-                cursor_cell: true,
-                coalesce: n,
-                ..Shape::default()
-            }),
-            Seam::Classed,
-        ));
-    }
-    assert_takes(&takes);
-}
-
-/// (iii) a content-free repaint half-way through every pause.
-#[test]
-fn an_ink_composer_repainting_mid_pause_keeps_every_boundary_space_lit() {
-    let takes = sweep(
-        ink(Shape {
-            cursor_cell: true,
-            idle_repaint: true,
-            ..Shape::default()
-        }),
-        Seam::Classed,
-    );
-    assert_takes(&takes);
-}
-
-/// (iv) The space's repaint lands late, either side of the typed hint's 250 ms
-/// freshness, with nothing after it at a burst's end.
-#[test]
-fn an_ink_composer_whose_space_repaints_late_keeps_every_boundary_space_lit() {
-    let mut takes = Vec::new();
-    for late in [150, 240, 300, 500, 800] {
-        takes.extend(sweep(
-            ink(Shape {
-                cursor_cell: true,
-                late_space_ms: late,
-                ..Shape::default()
-            }),
-            Seam::Classed,
-        ));
-    }
-    assert_takes(&takes);
-}
-
-/// (v) The row sampled mid-rewrite with one letter blank and the next burst's
-/// first key 50 ms later, inside the partial release's melt, then the rewrite
-/// completing. The witness must not take the run's never-armed spaces onto the
-/// retract with the blanked glyph, and the identical redraw's restore
-/// (`Ribbon::restore_releases`) must survive the new key changing the cohort's
-/// cell count.
-#[test]
-fn an_ink_composer_sampled_mid_rewrite_with_a_key_inside_the_melt_keeps_every_boundary_space_lit() {
-    let takes = sweep(
-        ink(Shape {
-            cursor_cell: true,
-            mid_rewrite_blank: true,
-            ..Shape::default()
-        }),
-        Seam::Classed,
-    );
-    assert_takes(&takes);
-}
-
 // ---- (3) Claude Code's own bytes, mid-turn ------------------------------
 
-/// The Claude Code sweep for one `(spinner, cadence)`: coalesce × chunk × split
-/// × pause × placement, one printed line per take, buffered so parallel tests
-/// never interleave.
-fn cc_sweep(spinner: bool, key_ms: u64) -> Vec<Take> {
+/// The Claude Code sweep for each `(spinner, cadence)`: coalesce × chunk ×
+/// split × pause × placement, one printed line per take, buffered so parallel
+/// tests never interleave.
+fn cc_sweep(runs: &[(bool, u64)]) -> Vec<Take> {
     let mut grid = Vec::new();
-    for coalesce in [1, 2, 3] {
-        for chunk in [Chunk::Whole, Chunk::Pty64] {
-            for &split_ms in &CC_SPLITS {
-                let shape = CcShape {
-                    spinner,
-                    coalesce,
-                    chunk,
-                    split_ms,
-                };
-                for placement in [Placement::SpaceBeforePause, Placement::SpaceAfterPause] {
-                    for &pause in &CC_PAUSES {
-                        grid.push((shape, placement, pause));
+    for &(spinner, key_ms) in runs {
+        for coalesce in [1, 2, 3] {
+            for chunk in [Chunk::Whole, Chunk::Pty64] {
+                for &split_ms in &CC_SPLITS {
+                    let shape = CcShape {
+                        spinner,
+                        coalesce,
+                        chunk,
+                        split_ms,
+                    };
+                    for placement in [Placement::SpaceBeforePause, Placement::SpaceAfterPause] {
+                        for &pause in &CC_PAUSES {
+                            grid.push((shape, placement, pause, key_ms));
+                        }
                     }
                 }
             }
         }
     }
-    let takes = run_takes(&grid, |&(shape, placement, pause)| {
+    let takes = run_takes(&grid, |&(shape, placement, pause, key_ms)| {
         take_at(
             Composer::ClaudeCode(shape),
             Seam::Classed,
@@ -1411,30 +1384,17 @@ fn assert_cc_takes(takes: &[Take]) {
     );
 }
 
-/// The recorded bytes, the composer idle (no turn): the letter, space and
-/// mid-pause frames alone, then coalesced, chunked and split.
+/// The recorded bytes at 10 and 25 cps, with the composer idle (no turn: the
+/// letter, space and mid-pause frames alone, then coalesced, chunked and
+/// split) and mid-turn (the owner's moment: a turn running, the spinner frame
+/// every 100 ms on `ROW - 3` between the keys and their frames).
 #[test]
-fn claude_code_s_recorded_frames_idle_keep_every_boundary_space_lit_at_10cps() {
-    let takes = cc_sweep(false, CC_CADENCES[0]);
-    assert_cc_takes(&takes);
-}
-
-#[test]
-fn claude_code_s_recorded_frames_idle_keep_every_boundary_space_lit_at_25cps() {
-    let takes = cc_sweep(false, CC_CADENCES[1]);
-    assert_cc_takes(&takes);
-}
-
-/// Mid-turn: the spinner frame every 100 ms on `ROW - 3` between the keys and
-/// their frames.
-#[test]
-fn claude_code_s_recorded_frames_mid_turn_keep_every_boundary_space_lit_at_10cps() {
-    let takes = cc_sweep(true, CC_CADENCES[0]);
-    assert_cc_takes(&takes);
-}
-
-#[test]
-fn claude_code_s_recorded_frames_mid_turn_keep_every_boundary_space_lit_at_25cps() {
-    let takes = cc_sweep(true, CC_CADENCES[1]);
-    assert_cc_takes(&takes);
+fn claude_code_s_recorded_frames_keep_every_boundary_space_lit() {
+    let mut runs = Vec::new();
+    for spinner in [false, true] {
+        for key_ms in CC_CADENCES {
+            runs.push((spinner, key_ms));
+        }
+    }
+    assert_cc_takes(&cc_sweep(&runs));
 }

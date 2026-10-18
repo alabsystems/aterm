@@ -11,7 +11,7 @@
 //! DECLRMM LF scrolling at the bottom margin, and DECRC (restores the flag).
 
 use super::Grid;
-#[cfg(any(test, feature = "fuzz", fuzzing))]
+#[cfg(test)]
 use super::clamp_u16;
 
 impl Grid {
@@ -48,7 +48,7 @@ impl Grid {
     /// REQUIRES: self.storage.visible_rows > 0
     /// ENSURES: self.storage.cursor.row < self.storage.visible_rows
     /// ENSURES: self.storage.cursor.col <= self.storage.max_col_for_row(self.storage.cursor.row)
-    #[cfg(any(test, feature = "fuzz", fuzzing))]
+    #[cfg(test)]
     #[inline]
     pub fn move_cursor_by(&mut self, dr: i32, dc: i32) {
         let new_row = clamp_u16(i32::from(self.storage.cursor.row) + dr);
@@ -307,11 +307,18 @@ impl Grid {
                 self.storage.cursor.row = self.storage.cursor.row.saturating_add(1);
             }
             std::cmp::Ordering::Equal => {
-                // Rectangular scroll, only with the cursor inside the margins;
-                // pending_wrap is kept (xterm xtermScroll saves and restores it).
+                // Rectangular scroll, only with the cursor inside the margins.
+                // Either way the wrap goes, as in `line_feed`: xterm's
+                // `xtermIndex` moves the cursor first (`CursorDown` by 1 outside
+                // the margins, which the bottom margin stops; by 0 before
+                // `xtermScroll` inside them), and `CursorDown` calls `ResetWrap`
+                // even for zero rows. Keeping it let the next glyph wrap and
+                // scroll the rectangle a second time
+                // (`\x1b[?69h\x1b[2;5s\x1b[3;5Ha\nZ`).
                 if cursor_in_margins {
                     self.scroll_region_up_margined(1, margins.left, margins.right);
                 }
+                self.storage.clear_pending_wrap();
             }
             std::cmp::Ordering::Greater => {
                 self.storage.clear_pending_wrap();
@@ -341,8 +348,12 @@ impl Grid {
                 self.storage.cursor.row = self.storage.cursor.row.saturating_sub(1);
             }
             std::cmp::Ordering::Equal => {
-                // pending_wrap is kept: xterm RevScroll never touches do_wrap.
+                // xterm `RevIndex` at the top margin is `RevScroll(1)` then
+                // `CursorUp(screen, 0)`, and CursorUp calls `ResetWrap` even for
+                // zero rows (cursor.c): the wrap goes. Only SD, which is
+                // `RevScroll` alone, keeps it.
                 self.scroll_region_down(1);
+                self.storage.clear_pending_wrap();
             }
             std::cmp::Ordering::Less => {
                 self.storage.clear_pending_wrap();
@@ -394,11 +405,14 @@ impl Grid {
                 self.storage.cursor.row = self.storage.cursor.row.saturating_sub(1);
             }
             std::cmp::Ordering::Equal => {
-                // Rectangular scroll, only with the cursor inside the margins;
-                // pending_wrap is kept (xterm RevScroll never touches it).
+                // Rectangular scroll, only with the cursor inside the margins.
+                // Either way xterm's `RevIndex` ends in `CursorUp` (by 1 outside
+                // the margins, which the top margin stops; by 0 after the
+                // scroll), whose `ResetWrap` clears the wrap.
                 if cursor_in_margins {
                     self.scroll_region_down_margined(1, margins.left, margins.right);
                 }
+                self.storage.clear_pending_wrap();
             }
             std::cmp::Ordering::Less => {
                 self.storage.clear_pending_wrap();
@@ -472,474 +486,570 @@ impl Grid {
 mod tests {
     use crate::{Cursor, Grid};
 
-    // set_cursor — absolute positioning and clamping
+    type Motion = fn(&mut Grid);
 
-    #[test]
-    fn set_cursor_exact_position() {
-        let mut grid = Grid::new(24, 80);
-        grid.set_cursor(12, 40);
-        assert_eq!(grid.cursor_row(), 12);
-        assert_eq!(grid.cursor_col(), 40);
+    /// One cursor motion from a start position under an optional DECSTBM region
+    /// and DECLRMM margins, and where it must land. `wrap` arms the pending
+    /// wrap first; every such motion must clear it.
+    struct Case {
+        name: &'static str,
+        size: (u16, u16),
+        region: Option<(u16, u16)>,
+        margins: Option<(u16, u16)>,
+        from: (u16, u16),
+        wrap: bool,
+        motion: Motion,
+        want: (u16, u16),
     }
 
-    #[test]
-    fn set_cursor_clamps_row_to_last_visible() {
-        let mut grid = Grid::new(10, 80);
-        grid.set_cursor(100, 5);
-        assert_eq!(grid.cursor_row(), 9);
-        assert_eq!(grid.cursor_col(), 5);
-    }
-
-    #[test]
-    fn set_cursor_clamps_col_to_max() {
-        let mut grid = Grid::new(10, 20);
-        grid.set_cursor(3, 200);
-        assert_eq!(grid.cursor_row(), 3);
-        assert_eq!(grid.cursor_col(), 19);
-    }
-
-    #[test]
-    fn set_cursor_clamps_both_row_and_col() {
-        let mut grid = Grid::new(5, 10);
-        grid.set_cursor(u16::MAX, u16::MAX);
-        assert_eq!(grid.cursor_row(), 4);
-        assert_eq!(grid.cursor_col(), 9);
-    }
-
-    #[test]
-    fn set_cursor_clears_pending_wrap() {
-        let mut grid = Grid::new(24, 80);
-        grid.set_pending_wrap(true);
-        assert!(grid.pending_wrap());
-        grid.set_cursor(5, 5);
-        assert!(!grid.pending_wrap());
-    }
-
-    // move_cursor_to — alias for set_cursor
-
-    #[test]
-    fn move_cursor_to_lands_or_clamps() {
-        // (grid rows, cols, target, expected cursor).
-        for (rows, cols, (row, col), want) in [
-            (24, 80, (10, 20), Cursor::new(10, 20)),
-            (5, 10, (50, 50), Cursor::new(4, 9)),
-        ] {
-            let mut grid = Grid::new(rows, cols);
-            grid.move_cursor_to(row, col);
-            assert_eq!(grid.cursor(), want, "{rows}x{cols} -> ({row}, {col})");
+    const fn case(
+        name: &'static str,
+        size: (u16, u16),
+        from: (u16, u16),
+        motion: Motion,
+        want: (u16, u16),
+    ) -> Case {
+        Case {
+            name,
+            size,
+            region: None,
+            margins: None,
+            from,
+            wrap: false,
+            motion,
+            want,
         }
     }
 
-    // cursor_up — vertical movement, scroll region interaction
-
-    #[test]
-    fn cursor_up_basic() {
-        let mut grid = Grid::new(24, 80);
-        grid.set_cursor(10, 5);
-        grid.cursor_up(3);
-        assert_eq!(grid.cursor_row(), 7);
-        assert_eq!(grid.cursor_col(), 5); // column unchanged
+    const fn region(mut c: Case, top: u16, bottom: u16) -> Case {
+        c.region = Some((top, bottom));
+        c
     }
 
-    #[test]
-    fn cursor_up_stops_at_row_zero_no_region() {
-        let mut grid = Grid::new(10, 80);
-        grid.set_cursor(2, 5);
-        grid.cursor_up(100);
-        assert_eq!(grid.cursor_row(), 0);
+    const fn margins(mut c: Case, left: u16, right: u16) -> Case {
+        c.margins = Some((left, right));
+        c
     }
 
-    #[test]
-    fn cursor_up_within_scroll_region_stops_at_top_margin() {
-        let mut grid = Grid::new(20, 80);
-        grid.set_scroll_region(5, 15);
-        grid.set_cursor(10, 0);
-        grid.cursor_up(100);
-        assert_eq!(grid.cursor_row(), 5);
+    const fn wrap(mut c: Case) -> Case {
+        c.wrap = true;
+        c
     }
 
+    /// EVERY CURSOR MOTION LANDS WHERE XTERM PUTS IT: absolute moves clamp to
+    /// the screen; CUU/CUD clamp on the margin they cross toward (even from
+    /// outside the region), VPR on the screen edge; CUF/CUB and CR honour
+    /// DECLRMM margins only in margin mode and only from inside them; LF/RI
+    /// scroll at the region edge and move freely outside it; and each motion
+    /// that consumes the pending wrap clears it.
     #[test]
-    fn cursor_up_above_scroll_region_stops_at_zero() {
-        let mut grid = Grid::new(20, 80);
-        grid.set_scroll_region(5, 15);
-        grid.set_cursor(2, 0); // above region
-        grid.cursor_up(100);
-        assert_eq!(grid.cursor_row(), 0);
+    fn every_motion_lands_where_xterm_puts_it() {
+        let cases = [
+            wrap(case(
+                "CUP",
+                (24, 80),
+                (0, 0),
+                |g| g.set_cursor(12, 40),
+                (12, 40),
+            )),
+            case(
+                "CUP clamps row",
+                (10, 80),
+                (0, 0),
+                |g| g.set_cursor(100, 5),
+                (9, 5),
+            ),
+            case(
+                "CUP clamps col",
+                (10, 20),
+                (0, 0),
+                |g| g.set_cursor(3, 200),
+                (3, 19),
+            ),
+            case(
+                "CUP clamps both",
+                (5, 10),
+                (0, 0),
+                |g| g.set_cursor(u16::MAX, u16::MAX),
+                (4, 9),
+            ),
+            case(
+                "move_cursor_to clamps",
+                (5, 10),
+                (0, 0),
+                |g| g.move_cursor_to(50, 50),
+                (4, 9),
+            ),
+            wrap(case("CUU", (24, 80), (10, 5), |g| g.cursor_up(3), (7, 5))),
+            case("CUU 0", (24, 80), (10, 5), |g| g.cursor_up(0), (10, 5)),
+            case(
+                "CUU to row 0",
+                (10, 80),
+                (2, 5),
+                |g| g.cursor_up(100),
+                (0, 5),
+            ),
+            region(
+                case(
+                    "CUU in region",
+                    (20, 80),
+                    (10, 0),
+                    |g| g.cursor_up(100),
+                    (5, 0),
+                ),
+                5,
+                15,
+            ),
+            region(
+                case(
+                    "CUU above region",
+                    (20, 80),
+                    (2, 0),
+                    |g| g.cursor_up(100),
+                    (0, 0),
+                ),
+                5,
+                15,
+            ),
+            region(
+                case(
+                    "CUU below region",
+                    (20, 80),
+                    (15, 0),
+                    |g| g.cursor_up(100),
+                    (3, 0),
+                ),
+                3,
+                12,
+            ),
+            wrap(case(
+                "CUD",
+                (24, 80),
+                (5, 10),
+                |g| g.cursor_down(3),
+                (8, 10),
+            )),
+            case("CUD 0", (24, 80), (5, 10), |g| g.cursor_down(0), (5, 10)),
+            case(
+                "CUD to last row",
+                (10, 80),
+                (5, 0),
+                |g| g.cursor_down(100),
+                (9, 0),
+            ),
+            region(
+                case(
+                    "CUD in region",
+                    (20, 80),
+                    (8, 0),
+                    |g| g.cursor_down(100),
+                    (12, 0),
+                ),
+                3,
+                12,
+            ),
+            region(
+                case(
+                    "CUD below region",
+                    (20, 80),
+                    (15, 0),
+                    |g| g.cursor_down(100),
+                    (19, 0),
+                ),
+                3,
+                12,
+            ),
+            region(
+                case(
+                    "CUD above region",
+                    (20, 80),
+                    (1, 0),
+                    |g| g.cursor_down(100),
+                    (12, 0),
+                ),
+                3,
+                12,
+            ),
+            region(
+                case(
+                    "VPR ignores the region",
+                    (20, 80),
+                    (5, 0),
+                    |g| g.line_position_relative(100),
+                    (19, 0),
+                ),
+                3,
+                12,
+            ),
+            case("CUF", (10, 80), (0, 10), |g| g.cursor_forward(5), (0, 15)),
+            case(
+                "CUF to edge",
+                (10, 20),
+                (0, 15),
+                |g| g.cursor_forward(100),
+                (0, 19),
+            ),
+            wrap(case(
+                "CUF 0",
+                (10, 80),
+                (0, 79),
+                |g| g.cursor_forward(0),
+                (0, 79),
+            )),
+            case("CUB", (10, 80), (0, 20), |g| g.cursor_backward(5), (0, 15)),
+            case(
+                "CUB to col 0",
+                (10, 80),
+                (0, 3),
+                |g| g.cursor_backward(100),
+                (0, 0),
+            ),
+            case(
+                "CUB at col 0",
+                (10, 80),
+                (0, 0),
+                |g| g.cursor_backward(5),
+                (0, 0),
+            ),
+            wrap(case(
+                "CUB wrapped",
+                (10, 80),
+                (0, 79),
+                |g| g.cursor_backward(1),
+                (0, 78),
+            )),
+            wrap(case("CR", (10, 80), (5, 40), Grid::carriage_return, (5, 0))),
+            case(
+                "CR no margin mode",
+                (10, 80),
+                (0, 40),
+                |g| g.carriage_return_margin(false),
+                (0, 0),
+            ),
+            margins(
+                case(
+                    "CR in margins",
+                    (10, 80),
+                    (0, 40),
+                    |g| g.carriage_return_margin(true),
+                    (0, 10),
+                ),
+                10,
+                70,
+            ),
+            margins(
+                case(
+                    "CR left of margin",
+                    (10, 80),
+                    (0, 5),
+                    |g| g.carriage_return_margin(true),
+                    (0, 0),
+                ),
+                10,
+                70,
+            ),
+            case(
+                "CUF no margin mode",
+                (10, 80),
+                (0, 10),
+                |g| g.cursor_forward_margin(5, false),
+                (0, 15),
+            ),
+            margins(
+                case(
+                    "CUF in margins",
+                    (10, 80),
+                    (0, 30),
+                    |g| g.cursor_forward_margin(100, true),
+                    (0, 50),
+                ),
+                10,
+                50,
+            ),
+            margins(
+                case(
+                    "CUF outside margins",
+                    (10, 80),
+                    (0, 5),
+                    |g| g.cursor_forward_margin(100, true),
+                    (0, 79),
+                ),
+                10,
+                50,
+            ),
+            case(
+                "CUB no margin mode",
+                (10, 80),
+                (0, 20),
+                |g| g.cursor_backward_margin(5, false),
+                (0, 15),
+            ),
+            margins(
+                case(
+                    "CUB in margins",
+                    (10, 80),
+                    (0, 30),
+                    |g| g.cursor_backward_margin(100, true),
+                    (0, 10),
+                ),
+                10,
+                50,
+            ),
+            margins(
+                case(
+                    "CUB outside margins",
+                    (10, 80),
+                    (0, 5),
+                    |g| g.cursor_backward_margin(100, true),
+                    (0, 0),
+                ),
+                10,
+                50,
+            ),
+            case("LF", (24, 80), (5, 10), Grid::line_feed, (6, 10)),
+            region(
+                case(
+                    "LF at region bottom scrolls",
+                    (10, 80),
+                    (7, 0),
+                    Grid::line_feed,
+                    (7, 0),
+                ),
+                2,
+                7,
+            ),
+            region(
+                case("LF below region", (10, 80), (7, 0), Grid::line_feed, (8, 0)),
+                2,
+                5,
+            ),
+            region(
+                case(
+                    "LF at last row below region",
+                    (10, 80),
+                    (9, 0),
+                    Grid::line_feed,
+                    (9, 0),
+                ),
+                2,
+                5,
+            ),
+            wrap(case(
+                "RI",
+                (24, 80),
+                (5, 10),
+                Grid::reverse_line_feed,
+                (4, 10),
+            )),
+            region(
+                case(
+                    "RI at region top scrolls",
+                    (10, 80),
+                    (3, 0),
+                    Grid::reverse_line_feed,
+                    (3, 0),
+                ),
+                3,
+                7,
+            ),
+            region(
+                case(
+                    "RI above region",
+                    (10, 80),
+                    (2, 0),
+                    Grid::reverse_line_feed,
+                    (1, 0),
+                ),
+                5,
+                8,
+            ),
+            region(
+                case(
+                    "RI at row 0 above region",
+                    (10, 80),
+                    (0, 0),
+                    Grid::reverse_line_feed,
+                    (0, 0),
+                ),
+                3,
+                8,
+            ),
+        ];
+        for c in cases {
+            let mut grid = Grid::new(c.size.0, c.size.1);
+            if let Some((top, bottom)) = c.region {
+                grid.set_scroll_region(top, bottom);
+            }
+            if let Some((left, right)) = c.margins {
+                grid.set_horizontal_margins(left, right);
+            }
+            grid.set_cursor(c.from.0, c.from.1);
+            if c.wrap {
+                grid.set_pending_wrap(true);
+            }
+            (c.motion)(&mut grid);
+            assert_eq!(grid.cursor(), Cursor::new(c.want.0, c.want.1), "{}", c.name);
+            assert_eq!(
+                (grid.cursor_row(), grid.cursor_col()),
+                c.want,
+                "{}: accessors",
+                c.name
+            );
+            if c.wrap {
+                assert!(!grid.pending_wrap(), "{}: pending wrap survived", c.name);
+            }
+        }
     }
 
-    #[test]
-    fn cursor_up_zero_does_nothing() {
-        let mut grid = Grid::new(24, 80);
-        grid.set_cursor(10, 5);
-        grid.cursor_up(0);
-        assert_eq!(grid.cursor_row(), 10);
+    /// One arm an index at a margin can take.
+    #[derive(Clone, Copy, Debug)]
+    struct MarginArm {
+        /// DECLRMM.
+        mode: bool,
+        /// DECSLRM margins `(left, right)`, if set.
+        margins: Option<(u16, u16)>,
+        /// The cursor's column, a wrap pending there.
+        col: u16,
+        /// Whether the index scrolls the rectangle.
+        scrolls: bool,
     }
 
-    #[test]
-    fn cursor_up_clears_pending_wrap() {
-        let mut grid = Grid::new(24, 80);
-        grid.set_cursor(5, 79);
+    /// The four arms: DECLRMM off; on with the cursor on the right margin
+    /// inside the rectangle (the margins reach the last column, or stop short
+    /// of it); on with the cursor right of the margins, parked on the screen's
+    /// last column.
+    const MARGIN_ARMS: [MarginArm; 4] = [
+        MarginArm {
+            mode: false,
+            margins: None,
+            col: 9,
+            scrolls: true,
+        },
+        MarginArm {
+            mode: true,
+            margins: Some((2, 9)),
+            col: 9,
+            scrolls: true,
+        },
+        MarginArm {
+            mode: true,
+            margins: Some((2, 5)),
+            col: 5,
+            scrolls: true,
+        },
+        MarginArm {
+            mode: true,
+            margins: Some((2, 5)),
+            col: 9,
+            scrolls: false,
+        },
+    ];
+
+    /// A 4x10 grid for `arm`, with a marker `q` at (`row`, 3), inside every
+    /// arm's rectangle, and a pending wrap at (`row`, `arm.col`).
+    fn margin_arm_grid(row: u16, arm: MarginArm) -> Grid {
+        let mut grid = Grid::new(4, 10);
+        grid.set_cursor(row, 3);
+        grid.write_char('q');
+        if let Some((left, right)) = arm.margins {
+            grid.set_horizontal_margins(left, right);
+        }
+        // The margined path runs only with margins narrower than the screen:
+        // every DECLRMM arm reaches it.
+        assert_eq!(!grid.horizontal_margins().is_full(grid.cols()), arm.mode);
+        grid.set_cursor(row, arm.col);
         grid.set_pending_wrap(true);
-        grid.cursor_up(1);
-        assert!(!grid.pending_wrap());
-        assert_eq!(grid.cursor_row(), 4);
+        grid
     }
 
-    // cursor_down — vertical movement, scroll region interaction
-
+    /// At the top margin too: xterm's `RevIndex` scrolls, then `CursorUp(0)`
+    /// resets the wrap (outside the margins it is `CursorUp(1)`, which the
+    /// margin stops). Found by the astream-term differential oracle
+    /// (aterm-conformance `tests/vt_oracle`), which had aterm keep it; the
+    /// DECLRMM arms are checked here because the oracle's subset has none.
     #[test]
-    fn cursor_down_basic() {
-        let mut grid = Grid::new(24, 80);
-        grid.set_cursor(5, 10);
-        grid.cursor_down(3);
-        assert_eq!(grid.cursor_row(), 8);
-        assert_eq!(grid.cursor_col(), 10);
+    fn reverse_line_feed_at_the_top_margin_clears_pending_wrap() {
+        for arm in MARGIN_ARMS {
+            let mut grid = margin_arm_grid(0, arm);
+            grid.reverse_line_feed_margined(arm.mode);
+            assert!(!grid.pending_wrap(), "{arm:?}: the wrap goes");
+            assert_eq!(
+                (grid.cursor_row(), grid.cursor_col()),
+                (0, arm.col),
+                "{arm:?}"
+            );
+            let marker_row = if arm.scrolls { 1 } else { 0 };
+            assert_eq!(
+                grid.cell(marker_row, 3).map(|c| c.char()),
+                Some('q'),
+                "{arm:?}: the rectangle scrolls only with the cursor inside it"
+            );
+        }
     }
 
+    /// LF/IND at the bottom margin, the mirror image: xterm's `xtermIndex` is
+    /// `CursorDown` (by 0 to the margin, then `xtermScroll`; by 1 outside the
+    /// margins, which the margin stops), and `CursorDown` resets the wrap. The
+    /// margined arms kept it, so the next glyph wrapped and scrolled again.
     #[test]
-    fn cursor_down_stops_at_last_row_no_region() {
-        let mut grid = Grid::new(10, 80);
-        grid.set_cursor(5, 0);
-        grid.cursor_down(100);
-        assert_eq!(grid.cursor_row(), 9);
+    fn line_feed_at_the_bottom_margin_clears_pending_wrap() {
+        for arm in MARGIN_ARMS {
+            let mut grid = margin_arm_grid(3, arm);
+            grid.line_feed_margined(arm.mode);
+            assert!(!grid.pending_wrap(), "{arm:?}: the wrap goes");
+            assert_eq!(
+                (grid.cursor_row(), grid.cursor_col()),
+                (3, arm.col),
+                "{arm:?}"
+            );
+            let marker_row = if arm.scrolls { 2 } else { 3 };
+            assert_eq!(
+                grid.cell(marker_row, 3).map(|c| c.char()),
+                Some('q'),
+                "{arm:?}: the rectangle scrolls only with the cursor inside it"
+            );
+        }
     }
 
+    /// A one-row screen's region is that row, and a reverse index there
+    /// scrolls it out (xterm `RevScroll` clamps to one line and clears it).
     #[test]
-    fn cursor_down_within_scroll_region_stops_at_bottom_margin() {
-        let mut grid = Grid::new(20, 80);
-        grid.set_scroll_region(3, 12);
-        grid.set_cursor(8, 0);
-        grid.cursor_down(100);
-        assert_eq!(grid.cursor_row(), 12);
-    }
-
-    #[test]
-    fn cursor_down_below_scroll_region_stops_at_last_line() {
-        let mut grid = Grid::new(20, 80);
-        grid.set_scroll_region(3, 12);
-        grid.set_cursor(15, 0); // below region
-        grid.cursor_down(100);
-        assert_eq!(grid.cursor_row(), 19);
-    }
-
-    #[test]
-    fn cursor_down_above_scroll_region_stops_at_bottom_margin() {
-        // xterm CursorDown clamps on the bottom margin alone: a cursor above the
-        // region moving down still stops at the bottom margin, not the last line.
-        let mut grid = Grid::new(20, 80);
-        grid.set_scroll_region(3, 12);
-        grid.set_cursor(1, 0); // above region
-        grid.cursor_down(100);
-        assert_eq!(grid.cursor_row(), 12);
-    }
-
-    #[test]
-    fn cursor_up_below_scroll_region_stops_at_top_margin() {
-        // Symmetric: a cursor below the region moving up stops at the top margin.
-        let mut grid = Grid::new(20, 80);
-        grid.set_scroll_region(3, 12);
-        grid.set_cursor(15, 0); // below region
-        grid.cursor_up(100);
-        assert_eq!(grid.cursor_row(), 3);
-    }
-
-    #[test]
-    fn line_position_relative_ignores_bottom_margin() {
-        // VPR (CSI Ps e) is page-relative: it clamps to the screen edge, not the
-        // scroll region's bottom margin (unlike CUD).
-        let mut grid = Grid::new(20, 80);
-        grid.set_scroll_region(3, 12);
-        grid.set_cursor(5, 0);
-        grid.line_position_relative(100);
-        assert_eq!(grid.cursor_row(), 19);
-    }
-
-    #[test]
-    fn cursor_down_zero_does_nothing() {
-        let mut grid = Grid::new(24, 80);
-        grid.set_cursor(5, 10);
-        grid.cursor_down(0);
-        assert_eq!(grid.cursor_row(), 5);
-    }
-
-    #[test]
-    fn cursor_down_clears_pending_wrap() {
-        let mut grid = Grid::new(24, 80);
-        grid.set_cursor(5, 79);
-        grid.set_pending_wrap(true);
-        grid.cursor_down(1);
-        assert!(!grid.pending_wrap());
-        assert_eq!(grid.cursor_row(), 6);
-    }
-
-    // cursor_forward — horizontal movement right
-
-    #[test]
-    fn cursor_forward_basic() {
-        let mut grid = Grid::new(10, 80);
-        grid.set_cursor(0, 10);
-        grid.cursor_forward(5);
-        assert_eq!(grid.cursor_col(), 15);
-    }
-
-    #[test]
-    fn cursor_forward_stops_at_right_edge() {
-        let mut grid = Grid::new(10, 20);
-        grid.set_cursor(0, 15);
-        grid.cursor_forward(100);
-        assert_eq!(grid.cursor_col(), 19);
-    }
-
-    #[test]
-    fn cursor_forward_zero_does_nothing() {
-        let mut grid = Grid::new(10, 80);
-        grid.set_cursor(0, 10);
-        grid.cursor_forward(0);
-        assert_eq!(grid.cursor_col(), 10);
-    }
-
-    #[test]
-    fn cursor_forward_clears_pending_wrap() {
-        let mut grid = Grid::new(10, 80);
-        grid.set_cursor(0, 79);
-        grid.set_pending_wrap(true);
-        grid.cursor_forward(0);
-        assert!(!grid.pending_wrap());
-    }
-
-    // cursor_backward — horizontal movement left
-
-    #[test]
-    fn cursor_backward_basic() {
-        let mut grid = Grid::new(10, 80);
-        grid.set_cursor(0, 20);
-        grid.cursor_backward(5);
-        assert_eq!(grid.cursor_col(), 15);
-    }
-
-    #[test]
-    fn cursor_backward_stops_at_column_zero() {
-        let mut grid = Grid::new(10, 80);
-        grid.set_cursor(0, 3);
-        grid.cursor_backward(100);
-        assert_eq!(grid.cursor_col(), 0);
-    }
-
-    #[test]
-    fn cursor_backward_from_zero() {
-        let mut grid = Grid::new(10, 80);
+    fn reverse_line_feed_on_a_one_row_screen_blanks_the_row() {
+        let mut grid = Grid::new(1, 10);
+        grid.write_char('b');
         grid.set_cursor(0, 0);
-        grid.cursor_backward(5);
-        assert_eq!(grid.cursor_col(), 0);
-    }
-
-    #[test]
-    fn cursor_backward_clears_pending_wrap() {
-        let mut grid = Grid::new(10, 80);
-        grid.set_cursor(0, 79);
-        grid.set_pending_wrap(true);
-        grid.cursor_backward(1);
-        assert!(!grid.pending_wrap());
-        assert_eq!(grid.cursor_col(), 78);
-    }
-
-    // carriage_return
-
-    #[test]
-    fn carriage_return_moves_to_col_zero() {
-        let mut grid = Grid::new(10, 80);
-        grid.set_cursor(5, 40);
-        grid.carriage_return();
-        assert_eq!(grid.cursor_col(), 0);
-        assert_eq!(grid.cursor_row(), 5); // row unchanged
-    }
-
-    #[test]
-    fn carriage_return_clears_pending_wrap() {
-        let mut grid = Grid::new(10, 80);
-        grid.set_cursor(0, 79);
-        grid.set_pending_wrap(true);
-        grid.carriage_return();
-        assert!(!grid.pending_wrap());
-        assert_eq!(grid.cursor_col(), 0);
-    }
-
-    // carriage_return_margin — DECLRMM interaction
-
-    #[test]
-    fn carriage_return_margin_no_mode_goes_to_zero() {
-        let mut grid = Grid::new(10, 80);
-        grid.set_cursor(0, 40);
-        grid.carriage_return_margin(false);
-        assert_eq!(grid.cursor_col(), 0);
-    }
-
-    #[test]
-    fn carriage_return_margin_mode_cursor_in_margins() {
-        let mut grid = Grid::new(10, 80);
-        grid.set_horizontal_margins(10, 70);
-        grid.set_cursor(0, 40); // within margins [10..70]
-        grid.carriage_return_margin(true);
-        assert_eq!(grid.cursor_col(), 10);
-    }
-
-    #[test]
-    fn carriage_return_margin_mode_cursor_left_of_margin() {
-        let mut grid = Grid::new(10, 80);
-        grid.set_horizontal_margins(10, 70);
-        grid.set_cursor(0, 5); // left of left margin
-        grid.carriage_return_margin(true);
-        assert_eq!(grid.cursor_col(), 0);
-    }
-
-    // line_feed — scroll region interaction
-
-    #[test]
-    fn line_feed_moves_down_within_region() {
-        let mut grid = Grid::new(24, 80);
-        grid.set_cursor(5, 10);
-        grid.line_feed();
-        assert_eq!(grid.cursor_row(), 6);
-        assert_eq!(grid.cursor_col(), 10);
-    }
-
-    #[test]
-    fn line_feed_at_bottom_of_region_scrolls() {
-        let mut grid = Grid::new(10, 80);
-        grid.set_scroll_region(2, 7);
-        grid.set_cursor(7, 0); // at bottom of region
-        grid.line_feed();
-        // After scroll, cursor stays at row 7 (bottom of region)
-        assert_eq!(grid.cursor_row(), 7);
-    }
-
-    #[test]
-    fn line_feed_below_region_moves_down() {
-        let mut grid = Grid::new(10, 80);
-        grid.set_scroll_region(2, 5);
-        grid.set_cursor(7, 0); // below region
-        grid.line_feed();
-        assert_eq!(grid.cursor_row(), 8);
-    }
-
-    #[test]
-    fn line_feed_at_last_row_below_region_stays() {
-        let mut grid = Grid::new(10, 80);
-        grid.set_scroll_region(2, 5);
-        grid.set_cursor(9, 0); // last row, below region
-        grid.line_feed();
-        assert_eq!(grid.cursor_row(), 9);
-    }
-
-    // reverse_line_feed
-
-    #[test]
-    fn reverse_line_feed_moves_up_within_region() {
-        let mut grid = Grid::new(24, 80);
-        grid.set_cursor(5, 10);
         grid.reverse_line_feed();
-        assert_eq!(grid.cursor_row(), 4);
-        assert_eq!(grid.cursor_col(), 10);
+        assert_eq!(grid.cell(0, 0).map(|c| c.char()), Some(' '));
     }
 
+    /// The same under DECLRMM margins: an index either way on a one-row
+    /// screen blanks the margin rectangle of its row and nothing outside it,
+    /// as the full-width ops blank the whole row (the margined scrolls used to
+    /// return early on `top == bottom` and leave the row standing).
     #[test]
-    fn reverse_line_feed_at_top_of_region_scrolls_down() {
-        let mut grid = Grid::new(10, 80);
-        grid.set_scroll_region(3, 7);
-        grid.set_cursor(3, 0); // at top of region
-        grid.reverse_line_feed();
-        // After scroll-down, cursor stays at row 3
-        assert_eq!(grid.cursor_row(), 3);
+    fn an_index_on_a_one_row_screen_blanks_the_margin_rectangle() {
+        for reverse in [false, true] {
+            let mut grid = Grid::new(1, 10);
+            for ch in "abcdefgh".chars() {
+                grid.write_char(ch);
+            }
+            grid.set_horizontal_margins(1, 5);
+            grid.set_cursor(0, 3);
+            if reverse {
+                grid.reverse_line_feed_margined(true);
+            } else {
+                grid.line_feed_margined(true);
+            }
+            let text: String = (0..10)
+                .map(|c| grid.cell(0, c).map_or(' ', |cell| cell.char()))
+                .collect();
+            assert_eq!(text, "a     gh  ", "reverse={reverse}");
+            assert_eq!((grid.cursor_row(), grid.cursor_col()), (0, 3));
+        }
     }
-
-    #[test]
-    fn reverse_line_feed_above_region_moves_up() {
-        let mut grid = Grid::new(10, 80);
-        grid.set_scroll_region(5, 8);
-        grid.set_cursor(2, 0); // above region
-        grid.reverse_line_feed();
-        assert_eq!(grid.cursor_row(), 1);
-    }
-
-    #[test]
-    fn reverse_line_feed_at_row_zero_above_region_stays() {
-        let mut grid = Grid::new(10, 80);
-        grid.set_scroll_region(3, 8);
-        grid.set_cursor(0, 0);
-        grid.reverse_line_feed();
-        assert_eq!(grid.cursor_row(), 0);
-    }
-
-    #[test]
-    fn reverse_line_feed_clears_pending_wrap() {
-        let mut grid = Grid::new(24, 80);
-        grid.set_cursor(5, 79);
-        grid.set_pending_wrap(true);
-        grid.reverse_line_feed();
-        assert!(!grid.pending_wrap());
-    }
-
-    // cursor_forward_margin — DECLRMM interaction
-
-    #[test]
-    fn cursor_forward_margin_no_mode_same_as_forward() {
-        let mut grid = Grid::new(10, 80);
-        grid.set_cursor(0, 10);
-        grid.cursor_forward_margin(5, false);
-        assert_eq!(grid.cursor_col(), 15);
-    }
-
-    #[test]
-    fn cursor_forward_margin_in_margins_stops_at_right() {
-        let mut grid = Grid::new(10, 80);
-        grid.set_horizontal_margins(10, 50);
-        grid.set_cursor(0, 30); // within [10..50]
-        grid.cursor_forward_margin(100, true);
-        assert_eq!(grid.cursor_col(), 50);
-    }
-
-    #[test]
-    fn cursor_forward_margin_outside_margins_goes_to_edge() {
-        let mut grid = Grid::new(10, 80);
-        grid.set_horizontal_margins(10, 50);
-        grid.set_cursor(0, 5); // left of margins
-        grid.cursor_forward_margin(100, true);
-        assert_eq!(grid.cursor_col(), 79);
-    }
-
-    // cursor_backward_margin — DECLRMM interaction
-
-    #[test]
-    fn cursor_backward_margin_no_mode_same_as_backward() {
-        let mut grid = Grid::new(10, 80);
-        grid.set_cursor(0, 20);
-        grid.cursor_backward_margin(5, false);
-        assert_eq!(grid.cursor_col(), 15);
-    }
-
-    #[test]
-    fn cursor_backward_margin_in_margins_stops_at_left() {
-        let mut grid = Grid::new(10, 80);
-        grid.set_horizontal_margins(10, 50);
-        grid.set_cursor(0, 30); // within [10..50]
-        grid.cursor_backward_margin(100, true);
-        assert_eq!(grid.cursor_col(), 10);
-    }
-
-    #[test]
-    fn cursor_backward_margin_outside_margins_goes_to_zero() {
-        let mut grid = Grid::new(10, 80);
-        grid.set_horizontal_margins(10, 50);
-        grid.set_cursor(0, 5); // left of margins
-        grid.cursor_backward_margin(100, true);
-        assert_eq!(grid.cursor_col(), 0);
-    }
-
-    // Edge cases: 1x1 grid
 
     #[test]
     fn grid_1x1_every_motion_stays_at_origin() {
-        type Motion = fn(&mut Grid);
         let motions: [(&str, Motion); 7] = [
             ("set_cursor(100, 100) clamps", |g| g.set_cursor(100, 100)),
             ("cursor_up(10)", |g| g.cursor_up(10)),

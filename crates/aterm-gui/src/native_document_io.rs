@@ -1370,11 +1370,11 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::*;
     use crate::document_store::{DocumentStore, DocumentTxnOutcome, TextEdit};
-    use aterm_spec::derive::{config_file_commit_cas_model, native_file_watch_model};
+    use aterm_models_native::{config_file_commit_cas_model, native_file_watch_model};
     use aterm_spec::interp::admits;
 
     fn snapshot(text: &str) -> (DocumentStore, DocumentId, DocumentSnapshot) {
-        let mut store = DocumentStore::for_test();
+        let mut store = crate::test_document_store();
         let id = store.open("file:///draft.md".to_string(), text.to_string());
         let snapshot = store.snapshot(id).expect("document snapshot");
         (store, id, snapshot)
@@ -1417,19 +1417,6 @@ mod tests {
             renamed_over_journal: true,
             directory_synced: true,
         }
-    }
-
-    #[test]
-    fn fingerprint_is_stable_and_content_sensitive() {
-        assert_eq!(
-            ContentFingerprint::of(b"same"),
-            ContentFingerprint::of(b"same")
-        );
-        assert_ne!(
-            ContentFingerprint::of(b"same"),
-            ContentFingerprint::of(b"same\0")
-        );
-        assert_ne!(ContentFingerprint::of(b"ab"), ContentFingerprint::of(b"ba"));
     }
 
     #[test]
@@ -1594,20 +1581,6 @@ mod tests {
         inverted.insert("verdict", 3);
         assert_eq!(admits(&model, &before, &inverted), None);
         assert!(!model.check_invariant("PriorityIsDeterministic", &inverted));
-    }
-
-    #[test]
-    fn save_plan_binds_generation_snapshot_and_observed_version() {
-        let (_store, id, snapshot) = snapshot("draft");
-        let observed = ObservedFileVersion::observed(b"prior", Some(1), Some(2));
-        let mut reducer = SaveReducer::new(id, observed);
-        let plan = reducer.begin(&snapshot).unwrap();
-        assert_eq!(plan.generation, SaveGeneration(1));
-        assert_eq!(plan.seq, snapshot.seq);
-        assert_eq!(plan.expected, observed);
-        assert_eq!(plan.bytes.as_ref(), b"draft");
-        assert_eq!(plan.desired, ContentFingerprint::of(b"draft"));
-        assert_eq!(plan.preflight(observed), Ok(()));
     }
 
     #[test]

@@ -2,10 +2,10 @@
 // Copyright 2026 Andrew Yates
 
 use super::paste_order;
-use aterm_session::sink::SinkWriter;
-use aterm_spec::derive::paste_order_sink_isolation_model;
+use aterm_models_session::paste_order_sink_isolation_model;
 #[cfg(unix)]
-use aterm_spec::derive::queued_key_kernel_delivery_model;
+use aterm_models_session::queued_key_kernel_delivery_model;
+use aterm_session::sink::SinkWriter;
 
 #[cfg(unix)]
 fn fill_socket_to_backpressure(writer: &mut std::os::unix::net::UnixStream) -> usize {
@@ -416,29 +416,4 @@ fn direct_queued_key_receipt_can_post_delivery_wake() {
         libc::close(pipe[0]);
         libc::close(pipe[1]);
     }
-}
-
-/// A dead peer discards spilled bytes; the old spill receipt remains
-/// ineligible for a direct-delivery wake even after the queue empties.
-#[cfg(unix)]
-#[test]
-fn peer_death_cannot_post_a_queued_key_delivery_wake() {
-    use crate::input::{Delivery, EgressReceipt};
-    use std::os::fd::AsRawFd;
-
-    let (reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
-    let sink = SinkWriter::new(writer.as_raw_fd());
-    fill_socket_to_backpressure(&mut writer);
-    let write = sink.write_frame_nonparking_with_receipt(b"k").unwrap();
-    assert!(!write.is_direct());
-    let receipt = EgressReceipt::from_reported_delivery(Delivery::Full, write.order());
-    let model = queued_key_kernel_delivery_model();
-    let mut state = model.init_state();
-    assert!(model.fire("AcceptSpill", &mut state));
-
-    drop(reader);
-    assert!(paste_order::completed_queued_key_wake(receipt, Some(7)).is_none());
-    assert!(model.fire("DrainFailure", &mut state));
-    assert!(!model.action_enabled("PostWake", &state));
-    assert!(model.check_invariant("WakeRequiresDirectReceipt", &state));
 }

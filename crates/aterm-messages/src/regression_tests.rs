@@ -19,10 +19,7 @@ use crate::text::{char_width, shape_detail, truncate};
 use crate::waits::{WaitEnd, lines_words, paste_row, rewrap_row, rewrap_stats};
 use crate::wire::{NoticeRequest, ReadQuery, message_rows, parse_read_args};
 use crate::words::{day_heading, local_day};
-use crate::{
-    Duration, Instant, LOG_CAP, MAX_ACTIONS, PROGRESS_GRACE, SHRINK_QUIET, STALE_STRAIN,
-    STALE_TAILED, STRAIN_KEY,
-};
+use crate::{Duration, Instant, LOG_CAP, MAX_ACTIONS, PROGRESS_GRACE, SHRINK_QUIET, STALE_TAILED};
 
 fn t0() -> Instant {
     Instant::now()
@@ -694,7 +691,6 @@ fn a_forced_short_elapsed_slot_spends_nothing() {
         meter: Some((None, "~3 GB")),
         busy: true,
         animated: false,
-        level: false,
         eta: false,
         load: None,
         load_slot: Loads::NONE,
@@ -1391,9 +1387,8 @@ fn a_measured_fill_never_paints_the_next_counts_percent() {
 }
 
 /// The band and the `messages` line share one load rule (`Live::said_load`):
-/// the work's own primary load shows only while other work is measurably
-/// slowed, so a download row whose `network busy` the band does not paint
-/// prints no `load=network`.
+/// the work's own primary load is the title's, so a download row whose
+/// `network busy` the band does not paint prints no `load=network`.
 #[test]
 fn messages_prints_load_only_where_the_glass_says_it() {
     let now = t0();
@@ -1424,16 +1419,6 @@ fn messages_prints_load_only_where_the_glass_says_it() {
     assert!(
         !line.contains(" load="),
         "the wire says a load the glass does not: {line}"
-    );
-    // Slowed: both name it.
-    c.set_slowing(true);
-    let glass = c.presentation(120, &char_width, None, Links::Painted);
-    assert!(glass.rows[0].load.is_some(), "slowed: the band says it");
-    let rows = message_rows(&c, &ReadQuery::default(), 2, &enc);
-    assert!(
-        rows[0].contains(" load=network"),
-        "slowed: the wire says it too: {}",
-        rows[0]
     );
 }
 
@@ -1475,8 +1460,8 @@ impl Host for Plain {
 
 /// `still open when aterm stopped` is for a record replayed open from a
 /// process that was killed or crashed. A seamless handoff ends the parent
-/// gracefully: the rows its carry did not take (an unrevealed row, the strain
-/// level) are closed by the parent at Commit
+/// gracefully: the rows its carry did not take (unrevealed rows) are closed by
+/// the parent at Commit
 /// (`MessageCenter::close_uncarried`), never read in the successor as cut
 /// off by a crash.
 #[test]
@@ -1496,15 +1481,15 @@ fn rows_the_carry_drops_are_not_read_as_a_crash_in_the_successor() {
             now,
         )
         .id;
-    let strain = parent
+    let check = parent
         .post(
-            Message::new(tags::SYSTEM, Severity::Info, "Typing slowed by 'yes'")
-                .key(STRAIN_KEY)
+            Message::new(tags::UPDATE, Severity::Info, "Checking for updates")
+                .in_flight()
+                .key("update.check")
                 .hold(Hold::Live {
-                    stale_after: STALE_STRAIN,
+                    stale_after: STALE_TAILED,
                 })
-                .meter(Meter::level(700, "5.6 of 8 cores"))
-                .no_excerpt(),
+                .reveal_after(PROGRESS_GRACE),
             stamp(2),
             now,
         )
@@ -1515,7 +1500,7 @@ fn rows_the_carry_drops_are_not_read_as_a_crash_in_the_successor() {
         carry
             .live
             .iter()
-            .all(|m| m.id != pass.raw() && m.id != strain.raw()),
+            .all(|m| m.id != pass.raw() && m.id != check.raw()),
         "premise: neither row is carried: {:?}",
         carry.live.iter().map(|m| m.id).collect::<Vec<_>>()
     );
@@ -1530,7 +1515,7 @@ fn rows_the_carry_drops_are_not_read_as_a_crash_in_the_successor() {
     c.seed_carried(&carry, stamp(3), now);
     c.merge_reloaded_log(&disk);
     let page = MessagesState::of(&c, &Plain);
-    let crashed: Vec<String> = [pass, strain]
+    let crashed: Vec<String> = [pass, check]
         .into_iter()
         .filter_map(|id| {
             let view = page.entry(id.raw()).expect("the record is in the ring");

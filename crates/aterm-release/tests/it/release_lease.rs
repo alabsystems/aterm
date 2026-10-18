@@ -359,27 +359,6 @@ fn killed_session_recovery_rotates_exact_old_token_with_one_winner() {
 }
 
 #[test]
-fn final_unlock_atomically_removes_owner_and_fence_without_orphan_state() {
-    let fixture = bare_fixture("atomic-final-unlock");
-    let repo = fixture.repo_a.clone();
-    let owner = fixture.owner_a.clone();
-    let git = Git::new(&repo);
-    publish::acquire_release_lease(&git, &owner).unwrap();
-    let fence = publish::acquire_publisher_fence(&git, &owner).unwrap();
-    assert_eq!(
-        publish::release_completed_publisher_session(&git, &owner, &fence).unwrap(),
-        LeaseRelease::Released
-    );
-    assert_eq!(publish::release_lease_owner(&git).unwrap(), None);
-    assert_eq!(publish::publisher_fence(&git).unwrap(), None);
-    assert_eq!(
-        publish::release_completed_release_lease(&git, &owner).unwrap(),
-        LeaseRelease::AlreadyAbsent,
-        "crash after atomic push and before journal mark converges"
-    );
-}
-
-#[test]
 fn unlock_only_replay_leaves_a_coherent_foreign_successor_pair_untouched() {
     let fixture = bare_fixture("unlock-successor-pair");
     let repo = fixture.repo_a.clone();

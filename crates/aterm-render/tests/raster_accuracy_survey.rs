@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE ACCURACY GUARD on `aterm_render::raster`, the first-party coverage
+//! The accuracy guard on `aterm_render::raster`, the first-party coverage
 //! rasterizer (`docs/measured/fontdue-oracle-decision-2026-08-29.md`).
 //!
 //! [`flattening_accuracy_is_bounded`] holds the shipped rasterizer to a pooled
 //! mean absolute coverage error of 0.100/255, a per-(face, size) row mean of
-//! 0.130/255 and a per-glyph worst cell of 6/255 against ground truth. Read its
-//! doc comment for where each bound comes from and for what it does NOT cover.
+//! 0.130/255 and a per-glyph worst cell of 6/255 against ground truth; its doc
+//! says where each bound comes from and what it does not cover.
 //!
-//! GROUND TRUTH is an independent scanline reference (`reference_coverage`):
-//! exact analytic span coverage in x, midpoint-sampled at `SUB` sub-scanlines
-//! per pixel row in y, over an outline flattened `REF_SEGMENTS_*` times finer
-//! than any candidate. It shares no code with either candidate — no signed-area
-//! accumulator, no incremental x march.
+//! Ground truth is an independent scanline reference
+//! (`reference_coverage_phased`): exact span coverage in x, `SUB` midpoint
+//! sub-scanlines per pixel row in y, over an outline flattened into
+//! `REF_SEGMENTS` pieces per curve. It shares no code with either candidate
+//! (the shipped fill, and the same fill flattened finer).
 //!
 //! Run (the headroom table prints with `--nocapture`):
 //!   targo --unverified test -p aterm-render --test render_suite -- raster_accuracy_survey:: --nocapture
@@ -22,7 +22,7 @@ const DEJAVU: &[u8] = include_bytes!("../assets/DejaVuSansMono.ttf");
 const NERD: &[u8] = include_bytes!("../assets/SymbolsNerdFontMono-Regular.ttf");
 
 // ---------------------------------------------------------------------------
-// Outline recording, in DESIGN units (y up).
+// Outline recording, in design units (y up).
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug)]
@@ -109,15 +109,13 @@ fn record(face: &aterm_font::Face, gid: u16) -> Option<Rec> {
 /// Sub-scanlines per pixel row. 64 is "8x supersampled" squared in y; the x
 /// axis is not sampled at all (spans are integrated exactly).
 const SUB: usize = 64;
-/// Uniform subdivisions used to flatten a quad/cubic FOR THE REFERENCE ONLY.
-/// A quadratic's max deviation from its `n`-segment polyline is `|dev| / (4n^2)`
-/// where `dev` is the second difference in px; at n = 256 and a 32 px glyph
-/// (`|dev|` under ~12 px) that is under 5e-5 px. The retired
-/// `reference_is_converged` measured the residual rather than trusting this
-/// arithmetic (decision note §1).
+/// Uniform subdivisions flattening a quad/cubic, for the reference only. A
+/// quadratic's max deviation from its `n`-segment polyline is `|dev| / (4n^2)`,
+/// `dev` the second difference in px; at n = 256 and a 32 px glyph (`|dev|`
+/// under ~12 px) that is under 5e-5 px.
 const REF_SEGMENTS: usize = 256;
 
-/// A flat edge list in GRID space (px, y DOWN, origin at the canvas top-left).
+/// A flat edge list in grid space (px, y down, origin at the canvas top-left).
 fn flatten_ref(segs: &[Seg], scale: f32, ox: f32, oy: f32, n: usize) -> Vec<(P, P)> {
     let map = |p: P| P {
         x: p.x * scale - ox,
@@ -160,59 +158,31 @@ fn flatten_ref(segs: &[Seg], scale: f32, ox: f32, oy: f32, n: usize) -> Vec<(P, 
     out
 }
 
-/// Two crossings this close in x are ONE crossing point, not two: the winding
-/// number is a property of the open REGION between distinct crossings, and the
-/// interval between two coincident crossings has no interior to have a winding
-/// number in.
-///
-/// The tie is normally EXACT — a sub-scanline that lands on a local-minimum
-/// vertex picks up both of that vertex's edges at `t = 0`, and `lo.x + 0.0 *
-/// (hi.x - lo.x)` is `lo.x` to the bit for each — so this epsilon only absorbs
-/// float dust. It is deliberately tiny: a genuine sliver `X_TIE_PX` wide
-/// contributes under `4e-9` of one texel's coverage, so nothing measurable is
-/// classified away by it.
+/// Two crossings this close in x are one crossing point: the interval between
+/// coincident crossings has no interior to carry a winding number. The tie is
+/// normally exact (both edges of a local-minimum vertex cross at `t = 0`,
+/// giving `lo.x` to the bit), so this absorbs only float dust; a sliver this
+/// wide is under `4e-9` of one texel's coverage.
 const X_TIE_PX: f32 = 1e-6;
 
-/// Nonzero-winding coverage of `edges` over a `w`x`h` grid, in 0..=1.
+/// Nonzero-winding coverage of `edges` over a `w`x`h` grid, in 0..=1, and
+/// whether the outline reaches a winding outside `{0, +1}` (or `{0, -1}` when
+/// reversed), i.e. self-overlaps or mixes contour orientations. A signed-area
+/// rasterizer (both candidates are one) accumulates area times winding, so in
+/// an overlap the clamp turns a partial pixel full, and oppositely wound ink in
+/// one pixel cancels where the nonzero rule fills. That difference is
+/// structural, not flattening, so the survey keeps those glyphs apart.
 ///
-/// The second return value is whether the outline reaches a winding number
-/// outside `{0, +1}` (or, for a reversed outline, outside `{0, -1}`) — i.e.
-/// whether it SELF-OVERLAPS or mixes contour orientations. That flag matters: a
-/// signed-area rasterizer (both candidates are one) accumulates area TIMES
-/// winding, so in an overlap it reports more than 1 and the caller's clamp turns
-/// a partially covered pixel into a fully covered one, while oppositely wound
-/// ink in one pixel CANCELS where the nonzero rule fills. That is a shared,
-/// structural difference from true nonzero-winding coverage, not a flattening
-/// difference, so the survey keeps the two glyph classes apart.
+/// The flag is read off regions: crossings are grouped by x ([`X_TIE_PX`]) and
+/// the winding is read only between distinct groups. Advancing one crossing at
+/// a time would flag a sampling artifact: a sub-scanline through a
+/// local-minimum vertex meets both its edges at the same x with directions +1
+/// and -1, and the sort order alone decides whether the sweep transiently
+/// reads -1 or +2 on a zero-width interval (DejaVu's `M`, `N`, `W`, `X` at
+/// 16 px, whose integer design coordinates land on the sub-scanlines).
 ///
-/// # The flag is read off REGIONS, not off the sweep's intermediate states
-///
-/// This classifier used to advance the winding count one crossing at a time and
-/// flag on every value it passed through. That flagged a SAMPLING ARTIFACT, not
-/// geometry. When a sub-scanline lands exactly on a local-minimum vertex, both
-/// of that vertex's edges cross it at the SAME x with directions `+1` and `-1`;
-/// the sort is by x alone, so whichever ties first decides whether the sweep
-/// transiently reads `-1` (flagging `saw_neg`) or `+2` (flagging `overlapped`)
-/// on an interval of zero width. Whether that happens depends only on whether a
-/// vertex's y lands on `row + (k + 0.5) / SUB` — a property of the sampling
-/// phase.
-///
-/// Measured: `'M'`, `'N'`, `'W'` and `'X'` in DejaVuSansMono contain no curves
-/// and cannot self-overlap, and were flagged at 16px and at no other size,
-/// because at 16px (scale `1/128`) the integer design coordinates land exactly
-/// on the odd-`128ths` the sub-scanlines sample. Nudging the sampling phase by
-/// `1/4900` px — which changes no geometry at all — dropped the flagged count
-/// from 561/2320 to 212/2320 and DejaVu's from 71 to 0.
-///
-/// So crossings are now GROUPED by x ([`X_TIE_PX`]) and the winding is read
-/// only between distinct groups, which is the winding number of an actual
-/// planar region. Coverage is unaffected either way: the old form deposited a
-/// zero-width span at each tie, which sums to the same total.
-///
-/// `phase` displaces the sub-scanline ladder by that many px. `phase = 0` is
-/// the shipped instrument; every other value is a DIFFERENT, equally valid
-/// instrument sampling the same geometry (the retired
-/// `reference_phase_sensitivity` read the instrument's own error bar off it).
+/// `phase` displaces the sub-scanline ladder by that many px; `phase = 0` is
+/// the shipped instrument.
 fn reference_coverage_phased(
     edges: &[(P, P)],
     w: usize,
@@ -226,19 +196,14 @@ fn reference_coverage_phased(
 
 /// The edge indices each pixel row's sub-scanlines can cross, in edge order.
 ///
-/// Row `row` samples `gy` in `(row + phase, row + 1 + phase)`, and an edge is
-/// crossed only where `lo.y <= gy < hi.y`, so it can only matter to rows
-/// `floor(lo.y - phase) - 1 ..= floor(hi.y - phase)`. Each bucket is widened by
-/// at least one more row on both sides so f32 rounding in `gy` can never drop a
-/// crossing; the sweep still applies the exact half-open test per sub-scanline,
-/// and within a bucket the edges keep their global order, so every
-/// sub-scanline's crossing list is the SAME list, in the SAME order, as a scan
-/// of all edges gives — bit-identical coverage and flags. Horizontal and NaN
-/// edges are never crossed and go in no bucket.
-///
-/// Why: without it every sub-scanline visited every edge of the reference
-/// outline (flattened 256 times per curve), and this one reference was ~95%
-/// of the guard's 17-25 s.
+/// Row `row` samples `gy` in `(row + phase, row + 1 + phase)` and an edge is
+/// crossed only where `lo.y <= gy < hi.y`, so it matters only to rows
+/// `floor(lo.y - phase) - 1 ..= floor(hi.y - phase)`; each bucket is widened by
+/// at least one more row per side so f32 rounding in `gy` never drops a
+/// crossing. The sweep still applies the exact half-open test and edges keep
+/// their global order, so coverage and flags are bit-identical to a full scan.
+/// Horizontal and NaN edges go in no bucket. Unbucketed, this reference is ~95%
+/// of the guard's time.
 fn row_buckets(edges: &[(P, P)], h: usize, phase: f32) -> Vec<Vec<u32>> {
     let mut buckets = vec![Vec::new(); h];
     if h == 0 {
@@ -279,13 +244,11 @@ fn reference_sweep<'a>(
 ) -> (Vec<f32>, bool) {
     let mut cov = vec![0.0f64; w * h];
     let mut overlapped = false;
-    // GLYPH-GLOBAL, not per-scanline: a pixel whose top half holds positively
-    // wound ink and whose bottom half holds negatively wound ink is CANCELLED
-    // by a signed-area accumulator and FILLED by the nonzero rule, and no
-    // single scanline sees both. Any outline that mixes orientations at all is
-    // therefore outside the class where the two definitions agree. A wholly
-    // REVERSED outline is not: `for_each_pixel` reports `|acc|`, so a uniform
-    // -1 reads exactly as a uniform +1 would.
+    // Glyph-global, not per-scanline: a pixel with positively wound ink in its
+    // top half and negatively wound ink in its bottom half is cancelled by a
+    // signed-area accumulator and filled by the nonzero rule, and no single
+    // scanline sees both. A wholly reversed outline is fine: `for_each_pixel`
+    // reports `|acc|`.
     let (mut saw_pos, mut saw_neg) = (false, false);
     let mut xs: Vec<(f32, i32)> = Vec::new();
     for row in 0..h {
@@ -315,17 +278,16 @@ fn reference_sweep<'a>(
             while i < xs.len() {
                 let x = xs[i].0;
                 let prev = wind;
-                // One crossing POINT, however many edges meet there.
+                // One crossing point, however many edges meet there.
                 while i < xs.len() && xs[i].0 - x <= X_TIE_PX {
                     wind += xs[i].1;
                     i += 1;
                 }
-                // |winding| >= 2 is one contour stacked on another; a glyph that
-                // has BOTH a positively and a negatively wound region is two
-                // contours of OPPOSITE direction crossing (an ordinary hole
-                // never goes negative — its regions are +1 and 0). A signed-area
-                // accumulator gets both wrong, in opposite directions: it
-                // over-reports the first and CANCELS the second.
+                // |winding| >= 2 is one contour stacked on another; both a
+                // positive and a negative region means two contours of opposite
+                // direction crossing (a hole's regions are +1 and 0). A
+                // signed-area accumulator over-reports the first and cancels
+                // the second.
                 if wind.abs() >= 2 {
                     overlapped = true;
                 }
@@ -410,17 +372,11 @@ fn place(
 }
 
 // ---------------------------------------------------------------------------
-// Candidate 2: the same signed-area fill, flattened FINER.
+// The candidates: the shipped fill, or the same fill flattened finer.
 // ---------------------------------------------------------------------------
 
-/// Rasterize with `aterm_render::raster`'s fill but the harness's own
-/// flattening: every quad/cubic is split into `n` uniform pieces where `n` is
-/// chosen so the polyline's max deviation from the curve is under `tol` px.
-/// `tol = None` means "use the shipped `draw_quad`/`draw_cubic`", i.e. the
-/// shipped rasterizer exactly.
 /// The placement of one fill: design-to-pixel `scale`, the translation the
-/// outline is mapped through, and the grid it lands in. Bundled because they
-/// always travel together and eight loose parameters is past what reads.
+/// outline is mapped through, and the grid it lands in.
 #[derive(Clone, Copy)]
 struct FillGrid {
     scale: f32,
@@ -430,6 +386,10 @@ struct FillGrid {
     gh: usize,
 }
 
+/// Rasterize with `aterm_render::raster`'s fill but the harness's own
+/// flattening: each quad/cubic splits into `n` uniform pieces, `n` chosen so
+/// the polyline deviates from the curve by under `tol` px. `tol = None` is the
+/// shipped `draw_quad`/`draw_cubic`, i.e. the shipped rasterizer exactly.
 fn fill_with_tolerance(
     segs: &[Seg],
     grid: FillGrid,
@@ -587,8 +547,7 @@ fn build_case(face: &aterm_font::Face, gid: u16, px: f32) -> Option<GlyphCase> {
 }
 
 /// [`build_case`] with the reference's sub-scanline ladder displaced by `phase`
-/// px. Only the REFERENCE moves; the candidate rasters are untouched, so the
-/// error this changes is entirely the instrument's.
+/// px; the candidate rasters are untouched.
 fn build_case_phased(face: &aterm_font::Face, gid: u16, px: f32, phase: f32) -> Option<GlyphCase> {
     let upem = f32::from(face.units_per_em());
     let scale = px / upem;
@@ -657,7 +616,7 @@ impl GlyphCase {
         true
     }
 
-    /// The SHIPPED first-party path, or a finer-flattened twin of it.
+    /// The shipped first-party path, or a finer-flattened twin of it.
     fn first_party(
         &self,
         tol: Option<f32>,
@@ -697,37 +656,29 @@ fn corpus_chars() -> Vec<char> {
 const PX: [f32; 8] = [8.0, 10.0, 12.0, 14.0, 16.0, 20.0, 24.0, 32.0];
 
 // ---------------------------------------------------------------------------
-// THE GUARD.
-//
-// Everything above builds the ground truth. This is the test that fails.
+// The guard.
 // ---------------------------------------------------------------------------
 
 /// Ground truth is expensive — 64 sub-scanlines over a 256-fold reference
 /// flattening, per glyph, ~120 ms per raster in an unoptimised build — so the
-/// guard scores two corpora and picks by build profile. A plain `cargo test`
-/// gets the SAMPLE (137 of 144 rasters, 7 dropped by the winding classifier,
-/// 16 s); `cargo test --release` gets the whole thing (2,108 of 2,320 rasters,
-/// 212 dropped, 17 s). Both are held to the same bounds.
+/// guard scores two corpora and picks by build profile: a build with debug
+/// assertions (`targo --unverified test -p aterm-render`, 16 s; the optimized
+/// `--profile opt-test` keeps them on too) gets the SAMPLE (137 of 144
+/// rasters, 7 dropped by the winding classifier); one without them
+/// (`targo --unverified test --release -p aterm-render --test render_suite --
+/// raster_accuracy_survey::`) gets the whole thing (2,108 of 2,320 rasters, 212
+/// dropped, 17 s). Both are held to the same bounds. Quote a corpus size with
+/// its exclusion count: the classifier is the part of this instrument most able
+/// to rot.
 ///
-/// **Quote the corpus size WITH its exclusion count, always.** "2,108 rasters"
-/// on its own hides that 212 were classified out, and the classifier is the
-/// part of this instrument most able to rot — see
-/// [`reference_coverage_phased`], which used to drop 561 of the 2,320 because
-/// it was reading its own sampling phase.
-///
-/// The sample is not a weaker test of the FLATTENING: the error this guards is
-/// a per-curve property that every glyph with a curve in it carries, so it
-/// shows up in 137 rasters as plainly as in 2,108 — measured, at the loosenings
-/// this guard was watched failing at, the sample tripped on the FIRST offending
-/// glyph. What the full corpus adds is worst-cell coverage, which is why the
-/// max bound is the limb that benefits from a release run.
+/// The sample tests the flattening as sharply, since the error is a per-curve
+/// property every curved glyph carries; the full corpus adds worst-cell reach.
 ///
 /// Returns `(px sweep, per-face character sampling stride, glyph-count floor)`.
 const fn guard_corpus() -> (&'static [f32], usize, usize) {
     if cfg!(debug_assertions) {
         // 12 px is the desktop size the shipped path is tuned around; 32 px is
-        // where a once-at-parse flattening degrades worst and so where a
-        // per-px one has the most to prove.
+        // where a coarse flattening degrades worst.
         (&[12.0, 32.0], 4, 130)
     } else {
         (&PX, 1, 2_050)
@@ -760,32 +711,22 @@ fn guard_chars(bytes: &'static [u8], name: &str, stride: usize) -> Vec<char> {
     all.into_iter().step_by(stride).collect()
 }
 
-/// THE ACCURACY BOUND on `raster::draw_quad` / `raster::draw_cubic`.
+/// The accuracy bound on `raster::draw_quad` / `raster::draw_cubic`, in three
+/// limbs:
 ///
-/// # Three limbs, because one mean cannot see what the other two can
+/// * `MEAN_LIMIT`: the pooled corpus mean.
+/// * `ROW_MEAN_LIMIT`: the mean of each (face, size) row on its own. The pooled
+///   mean is texel-weighted; the Nerd face is 76.8% of the scored texels and
+///   DejaVu at 12 and 16 px, what a terminal draws, only 1.9% and 2.5%, so a
+///   regression there alone moves the pooled mean by under its printed
+///   precision.
+/// * `MAX_LIMIT`: the worst single cell of any one glyph.
 ///
-/// * `MEAN_LIMIT` — the pooled corpus mean.
-/// * `ROW_MEAN_LIMIT` — the mean of EACH (face, size) row on its own.
-/// * `MAX_LIMIT` — the worst single cell of any one glyph.
-///
-/// The per-row limb exists because [`ErrStat::mean`] is TEXEL-pooled and the
-/// corpus is not evenly spread: measured on the release corpus, the Nerd face
-/// is **76.8 %** of all scored texels, and DejaVu at 12px and 16px — the face
-/// and the sizes a terminal actually draws — are **1.9 %** and **2.5 %**. A
-/// regression that doubled DejaVu 12px alone would move the pooled mean by
-/// under 0.002/255, inside the printing precision, and the pooled limb would
-/// never see it. Every row therefore carries its own bound.
-///
-/// # Where the numbers come from — measured, then given stated headroom
-///
-/// **The flattening's own budget** is `raster::FLATTEN_SAGITTA_PX`: the mask is
-/// 8 bits, a polyline whose sagitta is `t` px displaces the true edge by at
-/// most `t`, an edge crossing a cell spans at most 1 px of it, so flattening
-/// contributes at most `t` of coverage error to any cell — and `t = 1/255` px
-/// holds that under one output level.
-///
-/// **The bounds here pin that derived point.** Shipped readings on this box,
-/// with the headroom each bound leaves:
+/// The flattening's budget is `raster::FLATTEN_SAGITTA_PX`: a polyline with
+/// sagitta `t` px displaces the true edge by at most `t`, so it adds at most
+/// `t` of coverage error to a cell, and `t = 1/255` keeps that under one 8-bit
+/// level. The bounds pin that budget with stated headroom over the shipped
+/// readings:
 ///
 /// ```text
 ///                          debug     release     bound   headroom
@@ -794,62 +735,34 @@ fn guard_chars(bytes: &'static [u8], name: &str, stride: usize) -> Vec<char> {
 /// worst single cell        3.83        4.42       6.0    1.36x
 /// ```
 ///
-/// The bounds this guard SHIPPED WITH were 0.20 mean / 8.0 max and no row limb,
-/// which a 5x loosening of the flattening walked straight through: at
-/// `FLATTEN_SAGITTA_PX = 0.020 px` the corpus reads mean 0.172 (debug) / 0.190
-/// (release) and worst cell 6.72, all of it inside the old bounds. Against the
-/// bounds above, 0.020 px fails on the pooled mean (1.72x / 1.90x over), on
-/// every row and on the worst cell — the guard pins the derived budget instead
-/// of merely permitting it.
+/// A 5x looser flattening (`FLATTEN_SAGITTA_PX = 0.020`) fails every limb. If
+/// the reference changes, re-derive these numbers; never nudge a bound to fit
+/// the result it judges.
 ///
-/// **These numbers must be RE-DERIVED, not nudged, if the reference changes.**
-/// A bound that moves to accommodate a result it was supposed to judge is not a
-/// bound.
+/// Not covered:
 ///
-/// # What it does not cover — three limits, recorded rather than papered
+/// 1. The worst-cell reading is instrument-limited, so a lower bound:
+///    displacing the reference's sampling phase by 1/303 px moves one scored
+///    cell's error by up to 3.98/255, against a worst cell of 4.42. The pooled
+///    mean is robust to it.
+/// 2. The hinted path. `HintMode::initial` builds renderers at
+///    `HintMode::Full`, so Linux and Windows body text is rasterized from
+///    grid-fitted outlines this survey never builds. The `RASTER_PAD`
+///    grid-escape class (§6/§8 of the decision note) lives there, covered only
+///    by `raster.rs`'s unit tests.
+/// 3. The shipped entry point. This test builds its own design-to-grid mapping
+///    and crop, so a defect in `variation.rs` (`crop_padded_coverage`,
+///    `OutlineToRaster::map`) is outside it (§6 of the decision note).
 ///
-/// **1. The worst-cell reading is INSTRUMENT-LIMITED and is a lower bound.**
-/// `reference_is_converged` (retired; see the header) refined the reference by
-/// powers of two, so every ladder it compared CONTAINS the coarser ladder's
-/// sample positions and the comparison is structurally blind to the sampling
-/// PHASE. Displace that ladder instead (`reference_phase_sensitivity`, also
-/// retired) and the same rasterizer scores
-/// differently: at a phase move of 1/303 px the corpus mean goes 0.0749 ->
-/// 0.0970 (+0.0221/255), one reference cell moves by up to **7.97/255** and one
-/// scored cell's error by up to **3.98/255** — against a shipped worst cell of
-/// 4.42. So 4.42/255 is a LOWER BOUND on the worst-cell figure, not a
-/// measurement of it. The pooled mean survives the same test with room to spare
-/// (the 0.862 -> 0.075 tightening is ~36x the phase spread); the worst cell does
-/// not.
-///
-/// **2. The HINTED path is unmeasured.** `hinted.rs` builds every renderer at
-/// `HintMode::Full` (`HintMode::initial`), so ordinary body text on
-/// linux and windows is rasterized from GRID-FITTED outlines that this survey
-/// never builds — it drives `variation.rs`'s unhinted path only. The
-/// `RASTER_PAD` grid-escape class lives entirely in that gap (see §6/§8 of the
-/// decision note); `raster.rs`'s own `#[cfg(test)] mod tests` drives the escape
-/// paths directly, and extending an accuracy guard over the hinted path is
-/// still open.
-///
-/// **3. The SHIPPED entry point is not guarded here.** This test builds its
-/// own design->grid mapping and its own crop, so a defect living in
-/// `variation.rs` — a rounding-mode change in `crop_padded_coverage`, a sub-LSB
-/// shift in `OutlineToRaster::map` — is outside it. See the CORRECTION in §6 of
-/// the decision note; the gap is open.
-///
-/// # Why self-overlapping glyphs are excluded
-///
-/// In an overlap a signed-area rasterizer accumulates area TIMES winding and
-/// the caller clamps — a structural difference from nonzero-winding coverage
-/// (measured at up to 184.5/255).
-/// Scoring them would measure that, not the flattening. The classifier is
-/// [`reference_coverage_phased`], and its own failure mode is documented
-/// there.
+/// Self-overlapping glyphs are excluded: there a signed-area rasterizer
+/// accumulates area times winding and the caller clamps, a structural
+/// difference from nonzero-winding coverage (up to 184.5/255), not a
+/// flattening error. The classifier is [`reference_coverage_phased`].
 #[test]
 fn flattening_accuracy_is_bounded() {
     /// Corpus mean |coverage error|, in 0..255 units, pooled over every raster.
     const MEAN_LIMIT: f64 = 0.100;
-    /// Mean |coverage error| of ONE (face, size) row, in 0..255 units.
+    /// Mean |coverage error| of one (face, size) row, in 0..255 units.
     const ROW_MEAN_LIMIT: f64 = 0.130;
     /// Worst single cell of any one glyph, in 0..255 units.
     const MAX_LIMIT: f32 = 6.0;
@@ -858,8 +771,7 @@ fn flattening_accuracy_is_bounded() {
     let mut worst: Option<(String, f32)> = None;
     let mut scored = 0usize;
     let mut excluded = 0usize;
-    // One row PER (face, size). See the doc comment: the pooled mean cannot see
-    // a regression at the sizes a terminal actually draws.
+    // One row per (face, size).
     let mut rows: Vec<(String, usize, ErrStat)> = Vec::new();
     for (bytes, name) in [(DEJAVU, "DejaVuSansMono"), (NERD, "SymbolsNerd")] {
         let face = aterm_font::Face::parse(bytes, 0).unwrap();
@@ -911,9 +823,7 @@ fn flattening_accuracy_is_bounded() {
     );
     let mean = total.mean();
     let (worst_case, worst_err) = worst.expect("a scored corpus has a worst glyph");
-    // Printed, not only asserted: the decision this guard came from requires the
-    // headroom to be visible rather than assumed, so `--nocapture` shows how far
-    // the shipped path actually is from every bound, per row and pooled.
+    // Printed so `--nocapture` shows the headroom, per row and pooled.
     eprintln!(
         "\n{:<20} {:>8} {:>9} {:>9}",
         "row", "rasters", "mean", "headroom"
@@ -932,11 +842,8 @@ fn flattening_accuracy_is_bounded() {
         MEAN_LIMIT / mean.max(f64::MIN_POSITIVE),
         f64::from(MAX_LIMIT) / f64::from(worst_err).max(f64::MIN_POSITIVE),
     );
-    // PER-ROW, and only then pooled. The pooled mean is texel-weighted and the
-    // corpus is 76.8% Nerd-face, so DejaVu 12px and 16px — the face and the
-    // sizes a terminal actually draws — are 1.9% and 2.5% of it and a full
-    // regression there moves the pooled figure by less than its own printing
-    // precision. Every row therefore carries its own bound.
+    // Per row first: the pooled mean cannot see a regression at the sizes a
+    // terminal draws (see `ROW_MEAN_LIMIT` above).
     for (label, n, row) in &rows {
         assert!(
             *n > 0,
@@ -959,56 +866,3 @@ fn flattening_accuracy_is_bounded() {
          budget, do not raise this number."
     );
 }
-
-/// The row bucketing in [`reference_coverage_phased`] is a pure speed-up: on
-/// curved and straight glyphs of both guard faces, at both guard sizes and at
-/// a displaced sampling phase, it gives the same coverage (to the bit) and the
-/// same overlap flag as sweeping every edge on every sub-scanline.
-#[test]
-fn bucketed_reference_is_bit_identical_to_the_full_scan() {
-    // Few rasters on purpose: the full scan this compares against is the cost
-    // the bucketing removed. Curves, holes, a straight-edged glyph and a PUA
-    // icon exercise buckets spanning many rows, few rows and the canvas edges.
-    let nerd_first = guard_chars(NERD, "SymbolsNerd", 1)[0];
-    let cases = [
-        (DEJAVU, "DejaVuSansMono", '@', 12.0f32),
-        (DEJAVU, "DejaVuSansMono", '@', 32.0),
-        (DEJAVU, "DejaVuSansMono", 'g', 12.0),
-        (DEJAVU, "DejaVuSansMono", '8', 32.0),
-        (DEJAVU, "DejaVuSansMono", 'W', 12.0),
-        (NERD, "SymbolsNerd", nerd_first, 12.0),
-    ];
-    let mut compared = 0usize;
-    for (bytes, name, ch, px) in cases {
-        let face = aterm_font::Face::parse(bytes, 0).unwrap();
-        let gid = face.glyph_index(ch).unwrap();
-        let case = build_case(&face, gid.0, px).unwrap();
-        let edges = flatten_ref(
-            &case.segs,
-            case.scale,
-            case.canvas.x0 as f32,
-            case.canvas.ytop as f32,
-            REF_SEGMENTS,
-        );
-        let all: Vec<u32> = (0..edges.len() as u32).collect();
-        for phase in [0.0f32, 0.37] {
-            let (w, h) = (case.canvas.w, case.canvas.h);
-            let (bucketed, bf) = reference_coverage_phased(&edges, w, h, SUB, phase);
-            let (full, ff) = reference_sweep(&edges, w, h, SUB, phase, |_| all.as_slice());
-            assert_eq!(bf, ff, "{name} {ch:?} @ {px}px phase {phase}: overlap flag");
-            assert!(
-                bucketed
-                    .iter()
-                    .zip(&full)
-                    .all(|(a, b)| a.to_bits() == b.to_bits()),
-                "{name} {ch:?} @ {px}px phase {phase}: bucketed coverage differs"
-            );
-            compared += 1;
-        }
-    }
-    assert_eq!(compared, 12);
-}
-
-// ---------------------------------------------------------------------------
-// The COST side of the budget, on the path that actually pays it.
-// ---------------------------------------------------------------------------

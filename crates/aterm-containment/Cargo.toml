@@ -16,7 +16,6 @@ authors.workspace = true
 autotests = false
 
 [features]
-default = []
 
 [dependencies]
 aterm-log.workspace = true
@@ -31,6 +30,9 @@ libc.workspace = true
 [dev-dependencies]
 aterm-log = { workspace = true }
 aterm-tempfile.workspace = true
+# `aterm_spec::host::could_not_run`: a proof this host cannot run (no HOME, a
+# missing tool) ends COULD NOT RUN, never a silent pass.
+aterm-spec = { workspace = true }
 
 [lints]
 workspace = true

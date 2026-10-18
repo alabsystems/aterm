@@ -1,0 +1,40 @@
+# claude-code 2.1.301 · MEASURED 2026-10-15, `aterm ctl text` of a private headless aterm (42x40, aterm 0.104.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · a 529 the stub answers every retry with (mode overloaded), the pane 42 columns wide: the vendor's retry row (uyn) with its glyph on a row of its own
+❯ carry on with the task
+
+⏺ API Error: Repeated 529
+  Overloaded errors. The API is at
+  capacity — this is usually
+  temporary. Try again in a
+  moment. If it persists, check
+  your inference gateway
+  (127.0.0.1:56330).
+
+✻ Crunched for 1s · done 12:51 PM
+
+❯ carry on with the task
+
+⏺ tick 1 tick 2 tick 3 tick 4 tick 5 tick
+  6 tick 7 tick 8 tick 9 tick 10 tick 11
+  tick 12 tick 13 tick 14 tick 15 tick 16
+  tick 17 tick 18 tick 19 tick 20 tick 21
+  tick 22 tick 23 tick 24 tick 25 tick 26
+  tick 27 tick 28 tick 29 tick 30
+
+✻ Crunched for 30s · done 12:52 PM
+
+❯ carry on with the task
+
+❯ carry on with the task
+
+❯ carry on with the task
+
+❯ carry on with the task
+  ctrl+enter to send now
+
+✻
+API error · Retrying in 1s · attempt 2/10
+
+──────────────────────────────────────────
+❯ Press up to edit queued messages
+──────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) ·

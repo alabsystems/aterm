@@ -89,9 +89,43 @@ pub fn s(path: &Path) -> &str {
     path.to_str().expect("scratch paths are UTF-8")
 }
 
+/// Where every [`Scratch`] is made: the target dir, unless the Linux verifier
+/// would refuse a store below it. A scratch dir is `0700`, so it shields the
+/// stores laid in it; the chain ABOVE it must pass on its own, and /tmp
+/// (world-writable) never does. A checkout another account can write — cloned
+/// under a umask of 002 into a group other accounts share — falls back to
+/// `$XDG_RUNTIME_DIR` when that is this user's own private directory, so
+/// the outcome never depends on the umask the checkout was made under.
+pub fn scratch_root() -> &'static Path {
+    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        let target = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+        #[cfg(target_os = "linux")]
+        if let Err(why) = aterm_update::linux::install_path::refusal(&target) {
+            use std::os::unix::fs::MetadataExt as _;
+            let private = |dir: &Path| {
+                std::fs::symlink_metadata(dir).is_ok_and(|m| {
+                    // SAFETY: getuid has no preconditions and cannot fail.
+                    m.is_dir() && m.uid() == unsafe { libc::getuid() } && m.mode() & 0o077 == 0
+                })
+            };
+            return std::env::var_os("XDG_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .filter(|dir| dir.is_absolute() && private(dir))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the Linux verifier refuses every store under the target dir ({why}), \
+                         and no private $XDG_RUNTIME_DIR stands in for it"
+                    )
+                });
+        }
+        target
+    })
+}
+
 /// A scratch directory, removed on drop, named by its PHYSICAL path (the
-/// spelling `pwd -P` and the installer's own probes print). It lives in the
-/// target dir: the Linux verifier refuses a store under a world-writable
+/// spelling `pwd -P` and the installer's own probes print). It lives under
+/// [`scratch_root`]: the Linux verifier refuses a store under a world-writable
 /// ancestor such as /tmp.
 pub struct Scratch {
     _dir: aterm_tempfile::TempDir,
@@ -102,7 +136,7 @@ impl Scratch {
     pub fn new() -> Self {
         let dir = aterm_tempfile::Builder::new()
             .prefix("install-sh.")
-            .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .tempdir_in(scratch_root())
             .expect("a scratch dir");
         let path = dir
             .path()

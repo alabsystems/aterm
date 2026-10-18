@@ -1,0 +1,51 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab) · the stub's call `muse.web_fetch {url: "http://127.0.0.1:<stub port>/lab-probe"}` (the lab's own stub, loopback): the network box, before any key — `network: <host:port> http` and `full URL: …` under its title, a one-shot allow, a session grant (`(p)`), an ALWAYS grant and the refusal, the two grants naming the destination beside their labels; the approval judge's side calls (`x-tbh-agent-role: judge`, answered `ok` by the stub) came first · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+◆ Interrupted · Report issues with /feedback
+
+❯ toolstart
+
+◆ Ran touch probe-a.txt — denied
+  └ approval aborted
+    The user rejected this action. Don't retry it unless they ask.
+
+◆ Ran 2 commands · Create the third probe · Create the second probe · 18s · ctrl+o
+
+◆ Tool call done. Result: { "chunk_id": "exec-2-1", "exit_code": 0, "terminal_status": "completed", "output": "", "original_output_bytes": 0,
+  "original_output_tokens": 0, "truncated": false }
+
+❯ toolstart
+
+◆ Ran ls -l /private/tmp/at.lab0/proj/lab.sock — failed
+  └ unix_socket_paths requires managed macOS sandboxing with proxy-only networking
+
+◆ Tool call done. Result: tool failed: unix_socket_paths requires managed macOS sandboxing with proxy-only networking
+
+❯ toolstart
+
+◆ Ran curl -sS -m 5 http://lab-probe.invalid/ ; env | grep -i _proxy | cut -c1-60 — failed
+  └ environment failure: sandbox enforcement unavailable: macOS sandbox executable `/usr/bin/sandbox-exec` failed enforcement probe: allowed pro
+    be write did not complete, status=exit status: 71, stderr=sandbox-exec: sandbox_apply: Operation not permitted
+
+    The execution environment is broken: the command was never started and every later command will fail the same way. Do not retry and do not f
+    abricate command output; report this environment failure.
+
+◆ Tool call done. Result: tool failed: environment failure: sandbox enforcement unavailable: macOS sandbox executable /usr/bin/sandbox-exec
+  failed enforcement probe: allowed probe write did not complete, status=exit status:~
+
+❯ toolstart
+
+◆ Calling tools (16s · esc to interrupt)
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+Would you like to allow this network access?
+
+  network: 127.0.0.1:50581 http
+  full URL: http://127.0.0.1:50581/lab-probe
+
+⟩ 1. Yes, proceed (y)
+  2. Yes, don't ask again this session (p)  127.0.0.1:50581 (http)
+  3. Always allow this network destination  127.0.0.1:50581 (http)
+  4. No, and tell Muse Code what to do differently (esc)
+Change approval defaults in /permissions
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  lab-stub · high · /private/tmp/at.lab0/proj · Auto-review

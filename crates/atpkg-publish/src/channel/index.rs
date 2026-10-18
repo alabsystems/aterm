@@ -16,8 +16,13 @@
 //! * pins are carried unless moved; a move below the head's pin is refused (a rollback is
 //!   a yank or `min_build`); a pinned program is dropped only by retiring it; a
 //!   vendor-direct program (`atpkg::vendor_direct::is_vendor`) is never pinned, and a head
-//!   pin of one is carried until retired; a new program must be a
-//!   [`crate::programs::PROGRAMS`] row. Per-target overlays likewise: each cell its own
+//!   pin of one is carried until retired — except an ALab-built agent program
+//!   ([`crate::programs::alab_package`], codex): an explicit `--pin` of a NEW build inside
+//!   the client's ALab store window switches its block to the table's row (repo
+//!   `codex-alab`), and without one the head's block and pin are carried byte for byte (the
+//!   live index's legacy row names `aterm`, which the client never routes to ALab); a
+//!   `--target-pin` never pins it. A new program must be a [`crate::programs::PROGRAMS`]
+//!   row. Per-target overlays likewise: each cell its own
 //!   downgrade floor, retired only by name, naming only programs `pin` pins;
 //! * `yanked` is carried plus the delta's additions (of a pinned or vendor-direct program)
 //!   and named lifts; a vendor-direct program's yanks bind its client whether or not the
@@ -29,6 +34,10 @@
 //!   program the head lists that the table does not keeps the head's block.
 //!
 //! Then [`render`], sign, and self-verify the four files ([`crate::quad::verify_dir`]).
+//! An ALab pin this publish moves or adds is then held to its pack, dry run or not
+//! ([`crate::artifact::package::verify_pinned`]: the manifest under the new index's roster,
+//! the archive staged as a client stages it, the ALab pack gate), read from `--pack-dir` (a
+//! local proof) or the hosts; a pack that does not verify removes the signed quad again.
 //! With `--upload`: refuse a baseline the download host does not serve; run the darwin
 //! triple-drop gate per moved pin; mirror the packs ([`super::mirror`]); then
 //! [`compare_and_swap`] on `atpkg-index-N+1`; finally confirm the index answers on the
@@ -45,6 +54,7 @@ use atpkg::{Channel, Program};
 use super::mirror::{self, MirrorOptions};
 use super::{Log, Scratch, download_retried, flag_value, horizon, host_error};
 use crate::api::{Baseline, Build, Delta, IndexRequest, Indexer, Published, TripleDrop, Yank};
+use crate::artifact::{pkgdoc, upload};
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
 use crate::host::{HostError, Probe, Replace};
@@ -329,6 +339,45 @@ fn vendor_pin(p: &str) -> Error {
     ))
 }
 
+/// Admit `--pin <p>=<b>` of an ALab-built agent program `def` (its
+/// [`programs::alab_package`] row): `b` is inside the client's ALab store window, and a pin
+/// that switches the block from another repo (the live index's legacy row names `aterm`)
+/// names a NEW build above the head's pin, which is that other repo's build. Whether the
+/// pack verifies is asked once the index is signed ([`publish_with`]).
+fn admit_alab_pin(
+    def: &programs::ProgramDef,
+    b: Build,
+    head_pin: Option<Build>,
+    head_block: Option<&Program>,
+) -> Result<()> {
+    let p = def.name;
+    crate::artifact::package::check_build(p, b)
+        .map_err(|e| Error::refused(format!("--pin {p}={b}: {e}")))?;
+    if let Some(old) = head_pin
+        && b <= old
+        && head_block.is_none_or(|blk| blk.repo != def.repo)
+    {
+        return Err(Error::refused(format!(
+            "REFUSING --pin {p}={b}: it switches [programs.{p}] from repo {:?} to {:?}, and \
+             the head's pin {old} is that other repo's build — the switch names a NEW ALab \
+             build above it",
+            head_block.map_or("<none>", |blk| blk.repo.as_str()),
+            def.repo
+        )));
+    }
+    Ok(())
+}
+
+/// The ALab pins `plan` moves or adds: each is signed only over a pack that verifies.
+fn alab_pins(plan: &Plan) -> Vec<(&'static programs::ProgramDef, Build)> {
+    plan.moved
+        .iter()
+        .map(|m| (m.program.as_str(), m.to))
+        .chain(plan.added.iter().map(|(p, b)| (p.as_str(), *b)))
+        .filter_map(|(p, b)| programs::alab_package(p).map(|def| (def, b)))
+        .collect()
+}
+
 /// The block a table row renders.
 fn block_of(def: &programs::ProgramDef) -> Program {
     Program {
@@ -400,9 +449,16 @@ pub fn plan(
         .collect();
     let mut moved = Vec::new();
     let mut added = Vec::new();
+    // The ALab-built agent programs whose row this publish switches to (or keeps on) ALab's
+    // repo by an explicit pin; every other one keeps the head's block as it stands.
+    let mut switched: BTreeSet<&str> = BTreeSet::new();
     for (p, &b) in &delta.pins {
         if atpkg::vendor_direct::is_vendor(p) {
-            return Err(vendor_pin(p));
+            let Some(def) = programs::alab_package(p) else {
+                return Err(vendor_pin(p));
+            };
+            admit_alab_pin(def, b, head.pin.get(p).copied(), base.programs.get(p))?;
+            switched.insert(def.name);
         }
         if programs::get(p).is_none() && !base.programs.contains_key(p) {
             return Err(Error::refused(format!(
@@ -490,6 +546,13 @@ pub fn plan(
     for (t, cells) in &delta.target_pins {
         let mut said = Vec::new();
         for (p, &b) in cells {
+            if programs::alab_package(p).is_some() {
+                return Err(Error::refused(format!(
+                    "--target-pin {t}:{p}={b}: {p} is pinned for the targets ALab builds it \
+                     for by `--pin {p}=<b>` alone — an overlay never pins it (everywhere else \
+                     its client follows the vendor)"
+                )));
+            }
             if atpkg::vendor_direct::is_vendor(p) {
                 return Err(vendor_pin(p));
             }
@@ -634,20 +697,43 @@ pub fn plan(
 
     // Program blocks: the table's, else the head's; table order, then the rest sorted.
     let mut programs_out = Vec::new();
+    // An ALab package row renders from the table only once its head block already names
+    // ALab's repo or this publish pins it explicitly; until then the head's block is carried
+    // byte for byte, in the head-only order it always had.
+    let carried_alab = |name: &str| {
+        programs::alab_package(name).is_some_and(|def| {
+            !switched.contains(name) && base.programs.get(name).is_none_or(|b| b.repo != def.repo)
+        })
+    };
     let mut listed: BTreeSet<&str> = pin.keys().map(String::as_str).collect();
     for def in programs::PROGRAMS {
-        if listed.remove(def.name) {
+        if !carried_alab(def.name) && listed.remove(def.name) {
             programs_out.push((def.name.to_string(), block_of(def)));
         }
     }
     for p in listed {
         let block = base.programs.get(p).cloned().ok_or_else(|| {
-            Error::refused(format!(
-                "{p} is pinned but has no [programs.{p}] block in the head and no row in \
-                 programs::PROGRAMS"
-            ))
+            Error::refused(if carried_alab(p) {
+                format!(
+                    "the head pins {p} with no [programs.{p}] block — refusing to render \
+                     ALab's row over a pin nobody named: `--pin {p}=<b>` switches it"
+                )
+            } else {
+                format!(
+                    "{p} is pinned but has no [programs.{p}] block in the head and no row in \
+                     programs::PROGRAMS"
+                )
+            })
         })?;
-        log.note(if atpkg::vendor_direct::is_vendor(p) {
+        log.note(if carried_alab(p) {
+            format!(
+                "{p}: the head's [programs.{p}] (repo {:?}) and its pin are carried as they \
+                 stand, and every client keeps {p} on its vendor lane — only `--pin {p}=<b>` \
+                 naming a verified ALab pack switches the row to repo {:?}",
+                block.repo,
+                programs::get(p).map_or("", |d| d.repo)
+            )
+        } else if atpkg::vendor_direct::is_vendor(p) {
             format!(
                 "{p} is vendor-direct — its head pin and block are carried until --retire {p} \
                  drops them"
@@ -1099,6 +1185,29 @@ pub fn publish_with(ctx: &Ctx, request: &IndexRequest, log: &mut Log) -> Result<
         ))
     })?;
     let new = write_quad(ctx, &plan, &roster, &signer.key, out, log)?;
+    for (def, b) in alab_pins(&plan) {
+        if let Err(e) = crate::artifact::package::verify_pinned(
+            ctx,
+            &new,
+            def,
+            b,
+            request.pack_dir.as_deref(),
+            log,
+        ) {
+            for f in QUAD_FILES {
+                let _ = std::fs::remove_file(out.join(f));
+            }
+            return Err(within(
+                e,
+                &format!(
+                    "REFUSING to pin {}@{b}: its pack does not verify as a client stages it — \
+                     the signed quad was removed from {}, nothing was published",
+                    def.name,
+                    ctx.shown(out)
+                ),
+            ));
+        }
+    }
 
     if request.upload {
         publish_quad(ctx, request, &base, head.as_ref(), &new, &plan, log)?;
@@ -1449,9 +1558,9 @@ fn read_manifest(
     staging_too: bool,
     dir: &Path,
 ) -> Option<atpkg::PkgManifest> {
-    let tag = format!("atpkg-{program}-{build}");
-    let mf = format!("pkg-{program}-{build}.toml");
-    let sig = format!("{mf}.sig");
+    let tag = upload::tag(program, build);
+    let mf = pkgdoc::manifest_name(program, build);
+    let sig = pkgdoc::sig_name(program, build);
     let public = ctx.public_slug(repo);
     let host = &*ctx.hosts.channel;
     let public_dir = dir.join("public").join(&tag);
@@ -1498,6 +1607,13 @@ fn triple_gate(
     let _ = std::fs::remove_dir_all(&dir);
     let result = (|| {
         for m in &plan.moved {
+            // An ALab pin's targets are the row's own, and its pack was verified to carry
+            // exactly them (`artifact::package::check_pack`); its head pin may be another
+            // repo's legacy build, and everywhere ALab does not build it the client follows
+            // the vendor.
+            if programs::alab_package(&m.program).is_some() {
+                continue;
+            }
             let repo = plan
                 .programs
                 .iter()
@@ -1561,6 +1677,7 @@ struct Options {
     baseline: Option<PathBuf>,
     first: Option<String>,
     first_build: Option<u64>,
+    pack_dir: Option<PathBuf>,
 }
 
 /// The change a command line names (`--pin name=build`, `--target-pin
@@ -1675,6 +1792,9 @@ fn parse(args: &[String], verb: bool) -> Result<(Delta, Options)> {
                 o.baseline = Some(PathBuf::from(flag_value(args, &mut i, flag)?));
             }
             "--first" if verb => o.first = Some(flag_value(args, &mut i, flag)?.to_string()),
+            "--pack-dir" if verb => {
+                o.pack_dir = Some(PathBuf::from(flag_value(args, &mut i, flag)?));
+            }
             "--index-build" if verb => {
                 let v = flag_value(args, &mut i, flag)?;
                 o.first_build = Some(v.parse().map_err(|_| {
@@ -1744,11 +1864,18 @@ pub fn parse_request(args: &[String]) -> Result<IndexRequest> {
             ));
         }
     };
+    if o.upload && o.pack_dir.is_some() {
+        return Err(Error::usage(
+            "--pack-dir verifies an ALab pack from a local directory for a dry run; a publish \
+             verifies the pack the hosts serve, which every client fetches",
+        ));
+    }
     Ok(IndexRequest {
         baseline,
         delta,
         out: o.out.unwrap_or_else(|| PathBuf::from("dist")),
         upload: o.upload,
+        pack_dir: o.pack_dir,
     })
 }
 

@@ -41,8 +41,6 @@ bitflags! {
         const UTF8_MOUSE = 1 << 14;
         /// Alternate scroll mode (1007).
         const ALTERNATE_SCROLL = 1 << 15;
-        /// Vi mode is active.
-        const VI = 1 << 16;
         /// Urgency hints mode.
         const URGENCY_HINTS = 1 << 17;
         /// Synchronized output mode (2026).

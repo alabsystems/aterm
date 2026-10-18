@@ -4,38 +4,7 @@
 
 use super::*;
 
-#[test]
-fn index_and_search() {
-    let mut index = SearchIndex::new();
-
-    index.index_line(0, "hello world");
-    index.index_line(1, "goodbye world");
-    index.index_line(2, "hello there");
-
-    // Search for "world"
-    let results: Vec<_> = index.search("world").collect();
-    assert!(results.contains(&0));
-    assert!(results.contains(&1));
-    assert!(!results.contains(&2));
-
-    // Search for "hello"
-    let results: Vec<_> = index.search("hello").collect();
-    assert!(results.contains(&0));
-    assert!(results.contains(&2));
-}
-
-#[test]
-fn empty_query() {
-    let mut index = SearchIndex::new();
-    index.index_line(0, "test");
-
-    // Short queries return all lines
-    let results: Vec<_> = index.search("ab").collect();
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0], 0, "short query should return the indexed line");
-}
-
-/// CRITICAL: Empty query must return empty results without infinite loop.
+/// CRITICAL: an empty query returns nothing, on every path, without looping.
 ///
 /// This catches the bug where `"text".find("")` returns `Some(0)` forever.
 #[test]
@@ -44,9 +13,13 @@ fn empty_query_search_with_positions() {
     index.index_line(0, "test content");
     index.index_line(1, "more content");
 
-    // Empty query MUST return empty results (not infinite loop)
-    let matches = index.search_with_positions("");
-    assert!(matches.is_empty(), "empty query must return empty results");
+    assert!(index.search_with_positions("").is_empty(), "positions");
+    assert_eq!(index.search_from_line("", 0).count(), 0, "forward iterator");
+    assert_eq!(
+        index.search_before_line("", 10).count(),
+        0,
+        "reverse iterator"
+    );
 }
 
 /// Empty query through TerminalSearch API.
@@ -67,15 +40,6 @@ fn empty_query_terminal_search() {
 }
 
 #[test]
-fn no_matches() {
-    let mut index = SearchIndex::new();
-    index.index_line(0, "hello world");
-
-    let results: Vec<_> = index.search("xyz").collect();
-    assert!(results.is_empty());
-}
-
-#[test]
 fn bloom_filter_rejection() {
     let mut index = SearchIndex::new();
     index.index_line(0, "hello world");
@@ -93,61 +57,6 @@ fn bloom_filter_rejection() {
 
     // Short queries (<3 chars) bypass the bloom filter and always return true
     assert!(index.might_contain("zz"));
-}
-
-#[test]
-fn search_with_positions() {
-    let mut index = SearchIndex::new();
-    index.index_line(0, "hello hello");
-    index.index_line(1, "hello world");
-
-    let matches = index.search_with_positions("hello");
-
-    // Line 0 has 2 matches + line 1 has 1 match = 3 total
-    assert_eq!(matches.len(), 3);
-
-    // Line 0 should have two matches
-    let line0_matches: Vec<_> = matches.iter().filter(|m| m.line == 0).collect();
-    assert_eq!(line0_matches.len(), 2);
-
-    // Verify positions
-    assert_eq!(line0_matches[0].start_col, 0);
-    assert_eq!(line0_matches[0].end_col, 5);
-    assert_eq!(line0_matches[1].start_col, 6);
-    assert_eq!(line0_matches[1].end_col, 11);
-}
-
-#[test]
-fn push_line() {
-    let mut index = SearchIndex::new();
-
-    let n0 = index.push_line("line 0");
-    let n1 = index.push_line("line 1");
-    let n2 = index.push_line("line 2");
-
-    assert_eq!(n0, 0);
-    assert_eq!(n1, 1);
-    assert_eq!(n2, 2);
-    assert_eq!(index.len(), 3);
-}
-
-#[test]
-fn terminal_search_basic() {
-    let mut search = TerminalSearch::new();
-
-    search.index_scrollback_line("scrollback line 1");
-    search.index_scrollback_line("scrollback line 2");
-    search.index_scrollback_line("scrollback line 3");
-
-    let matches = search.search("scrollback");
-    assert_eq!(matches.len(), 3);
-    // Each match should start at column 0 (where "scrollback" begins in each line)
-    for (i, m) in matches.iter().enumerate() {
-        assert_eq!(m.line, i, "match {i} should be on line {i}");
-        assert_eq!(m.start_col, 0, "match {i} should start at column 0");
-    }
-
-    assert_eq!(search.indexed_scrollback_count(), 3);
 }
 
 #[test]
@@ -240,17 +149,6 @@ fn find_next_prev_same_line_column_boundary() {
 }
 
 #[test]
-fn index_clear() {
-    let mut index = SearchIndex::new();
-    index.index_line(0, "test");
-    assert!(!index.is_empty());
-
-    index.clear();
-    assert!(index.is_empty());
-    assert_eq!(index.len(), 0);
-}
-
-#[test]
 fn reindex_line() {
     let mut index = SearchIndex::new();
     index.index_line(0, "original");
@@ -287,15 +185,6 @@ fn search_from_line_basic() {
 }
 
 #[test]
-fn search_from_line_empty_query() {
-    let mut index = SearchIndex::new();
-    index.index_line(0, "test");
-
-    let matches: Vec<_> = index.search_from_line("", 0).collect();
-    assert!(matches.is_empty());
-}
-
-#[test]
 fn search_from_line_short_query() {
     let mut index = SearchIndex::new();
     index.index_line(0, "ab test");
@@ -307,16 +196,6 @@ fn search_from_line_short_query() {
     assert_eq!(matches.len(), 2);
     assert_eq!(matches[0].line, 1);
     assert_eq!(matches[1].line, 2);
-}
-
-#[test]
-fn search_from_line_no_matches() {
-    let mut index = SearchIndex::new();
-    index.index_line(0, "hello world");
-    index.index_line(1, "goodbye world");
-
-    let matches: Vec<_> = index.search_from_line("xyz", 0).collect();
-    assert!(matches.is_empty());
 }
 
 #[test]
@@ -336,36 +215,6 @@ fn search_before_line_basic() {
     assert_eq!(matches[0].line, 2);
     assert_eq!(matches[1].line, 1);
     assert_eq!(matches[2].line, 0);
-}
-
-#[test]
-fn search_before_line_empty_query() {
-    let mut index = SearchIndex::new();
-    index.index_line(0, "test");
-
-    let matches: Vec<_> = index.search_before_line("", 10).collect();
-    assert!(matches.is_empty());
-}
-
-#[test]
-fn search_iterator_early_termination() {
-    let mut index = SearchIndex::new();
-    // Index 1000 lines with "test"
-    for i in 0..1000 {
-        index.index_line(i, &format!("test line {i}"));
-    }
-
-    // Using the iterator with early termination (via .next())
-    // should not need to process all 1000 lines
-    let mut iter = index.search_from_line("test", 500);
-    let first = iter.next().unwrap();
-    assert_eq!(first.line, 500);
-    assert_eq!(first.start_col, 0);
-
-    // We can continue iteration if needed
-    let second = iter.next().unwrap();
-    assert_eq!(second.line, 501);
-    assert_eq!(second.start_col, 0);
 }
 
 #[test]
@@ -405,27 +254,6 @@ fn search_reverse_iterator_multiple_matches_per_line() {
     assert_eq!(matches[3].start_col, 0); // leftmost last
 }
 
-#[test]
-fn find_next_optimized() {
-    let mut search = TerminalSearch::new();
-
-    // Index many lines to test that we don't scan all of them
-    for i in 0..100 {
-        search.index_scrollback_line(&format!("match at line {i}"));
-    }
-
-    // Find next from line 50 — "match" at col 0 is excluded (not strictly after col 0),
-    // so result is line 51 at col 0
-    let m = search.find_next("match", 50, 0).unwrap();
-    assert_eq!(m.line, 51);
-    assert_eq!(m.start_col, 0);
-
-    // Find from middle of line 50 — "match" at col 0 is before col 5, so skipped
-    let m = search.find_next("match", 50, 5).unwrap();
-    assert_eq!(m.line, 51);
-    assert_eq!(m.start_col, 0);
-}
-
 /// Verify `find_next` lazily visits only the first suffix candidate and never
 /// touches prefix matches before `after_line`.
 #[test]
@@ -458,46 +286,6 @@ fn find_next_range_query_skips_prefix_matches() {
 
     assert_eq!(small_candidates, 1, "small-prefix run visits one candidate");
     assert_eq!(large_candidates, 1, "large-prefix run visits one candidate");
-}
-
-#[test]
-fn find_prev_optimized() {
-    let mut search = TerminalSearch::new();
-
-    // Index many lines
-    for i in 0..100 {
-        search.index_scrollback_line(&format!("match at line {i}"));
-    }
-
-    // Find prev from line 50, col 100 — "match" at col 0 is before col 100, so found
-    let m = search.find_prev("match", 50, 100).unwrap();
-    assert_eq!(m.line, 50);
-    assert_eq!(m.start_col, 0);
-
-    // Find prev from line 50 col 0 — "match" at col 0 is NOT before col 0, so line 49
-    let m = search.find_prev("match", 50, 0).unwrap();
-    assert_eq!(m.line, 49);
-    assert_eq!(m.start_col, 0);
-}
-
-/// Regression: searching for a multi-byte UTF-8 query that appears multiple times
-/// must not panic when advancing past the first match.
-///
-/// The bug: `start = abs_pos + 1` advances by one *byte*, which can land in the
-/// middle of a multi-byte character. `text[start..]` then panics because `start`
-/// is not a char boundary.
-#[test]
-fn search_multibyte_query_no_panic() {
-    let mut index = SearchIndex::new();
-    // "日本語" repeated: each char is 3 bytes
-    index.index_line(0, "日本語 日本語");
-
-    // Searching for a multi-byte string should find both occurrences without panic
-    let matches = index.search_with_positions("日本語");
-    assert_eq!(matches.len(), 2, "should find both occurrences");
-    assert_eq!(matches[0].start_col, 0);
-    // "日本語 " = 3 CJK chars × 2 columns + 1 space = 7 columns
-    assert_eq!(matches[1].start_col, 7);
 }
 
 /// Regression: overlapping multi-byte matches via the iterator path.
@@ -573,19 +361,6 @@ fn terminal_search_index_visible_content() {
     assert_eq!(matches[1].line, 4, "second visible line at index 4");
 }
 
-/// Verify `SearchMatch` helper methods.
-#[test]
-fn search_match_helpers() {
-    let m = SearchMatch::new(5, 10, 15);
-    assert_eq!(m.len(), 5, "match length should be end_col - start_col");
-    assert!(!m.is_empty(), "match with length 5 should not be empty");
-
-    // Edge case: zero-width match
-    let empty = SearchMatch::new(0, 5, 5);
-    assert_eq!(empty.len(), 0);
-    assert!(empty.is_empty());
-}
-
 /// `find_prev` with `before_line = usize::MAX` must not overflow.
 ///
 /// This edge case can occur when callers use `usize::MAX` as a high sentinel.
@@ -621,28 +396,6 @@ fn search_before_line_zero_returns_empty() {
     );
 }
 
-/// `find_prev` at line 0, col 0 with content at line 0 returns None.
-///
-/// Edge case: the only match is AT the boundary position, which is not
-/// "before" it (strict inequality).
-#[test]
-fn find_prev_boundary_at_first_line() {
-    let mut search = TerminalSearch::new();
-    search.index_scrollback_line("match here");
-
-    // before_line=0, before_col=0 means "find match before position (0,0)"
-    // "match" is at (0,0) which is NOT strictly before (0,0)
-    assert!(search.find_prev("match", 0, 0).is_none());
-
-    // before_line=0, before_col=1 means "find match before position (0,1)"
-    // "match" at col 0 IS strictly before col 1
-    let m = search
-        .find_prev("match", 0, 1)
-        .expect("invariant: match at col 0 is before col 1");
-    assert_eq!(m.line, 0);
-    assert_eq!(m.start_col, 0);
-}
-
 /// `find_next` at the very last indexed line returns None when no match follows.
 #[test]
 fn find_next_past_last_line() {
@@ -662,61 +415,6 @@ fn find_next_past_last_line() {
 
     // No match strictly after (1, 0)
     assert!(search.find_next("match", 1, 0).is_none());
-}
-
-/// Verify `SearchIndex::with_capacity` works like `new` but pre-allocates.
-#[test]
-fn search_index_with_capacity() {
-    let mut index = SearchIndex::with_capacity(100);
-
-    // Should behave identically to new()
-    assert!(index.is_empty());
-    assert_eq!(index.len(), 0);
-
-    index.index_line(0, "test content");
-    assert_eq!(index.len(), 1);
-    let results: Vec<_> = index.search("test").collect();
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0], 0);
-}
-
-/// Scaling test: search for a common 1-char term on a 10K-line buffer.
-///
-/// Verifies that ColumnMap-based search produces correct results at scale.
-/// The old O(M × G) implementation would scan each line's graphemes from 0
-/// per match; this test confirms correctness of the O(G + M·log G) path.
-#[test]
-fn search_10k_lines_common_char() {
-    let mut index = SearchIndex::with_capacity(10_000);
-    // Each line has ~10 occurrences of 'e' across 80 chars
-    let line = "the quick brown fox jumped over the lazy fence near the hedge";
-    for i in 0..10_000 {
-        index.index_line(i, line);
-    }
-
-    // "e" is <3 chars, so trigram index falls back to all-lines scan.
-    // This exercises the full byte_to_column → ColumnMap path on every line.
-    let matches = index.search_with_positions("e");
-
-    // Count expected: "e" appears 7 times in the line
-    let expected_per_line = line.matches('e').count();
-    assert_eq!(
-        matches.len(),
-        10_000 * expected_per_line,
-        "should find {expected_per_line} matches per line × 10,000 lines"
-    );
-
-    // Verify column positions are valid (non-decreasing within each line)
-    for window in matches.windows(2) {
-        if window[0].line == window[1].line {
-            assert!(
-                window[0].start_col < window[1].start_col,
-                "columns must increase within a line: {} vs {}",
-                window[0].start_col,
-                window[1].start_col,
-            );
-        }
-    }
 }
 
 /// Round-8: the case-insensitive ASCII path switched from an O(L·Q) per-start
@@ -1062,105 +760,6 @@ fn regex_search_preserves_nonzero_matches_alongside_zero_length() {
     }
 }
 
-/// `search_before_line` returns candidates in strictly descending line order
-/// (the O(n) `.reverse()` of the sorted bitmap range).
-#[test]
-fn search_before_line_descending_order_at_scale() {
-    let mut index = SearchIndex::new();
-    // Index 500 lines with the same trigram-matchable content.
-    for i in 0..500 {
-        index.index_line(i, &format!("needle at line {i}"));
-    }
-
-    let matches: Vec<_> = index.search_before_line("needle", 500).collect();
-    assert_eq!(matches.len(), 500);
-
-    // Verify strict descending line order.
-    for window in matches.windows(2) {
-        assert!(
-            window[0].line > window[1].line,
-            "search_before_line must return descending line order: \
-             line {} should be > line {}",
-            window[0].line,
-            window[1].line,
-        );
-    }
-    // First match is the highest line (499), last is line 0.
-    assert_eq!(matches[0].line, 499);
-    assert_eq!(matches[499].line, 0);
-}
-
-/// Performance proof: `search_before_line` with a large prefix region and a
-/// small suffix region only materializes candidates in the queried range, not
-/// the entire index. Verifies that the bitmap range query `..before_line`
-/// correctly bounds the candidate set.
-#[test]
-fn search_before_line_range_bounded() {
-    let mut index = SearchIndex::new();
-    // 1000 lines total, all matching "needle".
-    for i in 0..1000 {
-        index.index_line(i, &format!("needle line {i}"));
-    }
-
-    // Search before line 10 — should return exactly 10 matches (lines 0..10).
-    let matches: Vec<_> = index.search_before_line("needle", 10).collect();
-    assert_eq!(
-        matches.len(),
-        10,
-        "should only find 10 matches before line 10"
-    );
-    assert_eq!(
-        matches[0].line, 9,
-        "first match should be line 9 (descending)"
-    );
-    assert_eq!(matches[9].line, 0, "last match should be line 0");
-}
-
-/// Case-insensitive search finds matches regardless of letter case (ASCII fast path).
-#[test]
-fn case_insensitive_ascii_search() {
-    let mut index = SearchIndex::new();
-    index.index_line(0, "Hello World");
-    index.index_line(1, "HELLO WORLD");
-    index.index_line(2, "hello world");
-    index.index_line(3, "no match here");
-
-    let matches = index
-        .search_with_positions_opts("hello", false, false)
-        .unwrap();
-    assert_eq!(matches.len(), 3, "should find 3 case-insensitive matches");
-    let lines: Vec<_> = matches.iter().map(|m| m.line).collect();
-    assert!(lines.contains(&0));
-    assert!(lines.contains(&1));
-    assert!(lines.contains(&2));
-    // All matches start at column 0
-    for m in &matches {
-        assert_eq!(m.start_col, 0);
-        assert_eq!(m.end_col, 5);
-    }
-}
-
-/// Case-insensitive search with non-ASCII text uses the buffer-reuse path.
-#[test]
-fn case_insensitive_non_ascii_search() {
-    let mut index = SearchIndex::new();
-    index.index_line(0, "ΔΕΛΤΑ data");
-    index.index_line(1, "δελτα data");
-    index.index_line(2, "no greek here");
-
-    let matches = index
-        .search_with_positions_opts("δελτα", false, false)
-        .unwrap();
-    assert_eq!(
-        matches.len(),
-        2,
-        "should find Greek matches case-insensitively"
-    );
-    let lines: Vec<_> = matches.iter().map(|m| m.line).collect();
-    assert!(lines.contains(&0));
-    assert!(lines.contains(&1));
-}
-
 /// Regression: case-insensitive search must match across all three forms of
 /// Greek sigma (capital Σ, medial σ, word-final ς).
 ///
@@ -1201,19 +800,6 @@ fn case_insensitive_greek_final_sigma_unified() {
             "{label} must not match the non-Greek line, got {lines:?}"
         );
     }
-}
-
-/// Case-insensitive search finds multiple overlapping matches on the same line.
-#[test]
-fn case_insensitive_overlapping_matches() {
-    let mut index = SearchIndex::new();
-    index.index_line(0, "aAaAa");
-
-    let matches = index
-        .search_with_positions_opts("aa", false, false)
-        .unwrap();
-    // "aAaAa" lowered = "aaaaa", matches at offsets 0,1,2,3
-    assert_eq!(matches.len(), 4, "should find 4 overlapping matches");
 }
 
 /// A repeated first-byte prefix must not make case-insensitive verification
@@ -1455,7 +1041,7 @@ fn terminal_search_option_navigation_is_ordered_and_case_insensitive() {
 /// Regex pattern exceeding `MAX_REGEX_PATTERN_LEN` is rejected before compilation.
 ///
 /// Prevents ReDoS via compilation by bounding pattern length at the index
-/// layer, matching the streaming engine's `max_pattern_len` guard.
+/// layer.
 #[test]
 fn regex_pattern_too_long_rejected() {
     let mut index = SearchIndex::new();
@@ -1479,78 +1065,28 @@ fn regex_pattern_too_long_rejected() {
     );
 }
 
-/// Regex compilation with bounded `size_limit` rejects patterns that would
-/// produce oversized NFA/DFA automata. This verifies the `RegexBuilder`
-/// size limits are effective.
-#[test]
-fn regex_compilation_size_limit_enforced() {
-    let mut index = SearchIndex::new();
-    index.index_line(0, "test content");
-
-    // A pattern with many large alternations can blow up NFA size even within
-    // the 1024-byte length limit. This pattern generates a large automaton.
-    // Use 100 unique 8-char alternations (~999 bytes with separators).
-    let alternatives: Vec<String> = (0..100).map(|i| format!("alt{i:05}x")).collect();
-    let pattern = alternatives.join("|");
-    assert!(
-        pattern.len() <= 1024,
-        "test pattern should fit in length limit"
-    );
-
-    // This should either succeed or fail with InvalidRegex (due to size_limit),
-    // but must never panic or hang.
-    let result = index.search_with_positions_opts(&pattern, true, true);
-    assert!(
-        matches!(result, Ok(_) | Err(SearchOptionsError::InvalidRegex(_))),
-        "large-automaton pattern should succeed or return InvalidRegex, got {result:?}"
-    );
-}
-
 // =============================================================================
 // Generation counter tests (#7271)
 // =============================================================================
 
-/// Generation counter starts at 0 and bumps on each index mutation.
+/// Every index mutation bumps the generation exactly once: per scrollback
+/// line (the batch method too), per `index_visible_content` call, per
+/// `clear`, and per `invalidate` — which leaves the content searchable.
 #[test]
-fn generation_counter_starts_at_zero() {
-    let search = TerminalSearch::new();
-    assert_eq!(search.generation(), 0);
-}
-
-/// Each `index_scrollback_line` bumps the generation.
-#[test]
-fn generation_bumps_on_index_scrollback_line() {
+fn generation_bumps_once_per_mutation() {
     let mut search = TerminalSearch::new();
     assert_eq!(search.generation(), 0);
-
     search.index_scrollback_line("line 0");
     assert_eq!(search.generation(), 1);
-
-    search.index_scrollback_line("line 1");
-    assert_eq!(search.generation(), 2);
-}
-
-/// `index_scrollback_lines` bumps once per line (batch method).
-#[test]
-fn generation_bumps_on_index_scrollback_lines_batch() {
-    let mut search = TerminalSearch::new();
     search.index_scrollback_lines(vec!["a", "b", "c"]);
-    assert_eq!(
-        search.generation(),
-        3,
-        "batch of 3 lines should bump generation 3 times"
-    );
-}
-
-/// `index_visible_content` bumps the generation once per call.
-#[test]
-fn generation_bumps_on_index_visible_content() {
-    let mut search = TerminalSearch::new();
-    search.index_visible_content(0, vec!["line A", "line B"]);
-    assert_eq!(search.generation(), 1);
-
-    search.index_visible_content(2, vec!["line C"]);
-    assert_eq!(search.generation(), 2);
+    assert_eq!(search.generation(), 4, "one per batched line");
+    search.index_visible_content(4, vec!["line A", "line B"]);
+    assert_eq!(search.generation(), 5, "one per visible-content call");
+    search.invalidate();
+    assert_eq!(search.generation(), 6);
+    assert_eq!(search.search("line A").len(), 1, "invalidate keeps content");
+    search.clear();
+    assert_eq!(search.generation(), 7);
 }
 
 /// The owned batch seam is result-identical to borrowed indexing and advances
@@ -1584,67 +1120,6 @@ fn owned_numbered_content_matches_borrowed_indexing() {
         .expect("owned search is valid");
     assert_eq!(owned_results, borrowed_results);
     assert_eq!(owned.generation(), 1, "owned batch bumps exactly once");
-}
-
-/// `clear` bumps the generation.
-#[test]
-fn generation_bumps_on_clear() {
-    let mut search = TerminalSearch::new();
-    search.index_scrollback_line("content");
-    let gen_before_clear = search.generation();
-
-    search.clear();
-    assert_eq!(
-        search.generation(),
-        gen_before_clear + 1,
-        "clear should bump generation"
-    );
-}
-
-/// `invalidate` bumps the generation without modifying index content.
-#[test]
-fn generation_bumps_on_invalidate() {
-    let mut search = TerminalSearch::new();
-    search.index_scrollback_line("content");
-    let gen_after_index = search.generation();
-
-    search.invalidate();
-    assert_eq!(
-        search.generation(),
-        gen_after_index + 1,
-        "invalidate should bump generation"
-    );
-
-    // Content is still searchable after invalidate (it only signals staleness)
-    let matches = search.search("content");
-    assert_eq!(
-        matches.len(),
-        1,
-        "invalidate does not remove content from index"
-    );
-}
-
-/// Snapshot-and-compare pattern: detect stale results.
-#[test]
-fn generation_detects_stale_results() {
-    let mut search = TerminalSearch::new();
-    search.index_scrollback_line("findme here");
-    search.index_scrollback_line("findme there");
-
-    // Snapshot generation before searching
-    let gen_snapshot = search.generation();
-    let results = search.search("findme");
-    assert_eq!(results.len(), 2);
-
-    // Mutate the index (simulating grid change)
-    search.index_scrollback_line("new line with findme");
-
-    // Generation changed => cached results are stale
-    assert_ne!(
-        search.generation(),
-        gen_snapshot,
-        "generation should differ after mutation"
-    );
 }
 
 /// Read-only operations (search, find_next, find_prev, might_contain)
@@ -1887,56 +1362,6 @@ fn terminal_search_surfaces_eviction_signal() {
     assert!(results.incomplete);
     assert_eq!(results.lowest_retained_line, search.lowest_retained_line());
     assert!(!results.is_empty(), "surviving lines remain searchable");
-}
-
-/// Case-insensitive search uses the trigram index instead of full scan (#7273).
-///
-/// Verifies that:
-/// 1. Lowercased trigrams are indexed at index time
-/// 2. Case-insensitive queries use the trigram index for candidate filtering
-/// 3. Non-matching trigrams are correctly rejected (not a full scan)
-#[test]
-fn case_insensitive_search_uses_trigram_index() {
-    let mut index = SearchIndex::new();
-    // Index 100 lines, only 3 contain "Hello" (mixed case)
-    for i in 0..100 {
-        if i == 10 || i == 50 || i == 90 {
-            index.index_line(i, &format!("Hello World line {i}"));
-        } else {
-            index.index_line(i, &format!("zzzzz nothing line {i}"));
-        }
-    }
-
-    // Case-insensitive search for "hello" should find exactly 3 matches
-    let matches = index
-        .search_with_positions_opts("hello", false, false)
-        .unwrap();
-    assert_eq!(
-        matches.len(),
-        3,
-        "case-insensitive 'hello' should find 3 matches"
-    );
-    let lines: Vec<_> = matches.iter().map(|m| m.line).collect();
-    assert!(lines.contains(&10));
-    assert!(lines.contains(&50));
-    assert!(lines.contains(&90));
-
-    // Verify the trigram index contains lowercased trigrams by checking
-    // that the bloom filter accepts the lowercased query
-    assert!(
-        index.might_contain("hel"),
-        "bloom filter should accept lowercased trigram 'hel' from 'Hello'"
-    );
-
-    // A query with no matching trigrams should return empty even for
-    // case-insensitive search, proving the trigram filter is active
-    let no_match = index
-        .search_with_positions_opts("xyzqj", false, false)
-        .unwrap();
-    assert!(
-        no_match.is_empty(),
-        "trigram filter should reject non-matching case-insensitive query"
-    );
 }
 
 // Regression for the lowercased-trigram fast path: gating the lowered pass

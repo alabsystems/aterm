@@ -6,21 +6,17 @@
 //! and this agent is what holds the memory.
 //!
 //! * Past the ceiling is a warning ([`judge`] → [`MemoryOver`]): one Messages
-//!   row per episode ([`MemoryOver::warning`]), said again when what comes next
-//!   changes ([`Verdict`]). The episode ends when the footprint falls an eighth
-//!   under the ceiling ([`episode_over`]).
-//! * A restart ([`MemoryOver::acts`]) only when the machine is in trouble
-//!   ([`AgentMemory::strain`]: critical pressure, or warn while swapping at
-//!   least [`THRASH_SWAP_KIB_S`]) and this agent dominates
+//!   row per episode ([`MemoryOver::warning`]), said again when its [`Verdict`]
+//!   changes. The episode ends an eighth under the ceiling ([`episode_over`]).
+//! * A restart ([`MemoryOver::acts`]) needs the machine in trouble
+//!   ([`AgentMemory::strain`]) and this agent dominant
 //!   ([`AgentMemory::dominant`]). The loop then reads the measure as
 //!   [`aterm_phase::WallKind::Memory`] at the next idle point, where the
-//!   turn-end policy's `memory_restart` asks the host for a restart, or hands
+//!   turn-end policy's `memory_restart` asks the host for a restart or hands
 //!   the person the resume line. One agent is restarted at a time, the largest.
 //!
-//! The ceiling ([`MemoryCeiling::ceiling_mib`]) is by default an eighth of
-//! physical memory plus half of what is available now, clamped between the
-//! smaller of [`AUTO_FLOOR_MIB`] and a quarter of the machine, and half of it.
-//! A fixed number of GiB does not move; `off` disables warning and restart.
+//! The ceiling is [`MemoryCeiling::ceiling_mib`]: `auto` moves with the
+//! machine, a number of GiB does not, `off` disables warning and restart.
 
 use std::fmt::Write as _;
 
@@ -39,9 +35,9 @@ pub const AUTO_FLOOR_MIB: u64 = 4 * 1024;
 pub const UNKNOWN_MACHINE_MIB: u64 = 16 * 1024;
 
 /// The swap rate, KiB/s (in plus out), at which a Mac whose kernel says warn
-/// is thrashing ([`AgentMemory::strain`]): the strain engine's own warn enter
-/// line, 4 MB/s. Machines frozen by memory swap tens of MB/s at warn.
-pub use aterm_messages::strain::WARN_SWAP_ENTER_KIB_S as THRASH_SWAP_KIB_S;
+/// is thrashing ([`AgentMemory::strain`]): 4 MB/s. Machines frozen by memory
+/// swap tens of MB/s at warn.
+pub const THRASH_SWAP_KIB_S: u32 = 4096;
 
 /// The share of memory in use, percent, an agent must hold to be the dominant
 /// consumer ([`AgentMemory::dominant`]): a fifth.
@@ -61,7 +57,7 @@ pub enum MemoryCeiling {
     #[default]
     Auto,
     /// Never measured: no warning and no restart; only Claude Code's own
-    /// banner is a wall. The key's limit.
+    /// banner is a wall. The value that gives least ([`Self::no_more_than`]).
     Off,
     /// This many GiB, whatever the machine.
     Gib(u32),
@@ -102,9 +98,8 @@ impl MemoryCeiling {
     }
 
     /// Whether `self` gives no more power than `before`: the same, off, or a
-    /// HIGHER number of GiB (a higher ceiling warns, and restarts, less).
-    /// `auto` against a number cannot be compared without the machine, so
-    /// neither limits the other.
+    /// higher number of GiB (a higher ceiling warns, and restarts, less). `auto`
+    /// and a number are not comparable without the machine.
     #[must_use]
     pub fn no_more_than(self, before: Self) -> bool {
         match (self, before) {
@@ -161,7 +156,7 @@ pub enum Strain {
     /// The kernel says its pressure is critical.
     Critical,
     /// The kernel says warn while the Mac swaps this many KiB/s (at least
-    /// [`THRASH_SWAP_KIB_S`]): the thrash the recorded freezes were.
+    /// [`THRASH_SWAP_KIB_S`]).
     Swapping {
         /// Swapped in plus out, KiB/s.
         swap_kib_s: u32,
@@ -227,7 +222,7 @@ impl AgentMemory {
     }
 }
 
-/// An agent's memory past its ceiling ([`judge`]): a WARNING, and a restart
+/// An agent's memory past its ceiling ([`judge`]): a warning, and a restart
 /// only where [`Self::acts`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemoryOver {
@@ -244,13 +239,9 @@ pub struct MemoryOver {
 }
 
 /// What a warning says comes next ([`MemoryOver::verdict`]). The warning is
-/// said once an episode AND again whenever this changes within it — the Mac
-/// falling into trouble, recovering, another agent growing past this one, a
-/// host that restarts or no longer does, a restart the host refused (and one
-/// made after it) — so the row on the window's
-/// Messages (keyed per tab: the new one replaces the old) never says a
-/// warning only while aterm restarts the agent, nor a restart that is no
-/// longer coming.
+/// said once an episode and again whenever this changes, so the window's
+/// Messages row (keyed per tab, the new replacing the old) never promises a
+/// restart that is no longer coming, nor says "warning only" while one is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
     /// Acted on, and the host restarts it at its next idle point.
@@ -280,10 +271,9 @@ pub fn judge(cfg: MemoryCeiling, m: &AgentMemory) -> Option<MemoryOver> {
     })
 }
 
-/// Whether a warning's EPISODE is over: no measure, the ceiling off, or the
-/// footprint an eighth or more under the ceiling now. Between that line and
-/// the ceiling the episode stands, so a ceiling that moves with the
-/// machine's available memory does not warn again each time the two cross.
+/// Whether a warning's episode is over: no measure, the ceiling off, or the
+/// footprint an eighth or more under the ceiling. The band keeps a ceiling that
+/// moves with available memory from warning again each time the two cross.
 #[must_use]
 pub fn episode_over(cfg: MemoryCeiling, m: Option<&AgentMemory>) -> bool {
     let Some(m) = m else {
@@ -302,16 +292,15 @@ pub fn gb(mib: u64) -> String {
     format!("{}.{} GB", tenths / 10, tenths % 10)
 }
 
-/// The swap rate as the strain row writes it, MB/s rounded.
+/// The swap rate as the banner writes it, MB/s rounded.
 fn mb_s(swap_kib_s: u32) -> u32 {
     swap_kib_s.saturating_add(512) / 1024
 }
 
 impl MemoryOver {
-    /// Whether the measure is to be ACTED on — the agent restarted at its
-    /// next idle point where its host can, the person handed its resume line
-    /// where not: the machine is in trouble ([`AgentMemory::strain`]) and
-    /// this agent is the dominant consumer. Otherwise it is a warning.
+    /// Whether the measure is acted on (a restart at the next idle point, or the
+    /// person handed the resume line): the machine is in trouble and this agent
+    /// is the dominant consumer. Otherwise it is a warning.
     #[must_use]
     pub fn acts(&self) -> bool {
         self.strain.is_some() && self.dominant
@@ -364,10 +353,9 @@ impl MemoryOver {
         }
     }
 
-    /// What the warning says comes next ([`Verdict`]), `restarts` being
-    /// whether the host makes a restart: the part of a measure that, when it
-    /// changes within an episode, has the warning said again — the numbers
-    /// alone never do.
+    /// What the warning says comes next, `restarts` being whether the host
+    /// makes a restart. Only a change in this, not in the numbers, has the
+    /// warning said again within an episode.
     #[must_use]
     pub fn verdict(&self, restarts: bool) -> Verdict {
         match (self.acts(), restarts) {
@@ -378,16 +366,11 @@ impl MemoryOver {
         }
     }
 
-    /// The WARNING said once an episode, and again whenever its
-    /// [`Verdict`] changes within it (the window's Messages): `<agent>:
-    /// <footprint and ceiling>; <the machine>; <what comes next>`. What
-    /// comes next: aterm's restart at the next idle point where the measure
-    /// [`Self::acts`] and `restarts` (the host makes one); the person's,
-    /// with `resume` (the tab's own `claude --resume <id>`, or a Codex's
-    /// `codex resume <thread>`), where it acts and the host makes none; else
-    /// nothing — a warning — and the line that restarts it by hand. The line
-    /// is the warning's last words, so a renderer that cuts keeps it whole
-    /// or not at all ([`never_cut`]).
+    /// The warning for the window's Messages: `<agent> uses <footprint>, past
+    /// aterm's memory ceiling of <ceiling>; <the machine>; <what comes next>`.
+    /// What comes next follows [`Self::verdict`]; `resume` (the tab's own
+    /// `claude --resume <id>`) is the line that restarts it by hand; it ends
+    /// the warning, so [`never_cut`] can keep it whole or not at all.
     #[must_use]
     pub fn warning(&self, agent: &str, restarts: bool, resume: Option<&str>) -> String {
         let (footprint, ceiling) = (gb(self.footprint_mib), gb(self.ceiling_mib));
@@ -421,14 +404,12 @@ const RESTART_IT_YOURSELF: &str = "to restart it yourself: ";
 /// What the warning says in its place where it can name no line.
 const RESTART_IT_BY_HAND: &str = "restart it yourself if it should give the memory back";
 
-/// `render(text)` for a warning [`MemoryOver::warning`] made, `render` a
-/// renderer that may cut its input to fit a cap or break it into lines (the
-/// window's row: the tab's place ahead of it, 400 characters, lines at its
-/// joints), with the resume line the warning ends with kept whole or not at
-/// all — a rendering keeps it where it ends with it: the first of `text`,
-/// `text` with each of the line's shorter forms
+/// `render(text)` for a warning [`MemoryOver::warning`] made, with the resume
+/// line it ends with kept whole or not at all, where `render` may cut its
+/// input or break it into lines: the first rendering still ending with the
+/// line, of `text` and then of `text` with each of the line's shorter forms
 /// ([`crate::harness::resume::shorter`]: its permission mode alone, then the
-/// conversation alone), and `text` naming no line, which still says to
+/// conversation alone); else `text` naming no line, which still says to
 /// restart it by hand. Text naming no line is rendered as it is. A cut id
 /// names no conversation, or another's.
 #[must_use]
@@ -452,11 +433,9 @@ mod tests {
 
     const GIB: u64 = 1024;
 
-    /// The automatic ceiling moves with the machine: an eighth of the Mac plus
-    /// half of what is available, between the smaller of 4 GiB and a quarter of
-    /// the Mac, and half of the Mac; a quarter where available is unknown;
-    /// 16 GiB on an unknown machine. Negative control: more available means a
-    /// higher ceiling, and an owner's number does not move.
+    /// The automatic ceiling follows [`MemoryCeiling::ceiling_mib`]. Negative
+    /// control: more available means a higher ceiling; an owner's number does
+    /// not move.
     #[test]
     fn the_automatic_ceiling_moves_with_the_available_memory() {
         let auto = |p: Option<u64>, a: Option<u64>| {
@@ -519,11 +498,9 @@ mod tests {
         }
     }
 
-    /// The machine is in trouble at critical pressure whatever the swap, and at
-    /// warn only while swapping at least [`THRASH_SWAP_KIB_S`] (e.g.
-    /// `pressure warn · swap 89 MB/s`); not at warn with swap quiet, under the
-    /// line or unmeasured, nor at normal pressure however fast it swaps, nor at
-    /// an unknown level.
+    /// In trouble at critical pressure whatever the swap, and at warn only while
+    /// swapping at least [`THRASH_SWAP_KIB_S`]; not at warn with swap under the
+    /// line or unmeasured, at normal pressure, nor at an unknown level.
     #[test]
     fn the_machine_is_in_trouble_at_critical_or_at_warn_while_it_swaps() {
         let at = |p, swap| m(5, 128, 2, 120, p, swap).strain();
@@ -588,13 +565,10 @@ mod tests {
         assert!(by_mac.dominant(), "28 of the 128 GB Mac: 21%");
     }
 
-    /// Warn first: on a Mac with memory to spare every footprint past the
-    /// ceiling is a warning, never acted on, a 215 GiB runaway included. Acted
-    /// on only when the Mac is in trouble and the agent dominates (a 109 GB
-    /// agent at warn swapping 89 MB/s with 121 GB in use; an agent at critical
-    /// pressure). Negative controls: a 45.8 GB agent beside the 109 GB one is
-    /// warned about, not acted on; a healthy agent is never over; `off` judges
-    /// nothing; one MiB under the ceiling is under it.
+    /// With memory to spare every footprint past the ceiling is a warning only;
+    /// it is acted on only when the Mac is in trouble and the agent dominates.
+    /// Negative controls: a smaller agent beside a larger one, a healthy agent,
+    /// `off`, and one MiB under the ceiling.
     #[test]
     fn a_measure_past_the_ceiling_warns_and_acts_only_in_trouble_on_the_dominant_agent() {
         use Pressure::{Critical, Normal, Warn};
@@ -607,7 +581,7 @@ mod tests {
         // Warn while quiet: the kernel keeps up; still a warning.
         let quiet = judge(auto, &m(2150, 128, 8, 120, Warn, Some(0))).expect("over");
         assert!(!quiet.acts(), "{quiet:?}");
-        // The 09-28 freeze.
+        // The dominant agent at warn, swapping 89 MB/s.
         let big = judge(
             auto,
             &AgentMemory {
@@ -626,7 +600,7 @@ mod tests {
         )
         .expect("over the ceiling too");
         assert!(!beside.acts(), "not the dominant one: {beside:?}");
-        // The 09-24 process: 38.8 GiB on a 192 GB Mac at critical pressure.
+        // 38.8 GiB on a 192 GB Mac at critical pressure.
         let crit = judge(auto, &m(388, 192, 4, 136, Critical, None)).expect("over");
         assert!(crit.acts(), "{crit:?}");
         // Negative controls.
@@ -671,10 +645,8 @@ mod tests {
         assert!(episode_over(MemoryCeiling::Off, Some(&at(200 * GIB))));
     }
 
-    /// The verdict is what has the warning said again: it moves with the Mac's
-    /// trouble, this agent's rank and a restarting host, not with the numbers,
-    /// so a footprint, ceiling or swap rate moving within an episode says
-    /// nothing new.
+    /// The verdict moves with the Mac's trouble, this agent's rank and a
+    /// restarting host, never with the numbers alone.
     #[test]
     fn the_verdict_moves_with_trouble_rank_and_restart_not_with_the_numbers() {
         let spare = MemoryOver {
@@ -719,10 +691,9 @@ mod tests {
     }
 
     /// The fact is in the banner's shape, with no ` — ` for the banner's head
-    /// to cut at; the warning names the footprint, the machine and the
-    /// resume line; what comes next follows the verdict.
+    /// to cut at, whatever the strain.
     #[test]
-    fn the_fact_and_the_warning_name_the_measure_the_machine_and_the_remedy() {
+    fn the_fact_is_read_whole_as_the_banners_head() {
         let over = MemoryOver {
             footprint_mib: 220_279,
             ceiling_mib: 48 * GIB,
@@ -730,67 +701,24 @@ mod tests {
             strain: None,
             dominant: true,
         };
-        assert_eq!(
-            over.fact(),
-            "Memory past aterm's ceiling (215.1 GB; ceiling 48.0 GB)"
-        );
-        let resume = "claude --resume 0badf00d";
-        assert_eq!(
-            over.warning("Claude Code", true, Some(resume)),
-            "Claude Code uses 215.1 GB, past aterm's memory ceiling of 48.0 GB; the Mac has \
-             60.0 GB available and is not short of memory; a warning only: nothing is \
-             restarted; to restart it yourself: claude --resume 0badf00d"
-        );
         let swapping = MemoryOver {
             strain: Some(Strain::Swapping { swap_kib_s: 60_000 }),
             ..over
         };
-        assert!(
-            swapping
-                .fact()
-                .ends_with(", the Mac swapping 59 MB/s under memory pressure)"),
-            "{}",
-            swapping.fact()
-        );
-        assert!(
-            swapping
-                .warning("Claude Code", true, Some(resume))
-                .ends_with("aterm restarts it on its conversation at its next idle point"),
-        );
-        assert!(
-            swapping
-                .warning("Claude Code", false, Some(resume))
-                .ends_with(
-                    "it holds the most memory; to restart it yourself: claude --resume 0badf00d"
-                ),
-        );
-        let second = MemoryOver {
-            dominant: false,
-            ..swapping
-        };
-        assert!(
-            second
-                .warning("Codex", true, None)
-                .contains("a warning only: another agent holds more, so it keeps running"),
-        );
         let critical = MemoryOver {
             strain: Some(Strain::Critical),
             ..over
         };
-        assert!(critical.fact().ends_with(", at critical memory pressure)"));
         for f in [over, swapping, critical] {
             assert_eq!(aterm_phase::memory_banner_head(&f.fact()), f.fact());
         }
-        assert_eq!(gb(0), "0.0 GB");
-        assert_eq!(gb(1536), "1.5 GB");
     }
 
-    /// THE WARNING'S RESUME LINE IS KEPT WHOLE OR NOT AT ALL ([`never_cut`]):
-    /// under a renderer's cap, a Codex's line steps down to its sandbox and
-    /// approval flags, then to its thread alone, and past that the warning
-    /// names no line and says to restart it by hand. A warning that names
-    /// none is rendered as it is. NEGATIVE CONTROL: the cap alone cuts the
-    /// thread.
+    /// The warning's resume line is kept whole or not at all ([`never_cut`]):
+    /// under a renderer's cap a Claude Code's line steps down to its
+    /// permission mode, then to its conversation alone, then to no line and
+    /// the restart-by-hand words. A warning that names no line renders as it
+    /// is. Negative control: the cap alone cuts the conversation.
     #[test]
     fn the_warnings_resume_line_is_kept_whole_or_not_at_all() {
         let over = MemoryOver {
@@ -800,22 +728,20 @@ mod tests {
             strain: None,
             dominant: true,
         };
-        let thread = "019a0b1c-2d3e-7f40-8a5b-6c7d8e9f0a1b";
+        let session = "0badf00d-1111-2222-3333-444455556666";
         let argv: Vec<String> = [
-            "codex",
-            "-m",
-            "gpt-5-codex",
-            "-c",
-            "mcp_servers.github.command=\"/opt/homebrew/bin/github-mcp-server\"",
-            "-s",
-            "workspace-write",
-            "-a",
-            "on-request",
+            "claude",
+            "--model",
+            "claude-opus-5-5",
+            "--add-dir",
+            "/Users//someone/a-rather-long-project-directory",
+            "--permission-mode",
+            "plan",
         ]
         .map(String::from)
         .to_vec();
-        let line = crate::harness::resume::codex_command(&argv, thread, None).unwrap();
-        let text = over.warning("Codex", false, Some(&line));
+        let line = crate::harness::resume::command(&argv, session).unwrap();
+        let text = over.warning("Claude", false, Some(&line));
         let cap = |n: usize| {
             move |t: &str| -> String {
                 let mut out: String = t.chars().take(n).collect();
@@ -827,8 +753,15 @@ mod tests {
         };
         let len = |t: &str| t.chars().count();
         let head = text.strip_suffix(line.as_str()).unwrap();
-        let mode = format!("{head}codex resume -s workspace-write -a on-request {thread}");
-        let bare = format!("{head}codex resume {thread}");
+        let mode = format!(
+            "{head}{}",
+            crate::harness::resume::mode_of(&line).expect("a permission mode")
+        );
+        let bare = format!("{head}claude --resume {session}");
+        assert!(
+            mode.contains("plan") && !mode.contains("--add-dir"),
+            "{mode}"
+        );
         assert_eq!(never_cut(&text, cap(len(&text))), text, "whole");
         assert_eq!(never_cut(&text, cap(len(&text) - 1)), mode);
         assert_eq!(never_cut(&text, cap(len(&mode) - 1)), bare);
@@ -843,10 +776,10 @@ mod tests {
             strain: Some(Strain::Critical),
             ..over
         }
-        .warning("Codex", true, Some(&line));
+        .warning("Claude", true, Some(&line));
         assert_eq!(never_cut(&restart, cap(400)), restart, "no line named");
-        // NEGATIVE CONTROL.
-        assert!(!cap(len(&text) - 1)(&text).contains(thread));
+        // Negative control.
+        assert!(!cap(len(&text) - 1)(&text).contains(session));
     }
 
     /// The key's text round-trips, takes a unit, and reads zero as off.

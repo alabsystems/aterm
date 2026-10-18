@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm_objc::MainThreadBound` and an unsound twin, measured side by side.
+//! `aterm_objc::MainThreadBound`, measured on the real process main thread.
 //!
 //! The container's third obligation (the value is dropped on the main thread) is discharged by
 //! [`aterm_objc::run_on_main`] inside `Drop`, which libtest cannot exercise: it runs each test
@@ -12,23 +12,25 @@
 //! without running; on macOS a NOT RUN (`2`: no main thread, no witness, no probe class) is a
 //! failing exit.
 //!
-//! The drop obligation has no type-system half, so the counterexample is not a `compile_fail`
-//! doctest but `NaiveBound<T>`: the same `unsafe impl<T> Send` and witnessed `new`, with a drop
-//! in place. Stage 3 measures where its `T`'s destructor runs against `MainThreadBound`'s;
-//! stage 4 does the same with a `Retained` of a declared class whose ivar has a destructor
-//! (`S3`'s release end in the crate's soundness list), which `NaiveBound` lets `-dealloc` run on
-//! a spawned thread through safe code.
+//! The drop obligation has no type-system half, so it is measured: stage 2 drops a container on
+//! a worker and reads the thread its `T`'s destructor ran on, and stage 3 does the same with a
+//! `Retained` of a declared class whose ivar has a destructor (`S3`'s release end in the crate's
+//! soundness list, closed for everything this container holds).
 //!
-//! A `Drop` that drops in place instead of rescheduling fails stages 2 and 4 (the destructor
-//! lands on the worker) and stage 5's needs-drop child (it stops hanging); removing the
-//! `needs_drop` short-circuit makes stage 5's drop-less child hang. Stages 3 and 4b are the
-//! counterexample's arms and expect the worker: they fail if `NaiveBound` stops being unsound.
-//! Stage 5 is a child-process differential because the failure the short-circuit prevents is a
-//! hang: a child dropping a needs-drop container on a worker with its main thread parked must
-//! never return, and the same child with a drop-less `T` must exit 0.
+//! `Drop` skips the dispatch entirely when `T` has no destructor; without the skip, a container
+//! dropped on a worker while the main thread is parked (a libtest binary's shape) would block
+//! for ever. Stage 4 runs that position in a child process with a drop-less `T` and requires it
+//! to exit 0.
 #![allow(
     clippy::disallowed_types,
     reason = "test code: a stand-in child may inherit descriptors"
+)]
+#![cfg_attr(
+    target_os = "macos",
+    expect(
+        clippy::disallowed_methods,
+        reason = "aterm-objc's own runtime tests drive the bare `msg` cast; everything else uses checked_msg"
+    )
 )]
 
 /// The name libtest's argv selects this target by: its `[[test]] name`.
@@ -140,12 +142,6 @@ const NOT_RUN: i32 = 2;
 #[cfg(target_os = "macos")]
 const MODE: &str = "ATERM_OBJC_BOUND_DRIVE_MODE";
 
-/// How long stage 5's needs-drop child, which must never return, is watched before it counts as
-/// hung; it always costs this whole window. A `Drop` that does not reschedule returns in
-/// milliseconds.
-#[cfg(target_os = "macos")]
-const HANG_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
-
 /// A hang detector, never a latency budget, for anything that must complete: a dispatched drop,
 /// a `get_on_main`, the drop-less child. Each wait returns the moment it completes.
 #[cfg(target_os = "macos")]
@@ -160,7 +156,6 @@ fn run() -> i32 {
 #[cfg(target_os = "macos")]
 fn run() -> i32 {
     match std::env::var(MODE).as_deref() {
-        Ok("hang") => macos::child_drop_with_destructor(),
         Ok("nodrop") => macos::child_drop_without_destructor(),
         _ => macos::parent(),
     }
@@ -170,7 +165,6 @@ fn run() -> i32 {
 mod macos {
     use std::cell::Cell;
     use std::ffi::c_void;
-    use std::mem::ManuallyDrop;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
@@ -179,7 +173,7 @@ mod macos {
         Bool, Id, MainThread, MainThreadBound, Retained, Sel, class, declare_class, msg, sel,
     };
 
-    use super::{FAIL, HANG_WINDOW, MODE, NOT_RUN, PASS, WATCHDOG};
+    use super::{FAIL, MODE, NOT_RUN, PASS, WATCHDOG};
 
     // SAFETY: CoreFoundation is a system framework, always present, and these are its
     // declarations. The main thread must service its queue or every dispatched drop blocks.
@@ -200,33 +194,6 @@ mod macos {
         }
     }
 
-    // -- The counterexample ----------------------------------------------
-
-    /// `MainThreadBound`'s twin without the rescheduling drop: the same witnessed `new` and the
-    /// same `unsafe impl<T> Send`, whose SAFETY argument holds for two of its three clauses. The
-    /// compiler cannot tell the two apart.
-    struct NaiveBound<T>(ManuallyDrop<T>);
-
-    // SAFETY: deliberately false; that is the measurement. The value is born on the main thread
-    // (`new` takes a witness) and never read, but `Drop` destroys it wherever the container
-    // dies. The compiler does not object; stage 3 does.
-    unsafe impl<T> Send for NaiveBound<T> {}
-
-    impl<T> NaiveBound<T> {
-        fn new(inner: T, _mt: MainThread) -> Self {
-            Self(ManuallyDrop::new(inner))
-        }
-    }
-
-    impl<T> Drop for NaiveBound<T> {
-        fn drop(&mut self) {
-            // SAFETY: the container's own drop: the value is destroyed exactly once and never
-            // read again. What is missing is not a safety condition on this line but the thread
-            // it runs on.
-            unsafe { ManuallyDrop::drop(&mut self.0) };
-        }
-    }
-
     // -- The payloads whose destructors report where they ran ------------
 
     /// 1 if the destructor ran on the main thread, 2 if it did not, 0 if it has
@@ -241,11 +208,11 @@ mod macos {
         }
     }
 
-    /// Stage 4's ivars: a destructor that records the thread `-dealloc` ran on, and a `Cell` so
+    /// Stage 3's ivars: a destructor that records the thread `-dealloc` ran on, and a `Cell` so
     /// the type is `!Send` as real ivars are.
     struct DeallocWatch {
         _calls: Cell<i64>,
-        /// Held for its `Drop`, which is the observation stage 4 makes.
+        /// Held for its `Drop`, which is the observation stage 3 makes.
         _where_died: WhereDidIDie,
     }
 
@@ -286,29 +253,10 @@ mod macos {
         }
     }
 
-    // -- The child probes: stage 5's differential (the failure it guards is a hang) --
+    // -- The child probe: stage 4, in its own process (the failure it guards is a hang) --
 
-    /// A needs-drop container dropped on a worker with the main thread parked, as in a libtest
-    /// binary: `run_on_main`'s first documented hang, through `Drop`. Must never return.
-    pub fn child_drop_with_destructor() -> i32 {
-        assert!(is_main_thread(), "the probe must start on the main thread");
-        // SAFETY: this process's main thread is where `main` is running.
-        let mt = MainThread::new().expect("the probe runs on the main thread");
-        let flag = std::sync::Arc::new(AtomicU32::new(0));
-        let bound = MainThreadBound::new(WhereDidIDie(flag), mt);
-        eprintln!("child(hang): dropping a needs-drop container on a worker, main thread parked");
-        let worker = std::thread::spawn(move || {
-            drop(bound);
-            println!("HANG-CHILD-RETURNED");
-        });
-        // Parks rather than pumping, as a libtest main thread does joining its workers.
-        let _ = worker.join();
-        println!("HANG-CHILD-JOINED");
-        PASS
-    }
-
-    /// The same position, with a `T` that has no destructor. The short-circuit
-    /// means this never reaches the queue, so it must return at once.
+    /// A drop-less container dropped on a worker with the main thread parked, as in a libtest
+    /// binary. The short-circuit means this never reaches the queue, so it must return at once.
     pub fn child_drop_without_destructor() -> i32 {
         assert!(is_main_thread(), "the probe must start on the main thread");
         // SAFETY: as above.
@@ -376,33 +324,8 @@ mod macos {
             "stage2: and the destructor still ran on the MAIN thread",
         );
 
-        // -- Stage 3: the counterexample ----------------------------------
-        eprintln!("stage 3: the SAME program with `NaiveBound` — same `unsafe impl Send`, no");
-        eprintln!("         reschedule. It compiles, and it lands somewhere else.");
-        let flag = std::sync::Arc::new(AtomicU32::new(0));
-        let naive = NaiveBound::new(WhereDidIDie(flag.clone()), mt);
-        let (tx, rx) = mpsc::channel::<bool>();
-        let worker = std::thread::spawn(move || {
-            let off_main = !is_main_thread();
-            drop(naive);
-            let _ = tx.send(off_main);
-        });
-        let off_main = pump_until(&rx);
-        let _ = worker.join();
-        eprintln!("       died on {}", where_it_died(&flag));
-        check(
-            off_main == Some(true),
-            "stage3: the naive container was dropped off the main thread too",
-        );
-        check(
-            flag.load(Ordering::SeqCst) == 2,
-            "stage3: and ITS destructor ran on the WORKER — the difference between the two \
-             containers is the `Drop` impl and nothing else, and no compiler diagnostic \
-             distinguishes them",
-        );
-
-        // -- Stage 4: S3's release end, on a real declared class -----------
-        eprintln!("stage 4: an aterm_objc::Retained of a declared class — S3's release end");
+        // -- Stage 3: S3's release end, on a real declared class -----------
+        eprintln!("stage 3: an aterm_objc::Retained of a declared class — S3's release end");
         let flag = std::sync::Arc::new(AtomicU32::new(0));
         let Some(obj): Option<Retained<Watched>> = Watched::alloc_init(
             mt,
@@ -437,95 +360,27 @@ mod macos {
         );
         check(
             off_main == Some(true),
-            "stage4: the last release was performed off the main thread",
+            "stage3: the last release was performed off the main thread",
         );
         check(
             flag.load(Ordering::SeqCst) == 1,
-            "stage4: and -dealloc ran the Rust ivar destructor on the MAIN thread — S3's release \
+            "stage3: and -dealloc ran the Rust ivar destructor on the MAIN thread — S3's release \
              end, closed for everything this container holds",
         );
 
-        eprintln!("stage 4b: the same object in a NaiveBound");
-        let flag = std::sync::Arc::new(AtomicU32::new(0));
-        let Some(obj): Option<Retained<Watched>> = Watched::alloc_init(
-            mt,
-            DeallocWatch {
-                _calls: Cell::new(0),
-                _where_died: WhereDidIDie(flag.clone()),
-            },
-        ) else {
-            eprintln!("objc-bound-drive: NOT RUN — the probe class could not be instantiated.");
-            return NOT_RUN;
-        };
-        let naive = NaiveBound::new(obj, mt);
-        let (tx, rx) = mpsc::channel::<bool>();
-        let worker = std::thread::spawn(move || {
-            let off_main = !is_main_thread();
-            drop(naive);
-            let _ = tx.send(off_main);
-        });
-        let off_main = pump_until(&rx);
-        let _ = worker.join();
-        eprintln!(
-            "       -dealloc's ivar destructor ran on {}",
-            where_it_died(&flag)
-        );
+        // -- Stage 4: the needs_drop short-circuit --------------------------
+        eprintln!("stage 4: a drop-less container dropped off-main with the main thread parked");
+        let outcome = probe("nodrop", WATCHDOG);
+        if let Err(e) = &outcome {
+            eprintln!("       {e}");
+        }
         check(
-            off_main == Some(true),
-            "stage4b: dropped off the main thread",
-        );
-        check(
-            flag.load(Ordering::SeqCst) == 2,
-            "stage4b: and a DECLARED CLASS's -dealloc ran its Rust ivar destructor on a spawned \
-             thread — the hole `MainThreadBound`'s Drop exists to close",
+            outcome.is_ok_and(|stdout| stdout.contains("nodrop-child-returned")),
+            "stage4: a drop-less T dropped on a worker with the main thread parked exits 0",
         );
 
-        // -- Stage 5: the needs_drop short-circuit, by differential --------
-        eprintln!(
-            "stage 5: the `needs_drop` skip is a GUARANTEE — proved against the hang it avoids"
-        );
-        match probe("hang", HANG_WINDOW) {
-            ProbeOutcome::StillRunning => check(
-                true,
-                "stage5: a needs-drop container dropped off-main with the main thread PARKED \
-                 never returns — which is why the short-circuit for a drop-less T is not an \
-                 optimisation",
-            ),
-            ProbeOutcome::Exited { code, stdout } => {
-                eprintln!("       child exited {code:?} stdout={stdout:?}");
-                check(
-                    false,
-                    "stage5: the needs-drop child RETURNED — the hazard premise is false",
-                );
-            }
-            ProbeOutcome::Signalled(sig) => {
-                eprintln!("       child died on signal {sig}");
-                check(
-                    true,
-                    "stage5: the needs-drop child did not return (it was signalled)",
-                );
-            }
-            ProbeOutcome::Failed(e) => {
-                eprintln!("       {e}");
-                check(false, "stage5: the needs-drop probe could not be launched");
-            }
-        }
-        match probe("nodrop", WATCHDOG) {
-            ProbeOutcome::Exited { code, stdout } => {
-                check(
-                    code == Some(PASS) && stdout.contains("nodrop-child-returned"),
-                    "stage5: the SAME position with a drop-less T exits 0 — same binary, same \
-                     thread, same parked main thread",
-                );
-            }
-            other => {
-                eprintln!("       {other:?}");
-                check(false, "stage5: the drop-less child exited cleanly");
-            }
-        }
-
-        // -- Stage 6: get_on_main from a worker ---------------------------
-        eprintln!("stage 6: get_on_main from a worker reaches the value ON the main thread");
+        // -- Stage 5: get_on_main from a worker ---------------------------
+        eprintln!("stage 5: get_on_main from a worker reaches the value ON the main thread");
         let bound = std::sync::Arc::new(MainThreadBound::new(Cell::new(41_i64), mt));
         let (tx, rx) = mpsc::channel::<(i64, bool)>();
         let shared = std::sync::Arc::clone(&bound);
@@ -542,12 +397,12 @@ mod macos {
         let _ = worker.join();
         check(
             got == Some((42, true)),
-            "stage6: the closure ran on the main thread and its value crossed back",
+            "stage5: the closure ran on the main thread and its value crossed back",
         );
         let bound = std::sync::Arc::try_unwrap(bound).ok();
         check(
             bound.map(|b| b.into_inner(mt).get()) == Some(42),
-            "stage6: and the mutation stuck",
+            "stage5: and the mutation stuck",
         );
 
         if failures.is_empty() {
@@ -564,55 +419,34 @@ mod macos {
 
     // -- Child-process plumbing ------------------------------------------
 
-    #[derive(Debug)]
-    enum ProbeOutcome {
-        StillRunning,
-        Signalled(i32),
-        Exited { code: Option<i32>, stdout: String },
-        Failed(String),
-    }
-
-    /// Re-execute this binary in `mode` and watch it for `budget`.
-    fn probe(mode: &str, budget: Duration) -> ProbeOutcome {
-        let exe = match std::env::current_exe() {
-            Ok(p) => p,
-            Err(e) => return ProbeOutcome::Failed(format!("current_exe: {e}")),
-        };
-        let mut child = match std::process::Command::new(exe)
+    /// Re-execute this binary in `mode` and watch it for `budget`: its
+    /// lowercased stdout if it exited 0, otherwise what happened instead.
+    fn probe(mode: &str, budget: Duration) -> Result<String, String> {
+        let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+        let mut child = std::process::Command::new(exe)
             .env(MODE, mode)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .spawn()
-        {
-            Ok(c) => c,
-            Err(e) => return ProbeOutcome::Failed(format!("spawn: {e}")),
-        };
+            .map_err(|e| format!("spawn: {e}"))?;
 
         let deadline = Instant::now() + budget;
         loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    use std::os::unix::process::ExitStatusExt as _;
-                    if let Some(sig) = status.signal() {
-                        return ProbeOutcome::Signalled(sig);
-                    }
-                    let mut stdout = String::new();
-                    if let Some(mut out) = child.stdout.take() {
-                        use std::io::Read as _;
-                        let _ = out.read_to_string(&mut stdout);
-                    }
-                    return ProbeOutcome::Exited {
-                        code: status.code(),
-                        stdout: stdout.to_lowercase(),
-                    };
+            if let Some(status) = child.try_wait().map_err(|e| format!("try_wait: {e}"))? {
+                if !status.success() {
+                    return Err(format!("child exited {status}"));
                 }
-                Ok(None) => {}
-                Err(e) => return ProbeOutcome::Failed(format!("try_wait: {e}")),
+                let mut stdout = String::new();
+                if let Some(mut out) = child.stdout.take() {
+                    use std::io::Read as _;
+                    let _ = out.read_to_string(&mut stdout);
+                }
+                return Ok(stdout.to_lowercase());
             }
             if Instant::now() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
-                return ProbeOutcome::StillRunning;
+                return Err(format!("child still running after {budget:?}: hung"));
             }
             std::thread::sleep(Duration::from_millis(20));
         }

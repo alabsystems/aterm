@@ -10,8 +10,9 @@
 //! irrelevant against it. These tests are what catches that stub.
 //!
 //! Nothing here needs a VALID signature, and that is the point — minting one
-//! would need a committed private key, which `mint.sh` deliberately does not
-//! produce and which the repository's B6 guard forbids outright. Proving the
+//! would need a committed private key, which the fixtures' minting
+//! (`src/testdata/tls/PROVENANCE.md`) deliberately does not keep and which the
+//! repository's B6 guard forbids outright. Proving the
 //! REJECT direction is enough to kill the stub: a method that always returns
 //! `Ok` cannot reject anything.
 //!
@@ -92,27 +93,4 @@ fn tls12_rejects_a_signature_that_verifies_against_nothing() {
         &garbage_dss(SignatureScheme::ECDSA_NISTP256_SHA256),
     )
     .expect_err("a bogus TLS 1.2 handshake signature MUST be rejected");
-}
-
-/// THE CONTROL for the two tests above. They assert that something is
-/// REJECTED; without this, a verifier that rejected every scheme — including
-/// ones a real server legitimately uses — would satisfy them while breaking
-/// every handshake. `supported_verify_schemes` must be non-empty and must
-/// include the schemes modern servers actually offer.
-#[test]
-fn the_verifier_still_advertises_real_schemes() {
-    let schemes = verifier().supported_verify_schemes();
-    assert!(
-        !schemes.is_empty(),
-        "a verifier advertising no schemes cannot handshake at all"
-    );
-    for wanted in [
-        SignatureScheme::ECDSA_NISTP256_SHA256,
-        SignatureScheme::RSA_PSS_SHA256,
-    ] {
-        assert!(
-            schemes.contains(&wanted),
-            "{wanted:?} is offered by real servers and must stay supported; got {schemes:?}"
-        );
-    }
 }

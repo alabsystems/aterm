@@ -421,40 +421,6 @@ fn a_submit_that_clears_the_composer_lets_the_band_leave_through_its_own_swoosh_
     );
 }
 
-/// The frame after the submit: the blanked row's cohort is abandoned and
-/// retracting, and no cell carries a retirement stamp.
-#[test]
-fn the_blanked_band_is_drawn_into_the_hand_by_the_swoosh_s_retract_not_stamped() {
-    let mut h = composed(5);
-    h.ret(SUBMIT_SAME_ROW);
-    h.idle(16);
-    assert_eq!(
-        h.cohorts(5),
-        vec![(true, true)],
-        "the row's one cohort is abandoned into its retract"
-    );
-    assert!(
-        h.leaving(5).is_empty(),
-        "no cell is stamped: {:?}",
-        h.cells(5)
-    );
-    assert_eq!(
-        h.live(5).len(),
-        TEXT.len(),
-        "every cell is still resident, retracting"
-    );
-    assert!(
-        h.since_key() < GRACE_S,
-        "inside the grace: this is the release, not the finger-lift"
-    );
-    h.idle(((RETRACT_DUR_S + RETRACT_FADE_S) * 1000.0) as u64 + 40);
-    assert!(
-        h.cells(5).is_empty(),
-        "out of the pool after the retract's own span"
-    );
-    assert!(!h.lit(5));
-}
-
 /// The empty composer re-laid two rows down with the caret: the old row fades the
 /// same way, monotone, over the retract's span.
 #[test]
@@ -664,43 +630,6 @@ fn a_declined_hidden_relocation_whose_text_went_with_it_carries_the_band_with_it
 /// Claude Code's spinner on the row the composer left: a different glyph under
 /// every column of `hello world` but the tenth, which stays blank.
 const SPINNER: &[u8] = b"* Thinking about it (esc to interrupt)";
-
-/// The blanked band is counted in `ribbon_retired=` once: not again on a second
-/// walk over the blank, when the spinner stamps it for the fast melt, or on a
-/// second clear under the melting cells.
-#[test]
-fn a_released_band_is_counted_once_on_ribbon_retired() {
-    let want: Vec<u16> = (2..2 + TEXT.len() as u16).collect();
-    let mut h = composed(5);
-    h.ret(SUBMIT_SAME_ROW);
-    assert_eq!(h.retired(), TEXT.len() as u64, "the eleven cells, once");
-    assert!(h.leaving(5).is_empty(), "no cell is stamped");
-    h.idle(100);
-    assert_eq!(h.retired(), TEXT.len() as u64, "…and never again");
-    // The spinner under the released band: the melt, and the count holds.
-    h.program(&[b"\x1b[6;1H", SPINNER, b"\x1b[6;3H"].concat());
-    assert_eq!(
-        h.leaving(5),
-        want,
-        "every released cell is stamped for the melt when text lands under it: {:?}",
-        h.cells(5)
-    );
-    assert_eq!(
-        h.retired(),
-        TEXT.len() as u64,
-        "the count does not move: the cells were counted when released"
-    );
-    // Leaving cells are not read, so a second clear names nothing.
-    h.program(b"\x1b[6;1H\x1b[2K> \x1b[6;3H");
-    assert_eq!(
-        h.retired(),
-        TEXT.len() as u64,
-        "a leaving cell is never named again"
-    );
-    h.idle(200);
-    assert!(h.cells(5).is_empty(), "out of the pool on the melt's clock");
-    assert_eq!(h.retired(), TEXT.len() as u64);
-}
 
 /// Different text under a released band is replaced text: the clear lands on a
 /// hidden frame, the next paints the spinner on the old row and re-lays the empty

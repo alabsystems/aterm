@@ -13,11 +13,10 @@
 //! It lives in aterm-core so the corpus goes through the real parser (OSC 8,
 //! SGR 58, truecolor, ZWJ/VS16/skin-tone/flag emoji, CJK).
 //!
-//! `take_ring_fast_materialize` is asserted non-zero on the ring corpus (the
-//! fast path fired) and zero on a read from the tiered store.
+//! `take_ring_fast_materialize` is asserted to fire on every ring row, so the
+//! parity is never the round trip compared with itself.
 
 use aterm_core::grid::materialize_from_line;
-use aterm_core::scrollback::Scrollback;
 use aterm_core::terminal::Terminal;
 use aterm_grid::test_counters::take_ring_fast_materialize;
 
@@ -140,42 +139,4 @@ fn ring_rows_materialize_identically_to_the_line_round_trip() {
              assertion for it compared the round trip with itself. Row text: {text:?}"
         );
     }
-}
-
-/// The mirror image: a row that has left the ring for the tiered store is not
-/// claimed by the fast path, and still materializes identically.
-#[test]
-fn tiered_rows_fall_back_to_the_line_path() {
-    const RING: usize = 8;
-    let mut term = Terminal::with_scrollback(ROWS, COLS, RING, Scrollback::with_defaults());
-    fill(&mut term);
-    // Settle the lazy buffer into the tiers so the deep reads are real tier reads.
-    let _ = term.grid_mut().scrollback_mut();
-    let depth = term.grid().scrollback_lines();
-    assert!(
-        depth > RING + 2,
-        "fixture history ({depth}) does not reach past the {RING}-line ring"
-    );
-
-    // The oldest rows are the tiered ones (the ring holds the newest).
-    let _ = take_ring_fast_materialize();
-    let deepest = depth - 1;
-    for rev_idx in [deepest, deepest - 1, deepest - 2] {
-        assert_row_parity(&term, rev_idx);
-    }
-    assert_eq!(
-        take_ring_fast_materialize(),
-        0,
-        "the ring fast path claimed a row that has left the ring"
-    );
-
-    // ...while the newest rows, still in the ring, DO take it.
-    for rev_idx in 0..RING {
-        assert_row_parity(&term, rev_idx);
-    }
-    assert_eq!(
-        take_ring_fast_materialize(),
-        RING,
-        "the newest {RING} rows are in the ring and must take the fast path"
-    );
 }

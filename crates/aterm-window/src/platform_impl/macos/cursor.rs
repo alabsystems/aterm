@@ -40,9 +40,9 @@ pub(crate) fn default_cursor() -> Obj {
 
 /// A `+…Cursor` class accessor's result, retained.
 ///
-/// LOCAL PATCH (aterm): all six are `@16@0:8` on `NSCursor`'s metaclass and
-/// all are +0 autoreleased (none is named `new`/`alloc`/`copy`), so the retain
-/// objc2's bindings applied is applied here once instead of six times.
+/// LOCAL PATCH (aterm): every accessor passed here is `@16@0:8` on `NSCursor`'s
+/// metaclass and +0 autoreleased (none is named `new`/`alloc`/`copy`), so the retain
+/// objc2's bindings applied is applied here once instead of at each call site.
 #[must_use]
 fn class_cursor(s: aterm_objc::Sel) -> Obj {
     // SAFETY: `s` is one of `NSCursor`'s `@16@0:8` class accessors (every call
@@ -66,5 +66,16 @@ pub(crate) fn cursor_from_icon(icon: CursorIcon) -> Obj {
         CursorIcon::Grabbing => class_cursor(sel!(closedHandCursor)),
         CursorIcon::ColResize => class_cursor(sel!(resizeLeftRightCursor)),
         CursorIcon::RowResize => class_cursor(sel!(resizeUpDownCursor)),
+        // LOCAL PATCH (aterm), LW.5: the edge-resize icons, which aterm sets only on its own
+        // Wayland frame. The four edges map as upstream's did; for the corners upstream reached
+        // the undocumented `+_windowResize…Cursor` accessors, cut above, so they are the arrow.
+        CursorIcon::NResize => class_cursor(sel!(resizeUpCursor)),
+        CursorIcon::SResize => class_cursor(sel!(resizeDownCursor)),
+        CursorIcon::EResize => class_cursor(sel!(resizeRightCursor)),
+        CursorIcon::WResize => class_cursor(sel!(resizeLeftCursor)),
+        CursorIcon::NeResize
+        | CursorIcon::SeResize
+        | CursorIcon::SwResize
+        | CursorIcon::NwResize => default_cursor(),
     }
 }

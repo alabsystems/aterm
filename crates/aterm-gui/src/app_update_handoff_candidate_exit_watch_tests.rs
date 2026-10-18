@@ -58,22 +58,6 @@ fn spawn_orphan(script: &str) -> (u32, OrphanGate) {
     (pid.trim().parse().expect("a pid"), OrphanGate(gate_write))
 }
 
-/// Waits for the watch to answer, or fails. Bounded here only; production reads
-/// are single zero-timeout polls.
-fn wait_for_status(watch: &CandidateExitWatch) -> std::process::ExitStatus {
-    let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
-    loop {
-        if let Some(status) = watch.exit_status() {
-            return status;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "an exited process must report through EVFILT_PROC"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    }
-}
-
 /// The launched lane's liveness probe leaves the witness alone: the ready wait
 /// asks `candidate_gone` every slice, and reading the kqueue would consume the one
 /// exit event, turning every death on that lane into `Unobserved`.
@@ -104,56 +88,6 @@ fn asking_whether_a_launched_candidate_is_gone_keeps_its_exit_status() {
             .expect("the exit event is still queued after the probe")
             .code(),
         Some(7)
-    );
-}
-
-/// A full `wait(2)` status for a process this one did not fork and may not reap,
-/// distinguishing a candidate that chose to stop from one something else
-/// stopped.
-#[test]
-fn a_non_parent_can_read_an_orphan_s_own_exit_status() {
-    use std::os::unix::process::ExitStatusExt as _;
-
-    let (refused, gate) = spawn_orphan("exit 7");
-    // Attached while the orphan is provably alive: it cannot run `exit`
-    // before the gate opens, and the gate opens after this returns.
-    let watch = CandidateExitWatch::watch(refused)
-        .expect("EVFILT_PROC attaches to a same-user process we may SIGKILL");
-    gate.release();
-    let status = wait_for_status(&watch);
-    assert_eq!(
-        status.code(),
-        Some(7),
-        "a clean exit reaches a watcher that is nobody's parent — which is \
-         what lets the launched lane tell a refusal from a kill at all"
-    );
-    assert_eq!(
-        watch.exit_status(),
-        Some(status),
-        "the knote is one-shot, so the watch must keep what it read: the hold \
-         loop's liveness check is a read, and the stand-down after it must \
-         still name the status"
-    );
-
-    let (starved, gate) = spawn_orphan("sleep 30");
-    let watch = CandidateExitWatch::watch(starved)
-        .expect("EVFILT_PROC attaches to a same-user process we may SIGKILL");
-    gate.release();
-    assert!(
-        watch.exit_status().is_none(),
-        "a LIVE candidate must report nothing: the pre-kill read is what \
-         makes a SIGKILL attributable, so a false positive there would call \
-         every rejection a machine kill"
-    );
-    let pid = libc::pid_t::try_from(starved).expect("pid fits");
-    // SAFETY: `kill` against a positive pid we just created and still see.
-    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
-    let status = wait_for_status(&watch);
-    assert_eq!(
-        status.signal(),
-        Some(libc::SIGKILL),
-        "and the machine's kill arrives with the same fidelity — this is the \
-         field shape the launched lane could previously observe nothing about"
     );
 }
 

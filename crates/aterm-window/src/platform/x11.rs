@@ -198,6 +198,12 @@ pub trait WindowAttributesExtX11 {
     /// [Desktop Entry Spec](https://specifications.freedesktop.org/desktop-entry-spec/desktop-entry-spec-latest.html#desktop-file-id)
     fn with_name(self, general: impl Into<String>, instance: impl Into<String>) -> Self;
 
+    /// Build window with the launcher's startup-notification token, the value of
+    /// `DESKTOP_STARTUP_ID`: the window carries it as `_NET_STARTUP_ID` from creation,
+    /// and its first map ends the launch sequence (`remove: ID=…`). The same attribute
+    /// as `WindowAttributesExtWayland::with_activation_token`.
+    fn with_activation_token(self, token: impl Into<String>) -> Self;
+
     /// Build window with override-redirect flag; defaults to false.
     fn with_override_redirect(self, override_redirect: bool) -> Self;
 
@@ -252,6 +258,12 @@ impl WindowAttributesExtX11 for WindowAttributes {
     fn with_name(mut self, general: impl Into<String>, instance: impl Into<String>) -> Self {
         self.platform_specific.name =
             Some(crate::platform_impl::ApplicationName::new(general.into(), instance.into()));
+        self
+    }
+
+    #[inline]
+    fn with_activation_token(mut self, token: impl Into<String>) -> Self {
+        self.platform_specific.activation_token = Some(token.into());
         self
     }
 

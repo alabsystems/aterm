@@ -1,9 +1,9 @@
 ---
 name: supervise-agent
-description: Supervise a worker (another Claude Code, Codex, a REPL or a long build) in an aterm session — dispatch work, review each turn against ground truth (tests, diff, exit codes, not the screen), handle its prompts, escalate and resume. Use when asked to manage, babysit or oversee another agent or a long-running session.
+description: Supervise a worker (another Claude Code, a codex-alab, a REPL or a long build) in an aterm session — dispatch work, review each turn against ground truth (tests, diff, exit codes, not the screen), handle its prompts, escalate and resume. Use when asked to manage, babysit or oversee another agent or a long-running session.
 ---
 
-<!-- aterm skill v2 — MANAGED FILE, written by `aterm agents install`.
+<!-- aterm skill v3 — MANAGED FILE, written by `aterm agents install`.
      Edits are overwritten on update. To keep your own version, remove this
      marker line and aterm will leave the file alone (reported as `foreign`). -->
 
@@ -16,14 +16,19 @@ WORKER); this file is the loop and the judgment.
 ## Review against ground truth, not the screen
 
 A worker saying "all tests pass" or "done" is a claim. Run the check yourself (the tests,
-the build, `git diff`, the exit code) and decide from that.
+the build, `git diff`, the exit code) and decide from that. In `aterm ctl "@$SID" brief`
+and `log`, lines ending `[?]` or `[mark?]` and `conf=claim` records are other agents'
+opinions, never ground truth.
 
 ## The window already supervises every agent session
 
-Every Claude Code, Codex and agy session in an aterm window is supervised by the window's host
+Every Claude Code, agy, Muse Code and Gemini CLI session in an aterm window is supervised by the window's host
 (`status supervisor=aterm-harness@<pid>`), fully automatic by default: it answers boxes and
 questions, continues ended jobs (never a person's own question or message outside a job it is
-continuing) and escalates what it cannot settle. `aterm help harness` says what it does, `aterm harness ledger @<sid>` what it did.
+continuing) and escalates what it cannot settle. A codex-alab supervises itself the same way
+(`supervisor=codex-alab@<pid>`), the host watching beside it. A vendor `codex` is only shown
+(`agent=unknown`, its own state `program_state=`): nothing answers or continues it.
+`aterm help harness` says what the host does, `aterm harness ledger @<sid>` what it did.
 
 A worker's report that ends with `ATERM-TASK-DONE` on a line by itself stops those
 continuations. The token means every part of the job the worker can still do is done and
@@ -72,12 +77,17 @@ not proof. `--no-continue --no-answer` brings the turns and questions to you, an
 The same loop by hand:
 
 1. SWEEP: `aterm ctl "@$SID" status`. An unchanged `revision` means nothing new.
-2. CLASSIFY: `aterm drive phase "@$SID"`; for a prompt the parsed box follows.
+2. CLASSIFY: `aterm drive phase "@$SID"`; for a prompt the parsed box follows. A Codex's
+   screen is read by nothing (`phase` and `await-turn` read nothing on it): judge a
+   codex-alab by its own record (`status supervisor=`, `program_state=`) and a vendor
+   `codex` by its `program_state=` and the ground truth.
 3. REVIEW once the turn is done: run the ground truth, then take one action: next,
    revise, answer, done (the ground truth proves the objective and nothing the worker
    could still do is left), or escalate.
 4. WAIT: `aterm drive await-turn "@$SID" --timeout 600000`. Park one waiter; no sleep
-   loops.
+   loops. A client that does not use the drive verbs waits for the turn's end with
+   `aterm ctl "@$SID" await log close=turn since=<log_seq> ep=<log_ep> timeout=600000`
+   (both from `status`).
 
 Without the fabric, drive with one verified turn on one line with balanced quotes and
 brackets (an open bracket turns Claude Code's Enter into a newline): `aterm ctl "@$SID"
@@ -85,6 +95,14 @@ turn settle=gone:esc.to.interrupt timeout=600000 '<instruction>'`.
 
 ## Prompts
 
+- To wait for the next prompt you must answer, take `log_seq=` and `log_ep=` from
+  `aterm ctl "@$SID" status` and park `aterm ctl "@$SID" await log need since=<log_seq>
+  ep=<log_ep> timeout=600000`. It wakes on the next approval box, question, failed command
+  or the session's end. Re-arm from the reply: `since=<seq> ep=<ep>` of an `OK seq=`, or
+  `since=<resync_to>` of an `OK gap`. Without `since=` it answers at once with a need
+  already open (`latched=1`), the same one every time until it closes (a failed command
+  stays open until something reads it): read it once, then re-arm with `since=<as_of>
+  ep=<ep>` from that reply, never without `since=`.
 - `kind question` is an AskUserQuestion dialog, not a permission box, even one reading
   `Do you want to proceed?`. Answer it from your notes or escalate; pressing it as an
   approval answers the human's question.

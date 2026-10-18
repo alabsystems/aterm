@@ -13,27 +13,17 @@
 //! the last 40 rows; and a measured tall pane drew the error on row 8 of 50, 35
 //! blank rows, the composer pinned to the foot.
 //!
-//! This sweep holds the zone to what those changes may and may not move, over
-//! every fixture FILE under `aterm-phase/src/fixtures/` and (in the aterm
+//! This sweep holds the zone to what those changes may not move, over every
+//! fixture FILE under `aterm-phase/src/fixtures/` and (in the aterm
 //! workspace) `aterm-agent/src/supervise/policy/fixtures/`, read by Claude
-//! Code's reader, Codex's and the screen-identified one:
-//!
-//! * a screen drawn to its last row with no blank run of a gap's length
-//!   reaching into its last 40 rows (a fullscreen REPL on a full transcript, a
-//!   Codex composer, a box drawn to the bottom) has exactly the zone the
-//!   grid's last 40 rows gave — so every reading of it is what it was;
-//! * one WITH such a run has a zone that reaches above them;
-//! * the same screen in a taller pane — 7, 30 and 60 blank rows added below
-//!   it — reads exactly as it reads in a pane as tall as what is drawn: the
-//!   blank rows under the drawing decide nothing, whatever the program;
-//! * a supervisor that reads the last 40 rows is told, by
-//!   [`aterm_phase::live_zone_reaches_above`], whenever they hold a gap — the
-//!   only zones above them it cannot see are those whose gap their top row
-//!   cuts.
+//! Code's reader, Codex's and the screen-identified one: the same screen in a
+//! taller pane — 7, 30 and 60 blank rows added below it — reads exactly as it
+//! reads in a pane as tall as what is drawn. The zone's arithmetic and the
+//! tail's gap test are `reader.rs`'s unit tests.
 
 use aterm_phase::prompt::PromptKind;
 use aterm_phase::prompt::fixtures as fx;
-use aterm_phase::{BLANK_GAP, Program, live_zone_reaches_above, live_zone_start};
+use aterm_phase::{Program, live_zone_start};
 
 use crate::fixture_files::{file_rows, fixture_screens};
 
@@ -63,51 +53,6 @@ fn readings(rows: &[String]) -> Vec<String> {
 
 fn blank(r: &str) -> bool {
     r.trim().is_empty()
-}
-
-/// Whether the zone of `rows`, a screen taller than the zone and drawn to its
-/// last row, must reach above its last `ZONE_ROWS` rows — decided by the
-/// SCREEN, not by the function under test: some maximal run of `BLANK_GAP`
-/// blank rows or more ENDS inside those rows (its top may lie above them: a
-/// run that straddles the boundary is a gap however few of its rows are
-/// inside — the walk counts it as one row all the same).
-fn gap_reaches_into_the_tail(rows: &[String]) -> bool {
-    let first = rows.len().saturating_sub(ZONE_ROWS);
-    let mut run = 0;
-    for (i, r) in rows.iter().enumerate() {
-        if blank(r) {
-            run += 1;
-        } else {
-            run = 0;
-        }
-        let ends_here = rows.get(i + 1).is_none_or(|next| !blank(next));
-        if ends_here && run >= BLANK_GAP && i >= first {
-            return true;
-        }
-    }
-    false
-}
-
-#[test]
-fn a_screen_drawn_to_its_last_row_has_the_zone_the_last_40_rows_gave() {
-    let (mut drawn_to_bottom, mut gapped) = (0, 0);
-    for (name, rows) in fixture_screens("live zone sweep") {
-        if rows.last().is_some_and(|r| !blank(r)) {
-            drawn_to_bottom += 1;
-            let last40 = rows.len().saturating_sub(ZONE_ROWS);
-            let start = live_zone_start(&rows, ZONE_ROWS);
-            // The zone reaches above the last 40 rows exactly where a gap
-            // reaches into them — and never below them.
-            assert_eq!(
-                start < last40,
-                gap_reaches_into_the_tail(&rows) && rows.len() > ZONE_ROWS,
-                "{name}: the zone starts on row {start}, the last 40 rows on row {last40}"
-            );
-            gapped += usize::from(start < last40);
-        }
-    }
-    assert!(drawn_to_bottom > 50, "only {drawn_to_bottom} such screens");
-    assert!(gapped > 0, "no screen with a gap swept");
 }
 
 /// THE PLAN DIALOG'S GAIN, NAMED: `claude-2.1.281-plan-approval.txt` is 44
@@ -146,55 +91,9 @@ fn the_plan_approval_is_read_whole_through_its_zone() {
     assert_eq!(kind(&filled[last40..]), kind(&filled[start..]));
 }
 
-/// THE SUPERVISOR'S TAIL READ KNOWS WHEN IT HOLDS LESS THAN THE ZONE: on every
-/// screen taller than the zone and drawn to its last row, the tail asks
-/// [`live_zone_reaches_above`] for the whole read exactly when it holds a gap
-/// (four blank rows in a row inside the last 40 rows) — decided here by
-/// counting them, not by the walk — and the measured tall pane is one. The
-/// only zones above the tail the tail cannot see are the ones whose gap the
-/// tail's top row cuts (fewer than a gap's rows inside it): every miss over
-/// every fixture file is one of those, and how many is reported.
-#[test]
-fn the_tail_sees_every_gap_inside_it() {
-    let (mut above, mut cut, mut swept) = (0, Vec::new(), 0);
-    let mut tall_pane_asked = false;
-    for (name, rows) in fixture_screens("live zone sweep") {
-        if rows.len() <= ZONE_ROWS || rows.last().is_none_or(|r| blank(r)) {
-            continue;
-        }
-        swept += 1;
-        let last40 = rows.len() - ZONE_ROWS;
-        let asks = live_zone_reaches_above(&rows[last40..], ZONE_ROWS);
-        let gap_in_tail = rows[last40..]
-            .windows(BLANK_GAP)
-            .any(|w| w.iter().all(|r| blank(r)));
-        assert_eq!(asks, gap_in_tail, "{name}: the tail's own gap");
-        let needs = live_zone_start(&rows, ZONE_ROWS) < last40;
-        above += usize::from(needs);
-        if needs && !asks {
-            // A run the tail's top row cuts: blank on both sides of it.
-            assert!(
-                blank(&rows[last40]) && blank(&rows[last40 - 1]),
-                "{name}: the zone is above the tail and the tail cannot see it"
-            );
-            cut.push(name.clone());
-        }
-        if name.ends_with("claude-2.1.284-api-error-tall-pane-measured.txt") {
-            tall_pane_asked = asks && needs;
-        }
-    }
-    eprintln!(
-        "live zone sweep: {swept} tall screens drawn to their last row; {above} have a zone above \
-         the tail; {} of them a gap the tail's top row cuts: {cut:#?}",
-        cut.len()
-    );
-    assert!(tall_pane_asked, "the measured tall pane");
-    assert!(above > 0 && swept > 20, "{above} of {swept}");
-}
-
 #[test]
 fn blank_rows_under_the_drawing_decide_nothing() {
-    let (mut swept, mut moved_from_the_old_cut) = (0, Vec::new());
+    let mut swept = 0;
     for (name, rows) in fixture_screens("live zone sweep") {
         // The screen in a pane exactly as tall as what is drawn on it.
         let drawn = rows.iter().rposition(|r| !blank(r)).map_or(0, |i| i + 1);
@@ -207,19 +106,8 @@ fn blank_rows_under_the_drawing_decide_nothing() {
             for (w, g) in want.iter().zip(&got) {
                 assert_eq!(w, g, "{name} with {pad} blank rows below");
             }
-            // What the grid's last 40 rows read instead (for the report of
-            // what the zone changed: only screens with blank rows under a
-            // drawing taller than what the old cut kept).
-            let old = &tall[tall.len().saturating_sub(ZONE_ROWS)..];
-            if readings(old) != got {
-                moved_from_the_old_cut.push(format!("{name} +{pad}"));
-            }
             swept += 1;
         }
     }
-    eprintln!(
-        "live zone sweep: {swept} screens; {} read otherwise on the grid's last {ZONE_ROWS} rows: {moved_from_the_old_cut:#?}",
-        moved_from_the_old_cut.len()
-    );
     assert!(swept > 200, "only {swept} screens swept");
 }

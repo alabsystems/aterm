@@ -4,22 +4,12 @@
 //! Metal resource creation behind a device handle that stamps every texture
 //! with its loss domain.
 //!
-//! [`super::encoder::EncodeSession`] owns the render queue and binds a
-//! `LossLatch`, and `Frame::present` cross-checks the session's latch against
-//! the swapchain's. Without more, a caller with a second latch and session
-//! could render a texture on one session and present on the other. So
-//! textures are created here, through a [`MetalResourceDevice`] carrying the
-//! `Arc<LossLatch>`, and each [`SealedTexture`] is stamped with it. The
-//! encoder's write verbs (`render_pass`, copies) and `Frame::present` check
-//! the stamp by `Arc::ptr_eq`, so a cross-domain texture is refused before
-//! any FFI.
-//!
-//! Views from [`SealedTexture::alias_view`] inherit the parent's stamp (the
-//! Unorm/sRGB alias pair is one texture, so one loss domain).
-//!
-//! Buffers and samplers ([`MetalResourceDevice::buffer`] /
-//! [`MetalResourceDevice::sampler`]) are plain [`Obj`]s: they are never
-//! presented or used as render targets.
+//! The encoder's write verbs (`render_pass`, the copies) refuse a
+//! [`SealedTexture`] whose `Arc<LossLatch>` stamp is not their session's (by
+//! `Arc::ptr_eq`), and `Frame::present` refuses a session whose latch is not
+//! the swapchain's, so a texture cannot be rendered on one session and
+//! presented on another. Alias views inherit the parent's stamp. Buffers and
+//! samplers are plain [`Obj`]s: they are never presented or rendered to.
 
 use std::sync::Arc;
 
@@ -50,14 +40,7 @@ impl MetalResourceDevice {
         &self.dev
     }
 
-    /// The loss domain this mint stamps.
-    #[cfg(test)]
-    pub(crate) const fn latch(&self) -> &Arc<LossLatch> {
-        &self.latch
-    }
-
-    /// A 2-D texture stamped with this mint's loss domain — the ONLY way a
-    /// Metal texture enters the encoder's write verbs.
+    /// A 2-D texture stamped with this mint's loss domain.
     pub(crate) fn texture_2d(
         &self,
         format: PixelFormat,
@@ -90,12 +73,10 @@ impl MetalResourceDevice {
     }
 }
 
-// Threading: Metal resources (`MTLBuffer`/`MTLTexture`/`MTLSamplerState`,
-// all `MTLResource`) are documented thread-safe, as are objc_retain/release;
-// wgpu-hal relies on the same contract. The device layer's `VertexBuffer`,
-// `ResidentAtlas` and `TrayOverlay` live in `GpuRenderer`, which crosses a
-// thread at gui startup, so the sealed types declare exactly that Send/Sync.
-// Encoding into them stays on the session's thread, checked by the stamp.
+// Threading: `MTLResource`s and objc_retain/release are documented thread-safe
+// (wgpu-hal relies on the same contract). `GpuRenderer` holds these types and
+// crosses a thread at gui startup, hence Send/Sync; encoding stays on the
+// session's thread.
 
 // SAFETY: `MTLTexture` is an `MTLResource` (thread-safe per Metal's threading
 // model); `Arc<LossLatch>` is Send+Sync. See the threading note above.
@@ -104,14 +85,13 @@ unsafe impl Send for SealedTexture {}
 // this type adds only the immutable stamp.
 unsafe impl Sync for SealedTexture {}
 
-/// A shared-storage `MTLBuffer` minted by [`MetalResourceDevice::buffer`],
-/// wrapped so it can cross threads (see the threading note). The object is
-/// thread-safe; coherent access to its contents relies on the writer waiting
-/// before rewriting.
+/// A shared-storage `MTLBuffer` from [`MetalResourceDevice::buffer`], wrapped so
+/// it can cross threads. Coherent access to its contents relies on the writer
+/// waiting for the GPU before rewriting.
 #[derive(Debug)]
 pub(crate) struct SharedBuffer(Obj);
 
-// SAFETY: `MTLBuffer` is an `MTLResource` — see the THREADING note.
+// SAFETY: `MTLBuffer` is an `MTLResource`; see the threading note above.
 unsafe impl Send for SharedBuffer {}
 // SAFETY: as for `Send`.
 unsafe impl Sync for SharedBuffer {}
@@ -127,8 +107,8 @@ impl SharedBuffer {
         &self.0
     }
 
-    /// The raw buffer, by value: a one-shot buffer the caller binds and drops
-    /// on this thread.
+    /// The raw buffer, by value, for a one-shot buffer used and dropped on this
+    /// thread.
     pub(crate) fn into_obj(self) -> Obj {
         self.0
     }
@@ -166,9 +146,7 @@ impl SealedTexture {
     }
 
     /// A second +1 handle to the same texture with the same stamp
-    /// ([`Obj::clone_retained`]), so it cannot move a texture into another
-    /// domain. The armed renderer's per-frame rig clones resident handles
-    /// with this.
+    /// ([`Obj::clone_retained`]).
     pub(crate) fn clone_handle(&self) -> Self {
         Self {
             obj: self.obj.clone_retained(),
@@ -176,7 +154,7 @@ impl SealedTexture {
         }
     }
 
-    /// `newTextureViewWithPixelFormat:` inheriting THIS texture's stamp — the
+    /// `newTextureViewWithPixelFormat:` inheriting this texture's stamp: the
     /// Unorm/sRGB alias pair is one storage, one loss domain.
     pub(crate) fn alias_view(&self, format: PixelFormat) -> Option<SealedTexture> {
         ffi::texture_view(&self.obj, format).map(|obj| SealedTexture {

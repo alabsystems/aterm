@@ -184,8 +184,9 @@ impl std::error::Error for CarryRefusal {}
 impl Parser {
     /// The parser's partial state as a [`ParserCarry`] — a pure read.
     ///
-    /// `None` only in `DcsPassthrough`: a hooked DCS string's state lives in
-    /// the handler it was hooked to, which no carry can reach. Everything else
+    /// `None` only for a hooked DCS string ([`Parser::in_hooked_dcs`]: in
+    /// `DcsPassthrough`, or at the ESC that may begin its ST): its state lives
+    /// in the handler it was hooked to, which no carry can reach. Everything else
     /// is carried: a Ground parser (with the head of a split UTF-8 character,
     /// if one is pending), an escape, CSI or DCS header with its parameters
     /// and intermediates, an OSC string with its payload (or, over
@@ -193,6 +194,9 @@ impl Parser {
     /// SOS/PM/APC string as one to ignore to its terminator.
     #[must_use]
     pub fn carry(&self) -> Option<ParserCarry> {
+        if self.dcs_st_pending {
+            return None;
+        }
         let mut carry = ParserCarry {
             state: self.state,
             ..ParserCarry::default()
@@ -260,8 +264,19 @@ impl Parser {
     /// (`tests::c1::an_ignored_dcs_reads_every_byte_as_a_hooked_one`), which
     /// the live parser needed too. Every consumer that restores a carry at all
     /// accepts `SosPmApcString`.
+    ///
+    /// At the ESC that may begin the hooked string's ST, the ESC is already
+    /// read, so the carry is `Escape` holding nothing: the successor reads the
+    /// next byte as that ESC's, which is what follows the string whichever way
+    /// it ends, and the string it never hooked ends with nothing, as above.
     #[must_use]
     pub fn carry_unhooking(&self) -> ParserCarry {
+        if self.dcs_st_pending {
+            return ParserCarry {
+                state: State::Escape,
+                ..ParserCarry::default()
+            };
+        }
         self.carry().unwrap_or_else(|| ParserCarry {
             state: HOOKED_STRING_CARRY,
             string_utf8_tail: self.string_utf8.as_slice().to_vec(),

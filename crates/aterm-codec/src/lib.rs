@@ -31,6 +31,8 @@
 //! ```
 
 pub mod base64;
+/// The cell wire's attribute vocabulary and strict style reader.
+pub mod cell;
 pub mod crc32;
 pub mod hex;
 pub mod inflate;

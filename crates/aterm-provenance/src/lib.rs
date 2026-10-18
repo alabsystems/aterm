@@ -17,9 +17,9 @@
 //! This crate provides the type-level taint the parser carries: every byte the
 //! PTY hands the `ActionSink` arrives as `Provenance<_, Pty>`, and no conversion
 //! relabels it.
-//! Privileged sinks are gated by capability ZSTs minted inside dispatch (each
-//! sealed by a private field, `aterm-core/src/terminal/mod.rs`'s `Seal`), not by
-//! a lift out of `Pty`.
+//! Privileged sinks are gated by capability ZSTs minted inside dispatch
+//! (`aterm-core/src/terminal/*_auth.rs`, each sealed by a private field,
+//! `aterm-core/src/terminal/mod.rs`'s `Seal`), not by a lift out of `Pty`.
 //!
 //! # Overview
 //!

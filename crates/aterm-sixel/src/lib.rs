@@ -57,7 +57,9 @@ pub const MAX_COLOR_REGISTERS: usize = 1024;
 
 /// Maximum sixel image dimension (pixels) on either axis. A hard clamp on the
 /// raster buffer so a hostile `"` raster declaration or a long run of data/`-`
-/// bands cannot allocate unboundedly. Matches the value XTSMGRAPHICS reports.
+/// bands cannot allocate unboundedly. Not what XTSMGRAPHICS reports: the
+/// pixel and DCS budgets refuse a raster this size, so aterm-core advertises
+/// the largest that places.
 pub const SIXEL_MAX_DIMENSION: usize = 4096;
 
 /// Maximum total pixel count (width × height) of a decoded raster, INDEPENDENT

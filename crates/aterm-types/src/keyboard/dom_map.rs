@@ -8,7 +8,10 @@
 //!
 //! [`KeyboardEvent.key`]: https://www.w3.org/TR/uievents-key/
 
-use super::{Key, KeyEventType, KeyboardMode, Modifiers, NamedKey, encode_key_with_layout};
+use super::{
+    Key, KeyEventType, KeyboardMode, Modifiers, NamedKey, encode_key_with_layout,
+    encode_key_with_text, shifted_character,
+};
 
 /// Encode a DOM keyboard event against an explicit [`KeyboardMode`]: the one implementation
 /// behind both wasm bindings' `encode_key` (live mode) and `encode_key_with_mode` (a
@@ -18,6 +21,15 @@ use super::{Key, KeyEventType, KeyboardMode, Modifiers, NamedKey, encode_key_wit
 /// `event_type` 0=Press, 1=Repeat, 2=Release (anything else is refused); `base_layout_key` the
 /// physical key's US-QWERTY char for Kitty `REPORT_ALTERNATE_KEYS`. `None` when the event
 /// encodes to nothing (e.g. a release without Kitty) or the key does not map.
+///
+/// `key` is the glyph the layout chose at its level, so a chord on a key whose glyph has no
+/// control byte is encoded as on the native path, by the physical key: Ctrl on a non-ASCII
+/// glyph with none sends `base_layout_key`'s (Russian Ctrl+х on the `[` key is ESC, Ctrl+€ on
+/// the E key ^E). `mods` are the chord's modifiers only. A level shift the browser reports as
+/// modifiers is the host's to clear: Windows reports AltGr as Ctrl+Alt, with
+/// `getModifierState("AltGraph")` true and `key` already its glyph, so the host passes that
+/// press without CTRL and ALT. A Ctrl+Alt left on it is a chord here (AltGr+Q's '@' would be
+/// ESC NUL and AltGr+E's '€' ESC ^E), since the encoder cannot tell the two apart.
 #[must_use]
 pub fn encode_dom_key(
     key: &str,
@@ -33,14 +45,53 @@ pub fn encode_dom_key(
         2 => KeyEventType::Release,
         _ => return None,
     };
-    let bytes = encode_key_with_layout(
-        &key,
-        Modifiers::from_bits_truncate(mods),
-        mode,
-        event_type,
-        base_layout_key,
-    );
+    let mods = Modifiers::from_bits_truncate(mods);
+    // A DOM key is the glyph after Shift ("A", "@"), but a kitty key code is the key
+    // WITHOUT Shift, its shifted glyph the alternate (as the native path, whose key is
+    // the layout's base key, reports it): recover the base for the kitty forms only.
+    let bytes = match unshifted_dom_key(&key, mods, mode, base_layout_key) {
+        Some((base, glyph)) => encode_key_with_text(
+            &Key::Character(base),
+            mods,
+            mode,
+            event_type,
+            base_layout_key,
+            Some(glyph),
+        ),
+        None => encode_key_with_layout(&key, mods, mode, event_type, base_layout_key),
+    };
     if bytes.is_empty() { None } else { Some(bytes) }
+}
+
+/// The unshifted key and shifted glyph of a Shift press the kitty protocol reports:
+/// the physical key's US char when Shift maps it to the glyph, else the glyph's
+/// lowercase. `None` outside the kitty forms (legacy and modifyOtherKeys report the
+/// shifted glyph, win32-input-mode has its own fields) or when nothing unshifts it.
+fn unshifted_dom_key(
+    key: &Key,
+    mods: Modifiers,
+    mode: KeyboardMode,
+    base_layout_key: Option<char>,
+) -> Option<(char, char)> {
+    let Key::Character(glyph) = *key else {
+        return None;
+    };
+    if !mods.contains(Modifiers::SHIFT)
+        || !mode.intersects(KeyboardMode::KITTY_PROTOCOL_FLAGS)
+        || mode.contains(KeyboardMode::WIN32_INPUT)
+    {
+        return None;
+    }
+    if let Some(base) =
+        base_layout_key.filter(|&b| b != glyph && shifted_character(b, mods) == Some(glyph))
+    {
+        return Some((base, glyph));
+    }
+    let mut lower = glyph.to_lowercase();
+    match (lower.next(), lower.next()) {
+        (Some(base), None) if base != glyph => Some((base, glyph)),
+        _ => None,
+    }
 }
 
 /// Map a DOM [`KeyboardEvent.key`] value into the engine's [`Key`]. `None` for values the
@@ -164,101 +215,100 @@ fn map_dom_named_key(key: &str) -> Option<NamedKey> {
 mod tests {
     use super::*;
 
+    /// ATERM-KI-1015-9 review: the DOM key is the layout's glyph, and a Ctrl chord on a
+    /// non-ASCII glyph with no control byte takes the physical key's US byte, as the native
+    /// path does. Ctrl+Alt is a chord: an AltGr press arrives as its glyph only once the host
+    /// clears the Ctrl+Alt the browser reports for it (`encode_dom_key`'s contract).
     #[test]
-    fn maps_single_char_keys_to_character() {
-        assert_eq!(map_dom_key("a"), Some(Key::Character('a')));
-        assert_eq!(map_dom_key("A"), Some(Key::Character('A')));
-        assert_eq!(map_dom_key("@"), Some(Key::Character('@')));
-        // Non-ASCII single codepoints are real character keys (layouts/IME).
-        assert_eq!(map_dom_key("é"), Some(Key::Character('é')));
+    fn a_dom_ctrl_chord_without_a_control_byte_takes_the_physical_keys() {
+        let legacy = KeyboardMode::empty();
+        let ctrl = Modifiers::CTRL.bits();
+        let ctrl_alt = (Modifiers::CTRL | Modifiers::ALT).bits();
+        let enc = |key, mods, base| encode_dom_key(key, mods, 0, base, legacy);
+        for (key, mods, base, want, why) in [
+            ("х", ctrl, Some('['), &b"\x1b"[..], "ru Ctrl+х, the [ key"),
+            ("ü", ctrl, Some('['), b"\x1b", "de Ctrl+ü, the [ key"),
+            ("с", ctrl, Some('c'), b"\x03", "ru Ctrl+с, the C key"),
+            ("é", ctrl, Some('2'), b"\x00", "fr Ctrl+é, the 2 key"),
+            ("€", ctrl, Some('e'), b"\x05", "Ctrl+€ on the E key"),
+            ("€", ctrl_alt, Some('e'), b"\x1b\x05", "Ctrl+Alt is a chord"),
+            ("@", ctrl_alt, Some('q'), b"\x1b\x00", "Ctrl+Alt is a chord"),
+            (
+                "€",
+                0,
+                Some('e'),
+                "€".as_bytes(),
+                "AltGr+E, Ctrl+Alt cleared",
+            ),
+            ("@", 0, Some('q'), b"@", "AltGr+Q, Ctrl+Alt cleared"),
+            (
+                "ö",
+                ctrl,
+                Some(';'),
+                "ö".as_bytes(),
+                "de Ctrl+ö: ; has no byte",
+            ),
+            ("€", ctrl, None, "€".as_bytes(), "no physical key"),
+        ] {
+            assert_eq!(enc(key, mods, base).as_deref(), Some(want), "{why}");
+        }
     }
 
     #[test]
-    fn space_maps_to_the_named_form_legacy_expects() {
-        // The legacy encoder's Ctrl+Space → NUL lives on the named Space arm.
-        assert_eq!(map_dom_key(" "), Some(Key::Named(NamedKey::Space)));
-    }
-
-    #[test]
-    fn maps_named_navigation_and_editing_keys() {
-        assert_eq!(map_dom_key("ArrowUp"), Some(Key::Named(NamedKey::ArrowUp)));
-        assert_eq!(map_dom_key("Enter"), Some(Key::Named(NamedKey::Enter)));
-        assert_eq!(map_dom_key("Tab"), Some(Key::Named(NamedKey::Tab)));
-        assert_eq!(
-            map_dom_key("Backspace"),
-            Some(Key::Named(NamedKey::Backspace))
-        );
-        assert_eq!(map_dom_key("Delete"), Some(Key::Named(NamedKey::Delete)));
-        assert_eq!(map_dom_key("Home"), Some(Key::Named(NamedKey::Home)));
-        assert_eq!(map_dom_key("End"), Some(Key::Named(NamedKey::End)));
-        assert_eq!(map_dom_key("PageUp"), Some(Key::Named(NamedKey::PageUp)));
-        assert_eq!(
-            map_dom_key("PageDown"),
-            Some(Key::Named(NamedKey::PageDown))
-        );
-        assert_eq!(map_dom_key("Insert"), Some(Key::Named(NamedKey::Insert)));
-        assert_eq!(map_dom_key("Escape"), Some(Key::Named(NamedKey::Escape)));
-    }
-
-    #[test]
-    fn maps_system_and_lock_keys() {
-        assert_eq!(
-            map_dom_key("ContextMenu"),
-            Some(Key::Named(NamedKey::ContextMenu))
-        );
-        assert_eq!(map_dom_key("Pause"), Some(Key::Named(NamedKey::Pause)));
-        assert_eq!(
-            map_dom_key("PrintScreen"),
-            Some(Key::Named(NamedKey::PrintScreen))
-        );
-        assert_eq!(
-            map_dom_key("ScrollLock"),
-            Some(Key::Named(NamedKey::ScrollLock))
-        );
-        assert_eq!(
-            map_dom_key("CapsLock"),
-            Some(Key::Named(NamedKey::CapsLock))
-        );
-        assert_eq!(map_dom_key("NumLock"), Some(Key::Named(NamedKey::NumLock)));
-    }
-
-    #[test]
-    fn maps_function_keys_through_f24_and_beyond() {
-        assert_eq!(map_dom_key("F1"), Some(Key::Named(NamedKey::F1)));
-        assert_eq!(map_dom_key("F12"), Some(Key::Named(NamedKey::F12)));
-        assert_eq!(map_dom_key("F24"), Some(Key::Named(NamedKey::F24)));
-        assert_eq!(map_dom_key("F35"), Some(Key::Named(NamedKey::F35)));
-        // Not a function key the spec defines.
-        assert_eq!(map_dom_key("F36"), None);
-        assert_eq!(map_dom_key("F0"), None);
-    }
-
-    #[test]
-    fn maps_media_keys() {
-        assert_eq!(
-            map_dom_key("MediaPlayPause"),
-            Some(Key::Named(NamedKey::MediaPlayPause))
-        );
-        assert_eq!(
-            map_dom_key("AudioVolumeMute"),
-            Some(Key::Named(NamedKey::AudioVolumeMute))
-        );
-    }
-
-    #[test]
-    fn modifier_keys_map_left_canonical() {
-        // Mapped so Kitty REPORT_ALL_KEYS_AS_ESC apps receive them; the encoder keeps them
-        // silent in every other mode.
-        assert_eq!(map_dom_key("Shift"), Some(Key::Named(NamedKey::ShiftLeft)));
-        assert_eq!(
-            map_dom_key("Control"),
-            Some(Key::Named(NamedKey::ControlLeft))
-        );
-        assert_eq!(map_dom_key("Alt"), Some(Key::Named(NamedKey::AltLeft)));
-        assert_eq!(map_dom_key("Meta"), Some(Key::Named(NamedKey::SuperLeft)));
-        // No NamedKey variants exist for these — still refused.
-        for key in ["AltGraph", "Fn"] {
-            assert_eq!(map_dom_key(key), None, "{key} must not map");
+    fn map_dom_key_reads_the_dom_key_names() {
+        let named = |k| Some(Key::Named(k));
+        for (dom, want) in [
+            ("a", Some(Key::Character('a'))),
+            ("A", Some(Key::Character('A'))),
+            ("@", Some(Key::Character('@'))),
+            // Non-ASCII single codepoints are real character keys (layouts/IME).
+            ("é", Some(Key::Character('é'))),
+            // DOM reports the space bar as " "; the legacy encoder's
+            // Ctrl+Space -> NUL lives on the named Space arm.
+            (" ", named(NamedKey::Space)),
+            ("ArrowUp", named(NamedKey::ArrowUp)),
+            ("Enter", named(NamedKey::Enter)),
+            ("Tab", named(NamedKey::Tab)),
+            ("Backspace", named(NamedKey::Backspace)),
+            ("Delete", named(NamedKey::Delete)),
+            ("Home", named(NamedKey::Home)),
+            ("End", named(NamedKey::End)),
+            ("PageUp", named(NamedKey::PageUp)),
+            ("PageDown", named(NamedKey::PageDown)),
+            ("Insert", named(NamedKey::Insert)),
+            ("Escape", named(NamedKey::Escape)),
+            ("ContextMenu", named(NamedKey::ContextMenu)),
+            ("Pause", named(NamedKey::Pause)),
+            ("PrintScreen", named(NamedKey::PrintScreen)),
+            ("ScrollLock", named(NamedKey::ScrollLock)),
+            ("CapsLock", named(NamedKey::CapsLock)),
+            ("NumLock", named(NamedKey::NumLock)),
+            ("F1", named(NamedKey::F1)),
+            ("F12", named(NamedKey::F12)),
+            ("F24", named(NamedKey::F24)),
+            ("F35", named(NamedKey::F35)),
+            ("F36", None),
+            ("F0", None),
+            ("MediaPlayPause", named(NamedKey::MediaPlayPause)),
+            ("AudioVolumeMute", named(NamedKey::AudioVolumeMute)),
+            // Modifier keydowns map Left-canonical so REPORT_ALL_KEYS_AS_ESC
+            // apps receive them; the encoder keeps them silent otherwise.
+            ("Shift", named(NamedKey::ShiftLeft)),
+            ("Control", named(NamedKey::ControlLeft)),
+            ("Alt", named(NamedKey::AltLeft)),
+            ("Meta", named(NamedKey::SuperLeft)),
+            ("AltGraph", None),
+            ("Fn", None),
+            // IME, dead and unidentified keys; composed multi-codepoint text.
+            ("Dead", None),
+            ("Process", None),
+            ("Compose", None),
+            ("Unidentified", None),
+            ("ab", None),
+            ("こんにちは", None),
+            ("", None),
+        ] {
+            assert_eq!(map_dom_key(dom), want, "{dom:?}");
         }
     }
 
@@ -277,17 +327,6 @@ mod tests {
             encode_dom_key("Shift", 1, 0, None, KeyboardMode::REPORT_ALL_KEYS_AS_ESC).as_deref(),
             Some(&b"\x1b[57441;2u"[..])
         );
-    }
-
-    #[test]
-    fn ime_and_unidentified_keys_are_none() {
-        for key in ["Dead", "Process", "Compose", "Unidentified"] {
-            assert_eq!(map_dom_key(key), None, "{key} must not map");
-        }
-        // Multi-codepoint composed text is not a single key event.
-        assert_eq!(map_dom_key("ab"), None);
-        assert_eq!(map_dom_key("こんにちは"), None);
-        assert_eq!(map_dom_key(""), None);
     }
 
     #[test]
@@ -312,6 +351,26 @@ mod tests {
         assert!(encode_dom_key("ArrowUp", 0, 2, None, KeyboardMode::empty()).is_none());
         assert!(encode_dom_key("Shift", 0, 0, None, KeyboardMode::empty()).is_none());
         assert!(encode_dom_key("ArrowUp", 0, 3, None, KeyboardMode::empty()).is_none());
+    }
+
+    #[test]
+    fn a_shifted_dom_key_reports_its_unshifted_kitty_code() {
+        // Kitty codes are the key without Shift, the shifted glyph its alternate.
+        let kitty = KeyboardMode::DISAMBIGUATE_ESC_CODES;
+        let ctrl_shift = (Modifiers::CTRL | Modifiers::SHIFT).bits();
+        assert_eq!(
+            encode_dom_key("A", ctrl_shift, 0, Some('a'), kitty).as_deref(),
+            Some(&b"\x1b[97;6u"[..])
+        );
+        assert_eq!(
+            encode_dom_key("@", ctrl_shift, 0, Some('2'), kitty).as_deref(),
+            Some(&b"\x1b[50;6u"[..])
+        );
+        let alternates = kitty | KeyboardMode::REPORT_ALTERNATE_KEYS;
+        assert_eq!(
+            encode_dom_key("A", ctrl_shift, 0, Some('a'), alternates).as_deref(),
+            Some(&b"\x1b[97:65;6u"[..])
+        );
     }
 
     #[test]

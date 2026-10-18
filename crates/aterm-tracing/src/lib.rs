@@ -5,8 +5,8 @@
 //! `tracing` facade. Every macro expands to nothing.
 //!
 //! Published under the package name `tracing` so `[patch.crates-io]` redirects
-//! its four upstream consumers — the absorbed winit (`crates/aterm-window`),
-//! `softbuffer`, `tiny-xlib` and `zbus` — here. It replaces `tracing`, `tracing-core` and
+//! its upstream consumers — the absorbed winit (`crates/aterm-window`),
+//! `softbuffer`; `zbus` until A11Y.4 and `tiny-xlib` until LW.6 — here. It replaces `tracing`, `tracing-core` and
 //! `tracing-attributes` (and `pin-project-lite` on mac and windows).
 //!
 //! # Why a no-op is behaviourally identical
@@ -23,7 +23,7 @@
 //!    `--workspace -e all` matters: `-p aterm -e normal` misses
 //!    dev-dependencies, so a subscriber added to a test would go unseen while
 //!    this shim blanked its output. `cargo tree --workspace --target all -i
-//!    tracing` names no consumer beyond the four above.
+//!    tracing` names no consumer beyond those above.
 //! 3. **So the dispatcher is `NoSubscriber` for the whole process**, every
 //!    callsite's `Interest` is *never*, and upstream does not evaluate the
 //!    arguments of a disabled callsite (they live in a closure run only after
@@ -59,20 +59,20 @@
 //! rejected: taking a reference is evaluation, and would run e.g. winit's
 //! `unsafe { old.name() }` on a callsite upstream leaves untouched. Zero
 //! evaluation also means `trace_span!("{}", task_name)` never moves
-//! `task_name` (zbus reuses it).
+//! `task_name` (zbus, its one caller, reused it).
 //!
 //! # Surface
 //!
-//! Exactly what the four consumers use:
+//! Exactly what the consumers use:
 //!
 //! * events — [`trace!`], [`debug!`], [`info!`], [`warn!`], [`error!`]
 //! * spans — [`trace_span!`], [`debug_span!`], [`info_span!`], `warn_span!`,
 //!   `error_span!`
-//! * types — [`Span`], [`EnteredSpan`], [`Instrument`], [`Instrumented`]
-//! * attribute — `#[instrument]`, re-exported from `aterm-tracing-attributes`
-//!   behind the default `attributes` feature, as upstream does
+//! * types — [`Span`], [`EnteredSpan`]
 //!
-//! Deliberately absent, because no consumer names them: `Level`,
+//! Deliberately absent, because no consumer names them: `Instrument` and
+//! `Instrumented` (zbus's, deleted at A11Y.6 of
+//! docs/AUDIT-third-party-2026-10-15.md once zbus had left), `Level`,
 //! `LevelFilter`, `Metadata`, `Event`, `Id`, `Dispatch`, `Subscriber`,
 //! `field::*`, `Value`, `WithSubscriber`, `tracing::log`,
 //! `level_filters::STATIC_MAX_LEVEL`, the `Level`-taking `event!` / `span!` /
@@ -86,7 +86,7 @@
 //! Everything below compiles, runs, and does nothing — which is the contract.
 //!
 //! ```
-//! use tracing::{Instrument, Span, info_span, warn};
+//! use tracing::{Span, warn};
 //!
 //! // An event. `expensive()` is never called, exactly as on a disabled
 //! // upstream callsite.
@@ -96,12 +96,6 @@
 //! // A span guard, the winit shape.
 //! let _span = tracing::debug_span!("aterm::Window::set_title", title = "aterm").entered();
 //!
-//! // A span attached to a future, the zbus shape. The result is
-//! // `Future + Send + 'static`, so it can go straight to an executor.
-//! let task = async { 7u8 }.instrument(info_span!("obj_server_task"));
-//! fn spawnable<F: core::future::Future + Send + 'static>(f: F) -> F { f }
-//! let task = spawnable(task);
-//!
 //! assert_eq!(Span::none(), Span::default());
 //! ```
 
@@ -110,20 +104,10 @@
 // this package with NO features (softbuffer and winit take it
 // `default-features = false`), and nothing here needs an allocator or an OS.
 
-use core::future::Future;
-use core::pin::Pin;
-use core::task::{Context, Poll};
-
-/// The pass-through `#[instrument]` attribute, at the crate root where upstream
-/// puts it (zbus spells it `use tracing::instrument;`).
-#[cfg(feature = "attributes")]
-pub use tracing_attributes::instrument;
-
 /// A span — always disabled, therefore zero-sized and empty.
 ///
-/// A real owned type rather than `()` because consumers treat it as one: zbus
-/// binds a span and later moves it into `.instrument(…)`, winit calls
-/// `.entered()`. The derives match upstream's; `Copy` is deliberately absent so
+/// A real owned type rather than `()` because consumers treat it as one:
+/// winit calls `.entered()`, which consumes it. The derives match upstream's; `Copy` is deliberately absent so
 /// this never accepts code the real facade rejects.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Span;
@@ -134,7 +118,7 @@ impl Span {
     ///
     /// ```
     /// let span = tracing::Span::none();
-    /// let moved_later = span;            // a real owned value, as zbus needs
+    /// let moved_later = span;            // a real owned value
     /// let _guard = moved_later.entered();
     /// ```
     #[must_use]
@@ -168,69 +152,13 @@ impl EnteredSpan {
     }
 }
 
-/// Attaches a [`Span`] to a future. Blanket-implemented for every `Sized`
-/// type, as upstream does.
-pub trait Instrument: Sized {
-    /// Wrap `self` so it is polled "inside" `span`. The wrapper is
-    /// `Future + Send + 'static` whenever `Self` is, because zbus hands it to
-    /// `Executor::spawn`.
-    fn instrument(self, span: Span) -> Instrumented<Self> {
-        Instrumented { inner: self, span }
-    }
-
-    /// Wrap `self` with the current span — with no subscriber, `Span::none()`.
-    fn in_current_span(self) -> Instrumented<Self> {
-        self.instrument(Span::none())
-    }
-}
-
-impl<T: Sized> Instrument for T {}
-
-/// A future with a [`Span`] attached — i.e. the future, unchanged.
-///
-/// The pin projection is done by hand, so this crate needs no
-/// `pin-project-lite`. That package still survives on linux (zbus's async
-/// stack) and wasm (`futures-util` via winit), just not through `tracing`.
-#[derive(Debug, Clone)]
-pub struct Instrumented<T> {
-    // Structurally pinned — see the `Future` impl.
-    inner: T,
-    // Kept so the span lives exactly as long as the future, as upstream;
-    // read by `span()`, which keeps `dead_code` quiet about it.
-    span: Span,
-}
-
-impl<T> Instrumented<T> {
-    /// The span attached to this future.
-    #[must_use]
-    pub const fn span(&self) -> &Span {
-        &self.span
-    }
-}
-
-impl<T: Future> Future for Instrumented<T> {
-    type Output = T::Output;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // SAFETY: `inner` is structurally pinned:
-        //   1. it is never moved out, and no `&mut T` to it escapes — this is
-        //      the only place it is touched (`span()` reads the other field);
-        //   2. neither `Instrumented<T>` nor `Span` has a `Drop` impl, so no
-        //      destructor can relocate it;
-        //   3. `Instrumented<T>: Unpin` is auto-derived and `Span` is `Unpin`,
-        //      so the wrapper is `Unpin` exactly when `T` is.
-        let inner = unsafe { self.map_unchecked_mut(|this| &mut this.inner) };
-        inner.poll(cx)
-    }
-}
-
 // Every macro matches `($($discarded:tt)*)`: any balanced token tree, so no
 // argument form (format captures, `field = ?value`, `%unsafe { … }`, fields
 // before or after the message) can break it — the arguments are never
 // inspected.
 //
 // Event macros expand to `{}`, which is both a statement and a `()`
-// expression; zbus uses `Err(e) => warn!(…)` as a match arm value. Span
+// expression, so `Err(e) => warn!(…)` works as a match arm value. Span
 // macros expand to a `Span::none()` call, so both `.entered()` on the
 // invocation and passing it as an argument parse.
 //

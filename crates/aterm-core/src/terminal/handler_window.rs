@@ -406,29 +406,30 @@ impl TerminalHandler<'_> {
     }
 
     /// Push current title(s) onto the title stack (`Arc<str>` clones, no
-    /// allocation).
+    /// allocation); a slot the push does not name is left unsaved (`None`).
     fn push_title(&mut self, icon: bool, window: bool) {
         if self.title.stack.len() >= TITLE_STACK_MAX_DEPTH {
             return;
         }
-        let icon_title: Arc<str> = if icon {
-            Arc::clone(&self.title.icon)
-        } else {
-            Arc::from("")
-        };
-        let window_title: Arc<str> = if window {
-            Arc::clone(&self.title.window)
-        } else {
-            Arc::from("")
-        };
+        let icon_title = icon.then(|| Arc::clone(&self.title.icon));
+        let window_title = window.then(|| Arc::clone(&self.title.window));
         self.title.stack.push((icon_title, window_title));
     }
 
     /// Pop title(s) from the title stack and restore them, re-capped at
-    /// [`super::MAX_TITLE_BYTES`].
+    /// [`super::MAX_TITLE_BYTES`]. As in xterm (`xtermPopTitle`'s `TryHigher`), a
+    /// slot the popped entry did not save takes the nearest older entry's, which
+    /// stays on the stack: vim pushes window then icon and pops in the same order,
+    /// and gets the window title back from the older entry. A saved empty title
+    /// is restored like any other.
     fn pop_title(&mut self, icon: bool, window: bool) {
         if let Some((icon_title, window_title)) = self.title.stack.pop() {
-            if icon && !icon_title.is_empty() {
+            let older = |slot: fn(&super::grouped_state::TitleStackEntry) -> &Option<Arc<str>>| {
+                self.title.stack.iter().rev().find_map(|e| slot(e).clone())
+            };
+            let icon_title = icon_title.or_else(|| older(|e| &e.0));
+            let window_title = window_title.or_else(|| older(|e| &e.1));
+            if icon && let Some(icon_title) = icon_title {
                 let b = icon_title.floor_char_boundary(super::MAX_TITLE_BYTES);
                 self.title.icon = if b < icon_title.len() {
                     Arc::from(&icon_title[..b])
@@ -436,7 +437,7 @@ impl TerminalHandler<'_> {
                     icon_title
                 };
             }
-            if window && !window_title.is_empty() {
+            if window && let Some(window_title) = window_title {
                 let b = window_title.floor_char_boundary(super::MAX_TITLE_BYTES);
                 let capped: Arc<str> = if b < window_title.len() {
                     Arc::from(&window_title[..b])
@@ -480,37 +481,23 @@ mod tests {
         )
     }
 
-    /// CSI 21 t (report window title) emits no response when
-    /// `allow_window_ops=false`.
+    /// CSI 21 t / CSI 20 t (report window title / icon label) emit no response
+    /// when `allow_window_ops=false`.
     #[test]
     fn csi_21t_title_report_suppressed_when_window_ops_disabled() {
-        let mut term = Terminal::new(24, 80);
-        // Default is false, but set explicitly to document the invariant.
-        term.modes_mut().allow_window_ops = false;
-        term.set_title("secret-title");
+        for query in [b"\x1b[21t".as_slice(), b"\x1b[20t".as_slice()] {
+            let mut term = Terminal::new(24, 80);
+            // Default is false, but set explicitly to document the invariant.
+            term.modes_mut().allow_window_ops = false;
+            term.set_title("secret-title");
 
-        term.process(b"\x1b[21t");
+            term.process(query);
 
-        assert!(
-            term.take_response().is_none(),
-            "CSI 21 t must not leak the window title when allow_window_ops is false"
-        );
-    }
-
-    /// CSI 20 t (report icon label) emits no response when
-    /// `allow_window_ops=false`.
-    #[test]
-    fn csi_20t_icon_label_report_suppressed_when_window_ops_disabled() {
-        let mut term = Terminal::new(24, 80);
-        term.modes_mut().allow_window_ops = false;
-        term.set_title("secret-title");
-
-        term.process(b"\x1b[20t");
-
-        assert!(
-            term.take_response().is_none(),
-            "CSI 20 t must not leak the icon label when allow_window_ops is false"
-        );
+            assert!(
+                term.take_response().is_none(),
+                "{query:?} must not leak the title when allow_window_ops is false"
+            );
+        }
     }
 
     /// CSI 21 t does respond when `allow_window_ops=true`.
@@ -564,6 +551,32 @@ mod tests {
 
     /// CSI 23 t (title stack pop) restoring a different window title bumps
     /// `title_epoch()`, as set_title and OSC 0/2 do.
+    #[test]
+    fn a_title_pushed_and_popped_slot_by_slot_comes_back() {
+        // vim pushes the window title then the icon name (22;2t 22;1t) and pops in
+        // the same order (23;2t 23;1t), not LIFO; with `:set title` it also pops,
+        // re-pushes and pops again on exit. As in xterm, a pop's unsaved slot takes
+        // the nearest older entry's, so the tab gets its own title back.
+        for (before, vim) in [
+            (
+                "orig",
+                &b"\x1b[22;2t\x1b[22;1t\x1b]2;file.txt - VIM\x07\x1b[23;2t\x1b[23;1t"[..],
+            ),
+            (
+                "orig",
+                b"\x1b[22;2t\x1b[22;1t\x1b]2;file.txt - VIM\x07\x1b]2;Thanks for flying Vim\x07\
+                  \x1b[23;2t\x1b[23;1t\x1b[22;2t\x1b[22;1t\x1b[23;2t\x1b[23;1t",
+            ),
+            // A saved empty title (a tab labelled by its cwd) is restored too.
+            ("", b"\x1b[22t\x1b]2;prog\x07\x1b[23t"),
+        ] {
+            let mut term = Terminal::new(24, 80);
+            term.process(format!("\x1b]2;{before}\x07").as_bytes());
+            term.process(vim);
+            assert_eq!(term.title(), before, "{}", String::from_utf8_lossy(vim));
+        }
+    }
+
     #[test]
     fn csi_23t_title_pop_bumps_epoch_on_window_change() {
         let mut term = Terminal::new(24, 80);
@@ -658,21 +671,6 @@ mod tests {
             response_string(&mut term).as_deref(),
             Some("\x1b[6;19;9t"),
             "CSI 16 t must answer the real cell box, height then width"
-        );
-    }
-
-    /// CSI 14 t reports the text area in pixels: the grid times the cell box.
-    #[test]
-    fn csi_14t_reports_the_text_area_in_pixels() {
-        let mut term = windowed_term(24, 80);
-        term.set_cell_pixel_size(9, 19);
-
-        term.process(b"\x1b[14t");
-
-        // 24 rows x 19 px = 456 tall; 80 cols x 9 px = 720 wide.
-        assert_eq!(
-            response_string(&mut term).as_deref(),
-            Some("\x1b[4;456;720t")
         );
     }
 

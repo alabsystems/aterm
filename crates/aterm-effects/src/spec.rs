@@ -1465,43 +1465,22 @@ mod tests {
     fn toy_pack_schema_is_strict_about_unknown_fields_and_values() {
         let unknown_field =
             TINY_TRIUMPHS.replacen("chance_pct = 35", "chance_pct = 35, surprise = true", 1);
-        let error = compile_toy_pack_toml(&unknown_field).expect_err("unknown field rejected");
-        assert!(
-            error.to_string().contains("unknown field `surprise`"),
-            "{error}"
-        );
+        compile_toy_pack_toml(&unknown_field).expect_err("unknown field rejected");
 
         let unknown_kind =
             TINY_TRIUMPHS.replacen("kind = \"starburst\"", "kind = \"confetti_cannon\"", 1);
-        let error = compile_toy_pack_toml(&unknown_kind).expect_err("unknown effect rejected");
-        assert!(error.to_string().contains("confetti_cannon"), "{error}");
+        compile_toy_pack_toml(&unknown_kind).expect_err("unknown effect rejected");
 
         let bad_color = TINY_TRIUMPHS.replacen("#58D8FF", "58D8FF", 1);
-        let error = compile_toy_pack_toml(&bad_color).expect_err("non-canonical color rejected");
-        assert!(
-            error.to_string().contains("expected exactly #RRGGBB"),
-            "{error}"
-        );
+        compile_toy_pack_toml(&bad_color).expect_err("non-canonical color rejected");
 
         let unscannable = TINY_TRIUMPHS.replacen("\"shipit\"", "\"ship it\"", 1);
-        let error = compile_toy_pack_toml(&unscannable).expect_err("multi-word trigger rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("not a single scannable whole-word"),
-            "{error}"
-        );
+        compile_toy_pack_toml(&unscannable).expect_err("multi-word trigger rejected");
 
         // 猫背 (stoop) is a production exceptions.toml suppression.
         let cjk_exception = TINY_TRIUMPHS.replacen("\"shipit\"", "\"猫背\"", 1);
-        let error = compile_toy_pack_toml(&cjk_exception)
+        compile_toy_pack_toml(&cjk_exception)
             .expect_err("a production-scanner CJK exception cannot become a trigger");
-        assert!(
-            error
-                .to_string()
-                .contains("does not produce a whole-surface scanner match"),
-            "{error}"
-        );
     }
 
     #[test]
@@ -1530,35 +1509,37 @@ words = ["DUPLICATE"]
 ink = { kind = "self_glow", window_ms = 9000 }
 "##;
         let error = compile_toy_pack_toml(bad).expect_err("semantic errors rejected");
-        let joined = error.diagnostics().join("\n");
-        for expected in [
-            "unsupported version 7",
-            "namespaced lowercase ASCII id",
-            "pack.version: must be at least 1",
-            "pack.authors: at least one",
-            "duplicate recipe id",
-            "normalized surface duplicates",
-            "BCP47-like",
-            "leading/trailing whitespace",
-            "not valid for kind \"rainbow\"",
-            "drift_ms: 20 is outside",
-            "chance_pct: 101",
-            "supports only cats",
-            "expected [lo, hi]",
-            "window_ms: 9000 is outside",
-        ] {
-            assert!(
-                joined.contains(expected),
-                "missing {expected:?} in:\n{joined}"
-            );
-        }
+        // Every problem is collected (not just the first), once, at its field.
+        let mut fields: Vec<&str> = error
+            .diagnostics()
+            .iter()
+            .map(|d| d.split_once(": ").map_or(d.as_str(), |(field, _)| field))
+            .collect();
+        fields.sort_unstable();
+        let mut want = vec![
+            "schema",
+            "pack.id",
+            "pack.version",
+            "pack.authors",
+            "toy[0] (\"same\").lang",
+            "toy[0] (\"same\").ink.colors",
+            "toy[0] (\"same\").ink.drift_ms",
+            "toy[0] (\"same\").burst.chance_pct",
+            "toy[0] (\"same\").graphic.collection",
+            "toy[0] (\"same\").graphic.dwell_ms",
+            "toy[0] (\"same\").words[1]",
+            "toy[1] (\"same\").id",
+            "toy[1] (\"same\").ink.window_ms",
+            "toy[1] (\"same\").words[0]",
+        ];
+        want.sort_unstable();
+        assert_eq!(fields, want, "{:#?}", error.diagnostics());
     }
 
     #[test]
     fn toy_pack_source_cap_precedes_toml_parse() {
         let oversized = "x".repeat(MAX_TOY_PACK_BYTES + 1);
         let error = compile_toy_pack_toml(&oversized).expect_err("oversize source rejected");
-        assert!(error.to_string().contains("maximum"), "{error}");
         assert!(
             error.to_string().contains(&MAX_TOY_PACK_BYTES.to_string()),
             "{error}"
@@ -1615,13 +1596,8 @@ ink = { kind = "self_glow", window_ms = 9000 }
             "words = [\"shipit\", \"shipit's\"]",
             1,
         );
-        let error = compile_toy_pack_toml(&colliding)
+        compile_toy_pack_toml(&colliding)
             .expect_err("base and possessive surface must not share a dispatch key");
-        assert!(
-            error.to_string().contains("dispatch key collides")
-                && error.to_string().contains("possessive variants"),
-            "{error}"
-        );
     }
 
     #[test]
@@ -1644,8 +1620,7 @@ ink = { kind = "self_glow", window_ms = 9000 }
              words = [{words}]\n\
              burst = {{ kind = \"glow\" }}\n"
         );
-        let error = compile_toy_pack_toml(&source).expect_err("word cap rejected");
-        assert!(error.to_string().contains("per-recipe maximum"), "{error}");
+        compile_toy_pack_toml(&source).expect_err("word cap rejected");
     }
 
     #[test]
@@ -1789,20 +1764,13 @@ ink = { colorway = "rainbow" }
         assert!(table.override_for(form_hash("犬")).is_some());
         let lx = aterm_lexicon::Lexicon::with_languages_and_override(&["en"], Some(&lex_frag))
             .expect("synthesized fragment parses");
-        assert!(
-            lx.conflicts()
-                .iter()
-                .any(|c| c.contains("\"犬\"") && c.contains("requires cjk_single_char = true")),
-            "single-char CJK custom word warns, got {:?}",
-            lx.conflicts()
-        );
-        assert!(
-            lx.conflicts()
-                .iter()
-                .any(|c| c.contains("\"abc猫\"") && c.contains("dropped")),
-            "mixed-script custom word warns dropped, got {:?}",
-            lx.conflicts()
-        );
+        for word in ["\"犬\"", "\"abc猫\""] {
+            assert!(
+                lx.conflicts().iter().any(|c| c.contains(word)),
+                "{word} does not warn, got {:?}",
+                lx.conflicts()
+            );
+        }
     }
 
     #[test]

@@ -292,9 +292,7 @@ mod tests {
     #[test]
     fn a_copied_bundle_keeps_its_signature() {
         // Re-signing a copy of an Apple-signed binary waits on trustd.
-        if aterm_uds::deadline::trust_service_silent() {
-            return;
-        }
+        crate::require_trust_service();
         let dir = std::env::temp_dir().join(format!("akbundle-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let app = dir.join("t.app");

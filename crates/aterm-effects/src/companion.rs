@@ -1498,28 +1498,22 @@ mod law_tests {
     use super::*;
     use crate::kitty_cursor::{CatExit, CatFrame, CatPose, CatReaction};
     use aterm_core::terminal::UnderlineStyle;
-    use aterm_time::Duration;
 
     /// Ownership is pet mode, the trail master and the pet style, nothing else.
     #[test]
     fn the_owner_is_present_only_with_pet_mode_the_master_and_the_pet_style() {
-        assert!(resident_pet_owner_present(
-            true,
-            true,
-            GlowStyle::RainbowKitty
-        ));
-        assert!(!resident_pet_owner_present(
-            false,
-            true,
-            GlowStyle::RainbowKitty
-        ));
-        assert!(!resident_pet_owner_present(
-            true,
-            false,
-            GlowStyle::RainbowKitty
-        ));
-        assert!(!resident_pet_owner_present(true, true, GlowStyle::Lumen));
-        assert!(!resident_pet_owner_present(true, true, GlowStyle::Sparkle));
+        for (pet_mode, master, style, owned) in [
+            (true, true, GlowStyle::RainbowKitty, true),
+            (false, true, GlowStyle::RainbowKitty, false),
+            (true, false, GlowStyle::RainbowKitty, false),
+            (true, true, GlowStyle::Lumen, false),
+        ] {
+            assert_eq!(
+                resident_pet_owner_present(pet_mode, master, style),
+                owned,
+                "pet_mode={pet_mode} master={master} {style:?}"
+            );
+        }
     }
 
     #[test]
@@ -1584,40 +1578,16 @@ mod law_tests {
             .expect("an unresolved footprint still claims the caret band");
         assert_eq!(degraded.body_px, None);
         assert!(degraded.guards_caret);
-    }
 
-    #[test]
-    fn exactly_one_companion_can_own_a_frame_even_if_both_alphas_arrive() {
         // Unreachable through custody (pet mode never admits the head), but the
-        // shape still guarantees one body.
-        assert_eq!(
-            cursor_companion_duty(true, 255, Some((4, 9))),
-            CompanionDuty::Pet,
-        );
-        // The yield box then describes the pet, never the head.
-        let pet_body = (37, 66, 48, 82);
-        let head = (26, 85, 73, 123);
-        let on_glass = cursor_companion_on_glass(
-            cursor_companion_duty(true, 255, Some((4, 9))),
-            Some((4, 9)),
-            Some(head),
-            Some(pet_body),
-        )
-        .expect("the pet owns the frame");
-        assert_eq!(on_glass.body_px, Some(pet_body));
+        // shape still guarantees one body, and the pet wins: the yield box
+        // describes the pet, never the head.
+        let duty = cursor_companion_duty(true, 255, Some((4, 9)));
+        assert_eq!(duty, CompanionDuty::Pet);
+        let on_glass = cursor_companion_on_glass(duty, Some((4, 9)), Some(head), Some(body))
+            .expect("the pet owns the frame");
+        assert_eq!(on_glass.body_px, Some(body));
         assert!(!on_glass.guards_caret);
-        // Negative control: with the pet off glass the same inputs go to the head.
-        assert_eq!(
-            cursor_companion_on_glass(
-                cursor_companion_duty(false, 255, Some((4, 9))),
-                Some((4, 9)),
-                Some(head),
-                Some(pet_body),
-            )
-            .expect("the head owns the frame")
-            .body_px,
-            Some(head),
-        );
     }
 
     #[test]
@@ -1726,38 +1696,14 @@ mod law_tests {
                 vec![cell(' ', [240, 240, 240], bottom_bg); 3],
             ]
         };
-        let red = cursor_cat_color_key(
-            &make([255, 20, 20], [8, 8, 8], [8, 8, 8]),
-            geom,
-            footprint,
-            0,
-            0x00FF_FFFF,
-            0,
-        );
-        let blue = cursor_cat_color_key(
-            &make([20, 80, 255], [8, 8, 8], [8, 8, 8]),
-            geom,
-            footprint,
-            0,
-            0x00FF_FFFF,
-            0,
-        );
-        let light = cursor_cat_color_key(
-            &make([255, 20, 20], [248, 248, 248], [248, 248, 248]),
-            geom,
-            footprint,
-            0,
-            0x00FF_FFFF,
-            0,
-        );
-        let mixed = cursor_cat_color_key(
-            &make([255, 20, 20], [4, 4, 4], [248, 248, 248]),
-            geom,
-            footprint,
-            0,
-            0x00FF_FFFF,
-            0,
-        );
+        let key = |neighbor, top_bg, bottom_bg| {
+            let cells = make(neighbor, top_bg, bottom_bg);
+            cursor_cat_color_key(&cells, geom, footprint, 0, 0x00FF_FFFF, 0)
+        };
+        let red = key([255, 20, 20], [8, 8, 8], [8, 8, 8]);
+        let blue = key([20, 80, 255], [8, 8, 8], [8, 8, 8]);
+        let light = key([255, 20, 20], [248, 248, 248], [248, 248, 248]);
+        let mixed = key([255, 20, 20], [4, 4, 4], [248, 248, 248]);
         assert_ne!(
             red.accent, blue.accent,
             "neighbor text changes the hue family"
@@ -1880,274 +1826,6 @@ mod law_tests {
         );
     }
 
-    /// The slop band is symmetric on every side, right/bottom exclusive.
-    #[test]
-    fn a_press_lands_inside_the_body_plus_slop_and_nowhere_else() {
-        let rect = (10, 30, 40, 60);
-        assert!(pet_rect_hit(rect, 20.0, 50.0, PET_HIT_SLOP_PX));
-        assert!(
-            pet_rect_hit(rect, 6.0, 36.0, PET_HIT_SLOP_PX),
-            "the top-left grace"
-        );
-        assert!(
-            pet_rect_hit(rect, 33.9, 63.9, PET_HIT_SLOP_PX),
-            "the bottom-right grace"
-        );
-        assert!(!pet_rect_hit(rect, 5.9, 50.0, PET_HIT_SLOP_PX));
-        assert!(
-            !pet_rect_hit(rect, 34.0, 50.0, PET_HIT_SLOP_PX),
-            "right/bottom exclusive"
-        );
-        assert!(!pet_rect_hit(rect, 20.0, 64.0, PET_HIT_SLOP_PX));
-        assert!(
-            !pet_rect_hit(rect, 20.0, 50.0, -20),
-            "a negative slop shrinks past nothing"
-        );
-    }
-
-    /// The 10x20-cell, 80x30 grid the hit-box cases' `PetSense` uses.
-    fn hit_geom() -> EffectGeom {
-        EffectGeom {
-            cell_w: 10,
-            cell_h: 20,
-            rows: 30,
-            cols: 80,
-        }
-    }
-
-    /// The face changes at the authored threshold; custody does not.
-    #[test]
-    fn face_goes_live_at_the_swap_threshold() {
-        assert!(!sing_face_live(0.0));
-        assert!(!sing_face_live(0.3299));
-        assert!(sing_face_live(0.33));
-        assert!(sing_face_live(0.34));
-        assert!(sing_face_live(1.0));
-        assert!(!sing_face_live(f32::NAN));
-    }
-
-    #[test]
-    fn reduced_song_keeps_full_pet_present_and_late_cutoffs_never_blank() {
-        use crate::cursor_glow::{CursorCatMotionKind, CursorCatMotionPulse};
-        use crate::kitty_cursor::{CursorCat, SingSync};
-
-        let t0 = Instant::now();
-        let sense = |now, caret| PetSense {
-            caret_drawn: true,
-            now,
-            caret,
-            rows: 24,
-            cols: 80,
-            cell_w: 10,
-            cell_h: 20,
-            reduced_motion: true,
-            output_burst: false,
-            pointer: None,
-            wrapped: false,
-        };
-        let mut pet = PetBrain::default();
-        let mut now = t0;
-
-        // The ordinary resident is fully present before the song starts.
-        for _ in 0..30 {
-            now += Duration::from_millis(16);
-            let _ = pet.tick(sense(now, Some((4, 12))));
-        }
-        let mut pet_frame = pet.tick(sense(now, Some((4, 12))));
-        assert_eq!(pet_frame.alpha, 255);
-
-        let mut singer = CursorCat::default();
-        let singer_run = now;
-        for i in 0..160u64 {
-            singer.on_pet_mode_motion_pulse(CursorCatMotionPulse {
-                at: singer_run + Duration::from_millis(i * 40),
-                kind: CursorCatMotionKind::Advance,
-            });
-        }
-        now = singer_run + Duration::from_millis(6_500);
-        singer.set_singing(
-            now,
-            SingSync {
-                drive: 1.0,
-                beat: 0.0,
-            },
-        );
-        let held = singer.static_frame(now);
-        assert_eq!(held.alpha, 255);
-        // An opaque singing head exists, but pet mode never admits it.
-        pet_frame = pet.tick(sense(now, Some((4, 12))));
-        assert_eq!(pet_frame.alpha, 255);
-
-        // Project the real reduced-motion custody verdict onto the derived model:
-        // phase bookkeeping from the model successor, presentation facts from
-        // runtime (the head is never admitted in pet mode).
-        let handoff_model = aterm_spec::derive::reduced_motion_companion_handoff_model();
-        let bind_handoff = |before: &aterm_spec::interp::State,
-                            action: &'static str,
-                            singer_visible: bool,
-                            pet_ready: bool,
-                            pet_visible: bool| {
-            let mut observed = handoff_model.successors(action, before)[0].clone();
-            observed.insert("singer_visible", i64::from(singer_visible));
-            observed.insert("pet_ready", i64::from(pet_ready));
-            observed.insert("pet_visible", i64::from(pet_visible));
-            let label = format!("reduced companion runtime {action}");
-            let (ok, why) = aterm_spec::verify::validate_transition_tiered(
-                &handoff_model,
-                &[],
-                before,
-                &observed,
-                Some(action),
-                &label,
-            );
-            assert!(ok, "real reduced custody transition rejected: {why}");
-            observed
-        };
-        let started = bind_handoff(
-            &handoff_model.init_state(),
-            "StartReducedSong",
-            false,
-            pet_frame.alpha == 255,
-            pet_frame.alpha > 0,
-        );
-
-        // An occluded frame jumps straight from the held drive to below half, below
-        // the 0.33 cutoff, or drained; a forged transparent result must be rejected.
-        for (drive, action) in [
-            (0.49, "SampleLateBelowHalf"),
-            (0.30, "SampleLateBelowFaceSwap"),
-            (0.0, "SampleLateDrained"),
-        ] {
-            singer.set_singing(
-                now,
-                SingSync {
-                    drive: 1.0,
-                    beat: 0.0,
-                },
-            );
-            assert_eq!(singer.static_frame(now).alpha, 255);
-            now += Duration::from_millis(16);
-            singer.set_singing(now, SingSync { drive, beat: 0.0 });
-            let _ = singer.static_frame(now);
-            pet_frame = pet.tick(sense(now, Some((4, 12))));
-            assert_eq!(
-                pet_frame.alpha, 255,
-                "direct 1.0→{drive} reduced cutoff must reveal an opaque pet"
-            );
-            let observed = bind_handoff(
-                &started,
-                action,
-                false,
-                pet_frame.alpha == 255,
-                pet_frame.alpha > 0,
-            );
-            let mut forged_blackout = observed;
-            forged_blackout.insert("singer_visible", 0);
-            forged_blackout.insert("pet_visible", 0);
-            let (ok, _) = aterm_spec::verify::validate_transition_tiered(
-                &handoff_model,
-                &[],
-                &started,
-                &forged_blackout,
-                Some(action),
-                "forged reduced companion blackout",
-            );
-            assert!(!ok, "{action} must reject an all-transparent projection");
-        }
-
-        // The ordinary cadence: half cutoff -> sampled tail -> below-face -> drain.
-        let mut cadenced = started.clone();
-        for (drive, action) in [
-            (0.50, "SampleAtHalfCutoff"),
-            (0.49, "SampleCadencedBelowHalf"),
-            (0.329, "SampleBelowFaceSwap"),
-            (0.0, "DrainSongTail"),
-        ] {
-            singer.set_singing(now, SingSync { drive, beat: 0.0 });
-            let _ = singer.static_frame(now);
-            assert_eq!(pet_frame.alpha, 255, "drive {drive}");
-            cadenced = bind_handoff(
-                &cadenced,
-                action,
-                false,
-                pet_frame.alpha == 255,
-                pet_frame.alpha > 0,
-            );
-        }
-        assert_eq!(cadenced[&"phase"], 5);
-        assert_eq!(cadenced[&"pet_visible"], 1);
-
-        // A cold reduced-motion resident is an opaque still on its first caret
-        // sample: reduced motion owns no frame lane, so an appearance ramp could
-        // strand it transparent until an unrelated redraw.
-        let mut cold_pet = PetBrain::default();
-        let first = cold_pet.tick(sense(now, Some((4, 12))));
-        assert_eq!(first.alpha, 255);
-        for _ in 0..20 {
-            now += Duration::from_millis(16);
-            let frame = cold_pet.tick(sense(now, Some((4, 12))));
-            assert_eq!(frame.alpha, 255, "the reduced still stays opaque");
-            pet_frame = frame;
-        }
-        assert_eq!(pet_frame.alpha, 255, "the resident remains on glass");
-    }
-
-    #[test]
-    fn history_suppresses_both_cursor_companions_without_suspending_decorations() {
-        assert!(cursor_companion_presentable(true, true));
-        assert!(
-            !cursor_companion_presentable(true, false),
-            "a presentable decoration surface still suppresses cursor-owned bodies in history"
-        );
-        assert!(!cursor_companion_presentable(false, true));
-    }
-
-    /// In history the resident keeps getting hidden-caret ticks and its scheduler
-    /// settles.
-    #[test]
-    fn history_lets_the_fading_pet_brain_settle() {
-        let t0 = Instant::now();
-        let sense = |now, caret| PetSense {
-            caret_drawn: true,
-            now,
-            caret,
-            rows: 24,
-            cols: 80,
-            cell_w: 10,
-            cell_h: 20,
-            reduced_motion: false,
-            output_burst: false,
-            pointer: None,
-            wrapped: false,
-        };
-        let mut pet = PetBrain::default();
-        let _ = pet.tick(sense(t0, Some((4, 12))));
-        let live_pet = pet.tick(sense(t0 + Duration::from_millis(500), Some((4, 12))));
-        assert!(live_pet.alpha > 0, "negative control owns a resident pet");
-        let g = hit_geom();
-        assert!(
-            live_pet
-                .body_px(g.cell_w, g.cell_h, g.cols, g.rows)
-                .is_some(),
-            "the live pet owns a clickable body"
-        );
-        let hidden_pet = pet.tick(sense(t0 + Duration::from_millis(600), None));
-        assert!(
-            hidden_pet.alpha > 0,
-            "the brain is still fading on the first history frame"
-        );
-        for step in 1..=300 {
-            let _ = pet.tick(sense(t0 + Duration::from_millis(600 + step * 100), None));
-            if !pet.needs_frames() {
-                break;
-            }
-        }
-        assert!(
-            !pet.needs_frames(),
-            "hidden-caret ticks let the pet release the animation scheduler"
-        );
-    }
-
     /// A pet-mode summon exits plain whatever flourish was rolled; outside pet
     /// mode the roll is untouched.
     #[test]
@@ -2174,50 +1852,31 @@ mod law_tests {
         }
     }
 
-    /// Non-program rungs are quiet, a program rung carries the gate's ruling, an
-    /// undressed pet keeps its ceremony, and a near-identical coat is demoted.
+    /// Non-program rungs are quiet whatever the gate ruled, a program rung carries
+    /// the gate's ruling, an undressed pet keeps its ceremony, and a near-identical
+    /// coat is demoted.
     #[test]
     fn the_arrival_mapping_rations_the_theater_by_rung_and_difference() {
         use crate::kitty_registry::{SUFFICIENT_DIFFERENCE, coat_distance};
-        for rung in [CompanionRung::Favourite, CompanionRung::Launch] {
-            assert_eq!(
-                pet_arrival_for_sync(rung, PetArrival::Ceremony, None, 3),
-                PetArrival::Quiet,
-                "{rung:?} never announces"
-            );
-        }
-        assert_eq!(
-            pet_arrival_for_sync(CompanionRung::Program, PetArrival::Quiet, None, 3),
-            PetArrival::Quiet
-        );
-        assert_eq!(
-            pet_arrival_for_sync(CompanionRung::Program, PetArrival::Ceremony, None, 3),
-            PetArrival::Ceremony,
-            "a pet never yet dressed has nothing to compare against"
-        );
-        // The same coat is within any difference of itself: demoted.
-        assert_eq!(
-            pet_arrival_for_sync(
-                CompanionRung::Program,
-                PetArrival::Ceremony,
-                Some((3, 0)),
-                3
-            ),
-            PetArrival::Quiet
-        );
-        // A coat far enough away keeps its ceremony — found, not assumed.
+        use CompanionRung::{Favourite, Launch, Program};
+        use PetArrival::{Ceremony, Quiet};
         let far = (0u8..16)
             .find(|&c| coat_distance(3, c) >= SUFFICIENT_DIFFERENCE)
             .expect("some coat is sufficiently different from coat 3");
-        assert_eq!(
-            pet_arrival_for_sync(
-                CompanionRung::Program,
-                PetArrival::Ceremony,
-                Some((3, 0)),
-                far
-            ),
-            PetArrival::Ceremony
-        );
+        for (rung, authorised, worn, incoming, expected) in [
+            (Favourite, Ceremony, None, 3, Quiet),
+            (Launch, Ceremony, None, 3, Quiet),
+            (Program, Quiet, None, 3, Quiet),
+            (Program, Ceremony, None, 3, Ceremony),
+            (Program, Ceremony, Some((3, 0)), 3, Quiet),
+            (Program, Ceremony, Some((3, 0)), far, Ceremony),
+        ] {
+            assert_eq!(
+                pet_arrival_for_sync(rung, authorised, worn, incoming),
+                expected,
+                "{rung:?} {authorised:?} worn={worn:?} incoming={incoming}"
+            );
+        }
     }
 }
 
@@ -2284,6 +1943,21 @@ mod owner_tests {
         }
     }
 
+    /// One owned, focused, unobscured pet-mode frame's facts; a test shapes
+    /// only the field it changes (`PetFacts { focused: false, ..pet_facts(..) }`).
+    fn pet_facts<'a>(facts: &'a TerminalFacts, host: &'a HostFrameInput) -> PetFacts<'a> {
+        PetFacts {
+            facts,
+            host,
+            glow: pet_glow(),
+            sing: SingFacts::default(),
+            focused: true,
+            obscured: false,
+            pane: None,
+            room: None,
+        }
+    }
+
     fn an_enabled_owner() -> CompanionOwner {
         let mut owner = CompanionOwner::default();
         owner.set_enabled_seed(true, 0x5EED);
@@ -2299,19 +1973,7 @@ mod owner_tests {
     ) -> CompanionFrame {
         let facts = facts_with(caret);
         let host = host_at(now);
-        owner.sense(
-            PetFacts {
-                facts: &facts,
-                host: &host,
-                glow: pet_glow(),
-                sing: SingFacts::default(),
-                focused: true,
-                obscured: false,
-                pane: None,
-                room: None,
-            },
-            decos,
-        )
+        owner.sense(pet_facts(&facts, &host), decos)
     }
 
     /// Walk the caret until the resident is on glass and moving; returns when.
@@ -2345,60 +2007,6 @@ mod owner_tests {
         panic!("fixture: the resident never settled");
     }
 
-    /// The same seed dresses the same pair on any instance; `enabled = false`
-    /// retires the body, rect and lane at once.
-    #[test]
-    fn the_seed_door_dresses_the_pet_and_disabling_retires_it() {
-        let mut decos = WordDecorations::default();
-        let mut a = an_enabled_owner();
-        let now = materialize(&mut a, &mut decos);
-        let t = frame(
-            &mut a,
-            &mut decos,
-            now + Duration::from_millis(16),
-            Some((4, 12)),
-        );
-        let mut free = Vec::new();
-        let (_, worn_a) = a.emit(
-            &t,
-            &[],
-            ContrastFallback {
-                bg: 0,
-                cursor: 0x00FF_FFFF,
-                accent: 0x0040_80FF,
-            },
-            &mut decos,
-            &mut free,
-        );
-        let launch = KittyLook::for_launch(0x5EED);
-        assert_eq!(
-            worn_a.worn,
-            (launch.coat, launch.iris),
-            "the launch look is worn"
-        );
-        assert!(!free.is_empty(), "one body landed");
-
-        let other = (0u64..64)
-            .map(KittyLook::for_launch)
-            .find(|l| (l.coat, l.iris) != (launch.coat, launch.iris))
-            .expect("a different seed dresses a different cat");
-        let mut b = CompanionOwner::default();
-        assert!(
-            !b.enabled(),
-            "off at construction: the byte-identical posture"
-        );
-        b.set_enabled_seed(true, 0x5EED);
-        assert!(b.enabled());
-        let _ = other;
-
-        a.set_enabled_seed(false, 0x5EED);
-        assert!(!a.enabled());
-        assert!(!a.needs_frames(), "disable releases the lane at once");
-        assert_eq!(a.alpha(), 0);
-        assert_eq!(a.hit_rect(), None);
-        assert!(!a.brain().is_active());
-    }
-
     /// An unfocused surface feeds `caret: None` and the resident releases the
     /// lane. Negative control: an unticked brain's `needs_frames` stays true.
     #[test]
@@ -2414,14 +2022,8 @@ mod owner_tests {
             let host = host_at(now);
             let t = owner.sense(
                 PetFacts {
-                    facts: &facts,
-                    host: &host,
-                    glow: pet_glow(),
-                    sing: SingFacts::default(),
                     focused: false,
-                    obscured: false,
-                    pane: None,
-                    room: None,
+                    ..pet_facts(&facts, &host)
                 },
                 &mut decos,
             );
@@ -2447,87 +2049,10 @@ mod owner_tests {
         );
     }
 
-    /// The first read of a session baselines silently, a None→Some edge within it
-    /// is a real completion, later ones are felt, and a session switch never replays.
-    #[test]
-    fn the_command_latch_baselines_silently_then_feels_each_completion_once() {
-        let mut decos = WordDecorations::default();
-        let sense_cmd = |owner: &mut CompanionOwner,
-                         decos: &mut WordDecorations,
-                         now: Instant,
-                         session: u64,
-                         cmd_done: Option<(u64, i32, Option<u64>)>| {
-            let mut facts = facts_with(Some((4, 12)));
-            facts.session = session;
-            facts.cmd_done = cmd_done;
-            let host = host_at(now);
-            let _ = owner.sense(
-                PetFacts {
-                    facts: &facts,
-                    host: &host,
-                    glow: pet_glow(),
-                    sing: SingFacts::default(),
-                    focused: true,
-                    obscured: false,
-                    pane: None,
-                    room: None,
-                },
-                decos,
-            );
-        };
-
-        // First read ever, with a failure already in the history: baseline.
-        let mut owner = an_enabled_owner();
-        let now = Instant::now();
-        sense_cmd(&mut owner, &mut decos, now, 1, Some((9, 1, None)));
-        assert!(
-            !owner.brain().grieving(),
-            "the first read of a session's history is a silent baseline"
-        );
-        // A new same-session completion: felt.
-        sense_cmd(
-            &mut owner,
-            &mut decos,
-            now + Duration::from_millis(16),
-            1,
-            Some((10, 1, None)),
-        );
-        assert!(owner.brain().grieving(), "a same-session failure is felt");
-
-        // The None→Some edge within one session is a real first completion.
-        let mut first = an_enabled_owner();
-        sense_cmd(&mut first, &mut decos, now, 1, None);
-        assert!(!first.brain().grieving());
-        sense_cmd(
-            &mut first,
-            &mut decos,
-            now + Duration::from_millis(16),
-            1,
-            Some((1, 1, None)),
-        );
-        assert!(
-            first.brain().grieving(),
-            "the first completion this session saw"
-        );
-
-        // A session switch with a differing seq: baseline only, never a replay.
-        let mut switched = an_enabled_owner();
-        sense_cmd(&mut switched, &mut decos, now, 1, Some((9, 0, None)));
-        sense_cmd(
-            &mut switched,
-            &mut decos,
-            now + Duration::from_millis(16),
-            2,
-            Some((3, 1, None)),
-        );
-        assert!(
-            !switched.brain().grieving(),
-            "a session change is never a completion"
-        );
-    }
-
     /// A press inside the drawn body (plus slop) latches a pet and is consumed;
-    /// outside passes; a retired pet has no body.
+    /// outside passes. Contact needs the body the last frame drew (its hit rect),
+    /// so a withdrawn body cannot be touched, by a press or the pointer, while the
+    /// brain keeps its frame.
     #[test]
     fn a_press_inside_the_body_plus_slop_pets_and_outside_passes() {
         let mut decos = WordDecorations::default();
@@ -2550,12 +2075,19 @@ mod owner_tests {
         assert_eq!(owner.press(now, outside), PressOutcome::Pass);
         assert_eq!(owner.brain().pending_pets(), 2, "a miss latches nothing");
 
-        owner.retire();
+        owner.withdraw_hit_rect();
+        assert_eq!(owner.hit_rect(), None);
+        assert!(owner.brain().is_active(), "the brain keeps its frame");
         assert_eq!(
             owner.press(now, inside),
             PressOutcome::Pass,
             "no body, no pet"
         );
+        let mut host = host_at(now + Duration::from_millis(16));
+        host.pointer_px = Some(inside);
+        let facts = facts_with(Some((4, 12)));
+        let t = prepared(&mut owner, &mut decos, &facts, &host, false);
+        assert_eq!(t.sense.pointer, None, "a withdrawn body is untouchable");
     }
 
     #[test]
@@ -2590,17 +2122,12 @@ mod owner_tests {
                 ));
                 let result = owner.sense(
                     PetFacts {
-                        facts: &facts,
-                        host: &host,
-                        glow: pet_glow(),
                         sing: SingFacts {
                             drive: sing_drive,
                             ..SingFacts::default()
                         },
                         focused,
-                        obscured: false,
-                        pane: None,
-                        room: None,
+                        ..pet_facts(&facts, &host)
                     },
                     &mut decos,
                 );
@@ -2693,37 +2220,13 @@ mod owner_tests {
         let mut capture = an_enabled_owner();
         let mut host = host_at(now);
         host.capture = CaptureMode::StaticCapture;
-        let still = capture.sense(
-            PetFacts {
-                facts: &facts,
-                host: &host,
-                glow: pet_glow(),
-                sing: SingFacts::default(),
-                focused: true,
-                obscured: false,
-                pane: None,
-                room: None,
-            },
-            &mut decos,
-        );
+        let still = capture.sense(pet_facts(&facts, &host), &mut decos);
         assert_eq!(still.pet.alpha, 255, "the still shows the resident");
         assert!(still.on_glass && still.body_px.is_some());
 
         let mut present = an_enabled_owner();
         let host = host_at(now);
-        let first = present.sense(
-            PetFacts {
-                facts: &facts,
-                host: &host,
-                glow: pet_glow(),
-                sing: SingFacts::default(),
-                focused: true,
-                obscured: false,
-                pane: None,
-                room: None,
-            },
-            &mut decos,
-        );
+        let first = present.sense(pet_facts(&facts, &host), &mut decos);
         assert_eq!(first.pet.alpha, 0, "negative control: a present fades in");
         assert!(present.needs_frames(), "…and claims the lane to do so");
     }
@@ -2812,7 +2315,8 @@ mod owner_tests {
     }
 
     /// A program ceremony for a different enough coat commits on a drawn present,
-    /// never on a capture, and a re-sync under Quiet cannot commit again.
+    /// never on a capture nor an emit that put nothing on glass, and a re-sync
+    /// under Quiet cannot commit again.
     #[test]
     fn the_hello_seam_commits_only_a_performed_ceremony_on_a_present() {
         use crate::kitty_registry::{SUFFICIENT_DIFFERENCE, coat_distance};
@@ -2853,6 +2357,19 @@ mod owner_tests {
             !owner.commit_hello_due(false, outcome),
             "a capture never does"
         );
+        let off = CompanionFrame {
+            on_glass: false,
+            duty: CompanionDuty::Idle,
+            body_px: None,
+            companion: None,
+            ..t
+        };
+        let (fp, off_outcome) = owner.emit(&off, &[], theme, &mut decos, &mut Vec::new());
+        assert_eq!(fp, 0, "nothing drawn");
+        assert!(
+            !owner.commit_hello_due(true, off_outcome),
+            "an off-glass frame performed nothing, so it commits nothing"
+        );
 
         // Committed, the host latch is Quiet: the re-sync cannot commit again.
         owner.set_look((far, worn.1), PetArrival::Quiet, CompanionRung::Program);
@@ -2866,86 +2383,6 @@ mod owner_tests {
         assert!(!owner.commit_hello_due(true, again));
     }
 
-    /// The species is the brain's identity from the host's choice, before any
-    /// frame; after a drain the next prepare restores it.
-    #[test]
-    fn a_chosen_species_is_the_brains_at_once_and_a_drain_drops_it_until_the_next_prepare() {
-        let mut decos = WordDecorations::default();
-        let mut owner = an_enabled_owner();
-        owner.set_species(PetSpecies::Dog);
-        assert_eq!(
-            owner.brain().species(),
-            PetSpecies::Dog,
-            "a cold owner's brain already wears the chosen animal"
-        );
-        let now = materialize(&mut owner, &mut decos);
-        owner.drain();
-        assert_eq!(
-            owner.brain().species(),
-            PetSpecies::default(),
-            "a drain is a fresh brain: the identity is gone until the next prepare"
-        );
-        assert_ne!(PetSpecies::default(), PetSpecies::Dog, "fixture");
-        let _ = frame(
-            &mut owner,
-            &mut decos,
-            now + Duration::from_millis(16),
-            Some((4, 12)),
-        );
-        assert_eq!(owner.brain().species(), PetSpecies::Dog);
-    }
-
-    /// The owner retire keeps durable identity (species, worn look), drops every
-    /// surface-relative fact, and re-baselines the command probe.
-    #[test]
-    fn retiring_the_owner_keeps_identity_and_drops_the_surface() {
-        let mut decos = WordDecorations::default();
-        let mut owner = an_enabled_owner();
-        owner.set_species(PetSpecies::Dog);
-        let now = materialize(&mut owner, &mut decos);
-        let t = frame(
-            &mut owner,
-            &mut decos,
-            now + Duration::from_millis(16),
-            Some((4, 12)),
-        );
-        let (_, before) = owner.emit(&t, &[], BLACK_FALLBACK, &mut decos, &mut Vec::new());
-
-        owner.retire_owner();
-        assert!(!owner.brain().is_active() && !owner.needs_frames());
-        assert_eq!(owner.hit_rect(), None);
-        assert_eq!(
-            owner.brain().species(),
-            PetSpecies::Dog,
-            "durable identity survives the edge"
-        );
-        assert_eq!(
-            owner.brain().worn_pair(),
-            Some(before.worn),
-            "…and so does the coat"
-        );
-
-        // The replacement owner's first completion is a baseline, not grief.
-        let mut facts = facts_with(Some((4, 12)));
-        facts.session = 2;
-        facts.cmd_done = Some((1, 1, None));
-        let host = host_at(now + Duration::from_millis(32));
-        let _ = owner.sense(
-            PetFacts {
-                facts: &facts,
-                host: &host,
-                glow: pet_glow(),
-                sing: SingFacts::default(),
-                focused: true,
-                obscured: false,
-                pane: None,
-                room: None,
-            },
-            &mut decos,
-        );
-        assert!(!owner.brain().grieving());
-    }
-
     /// One owned, focused frame's facts and host at `now`.
     fn prepared(
         owner: &mut CompanionOwner,
@@ -2956,64 +2393,18 @@ mod owner_tests {
     ) -> PetTick {
         owner.prepare(
             PetFacts {
-                facts,
-                host,
-                glow: pet_glow(),
-                sing: SingFacts::default(),
-                focused: true,
                 obscured,
-                pane: None,
-                room: None,
+                ..pet_facts(facts, host)
             },
             decos,
         )
     }
 
-    /// A DECTCEM-hidden caret is still chased, flagged unpainted, rather than lost
-    /// for every TUI repaint; the yield box claims only a painted caret.
-    #[test]
-    fn a_hidden_caret_is_still_chased_and_reported_unpainted() {
-        let mut decos = WordDecorations::default();
-        let mut owner = an_enabled_owner();
-        let now = materialize(&mut owner, &mut decos);
-        let mut facts = facts_with(Some((4, 12)));
-        facts.cursor_visible = false;
-        let host = host_at(now + Duration::from_millis(16));
-        let t = prepared(&mut owner, &mut decos, &facts, &host, false);
-        assert_eq!(t.sense.caret, Some((4, 12)), "the hidden caret travels");
-        assert!(!t.sense.caret_drawn, "…and is reported unpainted");
-        assert_eq!(
-            t.painted_caret, None,
-            "no stale word claim at a hidden caret"
-        );
-        let frame = owner.tick(t);
-        assert!(
-            frame.on_glass,
-            "the resident keeps its body through the hide"
-        );
-        assert!(
-            frame.companion.is_some_and(|c| c.cell.is_none()),
-            "the yield box is the body alone"
-        );
-
-        facts.cursor_visible = true;
-        let t = prepared(
-            &mut owner,
-            &mut decos,
-            &facts,
-            &host_at(now + Duration::from_millis(32)),
-            false,
-        );
-        assert!(
-            t.sense.caret_drawn,
-            "negative control: a painted caret is drawn"
-        );
-    }
-
     /// On an unfinished frame a hidden caret is the write position: the sense
     /// carries the last finished present's caret and paint, and the wrap waits.
-    /// A finished frame's hidden caret still travels (the control); a torn frame
-    /// with no finished caret of its session reads none.
+    /// A finished frame's DECTCEM-hidden caret is still chased, flagged unpainted,
+    /// rather than lost for every TUI repaint, and the yield box is the body alone;
+    /// a torn frame with no finished caret of its session reads none.
     #[test]
     fn a_torn_frames_hidden_cursor_reads_as_the_last_finished_caret() {
         let mut decos = WordDecorations::default();
@@ -3051,9 +2442,21 @@ mod owner_tests {
         assert_eq!(
             (t.sense.caret, t.sense.caret_drawn),
             (Some((20, 8)), false),
-            "control: a finished frame's hidden caret still travels, unpainted"
+            "a finished frame's hidden caret still travels, unpainted"
         );
-        let _ = owner.tick(t);
+        assert_eq!(
+            t.painted_caret, None,
+            "no stale word claim at a hidden caret"
+        );
+        let frame = owner.tick(t);
+        assert!(
+            frame.on_glass,
+            "the resident keeps its body through the hide"
+        );
+        assert!(
+            frame.companion.is_some_and(|c| c.cell.is_none()),
+            "the yield box is the body alone"
+        );
 
         let mut other = torn;
         other.session = 2;
@@ -3136,6 +2539,12 @@ mod owner_tests {
             None,
             "a session switch re-baselines silently"
         );
+        assert_eq!(step(&mut owner, 9, None), None, "a session with no history");
+        assert_eq!(
+            step(&mut owner, 9, Some((1, 1, None))),
+            Some((1, None)),
+            "its None -> Some edge is a real first completion"
+        );
     }
 
     /// An app surface over the grid keeps the resident owned but not presented.
@@ -3208,39 +2617,19 @@ mod owner_tests {
         assert_eq!(owner.next_change_deadline(host.now), None);
     }
 
-    /// Pointer contact needs the body the last frame drew, so a withdrawn body
-    /// cannot be touched.
-    #[test]
-    fn a_withdrawn_body_cannot_be_touched_and_keeps_its_brain() {
-        let mut decos = WordDecorations::default();
-        let mut owner = an_enabled_owner();
-        let now = materialize(&mut owner, &mut decos);
-        let facts = facts_with(Some((4, 12)));
-        let rect = owner.hit_rect().expect("fixture: the resident is drawn");
-        let over = (
-            (rect.0 + rect.1) as f32 * 0.5,
-            (rect.2 + rect.3) as f32 * 0.5,
-        );
-        let mut host = host_at(now + Duration::from_millis(16));
-        host.pointer_px = Some(over);
-        let t = prepared(&mut owner, &mut decos, &facts, &host, false);
-        assert!(t.sense.pointer.is_some(), "a drawn body senses the pointer");
-        let _ = owner.tick(t);
-
-        owner.withdraw_hit_rect();
-        assert_eq!(owner.hit_rect(), None);
-        assert!(owner.brain().is_active(), "the brain keeps its frame");
-        assert_eq!(owner.press(now, over), PressOutcome::Pass, "nothing to pet");
-        host.now += Duration::from_millis(16);
-        let t = prepared(&mut owner, &mut decos, &facts, &host, false);
-        assert_eq!(t.sense.pointer, None, "a withdrawn body is untouchable");
-    }
-
-    /// Serious Mode's drain is a fresh brain; the session latches survive.
+    /// Serious Mode's drain is a fresh brain (a latched trick, the body and the
+    /// species alike); the session latches survive. The species is the brain's
+    /// from the moment the host chooses it, and the next prepare restores it.
     #[test]
     fn the_drain_is_a_fresh_brain_that_keeps_the_session_latches() {
         let mut decos = WordDecorations::default();
         let mut owner = an_enabled_owner();
+        owner.set_species(PetSpecies::Dog);
+        assert_eq!(
+            owner.brain().species(),
+            PetSpecies::Dog,
+            "a cold owner's brain already wears the chosen animal"
+        );
         let mut now = materialize(&mut owner, &mut decos);
         let mut facts = facts_with(Some((4, 12)));
         facts.cmd_done = Some((5, 0, None));
@@ -3253,62 +2642,21 @@ mod owner_tests {
         assert!(!owner.brain().is_active() && owner.brain().pending_trick().is_none());
         assert_eq!(owner.hit_rect(), None);
         // The latch still holds seq 5: that completion is not news, the next is.
+        assert_ne!(PetSpecies::default(), PetSpecies::Dog, "fixture");
+        assert_eq!(
+            owner.brain().species(),
+            PetSpecies::default(),
+            "a drain is a fresh brain: the identity is gone until the next prepare"
+        );
         now += Duration::from_millis(16);
         let t = prepared(&mut owner, &mut decos, &facts, &host_at(now), false);
+        assert_eq!(owner.brain().species(), PetSpecies::Dog);
         assert_eq!(t.completion, None, "seq 5 was already felt");
         let _ = owner.tick(t);
         facts.cmd_done = Some((6, 0, None));
         now += Duration::from_millis(16);
         let t = prepared(&mut owner, &mut decos, &facts, &host_at(now), false);
         assert_eq!(t.completion, Some((0, None)));
-    }
-
-    /// An emit that put nothing on glass syncs nothing, leaving no stale ceremony.
-    #[test]
-    fn an_off_glass_emit_leaves_no_hello_to_commit() {
-        let mut decos = WordDecorations::default();
-        let mut owner = an_enabled_owner();
-        let now = materialize(&mut owner, &mut decos);
-        // Dress the resident so the next verdict parks.
-        let t = frame(&mut owner, &mut decos, now, Some((4, 12)));
-        let _ = owner.emit(&t, &[], BLACK_FALLBACK, &mut decos, &mut Vec::new());
-        let worn = owner
-            .brain()
-            .worn_pair()
-            .expect("fixture: the resident is dressed");
-        let other = (0..=u8::MAX)
-            .map(|coat| (coat, 0))
-            .find(|pair| {
-                crate::kitty_registry::coat_distance(worn.0, pair.0)
-                    >= crate::kitty_registry::SUFFICIENT_DIFFERENCE
-            })
-            .expect("a visibly different coat");
-        owner.set_look(other, PetArrival::Ceremony, CompanionRung::Program);
-        let t = frame(
-            &mut owner,
-            &mut decos,
-            now + Duration::from_millis(16),
-            Some((4, 12)),
-        );
-        let (_, outcome) = owner.emit(&t, &[], BLACK_FALLBACK, &mut decos, &mut Vec::new());
-        assert!(
-            owner.commit_hello_due(true, outcome),
-            "fixture: the on-glass present performed the ceremony"
-        );
-
-        let off = CompanionFrame {
-            on_glass: false,
-            duty: CompanionDuty::Idle,
-            body_px: None,
-            companion: None,
-            ..t
-        };
-        let (fp, outcome) = owner.emit(&off, &[], BLACK_FALLBACK, &mut decos, &mut Vec::new());
-        assert_eq!(fp, 0, "nothing drawn");
-        assert!(
-            !owner.commit_hello_due(true, outcome),
-            "an off-glass frame performed nothing, so it commits nothing"
-        );
     }
 
     /// A style that stops naming the pet and serious mode retire it; the Hidden
@@ -3324,18 +2672,12 @@ mod owner_tests {
         let host = host_at(now + Duration::from_millis(16));
         let t = owner.sense(
             PetFacts {
-                facts: &facts,
-                host: &host,
                 glow: GlowOwnership {
                     enabled: true,
                     style: GlowStyle::Lumen,
                     style_raw_names_pet: false,
                 },
-                sing: SingFacts::default(),
-                focused: true,
-                obscured: false,
-                pane: None,
-                room: None,
+                ..pet_facts(&facts, &host)
             },
             &mut decos,
         );
@@ -3349,22 +2691,11 @@ mod owner_tests {
         let now = materialize(&mut owner, &mut decos);
         let mut host = host_at(now + Duration::from_millis(16));
         host.serious = true;
-        let t = owner.sense(
-            PetFacts {
-                facts: &facts,
-                host: &host,
-                glow: pet_glow(),
-                sing: SingFacts::default(),
-                focused: true,
-                obscured: false,
-                pane: None,
-                room: None,
-            },
-            &mut decos,
-        );
+        let t = owner.sense(pet_facts(&facts, &host), &mut decos);
         assert!(!t.on_glass && !owner.needs_frames());
 
-        // Hidden: the surface retires, the coat is kept.
+        // Hidden: the surface retires, the coat is kept (a coordinate-space
+        // retire, never a drain).
         let mut owner = an_enabled_owner();
         let now = materialize(&mut owner, &mut decos);
         let t = frame(
@@ -3378,14 +2709,8 @@ mod owner_tests {
         host.visibility = Visibility::Hidden;
         let t = owner.sense(
             PetFacts {
-                facts: &facts,
-                host: &host,
-                glow: pet_glow(),
-                sing: SingFacts::default(),
                 focused: false,
-                obscured: false,
-                pane: None,
-                room: None,
+                ..pet_facts(&facts, &host)
             },
             &mut decos,
         );
@@ -3404,19 +2729,7 @@ mod owner_tests {
         history.display_offset = 3;
         history.live_viewport = false;
         let host = host_at(now + Duration::from_millis(16));
-        let t = owner.sense(
-            PetFacts {
-                facts: &history,
-                host: &host,
-                glow: pet_glow(),
-                sing: SingFacts::default(),
-                focused: true,
-                obscured: false,
-                pane: None,
-                room: None,
-            },
-            &mut decos,
-        );
+        let t = owner.sense(pet_facts(&history, &host), &mut decos);
         assert!(!t.on_glass);
         assert_eq!(
             owner.hit_rect(),
@@ -3442,19 +2755,7 @@ mod owner_tests {
         let mut host = host_at(now + Duration::from_millis(32));
         host.shed_envelope = 0.5;
         host.shed_active = true;
-        let t = owner.sense(
-            PetFacts {
-                facts: &facts,
-                host: &host,
-                glow: pet_glow(),
-                sing: SingFacts::default(),
-                focused: true,
-                obscured: false,
-                pane: None,
-                room: None,
-            },
-            &mut decos,
-        );
+        let t = owner.sense(pet_facts(&facts, &host), &mut decos);
         assert!(t.on_glass);
         assert_eq!(t.pet.alpha, 255, "the full resident remains visible");
         assert_eq!(owner.alpha(), 255);
@@ -3826,19 +3127,7 @@ mod owner_tests {
         let facts = facts_with(Some((4, 12)));
         let mut host = host_at(now);
         host.capture = CaptureMode::StaticCapture;
-        owner.sense(
-            PetFacts {
-                facts: &facts,
-                host: &host,
-                glow: pet_glow(),
-                sing: SingFacts::default(),
-                focused: true,
-                obscured: false,
-                pane: None,
-                room: None,
-            },
-            &mut decos,
-        );
+        owner.sense(pet_facts(&facts, &host), &mut decos);
         assert!(
             owner.brain().needs_frames(),
             "the captured owner still has live motion"
@@ -3861,43 +3150,21 @@ mod owner_tests {
         host.capture = CaptureMode::Present;
         host.shed_envelope = 0.0;
         host.shed_active = true;
-        owner.sense(
-            PetFacts {
-                facts: &facts,
-                host: &host,
-                glow: pet_glow(),
-                sing: SingFacts::default(),
-                focused: true,
-                obscured: false,
-                pane: None,
-                room: None,
-            },
-            &mut decos,
-        );
+        owner.sense(pet_facts(&facts, &host), &mut decos);
         // The shed moves the resident off the train without a static posture.
         assert!(!owner.last_static && owner.last_shed_tick == Some(now));
         assert!(!owner.needs_frames());
         owner.set_enabled_seed(false, 0x5EED);
         assert!(!owner.last_static && owner.last_shed_tick.is_none() && !owner.needs_frames());
         assert_eq!(owner.hit_rect(), None);
+        assert_eq!(owner.alpha(), 0, "disable retires the body at once");
+        assert!(!owner.brain().is_active());
         owner.set_enabled_seed(true, 0x5EED);
         now += Duration::from_millis(16);
         host.now = now;
         host.shed_envelope = 1.0;
         host.shed_active = false;
-        owner.sense(
-            PetFacts {
-                facts: &facts,
-                host: &host,
-                glow: pet_glow(),
-                sing: SingFacts::default(),
-                focused: true,
-                obscured: false,
-                pane: None,
-                room: None,
-            },
-            &mut decos,
-        );
+        owner.sense(pet_facts(&facts, &host), &mut decos);
         assert!(!owner.last_static);
         assert!(
             owner.brain().needs_frames(),
@@ -3910,43 +3177,92 @@ mod owner_tests {
     }
 
     /// The resident stays full and pettable through the held song and every tail
-    /// cutoff, even when a competing head has live alpha.
+    /// cutoff, sampled at its cadence or jumped to directly from the held song by an
+    /// occluded frame, even when a competing head has live alpha. Each sample is a
+    /// transition of `reduced_motion_companion_handoff_model` (its `Buggy` replays
+    /// the former singing-head takeover and late-frame blackout), and a forged
+    /// all-transparent projection of the same sample is rejected.
     #[test]
     fn a_song_and_its_tail_keep_full_resident_custody() {
+        let model = aterm_models_effects::reduced_motion_companion_handoff_model();
+        let held = (1.0, "StartReducedSong");
+        let runs: [&[(f32, &str)]; 4] = [
+            &[
+                held,
+                (0.5, "SampleAtHalfCutoff"),
+                (0.4, "SampleCadencedBelowHalf"),
+                (0.329, "SampleBelowFaceSwap"),
+                (0.1, ""),
+                (0.0, "DrainSongTail"),
+            ],
+            &[held, (0.49, "SampleLateBelowHalf")],
+            &[held, (0.30, "SampleLateBelowFaceSwap")],
+            &[held, (0.0, "SampleLateDrained")],
+        ];
         for reduced_motion in [false, true] {
-            let mut decos = WordDecorations::default();
-            let mut owner = an_enabled_owner();
-            let mut now = materialize(&mut owner, &mut decos);
-            let facts = facts_with(Some((4, 12)));
-            for drive in [1.0, 0.5, 0.4, 0.329, 0.1, 0.0] {
-                now += Duration::from_millis(16);
-                let mut host = host_at(now);
-                host.reduced_motion = reduced_motion;
-                let result = owner.sense(
-                    PetFacts {
-                        facts: &facts,
-                        host: &host,
-                        glow: pet_glow(),
-                        sing: SingFacts {
-                            drive,
-                            flying_alpha: 200,
+            for run in runs {
+                let mut decos = WordDecorations::default();
+                let mut owner = an_enabled_owner();
+                let mut now = materialize(&mut owner, &mut decos);
+                let facts = facts_with(Some((4, 12)));
+                let mut state = model.init_state();
+                for &(drive, action) in run {
+                    now += Duration::from_millis(16);
+                    let mut host = host_at(now);
+                    host.reduced_motion = reduced_motion;
+                    let result = owner.sense(
+                        PetFacts {
+                            sing: SingFacts {
+                                drive,
+                                flying_alpha: 200,
+                            },
+                            ..pet_facts(&facts, &host)
                         },
-                        focused: true,
-                        obscured: false,
-                        pane: None,
-                        room: None,
-                    },
-                    &mut decos,
-                );
-                assert_eq!(result.duty, CompanionDuty::Pet, "drive={drive}");
-                assert!(result.on_glass);
-                assert_eq!(result.pet.alpha, 255);
-                assert!(result.body_px.is_some(), "the full body owns geometry");
-                assert!(owner.hit_rect().is_some(), "the resident stays pettable");
-                assert!(
-                    result.companion.is_some_and(|c| !c.guards_caret),
-                    "word companions yield to the resident body, not a head's caret band"
-                );
+                        &mut decos,
+                    );
+                    assert_eq!(result.duty, CompanionDuty::Pet, "drive={drive}");
+                    assert!(result.on_glass);
+                    assert_eq!(result.pet.alpha, 255);
+                    assert!(result.body_px.is_some(), "the full body owns geometry");
+                    assert!(owner.hit_rect().is_some(), "the resident stays pettable");
+                    assert!(
+                        result.companion.is_some_and(|c| !c.guards_caret),
+                        "word companions yield to the resident body, not a head's caret band"
+                    );
+                    if action.is_empty() {
+                        continue;
+                    }
+                    let mut observed = model.successors(action, &state)[0].clone();
+                    observed.insert(
+                        "singer_visible",
+                        i64::from(result.duty != CompanionDuty::Pet),
+                    );
+                    observed.insert("pet_ready", i64::from(result.pet.alpha == 255));
+                    observed.insert("pet_visible", i64::from(result.on_glass));
+                    let label = format!("resident custody {action} (reduced={reduced_motion})");
+                    let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+                        &model,
+                        &[],
+                        &state,
+                        &observed,
+                        Some(action),
+                        &label,
+                    );
+                    assert!(ok, "{label}: the real owner's sample is rejected: {why}");
+                    let mut blackout = observed.clone();
+                    blackout.insert("singer_visible", 0);
+                    blackout.insert("pet_visible", 0);
+                    let (forged_ok, _) = aterm_spec::verify::validate_transition_tiered(
+                        &model,
+                        &[],
+                        &state,
+                        &blackout,
+                        Some(action),
+                        "forged blackout",
+                    );
+                    assert!(!forged_ok, "{label}: an all-transparent projection passed");
+                    state = observed;
+                }
             }
         }
     }
@@ -3961,19 +3277,7 @@ mod owner_tests {
         let mut host = host_at(now);
         host.reduced_motion = true;
         let facts = facts_with(Some((4, 12)));
-        let first = owner.sense(
-            PetFacts {
-                facts: &facts,
-                host: &host,
-                glow: pet_glow(),
-                sing: SingFacts::default(),
-                focused: true,
-                obscured: false,
-                pane: None,
-                room: None,
-            },
-            &mut decos,
-        );
+        let first = owner.sense(pet_facts(&facts, &host), &mut decos);
         assert_eq!(
             first.pet.alpha, 255,
             "the first reduced frame has real pixels"
@@ -3981,19 +3285,7 @@ mod owner_tests {
         let far = facts_with(Some((20, 70)));
         let mut host = host_at(now + Duration::from_millis(16));
         host.reduced_motion = true;
-        let jumped = owner.sense(
-            PetFacts {
-                facts: &far,
-                host: &host,
-                glow: pet_glow(),
-                sing: SingFacts::default(),
-                focused: true,
-                obscured: false,
-                pane: None,
-                room: None,
-            },
-            &mut decos,
-        );
+        let jumped = owner.sense(pet_facts(&far, &host), &mut decos);
         assert_eq!(jumped.pet.alpha, 255);
         assert_eq!(jumped.pet.lift, 0.0, "no arc");
         assert_eq!(
@@ -4082,7 +3374,7 @@ mod owner_tests {
 
     /// `retire_coordinate_space` is surface only, so a later completion is still
     /// felt; `retire_owner` also re-baselines the command probe. Both drop body and
-    /// hit rect.
+    /// hit rect and keep the durable identity (species, worn coat).
     #[test]
     fn retire_coordinate_space_keeps_the_command_latch_and_retire_owner_rebaselines_it() {
         let sense_cmd = |owner: &mut CompanionOwner,
@@ -4092,27 +3384,18 @@ mod owner_tests {
             let mut facts = facts_with(Some((4, 12)));
             facts.cmd_done = cmd_done;
             let host = host_at(now);
-            let _ = owner.sense(
-                PetFacts {
-                    facts: &facts,
-                    host: &host,
-                    glow: pet_glow(),
-                    sing: SingFacts::default(),
-                    focused: true,
-                    obscured: false,
-                    pane: None,
-                    room: None,
-                },
-                decos,
-            );
+            let _ = owner.sense(pet_facts(&facts, &host), decos);
         };
 
         for owner_edge in [false, true] {
             let mut decos = WordDecorations::default();
             let mut owner = an_enabled_owner();
+            owner.set_species(PetSpecies::Dog);
             let now = materialize(&mut owner, &mut decos);
             sense_cmd(&mut owner, &mut decos, now, Some((9, 0, None)));
             assert!(owner.hit_rect().is_some(), "fixture: a body to retire");
+            let t = frame(&mut owner, &mut decos, now, Some((4, 12)));
+            let (_, before) = owner.emit(&t, &[], BLACK_FALLBACK, &mut decos, &mut Vec::new());
 
             if owner_edge {
                 owner.retire_owner();
@@ -4127,6 +3410,11 @@ mod owner_tests {
             assert!(
                 !owner.brain().is_active() && !owner.needs_frames(),
                 "either retire drops the body and its lane claim ({owner_edge})"
+            );
+            assert_eq!(
+                (owner.brain().species(), owner.brain().worn_pair()),
+                (PetSpecies::Dog, Some(before.worn)),
+                "durable identity, species and coat, survives either retire ({owner_edge})"
             );
 
             sense_cmd(

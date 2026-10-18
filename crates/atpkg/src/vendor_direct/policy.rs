@@ -46,6 +46,11 @@ pub struct Policy {
     yanked: BTreeMap<String, BTreeSet<Version>>,
     /// program → yanked legacy (ALab index) build numbers.
     legacy: BTreeMap<String, BTreeSet<u64>>,
+    /// ALab-built agent program ([`crate::alab`]) → the signed build floor its channels set
+    /// (`min_build_for`, the highest of them): every ALab build below it is revoked, as the
+    /// index lane revokes one ([`crate::gate`]). Only ALab-built programs carry one; a vendor
+    /// build is ordered by version, which a build floor does not speak.
+    floors: BTreeMap<String, u64>,
 }
 
 impl Policy {
@@ -60,12 +65,36 @@ impl Policy {
     /// vendor, not a channel, so a yank in any channel binds it.
     #[must_use]
     pub fn from_index(index: &Index) -> Self {
-        Self::from_entries(
+        let mut policy = Self::from_entries(
             index
                 .channels
                 .iter()
                 .flat_map(|c| c.yanked.iter().map(String::as_str)),
-        )
+        );
+        for agent in crate::alab::ALAB_AGENTS {
+            let floor = index
+                .channels
+                .iter()
+                .map(|c| c.min_build_for(agent.program))
+                .max()
+                .unwrap_or(0);
+            policy.set_floor(agent.program, floor);
+        }
+        policy
+    }
+
+    /// Record `floor` for ALab-built `program`; a zero floor is none.
+    fn set_floor(&mut self, program: &str, floor: u64) {
+        if floor > 0 && crate::alab::agent(program).is_some() {
+            self.floors.insert(program.to_string(), floor);
+        }
+    }
+
+    /// The signed build floor of ALab-built `program` (`0`: none): an ALab build below it is
+    /// revoked (`lane::Revoked`).
+    #[must_use]
+    pub(crate) fn alab_floor(&self, program: &str) -> u64 {
+        self.floors.get(program).copied().unwrap_or(0)
     }
 
     /// The policy the lane reads: the yanks of the newest index this machine verified
@@ -190,6 +219,9 @@ struct LatchFile {
     checked_at: i64,
     #[serde(default)]
     yanks: BTreeMap<String, Vec<String>>,
+    /// [`Policy::alab_floor`]s. A reader that predates them ignores the table.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    floors: BTreeMap<String, u64>,
 }
 
 /// `<prefix>/vendor-yanks.toml`.
@@ -214,6 +246,9 @@ impl YankLatch {
                     policy.insert(program, spelling);
                 }
             }
+        }
+        for (program, floor) in &file.floors {
+            policy.set_floor(program, *floor);
         }
         Some(Self {
             index_build: file.index_build,
@@ -330,6 +365,7 @@ impl YankLatch {
             roster_seq,
             checked_at,
             yanks: next.policy.spellings(),
+            floors: next.policy.floors.clone(),
         };
         let bytes = durable::to_toml(&file, MAX_LATCH_BYTES)?;
         durable::write_durable(&latch_path(layout), &bytes)?;

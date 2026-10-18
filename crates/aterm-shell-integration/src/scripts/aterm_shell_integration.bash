@@ -54,7 +54,8 @@
 # `set -x`, or a typed upgrade under one, traces nothing of it but its first
 # line, `[[ $- != *i* ]]`. What remains is bash's own trace of the hooks'
 # calls — the DEBUG trap's `__aterm_preexec <$_>` before each command and
-# PROMPT_COMMAND's `__aterm_prompt_command` — and an `eval` line before a scalar
+# PROMPT_COMMAND's `__aterm_prompt_command` (and an array one's last element,
+# `__aterm_prompt_end`) — and an `eval` line before a scalar
 # PROMPT_COMMAND of the user's; none carries the nonce. Under BASH_XTRACEFD
 # (bash 4.1+) the trace is not on stderr, so each function's opening `local` and
 # `set +xv` and its closing `return` reach it too: about 15 lines a command, no
@@ -289,14 +290,11 @@ if [[ ${#__aterm_body_rev} -ne 16 || "$__aterm_body_rev" == *[!0-9a-f]* ]]; then
     __aterm_body_rev=""
 fi
 
-# Package bin directory — once per shell: an upgrade in place already has it (and
-# the shell.d hooks below already ran; the LIVE block re-sources the atpkg hook
-# whenever it changes).
-if (( __aterm_fresh_load )) && [ -d "$HOME/.aterm/bin" ]; then
-    export PATH="$HOME/.aterm/bin:$PATH"
-fi
-
-# Source package shell hooks
+# Source package shell hooks — once per shell: an upgrade in place already ran
+# them (the LIVE block re-sources the atpkg hook whenever it changes).
+# No `~/.aterm/bin` goes on PATH: nothing creates or manages that folder, and an
+# entry there ahead of everything would let whatever lands in it shadow every
+# command in every session. atpkg's managed bin/ is APPENDED, by its own hook.
 if (( __aterm_fresh_load )) && [ -d "$HOME/.aterm/shell.d" ]; then
     for f in "$HOME/.aterm/shell.d"/*.bash "$HOME/.aterm/shell.d"/*.sh; do
         [ -f "$f" ] && . "$f"
@@ -668,9 +666,41 @@ __aterm_last_command="${__aterm_last_command:-}"
 # pyenv, nvm, etc.) would be captured as if they were user commands.
 __aterm_in_prompt_cmd="${__aterm_in_prompt_cmd:-0}"
 
+# ─── The marks go to the terminal (2026-10-16) ───
+#
+# The DEBUG trap fires for the first simple command INSIDE a compound command
+# typed at the prompt, and by then bash has applied the compound's redirections:
+# for `{ echo a; echo b; } > f`, `if …; fi > f`, `for …; done > f` or `while …;
+# done <<< x > f` the preexec ran with stdout on f, and 633;E (the line and the
+# capability nonce), the running title and 133;C went into the user's file
+# ahead of its data, while the terminal never saw the block start (measured on
+# bash 5.2.21: 419 bytes in f for 20 of output, the block left `entering`). A
+# simple command's redirections come after its trap, so `echo a > f` was clean;
+# a pipeline's group runs in a subshell the trap does not reach. A shell whose
+# stdout the user moved for good (`exec >log`) put every mark in the log.
+#
+# So a mark goes to stdout while stdout is a terminal, and otherwise to the
+# terminal the shell is on: stderr when that still is one (the prompt's own
+# stream, no open), else /dev/tty, opened per mark with its failure silenced (no
+# controlling terminal loses the mark, never writes it into a file). Builtins
+# only, no fork; the hot path is one isatty per mark. Only a shell whose stdout
+# WAS a terminal when this loaded does that: one started on pipes (a test's, an
+# embedder's) writes to stdout as it always did, and never reaches a terminal it
+# was not handed. The answer is kept across a live re-source, which runs inside
+# PROMPT_COMMAND, where an `exec >log` holds stdout.
+if [[ -z ${__aterm_osc_tty+x} ]]; then
+    if [[ -t 1 ]]; then __aterm_osc_tty=1; else __aterm_osc_tty=0; fi
+fi
+
 # OSC escape sequences
 __aterm_osc() {
-    printf '\033]%s\a' "$1"
+    if [[ -t 1 || ${__aterm_osc_tty-} != 1 ]]; then
+        printf '\033]%s\a' "$1"
+    elif [[ -t 2 ]]; then
+        printf '\033]%s\a' "$1" >&2
+    else
+        { printf '\033]%s\a' "$1" >/dev/tty; } 2>/dev/null || :
+    fi
 }
 
 # The re-key channel's check (the path is captured by the loader above).
@@ -751,6 +781,143 @@ case "$OSTYPE" in
 esac
 __aterm_win_cwd_from=
 __aterm_win_cwd_to=
+
+# ─── The line as typed (2026-10-16) ───
+#
+# The DEBUG trap fires before each SIMPLE command, and `$BASH_COMMAND` is that
+# one simple command, alias-expanded and re-printed. Taken at the line's first
+# trap it was the block's command and the tab title: `sleep 2; (exit 7)` was
+# recorded as `sleep 2`, `true && sleep 3 | cat` showed `true` while it ran,
+# `{ echo a; echo b; } | wc -l` was `wc -l`, and with Ubuntu's stock aliases a
+# plain `ls /` was `ls --color=auto /` (measured on bash 5.2.21). zsh's preexec
+# and fish's are handed the whole line. bash keeps it in one place: the history
+# entry it saved before running it. So the first trap takes `history 1` — when
+# the line WAS saved: the prompt marks `$HISTCMD` once nothing of the user's
+# runs before the line (a `history -a; history -c; history -r` in their
+# PROMPT_COMMAND moves it), and a line bash saved runs at that number, while one
+# it did not (ignorespace, ignoredups, `set +o history`, HISTSIZE=0) runs below
+# it. The mark is taken at the end of the prompt handler when PROMPT_COMMAND is
+# the trampoline alone (a scalar of the user's runs inside the handler), and by
+# THE LAST ELEMENT (below) when it is an array; anything else after the
+# trampoline leaves no mark. The first trap spends it, and the next prompt
+# clears it first. Without a mark, and where a fork costs too much, it is
+# `$BASH_COMMAND` as before.
+#
+# Reading the entry takes a command substitution: a fork (0.8 ms in a bash tab
+# on Linux) on the way from Enter to the command, except on bash 5.3+, whose
+# `${ ...; }` runs in the shell. Under Git Bash, MSYS2 and Cygwin a fork costs
+# tens of milliseconds, so there it stays `$BASH_COMMAND`.
+__aterm_hist_mark="${__aterm_hist_mark:-}"
+if [[ -n "$__aterm_win_posix" ]]; then
+    __aterm_history_line() { return 1; }
+elif (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 3) )); then
+    # Inside eval: an older bash cannot parse `${ ...; }` at all.
+    eval '__aterm_history_line() { REPLY=${ HISTTIMEFORMAT= builtin history 1; }; }'
+else
+    __aterm_history_line() { REPLY=$(HISTTIMEFORMAT= builtin history 1); }
+fi
+
+# bash before 5 is not judged by `$HISTCMD` alone: 3.2's read 1 at every prompt
+# and in every trap, whether bash saved the line or not (measured on 3.2.57,
+# macOS's /bin/bash), so an ignorespace line ran "at the mark" too and was
+# reported, and titled, as the entry before it. There the mark also keeps the
+# entry the list ends in, and the first trap takes the history entry only when
+# it is another: a line bash saved is a new entry, one it did not leaves the
+# list as the prompt saw it. That costs a fork at each prompt, on bash before 5
+# only (4.x was not measured, and is judged the same way).
+__aterm_hist_seen="${__aterm_hist_seen:-}"
+if (( BASH_VERSINFO[0] < 5 )); then
+    __aterm_hist_mark_take() {
+        local REPLY
+        __aterm_hist_mark=${HISTCMD-}
+        __aterm_hist_seen=
+        __aterm_history_line && __aterm_hist_seen=$REPLY
+    }
+else
+    __aterm_hist_mark_take() { __aterm_hist_mark=${HISTCMD-}; }
+fi
+
+# The command line the first trap reports, into REPLY: the history entry when
+# bash saved this line (see above), its number and the `*` of an edited entry
+# cut, else `$BASH_COMMAND`.
+__aterm_typed_line() {
+    local __aterm_mark=$__aterm_hist_mark __aterm_seen=${__aterm_hist_seen-}
+    __aterm_hist_mark=
+    __aterm_hist_seen=
+    if [[ "$__aterm_mark" == [1-9]* && "${HISTCMD-}" == "$__aterm_mark" ]] &&
+        __aterm_history_line && [[ "$REPLY" != "$__aterm_seen" ]]; then
+        REPLY="${REPLY#*[0-9][* ] }"
+        [[ -n "$REPLY" ]] && return 0
+    fi
+    REPLY="$BASH_COMMAND"
+}
+
+# ─── THE LAST ELEMENT (2026-10-16) — an array PROMPT_COMMAND ───
+#
+# bash 5.1+ runs every element of an array PROMPT_COMMAND, each as its own
+# top-level command, and aterm's trampoline is the first: the user's elements
+# ran after the prompt handler had lowered the in-prompt flag. The DEBUG trap
+# skips an element it fires for whole, but an element of several commands
+# (`__x=1; __y=2`, `history -a; history -c; history -r`) fires it for each, and
+# the first was taken for a typed line at every prompt, an empty Enter's too:
+# a block of its own, and the line typed next unreported, its slot taken. A
+# `$HISTCMD` mark taken in the handler was stale by then, too: the element that
+# re-reads the history file moved it, and an ignorespace line typed after it
+# was reported, and titled, as the line another tab had appended (measured on
+# bash 5.2.21).
+#
+# So the array ends in `__aterm_prompt_end`, after the user's elements: the
+# handler leaves the flag raised when this prompt's array ends in it, and it
+# lowers the flag and takes the mark. bash runs a copy of the array taken
+# before the first element, so the handler reads what this prompt runs; when
+# the array does not end in it (an element appended since, or the shell's
+# first prompt after a live upgrade), the handler lowers the flag as before,
+# leaves no mark, and puts it last for the next prompt. Only an armed one acts.
+# A Ctrl-C in a user element cuts the rest of the array, this element too, but
+# bash then runs PROMPT_COMMAND again before the prompt (measured), so the flag
+# is never left raised at one. bash before 5.1 runs only the first element of
+# an array, and gets none. Its name is the wiring's, never renamed, like the
+# trampoline's.
+__aterm_pc_arrays=0
+if (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1) )); then
+    __aterm_pc_arrays=1
+    # Whether PROMPT_COMMAND is an array of more than one element, so that
+    # bash runs more after the trampoline. Nounset-safe in this order: under
+    # `set -u` bash 5.2
+    # calls a scalar's `${#X[@]}` unbound and an empty array's `${X@a}`, and a
+    # scalar has no `[-1]`. Inside eval, as the history read above: bash 3.2
+    # has no `@a`.
+    eval '__aterm_pc_more() {
+        [[ -n ${PROMPT_COMMAND[@]+x} && ${PROMPT_COMMAND@a} == *a* ]] &&
+            (( ${#PROMPT_COMMAND[@]} > 1 ))
+    }'
+else
+    # One element runs (bash before 5.1 reads an array's first alone).
+    __aterm_pc_more() { return 1; }
+fi
+__aterm_prompt_end_armed=0
+
+__aterm_prompt_end() {
+    { local __aterm_flags=$-; set +xv; } 2>/dev/null
+    if (( __aterm_prompt_end_armed )); then
+        __aterm_prompt_end_armed=0
+        __aterm_hist_mark_take
+        __aterm_in_prompt_cmd=0
+    fi
+    __aterm_flags_put "$__aterm_flags"
+}
+
+# `__aterm_prompt_end` last in PROMPT_COMMAND (an array), and only there; the
+# user's elements keep their indices.
+__aterm_prompt_end_last() {
+    local __aterm_i
+    for __aterm_i in "${!PROMPT_COMMAND[@]}"; do
+        if [[ "${PROMPT_COMMAND[__aterm_i]}" == __aterm_prompt_end ]]; then
+            unset 'PROMPT_COMMAND[__aterm_i]'
+        fi
+    done
+    PROMPT_COMMAND+=(__aterm_prompt_end)
+}
 
 # Set __aterm_win_cwd_to to the Windows form of POSIX path $1 (a variable, not
 # output, so the per-prompt caller forks nothing for it).
@@ -941,14 +1108,16 @@ __aterm_preexec_run() {
         # at a prompt that was drawn before atpkg laid agents/ must already run
         # the twin (see "LIVE" above).
         __aterm_managed_path_live
-        __aterm_last_command="$BASH_COMMAND"
-        # Report command text for session memory (OSC 633;E)
+        # The line as typed (see above), not this one simple command of it.
         local REPLY
-        __aterm_encode_cmd "$BASH_COMMAND"
+        __aterm_typed_line
+        __aterm_last_command="$REPLY"
+        # Report command text for session memory (OSC 633;E)
+        __aterm_encode_cmd "$__aterm_last_command"
         __aterm_osc "633;E;${REPLY}${__aterm_id_suffix_str}"
         # Set tab title to running command (OSC 0).
         # Truncate to first 64 chars and strip control characters.
-        local cmd="${BASH_COMMAND:0:64}"
+        local cmd="${__aterm_last_command:0:64}"
         cmd="${cmd//[[:cntrl:]]/}"
         if [[ -z "${ATERM_DISABLE_PROMPT_TITLES:-}" ]]; then
             __aterm_osc "0;$cmd"
@@ -993,6 +1162,69 @@ __aterm_tty_repair() {
     return 0
 }
 
+# ─── THE START MARK and THE WARM HOLD (docs/DESIGN-warm-spare-2026-10-16.md) ───
+#
+# The zsh script's twins. Every fresh integrated bash signs ONE start record at
+# its first prompt, after every startup file: the rc folder ($HOME), its flags
+# and `cold` or `spare`, in one fork-free write to /dev/tty. bash runs nothing of
+# the user's prompt path before the trampoline (the wrapper sources this file
+# last, and it wraps PROMPT_COMMAND), so no hook is ever ahead of aterm's
+# (`pre:0`), and bash has no `sched` or periodic hooks. A cold shell leaves its
+# job count out (`j:-`: counting forks); a warm spare counts its jobs with one
+# fork, in its idle time.
+__aterm_start_mark() {
+    local REPLY="$HOME" __aterm_j=-
+    if [[ $1 == spare ]]; then
+        local __aterm_jl
+        __aterm_jl=$(jobs -p 2>/dev/null)
+        local -a __aterm_ja=($__aterm_jl)
+        __aterm_j=${#__aterm_ja[@]}
+    fi
+    case $REPLY in *[\\\;\ [:cntrl:]]*) __aterm_encode_cmd "$REPLY" ;; esac
+    printf '\033]633;P;AtermStartRc=%s%s\a\033]633;P;AtermStartFlags=pre:0,s:0,j:%s,r:0%s\a\033]633;P;AtermStart=%s%s\a' \
+        "$REPLY" "$__aterm_id_suffix_str" "$__aterm_j" "$__aterm_id_suffix_str" \
+        "$1" "$__aterm_id_suffix_str" >/dev/tty 2>/dev/null
+    return 0
+}
+
+# A WARM spare's hold, at the top of its first prompt handler: its startup files
+# have run unseen, and nothing of the prompt has. HISTFILE is unset while held, so
+# a discard's hang-up writes no history; released by `go`, it is put back and
+# the list read again as a cold start reads it (the sizes applied, then
+# `history -c; history -r`: bash 3.2 has no fork-free stat to tell whether the
+# file moved, and a reload of an unmoved file reads the same list), and
+# `$SECONDS` carries on from the rc's run.
+# Nothing here touches the tty, so what is typed before the release waits there
+# for readline.
+__aterm_spare_hold() {
+    local __aterm_rc=$SECONDS __aterm_go="" __aterm_n=0
+    local __aterm_hf_set=${HISTFILE+x} __aterm_hf=${HISTFILE-}
+    unset HISTFILE
+    __aterm_start_mark spare
+    while :; do
+        if IFS= read -r __aterm_go < "$__aterm_spare_fifo"; then
+            [[ $__aterm_go == go ]] && break
+        else
+            __aterm_n=$((__aterm_n + 1))
+            { [[ $__aterm_n -lt 50 ]] && [[ -p $__aterm_spare_fifo ]]; } || exit 0
+        fi
+    done 2>/dev/null
+    unset __aterm_spare_mode __aterm_spare_fifo
+    if [[ -n $__aterm_hf_set ]]; then
+        HISTFILE=$__aterm_hf
+        if [[ -f $HISTFILE ]]; then
+            # As bash's own load: the list's size, then the file cut to
+            # HISTFILESIZE (each assignment applies it), then the read.
+            [[ -z ${HISTSIZE+x} ]] || HISTSIZE=$HISTSIZE
+            [[ -z ${HISTFILESIZE+x} ]] || HISTFILESIZE=$HISTFILESIZE
+            history -c
+            history -r
+        fi
+    fi
+    SECONDS=$__aterm_rc
+    return 0
+}
+
 # PROMPT_COMMAND handler - runs before each prompt, from the loader's trampoline,
 # which hands it the status the command before it left, the user's flags with
 # XTRACE and VERBOSE already off, and the user's `$_`; the flags are the
@@ -1005,6 +1237,21 @@ __aterm_body_prompt_command() {
     local last_status=$1 __aterm_lastarg=${3-}
     __aterm_last_exit=$last_status
     __aterm_in_prompt_cmd=1
+    # No mark from an earlier prompt (see "The line as typed").
+    __aterm_hist_mark=
+    __aterm_hist_seen=
+    __aterm_prompt_end_armed=0
+
+    # The first prompt of a fresh load signs the start record; a warm spare
+    # waits there first (see THE WARM HOLD).
+    if [[ -n "${__aterm_start_pending:-}" ]]; then
+        unset __aterm_start_pending
+        if [[ "${__aterm_spare_mode:-}" == warm ]]; then
+            __aterm_spare_hold
+        else
+            __aterm_start_mark cold
+        fi
+    fi
 
     # A waiting re-key first, so every mark this prompt emits carries it.
     __aterm_rekey_check
@@ -1128,7 +1375,20 @@ __aterm_body_prompt_command() {
     # puts `$?` back after PROMPT_COMMAND — and after each element of an array
     # one, which run after it — so PS1 reads the command's (measured on bash
     # 3.2.57 and 5.2.37).
-    __aterm_in_prompt_cmd=0
+    # The number the next line runs at if bash saves it (see "The line as
+    # typed"): taken here, after a scalar of the user's, when nothing runs
+    # after this; with more elements of an array to run, by the last element
+    # (see THE LAST ELEMENT), which then lowers the flag.
+    if __aterm_pc_more; then
+        if [[ "${PROMPT_COMMAND[-1]}" == __aterm_prompt_end ]]; then
+            __aterm_prompt_end_armed=1
+        else
+            __aterm_prompt_end_last
+        fi
+    elif [[ "${PROMPT_COMMAND-}" == __aterm_prompt_command ]]; then
+        __aterm_hist_mark_take
+    fi
+    (( __aterm_prompt_end_armed )) || __aterm_in_prompt_cmd=0
     [[ -n ${2+x} ]] || __aterm_flags_put "$__aterm_flags"
 }
 
@@ -1277,6 +1537,12 @@ if (( __aterm_fresh_load )); then
     unset __aterm_tmp
 fi
 
+# The start record is owed once per shell, at its first prompt (see THE START
+# MARK): a fresh load only. A body re-sourced live, or a typed upgrade, owes none.
+if (( __aterm_fresh_load )); then
+    __aterm_start_pending=1
+fi
+
 # Install the integration. The trap goes LAST: the DEBUG trap is live from the
 # very next top-level command, and inside a sourced script that next command is
 # the remainder of THIS file — with the trap first, the PROMPT_COMMAND wiring
@@ -1286,6 +1552,10 @@ fi
 if (( __aterm_fresh_load )); then
     if (( __aterm_prompt_cmd_is_array )); then
         PROMPT_COMMAND=("__aterm_prompt_command" "${PROMPT_COMMAND[@]}")
+        # The first prompt's array already ends in it (see THE LAST ELEMENT).
+        if (( __aterm_pc_arrays )); then
+            PROMPT_COMMAND+=(__aterm_prompt_end)
+        fi
     else
         PROMPT_COMMAND="__aterm_prompt_command"
     fi

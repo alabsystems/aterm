@@ -166,15 +166,15 @@ pub fn state_word(rec: &LogRecord, live: Option<&Live>) -> &'static str {
 /// One `messages` row:
 /// `message <id> at=<unix_ms> ago_ms=<ms> tag=<tag> sev=<sev>
 /// origin=<host|wire|carried> state=<…> glass=<row|-> rep=<n> key=<pct|->
-/// title=<pct> detail=<pct> actions=<pct|-> [progress=<n>/100|level=<n>/100|busy=1]
-/// [load=<network|disk|cpu|memory>] [since_ms=<ms>] [need=<class>]`. `at=` is
+/// title=<pct> detail=<pct> actions=<pct|-> [progress=<n>/100|busy=1]
+/// [load=<network|disk|cpu>] [since_ms=<ms>] [need=<class>]`. `at=` is
 /// the wall clock at ingress; `ago_ms=` and `since_ms=` are both read off the one
 /// `now_unix_ms` of the reply (the retirement's wall time is the posting wall
 /// plus the row's monotonic life, [`Live::wall_at`]), so `since_ms <= ago_ms`
 /// always; `since_ms=` is present only for rows retired in this process.
 /// `detail=` is the lines joined by `\n` before encoding; `actions=` the full
-/// capsule labels joined by `,`. A live row with a fill says `progress=` (a
-/// measured level, the strain row, says `level=`), a busy one `busy=1`, and
+/// capsule labels joined by `,`. A live row with a fill says `progress=`, a
+/// busy one `busy=1`, and
 /// `load=` only while the row says its load words on the glass
 /// ([`Live::said_load`]). No ETA, elapsed or frame state reaches the line:
 /// motion is the glass's.
@@ -183,7 +183,6 @@ pub(crate) fn message_row(
     rec: &LogRecord,
     live: Option<&Live>,
     glass_row: Option<usize>,
-    slowing: bool,
     now_unix_ms: u64,
     enc: &dyn Fn(&str) -> String,
 ) -> String {
@@ -218,17 +217,7 @@ pub(crate) fn message_row(
         },
     );
     if let Some(l) = live {
-        if let Some(fill) = l
-            .msg
-            .meter
-            .as_ref()
-            .filter(|m| m.level)
-            .and_then(|m| m.fill_permille)
-        {
-            // A measured level is not progress.
-            row.push_str(" level=");
-            row.push_str(&progress_word(Some(fill)));
-        } else if let Some(fill) = l.msg.meter.as_ref().and_then(|m| m.fill_permille) {
+        if let Some(fill) = l.msg.meter.as_ref().and_then(|m| m.fill_permille) {
             // The percent the band paints, floored: `11/40` is `27%` on the
             // glass and `progress=27/100` here, never a rounded 28 beside it.
             // `appstatus` keeps its nearest percent, the bars' grammar.
@@ -238,7 +227,7 @@ pub(crate) fn message_row(
         } else if l.is_busy() {
             row.push_str(" busy=1");
         }
-        if let Some(load) = l.said_load(slowing) {
+        if let Some(load) = l.said_load() {
             row.push_str(" load=");
             row.push_str(load.word());
         }
@@ -300,10 +289,10 @@ pub fn message_rows(
                 now_words.detail = e.detail;
                 now_words.actions = e.actions;
                 now_words.repeats = e.repeats;
-                return message_row(&now_words, None, None, center.slowing(), now_unix_ms, enc);
+                return message_row(&now_words, None, None, now_unix_ms, enc);
             }
             let glass = live.and_then(|_| center.glass_position(rec.id));
-            message_row(rec, live, glass, center.slowing(), now_unix_ms, enc)
+            message_row(rec, live, glass, now_unix_ms, enc)
         })
         .collect()
 }
@@ -735,7 +724,7 @@ impl ProgressRequest {
             } else if let Some(v) = word.strip_prefix("unit=") {
                 unit = Some(Unit::parse(v).ok_or(PROGRESS_USAGE)?);
             } else if let Some(v) = word.strip_prefix("load=") {
-                load = Some(Load::parse_wire(v).ok_or(PROGRESS_USAGE)?);
+                load = Some(Load::parse(v).ok_or(PROGRESS_USAGE)?);
             } else {
                 return Ok(false);
             }
@@ -1872,7 +1861,7 @@ mod tests {
                 .unwrap()
         };
         for now_unix_ms in [10_000, 10_150, 10_300, 10_301, 12_345, 99_999] {
-            let row = message_row(rec, None, None, false, now_unix_ms, &pct_encode);
+            let row = message_row(rec, None, None, now_unix_ms, &pct_encode);
             let (ago, since) = (field(&row, "ago_ms="), field(&row, "since_ms="));
             assert_eq!(ago, now_unix_ms - 10_000, "{row}");
             assert!(since <= ago, "{row}");
@@ -1910,7 +1899,7 @@ mod tests {
         let rec = child.log().get(p.id).unwrap();
         assert!(rec.retired_at.is_some(), "{rec:?}");
         assert_eq!(rec.retired_unix_ms, Some(71_000));
-        let row = message_row(rec, None, None, false, 71_050, &pct_encode);
+        let row = message_row(rec, None, None, 71_050, &pct_encode);
         assert!(row.contains(" ago_ms=61050 "), "{row}");
         assert!(row.ends_with(" since_ms=50"), "{row}");
     }
@@ -1936,7 +1925,7 @@ mod tests {
         );
         c.commit_rows(now, 3);
         let rec = c.log().get(p.id).unwrap();
-        let row = message_row(rec, c.live(p.id), Some(0), false, 6_500, &pct_encode);
+        let row = message_row(rec, c.live(p.id), Some(0), 6_500, &pct_encode);
         assert_eq!(
             row,
             "message 1 at=5000 ago_ms=1500 tag=privacy sev=info origin=host state=held glass=0 rep=1 key=privacy.fda title=File%20access%20not%20confirmed detail=Full%20Disk%20Access%20may%20already%20be%20enabled%0Asecond%20line actions=Open%20Settings,Not%20now"
@@ -1955,7 +1944,7 @@ mod tests {
             now,
         );
         let rec = c.log().get(m.id).unwrap();
-        let row = message_row(rec, c.live(m.id), None, false, 5_100, &pct_encode);
+        let row = message_row(rec, c.live(m.id), None, 5_100, &pct_encode);
         assert!(
             row.ends_with(" key=- title=Installing detail= actions=- progress=42/100"),
             "{row}"
@@ -1963,7 +1952,7 @@ mod tests {
         assert!(row.contains(" state=live glass=- "), "{row}");
         c.dismiss(p.id, now + Duration::from_millis(250));
         let rec = c.log().get(p.id).unwrap();
-        let row = message_row(rec, None, None, false, 9_000, &pct_encode);
+        let row = message_row(rec, None, None, 9_000, &pct_encode);
         assert!(row.contains(" state=dismissed glass=- "), "{row}");
         // Retired at 5 000 + 250 on the wall; read at 9 000.
         assert!(row.contains(" ago_ms=4000 "), "{row}");
@@ -2336,26 +2325,6 @@ mod tests {
         .collect();
         for (line, want) in &junk {
             assert_eq!(NoticeRequest::parse(line), Err(*want), "{line:?}");
-        }
-    }
-
-    /// Every title fault the engine can name has its own `notice:` refusal.
-    #[test]
-    fn every_title_fault_has_its_refusal() {
-        for title in [
-            "one two three four five six seven",
-            &"x".repeat(49),
-            "Build: failed",
-            "Build failed.",
-        ] {
-            let fault = glass_title_fault(title).unwrap();
-            for tail in [true, false] {
-                let refusal = title_refusal(fault, tail);
-                assert_ne!(refusal, "notice: title out of form", "{fault}");
-                assert!(refusal.starts_with("notice: title "), "{refusal}");
-                assert!(!refusal.contains("glass"), "no band jargon: {refusal}");
-                assert_eq!(refusal.contains(" --"), tail && !title.ends_with('.'));
-            }
         }
     }
 

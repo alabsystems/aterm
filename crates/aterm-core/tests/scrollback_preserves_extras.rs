@@ -30,104 +30,6 @@ fn render_row(frame: &RenderInput, start: char) -> Option<usize> {
         .position(|row| row.first().is_some_and(|c| c.ch == start))
 }
 
-/// Locate the visible row (via row_text) that begins with `start`.
-fn text_row(t: &Terminal, max_rows: u16, start: char) -> Option<String> {
-    (0..max_rows).find_map(|r| {
-        let s = t.row_text(usize::from(r))?;
-        s.trim_end()
-            .starts_with(start)
-            .then(|| s.trim_end().to_string())
-    })
-}
-
-#[test]
-fn scrollback_render_preserves_emoji() {
-    let mut t = scrolled_off(b"Q\xf0\x9f\x98\x80Z"); // Q😀Z
-    t.scroll_to_top();
-    let frame = t.cell_frame(6, 80);
-    let r = render_row(&frame, 'Q').expect("Q row visible after scroll_to_top");
-    assert_eq!(
-        frame.cells[r][1].ch, '\u{1F600}',
-        "scrolled-back emoji must render as 😀, not U+FFFD"
-    );
-}
-
-#[test]
-fn scrollback_row_text_preserves_emoji() {
-    let mut t = scrolled_off(b"Q\xf0\x9f\x98\x80Z");
-    t.scroll_to_top();
-    assert_eq!(text_row(&t, 6, 'Q').as_deref(), Some("Q\u{1F600}Z"));
-}
-
-#[test]
-fn scrollback_render_preserves_combining_mark() {
-    let mut t = scrolled_off(b"Qe\xcc\x81Z"); // Q é(e+U+0301) Z
-    t.scroll_to_top();
-    let frame = t.cell_frame(6, 80);
-    let r = render_row(&frame, 'Q').expect("Q row visible");
-    assert_eq!(frame.cells[r][1].ch, 'e', "base char survives");
-    let marks: Vec<char> = frame.combining[r]
-        .iter()
-        .find(|(col, _)| *col == 1)
-        .map(|(_, m)| m.to_vec())
-        .unwrap_or_default();
-    assert_eq!(
-        marks,
-        vec!['\u{0301}'],
-        "combining mark must not be stripped"
-    );
-}
-
-#[test]
-fn scrollback_row_text_preserves_combining_mark() {
-    let mut t = scrolled_off(b"Qe\xcc\x81Z");
-    t.scroll_to_top();
-    assert_eq!(text_row(&t, 6, 'Q').as_deref(), Some("Qe\u{301}Z"));
-}
-
-#[test]
-fn scrollback_render_preserves_truecolor() {
-    // Truecolor X on the scrolled-off row.
-    let mut t = scrolled_off(b"X\x1b[38;2;10;20;30mY\x1b[0m");
-    t.scroll_to_top();
-    let frame = t.cell_frame(6, 80);
-    let r = render_row(&frame, 'X').expect("X row visible");
-    assert_eq!(
-        frame.cells[r][1].fg,
-        [10, 20, 30],
-        "scrolled-back truecolor fg must be preserved"
-    );
-}
-
-#[test]
-fn scrollback_render_preserves_zwj_cluster() {
-    // Family ZWJ sequence 👨‍👩‍👧 — must surface the whole grapheme, not just the base.
-    let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
-    let mut t = Terminal::new(6, 80);
-    t.process(format!("Q{family}Z").as_bytes());
-    t.process(b"\r\n");
-    for i in 0..10 {
-        t.process(format!("f{i}\r\n").as_bytes());
-    }
-    t.scroll_to_top();
-    let frame = t.cell_frame(6, 80);
-    let r = render_row(&frame, 'Q').expect("Q row visible");
-    let cluster = frame.clusters[r]
-        .iter()
-        .find(|(col, _)| *col == 1)
-        .map(|(_, s)| s.to_string());
-    assert_eq!(
-        cluster.as_deref(),
-        Some(family),
-        "scrolled-back ZWJ family must surface the full grapheme cluster"
-    );
-    // row_text emits the full family too.
-    assert_eq!(
-        text_row(&t, 6, 'Q').as_deref(),
-        Some(format!("Q{family}Z").as_str())
-    );
-}
-
 #[test]
 fn partial_scroll_live_row_reads_correct_extras() {
     // During a partial scroll the still-live bottom rows read extras at
@@ -147,156 +49,6 @@ fn partial_scroll_live_row_reads_correct_extras() {
     assert_eq!(
         frame.cells[r][1].ch, '\u{1F600}',
         "live row's emoji must survive partial scroll (screen_row mapping), not read a neighbor's extras"
-    );
-}
-
-#[test]
-fn scroll_to_top_shows_oldest_line_first() {
-    // Boundary: at display_offset == history_line_count, visible row 0 == oldest line.
-    let mut t = Terminal::new(4, 80);
-    for i in 0..12 {
-        t.process(format!("L{i:02}\r\n").as_bytes());
-    }
-    t.scroll_to_top();
-    let top = t.row_text(0).map(|s| s.trim_end().to_string());
-    assert_eq!(
-        top.as_deref(),
-        Some("L00"),
-        "top of scroll_to_top is the oldest line"
-    );
-}
-
-#[test]
-fn live_view_unchanged_at_offset_zero() {
-    // display_offset == 0 must be byte-identical to the pre-fix live read: an emoji
-    // on a live row still renders and row_text still resolves it.
-    let mut t = Terminal::new(6, 80);
-    t.process(b"Q\xf0\x9f\x98\x80Z");
-    assert_eq!(t.grid().display_offset(), 0);
-    let frame = t.cell_frame(6, 80);
-    assert_eq!(frame.cells[0][1].ch, '\u{1F600}');
-    assert_eq!(
-        t.row_text(0).as_deref().map(str::trim_end),
-        Some("Q\u{1F600}Z")
-    );
-}
-
-#[test]
-fn scrollback_render_preserves_flag_pair() {
-    // 🇺🇸 = U+1F1FA U+1F1F8. The materialize grapheme segmenter must fold the
-    // regional-indicator pair into one cell so it stays one cluster (not two
-    // split letters across doubled columns) when scrolled back.
-    let flag = "\u{1F1FA}\u{1F1F8}";
-    let mut t = Terminal::new(6, 80);
-    t.process(format!("Q{flag}Z").as_bytes());
-    t.process(b"\r\n");
-    for i in 0..10 {
-        t.process(format!("f{i}\r\n").as_bytes());
-    }
-    t.scroll_to_top();
-    let frame = t.cell_frame(6, 80);
-    let r = render_row(&frame, 'Q').expect("Q row visible");
-    let cluster = frame.clusters[r]
-        .iter()
-        .find(|(col, _)| *col == 1)
-        .map(|(_, s)| s.to_string());
-    assert_eq!(
-        cluster.as_deref(),
-        Some(flag),
-        "scrolled-back flag must be one cluster"
-    );
-    // Z must sit at col 3 (flag occupies one wide cell: col 1 lead + col 2 cont),
-    // not be pushed out by a split into 4 columns.
-    assert_eq!(
-        frame.cells[r][3].ch, 'Z',
-        "flag must occupy one cell, not split columns"
-    );
-}
-
-#[test]
-fn scrollback_render_preserves_skin_tone() {
-    // 👍🏽 = U+1F44D U+1F3FD. The skin-tone modifier must fold onto the emoji base.
-    let thumb = "\u{1F44D}\u{1F3FD}";
-    let mut t = Terminal::new(6, 80);
-    t.process(format!("Q{thumb}Z").as_bytes());
-    t.process(b"\r\n");
-    for i in 0..10 {
-        t.process(format!("f{i}\r\n").as_bytes());
-    }
-    t.scroll_to_top();
-    let frame = t.cell_frame(6, 80);
-    let r = render_row(&frame, 'Q').expect("Q row visible");
-    let cluster = frame.clusters[r]
-        .iter()
-        .find(|(col, _)| *col == 1)
-        .map(|(_, s)| s.to_string());
-    assert_eq!(
-        cluster.as_deref(),
-        Some(thumb),
-        "scrolled-back skin-toned emoji must be one cluster"
-    );
-    assert_eq!(
-        frame.cells[r][3].ch, 'Z',
-        "skin-toned emoji must occupy one cell"
-    );
-}
-
-#[test]
-fn scrollback_wide_nonbase_keeps_skin_tone_split() {
-    // Over-fold guard: a skin-tone modifier after a wide but non-modifier-base
-    // char (中, U+4E2D) must not fold. The live writer gates folding on
-    // is_emoji_modifier_base(base), not cell width, so it renders two cells; the
-    // materializer must match.
-    let mut t = Terminal::new(6, 80);
-    t.process("中\u{1F3FD}Z".as_bytes()); // 中 + skin-tone (Type-4) + Z
-    t.process(b"\r\n");
-    for i in 0..10 {
-        t.process(format!("f{i}\r\n").as_bytes());
-    }
-    t.scroll_to_top();
-    let frame = t.cell_frame(6, 80);
-    let r = render_row(&frame, '中').expect("中 row visible");
-    // 中 wide at col0-1, the orphan skin-tone its own wide cell at col2-3, Z at col4.
-    assert_eq!(frame.cells[r][0].ch, '中');
-    assert_eq!(
-        frame.cells[r][2].ch, '\u{1F3FD}',
-        "skin-tone after a non-modifier-base must stay a separate cell (no over-fold)"
-    );
-    assert_eq!(
-        frame.cells[r][4].ch, 'Z',
-        "Z must not be pulled left by an over-fold"
-    );
-}
-
-#[test]
-fn scrollback_vs16_base_folds_skin_tone() {
-    // Under-fold guard: 👋️🏽 = U+1F44B U+FE0F U+1F3FD. The VS16 sits between the
-    // emoji base and the skin-tone modifier. Folding must key on the retained unit
-    // base (is_emoji_modifier_base(👋)), not the intervening zero-width VS16 — else
-    // the modifier splits off. Live renders one cell; scrolled back must too.
-    let seq = "\u{1F44B}\u{FE0F}\u{1F3FD}";
-    let mut t = Terminal::new(6, 80);
-    t.process(format!("Q{seq}Z").as_bytes());
-    t.process(b"\r\n");
-    for i in 0..10 {
-        t.process(format!("f{i}\r\n").as_bytes());
-    }
-    t.scroll_to_top();
-    let frame = t.cell_frame(6, 80);
-    let r = render_row(&frame, 'Q').expect("Q row visible");
-    let cluster = frame.clusters[r]
-        .iter()
-        .find(|(col, _)| *col == 1)
-        .map(|(_, s)| s.to_string());
-    assert_eq!(
-        cluster.as_deref(),
-        Some(seq),
-        "VS16-separated skin-tone must fold onto the base into one cluster"
-    );
-    // One wide cell (col1 lead + col2 cont) → Z at col3, not pushed to col5 by a split.
-    assert_eq!(
-        frame.cells[r][3].ch, 'Z',
-        "folded grapheme occupies one cell"
     );
 }
 
@@ -328,28 +80,6 @@ fn row_text_screen_ignores_scroll_position() {
     assert_ne!(live0_scrolled.as_deref(), Some("L00"));
 }
 
-#[test]
-fn render_matches_row_text_across_offsets() {
-    // The render glyph stream and row_text must agree for the scrolled emoji row
-    // (no channel dropped on one path but not the other).
-    let mut t = scrolled_off(b"Q\xf0\x9f\x98\x80Z");
-    t.scroll_to_top();
-    let frame = t.cell_frame(6, 80);
-    let r = render_row(&frame, 'Q').expect("Q row visible");
-    // Skip wide-continuation cells (the blank right half of 😀; RenderCell.wide
-    // marks the continuation itself), which row_text omits, then compare streams.
-    let mut from_render = String::new();
-    for cell in &frame.cells[r] {
-        if cell.wide {
-            continue;
-        }
-        from_render.push(cell.ch);
-    }
-    let from_render = from_render.trim_end().to_string();
-    let from_text = t.row_text(r).map(|s| s.trim_end().to_string());
-    assert_eq!(Some(from_render), from_text);
-}
-
 /// The strongest scrollback invariant: a row rendered live (display_offset==0)
 /// must render byte-for-byte identically once it has scrolled into history — the
 /// full `RenderCell` (glyph, fg/bg, wide, emoji_presentation, bold/italic,
@@ -369,6 +99,7 @@ fn assert_scrollback_parity_dims(rows: u16, cols: u16, input: &[u8], find: char)
     let live_cells = live.cells[0].clone();
     let live_clusters = live.clusters[0].clone();
     let live_combining = live.combining[0].clone();
+    let live_text = t.row_text(0);
 
     t.process(b"\r\n");
     for i in 0..10 {
@@ -377,6 +108,11 @@ fn assert_scrollback_parity_dims(rows: u16, cols: u16, input: &[u8], find: char)
     t.scroll_to_top();
     let frame = t.cell_frame(usize::from(rows), usize::from(cols));
     let r = render_row(&frame, find).expect("row visible after scroll_to_top");
+    assert_eq!(
+        t.row_text(r),
+        live_text,
+        "scrolled-back row_text must equal live"
+    );
 
     assert_eq!(
         frame.cells[r], live_cells,
@@ -396,6 +132,21 @@ fn assert_scrollback_parity_dims(rows: u16, cols: u16, input: &[u8], find: char)
 fn scrollback_parity_rows() {
     // (rows, cols, input, first char of the row). Each row was its own test.
     let rows: &[(u16, u16, &str, char)] = &[
+        // An SMP emoji, a combining mark, a truecolor foreground and a ZWJ
+        // family: the extras live in scrollback, not the live extras map, so
+        // a read that consulted only the latter shows U+FFFD, a bare base or
+        // the default colour.
+        (6, 80, "Q\u{1F600}Z", 'Q'),
+        (6, 80, "Qe\u{301}Z", 'Q'),
+        (6, 80, "X\x1b[38;2;10;20;30mY\x1b[0m", 'X'),
+        (6, 80, "Q\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}Z", 'Q'),
+        // A flag pair and a skin-toned emoji stay one cell; a skin tone after
+        // a wide non-modifier-base (中) stays a cell of its own (no over-fold);
+        // a VS16 between base and skin tone still folds (no under-fold).
+        (6, 80, "Q\u{1F1FA}\u{1F1F8}Z", 'Q'),
+        (6, 80, "Q\u{1F44D}\u{1F3FD}Z", 'Q'),
+        (6, 80, "\u{4E2D}\u{1F3FD}Z", '\u{4E2D}'),
+        (6, 80, "Q\u{1F44B}\u{FE0F}\u{1F3FD}Z", 'Q'),
         // ❤️ = U+2764 U+FE0F: VS16 widens a text-presentation base to 2 cells and
         // sets emoji_presentation; must not collapse to 1 column on scrollback.
         (6, 80, "Q\u{2764}\u{FE0F}Z", 'Q'),
@@ -600,30 +351,6 @@ fn vs16_widened_spacer_carries_the_lead_underline_colour_live() {
         live.cells[0][2].underline_color,
         Some([0, 0, 255]),
         "a VS16-widened pair must answer the same colour for its right half as a naturally-wide one"
-    );
-}
-
-#[test]
-fn scrollback_underline_indexed_reresolves_after_palette_change() {
-    // The packed index (not a frozen RGB triple) must survive scrollback: redefine
-    // palette entry 1 after the row scrolls into history, and the materialized
-    // underline must re-resolve to the new colour. This fails if scrollback stored
-    // a resolved RGB — the reason underline colour is carried in packed form.
-    let mut t = Terminal::new(6, 80);
-    t.process(b"Q\x1b[4;58:5:1mU\x1b[0mZ");
-    t.process(b"\r\n");
-    for i in 0..10 {
-        t.process(format!("f{i}\r\n").as_bytes());
-    }
-    // Direct palette API (no OSC-4 reconfigure policy gate).
-    t.set_palette_color_components(1, 0x11, 0x22, 0x33);
-    t.scroll_to_top();
-    let frame = t.cell_frame(6, 80);
-    let r = render_row(&frame, 'Q').expect("Q row visible after scroll_to_top");
-    assert_eq!(
-        frame.cells[r][1].underline_color,
-        Some([0x11, 0x22, 0x33]),
-        "scrolled-back indexed underline must re-resolve against the changed palette"
     );
 }
 

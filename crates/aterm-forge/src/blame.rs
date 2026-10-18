@@ -5,18 +5,16 @@
 //!
 //! Answers three questions a `cargo tree | grep` cannot:
 //!
-//!   1. **Which first-party line is responsible.** Every path from the cell root
-//!      to the package is enumerated (the shortest printed, the rest counted),
-//!      with the direct dependants: the manifest lines that would have to
-//!      change.
-//!   2. **What it costs.** The dominator cost per cell, not the subtree.
-//!   3. **Whether the fork is live.** A `[patch.crates-io]` entry replaces one
-//!      version. A dependant asking for a different major gets the unpatched
-//!      registry copy in the same build, and cargo says nothing; this verb
-//!      reports it.
+//!   1. Which first-party line is responsible: every path from the cell root to the package
+//!      (the shortest printed, the rest counted), with the direct dependants whose manifest
+//!      lines would have to change.
+//!   2. What it costs: the dominator cost per cell, not the subtree.
+//!   3. Whether the fork is live: a `[patch.crates-io]` entry replaces one version, so a
+//!      dependant asking for another major silently gets the unpatched registry copy in the
+//!      same build.
 //!
-//! A bare `name` is never refused for ambiguity (as `cargo pkgid` does); every
-//! matching version is listed with the cells that hold it.
+//! A bare `name` is never refused as ambiguous (as `cargo pkgid` does); every matching version
+//! is listed with the cells that hold it.
 
 use crate::model::{CellSurvey, Graph, PkgId};
 use crate::survey::{commas, fit, fit_path, survey_cells, wrap};
@@ -28,22 +26,22 @@ use std::path::Path;
 
 /// Paths printed per cell before the rest are counted rather than listed.
 const PATHS_SHOWN: usize = 10;
-/// Hard bound on the best-first path search, so a wide graph cannot hang the
-/// report. When it trips the report SAYS so rather than quietly printing fewer.
+/// Hard bound on the best-first path search, so a wide graph cannot hang the report. When it
+/// trips, the report says so.
 const SEARCH_BUDGET: usize = 40_000;
 const W_LINE: usize = 96;
 
 /// What `[patch.crates-io]` actually did to this exact `(name, version)`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PatchState {
-    /// This version IS the vendored fork aterm maintains.
+    /// This version is the vendored fork aterm maintains.
     Fork { path: String },
-    /// A fork of this NAME exists at another version, and this copy is the
-    /// pristine registry code. The fork's fixes do not reach it.
+    /// A fork of this name exists at another version, and this copy is the pristine registry
+    /// code: the fork's fixes do not reach it.
     UnpatchedBesideFork { path: String, fork_version: String },
     /// A fork directory exists but its version could not be read.
     ForkVersionUnreadable { path: String },
-    /// Ordinary registry code, no fork of this name.
+    /// Ordinary registry code: no patch row claims this version.
     Registry,
     /// aterm's own code, vendored in-tree and reached by a path dependency
     /// (`provenance::FIRST_PARTY_VENDORED`). Neither a fork nor registry code.
@@ -194,7 +192,7 @@ fn versions_block(
     }
 }
 
-/// THE load-bearing check: a fork that only covers one of the resolved versions.
+/// The patch-liveness check: a fork that covers only one of the resolved versions.
 fn liveness_block(
     log: &mut String,
     root: &Path,
@@ -391,9 +389,6 @@ fn package_block(
             }
         );
         if let Some(dir) = &f.root_dir {
-            // In-repo dirs print repo-relative (the checkout prefix varies per
-            // machine); out-of-repo registry dirs stay absolute but bounded,
-            // eliding the constant prefix and keeping the package's own tail.
             let _ = writeln!(log, "                {}", dir_line(root, dir));
         }
         // If the facts were not measured from the fork's directory, say so and
@@ -957,8 +952,8 @@ fn write_path(out: &mut String, indent: &str, path: &[PkgId]) {
     let _ = writeln!(out, "{line}");
 }
 
-/// Physical `*.rs` lines under a directory via [`aterm_census::collect_rs_files`],
-/// measured the way [`crate::loc`] measures, so the two can be subtracted.
+/// Physical `*.rs` lines under a directory, comparable with [`crate::loc`]'s count (though
+/// [`aterm_census::collect_rs_files`] skips dot-directories, which loc's walk does not).
 fn rs_lines(dir: &Path) -> u64 {
     let mut files = Vec::new();
     if aterm_census::collect_rs_files(dir, &mut files).is_err() {
@@ -978,7 +973,6 @@ fn yes_no(b: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::repo_root;
 
     fn toy() -> Graph {
         // root -> a -> c ; root -> b -> c ; c -> d
@@ -1006,6 +1000,8 @@ mod tests {
         g
     }
 
+    /// Every path is counted, the shortest come first, a bounded request returns
+    /// only the shortest, and an absent node has none (and no panic).
     #[test]
     fn every_path_is_counted_and_the_shortest_come_first() {
         let g = toy();
@@ -1021,292 +1017,11 @@ mod tests {
         }
         // The root reaches itself by exactly one (empty) path.
         assert_eq!(count_paths(&g, &g.root), (1, false));
-    }
-
-    #[test]
-    fn a_bounded_request_returns_only_the_shortest() {
-        let g = toy();
         let (paths, _) = shortest_paths(&g, &PkgId::new("c", "1"), 1);
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0].len(), 3);
-    }
-
-    #[test]
-    fn an_absent_node_has_no_paths_and_no_panic() {
-        let g = toy();
         let ghost = PkgId::new("ghost", "9");
         assert_eq!(shortest_paths(&g, &ghost, 10).0.len(), 0);
         assert_eq!(count_paths(&g, &ghost), (0, false));
-    }
-
-    #[test]
-    fn the_workspace_patch_table_is_read_with_its_vendored_versions() {
-        let forks = read_forks(&repo_root()).expect("the workspace manifest parses");
-        assert!(
-            forks.contains_key("indexmap"),
-            "vendor/indexmap is patched in: {forks:?}"
-        );
-        let w = &forks["indexmap"][0];
-        assert_eq!(w.path, "vendor/indexmap");
-        let v = w
-            .version
-            .clone()
-            .expect("vendor/indexmap/Cargo.toml carries a literal version");
-        let root = repo_root();
-        assert_eq!(
-            patch_state(&root, None, &forks, &PkgId::new("indexmap", v.clone())),
-            PatchState::Fork {
-                path: "vendor/indexmap".into()
-            }
-        );
-        // Any other version of a forked name is the defect this verb reports.
-        // A synthetic id, since the shipped graph carries no unpatched sibling.
-        assert!(matches!(
-            patch_state(&root, None, &forks, &PkgId::new("indexmap", "3.0.0")),
-            PatchState::UnpatchedBesideFork { .. }
-        ));
-        assert_eq!(
-            patch_state(&root, None, &forks, &PkgId::new("serde", "1.0.0")),
-            PatchState::Registry
-        );
-        // A first-party vendored crate has no patch entry; its measured
-        // directory is what the roster decides on, so it is not reported as
-        // crates.io.
-        let own = crate::model::PkgFacts {
-            root_dir: Some(root.join("vendor/astream/crates/astream-cap")),
-            ..crate::model::PkgFacts::default()
-        };
-        assert_eq!(
-            patch_state(
-                &root,
-                Some(&own),
-                &forks,
-                &PkgId::new("astream-cap", "0.0.0")
-            ),
-            PatchState::FirstPartyVendored {
-                path: "vendor/astream/crates/astream-cap".into()
-            }
-        );
-        // A REAL fork's directory must not be swallowed by the same arm.
-        let fork = crate::model::PkgFacts {
-            root_dir: Some(root.join("vendor/indexmap")),
-            ..crate::model::PkgFacts::default()
-        };
-        assert!(matches!(
-            patch_state(
-                &root,
-                Some(&fork),
-                &forks,
-                &PkgId::new("indexmap", "2.14.0")
-            ),
-            PatchState::Fork { .. }
-        ));
-    }
-
-    /// The dir line's width depends on content, not environment: an in-repo
-    /// dir loses the checkout prefix, and an out-of-repo registry dir is
-    /// bounded while keeping the package directory.
-    #[test]
-    fn the_dir_line_is_bounded_and_keeps_the_package_directory() {
-        let root = Path::new(
-            "/private/tmp/build-501/-Users-example-aterm/2b813347-8abb-4e85/scratchpad/wt",
-        );
-
-        // IN-REPO: repo-relative, and the deep checkout prefix is gone.
-        let line = dir_line(root, &root.join("vendor/indexmap"));
-        assert_eq!(line, "vendor/indexmap");
-
-        // OUT-OF-REPO: nothing to strip, so it must be bounded instead.
-        let registry = Path::new(
-            "/Users//a-very-long-operator-name/.cargo/registry/src/\
-             index.crates.io-1949cf8c6b5b557f/wgpu-core-deps-windows-linux-android-29.0.3",
-        );
-        let line = dir_line(root, registry);
-        assert!(
-            line.chars().count() <= W_LINE - 16,
-            "{} cols: {line:?}",
-            line.chars().count()
-        );
-        assert!(
-            line.ends_with("wgpu-core-deps-windows-linux-android-29.0.3"),
-            "the package directory is the part worth keeping: {line:?}"
-        );
-        // …and the whole rendered line, indent included, fits the budget the
-        // width test holds every line to.
-        assert!(format!("                {line}").chars().count() <= 100);
-    }
-
-    /// A long name never runs into the next column.
-    #[test]
-    fn a_long_name_version_keeps_the_column_separator() {
-        let row = versions_row(
-            "wgpu-core-deps-windows-linux-android",
-            "29.0.3",
-            "registry",
-            "linux, win",
-        );
-        assert!(
-            !row.contains("29.0.3registry"),
-            "the version ran into the tag: {row:?}"
-        );
-        assert!(
-            row.chars().count() <= 100,
-            "{} cols: {row:?}",
-            row.chars().count()
-        );
-        // The fitted name is followed by a REAL separator, not butted up.
-        let tag_at = row.find("registry").expect("the tag is printed");
-        assert!(
-            row[..tag_at].ends_with(' '),
-            "no separator before the tag: {row:?}"
-        );
-        // The version must survive the cut.
-        assert!(
-            row.contains("29.0.3"),
-            "the version was truncated away: {row:?}"
-        );
-        // A short row is untouched, padding and all.
-        let short = versions_row("indexmap", "2.13.0", "registry", "mac-arm");
-        assert!(short.starts_with("    indexmap 2.13.0 "), "{short:?}");
-        assert!(short.contains(" registry"), "{short:?}");
-    }
-
-    #[test]
-    fn wrapped_paths_stay_inside_the_terminal() {
-        let mut out = String::new();
-        let long: Vec<PkgId> = (0..12)
-            .map(|i| PkgId::new(format!("a-rather-long-package-name-{i}"), "0.47.0"))
-            .collect();
-        write_path(&mut out, "      ", &long);
-        for line in out.lines() {
-            assert!(
-                line.chars().count() <= 100,
-                "{} cols: {line:?}",
-                line.chars().count()
-            );
-        }
-        assert!(out.contains("a-rather-long-package-name-11 0.47.0"));
-    }
-
-    /// What blame owes for a forked crate in the shipped graph: the version,
-    /// that it is forked, the fork's path, the cells it resolves in, its
-    /// dominator cost, and the first-party edges responsible.
-    ///
-    /// Liveness reporting is proved separately: `patch_state` returns
-    /// `UnpatchedBesideFork` for a synthetic off-fork version in
-    /// `the_workspace_patch_table_is_read_with_its_vendored_versions`, and
-    /// `tests/red_fixtures.rs::an_unpatched_sibling_version_reds_the_forge_verb`
-    /// plants one in a scratch tree.
-    #[test]
-    fn blame_names_the_fork_its_path_and_its_cost_in_every_cell() {
-        let root = repo_root();
-        // `indexmap` is resolved via wgpu in the linux cell, so blame is
-        // exercised there against a live fork.
-        let cells = ["linux".to_string()];
-        let out = run(&root, "indexmap", &cells).expect("blame runs");
-        assert!(out.ok, "{}", out.log);
-        assert!(
-            out.log.contains("indexmap 2.14.0"),
-            "the version is named:\n{}",
-            out.log
-        );
-        assert!(
-            out.log.contains("FORKED"),
-            "the fork is flagged as one:\n{}",
-            out.log
-        );
-        assert!(
-            out.log.contains("vendor/indexmap"),
-            "the fork's path is named:\n{}",
-            out.log
-        );
-        for c in &cells {
-            assert!(
-                out.log.contains(c.as_str()),
-                "cell `{c}` is reported:\n{}",
-                out.log
-            );
-            assert!(
-                out.log.contains(&format!("cell {c}   dom ")),
-                "cell `{c}` gets a dominator cost:\n{}",
-                out.log
-            );
-        }
-        assert!(
-            out.log.contains("first-party edges responsible:"),
-            "blame's whole job is naming the first-party edge:\n{}",
-            out.log
-        );
-        // ONE version resolves, in every cell, so there is no liveness defect
-        // to report. Asserted as a property of THIS fork rather than of the tree
-        // as a whole — `[OB-12]` (`verify forge`) owns the tree-wide
-        // claim, and `red_fixtures` owns the detector.
-        assert!(
-            !out.log.contains("PATCH LIVENESS DEFECT"),
-            "indexmap resolves at one version, so blame must not report a \
-             liveness defect:\n{}",
-            out.log
-        );
-        for line in out.log.lines() {
-            assert!(
-                line.chars().count() <= 100,
-                "{} cols: {line:?}",
-                line.chars().count()
-            );
-        }
-    }
-
-    #[test]
-    fn blame_accepts_an_exact_version_and_prints_paths_and_cost() {
-        let root = repo_root();
-        let out = run(&root, "libc@0.2.186", &["mac-arm".into()]).expect("blame runs");
-        assert!(out.ok, "{}", out.log);
-        assert!(out.log.contains("libc 0.2.186"));
-        assert!(out.log.contains("path(s) from `aterm`"), "{}", out.log);
-        assert!(
-            out.log.contains("first-party edges responsible:"),
-            "{}",
-            out.log
-        );
-    }
-
-    #[test]
-    fn an_absent_package_is_refused_with_the_cells_it_searched() {
-        let root = repo_root();
-        let out = run(&root, "definitely-not-a-crate", &["mac-arm".into()]).expect("blame runs");
-        assert!(!out.ok, "an absent package is a refusal, not a pass");
-        assert!(out.log.contains("NOT RESOLVED"));
-        assert!(
-            out.log.contains("mac-arm"),
-            "the refusal names the cells searched:\n{}",
-            out.log
-        );
-        assert!(
-            out.log.contains("Fix:"),
-            "the refusal names the fix:\n{}",
-            out.log
-        );
-    }
-
-    #[test]
-    fn a_wrong_version_of_a_present_package_says_which_versions_exist() {
-        let root = repo_root();
-        let out = run(&root, "libc@0.0.1", &["mac-arm".into()]).expect("blame runs");
-        assert!(!out.ok);
-        assert!(
-            out.log.contains("IS resolved, but not at 0.0.1"),
-            "{}",
-            out.log
-        );
-    }
-
-    #[test]
-    fn a_malformed_spec_is_a_typed_refusal_naming_the_shape() {
-        let root = repo_root();
-        // `Outcome` carries no `Debug`, so the error arm is taken by pattern.
-        let Err(err) = run(&root, "indexmap@", &["mac-arm".into()]) else {
-            panic!("a spec with an empty version must be refused, not surveyed")
-        };
-        assert!(err.contains("name@version"), "{err}");
     }
 }

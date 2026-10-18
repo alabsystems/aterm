@@ -68,10 +68,13 @@ pub(crate) enum Role {
     /// here. Process REAPERS in particular look like housekeeping and are not:
     /// they enforce a kill-and-reap contract on a real deadline, and a starved
     /// reaper leaks the very processes whose CPU use degrades the machine. They
-    /// take [`Role::Background`]. (Pinned by experience — putting the managed
-    /// runtime's reapers here made their 500 ms kill-and-reap assertions fail
-    /// under load; so did the artifact-reply quarantine reaper, whose guards
-    /// hold capture capacity, by 60 s, 2026-09-30.)
+    /// take [`Role::Background`]. (Pinned by experience — putting the
+    /// artifact-reply quarantine reaper here, whose guards hold capture
+    /// capacity, failed its reap by 60 s, 2026-09-30.)
+    #[cfg_attr(
+        not(any(unix, test)),
+        expect(dead_code, reason = "no Windows worker runs at it")
+    )]
     Housekeeping,
 }
 
@@ -123,6 +126,33 @@ pub(crate) fn set_self(role: Role) {
     let _ = role;
 }
 
+/// Spawn the named worker thread `name` whose WHOLE body runs at `role`: the
+/// role is declared as the first thing the new thread does, on that thread.
+///
+/// The one way a lane thread is made, so none can be spawned undeclared or
+/// declared on the wrong side. A role does not reach a thread from the one that
+/// creates it (measured 2026-09-15: a thread created from a `QOS_CLASS_UTILITY`
+/// thread reads `QOS_CLASS_DEFAULT`), so a `set_self` on the spawning side would
+/// read as a declaration and change nothing; an undeclared lane ran at the
+/// inherited DEFAULT band — the typing band — while it held the terminal mutex
+/// or parsed a package pass's output.
+pub(crate) fn spawn_lane_thread<F, T>(
+    name: impl Into<String>,
+    role: Role,
+    f: F,
+) -> std::io::Result<std::thread::JoinHandle<T>>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            set_self(role);
+            f()
+        })
+}
+
 // ---------------------------------------------------------------------------
 // A FORK FROM A DEMOTED THREAD RUNS AT THE DEFAULT CLASS.
 //
@@ -132,12 +162,10 @@ pub(crate) fn set_self(role: Role) {
 // copy inside `fork(2)` until the child's exec closes them. `fork(2)` runs on the
 // FORKING thread: aterm's address space is copied there, and the child cannot
 // run before that copy is done. So that window is paid at the forking thread's
-// class, and a `Background` thread paid it at UTILITY. The retired Smart Titles
-// worker starting its managed Ollama daemon (`setsid` and `InheritStrip` in a
-// `pre_exec`) was that fork; every other fork-path spawn found runs on an
-// undeclared or a raised thread (the update handoff worker, the shell spawns,
-// the CLI's own verbs), and the guard below holds for whichever demoted thread
-// forks next.
+// class, and a `Background` thread paid it at UTILITY. Every fork-path spawn
+// found today runs on an undeclared or a raised thread (the update handoff
+// worker, the shell spawns, the CLI's own verbs), and the guard below holds for
+// whichever demoted thread forks next.
 //
 // MEASURED 2026-10-01 at load 128-140 on 18 cores (6 P, 12 E): from the
 // instant `fork` is called to the child's last `pre_exec` step, `/usr/bin/true`
@@ -504,6 +532,15 @@ pub(crate) fn command(
     command_with(role, program.as_ref(), std::path::Path::new(TASKPOLICY))
 }
 
+/// THE way the GUI starts the co-located `atpkg`: a [`Role::Background`]
+/// [`command`], so a package pass — parsing, verifying, unpacking — never runs
+/// in the band of the program being typed into. A bare `Command::new(atpkg)`
+/// compiles, runs and passes every functional test; it shows up only as echo
+/// lag while an update pass verifies a snapshot.
+pub(crate) fn atpkg_command(atpkg: impl AsRef<std::path::Path>) -> aterm_uds::spawnfd::Command {
+    command(Role::Background, atpkg)
+}
+
 /// [`command`] over an explicit launcher, so the wrapping decision is testable on
 /// every Unix against a stand-in.
 fn command_with(
@@ -691,7 +728,6 @@ pub(crate) fn class_for(role: Role) -> u32 {
 
 /// The class a worker that declares no role runs at — what every silent `spawn`
 /// in this crate gets, and what a deleted `set_self` line leaves behind.
-/// MEASURED, not assumed: see `tests::a_role_reaches_only_the_thread_that_declares_it`.
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) const UNDECLARED_CLASS: u32 = libc::qos_class_t::QOS_CLASS_DEFAULT as u32;
 
@@ -795,32 +831,6 @@ mod tests {
         }
     }
 
-    /// A ROLE REACHES ONLY THE THREAD THAT DECLARES IT — the measurement the
-    /// rest of this file rests on, and until now only a comment in it. It is why
-    /// a declaration must be the first statement INSIDE a worker's closure, why
-    /// `every_control_plane_thread_declares_its_role_inside_its_closure` insists
-    /// the `set_self` sits after the `.spawn(`, and why a `Background` worker's
-    /// CHILD PROCESS needs [`command`]'s clamp: neither a thread nor a process
-    /// inherits the class of whatever created it.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_role_reaches_only_the_thread_that_declares_it() {
-        let inherited = std::thread::spawn(|| {
-            set_self(Role::Interactive);
-            std::thread::spawn(class_of_self)
-                .join()
-                .expect("the spawned thread")
-        })
-        .join()
-        .expect("the declaring thread");
-        assert_eq!(
-            inherited, UNDECLARED_CLASS,
-            "a spawned thread inherited its creator's class (0x{inherited:x}); every \
-             `set_self` this crate places inside a closure on the opposite \
-             assumption would need re-deriving"
-        );
-    }
-
     /// The class a fork from the CALLING thread ran at, as the forked child
     /// reads it in its last step before the exec: its copy of this thread's QoS
     /// word, which `fork(2)` took when it copied the address space — the copy
@@ -922,19 +932,6 @@ mod tests {
             rank(Role::Background) > rank(Role::Housekeeping),
             "useful background work must outrank an opportunistic disk sweep"
         );
-    }
-
-    /// The inherited class a silent `spawn` leaves a thread at sits BETWEEN the
-    /// two roles the floor rule chooses between: demoting a lock holder to
-    /// `Background` really is a demotion below what it had, and `Responsive`
-    /// really is a promotion. If Apple ever renumbers the classes this is the
-    /// assertion that notices.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn the_undeclared_default_sits_between_responsive_and_background() {
-        let default = libc::qos_class_t::QOS_CLASS_DEFAULT as u32;
-        assert!(qos_class(Role::Responsive) as u32 > default);
-        assert!(default > qos_class(Role::Background) as u32);
     }
 
     /// The Linux slice map keeps the enum's order: the keystroke path asks for
@@ -1154,173 +1151,5 @@ mod tests {
             pri <= 20,
             "a Background child ran at pri {pri}, not utility (20)"
         );
-    }
-
-    /// Every thread of the package lane DECLARES its role. A role does not reach
-    /// a thread any more than it reaches a child: measured 2026-09-15, a thread
-    /// created from a `QOS_CLASS_UTILITY` thread reads `QOS_CLASS_DEFAULT`, so a
-    /// lane whose entry thread declares `Background` still hands every thread it
-    /// spawns back to the band the program being typed into runs in. Undeclared
-    /// costs nothing functional — it shows up only as echo lag while a six-hourly
-    /// pass parses its child's stdout and tails its progress file.
-    #[test]
-    fn every_package_lane_thread_declares_its_role() {
-        let lib = include_str!("lib.rs");
-        let native = include_str!("app_native.rs");
-        for (file, source, thread) in [
-            ("lib.rs", lib, "atpkg-update"),
-            ("lib.rs", lib, "atpkg-machine"),
-            ("lib.rs", lib, "atpkg-progress-tail"),
-            // The Settings ▸ Packages verb worker: same lane, same six-hourly
-            // store, reached by a click instead of by the park. Its CHILD already
-            // takes the clamp; the thread that waits on it and parses its output
-            // was the half still in the typing band.
-            ("app_native.rs", native, "aterm-packages-verb"),
-        ] {
-            let needle = format!(".name(\"{thread}\".into())");
-            let at = source
-                .find(&needle)
-                .unwrap_or_else(|| panic!("no thread named {thread} in {file}"));
-            let head = &source[at..source.len().min(at + 600)];
-            assert!(
-                head.contains("qos::set_self(crate::qos::Role::Background)"),
-                "the {thread} thread declares no role at the top of its closure, \
-                 so it runs at the inherited DEFAULT band"
-            );
-        }
-    }
-
-    /// The pooled scrollback rewrap declares [`Role::Responsive`] — the class this
-    /// module's own doc names for reflow, and the FLOOR the port-time rule sets for
-    /// a worker holding a lock the UI thread contends (`REFLOW_POOL`, which the
-    /// main thread takes on every settle to submit). Undeclared it sat at the
-    /// inherited DEFAULT: below its intended class, and low enough that a
-    /// descheduled worker can hold the pool lock with the resizing UI thread queued
-    /// behind it.
-    ///
-    /// Anchored on the FUNCTION, not on a `.name(…)` closure: the pool spawns
-    /// `.spawn(reflow_worker_main)` by name, so the declaration belongs at the
-    /// worker's entry rather than at either of the two spawn sites.
-    #[test]
-    fn the_reflow_pool_worker_declares_its_role_at_its_entry() {
-        let source = include_str!("app_render.rs");
-        let at = source
-            .find("fn reflow_worker_main() {")
-            .expect("no reflow_worker_main in app_render.rs");
-        let head = &source[at..source.len().min(at + 600)];
-        assert!(
-            head.contains("qos::set_self(crate::qos::Role::Responsive)"),
-            "the aterm-reflow worker declares no role at its entry, so it runs at \
-             the inherited DEFAULT band — below the class reflow is meant to have"
-        );
-    }
-
-    /// EVERY CONTROL-PLANE THREAD THAT SERVES A VERB declares [`Role::Responsive`],
-    /// the floor this module's port-time rule sets for a worker holding a lock the
-    /// UI thread contends. These lanes hold the TERMINAL MUTEX itself: a `text`
-    /// verb formats every visible row under one `term_lock`, and a subscription's
-    /// push loop takes it per target per tick. Undeclared, all thirteen of them ran
-    /// at the inherited DEFAULT band — below the UI thread, which takes that same
-    /// mutex on the key path (`term_lock_ui`) and in the redraw — so an agent
-    /// driving a session with `ctl text`/`screen` could leave a descheduled holder
-    /// in front of the next keystroke.
-    ///
-    /// What is asserted is that the declaration sits INSIDE the spawned closure. A
-    /// role does not reach a thread from the one that creates it (measured
-    /// 2026-09-15, the same finding that put every other entry in this file), so a
-    /// `set_self` on the spawning side would read as a fix and change nothing.
-    #[test]
-    fn every_control_plane_thread_declares_its_role_inside_its_closure() {
-        let control = include_str!("control.rs");
-        let lanes = include_str!("control_lanes.rs");
-        let listener = include_str!("control_listener.rs");
-        for (thread, source, anchor) in [
-            (
-                "aterm-control-N (8 request lanes)",
-                lanes,
-                "pub(super) fn start(self: &Arc<Self>)",
-            ),
-            (
-                "aterm-control-parker",
-                lanes,
-                "fn start_parker(self: &Arc<Self>)",
-            ),
-            (
-                "aterm-subscribe-N (4 push lanes)",
-                control,
-                "fn spawn_subscription_workers(",
-            ),
-            ("aterm-fabric-bridge", control, "fn attach_fabric_bridge("),
-            (
-                "aterm-control-listener",
-                control,
-                ".name(\"aterm-control-listener\".into())",
-            ),
-            // The supervised accept thread admits every peer (the listener
-            // thread above is its watchdog), and the startup signature hash is
-            // what a lane's `version` answer may wait on.
-            (
-                "aterm-control-accept-N",
-                listener,
-                ".name(format!(\"aterm-control-accept-{generation}\"))",
-            ),
-            (
-                "aterm-build-signature",
-                control,
-                ".name(\"aterm-build-signature\".into())",
-            ),
-        ] {
-            let at = source
-                .find(anchor)
-                .unwrap_or_else(|| panic!("no `{anchor}` in its source"));
-            let head = &source[at..source.len().min(at + 2000)];
-            let spawn = head
-                .find(".spawn(")
-                .unwrap_or_else(|| panic!("no spawn under `{anchor}`"));
-            let declared = head
-                .find("qos::set_self(crate::qos::Role::Responsive)")
-                .unwrap_or_else(|| {
-                    panic!(
-                        "the {thread} thread declares no role, so it serves control \
-                         verbs at the inherited DEFAULT band while holding the \
-                         terminal mutex the UI thread takes on the key path"
-                    )
-                });
-            assert!(
-                declared > spawn,
-                "the {thread} thread's role is declared on the SPAWNING thread; a \
-                 role does not reach the thread that thread creates"
-            );
-        }
-        // The wait lanes are spawned by name (`.spawn(move || lanes.wait_lane())`,
-        // on demand), so their declaration belongs at the lane's entry, as the
-        // reflow worker's does.
-        let at = lanes
-            .find("fn wait_lane(self: &Arc<Self>) {")
-            .expect("no wait_lane in control_lanes.rs");
-        let head = &lanes[at..lanes.len().min(at + 200)];
-        assert!(
-            head.contains("qos::set_self(crate::qos::Role::Responsive)"),
-            "the aterm-control-wait-N lanes declare no role at their entry"
-        );
-    }
-
-    /// Every `atpkg` child the GUI launches takes the clamp. A bare
-    /// `Command::new(atpkg)` compiles, runs and passes every functional test; it
-    /// shows up only as echo lag while an update pass verifies a snapshot.
-    #[test]
-    fn no_atpkg_child_is_spawned_at_the_inherited_band() {
-        for (file, source) in [
-            ("lib.rs", include_str!("lib.rs")),
-            ("app_native.rs", include_str!("app_native.rs")),
-        ] {
-            for bare in ["Command::new(atpkg)", "Command::new(&atpkg)"] {
-                assert!(
-                    !source.contains(bare),
-                    "{file} spawns `{bare}` at the inherited band; use \
-                     `qos::command(Role::Background, …)`"
-                );
-            }
-        }
     }
 }

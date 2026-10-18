@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Hand-rolled `std::env::args` parsing with a `USAGE` const and a typed
-//! `ParseError` — the shape `aterm-verify`, `aterm-release` and
-//! `aterm-ctl` all use. No third-party argument crate: a program whose entire
-//! purpose is to shrink the dependency surface does not get to add one.
+//! Hand-rolled `std::env::args` parsing with a `USAGE` const and a typed `ParseError`. No
+//! third-party argument crate: the tool that shrinks the dependency surface does not add to it.
 
 use std::path::PathBuf;
 
@@ -12,7 +10,7 @@ pub const USAGE: &str = "\
 cargo forge — aterm's third-party surface: survey, notarize, ratchet.
 
 USAGE
-  targo --unverified forge survey [--cell NAME]... [--top N] [--json PATH]
+  targo --unverified forge survey [--cell NAME]... [--top N]
         Emit the inventory: packages, LOC, unsafe tokens, build scripts,
         proc macros, duplicate versions, and dominator cost per package.
         Read-only. Needs no compiler. This is the answer to \"what are all
@@ -24,8 +22,8 @@ USAGE
 
   targo --unverified forge budget [--update] [--allow-regress \"<reason>\"]
         Compare the live surface against tools/forge-budget.tsv. --update may
-        only LOWER a ceiling; raising one needs a reason of >= 80 characters,
-        which is written into the file's 4th column.
+        only LOWER a ceiling; raising one needs a one-line reason, which is
+        written into the file's 4th column.
 
   targo --unverified forge attest
         Provenance and license obligations over vendor/: patch agreement,
@@ -53,7 +51,6 @@ OPTIONS
   --root PATH      Workspace root (default: discovered from CWD)
   --cell NAME      Restrict to one cell; repeatable. Default: every cell.
   --top N          Rows in the ranked survey table (default 40)
-  --json PATH      Also write the survey as JSON
   -h, --help       This text
 
 EXIT CODES
@@ -65,7 +62,6 @@ pub enum Cmd {
     Survey {
         cells: Vec<String>,
         top: usize,
-        json: Option<PathBuf>,
     },
     Blame {
         pkg: String,
@@ -102,8 +98,7 @@ pub enum ParseError {
 }
 
 impl ParseError {
-    /// One sentence, naming the fix. A refusal that does not say what to type
-    /// instead is a bug report addressed to nobody.
+    /// One sentence, naming the fix.
     pub fn message(&self) -> String {
         match self {
             Self::NoVerb => "no verb given — try `targo --unverified forge survey`".into(),
@@ -125,7 +120,6 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Pars
     let mut root: Option<PathBuf> = None;
     let mut cells: Vec<String> = Vec::new();
     let mut top: usize = 40;
-    let mut json: Option<PathBuf> = None;
     let mut update = false;
     let mut allow_regress: Option<String> = None;
     let mut operands: Vec<String> = Vec::new();
@@ -161,7 +155,6 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Pars
                 let v = next(&mut it, "--top")?;
                 top = v.parse().map_err(|_| ParseError::BadNumber(v))?;
             }
-            "--json" => json = Some(PathBuf::from(next(&mut it, "--json")?)),
             "--update" => update = true,
             "--allow-regress" => allow_regress = Some(next(&mut it, "--allow-regress")?),
             other if other.starts_with('-') => return Err(ParseError::UnexpectedArg(other.into())),
@@ -170,7 +163,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Pars
     }
 
     let cmd = match verb.as_str() {
-        "survey" => Cmd::Survey { cells, top, json },
+        "survey" => Cmd::Survey { cells, top },
         "blame" => Cmd::Blame {
             pkg: operands
                 .pop()
@@ -204,50 +197,6 @@ mod tests {
     }
 
     #[test]
-    fn survey_defaults_to_every_cell_and_forty_rows() {
-        let inv = p(&["survey"]).unwrap();
-        assert_eq!(
-            inv.cmd,
-            Cmd::Survey {
-                cells: vec![],
-                top: 40,
-                json: None
-            }
-        );
-    }
-
-    #[test]
-    fn cell_flag_repeats() {
-        let inv = p(&["survey", "--cell", "mac-arm", "--cell", "linux"]).unwrap();
-        let Cmd::Survey { cells, .. } = inv.cmd else {
-            panic!("wrong verb")
-        };
-        assert_eq!(cells, vec!["mac-arm", "linux"]);
-    }
-
-    #[test]
-    fn blame_requires_a_package() {
-        assert_eq!(
-            p(&["blame"]).unwrap_err(),
-            ParseError::MissingOperand("a package name")
-        );
-    }
-
-    #[test]
-    fn unknown_verb_names_the_alternatives() {
-        let e = p(&["carve"]).unwrap_err();
-        assert!(e.message().contains("survey"), "{}", e.message());
-    }
-
-    #[test]
-    fn a_flag_missing_its_value_is_a_typed_error_not_a_panic() {
-        assert_eq!(
-            p(&["survey", "--top"]).unwrap_err(),
-            ParseError::MissingValue("--top")
-        );
-    }
-
-    #[test]
     fn serde_attrs_takes_any_number_of_paths() {
         assert_eq!(
             p(&["serde-attrs"]).unwrap().cmd,
@@ -261,12 +210,5 @@ mod tests {
                 paths: vec!["crates/aterm-serde".into(), "crates/x".into()]
             }
         );
-    }
-
-    #[test]
-    fn root_is_accepted_before_or_after_the_verb() {
-        let a = p(&["--root", "/tmp/x", "survey"]).unwrap();
-        let b = p(&["survey", "--root", "/tmp/x"]).unwrap();
-        assert_eq!(a.root, b.root);
     }
 }

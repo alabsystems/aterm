@@ -7,4 +7,5 @@
 // Modified by the aterm project in 2026; see the repository NOTICE.
 
 pub mod percent;
+pub mod poll;
 pub mod xkb;

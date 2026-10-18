@@ -16,7 +16,7 @@
 //!              sysroots pruned; fat Mach-O thinned; retired entrypoints stripped;
 //!              one compiler (bin/rustc a hard link to bin/trustc); symbols stripped and
 //!              re-signed once per hard-link group
-//!  → Relocated `atpkg::relocate::relocate_stage` (fail-closed audit; donor roots only)
+//!  → Relocated `crate::artifact::relocate::relocate_stage` (fail-closed audit; donor roots only)
 //!  → Gated     one-compiler gate; LINEAGE stamped; payload scan; arch gate over bin/;
 //!              every exposed bin present; per-bin smoke; hello-world; tippy over a
 //!              hello crate
@@ -197,6 +197,9 @@ struct Bundle<'a> {
     base: Option<Vec<u8>>,
     signer: Option<Signer>,
     _lease: toolchain::Held,
+    /// The hello sysroot's lease when it is a store build ([`toolchain::lease_required`]):
+    /// the hello runs its compiler, so a reclaim mid-pack would leave it proving nothing.
+    _hello_lease: toolchain::Held,
 }
 
 /// Phase 1: everything that can be decided before a byte is copied, decided.
@@ -299,6 +302,14 @@ pub fn admit<'a>(
         &sysroot,
         &format!("atpkg-publish pack-bundle {program}"),
     )?;
+    let hello_lease = match &hello {
+        HelloPlan::Trust { sysroot: hs, .. } => toolchain::lease_required(
+            ctx,
+            hs,
+            &format!("atpkg-publish pack-bundle {program} (hello sysroot)"),
+        )?,
+        HelloPlan::Skip | HelloPlan::Staged => toolchain::Held::Nothing,
+    };
     let trust_repo = lineage_switch::default_trust_repo(ctx);
     let switch = lineage_switch::read(ctx, &trust_repo)?;
     pack::say_switch(ctx, &trust_repo, &switch);
@@ -407,6 +418,7 @@ pub fn admit<'a>(
         base,
         signer,
         _lease: lease,
+        _hello_lease: hello_lease,
     }))
 }
 
@@ -670,7 +682,7 @@ pub fn thin_fat(tools: &dyn Tools, root: &Path, triple: Triple) -> Result<Vec<St
         Arch::Aarch64 => "arm64",
         Arch::X86_64 => "x86_64",
     };
-    for rel in atpkg::relocate::walk_files(root).map_err(Error::cannot_run)? {
+    for rel in crate::artifact::relocate::walk_files(root).map_err(Error::cannot_run)? {
         let path = root.join(&rel);
         let Some(obj) = arch::read(&path) else {
             continue;
@@ -834,7 +846,7 @@ pub fn compiler_gate(root: &Path) -> Result<OneCompiler> {
 pub fn strip_symbols(tools: &dyn Tools, root: &Path) -> Result<(usize, usize)> {
     let mut groups: BTreeMap<(u64, u64), Vec<PathBuf>> = BTreeMap::new();
     let mut solo = 0u64;
-    for rel in atpkg::relocate::walk_files(root).map_err(Error::cannot_run)? {
+    for rel in crate::artifact::relocate::walk_files(root).map_err(Error::cannot_run)? {
         let skip = rel
             .extension()
             .and_then(|e| e.to_str())
@@ -935,10 +947,10 @@ impl<'a> Mutated<'a> {
         let report = b
             .tools
             .relocate(&root_of(&stage), &donors)
-            .map_err(|e| Error::refused(format!("atpkg relocate: {e}")))?;
+            .map_err(|e| Error::refused(format!("relocation: {e}")))?;
         report
             .require_self_contained()
-            .map_err(|e| Error::refused(format!("atpkg relocate: {e}")))?;
+            .map_err(|e| Error::refused(format!("relocation: {e}")))?;
         Ok(Relocated { b, stage })
     }
 }
@@ -1168,7 +1180,7 @@ impl<'a> Relocated<'a> {
         // LINEAGE is stamped inside the signed tree over the shipped digests, after the
         // last byte-changing pass. An unproven source records nothing.
         if b.own_compiler && b.proven {
-            atpkg::lineage::stamp_with(&root, &b.sysroot.join("bin"), &probe).map_err(|r| {
+            super::lineage::stamp_with(&root, &b.sysroot.join("bin"), &probe).map_err(|r| {
                 Error::refused(format!(
                     "cannot stamp LINEAGE over the staged compiler:\n  {}",
                     r.join("\n  ")
@@ -1275,7 +1287,7 @@ impl Gated<'_> {
             Some(bytes) => pkgdoc::merge(bytes, &header, &row)?,
             None => pkgdoc::fresh(&header, &row)?,
         };
-        let pkg = b.req.out.join(pkgdoc::file_name(program, b.build));
+        let pkg = b.req.out.join(pkgdoc::manifest_name(program, b.build));
         let signature = pack::write_manifest(b.ctx, &doc, &header, &row, &pkg, b.signer.as_ref())?;
         let mut uploaded = false;
         if b.req.upload {

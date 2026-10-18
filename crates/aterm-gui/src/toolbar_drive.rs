@@ -59,7 +59,10 @@ pub(crate) const HUNG: i32 = 3;
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn run_toolbar_drive() -> i32 {
-    macos::run()
+    // The drive is a windowed process of its own: it builds AppKit windows and
+    // reads NSApp, so it mints the proof a windowed launch carries and hands it
+    // to the body that sends `+sharedApplication`.
+    macos::run(crate::platform::Windowed::launch())
 }
 
 #[cfg(target_os = "macos")]
@@ -68,9 +71,9 @@ mod macos {
     use std::time::{Duration, Instant};
 
     use aterm_objc::{
-        Bool, CGPoint, CGRect, CGSize, ClassPtr, Id, Sel, class, class_methods, class_name,
-        class_of, class_protocols, method_types, msg, ns_string, protocol, protocol_method_types,
-        sel, strip_method_offsets, superclass_of,
+        Bool, CGPoint, CGRect, CGSize, ClassPtr, Id, Sel, checked_msg, class, class_methods,
+        class_name, class_of, class_protocols, method_types, ns_string, protocol,
+        protocol_method_types, sel, strip_method_offsets, superclass_of,
     };
     use winit::application::ApplicationHandler;
     use winit::event_loop::{ActiveEventLoop, EventLoop};
@@ -139,63 +142,63 @@ mod macos {
     unsafe fn s_v_id(r: Id, s: Sel, a: Id) {
         // SAFETY: as above, for `void (id, SEL, id)`.
         unsafe {
-            let f: unsafe extern "C-unwind" fn(Id, Sel, Id) = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
             f(r, s, a);
         }
     }
     unsafe fn s_v_bool(r: Id, s: Sel, a: bool) {
         // SAFETY: as above, for `void (id, SEL, BOOL)`.
         unsafe {
-            let f: unsafe extern "C-unwind" fn(Id, Sel, Bool) = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, Bool) = checked_msg();
             f(r, s, Bool::new(a));
         }
     }
     unsafe fn s_id(r: Id, s: Sel) -> Id {
         // SAFETY: as above, for `id (id, SEL)`.
         unsafe {
-            let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             f(r, s)
         }
     }
     unsafe fn s_id_id(r: Id, s: Sel, a: Id) -> Id {
         // SAFETY: as above, for `id (id, SEL, id)`.
         unsafe {
-            let f: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Id = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Id = checked_msg();
             f(r, s, a)
         }
     }
     unsafe fn s_id_usize(r: Id, s: Sel, a: usize) -> Id {
         // SAFETY: as above, for `id (id, SEL, NSUInteger)`.
         unsafe {
-            let f: unsafe extern "C-unwind" fn(Id, Sel, usize) -> Id = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, usize) -> Id = checked_msg();
             f(r, s, a)
         }
     }
     unsafe fn s_usize(r: Id, s: Sel) -> usize {
         // SAFETY: as above, for `NSUInteger (id, SEL)`.
         unsafe {
-            let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = checked_msg();
             f(r, s)
         }
     }
     unsafe fn s_isize(r: Id, s: Sel) -> isize {
         // SAFETY: as above, for `NSInteger (id, SEL)`.
         unsafe {
-            let f: unsafe extern "C-unwind" fn(Id, Sel) -> isize = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> isize = checked_msg();
             f(r, s)
         }
     }
     unsafe fn s_bool(r: Id, s: Sel) -> bool {
         // SAFETY: as above, for `BOOL (id, SEL)`.
         unsafe {
-            let f: unsafe extern "C-unwind" fn(Id, Sel) -> Bool = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> Bool = checked_msg();
             f(r, s).as_bool()
         }
     }
     unsafe fn s_bool_id(r: Id, s: Sel, a: Id) -> bool {
         // SAFETY: as above, for `BOOL (id, SEL, id)`.
         unsafe {
-            let f: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Bool = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Bool = checked_msg();
             f(r, s, a).as_bool()
         }
     }
@@ -203,35 +206,35 @@ mod macos {
         // SAFETY: as above, for `NSRect (id, SEL)`. 32 bytes, returned in
         // registers on both Apple ABIs for this shape.
         unsafe {
-            let f: unsafe extern "C-unwind" fn(Id, Sel) -> CGRect = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> CGRect = checked_msg();
             f(r, s)
         }
     }
     unsafe fn s_id_point(r: Id, s: Sel, p: CGPoint) -> Id {
         // SAFETY: as above, for `id (id, SEL, NSPoint)`.
         unsafe {
-            let f: unsafe extern "C-unwind" fn(Id, Sel, CGPoint) -> Id = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, CGPoint) -> Id = checked_msg();
             f(r, s, p)
         }
     }
     unsafe fn s_point_point_id(r: Id, s: Sel, p: CGPoint, v: Id) -> CGPoint {
         // SAFETY: as above, for `NSPoint (id, SEL, NSPoint, id)`.
         unsafe {
-            let f: unsafe extern "C-unwind" fn(Id, Sel, CGPoint, Id) -> CGPoint = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, CGPoint, Id) -> CGPoint = checked_msg();
             f(r, s, p, v)
         }
     }
     unsafe fn s_v_rect_id(r: Id, s: Sel, a: CGRect, b: Id) {
         // SAFETY: as above, for `void (id, SEL, NSRect, id)`.
         unsafe {
-            let f: unsafe extern "C-unwind" fn(Id, Sel, CGRect, Id) = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, CGRect, Id) = checked_msg();
             f(r, s, a, b);
         }
     }
     unsafe fn s_id_rect(r: Id, s: Sel, a: CGRect) -> Id {
         // SAFETY: as above, for `id (id, SEL, NSRect)`.
         unsafe {
-            let f: unsafe extern "C-unwind" fn(Id, Sel, CGRect) -> Id = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, CGRect) -> Id = checked_msg();
             f(r, s, a)
         }
     }
@@ -240,14 +243,14 @@ mod macos {
         // (`-[NSBitmapImageRep bitmapData]`). Taken as `Id` and re-cast
         // because both are one pointer-sized return in the same register.
         unsafe {
-            let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             f(r, s).as_ptr().cast_const().cast::<u8>()
         }
     }
     unsafe fn s_v_rect_bool(r: Id, s: Sel, a: CGRect, b: bool) {
         // SAFETY: as above, for `void (id, SEL, NSRect, BOOL)`.
         unsafe {
-            let f: unsafe extern "C-unwind" fn(Id, Sel, CGRect, Bool) = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, CGRect, Bool) = checked_msg();
             f(r, s, a, Bool::new(b));
         }
     }
@@ -277,7 +280,7 @@ mod macos {
                 isize,
                 isize,
                 f32,
-            ) -> Id = msg();
+            ) -> Id = checked_msg();
             f(
                 class(c"NSEvent").as_id(),
                 sel!(mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:clickCount:pressure:),
@@ -312,7 +315,7 @@ mod macos {
                 Id,
                 Bool,
                 u16,
-            ) -> Id = msg();
+            ) -> Id = checked_msg();
             f(
                 class(c"NSEvent").as_id(),
                 sel!(keyEventWithType:location:modifierFlags:timestamp:windowNumber:context:characters:charactersIgnoringModifiers:isARepeat:keyCode:),
@@ -882,7 +885,7 @@ mod macos {
                   would thread a dozen raw `Id`s through signatures that say \
                   nothing"
     )]
-    pub(crate) fn run() -> i32 {
+    pub(crate) fn run(_windowed: crate::platform::Windowed) -> i32 {
         // The watchdog: this driver enters `-mouseDown:`/`-rightMouseDown:`
         // IMPs directly, and a context menu that popped would run a modal
         // tracking loop that never returns. A hang gets its own exit code.

@@ -28,7 +28,8 @@ use crate::handoff_rendezvous::{
     DialerCode, Rendezvous, RendezvousError, TRUSTD_SILENT, admitted, dial_for_test,
     held_for_trustd,
 };
-use aterm_spec::derive::{Model, native_update_launched_dial_wait_model};
+use aterm_models_update::native_update_launched_dial_wait_model;
+use aterm_spec::derive::Model;
 use aterm_spec::interp::{self, State};
 use std::time::{Duration, Instant};
 
@@ -776,14 +777,14 @@ fn the_models_mutants_are_the_defects_they_name() {
 /// The machine's actions with no shipping code of their own on the outgoing side, each waived
 /// by name; the anchored ones are listed in `the_real_dial_wait_refines_the_model`.
 mod waivers {
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_launched_dial_wait",
         action = "Dial",
         reason = "The successor's dial (handoff_rendezvous::claim_incoming), bound by \
                   NativeUpdateSuccessorWarmBeforeClaim's Tier-1; this conformance dials the real \
                   listener with the real claim frame."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_launched_dial_wait",
         action = "Die",
         reason = "The environment: a successor that dies before its dial (a warm-prologue fatal, \
@@ -791,36 +792,36 @@ mod waivers {
                   main_entry; a unit test may not launch an application (AGENTS.md), so \
                   the named-pid half ends a real stand-in process instead."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_launched_dial_wait",
         action = "Expire",
         reason = "The environment: the dial budget running out (handoff_ready_deadline)."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_launched_dial_wait",
         action = "EndOnAnyAnswer",
         reason = "The Buggy=1 mutant: an answer that proves nothing read as death; no shipping \
                   code, and the conformance's negative control replays it and sees it refused."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_launched_dial_wait",
         action = "ConsumingPoll",
         reason = "The Buggy=1 mutant: the pre-dial poll taking the answer; no shipping code (the \
                   wait peeks), replayed for real and caught by the conformance."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_launched_dial_wait",
         action = "PollCancelOnly",
         reason = "The Buggy=1 liveness mutant: the retired cancel-only abort; replayed for real \
                   by the conformance, which waits out its budget beside a reported death."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_launched_dial_wait",
         action = "EndOnNamedPid",
         reason = "The Buggy=1 mutant: a named pid taken for gone without the kernel's word; no \
                   shipping code, replayed for real on pid 1 and refused by the conformance."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "native_update_launched_dial_wait",
         action = "IgnoreNamedPid",
         reason = "The Buggy=1 liveness mutant: the abort before the named-pid watch; replayed \

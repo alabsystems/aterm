@@ -88,7 +88,6 @@ impl Grid {
                 &self.storage.rows[hist + i],
                 &self.storage.extras,
                 row_u16(i),
-                self.styles(),
             );
             let row = &self.storage.rows[hist + i];
             // Read as a history row is: a belt row its successor continues

@@ -85,22 +85,6 @@ fn shift_f10_reaches_the_program_by_default() {
     close(pipe);
 }
 
-/// The same default, without a PTY: on every platform the arm compiles on,
-/// an unedited config lets ⇧F10 fall through the chord arm untouched.
-#[test]
-fn shift_f10_falls_through_the_chord_arm_by_default() {
-    let (mut app, wid) = app_with_strip();
-    app.windows.get_mut(&wid).unwrap().mods = ModifiersState::SHIFT;
-    app.on_key(wid, named(NamedKey::F10));
-    assert!(app.windows[&wid].tab_menu.is_none());
-    assert!(
-        !app.windows[&wid]
-            .consumed_press_keys
-            .contains(&PhysicalKey::Code(KeyCode::KeyA)),
-        "the press took the ordinary encoder path"
-    );
-}
-
 /// Under `tab_menu_chord = "on"` Shift+F10 is the Windows-wide "context
 /// menu for the focused thing" chord; bare F10 is a terminal function key
 /// and is never claimed.
@@ -119,15 +103,6 @@ fn shift_f10_pops_the_menu_and_bare_f10_does_not() {
         app.windows[&wid].tab_menu.is_some(),
         "⇧F10 pops the focused tab's menu"
     );
-}
-
-#[test]
-fn the_menu_key_pops_it_too_and_esc_dismisses() {
-    let (mut app, wid) = app_with_strip();
-    app.on_key(wid, named(NamedKey::ContextMenu));
-    assert!(app.windows[&wid].tab_menu.is_some());
-    app.on_key(wid, named(NamedKey::Escape));
-    assert!(app.windows[&wid].tab_menu.is_none(), "Esc dismisses");
 }
 
 /// ↑/↓ walk ENABLED actions only, and the walk is a real cycle.

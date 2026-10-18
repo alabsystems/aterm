@@ -8,10 +8,16 @@
 //!
 //! Content-modifying scrolls preserve the `pending_wrap` flag, as in xterm:
 //! `xtermScroll` saves and restores `screen->do_wrap` and `RevScroll` never
-//! touches it (util.c), so a scrolling LF/RI/SU/SD leaves a deferred wrap
-//! pending. Only cursor-motion ops (CursorUp/Down/Back/Forward/Set, CR) and
-//! the editing ops with an explicit xterm `ResetWrap` (ICH/DCH/ECH/IL/DL and
-//! the ED/EL-right family) cancel it.
+//! touches it (util.c), so SU/SD leave a deferred wrap pending. The ops that
+//! scroll as a side effect of moving the cursor do not: LF/IND (`xtermIndex`:
+//! `CursorDown` to the bottom margin, then `xtermScroll`) and RI (`RevIndex`:
+//! `RevScroll`, then `CursorUp` to the top margin) move the cursor by zero
+//! rows around the scroll, and that motion's `ResetWrap` runs anyway, with or
+//! without DECSLRM margins (`Grid::line_feed_margined` and
+//! `Grid::reverse_line_feed_margined` clear it as their plain twins do). Those,
+//! the other cursor-motion ops (CursorBack/Forward/Set, CR) and the editing ops
+//! with an explicit xterm `ResetWrap` (ICH/DCH/ECH/IL/DL and the ED/EL-right
+//! family) cancel it.
 //!
 //! The rows live in a ring buffer (`ring_head` is the oldest row): below
 //! capacity a scroll appends rows, at capacity it reuses the oldest (after
@@ -276,12 +282,8 @@ impl Grid {
         for i in 0..rows_to_add {
             let row_idx = row_u16(i);
             let phys = (self.storage.ring_head + ring_sb + i) % row_count;
-            let extracted = Self::extract_row_extras(
-                &self.storage.rows[phys],
-                &self.storage.extras,
-                row_idx,
-                self.styles(),
-            );
+            let extracted =
+                Self::extract_row_extras(&self.storage.rows[phys], &self.storage.extras, row_idx);
             self.storage.push_ring_extras(extracted);
         }
 
@@ -396,7 +398,6 @@ impl Grid {
                 &self.storage.rows[phys],
                 &self.storage.extras,
                 0,
-                self.styles(),
             );
             // Preserve the `None ⟺ empty` ring_extras encoding.
             self.storage
@@ -404,17 +405,11 @@ impl Grid {
                 .push_back(if bx.is_empty() { None } else { Some(bx) });
         } else {
             // Popped entry was None (plain row) — nothing to recycle.
-            let extracted = Self::extract_row_extras(
-                &self.storage.rows[phys],
-                &self.storage.extras,
-                0,
-                self.styles(),
-            );
+            let extracted =
+                Self::extract_row_extras(&self.storage.rows[phys], &self.storage.extras, 0);
             self.storage.push_ring_extras(extracted);
         }
 
-        let evicted_page = self.storage.rows[oldest].page_id();
-        self.storage.generations.evict_page(evicted_page);
         {
             let storage = &mut self.storage;
             let pages = &mut storage.pages;
@@ -447,7 +442,6 @@ impl Grid {
                 &self.storage.rows[phys],
                 &self.storage.extras,
                 row_u16(0),
-                self.styles(),
             );
             self.reuse_one_scrolled_row(new_extras, cols, row_count, has_scrollback, fill);
             return;
@@ -462,12 +456,7 @@ impl Grid {
             .map(|i| {
                 let row_idx = row_u16(i);
                 let phys = (self.storage.ring_head + ring_sb + i) % row_count;
-                Self::extract_row_extras(
-                    &self.storage.rows[phys],
-                    &self.storage.extras,
-                    row_idx,
-                    self.styles(),
-                )
+                Self::extract_row_extras(&self.storage.rows[phys], &self.storage.extras, row_idx)
             })
             .collect();
 
@@ -508,8 +497,6 @@ impl Grid {
                 .push_row_boxed(&self.storage.rows[oldest], extras);
         }
 
-        let evicted_page = self.storage.rows[oldest].page_id();
-        self.storage.generations.evict_page(evicted_page);
         {
             let storage = &mut self.storage;
             let pages = &mut storage.pages;
@@ -687,6 +674,66 @@ impl Grid {
     #[inline]
     pub fn lazy_backlog_len(&self) -> usize {
         self.storage.lazy_buffer.len()
+    }
+
+    const FLOOD_WEIGHT_SAMPLE: usize = 1024;
+
+    /// Oldest staged rows to promote before a memory-bound flood reaches its
+    /// cut. A short sample of the newest rows predicts whether the line limit
+    /// would hold the backlog raw; such a stream needs no eager compression.
+    /// Otherwise keep half the reclaimable headroom free, without draining
+    /// below half the backpressure floor. This is a forecast, not a promise
+    /// that an arbitrarily late worker can prevent loss.
+    ///
+    /// No promotion is due once a cut is open: promoting its marker during
+    /// continued overload would split one cut into several. Every subsequent
+    /// batch must use [`Self::drain_lazy_pressure_bounded`] too, since a cut
+    /// can open while the worker releases the terminal lock between batches.
+    /// A detached or absent store can promote nothing.
+    #[must_use]
+    pub fn flood_promotion_due(&self) -> usize {
+        let buffer = &self.storage.lazy_buffer;
+        if buffer.cut_open() {
+            return 0;
+        }
+        let Some(store) = self.storage.scrollback.as_ref() else {
+            return 0;
+        };
+        let floor = Self::ASYNC_COMPRESS_BACKPRESSURE;
+        let headroom = store
+            .memory_budget()
+            .saturating_sub(store.budgeted_memory_used());
+        let mark = headroom / 2;
+        if !buffer.outweighs(mark) {
+            return 0;
+        }
+        if let Some(share) = store.line_limit()
+            && (share <= floor
+                || buffer.projected_peak(share, Self::FLOOD_WEIGHT_SAMPLE) <= headroom)
+        {
+            return 0;
+        }
+        buffer.front_rows_over(mark, floor / 2)
+    }
+
+    /// One pressure-relief batch, returning the backlog still staged. Unlike
+    /// the quiet drain this never promotes an open cut's marker, even if the
+    /// cut opened after the caller counted the rows it owed. The check and
+    /// drain share this exclusive borrow. A skipped batch preserves arrivals
+    /// for the ordinary trickle's fast-flood/slow-tail decision.
+    /// Recheck the half-floor against the current backlog too: an erase or
+    /// reflow across a lock release may have replaced the counted rows.
+    pub fn drain_lazy_pressure_bounded(&mut self, max_lines: usize) -> usize {
+        let remaining = self.storage.lazy_buffer.len();
+        if self.storage.lazy_buffer.cut_open() || self.storage.scrollback.is_none() {
+            return remaining;
+        }
+        let max_lines =
+            max_lines.min(remaining.saturating_sub(Self::ASYNC_COMPRESS_BACKPRESSURE / 2));
+        if max_lines == 0 {
+            return remaining;
+        }
+        self.drain_lazy_bounded(max_lines)
     }
 
     /// One bounded drain opportunity for a host polling while output may still
@@ -1032,8 +1079,18 @@ impl Grid {
         if n == 0 {
             return;
         }
-        // Degenerate single-row region: nowhere to scroll to — no-op.
-        if self.storage.scroll_region.top == self.storage.scroll_region.bottom {
+        // A one-row screen's full region is a single row, and it scrolls like
+        // any other: its only row goes and a blank takes its place, as xterm's
+        // `RevScroll` clamps the count to `bot_marg - top_marg + 1 = 1` and
+        // clears that line (returning here left the row standing under a reverse
+        // index). Any other single-row region cannot be set (DECSTBM refuses
+        // `top >= bottom`); for that defensive state this stays a no-op.
+        if self.storage.scroll_region.top == self.storage.scroll_region.bottom
+            && !self
+                .storage
+                .scroll_region
+                .is_full(self.storage.visible_rows)
+        {
             return;
         }
         // Row index arithmetic requires display_offset == 0. Reset
@@ -1083,8 +1140,17 @@ impl Grid {
         if n == 0 {
             return;
         }
-        // Degenerate single-row region: nowhere to scroll to — no-op.
-        if self.storage.scroll_region.top == self.storage.scroll_region.bottom {
+        // A one-row screen's rectangle scrolls like any other: the count clamps
+        // to the one row and its cells inside the margins blank, as without
+        // margins (`scroll_region_up`'s full-screen arm) and as xterm's
+        // `xtermScroll` clamps to the region. Only the defensive non-full
+        // single-row region (DECSTBM refuses `top >= bottom`) is a no-op.
+        if self.storage.scroll_region.top == self.storage.scroll_region.bottom
+            && !self
+                .storage
+                .scroll_region
+                .is_full(self.storage.visible_rows)
+        {
             return;
         }
         self.reset_display_offset_with_damage();
@@ -1185,8 +1251,15 @@ impl Grid {
         if n == 0 {
             return;
         }
-        // Degenerate single-row region: nowhere to scroll to — no-op.
-        if self.storage.scroll_region.top == self.storage.scroll_region.bottom {
+        // A one-row screen's rectangle blanks, as `scroll_region_down` blanks
+        // the row (xterm's `RevScroll` clamps the count to the region); only the
+        // defensive non-full single-row region is a no-op.
+        if self.storage.scroll_region.top == self.storage.scroll_region.bottom
+            && !self
+                .storage
+                .scroll_region
+                .is_full(self.storage.visible_rows)
+        {
             return;
         }
         self.reset_display_offset_with_damage();
@@ -1752,16 +1825,6 @@ mod flood_cut_tests {
         grid.assert_invariants();
     }
 
-    #[test]
-    fn no_marker_when_nothing_was_dropped() {
-        let mut grid = flooded_grid(80, 8, DEFAULT_BUDGET);
-        feed_numbered_lines(&mut grid, 0, 30_000);
-        let hist = history_trimmed(&grid);
-        assert!(assert_no_silent_hole(&hist, 0).is_empty());
-        assert_eq!(hist, newest(30_000, 30_000 - 2), "every line from L0 on");
-        assert_eq!(grid.truncated_lines(), 0);
-    }
-
     /// Flood `total` lines in 1000-line chunks with one worker opportunity per
     /// chunk — `guarded`: the GUI worker's `trickle_lazy_bounded`; otherwise
     /// an unconditional batch — then the post-flood drain; returns every
@@ -1903,12 +1966,6 @@ mod flood_cut_tests {
             (0..width).all(|i| line.get_attr(i).flags & CellFlags::DIM.bits() != 0),
             "the whole row is dim"
         );
-        assert!(
-            flood_marker_line(1)
-                .to_string()
-                .starts_with("— aterm dropped 1 line here"),
-            "a single line is not `1 lines`"
-        );
     }
 
     #[test]
@@ -1949,5 +2006,365 @@ mod flood_cut_tests {
             grid.lazy_backlog_len()
         );
         grid.assert_invariants();
+    }
+
+    /// A late worker must not take the open marker even if pressure remains.
+    /// Continued overload stays one cut, with the ordinary trickle's arrival
+    /// count intact; once output stops the quiet drain preserves its rows.
+    #[test]
+    fn pressure_relief_after_a_late_worker_leaves_one_marker_for_continued_overload() {
+        let mut grid = flooded_grid(80, 8, FLOOR_BUDGET);
+        assert_floor_is_the_cap(&grid);
+        feed_numbered_lines(&mut grid, 0, 22_000);
+        assert!(grid.truncated_lines() > 0, "the worker was already late");
+        for start in (22_000..42_000).step_by(1_000) {
+            feed_numbered_lines(&mut grid, start, 1_000);
+            let before = grid.lazy_backlog_len();
+            assert_eq!(grid.flood_promotion_due(), 0, "the cut stays open");
+            assert_eq!(grid.drain_lazy_pressure_bounded(BATCH), before);
+            assert_eq!(
+                grid.trickle_lazy_bounded(BATCH),
+                before,
+                "the skipped pressure batch did not erase the arrival count"
+            );
+        }
+        while grid.drain_lazy_bounded(BATCH) > 0 {}
+        let markers = assert_no_silent_hole(&history_trimmed(&grid), 0);
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].1, grid.truncated_lines());
+        grid.assert_invariants();
+    }
+
+    /// An owed count survives a worker's lock release, but permission to drain
+    /// does not: a reader can open a cut before the next bounded batch.
+    #[test]
+    fn a_cut_opened_between_pressure_batches_overrides_the_owed_count() {
+        let mut grid = flooded_grid(80, 8, FLOOR_BUDGET);
+        assert_floor_is_the_cap(&grid);
+        feed_numbered_lines(&mut grid, 0, 15_000);
+        let owed = grid.flood_promotion_due();
+        assert!(owed > BATCH, "several batches were counted before the cut");
+        let before = grid.lazy_backlog_len();
+        assert_eq!(grid.drain_lazy_pressure_bounded(BATCH), before - BATCH);
+        let owed = owed - BATCH;
+        assert!(owed > 0);
+
+        // The reader runs while the worker yields with that count outstanding.
+        feed_numbered_lines(&mut grid, 15_000, 10_000);
+        assert!(grid.truncated_lines() > 0, "the reader opened a cut");
+        let before = grid.lazy_backlog_len();
+        assert_eq!(
+            grid.drain_lazy_pressure_bounded(BATCH),
+            before,
+            "a counted batch must recheck before taking the marker"
+        );
+        assert_eq!(grid.trickle_lazy_bounded(BATCH), before);
+        assert_eq!(grid.flood_promotion_due(), 0);
+
+        while grid.drain_lazy_bounded(BATCH) > 0 {}
+        let markers = assert_no_silent_hole(&history_trimmed(&grid), 0);
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].0, BATCH, "the cut follows the first batch");
+        assert_eq!(markers[0].1, grid.truncated_lines());
+        grid.assert_invariants();
+    }
+
+    // Deterministic staged/compressed retention controls for pressure relief.
+    fn feed_long(grid: &mut Grid, start: usize, n: usize, width: usize) {
+        let mut row = Vec::with_capacity(width);
+        for i in start..start + n {
+            row.clear();
+            row.extend_from_slice(format!("L{i} ").as_bytes());
+            row.resize(width, b'p');
+            grid.carriage_return();
+            grid.write_ascii_blast(&row);
+            grid.line_feed();
+        }
+    }
+
+    fn relieve(grid: &mut Grid) {
+        loop {
+            let due = grid.flood_promotion_due();
+            if due == 0 {
+                return;
+            }
+            grid.drain_lazy_pressure_bounded(due.min(BATCH));
+        }
+    }
+
+    fn maximized_flood(relieving: bool) -> (Grid, usize, u64) {
+        let mut grid = flooded_grid(253, 8, DEFAULT_BUDGET);
+        grid.set_scrollback_line_limit(Some(100_000));
+        let mut peak = 0;
+        let mut fed = 0;
+        let mut reads = 0;
+        while fed < 120_000 {
+            feed_long(&mut grid, fed, 300, 230);
+            fed += 300;
+            reads += 1;
+            peak = peak.max(grid.storage.lazy_buffer.staged_bytes());
+            if relieving {
+                relieve(&mut grid);
+            }
+            if reads % 57 == 0 {
+                grid.trickle_lazy_bounded(BATCH);
+            }
+        }
+        let lost = grid.truncated_lines();
+        (grid, peak, lost)
+    }
+
+    #[test]
+    fn a_maximized_flood_of_long_lines_keeps_the_whole_limit_when_promoted_under_pressure() {
+        let (mut grid, peak, lost) = maximized_flood(true);
+        assert_eq!(lost, 0, "nothing was cut");
+        let hist = history_trimmed(&grid);
+        assert!(assert_no_silent_hole(&hist, 0).is_empty(), "no marker");
+        assert!(hist.len() >= 100_000);
+        assert_eq!(line_number(&hist[hist.len() - 1]), 120_000 - 3);
+
+        while grid.drain_lazy_bounded(BATCH) > 0 {}
+        let hist = history_trimmed(&grid);
+        assert!(
+            assert_no_silent_hole(&hist, window_top(120_000, 100_000)).is_empty(),
+            "no marker"
+        );
+        assert_eq!(hist.len(), 100_000, "the whole configured limit");
+        assert_eq!(line_number(&hist[0]), window_top(120_000, 100_000));
+        assert_eq!(
+            line_number(&hist[hist.len() - 1]),
+            120_000 - 3,
+            "the newest line"
+        );
+        assert_eq!(grid.truncated_lines(), 0);
+        let per_row = std::mem::size_of::<super::super::scroll_convert::DeferredLine>()
+            + 253 * std::mem::size_of::<crate::Cell>();
+        assert!(
+            peak <= DEFAULT_BUDGET / 2 + 300 * per_row,
+            "the backlog peaked at {peak} bytes"
+        );
+        let store = grid.scrollback().expect("a tiered store");
+        assert!(store.budgeted_memory_used() <= store.memory_budget());
+        grid.assert_invariants();
+
+        let (starved, _, lost) = maximized_flood(false);
+        assert!(
+            lost > 40_000 && starved.scrollback_lines() < 60_000,
+            "the trickle alone keeps {} lines and loses {lost}",
+            starved.scrollback_lines()
+        );
+    }
+
+    #[test]
+    fn promotion_is_due_only_past_half_the_headroom_and_names_the_excess() {
+        let mut grid = flooded_grid(253, 8, DEFAULT_BUDGET);
+        feed_long(&mut grid, 0, 20_000, 253);
+        assert_eq!(grid.flood_promotion_due(), 0, "under the mark");
+        feed_long(&mut grid, 20_000, 20_000, 253);
+        let due = grid.flood_promotion_due();
+        assert!(due > 0, "past the mark");
+        let store = grid.scrollback().expect("a tiered store");
+        let mark = (store.memory_budget() - store.budgeted_memory_used()) / 2;
+        let bytes = grid.storage.lazy_buffer.staged_bytes();
+        let row = bytes / grid.storage.lazy_buffer.staged_rows();
+        assert_eq!(
+            due,
+            (bytes - mark).div_ceil(row),
+            "exactly the rows that take {bytes} bytes back to {mark}"
+        );
+        grid.drain_lazy_pressure_bounded(due);
+        assert!(grid.flood_promotion_due() < BATCH);
+        relieve(&mut grid);
+        assert_eq!(grid.flood_promotion_due(), 0, "the loop clears it");
+        assert_eq!(grid.truncated_lines(), 0);
+
+        let mut grid = flooded_grid(80, 8, FLOOR_BUDGET);
+        assert_floor_is_the_cap(&grid);
+        let half_floor = Grid::ASYNC_COMPRESS_BACKPRESSURE / 2;
+        feed_numbered_lines(&mut grid, 0, half_floor);
+        assert!(grid.lazy_backlog_len() <= half_floor);
+        assert_eq!(grid.flood_promotion_due(), 0, "within half the floor");
+        feed_numbered_lines(&mut grid, half_floor, 5_000);
+        assert_eq!(
+            grid.flood_promotion_due(),
+            grid.lazy_backlog_len() - half_floor,
+            "every row past half the floor"
+        );
+        assert_eq!(grid.truncated_lines(), 0, "and the cut has not started");
+
+        let mut ring_only = Grid::new(3, 253);
+        feed_long(&mut ring_only, 0, 1_000, 253);
+        assert_eq!(ring_only.flood_promotion_due(), 0);
+    }
+
+    #[test]
+    fn no_promotion_is_due_while_the_store_is_away_for_a_reflow() {
+        let mut grid = flooded_grid(80, 8, FLOOR_BUDGET);
+        let pending = grid
+            .resize_offloading_scrollback(3, 100)
+            .expect("a width change detaches the store");
+        feed_numbered_lines(&mut grid, 0, Grid::ASYNC_COMPRESS_BACKPRESSURE);
+        assert!(
+            grid.lazy_backlog_len() > Grid::ASYNC_COMPRESS_BACKPRESSURE / 2,
+            "precondition: past the mark had the store been here"
+        );
+        assert_eq!(grid.flood_promotion_due(), 0);
+        let before = grid.lazy_backlog_len();
+        assert_eq!(grid.drain_lazy_pressure_bounded(BATCH), before);
+        grid.reattach_reflowed_scrollback(pending.reflow());
+        grid.assert_invariants();
+    }
+
+    #[test]
+    fn a_promoted_flood_under_the_floor_budget_leaves_no_cut() {
+        let mut grid = flooded_grid(80, 8, FLOOR_BUDGET);
+        assert_floor_is_the_cap(&grid);
+        let mut fed = 0;
+        while fed < 40_000 {
+            feed_numbered_lines(&mut grid, fed, 1_000);
+            fed += 1_000;
+            relieve(&mut grid);
+            grid.trickle_lazy_bounded(BATCH);
+        }
+        assert_eq!(grid.truncated_lines(), 0, "nothing lost");
+        let hist = history_trimmed(&grid);
+        assert!(assert_no_silent_hole(&hist, 0).is_empty(), "no marker");
+        assert_eq!(hist, newest(40_000, 40_000 - 2), "every line, contiguous");
+        grid.assert_invariants();
+    }
+
+    fn row_bytes(width: usize) -> usize {
+        std::mem::size_of::<super::super::scroll_convert::DeferredLine>()
+            + width * std::mem::size_of::<crate::Cell>()
+    }
+
+    #[test]
+    fn a_flood_the_line_limit_holds_never_makes_a_promotion_due() {
+        for (cols, width) in [(80u16, 80usize), (120, 100)] {
+            assert!(
+                100_000 * row_bytes(width) < DEFAULT_BUDGET,
+                "precondition: 100k raw rows of {width} cells fit the budget"
+            );
+            let mut grid = flooded_grid(cols, 8, DEFAULT_BUDGET);
+            grid.set_scrollback_line_limit(Some(100_000));
+            let mut past_half = false;
+            let mut fed = 0;
+            while fed < 120_000 {
+                feed_long(&mut grid, fed, 300, width);
+                fed += 300;
+                assert_eq!(
+                    grid.flood_promotion_due(),
+                    0,
+                    "{width} cells at {cols} columns, {fed} lines in"
+                );
+                let store = grid.scrollback().expect("a tiered store");
+                let headroom = store.memory_budget() - store.budgeted_memory_used();
+                past_half |= grid.storage.lazy_buffer.outweighs(headroom / 2);
+            }
+            assert!(
+                past_half,
+                "the backlog of {width}-cell rows passed half the headroom"
+            );
+            assert_eq!(grid.truncated_lines(), 0, "nothing was cut");
+            let hist = history_trimmed(&grid);
+            let top = window_top(120_000, 100_000);
+            assert!(assert_no_silent_hole(&hist, top).is_empty(), "no marker");
+            assert_eq!(hist.len(), 100_000, "the whole configured limit");
+            assert_eq!(line_number(&hist[0]), top);
+            grid.assert_invariants();
+        }
+    }
+
+    fn widening_flood(relieving: bool) -> (Grid, Option<bool>) {
+        let mut grid = flooded_grid(253, 8, DEFAULT_BUDGET);
+        grid.set_scrollback_line_limit(Some(100_000));
+        let mut fed = 0;
+        while fed < 100_000 {
+            feed_numbered_lines(&mut grid, fed, 1_000);
+            fed += 1_000;
+            assert_eq!(grid.flood_promotion_due(), 0, "short rows: none due");
+        }
+        let mut average_lagged = None;
+        while fed < 160_000 {
+            feed_long(&mut grid, fed, 300, 230);
+            fed += 300;
+            if !relieving {
+                continue;
+            }
+            if average_lagged.is_none() && grid.flood_promotion_due() > 0 {
+                let buffer = &grid.storage.lazy_buffer;
+                let store = grid.scrollback().expect("a tiered store");
+                let headroom = store.memory_budget() - store.budgeted_memory_used();
+                let share = store.line_limit().expect("a line limit");
+                let average = buffer.staged_bytes() / buffer.staged_rows();
+                average_lagged = Some(average * share <= headroom);
+            }
+            relieve(&mut grid);
+        }
+        (grid, average_lagged)
+    }
+
+    #[test]
+    fn a_flood_that_turns_wide_after_its_backlog_filled_is_promoted_before_it_cuts() {
+        let (mut grid, average_lagged) = widening_flood(true);
+        assert_eq!(grid.truncated_lines(), 0, "nothing was cut");
+        assert_eq!(
+            average_lagged,
+            Some(true),
+            "relief began while the whole backlog's average projected no cut"
+        );
+        while grid.drain_lazy_bounded(BATCH) > 0 {}
+        let hist = history_trimmed(&grid);
+        let top = window_top(160_000, 100_000);
+        assert!(assert_no_silent_hole(&hist, top).is_empty(), "no marker");
+        assert_eq!(hist.len(), 100_000, "the whole configured limit");
+        assert_eq!(line_number(&hist[0]), top);
+        assert_eq!(line_number(&hist[hist.len() - 1]), 160_000 - 3);
+        grid.assert_invariants();
+
+        let (starved, _) = widening_flood(false);
+        assert!(
+            starved.truncated_lines() > 0,
+            "the unrelieved flood kept {} lines and lost none",
+            starved.scrollback_lines()
+        );
+    }
+
+    #[test]
+    fn the_projection_weighs_the_flood_by_its_newest_rows() {
+        let cap = 100_000;
+        let mut grid = flooded_grid(253, 8, DEFAULT_BUDGET);
+        feed_numbered_lines(&mut grid, 0, 5_000);
+        feed_long(&mut grid, 5_000, 2_000, 253);
+        let buffer = &grid.storage.lazy_buffer;
+        let average = buffer.staged_bytes() / buffer.staged_rows();
+        let peak = buffer.projected_peak(cap, Grid::FLOOD_WEIGHT_SAMPLE);
+        assert_eq!(peak, cap * row_bytes(253), "cap rows of the newest weight");
+        assert!(peak > 2 * average * cap, "far above the whole average");
+
+        let mut grid = flooded_grid(253, 8, DEFAULT_BUDGET);
+        feed_long(&mut grid, 0, 5_000, 253);
+        feed_numbered_lines(&mut grid, 5_000, 2_000);
+        let buffer = &grid.storage.lazy_buffer;
+        let staged = buffer.staged_bytes();
+        let peak = buffer.projected_peak(cap, Grid::FLOOD_WEIGHT_SAMPLE);
+        assert!(peak >= staged, "the staged rows are part of the peak");
+        assert!(
+            peak < staged + cap * row_bytes(16),
+            "the rows to come weigh what the newest (short) rows do"
+        );
+    }
+
+    #[test]
+    fn a_line_share_within_the_floor_never_makes_a_promotion_due() {
+        let mut grid = flooded_grid(253, 8, FLOOR_BUDGET);
+        grid.set_scrollback_line_limit(Some(15_000));
+        feed_long(&mut grid, 0, 30_000, 253);
+        assert!(
+            grid.storage.lazy_buffer.outweighs(FLOOR_BUDGET),
+            "precondition: far past the mark"
+        );
+        assert_eq!(grid.flood_promotion_due(), 0);
+        assert_eq!(grid.truncated_lines(), 0, "nothing was cut");
     }
 }

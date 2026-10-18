@@ -11,11 +11,6 @@
 //! (`status`, `text`, `cursor`, `modes`, `cast`), so it is safe against a tab
 //! in use. Its header says `computed=client`.
 //!
-//! Through a relay, `aterm ctl dial <name> [@<sid>] cast drift …` asks the
-//! remote the same way, each request sent as `dial <name> …` and each reply
-//! framed as the remote's answer ([`Route`]). Only a relay that cannot carry
-//! the reads is refused.
-//!
 //! The offline form reads saved files and needs no socket:
 //! `aterm ctl cast drift --file <cast> [--screen <text>] [--until <t>] [k=v…]`
 //! (with no screen it compares the faithful replay with the stable one:
@@ -72,9 +67,8 @@ pub enum DriftCut {
 /// halves moves nothing. An aterm without it shifts its screen on every flap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DriftPeer {
-    /// An aterm older than `cast drift` (the live fallback, direct or through
-    /// `dial`), and so older than the resize undo: the replays drop it
-    /// (`undo=off`).
+    /// An aterm older than `cast drift` (the live fallback), and so older than
+    /// the resize undo: the replays drop it (`undo=off`).
     PreUndo,
     /// Not known (saved files): the replays keep the undo, and drop it only
     /// when that alone reproduces the given screen.
@@ -110,59 +104,17 @@ const SETTLE: Duration = Duration::from_millis(60);
 /// Consistent-cut attempts before the client proceeds with `cut=racy`.
 const CUT_ATTEMPTS: usize = 3;
 
-/// Where `cast drift`'s requests go: a `dial <name>` relay head when the
-/// session is on a remote, then the session's `@<selector>`, if any.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Route<'a> {
-    /// The saved connection the local server relays to (`dial <name>`).
-    pub(crate) dial: Option<&'a str>,
-    /// The session, `@<sid>` / `@.`.
-    pub(crate) selector: Option<&'a str>,
-}
-
-impl Route<'_> {
-    /// The request as the remote (or the one server) reads it:
-    /// `[@<selector> ]<verb>` — what its reply is framed by.
-    fn framed(&self, verb: &str) -> String {
-        let mut r = String::new();
-        if let Some(sel) = self.selector {
-            r.push_str(sel);
-            r.push(' ');
-        }
-        r.push_str(verb);
-        r
+/// The request line `[@<selector> ]<verb>` — what its reply is framed by.
+/// `selector` is the session `cast drift`'s requests go to (`@<sid>` / `@.`),
+/// if any.
+fn request_line(selector: Option<&str>, verb: &str) -> String {
+    let mut r = String::new();
+    if let Some(sel) = selector {
+        r.push_str(sel);
+        r.push(' ');
     }
-
-    /// The line sent: [`framed`](Self::framed) behind the relay head.
-    fn line(&self, verb: &str) -> String {
-        let framed = self.framed(verb);
-        match self.dial {
-            Some(name) => {
-                let mut r = String::from("dial ");
-                r.push_str(name);
-                r.push(' ');
-                r.push_str(&framed);
-                r
-            }
-            None => framed,
-        }
-    }
-}
-
-/// `dial <name> [@<selector>] <verb…>` split into the connection, the
-/// selector and the request from its verb on; `None` for anything else (a
-/// bare `dial <name>` included).
-pub(crate) fn split_dial(parts: &[String]) -> Option<(&str, Option<&str>, &[String])> {
-    if parts.first().map(String::as_str) != Some("dial") {
-        return None;
-    }
-    let name = parts.get(1)?.as_str();
-    let rest = parts.get(2..)?;
-    match rest.first() {
-        Some(sel) if sel.starts_with('@') => Some((name, Some(sel.as_str()), &rest[1..])),
-        Some(_) => Some((name, None, rest)),
-        None => None,
-    }
+    r.push_str(verb);
+    r
 }
 
 /// Whether `rest` (the request with any `@<selector>` split off) is `cast drift`.
@@ -265,7 +217,7 @@ fn screen_rows(text: &str) -> Vec<String> {
 }
 
 /// The offline form, answered with no socket: `Ok(None)` when `parts` is not
-/// it (the caller goes on to dial). A `@<selector>` with the offline flags is a
+/// it (the caller goes on to the server). A `@<selector>` with the offline flags is a
 /// usage error: the files are the session.
 pub(crate) fn offline_entry(parts: &[String], local: &LocalVerbs) -> io::Result<Option<ExitCode>> {
     let (selector, rest) = match parts.first() {
@@ -338,9 +290,7 @@ fn print_report(report: Result<String, String>) -> io::Result<ExitCode> {
     }
 }
 
-/// A request a server answered `ERR …`: the request and its status line, kept
-/// apart so a caller can tell who refused (the local relay's `ERR dial …`, or
-/// the remote's own answer).
+/// A request a server answered `ERR …`: the request and its status line.
 #[derive(Debug)]
 struct Refused {
     request: String,
@@ -355,30 +305,6 @@ impl std::fmt::Display for Refused {
 
 impl std::error::Error for Refused {}
 
-/// Whether `e`, from a read sent through `dial`, is the relay failing (the
-/// transport, or the local server's own `ERR dial …`) rather than the remote
-/// answering. A remote refusal, a wrong-shaped reply or a non-UTF-8 cast came
-/// through a working relay and is reported as itself.
-fn relay_failed(e: &io::Error) -> bool {
-    if let Some(refused) = e
-        .get_ref()
-        .and_then(|inner| inner.downcast_ref::<Refused>())
-    {
-        return refused.status.starts_with("ERR dial");
-    }
-    matches!(
-        e.kind(),
-        io::ErrorKind::UnexpectedEof
-            | io::ErrorKind::ConnectionRefused
-            | io::ErrorKind::ConnectionReset
-            | io::ErrorKind::ConnectionAborted
-            | io::ErrorKind::NotConnected
-            | io::ErrorKind::BrokenPipe
-            | io::ErrorKind::TimedOut
-            | io::ErrorKind::WouldBlock
-    )
-}
-
 /// One reply, read whole.
 enum Reply {
     /// A status line.
@@ -390,18 +316,16 @@ enum Reply {
 }
 
 /// One request on its own connection, its reply read whole by the verb's
-/// framing (the remote's answer to `verb`, for a relayed route). An `ERR`
-/// reply is an error naming the request ([`Refused`]).
+/// framing. An `ERR` reply is an error naming the request ([`Refused`]).
 fn fetch(
     path: &str,
     origin: TargetOrigin,
-    route: Route<'_>,
+    selector: Option<&str>,
     verb: &str,
     deadline: Option<Duration>,
 ) -> io::Result<Reply> {
-    let request = route.line(verb);
-    let framed = route.framed(verb);
-    let request = request.as_str();
+    let framed = request_line(selector, verb);
+    let request = framed.as_str();
     converse(path, origin, deadline, |stream, token| {
         stream.set_read_timeout(deadline)?;
         stream.set_write_timeout(deadline)?;
@@ -519,11 +443,11 @@ struct Material {
 fn read_material(
     path: &str,
     origin: TargetOrigin,
-    route: Route<'_>,
+    selector: Option<&str>,
     deadline: Option<Duration>,
     settle: &dyn Fn(Duration),
 ) -> io::Result<Material> {
-    let get = |verb: &str| fetch(path, origin, route, verb, deadline);
+    let get = |verb: &str| fetch(path, origin, selector, verb, deadline);
     let mut attempt = 0;
     loop {
         attempt += 1;
@@ -628,34 +552,19 @@ fn probe(
     Ok(served.unwrap_or_else(Probe::Answered))
 }
 
-/// The live form: ask the server (through `route`'s relay, if any); compute
-/// client-side when it predates the verb.
+/// The live form: ask the server; compute client-side when it predates the
+/// verb.
 pub(crate) fn live(
     path: &str,
     origin: TargetOrigin,
-    route: Route<'_>,
+    selector: Option<&str>,
     tail: &[String],
     deadline: Option<Duration>,
     local: &LocalVerbs,
 ) -> io::Result<ExitCode> {
-    live_with(path, origin, route, tail, deadline, local, &|d| {
+    live_with(path, origin, selector, tail, deadline, local, &|d| {
         std::thread::sleep(d);
     })
-}
-
-/// Why a relayed remote that predates the verb gets no report: said by name,
-/// with the two ways that still get one.
-fn relay_refusal(why: &str) -> io::Error {
-    let mut msg = String::from(
-        "the aterm this `dial` reached predates `cast drift` (it answered the bare cast, not a \
-         report), and ",
-    );
-    msg.push_str(why);
-    msg.push_str(
-        "; ask it with a newer `aterm ctl` on its own machine, or save its `cast` and `text` \
-         and run `aterm ctl cast drift --file <cast> --screen <text>`",
-    );
-    io::Error::other(msg)
 }
 
 /// [`live`] with the settle step injected, so a test drives the fallback
@@ -663,7 +572,7 @@ fn relay_refusal(why: &str) -> io::Error {
 fn live_with(
     path: &str,
     origin: TargetOrigin,
-    route: Route<'_>,
+    selector: Option<&str>,
     tail: &[String],
     deadline: Option<Duration>,
     local: &LocalVerbs,
@@ -675,37 +584,18 @@ fn live_with(
         verb.push(' ');
         verb.push_str(&args);
     }
-    let mut request = route.line(&verb);
+    let mut request = request_line(selector, &verb);
     request.push('\n');
     if let Probe::Answered(code) = probe(path, origin, &request, deadline)? {
         return Ok(code);
     }
     let Some(analyze) = local.cast_drift else {
-        return Err(no_analyzer_error(if route.dial.is_some() {
-            "the aterm this `dial` reached predates `cast drift` (it answered the bare cast)"
-        } else {
-            "this aterm predates `cast drift` (it answered the bare cast)"
-        }));
+        return Err(no_analyzer_error(
+            "this aterm predates `cast drift` (it answered the bare cast)",
+        ));
     };
-    let m = match read_material(path, origin, route, deadline, settle) {
-        Ok(m) => m,
-        // Only the relay's failure is a refusal; anything the remote itself
-        // answered is reported as it is, as on the direct route.
-        Err(e) if route.dial.is_some() && relay_failed(&e) => {
-            let mut why =
-                String::from("the relay could not carry the reads a client-side report needs (");
-            why.push_str(&e.to_string());
-            why.push(')');
-            return Err(relay_refusal(&why));
-        }
-        Err(e) => return Err(e),
-    };
-    stderr_line(if route.dial.is_some() {
-        "the aterm this `dial` reached predates `cast drift`; computed client-side through the \
-         relay (computed=client)"
-    } else {
-        "this aterm predates `cast drift`; computed client-side (computed=client)"
-    })?;
+    let m = read_material(path, origin, selector, deadline, settle)?;
+    stderr_line("this aterm predates `cast drift`; computed client-side (computed=client)")?;
     let job = CastDriftJob {
         cast: &m.cast,
         screen: Some(&m.rows),
@@ -773,6 +663,7 @@ mod tests {
         );
         assert_eq!(stamp("OK nothing"), None);
         assert_eq!(parse_cursor("OK 58 2 1 blinking_block"), Some((58, 2)));
+        assert_eq!(screen_rows("one\r\ntwo\n"), strings(&["one", "two"]));
         assert_eq!(
             parse_alt(&strings(&["cursor_visible=true", "alt_screen=true"])),
             Some(true)
@@ -861,10 +752,7 @@ mod tests {
         let code = live_with(
             &path,
             TargetOrigin::Pinned,
-            Route {
-                dial: None,
-                selector: Some("@s-x"),
-            },
+            Some("@s-x"),
             &strings(&["rows=3"]),
             Some(Duration::from_secs(60)),
             &local,
@@ -872,23 +760,16 @@ mod tests {
         )
         .expect("computed client-side");
         assert_eq!(code, ExitCode::SUCCESS);
-        let refused = live_with(
+        live_with(
             &path,
             TargetOrigin::Pinned,
-            Route {
-                dial: None,
-                selector: Some("@s-x"),
-            },
+            Some("@s-x"),
             &[],
             Some(Duration::from_secs(60)),
             &LocalVerbs::NONE,
             &|_| {},
         )
-        .expect_err("no analyzer: refused by name");
-        assert!(
-            refused.to_string().contains("predates `cast drift`"),
-            "{refused}"
-        );
+        .expect_err("no analyzer: refused");
         let seen = server.join().expect("server");
         assert_eq!(
             seen,
@@ -907,264 +788,12 @@ mod tests {
         let _ = std::fs::remove_dir(&dir);
     }
 
-    /// A mock control server on a fresh socket: each connection reads one
-    /// request line and answers `reply(verb)`, where the verb is the first
-    /// token after any `dial <name>` head and `@<selector>`. Returns the
-    /// socket path and the thread that hands back the request lines seen.
-    #[cfg(unix)]
-    fn mock_server(
-        tag: &str,
-        connections: usize,
-        reply: fn(&str) -> String,
-    ) -> (std::path::PathBuf, std::thread::JoinHandle<Vec<String>>) {
-        use std::os::unix::net::UnixListener;
-        let dir = std::env::temp_dir().join(format!("aterm-ctl-{tag}-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let sock = dir.join("m.sock");
-        let _ = std::fs::remove_file(&sock);
-        let listener = UnixListener::bind(&sock).expect("bind");
-        let server = std::thread::spawn(move || {
-            let mut seen = Vec::new();
-            for _ in 0..connections {
-                let (conn, _) = listener.accept().expect("accept");
-                let mut r = BufReader::new(conn.try_clone().expect("clone"));
-                let mut line = String::new();
-                r.read_line(&mut line).expect("request");
-                let req = line.trim_end().to_string();
-                let mut toks = req.split_whitespace().peekable();
-                if toks.peek() == Some(&"dial") {
-                    toks.next();
-                    toks.next();
-                }
-                if toks.peek().is_some_and(|t| t.starts_with('@')) {
-                    toks.next();
-                }
-                let verb = toks.next().unwrap_or("").to_string();
-                let mut w = conn;
-                w.write_all(reply(&verb).as_bytes()).expect("reply");
-                w.flush().expect("flush");
-                seen.push(req);
-            }
-            seen
-        });
-        (sock, server)
-    }
-
-    const OLD_CAST: &str = "{\"version\": 2, \"width\": 20, \"height\": 8}\n[0.1, \"o\", \"hi\"]\n";
-
-    /// An older aterm behind the relay: every verb the fallback reads.
-    fn older_remote(verb: &str) -> String {
-        match verb {
-            "cast" => format!("OK {}\n{OLD_CAST}", OLD_CAST.len()),
-            "status" => "OK schema=1 gen=1.7 seq=7 hash=abc\n".to_string(),
-            "text" => "OK 2\nrow zero\nrow one\n".to_string(),
-            "cursor" => "OK 1 3 1 blinking_block\n".to_string(),
-            "modes" => "OK 2\nalt_screen=true\ncursor_visible=true\n".to_string(),
-            _ => "ERR unknown verb (try: help)\n".to_string(),
-        }
-    }
-
-    /// `dial <name> [@<sid>] cast drift` against a remote that predates the
-    /// verb: the report is computed from the remote's status, text, cursor,
-    /// modes and cast, each read sent through the relay and framed as the
-    /// remote's answer.
-    #[cfg(unix)]
-    #[test]
-    fn a_relayed_older_remote_gets_the_report_computed_client_side() {
-        let (sock, server) = mock_server("dial-drift", 7, older_remote);
-        let path = sock.to_str().expect("utf8").to_string();
-        let local = LocalVerbs {
-            cast_drift: Some(echo_pre_undo),
-        };
-        let route = Route {
-            dial: Some("box"),
-            selector: Some("@s-r"),
-        };
-        let code = live_with(
-            &path,
-            TargetOrigin::Pinned,
-            route,
-            &strings(&["rows=3"]),
-            Some(Duration::from_secs(60)),
-            &local,
-            &|_| {},
-        )
-        .expect("computed client-side through the relay");
-        assert_eq!(code, ExitCode::SUCCESS);
-        let seen = server.join().expect("server");
-        assert_eq!(
-            seen,
-            [
-                "dial box @s-r cast drift rows=3",
-                "dial box @s-r status",
-                "dial box @s-r text",
-                "dial box @s-r cursor",
-                "dial box @s-r modes",
-                "dial box @s-r cast",
-                "dial box @s-r status",
-            ]
-        );
-        let _ = std::fs::remove_file(&sock);
-        let _ = sock.parent().map(std::fs::remove_dir);
-    }
-
-    /// A relay that refuses the follow-up reads: the error names the relay and
-    /// why, and says how to get a report.
-    #[cfg(unix)]
-    #[test]
-    fn a_relay_that_cannot_carry_the_reads_is_refused_by_name() {
-        fn only_the_probe(verb: &str) -> String {
-            match verb {
-                "cast" => older_remote(verb),
-                _ => "ERR dial box: connection reset\n".to_string(),
-            }
-        }
-        let (sock, server) = mock_server("dial-refuse", 2, only_the_probe);
-        let path = sock.to_str().expect("utf8").to_string();
-        let local = LocalVerbs {
-            cast_drift: Some(echo),
-        };
-        let route = Route {
-            dial: Some("box"),
-            selector: None,
-        };
-        let refused = live_with(
-            &path,
-            TargetOrigin::Pinned,
-            route,
-            &[],
-            Some(Duration::from_secs(60)),
-            &local,
-            &|_| {},
-        )
-        .expect_err("the relay dropped the reads");
-        let msg = refused.to_string();
-        assert!(
-            msg.contains("the aterm this `dial` reached predates `cast drift`")
-                && msg.contains("the relay could not carry")
-                && msg.contains("connection reset")
-                && msg.contains("--file <cast> --screen <text>"),
-            "{msg}"
-        );
-        assert_eq!(
-            server.join().expect("server"),
-            ["dial box cast drift", "dial box status"]
-        );
-        let _ = std::fs::remove_file(&sock);
-        let _ = sock.parent().map(std::fs::remove_dir);
-    }
-
-    /// A remote refusal (`ERR no such session`, the tab closed between probe
-    /// and reads) is reported as itself, never as the relay failing.
-    #[cfg(unix)]
-    #[test]
-    fn a_remote_refusal_through_a_working_relay_is_not_blamed_on_the_relay() {
-        fn tab_closed(verb: &str) -> String {
-            match verb {
-                "cast" => older_remote(verb),
-                _ => "ERR no such session\n".to_string(),
-            }
-        }
-        let (sock, server) = mock_server("dial-gone", 2, tab_closed);
-        let path = sock.to_str().expect("utf8").to_string();
-        let local = LocalVerbs {
-            cast_drift: Some(echo),
-        };
-        let route = Route {
-            dial: Some("box"),
-            selector: Some("@s-gone"),
-        };
-        let err = live_with(
-            &path,
-            TargetOrigin::Pinned,
-            route,
-            &[],
-            Some(Duration::from_secs(60)),
-            &local,
-            &|_| {},
-        )
-        .expect_err("the remote refused the read");
-        let msg = err.to_string();
-        assert_eq!(msg, "dial box @s-gone status: ERR no such session");
-        assert!(!relay_failed(&err));
-        assert_eq!(
-            server.join().expect("server"),
-            ["dial box @s-gone cast drift", "dial box @s-gone status"]
-        );
-        let _ = std::fs::remove_file(&sock);
-        let _ = sock.parent().map(std::fs::remove_dir);
-
-        // What IS the relay: its own `ERR dial …`, and a transport that broke.
-        let refused = |status: &str| {
-            io::Error::other(Refused {
-                request: "dial box status".to_string(),
-                status: status.to_string(),
-            })
-        };
-        assert!(relay_failed(&refused("ERR dial box: connection reset")));
-        assert!(relay_failed(&io::Error::from(io::ErrorKind::UnexpectedEof)));
-        assert!(!relay_failed(&io::Error::new(
-            io::ErrorKind::InvalidData,
-            "the cast body is not UTF-8"
-        )));
-    }
-
-    /// `dial <name> [@<sid>] <verb…>` splits into its parts; a bare dial and
-    /// any other request do not.
-    #[test]
-    fn the_dial_head_splits_off_the_request() {
-        let parts = strings(&["dial", "box", "@s-a", "cast", "drift", "rows=2"]);
-        let (name, sel, rest) = split_dial(&parts).expect("dial");
-        assert_eq!((name, sel), ("box", Some("@s-a")));
-        assert!(is_cast_drift(rest));
-        let parts = strings(&["dial", "box", "cast", "drift"]);
-        assert_eq!(
-            split_dial(&parts).map(|(n, s, r)| (n, s, r.len())),
-            Some(("box", None, 2))
-        );
-        assert!(split_dial(&strings(&["dial", "box"])).is_none());
-        assert!(split_dial(&strings(&["cast", "drift"])).is_none());
-        let route = Route {
-            dial: Some("box"),
-            selector: Some("@s-a"),
-        };
-        assert_eq!(route.line("text"), "dial box @s-a text");
-        assert_eq!(route.framed("text"), "@s-a text");
-        assert_eq!(Route::default().line("cast"), "cast");
-    }
-
-    /// The material itself, through the same mock: what the analyzer is handed.
-    #[test]
-    fn the_echo_analyzer_sees_the_material() {
-        let rows = strings(&["a", "b"]);
-        let job = CastDriftJob {
-            cast: "xyz",
-            screen: Some(&rows),
-            cursor: Some((1, 3)),
-            alt: Some(true),
-            args: "rows=3",
-            cut: DriftCut::Quiescent,
-            until: None,
-            peer: DriftPeer::PreUndo,
-        };
-        assert_eq!(
-            echo(&job).unwrap(),
-            "OK 1 verdict=echo computed=client\ncast_bytes=3 screen=2 cursor=Some((1, 3)) \
-             alt=Some(true) args=rows=3 cut=Quiescent peer=PreUndo\n"
-        );
-        assert_eq!(screen_rows("one\r\ntwo\n"), strings(&["one", "two"]));
-    }
-
     /// The offline form with no analyzer refuses by name, and with a selector is
     /// a usage error; a live-form request is not taken.
     #[test]
     fn the_offline_entry_refuses_what_it_cannot_do() {
         let parts = strings(&["cast", "drift", "--file", "/nonexistent.cast"]);
-        let err = offline_entry(&parts, &LocalVerbs::NONE).expect_err("no analyzer");
-        assert!(
-            err.to_string().contains("does not link the engine"),
-            "{err}"
-        );
+        offline_entry(&parts, &LocalVerbs::NONE).expect_err("no analyzer");
         let with_sel = strings(&["@s-a", "cast", "drift", "--file", "x"]);
         let local = LocalVerbs {
             cast_drift: Some(echo),

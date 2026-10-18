@@ -29,6 +29,17 @@ use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::durable::Flush;
+
+/// How a new private file is published: the flush that finishes its bytes, and
+/// whether its parent's entries are synced at once or left to the caller's batch
+/// barrier (a video recording's [`PinnedDir::sync`] before its marker).
+#[derive(Clone, Copy)]
+struct Publication {
+    flush: Flush,
+    sync_parent: bool,
+}
+
 /// Whether `name` is ONE ordinary path component that every backend may hand
 /// a handle-relative call: the rule [`validate_component`] enforces, for the
 /// callers that judge a name before it reaches a [`PinnedDir`].
@@ -180,6 +191,8 @@ mod imp {
     use std::path::Component;
     use std::sync::Arc;
 
+    use crate::durable::Flush;
+
     use aterm_dirfd::OwnedFd;
     #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
     use aterm_dirfd::linkat;
@@ -191,7 +204,7 @@ mod imp {
     use aterm_dirfd::{RenameFlags, renameat_with};
 
     use super::{
-        OsStr, OsString, Path, PathBuf, identity_changed, io, validate_component,
+        OsStr, OsString, Path, PathBuf, Publication, identity_changed, io, validate_component,
         validate_open_path,
     };
 
@@ -559,8 +572,8 @@ mod imp {
         }
 
         #[cfg_attr(
-            test,
-            aterm_spec::refines(
+            any(test, debug_assertions),
+            aterm_spec_anchor::refines(
                 machine = "AnchoredArtifactTransaction",
                 action = "ConfinePin",
                 project = "aterm_gui::artifact_transaction_conformance::project_anchored"
@@ -692,6 +705,16 @@ mod imp {
             aterm_dirfd::fsync(self.leaf()).map_err(Into::into)
         }
 
+        /// Flush the directory's entries ORDERED ahead of every later write on the
+        /// device ([`aterm_durable::ordered`] on a duplicate of the retained
+        /// descriptor), for a caller whose entries only a later step on this device
+        /// depends on (the session log's segments, instance lock and retention).
+        /// [`Self::sync`] stays the plain `fsync(2)` its other callers take (a video
+        /// recording's batch barrier, a new artifact's entry).
+        pub(crate) fn sync_ordered(&self) -> io::Result<()> {
+            aterm_durable::ordered(&std::fs::File::from(self.leaf().try_clone()?))
+        }
+
         pub(crate) fn child(&self, name: &OsStr) -> io::Result<Self> {
             validate_component(name)?;
             let child = open_directory_at(self.leaf(), name)?;
@@ -727,6 +750,7 @@ mod imp {
             name: &OsStr,
             bytes: &[u8],
             after_create: &mut Option<F>,
+            flush: Flush,
         ) -> io::Result<PinnedFile> {
             validate_component(name)?;
             let flags = OFlags::WRONLY
@@ -761,7 +785,14 @@ mod imp {
             }
             let result = (|| {
                 (&file.file).write_all(bytes)?;
-                crate::durable::sync_all(&file.file)
+                // The caller's tier: ordered for an artifact, whose bytes land before its
+                // marker (`.done`, `.published`) or its rename (the requester is local
+                // and reads the page cache, no recovery reads these files, and a torn PNG
+                // fails its CRC). A caller that names `Flush::Durable` gets the bytes
+                // fully flushed, but the entry that names them still takes
+                // [`PinnedDir::sync`]'s plain `fsync(2)`, which on Apple promises
+                // neither order nor durability: no such caller is left.
+                crate::durable::finish(&file.file, flush)
             })();
             if let Err(error) = result {
                 let _ = file.remove_exact();
@@ -772,7 +803,9 @@ mod imp {
 
         fn write_private_inner(&self, name: &OsStr, bytes: &[u8]) -> io::Result<PinnedFile> {
             let mut after_create = Some(|| {});
-            self.write_private_inner_with_hook(name, bytes, &mut after_create)
+            // Ordered: every caller of the replacing writers is an artifact (a snapshot's
+            // png and txt, a capture's PNG reply).
+            self.write_private_inner_with_hook(name, bytes, &mut after_create, Flush::Ordered)
         }
 
         fn temporary_name(sequence: u64) -> OsString {
@@ -783,8 +816,8 @@ mod imp {
         }
 
         #[cfg_attr(
-            test,
-            aterm_spec::refines(
+            any(test, debug_assertions),
+            aterm_spec_anchor::refines(
                 machine = "AnchoredArtifactTransaction",
                 action = "WritePinned",
                 project = "aterm_gui::artifact_transaction_conformance::project_anchored"
@@ -861,13 +894,17 @@ mod imp {
                 authorize,
                 || {},
                 || {},
-                true,
+                Publication {
+                    flush: Flush::Ordered,
+                    sync_parent: true,
+                },
             )
         }
 
-        /// Publish one durable file as part of a private batch whose caller
-        /// supplies the parent-directory sync barrier before any visibility
-        /// marker. The file itself is still fsynced and identity-checked.
+        /// Publish one file as part of a private batch whose caller supplies the
+        /// parent-directory sync barrier before any visibility marker. The file
+        /// itself is still flushed (ordered: a video frame or index lands before the
+        /// marker that publishes it) and identity-checked.
         pub(crate) fn write_new_private_deferred_dir_sync_authorized(
             &self,
             name: &OsStr,
@@ -880,18 +917,22 @@ mod imp {
                 authorize,
                 || {},
                 || {},
-                false,
+                Publication {
+                    flush: Flush::Ordered,
+                    sync_parent: false,
+                },
             )
         }
 
-        /// Create and fsync an invisible temporary file, then atomically
-        /// publish it without replacing any existing final component.
+        /// Create an invisible temporary file finished with `flush`, then
+        /// atomically publish it without replacing any existing final component.
         pub(crate) fn write_new_private_with_hooks(
             &self,
             name: &OsStr,
             bytes: &[u8],
             after_temp_create: impl FnOnce(),
             after_publish: impl FnOnce(),
+            flush: Flush,
         ) -> io::Result<PinnedFile> {
             self.write_new_private_with_authorizer_and_hooks(
                 name,
@@ -899,7 +940,10 @@ mod imp {
                 || true,
                 after_temp_create,
                 after_publish,
-                true,
+                Publication {
+                    flush,
+                    sync_parent: true,
+                },
             )
         }
 
@@ -910,8 +954,9 @@ mod imp {
             authorize: impl FnOnce() -> bool,
             after_temp_create: impl FnOnce(),
             after_publish: impl FnOnce(),
-            sync_parent: bool,
+            publication: Publication,
         ) -> io::Result<PinnedFile> {
+            let Publication { flush, sync_parent } = publication;
             validate_component(name)?;
             static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let mut authorize = Some(authorize);
@@ -920,8 +965,12 @@ mod imp {
             for _ in 0..32 {
                 let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let temporary = Self::temporary_name(sequence);
-                match self.write_private_inner_with_hook(&temporary, bytes, &mut after_temp_create)
-                {
+                match self.write_private_inner_with_hook(
+                    &temporary,
+                    bytes,
+                    &mut after_temp_create,
+                    flush,
+                ) {
                     Ok(file) => {
                         if !authorize
                             .take()
@@ -962,8 +1011,17 @@ mod imp {
 
         /// Read a child through the retained directory capability and revalidate
         /// the child entry against that same capability after the bounded read.
-        /// Unlike [`Self::read_private`], an ancestor rename is allowed: this is
-        /// reserved for cleanup that must stay on an already-authorized inode.
+        /// An ancestor rename is allowed: a caller that needs the lexical path to
+        /// still name this directory follows with
+        /// [`PinnedFile::validate_path_identity`].
+        #[cfg_attr(
+            any(test, debug_assertions),
+            aterm_spec_anchor::refines(
+                machine = "AnchoredArtifactTransaction",
+                action = "ReadPinned",
+                project = "aterm_gui::artifact_transaction_conformance::project_anchored"
+            )
+        )]
         pub(crate) fn read_private_at_retained(
             &self,
             name: &OsStr,
@@ -995,24 +1053,6 @@ mod imp {
                 file,
             };
             guard.validate_entry_identity_at_retained()?;
-            Ok((bytes, guard))
-        }
-
-        #[cfg_attr(
-            test,
-            aterm_spec::refines(
-                machine = "AnchoredArtifactTransaction",
-                action = "ReadPinned",
-                project = "aterm_gui::artifact_transaction_conformance::project_anchored"
-            )
-        )]
-        pub(crate) fn read_private(
-            &self,
-            name: &OsStr,
-            limit: usize,
-        ) -> io::Result<(Vec<u8>, PinnedFile)> {
-            let (bytes, guard) = self.read_private_at_retained(name, limit)?;
-            guard.validate_path_identity()?;
             Ok((bytes, guard))
         }
 
@@ -1105,6 +1145,32 @@ mod imp {
                 names.push(OsStr::from_bytes(bytes).to_os_string());
             }
             Ok(names)
+        }
+
+        /// Visit at most `limit` entries' names in directory order, holding
+        /// none of them (bounded memory however large the directory): `true`
+        /// when an entry was left unvisited.
+        pub(crate) fn visit_names(
+            &self,
+            limit: usize,
+            visit: &mut dyn FnMut(&OsStr),
+        ) -> io::Result<bool> {
+            let mut directory = Dir::read_from(self.leaf()).map_err(io::Error::from)?;
+            let mut seen = 0usize;
+            for entry in &mut directory {
+                let entry = entry.map_err(io::Error::from)?;
+                let bytes = entry.file_name().to_bytes();
+                if bytes == b"." || bytes == b".." {
+                    continue;
+                }
+                if seen == limit {
+                    return Ok(true);
+                }
+                seen += 1;
+                use std::os::unix::ffi::OsStrExt as _;
+                visit(OsStr::from_bytes(bytes));
+            }
+            Ok(false)
         }
 
         /// Return at most `limit` entries without turning a larger directory
@@ -1289,6 +1355,126 @@ mod imp {
             }
             Ok(())
         }
+
+        /// A NEW private append-only file (the session journal's segment,
+        /// `session_log_journal_fs`): `O_WRONLY|O_APPEND|O_CREAT|O_EXCL|
+        /// O_NOFOLLOW|O_CLOEXEC` at mode 0600 through the retained directory,
+        /// then checked a singly linked regular file and set to 0600 whatever
+        /// the umask. An existing name (a symlink, a FIFO, a file) is refused
+        /// by the exclusive create; a new file that fails the check is removed
+        /// exactly.
+        pub(crate) fn create_new_append_private(&self, name: &OsStr) -> io::Result<std::fs::File> {
+            self.create_new_private_with(name, OFlags::WRONLY | OFlags::APPEND)
+        }
+
+        /// A NEW private read-write file (the session journal's pending
+        /// instance lock): as [`Self::create_new_append_private`], opened
+        /// `O_RDWR`.
+        pub(crate) fn create_new_private_rw(&self, name: &OsStr) -> io::Result<std::fs::File> {
+            self.create_new_private_with(name, OFlags::RDWR)
+        }
+
+        fn create_new_private_with(
+            &self,
+            name: &OsStr,
+            access: OFlags,
+        ) -> io::Result<std::fs::File> {
+            validate_component(name)?;
+            let flags = access
+                | OFlags::CREATE
+                | OFlags::EXCL
+                | OFlags::NOFOLLOW
+                | OFlags::NONBLOCK
+                | OFlags::CLOEXEC;
+            let fd = openat(self.leaf(), name, flags, Mode::RUSR | Mode::WUSR)
+                .map_err(io::Error::from)?;
+            let file = PinnedFile {
+                dir: self.clone(),
+                name: name.to_os_string(),
+                file: std::fs::File::from(fd),
+            };
+            let prepare = (|| {
+                let stat = fstat(&file.file).map_err(io::Error::from)?;
+                if !FileType::from_raw_mode(stat.st_mode).is_file() || stat.st_nlink != 1 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "a new private file is not a singly-linked regular file",
+                    ));
+                }
+                fchmod(&file.file, Mode::RUSR | Mode::WUSR).map_err(io::Error::from)
+            })();
+            if let Err(error) = prepare {
+                let _ = file.remove_exact();
+                return Err(error);
+            }
+            Ok(file.file)
+        }
+
+        /// An existing entry, or a new one, opened read-write with no follow
+        /// (the session journal's retention lock): `O_RDWR|O_CREAT|
+        /// O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC`, mode 0600 when created; a
+        /// symlink is refused, and anything but a regular file too.
+        pub(crate) fn open_or_create_private_rw(&self, name: &OsStr) -> io::Result<std::fs::File> {
+            validate_component(name)?;
+            let flags = OFlags::RDWR
+                | OFlags::CREATE
+                | OFlags::NOFOLLOW
+                | OFlags::NONBLOCK
+                | OFlags::CLOEXEC;
+            let fd = openat(self.leaf(), name, flags, Mode::RUSR | Mode::WUSR)
+                .map_err(io::Error::from)?;
+            let file = std::fs::File::from(fd);
+            if !is_regular_file(&file) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "a private file is not a regular file",
+                ));
+            }
+            Ok(file)
+        }
+
+        /// An existing entry opened read-only with no follow and no wait (a
+        /// symlink refused, a FIFO opened without blocking and then refused,
+        /// as anything but a regular file is): what the session journal
+        /// reads, stats and probes.
+        pub(crate) fn open_regular_at_retained(&self, name: &OsStr) -> io::Result<std::fs::File> {
+            validate_component(name)?;
+            let fd = openat(self.leaf(), name, file_read_flags(), Mode::empty())
+                .map_err(io::Error::from)?;
+            let file = std::fs::File::from(fd);
+            if !is_regular_file(&file) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "not a regular file",
+                ));
+            }
+            Ok(file)
+        }
+
+        /// Rename `from` to `to` within this directory, never over an
+        /// existing `to` (Darwin `RENAME_EXCL`, Linux `RENAME_NOREPLACE`).
+        pub(crate) fn rename_no_replace(&self, from: &OsStr, to: &OsStr) -> io::Result<()> {
+            validate_component(from)?;
+            validate_component(to)?;
+            rename_no_replace_with_hook(self.leaf(), from, to, || {})
+        }
+
+        /// The retained directory's own metadata (its owner and mode).
+        pub(crate) fn leaf_metadata(&self) -> io::Result<std::fs::Metadata> {
+            std::fs::File::from(open_directory_at(self.leaf(), ".")?).metadata()
+        }
+
+        /// Set the retained directory's mode to 0700.
+        pub(crate) fn restrict_to_owner(&self) -> io::Result<()> {
+            fchmod(self.leaf(), Mode::RWXU).map_err(io::Error::from)
+        }
+    }
+
+    impl PinnedFile {
+        /// The pinned file's metadata (through its own descriptor).
+        pub(crate) fn metadata(&self) -> io::Result<std::fs::Metadata> {
+            self.file.metadata()
+        }
     }
 }
 
@@ -1299,8 +1485,10 @@ mod imp {
     use std::os::windows::io::AsRawHandle as _;
     use std::sync::Arc;
 
+    use crate::durable::Flush;
+
     use super::{
-        OsStr, OsString, Path, PathBuf, identity_changed, io, validate_component,
+        OsStr, OsString, Path, PathBuf, Publication, identity_changed, io, validate_component,
         validate_open_path,
     };
 
@@ -1711,8 +1899,8 @@ mod imp {
         }
 
         #[cfg_attr(
-            test,
-            aterm_spec::refines(
+            any(test, debug_assertions),
+            aterm_spec_anchor::refines(
                 machine = "AnchoredArtifactTransaction",
                 action = "ConfinePin",
                 project = "aterm_gui::artifact_transaction_conformance::project_anchored"
@@ -1872,6 +2060,7 @@ mod imp {
             bytes: &[u8],
             after_create: &mut Option<F>,
             validate_path: bool,
+            flush: Flush,
         ) -> io::Result<PinnedFile> {
             validate_component(name)?;
             if validate_path {
@@ -1925,7 +2114,8 @@ mod imp {
             }
             let result = (|| {
                 (&file.file).write_all(bytes)?;
-                crate::durable::sync_all(&file.file)
+                // The caller's tier, as the unix arm's.
+                crate::durable::finish(&file.file, flush)
             })();
             if let Err(error) = result {
                 let _ = file.remove_exact();
@@ -1936,7 +2126,8 @@ mod imp {
 
         fn write_private_inner(&self, name: &OsStr, bytes: &[u8]) -> io::Result<PinnedFile> {
             let mut after_create = Some(|| {});
-            self.write_private_inner_with_hook(name, bytes, &mut after_create, true)
+            // Ordered, as the unix arm's: every caller is an artifact.
+            self.write_private_inner_with_hook(name, bytes, &mut after_create, true, Flush::Ordered)
         }
 
         fn temporary_name(sequence: u64) -> OsString {
@@ -1947,8 +2138,8 @@ mod imp {
         }
 
         #[cfg_attr(
-            test,
-            aterm_spec::refines(
+            any(test, debug_assertions),
+            aterm_spec_anchor::refines(
                 machine = "AnchoredArtifactTransaction",
                 action = "WritePinned",
                 project = "aterm_gui::artifact_transaction_conformance::project_anchored"
@@ -2025,13 +2216,17 @@ mod imp {
                 authorize,
                 || {},
                 || {},
-                true,
+                Publication {
+                    flush: Flush::Ordered,
+                    sync_parent: true,
+                },
             )
         }
 
-        /// Publish one durable file as part of a private batch whose caller
-        /// supplies the parent-directory sync barrier before any visibility
-        /// marker. The file itself is still fsynced and identity-checked.
+        /// Publish one file as part of a private batch whose caller supplies the
+        /// parent-directory sync barrier before any visibility marker. The file
+        /// itself is still flushed (ordered: a video frame or index lands before the
+        /// marker that publishes it) and identity-checked.
         pub(crate) fn write_new_private_deferred_dir_sync_authorized(
             &self,
             name: &OsStr,
@@ -2044,7 +2239,10 @@ mod imp {
                 authorize,
                 || {},
                 || {},
-                false,
+                Publication {
+                    flush: Flush::Ordered,
+                    sync_parent: false,
+                },
             )
         }
 
@@ -2054,6 +2252,7 @@ mod imp {
             bytes: &[u8],
             after_temp_create: impl FnOnce(),
             after_publish: impl FnOnce(),
+            flush: Flush,
         ) -> io::Result<PinnedFile> {
             self.write_new_private_with_authorizer_and_hooks(
                 name,
@@ -2061,7 +2260,10 @@ mod imp {
                 || true,
                 after_temp_create,
                 after_publish,
-                true,
+                Publication {
+                    flush,
+                    sync_parent: true,
+                },
             )
         }
 
@@ -2072,8 +2274,9 @@ mod imp {
             authorize: impl FnOnce() -> bool,
             after_temp_create: impl FnOnce(),
             after_publish: impl FnOnce(),
-            sync_parent: bool,
+            publication: Publication,
         ) -> io::Result<PinnedFile> {
+            let Publication { flush, sync_parent } = publication;
             validate_component(name)?;
             static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let mut authorize = Some(authorize);
@@ -2087,6 +2290,7 @@ mod imp {
                     bytes,
                     &mut after_temp_create,
                     sync_parent,
+                    flush,
                 ) {
                     Ok(file) => {
                         if !authorize
@@ -2127,8 +2331,8 @@ mod imp {
         }
 
         #[cfg_attr(
-            test,
-            aterm_spec::refines(
+            any(test, debug_assertions),
+            aterm_spec_anchor::refines(
                 machine = "AnchoredArtifactTransaction",
                 action = "ReadPinned",
                 project = "aterm_gui::artifact_transaction_conformance::project_anchored"
@@ -2658,6 +2862,9 @@ mod shared_backend_contract_tests {
         assert!(!root.join(file).exists());
         pinned.remove_file_if_exists(file).unwrap();
 
+        // A Windows chain root denies delete while pinned, so the cleanup below
+        // must come after the pin drops or it silently leaves `root` behind.
+        drop(pinned);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3024,6 +3231,55 @@ mod tests {
             ))
     }
 
+    /// An artifact's bytes are only ordered ahead of what follows (aterm-durable's
+    /// counting seam), never fully flushed: the requester is local and reads the
+    /// page cache, and no recovery reads them. A write that asks for
+    /// [`Flush::Durable`] still gets it (no caller asks now that the network drive
+    /// is gone, but the tier is plumbed), and the directory flush,
+    /// [`PinnedDir::sync`], is the untouched plain `fsync(2)`, which goes through no
+    /// aterm-durable arm and so records nothing.
+    #[test]
+    fn an_artifacts_bytes_are_ordered_and_a_durable_write_stays_durable() {
+        use aterm_durable::{Flush, seam::Recording};
+        use std::ffi::OsStr;
+        let root = unique_dir("flush-tiers");
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = PinnedDir::open_resolved(&root).unwrap();
+        let recording = Recording::start();
+        let shot = dir.write_private(OsStr::new("shot.png"), b"png").unwrap();
+        assert_eq!(
+            recording.take(),
+            [Flush::Ordered],
+            "a replaced artifact's bytes; its entry takes the plain fsync(2)"
+        );
+        let done = dir
+            .write_new_private(OsStr::new("shot.done"), b"done")
+            .unwrap();
+        assert_eq!(recording.take(), [Flush::Ordered], "a new artifact's bytes");
+        let frame = dir
+            .write_new_private_deferred_dir_sync_authorized(OsStr::new("frame.png"), b"f", || true)
+            .unwrap();
+        assert_eq!(
+            recording.take(),
+            [Flush::Ordered],
+            "a video batch member's bytes"
+        );
+        let token = dir
+            .write_new_private_with_hooks(
+                OsStr::new("token"),
+                b"secret",
+                || {},
+                || {},
+                Flush::Durable,
+            )
+            .unwrap();
+        assert_eq!(recording.take(), [Flush::Durable], "a durable write");
+        dir.sync().unwrap();
+        assert_eq!(recording.take(), [], "the directory's plain fsync(2)");
+        drop((shot, done, frame, token));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// REGRESSION (FS-1, 2026-10-10): `O_NOFOLLOW`, `unlinkat` and `renameat`
     /// govern only a name's final component, and the kernel resolves `link` in
     /// `"link/"`, `"link/."` and `"link//"`. Until the name was judged raw,
@@ -3377,12 +3633,6 @@ mod tests {
         assert!(
             pinned.validate_path_identity().is_err(),
             "the ordinary path authority must reject the replaced namespace"
-        );
-        assert!(
-            pinned
-                .read_private(std::ffi::OsStr::new("index.json"), 64)
-                .is_err(),
-            "ordinary reads retain their lexical fail-closed contract"
         );
         let (index, index_guard) = pinned
             .read_private_at_retained(std::ffi::OsStr::new("index.json"), 64)

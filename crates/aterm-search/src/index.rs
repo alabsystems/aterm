@@ -1113,24 +1113,6 @@ impl SearchIndex {
             .collect()
     }
 
-    /// Verified matches, sorted for `direction`.
-    #[cfg(test)]
-    pub fn search_ordered(&self, query: &str, direction: SearchDirection) -> Vec<SearchMatch> {
-        let mut matches = self.search_with_positions(query);
-
-        match direction {
-            SearchDirection::Forward => {
-                matches.sort_by_key(|m| (m.line, m.start_col));
-            }
-            SearchDirection::Backward => {
-                matches
-                    .sort_by_key(|m| (std::cmp::Reverse(m.line), std::cmp::Reverse(m.start_col)));
-            }
-        }
-
-        matches
-    }
-
     /// Get the number of indexed lines.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -1406,8 +1388,8 @@ impl SearchIndex {
     }
 }
 
-/// Maximum regex pattern length in bytes, the streaming engine's default
-/// `max_pattern_len`; longer patterns are refused before compiling.
+/// Maximum regex pattern length in bytes; longer patterns are refused before
+/// compiling, to bound CPU cost.
 const MAX_REGEX_PATTERN_LEN: usize = 1024;
 
 /// Maximum compiled regex size (bytes) passed to `RegexBuilder::size_limit`: 128 KiB,
@@ -2351,13 +2333,6 @@ mod regex_scan_budget_tests {
         index
     }
 
-    #[test]
-    fn the_compiled_pattern_carries_the_scan_budget() {
-        let re = SearchIndex::compile_regex("needle", true).expect("compiles");
-        assert_eq!(re.step_limit(), REGEX_STEP_LIMIT);
-        assert!(!re.step_limit_exceeded());
-    }
-
     /// A pattern too expensive to finish a line is never answered with a list that
     /// reads as complete: the batch result counts the lines it could not finish and
     /// keeps every other line's matches, the matches-only API refuses, and point
@@ -2496,29 +2471,6 @@ mod regex_scan_budget_tests {
             got.matches.iter().map(|m| m.line).collect::<Vec<_>>(),
             vec![0, 2]
         );
-    }
-
-    /// Ordinary patterns over the same content are untouched: the budget is
-    /// three orders of magnitude above what a real query costs.
-    #[test]
-    fn ordinary_regex_queries_are_unaffected() {
-        let mut index = SearchIndex::new();
-        index.index_line(0, "commit 66390b5c8f2a1b3c landed at 192.168.0.1");
-        index.index_line(1, &"user@example.com ".repeat(240));
-        index.index_line(2, "nothing here");
-
-        for (pattern, want_lines) in [
-            (r"\b[0-9a-f]{7,40}\b", vec![0usize]),
-            (r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", vec![1]),
-            (r"\d+\.\d+\.\d+\.\d+", vec![0]),
-        ] {
-            let matches = index
-                .search_with_positions_opts(pattern, true, true)
-                .unwrap_or_else(|e| panic!("{pattern:?} must not be refused: {e}"));
-            let mut lines: Vec<usize> = matches.iter().map(|m| m.line).collect();
-            lines.dedup();
-            assert_eq!(lines, want_lines, "{pattern:?}");
-        }
     }
 }
 

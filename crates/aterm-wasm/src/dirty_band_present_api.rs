@@ -226,8 +226,8 @@ impl AtermTerminal {
 mod tests {
     use super::*;
 
-    fn term() -> Option<AtermTerminal> {
-        AtermTerminal::new_from_system(8, 40, 14.0)
+    fn term() -> AtermTerminal {
+        crate::system_font_terminal(8, 40, 14.0)
     }
 
     /// What a from-scratch full expansion of the current frame produces.
@@ -259,7 +259,7 @@ mod tests {
 
     #[test]
     fn first_frame_is_one_full_band_and_gate_hit_is_zero() {
-        let Some(mut t) = term() else { return };
+        let mut t = term();
         t.process(b"hello band world\r\n");
         t.render();
         assert_eq!(
@@ -275,7 +275,7 @@ mod tests {
 
     #[test]
     fn keystroke_damage_exports_a_sub_frame_band_and_stays_byte_exact() {
-        let Some(mut t) = term() else { return };
+        let mut t = term();
         t.process(b"line one\r\nline two\r\nline three");
         t.render();
         t.process_str("x"); // one-row edit on the cursor row
@@ -300,7 +300,7 @@ mod tests {
 
     #[test]
     fn scroll_and_resize_take_the_full_band_path() {
-        let Some(mut t) = term() else { return };
+        let mut t = term();
         for i in 0..50 {
             t.process(format!("scroll line {i}\r\n").as_bytes());
         }
@@ -320,7 +320,7 @@ mod tests {
 
     #[test]
     fn fractional_scroll_frames_present_the_full_band() {
-        let Some(mut t) = term() else { return };
+        let mut t = term();
         for i in 0..50 {
             t.process(format!("frac line {i}\r\n").as_bytes());
         }
@@ -349,7 +349,7 @@ mod tests {
     #[test]
     fn scroll_blit_is_taken_and_stays_byte_exact() {
         use aterm_render::DamageOutcome;
-        let Some(mut t) = term() else { return };
+        let mut t = term();
         t.set_scrollback_limit(4000);
         for i in 0..2000 {
             t.process(format!("scroll blit line {i}\r\n").as_bytes());
@@ -386,7 +386,7 @@ mod tests {
     #[test]
     fn shade_scroll_blit_present_stays_byte_exact() {
         use aterm_render::DamageOutcome;
-        let Some(mut t) = term() else { return };
+        let mut t = term();
         t.set_scrollback_limit(4000);
         for i in 0..1500 {
             // ▓▓▒░ shade + accented capitals (upward overshoot) + box glyphs.
@@ -417,7 +417,7 @@ mod tests {
 
     #[test]
     fn selection_change_bands_only_the_selection_rows() {
-        let Some(mut t) = term() else { return };
+        let mut t = term();
         t.process(b"alpha beta gamma\r\ndelta epsilon\r\nzeta eta");
         t.render();
         t.selection_start(1, 0);

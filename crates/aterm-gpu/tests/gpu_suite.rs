@@ -19,14 +19,19 @@ mod common;
 #[allow(dead_code)]
 mod rain_common;
 
-mod atlas_follows_the_cpu_rasters;
+// The wgpu oracle's blit and present seams: `--features wgpu-oracle` only.
+#[cfg(wgpu_arm)]
 mod blit_bands;
+// The wgpu oracle's blit and present seams: `--features wgpu-oracle` only.
+#[cfg(wgpu_arm)]
 mod blit_invert;
 mod capture_tap_conformance;
 mod cat_parity;
 mod conformance_gpuencode;
 mod cursor_shapes_gpu;
 mod dirty_gate;
+// The wgpu arm's effect-pipeline ledger: `--features wgpu-oracle` only on macOS.
+#[cfg(wgpu_arm)]
 mod effect_pipeline_demand;
 mod feature_flip_parity;
 mod fire_halo_gpu;
@@ -36,6 +41,8 @@ mod free_sprite_gpu;
 mod glow_halo_parity;
 mod glow_under_parity;
 mod gpu_matches_cpu;
+// The wgpu arm's bloom target and suballocator: `--features wgpu-oracle` only on macOS.
+#[cfg(wgpu_arm)]
 mod gpu_memory_floor;
 mod hdr_gate;
 mod heat_shimmer;
@@ -45,7 +52,8 @@ mod merged_ligature_parity;
 mod oversized_resize;
 mod parity_fuzz;
 mod parity_fuzz_adversarial;
-mod pipeline_table_guard;
+// The wgpu oracle's blit and present seams: `--features wgpu-oracle` only.
+#[cfg(wgpu_arm)]
 mod present_real;
 mod rain_parity;
 mod scissor_repaint;

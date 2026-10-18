@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 bind for `DriverGeometry` (`aterm_spec::derive::driver_geometry_model`)
+//! Tier-1 bind for `DriverGeometry` (`aterm_models_gui::driver_geometry_model`)
 //! — the live upgrade's notice, refused `skipped reason=changed` on 121
 //! visits of 121 on 2026-09-27.
 //!
@@ -50,8 +50,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aterm_core::terminal::Terminal;
+use aterm_models_gui::driver_geometry_model;
 use aterm_session::sink::SinkWriter;
-use aterm_spec::derive::driver_geometry_model;
 use aterm_spec::interp;
 
 use crate::input_stall::tests::raw_pty_pair;

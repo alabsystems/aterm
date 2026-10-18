@@ -12,9 +12,7 @@ use super::state::{GridCursorState, GridPresentationState, GridStorage};
 use super::{Cell, Grid, HorizontalMargins, PAGE_SIZE, PageStore, ScrollRegion};
 use crate::CellExtras;
 use crate::Damage;
-use crate::GenerationTracker;
 use crate::Row;
-use crate::StyleTable;
 use crate::{MAX_GRID_COLS, MAX_GRID_ROWS};
 
 impl Grid {
@@ -69,13 +67,11 @@ impl Grid {
                 compress_offload_active: false,
                 flood_truncated_lines: 0,
                 reflow_window_cap_dropped: 0,
-                ring_byte_watermark: None,
                 scrollback_clear_gen: 0,
                 history_renumber_epoch: 0,
                 history_reveal_gen: 0,
                 ring_extras: super::ring_extras::RingExtras::new(),
                 resize_undo: None,
-                generations: GenerationTracker::new(),
                 absolute_row_counter: u64::from(rows),
                 // Nonzero, so `0` is a usable "never observed" sentinel.
                 content_gen: 1,
@@ -96,7 +92,6 @@ impl Grid {
                     presentation: GridPresentationState {
                         damage: Damage::Full,
                         extras: CellExtras::new(),
-                        styles: StyleTable::new(),
                         content_scroll_delta: 0,
                         selection_damage: crate::SelectionDamage::None,
                         last_output_damage_abs: None,
@@ -116,9 +111,9 @@ impl Grid {
     }
 
     /// Create a grid with tiered scrollback: the ring holds `ring_buffer_size`
-    /// lines and older lines go to `scrollback` (memory or disk-backed).
+    /// lines and older lines go to `scrollback`.
     ///
-    /// A pre-filled store (a restored checkpoint, a reopened disk tier) holds
+    /// A pre-filled store (a restored checkpoint) holds
     /// lines this grid's lineage already pushed, so the absolute row counter
     /// starts past them: the oldest carried line is `0` and the live top
     /// `carried`, as [`Grid::oldest_absolute_row`] expects.
@@ -170,13 +165,11 @@ impl Grid {
                 compress_offload_active: false,
                 flood_truncated_lines: 0,
                 reflow_window_cap_dropped: 0,
-                ring_byte_watermark: None,
                 scrollback_clear_gen: 0,
                 history_renumber_epoch: 0,
                 history_reveal_gen: 0,
                 ring_extras: super::ring_extras::RingExtras::new(),
                 resize_undo: None,
-                generations: GenerationTracker::new(),
                 absolute_row_counter: u64::from(rows).saturating_add(carried),
                 // Nonzero, so `0` is a usable "never observed" sentinel.
                 content_gen: 1,
@@ -197,7 +190,6 @@ impl Grid {
                     presentation: GridPresentationState {
                         damage: Damage::Full,
                         extras: CellExtras::new(),
-                        styles: StyleTable::new(),
                         content_scroll_delta: 0,
                         selection_damage: crate::SelectionDamage::None,
                         last_output_damage_abs: None,
@@ -227,62 +219,27 @@ impl Default for Grid {
 mod tests {
     use super::*;
 
-    // Grid::new() clamps its dimensions
-
+    /// Every constructor clamps its dimensions into `1..=MAX` and builds a
+    /// grid whose invariants hold.
     #[test]
-    fn test_new_clamps_zero_rows_to_one() {
-        let grid = Grid::new(0, 80);
-        assert_eq!(grid.rows(), 1, "zero rows should be clamped to 1");
-    }
-
-    #[test]
-    fn test_new_clamps_zero_cols_to_one() {
-        let grid = Grid::new(24, 0);
-        assert_eq!(grid.cols(), 1, "zero cols should be clamped to 1");
-    }
-
-    #[test]
-    fn test_new_clamps_both_zero_to_one() {
-        let grid = Grid::new(0, 0);
-        assert_eq!(grid.rows(), 1);
-        assert_eq!(grid.cols(), 1);
-    }
-
-    #[test]
-    fn test_new_clamps_oversize_to_max() {
-        let grid = Grid::new(u16::MAX, u16::MAX);
-        assert_eq!(grid.rows(), MAX_GRID_ROWS);
-        assert_eq!(grid.cols(), MAX_GRID_COLS);
-    }
-
-    // Grid::with_tiered_scrollback()
-
-    #[test]
-    fn test_with_tiered_scrollback_clamps_zero() {
-        let sb = aterm_scrollback::Scrollback::new(100, 1000, 1_000_000);
-        let grid = Grid::with_tiered_scrollback(0, 0, 500, sb);
-        assert_eq!(grid.rows(), 1);
-        assert_eq!(grid.cols(), 1);
-    }
-
-    // Invariant checks after construction
-
-    #[test]
-    fn test_new_invariants_hold() {
-        let grid = Grid::new(24, 80);
-        grid.assert_invariants();
-    }
-
-    #[test]
-    fn test_with_scrollback_invariants_hold() {
-        let grid = Grid::with_scrollback(10, 40, 500);
-        grid.assert_invariants();
-    }
-
-    #[test]
-    fn test_with_tiered_scrollback_invariants_hold() {
-        let sb = aterm_scrollback::Scrollback::new(50, 500, 500_000);
-        let grid = Grid::with_tiered_scrollback(10, 40, 500, sb);
-        grid.assert_invariants();
+    fn constructors_clamp_dimensions_and_hold_invariants() {
+        let cases = [
+            ((0, 80), (1, 80)),
+            ((24, 0), (24, 1)),
+            ((0, 0), (1, 1)),
+            ((u16::MAX, u16::MAX), (MAX_GRID_ROWS, MAX_GRID_COLS)),
+            ((10, 40), (10, 40)),
+        ];
+        for ((rows, cols), want) in cases {
+            let tiered = aterm_scrollback::Scrollback::new(50, 500, 500_000);
+            for grid in [
+                Grid::new(rows, cols),
+                Grid::with_scrollback(rows, cols, 500),
+                Grid::with_tiered_scrollback(rows, cols, 500, tiered),
+            ] {
+                assert_eq!((grid.rows(), grid.cols()), want, "{rows}x{cols}");
+                grid.assert_invariants();
+            }
+        }
     }
 }

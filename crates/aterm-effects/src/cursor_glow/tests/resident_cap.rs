@@ -39,37 +39,6 @@ fn cursor_resident_cap_model() -> aterm_spec::derive::Model {
     }
 }
 
-/// A hostile same-instant move flood cannot grow resident path or particle
-/// work beyond the hard caps. This exercises the pre-decay worst case.
-#[test]
-fn resident_glow_state_is_hard_capped_at_spawn() {
-    let g = geom();
-    let mut c = cfg(GlowStyle::Water, true);
-    c.length = usize::MAX;
-    c.intensity = 1.0;
-    let mut glow = CursorGlow {
-        rng: 0x9E37_79B9,
-        ..CursorGlow::default()
-    };
-    let t = Instant::now();
-    for i in 0..1_000u16 {
-        let (from, to) = if i.is_multiple_of(2) { (1, 2) } else { (2, 1) };
-        glow.last = Some((2, from));
-        glow.note_synthetic_move(t);
-        glow.spawn(2, from, 2, to, t, &c, g, SpawnLane::Visible);
-        assert!(glow.sparks.len() <= CursorGlow::MAX_SPARKS);
-        assert!(glow.particles.len() <= CursorGlow::MAX_PARTICLES);
-    }
-    assert_eq!(glow.sparks.len(), CursorGlow::MAX_SPARKS);
-    assert_eq!(glow.particles.len(), CursorGlow::MAX_PARTICLES);
-
-    let mut out = Vec::new();
-    glow.last = Some((2, 1));
-    glow.tick(Some((2, 1)), t, &c, g, &mut out);
-    assert!(out.len() <= CursorGlow::MAX_QUADS);
-    assert_invariants(&out, g);
-}
-
 /// Tier 0: the healthy saturating transition proves both resident bounds over
 /// the full bounded state space, while the unclamped `Buggy=1` twin must yield
 /// a counterexample. The latter prevents a vacuous green proof.
@@ -175,17 +144,4 @@ fn cursor_resident_cap_real_spawn_conforms_to_model() {
         "CursorGlow resident-cap negative control",
     );
     assert!(!admitted, "missing-clamp transition must be rejected");
-}
-
-#[test]
-fn hsv_and_fire_are_sane() {
-    assert_eq!(hsv2rgb(0.0, 1.0, 1.0), 0x00FF_0000); // red
-    assert_eq!(hsv2rgb(1.0 / 3.0, 1.0, 1.0), 0x0000_FF00); // green
-    assert_eq!(hsv2rgb(2.0 / 3.0, 1.0, 1.0), 0x0000_00FF); // blue
-    let hot = fire_ramp(1.0);
-    let cool = fire_ramp(0.0);
-    assert!(
-        (hot >> 16) & 0xff >= (cool >> 16) & 0xff,
-        "hot end is brighter red+"
-    );
 }

@@ -119,3 +119,87 @@ fn claude_with_no_accounts_store_reads_its_profile() {
         "an oauthAccount is a signed-in account"
     );
 }
+
+/// CODEX'S LIMIT IS READ BY ITS PICK (`ai::codex_limits::home_pick`): a window at
+/// 100% whose reset is ahead names the limit's end, though another thread of the login wrote a
+/// smaller share of that window since (a count written again from what it held), and a legacy
+/// fork written last copied its parent's 60% under fresh stamps. Negative controls: a login
+/// signed in since, whose own window is far from its limit, is the one read; and a 100% window
+/// whose reset has passed names no end.
+#[test]
+fn codexs_limit_is_the_newest_logins_largest_share_past_a_forks_copy() {
+    use crate::harness::codex_rollout::fixtures::{meta_as, rate};
+    const ROOT: &str = "01900000-0000-7000-8000-000000000001";
+    const SIDE: &str = "01900000-0000-7000-8000-000000000002";
+    const FORK: &str = "01900000-0000-7000-8000-000000000003";
+    const OTHER: &str = "01900000-0000-7000-8000-000000000004";
+    let b = machine(&["codex"]);
+    let now = 1_800_000_000_i64;
+    let ms = now * 1000;
+    let day = b.home.join(".codex/sessions/2026/12/15");
+    std::fs::create_dir_all(&day).expect("day");
+    let path = |thread: &str| day.join(format!("rollout-2026-12-15T10-00-00-{thread}.jsonl"));
+    let write = |thread: &str, body: String, age_s: u64| {
+        std::fs::write(path(thread), body).expect("write");
+        std::fs::File::options()
+            .append(true)
+            .open(path(thread))
+            .and_then(|f| {
+                f.set_modified(
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000 - age_s),
+                )
+            })
+            .expect("mtime");
+    };
+    let a = Some(("acct-stand-in-1", "user-stand-in"));
+    let reset = now + 3600;
+    let limited = |reset: i64| {
+        [
+            meta_as(ms - 7_200_000, ROOT, ROOT, None, Some("paginated"), a),
+            rate(ms - 1_800_000, "codex", Some((97.0, 300, reset)), None),
+            rate(ms - 900_000, "codex", Some((100.0, 300, reset + 20)), None),
+        ]
+        .concat()
+    };
+    write(ROOT, limited(reset), 600);
+    write(
+        SIDE,
+        [
+            meta_as(ms - 3_600_000, SIDE, SIDE, None, Some("paginated"), a),
+            rate(ms - 300_000, "codex", Some((99.0, 300, reset + 40)), None),
+        ]
+        .concat(),
+        300,
+    );
+    write(
+        FORK,
+        [
+            meta_as(ms - 60_000, FORK, FORK, Some(ROOT), Some("legacy"), a),
+            rate(ms - 60_000, "codex", Some((60.0, 300, reset + 40)), None),
+        ]
+        .concat(),
+        60,
+    );
+    let limit = |b: &crate::ai::testing::Box3| gather_with(b, &[], &[], &CODEX).limited_until;
+    assert_eq!(limit(&b), Some(reset + 40), "the window's anchor");
+    // NEGATIVE CONTROL 1: another login's thread, written last.
+    let other = [
+        meta_as(
+            ms - 30_000,
+            OTHER,
+            OTHER,
+            None,
+            Some("paginated"),
+            Some(("acct-stand-in-2", "user-stand-in")),
+        ),
+        rate(ms - 20_000, "codex", Some((10.0, 300, now + 9000)), None),
+    ]
+    .concat();
+    write(OTHER, other, 20);
+    assert_eq!(limit(&b), None);
+    // NEGATIVE CONTROL 2: the 100% window's reset passed.
+    std::fs::remove_file(path(OTHER)).expect("rm");
+    std::fs::remove_file(path(SIDE)).expect("rm");
+    write(ROOT, limited(now - 100), 600);
+    assert_eq!(limit(&b), None);
+}

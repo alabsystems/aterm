@@ -36,8 +36,8 @@ pub use self::wm::*;
 pub use self::xmodmap::ModifierKeymap;
 
 use super::atoms::*;
-use super::{ffi, VoidCookie, X11Error, XConnection, XError};
-use x11rb::protocol::xproto::{self, ConnectionExt as _};
+use super::{ffi, IgnoreError as _, VoidCookie, X11Error, XConnection, XError};
+use aterm_x11::proto::xproto;
 
 pub fn maybe_change<T: PartialEq>(field: &mut Option<T>, value: T) -> bool {
     let wrapped = Some(value);
@@ -76,7 +76,7 @@ impl XConnection {
     }
 
     pub fn sync_with_server(&self) -> Result<(), XError> {
-        unsafe { (self.xlib.XSync)(self.display, ffi::False) };
+        unsafe { (self.xlib.XSync)(self.display, ffi::FALSE) };
         // println!("XSync");
         self.check_errors()
     }

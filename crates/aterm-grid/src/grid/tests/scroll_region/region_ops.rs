@@ -128,27 +128,6 @@ fn grid_top_anchored_partial_scroll_archives_history_and_preserves_footer() {
 }
 
 #[test]
-fn grid_top_anchored_partial_batch_scroll_archives_each_displaced_row() {
-    let mut grid = lettered(Grid::with_scrollback(5, 10, 10));
-
-    grid.set_scroll_region(0, 2);
-    grid.scroll_region_up(2);
-
-    assert_eq!(grid.scrollback_lines(), 2);
-    for (index, expected) in ["A", "B"].into_iter().enumerate() {
-        assert_eq!(
-            grid.get_history_line(index)
-                .expect("each displaced row enters history")
-                .to_string()
-                .trim_end(),
-            expected
-        );
-    }
-    assert_eq!(col0(&grid), "C  DE");
-    grid.assert_invariants();
-}
-
-#[test]
 fn grid_repeated_top_anchored_scrolls_coalesce_footer_row_splices() {
     let mut grid = Grid::with_scrollback(5, 10, 10);
     // Written rows: never-written ones archive nothing and splice nothing (pinned below).
@@ -497,62 +476,29 @@ fn grid_scroll_region_down_within_region() {
     assert_eq!(col0(&grid), "AB  CDGH");
 }
 
-/// scroll_region_up with a nonzero display_offset snaps to the live view.
+/// Every region line op (SU, SD, IL, DL) run with a nonzero display_offset
+/// snaps the viewport to the live view.
 #[test]
-fn grid_scroll_region_up_resets_nonzero_display_offset() {
-    let mut grid = lettered(Grid::with_scrollback(8, 10, 20));
-    grid.scroll_up(4);
-    grid.set_scroll_region(2, 5);
-    grid.scroll_display(2);
-    assert_eq!(grid.display_offset(), 2);
+fn grid_region_line_ops_reset_nonzero_display_offset() {
+    #[expect(clippy::type_complexity, reason = "a test's case table")]
+    let ops: [(&str, fn(&mut Grid)); 4] = [
+        ("scroll_region_up", |g| g.scroll_region_up(1)),
+        ("scroll_region_down", |g| g.scroll_region_down(1)),
+        ("insert_lines", |g| g.insert_lines(1)),
+        ("delete_lines", |g| g.delete_lines(1)),
+    ];
+    for (name, op) in ops {
+        let mut grid = lettered(Grid::with_scrollback(8, 10, 20));
+        grid.scroll_up(4);
+        grid.set_scroll_region(2, 5);
+        grid.set_cursor(3, 0);
+        grid.scroll_display(2);
+        assert_eq!(grid.display_offset(), 2, "{name}: precondition");
 
-    grid.scroll_region_up(1);
-    assert_eq!(grid.display_offset(), 0);
-    grid.assert_invariants();
-}
-
-/// scroll_region_down resets display_offset to 0.
-#[test]
-fn grid_scroll_region_down_resets_nonzero_display_offset() {
-    let mut grid = lettered(Grid::with_scrollback(8, 10, 20));
-    grid.scroll_up(4);
-    grid.set_scroll_region(2, 5);
-    grid.scroll_display(2);
-    assert_eq!(grid.display_offset(), 2);
-
-    grid.scroll_region_down(1);
-    assert_eq!(grid.display_offset(), 0);
-    grid.assert_invariants();
-}
-
-/// insert_lines resets display_offset to 0.
-#[test]
-fn grid_insert_lines_resets_nonzero_display_offset() {
-    let mut grid = lettered(Grid::with_scrollback(8, 10, 20));
-    grid.scroll_up(4);
-    grid.set_scroll_region(2, 5);
-    grid.set_cursor(3, 0);
-    grid.scroll_display(2);
-    assert_eq!(grid.display_offset(), 2);
-
-    grid.insert_lines(1);
-    assert_eq!(grid.display_offset(), 0);
-    grid.assert_invariants();
-}
-
-/// delete_lines resets display_offset to 0.
-#[test]
-fn grid_delete_lines_resets_nonzero_display_offset() {
-    let mut grid = lettered(Grid::with_scrollback(8, 10, 20));
-    grid.scroll_up(4);
-    grid.set_scroll_region(2, 5);
-    grid.set_cursor(3, 0);
-    grid.scroll_display(2);
-    assert_eq!(grid.display_offset(), 2);
-
-    grid.delete_lines(1);
-    assert_eq!(grid.display_offset(), 0);
-    grid.assert_invariants();
+        op(&mut grid);
+        assert_eq!(grid.display_offset(), 0, "{name}");
+        grid.assert_invariants();
+    }
 }
 
 // Margined IL/DL tests (DECLRMM)

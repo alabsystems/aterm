@@ -63,12 +63,10 @@ enum SeamOwner {
 }
 
 /// The census of one scripted session through the seam: every wake the
-/// seam asked for, by owner, plus the two idle marks after the last key.
+/// seam asked for, by owner, plus the idle marks after the last key.
 #[derive(Debug, Default)]
 struct SeamCensus {
     wakes: std::collections::BTreeMap<SeamOwner, u32>,
-    renders: u32,
-    presents: u32,
     /// Ticks on which `is_active` held with no deadline offered: the fingerprint-only pin the
     /// host's train would otherwise re-arm on.
     fp_only: u32,
@@ -82,8 +80,6 @@ struct SeamCensus {
     /// ms after the last gesture at which `next_change_deadline` first read
     /// `None`.
     deadline_none_ms: Option<u64>,
-    /// ms after the last gesture at which the seam's crown window last held.
-    crown_last_ms: Option<u64>,
 }
 
 /// Drive the seam through [`census_schedule`] as the host's lane would: a wake
@@ -112,7 +108,6 @@ fn seam_wake_census(lane: Duration) -> SeamCensus {
     let mut census = SeamCensus::default();
     let mut cell = (12u16, 4u16);
     let mut next_ev = 0usize;
-    let mut last_fp = 0u64;
     // Seed: one dark tick so the engine has a source cell.
     let mut now = t0 - Duration::from_millis(50);
     glow.tick(Some(cell), now, &c, g, &mut out);
@@ -156,12 +151,7 @@ fn seam_wake_census(lane: Duration) -> SeamCensus {
             }
             next_ev += 1;
         }
-        let fp = glow.tick(Some(cell), now, &c, g, &mut out);
-        census.renders += 1;
-        if fp != last_fp {
-            census.presents += 1;
-            last_fp = fp;
-        }
+        glow.tick(Some(cell), now, &c, g, &mut out);
         glow.drain_sound_cues().for_each(drop);
         // Classify the deadline the seam offers from this state.
         due = glow.next_change_deadline(now, lane);
@@ -184,9 +174,6 @@ fn seam_wake_census(lane: Duration) -> SeamCensus {
                 census.deadline_none_ms = None;
             } else if census.deadline_none_ms.is_none() {
                 census.deadline_none_ms = Some(since_last);
-            }
-            if crown {
-                census.crown_last_ms = Some(since_last);
             }
         }
         if glow.is_active() && due.is_none() {
@@ -219,27 +206,12 @@ fn seam_wake_census(lane: Duration) -> SeamCensus {
     census
 }
 
-/// The seam's wake census, printed with `--nocapture`: wakes by owner over the census schedule.
-/// No v1 pool holds the frame train under v2, and the seam's cadence releases when the engine's
-/// does.
+/// The seam's wake census: wakes by owner over the census schedule. No v1 pool holds the frame
+/// train under v2, and the seam's cadence releases when the engine's does.
 #[test]
 fn under_v2_the_seam_never_paces_the_frame_train_for_v1s_crown() {
     let lane = Duration::from_micros(16_667);
     let v2 = seam_wake_census(lane);
-    let total: u32 = v2.wakes.values().sum();
-    println!(
-        "seam census v2: wakes {total} renders {} presents {} fp_only {} \
-         cadence→false +{:?} ms (engine +{:?} ms) deadline→None +{:?} ms crown last \
-         +{:?} ms by owner {:?}",
-        v2.renders,
-        v2.presents,
-        v2.fp_only,
-        v2.cadence_false_ms,
-        v2.engine_brisk_false_ms,
-        v2.deadline_none_ms,
-        v2.crown_last_ms,
-        v2.wakes
-    );
     assert_eq!(
         v2.wakes.get(&SeamOwner::V1Crown).copied().unwrap_or(0),
         0,
@@ -276,7 +248,6 @@ fn under_v2_the_seam_never_paces_the_frame_train_for_v1s_crown() {
     let last_ms = census_schedule().last().map_or(0, |s| s.0);
     let lane_ticks =
         ((last_ms + cadence_false) as f64 / (lane.as_secs_f64() * 1_000.0)).ceil() as u32 + 1;
-    println!("seam census v2: brisk wakes {train_v2} over {lane_ticks} lane ticks");
     assert!(
         train_v2 > 0 && train_v2 <= lane_ticks,
         "v2 held the frame train for {train_v2} wakes where the lane ticked {lane_ticks} \

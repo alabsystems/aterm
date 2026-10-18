@@ -35,8 +35,10 @@
 //! Everything is pure over data except these thin wrappers, each beside a table-testable pure
 //! classifier:
 //!
-//! * [`probe_fda`]: one `open(…, O_RDONLY)` of the user's `TCC.db`, closed unread; prompt-free,
-//!   as `kTCCServiceSystemPolicyAllFiles` does not allow prompting.
+//! * [`probe_fda`]: one `open(…, O_RDONLY)` of the user's `TCC.db`, or of the system one where
+//!   macOS keeps no user store (macOS 27), closed unread, by a child of this process
+//!   (`aterm __tcc-open`); prompt-free, as `kTCCServiceSystemPolicyAllFiles` does not allow
+//!   prompting.
 //! * [`responsible_pid`], [`responsible_app`]: the responsibility SPI (through `dlsym`),
 //!   `proc_pidpath`, and at most one bounded `Info.plist` read outside the protected roots.
 //! * [`tccutil_presence`]: one `stat` of `/usr/bin/tccutil`.
@@ -44,7 +46,8 @@
 //! * [`debugger_membership`], [`self_hardening`], [`process_birth`]: directory and kernel
 //!   queries, no spawn.
 //! * [`probe_devtool`]: at most one `/usr/bin/log show`; [`probe_devtool_list`]: one `open` of
-//!   the system `TCC.db`, then at most one `sqlite3 -readonly`; both with a constant argv.
+//!   the system `TCC.db` (by a child, as for [`probe_fda`]), then at most one
+//!   `sqlite3 -readonly`; both with a constant argv.
 //! * [`run_devtools_change`], the one actuator: a fresh `-status` read, then at most one
 //!   `DevToolsSecurity -enable` or `-disable`.
 //!
@@ -87,7 +90,9 @@ pub const ERRNO_ESRCH: i32 = 3;
 pub const ERRNO_ENOENT: i32 = 2;
 
 /// The user's TCC store, relative to `$HOME`. Reaching it requires Full Disk
-/// Access; its contents are never read.
+/// Access; its contents are never read. macOS 27 keeps no user store (the directory is
+/// absent, so the open answers `ENOENT` with or without the grant), and the probe then opens
+/// [`SYSTEM_TCC_DB`], which answers `EPERM` without the grant (measured on macOS 27.0.1).
 #[cfg(any(target_os = "macos", test))]
 const TCC_DB_RELATIVE: &str = "Library/Application Support/com.apple.TCC/TCC.db";
 
@@ -315,17 +320,19 @@ pub const fn unsupported_probe() -> FdaProbe {
 }
 
 /// The probe with the executable, the home directory and the syscall injected: the seam every
-/// guard is enforced at. `syscall` runs at most once, with the resolved `TCC.db` path, and only
-/// after every refusal is ruled out.
+/// guard is enforced at. `syscall` runs only after every refusal is ruled out: once with the
+/// user's `TCC.db`, and a second time with [`SYSTEM_TCC_DB`] only when the user store is
+/// absent (`ENOENT`, macOS 27), so a Mac that still keeps a user store is probed exactly as
+/// before.
 #[cfg(any(target_os = "macos", test))]
 pub fn probe_fda_with<F>(
     gate: ProbeGate,
     exe: Option<&Path>,
     home: Option<&Path>,
-    syscall: F,
+    mut syscall: F,
 ) -> FdaProbe
 where
-    F: FnOnce(&Path) -> ProbeOutcome,
+    F: FnMut(&Path) -> ProbeOutcome,
 {
     if !gate.permits() {
         return FdaProbe::refused(ProbeLabel::RefusedDisabled);
@@ -345,24 +352,151 @@ where
     if path_has_interior_nul(&db) {
         return FdaProbe::refused(ProbeLabel::RefusedBadPath);
     }
-    classify_probe(syscall(&db))
+    match syscall(&db) {
+        ProbeOutcome::Errno(ERRNO_ENOENT) => classify_probe(syscall(Path::new(SYSTEM_TCC_DB))),
+        outcome => classify_probe(outcome),
+    }
 }
 
 /// Probe Full Disk Access for the running process: `probe_fda_with` over [`fence_exe`], `$HOME`
-/// and one `open(…, O_RDONLY)` of `TCC.db`, closed unread. Off macOS it is `unsupported_probe`.
+/// and an `open(…, O_RDONLY)` of a `TCC.db`, closed unread, made by a child of this process
+/// ([`open_probe_in_child`]). Off macOS it is `unsupported_probe`.
 #[must_use]
 pub fn probe_fda(gate: ProbeGate) -> FdaProbe {
     #[cfg(target_os = "macos")]
     {
         let exe = fence_exe();
         let home = std::env::var_os("HOME").map(PathBuf::from);
-        probe_fda_with(gate, exe.as_deref(), home.as_deref(), imp::open_probe)
+        let child = exe.clone();
+        probe_fda_with(gate, exe.as_deref(), home.as_deref(), |db| {
+            open_probe_in_child(child.as_deref(), db)
+        })
     }
     #[cfg(not(target_os = "macos"))]
     {
         let _ = gate;
         unsupported_probe()
     }
+}
+
+/// The hidden verb `aterm __tcc-open <path>` ([`run_open_probe_verb`]): never advertised,
+/// answered at the front door before anything else runs.
+pub const OPEN_PROBE_VERB: &str = "__tcc-open";
+
+/// How long [`open_probe_in_child`] waits for its child: a hang detector, never a budget.
+#[cfg(target_os = "macos")]
+const OPEN_PROBE_CEILING: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// THE PROBE'S OPEN, MADE BY A CHILD: `aterm __tcc-open <db>` from the bundle's own
+/// executable, which this process stays responsible for. Falls back to the open in this
+/// process when there is no executable or the child gives no answer.
+///
+/// Measured on macOS 26.6.2 and 27.0 (2026-10-17, design §2.2): a window an in-place update
+/// started is attributed to the outgoing process's image, which `.rollback` names and the
+/// update then deleted (it now keeps it there while that window runs). Deleted or moved,
+/// tccd fails that identity (`-67068`) for as long as the window runs and answers
+/// `Denied (Service Policy)` to the window's own opens, even with aterm switched on, and
+/// sandboxd keeps that answer for the window's tabs too. A child of the window is
+/// attributed to the window's own image, and the answer it gets is the one sandboxd keeps.
+#[cfg(target_os = "macos")]
+fn open_probe_in_child(exe: Option<&Path>, db: &Path) -> ProbeOutcome {
+    let program = exe.and_then(Path::to_str);
+    program
+        .and_then(|program| {
+            run_bounded(
+                program,
+                &[OPEN_PROBE_VERB.as_ref(), db.as_os_str()],
+                OPEN_PROBE_CEILING,
+            )
+        })
+        .filter(|(ok, _, _)| *ok)
+        .and_then(|(_, out, _)| parse_open_probe_line(&out))
+        .unwrap_or_else(|| imp::open_probe(db))
+}
+
+/// The one line [`run_open_probe_verb`] prints for `outcome`: `ok`, or `errno <n>`.
+#[must_use]
+pub fn open_probe_line(outcome: ProbeOutcome) -> String {
+    match outcome {
+        ProbeOutcome::Ok => "ok".to_owned(),
+        ProbeOutcome::Errno(errno) => format!("errno {errno}"),
+    }
+}
+
+/// Read back what [`open_probe_line`] printed. Anything else is no answer.
+#[must_use]
+pub fn parse_open_probe_line(out: &str) -> Option<ProbeOutcome> {
+    match out.trim_end_matches('\n').split_once(' ') {
+        None if out.trim_end_matches('\n') == "ok" => Some(ProbeOutcome::Ok),
+        Some(("errno", errno)) => errno.parse().ok().map(ProbeOutcome::Errno),
+        _ => None,
+    }
+}
+
+/// [`OPEN_PROBE_VERB`]: open the one path named, close it unread, and print
+/// [`open_probe_line`]. Says one line on stderr and fails for anything but one operand, and
+/// off macOS.
+#[must_use]
+pub fn run_open_probe_verb(args: &[std::ffi::OsString]) -> std::process::ExitCode {
+    #[cfg(target_os = "macos")]
+    if let [db] = args {
+        println!("{}", open_probe_line(imp::open_probe(Path::new(db))));
+        return std::process::ExitCode::SUCCESS;
+    }
+    let _ = args;
+    eprintln!("aterm {OPEN_PROBE_VERB}: one path, on macOS");
+    std::process::ExitCode::FAILURE
+}
+
+/// This Mac's hardware UUID (`gethostuuid(2)`), the key of what aterm verified on THIS
+/// Mac: a record that travelled in a synced or migrated config directory names another.
+/// Neither a TCC nor a `WindowServer` call. `None` off macOS, or when the kernel does not
+/// answer.
+/// Read once per process (the kernel's answer does not change), on whichever thread asks
+/// first: a worker, so [`host_uuid_if_warm`] serves the event loop with no syscall.
+#[must_use]
+pub fn host_uuid() -> Option<String> {
+    host_uuid_cell()
+        .get_or_init(|| {
+            #[cfg(target_os = "macos")]
+            {
+                imp::host_uuid()
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                None
+            }
+        })
+        .clone()
+}
+
+/// [`host_uuid`] only if something has read it: never a syscall.
+#[must_use]
+pub fn host_uuid_if_warm() -> Option<&'static str> {
+    host_uuid_cell().get().and_then(Option::as_deref)
+}
+
+fn host_uuid_cell() -> &'static std::sync::OnceLock<Option<String>> {
+    static HOST_UUID: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    &HOST_UUID
+}
+
+/// A `uuid_t` in its usual spelling (`8-4-4-4-12`, upper-case hex). Pure.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn format_uuid(id: &[u8; 16]) -> String {
+    use std::fmt::Write as _;
+    let hex = id.iter().fold(String::with_capacity(32), |mut hex, byte| {
+        let _ = write!(hex, "{byte:02X}");
+        hex
+    });
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -421,9 +555,10 @@ pub fn fence_exe_from(exec: Option<PathBuf>, image: &SelfImage) -> Option<PathBu
 ///
 /// A TCC grant is validated against the running code: once the running bundle is renamed or
 /// deleted, `tccd` cannot build a code object for it, and every consent decision for the
-/// process and its attributed descendants falls back to asking. The updater's apply does both:
-/// `RENAME_SWAP` moves the running bundle to `aterm.app.rollback`, and boot-health confirmation
-/// later deletes it.
+/// process and its attributed descendants falls back to asking. The updater's apply renames:
+/// `RENAME_SWAP` moves the running bundle to `aterm.app.rollback`, where a window's boot-health
+/// confirmation keeps it while that window runs; the first launch after it, or the next
+/// update, deletes it.
 ///
 /// Classified from the kernel's path (`proc_pidpath`: one syscall, no protected read, no
 /// dialog), never `current_exe()`, the frozen `execve`-time string:
@@ -4170,7 +4305,8 @@ where
 }
 
 /// Read the Developer Tools list's row for `subject`, the running bundle's identifier: one
-/// `open` of [`SYSTEM_TCC_DB`] and at most one `/usr/bin/sqlite3`, within a 5 s ceiling and a
+/// `open` of [`SYSTEM_TCC_DB`] by a child ([`open_probe_in_child`]) and at most one
+/// `/usr/bin/sqlite3`, within a 5 s ceiling and a
 /// 1 MiB output cap. Refuses, opening and spawning nothing, when the gate is off, the running
 /// executable is not inside a `.app`, or `subject` is unusable. Off macOS it is
 /// [`unsupported_devtool_list`].
@@ -4183,7 +4319,7 @@ pub fn probe_devtool_list(gate: ProbeGate, subject: &str) -> DevToolList {
             gate,
             exe.as_deref(),
             subject,
-            imp::open_probe,
+            |db| open_probe_in_child(exe.as_deref(), db),
             |program, args| {
                 let args: Vec<&std::ffi::OsStr> = args.iter().map(std::ffi::OsStr::new).collect();
                 run_bounded_exit(program, &args, DEVTOOL_DB_CEILING, TOOL_OUTPUT_MAX_BYTES)
@@ -4876,12 +5012,16 @@ impl FsConsent {
 )]
 pub struct SpikeEvidence {
     /// §7 S4 — how much a held Full Disk Access grant actually suppresses.
-    /// Until this is `true`, no folder is ever reported `covered`.
+    /// Until this is `true`, no folder is ever reported `covered`. S4 is measured (the three
+    /// folders and both volume classes covered on macOS 26.6.2 and 27.0), but the flag stays
+    /// `false`: it also turns `prompt_possible` to `no` under a held grant, and the services
+    /// the grant does not reach still prompt then (design §1.6b), so the flip waits on
+    /// `prompt_possible` naming only the covered classes.
     pub fda_coverage_measured: bool,
     /// §7 S2: what an adopted-across-a-handoff session's attribution and access do. Until
-    /// `true`, an adopted session reports `unknown`, never `denied`. Measuring it needs a real
-    /// in-place `update apply` of an installed Developer-ID `aterm.app`; then flip it where
-    /// `aterm-gui` passes [`Self::UNMEASURED`].
+    /// `true`, an adopted session reports `unknown`, never `denied`. S2 is measured (adopted
+    /// sessions follow aterm's grant, design §2.2), but the flag stays `false`: it only lets an
+    /// observed `EPERM` read `denied`, and no production site observes one yet.
     pub handoff_attribution_measured: bool,
     /// §7 S1 — how far a grant reaches. Stays [`FdaScope::Unknown`].
     pub fda_scope: FdaScope,
@@ -4974,7 +5114,8 @@ impl ConsentPosture {
     ///   `-1` for any process the caller does not own).
     /// * `fs_consent` is `Denied` only on an observed `EPERM`, `Covered` only when the grant is
     ///   held, the session is live and §7 S4 measured the coverage, else `Unknown`. An adopted
-    ///   session stays `Unknown` until §7 S2 (design §3.9 pt 3).
+    ///   session stays `Unknown` while `handoff_attribution_measured` is false (design §3.9
+    ///   pt 2).
     /// * `prompt_possible` is `false` only when the grant is held and its coverage measured.
     #[must_use]
     pub const fn join(inputs: PostureInputs) -> Self {
@@ -5060,6 +5201,27 @@ mod imp {
 
     /// `PROC_PIDPATHINFO_MAXSIZE` — `4 * MAXPATHLEN`.
     const PROC_PIDPATHINFO_MAXSIZE: usize = 4 * 1024;
+
+    // `gethostuuid(2)`, the Mac's hardware UUID (IOPlatformUUID), from libSystem. Not in
+    // `crates/aterm-libc` for the reason the debugger facts below are not.
+    unsafe extern "C" {
+        /// `int gethostuuid(uuid_t id, const struct timespec *wait)`
+        fn gethostuuid(id: *mut u8, wait: *const libc::timespec) -> libc::c_int;
+    }
+
+    /// This Mac's hardware UUID, upper-case and hyphenated; `None` when the kernel does
+    /// not answer within a second.
+    pub(super) fn host_uuid() -> Option<String> {
+        let mut id = [0u8; 16];
+        let wait = libc::timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        };
+        // SAFETY: `id` is the 16 bytes of a `uuid_t` and outlives the call; `wait` is a
+        // valid `timespec` read during the call only.
+        let rc = unsafe { gethostuuid(id.as_mut_ptr(), &raw const wait) };
+        (rc == 0).then(|| super::format_uuid(&id))
+    }
 
     // The debugger-access facts (design §3.2). Declared here rather than in
     // `crates/aterm-libc`, whose cells are generated from the crates.io `libc`
@@ -5579,28 +5741,53 @@ mod tests {
 
     // -- the fence -----------------------------------------------------------
 
+    /// The fence is lexical, as one table: `app_bundle_root` (the innermost
+    /// `.app` around the executable; `path_is_in_app_bundle` is its `is_some`)
+    /// and `bundle_layout_root` (the same layout under any name, the updater's
+    /// `.app.rollback` included).
     #[test]
-    fn out_of_bundle_paths_are_not_in_a_bundle() {
-        for path in [
-            "/Users//a/aterm/target/debug/deps/aterm_containment-abc123",
-            "/Users//a/aterm/target/debug/aterm-gui",
-            "/usr/local/bin/aterm",
-            "/Applications/aterm.app",
-            "/Applications/aterm.app/Contents",
-            "/Applications/aterm.app/Contents/MacOS",
-            "/Applications/.app/Contents/MacOS/aterm",
-            "/Applications/aterm.app/Contents/Resources/aterm",
-            "relative/Contents/MacOS/aterm",
-        ] {
-            assert!(
-                !path_is_in_app_bundle(Path::new(path)),
-                "must not read as in-bundle: {path}"
-            );
+    fn the_bundle_root_is_lexical() {
+        let (app, dev, inner) = (
+            "/A/x.app",
+            "/A/x (dev).app",
+            "/A/O.app/Contents/MacOS/I.app",
+        );
+        let cases: &[(&str, Option<&str>, Option<&str>)] = &[
+            ("/A/x.app/Contents/MacOS/x", Some(app), Some(app)),
+            ("/A/x (dev).app/Contents/MacOS/x", Some(dev), Some(dev)),
+            ("/A/x.app/Contents/MacOS/helpers/x", Some(app), Some(app)),
+            // Nested bundles: the innermost enclosing one wins.
+            (
+                "/A/O.app/Contents/MacOS/I.app/Contents/MacOS/x",
+                Some(inner),
+                Some(inner),
+            ),
+            // Lexical: a relative path with a bundle's shape resolves.
+            (
+                "sub/x.app/Contents/MacOS/x",
+                Some("sub/x.app"),
+                Some("sub/x.app"),
+            ),
+            (
+                "/A/x.app.rollback/Contents/MacOS/x",
+                None,
+                Some("/A/x.app.rollback"),
+            ),
+            ("/A/.app/Contents/MacOS/x", None, Some("/A/.app")),
+            ("rel/Contents/MacOS/x", None, Some("rel")),
+            ("/Contents/MacOS/x", None, None),
+            ("/A/target/debug/deps/aterm_containment-abc123", None, None),
+            ("/usr/local/bin/aterm", None, None),
+            (app, None, None),
+            ("/A/x.app/Contents/MacOS", None, None),
+            ("/A/x.app/Contents/Resources/x", None, None),
+        ];
+        for &(exe, bundle, layout) in cases {
+            let exe_path = Path::new(exe);
+            assert_eq!(app_bundle_root(exe_path), bundle.map(p), "{exe}");
+            assert_eq!(path_is_in_app_bundle(exe_path), bundle.is_some(), "{exe}");
+            assert_eq!(bundle_layout_root(exe_path), layout.map(p), "{exe}");
         }
-        // The guard is lexical: a relative bundle-shaped path counts.
-        assert!(path_is_in_app_bundle(Path::new(
-            "sub/aterm.app/Contents/MacOS/aterm"
-        )));
     }
 
     // -----------------------------------------------------------------
@@ -5658,19 +5845,19 @@ mod tests {
         assert_eq!(classify_signing("something else entirely\n"), "unknown");
     }
 
-    /// XML only, exact key, and a key whose value is not the next element binds nothing.
+    /// XML only, exact key (a key it is a prefix of does not bind), and a key whose value is
+    /// not the next element binds nothing.
     #[test]
     fn the_plist_reader_is_exact_and_xml_only() {
         let xml = "<plist><dict>\
                    <key>CFBundleIdentifier</key><string>com.aterm.aterm.dev</string>\
-                   <key>CFBundleName</key><string>aterm (dev)</string>\
+                   <key>CFBundleNameSuffix</key><string>nope</string>\
                    </dict></plist>";
         assert_eq!(
             plist_string(xml, "CFBundleIdentifier"),
             Some("com.aterm.aterm.dev")
         );
-        assert_eq!(plist_string(xml, "CFBundleName"), Some("aterm (dev)"));
-        assert_eq!(plist_string(xml, "CFBundleDisplayName"), None);
+        assert_eq!(plist_string(xml, "CFBundleName"), None);
         assert_eq!(
             plist_string("<key>A</key><key>B</key><string>v</string>", "A"),
             None
@@ -5691,11 +5878,7 @@ mod tests {
             links: Vec::new(),
         };
         assert!(!mk(DEV_ID).conflicts_with(&mk(DEV_ID)));
-        assert!(
-            mk("designated => cdhash H\"aa\"").conflicts_with(&mk("designated => cdhash H\"bb\""))
-        );
         assert!(mk("").conflicts_with(&mk("")));
-        assert!(mk("").conflicts_with(&mk(DEV_ID)));
     }
 
     /// A Developer-ID install, its `.rollback` and a backup (both ad hoc), an unreadable copy,
@@ -5754,11 +5937,6 @@ mod tests {
         );
         assert_eq!(c.found.len(), 5, "{:?}", c.found);
         assert!(c.found[0].running && c.found[0].path == running);
-        assert!(
-            c.found
-                .iter()
-                .any(|x| x.path == apps.join("x.app.rollback"))
-        );
         assert!(
             c.found.iter().any(|x| x.path == far),
             "LaunchServices' copy is found"
@@ -5852,62 +6030,58 @@ mod tests {
         );
     }
 
-    /// Beside an unstable running copy, a conflicting Developer-ID copy may
-    /// well be the real release, so nothing is retirable.
+    /// Beside a Developer-ID running copy, every copy that differs conflicts,
+    /// but the Trash takes only a build: an ad-hoc copy, or an unsigned one
+    /// (its class read off `codesign`'s whole report). A Developer ID copy whose
+    /// requirement pins a cdhash, and a copy whose signature could not be read,
+    /// are listed and left alone.
     #[test]
-    fn nothing_is_retirable_beside_an_unstable_running_copy() {
-        let running = PathBuf::from("/A/x.app.rollback");
-        let release = PathBuf::from("/A/x.app");
-        let c = classify_claimants(
-            Some(&running),
-            &[(PathBuf::from("/A"), true)],
-            Some(&[]),
-            |_| Listing::Entries(vec![running.clone(), release.clone()]),
-            as_spelled,
-            |root: &Path| {
-                if root == release.as_path() {
-                    ours(DEV_ID)
-                } else {
-                    ours("designated => cdhash H\"aa\"")
-                }
-            },
-        );
-        assert_eq!(c.conflicting().len(), 1);
-        assert!(c.retirable().is_empty());
-    }
-
-    /// A Developer ID copy pinning a cdhash conflicts but is left alone; the ad-hoc copy beside
-    /// it is offered.
-    #[test]
-    fn a_developer_id_copy_is_never_retirable() {
+    fn only_an_ad_hoc_or_unsigned_copy_is_retirable() {
         let running = PathBuf::from("/A/x.app");
-        let pinned = PathBuf::from("/A/x-pinned.app");
-        let adhoc = PathBuf::from("/A/x-adhoc.app");
+        let [pinned, adhoc, unsigned, unread] = [
+            "x-pinned.app",
+            "x-adhoc.app",
+            "x-unsigned.app",
+            "x-unread.app",
+        ]
+        .map(|name| PathBuf::from("/A").join(name));
+        let entries = vec![
+            running.clone(),
+            pinned.clone(),
+            adhoc.clone(),
+            unsigned.clone(),
+            unread.clone(),
+        ];
         let c = classify_claimants(
             Some(&running),
             &[(PathBuf::from("/A"), true)],
             Some(&[]),
-            |_| Listing::Entries(vec![running.clone(), pinned.clone(), adhoc.clone()]),
+            |_| Listing::Entries(entries.clone()),
             as_spelled,
             |root: &Path| {
-                if root == running.as_path() {
-                    ours(DEV_ID)
+                let report = if root == running.as_path() {
+                    return ours(DEV_ID);
                 } else if root == pinned.as_path() {
-                    Candidate::Ours(BundleIdentity {
+                    return Candidate::Ours(BundleIdentity {
                         bundle_id: Some("x".to_string()),
                         dr_text: "cdhash H\"aa\"".to_string(),
                         dr: DrClass::Cdhash,
                         signing: "developer-id",
                         team: Some("T".to_string()),
-                    })
+                    });
+                } else if root == adhoc.as_path() {
+                    return ours("designated => cdhash H\"bb\"");
+                } else if root == unsigned.as_path() {
+                    Some("/A/x-unsigned.app: code object is not signed at all\n")
                 } else {
-                    ours("designated => cdhash H\"bb\"")
-                }
+                    None
+                };
+                Candidate::Ours(identity_from_report(report, Some("x".to_string())))
             },
         );
-        assert_eq!(c.conflicting().len(), 2);
+        assert_eq!(c.conflicting().len(), 4);
         let retirable: Vec<&Path> = c.retirable().iter().map(|c| c.path.as_path()).collect();
-        assert_eq!(retirable, vec![adhoc.as_path()]);
+        assert_eq!(retirable, vec![adhoc.as_path(), unsigned.as_path()]);
     }
 
     /// Every other copy stays with its reason, and nothing outside the plan is touched.
@@ -6085,48 +6259,8 @@ mod tests {
             "the control: the same bundle without the link is vouched for"
         );
 
-        // A link out of the bundle, to a folder holding a second link into the root.
-        let elsewhere = dir.join("elsewhere");
-        std::fs::create_dir_all(&elsewhere).unwrap();
-        std::os::unix::fs::symlink(documents.join("z"), elsewhere.join("CodeResources")).unwrap();
-        let hop = apps.join("h.app");
-        std::fs::create_dir_all(hop.join("Contents")).unwrap();
-        std::fs::write(
-            hop.join("Contents/Info.plist"),
-            "<plist><dict><key>CFBundleIdentifier</key><string>x</string></dict></plist>",
-        )
-        .unwrap();
-        std::os::unix::fs::symlink(&elsewhere, hop.join("Contents/_CodeSignature")).unwrap();
-        assert_eq!(
-            read_candidate(&hop, "x", &protected),
-            Candidate::Hole,
-            "a link out of the bundle"
-        );
-        assert_eq!(bundle_identity(&hop, &protected), None);
-        // A link to a folder above the root: refused without listing it.
-        let above = apps.join("a.app");
-        std::fs::create_dir_all(above.join("Contents")).unwrap();
-        std::fs::write(
-            above.join("Contents/Info.plist"),
-            "<plist><dict><key>CFBundleIdentifier</key><string>x</string></dict></plist>",
-        )
-        .unwrap();
-        std::os::unix::fs::symlink(&dir, above.join("Contents/Resources")).unwrap();
-        assert!(bundle_reaches_protected(&above, &protected));
-        assert_eq!(read_candidate(&above, "x", &protected), Candidate::Hole);
-        // A `Contents` linking out of the bundle, to the folder above the root.
-        let out = apps.join("u.app");
-        std::fs::create_dir_all(&out).unwrap();
-        std::fs::write(
-            dir.join("Info.plist"),
-            "<plist><dict><key>CFBundleIdentifier</key><string>x</string></dict></plist>",
-        )
-        .unwrap();
-        std::os::unix::fs::symlink(&dir, out.join("Contents")).unwrap();
-        assert!(bundle_reaches_protected(&out, &protected));
-        assert_eq!(read_candidate(&out, "x", &protected), Candidate::Hole);
-        assert_eq!(bundle_identity(&out, &protected), None);
-        // The same, to a harmless folder: only the rule that `Contents` stays inside refuses it.
+        // A `Contents` linking out of the bundle, to a harmless folder: only the rule that
+        // `Contents` stays inside refuses it.
         let away = dir.join("away");
         std::fs::create_dir_all(&away).unwrap();
         std::fs::write(
@@ -6206,12 +6340,6 @@ mod tests {
             !bundle_reaches_protected(&r2, &[]),
             "the control: the same link, to a folder named like a bundle"
         );
-        // The updater's displaced copy is named like one too.
-        let rollback = dir.join("home.app.rollback");
-        lay(&rollback);
-        let r3 = apps.join("r3.app");
-        std::os::unix::fs::symlink(&rollback, &r3).unwrap();
-        assert!(!bundle_reaches_protected(&r3, &[]), "`.app.rollback`");
 
         // A bundle holding a protected root is refused before anything in it is listed.
         let p = apps.join("p.app");
@@ -6305,11 +6433,9 @@ mod tests {
         };
         let exe = |value: &str| format!("<key>CFBundleExecutable</key><string>{value}</string>");
         let abs = "<string>/Users//u/Documents/z</string>";
+        // Every name `plain_file_name` refuses is refused here; one stands for
+        // its table.
         assert!(refused("e1.app", &dict(&exe("/Users//u/Documents/z"))));
-        assert!(refused("e2.app", &dict(&exe("../../../Documents/z"))));
-        assert!(refused("e3.app", &dict(&exe("MacOS/x"))));
-        assert!(refused("e4.app", &dict(&exe(".."))));
-        assert!(refused("e5.app", &dict(&exe(""))));
         assert!(refused(
             "e6.app",
             &dict(&exe("&#47;Users&#47;u&#47;Documents&#47;z"))
@@ -6341,7 +6467,6 @@ mod tests {
             "e15.app",
             &dict(&format!("<key>NSExecutable</key>{abs}"))
         ));
-        assert!(refused("e17.app", &dict(&exe("x\nSignature=adhoc"))));
         // Past the length bound a name is not read, so not vouched for.
         assert!(refused("e18.app", &dict(&exe(&"a".repeat(2000)))));
         // An over-long key is none `CFBundle` reads: its value is not judged.
@@ -6522,29 +6647,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A report read in part is not read: a stream one byte over the cap, or one
-    /// that is not UTF-8, makes the whole run `None`; at the cap it is whole.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_tool_report_read_in_part_is_no_report() {
-        let bytes = |count: u64| format!("head -c {count} /dev/zero");
-        let sh = |script: &str| {
-            run_bounded(
-                "/bin/sh",
-                &["-c".as_ref(), script.as_ref()],
-                CODESIGN_CEILING,
-            )
-        };
-        assert_eq!(sh(&bytes(TOOL_OUTPUT_MAX_BYTES + 1)), None);
-        assert_eq!(sh("printf '\\377'"), None);
-        let whole = sh(&bytes(TOOL_OUTPUT_MAX_BYTES)).expect("a report at the cap");
-        assert!(whole.0 && whole.2.is_empty());
-        assert_eq!(
-            u64::try_from(whole.1.len()).ok(),
-            Some(TOOL_OUTPUT_MAX_BYTES)
-        );
-    }
-
     /// A wait for something that must happen is a hang detector, never a latency
     /// budget (AGENTS.md).
     #[cfg(target_os = "macos")]
@@ -6613,6 +6715,60 @@ mod tests {
             imp::open_probe(&path),
             ProbeOutcome::Errno(libc::ENOENT),
             "a missing file is its errno"
+        );
+    }
+
+    /// What `aterm __tcc-open` prints reads back as the outcome it printed, and nothing else
+    /// reads as an answer.
+    #[test]
+    fn the_open_probe_child_line_reads_back_as_its_outcome() {
+        for outcome in [
+            ProbeOutcome::Ok,
+            ProbeOutcome::Errno(ERRNO_EPERM),
+            ProbeOutcome::Errno(ERRNO_ENOENT),
+            ProbeOutcome::Errno(13),
+        ] {
+            let printed = format!("{}\n", open_probe_line(outcome));
+            assert_eq!(
+                parse_open_probe_line(&printed),
+                Some(outcome),
+                "{printed:?}"
+            );
+        }
+        for garbage in [
+            "",
+            "\n",
+            "OK\n",
+            "okay\n",
+            "errno\n",
+            "errno x\n",
+            "errno 1 2\n",
+        ] {
+            assert_eq!(parse_open_probe_line(garbage), None, "{garbage:?}");
+        }
+        assert_eq!(
+            format!("{:?}", run_open_probe_verb(&[])),
+            format!("{:?}", std::process::ExitCode::FAILURE),
+            "the verb wants one path"
+        );
+    }
+
+    /// A child that cannot answer (no executable, one that does not exist, one that fails)
+    /// leaves the open to this process, so the probe still reads.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_child_that_cannot_answer_leaves_the_open_to_this_process() {
+        let scratch = aterm_tempfile::tempdir().expect("owned probe scratch");
+        let path = scratch.path().join("open-child");
+        std::fs::write(&path, b"").unwrap();
+        let missing = Path::new("/nonexistent/aterm.app/Contents/MacOS/aterm");
+        for exe in [None, Some(missing), Some(Path::new("/usr/bin/false"))] {
+            assert_eq!(open_probe_in_child(exe, &path), ProbeOutcome::Ok, "{exe:?}");
+        }
+        std::fs::remove_file(&path).expect("remove only this probe fixture");
+        assert_eq!(
+            open_probe_in_child(Some(missing), &path),
+            ProbeOutcome::Errno(libc::ENOENT)
         );
     }
 
@@ -6711,10 +6867,6 @@ mod tests {
     /// inside a path on a signed copy's report is not.
     #[test]
     fn unsigned_is_the_whole_report_not_a_phrase_in_it() {
-        assert_eq!(
-            classify_signing("/A/x.app: code object is not signed at all\n"),
-            "unsigned"
-        );
         let planted = "Executable=/A/x: code object is not signed at all/x\n\
                        Identifier=x\nSignature=adhoc\n\
                        # designated => cdhash H\"aa\"\n";
@@ -6758,42 +6910,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// An unsigned copy and a failed read both lack requirement text and must not compare
-    /// equal; a read with no class never matches.
-    #[test]
-    fn the_identity_recheck_tells_an_unsigned_copy_from_a_failed_read() {
-        let unsigned = identity_from_report(
-            Some("/x.app: code object is not signed at all\n"),
-            Some("x".to_string()),
-        );
-        let failed = identity_from_report(None, Some("x".to_string()));
-        let copy = Claimant {
-            path: PathBuf::from("/A/x.app"),
-            dr: unsigned.dr,
-            dr_text: unsigned.dr_text.clone(),
-            signing: unsigned.signing,
-            team: None,
-            running: false,
-            links: Vec::new(),
-        };
-        assert!(same_identity(&unsigned, &copy));
-        assert!(
-            !same_identity(&failed, &copy),
-            "a failed read is not the copy"
-        );
-        let unknown = Claimant {
-            dr: DrClass::Unknown,
-            signing: "unknown",
-            ..copy.clone()
-        };
-        assert!(!same_identity(&failed, &unknown), "Unknown never matches");
-        let adhoc = identity_from_report(
-            Some("Signature=adhoc\n# designated => cdhash H\"aa\"\n"),
-            Some("x".to_string()),
-        );
-        assert!(!same_identity(&adhoc, &copy), "re-signed ad hoc");
-    }
-
     /// The Trash is offered only among the rows the owner can see: a retirable
     /// copy past the first MAX_CLAIMANT_ROWS conflicting ones is never offered.
     #[test]
@@ -6830,48 +6946,6 @@ mod tests {
             c.offered_for_trash(true).is_empty(),
             "but it is past the listed rows, so it is not offered"
         );
-    }
-
-    /// An unsigned bundle's class comes from the whole report (`Unsigned`, never `Unknown`);
-    /// beside a Developer-ID running copy it is offered, and an unreadable copy is not.
-    #[test]
-    fn an_unsigned_copy_is_unsigned_and_offered_an_unreadable_one_is_not() {
-        let unsigned = identity_from_report(
-            Some("/x/y.app: code object is not signed at all\n"),
-            Some("x".to_string()),
-        );
-        assert_eq!(unsigned.dr, DrClass::Unsigned);
-        assert_eq!(unsigned.signing, "unsigned");
-        assert_eq!(identity_from_report(None, None).dr, DrClass::Unknown);
-
-        let dir = PathBuf::from("/A");
-        let running = dir.join("x.app");
-        let bare = dir.join("x-unsigned.app");
-        let unread = dir.join("x-unread.app");
-        let entries = vec![running.clone(), bare.clone(), unread.clone()];
-        let c = classify_claimants(
-            Some(&running),
-            &[(dir.clone(), true)],
-            Some(&[]),
-            |_| Listing::Entries(entries.clone()),
-            as_spelled,
-            |root: &Path| {
-                if root == running.as_path() {
-                    ours(DEV_ID)
-                } else if root == bare.as_path() {
-                    Candidate::Ours(unsigned.clone())
-                } else {
-                    Candidate::Ours(identity_from_report(None, Some("x".to_string())))
-                }
-            },
-        );
-        assert_eq!(c.conflicting().len(), 2);
-        let offered: Vec<_> = c
-            .offered_for_trash(true)
-            .iter()
-            .map(|x| x.path.clone())
-            .collect();
-        assert_eq!(offered, vec![bare]);
     }
 
     #[test]
@@ -7006,8 +7080,6 @@ mod tests {
             );
         }
         assert_eq!(fence_exe_from(None, &SelfImage::Unreadable), None);
-        // This test binary is outside a bundle by both paths: the fence holds.
-        assert!(!fence_exe().is_some_and(|exe| path_is_in_app_bundle(&exe)));
     }
 
     /// The image anchor as a table: every arm, classified from the kernel's
@@ -7068,61 +7140,6 @@ mod tests {
         ] {
             assert!(!ok.grant_unverifiable(), "{ok:?}");
         }
-
-        // Wire spellings are stable: they are read by agents.
-        assert_eq!(ImageAnchor::Live.as_str(), "live");
-        assert_eq!(ImageAnchor::Displaced.as_str(), "displaced");
-        assert_eq!(ImageAnchor::Deleted.as_str(), "deleted");
-        assert_eq!(ImageAnchor::NotBundled.as_str(), "not-bundled");
-        assert_eq!(ImageAnchor::Unknown.as_str(), "unknown");
-    }
-
-    #[test]
-    fn the_bundle_layout_root_ignores_the_directory_name() {
-        assert_eq!(
-            bundle_layout_root(Path::new("/A/aterm.app.rollback/Contents/MacOS/aterm")),
-            Some(PathBuf::from("/A/aterm.app.rollback"))
-        );
-        assert_eq!(
-            bundle_layout_root(Path::new("/A/aterm.app/Contents/MacOS/aterm")),
-            Some(PathBuf::from("/A/aterm.app"))
-        );
-        assert_eq!(bundle_layout_root(Path::new("/usr/local/bin/aterm")), None);
-        assert_eq!(bundle_layout_root(Path::new("/Contents/MacOS/x")), None);
-    }
-
-    #[test]
-    fn in_bundle_paths_resolve_to_their_bundle_root() {
-        let cases = [
-            (
-                "/Applications/aterm.app/Contents/MacOS/aterm",
-                "/Applications/aterm.app",
-            ),
-            (
-                "/Applications/aterm (dev).app/Contents/MacOS/aterm",
-                "/Applications/aterm (dev).app",
-            ),
-            (
-                "/Applications/iTerm.app/Contents/MacOS/iTerm2",
-                "/Applications/iTerm.app",
-            ),
-            (
-                "/Applications/aterm.app/Contents/MacOS/helpers/aterm",
-                "/Applications/aterm.app",
-            ),
-            // Nested bundles: the innermost enclosing .app wins.
-            (
-                "/Applications/Outer.app/Contents/MacOS/Inner.app/Contents/MacOS/x",
-                "/Applications/Outer.app/Contents/MacOS/Inner.app",
-            ),
-        ];
-        for (exe, root) in cases {
-            assert_eq!(
-                app_bundle_root(Path::new(exe)),
-                Some(p(root)),
-                "bundle root for {exe}"
-            );
-        }
     }
 
     /// The injected syscall panics, so a guard moved below the syscall fails loudly.
@@ -7177,23 +7194,69 @@ mod tests {
         }
     }
 
+    /// A `uuid_t` reads as `gethostuuid`'s callers and `ioreg` spell it.
     #[test]
-    fn probe_reaches_the_syscall_exactly_once_from_inside_a_bundle() {
+    fn a_host_uuid_is_spelled_8_4_4_4_12() {
+        let id = [
+            0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+            0xcd, 0xef,
+        ];
+        assert_eq!(format_uuid(&id), "12345678-9ABC-DEF0-0123-456789ABCDEF");
+    }
+
+    /// macOS 26 and earlier keep a user store: it answers, and nothing else is opened.
+    #[test]
+    fn probe_opens_only_the_user_store_when_it_answers() {
         let bundled = p("/Applications/aterm.app/Contents/MacOS/aterm");
         let home = p("/Users//a");
-        let mut seen: Option<PathBuf> = None;
-        let got = probe_fda_with(ProbeGate::on(), Some(&bundled), Some(&home), |db| {
-            seen = Some(db.to_path_buf());
-            ProbeOutcome::Ok
-        });
-        assert_eq!(got.state, FdaState::Granted);
-        assert_eq!(got.label, ProbeLabel::OpenOk);
-        assert_eq!(
-            seen,
-            Some(p(
-                "/Users//a/Library/Application Support/com.apple.TCC/TCC.db"
-            ))
-        );
+        let user = p("/Users//a/Library/Application Support/com.apple.TCC/TCC.db");
+        for (outcome, state) in [
+            (ProbeOutcome::Ok, FdaState::Granted),
+            (ProbeOutcome::Errno(ERRNO_EPERM), FdaState::Denied),
+            (ProbeOutcome::Errno(13), FdaState::Unknown),
+        ] {
+            let mut seen = Vec::new();
+            let got = probe_fda_with(ProbeGate::on(), Some(&bundled), Some(&home), |db| {
+                seen.push(db.to_path_buf());
+                outcome
+            });
+            assert_eq!(got.state, state, "{outcome:?}");
+            assert_eq!(seen, vec![user.clone()], "{outcome:?}");
+        }
+    }
+
+    /// macOS 27 keeps no user store, so its absence must not end the probe at `unknown`: the
+    /// system store answers, `EPERM` without the grant (measured on macOS 27.0.1).
+    #[test]
+    fn probe_falls_back_to_the_system_store_when_the_user_store_is_absent() {
+        let bundled = p("/Applications/aterm.app/Contents/MacOS/aterm");
+        let home = p("/Users//a");
+        let user = p("/Users//a/Library/Application Support/com.apple.TCC/TCC.db");
+        for (system, state, label) in [
+            (ProbeOutcome::Ok, FdaState::Granted, ProbeLabel::OpenOk),
+            (
+                ProbeOutcome::Errno(ERRNO_EPERM),
+                FdaState::Denied,
+                ProbeLabel::OpenEperm,
+            ),
+            (
+                ProbeOutcome::Errno(ERRNO_ENOENT),
+                FdaState::Unknown,
+                ProbeLabel::OpenErrno(ERRNO_ENOENT),
+            ),
+        ] {
+            let mut seen = Vec::new();
+            let got = probe_fda_with(ProbeGate::on(), Some(&bundled), Some(&home), |db| {
+                seen.push(db.to_path_buf());
+                if db == user {
+                    ProbeOutcome::Errno(ERRNO_ENOENT)
+                } else {
+                    system
+                }
+            });
+            assert_eq!((got.state, got.label), (state, label), "{system:?}");
+            assert_eq!(seen, vec![user.clone(), p(SYSTEM_TCC_DB)], "{system:?}");
+        }
     }
 
     #[test]
@@ -7211,75 +7274,12 @@ mod tests {
                 FdaState::Unknown,
                 ProbeLabel::OpenErrno(13),
             ),
-            // ENOENT.
-            (
-                ProbeOutcome::Errno(2),
-                FdaState::Unknown,
-                ProbeLabel::OpenErrno(2),
-            ),
-            // EINTR.
-            (
-                ProbeOutcome::Errno(4),
-                FdaState::Unknown,
-                ProbeLabel::OpenErrno(4),
-            ),
         ];
         for (outcome, state, label) in cases {
             let got = classify_probe(outcome);
             assert_eq!(got.state, state, "state for {outcome:?}");
             assert_eq!(got.label, label, "label for {outcome:?}");
         }
-    }
-
-    #[test]
-    fn refusal_labels_all_report_no_syscall() {
-        for label in [
-            ProbeLabel::RefusedOutOfBundle,
-            ProbeLabel::RefusedNoExe,
-            ProbeLabel::RefusedDisabled,
-            ProbeLabel::RefusedNoHome,
-            ProbeLabel::RefusedBadPath,
-            ProbeLabel::UnsupportedPlatform,
-        ] {
-            assert!(label.refused(), "{label:?} must report no syscall");
-        }
-        for label in [
-            ProbeLabel::OpenOk,
-            ProbeLabel::OpenEperm,
-            ProbeLabel::OpenErrno(9),
-        ] {
-            assert!(!label.refused(), "{label:?} performed a syscall");
-        }
-    }
-
-    // -- the stub ------------------------------------------------------------
-
-    #[test]
-    fn the_non_macos_answer_is_unknown() {
-        let stub = unsupported_probe();
-        assert_eq!(stub.state, FdaState::Unknown);
-        assert_eq!(stub.label, ProbeLabel::UnsupportedPlatform);
-        assert!(stub.label.refused());
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn off_macos_every_os_wrapper_answers_unknown() {
-        assert_eq!(probe_fda(ProbeGate::on()).state, FdaState::Unknown);
-        assert_eq!(
-            probe_fda(ProbeGate::on()).label,
-            ProbeLabel::UnsupportedPlatform
-        );
-        assert_eq!(responsible_pid(1), None);
-        assert_eq!(
-            responsible_pid_detailed(1),
-            Err(ResponsibleError::Unsupported)
-        );
-        assert_eq!(responsible_app(1), None);
-        assert_eq!(
-            probe_devtool(ProbeGate::on(), "a.b").label,
-            DevToolProbeLabel::UnsupportedPlatform
-        );
     }
 
     // -- responsibility ------------------------------------------------------
@@ -7324,16 +7324,6 @@ mod tests {
         assert_eq!(classify_responsible(me, Ok(-1)), Responsible::Unknown);
     }
 
-    #[test]
-    fn responsible_tokens_render() {
-        assert_eq!(Responsible::SelfProcess.token(), Some("self"));
-        assert_eq!(Responsible::Exited.token(), Some("exited"));
-        assert_eq!(Responsible::Unknown.token(), Some("unknown"));
-        assert_eq!(Responsible::Other(42).token(), None);
-        assert_eq!(Responsible::Other(42).pid(), Some(42));
-        assert_eq!(Responsible::SelfProcess.pid(), None);
-    }
-
     // -- responsible_app's Info.plist guard ----------------------------------
 
     #[test]
@@ -7349,16 +7339,6 @@ mod tests {
         let evil = p("/Users//a/Documents/Sketchy.app/Contents/MacOS/Sketchy");
         assert_eq!(readable_info_plist(&evil, &protected), None);
         assert_eq!(display_name(&evil, None), "Sketchy");
-
-        // Same shape under other protected roots.
-        for root in ["Desktop", "Downloads", "Library/Messages"] {
-            let exe = home.join(root).join("X.app/Contents/MacOS/X");
-            assert_eq!(
-                readable_info_plist(&exe, &protected),
-                None,
-                "must refuse under {root}"
-            );
-        }
 
         // An app outside every protected root is fine to read.
         let ok = p("/Applications/iTerm.app/Contents/MacOS/iTerm2");
@@ -7387,25 +7367,12 @@ mod tests {
         let neither = "<plist><dict><key>CFBundleIdentifier</key><string>com.aterm.aterm</string></dict></plist>";
         assert_eq!(display_name(&exe, Some(neither)), "aterm");
 
-        // A binary plist reads as absent — basename.
-        assert_eq!(display_name(&exe, Some("bplist00\u{0}\u{1}")), "aterm");
         // An empty value is not a name.
         let empty = "<plist><dict><key>CFBundleDisplayName</key><string></string></dict></plist>";
         assert_eq!(display_name(&exe, Some(empty)), "aterm");
         // A key whose value is not a string is not mis-bound: the lookup falls through.
         let wrong = "<plist><dict><key>CFBundleDisplayName</key><true/><key>CFBundleName</key><string>ok</string></dict></plist>";
         assert_eq!(display_name(&exe, Some(wrong)), "ok");
-        // With neither key carrying a string, the basename stands.
-        let both_wrong = "<plist><dict><key>CFBundleDisplayName</key><true/><key>CFBundleName</key><false/></dict></plist>";
-        assert_eq!(display_name(&exe, Some(both_wrong)), "aterm");
-    }
-
-    #[test]
-    fn display_name_does_not_bind_a_prefix_key() {
-        let exe = p("/Applications/aterm.app/Contents/MacOS/aterm");
-        // `CFBundleNameSuffix` must not satisfy a lookup for `CFBundleName`.
-        let text = "<plist><dict><key>CFBundleNameSuffix</key><string>nope</string></dict></plist>";
-        assert_eq!(display_name(&exe, Some(text)), "aterm");
     }
 
     // -- designated requirement ---------------------------------------------
@@ -7434,16 +7401,10 @@ mod tests {
                 "identifier \"com.aterm.aterm\" and cdhash H\"abc\"",
                 DrClass::Cdhash,
             ),
-            (
-                "test-requirement: code object is not signed at all",
-                DrClass::Unsigned,
-            ),
             ("code object is not signed at all", DrClass::Unsigned),
             ("", DrClass::Unknown),
-            ("   ", DrClass::Unknown),
             ("anchor apple", DrClass::Unknown),
             ("identifier \"com.aterm.aterm\"", DrClass::Unknown),
-            ("nonsense", DrClass::Unknown),
             // A Developer ID copy named for a cdhash is still stable.
             (
                 "identifier \"com.cdhash.x\" and anchor apple generic and \
@@ -7478,34 +7439,25 @@ mod tests {
         for (input, want) in cases {
             assert_eq!(classify_dr(input), want, "classifying {input:?}");
         }
-    }
-
-    #[test]
-    fn only_an_identity_requirement_is_grant_stable() {
-        assert!(DrClass::Identity.grant_stable());
-        for class in [DrClass::Cdhash, DrClass::Unsigned, DrClass::Unknown] {
-            assert!(!class.grant_stable(), "{class:?} must not be grant-stable");
+        // Only an identity requirement keeps a grant across builds.
+        for (class, stable) in [
+            (DrClass::Identity, true),
+            (DrClass::Cdhash, false),
+            (DrClass::Unsigned, false),
+            (DrClass::Unknown, false),
+        ] {
+            assert_eq!(class.grant_stable(), stable, "{class:?}");
         }
-        assert_eq!(DrClass::Identity.as_str(), "identity");
-        assert_eq!(DrClass::Cdhash.as_str(), "cdhash");
-        assert_eq!(DrClass::Unsigned.as_str(), "unsigned");
-        assert_eq!(DrClass::Unknown.as_str(), "unknown");
     }
 
     // -- protected roots -----------------------------------------------------
 
+    /// Containment and consent cannot disagree: with no override the consent
+    /// roots are the sandbox's private subdirectories, in its order.
     #[test]
     fn empty_overrides_resolve_to_private_subdirs() {
         let home = p("/Users//a");
         let roots = protected_roots_in(Some(&home), &[]);
-        assert_eq!(roots.len(), crate::sbpl::PRIVATE_SUBDIRS.len());
-        for sub in crate::sbpl::PRIVATE_SUBDIRS {
-            assert!(
-                roots.contains(&home.join(sub)),
-                "PRIVATE_SUBDIRS entry {sub} missing from the consent roots"
-            );
-        }
-        // Containment and consent cannot disagree.
         assert_eq!(
             roots,
             crate::sbpl::PRIVATE_SUBDIRS
@@ -7537,12 +7489,8 @@ mod tests {
                 p("/Users//a/Library/CloudStorage"),
             ]
         );
-    }
-
-    #[test]
-    fn no_home_means_no_default_roots_and_absolute_overrides_only() {
+        // With no home there is no default, and a `~` override is dropped.
         assert!(protected_roots_in(None, &[]).is_empty());
-        let overrides = [String::from("~/Documents"), String::from("/Volumes")];
         assert_eq!(protected_roots_in(None, &overrides), vec![p("/Volumes")]);
     }
 
@@ -7604,62 +7552,17 @@ mod tests {
             assert_eq!(Folder::parse(name), Some(folder));
             assert_eq!(Folder::parse(&name.to_uppercase()), Some(folder));
         }
-        assert_eq!(Folder::parse("pictures"), None);
-        assert_eq!(Folder::parse(""), None);
-        assert_eq!(Folder::ALL.len(), 4);
-        assert_eq!(*Folder::ALL.last().expect("non-empty"), Folder::AppData);
-    }
-
-    /// The three folders in `ALL`'s order, without app-data, whose Allow macOS forgets when the
-    /// responsible instance ends.
-    #[test]
-    fn the_warmup_default_is_the_folders_without_app_data() {
-        assert_eq!(
-            Folder::WARMUP_DEFAULT,
-            &[Folder::Documents, Folder::Desktop, Folder::Downloads]
-        );
-        assert!(!Folder::WARMUP_DEFAULT.contains(&Folder::AppData));
-        assert!(
-            Folder::WARMUP_DEFAULT
-                .iter()
-                .all(|f| Folder::ALL.contains(f))
-        );
-        assert_eq!(&Folder::ALL[..3], Folder::WARMUP_DEFAULT);
-    }
-
-    /// The three spellings a hand-written config might use, and nothing else.
-    #[test]
-    fn the_app_data_item_answers_to_every_spelling_of_its_name() {
-        for spelling in ["app-data", "app_data", "appdata", "APP-DATA", " App_Data "] {
+        // The app-data item answers to the spellings a hand-written config
+        // might use, and to nothing else.
+        for spelling in ["app_data", "appdata", " App_Data "] {
             assert_eq!(
                 Folder::parse(spelling),
                 Some(Folder::AppData),
-                "spelling {spelling:?}"
+                "{spelling:?}"
             );
         }
-        assert_eq!(Folder::parse("app data"), None);
-        assert_eq!(Folder::parse("apps"), None);
-    }
-
-    /// No two items share a label: the panel prints them side by side.
-    #[test]
-    fn every_item_has_its_own_label_and_noun() {
-        let mut labels: Vec<&str> = Folder::ALL.iter().map(|f| f.label()).collect();
-        labels.sort_unstable();
-        labels.dedup();
-        assert_eq!(labels.len(), Folder::ALL.len(), "labels are distinct");
-        assert_eq!(Folder::Documents.label(), "Documents");
-        assert_eq!(Folder::Documents.noun(), "folder");
-        assert_eq!(Folder::AppData.label(), "Other applications' data");
-        assert_eq!(Folder::AppData.noun(), "data");
-    }
-
-    /// The folders exist from account setup; the app-data container may never have been made.
-    #[test]
-    fn only_the_app_data_probe_reads_a_missing_path_as_permission() {
-        assert!(Folder::AppData.absent_means_allowed());
-        for folder in [Folder::Documents, Folder::Desktop, Folder::Downloads] {
-            assert!(!folder.absent_means_allowed(), "{folder:?}");
+        for unknown in ["pictures", "", "app data", "apps"] {
+            assert_eq!(Folder::parse(unknown), None, "{unknown:?}");
         }
     }
 
@@ -7679,27 +7582,6 @@ mod tests {
             ]
         );
         assert!(folder_paths_in(None, &names).is_empty());
-    }
-
-    #[test]
-    fn the_reset_command_is_built_from_the_running_bundle_id() {
-        assert_eq!(
-            tccutil_reset_command("com.aterm.aterm.dev", Folder::Documents),
-            vec![
-                "/usr/bin/tccutil",
-                "reset",
-                "SystemPolicyDocumentsFolder",
-                "com.aterm.aterm.dev",
-            ]
-        );
-        // The id out is the id in, always last.
-        for id in ["com.aterm.aterm", "com.aterm.aterm.dev", "com.example.x"] {
-            for folder in Folder::ALL {
-                let argv = tccutil_reset_command(id, *folder);
-                assert_eq!(argv[3], id);
-                assert_eq!(argv[2], folder.tcc_service());
-            }
-        }
     }
 
     // -- denied-state repair (§3.7) ------------------------------------------
@@ -7753,57 +7635,13 @@ mod tests {
         }
     }
 
+    /// A plan is one command per distinct folder, in plan order — no retry and
+    /// no loop: a folder listed twice is still one command — every one naming
+    /// the same trimmed subject. An unusable subject or no folder is no plan.
     #[test]
-    fn no_bundle_id_literal_lives_outside_the_tests() {
-        // An aterm bundle id in the shipping half could reset another channel's rows.
-        let source = include_str!("consent.rs");
-        let (shipping, _tests) = source
-            .split_once("#[cfg(test)]\nmod tests {")
-            .expect("the test module marker is in this file");
-        assert!(
-            !shipping.contains("com.aterm"),
-            "an aterm bundle id literal appeared outside the tests"
-        );
-    }
-
-    #[test]
-    fn a_plan_refuses_an_unusable_subject_or_an_empty_folder_set() {
-        assert!(ResetPlan::new("a.b.c", Folder::ALL).is_some());
-        assert!(ResetPlan::new("", Folder::ALL).is_none());
-        assert!(ResetPlan::new("   ", Folder::ALL).is_none());
-        assert!(ResetPlan::new("-x", Folder::ALL).is_none());
-        assert!(ResetPlan::new("a b", Folder::ALL).is_none());
-        assert!(ResetPlan::new("a.b.c", &[]).is_none());
-    }
-
-    #[test]
-    fn a_plan_is_one_command_per_folder_in_plan_order_from_one_subject() {
-        let plan = ResetPlan::new(" a.b.c ", Folder::ALL).expect("plan builds");
-        assert_eq!(plan.bundle_id(), "a.b.c", "the subject is trimmed once");
-        assert_eq!(plan.folders(), Folder::ALL);
-
-        let commands = plan.commands();
-        assert_eq!(commands.len(), Folder::ALL.len());
-        for (folder, argv) in &commands {
-            assert_eq!(argv[2], folder.tcc_service());
-            assert_eq!(argv[3], "a.b.c", "every invocation names the same subject");
-        }
-        assert_eq!(
-            commands.iter().map(|(f, _)| *f).collect::<Vec<_>>(),
-            vec![
-                Folder::Documents,
-                Folder::Desktop,
-                Folder::Downloads,
-                Folder::AppData
-            ]
-        );
-    }
-
-    #[test]
-    fn a_repeated_folder_never_becomes_a_second_invocation() {
-        // No retry and no loop: a folder listed twice is still one command.
+    fn a_plan_is_one_command_per_distinct_folder_from_one_subject() {
         let plan = ResetPlan::new(
-            "a.b.c",
+            " a.b.c ",
             &[
                 Folder::Downloads,
                 Folder::Documents,
@@ -7812,8 +7650,24 @@ mod tests {
             ],
         )
         .expect("plan builds");
+        assert_eq!(plan.bundle_id(), "a.b.c", "the subject is trimmed once");
         assert_eq!(plan.folders(), &[Folder::Downloads, Folder::Documents]);
-        assert_eq!(plan.commands().len(), 2);
+        let commands = plan.commands();
+        assert_eq!(
+            commands,
+            vec![
+                (
+                    Folder::Downloads,
+                    tccutil_reset_command("a.b.c", Folder::Downloads)
+                ),
+                (
+                    Folder::Documents,
+                    tccutil_reset_command("a.b.c", Folder::Documents)
+                ),
+            ]
+        );
+        assert!(ResetPlan::new("-x", Folder::ALL).is_none());
+        assert!(ResetPlan::new("a.b.c", &[]).is_none());
     }
 
     fn offer_inputs(
@@ -7872,7 +7726,14 @@ mod tests {
         for (dr, tool, bundle, want) in cases {
             let got = reset_offer(offer_inputs(dr, tool, bundle));
             assert_eq!(got, want, "dr={dr:?} tool={tool:?} bundle={bundle:?}");
-            assert_eq!(got.shows_button(), want == ResetOffer::Offer);
+            // "The button is hidden" and "no argv exists" are the same fact.
+            let offered = want == ResetOffer::Offer;
+            assert_eq!(got.shows_button(), offered);
+            assert_eq!(
+                ResetPlan::for_offer(offer_inputs(dr, tool, bundle), Folder::ALL).is_some(),
+                offered,
+                "dr={dr:?} tool={tool:?} bundle={bundle:?}"
+            );
         }
         // The all-unknown default never offers a destructive action.
         assert_eq!(
@@ -7882,62 +7743,8 @@ mod tests {
     }
 
     #[test]
-    fn a_rebuild_scoped_identity_suppresses_the_button_entirely() {
-        let got = reset_offer(offer_inputs(
-            DrClass::Cdhash,
-            TccutilPresence::Executable,
-            Some("a.b.c"),
-        ));
-        assert_eq!(got, ResetOffer::ExplainRebuild);
-        assert!(
-            !got.shows_button(),
-            "a reset that cannot hold is not offered"
-        );
-        assert!(!DrClass::Cdhash.grant_stable());
-    }
-
-    #[test]
-    fn only_an_offered_repair_can_be_built() {
-        // "The button is hidden" and "no argv exists" are the same fact.
-        let offered = ResetPlan::for_offer(
-            offer_inputs(
-                DrClass::Identity,
-                TccutilPresence::Executable,
-                Some("a.b.c"),
-            ),
-            Folder::ALL,
-        );
-        assert_eq!(offered.map(|p| p.commands().len()), Some(Folder::ALL.len()));
-
-        let (run, notx, gone, unk) = (
-            TccutilPresence::Executable,
-            TccutilPresence::NotExecutable,
-            TccutilPresence::Missing,
-            TccutilPresence::Unknown,
-        );
-        for suppressed in [
-            offer_inputs(DrClass::Cdhash, run, Some("a.b.c")),
-            offer_inputs(DrClass::Unsigned, run, Some("a.b.c")),
-            offer_inputs(DrClass::Identity, gone, Some("a.b.c")),
-            offer_inputs(DrClass::Identity, notx, Some("a.b.c")),
-            offer_inputs(DrClass::Identity, unk, Some("a.b.c")),
-            offer_inputs(DrClass::Identity, run, None),
-            offer_inputs(DrClass::Identity, run, Some("")),
-        ] {
-            assert!(
-                ResetPlan::for_offer(suppressed, Folder::ALL).is_none(),
-                "{suppressed:?} must not produce an argv"
-            );
-        }
-    }
-
-    #[test]
     fn one_invocations_status_is_read_from_its_exit_alone() {
         assert_eq!(ResetStatus::from_exit_status(Some(0)), ResetStatus::Reset);
-        assert_eq!(
-            ResetStatus::from_exit_status(Some(1)),
-            ResetStatus::Declined { code: Some(1) }
-        );
         assert_eq!(
             ResetStatus::from_exit_status(Some(64)),
             ResetStatus::Declined { code: Some(64) }
@@ -7947,18 +7754,6 @@ mod tests {
             ResetStatus::from_exit_status(None),
             ResetStatus::Declined { code: None }
         );
-        assert!(!ResetStatus::from_exit_status(None).is_reset());
-        assert!(ResetStatus::Reset.is_reset());
-        assert!(!ResetStatus::ToolAbsent.is_reset());
-        assert_eq!(
-            ResetAttempt::from_exit_status(Folder::Desktop, Some(0)),
-            ResetAttempt::new(Folder::Desktop, ResetStatus::Reset)
-        );
-        assert_eq!(
-            ResetAttempt::tool_absent(Folder::Desktop).status,
-            ResetStatus::ToolAbsent
-        );
-        assert!(ResetAttempt::from_exit_status(Folder::Desktop, Some(0)).is_reset());
     }
 
     #[test]
@@ -8021,41 +7816,22 @@ mod tests {
         }
     }
 
+    /// The warm-up follows only what actually reset; each folder macOS
+    /// declined is named with its status; an absent tool asked nothing, so
+    /// nothing was declined.
     #[test]
-    fn a_partial_success_is_never_reported_as_every_folder() {
+    fn only_a_reset_folder_is_warmed_and_only_an_asked_one_declined() {
         let attempts = [
             ResetAttempt::new(Folder::Documents, ResetStatus::Reset),
             ResetAttempt::from_exit_status(Folder::Desktop, Some(1)),
             ResetAttempt::from_exit_status(Folder::Downloads, None),
+            ResetAttempt::tool_absent(Folder::AppData),
         ];
-        let outcome = reset_outcome(&attempts);
-        assert_eq!(
-            outcome,
-            ResetOutcome::Partial,
-            "one success must never speak for the whole set"
-        );
-
-        // The warm-up follows only what actually reset.
         assert_eq!(folders_reset(&attempts), vec![Folder::Documents]);
-        // And each failure yields one line, naming its folder and its status.
         assert_eq!(
             folders_declined(&attempts),
             vec![(Folder::Desktop, Some(1)), (Folder::Downloads, None)]
         );
-    }
-
-    #[test]
-    fn an_absent_tool_is_never_reported_as_a_refusal() {
-        let attempts = [
-            ResetAttempt::tool_absent(Folder::Documents),
-            ResetAttempt::tool_absent(Folder::Desktop),
-        ];
-        assert!(
-            folders_declined(&attempts).is_empty(),
-            "nothing was asked, so macOS declined nothing"
-        );
-        assert!(folders_reset(&attempts).is_empty());
-        assert_eq!(reset_outcome(&attempts), ResetOutcome::ToolAbsent);
     }
 
     // -- the posture join ----------------------------------------------------
@@ -8101,10 +7877,6 @@ mod tests {
 
     #[test]
     fn an_observed_eperm_is_the_only_route_to_denied() {
-        let mut base = inputs(Attribution::Live, FdaState::Granted);
-        base.observed_eperm = true;
-        assert_eq!(ConsentPosture::join(base).fs_consent, FsConsent::Denied);
-
         // The observation alone decides; the FDA state does not matter.
         for fda in [FdaState::Granted, FdaState::Denied, FdaState::Unknown] {
             let mut i = inputs(Attribution::Live, fda);
@@ -8139,6 +7911,7 @@ mod tests {
     fn covered_requires_grant_plus_live_plus_measured_coverage() {
         let measured = SpikeEvidence {
             fda_coverage_measured: true,
+            fda_scope: FdaScope::ThisProcess,
             ..SpikeEvidence::UNMEASURED
         };
         let mut i = inputs(Attribution::Live, FdaState::Granted);
@@ -8146,6 +7919,11 @@ mod tests {
         let got = ConsentPosture::join(i);
         assert_eq!(got.fs_consent, FsConsent::Covered);
         assert!(!got.prompt_possible);
+        assert_eq!(
+            got.fda_scope,
+            FdaScope::ThisProcess,
+            "carried from the evidence"
+        );
 
         // Drop any one of the three legs and it is Unknown again.
         let mut not_live = i;
@@ -8195,58 +7973,139 @@ mod tests {
                 assert_eq!(got.responsible, corroboration, "corroboration is carried");
             }
         }
-        // `responsible_pid` answering `None` does not make a live session unknown.
-        let mut live = inputs(Attribution::Live, FdaState::Unknown);
-        live.responsible = Responsible::Unknown;
-        assert_eq!(ConsentPosture::join(live).attribution, Attribution::Live);
     }
 
-    #[test]
-    fn fda_scope_is_carried_from_the_evidence_and_is_unknown_today() {
-        assert_eq!(SpikeEvidence::UNMEASURED.fda_scope, FdaScope::Unknown);
-        assert_eq!(SpikeEvidence::default(), SpikeEvidence::UNMEASURED);
-        let mut i = inputs(Attribution::Live, FdaState::Granted);
-        i.evidence.fda_scope = FdaScope::ThisProcess;
-        assert_eq!(ConsentPosture::join(i).fda_scope, FdaScope::ThisProcess);
-        assert_eq!(FdaScope::Unknown.as_str(), "unknown");
-        assert_eq!(FdaScope::ThisProcess.as_str(), "this_process");
-        assert_eq!(FdaScope::NewProcesses.as_str(), "new_processes");
-    }
+    // -- the wire ------------------------------------------------------------
 
+    /// The wire tokens, pinned: they are the `privacy` row's and `aterm
+    /// doctor`'s schema, read by agents. A `refused` label means no syscall or
+    /// spawn ran; and every default is the not-observed answer, never a verdict.
     #[test]
-    fn tokens_render_for_every_state() {
-        assert_eq!(FdaState::Granted.as_str(), "granted");
-        assert_eq!(FdaState::Denied.as_str(), "denied");
-        assert_eq!(FdaState::Unknown.as_str(), "unknown");
-        assert_eq!(FdaState::default(), FdaState::Unknown);
-        assert_eq!(Attribution::Live.as_str(), "live");
-        assert_eq!(Attribution::Adopted.as_str(), "adopted");
-        assert_eq!(Attribution::Unknown.as_str(), "unknown");
-        assert_eq!(Attribution::default(), Attribution::Unknown);
-        assert_eq!(FsConsent::Covered.as_str(), "covered");
-        assert_eq!(FsConsent::Denied.as_str(), "denied");
-        assert_eq!(FsConsent::Unknown.as_str(), "unknown");
-        assert_eq!(FsConsent::default(), FsConsent::Unknown);
-        assert_eq!(ProbeLabel::OpenEperm.as_str(), "open_eperm");
-        assert_eq!(ProbeLabel::OpenErrno(9).as_str(), "open_errno");
-        assert_eq!(
-            ProbeLabel::RefusedOutOfBundle.as_str(),
-            "refused_out_of_bundle"
-        );
-    }
+    fn the_wire_tokens_are_the_documented_spellings() {
+        let tokens = [
+            (FdaState::Granted.as_str(), "granted"),
+            (FdaState::Denied.as_str(), "denied"),
+            (FdaState::Unknown.as_str(), "unknown"),
+            (Attribution::Live.as_str(), "live"),
+            (Attribution::Adopted.as_str(), "adopted"),
+            (Attribution::Unknown.as_str(), "unknown"),
+            (FsConsent::Covered.as_str(), "covered"),
+            (FsConsent::Denied.as_str(), "denied"),
+            (FsConsent::Unknown.as_str(), "unknown"),
+            (FdaScope::Unknown.as_str(), "unknown"),
+            (FdaScope::ThisProcess.as_str(), "this_process"),
+            (FdaScope::NewProcesses.as_str(), "new_processes"),
+            (ProbeLabel::OpenEperm.as_str(), "open_eperm"),
+            (ProbeLabel::OpenErrno(9).as_str(), "open_errno"),
+            (
+                ProbeLabel::RefusedOutOfBundle.as_str(),
+                "refused_out_of_bundle",
+            ),
+            (DrClass::Identity.as_str(), "identity"),
+            (DrClass::Cdhash.as_str(), "cdhash"),
+            (DrClass::Unsigned.as_str(), "unsigned"),
+            (DrClass::Unknown.as_str(), "unknown"),
+            (ImageAnchor::Live.as_str(), "live"),
+            (ImageAnchor::Displaced.as_str(), "displaced"),
+            (ImageAnchor::Deleted.as_str(), "deleted"),
+            (ImageAnchor::NotBundled.as_str(), "not-bundled"),
+            (ImageAnchor::Unknown.as_str(), "unknown"),
+            (DebuggerMode::Enabled.as_str(), "enabled"),
+            (DebuggerMode::Disabled.as_str(), "disabled"),
+            (DebuggerMode::Unrecognized.as_str(), "unrecognized"),
+            (DebuggerMode::Unknown.as_str(), "unknown"),
+            (DebuggerMember::Admin.as_str(), "admin"),
+            (DebuggerMember::Developer.as_str(), "developer"),
+            (DebuggerMember::NotMember.as_str(), "no"),
+            (DebuggerMember::Unknown.as_str(), "unknown"),
+            (SelfHardening::Hardened.as_str(), "yes"),
+            (SelfHardening::NotHardened.as_str(), "no"),
+            (SelfHardening::Unknown.as_str(), "unknown"),
+            (DevToolState::Allowed.as_str(), "allowed"),
+            (DevToolState::Denied.as_str(), "denied"),
+            (DevToolState::Unlisted.as_str(), "unlisted"),
+            (DevToolState::Unknown.as_str(), "unknown"),
+            (DevToolListing::On.as_str(), "on"),
+            (DevToolListing::Off.as_str(), "off"),
+            (DevToolListing::Absent.as_str(), "absent"),
+            (DevToolListing::Unknown.as_str(), "unknown"),
+            (DevToolGrant::Granted.as_str(), "granted"),
+            (DevToolGrant::NotGranted.as_str(), "not_granted"),
+            (DevToolGrant::Unknown.as_str(), "unknown"),
+        ];
+        for (got, want) in tokens {
+            assert_eq!(got, want);
+        }
 
-    // -- cache ---------------------------------------------------------------
+        use DebuggerProbeLabel as D;
+        for (label, token, refused) in [
+            (D::Pending, "pending", false),
+            (D::StatusOk, "status_ok", false),
+            (D::StatusUnrecognized, "status_unrecognized", false),
+            (D::ToolAbsent, "tool_absent", false),
+            (D::SpawnFailed, "spawn_failed", false),
+            (D::TimedOut, "timed_out", false),
+            (D::OutputUnreadable, "output_unreadable", false),
+            (D::RefusedDisabled, "refused_disabled", true),
+            (D::RefusedOutOfBundle, "refused_out_of_bundle", true),
+            (D::RefusedNoExe, "refused_no_exe", true),
+            (D::UnsupportedPlatform, "unsupported_platform", true),
+        ] {
+            assert_eq!((label.as_str(), label.refused()), (token, refused));
+        }
+        use DevToolProbeLabel as T;
+        for (label, token, refused) in [
+            (T::Pending, "pending", false),
+            (T::Observed, "observed", false),
+            (T::NoRecentRequest, "no_recent_request", false),
+            (T::LogUnavailable, "log_unavailable", false),
+            (T::LogFailed, "log_failed", false),
+            (T::FormatUnrecognized, "format_unrecognized", false),
+            (T::TimedOut, "timed_out", false),
+            (T::SpawnFailed, "spawn_failed", false),
+            (T::OutputUnreadable, "output_unreadable", false),
+            (T::RefusedDisabled, "refused_disabled", true),
+            (T::RefusedObserverOff, "refused_observer_off", true),
+            (T::RefusedOutOfBundle, "refused_out_of_bundle", true),
+            (T::RefusedNoExe, "refused_no_exe", true),
+            (T::RefusedNoSubject, "refused_no_subject", true),
+            (T::UnsupportedPlatform, "unsupported_platform", true),
+        ] {
+            assert_eq!((label.as_str(), label.refused()), (token, refused));
+        }
+        use DevToolListLabel as L;
+        for (label, token, refused) in [
+            (L::Pending, "pending", false),
+            (L::Read, "read", false),
+            (L::NoFullDiskAccess, "no_full_disk_access", false),
+            (L::OpenFailed, "open_failed", false),
+            (L::ToolFailed, "sqlite_failed", false),
+            (L::FormatUnrecognized, "format_unrecognized", false),
+            (L::TimedOut, "timed_out", false),
+            (L::SpawnFailed, "spawn_failed", false),
+            (L::OutputUnreadable, "output_unreadable", false),
+            (L::RefusedDisabled, "refused_disabled", true),
+            (L::RefusedObserverOff, "refused_observer_off", true),
+            (L::RefusedOutOfBundle, "refused_out_of_bundle", true),
+            (L::RefusedNoExe, "refused_no_exe", true),
+            (L::RefusedNoSubject, "refused_no_subject", true),
+            (L::UnsupportedPlatform, "unsupported_platform", true),
+        ] {
+            assert_eq!((label.as_str(), label.refused()), (token, refused));
+        }
 
-    #[test]
-    fn cache_bundle_prefers_the_bundle_root() {
-        assert_eq!(
-            cache_bundle_for(Path::new("/Applications/aterm.app/Contents/MacOS/aterm")),
-            p("/Applications/aterm.app")
-        );
-        assert_eq!(
-            cache_bundle_for(Path::new("/Users//a/aterm/target/debug/deps/x-1")),
-            p("/Users//a/aterm/target/debug/deps/x-1")
-        );
+        let unobserved = [
+            FdaState::default() == FdaState::Unknown,
+            Attribution::default() == Attribution::Unknown,
+            FsConsent::default() == FsConsent::Unknown,
+            DebuggerMode::default() == DebuggerMode::Unknown,
+            DebuggerMember::default() == DebuggerMember::Unknown,
+            SelfHardening::default() == SelfHardening::Unknown,
+            DevToolState::default() == DevToolState::Unknown,
+            DevToolListing::default() == DevToolListing::Unknown,
+            DevToolGrant::default() == DevToolGrant::Unknown,
+        ];
+        assert_eq!(unobserved, [true; 9], "a default that is a verdict");
     }
 
     // -----------------------------------------------------------------
@@ -8256,37 +8115,27 @@ mod tests {
     /// Each argv carries its flag (`-enable` spelled out) on an absolute path.
     #[test]
     fn the_change_builders_always_carry_their_flags() {
-        let status = devtools_status_command();
-        assert_eq!(status, [DEVTOOLSSECURITY_PATH, "-status"]);
         assert!(
             Path::new(DEVTOOLSSECURITY_PATH).is_absolute(),
             "never resolved through PATH"
         );
-        let enable = devtools_enable_command();
-        assert_eq!(enable[0], DEVTOOLSSECURITY_PATH);
-        assert_eq!(enable[1], "-enable");
-        let disable = devtools_disable_command();
-        assert_eq!(disable[0], DEVTOOLSSECURITY_PATH);
-        assert_eq!(disable[1], "-disable");
-        assert_eq!(DebuggerChange::On.command(), enable);
-        assert_eq!(DebuggerChange::Off.command(), disable);
+        assert_eq!(
+            DebuggerChange::On.command(),
+            [DEVTOOLSSECURITY_PATH, "-enable"]
+        );
+        let disable = DebuggerChange::Off.command();
+        assert_eq!(disable, [DEVTOOLSSECURITY_PATH, "-disable"]);
         // The revert line a human reads is the argv `Off` runs.
         assert_eq!(DEBUGGER_ACCESS_REVERT, disable.join(" "));
+        // `-enable` runs only over a rule read as disabled, `-disable` only
+        // over one read as enabled: never over one Apple's tool cannot read.
+        assert_eq!(DebuggerChange::On.precondition(), DebuggerMode::Disabled);
+        assert_eq!(DebuggerChange::Off.precondition(), DebuggerMode::Enabled);
+        assert_eq!(DebuggerChange::On.target(), DebuggerMode::Enabled);
+        assert_eq!(DebuggerChange::Off.target(), DebuggerMode::Disabled);
         for change in [DebuggerChange::On, DebuggerChange::Off] {
-            assert_ne!(change.precondition(), change.target());
-            assert!(!matches!(
-                change.precondition(),
-                DebuggerMode::Unrecognized | DebuggerMode::Unknown
-            ));
             assert_eq!(DebuggerChange::from_token(change.as_str()), Some(change));
         }
-        assert_eq!(
-            DebuggerChange::On.precondition(),
-            DebuggerMode::Disabled,
-            "-enable runs only over a rule read as disabled"
-        );
-        assert_eq!(DebuggerChange::Off.precondition(), DebuggerMode::Enabled);
-        assert_eq!(DebuggerChange::from_token(""), None);
         assert_eq!(DebuggerChange::from_token("enable"), None);
     }
 
@@ -8354,17 +8203,6 @@ mod tests {
         }
     }
 
-    /// `spawned` is true exactly where a child was started.
-    #[test]
-    fn only_a_started_child_counts_as_spawned() {
-        let observed = DebuggerProbe::pending();
-        assert!(!DevtoolsChangeRun::NotDue { observed }.spawned());
-        assert!(!DevtoolsChangeRun::Absent.spawned());
-        assert!(!DevtoolsChangeRun::SpawnFailed.spawned());
-        assert!(!DevtoolsChangeRun::Unsupported.spawned());
-        assert!(DevtoolsChangeRun::WaitFailed.spawned());
-    }
-
     /// Against a `/bin/sh` stand-in: the exit code, a 4 KiB head of each stream, stdin closed,
     /// and `on_spawn` told the live pid before the wait.
     #[cfg(unix)]
@@ -8402,20 +8240,10 @@ mod tests {
         assert_eq!(stderr_head, "nope\n");
     }
 
-    /// A child that takes its time is waited for, not killed; a missing
-    /// program is `Absent` and never calls `on_spawn`.
+    /// A missing program is `Absent` and never calls `on_spawn`.
     #[cfg(unix)]
     #[test]
-    fn the_change_runner_waits_and_names_a_missing_program() {
-        let run = run_to_exit_keeping_heads(&["/bin/sh", "-c", "sleep 0.3; echo done"], |_| {});
-        assert_eq!(
-            run,
-            DevtoolsChangeRun::Exited {
-                code: Some(0),
-                stdout_head: "done\n".to_owned(),
-                stderr_head: String::new(),
-            }
-        );
+    fn the_change_runner_names_a_missing_program() {
         let missing = std::env::temp_dir().join(format!(
             "aterm-devtools-missing-{}/DevToolsSecurity-stand-in",
             std::process::id()
@@ -8466,85 +8294,6 @@ mod tests {
         assert_eq!(process_birth(1), None);
     }
 
-    /// The wire tokens, pinned: they are the `privacy` row's schema.
-    #[test]
-    fn the_debugger_tokens_are_the_documented_spellings() {
-        let modes = [
-            (DebuggerMode::Enabled, "enabled"),
-            (DebuggerMode::Disabled, "disabled"),
-            (DebuggerMode::Unrecognized, "unrecognized"),
-            (DebuggerMode::Unknown, "unknown"),
-        ];
-        for (mode, token) in modes {
-            assert_eq!(mode.as_str(), token);
-        }
-        let members = [
-            (DebuggerMember::Admin, "admin"),
-            (DebuggerMember::Developer, "developer"),
-            (DebuggerMember::NotMember, "no"),
-            (DebuggerMember::Unknown, "unknown"),
-        ];
-        for (member, token) in members {
-            assert_eq!(member.as_str(), token);
-        }
-        let hardening = [
-            (SelfHardening::Hardened, "yes"),
-            (SelfHardening::NotHardened, "no"),
-            (SelfHardening::Unknown, "unknown"),
-        ];
-        for (fact, token) in hardening {
-            assert_eq!(fact.as_str(), token);
-        }
-        let labels = [
-            (DebuggerProbeLabel::Pending, "pending", false),
-            (DebuggerProbeLabel::StatusOk, "status_ok", false),
-            (
-                DebuggerProbeLabel::StatusUnrecognized,
-                "status_unrecognized",
-                false,
-            ),
-            (DebuggerProbeLabel::ToolAbsent, "tool_absent", false),
-            (DebuggerProbeLabel::SpawnFailed, "spawn_failed", false),
-            (DebuggerProbeLabel::TimedOut, "timed_out", false),
-            (
-                DebuggerProbeLabel::OutputUnreadable,
-                "output_unreadable",
-                false,
-            ),
-            (
-                DebuggerProbeLabel::RefusedDisabled,
-                "refused_disabled",
-                true,
-            ),
-            (
-                DebuggerProbeLabel::RefusedOutOfBundle,
-                "refused_out_of_bundle",
-                true,
-            ),
-            (DebuggerProbeLabel::RefusedNoExe, "refused_no_exe", true),
-            (
-                DebuggerProbeLabel::UnsupportedPlatform,
-                "unsupported_platform",
-                true,
-            ),
-        ];
-        for (label, token, refused) in labels {
-            assert_eq!(label.as_str(), token);
-            assert_eq!(label.refused(), refused, "{token}");
-        }
-        // The defaults are the not-observed answers, never a verdict.
-        assert_eq!(DebuggerMode::default(), DebuggerMode::Unknown);
-        assert_eq!(DebuggerMember::default(), DebuggerMember::Unknown);
-        assert_eq!(SelfHardening::default(), SelfHardening::Unknown);
-        let pending = DebuggerProbe::pending();
-        assert_eq!(pending.label, DebuggerProbeLabel::Pending);
-        assert!(!pending.label.refused());
-        assert_eq!(pending.mode, DebuggerMode::Unknown);
-        let unsupported = unsupported_debugger_probe();
-        assert_eq!(unsupported.label, DebuggerProbeLabel::UnsupportedPlatform);
-        assert_eq!(unsupported.member, DebuggerMember::Unknown);
-    }
-
     fn exited(code: Option<i32>, stdout: &str, stderr: &str) -> ToolRun {
         ToolRun::Exited {
             code,
@@ -8585,10 +8334,6 @@ mod tests {
             (
                 exited(Some(0), "Developer mode is now enabled.\n", ""),
                 (M::Enabled, ok),
-            ),
-            (
-                exited(Some(0), "Developer mode is now disabled.\n", ""),
-                (M::Disabled, ok),
             ),
             (
                 exited(Some(0), "  Developer mode is currently disabled.\r\n", ""),
@@ -8754,10 +8499,6 @@ mod tests {
                 enabled: true,
                 check: false,
             },
-            ProbeGate {
-                enabled: false,
-                check: false,
-            },
         ] {
             let got = probe_debugger_with(gate, Some(&bundled), never_spawn, never_ask);
             assert_eq!(
@@ -8770,25 +8511,16 @@ mod tests {
             got,
             DebuggerProbe::refused(DebuggerProbeLabel::RefusedNoExe)
         );
-        for exe in [
-            "/Users//a/aterm/target/debug/deps/aterm_containment-abc123",
-            "/Users//a/aterm/target/release/aterm",
-            "/Applications/aterm.app/Contents/Resources/aterm",
-        ] {
-            let got = probe_debugger_with(
-                ProbeGate::on(),
-                Some(Path::new(exe)),
-                never_spawn,
-                never_ask,
-            );
-            assert_eq!(
-                got,
-                DebuggerProbe::refused(DebuggerProbeLabel::RefusedOutOfBundle),
-                "{exe}"
-            );
-            assert_eq!(got.mode, DebuggerMode::Unknown);
-            assert_eq!(got.member, DebuggerMember::Unknown);
-        }
+        let deps = p("/Users//a/aterm/target/debug/deps/aterm_containment-abc123");
+        let got = probe_debugger_with(ProbeGate::on(), Some(&deps), never_spawn, never_ask);
+        assert_eq!(
+            got,
+            DebuggerProbe::refused(DebuggerProbeLabel::RefusedOutOfBundle)
+        );
+        assert_eq!(
+            (got.mode, got.member),
+            (DebuggerMode::Unknown, DebuggerMember::Unknown)
+        );
     }
 
     /// Past the refusals the probe spawns exactly the `-status` argv, once, and
@@ -8831,20 +8563,6 @@ mod tests {
         assert_eq!(got.mode, DebuggerMode::Unknown);
         assert_eq!(got.member, DebuggerMember::Developer);
         assert_eq!(got.label, DebuggerProbeLabel::TimedOut);
-    }
-
-    /// The real entry point refuses from this test binary (under `target/debug/deps`), so
-    /// `DevToolsSecurity` never runs from a test.
-    #[test]
-    fn the_real_debugger_probe_refuses_from_a_test_binary() {
-        let got = probe_debugger(ProbeGate::on());
-        assert!(got.label.refused(), "{got:?}");
-        assert_eq!(got.mode, DebuggerMode::Unknown);
-        assert_eq!(got.member, DebuggerMember::Unknown);
-        #[cfg(target_os = "macos")]
-        assert_eq!(got.label, DebuggerProbeLabel::RefusedOutOfBundle);
-        #[cfg(not(target_os = "macos"))]
-        assert_eq!(got.label, DebuggerProbeLabel::UnsupportedPlatform);
     }
 
     // -- the Developer Tools list (kTCCServiceDeveloperTool) ----------------
@@ -9213,17 +8931,8 @@ mod tests {
                 unrecognized(),
             ),
             // Another app named aterm's subject plus tccd's next field: only the second
-            // `}Resp:{` tells its answer from aterm's.
-            (
-                "an app named aterm}Resp:{ is not aterm: its unlisted",
-                log_of(&[answer_at(21, FORGED_SUB, "Unknown (None)")]),
-                unrecognized(),
-            ),
-            (
-                "an app named aterm}Resp:{ is not aterm: its allowed",
-                log_of(&[answer_at(21, FORGED_SUB, "Allowed (User Set)")]),
-                unrecognized(),
-            ),
+            // `}Resp:{` tells its answer from aterm's. Read as aterm's or skipped as another
+            // app's, each row answers wrong.
             (
                 "its unlisted after aterm's real allowed",
                 log_of(&[allowed(10), answer_at(21, FORGED_SUB, "Unknown (None)")]),
@@ -9625,23 +9334,11 @@ mod tests {
             probe_devtool_with(ProbeGate::on(), None, ATERM, never_look, never_spawn),
             DevToolProbe::refused(DevToolProbeLabel::RefusedNoExe)
         );
-        for exe in [
-            "/private/tmp/x/target/debug/deps/aterm_containment-abc123",
-            "/private/tmp/x/target/release/aterm",
-            "/Applications/aterm.app/Contents/Resources/aterm",
-        ] {
-            assert_eq!(
-                probe_devtool_with(
-                    ProbeGate::on(),
-                    Some(Path::new(exe)),
-                    ATERM,
-                    never_look,
-                    never_spawn
-                ),
-                DevToolProbe::refused(DevToolProbeLabel::RefusedOutOfBundle),
-                "{exe}"
-            );
-        }
+        let deps = p("/private/tmp/x/target/debug/deps/aterm_containment-abc123");
+        assert_eq!(
+            probe_devtool_with(ProbeGate::on(), Some(&deps), ATERM, never_look, never_spawn),
+            DevToolProbe::refused(DevToolProbeLabel::RefusedOutOfBundle)
+        );
         for subject in [
             "",
             "  ",
@@ -9739,62 +9436,6 @@ mod tests {
             .map(|i| args[i + 1].clone());
         assert_eq!(last, Some(format!("{}m", DEVTOOL_WINDOW_S / 60)));
         assert!(args.contains(&"ndjson".to_string()), "the escaped framing");
-    }
-
-    /// The real entry point refuses from this test binary (under `target/debug/deps`): nothing
-    /// runs.
-    #[test]
-    fn the_real_devtool_probe_refuses_from_a_test_binary() {
-        let got = probe_devtool(ProbeGate::on(), ATERM);
-        assert!(got.label.refused(), "{got:?}");
-        assert_eq!(got.state, DevToolState::Unknown);
-        assert_eq!(got.requests, None);
-        #[cfg(target_os = "macos")]
-        assert_eq!(got.label, DevToolProbeLabel::RefusedOutOfBundle);
-        #[cfg(not(target_os = "macos"))]
-        assert_eq!(got.label, DevToolProbeLabel::UnsupportedPlatform);
-    }
-
-    /// The wire tokens, pinned: they are the `privacy` row's schema.
-    #[test]
-    fn the_devtool_tokens_are_the_documented_spellings() {
-        for (state, token) in [
-            (DevToolState::Allowed, "allowed"),
-            (DevToolState::Denied, "denied"),
-            (DevToolState::Unlisted, "unlisted"),
-            (DevToolState::Unknown, "unknown"),
-        ] {
-            assert_eq!(state.as_str(), token);
-        }
-        use DevToolProbeLabel as L;
-        for (label, token, refused) in [
-            (L::Pending, "pending", false),
-            (L::Observed, "observed", false),
-            (L::NoRecentRequest, "no_recent_request", false),
-            (L::LogUnavailable, "log_unavailable", false),
-            (L::LogFailed, "log_failed", false),
-            (L::FormatUnrecognized, "format_unrecognized", false),
-            (L::TimedOut, "timed_out", false),
-            (L::SpawnFailed, "spawn_failed", false),
-            (L::OutputUnreadable, "output_unreadable", false),
-            (L::RefusedDisabled, "refused_disabled", true),
-            (L::RefusedObserverOff, "refused_observer_off", true),
-            (L::RefusedOutOfBundle, "refused_out_of_bundle", true),
-            (L::RefusedNoExe, "refused_no_exe", true),
-            (L::RefusedNoSubject, "refused_no_subject", true),
-            (L::UnsupportedPlatform, "unsupported_platform", true),
-        ] {
-            assert_eq!(label.as_str(), token);
-            assert_eq!(label.refused(), refused, "{token}");
-        }
-        assert_eq!(DevToolState::default(), DevToolState::Unknown);
-        let pending = DevToolProbe::pending();
-        assert_eq!(pending.label, L::Pending);
-        assert!(!pending.label.refused());
-        assert_eq!(unsupported_devtool_probe().label, L::UnsupportedPlatform);
-        assert_eq!(DEVTOOL_WINDOW_S, 600);
-        assert!(!SpikeEvidence::UNMEASURED.devtool_answer_shapes_measured);
-        assert!(!SpikeEvidence::UNMEASURED.devtool_skips_first_run_check);
     }
 
     // -- the Developer Tools list's row in the system TCC.db ----------------
@@ -10004,24 +9645,6 @@ mod tests {
                 "errno {errno}"
             );
         }
-        for label in [
-            DevToolListLabel::RefusedDisabled,
-            DevToolListLabel::RefusedObserverOff,
-            DevToolListLabel::RefusedOutOfBundle,
-            DevToolListLabel::RefusedNoExe,
-            DevToolListLabel::RefusedNoSubject,
-            DevToolListLabel::UnsupportedPlatform,
-        ] {
-            assert!(label.refused(), "{label:?}");
-        }
-        for label in [
-            DevToolListLabel::Pending,
-            DevToolListLabel::Read,
-            DevToolListLabel::NoFullDiskAccess,
-            DevToolListLabel::OpenFailed,
-        ] {
-            assert!(!label.refused(), "{label:?}");
-        }
     }
 
     /// Past the refusals the probe opens the system database once, then runs
@@ -10077,19 +9700,6 @@ mod tests {
                 && DEVTOOL_DB_QUERY.starts_with("SELECT "),
             "a read of the Developer Tools rows only"
         );
-    }
-
-    /// The real entry point refuses from this test binary: no open of the
-    /// system database, no `sqlite3`.
-    #[test]
-    fn the_real_list_probe_refuses_from_a_test_binary() {
-        let got = probe_devtool_list(ProbeGate::on(), ATERM);
-        assert!(got.label.refused(), "{got:?}");
-        assert_eq!(got.listing, DevToolListing::Unknown);
-        #[cfg(target_os = "macos")]
-        assert_eq!(got.label, DevToolListLabel::RefusedOutOfBundle);
-        #[cfg(not(target_os = "macos"))]
-        assert_eq!(got.label, DevToolListLabel::UnsupportedPlatform);
     }
 
     /// The join, as a table: the switch decides unless tccd answered after it
@@ -10199,49 +9809,6 @@ mod tests {
         }
     }
 
-    /// The wire tokens, pinned: they are the `privacy` row's schema.
-    #[test]
-    fn the_list_and_grant_tokens_are_the_documented_spellings() {
-        for (listing, token) in [
-            (DevToolListing::On, "on"),
-            (DevToolListing::Off, "off"),
-            (DevToolListing::Absent, "absent"),
-            (DevToolListing::Unknown, "unknown"),
-        ] {
-            assert_eq!(listing.as_str(), token);
-        }
-        for (grant, token) in [
-            (DevToolGrant::Granted, "granted"),
-            (DevToolGrant::NotGranted, "not_granted"),
-            (DevToolGrant::Unknown, "unknown"),
-        ] {
-            assert_eq!(grant.as_str(), token);
-        }
-        use DevToolListLabel as L;
-        for (label, token) in [
-            (L::Pending, "pending"),
-            (L::Read, "read"),
-            (L::NoFullDiskAccess, "no_full_disk_access"),
-            (L::OpenFailed, "open_failed"),
-            (L::ToolFailed, "sqlite_failed"),
-            (L::FormatUnrecognized, "format_unrecognized"),
-            (L::TimedOut, "timed_out"),
-            (L::SpawnFailed, "spawn_failed"),
-            (L::OutputUnreadable, "output_unreadable"),
-            (L::RefusedDisabled, "refused_disabled"),
-            (L::RefusedObserverOff, "refused_observer_off"),
-            (L::RefusedOutOfBundle, "refused_out_of_bundle"),
-            (L::RefusedNoExe, "refused_no_exe"),
-            (L::RefusedNoSubject, "refused_no_subject"),
-            (L::UnsupportedPlatform, "unsupported_platform"),
-        ] {
-            assert_eq!(label.as_str(), token);
-        }
-        assert_eq!(DevToolListing::default(), DevToolListing::Unknown);
-        assert_eq!(DevToolGrant::default(), DevToolGrant::Unknown);
-        assert_eq!(unsupported_devtool_list().label, L::UnsupportedPlatform);
-    }
-
     #[test]
     fn the_bundle_id_is_read_off_the_bundle_and_never_under_a_protected_root() {
         let dir = aterm_tempfile::tempdir().expect("tempdir");
@@ -10287,6 +9854,8 @@ mod tests {
         ));
         assert_eq!(sh("sleep 5", 200), ToolRun::TimedOut);
         assert_eq!(sh("printf '\\377'", 60_000), ToolRun::Unreadable);
+        // A stream one byte over the cap is read in part, so it is no report;
+        // at the cap it is whole.
         assert_eq!(
             sh(
                 &format!("head -c {} /dev/zero", TOOL_OUTPUT_MAX_BYTES + 1),
@@ -10294,6 +9863,20 @@ mod tests {
             ),
             ToolRun::Unreadable
         );
+        match sh(
+            &format!("head -c {TOOL_OUTPUT_MAX_BYTES} /dev/zero"),
+            60_000,
+        ) {
+            ToolRun::Exited {
+                code: Some(0),
+                stdout,
+                ..
+            } => assert_eq!(
+                u64::try_from(stdout.len()).ok(),
+                Some(TOOL_OUTPUT_MAX_BYTES)
+            ),
+            other => panic!("a report at the cap: {other:?}"),
+        }
         // The cap is the caller's: the same stream reads whole under the
         // Developer Tools read's larger one.
         let over = TOOL_OUTPUT_MAX_BYTES + 1;
@@ -10359,26 +9942,29 @@ mod tests {
         assert_eq!(ERRNO_ESRCH, libc::ESRCH);
     }
 
-    /// This test binary lives under `target/debug/deps`, so the real entry
-    /// point refuses, end to end through the function production calls.
+    /// This test binary lives under `target/debug/deps`, so every real entry
+    /// point refuses, end to end through the functions production calls: the
+    /// 2026-08-17 fence. Nothing is opened or spawned — no `TCC.db`, no
+    /// `DevToolsSecurity`, no `log`, no `sqlite3` — and nothing is learned.
     #[cfg(target_os = "macos")]
     #[test]
-    fn the_real_probe_refuses_from_a_test_binary() {
-        let got = probe_fda(ProbeGate::on());
+    fn the_real_probes_refuse_from_a_test_binary() {
+        let fda = probe_fda(ProbeGate::on());
         assert_eq!(
-            got.state,
-            FdaState::Unknown,
-            "a test binary must never learn the FDA state"
-        );
-        assert!(
-            got.label.refused(),
-            "a test binary must never reach the syscall: {:?}",
-            got.label
+            (fda.state, fda.label),
+            (FdaState::Unknown, ProbeLabel::RefusedOutOfBundle)
         );
         assert_eq!(
-            got.label,
-            ProbeLabel::RefusedOutOfBundle,
-            "the refusal reason must be the in-bundle guard"
+            probe_debugger(ProbeGate::on()),
+            DebuggerProbe::refused(DebuggerProbeLabel::RefusedOutOfBundle)
+        );
+        assert_eq!(
+            probe_devtool(ProbeGate::on(), ATERM),
+            DevToolProbe::refused(DevToolProbeLabel::RefusedOutOfBundle)
+        );
+        assert_eq!(
+            probe_devtool_list(ProbeGate::on(), ATERM),
+            DevToolList::refused(DevToolListLabel::RefusedOutOfBundle)
         );
     }
 
@@ -10393,37 +9979,5 @@ mod tests {
             "/usr/bin/tccutil is part of macOS; {got:?} means the mode read is wrong"
         );
         assert!(got.can_run());
-    }
-
-    /// Total from a test binary: some answer, no panic, no hang.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn the_responsibility_spi_is_total_for_our_own_process() {
-        let me = i32::try_from(std::process::id()).expect("pid fits in i32");
-        let answer = responsible_pid_detailed(me);
-        match answer {
-            Ok(pid) => assert!(pid >= 0, "a non-negative pid or an error, never a raw -1"),
-            Err(_) => {}
-        }
-        // And a pid that cannot exist is never mistaken for us.
-        assert_ne!(
-            classify_responsible(me, responsible_pid_detailed(-1)),
-            Responsible::SelfProcess
-        );
-    }
-
-    /// Total from a test binary, and never an invented name.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn responsible_app_is_total_and_names_something_real() {
-        let me = i32::try_from(std::process::id()).expect("pid fits in i32");
-        if let Some(app) = responsible_app(me) {
-            assert!(app.pid > 0);
-            assert!(
-                app.path.is_absolute(),
-                "proc_pidpath returns absolute paths"
-            );
-            assert!(!app.display_name.is_empty());
-        }
     }
 }

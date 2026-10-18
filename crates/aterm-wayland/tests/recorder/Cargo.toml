@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# THE WAYLAND ORACLE'S RECORDER (LW.6, docs/AUDIT-third-party-2026-10-15.md,
+# linux-windowing), in ITS OWN WORKSPACE (the empty `[workspace]` below):
+# registry wayland-scanner 0.31.10 generates the C interface tables from the
+# same protocol files aterm-wayland's generator reads (../../protocols/), and
+# this program prints every interface, message, signature and argument type
+# of them. aterm-wayland is held to that recording with no wayland-* crate in
+# the workspace graph. tablet-v2.xml (wayland-protocols 0.32.12, MIT) is here
+# only because cursor-shape names zwp_tablet_tool_v2; aterm-wayland carries a
+# stub of that one interface.
+#
+# Nothing in the aterm workspace builds this. From this directory:
+#   targo --unverified run --release --locked > ../recorded/wayland-scanner-0.31.10-interfaces.tsv.new
+# It prints rows only; the committed TSV adds the `#` header. A difference is
+# wayland-scanner (or a protocol file) changing, never a reason to edit the
+# recording by hand.
+[package]
+name = "aterm-wayland-recorder"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+wayland-scanner = "=0.31.10"
+wayland-backend = { version = "=0.3.15", default-features = false }

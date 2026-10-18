@@ -89,3 +89,34 @@ pub fn linkheavy_corpus(lines: usize) -> Vec<u8> {
     }
     out
 }
+
+/// The throughput lane's workload, at least `bytes` long: a repeating mix of plain
+/// text, SGR colour/style runs, CSI cursor moves + erases, and newline-driven
+/// scrolling. Deterministic byte-for-byte across machines (no RNG, no clock) so
+/// the corpus — and therefore the work performed — is identical everywhere.
+/// Shared by `perf_harness` (the `throughput` lane) and `crash_restore_harness`
+/// (the tail tap's overhead on the same bytes).
+#[must_use]
+pub fn throughput_corpus(bytes: usize) -> Vec<u8> {
+    // One "frame" of mixed traffic. Hand-built so the proportions are stable:
+    //   - plain printable ASCII (the cheap path),
+    //   - SGR runs (parser-heavy: params + dispatch),
+    //   - CSI cursor positioning + erase-in-line (state mutation),
+    //   - explicit newlines so the 24-row window scrolls constantly.
+    let frame: &[&[u8]] = &[
+        b"the quick brown fox jumps over the lazy dog 0123456789\r\n",
+        b"\x1b[1;38;5;202mERROR\x1b[0m \x1b[4;48;5;19mwarning\x1b[0m normal text here\r\n",
+        b"\x1b[2K\x1b[1Gredrawn line after erase-in-line and cursor-to-col-1\r\n",
+        b"\x1b[7minverse\x1b[27m \x1b[3mitalic\x1b[23m \x1b[9mstrike\x1b[29m mixed sgr\r\n",
+        b"\x1b[10;5Hpositioned via CUP \x1b[K then erased to end of line\r\n",
+        b"plain throughput line with a tab\tand more ascii content padding 42\r\n",
+        b"\x1b[38;2;120;200;255mtruecolor\x1b[0m run plus \x1b[48;2;10;10;10mbg\x1b[0m\r\n",
+        b"\x1b[H\x1b[2Jfull clear then home, forcing a screen reset every frame\r\n",
+    ];
+    let unit: Vec<u8> = frame.concat();
+    let mut out = Vec::with_capacity(bytes + unit.len());
+    while out.len() < bytes {
+        out.extend_from_slice(&unit);
+    }
+    out
+}

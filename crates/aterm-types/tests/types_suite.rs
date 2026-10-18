@@ -13,6 +13,4 @@
 //! `targo --unverified test -p aterm-types --test types_suite -- <file>::`.
 
 mod color_space;
-mod input_key_bridge_tests;
 mod kitty_keyboard_tests;
-mod xterm_keyboard_tests;

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Tier-1 bind for `TerminalModes` (`aterm_spec::derive::terminal_modes_model`): drives
+//! Tier-1 bind for `TerminalModes` (`aterm_models_core::terminal_modes_model`): drives
 //! every `#[refines(machine = "terminal_modes", …)]` action through real
 //! `Terminal::process_at` bytes, projects the modes with [`project_modes`], and validates
 //! each step against the model (in-process, plus `ty trace validate` where installed).
@@ -15,7 +15,8 @@
 
 use std::collections::BTreeMap;
 
-use aterm_spec::derive::{Model, terminal_modes_model};
+use aterm_models_core::terminal_modes_model;
+use aterm_spec::derive::Model;
 use aterm_spec::xref::StepEvidence;
 use aterm_spec::{interp, verify};
 use aterm_types::CursorStyle;

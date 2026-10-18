@@ -88,6 +88,21 @@ impl ShellStartup {
         self.zsh
     }
 
+    /// Each alias and function read: its name, what it is (`an alias in
+    /// <snapshot>`) and whether it is an alias — what a harness tape holds of
+    /// a startup (`super::probe`), never the snapshot's text.
+    #[must_use]
+    pub fn names(&self) -> &[(String, String, bool)] {
+        &self.names
+    }
+
+    /// The startup [`Self::names`] and [`Self::may_run_zsh`] describe: a
+    /// startup read back off a tape.
+    #[must_use]
+    pub fn of_parts(names: Vec<(String, String, bool)>, zsh: bool) -> Self {
+        Self { names, zsh }
+    }
+
     /// `Err` naming the alias or function `line` may run: a function whose
     /// name is a word of the line under any quoting of it ([`dequotings`]), an
     /// alias whose name is a word in command position ([`command_heads`]) —
@@ -541,6 +556,15 @@ fn hook_env_scripts(claude: &Path) -> Result<(), String> {
 /// Read one snapshot's person's part (everything above [`CLAUDE_PART`]):
 /// `Err` naming an option that fails every line, `state` given the names it
 /// defines. `source` names the file in a reason.
+///
+/// A reason names what it found by its NAMES — an option's (`setopt
+/// globsubst`, `shopt -s nullglob`, `set -o posix`, rebuilt from the line's
+/// words in the one shape each is listed in), an alias's or a function's —
+/// and a line of any other shape by its first word and its number, never by
+/// its text: the snapshot is the person's shell startup written out, and the
+/// reason reaches a journal row, a decision's mark and a harness tape's
+/// `probe.shell_startup` reply ([`zshenv_hazard`] says the same of a
+/// `.zshenv`).
 pub fn parse_snapshot(
     kind: Kind,
     text: &str,
@@ -556,18 +580,28 @@ pub fn parse_snapshot(
         .iter()
         .rposition(|l| l.trim_end() == CLAUDE_PART)
         .ok_or_else(|| format!("{source} is not a whole shell snapshot (no `{CLAUDE_PART}`)"))?;
-    let option = |line: &str| {
-        format!(
-            "the Bash tool's {} starts with `{line}` from the person's shell startup (Claude \
-             Code's shell snapshot {source})",
-            kind.name()
-        )
-    };
-    for line in &lines[1..end] {
+    for (at, line) in lines.iter().enumerate().take(end).skip(1) {
         if line.starts_with(char::is_whitespace) {
             continue;
         }
         let words: Vec<&str> = line.split_whitespace().collect();
+        // `what` is the option by its words, or a line of another shape by
+        // its first; `at + 1` is its line in the file.
+        let option = |what: &str| {
+            format!(
+                "the Bash tool's {} starts with {what} from the person's shell startup (line {} \
+                 of Claude Code's shell snapshot {source})",
+                kind.name(),
+                at + 1
+            )
+        };
+        let named = || option(&format!("`{}`", words.join(" ")));
+        let unnamed = || {
+            option(&format!(
+                "a `{}` line this check does not read",
+                words.first().copied().unwrap_or_default()
+            ))
+        };
         match (kind, words.as_slice()) {
             (Kind::Zsh, [name, "()", "{"]) => {
                 define(
@@ -579,24 +613,24 @@ pub fn parse_snapshot(
             }
             (Kind::Zsh, ["setopt", name]) => {
                 if !ZSH_INERT.contains(&name.to_ascii_lowercase().replace('_', "").as_str()) {
-                    return Err(option(line.trim_end()));
+                    return Err(named());
                 }
             }
-            (Kind::Zsh, ["setopt", ..]) => return Err(option(line.trim_end())),
+            (Kind::Zsh, ["setopt", ..]) => return Err(unnamed()),
             (Kind::Bash, ["set", "-o", name]) => {
                 if !BASH_SET_INERT.contains(name) {
-                    return Err(option(line.trim_end()));
+                    return Err(named());
                 }
             }
             (Kind::Bash, ["shopt", flag @ ("-s" | "-u"), name]) => {
                 match BASH_SHOPTS.iter().find(|(n, _)| n == name) {
                     Some((_, None)) => {}
                     Some((_, Some(default))) if *default == (*flag == "-s") => {}
-                    _ => return Err(option(line.trim_end())),
+                    _ => return Err(named()),
                 }
             }
             (_, ["set" | "shopt" | "setopt" | "unsetopt" | "emulate", ..]) => {
-                return Err(option(line.trim_end()));
+                return Err(unnamed());
             }
             (_, ["alias", "--", ..]) => {
                 let def = line.strip_prefix("alias -- ").unwrap_or_default();
@@ -934,7 +968,7 @@ fn zshenv(worker: &WorkerEnv) -> Result<(), String> {
             .ok_or_else(|| format!("{} cannot be read whole", path.display()))?;
         if let Some(what) = zshenv_hazard(&text) {
             return Err(format!(
-                "{} runs before every command the Bash tool runs and {what}",
+                "{} runs before every command the Bash tool runs, and {what}",
                 path.display()
             ));
         }
@@ -949,12 +983,15 @@ fn zshenv(worker: &WorkerEnv) -> Result<(), String> {
 /// not read: `None` when nothing does. Comments aside (a `#` that starts a
 /// word: `${#x}` is code), every line is read; the words are matched
 /// anywhere in it, and an empty `()` (a function, or an empty array) counts.
+///
+/// The verdict names the line by its NUMBER and what was found on it by a
+/// word of this check's own ([`ZSHENV_WORDS`]), never by its text: a
+/// `.zshenv` is where a person exports their keys (`alias deploy='AWS_…=…
+/// ./deploy'`), and this verdict is a reason a journal row, a decision's mark
+/// and a harness tape's `probe.shell_startup` reply all hold. The person
+/// opens the file at that line; nothing of it is copied out.
 pub fn zshenv_hazard(text: &str) -> Option<String> {
-    const WORDS: &[&str] = &[
-        "emulate", "setopt", "unsetopt", "options", "set", "source", ".", "eval", "alias",
-        "function", "autoload", "zmodload", "builtin", "exec", "trap",
-    ];
-    for line in text.lines() {
+    for (n, line) in text.lines().enumerate() {
         let comment = line.char_indices().find(|&(at, c)| {
             c == '#'
                 && line[..at]
@@ -964,16 +1001,24 @@ pub fn zshenv_hazard(text: &str) -> Option<String> {
         });
         let code = comment.map_or(line, |(at, _)| &line[..at]);
         if code.contains("()") {
-            return Some(format!("defines a function (`{}`)", line.trim()));
+            return Some(format!("its line {} defines a function", n + 1));
         }
         for word in code.split(|c: char| c.is_whitespace() || ";&|(){}[]`\"'".contains(c)) {
-            if WORDS.contains(&word) {
-                return Some(format!("runs `{word}` (`{}`)", line.trim()));
+            if let Some(word) = ZSHENV_WORDS.iter().find(|w| **w == word) {
+                return Some(format!("its line {} runs `{word}`", n + 1));
             }
         }
     }
     None
 }
+
+/// The words of a `.zshenv` line that may set what the snapshot's listing
+/// would not show, or run code this check does not read ([`zshenv_hazard`],
+/// whose verdict quotes one of these and nothing else of the line).
+const ZSHENV_WORDS: &[&str] = &[
+    "emulate", "setopt", "unsetopt", "options", "set", "source", ".", "eval", "alias", "function",
+    "autoload", "zmodload", "builtin", "exec", "trap",
+];
 
 /// `Err` naming a variable of the worker's that makes bash read a file before
 /// a command or sets its options.

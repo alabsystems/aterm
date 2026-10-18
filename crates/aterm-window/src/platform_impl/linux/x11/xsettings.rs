@@ -4,6 +4,9 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/xsettings.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
+// Modified by the aterm project in 2026; see the repository NOTICE. (aterm-x11's requests,
+// where upstream used x11rb's.)
+
 //! Parser for the xsettings data format.
 //!
 //! Some of this code is referenced from [here].
@@ -12,7 +15,7 @@
 
 use std::num::NonZeroUsize;
 
-use x11rb::protocol::xproto::{self, ConnectionExt};
+use aterm_x11::proto::xproto;
 
 use super::atoms::*;
 use super::XConnection;
@@ -33,7 +36,7 @@ impl XConnection {
         let atoms = self.atoms();
 
         // Get the current owner of the screen's settings.
-        let owner = self.xcb_connection().get_selection_owner(xsettings_screen)?.reply()?;
+        let owner = self.request(xproto::get_selection_owner(xsettings_screen))?;
 
         // Read the _XSETTINGS_SETTINGS property.
         let data: Vec<u8> =

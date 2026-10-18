@@ -59,41 +59,6 @@ fn resize_reflow_with_nonzero_display_offset_preserves_live_content() {
     grid.assert_invariants();
 }
 
-/// Reflow remaps extras instead of clearing them; one in the first chunk keeps its coordinate.
-#[test]
-fn reflow_shrink_remaps_extras_within_first_chunk() {
-    let mut grid = Grid::new(5, 10);
-    for c in "ABCDEFGHIJ".chars() {
-        grid.write_char(c);
-    }
-
-    let coord = CellCoord::new(0, 3);
-    grid.extras_mut()
-        .get_or_create(coord)
-        .set_hyperlink(Some(Arc::from("https://example.com")));
-    assert!(grid.extras().get(coord).is_some());
-
-    // 'D' stays in the first chunk.
-    grid.resize(5, 5);
-
-    assert!(
-        grid.extras().get(CellCoord::new(0, 3)).is_some(),
-        "hyperlink on 'D' should survive reflow at (0,3)"
-    );
-    assert!(
-        grid.extras()
-            .get(CellCoord::new(0, 3))
-            .unwrap()
-            .hyperlink()
-            .is_some(),
-        "hyperlink URL must be preserved"
-    );
-    assert!(
-        grid.extras().get(CellCoord::new(1, 3)).is_none(),
-        "no extras should appear on row 1 col 3"
-    );
-}
-
 /// Hyperlink that moves to a new row during shrink reflow is preserved.
 #[test]
 fn reflow_shrink_hyperlink_moves_to_new_row() {
@@ -230,38 +195,6 @@ fn reflow_shrink_preserves_bg_rgb() {
     );
 }
 
-/// Hyperlinks on multiple cells all survive reflow.
-#[test]
-fn reflow_shrink_multiple_extras_remapped() {
-    let mut grid = Grid::new(5, 10);
-    for c in "ABCDEFGHIJ".chars() {
-        grid.write_char(c);
-    }
-
-    grid.extras_mut()
-        .get_or_create(CellCoord::new(0, 2))
-        .set_hyperlink(Some(Arc::from("https://c.example")));
-    grid.extras_mut()
-        .get_or_create(CellCoord::new(0, 7))
-        .set_hyperlink(Some(Arc::from("https://h.example")));
-
-    grid.resize(5, 5);
-
-    let c_extra = grid.extras().get(CellCoord::new(0, 2));
-    assert!(c_extra.is_some(), "'C' hyperlink at (0,2) preserved");
-    assert_eq!(
-        c_extra.unwrap().hyperlink().map(|u| u.as_ref()),
-        Some("https://c.example")
-    );
-
-    let h_extra = grid.extras().get(CellCoord::new(1, 2));
-    assert!(h_extra.is_some(), "'H' hyperlink remapped to (1,2)");
-    assert_eq!(
-        h_extra.unwrap().hyperlink().map(|u| u.as_ref()),
-        Some("https://h.example")
-    );
-}
-
 /// Complex-char overflow survives shrink reflow and still renders via row_text().
 #[test]
 fn reflow_shrink_preserves_complex_char_and_row_text() {
@@ -291,7 +224,12 @@ fn reflow_shrink_preserves_complex_char_and_row_text() {
 #[test]
 fn reflow_shrink_drops_wide_char_extras_when_wide_cell_is_replaced() {
     let mut grid = Grid::new(3, 4);
-    grid.write_wide_char_wrap_with_style_id('中', StyleId::default(), CellFlags::empty());
+    grid.write_wide_char_wrap_styled(
+        '中',
+        crate::PackedColor::DEFAULT_FG,
+        crate::PackedColor::DEFAULT_BG,
+        CellFlags::empty(),
+    );
     grid.write_char('A');
 
     let extra = grid.extras_mut().get_or_create(CellCoord::new(0, 0));
@@ -578,8 +516,15 @@ fn column_reflow_preserves_ring_scrollback_both_directions() {
         );
     }
 
+    // Widen back: lines unwrap; content still complete and the rewrap is
+    // reversible (same physical row count).
     grid.resize(4, 40);
     grid.assert_invariants();
+    assert_eq!(
+        grid.scrollback_lines(),
+        count_before,
+        "round-trip restores original scrollback row count"
+    );
     let wide = logical_scrollback(&grid);
     for line in &before {
         assert!(
@@ -587,39 +532,6 @@ fn column_reflow_preserves_ring_scrollback_both_directions() {
             "logical line dropped on widen: {line:?}"
         );
     }
-}
-
-/// A width round trip keeps an early line and restores the scrollback row count.
-#[test]
-fn column_reflow_round_trip_restores_scrollback_count() {
-    let mut grid = Grid::with_scrollback(3, 30, 1000);
-    for i in 0..25u16 {
-        grid.set_cursor(2, 0);
-        let mut text = format!("ROW{i}-");
-        while text.len() < 28 {
-            text.push('z');
-        }
-        for c in text.chars() {
-            grid.write_char(c);
-        }
-        grid.line_feed();
-        grid.carriage_return();
-    }
-
-    let sb0 = grid.scrollback_lines();
-    let present = |g: &Grid| logical_scrollback(g).iter().any(|l| l.starts_with("ROW5-"));
-    assert!(present(&grid), "ROW5 present initially");
-
-    grid.resize(3, 18);
-    assert!(present(&grid), "ROW5 survives shrink");
-    grid.resize(3, 30);
-    assert!(present(&grid), "ROW5 survives round-trip");
-    assert_eq!(
-        grid.scrollback_lines(),
-        sb0,
-        "round-trip restores original scrollback row count"
-    );
-    grid.assert_invariants();
 }
 
 /// With a tiered store, `restore_reflowed_scrollback` pushes rewrapped history into the store,

@@ -2,15 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Shared types for the aterm terminal engine.
-//!
-//! Provides primitive types (`Rgb`, `CursorStyle`, `BiDiMode`, `ColorPalette`,
-//! `TerminalSize`) and cross-crate type definitions for domain, input,
-//! keyboard, mouse, selection, GPU views, text shaping, terminal hosting,
-//! and perception.
+//! Shared types for the aterm terminal engine: primitives (`Rgb`, `CursorStyle`, `BiDiMode`,
+//! `ColorPalette`, `TerminalSize`) and the cross-crate vocabulary for domain, input, keyboard,
+//! mouse, selection, text shaping, terminal hosting, themes and the control socket.
 
 #![warn(missing_docs)]
-// Trust tool-attribute plumbing (scrollback/lz4 pattern) for #[trust::contract_panic].
+// Registers the `trust` tool so `#[trust::…]` attributes resolve under the Trust verifier.
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]
 
@@ -27,9 +24,6 @@ pub mod dev_seam;
 pub mod identity;
 pub mod version;
 
-// ============================================================================
-// Domain types — owned by this crate
-// ============================================================================
 mod cursor;
 
 // Grid indexing types (Line, Column, Point, etc.).
@@ -43,13 +37,13 @@ pub mod dirs;
 mod time;
 pub use time::duration_to_nanos;
 
-// Howard Hinnant civil-calendar math + the RFC3339 UTC stamp built on it —
-// the one workspace home (update, release, gui, and atpkg all stamp this shape).
+// Civil-calendar math (Howard Hinnant's) and the RFC 3339 UTC stamp built on it: the one
+// workspace home for that shape.
 pub mod rfc3339;
 
-// Rust on this machine means the Trust toolchain: the stock names, their Trust
-// spellings, and the reader that finds a stock tool at command position — one
-// vocabulary for atpkg's reroute, `aterm pkg lane` and `aterm help rust`.
+// Rust on this machine means the Trust toolchain: the stock names, their Trust spellings, and
+// the reader that finds a stock tool at command position, for atpkg's reroute,
+// `aterm pkg lane` and `aterm help rust`.
 pub mod rust_lane;
 
 pub mod app_inspection;
@@ -61,9 +55,8 @@ pub mod control_verbs;
 // depends on another.
 pub mod fabric_grammar;
 pub mod fs_restricted;
-// The inline-image payload: shared vocabulary because the live grid and the
-// history line model must hold the SAME `Arc`, and neither of those crates can
-// see the other's types (see the module docs).
+// The inline-image payload: shared vocabulary because the live grid and the history line model
+// must hold the same `Arc`, and neither of those crates can see the other's types.
 mod inline_image;
 pub mod scheme;
 // `aterm theme import`: offline converters from other terminals' theme formats
@@ -71,9 +64,14 @@ pub mod scheme;
 pub mod scheme_import;
 // The one write path an import takes into the themes folder (CLI and window).
 pub mod scheme_install;
+// A theme's typography (font families and type knobs) and its value readers.
+pub mod scheme_typography;
 // The signature bar (OkLCh hue, chroma and distance rows): the built-ins'
 // law test and `aterm theme check --signature` share it.
 pub mod scheme_signature;
+// The 256-colour palette (slots 16-255) a theme derives from its ANSI
+// colours when it opts in with `palette_generate`.
+pub mod scheme_palette256;
 mod x11_colors;
 pub use color_palette::ColorPalette;
 pub use cursor::CursorStyle;
@@ -83,8 +81,6 @@ pub use inline_image::{
 // Named color schemes ("theme palettes"): the single source for terminal colors.
 pub use scheme::{Appearance, ColorScheme, ThemeParts};
 
-mod buffer_access;
-pub mod buffer_command;
 mod clipboard;
 pub mod domain;
 mod env_sanitize;
@@ -92,6 +88,9 @@ pub mod input;
 pub mod keyboard;
 mod kitty_keyboard;
 pub mod mouse;
+// A window's X11 or Wayland handles, from the windowing crate to the GL arm
+// and the CPU presenters.
+pub mod native_window;
 pub mod pipeline_timestamps;
 pub use pipeline_timestamps::PipelineTimestamps;
 mod callback_types;
@@ -123,21 +122,12 @@ pub use vt_level::VtLevel;
 pub use window::{WindowOperation, WindowResponse};
 pub use xterm_keyboard::XtermKeyboardState;
 pub mod osc;
-mod search_content;
-pub use buffer_access::BufferAccess;
-pub use buffer_command::BufferCommand;
 pub use callback_types::{
-    AdvancedNotificationCallback, ClipboardCallback, ColorChangeCallback, ColorChangeOp,
-    NotificationCallback, WindowCallback,
+    AdvancedNotificationCallback, ClipboardCallback, NotificationCallback, WindowCallback,
 };
 pub use osc::{
     Iterm2ShellIntegrationVersion, Notification, NotificationUrgency, RemoteHost, TaskbarProgress,
 };
-pub use search_content::SearchContent;
-
-// ============================================================================
-// Terminal Size
-// ============================================================================
 
 /// Terminal dimensions (rows and columns).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,18 +161,12 @@ impl TerminalSize {
 // SGR Dim (Faint) Factor
 // ============================================================================
 
-/// Dim (SGR faint) brightness multiplier applied to each RGB channel.
-///
-/// Centralized here so all render paths (CPU color resolve, FFI cell export,
-/// GPU shader logic) share one authoritative value. The WGSL shader cannot
-/// import Rust constants — keep its inline `0.5` in sync manually.
-///
-/// aterm uses 0.5; Alacritty upstream uses 0.66.
+/// Default `faint_opacity`: the fraction of the foreground's contrast SGR 2
+/// (dim/faint) keeps, in log space. Faint is a linear-light blend toward the
+/// cell background, raised to a readable floor where needed; see
+/// `aterm_core::terminal::color_resolve::dim_toward_bg`.
 pub const DIM_FACTOR: f32 = 0.5;
 
-// ============================================================================
-// RGB Color Type
-// ============================================================================
 /// RGB color value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -195,21 +179,14 @@ pub struct Rgb {
     pub b: u8,
 }
 
-/// The terminal's default foreground — the VT/engine spec default (ANSI "white",
-/// `#E5E5E5`, the index-7 grey, NOT pure white). This is the SINGLE source of truth
-/// for the unstyled foreground: both the runtime terminal state
-/// (`aterm_core::terminal::transient_state`) and `TerminalConfig::default()` derive
-/// their default fg from it, so a bare `Terminal::new()` and an applied default
-/// config can never disagree.
-///
-/// NOTE: this is the *engine* default. The windowed GUI deliberately overrides it
-/// with its themed [`ColorScheme`] (default fg `#D0D0D0`) via the GUI's
-/// `applied_terminal_config()`, so end users see the theme, not this value.
+/// The engine's default foreground: ANSI "white", `#E5E5E5` (the index-7 grey, not pure
+/// white). The terminal state (`aterm_core::terminal::transient_state`) and
+/// `TerminalConfig::default()` both take it, so a bare `Terminal::new()` and a default config
+/// agree. The windowed GUI applies its themed [`ColorScheme`] instead (fg `#D0D0D0`).
 pub const DEFAULT_FOREGROUND: Rgb = Rgb::new(229, 229, 229);
 
-/// The terminal's default background — the VT/engine spec default (black). Single
-/// source of truth, mirrored by `transient_state` and `TerminalConfig::default()`
-/// (see [`DEFAULT_FOREGROUND`]). The GUI overrides it with the theme bg (`#111318`).
+/// The engine's default background, black, shared like [`DEFAULT_FOREGROUND`]. The GUI's
+/// theme uses `#111318`.
 pub const DEFAULT_BACKGROUND: Rgb = Rgb::new(0, 0, 0);
 
 impl Rgb {
@@ -219,16 +196,12 @@ impl Rgb {
         Self { r, g, b }
     }
 
-    /// Calculate contrast ratio between two colors.
-    ///
-    /// Returns the WCAG relative luminance contrast ratio.
+    /// The WCAG contrast ratio between two colors.
     #[must_use]
-    // Skip: f64 arithmetic — the float-interval lane.
+    // Skip: f64 arithmetic, the float-interval lane.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn contrast(self, other: Self) -> f64 {
-        // `luminance` is mathematically in [0, 1]; the explicit clamp is identity
-        // on every real value but gives the Trust gate a finite bound so the
-        // `+ 0.05` additions provably cannot overflow to infinity.
+        // `luminance` is in [0, 1]; the clamp is identity but gives the Trust gate the bound.
         let lum1 = self.luminance().clamp(0.0, 1.0);
         let lum2 = other.luminance().clamp(0.0, 1.0);
         let (lighter, darker) = if lum1 > lum2 {
@@ -236,11 +209,8 @@ impl Rgb {
         } else {
             (lum2, lum1)
         };
-        // Re-clamp at the arithmetic site: `clamp` is idempotent, so this is
-        // exactly the values selected above (already clamped to [0, 1]) — but
-        // it puts the bound on the operands the Trust gate reasons about
-        // locally, so `+ 0.05` provably cannot overflow to infinity and the
-        // divisor is provably >= 0.05 (no division by zero).
+        // Re-clamped at the arithmetic site (identity) so the Trust gate sees the operand
+        // bounds locally: no overflow to infinity, a divisor >= 0.05.
         let lighter = lighter.clamp(0.0, 1.0);
         let darker = darker.clamp(0.0, 1.0);
         (lighter + 0.05) / (darker + 0.05)
@@ -248,14 +218,9 @@ impl Rgb {
 
     /// Calculate relative luminance per WCAG 2.0.
     fn luminance(self) -> f64 {
-        // Skip, standing: `powf` is an inexact float intrinsic, which Trust
-        // refuses to admit by design (std documents its precision as
-        // non-deterministic; trust d1a7b27696 and c065186961). No seal will
-        // discharge this body as written. No `[f64; 256]` table replaces it:
-        // `aterm_messages::ink::contrast` transcribes this body token for token
-        // and is pinned to it bit for bit (ruling 324) with no aterm-types
-        // dependency, so a table here needs a second copy there or leaves the
-        // pin resting on the host's `pow` matching the table's.
+        // Skip: `powf` is an inexact float intrinsic, which Trust refuses by design. No
+        // `[f64; 256]` table replaces it: `aterm_messages::ink::contrast` transcribes this body
+        // and is pinned to it bit for bit, so a table here would need a second copy there.
         #[cfg_attr(trust_verify, trust::skip)]
         fn linearize(c: u8) -> f64 {
             let c = f64::from(c) / 255.0;
@@ -264,17 +229,12 @@ impl Rgb {
             } else {
                 ((c + 0.055) / 1.055).powf(2.4)
             };
-            // sRGB linearization maps [0, 1] onto [0, 1]; the clamp is identity
-            // on every real input but makes the range explicit so the weighted
-            // sum below provably cannot overflow to infinity (the `powf` result
-            // is otherwise opaque to the Trust gate).
+            // Identity on [0, 1], but it makes the range explicit to the Trust gate, for which
+            // the `powf` result is opaque.
             l.clamp(0.0, 1.0)
         }
-        // Re-clamp at the call site: `linearize` already returns a value
-        // clamped to [0, 1] and `clamp` is idempotent, so these are the exact
-        // same values — but the bound now sits in this frame, where the Trust
-        // gate evaluates the weighted sum, so each product is provably <= 1
-        // and the adds provably cannot overflow to infinity.
+        // Re-clamped here (identity) so the bound sits in the frame where the Trust gate
+        // evaluates the weighted sum: each product <= 1, no overflow to infinity.
         let r = linearize(self.r).clamp(0.0, 1.0);
         let g = linearize(self.g).clamp(0.0, 1.0);
         let b = linearize(self.b).clamp(0.0, 1.0);
@@ -285,10 +245,8 @@ impl Rgb {
 impl std::ops::Mul<f32> for Rgb {
     type Output = Self;
 
-    // Skip: f32 multiply, clamp and saturating cast, no transcendental — the
-    // float-interval lane (docs/TRUST_100PCT_PLAN.md, wave 3b: "float-clamp
-    // intervals", blocked on native float theory in $HOME/trust). Delete it when a
-    // promoted seal proves this body.
+    // Skip: f32 multiply, clamp and saturating cast, the float-interval lane
+    // (docs/TRUST_100PCT_PLAN.md). Delete it when a promoted seal proves this body.
     #[cfg_attr(trust_verify, trust::skip)]
     fn mul(self, rhs: f32) -> Self::Output {
         Self {
@@ -310,10 +268,6 @@ impl std::ops::Add for Rgb {
         }
     }
 }
-
-// ============================================================================
-// BiDi Mode
-// ============================================================================
 
 /// BiDi (Bidirectional Text) display mode.
 ///
@@ -337,17 +291,9 @@ pub enum BiDiMode {
 mod tests {
     use super::*;
 
-    // =========================================================================
-    // Rgb
-    // =========================================================================
-
-    // =========================================================================
-    // CursorStyle
-    // =========================================================================
-
     #[test]
-    fn cursor_style_from_param_valid() {
-        // Param 0 maps to BlinkingBlock (same as 1 per DECSCUSR)
+    fn cursor_style_from_decscusr_param() {
+        // Param 0 is BlinkingBlock, as 1 is (DECSCUSR).
         assert_eq!(CursorStyle::from_param(0), Some(CursorStyle::BlinkingBlock));
         assert_eq!(CursorStyle::from_param(1), Some(CursorStyle::BlinkingBlock));
         assert_eq!(CursorStyle::from_param(2), Some(CursorStyle::SteadyBlock));
@@ -361,12 +307,8 @@ mod tests {
         );
         assert_eq!(CursorStyle::from_param(5), Some(CursorStyle::BlinkingBar));
         assert_eq!(CursorStyle::from_param(6), Some(CursorStyle::SteadyBar));
-    }
-
-    #[test]
-    fn cursor_style_from_param_invalid() {
-        assert_eq!(CursorStyle::from_param(7), None);
-        assert_eq!(CursorStyle::from_param(255), None);
-        assert_eq!(CursorStyle::from_param(u16::MAX), None);
+        for invalid in [7, 255, u16::MAX] {
+            assert_eq!(CursorStyle::from_param(invalid), None, "{invalid}");
+        }
     }
 }

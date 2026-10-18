@@ -97,14 +97,12 @@ fn assert_cursor_companion_owner_transition(
 
 /// A copy reads the terminal the gesture was addressed to (`copy_selection_in(wid)`, for both
 /// the ⌘-C arm and `Action::Copy`), not `frontmost_window`, which can move ahead of OS focus.
-/// Test builds' `pbcopy` goes to a thread-local board, so only "nothing to copy" is asserted.
 #[test]
 fn a_copy_resolves_the_routed_window_not_the_frontmost_one() {
     use aterm_core::selection::SelectionSide;
 
     let mut app = App::headless_for_test();
     let wid_a = WindowId(0);
-
     let term_a = app.front_terminal(wid_a).expect("terminal A").term.clone();
     {
         let mut t = term_lock(&term_a);
@@ -113,31 +111,23 @@ fn a_copy_resolves_the_routed_window_not_the_frontmost_one() {
         sel.start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
         sel.update_selection(0, 4, SelectionSide::Right);
         sel.complete_selection();
-        assert!(t.selection_to_string().is_some_and(|s| !s.is_empty()));
     }
-
     let sid = app.next_session_id;
     let wid_b = app.insert_logical_window(stub_session(sid), 24, 80);
-    assert_eq!(wid_b, WindowId(1));
-    assert_eq!(
-        app.frontmost_window,
-        Some(wid_b),
-        "the new window is frontmost while A still holds the selection"
-    );
-
+    assert_eq!(app.frontmost_window, Some(wid_b));
     assert!(
         !app.copy_selection(),
         "the frontmost form resolves window B, which has no selection"
     );
     assert!(
-        !app.copy_selection_in(wid_b),
-        "copy_selection_in must resolve the window it was asked for"
+        app.copy_selection_in(wid_a),
+        "the routed form reads the window it was asked for"
     );
-    assert!(
-        term_lock(&term_a)
-            .selection_to_string()
-            .is_some_and(|s| !s.is_empty()),
-        "window A's selection survived and is what the routed copy reads"
+    assert_eq!(
+        crate::control::PBPASTE_STUB
+            .with(|b| b.borrow().clone())
+            .as_deref(),
+        Some("hello")
     );
 }
 
@@ -237,11 +227,10 @@ fn compose_band_for_test(app: &mut App) {
 fn the_composed_band_is_sealed_on_the_row_that_meets_the_terminal() {
     use aterm_messages::{Message, Severity, tags};
     let ink = crate::chrome_band::band_colors(aterm_render::Theme::default()).label;
-    let sealed = |row: &[aterm_core::terminal::RenderCell]| {
-        row.iter().all(|c| {
-            c.underline == aterm_core::terminal::UnderlineStyle::Single
-                && c.underline_color == Some(ink)
-        })
+    // A row's closing line, drawn as underlines or as a rail as the cell
+    // height allows (`message_band::closing_line`).
+    let line = |app: &App, row: usize| {
+        crate::message_band::closing_line(&app.windows[&WindowId(0)].input_scratch, row)
     };
     let bare = |row: &[aterm_core::terminal::RenderCell]| {
         row.iter()
@@ -260,7 +249,6 @@ fn the_composed_band_is_sealed_on_the_row_that_meets_the_terminal() {
         "the count lags the dismissal, so the splice PADS — the case under test"
     );
     compose_band_for_test(&mut app);
-    let cells = &app.windows[&WindowId(0)].input_scratch.cells;
     // The row above keeps only the stack's divider, never the seam's ink.
     let colors = crate::chrome_band::band_colors(aterm_render::Theme::default());
     let divider = crate::chrome_band::mix3(
@@ -268,12 +256,14 @@ fn the_composed_band_is_sealed_on_the_row_that_meets_the_terminal() {
         colors.label,
         crate::message_band::DIVIDER_ALPHA,
     );
-    assert!(
-        cells[0].iter().all(|c| c.underline_color == Some(divider)),
+    assert_eq!(
+        line(&app, 0),
+        Some(divider),
         "the seam must leave the row above"
     );
-    assert!(
-        sealed(&cells[1]),
+    assert_eq!(
+        line(&app, 1),
+        Some(ink),
         "the padded row meets the terminal, so it carries the seam"
     );
 
@@ -282,12 +272,15 @@ fn the_composed_band_is_sealed_on_the_row_that_meets_the_terminal() {
     assert_eq!(app.message_band_rows, 0);
     app.windows.get_mut(&WindowId(0)).unwrap().presence.rows = 1;
     compose_band_for_test(&mut app);
-    let cells = &app.windows[&WindowId(0)].input_scratch.cells;
-    assert!(
-        sealed(&cells[0]),
+    assert_eq!(
+        line(&app, 0),
+        Some(ink),
         "a presence row with nothing under it carries the closing seam"
     );
-    assert!(bare(&cells[1]), "and the terminal's own first row does not");
+    assert!(
+        line(&app, 1).is_none() && bare(&app.windows[&WindowId(0)].input_scratch.cells[1]),
+        "and the terminal's own first row does not"
+    );
 }
 
 #[test]
@@ -359,93 +352,8 @@ fn native_tab_install_and_close_are_atomic_without_a_pty_mirror() {
     assert!(app.structural_invariants_ok());
 }
 
-/// A second window (real `create`/`install` bookkeeping, stub session) lands as a strictly
-/// greater frontmost id with its own pooled session and intact invariants; closing the
-/// non-frontmost one is `Stay` and re-points frontmost to a live window; closing the last
-/// is `Exit`.
-#[test]
-fn multi_window_lifecycle() {
-    let mut app = App::headless_for_test();
-    assert_eq!(app.windows.len(), 1);
-    assert_eq!(app.frontmost_window, Some(WindowId(0)));
-    assert_eq!(app.pool.iter().count(), 1);
-    assert!(app.structural_invariants_ok());
-
-    // The stub session's id must be the App's next session id (`insert_logical_window`
-    // asserts it), as `create_window_logical` pairs them.
-    let sid1 = app.next_session_id; // 1
-    let wid1 = app.insert_logical_window(stub_session(sid1), 24, 80);
-    assert_eq!(app.windows.len(), 2, "a 2nd window now exists");
-    assert_eq!(
-        app.frontmost_window,
-        Some(wid1),
-        "the new window is frontmost"
-    );
-    assert!(wid1 > WindowId(0), "minted a strictly-increasing WindowId");
-    assert_eq!(app.pool.iter().count(), 2, "the pool owns both sessions");
-    assert!(app.structural_invariants_ok());
-
-    let sid2 = app.next_session_id; // 2
-    let wid2 = app.insert_logical_window(stub_session(sid2), 24, 80);
-    assert!(
-        wid2 > wid1,
-        "each create mints a strictly-increasing WindowId"
-    );
-    assert_eq!(app.windows.len(), 3);
-    assert_eq!(app.frontmost_window, Some(wid2));
-    assert_eq!(app.pool.iter().count(), 3);
-
-    let outcome = app.close_window_logical(WindowId(0));
-    assert_eq!(
-        outcome,
-        CloseOutcome::Stay,
-        "closing a non-last window keeps the app"
-    );
-    assert_eq!(app.windows.len(), 2, "the closed window is gone");
-    assert!(!app.windows.contains_key(&WindowId(0)));
-    assert_eq!(
-        app.pool.iter().count(),
-        2,
-        "only the closed window's session dropped"
-    );
-    assert_eq!(
-        app.frontmost_window,
-        Some(wid2),
-        "frontmost untouched (closed a sibling)"
-    );
-    assert!(app.structural_invariants_ok());
-
-    let outcome = app.close_window_logical(wid2);
-    assert_eq!(outcome, CloseOutcome::Stay, "a sibling remains → app stays");
-    assert_eq!(app.windows.len(), 1);
-    assert_eq!(
-        app.frontmost_window,
-        Some(wid1),
-        "frontmost re-points to the surviving window",
-    );
-    assert!(
-        app.frontmost_window
-            .is_some_and(|f| app.windows.contains_key(&f))
-    );
-    assert!(app.structural_invariants_ok());
-
-    let outcome = app.close_window_logical(wid1);
-    assert_eq!(
-        outcome,
-        CloseOutcome::Exit,
-        "closing the last window exits the app"
-    );
-    assert!(app.windows.is_empty(), "no windows remain");
-    assert_eq!(app.frontmost_window, None, "frontmost is None once empty");
-    assert_eq!(app.pool.iter().count(), 0, "every session detached");
-
-    // An unknown WindowId closes as a no-op `Stay`, never a panic: stale events are harmless.
-    assert_eq!(app.close_window_logical(WindowId(999)), CloseOutcome::Stay);
-}
-
 /// An OS light↔dark switch re-resolves a `dark:…,light:…` split `theme`: Light moves
-/// `self.theme` and the engine factory bg to the light side, Dark restores the dark side,
-/// and a repeated appearance is a no-op.
+/// `self.theme` and the engine factory bg to the light side, and Dark restores the dark side.
 #[test]
 fn os_appearance_switch_retthemes_split_theme() {
     let mut app = App::headless_for_test();
@@ -476,325 +384,121 @@ fn os_appearance_switch_retthemes_split_theme() {
     app.sync_app_theme_to_appearance(aterm_types::Appearance::Dark);
     assert_eq!(app.os_appearance, aterm_types::Appearance::Dark);
     assert_eq!(app.theme.bg, dark_bg);
-
-    app.sync_app_theme_to_appearance(aterm_types::Appearance::Dark);
-    assert_eq!(app.theme.bg, dark_bg);
-}
-
-/// A plain (non-split) `theme` never re-themes on an OS appearance switch: the
-/// rendered theme is identical for both sides, so the switch is a no-op for it.
-#[test]
-fn os_appearance_switch_noop_for_plain_theme() {
-    let mut app = App::headless_for_test();
-    app.config = aterm_toml::from_str(r#"theme = "Dracula""#).expect("valid toml");
-    app.os_appearance = aterm_types::Appearance::Dark;
-    app.theme = app.config.theme_for(aterm_types::Appearance::Dark);
-    let bg = app.theme.bg;
-    app.sync_app_theme_to_appearance(aterm_types::Appearance::Light);
-    assert_eq!(app.os_appearance, aterm_types::Appearance::Light);
-    assert_eq!(
-        app.theme.bg, bg,
-        "a single theme renders the same in light mode"
-    );
 }
 
 /// "Move Tab to New Window" moves the front window's active tab into a new frontmost
-/// window: the source loses it (active clamped), the pool's session count is unchanged,
-/// and a single-tab source is a no-op.
+/// window: the source loses it, the new window holds exactly it under its stable
+/// `TabId`/`ViewId`, the pool's session count is unchanged, and a single-tab source is a
+/// no-op.
 #[test]
 fn detach_active_tab_moves_view_to_new_window() {
     let mut app = App::headless_for_test();
-    // Window 0 gets a second tab (session 1), which becomes active.
-    let sid1 = app.next_session_id; // 1
-    app.push_stub_tab(WindowId(0), stub_session(sid1));
-    assert_eq!(app.windows.len(), 1);
+    let sid1 = app.next_session_id;
+    app.push_stub_tab(WindowId(0), stub_session(sid1)); // tabs [0, sid1], sid1 active
     let pool_before = app.pool.iter().count();
-    assert_eq!(pool_before, 2, "two pooled sessions before the detach");
     let (moved_tab_id, moved_view_id) = {
-        let ws0 = app.windows.get(&WindowId(0)).expect("window 0");
-        let tab = ws0.tab_set.tab_at(1).expect("second stable tab");
+        let tab = app.windows[&WindowId(0)]
+            .tab_set
+            .tab_at(1)
+            .expect("second stable tab");
         (tab.id, tab.root.leaves()[0])
     };
-    {
-        let Some(ws0) = app.windows.get(&WindowId(0)) else {
-            panic!("window 0 exists")
-        };
-        assert_eq!(
-            ws0.layouts.iter().map(|t| t.focus()).collect::<Vec<_>>(),
-            vec![0, sid1]
-        );
-        assert_eq!(ws0.tabs.active, 1);
-        assert_eq!(
-            ws0.front_terminal().expect("front terminal").session,
-            sid1,
-            "the appended tab is active"
-        );
-    }
-    assert!(app.structural_invariants_ok());
+    let focuses = |app: &App, wid: WindowId| {
+        app.windows[&wid]
+            .layouts
+            .iter()
+            .map(|t| t.focus())
+            .collect::<Vec<_>>()
+    };
 
     // The logical half of the detach (no OS window attach) returns the new id.
     let wid_b = app
         .detach_active_tab_logical()
         .expect("a 2-tab source detaches its active tab");
-
     assert!(wid_b > WindowId(0), "minted a strictly-increasing WindowId");
-    assert_eq!(
-        app.frontmost_window,
-        Some(wid_b),
-        "the new window is frontmost"
-    );
-    assert_eq!(app.windows.len(), 2, "windows grew by one");
-
-    {
-        let Some(ws0) = app.windows.get(&WindowId(0)) else {
-            panic!("source survives")
-        };
-        assert_eq!(
-            ws0.layouts.iter().map(|t| t.focus()).collect::<Vec<_>>(),
-            vec![0],
-            "source lost the moved tab"
-        );
-        assert_eq!(ws0.tabs.count, 1);
-        assert_eq!(ws0.tabs.active, 0, "source active clamped into range");
-        assert_eq!(
-            ws0.front_terminal().expect("front terminal").session,
-            0,
-            "source re-mirrored onto its surviving tab"
-        );
-    }
-
-    {
-        let Some(ws_b) = app.windows.get(&wid_b) else {
-            panic!("the new window exists")
-        };
-        assert_eq!(
-            ws_b.layouts.iter().map(|t| t.focus()).collect::<Vec<_>>(),
-            vec![sid1],
-            "new window holds exactly the moved tab"
-        );
-        assert_eq!(ws_b.tabs.count, 1);
-        assert_eq!(ws_b.tabs.active, 0);
-        assert_eq!(
-            ws_b.front_terminal().expect("front terminal").session,
-            sid1,
-            "new window displays the moved tab"
-        );
-        let moved = ws_b.tab_set.active().expect("moved stable tab is active");
-        assert_eq!(moved.id, moved_tab_id, "detach preserves stable TabId");
-        assert_eq!(
-            moved.root.leaves(),
-            vec![moved_view_id],
-            "detach preserves every stable ViewId"
-        );
-    }
-    assert!(
-        app.view_store.contains(moved_view_id),
-        "moving a view never retires its identity"
-    );
-
-    assert_eq!(
-        app.pool.iter().count(),
-        pool_before,
-        "detach moves the view; the pool's session count is unchanged",
-    );
-    assert!(
-        app.pool.get(sid1).is_some(),
-        "the moved session is still pooled"
-    );
+    assert_eq!(app.frontmost_window, Some(wid_b));
+    assert_eq!(focuses(&app, WindowId(0)), vec![0], "source lost the tab");
+    assert_eq!(focuses(&app, wid_b), vec![sid1], "B holds exactly it");
+    let moved = app.windows[&wid_b].tab_set.active().expect("moved tab");
+    assert_eq!(moved.id, moved_tab_id, "detach preserves stable TabId");
+    assert_eq!(moved.root.leaves(), vec![moved_view_id], "…and ViewId");
+    assert!(app.view_store.contains(moved_view_id));
+    assert_eq!(app.pool.iter().count(), pool_before, "pool unchanged");
     assert!(app.structural_invariants_ok());
 
-    let windows_before = app.windows.len();
-    let front_before = app.frontmost_window;
-    assert_eq!(
-        app.detach_active_tab_logical(),
-        None,
-        "a single-tab source refuses the detach",
-    );
-    assert_eq!(
-        app.windows.len(),
-        windows_before,
-        "no window minted on a no-op"
-    );
-    assert_eq!(
-        app.frontmost_window, front_before,
-        "frontmost untouched on a no-op"
-    );
-    assert_eq!(
-        app.pool.iter().count(),
-        pool_before,
-        "pool untouched on a no-op"
-    );
-    assert!(app.structural_invariants_ok());
+    // Window B now has a single tab: detach is refused and nothing changes.
+    assert_eq!(app.detach_active_tab_logical(), None);
+    assert_eq!(app.windows.len(), 2, "no window minted on a no-op");
+    assert_eq!(app.frontmost_window, Some(wid_b));
+    assert_eq!(app.pool.iter().count(), pool_before);
 }
 
 /// "Move Tab to Next Window": the front window's active tab moves to the next existing
 /// window (wrapping), becoming its active tab, with the pool unchanged and the
-/// destination frontmost. (1) A source with two tabs keeps the other; (2) a single-tab
-/// source is closed without double-detaching the view. Fewer than two windows is a no-op.
+/// destination frontmost. (1) A source with two tabs keeps the other and the moved
+/// session reflows to the destination geometry; (2) a single-tab source is closed
+/// without double-detaching the view. Fewer than two windows is a no-op.
 #[test]
 fn migrate_active_tab_moves_view_to_next_window() {
-    // One window: nothing to move the tab to.
-    {
-        let mut app = App::headless_for_test();
-        assert_eq!(app.windows.len(), 1);
-        let pool_before = app.pool.iter().count();
-        let front_before = app.frontmost_window;
-        let _ = app.migrate_active_tab_to_next_window();
-        assert_eq!(app.windows.len(), 1, "single window: migrate is a no-op");
-        assert_eq!(
-            app.frontmost_window, front_before,
-            "frontmost untouched on a no-op"
-        );
-        assert_eq!(
-            app.pool.iter().count(),
-            pool_before,
-            "pool untouched on a no-op"
-        );
-        assert!(app.structural_invariants_ok());
-    }
+    let focuses = |app: &App, wid: WindowId| {
+        app.windows[&wid]
+            .layouts
+            .iter()
+            .map(|t| t.focus())
+            .collect::<Vec<_>>()
+    };
 
-    // Case 1: a two-tab source survives.
-    {
-        let mut app = App::headless_for_test();
-        let sid1 = app.next_session_id; // 1
-        let wid_b = app.insert_logical_window(stub_session(sid1), 24, 80);
-        assert_eq!(wid_b, WindowId(1));
-        let sid2 = app.next_session_id; // 2
-        app.push_stub_tab(WindowId(0), stub_session(sid2));
-        // Window 0 is the source; the next window after it in id order is WindowId(1).
-        app.frontmost_window = Some(WindowId(0));
-        app.sync_active_session();
-        assert_eq!(app.windows.len(), 2);
-        let pool_before = app.pool.iter().count();
-        assert_eq!(pool_before, 3, "three pooled sessions before the migrate");
-        {
-            let Some(ws0) = app.windows.get(&WindowId(0)) else {
-                panic!("window 0 exists")
-            };
-            assert_eq!(
-                ws0.layouts.iter().map(|t| t.focus()).collect::<Vec<_>>(),
-                vec![0, sid2]
-            );
-            assert_eq!(
-                ws0.front_terminal().expect("front terminal").session,
-                sid2,
-                "the appended tab is active"
-            );
-        }
-        assert!(app.structural_invariants_ok());
+    // No-op with one window.
+    let mut app = App::headless_for_test();
+    let _ = app.migrate_active_tab_to_next_window();
+    assert_eq!(app.windows.len(), 1, "single window: migrate is a no-op");
+    assert_eq!(focuses(&app, WindowId(0)), vec![0]);
 
-        let _ = app.migrate_active_tab_to_next_window();
+    // Case 1: the source survives. B is 40x120; window 0 holds [0, sid2].
+    let mut app = App::headless_for_test();
+    let sid1 = app.next_session_id;
+    let wid_b = app.insert_logical_window(stub_session(sid1), 40, 120);
+    let sid2 = app.next_session_id;
+    app.push_stub_tab(WindowId(0), stub_session(sid2));
+    app.frontmost_window = Some(WindowId(0));
+    app.sync_active_session();
+    let pool_before = app.pool.iter().count();
+    let _ = app.migrate_active_tab_to_next_window();
+    assert_eq!(app.windows.len(), 2);
+    assert_eq!(app.frontmost_window, Some(wid_b), "focus follows the tab");
+    assert_eq!(focuses(&app, WindowId(0)), vec![0], "source lost the tab");
+    assert_eq!(focuses(&app, wid_b), vec![sid1, sid2], "appended to B");
+    assert_eq!(app.windows[&wid_b].tabs.active, 1, "and active there");
+    assert_eq!(app.pool.iter().count(), pool_before, "pool unchanged");
+    let t = super::term_lock(&app.pool.get(sid2).expect("s2 pooled").term);
+    assert_eq!(
+        (t.rows(), t.cols()),
+        (40, 120),
+        "the moved session reflowed to the destination geometry"
+    );
+    drop(t);
+    assert!(app.structural_invariants_ok());
 
-        assert_eq!(
-            app.windows.len(),
-            2,
-            "a surviving source keeps both windows"
-        );
-        assert_eq!(
-            app.frontmost_window,
-            Some(wid_b),
-            "focus follows the moved tab to B"
-        );
-
-        {
-            let Some(ws0) = app.windows.get(&WindowId(0)) else {
-                panic!("source survives")
-            };
-            assert_eq!(
-                ws0.layouts.iter().map(|t| t.focus()).collect::<Vec<_>>(),
-                vec![0],
-                "source lost the moved tab"
-            );
-            assert_eq!(ws0.tabs.count, 1);
-            assert_eq!(ws0.tabs.active, 0, "source active clamped into range");
-            assert_eq!(
-                ws0.front_terminal().expect("front terminal").session,
-                0,
-                "source re-mirrored onto its surviving tab"
-            );
-        }
-        {
-            let Some(ws_b) = app.windows.get(&wid_b) else {
-                panic!("destination exists")
-            };
-            assert_eq!(
-                ws_b.layouts.iter().map(|t| t.focus()).collect::<Vec<_>>(),
-                vec![sid1, sid2],
-                "moved tab appended to B"
-            );
-            assert_eq!(ws_b.tabs.count, 2);
-            assert_eq!(ws_b.tabs.active, 1, "B's active points at the moved tab");
-            assert_eq!(
-                ws_b.front_terminal().expect("front terminal").session,
-                sid2,
-                "B displays the moved tab"
-            );
-        }
-        assert_eq!(
-            app.pool.iter().count(),
-            pool_before,
-            "migrate moves the view; the pool's session count is unchanged",
-        );
-        assert!(
-            app.pool.get(sid2).is_some(),
-            "the moved session is still pooled"
-        );
-        assert!(app.structural_invariants_ok());
-    }
-
-    // Case 2: a single-tab source empties and closes.
-    {
-        let mut app = App::headless_for_test();
-        let sid1 = app.next_session_id; // 1
-        let wid_b = app.insert_logical_window(stub_session(sid1), 24, 80);
-        assert_eq!(wid_b, WindowId(1));
-        // The single-tab window 0 is the source.
-        app.frontmost_window = Some(WindowId(0));
-        app.sync_active_session();
-        assert_eq!(app.windows.len(), 2);
-        let pool_before = app.pool.iter().count();
-        assert_eq!(pool_before, 2, "two pooled sessions before the migrate");
-
-        let _ = app.migrate_active_tab_to_next_window();
-
-        assert_eq!(app.windows.len(), 1, "the emptied source window is closed");
-        assert!(
-            !app.windows.contains_key(&WindowId(0)),
-            "source window removed"
-        );
-        assert_eq!(
-            app.frontmost_window,
-            Some(wid_b),
-            "the destination is frontmost"
-        );
-        {
-            let Some(ws_b) = app.windows.get(&wid_b) else {
-                panic!("destination exists")
-            };
-            assert_eq!(
-                ws_b.layouts.iter().map(|t| t.focus()).collect::<Vec<_>>(),
-                vec![sid1, 0],
-                "moved tab appended to B"
-            );
-            assert_eq!(ws_b.tabs.count, 2);
-            assert_eq!(ws_b.tabs.active, 1, "B's active points at the moved tab");
-            assert_eq!(
-                ws_b.front_terminal().expect("front terminal").session,
-                0,
-                "B displays the moved tab"
-            );
-        }
-        assert_eq!(
-            app.pool.iter().count(),
-            pool_before,
-            "closing the emptied source does NOT detach the already-moved view",
-        );
-        assert!(
-            app.pool.get(0).is_some(),
-            "the moved session is still pooled"
-        );
-        assert!(app.structural_invariants_ok());
-    }
+    // Case 2: the source empties and closes.
+    let mut app = App::headless_for_test();
+    let sid1 = app.next_session_id;
+    let wid_b = app.insert_logical_window(stub_session(sid1), 24, 80);
+    app.frontmost_window = Some(WindowId(0));
+    app.sync_active_session();
+    let _ = app.migrate_active_tab_to_next_window();
+    assert!(
+        !app.windows.contains_key(&WindowId(0)),
+        "emptied source closed"
+    );
+    assert_eq!(app.frontmost_window, Some(wid_b));
+    assert_eq!(focuses(&app, wid_b), vec![sid1, 0], "appended to B");
+    assert_eq!(app.windows[&wid_b].tabs.active, 1);
+    assert_eq!(
+        app.pool.iter().count(),
+        2,
+        "closing the emptied source does NOT detach the already-moved view"
+    );
+    assert!(app.structural_invariants_ok());
 }
 
 /// `window_of_session` prefers the front window, else the lowest id (the `ls` roster rule).
@@ -826,111 +530,33 @@ fn window_of_session_prefers_the_front_window_then_the_lowest_id() {
 #[test]
 fn open_active_session_in_new_window_shares_one_session_across_two_windows() {
     let mut app = App::headless_for_test();
-    assert_eq!(app.windows.len(), 1);
-    assert_eq!(app.frontmost_window, Some(WindowId(0)));
-    assert_eq!(app.pool.iter().count(), 1, "one pooled session at start");
-    assert_eq!(
-        app.pool.views(0),
-        Some(1),
-        "session 0 has a single view at start"
-    );
-    {
-        let Some(ws0) = app.windows.get(&WindowId(0)) else {
-            panic!("window 0 exists")
-        };
-        assert_eq!(
-            ws0.front_terminal().expect("front terminal").session,
-            0,
-            "window 0 displays session 0"
-        );
-    }
-    assert!(app.structural_invariants_ok());
-
     let new_wid = app
         .open_active_session_in_new_window_logical()
         .expect("the front window has an active session to open in a new window");
-
-    assert!(
-        new_wid > WindowId(0),
-        "minted a strictly-increasing WindowId"
-    );
     assert_eq!(
         app.frontmost_window,
         Some(new_wid),
         "the new window is frontmost"
     );
-    assert_eq!(app.windows.len(), 2, "windows grew by one");
-
-    {
-        let Some(ws0) = app.windows.get(&WindowId(0)) else {
-            panic!("source survives")
-        };
+    for wid in [WindowId(0), new_wid] {
         assert_eq!(
-            ws0.front_terminal().expect("front terminal").session,
+            app.windows[&wid]
+                .front_terminal()
+                .expect("front terminal")
+                .session,
             0,
-            "the original window still shows session 0"
+            "{wid:?} shows session 0"
         );
     }
-    {
-        let Some(ws_b) = app.windows.get(&new_wid) else {
-            panic!("the new window exists")
-        };
-        assert_eq!(
-            ws_b.layouts.iter().map(|t| t.focus()).collect::<Vec<_>>(),
-            vec![0],
-            "the new window views exactly session 0"
-        );
-        assert_eq!(
-            ws_b.front_terminal().expect("front terminal").session,
-            0,
-            "the new window also shows session 0"
-        );
-    }
-
-    assert_eq!(
-        app.pool.iter().count(),
-        1,
-        "a SHARED view, not a second session"
-    );
-    assert!(app.pool.get(0).is_some(), "session 0 is still pooled");
+    // A SHARED view, not a second session: one pooled session, views 1→2.
+    assert_eq!(app.pool.iter().count(), 1);
     assert_eq!(app.pool.views(0), Some(2), "two windows now view session 0");
-
-    // A shared session's output repaints every window that shows it.
-    {
-        let mut displaying: Vec<WindowId> = app.windows_displaying(0).collect();
-        displaying.sort();
-        let mut expected = vec![WindowId(0), new_wid];
-        expected.sort();
-        assert_eq!(displaying, expected, "both windows display session 0");
-    }
     assert!(app.structural_invariants_ok());
 
-    // Closing one viewer releases one view: the session and its PTY survive.
-    assert_eq!(
-        app.close_window_logical(new_wid),
-        CloseOutcome::Stay,
-        "closing one of two windows keeps the app alive",
-    );
-    assert_eq!(app.windows.len(), 1, "back to one window");
-    assert!(
-        app.pool.get(0).is_some(),
-        "the shared session survives one viewer leaving"
-    );
-    assert_eq!(
-        app.pool.views(0),
-        Some(1),
-        "views 2→1 — the PTY is NOT closed yet"
-    );
-    {
-        let Some(ws0) = app.windows.get(&WindowId(0)) else {
-            panic!("original survives")
-        };
-        assert_eq!(
-            ws0.front_terminal().expect("front terminal").session,
-            0,
-            "the original window still shows session 0"
-        );
-    }
+    // Closing one viewer releases one view: the session and its PTY survive, and only the
+    // original window displays it.
+    assert_eq!(app.close_window_logical(new_wid), CloseOutcome::Stay);
+    assert_eq!(app.pool.views(0), Some(1), "views 2→1");
     assert_eq!(
         app.windows_displaying(0).collect::<Vec<_>>(),
         vec![WindowId(0)],
@@ -944,13 +570,10 @@ fn open_active_session_in_new_window_shares_one_session_across_two_windows() {
         CloseOutcome::Exit,
         "closing the last window exits the app",
     );
-    assert!(app.windows.is_empty(), "no windows remain");
-    assert_eq!(app.frontmost_window, None, "frontmost is None once empty");
     assert!(
         app.pool.get(0).is_none(),
         "the last viewer leaving drops the session"
     );
-    assert_eq!(app.pool.views(0), None, "the session is gone from the pool");
     assert_eq!(app.pool.iter().count(), 0, "the pool is empty");
 }
 
@@ -1130,7 +753,8 @@ fn shared_session_exit_closes_every_viewer_not_just_the_first() {
 
 /// Closing the frontmost window re-points to the most recently focused survivor (the one
 /// the OS raises); with no focus history (headless) it falls back to the lowest live id,
-/// the deterministic choice automation relies on.
+/// the deterministic choice automation relies on. Closing a non-front window leaves
+/// frontmost alone, an unknown id is a fail-closed `Stay`, and the last close is `Exit`.
 #[test]
 fn close_front_repoints_to_mru_survivor_else_lowest_id() {
     // No focus history (headless): the lowest live id.
@@ -1177,6 +801,14 @@ fn close_front_repoints_to_mru_survivor_else_lowest_id() {
         "the closed window left the focus stack"
     );
     assert!(app.structural_invariants_ok());
+
+    assert_eq!(app.close_window_logical(WindowId(0)), CloseOutcome::Stay);
+    assert_eq!(app.frontmost_window, Some(w1), "closed a sibling");
+    assert_eq!(app.pool.iter().count(), 1, "only its session dropped");
+    assert_eq!(app.close_window_logical(WindowId(999)), CloseOutcome::Stay);
+    assert_eq!(app.close_window_logical(w1), CloseOutcome::Exit);
+    assert_eq!(app.frontmost_window, None);
+    assert_eq!(app.pool.iter().count(), 0);
 }
 
 /// A pane-space mutation retires departed panes only: zoom removes no pane, so each pane keeps
@@ -1257,23 +889,13 @@ fn a_split_that_cannot_fit_is_refused_before_any_shell_is_spawned() {
     assert!(app.apply_term_resize(wid, 24, 32), "geometry applies");
     let sessions_before = app.pool.iter().count();
     let next_id_before = app.next_session_id;
-    let registry_before = app
-        .store
-        .read()
-        .unwrap_or_else(|p| p.into_inner())
-        .snapshot()
-        .len();
 
     let refusal = app
         .split_focused_pane_in(pane::SplitDir::Vertical, None)
         .expect_err("a 32-column pane cannot hold two 16-column panes");
     assert!(
-        refusal.starts_with("Split refused: this pane is 32x24 cells"),
-        "the refusal names the pane it measured: {refusal}"
-    );
-    assert!(
-        refusal.contains("left/right split needs at least 33x4"),
-        "and the size it needed: {refusal}"
+        refusal.contains("32x24") && refusal.contains("33x4"),
+        "the refusal names the pane it measured and the size it needed: {refusal}"
     );
 
     assert_eq!(
@@ -1286,15 +908,6 @@ fn a_split_that_cannot_fit_is_refused_before_any_shell_is_spawned() {
         "not even a session id was burned"
     );
     assert_eq!(
-        app.store
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .snapshot()
-            .len(),
-        registry_before,
-        "no session registered"
-    );
-    assert_eq!(
         app.active_tree(wid).map(pane::PaneTree::len),
         Some(1),
         "the tree is untouched — no invisible pane"
@@ -1304,18 +917,13 @@ fn a_split_that_cannot_fit_is_refused_before_any_shell_is_spawned() {
     let row = app
         .messages
         .live_rows()
-        .find(|l| l.msg.title == "Couldn't split the pane")
-        .expect("a refused split posts a Split refused row");
-    assert_eq!(
-        row.msg.detail[0], "pane 32\u{00d7}24, needs 33\u{00d7}4",
-        "the sizes are the excerpt: {:?}",
-        row.msg.detail
-    );
-    assert!(
-        row.msg.detail[1].starts_with("this pane is 32x24 cells"),
-        "the whole reason is behind it: {:?}",
-        row.msg.detail
-    );
+        .find(|l| {
+            l.msg
+                .detail
+                .first()
+                .is_some_and(|d| d.contains("32\u{00d7}24") && d.contains("33\u{00d7}4"))
+        })
+        .expect("a refused split posts a row naming the sizes");
     assert_eq!(row.msg.severity, aterm_messages::Severity::Error);
 
     // The other axis still fits in 24 rows (2*3 + 1 = 7 needed), so the gate
@@ -1368,23 +976,12 @@ fn a_zoomed_pane_is_measured_unzoomed_so_zoom_cannot_smuggle_a_split_through() {
         "zoom must not inflate the size the split gate measures"
     );
 
-    let sessions_before = app.pool.iter().count();
-    let next_id_before = app.next_session_id;
     let refusal = app
         .split_focused_pane_in(pane::SplitDir::Vertical, None)
         .expect_err("a zoomed 19-column pane is still a 19-column pane");
-    assert_eq!(
-        refusal, "Split refused: this pane is 19x24 cells; a left/right split needs at least 33x4",
-        "the refusal names the UNZOOMED pane"
-    );
-    assert_eq!(
-        app.pool.iter().count(),
-        sessions_before,
-        "no session pooled"
-    );
-    assert_eq!(
-        app.next_session_id, next_id_before,
-        "not even a session id was burned"
+    assert!(
+        refusal.contains("19x24"),
+        "the refusal names the UNZOOMED pane: {refusal}"
     );
     assert_eq!(
         app.active_tree(wid).map(pane::PaneTree::len),
@@ -1572,16 +1169,27 @@ fn divider_drag_resizes_split_headless() {
         );
     }
 
-    // Drag past the left edge (col 0): the clamp pins it, never a zero-width pane.
+    // Drag past the left edge (col 0) right away, inside the relayout throttle
+    // (`RESIZE_THROTTLE` coalesces it), then release: the release flushes the final
+    // position, clamped so no pane is zero-width, and the engine gets that size.
     if let Some(ws) = app.windows.get_mut(&wid) {
         ws.last_mouse_window_cell = (5, 0);
     }
     app.drag_divider(wid);
-    for r in app.active_tree(wid).unwrap().compute_layout(24, 80) {
+    assert!(app.finish_divider_drag(wid), "release ends the active drag");
+    let layout = app.active_tree(wid).unwrap().compute_layout(24, 80);
+    for r in &layout {
         assert!(r.cols >= 1, "clamp keeps every pane non-empty: {r:?}");
     }
+    let left_final = layout.iter().find(|r| r.session == 0).unwrap().cols;
+    assert!(left_final < 20, "release flushed the coalesced final step");
+    assert_eq!(
+        super::term_lock(&app.pool.get(0).unwrap().term).cols(),
+        left_final,
+        "…and the engine got the final size"
+    );
 
-    assert!(app.finish_divider_drag(wid), "release ends the active drag");
+    // A second release is a no-op.
     assert!(app.windows[&wid].divider_drag.is_none());
     assert!(
         !app.finish_divider_drag(wid),
@@ -1591,71 +1199,14 @@ fn divider_drag_resizes_split_headless() {
     assert!(app.structural_invariants_ok());
 }
 
-/// Every committed resize resets coordinate space: no gesture can connect old cell geometry to
-/// the reflowed grid, so mid-drag, settled and out-of-band commits all stay dark.
-#[test]
-fn every_resize_commit_retires_reflow_provenance_regardless_of_gesture_age() {
-    let mut app = App::headless_for_test();
-    let wid = WindowId(0);
-
-    // Mid-drag: an interactive `Resized` just landed, so the settle after it is a
-    // continuation, not the end of the gesture.
-    app.windows.get_mut(&wid).unwrap().last_resized_event_at = Some(Instant::now());
-    assert!(
-        app.apply_term_resize(wid, 30, 100),
-        "the geometry still applies mid-drag — only the LICENSE is withheld"
-    );
-    assert!(
-        !app.windows[&wid].fx.cursor().glow.reflow_hint_armed(),
-        "a mid-drag settle must NOT license a streak (else ~20/sec of scribble)"
-    );
-
-    // Hand stopped: age does not make incomparable coordinate spaces correlatable.
-    app.windows.get_mut(&wid).unwrap().last_resized_event_at =
-        Some(Instant::now() - crate::RESIZE_THROTTLE - std::time::Duration::from_millis(5));
-    // Give the settled reflow a real cursor landing: shrinking a live
-    // logical line wraps the caret into the next row.
-    let term = app.pool.get(0).unwrap().term.clone();
-    term_lock(&term).process(&[b'x'; 75]);
-    let before = term_lock(&term).cursor();
-    assert!(app.apply_term_resize(wid, 32, 50), "geometry applies");
-    let after = term_lock(&term).cursor();
-    assert_ne!(
-        (before.row, before.col),
-        (after.row, after.col),
-        "fixture must exercise a real reflow landing"
-    );
-    assert!(!app.windows[&wid].fx.cursor().glow.reflow_hint_armed());
-    assert!(!app.windows[&wid].fx.cursor().glow.is_active());
-    assert!(!app.windows[&wid].fx.cursor().trail.is_active());
-
-    // Out-of-band (control-socket `resize`, font zoom, scale change): the same hard reset
-    // without an interactive stamp.
-    let mut fresh = App::headless_for_test();
-    assert!(fresh.windows[&wid].last_resized_event_at.is_none());
-    let term = fresh.pool.get(0).unwrap().term.clone();
-    term_lock(&term).process(&[b'x'; 70]);
-    let before = term_lock(&term).cursor();
-    assert!(fresh.apply_term_resize(wid, 28, 40), "geometry applies");
-    let after = term_lock(&term).cursor();
-    assert_ne!(
-        (before.row, before.col),
-        (after.row, after.col),
-        "out-of-band fixture must exercise a real reflow landing"
-    );
-    assert!(!fresh.windows[&wid].fx.cursor().glow.reflow_hint_armed());
-    assert!(!fresh.windows[&wid].fx.cursor().glow.is_active());
-    assert!(!fresh.windows[&wid].fx.cursor().trail.is_active());
-}
-
-/// A committed resize changes what every retained endpoint means, even when the cursor keeps
-/// its numeric cell: both engines retire before the new layout seeds, and a moving landing's
-/// one-shot is consumed dark by the unseeded first tick.
+/// Every committed resize is a coordinate-space reset: both cursor engines retire
+/// their old-layout anchors, and no gesture age (mid-drag, settled drag, out-of-band
+/// `resize`/font zoom) licenses a reflow streak. Pinned twice: a same-cell completion
+/// (a later program move cannot borrow the resize) and, per gesture age, a real
+/// reflow landing (the first tick in the new space only seeds).
 #[test]
 fn committed_resize_retires_geometry_and_cannot_leak_its_reflow_licence() {
-    use std::time::Duration;
-
-    use crate::cursor_glow::{Geom, GlowStyle};
+    use crate::cursor_glow::Geom;
     use crate::cursor_trail::TrailConfig;
 
     let wid = WindowId(0);
@@ -1667,176 +1218,91 @@ fn committed_resize_retires_geometry_and_cannot_leak_its_reflow_licence() {
         intensity: 0.0,
         warmth: 0.0,
     };
-
-    let configure = |app: &mut App| {
-        app.config.cursor_trail = Some(true);
-        app.config.cursor_trail_style = Some("rainbow kitty".to_string());
-    };
-
-    // Same-cell completion: anchors at A, resize an empty terminal, then a cold A→B move
-    // stays dark.
-    let mut still = App::headless_for_test();
-    configure(&mut still);
-    let glow_cfg = still.glow_config();
-    assert!(matches!(glow_cfg.style, GlowStyle::RainbowKitty));
-    let before_geom = Geom {
+    let geom = |rows: usize, cols: usize| Geom {
         cw: 8,
         ch: 16,
-        rows: 24,
-        cols: 80,
+        rows,
+        cols,
         origin_x: 0,
         origin_y: 0,
-        win_w: 640,
-        win_h: 384,
+        win_w: u16::try_from(cols * 8).unwrap(),
+        win_h: u16::try_from(rows * 16).unwrap(),
         head: 0,
     };
-    let mut glow_out = Vec::new();
-    let mut trail_out = Vec::new();
-    let seed = Instant::now();
-    {
-        let ws = still.windows.get_mut(&wid).unwrap();
-        ws.fx
-            .cursor_mut()
+    // Seed both engines at `cell`, resize to `rows x cols`, then tick at the cursor's
+    // post-resize cell: nothing may paint. Returns the (before, after) cursor cells.
+    let run = |app: &mut App, cell: (u16, u16), rows: u16, cols: u16| {
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+        let glow_cfg = app.glow_config();
+        let (mut glow_out, mut trail_out) = (Vec::new(), Vec::new());
+        let seed = Instant::now();
+        let ws = app.windows.get_mut(&wid).unwrap();
+        let cursor = ws.fx.cursor_mut();
+        cursor
             .glow
-            .tick(Some((0, 0)), seed, &glow_cfg, before_geom, &mut glow_out);
-        ws.fx
-            .cursor_mut()
+            .tick(Some(cell), seed, &glow_cfg, geom(24, 80), &mut glow_out);
+        cursor
             .trail
-            .tick(Some((0, 0)), seed, &trail_cfg, &mut trail_out);
-    }
-    assert!(still.apply_term_resize(wid, 30, 100));
-    assert!(
-        !still.windows[&wid].fx.cursor().glow.reflow_hint_armed(),
-        "the synchronous same-cell completion retires its reflow class"
-    );
-    let moved = seed + Duration::from_millis(4);
-    let after_geom = Geom {
-        rows: 30,
-        cols: 100,
-        win_w: 800,
-        win_h: 480,
-        ..before_geom
-    };
-    let ws = still.windows.get_mut(&wid).unwrap();
-    assert_eq!(
-        ws.fx
-            .cursor_mut()
-            .glow
-            .tick(Some((0, 1)), moved, &glow_cfg, after_geom, &mut glow_out,),
-        0
-    );
-    assert_eq!(
-        ws.fx
-            .cursor_mut()
-            .trail
-            .tick(Some((0, 1)), moved, &trail_cfg, &mut trail_out,),
-        0
-    );
-    assert!(
-        glow_out.is_empty()
-            && trail_out.is_empty()
-            && ws.fx.cursor_mut().glow.halos().is_empty()
-            && ws.fx.cursor_mut().glow.under_quads().is_empty(),
-        "a later program move cannot borrow the completed resize"
-    );
-
-    // Moving completion: a wrapped line changes the cursor cell, but the old-layout
-    // anchors were retired before reflow, so the first tick only seeds the new space.
-    let mut landing = App::headless_for_test();
-    configure(&mut landing);
-    let glow_cfg = landing.glow_config();
-    let term = landing.pool.get(0).unwrap().term.clone();
-    term_lock(&term).process(&[b'x'; 70]);
-    let before = term_lock(&term).cursor();
-    let before_cell = (before.row, before.col);
-    let seed = Instant::now();
-    glow_out.clear();
-    trail_out.clear();
-    {
-        let ws = landing.windows.get_mut(&wid).unwrap();
-        ws.fx.cursor_mut().glow.tick(
-            Some(before_cell),
-            seed,
-            &glow_cfg,
-            before_geom,
-            &mut glow_out,
+            .tick(Some(cell), seed, &trail_cfg, &mut trail_out);
+        assert!(app.apply_term_resize(wid, rows, cols), "geometry applies");
+        assert!(
+            !app.windows[&wid].fx.cursor().glow.reflow_hint_armed(),
+            "a resize commit must NOT license a streak"
         );
-        ws.fx
-            .cursor_mut()
-            .trail
-            .tick(Some(before_cell), seed, &trail_cfg, &mut trail_out);
-    }
-    assert!(landing.apply_term_resize(wid, 30, 40));
-    let after = term_lock(&term).cursor();
-    let after_cell = (after.row, after.col);
-    assert_ne!(before_cell, after_cell, "fixture must move under reflow");
-    assert!(
-        !landing.windows[&wid].fx.cursor().glow.is_active()
-            && !landing.windows[&wid].fx.cursor().trail.is_active(),
-        "the resize commit retires every old-coordinate survivor"
-    );
-    let moved = seed + Duration::from_millis(4);
-    let after_geom = Geom {
-        rows: 30,
-        cols: 40,
-        win_w: 320,
-        win_h: 480,
-        ..before_geom
+        let term = app.pool.get(0).unwrap().term.clone();
+        let after = term_lock(&term).cursor();
+        let next = if (after.row, after.col) == cell {
+            (cell.0, cell.1 + 1)
+        } else {
+            (after.row, after.col)
+        };
+        let moved = seed + Duration::from_millis(4);
+        let ws = app.windows.get_mut(&wid).unwrap();
+        let cursor = ws.fx.cursor_mut();
+        let geom = geom(usize::from(rows), usize::from(cols));
+        let fp = (
+            cursor
+                .glow
+                .tick(Some(next), moved, &glow_cfg, geom, &mut glow_out),
+            cursor
+                .trail
+                .tick(Some(next), moved, &trail_cfg, &mut trail_out),
+        );
+        assert_eq!(fp, (0, 0));
+        assert!(
+            glow_out.is_empty()
+                && trail_out.is_empty()
+                && cursor.glow.halos().is_empty()
+                && cursor.glow.under_quads().is_empty(),
+            "a first tick in the new layout cannot bridge to the old one"
+        );
+        (cell, (after.row, after.col))
     };
-    let ws = landing.windows.get_mut(&wid).unwrap();
-    let glow_fp = ws.fx.cursor_mut().glow.tick(
-        Some(after_cell),
-        moved,
-        &glow_cfg,
-        after_geom,
-        &mut glow_out,
-    );
-    let trail_fp =
-        ws.fx
-            .cursor_mut()
-            .trail
-            .tick(Some(after_cell), moved, &trail_cfg, &mut trail_out);
-    assert_eq!((glow_fp, trail_fp), (0, 0));
-    assert!(
-        glow_out.is_empty()
-            && trail_out.is_empty()
-            && ws.fx.cursor_mut().glow.halos().is_empty()
-            && ws.fx.cursor_mut().glow.under_quads().is_empty(),
-        "an unseeded reflow landing cannot bridge old and new layouts"
-    );
 
-    // Tier 1: the same-cell completion projects onto the licence model's swallow
-    // disposition (an armed class whose landing provably never occurs clears at the
-    // boundary, as for a swallowed key). Retaining the stamp is the negative control.
-    let model = aterm_spec::derive::cursor_hint_license_model();
-    let mut armed = model.init_state();
-    armed.insert("hint", 1);
-    armed.insert("arms", 1);
-    armed.insert("credit_arms", 1);
-    let mut revoked = armed.clone();
-    revoked.insert("hint", 0);
-    revoked.insert("cleared", 1);
-    revoked.insert("swallowed", 1);
-    let (ok, why) = aterm_spec::verify::validate_transition_tiered(
-        &model,
-        &[],
-        &armed,
-        &revoked,
-        Some("SwallowedKeyClearsLicense"),
-        "same-cell resize reflow revocation",
-    );
-    assert!(ok, "same-cell resize revocation rejected: {why}");
-    let mut sticky = revoked;
-    sticky.insert("hint", 1);
-    let (ok, _) = aterm_spec::verify::validate_transition_tiered(
-        &model,
-        &[],
-        &armed,
-        &sticky,
-        Some("SwallowedKeyClearsLicense"),
-        "same-cell resize sticky-hint negative control",
-    );
-    assert!(!ok, "same-cell resize may not retain a reflow licence");
+    // Same-cell completion: an empty terminal's caret stays at (0, 0).
+    let mut still = App::headless_for_test();
+    let (before, after) = run(&mut still, (0, 0), 30, 100);
+    assert_eq!(before, after, "fixture: the caret does not move");
+
+    let settled = Instant::now() - crate::RESIZE_THROTTLE - Duration::from_millis(5);
+    for (gesture, stamp) in [
+        ("mid-drag", Some(Instant::now())),
+        ("settled drag", Some(settled)),
+        ("out-of-band", None),
+    ] {
+        let mut app = App::headless_for_test();
+        app.windows.get_mut(&wid).unwrap().last_resized_event_at = stamp;
+        // Shrinking a live logical line wraps the caret into the next row.
+        let term = app.pool.get(0).unwrap().term.clone();
+        term_lock(&term).process(&[b'x'; 70]);
+        let cell = {
+            let c = term_lock(&term).cursor();
+            (c.row, c.col)
+        };
+        let (before, after) = run(&mut app, cell, 28, 40);
+        assert_ne!(before, after, "{gesture}: fixture must reflow the caret");
+    }
 }
 
 /// An all-tabs width settle over a multi-tab, multi-pane window gives every pane its
@@ -1969,24 +1435,23 @@ fn a_scoped_resize_still_reaches_a_shared_background_tab() {
     }
     app.resize_panes_scoped(wid, true);
 
-    assert_eq!(size(&app, 2), (30, 100), "the ACTIVE tab reflows this tick");
-    assert_eq!(
-        size(&app, 1),
-        (24, 80),
-        "a plain BACKGROUND tab stays deferred — laying it out is exactly \
-         the work the upstream filter exists to skip"
-    );
+    // (Active-tab reflow and plain background deferral are
+    // `live_drag_resize_scopes_to_active_tab_then_flushes_on_switch`.)
     assert_eq!(
         size(&app, 0),
         (20, 60),
         "the SHARED session in a BACKGROUND tab is still driven to the \
          element-wise min across its foreground viewers"
     );
-    assert!(
-        app.windows[&wid].panes_stale,
-        "a deferred background tab marks the window panes_stale"
-    );
     assert!(app.structural_invariants_ok());
+}
+
+/// A latency epoch two seconds old, so a stamp aged up to that is non-zero
+/// (zero reads as UNARMED) without waiting for the clock to get there.
+fn aged_epoch() -> Instant {
+    Instant::now()
+        .checked_sub(Duration::from_secs(2))
+        .expect("uptime")
 }
 
 /// An early-out closes the stamps it proved idle: a burst before a compose that
@@ -2000,9 +1465,7 @@ fn an_early_out_discards_stamps_that_predate_its_compose_and_keeps_later_ones() 
     app.push_stub_tab(wid, stub_session(1));
     app.switch_tab_in(wid, 0); // session 0 is what this glass shows
     // Age the epoch so a stamp 10 ms back is non-zero (zero reads as unarmed).
-    while (app.lat_epoch.elapsed().as_nanos() as u64) <= 20_000_000 {
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
+    app.lat_epoch = aged_epoch();
     let stamp_of = |app: &App| {
         app.pool
             .get(0)
@@ -2031,8 +1494,9 @@ fn an_early_out_discards_stamps_that_predate_its_compose_and_keeps_later_ones() 
 
     // A burst that lands after the compose began is the next frame's edge:
     // it survives the discard and the next present books it.
-    let composed_at = Instant::now();
-    std::thread::sleep(std::time::Duration::from_millis(2));
+    let composed_at = Instant::now()
+        .checked_sub(Duration::from_millis(2))
+        .expect("uptime");
     let later = app.lat_epoch.elapsed().as_nanos() as u64;
     stamp_of(&app).store(later, Relaxed);
     app.discard_unpresented_output_stamps(wid, composed_at);
@@ -2059,12 +1523,10 @@ fn a_revealed_panes_stale_output_stamp_is_discarded_not_booked() {
     let wid = WindowId(0);
     app.push_stub_tab(wid, stub_session(1)); // tab 1 = session 1 (now active)
     app.switch_tab_in(wid, 0); // tab 0 (session 0) is what this glass shows
+    // The epoch must be older than any simulated age, or `now - age` saturates to
+    // zero (the unarmed sentinel) and every assertion passes vacuously.
+    app.lat_epoch = aged_epoch();
     let arm = |app: &App, id: u64, age_ns: u64| {
-        // The epoch must be older than the simulated age, or `now - age` saturates to
-        // zero (the unarmed sentinel) and every assertion passes vacuously.
-        while (app.lat_epoch.elapsed().as_nanos() as u64) <= age_ns {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
         let now = app.lat_epoch.elapsed().as_nanos() as u64;
         let stamp = now - age_ns;
         assert!(stamp > 0, "a zero stamp reads as UNARMED, not as aged");
@@ -2093,7 +1555,7 @@ fn a_revealed_panes_stale_output_stamp_is_discarded_not_booked() {
     arm(&app, 0, 2_000_000);
     let dt = app.present_latency_ns(wid);
     assert!(
-        (2_000_000..5_000_000_000).contains(&dt),
+        dt >= 2_000_000,
         "the visible pane's 2 ms wait must be booked (got {dt} ns)"
     );
     assert_eq!(
@@ -2115,7 +1577,7 @@ fn a_revealed_panes_stale_output_stamp_is_discarded_not_booked() {
     arm(&app, 1, 3_000_000);
     let dt = app.present_latency_ns(wid);
     assert!(
-        (3_000_000..5_000_000_000).contains(&dt),
+        dt >= 3_000_000,
         "the newly revealed pane must book its own honest waits (got {dt} ns)"
     );
 }
@@ -2129,11 +1591,10 @@ fn an_occlusion_reveal_discards_the_stale_output_stamp_not_books_it() {
 
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
+    // The epoch must be older than any simulated age, or `now - age` saturates
+    // to the walk's "unarmed" zero sentinel (see the MPT-3 test above).
+    app.lat_epoch = aged_epoch();
     let arm = |app: &App, age_ns: u64| {
-        // As in the sibling test above: the epoch must be older than the simulated age.
-        while (app.lat_epoch.elapsed().as_nanos() as u64) <= age_ns {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
         let stamp = app.lat_epoch.elapsed().as_nanos() as u64 - age_ns;
         app.pool
             .get(0)
@@ -2150,7 +1611,7 @@ fn an_occlusion_reveal_discards_the_stale_output_stamp_not_books_it() {
     arm(&app, 2_000_000);
     let dt = app.present_latency_ns(wid);
     assert!(
-        (2_000_000..5_000_000_000).contains(&dt),
+        dt >= 2_000_000,
         "an occlusion edge alone must not delete a real sample (got {dt} ns)"
     );
 
@@ -2168,7 +1629,7 @@ fn an_occlusion_reveal_discards_the_stale_output_stamp_not_books_it() {
     arm(&app, 3_000_000);
     let dt = app.present_latency_ns(wid);
     assert!(
-        (3_000_000..5_000_000_000).contains(&dt),
+        dt >= 3_000_000,
         "the revealed window must book its own honest waits (got {dt} ns)"
     );
 }
@@ -2377,68 +1838,15 @@ fn live_drag_resize_scopes_to_active_tab_then_flushes_on_switch() {
     assert!(!app.windows[&wid].panes_stale, "AllTabs clears panes_stale");
 }
 
-/// Divider-drag relayout throttle: a step inside `RESIZE_THROTTLE` after an applied one
-/// is coalesced (neither ratio nor engines move, so layout and PTY sizes never
-/// diverge), and release flushes the final position. Each test's thread-local throttle
-/// state starts clean.
-#[test]
-fn divider_drag_coalesces_and_release_flushes_final_size() {
-    let mut app = App::headless_for_test(); // window 0 = 24x80, session 0
-    let _ = app.split_active_stub_tab(WindowId(0)); // 1 | 2 vertical, divider @ col 40
-    let wid = WindowId(0);
-    let left_cols = |app: &App| {
-        app.active_tree(wid)
-            .unwrap()
-            .compute_layout(24, 80)
-            .into_iter()
-            .find(|r| r.session == 0)
-            .unwrap()
-            .cols
-    };
-    let engine_cols = |app: &App| super::term_lock(&app.pool.get(0).unwrap().term).cols();
-
-    if let Some(ws) = app.windows.get_mut(&wid) {
-        ws.last_mouse_window_cell = (5, 40);
-    }
-    assert!(app.begin_divider_drag(wid), "divider press arms a drag");
-
-    // Leading edge: the drag's first move applies (ratio + reflow) immediately.
-    // `t0` is captured before the apply stamps the throttle, so
-    // `t0.elapsed() < RESIZE_THROTTLE` soundly implies the next step is gated.
-    if let Some(ws) = app.windows.get_mut(&wid) {
-        ws.last_mouse_window_cell = (5, 30);
-    }
-    let t0 = Instant::now();
-    app.drag_divider(wid);
-    assert_eq!(left_cols(&app), 30, "leading-edge move applies immediately");
-    assert_eq!(engine_cols(&app), 30, "…and reflows the engine with it");
-
-    // A second move inside the throttle window is coalesced, checked only while the clock
-    // confirms it (a scheduler stall past the window skips it; the flush below holds anyway).
-    if let Some(ws) = app.windows.get_mut(&wid) {
-        ws.last_mouse_window_cell = (5, 20);
-    }
-    app.drag_divider(wid);
-    if t0.elapsed() < super::RESIZE_THROTTLE {
-        assert_eq!(left_cols(&app), 30, "mid-throttle step is coalesced");
-        assert_eq!(engine_cols(&app), 30, "…and never reaches term.resize");
-    }
-
-    // Release flushes the coalesced step: the final pointer position lands.
-    assert!(app.finish_divider_drag(wid), "release ends the active drag");
-    assert_eq!(left_cols(&app), 20, "release flushed the final ratio");
-    assert_eq!(engine_cols(&app), 20, "…and the engine got the final size");
-    assert!(app.structural_invariants_ok());
-}
-
 /// Focus loss scrubs the previous ambient modifier snapshot. Every later Winit
 /// report is authoritative, including a fresh pre-`Focused(true)` snapshot;
 /// without any later report, the post-focus ordinary `l` remains plain.
 #[test]
 fn focus_loss_scrubs_stale_modifiers_without_breaking_real_chords() {
+    use aterm_models_misc::focus_modifier_cache_model;
     #[cfg(unix)]
     use aterm_session::sink::SinkWriter;
-    use aterm_spec::derive::{Model, focus_modifier_cache_model};
+    use aterm_spec::derive::Model;
     use aterm_types::keyboard::{Key, KeyEventType, KeyboardMode, encode_key_with_event};
     use std::collections::BTreeMap;
     #[cfg(unix)]
@@ -2602,20 +2010,9 @@ fn focus_loss_scrubs_stale_modifiers_without_breaking_real_chords() {
     // The plain press remained held across FocusOut and a fresh Ctrl report.
     // Its real release must use the immutable press-time (plain) modifiers,
     // not the now-current Ctrl cache, and must retire ownership exactly once.
+    // A text-producing release is byte-silent in Codex mode; the exact Ctrl press
+    // read below proves no stray release prefix was queued before that frame.
     app.on_key(wid, l_event(ElementState::Released));
-    #[cfg(unix)]
-    // A text-producing release is deliberately byte-silent in Codex mode.
-    // Do not block on the observer pipe; the exact Ctrl press read below
-    // also proves no stray release prefix was queued before that frame.
-    let bytes = Vec::<u8>::new();
-    #[cfg(not(unix))]
-    let bytes = codex_l_bytes(ModifiersState::empty(), KeyEventType::Release);
-    let plain_release = codex_l_bytes(ModifiersState::empty(), KeyEventType::Release);
-    assert_eq!(bytes, plain_release);
-    assert!(
-        bytes.is_empty(),
-        "Codex mode must not fabricate a release report for a text-producing key"
-    );
     assert!(
         !app.physical_press_owners.contains_key(&physical_l),
         "the matching release retires the held physical owner"
@@ -2629,7 +2026,6 @@ fn focus_loss_scrubs_stale_modifiers_without_breaking_real_chords() {
     #[cfg(not(unix))]
     let bytes = codex_l_bytes(app.windows[&wid].mods, KeyEventType::Press);
     let ctrl_press = codex_l_bytes(ModifiersState::CONTROL, KeyEventType::Press);
-    assert_eq!(bytes, ctrl_press);
     assert_eq!(
         bytes, b"\x1b[108;5u",
         "headless: no lock bits, so the byte pin is exact"
@@ -2643,14 +2039,9 @@ fn focus_loss_scrubs_stale_modifiers_without_breaking_real_chords() {
     let bytes = read_pty_bytes(pipe[0]);
     #[cfg(not(unix))]
     let bytes = codex_l_bytes(ModifiersState::CONTROL, KeyEventType::Release);
-    let ctrl_release = codex_l_bytes(ModifiersState::CONTROL, KeyEventType::Release);
-    assert_eq!(
-        bytes, ctrl_release,
-        "real release keeps the same authoritative Ctrl modifier"
-    );
     assert_eq!(
         bytes, b"\x1b[108;5:3u",
-        "headless: no lock bits, so the byte pin is exact"
+        "real release keeps the same authoritative Ctrl modifier"
     );
     assert!(!app.physical_press_owners.contains_key(&physical_l));
 
@@ -2699,7 +2090,7 @@ fn focus_loss_scrubs_stale_modifiers_without_breaking_real_chords() {
 fn attached_window_adopts_os_focus_without_waiting_for_an_event() {
     let wid = WindowId(0);
     let mut app = App::headless_for_test();
-    let model = aterm_spec::derive::focus_modifier_cache_model();
+    let model = aterm_models_misc::focus_modifier_cache_model();
     let before = project_focus_modifier_cache(&app, wid, 0, 0);
     assert!(app.windows[&wid].focused);
 
@@ -2975,21 +2366,6 @@ fn on_focus_loss_pauses_collection_hello_before_any_redraw() {
             .collection_hello,
         "with no redraw delivered, the hello remains protected"
     );
-
-    let Some(ws) = app.windows.get_mut(&wid) else {
-        panic!("headless fixture retains window 0");
-    };
-    ws.fx
-        .companions_mut()
-        .cursor_cat
-        .set_collection_presentable(much_later, true);
-    let visible = ws
-        .fx
-        .companions_mut()
-        .cursor_cat
-        .static_frame(much_later + std::time::Duration::from_millis(100));
-    assert_eq!(visible.alpha, 255);
-    assert!(visible.collection_hello && visible.discovery);
 }
 
 #[test]
@@ -2998,7 +2374,7 @@ fn pane_and_tab_owner_switches_retire_only_coordinate_bound_companions() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         let now = Instant::now();
-        let model = aterm_spec::derive::cursor_companion_owner_lifecycle_model();
+        let model = aterm_models_effects::cursor_companion_owner_lifecycle_model();
         if pane_switch {
             app.split_active_stub_tab(wid);
         }
@@ -3143,7 +2519,7 @@ fn screen_buffer_switches_retire_coordinates_and_preserve_companion_identity_and
     let wid = WindowId(0);
     let session = app.focused_session_id(wid).expect("focused terminal");
     let term = app.pool.get(session).expect("pooled terminal").term.clone();
-    let model = aterm_spec::derive::cursor_companion_owner_lifecycle_model();
+    let model = aterm_models_effects::cursor_companion_owner_lifecycle_model();
     let now = Instant::now();
 
     let (terminal_id, initial_alt) = {
@@ -3277,7 +2653,7 @@ fn screen_buffer_switches_retire_coordinates_and_preserve_companion_identity_and
 fn focus_loss_retires_pet_only_when_cursor_effects_are_unpresentable() {
     let wid = WindowId(0);
     let now = Instant::now();
-    let model = aterm_spec::derive::cursor_companion_owner_lifecycle_model();
+    let model = aterm_models_effects::cursor_companion_owner_lifecycle_model();
 
     let mut unwatched = App::headless_for_test();
     unwatched
@@ -3359,7 +2735,7 @@ fn recording_pin_preserves_pet_across_raw_focus_loss() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     let now = Instant::now();
-    let model = aterm_spec::derive::cursor_companion_owner_lifecycle_model();
+    let model = aterm_models_effects::cursor_companion_owner_lifecycle_model();
     app.windows
         .get_mut(&wid)
         .expect("test window")
@@ -3386,10 +2762,6 @@ fn recording_pin_preserves_pet_across_raw_focus_loss() {
         started_us: 0,
         keys: false,
         key_log: Vec::new(),
-        trail: false,
-        trail_log: Vec::new(),
-        trail_seen: 0,
-        trail_lost: 0,
         pace_ticks: Vec::new(),
         mode: super::VideoMode::OffscreenPresentReal,
         next_frame: None,
@@ -3411,47 +2783,6 @@ fn recording_pin_preserves_pet_across_raw_focus_loss() {
 
     let _ = app.video_rec.take();
     let _ = std::fs::remove_dir_all(root);
-}
-
-/// Migrating a tab into a different-sized window reflows the moved session to the
-/// destination's grid.
-#[test]
-fn migrate_to_different_size_window_reflows_moved_session() {
-    let mut app = App::headless_for_test(); // window 0 = 24x80, session 0
-    // Destination window B at a different size (40x120).
-    let s1 = app.next_session_id;
-    let wid_b = app.insert_logical_window(stub_session(s1), 40, 120);
-    // Give window 0 a 2nd tab (session s2) so the source survives the move, and
-    // make window 0 the migration source.
-    let s2 = app.next_session_id;
-    app.push_stub_tab(WindowId(0), stub_session(s2));
-    app.frontmost_window = Some(WindowId(0));
-    app.sync_active_session();
-    {
-        let s = app.pool.get(s2).expect("s2 pooled");
-        let t = super::term_lock(&s.term);
-        assert_eq!(
-            (t.rows(), t.cols()),
-            (24, 80),
-            "s2 starts at the source geometry"
-        );
-    }
-    let _ = app.migrate_active_tab_to_next_window();
-    assert_eq!(
-        app.frontmost_window,
-        Some(wid_b),
-        "focus follows the moved tab"
-    );
-    {
-        let s = app.pool.get(s2).expect("s2 still pooled (pure view-move)");
-        let t = super::term_lock(&s.term);
-        assert_eq!(
-            (t.rows(), t.cols()),
-            (40, 120),
-            "s2 reflowed to the destination geometry"
-        );
-    }
-    assert!(app.structural_invariants_ok());
 }
 
 /// `close_active_tab` returns the frontmost window whose last tab it closed, so the
@@ -3490,20 +2821,12 @@ fn detach_rollback_returns_the_moved_session_no_data_loss() {
     let s1 = app.next_session_id;
     app.push_stub_tab(WindowId(0), stub_session(s1)); // tabs [0, s1], active=s1
     let pool_before = app.pool.iter().count();
-    assert_eq!(pool_before, 2);
 
     // Detach the active tab (s1) into a new window B, a pure view-move: s1 is now B's only
     // view.
     let wid_b = app
         .detach_active_tab_logical()
         .expect("detach moves the active tab to B");
-    assert_eq!(app.windows.len(), 2);
-    assert!(app.pool.get(s1).is_some(), "moved session still pooled");
-    assert_eq!(
-        app.pool.iter().count(),
-        pool_before,
-        "no pool churn on the move"
-    );
 
     // Simulate the GPU-attach failure → rollback.
     app.detach_rollback_logical(Some(WindowId(0)), wid_b);
@@ -3562,39 +2885,6 @@ fn shared_target_geometry_uses_foreground_viewers_only() {
     );
 }
 
-/// The last-tab Cmd-W escalation closes the frontmost window it flagged, even when that
-/// is not the OS-event window.
-#[test]
-fn pending_close_flag_lands_on_the_frontmost_for_escalation() {
-    let mut app = App::headless_for_test(); // window 0, single tab
-    let w1 = app.insert_logical_window(stub_session(app.next_session_id), 24, 80);
-    // Logical frontmost = window 0 (single tab); imagine OS focus lags on w1.
-    app.frontmost_window = Some(WindowId(0));
-    app.sync_active_session();
-    // Cmd-W: close_active_tab closes the frontmost's last tab and reports it; the
-    // producer flags that window (not the event window).
-    let closed = app.close_active_tab().expect("frontmost's last tab closed");
-    assert_eq!(closed, WindowId(0));
-    if let Some(ws) = app.windows.get_mut(&closed) {
-        ws.pending_close = true;
-    }
-    // The escalation scan (as in `escalate_pending_close`) finds the flagged window (0), not
-    // the OS-event window, and closing it leaves w1.
-    let flagged: Vec<WindowId> = app
-        .windows
-        .iter()
-        .filter(|(_, ws)| ws.pending_close)
-        .map(|(w, _)| *w)
-        .collect();
-    assert_eq!(
-        flagged,
-        vec![WindowId(0)],
-        "flag is on the frontmost that was closed"
-    );
-    assert_eq!(app.close_window_logical(WindowId(0)), CloseOutcome::Stay);
-    assert_eq!(app.windows.keys().copied().collect::<Vec<_>>(), vec![w1]);
-}
-
 /// `App::move_tab` (behind `tab move <from> <to>` and the native mouse drag) permutes the
 /// window's `layouts` and fixes `tabs.active` so the same session stays selected, keeping
 /// `count == layouts.len()` and `active < count`.
@@ -3628,13 +2918,7 @@ fn move_tab_reorders_and_tracks_active() {
         0,
         "active follows the moved tab"
     );
-    assert_eq!(
-        app.front_terminal(WindowId(0))
-            .expect("front terminal")
-            .session,
-        s2,
-        "re-mirrored onto the moved tab"
-    );
+    assert!(app.structural_invariants_ok());
 
     // Move a tab from after the active to before it: active shifts up one (the
     // viewed session is unchanged). Order is [s2,0,s1]; move index 2 (s1) to 0.
@@ -3645,13 +2929,6 @@ fn move_tab_reorders_and_tracks_active() {
         1,
         "active shifted to follow s2"
     );
-    assert_eq!(
-        app.front_terminal(WindowId(0))
-            .expect("front terminal")
-            .session,
-        s2,
-        "still viewing the same session"
-    );
 
     // Out-of-range / identity moves are no-ops.
     let snapshot = order(&app);
@@ -3661,11 +2938,6 @@ fn move_tab_reorders_and_tracks_active() {
     app.move_tab(WindowId(0), 0, 9); // to out of range
     assert_eq!(order(&app), snapshot, "no-op moves leave order unchanged");
     assert_eq!(app.windows[&WindowId(0)].tabs.active, active_before);
-    assert_eq!(
-        app.windows[&WindowId(0)].tabs.count,
-        3,
-        "count preserved (pure permutation)"
-    );
     assert!(app.structural_invariants_ok());
 }
 

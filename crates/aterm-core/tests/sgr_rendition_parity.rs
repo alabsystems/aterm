@@ -229,3 +229,98 @@ fn many_distinct_truecolours_all_render_exactly() {
         );
     }
 }
+
+#[test]
+fn a_truecolour_rewrite_carrying_extras_paints_its_own_colour() {
+    // A truecolour run that also carries a link, an underline style or an SGR 58
+    // colour stores its RGB beside those extras, while a plain truecolour run (or
+    // a truecolour erase) stores its bytes elsewhere. Rewriting such cells must
+    // paint the new colour, not the bytes the earlier writer left.
+    for extras in [
+        "\x1b]8;;https://e.x/\x1b\\",
+        "\x1b[4:3m",
+        "\x1b[4;58:2::255:0:0m",
+    ] {
+        let mut t = Terminal::new(ROWS, COLS);
+        t.process(b"\x1b[H\x1b[38;2;10;20;30mhello world\r");
+        t.process(format!("\x1b[38;2;200;0;0m{extras}hello").as_bytes());
+        assert_eq!(
+            cell_at(&t, 0).fg,
+            [200, 0, 0],
+            "{extras:?}: the rewritten cell painted the overwritten text's colour"
+        );
+
+        let mut t = Terminal::new(ROWS, COLS);
+        t.process(b"\x1b[H\x1b[48;2;1;2;3m\x1b[K");
+        t.process(format!("\x1b[48;2;50;60;70m{extras}link").as_bytes());
+        assert_eq!(
+            cell_at(&t, 0).bg,
+            [50, 60, 70],
+            "{extras:?}: the cell painted the erased line's background"
+        );
+    }
+}
+
+#[test]
+fn a_vs16_spacer_paints_its_leads_truecolour() {
+    // VS16 widens the previous cell; its new right half takes the lead's
+    // rendition, not the colour of the text it replaced.
+    let mut t = Terminal::new(ROWS, COLS);
+    t.process(b"\x1b[H\x1b[48;2;1;2;3mxxxxxxxx\r");
+    t.process("\x1b[48;2;200;0;0m\u{2764}\u{FE0F}".as_bytes());
+    let row = t.render_row(0);
+    assert_eq!(
+        (row[0].bg, row[1].bg),
+        ([200, 0, 0], [200, 0, 0]),
+        "the widened emoji's right half kept the replaced cell's background"
+    );
+}
+
+#[test]
+fn a_serialized_screen_replays_every_rendition() {
+    // `serialize_ansi` is replayable ANSI: a fresh terminal fed it paints each
+    // cell as the source does, for every rendition the SGR decoder stores.
+    let mut a = Terminal::new(ROWS, COLS);
+    a.process(
+        b"\x1b[H\x1b[4:3mC\x1b[0m\x1b[21mD\x1b[0m\x1b[4:4mo\x1b[0m\x1b[4:5ma\x1b[0m\
+          \x1b[4m\x1b[58:2::255:0:0mU\x1b[0m\x1b[4;58:5:9mI\x1b[0m\x1b[4:3;58:2::0:9:9mW\
+          \x1b[0m\x1b[73mS\x1b[0m\x1b[74mb\x1b[0m\x1b[53mO\x1b[0m",
+    );
+    let mut b = Terminal::new(ROWS, COLS);
+    b.process(a.serialize_ansi(usize::from(ROWS), Some(0)).as_bytes());
+    assert_eq!(a.render_row(0), b.render_row(0));
+    let flags = |t: &Terminal| -> Vec<_> {
+        (0..COLS)
+            .map(|c| t.grid().cell(0, c).map(|cell| cell.flags()))
+            .collect()
+    };
+    assert_eq!(flags(&a), flags(&b), "a stored rendition did not replay");
+}
+
+#[test]
+fn a_wide_half_an_edit_orphans_paints_the_erase_background() {
+    // ICH, DCH, DECDC and ECH blank the half of a wide pair they bisect or push
+    // off the edge with the erase background, as EL does: its colour, not no
+    // colour and not the bytes of the glyph that was there. (input, the orphan
+    // columns of row 0)
+    let bce = "\x1b[48;2;200;0;0m";
+    let cases: [(String, &[usize]); 6] = [
+        (format!("ab\u{4E2D}cd{bce}\x1b[1;1H\x1b[3P"), &[0]),
+        (
+            format!("\x1b[48;2;1;2;3mxxxx\r\x1b[0m\u{4E2D}{bce}\x1b[1;2H\x1b[P"),
+            &[0],
+        ),
+        (format!("\u{4E2D}ab{bce}\x1b[1;2H\x1b[@"), &[0, 2]),
+        (format!("abcdefgh\u{4E2D}{bce}\x1b[1;1H\x1b[@"), &[9]),
+        (format!("ab\u{4E2D}cd{bce}\x1b[1;3H\x1b['~"), &[2]),
+        (format!("\u{4E2D}ab{bce}\x1b[1;2H\x1b[X"), &[0]),
+    ];
+    for (input, orphans) in cases {
+        let mut t = Terminal::new(3, 10);
+        t.process(input.as_bytes());
+        let row = t.render_row(0);
+        for &c in orphans {
+            assert_eq!(row[c].bg, [200, 0, 0], "{input:?}: column {c}");
+        }
+    }
+}

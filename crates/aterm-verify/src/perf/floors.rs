@@ -343,6 +343,41 @@ pub(crate) const RESIZE_LANE: FloorLane = FloorLane {
     cli: "resize",
 };
 
+/// CRASH-RESTORE floor (the crash-restore plan §6 and §7.3; `crates/aterm-restore`): what
+/// the journal costs the parse thread and what a restore costs the next window. The keys
+/// mirror `aterm-bench/examples/crash_restore_harness.rs`: the parse thread's throughput
+/// with the tail tap on, keyframes per second (capture, encode and copy) for a shell, a
+/// full-screen program over a saved primary and a shell with a 256- and a 512-line bridge,
+/// and restores per second of a keyframe plus a 256 KiB tail. The tap's overhead ratio is an
+/// absolute fence ([`TAIL_TAP_RATIO_FENCE`]), not a ratio floor: it is already a ratio. Named
+/// `crash-restore` because `restore` is the serialize-and-replay lane.
+pub(crate) const CRASH_RESTORE_LANE: FloorLane = FloorLane {
+    lane: "crash-restore",
+    example: "crash_restore_harness",
+    keys: &[
+        "tail_tap_mbps",
+        "kf_shell_hz",
+        "kf_tui_hz",
+        "kf_bridge256_hz",
+        "kf_bridge512_hz",
+        "recover_hz",
+    ],
+    baseline_file: "perf-baseline-crash-restore.json",
+    comment: "aterm CRASH-RESTORE baseline: parse-thread MB/s with the journal's tail tap, \
+              keyframes/s (shell, TUI over a saved primary, +256 and +512 bridge) and \
+              restores/s of a keyframe plus a 256 KiB tail. BIGGER-IS-BETTER; the tap \
+              overhead fence lives in the lane code. Re-record with targo --unverified verify \
+              perf --record crash-restore.",
+    cli: "crash-restore",
+};
+
+/// The tail tap's ABSOLUTE fence: with the tap on, the parse thread keeps at least this
+/// fraction of its throughput on the throughput corpus (the plan's floor). The tap copies
+/// each PTY byte once into the region after `process`; measured 0.993-0.995 on an M5 Max
+/// (a word-at-a-time copy measured 0.75 and a double copy 0.93, which this fence catches).
+/// It holds with no baseline, like the resize fences.
+pub(crate) const TAIL_TAP_RATIO_FENCE: f64 = 0.97;
+
 /// ZSTD-DECODE floor (docs/AUDIT-third-party-2026-10-15.md ZC.4): decoded MB/s
 /// of `aterm_zstd::Decoder`, atpkg's `.tar.zst` reader, over five frames the
 /// zstd 1.5.7 CLI wrote (aterm-zstd's recorded answers, so no encoder runs and
@@ -586,6 +621,52 @@ pub(crate) fn gate_keyed(lane: &FloorLane, record: bool) -> LaneRun {
     }
 }
 
+/// CRASH-RESTORE: the ratio floors, the tail tap's absolute fence (which holds with no
+/// baseline), and a line naming every key the harness reported that nothing judges.
+pub(crate) fn gate_crash_restore(record: bool) -> LaneRun {
+    match measure_example(CRASH_RESTORE_LANE.example) {
+        Ok(json) => judge_crash_restore(&json, record),
+        Err(e) => LaneRun::fail(format!("could not measure: {e}")),
+    }
+}
+
+fn judge_crash_restore(json: &Value, record: bool) -> LaneRun {
+    let mut run = judge_keyed(&CRASH_RESTORE_LANE, json, record);
+    match tail_tap_fence(json) {
+        Ok(()) => run.fence_held(CRASH_RESTORE_LANE.cli),
+        Err(finding) => run.add_failure(finding),
+    }
+    let ungated: Vec<&str> = json
+        .as_object()
+        .map(|o| o.keys().map(String::as_str).collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|k| !CRASH_RESTORE_LANE.keys.contains(k) && *k != "tail_tap_ratio")
+        .collect();
+    if !ungated.is_empty() {
+        eprintln!("    UNGATED — reported, not judged: {}", ungated.join(", "));
+    }
+    run
+}
+
+/// The tail tap's fence: a missing ratio is a breach (an unmeasured cost is not a small
+/// one).
+pub(crate) fn tail_tap_fence(json: &Value) -> Result<(), String> {
+    match number(json, "tail_tap_ratio") {
+        Some(v) if v >= TAIL_TAP_RATIO_FENCE => {
+            eprintln!(
+                "    tail_tap_ratio: GREEN — {v:.3} >= absolute fence {TAIL_TAP_RATIO_FENCE}"
+            );
+            Ok(())
+        }
+        Some(v) => Err(format!(
+            "tail_tap_ratio {v:.3} < absolute fence {TAIL_TAP_RATIO_FENCE}: the journal's tail tap \
+             costs the parse thread more than the plan allows"
+        )),
+        None => Err("tail_tap_ratio missing from the harness report".to_string()),
+    }
+}
+
 /// The resize report's LOWER-is-better latencies: same-box trend samples,
 /// INVERTED, so a creep under the absolute caps is still caught on the box
 /// that has history.
@@ -739,13 +820,14 @@ mod tests {
         assert!(compare_against_baseline(&path, &report(1234.5)).failed());
     }
 
-    const KEYED_LANES: [&FloorLane; 6] = [
+    const KEYED_LANES: [&FloorLane; 7] = [
         &PATHOLOGICAL_LANE,
         &SCROLL_LANE,
         &SEARCH_LANE,
         &RESTORE_LANE,
         &RESIZE_LANE,
         &ZSTD_LANE,
+        &CRASH_RESTORE_LANE,
     ];
 
     fn keyed_line(lane: &FloorLane, scale: f64) -> Value {
@@ -907,6 +989,29 @@ mod tests {
             1,
             "missing is a breach"
         );
+    }
+
+    #[test]
+    fn the_tail_tap_fence_holds_absolutely() {
+        assert_eq!(tail_tap_fence(&json("{\"tail_tap_ratio\":0.994}")), Ok(()));
+        assert_eq!(
+            tail_tap_fence(&json("{\"tail_tap_ratio\":0.97}")),
+            Ok(()),
+            "inclusive"
+        );
+        assert!(tail_tap_fence(&json("{\"tail_tap_ratio\":0.93}")).is_err());
+        assert!(
+            tail_tap_fence(&json("{\"tail_tap_mbps\":500.0}")).is_err(),
+            "missing is a breach"
+        );
+        // The fence holds with no baseline: a fresh checkout judges it and nothing else.
+        let mut s = String::from("{\"tail_tap_ratio\":0.5,");
+        for key in CRASH_RESTORE_LANE.keys {
+            s.push_str(&format!("\"{key}\":10.0,"));
+        }
+        s.push_str("\"n\":9}");
+        let run = judge_crash_restore(&json(&s), false);
+        assert!(run.failed(), "{run:?}");
     }
 
     #[test]

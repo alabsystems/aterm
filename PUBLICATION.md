@@ -45,10 +45,11 @@ The export is an allowlist: only listed paths ship. That is the full Rust
 workspace — including developer and release-helper source, so the reviewed
 `Cargo.lock` needs no regeneration — plus the modified vendored crates, the
 public README media, the installer script `tools/install.sh`, the community
-theme kit `contrib/themes`, and the license material.
+theme kit `contrib/themes`, the manual page `man/aterm.1` (the binary embeds
+it), and the license material.
 
 Everything else stays private: operational notes, the changelog and release
-ledger, man pages, the release and publication machinery, internal proof
+ledger, the release and publication machinery, internal proof
 packets, generated tool caches, and unused traced art inputs whose source
 rights were not established. A test whose only fixture is something the export
 omits (the `ay` proof bundles, the changelog) is left out too, so a fresh clone

@@ -21,11 +21,7 @@ use std::os::unix::process::CommandExt as _;
 
 /// Replace this process with `command`'s program. Returns only on failure, with SIGPIPE
 /// as it was on entry.
-#[expect(
-    clippy::disallowed_types,
-    reason = "the update lane's exec of this process's own image, which keeps its handoff descriptors"
-)]
-pub fn exec_keeping_sigpipe(command: &mut std::process::Command) -> io::Error {
+pub fn exec_keeping_sigpipe(command: &mut aterm_uds::spawnfd::StdCommand) -> io::Error {
     let saved = sigpipe_disposition();
     let error = command.exec();
     if let Some(saved) = saved.as_ref() {

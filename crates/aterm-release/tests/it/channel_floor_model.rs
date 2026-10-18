@@ -6,10 +6,11 @@
 
 use crate::{ledger, manifest_out, publish, verify};
 
-use aterm_spec::derive::{
-    Model, release_channel_floor_model, release_published_identity_model,
+use aterm_models_release::{
+    release_channel_floor_model, release_published_identity_model,
     release_yank_successor_first_model,
 };
+use aterm_spec::derive::Model;
 use ledger::{GitRunner, RunOut};
 use std::collections::VecDeque;
 use std::sync::Mutex;

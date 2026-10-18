@@ -56,7 +56,6 @@ pub fn cfg() -> GlowConfig {
         ring: true,
         beam: false,
         head_dx: 0.5,
-        pack: None,
     }
 }
 
@@ -93,8 +92,6 @@ pub enum Flag {
 /// One text cell on one frame.
 #[derive(Clone, Copy, Debug)]
 pub struct Pos {
-    pub row: u16,
-    pub col: u16,
     pub lit: bool,
     pub t: Option<f32>,
     /// Whether a not-leaving cell owns the position.
@@ -224,7 +221,6 @@ pub struct Host {
     blink: u64,
     last_blink: Option<Instant>,
     scroll: Option<ContentScrollState>,
-    ring_seen: u64,
     /// The GUI's real pacing: a frame when output lands, then 16 ms while
     /// the engine asks for cadence, else at its next change deadline.
     pub paced: bool,
@@ -266,7 +262,6 @@ impl Host {
             blink: 0,
             last_blink: None,
             scroll: None,
-            ring_seen: 0,
             paced: false,
         }
     }
@@ -327,7 +322,8 @@ impl Host {
             (r > 0).then_some(self.above.as_slice()),
             (r + 1 < rows).then_some(self.below.as_slice()),
         );
-        self.glow.observe_print_anchor(self.term.print_anchor());
+        self.glow
+            .observe_print_anchor(aterm_effects::host::motion_print_anchor(&self.term).0);
         self.glow.observe_ribbon_row(c.row, &self.row_buf);
         let mut rows = [0u16; WITNESS_ROWS];
         let n = self.glow.ribbon_rows(&mut rows);
@@ -340,74 +336,6 @@ impl Host {
         }
         self.glow
             .tick(cur, self.now, &self.cfg, self.g, &mut self.out);
-        self.debug();
-    }
-
-    /// `WALK_CENSUS_RING=<ms>:<ms>`: every new admission verdict, and the
-    /// ribbon's cohorts and cells, per frame in that window.
-    fn debug(&mut self) {
-        let Some((a, b)) = std::env::var("WALK_CENSUS_RING").ok().and_then(|w| {
-            let (a, b) = w.split_once(':')?;
-            Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?))
-        }) else {
-            return;
-        };
-        let ms = self.ms();
-        if ms < a || ms > b {
-            return;
-        }
-        for rec in self.glow.admission_log() {
-            if rec.seq > self.ring_seen {
-                eprintln!("  t={ms} ring: {}", rec.line(self.now));
-                self.ring_seen = rec.seq;
-            }
-        }
-        let c = self.term.cursor();
-        let rib = self.glow.v2_ribbon().expect("rainbow kitty owns the frame");
-        let mut cells: Vec<(u16, u16, u32, bool, String)> = rib
-            .cells()
-            .iter()
-            .map(|x| {
-                (
-                    x.row,
-                    x.col,
-                    x.cohort,
-                    x.leaving(),
-                    format!("{:.4}{:?}", x.t, x.layer),
-                )
-            })
-            .collect();
-        cells.sort_by_key(|x| (x.0, x.1));
-        eprintln!(
-            "  t={ms} caret=({},{}) segs={} cells={cells:?}",
-            c.row,
-            c.col,
-            rib.plan_segments().len()
-        );
-        eprintln!("  t={ms} cohorts:");
-        for k in rib.cohorts() {
-            let n = rib.cells().iter().filter(|x| x.cohort == k.id).count();
-            let lv = rib
-                .cells()
-                .iter()
-                .filter(|x| x.cohort == k.id && x.leaving())
-                .count();
-            eprintln!(
-                "    id={} row={} cols={}..{} anchor={} t0={:.4} d0={} wake={} aband={} phrase={} phase={:?} flow={} cells={n} leaving={lv}",
-                k.id,
-                k.row,
-                k.col0,
-                k.col1,
-                k.anchor_col,
-                k.t0,
-                k.d0,
-                k.wake,
-                k.abandoned,
-                k.phrase,
-                k.phase,
-                k.flow.is_some()
-            );
-        }
     }
 
     /// Run the frame train through every frame due at or before `t`;
@@ -479,8 +407,6 @@ impl Host {
                     .iter()
                     .any(|c| c.row == row && c.col == col && !c.leaving());
                 Pos {
-                    row,
-                    col,
                     lit,
                     t: rib.field_at(row, col),
                     live,
@@ -958,20 +884,8 @@ impl Shell {
         }
     }
 
-    pub fn runs(&self) -> Vec<(Flag, usize, usize, usize)> {
-        runs(&self.snaps)
-    }
-
-    pub fn standing(&self) -> Vec<(Flag, usize, usize, usize)> {
-        standing(&self.snaps)
-    }
-
     pub fn dump(&self, from: usize, to: usize) -> String {
         dump(&self.snaps, from, to)
-    }
-
-    pub fn verdict(&self, name: &str) -> String {
-        verdict(&self.snaps, name)
     }
 
     pub fn mark(&mut self, label: &str) {
@@ -1029,37 +943,6 @@ pub fn dump(snaps: &[Snap], from: usize, to: usize) -> String {
             f.text,
             f.map(),
             f.ts()
-        ));
-    }
-    s
-}
-
-/// A one-line verdict and, for each standing run, its first frames.
-pub fn verdict(snaps: &[Snap], name: &str) -> String {
-    let runs = runs(snaps);
-    let standing = standing(snaps);
-    let mut s = format!(
-        "{name}: {} snaps, {} flagged runs ({} standing >= {STANDING_FRAMES} frames)\n",
-        snaps.len(),
-        runs.len(),
-        standing.len()
-    );
-    let rc = recolours(snaps);
-    if let Some(&(i, k, a, b)) = rc.first() {
-        s.push_str(&format!(
-            "  RECOLOUR: {} text cells lit again in another colour under unchanged text; \
-             first text {i} at t={}ms [{}]: {a:.4} -> {b:.4}\n",
-            rc.len(),
-            snaps[k].ms,
-            snaps[k].label
-        ));
-    }
-    for (f, i, a, b) in runs.iter().take(12) {
-        s.push_str(&format!(
-            "  {f:?} at text {i} frames {a}..={b} ({} frames) t={}ms [{}]\n",
-            b - a + 1,
-            snaps[*a].ms,
-            snaps[*a].label
         ));
     }
     s
@@ -1161,7 +1044,7 @@ pub fn unhex(s: &str) -> Vec<u8> {
         .collect()
 }
 
-/// `(ms from the first line, event)`; `ptyrec.py` stamps nanoseconds.
+/// `(ms from the first line, event)`; `lab ptyrec` stamps nanoseconds.
 pub fn recording(src: &str) -> Vec<(u64, Rec)> {
     let mut t0 = None;
     src.lines()

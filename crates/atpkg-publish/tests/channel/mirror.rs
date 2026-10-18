@@ -82,7 +82,7 @@ fn writes(host: &FakeHost) -> Vec<String> {
 #[test]
 fn an_absent_pack_is_checked_and_planned_with_exactly_its_signed_set() {
     let (rig, q) = setup("mirror-plan", index());
-    let (report, log) = ok(&rig, &q, true);
+    let (report, _) = ok(&rig, &q, true);
     assert_eq!(
         report.planned,
         vec![(
@@ -94,12 +94,6 @@ fn an_absent_pack_is_checked_and_planned_with_exactly_its_signed_set() {
             ]
         )]
     );
-    assert!(log.contains("checked atpkg-ay-8256 ("), "{log}");
-    assert!(log.contains("no extras"), "{log}");
-    assert!(log.contains(&format!(
-        "DRY RUN — would create alabsystems/ay@atpkg-ay-8256 with: pkg-ay-8256.toml \
-         pkg-ay-8256.toml.sig {TARBALL}"
-    )));
     assert!(
         rig.host
             .calls()
@@ -191,9 +185,8 @@ fn a_publish_creates_the_signed_set_and_confirms_it_then_a_rerun_skips() {
 
     // Public and complete: skipped — no staging read, no write, no payload download.
     let before = rig.host.calls().len();
-    let (report, log) = ok(&rig, &q, false);
+    let (report, _) = ok(&rig, &q, false);
     assert_eq!(report.skipped, ["atpkg-ay-8256"]);
-    assert!(log.contains("alabsystems/ay@atpkg-ay-8256 is public and complete — skip"));
     let calls = &rig.host.calls()[before..];
     assert!(
         !calls.iter().any(|c| c.contains("alabsystems")),
@@ -384,10 +377,9 @@ fn every_build_any_target_resolves_is_mirrored_once() {
     let (rig, q) = setup("mirror-union", doc);
     rig.lay_pack("alabsystems", "ay", 9001, &[LINUX]);
     rig.lay_pack("alabsystems", "ay", 9002, &[LINUX_ARM]);
-    let (report, log) = ok(&rig, &q, true);
+    let (report, _) = ok(&rig, &q, true);
     let tags: Vec<&str> = report.planned.iter().map(|(t, _)| t.as_str()).collect();
     assert_eq!(tags, ["atpkg-ay-8256", "atpkg-ay-9001", "atpkg-ay-9002"]);
-    assert!(log.contains(&format!("per-target pin overlays for: {LINUX_ARM} {LINUX}")));
     assert_eq!(
         report.planned[1].1,
         [

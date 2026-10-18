@@ -161,7 +161,8 @@
 //! * `x11` (enabled by default): On Unix platforms, enables the X11 backend.
 //! * `wayland` (enabled by default): On Unix platforms, enables the Wayland backend.
 //! * `rwh_06`: Implement `raw-window-handle v0.6` traits. (aterm: not a default; on macOS a
-//!   window's content view is `aterm_objc::HasNsView`.)
+//!   window's content view is `aterm_objc::HasNsView`, and on X11 and Wayland a window's handles
+//!   are `aterm_types::native_window::HasNativeWindow`.)
 //!
 //! See the [`platform`] module for documentation on platform-specific cargo
 //! features.

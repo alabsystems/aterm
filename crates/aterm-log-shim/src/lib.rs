@@ -32,8 +32,10 @@
 //!   oracle's test graph only: since `rustybuzz`, the one consumer every
 //!   shipped cell compiled, left at TF.6, the shipped mac graph has no `log`.
 //! * **windows + linux** — `gpu-allocator`
-//! * **linux only** — `calloop`, `sctk-adwaita`, `smithay-client-toolkit`,
-//!   `tiny-skia`, `wayland-sys`, `xkbcommon-dl`
+//! * **linux only** — none since linux-windowing LW.7, where `calloop`,
+//!   `smithay-client-toolkit`, `wayland-sys` and `xkbcommon-dl` left with the
+//!   winit fork's move to the first-party Linux crates (`sctk-adwaita` and
+//!   `tiny-skia` left at LW.5)
 //! * **lock only** — `gl_generator`, the graph's only
 //!   `#[macro_use] extern crate log;`. It is a build-dependency of
 //!   `glutin_wgl_sys`, under wgpu-hal's GL backend on Windows, which no cell
@@ -167,9 +169,9 @@
 //!    implements upstream's `FromStr` exactly and has no `parse`.
 //! 4. **`no_std`.** `aterm_log` is std-only (`std::sync::OnceLock`,
 //!    `std::borrow::Cow`, `std::error::Error`, a whole `pub mod env` over
-//!    `std::env`). Six consumers are `#![no_std]` — naga, wgpu, wgpu-core,
-//!    wgpu-hal, wgpu-types, tiny-skia (rustybuzz was a seventh until TF.6) —
-//!    and none enables `log/std`.
+//!    `std::env`). Five consumers are `#![no_std]` — naga, wgpu, wgpu-core,
+//!    wgpu-hal, wgpu-types (rustybuzz was a sixth until TF.6, tiny-skia until
+//!    LW.5) — and none enables `log/std`.
 //!
 //! Reasons 2 and 3 are the decisive ones, because they are cases where
 //! delegating would ship an API that is *wrong*, not merely inelegant. Reason 1
@@ -296,9 +298,9 @@
 
 #![no_std]
 // `no_std` unconditionally, and not behind the `std` feature — the same choice
-// `crates/aterm-tracing` made and for a sharper reason. Six of the thirteen
-// consumers are `#![no_std]` (naga, wgpu, wgpu-core, wgpu-hal, wgpu-types,
-// tiny-skia; rustybuzz was a seventh until TF.6) and `gpu-allocator` is
+// `crates/aterm-tracing` made and for a sharper reason. Five of the consumers
+// are `#![no_std]` (naga, wgpu, wgpu-core, wgpu-hal, wgpu-types; rustybuzz was a
+// sixth until TF.6, tiny-skia until LW.5) and `gpu-allocator` is
 // `#![cfg_attr(not(feature = "std"), no_std)]`; none of them enables `log/std`,
 // measured on all four cells. Nothing in this crate needs an allocator or an
 // OS, so the simplest way to guarantee it keeps working for them is to never
@@ -781,10 +783,11 @@ pub fn max_level() -> LevelFilter {
 // formulation that FIXES the specific gap that made `aterm_log`'s macros
 // unusable here — those splice `$($arg:tt)*` straight into `format_args!`, and
 // `format_args!` REJECTS a `target:` prefix with
-// `error: expected `,`, found `:``. There are eighteen `target:` sites, all in
+// `error: expected `,`, found `:``. There were eighteen `target:` sites, all in
 // smithay-client-toolkit 0.19.2 (9 `warn!`, 5 `debug!`, 3 `error!`, 1 `trace!`),
-// i.e. entirely on the one cell that cannot be compiled on this machine. A
-// token-discarding arm swallows them; a `format_args!`-splicing arm does not.
+// i.e. entirely on the one cell that cannot be compiled on this machine, until
+// it left the graph at linux-windowing LW.7. A token-discarding arm swallows such
+// a form; a `format_args!`-splicing arm does not.
 //
 // The expansion is `{}`: an empty block. It has to be an expression, because
 // these macros appear in expression position as well as statement position —

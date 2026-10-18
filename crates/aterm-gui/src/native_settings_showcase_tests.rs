@@ -7,6 +7,7 @@
 //! the compiled tree, and the card tiles' paint discipline.
 
 use super::*;
+use crate::settings_preview::theme_card::ShowcaseTier;
 use showcase_page::{
     ShowcaseChip, ShowcaseState, ShowcaseTrial, carried_override_keys, palette_reset, palette_with,
     save_as_text, save_name_problem,
@@ -126,7 +127,12 @@ fn showcase_chips_filter_by_appearance_and_origin() {
     let dark = shown(&mut showcase, ShowcaseChip::Dark);
     let light = shown(&mut showcase, ShowcaseChip::Light);
     let yours = shown(&mut showcase, ShowcaseChip::Yours);
-    assert_eq!(all.len(), showcase.cards.len());
+    let drawable = showcase
+        .cards
+        .iter()
+        .filter(|card| card.tier != ShowcaseTier::Pack)
+        .count();
+    assert_eq!(all.len(), drawable);
     assert!(dark.is_disjoint(&light));
     assert_eq!(dark.union(&light).cloned().collect::<BTreeSet<_>>(), all);
     assert_eq!(
@@ -245,47 +251,14 @@ fn showcase_keep_on_a_split_writes_only_the_shown_side() {
     );
 }
 
-/// Keep while `theme` is unset (which follows the OS) keeps following it:
-/// the tried theme on the side the page shows and its own pair on the other,
-/// so the saved value still draws a theme for each appearance. Over a plain
-/// name (the negative control) Keep writes the plain name.
+/// With no theme set (Default, one theme), Keep writes the kept theme's own
+/// name, for whichever side the page shows, and the status names it alone:
+/// keeping never starts following the OS. Negative control: a pair the
+/// person chose keeps having only its shown side replaced.
 #[test]
-fn showcase_keep_from_an_unset_theme_keeps_following_the_os() {
-    let keep = |source: &str| {
-        let (mut service, mut runtime, instance, view) = themes_view(source);
-        // The view has seen a light OS: the light side is the one shown.
-        let card = card_action(&runtime, view, "Aterm Day");
-        let _ = act(&mut runtime, instance, view, &card, None);
-        let kept = act(&mut runtime, instance, view, "settings/showcase/keep", None);
-        let patches = config_patches(&kept);
-        assert_eq!(patches.len(), 1, "{source:?}: one write");
-        let (published, _) = apply_real_config_patch(&mut service, &patches[0].0);
-        published.config.theme.clone().expect("theme written")
-    };
-    let written = keep("");
-    assert_eq!(written, "dark:Aterm Night,light:Aterm Day");
-    for (appearance, drawn) in [
-        (aterm_types::Appearance::Dark, "Aterm Night"),
-        (aterm_types::Appearance::Light, "Aterm Day"),
-    ] {
-        assert_eq!(
-            crate::app_config::resolve_theme_name_value(Some(&written), appearance).as_deref(),
-            Some(drawn)
-        );
-    }
-    assert_eq!(keep("theme = \"Dracula\"\n"), "Aterm Day");
-}
-
-/// With no theme set, Keep on a theme drawn for the other appearance (a
-/// light theme while the page shows the dark side) keeps it as the one
-/// theme for both, and the status says so: never filed under the side shown,
-/// where it would sit in the wrong slot and leave when macOS turns light.
-/// A theme for the side shown still takes only that side, and a pair the
-/// person chose keeps having its shown side replaced.
-#[test]
-fn showcase_keep_with_no_theme_keeps_a_theme_for_the_other_appearance_on_both_sides() {
+fn showcase_keep_with_no_theme_writes_the_plain_name() {
     let keep = |source: &str, id: &str| {
-        let (_service, mut runtime, instance, view) = themes_view(source);
+        let (mut service, mut runtime, instance, view) = themes_view(source);
         {
             let Some(AppViewState::Settings(shown)) = runtime.view_state_mut(view) else {
                 unreachable!()
@@ -297,34 +270,24 @@ fn showcase_keep_with_no_theme_keeps_a_theme_for_the_other_appearance_on_both_si
         let kept = act(&mut runtime, instance, view, "settings/showcase/keep", None);
         let patches = config_patches(&kept);
         assert_eq!(patches.len(), 1, "{source:?} {id}");
-        (
-            patches[0].0.edits[0].value.clone(),
-            state(&runtime, view).feedback.clone(),
-        )
+        let feedback = state(&runtime, view).feedback.clone();
+        let (published, _) = apply_real_config_patch(&mut service, &patches[0].0);
+        (published.config.theme.clone(), feedback)
     };
-    assert_eq!(
-        keep("", "Aterm Day"),
-        (
-            Some("dark:Aterm Day,light:Aterm Day".to_string()),
-            Some("Keeping Aterm Day for light and dark mode\u{2026}".to_string())
-        )
-    );
-    assert_eq!(
-        keep("", "Nord"),
-        (
-            Some("dark:Nord,light:Default Light".to_string()),
-            Some("Keeping Nord for dark mode\u{2026}".to_string())
-        )
-    );
+    for id in ["Aterm Day", "Nord"] {
+        assert_eq!(
+            keep("", id),
+            (Some(id.to_string()), Some(format!("Keeping {id}\u{2026}")))
+        );
+    }
     assert_eq!(
         keep("theme = \"dark:Nord,light:Default Light\"\n", "Aterm Day").0,
         Some("dark:Aterm Day,light:Default Light".to_string())
     );
 
-    // Once it lands, the status names the one theme for both appearances.
+    // Once it lands, the status names the one theme.
     let mut lab = super::modified::Lab::new("");
     lab.state_mut().navigate(SettingsRoute::Themes);
-    lab.state_mut().theme_preview_side = Some(aterm_types::Appearance::Dark);
     let slug = lab
         .state()
         .showcase
@@ -336,7 +299,7 @@ fn showcase_keep_with_no_theme_keeps_a_theme_for_the_other_appearance_on_both_si
         .clone();
     let _ = lab.invoke(&format!("settings/showcase/card/{slug}"), None);
     lab.commit("settings/showcase/keep", None);
-    assert_eq!(lab.text(), "theme = \"dark:Aterm Day,light:Aterm Day\"\n");
+    assert_eq!(lab.text(), "theme = \"Aterm Day\"\n");
     let feedback = lab.state().feedback.clone().unwrap_or_default();
     assert!(
         feedback.starts_with("Color theme set to Aterm Day"),
@@ -493,7 +456,13 @@ fn save_as_writes_conf_that_parses_to_resolved_scheme() {
     );
     assert_eq!(resolved.scheme.ansi[0], aterm_types::Rgb::new(0xff, 0, 0));
     // The pure builder: the text parses to the resolved scheme, renamed.
-    let text = save_as_text(&resolved, "Nord Custom", "Nord").expect("serializes");
+    let text = save_as_text(
+        &resolved,
+        "Nord Custom",
+        "Nord",
+        &aterm_types::scheme::ThemeTypography::NONE,
+    )
+    .expect("serializes");
     let parsed = aterm_types::scheme::parse_theme_str(&text).expect("parses");
     let mut expected = resolved.scheme.clone();
     expected.name = "Nord Custom".to_string();
@@ -501,7 +470,7 @@ fn save_as_writes_conf_that_parses_to_resolved_scheme() {
     assert_eq!(parsed.scheme, expected);
     assert_eq!(parsed.scheme.selection_fg, resolved.scheme.selection_fg);
     assert_eq!(
-        carried_override_keys(&resolved),
+        carried_override_keys(&resolved, &aterm_types::scheme::ThemeTypography::NONE),
         vec![
             prefs::EDIT_FOREGROUND.to_string(),
             prefs::EDIT_SELECTION_FOREGROUND.to_string(),
@@ -1281,7 +1250,8 @@ fn theme_card_paint_never_emits_terminal_specimen() {
 }
 
 /// Esc unwinds the page deepest first: the palette slot editor, then the
-/// trial, then the filter; only then does it leave the page.
+/// trial, then the filter; only then does it leave the page, one level up:
+/// to Appearance, then Home.
 #[test]
 fn showcase_escape_unwinds_slot_trial_filter_then_leaves() {
     let (_service, mut runtime, instance, view) = themes_view("");
@@ -1306,28 +1276,114 @@ fn showcase_escape_unwinds_slot_trial_filter_then_leaves() {
     assert!(state(&runtime, view).showcase.filter.value().is_empty());
     assert_eq!(state(&runtime, view).route, SettingsRoute::Themes);
     escape(&mut runtime);
+    assert_eq!(state(&runtime, view).route, SettingsRoute::Appearance);
+    escape(&mut runtime);
     assert_eq!(state(&runtime, view).route, SettingsRoute::Home);
 }
 
-/// The rail lists every route but a sub-page, and shows the sub-page's
-/// parent selected while it is the route.
+/// While Themes shows, the rail lists its own row right under Appearance's,
+/// indented, and that row is the selected one — in the semantic tree and in
+/// `controls` alike. Back on Appearance the row is gone and Appearance is
+/// selected: the row is transient and the selection follows the route.
 #[test]
-fn themes_is_appearances_sub_page_on_the_rail() {
-    let (_service, runtime, instance, view) = themes_view("");
+fn the_rail_selects_the_themes_row_under_appearance() {
+    let (_service, mut runtime, instance, view) = themes_view("");
     let cx = view_cx_at(1_200.0, 820.0);
+    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+    let row = |key: &str| {
+        compiled
+            .semantic(&UiKey::new(key))
+            .unwrap_or_else(|| panic!("{key} on the rail"))
+    };
+    let selected =
+        |node: &crate::native_ui::SemanticNode| node.state.is_some_and(|state| state.selected);
+    let themes = row("settings/nav/themes");
+    let appearance = row("settings/nav/appearance");
+    assert!(selected(themes), "the sub-page's own row is selected");
+    assert!(!selected(appearance), "its parent's is not");
+    assert_eq!(
+        themes.action.as_ref().map(ActionId::as_str),
+        Some(route_action(SettingsRoute::Themes).as_str())
+    );
+    let navigation = row("settings/navigation");
+    let wallpaper = row("settings/nav/wallpaper");
+    // Directly under Appearance: the column's one gap between them, the
+    // same gap Wallpaper sits under Themes by.
+    let gap = wallpaper.rect.y - themes.rect.bottom();
+    assert!(gap >= 0.0, "{gap}");
+    assert!(
+        (themes.rect.y - appearance.rect.bottom() - gap).abs() < 0.01,
+        "{:?} under {:?}",
+        themes.rect,
+        appearance.rect
+    );
+    assert!(themes.rect.x > appearance.rect.x, "indented");
+    assert!(themes.rect.bottom() <= navigation.rect.bottom() + 0.01);
+    let lines = compiled.controls_lines();
+    let line = |key: &str| {
+        let quoted = format!("key=\"{key}\"");
+        lines
+            .iter()
+            .find(|line| line.contains(&quoted))
+            .unwrap_or_else(|| panic!("{key} in controls: {lines:#?}"))
+            .clone()
+    };
+    assert!(line("settings/nav/themes").contains("selected:true"));
+    assert!(line("settings/nav/appearance").contains("selected:false"));
+
+    // Negative control: on Appearance the row is gone and Appearance is
+    // the selected one.
+    let _ = act(
+        &mut runtime,
+        instance,
+        view,
+        route_action(SettingsRoute::Appearance).as_str(),
+        None,
+    );
     let compiled = compile_settings_view(&runtime, instance, view, &cx);
     assert!(
         compiled
             .semantic(&UiKey::new("settings/nav/themes"))
             .is_none()
     );
-    let appearance = compiled
-        .semantic(&UiKey::new("settings/nav/appearance"))
-        .expect("Appearance on the rail");
-    assert!(appearance.state.is_some_and(|state| state.selected));
+    assert!(
+        compiled
+            .semantic(&UiKey::new("settings/nav/appearance"))
+            .is_some_and(selected)
+    );
     assert_eq!(
         SettingsRoute::from_path("/themes"),
         Some(SettingsRoute::Themes)
+    );
+}
+
+/// A Medium page at large type is as narrow, in its own type, as a Compact
+/// one: where the chips do not fit beside the filter they take a row of
+/// their own, so the filter keeps its placeholder whole (at 2× on an
+/// 1698pt window the chips squeezed it to 132 of its 148pt). The negative
+/// control: at 1× on a Wide window the chips share the toolbar's row.
+#[test]
+fn a_narrow_toolbar_puts_the_chips_on_their_own_row_at_any_width() {
+    at_each_text_scale(&[2.0], "the Themes toolbar", |_| {
+        let (_service, runtime, instance, view) = themes_view("");
+        let cx = view_cx_at(1_698.0, 1_002.0);
+        assert_eq!(SettingsWidth::for_viewport(1_698.0), SettingsWidth::Medium);
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        assert!(
+            compiled
+                .semantic(&UiKey::new("settings/showcase/chips"))
+                .is_some(),
+            "the chips' own row"
+        );
+        let failures = compiled.fit_failures();
+        assert!(failures.is_empty(), "{failures:#?}");
+    });
+    let (_service, runtime, instance, view) = themes_view("");
+    let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_200.0, 820.0));
+    assert!(
+        compiled
+            .semantic(&UiKey::new("settings/showcase/chips"))
+            .is_none()
     );
 }
 
@@ -1557,8 +1613,24 @@ fn save_as_text_accepts_a_name_the_file_respells() {
     let state = state(&runtime, view);
     let resolved =
         preview_resolved_colors_with(state, state.presented_motion.get().system_dark, None);
-    assert!(save_as_text(&resolved, "Nord #2", "Nord").is_ok());
-    assert!(save_as_text(&resolved, &"N".repeat(300), "Nord").is_ok());
+    assert!(
+        save_as_text(
+            &resolved,
+            "Nord #2",
+            "Nord",
+            &aterm_types::scheme::ThemeTypography::NONE
+        )
+        .is_ok()
+    );
+    assert!(
+        save_as_text(
+            &resolved,
+            &"N".repeat(300),
+            "Nord",
+            &aterm_types::scheme::ThemeTypography::NONE
+        )
+        .is_ok()
+    );
 }
 
 /// Tuning one palette slot with no `palette` list writes that slot alone
@@ -1817,15 +1889,8 @@ fn save_as_over_a_slot_override_selects_the_theme_and_clears_the_slot() {
     let patches = config_patches(&published);
     assert_eq!(patches.len(), 1, "one select patch");
     let (snapshot, _) = apply_real_config_patch(&mut service, &patches[0].0);
-    // Over the unset theme the select keeps following the OS, with the saved
-    // theme on the side the page shows (a light OS here).
-    let theme = snapshot.config.theme.as_deref();
-    assert_eq!(prefs::theme_mode(theme), prefs::ThemeMode::FollowSystem);
-    assert_eq!(
-        crate::app_config::resolve_theme_name_value(theme, aterm_types::Appearance::Light)
-            .as_deref(),
-        Some(id.as_str())
-    );
+    // Over the unset theme the select is the saved theme's own name.
+    assert_eq!(snapshot.config.theme.as_deref(), Some(id.as_str()));
     assert!(
         snapshot
             .config
@@ -1851,9 +1916,9 @@ fn save_as_over_a_slot_override_selects_the_theme_and_clears_the_slot() {
 
 /// Save as over a pair that draws one theme on both sides selects the saved
 /// theme by Keep's rule, once the catalog knows what the saved theme is made
-/// for: a dark theme saved on a light OS takes both sides, as it would over
-/// an unset value. The name alone (what the Save click knew) would have
-/// changed only the shown side, leaving the old theme on the other.
+/// for: a dark theme saved on a light OS takes both sides. The name alone
+/// (what the Save click knew) would have changed only the shown side,
+/// leaving the old theme on the other.
 #[test]
 fn save_as_over_a_one_theme_pair_selects_by_keeps_rule() {
     let (mut service, mut runtime, instance, view) =
@@ -1884,7 +1949,7 @@ fn save_as_over_a_one_theme_pair_selects_by_keeps_rule() {
     let unknown = crate::app_config::ThemeCatalog::empty();
     assert_eq!(
         prefs::theme_choice_value(raw, aterm_types::Appearance::Light, &id, &unknown).0,
-        Some(format!("dark:Hearth,light:{id}"))
+        format!("dark:Hearth,light:{id}")
     );
 }
 
@@ -1930,10 +1995,10 @@ fn the_stage_names_the_theme_it_draws() {
     assert_ne!(second.id, configured, "the control: the badge moved");
 }
 
-/// With `theme` unset the stage's badge names the state as the theme row
-/// does, Follow system, and the side it draws; a card the stage draws reads
-/// as a sample, never as the theme in use. After a Revert the caption still
-/// names the focused card as a sample only, not a preview of the window.
+/// With `theme` unset the stage's badge names Default, the theme it draws,
+/// as the theme row does; a card the stage draws reads as a sample, never
+/// as the theme in use. After a Revert the caption still names the focused
+/// card as a sample only, not a preview of the window.
 #[test]
 fn the_stage_names_an_unset_theme_and_samples_apart() {
     let (_service, mut runtime, instance, view) = themes_view("");
@@ -1952,7 +2017,8 @@ fn the_stage_names_an_unset_theme_and_samples_apart() {
     };
     let idle = stage_spec(&compile_settings_view(&runtime, instance, view, &cx)).unwrap();
     let drawn = state(&runtime, view).showcase_stage_theme_id().unwrap();
-    assert_eq!(idle.focused_value, prefs::unset_theme_label(&drawn));
+    assert_eq!(drawn, "Default");
+    assert_eq!(idle.focused_value, drawn);
     assert!(!idle.theme_sample);
     // The spoken value agrees with the badge and names no sample.
     let spoken = idle.semantic_value();
@@ -2555,4 +2621,744 @@ fn a_small_gallery_keeps_a_whole_card_reachable_after_revert() {
         1,
         "after Revert feedback",
     );
+}
+
+fn ids_under(showcase: &mut ShowcaseState, chip: ShowcaseChip) -> BTreeSet<String> {
+    showcase.chip = chip;
+    showcase
+        .visible()
+        .into_iter()
+        .map(|index| showcase.cards[index].id.clone())
+        .collect()
+}
+
+/// Get More lists exactly the pack themes the folder has no file for, as
+/// pack cards, and no other chip lists a pack card. Negative control: once
+/// the folder holds "Kanagawa Wave" its pack card goes (its own card is
+/// under Yours).
+#[test]
+fn get_more_lists_only_the_pack_themes_the_folder_lacks() {
+    let pack: BTreeSet<String> = aterm_theme_pack::themes()
+        .iter()
+        .map(|theme| theme.id.to_string())
+        .collect();
+    let mut bare = ShowcaseState::new(&crate::app_config::ThemeCatalog::from_schemes([]));
+    assert_eq!(ids_under(&mut bare, ShowcaseChip::More), pack);
+    for chip in [ShowcaseChip::All, ShowcaseChip::Dark, ShowcaseChip::Light] {
+        bare.chip = chip;
+        assert!(
+            bare.visible()
+                .into_iter()
+                .all(|index| bare.cards[index].tier != ShowcaseTier::Pack),
+            "{chip:?}"
+        );
+    }
+    bare.chip = ShowcaseChip::More;
+    assert!(
+        bare.visible()
+            .into_iter()
+            .all(|index| bare.cards[index].tier == ShowcaseTier::Pack)
+    );
+
+    let themes = crate::app_config::ThemeCatalog::from_schemes([user_scheme(
+        "Kanagawa Wave",
+        aterm_types::Appearance::Dark,
+    )]);
+    let mut installed = ShowcaseState::new(&themes);
+    let more = ids_under(&mut installed, ShowcaseChip::More);
+    assert!(!more.contains("Kanagawa Wave"));
+    assert_eq!(more.len(), pack.len() - 1);
+    assert!(ids_under(&mut installed, ShowcaseChip::Yours).contains("Kanagawa Wave"));
+    assert_eq!(
+        installed
+            .cards
+            .iter()
+            .filter(|card| card.id == "Kanagawa Wave")
+            .count(),
+        1
+    );
+}
+
+/// The one AddPack request a pack card's press sends, if it sent one.
+fn add_pack_request(outcome: &crate::native_app::DispatchOutcome) -> Vec<(String, OperationId)> {
+    outcome
+        .effects
+        .iter()
+        .filter_map(|effect| match effect {
+            AppEffect::Themes {
+                request: ThemesRequest::AddPack { id },
+                reply,
+            } => Some((id.clone(), reply.operation)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A pack card's press asks the host to add the theme and writes no
+/// config; once the add reports and the catalog lists the file, the theme
+/// is tried with the keyboard on Keep, and aterm.toml is untouched.
+#[test]
+fn a_pack_card_adds_its_theme_then_tries_it() {
+    let (mut service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
+    let before = service.snapshot().text.to_string();
+    let _ = act(
+        &mut runtime,
+        instance,
+        view,
+        "settings/showcase/chip/more",
+        None,
+    );
+    let _ = act(
+        &mut runtime,
+        instance,
+        view,
+        "settings/showcase/filter",
+        Some("Iceberg"),
+    );
+    let card = card_action(&runtime, view, "Iceberg Light");
+    // To the eye, the card says a press adds it.
+    let cx = view_cx_at(1_200.0, 900.0);
+    let kicker = |runtime: &NativeRuntime, card: &str| {
+        compile_settings_view(runtime, instance, view, &cx)
+            .paint
+            .iter()
+            .find_map(|node| match &node.content {
+                UiContent::Text(text) if node.key.as_str() == format!("{card}/kicker") => {
+                    Some(text.text.clone())
+                }
+                _ => None,
+            })
+    };
+    assert_eq!(kicker(&runtime, &card).as_deref(), Some("+ ADD"));
+    let pressed = act(&mut runtime, instance, view, &card, None);
+    let requests = add_pack_request(&pressed);
+    assert_eq!(requests.len(), 1, "{:?}", pressed.effects);
+    assert_eq!(requests[0].0, "Iceberg Light");
+    assert!(config_patches(&pressed).is_empty());
+    assert_eq!(state(&runtime, view).theme_trial_intent(), None);
+
+    let finished = runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::ThemesFinished {
+                operation: requests[0].1,
+                outcome: ThemesOutcome::Added {
+                    id: "Iceberg Light".to_string(),
+                },
+            },
+        )
+        .unwrap();
+    assert!(config_patches(&finished).is_empty());
+    assert_eq!(
+        state(&runtime, view).theme_trial_intent(),
+        None,
+        "not tried before the catalog lists it"
+    );
+    let text = aterm_theme_pack::find("Iceberg Light").unwrap().text;
+    let scheme = aterm_types::scheme::parse_theme_str(text).unwrap().scheme;
+    let listed = publish_saved_catalog(
+        &mut service,
+        &mut runtime,
+        instance,
+        view,
+        "Iceberg Light",
+        scheme,
+    );
+    assert!(config_patches(&listed).is_empty());
+    assert_eq!(
+        state(&runtime, view).theme_trial_intent(),
+        Some(crate::control_theme::ThemeTrialIntent::Show(
+            "Iceberg Light".to_string()
+        ))
+    );
+    assert_eq!(
+        state(&runtime, view).common.last_focus,
+        Some(UiKey::new("settings/showcase/keep"))
+    );
+    assert_eq!(service.snapshot().text.to_string(), before);
+    // Get More no longer lists it: the page shows it among Yours, drawn as
+    // the theme being tried.
+    assert_eq!(state(&runtime, view).showcase.chip, ShowcaseChip::Yours);
+    let added = card_action(&runtime, view, "Iceberg Light");
+    assert!(
+        compile_settings_view(&runtime, instance, view, &cx)
+            .semantic(&UiKey::new(added.as_str()))
+            .is_some(),
+        "the tried card is on the page"
+    );
+    assert_eq!(kicker(&runtime, &added).as_deref(), Some("TRYING"));
+}
+
+/// An add that fails lets the try go: a later catalog that lists the
+/// theme does not try it.
+#[test]
+fn a_failed_pack_add_tries_nothing() {
+    let (mut service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
+    let _ = act(
+        &mut runtime,
+        instance,
+        view,
+        "settings/showcase/chip/more",
+        None,
+    );
+    let card = card_action(&runtime, view, "Iceberg Light");
+    let pressed = act(&mut runtime, instance, view, &card, None);
+    let operation = add_pack_request(&pressed)[0].1;
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::ThemesFinished {
+                operation,
+                outcome: ThemesOutcome::Failed {
+                    message: "a theme named \"Iceberg Light\" is already in the themes folder"
+                        .to_string(),
+                },
+            },
+        )
+        .unwrap();
+    assert!(state(&runtime, view).showcase.pending_try.is_none());
+    let text = aterm_theme_pack::find("Iceberg Light").unwrap().text;
+    let scheme = aterm_types::scheme::parse_theme_str(text).unwrap().scheme;
+    let _ = publish_saved_catalog(
+        &mut service,
+        &mut runtime,
+        instance,
+        view,
+        "Iceberg Light",
+        scheme,
+    );
+    assert_eq!(state(&runtime, view).theme_trial_intent(), None);
+    assert_eq!(state(&runtime, view).showcase.trial, ShowcaseTrial::Idle);
+}
+
+/// A pack theme aterm.toml already names (its file was missing) is drawn
+/// once added, not tried: there is nothing to Keep. Negative control: the
+/// same add with another theme configured is tried
+/// (`a_pack_card_adds_its_theme_then_tries_it`).
+#[test]
+fn adding_the_configured_pack_theme_does_not_try_it() {
+    let (mut service, mut runtime, instance, view) = themes_view("theme = \"Iceberg Light\"\n");
+    let _ = act(
+        &mut runtime,
+        instance,
+        view,
+        "settings/showcase/chip/more",
+        None,
+    );
+    let card = card_action(&runtime, view, "Iceberg Light");
+    let pressed = act(&mut runtime, instance, view, &card, None);
+    let operation = add_pack_request(&pressed)[0].1;
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::ThemesFinished {
+                operation,
+                outcome: ThemesOutcome::Added {
+                    id: "Iceberg Light".to_string(),
+                },
+            },
+        )
+        .unwrap();
+    let text = aterm_theme_pack::find("Iceberg Light").unwrap().text;
+    let scheme = aterm_types::scheme::parse_theme_str(text).unwrap().scheme;
+    let listed = publish_saved_catalog(
+        &mut service,
+        &mut runtime,
+        instance,
+        view,
+        "Iceberg Light",
+        scheme,
+    );
+    assert!(config_patches(&listed).is_empty());
+    assert_eq!(state(&runtime, view).theme_trial_intent(), None);
+    assert!(state(&runtime, view).showcase.pending_try.is_none());
+}
+
+/// Get More sits among the toolbar's chips where the row has room for a
+/// fifth, and only in the footer where it does not (the four filter chips
+/// keep their row, so a small window still opens on a card). The footer's
+/// button shows the same filter.
+#[test]
+fn get_more_joins_the_toolbar_only_where_it_fits() {
+    let (_service, mut runtime, instance, view) = themes_view("");
+    let more = UiKey::new("settings/showcase/chip/more");
+    let wide = compile_settings_view(&runtime, instance, view, &view_cx_at(724.0, 434.0));
+    assert!(wide.semantic(&more).is_some(), "a wide row seats Get More");
+    let narrow = compile_settings_view(&runtime, instance, view, &view_cx_at(584.0, 350.0));
+    assert!(
+        narrow.semantic(&more).is_none(),
+        "a narrow row keeps four chips"
+    );
+    assert!(
+        narrow
+            .semantic(&UiKey::new("settings/showcase/chip/yours"))
+            .is_some()
+    );
+    let _ = act(
+        &mut runtime,
+        instance,
+        view,
+        "settings/showcase/footer/get-more",
+        None,
+    );
+    assert_eq!(state(&runtime, view).showcase.chip, ShowcaseChip::More);
+}
+
+/// A catalog of one typography theme `Studio` (and the built-ins).
+fn studio_catalog(extra: &str) -> std::sync::Arc<crate::app_config::ThemeCatalog> {
+    let text = format!("foreground = #e0e0e0\nbackground = #101418\n{extra}");
+    let parsed = aterm_types::scheme::parse_theme_str(&text).expect("a theme");
+    crate::app_config::ThemeCatalog::from_parsed([("Studio".to_string(), parsed)])
+}
+
+const STUDIO_TYPE: &str = "font_family = Berkeley Mono\nline_height = 1.15\nfont_weight = 450\n";
+
+/// The Themes page over `source` with `themes` admitted.
+fn typography_view(
+    source: &str,
+    themes: std::sync::Arc<crate::app_config::ThemeCatalog>,
+) -> (
+    VersionedConfigService,
+    NativeRuntime,
+    crate::native_app::AppInstanceId,
+    crate::native_app::ViewId,
+) {
+    let mut service = VersionedConfigService::new(source.to_string()).expect("valid fixture");
+    let snapshot = service.replace_theme_catalog(themes);
+    let (mut runtime, instance, view) = setup();
+    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        unreachable!()
+    };
+    **state = SettingsViewState::from_snapshot(&snapshot).expect("snapshot");
+    state.navigate(SettingsRoute::Themes);
+    (service, runtime, instance, view)
+}
+
+/// The stage's badge names a themes-folder theme by its `name =`, as its
+/// card does, never by its file id. Negative control: a built-in's id is its
+/// name (`the_stage_names_an_unset_theme_and_samples_apart`).
+#[test]
+fn the_stage_names_a_folder_theme_by_its_name() {
+    let parsed = aterm_types::scheme::parse_theme_str(
+        "name = Harbour Chrome\nforeground = #d8dee9\nbackground = #101820\n",
+    )
+    .expect("a theme");
+    let themes =
+        crate::app_config::ThemeCatalog::from_parsed([("harbour-chrome".to_string(), parsed)]);
+    let (_service, runtime, instance, view) =
+        typography_view("theme = \"harbour-chrome\"\n", themes);
+    let cx = view_cx_at(1_200.0, 900.0);
+    let spec = stage_spec(&compile_settings_view(&runtime, instance, view, &cx)).unwrap();
+    assert_eq!(spec.focused_value, "Harbour Chrome");
+    let spoken = spec.semantic_value();
+    assert!(
+        spoken.starts_with("Color theme: Harbour Chrome, "),
+        "{spoken}"
+    );
+}
+
+/// A typography card says what it sets, to the eye (a meta line) and in
+/// its accessible label, and the filter finds it by its font or by "font".
+/// Negative control: a colours-only card sets nothing and says none of it.
+#[test]
+fn a_typography_card_says_what_type_it_sets() {
+    let cards = crate::settings_preview::theme_card::showcase_cards(&studio_catalog(STUDIO_TYPE));
+    let studio = cards
+        .iter()
+        .find(|card| card.id == "Studio")
+        .expect("Studio");
+    assert_eq!(studio.type_keys, 3);
+    assert!(studio.typography.is_some() && studio.typography_spoken.is_some());
+    assert!(studio.matches("berkeley") && studio.matches("font"));
+    let plain = crate::settings_preview::theme_card::showcase_cards(&studio_catalog(""));
+    let plain = plain
+        .iter()
+        .find(|card| card.id == "Studio")
+        .expect("Studio");
+    assert_eq!(plain.type_keys, 0);
+    assert!(plain.typography.is_none() && plain.typography_spoken.is_none());
+    assert!(!plain.matches("berkeley"));
+    assert!(!plain.accessible_label().is_empty());
+    assert_ne!(studio.accessible_label(), plain.accessible_label());
+    assert_ne!(studio.tile_value(false), plain.tile_value(false));
+}
+
+/// The control at `key` in `compiled`, enabled or not.
+fn enabled(compiled: &crate::native_ui::CompiledUi, key: &str) -> Option<bool> {
+    compiled
+        .semantic(&UiKey::new(key))
+        .map(|node| node.state.is_none_or(|state| state.enabled))
+}
+
+/// Trying a typography theme draws its colours only and lists, by key, what
+/// its type settings would change: each side in one vocabulary (a switch
+/// reads on/off on both). Keep colours only writes ONE patch: the theme and
+/// each changed setting pinned at its current value. Negative control: a
+/// colours-only theme lists nothing and offers no second Keep.
+#[test]
+fn trying_a_typography_theme_offers_keep_colours_only() {
+    let studio_type = "font_family = Berkeley Mono\nline_height = 1.15\nligatures = false\n";
+    let (_service, mut runtime, instance, view) =
+        typography_view("theme = \"Dracula\"\n", studio_catalog(studio_type));
+    let cx = view_cx_at(1_200.0, 900.0);
+    let studio = card_action(&runtime, view, "Studio");
+    let _ = act(&mut runtime, instance, view, &studio, None);
+    let trial = state(&runtime, view).trial_typography("Studio");
+    let changes: Vec<(&str, &str, &str)> = trial
+        .changes
+        .iter()
+        .map(|change| (change.key, change.theme.as_str(), change.current.as_str()))
+        .collect();
+    assert_eq!(
+        changes,
+        vec![
+            (prefs::EDIT_FONT_FAMILY, "Berkeley Mono", "aterm's own face"),
+            (prefs::EDIT_LINE_HEIGHT, "1.15", "1.0"),
+            (prefs::EDIT_LIGATURES, "off", "on"),
+        ]
+    );
+    assert!(trial.keeps_colours_only());
+    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+    assert!(
+        compiled
+            .semantic(&UiKey::new("settings/top/showcase-typography"))
+            .is_some()
+    );
+    assert_eq!(enabled(&compiled, SHOWCASE_KEEP_COLOURS_KEY), Some(true));
+
+    let kept = act(
+        &mut runtime,
+        instance,
+        view,
+        SHOWCASE_KEEP_COLOURS_KEY,
+        None,
+    );
+    let patches = config_patches(&kept);
+    assert_eq!(patches.len(), 1, "one write");
+    let edits: BTreeMap<String, Option<String>> = patches[0]
+        .0
+        .edits
+        .iter()
+        .map(|edit| (edit.key.clone(), edit.value.clone()))
+        .collect();
+    assert_eq!(
+        edits,
+        BTreeMap::from([
+            (prefs::EDIT_THEME.to_string(), Some("Studio".to_string())),
+            (prefs::EDIT_FONT_FAMILY.to_string(), Some(String::new())),
+            (prefs::EDIT_LINE_HEIGHT.to_string(), Some("1.0".to_string())),
+            (prefs::EDIT_LIGATURES.to_string(), Some("true".to_string())),
+        ]),
+    );
+    // The pins really keep the face: the config they make resolves to no
+    // theme typography at all.
+    let pinned: Config = aterm_toml::from_str(
+        "theme = \"Studio\"\nfont_family = \"\"\nline_height = 1.0\nligatures = true\n",
+    )
+    .expect("toml");
+    let typo = pinned.resolved_typography_with_flag(
+        aterm_types::Appearance::Dark,
+        &studio_catalog(studio_type),
+        None,
+    );
+    assert!(typo.applied.keys().is_empty(), "{:?}", typo.applied.keys());
+
+    // Negative control.
+    let (_service, mut runtime, instance, view) =
+        typography_view("theme = \"Dracula\"\n", studio_catalog(""));
+    let studio = card_action(&runtime, view, "Studio");
+    let _ = act(&mut runtime, instance, view, &studio, None);
+    assert!(
+        state(&runtime, view)
+            .trial_typography("Studio")
+            .changes
+            .is_empty()
+    );
+    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+    assert!(
+        compiled
+            .semantic(&UiKey::new("settings/top/showcase-typography"))
+            .is_none()
+    );
+    assert_eq!(enabled(&compiled, SHOWCASE_KEEP_COLOURS_KEY), None);
+}
+
+/// A theme that sets `font_weight` cannot be kept as colours only: no
+/// aterm.toml value keeps the font's own weight. The button is drawn
+/// disabled, and pressing it anyway (the palette) writes nothing. Negative
+/// control: the same theme without the weight is offered.
+#[test]
+fn keep_colours_only_is_withheld_when_a_change_cannot_be_pinned() {
+    let (_service, mut runtime, instance, view) =
+        typography_view("theme = \"Dracula\"\n", studio_catalog(STUDIO_TYPE));
+    let cx = view_cx_at(1_200.0, 900.0);
+    let studio = card_action(&runtime, view, "Studio");
+    let _ = act(&mut runtime, instance, view, &studio, None);
+    let trial = state(&runtime, view).trial_typography("Studio");
+    assert!(
+        trial
+            .changes
+            .iter()
+            .any(|change| change.key == prefs::EDIT_FONT_WEIGHT && change.pin.is_none())
+    );
+    assert!(!trial.keeps_colours_only());
+    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+    assert_eq!(enabled(&compiled, SHOWCASE_KEEP_COLOURS_KEY), Some(false));
+    let pressed = act(
+        &mut runtime,
+        instance,
+        view,
+        SHOWCASE_KEEP_COLOURS_KEY,
+        None,
+    );
+    assert!(config_patches(&pressed).is_empty(), "nothing is written");
+    assert!(matches!(
+        state(&runtime, view).showcase.trial,
+        ShowcaseTrial::Trying { .. }
+    ));
+
+    let (_service, mut runtime, instance, view) = typography_view(
+        "theme = \"Dracula\"\n",
+        studio_catalog("font_family = Berkeley Mono\n"),
+    );
+    let studio = card_action(&runtime, view, "Studio");
+    let _ = act(&mut runtime, instance, view, &studio, None);
+    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+    assert_eq!(enabled(&compiled, SHOWCASE_KEEP_COLOURS_KEY), Some(true));
+}
+
+/// A theme setting your `display_font` beats is listed as kept by
+/// `display_font`, with its value. Negative control: with `font_family`
+/// set, `font_family` is what keeps it.
+#[test]
+fn a_kept_type_setting_names_what_wins() {
+    for (config, by, value) in [
+        ("display_font = \"pixel\"\n", "display_font", "pixel"),
+        ("font_family = \"Menlo\"\n", "font_family", "Menlo"),
+    ] {
+        let (_service, mut runtime, instance, view) = typography_view(
+            &format!("theme = \"Dracula\"\n{config}"),
+            studio_catalog("font_family = Berkeley Mono\nline_height = 1.15\n"),
+        );
+        let studio = card_action(&runtime, view, "Studio");
+        let _ = act(&mut runtime, instance, view, &studio, None);
+        let trial = state(&runtime, view).trial_typography("Studio");
+        let kept: Vec<(&str, &str, &str)> = trial
+            .kept
+            .iter()
+            .map(|kept| (kept.key, kept.by, kept.value.as_str()))
+            .collect();
+        assert_eq!(kept, vec![(prefs::EDIT_FONT_FAMILY, by, value)], "{config}");
+    }
+}
+
+const SHOWCASE_KEEP_COLOURS_KEY: &str = "settings/showcase/keep-colours";
+
+/// A font row the config leaves unset reads the theme's value "(from theme
+/// X)", its picker's reset reads "Use theme's (…)", and a row the config sets
+/// says it overrides the theme while its Reset returns to the theme's.
+#[test]
+fn font_rows_name_the_themes_values() {
+    let (_service, runtime, _instance, view) = typography_view(
+        "theme = \"Studio\"\nline_height = 1.4\n",
+        studio_catalog(STUDIO_TYPE),
+    );
+    let view_state = state(&runtime, view);
+    let family = view_state
+        .field_by_key(prefs::EDIT_FONT_FAMILY)
+        .expect("family row");
+    assert_eq!(family.placeholder, "Berkeley Mono (from theme Studio)");
+    let picker = font_choice_picker(view_state, prefs::EDIT_FONT_FAMILY);
+    assert_eq!(picker.options[0].label, "Use theme's (Berkeley Mono)");
+    let line = view_state
+        .field_by_key(prefs::EDIT_LINE_HEIGHT)
+        .expect("line height row");
+    assert_eq!(line.seed.as_deref(), Some("1.4"), "the config wins");
+    assert_eq!(
+        view_state.theme_fallback_for(prefs::EDIT_LINE_HEIGHT),
+        Some(("1.15".to_string(), "Studio".to_string()))
+    );
+    // Negative control: without the theme the row is aterm's default.
+    let (_service, runtime, _instance, view) =
+        typography_view("line_height = 1.4\n", studio_catalog(STUDIO_TYPE));
+    let view_state = state(&runtime, view);
+    assert_eq!(view_state.theme_fallback_for(prefs::EDIT_LINE_HEIGHT), None);
+    assert_eq!(
+        view_state
+            .field_by_key(prefs::EDIT_FONT_FAMILY)
+            .expect("family row")
+            .placeholder,
+        "Automatic"
+    );
+}
+
+/// Save as theme with "Include type settings" writes the type the page shows
+/// and reads it back whole, and carries those keys; without it the file
+/// carries none.
+#[test]
+fn save_as_theme_includes_type_settings_on_request() {
+    let resolved = Config::default().resolved_colors(
+        aterm_types::Appearance::Dark,
+        &crate::app_config::ThemeCatalog::empty(),
+        None,
+    );
+    let typography = aterm_types::scheme::parse_theme_str(
+        "fg = #ffffff\nbg = #000000\nfont_family = Berkeley Mono\nline_height = 1.15\n",
+    )
+    .expect("theme")
+    .typography;
+    let text = save_as_text(&resolved, "Mine", "Default", &typography).expect("saves");
+    let parsed = aterm_types::scheme::parse_theme_str(&text).expect("reads back");
+    assert_eq!(parsed.typography, typography);
+    assert!(
+        carried_override_keys(&resolved, &typography)
+            .iter()
+            .any(|key| key == prefs::EDIT_LINE_HEIGHT)
+    );
+    let plain = save_as_text(
+        &resolved,
+        "Mine",
+        "Default",
+        &aterm_types::scheme::ThemeTypography::NONE,
+    )
+    .expect("saves");
+    assert!(
+        aterm_types::scheme::parse_theme_str(&plain)
+            .expect("reads back")
+            .typography
+            .is_empty()
+    );
+}
+
+/// Five type keys: a tall typography delta.
+const STUDIO_FIVE: &str = "font_family = Menlo\nline_height = 1.2\nligatures = false\n\
+                           font_weight = 500\nfont_size_scale = 1.1\n";
+
+/// While a typed theme is tried on a Wide page, the trial bar and toolbar
+/// are laid out for the width they are drawn in: pinned over the page, or
+/// moved into the gallery column beside the stage on a short window. The
+/// filter in force stays on screen and no chip is cut off; and at an
+/// ordinary window the bar's Keep, Keep colours only and Revert stay in
+/// view with the delta (its lines are text lines, not control rows).
+#[test]
+fn a_typed_trial_keeps_the_bar_and_toolbar_whole_on_a_wide_page() {
+    let (_service, mut runtime, instance, view) =
+        typography_view("theme = \"Dracula\"\n", studio_catalog(STUDIO_FIVE));
+    let _ = act(
+        &mut runtime,
+        instance,
+        view,
+        "settings/showcase/filter",
+        Some("Studio"),
+    );
+    let studio = card_action(&runtime, view, "Studio");
+    let _ = act(&mut runtime, instance, view, &studio, None);
+    for (width, height) in [(1_074.0, 658.0), (1_074.0, 560.0), (1_120.0, 380.0)] {
+        assert_eq!(SettingsWidth::for_viewport(width), SettingsWidth::Wide);
+        let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(width, height));
+        let at = format!("{width}x{height}");
+        assert!(
+            compiled
+                .semantic(&UiKey::new("settings/showcase/filter"))
+                .is_some(),
+            "{at}: the active filter is on screen"
+        );
+        let failures = compiled.fit_failures();
+        assert!(failures.is_empty(), "{at}: {failures:#?}");
+    }
+    let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_074.0, 658.0));
+    for key in [
+        "settings/showcase/keep",
+        SHOWCASE_KEEP_COLOURS_KEY,
+        "settings/showcase/revert",
+    ] {
+        assert!(compiled.semantic(&UiKey::new(key)).is_some(), "{key}");
+    }
+}
+
+/// Save as theme draws the type switch's own words beside it (the Setting
+/// switch paints only On/Off), and the note under the row says what the
+/// save writes: with the switch on, the type settings too.
+#[test]
+fn save_as_theme_labels_its_type_switch() {
+    let (_service, mut runtime, instance, view) = themes_view("");
+    let _ = act(
+        &mut runtime,
+        instance,
+        view,
+        "settings/showcase/save-as",
+        None,
+    );
+    let cx = view_cx_at(1_200.0, 900.0);
+    let painted = |runtime: &NativeRuntime, key: &str| {
+        compile_settings_view(runtime, instance, view, &cx)
+            .paint
+            .iter()
+            .find_map(|node| match &node.content {
+                UiContent::Text(text) if node.key.as_str() == key => Some(text.text.clone()),
+                _ => None,
+            })
+    };
+    assert_eq!(
+        painted(&runtime, "settings/showcase/save-type-label").as_deref(),
+        Some("Include type settings")
+    );
+    let off = painted(&runtime, "settings/showcase/save-note").expect("a note");
+    let _ = act(
+        &mut runtime,
+        instance,
+        view,
+        "settings/showcase/save-type",
+        None,
+    );
+    assert!(
+        state(&runtime, view)
+            .showcase
+            .save
+            .as_ref()
+            .is_some_and(|save| save.include_type)
+    );
+    let on = painted(&runtime, "settings/showcase/save-note").expect("a note");
+    assert_ne!(on, off, "the note follows the switch");
+}
+
+/// Every chip's and Get More's accessible name starts with the words it
+/// shows (WCAG 2.5.3), as do the trial bar's Keep theme and Keep colours
+/// only.
+#[test]
+fn showcase_buttons_are_named_by_their_visible_words() {
+    let (_service, mut runtime, instance, view) = typography_view(
+        "theme = \"Dracula\"\n",
+        studio_catalog("font_family = Menlo\n"),
+    );
+    let studio = card_action(&runtime, view, "Studio");
+    let _ = act(&mut runtime, instance, view, &studio, None);
+    let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_200.0, 900.0));
+    let mut checked = 0;
+    for (key, visible) in [
+        ("settings/showcase/chip/all", "All"),
+        ("settings/showcase/chip/dark", "Dark"),
+        ("settings/showcase/chip/light", "Light"),
+        ("settings/showcase/chip/yours", "Yours"),
+        ("settings/showcase/chip/more", "Get More"),
+        ("settings/showcase/footer/get-more", "Get More"),
+        ("settings/showcase/keep", "Keep theme"),
+        (SHOWCASE_KEEP_COLOURS_KEY, "Keep colours only"),
+    ] {
+        let Some(node) = compiled.semantic(&UiKey::new(key)) else {
+            continue;
+        };
+        checked += 1;
+        assert!(
+            node.label
+                .to_lowercase()
+                .starts_with(&visible.to_lowercase()),
+            "{key}: {:?}",
+            node.label
+        );
+    }
+    assert!(checked >= 6, "the controls are on the page");
 }

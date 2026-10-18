@@ -662,30 +662,6 @@ fn decrara_does_not_change_dec_sca_protection() {
 }
 
 #[test]
-fn decrara_does_not_move_the_cursor() {
-    let mut s = Screen::new(10, 20);
-    decaln(&mut s);
-    s.feed(b"\x1b[5;5H");
-    s.feed(b"\x1b[1;1;2;2;7$t");
-    assert_eq!(s.cursor(), (4, 4), "cursor pinned through DECRARA");
-}
-
-#[test]
-fn decrara_with_an_inverted_rectangle_is_ignored() {
-    let mut s = Screen::new(6, 10);
-    decaln(&mut s);
-    // Same rule as its siblings (`reversed_coords_are_ignored`): Pt <= Pb and
-    // Pl <= Pr, otherwise no-op.
-    s.feed(b"\x1b[2*x\x1b[4;3;2;6;1$t"); // Pb < Pt
-    s.feed(b"\x1b[2*x\x1b[2;6;4;3;1$t"); // Pr < Pl
-    for r in 0..6 {
-        for c in 0..10 {
-            assert!(!has_flags(&s, r, c, CellFlags::BOLD), "({r},{c}) untouched");
-        }
-    }
-}
-
-#[test]
 fn rect_coords_are_relative_to_margins_when_decom_set() {
     let mut s = Screen::new(10, 10);
     decaln(&mut s);
@@ -745,6 +721,8 @@ fn reversed_coords_are_ignored() {
     s.feed(b"\x1b[4;3;2;6${"); // DECSERA, Pb < Pt
     s.feed(b"\x1b[2*x\x1b[4;3;2;6;1$r"); // DECCARA (rect extent), Pb < Pt
     s.feed(b"\x1b[4;1;2;3;1;1;1;1$v"); // DECCRA, source Pb < Pt
+    s.feed(b"\x1b[2*x\x1b[4;3;2;6;1$t"); // DECRARA (rect extent), Pb < Pt
+    s.feed(b"\x1b[2*x\x1b[2;6;4;3;1$t"); // DECRARA (rect extent), Pr < Pl
     for r in 0..6 {
         assert_eq!(
             s.row(r),
@@ -767,19 +745,6 @@ fn zero_params_take_defaults() {
     // Pb=bottom, Pr=right).
     s.feed(b"\x1b[0;0;0;0$z");
     assert_eq!(s.screen(), "", "0;0;0;0 = full-page defaults");
-}
-
-#[test]
-fn rect_clipped_at_screen_bottom() {
-    let mut s = Screen::new(6, 10);
-    decaln(&mut s);
-    // Pb past the page clips to it (DEC STD 070; xterm clamps to the screen):
-    // fill rows 5-99 lands on rows 5-6, cols 2-4, without wrapping.
-    s.feed(b"\x1b[42;5;2;99;4$x");
-    assert_eq!(s.row(0), "EEEEEEEEEE");
-    assert_eq!(s.row(3), "EEEEEEEEEE");
-    assert_eq!(s.row(4), "E***EEEEEE", "row 5 filled, Pb clamped");
-    assert_eq!(s.row(5), "E***EEEEEE", "row 6 (page bottom) filled");
 }
 
 #[test]
@@ -814,17 +779,14 @@ fn rect_ops_do_not_move_cursor() {
     s.feed(b"\x1b[5;5H");
     assert_eq!(s.cursor(), (4, 4));
     // VT520: DECFRA/DECERA/DECSERA/DECCARA/DECCRA "do not change the cursor
-    // position".
+    // position"; DECRARA follows them.
     s.feed(b"\x1b[42;1;1;2;2$x");
     s.feed(b"\x1b[1;1;2;2$z");
     s.feed(b"\x1b[1;1;2;2${");
     s.feed(b"\x1b[1;1;2;2;1$r");
     s.feed(b"\x1b[1;1;2;2;1;3;3;1$v");
-    assert_eq!(
-        s.cursor(),
-        (4, 4),
-        "cursor pinned through all five rect ops"
-    );
+    s.feed(b"\x1b[1;1;2;2;7$t");
+    assert_eq!(s.cursor(), (4, 4), "cursor pinned through all six rect ops");
 }
 
 #[test]

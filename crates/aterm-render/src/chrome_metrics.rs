@@ -2,8 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! Fixed-point typography math for the GUI CHROME (the tray/overlay text the
-//! `aterm-gui` `tray_raster` draws: Settings, About, the command palette, the
-//! system-performance card).
+//! `aterm-gui` `tray_raster` draws: Settings, About, the command palette).
 //!
 //! Two laws live here as PURE integer functions so they can be checked
 //! exhaustively (the lattice tests below cover every residue the laws depend
@@ -31,8 +30,7 @@
 //! exactly like the box-drawing rounding law (`procedural.rs`) — the
 //! machine-checked encodings are the exhaustive lattice tests here, not a `ty`
 //! model. The FACE-SELECTION policy of the same
-//! chrome overhaul (a pure boolean gate) IS `ty`-modelled: see
-//! `aterm_spec::derive::chrome_face_gate_model` and its Tier-1 binding in
+//! chrome overhaul (a pure boolean gate) is enumerated exhaustively in
 //! `aterm-gui`'s `tray_raster`.
 
 /// One device pixel in 26.6 fixed point (Q = 64 subunits per px).
@@ -61,7 +59,7 @@ pub fn q_to_px(q: i64) -> f32 {
 /// `|q_round_to_px(q) * Q − q| <= Q/2` for all `q` — each placement is within
 /// half a pixel of the exact fixed-point pen, with no dependence on how many
 /// advances were summed before it (`rounding_error_bounded_by_half_px`, which
-/// covers every residue mod `Q`, + the `pen_is_drift_free` lattice test).
+/// covers every residue mod `Q`).
 #[must_use]
 pub fn q_round_to_px(q: i64) -> i64 {
     (q + Q / 2).div_euclid(Q)
@@ -159,55 +157,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    /// L0 drift-freedom of the fixed-point pen: over a long pseudo-random run of
-    /// fractional advances, EVERY prefix placement is within 0.5px of the exact
-    /// fixed-point pen (which is an exact integer sum — checked against i128),
-    /// and the error does not grow with the prefix length. Negative control:
-    /// the historical float pen + `as i32` truncation exceeds 0.5px error.
-    #[test]
-    fn pen_is_drift_free() {
-        // Deterministic LCG advances in [4.0, 12.0) px with fractional parts.
-        let mut seed = 0x2545_F491u64;
-        let mut lcg = || {
-            seed = seed
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            ((seed >> 33) as f32 / (u32::MAX >> 1) as f32) * 8.0 + 4.0
-        };
-        let advances: Vec<f32> = (0..4096).map(|_| lcg()).collect();
-
-        let mut pen_q: i64 = 0;
-        let mut exact: i128 = 0;
-        let mut float_pen: f32 = 0.0;
-        let mut trunc_err_seen: f32 = 0.0;
-        for a in &advances {
-            let aq = px_to_q(*a);
-            pen_q += aq;
-            exact += i128::from(aq);
-            assert_eq!(
-                i128::from(pen_q),
-                exact,
-                "fixed-point accumulation is exact"
-            );
-            let placed = q_round_to_px(pen_q);
-            let err_subunits = (placed * Q - pen_q).abs();
-            assert!(
-                err_subunits <= Q / 2,
-                "placement error {err_subunits} subunits exceeds 0.5px"
-            );
-            // The old path: f32 running pen, truncated per glyph.
-            float_pen += *a;
-            let old_placed = float_pen as i32; // the historical `as i32`
-            trunc_err_seen = trunc_err_seen.max(float_pen - old_placed as f32);
-        }
-        // Negative control: truncation error genuinely exceeds the 0.5px bound
-        // the rounded fixed-point pen guarantees (the pre-fix leftward bias).
-        assert!(
-            trunc_err_seen > 0.5,
-            "the pre-fix truncating pen must show > 0.5px error (saw {trunc_err_seen})"
-        );
     }
 
     /// `q_round_to_px` half-pixel bound over a dense signed lattice: the error

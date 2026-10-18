@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 
 use aterm_effects::kitty_cursor::{CursorCat, MIN_RUN_KEYS};
 use aterm_effects::kitty_sing::{KittySing, SING_ARM_REPEATS, SING_REPEAT_GAP, SING_WIND_DOWN};
-use aterm_spec::derive::{Model, cursor_cat_earn_floor_model, kitty_sing_detector_model};
+use aterm_models_effects::{cursor_cat_earn_floor_model, kitty_sing_detector_model};
+use aterm_spec::derive::Model;
 use aterm_spec::{interp, verify};
 
 type State = BTreeMap<&'static str, i64>;

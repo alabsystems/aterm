@@ -9,8 +9,8 @@
 //! `&Terminal`, no rendering, no clock reads except through the thin `Instant`
 //! wrappers), so the M1 PROVE bullets are machine-checked over deliberate
 //! input lattices under plain `cargo test`, and the glide's wake discipline
-//! has an abstract ty twin (`aterm_spec::derive::scroll_glide_model`, checked
-//! by the real Trust `ty` in aterm-spec's `derived_ring_ty`). That same model
+//! has an abstract ty twin (`aterm_models_render::scroll_glide_model`, checked
+//! by the real Trust `ty` in aterm-models' `derived_ring_ty`). That same model
 //! includes the host's Full→Reduced settle transition: land at the intended
 //! target and disarm in one edge, with no Reduced-policy deadline retained.
 //!
@@ -221,8 +221,8 @@ impl Glide {
     /// idles until a row banks, then covers it; measured at 120 Hz with a 34
     /// px cell the per-frame velocity of the extending chain ran
     /// `0,0,5,4,3,9,…,27,12,4,34` at 4 rows/100 ms and `…,1,1,0,0,0,0,5,4,…`
-    /// at 1 row/100 ms (the `a_precise_stream_tracks_one_to_one…` control
-    /// below), which is the "blocky" scrolling reported on 2026-09-22.
+    /// at 1 row/100 ms, which is the "blocky" scrolling reported on
+    /// 2026-09-22.
     pub(crate) fn track(&mut self, delta_px: f64, cell_h: i64, max_px: i64, now: Instant) -> i64 {
         let (pos, _) = self.sample(now);
         let want = pos as f64 + self.carry_px + delta_px;
@@ -319,46 +319,6 @@ impl Glide {
         // 120 ms, and its positions are whole rows (no sub-pixel carry).
         self.dur = Duration::from_millis(GLIDE_MS);
         self.carry_px = 0.0;
-    }
-
-    /// RETIRED FROM PRODUCTION (2026-09-22) — kept under `cfg(test)` as the
-    /// NEGATIVE CONTROL of `a_precise_stream_tracks_one_to_one…`: this was the
-    /// 2026-09-06 chain for precise deltas, and over whole-row banked targets
-    /// its remaining duration shrinks toward zero at the deadline, so the ease
-    /// velocity (`3·Δ/dur` at `u = 0`) spikes and the last delta before the
-    /// deadline snaps a whole row in one frame — the sawtooth the control
-    /// measures. Precise deltas now [`Self::track`] with no ease.
-    ///
-    /// Move the target WITHOUT pushing the deadline out — the chained form for
-    /// a stream of precise (trackpad) deltas within one glide. The chosen form,
-    /// named as docs/DESIGN-selection-custody §5.6 asks: [`Self::end`] is kept
-    /// exactly; the ease is re-based from the CURRENT sample over the REMAINING
-    /// duration, so the position is continuous at the extension and the glide
-    /// still lands on the new target at the original end and disarms there.
-    ///
-    /// Why not [`Self::retarget`]: it sets `t0 = now`, so a 120 Hz stream of
-    /// deltas restarts the 180 ms ease every 8 ms; the ease never gets past its
-    /// first frame and the content settles ~6.9 intervals (~57 ms) behind the
-    /// finger at any constant speed, with a full 180 ms tail after the last
-    /// delta. Keeping the end bounded is what makes the ease PROGRESS. (Moving
-    /// `target_px` alone, with `t0`/`start_px` untouched, would jump the
-    /// position by `Δtarget · e(t)` at every extension — a visible step late in
-    /// the glide — which is why the re-base is from the sampled position.)
-    ///
-    /// The bounded-wakes / disarm-only-at-target invariants of the abstract
-    /// `scroll_glide_model` are untouched: the deadline is the ORIGINAL end, so
-    /// a chain of extensions arms no more wakes than the glide they extend.
-    #[cfg(test)]
-    pub(crate) fn extend_target(&mut self, target_px: i64, now: Instant) {
-        let end = self.end();
-        let (pos, _) = self.sample(now);
-        self.start_px = pos;
-        self.target_px = target_px;
-        self.t0 = now;
-        // Past the end (a delta landing on the very last frame) the remaining
-        // duration is zero and `sample` returns the target at once — the one
-        // bounded snap a fixed deadline implies; the next delta arms afresh.
-        self.dur = end.saturating_duration_since(now);
     }
 
     /// The glide's current target (absolute px), for chained retargeting.
@@ -616,7 +576,7 @@ mod tests {
     //! decomposition law, glide convergence, spring overshoot-freedom, and
     //! the pill laws — over the SHIPPING kinematics above. The glide's wake
     //! discipline also carries a Tier-0 abstract twin
-    //! (`aterm_spec::derive::scroll_glide_model`) checked by the real Trust
+    //! (`aterm_models_render::scroll_glide_model`) checked by the real Trust
     //! `ty` (proves at `Buggy=0`, counterexample at `Buggy=1`); these tests
     //! bind ordinary convergence to the code that ships, while app_input's
     //! `reduced_motion_settle_conforms_to_scroll_glide_model` binds the policy
@@ -635,8 +595,7 @@ mod tests {
     /// PROVE (1) — decomposition law: `rows*cell_h + frac == px` with
     /// `frac ∈ [0, cell_h)` for EVERY point of a signed px lattice × the
     /// cell-height lattice. Includes negative px (elastic overscroll) where
-    /// truncating division would violate the frac range — the negative
-    /// control below shows exactly that.
+    /// truncating division would violate the frac range.
     #[test]
     fn scroll_px_decomposition_law() {
         for &ch in &CELL_HEIGHTS {
@@ -755,15 +714,8 @@ mod tests {
     /// per 100 ms; after the last delta the band HOLDS for `TRACK_REST_MS` with
     /// one armed wake, then settles to the nearest whole row and is done at
     /// `end()`; `release` starts that settle at once.
-    ///
-    /// NEGATIVE CONTROL: the same streams through the law this replaces —
-    /// whole-row banking (`bank_scroll_lines` truncation) feeding
-    /// `extend_target` on an in-flight glide, else a fresh 180 ms glide, sampled
-    /// on the same frame ticks — produce zero-motion frames AND a frame faster
-    /// than twice the average at EVERY speed. The assertion has teeth against
-    /// the shipping 2026-09-06 code, not against a strawman.
     #[test]
-    fn a_precise_stream_tracks_one_to_one_and_the_extend_chain_it_replaces_stutters() {
+    fn a_precise_stream_tracks_one_to_one() {
         let t0 = Instant::now();
         let cell = 34i64; // Retina 2x, 15 px face
         let tick = Duration::from_micros(8_333); // 120 Hz
@@ -841,55 +793,6 @@ mod tests {
                 e.end(),
                 t0 + Duration::from_millis(GLIDE_MS),
                 "a notch glide ignores release"
-            );
-
-            // ---- CONTROL: the retired extend_target chain over whole rows -------
-            let mut now = t0;
-            let mut residual = 0.0f64;
-            let mut glide: Option<Glide> = None;
-            let mut landed = 0i64;
-            let mut pos = 0i64;
-            let mut prev = 0i64;
-            let mut vels: Vec<i64> = Vec::new();
-            for i in 1..=120u32 {
-                now += tick;
-                if let Some(g) = glide.as_ref() {
-                    let (p, done) = g.sample(now);
-                    pos = p;
-                    if done {
-                        landed = g.target_px();
-                        glide = None;
-                    }
-                }
-                // `bank_scroll_lines`: truncate to whole rows, carry the rest.
-                residual += px_per_tick / cell as f64;
-                let whole = residual.trunc();
-                residual -= whole;
-                if whole != 0.0 {
-                    let rows = whole as i64;
-                    match glide.as_mut() {
-                        Some(g) => {
-                            let target = g.target_px() + rows * cell;
-                            g.extend_target(target, now);
-                        }
-                        None => glide = Some(Glide::new(landed, landed + rows * cell, now)),
-                    }
-                    pos = glide.as_ref().map_or(pos, |g| g.sample(now).0);
-                }
-                if i > 12 {
-                    vels.push(pos - prev);
-                }
-                prev = pos;
-            }
-            let zeros = vels.iter().filter(|v| **v == 0).count();
-            let mx = *vels.iter().max().unwrap();
-            let avg = vels.iter().sum::<i64>() as f64 / vels.len() as f64;
-            eprintln!(
-                "control @{rows_per_100ms} rows/100 ms: {zeros} zero-motion frames, max {mx} px/frame vs avg {avg:.2}"
-            );
-            assert!(
-                zeros > 0 && mx as f64 > 2.0 * avg,
-                "control: the extend chain idles then jumps at {rows_per_100ms} rows/100 ms"
             );
         }
     }

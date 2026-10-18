@@ -130,6 +130,23 @@ pub(crate) struct TargetStreams {
     /// (`control::required_op`), so a subscriber allowed to watch this session
     /// may already list its inbox — this is a push face on a read it can make.
     pub mail: bool,
+    /// Emit `LOG <local> <record>`, one line per record appended to the watched
+    /// session's SESSION LOG (phase 3A), at the host tier `log` shows by default
+    /// (never the content tier: no OSC title), filtered as `log lvl= class=turn`
+    /// filter ([`crate::session_log::shows`]), and `GAP <local> log-lost=<n>
+    /// why=<w> resync_to=<seq> ep=<e>` when the records past the watch's cursor
+    /// cross a loss, exactly as the read counts it (seqs have holes across a
+    /// carried update, so no id arithmetic would do). Live from the head unless
+    /// resumed with `since-log=<seq> log-ep=<e>`, or (an `@*` adoption of a
+    /// session created after the subscription) from its log's start. The
+    /// target's `sub <local> <sid>` line names where the stream starts,
+    /// ` log_seq=<seq> log_ep=<e>`: a reader that resumes from the last record
+    /// it read (or from there, when it read none) misses nothing and is shown
+    /// nothing twice.
+    ///
+    /// AUTHORITY: none beyond the subscribe gate this target already passed —
+    /// the push face of `log`, which a `ReadScreen` edge may already read.
+    pub log: bool,
 }
 
 impl TargetStreams {
@@ -144,7 +161,13 @@ impl TargetStreams {
     /// "names at least one source" check and ack a stream that never emits.
     #[must_use]
     fn any_frame_source(self) -> bool {
-        self.screen || self.cursor || self.events || self.cells || self.bytes || self.mail
+        self.screen
+            || self.cursor
+            || self.events
+            || self.cells
+            || self.bytes
+            || self.mail
+            || self.log
     }
 }
 
@@ -244,6 +267,9 @@ pub(crate) struct Requested {
     /// `mail`'s `kinds=`/`from=` filter. Inert unless `targets.mail` is set; it
     /// carries NO authority — it only narrows rows the gate already allowed.
     pub mail: crate::fabric::MailFilter,
+    /// `log`'s `lvl=`/`class=turn` filter. Inert unless `targets.log` is set;
+    /// it carries no authority, only narrows records the gate already allowed.
+    pub log: LogFilter,
     /// The instance-wide frame sources, gated once for the connection.
     pub instance: RequestedInstance,
     /// A MODIFIER (not a frame source): when set, the frames a wake emits are prefixed
@@ -286,8 +312,12 @@ fn fold_mail_params(s: &str) -> Vec<String> {
     // THE ONE VOCABULARY, plus the `ts` alias the catalog spells inside
     // `timestamps`. A fourth hand-written copy is how `mail` came to be missing
     // from the refusal for a whole round.
-    let is_stream =
-        |t: &str| t == "ts" || aterm_types::control_verbs::SUBSCRIBE_STREAMS.contains(&t);
+    // A piece names a stream by the part before any `:` (`log:class=turn` is
+    // the `log` stream, never a continuation of `mail:`'s comma list).
+    let is_stream = |t: &str| {
+        let head = t.split_once(':').map_or(t, |(head, _)| head);
+        head == "ts" || aterm_types::control_verbs::SUBSCRIBE_STREAMS.contains(&head)
+    };
     let mut out: Vec<String> = Vec::new();
     for tok in s.split([',', ' ', '\t']).filter(|t| !t.is_empty()) {
         let continues_mail = out
@@ -371,6 +401,48 @@ fn parse_mail_params(spec: &str) -> Option<crate::fabric::MailFilter> {
     Some(want)
 }
 
+/// `log`'s filter (phase 3A): the deepest level shown (`log:lvl=<l>`) and the
+/// turn class only (`log:class=turn`), as the `log` verb's `lvl=` and
+/// `class=turn` read ([`crate::session_log::shows`]).
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct LogFilter {
+    /// `lvl=`: no record of a deeper level.
+    pub lvl: Option<aterm_slog::Lvl>,
+    /// `class=turn`: only the turn class.
+    pub class_turn: bool,
+}
+
+/// `` | `:lvl=<session|run|turn|step>` | `:class=turn` | both, in either order.
+/// FAIL-CLOSED on anything else (an unknown key, a repeat, a bad level), as
+/// [`parse_mail_params`] is.
+fn parse_log_params(spec: &str) -> Option<LogFilter> {
+    let mut want = LogFilter::default();
+    if spec.is_empty() {
+        return Some(want);
+    }
+    let (mut lvl, mut class) = (false, false);
+    for part in spec.strip_prefix(':')?.split(':') {
+        match part.split_once('=')? {
+            ("lvl", v) if !lvl => {
+                lvl = true;
+                want.lvl = Some(match v {
+                    "session" => aterm_slog::Lvl::Session,
+                    "run" => aterm_slog::Lvl::Run,
+                    "turn" => aterm_slog::Lvl::Turn,
+                    "step" => aterm_slog::Lvl::Step,
+                    _ => return None,
+                });
+            }
+            ("class", "turn") if !class => {
+                class = true;
+                want.class_turn = true;
+            }
+            _ => return None,
+        }
+    }
+    Some(want)
+}
+
 impl Requested {
     /// Parse a whitespace-or-comma separated stream list (`screen,cursor,events`).
     /// FAIL-CLOSED twice over: `None` on any unknown token, so a typo cannot silently
@@ -386,6 +458,14 @@ impl Requested {
             if let Some(spec) = tok.strip_prefix("mail") {
                 out.targets.mail = true;
                 out.mail = parse_mail_params(spec)?;
+                continue;
+            }
+            if let Some(spec) = tok.strip_prefix("log") {
+                if out.targets.log {
+                    return None;
+                }
+                out.targets.log = true;
+                out.log = parse_log_params(spec)?;
                 continue;
             }
             match tok {
@@ -432,6 +512,19 @@ pub(crate) struct PushOptions {
     /// authority-bearing arguments — the reason this struct exists. Its
     /// `String`s are why `PushOptions` is `Clone` and no longer `Copy`.
     pub mail: crate::fabric::MailFilter,
+    /// `log`'s filter ([`Requested::log`]), no authority, like `mail`'s.
+    pub log: LogFilter,
+    /// `since-log=<seq> log-ep=<e>`: resume the `log` stream after that record
+    /// of that epoch (a `log`/`brief`/`status`/`await log` reply's), the read
+    /// saying any loss in between as a `GAP`. `None`: live from the head.
+    pub log_since: Option<aterm_slog::Cursor>,
+    /// `@*`: the roster journal's seq when the target set was resolved. A
+    /// session the journal says was CREATED after it is news to this
+    /// subscription: its `log` stream reads from the start of its log, so its
+    /// opening (`open - spawn|adopt|restore parent= …`, the lineage only that
+    /// record names) and whatever it logged before the adoption pass reach
+    /// the reader. `None` (a named target set): every watch starts live.
+    pub adopt_after: Option<u64>,
 }
 
 /// One subscriber's wake handle: a single-slot notify the producer `try_send`s into.
@@ -590,6 +683,12 @@ impl Subscription {
     #[must_use]
     pub(crate) fn wait(&self, timeout: Duration) -> bool {
         matches!(self.rx.recv_timeout(timeout), Ok(()))
+    }
+
+    /// Take a notify that is pending, without waiting: for a pass about to read
+    /// the state that notify announced, which answers it (see [`Pacer`]).
+    fn take_pending(&self) {
+        let _ = self.rx.try_recv();
     }
 }
 
@@ -760,6 +859,19 @@ struct Watch {
     last_mail_id: u64,
     /// Which rows this subscriber asked for.
     mail: crate::fabric::MailFilter,
+    /// The `log` stream's cursor and filter, when it was asked for.
+    log: Option<LogWatch>,
+    /// Set for a closing watch's FINAL pass ([`Closing::drain`]), which the
+    /// test-only `timeline` hold never withholds ([`drain_timeline_events`]).
+    closing: bool,
+}
+
+/// One target's `log` stream: where it has read to and what it shows. About
+/// 32 bytes; each wake's records are built once and released.
+#[derive(Clone, Copy, Debug)]
+struct LogWatch {
+    cursor: aterm_slog::Cursor,
+    filter: LogFilter,
 }
 
 /// AUTHORITY for the `@*` LIVE TARGET SET: whether this subscription may adopt
@@ -1144,14 +1256,29 @@ fn drain_title_event(
 /// lane's `mail-dropped=` twin), so a bridge can re-read what a lost `topic`
 /// row would have told it. Small payload strings are cloned OUT under the lock;
 /// the lock is never held across a write.
+///
+/// `holdable` is false only for a closing watch's final pass: the test-only
+/// `timeline` hold ([`push_held`]) withholds the live drains, and a watch whose
+/// reader stopped draining delivers its tail late, never not at all.
 fn drain_timeline_events(
     timeline: &Arc<Mutex<crate::session_timeline::SessionTimeline>>,
     sid: &str,
     last_id: Option<u64>,
+    holdable: bool,
     out: &mut String,
 ) -> Option<u64> {
     let (missed, fresh, high) = {
         let tl = timeline.lock().unwrap_or_else(|p| p.into_inner());
+        // THE `timeline` HOLD IS READ UNDER THIS LOCK, which is what makes it
+        // exact. A record is appended under the same lock, so a drain either
+        // ran before the record existed or reads a marker that was written
+        // before the record was asked for: no record made after the marker
+        // reaches the wire while it stands. A held drain leaves the watermark
+        // where it was, and the first drain after the marker goes reports
+        // whatever the ring evicted meanwhile as the `GAP` below.
+        if holdable && timeline_held(&tl) {
+            return last_id;
+        }
         // O(1) HIGH-WATER COMPARE BEFORE THE SCAN. `high_id()` is `back()`, so
         // this is one integer compare; the overwhelmingly common wake is a bare
         // 250 ms liveness tick on a session whose timeline has not moved, and
@@ -1592,6 +1719,90 @@ fn drain_mail_events(watch: &mut Watch, sid: &str, out: &mut String) {
     watch.last_mail_id = watch.last_mail_id.max(since.high);
 }
 
+/// Where a watch's `log` stream starts, for its `sub` line: ` log_seq=<seq>
+/// log_ep=<e>` (the cursor it was seeded at), or nothing when it streams no
+/// log. A reader that resumes from the last `LOG` line it read, or from here
+/// when it read none, misses nothing between two streams and is shown nothing
+/// twice (`aterm ctl`'s relay does, across an update).
+fn log_anchor(watch: &Watch) -> String {
+    watch.log.as_ref().map_or_else(String::new, |lw| {
+        format!(" log_seq={} log_ep={}", lw.cursor.seq, lw.cursor.ep)
+    })
+}
+
+/// The handshake with each `sub <local> <sid>` line of a log-streaming target
+/// naming where its stream starts ([`log_anchor`]), the watches being seeded.
+fn with_log_anchors<'h>(handshake: &'h str, watches: &[Watch]) -> std::borrow::Cow<'h, str> {
+    if watches.iter().all(|w| w.log.is_none()) {
+        return std::borrow::Cow::Borrowed(handshake);
+    }
+    let mut out = String::with_capacity(handshake.len() + 32 * watches.len());
+    for line in handshake.split_inclusive('\n') {
+        let watch = line
+            .strip_prefix("sub ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|local| local.parse::<u64>().ok())
+            .and_then(|local| watches.iter().find(|w| w.local_id == local));
+        match (watch.map(log_anchor), line.strip_suffix('\n')) {
+            (Some(anchor), Some(body)) if !anchor.is_empty() => {
+                out.push_str(body);
+                out.push_str(&anchor);
+                out.push('\n');
+            }
+            _ => out.push_str(line),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// THE `log` STREAM's drain (phase 3A): the records past the watch's cursor,
+/// read under the timeline's leaf lock alone and filtered as the `log` verb
+/// filters (records filtered out move the cursor too: they are not loss), then
+/// formatted with the lock released: `GAP <sid> log-lost=<n> why=<w>
+/// resync_to=<seq> ep=<e>` for the loss the read crossed (exact: the read's own
+/// count, holes and resets said apart), then `LOG <sid> <record>` per record at
+/// the host tier. An idle wake compares the head and the epoch and reads
+/// nothing.
+fn drain_log_events(watch: &mut Watch, sid: &str, out: &mut String) {
+    let Some(lw) = watch.log.as_mut() else {
+        return;
+    };
+    let (gap, recs, next) = {
+        let tl = watch.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        let log = tl.slog().log();
+        if log.reader_last_seq() == lw.cursor.seq && log.ep() == lw.cursor.ep {
+            return;
+        }
+        let read = log.read(lw.cursor, aterm_slog::MAX_RECORDS);
+        let recs: Vec<aterm_slog::Rec> = read
+            .recs
+            .iter()
+            .filter(|r| crate::session_log::shows(r, lw.filter.lvl, lw.filter.class_turn))
+            .map(|r| (*r).clone())
+            .collect();
+        (read.gap, recs, read.next)
+    };
+    lw.cursor = next;
+    if let Some(g) = gap {
+        out.push_str(&format!(
+            "GAP {sid} log-lost={} why={} resync_to={} ep={}\n",
+            g.lost,
+            g.why.word(),
+            g.resync_to,
+            next.ep
+        ));
+    }
+    for r in &recs {
+        let line = aterm_slog::encode(r, aterm_slog::Tier::Host)
+            .unwrap_or_else(|_| format!("{} {} {}", r.seq, r.op.word(), r.node));
+        out.push_str("LOG ");
+        out.push_str(sid);
+        out.push(' ');
+        out.push_str(&line);
+        out.push('\n');
+    }
+}
+
 /// A `GAP <sid> events-resync=<floor>` frame: a `since-turn=` resume anchor sat below
 /// the ledger's retained low-water, so turn records in `(anchor, floor)` were
 /// drop-oldest evicted, or left behind by a self-update handoff that could not carry
@@ -1900,14 +2111,25 @@ fn frames_for_watch(watch: &mut Watch, streams: TargetStreams, woke: bool) -> Ve
             engine.resize,
             &mut out,
         );
-        watch.last_timeline_id =
-            drain_timeline_events(&watch.timeline, sid, watch.last_timeline_id, &mut out);
+        watch.last_timeline_id = drain_timeline_events(
+            &watch.timeline,
+            sid,
+            watch.last_timeline_id,
+            !watch.closing,
+            &mut out,
+        );
         watch.last_title = drain_title_event(sid, engine.title, watch.last_title.take(), &mut out);
         watch.last_bell = drain_bell_event(sid, engine.bell, watch.last_bell, &mut out);
     }
 
     if streams.mail {
         drain_mail_events(watch, sid, &mut out);
+    }
+
+    // LAST in a wake (content, events, mail, then the log), so a closed
+    // session's `close - out=…` precedes its `EVENT <local> exited`.
+    if streams.log {
+        drain_log_events(watch, sid, &mut out);
     }
 
     if out.is_empty() {
@@ -1941,6 +2163,18 @@ pub(crate) type ResolvedTarget = (
 /// multi-target subscription (and for `@*` outright), so in adopt mode they are
 /// always `None` here and this function behaves identically for both callers.
 fn new_watch(target: &ResolvedTarget, streams: TargetStreams, opts: &PushOptions) -> Watch {
+    new_watch_at(target, streams, opts, false)
+}
+
+/// [`new_watch`], its `log` stream read from the START of the target's log
+/// when `log_from_start` (a session created after the subscription, which
+/// holds nothing the reader could have read before it: [`drain_membership`]).
+fn new_watch_at(
+    target: &ResolvedTarget,
+    streams: TargetStreams,
+    opts: &PushOptions,
+    log_from_start: bool,
+) -> Watch {
     let (id, term, fanout, turns, timeline, fabric) = target;
     Watch {
         local_id: *id,
@@ -1955,6 +2189,25 @@ fn new_watch(target: &ResolvedTarget, streams: TargetStreams, opts: &PushOptions
             0
         },
         mail: opts.mail.clone(),
+        // `log`: resumed after `since-log=`, else live from the reader's head
+        // (a live stream replays no backlog, as `mail` does not) — but a
+        // session created after the subscription is read from its log's start
+        // (its seq 0 in its own epoch: every record it holds came after the
+        // subscribe, and a loss among them is a `GAP` like any other).
+        log: streams.log.then(|| LogWatch {
+            cursor: opts.log_since.unwrap_or_else(|| {
+                let tl = timeline.lock().unwrap_or_else(|p| p.into_inner());
+                let log = tl.slog().log();
+                let from = if log_from_start {
+                    0
+                } else {
+                    log.reader_last_seq()
+                };
+                aterm_slog::Cursor::new(log.ep(), from)
+            }),
+            filter: opts.log,
+        }),
+        closing: false,
         term: term.clone(),
         turns: turns.clone(),
         // `since-turn=<id>` resumes the turn stream from that id (push turns
@@ -2087,8 +2340,13 @@ struct PushCursors {
 /// A push-only connection can remain completely quiet for hours. A dead reader
 /// therefore cannot be discovered by waiting for the next write: doing so pins a
 /// reserved subscription worker forever when the target is quiet. `peer_gone` is
-/// sampled on every bounded liveness wake and must be non-blocking (or tightly
-/// bounded). The control-socket host supplies a read-side EOF/HUP probe. A
+/// sampled at the top of EVERY pass, the real wakes as well as the liveness
+/// ticks, so it must never wait: a wait in it is paid in front of every frame
+/// pushed (a "tightly bounded" 1 ms read once cost each one about 1.1 ms). What
+/// that read also did — fold a flood of wakes into one pass a millisecond — is
+/// the loop's pass budget now ([`Pacer`]), which holds no wake that has room.
+/// The control-socket host supplies a non-blocking read-side peek
+/// ([`crate::control`]'s `subscription_peer_gone`). A
 /// test's probe is also the one hook the loop calls on its own thread between
 /// a wake's bounded wait and its closing pass, which is where a test that must
 /// act at that instant acts.
@@ -2167,6 +2425,9 @@ pub(crate) fn push_loop_with_peer_probe<W: Write, P: FnMut() -> bool>(
     // THE HANDSHAKE, NOW THAT EVERY WATCH IN IT IS SEEDED: see the doc above.
     // A write failure is the client gone, which ends the stream as `Gone`
     // does below.
+    // Each log-streaming target's `sub` line names where its stream starts,
+    // read from the watch just seeded ([`with_log_anchors`]).
+    let handshake = with_log_anchors(handshake, &watches);
     if !handshake.is_empty()
         && (writer.write_all(handshake.as_bytes()).is_err() || writer.flush().is_err())
     {
@@ -2198,6 +2459,291 @@ pub(crate) fn push_loop_with_peer_probe<W: Write, P: FnMut() -> bool>(
         &mut egress,
         &mut peer_gone,
     );
+}
+
+/// The push loop's pass budget: [`PASS_BURST`] woken passes back to back go at
+/// once, and past them a woken pass first rests this long since the last one
+/// ended.
+pub(crate) const PASS_INTERVAL: Duration = Duration::from_millis(1);
+
+/// How many woken passes in a row the budget lets through unpaced: the credit a
+/// quiet loop holds, one [`PASS_INTERVAL`] of rest each.
+pub(crate) const PASS_BURST: u32 = 8;
+
+/// THE PUSH LOOP'S PASS BUDGET: a wake with room is pushed at once; a flood of
+/// them, once [`PASS_BURST`] passes are spent, gets one pass per
+/// [`PASS_INTERVAL`] of rest after the last one ended.
+///
+/// A pass is not free. Each takes every watched session's terminal lock (a
+/// `screen` one renders every changed row under it) and writes a frame, and the
+/// producer notifies on every output burst, so a session printing as fast as
+/// its program can wakes this loop thousands of times a second — the fabric
+/// bridge's `@* events,sessions` loop included, which then locks every session
+/// it watches per pass, the flooding one too. The push probe once slept 1 ms
+/// before every pass, and that sleep was this loop's only coalescing window:
+/// notifies that landed during it folded into the pass after it. Taking the
+/// sleep out to stop it delaying every frame (see `subscription_peer_gone` in
+/// [`crate::control`]) took the window with it. Measured 2026-10-16: a lab
+/// instance at 160×48 flooded with 16 MB of `yes` under one `subscribe @0
+/// screen`, debug build, arms interleaved, medians of 6 runs each (load 8–50):
+///
+/// | arm            | DELTAs | flood (s) | aterm CPU (s) |
+/// |----------------|-------:|----------:|--------------:|
+/// | the 1 ms sleep |  6,034 |      9.35 |          23.6 |
+/// | no window      | 57,214 |     16.74 |          24.0 |
+/// | this budget    |  9,183 |     11.23 |          26.3 |
+///
+/// (Ranges: 2,249–8,848 / 51,167–70,499 / 8,170–10,037 DELTAs; 7.0–20.1 /
+/// 10.1–35.6 / 9.2–12.0 s of flood.) A quieter batch without the budget arm
+/// (load 5–14) put no window at ~16× the sleep's frames, a flood ~40% slower
+/// and ~1.6× the CPU. The budget pays back nearly all the frames and most of
+/// the flood time. It is not the sleep's exact match: it pushes ~818 frames a
+/// second of flood to the sleep's ~645, and the flood stays ~20% slower than
+/// under the sleep — a gap no run here has explained.
+///
+/// A budget, not a sleep, is the fix: it costs a wake nothing until wakes come
+/// faster than one per [`PASS_INTERVAL`] for longer than [`PASS_BURST`] passes,
+/// so a keystroke's echo, a lone `EVENT`, and the handful of wakes one fabric
+/// post makes are pushed as soon as they land (the bucket refills a pass per
+/// interval of rest). The push hop — a notify until the client has read the
+/// whole DELTA — with 2 ms between frames: p50/p95/p99 27.1/45.8/56.0 µs
+/// without the budget, 27.8/47.3/52.3 µs with it (n = 400 each, load 19–23).
+/// Only a sustained flood is paced, back to the sleep's price and never past
+/// it: the same hop in lockstep with no gap goes 20.2 → 1014.8 µs p50 once
+/// the burst is spent. What lands during a pause is read by the pass after it,
+/// the one frame it coalesces into. A pause is taken after the peer probe, so
+/// liveness is still asked once a wake; the 250 ms liveness ticks are neither
+/// paced nor charged.
+struct Pacer {
+    /// Rest banked for passes to come: at most [`PASS_BURST`] intervals of it.
+    credit: Duration,
+    /// When the loop last began to rest: the end of its last pass, or a refill.
+    /// Time inside a pass earns nothing.
+    at: std::time::Instant,
+}
+
+impl Pacer {
+    /// The full credit of [`PASS_BURST`] passes.
+    const FULL: Duration = PASS_INTERVAL.saturating_mul(PASS_BURST);
+
+    fn new() -> Self {
+        Self {
+            credit: Self::FULL,
+            at: pace_clock::now(),
+        }
+    }
+
+    /// Bank the wait before every pass. A liveness tick spends no credit, but
+    /// its preceding quiet time must be kept before `rest_from_now` excludes the
+    /// work inside that pass.
+    fn begin_pass(&mut self, woke: bool, sub: &Subscription) {
+        if woke {
+            self.admit(sub);
+        } else {
+            self.refill();
+        }
+    }
+
+    /// Before a woken pass: spend one interval of banked rest, first pausing for
+    /// what is missing of it. The pass then reads the state AFTER the pause, so a
+    /// notify that landed during it is answered by this pass and is taken now —
+    /// otherwise it would wake a pass that finds nothing new.
+    fn admit(&mut self, sub: &Subscription) {
+        self.refill();
+        if self.credit < PASS_INTERVAL {
+            pace_clock::pause(PASS_INTERVAL - self.credit);
+            sub.take_pending();
+            self.refill();
+        }
+        self.credit = self.credit.saturating_sub(PASS_INTERVAL);
+        #[cfg(test)]
+        pace_clock::tally::admitted();
+    }
+
+    /// A pass ended: the loop rests from here. Time spent inside the pass is not
+    /// rest, so a flood's passes are each followed by a full interval off the
+    /// terminal locks, however long the pass took.
+    fn rest_from_now(&mut self) {
+        self.at = pace_clock::now();
+    }
+
+    fn refill(&mut self) {
+        let now = pace_clock::now();
+        self.credit = (self.credit + now.saturating_duration_since(self.at)).min(Self::FULL);
+        self.at = now;
+    }
+}
+
+/// The [`Pacer`]'s clock and pause: the real ones, which a test on the push
+/// loop's own thread freezes or steps (a thread-local, so a sibling test's loop
+/// runs on real time) and whose pauses it counts.
+pub(crate) mod pace_clock {
+    use std::time::{Duration, Instant};
+
+    pub(super) fn now() -> Instant {
+        #[cfg(test)]
+        if let Some(now) = tally::NOW.with(std::cell::Cell::get) {
+            return now;
+        }
+        Instant::now()
+    }
+
+    pub(super) fn pause(rest: Duration) {
+        #[cfg(test)]
+        tally::paused();
+        std::thread::sleep(rest);
+    }
+
+    /// TEST-ONLY: this thread's pacer clock and what its pacer did.
+    #[cfg(test)]
+    pub(crate) mod tally {
+        use std::cell::Cell;
+        use std::time::{Duration, Instant};
+
+        /// Woken passes this thread's pacer admitted, and how many it paused first.
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+        pub(crate) struct Tally {
+            pub(crate) admitted: u64,
+            pub(crate) paused: u64,
+        }
+
+        thread_local! {
+            pub(super) static NOW: Cell<Option<Instant>> = const { Cell::new(None) };
+            static TALLY: Cell<Tally> = const { Cell::new(Tally { admitted: 0, paused: 0 }) };
+        }
+
+        /// Stop this thread's pacer clock: it reads this instant until stepped.
+        pub(crate) fn freeze() {
+            NOW.with(|now| now.set(Some(Instant::now())));
+        }
+
+        /// Move this thread's frozen pacer clock on by `by`.
+        pub(crate) fn step(by: Duration) {
+            NOW.with(|now| now.set(now.get().map(|at| at + by)));
+        }
+
+        pub(in crate::subscribe) fn admitted() {
+            TALLY.with(|t| {
+                let mut now = t.get();
+                now.admitted += 1;
+                t.set(now);
+            });
+        }
+
+        pub(super) fn paused() {
+            TALLY.with(|t| {
+                let mut now = t.get();
+                now.paused += 1;
+                t.set(now);
+            });
+        }
+
+        /// This thread's tally since its last `take`, reset to zero.
+        pub(crate) fn take() -> Tally {
+            TALLY.with(|t| t.replace(Tally::default()))
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            use crate::subscribe::{PASS_BURST, PASS_INTERVAL, Pacer, SubscriberSet, new_registry};
+
+            // Restore both thread-local seams even when an assertion unwinds.
+            struct FrozenClock {
+                previous: Option<Instant>,
+                tally: Tally,
+            }
+
+            impl FrozenClock {
+                fn new() -> Self {
+                    Self {
+                        previous: NOW.with(|now| now.replace(Some(Instant::now()))),
+                        tally: TALLY.with(|t| t.replace(Tally::default())),
+                    }
+                }
+            }
+
+            impl Drop for FrozenClock {
+                fn drop(&mut self) {
+                    NOW.with(|now| now.set(self.previous));
+                    TALLY.with(|t| t.set(self.tally));
+                }
+            }
+
+            #[test]
+            fn an_unwoken_pass_keeps_idle_credit_but_earns_none_for_its_work() {
+                let _clock = FrozenClock::new();
+                let registry = new_registry();
+                let sub = SubscriberSet::register(&registry, &[]);
+                let mut pacer = Pacer::new();
+                for _ in 0..PASS_BURST {
+                    pacer.begin_pass(true, &sub);
+                    pacer.rest_from_now();
+                }
+                assert_eq!(pacer.credit, Duration::ZERO, "the flood spent the burst");
+                assert_eq!(
+                    take(),
+                    Tally {
+                        admitted: u64::from(PASS_BURST),
+                        paused: 0
+                    }
+                );
+
+                // A long pass is work, not rest, even if no wake paid for it.
+                step(Duration::from_secs(1));
+                pacer.rest_from_now();
+                pacer.begin_pass(false, &sub);
+                assert_eq!(pacer.credit, Duration::ZERO, "pass work earned nothing");
+                assert_eq!(take(), Tally::default(), "a tick spends no pass");
+
+                // A short quiet wait is banked before its unwoken pass starts;
+                // time spent inside that pass must not inflate it to FULL.
+                step(PASS_INTERVAL.saturating_mul(3));
+                pacer.begin_pass(false, &sub);
+                step(Duration::from_secs(1));
+                pacer.rest_from_now();
+                assert_eq!(pacer.credit, PASS_INTERVAL.saturating_mul(3));
+                for _ in 0..3 {
+                    pacer.begin_pass(true, &sub);
+                    pacer.rest_from_now();
+                }
+                assert_eq!(pacer.credit, Duration::ZERO);
+                assert_eq!(
+                    take(),
+                    Tally {
+                        admitted: 3,
+                        paused: 0
+                    }
+                );
+
+                // After the real loop's quiet liveness interval, the next
+                // complete burst needs no pause. Check room before admitting
+                // it, so a regression fails without entering a real sleep.
+                step(Duration::from_millis(250));
+                sub.notify.try_send(()).expect("one pending notify");
+                pacer.begin_pass(false, &sub);
+                assert_eq!(pacer.credit, Pacer::FULL, "a tick retains the idle burst");
+                assert_eq!(
+                    sub.rx.try_recv(),
+                    Ok(()),
+                    "accounting does not consume a notify"
+                );
+                assert_eq!(take(), Tally::default(), "an unwoken pass is uncharged");
+                pacer.rest_from_now();
+                for _ in 0..PASS_BURST {
+                    pacer.begin_pass(true, &sub);
+                    pacer.rest_from_now();
+                }
+                assert_eq!(
+                    take(),
+                    Tally {
+                        admitted: u64::from(PASS_BURST),
+                        paused: 0
+                    }
+                );
+            }
+        }
+    }
 }
 
 /// The push loop proper: the catch-up wake, then one wake per notify (or per bounded
@@ -2265,6 +2811,7 @@ fn pump<W: Write, P: FnMut() -> bool>(
     }
     egress.end_wake()?;
 
+    let mut pacer = Pacer::new();
     loop {
         // A bounded wait: on a real wake we push immediately; on a timeout we still
         // loop (a no-op pass that costs one cheap content_seq compare per target and
@@ -2279,6 +2826,9 @@ fn pump<W: Write, P: FnMut() -> bool>(
         if peer_gone() {
             return Err(Gone);
         }
+        // A wake spends the pass budget; an unwoken liveness tick only banks
+        // its preceding quiet wait. Neither banks the work inside this pass.
+        pacer.begin_pass(woke, sub);
         egress.begin_wake();
 
         // CLOSINGS FIRST. A target deregistered from the store (its pane closed) must
@@ -2342,15 +2892,25 @@ fn pump<W: Write, P: FnMut() -> bool>(
             }
         }
         egress.end_wake()?;
+        pacer.rest_from_now();
     }
 }
 
 /// TEST-ONLY: whether one of [`drain_membership`]'s two decisions is HELD —
-/// `adopt` ([`pick_adoptions`]) or `sessions` ([`drain_roster`]) — because a
-/// file of that name exists in the directory `$ATERM_TEST_PUSH_HOLD` names. A
-/// held decision is skipped for that wake with its cursor untouched, so the
-/// journal replays it on the first wake after the file goes. Both are read
-/// before the pass takes its store guard.
+/// `adopt` ([`pick_adoptions`]) or `sessions` ([`drain_roster`]) — or a
+/// watch's `timeline` drain ([`drain_timeline_events`]), because a file of
+/// that name exists in the directory `$ATERM_TEST_PUSH_HOLD` names (or, under
+/// a unit test, because its thread holds it: [`HELD_HERE`]). A held step is
+/// skipped for that wake with its cursor untouched, so the first wake after
+/// the file goes resumes from that cursor: it replays what the journal or the
+/// timeline retains past it, and reports what the ring evicted meanwhile the
+/// way a slow reader's is reported — the timeline's as a `GAP`, the roster's
+/// by its rebuild from the live set. The two membership holds are read before
+/// the pass takes its store guard (they stat a file, which has no business
+/// under the store lock); the `timeline` hold is read under the session's
+/// timeline lock ([`timeline_held`] takes its guard), because exactness needs
+/// that read there and the stat costs only in a debug build with the seam set.
+/// It never holds a closing watch's final pass.
 ///
 /// THE STATES IT HOLDS OPEN ARE REAL, and only how long they last is chosen.
 /// A session registered in the store is listed by it at once and adopted
@@ -2362,9 +2922,17 @@ fn pump<W: Write, P: FnMut() -> bool>(
 /// frees, if ever. Holding `adopt` while `sessions` runs is that deferral
 /// without 256 sessions: the pass announces the session marked
 /// `watch=deferred`, which is true, and acks it on the first pass after the
-/// file goes. A test that raced these states from outside would be the flake
-/// this codebase refuses, so it holds each open and closes it at a named
-/// point.
+/// file goes. A watch whose reader stops draining — a stopped bridge, a full
+/// socket on a busy node — keeps its timeline watermark while the ring moves
+/// on; holding `timeline` is that state without the race between the push
+/// loop's last drain and the record a test wants to fall in the hole, for the
+/// timeline's own order and its `GAP` count only. The hold withholds the
+/// timeline stream alone, so a held record reaches the wire after the frames of
+/// other streams (and `sub` acks) made after it, an order a stalled socket
+/// never writes; a test may rely on the timeline's order and the `GAP`, nothing
+/// across streams. A test
+/// that raced these states from outside would be the flake this codebase
+/// refuses, so it holds each open and closes it at a named point.
 ///
 /// What no hold can open is the window [`drain_membership`] closed: both
 /// decisions are still taken under its one store guard, so a plain
@@ -2376,6 +2944,10 @@ fn pump<W: Write, P: FnMut() -> bool>(
 /// binary has no hold to arm.
 #[cfg(debug_assertions)]
 fn push_held(step: &str) -> bool {
+    #[cfg(test)]
+    if HELD_HERE.with(|held| held.get().contains(&step)) {
+        return true;
+    }
     static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
     DIR.get_or_init(|| aterm_types::dev_seam!("ATERM_TEST_PUSH_HOLD").map(std::path::PathBuf::from))
         .as_ref()
@@ -2386,6 +2958,22 @@ fn push_held(step: &str) -> bool {
 #[cfg(not(debug_assertions))]
 const fn push_held(_step: &str) -> bool {
     false
+}
+
+/// Whether the test-only `timeline` hold ([`push_held`]) stands, read under the
+/// session's timeline lock: it takes the guard, so the read cannot move out from
+/// under the lock that makes the hold exact ([`drain_timeline_events`]).
+fn timeline_held(_under: &crate::session_timeline::SessionTimeline) -> bool {
+    push_held("timeline")
+}
+
+#[cfg(test)]
+thread_local! {
+    /// TEST-ONLY: the steps a unit test holds ([`push_held`]), per thread.
+    /// The marker directory is the process's, named once, and every unit test
+    /// shares the process, so a marker one test wrote would hold every other
+    /// test's push loop; a unit test runs its push loop on its own thread.
+    static HELD_HERE: std::cell::Cell<&'static [&'static str]> = const { std::cell::Cell::new(&[]) };
 }
 
 /// The block-id watermark to start a fresh `events` subscription at: the current
@@ -2472,8 +3060,8 @@ fn initial_resize_watermark(
 /// had to open a WHOLE NEW subscription for it: a fresh child process, a fresh
 /// UDS connection, and a fresh server push thread, once per DISCOVERY MOMENT
 /// rather than once per instance. The server admits
-/// `CONTROL_SUBSCRIPTION_WORKERS` = 4 of those at a time, so the fifth tab-open
-/// was refused — and refused silently, because a push-only client that has
+/// `CONTROL_SUBSCRIPTION_WORKERS` = 4 of those at a time (then; the pool now
+/// grows to a ceiling), so the fifth tab-open was refused — and refused silently, because a push-only client that has
 /// already marked the sid as seen never asks again. Past four staggered
 /// discoveries, sessions simply stopped being federated. One live target set
 /// replaces all of it with one connection per instance.
@@ -2640,13 +3228,29 @@ fn drain_membership(
         } else {
             Vec::new()
         };
+        // Which of them the journal says were CREATED after the subscription
+        // resolved its targets ([`PushOptions::adopt_after`]): their `log`
+        // streams read from the start. One whose record the journal no longer
+        // holds cannot be told from a session left over by the cap, and
+        // starts live.
+        let picked: Vec<(ResolvedTarget, String, bool)> = picked
+            .into_iter()
+            .map(|(target, sid)| {
+                let fresh = opts.adopt_after.is_some_and(|after| {
+                    g.roster_since(after).any(|r| {
+                        r.change == crate::session_store::RosterChange::Created && r.sid == sid
+                    })
+                });
+                (target, sid, fresh)
+            })
+            .collect();
         let mut roster = String::new();
         if let Some(cursor) = cursors.roster.as_mut()
             && !roster_held
         {
             let watched = |local: u64| {
                 watches.iter().any(|w| w.local_id == local)
-                    || picked.iter().any(|(t, _)| t.0 == local)
+                    || picked.iter().any(|(t, _, _)| t.0 == local)
             };
             let watched: Option<&dyn Fn(u64) -> bool> = adopt.on().then_some(&watched);
             drain_roster(&g, cursor, watched, &mut roster);
@@ -2655,7 +3259,7 @@ fn drain_membership(
         // guard drops here, BEFORE `new_watch` takes any Terminal lock
     };
     let mut out = Vec::with_capacity(picked.len() + 1);
-    for (target, sid) in picked {
+    for (target, sid, fresh) in picked {
         // SEED, THEN REGISTER — the main path's rule (see its "REGISTER AFTER
         // THE WATCHES ARE SEEDED"). A screen's content would survive either
         // order, since a wake re-reads it whole; an event stream's would not: a
@@ -2663,11 +3267,13 @@ fn drain_membership(
         // the seed and pushed to nobody (the bridge's `fetch` event was, in the
         // 2026-10-06 world-suite red). Seeding first costs at most one 250 ms
         // liveness tick for a burst that lands in between, and loses nothing.
-        watches.push(new_watch(&target, streams, opts));
+        let watch = new_watch_at(&target, streams, opts, fresh);
+        let anchor = log_anchor(&watch);
+        watches.push(watch);
         sub.watch(target.0);
         out.push(Frame::text(
             Tag::Instance,
-            format!("sub {} {sid}\n", target.0),
+            format!("sub {} {sid}{anchor}\n", target.0),
         ));
     }
     if !roster.is_empty() {
@@ -2714,6 +3320,7 @@ impl Closing {
 
     fn drain(mut self, streams: TargetStreams) -> Vec<Frame> {
         let tag = Tag::Channel(self.0.local_id);
+        self.0.closing = true;
         let mut out = frames_for_watch(&mut self.0, streams, false);
         out.extend(drain_bytes_frames(&self.0));
         if streams.events {
@@ -2938,6 +3545,8 @@ pub(crate) mod digest_fixture {
             fabric: std::sync::Arc::default(),
             last_mail_id: 0,
             mail: crate::fabric::MailFilter::default(),
+            log: None,
+            closing: false,
             term: term.clone(),
             last_sent_seq: 0,
             last_alt: false,
@@ -3001,54 +3610,36 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    fn test_watch(term: Arc<Mutex<Terminal>>) -> Watch {
-        Watch {
-            local_id: 1,
-            fabric: std::sync::Arc::default(),
-            last_mail_id: 0,
-            mail: crate::fabric::MailFilter::default(),
-            term,
-            last_sent_seq: 0,
-            last_alt: false,
-            last_cursor: (u16::MAX, u16::MAX, false, ""),
-            last_render_sig: 0,
-            last_block_id: None,
-            turns: Arc::new(Mutex::new(TurnLedger::default())),
-            timeline: Arc::new(Mutex::new(
-                crate::session_timeline::SessionTimeline::default(),
-            )),
-            last_timeline_id: None,
-            last_resize_id: 0,
-            last_turn_id: None,
-            last_title: None,
-            last_bell: 0,
-            byte_sub: None,
-            non_coalesced: false,
-        }
-    }
-
-    /// `@*` ADOPTION IS OWNER-ONLY, at the type level. The capability has no
-    /// public constructor that can produce a permissive value from a non-Owner
-    /// scope, so a future caller that forgets the refusal in
-    /// `run_subscribe_with_peer_probe` still cannot grant it — the same invariant `InstanceStreams::authorize`
-    /// carries for the instance `sessions` stream, and for the same reason: a
-    /// live target set names sessions the subscriber could not have named.
+    /// THE INSTANCE-WIDE GRANTS ARE OWNER-ONLY, at the type level: `@*`
+    /// adoption and the `sessions` stream both name sessions the subscriber
+    /// could not have named, and the per-target `ReadScreen` gate resolves only
+    /// the selectors the client named. Neither capability has a constructor
+    /// that yields a permissive value from a non-Owner scope, so a future
+    /// caller that forgets the refusal in `run_subscribe_with_peer_probe` still
+    /// cannot grant it; and an Owner that did not ask does not get it.
     #[test]
-    fn adopt_scope_is_owner_only() {
+    fn only_owner_is_granted_the_instance_sessions_stream() {
+        let edge = || Scope::Edge(aterm_session::EdgeToken::from_bytes([9u8; 32]));
+        assert!(AdoptScope::authorize(true, Scope::Owner).on());
         assert!(
-            AdoptScope::authorize(true, Scope::Owner).on(),
-            "Owner asking for @* gets it"
-        );
-        let edge = Scope::Edge(aterm_session::EdgeToken::from_bytes([9u8; 32]));
-        assert!(
-            !AdoptScope::authorize(true, edge).on(),
-            "an EDGE asking for @* is refused, whatever its per-target reach"
+            !AdoptScope::authorize(true, edge()).on(),
+            "an EDGE asking for @*"
         );
         assert!(
             !AdoptScope::authorize(false, Scope::Owner).on(),
-            "not asked for = not granted"
+            "not asked for"
         );
         assert!(!AdoptScope::none().on(), "the refusing default refuses");
+        let asked = RequestedInstance { sessions: true };
+        assert!(InstanceStreams::authorize(asked, Scope::Owner).sessions());
+        assert!(
+            !InstanceStreams::authorize(asked, edge()).sessions(),
+            "an EDGE asking for the roster"
+        );
+        assert!(
+            !InstanceStreams::authorize(RequestedInstance::default(), Scope::Owner).sessions(),
+            "authorize grants, it does not add"
+        );
     }
 
     /// A LIVE target set's notify registration must track its watch set exactly:
@@ -3087,7 +3678,7 @@ mod tests {
         assert!(registry.any(), "session 1 is still watched");
         registry.lock().unwrap().notify(2);
         assert!(
-            !sub.wait(Duration::from_millis(50)),
+            !sub.wait(Duration::ZERO),
             "a notify on a dropped session no longer wakes the subscription"
         );
 
@@ -3097,6 +3688,19 @@ mod tests {
             "the lock-free fast-path flag follows the LAST removal, so a producer \
              stops paying for a subscription that watches nothing"
         );
+
+        // A DROPPED subscription deregisters too: a notify on its session is a
+        // no-op the producer pays nothing for.
+        {
+            let _gone = SubscriberSet::register(&registry, &[5]);
+            assert_eq!(registry.lock().unwrap().watched_sessions(), 1);
+        }
+        assert_eq!(
+            registry.lock().unwrap().watched_sessions(),
+            0,
+            "deregistered on drop"
+        );
+        registry.lock().unwrap().notify(5);
     }
 
     /// THE `@*` END-TO-END CLAIM: a subscription ADOPTS a session created after
@@ -3161,25 +3765,79 @@ mod tests {
         );
     }
 
-    /// A subscriber registered for a session is woken by a notify on that session,
-    /// and NOT by a notify on an unrelated session.
+    /// `@* log` PUSHES A NEW SESSION'S OPENING: a session the roster journal
+    /// says was created after the subscription resolved its targets is news to
+    /// it, so its `log` stream reads from its log's start, and its first `LOG`
+    /// line is `open - spawn` (seq 1, the only record naming its lineage),
+    /// which an adoption seeded at the head skipped with no `GAP`. Each `sub`
+    /// line names where its stream starts (` log_seq= log_ep=`). NEGATIVE
+    /// CONTROL: a session that was there when the subscription resolved its
+    /// targets (one the cap left over) starts live and replays nothing.
     #[test]
-    fn notify_wakes_only_subscribed_sessions() {
-        let reg = new_registry();
-        let sub = SubscriberSet::register(&reg, &[7]);
-
-        // A notify on an unrelated session does not wake us.
-        reg.lock().unwrap().notify(99);
+    fn an_adopted_new_sessions_log_stream_starts_with_its_opening() {
+        let store = crate::session_store::new_store();
+        let registry = new_registry();
+        let mut sub = SubscriberSet::register(&registry, &[]);
+        let mut watches: Vec<Watch> = Vec::new();
+        let mut cursors = PushCursors {
+            roster: None,
+            adopt_seq: 0,
+        };
+        let streams = TargetStreams {
+            log: true,
+            ..Default::default()
+        };
+        let before = crate::session_store::test_handle(4);
+        let old_sid = before.sid.as_str().to_string();
+        store
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .register(before);
+        let resolved_at = store.read().unwrap_or_else(|p| p.into_inner()).roster_seq();
+        let opts = PushOptions {
+            adopt_after: Some(resolved_at),
+            ..PushOptions::default()
+        };
+        let h = crate::session_store::test_handle(5);
+        let sid = h.sid.as_str().to_string();
+        store.write().unwrap_or_else(|p| p.into_inner()).register(h);
+        let all = AdoptScope::authorize(true, Scope::Owner);
+        let acks = text(&drain_membership(
+            &store,
+            &mut watches,
+            &mut sub,
+            streams,
+            &opts,
+            all,
+            &mut cursors,
+        ));
         assert!(
-            !sub.wait(Duration::from_millis(20)),
-            "unrelated notify must not wake"
+            acks.contains(&format!("sub 5 {sid} log_seq=0 log_ep=1\n")),
+            "{acks}"
         );
-
-        // A notify on our session wakes us.
-        reg.lock().unwrap().notify(7);
         assert!(
-            sub.wait(aterm_spec::wait::MUST_HAPPEN),
-            "our notify must wake"
+            acks.contains(&format!("sub 4 {old_sid} log_seq=1 log_ep=1\n")),
+            "{acks}"
+        );
+        let mut take = |local: u64| {
+            let w = watches
+                .iter_mut()
+                .find(|w| w.local_id == local)
+                .expect("adopted");
+            text(&frames_for_watch(w, streams, true))
+        };
+        let new = take(5);
+        assert!(
+            new.lines()
+                .next()
+                .is_some_and(|l| l.starts_with("LOG 5 1 open - spawn ")),
+            "the new session's opening comes first: {new:?}"
+        );
+        assert!(!new.contains("GAP"), "{new:?}");
+        assert_eq!(
+            take(4),
+            "",
+            "NEGATIVE CONTROL: a session from before replays nothing"
         );
     }
 
@@ -3202,41 +3860,7 @@ mod tests {
             sub.wait(aterm_spec::wait::MUST_HAPPEN),
             "first wake delivered"
         );
-        assert!(
-            !sub.wait(Duration::from_millis(20)),
-            "flood coalesced to one wake"
-        );
-    }
-
-    /// A notify to a session with a DROPPED subscriber is a no-op and the registry
-    /// self-cleans: the dropped subscription deregisters, so the producer pays
-    /// nothing for a dead subscriber.
-    #[test]
-    fn dropped_subscriber_deregisters_and_notify_is_noop() {
-        let reg = new_registry();
-        {
-            let _sub = SubscriberSet::register(&reg, &[5]);
-            assert_eq!(reg.lock().unwrap().watched_sessions(), 1);
-        } // _sub dropped here
-        assert_eq!(
-            reg.lock().unwrap().watched_sessions(),
-            0,
-            "deregistered on drop"
-        );
-        // Still a safe no-op.
-        reg.lock().unwrap().notify(5);
-    }
-
-    /// Multiplex: one subscription watching two sessions is woken by EITHER.
-    #[test]
-    fn one_subscription_watches_multiple_sessions() {
-        let reg = new_registry();
-        let sub = SubscriberSet::register(&reg, &[10, 20]);
-        reg.lock().unwrap().notify(20);
-        assert!(
-            sub.wait(aterm_spec::wait::MUST_HAPPEN),
-            "woken by either watched session"
-        );
+        assert!(!sub.wait(Duration::ZERO), "flood coalesced to one wake");
     }
 
     /// A [`Watch`] on `term` seeded the way a subscription with no resume anchor
@@ -3250,6 +3874,8 @@ mod tests {
             fabric: std::sync::Arc::default(),
             last_mail_id: 0,
             mail: crate::fabric::MailFilter::default(),
+            log: None,
+            closing: false,
             term: term.clone(),
             last_sent_seq: 0,
             last_alt: false,
@@ -3486,8 +4112,23 @@ mod tests {
             "mail:topic=a/b",            // nor is this
             "mail:topic=a:topic=b",      // repeated
             "mailish",                   // not this stream, not any stream
+            // `from=` IS SINGULAR: the fold that reassembles `kinds=`'s comma
+            // list hands it a second piece, and `mail:from=h-a,h-b` was taken
+            // verbatim and matched NOTHING.
+            "mail:from=h-andrew,h-bob",
+            "mail:from=human,agent",
+            "mail:from=andrew", // no class prefix, not a class
+            "mail:from=h-",     // a prefix and nothing else
+            "mail:from=h-a b",
         ] {
             assert_eq!(Requested::parse(bad), None, "{bad} must fail closed");
+        }
+        for good in ["service", "other", "s-w1@n-lab", "a-svc"] {
+            assert_eq!(
+                got(&format!("mail:from={good}")).mail,
+                mail(&[], Some(good)),
+                "{good}"
+            );
         }
     }
 
@@ -3551,155 +4192,72 @@ mod tests {
         );
     }
 
-    /// **`from=` IS SINGULAR.** The fold that reassembles `kinds=`'s comma list
-    /// will hand `from=` a second piece, and `mail:from=h-a,h-b` was taken
-    /// verbatim and matched NOTHING — a live-looking subscription that says
-    /// nothing, the exact failure the fail-closed rule exists to prevent.
-    #[test]
-    fn a_from_selector_is_one_class_or_one_principal() {
-        let from = |s: &str| Requested::parse(s).map(|r| r.mail.from);
-        for good in [
-            "human",
-            "agent",
-            "service",
-            "other",
-            "h-andrew",
-            "s-w1@n-lab",
-            "a-svc",
-        ] {
-            assert_eq!(
-                from(&format!("mail:from={good}")),
-                Some(Some(good.to_string())),
-                "{good}"
-            );
-        }
-        for bad in [
-            "mail:from=h-andrew,h-bob", // a list: the defect
-            "mail:from=human,agent",
-            "mail:from=andrew", // no class prefix, not a class
-            "mail:from=h-",     // a prefix and nothing else
-            "mail:from=h-a b",
-        ] {
-            assert_eq!(Requested::parse(bad), None, "{bad} must fail closed");
-        }
-    }
-
-    /// Stream parsing: a subset of the known streams parses; an empty list or a
-    /// typo fails closed (so a bad request never silently subscribes to nothing).
+    /// Stream parsing: a subset of the known streams parses, comma or space
+    /// separated. `trim` and `ts`/`timestamps` are MODIFIERS: beside a frame
+    /// source they land on the per-target set (`trim`) or outside both stream
+    /// sets (`timestamps`, which restamps frames and authorizes none); alone, or
+    /// with only other modifiers, they name no source and fail closed, as an
+    /// empty list, a typo or one bad token does — otherwise the connection acks
+    /// `OK subscribe 1` and stays silent forever, indistinguishable from a hang.
+    /// `sessions` alone is a frame source (an instance-scoped one): it parses
+    /// here and is REFUSED later, by authority, not by the grammar.
     #[test]
     fn streams_parse_subset_and_fail_closed() {
-        assert_eq!(
-            Requested::parse("screen"),
+        let req = |targets: TargetStreams, timestamps: bool| {
             Some(Requested {
-                targets: targets_of(true, false, false),
+                targets,
+                timestamps,
                 ..Default::default()
             })
-        );
-        assert_eq!(
-            Requested::parse("screen,cursor,events"),
-            Some(Requested {
-                targets: targets_of(true, true, true),
-                ..Default::default()
-            }),
-        );
-        assert_eq!(
-            Requested::parse("cursor screen"),
-            Some(Requested {
-                targets: targets_of(true, true, false),
-                ..Default::default()
-            }),
-        );
-        assert_eq!(Requested::parse(""), None, "empty fails closed");
-        assert_eq!(
-            Requested::parse("bogus"),
-            None,
-            "unknown stream fails closed"
-        );
-        assert_eq!(
-            Requested::parse("screen,bogus"),
-            None,
-            "one bad token fails the whole list"
-        );
-    }
-
-    /// `trim` is a MODIFIER inside the stream list: beside a frame source it parses
-    /// and lands on the per-target set (it shapes the `screen` frame); alone, or
-    /// with only other modifiers, it names no source and fails closed like `ts`.
-    /// A `trim` AFTER the list is not this parser's business — the handler's
-    /// unknown-arg rule refuses it, exactly as it refuses a trailing `ts`.
-    #[test]
-    fn trim_modifier_parses_inside_the_stream_list_and_never_alone() {
-        assert_eq!(
-            Requested::parse("screen,trim"),
-            Some(Requested {
-                targets: TargetStreams {
-                    screen: true,
-                    trim: true,
+        };
+        let trimmed = TargetStreams {
+            screen: true,
+            trim: true,
+            ..Default::default()
+        };
+        let cells_bytes = |screen| TargetStreams {
+            cells: true,
+            bytes: true,
+            screen,
+            ..Default::default()
+        };
+        for (input, want) in [
+            ("screen", req(targets_of(true, false, false), false)),
+            (
+                "screen,cursor,events",
+                req(targets_of(true, true, true), false),
+            ),
+            ("cursor screen", req(targets_of(true, true, false), false)),
+            ("cells,bytes,screen", req(cells_bytes(true), false)),
+            (
+                "screen,timestamps",
+                req(targets_of(true, false, false), true),
+            ),
+            ("cursor ts", req(targets_of(false, true, false), true)),
+            ("ts,screen", req(targets_of(true, false, false), true)),
+            ("screen,trim", req(trimmed, false)),
+            ("trim screen ts", req(trimmed, true)),
+            (
+                "sessions",
+                Some(Requested {
+                    instance: RequestedInstance { sessions: true },
                     ..Default::default()
-                },
-                ..Default::default()
-            })
-        );
-        assert_eq!(
-            Requested::parse("trim screen ts"),
-            Some(Requested {
-                targets: TargetStreams {
-                    screen: true,
-                    trim: true,
-                    ..Default::default()
-                },
-                timestamps: true,
-                ..Default::default()
-            })
-        );
-        assert_eq!(Requested::parse("trim"), None, "bare modifier");
-        assert_eq!(Requested::parse("trim,ts"), None, "only modifiers");
-    }
-
-    /// A list of MODIFIERS ONLY parses every token yet names no frame source. It
-    /// must fail closed: otherwise the connection acks `OK subscribe 1`, flips to
-    /// push-only, and then stays silent forever — indistinguishable from a hang.
-    #[test]
-    fn modifier_only_stream_list_fails_closed() {
-        assert_eq!(Requested::parse("timestamps"), None, "bare modifier");
-        assert_eq!(Requested::parse("ts"), None, "bare modifier alias");
-        assert_eq!(Requested::parse("ts,timestamps"), None, "only modifiers");
-        // Non-vacuity: the same modifier ALONGSIDE a frame source still parses.
-        assert!(Requested::parse("ts,screen").is_some());
-        // `sessions` alone is a frame source (an instance-scoped one), so it parses
-        // here — it is REFUSED later, by authority, not by the grammar.
-        assert_eq!(
-            Requested::parse("sessions"),
-            Some(Requested {
-                instance: RequestedInstance { sessions: true },
-                ..Default::default()
-            })
-        );
-    }
-
-    /// AUTHORITY SCOPE: `sessions` is instance-wide, so only an Owner subscription
-    /// can hold it. The per-target `ReadScreen` gate resolves the selectors the
-    /// client named and cannot speak for the rest of the instance roster, so an Edge
-    /// scope gets the EMPTY instance set even when it asks — and there is no other
-    /// way to build a non-empty one (the field is private and `authorize` is the
-    /// only constructor, which is a compile-level fact this test cannot express).
-    #[test]
-    fn only_owner_is_granted_the_instance_sessions_stream() {
-        let asked = RequestedInstance { sessions: true };
-        assert!(
-            InstanceStreams::authorize(asked, Scope::Owner).sessions(),
-            "Owner already holds the roster via the `sessions`/`who` verbs"
-        );
-        let edge = Scope::Edge(aterm_session::EdgeToken::from_bytes([7u8; 32]));
-        assert!(
-            !InstanceStreams::authorize(asked, edge).sessions(),
-            "a per-target edge cannot authorize the instance roster"
-        );
-        // And an Owner that did not ask still does not get it.
-        assert!(
-            !InstanceStreams::authorize(RequestedInstance::default(), Scope::Owner).sessions(),
-            "authorize grants, it does not add"
-        );
+                }),
+            ),
+            ("", None),
+            ("bogus", None),
+            ("screen,bogus", None),
+            ("trim", None),
+            ("trim,ts", None),
+            ("timestamps", None),
+            ("ts", None),
+            ("ts,timestamps", None),
+        ] {
+            assert_eq!(Requested::parse(input), want, "{input:?}");
+        }
+        for single in ["cells", "bytes"] {
+            assert!(Requested::parse(single).is_some(), "{single:?}");
+        }
     }
 
     /// CORE coalescing claim at the FRAME level: a screen DELTA is emitted only when
@@ -3794,46 +4352,6 @@ mod tests {
         );
     }
 
-    /// MULTIPLEX: two distinct watches produce frames tagged with their OWN sid, so
-    /// a single connection watching both can demultiplex by the leading `<sid>`.
-    #[test]
-    fn multiplex_two_sids_tag_their_own_deltas() {
-        let term_a = Arc::new(Mutex::new(Terminal::new(24, 80)));
-        let term_b = Arc::new(Mutex::new(Terminal::new(24, 80)));
-        crate::term_lock(&term_a).process(b"alpha");
-        crate::term_lock(&term_b).process(b"bravo");
-        let streams = TargetStreams {
-            screen: true,
-            ..Default::default()
-        };
-        let mut wa = watch_on(1, &term_a);
-        let mut wb = watch_on(2, &term_b);
-
-        let fa = wake_text(&mut wa, streams, true);
-        let fb = wake_text(&mut wb, streams, true);
-        assert!(fa.starts_with("DELTA 1 "), "watch A tags sid 1: {fa:?}");
-        assert!(fa.contains("alpha"));
-        assert!(fb.starts_with("DELTA 2 "), "watch B tags sid 2: {fb:?}");
-        assert!(fb.contains("bravo"));
-    }
-
-    /// A cursor DELTA carries the deterministic cursor state in the SAME wire shape
-    /// the `cursor` verb reports, tagged with the sid.
-    #[test]
-    fn cursor_delta_reports_position_and_style() {
-        let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
-        crate::term_lock(&term).process(b"abc");
-        let streams = TargetStreams {
-            cursor: true,
-            ..Default::default()
-        };
-        let mut w = watch_on(9, &term);
-        let f = wake_text(&mut w, streams, true);
-        // "abc" advances the cursor to col 3 on row 0.
-        assert!(f.contains("DELTA 9 seq="), "sid-tagged cursor delta: {f:?}");
-        assert!(f.contains("cursor 0 3 "), "cursor row/col reported: {f:?}");
-    }
-
     /// `since=<seq>` SEMANTICS at the frame level: seeding `last_sent_seq` to the
     /// CURRENT content seq means a fresh wake emits NOTHING (the client is already
     /// caught up); seeding it BELOW the current content seq emits an immediate
@@ -3872,11 +4390,12 @@ mod tests {
         );
     }
 
-    /// CURSOR STREAM completeness: a pure caret move (CSI H) bumps no `content_seq`,
-    /// so a seq-gated stream would never push it. The `cursor` stream must emit a
-    /// DELTA on the change anyway (its whole purpose), matching the poll `cursor` verb.
+    /// CURSOR STREAM completeness: a pure caret move (CSI H) and a DECTCEM
+    /// hide bump no `content_seq`, so a seq-gated stream would never push
+    /// them. The `cursor` stream emits a DELTA on each anyway (its whole
+    /// purpose), carrying the `<visible>` bit, matching the poll `cursor` verb.
     #[test]
-    fn cursor_only_move_emits_delta_on_unchanged_seq() {
+    fn cursor_stream_emits_moves_and_visibility_on_unchanged_seq() {
         let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
         crate::term_lock(&term).process(b"abc"); // content advances; cursor at (0,3)
         let streams = TargetStreams {
@@ -3885,62 +4404,44 @@ mod tests {
         };
         let mut w = watch_on(5, &term);
         // First wake syncs the cursor watermark off the content advance.
-        assert!(wake_text(&mut w, streams, true).contains("cursor 0 3 "));
-        let seq_before = crate::term_lock(&term).content_seq();
-        // CSI H moves the caret WITHOUT a cell write — content_seq stays put.
-        crate::term_lock(&term).process(b"\x1b[10;5H");
-        assert_eq!(
-            crate::term_lock(&term).content_seq(),
-            seq_before,
-            "a pure cursor move must not bump content_seq (else this tests nothing)"
-        );
-        // The seq is unchanged, but the caret moved to (9,4): a cursor DELTA still fires.
-        let f = wake_text(&mut w, streams, true);
-        assert!(
-            f.contains("cursor 9 4 "),
-            "cursor-only move emits a delta on an unchanged seq: {f:?}"
-        );
+        assert!(wake_text(&mut w, streams, true).contains("cursor 0 3 1 "));
+        let seq = crate::term_lock(&term).content_seq();
+        for (bytes, want) in [
+            (&b"\x1b[10;5H"[..], "cursor 9 4 1 "),
+            (&b"\x1b[?25l"[..], "cursor 9 4 0 "),
+        ] {
+            crate::term_lock(&term).process(bytes);
+            assert_eq!(
+                crate::term_lock(&term).content_seq(),
+                seq,
+                "{want}: the premise: no cell write"
+            );
+            let f = wake_text(&mut w, streams, true);
+            assert!(f.contains(want), "{want}: on an unchanged seq: {f:?}");
+        }
     }
 
-    /// CURSOR VISIBILITY (DECTCEM ?25l/?25h) bumps no `content_seq`, but the `cursor`
-    /// stream carries the `<visible>` bit (matching the poll `cursor` verb), so a pure
-    /// hide/show still emits a DELTA reflecting the flip.
+    /// A RENDER-ONLY change mutates the styled output WITHOUT bumping
+    /// `content_seq`, so a seq-gated `cells` subscriber would show stale state:
+    /// a recolor (OSC 11 default background; OSC 4 is allowed by default in
+    /// the app, but the engine default refuses it), DECSCNM reverse video,
+    /// the CELLS frame's own cursor object (position, DECSCUSR shape, OSC 12
+    /// colour) for a subscriber without the `cursor` stream, and a stationary
+    /// selection's OSC 17/19 colours. The per-wake render signature notices
+    /// each and re-emits a `cells` DELTA at the unchanged seq, with no GAP; an
+    /// unchanged render stays coalesced.
     #[test]
-    fn cursor_visibility_toggle_emits_delta_with_visible_bit() {
-        let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
-        crate::term_lock(&term).process(b"hi"); // caret at (0,2), cursor visible
-        let streams = TargetStreams {
-            cursor: true,
-            ..Default::default()
-        };
-        let mut w = watch_on(1, &term);
-        // First wake syncs; the caret is visible (bit 1).
-        assert!(
-            wake_text(&mut w, streams, true).contains("cursor 0 2 1 "),
-            "initial cursor delta carries visible=1"
-        );
-        let seq_before = crate::term_lock(&term).content_seq();
-        crate::term_lock(&term).process(b"\x1b[?25l"); // DECTCEM hide — no cell write
-        assert_eq!(
-            crate::term_lock(&term).content_seq(),
-            seq_before,
-            "a DECTCEM toggle must not bump content_seq (else this tests nothing)"
-        );
-        let f = wake_text(&mut w, streams, true);
-        assert!(
-            f.contains("cursor 0 2 0 "),
-            "a pure visibility hide emits a cursor delta with visible=0: {f:?}"
-        );
-    }
-
-    /// A RECOLOR (OSC 4 palette / OSC 10-12 dynamic colour) or DECSCNM reverse-video
-    /// mutates the styled output WITHOUT bumping `content_seq`, so a seq-gated `cells`
-    /// subscriber would show stale colours. The per-wake render signature notices it
-    /// and re-emits a `cells` DELTA at the unchanged seq (no GAP).
-    #[test]
-    fn recolor_reemits_cells_on_unchanged_seq() {
-        let term = Arc::new(Mutex::new(Terminal::new(4, 8)));
-        crate::term_lock(&term).process(b"x");
+    fn render_only_changes_reemit_cells_on_unchanged_seq() {
+        use aterm_core::selection::{SelectionSide, SelectionType};
+        let term = Arc::new(Mutex::new(Terminal::new(12, 16)));
+        {
+            let mut t = crate::term_lock(&term);
+            t.process(b"x");
+            let sel = t.text_selection_mut();
+            sel.start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
+            sel.update_selection(0, 7, SelectionSide::Right);
+            sel.complete_selection();
+        }
         let streams = TargetStreams {
             cells: true,
             ..Default::default()
@@ -3948,38 +4449,42 @@ mod tests {
         let mut w = watch_on(1, &term);
         // First wake emits cells and syncs the render signature.
         assert!(wake_text(&mut w, streams, true).contains(" cells "));
-        let seq_before = crate::term_lock(&term).content_seq();
-        // OSC 11: set the default BACKGROUND (the dark/light-toggle path) — a render
-        // change with no cell write. (OSC 4 palette set is gated by
-        // `allow_palette_reconfigure`; OSC 10/11/12 defaults are not.)
-        crate::term_lock(&term).process(b"\x1b]11;rgb:00/00/80\x07");
-        assert_eq!(
-            crate::term_lock(&term).content_seq(),
-            seq_before,
-            "a recolor must not bump content_seq (else this tests nothing)"
-        );
-        let f = wake_text(&mut w, streams, true);
+        let seq = crate::term_lock(&term).content_seq();
+        for (bytes, want) in [
+            (&b"\x1b]11;rgb:00/00/80\x07"[..], " cells "),
+            (&b"\x1b[?5h"[..], " cells "),
+            (
+                &b"\x1b[10;5H"[..],
+                "\"cursor\":{\"row\":9,\"col\":4,\"visible\":true",
+            ),
+            (&b"\x1b[6 q"[..], "\"style\":\"steady_bar\""),
+            (&b"\x1b]12;rgb:ab/cd/ef\x07"[..], "\"color\":\"abcdef\""),
+            (
+                &b"\x1b]17;rgb:12/34/56\x07"[..],
+                "\"selection_bg\":\"123456\"",
+            ),
+            (
+                &b"\x1b]19;rgb:fe/dc/ba\x07"[..],
+                "\"selection_fg\":\"fedcba\"",
+            ),
+        ] {
+            let name = String::from_utf8_lossy(bytes).escape_debug().to_string();
+            crate::term_lock(&term).process(bytes);
+            assert_eq!(
+                crate::term_lock(&term).content_seq(),
+                seq,
+                "{name}: the premise: a render-only change"
+            );
+            let f = wake_text(&mut w, streams, true);
+            assert!(
+                f.contains(" cells ") && f.contains(&format!("seq={seq} ")) && f.contains(want),
+                "{name}: re-emits a cells DELTA at the unchanged seq: {f:?}"
+            );
+            assert!(!f.contains("GAP"), "{name}: no GAP resync: {f:?}");
+        }
         assert!(
-            f.contains("cells ") && f.contains(&format!("seq={seq_before} ")),
-            "recolor re-emits a cells DELTA at the unchanged seq: {f:?}"
-        );
-        assert!(
-            !f.contains("GAP"),
-            "a render-only change needs no GAP resync: {f:?}"
-        );
-
-        // DECSCNM reverse-video (a distinct render path via the reverse_video accessor)
-        // likewise re-emits at an unchanged seq.
-        let seq2 = crate::term_lock(&term).content_seq();
-        crate::term_lock(&term).process(b"\x1b[?5h"); // DECSCNM on
-        assert_eq!(
-            crate::term_lock(&term).content_seq(),
-            seq2,
-            "DECSCNM bumps no content_seq"
-        );
-        assert!(
-            wake_text(&mut w, streams, true).contains("cells "),
-            "a DECSCNM flip re-emits a cells DELTA at the unchanged seq"
+            frames_for_watch(&mut w, streams, true).is_empty(),
+            "an unchanged render stays coalesced"
         );
     }
 
@@ -4040,7 +4545,7 @@ mod tests {
             cells: true,
             ..Default::default()
         };
-        let mut watch = test_watch(term.clone());
+        let mut watch = watch_on(1, &term);
         assert!(
             wake_text(&mut watch, streams, true).contains(" cells "),
             "first wake establishes the cells/render watermarks"
@@ -4082,103 +4587,6 @@ mod tests {
         );
     }
 
-    /// OSC 17/19 recolor a stationary selection without a grid write. Both the
-    /// render signature and the pushed payload must carry those changes.
-    #[test]
-    fn selection_recolor_reemits_cells_on_unchanged_seq() {
-        use aterm_core::selection::{SelectionSide, SelectionType};
-
-        let term = Arc::new(Mutex::new(Terminal::new(2, 8)));
-        {
-            let mut t = crate::term_lock(&term);
-            t.process(b"x");
-            let sel = t.text_selection_mut();
-            sel.start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
-            sel.update_selection(0, 7, SelectionSide::Right);
-            sel.complete_selection();
-        }
-        let streams = TargetStreams {
-            cells: true,
-            ..Default::default()
-        };
-        let mut watch = test_watch(term.clone());
-        assert!(wake_text(&mut watch, streams, true).contains(" cells "));
-        let seq = crate::term_lock(&term).content_seq();
-
-        crate::term_lock(&term).process(b"\x1b]17;rgb:12/34/56\x07");
-        assert_eq!(
-            crate::term_lock(&term).content_seq(),
-            seq,
-            "OSC 17 is render-only"
-        );
-        let background = wake_text(&mut watch, streams, true);
-        assert!(
-            background.contains(" cells ") && background.contains("\"selection_bg\":\"123456\""),
-            "OSC 17 must push the new selection fill: {background:?}"
-        );
-
-        crate::term_lock(&term).process(b"\x1b]19;rgb:fe/dc/ba\x07");
-        assert_eq!(
-            crate::term_lock(&term).content_seq(),
-            seq,
-            "OSC 19 is render-only"
-        );
-        let foreground = wake_text(&mut watch, streams, true);
-        assert!(
-            foreground.contains(" cells ") && foreground.contains("\"selection_fg\":\"fedcba\""),
-            "OSC 19 must push the new selected-text ink: {foreground:?}"
-        );
-    }
-
-    /// A styled CELLS frame contains its own cursor object. Therefore a cells-only
-    /// subscriber (without the separate `cursor` stream) must refresh on pure
-    /// position/style/color changes at an unchanged content sequence.
-    #[test]
-    fn cursor_only_change_reemits_cells_on_unchanged_seq() {
-        let term = Arc::new(Mutex::new(Terminal::new(12, 16)));
-        crate::term_lock(&term).process(b"x");
-        let streams = TargetStreams {
-            cells: true,
-            ..Default::default()
-        };
-        let mut watch = test_watch(term.clone());
-        assert!(wake_text(&mut watch, streams, true).contains(" cells "));
-        let seq = crate::term_lock(&term).content_seq();
-
-        crate::term_lock(&term).process(b"\x1b[10;5H");
-        assert_eq!(
-            crate::term_lock(&term).content_seq(),
-            seq,
-            "pure cursor move is render-only"
-        );
-        let moved = wake_text(&mut watch, streams, true);
-        assert!(
-            moved.contains(" cells ")
-                && moved.contains("\"cursor\":{\"row\":9,\"col\":4,\"visible\":true"),
-            "cells-only watcher must receive the moved cursor: {moved:?}"
-        );
-
-        crate::term_lock(&term).process(b"\x1b[6 q");
-        assert_eq!(crate::term_lock(&term).content_seq(), seq);
-        let shaped = wake_text(&mut watch, streams, true);
-        assert!(
-            shaped.contains(" cells ") && shaped.contains("\"style\":\"steady_bar\""),
-            "cells-only watcher must receive DECSCUSR: {shaped:?}"
-        );
-
-        crate::term_lock(&term).process(b"\x1b]12;rgb:ab/cd/ef\x07");
-        assert_eq!(crate::term_lock(&term).content_seq(), seq);
-        let colored = wake_text(&mut watch, streams, true);
-        assert!(
-            colored.contains(" cells ") && colored.contains("\"color\":\"abcdef\""),
-            "cells-only watcher must receive OSC 12 cursor color: {colored:?}"
-        );
-        assert!(
-            frames_for_watch(&mut watch, streams, true).is_empty(),
-            "unchanged cursor overlay must remain coalesced"
-        );
-    }
-
     /// ALT-SCREEN swap (1049) does not move the MAIN grid's `content_seq`, so a swap
     /// landing on a seq the client already saw would be invisible to a pure seq
     /// compare. A flag flip must force a resync (GAP + full frame) even at equal seq.
@@ -4209,89 +4617,6 @@ mod tests {
         assert!(w.last_alt, "the alt watermark is updated after the resync");
     }
 
-    /// ITEM 2: the `cells` and `bytes` stream tokens parse (additively with the
-    /// existing screen/cursor/events).
-    #[test]
-    fn streams_parse_accepts_cells_and_bytes() {
-        assert_eq!(
-            Requested::parse("cells"),
-            Some(Requested {
-                targets: TargetStreams {
-                    cells: true,
-                    ..Default::default()
-                },
-                ..Default::default()
-            })
-        );
-        assert_eq!(
-            Requested::parse("bytes"),
-            Some(Requested {
-                targets: TargetStreams {
-                    bytes: true,
-                    ..Default::default()
-                },
-                ..Default::default()
-            })
-        );
-        assert_eq!(
-            Requested::parse("cells,bytes,screen"),
-            Some(Requested {
-                targets: TargetStreams {
-                    cells: true,
-                    bytes: true,
-                    screen: true,
-                    ..Default::default()
-                },
-                ..Default::default()
-            }),
-        );
-        // `timestamps` / `ts` are MODIFIER tokens (no own frames), so they land
-        // OUTSIDE both stream sets — they restamp frames, they never authorize any.
-        assert_eq!(
-            Requested::parse("screen,timestamps"),
-            Some(Requested {
-                targets: targets_of(true, false, false),
-                timestamps: true,
-                ..Default::default()
-            })
-        );
-        assert_eq!(
-            Requested::parse("cursor ts"),
-            Some(Requested {
-                targets: targets_of(false, true, false),
-                timestamps: true,
-                ..Default::default()
-            })
-        );
-    }
-
-    /// The `timestamps` modifier prefixes a wake's frames with a `T <sid> <t_us>`
-    /// line (one per wake, video's `now_us` clock), turning the stream into a timed
-    /// frame source. Off by default (byte-identical un-timestamped stream).
-    #[test]
-    fn timestamps_prefixes_a_wake_with_a_t_line() {
-        let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
-        crate::term_lock(&term).process(b"hello");
-        let streams = TargetStreams {
-            screen: true,
-            ..Default::default()
-        };
-        let mut w = watch_on(7, &term);
-        let f = String::from_utf8(wire(true, frames_for_watch(&mut w, streams, true))).unwrap();
-        assert!(f.starts_with("T 7 "), "wake prefixed with a T line: {f:?}");
-        assert!(
-            f.contains("\nDELTA 7 "),
-            "the frames follow the T line: {f:?}"
-        );
-        // Without the modifier, no T line.
-        let mut w2 = watch_on(7, &term);
-        let f2 = String::from_utf8(wire(false, frames_for_watch(&mut w2, streams, true))).unwrap();
-        assert!(
-            f2.starts_with("DELTA 7 "),
-            "no T line without the modifier: {f2:?}"
-        );
-    }
-
     /// 4.5: the stamp is the EGRESS's, not one producer's. A `bytes`-only
     /// subscription with `timestamps` gets its `BYTES` bursts stamped — the frame
     /// kind that could never be stamped while the `T` line was written inside
@@ -4316,23 +4641,12 @@ mod tests {
             stamped.contains("\nBYTES 7 3\nout\n"),
             "the burst follows its stamp, byte-exact: {stamped:?}"
         );
-    }
 
-    /// NEGATIVE CONTROL for [`bytes_only_subscription_gets_its_bursts_stamped`]:
-    /// prove the assertion is not vacuous. The stamp must be absent when the modifier
-    /// is off (else `starts_with("T 7 ")` would be testing the `BYTES` header's own
-    /// shape), and it must appear exactly ONCE per tag per wake (else "stamped" would
-    /// be satisfied by a per-frame stamp, which is a different, chattier contract).
-    #[test]
-    fn the_bytes_stamp_is_opt_in_and_once_per_wake_non_vacuous() {
-        let fan = Arc::new(ByteFanout::new());
-        let term = Arc::new(Mutex::new(Terminal::new(2, 4)));
-        let bs = fan.subscribe();
+        // NEGATIVE CONTROL: the stamp is absent when the modifier is off (else
+        // `starts_with("T 7 ")` would be testing the `BYTES` header's own shape),
+        // and it appears exactly ONCE per tag per wake (else "stamped" would be
+        // satisfied by a per-frame stamp, a different, chattier contract).
         fan.tee(&Arc::from(&b"a"[..]));
-        let w = Watch {
-            byte_sub: Some(bs),
-            ..watch_on(7, &term)
-        };
         let unstamped = String::from_utf8(wire(false, drain_bytes_frames(&w))).unwrap();
         assert_eq!(
             unstamped, "BYTES 7 1\na\n",
@@ -4424,7 +4738,7 @@ mod tests {
 
         // Nothing new: no frames, watermark stays.
         let mut out = String::new();
-        let wm = drain_timeline_events(&timeline, "7", seeded, &mut out);
+        let wm = drain_timeline_events(&timeline, "7", seeded, true, &mut out);
         assert!(
             out.is_empty(),
             "no replay of pre-subscription history: {out}"
@@ -4442,7 +4756,7 @@ mod tests {
             .unwrap()
             .record("state-change", "state=exited".to_string());
         let mut out = String::new();
-        let wm = drain_timeline_events(&timeline, "7", wm, &mut out);
+        let wm = drain_timeline_events(&timeline, "7", wm, true, &mut out);
         assert_eq!(
             out, "EVENT 7 meta field=title value=build%20agent\n",
             "exactly the meta record, verbatim payload"
@@ -4450,36 +4764,16 @@ mod tests {
         assert_eq!(wm, Some(4), "watermark passes the non-meta record too");
         // Drained again: silence (no double emit).
         let mut out = String::new();
-        let wm2 = drain_timeline_events(&timeline, "7", wm, &mut out);
+        let wm2 = drain_timeline_events(&timeline, "7", wm, true, &mut out);
         assert!(out.is_empty());
         assert_eq!(wm2, Some(4));
-    }
-
-    /// A person started typing (`app_input::note_person` records the
-    /// `human` row once per burst): the digest pushes `EVENT <local> human`,
-    /// bare — no trailing space, nothing a parser must strip. NEGATIVE
-    /// CONTROL: the `spawned` row beside it is not pushed.
-    #[test]
-    fn a_human_row_pushes_a_bare_event() {
-        let timeline = std::sync::Arc::new(std::sync::Mutex::new(
-            crate::session_timeline::SessionTimeline::default(),
-        ));
-        let seeded = initial_timeline_watermark(
-            &timeline,
-            TargetStreams {
-                events: true,
-                ..Default::default()
-            },
-        );
-        {
-            let mut t = timeline.lock().unwrap();
-            t.record("spawned", "state=alive".to_string());
-            t.record("human", String::new());
-        }
+        // A person started typing (`app_input::note_person` records the
+        // `human` row once per burst): `EVENT <local> human`, bare — no
+        // trailing space, nothing a parser must strip.
+        timeline.lock().unwrap().record("human", String::new());
         let mut out = String::new();
-        let wm = drain_timeline_events(&timeline, "7", seeded, &mut out);
+        drain_timeline_events(&timeline, "7", wm2, true, &mut out);
         assert_eq!(out, "EVENT 7 human\n");
-        assert_eq!(wm, Some(2));
     }
 
     /// A WATERMARK BELOW THE RETAINED LOW IS A HOLE, AND IT IS SAID. The
@@ -4511,7 +4805,7 @@ mod tests {
             .unwrap()
             .record("topic", "add t since=head".to_string());
         let mut out = String::new();
-        let wm = drain_timeline_events(&timeline, "7", seeded, &mut out);
+        let wm = drain_timeline_events(&timeline, "7", seeded, true, &mut out);
         assert_eq!(out, "EVENT 7 topic add t since=head\n");
         assert_eq!(wm, Some(2));
         // Past the ring: the ring keeps the newest TIMELINE_CAP of these.
@@ -4528,7 +4822,7 @@ mod tests {
         assert_eq!(high, 2 + TIMELINE_CAP as u64 + 5);
         assert_eq!(low, high - TIMELINE_CAP as u64 + 1);
         let mut out = String::new();
-        let wm = drain_timeline_events(&timeline, "7", wm, &mut out);
+        let wm = drain_timeline_events(&timeline, "7", wm, true, &mut out);
         let missed = low - 2 - 1; // ids 3 ..= low-1 are gone
         assert!(
             out.starts_with(&format!("GAP 7 events-dropped={missed}\n")),
@@ -4543,7 +4837,7 @@ mod tests {
         assert_eq!(wm, Some(high));
         // Drained again: silence.
         let mut out = String::new();
-        drain_timeline_events(&timeline, "7", wm, &mut out);
+        drain_timeline_events(&timeline, "7", wm, true, &mut out);
         assert!(out.is_empty());
     }
 
@@ -4619,6 +4913,228 @@ mod tests {
         );
     }
 
+    /// Hold `steps` on this thread ([`HELD_HERE`]) until the guard drops.
+    struct HeldHere;
+
+    impl HeldHere {
+        fn on(steps: &'static [&'static str]) -> Self {
+            HELD_HERE.with(|held| held.set(steps));
+            HeldHere
+        }
+    }
+
+    impl Drop for HeldHere {
+        fn drop(&mut self) {
+            HELD_HERE.with(|held| held.set(&[]));
+        }
+    }
+
+    /// A subscriber socket a test reads while the push loop writes to it: the
+    /// loop's peer probe runs on the loop's own thread, between its writes.
+    #[derive(Clone, Default)]
+    struct Shared(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+    impl Shared {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.borrow()).into_owned()
+        }
+    }
+
+    impl Write for Shared {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// THE `timeline` HOLD STANDS IN FOR A STALLED READER (for the timeline's
+    /// own order), AND A STALLED READER'S TAIL IS LATE, NEVER LOST. While the
+    /// hold stands, a live wake drains nothing off
+    /// the timeline and leaves the watermark where it was, so the record made
+    /// on the first wake is still unwritten at the second. A session that
+    /// leaves the store under the hold gets its closing pass all the same — a
+    /// stopped reader's socket keeps that pass's frames until it reads again —
+    /// so the held record and the `closing` row both precede `exited`. A hold
+    /// that also held the closing pass loses both; an inert one writes the
+    /// record on the first wake.
+    #[test]
+    fn the_timeline_hold_withholds_live_drains_and_never_a_closing_tail() {
+        let store = crate::session_store::new_store();
+        let h = crate::session_store::test_handle(9);
+        let target = target_of(&h);
+        let timeline = h.ctx.timeline.clone();
+        store.write().unwrap_or_else(|p| p.into_inner()).register(h);
+        let registry = new_registry();
+        let wire = Shared::default();
+        let _held = HeldHere::on(&["timeline"]);
+        let mut wakes = 0;
+        let mut hung = hang_detector();
+        push_loop_with_peer_probe(
+            &registry,
+            &store,
+            &[target],
+            PushScopes {
+                streams: TargetStreams {
+                    events: true,
+                    ..Default::default()
+                },
+                instance: InstanceStreams::default(),
+                adopt: AdoptScope::none(),
+            },
+            PushOptions::default(),
+            "",
+            &mut wire.clone(),
+            || {
+                wakes += 1;
+                if wakes == 1 {
+                    timeline
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .record("meta-change", "field=title value=held".to_string());
+                } else if wakes == 2 {
+                    assert_eq!(wire.text(), "", "the first wake's live drain was held");
+                    store
+                        .write()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .deregister_local_as(
+                            9,
+                            crate::session_store::ExitReason::CtlClose,
+                            crate::session_store::ExitActor::Sid("s-boss".into()),
+                        );
+                }
+                hung()
+            },
+        );
+        assert_eq!(
+            wire.text(),
+            "EVENT 9 meta field=title value=held\n\
+             EVENT 9 closing reason=ctl-close by=s-boss\n\
+             EVENT 9 exited\n",
+            "the closing pass drains past the hold: the held record, the ledger row, the end marker"
+        );
+    }
+
+    /// A subscriber socket whose reader STALLS once the wire holds `at` bytes.
+    /// The write that crosses `at` is cut short there, and the next one is
+    /// where the push loop blocks: `stall` runs inside it — on the loop's own
+    /// thread, so while the loop is in `Egress::emit` with the watermark at the
+    /// high its drain read — and the call is refused (`Interrupted`). From then
+    /// on the reader takes three bytes a call. It hangs up once the wire ends
+    /// with `last`.
+    struct Stalling<S: FnMut()> {
+        wire: Vec<u8>,
+        at: usize,
+        stall: Option<S>,
+        last: String,
+    }
+
+    impl<S: FnMut()> Write for Stalling<S> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.flush()?;
+            let n = if self.wire.len() < self.at {
+                buf.len().min(self.at - self.wire.len())
+            } else if let Some(mut stall) = self.stall.take() {
+                stall();
+                return Err(std::io::ErrorKind::Interrupted.into());
+            } else {
+                buf.len().min(3)
+            };
+            self.wire.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.wire.ends_with(self.last.as_bytes()) {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Everything a stalled reader ([`Stalling`]) gets from the shipping push
+    /// loop: one `meta-change` record made on the first wake, and `n` more made
+    /// while the loop is blocked writing the first one's frame.
+    fn stalled_wire(n: usize) -> String {
+        let store = crate::session_store::new_store();
+        let h = crate::session_store::test_handle(9);
+        let target = target_of(&h);
+        let timeline = h.ctx.timeline.clone();
+        store.write().unwrap_or_else(|p| p.into_inner()).register(h);
+        let record = |payload: String| {
+            timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .record("meta-change", payload);
+        };
+        let mut sink = Stalling {
+            wire: Vec::new(),
+            at: 10,
+            stall: Some(|| (0..n).for_each(|i| record(format!("x=s{i}")))),
+            last: format!("EVENT 9 meta x=s{}\n", n - 1),
+        };
+        let mut wakes = 0;
+        let mut hung = hang_detector();
+        push_loop_with_peer_probe(
+            &new_registry(),
+            &store,
+            &[target],
+            PushScopes {
+                streams: TargetStreams {
+                    events: true,
+                    ..Default::default()
+                },
+                instance: InstanceStreams::default(),
+                adopt: AdoptScope::none(),
+            },
+            PushOptions::default(),
+            "",
+            &mut sink,
+            || {
+                wakes += 1;
+                if wakes == 1 {
+                    record("x=before".to_string());
+                }
+                hung()
+            },
+        );
+        String::from_utf8(sink.wire).expect("text frames are UTF-8")
+    }
+
+    /// A STALLED READER'S RECORDS COME AFTER THE STALL, OR IN ITS GAP. A push
+    /// loop blocked writing to a reader that stopped draining has already moved
+    /// the watch's watermark to the high its drain read, and the egress writes
+    /// every frame whole however the reader paces it — cut short, refused,
+    /// three bytes a call. So a record made during the block is above the
+    /// watermark: the next drain pushes it, or counts it in the `GAP` before
+    /// the retained ones if the ring evicted it meanwhile. That is the state
+    /// the test-only `timeline` hold stands in for. A watermark moved past what
+    /// was drained, a frame cut at the short write, or a hole with no `GAP`
+    /// each changes the wire.
+    #[test]
+    fn a_stalled_readers_records_come_after_the_stall_or_in_its_gap() {
+        use crate::session_timeline::TIMELINE_CAP;
+        let stalled = |range: std::ops::Range<usize>| -> String {
+            range.map(|i| format!("EVENT 9 meta x=s{i}\n")).collect()
+        };
+        let before = "EVENT 9 meta x=before\n";
+        assert_eq!(
+            stalled_wire(3),
+            format!("{before}{}", stalled(0..3)),
+            "within the ring: every record made in the stall, after it"
+        );
+        let n = TIMELINE_CAP + 5;
+        assert_eq!(
+            stalled_wire(n),
+            format!("{before}GAP 9 events-dropped=5\n{}", stalled(5..n)),
+            "past the ring: the five it evicted counted, the rest pushed"
+        );
+    }
+
     /// The `bytes` stream drains EVERY burst byte-exactly (incl. non-UTF-8) as
     /// length-prefixed `BYTES` frames — live and every-frame, no coalescing.
     #[test]
@@ -4675,28 +5191,18 @@ mod tests {
         let title = |last: Option<&str>| sample_engine_events(&term, None, last).title;
         // First drain with no watermark emits the current title.
         let sampled = title(None).expect("no watermark must sample a title");
-        let allocation = sampled.as_ptr();
         let wm = drain_title_event("3", Some(sampled), None, &mut out);
         assert!(
             out.contains("EVENT 3 title my%20dir\n"),
             "title emitted + pct-encoded: {out:?}"
         );
-        assert_eq!(
-            wm.as_ref().unwrap().as_ptr(),
-            allocation,
-            "reuse the sample"
-        );
         // A re-scan with the same title emits nothing.
         out.clear();
         let sampled = title(wm.as_deref());
-        assert!(sampled.is_none(), "an idle sample owns no title allocation");
+        assert!(sampled.is_none(), "an idle sample is no change");
         let wm = drain_title_event("3", sampled, wm, &mut out);
         assert!(out.is_empty(), "unchanged title emits nothing: {out:?}");
-        assert_eq!(
-            wm.as_ref().unwrap().as_ptr(),
-            allocation,
-            "keep the watermark"
-        );
+        assert_eq!(wm.as_deref(), Some("my dir"), "keep the watermark");
         // A new title emits again.
         crate::term_lock(&term).process(b"\x1b]2;other\x07");
         out.clear();
@@ -4791,36 +5297,6 @@ mod tests {
             all,
             "no watermark = every completed block, oldest-first"
         );
-    }
-
-    /// The `sessions` stream emits `EVENT * session-created <sid>` for a sid newly
-    /// live and `EVENT * session-exited <sid>` for one gone, and NOTHING for an
-    /// unchanged set (watermark) — so a supervisor learns of a SIBLING spawn/exit
-    /// without polling `ls`.
-    #[test]
-    fn diff_session_events_emits_created_and_exited() {
-        use std::collections::HashSet;
-        let known: HashSet<String> = ["s-aaa".to_string(), "s-bbb".to_string()].into();
-        // A new session (s-ccc) appears; s-bbb is gone.
-        let live: HashSet<String> = ["s-aaa".to_string(), "s-ccc".to_string()].into();
-        let mut out = String::new();
-        diff_session_events(&live, &known, &|_| "", &mut out);
-        assert!(
-            out.contains("EVENT * session-created s-ccc\n"),
-            "created: {out:?}"
-        );
-        assert!(
-            out.contains("EVENT * session-exited s-bbb reason=unknown\n"),
-            "exited (a set diff cannot know why, and says so): {out:?}"
-        );
-        assert!(
-            !out.contains("s-aaa"),
-            "unchanged session emits nothing: {out:?}"
-        );
-        // No change -> nothing.
-        let mut out2 = String::new();
-        diff_session_events(&live, &live, &|_| "", &mut out2);
-        assert!(out2.is_empty(), "unchanged set emits nothing: {out2:?}");
     }
 
     /// A cursor seeded at the current journal high, the way `push_loop` seeds one.
@@ -5035,226 +5511,104 @@ mod tests {
             wake_text(&mut w2, streams, true).contains(" cells "),
             "every-frame re-emits cells on unchanged seq",
         );
-    }
-
-    /// R5 efficiency: an every-frame subscriber does NOT re-emit on a bare liveness
-    /// TIMEOUT (`woke == false`) — only a genuine wake re-serializes the grid. This
-    /// is what keeps an idle animation-mode subscriber from burning a full styled
-    /// gather every 250ms tick.
-    #[test]
-    fn every_frame_does_not_reemit_on_timeout() {
-        let term = Arc::new(Mutex::new(Terminal::new(2, 4)));
-        crate::term_lock(&term).process(b"x");
-        let streams = TargetStreams {
-            cells: true,
-            ..Default::default()
-        };
-        let mut w = Watch {
-            non_coalesced: true,
-            ..watch_on(1, &term)
-        };
-        // First (genuine) wake emits the frame and catches the watermark up.
-        assert!(wake_text(&mut w, streams, true).starts_with("DELTA 1 "));
-        // A TIMEOUT tick on the now-unchanged seq re-emits NOTHING (the efficiency
-        // win); a genuine wake still would (proven by the test above).
+        // R5 efficiency: but not on a bare liveness TIMEOUT (`woke == false`),
+        // which would re-serialize the grid every 250 ms for an idle
+        // animation-mode subscriber.
         assert!(
-            wake_text(&mut w, streams, false).is_empty(),
+            wake_text(&mut w2, streams, false).is_empty(),
             "every-frame must not re-emit on a bare liveness timeout",
         );
-    }
-
-    /// A subscribe target on a session the store never knew — which is what a
-    /// deregistered (pane-closed) session looks like to [`prune_closed`], since the
-    /// only thing it asks is whether the local id still resolves.
-    fn dead_target(local_id: u64, fan: &Arc<ByteFanout>) -> (Store, Vec<ResolvedTarget>) {
-        let target: ResolvedTarget = (
-            local_id,
-            Arc::new(Mutex::new(Terminal::new(4, 8))),
-            fan.clone(),
-            Arc::new(Mutex::new(TurnLedger::default())),
-            Arc::new(Mutex::new(
-                crate::session_timeline::SessionTimeline::default(),
-            )),
-            Arc::default(),
-        );
-        (crate::session_store::new_store(), vec![target])
     }
 
     /// 4.3 — the DATA-LOSS regression test. A session that closes with output still
     /// queued must deliver that tail, and deliver it BEFORE `EVENT <sid> exited`:
     /// `exited` is the client's end-of-stream marker, so anything after it is
     /// unreachable and anything dropped before it is silent loss (the protocol
-    /// promises `GAP` as the ONLY loss marker).
+    /// promises `GAP` as the ONLY loss marker). The same holds with `events` off
+    /// (no `exited` frame at all): the "every watched session closed" exit sits
+    /// BELOW the closing drain, or a `bytes`-only client would get a bare EOF with
+    /// its last burst destroyed and no marker of any kind.
     ///
-    /// The session here is already gone when [`push_loop_with_peer_probe`] starts, so the first
-    /// liveness pass classifies it dead before ANY live per-watch pass can run for
-    /// it — which means every byte in the output below came from [`Closing::drain`]
-    /// and from nowhere else. That is the exact ordering the old `Vec::retain` broke:
-    /// it dropped the `Watch`, and with it the `ByteSubscription` holding the queue.
+    /// The session here is already gone when [`push_loop_with_peer_probe`] starts
+    /// (a subscribe target the store never knew — what a deregistered session
+    /// looks like to [`prune_closed`]), so the first liveness pass classifies it
+    /// dead before ANY live per-watch pass can run for it — which means every byte
+    /// in the output below came from [`Closing::drain`] and from nowhere else. That
+    /// is the exact ordering the old `Vec::retain` broke: it dropped the `Watch`,
+    /// and with it the `ByteSubscription` holding the queue.
     #[test]
     fn a_closed_session_delivers_its_byte_tail_before_exited() {
-        let fan = Arc::new(ByteFanout::new());
-        let (store, targets) = dead_target(11, &fan);
-        let streams = TargetStreams {
-            bytes: true,
-            events: true,
-            ..Default::default()
-        };
-        let registry = new_registry();
-        let mut sink: Vec<u8> = Vec::new();
+        for events in [true, false] {
+            let fan = Arc::new(ByteFanout::new());
+            let targets: Vec<ResolvedTarget> = vec![(
+                11,
+                Arc::new(Mutex::new(Terminal::new(4, 8))),
+                fan.clone(),
+                Arc::new(Mutex::new(TurnLedger::default())),
+                Arc::new(Mutex::new(
+                    crate::session_timeline::SessionTimeline::default(),
+                )),
+                Arc::default(),
+            )];
+            let store = crate::session_store::new_store();
+            let streams = TargetStreams {
+                bytes: true,
+                events,
+                ..Default::default()
+            };
+            let registry = new_registry();
+            let mut sink: Vec<u8> = Vec::new();
 
-        // `push_loop` subscribes to the fan-out itself, and its first wake's
-        // closing pass drains the dead watch: the burst must land between the
-        // two. It is teed from the loop's OWN peer probe, which that wake asks
-        // after its bounded wait and before the closing pass — an instant in the
-        // loop's order, not a race against its 250 ms wait. A feeder thread raced
-        // both edges, a sleep-paced one on either side and a fact-paced one
-        // (`subscriber_count`) still on the far one: descheduled past the wait,
-        // it teed after the drain, into nothing.
-        let mut teed = false;
-        push_loop_with_peer_probe(
-            &registry,
-            &store,
-            &targets,
-            PushScopes {
-                streams,
-                instance: InstanceStreams::default(),
-                adopt: AdoptScope::none(),
-            },
-            PushOptions::default(),
-            "",
-            &mut sink,
-            || {
-                if !std::mem::replace(&mut teed, true) {
-                    assert!(fan.subscriber_count() > 0, "push_loop subscribed first");
-                    fan.tee(&Arc::from(&b"tail-bytes"[..]));
-                }
-                false
-            },
-        );
-        assert!(teed, "REACH: the loop woke once and the burst was teed");
+            // `push_loop` subscribes to the fan-out itself, and its first wake's
+            // closing pass drains the dead watch: the burst must land between the
+            // two. It is teed from the loop's OWN peer probe, which that wake asks
+            // after its bounded wait and before the closing pass — an instant in
+            // the loop's order, not a race against its 250 ms wait (a feeder
+            // thread, descheduled past the wait, teed after the drain, into
+            // nothing).
+            let mut teed = false;
+            push_loop_with_peer_probe(
+                &registry,
+                &store,
+                &targets,
+                PushScopes {
+                    streams,
+                    instance: InstanceStreams::default(),
+                    adopt: AdoptScope::none(),
+                },
+                PushOptions::default(),
+                "",
+                &mut sink,
+                || {
+                    if !std::mem::replace(&mut teed, true) {
+                        assert!(fan.subscriber_count() > 0, "push_loop subscribed first");
+                        fan.tee(&Arc::from(&b"tail-bytes"[..]));
+                    }
+                    false
+                },
+            );
+            assert!(teed, "REACH: the loop woke once and the burst was teed");
 
-        let out = String::from_utf8_lossy(&sink).into_owned();
-        let bytes_at = out.find("BYTES 11 10\ntail-bytes\n");
-        let exited_at = out.find("EVENT 11 exited\n");
-        assert!(
-            bytes_at.is_some(),
-            "the queued tail survived the close: {out:?}"
-        );
-        assert!(exited_at.is_some(), "the close was reported: {out:?}");
-        assert!(
-            bytes_at < exited_at,
-            "the tail precedes the end-of-stream marker: {out:?}"
-        );
-    }
-
-    /// NEGATIVE CONTROL for [`a_closed_session_delivers_its_byte_tail_before_exited`]
-    /// — the house prove-and-catch shape: a guard that would pass with the bug in
-    /// place proves nothing.
-    ///
-    /// Here the SAME dead watch is pruned twice over. Dropping the returned
-    /// [`Closing`] instead of draining it is precisely what `Vec::retain` used to do,
-    /// and it yields nothing at all; draining the identical watch yields the burst.
-    /// So the queue really was still undelivered at prune time, and it really is
-    /// `drain`'s by-value consumption that rescues it.
-    #[test]
-    fn a_dropped_closing_loses_the_tail_negative_control() {
-        let fan = Arc::new(ByteFanout::new());
-        let (store, _targets) = dead_target(12, &fan);
-        let streams = TargetStreams {
-            bytes: true,
-            events: true,
-            ..Default::default()
-        };
-        let term = Arc::new(Mutex::new(Terminal::new(4, 8)));
-        // Two independent subscriptions on one fan-out get one queue each, so both
-        // watches below hold the SAME undelivered burst.
-        let (a, b) = (fan.subscribe(), fan.subscribe());
-        fan.tee(&Arc::from(&b"tail"[..]));
-
-        let mut dropped = vec![Watch {
-            byte_sub: Some(a),
-            ..watch_on(12, &term)
-        }];
-        let closing = prune_closed(&store, &mut dropped);
-        assert!(
-            dropped.is_empty(),
-            "dead on the FIRST pass: no live per-watch drain can have run for it"
-        );
-        assert_eq!(
-            closing.len(),
-            1,
-            "the dead watch is handed back, not dropped"
-        );
-        drop(closing); // exactly what `retain` did
-        assert!(
-            prune_closed(&store, &mut dropped).is_empty(),
-            "nothing is left to re-drain: the tail is unrecoverable once dropped"
-        );
-
-        let mut drained = vec![Watch {
-            byte_sub: Some(b),
-            ..watch_on(12, &term)
-        }];
-        let frames = prune_closed(&store, &mut drained)
-            .pop()
-            .expect("same store, same liveness verdict")
-            .drain(streams);
-        let out = String::from_utf8_lossy(&frame_bytes(&frames)).into_owned();
-        assert!(
-            out.contains("BYTES 12 4\ntail\n"),
-            "the identical watch, DRAINED, still carries the burst: {out:?}"
-        );
-    }
-
-    /// The second half of 4.3: the "every watched session closed" exit must sit BELOW
-    /// the closing drain, not above it. With `events` off there is no `exited` frame
-    /// at all, so a client whose only stream is `bytes` would otherwise get a bare
-    /// socket EOF with its last burst destroyed and no marker of any kind — and the
-    /// protocol promises `GAP` as the only loss marker.
-    #[test]
-    fn the_last_watch_closing_does_not_short_circuit_its_own_tail() {
-        let fan = Arc::new(ByteFanout::new());
-        let (store, targets) = dead_target(13, &fan);
-        let streams = TargetStreams {
-            bytes: true,
-            ..Default::default()
-        };
-        let registry = new_registry();
-        let mut sink: Vec<u8> = Vec::new();
-        // Teed from the loop's own peer probe, between its subscription and the
-        // first closing pass — see the test above.
-        let mut teed = false;
-        push_loop_with_peer_probe(
-            &registry,
-            &store,
-            &targets,
-            PushScopes {
-                streams,
-                instance: InstanceStreams::default(),
-                adopt: AdoptScope::none(),
-            },
-            PushOptions::default(),
-            "",
-            &mut sink,
-            || {
-                if !std::mem::replace(&mut teed, true) {
-                    assert!(fan.subscriber_count() > 0, "push_loop subscribed first");
-                    fan.tee(&Arc::from(&b"last"[..]));
-                }
-                false
-            },
-        );
-        assert!(teed, "REACH: the loop woke once and the burst was teed");
-        let out = String::from_utf8_lossy(&sink).into_owned();
-        assert!(
-            out.contains("BYTES 13 4\nlast\n"),
-            "the sole watch's tail is emitted before the loop returns: {out:?}"
-        );
-        assert!(
-            !out.contains("EVENT 13 exited"),
-            "`exited` belongs to the events stream, which was not requested: {out:?}"
-        );
+            let out = String::from_utf8_lossy(&sink).into_owned();
+            let bytes_at = out.find("BYTES 11 10\ntail-bytes\n");
+            let exited_at = out.find("EVENT 11 exited\n");
+            assert!(
+                bytes_at.is_some(),
+                "events={events}: the queued tail survived the close: {out:?}"
+            );
+            if events {
+                assert!(exited_at.is_some(), "the close was reported: {out:?}");
+                assert!(
+                    bytes_at < exited_at,
+                    "the tail precedes the end-of-stream marker: {out:?}"
+                );
+            } else {
+                assert_eq!(
+                    exited_at, None,
+                    "`exited` belongs to the events stream, which was not requested: {out:?}"
+                );
+            }
+        }
     }
 
     /// The opt-in the announcement tests below are about.
@@ -5546,109 +5900,10 @@ mod tests {
         );
     }
 
-    /// The cap twin. At [`crate::control::MAX_SUBSCRIBE_TARGETS`] watches
-    /// adoption is DEFERRED — the cap must hold, and does — and the roster used
-    /// to announce the deferred session plainly, as if it were watched. It is
-    /// announced AT ONCE still, because the `sessions` stream exists to tell a
-    /// supervisor about sessions it is not watching, but marked
-    /// `watch=deferred`; the adoption that follows when a slot frees is its
-    /// `sub` ack alone, with no second announcement. The probe reads the
-    /// session on the marked line and again on the ack, as the bridge does,
-    /// so the add made in between is learned.
-    ///
-    /// Every step runs on the push loop's thread from what it writes, except
-    /// the kick-off, which waits for the subscription's REGISTRATION: that
-    /// follows the roster seed in `push_loop`, so S lands above the roster
-    /// cursor. The marked line is written by a pass that saw S registered at
-    /// the cap, and the slot is freed on that line, so every pass before it
-    /// had room zero.
-    #[test]
-    fn a_session_deferred_at_the_cap_is_announced_at_once_and_marked() {
-        use crate::control::MAX_SUBSCRIBE_TARGETS as CAP;
-        let store = crate::session_store::new_store();
-        let registry = new_registry();
-        let handles: Vec<crate::session_store::SessionHandle> = (0..CAP as u64)
-            .map(crate::session_store::test_handle)
-            .collect();
-        {
-            let mut g = store.write().unwrap_or_else(|p| p.into_inner());
-            for h in &handles {
-                g.register(h.clone());
-            }
-        }
-        let targets: Vec<ResolvedTarget> = handles.iter().map(target_of).collect();
-        let s = crate::session_store::test_handle(CAP as u64);
-        let mut probe = OptInProbe::new(&s);
-        let kick = {
-            let (store, registry) = (store.clone(), registry.clone());
-            std::thread::spawn(move || {
-                aterm_spec::wait::until_within(
-                    aterm_spec::wait::MUST_HAPPEN,
-                    "the push loop watches session 1",
-                    || (registry.lock().unwrap().watchers(1) > 0).then_some(()),
-                );
-                store.write().unwrap_or_else(|p| p.into_inner()).register(s);
-            })
-        };
-        let mut room_freed = false;
-        let mut acked_at_cap = false;
-        let (ack, deferred) = (probe.ack_line(), probe.deferred_line());
-        let mut sink = Scripted::new(|line: &str| {
-            acked_at_cap |= !room_freed && line == ack;
-            let more = probe.on_line(line);
-            if line == deferred && !room_freed {
-                store
-                    .write()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .deregister_local(0);
-                room_freed = true;
-            }
-            more
-        });
-        push_loop_with_peer_probe(
-            &registry,
-            &store,
-            &targets,
-            bridge_scopes(),
-            PushOptions::default(),
-            "",
-            &mut sink,
-            hang_detector(),
-        );
-        let wire = std::mem::take(&mut sink.wire);
-        drop(sink);
-        kick.join().unwrap();
-
-        assert!(
-            room_freed && probe.acked && probe.beat,
-            "REACH: S was announced at the cap, W0 closed, S was adopted and its \
-             heartbeat came back: {wire:?}"
-        );
-        assert!(
-            !acked_at_cap,
-            "the cap held: S was not adopted while {CAP} watches were live"
-        );
-        let (ack, announced, marked) = probe.order(&wire);
-        assert!(
-            marked.is_some() && marked < ack,
-            "S is announced before a slot frees, marked `watch=deferred`: {wire:?}"
-        );
-        assert_eq!(
-            (announced, wire.matches(&probe.created_line()).count()),
-            (None, 1),
-            "S is announced once, marked, and never again as if watched: {wire:?}"
-        );
-        assert!(
-            probe.learned(&wire),
-            "the `topic add` made after the bridge's first read reached it by no \
-             road — not a later read, not S's watch, no GAP: {wire:?}"
-        );
-    }
-
     /// The deferred session, one pass at a time: announced at once and marked
-    /// by the pass that could not adopt it; a pass that adopts it later acks it
-    /// and says nothing more; one that exits first is announced exiting like
-    /// any other; and the journal's RECOVERY arm marks a newcomer the same way,
+    /// by the pass that could not adopt it; one that exits first is announced
+    /// exiting like any other; and the journal's RECOVERY arm marks a newcomer
+    /// the same way, and acks it when a slot opens,
     /// while the churned sessions nobody could watch net to nothing, as
     /// recovery always has.
     #[test]
@@ -5704,25 +5959,10 @@ mod tests {
             "a deferred session that leaves is announced exiting like any other"
         );
 
-        // Deferred, then a slot opens. Slots are freed by dropping a
-        // PLACEHOLDER (index 0): an adopted watch is pushed at the end, and
-        // dropping it would put its session back in the running for the slot.
-        let b = spawn(2);
-        assert_eq!(
-            pass(&mut watches, &mut sub, &mut cursors),
-            format!("EVENT * session-created {b} watch=deferred\n")
-        );
-        drop(watches.remove(0));
-        assert_eq!(
-            pass(&mut watches, &mut sub, &mut cursors),
-            format!("sub 2 {b}\n"),
-            "the adopting pass acks, and announces nothing a second time"
-        );
-        assert_eq!(pass(&mut watches, &mut sub, &mut cursors), "");
-
-        // RECOVERY. Back at the cap (b took the freed slot): c is deferred,
-        // then d, e registers and d leaves while the journal rolls past the
-        // roster cursor, so recovery has to find e by the set diff.
+        // RECOVERY. Still at the cap: c is deferred, then d, e registers and
+        // d leaves while the journal rolls past the roster cursor, so recovery
+        // has to find e by the set diff. (Deferred, then adopted when a slot
+        // opens: `membership_passes_refine_the_announcement_model`.)
         let c = spawn(3);
         assert_eq!(
             pass(&mut watches, &mut sub, &mut cursors),
@@ -5756,6 +5996,7 @@ mod tests {
             "recovery marks the newcomer it cannot watch, reports the deferred \
              session that left, and nets the churn to nothing"
         );
+        // Slots are freed by dropping PLACEHOLDERS (index 0).
         drop(watches.remove(0));
         drop(watches.remove(0));
         let adopted = pass(&mut watches, &mut sub, &mut cursors);
@@ -5916,7 +6157,7 @@ mod tests {
     #[test]
     fn membership_passes_refine_the_announcement_model() {
         use aterm_spec::interp::State;
-        let model = aterm_spec::derive::subscribe_announcement_order_model();
+        let model = aterm_models_session::subscribe_announcement_order_model();
         const LAW: &str = "NotAnnouncedBeforeItsWatchOrExit";
 
         let admits =
@@ -6283,5 +6524,396 @@ mod tests {
             frames.push_str(&roster);
             self.decided(&frames)
         }
+    }
+}
+
+/// THE `log` STREAM (phase 3A): its grammar, its live and resumed cursors, its
+/// exact gap, the `log` verb's filter, the host tier, and its place in a wake.
+#[cfg(test)]
+mod log_stream_tests {
+    use super::*;
+
+    /// A watch of `timeline`'s log only, from `cursor`, filtered by `filter`.
+    fn log_watch(
+        timeline: &Arc<Mutex<crate::session_timeline::SessionTimeline>>,
+        cursor: Option<aterm_slog::Cursor>,
+        filter: LogFilter,
+    ) -> (Watch, TargetStreams) {
+        let streams = TargetStreams {
+            log: true,
+            ..TargetStreams::default()
+        };
+        let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
+        let target: ResolvedTarget = (
+            1,
+            term,
+            Arc::new(ByteFanout::new()),
+            Arc::new(Mutex::new(TurnLedger::default())),
+            timeline.clone(),
+            Arc::default(),
+        );
+        let opts = PushOptions {
+            log: filter,
+            log_since: cursor,
+            ..PushOptions::default()
+        };
+        (new_watch(&target, streams, &opts), streams)
+    }
+
+    fn text(frames: &[Frame]) -> String {
+        frames
+            .iter()
+            .map(|f| String::from_utf8_lossy(&f.body).into_owned())
+            .collect()
+    }
+
+    /// A timeline whose log holds its session's open.
+    fn timeline() -> Arc<Mutex<crate::session_timeline::SessionTimeline>> {
+        let tl = Arc::new(Mutex::new(
+            crate::session_timeline::SessionTimeline::default(),
+        ));
+        {
+            let mut g = tl.lock().unwrap();
+            let now = g.slog().now();
+            g.slog_mut().open_session(None, now);
+        }
+        tl
+    }
+
+    fn mark(
+        tl: &Mutex<crate::session_timeline::SessionTimeline>,
+        kind: aterm_slog::Kind,
+        src: aterm_slog::Src,
+    ) {
+        let mut g = tl.lock().unwrap();
+        let now = g.slog().now();
+        g.slog_mut()
+            .log_mut_for_journal()
+            .mark(
+                aterm_slog::Mark::new(kind, src, aterm_slog::Conf::Strong),
+                now,
+            )
+            .expect("a mark");
+    }
+
+    /// The handshake's `sub` line of a log-streaming target names where its
+    /// stream starts — the cursor the watch was seeded at, the head for a live
+    /// stream, the resume cursor for `since-log=` — so a reader that resumes
+    /// from the last `LOG` it read (or from there) misses nothing and is shown
+    /// nothing twice. NEGATIVE CONTROL: a watch with no log stream leaves its
+    /// line as it was, byte for byte.
+    #[test]
+    fn a_log_streams_sub_line_names_where_it_starts() {
+        let tl = timeline();
+        mark(&tl, aterm_slog::Kind::Bell, aterm_slog::Src::Engine);
+        let (live, _) = log_watch(&tl, None, LogFilter::default());
+        let ack = "OK subscribe 1\nsub 1 s-aaaa\n";
+        assert_eq!(
+            with_log_anchors(ack, std::slice::from_ref(&live)),
+            "OK subscribe 1\nsub 1 s-aaaa log_seq=2 log_ep=1\n"
+        );
+        let (resumed, _) = log_watch(
+            &tl,
+            Some(aterm_slog::Cursor::new(1, 1)),
+            LogFilter::default(),
+        );
+        assert_eq!(
+            with_log_anchors(ack, std::slice::from_ref(&resumed)),
+            "OK subscribe 1\nsub 1 s-aaaa log_seq=1 log_ep=1\n"
+        );
+        let mut quiet = live;
+        quiet.log = None;
+        assert_eq!(with_log_anchors(ack, std::slice::from_ref(&quiet)), ack);
+    }
+
+    #[test]
+    fn the_log_stream_parses_and_fails_closed() {
+        for (spec, lvl, class) in [
+            ("log", None, false),
+            ("log:lvl=turn", Some(aterm_slog::Lvl::Turn), false),
+            ("log:class=turn", None, true),
+            ("log:lvl=run:class=turn", Some(aterm_slog::Lvl::Run), true),
+            ("log:class=turn:lvl=step", Some(aterm_slog::Lvl::Step), true),
+        ] {
+            let req = Requested::parse(spec).unwrap_or_else(|| panic!("{spec}"));
+            assert!(req.targets.log, "{spec}");
+            assert_eq!(
+                req.log,
+                LogFilter {
+                    lvl,
+                    class_turn: class
+                },
+                "{spec}"
+            );
+        }
+        for bad in [
+            "log:lvl=page",
+            "log:class=step",
+            "log:lvl=turn:lvl=run",
+            "log:foo=1",
+            "log,log",
+            "logs",
+            "log:",
+        ] {
+            assert!(Requested::parse(bad).is_none(), "{bad} must fail closed");
+        }
+        // Regression: a `log:` token after `mail:`'s comma list is its own stream.
+        let both = Requested::parse("mail:kinds=task,log:class=turn").expect("two streams");
+        assert!(both.targets.mail && both.targets.log);
+        assert_eq!(both.mail.kinds, vec!["task".to_string()]);
+        assert!(both.log.class_turn);
+        assert!(aterm_types::control_verbs::SUBSCRIBE_STREAMS.contains(&"log"));
+    }
+
+    /// Live from the head: what was written before the subscribe is not
+    /// pushed; what comes after is, in seq order. Resumed with `since-log=`,
+    /// the records after it are pushed first. An idle wake reads nothing.
+    #[test]
+    fn a_log_watch_is_live_from_the_head_and_replays_from_since_log() {
+        let tl = timeline();
+        mark(&tl, aterm_slog::Kind::Bell, aterm_slog::Src::Engine);
+        let (mut live, streams) = log_watch(&tl, None, LogFilter::default());
+        assert!(
+            frames_for_watch(&mut live, streams, true).is_empty(),
+            "no backlog"
+        );
+        mark(&tl, aterm_slog::Kind::Bell, aterm_slog::Src::Engine);
+        mark(&tl, aterm_slog::Kind::Cwd, aterm_slog::Src::Engine);
+        let got = text(&frames_for_watch(&mut live, streams, true));
+        let lines: Vec<&str> = got.lines().collect();
+        assert_eq!(lines.len(), 2, "{got}");
+        assert!(
+            lines[0].starts_with("LOG 1 3 mark - bell ")
+                && lines[1].starts_with("LOG 1 4 mark - cwd "),
+            "{got}"
+        );
+        assert!(
+            frames_for_watch(&mut live, streams, false).is_empty(),
+            "idle"
+        );
+        let ep = tl.lock().unwrap().slog().log().ep();
+        let (mut resumed, streams) = log_watch(
+            &tl,
+            Some(aterm_slog::Cursor::new(ep, 1)),
+            LogFilter::default(),
+        );
+        let got = text(&frames_for_watch(&mut resumed, streams, true));
+        assert_eq!(got.lines().count(), 3, "seqs 2..=4: {got}");
+        assert!(got.starts_with("LOG 1 2 mark - bell "), "{got}");
+    }
+
+    /// The GAP is the read's own exact count: an eviction (`why=evicted`), a
+    /// cursor of another epoch (`why=reset`), a carried update's hole
+    /// (`why=handoff`); NEGATIVE: no loss, no GAP line.
+    #[test]
+    fn the_log_gap_is_the_reads_exact_count() {
+        let tl = timeline();
+        let ep = tl.lock().unwrap().slog().log().ep();
+        for _ in 0..200 {
+            mark(&tl, aterm_slog::Kind::Bell, aterm_slog::Src::Engine);
+        }
+        let (mut clean, streams) = log_watch(
+            &tl,
+            Some(aterm_slog::Cursor::new(ep, 1)),
+            LogFilter::default(),
+        );
+        assert!(!text(&frames_for_watch(&mut clean, streams, true)).contains("GAP"));
+        tl.lock().unwrap().slog_mut().set_log_byte_budget(2048);
+        let lost = tl.lock().unwrap().slog().log().lost();
+        assert!(lost > 0);
+        let (mut behind, streams) = log_watch(
+            &tl,
+            Some(aterm_slog::Cursor::new(ep, 1)),
+            LogFilter::default(),
+        );
+        let got = text(&frames_for_watch(&mut behind, streams, true));
+        assert!(
+            got.starts_with(&format!("GAP 1 log-lost={lost} why=evicted resync_to=")),
+            "{got}"
+        );
+        let (mut reset, streams) = log_watch(
+            &tl,
+            Some(aterm_slog::Cursor::new(ep + 7, 3)),
+            LogFilter::default(),
+        );
+        assert!(text(&frames_for_watch(&mut reset, streams, true)).starts_with("GAP 1 log-lost="));
+        let (mut reset2, streams) = log_watch(
+            &tl,
+            Some(aterm_slog::Cursor::new(ep + 7, 3)),
+            LogFilter::default(),
+        );
+        assert!(text(&frames_for_watch(&mut reset2, streams, true)).contains(" why=reset "));
+        let head = tl.lock().unwrap().slog().log().last_seq();
+        let (mut across, streams) = log_watch(
+            &tl,
+            Some(aterm_slog::Cursor::new(ep, head)),
+            LogFilter::default(),
+        );
+        {
+            let mut g = tl.lock().unwrap();
+            g.slog_mut().log_mut_for_journal().skip_to(head + 50);
+        }
+        mark(&tl, aterm_slog::Kind::Bell, aterm_slog::Src::Engine);
+        let got = text(&frames_for_watch(&mut across, streams, true));
+        assert!(got.starts_with("GAP 1 log-lost=0 why=handoff "), "{got}");
+        assert!(
+            got.lines().nth(1).is_some_and(|l| l.starts_with("LOG 1 ")),
+            "{got}"
+        );
+    }
+
+    /// The `log` verb's filter, shared: `class=turn` drops steps and plain
+    /// marks, `lvl=run` drops turns; a filtered record moves the cursor (it is
+    /// no loss). The stream never pushes the content tier (no `title=`).
+    #[test]
+    fn the_log_filter_is_the_log_verbs_and_the_tier_is_hosts() {
+        let tl = timeline();
+        let (mut runs, streams) = log_watch(
+            &tl,
+            None,
+            LogFilter {
+                lvl: Some(aterm_slog::Lvl::Run),
+                class_turn: false,
+            },
+        );
+        let (mut class, _) = log_watch(
+            &tl,
+            None,
+            LogFilter {
+                lvl: None,
+                class_turn: true,
+            },
+        );
+        let (mut all, _) = log_watch(&tl, None, LogFilter::default());
+        {
+            let mut g = tl.lock().unwrap();
+            let now = g.slog().now();
+            let log = g.slog_mut().log_mut_for_journal();
+            let run = log
+                .open(
+                    aterm_slog::Open::new(
+                        aterm_slog::Kind::Agent,
+                        aterm_slog::Src::Status,
+                        aterm_slog::Conf::Strong,
+                    ),
+                    now,
+                )
+                .expect("run");
+            let turn = log
+                .open(
+                    aterm_slog::Open::new(
+                        aterm_slog::Kind::Turn,
+                        aterm_slog::Src::Screen,
+                        aterm_slog::Conf::Strong,
+                    )
+                    .under(run),
+                    now,
+                )
+                .expect("turn");
+            log.mark(
+                aterm_slog::Mark::new(
+                    aterm_slog::Kind::Title,
+                    aterm_slog::Src::Engine,
+                    aterm_slog::Conf::Exact,
+                )
+                .at(turn)
+                .fields(
+                    aterm_slog::Fields::new()
+                        .text(aterm_slog::Key::Title, "SECRET TITLE")
+                        .expect("title"),
+                ),
+                now,
+            )
+            .expect("title");
+        }
+        let runs_got = text(&frames_for_watch(&mut runs, streams, true));
+        assert!(
+            runs_got.contains(" open r1 agent ") && !runs_got.contains(" open t1 turn "),
+            "{runs_got}"
+        );
+        let class_got = text(&frames_for_watch(&mut class, streams, true));
+        assert!(
+            class_got.contains(" open t1 turn ") && !class_got.contains(" title"),
+            "{class_got}"
+        );
+        let all_got = text(&frames_for_watch(&mut all, streams, true));
+        assert!(all_got.contains(" mark t1 title "), "{all_got}");
+        assert!(
+            !all_got.contains("SECRET"),
+            "never the content tier: {all_got}"
+        );
+        // The same filter the `log` verb applies.
+        let log = tl.lock().unwrap().slog().log().clone();
+        let q = crate::session_log::LogQuery::parse("lvl=run").expect("q");
+        let verb = crate::session_log::render_log(&log, &q);
+        assert_eq!(
+            verb.lines()
+                .skip(1)
+                .filter(|l| l.contains(" open "))
+                .count(),
+            runs_got.lines().filter(|l| l.contains(" open ")).count() + 1,
+            "the verb also shows the session's open the live stream started after"
+        );
+    }
+
+    /// A closed session's `close - out=…` is pushed before its `EVENT <local>
+    /// exited` (the log drains last in the wake `Closing::drain` runs).
+    #[test]
+    fn a_closed_sessions_close_record_precedes_exited() {
+        let store = crate::session_store::new_store();
+        let h = crate::session_store::test_handle(9);
+        let target: ResolvedTarget = (
+            9,
+            h.term.clone(),
+            h.ctx.byte_fanout.clone(),
+            h.ctx.turns.clone(),
+            h.ctx.timeline.clone(),
+            h.ctx.fabric.clone(),
+        );
+        store.write().unwrap_or_else(|p| p.into_inner()).register(h);
+        let streams = TargetStreams {
+            events: true,
+            log: true,
+            ..Default::default()
+        };
+        let registry = new_registry();
+        let mut sink: Vec<u8> = Vec::new();
+        let mut closed = false;
+        let close_once = || {
+            if !closed {
+                closed = true;
+                store
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .deregister_local_as(
+                        9,
+                        crate::session_store::ExitReason::CtlClose,
+                        crate::session_store::ExitActor::Ctl,
+                    );
+            }
+            false
+        };
+        push_loop_with_peer_probe(
+            &registry,
+            &store,
+            &[target],
+            PushScopes {
+                streams,
+                instance: InstanceStreams::default(),
+                adopt: AdoptScope::none(),
+            },
+            PushOptions::default(),
+            "",
+            &mut sink,
+            close_once,
+        );
+        let out = String::from_utf8_lossy(&sink).into_owned();
+        let close = out
+            .find("LOG 9 2 close - spawn out=ctl-close")
+            .unwrap_or_else(|| panic!("{out}"));
+        let exited = out
+            .find("EVENT 9 exited")
+            .unwrap_or_else(|| panic!("{out}"));
+        assert!(close < exited, "{out}");
     }
 }

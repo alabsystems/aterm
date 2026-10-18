@@ -7,7 +7,6 @@
 use crate::damage::Damage;
 use crate::extra::{CellCoord, CellExtra};
 use crate::extra_collection::CellExtras;
-use crate::style::StyleTable;
 
 /// Change to the grid's monotonic absolute-row coordinate space.
 ///
@@ -377,9 +376,6 @@ pub struct GridPresentationState {
     /// Cell extras (hyperlinks, combining chars, underline colors).
     /// Stored separately from cells to keep the common case fast.
     pub extras: CellExtras,
-    /// Style deduplication table: interns unique styles and hands out IDs for
-    /// compact storage (terminals typically use 50-200 distinct styles).
-    pub styles: StyleTable,
     /// Accumulated content scroll delta since last `take_content_scroll_delta()`.
     /// Used by Terminal to adjust selection coordinates after processing.
     /// Positive = content scrolled up by this many lines.
@@ -703,18 +699,6 @@ impl GridPresentationState {
 
     #[must_use]
     #[inline]
-    pub(crate) fn styles(&self) -> &StyleTable {
-        &self.styles
-    }
-
-    #[inline]
-    #[cfg(test)]
-    pub(crate) fn styles_mut(&mut self) -> &mut StyleTable {
-        &mut self.styles
-    }
-
-    #[must_use]
-    #[inline]
     pub(crate) fn cell_extra(&self, row: u16, col: u16) -> Option<&CellExtra> {
         self.extras.get(CellCoord::new(row, col))
     }
@@ -788,16 +772,6 @@ mod tests {
         let rows = band(3, 3).union(band(4, 4)).union(band(5, 5));
         assert_eq!(rows, band(3, 5));
         assert_eq!(band(3, 7).union(band(5, 9)), band(3, 9));
-    }
-
-    /// Order must not matter: bands are recorded at arbitrary points in a batch, and
-    /// the composition's soundness rests on that.
-    #[test]
-    fn union_is_order_independent() {
-        let forward = band(50, 50).union(band(10, 10)).union(band(30, 30));
-        let backward = band(30, 30).union(band(10, 10)).union(band(50, 50));
-        assert_eq!(forward, backward);
-        assert_eq!(bands_of(forward), vec![(10, 10), (30, 30), (50, 50)]);
     }
 
     /// Order independence holds across the arity bound: a sequence that

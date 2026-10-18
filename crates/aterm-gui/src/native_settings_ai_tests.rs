@@ -7,7 +7,9 @@
 
 use super::*;
 use crate::ai_screen::{AiChoices, AiCli, AiReading, AiState};
-use crate::native_settings::ai_page::{AI_OPEN_FLEET, AI_OPEN_REVIEWS, AI_REFRESH, ai_page_rows};
+use crate::native_settings::ai_page::{
+    AI_FLEET_FETCH, AI_OPEN_FLEET, AI_OPEN_REVIEWS, AI_REFRESH, ai_page_rows,
+};
 use aterm_agent::ai::state::{Mark, State};
 
 /// One CLI as a look would judge it: measured as its row is, wanted.
@@ -36,7 +38,9 @@ fn fixture() -> HarnessState {
     );
     let settings = aterm_agent::ai::config::resolve(
         &local,
-        Some(std::path::Path::new("/dotfiles/ai-fleet.toml")),
+        Some(&aterm_agent::ai::config::FleetSource::Path(
+            "/dotfiles/ai-fleet.toml".into(),
+        )),
         Some(aterm_agent::ai::config::read_fleet(
             "schema = 1\npreferred = \"codex\"\n",
         )),
@@ -72,6 +76,7 @@ fn fixture() -> HarnessState {
                     },
                 ],
                 store_note: None,
+                held: None,
             }),
             unavailable: None,
         },
@@ -176,8 +181,8 @@ fn shown(pages: &[crate::native_ui::CompiledUi], key: &str) -> bool {
         .any(|page| page.semantic(&UiKey::new(key)).is_some())
 }
 
-/// THE ROUTE IS ITS SPECIAL PAGE (§10): Harness's sub-page, the rail's
-/// Harness row selected while it shows; the heading; THIS MACHINE's two
+/// THE ROUTE IS ITS SPECIAL PAGE (§10): Harness's sub-page, its own row
+/// listed and selected under Harness's while it shows; the heading; THIS MACHINE's two
 /// registry rows; the CLIS card's health line, one status row per CLI with a
 /// Sign in only on the one that needs a person, and each "Use on this
 /// machine" switch as its ordinary registry control; REVIEWS and FLEET
@@ -197,12 +202,17 @@ fn the_ai_route_renders_its_cards_and_controls() {
         "AI CLIs"
     );
     assert!(
-        node(&pages, "settings/nav/harness")
+        node(&pages, "settings/nav/ai")
             .state
             .is_some_and(|state| state.selected),
-        "the rail's Harness row stands for its sub-page"
+        "the sub-page's own row is the selected one"
     );
-    assert!(!shown(&pages, "settings/nav/ai"), "no rail row of its own");
+    assert!(
+        !node(&pages, "settings/nav/harness")
+            .state
+            .is_some_and(|state| state.selected),
+        "its parent's row is not"
+    );
     for key in ai_page_rows() {
         let control = node(&pages, &format!("settings/control/{key}"));
         assert_eq!(
@@ -234,14 +244,14 @@ fn the_ai_route_renders_its_cards_and_controls() {
     }
     assert_eq!(
         node(&pages, "ai/reviews/row/reviewers").label,
-        "Reviewers: codex, claude"
+        "Reviewers: codex, claude, but the one asking (aterm.toml)"
     );
     assert_eq!(
-        node(&pages, "ai/reviews/row/from").label,
-        "From: aterm.toml"
+        node(&pages, "ai/reviews/row/permissions").label,
+        "Permissions: the asking agent's own; yolo when you ask"
     );
     assert_eq!(node(&pages, "ai/fleet/row/machine").label, "Machine: m7");
-    for key in [AI_REFRESH, AI_OPEN_REVIEWS, AI_OPEN_FLEET] {
+    for key in [AI_REFRESH, AI_OPEN_REVIEWS, AI_OPEN_FLEET, AI_FLEET_FETCH] {
         assert_eq!(
             node(&pages, key).action.as_ref().map(ActionId::as_str),
             Some(key)
@@ -300,9 +310,13 @@ fn the_ai_routes_presses_are_typed_host_requests() {
         harness(&press(&mut runtime, instance, view, AI_REFRESH)),
         [crate::native_app::HarnessRequest::AiLook]
     );
+    assert_eq!(
+        harness(&press(&mut runtime, instance, view, AI_FLEET_FETCH)),
+        [crate::native_app::HarnessRequest::AiFleetFetch]
+    );
     for (action, key) in [
         (AI_OPEN_REVIEWS, "ai.reviewers"),
-        (AI_OPEN_FLEET, "ai.machine"),
+        (AI_OPEN_FLEET, "ai.fleet"),
     ] {
         let effects = press(&mut runtime, instance, view, action);
         assert!(

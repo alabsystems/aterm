@@ -1,0 +1,54 @@
+# claude-code 2.1.302 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (41x60, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a fresh session's multi-select at 41 columns right after the harness typed the long-term policy text into its free-text row (`question_priority = "long-term"`): the grid from its row 7, the dialog's top rule (the launch card and the prompt above it left out), to its last row, row 59 — the text wrapped over ten rows at column 9, the focus on it, 26 blank rows under the footer, so the grid's last 40 rows begin inside the text (ATERM-KI-1015-1 F2)
+─────────────────────────────────────────
+←  ☒ Checks  ✔ Submit  →
+
+Which checks should run?
+
+  1. [ ] Unit tests (Recommended)
+         Fast
+  2. [ ] Lint
+         Style
+  3. [ ] Fuzz
+         Slow
+❯ 4. [✔] Decide yourself: choose the
+         option that best serves long
+         term correctness and total
+         value even at the cost of short
+         term deliverables. Say which
+         you chose and why in one line
+         and continue without asking
+         again. (Answered by the aterm
+         harness by policy. The user was
+         not asked.)
+     Submit
+─────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate ·
+ctrl+g to edit in Vim · Esc to cancel
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

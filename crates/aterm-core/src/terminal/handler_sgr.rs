@@ -139,16 +139,16 @@ impl SgrStyleHandler<'_> {
             38 => {
                 if let Some(color) = Self::parse_extended_color(&params[i..]) {
                     self.style.fg = color;
-                    return Self::extended_color_skip(&params[i..]);
                 }
+                return Self::extended_color_skip(&params[i..]);
             }
             39 => self.style.fg = PackedColor::DEFAULT_FG,
             40..=47 => self.style.bg = PackedColor::indexed(sgr_color_u8(param - 40)),
             48 => {
                 if let Some(color) = Self::parse_extended_color(&params[i..]) {
                     self.style.bg = color;
-                    return Self::extended_color_skip(&params[i..]);
                 }
+                return Self::extended_color_skip(&params[i..]);
             }
             49 => self.style.bg = PackedColor::DEFAULT_BG,
             58 => {
@@ -158,8 +158,8 @@ impl SgrStyleHandler<'_> {
                     // changes apply.
                     self.transient.current_underline_color = Some(color);
                     self.transient.update_has_transient_extras();
-                    return Self::extended_color_skip(&params[i..]);
                 }
+                return Self::extended_color_skip(&params[i..]);
             }
             59 => {
                 self.transient.current_underline_color = None;
@@ -172,13 +172,23 @@ impl SgrStyleHandler<'_> {
         0
     }
 
-    /// Return extra params to skip for extended color sequences.
+    /// The params an extended colour (`38`, `48`, `58`) consumes after its own
+    /// code, WHETHER OR NOT it selected a colour.
+    ///
+    /// xterm's `parse_extended_colors` (charproc.c) takes the selector and as
+    /// many values as the selector needs (`extended_colors_limit`: 1 for `5`,
+    /// 3 for `2`, none for any other) and moves the SGR loop past them even
+    /// when they are missing or out of range. Returning 0 for a refused colour
+    /// instead re-dispatched its tail as top-level codes: a truncated `38;5`
+    /// turned on blink (5), and `38;2;1;2` set faint, bold and faint again.
+    /// xterm has no SGR 58; the underline colour follows the 38/48 rule.
     #[inline]
     fn extended_color_skip(params: &[u16]) -> usize {
         match params.get(1) {
             Some(&2) => 4, // 38;2;r;g;b
             Some(&5) => 2, // 38;5;n
-            _ => 0,
+            Some(_) => 1,  // an unknown selector consumes itself
+            None => 0,     // a bare 38 at the end of the list
         }
     }
 
@@ -600,27 +610,6 @@ mod tests {
     }
 
     #[test]
-    fn semicolon_rgb_after_sgr_4_colours_the_underline_red() {
-        let mut term = Terminal::new(2, 16);
-        term.process(b"\x1b[4m\x1b[58;2;255;0;0m");
-        assert_eq!(
-            term.transient.current_underline_color,
-            Some(RED),
-            "58;2;255;0;0 is one RGB colour"
-        );
-        assert!(
-            term.style.flags.contains(CellFlags::UNDERLINE),
-            "SGR 4 survives the colour"
-        );
-        term.process(b"TEXT\x1b[0m");
-        assert_eq!(drawn(&mut term, 4), single("TEXT", [255, 0, 0]));
-        assert_eq!(
-            term.transient.current_underline_color, None,
-            "SGR 0 clears the colour"
-        );
-    }
-
-    #[test]
     fn semicolon_indexed_after_sgr_4_colours_the_underline_from_the_palette() {
         let mut term = Terminal::new(2, 16);
         term.process(b"\x1b[4m\x1b[58;5;196m");
@@ -753,35 +742,39 @@ mod tests {
         assert!(term.style.fg == PackedColor::DEFAULT_FG, "4;58;2;r;g;b;39");
     }
 
+    /// A colour the engine refuses still consumes what xterm's
+    /// `parse_extended_colors` consumes: the selector, and the values it
+    /// needs, present or not. Found by the astream-term differential oracle
+    /// (aterm-conformance `tests/vt_oracle`): a truncated `38;5` turned on
+    /// blink, because the refused colour returned its tail to the SGR loop.
     #[test]
-    fn semicolon_forms_consume_exactly_their_sub_parameters() {
-        // Parse and skip must agree on each form's width: 58;2;r;g;b is five
-        // params (four after 58), 58;5;n is three (two after).
-        assert_eq!(
-            SgrStyleHandler::parse_underline_color(&[58, 2, 255, 0, 0]),
-            Some(RED)
-        );
-        assert_eq!(SgrStyleHandler::extended_color_skip(&[58, 2, 255, 0, 0]), 4);
-        assert_eq!(
-            SgrStyleHandler::parse_underline_color(&[58, 5, 196]),
-            Some(IDX_196)
-        );
-        assert_eq!(SgrStyleHandler::extended_color_skip(&[58, 5, 196]), 2);
-        // A truncated triple is refused, never read short.
-        assert_eq!(
-            SgrStyleHandler::parse_underline_color(&[58, 2, 255, 0]),
-            None
-        );
-        // 38/48 use the same skip and the same widths.
-        assert!(
-            SgrStyleHandler::parse_extended_color(&[38, 2, 1, 2, 3])
-                == Some(PackedColor::rgb(1, 2, 3))
-        );
-        assert_eq!(SgrStyleHandler::extended_color_skip(&[38, 2, 1, 2, 3]), 4);
-        assert!(
-            SgrStyleHandler::parse_extended_color(&[48, 5, 7]) == Some(PackedColor::indexed(7))
-        );
-        assert_eq!(SgrStyleHandler::extended_color_skip(&[48, 5, 7]), 2);
-        assert!(SgrStyleHandler::parse_extended_color(&[38, 2, 1, 2]).is_none());
+    fn a_refused_extended_colour_consumes_what_xterm_consumes() {
+        let mut term = Terminal::new(2, 16);
+        for (seq, what) in [
+            (&b"\x1b[31;44m\x1b[38;5m"[..], "38;5 with no index"),
+            (b"\x1b[31;44m\x1b[48;5m", "48;5 with no index"),
+            (b"\x1b[31;44m\x1b[58;5m", "58;5 with no index"),
+            (b"\x1b[31;44m\x1b[38;2;1;2m", "38;2 one value short"),
+            (b"\x1b[31;44m\x1b[48;2m", "48;2 with no values"),
+        ] {
+            term.process(b"\x1b[0m");
+            term.process(seq);
+            assert_eq!(
+                term.style.flags,
+                CellFlags::empty(),
+                "{what}: no stray blink, faint or bold"
+            );
+            assert!(term.style.fg == PackedColor::indexed(1), "{what}: fg kept");
+            assert!(term.style.bg == PackedColor::indexed(4), "{what}: bg kept");
+            assert_eq!(term.transient.current_underline_color, None, "{what}");
+        }
+        // An unknown selector consumes only itself (`extended_colors_limit` is
+        // 0 for it): the 7 is not reverse video, the 1 after it is bold.
+        term.process(b"\x1b[0m\x1b[38;7;1m");
+        assert_eq!(term.style.flags, CellFlags::BOLD, "38;7;1");
+        // A bare 38 at the end of the list consumes nothing and changes nothing.
+        term.process(b"\x1b[0m\x1b[4;38m");
+        assert_eq!(term.style.flags, CellFlags::UNDERLINE, "4;38");
+        assert!(term.style.fg == PackedColor::DEFAULT_FG, "4;38");
     }
 }

@@ -10,7 +10,8 @@ use std::collections::{BTreeSet, VecDeque};
 
 use aterm_agent::harness::upgrade_catalog::{Baked, BakedModel};
 use aterm_agent::harness::upgrade_models::{self as models, Change, Evidence, Priority, ServedRow};
-use aterm_spec::derive::{Model, harness_model_priority_model};
+use aterm_models_harness::harness_model_priority_model;
+use aterm_spec::derive::Model;
 
 use super::{Vars, assert_forged_rejected, assert_transition};
 

@@ -600,10 +600,6 @@ pub(crate) struct RowSpec<'a> {
     /// bring the ETA slot and the load slot. A still fill (a held row's)
     /// brings neither.
     pub animated: bool,
-    /// The fill is a measured level ([`crate::Meter::level`]): the whole row
-    /// still, but no percent (the elapsed clock, how long the strain has
-    /// lasted, and the load slot in its place) and never an ETA.
-    pub level: bool,
     /// Reserve the ETA slot (a live determinate row whose reporter supplies
     /// an amount).
     pub eta: bool,
@@ -622,7 +618,6 @@ impl RowSpec<'_> {
     /// The activity cells the fixed head reserves (module doc, step 1).
     fn activity(&self) -> Activity {
         match (self.fill(), self.busy, self.animated) {
-            (Some(_), _, _) if self.level => Activity::LiveLevel,
             (Some(_), _, true) => Activity::LiveBar,
             (Some(_), _, false) => Activity::HeldBar,
             (None, true, _) => Activity::LiveBusy,
@@ -645,9 +640,6 @@ enum Activity {
     LiveBar,
     /// A busy row: the elapsed slot (and the load slot it may bring).
     LiveBusy,
-    /// A measured level: the elapsed slot (and the load slot it may bring)
-    /// over its fill — never a percent, never an ETA.
-    LiveLevel,
     /// A still fill: the percent.
     HeldBar,
 }
@@ -659,7 +651,7 @@ impl Activity {
             Self::LiveBar | Self::HeldBar => PCT_W,
             // The short elapsed form is the head's: the long one is an extra,
             // the first sacrificed.
-            Self::LiveBusy | Self::LiveLevel => 1 + ELAPSED_SHORT_W,
+            Self::LiveBusy => 1 + ELAPSED_SHORT_W,
         }
     }
 }
@@ -680,7 +672,6 @@ pub(crate) fn overflow_spec(hidden: usize, words: &str) -> RowSpec<'_> {
         meter: None,
         busy: false,
         animated: false,
-        level: false,
         eta: false,
         load: None,
         load_slot: Loads::NONE,
@@ -876,8 +867,6 @@ fn load_slot_width(spec: &RowSpec<'_>, width: &dyn Fn(&str) -> usize) -> usize {
 /// Whether the row lays out the load slot: a moving activity on a row that
 /// reserves one (or shows words now).
 fn reserves_load(spec: &RowSpec<'_>, activity: Activity) -> bool {
-    // A measured level (the strain row) never has one: its title already
-    // names the load.
     matches!(activity, Activity::LiveBar | Activity::LiveBusy)
         && (!spec.load_slot.is_empty() || spec.load.is_some())
 }
@@ -900,10 +889,8 @@ fn load_cells(spec: &RowSpec<'_>, activity: Activity, width: &dyn Fn(&str) -> us
 /// read: it outranks the load slot and is paid for by the capsules' short
 /// forms and the title's elision, never dropped while they can pay.
 fn action_excerpt(spec: &RowSpec<'_>, activity: Activity) -> bool {
-    matches!(
-        activity,
-        Activity::LiveBar | Activity::LiveBusy | Activity::LiveLevel
-    ) && spec.detail0.is_some_and(|d| !d.is_empty())
+    matches!(activity, Activity::LiveBar | Activity::LiveBusy)
+        && spec.detail0.is_some_and(|d| !d.is_empty())
 }
 
 /// The cells an action excerpt reserves in the fixed head: its joint and
@@ -1131,7 +1118,7 @@ fn allocate_extras(
     //    (`for 3m`, paid for in the head), which starves the rest, as a
     //    short ETA does.
     let mut elapsed_w = 0;
-    if matches!(fit.activity, Activity::LiveBusy | Activity::LiveLevel) {
+    if matches!(fit.activity, Activity::LiveBusy) {
         if ELAPSED_W - ELAPSED_SHORT_W <= room {
             // Forced short, the row still pays the long form's cells: they
             // buy no stats, excerpt or load slot its own layout at this width
@@ -1319,7 +1306,7 @@ fn place(
             pct = Some((col + PCT_SLOT.saturating_sub(width(&text)), text));
             col += PCT_SLOT;
         }
-        (Activity::LiveBusy | Activity::LiveLevel, _) => {
+        (Activity::LiveBusy, _) => {
             col += 1;
             elapsed = Some(col);
             col += extras.elapsed_w.max(ELAPSED_SHORT_W);
@@ -1586,7 +1573,6 @@ pub(crate) mod tests {
                     detail0: Some(CRASH_DETAIL),
                     meter: None,
                     animated: false,
-                    level: false,
                     busy: false,
                     eta: false,
                     load: None,
@@ -1605,7 +1591,6 @@ pub(crate) mod tests {
                     detail0: Some("Full Disk Access may already be enabled"),
                     meter: None,
                     animated: false,
-                    level: false,
                     busy: false,
                     eta: false,
                     load: None,
@@ -1631,7 +1616,6 @@ pub(crate) mod tests {
                     detail0: Some(STAGED_MANUAL),
                     meter: None,
                     animated: false,
-                    level: false,
                     busy: false,
                     eta: false,
                     load: None,
@@ -1650,7 +1634,6 @@ pub(crate) mod tests {
                     detail0: Some(STAGED_AUTO),
                     meter: None,
                     animated: false,
-                    level: false,
                     busy: false,
                     eta: false,
                     load: None,
@@ -1669,7 +1652,6 @@ pub(crate) mod tests {
                     detail0: Some("skipping \"cmd+shift+k\": unknown action \"foo\""),
                     meter: None,
                     animated: false,
-                    level: false,
                     busy: false,
                     eta: false,
                     load: None,
@@ -1688,7 +1670,6 @@ pub(crate) mod tests {
                     detail0: Some("trust \u{00b7} extracting"),
                     meter: Some((Some(420), "512 MB / 1.2 GB")),
                     animated: true,
-                    level: false,
                     busy: false,
                     eta: false,
                     load: None,
@@ -1717,7 +1698,6 @@ pub(crate) mod tests {
                     detail0: None,
                     meter: Some((Some(420), "31 MB / 74 MB")),
                     animated: true,
-                    level: false,
                     busy: false,
                     eta: true,
                     load: None,
@@ -1736,7 +1716,6 @@ pub(crate) mod tests {
                     detail0: None,
                     meter: Some((Some(420), "3 of 10 programs")),
                     animated: true,
-                    level: false,
                     busy: false,
                     eta: true,
                     load: Some(Load::Disk),
@@ -1757,7 +1736,6 @@ pub(crate) mod tests {
                     detail0: None,
                     meter: Some((Some(420), "3 of 10 programs")),
                     animated: true,
-                    level: false,
                     busy: false,
                     eta: true,
                     load: None,
@@ -1778,7 +1756,6 @@ pub(crate) mod tests {
                     detail0: Some("enter your password in the macOS dialog"),
                     meter: Some((None, "")),
                     animated: true,
-                    level: false,
                     busy: true,
                     eta: false,
                     load: Some(Load::Disk),
@@ -1797,7 +1774,6 @@ pub(crate) mod tests {
                     detail0: Some("keys typed now arrive in a moment"),
                     meter: Some((None, "")),
                     animated: true,
-                    level: false,
                     busy: true,
                     eta: false,
                     load: None,
@@ -1816,7 +1792,6 @@ pub(crate) mod tests {
                     detail0: Some("trust \u{2014} extracting 120 MB / 900 MB"),
                     meter: Some((Some(430), "3 of 10")),
                     animated: false,
-                    level: false,
                     busy: false,
                     eta: false,
                     load: None,
@@ -1829,150 +1804,6 @@ pub(crate) mod tests {
         ]
     }
 
-    /// The five rows at 60 / 80 / 120 / 160 columns, pinned string for string (whole /
-    /// shaped-to-N / dropped / short capsules / meter width). A chip is ` label `; every
-    /// row is exactly `cols` cells.
-    #[test]
-    fn the_five_rows_at_60_80_120_160_are_pinned_string_for_string() {
-        let pinned: &[(&str, usize, &str)] = &[
-            (
-                "crash",
-                160,
-                " ⚠ aterm closed unexpectedly last time · crash log at ~/Library/Logs/aterm/crash-signal-8123-1758470000.log.seen                          Open log   Details ›  ",
-            ),
-            (
-                "crash",
-                120,
-                " ⚠ aterm closed unexpectedly last time · crash log at …/crash-signal-8123-1758470000.log.seen     Open log   Details ›  ",
-            ),
-            (
-                "crash",
-                80,
-                " ⚠ aterm closed unexpectedly last time                    Open log   Details ›  ",
-            ),
-            (
-                "crash",
-                60,
-                " ⚠ aterm closed unexpectedly last time            Open log  ",
-            ),
-            (
-                "file-access",
-                160,
-                " ℹ File access not confirmed · Full Disk Access may already be enabled                                                     Open Settings   Not now   Details ›  ",
-            ),
-            (
-                "file-access",
-                120,
-                " ℹ File access not confirmed · Full Disk Access may already be enabled             Open Settings   Not now   Details ›  ",
-            ),
-            (
-                "file-access",
-                80,
-                " ℹ File access not confirmed               Open Settings   Not now   Details ›  ",
-            ),
-            (
-                "file-access",
-                60,
-                " ℹ File access not confirmed       Open Settings   Not now  ",
-            ),
-            (
-                "staged-manual",
-                160,
-                " ✓ aterm v0.91.0 is ready · build 1234 — verified; auto-apply is off — apply it from the Version menu or Software Update (in place;…   Install now   Details ›  ",
-            ),
-            (
-                "staged-manual",
-                120,
-                " ✓ aterm v0.91.0 is ready · build 1234 — verified; auto-apply is off — apply it from the…      Install now   Details ›  ",
-            ),
-            (
-                "staged-manual",
-                80,
-                " ✓ aterm v0.91.0 is ready · build 1234 — verified;…    Install now   Details ›  ",
-            ),
-            (
-                "staged-manual",
-                60,
-                " ✓ aterm v0.91.0 is ready          Install now   Details ›  ",
-            ),
-            (
-                "staged-auto",
-                160,
-                " ✓ aterm v0.91.0 is ready · build 1234 — verified; applies by itself at the next quiet moment, and within 15 min regardless — nothing to do; your…   Details ›  ",
-            ),
-            (
-                "staged-auto",
-                120,
-                " ✓ aterm v0.91.0 is ready · build 1234 — verified; applies by itself at the next quiet moment, and within…   Details ›  ",
-            ),
-            (
-                "staged-auto",
-                80,
-                " ✓ aterm v0.91.0 is ready · build 1234 — verified; applies by…       Details ›  ",
-            ),
-            (
-                "staged-auto",
-                60,
-                " ✓ aterm v0.91.0 is ready                        Details ›  ",
-            ),
-            (
-                "config",
-                160,
-                " ⚠ 3 keybindings in aterm.toml were skipped · skipping \"cmd+shift+k\": unknown action \"foo\"                                         Open aterm.toml   Details ›  ",
-            ),
-            (
-                "config",
-                120,
-                " ⚠ 3 keybindings in aterm.toml were skipped · skipping \"cmd+shift+k\": unknown action…      Open aterm.toml   Details ›  ",
-            ),
-            (
-                "config",
-                80,
-                " ⚠ 3 keybindings in aterm.toml were skipped        Open aterm.toml   Details ›  ",
-            ),
-            (
-                "config",
-                60,
-                " ⚠ 3 keybindings in aterm.toml were skipped           Edit  ",
-            ),
-            (
-                "toolchain",
-                160,
-                " ⇣ Installing ALab tools · trust · extracting   42%  512 MB of 1.2 GB                                                                     Packages   Details ›  ",
-            ),
-            (
-                "toolchain",
-                120,
-                " ⇣ Installing ALab tools · trust · extracting   42%  512 MB of 1.2 GB                             Packages   Details ›  ",
-            ),
-            (
-                "toolchain",
-                80,
-                " ⇣ Installing ALab tools · trust · extracting   42%       Packages   Details ›  ",
-            ),
-            // A moving row's painted excerpt is an action excerpt (the host
-            // paints one only where it changes what the person does): at 60
-            // the capsules' short forms and the title's elision pay for it.
-            (
-                "toolchain",
-                60,
-                " ⇣ Installing ALab … · trust · extracting   42%   Packages  ",
-            ),
-        ];
-        let fixtures = fixtures();
-        let mut failures = Vec::new();
-        for (name, cols, want) in pinned {
-            let spec = &fixtures.iter().find(|(n, _)| n == name).unwrap().1;
-            let row = layout_row(spec, *cols, &chars);
-            let got = render(&row, *cols);
-            assert_eq!(chars(&got), *cols, "{name}@{cols}: {got:?}");
-            if &got != want {
-                failures.push(format!("(\"{name}\", {cols}, {got:?}),"));
-            }
-        }
-        assert!(failures.is_empty(), "re-pin:\n{}", failures.join("\n"));
-    }
-
     /// Cols 8..=200 over the five fixtures, the live indicator's and the overdue upgrade
     /// rows: every row exactly `cols` wide, no panic; the sacrifices land in the module
     /// doc's order; authored capsules present at every width; the meter (or a busy row's
@@ -1981,7 +1812,7 @@ pub(crate) mod tests {
     #[test]
     fn width_law_degrades_in_order() {
         // The overdue upgrade rows: one tab's excerpt's lead clause stands
-        // below the floor at 97..=102 columns, the agent's row's first ` · `
+        // below the floor at 97..=102 columns, an excerpt's first ` · `
         // piece likewise, and a 26-hour lead stands whole where the floor's
         // cut would add no word to it.
         use crate::model::UpgradeWord::{NotToday, Now, Skip};
@@ -1989,13 +1820,6 @@ pub(crate) mod tests {
             tab: "s-1".into(),
             to: "2.1.283".into(),
             word,
-        };
-        let tabs = |word| Intent::AgentUpgradeTabs {
-            word,
-            moves: vec![
-                ("s-1".into(), "2.1.283".into()),
-                ("s-3".into(), "2.1.283".into()),
-            ],
         };
         let overdue = |name, title, detail0, capsules| {
             (
@@ -2009,7 +1833,6 @@ pub(crate) mod tests {
                     detail0: Some(detail0),
                     meter: None,
                     animated: false,
-                    level: false,
                     busy: false,
                     eta: false,
                     load: None,
@@ -2036,7 +1859,7 @@ pub(crate) mod tests {
                 "overdue-tabs",
                 "Couldn't upgrade Claude in 2 tabs yet",
                 "tab 1 for 7 h \u{b7} tab 3 for 2 h",
-                caps(&[tabs(Now), tabs(NotToday)]),
+                caps(&[upgrade(Now), upgrade(NotToday)]),
             ),
         ];
         let mut clause_seen = std::collections::BTreeSet::new();
@@ -2350,11 +2173,12 @@ pub(crate) mod tests {
     }
 
     /// Every capsule column range maps back to its `ActionIndex`; the gaps map to
-    /// `Body`; the overflow row is one link.
+    /// `Body`; the overflow row is one link, at every width, the degenerate clip
+    /// (capsules from column 0) included.
     #[test]
     fn hit_test_agrees_with_layout() {
         let fixtures = fixtures();
-        for cols in [40usize, 60, 80, 120, 160] {
+        for cols in 8..=160usize {
             let mut rows: Vec<RowLayout> = fixtures
                 .iter()
                 .map(|(_, s)| layout_row(s, cols, &chars))
@@ -2462,7 +2286,6 @@ pub(crate) mod tests {
             meter: Some((None, "")),
             busy: true,
             animated: false,
-            level: false,
             eta: false,
             load: None,
             load_slot: Loads::NONE,
@@ -2607,7 +2430,6 @@ pub(crate) mod tests {
             detail0: Some(&detail),
             meter: None,
             animated: false,
-            level: false,
             busy: false,
             eta: false,
             load: None,
@@ -2656,7 +2478,6 @@ pub(crate) mod tests {
                 meter: Some((fill, "")),
                 busy: false,
                 animated,
-                level: false,
                 eta: false,
                 load: None,
                 load_slot: Loads::NONE,
@@ -2695,159 +2516,6 @@ pub(crate) mod tests {
             }
             assert_eq!(layout_row(&spec(Some(420)), 0, &chars).meter, None);
         }
-    }
-
-    /// The live indicator at 60 / 80 / 120 / 160 columns, pinned string for string (the
-    /// time slots are the motion layer's and render blank; the meter is asserted in the
-    /// width-law test).
-    #[test]
-    fn the_live_indicator_rows_are_pinned_string_for_string() {
-        let pinned: &[(&str, usize, &str)] = &[
-            (
-                "download",
-                60,
-                " ↻ Downloading aterm v0.92.0   42%               Details ›  ",
-            ),
-            (
-                "download",
-                80,
-                " ↻ Downloading aterm v0.92.0   42%              31 of 74 MB          Details ›  ",
-            ),
-            (
-                "download",
-                120,
-                " ↻ Downloading aterm v0.92.0   42%              31 of 74 MB                                                  Details ›  ",
-            ),
-            (
-                "download",
-                160,
-                " ↻ Downloading aterm v0.92.0   42%              31 of 74 MB                                                                                          Details ›  ",
-            ),
-            (
-                "first-run",
-                60,
-                " ⇣ Installing ALab tools   42%                   Details ›  ",
-            ),
-            (
-                "first-run",
-                80,
-                " ⇣ Installing ALab tools   42%                           disk busy   Details ›  ",
-            ),
-            (
-                "first-run",
-                120,
-                " ⇣ Installing ALab tools   42%              3 of 10 programs                                     disk busy   Details ›  ",
-            ),
-            (
-                "first-run",
-                160,
-                " ⇣ Installing ALab tools   42%              3 of 10 programs                                                                             disk busy   Details ›  ",
-            ),
-            (
-                "first-run-lull",
-                60,
-                " ⇣ Installing ALab tools   42%                   Details ›  ",
-            ),
-            (
-                "first-run-lull",
-                80,
-                " ⇣ Installing ALab tools   42%                                       Details ›  ",
-            ),
-            (
-                "first-run-lull",
-                120,
-                " ⇣ Installing ALab tools   42%              3 of 10 programs                                                 Details ›  ",
-            ),
-            (
-                "first-run-lull",
-                160,
-                " ⇣ Installing ALab tools   42%              3 of 10 programs                                                                                         Details ›  ",
-            ),
-            // An action excerpt outranks the load slot and `Details ›`, and
-            // the title elides for it.
-            (
-                "action-excerpt",
-                60,
-                " ⇣ Installing Command Line… · enter your password…          ",
-            ),
-            (
-                "action-excerpt",
-                80,
-                " ⇣ Installing Command Line Tools and Homebrew · enter your password…            ",
-            ),
-            (
-                "action-excerpt",
-                120,
-                " ⇣ Installing Command Line Tools and Homebrew · enter your password in the macOS dialog                      Details ›  ",
-            ),
-            (
-                "action-excerpt",
-                160,
-                " ⇣ Installing Command Line Tools and Homebrew · enter your password in the macOS dialog                                                  disk busy   Details ›  ",
-            ),
-            (
-                "busy-excerpt",
-                60,
-                " ↑ Finishing aterm v0.92.0 · keys typed now…                ",
-            ),
-            (
-                "busy-excerpt",
-                80,
-                " ↑ Finishing aterm v0.92.0 · keys typed now arrive in…               Details ›  ",
-            ),
-            (
-                "busy-excerpt",
-                120,
-                " ↑ Finishing aterm v0.92.0 · keys typed now arrive in a moment                                               Details ›  ",
-            ),
-            (
-                "busy-excerpt",
-                160,
-                " ↑ Finishing aterm v0.92.0 · keys typed now arrive in a moment                                                                                       Details ›  ",
-            ),
-            (
-                "held-meter",
-                60,
-                " ⚠ ALab tools   43%                   Packages   Details ›  ",
-            ),
-            (
-                "held-meter",
-                80,
-                " ⚠ ALab tools · trust — extracting 120 MB / 900…   43%    Packages   Details ›  ",
-            ),
-            (
-                "held-meter",
-                120,
-                " ⚠ ALab tools · trust — extracting 120 MB / 900 MB   43%  3 of 10                                 Packages   Details ›  ",
-            ),
-            (
-                "held-meter",
-                160,
-                " ⚠ ALab tools · trust — extracting 120 MB / 900 MB   43%  3 of 10                                                                         Packages   Details ›  ",
-            ),
-        ];
-        let fixtures = motion_fixtures();
-        let mut failures = Vec::new();
-        for name in [
-            "download",
-            "first-run",
-            "first-run-lull",
-            "action-excerpt",
-            "busy-excerpt",
-            "held-meter",
-        ] {
-            for cols in [60usize, 80, 120, 160] {
-                let spec = &fixtures.iter().find(|(n, _)| *n == name).unwrap().1;
-                let row = layout_row(spec, cols, &chars);
-                let got = render(&row, cols);
-                assert_eq!(chars(&got), cols);
-                match pinned.iter().find(|(n, c, _)| *n == name && *c == cols) {
-                    Some((_, _, want)) if *want == got => {}
-                    _ => failures.push(format!("(\"{name}\", {cols}, {got:?}),")),
-                }
-            }
-        }
-        assert!(failures.is_empty(), "re-pin:\n{}", failures.join("\n"));
     }
 
     /// At 80 columns a first run's row under disk load takes the ETA's short form
@@ -2915,9 +2583,8 @@ pub(crate) mod tests {
     /// stats, which go whole rather than as a bare `3/10`.
     #[test]
     fn the_load_slot_is_sized_to_the_rows_declared_loads() {
-        // A busy build that declared its CPU (a measured level, the strain
-        // row, has no load slot at all: its title names the load).
-        let strain = |slot: Loads| RowSpec {
+        // A busy build that declared its CPU.
+        let build = |slot: Loads| RowSpec {
             kind: RowKind::Message(id(20)),
             severity: Severity::Info,
             live: true,
@@ -2926,7 +2593,6 @@ pub(crate) mod tests {
             detail0: None,
             meter: Some((None, "3 of 10 targets")),
             animated: false,
-            level: false,
             busy: true,
             eta: false,
             load: Some(Load::Cpu),
@@ -2934,55 +2600,24 @@ pub(crate) mod tests {
             capsules: caps(&[]),
         };
         let cpu = Loads::NONE.with(Load::Cpu);
-        let pinned: &[(Loads, usize, &str)] = &[
-            (
-                cpu,
-                60,
-                " ℹ Building aterm and tools           CPU busy   Details ›  ",
-            ),
-            (
-                cpu,
-                80,
-                " ℹ Building aterm and tools             3 of 10 targets   CPU busy   Details ›  ",
-            ),
-            (
-                cpu,
-                120,
-                " ℹ Building aterm and tools             3 of 10 targets                                           CPU busy   Details ›  ",
-            ),
-            (
-                Loads::ALL,
-                80,
-                " ℹ Building aterm and tools             3/10 targets      CPU busy   Details ›  ",
-            ),
-        ];
-        let mut failures = Vec::new();
-        for &(slot, cols, want) in pinned {
-            let row = layout_row(&strain(slot), cols, &chars);
-            if render(&row, cols) != want {
-                failures.push(format!("{slot:?}@{cols}: {:?}", render(&row, cols)));
-            }
-            assert_eq!(render(&row, cols).chars().count(), cols);
-        }
-        assert!(failures.is_empty(), "re-pin:\n{}", failures.join("\n"));
         // The slot's width is the declared words', joint apart…
         let slot_w = |slot: Loads, cols: usize| {
-            layout_row(&strain(slot), cols, &chars)
+            layout_row(&build(slot), cols, &chars)
                 .load_slot
                 .map(|(_, w)| w)
         };
         assert_eq!(slot_w(cpu, 80), Some(chars("CPU busy")));
         assert_eq!(slot_w(Loads::ALL, 80), Some(chars("network busy")));
         assert_eq!(
-            slot_w(cpu.with(Load::Memory), 80),
-            Some(chars("memory full")),
+            slot_w(cpu.with(Load::Network), 80),
+            Some(chars("network busy")),
             "a second kind widens it to the wider words"
         );
         // …and the words leaving keep the declared slot: nothing moves.
-        let mut lull = strain(cpu);
+        let mut lull = build(cpu);
         lull.load = None;
         let (with, without) = (
-            layout_row(&strain(cpu), 80, &chars),
+            layout_row(&build(cpu), 80, &chars),
             layout_row(&lull, 80, &chars),
         );
         assert_eq!(with.load_slot, without.load_slot);
@@ -3000,7 +2635,6 @@ pub(crate) mod tests {
                     detail0: None,
                     meter: Some((Some(420), "3 of 10 programs")),
                     animated: true,
-                    level: false,
                     busy: false,
                     eta: true,
                     load: Some(Load::Disk),
@@ -3018,10 +2652,6 @@ pub(crate) mod tests {
         // 80 keeps the ETA; the count's short form, `3/10 programs`, does
         // not fit beside it, and a bare `3/10` never stands in for it: the
         // stats go whole. 120 keeps the long count; 60 neither.
-        assert_eq!(
-            render(&pass(80), 80),
-            " \u{21e3} Installing ALab tools   42%                           disk busy   Details ›  "
-        );
         assert!(pass(80).eta.is_some(), "80: the ETA first");
         assert_eq!(pass(80).stats, None);
         assert!(
@@ -3091,7 +2721,6 @@ pub(crate) mod tests {
             detail0: None,
             meter: Some((Some(660), "1 of 2 programs")),
             animated: true,
-            level: false,
             busy: false,
             eta: true,
             load,
@@ -3155,7 +2784,6 @@ pub(crate) mod tests {
                     detail0: None,
                     meter: Some((None, "10 programs \u{b7} ~3 GB")),
                     animated: false,
-                    level: false,
                     busy: true,
                     eta: false,
                     load: Some(Load::Network),

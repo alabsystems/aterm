@@ -32,6 +32,7 @@ use crate::keyboard::{
     Key, KeyCode, KeyLocation, ModifiersKeys, ModifiersState, NamedKey, NativeKey, NativeKeyCode,
     PhysicalKey,
 };
+use crate::platform::macos::OptionAsAlt;
 use crate::platform_impl::platform::ffi;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -102,7 +103,7 @@ fn get_logical_key_char(ns_event: Id, modifierless_chars: &str) -> Key {
     // autoreleased `NSString` (encoding `@16@0:8`). The pool is explicit
     // because this is reachable from the key rows, which a caller can enter
     // outside AppKit's own event pool (`replace_event`, the path this note
-    // first named, was cut in winit-core step 5).
+    // first named, was cut in winit-core step 5 and restored on 2026-10-16).
     let string = autoreleasepool(|_| {
         // SAFETY: `ns_event` is the live `NSEvent` the caller borrows for the
         // whole of this call, and the cast matches the read encoding.
@@ -339,6 +340,22 @@ fn has_flag(flags: usize, mask: usize) -> bool {
     flags & mask == mask
 }
 
+/// Whether `option_as_alt` makes the Option a key event's `-modifierFlags` hold an Alt
+/// (`WindowExtMacOS::set_option_as_alt`): the held Option it names, with no Control or Command,
+/// whose chords AppKit already reads without Option (`create_key_event` takes their logical key
+/// from `-charactersIgnoringModifiers`). Upstream's `replace_event` test, on the flags alone.
+pub(super) fn option_is_alt(option_as_alt: OptionAsAlt, flags: usize) -> bool {
+    let option = match option_as_alt {
+        OptionAsAlt::OnlyLeft => has_flag(flags, NX_DEVICELALTKEYMASK),
+        OptionAsAlt::OnlyRight => has_flag(flags, NX_DEVICERALTKEYMASK),
+        OptionAsAlt::Both => has_flag(flags, consts::NS_EVENT_MODIFIER_FLAG_OPTION),
+        OptionAsAlt::None => false,
+    };
+    option
+        && !has_flag(flags, consts::NS_EVENT_MODIFIER_FLAG_CONTROL)
+        && !has_flag(flags, consts::NS_EVENT_MODIFIER_FLAG_COMMAND)
+}
+
 pub(super) fn event_mods(event: Id) -> Modifiers {
     // SAFETY: `event` is the live `NSEvent` the caller borrows for this call.
     let flags = unsafe { send_usize(event, sel!(modifierFlags)) };
@@ -537,4 +554,43 @@ pub(crate) fn scancode_to_physicalkey(scancode: u32) -> PhysicalKey {
         0xa => KeyCode::Backquote,
         _ => return PhysicalKey::Unidentified(NativeKeyCode::MacOS(scancode as u16)),
     })
+}
+
+#[cfg(test)]
+mod option_is_alt_tests {
+    use super::consts::{
+        NS_EVENT_MODIFIER_FLAG_COMMAND as COMMAND, NS_EVENT_MODIFIER_FLAG_CONTROL as CONTROL,
+        NS_EVENT_MODIFIER_FLAG_OPTION as OPTION, NS_EVENT_MODIFIER_FLAG_SHIFT as SHIFT,
+    };
+    use super::{option_is_alt, NX_DEVICELALTKEYMASK, NX_DEVICERALTKEYMASK};
+    use crate::platform::macos::OptionAsAlt;
+
+    const LEFT: usize = OPTION | NX_DEVICELALTKEYMASK;
+    const RIGHT: usize = OPTION | NX_DEVICERALTKEYMASK;
+
+    /// Which held Option a setting makes an Alt, and that a chord with Control or Command
+    /// keeps AppKit's own reading (its text is already read without Option).
+    #[test]
+    fn an_option_is_alt_only_where_the_setting_names_it_and_never_under_control_or_command() {
+        use OptionAsAlt::{Both, None, OnlyLeft, OnlyRight};
+        let rows: &[(OptionAsAlt, usize, bool)] = &[
+            (None, LEFT, false),
+            (None, RIGHT, false),
+            (Both, LEFT, true),
+            (Both, RIGHT, true),
+            (Both, LEFT | SHIFT, true),
+            (Both, SHIFT, false),
+            (Both, 0, false),
+            (OnlyLeft, LEFT, true),
+            (OnlyLeft, RIGHT, false),
+            (OnlyRight, RIGHT, true),
+            (OnlyRight, LEFT, false),
+            (Both, LEFT | CONTROL, false),
+            (Both, RIGHT | COMMAND, false),
+            (OnlyLeft, LEFT | CONTROL | SHIFT, false),
+        ];
+        for &(setting, flags, alt) in rows {
+            assert_eq!(option_is_alt(setting, flags), alt, "{setting:?} flags {flags:#x}");
+        }
+    }
 }

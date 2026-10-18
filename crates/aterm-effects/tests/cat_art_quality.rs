@@ -8,8 +8,7 @@
 
 use std::path::PathBuf;
 
-use aterm_effects::cat_baker::{CatColorKey, ResolvedFills, bake_variant};
-use aterm_effects::cat_glyphs_gen::CatGlyphId;
+use aterm_effects::cat_baker::{CatColorKey, ResolvedFills};
 use aterm_scene::{PathCmd, PathTransform, Tile, fill_path, parse_path};
 
 const HEROES: [&str; 4] = ["s1_03", "s1_15", "s1_21", "spec_stretch"];
@@ -41,12 +40,6 @@ const ARTIST_PASS: [&str; 24] = [
     "spec_yarn",
 ];
 const ACCESSORIES: [&str; 3] = ["acc_bow", "acc_crown", "acc_bell"];
-const TINY_FACE_POLISH: [(&str, f32); 4] = [
-    ("s1_09", 2.0),
-    ("s1_18", 0.7),
-    ("s1_20", 4.0),
-    ("s2_06b", 2.5),
-];
 const HEAD_ROLES: [&str; 8] = [
     "outline",
     "coat",
@@ -212,59 +205,65 @@ fn luma(layer: &aterm_toml::Value) -> f32 {
     0.2126 * r + 0.7152 * g + 0.0722 * b
 }
 
-fn write_preview(path: &std::path::Path, tile: &Tile, dark: bool) {
-    let background: [u8; 3] = if dark {
-        [0x1A, 0x1B, 0x26]
-    } else {
-        [0xFA, 0xFA, 0xF4]
-    };
-    let mut rgb = Vec::with_capacity((tile.width() * tile.height() * 3) as usize);
-    for pixel in tile.pixels().as_chunks::<4>().0 {
-        let alpha = f32::from(pixel[3]) / 255.0;
-        for channel in 0..3 {
-            rgb.push(
-                (f32::from(pixel[channel]) * alpha + f32::from(background[channel]) * (1.0 - alpha))
-                    .round() as u8,
-            );
-        }
+/// The budget every authored glyph meets: at most `max_layers` layers, one
+/// outer silhouette painted first, every role in `roles`, and at most
+/// `max_commands` path commands.
+fn assert_clean_and_bounded(asset: &Asset, max_layers: usize, roles: &[&str], max_commands: usize) {
+    let id = &asset.id;
+    assert!(
+        asset.layers.len() <= max_layers,
+        "{id}: {} layers exceed the budget of {max_layers}",
+        asset.layers.len()
+    );
+    assert_eq!(role(&asset.layers[0]), "outline", "{id}: silhouette first");
+    assert_eq!(
+        asset
+            .layers
+            .iter()
+            .filter(|layer| role(layer) == "outline")
+            .count(),
+        1,
+        "{id}: one intentional outer silhouette, not patch fragments"
+    );
+    for required in roles {
+        role_layer(asset, required);
     }
-    let file = std::fs::File::create(path).expect("create preview PNG");
-    let mut encoder =
-        aterm_png::Encoder::new(std::io::BufWriter::new(file), tile.width(), tile.height());
-    encoder.set_color(aterm_png::ColorType::Rgb);
-    encoder.set_depth(aterm_png::BitDepth::Eight);
-    encoder
-        .write_header()
-        .expect("write PNG header")
-        .write_image_data(&rgb)
-        .expect("write PNG pixels");
+    let commands: usize = asset
+        .layers
+        .iter()
+        .flat_map(parsed_paths)
+        .map(|path| path.len())
+        .sum();
+    assert!(
+        commands <= max_commands,
+        "{id}: {commands} path commands exceed the budget of {max_commands}"
+    );
+}
+
+/// At a 16 px bake the outline+coat silhouette covers at least
+/// `silhouette` px and each `(role, minimum)` feature at least its minimum.
+fn assert_legible_at_16(asset: &Asset, silhouette: f32, features: &[(&str, f32)]) {
+    let id = &asset.id;
+    let core = coverage(&render_roles(asset, &["outline", "coat"], 16));
+    assert!(core >= silhouette, "{id}: silhouette collapsed at 16 px");
+    for &(feature, minimum) in features {
+        let actual = coverage(&render_roles(asset, &[feature], 16));
+        assert!(
+            actual >= minimum,
+            "{id}: `{feature}` has only {actual:.2}px coverage at 16 px"
+        );
+    }
 }
 
 #[test]
-fn hero_assets_are_semantic_bounded_and_layout_stable() {
+fn hero_assets_are_semantic_bounded_layout_stable_and_legible() {
     let assets: Vec<Asset> = HEROES.iter().map(|id| load(id)).collect();
     for asset in &assets {
         assert_eq!(
             asset.id,
             asset_path(&asset.id).file_stem().unwrap().to_string_lossy()
         );
-        assert!(
-            asset.layers.len() <= 14,
-            "{} has {} layers; hero art must stay cheap to bake",
-            asset.id,
-            asset.layers.len()
-        );
-        assert_eq!(role(&asset.layers[0]), "outline", "outline paints first");
-        assert_eq!(
-            asset
-                .layers
-                .iter()
-                .filter(|layer| role(layer) == "outline")
-                .count(),
-            1,
-            "{} uses one coherent silhouette",
-            asset.id
-        );
+        assert_clean_and_bounded(asset, 14, &["outline", "coat", "muzzle"], 240);
         assert_eq!(
             role_layer(asset, "outline")["recolor"].as_str(),
             Some("fixed")
@@ -278,14 +277,18 @@ fn hero_assets_are_semantic_bounded_and_layout_stable() {
             luma(role_layer(asset, "muzzle")) > 0.80,
             "muzzle protects face contrast"
         );
-
-        let commands: usize = asset
-            .layers
-            .iter()
-            .flat_map(parsed_paths)
-            .map(|path| path.len())
-            .sum();
-        assert!(commands <= 240, "{} has {commands} path commands", asset.id);
+        assert_legible_at_16(
+            asset,
+            55.0,
+            &[
+                ("inner_ear", 0.7),
+                ("muzzle", 2.0),
+                ("eye", 1.0),
+                ("nose", 0.2),
+                ("mouth", 0.45),
+                ("whisker", 1.5),
+            ],
+        );
     }
 
     for asset in &assets[..3] {
@@ -310,73 +313,13 @@ fn hero_assets_are_semantic_bounded_and_layout_stable() {
 }
 
 #[test]
-fn hero_faces_survive_a_sixteen_pixel_bake() {
-    for id in HEROES {
-        let asset = load(id);
-        let core = render_roles(&asset, &["outline", "coat"], 16);
-        assert!(
-            coverage(&core) >= 55.0,
-            "{id}: silhouette collapsed at 16 px"
-        );
-
-        for (feature, minimum) in [
-            ("inner_ear", 0.7),
-            ("muzzle", 2.0),
-            ("eye", 1.0),
-            ("nose", 0.2),
-            ("mouth", 0.45),
-            ("whisker", 1.5),
-        ] {
-            let mask = render_roles(&asset, &[feature], 16);
-            let actual = coverage(&mask);
-            assert!(
-                actual >= minimum,
-                "{id}: `{feature}` has only {actual:.2}px coverage at 16 px"
-            );
-        }
-    }
-}
-
-#[test]
 fn repaired_roster_heads_are_semantic_bounded_and_legible() {
     let mut rendered = Vec::new();
     for id in REPAIRS {
         let asset = load(id);
-        assert!(
-            asset.layers.len() <= 14,
-            "{id}: {} layers exceed the hero bake budget",
-            asset.layers.len()
-        );
-        assert_eq!(
-            role(&asset.layers[0]),
-            "outline",
-            "{id}: silhouette paints first"
-        );
-        assert_eq!(
-            asset
-                .layers
-                .iter()
-                .filter(|layer| role(layer) == "outline")
-                .count(),
-            1,
-            "{id}: exterior ink must be one coherent silhouette"
-        );
-        for required in REPAIR_ROLES {
-            role_layer(&asset, required);
-        }
+        assert_clean_and_bounded(&asset, 14, &REPAIR_ROLES, 240);
         assert_eq!(role_layer(&asset, "coat")["recolor"].as_str(), Some("coat"));
         assert!(luma(role_layer(&asset, "outline")) < 0.25);
-
-        let commands: usize = asset
-            .layers
-            .iter()
-            .flat_map(parsed_paths)
-            .map(|path| path.len())
-            .sum();
-        assert!(
-            commands <= 240,
-            "{id}: {commands} commands exceed the art budget"
-        );
         assert!(
             (1.10..=1.30).contains(&(asset.viewbox.0 / asset.viewbox.1)),
             "{id}: implausible head aspect {:?}",
@@ -391,24 +334,16 @@ fn repaired_roster_heads_are_semantic_bounded_and_legible() {
             "{id}: head must stay horizontally centered"
         );
         assert_eq!(asset.anchor.2, 1.0, "{id}: word-top anchor drift");
-
-        let core = render_roles(&asset, &["outline", "coat"], 16);
-        assert!(
-            coverage(&core) >= 55.0,
-            "{id}: silhouette collapsed at 16 px"
+        assert_legible_at_16(
+            &asset,
+            55.0,
+            &[
+                ("eye", 0.9),
+                ("nose", 0.15),
+                ("mouth", 0.35),
+                ("whisker", 1.0),
+            ],
         );
-        for (feature, minimum) in [
-            ("eye", 0.9),
-            ("nose", 0.15),
-            ("mouth", 0.35),
-            ("whisker", 1.0),
-        ] {
-            let actual = coverage(&render_roles(&asset, &[feature], 16));
-            assert!(
-                actual >= minimum,
-                "{id}: `{feature}` has only {actual:.2}px coverage at 16 px"
-            );
-        }
         rendered.push((id, render_context(&asset, 16, false)));
     }
 
@@ -448,24 +383,7 @@ fn cursor_reactions_remain_visibly_distinct_at_terminal_size() {
 fn authored_characters_stay_clean_bounded_and_readable() {
     for id in ARTIST_PASS {
         let asset = load(id);
-        assert!(
-            asset.layers.len() <= 14,
-            "{id}: {} layers exceed the authored-art budget",
-            asset.layers.len()
-        );
-        assert_eq!(role(&asset.layers[0]), "outline", "{id}: silhouette first");
-        assert_eq!(
-            asset
-                .layers
-                .iter()
-                .filter(|layer| role(layer) == "outline")
-                .count(),
-            1,
-            "{id}: use one intentional outer silhouette, not patch fragments"
-        );
-        for required in ["outline", "coat", "eye", "nose", "mouth", "whisker"] {
-            role_layer(&asset, required);
-        }
+        assert_clean_and_bounded(&asset, 14, &REPAIR_ROLES, 240);
         assert!(
             matches!(
                 role_layer(&asset, "coat")["recolor"].as_str(),
@@ -473,135 +391,22 @@ fn authored_characters_stay_clean_bounded_and_readable() {
             ),
             "{id}: coat must use a declared palette policy"
         );
-
-        let commands: usize = asset
-            .layers
-            .iter()
-            .flat_map(parsed_paths)
-            .map(|path| path.len())
-            .sum();
-        assert!(
-            commands <= 240,
-            "{id}: {commands} commands exceed the tiny-art geometry budget"
-        );
-
-        let silhouette = render_roles(&asset, &["outline", "coat"], 16);
-        assert!(
-            coverage(&silhouette) >= 35.0,
-            "{id}: silhouette collapsed at 16 px"
-        );
-        for (feature, minimum) in [("eye", 0.35), ("nose", 0.10), ("mouth", 0.20)] {
-            let actual = coverage(&render_roles(&asset, &[feature], 16));
-            assert!(
-                actual >= minimum,
-                "{id}: `{feature}` has only {actual:.2}px coverage at 16 px"
-            );
-        }
-    }
-}
-
-#[test]
-fn polished_faces_keep_visible_non_textual_features_at_sixteen_pixels() {
-    for (id, minimum_eye_coverage) in TINY_FACE_POLISH {
-        let asset = load(id);
-        let eye_coverage = coverage(&render_roles(&asset, &["eye"], 16));
-        assert!(
-            eye_coverage >= minimum_eye_coverage,
-            "{id}: eye coverage {eye_coverage:.2}px collapsed below {minimum_eye_coverage:.2}px"
-        );
-        assert!(
-            (luma(role_layer(&asset, "eye")) - luma(role_layer(&asset, "coat"))).abs() >= 0.20,
-            "{id}: eye and coat lost their authored luminance separation"
-        );
-        assert!(
-            coverage(&render_roles(&asset, &["mouth"], 16)) >= 0.25,
-            "{id}: mouth collapsed into punctuation noise"
+        assert_legible_at_16(
+            &asset,
+            35.0,
+            &[("eye", 0.35), ("nose", 0.10), ("mouth", 0.20)],
         );
     }
-
-    role_layer(&load("s1_18"), "muzzle");
 }
 
 #[test]
 fn authored_accessories_have_no_backdrop_or_fragmented_outline() {
     for id in ACCESSORIES {
         let asset = load(id);
-        assert!(
-            asset.layers.len() <= 6,
-            "{id}: {} layers exceed the accessory budget",
-            asset.layers.len()
-        );
-        assert_eq!(role(&asset.layers[0]), "outline", "{id}: silhouette first");
-        assert_eq!(
-            asset
-                .layers
-                .iter()
-                .filter(|layer| role(layer) == "outline")
-                .count(),
-            1,
-            "{id}: accessory needs one coherent outline"
-        );
-        role_layer(&asset, "accessory");
-
-        let commands: usize = asset
-            .layers
-            .iter()
-            .flat_map(parsed_paths)
-            .map(|path| path.len())
-            .sum();
-        assert!(commands <= 100, "{id}: {commands} commands are too noisy");
+        assert_clean_and_bounded(&asset, 6, &["accessory"], 100);
         assert!(
             coverage(&render_roles(&asset, &[], 16)) >= 20.0,
             "{id}: accessory disappears at 16 px"
         );
-    }
-}
-
-#[test]
-fn dump_hero_context_crops_when_requested() {
-    let Some(directory) = std::env::var_os("ATERM_CAT_ART_DUMP_DIR") else {
-        return;
-    };
-    let directory = PathBuf::from(directory);
-    std::fs::create_dir_all(&directory).expect("create crop directory");
-    for id in HEROES
-        .into_iter()
-        .chain(REPAIRS)
-        .chain(ARTIST_PASS)
-        .chain(ACCESSORIES)
-    {
-        let asset = load(id);
-        for height in [16, 24, 32] {
-            for dark in [false, true] {
-                let theme = if dark { "dark" } else { "light" };
-                let tile = render_context(&asset, height, dark);
-                write_preview(
-                    &directory.join(format!("{id}_{height}_{theme}.png")),
-                    &tile,
-                    dark,
-                );
-            }
-        }
-    }
-
-    let s100 = load("s1_00");
-    for coat in [0, 1] {
-        for height in [16, 24, 32] {
-            let width = (height as f32 * s100.viewbox.0 / s100.viewbox.1).round() as u32;
-            for dark in [false, true] {
-                let theme = if dark { "dark" } else { "light" };
-                let colors = CatColorKey {
-                    accent: 12,
-                    background: if dark { 0 } else { 3 },
-                };
-                let fills = ResolvedFills::from_context(coat, 4, colors);
-                let tile = bake_variant(CatGlyphId::S100, &fills, width, height);
-                write_preview(
-                    &directory.join(format!("s100_coat{coat:02}_{height}_{theme}.png")),
-                    &tile,
-                    dark,
-                );
-            }
-        }
     }
 }

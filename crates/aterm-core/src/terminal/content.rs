@@ -151,7 +151,10 @@ fn visible_row_text(
     if let Some(row_cells) = grid.row_at_screen(row) {
         let end_col = match trailing {
             TrailingBlanks::Trim => Some(end_col),
-            TrailingBlanks::Written => row_cells.len().checked_sub(1).map(|last| end_col.min(last)),
+            TrailingBlanks::Written => row_cells
+                .written_len()
+                .checked_sub(1)
+                .map(|last| end_col.min(last)),
         };
         if let Some(end_col) = end_col {
             for col in effective_start..=end_col {

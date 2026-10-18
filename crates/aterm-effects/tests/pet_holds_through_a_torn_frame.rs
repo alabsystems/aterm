@@ -34,7 +34,8 @@ use aterm_effects::kitty_pet::{PetAction, PetFrame, PetInputKind};
 use aterm_effects::pet_world::{PetPane, PetWorldFacts};
 use aterm_effects::word_decorations::{DecoConfig, WordDecorations};
 use aterm_lexicon::Lexicon;
-use aterm_spec::derive::{Model, console_cursor_home_model};
+use aterm_models_effects::console_cursor_home_model;
+use aterm_spec::derive::Model;
 
 /// The recording's grid (`resize 40 120`, 7x14 px cells) and composer row.
 const ROWS: u16 = 40;
@@ -608,7 +609,23 @@ fn a_torn_full_repaint_neither_moves_nor_fades_the_settled_pet() {
 /// dims it, or starts a reaction. Negative control: the raw contract past the
 /// repaint hold chases the write cursor off the composer.
 ///
-/// One `#[test]` per take, so libtest runs the six replays side by side.
+/// The six takes (the four fixtures at 280 ms, the popup at 1.3 s, and the
+/// raw control) replay side by side on `crate::common::par_map`.
+#[test]
+fn every_bracket_torn_keeps_the_pet_at_the_composer_while_typing() {
+    let takes = [
+        (0, OWNER_MS, Contract::Shipping),
+        (1, OWNER_MS, Contract::Shipping),
+        (2, OWNER_MS, Contract::Shipping),
+        (3, OWNER_MS, Contract::Shipping),
+        (3, PAST_TIMEOUT_MS, Contract::Shipping),
+        (3, PAST_TIMEOUT_MS, Contract::Raw),
+    ];
+    crate::common::par_map(&takes, |&(fixture, open_ms, contract)| {
+        every_bracket_torn_keeps_the_pet_at_the_composer(fixture, open_ms, contract);
+    });
+}
+
 fn every_bracket_torn_keeps_the_pet_at_the_composer(
     fixture: usize,
     open_ms: u64,
@@ -675,36 +692,6 @@ fn every_bracket_torn_keeps_the_pet_at_the_composer(
         "{label}: reacted to a torn frame: {:?}",
         &reactions[..reactions.len().min(4)]
     );
-}
-
-#[test]
-fn every_bracket_torn_keeps_the_pet_at_the_composer_while_typing_insert() {
-    every_bracket_torn_keeps_the_pet_at_the_composer(0, OWNER_MS, Contract::Shipping);
-}
-
-#[test]
-fn every_bracket_torn_keeps_the_pet_at_the_composer_while_typing_end() {
-    every_bracket_torn_keeps_the_pet_at_the_composer(1, OWNER_MS, Contract::Shipping);
-}
-
-#[test]
-fn every_bracket_torn_keeps_the_pet_at_the_composer_while_typing_scrub3() {
-    every_bracket_torn_keeps_the_pet_at_the_composer(2, OWNER_MS, Contract::Shipping);
-}
-
-#[test]
-fn every_bracket_torn_keeps_the_pet_at_the_composer_while_typing_popup() {
-    every_bracket_torn_keeps_the_pet_at_the_composer(3, OWNER_MS, Contract::Shipping);
-}
-
-#[test]
-fn every_bracket_torn_keeps_the_pet_at_the_composer_while_typing_popup_past_timeout() {
-    every_bracket_torn_keeps_the_pet_at_the_composer(3, PAST_TIMEOUT_MS, Contract::Shipping);
-}
-
-#[test]
-fn every_bracket_torn_past_timeout_raw_chases_the_write_cursor() {
-    every_bracket_torn_keeps_the_pet_at_the_composer(3, PAST_TIMEOUT_MS, Contract::Raw);
 }
 
 /// A finished frame's hidden caret (no bracket: a build, a pager, a prompt redraw)

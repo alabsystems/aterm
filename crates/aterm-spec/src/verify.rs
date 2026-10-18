@@ -14,24 +14,22 @@
 //!
 //! ## The Trust checkers, when asked
 //!
-//! `ty`, `trust-ir` and `ay` run only when the process asks for them: `spec-check`
-//! ([`crate::check`]) calls [`require_checkers`], and a test built with aterm-spec's `checkers`
-//! feature runs the obligations inside it ([`checkers_required`]). Asked for, a missing checker
-//! fails the obligation instead of reading as absent. `ty` checks the same derived model and must
-//! agree with the interpreter on the verdict and the explored state count. The tool-only analyses
-//! (hand-written `.tla`, `--strict-vacuity`, `trust-ir spec-link`, SMT certificates) live in
-//! `spec-check`. The TrustIr artifact is `DesignOnly`, so `spec-link` is non-certifying, not Ob.3
-//! certification.
+//! `ty` and `ay` run only when the process asks for them: `spec-check` ([`crate::check`]) calls
+//! [`require_checkers`], and a test built with aterm-spec's `checkers` feature runs the obligations
+//! inside it ([`checkers_required`]). Asked for, a missing checker fails the obligation instead of
+//! reading as absent. `ty` checks the same derived model and must agree with the interpreter on the
+//! verdict and the explored state count. The tool-only analyses (`--strict-vacuity`, SMT
+//! certificates) live in `spec-check`.
 //!
 //! ## Discovery
 //!
-//! `ty`, `trust-ir` and `ay` are atpkg programs (`aterm pkg install --default-set`, or one at a
-//! time), never built from source here. Discovery ([`locate_ty`], [`locate_trust_ir`],
-//! [`locate_ay`]) looks in the atpkg store's shim (`<prefix>/bin/<tool>`), then on `PATH`, and
-//! nowhere else: a stale checkout would shadow the store's build. A developer's own build goes
-//! through the shim (`aterm pkg link <tool> <checkout>`). The store is under this account's home
-//! (`getpwuid_r`, never `$HOME`, which a test process moves); `PATH`, and on Windows
-//! `%HOME%`/`%USERPROFILE%` and `%LOCALAPPDATA%`, are all the environment discovery reads.
+//! `ty` and `ay` are atpkg programs (`aterm pkg install --default-set`, or one at a time), never
+//! built from source here. Discovery ([`locate_ty`], [`locate_ay`]) looks in the atpkg store's shim
+//! (`<prefix>/bin/<tool>`), then on `PATH`, and nowhere else: a stale checkout would shadow the
+//! store's build. A developer's own build goes through the shim (`aterm pkg link <tool>
+//! <checkout>`). The store is under this account's home (`getpwuid_r`, never `$HOME`, which a test
+//! process moves); `PATH`, and on Windows `%HOME%`/`%USERPROFILE%` and `%LOCALAPPDATA%`, are all
+//! the environment discovery reads.
 //!
 //! ## The tier names the binary it ran
 //!
@@ -55,8 +53,8 @@
 //! follow the same identity (`memoized_verdict`): a step is answered by the build the last line
 //! names. The cost is one `--version` spawn per printed line (plus one `capabilities` spawn per
 //! `ty` build, each bounded by `PROBE_HANG`), and per discovery a few `stat`s and small head reads;
-//! store copies are described from the filesystem, never run. [`locate_ty`]/[`locate_ay`]/
-//! [`locate_trust_ir`] return the answer as a [`Located`].
+//! store copies are described from the filesystem, never run. [`locate_ty`]/[`locate_ay`] return
+//! the answer as a [`Located`].
 //!
 //! ## Caller idioms
 //!
@@ -69,14 +67,9 @@
 //! // checker run the obligation does NOT run, and the `_tiered` forms return
 //! // `Result<Covered, NotRun>` so the caller must state a policy (a registered
 //! // one is `spec-check models`'s):
-//! match aterm_spec::verify::check_model_tiered(&m, "Thing Tier-0") { /* ... */ }
+//! match aterm_spec::verify::prove_and_catch_tiered(&m, "Thing Tier-0") { /* ... */ }
 //!
 //! let (ok, why) = aterm_spec::verify::validate_transition_tiered(&m, &overrides, &prev, &next, Some("Push"), "Thing conformance");
-//!
-//! // A test only `ty` can discharge (a hand-written `.tla`): `#[ignore]`d and
-//! // named `…_under_ty`, run by `-- --ignored _under_ty`.
-//! let ty = aterm_spec::verify::required_ty();
-//! let out = aterm_spec::verify::TyCommand::check(&ty, &spec, &cfg).output()?;
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -112,12 +105,6 @@ pub fn locate_ty() -> Option<Located> {
     discover("ty")
 }
 
-/// [`locate_ty`] for `trust-ir`.
-#[must_use]
-pub fn locate_trust_ir() -> Option<Located> {
-    discover("trust-ir")
-}
-
 /// [`locate_ty`] for `ay`.
 #[must_use]
 pub fn locate_ay() -> Option<Located> {
@@ -127,9 +114,9 @@ pub fn locate_ay() -> Option<Located> {
 /// Whether this process runs the external checkers; decided once.
 static CHECKERS_REQUIRED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
-/// Turn the external checkers on for this process: from here every `ty`,
-/// `ay` and `trust-ir` obligation runs, and a missing checker fails it.
-/// `spec-check` calls this before anything else.
+/// Turn the external checkers on for this process: from here every `ty` and
+/// `ay` obligation runs, and a missing checker fails it. `spec-check` calls
+/// this before anything else.
 ///
 /// # Panics
 ///
@@ -151,14 +138,12 @@ pub fn require_checkers() {
 /// Every Trust checker, on purpose (each fails closed on a missing tool):
 ///
 /// ```text
-/// targo --unverified run -q -p aterm-spec --features anchors --bin spec-check
+/// targo --unverified run -q -p aterm-models --bin spec-check
 /// targo --unverified test --workspace --features aterm-spec/checkers
-/// targo --unverified test --workspace -- --ignored _under_ty
 /// ```
 ///
-/// The first holds the registry, the hand-written specs, the `ay` bundles and `trust-ir`; the
-/// second re-runs every test that discharges a model through a tiered helper, with `ty` agreeing;
-/// the third runs the tests only `ty` can discharge ([`required_ty`]).
+/// The first holds the registry to `ty` and the `ay` bundles to their declared verdicts; the
+/// second re-runs every test that discharges a model through a tiered helper, with `ty` agreeing.
 #[must_use]
 pub fn checkers_required() -> bool {
     *CHECKERS_REQUIRED.get_or_init(|| cfg!(feature = "checkers"))
@@ -1388,29 +1373,6 @@ fn missing_tool_tail(bin: &str) -> (&'static str, String) {
     }
 }
 
-/// `ty` for a test only it can discharge (a hand-written `.tla` its real steps are validated
-/// against), whatever [`checkers_required`] says. Such a test is `#[ignore]`d and named
-/// `…_under_ty`, so a plain run lists it as ignored rather than passing it unchecked, and
-/// `-- --ignored _under_ty` runs every one ([`checkers_required`] lists each checker command).
-///
-/// # Panics
-///
-/// When no `ty` is found: the obligation cannot be discharged, so the run fails closed.
-// Audited contract panic (T9): the fail-closed gate of a test that asked for `ty`; it masks no
-// other panic.
-#[cfg_attr(
-    trust_verify,
-    trust::contract_panic(message_contains = "VERIFICATION GATE")
-)]
-#[cfg_attr(trust_verify, trust::skip)]
-#[must_use]
-pub fn required_ty() -> PathBuf {
-    locate_ty().map(|l| l.path).unwrap_or_else(|| {
-        let (state, tail) = missing_tool_tail("ty");
-        panic!("VERIFICATION GATE: this test needs Trust `ty`, which {state}.{tail}")
-    })
-}
-
 // ---------------------------------------------------------------------------
 // The tiered derived-model discharges: the interpreter always, and `ty` too when the checkers run,
 // on the same derived model; a disagreement panics.
@@ -1727,69 +1689,12 @@ fn assert_same_space_explored(m: &Model, interp_states: usize, evidence: &str, l
     );
 }
 
-/// Tiered Tier-0 check of a derived model: the interpreter proves every invariant over the whole
-/// bounded space, and when the checkers run, `ty check` proves the generated TLA+ too; a failure
-/// or a tier disagreement panics. A function-valued model skips the interpreter and needs `ty`, so
-/// outside a checker run it returns [`NotRun`]. A scalar model never does, which
-/// [`prove_and_catch_scalar`] asserts once.
-// Skip: a tiered verification driver (shells out to `ty`; its asserts are the gate).
-#[cfg_attr(trust_verify, trust::skip)]
-pub fn check_model_tiered(m: &Model, label: &str) -> Result<Covered, NotRun> {
-    // `Some(n)`: the interpreter proved the invariants over `n` states, the `ty` tier's yardstick.
-    // `None`: function-valued, so no interpreter tier.
-    let interp_states = if m.fn_vars.is_empty() {
-        match interp::bmc(m) {
-            Ok(n) => {
-                eprintln!("{label}: {} proven over {n} states (interpreter).", m.name);
-                Some(n)
-            }
-            Err((st, inv)) => panic!(
-                "{label}: {} invariant `{inv}` VIOLATED at {st:?} (interpreter tier)",
-                m.name
-            ),
-        }
-    } else {
-        None
-    };
-    let interp_ran = interp_states.is_some();
-    match find_ty() {
-        Some(ty) => {
-            let (ok, evidence) = ty_check_derived(&ty, m, &m.to_cfg(), label);
-            assert!(
-                ok,
-                "{label}: ty check FAILED on derived {} spec{}\n{evidence}\n--- generated ---\n{}",
-                m.name,
-                if interp_ran {
-                    " — TIER DISAGREEMENT (interpreter proved it; checker bug?)"
-                } else {
-                    ""
-                },
-                m.to_tla()
-            );
-            if let Some(n) = interp_states {
-                assert_same_space_explored(m, n, &evidence, label);
-            }
-            eprintln!(
-                "{label}: {} additionally model-checked clean by ty.",
-                m.name
-            );
-            if interp_ran {
-                Ok(Covered::InterpreterAndTy)
-            } else {
-                Ok(Covered::TyOnly)
-            }
-        }
-        None if interp_ran => Ok(Covered::Interpreter),
-        None => Err(NotRun { model: m.name }),
-    }
-}
-
 /// Tiered prove-and-catch (the `Buggy` convention): the interpreter proves the invariants at
 /// `Buggy=0` and finds a counterexample at `Buggy=1`, and when the checkers run, `ty` does the
 /// same; a failure or a tier disagreement panics. A function-valued model skips the interpreter
 /// and needs `ty`, so outside a checker run it returns [`NotRun`]. Scalar callers want
 /// [`prove_and_catch_scalar`].
-// Skip: the same tiered-driver class as `check_model_tiered`.
+// Skip: a tiered verification driver (shells out to `ty`; its asserts are the gate).
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn prove_and_catch_tiered(m: &Model, label: &str) -> Result<Covered, NotRun> {
     // `prove_and_catch` returns the committed arm's state count, the `ty` tier's yardstick.
@@ -3274,8 +3179,8 @@ pub fn uncaught_invariants(m: &Model) -> Vec<&'static str> {
 ///   `Buggy` dial the model is written for ([`Model::mutant_dials`]), in each
 ///   configuration — breaks within the interpreter's budget: it asserts
 ///   nothing, so a proof of it proves nothing;
-/// * a `bound` or `uncaught` law some mutant breaks: it is a caught design
-///   claim, and a stale declaration would exempt it from the line above;
+/// * a `bound` some mutant breaks: it is a caught design claim, and a stale
+///   declaration would exempt it from the line above;
 /// * an action that never fires with no mutant on and is no audited negative
 ///   control ([`audit_dead_negative_controls`]).
 ///
@@ -3323,20 +3228,13 @@ pub fn sweep_faults(configs: &[Model]) -> Vec<String> {
         match (inv.kind, caught.contains(inv.name)) {
             (InvariantKind::Claim, false) => faults.push(format!(
                 "{}::{}: no mutant breaks it — give it one, delete it if it restates another \
-                 law, declare it a `bound` if it states the space, or `uncaught` while no \
-                 mutant exists",
+                 law or no defect can reach it, or declare it a `bound` if it states the space",
                 m.name, inv.name
             )),
-            (InvariantKind::Bound | InvariantKind::Uncaught, true) => faults.push(format!(
-                "{}::{}: declared `{}`, but a mutant breaks it — it is a caught design claim: \
-                 declare it `invariant`",
-                m.name,
-                inv.name,
-                if inv.kind == InvariantKind::Bound {
-                    "bound"
-                } else {
-                    "uncaught"
-                }
+            (InvariantKind::Bound, true) => faults.push(format!(
+                "{}::{}: declared `bound`, but a mutant breaks it — it is a caught design \
+                 claim: declare it `invariant`",
+                m.name, inv.name
             )),
             _ => {}
         }
@@ -3354,16 +3252,6 @@ fn config_overrides(m: &Model, config: &Model) -> Vec<(&'static str, i64)> {
         .iter()
         .filter(|c| !m.consts.contains(c))
         .copied()
-        .collect()
-}
-
-/// Every law of `m` declared `uncaught`: a claim no mutant breaks yet.
-#[must_use]
-pub fn declared_uncaught(m: &Model) -> Vec<&'static str> {
-    m.invariants
-        .iter()
-        .filter(|inv| inv.kind == crate::derive::InvariantKind::Uncaught)
-        .map(|inv| inv.name)
         .collect()
 }
 

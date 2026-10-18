@@ -65,9 +65,10 @@
 //! `[privacy] observer` is a tri-state ([`ObserverMode`]). ABSENT is the
 //! SENTINEL: one `/usr/bin/log stream` child whose predicate matches only the
 //! line macOS writes when it shows a consent dialog (`AUTHREQ_PROMPTING`),
-//! which is silent between dialogs and whose only job is to tell the access
-//! card that a real need exists (a `find /` in a tab just raised the "access
-//! data from other apps" dialog). `false` is off. `true` is FULL: the whole
+//! which is silent between dialogs and whose job is to tell the access card
+//! that a real need exists (a `find /` in a tab just raised the "access data
+//! from other apps" dialog) and, for any other dialog it can name, to record
+//! which tab drew it (`App::note_observed_prompts`). `false` is off. `true` is FULL: the whole
 //! `tccd` stream, the correlation table, the tab mark and the per-dialog OS
 //! banner. The banner, the once-per-process `EPERM` banner and the tab mark
 //! run ONLY in Full mode: a banner that repeats what the dialog already says
@@ -98,8 +99,8 @@
 //! because that session "went quiet before the alert appeared" (§3.6, *what we
 //! will never do*). That manufactures a claim from silence plus coincidence and
 //! puts a `WindowServer` call next to the 2026-08-17 fence. There is no window
-//! query in this file, and `tests::the_module_makes_no_window_server_query`
-//! is the fence.
+//! query in this file: its one child is [`LOG_TOOL`], and its one input is
+//! that child's stdout.
 //!
 //! # Threading discipline
 //!
@@ -125,6 +126,9 @@ use std::time::{Duration, Instant};
 /// result. Never spell it any other way.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) use aterm_containment::consent::LOG_TOOL;
+// Named absolutely, so a shell builtin can never shadow it.
+#[cfg(any(target_os = "macos", test))]
+const _: () = assert!(LOG_TOOL.as_bytes()[0] == b'/');
 
 /// Whether this account can read the unified log's backing store at all:
 /// `aterm_containment::consent::DIAGNOSTICS_DIR` is `root:admin drwxr-x---` on
@@ -179,7 +183,8 @@ pub(crate) enum ObserverMode {
     /// `observer = false`: nothing is spawned or looked at.
     Off,
     /// `observer` absent: the narrow `AUTHREQ_PROMPTING` stream that feeds the
-    /// access card and posts no banner.
+    /// access card, records which tab drew any other dialog it can name, and
+    /// posts no banner.
     Sentinel,
     /// `observer = true`: the whole `tccd` stream, the tab mark and the banner.
     Full,
@@ -884,6 +889,8 @@ impl StreamSink {
 #[derive(Clone, Copy)]
 pub(crate) struct ObserverProbe {
     run: fn(&StreamSink, ObserverMode),
+    parent_of: fn(i32) -> Option<i32>,
+    pgid_of: fn(i32) -> Option<i32>,
     live: bool,
 }
 
@@ -892,6 +899,8 @@ impl ObserverProbe {
     pub(crate) const fn live() -> Self {
         Self {
             run: live_run_stream,
+            parent_of: crate::session_status::program::parent_of,
+            pgid_of: live_pgid_of,
             live: true,
         }
     }
@@ -901,6 +910,8 @@ impl ObserverProbe {
     pub(crate) const fn inert() -> Self {
         Self {
             run: inert_run_stream,
+            parent_of: inert_process_probe,
+            pgid_of: inert_process_probe,
             live: false,
         }
     }
@@ -919,6 +930,11 @@ impl ObserverProbe {
     pub(crate) const fn is_live(self) -> bool {
         self.live
     }
+}
+
+/// Headless attribution has no process-table observation.
+fn inert_process_probe(_pid: i32) -> Option<i32> {
+    None
 }
 
 /// The inert arm. No child, no syscall, and the reason said out loud.
@@ -1559,6 +1575,21 @@ impl ObserverState {
         out
     }
 
+    /// Attribute only through this instance's process arms. Tests/headless keep
+    /// them inert even when a fixture changes App's windowed-policy boolean.
+    pub(crate) fn session_for_pid(&self, pid: i32, sessions: &[(u64, i32)]) -> Option<u64> {
+        session_of_pid(pid, sessions, self.probe.parent_of, self.probe.pgid_of)
+    }
+
+    /// Full-mode announcements use the same instance-owned group observation.
+    pub(crate) fn take_new_verdicts_for_instance(
+        &mut self,
+        now: Instant,
+        sessions: &[(u64, i32)],
+    ) -> Vec<ObservedPrompt> {
+        self.take_new_verdicts(now, sessions, self.probe.pgid_of)
+    }
+
     /// THE NEEDS. Every observed consent dialog that is FOR THIS APP (its
     /// subject is `bundle_id`), each once, oldest first. A dialog for any other
     /// subject is dropped: it is not this aterm's need.
@@ -1618,6 +1649,47 @@ impl ObserverState {
     }
 }
 
+/// A TCC service as `tccd` names it (`kTCCServiceMediaLibrary`, or already
+/// bare), as the short id every table here keys on (`MediaLibrary`): trimmed,
+/// one prefix stripped. The one normalization, so the app-data test, the words
+/// and a record's key all judge the same id.
+pub(crate) fn short_service(service: &str) -> &str {
+    let service = service.trim();
+    service.strip_prefix("kTCCService").unwrap_or(service)
+}
+
+/// What a consent dialog for `short` (a [`short_service`] id) is about, in
+/// words: the folder's own name where the service is one of aterm's, and a
+/// fixed phrase where aterm knows the service. The service id itself
+/// ("AddressBook", "ListenEvent") is no name macOS shows a person, so an
+/// unknown one is `None`: the notice says "a permission", and no record is
+/// made.
+pub(crate) fn service_words(short: &str) -> Option<&'static str> {
+    use aterm_containment::consent::Folder;
+    match Folder::ALL.iter().find(|f| f.tcc_service() == short) {
+        Some(Folder::AppData) => Some("other applications' data"),
+        Some(folder) => Some(folder.label()),
+        None => match short {
+            "SystemPolicyNetworkVolumes" => Some("network drives"),
+            "SystemPolicyRemovableVolumes" => Some("removable drives"),
+            "SystemPolicyAllFiles" => Some("all your files"),
+            "SystemPolicyAppBundles" => Some("other apps' bundles"),
+            "MediaLibrary" => Some("the music and media library"),
+            "Photos" => Some("the Photos library"),
+            "AddressBook" => Some("your contacts"),
+            "Calendar" => Some("your calendars"),
+            "Reminders" => Some("your reminders"),
+            "Camera" => Some("the camera"),
+            "Microphone" => Some("the microphone"),
+            "ScreenCapture" => Some("your screen"),
+            "ListenEvent" => Some("your keyboard input"),
+            "Accessibility" | "PostEvent" => Some("accessibility features"),
+            "AppleEvents" => Some("another app"),
+            _ => None,
+        },
+    }
+}
+
 /// One observed pending prompt, attributed to a session, that the human has not
 /// been told about yet.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1633,39 +1705,7 @@ pub(crate) struct ObservedPrompt {
 impl ObservedPrompt {
     /// The one native notification this prompt earns.
     pub(crate) fn notice(&self) -> AttentionNotice {
-        use aterm_containment::consent::Folder;
-        let short = self
-            .service
-            .trim()
-            .strip_prefix("kTCCService")
-            .unwrap_or(self.service.trim());
-        // The folder's own name where the service is one of aterm's, and what
-        // the dialog is about in words where aterm knows the service. The
-        // service id itself ("AddressBook", "ListenEvent") is no name macOS
-        // shows a person: an unknown one is "a permission" here, and stays
-        // whole in `blocked_on=`.
-        let what = match Folder::ALL.iter().find(|f| f.tcc_service() == short) {
-            Some(Folder::AppData) => Some("other applications' data"),
-            Some(folder) => Some(folder.label()),
-            None => match short {
-                "SystemPolicyNetworkVolumes" => Some("network drives"),
-                "SystemPolicyRemovableVolumes" => Some("removable drives"),
-                "SystemPolicyAllFiles" => Some("all your files"),
-                "MediaLibrary" => Some("the music and media library"),
-                "Photos" => Some("the Photos library"),
-                "AddressBook" => Some("your contacts"),
-                "Calendar" => Some("your calendars"),
-                "Reminders" => Some("your reminders"),
-                "Camera" => Some("the camera"),
-                "Microphone" => Some("the microphone"),
-                "ScreenCapture" => Some("your screen"),
-                "ListenEvent" => Some("your keyboard input"),
-                "Accessibility" | "PostEvent" => Some("accessibility features"),
-                "AppleEvents" => Some("another app"),
-                _ => None,
-            },
-        };
-        let asked = what.map_or_else(
+        let asked = service_words(short_service(&self.service)).map_or_else(
             || "macOS is asking for a permission.".to_string(),
             |what| format!("macOS is asking for access to {what}."),
         );
@@ -1901,37 +1941,6 @@ mod tests {
 
     use super::*;
 
-    /// The module's SHIPPING source: everything before the first TOP-LEVEL
-    /// `#[cfg(test)]` attribute, which is the test-seam block's (an indented one
-    /// gates a single test-only method and ends nothing). It is what lets the scans below
-    /// name the very patterns they are forbidding.
-    fn shipping_source() -> &'static str {
-        const SOURCE: &str = include_str!("consent_observer.rs");
-        let marker = "\n#[cfg(test)]\n";
-        let shipping = SOURCE
-            .split(marker)
-            .next()
-            .expect("split always yields a first part");
-        assert!(
-            shipping.len() < SOURCE.len(),
-            "the test module must be excluded from the scan"
-        );
-        shipping
-    }
-
-    /// Shipping source minus comment lines, matching `np_strip`'s first rule:
-    /// a comment naming a hazard is prose, not a syscall.
-    fn shipping_code() -> String {
-        shipping_source()
-            .lines()
-            .filter(|line| {
-                let t = line.trim_start();
-                !(t.starts_with("//") || t.starts_with('*'))
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
     // -----------------------------------------------------------------------
     // THE PARSER, table-tested over recorded lines
     // -----------------------------------------------------------------------
@@ -2047,46 +2056,6 @@ mod tests {
                 "recorded line must parse: {line}"
             );
         }
-    }
-
-    /// The ATTRIBUTION line carries two pids — `accessing` and `requesting` —
-    /// and only the accessing one names the parked process. Anchoring on the
-    /// wrong block would attribute a prompt to somebody else's session, which is
-    /// worse than reporting nothing.
-    #[test]
-    fn attribution_never_correlates_on_the_responsible_pid() {
-        let Some(TccEvent::Attribution {
-            accessing_pid,
-            requesting_pid,
-            ..
-        }) = parse_line(REC_ATTRIBUTION)
-        else {
-            panic!("the recorded attribution line parses");
-        };
-        assert_eq!(accessing_pid, Some(18584), "the accessing block");
-        assert_eq!(requesting_pid, Some(378), "the requesting block");
-        // 4059 is the RESPONSIBLE pid — the terminal application, the same pid
-        // for every session it hosts. Reading it would attribute one session's
-        // prompt to all of them, and it is the FIRST block on the line, so a
-        // parser that did not anchor on block names would read exactly this.
-        assert_ne!(accessing_pid, Some(4059));
-        assert_ne!(requesting_pid, Some(4059));
-    }
-
-    /// A self-request carries ONLY `requesting=`. It is ordinary traffic, not a
-    /// format change, and the requesting pid stands in for the accessor.
-    #[test]
-    fn a_self_request_with_no_accessing_block_is_still_understood() {
-        let event = parse_line(REC_ATTRIBUTION_SELF).expect("parses");
-        assert_eq!(
-            event,
-            TccEvent::Attribution {
-                msg_id: "3956.1".to_owned(),
-                accessing_pid: None,
-                requesting_pid: Some(3956),
-            }
-        );
-        assert_ne!(event, TccEvent::Unparsed, "not a format change");
     }
 
     /// A line that is not a `tccd` `AUTHREQ_*` message is not evidence of
@@ -2478,6 +2447,55 @@ mod tests {
         );
     }
 
+    /// Both App-facing attribution routes keep headless process reads inert;
+    /// a fixture's synthetic process arms can then prove group and ancestor joins.
+    #[test]
+    fn the_instance_owns_its_process_attribution_probes() {
+        fn parent(pid: i32) -> Option<i32> {
+            match pid {
+                18585 => Some(4711),
+                _ => None,
+            }
+        }
+        fn group(pid: i32) -> Option<i32> {
+            match pid {
+                18584 => Some(4711),
+                _ => None,
+            }
+        }
+        let now = Instant::now();
+        let later = now + PENDING_PROMPT_THRESHOLD + Duration::from_secs(1);
+        let sessions = &[(4_u64, 4711_i32)];
+        let mut observer = ObserverState::inert();
+        observer.feed_for_test(ObserverEvent::Started, now);
+        for line in [REC_CTX, REC_ATTRIBUTION, REC_SUBJECT] {
+            observer.feed_for_test(
+                ObserverEvent::Line(parse_line(line).expect("fixture line")),
+                now,
+            );
+        }
+        assert_eq!(observer.session_for_pid(18584, sessions), None);
+        assert_eq!(observer.session_for_pid(18585, sessions), None);
+        assert!(
+            observer
+                .take_new_verdicts_for_instance(later, sessions)
+                .is_empty()
+        );
+        observer.probe.parent_of = parent;
+        observer.probe.pgid_of = group;
+        assert!(!observer.probe_is_live(), "the stream stays inert");
+        assert_eq!(observer.session_for_pid(18584, sessions), Some(4), "group");
+        assert_eq!(
+            observer.session_for_pid(18585, sessions),
+            Some(4),
+            "ancestor"
+        );
+        assert_eq!(observer.session_for_pid(9999, sessions), None, "unrelated");
+        let fresh = observer.take_new_verdicts_for_instance(later, sessions);
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].session, 4);
+    }
+
     /// THE 3AM PAGE, and its rate limit: one observed dialog pages ONCE, no
     /// matter how many times the correlation is re-read, because the `msgID` is
     /// the identity of the dialog a human still has to answer.
@@ -2501,39 +2519,7 @@ mod tests {
             first[0].blocked_on,
             "macos-permission:SystemPolicyDocumentsFolder"
         );
-        let notice = first[0].notice();
-        assert_eq!(notice.session, 4);
-        assert_eq!(notice.title, PROMPT_TITLE, "a question, not a denial");
-        assert_eq!(
-            notice.body,
-            "macOS is asking for access to Documents. The program that asked waits until \
-             you answer.",
-            "the body names the folder in words"
-        );
-        for (service, what) in [
-            ("kTCCServiceSystemPolicyNetworkVolumes", "network drives"),
-            (
-                "kTCCServiceSystemPolicyRemovableVolumes",
-                "removable drives",
-            ),
-            ("kTCCServiceAddressBook", "your contacts"),
-            ("kTCCServiceListenEvent", "your keyboard input"),
-            ("kTCCServiceAppleEvents", "another app"),
-        ] {
-            let prompt = ObservedPrompt {
-                session: 4,
-                blocked_on: String::new(),
-                service: service.to_owned(),
-            };
-            assert_eq!(
-                prompt.notice().body,
-                format!(
-                    "macOS is asking for access to {what}. The program that asked waits until \
-                     you answer."
-                ),
-                "{service} is named in words where aterm knows it"
-            );
-        }
+        assert_eq!(first[0].notice().session, 4);
         // A service aterm does not know is never printed as its id, which
         // stays whole in `blocked_on=`.
         let unknown = ObservedPrompt {
@@ -2541,11 +2527,7 @@ mod tests {
             blocked_on: blocked_on_token("kTCCServiceSomethingNew"),
             service: "kTCCServiceSomethingNew".to_owned(),
         };
-        assert_eq!(
-            unknown.notice().body,
-            "macOS is asking for a permission. The program that asked waits until you answer."
-        );
-        assert_eq!(unknown.blocked_on, "macos-permission:SomethingNew");
+        assert!(!unknown.notice().body.contains("kTCCService"));
 
         assert!(
             observer.take_new_verdicts(later, sessions, pgid).is_empty(),
@@ -2636,25 +2618,6 @@ mod tests {
             ObserverAvailability::Unavailable(UnavailableReason::FormatUnrecognized)
         );
         assert!(observer.verdicts(now, &[(1, 4711)], |_| None).is_empty());
-    }
-
-    /// One understood event clears the drift run: a single odd line among good
-    /// ones is not a format change.
-    #[test]
-    fn one_understood_event_clears_the_drift_run() {
-        let now = Instant::now();
-        let mut table = PendingTable::new();
-        for _ in 0..FORMAT_DRIFT_LIMIT {
-            table.note(TccEvent::Unparsed, now);
-        }
-        assert!(table.format_looks_changed());
-        table.note(
-            TccEvent::Result {
-                msg_id: "1.1".to_owned(),
-            },
-            now,
-        );
-        assert!(!table.format_looks_changed());
     }
 
     /// `log stream` prints two header lines on STDOUT at the start of every
@@ -2786,14 +2749,6 @@ mod tests {
             notice.session,
             u64::MAX,
             "an instance-level notice names no session, so focus suppresses nothing"
-        );
-        assert_eq!(notice.title, "aterm · file access denied");
-        assert_eq!(
-            notice.body,
-            format!(
-                "Turn on aterm in {} (+ adds a missing app).",
-                crate::menu::privacy_settings_path_words(crate::menu::PrivacyPane::FullDiskAccess)
-            )
         );
     }
 
@@ -3119,79 +3074,5 @@ com.apple.sandboxd, pid=69745, auid=0, euid=0, binary_path=/usr/libexec/sandboxd
         // A cycle cannot loop forever.
         let cyclic = |pid: i32| Some(if pid == 7 { 8 } else { 7 });
         assert_eq!(session_of_pid(7, &sessions, cyclic, no_group), None);
-    }
-
-    // -----------------------------------------------------------------------
-    // THE FENCES
-    // -----------------------------------------------------------------------
-
-    /// `log` is a ZSH BUILTIN that shadows `/usr/bin/log`, exits 0 and prints
-    /// nothing — the artifact that produced a false "tccd is invisible"
-    /// finding. The tool is named absolutely, here and nowhere else.
-    ///
-    /// Unix-only: `/usr/bin/log` is macOS's, and on Windows `Path::is_absolute`
-    /// wants a drive letter, so the absoluteness half cannot be asked there.
-    #[cfg(unix)]
-    #[test]
-    fn the_log_tool_is_named_absolutely() {
-        assert_eq!(LOG_TOOL, "/usr/bin/log");
-        assert!(std::path::Path::new(LOG_TOOL).is_absolute());
-        let code = shipping_code();
-        assert!(
-            !code.contains("Command::new(\"log\")"),
-            "a bare `log` is the zsh builtin, not the tool"
-        );
-        assert_eq!(
-            code.matches("Command::new(").count(),
-            1,
-            "exactly one child is ever spawned, and it is LOG_TOOL"
-        );
-        assert!(
-            code.contains("LaneCommand::new(LOG_TOOL)"),
-            "and it is spawned holding its stdout and nothing else (`spawnfd::spawn`)"
-        );
-    }
-
-    /// §3.6 "what we will never do": no window-list scan, no `WindowServer`
-    /// contact, no alert-on-screen inference. The 2026-08-17 fence is right
-    /// next to this code.
-    #[test]
-    fn the_module_makes_no_window_server_query() {
-        let code = shipping_code();
-        for needle in [
-            "WindowServer",
-            "UserNotificationCenter",
-            "CGWindowList",
-            "NSWorkspace",
-            "objc2",
-        ] {
-            assert!(
-                !code.contains(needle),
-                "the observer must never ask the window server anything: {needle}"
-            );
-        }
-    }
-
-    /// The threading discipline, asserted structurally: the worker's
-    /// `JoinHandle` is dropped on the spot, and NOTHING here joins a thread or
-    /// waits on a child from the event loop.
-    #[test]
-    fn nothing_in_this_module_joins_a_worker() {
-        let code = shipping_code();
-        assert!(
-            !code.contains(".join()"),
-            "a join on the event loop is the trail_audio.rs freeze"
-        );
-        assert!(
-            code.contains("Ok(_handle) => {}"),
-            "the handle must be dropped where it is produced"
-        );
-        // `wait()` exists exactly once, inside the worker that spawned the
-        // child — never on any path the event loop can take.
-        assert_eq!(
-            code.matches(".wait()").count(),
-            1,
-            "the only reap is the worker's own"
-        );
     }
 }

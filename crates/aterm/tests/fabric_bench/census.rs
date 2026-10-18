@@ -1,0 +1,466 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! WHAT THE LOG HOLDS: every record a world's broker wrote, read back once the
+//! broker has stopped, and counted per kind of record over a measured window.
+//!
+//! WHY THE FILE AND NOT A `Fetch`. The bridge's inbox commits are records too —
+//! astream writes a group commit as a hidden `/a/commit` record that consumes
+//! an offset and costs the same Strict fsync as a publish — and every delivery
+//! path, `Fetch` included, skips hidden subjects on purpose. A census over
+//! `Fetch` would show the posts and never the commits, which are precisely the
+//! records the bridge's batching takes away: it commits its inbox cursor once
+//! no inbox record is queued and every `INBOX_COMMIT_EVERY` (256) records
+//! (`Bridge::round`), so a burst costs a few commits where it once cost one per
+//! message, and how many depends on when the queue drains. So each world's log
+//! is opened with [`astream_broker::BrokerLog`] after its broker has shut down
+//! — `BrokerHandle::shutdown` joins the writer and releases the log's exclusive
+//! lock before it returns — and read whole: every record, hidden or not, at its
+//! own offset.
+//!
+//! A RECORD'S KIND is its subject with the identities taken out ([`class_of`]):
+//! `/f/f1/in/<node>/<sid>/<node>/note` is a post on an inbox lane, whoever sent
+//! it to whom. The table that comes out names every kind the window held, so a
+//! record nobody expected (a presence republish a roster round made, an `ev`
+//! per delivery) is counted where it can be seen rather than folded away.
+//!
+//! A FIRED WILL IS NOT THE NEXT BRIDGE'S COST. When the bench SIGKILLs a bridge
+//! the broker publishes that bridge's registered will (its node row, `state=gone`)
+//! — a record the kill caused, landing inside the attach window that follows.
+//! [`will_firings`] names those records by the one mark astream leaves on them,
+//! so the attach census counts them apart instead of billing them to the attach.
+
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::path::Path;
+
+use astream_broker::store::{COMMIT_SUBJECT, WILL_SUBJECT, is_hidden_subject};
+
+/// One record of the log, as the census needs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rec {
+    /// Its offset.
+    pub seq: u64,
+    /// Its idempotency key: `(producer_id, producer_seq)`.
+    pub producer: (u64, u64),
+    pub subject: String,
+    /// The fabric body's `text=`, decoded (empty for a record with none).
+    pub text: String,
+    /// The body's head line (a presence row's `state=`, `inc=`, `pid=` …).
+    pub head: String,
+    /// The consumer-group commit it carries: `(group, upto)`.
+    pub commit: Option<(String, u64)>,
+}
+
+impl Rec {
+    /// A pure commit record, or a record that carries a commit beside its
+    /// output (astream's `process_and_produce`).
+    #[must_use]
+    pub fn commits(&self) -> bool {
+        self.commit.is_some() || self.subject == COMMIT_SUBJECT
+    }
+}
+
+/// Every record of the stopped broker's log at `path`, in offset order.
+///
+/// # Panics
+///
+/// The log does not open — the broker still holds it, or it is not a log. The
+/// census runs only after `BrokerHandle::shutdown` returned, which released the
+/// lock, so either is a broken run.
+#[must_use]
+pub fn read_log(path: &Path) -> Vec<Rec> {
+    let log = astream_broker::BrokerLog::open(path)
+        .unwrap_or_else(|e| panic!("open the stopped broker's log {}: {e}", path.display()));
+    log.read_from(log.base())
+        .iter()
+        .map(|r| {
+            let (body, _) = aterm_link::body::Body::decode(&r.body);
+            Rec {
+                seq: r.seq.0,
+                producer: (r.producer_id, r.producer_seq),
+                subject: r.subject.clone(),
+                text: body.text,
+                head: head_line(&r.body),
+                commit: r.commit.as_ref().map(|c| (c.group.clone(), c.upto)),
+            }
+        })
+        .collect()
+}
+
+/// A body's first line, lossily decoded: where a presence row keeps its
+/// tokens.
+#[must_use]
+pub fn head_line(body: &[u8]) -> String {
+    let head = body.split(|b| *b == b'\n').next().unwrap_or_default();
+    String::from_utf8_lossy(head).into_owned()
+}
+
+/// The value of the `key=value` token in `head`, if it has one. Pure
+/// (unit-tested).
+#[must_use]
+pub fn token<'a>(head: &'a str, key: &str) -> Option<&'a str> {
+    head.split_whitespace()
+        .find_map(|t| t.strip_prefix(key)?.strip_prefix('='))
+}
+
+/// A subject with its identities taken out: a node segment (`n-…`) reads
+/// `<node>`, a session (`s-…`) `<sid>`, a human or agent principal (`h-…`,
+/// `a-…`) `<principal>`. Pure (unit-tested).
+#[must_use]
+pub fn class_of(subject: &str) -> String {
+    subject
+        .split('/')
+        .map(|seg| {
+            if seg.starts_with("n-") {
+                "<node>"
+            } else if seg.starts_with("s-") {
+                "<sid>"
+            } else if seg.starts_with("h-") || seg.starts_with("a-") {
+                "<principal>"
+            } else {
+                seg
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// The records of one window, counted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Census {
+    /// Every record, hidden or not.
+    pub total: usize,
+    /// Records a subscriber or a `Fetch` would never see (`/a/commit`,
+    /// `/a/will`, `/a/bind`).
+    pub hidden: usize,
+    /// Records that commit a consumer group ([`Rec::commits`]).
+    pub commits: usize,
+    /// Every kind ([`class_of`]) and how many of it.
+    pub by_class: BTreeMap<String, usize>,
+}
+
+/// The records with offsets in `lo..=hi`.
+pub fn window(recs: &[Rec], lo: u64, hi: u64) -> impl Iterator<Item = &Rec> {
+    recs.iter().filter(move |r| (lo..=hi).contains(&r.seq))
+}
+
+/// The census of `recs` — a [`window`], perhaps filtered. Pure (unit-tested).
+#[must_use]
+pub fn census<'a>(recs: impl IntoIterator<Item = &'a Rec>) -> Census {
+    let mut c = Census::default();
+    for r in recs {
+        c.total += 1;
+        c.hidden += usize::from(is_hidden_subject(&r.subject));
+        c.commits += usize::from(r.commits());
+        *c.by_class.entry(class_of(&r.subject)).or_default() += 1;
+    }
+    c
+}
+
+/// The first record at or after `from` that commits `group` up to `upto` or
+/// past it: the moment a consumer's cursor covered offset `upto`.
+#[must_use]
+pub fn covering_commit<'a>(recs: &'a [Rec], group: &str, upto: u64, from: u64) -> Option<&'a Rec> {
+    recs.iter().filter(|r| r.seq >= from).find(|r| {
+        r.commit
+            .as_ref()
+            .is_some_and(|(g, u)| g == group && *u >= upto)
+    })
+}
+
+/// The offsets of every record that is a FIRED WILL. Pure (unit-tested).
+///
+/// astream persists a registered will as a hidden `/a/will` record carrying the
+/// will's own idempotency key in its producer fields, and fires it as an
+/// ordinary publish under that same key (`store.rs`, `WillRecord`). So a
+/// visible record whose `(producer_id, producer_seq)` an earlier `/a/will`
+/// registered IS that will, fired: no other record can carry the key, because
+/// the broker dedups on it (and aterm-link registers its will at the reserved
+/// low half `WILL_SEQ_LOW`, which no ordinary publish takes).
+#[must_use]
+pub fn will_firings(recs: &[Rec]) -> BTreeSet<u64> {
+    let mut registered: HashSet<(u64, u64)> = HashSet::new();
+    let mut fired = BTreeSet::new();
+    for r in recs {
+        if r.subject == WILL_SUBJECT {
+            registered.insert(r.producer);
+        } else if registered.contains(&r.producer) {
+            fired.insert(r.seq);
+        }
+    }
+    fired
+}
+
+/// Whether the record right after offset `seq` is `group`'s commit covering
+/// it — what the latency phase's idle-bridge wait takes for granted when it
+/// treats "the head passed `seq + 1`" as "the delivery's commit is durable".
+/// Pure (unit-tested).
+///
+/// # Errors
+///
+/// What sits at `seq + 1` instead, so the bench can say why its idle wait no
+/// longer waits for the commit.
+pub fn next_is_its_commit(recs: &[Rec], group: &str, seq: u64) -> Result<(), String> {
+    let next = recs.iter().find(|r| r.seq == seq + 1);
+    match next {
+        Some(r)
+            if r.commit
+                .as_ref()
+                .is_some_and(|(g, u)| g == group && *u >= seq) =>
+        {
+            Ok(())
+        }
+        Some(r) => Err(format!(
+            "offset {} after the delivery at {seq} is `{}` (commit {:?}), not {group}'s commit \
+             covering {seq}",
+            r.seq, r.subject, r.commit
+        )),
+        None => Err(format!("no record follows the delivery at {seq}")),
+    }
+}
+
+/// Whether `group`'s commit covering offset `upto` lands BEFORE the record at
+/// `fence` — what the burst phase's fence takes for granted when it bounds the
+/// burst's window by that commit: a commit that also covers the fence, or
+/// lands after it, puts the fence's whole post -> deliver round trip (and its
+/// post record) inside the burst's numbers. Pure (unit-tested).
+///
+/// # Errors
+///
+/// No commit covers `upto`, or the one that does lands after `fence`.
+pub fn lands_before(recs: &[Rec], group: &str, upto: u64, fence: u64) -> Result<(), String> {
+    match covering_commit(recs, group, upto, upto) {
+        Some(r) if r.seq < fence => Ok(()),
+        Some(r) => Err(format!(
+            "{group}'s commit covering {upto} is at offset {} (through {:?}), after the fence's \
+             record at {fence}",
+            r.seq,
+            r.commit.as_ref().map(|(_, u)| *u)
+        )),
+        None => Err(format!("no commit of {group} covers offset {upto}")),
+    }
+}
+
+/// The census as JSON: totals, and per message when `messages` is non-zero.
+#[must_use]
+pub fn to_json(c: &Census, messages: usize, window: (u64, u64)) -> aterm_json::Value {
+    let per = |n: usize| {
+        if messages == 0 {
+            aterm_json::Value::Null
+        } else {
+            aterm_json::json!(crate::stats::round3(n as f64 / messages as f64))
+        }
+    };
+    let mut classes = aterm_json::Map::new();
+    for (class, n) in &c.by_class {
+        classes.insert(
+            class.clone(),
+            aterm_json::json!({"records": n, "per_message": per(*n)}),
+        );
+    }
+    aterm_json::json!({
+        "window": {"first_offset": window.0, "last_offset": window.1},
+        "messages": messages,
+        "records": c.total,
+        "records_per_message": per(c.total),
+        "hidden": c.hidden,
+        "commit_records": c.commits,
+        "commit_records_per_message": per(c.commits),
+        "by_class": aterm_json::Value::Object(classes),
+    })
+}
+
+/// The census as markdown rows: one per kind, then the totals.
+#[must_use]
+pub fn rows(c: &Census, messages: usize) -> Vec<String> {
+    let per = |n: usize| {
+        if messages == 0 {
+            "–".to_string()
+        } else {
+            format!("{:.3}", n as f64 / messages as f64)
+        }
+    };
+    let mut out = vec![
+        "| record kind | records | per message |".to_string(),
+        "|---|---:|---:|".to_string(),
+    ];
+    for (class, n) in &c.by_class {
+        out.push(format!("| `{class}` | {n} | {} |", per(*n)));
+    }
+    out.push(format!(
+        "| **all records** | {} | {} |",
+        c.total,
+        per(c.total)
+    ));
+    out.push(format!(
+        "| of which commit records | {} | {} |",
+        c.commits,
+        per(c.commits)
+    ));
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rec(seq: u64, subject: &str, text: &str, commit: Option<(&str, u64)>) -> Rec {
+        Rec {
+            seq,
+            producer: (1, seq),
+            subject: subject.to_string(),
+            text: text.to_string(),
+            head: String::new(),
+            commit: commit.map(|(g, u)| (g.to_string(), u)),
+        }
+    }
+
+    #[test]
+    fn a_kind_is_the_subject_without_its_identities() {
+        assert_eq!(
+            class_of("/f/f1/in/n-00ab/s-77/n-00ab/note"),
+            "/f/f1/in/<node>/<sid>/<node>/note"
+        );
+        assert_eq!(
+            class_of("/f/f1/pub/n-1/node/presence"),
+            "/f/f1/pub/<node>/node/presence"
+        );
+        assert_eq!(class_of("/a/commit"), "/a/commit");
+        assert_eq!(
+            class_of("/f/f1/in/n-1/s-2/h-andrew/task"),
+            "/f/f1/in/<node>/<sid>/<principal>/task"
+        );
+    }
+
+    #[test]
+    fn a_token_is_read_whole_from_the_head_line() {
+        let head = head_line(b"v=1 t=9 state=live inc=3 pid=41 statex=no\nsecond=line");
+        assert_eq!(token(&head, "state"), Some("live"));
+        assert_eq!(token(&head, "inc"), Some("3"));
+        assert_eq!(token(&head, "pid"), Some("41"));
+        assert_eq!(token(&head, "second"), None, "the head line only");
+        assert_eq!(token(&head, "sta"), None, "a whole key, not a prefix");
+    }
+
+    #[test]
+    fn a_window_counts_every_record_and_names_the_commits() {
+        let group = "/f/f1/cur/n-1/node/inbox";
+        let recs = vec![
+            rec(4, "/f/f1/in/n-1/s-b/n-1/note", "lat-0", None),
+            rec(5, COMMIT_SUBJECT, "", Some((group, 4))),
+            rec(6, "/f/f1/in/n-1/s-b/n-1/note", "lat-1", None),
+            rec(7, "/f/f1/pub/n-1/s-b/ev", "", None),
+            rec(8, COMMIT_SUBJECT, "", Some((group, 6))),
+            rec(9, "/a/will", "", None),
+        ];
+        let c = census(window(&recs, 4, 8));
+        assert_eq!((c.total, c.hidden, c.commits), (5, 2, 2));
+        assert_eq!(
+            c.by_class.get("/f/f1/in/<node>/<sid>/<node>/note"),
+            Some(&2)
+        );
+        assert_eq!(c.by_class.get("/a/commit"), Some(&2));
+        assert!(!c.by_class.contains_key("/a/will"), "outside the window");
+        // The cursor covers offset 6 at the second commit, not the first.
+        assert_eq!(covering_commit(&recs, group, 6, 0).map(|r| r.seq), Some(8));
+        assert_eq!(covering_commit(&recs, group, 7, 0).map(|r| r.seq), None);
+        assert_eq!(covering_commit(&recs, "other", 4, 0), None);
+        let j = to_json(&c, 2, (4, 8));
+        assert_eq!(
+            j.get("records_per_message")
+                .and_then(aterm_json::Value::as_f64),
+            Some(2.5)
+        );
+        assert_eq!(
+            j.get("commit_records_per_message")
+                .and_then(aterm_json::Value::as_f64),
+            Some(1.0)
+        );
+        let table = rows(&c, 2);
+        assert!(
+            table.iter().any(|r| r == "| **all records** | 5 | 2.500 |"),
+            "{table:?}"
+        );
+    }
+
+    #[test]
+    fn a_fired_will_is_named_by_the_key_its_registration_carried() {
+        // The killed bridge registered its will at (7, 0xFFFF_FFFF) long ago;
+        // the kill fires it as its node row; the new bridge registers its own
+        // will and publishes its live rows under ordinary sequences.
+        let node = "/f/f1/pub/n-1/node/presence";
+        let mut recs = vec![
+            rec(2, WILL_SUBJECT, "", None),
+            rec(3, node, "", None),
+            rec(10, node, "", None),
+            rec(11, WILL_SUBJECT, "", None),
+            rec(12, node, "", None),
+            rec(13, "/f/f1/pub/n-1/s-a/presence", "", None),
+        ];
+        recs[0].producer = (7, 0xFFFF_FFFF);
+        recs[2].producer = (7, 0xFFFF_FFFF);
+        recs[3].producer = (7, (1 << 32) | 0xFFFF_FFFF);
+        assert_eq!(will_firings(&recs), BTreeSet::from([10]));
+        // A record under the key BEFORE any registration of it is not one.
+        recs[1].producer = (7, (1 << 32) | 0xFFFF_FFFF);
+        assert_eq!(will_firings(&recs), BTreeSet::from([10]));
+    }
+
+    #[test]
+    fn the_idle_wait_holds_only_when_the_commit_is_the_next_record() {
+        let group = "/f/f1/cur/n-1/node/inbox";
+        let recs = vec![
+            rec(4, "/f/f1/in/n-1/s-b/n-1/note", "lat-0", None),
+            rec(5, COMMIT_SUBJECT, "", Some((group, 4))),
+            rec(6, "/f/f1/in/n-1/s-b/n-1/note", "lat-1", None),
+            // A bridge that wrote something between a delivery and its commit:
+            // the head passing 7 no longer means lat-1's commit is durable.
+            rec(7, "/f/f1/pub/n-1/s-b/ev", "", None),
+            rec(8, COMMIT_SUBJECT, "", Some((group, 6))),
+            rec(9, "/f/f1/in/n-1/s-b/n-1/note", "lat-2", None),
+        ];
+        assert_eq!(next_is_its_commit(&recs, group, 4), Ok(()));
+        let why = next_is_its_commit(&recs, group, 6).expect_err("an ev sits at 7");
+        assert!(why.contains("offset 7"), "{why}");
+        assert!(next_is_its_commit(&recs, "other", 4).is_err());
+        assert!(
+            next_is_its_commit(&recs, group, 9).is_err(),
+            "nothing follows"
+        );
+    }
+
+    #[test]
+    fn the_fence_holds_only_when_the_bursts_commit_lands_before_it() {
+        let group = "/f/f1/cur/n-1/node/inbox";
+        let note = "/f/f1/in/n-1/s-b/n-1/note";
+        let held = vec![
+            rec(10, note, "burst-0", None),
+            rec(11, note, "burst-1", None),
+            rec(12, COMMIT_SUBJECT, "", Some((group, 11))),
+            rec(13, note, "fence-0", None),
+            rec(14, COMMIT_SUBJECT, "", Some((group, 13))),
+        ];
+        assert_eq!(lands_before(&held, group, 11, 13), Ok(()));
+        // A round drained the fence's post ahead of its flush: one commit
+        // covers the burst AND the fence.
+        let shared = vec![
+            rec(10, note, "burst-0", None),
+            rec(11, note, "burst-1", None),
+            rec(12, note, "fence-0", None),
+            rec(13, COMMIT_SUBJECT, "", Some((group, 12))),
+        ];
+        let why = lands_before(&shared, group, 11, 12).expect_err("the fence shares it");
+        assert!(why.contains("offset 13") && why.contains("at 12"), "{why}");
+        // The fence's post landed first, even if the commit covers only the burst.
+        let late = vec![
+            rec(11, note, "burst-1", None),
+            rec(12, note, "fence-0", None),
+            rec(13, COMMIT_SUBJECT, "", Some((group, 11))),
+        ];
+        assert!(lands_before(&late, group, 11, 12).is_err());
+        assert!(
+            lands_before(&held[..2], group, 11, 13).is_err(),
+            "no commit at all"
+        );
+    }
+}

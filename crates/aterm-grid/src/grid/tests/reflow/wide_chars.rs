@@ -5,13 +5,18 @@
 //! Wide-char reflow tests — narrow terminal regressions, spacer handling, cursor clamping.
 
 use crate::grid::reflow::ReflowMode;
-use crate::{Cell, CellFlags, Grid, StyleId};
+use crate::{Cell, CellFlags, Grid};
 
 #[test]
 fn reflow_narrow_terminal_with_wide_chars_terminates() {
     let mut grid = Grid::new(5, 10);
 
-    grid.write_wide_char_wrap_with_style_id('中', StyleId::default(), CellFlags::empty());
+    grid.write_wide_char_wrap_styled(
+        '中',
+        crate::PackedColor::DEFAULT_FG,
+        crate::PackedColor::DEFAULT_BG,
+        CellFlags::empty(),
+    );
     grid.write_char('A');
 
     // The wide char cannot fit one column: it is skipped, not retried forever.
@@ -97,43 +102,21 @@ fn reflow_narrow_terminal_with_wide_chars_terminates() {
 }
 
 #[test]
-fn reflow_narrow_terminal_skips_wide_spacer_only_after_replacement() {
-    let mut grid = Grid::new(3, 4);
-
-    grid.write_wide_char_wrap_with_style_id('中', StyleId::default(), CellFlags::empty());
-    grid.write_char('A');
-    grid.write_char('B');
-
-    // At 1 column the wide char is blanked and its spacer skipped exactly once.
-    grid.resize(3, 1);
-    grid.assert_invariants();
-
-    let row0_cell = grid.row(0).unwrap().get(0).unwrap();
-    assert_eq!(
-        row0_cell.char_data(),
-        ' ' as u16,
-        "wide char should be replaced with space"
-    );
-    let row1_cell = grid.row(1).unwrap().get(0).unwrap();
-    assert_eq!(
-        row1_cell.char_data(),
-        'A' as u16,
-        "first ASCII cell should follow replacement"
-    );
-    let row2_cell = grid.row(2).unwrap().get(0).unwrap();
-    assert_eq!(
-        row2_cell.char_data(),
-        'B' as u16,
-        "second ASCII cell should follow without spacer row"
-    );
-}
-
-#[test]
 fn reflow_narrow_terminal_replaces_multiple_wide_chars() {
     let mut grid = Grid::new(2, 4);
 
-    grid.write_wide_char_wrap_with_style_id('中', StyleId::default(), CellFlags::empty());
-    grid.write_wide_char_wrap_with_style_id('中', StyleId::default(), CellFlags::empty());
+    grid.write_wide_char_wrap_styled(
+        '中',
+        crate::PackedColor::DEFAULT_FG,
+        crate::PackedColor::DEFAULT_BG,
+        CellFlags::empty(),
+    );
+    grid.write_wide_char_wrap_styled(
+        '中',
+        crate::PackedColor::DEFAULT_FG,
+        crate::PackedColor::DEFAULT_BG,
+        CellFlags::empty(),
+    );
 
     grid.resize(2, 1);
     grid.assert_invariants();
@@ -160,7 +143,12 @@ fn reflow_narrow_terminal_replaces_multiple_wide_chars() {
 /// cursor lands at (`row`, 0) on a narrow `ch` (`what`) with row 1 continuing row 0.
 fn shrink_wide_pair_with_cursor_at(col: u16, row: u16, ch: char, what: &str) -> Grid {
     let mut grid = Grid::new(2, 4);
-    grid.write_wide_char_wrap_with_style_id('中', StyleId::default(), CellFlags::empty());
+    grid.write_wide_char_wrap_styled(
+        '中',
+        crate::PackedColor::DEFAULT_FG,
+        crate::PackedColor::DEFAULT_BG,
+        CellFlags::empty(),
+    );
     grid.write_char('A');
     grid.set_cursor(0, col);
 
@@ -226,23 +214,6 @@ fn reflow_narrow_terminal_with_wide_chars_clamps_cursor() {
 }
 
 #[test]
-fn resize_without_reflow_clears_unfittable_wide_chars() {
-    let mut grid = Grid::new(2, 4);
-
-    grid.write_wide_char_wrap_with_style_id('中', StyleId::default(), CellFlags::empty());
-    grid.write_char('A');
-
-    grid.resize_with_reflow_mode(2, 1, ReflowMode::Disabled);
-    grid.assert_invariants();
-
-    let cell = grid.row(0).unwrap().get(0).unwrap();
-    assert!(
-        !cell.is_wide(),
-        "wide chars should be cleared when the terminal is too narrow"
-    );
-}
-
-#[test]
 fn resize_no_reflow_clears_wide_char_at_boundary() {
     // `Row::resize` blanks a wide char whose spacer is cut off (WideCharNotAtEnd).
     let mut grid = Grid::new(2, 4);
@@ -251,7 +222,12 @@ fn resize_no_reflow_clears_wide_char_at_boundary() {
     grid.row_mut(0).unwrap().set(1, Cell::new('B'));
 
     grid.set_cursor(0, 2);
-    grid.write_wide_char_wrap_with_style_id('中', StyleId::default(), CellFlags::empty());
+    grid.write_wide_char_wrap_styled(
+        '中',
+        crate::PackedColor::DEFAULT_FG,
+        crate::PackedColor::DEFAULT_BG,
+        CellFlags::empty(),
+    );
 
     grid.resize_with_reflow_mode(2, 3, ReflowMode::Disabled);
     grid.assert_invariants();
@@ -274,7 +250,12 @@ fn reflow_shrink_wide_char_at_chunk_boundary() {
 
     // [A][中][spacer][B][C]
     grid.write_char('A');
-    grid.write_wide_char_wrap_with_style_id('中', StyleId::default(), CellFlags::empty());
+    grid.write_wide_char_wrap_styled(
+        '中',
+        crate::PackedColor::DEFAULT_FG,
+        crate::PackedColor::DEFAULT_BG,
+        CellFlags::empty(),
+    );
     grid.write_char('B');
     grid.write_char('C');
 
@@ -319,7 +300,12 @@ fn reflow_grow_cursor_at_end_of_wide_char_content() {
     let mut grid = Grid::new(4, 4);
 
     // Row 0: [中][spacer][A][B], full.
-    grid.write_wide_char_wrap_with_style_id('中', StyleId::default(), CellFlags::empty());
+    grid.write_wide_char_wrap_styled(
+        '中',
+        crate::PackedColor::DEFAULT_FG,
+        crate::PackedColor::DEFAULT_BG,
+        CellFlags::empty(),
+    );
     grid.write_char('A');
     grid.write_char('B');
 

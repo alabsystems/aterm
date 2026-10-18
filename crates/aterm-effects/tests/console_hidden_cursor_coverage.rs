@@ -65,16 +65,6 @@ fn check_hidden(rows: u16, cols: u16, caret: (u16, u16)) {
     assert_eq!(shown.alpha, 255, "must first materialize at {rows}x{cols}");
     term.process(b"\x1b[?25l");
     let hidden = tick(&mut term, &mut brain, &mut now, rows, cols);
-    eprintln!(
-        "pane={rows}x{cols} caret={caret:?} before=({:.3},{:.3},a{}) hidden=({:.3},{:.3},a{}) reason={}",
-        shown.row,
-        shown.col,
-        shown.alpha,
-        hidden.row,
-        hidden.col,
-        hidden.alpha,
-        brain.console_reason()
-    );
     assert!(
         hidden.alpha > 0,
         "hidden-caret resident lost on {rows}x{cols}: {}",
@@ -82,13 +72,13 @@ fn check_hidden(rows: u16, cols: u16, caret: (u16, u16)) {
     );
     assert!(
         (hidden.col - shown.col).abs() < 1.0 && (hidden.row - shown.row).abs() < 1.0,
-        "hiding the caret must hold its existing home"
+        "{rows}x{cols}: hiding the caret must hold its existing home"
     );
     // Losing one observation must not lose the remembered sampling center.
     let unknown = tick_with_surface(&mut term, &mut brain, &mut now, rows, cols, true);
     assert_eq!(
         unknown.alpha, hidden.alpha,
-        "an unknown frame holds the body on glass rather than blinking it"
+        "{rows}x{cols}: an unknown frame holds the body on glass rather than blinking it"
     );
     assert!((unknown.col - hidden.col).abs() < 0.01 && (unknown.row - hidden.row).abs() < 0.01);
     let recovered = tick(&mut term, &mut brain, &mut now, rows, cols);
@@ -106,22 +96,16 @@ fn check_hidden(rows: u16, cols: u16, caret: (u16, u16)) {
     assert_eq!(tick(&mut term, &mut brain, &mut now, rows, cols).alpha, 0);
 }
 
+/// A pane inside the bounded world map (the control), wider, taller, and
+/// both.
 #[test]
-fn hidden_caret_small_control_keeps_resident_home() {
-    check_hidden(58, 116, (55, 2));
-}
-
-#[test]
-fn hidden_caret_wide_keeps_resident_home() {
-    check_hidden(58, 600, (55, 2));
-}
-
-#[test]
-fn hidden_caret_tall_keeps_resident_home() {
-    check_hidden(200, 116, (190, 2));
-}
-
-#[test]
-fn hidden_caret_large_keeps_resident_home() {
-    check_hidden(200, 600, (190, 10));
+fn a_hidden_caret_keeps_the_resident_home_at_every_pane_size() {
+    for (rows, cols, caret) in [
+        (58, 116, (55, 2)),
+        (58, 600, (55, 2)),
+        (200, 116, (190, 2)),
+        (200, 600, (190, 10)),
+    ] {
+        check_hidden(rows, cols, caret);
+    }
 }

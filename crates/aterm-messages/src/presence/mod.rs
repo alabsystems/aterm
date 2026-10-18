@@ -89,9 +89,11 @@ pub trait Host: Copy + Eq + Debug {
     /// if-stalled`), or `None`. When it names one, the spoken remedy names it,
     /// for a survivor too in place of `signal kill`.
     fn stall_restart(stall: &Self::Stall) -> Option<&str>;
-    /// Whether `holder` is the drive-lease holder name of this process's own
-    /// harness.
-    fn is_aterms_holder(holder: &str) -> bool;
+    /// Whether a drive lease held under `holder`, taken by the process the
+    /// kernel names `pid`, is this process's own harness's: its holder name,
+    /// AND taken by this very process. The name alone is any client's to
+    /// spell; a lease whose taker no kernel named (`None`) is never aterm's.
+    fn is_aterms_holder(holder: &str, pid: Option<u32>) -> bool;
     /// The wire's percent encoding of a free-text token.
     fn pct_encode(s: &str) -> String;
     /// The wire's percent decoding of a token.

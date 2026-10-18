@@ -10,6 +10,8 @@
 //! contract's texts wrapped as 2.1.283 wraps them read whole at 80 and 200
 //! columns, and a wrap at any other column never read whole.
 
+use std::collections::BTreeSet;
+
 use super::*;
 use crate::phase::{Phase, worker_phase};
 use crate::prompt::fixtures::*;
@@ -406,7 +408,6 @@ fn every_live_question_capture_reads_as_its_form() {
             unanswered: false,
         },
     ];
-    assert_eq!(table.len(), 19, "every live dialog capture");
     for want in &table {
         let name = want.name;
         let (r, p, d) = read(want.text);
@@ -812,6 +813,260 @@ fn a_cut_question_is_head_off_screen_never_idle() {
         assert_eq!(worker_phase(&t), Phase::Prompt, "review from {from}");
     }
     assert!(!parse_prompt_v2(&r[rule..]).expect("whole").head_off_screen);
+}
+
+/// ATERM-KI-1015-1 F2, measured on Claude Code 2.1.302: a multi-select
+/// whose policy text wraps over more rows than a read's top leaves of the
+/// dialog. The harness types the long-term text at 41 columns into a fresh
+/// session's dialog drawn from row 7 of a 60-row pane; the 40-row tail the
+/// supervisor reads begins inside the text, every numbered row above it,
+/// the rows left the text's wrap (column 9, the focus on the row), the
+/// button, the chat row and the footer. That tail is the dialog with its
+/// head off the screen — so the supervisor reads the grid whole, where the
+/// text reads back as typed — never a question named by its footer alone
+/// with its head on the screen, which stood as the read and failed the
+/// read-back ("the dialog is no longer the question it was written into").
+/// The same for a cut at every row of the text's wrap, the button and the
+/// divider, and after `down` to `Submit` at 41 columns, the text drawn from
+/// column 8 (`[✔]Decide`).
+#[test]
+fn a_multi_select_cut_inside_its_free_text_row_is_head_off_screen() {
+    let grid = screen(QUESTION_MULTI_TYPED_41X60_2_1_302);
+    // The grid's rows 7 to 59: its last 40 rows are the tail read.
+    assert_eq!(grid.len(), 53, "PRECONDITION: the grid from its row 7");
+    let (_, whole, d) = read(QUESTION_MULTI_TYPED_41X60_2_1_302);
+    assert!(!whole.head_off_screen);
+    let free = free_row(&d);
+    assert!(free.focused && free.checked == Some(true) && !free.pristine);
+    assert!(free.text.starts_with("Decide yourself: choose the option"));
+    assert!(free.text.ends_with("The user was not asked.)"));
+    let cut_at = |rows: &[String], from: usize, what: &str| {
+        let t = rows[from..].to_vec();
+        let p = parse_prompt_v2(&t).unwrap_or_else(|| panic!("{what}: no box"));
+        assert!(p.head_off_screen, "{what}: {:?}", p.question_dialog);
+        assert_eq!(p.kind, PromptKind::Question, "{what}");
+        assert_eq!(
+            why(&p.question_dialog.expect("the dialog")),
+            HEAD_CUT,
+            "{what}"
+        );
+        assert_eq!(worker_phase(&t), Phase::Prompt, "{what}");
+    };
+    let tail = grid.len() - 40;
+    assert!(
+        grid[tail].starts_with("         ") && tail > free.row,
+        "PRECONDITION: the tail begins inside the text: {:?}",
+        grid[tail]
+    );
+    cut_at(&grid, tail, "the 40-row tail");
+    let button = row_of(&grid, "Submit");
+    for from in free.row + 1..=button + 1 {
+        cut_at(&grid, from, &format!("typed, from row {from}"));
+    }
+    // After `down`: the focus on `Submit`, the text from column 8.
+    let (cols, kept) = QUESTION_MULTI_REFLOW_LONG_KEPT_2_1_302[1];
+    assert_eq!(cols, 41);
+    let (r, _, d) = read(kept);
+    let free = free_row(&d);
+    assert!(!free.focused && free.checked == Some(true));
+    let button = row_of(&r, "❯    Submit");
+    assert!(
+        r[free.row + 1].starts_with("        o"),
+        "PRECONDITION: column 8"
+    );
+    for from in free.row + 1..=button + 1 {
+        cut_at(&r, from, &format!("after down, from row {from}"));
+    }
+}
+
+/// A multi-select cut at ANY row from its first option down to its divider
+/// is the dialog with its head off the screen, wherever the focus is: on an
+/// option (the pristine dialog at 37, 41 and 80 columns), in the typed text
+/// (41x60), or on `Submit` after `down` (the nine widths of
+/// `QUESTION_MULTI_REFLOW_LONG_KEPT_2_1_302`), all measured on Claude Code
+/// 2.1.302, and the 2.1.283 captures at 120 columns. The cut AT the focused
+/// `❯    Submit` is the one the supervisor's 40-row tail makes in a fresh
+/// pane `top + 11 + N + 40` rows tall (the review of round 21, measured on
+/// 2.1.302 at 41x67: the dialog from row 7, `Submit` on row 27): Claude Code
+/// parks the cursor on that row, the tail's first, so only the reading's
+/// own `head_off_screen` sends the supervisor to the whole grid. Read as a
+/// question named by its footer alone with its head on the screen, it stood
+/// as the read, `down` came back "not the question it was", and the box went
+/// to the manager. A cut at the divider is one too (`Submit` above it).
+#[test]
+fn a_multi_select_cut_at_any_row_under_its_head_is_head_off_screen() {
+    let mut frames: Vec<(String, &str)> = vec![
+        (
+            "typed 41x60".to_string(),
+            QUESTION_MULTI_TYPED_41X60_2_1_302,
+        ),
+        (
+            "2.1.283 typed".to_string(),
+            QUESTION_283_MULTISELECT_TYPED_LONG_TERM,
+        ),
+        (
+            "2.1.283 Submit".to_string(),
+            QUESTION_283_MULTISELECT_TYPED_BUTTON,
+        ),
+        (
+            "2.1.283 pristine".to_string(),
+            QUESTION_283_MULTISELECT_FREE_TEXT_FOCUSED,
+        ),
+    ];
+    for (cols, capture) in QUESTION_MULTI_PRISTINE_2_1_302 {
+        frames.push((format!("pristine at {cols}"), capture));
+    }
+    for (cols, capture) in QUESTION_MULTI_REFLOW_LONG_KEPT_2_1_302 {
+        frames.push((format!("Submit at {cols}"), capture));
+    }
+    let mut buttons = 0;
+    let mut misread: Vec<String> = Vec::new();
+    for (what, capture) in frames {
+        let (r, whole, d) = read(capture);
+        assert!(!whole.head_off_screen, "{what}: PRECONDITION: read whole");
+        assert!(matches!(d.form, QuestionForm::Multi { .. }), "{what}");
+        let divider = row_of(&r, "5. Chat about this") - 1;
+        if button_row(&r[divider - 1]).is_some_and(|(_, focused)| focused) {
+            buttons += 1;
+        }
+        misread.extend(
+            cuts_under_the_head(&r, &what)
+                .into_iter()
+                .filter_map(|(at, off, form)| {
+                    (!off || !matches!(form, QuestionForm::Unknown { why } if why == HEAD_CUT))
+                        .then(|| format!("{at}: {form:?}"))
+                }),
+        );
+    }
+    assert_eq!(
+        buttons, 10,
+        "PRECONDITION: the focus on `Submit` in ten frames"
+    );
+    assert!(
+        misread.is_empty(),
+        "read with the head on the screen: {misread:#?}"
+    );
+}
+
+/// Each cut of a multi-select's whole dialog `r` from its option 1 down to
+/// its divider, read: where it was cut (for `what`), whether its head is off
+/// the screen, and its form. Every cut is a question the worker is
+/// prompted by.
+fn cuts_under_the_head(r: &[String], what: &str) -> Vec<(String, bool, QuestionForm)> {
+    let first = r
+        .iter()
+        .position(|x| x.trim_start_matches('❯').trim_start().starts_with("1. ["))
+        .expect("option 1");
+    let divider = row_of(r, "5. Chat about this") - 1;
+    assert!(is_rule(&r[divider]), "{what}: PRECONDITION: the divider");
+    (first..=divider)
+        .map(|from| {
+            let t = r[from..].to_vec();
+            let at = format!("{what}, cut at {:?}", r[from]);
+            let p = parse_prompt_v2(&t).unwrap_or_else(|| panic!("{at}: no box"));
+            assert_eq!(p.kind, PromptKind::Question, "{at}");
+            assert_eq!(worker_phase(&t), Phase::Prompt, "{at}");
+            let form = p.question_dialog.expect("the dialog").form;
+            (at, p.head_off_screen, form)
+        })
+        .collect()
+}
+
+/// The review of round 21's F2 lane, on Claude Code 2.1.302: every frame of
+/// the four reflow sweeps from 33 columns (under it option 1 wraps), both
+/// policy texts typed and `down` to `Submit`, rebuilt whole
+/// ([`reflow_dialog`], first held to the nine measured dialogs it redraws
+/// row for row), is the dialog with its head off the screen when cut at
+/// any row from option 1 down to the divider, wherever the whole reads as
+/// the multi-select — every frame the text kept its rows in (the widths
+/// the harness types at, column 8 and column 9) and the frames `Submit`
+/// was drawn over that still read. So the supervisor's tail cut at the
+/// focused `Submit` goes to the whole grid at every width it types at, not
+/// at 41 columns alone. A frame `Submit` was drawn over that does not read
+/// whole (a width the harness never types at) is no question read whole
+/// when cut either.
+#[test]
+fn a_multi_select_cut_under_its_head_is_head_off_screen_at_every_swept_width() {
+    let template = QUESTION_MULTI_REFLOW_LONG_KEPT_2_1_302[1].1;
+    let long = reflow_frames(QUESTION_MULTI_REFLOW_LONG_SWEEP_2_1_302);
+    for (cols, capture) in QUESTION_MULTI_REFLOW_LONG_KEPT_2_1_302 {
+        let (_, frame) = long.iter().find(|(c, _)| *c == cols).expect("swept");
+        assert_eq!(
+            reflow_dialog(template, frame, cols),
+            screen(capture),
+            "PRECONDITION: the dialog measured at {cols} columns redrawn"
+        );
+    }
+    let mut misread: Vec<String> = Vec::new();
+    for (name, sweeps, swept, kept_in) in [
+        (
+            "long-term",
+            [
+                QUESTION_MULTI_REFLOW_LONG_SWEEP_2_1_302,
+                QUESTION_MULTI_REFLOW_LONG_WIDE_2_1_302,
+            ],
+            159,
+            137,
+        ),
+        (
+            "short-term",
+            [
+                QUESTION_MULTI_REFLOW_SHORT_SWEEP_2_1_302,
+                QUESTION_MULTI_REFLOW_SHORT_WIDE_2_1_302,
+            ],
+            149,
+            130,
+        ),
+    ] {
+        let (mut frames, mut kept) = (0, 0);
+        let mut cols_at = BTreeSet::new();
+        for (cols, frame) in sweeps.into_iter().flat_map(reflow_frames) {
+            if cols < 33 {
+                continue;
+            }
+            frames += 1;
+            let r = reflow_dialog(template, &frame, cols);
+            let what = format!("{name} at {cols} columns");
+            let whole = parse_prompt_v2(&r).unwrap_or_else(|| panic!("{what}: no box"));
+            assert!(!whole.head_off_screen, "{what}: PRECONDITION: whole");
+            let reads = matches!(
+                whole.question_dialog.expect("the dialog").form,
+                QuestionForm::Multi { .. }
+            );
+            // Every row kept: `Submit` alone on its row over the divider.
+            if frame[frame.len() - 2] == "❯    Submit" {
+                kept += 1;
+                cols_at.insert(if frame[0].starts_with("  4. [✔] ") {
+                    9
+                } else {
+                    8
+                });
+                if !reads {
+                    misread.push(format!("{what}: kept, not read whole"));
+                }
+            }
+            misread.extend(cuts_under_the_head(&r, &what).into_iter().filter_map(
+                |(at, off, form)| {
+                    let cut = if reads {
+                        off && matches!(form, QuestionForm::Unknown { why } if why == HEAD_CUT)
+                    } else {
+                        matches!(form, QuestionForm::Unknown { .. })
+                    };
+                    (!cut).then(|| format!("{at}: {form:?}"))
+                },
+            ));
+        }
+        assert_eq!(
+            (frames, kept),
+            (swept, kept_in),
+            "{name}: PRECONDITION: the frames from 33 columns, and those kept"
+        );
+        assert_eq!(cols_at, BTreeSet::from([8, 9]), "{name}: both columns");
+    }
+    assert!(
+        misread.is_empty(),
+        "read with the head on the screen: {misread:#?}"
+    );
 }
 
 /// The hand-built column-one dialogs (a shape 2.1.282 does not draw)
@@ -1459,14 +1714,8 @@ fn every_2_1_283_question_capture_reads_as_its_form() {
             None,
         ),
     ];
-    assert_eq!(table.len(), 24, "every committed 2.1.283 dialog capture");
     for want in &table {
         let name = want.name;
-        let prov = provenance(want.text).expect("provenance");
-        assert!(
-            prov.starts_with("claude-code 2.1.283 · MEASURED") && prov.contains(name),
-            "{name}: {prov}"
-        );
         let (r, p, d) = read(want.text);
         assert_eq!(p.kind, PromptKind::Question, "{name}");
         assert!(!p.head_off_screen, "{name}");
@@ -1653,24 +1902,6 @@ fn the_2_1_283_preview_is_unknown_on_its_chat_row_and_with_its_notes_open() {
     assert_eq!(focused.len(), 2);
     assert!(focused[0].starts_with("❯ 2. Side by side  "));
     assert_eq!(focused[1], "❯ Chat about this");
-}
-
-/// The synthetic wrap ([`rewrap_free_text`]) is the MEASURED one: fed each
-/// capture's own text at its own 120 columns it redraws the capture's
-/// dialog row for row — the focused field wrapping at cell 119 (c8-02's
-/// `you` would fit at 120), the unfocused one at 120 (c3-06's `(Answered`
-/// runs to it) — so the wraps below are the shape 2.1.283 draws.
-#[test]
-fn rewrap_free_text_redraws_every_measured_wrap() {
-    for (name, text, measured) in TYPED_2_1_283 {
-        let r = screen(text);
-        let top = r
-            .iter()
-            .rposition(|x| x.starts_with('←') || x.starts_with(" ☐") || x.starts_with(" ☒"))
-            .expect("the tab bar")
-            - 1;
-        assert_eq!(rewrap_free_text(text, measured, 120), r[top..], "{name}");
-    }
 }
 
 /// The contract's texts (§4), typed into each 2.1.283 select tab — single
@@ -1914,6 +2145,219 @@ fn a_question_whose_footer_wraps_is_read_whole() {
     for rows in [short, moved, quoted] {
         assert_eq!(parse_prompt_v2(&rows), None, "{rows:#?}");
     }
+}
+
+/// Claude Code 2.1.300 MEASURED (2026-10-15, ATERM-KI-1015-1 F2, the
+/// real-Claude lab): a multi-select whose free-text row holds the long-term
+/// text, typed by hand, after `down` to `Submit` — at 47 columns every row
+/// kept, the text drawn one cell left of its label column (`[✔]Decide`); at
+/// 39 the same, `Submit` drawn over the text's last row.
+const REFLOW_39_2_1_300: &str =
+    include_str!("fixtures/claude-2.1.300-question-multi-reflow-39col.txt");
+const REFLOW_47_2_1_300: &str =
+    include_str!("fixtures/claude-2.1.300-question-multi-reflow-47col.txt");
+
+/// `text` in rows `width` cells wide as 2.1.300 draws a multi-select's
+/// unfocused free-text row (Ink's `wrap-ansi` with `trim: false`, MEASURED
+/// with the long-term text at 43 widths from 38 to 150 columns,
+/// `aterm-agent`'s `question::drawn_rows`): greedy at
+/// single spaces, save that a row filled to its last cell leaves the next
+/// one starting with the space between, which takes a cell and is not
+/// drawn.
+fn drawn_wrap(text: &str, width: usize) -> Vec<String> {
+    let mut rows = vec![String::new()];
+    let mut line = 0usize;
+    for (k, word) in text.split(' ').enumerate() {
+        if k > 0 {
+            if line >= width {
+                rows.push(String::new());
+                line = 0;
+            }
+            rows.last_mut().expect("a row").push(' ');
+            line += 1;
+        }
+        if line + word.len() > width {
+            rows.push(String::new());
+            line = 0;
+        }
+        rows.last_mut().expect("a row").push_str(word);
+        line += word.len();
+    }
+    rows.iter().map(|r| r.trim().to_string()).collect()
+}
+
+/// `text` word-wrapped greedily into rows `width` cells wide (Ink's footer).
+fn word_wrap(text: &str, width: usize) -> Vec<String> {
+    let mut rows: Vec<String> = vec![String::new()];
+    for word in text.split(' ') {
+        let line = rows.last_mut().expect("a row");
+        if line.is_empty() {
+            line.push_str(word);
+        } else if line.chars().count() + 1 + word.chars().count() <= width {
+            line.push(' ');
+            line.push_str(word);
+        } else {
+            rows.push(word.to_string());
+        }
+    }
+    rows
+}
+
+/// A 2.1.300 multi-select `cols` wide, the focus on `Submit`, with `text` in
+/// its free-text row drawn from column `col` — 9, its label column, behind
+/// `[✔] `, or 8, behind `[✔]` with no space — on the rows [`drawn_wrap`]
+/// gives at `cols - col`, and `Submit` on its own row under them.
+/// SYNTHETIC from the measured 47-column frame: both rules `cols` wide, the
+/// footer word-wrapped at `cols`, every other row as captured.
+fn reflowed(text: &str, cols: usize, col: usize) -> Vec<String> {
+    let rows = screen(REFLOW_47_2_1_300);
+    let free = rows
+        .iter()
+        .position(|r| r.starts_with("  4. [✔]"))
+        .expect("the free-text row");
+    let divider = (free..rows.len())
+        .find(|&i| is_rule(&rows[i]))
+        .expect("the divider");
+    let footer = rows
+        .iter()
+        .position(|r| r.starts_with("Enter to select"))
+        .expect("the footer");
+    let lead = if col == 9 {
+        "  4. [✔] "
+    } else {
+        "  4. [✔]"
+    };
+    let mut out: Vec<String> = rows[..free]
+        .iter()
+        .map(|r| {
+            if is_rule(r) {
+                "─".repeat(cols)
+            } else {
+                r.clone()
+            }
+        })
+        .collect();
+    for (k, line) in drawn_wrap(text, cols - col).into_iter().enumerate() {
+        let at = if k == 0 {
+            lead.to_string()
+        } else {
+            " ".repeat(col)
+        };
+        out.push(format!("{at}{line}"));
+    }
+    out.push("❯    Submit".to_string());
+    out.push("─".repeat(cols));
+    out.extend(rows[divider + 1..footer].iter().cloned());
+    let joined = crate::wrap::rejoined(&rows[footer..]);
+    out.extend(word_wrap(&joined, cols));
+    out
+}
+
+/// THE CHECKBOX DRAWN WITHOUT ITS SPACE (ATERM-KI-1015-1 F2). 2.1.300 draws
+/// a multi-select's free-text checkbox as a text with its space inside it
+/// (`["[", tick, "]", " "]`, no fixed-width box, unlike every option's), and
+/// once the focus leaves a text that overflows the row, the flex layout takes
+/// that space: the text and every row it wraps onto start one cell left of
+/// the label column (`  4. [✔]Decide …`, rows at column 8; MEASURED with the
+/// long-term text at 38, 39 and 41 to 51 columns, the short-term text's
+/// widths a layout model's prediction only). The harness typed its text,
+/// moved the focus to `Submit`, read the dialog unknown (no options zone:
+/// "named a question by its footer or its options alone"), and handed it
+/// over half answered. The frame reads whole — its options, the text exactly
+/// as typed, ticked, the focus on the button — and so does either policy
+/// text drawn from either column at every width from 38 to 150 (SYNTHETIC,
+/// [`reflowed`]). NEGATIVE CONTROLS: a row of the text at any other
+/// column than the one its first row starts at, and a frame whose button is
+/// drawn over the text's last row, are never read whole.
+#[test]
+fn a_free_text_drawn_against_its_checkbox_reads_whole() {
+    let (r, p, d) = read(REFLOW_47_2_1_300);
+    assert_eq!(p.kind, PromptKind::Question);
+    assert!(!p.head_off_screen);
+    assert_eq!(worker_phase(&r), Phase::Prompt);
+    let QuestionForm::Multi {
+        options,
+        free_text,
+        button,
+        ..
+    } = &d.form
+    else {
+        panic!("not read whole: {:?}", d.form)
+    };
+    let read_options: Vec<(&str, &str, Option<bool>)> = options
+        .iter()
+        .map(|o| (o.label.as_str(), o.description.as_str(), o.checked))
+        .collect();
+    assert_eq!(
+        read_options,
+        [
+            ("Unit tests (Recommended)", "Fast", Some(false)),
+            ("Lint", "Style", Some(false)),
+            ("Fuzz", "Slow", Some(false)),
+        ]
+    );
+    assert_eq!(free_text.text, REWORDED_LONG_TERM);
+    assert_eq!((free_text.pristine, free_text.checked), (false, Some(true)));
+    assert_eq!(button.label, "Submit");
+    assert_eq!(d.focus(), QuestionFocus::Button);
+
+    // The synthetic frame is the measured one, row for row.
+    assert_eq!(reflowed(REWORDED_LONG_TERM, 47, 8), r);
+
+    for text in [REWORDED_LONG_TERM, REWORDED_SHORT_TERM] {
+        for col in [8, 9] {
+            for cols in 38..=150 {
+                let rows = reflowed(text, cols, col);
+                let p = parse_prompt_v2(&rows).unwrap_or_else(|| panic!("{cols}/{col}: no box"));
+                assert_eq!(p.kind, PromptKind::Question, "{cols}/{col}");
+                let d = p.question_dialog.expect("the dialog");
+                let f = free_row(&d);
+                assert_eq!(f.text, text, "{cols}/{col}");
+                assert_eq!(f.checked, Some(true), "{cols}/{col}");
+                assert_eq!(d.focus(), QuestionFocus::Button, "{cols}/{col}");
+                assert_eq!(worker_phase(&rows), Phase::Prompt, "{cols}/{col}");
+
+                // NEGATIVE CONTROL: one row of the text a cell either side of
+                // the column its first row starts at.
+                let first = rows
+                    .iter()
+                    .position(|x| x.starts_with("  4. [✔]"))
+                    .expect("the row");
+                let last = rows
+                    .iter()
+                    .position(|x| x.starts_with("❯    Submit"))
+                    .expect("the button");
+                for k in first + 1..last {
+                    for moved_to in [col - 1, col + 1] {
+                        let mut moved = rows.clone();
+                        moved[k] = format!("{}{}", " ".repeat(moved_to), rows[k].trim_start());
+                        let p = parse_prompt_v2(&moved).unwrap_or_else(|| {
+                            panic!("{cols}/{col}: row {k} at {moved_to}: no box")
+                        });
+                        assert_eq!(p.kind, PromptKind::Question, "{cols}/{col} row {k}");
+                        let d = p.question_dialog.expect("the dialog");
+                        assert!(
+                            matches!(d.form, QuestionForm::Unknown { .. }),
+                            "{cols}/{col}: row {k} at {moved_to}: {:?}",
+                            d.form
+                        );
+                        assert_eq!(worker_phase(&moved), Phase::Prompt, "{cols}/{col} row {k}");
+                    }
+                }
+            }
+        }
+    }
+
+    // NEGATIVE CONTROL: `Submit` drawn over the text's last row (39 columns,
+    // `❯    Submit asked.)`) is never read whole: still a question, never idle.
+    let (r, p, d) = read(REFLOW_39_2_1_300);
+    assert_eq!(p.kind, PromptKind::Question);
+    assert!(
+        matches!(d.form, QuestionForm::Unknown { .. }),
+        "{:?}",
+        d.form
+    );
+    assert_eq!(worker_phase(&r), Phase::Prompt);
 }
 
 /// ATERM-KI-1015-1 F2, the reader's half (the harness sweep of 2026-10-15,

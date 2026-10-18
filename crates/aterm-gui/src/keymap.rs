@@ -466,13 +466,17 @@ pub(crate) fn encode_committed_text(text: &str, mode: KeyboardMode) -> Vec<u8> {
 // OS's answer, so German Shift+2 wrote '@' (the layout types '"'), AZERTY's
 // digits were unreachable, Russian Shift+ф wrote 'ф' and Caps Lock + a wrote
 // 'a'. [`layout_text`] carries the layout's character beside the base key;
-// the encoder writes it for the text press and keeps the base key for the
-// kitty key code and for every Ctrl/Alt chord.
+// the encoder writes it for the text press, sends it after ESC for an Alt
+// chord, takes a Ctrl chord's control byte from it, and keeps the base key
+// for the kitty key code. `option_composes` is
+// [`crate::platform::option_composes`]: an Option chord's text is then the
+// composed glyph, not the layout's character.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[must_use]
 pub(crate) fn build_key_input(
     ev: &KeyEvent,
     mods: Modifiers,
+    option_composes: bool,
 ) -> Option<(keyboard::Key, Modifiers, Option<char>, Option<char>)> {
     use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
     let base_layout = aterm_winit_keymap::base_layout_key_for(ev.physical_key);
@@ -483,7 +487,7 @@ pub(crate) fn build_key_input(
         return Some((key, mods, base_layout, None));
     }
     let key = aterm_winit_keymap::map_logical_key(&ev.key_without_modifiers())?;
-    let text = layout_text(ev.text.as_deref(), &key, mods);
+    let text = layout_text(ev.text.as_deref(), &key, mods, option_composes);
     Some((
         aterm_winit_keymap::sided_modifier(key, ev.location),
         mods,
@@ -492,16 +496,24 @@ pub(crate) fn build_key_input(
     ))
 }
 
-/// The character the user's ACTIVE layout typed for a TEXT press, when it is
-/// not what the engine would derive from the unshifted `key` on its own
-/// ([`keyboard::typed_character`]: the US Shift table, Caps Lock capitals).
+/// The character the user's ACTIVE layout types for a press at its Shift and
+/// lock level, Ctrl and Alt aside, when it is not what the engine would derive
+/// from the unshifted `key` on its own ([`keyboard::typed_character`]: the US
+/// Shift table, Caps Lock capitals).
 ///
-/// `text` is winit's composed text for the press (`KeyEvent::text`: AppKit's
-/// `-characters`, xkb's level-and-lock-resolved keysym). A text press is a
-/// character key with no Ctrl, Alt, Super, Meta or Hyper — Shift and the
-/// lock keys compose text, every other modifier makes a chord the engine
-/// encodes from the base key. One printable character only: a dead key's
-/// empty text, a multi-character commit and a control code carry nothing.
+/// `text` is winit's text for the press (`KeyEvent::text`): xkb's level-and-
+/// lock-resolved keysym on X11/Wayland, where neither Ctrl nor Alt changes the
+/// level; on macOS AppKit's `-charactersIgnoringModifiers` for a Ctrl chord
+/// (the backend reads a Control or Command chord without them), and for an
+/// Option chord when the window treats Option as Alt
+/// ([`crate::platform::option_as_alt_for`]), `-characters` otherwise. So the
+/// field serves a text press, an Alt chord (ESC + the layout's character:
+/// German Alt+Shift+2 is `ESC "`, not the US table's `ESC @`) and a Ctrl chord
+/// (German Ctrl+Shift+ß is `?`'s DEL). Not when `option_composes`, where an
+/// Option chord's text is what Option composed (Option+a, "å"), and never for
+/// Super, Meta or Hyper, which the engine encodes from the base key. One
+/// printable character only: a dead key's empty text, a multi-character
+/// commit and a control code carry nothing.
 ///
 /// `None` whenever the derivation already agrees (US Shift+a is 'A'), so a
 /// window press and the controller's `key a mods=shift` stay the same event
@@ -511,26 +523,76 @@ pub(crate) fn build_key_input(
 /// and the Linux backends not at all) and, on X11/Wayland, a level-3 (AltGr)
 /// character or an xkb compose result, neither of which winit reports as a
 /// modifier.
+///
+/// On a Ctrl or Alt chord whose text is the key's letter in either case, the
+/// text is that letter in Shift's case, never the lock's ([`chord_letter`]):
+/// the lock's case (Caps Lock, or xkb's Shift+Lock level) is dropped, as the
+/// encoder's own chord rule and kitty's legacy encoding ignore the lock
+/// modifiers, and Shift's capital is the layout's, which the US table cannot
+/// derive for a letter outside it. So Caps Lock + Alt+b stays ESC b, Turkish
+/// Caps Lock + Alt+ı is ESC ı, Russian Alt+Shift+и is ESC И, and Ctrl+c under
+/// modifyOtherKeys level 2 still reports 'c'. The lock's state is not needed:
+/// the Linux backends never report it.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[must_use]
 pub(crate) fn layout_text(
     text: Option<&str>,
     key: &keyboard::Key,
     mods: Modifiers,
+    option_composes: bool,
 ) -> Option<char> {
     let keyboard::Key::Character(base) = key else {
         return None;
     };
-    if mods.intersects(
-        Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER | Modifiers::META | Modifiers::HYPER,
-    ) {
+    if mods.intersects(Modifiers::SUPER | Modifiers::META | Modifiers::HYPER)
+        || (option_composes && mods.contains(Modifiers::ALT) && !mods.contains(Modifiers::CTRL))
+    {
         return None;
     }
     let mut chars = text?.chars();
     let (Some(glyph), None) = (chars.next(), chars.next()) else {
         return None;
     };
+    let glyph = if mods.intersects(Modifiers::CTRL | Modifiers::ALT) {
+        chord_letter(glyph, *base, mods.contains(Modifiers::SHIFT))
+    } else {
+        glyph
+    };
     (!glyph.is_control() && glyph != keyboard::typed_character(*base, mods)).then_some(glyph)
+}
+
+/// The character a chord on key `base` names when the layout typed `glyph`: when `glyph` is
+/// `base`'s letter in either case ([`same_letter`]), that letter in Shift's case (`shift`),
+/// never the lock's. Shift's capital is `glyph` when the layout typed a capital (Turkish
+/// Shift+i is 'İ'), else `base`'s own one-character capital. Any other `glyph` (German
+/// Shift+2's '"') is itself.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn chord_letter(glyph: char, base: char, shift: bool) -> char {
+    if !same_letter(glyph, base) {
+        return glyph;
+    }
+    if !shift {
+        return base;
+    }
+    if glyph != base && glyph.is_uppercase() {
+        return glyph;
+    }
+    let mut capital = base.to_uppercase();
+    match (capital.next(), capital.next()) {
+        (Some(capital), None) => capital,
+        _ => glyph,
+    }
+}
+
+/// Whether `a` and `b` are one character or one letter in two cases: by Unicode's default
+/// lowercase or uppercase, which between them also pair Turkish 'I' with 'ı', plus the
+/// Turkic dotted pair 'İ' and 'i', which neither default mapping takes to the other.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn same_letter(a: char, b: char) -> bool {
+    a == b
+        || a.to_lowercase().eq(b.to_lowercase())
+        || a.to_uppercase().eq(b.to_uppercase())
+        || matches!((a, b), ('İ', 'i') | ('i', 'İ'))
 }
 
 /// [`build_key_input`] on Windows, where `KeyEventExtModifierSupplement` exists
@@ -546,12 +608,13 @@ pub(crate) fn layout_text(
 /// so the strip and the Ctrl+Alt fallback never see one.
 ///
 /// Windows encodes the COMPOSED key already, so it carries no separate layout
-/// text (the fourth field is always `None`).
+/// text (the fourth field is always `None`, and `_option_composes` is unread).
 #[cfg(windows)]
 #[must_use]
 pub(crate) fn build_key_input(
     ev: &KeyEvent,
     mods: Modifiers,
+    _option_composes: bool,
 ) -> Option<(keyboard::Key, Modifiers, Option<char>, Option<char>)> {
     let base_layout = aterm_winit_keymap::base_layout_key_for(ev.physical_key);
     if let Some(key) =
@@ -738,113 +801,107 @@ mod tests {
         mode: KeyboardMode,
     ) -> Option<Vec<u8>> {
         let ev = press_at(code, logical, winit::keyboard::KeyLocation::Standard);
-        let (key, mods, base, text) = build_key_input(&ev, mods)?;
+        let (key, mods, base, text) = build_key_input(&ev, mods, false)?;
         let bytes =
             keyboard::encode_key_with_text(&key, mods, mode, KeyEventType::Press, base, text);
         (!bytes.is_empty()).then_some(bytes)
     }
 
-    /// Alt+a must emit the ESC-prefixed base key (ESC a), NOT the macOS
-    /// Option-composed "å". We pass the layout base key ('a'); the engine
-    /// prefixes ESC for ALT. This is THE K-1 regression: the old GUI wrote
-    /// `ev.text`, which on macOS is the composed glyph.
+    /// The bytes the shipping encode path writes for one press, each row a
+    /// regression the rewrite fixed or kept:
+    ///
+    /// * Alt+a is ESC a, NOT the macOS Option-composed "å" — THE K-1
+    ///   regression: the old GUI wrote `ev.text`, the composed glyph;
+    /// * Ctrl+Space is NUL and Ctrl+\\ is FS — the old `& 0x1f` branch only
+    ///   fired for ASCII alphabetics, so both fell through to a raw byte;
+    /// * a plain printable under kitty DISAMBIGUATE is its text byte —
+    ///   over-escaping `a` to `ESC [ 97 u` corrupted ordinary typing;
+    /// * Ctrl-C / Ctrl-D stay 0x03 / 0x04, plain ASCII writes its literal byte,
+    ///   and a bare Shift press writes nothing in legacy mode.
     #[test]
-    fn alt_a_is_esc_prefixed_not_composed() {
-        let bytes = encode_press(
-            ch("a"),
-            KeyCode::KeyA,
-            Modifiers::ALT,
-            KeyboardMode::empty(),
-        )
-        .expect("alt+a encodes");
-        assert_eq!(
-            bytes,
-            vec![0x1b, b'a'],
-            "Alt+a must be ESC a, not composed å"
-        );
-    }
-
-    /// Ctrl+Space => NUL (0x00). The old `& 0x1f` branch only fired for ASCII
-    /// alphabetics, so Ctrl+Space fell through to a raw " " write — wrong.
-    #[test]
-    fn ctrl_space_is_nul() {
-        let bytes = encode_press(
-            WinitKey::Named(WinitNamed::Space),
-            KeyCode::Space,
-            Modifiers::CTRL,
-            KeyboardMode::empty(),
-        )
-        .expect("ctrl+space encodes");
-        assert_eq!(bytes, vec![0x00], "Ctrl+Space must be NUL");
-    }
-
-    /// Ctrl+\\ => FS (0x1c). The old `& 0x1f` branch ignored non-alpha keys, so
-    /// Ctrl+\\ produced a raw backslash instead of the control byte.
-    #[test]
-    fn ctrl_backslash_is_fs() {
-        let bytes = encode_press(
-            ch("\\"),
-            KeyCode::Backslash,
-            Modifiers::CTRL,
-            KeyboardMode::empty(),
-        )
-        .expect("ctrl+backslash encodes");
-        assert_eq!(bytes, vec![0x1c], "Ctrl+\\ must be FS (0x1c)");
-    }
-
-    /// Under DISAMBIGUATE_ESC_CODES (Kitty) a *plain* printable key still emits
-    /// its text byte — disambiguate only escapes genuinely ambiguous keys (Esc,
-    /// Ctrl/Alt combos). Over-escaping `a` to `ESC [ 97 u` was a confirmed
-    /// defect that corrupted ordinary typing.
-    #[test]
-    fn printable_under_disambiguate_is_plain_text() {
-        let bytes = encode_press(
-            ch("a"),
-            KeyCode::KeyA,
-            Modifiers::empty(),
-            KeyboardMode::DISAMBIGUATE_ESC_CODES,
-        )
-        .expect("a encodes");
-        assert_eq!(
-            bytes, b"a",
-            "plain printable under Kitty disambiguate must be its text byte"
-        );
-    }
-
-    /// Existing Ctrl-C / Ctrl-D byte output is UNCHANGED by the rewrite: the
-    /// classic control bytes 0x03 / 0x04 still reach the PTY.
-    #[test]
-    fn ctrl_c_and_ctrl_d_unchanged() {
-        let c = encode_press(
-            ch("c"),
-            KeyCode::KeyC,
-            Modifiers::CTRL,
-            KeyboardMode::empty(),
-        )
-        .expect("ctrl+c encodes");
-        assert_eq!(c, vec![0x03], "Ctrl-C must stay 0x03");
-        let d = encode_press(
-            ch("d"),
-            KeyCode::KeyD,
-            Modifiers::CTRL,
-            KeyboardMode::empty(),
-        )
-        .expect("ctrl+d encodes");
-        assert_eq!(d, vec![0x04], "Ctrl-D must stay 0x04");
-    }
-
-    /// A plain printable key with no modifiers and no Kitty mode writes the
-    /// literal byte — ordinary ASCII typing still works after the rewrite.
-    #[test]
-    fn plain_ascii_writes_literal() {
-        let bytes = encode_press(
-            ch("a"),
-            KeyCode::KeyA,
-            Modifiers::empty(),
-            KeyboardMode::empty(),
-        )
-        .expect("a encodes");
-        assert_eq!(bytes, vec![b'a']);
+    fn a_press_encodes_to_its_terminal_bytes() {
+        let none = KeyboardMode::empty();
+        #[expect(clippy::type_complexity, reason = "a test's case table")]
+        let cases: [(
+            &str,
+            WinitKey,
+            KeyCode,
+            Modifiers,
+            KeyboardMode,
+            Option<&[u8]>,
+        ); 8] = [
+            (
+                "alt+a",
+                ch("a"),
+                KeyCode::KeyA,
+                Modifiers::ALT,
+                none,
+                Some(b"\x1ba"),
+            ),
+            (
+                "ctrl+space",
+                WinitKey::Named(WinitNamed::Space),
+                KeyCode::Space,
+                Modifiers::CTRL,
+                none,
+                Some(b"\x00"),
+            ),
+            (
+                "ctrl+\\",
+                ch("\\"),
+                KeyCode::Backslash,
+                Modifiers::CTRL,
+                none,
+                Some(b"\x1c"),
+            ),
+            (
+                "a under disambiguate",
+                ch("a"),
+                KeyCode::KeyA,
+                Modifiers::empty(),
+                KeyboardMode::DISAMBIGUATE_ESC_CODES,
+                Some(b"a"),
+            ),
+            (
+                "ctrl+c",
+                ch("c"),
+                KeyCode::KeyC,
+                Modifiers::CTRL,
+                none,
+                Some(b"\x03"),
+            ),
+            (
+                "ctrl+d",
+                ch("d"),
+                KeyCode::KeyD,
+                Modifiers::CTRL,
+                none,
+                Some(b"\x04"),
+            ),
+            (
+                "a",
+                ch("a"),
+                KeyCode::KeyA,
+                Modifiers::empty(),
+                none,
+                Some(b"a"),
+            ),
+            (
+                "bare shift",
+                WinitKey::Named(WinitNamed::Shift),
+                KeyCode::ShiftLeft,
+                Modifiers::SHIFT,
+                none,
+                None,
+            ),
+        ];
+        for (case, logical, code, mods, mode, want) in cases {
+            assert_eq!(
+                encode_press(logical, code, mods, mode).as_deref(),
+                want,
+                "{case}"
+            );
+        }
     }
 
     /// Regression (the "Shift doesn't work" report): Shift+<symbol> must encode
@@ -861,7 +918,7 @@ mod tests {
     #[test]
     fn shift_symbol_encodes_shifted_glyph() {
         let ev = mac_press(KeyCode::Digit2, "@", "2", "@");
-        let (key, mods, base, text) = build_key_input(&ev, Modifiers::SHIFT).expect("maps");
+        let (key, mods, base, text) = build_key_input(&ev, Modifiers::SHIFT, false).expect("maps");
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             assert_eq!(key, keyboard::Key::Character('2'));
@@ -876,21 +933,6 @@ mod tests {
             text,
         );
         assert_eq!(bytes, b"@", "Shift+2 must emit '@', not '2'");
-    }
-
-    /// A bare modifier press (Shift alone) encodes to nothing in legacy mode.
-    #[test]
-    fn bare_modifier_press_is_none() {
-        assert_eq!(
-            encode_press(
-                WinitKey::Named(WinitNamed::Shift),
-                KeyCode::ShiftLeft,
-                Modifiers::SHIFT,
-                KeyboardMode::empty(),
-            ),
-            None,
-            "a bare Shift press must produce no bytes in legacy mode"
-        );
     }
 
     /// The Windows lock-state query returns ONLY the two lock bits (whatever
@@ -1103,21 +1145,6 @@ mod tests {
         assert!(m.contains(Modifiers::SUPER));
     }
 
-    /// IME-1: while a composition is active (non-empty preedit), direct key
-    /// sends are SUPPRESSED so the composing keystrokes don't double-input; with
-    /// no composition (empty preedit) they proceed.
-    #[test]
-    fn composition_suppresses_direct_send() {
-        assert!(
-            suppress_direct_send("か"),
-            "an active preedit must suppress direct key sends"
-        );
-        assert!(
-            !suppress_direct_send(""),
-            "no composition (empty preedit) must NOT suppress direct sends"
-        );
-    }
-
     /// IME-1: a committed composition is encoded as ordinary text through the
     /// engine (each char a `Character` key), NOT a raw `& 0x1f` byte. ASCII
     /// commits round-trip to their bytes; multi-byte CJK to their UTF-8.
@@ -1255,7 +1282,7 @@ mod tests {
     /// The bytes the seam writes for the triple `build_key_input` builds.
     fn seam_bytes(ev: &KeyEvent, mode: KeyboardMode) -> Vec<u8> {
         let (key, mods, base, text) =
-            build_key_input(ev, Modifiers::empty()).expect("the key maps");
+            build_key_input(ev, Modifiers::empty(), false).expect("the key maps");
         keyboard::encode_key_with_text(&key, mods, mode, KeyEventType::Press, base, text)
     }
 
@@ -1269,7 +1296,7 @@ mod tests {
         use aterm_types::keyboard::NamedKey;
         use winit::keyboard::KeyLocation;
         let ev = press_at(KeyCode::Numpad5, ch("5"), KeyLocation::Numpad);
-        let (key, _, _, _) = build_key_input(&ev, Modifiers::empty()).expect("KP_5 maps");
+        let (key, _, _, _) = build_key_input(&ev, Modifiers::empty(), false).expect("KP_5 maps");
         assert_eq!(key, keyboard::Key::Named(NamedKey::Numpad5));
         assert_eq!(seam_bytes(&ev, KeyboardMode::empty()), b"5");
         assert_eq!(seam_bytes(&ev, KeyboardMode::APP_KEYPAD), b"\x1bOu");
@@ -1293,7 +1320,8 @@ mod tests {
         use aterm_types::keyboard::NamedKey;
         use winit::keyboard::KeyLocation;
         let ev = press_at(KeyCode::Numpad5, ch("5"), KeyLocation::Numpad);
-        let (key, mods, base, _) = build_key_input(&ev, Modifiers::SHIFT).expect("KP_5 maps");
+        let (key, mods, base, _) =
+            build_key_input(&ev, Modifiers::SHIFT, false).expect("KP_5 maps");
         assert_eq!(key, keyboard::Key::Named(NamedKey::Numpad5));
         assert!(
             mods.contains(Modifiers::SHIFT),
@@ -1331,7 +1359,8 @@ mod tests {
             WinitKey::Named(WinitNamed::Enter),
             KeyLocation::Numpad,
         );
-        let (key, _, _, _) = build_key_input(&ev, Modifiers::empty()).expect("KP_Enter maps");
+        let (key, _, _, _) =
+            build_key_input(&ev, Modifiers::empty(), false).expect("KP_Enter maps");
         assert_eq!(key, keyboard::Key::Named(NamedKey::NumpadEnter));
         assert_eq!(seam_bytes(&ev, KeyboardMode::empty()), b"\r");
         assert_eq!(seam_bytes(&ev, KeyboardMode::APP_KEYPAD), b"\x1bOM");
@@ -1355,7 +1384,7 @@ mod tests {
             WinitKey::Named(WinitNamed::End),
             KeyLocation::Numpad,
         );
-        let (key, _, _, _) = build_key_input(&ev, Modifiers::empty()).expect("KP_End maps");
+        let (key, _, _, _) = build_key_input(&ev, Modifiers::empty(), false).expect("KP_End maps");
         assert_eq!(key, keyboard::Key::Named(NamedKey::NumpadEnd));
         assert_eq!(seam_bytes(&ev, KeyboardMode::empty()), b"\x1b[F");
         assert_eq!(
@@ -1372,7 +1401,7 @@ mod tests {
         use aterm_types::keyboard::NamedKey;
         use winit::keyboard::KeyLocation;
         let five = press_at(KeyCode::Digit5, ch("5"), KeyLocation::Standard);
-        let (key, _, _, _) = build_key_input(&five, Modifiers::empty()).expect("5 maps");
+        let (key, _, _, _) = build_key_input(&five, Modifiers::empty(), false).expect("5 maps");
         assert_eq!(key, keyboard::Key::Character('5'));
         assert_eq!(seam_bytes(&five, KeyboardMode::APP_KEYPAD), b"5");
         assert_eq!(
@@ -1384,7 +1413,8 @@ mod tests {
             WinitKey::Named(WinitNamed::Enter),
             KeyLocation::Standard,
         );
-        let (key, _, _, _) = build_key_input(&enter, Modifiers::empty()).expect("Enter maps");
+        let (key, _, _, _) =
+            build_key_input(&enter, Modifiers::empty(), false).expect("Enter maps");
         assert_eq!(key, keyboard::Key::Named(NamedKey::Enter));
         assert_eq!(seam_bytes(&enter, KeyboardMode::APP_KEYPAD), b"\r");
     }
@@ -1445,7 +1475,7 @@ mod tests {
                 "the harness really does hand the builder a divergent base key"
             );
         }
-        let (key, _, _, _) = build_key_input(&ev, Modifiers::empty()).expect("KP_1 maps");
+        let (key, _, _, _) = build_key_input(&ev, Modifiers::empty(), false).expect("KP_1 maps");
         assert_eq!(key, keyboard::Key::Named(NamedKey::Numpad1));
         assert_eq!(
             seam_bytes(&ev, KeyboardMode::empty()),
@@ -1508,7 +1538,8 @@ mod tests {
             WinitKey::Unidentified(NativeKey::Xkb(0xff9d)),
             KeyLocation::Numpad,
         );
-        let (key, _, _, _) = build_key_input(&ev, Modifiers::empty()).expect("KP_Begin maps");
+        let (key, _, _, _) =
+            build_key_input(&ev, Modifiers::empty(), false).expect("KP_Begin maps");
         assert_eq!(key, keyboard::Key::Named(NamedKey::NumpadBegin));
         assert_eq!(
             seam_bytes(&ev, KeyboardMode::empty()),
@@ -1540,17 +1571,18 @@ mod tests {
     /// The bytes the seam writes for a macOS-shaped press under `mods`.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn mac_bytes(ev: &KeyEvent, mods: Modifiers, mode: KeyboardMode) -> Vec<u8> {
-        let (key, mods, base, text) = build_key_input(ev, mods).expect("the key maps");
+        let (key, mods, base, text) = build_key_input(ev, mods, false).expect("the key maps");
         keyboard::encode_key_with_text(&key, mods, mode, KeyEventType::Press, base, text)
     }
 
-    /// Bug hunt 8: the window carries the layout's character only for a TEXT
-    /// press, and only when the US derivation from the unshifted key would type
-    /// something else — so a US press stays the event a controller builds.
+    /// Bug hunt 8: the window carries the layout's character only when the US
+    /// derivation from the unshifted key would type something else — so a US
+    /// press stays the event a controller builds — for a text press and, since
+    /// ATERM-KI-1015-9, a Ctrl or Alt chord.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
-    fn layout_text_rides_a_text_press_only_when_the_layout_differs() {
-        let text = |ev: &KeyEvent, mods| build_key_input(ev, mods).expect("maps").3;
+    fn layout_text_rides_a_press_only_when_the_layout_differs() {
+        let text = |ev: &KeyEvent, mods| build_key_input(ev, mods, false).expect("maps").3;
         // US: the engine already agrees.
         assert_eq!(
             text(&mac_press(KeyCode::KeyA, "a", "a", "a"), Modifiers::empty()),
@@ -1584,18 +1616,79 @@ mod tests {
             text(&mac_press(KeyCode::KeyA, "Ф", "ф", "Ф"), Modifiers::SHIFT),
             Some('Ф')
         );
-        // A chord never carries it; neither does a dead key's empty text.
-        let alt_a = mac_press(KeyCode::KeyA, "å", "a", "å");
-        assert_eq!(text(&alt_a, Modifiers::ALT), None);
-        let ctrl_shift_2 = mac_press(KeyCode::Digit2, "\"", "2", "\"");
+        // A Ctrl or Alt chord carries the layout's character too (German
+        // Ctrl+Shift+2 and Option+Shift+2 read '"' without Ctrl or Option),
+        // but not when it agrees with the derivation (Alt+a's 'a'), nor an
+        // Option chord whose text Option composed, nor a Super chord, nor a
+        // dead key's empty text.
+        let de_2 = mac_press(KeyCode::Digit2, "\"", "2", "\"");
+        assert_eq!(text(&de_2, Modifiers::CTRL | Modifiers::SHIFT), Some('"'));
+        assert_eq!(text(&de_2, Modifiers::ALT | Modifiers::SHIFT), Some('"'));
         assert_eq!(
-            text(&ctrl_shift_2, Modifiers::CTRL | Modifiers::SHIFT),
+            text(&mac_press(KeyCode::KeyA, "a", "a", "a"), Modifiers::ALT),
             None
         );
+        let alt_a = mac_press(KeyCode::KeyA, "å", "a", "å");
+        let composes = |ev: &KeyEvent, mods| build_key_input(ev, mods, true).expect("maps").3;
+        assert_eq!(
+            composes(&alt_a, Modifiers::ALT),
+            None,
+            "Option composed 'å'"
+        );
+        assert_eq!(
+            composes(&de_2, Modifiers::CTRL | Modifiers::ALT | Modifiers::SHIFT),
+            Some('"'),
+            "a Ctrl chord's text is read without Option"
+        );
+        assert_eq!(text(&de_2, Modifiers::SUPER | Modifiers::SHIFT), None);
         assert_eq!(
             text(&mac_press(KeyCode::KeyE, "e", "e", ""), Modifiers::empty()),
             None
         );
+        // A chord's letter in the lock's case carries nothing (Caps Lock +
+        // Alt+b, Caps Lock + Ctrl+c, Russian Caps Lock + Alt+и, and xkb's
+        // Shift+Lock level, which types the small letter), while a text press
+        // keeps the lock's capital (above).
+        let caps_b = mac_press(KeyCode::KeyB, "B", "b", "B");
+        assert_eq!(text(&caps_b, Modifiers::ALT), None);
+        assert_eq!(
+            text(&mac_press(KeyCode::KeyC, "C", "c", "C"), Modifiers::CTRL),
+            None
+        );
+        assert_eq!(
+            text(&mac_press(KeyCode::KeyB, "И", "и", "И"), Modifiers::ALT),
+            None
+        );
+        assert_eq!(
+            text(
+                &mac_press(KeyCode::KeyB, "b", "b", "b"),
+                Modifiers::CTRL | Modifiers::SHIFT
+            ),
+            None
+        );
+        // Every case pair, Turkish Q's two included (Caps Lock + Alt+ı reads
+        // 'I', Caps Lock + Alt+i 'İ'), and Shift's capital where the US table
+        // derives none (Russian Alt+Shift+и, German Alt+Shift+ü).
+        let alt_shift = Modifiers::ALT | Modifiers::SHIFT;
+        for (press, mods, want, why) in [
+            (("I", "ı"), Modifiers::ALT, None, "tr Caps Lock + Alt+ı"),
+            (("İ", "i"), Modifiers::ALT, None, "tr Caps Lock + Alt+i"),
+            (("I", "ı"), alt_shift, Some('I'), "tr Alt+Shift+ı"),
+            (("İ", "i"), alt_shift, Some('İ'), "tr Alt+Shift+i"),
+            (("И", "и"), alt_shift, Some('И'), "ru Alt+Shift+и"),
+            (("Ü", "ü"), alt_shift, Some('Ü'), "de Alt+Shift+ü"),
+            (
+                ("и", "и"),
+                alt_shift,
+                Some('И'),
+                "ru Shift under Caps Lock (xkb)",
+            ),
+            (("ẞ", "ß"), Modifiers::ALT, None, "de Caps Lock + Alt+ß"),
+        ] {
+            let (glyph, base) = press;
+            let ev = mac_press(KeyCode::KeyI, glyph, base, glyph);
+            assert_eq!(text(&ev, mods), want, "{why}");
+        }
     }
 
     /// Bug hunt 8, the window half: Caps Lock + A, and Shift on a non-US

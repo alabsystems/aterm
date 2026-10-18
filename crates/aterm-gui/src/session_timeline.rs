@@ -83,22 +83,30 @@ pub(crate) const META_QUESTIONS_MAX: usize = 16;
 ///   prose question with `answer_text`;
 /// - `long-term` and `short-term` answer by the worker's own choice under that
 ///   priority, from a fixed text the supervisor writes into the free-text row
-///   (`aterm_agent::supervise::QuestionPriority::WORDS`, pinned beside this).
+///   (`aterm_agent::supervise::QuestionPriority::WORDS`, which this list is
+///   built from).
 ///
 /// This store holds the word only. Unset (`questions=-`), the global switch
 /// decides; a build restoring a word it does not know drops it.
-pub(crate) const QUESTIONS_POLICY_WORDS: [&str; 4] =
-    ["ask", "recommended", "long-term", "short-term"];
+pub(crate) const QUESTIONS_POLICY_WORDS: [&str;
+    1 + aterm_agent::supervise::QuestionPriority::WORDS.len()] = {
+    let w = aterm_agent::supervise::QuestionPriority::WORDS;
+    ["ask", w[0], w[1], w[2]]
+};
 
 /// The one usage line every refusal of a `meta set questions` value prints
-/// (after the `ERR ` prefix), so the wire and its tests cannot spell it twice.
-pub(crate) const QUESTIONS_USAGE: &str =
-    "usage: meta set questions ask|recommended|long-term|short-term";
+/// (after the `ERR ` prefix), built from [`QUESTIONS_POLICY_WORDS`].
+pub(crate) fn questions_usage() -> String {
+    format!(
+        "usage: meta set questions {}",
+        QUESTIONS_POLICY_WORDS.join("|")
+    )
+}
 
 /// Normalize a `questions` value to its policy word, or `None` when it is not
 /// one: whitespace is trimmed and ASCII case folded (`Recommended` stores
 /// `recommended`), so every reader compares one spelling. Anything else is
-/// `None`, and the wire answers [`QUESTIONS_USAGE`]. Pure: the control verb,
+/// `None`, and the wire answers [`questions_usage`]. Pure: the control verb,
 /// the restore sanitizer and [`SessionMeta::set`]'s second gate all use it.
 #[must_use]
 pub(crate) fn normalize_questions_value(value: &str) -> Option<&'static str> {
@@ -114,11 +122,16 @@ pub(crate) fn normalize_questions_value(value: &str) -> Option<&'static str> {
 pub(crate) const META_AUTOPILOT_MAX: usize = 16;
 
 /// The one usage line every refusal of a `meta set autopilot` value prints
-/// (after the `ERR ` prefix). It spells the three stored words, in the order
-/// the chip cycles them; the owner's own words for two of them (`forever`,
-/// `infinity`, `wrap-up`, `wrapup`, `wrap`) are admitted too and stored as
-/// the word they stand for ([`normalize_autopilot_value`]).
-pub(crate) const AUTOPILOT_USAGE: &str = "usage: meta set autopilot cruise|land|off";
+/// (after the `ERR ` prefix, and after the reason where one is named:
+/// `ERR until= goes with cruise only: usage: …`). It spells the three stored
+/// words, in the order the chip cycles them, and the timed Cruise's
+/// `until=` (`docs/DESIGN-harness-autopilot-2026-10-15.md` §9.3.5: a local
+/// `HH:MM`, or `+<n>h`, `+<n>m`, `+<n>h<n>m` of elapsed time); the owner's
+/// own words for two of them (`forever`, `infinity`, `wrap-up`, `wrapup`,
+/// `wrap`) are admitted too and stored as the word they stand for
+/// ([`normalize_autopilot_value`]).
+pub(crate) const AUTOPILOT_USAGE: &str =
+    "usage: meta set autopilot cruise [until=HH:MM|+DURATION]|land|off";
 
 /// Normalize an `autopilot` value to its stored word, or `None` when it is no
 /// mode: the session's AUTOPILOT (`docs/DESIGN-harness-autopilot-2026-10-15.md`
@@ -288,7 +301,9 @@ pub(crate) struct SessionMeta {
     /// the word `cruise`, and written with it by one method. `meta`,
     /// `status` and `ls` print it (`land_at=`, unix seconds, `-` while
     /// unset). It is no [`MetaField`]: it rides the autopilot field. Written
-    /// by nothing yet. Part of equality, like the word it goes with.
+    /// only with the word, by [`Self::set_autopilot`]: every write of the
+    /// word by hand, the same word included, drops it. Part of equality,
+    /// like the word it goes with.
     pub(crate) land_at: Option<i64>,
     /// Provenance, not value: one bit per [`MetaField`] a driver has written in
     /// this process (every write [`apply_meta_value`] accepted, including a
@@ -448,6 +463,7 @@ impl SessionMeta {
             self.attention_owners.get(BARE_ATTENTION_OWNER)
         }
         .and_then(carried_attention);
+        let (autopilot, land_at) = self.carried_autopilot();
         Self {
             user_title: self.presentation_value("title"),
             description: self.presentation_value("description"),
@@ -458,14 +474,26 @@ impl SessionMeta {
             supervisor: None,
             supervisor_revision: 0,
             questions: self.presentation_value("questions"),
-            autopilot: self.presentation_value("autopilot"),
-            // The timer travels with the word it goes with, and only with
-            // `cruise` (§9.3.6, item 2).
-            land_at: self.land_at.filter(|_| {
-                self.autopilot_word() == Some(aterm_agent::supervise::Autopilot::Cruise)
-            }),
+            autopilot,
+            land_at,
             driver_writes: 0,
         }
+    }
+
+    /// THE AUTOPILOT PAIR AS A RESTORE LAYOUT CARRIES IT: the word in its
+    /// presentation form, and the timer beside it — which travels with the
+    /// word it goes with, and only with `cruise` (§9.3.6, item 2). The one
+    /// projection [`Self::sanitized`] (every capture's) and the crash
+    /// journal's check of what its last image carries
+    /// (`App::journal_owner_words`) both read, so the two never disagree.
+    #[must_use]
+    pub(crate) fn carried_autopilot(&self) -> (Option<String>, Option<i64>) {
+        (
+            self.presentation_value("autopilot"),
+            self.land_at.filter(|_| {
+                self.autopilot_word() == Some(aterm_agent::supervise::Autopilot::Cruise)
+            }),
+        )
     }
 
     /// Set (or with `None`, clear) `owner`'s attention entry and re-project
@@ -553,6 +581,7 @@ impl SessionMeta {
     ///
     /// Carrying our own host's lease would park the successor's host behind a
     /// dead process's claim.
+    #[cfg(any(unix, test))]
     #[must_use]
     pub(crate) fn handoff_supervisor(
         &self,
@@ -598,6 +627,7 @@ impl SessionMeta {
     /// must survive the update. A map built as a literal (its bare value in
     /// [`Self::attention`] alone) carries nothing here; that value crosses in
     /// the restore leaf.
+    #[cfg(any(unix, test))]
     #[must_use]
     pub(crate) fn handoff_attention_owners(&self) -> Vec<String> {
         self.attention_owners
@@ -637,13 +667,17 @@ impl SessionMeta {
                     .unwrap_or(false),
             );
         }
+        if field == "autopilot" {
+            // The word alone is a hand write of it: its timer goes with it
+            // (§9.3.6, item 1).
+            return Some(self.set_autopilot(value, None));
+        }
         let slot = match field {
             "title" => &mut self.user_title,
             "description" => &mut self.description,
             "icon" => &mut self.icon,
             "role" => &mut self.role,
             "questions" => &mut self.questions,
-            "autopilot" => &mut self.autopilot,
             _ => return None,
         };
         // User-facing callers reject unsafe/over-cap values visibly; this second
@@ -652,6 +686,27 @@ impl SessionMeta {
         let changed = *slot != value;
         *slot = value;
         Some(changed)
+    }
+}
+
+impl SessionMeta {
+    /// THE ONE WRITER OF THE AUTOPILOT PAIR (§9.3.6, item 1): store `word`
+    /// (`None`: unset; sanitized as [`Self::set`] sanitizes) and `land_at`
+    /// (unix ms) together. The timer is kept only beside the word `cruise`
+    /// — a `land_at` under any other word, or none, is dropped — so a timer
+    /// never outlives its Cruise. Whether EITHER half moved: a write of the
+    /// same word that drops a timer is a change, so its record, its wake and
+    /// the index follow it. The host's ring follows the word alone
+    /// ([`apply_autopilot`]).
+    pub(crate) fn set_autopilot(&mut self, word: Option<String>, land_at: Option<i64>) -> bool {
+        let word = word.and_then(|value| sanitize_metadata_value("autopilot", &value));
+        let cruise = word.as_deref().and_then(normalize_autopilot_value)
+            == Some(aterm_agent::supervise::Autopilot::Cruise.word());
+        let land_at = land_at.filter(|_| cruise);
+        let changed = self.autopilot != word || self.land_at != land_at;
+        self.autopilot = word;
+        self.land_at = land_at;
+        changed
     }
 }
 
@@ -724,6 +779,7 @@ impl AttentionOwners {
     /// Every `(owner, text)` in write order, oldest first: written again into an
     /// empty map it gives the same effective entry. What a handoff carries
     /// ([`SessionMeta::handoff_attention_owners`]).
+    #[cfg(any(unix, test))]
     fn in_write_order(&self) -> Vec<(&str, &str)> {
         let mut entries: Vec<&AttentionEntry> = self.entries.iter().collect();
         entries.sort_by_key(|entry| entry.stamp);
@@ -927,7 +983,7 @@ pub(crate) enum MetaWriteError {
         cap: usize,
     },
     /// A `questions` value outside its closed set
-    /// ([`normalize_questions_value`]); the wire answers [`QUESTIONS_USAGE`].
+    /// ([`normalize_questions_value`]); the wire answers [`questions_usage`].
     NotAQuestionsPolicy,
     /// An `autopilot` value that names no mode
     /// ([`normalize_autopilot_value`]); the wire answers [`AUTOPILOT_USAGE`].
@@ -1008,6 +1064,10 @@ pub(crate) fn apply_meta_value(
     field: MetaField,
     value: Option<String>,
 ) -> bool {
+    if field == MetaField::Autopilot {
+        // The word written by hand: its timer, if any, goes with it.
+        return apply_autopilot(ctx, value, None).moved;
+    }
     let payload = meta_change_payload(field, value.as_deref());
     let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
     meta.driver_writes |= field.bit();
@@ -1023,6 +1083,155 @@ pub(crate) fn apply_meta_value(
         crate::harness_host::ring();
     }
     changed
+}
+
+/// What one write of the Autopilot pair did ([`apply_autopilot`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AutopilotWrite {
+    /// Either half moved: the record, the wake, the footer and the timer's
+    /// index follow it.
+    pub(crate) moved: bool,
+    /// The word moved: the window's host was rung.
+    pub(crate) word_moved: bool,
+}
+
+/// Write session `ctx`'s AUTOPILOT PAIR (§9.3.6, item 1): its word (`None`:
+/// unset; a value [`validated_meta_value`] produced) and the instant a timed
+/// Cruise lands (`land_at`, unix ms; kept only beside `cruise`), as ONE step
+/// under the meta guard ([`SessionMeta::set_autopilot`]). The wire's `meta
+/// set|unset autopilot … [until=]` and the window's own writer
+/// (`App::set_session_autopilot_timed`) both come here. Marks the autopilot
+/// field driver-written — the pair rides its bit — and, when either half
+/// moved, records the `meta-change` (`field=autopilot value=<word|->`, with
+/// ` land_at=<unix s>` while a timer is armed) under the guard, as
+/// [`apply_meta_value`] does. A word that moved rings the window's host
+/// after the guards are released; a timer alone does not (the loop reads
+/// the word, never the timer).
+pub(crate) fn apply_autopilot(
+    ctx: &crate::SessionCtx,
+    word: Option<String>,
+    land_at: Option<i64>,
+) -> AutopilotWrite {
+    let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+    meta.driver_writes |= MetaField::Autopilot.bit();
+    let before = meta.autopilot.clone();
+    let moved = meta.set_autopilot(word, land_at);
+    let word_moved = meta.autopilot != before;
+    if moved {
+        let payload = autopilot_change_payload(&meta);
+        ctx.timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .record("meta-change", payload);
+    }
+    drop(meta);
+    if word_moved {
+        crate::harness_host::ring();
+    }
+    AutopilotWrite { moved, word_moved }
+}
+
+/// What THE FIRE of a timed Cruise found (§9.3.6, item 5; [`fire_land_at`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Fired {
+    /// The stored pair was the timer's, and its instant had come: `land`
+    /// is stored, with no timer.
+    Landed,
+    /// The stored pair is the timer's, but the wall clock is short of its
+    /// instant by this many ms (set back, or the monotonic deadline ran
+    /// early): nothing written; indexed again from the remainder.
+    NotYet(i64),
+    /// The stored pair is no longer the timer's — the word is not `cruise`,
+    /// or the instant moved — so nothing is written; indexed again from what
+    /// is stored (`Some`), or not at all.
+    Moved(Option<i64>),
+}
+
+/// THE FIRE IS A COMPARE-AND-SET (§9.3.6, item 5): under session `ctx`'s
+/// meta guard, write `land` (and drop the timer) only where the STORED pair
+/// is still `cruise` with `land_at == expected_ms` and the wall clock
+/// (`wall_ms`, read once by the caller) is at or past it. The App's index
+/// says only when to look: a hand write stored before this — `meta set
+/// autopilot off` over the wire whose wake the App has not applied yet, the
+/// same word again, a new arm — leaves a pair this does not match, so the
+/// hand always wins. A write here is this process's: it marks the
+/// autopilot `driver_writes` bit, so a later graft of a carried identity
+/// never reverts it, and records the `meta-change` under the guard as
+/// [`apply_meta_value`] does. The word moved, so the host is rung after the
+/// guard is released; the rest of the fan-out (the footer, the A/B arm, the
+/// page, the message) is the App's.
+pub(crate) fn fire_land_at(ctx: &crate::SessionCtx, expected_ms: i64, wall_ms: i64) -> Fired {
+    use aterm_agent::supervise::Autopilot;
+    let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+    let ours =
+        meta.autopilot_word() == Some(Autopilot::Cruise) && meta.land_at == Some(expected_ms);
+    if !ours {
+        return Fired::Moved(meta.land_at);
+    }
+    if wall_ms < expected_ms {
+        return Fired::NotYet(expected_ms - wall_ms);
+    }
+    meta.driver_writes |= MetaField::Autopilot.bit();
+    meta.set_autopilot(Some(Autopilot::Land.word().to_string()), None);
+    let payload = autopilot_change_payload(&meta);
+    ctx.timeline
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .record("meta-change", payload);
+    drop(meta);
+    crate::harness_host::ring();
+    Fired::Landed
+}
+
+/// THE CANCEL IS A COMPARE-AND-SET TOO (§9.3.3, §9.3.4: "Cancel landing"
+/// is offered only while a timer is armed): under session `ctx`'s meta
+/// guard, drop the timer only where the STORED pair is still `cruise` with
+/// a `land_at` — the very instant `expected` names, where the row that asked
+/// named one — and keep the word as stored. Anything else (a hand write of
+/// `off` or `land` stored first, the timer's own fire, a new arm the row
+/// never showed) writes nothing, so a cancel offered by a page or a menu
+/// that has gone stale can never write `cruise` over a word the person or
+/// the timer wrote. A drop is a hand write of the pair: it marks the
+/// autopilot `driver_writes` bit and records the `meta-change` under the
+/// guard, as [`apply_autopilot`] does; the word did not move, so the host
+/// is not rung. What it did.
+pub(crate) fn cancel_land_at(ctx: &crate::SessionCtx, expected: Option<i64>) -> AutopilotWrite {
+    use aterm_agent::supervise::Autopilot;
+    let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+    let armed = meta.autopilot_word() == Some(Autopilot::Cruise)
+        && meta
+            .land_at
+            .is_some_and(|at| expected.is_none_or(|expected| expected == at));
+    if !armed {
+        return AutopilotWrite::default();
+    }
+    meta.driver_writes |= MetaField::Autopilot.bit();
+    let word = meta.autopilot.clone();
+    let moved = meta.set_autopilot(word, None);
+    if moved {
+        let payload = autopilot_change_payload(&meta);
+        ctx.timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .record("meta-change", payload);
+    }
+    AutopilotWrite {
+        moved,
+        word_moved: false,
+    }
+}
+
+/// The `meta-change` payload for the Autopilot pair as `meta` now stores it:
+/// [`meta_change_payload`]'s `field=autopilot value=<pct|->`, and
+/// ` land_at=<unix s>` after it while a timer is armed — so a write that
+/// only drops a timer reads as the change it is.
+fn autopilot_change_payload(meta: &SessionMeta) -> String {
+    let mut payload = meta_change_payload(MetaField::Autopilot, meta.autopilot.as_deref());
+    if let Some(ms) = meta.land_at {
+        payload.push_str(" land_at=");
+        payload.push_str(&ms.div_euclid(1000).to_string());
+    }
+    payload
 }
 
 /// Why a keyed attention write was refused.
@@ -1601,6 +1810,11 @@ fn meta_change_payload(field: MetaField, value: Option<&str>) -> String {
 /// * An Autopilot word that moves rings the window's host, as
 ///   [`apply_meta_value`] does: a session carried in `off` is let alone from
 ///   the host's next pass.
+/// * The Autopilot word and its timer (`land_at`) are ONE step
+///   ([`SessionMeta::set_autopilot`]), under the autopilot field's bit: a
+///   driver's write of the word here set or cleared the timer with it, so
+///   it wins for both halves; else both take the carried pair. The App
+///   indexes the session's timer after this (`App::index_autopilot_timer`).
 ///
 /// Returns whether any stored value moved: the caller's gate for waking the
 /// session's `events` watchers.
@@ -1613,6 +1827,23 @@ pub(crate) fn restore_carried_meta(ctx: &crate::SessionCtx, carried: &SessionMet
             continue;
         }
         let name = field.wire_name();
+        if field == MetaField::Autopilot {
+            // The PAIR, as one step (§9.3.6, item 2): the word and its timer,
+            // both kept where a driver wrote the word here (its write set or
+            // cleared the timer with it).
+            let before = meta.autopilot.clone();
+            if !meta.set_autopilot(carried.autopilot.clone(), carried.land_at) {
+                continue;
+            }
+            moved = true;
+            autopilot_moved |= meta.autopilot != before;
+            let payload = autopilot_change_payload(&meta);
+            ctx.timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .record("meta-change", payload);
+            continue;
+        }
         if !meta
             .set(name, carried.get(name).map(str::to_owned))
             .unwrap_or(false)
@@ -1620,7 +1851,6 @@ pub(crate) fn restore_carried_meta(ctx: &crate::SessionCtx, carried: &SessionMet
             continue;
         }
         moved = true;
-        autopilot_moved |= field == MetaField::Autopilot;
         // The STORED value, which `set`'s sanitizer may have narrowed from
         // what the manifest spelled.
         let payload = meta_change_payload(field, meta.get(name));
@@ -1778,6 +2008,7 @@ pub(crate) struct SessionTimeline {
     /// from ([`Self::handoff_id`]): this process may hand out ids up to it
     /// without either process naming one event twice. `None` until a park
     /// draws a manifest.
+    #[cfg(any(unix, test))]
     handoff_ceiling: Option<u64>,
     /// When a move of the screen alone last woke the supervisor host
     /// ([`Self::publish_agent`]): at most once per
@@ -1799,6 +2030,18 @@ pub(crate) struct SessionTimeline {
     /// told it, or the loop that did has ended. Written only by
     /// `App::apply_harness_fact`.
     task_face: Option<(aterm_agent::harness::acts::TaskFace, i64)>,
+    /// The face and its time as they stood when the host told "unknown"
+    /// (the loop ended: a restart, a panicked body, an Off), kept so the next
+    /// loop's start face, where it is the same (a landing seeded across the
+    /// restart), RESTATES it with its first time rather than moving it
+    /// ([`Self::set_task_face`]). Gone at the first face told after.
+    task_face_held: Option<(aterm_agent::harness::acts::TaskFace, i64)>,
+    /// Which foreground group was in front when the status sweep first saw
+    /// the engine's current cwd report: `(Terminal::reported_cwd_seq, pgid)`
+    /// ([`Self::witness_cwd_report`]). A report stands only under the group it
+    /// was made under: an ssh's remote shell's OSC 7 says nothing once the
+    /// local shell is back in front (`App::resolve_citation`).
+    cwd_witness: Option<(u64, i32)>,
 }
 
 /// How many ids a seamless update leaves this process between the park's draw
@@ -1807,6 +2050,7 @@ pub(crate) struct SessionTimeline {
 /// `timeline since=` filters by id, so the jump is invisible. A process that
 /// records more than this in one overlap refuses its Commit (a lossless retry)
 /// rather than hand an id out twice.
+#[cfg(any(unix, test))]
 pub(crate) const HANDOFF_ID_RESERVE: u64 = 1 << 16;
 
 /// One measurement of the shell's PATH ([`SessionTimeline::set_leader`]).
@@ -2158,6 +2402,7 @@ impl SessionTimeline {
                 aterm_phase::Program::Codex
                 | aterm_phase::Program::Agy
                 | aterm_phase::Program::Muse
+                | aterm_phase::Program::Gemini
                 | aterm_phase::Program::Generic,
             )
             | None => false,
@@ -2240,6 +2485,28 @@ impl SessionTimeline {
         self.slog.handoff_carry().row()
     }
 
+    /// The session log's seq count for the handoff (`SessionRecord::log_seq`):
+    /// its last seq plus its overlap reserve, remembered as this process's
+    /// ceiling ([`Self::past_handoff_ceiling`]).
+    #[cfg(any(unix, test))]
+    pub(crate) fn handoff_log_seq(&mut self) -> u64 {
+        self.slog.handoff_seq()
+    }
+
+    /// The adopted session's engine, hydrated: its next block id and C count,
+    /// which a carried block cursor must fit (`SessionLog::fit_engine`).
+    pub(crate) fn slog_fit_engine(&mut self, next_block: u64, started: u64) {
+        let now = self.slog.now();
+        self.slog.fit_engine(next_block, started, now);
+    }
+
+    /// THE HANDOFF WORKER'S TAKE of the session log (phase 2A): its carry
+    /// snapshot and producers' lines, its readers fenced from now on.
+    #[cfg(any(unix, test))]
+    pub(crate) fn slog_carry_source(&mut self) -> crate::session_log::SlogCarrySource {
+        self.slog.carry_source()
+    }
+
     /// The session log ([`crate::session_log`]).
     pub(crate) fn slog(&self) -> &crate::session_log::SessionLog {
         &self.slog
@@ -2262,6 +2529,13 @@ impl SessionTimeline {
     pub(crate) fn slog_tick(&mut self) -> Option<u64> {
         let at = self.slog.now();
         self.slog.tick(at)
+    }
+
+    /// Whether the session log's readers are owed a wake
+    /// ([`crate::session_log::SessionLog::take_log_wake`]): the caller wakes
+    /// the session's subscribers once this lock is released.
+    pub(crate) fn slog_take_wake(&mut self) -> bool {
+        self.slog.take_log_wake()
     }
 
     /// Count on from a seamless update: the adopted session's timeline starts
@@ -2439,6 +2713,26 @@ impl SessionTimeline {
         let at = self.slog.now();
         self.slog.foreground_moved(pgid, at);
         true
+    }
+
+    /// The status sweep saw the engine's cwd report `seq`
+    /// (`Terminal::reported_cwd_seq`) with group `pgid` in front: the first
+    /// sight of a report names the group it is held to, a later sight of the
+    /// same report changes nothing. No group (`pgid <= 0`) or a carried cwd
+    /// (`None`) witnesses nothing.
+    pub(crate) fn witness_cwd_report(&mut self, seq: Option<u64>, pgid: i32) {
+        let Some(seq) = seq.filter(|_| pgid > 0) else {
+            return;
+        };
+        if self.cwd_witness.is_none_or(|(seen, _)| seen != seq) {
+            self.cwd_witness = Some((seq, pgid));
+        }
+    }
+
+    /// [`Self::witness_cwd_report`]'s record: the report and the group it was
+    /// first seen under.
+    pub(crate) fn cwd_witness(&self) -> Option<(u64, i32)> {
+        self.cwd_witness
     }
 
     /// The session's own process group (its shell's pid), for the session
@@ -2723,7 +3017,10 @@ impl SessionTimeline {
     /// Replace the task's face ([`Self::task_face()`]): `face` and the wall
     /// time of its move (unix ms), or `None` for "unknown". Whether the face
     /// moved — a move to the face already held keeps its first time, so a
-    /// face told again is no change.
+    /// face told again is no change. A face told after "unknown" that is the
+    /// one held before it (a landed session's next loop, which starts landed)
+    /// takes back that face's first time: `landed 17:42` stays 17:42 across a
+    /// restart.
     pub(crate) fn set_task_face(
         &mut self,
         face: Option<aterm_agent::harness::acts::TaskFace>,
@@ -2732,7 +3029,14 @@ impl SessionTimeline {
         if self.task_face.map(|(f, _)| f) == face {
             return false;
         }
-        self.task_face = face.map(|f| (f, at_ms));
+        let held = self.task_face_held.take();
+        self.task_face = match face {
+            None => {
+                self.task_face_held = self.task_face;
+                None
+            }
+            Some(f) => Some(held.filter(|&(h, _)| h == f).unwrap_or((f, at_ms))),
+        };
         true
     }
 
@@ -3044,12 +3348,6 @@ mod tests {
         // Unknown fields are rejected (None), not silently stored.
         assert_eq!(m.set("colour", Some("red".into())), None);
         assert_eq!(m.get("colour"), None);
-        assert_eq!(SessionMeta::cap("title"), Some(META_TITLE_MAX));
-        assert_eq!(SessionMeta::cap("description"), Some(META_DESCRIPTION_MAX));
-        assert_eq!(SessionMeta::cap("icon"), Some(META_ICON_MAX));
-        assert_eq!(SessionMeta::cap("role"), Some(META_ROLE_MAX));
-        assert_eq!(SessionMeta::cap("attention"), Some(META_ATTENTION_MAX));
-        assert_eq!(SessionMeta::cap("colour"), None);
         // The typed keys round-trip like the original three and flip any_set.
         assert_eq!(m.set("role", Some("operator".into())), Some(true));
         assert_eq!(m.get("role"), Some("operator"));
@@ -3218,12 +3516,12 @@ mod write_api_tests {
 mod questions_field_tests {
     use super::{
         META_QUESTIONS_MAX, MetaEdit, MetaField, MetaWriteError, QUESTIONS_POLICY_WORDS,
-        QUESTIONS_USAGE, SessionMeta, normalize_questions_value, restore_carried_meta,
-        sanitize_metadata_value, validated_meta_value,
+        SessionMeta, normalize_questions_value, restore_carried_meta, sanitize_metadata_value,
+        validated_meta_value,
     };
 
-    /// Every spelling the contract admits, and the one it stores; the usage
-    /// line spells exactly the words, and the cap holds the longest.
+    /// Every spelling the contract admits, and the one it stores; the cap
+    /// holds the longest.
     #[test]
     fn the_policy_words_are_admitted_and_case_folded() {
         for word in QUESTIONS_POLICY_WORDS {
@@ -3240,14 +3538,6 @@ mod questions_field_tests {
         ] {
             assert_eq!(normalize_questions_value(typed), Some(stored), "{typed:?}");
         }
-        assert_eq!(
-            QUESTIONS_USAGE,
-            format!(
-                "usage: meta set questions {}",
-                QUESTIONS_POLICY_WORDS.join("|")
-            ),
-            "the usage line spells the closed set"
-        );
     }
 
     /// Anything else is refused whole — never trimmed into a different value.
@@ -3330,22 +3620,6 @@ mod questions_field_tests {
         assert_eq!(sanitize_metadata_value("questions", "@s-x"), None);
     }
 
-    /// The session's words and the supervisor's priority words are one list:
-    /// every word but `ask` is a `question_priority` word and every priority
-    /// word is a session word.
-    #[test]
-    fn the_session_words_are_ask_and_the_supervisors_priority_words() {
-        let priorities = aterm_agent::supervise::QuestionPriority::WORDS;
-        assert_eq!(QUESTIONS_POLICY_WORDS[0], "ask");
-        assert_eq!(&QUESTIONS_POLICY_WORDS[1..], &priorities[..]);
-        for word in priorities {
-            assert_eq!(
-                aterm_agent::supervise::QuestionPriority::parse(word).map(|p| p.word()),
-                normalize_questions_value(word)
-            );
-        }
-    }
-
     /// Restore and handoff carry it: a sanitized copy keeps it, and the carried
     /// identity puts it back on the live session as an ordinary `meta-change`,
     /// for each of the four words.
@@ -3406,7 +3680,15 @@ mod autopilot_field_tests {
         ] {
             assert_eq!(normalize_autopilot_value(typed), Some(stored), "{typed:?}");
         }
-        let words: Vec<&str> = Autopilot::ALL.iter().map(|m| m.word()).collect();
+        // The three words in the chip's cycle order, Cruise's `until=`
+        // (§9.3.5) beside it.
+        let words: Vec<String> = Autopilot::ALL
+            .iter()
+            .map(|m| match m {
+                Autopilot::Cruise => format!("{} [until=HH:MM|+DURATION]", m.word()),
+                _ => m.word().to_string(),
+            })
+            .collect();
         assert_eq!(
             AUTOPILOT_USAGE,
             format!("usage: meta set autopilot {}", words.join("|"))

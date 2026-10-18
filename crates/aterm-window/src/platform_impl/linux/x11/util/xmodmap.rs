@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 use std::slice;
 
-use x11_dl::xlib::{KeyCode as XKeyCode, XModifierKeymap};
+use super::ffi::{KeyCode as XKeyCode, XModifierKeymap};
 
 // Offsets within XModifierKeymap to each set of keycodes.
 // We are only interested in Shift, Control, Alt, and Logo.

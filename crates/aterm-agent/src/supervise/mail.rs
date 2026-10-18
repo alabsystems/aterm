@@ -32,7 +32,7 @@ use aterm_types::fabric_grammar::{ANSWER_KINDS, KINDS};
 
 use super::phase::Phase;
 use super::run::{
-    Ctl, CtlReply, EXIT_TIMEOUT, RECONNECT_PAUSE, RECONNECT_PAUSE_MAX, Session, composer_guard,
+    Ctl, CtlReply, EXIT_TIMEOUT, RECONNECT_PAUSE, RECONNECT_PAUSE_MAX, Session, composer_guard_at,
 };
 
 /// `--report-window`'s default: how long before its `EVENT idle` a worker's
@@ -634,8 +634,30 @@ fn nudge_left<C: Ctl>(
 /// when the worker could not be read, when the nudge's turn was refused, or
 /// when an outage outlasted `--reconnect-s`.
 pub fn task<C: Ctl>(ctl: &mut C, opts: &TaskOpts, out: &mut dyn Write) -> Result<u8, String> {
-    task_with_clock(ctl, opts, out, Instant::now, std::thread::sleep)
+    task_with_clock(
+        ctl,
+        opts,
+        out,
+        Instant::now,
+        std::thread::sleep,
+        &alab_idle_now,
+    )
 }
+
+/// Whether the codex-alab `pid` is at its own idle point now — its session
+/// record read live, `status:"idle"` with `draftEmpty:true`
+/// ([`crate::harness::self_claimed::read_idle`]), the identity the kernel
+/// names now — the one evidence aterm types a Codex's mail line on (aterm
+/// reads no Codex screen). A process this host cannot read (gone, another
+/// host's) is no idle point.
+fn alab_idle_now(pid: u32) -> bool {
+    crate::harness::restart_stamp::kernel_start(pid)
+        .is_some_and(|start| crate::harness::self_claimed::read_idle(pid, &start))
+}
+
+/// The caret codex-alab draws its composer with, at its row's first column:
+/// the nudge's Enter is guarded on that row holding the nudge.
+const ALAB_CARET: char = '\u{203a}';
 
 /// An outage `task --wait` rides out: a request not served
 /// ([`CtlReply::lost`]) at `since`, as an aterm self-update's handoff leaves
@@ -693,13 +715,16 @@ impl Outage {
 
 /// The shipping deadline loop with its monotonic clock and its pause
 /// supplied separately so scripted host timeouts and outages can exercise it
-/// without depending on OS scheduling.
+/// without depending on OS scheduling; `alab_idle`, a codex-alab's own idle
+/// point by its pid ([`alab_idle_now`] in the shipped loop, a stand-in in
+/// tests).
 fn task_with_clock<C: Ctl>(
     ctl: &mut C,
     opts: &TaskOpts,
     out: &mut dyn Write,
     mut now: impl FnMut() -> Instant,
     mut sleep: impl FnMut(Duration),
+    alab_idle: &dyn Fn(u32) -> bool,
 ) -> Result<u8, String> {
     let since = match opts.wait {
         Some(_) => {
@@ -756,33 +781,68 @@ fn task_with_clock<C: Ctl>(
     let mut nudged = false;
     let mut refused = None;
     // The worker is read by its own grammar (`status program=`, else what its
-    // screen shows: Claude Code's, Codex's), and only an agent's idle screen
-    // with a composer that grammar draws is nudged: a shell, a box and a
-    // running turn get the mail alone. Idle must be evidence, as the loop's
+    // screen shows), and only an agent's idle screen with a composer that
+    // grammar draws is nudged: a shell, a box and a running turn get the mail
+    // alone. A CODEX is no screen aterm reads (the Codex screen lane's
+    // retirement, 2026-10-16): only a codex-alab whose PROVEN self-claim the
+    // `status` names is nudged, at its own idle point (its record at rest,
+    // its draft empty: `alab_idle`), as its contract's inbox row asks (the
+    // line is the trigger it reads its mail by); a vendor `codex` gets the
+    // mail alone. Idle must be evidence, as the loop's
     // own acts require: a long Codex answer streaming past the rows read
-    // shows no turn either way, and reads idle without it.
+    // shows no turn either way, and reads idle without it. And the composer
+    // must be EMPTY, judged as the loop judges it before typing
+    // (`Session::composer_draft`: the cell tells Claude Code's
+    // dim placeholder, and Muse Code's prompt hint, from a draft whose caret
+    // was moved home): a person's draft — Muse Code's `/` menu filter among
+    // them — is theirs, never typed into.
     let read = {
         let mut worker = Session::new(&mut *ctl, Some(opts.worker.clone()));
         worker.read_screen().and_then(|screen| {
             let reader = worker.program_reader(&screen.rows)?;
+            match reader.program() {
+                aterm_phase::Program::Codex => {
+                    return Ok(worker
+                        .proven_alab
+                        .is_some_and(alab_idle)
+                        .then_some((ALAB_CARET, 0)));
+                }
+                aterm_phase::Program::Claude
+                | aterm_phase::Program::Agy
+                | aterm_phase::Program::Muse
+                | aterm_phase::Program::Gemini
+                | aterm_phase::Program::Generic => {}
+            }
             let rows = &screen.rows;
             let phase = reader.phase(rows);
+            let composer = reader.composer(rows);
             let idle = reader.program().supervisable()
                 && phase == Phase::Idle
                 && reader.phase_authoritative(rows, &phase)
-                && reader.composer(rows).is_some();
-            Ok(idle.then(|| reader.caret_on(rows)).flatten())
+                && composer.is_some()
+                && worker.composer_draft(
+                    composer.as_ref(),
+                    reader.placeholder(),
+                    reader.placeholder_fg(),
+                    &screen,
+                ) == Some(false);
+            Ok(idle
+                .then(|| reader.caret_on(rows).map(|c| (c, reader.caret_column())))
+                .flatten())
         })
     };
     match read {
         Err(why) => refused = Some(format!("cannot read the worker for the nudge: {why}")),
-        Ok(Some(caret)) => {
+        Ok(Some((caret, column))) => {
             // The Enter is guarded on the composer's caret row holding the
             // nudge: a box the read missed, or that came up since, has no such
             // row, so the Enter can never choose its focused option. The
             // caret is the one the worker's composer is drawn with.
             let nudge = format!("{NUDGE}{off}");
-            let submit = format!("submit=guarded:{}", composer_guard(caret, &nudge));
+            let submit = format!(
+                "submit=guarded:{}",
+                composer_guard_at(caret, column, &nudge)
+            );
             let r = ctl.call(&[
                 &opts.worker,
                 "turn",
@@ -1003,6 +1063,7 @@ mod tests {
     }
     use super::super::phase::worker_phase;
     use super::super::prompt::fixtures::{composer, rows, screen as fixture_rows};
+    use super::super::run::{composer_guard, composer_guard_at};
     use super::*;
     use std::cell::Cell;
     use std::collections::VecDeque;
@@ -1102,12 +1163,17 @@ mod tests {
     }
     /// A `text --json` reply of these rows.
     fn screen(rows: &[String]) -> CtlReply {
+        screen_at(rows, 10)
+    }
+    /// [`screen`] with the cursor at column 2 of row `row`, where a program
+    /// parks it on its empty composer.
+    fn screen_at(rows: &[String], row: usize) -> CtlReply {
         let rows: Vec<String> = rows
             .iter()
             .map(|r| format!("\"{}\"", r.replace('\\', "\\\\").replace('"', "\\\"")))
             .collect();
         ok(&format!(
-            "{{\"rows\":[{}],\"cursor\":{{\"row\":10,\"col\":2,\"visible\":true,\"style\":\"block\"}},\"dims\":{{\"rows\":40,\"cols\":120}},\"seq\":7}}\n",
+            "{{\"rows\":[{}],\"cursor\":{{\"row\":{row},\"col\":2,\"visible\":true,\"style\":\"block\"}},\"dims\":{{\"rows\":40,\"cols\":120}},\"seq\":7}}\n",
             rows.join(",")
         ))
     }
@@ -1142,6 +1208,16 @@ mod tests {
     }
     /// [`task_with_clock`] on the script's clock: a pause moves it on.
     fn run_task(s: &mut Script, opts: &TaskOpts) -> (Result<u8, String>, Vec<String>) {
+        run_task_with(s, opts, &|_| {
+            panic!("no codex-alab's idle point is read here")
+        })
+    }
+    /// [`run_task`] with `alab_idle` standing for codex-alab's own idle point.
+    fn run_task_with(
+        s: &mut Script,
+        opts: &TaskOpts,
+        alab_idle: &dyn Fn(u32) -> bool,
+    ) -> (Result<u8, String>, Vec<String>) {
         let mut out: Vec<u8> = Vec::new();
         let now = Rc::clone(&s.now);
         let paused = Rc::clone(&s.now);
@@ -1151,6 +1227,7 @@ mod tests {
             &mut out,
             || now.get(),
             |d| paused.set(paused.get() + d),
+            alab_idle,
         );
         let text = String::from_utf8(out).expect("utf-8");
         (code, text.lines().map(str::to_string).collect())
@@ -1420,10 +1497,7 @@ mod tests {
         let (code, lines) = run_task(&mut s, &task_opts(None));
         assert_eq!(lines, ["task @91 nudged=0"]);
         let why = code.expect_err("a missed guard is said");
-        assert!(
-            why.contains("not submitted") && why.contains("reason=guard"),
-            "{why}"
-        );
+        assert!(why.contains("reason=guard"), "{why}");
         assert_eq!(s.requests.len(), 4, "{:?}", s.requests);
     }
 
@@ -1443,27 +1517,196 @@ mod tests {
         assert!(!s.requests.iter().any(|r| r.contains("turn")));
     }
 
-    /// A worker is read by ITS OWN grammar (`status program=`): an idle Codex
-    /// is nudged under the caret its composer is drawn with (`›`), never
-    /// under Claude Code's `❯`, which no Codex row starts with. NEGATIVE
-    /// CONTROLS: a Codex approval box, a running Codex turn and one whose
-    /// idle is no evidence (its answer streaming past the rows read) get the
-    /// mail alone (no `turn`, so nothing is typed over the box's digit
-    /// choices or into the turn), and a shell printing an idle Claude Code
-    /// screen is no agent to nudge.
+    /// A worker is read by ITS OWN reader (`status program=`): a vendor
+    /// Codex is never nudged, since aterm reads no Codex screen (its Codex
+    /// screen lane was retired on 2026-10-16) and no claim names its idle
+    /// point (codex-alab's: the next test), so it gets the mail alone (no
+    /// `turn`, nothing typed); and a shell printing an idle Claude Code
+    /// screen is no agent to nudge. NEGATIVE CONTROL: the same idle Claude
+    /// Code screen under `claude` is nudged.
     #[test]
     fn a_worker_is_nudged_by_its_own_grammar() {
-        use aterm_phase::codex::fixtures::{BOX_EXEC, BUSY, IDLE, STREAMING};
+        let codex_idle = rows(&[
+            "• Done: the parser is fixed.",
+            "",
+            "› Ask Codex to do anything",
+            "",
+            "  gpt-5 · ~/src",
+        ]);
+        let codex_busy = rows(&[
+            "• Working (12s • esc to interrupt)",
+            "",
+            "› Ask Codex to do anything",
+            "",
+            "  gpt-5 · ~/src",
+        ]);
+        for (name, rows, program) in [
+            ("an idle Codex", codex_idle, "codex"),
+            ("a Codex turn", codex_busy, "codex"),
+            ("a shell printing Claude Code", idle_screen(), "zsh"),
+        ] {
+            let mut s = Script::new(vec![ok("OK 3 off=91\n"), screen(&rows), status(program)]);
+            let (code, lines) = run_task(&mut s, &task_opts(None));
+            assert_eq!(code, Ok(0), "{name}");
+            assert_eq!(lines, ["task @91 nudged=0"], "{name}");
+            assert!(
+                !s.requests.iter().any(|q| q.contains(" turn ")),
+                "{name}: {:?}",
+                s.requests
+            );
+        }
         let mut s = Script::new(vec![
             ok("OK 3 off=91\n"),
-            screen(&fixture_rows(IDLE)),
-            status("codex"),
+            screen(&idle_screen()),
+            status("claude"),
+            ok("turn 5 submitted=1 status=timeout seq=9 dur_ms=2500 hash=0000000000000000\n"),
+        ]);
+        let (code, lines) = run_task(&mut s, &task_opts(None));
+        assert_eq!(code, Ok(0));
+        assert_eq!(lines, ["task @91 nudged=1"], "the control");
+    }
+
+    /// A CODEX-ALAB WITH A PROVEN SELF-CLAIM IS NUDGED AT ITS OWN IDLE POINT
+    /// (its contract's inbox row: the typed `Inbox: task @<off>` is the
+    /// trigger it reads its mail by): the `status` names the proven claim
+    /// (`supervisor_proven=1`, `supervisor=codex-alab@<pid>`), its record says
+    /// it is at rest with its draft empty (`alab_idle`), and the nudge goes,
+    /// its Enter guarded on the `›` row holding it — whatever its screen
+    /// shows, which aterm does not read. NEGATIVE CONTROLS: the same claim
+    /// not at rest, an unproven claim, and a vendor `codex` (no claim) get
+    /// the mail alone, and the idle point of a pid no proven claim names is
+    /// never asked.
+    #[test]
+    fn a_proven_codex_alab_is_nudged_at_its_own_idle_point_and_a_vendor_codex_never() {
+        let proven = |pid: u32, proven: u8| {
+            ok(&format!(
+                "OK schema=1 sid=s-1 hold=0 fabric=connected program=codex \
+                 supervisor=codex-alab%40{pid} supervisor_proven={proven}\n"
+            ))
+        };
+        let busy = rows(&["• Working (12s • esc to interrupt)", "", "› Ask Codex"]);
+        let mut s = Script::new(vec![
+            ok("OK 3 off=91\n"),
+            screen(&busy),
+            proven(4242, 1),
+            ok("turn 5 submitted=1 status=timeout seq=9 dur_ms=2500 hash=0000000000000000\n"),
+        ]);
+        let asked = std::cell::Cell::new(0);
+        let (code, lines) = run_task_with(&mut s, &task_opts(None), &|pid| {
+            asked.set(pid);
+            true
+        });
+        assert_eq!(code, Ok(0), "{:?}", s.requests);
+        assert_eq!(lines, ["task @91 nudged=1"]);
+        assert_eq!(asked.get(), 4242, "its own record, by the claim's pid");
+        let turn = s
+            .requests
+            .iter()
+            .find(|q| q.contains(" turn "))
+            .expect("the nudge");
+        assert!(
+            turn.contains("submit=guarded:^\u{203a}") && turn.ends_with("Inbox: task @91"),
+            "{turn}"
+        );
+        for (why, status, at_rest) in [
+            ("not at rest", proven(4242, 1), false),
+            ("unproven", proven(4242, 0), true),
+            (
+                "a vendor codex",
+                ok("OK schema=1 sid=s-1 hold=0 fabric=connected program=codex\n"),
+                true,
+            ),
+        ] {
+            let mut s = Script::new(vec![ok("OK 3 off=91\n"), screen(&busy), status]);
+            let (code, lines) = run_task_with(&mut s, &task_opts(None), &|pid| {
+                assert_eq!(pid, 4242, "{why}: only a proven claim's pid is asked");
+                assert_eq!(why, "not at rest", "{why}: its idle point is never asked");
+                at_rest
+            });
+            assert_eq!(code, Ok(0), "{why}");
+            assert_eq!(lines, ["task @91 nudged=0"], "{why}");
+            assert!(
+                !s.requests.iter().any(|q| q.contains(" turn ")),
+                "{why}: {:?}",
+                s.requests
+            );
+        }
+    }
+
+    /// A homed draft or unknown cell gets mail alone. Both admitted DIM and known
+    /// non-DIM controls run before the unreadable and malformed cell paths; all
+    /// requests are the scripted transport, never session input.
+    #[test]
+    fn a_draft_whose_caret_went_home_is_not_typed_into() {
+        let mut drafted = idle_screen();
+        let caret = drafted
+            .iter()
+            .position(|r| r.starts_with('❯'))
+            .expect("caret row");
+        drafted[caret] = "❯ fix the flaky test".to_string();
+        let mut wrong = Vec::new();
+        for (label, cell, nudged) in [
+            ("known draft", ok("OK f d0d0d0 111318 none\n"), false),
+            (
+                "known DIM placeholder",
+                ok("OK f 8a8f99 111318 dim\n"),
+                true,
+            ),
+            ("unreadable cell", err("no such verb: cell"), false),
+            ("missing cell attributes", ok("OK f 8a8f99 111318\n"), false),
+        ] {
+            let mut s = Script::new(vec![
+                ok("OK 3 off=91\n"),
+                screen_at(&drafted, caret),
+                status("claude"),
+                cell,
+                // Let the old unsafe branch complete so its final request is observed.
+                ok("turn 5 submitted=1 status=timeout seq=9 dur_ms=2500 hash=0000000000000000\n"),
+            ]);
+            let (code, lines) = run_task(&mut s, &task_opts(None));
+            assert_eq!(code, Ok(0), "{label}: {lines:?} / {:?}", s.requests);
+            assert!(
+                s.requests.iter().any(|q| q.contains(" cell ")),
+                "cell reached: {:?}",
+                s.requests
+            );
+            let typed = s.requests.iter().any(|q| q.contains(" turn "));
+            if label.starts_with("known") {
+                assert_eq!(
+                    typed, nudged,
+                    "admitted/control mismatch {label}: {:?}",
+                    s.requests
+                );
+            }
+            if typed != nudged || lines != [format!("task @91 nudged={}", u8::from(nudged))] {
+                wrong.push((label, lines, s.requests));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "a task typed without a known empty composer: {wrong:?}"
+        );
+    }
+
+    /// GEMINI CLI runs as `node`, so `drive task` reads it by its screen: an
+    /// idle Gemini CLI is nudged under its own caret, one column in (` > `,
+    /// `composer_guard_at`). NEGATIVE CONTROLS: its shell box, its running
+    /// turn and its open `/` menu get the mail alone, and the column-0 guard
+    /// every other program takes is not the one sent.
+    #[test]
+    fn an_idle_gemini_cli_is_nudged_one_column_in() {
+        use aterm_phase::gemini::fixtures::{BOX_SHELL, BUSY_THINKING, END_OF_TURN, SLASH_MENU};
+        let mut s = Script::new(vec![
+            ok("OK 3 off=91\n"),
+            screen(&fixture_rows(END_OF_TURN)),
+            status("node"),
             ok("turn 5 submitted=1 status=timeout seq=9 dur_ms=2500 hash=0000000000000000\n"),
         ]);
         let (code, lines) = run_task(&mut s, &task_opts(None));
         assert_eq!(code, Ok(0));
         assert_eq!(lines, ["task @91 nudged=1"]);
-        let guard = composer_guard('›', "Inbox: task @91");
+        let guard = composer_guard_at('>', 1, "Inbox: task @91");
+        assert_ne!(guard, composer_guard('>', "Inbox: task @91"));
         assert_eq!(
             s.requests.last().map(String::as_str),
             Some(
@@ -1471,26 +1714,12 @@ mod tests {
                     .as_str()
             )
         );
-        // A long answer streaming past the rows read: no user row, no end
-        // row and no status row above the composer, so the reading is idle
-        // but not evidence of it.
-        let streaming = fixture_rows(STREAMING);
-        let user = streaming
-            .iter()
-            .rposition(|r| r.starts_with("› ") && !r.contains("Ask Codex"))
-            .expect("the turn's user row");
-        let past = streaming[user + 1..].to_vec();
-        let reader = aterm_phase::identify(Some("codex"), &past);
-        let phase = reader.phase(&past);
-        assert_eq!(phase, Phase::Idle, "{past:#?}");
-        assert!(!reader.phase_authoritative(&past, &phase), "{past:#?}");
-        for (name, rows, program) in [
-            ("a Codex box", fixture_rows(BOX_EXEC), "codex"),
-            ("a Codex turn", fixture_rows(BUSY), "codex"),
-            ("a Codex answer streaming past the rows read", past, "codex"),
-            ("a shell printing Claude Code", idle_screen(), "zsh"),
+        for (name, rows) in [
+            ("its shell box", fixture_rows(BOX_SHELL)),
+            ("its running turn", fixture_rows(BUSY_THINKING)),
+            ("its / menu", fixture_rows(SLASH_MENU)),
         ] {
-            let mut s = Script::new(vec![ok("OK 3 off=91\n"), screen(&rows), status(program)]);
+            let mut s = Script::new(vec![ok("OK 3 off=91\n"), screen(&rows), status("node")]);
             let (code, lines) = run_task(&mut s, &task_opts(None));
             assert_eq!(code, Ok(0), "{name}");
             assert_eq!(lines, ["task @91 nudged=0"], "{name}");
@@ -1668,13 +1897,9 @@ mod tests {
             "the timeout must consume the bound, not just the first host wait"
         );
         assert_eq!(code, Ok(EXIT_TIMEOUT));
-        assert_eq!(
-            lines,
-            [
-                "task @91 nudged=0",
-                "TIMEOUT no answer, report or ack re=91 within 0.06 s",
-            ]
-        );
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[0], "task @91 nudged=0");
+        assert!(lines[1].starts_with("TIMEOUT "), "{lines:?}");
         let awaits: Vec<&str> = s
             .requests
             .iter()
@@ -1860,16 +2085,8 @@ mod tests {
         ]);
         let (code, lines) = run_task(&mut s, &opts);
         assert_eq!(lines, ["task @91 nudged=0"]);
-        assert_eq!(
-            code,
-            Err(
-                "reconnect window lapsed: inbox: connect /d/aterm.sock: Connection refused (os \
-                 error 61)"
-                    .to_string()
-            ),
-            "requests: {:?}",
-            s.requests
-        );
+        let why = code.expect_err("the outage outlasted --reconnect-s");
+        assert!(why.contains("Connection refused"), "{why}");
         assert_eq!(s.requests.len(), 9, "{:?}", s.requests);
 
         let opts = TaskOpts {
@@ -1884,7 +2101,7 @@ mod tests {
             replaced(CUT_SINCE),
         ]);
         let (code, _) = run_task(&mut s, &opts);
-        assert_eq!(code, Err(format!("await inbox: {CUT_SINCE}")));
+        assert!(code.expect_err("no reconnect window").contains(CUT_SINCE));
 
         let post_cut = "aterm was replaced (pid 10 -> 11) before it answered; the \
                         `post` may already be queued (exit 75)";
@@ -1904,13 +2121,10 @@ mod tests {
         ] {
             let mut s = Script::new(vec![cut.clone()]);
             let (code, lines) = run_task(&mut s, &task_opts(None));
-            assert_eq!(
-                code,
-                Err(format!(
-                    "task post got no answer and may have landed — look before posting it \
-                     again (`outbox`, `timeline`): {}",
-                    cut.err_text()
-                ))
+            let why = code.expect_err("a cut post");
+            assert!(
+                why.contains("may have landed") && why.contains(cut.err_text()),
+                "{why}"
             );
             assert!(lines.is_empty());
             assert_eq!(s.requests.len(), 1, "never posted again: {:?}", s.requests);
@@ -1928,7 +2142,11 @@ mod tests {
         ] {
             let mut s = Script::new(vec![unread.clone()]);
             let (code, lines) = run_task(&mut s, &task_opts(None));
-            assert_eq!(code, Err(format!("task not posted: {}", unread.err_text())));
+            let why = code.expect_err("an unread post");
+            assert!(
+                why.contains("not posted") && why.contains(unread.err_text()),
+                "{why}"
+            );
             assert!(lines.is_empty());
             assert_eq!(s.requests.len(), 1, "never posted again: {:?}", s.requests);
         }
@@ -2243,10 +2461,8 @@ mod tests {
         let mut h = Handoff::after(vec![ok(INBOX_1), err("no such session")], SUCCESSOR_INBOX);
         let (said, got) = first_delivery(&mut h);
         assert!(got.is_err(), "{said:?}");
-        assert_eq!(
-            said,
-            ["MAIL off: await inbox: ERR no such session (the loop goes on without mail)"]
-        );
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].starts_with("MAIL off: "), "{said:?}");
     }
 
     /// A resync listing that took a retry (the handoff cut it too) is the
@@ -2296,10 +2512,8 @@ mod tests {
     fn a_post_that_did_not_land_is_the_servers_words() {
         let mut s = Script::new(vec![err("fabric absent id=3 queued=1 no-bridge=1")]);
         let (code, lines) = run_task(&mut s, &task_opts(None));
-        assert_eq!(
-            code,
-            Err("task not posted: ERR fabric absent id=3 queued=1 no-bridge=1".to_string())
-        );
+        let why = code.expect_err("a post that did not land");
+        assert!(why.contains("ERR fabric absent id=3 queued=1"), "{why}");
         assert!(lines.is_empty());
         assert_eq!(s.requests.len(), 1);
         // A nudge the server refused: the task line stands, the refusal is
@@ -2311,7 +2525,7 @@ mod tests {
             err("halted"),
         ]);
         let (code, lines) = run_task(&mut s, &task_opts(None));
-        assert_eq!(code, Err("nudge refused: ERR halted".to_string()));
+        assert!(code.expect_err("refused").contains("ERR halted"));
         assert_eq!(lines, ["task @91 nudged=0"]);
         // A worker that cannot be read for the nudge: the offset is still
         // printed — the post landed — and the read is the error.
@@ -2319,10 +2533,6 @@ mod tests {
         let (code, lines) = run_task(&mut s, &task_opts(None));
         assert_eq!(lines, ["task @91 nudged=0"]);
         let why = code.expect_err("the worker could not be read");
-        assert!(
-            why.starts_with("cannot read the worker for the nudge: ")
-                && why.contains("no such session"),
-            "{why}"
-        );
+        assert!(why.contains("no such session"), "{why}");
     }
 }

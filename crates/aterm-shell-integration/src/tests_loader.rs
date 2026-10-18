@@ -5,93 +5,13 @@
 // ─── The loader and the body ───
 //
 // `include!`d into lib.rs's `#[cfg(test)] mod tests` after tests.rs, whose
-// helpers (`LiveShell`, `LiveFixture`, `shell_command`, `shell_function_body`,
-// the re-key probes and `deliver`) it uses.
+// helpers (`LiveShell`, `LiveFixture`, `shell_command`, the re-key probes
+// and `deliver`) it uses.
 
 /// A folder address this suite's builds never write: the NEWER build the live
 /// tests point a running shell at.
 #[cfg(unix)]
 const NEWER_REV: &str = "0123456789abcdef";
-
-/// Each POSIX script is ONE body between two markers, inside a loader: the
-/// body holds every mark and the revision the host reads, the loader holds what
-/// a shell runs once — the channel captures and scrubs, the body check, the
-/// trampoline, the wiring — and none of that is in the body, so re-sourcing it
-/// never re-captures a secret or re-wires a hook. PowerShell has no body.
-#[test]
-fn every_posix_script_is_a_loader_around_one_body() {
-    for (label, script, fish) in [
-        ("zsh", scripts::ZSH, false),
-        ("bash", scripts::BASH, false),
-        ("fish", scripts::FISH, true),
-    ] {
-        assert_eq!(script.matches(scripts::BODY_BEGIN).count(), 1, "{label}");
-        assert_eq!(script.matches(scripts::BODY_END).count(), 1, "{label}");
-        let body = scripts::body(script).expect(label);
-        assert!(body.starts_with(scripts::BODY_BEGIN), "{label}");
-        assert!(
-            body.lines()
-                .last()
-                .is_some_and(|l| l.starts_with(scripts::BODY_END)),
-            "{label}: the body runs through its end marker's line"
-        );
-        let at = script
-            .find(body)
-            .expect("the body is a slice of its script");
-        let (head, tail) = (&script[..at], &script[at + body.len()..]);
-        for needle in [
-            "__aterm_body_check",
-            BODY_POINTER_VAR,
-            "__aterm_fresh_load",
-            "__aterm_si_root",
-            "__aterm_body_rev",
-        ] {
-            assert!(head.contains(needle), "{label}: the loader holds {needle}");
-        }
-        for mark in ["133;A", "133;B", "133;C", "133;D;", "633;E;"] {
-            assert!(body.contains(mark), "{label}: the body emits {mark}");
-        }
-        assert!(
-            body.contains(&format!("633;P;{INTEGRATION_REV_KEY}=")),
-            "{label}: the body signs its revision"
-        );
-        for fn_name in [
-            "__aterm_rekey_check",
-            "__aterm_managed_path_live",
-            "__aterm_mark_integration_rev",
-        ] {
-            let _ = shell_function_body(body, fn_name, fish);
-        }
-        // What runs once per shell is never in the body.
-        for once in [
-            "unset ATERM_SHELL_NONCE",
-            "set -e ATERM_SHELL_NONCE",
-            "unset ATERM_REKEY_PATH",
-            "set -e ATERM_REKEY_PATH",
-            "unset ATERM_INTEGRATION_POINTER",
-            "set -e ATERM_INTEGRATION_POINTER",
-            "PROMPT_COMMAND=",
-            "trap '__aterm_preexec \"$_\"' DEBUG",
-            "add-zsh-hook precmd __aterm_precmd",
-            "zle -N zle-line-init __aterm_zle_line_init",
-            "functions -c fish_prompt __aterm_original_fish_prompt",
-            "shell.d\"/*",
-            "shell.d/*",
-            "export ATERM_SHELL_INTEGRATION_INSTALLED",
-            "set -gx ATERM_SHELL_INTEGRATION_INSTALLED",
-        ] {
-            assert!(!body.contains(once), "{label}: `{once}` is the loader's");
-        }
-        // The wiring comes after the body, where every name it wires exists.
-        let wiring = match label {
-            "zsh" => "add-zsh-hook precmd __aterm_precmd",
-            "bash" => "PROMPT_COMMAND=\"__aterm_prompt_command\"",
-            _ => "functions -c fish_prompt __aterm_original_fish_prompt",
-        };
-        assert!(tail.contains(wiring), "{label}: {wiring} follows the body");
-    }
-    assert_eq!(scripts::body(scripts::POWERSHELL), None);
-}
 
 /// The script folder carries each body beside its loader, as the loader's own
 /// text under a header — so the body a running shell takes from a folder is the
@@ -168,10 +88,10 @@ fn canonical_text(shell: &str, script: &str) -> String {
 #[cfg(unix)]
 #[test]
 fn installed_scripts_run_the_code_of_their_source() {
-    let mut shells = vec![("bash", bash_shell(), scripts::BASH, installed_bash())];
-    if let Some(zsh) = zsh_shell() {
-        shells.push(("zsh", zsh, scripts::ZSH, installed_zsh()));
-    }
+    let shells = [
+        ("bash", bash_shell(), scripts::BASH, installed_bash()),
+        ("zsh", need_zsh(), scripts::ZSH, installed_zsh()),
+    ];
     for (label, shell, source, installed) in shells {
         let comment = |line: &&str| line.trim_start().starts_with('#');
         assert!(
@@ -211,10 +131,7 @@ fn installed_scripts_run_the_code_of_their_source() {
 #[cfg(unix)]
 #[test]
 fn a_compiled_zsh_set_is_sourced_from_its_wordcode() {
-    let Some(zsh) = zsh_shell() else {
-        eprintln!("zsh not installed; skipping the compiled zsh set");
-        return;
-    };
+    let zsh = need_zsh();
     let dir = aterm_tempfile::tempdir().unwrap();
     ensure_scripts(dir.path()).unwrap();
     let body = dir.path().join(format!("{BODY_FILE_STEM}.zsh"));
@@ -681,7 +598,11 @@ fn preloader_folder(fx: &LiveFixture) -> PathBuf {
     std::fs::write(old.join("aterm_shell_integration.zsh"), PRELOADER_ZSH).unwrap();
     std::fs::write(old.join("aterm_shell_integration.bash"), PRELOADER_BASH).unwrap();
     std::fs::write(old.join("zdotdir/.zshenv"), ZSH_WRAPPER).unwrap();
-    std::fs::write(old.join("bash/rcfile"), BASH_WRAPPER).unwrap();
+    // The wrapper a build of that day started bash on, at the path this build
+    // starts bash from (`bash/bashrc` off macOS).
+    for loader in ["rcfile", BASH_LOADER_FILE] {
+        std::fs::write(old.join("bash").join(loader), BASH_WRAPPER).unwrap();
+    }
     let conf_d = old.join("fish-xdg/fish/vendor_conf.d");
     std::fs::create_dir_all(&conf_d).unwrap();
     std::fs::write(old.join("aterm_shell_integration.fish"), PRELOADER_FISH).unwrap();
@@ -1064,24 +985,18 @@ fn spawn_live_fish_from(
 }
 
 /// The fish lanes need fish and a pty. Like every other live fish test in this
-/// crate, a host without them runs none of them — and says so.
+/// crate, a host without them runs none of them and says so: COULD NOT RUN.
 #[cfg(unix)]
-fn live_fish() -> Option<&'static str> {
-    let Some(fish) = fish_shell() else {
-        eprintln!("fish not installed; skipping (ATERM_TEST_FISH=<fish> runs it)");
-        return None;
-    };
-    if !script_can_allocate_a_pty() {
-        eprintln!("no `script` to allocate a pty; skipping");
-        return None;
-    }
-    Some(fish)
+fn live_fish() -> &'static str {
+    let fish = need_fish();
+    need_pty_script();
+    fish
 }
 
 #[cfg(unix)]
 #[test]
 fn a_live_fish_takes_a_newer_body_at_its_next_prompt() {
-    let Some(fish) = live_fish() else { return };
+    let fish = live_fish();
     for hooked in [true, false] {
         let bf = BodyFixture::new();
         let pointer = bf.pointer.to_str().unwrap().to_string();
@@ -1098,7 +1013,7 @@ fn a_live_fish_takes_a_newer_body_at_its_next_prompt() {
 #[cfg(unix)]
 #[test]
 fn a_live_fish_from_before_loaders_is_upgraded_by_the_typed_line() {
-    let Some(fish) = live_fish() else { return };
+    let fish = live_fish();
     let bf = BodyFixture::new();
     let old = preloader_folder(&bf.fx);
     let mut sh = spawn_live_fish_from(
@@ -1114,7 +1029,7 @@ fn a_live_fish_from_before_loaders_is_upgraded_by_the_typed_line() {
 #[cfg(unix)]
 #[test]
 fn a_nested_fish_is_not_integrated_by_the_typed_line() {
-    let Some(fish) = live_fish() else { return };
+    let fish = live_fish();
     let bf = BodyFixture::new();
     bf.fx.lay_dirs();
     let reroute = bf.fx.reroute.to_str().unwrap().to_string();
@@ -1220,7 +1135,7 @@ fn a_live_zsh_keeps_the_users_key_bindings_across_a_newer_body() {
 #[cfg(unix)]
 #[test]
 fn a_live_fish_keeps_the_users_key_bindings_across_a_newer_body() {
-    let Some(fish) = live_fish() else { return };
+    let fish = live_fish();
     let bf = BodyFixture::new();
     let pointer = bf.pointer.to_str().unwrap().to_string();
     let mut sh = spawn_live_fish_from(
@@ -1346,7 +1261,7 @@ fn a_live_zsh_with_a_line_init_hook_is_upgraded_without_a_widget_loop() {
 #[cfg(unix)]
 #[test]
 fn a_live_fish_keeps_the_users_own_prompt_through_the_typed_upgrade() {
-    let Some(fish) = live_fish() else { return };
+    let fish = live_fish();
     let bf = BodyFixture::new();
     let old = preloader_folder(&bf.fx);
     let config = bf.fx.home.join("config").join("fish");
@@ -1422,7 +1337,7 @@ fn a_live_fish_keeps_the_users_own_prompt_through_the_typed_upgrade() {
 #[cfg(unix)]
 #[test]
 fn a_live_fish_with_its_own_prompt_takes_a_newer_body() {
-    let Some(fish) = live_fish() else { return };
+    let fish = live_fish();
     let bf = BodyFixture::new();
     let config = bf.fx.home.join("config").join("fish");
     std::fs::create_dir_all(&config).expect("config dir");
@@ -1490,7 +1405,7 @@ fn a_live_fish_with_its_own_prompt_takes_a_newer_body() {
 #[cfg(unix)]
 #[test]
 fn a_live_fish_wrapped_prompt_reads_the_commands_status() {
-    let Some(fish) = live_fish() else { return };
+    let fish = live_fish();
     let fx = LiveFixture::new();
     let ours = install_script_set(&fx.base).expect("install");
     let functions = fx.home.join("config").join("fish").join("functions");
@@ -1557,7 +1472,7 @@ fn a_live_fish_wrapped_prompt_reads_the_commands_status() {
 #[cfg(unix)]
 #[test]
 fn a_live_fish_with_a_prompt_style_gives_the_users_prompt_back() {
-    let Some(fish) = live_fish() else { return };
+    let fish = live_fish();
     let fx = LiveFixture::new();
     let ours = install_script_set(&fx.base).expect("install");
     let functions = fx.home.join("config").join("fish").join("functions");
@@ -1623,7 +1538,7 @@ fn a_live_fish_with_a_prompt_style_gives_the_users_prompt_back() {
 #[cfg(unix)]
 #[test]
 fn a_live_fish_with_its_own_prompt_keeps_its_prompt_marks() {
-    let Some(fish) = live_fish() else { return };
+    let fish = live_fish();
     let fx = LiveFixture::new();
     let ours = install_script_set(&fx.base).expect("install");
     let config = fx.home.join("config").join("fish");

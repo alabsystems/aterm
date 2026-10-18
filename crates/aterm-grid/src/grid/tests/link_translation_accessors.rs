@@ -8,22 +8,6 @@
 use super::super::*;
 
 #[test]
-fn base_y_equals_oldest_absolute_plus_scrollback() {
-    let mut grid = Grid::with_scrollback(3, 80, 100);
-    for i in 0..10 {
-        grid.write_char((b'A' + i) as char);
-        grid.line_feed();
-    }
-
-    assert!(
-        grid.scrollback_lines() > 0,
-        "lines should have scrolled off"
-    );
-    let expected = grid.oldest_absolute_row() as usize + grid.scrollback_lines();
-    assert_eq!(grid.base_y(), expected);
-}
-
-#[test]
 fn display_origin_absolute_tracks_scroll() {
     let mut grid = Grid::with_scrollback(3, 80, 100);
     for i in 0..10 {

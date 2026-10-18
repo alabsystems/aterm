@@ -62,7 +62,7 @@ const FADE_END_PAUSES_MS: [u64; 6] = [1481, 1483, 1485, 1487, 1489, 1491];
 /// Which program echoes the keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Composer {
-    /// `inkish.py`: 30 rows, the line on row 3, prefix-less.
+    /// The Ink-shaped composer: 30 rows, the line on row 3, prefix-less.
     Ink,
     /// Claude Code's shape: 60 rows, the composer bottom-pinned with a `> `
     /// prompt, a spinner row three rows above it.
@@ -101,7 +101,8 @@ impl Composer {
 /// Which way the word keys move.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WordKeys {
-    /// `inkish.py`: ⌥→ to the NEXT word's start (the end past the last word).
+    /// The Ink-shaped composer's: ⌥→ to the NEXT word's start (the end past
+    /// the last word).
     Inkish,
     /// readline / Claude Code: ⌥→ to the end of the current-or-next word.
     Readline,

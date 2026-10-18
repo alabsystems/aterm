@@ -9,9 +9,11 @@
 # second package name over the SAME src/lib.rs, because one package may not
 # depend on two semver-compatible copies of one name.
 #
-# Nothing in the aterm workspace builds this. `./run.sh` runs it (STOCK
-# EXCEPTION: rustup's stable carries the x86_64- and aarch64-pc-windows-msvc
-# std, which Trust does not ship). Cargo.lock pins the registry side.
+# Nothing in the aterm workspace builds this. `targo --unverified run -p
+# aterm-win32-oracle -- oracle-052` runs it (crates/aterm-win32-oracle/src/
+# facade052.rs; STOCK EXCEPTION: rustup's stable carries the x86_64- and
+# aarch64-pc-windows-msvc std, which Trust does not ship). Cargo.lock pins the
+# registry side.
 [workspace]
 resolver = "2"
 members = ["under-test", "conformance"]

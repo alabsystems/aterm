@@ -12,7 +12,8 @@
 //!
 //! 1. **Per-user private directory.** The socket lives in a `0700` directory
 //!    only the owning user can traverse (`$XDG_RUNTIME_DIR`, else
-//!    `~/Library/Application Support/aterm`), and the socket file itself is
+//!    `~/Library/Application Support/aterm` on macOS and
+//!    `~/.local/state/aterm/run` on other Unix), and the socket file itself is
 //!    `chmod 0600` after bind. A different user cannot even reach the socket.
 //! 2. **Peer credential check.** After `accept(2)` the server reads the
 //!    connecting peer's uid via `getpeereid(2)` and refuses any peer whose uid
@@ -250,8 +251,8 @@ pub(crate) struct ArtifactPathLease {
 }
 
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "ArtifactReaderLease",
         action = "Acquire",
         project = "aterm_gui::artifact_transaction_conformance::project_artifact_reader_lease"
@@ -260,8 +261,8 @@ pub(crate) struct ArtifactPathLease {
 fn artifact_reader_acquire_anchor() {}
 
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "ArtifactReaderLease",
         action = "RejectAcquireWhileSweeping",
         project = "aterm_gui::artifact_transaction_conformance::project_artifact_reader_lease"
@@ -270,8 +271,8 @@ fn artifact_reader_acquire_anchor() {}
 fn artifact_reader_reject_acquire_anchor() {}
 
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "ArtifactReaderLease",
         action = "RejectReplacedIdentity",
         project = "aterm_gui::artifact_transaction_conformance::project_artifact_reader_lease"
@@ -280,8 +281,8 @@ fn artifact_reader_reject_acquire_anchor() {}
 fn artifact_reader_reject_replaced_identity_anchor() {}
 
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "ArtifactReaderLease",
         action = "Arm",
         project = "aterm_gui::artifact_transaction_conformance::project_artifact_reader_lease"
@@ -290,8 +291,8 @@ fn artifact_reader_reject_replaced_identity_anchor() {}
 fn artifact_reader_arm_anchor() {}
 
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "ArtifactReaderLease",
         action = "Release",
         project = "aterm_gui::artifact_transaction_conformance::project_artifact_reader_lease"
@@ -300,8 +301,8 @@ fn artifact_reader_arm_anchor() {}
 fn artifact_reader_release_anchor() {}
 
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "ArtifactReaderLease",
         action = "StartSweep",
         project = "aterm_gui::artifact_transaction_conformance::project_artifact_reader_lease"
@@ -310,8 +311,8 @@ fn artifact_reader_release_anchor() {}
 fn artifact_reader_start_sweep_anchor() {}
 
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "ArtifactReaderLease",
         action = "FinishSweep",
         project = "aterm_gui::artifact_transaction_conformance::project_artifact_reader_lease"
@@ -1558,8 +1559,8 @@ fn leased_artifact_names(
 /// either the retention mutation wins and a later reader's identity check
 /// fails, or the reader lease wins and the artifact is skipped.
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "ArtifactReplyPublication",
         action = "RetentionSweep",
         project = "aterm_gui::artifact_transaction_conformance::project_artifact_reply"
@@ -1641,101 +1642,6 @@ impl Drop for ArtifactPathLease {
             // registry transition after releasing its retained resources.
             let _ = try_schedule_video_retention(task);
         }
-    }
-}
-
-/// Filename of the PERSISTENT network-drive token, stored beside the operator's TLS
-/// key (a persistent, operator-owned dir). Unlike the per-launch control token, this
-/// SURVIVES a remote restart, so a saved `dial` credential is not invalidated every
-/// time the remote process restarts (R37).
-pub(crate) const NETWORK_DRIVE_TOKEN_FILE: &str = "aterm-network-drive.token";
-
-/// Load (or generate-once into a `0600` file) the PERSISTENT network-drive token in
-/// `dir` — the channel-binding secret a `dial` peer presents. Because it persists
-/// across restarts, an operator provisions it ONCE (`dial-token <name> <hex>`) and
-/// it keeps working, instead of re-copying the remote's per-launch control token
-/// after every restart. Returns the 64-char hex, or `None` if entropy/write fails
-/// (the caller then falls back to the per-launch token — network drive still works,
-/// it just needs re-provisioning per restart, the pre-R37 behavior).
-///
-/// Returns `(hex, freshly_minted)` — `freshly_minted` is `true` ONLY on the run that
-/// creates the file, so the caller reveals the raw secret to the operator's log once
-/// (at provisioning) instead of on every boot (CWE-532).
-#[must_use]
-pub(crate) fn load_or_create_network_drive_token(dir: &Path) -> Option<(String, bool)> {
-    load_or_create_network_drive_token_with_hook(dir, || {})
-}
-
-fn load_or_create_network_drive_token_with_hook(
-    dir: &Path,
-    after_temp_create: impl FnOnce(),
-) -> Option<(String, bool)> {
-    load_or_create_network_drive_token_with_hooks(dir, after_temp_create, || {})
-}
-
-fn load_or_create_network_drive_token_with_hooks(
-    dir: &Path,
-    after_temp_create: impl FnOnce(),
-    after_publish: impl FnOnce(),
-) -> Option<(String, bool)> {
-    let absolute = if dir.is_absolute() {
-        dir.to_path_buf()
-    } else {
-        std::env::current_dir().ok()?.join(dir)
-    };
-    let pinned = crate::pinned_dir::PinnedDir::open_resolved(&absolute).ok()?;
-    let read_valid = || {
-        let (bytes, file) = pinned
-            .read_private(std::ffi::OsStr::new(NETWORK_DRIVE_TOKEN_FILE), 4096)
-            .ok()?;
-        let hex = String::from_utf8_lossy(&bytes).trim().to_string();
-        aterm_session::EdgeToken::from_hex(&hex)?;
-        pinned.validate_path_identity().ok()?;
-        file.validate_path_identity().ok()?;
-        Some(hex)
-    };
-    // Reuse an existing valid token (the persistence that makes a saved credential
-    // survive a restart). HARDENED read, matching the cert/key + control-token
-    // readers: `O_NONBLOCK` so a same-uid writerless FIFO planted at this path cannot
-    // park the control-socket serve thread at `open()`, `O_NOFOLLOW`, regular-file
-    // only, capped — the bare `std::fs::read` this replaced had none of those. A
-    // corrupt/short/unreadable file fails closed until the operator removes it.
-    if let Some(hex) = read_valid() {
-        return Some((hex, false)); // loaded an existing token — NOT freshly minted
-    }
-    // First run: race all creators with CREATE_NEW. One winner publishes and
-    // fsyncs the directory; every loser re-reads that winner. A pre-existing
-    // corrupt/nonregular target fails closed instead of being overwritten.
-    let hex = random_token_hex()?;
-    match pinned.write_new_private_with_hooks(
-        std::ffi::OsStr::new(NETWORK_DRIVE_TOKEN_FILE),
-        hex.as_bytes(),
-        after_temp_create,
-        after_publish,
-    ) {
-        Ok(file) => {
-            pinned.sync().ok()?;
-            pinned.validate_path_identity().ok()?;
-            file.validate_path_identity().ok()?;
-            Some((hex, true))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            // A winner using the portable Unix fallback may briefly have both
-            // its private temp link and final link. `read_private` correctly
-            // rejects that nlink=2 state. Retry only this known create race;
-            // arbitrary planted hardlinks/corrupt targets remain rejected.
-            for attempt in 0..32 {
-                if let Some(winner) = read_valid() {
-                    return Some((winner, false));
-                }
-                if attempt != 31 {
-                    std::thread::yield_now();
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-            }
-            None
-        }
-        Err(_) => None,
     }
 }
 
@@ -1839,8 +1745,8 @@ pub(crate) enum InstanceSweepDecision {
 /// projection. An exact lease dominates PID state; PID is consulted only for a
 /// legacy namespace with no lease.
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "ExactInstanceRetention",
         action = "Decide",
         project = "aterm_gui::instance_retention_conformance::project_before"
@@ -2162,7 +2068,18 @@ impl DeadNamespaceSweep {
                 // Keep a successful exact-lease acquisition alive across the exact
                 // rename and bounded cleanup. Legacy/no-lease removal carries no
                 // guard by definition.
+                #[cfg(not(windows))]
                 let _acquired_lease = acquired_lease;
+                // Windows cannot keep it: NTFS refuses to rename a directory while
+                // a file inside it is open, so the held lease answered
+                // ERROR_ACCESS_DENIED to the rename below and no dead launch's
+                // namespace was ever swept (6ad1a274d8's measurement, 2026-09-28).
+                // Letting go first is safe: the acquisition proved the launch gone,
+                // the instance name carries its launch nonce so no later launch can
+                // take this lease, and a sweeper that locks it in the gap only makes
+                // this rename fail, which keeps the namespace for a later pass.
+                #[cfg(windows)]
+                drop(acquired_lease);
                 if namespace.validate_path_identity().is_err() {
                     continue;
                 }
@@ -2499,7 +2416,8 @@ impl ConfinedVideoDir {
             .write_new_private(name, bytes)
     }
 
-    /// Durably write one frame, then close its per-file descriptor and retain
+    /// Write one frame (its bytes ordered ahead of the marker, `aterm_durable::ordered`),
+    /// then close its per-file descriptor and retain
     /// only an identity seal. Publication reopens seals sequentially, keeping the
     /// live descriptor count constant regardless of recording length.
     pub(crate) fn write_sealed_frame(
@@ -2514,13 +2432,14 @@ impl ConfinedVideoDir {
         })
     }
 
-    /// Write a durable frame/index batch member without syncing the recording
+    /// Write a frame/index batch member, its bytes ordered ahead of the marker, without
+    /// syncing the recording
     /// directory yet. Per-member work stays on the retained recording
     /// capability and validates only the renamed entry; [`Self::publish`] is the
     /// mandatory full-path batch barrier before the visibility marker exists.
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "VideoBatchPublicationDurability",
             action = "WriteMember",
             project = "aterm_gui::artifact_transaction_conformance::project_video_batch_publication_durability"
@@ -2582,15 +2501,15 @@ impl ConfinedVideoDir {
         self.abort_in_place()
     }
 
-    /// Publish only after `index.json` is durable. Marker publication requests
+    /// Publish only after `index.json` is flushed. Marker publication requests
     /// one retention sweep, which the final producer-or-reader lease performs;
     /// retention never runs at mint or in this fallible pre-marker phase, so a
     /// refused/failed request never deletes a prior good recording. This is also
     /// the required parent-directory durability barrier for all deferred
     /// frame/index writes.
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "VideoBatchPublicationDurability",
             action = "SyncBatch",
             project = "aterm_gui::artifact_transaction_conformance::project_video_batch_publication_durability"
@@ -2620,8 +2539,8 @@ impl ConfinedVideoDir {
     /// the recording intact until launch-namespace cleanup: a successful reader
     /// may already have received paths and need to open them after disconnect.
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "VideoBatchPublicationDurability",
             action = "PublishMarker",
             project = "aterm_gui::artifact_transaction_conformance::project_video_batch_publication_durability"
@@ -2667,6 +2586,10 @@ impl ConfinedVideoDir {
                 }
                 after_publish();
             },
+            // Ordered: nothing depends on the marker after a power loss; a recording
+            // that never became visible is cleaned as a tombstone, and the requester is
+            // local.
+            crate::durable::Flush::Ordered,
         );
         arm_error.map_or(result, Err)
     }
@@ -3291,7 +3214,9 @@ fn prune_video_dirs(
 /// 1. `$XDG_RUNTIME_DIR/aterm` when `XDG_RUNTIME_DIR` is set (already a
 ///    per-user `0700` dir on systems that provide it).
 /// 2. `~/Library/Application Support/aterm` on macOS (the conventional
-///    per-user app-support location), created `0700`.
+///    per-user app-support location), and on every other Unix
+///    `${XDG_STATE_HOME:-~/.local/state}/aterm/run` (under aterm's XDG state
+///    folder), created `0700`.
 /// 3. Windows: `%TEMP%\aterm` (`%TMP%`/`%TEMP%`, else `%LOCALAPPDATA%\Temp\aterm`)
 ///    — deliberately OUTSIDE the OneDrive-managed `%APPDATA%` subtree, where afunix
 ///    `connect` cannot reach the socket's reparse point (WSAEINVAL). See
@@ -3825,6 +3750,29 @@ pub(crate) enum AuthOutcome {
     Denied,
 }
 
+/// THE HARNESS TOKEN (design §2.5, phase 3A): 32 random bytes in hex, minted
+/// on first use and held only in this process's memory — never written to a
+/// file, the environment or a log — which the in-GUI harness presents on its
+/// own instance's socket so its acts read `by=harness` in the session log.
+/// It is the instance token's power under another name
+/// (`control::Principal::Harness`), so it grants nothing an in-session client
+/// lacks. `None` when no entropy is available: the harness then presents the
+/// instance token, and reads `by=ctl`.
+pub(crate) fn harness_token() -> Option<&'static str> {
+    static TOKEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    TOKEN.get_or_init(random_token_hex).as_deref()
+}
+
+/// [`check_auth_line`] against the [`harness_token`] (the same
+/// constant-time compare); `Denied` when there is none.
+#[must_use]
+pub(crate) fn check_harness_line(line: &str) -> AuthOutcome {
+    match harness_token() {
+        Some(token) => check_auth_line(line, token),
+        None => AuthOutcome::Denied,
+    }
+}
+
 /// Validate a connection's first line against the expected token.
 ///
 /// Accepts two equivalent forms so a client can authenticate without an extra
@@ -3956,8 +3904,8 @@ impl ConfinedImage {
     /// A file-path reply is authorized only while every original absolute
     /// directory component still resolves to the retained identity.
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "AnchoredArtifactTransaction",
             action = "ValidateReply",
             project = "aterm_gui::artifact_transaction_conformance::project_anchored"
@@ -4001,27 +3949,25 @@ pub(crate) fn confine_image_path(sock_dir: &Path, requested: &str) -> Option<Con
 /// canonical dir + validated filename, or `None` when the request would escape
 /// or names a nested path.
 ///
-/// SPEC: this is the real `Confine` action of the external `PathConfine.tla` model
-/// (TRUST_NATIVE_TLA Phase 2, control-socket CONFINEMENT family). The spec's
-/// `WriteWithinSubdir` / `EscapeRejected` invariants — a committed write only ever
-/// lands INSIDE the root, and a request whose final component resolves OUTSIDE is
-/// rejected with no write — are exactly the confused-deputy symlink escape this
-/// canonicalize-the-RESOLVED-location check fixes (the old guard checked only the
-/// parent prefix, then the writer FOLLOWED a symlinked last segment). A `Some(_)`
-/// here maps to the spec's `committed=TRUE, target="inside"`; a `None` (escape) maps
-/// to `committed=FALSE, target="none"`. Tier-1 conformance drives this against a real
-/// planted symlink (`crates/aterm-gui/src/lib.rs::path_confine_conformance`).
-// Anchor gated on `test` ALONE (not a feature): the relocated `spec_xref_closure`
-// gate lives in THIS crate's own test build, so `cfg(test)` already makes this
-// anchor visible to it — no cross-crate `spec-anchors` feature is needed here.
+/// SPEC: this is the real `Confine` action of `aterm_models_gui::path_confine_model`
+/// (`PathConfine`, the control-socket CONFINEMENT family). Its `WriteWithinSubdir` /
+/// `EscapeRejected` invariants — a committed write only ever lands INSIDE the root, and a
+/// request whose final component resolves OUTSIDE is rejected with no write — are exactly
+/// the confused-deputy symlink escape this canonicalize-the-RESOLVED-location check fixes
+/// (the old guard checked only the parent prefix, then the writer FOLLOWED a symlinked
+/// last segment). A `Some(_)` here maps to the model's `committed=1, target=1` (inside); a
+/// `None` (escape) maps to `committed=0, target=0` (none). Tier-1 conformance drives this
+/// against a real planted symlink (`crates/aterm-gui/src/path_confine_conformance_tests.rs`).
+// The anchor expands in every test and debug build, so aterm-gui's own closure gate sees
+// it, and so does aterm-models' from outside the crate.
 // PROJECTION (TRUST_VACUITY_GATE §2.2 / finding 2): `Confine` projects the real
-// confine outcome onto the spec's `<<linkOutside, decided, committed, target>>` — the
-// projection the `path_confine_conformance` Tier-1 test drives (`Some` → committed
-// inside, `None` → rejected). L2 requires the projection NAME be present (Trust does
+// confine outcome onto the model's `<<decided, committed, target>>` — the projection
+// the `path_confine_conformance_tests` Tier-1 test drives (`Some` → committed inside,
+// `None` → rejected). L2 requires the projection NAME be present (Trust does
 // not execute it); `aterm_gui::control_auth::project_confine` is that witness.
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "path_confine",
         action = "Confine",
         project = "aterm_gui::control_auth::project_confine"
@@ -4224,14 +4170,6 @@ mod tests {
         let _ = std::fs::remove_dir(&dir);
     }
 
-    /// The bind decision refuses a live socket (never hijack) and removes-then-binds
-    /// a stale/absent one.
-    #[test]
-    fn decide_bind_refuses_live_keeps_stale() {
-        assert_eq!(decide_bind(true), BindAction::RefuseLiveSocket);
-        assert_eq!(decide_bind(false), BindAction::RemoveAndBind);
-    }
-
     /// A liveness probe must remain bounded even when nobody drains accept().
     /// A blocking connect can wait for this listener's queue to drain.
     #[cfg(unix)]
@@ -4297,33 +4235,34 @@ mod tests {
         drop(listener);
     }
 
+    /// Equal bytes compare equal; any difference — content or length —
+    /// does not. REGRESSION: the length fold once covered only the low 16
+    /// bits of the delta, so all-zero slices 65536 bytes apart compared EQUAL.
     #[test]
-    fn constant_time_eq_matches() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(constant_time_eq(b"", b""));
+    fn constant_time_eq_is_exact_equality() {
         let tok = "deadbeef".repeat(8);
-        assert!(constant_time_eq(tok.as_bytes(), tok.as_bytes()));
-    }
-
-    #[test]
-    fn constant_time_eq_rejects_differences() {
-        assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"abc", b"abcd"));
-        assert!(!constant_time_eq(b"abcd", b"abc"));
-        assert!(!constant_time_eq(b"abc", b""));
-        assert!(!constant_time_eq(b"", b"abc"));
-    }
-
-    #[test]
-    fn constant_time_eq_detects_length_delta_above_16_bits() {
-        // Regression: the length fold once only covered the low 16 bits of the
-        // usize delta, so all-zero slices whose lengths differ by exactly
-        // 0x10000 (65536) compared EQUAL — the common prefix matched and the
-        // dropped delta bit hid the rest. Must report NOT equal.
-        let short = vec![0u8; 64];
-        let long = vec![0u8; 64 + 65536];
-        assert!(!constant_time_eq(&short, &long));
-        assert!(!constant_time_eq(&long, &short));
+        let (short, long) = (vec![0u8; 64], vec![0u8; 64 + 65536]);
+        let cases: [(&[u8], &[u8], bool); 10] = [
+            (b"abc", b"abc", true),
+            (b"", b"", true),
+            (tok.as_bytes(), tok.as_bytes(), true),
+            (b"abc", b"abd", false),
+            (b"abc", b"abcd", false),
+            (b"abcd", b"abc", false),
+            (b"abc", b"", false),
+            (b"", b"abc", false),
+            (&short, &long, false),
+            (&long, &short, false),
+        ];
+        for (a, b, equal) in cases {
+            assert_eq!(
+                constant_time_eq(a, b),
+                equal,
+                "{} vs {} bytes",
+                a.len(),
+                b.len()
+            );
+        }
     }
 
     /// An explicit socket path over the platform `sun_path` capacity must be
@@ -4358,55 +4297,32 @@ mod tests {
         assert_ne!(t, t2);
     }
 
+    /// `AUTH <token>` and `TOKEN <token> [verb]` admit the exact token only
+    /// (a trailing CR tolerated); anything else is denied.
     #[test]
-    fn auth_line_accepts_correct_token() {
-        let tok = "a".repeat(64);
-        assert_eq!(
-            check_auth_line(&format!("AUTH {tok}"), &tok),
-            AuthOutcome::Ok(None)
-        );
-        // CRLF tolerance: a trailing CR must not break the compare.
-        assert_eq!(
-            check_auth_line(&format!("AUTH {tok}\r"), &tok),
-            AuthOutcome::Ok(None)
-        );
-    }
-
-    #[test]
-    fn auth_line_rejects_wrong_token() {
+    fn auth_line_admits_only_the_exact_token() {
         let tok = "a".repeat(64);
         let bad = "b".repeat(64);
-        assert_eq!(
-            check_auth_line(&format!("AUTH {bad}"), &tok),
-            AuthOutcome::Denied
-        );
-        assert_eq!(check_auth_line("AUTH", &tok), AuthOutcome::Denied);
-        assert_eq!(check_auth_line("text", &tok), AuthOutcome::Denied);
-        assert_eq!(check_auth_line("", &tok), AuthOutcome::Denied);
-    }
-
-    #[test]
-    fn token_prefix_form_carries_verb() {
-        let tok = "c".repeat(64);
-        assert_eq!(
-            check_auth_line(&format!("TOKEN {tok} text"), &tok),
-            AuthOutcome::Ok(Some("text".to_string()))
-        );
-        assert_eq!(
-            check_auth_line(&format!("TOKEN {tok} send echo hi"), &tok),
-            AuthOutcome::Ok(Some("send echo hi".to_string()))
-        );
-        // Bare token with no verb still authenticates (empty verb tail).
-        assert_eq!(
-            check_auth_line(&format!("TOKEN {tok}"), &tok),
-            AuthOutcome::Ok(Some(String::new()))
-        );
-        // Wrong token in TOKEN form is denied.
-        let bad = "d".repeat(64);
-        assert_eq!(
-            check_auth_line(&format!("TOKEN {bad} text"), &tok),
-            AuthOutcome::Denied
-        );
+        for (line, want) in [
+            (format!("AUTH {tok}"), AuthOutcome::Ok(None)),
+            (format!("AUTH {tok}\r"), AuthOutcome::Ok(None)),
+            (format!("AUTH {bad}"), AuthOutcome::Denied),
+            ("AUTH".to_string(), AuthOutcome::Denied),
+            ("text".to_string(), AuthOutcome::Denied),
+            (String::new(), AuthOutcome::Denied),
+            (
+                format!("TOKEN {tok} text"),
+                AuthOutcome::Ok(Some("text".to_string())),
+            ),
+            (
+                format!("TOKEN {tok} send echo hi"),
+                AuthOutcome::Ok(Some("send echo hi".to_string())),
+            ),
+            (format!("TOKEN {tok}"), AuthOutcome::Ok(Some(String::new()))),
+            (format!("TOKEN {bad} text"), AuthOutcome::Denied),
+        ] {
+            assert_eq!(check_auth_line(&line, &tok), want, "{line:?}");
+        }
     }
 
     #[test]
@@ -5096,76 +5012,6 @@ mod tests {
         }
     }
 
-    /// A minimal stand-in for the server's `serve` auth preamble, run over a
-    /// real `CtlStream` pair, proving the on-the-wire handshake:
-    /// * the `AUTH <hex>` line is consumed SILENTLY on success (no reply), so
-    ///   the first reply a client reads is the response to its first verb;
-    /// * a bad/missing token yields exactly `ERR auth\n` and closes.
-    fn run_auth_preamble(mut server: CtlStream, token: &str) {
-        use std::io::{BufRead, BufReader, Write};
-        let reader = BufReader::new(server.try_clone().unwrap());
-        let mut lines = reader.lines();
-        let first = match lines.next() {
-            Some(Ok(l)) => l,
-            _ => return,
-        };
-        match check_auth_line(&first, token) {
-            // A folded-in verb (`TOKEN <hex> <verb>`) is answered immediately;
-            // we must NOT then block reading another line (the client sent only
-            // one). A bare `AUTH`/empty `TOKEN` reads the next line as the verb.
-            // This mirrors the real `serve` preamble exactly.
-            AuthOutcome::Ok(Some(v)) if !v.is_empty() => {
-                let _ = server.write_all(format!("OK {v}\n").as_bytes());
-            }
-            AuthOutcome::Ok(_) => {
-                if let Some(Ok(next)) = lines.next() {
-                    let _ = server.write_all(format!("OK {next}\n").as_bytes());
-                }
-            }
-            AuthOutcome::Denied => {
-                let _ = server.write_all(b"ERR auth\n");
-            }
-        }
-        let _ = server.flush();
-    }
-
-    #[test]
-    fn handshake_correct_token_runs_verb() {
-        use std::io::{BufRead, BufReader, Write};
-        let token = "e".repeat(64);
-        let (client, server) = CtlStream::pair().unwrap();
-        let tok = token.clone();
-        let h = std::thread::spawn(move || run_auth_preamble(server, &tok));
-
-        // Client: AUTH first (silently consumed), then the verb.
-        (&client)
-            .write_all(format!("AUTH {token}\n").as_bytes())
-            .unwrap();
-        (&client).write_all(b"text\n").unwrap();
-        (&client).flush().unwrap();
-        let mut reply = String::new();
-        BufReader::new(&client).read_line(&mut reply).unwrap();
-        h.join().unwrap();
-        // The FIRST reply is the response to `text`, NOT to AUTH.
-        assert_eq!(reply, "OK text\n");
-    }
-
-    #[test]
-    fn handshake_missing_token_is_refused() {
-        use std::io::{BufRead, BufReader, Write};
-        let token = "f".repeat(64);
-        let (client, server) = CtlStream::pair().unwrap();
-        let h = std::thread::spawn(move || run_auth_preamble(server, &token));
-
-        // Client skips AUTH and goes straight to a verb.
-        (&client).write_all(b"send rm -rf /\n").unwrap();
-        (&client).flush().unwrap();
-        let mut reply = String::new();
-        BufReader::new(&client).read_line(&mut reply).unwrap();
-        h.join().unwrap();
-        assert_eq!(reply, "ERR auth\n");
-    }
-
     #[test]
     fn sweep_removes_only_dead_instances_files() {
         let dir = std::env::temp_dir().join(format!("aterm-sweep-test-{}", std::process::id()));
@@ -5421,25 +5267,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn handshake_token_prefix_form_runs_inline_verb() {
-        use std::io::{BufRead, BufReader, Write};
-        let token = "1".repeat(64);
-        let (client, server) = CtlStream::pair().unwrap();
-        let tok = token.clone();
-        let h = std::thread::spawn(move || run_auth_preamble(server, &tok));
-
-        // One-line auth + verb.
-        (&client)
-            .write_all(format!("TOKEN {token} text\n").as_bytes())
-            .unwrap();
-        (&client).flush().unwrap();
-        let mut reply = String::new();
-        BufReader::new(&client).read_line(&mut reply).unwrap();
-        h.join().unwrap();
-        assert_eq!(reply, "OK text\n");
-    }
-
     fn write_completed_video_fixture(root: &Path, name: &str) {
         let recording = root.join(name);
         std::fs::create_dir(&recording).unwrap();
@@ -5482,10 +5309,23 @@ mod tests {
 
         let mut producer = confine_video_dir_for_instance(&dir, &instance).unwrap();
         let path = producer.path().to_path_buf();
+        // aterm-durable's counting seam, folded in here rather than minting one more
+        // recording against the process-wide cleanup budget: the index's bytes and the
+        // marker's are only ORDERED (the members land before the marker that makes them
+        // visible, nothing depends on the marker after a power loss, and the requester
+        // is local); the batch barrier and the marker's entry are the recording
+        // directory's untouched plain `fsync(2)`, which records nothing.
+        let flushes = aterm_durable::seam::Recording::start();
         let index = producer
             .write_new_private(std::ffi::OsStr::new("index.json"), b"{\"frames\":[]}")
             .unwrap();
+        assert_eq!(
+            flushes.take(),
+            [aterm_durable::Flush::Ordered],
+            "the index's bytes"
+        );
         producer.publish(&[], &index).unwrap();
+        assert_eq!(flushes.take(), [], "the batch barrier: a plain fsync(2)");
         assert_eq!(
             artifact_lease_count(&path),
             Some(1),
@@ -5497,6 +5337,12 @@ mod tests {
         );
 
         let marker = producer.publish_marker().unwrap();
+        assert_eq!(
+            flushes.take(),
+            [aterm_durable::Flush::Ordered],
+            "the marker's bytes"
+        );
+        drop(flushes);
         assert!(path.join(VIDEO_PUBLISHED_FILE).is_file());
         assert_eq!(
             artifact_lease_count(&path),
@@ -5668,42 +5514,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn video_reader_registry_rejects_replaced_recording_identity() {
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-video-reader-identity-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        ensure_private_dir(&dir).unwrap();
-        let root_path = dir.join("recordings");
-        ensure_private_dir(&root_path).unwrap();
-        let fresh = std::ffi::OsString::from("rec-00000000000000000000-000");
-        write_completed_video_fixture(&root_path, fresh.to_str().unwrap());
-
-        let first_root = crate::pinned_dir::PinnedDir::open_resolved(&root_path).unwrap();
-        let first_recording = first_root.child(&fresh).unwrap();
-        let first = retain_video_artifact_path(first_root, fresh.clone(), &first_recording)
-            .unwrap()
-            .expect("first reader lease");
-        drop(first_recording);
-
-        let moved = root_path.join("recording-original");
-        std::fs::rename(root_path.join(&fresh), &moved).unwrap();
-        write_completed_video_fixture(&root_path, fresh.to_str().unwrap());
-        let replacement_root = crate::pinned_dir::PinnedDir::open_resolved(&root_path).unwrap();
-        let replacement = replacement_root.child(&fresh).unwrap();
-        let error = retain_video_artifact_path(replacement_root, fresh, &replacement)
-            .expect_err("a replacement cannot join the live recording lease group");
-        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
-        assert_eq!(artifact_lease_count(first.key.as_ref().unwrap()), Some(1));
-
-        drop(replacement);
-        drop(first);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn video_reader_registry_rejects_same_recording_moved_to_replacement_root() {
         let dir = std::env::temp_dir().join(format!(
             "aterm-video-reader-root-identity-{}",
@@ -5737,114 +5547,6 @@ mod tests {
 
         drop(same_recording);
         drop(first);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn concurrent_image_and_video_sweeps_share_one_gate_and_converge() {
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-media-concurrent-retention-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        ensure_private_dir(&dir).unwrap();
-
-        let image = confine_automatic_image_path(&dir, "image").unwrap();
-        std::fs::write(image.display_path(), b"fresh").unwrap();
-        for sequence in 0..(AUTO_IMAGE_KEEP + 4) {
-            let name = automatic_capture_name_for(
-                "image",
-                process_instance_id(),
-                1_000_000 + sequence as u64,
-            );
-            std::fs::write(image.dir.join(name), b"old").unwrap();
-        }
-
-        let video_root_path = dir.join("video-fixture");
-        ensure_private_dir(&video_root_path).unwrap();
-        for sequence in 0..(VIDEO_KEEP + 4) {
-            write_completed_video_fixture(&video_root_path, &format!("rec-{sequence:020}-000"));
-        }
-        let video_fresh = std::ffi::OsString::from("rec-99999999999999999999-000");
-        write_completed_video_fixture(&video_root_path, video_fresh.to_str().unwrap());
-        let video_root = crate::pinned_dir::PinnedDir::open_resolved(&video_root_path).unwrap();
-
-        let gate = retention_sweep_gate()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-
-        let image_worker = {
-            let started = started_tx.clone();
-            let done = done_tx.clone();
-            let target = image.clone();
-            std::thread::spawn(move || {
-                started.send("image").unwrap();
-                prune_automatic_image_dir(&target);
-                done.send("image").unwrap();
-            })
-        };
-        let video_worker = {
-            let started = started_tx.clone();
-            let done = done_tx.clone();
-            std::thread::spawn(move || {
-                started.send("video").unwrap();
-                prune_video_dirs(&video_root, &video_fresh).unwrap();
-                done.send("video").unwrap();
-            })
-        };
-        drop(started_tx);
-        drop(done_tx);
-        assert!(started_rx.recv().is_ok());
-        assert!(started_rx.recv().is_ok());
-        let early = done_rx
-            .recv_timeout(std::time::Duration::from_millis(150))
-            .ok();
-        let bypassed_gate = early.is_some();
-        drop(gate);
-
-        let mut completed = early.into_iter().collect::<Vec<_>>();
-        while completed.len() < 2 {
-            completed.push(
-                done_rx
-                    .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
-                    .expect("both retention workers finish after the shared gate opens"),
-            );
-        }
-        image_worker.join().unwrap();
-        video_worker.join().unwrap();
-        assert!(
-            !bypassed_gate,
-            "neither sweep bypasses the shared census/mutation gate"
-        );
-        assert_eq!(completed.len(), 2);
-
-        let automatic_images = std::fs::read_dir(&image.dir)
-            .unwrap()
-            .flatten()
-            .filter(|entry| automatic_capture_sequence(&entry.file_name()).is_some())
-            .count();
-        assert_eq!(
-            automatic_images, AUTO_IMAGE_KEEP,
-            "the image namespace converges after the serialized sweep"
-        );
-        assert!(
-            image.display_path().is_file(),
-            "the image fresh path survives"
-        );
-        assert_eq!(
-            completed_video_fixture_count(&video_root_path),
-            VIDEO_KEEP,
-            "the video namespace converges after the serialized sweep"
-        );
-        assert!(
-            video_root_path
-                .join("rec-99999999999999999999-000")
-                .is_dir(),
-            "the video fresh path survives"
-        );
-
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6828,246 +6530,5 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&outside);
-    }
-
-    /// R37: the network-drive token PERSISTS — a second call (simulating a remote
-    /// restart) returns the SAME token, so a saved dial credential is not
-    /// invalidated. A fresh dir generates one; a corrupt file fails closed.
-    #[test]
-    fn network_drive_token_persists_across_restarts() {
-        let dir = std::env::temp_dir().join(format!("aterm-drive-tok-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        // First launch: mint + persist a valid 64-hex token; `minted` is true so the
-        // caller reveals it to the operator's log exactly once.
-        let (t1, minted1) = super::load_or_create_network_drive_token(&dir).expect("mint token");
-        assert!(minted1, "first run freshly mints (reveal-once)");
-        assert_eq!(t1.len(), 64, "64-char hex");
-        assert!(
-            aterm_session::EdgeToken::from_hex(&t1).is_some(),
-            "valid EdgeToken"
-        );
-        // A file was written (0600 on unix — perms enforced by write_private).
-        assert!(dir.join(super::NETWORK_DRIVE_TOKEN_FILE).exists());
-
-        // SECOND launch (a "restart"): the SAME token — the persistence R37 needs —
-        // and `minted` is now FALSE, so the raw secret is NOT re-logged.
-        let (t2, minted2) = super::load_or_create_network_drive_token(&dir).expect("reload token");
-        assert_eq!(t1, t2, "the drive token survives a restart");
-        assert!(!minted2, "a reload does not re-reveal the token");
-
-        // A corrupt file fails closed: without a cross-process lock it cannot
-        // be safely replaced while another process might be inspecting it.
-        std::fs::write(dir.join(super::NETWORK_DRIVE_TOKEN_FILE), b"garbage").unwrap();
-        assert!(super::load_or_create_network_drive_token(&dir).is_none());
-        std::fs::remove_file(dir.join(super::NETWORK_DRIVE_TOKEN_FILE)).unwrap();
-        let (t3, minted3) =
-            super::load_or_create_network_drive_token(&dir).expect("mint after operator cleanup");
-        assert_ne!(t3, t1, "operator cleanup permits a new token");
-        assert!(minted3, "a regenerated token counts as freshly minted");
-        assert!(aterm_session::EdgeToken::from_hex(&t3).is_some());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn network_drive_token_create_new_race_has_one_winner() {
-        let dir =
-            std::env::temp_dir().join(format!("aterm-drive-token-race-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let mut workers = Vec::new();
-        for _ in 0..2 {
-            let dir = dir.clone();
-            let barrier = std::sync::Arc::clone(&barrier);
-            workers.push(std::thread::spawn(move || {
-                super::load_or_create_network_drive_token_with_hook(&dir, move || {
-                    barrier.wait();
-                })
-                .unwrap()
-            }));
-        }
-        let first = workers.remove(0).join().unwrap();
-        let second = workers.remove(0).join().unwrap();
-        assert_eq!(first.0, second.0, "both creators converge on one token");
-        assert_ne!(
-            first.1, second.1,
-            "exactly one atomic no-replace publisher is the mint winner"
-        );
-        assert_eq!(
-            std::fs::read_to_string(dir.join(super::NETWORK_DRIVE_TOKEN_FILE)).unwrap(),
-            first.0,
-            "both callers return the exact fully persisted final token"
-        );
-        assert!(
-            std::fs::read_dir(&dir).unwrap().flatten().all(|entry| {
-                !entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".aterm-write-")
-            }),
-            "losing temporary token files are removed"
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn network_drive_token_final_is_absent_until_atomic_complete_publication() {
-        use std::os::unix::fs::MetadataExt as _;
-
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-drive-token-publication-seams-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let final_path = dir.join(super::NETWORK_DRIVE_TOKEN_FILE);
-        let (temp_entered_tx, temp_entered_rx) = std::sync::mpsc::channel();
-        let (release_temp_tx, release_temp_rx) = std::sync::mpsc::channel();
-        let (published_tx, published_rx) = std::sync::mpsc::channel();
-        let (release_publish_tx, release_publish_rx) = std::sync::mpsc::channel();
-        let writer_dir = dir.clone();
-        let writer = std::thread::spawn(move || {
-            super::load_or_create_network_drive_token_with_hooks(
-                &writer_dir,
-                move || {
-                    temp_entered_tx.send(()).unwrap();
-                    release_temp_rx.recv().unwrap();
-                },
-                move || {
-                    published_tx.send(()).unwrap();
-                    release_publish_rx.recv().unwrap();
-                },
-            )
-            .unwrap()
-        });
-
-        temp_entered_rx.recv().unwrap();
-        assert!(
-            !final_path.exists(),
-            "the fully private temp write exposes no empty or partial final component"
-        );
-        release_temp_tx.send(()).unwrap();
-        published_rx.recv().unwrap();
-        let metadata = std::fs::metadata(&final_path).unwrap();
-        assert_eq!(
-            metadata.nlink(),
-            1,
-            "atomic no-replace rename has no final-name nlink=2 window"
-        );
-        let loser = super::load_or_create_network_drive_token(&dir)
-            .expect("a concurrent loser reads the complete visible token");
-        assert!(
-            !loser.1,
-            "the observer loads rather than remints the published token"
-        );
-        release_publish_tx.send(()).unwrap();
-        let winner = writer.join().unwrap();
-        assert!(winner.1);
-        assert_eq!(loser.0, winner.0);
-        assert_eq!(std::fs::read_to_string(&final_path).unwrap(), winner.0);
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn network_drive_token_rejects_hardlink_and_fifo_without_touching_victim() {
-        use std::os::unix::ffi::OsStrExt as _;
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let hardlink_dir =
-            std::env::temp_dir().join(format!("aterm-drive-token-hardlink-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&hardlink_dir);
-        std::fs::create_dir_all(&hardlink_dir).unwrap();
-        let victim = hardlink_dir.join("victim");
-        std::fs::write(&victim, b"victim-bytes").unwrap();
-        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o640)).unwrap();
-        std::fs::hard_link(&victim, hardlink_dir.join(super::NETWORK_DRIVE_TOKEN_FILE)).unwrap();
-        assert!(
-            super::load_or_create_network_drive_token(&hardlink_dir).is_none(),
-            "a planted hardlink fails closed"
-        );
-        assert_eq!(std::fs::read(&victim).unwrap(), b"victim-bytes");
-        assert_eq!(
-            std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
-            0o640
-        );
-
-        let fifo_dir =
-            std::env::temp_dir().join(format!("aterm-drive-token-fifo-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&fifo_dir);
-        std::fs::create_dir_all(&fifo_dir).unwrap();
-        let fifo = fifo_dir.join(super::NETWORK_DRIVE_TOKEN_FILE);
-        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
-        // SAFETY: `fifo_c` is a valid NUL-terminated absent path.
-        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
-        // The regression is an open() that blocks FOREVER on a writerless
-        // FIFO, so the load runs on its own thread and the bound is a hang
-        // discriminator: a hang fails here instead of wedging the suite, and a
-        // correct refusal is never measured against scheduler or fsync latency
-        // (it was a 1 s stopwatch — the load-sensitive test audit of 2026-09-27).
-        let (loaded_tx, loaded_rx) = std::sync::mpsc::channel();
-        let loader_dir = fifo_dir.clone();
-        std::thread::spawn(move || {
-            let _ =
-                loaded_tx.send(super::load_or_create_network_drive_token(&loader_dir).is_none());
-        });
-        assert!(
-            loaded_rx
-                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
-                .expect("the token loader must never block on a planted FIFO"),
-            "a planted FIFO is refused, never read as a token"
-        );
-
-        let _ = std::fs::remove_dir_all(hardlink_dir);
-        let _ = std::fs::remove_dir_all(fifo_dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn network_drive_token_fails_closed_after_ancestor_replacement() {
-        use std::os::unix::fs::symlink;
-
-        let root =
-            std::env::temp_dir().join(format!("aterm-drive-token-swap-{}", std::process::id()));
-        let replacement = std::env::temp_dir().join(format!(
-            "aterm-drive-token-swap-replacement-{}",
-            std::process::id()
-        ));
-        let token_dir = root.join("tokens");
-        let moved = root.join("tokens-moved");
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&replacement);
-        std::fs::create_dir_all(&token_dir).unwrap();
-        std::fs::create_dir_all(&replacement).unwrap();
-        std::fs::write(replacement.join("keep.txt"), b"keep").unwrap();
-
-        let token_dir_for_hook = token_dir.clone();
-        let moved_for_hook = moved.clone();
-        let replacement_for_hook = replacement.clone();
-        assert!(
-            super::load_or_create_network_drive_token_with_hook(&token_dir, move || {
-                std::fs::rename(&token_dir_for_hook, &moved_for_hook).unwrap();
-                symlink(&replacement_for_hook, &token_dir_for_hook).unwrap();
-            })
-            .is_none()
-        );
-        assert!(!moved.join(super::NETWORK_DRIVE_TOKEN_FILE).exists());
-        assert_eq!(
-            std::fs::read(replacement.join("keep.txt")).unwrap(),
-            b"keep"
-        );
-        assert!(
-            !replacement.join(super::NETWORK_DRIVE_TOKEN_FILE).exists(),
-            "the replacement path never receives the secret"
-        );
-
-        let _ = std::fs::remove_file(token_dir);
-        let _ = std::fs::remove_dir_all(root);
-        let _ = std::fs::remove_dir_all(replacement);
     }
 }

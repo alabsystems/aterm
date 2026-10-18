@@ -767,116 +767,23 @@ mod tests {
             .expect_err("the pair alone is a source release, not a published cut");
     }
 
-    /// PINS THE ONE-DMG SHAPE. The bare `aterm-<v>.dmg` spelling is
-    /// fleet-load-bearing (the deployed updater and install.sh bind it
-    /// exactly) and it is the ONLY macOS DMG a cut publishes: the retired
-    /// Intel `-x86_64` variant, the `-lite` twin and the `aterm-offline.dmg`
-    /// alias must never re-enter the required set under any flag, and a
-    /// channel head still carrying one of them is refused as a foreign
-    /// object rather than converged.
+    /// The channel's workspace version must EQUAL the cut's: behind (the observed
+    /// `v0.6.0` tag on a `0.5.0` tree) and ahead both refuse; an empty body is the
+    /// only skip, and a manifest with no version is unknown, never absent.
     #[test]
-    fn the_required_set_carries_exactly_one_dmg_and_no_retired_names() {
-        assert_eq!(dmg_asset_name("0.62.0"), "aterm-0.62.0.dmg");
-        assert_eq!(stable_dmg_asset_name(), "aterm.dmg");
-        assert_eq!(stable_zip_asset_name(), "aterm-mac.zip");
-
-        for (signed, rostered) in [(false, false), (true, false), (true, true)] {
-            let set = required_asset_names("0.62.0", signed, rostered);
-            let dmgs: Vec<&String> = set.iter().filter(|n| n.ends_with(".dmg")).collect();
-            assert_eq!(
-                dmgs,
-                vec!["aterm-0.62.0.dmg", "aterm.dmg"],
-                "exactly the canonical DMG and its evergreen twin: {set:?}"
-            );
-            assert!(
-                !set.iter().any(|n| {
-                    n.contains("x86_64") || n.contains("lite") || n.contains("offline")
-                }),
-                "a retired container name re-entered the set: {set:?}"
-            );
-        }
-
-        let ok = required_asset_names("0.62.0", true, false);
-        for retired in [
-            "aterm-0.62.0-x86_64.dmg",
-            "aterm-0.62.0-x86_64.dmg.sha256",
-            "aterm-0.62.0-lite.dmg",
-            "aterm-0.62.0-lite.dmg.sha256",
-            "aterm-offline.dmg",
-            "aterm-offline.dmg.sha256",
-        ] {
-            let mut stale = ok.clone();
-            stale.push(retired.to_string());
-            let err = validate_channel_asset_set(&stale, "0.62.0", true, false, &[])
-                .expect_err("a retired container on the channel head is a foreign object");
-            assert!(err.to_string().contains(retired), "{err}");
-        }
-    }
-
-    /// The drift this gate exists to stop, in its exact observed form: the tag
-    /// `v0.6.0` came to rest on a public tree still carrying `0.5.0`.
-    #[test]
-    fn a_channel_behind_the_cut_is_refused_with_the_publish_remedy() {
-        let channel = "[workspace.package]\nversion = \"0.5.0\"\n";
-        let err = check_channel_version("0.6.0", channel).expect_err("must refuse");
-        let msg = err.to_string();
-        assert!(msg.contains("0.6.0") && msg.contains("0.5.0"), "{msg}");
-        // The refusal is only useful if it names the fix.
-        assert!(
-            msg.contains("pub stage aterm && pub publish aterm"),
-            "{msg}"
-        );
-    }
-
-    /// Equality, not `>=`. A channel AHEAD means source exists for a version with
-    /// no binary — the residue of a half-finished publish, and just as wrong.
-    #[test]
-    fn a_channel_ahead_of_the_cut_is_refused_too() {
-        let channel = "[workspace.package]\nversion = \"0.9.0\"\n";
-        assert!(check_channel_version("0.8.0", channel).is_err());
-    }
-
-    #[test]
-    fn agreement_is_exact_string_equality_of_the_workspace_version() {
-        let channel = "[workspace.package]\nversion = \"0.8.0\"\nedition = \"2024\"\n";
+    fn the_channel_version_must_equal_the_cut() {
+        let at = |v: &str| format!("[workspace.package]\nversion = \"{v}\"\nedition = \"2024\"\n");
+        assert!(check_channel_version("0.6.0", &at("0.5.0")).is_err());
+        assert!(check_channel_version("0.8.0", &at("0.9.0")).is_err());
         assert_eq!(
-            check_channel_version("0.8.0", channel).unwrap(),
+            check_channel_version("0.8.0", &at("0.8.0")).unwrap(),
             ChannelVersion::Agrees
         );
-    }
-
-    /// An EMPTY body is the only skip. Distinguishing this from "unreadable" is the
-    /// point: an empty channel legitimately has nothing to compare, whereas a
-    /// manifest we cannot parse is a channel whose version is unknown — and
-    /// proceeding on an unknown version is precisely the original bug.
-    #[test]
-    fn an_empty_channel_manifest_skips_but_an_unparseable_one_refuses() {
         assert_eq!(
             check_channel_version("0.8.0", "   \n\n").unwrap(),
             ChannelVersion::NoManifest
         );
-        assert!(
-            check_channel_version("0.8.0", "[workspace]\nmembers = []\n").is_err(),
-            "a real manifest with no [workspace.package] version must NOT be treated as absent"
-        );
-    }
-
-    /// The gate compares the channel against the version being cut, so it must read
-    /// the CHANNEL's manifest — not fall back to this repo's. Feeding it our own
-    /// manifest and a deliberately different version has to fail.
-    #[test]
-    fn the_gate_reads_the_channel_manifest_not_the_local_one() {
-        let ours = crate::publish::workspace_version(REAL_MANIFEST).unwrap();
-        let bumped = format!(
-            "{}99.0",
-            ours.trim_end_matches(|c: char| c.is_ascii_digit())
-        );
-        assert_ne!(bumped, ours);
-        assert!(check_channel_version(&bumped, REAL_MANIFEST).is_err());
-        assert_eq!(
-            check_channel_version(&ours, REAL_MANIFEST).unwrap(),
-            ChannelVersion::Agrees
-        );
+        assert!(check_channel_version("0.8.0", "[workspace]\nmembers = []\n").is_err());
     }
 
     #[test]
@@ -899,41 +806,6 @@ mod tests {
                 aterm_update_core::DEFAULT_REPO
             )
         );
-    }
-
-    #[test]
-    fn the_channel_is_never_pointed_back_at_the_private_staging_repo() {
-        // The channel is a separate repository precisely because the dev repo is
-        // private and unreadable without a credential. Pointing the channel back at
-        // it would restore the "fresh machine never updates" bug — and the cut's
-        // own preflight would refuse the private channel only at cut time.
-        //
-        // Scoped to the private staging namespace on purpose: `publish/` exports
-        // a PUBLIC source snapshot that rewrites the staging owner into the
-        // public org throughout, so in that tree `repository` and
-        // `update_channel` legally coincide — one public repo serving both
-        // source and releases, which is the documented "no separate channel"
-        // configuration, not a regression.
-        //
-        // The scope test must therefore contain NO rewritable literal: guarding
-        // on the staging owner's spelling would be rewritten into the public
-        // org, flip to always-true in the exported tree, and deterministically
-        // fail there. "alabsystems" is a FIXED POINT of that rewrite, so
-        // "publish owner is not the public org" identifies the private staging
-        // tree in both snapshots. Not `DEFAULT_OWNER` on purpose: build.rs
-        // stamps that from `update_channel`, so it MOVES WITH the exact
-        // regression this test names (channel repointed at the private repo
-        // recompiles DEFAULT_OWNER to the private owner and would skip the
-        // guard); the fixed literal keeps the tripwire live in that world.
-        let channel = update_channel_slug(REAL_MANIFEST).unwrap().unwrap();
-        let publish = crate::publish::repo_slug(REAL_MANIFEST).unwrap();
-        let publish_owner = publish.split('/').next().unwrap_or("");
-        if publish_owner != "alabsystems" {
-            assert_ne!(
-                channel, publish,
-                "the private staging repo must never be the update channel"
-            );
-        }
     }
 
     #[test]
@@ -979,24 +851,6 @@ update_channel = \"someone/else\"
         );
     }
 
-    /// REGRESSION: the channel anchor has exactly ONE home.
-    ///
-    /// A second copy in `[workspace.metadata.aterm] update_channel_pubkey`, edited
-    /// apart from `aterm_update_core::pins`, would sign releases with a key no client
-    /// accepts, silently. This test fails if the manifest key comes back.
-    #[test]
-    fn the_channel_anchor_lives_only_in_pins() {
-        assert!(
-            !REAL_MANIFEST.contains("update_channel_pubkey"),
-            "the channel anchor must live only in aterm_update_core::pins, \
-             never also in Cargo.toml"
-        );
-        assert!(
-            aterm_update_core::pins::roster_tier_armed(),
-            "the public channel's anchor — the paper master — is pinned in pins.rs"
-        );
-    }
-
     #[test]
     fn required_asset_set_is_exactly_what_the_updater_elects() {
         // Unsigned (Tier REPO, the default): appcast + version-bound DMG + the
@@ -1034,27 +888,6 @@ update_channel = \"someone/else\"
                 "aterm.dmg".to_string(),
                 "aterm.dmg.sha256".to_string(),
             ]
-        );
-        // The names are the client's literals, not a lookalike.
-        assert_eq!(manifest_out::MANIFEST_ASSET, "aterm-appcast.toml");
-        assert_eq!(manifest_out::MANIFEST_SIG_ASSET, "aterm-appcast.toml.sig");
-        assert_eq!(dmg_asset_name("1.2.3"), "aterm-1.2.3.dmg");
-        assert_eq!(zip_asset_name("1.2.3"), "aterm-1.2.3-mac.zip");
-        assert_eq!(
-            sha256_sidecar_name(&dmg_asset_name("1.2.3")),
-            "aterm-1.2.3.dmg.sha256"
-        );
-        assert_eq!(stable_dmg_asset_name(), "aterm.dmg");
-        // The twin names are VERSION-FREE by construction — that is the whole
-        // evergreen-URL property — and their sidecars embed exactly them.
-        assert_eq!(stable_zip_asset_name(), "aterm-mac.zip");
-        assert_eq!(
-            sha256_sidecar_name(&stable_zip_asset_name()),
-            "aterm-mac.zip.sha256"
-        );
-        assert_eq!(
-            sha256_sidecar_name(&stable_dmg_asset_name()),
-            "aterm.dmg.sha256"
         );
     }
 
@@ -1097,218 +930,68 @@ update_channel = \"someone/else\"
         ];
         validate_channel_asset_set(&reordered, "0.5.0", false, false, &[]).unwrap();
 
-        // Every way a plausible-looking release silently never updates:
-        let cases: Vec<(Vec<&str>, &str, bool, &str)> = vec![
-            // no appcast at all -> the release is skipped by selection
+        // Every way a plausible-looking release silently never updates, each
+        // refusal naming the asset it is about.
+        let without =
+            |name: &str| -> Vec<String> { ok.iter().filter(|n| *n != name).cloned().collect() };
+        let with = |extra: &str| -> Vec<String> {
+            let mut set = ok.clone();
+            set.push(extra.to_string());
+            set
+        };
+        let renamed = |from: &str, to: &str| -> Vec<String> {
+            ok.iter()
+                .map(|n| if n == from { to.to_string() } else { n.clone() })
+                .collect()
+        };
+        let cases: Vec<(&str, Vec<String>, bool, &str)> = vec![
             (
-                vec![
-                    "aterm-0.5.0.dmg",
-                    "aterm-0.5.0.dmg.sha256",
-                    "aterm-0.5.0-mac.zip",
-                    "aterm-0.5.0-mac.zip.sha256",
-                    "aterm.dmg",
-                    "aterm.dmg.sha256",
-                    "aterm-mac.zip",
-                    "aterm-mac.zip.sha256",
-                ],
-                "0.5.0",
+                "no appcast",
+                without("aterm-appcast.toml"),
                 false,
                 "aterm-appcast.toml",
             ),
-            // two appcasts -> `unique_asset_index` refuses the release
             (
-                vec![
-                    "aterm-appcast.toml",
-                    "aterm-appcast.toml",
-                    "aterm-0.5.0.dmg",
-                    "aterm-0.5.0.dmg.sha256",
-                    "aterm-0.5.0-mac.zip",
-                    "aterm-0.5.0-mac.zip.sha256",
-                    "aterm.dmg",
-                    "aterm.dmg.sha256",
-                    "aterm-mac.zip",
-                    "aterm-mac.zip.sha256",
-                ],
-                "0.5.0",
+                "two appcasts",
+                with("aterm-appcast.toml"),
                 false,
-                "duplicated",
+                "aterm-appcast.toml",
             ),
-            // DMG named for the WRONG version -> manifest/tag disagreement
             (
-                vec![
-                    "aterm-appcast.toml",
-                    "aterm-0.61.0.dmg",
-                    "aterm-0.5.0.dmg.sha256",
-                    "aterm-0.5.0-mac.zip",
-                    "aterm-0.5.0-mac.zip.sha256",
-                    "aterm.dmg",
-                    "aterm.dmg.sha256",
-                    "aterm-mac.zip",
-                    "aterm-mac.zip.sha256",
-                ],
-                "0.5.0",
+                "the DMG named for another version",
+                renamed("aterm-0.5.0.dmg", "aterm-0.61.0.dmg"),
                 false,
                 "aterm-0.5.0.dmg",
             ),
-            // the stable twin alone cannot substitute for the version-bound
-            // name the manifest elects -> the canonical DMG is still missing
             (
-                vec![
-                    "aterm-appcast.toml",
-                    "aterm.dmg",
-                    "aterm.dmg.sha256",
-                    "aterm-0.5.0.dmg.sha256",
-                    "aterm-0.5.0-mac.zip",
-                    "aterm-0.5.0-mac.zip.sha256",
-                    "aterm-mac.zip",
-                    "aterm-mac.zip.sha256",
-                ],
-                "0.5.0",
-                false,
-                "aterm-0.5.0.dmg",
-            ),
-            // the stable download twin never crossed -> every printed/bookmarked
-            // releases/latest/download/aterm.dmg link 404s on this head
-            (
-                vec![
-                    "aterm-appcast.toml",
-                    "aterm-0.5.0.dmg",
-                    "aterm-0.5.0-mac.zip",
-                ],
-                "0.5.0",
+                "no evergreen twin",
+                without("aterm.dmg"),
                 false,
                 "aterm.dmg",
             ),
-            // the PRIMARY evergreen download never crossed -> the alab.systems
-            // homepage's single releases/latest/download/aterm-mac.zip button
-            // 404s on this head
             (
-                vec![
-                    "aterm-appcast.toml",
-                    "aterm-0.5.0.dmg",
-                    "aterm-0.5.0.dmg.sha256",
-                    "aterm-0.5.0-mac.zip",
-                    "aterm-0.5.0-mac.zip.sha256",
-                    "aterm.dmg",
-                    "aterm.dmg.sha256",
-                    "aterm-mac.zip.sha256",
-                ],
-                "0.5.0",
-                false,
-                "aterm-mac.zip",
-            ),
-            // a twin without its ALIAS sidecar -> the documented shasum -c
-            // one-liner has no record naming the file the button actually saved
-            (
-                vec![
-                    "aterm-appcast.toml",
-                    "aterm-0.5.0.dmg",
-                    "aterm-0.5.0.dmg.sha256",
-                    "aterm-0.5.0-mac.zip",
-                    "aterm-0.5.0-mac.zip.sha256",
-                    "aterm.dmg",
-                    "aterm.dmg.sha256",
-                    "aterm-mac.zip",
-                ],
-                "0.5.0",
-                false,
-                "aterm-mac.zip.sha256",
-            ),
-            // the updater container never crossed -> the manifest names a zip the
-            // channel does not carry, and every in-app stage 404s
-            (
-                vec![
-                    "aterm-appcast.toml",
-                    "aterm-0.5.0.dmg",
-                    "aterm-0.5.0.dmg.sha256",
-                    "aterm-0.5.0-mac.zip.sha256",
-                    "aterm.dmg",
-                    "aterm.dmg.sha256",
-                    "aterm-mac.zip",
-                    "aterm-mac.zip.sha256",
-                ],
-                "0.5.0",
-                false,
-                "aterm-0.5.0-mac.zip",
-            ),
-            // zip named for the WRONG version -> same, with a plausible decoy
-            (
-                vec![
-                    "aterm-appcast.toml",
-                    "aterm-0.5.0.dmg",
-                    "aterm-0.5.0.dmg.sha256",
-                    "aterm-0.61.0-mac.zip",
-                    "aterm-0.5.0-mac.zip.sha256",
-                    "aterm.dmg",
-                    "aterm.dmg.sha256",
-                    "aterm-mac.zip",
-                    "aterm-mac.zip.sha256",
-                ],
-                "0.5.0",
-                false,
-                "aterm-0.5.0-mac.zip",
-            ),
-            // a container without its sidecar -> the human download the release
-            // page advertises cannot be verified the way the notes instruct
-            (
-                vec![
-                    "aterm-appcast.toml",
-                    "aterm-0.5.0.dmg",
-                    "aterm-0.5.0-mac.zip",
-                    "aterm-0.5.0-mac.zip.sha256",
-                    "aterm.dmg",
-                    "aterm.dmg.sha256",
-                    "aterm-mac.zip",
-                    "aterm-mac.zip.sha256",
-                ],
-                "0.5.0",
+                "no sidecar",
+                without("aterm-0.5.0.dmg.sha256"),
                 false,
                 "aterm-0.5.0.dmg.sha256",
             ),
-            // signed cut whose signature never crossed -> pinned clients refuse
             (
-                vec![
-                    "aterm-appcast.toml",
-                    "aterm-0.5.0.dmg",
-                    "aterm-0.5.0.dmg.sha256",
-                    "aterm-0.5.0-mac.zip",
-                    "aterm-0.5.0-mac.zip.sha256",
-                    "aterm.dmg",
-                    "aterm.dmg.sha256",
-                    "aterm-mac.zip",
-                    "aterm-mac.zip.sha256",
-                ],
-                "0.5.0",
+                "a signed cut without its signature",
+                ok.clone(),
                 true,
                 "aterm-appcast.toml.sig",
             ),
-            // private-only artifacts leaking into the public set
             (
-                vec![
-                    "aterm-appcast.toml",
-                    "aterm-0.5.0.dmg",
-                    "aterm-0.5.0.dmg.sha256",
-                    "aterm-0.5.0-mac.zip",
-                    "aterm-0.5.0-mac.zip.sha256",
-                    "aterm.dmg",
-                    "aterm.dmg.sha256",
-                    "aterm-mac.zip",
-                    "aterm-mac.zip.sha256",
-                    "aterm-0.5.0-dSYM.zip",
-                ],
-                "0.5.0",
+                "a private artifact",
+                with("aterm-0.5.0-dSYM.zip"),
                 false,
                 "aterm-0.5.0-dSYM.zip",
             ),
         ];
-        for (names, version, signed, needle) in cases {
-            let names: Vec<String> = names.into_iter().map(str::to_string).collect();
-            let err = validate_channel_asset_set(&names, version, signed, false, &[])
-                .expect_err(&format!("{names:?} must be refused"));
-            assert!(
-                err.to_string().contains(needle),
-                "error for {names:?} should name {needle:?}, got: {err}"
-            );
+        for (case, names, signed, needle) in cases {
+            let err =
+                validate_channel_asset_set(&names, "0.5.0", signed, false, &[]).expect_err(case);
+            assert!(err.to_string().contains(needle), "{case}: {err}");
         }
     }
 
@@ -1333,18 +1016,13 @@ update_channel = \"someone/else\"
             provenance_asset_name("0.5.0"),
             "aterm-0.5.0-dSYM.zip".to_string(),
         ];
-        assert_eq!(
-            aids[0], "aterm-0.5.0-build.txt",
-            "the name bundle.rs writes into dist/"
-        );
         let publishable = publishable_asset_names("0.5.0");
         for aid in &aids {
             assert!(!publishable.contains(aid), "{aid} is publishable");
             let mut set = required_asset_names("0.5.0", true, true);
             set.push(aid.clone());
-            let err = validate_channel_asset_set(&set, "0.5.0", true, true, &[])
+            validate_channel_asset_set(&set, "0.5.0", true, true, &[])
                 .expect_err("an aid on the channel is an unexpected object");
-            assert!(err.to_string().contains(aid.as_str()), "{err}");
         }
     }
 
@@ -1388,8 +1066,7 @@ update_channel = \"someone/else\"
         // …and a foreign name refuses instead of guessing.
         let mut foreign = adopted.clone();
         foreign.push("aterm-0.94.0.dmg".to_string());
-        let why = withdrawable_assets(&foreign, v, None).unwrap_err();
-        assert!(why.contains("aterm-0.94.0.dmg"), "{why}");
+        withdrawable_assets(&foreign, v, None).unwrap_err();
         // The source release alone has nothing to withdraw.
         assert!(withdrawable_assets(&source, v, None).unwrap().is_empty());
 

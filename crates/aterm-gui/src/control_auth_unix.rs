@@ -46,7 +46,11 @@ pub(crate) fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
     {
         return Ok(());
     }
-    std::fs::create_dir_all(dir)?;
+    // Missing ancestors `0755` whatever the umask, never `create_dir_all`'s `0777 & ~umask`:
+    // under the state root this can be the first to make `~/.local` (Linux) or the atpkg
+    // prefix's parent (macOS), and `targo trust` refuses every toolchain installed below a
+    // group-writable directory.
+    aterm_types::fs_restricted::create_dir_all_unshared(dir, 0o700)?;
     // Only a mode that is not already `0700` is written: a `chmod(2)` to the
     // mode a directory already has still moves its `st_ctime` (APFS), and
     // tippy aborts when an ancestor of its executable changes ctime mid-run
@@ -188,7 +192,6 @@ mod ctime_tests {
         };
         let before = stamp();
         assert_eq!(before.2, 0o700);
-        std::thread::sleep(std::time::Duration::from_millis(20));
         ensure_private_dir(&dir).unwrap();
         assert_eq!(stamp(), before, "an unchanged directory was written");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();

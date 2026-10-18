@@ -3,20 +3,6 @@
 
 use super::*;
 
-/// A cold restore's wait yields the one sweep lock between its checks; a live
-/// relaunch keeps its wait, and so does the upgrade's, which reads an agent
-/// that ended at once early ([`ends_at_once`]) but waits out one still
-/// starting.
-#[test]
-fn a_cold_restore_yields_between_session_checks_but_live_relaunch_keeps_its_wait() {
-    assert_eq!(held_wait(CAUSE_HOST), Duration::from_secs(7));
-    assert!(held_wait(CAUSE_HOST) > ENDED_AT_ONCE);
-    assert_eq!(held_wait(CAUSE_EXIT), HELD_WAIT);
-    assert!(ends_at_once("") && ends_at_once(CAUSE_UPGRADE_FRESH));
-    assert_eq!(held_wait(""), HELD_WAIT);
-    assert_eq!(held_wait(CAUSE_UPGRADE_FRESH), HELD_WAIT);
-}
-
 fn words(list: &[&str]) -> Vec<String> {
     list.iter().map(|s| (*s).to_string()).collect()
 }
@@ -86,9 +72,9 @@ fn the_program_is_the_script_or_the_image_that_is_claude() {
 /// (`hold=1`, a lease, a named driver's turn), else the owner's limit, else nobody's: relaunched. A
 /// person or a holder is asked about first, so their own exit is never said to them as a limit. An
 /// exit the explicit restart made is carried through a hold, a lease or a named turn
-/// (`WAIT_HAND_LIFTS`); the owner's limit still holds it. Negative controls: a keystroke older than
-/// the grace, `-`, a server that does not say, an unreadable status, an unnamed turn and a
-/// `driving:` hand are nobody.
+/// (`WAIT_HAND_LIFTS`) as its own word, [`OnExit::Asked`], no crash; the owner's limit still holds
+/// it. Negative controls: a keystroke older than the grace, `-`, a server that does not say, an
+/// unreadable status, an unnamed turn and a `driving:` hand are nobody.
 #[test]
 fn an_exit_is_relaunched_unless_someone_owns_it_or_it_is_limited() {
     let st = |tail: &str| format!("OK schema=1 {tail}");
@@ -158,7 +144,7 @@ fn an_exit_is_relaunched_unless_someone_owns_it_or_it_is_limited() {
     // owner's limit still holds.
     assert_eq!(
         on_exit(true, Some(&typed(1)), 120, true, false),
-        OnExit::Relaunch
+        OnExit::Asked
     );
     for (held, holder) in [
         ("hold=1 hand=- human_ms=1", true),
@@ -169,7 +155,7 @@ fn an_exit_is_relaunched_unless_someone_owns_it_or_it_is_limited() {
     ] {
         assert_eq!(
             on_exit(true, Some(&st(held)), 120, true, false),
-            OnExit::Relaunch,
+            OnExit::Asked,
             "{held}"
         );
         assert!(hand_on_tab(&st(held)), "{held}: what the host waits out");
@@ -285,7 +271,8 @@ fn a_step_is_relaunched_left_not_yet_or_never() {
 }
 
 /// The relaunched agent reads as ended only once its line's command was seen to run and every look
-/// for [`ENDED_AT_ONCE`] since found its shell holding the tab, looks [`SHELL_LOOK`] apart: by the
+/// for `ended_at_once` since found its shell holding the tab, looks `shell_look` apart (the
+/// production clock's 5 s and 1 s, [`super::super::Timings::PRODUCTION`]): by the
 /// kernel's witness (a look found the shell not holding its terminal) or, with the line's block,
 /// by that block being over ([`line_over`]). Negative controls: a shell that held its terminal
 /// throughout (its own hooks), a block not over, the agent still starting (the count starts over),
@@ -294,7 +281,7 @@ fn a_step_is_relaunched_left_not_yet_or_never() {
 fn a_shell_that_has_the_tab_back_reads_as_ended_only_once_its_line_ran() {
     let t0 = Instant::now();
     let at = |ms: u64| t0 + Duration::from_millis(ms);
-    let mut back = ShellBack::default();
+    let mut back = ShellBack::after(None, &super::super::Timings::PRODUCTION);
     assert!(back.due(at(0)));
     assert!(!back.due(at(400)), "not at the roster's pace");
     assert!(back.due(at(1_000)));
@@ -325,7 +312,7 @@ fn a_shell_that_has_the_tab_back_reads_as_ended_only_once_its_line_ran() {
         back.saw(Some(true), None, at(t + 10_000)),
         "held five seconds in a row"
     );
-    let mut never = ShellBack::default();
+    let mut never = ShellBack::after(None, &super::super::Timings::PRODUCTION);
     for s in 0..60 {
         assert!(
             !never.saw(None, None, at(s * 1_000)),
@@ -333,7 +320,7 @@ fn a_shell_that_has_the_tab_back_reads_as_ended_only_once_its_line_ran() {
         );
     }
     // The shell's own word: the line typed into block 7.
-    let mut marked = ShellBack::after(Some(7));
+    let mut marked = ShellBack::after(Some(7), &super::super::Timings::PRODUCTION);
     assert!(
         !marked.saw(Some(false), Some(false), at(0)),
         "the agent runs"
@@ -366,29 +353,6 @@ fn a_shell_that_has_the_tab_back_reads_as_ended_only_once_its_line_ran() {
         marked.saw(Some(true), Some(true), at(t + 10_000)),
         "over, and held five seconds since"
     );
-}
-
-/// Another actor on the lock is no miss: however many busy looks in a row, the back-off, the misses
-/// and the attention stay where they were. Negative control: the same number of real misses is
-/// said.
-#[test]
-fn another_actor_on_the_lock_is_never_a_miss() {
-    let t0 = Instant::now();
-    let mut r = Relaunches::default();
-    assert!(r.exited(OnExit::Relaunch, t0).is_ok());
-    let before = r.clone();
-    for _ in 0..BADGE_AFTER * 4 {
-        assert_eq!(
-            r.attempted(&outcome("busy:another-sweep"), t0),
-            Say::Nothing
-        );
-    }
-    assert_eq!(r, before, "a stutter");
-    assert!(r.pending(), "still due");
-    let said: Vec<Say> = (0..BADGE_AFTER)
-        .map(|_| r.attempted(&outcome("wait:shell-prompt"), t0))
-        .collect();
-    assert!(said.contains(&Say::Failing), "{said:?}");
 }
 
 /// A one-shot run is read wherever its flag stands — after a prompt, after a
@@ -445,20 +409,26 @@ fn an_exit_is_relaunched_only_where_the_relaunch_would_plan_it() {
         session: Some(ID.to_string()),
         cwd: "/w".to_string(),
         version: Some("2.1.283".to_string()),
-        codex: None,
+        run: crate::harness::relaunch::AgentRun::Claude,
         dialect: Some(upgrade::Dialect::Zsh),
         login: None,
         home: None,
         claude_dir: None,
     };
     let known = snap(&["/opt/claude", "--model", "opus"]);
-    assert!(resumes_on_exit(&known), "a launch the relaunch carries");
+    assert!(
+        resumes_on_exit(Path::new("/Users//someone"), &known),
+        "a launch the relaunch carries"
+    );
     for dialect in [upgrade::Dialect::Bash, upgrade::Dialect::Fish] {
         let other = Snapshot {
             dialect: Some(dialect),
             ..known.clone()
         };
-        assert!(resumes_on_exit(&other), "{dialect:?}");
+        assert!(
+            resumes_on_exit(Path::new("/Users//someone"), &other),
+            "{dialect:?}"
+        );
     }
 
     let unknown = ["/opt/claude", "--permission-prompt-tool", "mcp__x"];
@@ -466,18 +436,27 @@ fn an_exit_is_relaunched_only_where_the_relaunch_would_plan_it() {
         upgrade::rewrite_argv(&words(&unknown), ID).is_err(),
         "the premise: the relaunch refuses this argv"
     );
-    assert!(!resumes_on_exit(&snap(&unknown)), "argv:unknown-flag");
+    assert!(
+        !resumes_on_exit(Path::new("/Users//someone"), &snap(&unknown)),
+        "argv:unknown-flag"
+    );
     assert_eq!(
         super::super::resume::command(&words(&unknown), ID).as_deref(),
         Some("claude --resume 0badf00d-1111-2222-3333-444455556666"),
         "the person's command still resumes the conversation"
     );
     assert!(
-        !resumes_on_exit(&snap(&["/opt/claude", "--worktree"])),
+        !resumes_on_exit(
+            Path::new("/Users//someone"),
+            &snap(&["/opt/claude", "--worktree"])
+        ),
         "argv:not-resumable"
     );
     assert!(
-        !resumes_on_exit(&snap(&["/opt/claude", "-p", "x"])),
+        !resumes_on_exit(
+            Path::new("/Users//someone"),
+            &snap(&["/opt/claude", "-p", "x"])
+        ),
         "one-shot"
     );
     let nushell = Snapshot {
@@ -485,20 +464,23 @@ fn an_exit_is_relaunched_only_where_the_relaunch_would_plan_it() {
         ..known.clone()
     };
     assert!(
-        !resumes_on_exit(&nushell),
+        !resumes_on_exit(Path::new("/Users//someone"), &nushell),
         "no dialect: plan waits for ever"
     );
     let unregistered = Snapshot {
         session: None,
         ..known.clone()
     };
-    assert!(!resumes_on_exit(&unregistered), "no conversation to resume");
+    assert!(
+        !resumes_on_exit(Path::new("/Users//someone"), &unregistered),
+        "no conversation to resume"
+    );
     let control = Snapshot {
         cwd: "/w\nx".to_string(),
         ..known
     };
     assert!(
-        !resumes_on_exit(&control),
+        !resumes_on_exit(Path::new("/Users//someone"), &control),
         "no line with a control character"
     );
 }
@@ -525,7 +507,7 @@ fn a_snapshot_follows_its_own_process_and_nothing_else() {
         session: Some("0badf00d-1111-2222-3333-444455556666".to_string()),
         cwd: "/w".to_string(),
         version: Some("2.1.281".to_string()),
-        codex: None,
+        run: crate::harness::relaunch::AgentRun::Claude,
         dialect: Some(upgrade::Dialect::Zsh),
         login: None,
         home: None,
@@ -640,7 +622,7 @@ fn the_back_off_grows_caps_and_forgives_a_healthy_run() {
     // A limited one: nothing due, and said.
     assert_eq!(r.exited(OnExit::Limited, t0), Err(Say::Limited));
     assert!(!r.pending() && r.counts().1, "badged");
-    assert_eq!(r.running(), Say::Clear, "an agent back clears it");
+    assert_eq!(r.running(t0), Say::Clear, "an agent back clears it");
     // The launch's own end: nothing due, the tab left, nothing said.
     let _ = r.exited(OnExit::Relaunch, t0);
     assert_eq!(
@@ -674,16 +656,274 @@ fn the_back_off_grows_caps_and_forgives_a_healthy_run() {
         Say::Cannot
     );
     assert!(!m.pending());
-    assert_eq!(m.running(), Say::Clear, "a person's agent clears the word");
+    assert_eq!(
+        m.running(t0),
+        Say::Clear,
+        "a person's agent clears the word"
+    );
+}
+
+/// THE CRASH BACK-OFF COUNTS CRASHES (LC-6 of the 2026-10-15 sweep): an exit
+/// someone asked for — a person's `restart` (a keystroke just before it or
+/// none), the harness's own restart — lands without climbing the crash
+/// back-off or restarting the healthy run that forgives it, and its own
+/// misses are paced from the first step, whatever crashes came before. So
+/// for every crash history the next crash is judged exactly as if no
+/// restart had been asked. Before, three restarts made the next crash wait
+/// ten minutes, and a restart under a crash loop retried after ten.
+/// NEGATIVE CONTROL: one more CRASH in the same place does change the
+/// judged pause, so the comparison is not vacuous.
+#[test]
+fn an_exit_someone_asked_for_is_invisible_to_the_crash_back_off() {
+    let st = |tail: &str| format!("OK schema=1 {tail}");
+    let nobody = st("hold=0 hand=- human_ms=-");
+    let typed = st("hold=0 hand=- human_ms=1500");
+    let crash = on_exit(true, Some(&nobody), 120, false, false);
+    let asked = [
+        on_exit(true, Some(&typed), 120, true, false),
+        on_exit(true, Some(&nobody), 120, true, false),
+        on_exit(true, Some(&nobody), 120, false, true),
+    ];
+    let land = |r: &mut Relaunches, decision: OnExit, at: Instant| {
+        assert!(r.exited(decision, at).is_ok(), "{decision:?} due");
+        assert_eq!(r.attempted(&Outcome::Relaunched, at), Say::Nothing);
+    };
+    let secs = Duration::from_secs;
+    let t0 = Instant::now();
+    for history in 0..=4u64 {
+        let mut plain = Relaunches::default();
+        let mut last = t0;
+        for n in 0..history {
+            last = t0 + secs(30 * n);
+            land(&mut plain, crash, last);
+        }
+        let mut with = plain.clone();
+        let mut at = last;
+        for decision in asked {
+            at += secs(15);
+            land(&mut with, decision, at);
+        }
+        // A person's restart whose first attempt misses: its second try
+        // waits its own second step, never the crash history's.
+        at += secs(15);
+        assert!(with.exited(asked[1], at).is_ok());
+        assert_eq!(
+            with.attempted(&outcome("wait:shell-prompt"), at),
+            Say::Nothing
+        );
+        assert_eq!(with.pause(), BACKOFF[1], "history {history}");
+        assert_eq!(with.attempted(&Outcome::Relaunched, at), Say::Nothing);
+        // The next crash: soon after the restarts, and past a healthy run
+        // since the last crash.
+        for judged in [last + secs(60), last + HEALTHY + secs(1)] {
+            assert_eq!(
+                with.clone().exited(crash, judged),
+                plain.clone().exited(crash, judged),
+                "history {history}, judged {:?} after the last crash",
+                judged - last
+            );
+        }
+        if history < 3 {
+            let mut more = plain.clone();
+            land(&mut more, crash, last + secs(15));
+            assert_ne!(
+                more.exited(crash, last + secs(60)),
+                plain.clone().exited(crash, last + secs(60)),
+                "history {history}: a crash is a step"
+            );
+        }
+    }
+    // A CRASH STREAK CLIMBED BY MISSES ALONE (its relaunch never landed:
+    // three `wait:shell-prompt`, then the person resumes by hand) has no
+    // landing of a crash to start its healthy clock: the first agent seen
+    // running since starts it — the person's own (`running`) or, where none
+    // was seen, an asked exit's landing — and a run past HEALTHY forgives
+    // it. Before, nothing started it, and a crash days later waited ten
+    // minutes, the tab quiet. CONTROLS: a crash soon after that start still
+    // waits the climbed step (the clock is not skipped), and an asked
+    // landing after the person's start never moves the clock later.
+    let hour = secs(3600);
+    let day = 24 * hour;
+    let missed = || {
+        let mut r = Relaunches::default();
+        assert!(r.exited(crash, t0).is_ok());
+        for _ in 0..3 {
+            let _ = r.attempted(&outcome("wait:shell-prompt"), t0);
+        }
+        assert_eq!(r.counts().2, 3, "three crash steps, no landing");
+        r
+    };
+    let asked_lands = |r: &mut Relaunches, at: Instant| {
+        assert!(r.exited(asked[1], at).is_ok());
+        // (`Clear` where the misses' word still stood.)
+        let _ = r.attempted(&Outcome::Relaunched, at);
+        assert!(!r.pending(), "landed");
+    };
+    let climbed = Ok(BACKOFF[3]);
+    let forgiven = Ok(BACKOFF[0]);
+    // The person resumes an hour on; their restart lands a day on.
+    let mut resumed = missed();
+    let _ = resumed.running(t0 + hour);
+    assert_eq!(resumed.clone().exited(crash, t0 + hour + secs(60)), climbed);
+    asked_lands(&mut resumed, t0 + day);
+    assert_eq!(resumed.clone().exited(crash, t0 + 2 * day), forgiven);
+    // No agent seen running: the asked exit's landing starts the clock.
+    let mut landed = missed();
+    asked_lands(&mut landed, t0 + day);
+    assert_eq!(landed.clone().exited(crash, t0 + day + secs(60)), climbed);
+    assert_eq!(landed.clone().exited(crash, t0 + 2 * day), forgiven);
+    // The person's start stands; a restart that lands a minute after it
+    // never pushes the healthy run later.
+    let mut early = missed();
+    let _ = early.running(t0 + hour);
+    asked_lands(&mut early, t0 + hour + secs(60));
+    assert_eq!(early.exited(crash, t0 + hour + HEALTHY + secs(1)), forgiven);
+}
+
+/// THE WORD OF A RELAUNCH THAT KEEPS FAILING ENDS WITH ITS TRYING (the review
+/// of the r20 relaunch lane, 2026-10-16): the word said once a relaunch has
+/// missed [`BADGE_AFTER`] in a row — the tab's mark, "aterm still tries",
+/// naming the conversation it asks a person to resume ([`Relaunches::ask`])
+/// — is that relaunch's, and goes when it is tried no more: the launch's own
+/// end, a person or a holder back at the tab, another agent running there
+/// ([`Say::Clear`]); a limit or a refusal says its own word in its place,
+/// asking for nothing until the host names it again. It stood: "aterm still
+/// tries" over a relaunch that had ended, and, for an upgrade's fresh
+/// restart, `claude --resume` of a conversation Claude refuses, until that
+/// conversation ran. NEGATIVE CONTROL: the word of an agent that cannot be
+/// brought back (a refusal) stands through another agent's run and that
+/// agent's own end (LC-4 of ATERM-KI-1015-1).
+#[test]
+fn a_failing_relaunchs_word_ends_with_its_trying() {
+    const CONVERSATION: &str = "0badf00d-1111-2222-3333-444455556666";
+    let t0 = Instant::now();
+    let miss = Outcome::NotYet("wait:shell-prompt".to_string());
+    let failing = || {
+        let mut r = Relaunches::default();
+        assert!(r.exited(OnExit::Relaunch, t0).is_ok());
+        let said: Vec<Say> = (0..BADGE_AFTER).map(|_| r.attempted(&miss, t0)).collect();
+        assert_eq!(said.last(), Some(&Say::Failing), "{said:?}");
+        r.ask(CONVERSATION);
+        assert_eq!(r.asks(), Some(CONVERSATION));
+        r
+    };
+    let word = |r: &Relaunches| (r.asks().map(str::to_string), r.counts().1);
+    // The launch's own end, a person or a holder back, another agent: ended.
+    let mut left = failing();
+    assert_eq!(
+        left.attempted(&Outcome::Left("one-shot".to_string()), t0),
+        Say::Clear
+    );
+    assert_eq!(word(&left), (None, false), "the launch's own end");
+    for decision in [OnExit::PersonAsked, OnExit::Held] {
+        let mut r = failing();
+        assert_eq!(r.decide(decision), Some(Say::Clear), "{decision:?}");
+        assert_eq!(word(&r), (None, false), "{decision:?}");
+    }
+    let mut runs = failing();
+    assert_eq!(runs.running(t0), Say::Clear);
+    assert_eq!(word(&runs), (None, false), "another agent runs");
+    // A limit or a refusal: its own word in its place, asking nothing yet.
+    let mut limited = failing();
+    assert_eq!(limited.decide(OnExit::Limited), Some(Say::Limited));
+    assert_eq!(word(&limited), (None, true), "a limit");
+    let mut cannot = failing();
+    assert_eq!(
+        cannot.attempted(&Outcome::Cannot("shell-gone".to_string()), t0),
+        Say::Cannot
+    );
+    assert_eq!(word(&cannot), (None, true), "a refusal");
+    // NEGATIVE CONTROL: the word of an agent that cannot be brought back
+    // stands through another agent's run and that agent's own end.
+    let mut gone = Relaunches::default();
+    assert!(gone.exited(OnExit::Relaunch, t0).is_ok());
+    assert_eq!(
+        gone.attempted(&Outcome::Cannot("shell-gone".to_string()), t0),
+        Say::Cannot
+    );
+    gone.ask(CONVERSATION);
+    assert_eq!(gone.running(t0), Say::Nothing);
+    assert!(gone.exited(OnExit::Relaunch, t0).is_ok());
+    assert_eq!(
+        gone.attempted(&Outcome::Left("one-shot".to_string()), t0),
+        Say::Nothing
+    );
+    assert_eq!(word(&gone), (Some(CONVERSATION.to_string()), true));
+}
+
+/// A RELAUNCH THAT KEEPS FAILING BESIDE A WORD THAT ASKS FOR A CONVERSATION
+/// ENDS WITH ITS TRYING TOO (the review of the harness landing's eighth
+/// merge): the word of an agent before it that cannot be brought back keeps
+/// the attention, so this relaunch's failing is said beside it, once (the
+/// digest's line, "aterm still tries"). Once the relaunch is tried no more —
+/// its own end, a person or a holder back, another agent running — what said
+/// it ends ([`Say::Clear`], which the host takes for that line alone where
+/// such a word holds the tab's mark), and the word stands, asking for its
+/// conversation. Before, nothing ended the line while the word stood.
+/// CONTROLS: a refusal writes over it with its own word ([`Say::Cannot`]);
+/// a landing ends both.
+#[test]
+fn a_failing_said_beside_a_word_that_asks_ends_with_its_trying() {
+    const CONVERSATION: &str = "0badf00d-1111-2222-3333-444455556666";
+    let t0 = Instant::now();
+    let miss = Outcome::NotYet("wait:shell-prompt".to_string());
+    let beside = || {
+        let mut r = Relaunches::default();
+        assert!(r.exited(OnExit::Relaunch, t0).is_ok());
+        assert_eq!(
+            r.attempted(&Outcome::Cannot("shell-gone".to_string()), t0),
+            Say::Cannot
+        );
+        r.ask(CONVERSATION);
+        assert_eq!(
+            r.running(t0),
+            Say::Nothing,
+            "another agent: the word stands"
+        );
+        assert!(r.exited(OnExit::Relaunch, t0).is_ok());
+        let said: Vec<Say> = (0..BADGE_AFTER).map(|_| r.attempted(&miss, t0)).collect();
+        assert_eq!(said.last(), Some(&Say::Failing), "{said:?}");
+        assert!(r.failing_said() && !r.failing(), "said beside the word");
+        r
+    };
+    let word = |r: &Relaunches| (r.asks().map(str::to_string), r.counts().1, r.failing_said());
+    let standing = (Some(CONVERSATION.to_string()), true, false);
+    let mut left = beside();
+    assert_eq!(
+        left.attempted(&Outcome::Left("one-shot".to_string()), t0),
+        Say::Clear
+    );
+    assert_eq!(word(&left), standing, "the launch's own end");
+    for decision in [OnExit::PersonAsked, OnExit::Held] {
+        let mut r = beside();
+        assert_eq!(r.decide(decision), Some(Say::Clear), "{decision:?}");
+        assert_eq!(word(&r), standing, "{decision:?}");
+    }
+    let mut runs = beside();
+    assert_eq!(runs.running(t0), Say::Clear);
+    assert_eq!(word(&runs), standing, "another agent runs");
+    assert_eq!(runs.running(t0), Say::Nothing, "ended once");
+    // CONTROLS.
+    let mut cannot = beside();
+    assert_eq!(
+        cannot.attempted(&Outcome::Cannot("shell-gone".to_string()), t0),
+        Say::Cannot
+    );
+    assert_eq!(word(&cannot), standing, "a refusal writes over it");
+    let mut lands = beside();
+    assert_eq!(lands.attempted(&Outcome::Relaunched, t0), Say::Clear);
+    assert_eq!(word(&lands), (None, false, false), "a landing ends both");
 }
 
 /// Drive the real [`Relaunches`], [`on_exit`] and [`outcome`] through every action of
 /// `HarnessRelaunchOnExit`: after each, the state is the model's and every invariant holds,
-/// including for the harness's own restart (`Restarted`). Negative controls: each of the buggy
-/// host's defects is caught by an invariant.
+/// including for the harness's own restart (`Restarted`) and the explicit restart's
+/// (`Asked`), which the crash back-off neither paces nor counts until its stamp lapses
+/// (`Lapse`). Negative controls: each of the buggy host's defects is caught by an invariant, among
+/// them climbing the crash back-off on an exit someone asked for.
 #[test]
 fn the_real_relaunch_decisions_conform_to_the_model() {
-    let model = aterm_spec::derive::harness_relaunch_on_exit_model();
+    let model = aterm_models_harness::harness_relaunch_on_exit_model();
     let konst = |name: &str| {
         model
             .consts
@@ -700,12 +940,17 @@ fn the_real_relaunch_decisions_conform_to_the_model() {
     );
     let badge = u32::try_from(konst("Badge")).expect("small");
     // The one fact the type does not hold: whether an agent runs in the
-    // tab, which the host reads off the session's program.
+    // tab, which the host reads off the session's program — and the model's
+    // history variable `base`, the crash back-off as the exit being handled
+    // came, kept here as each exit reads it.
     let mut running = true;
+    let mut base = 0i64;
     let mut r = Relaunches::default();
     let mut now = Instant::now();
-    let project = |r: &Relaunches, running: bool| {
-        let (left, badged, _, misses) = r.counts();
+    const CONVERSATION: &str = "0badf00d-1111-2222-3333-444455556666";
+    let steps = i64::try_from(BACKOFF.len() - 1).expect("small");
+    let project = |r: &Relaunches, running: bool, base: i64| {
+        let (left, badged, streak, misses) = r.counts();
         let step = BACKOFF
             .iter()
             .position(|p| *p == r.pause())
@@ -718,10 +963,18 @@ fn the_real_relaunch_decisions_conform_to_the_model() {
             ("step", i64::try_from(step).expect("small")),
             ("misses", i64::from(misses.min(badge))),
             ("restarted", i64::from(r.restarted())),
+            ("crash", i64::from(r.crash())),
+            ("streak", i64::from(streak).min(steps)),
+            ("base", base),
+            ("asks", i64::from(r.asks().is_some())),
+            ("failing", i64::from(r.failing())),
+            ("said", i64::from(r.failing_said())),
         ]
         .into_iter()
         .collect::<std::collections::BTreeMap<&'static str, i64>>()
     };
+    // The crash back-off as an exit reads it ([`Relaunches::counts`]).
+    let streak_of = |r: &Relaunches| i64::from(r.counts().2).min(steps);
     let mut expect = model.init_state();
     let status = |tail: &str| format!("OK schema=1 {tail}");
     let nobody = status("hold=0 hand=- human_ms=-");
@@ -733,6 +986,35 @@ fn the_real_relaunch_decisions_conform_to_the_model() {
     // switch before an exit and during a pause for `Limited`, a one-shot
     // run and an agent that never ended for `Ended`).
     let schedule = [
+        // The explicit restart's exit, a keystroke just before it, a halt on
+        // the tab or nobody, and the harness's own: none a step of the crash
+        // back-off, landing or missing; one whose stamp lapsed while its
+        // program ran is a crash's from there. Another supervisor's claim
+        // takes a pending asked exit as it takes a crash.
+        ("Asked", "person"),
+        ("Miss", "wait:shell-prompt"),
+        ("Land", "adopted"),
+        ("Asked", "halted"),
+        ("Land", "adopted"),
+        ("Restarted", "limited"),
+        ("Land", "done:fresh"),
+        ("Asked", "nobody"),
+        ("PersonReturns", "claim"),
+        ("PersonRuns", ""),
+        // A crash streak no landing started a clock for (misses, then a
+        // relaunch that can never land): the person's own agent runs, and a
+        // healthy run of it forgives the streak, as the model's `Healthy`
+        // does wherever the agent runs.
+        ("Crash", "exit"),
+        ("Miss", "wait:shell-prompt"),
+        ("Cannot", "refused:shell-gone"),
+        ("PersonRuns", ""),
+        ("Healthy", ""),
+        ("Asked", "nobody"),
+        ("Miss", "wait:shell-prompt"),
+        ("Lapse", ""),
+        ("Miss", "wait:shell-prompt"),
+        ("Land", "adopted"),
         ("Crash", "exit"),
         ("Land", "adopted"),
         ("Crash", "exit"),
@@ -758,7 +1040,24 @@ fn the_real_relaunch_decisions_conform_to_the_model() {
         ("PersonRuns", ""),
         ("Crash", "exit"),
         ("Cannot", "refused:not-resumable --worktree"),
+        // The word names the conversation it asks a person to resume: another
+        // agent in the tab leaves it, that conversation's answers it (LC-4).
+        ("Ask", ""),
         ("PersonRuns", ""),
+        ("AskedRuns", ""),
+        // An exit the explicit restart made is no crash (LC-6): its misses
+        // grow its own pause, its landing leaves the crash back-off.
+        ("Asked", "person"),
+        ("Miss", "wait:shell-prompt"),
+        ("Land", "adopted"),
+        ("Asked", "halted"),
+        ("Land", "adopted"),
+        ("Crash", "exit"),
+        ("Miss", "wait:shell-prompt"),
+        ("Miss", "wait:shell-prompt"),
+        ("Miss", "wait:shell-prompt"),
+        ("Ask", ""),
+        ("Land", "adopted"),
         ("Crash", "exit"),
         ("Ended", "ended:one-shot"),
         ("PersonRuns", ""),
@@ -781,6 +1080,115 @@ fn the_real_relaunch_decisions_conform_to_the_model() {
         ("Crash", "exit"),
         ("Limited", "pause"),
         ("PersonRuns", ""),
+        // The word of a relaunch that keeps failing ends with its trying (the
+        // review of the r20 relaunch lane): its own end, a person or a holder
+        // back, a limit and a refusal each end it.
+        ("Crash", "exit"),
+        ("Miss", "wait:shell-prompt"),
+        ("Miss", "wait:shell-prompt"),
+        ("Miss", "wait:shell-prompt"),
+        ("Ask", ""),
+        ("Ended", "ended:one-shot"),
+        ("PersonRuns", ""),
+        ("Crash", "exit"),
+        ("Miss", "wait:shell-prompt"),
+        ("Miss", "wait:shell-prompt"),
+        ("Miss", "wait:shell-prompt"),
+        ("Ask", ""),
+        ("PersonReturns", "leased"),
+        ("PersonRuns", ""),
+        ("Crash", "exit"),
+        ("Miss", "wait:shell-prompt"),
+        ("Miss", "wait:shell-prompt"),
+        ("Miss", "wait:shell-prompt"),
+        ("Ask", ""),
+        ("Limited", "pause"),
+        ("PersonRuns", ""),
+        ("Crash", "exit"),
+        ("Miss", "wait:shell-prompt"),
+        ("Miss", "wait:shell-prompt"),
+        ("Miss", "wait:shell-prompt"),
+        ("Ask", ""),
+        ("Cannot", "refused:shell-gone"),
+        ("Ask", ""),
+        ("PersonRuns", ""),
+        ("AskedRuns", ""),
+        // A relaunch that keeps failing BESIDE a word that asks for a
+        // conversation (an agent before it that cannot be brought back) is
+        // said beside that word, and what said it ends with its trying —
+        // that word, its mark and its ask left standing: its own end, a
+        // person or a holder back, a limit, a refusal, a landing.
+        ("Crash", "exit"),
+        ("Land", "adopted"),
+        ("Crash", "exit"),
+        ("Cannot", "refused:shell-gone"),
+        ("Ask", ""),
+        ("PersonRuns", ""),
+        ("Crash", "exit"),
+        ("Miss", "wait:shell-prompt"),
+        ("Miss", "wait:shell-prompt"),
+        ("Miss", "wait:shell-prompt"),
+        ("Ended", "ended:one-shot"),
+        ("PersonRuns", ""),
+        ("Crash", "exit"),
+        ("Land", "adopted"),
+        ("Crash", "exit"),
+        ("Cannot", "refused:shell-gone"),
+        ("Ask", ""),
+        ("PersonRuns", ""),
+        ("Crash", "exit"),
+        ("Miss", "wait:shell-prompt"),
+        ("Miss", "wait:shell-prompt"),
+        ("Miss", "wait:shell-prompt"),
+        ("PersonReturns", "person"),
+        ("PersonRuns", ""),
+        ("Crash", "exit"),
+        ("Land", "adopted"),
+        ("Crash", "exit"),
+        ("Cannot", "refused:shell-gone"),
+        ("Ask", ""),
+        ("PersonRuns", ""),
+        ("Crash", "exit"),
+        ("Miss", "wait:shell-prompt"),
+        ("Miss", "wait:shell-prompt"),
+        ("Miss", "wait:shell-prompt"),
+        ("PersonReturns", "claim"),
+        ("PersonRuns", ""),
+        ("Crash", "exit"),
+        ("Land", "adopted"),
+        ("Crash", "exit"),
+        ("Cannot", "refused:shell-gone"),
+        ("Ask", ""),
+        ("PersonRuns", ""),
+        ("Crash", "exit"),
+        ("Miss", "wait:shell-prompt"),
+        ("Miss", "wait:shell-prompt"),
+        ("Miss", "wait:shell-prompt"),
+        ("Limited", "pause"),
+        ("PersonRuns", ""),
+        ("Crash", "exit"),
+        ("Land", "adopted"),
+        ("Crash", "exit"),
+        ("Cannot", "refused:shell-gone"),
+        ("Ask", ""),
+        ("PersonRuns", ""),
+        ("Crash", "exit"),
+        ("Miss", "wait:shell-prompt"),
+        ("Miss", "wait:shell-prompt"),
+        ("Miss", "wait:shell-prompt"),
+        ("Cannot", "refused:shell-gone"),
+        ("PersonRuns", ""),
+        ("Crash", "exit"),
+        ("Land", "adopted"),
+        ("Crash", "exit"),
+        ("Cannot", "refused:shell-gone"),
+        ("Ask", ""),
+        ("PersonRuns", ""),
+        ("Crash", "exit"),
+        ("Miss", "wait:shell-prompt"),
+        ("Miss", "wait:shell-prompt"),
+        ("Miss", "wait:shell-prompt"),
+        ("Land", "adopted"),
     ];
     for (action, input) in schedule {
         match (action, input) {
@@ -791,10 +1199,14 @@ fn the_real_relaunch_decisions_conform_to_the_model() {
                     "halted" => (true, &halted),
                     _ => (false, &nobody),
                 };
+                // The harness's own restart is no crash (`aterm-gui`'s
+                // `on_agent_left`: a crash is an exit neither asked nor
+                // restarted).
                 assert!(
-                    r.exited(on_exit(allowed, Some(who), 120, false, true), now)
+                    r.exited_as(on_exit(allowed, Some(who), 120, false, true), false, now)
                         .is_ok()
                 );
+                base = streak_of(&r);
                 assert_eq!(
                     r.decide(on_exit(allowed, Some(who), 120, false, true)),
                     None,
@@ -807,6 +1219,40 @@ fn the_real_relaunch_decisions_conform_to_the_model() {
                     r.exited(on_exit(true, Some(&nobody), 120, false, false), now)
                         .is_ok()
                 );
+                base = streak_of(&r);
+            }
+            // The explicit restart's exit: due whoever is at the tab (its
+            // stamp names the process), and no crash — its decision says so
+            // ([`OnExit::Asked`]), and re-asked during its pause it is still
+            // due.
+            ("Asked", who) => {
+                running = false;
+                let who = match who {
+                    "person" => &person,
+                    "halted" => &halted,
+                    _ => &nobody,
+                };
+                let decision = on_exit(true, Some(who), 120, true, false);
+                assert_eq!(decision, OnExit::Asked);
+                assert!(r.exited(decision, now).is_ok());
+                base = streak_of(&r);
+                assert_eq!(r.decide(decision), None, "still due");
+            }
+            // Its stamp lapsed before its program ended: decided again as
+            // nobody's exit, a crash's from here.
+            ("Lapse", _) => {
+                assert_eq!(
+                    r.decide(on_exit(true, Some(&nobody), 120, false, false)),
+                    None
+                );
+            }
+            ("PersonReturns", "claim") => {
+                let said = if expect["failing"] == 1 || expect["said"] == 1 {
+                    Say::Clear
+                } else {
+                    Say::Nothing
+                };
+                assert_eq!(r.decide(OnExit::Held), Some(said));
             }
             ("PersonExit", who) => {
                 running = false;
@@ -815,12 +1261,24 @@ fn the_real_relaunch_decisions_conform_to_the_model() {
                     r.exited(on_exit(true, Some(who), 120, false, false), now),
                     Err(Say::Nothing)
                 );
+                base = streak_of(&r);
+            }
+            ("Ask", _) => r.ask(CONVERSATION),
+            ("AskedRuns", _) => {
+                assert_eq!(r.conversation_runs(CONVERSATION), Say::Clear);
             }
             ("PersonReturns", who) => {
                 let who = if who == "person" { &person } else { &leased };
+                // A failing relaunch's word ends with it, and what said it
+                // beside a word that asks for a conversation.
+                let said = if expect["failing"] == 1 || expect["said"] == 1 {
+                    Say::Clear
+                } else {
+                    Say::Nothing
+                };
                 assert_eq!(
                     r.decide(on_exit(true, Some(who), 120, false, false)),
-                    Some(Say::Nothing)
+                    Some(said)
                 );
             }
             ("Limited", "exit") => {
@@ -829,6 +1287,7 @@ fn the_real_relaunch_decisions_conform_to_the_model() {
                     r.exited(on_exit(false, Some(&nobody), 120, false, false), now),
                     Err(Say::Limited)
                 );
+                base = streak_of(&r);
             }
             ("Limited", _) => {
                 assert_eq!(
@@ -845,11 +1304,12 @@ fn the_real_relaunch_decisions_conform_to_the_model() {
             }
             ("PersonRuns", _) => {
                 running = true;
-                let _ = r.running();
+                let _ = r.running(now);
             }
             ("Healthy", _) => {
                 now += HEALTHY;
                 r.forgive(now);
+                base = 0;
             }
             ("Stutter", step) => {
                 assert_eq!(r.attempted(&outcome(step), now), Say::Nothing);
@@ -860,7 +1320,7 @@ fn the_real_relaunch_decisions_conform_to_the_model() {
             action == "Stutter" || model.fire(action, &mut expect),
             "{action} disabled at {expect:?}"
         );
-        let seen = project(&r, running);
+        let seen = project(&r, running, base);
         for inv in &model.invariants {
             assert!(
                 model.check_invariant(inv.name, &seen),
@@ -876,13 +1336,31 @@ fn the_real_relaunch_decisions_conform_to_the_model() {
                 assert!(!model.action_enabled(off, &expect), "{off} after {action}");
             }
         }
+        // Another agent run in the tab while a relaunch keeps failing is a
+        // person back, then their agent: its word ends (or what said it
+        // beside a word that asks for a conversation).
+        if (expect["failing"] == 1 || expect["said"] == 1) && expect["restarted"] == 0 {
+            let mut probe = r.clone();
+            assert_eq!(probe.running(now), Say::Clear, "after {action}");
+            let mut runs = expect.clone();
+            assert!(model.fire("PersonReturns", &mut runs) && model.fire("PersonRuns", &mut runs));
+            assert_eq!(
+                project(&probe, true, base),
+                runs,
+                "another agent runs while it keeps failing"
+            );
+        }
         if expect["restarted"] == 1 && expect["pending"] == 1 {
             for word in ["ended:one-shot", "ended:graceful-exit", "wait:not-exited"] {
                 let mut probe = r.clone();
                 assert_eq!(probe.attempted(&outcome(word), now), Say::Cannot, "{word}");
                 let mut cannot = expect.clone();
                 assert!(model.fire("Cannot", &mut cannot));
-                assert_eq!(project(&probe, running), cannot, "{word}: a said Cannot");
+                assert_eq!(
+                    project(&probe, running, base),
+                    cannot,
+                    "{word}: a said Cannot"
+                );
             }
         }
     }
@@ -894,6 +1372,35 @@ fn the_real_relaunch_decisions_conform_to_the_model() {
             a.name
         );
     }
+    // LC-6 and LC-4 of ATERM-KI-1015-1, on the real type: a relaunch that
+    // is no crash's leaves the back-off where it was (the buggy host's
+    // `Land` climbed it); another agent leaves a word that asks for a
+    // conversation (its `PersonRuns` cleared it).
+    let mut own = Relaunches::default();
+    for _ in 0..3 {
+        let _ = own.exited_as(OnExit::Relaunch, false, now);
+        let _ = own.attempted(&outcome("wait:shell-prompt"), now);
+        let _ = own.attempted(&outcome("adopted"), now);
+    }
+    assert_eq!(own.exited(OnExit::Relaunch, now), Ok(BACKOFF[0]));
+    let mut asking = Relaunches::default();
+    let _ = asking.exited(OnExit::Relaunch, now);
+    assert_eq!(asking.attempted(&outcome("refused:home"), now), Say::Cannot);
+    asking.ask(CONVERSATION);
+    assert_eq!(
+        asking.running(now),
+        Say::Nothing,
+        "another agent: it stands"
+    );
+    assert_eq!(
+        asking.conversation_runs("0badf00d-9999-2222-3333-444455556666"),
+        Say::Nothing
+    );
+    assert_eq!(asking.conversation_runs(CONVERSATION), Say::Clear);
+    let buggy_host = aterm_spec::interp::with_buggy(&model, 1);
+    let mut counted = buggy_host.init_state();
+    assert!(buggy_host.fire("Asked", &mut counted) && buggy_host.fire("Land", &mut counted));
+    assert!(!buggy_host.check_invariant("NoCrashNoStreak", &counted));
     // Negative controls: the buggy host's defects, each caught.
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
     let mut after_person = buggy.init_state();
@@ -912,47 +1419,119 @@ fn the_real_relaunch_decisions_conform_to_the_model() {
         assert!(buggy.fire("Restarted", &mut own) && buggy.fire(off, &mut own));
         assert!(!buggy.check_invariant("RestartCarried", &own), "{off}");
     }
+    // The host of the harness landing's eighth merge (`SaidOutlives = 1`): a failing
+    // said beside a word that asks for a conversation outlived its trying.
+    let beside = aterm_spec::interp::with_consts(&model, &[("SaidOutlives", 1)]);
+    for end in ["Ended", "PersonReturns"] {
+        let mut b = beside.init_state();
+        for a in [
+            "Crash",
+            "Cannot",
+            "Ask",
+            "PersonRuns",
+            "Crash",
+            "Miss",
+            "Miss",
+            "Miss",
+            end,
+        ] {
+            assert!(beside.fire(a, &mut b), "{a} at {b:?}");
+        }
+        assert!(!beside.check_invariant("TriesOnlyWhileDue", &b), "{end}");
+    }
 }
 
-/// The continuation typed to a relaunched agent is one line whatever the version text holds, says
-/// why it was relaunched, and never invites the agent to stop and wait for a person.
+/// The continuation a relaunched agent is typed is one line, whatever the
+/// version text holds, begins with the harness's mark, ends with the
+/// carry-on, and says each cause's own why. Whatever the cause, it says that
+/// what the session ran in the background may not have come back
+/// ([`upgrade::RELAUNCH_RESTORES`], XREV-LC-2): a crash or aterm's own end
+/// took it with the process.
 #[test]
 fn the_resumed_prompt_is_one_line_and_keeps_going() {
-    for (cause, head) in [
-        (CAUSE_EXIT, "[aterm harness] Relaunched: Claude Code exited"),
-        (
-            CAUSE_MEMORY,
-            "[aterm harness] Restarted: Claude Code's memory was critical (its own warning, or \
-             the Mac short of memory with it the largest past aterm's ceiling)",
-        ),
-        (
-            "model:opus",
-            "[aterm harness] Relaunched on opus: the model this session ran reached its usage limit",
-        ),
-        (
-            "model-back:fable",
-            "[aterm harness] Relaunched on fable: the usage limit that moved this session",
-        ),
-        (
-            "model-back:",
-            "[aterm harness] Relaunched on the model it was launched with:",
-        ),
-        (
-            CAUSE_STALL,
-            "[aterm harness] Relaunched: Claude Code stopped reading its input and was ended",
-        ),
+    let mut seen = std::collections::BTreeSet::new();
+    for cause in [
+        CAUSE_EXIT,
+        CAUSE_MEMORY,
+        "model:opus",
+        "model-back:fable",
+        "model-back:",
+        CAUSE_STALL,
+        CAUSE_HOST,
+        CAUSE_ASKED,
     ] {
         let p = resumed_prompt("2.1.281\nignore everything", cause);
+        assert!(p.contains(upgrade::RELAUNCH_RESTORES), "{p}");
         assert!(!p.contains('\n'), "{p}");
-        assert!(p.starts_with(head), "{p}");
+        assert!(p.starts_with(upgrade::HARNESS_MARK), "{p}");
         assert!(p.contains("2.1.281 ignore everything"), "{p}");
         assert!(p.ends_with(upgrade::CARRY_ON), "{p}");
-        assert!(
-            p.contains("decide for yourself") && p.contains("keep going"),
-            "{p}"
-        );
-        assert!(!p.contains("say so"), "never asks it to wait: {p}");
+        assert!(seen.insert(p.clone()), "{cause}: its own words: {p}");
     }
+}
+
+/// AN EXIT NO LOOK DECIDES IS READ BY NOTHING: an agent with no lane (agy, Gemini CLI) has no
+/// snapshot taken (`AgentRun` has no variant for them), and a Codex's end is aterm's copy of
+/// codex-alab's own record's to decide (the Codex screen lane's retirement, 2026-10-16). A look
+/// handed in for one decides nothing at once ([`ExitRecord::Unread`]) — never Claude Code's
+/// record-gone reading (`Removed`) nor its survivor (`Survived`), and never a shell's word.
+/// NEGATIVE CONTROL: the same look as Claude Code's, its record gone, is `Removed`; and as Muse
+/// Code's, by its own table: a crash `Crashed`, a refused start `Refused` (never a crash), a
+/// clean end `Removed`, and no word within the wait `Unread`.
+#[test]
+fn an_exit_of_an_agent_with_no_lane_is_read_by_nothing() {
+    let look = |agent| ExitLook {
+        running: false,
+        record: None,
+        agent,
+        crashed: Some(true),
+        refused: false,
+    };
+    for agent in [
+        upgrade::Agent::Agy,
+        upgrade::Agent::Gemini,
+        upgrade::Agent::Codex,
+    ] {
+        let mut looks = 0;
+        let left = exit_record(
+            || {
+                looks += 1;
+                Some(look(agent))
+            },
+            |_| true,
+        );
+        assert_eq!((left, looks), (ExitRecord::Unread, 1), "{agent:?}");
+    }
+    assert_eq!(
+        exit_record(|| Some(look(upgrade::Agent::Claude)), |_| true),
+        ExitRecord::Removed
+    );
+    let muse = |crashed: Option<bool>, refused: bool| ExitLook {
+        crashed,
+        refused,
+        ..look(upgrade::Agent::Muse)
+    };
+    for (crashed, refused, want) in [
+        (Some(true), false, ExitRecord::Crashed),
+        (Some(false), true, ExitRecord::Refused),
+        (Some(false), false, ExitRecord::Removed),
+    ] {
+        assert_eq!(exit_record(|| Some(muse(crashed, refused)), |_| true), want);
+    }
+    let mut looks = 0;
+    let left = exit_record(
+        || {
+            looks += 1;
+            Some(muse(None, false))
+        },
+        |_| true,
+    );
+    assert_eq!(left, ExitRecord::Unread);
+    assert!(looks > 1, "waited for the shell's word: {looks}");
+    assert!(
+        !ExitRecord::Refused.crashed(),
+        "a refused start is no crash"
+    );
 }
 
 /// The look at an exit, over scripted looks and no clock: a record that survives the settle is a
@@ -980,6 +1559,7 @@ fn the_look_at_an_exit_waits_out_its_own_removal_and_no_longer() {
             record: record.then(|| sf.clone()),
             agent: upgrade::Agent::Claude,
             crashed: None,
+            refused: false,
         })
     };
     let steps =
@@ -1040,6 +1620,7 @@ fn the_look_at_an_exit_waits_out_its_own_removal_and_no_longer() {
                 record: Some(sf.clone()),
                 agent: upgrade::Agent::Claude,
                 crashed: None,
+                refused: false,
             })
         },
         |_| {
@@ -1059,6 +1640,7 @@ fn the_look_at_an_exit_waits_out_its_own_removal_and_no_longer() {
                 record: Some(sf.clone()),
                 agent: upgrade::Agent::Claude,
                 crashed: None,
+                refused: false,
             })
         },
         |_| true,
@@ -1259,20 +1841,21 @@ fn a_pill_names_its_mode_flag() {
     assert_eq!(mode_flag(Mode::Plan), "plan");
 }
 
-/// A Codex look is decided on its shell's word: a crash is
-/// [`ExitRecord::Crashed`], its own exit or someone's signal
+/// A Muse Code look is decided on its shell's word, by its own table: a crash
+/// is [`ExitRecord::Crashed`], its own exit or someone's signal
 /// [`ExitRecord::Removed`], at once; with no word yet it is looked at again up
 /// to [`EXIT_GONE`] (the shell writes it as it takes the terminal back), then
 /// left [`ExitRecord::Unread`], never read as a removal. Negative control: the
 /// same silence from a Claude Code look (no record) is a removal at once.
 #[test]
-fn a_codex_exit_is_decided_on_its_shells_word() {
+fn a_muse_exit_is_decided_on_its_shells_word() {
     let look = |crashed: Option<bool>| {
         Some(ExitLook {
             running: false,
             record: None,
-            agent: upgrade::Agent::Codex,
+            agent: upgrade::Agent::Muse,
             crashed,
+            refused: false,
         })
     };
     assert_eq!(
@@ -1312,43 +1895,10 @@ fn a_codex_exit_is_decided_on_its_shells_word() {
             record: None,
             agent: upgrade::Agent::Claude,
             crashed: None,
+            refused: false,
         })
     };
     assert_eq!(exit_record(claude, |_| true), ExitRecord::Removed);
-}
-
-/// A quiet restart's outcome names what is known, never "unconfirmed" (nothing
-/// is asked of the resumed session, so no answer names the model after): the
-/// build, that it was idle and nothing was typed, the model it ran before and,
-/// under the model rule, the model the relaunch asked for. Negative control:
-/// the ask flow's line, where a confirm step runs, still says `unconfirmed`
-/// before its answer.
-#[test]
-fn a_quiet_restarts_outcome_names_the_model_it_ran_never_unconfirmed() {
-    let st = |before: &str, list: &str| St {
-        model_before: before.to_string(),
-        model_list: list.to_string(),
-        ..St::default()
-    };
-    assert_eq!(
-        quiet_outcome(&st("claude-opus-5-5", ""), "2.1.282"),
-        "claude restarted on 2.1.282 · resumed while idle, nothing typed; it ran \
-         claude-opus-5-5 before the restart"
-    );
-    assert_eq!(
-        quiet_outcome(&st("claude-opus-5-5", "claude-opus-5-6"), "2.1.282"),
-        "claude restarted on 2.1.282 · resumed while idle, nothing typed; it ran \
-         claude-opus-5-5 before, and the relaunch asked for claude-opus-5-6"
-    );
-    assert_eq!(
-        quiet_outcome(&st("", ""), "2.1.282"),
-        "claude restarted on 2.1.282 · resumed while idle, nothing typed"
-    );
-    for (before, list) in [("claude-opus-5-5", ""), ("", "claude-opus-5-6"), ("", "")] {
-        let line = quiet_outcome(&st(before, list), "2.1.282");
-        assert!(!line.contains("unconfirmed"), "{line}");
-    }
-    assert!(outcome_line(&st("claude-opus-5-5", ""), "2.1.282", None).contains("unconfirmed"));
 }
 
 // ------------------------------------------------------------------------
@@ -1453,19 +2003,25 @@ fn the_relaunch_line_carries_the_claude_home_its_agent_ran_under() {
     let argv = ["claude", "--verbose"];
     let home = r"CLAUDE_CONFIG_DIR='/tmp/lab home/.claude'";
     assert_eq!(
-        required_env(Some(HOME), None),
+        required_env(Some(HOME), None, None),
         [(accounts::HOME_ENV, HOME)],
         "the home alone"
     );
     for dialect in [Dialect::Zsh, Dialect::Bash] {
         assert_eq!(
-            login_line(dialect, None, &argv, &required_env(Some(HOME), None)).as_deref(),
+            login_line(dialect, None, &argv, &required_env(Some(HOME), None, None)).as_deref(),
             Ok(format!(" {home} {survey} {tail}").as_str()),
             "{dialect:?}"
         );
     }
     assert_eq!(
-        login_line(Dialect::Fish, None, &argv, &required_env(Some(HOME), None)).as_deref(),
+        login_line(
+            Dialect::Fish,
+            None,
+            &argv,
+            &required_env(Some(HOME), None, None)
+        )
+        .as_deref(),
         Ok(format!(" env {home} {survey} {tail}").as_str())
     );
     // The home first, then the login: both carried.
@@ -1475,7 +2031,7 @@ fn the_relaunch_line_carries_the_claude_home_its_agent_ran_under() {
             Dialect::Zsh,
             None,
             &argv,
-            &required_env(Some(HOME), Some(LOGIN_DIR))
+            &required_env(Some(HOME), None, Some(LOGIN_DIR))
         )
         .as_deref(),
         Ok(format!(" {home} {posix} {survey} {tail}").as_str())
@@ -1483,13 +2039,43 @@ fn the_relaunch_line_carries_the_claude_home_its_agent_ran_under() {
     // Negative control: no home gives the login's line, and with neither the line as it always
     // was.
     assert_eq!(
-        required_env(None, Some(LOGIN_DIR)),
+        required_env(None, None, Some(LOGIN_DIR)),
         login_env(Some(LOGIN_DIR))
     );
-    assert!(required_env(None, None).is_empty());
+    assert!(required_env(None, None, None).is_empty());
     assert_eq!(
-        login_line(Dialect::Zsh, None, &argv, &required_env(None, None)).as_deref(),
+        login_line(Dialect::Zsh, None, &argv, &required_env(None, None, None)).as_deref(),
         Ok(format!(" {survey} {tail}").as_str())
+    );
+    // THE `HOME` AN AGENT WITH NO CLAUDE_CONFIG_DIR RAN UNDER, where it is
+    // not the user's (LC-4): carried as `HOME`, after the Claude home and
+    // before the login, quoted as every value is.
+    assert_eq!(
+        required_env(None, Some("/other"), Some(LOGIN_DIR)),
+        [("HOME", "/other")]
+            .into_iter()
+            .chain(login_env(Some(LOGIN_DIR)))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        login_line(
+            Dialect::Zsh,
+            None,
+            &argv,
+            &required_env(None, Some("/other"), None)
+        )
+        .as_deref(),
+        Ok(format!(" HOME=/other {survey} {tail}").as_str())
+    );
+    assert_eq!(
+        login_line(
+            Dialect::Zsh,
+            None,
+            &argv,
+            &required_env(None, Some("/tmp/lab home"), None)
+        )
+        .as_deref(),
+        Ok(format!(" HOME='/tmp/lab home' {survey} {tail}").as_str())
     );
     // Whether an exit is promised a relaunch asks the same line, home and all.
     let snap = |home: Option<String>| Snapshot {
@@ -1503,69 +2089,31 @@ fn the_relaunch_line_carries_the_claude_home_its_agent_ran_under() {
         session: Some(LOGIN_ID.to_string()),
         cwd: "/w".to_string(),
         version: Some("2.1.295".to_string()),
-        codex: None,
+        run: crate::harness::relaunch::AgentRun::Claude,
         dialect: Some(Dialect::Zsh),
         login: None,
         home,
         claude_dir: None,
     };
-    assert!(resumes_on_exit(&snap(None)));
-    assert!(resumes_on_exit(&snap(Some(HOME.to_string()))));
-    assert!(!resumes_on_exit(&snap(Some(format!(
-        "/tmp/{}",
-        "d".repeat(5000)
-    )))));
+    assert!(resumes_on_exit(Path::new("/Users//someone"), &snap(None)));
+    assert!(resumes_on_exit(
+        Path::new("/Users//someone"),
+        &snap(Some(HOME.to_string()))
+    ));
+    assert!(!resumes_on_exit(
+        Path::new("/Users//someone"),
+        &snap(Some(format!("/tmp/{}", "d".repeat(5000))))
+    ));
     // A control character in the value refuses the line, never a cut value.
     assert_eq!(
         login_line(
             Dialect::Zsh,
             None,
             &argv,
-            &required_env(Some("/tmp/a\nb"), None)
+            &required_env(Some("/tmp/a\nb"), None, None)
         ),
         Err("line".to_string())
     );
-}
-
-/// The survey switch is dropped before the login is, and the login never: a line that fits only
-/// without the switch is typed with the login alone, and one that cannot hold the login is refused
-/// (`refused:line`), never typed without it. Negative control: the same two launches with nothing
-/// required are the line and its fallback as they always were, the second typed with no
-/// environment at all.
-#[test]
-fn a_line_that_cannot_hold_the_login_is_refused_never_typed_without_it() {
-    let login = login_env(Some(LOGIN_DIR));
-    // A launch whose `--model` value pads the line to a chosen length.
-    let padded = |pad: usize| vec!["claude".to_string(), "--model".to_string(), "m".repeat(pad)];
-    let with = |pad: usize, required: &[(&str, &str)]| {
-        let argv = padded(pad);
-        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
-        login_line(Dialect::Zsh, None, &argv, required)
-    };
-    let has = |line: &str, name: &str| line.contains(&format!("{name}="));
-    let (login_var, survey_var) = (accounts::LOGIN_ENV, SURVEY_SWITCH_VAR);
-    // The longest launch whose line still holds the login and the switch, found against this
-    // kernel's own bound.
-    let both = (1..5000)
-        .take_while(|&pad| with(pad, &login).is_ok_and(|l| has(&l, survey_var)))
-        .last()
-        .expect("a short line holds both");
-    assert!(with(both, &login).is_ok_and(|l| has(&l, login_var) && has(&l, survey_var)));
-    // One byte longer: the switch goes, the login stays.
-    let line = with(both + 1, &login).expect("the login alone still fits");
-    assert!(has(&line, login_var) && !has(&line, survey_var), "{line}");
-    // Longer still, the login no longer fits: refused, not typed without it.
-    let lost = (both + 1..5000)
-        .find(|&pad| with(pad, &login).is_err())
-        .expect("a line too long for the login");
-    assert_eq!(with(lost, &login), Err("line".to_string()));
-    // Negative control: with nothing required that very launch is typed, as it always was, which
-    // is exactly what must not happen to a login.
-    let plain = with(lost, &[]).expect("the launch itself fits");
-    assert!(!has(&plain, login_var), "{plain}");
-    // …and the launch whose switch was dropped is typed with no environment.
-    let line = with(lost + 60, &[]).expect("fits with no environment");
-    assert!(!has(&line, survey_var), "{line}");
 }
 
 /// Whether an exit would be relaunched is asked of the line the relaunch would really type, with
@@ -1584,19 +2132,25 @@ fn an_exit_is_promised_a_relaunch_only_where_the_line_can_hold_its_login() {
         session: Some(LOGIN_ID.to_string()),
         cwd: "/w".to_string(),
         version: Some("2.1.286".to_string()),
-        codex: None,
+        run: crate::harness::relaunch::AgentRun::Claude,
         dialect: Some(Dialect::Zsh),
         login,
         home: None,
         claude_dir: None,
     };
-    assert!(resumes_on_exit(&snap(None)));
-    assert!(resumes_on_exit(&snap(Some(String::new()))));
-    assert!(resumes_on_exit(&snap(Some(LOGIN_DIR.to_string()))));
-    assert!(!resumes_on_exit(&snap(Some(format!(
-        "/tmp/{}",
-        "d".repeat(5000)
-    )))));
+    assert!(resumes_on_exit(Path::new("/Users//someone"), &snap(None)));
+    assert!(resumes_on_exit(
+        Path::new("/Users//someone"),
+        &snap(Some(String::new()))
+    ));
+    assert!(resumes_on_exit(
+        Path::new("/Users//someone"),
+        &snap(Some(LOGIN_DIR.to_string()))
+    ));
+    assert!(!resumes_on_exit(
+        Path::new("/Users//someone"),
+        &snap(Some(format!("/tmp/{}", "d".repeat(5000))))
+    ));
 }
 
 /// The roster names the login, and the process's own environment says which account it runs under:
@@ -1627,7 +2181,7 @@ fn a_label_is_a_login_only_through_the_roster() {
         session: None,
         cwd: String::new(),
         version: None,
-        codex: None,
+        run: crate::harness::relaunch::AgentRun::Claude,
         dialect: None,
         login: login.map(str::to_string),
         home: None,
@@ -1841,7 +2395,6 @@ fn an_account_move_over_another_restart_in_flight_is_not_tried() {
         to: label.to_string(),
         at: crate::supervise::policy::turn_end::AccountAt::Wall,
     };
-    assert_eq!(IN_FLIGHT_OTHER, "wait:restart-in-flight");
     let word = |why: &Restart, cause: &str, step: &str| carried_word(why, cause, step.to_string());
     for cause in [
         "",
@@ -1977,6 +2530,579 @@ fn a_cold_relaunch_carries_the_proven_active_account_and_nothing_else() {
         None,
         "a Claude home that is not the default"
     );
+}
+
+/// WHETHER THE AGENT A RELAUNCH ADOPTED IS GONE, by the conversation's
+/// record (the residual review's R5): in flight, with the adopted process
+/// on it, `Some(true)` for one that is no process now (a reaped child),
+/// `Some(false)` for one that lives (this test's own). NEGATIVE CONTROLS,
+/// `None`: none adopted (`relaunched_pid` 0), a record not in flight, no
+/// record — and ANOTHER TAB'S (F1-R9-G6): a record in flight the previous
+/// aterm left in the tab a cold restore's layout named, its adopted pid one
+/// that lives now (another process's, the pid reused), was read as the
+/// reopened tab's agent holding it, and a restored step that panicked there
+/// was over unsaid with nothing relaunched.
+#[cfg(unix)]
+#[test]
+fn whether_the_adopted_agent_is_gone_is_the_records_to_say() {
+    const ID: &str = "0badf00d-1111-2222-3333-777788889999";
+    let dir = crate::supervise::ScratchDir::new("relaunch", "adopted-gone");
+    let o = Opts {
+        home: dir.join("home"),
+        state: dir.join("state"),
+        sock: None,
+        only_sid: Some("s-restored".to_string()),
+        dry_run: false,
+        human_grace_s: 0,
+        hand_back: true,
+        background: false,
+        aterm_state: None,
+        ask: false,
+        several_logins: false,
+        instances: super::super::upgrade_drive::Instances::Listed(Vec::new()),
+        usage_tap: None,
+        agents_off: Vec::new(),
+        land: false,
+        timings: crate::harness::Timings::FAST,
+    };
+    std::fs::create_dir_all(state_dir(&o)).expect("state");
+    let reaped = {
+        let mut child = aterm_uds::spawnfd::command("true").spawn().expect("spawn");
+        let pid = child.id();
+        child.wait().expect("reap");
+        pid
+    };
+    let ours = std::process::id();
+    let gone_in = |tab: &str, phase: upgrade::Phase, pid: u32| {
+        save(
+            &o,
+            ID,
+            &St {
+                phase,
+                cause: CAUSE_HOST.to_string(),
+                tab: tab.to_string(),
+                relaunched_pid: pid,
+                ..St::default()
+            },
+        );
+        adopted_gone(&o, "s-restored", ID)
+    };
+    let gone = |phase: upgrade::Phase, pid: u32| gone_in("s-restored", phase, pid);
+    let flight = || upgrade::Phase::Relaunched {
+        at_s: 1_791_477_331,
+    };
+    assert_eq!(
+        gone(flight(), reaped),
+        Some(true),
+        "the adopted agent is gone"
+    );
+    assert_eq!(gone(flight(), ours), Some(false), "the adopted agent lives");
+    // NEGATIVE CONTROLS.
+    assert_eq!(gone(flight(), 0), None, "none adopted");
+    assert_eq!(gone(upgrade::Phase::Done, reaped), None, "not in flight");
+    assert_eq!(
+        gone_in("s-before-aterm-ended", flight(), ours),
+        None,
+        "another tab's record"
+    );
+    assert_eq!(
+        adopted_gone(&o, "s-restored", "0badf00d-0000-0000-0000-000000000000"),
+        None
+    );
+}
+
+/// A RELAUNCH-ONLY LANE'S WORKER CARRIES ITS OWN AGENT'S RECORD ALONE
+/// ([`owed_of`], [`resume_as`]'s `only`; the review of the Muse Code lane's
+/// rehome, 2026-10-17): a codex-alab's relaunch left owed in the tab is the
+/// sweep's (`lanes::sweep_carries_relaunch`), so a Muse Code worker's host
+/// neither parks for it nor carries it — `current`, the record still owed as
+/// it lies. NEGATIVE CONTROLS: asked for any agent's (Claude Code's worker,
+/// as on main) or for Codex's, it is owed; a Muse Code record in the same tab
+/// is the Muse worker's; another tab owes nothing.
+#[test]
+fn a_relaunch_only_lanes_worker_is_owed_its_own_agents_record_alone() {
+    const CODEX: &str = "019a0c3e-7d1f-7b52-9e41-5a6b7c8d9e0f";
+    const MUSE: &str = "01a148f8-9301-7752-96db-fef456f88074";
+    let dir = crate::supervise::ScratchDir::new("relaunch", "owed-of");
+    let o = Opts {
+        home: dir.join("home"),
+        state: dir.join("state"),
+        sock: None,
+        only_sid: Some("s-owed".to_string()),
+        dry_run: false,
+        human_grace_s: 0,
+        hand_back: true,
+        background: false,
+        aterm_state: None,
+        ask: false,
+        several_logins: false,
+        instances: super::super::upgrade_drive::Instances::Listed(Vec::new()),
+        usage_tap: None,
+        agents_off: Vec::new(),
+        land: false,
+        timings: crate::harness::Timings::FAST,
+    };
+    std::fs::create_dir_all(state_dir(&o)).expect("state");
+    let codex = St {
+        phase: upgrade::Phase::Relaunched { at_s: now_s() },
+        tab: "s-owed".to_string(),
+        agent: upgrade::Agent::Codex,
+        ..St::default()
+    };
+    save(&o, CODEX, &codex);
+    assert!(
+        !owed_of(&o, Some(upgrade::Agent::Muse)),
+        "the sweep's: not the Muse worker's"
+    );
+    assert_eq!(
+        resume_as(&o, false, Some(upgrade::Agent::Muse)).step,
+        "current",
+        "nothing carried for the Muse worker"
+    );
+    assert_eq!(
+        load(&o, CODEX).map(|st| st.phase),
+        Some(codex.phase.clone()),
+        "its record as it lies"
+    );
+    // NEGATIVE CONTROLS.
+    assert!(owed_of(&o, None), "any agent's: owed");
+    assert!(owed(&o), "any agent's: owed");
+    assert!(owed_of(&o, Some(upgrade::Agent::Codex)), "its own agent's");
+    let muse = St {
+        agent: upgrade::Agent::Muse,
+        ..codex.clone()
+    };
+    save(&o, MUSE, &muse);
+    assert!(owed_of(&o, Some(upgrade::Agent::Muse)), "its own agent's");
+    let other = Opts {
+        only_sid: Some("s-other".to_string()),
+        ..o.clone()
+    };
+    assert!(!owed_of(&other, None), "another tab owes nothing");
+}
+
+/// A LIMIT ROW THE HARNESS MOVED THE CONVERSATION OFF IS NO STANDING LIMIT
+/// (LIM-1; owner decision 3, the accounts design §6): the supervisor's loop
+/// reads the row the agent's transcript stands at as the wall where the
+/// screen draws none, and a move's carry-on must not be held behind the
+/// bucket or the account it left — on a cold restore too, whose new tab
+/// remembers nothing but the conversation's record. The measured weekly
+/// row (2.1.294, written at 1791477331), its record's last restart a move
+/// whose relaunch line was typed after it: an account move, a bucket's
+/// fallback onto Opus (the row then a `seven_day_sonnet` one), the way back
+/// — no limit; and so is a record of another cause that keeps a move made
+/// after the row (`St::moved_at`, the one writer's carry: driven through a
+/// real restore and a real crash in `upgrade_drive`'s
+/// `a_move_outlives_the_relaunch_records_written_over_it`). NEGATIVE
+/// CONTROLS, the limit stands: the record a relaunch on exit's, a crash's
+/// restore's or the upgrade's, with no move kept; a move made BEFORE the row
+/// (the new account's, or the fallback model's, own limit), its own or kept;
+/// no record; a conversation the snapshot names none of.
+///
+/// ONLY FOR THE AGENT UNDER THE MOVE (the residual review's R4): a record
+/// that names the move's target — the login an account move required, the
+/// model a fallback left — hides the row only from a live agent that runs
+/// that target. One back under the login it left (none read included) or
+/// on the model the fallback left stands at the limit, own or kept; one
+/// under the target does not. A record naming no target stays as before.
+#[test]
+fn a_limit_row_a_move_left_is_no_standing_limit() {
+    const ID: &str = "0badf00d-1111-2222-3333-444455556666";
+    const WRITTEN: u64 = 1_791_477_331;
+    let tail = include_str!("../supervise/fixtures/claude-2.1.294-transcript-weekly-limit.jsonl");
+    let sonnet = tail
+        .replace(
+            "You've hit your weekly limit · resets Oct 11 at 9:35am (America/Los_Angeles)",
+            "You've hit your Sonnet limit · resets Oct 11 at 9:35am (America/Los_Angeles)",
+        )
+        .replace(
+            "\"rateLimitType\":\"seven_day\"",
+            "\"rateLimitType\":\"seven_day_sonnet\"",
+        );
+    let dir = crate::supervise::ScratchDir::new("relaunch", "standing-limit");
+    let o = Opts {
+        home: dir.join("home"),
+        state: dir.join("state"),
+        sock: None,
+        only_sid: Some("s-restored".to_string()),
+        dry_run: false,
+        human_grace_s: 0,
+        hand_back: true,
+        background: false,
+        aterm_state: None,
+        ask: false,
+        several_logins: false,
+        usage_tap: None,
+        instances: super::super::upgrade_drive::Instances::Listed(Vec::new()),
+        agents_off: Vec::new(),
+        land: false,
+        timings: crate::harness::Timings::FAST,
+    };
+    std::fs::create_dir_all(state_dir(&o)).expect("state");
+    // The agent under the move: a fallback's `--model opus` on its line.
+    let snap = Snapshot {
+        tab: "s-restored".to_string(),
+        pid: 4242,
+        start: "Thu Oct 8 18:04:23 2026".to_string(),
+        shell: 4241,
+        program: PathBuf::from("/opt/claude"),
+        argv: words(&["/opt/claude", "--model", "opus"]),
+        session: Some(ID.to_string()),
+        cwd: "/w".to_string(),
+        version: Some("2.1.294".to_string()),
+        run: crate::harness::relaunch::AgentRun::Claude,
+        dialect: Some(upgrade::Dialect::Zsh),
+        login: None,
+        home: None,
+        claude_dir: None,
+        stored_login: false,
+    };
+    let standing = |cause: Option<&str>, relaunched_at: u64, tail: &str| {
+        let _ = std::fs::remove_file(state_dir(&o).join(format!("{ID}.json")));
+        if let Some(cause) = cause {
+            let st = St {
+                cause: cause.to_string(),
+                // Filed for the tab the restore replaced: the conversation's.
+                tab: "s-crashed".to_string(),
+                relaunched_at,
+                ..St::default()
+            };
+            save(&o, ID, &st);
+        }
+        standing_limit(&o, &snap, tail)
+    };
+    let after = WRITTEN + 600;
+    let weekly = standing(None, 0, tail).expect("the weekly row stands");
+    assert_eq!(
+        (weekly.until, weekly.window.as_deref(), weekly.at),
+        (Some(1_791_736_527), Some("seven_day"), Some(WRITTEN))
+    );
+    assert!(weekly.text.starts_with("You've hit your weekly limit"));
+    assert_eq!(
+        weekly.row.as_deref(),
+        Some("a65a7337-1491-48c9-983b-5dd498b525a0")
+    );
+    for (cause, tail) in [
+        ("account:work-2", tail),
+        ("model:opus", sonnet.as_str()),
+        ("model-back:claude-fable-5-1", tail),
+    ] {
+        assert_eq!(standing(Some(cause), after, tail), None, "{cause}");
+        assert_eq!(
+            standing(Some(cause), 0, tail),
+            None,
+            "{cause}: an older record with no instant"
+        );
+    }
+    // NEGATIVE CONTROLS: the limit stands.
+    for cause in [CAUSE_EXIT, CAUSE_HOST, CAUSE_STALL, CAUSE_MEMORY, ""] {
+        assert!(standing(Some(cause), after, tail).is_some(), "{cause:?}");
+    }
+    for cause in ["account:work-2", "model:opus"] {
+        assert!(
+            standing(Some(cause), WRITTEN - 600, tail).is_some(),
+            "{cause}: the row was written after the move"
+        );
+    }
+    // A record of another cause written over the move keeps it
+    // (`St::moved_at`): the move still left the row — and a row written
+    // after the kept move still stands.
+    let kept = |moved_at: u64| {
+        let _ = std::fs::remove_file(state_dir(&o).join(format!("{ID}.json")));
+        save(
+            &o,
+            ID,
+            &St {
+                cause: CAUSE_HOST.to_string(),
+                tab: "s-restored".to_string(),
+                relaunched_at: after + 60,
+                moved_at,
+                ..St::default()
+            },
+        );
+        standing_limit(&o, &snap, tail)
+    };
+    assert_eq!(kept(after), None, "the move a restore's record keeps");
+    assert!(kept(WRITTEN - 600).is_some(), "a row after the kept move");
+    assert!(kept(0).is_some(), "no move kept");
+    let unnamed = Snapshot {
+        session: None,
+        ..snap.clone()
+    };
+    save(
+        &o,
+        ID,
+        &St {
+            cause: "account:work-2".to_string(),
+            relaunched_at: after,
+            ..St::default()
+        },
+    );
+    assert!(standing_limit(&o, &unnamed, tail).is_some());
+    // THE MOVE'S TARGET against the live agent (R4).
+    let under = |st: St, live: &Snapshot, tail: &str| {
+        let _ = std::fs::remove_file(state_dir(&o).join(format!("{ID}.json")));
+        save(&o, ID, &st);
+        standing_limit(&o, live, tail)
+    };
+    let live = |login: Option<&str>, argv: &[&str]| Snapshot {
+        login: login.map(str::to_owned),
+        argv: words(argv),
+        ..snap.clone()
+    };
+    let bare = ["/opt/claude"];
+    let account = St {
+        cause: "account:work-2".to_string(),
+        tab: "s-crashed".to_string(),
+        relaunched_at: after,
+        login: Some("/accts/work-2".to_string()),
+        ..St::default()
+    };
+    assert!(
+        under(account.clone(), &live(None, &bare), tail).is_some(),
+        "an unread login: the limit stands"
+    );
+    assert!(
+        under(account.clone(), &live(Some("/accts/work-1"), &bare), tail).is_some(),
+        "back under the login the move left"
+    );
+    assert_eq!(
+        under(account, &live(Some("/accts/work-2"), &bare), tail),
+        None,
+        "under the login moved to"
+    );
+    let kept = St {
+        cause: CAUSE_HOST.to_string(),
+        tab: "s-restored".to_string(),
+        relaunched_at: after + 60,
+        moved_at: after,
+        moved_login: Some("work-2".to_string()),
+        ..St::default()
+    };
+    assert!(under(kept.clone(), &live(None, &bare), tail).is_some());
+    assert_eq!(under(kept, &live(Some("work-2"), &bare), tail), None);
+    let model = St {
+        cause: "model:opus".to_string(),
+        tab: "s-crashed".to_string(),
+        relaunched_at: after,
+        fallback_from: Some("claude-sonnet-x".to_string()),
+        ..St::default()
+    };
+    assert!(
+        under(
+            model.clone(),
+            &live(None, &["/opt/claude", "--model", "claude-sonnet-x"]),
+            &sonnet
+        )
+        .is_some(),
+        "back on the model the fallback left"
+    );
+    assert!(
+        under(
+            model.clone(),
+            &live(None, &["/opt/claude", "--model=claude-sonnet-x"]),
+            &sonnet
+        )
+        .is_some(),
+        "its `--model=` spelling"
+    );
+    assert_eq!(
+        under(
+            model,
+            &live(None, &["/opt/claude", "--model", "opus"]),
+            &sonnet
+        ),
+        None,
+        "under the fallback"
+    );
+    // NEGATIVE CONTROL: a record naming no target is the move, as before.
+    let older = St {
+        cause: "account:work-2".to_string(),
+        tab: "s-crashed".to_string(),
+        relaunched_at: after,
+        ..St::default()
+    };
+    assert_eq!(under(older, &live(None, &bare), tail), None);
+}
+
+/// A MOVE TO THE DEFAULT LOGIN IS MET BY AN UNSET VARIABLE UNDER THE DEFAULT
+/// HOME (the review's RR3-R4-1). `accounts::login_env` names the default
+/// account's login set and empty (`Some("")`), and R4 compared the live
+/// agent's variable with it exactly: an agent on the default login whose
+/// environment leaves the variable unset (a person's `claude -r` in a shell
+/// that sets none) read as not moved, and the old account's limit row, from
+/// before the move, held it until that account reset — up to a week. Unset
+/// under the default home (`CLAUDE_CONFIG_DIR` unset or empty) is the
+/// default login, as set and empty is; each case is read with the move the
+/// record's own (an account cause) and kept by a record written over it
+/// (`St::moved_at`), alike. NEGATIVE CONTROLS, the limit stands: unset under
+/// another home (that home's keychain item, which no move names), another
+/// login named, and an unset or a default variable against a move to
+/// another account's login.
+#[test]
+fn a_move_to_the_default_login_is_met_by_an_unset_variable_under_the_default_home() {
+    const ID: &str = "0badf00d-1111-2222-3333-444455556666";
+    const WRITTEN: u64 = 1_791_477_331;
+    let tail = include_str!("../supervise/fixtures/claude-2.1.294-transcript-weekly-limit.jsonl");
+    let dir = crate::supervise::ScratchDir::new("relaunch", "default-login-move");
+    let o = Opts {
+        home: dir.join("home"),
+        state: dir.join("state"),
+        sock: None,
+        only_sid: Some("s-restored".to_string()),
+        dry_run: false,
+        human_grace_s: 0,
+        hand_back: true,
+        background: false,
+        aterm_state: None,
+        ask: false,
+        several_logins: false,
+        usage_tap: None,
+        instances: super::super::upgrade_drive::Instances::Listed(Vec::new()),
+        agents_off: Vec::new(),
+        land: false,
+        timings: crate::harness::Timings::FAST,
+    };
+    std::fs::create_dir_all(state_dir(&o)).expect("state");
+    let live = |login: Option<&str>, home: Option<&str>| Snapshot {
+        tab: "s-restored".to_string(),
+        pid: 4242,
+        start: "Thu Oct 8 18:04:23 2026".to_string(),
+        shell: 4241,
+        program: PathBuf::from("/opt/claude"),
+        argv: words(&["/opt/claude"]),
+        session: Some(ID.to_string()),
+        cwd: "/w".to_string(),
+        version: Some("2.1.294".to_string()),
+        run: crate::harness::relaunch::AgentRun::Claude,
+        dialect: Some(upgrade::Dialect::Zsh),
+        login: login.map(str::to_owned),
+        home: home.map(str::to_owned),
+        claude_dir: None,
+        stored_login: false,
+    };
+    // Whether the weekly row stands for `live` after a move to `target`.
+    let stands = |target: &str, live: &Snapshot| {
+        let mut read = Vec::new();
+        for st in [
+            St {
+                cause: "account:personal".to_string(),
+                tab: "s-restored".to_string(),
+                relaunched_at: WRITTEN + 600,
+                login: Some(target.to_string()),
+                ..St::default()
+            },
+            St {
+                cause: CAUSE_HOST.to_string(),
+                tab: "s-restored".to_string(),
+                relaunched_at: WRITTEN + 700,
+                moved_at: WRITTEN + 600,
+                moved_login: Some(target.to_string()),
+                ..St::default()
+            },
+        ] {
+            let _ = std::fs::remove_file(state_dir(&o).join(format!("{ID}.json")));
+            save(&o, ID, &st);
+            read.push(standing_limit(&o, live, tail).is_some());
+        }
+        assert_eq!(read[0], read[1], "the move its own and kept read alike");
+        read[0]
+    };
+    assert!(!stands("", &live(Some(""), None)), "the default named");
+    assert!(!stands("", &live(None, None)), "unset, the default home");
+    assert!(
+        !stands("", &live(None, Some(""))),
+        "unset, the home set and empty"
+    );
+    assert!(
+        !stands("", &live(Some(""), Some("/alt"))),
+        "the default named under another home"
+    );
+    assert!(!stands("/accts/work-2", &live(Some("/accts/work-2"), None)));
+    // NEGATIVE CONTROLS: the limit stands.
+    assert!(
+        stands("", &live(None, Some("/alt"))),
+        "CONTROL: unset under another home is that home's login"
+    );
+    assert!(
+        stands("", &live(Some("/accts/work-1"), None)),
+        "CONTROL: another login named"
+    );
+    assert!(
+        stands("/accts/work-2", &live(None, None)),
+        "CONTROL: unset against another account's login"
+    );
+    assert!(
+        stands("/accts/work-2", &live(Some(""), None)),
+        "CONTROL: the default against another account's login"
+    );
+}
+
+/// THE COMMAND A PERSON IS TOLD CARRIES THE HOME ITS RELAUNCH CARRIES
+/// ([`told_command`]; ATERM-KI-1015-1 LC-4): an agent under another `HOME`
+/// is told `HOME=<it> claude --resume <id>`, one under an absolute
+/// `CLAUDE_CONFIG_DIR` that variable, as the relaunch line carries them;
+/// told bare, run at its tab's shell under another home, the line found no
+/// transcript, or met the first-run screen. A relative home a line would
+/// move gets no command at all. CONTROL: an agent under the user's own home
+/// is told exactly the line it always was ([`super::super::resume::command`]),
+/// and a login is never on it.
+#[test]
+fn the_command_a_person_is_told_carries_the_home_its_relaunch_carries() {
+    let user = Path::new("/u/me");
+    let snap = |home: Option<&str>, claude_dir: Option<&str>, cwd: &str| Snapshot {
+        tab: "s-1".to_string(),
+        pid: 4242,
+        start: "Thu Sep 24 01:02:03 2026".to_string(),
+        shell: 4241,
+        program: PathBuf::from("/opt/claude"),
+        argv: words(&["/opt/claude", "--verbose"]),
+        session: Some(LOGIN_ID.to_string()),
+        cwd: cwd.to_string(),
+        version: Some("2.1.300".to_string()),
+        run: crate::harness::relaunch::AgentRun::Claude,
+        dialect: Some(Dialect::Zsh),
+        login: Some(LOGIN_DIR.to_string()),
+        home: home.map(str::to_string),
+        claude_dir: claude_dir.map(PathBuf::from),
+        stored_login: false,
+    };
+    let bare = format!("claude --verbose --resume {LOGIN_ID}");
+    assert_eq!(
+        told_command(user, None, &snap(None, Some("/u/other/.claude"), "/w")),
+        Some(format!("HOME=/u/other {bare}")),
+        "another HOME"
+    );
+    assert_eq!(
+        told_command(user, None, &snap(Some("/abs/.claude"), None, "/w")),
+        Some(format!("CLAUDE_CONFIG_DIR=/abs/.claude {bare}")),
+        "an absolute CLAUDE_CONFIG_DIR"
+    );
+    assert_eq!(
+        told_command(
+            user,
+            None,
+            &snap(Some("rel/.claude"), Some("/work/b/rel/.claude"), "/work/c")
+        ),
+        None,
+        "a relative home the line would move"
+    );
+    // CONTROL: the user's own home, as it always was; never the login.
+    let own = told_command(user, None, &snap(None, None, "/w"));
+    assert_eq!(
+        own,
+        super::super::resume::command(&words(&["/opt/claude", "--verbose"]), LOGIN_ID)
+    );
+    assert_eq!(own.as_deref(), Some(bare.as_str()));
+    let codex = Snapshot {
+        run: crate::harness::relaunch::AgentRun::Codex(CodexRun {
+            home: PathBuf::from("/c"),
+            home_env: None,
+            self_claimed: None,
+        }),
+        ..snap(None, None, "/w")
+    };
+    assert_eq!(told_command(user, None, &codex), None, "a Codex");
 }
 
 // ------------------------------------------------------------------------
@@ -2127,26 +3253,327 @@ fn the_tap_is_dropped_before_the_required_login() {
     assert!(line(fits_bare + 1).is_err());
 }
 
-/// A snapshot says whether its process is on its stored login, from the exec environment it was
-/// read with (`ProcessLogin::of_exec_env`): the tap's first question. A credential, a profile or a
-/// route variable, and an environment that was not read, are not.
+/// A PROVEN SELF-CLAIMED CODEX-ALAB'S RELAUNCH AFTER ATERM ENDED IS THE CRASH
+/// RULE'S (the self-claim contract, §4; [`CodexRun::self_claimed`]): a
+/// snapshot that carries the line aterm's copy of its record validated — off
+/// a crash journal's or a restart's leaf, or owed at a seamless update's
+/// Commit — is relaunched by [`after_host_ended`] on that line, through the
+/// crash rule's own relaunch, its once-per-witness ledger read: a witness
+/// handled already is `ended:handled`, and one that is not would be typed
+/// (`would-relaunch`, a dry run). NEGATIVE CONTROL: the same snapshot with no
+/// line is nobody's (`ended:no-lane`), whatever ended it: no Codex lane plans
+/// a relaunch any more (the Codex screen lane's retirement, 2026-10-16).
 #[test]
-fn a_stored_login_is_read_off_the_exec_environment() {
-    let stored = |env: &[&str]| {
-        accounts::ProcessLogin::of_exec_env(&args(env)).is_some_and(|who| who.stored_login)
+fn a_relaunch_after_aterm_ended_is_made_on_the_carried_line_as_the_crash_rule_makes_it() {
+    const UUID: &str = "0199f2a4-6c1e-7a52-9d3b-2f6c8e1a4b77";
+    let tmp = aterm_tempfile::TempDir::new().expect("tmp");
+    let codex_home = tmp.path().join("codex");
+    let day = codex_home.join("sessions/2026/10/16");
+    std::fs::create_dir_all(&day).expect("sessions");
+    std::fs::write(
+        day.join(format!("rollout-2026-10-16T08-00-00-{UUID}.jsonl")),
+        "{}\n",
+    )
+    .expect("rollout");
+    let opts = super::super::upgrade_drive::Opts {
+        home: tmp.path().join("home"),
+        state: tmp.path().join("state"),
+        sock: None,
+        only_sid: Some("s-1".to_string()),
+        dry_run: true,
+        human_grace_s: 0,
+        hand_back: true,
+        background: false,
+        aterm_state: None,
+        ask: false,
+        several_logins: false,
+        usage_tap: None,
+        instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
+        agents_off: Vec::new(),
+        land: false,
+        timings: crate::harness::Timings::FAST,
     };
-    assert!(stored(&["HOME=/Users//example"]));
-    assert!(stored(&[
-        "HOME=/Users//example",
-        "CLAUDE_SECURESTORAGE_CONFIG_DIR="
-    ]));
-    assert!(!stored(&[]), "an environment not read");
-    for key in [
-        "CLAUDE_CODE_OAUTH_TOKEN=t",
-        "ANTHROPIC_API_KEY=k",
-        "ANTHROPIC_PROFILE=work",
-        "HTTPS_PROXY=http://gw.example",
-    ] {
-        assert!(!stored(&["HOME=/Users//example", key]), "{key}");
+    // The agent aterm's end took: a process that ran and is gone.
+    let mut gone = aterm_uds::spawnfd::command("/usr/bin/true")
+        .spawn()
+        .expect("spawn true");
+    let dead = gone.id();
+    let _ = gone.wait();
+    let launch = "/u/.aterm/agents/codex".to_string();
+    let line = super::super::self_claimed::Resume {
+        argv: vec![launch.clone(), "resume".to_string(), UUID.to_string()],
+        session: UUID.to_string(),
+        codex_home: None,
+        cwd: None,
+    };
+    let snap = |self_claimed: Option<super::super::self_claimed::Resume>| Snapshot {
+        stored_login: false,
+        tab: "s-1".to_string(),
+        pid: dead,
+        start: "Thu Oct 16 08:00:00 2026".to_string(),
+        // The reopened tab's shell: a process that runs (this one).
+        shell: std::process::id(),
+        program: launch.clone().into(),
+        argv: vec![launch.clone()],
+        session: Some(UUID.to_string()),
+        cwd: "/".to_string(),
+        version: Some("0.163.0".to_string()),
+        run: crate::harness::relaunch::AgentRun::Codex(CodexRun {
+            home: codex_home.clone(),
+            home_env: None,
+            self_claimed,
+        }),
+        dialect: None,
+        login: None,
+        home: None,
+        claude_dir: None,
+    };
+    let carried = snap(Some(line.clone()));
+    assert_eq!(self_claimed_line(&carried), Some(&line));
+    // ITS OWN EXIT IS NEVER RELAUNCHED ON THE LINE (the review of
+    // 2026-10-16, finding 1): a line that rode a snapshot past its copy — a
+    // seamless update's handed leaf, the agent still running at the Commit —
+    // says nothing of how it ended, and is nobody's: left. The witness is
+    // unhandled here, so the crash rule's relaunch would have typed it.
+    for left in [ExitRecord::Removed, ExitRecord::Unread] {
+        let step = after_exit(&opts, &carried, &left, true, None).step;
+        assert_ne!(step, "would-relaunch", "{left:?}: never on the line");
+        assert!(step.starts_with("ended:"), "{left:?}: {step}");
     }
+    assert_eq!(
+        after_host_ended(&opts, &carried, true).step,
+        "would-relaunch",
+        "the crash rule's relaunch, on the carried line"
+    );
+    super::super::self_claimed::Witnesses::under(&opts.state)
+        .record(dead, &carried.start)
+        .expect("the witness");
+    assert_eq!(
+        after_host_ended(&opts, &carried, true).step,
+        "ended:handled",
+        "relaunched once per witness, as the crash rule relaunches"
+    );
+    // NEGATIVE CONTROL: no line, nobody's to relaunch — not after aterm's
+    // end, not on an act's cause, not on its own exit.
+    let lane = snap(None);
+    assert_eq!(self_claimed_line(&lane), None);
+    assert_eq!(after_host_ended(&opts, &lane, true).step, "ended:no-lane");
+    assert_eq!(
+        after_exit(
+            &opts,
+            &lane,
+            &ExitRecord::Unread,
+            true,
+            Some(super::super::restart_stamp::Cause::Asked)
+        )
+        .step,
+        "ended:no-lane"
+    );
+    assert_eq!(
+        after_exit(&opts, &lane, &ExitRecord::Removed, true, None).step,
+        "ended:no-lane"
+    );
+}
+
+/// AN `adopted` ROW PROMISES WHAT THE LOOP'S FIRST IDLE POINT DOES (the live
+/// lab of 2026-10-17: a restored tab under Land was told "its supervisor
+/// types the continuation", and `done:landing` followed with nothing typed;
+/// a cleared conversation under Cruise was told the same, and
+/// `done:taskless` followed — the review's RV2-REL-1): a quiet restart is
+/// resumed with nothing typed; a conversation its own records owe nothing
+/// (`nothing_owed`: taskless, finished, left to its person, resumed by its
+/// loop first) gets nothing, the row naming why; a tab under Land — the
+/// pass's word, or the tab's own `status` read at the adoption — gets no
+/// continuation, its loop deciding its point; and any other move owes the
+/// continuation. Ranked as the carry-on ranks them: quiet, then nothing
+/// owed, then Land. NEGATIVE CONTROLS: neither the records nor Land is read
+/// for a quiet move, Land is not read where nothing is owed, and a `status`
+/// that says Cruise or Off, says no Autopilot (an older server), is no `OK`,
+/// or carries `autopilot=land` only inside another field's value or after
+/// the field's own word, is no Land.
+#[test]
+fn an_adoption_promises_what_its_first_idle_point_does() {
+    let quiet = St {
+        quiet: true,
+        ..St::default()
+    };
+    let owed = St::default();
+    let why = NOBODY_ASKED;
+    assert_eq!(
+        Adopted::of(
+            &quiet,
+            || panic!("the records are not read for a quiet move"),
+            || panic!("Land is not read for a quiet move")
+        ),
+        Adopted::Quiet
+    );
+    assert_eq!(
+        Adopted::of(
+            &owed,
+            || Some(why),
+            || panic!("Land is not read where nothing is owed")
+        ),
+        Adopted::NothingOwed(why)
+    );
+    assert_eq!(Adopted::of(&owed, || None, || true), Adopted::Land);
+    assert_eq!(Adopted::of(&owed, || None, || false), Adopted::Owed);
+    let [q, n, l, o] = [
+        Adopted::Quiet,
+        Adopted::NothingOwed(why),
+        Adopted::Land,
+        Adopted::Owed,
+    ]
+    .map(Adopted::detail);
+    let rows = [&q, &n, &l, &o];
+    for (i, a) in rows.iter().enumerate() {
+        for b in &rows[i + 1..] {
+            assert_ne!(a, b, "four promises, four rows");
+        }
+    }
+    assert!(n.ends_with(why), "the row names why: {n}");
+    assert!(land_by_status(
+        "OK schema=1 hold=0 supervisor=aterm-harness@1 autopilot=land land_at=- task=open"
+    ));
+    for line in [
+        "OK schema=1 hold=0 supervisor=- autopilot=cruise",
+        "OK schema=1 autopilot=off",
+        "OK schema=1 hold=0 hand=-",
+        "ERR no such session autopilot=land",
+        "OK subject=autopilot%3Dland autopilot=cruise",
+        "OK autopilot=- autopilot=land",
+    ] {
+        assert!(!land_by_status(line), "{line}");
+    }
+}
+
+/// A model-shaped option value or payload does not change the model the
+/// launch selected, so it cannot prove that a limit's model was left.
+#[test]
+fn a_model_move_reads_the_launchs_model_and_never_another_flags_value() {
+    let live = |argv: &[&str]| Snapshot {
+        tab: "s-cafe".to_string(),
+        pid: 0,
+        start: String::new(),
+        shell: 0,
+        program: PathBuf::from("/fixture/claude"),
+        argv: words(argv),
+        session: None,
+        cwd: String::new(),
+        version: None,
+        run: crate::harness::relaunch::AgentRun::Claude,
+        dialect: None,
+        login: None,
+        home: None,
+        claude_dir: None,
+        stored_login: false,
+    };
+    // Ordinary selections, the existing empty fallback, last-wins, and a
+    // required flag value that is literally `--` all keep their meaning.
+    for (argv, expected) in [
+        (&["claude"][..], ""),
+        (&["claude", "--model", "default"][..], "default"),
+        (&["claude", "--model", "opus"][..], "opus"),
+        (&["claude", "--model=sonnet"][..], "sonnet"),
+        (
+            &["claude", "--model", "opus", "--model=sonnet"][..],
+            "sonnet",
+        ),
+        (
+            &[
+                "claude",
+                "--model",
+                "opus",
+                "--append-system-prompt",
+                "--",
+                "--model=sonnet",
+            ][..],
+            "sonnet",
+        ),
+        (
+            &[
+                "claude",
+                "--append-system-prompt=--model=sonnet",
+                "--model",
+                "opus",
+            ][..],
+            "opus",
+        ),
+    ] {
+        let snap = live(argv);
+        assert_eq!(launch_model_of(&snap.argv), expected, "{argv:?}");
+        assert!(
+            !runs_moved(&snap, None, Some(expected)),
+            "the selected model still stands: {argv:?}"
+        );
+        assert!(
+            runs_moved(&snap, None, Some("another-model")),
+            "a different named model is left: {argv:?}"
+        );
+        assert!(
+            runs_moved(&snap, None, None),
+            "an older record names no model target"
+        );
+    }
+    let opus = live(&["claude", "--model", "opus"]);
+    assert!(
+        runs_moved(&opus, Some(""), Some("sonnet")),
+        "ordinary default-login control"
+    );
+    assert!(
+        !runs_moved(&opus, Some("another-login"), Some("sonnet")),
+        "a different login never proves the move"
+    );
+
+    let mut changed = Vec::new();
+    for (argv, expected) in [
+        (
+            &[
+                "claude",
+                "--model",
+                "opus",
+                "--append-system-prompt",
+                "--model=sonnet",
+            ][..],
+            "opus",
+        ),
+        (
+            &[
+                "claude",
+                "--model",
+                "opus",
+                "--append-system-prompt",
+                "--model",
+                "sonnet",
+            ][..],
+            "opus",
+        ),
+        (
+            &["claude", "--model", "opus", "--add-dir", "--model=sonnet"][..],
+            "opus",
+        ),
+        (
+            &["claude", "--model", "opus", "--", "--model=sonnet"][..],
+            "opus",
+        ),
+        (
+            &["claude", "--model", "opus", "--", "--model", "sonnet"][..],
+            "opus",
+        ),
+        (
+            &["claude", "--append-system-prompt", "--model=sonnet"][..],
+            "",
+        ),
+        (&["claude", "--", "--model=sonnet"][..], ""),
+    ] {
+        let snap = live(argv);
+        let read = launch_model_of(&snap.argv);
+        let moved = runs_moved(&snap, None, Some(expected));
+        if read != expected || moved {
+            changed.push((words(argv), read.to_string(), moved));
+        }
+    }
+    assert!(
+        changed.is_empty(),
+        "model selection must respect option values and -- boundaries: {changed:?}"
+    );
 }

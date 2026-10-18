@@ -1,27 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TEST SUPPORT (test and debug builds, never a release one): how a
-//! test that needs macOS's `trustd` to ANSWER finds out whether it will.
+//! Test support (test and debug builds, never release ones): whether a macOS service a test
+//! needs answers.
 //!
-//! * [`trust_service_silent`] asks ONCE per process, through the shipped
-//!   [`super::TRUST`] gate: one `SecStaticCodeCheckValidity` of
-//!   `/usr/bin/true`, Apple-signed, so its chain is evaluated by `trustd`.
-//!   MEASURED 2026-10-01: that call hangs exactly while `trustd` is wedged and
-//!   answers in about 0.24 s otherwise; the verdict is not the question, only
-//!   whether there is one. A silent service costs the first ask
-//!   [`PROBE_DEADLINE`]; every other ask returns the cached answer, and every
-//!   shipped call through the gate is refused at once from then on.
-//! * [`notice_once`] is how a skip reaches the output at all: libtest captures
-//!   `eprintln!` and discards it for a test that passes, and a skipped test
-//!   passes. It writes to the process's stderr directly, once per line per
-//!   binary.
+//! * [`trust_service_silent`] asks once per process, through the shipped [`super::TRUST`]
+//!   gate: one `SecStaticCodeCheckValidity` of the Apple-signed `/usr/bin/true`, whose chain
+//!   `trustd` evaluates. It hangs exactly while `trustd` is wedged (else about 0.24 s); only
+//!   whether there is a verdict matters. A silent service costs the first ask
+//!   [`PROBE_DEADLINE`], and from then on every call through the gate is refused at once.
+//! * [`disk_image_service_silent`] judges an `hdiutil` run the test already made.
+//! * [`notice_once`] prints the skip line.
 //!
-//! * [`disk_image_service_silent`] judges an `hdiutil` run the test already
-//!   made: only a failure with `Operation timed out` is the service not answering.
-//!
-//! The skip is ONLY for the service not answering: any other failure of the
-//! probe (an error status, a missing file) is an answer, and the tests run.
+//! Only silence skips: any other probe failure is an answer, and the tests run.
 
 use std::io::Write as _;
 use std::sync::{Mutex, OnceLock, PoisonError};
@@ -32,13 +23,12 @@ use super::{Refused, TRUST};
 // `SKIPPED` and `DISK_IMAGE_SKIPPED`: their own file, which aterm-verify includes too.
 include!("skipped.rs");
 
-/// How long the probe waits for `trustd`: about a hundred times its honest
-/// answer, and half the minute past which a wait reads as a hang.
+/// How long the probe waits for `trustd`: about a hundred times its honest answer, and half a
+/// test's one-minute hang detector.
 pub const PROBE_DEADLINE: Duration = Duration::from_secs(30);
 
-/// Prints `line` once per test binary, straight to the process's stderr, which
-/// libtest does not capture — so a skip is visible in a default run even
-/// though the skipped tests pass.
+/// Prints `line` once per test binary straight to stderr: libtest discards a passing test's
+/// captured `eprintln!`, and a skipped test passes.
 pub fn notice_once(line: &'static str) {
     static SAID: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
     #[cfg(test)]
@@ -52,8 +42,7 @@ pub fn notice_once(line: &'static str) {
 
 #[cfg(test)]
 thread_local! {
-    /// How many notices THIS thread asked [`notice_once`] for, printed or not:
-    /// what a test of a judgment reads to show it asked for none.
+    /// How many notices this thread asked [`notice_once`] for, printed or not.
     static ASKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -73,11 +62,9 @@ pub fn trust_service_silent() -> bool {
     silent
 }
 
-/// `true`, after [`notice_once`] of [`DISK_IMAGE_SKIPPED`], when `out` is an
-/// `hdiutil` run that failed because macOS's disk-image service did not answer
-/// (MEASURED 2026-10-08: a wedged service fails `hdiutil create` after about
-/// 121 s with `Operation timed out`); the caller then returns without
-/// asserting anything. Any other failure is an answer, and `false`.
+/// `true`, after [`notice_once`] of [`DISK_IMAGE_SKIPPED`], when `out` is an `hdiutil` run that
+/// failed with `Operation timed out` (a wedged disk-image service, after about 121 s); the
+/// caller then returns without asserting anything. Any other failure is an answer.
 #[must_use]
 pub fn disk_image_service_silent(out: &std::process::Output) -> bool {
     let silent = timed_out(out);
@@ -87,12 +74,10 @@ pub fn disk_image_service_silent(out: &std::process::Output) -> bool {
     silent
 }
 
-/// [`disk_image_service_silent`]'s judgment WITHOUT its notice: a failed run
-/// whose stderr says `Operation timed out`. A test of the judgment asks here,
-/// never the function above: the notice is the line `verify test` counts as a
-/// host skip (aterm-verify `libtest::host_skips`), and printed for a made-up
-/// run it makes a whole-tree run read "1 skipped", and stops a `verify release`
-/// as COULD NOT RUN, on a host whose service answers.
+/// [`disk_image_service_silent`]'s judgment without its notice. Tests of the judgment call
+/// this: the notice is the line `verify test` counts as a host skip (aterm-verify
+/// `libtest::host_skips`), so printing it for a made-up run reports a skip, and stops a
+/// `verify release` as COULD NOT RUN, on a host whose service answers.
 fn timed_out(out: &std::process::Output) -> bool {
     !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("Operation timed out")
 }
@@ -100,10 +85,8 @@ fn timed_out(out: &std::process::Output) -> bool {
 /// How long a test's own `codesign` may run: a hang detector, never a budget.
 pub const CODESIGN_HANG: Duration = Duration::from_secs(60);
 
-/// Sign `path` ad hoc (`codesign --force --sign -`), as a test does to a copy
-/// of an Apple binary so the kernel lets it run off the system volume (AGENTS.md
-/// rule 6). Under [`CODESIGN_HANG`], so a service that stops answering
-/// mid-run fails the test in a minute instead of hanging the suite; ask
+/// Sign `path` ad hoc (`codesign --force --sign -`), as a test does to a copy of an Apple
+/// binary so the kernel lets it run off the system volume. Under [`CODESIGN_HANG`]; ask
 /// [`trust_service_silent`] first. Panics, naming why, unless it signed.
 pub fn sign_ad_hoc(path: &std::path::Path) {
     let out = super::output_until(
@@ -187,12 +170,10 @@ mod tests {
         }
     }
 
-    /// Only a FAILED run that timed out is the service's silence: any other
-    /// failure is an answer, and the test asserts on it.
+    /// Only a failed run that timed out is the service's silence.
     #[test]
     fn only_a_timed_out_failure_is_a_silent_disk_image_service() {
-        // The judgment alone: `disk_image_service_silent` would print the skip
-        // line `verify test` reads, and no `hdiutil` ran here.
+        // The judgment alone: `disk_image_service_silent` would print the skip line.
         use super::timed_out as silent;
         let asked = super::ASKED.with(std::cell::Cell::get);
         assert!(silent(&run(

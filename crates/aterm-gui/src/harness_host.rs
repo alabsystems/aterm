@@ -4,8 +4,7 @@
 //! The in-GUI SUPERVISOR host: every agent session this instance owns — Claude
 //! Code's and Codex's — is supervised by default, under the owner's `[harness]` policy
 //! ([`aterm_agent::supervise::SupervisorConfig`]), with nothing typed to start
-//! it. Sibling of [`crate::operator_host`], whose threading and shutdown shape
-//! it copies: nothing here runs on the winit thread, and shutdown is an
+//! it. Nothing here runs on the winit thread, and shutdown is an
 //! explicit bounded join from `main_entry` after the event loop exits.
 //!
 //! **Discovery, without a poll.** One host thread (`aterm-harness-host`)
@@ -22,8 +21,9 @@
 //! while the agent still holds it is no exit ([`keep_holding`]) — or that
 //! closed, loses it. Which agents get one is ONE predicate,
 //! aterm-phase's ([`aterm_phase::Program::supervisable`]: an agent whose
-//! reader is measured — Claude Code and Codex), applied where the published
-//! program is read ([`agent_of`]). The relaunch on exit and the upgrade
+//! reader is measured — Claude Code, Codex, agy and Gemini CLI), applied
+//! where the published program is read ([`agent_of`]), by its screen under a
+//! runtime's name (Gemini CLI runs as `node`). The relaunch on exit and the upgrade
 //! below are both agents': Codex's by its own lane of the same step, at the
 //! same idle points.
 //!
@@ -105,18 +105,11 @@
 //!   cooperative upgrade ([`aterm_agent::harness::upgrade_drive::step`]:
 //!   announce and ask for READY; once READY, end the agent and relaunch it
 //!   on its conversation), and the loop runs on — over the relaunched agent,
-//!   with its claim, its badges and its policy's memory. A CODEX session's
-//!   step is the same step's Codex branch
-//!   ([`aterm_agent::harness::upgrade_codex`]): the shared app-server daemon
-//!   first, by the vendor's own verb, once nothing runs in it and every
-//!   Codex tab it serves has been asked; then the tab's TUI, ended by a typed
-//!   `/exit` — never a signal — and relaunched by `codex resume` of the same
-//!   conversation through the one relaunch line; an embedded session gets
-//!   the notice and READY first, and its carry-on is typed where the loop
-//!   parks next, as a Claude Code's is. A session busy only with its OWN
-//!   BACKGROUND WORK (a workflow it waits on, a shell it left, a Codex
-//!   background terminal) is at a natural break: its loop offers that break
-//!   ([`IdleHost::at_background`]) and the worker types only a line that
+//!   with its claim, its badges and its policy's memory. No CODEX session
+//!   is moved live: a vendor `codex` is shown, and codex-alab moves its own
+//!   build. A session busy only with its OWN BACKGROUND WORK (a workflow it
+//!   waits on, a shell it left) is at a natural break: its loop offers that
+//!   break ([`IdleHost::at_background`]) and the worker types only a line that
 //!   ends nothing there — a NOTICE, or the RELEASE LINE a give-up, a void or
 //!   a stop owes (2026-09-27: a break that never ends is the only point such
 //!   a session has) — and ends nothing (owner, 2026-09-26: "The notice
@@ -322,11 +315,12 @@
 //! and writes only under the sweep lock's `try_lock`: its own fields, the
 //! fresh wait word, a retarget, a limit's clock hold, a re-arm. It has no
 //! hands — it never types, presses, pastes, signals, kills, terminates or
-//! ends anything, past any budget (the aterm-census guard `watch-hands`) — and a worker
+//! ends anything, past any budget (its connections are read-only: aterm-agent's
+//! `RelayClient::reads_only`, pinned by `a_dry_runs_connection_reads_and_has_no_hands`) — and a worker
 //! whose upgrade reads due but asks for no point is parked again (the
 //! re-park, [`watch_tab`]), so the loop's next point takes the step.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::Write;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
@@ -338,8 +332,7 @@ use std::time::{Duration, Instant};
 use aterm_agent::harness::accounts;
 use aterm_agent::harness::netwatch::Route;
 use aterm_agent::harness::relaunch::{
-    self, CodexRun, ExitLook, ExitRecord, Foreground, OnExit, Outcome, Relaunches, Restart, Say,
-    Snapshot,
+    self, ExitLook, ExitRecord, Foreground, OnExit, Outcome, Relaunches, Restart, Say, Snapshot,
 };
 use aterm_agent::harness::restart_stamp;
 use aterm_agent::harness::resume;
@@ -355,9 +348,10 @@ use aterm_agent::supervise::policy::turn_end::{
 use aterm_agent::supervise::policy::{
     ResetAsk, ResetEnd, ResetGo, ResetNo, ResetOutcome, ResetWord,
 };
+use aterm_agent::supervise::tape::store as tape;
 use aterm_agent::supervise::{
-    Autopilot, Ctl, CtlReply, Endpoint, Guard, HostStep, IdleHost, Interrupter, ProbeMiss,
-    RelayCtl, Session, SuperviseOpts, SupervisorConfig, UsageSeen,
+    Autopilot, Ctl, CtlReply, Endpoint, Guard, HostStep, IdleHost, IdlePoint, Interrupter,
+    ProbeMiss, RelayCtl, Session, SuperviseOpts, SupervisorConfig, UsageSeen,
 };
 
 use crate::harness_netprobe::NetProbe;
@@ -376,7 +370,9 @@ use crate::session_store::{SessionState, Store};
 /// policy reads only whether it is `off` (`policy::turn_end`'s
 /// `account_rotates`), the host which of `early` and `wall` it is
 /// ([`Switches::accounts`]) — so every word but `off` is the default here,
-/// and an edit between `early` and `wall` restarts nothing.
+/// and an edit between `early` and `wall` restarts nothing. And `land_at`,
+/// which no engine path reads: the window's Autopilot menu and Settings
+/// offer it (`crate::autopilot_timers`), so editing it restarts nothing.
 pub(crate) fn effective(cfg: &SupervisorConfig) -> SupervisorConfig {
     let d = SupervisorConfig::default();
     SupervisorConfig {
@@ -384,6 +380,7 @@ pub(crate) fn effective(cfg: &SupervisorConfig) -> SupervisorConfig {
         relaunch: d.relaunch,
         probe_api: d.probe_api,
         off: d.off,
+        land_at: d.land_at,
         accounts: match cfg.accounts {
             accounts::Mode::Off => accounts::Mode::Off,
             accounts::Mode::Early | accounts::Mode::Wall => d.accounts,
@@ -542,6 +539,7 @@ const ACCOUNTS_WALL: u8 = 1;
 const ACCOUNTS_EARLY: u8 = 2;
 
 impl Switches {
+    #[cfg(any(unix, test))]
     fn park(&self, parked: bool) {
         self.parked.store(parked, Ordering::SeqCst);
     }
@@ -796,6 +794,14 @@ pub(crate) struct RestoredAgent {
     /// ([`restored_carried`]): never a counted try while a hand stands.
     /// `None`: an exit of its own, or aterm's end.
     pub(crate) asked: Option<restart_stamp::Cause>,
+    /// THE TAB IT RAN IN, where that was another sid than [`Self::sid`]
+    /// (`restore::AgentRestore::tab`): a cold restore's reopened tab is
+    /// minted a new one. Its relaunch keeps it among the conversation's
+    /// earlier tabs ([`relaunch::after_host_ended_from`]), so the old tab's
+    /// loop turns are read as the harness's own, never as a prompt that
+    /// reopens a finished task (XREV-LC-1). `None`: a kept sid (a handoff, a
+    /// failed Commit's rollback), or a leaf that names none.
+    pub(crate) was: Option<String>,
 }
 
 impl RestoredAgent {
@@ -849,6 +855,13 @@ struct RestoredAttempt {
     /// agent in its tab its own: never overtaken meanwhile
     /// ([`Self::typed`]), so a park carries it and a quit keeps it.
     landed: bool,
+    /// ITS STEPS THAT PANICKED, of an attempt kept through them
+    /// (F1-R8-G2, F1-R9-G2; [`restored_step_panicked`]): a landing no read
+    /// has reached, looked at again, or a typed line, stepped again — each
+    /// over only once this many reach [`RESTORED_TRIES`]. Counted apart from
+    /// [`Self::tried`], the budget of its relaunches, which a fault that
+    /// passes leaves whole.
+    faults: u32,
 }
 
 impl RestoredAttempt {
@@ -953,7 +966,18 @@ struct RestoredQueue {
     next_order: usize,
     /// The ones that did not come back, said in one row once the queue is
     /// done or paused.
-    missed: Vec<(usize, String, Outcome)>,
+    missed: Vec<RestoredMiss>,
+    /// EVERY RESTORED AGENT THIS PROCESS SAID DID NOT COME BACK, in the order
+    /// said (F1-R8-G3; [`say_restored`]): each row names them all. The row's
+    /// key supersedes the one before it in place, and the queue says one at
+    /// each pause and again when done — a failed Commit's rollback resumes
+    /// the same queue, a later restore runs it again, a successor's carry
+    /// says its own — so a row naming only its own misses took the earlier
+    /// tabs off the owner's view. ONE PER SESSION (F1-R9-G1): two panes of
+    /// one tab share its place, and keyed by it the second's miss took the
+    /// first's line; and one whose tab an agent holds since leaves it
+    /// (F1-R9-G3).
+    said: Vec<RestoredMiss>,
     /// A handoff parked the readers: the worker takes no new step until a
     /// rollback resumes it ([`HostHandle::resume_restored`]). The handoff
     /// layout reads the queue LIVE meanwhile ([`HostHandle::pending_restored_for`]).
@@ -988,12 +1012,45 @@ struct RestoredQueue {
     parked_looks: usize,
 }
 
-/// The keyed-attention owner this host writes (`meta set attention
-/// owner=supervisor …`): the engine's own, one constant.
+/// One restored agent that did not come back, for the restored agents' row
+/// ([`say_restored`]).
+#[derive(Clone, Debug, PartialEq)]
+struct RestoredMiss {
+    /// Its place in the layout's order.
+    order: usize,
+    /// Its tab's session: what the row keeps it by ([`RestoredQueue::said`]).
+    sid: String,
+    /// Where it is in the person's words (`in tab 2`): every pane of a tab
+    /// has the same.
+    place: String,
+    /// The agent that ran there: the row words its remedy by it (F1-R8-G4).
+    agent: upgrade::Agent,
+    /// Its last step's outcome.
+    outcome: Outcome,
+}
+
+/// The keyed-attention owner the loop writes (`meta set attention
+/// owner=supervisor …`): the engine's own, one constant — the tests' name
+/// for it; this host writes its own words under
+/// [`RELAUNCH_ATTENTION_OWNER`].
+#[cfg(test)]
 pub(crate) use aterm_agent::supervise::ATTENTION_OWNER;
+
 /// A loop that ended behind another holder's claim: aterm-agent's
 /// [`aterm_agent::supervise::CLAIM_HELD`], followed by the holder.
 use aterm_agent::supervise::CLAIM_HELD;
+/// THE KEYED-ATTENTION OWNER OF A RELAUNCH'S WORD, the tab's mark this host
+/// sets for an agent that is not back ([`set_badge`]): its own, apart from
+/// the loop's (`ATTENTION_OWNER`; the engine's constant, which the loop's
+/// reconcile leaves alone). Under the loop's owner, the next loop to claim
+/// the tab — any agent's, the told command fallen into Claude Code's
+/// first-run screens included — cleared it at its claim as an escalation of
+/// its own whose point was not on the screen (`reconcile`; LC-4 of
+/// ATERM-KI-1015-1, measured in the real-Claude lab): the mark asking for a
+/// conversation went the moment another agent ran. The host alone clears it
+/// now, once that conversation runs or is held again, or a relaunch lands
+/// (`Relaunches::conversation_runs`, [`end_lost_words`]).
+pub(crate) use aterm_agent::supervise::RELAUNCH_ATTENTION_OWNER;
 
 // ---------------------------------------------------------------------------
 // The bell: what the host thread parks on.
@@ -1027,9 +1084,11 @@ static CLAIM_EPOCH: AtomicU64 = AtomicU64::new(0);
 /// ([`look_at_upgrades`]).
 static UPGRADE_ACTS: AtomicU64 = AtomicU64::new(0);
 
-/// The source of the stamp a worker's step leaves on its worker
-/// ([`WorkerIdle::stepped`]): each is unique, so no worker's stamp is ever
-/// another's step's.
+/// The source of the stamp a worker's step leaves on its worker as it begins
+/// and again as it ends ([`WorkerIdle::stepped`]): each is unique, so no
+/// worker's stamp is ever another's step's, and each is past every stamp
+/// before it, so a pass that reads it before the roster knows a step that
+/// ended since by its worker's stamp alone ([`StepsSeen::stepping`]).
 static STEP_STAMPS: AtomicU64 = AtomicU64::new(0);
 
 /// A worker took an upgrade's or a relaunch's step: the owner's view is owed
@@ -1166,15 +1225,15 @@ pub(crate) fn self_claimed(sid: &str, replaced: Option<&str>) {
 
 /// The proven self-claim on tab `sid` was cleared. Its agent still runs
 /// (`alive`: codex-alab went passive and gave the claim back): the worker
-/// watching beside it is cut, and takes the session back with its own loop
-/// — aterm's lane and the menu rows return. Its agent gone: nothing is cut;
-/// the exit is the watch-only worker's to read as it is handed
-/// ([`on_agent_left`]).
+/// watching beside it is cut, and its next run watches beside the agent
+/// itself ([`WorkerJob::watch_beside`]) — aterm supervises no Codex, so
+/// nothing of a lane comes back. Its agent gone: nothing is cut; the exit is
+/// the watch-only worker's to read as it is handed ([`on_agent_left`]).
 pub(crate) fn self_claim_released(sid: &str, alive: bool) {
     if alive && cut_claim_side(sid, |beside| beside.is_some()) {
         aterm_log::info!(
             "harness @{sid}: the proven self-claim was given back while its agent runs; this \
-             host supervises the session again"
+             host watches it on, and supervises nothing of it"
         );
     }
 }
@@ -1293,9 +1352,10 @@ fn relaunching_of(
     relaunches: bool,
     kept: &Mutex<HashMap<String, Arc<Mutex<Kept>>>>,
 ) -> std::collections::HashSet<String> {
-    if !relaunches {
+    // The relaunch's own predicate, for the home the tab's shell has.
+    let Some(home) = aterm_primer::home_dir().filter(|_| relaunches) else {
         return std::collections::HashSet::new();
-    }
+    };
     let kept: Vec<(String, Arc<Mutex<Kept>>)> = kept
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -1308,7 +1368,7 @@ fn relaunching_of(
                 .unwrap_or_else(PoisonError::into_inner)
                 .snapshot
                 .as_ref()
-                .is_some_and(relaunch::resumes_on_exit)
+                .is_some_and(|snap| relaunch::resumes_on_exit(&home, snap))
         })
         .map(|(sid, _)| sid)
         .collect()
@@ -1377,6 +1437,10 @@ const STOPPED: &str = "the supervisor was stopped";
 pub(crate) struct HostCtl {
     endpoint: Endpoint,
     token: Option<String>,
+    /// `token` is the harness's in-memory one ([`Self::as_harness`]): the
+    /// transport falls back to the token beside the socket when a listener
+    /// refuses it ([`RelayCtl::preferring`]).
+    prefer: bool,
     inner: RelayCtl,
     cut: Arc<AtomicBool>,
     redialed: bool,
@@ -1429,11 +1493,40 @@ impl HostCtl {
             inner: RelayCtl::new(endpoint.clone(), token.clone()),
             endpoint,
             token,
+            prefer: false,
             cut: Arc::default(),
             redialed: false,
             admission: None,
             fence: None,
             watch_only: None,
+        }
+    }
+
+    /// THE HARNESS'S OWN TRANSPORT (design §2.5, phase 3A): [`Self::new`]
+    /// presenting the harness's in-memory token
+    /// ([`crate::control_auth::harness_token`]), so what the loop types and
+    /// marks reads `by=harness` in the session log. `endpoint` is this
+    /// instance's own socket, so the token is presented only to the process
+    /// that minted it — but a seamless update's successor rebinds that path
+    /// and never knew the token: on its `ERR auth` the transport takes the
+    /// token beside the socket from then on (ruling R10), and the loop's
+    /// requests read `by=ctl` there instead of failing. No token minted (no
+    /// entropy): the token beside the socket, as [`Self::new`].
+    pub(crate) fn as_harness(endpoint: Endpoint) -> Self {
+        let Some(token) = crate::control_auth::harness_token() else {
+            return Self::new(endpoint);
+        };
+        let mut ctl = Self::with_token(endpoint, Some(token.to_string()));
+        ctl.prefer = true;
+        ctl.inner = ctl.relay();
+        ctl
+    }
+
+    /// A fresh transport on this one's endpoint and token.
+    fn relay(&self) -> RelayCtl {
+        match (&self.token, self.prefer) {
+            (Some(token), true) => RelayCtl::preferring(self.endpoint.clone(), token.clone()),
+            (token, _) => RelayCtl::new(self.endpoint.clone(), token.clone()),
         }
     }
 }
@@ -1452,7 +1545,7 @@ impl Ctl for HostCtl {
                 return Err(STOPPED.to_string());
             }
             if !self.redialed {
-                self.inner = RelayCtl::new(self.endpoint.clone(), self.token.clone());
+                self.inner = self.relay();
                 self.redialed = true;
             }
         }
@@ -1538,6 +1631,15 @@ pub(crate) struct WorkerJob {
     pub(crate) handover: Arc<AtomicBool>,
     /// Clear the badge a previous worker's relaunch left before running.
     pub(crate) clear_badge: bool,
+    /// Unset the tab's relaunch mark ([`RELAUNCH_ATTENTION_OWNER`]) before
+    /// running, saying nothing: no ask of this host's keeps one there
+    /// (`Relaunches::asks`), so a mark that stands is not this host's. It is
+    /// a predecessor's, carried by a seamless update with the tab's other
+    /// escalations (`SessionMeta::handoff_attention_owners`), and an agent
+    /// runs in the tab again. Under the loop's owner the next loop's claim
+    /// cleared it; under its own (LC-4 of ATERM-KI-1015-1) nothing did, and
+    /// it stood on the tab for as long as the session lived.
+    pub(crate) unset_mark: bool,
     /// The session's failed runs ([`FaultHistory`]), shared with the host.
     pub(crate) faults: FaultHistory,
     /// The request for the loop's next idle point ([`WorkerIdle`], the
@@ -1576,10 +1678,12 @@ pub(crate) struct WorkerJob {
     pub(crate) left_at_commit: Arc<AtomicBool>,
     /// Set while the worker takes an upgrade step: the agent it ends and
     /// relaunches is ITS act, so while the step runs the host neither stops
-    /// it nor hands it the exit. A step that ended the agent and whose
-    /// relaunch waited leaves the tab at its shell once it is over: that exit
-    /// is handed, and carried as the harness's own restart's whatever
-    /// `[harness] relaunch` says ([`Acts::restarted`], [`on_agent_left`]).
+    /// it nor hands it the exit — nor after it, on a roster read the step
+    /// ran through ([`StepsSeen::stepping`]). A step that ended the agent
+    /// and whose relaunch waited leaves the tab at its shell once it is over:
+    /// that exit is handed, and carried as the harness's own restart's
+    /// whatever `[harness] relaunch` says ([`Acts::restarted`],
+    /// [`on_agent_left`]).
     pub(crate) acting: Arc<AtomicBool>,
     /// The host's own `[harness]` switches, live.
     pub(crate) switches: Arc<Switches>,
@@ -1639,6 +1743,17 @@ impl WorkerJob {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// The holder this worker's loop watches beside, if it watches only:
+    /// the proven self-claim's ([`Self::beside`]), else — a codex-alab with
+    /// none proven yet, or one it gave back while it runs — the agent's own
+    /// name ([`UNCLAIMED_CODEX_ALAB`]): aterm supervises no Codex
+    /// ([`watches_only`]), so its loop claims nothing and its transport
+    /// refuses every write from birth. `None`: the loop supervises.
+    fn watch_beside(&self) -> Option<String> {
+        self.beside()
+            .or_else(|| watches_only(self.agent).then(|| UNCLAIMED_CODEX_ALAB.to_string()))
     }
 
     fn admitted(&self) -> bool {
@@ -1738,8 +1853,8 @@ pub(crate) struct Kept {
     snapshot: Option<Snapshot>,
     /// THE RELAUNCH ON EXIT THIS SESSION IS OWED while its back-off runs
     /// ([`relaunch_until`]): the agent's snapshot, for an exit the relaunch
-    /// is decided on already — a crash (a Claude Code's record survived it,
-    /// a Codex's shell said so: [`relaunch::ExitRecord::crashed`]) or a
+    /// is decided on already — a crash (a Claude Code's record survived it:
+    /// [`relaunch::ExitRecord::crashed`]; a codex-alab's copy read one) or a
     /// stall's remedy — and `None` once the relaunch lands, is left or can never
     /// land. What a seamless update carries across its handoff for the tab
     /// ([`HostHandle::pending_restored_for`]; round six, F13): the back-off
@@ -1824,6 +1939,72 @@ pub(crate) struct Kept {
     exit_watch: Option<ExitWatched>,
     /// What the host keeps of the session's ACCOUNT ([`AccountKept`]).
     account: AccountKept,
+    /// THE WORD THAT THE TAB'S AGENT CANNOT BE BROUGHT BACK, standing
+    /// ([`Lost`]; ATERM-KI-1015-1 LC-4): ended when its conversation is held
+    /// again, in any tab ([`end_lost_words`]), or its tab closes with it
+    /// ([`forget_closed`]: it tells a command to run in that tab) — never by
+    /// a program that merely starts in the tab, which a Claude Code at its
+    /// first-run screen or one about to say `No conversation found` did.
+    lost: Option<Lost>,
+    /// A RELAUNCH AFTER ATERM ENDED LANDED IN THE TAB, of an agent whose
+    /// relaunch this host carries with no live upgrade ([`host_carries_relaunch`]:
+    /// Muse Code), and its continuation may be owed ([`relaunch::owed`]): the
+    /// tab's worker of such an agent asks for its next idle point
+    /// ([`WorkerIdle::wants`]), and that point clears it
+    /// ([`WorkerIdle::at_idle_on`]), as does a worker's attach, which reads
+    /// what is owed itself and parks for it ([`attach`]). Set by the cold
+    /// restore's queue at its landing ([`restored_landing_look`]). Its worker
+    /// may have attached before the relaunch's record said it was owed — the
+    /// roster names the agent the line started while the queue's turn still
+    /// waits on its submit — and an agent with no live upgrade has no due
+    /// upgrade to park its loop for: the first idle point was the loop's
+    /// alone and the continuation was never typed (the Muse Code lane's live
+    /// run `advm1`, 2026-10-17, phase 8). A point it asks for with nothing
+    /// owed (a fresh start's landing) steps nothing. Never set for Claude
+    /// Code, whose owed record is due to its watch's re-park as on main, nor
+    /// for codex-alab, whose worker watches only and would never answer it.
+    carry_asked: bool,
+}
+
+/// What a settle of a relaunch's last step said, told as at an idle point:
+/// a look that found what the resumed build did not bring back tells the
+/// owner once ([`RelaunchSay::NotRestored`]), and a step taken moves what
+/// the owner sees. Whether it settled anything (`done:<word>`).
+fn settle_said(sid: &str, step: &str, hooks: &Hooks) -> bool {
+    if step == "done:lost" {
+        (hooks.note)(HostNote::Relaunch {
+            sid: sid.to_string(),
+            said: RelaunchSay::NotRestored,
+        });
+    }
+    if !step.starts_with("done") {
+        return false;
+    }
+    note_upgrade_act();
+    true
+}
+
+/// THE WORD THAT AN AGENT CANNOT BE BROUGHT BACK, as [`tell`] said it
+/// ([`Kept::lost`]): the conversation it is about, the agent that ended
+/// (whose publication, however stale, is never that conversation held
+/// again), whether the word is the tab's mark ([`Hooks::badge`]) or a line
+/// of the digest, and what it said.
+struct Lost {
+    session: String,
+    pid: u32,
+    marked: bool,
+    reason: String,
+    restarted: bool,
+    command: Option<String>,
+    /// What the conversation the tab's agent holds now says of its task
+    /// ([`Acts::tasked`]), read on as it grows: once someone prompted it, a
+    /// person works in the tab on another conversation, and the mark steps
+    /// down to the digest ([`end_lost_words`]).
+    other: upgrade_drive::Tasked,
+    /// That read panicked on the host thread ([`step_down`], caught): it is
+    /// not asked again for this word, whose mark stands until its
+    /// conversation is held again or its tab closes.
+    faulted: bool,
 }
 
 /// A RELAUNCH ON EXIT A SESSION IS OWED ([`Kept::owed`]): the agent's
@@ -1985,51 +2166,11 @@ struct Probing {
     start: String,
 }
 
-/// WHY A PROBE WAS NOT CLAIMED ([`WorkerIdle::probe_claimed`]), each by its
-/// own word for the log.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum NoProbe {
-    /// `[harness] accounts`, read live, is not `early`: `wall` and `off`
-    /// never probe. Nothing was read.
-    Mode,
-    /// No roster lists an account, the agent is no Claude Code, or nothing
-    /// of its process could be read. With no roster nothing was read, made
-    /// or locked.
-    Unread,
-    /// The process is not one the roster's judgments are about
-    /// ([`AccountLook::judged`]: a listed, stored login in the default
-    /// home): the figures its panel shows are no listed account's.
-    NotJudged,
-    /// Asked afresh under the lock, the roster no longer says a probe is
-    /// due: a sample was recorded since, a wall stands on the account, the
-    /// owner pinned, the account is the active one still unanswered, or
-    /// there is an account to follow.
-    NotDue,
-    /// A claim stands in the way (`accounts::probe_held`): this account's
-    /// within `accounts::PROBE_MIN_S`, or ANY account's within
-    /// `accounts::PROBE_APART_S` — the vendor answers a usage read from the
-    /// home's one snapshot for a minute, whichever login fetched it (READ
-    /// in the 2.1.287 bundle; never observed with two logins).
-    Claimed,
-    /// The store's lock stayed held past its bounded wait.
-    LockHeld,
-    /// The state could not be read or written as this build's.
-    State,
-}
-
-impl NoProbe {
-    fn as_str(self) -> &'static str {
-        match self {
-            NoProbe::Mode => "not-early",
-            NoProbe::Unread => "unread",
-            NoProbe::NotJudged => "not-a-stored-login",
-            NoProbe::NotDue => "not-due",
-            NoProbe::Claimed => "claimed",
-            NoProbe::LockHeld => "lock-held",
-            NoProbe::State => "state",
-        }
-    }
-}
+// WHY A PROBE WAS NOT CLAIMED (`WorkerIdle::probe_claimed`), each by its own
+// word for the log: the loop's own refusals (`aterm_agent::supervise::ProbeNo`),
+// which this host hands the loop as they are (`IdleHost::account_probe`), so a
+// harness tape holds the very refusal and a replay gives it back.
+use aterm_agent::supervise::ProbeNo as NoProbe;
 
 /// WHY A LIMIT RESET WAS NOT CLAIMED ([`WorkerIdle::reset_claimed`]), each by
 /// its own word for the log. What the loop is answered is [`Self::word`]:
@@ -2467,7 +2608,7 @@ const WALL_AGAIN: u8 = 3;
 /// answers ([`account_lagging`]): a moment. The loop decides no nearer than
 /// its own floor (a minute, `IdleHost::account`), so a row a second late is
 /// read a minute on — against a wait that would else run to the limit's
-/// reset, hours or days off.
+/// reset, hours or days off. Waited through [`Hooks::pause`].
 const WALL_AGAIN_AFTER: Duration = Duration::from_secs(30);
 
 /// THE ADVICE OF A SESSION WHOSE EVIDENCE LAGS ITS SCREEN
@@ -2597,6 +2738,7 @@ impl Kept {
                 place,
                 cold: false,
                 asked: owed.asked,
+                was: None,
             })),
             _ => Stop::ForGood,
         }
@@ -2638,6 +2780,14 @@ pub(crate) struct FollowStamp {
     /// within 0.6 s of the Enter), and its record is followed for it
     /// ([`follow_entries`]).
     screen: u64,
+    /// A VENDOR CODEX (the Codex screen lane's retirement, 2026-10-16): a
+    /// session whose agent is Codex with no proven self-claim, no copy of its
+    /// record and no ALab build in front ([`codex_alab_runs`]). It is shown —
+    /// its own OSC 7501 report, its stall row, the disk tick — and admitted to
+    /// no worker ([`admits`]): nothing continues it, answers its boxes,
+    /// upgrades or relaunches it. `false` for every other agent, and for
+    /// codex-alab, whose worker watches only.
+    vendor: bool,
 }
 
 impl FollowStamp {
@@ -2657,6 +2807,10 @@ type RosterFn = dyn Fn() -> Vec<(String, Program, FollowStamp)> + Send + Sync;
 /// session with none is not in the map.
 type WordsFn = dyn Fn() -> HashMap<String, Autopilot> + Send + Sync;
 type WantedFn = dyn Fn(&str) -> bool + Send + Sync;
+/// Whether tab `sid` is owed a relaunch's continuation ([`Acts::owed`]):
+/// `(sid, only)`, of `only`'s record alone where it names an agent
+/// ([`carries_only`], [`relaunch::owed_of`]).
+type OwedFn = dyn Fn(&str, Option<upgrade::Agent>) -> bool + Send + Sync;
 /// [`Acts::offered`]: for tab `sid`, `None` where the explicit restart would
 /// not be carried, else `Some(promised)`.
 type OfferedFn = dyn Fn(&str) -> Option<bool> + Send + Sync;
@@ -2677,18 +2831,42 @@ type WaitingFn = dyn Fn(&str, Option<crate::presence::RetryPlan>) + Send + Sync;
 /// `(sid, fact)` — an act it took, or the task's face (`None`: unknown).
 type FactFn = dyn Fn(&str, crate::HarnessFact) + Send + Sync;
 
-/// A Codex's wall reset as the worker placed it, told to the window
-/// ([`IdleHost::place_reset`]): `(sid, placement)`, or `None` once the loop
-/// that placed it ended.
-type PlacedFn = dyn Fn(&str, Option<crate::presence::PlacedReset>) + Send + Sync;
 type EpochFn = dyn Fn() -> u64 + Send + Sync;
 type StepFn = dyn Fn(&str, u32) -> String + Send + Sync;
+/// A relaunched agent's owed carry-on, taken ([`Acts::resume`]): `(sid,
+/// grace, carry)`, what the host knows of the session and its point
+/// ([`CarryPoint`]), the step's word back.
+type ResumeFn = dyn Fn(&str, u32, CarryPoint) -> String + Send + Sync;
+/// That carry-on settled with nothing typed where the agent rests at a
+/// point its loop withheld from the host ([`Acts::settle`]): `(sid)`.
+type SettleFn = dyn Fn(&str) -> String + Send + Sync;
+
+/// What a relaunched agent's owed carry-on is told at the tab's idle point
+/// ([`Acts::resume`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CarryPoint {
+    /// The session's Autopilot is Land ([`upgrade_drive::Opts::land`]): the
+    /// carry-on types nothing of Cruise's and leaves the point to the loop's
+    /// land policy (F2).
+    pub(crate) land: bool,
+    /// The loop read the point as a task done under Land
+    /// ([`IdlePoint::done_under_land`]): the relaunched agent is adopted and
+    /// nothing is typed (`done:said-done`, `relaunch::resume_as`).
+    pub(crate) done_under_land: bool,
+    /// The one agent whose record is carried ([`carries_only`]): a
+    /// relaunch-only lane's worker carries its own agent's alone; `None`,
+    /// whatever record the tab owes.
+    pub(crate) only: Option<upgrade::Agent>,
+}
 /// The session noted behind since a unix second
 /// ([`upgrade_drive::note_behind`]).
 type BehindFn = dyn Fn(&str, u64) -> Behind + Send + Sync;
 /// The upgrade's clocks held until a unix second ([`Acts::hold`]): `false`
 /// while another sweep holds the lock, to be tried again.
 type HoldFn = dyn Fn(&str, u64) -> bool + Send + Sync;
+/// Type a text into a tab, the step's word back ([`Acts::disk_resume`]):
+/// `(sid, text)`.
+type DiskResumeFn = dyn Fn(&str, &str) -> String + Send + Sync;
 type SnapshotFn = dyn Fn(&str) -> Option<Snapshot> + Send + Sync;
 type FollowFn = dyn Fn(&str, &mut Snapshot) -> Foreground + Send + Sync;
 type StatusFn = dyn Fn(&str) -> Option<String> + Send + Sync;
@@ -2703,11 +2881,16 @@ type AskedFn = dyn Fn(&str, &Snapshot) -> Option<restart_stamp::Cause> + Send + 
 /// `(sid, grace, snapshot, what the exit left, upgrade, the act's cause)`.
 /// Tab `sid`'s copy of its proven self-claim's record ([`Acts::self_copy`]).
 type SelfCopyFn = dyn Fn(&str) -> Option<self_claimed::Copy> + Send + Sync;
+/// Whether tab `sid`'s proven self-claimed agent, the process `pid` started
+/// at `start`, is at its own idle point now ([`Acts::self_idle`]).
+type SelfIdleFn = dyn Fn(&str, u32, &str) -> bool + Send + Sync;
 /// The crash rule's relaunch ([`Acts::self_relaunch`]): `(sid, grace, snap,
 /// resume, asked)`, the step word.
 type SelfRelaunchFn = dyn Fn(&str, u32, &Snapshot, &self_claimed::Resume, Option<restart_stamp::Cause>) -> String
     + Send
     + Sync;
+type SelfSnapshotFn =
+    dyn Fn(&str, &self_claimed::Copy, &self_claimed::Resume) -> Option<Snapshot> + Send + Sync;
 type RelaunchFn = dyn Fn(&str, u32, &Snapshot, &ExitRecord, bool, Option<restart_stamp::Cause>) -> String
     + Send
     + Sync;
@@ -2716,13 +2899,24 @@ type RelaunchFn = dyn Fn(&str, u32, &Snapshot, &ExitRecord, bool, Option<restart
 type RestartedFn =
     dyn Fn(&str, aterm_agent::harness::upgrade::Agent, Option<u32>) -> bool + Send + Sync;
 /// One attempt at carrying that restart on ([`Acts::carry`]): `(sid, grace,
-/// agent, pid)`.
-type CarryFn =
-    dyn Fn(&str, u32, aterm_agent::harness::upgrade::Agent, Option<u32>) -> String + Send + Sync;
+/// agent, pid, through_hand)` — `through_hand`: the first carry since a hand
+/// the exit was carried through lifted ([`relaunch::carry_restart`]).
+type CarryFn = dyn Fn(&str, u32, aterm_agent::harness::upgrade::Agent, Option<u32>, bool) -> String
+    + Send
+    + Sync;
 /// The relaunch of an agent whose tab a crash of aterm took, in the tab the
-/// next launch reopened ([`relaunch::after_host_ended`]): `(sid, snapshot,
-/// upgrade)` to the step's word.
-type RestoredFn = dyn Fn(&str, &Snapshot, bool) -> String + Send + Sync;
+/// next launch reopened ([`relaunch::after_host_ended_from`]): `(sid,
+/// snapshot, upgrade, the tab it ran in)` to the step's word.
+type RestoredFn = dyn Fn(&str, &Snapshot, bool, Option<&str>) -> String + Send + Sync;
+/// A cold restore reopened tab `sid` from the tab `was` its agent ran in
+/// ([`upgrade_drive::note_earlier_tab`]): `(sid, was)`, noted whatever the
+/// restore does next.
+type EarlierTabFn = dyn Fn(&str, &str) + Send + Sync;
+/// Whether the agent the relaunch of tab `sid`'s conversation (`snap`'s)
+/// adopted is gone, by its record in flight in tab `sid`
+/// ([`relaunch::adopted_gone`]): `None`, the record says nothing — or is
+/// another tab's.
+type AdoptedGoneFn = dyn Fn(&str, &Snapshot) -> Option<bool> + Send + Sync;
 /// One step of a restart of tab `sid` that an outgoing instance left in
 /// flight at a seamless update's Commit ([`HostHandle::resume_after_handoff`]):
 /// `(sid, human_grace_s)` to the step's word, or `None` once the tab has no
@@ -2783,6 +2977,12 @@ type MemoryFn = dyn Fn(&str, u32) -> Option<AgentMemory> + Send + Sync;
 /// none), read on from where the worker's last read of it ended, in the
 /// agent's own records: `(sid, its snapshot, memo)`.
 type TaskedFn = dyn Fn(&str, &Snapshot, &mut upgrade_drive::Tasked) -> Option<bool> + Send + Sync;
+/// Whether the conversation a tab's agent holds says its task is finished
+/// ([`upgrade_drive::Finished::of_snapshot`], the tab's supervisor's own turns
+/// none), read on from where the worker's last read of it ended, in the
+/// agent's own records: `(sid, its snapshot, memo)`.
+type FinishedFn =
+    dyn Fn(&str, &Snapshot, &mut upgrade_drive::Finished) -> Option<bool> + Send + Sync;
 /// The reset the standing usage limit of the conversation a snapshot names
 /// names, read in its agent's own records
 /// ([`upgrade_drive::named_limit_reset`]; [`Acts::limit_reset`]).
@@ -2790,6 +2990,12 @@ type LimitResetFn = dyn Fn(&Snapshot) -> Option<u64> + Send + Sync;
 /// The tail of the transcript the Claude Code a snapshot names writes now
 /// ([`upgrade_drive::snapshot_transcript_tail`]; [`Acts::transcript_tail`]).
 type TranscriptTailFn = dyn Fn(&Snapshot) -> Option<String> + Send + Sync;
+/// The limit row the conversation of a tab's agent stands at, by its
+/// transcript, unless the harness moved it off that row
+/// ([`relaunch::standing_limit`]; [`Acts::standing_limit`]): `(sid, its
+/// snapshot)`.
+type StandingLimitFn =
+    dyn Fn(&str, &Snapshot) -> Option<aterm_agent::harness::upgrade::StandingLimit> + Send + Sync;
 /// The accounts recorder at a session's usage wall ([`Acts::account_wall`]):
 /// `(sid, its agent, whether that agent's SETTINGS leave it its stored
 /// login)` — its route the default one, no settings source and no profile
@@ -2827,14 +3033,13 @@ type AccountMadeFn = dyn Fn(&str, &str, AccountAt) + Send + Sync;
 /// The login a relaunch with no process to read carries
 /// ([`Acts::account_cold`]), for the snapshot the layout carried.
 type AccountColdFn = dyn Fn(&Snapshot) -> Option<String> + Send + Sync;
-/// The reset a Codex's wall words name, placed in the zone that Codex
-/// printed them in: `(pid, $CODEX_HOME, words, now)`
-/// ([`upgrade_drive::codex_wall_reset`]; [`Acts::codex_reset`]).
-type CodexResetFn = dyn Fn(u32, &Path, &str, u64) -> Option<u64> + Send + Sync;
 type BackoffFn = dyn Fn(usize) -> Duration + Send + Sync;
 type PauseFn = dyn Fn(Duration) -> Duration + Send + Sync;
 /// One look of the disk watch over the supervised sessions ([`Hooks::disk`]).
 type DiskFn = dyn Fn(&[String]) + Send + Sync;
+/// The Codex sessions the disk watch covers whether supervised or not
+/// ([`Hooks::codex_roster`]), by sid.
+type CodexRosterFn = dyn Fn() -> Vec<String> + Send + Sync;
 /// What a host thread tells the window ([`Hooks::note`], [`HostNote`]).
 type NoteFn = dyn Fn(HostNote) + Send + Sync;
 
@@ -2880,8 +3085,9 @@ pub(crate) enum HostNote {
     /// ([`Self::DiskSettingsRead`]).
     DiskLowCleanupOff { free_gib: u64, floor_gib: u64 },
     /// The volume is at or above the floor (before a pass, or measured after
-    /// it): said at EVERY such look (the window's end is idempotent),
-    /// so a low-disk line of either form an earlier process raised ends too.
+    /// it): found at EVERY such look (the window's end is idempotent), so a
+    /// low-disk line of either form an earlier process raised ends too —
+    /// and sent to the window once a change ([`DiskEndsSaid`]).
     DiskPlenty,
     /// aterm.toml does not say what the owner meant by a `[disk]` removal
     /// knob, so every removal is off until it is fixed
@@ -2891,10 +3097,30 @@ pub(crate) enum HostNote {
     /// ([`disk_settings_note`]); none quotes a value. Said at every look while
     /// it holds.
     DiskSettingsOff { notes: Vec<String> },
-    /// No `[disk]` value turns removal off: said at EVERY look that reads
+    /// A pass of the disk watch freed `bytes` (`went`: the largest of what
+    /// went, each a line, biggest first): a fact for later, an exceptions
+    /// entry ([`crate::message_reporters::disk_freed_entry`]).
+    DiskFreed { bytes: u64, went: Vec<String> },
+    /// THE DISK IS FULL AND ATERM CAN FREE NOTHING MORE SAFELY: after a pass
+    /// (or with removal off) the home volume is still below the emergency
+    /// line ([`aterm_agent::harness::disk::Thresholds::emergency`]). The
+    /// owner is needed now — one action (freeing space) changes the outcome
+    /// — so it stands on the glass ([`crate::message_reporters::disk_full`]),
+    /// restated in place, until [`Self::DiskFullOver`].
+    DiskFull {
+        free: u64,
+        volume: PathBuf,
+        freed: u64,
+        hogs: Vec<String>,
+        why: String,
+    },
+    /// The volume is back above the emergency line: the alert ends.
+    DiskFullOver,
+    /// No `[disk]` value turns removal off: found at EVERY look that reads
     /// the settings so (the window's end is idempotent), so a `disk.settings`
     /// line, and a [`Self::DiskLowCleanupOff`] line, that an earlier process
-    /// raised end too.
+    /// raised end too — and sent to the window once a change
+    /// ([`DiskEndsSaid`]).
     DiskSettingsRead,
     /// The live upgrade cannot run at all in this tab (`step` names why: its
     /// state folder, `dir`, cannot hold the lock).
@@ -3060,10 +3286,27 @@ impl AccountsSaid {
 ///   is it a line of the digest.
 /// * [`Self::Limited`]: the owner's own `[harness] relaunch = false`. A record.
 /// * [`Self::Cannot`]: no relaunch can be made and only a person can bring the
-///   agent back. With the command to run it is the tab's mark (the ask names why
-///   and the one command); without one, a line of the digest.
+///   agent back. With the command to run, whole, it is the tab's mark (the ask
+///   names why and the one command, [`Hooks::badge`]); without one, a
+///   line of the digest — keyed by its conversation where one is known
+///   (`lost`), else `gone`.
+/// * [`Self::SteppedDown`]: the mark stands no longer while a person works in
+///   the tab on another conversation: its line of the digest, with its
+///   command, a fact for later.
+/// * [`Self::Back`]: the conversation a `Cannot` was about is held again: its
+///   `lost` line ends. Nothing else ends it (LC-4) but a newer word of the
+///   tab (one word per tab: a marked `Cannot` ends it, an unmarked one writes
+///   over it) and the tab closing.
 /// * [`Self::Ended`]: an agent runs in the tab again (or nothing is owed any
-///   more): every line above ends.
+///   more): every line above ends, save a `lost` one.
+/// * [`Self::NotRestored`]: the agent came back, and Claude Code itself
+///   reported that something the session ran (a watch, a monitor, a loop) did
+///   not, where nothing was typed to restore it — a finished or taskless
+///   conversation (`relaunch::restore_look`'s `done:lost`; XREV-LC-2). A line
+///   of the digest, never a mark: the owner looks at the tab when they come.
+///   Its key is its own (`not-restored`, never the `lost` of a `Cannot`): it
+///   outlives [`Self::Ended`], [`Self::Back`] and a newer word of the tab —
+///   the agent runs, and what it lost stays lost — and ends with the tab.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RelaunchSay {
     Failing {
@@ -3071,6 +3314,10 @@ pub(crate) enum RelaunchSay {
         blocked_by: Option<&'static str>,
         /// The relaunch is aterm's own restart's, carried.
         restarted: bool,
+        /// The command the tab's mark names, which starts the agent by hand
+        /// (`None`: no mark, and the digest says it: LC-5 of
+        /// ATERM-KI-1015-1).
+        command: Option<String>,
     },
     Limited {
         why: String,
@@ -3079,10 +3326,23 @@ pub(crate) enum RelaunchSay {
         /// The refusal in a person's words.
         reason: String,
         restarted: bool,
-        /// `claude --resume <id>` (with its carried flags) when one is known.
+        /// `claude --resume <id>` (with its carried flags, and the Claude
+        /// home its agent ran under), or a Codex's `codex resume <thread>`,
+        /// when one is known.
+        command: Option<String>,
+        /// The word is the tab's mark ([`Hooks::badge`]).
+        marked: bool,
+        /// The conversation it is about is known ([`Kept::lost`]).
+        lost: bool,
+    },
+    SteppedDown {
+        reason: String,
+        restarted: bool,
         command: Option<String>,
     },
+    Back,
     Ended,
+    NotRestored,
 }
 
 /// The host's seams onto the process: which sessions run an agent, whether
@@ -3114,6 +3374,14 @@ pub(crate) struct Hooks {
     /// remembers of the session's upgrade.
     pub(crate) still_wanted: Arc<StillFn>,
     pub(crate) body: Arc<BodyFn>,
+    /// THE TAB'S MARK OF A RELAUNCH'S WORD (`Some`: raised, `None`:
+    /// lowered), under its own owner ([`RELAUNCH_ATTENTION_OWNER`];
+    /// ATERM-KI-1015-1 LC-4), which no loop's start ends: an agent that
+    /// cannot be brought back, ended only by its conversation running in the
+    /// tab or held again in any tab, a person working on another in the tab
+    /// ([`end_lost_words`]), a relaunch that lands, or a successor's first
+    /// worker over no ask of its own ([`WorkerJob::unset_mark`]); a relaunch
+    /// that keeps failing, ended with its trying.
     pub(crate) badge: Arc<BadgeFn>,
     /// Where the loop's NEXT TRY goes ([`IdleHost::waiting`], the tab's
     /// retry plan): the window, which shows it on the tab beside an API wall
@@ -3127,14 +3395,15 @@ pub(crate) struct Hooks {
     /// Autopilot chip (`Wake::HarnessFact`). Facts only: nothing acts on them.
     pub(crate) fact: Arc<FactFn>,
 
-    /// Where a Codex's wall reset goes once the worker placed it in that
-    /// Codex's own zone ([`IdleHost::place_reset`]): the window, which counts
-    /// the tab's wall down to it (`Wake::HarnessReset`). A fact only —
-    /// nothing acts on it.
-    pub(crate) placed: Arc<PlacedFn>,
     pub(crate) claim_epoch: Arc<EpochFn>,
     pub(crate) acts: Acts,
     pub(crate) backoff: Arc<BackoffFn>,
+    /// The length a named pause is waited: the relaunch's and the upgrade's
+    /// own pauses, the restored queue's, and the host's answers at the
+    /// loop's turn ends and idle points ([`WorkerIdle`]: the next look at a
+    /// background break, the moment a lagging or resetting account is
+    /// decided again). Production waits each as named, or its test value
+    /// under the one timing value (`aterm_gui_timing`).
     pub(crate) pause: Arc<PauseFn>,
     /// THE OWNER'S VIEW of this instance's upgrades
     /// ([`upgrade_drive::View`]): looked at by the host thread when
@@ -3147,6 +3416,16 @@ pub(crate) struct Hooks {
     /// and then the least recently used until free space is back
     /// ([`live_disk`], `aterm_agent::harness::cli::disk_tick`).
     pub(crate) disk: Arc<DiskFn>,
+    /// THE DISK WATCH'S CODEX SESSIONS, SUPERVISED OR NOT ([`disk_roster`]):
+    /// every live session whose agent is Codex by its name or its reader
+    /// ([`identified_agent`]), and every session a proven self-claim holds
+    /// (codex-alab, whatever its program is named). The disk tick is no
+    /// supervision: it is kept for a Codex the harness does not supervise
+    /// (the owner's ruling for the Codex lane's retirement: a vendor codex
+    /// keeps its disk tick), and for one that supervises itself. Live,
+    /// [`codex_roster_of`]: the store's snapshot, then each session's
+    /// timeline and metadata, leaf locks taken one at a time.
+    pub(crate) codex_roster: Arc<CodexRosterFn>,
     /// What the workers and the disk watch tell the window about themselves
     /// ([`HostNote`]): handed to the app loop as `Wake::HostNote`.
     pub(crate) note: Arc<NoteFn>,
@@ -3195,8 +3474,24 @@ pub(crate) struct Acts {
     /// give-up past `MAX_ASKS`. Nothing is ended
     /// ([`upgrade_drive::Opts::background`]).
     pub(crate) notice: Arc<StepFn>,
-    pub(crate) owed: Arc<WantedFn>,
-    pub(crate) resume: Arc<StepFn>,
+    pub(crate) owed: Arc<OwedFn>,
+    /// THE OWED CARRY-ON, at the loop's idle point ([`WorkerIdle::at_idle_on`]):
+    /// `relaunch::resume_as`, told what the host knows of the session and its
+    /// point ([`CarryPoint`]). Under Land it types nothing of Cruise's and
+    /// leaves the point to the loop's land policy (F2); at a point the loop
+    /// read as a task done under Land ([`IdlePoint::done_under_land`]) it
+    /// adopts the relaunched agent and types nothing (`done:said-done`).
+    pub(crate) resume: Arc<ResumeFn>,
+    /// The carry-on [`Self::owed`] names, SETTLED WITH NOTHING TYPED where the
+    /// agent rests at a point the tab's loop withheld from this host — around
+    /// its own act there, its task's end ([`IdleHost::at_withheld_point`];
+    /// [`relaunch::settle`], F1 of the live lab of 2026-10-16): what would
+    /// type stays the idle point's ([`Self::resume`]).
+    pub(crate) settle: Arc<SettleFn>,
+    /// THE DISK RESUME ([`WorkerIdle::at_idle`]): type `text` into tab `sid`
+    /// as one fenced turn (`aterm_agent::harness::disk::type_resume`); the
+    /// step's word, `typed` or `wait:<why>`.
+    pub(crate) disk_resume: Arc<DiskResumeFn>,
     pub(crate) snapshot: Arc<SnapshotFn>,
     pub(crate) follow: Arc<FollowFn>,
     pub(crate) status: Arc<StatusFn>,
@@ -3230,13 +3525,26 @@ pub(crate) struct Acts {
     pub(crate) offered: Arc<OfferedFn>,
     pub(crate) relaunch: Arc<RelaunchFn>,
     /// ATERM'S COPY of a proven self-claimed codex-alab's session record for
-    /// tab `sid` ([`crate::self_claim::copy_for`]: read only while its
+    /// tab `sid` ([`crate::self_claim::copy_of_tab`]: read only while its
     /// identity was live), whatever identity it names: the exit's reader
     /// matches it to the snapshot ([`self_claimed_exit`]).
     pub(crate) self_copy: Arc<SelfCopyFn>,
+    /// THE WATCH-ONLY WORKER'S IDLE POINT beside a proven self-claim
+    /// ([`WorkerIdle::beside_idle`]): `(sid, pid, start)` — whether the
+    /// session's proven claim still names that very process, and its own
+    /// session record, read NOW while the identity is live, says it rests
+    /// ([`self_claimed::read_idle`]: `status: "idle"`, `draftEmpty: true`).
+    /// No screen is read. Live, [`self_idle_now`]; `false` for anything
+    /// else.
+    pub(crate) self_idle: Arc<SelfIdleFn>,
     /// THE CRASH RULE'S RELAUNCH of such an agent, on the line its copy
     /// validated ([`upgrade_drive::self_claimed_after_exit`]).
     pub(crate) self_relaunch: Arc<SelfRelaunchFn>,
+    /// THE SNAPSHOT OF SUCH AN AGENT NO READ REACHED WHILE IT RAN
+    /// ([`relaunch::self_claimed_snapshot`]): its copy's identity at the shell
+    /// that holds tab `sid` at its exit, `None` where no job-control shell
+    /// does (a tab whose agent was its spawn command).
+    pub(crate) self_snapshot: Arc<SelfSnapshotFn>,
     /// Whether the harness's OWN restart ended the agent that left — the
     /// upgrade's, or the restart in place's, left in flight by its step
     /// ([`relaunch::restarted`]: both lanes' by the snapshot's pid, `None`
@@ -3248,6 +3556,19 @@ pub(crate) struct Acts {
     /// The relaunch of a restored tab's agent after aterm itself ended
     /// ([`HostHandle::relaunch_restored`]).
     pub(crate) relaunch_restored: Arc<RestoredFn>,
+    /// THE TAB A RESTORED AGENT RAN IN, noted beside its reopened tab's
+    /// ledger as the restore hands it over ([`queue_restored`]; the decision
+    /// review's RR-LC-3): a held tab, one an agent ran in since and a
+    /// carried claim relaunch nothing, so no conversation record keeps the
+    /// old tab, and a loop that later took the resumed conversation read the
+    /// old loop's `keep going` after the token as someone's prompt.
+    pub(crate) earlier_tab: Arc<EarlierTabFn>,
+    /// WHETHER A RESTORED LANDING'S ADOPTED AGENT IS GONE, by the
+    /// conversation's record ([`restored_landing_look`]; the residual
+    /// review's R5): the look right after an `adopted` step that reads no
+    /// agent and finds none named in its tab is decided by it — alive, read
+    /// again; gone, relaunched again — where it was left to the roster.
+    pub(crate) adopted_gone: Arc<AdoptedGoneFn>,
     /// One step of a restart the outgoing instance left in flight at a
     /// seamless update's Commit, while one is
     /// ([`HostHandle::resume_after_handoff`]; a seamless update is unix's).
@@ -3260,6 +3581,11 @@ pub(crate) struct Acts {
     /// records: where its snapshot read its record (its `CLAUDE_CONFIG_DIR`
     /// resolved as Claude Code resolves it), as every relaunch reads them.
     pub(crate) tasked: Arc<TaskedFn>,
+    /// Whether the conversation the session's agent holds says its task is
+    /// finished — its worker ended it, and no prompt of a person's or an
+    /// orchestrator's came since ([`WorkerIdle::finished`]) — read in the
+    /// agent's own Claude records, where [`Self::tasked`] reads them.
+    pub(crate) finished: Arc<FinishedFn>,
     /// The usage limit's reset the conversation's transcript names, past or
     /// to come ([`WorkerIdle::limit_until`]): asked by the loop where its
     /// limit episode read none of its own (design record C9), and where a
@@ -3273,6 +3599,12 @@ pub(crate) struct Acts {
     /// writes now, found from that process as the footer finds it (its own
     /// `CLAUDE_CONFIG_DIR` or `HOME`). It reads; it judges nothing.
     pub(crate) transcript_tail: Arc<TranscriptTailFn>,
+    /// THE LIMIT ONLY THE TRANSCRIPT SHOWS ([`WorkerIdle::standing_limit`]):
+    /// the limit row the snapshot's conversation stands at, read in the tail
+    /// [`Self::transcript_tail`] reads, and none where the conversation's
+    /// record says the harness moved it off that row (a bucket's fallback,
+    /// the way back, another account). It reads; it judges nothing else.
+    pub(crate) standing_limit: Arc<StandingLimitFn>,
     /// THE SESSION'S OWN USAGE WALL, RECORDED FOR ITS ACCOUNT (the accounts
     /// design, §5 "What counts as an observation" and §12 slice 2;
     /// [`WorkerIdle::limited`]): the Claude Code the worker keeps, at the
@@ -3346,10 +3678,6 @@ pub(crate) struct Acts {
     /// default home's conversations and the reopened shell's exec
     /// environment; with no roster, the roster's absence alone.
     pub(crate) account_cold: Arc<AccountColdFn>,
-    /// The reset a Codex's usage wall names, placed as its upgrade places it
-    /// ([`WorkerIdle::place_reset`]): asked by the loop wherever it reads
-    /// such a wall's words (the review of 2026-09-30).
-    pub(crate) codex_reset: Arc<CodexResetFn>,
     /// The live upgrade's clocks held through the loop's limit episode
     /// ([`upgrade_drive::hold_clock`], [`WorkerIdle::limited`]).
     pub(crate) hold: Arc<HoldFn>,
@@ -3418,6 +3746,54 @@ fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
         .map(|s| (*s).to_string())
         .or_else(|| payload.downcast_ref::<String>().cloned())
         .unwrap_or_else(|| "panicked".to_string())
+}
+
+/// ONE TAB'S ACT THAT THE HOST THREAD RUNS, CAUGHT: `act`, done for tab `sid`
+/// on the host's own pass — the note behind ([`host_note`]), the follow of
+/// its agent ([`follow_workers`]), the accounts recorder's forget of a
+/// closed tab ([`forget_closed`]), the read that steps a standing mark down
+/// ([`step_down`]) — and `Some` of what it returned, or
+/// `None` where it panicked, said here once: the caller then ends what
+/// asked it, so it is not asked again of that tab. A panic there used to
+/// unwind the pass, and the host's run with it, and an act still due at
+/// the same tab panicked again in every run restarted after it: no pass
+/// reached the tabs after it, started a worker for a new tab, handed an
+/// exit or watched an upgrade — for good (F1-R3-A2's class, the third and
+/// fourth verifications of F1's fix, 2026-10-16). A fault on the host
+/// thread is one tab's at most. `what` names the act in the log.
+fn host_caught<T>(sid: &str, what: &str, act: impl FnOnce() -> T) -> Option<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(act))
+        .map_err(|payload| {
+            aterm_log::warn!(
+                "harness @{sid}: {what} stopped after an internal panic on the host thread; it is \
+                 not asked again for this tab: {}",
+                panic_text(payload.as_ref())
+            );
+        })
+        .ok()
+}
+
+/// AN ACT NO TAB OWNS, CAUGHT, WHEREVER IT RUNS (F1-R6-H1, F1-R6-H2): the
+/// window's own acts on the host thread — the owner's view
+/// ([`look_at_upgrades`]), the disk watch's hand-off ([`look_at_disk`]) — and
+/// the acts the host starts on threads of their own — a tab's upgrade watch
+/// ([`spawn_watch`]), the disk watch's look ([`live_disk`]), the restored
+/// agents' queue ([`queue_restored`]). `Some` of what `act` returned, or
+/// `None` where it panicked, said here once with `then`, what comes of it:
+/// the caller ends what asked it as after any other end. On the host
+/// thread a panic there unwound the pass, and every restarted run asked the
+/// same act first and panicked again, its back-off climbing to an hour: no
+/// tab got a worker, no exit was handed. On its own thread it left the flag
+/// that says the act is in flight set for good, and the act never ran again.
+fn caught<T>(what: &str, then: &str, act: impl FnOnce() -> T) -> Option<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(act))
+        .map_err(|payload| {
+            aterm_log::warn!(
+                "harness: {what} stopped after an internal panic; {then}: {}",
+                panic_text(payload.as_ref())
+            );
+        })
+        .ok()
 }
 
 /// How long a worker waits before its `n`-th restart (1-based): the
@@ -3521,22 +3897,32 @@ fn worker_run(mut job: WorkerJob, hooks: &Hooks) -> WorkerExit {
         if job.stop.load(Ordering::SeqCst) || !job.admitted() {
             return stopped_beside(&job, hooks);
         }
+        // A worker that watches only claims nothing, so its loop never meets
+        // a proven self-claim standing at its start: whose it is, read before
+        // each run ([`WorkerJob::watch_beside`]: the proof's holder, or the
+        // agent itself).
+        if watches_only(job.agent) {
+            *job.beside.lock().unwrap_or_else(PoisonError::into_inner) =
+                (hooks.acts.status)(&job.sid)
+                    .as_deref()
+                    .and_then(proven_self_claim);
+        }
         let end = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (hooks.body)(&job)))
             .unwrap_or_else(|payload| BodyEnd::Failed(panic_text(payload.as_ref())));
         job.clear_badge = false;
+        job.unset_mark = false;
         *job.interrupt.lock().unwrap_or_else(PoisonError::into_inner) = None;
         // The loop that told a next try is gone — ended, held or failed
         // alike: the tab does not keep a time nobody will act on through the
         // restart pause ([`WorkerIdle`]'s drop clears it only when this
         // worker thread ends, and a failing body is started again on the
         // same [`WorkerJob`], its idle host with it). A plan a fresh run
-        // tells is told over this; so is a Codex's reset it places again.
+        // tells is told over this.
         (hooks.waiting)(&job.sid, None);
         // So does the task's face that loop told: "unknown" until the next
         // run's loop tells its own at its start — a body that panicked never
         // reached its loop's end, and a wake may have been lost.
         (hooks.fact)(&job.sid, crate::HarnessFact::Task(None));
-        (hooks.placed)(&job.sid, None);
         if job.stop.load(Ordering::SeqCst) {
             return stopped_beside(&job, hooks);
         }
@@ -3558,8 +3944,11 @@ fn worker_run(mut job: WorkerJob, hooks: &Hooks) -> WorkerExit {
                      only — aterm's stall and memory remedies stand, and its exit is read here",
                     job.sid
                 ),
+                // Only a codex-alab proves a claim, and aterm supervises no
+                // Codex: its worker watches on ([`watches_only`]).
                 None => aterm_log::info!(
-                    "harness @{}: the proven self-claim is gone; supervising again",
+                    "harness @{}: the proven self-claim is gone; watching only (aterm \
+                     supervises no Codex) — its stall and memory remedies stand",
                     job.sid
                 ),
             }
@@ -3720,12 +4109,22 @@ fn exit_handed(job: &WorkerJob) -> bool {
 /// take — or when the upgrade could not read the session yet
 /// ([`Due::Unread`]: the first idle point looks again), or when Claude has
 /// not yet registered the conversation the record must name (it has by the
-/// first idle point, where [`WorkerIdle::at_idle`] reads it again).
+/// first idle point, where [`WorkerIdle::at_idle`] reads it again). An agent
+/// with the relaunch on exit and no live upgrade (Muse Code) is attached the
+/// same way, its upgrade never due: its snapshot is what its relaunch needs,
+/// and a relaunched one is owed its continuation.
 fn attach(job: &WorkerJob, hooks: &Hooks) {
-    if !upgrades(job.agent) {
+    if !upgrades(job.agent) && !relaunches(job.agent) {
         return;
     }
-    let due = if job.switches.upgrade() {
+    // A landed relaunch's ask is for a worker attached before the landing:
+    // this one reads what is owed below and parks for it. Cleared BEFORE that
+    // read, so a landing after it asks again ([`Kept::carry_asked`]).
+    with_kept(job, |k| k.carry_asked = false);
+    // Only the live upgrade asks whether a move is due: no Codex is moved
+    // live (codex-alab moves its own build). What a relaunch needs is still
+    // read.
+    let due = if job.switches.upgrade() && upgrades(job.agent) {
         (hooks.acts.due)(&job.sid)
     } else {
         Due::No
@@ -3765,36 +4164,72 @@ fn attach(job: &WorkerJob, hooks: &Hooks) {
     let incomplete = with_kept(job, |k| {
         k.snapshot.as_ref().is_none_or(|s| s.session.is_none())
     });
-    if incomplete || (hooks.acts.owed)(&job.sid) || looks {
+    if incomplete || (hooks.acts.owed)(&job.sid, carries_only(job.agent)) || looks {
         job.park.store(true, Ordering::SeqCst);
     }
 }
 
-/// Whether the live upgrade is written for `agent`: Claude Code's restart,
-/// and the Codex branch of the same step (the daemon first, then a typed
-/// `/exit` and `codex resume`, never a signal).
+/// Whether the live upgrade is written for `agent`: Claude Code's restart.
+/// No Codex is moved live: a vendor `codex` is shown, and codex-alab moves
+/// its own build.
 fn upgrades(agent: Program) -> bool {
     aterm_agent::harness::lanes::lanes(agent).upgrade
 }
 
 /// Whether the relaunch on exit is written for `agent` ([`on_agent_left`]):
-/// Claude Code's, and — its Codex lane, the harness's Codex parity
-/// (2026-09-27) — Codex's.
+/// Claude Code's; Codex's for codex-alab alone, on the line aterm's copy of
+/// its own record validated ([`self_claimed_exit`]; a vendor `codex`'s exit
+/// is nobody's, [`unproven_codex_exit`]); and Muse Code's (its lane of
+/// 2026-10-17, which has no live upgrade).
 fn relaunches(agent: Program) -> bool {
     aterm_agent::harness::lanes::lanes(agent).relaunch
 }
 
+/// Whether THIS HOST carries `agent`'s relaunch on exit at its idle point
+/// with no live upgrade to take it there ([`WorkerIdle::idle_step`]): its
+/// snapshot read again and its relaunch's owed carry-on stepped. Muse Code's,
+/// whose relaunch in flight is no sweep's; never codex-alab's, which the
+/// sweep carries (`codex_alab_drive::sweep`) while this host reads its
+/// snapshot at the attach alone. The other half of
+/// [`aterm_agent::harness::lanes::sweep_carries_relaunch`], so a relaunch-only
+/// lane's record is carried by exactly one of them: its worker carries its
+/// own agent's record alone ([`carries_only`]). Claude Code is taken through
+/// [`upgrades`].
+fn host_carries_relaunch(agent: Program) -> bool {
+    relaunches(agent) && !aterm_agent::harness::lanes::sweep_carries_relaunch(agent)
+}
+
+/// THE ONE AGENT WHOSE OWED RELAUNCH `agent`'s worker carries
+/// ([`Acts::owed`], [`CarryPoint::only`]): a relaunch-only lane's worker
+/// ([`host_carries_relaunch`], Muse Code) carries its own agent's record and
+/// never one the sweep carries — a codex-alab's left owed in its tab is the
+/// sweep's alone (the review of the lane's rehome, 2026-10-17). `None`, any
+/// record the tab owes: Claude Code's worker, as on main, and a worker that
+/// steps nothing.
+fn carries_only(agent: Program) -> Option<upgrade::Agent> {
+    if host_carries_relaunch(agent) {
+        upgrade::Agent::of(agent)
+    } else {
+        None
+    }
+}
+
 /// Whether the host reads `agent`'s conversation through its TRANSCRIPT —
-/// whether anyone asked it anything ([`WorkerIdle::taskless`]), the limit's
-/// reset it names ([`WorkerIdle::limit_until`]), the tail that confirms a
-/// wall ([`WorkerIdle::transcript_tail`]): Claude Code's, whose own records
-/// name the conversation and the file it writes. A Codex's rollout is not
-/// read here, nor agy's or Muse Code's records, and a program no reader
-/// identifies has none.
+/// whether anyone asked it anything ([`WorkerIdle::taskless`]), whether its
+/// task is finished, the done check's closed answer and the turn it ends on
+/// ([`WorkerIdle::finished`], [`WorkerIdle::check_answer`],
+/// [`WorkerIdle::last_turn_key`]), the limit's reset it names
+/// ([`WorkerIdle::limit_until`]), the tail that confirms a wall and the
+/// launch its rows are read against ([`WorkerIdle::transcript_tail`],
+/// [`WorkerIdle::transcript_tail_again`], [`WorkerIdle::launched_at`]), the
+/// limit only it shows ([`WorkerIdle::standing_limit`]): Claude Code's,
+/// whose own records name the conversation and the file it writes. A
+/// Codex's rollout is not read here, nor agy's, Muse Code's or Gemini CLI's
+/// records, and a program no reader identifies has none.
 fn reads_transcript(agent: Program) -> bool {
     match agent {
         Program::Claude => true,
-        Program::Codex | Program::Agy | Program::Muse | Program::Generic => false,
+        Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => false,
     }
 }
 
@@ -3805,14 +4240,14 @@ fn reads_transcript(agent: Program) -> bool {
 fn accounts_for(agent: Program) -> bool {
     match agent {
         Program::Claude => true,
-        Program::Codex | Program::Agy | Program::Muse | Program::Generic => false,
+        Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => false,
     }
 }
 
 /// How soon a break of the agent's own background work is looked at again
 /// for the notice after one that typed nothing ([`WorkerIdle::at_background`]):
 /// the loop offers such a break at every read of it, and each look reads the
-/// session's builds, its tab and its screen.
+/// session's builds, its tab and its screen. Waited through [`Hooks::pause`].
 const BACKGROUND_LOOK: Duration = Duration::from_secs(60);
 
 /// A SESSION'S NOTE BEHIND STILL TO BE TAKEN (N3 of the live re-tests of
@@ -3982,6 +4417,12 @@ fn ask_note(sid: &str, note: &Mutex<Option<Owed>>, hooks: &Hooks) -> Option<Behi
 /// host wakes [`NOTE_GAP`] or more after the last ask. The instant the host
 /// is to wake for it, if any: none while another asker has it in flight
 /// (that one rings the host as it puts it back).
+///
+/// CAUGHT ([`host_caught`]): an ask that panics here ends the note — owed no
+/// more, by the host or the worker, until the next activation notice owes
+/// it afresh. Left owed as it stood (its flight landed as it unwound,
+/// [`InFlight`]), its instant still due, every restarted host run asked it
+/// again and panicked at the same worker.
 fn host_note(
     sid: &str,
     note: &Mutex<Option<Owed>>,
@@ -4001,8 +4442,9 @@ fn host_note(
                 && o.asked
                     .is_some_and(|at| now >= at + (hooks.pause)(NOTE_GAP)))
     };
-    if asks {
-        ask_note(sid, note, hooks);
+    if asks && host_caught(sid, "its note behind", || ask_note(sid, note, hooks)).is_none() {
+        *note.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        return None;
     }
     host_wake(note)
 }
@@ -4257,6 +4699,18 @@ impl UpgradeRun {
     }
 }
 
+/// What the harness typed into the conversation `snap` names, by tab
+/// `sid`'s loop and by the loops of the earlier tabs its record names
+/// ([`upgrade_drive::conversation_typed`]): a cold-restored tab reads the
+/// old tab's turns as the harness's own (XREV-LC-1).
+fn conversation_typed(
+    o: &upgrade_drive::Opts,
+    sid: &str,
+    snap: &Snapshot,
+) -> Vec<aterm_agent::supervise::approvals::Typed> {
+    upgrade_drive::conversation_typed(o, sid, snap.session.as_deref(), &[])
+}
+
 /// How long the live [`Acts::limit_reset`] keeps a conversation's read of
 /// its transcript's limit reset before reading it again: a reset matters to
 /// the hour ([`upgrade_drive::LIMIT_GRACE_S`] past it), and the loop asks at
@@ -4351,8 +4805,8 @@ pub(crate) struct WorkerIdle {
     look_at: Arc<Mutex<Option<Instant>>>,
     acting: Arc<AtomicBool>,
     /// The stamp of the last step this worker took that may end its agent,
-    /// moved as the step begins ([`Self::act`]) and again as it ends
-    /// ([`Self::acted`]; `0`: none, or the one its predecessor's keep began
+    /// moved as the step begins ([`Self::act`]) and again as it ends, returned
+    /// or unwound ([`Self::acted`]; `0`: none, or the one its predecessor's keep began
     /// at): a kept agent's exit is inferred only while it has not moved
     /// ([`keep_holding`]), and an agent a pass's roster missed is judged
     /// gone only if it has not moved since that read ([`StepsSeen`]).
@@ -4373,6 +4827,9 @@ pub(crate) struct WorkerIdle {
     /// Whether the session's conversation has a task, as far as its record
     /// has been read ([`WorkerIdle::taskless`]).
     tasked: Mutex<upgrade_drive::Tasked>,
+    /// Whether its task is finished, as far as its record has been read
+    /// ([`WorkerIdle::finished`]).
+    finished: Mutex<upgrade_drive::Finished>,
     /// The session's note behind still to be taken ([`Owed`]).
     note: Note,
     /// The unix second the loop last knew the session at its limit, not yet
@@ -4394,6 +4851,12 @@ pub(crate) struct WorkerIdle {
     memory: Mutex<Option<(u32, Instant, Option<AgentMemory>)>>,
     /// What the loop last offered and withheld ([`Points`]).
     points: Arc<Points>,
+    /// Whether the last settle at its loop's withheld point left what a
+    /// later one can settle ([`relaunch::settles_again`]): only then is it
+    /// asked again at a later wake of that point's wait
+    /// ([`IdleHost::at_withheld_point`]). This worker's alone: a successor
+    /// starts with none.
+    settle_later: AtomicBool,
     /// What this worker keeps of its session's usage tap ([`TapKept`]).
     tap: Mutex<TapKept>,
     /// The host started this worker as the session's Autopilot left Off
@@ -4405,13 +4868,16 @@ pub(crate) struct WorkerIdle {
 }
 
 impl WorkerIdle {
-    /// Whether the worker watches beside a proven self-claim
-    /// ([`WorkerJob::beside`]): nothing of the host's is typed or ended.
+    /// Whether the worker watches only ([`WorkerJob::watch_beside`]): beside
+    /// a proven self-claim, or a codex-alab's worker at all
+    /// ([`watches_only`]). Nothing of the host's is typed or ended.
     fn beside(&self) -> bool {
-        self.beside
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_some()
+        watches_only(self.agent)
+            || self
+                .beside
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_some()
     }
 }
 
@@ -4458,6 +4924,10 @@ impl IdleHost for WorkerIdle {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .is_some_and(|at| at <= Instant::now())
+            || (self.on() && disk_owed(&self.sid).is_some())
+            || (self.on()
+                && host_carries_relaunch(self.agent)
+                && with_kept_of(&self.kept, |k| k.carry_asked))
     }
 
     fn wants_at(&self) -> Option<Instant> {
@@ -4503,7 +4973,9 @@ impl IdleHost for WorkerIdle {
         // Claude Code's notices only: a Codex account's usage is its rollouts'.
         let claude = match self.agent {
             Program::Claude => true,
-            Program::Codex | Program::Agy | Program::Muse | Program::Generic => false,
+            Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => {
+                false
+            }
         };
         if !claude || !(listed || own) || !seen.says() {
             return;
@@ -4542,8 +5014,19 @@ impl IdleHost for WorkerIdle {
         }
     }
 
+    /// The live upgrade's wind-down owns the turn ends.
     fn owns_turn_end(&self) -> bool {
         self.on() && self.owns.load(Ordering::SeqCst) && self.switches.upgrade()
+    }
+
+    /// THE DISK IS FULL for this session: its Claude Code said `ENOSPC`
+    /// while the volume measured at an emergency ([`disk_withholds`]), and a
+    /// continuation typed into a session whose every write fails only burns
+    /// turns. Withheld only — no upgrade's ownership, so no account move or
+    /// relaunch hangs on it. The watch lifts it once space is measured back,
+    /// with the resume owed ([`Self::at_idle`]).
+    fn withholds_turn_end(&self) -> bool {
+        self.on() && disk_withholds(&self.sid)
     }
 
     /// A rating survey the loop cannot close, or its end: told to the window as a
@@ -4600,6 +5083,12 @@ impl IdleHost for WorkerIdle {
     /// answered READY among them). The request is cleared FIRST, so a notice
     /// that lands during the step asks again.
     fn at_idle(&self) -> Option<HostStep> {
+        self.at_idle_on(IdlePoint::default())
+    }
+
+    /// [`Self::at_idle`] at a point the loop describes ([`IdlePoint`]): a
+    /// task done under Land gets no carry-on typed ([`Self::idle_step`]).
+    fn at_idle_on(&self, point: IdlePoint) -> Option<HostStep> {
         if !self.on() || self.beside() {
             return None;
         }
@@ -4617,6 +5106,48 @@ impl IdleHost for WorkerIdle {
         }
         self.park.store(false, Ordering::SeqCst);
         drop(look);
+        // A landed relaunch's ask is answered by this point too.
+        with_kept_of(&self.kept, |k| k.carry_asked = false);
+        // THE DISK RESUME (`disk-resume@v1`): space is back after this
+        // session's Claude Code said the disk was full — typed once, fenced
+        // on a fresh read (a box, a draft, a person typing or a hold refuses
+        // it, and it is tried at the next point, [`DISK_RESUME_TRIES`] in all).
+        // Its words end `carry on`, so it keeps a continuation's gates
+        // ([`Self::disk_resume_unowed`]): where they type nothing it is
+        // spent, nothing typed, and the point is the loop's below.
+        let owed = disk_owed(&self.sid);
+        if owed.is_some()
+            && let Some(why) = self.disk_resume_unowed()
+        {
+            disk_resume_stepped(&self.sid, true);
+            aterm_log::info!(
+                "harness @{}: {} step=done:{why}: nothing typed",
+                self.sid,
+                aterm_agent::harness::disk::RULE_DISK_RESUME
+            );
+        } else if let Some(text) = owed {
+            let step = (self.hooks.acts.disk_resume)(&self.sid, &text);
+            let typed = step == "typed";
+            disk_resume_stepped(&self.sid, typed);
+            aterm_log::info!(
+                "harness @{}: {} step={step}",
+                self.sid,
+                aterm_agent::harness::disk::RULE_DISK_RESUME
+            );
+            if typed {
+                return Some(HostStep {
+                    line: format!(
+                        "{} step={step}",
+                        aterm_agent::harness::disk::RULE_DISK_RESUME
+                    ),
+                    moved: true,
+                    // The work resumed: its answer that says done is a done
+                    // report, as a carry-on's is.
+                    typed: Some(aterm_agent::supervise::policy::turn_end::HostTurn::CarryOn),
+                    repeat: false,
+                });
+            }
+        }
         // A limit reset's outcome the store's lock kept out is written at the
         // session's next idle point at the latest ([`Self::reset_flush`]):
         // one lock read where none is held.
@@ -4625,21 +5156,31 @@ impl IdleHost for WorkerIdle {
         {
             self.reset_flush(&seat);
         }
-        let step = self.idle_step();
+        let step = self.idle_step(point);
         if !self.on() {
             return None;
         }
         // A conversation not named yet (a Codex daemon client's thread has
-        // no rollout before its first message) is read again at the next
-        // idle point: known while the agent runs, its relaunch never depends
-        // on its daemon still holding the thread at the exit (a daemon the
-        // upgrade restarts meanwhile drops a dead client's thread).
-        if relaunches(self.agent)
-            && with_kept_of(&self.kept, |k| {
-                k.snapshot.as_ref().is_some_and(|s| s.session.is_none())
-            })
-        {
-            self.park.store(true, Ordering::SeqCst);
+        // no rollout before its first message) is read again at a LOOK a
+        // settle on — at whatever idle point the loop is at then, this one
+        // or the first after the agent's next turn: known while the agent
+        // runs, its relaunch never depends on its daemon still holding the
+        // thread at the exit (a daemon the upgrade restarts meanwhile drops a
+        // dead client's thread). Not by asking for a point again at once
+        // (F1-R6-A1): this step took nothing, and the loop offered the very
+        // point it is at again, thousands of times a second, until someone
+        // prompted the agent. A look the step set stands, a later one too
+        // (F1-R7 V-4): cut to the first rung, an upgrade's wait never climbed
+        // its ladder while nobody prompted the agent, a whole step every
+        // twenty seconds — and the agent's next turn turns that look into a
+        // point ([`IdleHost::turn_ran`]), so the conversation is read as soon.
+        if self.unnamed() {
+            let mut look = self.look_at.lock().unwrap_or_else(PoisonError::into_inner);
+            if look.is_none() {
+                *look = Some(Instant::now() + (self.hooks.pause)(upgrade_drive::first_look()));
+                drop(look);
+                ring();
+            }
         }
         step
     }
@@ -4677,19 +5218,19 @@ impl IdleHost for WorkerIdle {
         if lock().is_some_and(|at| Instant::now() < at) {
             return None;
         }
-        *lock() = Some(Instant::now() + BACKGROUND_LOOK);
         let hooks = &self.hooks;
+        *lock() = Some(Instant::now() + (hooks.pause)(BACKGROUND_LOOK));
         // Nothing read decides nothing here either: the idle point the park
         // keeps looks again.
-        if (hooks.acts.owed)(&self.sid) || (hooks.acts.due)(&self.sid) != Due::Yes {
+        if (hooks.acts.owed)(&self.sid, carries_only(self.agent))
+            || (hooks.acts.due)(&self.sid) != Due::Yes
+        {
             return None;
         }
         if !self.on() {
             return None;
         }
-        self.act();
-        let step = (hooks.acts.notice)(&self.sid, self.grace);
-        self.acted();
+        let step = self.act(|| (hooks.acts.notice)(&self.sid, self.grace));
         if !self.on() {
             return None;
         }
@@ -4716,6 +5257,46 @@ impl IdleHost for WorkerIdle {
             self.owns.store(true, Ordering::SeqCst);
         }
         Some(format!("upgrade step={step}"))
+    }
+
+    /// THE AGENT RESTS AT A POINT ITS LOOP'S GUARD WITHHELD FROM THIS WORKER
+    /// ([`IdleHost::at_withheld_point`]: a limit episode, a wall, the loop's
+    /// own act in flight): a relaunched agent's carry-on still owed
+    /// ([`relaunch::owed`]) is settled there WITH NOTHING TYPED
+    /// ([`Acts::settle`], [`relaunch::settle`]) — `done:carried` once the
+    /// loop's own act there resumed it, its one look open for its whole
+    /// window (F1-V1) — and what would type stays the next idle point's. F1
+    /// of the live lab of 2026-10-16: a crash's relaunch under a usage limit
+    /// stayed owed through the done check and `DONE`, holding the tab's
+    /// automatic update (its notice at a break, its step at idle) behind it
+    /// until the limit's reset plus an hour. A look that finds what the
+    /// resumed build did not bring back tells the owner, as at an idle point
+    /// (`done:lost`). Nothing owed asks nothing; a word that settled nothing
+    /// says nothing.
+    ///
+    /// ITS RETRIES ARE THE LOOP'S OWN (F1-R4, the fourth verification of F1's
+    /// fix): asked at the point and at the first ask of its wait — a look
+    /// this worker left come due partway through it among them (F1-R5-A1) —
+    /// and at a later wake of that wait only where the last settle left what
+    /// a later one can settle ([`Self::settle_later`]: another sweep's lock,
+    /// a relaunch not adopted yet, a look still open). A carry-on that would type is not
+    /// read again every wake for hours — each settle reads the conversation's
+    /// records — but at the loop's next point. The host thread settles
+    /// nothing: its timer, arm and catch (F1-R2, F1-R3) are gone, and with
+    /// them the successor that never settled what its predecessor's loop
+    /// left (F1-R4-A1): a successor's loop asks at its own first point.
+    fn at_withheld_point(&self, wake: bool) -> Option<String> {
+        if !self.on() || (wake && !self.settle_later.load(Ordering::SeqCst)) {
+            return None;
+        }
+        if !(self.hooks.acts.owed)(&self.sid, carries_only(self.agent)) {
+            self.settle_later.store(false, Ordering::SeqCst);
+            return None;
+        }
+        let step = (self.hooks.acts.settle)(&self.sid);
+        self.settle_later
+            .store(relaunch::settles_again(&step), Ordering::SeqCst);
+        settle_said(&self.sid, &step, &self.hooks).then(|| format!("carry-on step={step}"))
     }
 
     /// The loop withheld the point this worker asked for ([`Points`]): kept,
@@ -4749,9 +5330,7 @@ impl IdleHost for WorkerIdle {
             return self.on().then_some(step);
         }
         let hooks = &self.hooks;
-        self.act();
-        let step = (hooks.acts.restart)(&self.sid, self.grace, why);
-        self.acted();
+        let step = self.act(|| (hooks.acts.restart)(&self.sid, self.grace, why));
         if !self.on() {
             return None;
         }
@@ -4781,6 +5360,26 @@ impl IdleHost for WorkerIdle {
         self.on() && relaunches(self.agent) && self.switches.relaunch()
     }
 
+    /// BESIDE A PROVEN SELF-CLAIM, THE AGENT'S OWN IDLE POINT
+    /// ([`IdleHost::beside_idle`]): the process the kept snapshot names — the
+    /// one the remedies end — is the proven claim's, and its own session
+    /// record, read now while its identity is live, says it rests
+    /// ([`Acts::self_idle`]). Never a screen read. `false` off a self-claim,
+    /// before a snapshot, and for anything the read cannot vouch for.
+    fn beside_idle(&self) -> bool {
+        if !self.on() || !self.beside() {
+            return false;
+        }
+        let agent = self
+            .kept
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .snapshot
+            .as_ref()
+            .map(|snap| (snap.pid, snap.start.clone()));
+        agent.is_some_and(|(pid, start)| (self.hooks.acts.self_idle)(&self.sid, pid, &start))
+    }
+
     /// The agent's process as the kept snapshot names it: the leader the
     /// stall's remedy restarts (`restart pid=<n> if-stalled`). One leaf lock.
     fn agent_pid(&self) -> Option<u32> {
@@ -4790,6 +5389,29 @@ impl IdleHost for WorkerIdle {
             .snapshot
             .as_ref()
             .map(|snap| snap.pid)
+    }
+
+    /// When the kept snapshot's process started ([`process_started`]): a
+    /// countdown Claude Code armed before it is a gone process's
+    /// ([`IdleHost::agent_started`]). One leaf lock; `None` with no snapshot.
+    fn agent_started(&self) -> Option<i64> {
+        self.kept
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .snapshot
+            .as_ref()
+            .and_then(|snap| process_started(&snap.start))
+    }
+
+    /// The conversation the kept snapshot names
+    /// ([`IdleHost::agent_conversation`]). One leaf lock; no read.
+    fn agent_conversation(&self) -> Option<String> {
+        self.kept
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .snapshot
+            .as_ref()
+            .and_then(|snap| snap.session.clone())
     }
 
     /// Whether the explicit restart would be carried for the agent now, and
@@ -4804,10 +5426,10 @@ impl IdleHost for WorkerIdle {
 
     /// The line a person runs to resume this session's agent on its OWN
     /// conversation — `claude --resume <id>` with its launch flags, a
-    /// `--model` its record marks failed left off, or `codex resume <thread>`
-    /// with its kept flags ([`resume_told`]) — from the relaunch snapshot the
-    /// host keeps of it (its argv and the conversation the agent's own
-    /// records name, FOLLOWED through an in-app `/clear`), for the loop's
+    /// `--model` its record marks failed left off ([`resume_told`]) — from
+    /// the relaunch snapshot the host keeps of it (its argv and the
+    /// conversation the agent's own records name, FOLLOWED through an in-app
+    /// `/clear`), for the loop's
     /// frozen mail and memory escalation where the host does not relaunch it
     /// itself. `None` for an agent the relaunch is not written for, or before
     /// a snapshot was read. Never `claude --continue` (robustness backlog
@@ -4840,7 +5462,9 @@ impl IdleHost for WorkerIdle {
     fn reach(&self) -> Reach {
         let probed = match self.agent {
             Program::Claude => self.switches.probe_api(),
-            Program::Codex | Program::Agy | Program::Muse | Program::Generic => false,
+            Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => {
+                false
+            }
         };
         if !probed {
             return Reach::Unknown;
@@ -4902,7 +5526,9 @@ impl IdleHost for WorkerIdle {
     /// which a self-waking agent must not renew. A person's looks start over
     /// (the review of 2026-09-28): theirs are counted at one point, and the
     /// READY answer is a turn of its own. A step that did not wait left no
-    /// pause to start over.
+    /// pause to start over. Nor does a conversation not named yet wait out
+    /// its look ([`IdleHost::at_idle`]): the turn may have been its first
+    /// message, and the point after it reads it (F1-R6-A1).
     fn turn_ran(&self) {
         if let Some(pid) = with_kept_of(&self.kept, |k| k.snapshot.as_ref().map(|s| s.pid)) {
             self.tap
@@ -4910,10 +5536,11 @@ impl IdleHost for WorkerIdle {
                 .unwrap_or_else(PoisonError::into_inner)
                 .served = Some(pid);
         }
+        let unnamed = self.unnamed();
         let mut run = self.run.lock().unwrap_or_else(PoisonError::into_inner);
         let climbed = run.same > 0;
         run.new_point();
-        if !climbed {
+        if !climbed && !unnamed {
             return;
         }
         let pending = self
@@ -4972,6 +5599,71 @@ impl IdleHost for WorkerIdle {
         (self.hooks.acts.tasked)(&self.sid, &snap, &mut memo) == Some(false)
     }
 
+    /// ITS WORKER FINISHED ITS TASK AND NOBODY HAS ASKED ANYTHING SINCE: the
+    /// conversation a Claude Code holds — the kept record, as
+    /// [`Self::taskless`] reads it — through [`Acts::finished`], read on from
+    /// where the last read ended. Claude Code's own wakes (a background task's
+    /// notification, its usage-limit continuation), the harness's turns and a
+    /// relaunched agent's start-up reopen nothing; a person's or an
+    /// orchestrator's prompt does. A Codex, and a conversation not registered
+    /// yet, are left to the screen (`None`).
+    fn finished(&self) -> Option<bool> {
+        if !reads_transcript(self.agent) {
+            return None;
+        }
+        let snap = self
+            .kept
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .snapshot
+            .clone()
+            .filter(|s| s.session.is_some())?;
+        let mut memo = self.finished.lock().unwrap_or_else(PoisonError::into_inner);
+        (self.hooks.acts.finished)(&self.sid, &snap, &mut memo)
+    }
+
+    /// WHAT THE DONE CHECK'S CLOSED ANSWER SAYS BY THE RECORD
+    /// ([`IdleHost::check_answer`], the review's RR4-TE-1): the memo
+    /// [`Self::finished`] just read, not read again
+    /// (`upgrade_drive::Finished::check_answer`). A Codex reads none.
+    fn check_answer(&self) -> Option<bool> {
+        if !reads_transcript(self.agent) {
+            return None;
+        }
+        self.finished
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .check_answer()
+    }
+
+    /// WHETHER THE FINISH [`Self::finished`] READ IS A DONE REPLY IN WORDS TO
+    /// THE DONE CHECK, not the worker's token ([`IdleHost::finished_at_check`],
+    /// F2 of the live lab of 2026-10-16): the memo that read just made, not
+    /// read again (`upgrade_drive::Finished::finished_at_check`). A Codex
+    /// reads none.
+    fn finished_at_check(&self) -> bool {
+        reads_transcript(self.agent)
+            && self
+                .finished
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .finished_at_check()
+    }
+
+    /// THE TURN THE CONVERSATION ENDS ON, by its key
+    /// ([`IdleHost::last_turn_key`], the merge review's XR-1): the memo
+    /// [`Self::finished`] just read, not read again
+    /// (`upgrade_drive::Finished::last_turn_key`). A Codex reads none.
+    fn last_turn_key(&self) -> Option<String> {
+        if !reads_transcript(self.agent) {
+            return None;
+        }
+        self.finished
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .last_turn_key()
+    }
+
     /// THE USAGE LIMIT'S RESET THE CONVERSATION'S TRANSCRIPT NAMES
     /// ([`IdleHost::limit_until`]; the owner's ruling of 2026-09-29, design
     /// record C9): the conversation a Claude Code holds — the kept record, as
@@ -5018,42 +5710,56 @@ impl IdleHost for WorkerIdle {
         (self.hooks.acts.transcript_tail)(&snap)
     }
 
-    /// A CODEX'S WALL, PLACED WHERE ITS UPGRADE PLACES IT
-    /// ([`IdleHost::place_reset`]; the review of 2026-09-30): the words of
-    /// the wall the Codex the worker keeps (its snapshot's pid and
-    /// `$CODEX_HOME`) printed, placed in that Codex's own zone through
-    /// [`Acts::codex_reset`] — the loop runs in this process, whose zone a
-    /// `TZ` the tab's shell exported never reaches. `Some(None)`: its zone
-    /// cannot be read, and no reset is guessed, as its upgrade guesses none.
-    /// A Claude Code (its words name their zone), and a Codex not read yet,
-    /// are the loop's own to read.
-    fn place_reset(&self, text: &str, now: i64) -> Option<Option<i64>> {
-        match self.agent {
-            Program::Codex => {}
-            Program::Claude | Program::Agy | Program::Muse | Program::Generic => return None,
+    /// THE SAME TRANSCRIPT READ AGAIN ([`IdleHost::transcript_tail_again`]):
+    /// the kept snapshot's, the agent not read again — as [`Self::finished`]
+    /// and [`Self::taskless`] read it. The first read of each decision,
+    /// [`Self::transcript_tail`], refreshes the snapshot (a relaunch in the tab
+    /// moves it); the decision's LAG re-reads right after it ask only the
+    /// file again. A Codex, or no snapshot kept, reads none.
+    fn transcript_tail_again(&self) -> Option<String> {
+        if !reads_transcript(self.agent) {
+            return None;
         }
-        let (pid, home) = self
+        let snap = self
             .kept
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .snapshot
-            .as_ref()
-            .and_then(|s| Some((s.pid, s.codex.as_ref()?.home.clone())))?;
-        let now = u64::try_from(now).ok()?;
-        let at = (self.hooks.acts.codex_reset)(pid, &home, text, now)
-            .and_then(|at| i64::try_from(at).ok());
-        // The window counts the tab's wall down to this placement, not to its
-        // own reading of the words in its own zone.
-        (self.hooks.placed)(
-            &self.sid,
-            Some(crate::presence::PlacedReset {
-                words: text.to_string(),
-                at_unix: at,
-            }),
-        );
-        Some(at)
+            .clone()?;
+        (self.hooks.acts.transcript_tail)(&snap)
     }
 
+    /// WHEN THE CLAUDE CODE WHOSE TRANSCRIPT WAS LAST READ WAS LAUNCHED
+    /// ([`IdleHost::launched_at`], BG-1): the kernel start of the process the
+    /// snapshot names — the one [`Self::transcript_tail`] read afresh just
+    /// before — as unix seconds. A row of the transcript older than it was
+    /// written by a process aterm or a `--resume` has ended, whose background
+    /// work ended with it. A Codex, and a process not read, name none. The
+    /// same kernel start as [`Self::agent_started`] reads.
+    fn launched_at(&self) -> Option<i64> {
+        if !reads_transcript(self.agent) {
+            return None;
+        }
+        self.agent_started()
+    }
+
+    /// THE LIMIT ONLY THE TRANSCRIPT SHOWS ([`IdleHost::standing_limit`]):
+    /// the Claude Code in the tab NOW — the snapshot read again first, as
+    /// [`Self::transcript_tail`] reads it — through [`Acts::standing_limit`],
+    /// which names none the harness moved the conversation off. A read that
+    /// fails names none, and so does a Codex.
+    fn standing_limit(&self) -> Option<aterm_agent::harness::upgrade::StandingLimit> {
+        if !reads_transcript(self.agent) || !refresh_snapshot(&self.sid, &self.kept, &self.hooks) {
+            return None;
+        }
+        let snap = self
+            .kept
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .snapshot
+            .clone()?;
+        (self.hooks.acts.standing_limit)(&self.sid, &snap)
+    }
     /// The loop's LIMIT EPISODE opened or closed: the live upgrade owns none
     /// of the session's turn ends while one stands (its gates wait `limited`,
     /// and the wall is the loop's to wait out), and its clocks are held to
@@ -5421,11 +6127,11 @@ impl IdleHost for WorkerIdle {
     /// live, a listed stored login in the default home, and one bounded
     /// transaction in which the roster must still say `Probe` and the claim
     /// must take. `Ok` is the only answer on which the loop types; a refusal
-    /// is its one word ([`NoProbe::as_str`]), which the loop puts on its own
+    /// is its one word ([`NoProbe::word`]), which the loop puts on its own
     /// line about the probe it did not run (`SKIPPED … gate=claim
     /// host=<word>`).
-    fn account_probe(&self) -> Result<(), &'static str> {
-        self.probe_claim().map_err(NoProbe::as_str)
+    fn account_probe(&self) -> Result<(), NoProbe> {
+        self.probe_claim()
     }
 
     /// WHAT THE CLAIMED PROBE READ ([`IdleHost::account_probed`]):
@@ -5456,18 +6162,15 @@ impl IdleHost for WorkerIdle {
     }
 }
 
-/// A worker that ends takes its session's next try with it, and the reset it
-/// placed for a Codex's wall: the tab does not keep a time nobody will act on,
-/// and counts a wall down in its own zone again. (A loop that ends and is
-/// STARTED AGAIN on the same worker takes them too: [`worker_main`] tells
-/// `None` as each run of the body ends, since this drop runs only when the
-/// worker thread does.)
+/// A worker that ends takes its session's next try with it: the tab does not
+/// keep a time nobody will act on. (A loop that ends and is STARTED AGAIN on
+/// the same worker takes it too: [`worker_main`] tells `None` as each run of
+/// the body ends, since this drop runs only when the worker thread does.)
 impl Drop for WorkerIdle {
     fn drop(&mut self) {
         (self.hooks.waiting)(&self.sid, None);
         // …and the task's face it told: nobody tells it any more.
         (self.hooks.fact)(&self.sid, crate::HarnessFact::Task(None));
-        (self.hooks.placed)(&self.sid, None);
         // A worker's end ends its own silent tap.
         let silent = self
             .tap
@@ -5713,16 +6416,34 @@ impl WorkerIdle {
         }
     }
 
-    /// THE HOST'S STEP at an idle point ([`IdleHost::at_idle`], which parks
-    /// again after it while the conversation is unnamed): the relaunch
+    /// Whether this worker's agent is one the relaunch is written for and
+    /// its kept snapshot names no conversation yet ([`IdleHost::at_idle`]
+    /// reads it again at a look, [`IdleHost::turn_ran`] at the point after a
+    /// turn).
+    fn unnamed(&self) -> bool {
+        relaunches(self.agent)
+            && with_kept_of(&self.kept, |k| {
+                k.snapshot.as_ref().is_some_and(|s| s.session.is_none())
+            })
+    }
+
+    /// THE HOST'S STEP at an idle point ([`IdleHost::at_idle`], which sets a
+    /// look after it while the conversation is unnamed): the relaunch
     /// record read again, then the upgrade's step or a relaunched agent's
-    /// owed carry-on.
-    fn idle_step(&self) -> Option<HostStep> {
-        if !self.on() || !upgrades(self.agent) {
+    /// owed carry-on — with nothing typed where the loop read the point as a
+    /// task done under Land ([`IdlePoint::done_under_land`]).
+    fn idle_step(&self, point: IdlePoint) -> Option<HostStep> {
+        // An agent whose relaunch on exit this host carries with no live
+        // upgrade (Muse Code, [`host_carries_relaunch`]) takes this step too:
+        // its snapshot read again, and its own agent's relaunch's owed
+        // carry-on alone ([`carries_only`]); its upgrade is never due.
+        // codex-alab's is the sweep's, as on main.
+        let upgraded = upgrades(self.agent);
+        let relaunched = relaunches(self.agent);
+        if !self.on() || !(upgraded || host_carries_relaunch(self.agent)) {
             return None;
         }
         let hooks = &self.hooks;
-        let relaunched = relaunches(self.agent);
         if relaunched {
             refresh_snapshot(&self.sid, &self.kept, hooks);
         }
@@ -5731,7 +6452,7 @@ impl WorkerIdle {
         self.hold_clock();
         // A note behind still owed (N3) is asked first: a step that mints the
         // state then finds it minted with its age from the attach.
-        if self.switches.upgrade() {
+        if upgraded && self.switches.upgrade() {
             ask_note(&self.sid, &self.note, hooks);
         }
         let mut run = self.run.lock().unwrap_or_else(PoisonError::into_inner);
@@ -5743,18 +6464,38 @@ impl WorkerIdle {
             run.worded();
         }
         let due = || {
-            if self.switches.upgrade() {
+            if upgraded && self.switches.upgrade() {
                 (hooks.acts.due)(&self.sid)
             } else {
                 Due::No
             }
         };
-        let (what, step) = if (hooks.acts.owed)(&self.sid) {
+        let only = carries_only(self.agent);
+        let (what, step) = if (hooks.acts.owed)(&self.sid, only) {
             if !self.on() {
                 return None;
             }
             // Types into the agent, never ends it: its exit, meanwhile, is one.
-            ("carry-on", (hooks.acts.resume)(&self.sid, self.grace))
+            // Under Land it types nothing of Cruise's: the point is the
+            // loop's land policy's (F2); a task done under Land is adopted
+            // and typed nothing.
+            let carry = CarryPoint {
+                land: self.autopilot() == Autopilot::Land,
+                done_under_land: point.done_under_land,
+                only,
+            };
+            let step = (hooks.acts.resume)(&self.sid, self.grace, carry);
+            // THE RESUMED BUILD SAID SOMETHING DID NOT COME BACK, and nothing
+            // was typed to restore it (a finished or taskless conversation;
+            // `relaunch::restore_look`): a fact for the owner, told once by
+            // the step that recorded it (XREV-LC-2).
+            if step == "done:lost" {
+                (hooks.note)(HostNote::Relaunch {
+                    sid: self.sid.clone(),
+                    said: RelaunchSay::NotRestored,
+                });
+            }
+            ("carry-on", step)
         } else {
             let due = due();
             if !self.on() {
@@ -5765,9 +6506,7 @@ impl WorkerIdle {
                     if !self.on() {
                         return None;
                     }
-                    self.act();
-                    let step = (hooks.acts.step)(&self.sid, self.grace);
-                    self.acted();
+                    let step = self.act(|| (hooks.acts.step)(&self.sid, self.grace));
                     ("upgrade", step)
                 }
                 Due::Unread(why) => {
@@ -5780,7 +6519,7 @@ impl WorkerIdle {
                     return Some(HostStep {
                         line: format!("upgrade step=wait:{why}"),
                         moved: false,
-                        typed: false,
+                        typed: None,
                         repeat: false,
                     });
                 }
@@ -5818,6 +6557,17 @@ impl WorkerIdle {
             }
             After::Finished => {
                 self.upgrade_runs(&mut run);
+                // A LAST WORD SAID WITH A LOOK STILL OWED: a quiet restart's
+                // `done:resumed` leaves its one look at what the resumed build
+                // reports did not come back open ([`relaunch::owed`]), and no
+                // watch comes before that look's bound. Looked at again at the
+                // first rung, where the look reads once and ends
+                // ([`relaunch::resume`]).
+                if (hooks.acts.owed)(&self.sid, only) {
+                    *self.look_at.lock().unwrap_or_else(PoisonError::into_inner) =
+                        Some(Instant::now() + (hooks.pause)(upgrade_drive::first_look()));
+                    ring();
+                }
             }
             After::Broken => {
                 if !std::mem::replace(&mut run.broken, true) {
@@ -5839,7 +6589,7 @@ impl WorkerIdle {
         Some(HostStep {
             line: format!("{what} step={step}"),
             moved: upgrade_drive::moved(&step),
-            typed: upgrade_drive::typed(&step),
+            typed: upgrade_drive::host_turn(&step),
             repeat,
         })
     }
@@ -5857,23 +6607,39 @@ impl WorkerIdle {
         }
     }
 
-    /// A step that may end the agent begins ([`WorkerJob::acting`]), its
-    /// stamp left first ([`Self::stepped`]): a pass that finds the step over
-    /// has seen the stamp move.
-    fn act(&self) {
+    /// A STEP THAT MAY END THE AGENT, taken ([`WorkerJob::acting`]): its
+    /// stamp left first ([`Self::stepped`]), so a pass that finds the step
+    /// over has seen the stamp move, and its end ([`Self::acted`]) left on
+    /// EVERY way out of it, a step that panics too. The worker's run catches
+    /// that panic and starts its body again on this same idle host
+    /// ([`worker_run`]): a step that unwound past its end left `acting` set
+    /// for good, and the host, judging the worker stepping at every pass
+    /// ([`StepsSeen::stepping`]), never handed its agent's later exit
+    /// (left dead at its shell, never relaunched) nor stopped the worker
+    /// when its tab closed or its Autopilot went off.
+    fn act<T>(&self, step: impl FnOnce() -> T) -> T {
+        /// Dropped as the step returns or unwinds: it is over.
+        struct Acted<'a>(&'a WorkerIdle);
+        impl Drop for Acted<'_> {
+            fn drop(&mut self) {
+                self.0.acted();
+            }
+        }
         self.stepped.store(
             STEP_STAMPS.fetch_add(1, Ordering::SeqCst) + 1,
             Ordering::SeqCst,
         );
         self.acting.store(true, Ordering::SeqCst);
+        let _over = Acted(self);
+        step()
     }
 
-    /// ...and ends: its stamp moved again BEFORE `acting` clears, then the
-    /// host rung. A pass whose roster read fell inside the step — and missed
-    /// the agent the step ended and relaunched — finds the stamp moved since
-    /// that read even once the step is over ([`StepsSeen::stepping`]), and
-    /// leaves the absence to the pass this ring brings, which reads the
-    /// roster after the step.
+    /// That step is over, returned or unwound ([`Self::act`]): its stamp
+    /// moved again BEFORE `acting` clears, then the host rung. A pass whose
+    /// roster read fell inside the step — and missed the agent the step ended
+    /// and relaunches — finds the stamp moved since that read even once the
+    /// step is over ([`StepsSeen::stepping`]), and leaves the absence to the
+    /// pass this ring brings, which reads the roster after the step.
     fn acted(&self) {
         self.stepped.store(
             STEP_STAMPS.fetch_add(1, Ordering::SeqCst) + 1,
@@ -5885,6 +6651,32 @@ impl WorkerIdle {
 
     fn on(&self) -> bool {
         !self.stop.load(Ordering::SeqCst) && self.switches.on_for(self.agent)
+    }
+
+    /// The session's Autopilot now: its own word, else the table's default
+    /// ([`OffSessions::mode`], the one resolver's rule), read live.
+    fn autopilot(&self) -> Autopilot {
+        OffSessions::read(&self.hooks, self.switches.autopilot()).mode(&self.sid)
+    }
+
+    /// WHY THE DISK RESUME IS OWED NO LONGER, by the gates a continuation
+    /// keeps (`relaunch::carry_on_once`; the review of the harness landing's
+    /// eighth merge): its words end `carry on`, and under AUTOPILOT LAND no
+    /// continuation of Cruise's is typed — the loop's land policy decides the
+    /// point (F2, `landing`) — nor into a task its record says its worker
+    /// FINISHED ([`IdleHost::finished`], `finished`), nor into a conversation
+    /// nobody but the harness asked anything ([`IdleHost::taskless`],
+    /// `taskless`). `None`: it is owed.
+    fn disk_resume_unowed(&self) -> Option<&'static str> {
+        if self.autopilot() == Autopilot::Land {
+            Some("landing")
+        } else if self.finished() == Some(true) {
+            Some("finished")
+        } else if self.taskless() {
+            Some("taskless")
+        } else {
+            None
+        }
     }
 
     /// THE AGENT'S ROUTE ([`Acts::route`]), read once per agent process (its
@@ -6380,7 +7172,10 @@ impl WorkerIdle {
                  off it, asked again shortly",
                 self.sid
             );
-            return account_resetting(advised, Instant::now() + RESET_AGAIN_AFTER);
+            return account_resetting(
+                advised,
+                Instant::now() + (self.hooks.pause)(RESET_AGAIN_AFTER),
+            );
         }
         // One line of the log: a move and a wait as they are advised; why
         // NOTHING is advised only when the reason changes ([`AccountKept::stay`]:
@@ -6429,7 +7224,10 @@ impl WorkerIdle {
                  shortly",
                 self.sid
             );
-            return account_lagging(advised, Instant::now() + WALL_AGAIN_AFTER);
+            return account_lagging(
+                advised,
+                Instant::now() + (self.hooks.pause)(WALL_AGAIN_AFTER),
+            );
         }
         advised
     }
@@ -6532,7 +7330,7 @@ impl WorkerIdle {
             Err(why) => aterm_log::info!(
                 "harness @{}: account probe not claimed: {}",
                 self.sid,
-                why.as_str()
+                why.word()
             ),
         }
         let (probing, taken) = match claimed {
@@ -7084,7 +7882,7 @@ impl WorkerIdle {
                  shortly",
                 self.sid
             );
-            return account_resetting(None, Instant::now() + RESET_AGAIN_AFTER);
+            return account_resetting(None, Instant::now() + (self.hooks.pause)(RESET_AGAIN_AFTER));
         }
         let seen = self.lost_seen(&look.snap, point, seat.now);
         let (at, _, _) = account_point_read(seat, &look, point, seen);
@@ -7397,10 +8195,7 @@ impl WorkerIdle {
         // 2. The relaunch, no lock of the store's held.
         let before = (look.snap.pid, look.snap.start.clone());
         let step = if self.can_restart() {
-            self.act();
-            let step = (hooks.acts.restart)(&self.sid, self.grace, why);
-            self.acted();
-            step
+            self.act(|| (hooks.acts.restart)(&self.sid, self.grace, why))
         } else {
             // The transaction below must still undo a rotation already
             // committed before this live gate refused the restart.
@@ -7609,6 +8404,23 @@ impl WorkerIdle {
     }
 }
 
+/// The word each tab's last relaunch snapshot read was refused by, said when
+/// it changes: why an exit had no snapshot to relaunch at (the first session
+/// of a fresh instance, AD-5 of the codex-alab end-to-end run) is in the log,
+/// not only that it had none.
+fn snapshot_refused(sid: &str, why: Option<&'static str>) {
+    static SAID: Mutex<Option<HashMap<String, &'static str>>> = Mutex::new(None);
+    let mut said = SAID.lock().unwrap_or_else(PoisonError::into_inner);
+    let said = said.get_or_insert_with(HashMap::new);
+    let before = match why {
+        Some(why) => said.insert(sid.to_string(), why),
+        None => said.remove(sid),
+    };
+    if let Some(why) = why.filter(|why| before != Some(why)) {
+        aterm_log::info!("harness @{sid}: the relaunch snapshot could not be read ({why})");
+    }
+}
+
 /// Read the relaunch record again. A read that fails keeps the last one only
 /// while it still describes the tab ([`follow_snapshot`]). Whether the record
 /// kept IS this read (`false`: it failed, and what is kept is older).
@@ -7624,7 +8436,7 @@ fn refresh_snapshot_guarded(
 ) -> bool {
     match (hooks.acts.snapshot)(sid) {
         Some(mut snap) => {
-            let moved = {
+            let (moved, said) = {
                 let mut kept = kept.lock().unwrap_or_else(PoisonError::into_inner);
                 // A restored queue may close while the unlocked read runs.
                 // Its last publication must precede the shutdown's follow.
@@ -7633,10 +8445,12 @@ fn refresh_snapshot_guarded(
                 }
                 keep_session(kept.snapshot.as_ref(), &mut snap);
                 let moved = publish_snapshot(sid, Some(&snap));
+                let said = asked_runs(sid, &mut kept, &snap);
                 kept.snapshot = Some(snap);
-                moved
+                (moved, said)
             };
             tell_published(sid, moved, hooks);
+            told_asked_runs(sid, said, hooks);
             true
         }
         None => {
@@ -7646,15 +8460,11 @@ fn refresh_snapshot_guarded(
     }
 }
 
-/// A read `snap` that cannot name the conversation (a Codex's daemon
-/// restarted since, holding its thread no more) keeps what the earlier read
-/// `before` of the SAME process named — unless it could not tell the thread
-/// apart (`CodexRun::ambiguous`: two begun since it started, the review of
-/// 2026-09-27): the earlier name may be another client's, and a crash would
-/// resume that one in this tab.
+/// A read `snap` that cannot name the conversation (a codex-alab whose
+/// thread lock the read did not find this time) keeps what the earlier read
+/// `before` of the SAME process named.
 fn keep_session(before: Option<&Snapshot>, snap: &mut Snapshot) {
     if snap.session.is_none()
-        && !snap.codex.as_ref().is_some_and(|run| run.ambiguous)
         && let Some(before) = before
         && (before.pid, before.start.as_str()) == (snap.pid, snap.start.as_str())
     {
@@ -7674,16 +8484,57 @@ static PUBLISHED: Mutex<Option<HashMap<String, Snapshot>>> = Mutex::new(None);
 /// layout's leaf carries of it ([`crate::restore::AgentRestore::of`]: the
 /// process, its conversation, build, folder, home and login) moved — the
 /// caller tells the window so, with no lock of its own held
-/// ([`tell_published`]).
+/// ([`tell_published`]). One that names a conversation a word of
+/// [`Kept::lost`] stands for rings the host, whose pass ends that word
+/// ([`end_lost_words`]).
 fn publish_snapshot(sid: &str, snap: Option<&Snapshot>) -> bool {
+    publish_snapshot_from(sid, snap, false)
+}
+
+/// `handed` is true only for the snapshot admitted by `watch_handed`: its
+/// predecessor already validated the carried line. Ordinary live reads need
+/// this process's matching copy; any conflicting or refused copy wins.
+fn publish_snapshot_from(sid: &str, snap: Option<&Snapshot>, handed: bool) -> bool {
     let carried = |snap: &Snapshot| crate::restore::AgentRestore::of(snap.clone());
-    let mut map = PUBLISHED.lock().unwrap_or_else(PoisonError::into_inner);
-    let map = map.get_or_insert_with(HashMap::new);
-    let before = match snap {
-        Some(snap) => map.insert(sid.to_string(), snap.clone()),
-        None => map.remove(sid),
+    // Read before the map's lock: the copies are a leaf lock of their own.
+    let snap = snap.map(|snap| with_self_claimed_line(sid, snap.clone(), handed));
+    let moved = {
+        let mut map = PUBLISHED.lock().unwrap_or_else(PoisonError::into_inner);
+        let map = map.get_or_insert_with(HashMap::new);
+        let before = match &snap {
+            Some(snap) => map.insert(sid.to_string(), snap.clone()),
+            None => map.remove(sid),
+        };
+        before.as_ref().map(carried) != snap.as_ref().map(carried)
     };
-    before.as_ref().map(carried) != snap.map(carried)
+    if snap
+        .as_ref()
+        .and_then(|snap| snap.session.as_deref())
+        .is_some_and(lost_session)
+    {
+        ring();
+    }
+    moved
+}
+
+/// A PROVEN SELF-CLAIMED CODEX-ALAB'S SNAPSHOT CARRIES ITS VALIDATED LINE
+/// (the self-claim contract, §4; [`relaunch::CodexRun::self_claimed`]): the
+/// resume line aterm's own copy of the agent's session record validated
+/// against that very process ([`crate::self_claim::copy_of_tab`], its pid and
+/// kernel start the snapshot's), so a layout's leaf — the crash journal's, a
+/// restart's — relaunches it after aterm's own end exactly as the crash rule
+/// would. Any other snapshot, a copy of another process and a line that did
+/// not validate carry none. The copies' leaf lock alone.
+fn with_self_claimed_line(sid: &str, mut snap: Snapshot, handed: bool) -> Snapshot {
+    let (pid, start) = (snap.pid, snap.start.clone());
+    if let Some(run) = snap.codex_mut() {
+        run.self_claimed = match crate::self_claim::copy_of_tab(sid) {
+            Some(copy) if copy.pid == pid && copy.start == start => copy.resume.ok(),
+            None if handed => run.self_claimed.take(),
+            Some(_) | None => None,
+        };
+    }
+    snap
 }
 
 /// THE WINDOW IS TOLD WHEN WHAT A RESTORE CARRIES OF A TAB'S AGENT MOVED
@@ -7717,6 +8568,37 @@ pub(crate) fn published_snapshot(sid: &str) -> Option<Snapshot> {
         .and_then(|m| m.get(sid).cloned())
 }
 
+/// THE AGENT A LAYOUT THAT OUTLIVES IT NAMES (2026-10-15, ATERM-KI-1015-1
+/// LC-1): the snapshot the host last published for `sid`
+/// ([`published_snapshot`]), followed through Claude Code's own record of
+/// that very process ([`relaunch::follow`]: `sessions/<pid>.json` naming its
+/// pid and kernel start, in the directory the host read it in) as the layout
+/// is taken. The host follows the record only at its own wakes, and an
+/// in-app `/clear` or `/resume` rewrites it with none: a crash journal's
+/// image or a system quit's layout taken from the copy alone named the
+/// conversation the agent had left, and the next launch resumed that one and
+/// typed its continuation into it. A record of another process, one gone,
+/// one that names no conversation, or a snapshot read in no directory (one
+/// a restored carry published before the host's first read) leaves the copy
+/// as the host read it. A copy found behind rings the host, whose next pass
+/// follows every worker: the window never writes the host's copy itself.
+/// That pass moves the copy only while the agent holds its tab
+/// ([`follow_snapshot`]): under a tab its shell holds (a crashed agent's
+/// relaunch back-off) or whose group is not read yet, the host keeps it, and
+/// each capture that finds it behind rings again — at most one ring a
+/// capture, and a ring wakes no window, so it cannot loop. Once a later
+/// Claude Code's start sweeps a crashed agent's record, a layout names the
+/// copy again (the relaunch read that record at the exit).
+pub(crate) fn followed_snapshot(sid: &str) -> Option<Snapshot> {
+    let mut snap = published_snapshot(sid)?;
+    if snap.claude_dir.is_some()
+        && aterm_primer::home_dir().is_some_and(|home| relaunch::follow(&home, &mut snap))
+    {
+        ring();
+    }
+    Some(snap)
+}
+
 /// FOLLOW the session's kept snapshot against the tab's foreground job,
 /// cheaply — no socket, no `ps` ([`Acts::follow`]): while its agent holds
 /// the tab, take the conversation Claude's own record names now (an in-app
@@ -7745,6 +8627,7 @@ fn follow_snapshot_guarded(
     };
     let mut snap = before.clone();
     let fg = (hooks.acts.follow)(sid, &mut snap);
+    let mut said = (Say::Nothing, false);
     let moved = {
         let mut session = lock();
         if revoked.is_some_and(|revoked| revoked.load(Ordering::SeqCst))
@@ -7764,6 +8647,7 @@ fn follow_snapshot_guarded(
                     );
                 }
                 let moved = publish_snapshot(sid, Some(&snap));
+                said = asked_runs(sid, &mut session, &snap);
                 session.snapshot = Some(snap);
                 moved
             }
@@ -7776,7 +8660,65 @@ fn follow_snapshot_guarded(
         }
     };
     tell_published(sid, moved, hooks);
+    told_asked_runs(sid, said, hooks);
     true
+}
+
+/// THE TAB'S AGENT, READ, HOLDS THE CONVERSATION ITS STANDING WORD ASKS FOR
+/// (LC-4 of ATERM-KI-1015-1, `Relaunches::conversation_runs`): the word is
+/// answered — and the word that its agent could not be brought back
+/// ([`Kept::lost`]) with it, its conversation held again here by another
+/// process than the one that ended (whether the word was answered, the
+/// second). The caller tells it ([`told_asked_runs`]) once its lock is
+/// released.
+fn asked_runs(sid: &str, kept: &mut Kept, snap: &Snapshot) -> (Say, bool) {
+    let Some(conversation) = snap.session.as_deref() else {
+        return (Say::Nothing, false);
+    };
+    let said = kept.relaunches.conversation_runs(conversation);
+    let back = kept
+        .lost
+        .as_ref()
+        .is_some_and(|lost| lost.session == conversation && lost.pid != snap.pid);
+    if back && let Some(lost) = kept.lost.take() {
+        forget_lost(&lost.session, sid);
+    }
+    (said, back)
+}
+
+/// [`asked_runs`]' word, told with no lock held: the tab's mark and the lines
+/// it made end — the `lost` line too, where that word ended with it
+/// ([`RelaunchSay::Back`]).
+fn told_asked_runs(sid: &str, (said, back): (Say, bool), hooks: &Hooks) {
+    if said == Say::Clear || back {
+        aterm_log::info!(
+            "harness @{sid}: the conversation the tab's mark asked for runs in it again; the \
+             mark ends"
+        );
+        (hooks.badge)(sid, None);
+    }
+    if said == Say::Clear {
+        (hooks.note)(HostNote::Relaunch {
+            sid: sid.to_string(),
+            said: RelaunchSay::Ended,
+        });
+    }
+    if back {
+        (hooks.note)(HostNote::Relaunch {
+            sid: sid.to_string(),
+            said: RelaunchSay::Back,
+        });
+    }
+}
+
+/// Whether the tab's mark is a standing word that its agent could not be
+/// brought back ([`Kept::lost`], marked): it is that word's alone, which
+/// only its conversation held again or a person working on another ends
+/// ([`end_lost_words`], [`asked_runs`]) — never the relaunch's own words of
+/// another agent in the tab (its `Clear`, its failing mark), nor a worker's
+/// start.
+fn lost_marked(k: &Kept) -> bool {
+    k.lost.as_ref().is_some_and(|lost| lost.marked)
 }
 
 /// The agent's exit is handled: what was read of it goes with it.
@@ -8046,16 +8988,16 @@ fn end_exit_watches(shared: &Shared, armed_before: u64, which: impl Fn(&str) -> 
 /// takes it, asked at every look of the carry as at an exit's first read
 /// (ruling 17 and the review of ruling 20; the model's `ReadByClaim`).
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "HarnessRestartStamp",
         action = "Read",
         project = "harness_host::tests::project_restart_stamp"
     )
 )]
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "HarnessRestartStamp",
         action = "ReadByClaim",
         project = "harness_host::tests::project_restart_stamp"
@@ -8090,7 +9032,9 @@ fn on_agent_left(job: &WorkerJob, hooks: &Hooks) {
     // rather than kept for a later exit.
     let codex_exit = match job.agent {
         Program::Codex => true,
-        Program::Claude | Program::Generic | Program::Agy | Program::Muse => false,
+        Program::Claude | Program::Generic | Program::Agy | Program::Muse | Program::Gemini => {
+            false
+        }
     };
     let copy = (hooks.acts.self_copy)(sid).filter(|_| codex_exit);
     match copy.filter(|copy| match snap.as_ref() {
@@ -8105,6 +9049,14 @@ fn on_agent_left(job: &WorkerJob, hooks: &Hooks) {
         }
         None => crate::self_claim::discard_dead(sid),
     }
+    // A CODEX EXIT WITH NO COPY IS NOBODY'S TO RELAUNCH (the Codex screen
+    // lane's retirement, 2026-10-16): aterm supervises no Codex, and only
+    // aterm's copy of codex-alab's own record says how it ended and on what
+    // line it comes back. Never the lane's shell-word read nor its relaunch.
+    if codex_exit {
+        unproven_codex_exit(job, hooks, snap.as_ref(), asked);
+        return;
+    }
     // THE HARNESS'S OWN RESTART ENDED IT, read before whose exit it was: the
     // step that signalled it returned with its relaunch still to type (a
     // person at the returned prompt, a hold, a shell slow to take the
@@ -8115,9 +9067,15 @@ fn on_agent_left(job: &WorkerJob, hooks: &Hooks) {
     // ended the very process the snapshot names, by a restart that ends its
     // agent itself: never a relaunch on exit's own record, nor another
     // process's (a Codex a person started at the prompt that record waited
-    // on, whose `/exit` is theirs). An agent no lane restarts (agy, Muse
-    // Code) has no such record, and none is read for it as Claude Code's.
-    let lane = aterm_agent::harness::upgrade::Agent::of(job.agent);
+    // on, whose `/exit` is theirs). An agent no lane restarts — agy and
+    // Gemini CLI (`lanes()` all false), and an agent only relaunched on exit,
+    // Muse Code and a Codex (no upgrade, no restart in place ends it) — has
+    // no such record, and none is read for it, as its own or as Claude
+    // Code's.
+    let lane = aterm_agent::harness::upgrade::Agent::of(job.agent).filter(|agent| {
+        let lanes = aterm_agent::harness::lanes::lanes(agent.program());
+        lanes.upgrade || lanes.restart_in_place
+    });
     let pid = snap.as_ref().map(|s| s.pid);
     let restarted = lane.is_some_and(|agent| (hooks.acts.restarted)(sid, agent, pid));
     // AN EXIT WHOSE PROGRAM STILL RUNS IS NOBODY'S YET (rulings 15 and 17,
@@ -8130,7 +9088,7 @@ fn on_agent_left(job: &WorkerJob, hooks: &Hooks) {
     // came and went while it was stopped — the exit was left and its
     // snapshot forgotten, and the act's `KILL` after `fg`, which had waited
     // that hand out, was nobody's to relaunch. So while the program runs and
-    // its stamp stands every decision below PUTS IT OFF (`Relaunch`, its
+    // its stamp stands every decision below PUTS IT OFF (`Asked`, its
     // attempt [`relaunch::WAIT_ACT_ENDS`]: nothing read, nothing typed), and
     // the first decision that finds it ENDED is made as an exit's first read
     // is (ruling 17): the stamp looked up again — an end after it went stale
@@ -8169,6 +9127,10 @@ fn on_agent_left(job: &WorkerJob, hooks: &Hooks) {
     // session, which relaunches what it holds, and the relaunch line does
     // not wait on a claim — so every look of a carry asks it again.
     let hand_waits = std::cell::Cell::new(false);
+    // THE LOOK THAT FOUND THE HAND LIFTED, after one that carried the exit
+    // through it: the next carry of the harness's own restart says so
+    // ([`relaunch::carry_restart`]'s `through_hand`, LC-7).
+    let lifted = std::cell::Cell::new(false);
     // AN EXIT UNDER ANOTHER SUPERVISOR'S LIVE CLAIM is that supervisor's:
     // it holds the session as the exit is first read (whenever it claimed
     // it: a supervisor parked behind this host's loop can claim the tab at
@@ -8212,7 +9174,7 @@ fn on_agent_left(job: &WorkerJob, hooks: &Hooks) {
             if runs && (hooks.acts.asked)(sid, snap).is_some() {
                 put_off.set(true);
                 end_owed.set(true);
-                return OnExit::Relaunch;
+                return OnExit::Asked;
             }
             // Its end, first seen after any put-off (a program still running
             // past its stamp is left as `not-exited` by its attempt, looked
@@ -8251,11 +9213,18 @@ fn on_agent_left(job: &WorkerJob, hooks: &Hooks) {
             asked.is_some(),
             restarted,
         );
-        hand_waits.set(
-            decision == OnExit::Relaunch
-                && asked.is_some()
-                && status.as_deref().is_some_and(relaunch::hand_on_tab),
-        );
+        // THE HARNESS'S OWN RESTART IS CARRIED THROUGH A HAND THE SAME WAY
+        // (LC-7 of ATERM-KI-1015-1, one mechanism with ruling 20): a hold
+        // that lands just after the upgrade's `SIGTERM` holds the tab its
+        // relaunch line is typed at, and each carry under it was the line's
+        // `wait:held`, a counted miss, until the record went stale (five
+        // minutes) and the agent was never relaunched once the hold lifted.
+        // (Its carry waits out a hand of its own as well, for every carrier
+        // the host's look does not cover: `relaunch::carry_restart`.)
+        let carries = matches!(decision, OnExit::Restarted | OnExit::Asked);
+        let waits = carries && status.as_deref().is_some_and(relaunch::hand_on_tab);
+        hand_waits.set(waits);
+        lifted.set(carried && !waits);
         decision
     };
     let decide = || decide_at(false);
@@ -8279,14 +9248,22 @@ fn on_agent_left(job: &WorkerJob, hooks: &Hooks) {
         left_as_its_end(job, hooks, why, said);
         return;
     }
-    let pause = match with_kept(job, |k| k.relaunches.exited(decision, Instant::now())) {
+    // A CRASH IS AN EXIT NEITHER THE EXPLICIT RESTART NOR THE HARNESS'S OWN
+    // MADE (LC-6 of ATERM-KI-1015-1): only a crash's relaunch climbs the
+    // back-off — three restarts a person asked for made a later crash wait
+    // ten minutes.
+    let crash = asked.is_none() && !restarted;
+    let pause = match with_kept(job, |k| {
+        k.relaunches.exited_as(decision, crash, Instant::now())
+    }) {
         // An exit the act asked for is no crash: its first attempt is not
-        // backed off.
+        // backed off, and none of its steps is the crash back-off's
+        // ([`relaunch::Relaunches`], LC-6 of the 2026-10-15 sweep).
         Ok(_) if asked.is_some() => Duration::ZERO,
         Ok(pause) => pause,
         Err(said) => {
             forget_snapshot(job, hooks);
-            left_alone(job, hooks, decision, said);
+            left_alone(job, hooks, decision, said, false);
             return;
         }
     };
@@ -8295,8 +9272,32 @@ fn on_agent_left(job: &WorkerJob, hooks: &Hooks) {
             "harness @{sid}: the agent exited; the harness's own restart ended it, and its \
              relaunch is carried"
         );
+        // A carry waiting out a hand on the tab (LC-7, [`relaunch::WAIT_HAND_LIFTS`])
+        // is said once, as the asked exit's carry is, whether the host's look
+        // or the carry's own found the hand; the hook logs no line for it.
+        let carry_said = std::cell::Cell::new(false);
         relaunch_until(job, hooks, pause, &decide, true, || {
-            (hooks.acts.carry)(sid, grace, agent, pid)
+            if hand_waits.get() {
+                if !carry_said.replace(true) {
+                    aterm_log::info!(
+                        "harness @{sid}: the agent the harness's own restart ended is carried \
+                         through another hand on its tab (a hold, a lease, a turn); its \
+                         relaunch is typed once that hand lifts"
+                    );
+                }
+                return relaunch::WAIT_HAND_LIFTS.to_string();
+            }
+            let step = (hooks.acts.carry)(sid, grace, agent, pid, lifted.replace(false));
+            if step != relaunch::WAIT_HAND_LIFTS {
+                carry_said.set(false);
+            } else if !carry_said.replace(true) {
+                aterm_log::info!(
+                    "harness @{sid}: the restart the harness made is carried through a hand on \
+                     its tab (a hold, a lease, a turn); its relaunch line is typed once that \
+                     hand lifts"
+                );
+            }
+            step
         });
         return;
     }
@@ -8338,8 +9339,8 @@ fn on_agent_left(job: &WorkerJob, hooks: &Hooks) {
     );
     // An exit the relaunch is decided on already — a crash, a stall's remedy
     // — is OWED through the back-off: a handoff carries it (round six, F13).
-    // A crash by the rule the lanes relaunch on ([`relaunch::ExitRecord::crashed`]):
-    // a Codex's shell's word too, not a Claude Code's surviving record alone.
+    // A crash by the rule the relaunch reads ([`relaunch::ExitRecord::crashed`]):
+    // a Claude Code's surviving record (a Codex never reaches here).
     if asked.is_some() || left.crashed() {
         with_kept(job, |k| {
             if !job.revoked.load(Ordering::SeqCst) {
@@ -8401,30 +9402,30 @@ fn on_agent_left(job: &WorkerJob, hooks: &Hooks) {
 /// THE CRASH RULE (the self-claim contract, §4): the exit of an agent a
 /// proven self-claim supervised, decided by this host's watch-only worker
 /// alone, from aterm's OWN COPY of the agent's session record (`copy`, read
-/// while its identity was live) — never from the file now, never by the
-/// Codex lane's shell word (the exit-137 branch), and never left to the dead
+/// while its identity was live) — never from the file now, never by a
+/// shell's exit status, and never left to the dead
 /// self-claim (`claimed_by_another` reads it as nobody's). First whose exit it
 /// was ([`relaunch::on_exit`]: a person's keystroke, a hold, `[harness]
 /// relaunch`, another live supervisor's claim); then the copy's verdict
 /// ([`self_claimed::verdict`]): an orderly end is left alone; a crash — or
 /// the end of aterm's own restart, its stamp `asked` — is relaunched on the
-/// line the copy validated, through the Codex lane's relaunch
+/// line the copy validated, through the crash rule's relaunch
 /// ([`Acts::self_relaunch`]: the shell at its marked prompt, the thread's
 /// writer lock free, the witness ledger), after the session's back-off. A
 /// line that did not validate relaunches nothing and says so once (one
 /// Messages record); so does a tab whose agent was its spawn command (no
 /// shell to relaunch at).
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "HarnessRestartStamp",
         action = "CopyRelaunches",
         project = "harness_host::tests::project_restart_stamp"
     )
 )]
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "HarnessRestartStamp",
         action = "CopyLeaves",
         project = "harness_host::tests::project_restart_stamp"
@@ -8474,16 +9475,35 @@ fn self_claimed_exit(
         );
         return;
     }
-    let pause = match with_kept(job, |k| k.relaunches.exited(decision, Instant::now())) {
+    // An exit the explicit restart made is no crash (LC-6 of
+    // ATERM-KI-1015-1): its relaunch does not climb the crash back-off.
+    let pause = match with_kept(job, |k| {
+        k.relaunches
+            .exited_as(decision, asked.is_none(), Instant::now())
+    }) {
         Ok(_) if asked.is_some() => Duration::ZERO,
         Ok(pause) => pause,
         Err(said) => {
             forget_snapshot(job, hooks);
-            left_alone(job, hooks, decision, said);
+            left_alone(job, hooks, decision, said, false);
             return;
         }
     };
-    let Some(snap) = snap.filter(|snap| snap.shell != 0) else {
+    // A process no snapshot read reached while it ran (it claimed and died
+    // within moments: AD-5, AD-3's second crash) is relaunched at the shell
+    // that holds its tab now, from its copy ([`Acts::self_snapshot`]).
+    let snap = snap.filter(|snap| snap.shell != 0).or_else(|| {
+        let resume = copy.resume.as_ref().ok()?;
+        let snap = (hooks.acts.self_snapshot)(sid, copy, resume)?;
+        aterm_log::info!(
+            "harness @{sid}: no snapshot of the crashed codex-alab {} was read while it ran; \
+             its copy's line is relaunched at the shell holding the tab ({})",
+            copy.pid,
+            snap.shell
+        );
+        Some(snap)
+    });
+    let Some(snap) = snap else {
         settled(job);
         forget_snapshot(job, hooks);
         aterm_log::info!(
@@ -8499,6 +9519,20 @@ fn self_claimed_exit(
     };
     let resume = match &copy.resume {
         Ok(resume) => resume.clone(),
+        Err(why) if copy.seen == self_claimed::Seen::Never => {
+            settled(job);
+            forget_snapshot(job, hooks);
+            aterm_log::info!(
+                "harness @{sid}: the self-supervised codex-alab crashed before its record \
+                 named a line; not relaunched ({why})"
+            );
+            inform(format!(
+                "codex-alab ({}) crashed before its session record named a line, and is not \
+                 relaunched",
+                copy.pid
+            ));
+            return;
+        }
         Err(why) => {
             settled(job);
             forget_snapshot(job, hooks);
@@ -8519,8 +9553,74 @@ fn self_claimed_exit(
          conversation {}",
         resume.session
     );
+    // The process this line starts, read before its record's first write,
+    // relaunches on it again ([`self_claimed::inherited`], AD-3).
+    crate::self_claim::typed(sid, &resume);
+    // THE RELAUNCH IS OWED THROUGH ITS BACK-OFF, ON THE LINE THE COPY
+    // VALIDATED (§4; [`relaunch::CodexRun::self_claimed`]): a seamless
+    // update's Commit meanwhile carries it to the successor
+    // ([`HostHandle::pending_restored_for`]), and a failed one's rollback or
+    // a quit's layout keeps it, each relaunching it as this rule would
+    // (`relaunch::after_host_ended` on that line) — the copy itself is this
+    // instance's memory alone.
+    let mut owed = snap.clone();
+    if let Some(run) = owed.codex_mut() {
+        run.self_claimed = Some(resume.clone());
+    }
+    with_kept(job, |k| {
+        if !job.revoked.load(Ordering::SeqCst) {
+            k.owed = Some(OwedRelaunch { snap: owed, asked });
+        }
+    });
     relaunch_until(job, hooks, pause, &decide, false, || {
         (hooks.acts.self_relaunch)(sid, grace, &snap, &resume, asked)
+    });
+}
+
+/// THE EXIT OF A CODEX NO COPY DECIDES (the Codex screen lane's retirement,
+/// 2026-10-16), read by its watch-only worker: a codex-alab whose claim was
+/// never proven to this instance — an ALab build unclaimed yet, one whose
+/// claim was given back (the copy goes with the release), or one carried
+/// unproven across a seamless update and ended before its re-proof. FAIL
+/// CLOSED: it is left at its shell, its snapshot forgotten, and said once —
+/// whatever ended it. Its own exit says nothing of a crash without the copy,
+/// and an act's (`asked`) cannot be one here: the restart refuses a Codex no
+/// copy validated a line for (`crate::restart_act::unavailable`). The line a
+/// seamless update's leaf carries is aterm's own end's alone
+/// (`relaunch::after_host_ended`), never an exit's.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "HarnessRestartStamp",
+        action = "Unclaimed",
+        project = "harness_host::tests::project_restart_stamp"
+    )
+)]
+fn unproven_codex_exit(
+    job: &WorkerJob,
+    hooks: &Hooks,
+    snap: Option<&Snapshot>,
+    asked: Option<restart_stamp::Cause>,
+) {
+    let sid = job.sid.as_str();
+    settled(job);
+    forget_snapshot(job, hooks);
+    let pid = snap.map_or_else(|| "-".to_string(), |snap| snap.pid.to_string());
+    aterm_log::info!(
+        "harness @{sid}: the codex exited (pid {pid}{}); not relaunched: no proven self-claim \
+         left aterm a copy of its record to decide its end by",
+        if asked.is_some() {
+            ", ended by a restart"
+        } else {
+            ""
+        }
+    );
+    (hooks.note)(HostNote::Inform {
+        sid: sid.to_string(),
+        text: format!(
+            "codex-alab ({pid}) exited with no claim proven to this aterm, so how it ended \
+             cannot be read: it is not relaunched"
+        ),
     });
 }
 
@@ -8562,8 +9662,8 @@ fn relaunch_until(
             // says whether its agent is back NOW.
             if (hooks.still_wanted)(sid, job.group.load(Ordering::SeqCst)) {
                 runs_again(job, hooks, false);
-                let said = with_kept(job, |k| k.relaunches.running());
-                tell(job, hooks, said, "", restarted);
+                let said = with_kept(job, |k| k.relaunches.running(Instant::now()));
+                tell(job, hooks, said, "", restarted, false);
                 // Back before any carry was needed: a move's own line, typed
                 // by the step that signalled it, has landed.
                 account_land_for(job, hooks);
@@ -8600,10 +9700,13 @@ fn relaunch_until(
             // it carries debt even though it must start no new attempt.
             continue;
         }
-        if let Some(said) = with_kept(job, |k| k.relaunches.decide(decision)) {
+        if let Some((said, marked)) = with_kept(job, |k| {
+            let marked = failing_marked(k);
+            k.relaunches.decide(decision).map(|said| (said, marked))
+        }) {
             settled(job);
             forget_snapshot(job, hooks);
-            left_alone(job, hooks, decision, said);
+            left_alone(job, hooks, decision, said, marked);
             return;
         }
         let step = attempt();
@@ -8622,8 +9725,11 @@ fn relaunch_until(
             note_upgrade_act();
         }
         let outcome = relaunch::outcome(&step);
-        let said = with_kept(job, |k| k.relaunches.attempted(&outcome, Instant::now()));
-        tell(job, hooks, said, &step, restarted);
+        let (said, marked) = with_kept(job, |k| {
+            let marked = failing_marked(k);
+            (k.relaunches.attempted(&outcome, Instant::now()), marked)
+        });
+        tell(job, hooks, said, &step, restarted, marked);
         match outcome {
             Outcome::NotYet(_) => pause = with_kept(job, |k| k.relaunches.pause()),
             Outcome::Busy => pause = relaunch::BUSY,
@@ -8676,14 +9782,10 @@ fn relaunch_until(
                 // but, at most, the restarted agent's snapshot. A forgotten
                 // snapshot says `nothing-recorded`. A Claude Code's carries
                 // again, which closes the record and answers `landed` (the ledger
-                // says `failed:exited-before-continuing`). A Codex's record is no
-                // longer the restart's, so its lane decides on the shell's word
-                // for the command that just ran — the dead agent's own exit: it
-                // closes the record (`failed:exited-before-continuing`), ends a
-                // clean exit (`ended:graceful-exit`) and relaunches a crash on
-                // the restarted agent's conversation. With no mark, no worker is
-                // handed the exit at all. So only a crashed Codex with its
-                // snapshot kept is relaunched; for the rest it is accepted: no
+                // says `failed:exited-before-continuing`). No Codex restart is
+                // carried here (the Codex screen lane's retirement, 2026-10-16).
+                // With no mark, no worker is handed the exit at all. For the rest
+                // it is accepted: no
                 // read described the dead agent, so no relaunch could name its
                 // conversation, and the tab is left at its shell, as before
                 // 6c7df720f, never held for a dead process and said Cannot.
@@ -8787,7 +9889,12 @@ fn left_as_its_end(job: &WorkerJob, hooks: &Hooks, why: &str, said: Say) {
     if why != "not-exited" {
         account_gone(job, hooks);
     }
-    if left_ends_relaunch_line(said) {
+    // A word that asks a person to resume a conversation is not ended by
+    // another agent's own end (LC-4 of ATERM-KI-1015-1): only that
+    // conversation running answers it. (A failing relaunch's word asks for
+    // nothing now: it ended with its trying, `Say::Clear`.)
+    let asks = with_kept(job, |k| k.relaunches.asks().is_some());
+    if left_ends_relaunch_line(said) && !asks {
         (hooks.note)(HostNote::Relaunch {
             sid: sid.to_string(),
             said: RelaunchSay::Ended,
@@ -8917,9 +10024,8 @@ fn revoke_kept(kept: &mut Kept, switches: &Switches) {
 /// not here: its exit is still the relaunch's ([`gone_again`], round two),
 /// read back by a pass or not (round three). A restart's carry is the
 /// exception: it is never tried again, so its landing comes here with that
-/// agent gone, and nothing here relaunches it (only the Codex lane's exit
-/// worker may, for a crash; [`relaunch_until`], THE RESIDUAL, STATED, says
-/// when).
+/// agent gone, and nothing here relaunches it ([`relaunch_until`], THE
+/// RESIDUAL, STATED).
 ///
 /// A RELAUNCH THAT LANDED (`landed`: the conversation registered, the act's
 /// `adopted`, and the agent it started read alive — its snapshot is the
@@ -8988,7 +10094,7 @@ fn runs_again(job: &WorkerJob, hooks: &Hooks, landed: bool) {
 /// layout's reader of what is owed in a tab, for which the close keeps
 /// every debt ([`RestoredQueue::closed`]) — carried nothing for the tab.
 /// (That layout asks first for the agent the host last published there
-/// ([`published_snapshot`]), which names the crashed agent still unless a
+/// ([`followed_snapshot`]), which names the crashed agent still unless a
 /// follow forgot it: another program held the tab.) It is left owed,
 /// stranded as a worker deciding before the rollback leaves it
 /// ([`Committed::Stranded`]), for the layout to carry to the next launch.
@@ -9036,8 +10142,9 @@ fn take_up_after_rollback(job: &WorkerJob, hooks: &Hooks, agent: RestoredAgent) 
 
 /// An exit the host leaves alone ([`relaunch::on_exit`] said `decision`):
 /// journaled, and said on the session's attention when the relaunch was
-/// LIMITED by the owner's `[harness]`.
-fn left_alone(job: &WorkerJob, hooks: &Hooks, decision: OnExit, said: Say) {
+/// LIMITED by the owner's `[harness]`. `marked`: the tab's mark was the
+/// relaunch's that kept failing ([`failing_marked`]), which ends with it.
+fn left_alone(job: &WorkerJob, hooks: &Hooks, decision: OnExit, said: Say, marked: bool) {
     let sid = job.sid.as_str();
     let why = match decision {
         OnExit::PersonAsked => "a person typed into the session just before: the exit is theirs",
@@ -9045,26 +10152,34 @@ fn left_alone(job: &WorkerJob, hooks: &Hooks, decision: OnExit, said: Say) {
             "the session is held (a halt, a lease or a driver's turn): the exit is theirs"
         }
         OnExit::Limited => "[harness] relaunch = false",
-        OnExit::Relaunch | OnExit::Restarted => "",
+        OnExit::Relaunch | OnExit::Asked | OnExit::Restarted => "",
     };
     aterm_log::info!(
         "harness @{sid}: {} exited; not relaunched: {why}",
         job.agent.name()
     );
-    tell(job, hooks, said, why, false);
+    tell(job, hooks, said, why, false, marked);
     account_gone(job, hooks);
 }
 
 /// Say a relaunch's word (`why`: the step, or the limit, that said it). A step
 /// word (`refused:shell-gone`, `wait:resume`) is the log's. What the OWNER is
 /// told follows the rule that an alert persists only where they can act and it
-/// says why and what ([`RelaunchSay`]): a relaunch that keeps failing and one
-/// the owner limited are records; an agent that cannot be brought back is the
-/// tab's mark only with the command that resumes it (`claude --resume <id>`),
-/// else one line of the exceptions digest — save one its move's own row asks
-/// the owner about (`told:<why>`), said there alone; and a restart of the
-/// harness's own (`restarted`) says aterm ended the agent.
-fn tell(job: &WorkerJob, hooks: &Hooks, said: Say, why: &str, restarted: bool) {
+/// says why and what ([`RelaunchSay`]): one the owner limited is a record; a
+/// relaunch that keeps failing (the agent down, aterm still trying: LC-5 of
+/// ATERM-KI-1015-1) and an agent that cannot be brought back are the tab's
+/// mark with the command that starts it by hand (`claude --resume <id>`,
+/// under the agent's own `HOME` where it ran under another), else one line
+/// of the exceptions digest — save one its move's own row asks the owner
+/// about (`told:<why>`), said there alone; and a restart of the harness's own
+/// (`restarted`) says aterm ended the agent. A failing relaunch's mark is
+/// neither the harness's own restart's nor one blocked by its conversation
+/// open in another tab ([`failing_names_command`]), and it ends with its
+/// trying (`Relaunches::failing`: `marked`, the tab's mark was it, gives way
+/// to a word that sets none). The mark of an agent that cannot be brought
+/// back stands until that conversation runs in the tab (`Relaunches::ask`,
+/// LC-4).
+fn tell(job: &WorkerJob, hooks: &Hooks, said: Say, why: &str, restarted: bool, marked: bool) {
     let sid = job.sid.as_str();
     let why: String = why.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut end = why.len().min(80);
@@ -9078,10 +10193,22 @@ fn tell(job: &WorkerJob, hooks: &Hooks, said: Say, why: &str, restarted: bool) {
             said,
         });
     };
+    // The failing relaunch's mark, where it stood, ends with its trying: a
+    // word that sets no mark of its own unsets it.
+    let unmark = || {
+        if marked {
+            (hooks.badge)(sid, None);
+        }
+    };
     match said {
         Say::Nothing => {}
+        // A word that its agent could not be brought back holds the tab's
+        // mark ([`lost_marked`]): another agent's relaunch ending its own
+        // words leaves that mark (ATERM-KI-1015-1 LC-4).
         Say::Clear => {
-            (hooks.badge)(sid, None);
+            if !with_kept(job, |k| lost_marked(k)) {
+                (hooks.badge)(sid, None);
+            }
             told(RelaunchSay::Ended);
         }
         // THE MOVE'S OWN ROW ASKS (`told:`, `relaunch::outcome`): an
@@ -9096,40 +10223,156 @@ fn tell(job: &WorkerJob, hooks: &Hooks, said: Say, why: &str, restarted: bool) {
                 "harness @{sid}: aterm ended the agent and cannot bring it back ({why}); its \
                  upgrade's own row asks the owner"
             );
+            unmark();
             told(RelaunchSay::Ended);
         }
         Say::Cannot => {
-            let command = resume_line(job);
+            let asks = resume_line(job);
             let reason = cannot_reason(why);
-            let text = cannot_text(restarted, &reason, command.as_deref());
-            aterm_log::warn!("harness @{sid}: {text} ({why})");
-            // The tab's mark only where the ask is whole: why, and the one command.
-            if command.is_some() {
-                (hooks.badge)(sid, Some(&text));
+            let command = asks.as_ref().map(|(command, _)| command.clone());
+            aterm_log::warn!(
+                "harness @{sid}: {} ({why})",
+                cannot_said(restarted, &reason, command.as_deref())
+            );
+            // THE TAB'S MARK ONLY WHERE THE ASK IS WHOLE (why, and the one
+            // command, its Claude home and all), under its own owner: no
+            // loop's start and no other relaunch line ends it — only that
+            // conversation running in the tab (`Relaunches::ask`, LC-4 of
+            // ATERM-KI-1015-1) or held again in any tab ([`Kept::lost`],
+            // [`end_lost_words`]).
+            let mark = asks.as_ref().and_then(|(command, _)| {
+                mark_text(cannot_head(restarted), &reason, "run", command)
+            });
+            let _ = mark_with(sid, mark.as_deref(), asks, job, hooks);
+            let ended = with_kept(job, |k| {
+                k.snapshot
+                    .as_ref()
+                    .or_else(|| k.owed.as_ref().map(|owed| &owed.snap))
+                    .and_then(|snap| Some((snap.session.clone()?, snap.pid)))
+            });
+            let lost = ended.is_some();
+            let before = ended.and_then(|(session, pid)| {
+                lose(
+                    sid,
+                    job,
+                    Lost {
+                        session,
+                        pid,
+                        marked: mark.is_some(),
+                        reason: reason.clone(),
+                        restarted,
+                        command: command.clone(),
+                        other: upgrade_drive::Tasked::default(),
+                        faulted: false,
+                    },
+                )
+            });
+            // One word per tab, the newest: an earlier mark this one does not
+            // write over — the failing relaunch's (`marked`), or an earlier
+            // `Cannot`'s — is lowered with it, and an earlier line of the
+            // digest goes with a mark (the window's `Cannot`) or is written
+            // over by this one's.
+            if mark.is_none() && (marked || before.is_some_and(|before| before.marked)) {
+                (hooks.badge)(sid, None);
             }
             told(RelaunchSay::Cannot {
                 reason,
                 restarted,
                 command,
+                marked: mark.is_some(),
+                lost,
             });
         }
+        // AT ATTENTION (LC-5 of ATERM-KI-1015-1): an agent down while its
+        // relaunch keeps failing is the owner's to know now — the tab's mark,
+        // with the command that starts it by hand (the one action that
+        // brings it back sooner), standing while aterm tries; with no
+        // command, the digest's line at once (`exceptions_host`). It was a
+        // recorded message alone, at `level=quiet`, while the agent stayed
+        // down fifteen minutes. Not the harness's own restart's, nor one its
+        // conversation open in another tab holds ([`failing_names_command`]).
         Say::Failing => {
             aterm_log::warn!(
                 "harness @{sid}: the agent exited and its relaunch keeps failing (still trying) \
                  ({why})"
             );
+            // The tab's one mark is a standing word that its agent could
+            // not be brought back ([`lost_marked`]): this relaunch's own
+            // says itself in the digest, never over that mark.
+            let asks = resume_line(job).filter(|_| {
+                failing_names_command(restarted, why) && !with_kept(job, |k| lost_marked(k))
+            });
+            let mark = asks
+                .as_ref()
+                .and_then(|(command, _)| failing_text(why, command));
+            let command = mark_with(sid, mark.as_deref(), asks, job, hooks);
             told(RelaunchSay::Failing {
                 blocked_by: blocked_cause(why),
                 restarted,
+                command,
             });
         }
         Say::Limited => {
             aterm_log::warn!("harness @{sid}: the agent exited and is not relaunched: {why}");
+            unmark();
             told(RelaunchSay::Limited {
                 why: why.to_string(),
             });
         }
     }
+}
+
+/// THE TAB'S MARK, SET (`mark`, the whole ask) for the told command and its
+/// conversation (`asks`): the mark stands until that conversation runs in the
+/// tab (`Relaunches::ask`, LC-4 of ATERM-KI-1015-1) — or, a failing
+/// relaunch's, until its trying ends (`Relaunches::failing`) — and the
+/// command it names is answered. No mark — no command, or one too long for
+/// the mark whole — answers none, the digest's line then, and the log keeps
+/// the command.
+fn mark_with(
+    sid: &str,
+    mark: Option<&str>,
+    asks: Option<(String, String)>,
+    job: &WorkerJob,
+    hooks: &Hooks,
+) -> Option<String> {
+    let (command, conversation) = asks?;
+    let Some(mark) = mark else {
+        aterm_log::warn!(
+            "harness @{sid}: the command that starts the agent by hand is too long for the tab's \
+             mark whole: {command}"
+        );
+        return None;
+    };
+    (hooks.badge)(sid, Some(mark));
+    with_kept(job, |k| k.relaunches.ask(&conversation));
+    Some(command)
+}
+
+/// WHETHER THE TAB'S MARK IS THE RELAUNCH'S THAT KEEPS FAILING, as `k` holds
+/// it: its word stands ([`relaunch::Relaunches::failing`]) and names the
+/// conversation it asks for — the one sign this host set it
+/// ([`mark_with`]). Read before a step that may end the trying, so the word
+/// that follows unsets it where it sets no mark of its own ([`tell`]).
+fn failing_marked(k: &Kept) -> bool {
+    k.relaunches.failing() && k.relaunches.asks().is_some()
+}
+
+/// WHETHER A RELAUNCH THAT KEEPS FAILING AFTER `step` MARKS THE TAB WITH THE
+/// COMMAND THAT STARTS IT BY HAND (the review of the r20 relaunch lane,
+/// 2026-10-16) — not where running it in this tab is no remedy:
+/// - THE HARNESS'S OWN RESTART (`restarted`): its carry is bounded by its
+///   record's stale bound ([`relaunch::STALE_S`]), after which its refusal is
+///   said — and an upgrade's own row speaks for its record, with the remedy
+///   it knows (a plain `claude` for a restart that started its agent afresh:
+///   `claude --resume` of that conversation is refused). Its failing is the
+///   record it was before LC-5.
+/// - ITS CONVERSATION OPEN IN ANOTHER TAB (`wait:conversation-in-other-tab`):
+///   the command would make the second copy the relaunch waits on, and two
+///   copies would corrupt it; the digest's line says to close it in its
+///   other tab, at once ([`crate::message_reporters::relaunch_blocked_entry`]).
+fn failing_names_command(restarted: bool, step: &str) -> bool {
+    !restarted && blocked_cause(step) != Some("other-tab")
 }
 
 /// The cause a PERSON clears, of a relaunch that keeps failing after `step`: a
@@ -9155,6 +10398,10 @@ fn cannot_reason(step: &str) -> String {
         "shell-gone" => "its shell is gone".to_string(),
         "one-shot" => "it ran one prompt and ended".to_string(),
         "self" => "it is aterm's own agent".to_string(),
+        // A Claude home its relaunch line cannot repeat — a relative one its
+        // `cd` would move, records no `HOME` names (`upgrade_drive::home_carried`,
+        // LC-4 of ATERM-KI-1015-1) — never "aterm refused it".
+        "home" => "it runs under a Claude home its tab's shell does not have".to_string(),
         other if other.starts_with("argv:") => {
             "it was started with options aterm cannot repeat".to_string()
         }
@@ -9168,102 +10415,342 @@ fn cannot_reason(step: &str) -> String {
         // `stop_words`), never `aterm refused it` (the review of the
         // 2026-10-09 sweep fixes).
         "no-resume" => "the new agent never picked the conversation back up".to_string(),
+        // The Muse Code lane (its review, 2026-10-17): Muse refused the
+        // relaunch's resume (an unknown or log-less session), or the tab's
+        // shell could not run the line (a workspace gone, no program) — typed
+        // once, never again; and a relaunch whose own end cannot be read, or
+        // a store build with no managed `muse` to type. Never "aterm refused
+        // it".
+        "resume-refused" => "its relaunch's resume was refused".to_string(),
+        "relaunch-unwitnessed" => "how its relaunch ended cannot be read".to_string(),
+        "no-managed-muse" => "no managed `muse` is installed to start it".to_string(),
         _ => "aterm refused it".to_string(),
     }
 }
 
-/// The tab mark for an agent that cannot be brought back: why, and the one
-/// command, never cut. Within the server's keyed attention (200 bytes), what
-/// gives way, in order: every carried flag that sets no permission mode
-/// ([`resume::mode_of`]), the reason, and last the permission mode itself
-/// (the bare line, [`resume::bare_of`]) — the last flag a line gives up
-/// (round three of the joint audit of 2026-10-01: an orchestrator told a
-/// bare line comes back in another permission mode).
-fn cannot_text(restarted: bool, reason: &str, command: Option<&str>) -> String {
-    let head = if restarted {
+/// What an agent that cannot be brought back is said to be, by whom it
+/// ended.
+fn cannot_head(restarted: bool) -> &'static str {
+    if restarted {
         "aterm ended the agent and cannot bring it back"
     } else {
         "the agent exited and aterm cannot bring it back"
+    }
+}
+
+/// The whole word of an agent that cannot be brought back, for the log: why,
+/// and the command whole where there is one.
+fn cannot_said(restarted: bool, reason: &str, command: Option<&str>) -> String {
+    let head = cannot_head(restarted);
+    match command {
+        Some(command) => format!("{head} ({reason}); run {command} in this tab"),
+        None => format!("{head} ({reason})"),
+    }
+}
+
+/// The tab's mark for a relaunch that keeps failing (LC-5 of
+/// ATERM-KI-1015-1): that aterm still tries, why where a person's words say
+/// it ([`failing_reason`]), and the command that starts the agent now — in
+/// the server's 200-byte attention, never cut ([`mark_text`]; `None` where it
+/// cannot be whole). Its words leave room for the longest reason with a
+/// whole conversation id (the review of the r20 relaunch lane: the reason
+/// gave way for every one but "its tab is held").
+fn failing_text(step: &str, command: &str) -> Option<String> {
+    mark_text(
+        "the agent exited; its relaunch keeps failing",
+        failing_reason(step),
+        "aterm still tries; or run",
+        command,
+    )
+}
+
+/// Why a relaunch keeps failing, in a person's words, where its step says
+/// (empty where it does not: the log keeps the step word). A conversation
+/// open in another tab marks nothing ([`failing_names_command`]).
+fn failing_reason(step: &str) -> &'static str {
+    match blocked_cause(step) {
+        Some("held") => "its tab is held",
+        Some("shell-prompt") => "a job keeps its shell from its prompt",
+        Some(_) => "",
+        None if matches!(step, "failed:no-resume" | "wait:resume") => {
+            "the new agent never picked the conversation back up"
+        }
+        None => "",
+    }
+}
+
+/// A tab's mark that asks a person to run `command` (`ask`: the words in
+/// front of it) — the mark of an agent that cannot be brought back
+/// ([`cannot_head`], [`tell`]) and of a relaunch that keeps failing
+/// ([`failing_text`]): `head`, `reason` in parentheses where there is one,
+/// and the command whole. Within the server's keyed attention (200 bytes),
+/// what gives way, in order: every carried flag that sets no permission mode
+/// ([`resume::mode_of`]), the reason, and last the permission mode itself
+/// (the bare line, [`resume::bare_of`]) — the last flag a line gives up
+/// (round three of the joint audit of 2026-10-01: an orchestrator told a
+/// bare line comes back in another permission mode) — then the head itself
+/// (`agent not back`). Every form keeps the Claude home in front of the
+/// command (LC-4 of ATERM-KI-1015-1). `None` where not even that fits — a
+/// command told under a very long `HOME`: the ask is whole or it is no mark,
+/// the digest's line then, and the log keeps the command.
+fn mark_text(head: &str, reason: &str, ask: &str, command: &str) -> Option<String> {
+    let mode = resume::mode_of(command);
+    let bare = resume::bare_of(command);
+    let with = |command: &str| {
+        if reason.is_empty() {
+            format!("{head}; {ask} {command} in this tab")
+        } else {
+            format!("{head} ({reason}); {ask} {command} in this tab")
+        }
     };
-    let Some(command) = command else {
-        return format!("{head} ({reason})");
-    };
-    let mode = aterm_agent::harness::resume::mode_of(command);
-    let bare = aterm_agent::harness::resume::bare_of(command);
-    let with = |command: &str| format!("{head} ({reason}); run {command} in this tab");
-    let without = |command: &str| format!("{head}; run {command} in this tab");
+    let without = |command: &str| format!("{head}; {ask} {command} in this tab");
     std::iter::once(with(command))
         .chain(mode.as_deref().map(with))
         .chain(mode.as_deref().map(without))
         .chain(bare.as_deref().map(with))
+        .chain(bare.as_deref().map(without))
+        // Last, the fewest words that still say why and what: a command
+        // told under a long `HOME` (LC-4) is longer than any other.
+        .chain(
+            bare.as_deref()
+                .map(|bare| format!("agent not back: run {bare} in this tab")),
+        )
         .find(|text| text.len() <= 190)
-        .unwrap_or_else(|| {
-            bare.map_or_else(
-                || format!("{head}; resume it in this tab"),
-                |bare| without(&bare),
-            )
-        })
 }
 
 /// The command that resumes the tab's agent by hand, from the snapshot the host
-/// kept of it ([`resume_told`]: `None` for a launch the rewrite refuses as not
-/// resumable in place, and for a Codex whose thread was not named).
-fn resume_line(job: &WorkerJob) -> Option<String> {
-    resume_told(&with_kept(job, |k| {
+/// kept of it, and the conversation it resumes ([`resume_told`]: `None` for a
+/// launch the rewrite refuses as not resumable in place, and for a Codex).
+fn resume_line(job: &WorkerJob) -> Option<(String, String)> {
+    let snap = with_kept(job, |k| {
         k.snapshot
             .clone()
             .or_else(|| k.owed.as_ref().map(|owed| owed.snap.clone()))
-    })?)
+    })?;
+    Some((resume_told(&snap)?, snap.session?))
 }
 
 /// THE LINE A PERSON IS TOLD TO RUN to resume the agent `snap` describes on
 /// its own conversation: the mark of an agent aterm cannot bring back
 /// ([`resume_line`]) and the loop's memory warning, frozen mail and turn-end
 /// escalation ([`WorkerIdle::resume_command`]) alike, through the one rule
-/// the footer's remedy goes through too
-/// ([`upgrade_drive::resume_command_kept`]): a `--model` the conversation's
-/// record marks failed is not printed for a person to start on again. A
-/// Codex's is `codex resume <thread>` ([`codex_resume_line`]). `None` for a
-/// launch the rewrite refuses as not resumable in place, and for a Codex
-/// whose thread the read did not name, or could not tell from another's.
+/// the footer's remedy goes through too ([`relaunch::told_command`]): a
+/// `--model` the conversation's record marks failed is not printed for a
+/// person to start on again, and the Claude home its agent ran under is
+/// carried in front of it, as its relaunch line carries it (ATERM-KI-1015-1
+/// LC-4). `None` for a launch the rewrite refuses as not resumable in place,
+/// for a home no line can repeat, and for a Codex (the Codex screen lane's
+/// retirement, 2026-10-16): codex-alab comes back on the line its copy
+/// validated, and a vendor `codex` is shown, never told a line.
 fn resume_told(snap: &Snapshot) -> Option<String> {
-    match snap.agent() {
-        upgrade::Agent::Claude => upgrade_drive::resume_command_kept(
-            harness_state().as_deref(),
-            &snap.argv,
-            snap.session.as_deref()?,
-        ),
-        upgrade::Agent::Codex => codex_resume_line(snap, snap.codex.as_ref()?),
+    match &snap.run {
+        relaunch::AgentRun::Claude => {
+            relaunch::told_command(&aterm_primer::home_dir()?, harness_state().as_deref(), snap)
+        }
+        relaunch::AgentRun::Codex(_) => None,
+        // Muse Code's own resume line (`muse resume <uuid>`), behind the data
+        // and config homes its relaunch carries; none where its witness
+        // proved no session.
+        relaunch::AgentRun::Muse(run) => {
+            aterm_agent::harness::upgrade_muse::told_line(snap.session.as_deref()?, &run.env)
+        }
     }
 }
 
-/// `codex resume <its kept flags> <thread>` ([`resume::codex_command`]), behind
-/// `CODEX_HOME=<value>` where the Codex was started with one
-/// ([`CodexRun::home_env`], as its relaunch line carries it): the line a
-/// person runs to resume the Codex `snap` describes on its own thread, which
-/// every surface that prints it steps down and keeps whole as it does Claude
-/// Code's ([`resume::shorter`], [`resume::never_cut`]). `None` where the read
-/// named no thread, or could not tell it from another client's
-/// ([`CodexRun::ambiguous`]: the line would resume that one), and where
-/// [`resume::codex_command`] says none.
-///
-/// A RELATIVE `CODEX_HOME` is the TUI's directory's (Codex resolves it
-/// against its own working directory as it starts), and this line names no
-/// directory: a person runs it wherever they read it (the Messages row, a
-/// new tab). So it carries the home the TUI resolved, [`CodexRun::home`];
-/// an absolute value is carried verbatim, as the relaunch line carries it.
-fn codex_resume_line(snap: &Snapshot, run: &CodexRun) -> Option<String> {
-    if run.ambiguous {
-        return None;
+/// The conversations a word of [`Kept::lost`] stands for, each with the
+/// tabs whose word it is: a publication naming one rings the host, whose
+/// pass ends that word ([`end_lost_words`]) at once. A tab's word leaves it
+/// as it ends, is replaced, or its tab closes ([`forget_closed`]). A leaf
+/// lock, taken after a publication's own and never around anything.
+type LostTabs = HashMap<String, std::collections::HashSet<String>>;
+static LOST_SESSIONS: Mutex<Option<LostTabs>> = Mutex::new(None);
+
+/// Stand `lost` for session `sid`'s tab ([`Kept::lost`]), in place of any
+/// earlier word of the tab, which it answers: the earlier word no longer
+/// stands for its conversation here.
+fn lose(sid: &str, job: &WorkerJob, lost: Lost) -> Option<Lost> {
+    let session = lost.session.clone();
+    LOST_SESSIONS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get_or_insert_with(HashMap::new)
+        .entry(session.clone())
+        .or_default()
+        .insert(sid.to_string());
+    aterm_log::info!(
+        "harness @{sid}: the word that its agent cannot be brought back stands until \
+         conversation {session} is held again or its tab closes"
+    );
+    let before = with_kept(job, |k| k.lost.replace(lost));
+    if let Some(before) = before.as_ref().filter(|b| b.session != session) {
+        forget_lost(&before.session, sid);
     }
-    let home = run.home_env.as_deref().map(|value| {
-        if value.is_empty() || std::path::Path::new(value).is_absolute() {
-            value
-        } else {
-            run.home.to_str().unwrap_or(value)
+    before
+}
+
+/// Whether a word stands for conversation `session` ([`LOST_SESSIONS`]).
+fn lost_session(session: &str) -> bool {
+    LOST_SESSIONS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .is_some_and(|lost| lost.contains_key(session))
+}
+
+/// THE WORDS THAT AN AGENT CANNOT BE BROUGHT BACK, ENDED BY WHAT THEY ARE
+/// ABOUT (ATERM-KI-1015-1 LC-4), at every pass of the host over every tab
+/// that keeps one ([`Kept::lost`]):
+///
+/// * ITS CONVERSATION HELD AGAIN — named by a live agent's published snapshot
+///   in any tab ([`published_snapshot`]; resumed by hand, by `/resume`, in a
+///   new tab), never the ended agent's own: the word ends — its mark lowered,
+///   its digest line ended ([`RelaunchSay::Back`]), and the tab's standing
+///   ask answered with it (`Relaunches::conversation_runs`: it never runs in
+///   this tab). Nothing else of the relaunch's own state moves: no agent of
+///   the tab came back for it. Held again in the tab itself, the snapshot
+///   read answers the ask first ([`asked_runs`]), and this pass ends the
+///   digest's line.
+/// * A PERSON WORKING IN THE TAB ON ANOTHER CONVERSATION — the tab's agent
+///   holds one whose record holds a prompt of a person's or an
+///   orchestrator's ([`Acts::tasked`]): the mark steps down to its line of
+///   the digest, with its command ([`RelaunchSay::SteppedDown`]), a fact for
+///   later. A Claude Code at its first-run screen, or one about to say `No
+///   conversation found`, holds no such conversation: the mark stands.
+///
+/// Before, any program that started in the tab cleared the mark, and every
+/// new loop's start cleared it again as a stale entry of its own owner.
+fn end_lost_words(shared: &Shared, hooks: &Hooks) {
+    let standing: Vec<(String, Arc<Mutex<Kept>>)> = shared
+        .kept
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .map(|(sid, kept)| (sid.clone(), Arc::clone(kept)))
+        .collect();
+    for (sid, kept) in standing {
+        let Some((session, pid)) = with_kept_of(&kept, |k| {
+            k.lost.as_ref().map(|l| (l.session.clone(), l.pid))
+        }) else {
+            continue;
+        };
+        if held_again(&session, pid) {
+            // The tab's own word asking for it is answered with it
+            // (`Relaunches::conversation_runs`): held again in another tab,
+            // it never runs in this one.
+            let Some(lost) = with_kept_of(&kept, |k| {
+                let _ = k.relaunches.conversation_runs(&session);
+                k.lost.take()
+            }) else {
+                continue;
+            };
+            forget_lost(&lost.session, &sid);
+            aterm_log::info!(
+                "harness @{sid}: conversation {session} is held again; the word that its \
+                 agent could not be brought back ends"
+            );
+            if lost.marked {
+                (hooks.badge)(&sid, None);
+            }
+            (hooks.note)(HostNote::Relaunch {
+                sid: sid.clone(),
+                said: RelaunchSay::Back,
+            });
+            continue;
         }
+        step_down(&sid, &kept, hooks);
+    }
+}
+
+/// Whether a live agent other than `ended` holds `session` now, in any tab,
+/// by the snapshots the host publishes ([`publish_snapshot`]).
+fn held_again(session: &str, ended: u32) -> bool {
+    PUBLISHED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .is_some_and(|map| {
+            map.values()
+                .any(|snap| snap.pid != ended && snap.session.as_deref() == Some(session))
+        })
+}
+
+/// The tab `sid`'s standing MARK steps down to the digest where its agent
+/// now holds another conversation someone prompted ([`end_lost_words`]),
+/// read in that agent's transcript ([`reads_transcript`]): where none is
+/// read (a Codex), the mark stands.
+///
+/// CAUGHT ([`host_caught`]; F1-R5-G1, the fifth verification of F1's fix):
+/// the read is the harness's own record code, asked on the host thread at
+/// every pass while the mark stands and another conversation runs in the
+/// tab. One that panicked unwound the pass, and every restarted run asked
+/// it again and panicked there: no later tab got a worker, no exit was
+/// handed, for good. It now ends this word's step down ([`Lost::faulted`]),
+/// its read memo put back, the mark left standing.
+fn step_down(sid: &str, kept: &Mutex<Kept>, hooks: &Hooks) {
+    let Some((snap, mut other)) = with_kept_of(kept, |k| {
+        let lost = k.lost.as_mut().filter(|l| l.marked && !l.faulted)?;
+        let snap = k
+            .snapshot
+            .clone()
+            .filter(|s| s.pid != lost.pid && s.session.is_some())
+            .filter(|s| s.session.as_deref() != Some(lost.session.as_str()))
+            .filter(|s| reads_transcript(s.agent().program()))?;
+        Some((snap, std::mem::take(&mut lost.other)))
+    }) else {
+        return;
+    };
+    let tasked = host_caught(sid, "its mark's step down", || {
+        (hooks.acts.tasked)(sid, &snap, &mut other)
     });
-    resume::codex_command(&snap.argv, snap.session.as_deref()?, home)
+    let said = with_kept_of(kept, |k| {
+        let lost = k.lost.as_mut()?;
+        lost.other = other;
+        lost.faulted |= tasked.is_none();
+        if tasked != Some(Some(true)) {
+            return None;
+        }
+        lost.marked = false;
+        let said = RelaunchSay::SteppedDown {
+            reason: lost.reason.clone(),
+            restarted: lost.restarted,
+            command: lost.command.clone(),
+        };
+        // The mark lowered, the ask it made of the relaunch is answered with
+        // it (`Relaunches::conversation_runs`), as a word that ends does
+        // ([`end_lost_words`]): left standing, the next relaunch of the tab
+        // that kept failing was said beside a word no mark held any more —
+        // its own mark ("aterm still tries") never ended with its trying.
+        let session = lost.session.clone();
+        let _ = k.relaunches.conversation_runs(&session);
+        Some(said)
+    });
+    if let Some(said) = said {
+        aterm_log::info!(
+            "harness @{sid}: a person works in the tab on another conversation; the mark that \
+             its agent could not be brought back steps down to the digest"
+        );
+        (hooks.badge)(sid, None);
+        (hooks.note)(HostNote::Relaunch {
+            sid: sid.to_string(),
+            said,
+        });
+    }
+}
+
+/// Tab `sid`'s word no longer stands for `session` ([`LOST_SESSIONS`]); the
+/// conversation leaves the list with the last tab whose word it was.
+fn forget_lost(session: &str, sid: &str) {
+    if let Some(lost) = LOST_SESSIONS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_mut()
+        && let Some(tabs) = lost.get_mut(session)
+    {
+        tabs.remove(sid);
+        if tabs.is_empty() {
+            lost.remove(session);
+        }
+    }
 }
 
 struct Worker {
@@ -9301,6 +10788,10 @@ struct Worker {
     kept: Arc<Mutex<Kept>>,
     /// [`WorkerJob::left_at_commit`].
     left_at_commit: Arc<AtomicBool>,
+    /// The host's follow of this worker's agent panicked ([`host_caught`]):
+    /// the host follows it no more (the worker's own reads still refresh
+    /// what is kept of it, [`refresh_snapshot`]).
+    unfollowed: bool,
 }
 
 impl Worker {
@@ -9629,8 +11120,12 @@ struct Shared {
 // with nothing but a log line.
 
 /// The disk watch's period: a free-space figure has no event to hang on
-/// (design §5.5, §4.2 row 18), so this is the one timer the host keeps.
-const DISK_TICK: Duration = Duration::from_secs(6 * 3600);
+/// (design §5.5, §4.2 row 18), so this is the one timer the host keeps. A
+/// MINUTE (it was six hours until the disk filled twice on 2026-10-16, each
+/// time between two looks): a look above the floor is one `statvfs`, the
+/// settings read, and the supervised tabs' screens read in memory; a pass
+/// below the floor is rate-limited on its own ([`DISK_PASS_EVERY`]).
+const DISK_TICK: Duration = Duration::from_secs(60);
 /// The first look, a while after the host starts rather than in its first
 /// breath.
 const DISK_FIRST_LOOK: Duration = Duration::from_secs(120);
@@ -9994,6 +11489,19 @@ impl HostHandle {
         let _ = queue_restored(&self.shared, &self.hooks, restored);
     }
 
+    /// THE TAB A HELD TAB'S AGENT RAN IN, where a cold restore minted its
+    /// reopened tab another sid (the decision review's RR-LC-3, LC-8): a held
+    /// tab's agent is never queued ([`Self::relaunch_restored`]), so no
+    /// relaunch records the tab it ran in; it is noted beside the reopened
+    /// tab's loop ledger as a queued agent's is ([`Acts::earlier_tab`]), so
+    /// the old tab's loop turns stay the harness's own. A note in aterm's own
+    /// state, never an act on the tab.
+    pub(crate) fn note_earlier_tab(&self, sid: &str, was: &str) {
+        if was != sid {
+            (self.hooks.acts.earlier_tab)(sid, was);
+        }
+    }
+
     /// THE AUTOMATIC UPDATE WAITS FOR THE RESTORED AGENTS (round four, plan
     /// item 7): `true` while the cold restore's queue still holds an agent
     /// ([`Self::relaunch_restored`]) and `now` is inside [`RESTORED_HOLD`] of
@@ -10149,6 +11657,7 @@ impl HostHandle {
                     place,
                     cold: false,
                     asked: owed.asked,
+                    was: None,
                 })
             })
             .collect();
@@ -10301,13 +11810,18 @@ impl HostHandle {
     }
 
     /// Whether a restored agent of `agent` is relaunched: where this host
-    /// relaunches restored agents ([`Self::relaunches_restored`]), and only
-    /// while it admits that agent ([`Self::admits`]) — one switched off by
-    /// its own table is relaunched by nobody ([`restored_allowed`]). The
-    /// reopened layout's row asks it of each agent the layout carried, so
-    /// one switched off is said lost, never resuming.
+    /// relaunches restored agents ([`Self::relaunches_restored`]), only for
+    /// an agent whose relaunch is written ([`relaunches`]: never agy's, Muse
+    /// Code's or Gemini CLI's, which a leaf may name but no lane brings back,
+    /// `AgentRestore::snapshot`), and only while it admits that agent
+    /// ([`Self::admits`]) — one switched off by its own table is relaunched by
+    /// nobody ([`restored_allowed`]). The reopened layout's row asks it of
+    /// each agent the layout carried, so one switched off, or with no lane, is
+    /// said lost, never resuming.
     pub(crate) fn relaunches_restored_of(&self, agent: upgrade::Agent) -> bool {
-        relaunches_restored(&self.shared) && self.admits(agent.program())
+        relaunches_restored(&self.shared)
+            && relaunches(agent.program())
+            && self.admits(agent.program())
     }
 
     /// WHO ANSWERS a wall of `kind` on a session this host supervises (the
@@ -10574,21 +12088,24 @@ impl HostHandle {
         };
         let carry = Arc::clone(&self.hooks.acts.carry_in_flight);
         let words = Arc::clone(&self.hooks.autopilot);
+        let runs = Arc::clone(&self.hooks.still_wanted);
         let pause = Arc::clone(&self.hooks.pause);
         let shared = Arc::clone(&self.shared);
-        let spawned = std::thread::Builder::new()
-            .name(format!("{THREAD_PREFIX}carried"))
-            .spawn(move || {
-                crate::qos::set_self(crate::qos::Role::Background);
+        let spawned = crate::qos::spawn_lane_thread(
+            format!("{THREAD_PREFIX}carried"),
+            crate::qos::Role::Background,
+            move || {
                 carry_in_flight_after_handoff(
                     &shared,
                     carry.as_ref(),
                     words.as_ref(),
+                    runs.as_ref(),
                     pause.as_ref(),
                     &sessions,
                     grace,
                 );
-            });
+            },
+        );
         if let Err(e) = spawned {
             aterm_log::warn!(
                 "harness: the restarts the previous aterm left in flight could not be carried \
@@ -10618,12 +12135,34 @@ impl HostHandle {
     /// ([`Self::resume_after_handoff`], [`Acts::restarted`]). A tab whose
     /// snapshot names another process already (its worker read one) is that
     /// worker's. Nothing while the harness is off.
+    #[cfg(any(unix, test))]
     pub(crate) fn watch_handed(&self, agents: Vec<(String, Snapshot)>) {
         if agents.is_empty() || !would_supervise(&self.shared.lock().cfg, self.shared.headless) {
             return;
         }
         for (sid, snap) in agents {
             if !self.shared.switches.on_for(snap.agent().program()) {
+                continue;
+            }
+            // A VENDOR CODEX HANDED OVER IS NOBODY'S (the Codex screen lane's
+            // retirement, 2026-10-16): an older outgoing instance supervised
+            // it, this one watches no exit of it. codex-alab is known by the
+            // line its leaf carries (the outgoing copy validated it) or by its
+            // image ([`crate::self_claim::runs_alab_build`]: read once, here,
+            // while the handed agent runs). A Muse Code is its lane's, watched
+            // as a Claude Code is.
+            let watched = match &snap.run {
+                relaunch::AgentRun::Codex(_) => {
+                    relaunch::self_claimed_line(&snap).is_some()
+                        || crate::self_claim::runs_alab_build(snap.pid)
+                }
+                relaunch::AgentRun::Claude | relaunch::AgentRun::Muse(_) => true,
+            };
+            if !watched {
+                aterm_log::info!(
+                    "harness @{sid}: the vendor codex the previous aterm supervised here is shown, \
+                     not watched: aterm supervises no Codex"
+                );
                 continue;
             }
             if (self.hooks.acts.restarted)(&sid, snap.agent(), Some(snap.pid)) {
@@ -10647,10 +12186,24 @@ impl HostHandle {
                     .entry(sid.clone())
                     .or_default(),
             );
+            // A HANDED AGENT STILL RAN AT THE COMMIT: the snapshot KEPT for
+            // its exit carries no validated line (the review of 2026-10-16,
+            // finding 1). The line its leaf carries is the outgoing
+            // instance's copy's, and that copy decided nothing of an end
+            // read here: kept, an exit read before the agent re-proves its
+            // claim — an orderly one included — went to the crash rule's
+            // relaunch, and so did the relaunch that exit came to owe. The
+            // PUBLISHED snapshot keeps it (`publish_snapshot_from`, `handed`)
+            // for the crash image alone: aterm's own end is a relaunch on
+            // it (`relaunch::after_host_ended`), never an exit's.
+            let mut decided = snap.clone();
+            if let Some(run) = decided.codex_mut() {
+                run.self_claimed = None;
+            }
             let (ours, moved) = with_kept_of(&kept, |k| match &k.snapshot {
                 None => {
-                    k.snapshot = Some(snap.clone());
-                    (true, publish_snapshot(&sid, Some(&snap)))
+                    k.snapshot = Some(decided);
+                    (true, publish_snapshot_from(&sid, Some(&snap), true))
                 }
                 Some(read) => (read.pid == snap.pid && read.start == snap.start, false),
             });
@@ -10827,6 +12380,17 @@ fn queue_restored_guarded(
     mut restored: Vec<RestoredAgent>,
     revoked: Option<&AtomicBool>,
 ) -> Result<(), Vec<RestoredAgent>> {
+    // The tab each agent ran in, where a cold restore minted another sid:
+    // noted first, whatever the queue does with the agent (none is stepped
+    // under `relaunch = false`, nor an Off one; a held tab's is never queued:
+    // [`HostHandle::note_earlier_tab`]). A note
+    // beside the tab's loop ledger in aterm's own state, never an act on the
+    // tab.
+    for agent in &restored {
+        if let Some(was) = agent.was.as_deref().filter(|w| *w != agent.sid) {
+            (hooks.acts.earlier_tab)(&agent.sid, was);
+        }
+    }
     // An Off session's agent is queued too: its queue's thread drops it,
     // clearing its tab's word ([`restored_off`]).
     restored.retain(|agent| restored_allowed(shared, agent));
@@ -10866,6 +12430,7 @@ fn queue_restored_guarded(
                         agent_seen: false,
                         carried: false,
                         landed: false,
+                        faults: 0,
                     }),
             );
         !std::mem::replace(&mut queue.running, true)
@@ -10876,12 +12441,41 @@ fn queue_restored_guarded(
     }
     let queue_hooks = hooks.clone();
     let queue_shared = Arc::clone(shared);
-    let spawned = std::thread::Builder::new()
-        .name(format!("{THREAD_PREFIX}restored"))
-        .spawn(move || {
-            crate::qos::set_self(crate::qos::Role::Background);
-            relaunch_restored_queue(&queue_shared, &queue_hooks);
-        });
+    let spawned = crate::qos::spawn_lane_thread(
+        format!("{THREAD_PREFIX}restored"),
+        crate::qos::Role::Background,
+        move || {
+            // A queue that panicked outside any one tab's step (each is
+            // caught on its own, [`restored_step`]) ends as one that could
+            // not start ([`caught`]; F1-R6-H2): no longer running, so the
+            // next restore starts its worker again, and what it still owed
+            // said, never dropped unsaid ([`restored_queue_panicked`]).
+            // Uncaught, `running` stood for good: every later restore only
+            // queued behind it.
+            //
+            // ONLY WHILE THIS WORKER OWNS THE QUEUE (F1-R8-G5): it lets the
+            // queue go (`running` cleared) only under the queue's lock, at
+            // the instant it ends with nothing left to say, so a panic
+            // caught here is always one of the queue it still runs — never
+            // one after a restore queued meanwhile started a worker of its
+            // own, whose attempts (the one it steps included) this would end
+            // as not relaunched while that worker went on and landed them.
+            if caught(
+                "the restored agents' relaunch",
+                "what it still owed is said as not relaunched",
+                || relaunch_restored_queue(&queue_shared, &queue_hooks),
+            )
+            .is_none()
+            {
+                let missed = restored_queue_panicked(&queue_shared, queue_hooks.badge.as_ref());
+                let _ = caught(
+                    "the restored agents' row",
+                    "the tabs it would name are in the log",
+                    || say_restored(&queue_shared, queue_hooks.still_wanted.as_ref(), missed),
+                );
+            }
+        },
+    );
     if let Err(e) = spawned {
         aterm_log::warn!("harness: the restored tabs' agents could not be relaunched: {e}");
         // Nothing will step the queue: empty it, so the automatic update
@@ -10926,14 +12520,10 @@ fn queue_restored_guarded(
 /// a read, a pass naming it, or its end before any read — then stepped
 /// again ([`restored_landing_ends`]; the review of round eighteen's first
 /// cut).
+///
+/// A TAB THAT WAS HELD (ATERM-KI-1015-1 LC-8) is never queued: its agent is
+/// the holder's (`App::say_restored_held`).
 fn relaunch_restored_queue(shared: &Arc<Shared>, hooks: &Hooks) {
-    let (act, cold, badge, runs) = (
-        hooks.acts.relaunch_restored.as_ref(),
-        hooks.acts.account_cold.as_ref(),
-        hooks.badge.as_ref(),
-        hooks.still_wanted.as_ref(),
-    );
-    let switches = &shared.switches;
     let mut queue = shared
         .restored
         .lock()
@@ -10948,7 +12538,7 @@ fn relaunch_restored_queue(shared: &Arc<Shared>, hooks: &Hooks) {
             let missed = std::mem::take(&mut queue.missed);
             if !missed.is_empty() {
                 drop(queue);
-                say_restored_missed(missed);
+                say_restored(shared, hooks.still_wanted.as_ref(), missed);
                 queue = shared
                     .restored
                     .lock()
@@ -10971,12 +12561,24 @@ fn relaunch_restored_queue(shared: &Arc<Shared>, hooks: &Hooks) {
             .attempts
             .retain(|attempt| restored_allowed(shared, &attempt.agent));
         if queue.attempts.is_empty() {
-            // Done.
-            queue.running = false;
+            // Done: what it missed is said FIRST, the queue still this
+            // worker's, and let go only once nothing is left to say
+            // (F1-R8-G5). Let go before the row, a panic saying it reached
+            // the last resort on a queue another worker might own by then;
+            // and a restore queued while the row is said is this worker's
+            // still, stepped at the next look.
             let missed = std::mem::take(&mut queue.missed);
+            if missed.is_empty() {
+                queue.running = false;
+                return;
+            }
             drop(queue);
-            say_restored_missed(missed);
-            return;
+            say_restored(shared, hooks.still_wanted.as_ref(), missed);
+            queue = shared
+                .restored
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            continue;
         }
         // The earliest due tab runs first. Initial attempts all precede any
         // retry, even when the first step took a while. The one worker still
@@ -11000,222 +12602,439 @@ fn relaunch_restored_queue(shared: &Arc<Shared>, hooks: &Hooks) {
         }
         let attempt = &mut queue.attempts[at];
         attempt.acting = true;
-        let (order, agent) = (attempt.order, attempt.agent.clone());
-        let revoked = Arc::clone(&attempt.revoked);
-        let (typed, seen, carried) = (attempt.typed(), attempt.agent_seen, attempt.carried);
-        let landed = attempt.landed;
+        let taken = RestoredTaken {
+            order: attempt.order,
+            agent: attempt.agent.clone(),
+            revoked: Arc::clone(&attempt.revoked),
+            typed: attempt.typed(),
+            seen: attempt.agent_seen,
+            carried: attempt.carried,
+            landed: attempt.landed,
+        };
         drop(queue);
-        // ITS STEP LANDED AN AGENT NO READ HAS REACHED (round eighteen, the
-        // review of its first cut): looked at again, no step, nothing
-        // counted — read now, named by a pass, still unread, or gone.
-        if landed {
-            let look = restored_landing_look(shared, hooks, &agent.sid, seen, &revoked);
-            queue = shared
-                .restored
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            if queue.closed {
-                continue;
-            }
-            let Some(at) = queue.attempts.iter().position(|a| a.order == order) else {
-                continue;
-            };
-            let mut attempt = queue.attempts.remove(at).expect("the attempt was found");
-            attempt.acting = false;
-            match restored_landing_ends(attempt, look, hooks.pause.as_ref()) {
-                LandingEnd::Keep(attempt) => queue.attempts.push_back(attempt),
-                LandingEnd::Over(attempt, last, step) => {
-                    drop(queue);
-                    let missed = restored_over(badge, attempt, last, step);
-                    queue = shared
-                        .restored
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner);
-                    queue.missed.extend(missed);
-                }
-            }
-            continue;
+        // ONE TAB'S STEP, CAUGHT (F1-R7 V-1): a step that panics — its
+        // relaunch reading the tab's records, its landing's look — ends its
+        // own attempt alone, said as any end is ([`restored_step_panicked`]),
+        // and the queue goes on with every other tab's. Caught only around
+        // the whole worker, one tab's panic emptied the queue: every other
+        // agent queued with it, or queued while it ran, dropped with no row
+        // and its badge left up.
+        let relaunched = AtomicBool::new(taken.landed);
+        if caught(
+            &format!("@{}: the relaunch after aterm ended", taken.agent.sid),
+            "its attempt is over, said as one that could not be made, and the queue goes on",
+            || restored_step(shared, hooks, &taken, &relaunched),
+        )
+        .is_none()
+        {
+            restored_step_panicked(shared, hooks, &taken, relaunched.load(Ordering::SeqCst));
         }
-        // AUTOPILOT OFF in the tab since it was queued: over, no step, no
-        // row — and the word a relaunch raised on the tab ("still trying",
-        // a predecessor's carried here) is cleared, as a stop clears an Off
-        // session's badges ([`cleanup_request`]): no worker of its own will
-        // (the review of 345c41647). Asked FIRST, before whether an agent ran
-        // there: that branch leaves the attention to the agent's worker,
-        // which an Off session never gets.
-        if restored_off(shared, hooks, &agent) {
-            queue = shared
-                .restored
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            if queue.closed {
-                continue;
-            }
-            if let Some(at) = queue.attempts.iter().position(|a| a.order == order) {
-                queue.attempts.remove(at);
-            }
-            drop(queue);
-            badge(&agent.sid, None);
-            queue = shared
-                .restored
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            continue;
-        }
-        // AN AGENT RAN IN THE TAB SINCE (rounds eleven and twelve): nothing
-        // of this relaunch typed, it is over — the tab's agent is not typed
-        // at, and no row says one did not come back. Asked where the step
-        // would run, the attempt held as acting meanwhile. The tab's
-        // attention is left alone: its owner is that agent's own worker now
-        // (a word of this process's relaunch is cleared as that worker
-        // starts), and a step that came later — up to a long pause on —
-        // unset the escalation it had raised.
-        if restored_overtaken(typed, seen, runs, &agent.sid) {
-            aterm_log::info!(
-                "harness @{}: an agent ran {} since; the relaunch after aterm ended is over",
-                agent.sid,
-                agent.place
-            );
-            queue = shared
-                .restored
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            if queue.closed {
-                continue;
-            }
-            if let Some(at) = queue.attempts.iter().position(|a| a.order == order) {
-                queue.attempts.remove(at);
-            }
-            continue;
-        }
-        if let Some(look) = restored_carried(hooks, &agent, carried) {
-            queue = shared
-                .restored
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            if queue.closed {
-                continue;
-            }
-            if let Some(at) = queue.attempts.iter().position(|a| a.order == order) {
-                match look {
-                    // Over, as a step that ends it is: a word a relaunch on
-                    // exit raised on the tab is no longer true, and no row
-                    // says it did not come back (it is that supervisor's).
-                    Carried::Claimed => {
-                        queue.attempts.remove(at);
-                        drop(queue);
-                        badge(&agent.sid, None);
-                        queue = shared
-                            .restored
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner);
-                    }
-                    // Looked at again uncounted, its pause its own.
-                    Carried::Hand => {
-                        let attempt = &mut queue.attempts[at];
-                        attempt.acting = false;
-                        attempt.carried = true;
-                        attempt.due = Instant::now() + (hooks.pause)(relaunch::BUSY);
-                    }
-                }
-            }
-            continue;
-        }
-        let login = (agent.unread() && switches.accounts() != accounts::Mode::Off)
-            .then(|| cold(&agent.snap))
-            .flatten();
-        let grace = shared.lock().cfg.human_grace_s;
-        if !restored_current(shared, order, &agent) {
-            queue = shared
-                .restored
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            if queue.closed {
-                continue;
-            }
-            queue.attempts.retain(|attempt| attempt.order != order);
-            continue;
-        }
-        let step = relaunch_cold(&agent.snap, login, &|snap| match agent.asked {
-            // The act's relaunch, as the live worker makes it once the hand
-            // lifts: on its cause, the graceful-exit rule not applying.
-            Some(cause) => (hooks.acts.relaunch)(
-                &agent.sid,
-                grace,
-                snap,
-                &ExitRecord::Unread,
-                switches.upgrade(),
-                Some(cause),
-            ),
-            None => act(&agent.sid, snap, switches.upgrade()),
-        });
-        let last = relaunch::outcome(&step);
-        if !restored_current(shared, order, &agent) {
-            queue = shared
-                .restored
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            if queue.closed {
-                continue;
-            }
-            queue.attempts.retain(|attempt| attempt.order != order);
-            continue;
-        }
-        // THE AGENT IT LANDED IS READ AT ONCE, and watched until a pass names
-        // it (round eighteen), armed before the attempt is taken off the
-        // queue — or, no read reaching it, kept on the queue for it (the
-        // review of round eighteen's first cut, [`RestoredAttempt::landed`]).
-        let landing = (last == Outcome::Relaunched)
-            .then(|| restored_landing_look(shared, hooks, &agent.sid, false, &revoked));
         queue = shared
             .restored
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+    }
+}
+
+/// One restored attempt as [`relaunch_restored_queue`] takes it for a step,
+/// its lock released: the attempt itself stays queued, acting
+/// ([`RestoredAttempt::acting`]), and is found again by its `order`.
+struct RestoredTaken {
+    order: usize,
+    agent: RestoredAgent,
+    revoked: Arc<AtomicBool>,
+    /// [`RestoredAttempt::typed`].
+    typed: bool,
+    /// [`RestoredAttempt::agent_seen`].
+    seen: bool,
+    /// [`RestoredAttempt::carried`].
+    carried: bool,
+    /// [`RestoredAttempt::landed`].
+    landed: bool,
+}
+
+/// ONE STEP OF ONE RESTORED ATTEMPT ([`relaunch_restored_queue`]), run with
+/// the queue's lock released and taken again only to keep, end or put the
+/// attempt back — never once the host's shutdown closed the queue, which
+/// keeps what it owes for the next instance. `relaunched` is set once the step's relaunch has landed
+/// (or the attempt's had, `taken.landed`), for an end
+/// [`restored_step_panicked`] says.
+fn restored_step(shared: &Shared, hooks: &Hooks, taken: &RestoredTaken, relaunched: &AtomicBool) {
+    let (act, cold, badge, runs) = (
+        hooks.acts.relaunch_restored.as_ref(),
+        hooks.acts.account_cold.as_ref(),
+        hooks.badge.as_ref(),
+        hooks.still_wanted.as_ref(),
+    );
+    let switches = &shared.switches;
+    let RestoredTaken {
+        order,
+        ref agent,
+        ref revoked,
+        typed,
+        seen,
+        carried,
+        landed,
+    } = *taken;
+    let restored = || {
+        shared
+            .restored
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    };
+    // ITS STEP LANDED AN AGENT NO READ HAS REACHED (round eighteen, the
+    // review of its first cut): looked at again, no step, nothing
+    // counted — read now, named by a pass, still unread, or gone.
+    if landed {
+        let look = restored_landing_look(shared, hooks, &agent.sid, seen, &agent.snap, revoked);
+        let mut queue = restored();
         if queue.closed {
-            continue;
+            return;
         }
         let Some(at) = queue.attempts.iter().position(|a| a.order == order) else {
-            continue;
+            return;
         };
         let mut attempt = queue.attempts.remove(at).expect("the attempt was found");
         attempt.acting = false;
-        attempt.tried += 1;
-        if let Some(look) = landing {
-            match restored_landing_ends(attempt, look, hooks.pause.as_ref()) {
-                LandingEnd::Keep(attempt) => queue.attempts.push_back(attempt),
-                LandingEnd::Over(attempt, last, step) => {
+        match restored_landing_ends(attempt, look, hooks.pause.as_ref()) {
+            LandingEnd::Keep(attempt) => queue.attempts.push_back(attempt),
+            LandingEnd::Over(attempt, last, step) => {
+                drop(queue);
+                let missed = restored_over(badge, attempt, last, step);
+                restored().missed.extend(missed);
+            }
+        }
+        return;
+    }
+    // AUTOPILOT OFF in the tab since it was queued: over, no step, no
+    // row — and the word a relaunch raised on the tab ("still trying",
+    // a predecessor's carried here) is cleared, as a stop clears an Off
+    // session's badges ([`cleanup_request`]): no worker of its own will
+    // (the review of 345c41647). Asked FIRST, before whether an agent ran
+    // there: that branch leaves the attention to the agent's worker,
+    // which an Off session never gets.
+    if restored_off(shared, hooks, agent) {
+        {
+            let mut queue = restored();
+            if queue.closed {
+                return;
+            }
+            if let Some(at) = queue.attempts.iter().position(|a| a.order == order) {
+                queue.attempts.remove(at);
+            }
+        }
+        badge(&agent.sid, None);
+        return;
+    }
+    // AN AGENT RAN IN THE TAB SINCE (rounds eleven and twelve): nothing
+    // of this relaunch typed, it is over — the tab's agent is not typed
+    // at, and no row says one did not come back. Asked where the step
+    // would run, the attempt held as acting meanwhile. The tab's
+    // attention is left alone: its owner is that agent's own worker now
+    // (a word of this process's relaunch is cleared as that worker
+    // starts), and a step that came later — up to a long pause on —
+    // unset the escalation it had raised.
+    if restored_overtaken(typed, seen, runs, &agent.sid) {
+        aterm_log::info!(
+            "harness @{}: an agent ran {} since; the relaunch after aterm ended is over",
+            agent.sid,
+            agent.place
+        );
+        let mut queue = restored();
+        if queue.closed {
+            return;
+        }
+        if let Some(at) = queue.attempts.iter().position(|a| a.order == order) {
+            queue.attempts.remove(at);
+        }
+        return;
+    }
+    if let Some(look) = restored_carried(hooks, agent, carried) {
+        let mut queue = restored();
+        if queue.closed {
+            return;
+        }
+        if let Some(at) = queue.attempts.iter().position(|a| a.order == order) {
+            match look {
+                // Over, as a step that ends it is: a word a relaunch on
+                // exit raised on the tab is no longer true, and no row
+                // says it did not come back (it is that supervisor's).
+                Carried::Claimed => {
+                    queue.attempts.remove(at);
                     drop(queue);
-                    let missed = restored_over(badge, attempt, last, step);
-                    queue = shared
-                        .restored
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner);
-                    queue.missed.extend(missed);
+                    badge(&agent.sid, None);
+                }
+                // Looked at again uncounted, its pause its own.
+                Carried::Hand => {
+                    let attempt = &mut queue.attempts[at];
+                    attempt.acting = false;
+                    attempt.carried = true;
+                    attempt.due = Instant::now() + (hooks.pause)(relaunch::BUSY);
                 }
             }
-            continue;
         }
+        return;
+    }
+    let login = (agent.unread() && switches.accounts() != accounts::Mode::Off)
+        .then(|| cold(&agent.snap))
+        .flatten();
+    let grace = shared.lock().cfg.human_grace_s;
+    if !restored_current(shared, order, agent) {
+        let mut queue = restored();
+        if !queue.closed {
+            queue.attempts.retain(|attempt| attempt.order != order);
+        }
+        return;
+    }
+    let step = relaunch_cold(&agent.snap, login, &|snap| match agent.asked {
+        // The act's relaunch, as the live worker makes it once the hand
+        // lifts: on its cause, the graceful-exit rule not applying.
+        Some(cause) => (hooks.acts.relaunch)(
+            &agent.sid,
+            grace,
+            snap,
+            &ExitRecord::Unread,
+            switches.upgrade(),
+            Some(cause),
+        ),
+        None => act(&agent.sid, snap, switches.upgrade(), agent.was.as_deref()),
+    });
+    let last = relaunch::outcome(&step);
+    relaunched.store(last == Outcome::Relaunched, Ordering::SeqCst);
+    if !restored_current(shared, order, agent) {
+        let mut queue = restored();
+        if !queue.closed {
+            queue.attempts.retain(|attempt| attempt.order != order);
+        }
+        return;
+    }
+    // THE AGENT IT LANDED IS READ AT ONCE, and watched until a pass names
+    // it (round eighteen), armed before the attempt is taken off the
+    // queue — or, no read reaching it, kept on the queue for it (the
+    // review of round eighteen's first cut, [`RestoredAttempt::landed`]).
+    let landing = (last == Outcome::Relaunched)
+        .then(|| restored_landing_look(shared, hooks, &agent.sid, false, &agent.snap, revoked));
+    let mut queue = restored();
+    if queue.closed {
+        return;
+    }
+    let Some(at) = queue.attempts.iter().position(|a| a.order == order) else {
+        return;
+    };
+    let mut attempt = queue.attempts.remove(at).expect("the attempt was found");
+    attempt.acting = false;
+    attempt.tried += 1;
+    if let Some(look) = landing {
+        match restored_landing_ends(attempt, look, hooks.pause.as_ref()) {
+            LandingEnd::Keep(attempt) => queue.attempts.push_back(attempt),
+            LandingEnd::Over(attempt, last, step) => {
+                drop(queue);
+                let missed = restored_over(badge, attempt, last, step);
+                restored().missed.extend(missed);
+            }
+        }
+        return;
+    }
+    let now = Instant::now();
+    if step == "wait:resume" {
+        attempt.resume_wait_since.get_or_insert(now);
+    }
+    let waiting = attempt
+        .resume_wait_since
+        .map_or(Duration::ZERO, |since| now.saturating_duration_since(since));
+    if restored_retry(&step, &last, attempt.tried, waiting) {
+        attempt.due = now + attempt.pause;
+        attempt.pause = (attempt.pause * 2).min(RESTORED_MAX_PAUSE);
+        queue.attempts.push_back(attempt);
+        return;
+    }
+    drop(queue);
+    let missed = restored_over(badge, attempt, last, &step);
+    restored().missed.extend(missed);
+}
+
+/// A RESTORED ATTEMPT WHOSE STEP PANICKED (F1-R7 V-1, F1-R8-G1/-G2,
+/// F1-R9-G2; [`restored_step`]) IS A FAULT OF THAT ATTEMPT, never a relaunch
+/// made again from nothing, which might type its line into the tab a second
+/// time. ONE WHOSE NEXT STEP TYPES NOTHING NEW is kept and stepped again while
+/// its faults ([`RestoredAttempt::faults`], counted apart from
+/// [`RestoredAttempt::tried`], the budget of its relaunches) stay under
+/// [`RESTORED_TRIES`]:
+///
+/// - A LANDING — its relaunch landed (`relaunched`), or a landed attempt's
+///   look ([`RestoredAttempt::landed`]) — is the holder of that agent's exit:
+///   looked at again after [`LANDED_LOOK`] as a landed attempt is (a look
+///   types nothing). Ended at the first panic, its agent's crash before a
+///   pass named it was held by nobody (F1-R8-G2).
+/// - A LINE TYPED ([`RestoredAttempt::typed`]: a step of it said
+///   `wait:resume`) is stepped again as a step that said it again — on the
+///   attempt's back-off, while [`restored_retry`] keeps such a step — and its
+///   next step carries the conversation's record in flight, which types
+///   nothing while the relaunch it records is in flight, to what that record
+///   says: landed (`adopted`), or said as one that did not pick its
+///   conversation up. Decided at the panic by whether an agent held the tab,
+///   the line's own agent coming up was said as a relaunch that could not be
+///   made, its remedy typed into the Claude running there (F1-R8-G1), and a
+///   person's own agent started after the line's had ended was taken for its
+///   landing, the miss never said (F1-R9-G2): the tab's publication cannot
+///   tell the two apart, and the record's step can.
+///
+/// OVER, it ends by what it knows: a landing, as one whose exit nothing
+/// watches until a pass names it (logged); a typed line, as its last step
+/// would have, one that did not pick its conversation up (`wait:resume`,
+/// said). NOTHING TYPED — never made again (the step that panicked may have
+/// typed it) — it is over at once: where an agent holds the tab now, that
+/// agent's own, over with no row as an attempt an agent ran beside is
+/// ([`restored_overtaken`]); else one whose relaunch cannot be made
+/// (`internal-panic`, the panic itself in the log). Whether an agent holds
+/// the tab is asked of the conversation's record of THIS tab
+/// ([`Acts::adopted_gone`]: a record the previous aterm left in flight in
+/// the tab its layout named is another tab's, and its pid long gone, or
+/// another process's now, F1-R9-G6) and of the tab's publication
+/// ([`Hooks::still_wanted`]), each under its own catch: a read that panics
+/// says none.
+///
+/// Over, its tab's word is cleared and, where its agent resumes a
+/// conversation, its miss kept for the restored agents' row
+/// ([`restored_over`]). Only while it is still queued, and the queue still
+/// open: a step that panicked after taking it off had decided its end, and
+/// only saying it was left (the panic is logged); a queue the host's shutdown
+/// closed keeps what it owes for the next instance.
+fn restored_step_panicked(shared: &Shared, hooks: &Hooks, taken: &RestoredTaken, relaunched: bool) {
+    let sid = taken.agent.sid.as_str();
+    let landing = relaunched || taken.landed;
+    let held = !landing && !taken.typed && {
+        let looked = "the look at the tab of a relaunch that panicked";
+        let none = "it is taken for a tab nothing holds";
+        caught(&format!("@{sid}: {looked}"), none, || {
+            (hooks.acts.adopted_gone)(sid, &taken.agent.snap)
+        }) == Some(Some(false))
+            || caught(&format!("@{sid}: {looked}"), none, || {
+                (hooks.still_wanted)(sid, 0)
+            }) == Some(true)
+    };
+    let mut queue = shared
+        .restored
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    // A queue the host's shutdown closed keeps what it owes for the next
+    // instance, as a step's own end there does ([`restored_step`]).
+    if queue.closed {
+        return;
+    }
+    let Some(at) = queue.attempts.iter().position(|a| a.order == taken.order) else {
+        return;
+    };
+    let (last, step) = if landing || taken.typed {
+        let attempt = &mut queue.attempts[at];
+        attempt.acting = false;
+        attempt.faults += 1;
         let now = Instant::now();
-        if step == "wait:resume" {
-            attempt.resume_wait_since.get_or_insert(now);
+        if landing {
+            if attempt.faults < RESTORED_TRIES {
+                attempt.landed = true;
+                attempt.due = now + (hooks.pause)(LANDED_LOOK);
+                return;
+            }
+            aterm_log::warn!(
+                "harness @{sid}: the relaunch after aterm ended landed {}, but no look at its \
+                 agent could be made; it is over, its exit not watched until a pass names it",
+                taken.agent.place
+            );
+            (Outcome::Relaunched, "landed")
+        } else {
+            let last = Outcome::NotYet("wait:resume".to_string());
+            attempt.tried += 1;
+            let waiting = attempt
+                .resume_wait_since
+                .map_or(Duration::ZERO, |since| now.saturating_duration_since(since));
+            if attempt.faults < RESTORED_TRIES
+                && restored_retry("wait:resume", &last, attempt.tried, waiting)
+            {
+                attempt.due = now + attempt.pause;
+                attempt.pause = (attempt.pause * 2).min(RESTORED_MAX_PAUSE);
+                return;
+            }
+            (last, "wait:resume")
         }
-        let waiting = attempt
-            .resume_wait_since
-            .map_or(Duration::ZERO, |since| now.saturating_duration_since(since));
-        if restored_retry(&step, &last, attempt.tried, waiting) {
-            attempt.due = now + attempt.pause;
-            attempt.pause = (attempt.pause * 2).min(RESTORED_MAX_PAUSE);
-            queue.attempts.push_back(attempt);
-            continue;
-        }
-        drop(queue);
-        let missed = restored_over(badge, attempt, last, &step);
-        queue = shared
+    } else if held {
+        (Outcome::Relaunched, RESTORED_PANIC_HELD)
+    } else {
+        (Outcome::Cannot(RESTORED_PANIC.to_string()), RESTORED_PANIC)
+    };
+    let attempt = queue.attempts.remove(at).expect("the attempt was found");
+    drop(queue);
+    if step == RESTORED_PANIC_HELD {
+        aterm_log::info!(
+            "harness @{sid}: an agent holds the tab {} whose relaunch after aterm ended \
+             panicked before it typed anything; the relaunch is over, the agent its own",
+            taken.agent.place
+        );
+    }
+    let missed = caught(
+        &format!("@{sid}: the end of the relaunch after aterm ended"),
+        "its tab's word may stand",
+        || restored_over(hooks.badge.as_ref(), attempt, last, step),
+    )
+    .flatten();
+    shared
+        .restored
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .missed
+        .extend(missed);
+}
+
+/// The step word of a restored attempt whose step panicked before it typed
+/// anything while an agent held its tab ([`restored_step_panicked`]): over,
+/// unsaid.
+const RESTORED_PANIC_HELD: &str = "internal-panic:tab-held";
+
+/// The last step word of a restored attempt whose step panicked
+/// ([`restored_step_panicked`]), and of every attempt a queue that
+/// panicked still held ([`restored_queue_panicked`]).
+const RESTORED_PANIC: &str = "internal-panic";
+
+/// THE RESTORED QUEUE'S WORKER THAT PANICKED OUTSIDE ANY ONE TAB'S STEP
+/// (F1-R6-H2, F1-R7 V-1), the last resort: it ends as one that could not
+/// start, `running` cleared so the next restore starts its worker again —
+/// and nothing it held is dropped unsaid. Every attempt still queued is
+/// over as one whose relaunch cannot be made ([`restored_over`], its tab's
+/// word cleared), and returned with the misses gathered before, for the
+/// restored agents' row ([`say_restored`]: the tabs said before this launch
+/// are named again only beside one of these, F1-R9-G4). A queue the host's
+/// shutdown closed keeps what it owes and says nothing, as its own end there
+/// does. Run only on a queue its worker still owns (F1-R8-G5: the worker
+/// lets the queue go only as it ends, under the lock).
+fn restored_queue_panicked(shared: &Shared, badge: &BadgeFn) -> Vec<RestoredMiss> {
+    let (attempts, mut missed) = {
+        let mut queue = shared
             .restored
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        queue.missed.extend(missed);
+        queue.running = false;
+        if queue.closed {
+            queue.missed.clear();
+            return Vec::new();
+        }
+        (
+            std::mem::take(&mut queue.attempts),
+            std::mem::take(&mut queue.missed),
+        )
+    };
+    for attempt in attempts {
+        let sid = attempt.agent.sid.clone();
+        let last = Outcome::Cannot(RESTORED_PANIC.to_string());
+        missed.extend(
+            caught(
+                &format!("@{sid}: the end of the relaunch after aterm ended"),
+                "its tab's word may stand",
+                || restored_over(badge, attempt, last, RESTORED_PANIC),
+            )
+            .flatten(),
+        );
     }
+    missed
 }
 
 /// A RESTORED ATTEMPT IS OVER, `last` its last step's outcome (`step` its
@@ -11223,7 +13042,7 @@ fn relaunch_restored_queue(shared: &Arc<Shared>, hooks: &Hooks) {
 /// raised on the tab before a handoff carried it here ("still trying",
 /// round six F13) is no longer true — said without the queue's lock — and
 /// one that did not land is said missed where its agent resumes a
-/// conversation ([`say_restored_missed`]): the row it returns, which its
+/// conversation ([`say_restored`]): the miss it returns, which its
 /// caller adds under the queue's lock, taken again after this. Called
 /// without that lock: the word is said outside it, and no guard goes in or
 /// out, so every acquisition of the queue's lock is its caller's own.
@@ -11232,7 +13051,7 @@ fn restored_over(
     attempt: RestoredAttempt,
     last: Outcome,
     step: &str,
-) -> Option<(usize, String, Outcome)> {
+) -> Option<RestoredMiss> {
     let RestoredAgent {
         sid, snap, place, ..
     } = attempt.agent;
@@ -11244,9 +13063,45 @@ fn restored_over(
             "harness @{sid}: the agent aterm hosted {place} was not relaunched after aterm \
              ended (last step: {step})"
         );
-        return Some((attempt.order, place, last));
+        return Some(RestoredMiss {
+            order: attempt.order,
+            sid,
+            place,
+            agent: snap.agent(),
+            outcome: last,
+        });
     }
     None
+}
+
+/// What the queue's relaunches are journaled as in `aterm.log`
+/// (`relaunch-after-host-ended pid=… step=…`): each step's report (the
+/// `relaunch_restored` act) and a held tab's end ([`restored_held_line`]).
+const RESTORED_LINE: &str = "relaunch-after-host-ended";
+
+/// THE JOURNAL'S LINE FOR A HELD TAB'S END (`App::say_restored_held`; the
+/// review of LC-8): the line every step of the queue's relaunches is
+/// journaled by (`relaunch-after-host-ended pid=… tab=… session=… from=… to=…
+/// step=…`, the relaunch's own report, [`upgrade_drive::Report::line_as`]),
+/// its step `ended:held` — the agent's pid, its conversation and the build it
+/// ran as its leaf named them, in tab `tab`, and no target. A held tab's agent
+/// is never queued, so no step journals it; a sentence of its own alone was
+/// found by no reader of those lines.
+pub(crate) fn restored_held_line(
+    pid: u32,
+    tab: &str,
+    session: Option<&str>,
+    version: Option<&str>,
+) -> String {
+    let report = upgrade_drive::Report {
+        pid,
+        tab: tab.to_string(),
+        session: session.unwrap_or("-").to_string(),
+        from: version.unwrap_or("-").to_string(),
+        to: "-".to_string(),
+        step: "ended:held".to_string(),
+    };
+    report.line_as(RESTORED_LINE)
 }
 
 /// What [`restored_landing_ends`] decided for a landed attempt.
@@ -11320,6 +13175,11 @@ enum LandingLook {
     Unread,
     /// Gone before any read reached it.
     Gone,
+    /// GONE, BY THE CONVERSATION'S RECORD: no read reaches it, nothing names
+    /// it in its tab, and the process the step adopted is no more
+    /// ([`Acts::adopted_gone`]) — gone on a first look too, where [`Self::Gone`]
+    /// cannot tell an agent gone from one no publication names yet.
+    Died,
 }
 
 /// The step word a restored attempt whose landed agents kept exiting before
@@ -11336,14 +13196,19 @@ const LANDED_GONE: &str = "exited-before-read";
 /// landing is: its exit read as it is seen and handed by the host's next
 /// pass. `seen`: a pass named an agent in the tab already
 /// ([`RestoredAttempt::agent_seen`]), its worker's to read — nothing is
-/// armed. Else it holds its tab unread ([`Hooks::still_wanted`], no group of
-/// its own to ask about: a read the control socket refused, a roster that
-/// has not named the tab's group yet) or is gone before any read.
+/// armed; nor where the attempt is `revoked` ([`RestoredAttempt::revoked`]:
+/// its agent's harness was turned off since), and a watch armed here ends
+/// at a later revocation. Else it holds its tab unread
+/// ([`Hooks::still_wanted`], no group of its own to ask about: a read the
+/// control socket refused, a roster that has not named the tab's group yet),
+/// is alive or gone by the conversation's record of the process the step
+/// adopted (`snap`'s; [`Acts::adopted_gone`]), or is gone before any read.
 fn restored_landing_look(
     shared: &Shared,
     hooks: &Hooks,
     sid: &str,
     seen: bool,
+    snap: &Snapshot,
     revoked: &AtomicBool,
 ) -> LandingLook {
     if seen || revoked.load(Ordering::SeqCst) {
@@ -11357,6 +13222,12 @@ fn restored_landing_look(
             .entry(sid.to_string())
             .or_default(),
     );
+    // Its continuation is owed: the tab's worker, attached already or not,
+    // asks for its next idle point ([`Kept::carry_asked`]) — for an agent
+    // this host carries at idle with no live upgrade alone (Muse Code).
+    if host_carries_relaunch(snap.agent().program()) {
+        with_kept_of(&kept, |k| k.carry_asked = true);
+    }
     if refresh_snapshot_guarded(sid, &kept, hooks, Some(revoked)) {
         if let Some(pid) = landing_watched(sid, &kept, hooks, Some(revoked)) {
             aterm_log::info!(
@@ -11366,9 +13237,20 @@ fn restored_landing_look(
         }
         return LandingLook::Read;
     }
+    // A queue the host's shutdown closed keeps what it owes for the next
+    // instance: nothing more is read here.
     if revoked.load(Ordering::SeqCst) {
-        LandingLook::Read
-    } else if (hooks.still_wanted)(sid, 0) {
+        return LandingLook::Read;
+    }
+    // THE RECORD DECIDES what the screen's publication cannot (the residual
+    // review's R5): the process the step adopted lives — held, read again —
+    // or is gone, and its relaunch is made again.
+    match (hooks.acts.adopted_gone)(sid, snap) {
+        Some(false) => return LandingLook::Unread,
+        Some(true) => return LandingLook::Died,
+        None => {}
+    }
+    if (hooks.still_wanted)(sid, 0) {
         LandingLook::Unread
     } else {
         LandingLook::Gone
@@ -11392,15 +13274,19 @@ fn restored_landing_look(
 /// no longer held its tab: a crash before any read was held by nobody — no
 /// watch, no mark, no worker, no attempt — never relaunched and never said.
 ///
-/// THE RESIDUAL, STATED: the look right after the step that neither reads
-/// the agent nor finds it holding its tab leaves it to the roster, as the
-/// first cut did — the step's `adopted` found it registered and holding the
-/// tab through the tab's own job (`relaunch::await_held`), whatever the
-/// publication names yet, so that look cannot tell an agent gone in the
-/// moment since from one no publication names yet, and a step made again
-/// on the second would be typed beside a live agent. One gone there is
-/// read by nobody. Decided without the queue's lock: its caller keeps the
-/// attempt or ends it ([`LandingEnd`]).
+/// THE LOOK RIGHT AFTER THE STEP that neither reads the agent nor finds it
+/// holding its tab cannot tell, by the screen's publication, an agent gone
+/// in the moment since from one no publication names yet — the step's
+/// `adopted` found it registered and holding the tab through the tab's own
+/// job (`relaunch::await_held`) — and a step made again on the second would
+/// be typed beside a live agent. THE CONVERSATION'S RECORD TELLS THEM APART
+/// (the residual review's R5; [`Acts::adopted_gone`]): the process the step
+/// adopted lives — read again, as [`LandingLook::Unread`] — or is gone —
+/// [`LandingLook::Died`], the landed-and-gone arms whatever `landed` says,
+/// relaunched again within the budget, and past it said missed. Only where
+/// the record says nothing ([`LandingLook::Gone`] on a first look) is it
+/// left to the roster, as the first cut did. Decided without the queue's
+/// lock: its caller keeps the attempt or ends it ([`LandingEnd`]).
 fn restored_landing_ends(
     mut attempt: RestoredAttempt,
     look: LandingLook,
@@ -11432,7 +13318,7 @@ fn restored_landing_ends(
             );
             LandingEnd::Over(attempt, Outcome::Relaunched, "landed")
         }
-        LandingLook::Gone if attempt.tried < RESTORED_TRIES => {
+        LandingLook::Gone | LandingLook::Died if attempt.tried < RESTORED_TRIES => {
             aterm_log::info!(
                 "harness @{}: the agent the relaunch after aterm ended landed {} exited before \
                  any read reached it; its relaunch is made again",
@@ -11445,7 +13331,7 @@ fn restored_landing_ends(
             attempt.pause = (attempt.pause * 2).min(RESTORED_MAX_PAUSE);
             LandingEnd::Keep(attempt)
         }
-        LandingLook::Gone => LandingEnd::Over(
+        LandingLook::Gone | LandingLook::Died => LandingEnd::Over(
             attempt,
             Outcome::Cannot(LANDED_GONE.to_string()),
             LANDED_GONE,
@@ -11479,21 +13365,72 @@ fn landing_watched(
     Some(pid)
 }
 
-/// The one row for the restored agents that did not come back
-/// ([`crate::message_reporters::restored_agents_not_resumed`]), in the
-/// layout's order: attempts finish in due order. Nothing when none missed.
-fn say_restored_missed(mut missed: Vec<(usize, String, Outcome)>) {
+/// THE ONE ROW FOR THE RESTORED AGENTS THAT DID NOT COME BACK
+/// ([`crate::message_reporters::restored_agents_not_resumed`]), said for
+/// `missed`: one rule wherever a miss is said — the queue's pause and its end,
+/// its last resort, a successor's carry.
+///
+/// - SAID ONLY FOR A MISS (F1-R9-G4): nothing when `missed` is empty. A carry
+///   that missed nothing, or a last resort that had nothing left, said the
+///   process's earlier row again: a row the owner had dismissed came back,
+///   and a live one counted a repeat and showed again.
+/// - EVERY AGENT SAID BEFORE, ONE LINE EACH (F1-R8-G3, F1-R9-G1): `missed`
+///   (in the layout's order among themselves) is added to every restored
+///   agent this process said ([`RestoredQueue::said`]), by its tab's
+///   session — one said again keeping its line with its latest outcome —
+///   since the row's key supersedes the last. Kept by the place, the second
+///   of two panes of one tab (both `in tab 2`) took the first's line.
+/// - NEVER ONE WHOSE TAB AN AGENT HOLDS SINCE (F1-R9-G3): an earlier miss
+///   whose tab `runs` names an agent in now ([`Hooks::still_wanted`], no
+///   group of its own to ask about; each read under its own catch, one that
+///   panics naming none) leaves the row for good — its person brought it
+///   back as the row asked, or works there now, and its remedy would be
+///   typed into that agent — as no row says one did not come back where an
+///   agent ran beside its relaunch ([`restored_overtaken`]). A miss said now
+///   is said as its step decided it.
+///
+/// The publication is read with the queue's lock let go (it is the store's),
+/// and the row said outside it. Called without that lock.
+fn say_restored(shared: &Shared, runs: &StillFn, mut missed: Vec<RestoredMiss>) {
     if missed.is_empty() {
         return;
     }
-    missed.sort_by_key(|(order, _, _)| *order);
-    let missed = missed
+    let restored = || {
+        shared
+            .restored
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    };
+    let earlier: Vec<String> = restored().said.iter().map(|m| m.sid.clone()).collect();
+    let back: Vec<String> = earlier
         .into_iter()
-        .map(|(_, place, outcome)| (place, outcome))
-        .collect::<Vec<_>>();
+        .filter(|sid| {
+            caught(
+                &format!("@{sid}: the look at the tab of an agent said not to have come back"),
+                "it is said again",
+                || runs(sid, 0),
+            ) == Some(true)
+        })
+        .collect();
+    missed.sort_by_key(|m| m.order);
+    let row: Vec<(String, upgrade::Agent, Outcome)> = {
+        let mut queue = restored();
+        queue.said.retain(|m| !back.contains(&m.sid));
+        for miss in missed {
+            match queue.said.iter_mut().find(|m| m.sid == miss.sid) {
+                Some(said) => *said = miss,
+                None => queue.said.push(miss),
+            }
+        }
+        queue
+            .said
+            .iter()
+            .map(|m| (m.place.clone(), m.agent, m.outcome.clone()))
+            .collect()
+    };
     let log = crate::logging::log_dir().map(|dir| dir.join("aterm.log"));
     crate::message_inbox::queue_message(crate::message_reporters::restored_agents_not_resumed(
-        &missed,
+        &row,
         log.as_deref(),
     ));
 }
@@ -11506,7 +13443,7 @@ fn say_restored_missed(mut missed: Vec<(usize, String, Outcome)>) {
 /// [`RESTORED_MAX_PAUSE`], waited through the host's pause seam), until
 /// [`carry_bound`] has passed or the host is shutting down. A restart that
 /// cannot be made (`Cannot`: the tab's shell gone, no state to act on) is
-/// said in the restored agents' one row ([`say_restored_missed`]).
+/// said in the restored agents' one row ([`say_restored`]).
 ///
 /// LANDS, OR IS SAID (round six, F51): a tab whose last step still waited
 /// when the bound ran out — a person at the returned prompt, a hold — is said
@@ -11525,6 +13462,14 @@ fn say_restored_missed(mut missed: Vec<(usize, String, Outcome)>) {
 /// and the carry goes on. Until then a park ended the loop, and a failed
 /// Commit's [`HostHandle::resume`] never started it again.
 ///
+/// A HAND ON A TAB IS WAITED OUT, ITS BOUND WITH IT (LC-7 of the 2026-10-15
+/// sweep): a step that answers [`relaunch::WAIT_HAND_LIFTS`] — a hold or a
+/// hand the line waits on stands on that tab, and the record's clock stopped
+/// with it — starts that tab's bound over, as a park does. Bound from the
+/// successor's start alone, a hold longer than it dropped the tab with
+/// "not carried on in time" while the record stood `Exiting` with no
+/// carrier, and nothing relaunched the agent once the hold lifted.
+///
 /// AN OFF SESSION IS NOT CARRIED ([`OffSessions`], `words` its reader): the
 /// harness keeps its hands off it, a restart left in flight there included —
 /// dropped before its step, said in the log alone.
@@ -11533,13 +13478,14 @@ fn carry_in_flight_after_handoff(
     shared: &Shared,
     carry: &CarryInFlightFn,
     words: &WordsFn,
+    runs: &StillFn,
     pause: &PauseFn,
     sessions: &[(String, String)],
     grace: u32,
 ) {
-    // `(order, sid, place, due, pause, last)`: `last` is the last step's word
-    // and outcome while it waited, `None` before a step or while the tab was
-    // its worker's.
+    // `(order, sid, place, due, pause, last, since)`: `last` is the last
+    // step's word and outcome while it waited, `None` before a step or while
+    // the tab was its worker's; `since` is when the tab's bound began.
     type Owed<'a> = (
         usize,
         &'a str,
@@ -11547,8 +13493,9 @@ fn carry_in_flight_after_handoff(
         Instant,
         Duration,
         Option<(String, Outcome)>,
+        Instant,
     );
-    let mut started = Instant::now();
+    let started = Instant::now();
     let bound = carry_bound(pause);
     let mut owed: Vec<Owed<'_>> = sessions
         .iter()
@@ -11561,10 +13508,12 @@ fn carry_in_flight_after_handoff(
                 started,
                 RESTORED_FIRST_PAUSE,
                 None,
+                started,
             )
         })
         .collect();
     let mut missed = Vec::new();
+    let mut late = Vec::new();
     while !owed.is_empty() {
         let suspended = {
             let state = shared.lock();
@@ -11574,19 +13523,27 @@ fn carry_in_flight_after_handoff(
             state.suspended
         };
         if suspended {
-            // The time a park held the host is no time the carry had: its
-            // bound runs again from the resume.
+            // The time a park held the host is no time the carry had: every
+            // tab's bound runs again from the resume.
             std::thread::sleep(pause(RESTORED_FIRST_PAUSE));
-            started = Instant::now();
+            let now = Instant::now();
+            for tab in &mut owed {
+                tab.6 = now;
+            }
             continue;
         }
-        if started.elapsed() >= bound {
+        let (out, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut owed)
+            .into_iter()
+            .partition(|tab| tab.6.elapsed() >= bound);
+        owed = kept;
+        late.extend(out);
+        if owed.is_empty() {
             break;
         }
         let at = owed
             .iter()
             .enumerate()
-            .min_by_key(|(_, (order, _, _, due, _, _))| (*due, *order))
+            .min_by_key(|(_, (order, _, _, due, _, _, _))| (*due, *order))
             .map(|(at, _)| at)
             .expect("owed was not empty");
         let now = Instant::now();
@@ -11595,7 +13552,7 @@ fn carry_in_flight_after_handoff(
             std::thread::sleep((owed[at].3 - now).min(pause(RESTORED_FIRST_PAUSE)));
             continue;
         }
-        let (order, sid, place, _, wait, _) = owed[at];
+        let (order, sid, place, _, wait, _, _) = owed[at];
         let off = OffSessions {
             words: words(),
             default: shared.switches.autopilot(),
@@ -11615,6 +13572,9 @@ fn carry_in_flight_after_handoff(
         let last = relaunch::outcome(&step);
         let supervised = step == CARRY_SUPERVISED;
         if supervised || restored_again(&step, &last) {
+            if step == relaunch::WAIT_HAND_LIFTS {
+                owed[at].6 = Instant::now();
+            }
             owed[at].3 = Instant::now() + pause(wait);
             owed[at].4 = (wait * 2).min(RESTORED_MAX_PAUSE);
             owed[at].5 = (!supervised).then_some((step, last));
@@ -11626,10 +13586,16 @@ fn carry_in_flight_after_handoff(
                 "harness @{sid}: the restart the previous aterm left in flight {place} could \
                  not be carried on (last step: {step})"
             );
-            missed.push((order, place.to_string(), last));
+            missed.push(RestoredMiss {
+                order,
+                sid: sid.to_string(),
+                place: place.to_string(),
+                agent: CARRIED_AGENT,
+                outcome: last,
+            });
         }
     }
-    for (order, sid, place, _, _, last) in owed {
+    for (order, sid, place, _, _, last, _) in late.into_iter().chain(owed) {
         let Some((step, last)) = last else {
             continue;
         };
@@ -11637,10 +13603,22 @@ fn carry_in_flight_after_handoff(
             "harness @{sid}: the restart the previous aterm left in flight {place} was not \
              carried on in time (last step: {step})"
         );
-        missed.push((order, place.to_string(), last));
+        missed.push(RestoredMiss {
+            order,
+            sid: sid.to_string(),
+            place: place.to_string(),
+            agent: CARRIED_AGENT,
+            outcome: last,
+        });
     }
-    say_restored_missed(missed);
+    say_restored(shared, runs, missed);
 }
+
+/// The agent a carried restart that did not land is said as
+/// ([`carry_in_flight_after_handoff`]): the carry knows the tab, not the
+/// agent its record names, and says it as the row always did.
+#[cfg(any(unix, test))]
+const CARRIED_AGENT: upgrade::Agent = upgrade::Agent::Claude;
 
 /// ONE ANSWER OF [`Acts::carry_in_flight`] for a tab: `None` once nothing is
 /// in flight there (`in_flight`), [`CARRY_SUPERVISED`] — no step — while its
@@ -11996,8 +13974,8 @@ fn restart_under_policy(shared: &Shared, host: &mut HostState) {
 /// so is what was read of its agent for a relaunch once the roster names it
 /// no more ([`unwatched_exits`]); no keep holds it ([`keep_holding`]) and its
 /// exit watch ends ([`host_pass`]); no upgrade watch is fired for it
-/// ([`watch_upgrades`], which never types or signals in any case: the
-/// aterm-census guard `watch-hands`), and
+/// ([`watch_upgrades`], which never types or signals in any case: its
+/// connections are read-only), and
 /// the owner's view reads a move owed there as held by the Off
 /// ([`ViewLook::off`]); nothing the restored queue owes it is relaunched
 /// ([`restored_off`]), nor a restart a predecessor left in flight there
@@ -12032,7 +14010,12 @@ impl OffSessions {
 
     /// Whether session `sid` is Off.
     fn contains(&self, sid: &str) -> bool {
-        self.words.get(sid).copied().unwrap_or(self.default) == Autopilot::Off
+        self.mode(sid) == Autopilot::Off
+    }
+
+    /// Session `sid`'s Autopilot: its own word, else the table's default.
+    fn mode(&self, sid: &str) -> Autopilot {
+        self.words.get(sid).copied().unwrap_or(self.default)
     }
 }
 
@@ -12093,11 +14076,16 @@ fn host_pass(
     // Each worker's step stamp, read BEFORE the roster ([`StepsSeen`]).
     let steps = StepsSeen::read(&host.workers);
     // Every agent the roster names is one the ONE predicate supervises
-    // ([`agent_of`]).
+    // ([`agent_of`]) and the host admits a worker for ([`admits`]): a vendor
+    // Codex is as if the roster had not named it — a program no worker is
+    // for, whose tab a supervised agent it replaced has left.
     let (mut wanted, stamps): (HashMap<String, Program>, HashMap<String, FollowStamp>) = if active {
         (hooks.roster)().into_iter().fold(
             (HashMap::new(), HashMap::new()),
             |(mut wanted, mut stamps), (sid, program, stamp)| {
+                if !admits(program, stamp) {
+                    return (wanted, stamps);
+                }
                 wanted.insert(sid.clone(), program);
                 stamps.insert(sid, stamp);
                 (wanted, stamps)
@@ -12197,6 +14185,7 @@ fn host_pass(
     age_and_forgive(shared, host, cfg_gen, &wanted);
     forget_closed(shared, &host.workers, &wanted, active, hooks);
     let settle_at = follow_workers(shared, host, &wanted, &stamps, follow_all, now, hooks);
+    end_lost_words(shared, hooks);
     let next_look = visit_workers(
         shared,
         &mut host.workers,
@@ -12277,7 +14266,7 @@ fn host_pass(
         &mut host.disk_at,
         Instant::now(),
         active,
-        &wanted,
+        &disk_roster(&wanted, active, hooks),
         &off,
         hooks,
     );
@@ -12336,18 +14325,39 @@ fn full_follow_due(
     timed_out || full_before != full_now || phase_now < phase_before || phase_now - phase_before > 1
 }
 
+/// THE DISK WATCH'S ROSTER: the supervised sessions (`wanted`), and every
+/// Codex session besides, supervised or not ([`Hooks::codex_roster`]) — a
+/// vendor `codex` no lane supervises and a codex-alab that supervises itself
+/// keep the disk tick (the owner's ruling for the Codex lane's retirement:
+/// display only, the disk tick kept). Nothing while the host is not active.
+fn disk_roster(
+    wanted: &HashMap<String, Program>,
+    active: bool,
+    hooks: &Hooks,
+) -> HashMap<String, Program> {
+    let mut roster = wanted.clone();
+    if active {
+        for sid in (hooks.codex_roster)() {
+            roster.entry(sid).or_insert(Program::Codex);
+        }
+    }
+    roster
+}
+
 /// THE DISK WATCH's timer: when [`HostState::disk_at`] has come, the
-/// supervised sessions are handed to [`Hooks::disk`] and the next look is
-/// [`DISK_TICK`] on. Nothing is looked at while supervision is off or no
-/// agent session is hosted — the watch is over where the agents work — and
-/// then no instant is named. The instant to look again, if one.
+/// sessions of its roster ([`disk_roster`]: the supervised ones and every
+/// Codex) are handed to [`Hooks::disk`] and the next look is
+/// [`DISK_TICK`] on. The volume fills whether or not an agent is
+/// supervised (aterm's own build caches filled it on 2026-10-16), so the
+/// watch looks with supervision off or no agent session hosted too — handed
+/// NO session, and then a pass reclaims only aterm's own Rust build cache
+/// ([`disk_look`]). The instant to look again.
 ///
 /// AN OFF SESSION IS NOT THE WATCH'S ([`OffSessions`]; the review of
 /// 345c41647): the harness keeps its hands off it, so its working directory
 /// and its agent are never handed over — a look below the floor reclaims
-/// build caches in the working directories it is handed — and a host whose
-/// every session is Off hosts none for the watch, which then names no
-/// instant.
+/// build caches in the working directories it is handed. With supervision
+/// off no session is handed at all.
 fn look_at_disk(
     disk_at: &mut Instant,
     now: Instant,
@@ -12356,18 +14366,23 @@ fn look_at_disk(
     off: &OffSessions,
     hooks: &Hooks,
 ) -> Option<Instant> {
-    let mut sids: Vec<String> = wanted
-        .keys()
-        .filter(|sid| !off.contains(sid))
-        .cloned()
-        .collect();
-    if !active || sids.is_empty() {
-        return None;
-    }
+    let mut sids: Vec<String> = if active {
+        wanted
+            .keys()
+            .filter(|sid| !off.contains(sid))
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
     if now >= *disk_at {
         sids.sort();
-        (hooks.disk)(&sids);
+        // The next look is set first: a hand-off that panicked is tried
+        // again at it, never at once ([`caught`]).
         *disk_at = now + DISK_TICK;
+        let _ = caught("the disk watch", "it looks again at its next tick", || {
+            (hooks.disk)(&sids);
+        });
     }
     Some(*disk_at)
 }
@@ -12421,15 +14436,25 @@ fn look_at_upgrades(
     hooks: &Hooks,
 ) -> Option<Instant> {
     if !active {
-        if view.shown.take().is_some() {
-            let _ = (hooks.upgrade_view)(false, &[], &[], &[]);
+        // A STAND-DOWN THAT PANICKED is tried again [`WATCH_AGAIN`] on
+        // (F1-R7 V-3): its rows stood while upgrades were off, until they
+        // were on again.
+        let owed = view.shown.take().is_some() || view.next.is_some_and(|at| at <= Instant::now());
+        let again = owed
+            && caught(
+                "the owner's view of the upgrades, standing down",
+                "it is tried again in a while",
+                || (hooks.upgrade_view)(false, &[], &[], &[]),
+            )
+            .is_none();
+        if owed {
+            view.next = again.then(|| Instant::now() + (hooks.pause)(WATCH_AGAIN));
         }
-        view.next = None;
         view.next_s = None;
         view.follows.clear();
         view.settle = None;
         view.watch.clear();
-        return None;
+        return view.next;
     }
     let mut tabs: Vec<String> = wanted.keys().cloned().collect();
     tabs.sort();
@@ -12456,7 +14481,32 @@ fn look_at_upgrades(
         || view.settle.is_some_and(|at| at <= now)
         || moved
     {
-        let next = (hooks.upgrade_view)(true, &view.claimed, &view.off, &view.agent_off);
+        // A VIEW THAT PANICKED (F1-R6-H1: a record's line it could not read)
+        // is the window's alone ([`caught`]): it follows no tab and is asked
+        // again when what it shows moves — an act, an activation notice, the
+        // tabs, the claimed or the Off ones — or [`WATCH_AGAIN`] on, never at
+        // every pass, never in a loop (F1-R7 V-3: asked again by nothing
+        // else, a fault that passed left the owner's rows and the instant
+        // the upgrade watch's timer runs on stale for good). Uncaught, it
+        // unwound the pass, and the restart's first pass asked it again (the
+        // restart looks afresh): no tab got a worker for up to an hour at a
+        // time. The tabs the last look found past their watch stay listed
+        // ([`ViewLook::watch`]): a watch has no hands and reads its record
+        // afresh ([`watch_upgrades`]), so a list no look renewed fires only
+        // what each record owes, and no record's own timer is lost to the
+        // view's fault.
+        let Some(next) = caught(
+            "the owner's view of the upgrades",
+            "it is asked again once what it shows moves, or in a while",
+            || (hooks.upgrade_view)(true, &view.claimed, &view.off, &view.agent_off),
+        ) else {
+            view.next = Some(now + (hooks.pause)(WATCH_AGAIN));
+            view.next_s = None;
+            view.follows.clear();
+            view.settle = None;
+            view.shown = seen;
+            return view.next;
+        };
         let now_s = crate::upgrade_host::now_s();
         view.next = next
             .at
@@ -12531,8 +14581,8 @@ fn told_again(told: bool, watched: &upgrade_drive::Watched) -> bool {
 /// next pass after it ends. Only a supervised agent the upgrade moves, with
 /// a worker, and only while the policy and `[harness] upgrade` are on
 /// (`active`). The watch has no hands: it reads, and writes the record
-/// (step/notice/resume are the loop's points' alone; the aterm-census guard
-/// `watch-hands`). The instant to fire again, if one. An Off session
+/// (step/notice/resume are the loop's points' alone; the dry run's connections
+/// are read-only, `RelayClient::reads_only`). The instant to fire again, if one. An Off session
 /// ([`OffSessions`]) is watched by nothing: what it was told is dropped, and
 /// a watch is fired for it again only once it is on.
 #[allow(
@@ -12649,15 +14699,27 @@ fn spawn_watch(
     );
     let acts = hooks.acts.clone();
     let tab = sid.to_string();
-    let spawned = std::thread::Builder::new()
-        .name(format!("{THREAD_PREFIX}watch-{sid}"))
-        .spawn(move || {
-            crate::qos::set_self(crate::qos::Role::Background);
-            let watched = watch_tab(&tab, told, grace, &points, &park, &look_at, &acts);
-            owed.store(told_again(told, &watched), Ordering::SeqCst);
+    let spawned = crate::qos::spawn_lane_thread(
+        format!("{THREAD_PREFIX}watch-{sid}"),
+        crate::qos::Role::Background,
+        move || {
+            // A watch that panicked ends as one that could not write
+            // ([`caught`]; F1-R6-H2): its flag cleared, a told one told again
+            // [`WATCH_AGAIN`] on. Uncaught, `running` stood for good and the
+            // tab was never watched again while its worker lived.
+            let watched = caught(
+                &format!("@{tab}: the upgrade's watch"),
+                "it is fired again as a watch that could not write",
+                || watch_tab(&tab, told, grace, &points, &park, &look_at, &acts),
+            );
+            owed.store(
+                watched.as_ref().map_or(told, |w| told_again(told, w)),
+                Ordering::SeqCst,
+            );
             flag.store(false, Ordering::SeqCst);
             ring_bell();
-        });
+        },
+    );
     match spawned {
         Ok(_) => Some((running, again)),
         Err(e) => {
@@ -12685,8 +14747,9 @@ fn spawn_watch(
 /// gate it has.
 ///
 /// NO HANDS: nothing here types, signals or ends anything, past any budget —
-/// the aterm-census guard `watch-hands` fences this function and everything of
-/// this file it reaches.
+/// the dry run it calls reads over read-only connections
+/// (`RelayClient::reads_only`, pinned by aterm-agent's
+/// `a_dry_runs_connection_reads_and_has_no_hands`).
 fn watch_tab(
     sid: &str,
     told: bool,
@@ -12841,17 +14904,32 @@ fn forget_closed(
     for sid in &closed {
         crate::self_claim::forget(sid);
     }
-    let forgotten: Vec<Arc<Mutex<Kept>>> = {
+    let forgotten: Vec<(&String, Arc<Mutex<Kept>>)> = {
         let mut kept = shared.kept.lock().unwrap_or_else(PoisonError::into_inner);
-        closed.iter().filter_map(|sid| kept.remove(sid)).collect()
+        closed
+            .iter()
+            .filter_map(|sid| Some((sid, kept.remove(sid)?)))
+            .collect()
     };
-    // Nobody is handed a closed tab's exit: its watch ends.
-    for kept in forgotten {
-        with_kept_of(&kept, |k| k.exit_watch = None);
+    // Nobody is handed a closed tab's exit: its watch ends. Its word that
+    // the agent cannot be brought back ends with it, as its digest line does
+    // (`App::end_relaunch_lines_of_closed_tabs`): it told a command to run
+    // in that tab, and nothing of this host would end it now.
+    for (sid, kept) in forgotten {
+        let lost = with_kept_of(&kept, |k| {
+            k.exit_watch = None;
+            k.lost.take()
+        });
+        if let Some(lost) = lost {
+            forget_lost(&lost.session, sid);
+        }
     }
     if active {
         for sid in &closed {
-            (hooks.acts.account_gone)(sid);
+            // Caught: each closed tab is told, whatever another's did.
+            host_caught(sid, "the accounts recorder's forget", || {
+                (hooks.acts.account_gone)(sid);
+            });
         }
     }
 }
@@ -12873,27 +14951,51 @@ fn follow_workers(
         let kept = shared.kept.lock().unwrap_or_else(PoisonError::into_inner);
         host.workers
             .0
-            .keys()
-            .filter(|sid| wanted.contains_key(*sid))
-            .filter_map(|sid| kept.get(sid).map(|k| (sid.clone(), Arc::clone(k))))
+            .iter()
+            .filter(|(sid, w)| wanted.contains_key(*sid) && !w.unfollowed)
+            .filter_map(|(sid, _)| kept.get(sid).map(|k| (sid.clone(), Arc::clone(k))))
             .collect()
     };
     host.followed
         .retain(|sid, _| host.workers.0.contains_key(sid));
     host.settle
         .retain(|sid, _| following.iter().any(|(followed, _)| followed == sid));
-    follow_entries(
+    let (settle_at, faulted) = follow_entries_caught(
         &following,
         stamps,
         (&mut host.followed, &mut host.settle),
         follow_all,
         now,
         hooks,
-    )
+    );
+    for sid in faulted {
+        if let Some(w) = host.workers.0.get_mut(&sid) {
+            w.unfollowed = true;
+        }
+    }
+    settle_at
+}
+
+/// [`follow_entries_caught`]'s settle alone, for a test of what it follows.
+#[cfg(test)]
+fn follow_entries(
+    following: &[(String, Arc<Mutex<Kept>>)],
+    stamps: &HashMap<String, FollowStamp>,
+    owed: (
+        &mut HashMap<String, FollowStamp>,
+        &mut HashMap<String, Instant>,
+    ),
+    follow_all: bool,
+    now: Instant,
+    hooks: &Hooks,
+) -> Option<Instant> {
+    follow_entries_caught(following, stamps, owed, follow_all, now, hooks).0
 }
 
 /// Select and follow from the roster-backed candidates. The hook performs
 /// the real session-file read in production and is counted in the test.
+/// Also the tabs whose follow panicked ([`host_caught`]), followed no more by
+/// their worker's host.
 ///
 /// THE RECORD IS FOLLOWED A MOMENT AFTER THE SCREEN MOVED, ONCE MORE (LC-1 of
 /// ATERM-KI-1015-1, the 2026-10-15 sweep against Claude Code 2.1.300). Claude
@@ -12917,7 +15019,7 @@ fn follow_workers(
 /// on, not 2 s); a screen that never moved has spent no ring. A tab no stamp
 /// names owes none (it is followed at every pass). The instant the next
 /// settle comes, if one is owed.
-fn follow_entries(
+fn follow_entries_caught(
     following: &[(String, Arc<Mutex<Kept>>)],
     stamps: &HashMap<String, FollowStamp>,
     (followed, settle): (
@@ -12927,7 +15029,8 @@ fn follow_entries(
     follow_all: bool,
     now: Instant,
     hooks: &Hooks,
-) -> Option<Instant> {
+) -> (Option<Instant>, Vec<String>) {
+    let mut faulted = Vec::new();
     for (sid, kept) in following {
         let stamp = stamps.get(sid).copied();
         let before = followed.get(sid).copied();
@@ -12948,8 +15051,15 @@ fn follow_entries(
         if settled {
             settle.remove(sid);
         }
-        if !follow_snapshot(sid, kept, hooks) {
-            continue;
+        match host_caught(sid, "following its agent", || {
+            follow_snapshot(sid, kept, hooks)
+        }) {
+            Some(true) => {}
+            Some(false) => continue,
+            None => {
+                faulted.push(sid.clone());
+                continue;
+            }
         }
         if let Some(stamp) = stamp {
             followed.insert(sid.clone(), stamp);
@@ -12958,7 +15068,7 @@ fn follow_entries(
             settle.insert(sid.clone(), now + (hooks.pause)(STATUS_AFTER_SCREEN));
         }
     }
-    settle.values().min().copied()
+    (settle.values().min().copied(), faulted)
 }
 
 /// A NAME THE ROSTER COULD NOT READ IS NO EXIT (2026-09-28). The roster
@@ -12985,8 +15095,9 @@ fn follow_entries(
 /// nothing, and keeps nothing), as is one whose exit its worker was already
 /// handed, and one kept for [`HOLDS_KEEP_MAX`] already — the hold is no
 /// exact oracle ([`holds`]), and a real misread has healed long before; one
-/// its worker's own step is acting through is asked once the step is over,
-/// as a keep begun afresh.
+/// its worker's own step is acting through — or ran through at any time
+/// since the pass read the roster ([`StepsSeen`]) — is asked once the step is
+/// over, as a keep begun afresh.
 ///
 /// While one is kept the host looks again ([`hold_look`]). The look is the
 /// BACKSTOP for an exit during the misread, not its only signal: a
@@ -13272,16 +15383,16 @@ fn visit_workers(
             // it runs: it comes back relaunched, or — its relaunch waited —
             // is handed at the next pass and carried as the harness's own.
             // Otherwise an agent that left a tab that lives on (it holds the
-            // tab no longer: [`keep_holding`] kept every one that does) is the
-            // worker's to handle; a tab that closed (or a policy that stopped)
-            // just stops it. Each is asked once: a stop rings the bell, and one
-            // asked again at each pass woke the host at once through the
-            // worker's whole wind-down. A worker handed its exit, or whose
-            // agent was back since, is still stopped when its tab closes (the
-            // stop's word ends its relaunch's pause, and says it is no exit).
-            // A step that ran at any time since the roster was read — still
-            // running, or over already — may be what the roster missed: the
-            // absence is judged by the pass the step's end rings
+            // tab no longer: [`keep_holding`] kept every one that does) is
+            // the worker's to handle; a tab that closed (or a policy that
+            // stopped) just stops it. Each is asked once: a stop rings the
+            // bell, and one asked again at each pass woke the host at once
+            // through the worker's whole wind-down. A worker handed its exit,
+            // or whose agent was back since, is still stopped when its tab
+            // closes (the stop's word ends its relaunch's pause, and says it
+            // is no exit). A step that ran at any time since the roster was
+            // read — still running, or over already — may be what the roster
+            // missed: the absence is judged by the pass the step's end rings
             // ([`StepsSeen`]).
             if !steps.stepping(sid, w) {
                 if active && (hooks.acts.open)(sid) {
@@ -13740,20 +15851,26 @@ fn start_worker(
             .entry(sid.to_string())
             .or_default(),
     );
-    let relaunch_word = with_kept_of(&kept, |k| {
+    let (relaunch_word, unset_mark) = with_kept_of(&kept, |k| {
         // Its exit is this worker's now, an ordinary exit of this host:
         // nothing of the Commit that left it unwatched is left to act on.
         k.unwatched = None;
         k.commit = Committed::No;
         if exit.is_some() {
-            return false;
+            return (false, false);
         }
         // An agent runs in the tab: nothing of a relaunch is due, and a word
         // one raised goes. Nor is one owed for the last agent's exit, nor a
         // Commit's stop of its worker (reaped before this start) anything
-        // more to act on ([`Committed`]).
+        // more to act on ([`Committed`]). A mark no ask of this host's keeps
+        // goes too ([`WorkerJob::unset_mark`]).
         k.owed = None;
-        k.relaunches.running() == Say::Clear
+        // A mark a standing word that its agent could not be brought back
+        // holds is that word's ([`lost_marked`]): no start lowers it.
+        let asks = k.relaunches.asks().is_some();
+        let cleared = k.relaunches.running(Instant::now()) == Say::Clear;
+        let lost = lost_marked(k);
+        (cleared, !cleared && !asks && !lost)
     });
     let park = Arc::new(AtomicBool::new(false));
     let look_at: Arc<Mutex<Option<Instant>>> = Arc::default();
@@ -13795,12 +15912,14 @@ fn start_worker(
         owns: AtomicBool::new(false),
         background_at: Mutex::default(),
         tasked: Mutex::default(),
+        finished: Mutex::default(),
         note: Arc::clone(&note),
         clock_hold: Mutex::default(),
         net: Arc::clone(&shared.net),
         route: Mutex::default(),
         memory: Mutex::default(),
         points: Arc::clone(&points),
+        settle_later: AtomicBool::new(false),
         tap: Mutex::default(),
         lifted_off,
         beside: Arc::clone(&beside),
@@ -13826,6 +15945,7 @@ fn start_worker(
         interrupt: Arc::default(),
         handover: Arc::default(),
         clear_badge: relaunch_word,
+        unset_mark,
         faults,
         park,
         look_at,
@@ -13910,6 +16030,7 @@ fn start_worker(
             points,
             kept,
             left_at_commit,
+            unfollowed: false,
         },
     );
     // A worker's start — a hot swap's, an attach's — is a watch told
@@ -13964,14 +16085,16 @@ fn shutdown_workers(mut workers: Workers) {
 /// its last verdict's reader identified by the screen — a Claude Code
 /// started as `node` (the laws review of 2026-09-24: the server published
 /// its verdict and raised its rows while this host, keyed on the argv0 word
-/// alone, never supervised it) — and only one the ONE predicate supervises
-/// ([`aterm_phase::Program::supervisable`]). The reader counts only under a
+/// alone, never supervised it) — and only one with a harness table
+/// ([`aterm_phase::Program::harness_table`]: every agent the screen policy
+/// acts on, and Codex, which the host admits only as codex-alab, watching
+/// beside it: [`admits`], [`admitted`]). The reader counts only under a
 /// name that could host an agent ([`aterm_phase::may_host_agent`]) or no name
 /// yet, the names the verdict identifies by the screen under
 /// (`presence::agent_verdict`): under any other it is a verdict the program
 /// has since left (a same-group exec to `zsh`, read before the next verdict).
 pub(crate) fn agent_of(publication: &crate::session_timeline::AgentPublication) -> Option<Program> {
-    identified_agent(publication).filter(|p| p.supervisable())
+    identified_agent(publication).filter(|p| p.harness_table())
 }
 
 /// The agent that owns the foreground prompt, including one whose reader is
@@ -13989,7 +16112,9 @@ pub(crate) fn identified_agent(
             .reader
             .filter(|_| program.is_none_or(aterm_phase::may_host_agent)))
         .filter(|p| match p {
-            Program::Claude | Program::Codex | Program::Agy | Program::Muse => true,
+            Program::Claude | Program::Codex | Program::Agy | Program::Muse | Program::Gemini => {
+                true
+            }
             Program::Generic => false,
         })
 }
@@ -14001,29 +16126,301 @@ fn roster_of(store: &Store) -> Vec<(String, Program, FollowStamp)> {
         .read()
         .unwrap_or_else(PoisonError::into_inner)
         .snapshot();
-    handles
+    let roster: Vec<(String, Program, FollowStamp)> = handles
         .iter()
         .filter(|h| h.state != SessionState::Exited)
         .filter_map(|h| {
-            let tl = h
-                .ctx
-                .timeline
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            let publication = tl.agent();
-            let agent = agent_of(publication)?;
+            let (agent, stamp) = {
+                let tl = h
+                    .ctx
+                    .timeline
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let publication = tl.agent();
+                (
+                    agent_of(publication)?,
+                    FollowStamp {
+                        group: publication.program_pgid,
+                        reader: publication.reader,
+                        rev: publication.rev,
+                        screen: publication.screen_moves,
+                        vendor: false,
+                    },
+                )
+            };
+            // Read after the timeline's guard is let go: the claim's and the
+            // copies' leaf locks, then the image (a syscall and a few file
+            // reads, once per group: [`alab_image`]).
+            let vendor = !codex_alab_runs(&h.ctx, agent, stamp.group, Probe::Read);
             Some((
                 h.sid.as_str().to_string(),
                 agent,
-                FollowStamp {
-                    group: publication.program_pgid,
-                    reader: publication.reader,
-                    rev: publication.rev,
-                    screen: publication.screen_moves,
-                },
+                FollowStamp { vendor, ..stamp },
             ))
         })
-        .collect()
+        .collect();
+    // The images of sessions gone are forgotten with them once the reads
+    // kept pass their bound: one a closed tab left costs nothing meanwhile.
+    let mut images = ALAB_IMAGES.lock().unwrap_or_else(PoisonError::into_inner);
+    if images.len() > ALAB_IMAGES_KEPT {
+        images.retain(|sid, _| roster.iter().any(|(named, _, _)| named == sid));
+    }
+    drop(images);
+    roster
+}
+
+/// WHETHER THE HOST ADMITS A WORKER for `agent` as the roster read it with
+/// `stamp` (the Codex screen lane's retirement, 2026-10-16): every agent the
+/// one predicate supervises ([`agent_of`]) but a vendor Codex
+/// ([`FollowStamp::vendor`]), which is shown and never supervised. An
+/// exhaustive `match`, so a new agent decides here (the agent-gate guard).
+fn admits(agent: Program, stamp: FollowStamp) -> bool {
+    match agent {
+        Program::Codex => !stamp.vendor,
+        // The Codex gate alone: what else the roster names, it names by the
+        // one predicate.
+        Program::Claude | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => true,
+    }
+}
+
+/// Whether [`codex_alab_runs`] may read a process image it has not read
+/// for the group yet ([`alab_image`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Probe {
+    /// The host's roster pass: read it, once per group.
+    Read,
+    /// Any other reader (the window's frames, the control thread): only what
+    /// the host's pass read. Nothing read yet is no ALab build (fail closed).
+    Cached,
+}
+
+/// THE ALAB IMAGES READ, by tab ([`AlabImage`]). Read by the host's roster
+/// pass ([`Probe::Read`]), never per frame; forgotten with the tab.
+static ALAB_IMAGES: Mutex<BTreeMap<String, AlabImage>> = Mutex::new(BTreeMap::new());
+
+/// One tab's read of its group leader's image ([`ALAB_IMAGES`]): the group,
+/// the executable the kernel named for its leader (`proc_pidpath`), and
+/// whether that image is an ALab build of Codex
+/// ([`aterm_agent::harness::codex_alab::alab_bytes`]). A leader that `exec`s
+/// keeps its pid and its group but not its image — atpkg's `agents/codex`
+/// twin is a shell script that execs the store's binary — so the roster pass
+/// asks the kernel's path again each time (one syscall) and reads the
+/// package only when that path moved: a group first read while the twin's
+/// shell led it is read again once codex-alab does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AlabImage {
+    group: i32,
+    exe: Option<std::path::PathBuf>,
+    alab: bool,
+}
+
+/// How many tabs' image reads [`ALAB_IMAGES`] keeps before a roster pass
+/// forgets those of tabs it no longer names.
+const ALAB_IMAGES_KEPT: usize = 256;
+
+/// Whether tab `sid`'s group `group` leads with an ALab build: under
+/// [`Probe::Cached`], the cached read for that very group (none: not ALab,
+/// fail closed); under [`Probe::Read`], the cached read while the kernel
+/// still names the same image for the leader, else a read now, kept. The
+/// cache's leaf lock is never held over a read.
+fn alab_image(sid: &str, group: i32, probe: Probe) -> bool {
+    alab_image_by(sid, group, probe, &|pid| {
+        i32::try_from(pid).ok().and_then(aterm_uds::sudo::exe_path)
+    })
+}
+
+/// [`alab_image`] with the kernel's image path read by `exe_of`.
+fn alab_image_by(
+    sid: &str,
+    group: i32,
+    probe: Probe,
+    exe_of: &dyn Fn(u32) -> Option<std::path::PathBuf>,
+) -> bool {
+    let Some(pid) = u32::try_from(group).ok().filter(|pid| *pid > 0) else {
+        return false;
+    };
+    let cached = ALAB_IMAGES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(sid)
+        .cloned()
+        .filter(|read| read.group == group);
+    match probe {
+        Probe::Cached => cached.is_some_and(|read| read.alab),
+        Probe::Read => {
+            let exe = exe_of(pid);
+            if let Some(read) = cached.filter(|read| read.exe == exe) {
+                return read.alab;
+            }
+            let alab = exe
+                .as_deref()
+                .is_some_and(aterm_agent::harness::codex_alab::alab_bytes);
+            ALAB_IMAGES
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(sid.to_string(), AlabImage { group, exe, alab });
+            alab
+        }
+    }
+}
+
+/// WHETHER `ctx`'s `agent`, leading group `group`, is one the host admits as
+/// CODEX-ALAB (the Codex screen lane's retirement, 2026-10-16): a proven
+/// self-claim on the session, aterm's copy of that very process's record
+/// (an exit still to decide), or an ALab build in front whatever its claim's
+/// state — unclaimed yet, given back while it runs (`effective=off`, an
+/// unanswerable point), or carried unproven across a seamless update. Its
+/// worker watches only ([`watches_only`]). `true` for every agent that is
+/// not Codex: this is the Codex gate alone. Leaf locks, each taken alone;
+/// the caller holds none of the session's.
+fn codex_alab_runs(ctx: &crate::SessionCtx, agent: Program, group: i32, probe: Probe) -> bool {
+    match agent {
+        Program::Codex => {}
+        Program::Claude | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => {
+            return true;
+        }
+    }
+    let sid = ctx.self_id.as_str();
+    ctx.meta
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .supervisor_proven(crate::metrics::now_us())
+        || crate::self_claim::copy_of_tab(sid)
+            .is_some_and(|copy| i64::from(copy.pid) == i64::from(group))
+        || alab_image(sid, group, probe)
+}
+
+/// THE AGENT THE HOST SUPERVISES OR WATCHES in `ctx`'s session: [`agent_of`]
+/// with the Codex gate ([`codex_alab_runs`]) — a vendor `codex` is `None`
+/// (shown, never supervised), codex-alab is `Some(Codex)`. What a caller
+/// meaning "the host's hand is on it" asks (the menu's supervised row, the
+/// Autopilot wire field and chip, the Harness page's sessions, the restart
+/// offer); prompt ownership and identity stay [`identified_agent`] and
+/// [`agent_of`]. Reads only what the host's roster pass read of an image
+/// ([`Probe::Cached`]). The timeline's leaf lock, then the claim's: the
+/// caller holds none of the session's.
+pub(crate) fn admitted(ctx: &crate::SessionCtx) -> Option<Program> {
+    let (agent, group) = {
+        let tl = ctx.timeline.lock().unwrap_or_else(PoisonError::into_inner);
+        (agent_of(tl.agent()), tl.agent().program_pgid)
+    };
+    admitted_as(ctx, agent, group)
+}
+
+/// [`admitted`] for an `agent` (and its `group`) the caller read under the
+/// timeline's guard and has let go of.
+pub(crate) fn admitted_as(
+    ctx: &crate::SessionCtx,
+    agent: Option<Program>,
+    group: i32,
+) -> Option<Program> {
+    agent.filter(|agent| codex_alab_runs(ctx, *agent, group, Probe::Cached))
+}
+
+/// WHETHER `agent`'s worker WATCHES ONLY from birth (the Codex screen lane's
+/// retirement, 2026-10-16): aterm supervises no Codex. A Codex the host
+/// admits is codex-alab ([`admits`]), which supervises itself; its worker
+/// claims nothing and types, presses and upgrades nothing, beside its proven
+/// self-claim or — none proven yet, or given back — beside the agent itself
+/// ([`WorkerJob::watch_beside`]), and — under a standing proven claim alone,
+/// whose copy holds the validated line and whose record is the idle point —
+/// keeps the stall's and the memory ceiling's remedies and the crash rule. An
+/// exhaustive `match`.
+fn watches_only(agent: Program) -> bool {
+    match agent {
+        Program::Codex => true,
+        Program::Claude | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => {
+            false
+        }
+    }
+}
+
+/// The holder a codex-alab worker with no proven self-claim watches beside
+/// ([`WorkerJob::watch_beside`]): the agent's own name, never a claim.
+const UNCLAIMED_CODEX_ALAB: &str = "codex-alab";
+
+/// THE TABS WHOSE OWN CODEX REPORT IS SHOWN (OSC 7501,
+/// [`crate::program_state::ProgramStateGate`]): told by the window's status
+/// sweep ([`note_codex_report`]) and read by the disk tick's roster
+/// ([`codex_roster_of`]), so a vendor `codex` npm started as `node`, which no
+/// screen names since aterm reads no Codex screen (the Codex screen lane's
+/// retirement, 2026-10-16), keeps its disk tick by its own report. A leaf
+/// lock, taken alone.
+static CODEX_REPORTS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// Tell the host whether tab `sid` shows its program's own Codex report
+/// ([`CODEX_REPORTS`]): `shown` adds it, else it leaves.
+pub(crate) fn note_codex_report(sid: &str, shown: bool) {
+    let mut reports = CODEX_REPORTS.lock().unwrap_or_else(PoisonError::into_inner);
+    if shown {
+        reports.insert(sid.to_string());
+    } else {
+        reports.remove(sid);
+    }
+}
+
+/// How many tabs [`CODEX_REPORTS`] keeps before a roster pass forgets those
+/// it no longer finds live (a tab closed while its report showed).
+const CODEX_REPORTS_KEPT: usize = 256;
+
+/// Every live session whose agent is Codex ([`identified_agent`], supervised
+/// or not), every one that shows its own Codex report ([`CODEX_REPORTS`]: a
+/// vendor `codex` under `node`, named by no screen), and every one a PROVEN
+/// self-claim holds ([`Hooks::codex_roster`]): the store's handles (its read
+/// lock, let go first), then each one's timeline, the report set and then
+/// its metadata — leaf locks, each taken alone.
+fn codex_roster_of(store: &Store) -> Vec<String> {
+    let handles = store
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .snapshot();
+    let now = crate::metrics::now_us();
+    let roster: Vec<String> = handles
+        .iter()
+        .filter(|h| h.state != SessionState::Exited)
+        .filter(|h| {
+            let codex = {
+                let tl = h
+                    .ctx
+                    .timeline
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                match identified_agent(tl.agent()) {
+                    Some(Program::Codex) => true,
+                    Some(
+                        Program::Claude
+                        | Program::Agy
+                        | Program::Muse
+                        | Program::Gemini
+                        | Program::Generic,
+                    )
+                    | None => false,
+                }
+            };
+            codex
+                || CODEX_REPORTS
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .contains(h.sid.as_str())
+                || h.ctx
+                    .meta
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .live_claim(now)
+                    .is_some_and(|claim| claim.proven.is_some())
+        })
+        .map(|h| h.sid.as_str().to_string())
+        .collect();
+    let mut reports = CODEX_REPORTS.lock().unwrap_or_else(PoisonError::into_inner);
+    if reports.len() > CODEX_REPORTS_KEPT {
+        reports.retain(|sid| {
+            handles
+                .iter()
+                .any(|h| h.state != SessionState::Exited && h.sid.as_str() == sid)
+        });
+    }
+    drop(reports);
+    roster
 }
 
 /// Every live session's own Autopilot word ([`Hooks::autopilot`]), read
@@ -14090,6 +16487,19 @@ pub(crate) fn offered_now(store: &Store, sid: &str) -> Option<bool> {
     crate::restart_act::offered(&ctx, leader, crate::metrics::now_us()).map(|offer| offer.promised)
 }
 
+/// [`Acts::self_idle`], live: tab `sid`'s proven self-claim names the process
+/// `pid` started at `start`, and that process's own record, read now while
+/// its identity is live, says it rests ([`crate::self_claim::idle_now`]).
+/// The store's read lock, let go before the claim's leaf lock and the read.
+fn self_idle_now(store: &Store, sid: &str, pid: u32, start: &str) -> bool {
+    let ctx = store
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .by_sid(&aterm_session::SessionId::new(sid))
+        .map(|h| Arc::clone(&h.ctx));
+    ctx.is_some_and(|ctx| crate::self_claim::idle_now(&ctx, pid, start))
+}
+
 /// Whether `sid`'s agent still HOLDS its tab ([`Acts::holds`]): the tab's
 /// foreground group, read from its PTY master now, is `group`, that group's
 /// leader EXISTS (`kill(pid, 0)`: a job-control job's group id is its
@@ -14113,8 +16523,8 @@ pub(crate) fn offered_now(store: &Store, sid: &str) -> Option<bool> {
 /// runtime (`node`, `bun`) that outlives the agent it hosted in the same
 /// group: the keep's ceiling ([`HOLDS_KEEP_MAX`]) is what bounds those.
 /// `the_real_hold_reads_the_tabs_foreground_and_its_leader` and
-/// `the_hold_reads_the_groups_leader_and_a_zombie_still_reads_held` bind
-/// each case on a real terminal.
+/// `the_hold_reads_the_groups_leader` bind the leader's cases on a real
+/// terminal.
 fn holds(store: &Store, sid: &str, group: i32) -> Option<bool> {
     let leader = u32::try_from(group).ok().filter(|g| *g > 0)?;
     let h = store
@@ -14162,30 +16572,32 @@ fn still_wanted(store: &Store, sid: &str, group: i32) -> bool {
     still_supervisable(store, sid) || holds(store, sid, group) == Some(true)
 }
 
-/// Whether `sid` is still a live session of an agent the host supervises.
+/// Whether `sid` is still a live session of an agent the host supervises or
+/// watches ([`admitted`]: never a vendor Codex). The store's lock is held
+/// only to clone the tab's context.
 fn still_supervisable(store: &Store, sid: &str) -> bool {
-    let guard = store.read().unwrap_or_else(PoisonError::into_inner);
-    let Some(h) = guard.by_sid(&aterm_session::SessionId::new(sid)) else {
-        return false;
+    let ctx = {
+        let guard = store.read().unwrap_or_else(PoisonError::into_inner);
+        let Some(h) = guard.by_sid(&aterm_session::SessionId::new(sid)) else {
+            return false;
+        };
+        if h.state == SessionState::Exited {
+            return false;
+        }
+        Arc::clone(&h.ctx)
     };
-    if h.state == SessionState::Exited {
-        return false;
-    }
-    let tl = h
-        .ctx
-        .timeline
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    agent_of(tl.agent()).is_some()
+    admitted(&ctx).is_some()
 }
 
 /// One run of the loop over this instance's own socket.
 fn hosted_body(sock: &str, job: &WorkerJob) -> BodyEnd {
-    let mut ctl = HostCtl::new(Endpoint::Socket(sock.to_string()));
+    // The harness's own token: what it types and marks reads `by=harness`.
+    let mut ctl = HostCtl::as_harness(Endpoint::Socket(sock.to_string()));
     ctl.admission = Some((Arc::clone(&job.switches), job.agent));
-    // Watch-only beside a proven self-claim: the transport itself refuses
-    // every write, whatever the loop asks (§4).
-    ctl.watch_only = job.beside();
+    // Watch-only beside a proven self-claim, or a codex-alab's worker at
+    // all: the transport itself refuses every write, whatever the loop asks
+    // (§4).
+    ctl.watch_only = job.watch_beside();
     // Every write the loop types is fenced on its own claim: once a proven
     // self-claim replaced it, none lands (the self-claim contract, §2).
     ctl.fence = Some(holder());
@@ -14194,8 +16606,10 @@ fn hosted_body(sock: &str, job: &WorkerJob) -> BodyEnd {
         return BodyEnd::Stopped;
     }
     let sel = format!("@{}", job.sid);
-    if job.clear_badge {
-        let owner = format!("owner={ATTENTION_OWNER}");
+    // A mark a standing word that its agent could not be brought back holds
+    // is that word's ([`lost_marked`]): the relaunch's own `Clear` leaves it.
+    if (job.clear_badge && !with_kept(job, |k| lost_marked(k))) || job.unset_mark {
+        let owner = format!("owner={RELAUNCH_ATTENTION_OWNER}");
         if let Err(e) = ctl.call(&[&sel, "meta", "unset", "attention", &owner]) {
             return held_or_failed(e);
         }
@@ -14210,9 +16624,44 @@ fn hosted_body(sock: &str, job: &WorkerJob) -> BodyEnd {
     let mut session = Session::new(&mut ctl, Some(sel));
     session.set_supervisor_name(Some(holder()));
     session.set_handover(Arc::clone(&job.handover));
-    // Beside a proven self-claim: watch only, the remedies standing (§4).
-    session.set_beside(job.beside());
+    // Beside a proven self-claim (or a codex-alab with none): watch only,
+    // the remedies standing (§4).
+    session.set_beside(job.watch_beside());
+    // HARNESS TAPES, behind the development seam (the replay plan's T7; the
+    // lab's instances set it, and no shipped binary reads it): the run is
+    // recorded — its every control request, clock read and file, and every
+    // answer this host gives it — to a tape beside the session's ledger,
+    // which `aterm drive replay` runs again offline. Recording by default
+    // waits for the owner's decision (D1). The run itself is the same run.
+    if tape::seam_on(aterm_types::dev_seam!(tape::HOSTED_SEAM).as_deref()) {
+        let setup = session.setup().clone();
+        drop(session);
+        let warn = Box::new(LogLines {
+            sid: job.sid.clone(),
+            buf: Vec::new(),
+        });
+        return body_end(tape::run_hosted_taped(
+            &mut ctl,
+            setup,
+            &job.opts,
+            Arc::clone(&job.stop),
+            &mut out,
+            warn,
+            || stopped_by_commit(job),
+        ));
+    }
     body_end(session.run_hosted(&job.opts, Arc::clone(&job.stop), &mut out))
+}
+
+/// Whether the run of `job` that just returned was stopped by a seamless
+/// update's Commit ([`HostHandle::suspend`] marks the worker so, and
+/// nothing has decided or rolled back since): the hosted tape then ends
+/// SUSPENDED, not as a stop for good (`tape::run_hosted_taped`), so a reader
+/// of the tape knows the session went on in the successor. Asked once, as
+/// the loop returns and before its worker decides — the decision is what
+/// turns `Stopped` into `Stranded`.
+fn stopped_by_commit(job: &WorkerJob) -> bool {
+    with_kept(job, |k| k.commit == Committed::Stopped)
 }
 
 /// What one run of the loop came to: a stop, or the reason it ended (held
@@ -14232,11 +16681,12 @@ fn held_or_failed(e: String) -> BodyEnd {
     }
 }
 
-/// Set (`Some`) or clear the session's `owner=supervisor` attention.
+/// Set (`Some`) or clear the session's relaunch word, its
+/// `owner=relaunch` attention ([`RELAUNCH_ATTENTION_OWNER`]).
 fn set_badge(sock: &str, sid: &str, text: Option<&str>) {
     let mut ctl = RelayCtl::new(Endpoint::Socket(sock.to_string()), None);
     let sel = format!("@{sid}");
-    let owner = format!("owner={ATTENTION_OWNER}");
+    let owner = format!("owner={RELAUNCH_ATTENTION_OWNER}");
     let reply = match text {
         Some(t) => ctl.call(&[&sel, "meta", "set", "attention", &owner, t]),
         None => ctl.call(&[&sel, "meta", "unset", "attention", &owner]),
@@ -14253,6 +16703,7 @@ fn set_badge(sock: &str, sid: &str, text: Option<&str>) {
 /// user's home (Claude's records live under it). No home or no state
 /// directory: no upgrade is ever due and no relaunch can be made (said).
 fn live_acts(store: Store, sock: String) -> Acts {
+    let resume_sock = sock.clone();
     let home = aterm_primer::home_dir();
     let place = home.clone().zip(harness_state());
     let exit_home = home.clone();
@@ -14266,6 +16717,7 @@ fn live_acts(store: Store, sock: String) -> Acts {
     let holds_store = store.clone();
     let carry_store = store.clone();
     let offered_store = store.clone();
+    let idle_store = store.clone();
     let opts = move |sid: &str, grace: u32| {
         place.clone().map(|(home, state)| upgrade_drive::Opts {
             // `[harness] usage_tap`, read live ([`Switches::set`]): the
@@ -14300,7 +16752,7 @@ fn live_acts(store: Store, sock: String) -> Acts {
             background: false,
             // Where each worker's loop ledgers what it types
             // (`approvals::default_path`): its turns are no task.
-            aterm_state: aterm_agent::operator::default_state_root().ok(),
+            aterm_state: aterm_types::dirs::state_dir(),
             // `[harness] upgrade_ask`, read live ([`Switches::set`]).
             ask: UPGRADE_ASK.load(Ordering::SeqCst),
             // Two or more accounts listed: the home's model caches are
@@ -14314,12 +16766,27 @@ fn live_acts(store: Store, sock: String) -> Acts {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone(),
+            // The tab's Autopilot is the carry-on's alone, which its idle
+            // step reads and hands it ([`Acts::resume`]).
+            land: false,
+            // The harness's clock: the product's, or the test values under a
+            // debug build's fast-timers seam.
+            timings: aterm_agent::harness::Timings::for_build(),
         })
     };
     let opts = Arc::new(opts);
+    let standing_opts = Arc::clone(&opts);
+    // [`Acts::finished`]'s own.
+    let o_finished = Arc::clone(&opts);
+    // [`Acts::earlier_tab`]'s and [`Acts::adopted_gone`]'s own.
+    let o_earlier = Arc::clone(&opts);
+    let o_adopted = Arc::clone(&opts);
     let [o1, o2, o3, o4, o5, o6, o7, o8, o9, o10] = std::array::from_fn(|_| Arc::clone(&opts));
     let [o11, o12, o13, o14, o15, o16, o17, o18, o19] = std::array::from_fn(|_| Arc::clone(&opts));
     let o_self = Arc::clone(&opts);
+    let o_snap = Arc::clone(&opts);
+    // [`Acts::settle`]'s own.
+    let o_settle = Arc::clone(&opts);
     Acts {
         open: Arc::new(move |sid| open(&store, sid)),
         holds: Arc::new(move |sid, group| holds(&holds_store, sid, group)),
@@ -14350,18 +16817,49 @@ fn live_acts(store: Store, sock: String) -> Acts {
             }
             r.step
         }),
-        owed: Arc::new(move |sid| o6(sid, 0).is_some_and(|o| relaunch::owed(&o))),
-        resume: Arc::new(move |sid, grace| {
+        owed: Arc::new(move |sid, only| o6(sid, 0).is_some_and(|o| relaunch::owed_of(&o, only))),
+        disk_resume: Arc::new(move |sid, text| {
+            aterm_agent::harness::disk::type_resume(&resume_sock, sid, text)
+        }),
+        resume: Arc::new(move |sid, grace, carry| {
             let Some(o) = o7(sid, grace) else {
                 return "refused:no-home".to_string();
             };
-            let r = relaunch::resume(&o);
+            let r = relaunch::resume_as(
+                &upgrade_drive::Opts {
+                    land: carry.land,
+                    ..o
+                },
+                carry.done_under_land,
+                carry.only,
+            );
             if r.is_act() {
                 aterm_log::info!("harness @{sid}: {}", r.line_as("carry-on"));
             }
             r.step
         }),
-        snapshot: Arc::new(move |sid| o3(sid, 0).and_then(|o| relaunch::snapshot(&o).ok())),
+        settle: Arc::new(move |sid| {
+            let Some(o) = o_settle(sid, 0) else {
+                return "refused:no-home".to_string();
+            };
+            let r = relaunch::settle(&o);
+            if r.is_act() {
+                aterm_log::info!("harness @{sid}: {}", r.line_as("carry-on"));
+            }
+            r.step
+        }),
+        snapshot: Arc::new(move |sid| {
+            o3(sid, 0).and_then(|o| match relaunch::snapshot(&o) {
+                Ok(snap) => {
+                    snapshot_refused(sid, None);
+                    Some(snap)
+                }
+                Err(why) => {
+                    snapshot_refused(sid, Some(why));
+                    None
+                }
+            })
+        }),
         follow: Arc::new(move |sid, snap| {
             // An unknown group (none resolved yet) proves nothing: kept.
             let Some(fg) = foreground_of(&fg_store, sid) else {
@@ -14372,6 +16870,12 @@ fn live_acts(store: Store, sock: String) -> Acts {
                 && let Some(home) = home.as_deref()
             {
                 relaunch::follow(home, snap);
+            }
+            // A Muse Code's session, which `/new` and an in-TUI `/resume`
+            // move, read again between idle points.
+            // (`follow_muse` reads nothing for any other agent's snapshot.)
+            if at == Foreground::Agent {
+                relaunch::follow_muse(snap);
             }
             at
         }),
@@ -14385,12 +16889,17 @@ fn live_acts(store: Store, sock: String) -> Acts {
                 .find(|l| l.starts_with("OK"))
                 .map(str::to_string)
         }),
-        exit_look: Arc::new(move |sid, snap| match snap.agent() {
-            // A Codex's exit is its shell's word, over the control socket.
-            aterm_agent::harness::upgrade::Agent::Codex => {
-                o13(sid, 0).map(|o| relaunch::look_at_codex_exit(&o, snap))
+        exit_look: Arc::new(move |sid, snap| match &snap.run {
+            // A Codex's end is read by aterm's copy of codex-alab's own record
+            // alone ([`self_claimed_exit`]), never looked at here (the Codex
+            // screen lane's retirement, 2026-10-16): unread.
+            relaunch::AgentRun::Codex(_) => None,
+            // A Muse Code's exit is its shell's word, over the control
+            // socket, by its own table.
+            relaunch::AgentRun::Muse(_) => {
+                o13(sid, 0).map(|o| relaunch::look_at_muse_exit(&o, snap))
             }
-            aterm_agent::harness::upgrade::Agent::Claude => exit_home
+            relaunch::AgentRun::Claude => exit_home
                 .as_deref()
                 .map(|home| relaunch::look_at_exit(home, snap)),
         }),
@@ -14412,6 +16921,7 @@ fn live_acts(store: Store, sock: String) -> Acts {
         }),
         offered: Arc::new(move |sid| offered_now(&offered_store, sid)),
         self_copy: Arc::new(crate::self_claim::copy_of_tab),
+        self_idle: Arc::new(move |sid, pid, start| self_idle_now(&idle_store, sid, pid, start)),
         self_relaunch: Arc::new(move |sid, grace, snap, resume, asked| {
             let Some(o) = o_self(sid, grace) else {
                 return "refused:no-home".to_string();
@@ -14419,6 +16929,19 @@ fn live_acts(store: Store, sock: String) -> Acts {
             let r = upgrade_drive::self_claimed_after_exit(&o, snap, resume, asked);
             aterm_log::info!("harness @{sid}: {}", r.line_as("self-claimed-relaunch"));
             r.step
+        }),
+        self_snapshot: Arc::new(move |sid, copy, resume| {
+            let o = o_snap(sid, 0)?;
+            match relaunch::self_claimed_snapshot(&o, copy, resume) {
+                Ok(snap) => Some(snap),
+                Err(why) => {
+                    aterm_log::info!(
+                        "harness @{sid}: no shell holds the tab at the crashed codex-alab's exit \
+                         ({why})"
+                    );
+                    None
+                }
+            }
         }),
         relaunch: Arc::new(move |sid, grace, snap, left, upgrade, asked| {
             let Some(o) = o5(sid, grace) else {
@@ -14431,21 +16954,34 @@ fn live_acts(store: Store, sock: String) -> Acts {
         restarted: Arc::new(move |sid, agent, pid| {
             o15(sid, 0).is_some_and(|o| relaunch::restarted(&o, agent, pid))
         }),
-        carry: Arc::new(move |sid, grace, agent, pid| {
+        carry: Arc::new(move |sid, grace, agent, pid, through_hand| {
             let Some(o) = o16(sid, grace) else {
                 return "refused:no-home".to_string();
             };
-            let r = relaunch::carry_restart(&o, agent, pid);
-            aterm_log::info!("harness @{sid}: {}", r.line_as("carry-restart"));
+            let r = relaunch::carry_restart(&o, agent, pid, through_hand);
+            // A carry waiting out a hand is said once by its worker, never
+            // every `relaunch::BUSY` here.
+            if r.step != relaunch::WAIT_HAND_LIFTS {
+                aterm_log::info!("harness @{sid}: {}", r.line_as("carry-restart"));
+            }
             r.step
         }),
-        relaunch_restored: Arc::new(move |sid, snap, upgrade| {
+        relaunch_restored: Arc::new(move |sid, snap, upgrade, was| {
             let Some(o) = o14(sid, 0) else {
                 return "refused:no-home".to_string();
             };
-            let r = relaunch::after_host_ended(&o, snap, upgrade);
-            aterm_log::info!("harness @{sid}: {}", r.line_as("relaunch-after-host-ended"));
+            let r = relaunch::after_host_ended_from(&o, snap, upgrade, was);
+            aterm_log::info!("harness @{sid}: {}", r.line_as(RESTORED_LINE));
             r.step
+        }),
+        earlier_tab: Arc::new(move |sid, was| {
+            if let Some(o) = o_earlier(sid, 0) {
+                upgrade_drive::note_earlier_tab(&o, sid, was);
+            }
+        }),
+        adopted_gone: Arc::new(move |sid, snap| {
+            let o = o_adopted(sid, 0)?;
+            relaunch::adopted_gone(&o, sid, snap.session.as_deref()?)
         }),
         carry_in_flight: Arc::new(move |sid, grace| {
             let o = o17(sid, grace)?;
@@ -14494,7 +17030,18 @@ fn live_acts(store: Store, sock: String) -> Acts {
         }),
         tasked: Arc::new(move |sid, snap, memo| {
             let o = o10(sid, 0)?;
-            memo.of_snapshot(&o.home, snap, &upgrade_drive::supervisor_typed(&o, sid))
+            memo.of_snapshot(&o.home, snap, &conversation_typed(&o, sid, snap))
+        }),
+        finished: Arc::new(move |sid, snap, memo| {
+            let o = o_finished(sid, 0)?;
+            let finished = memo.of_snapshot(&o.home, snap, &conversation_typed(&o, sid, snap));
+            // Where a moved agent writes its conversation now, noted while it
+            // lives: its relaunch reads its finish there once it is gone
+            // (`upgrade_drive::note_writes`, RR-LC-5).
+            if let Some(dir) = memo.dir() {
+                upgrade_drive::note_writes(&o, snap, dir);
+            }
+            finished
         }),
         limit_reset: Arc::new(move |snap| {
             let session = snap.session.as_deref()?;
@@ -14505,6 +17052,10 @@ fn live_acts(store: Store, sock: String) -> Acts {
             })
         }),
         transcript_tail: Arc::new(upgrade_drive::snapshot_transcript_tail),
+        standing_limit: Arc::new(move |sid, snap| {
+            let tail = upgrade_drive::snapshot_transcript_tail(snap)?;
+            relaunch::standing_limit(&standing_opts(sid, 0)?, snap, &tail)
+        }),
         account_wall: Arc::new(move |sid, agent, settled| {
             account_wall_live(account_home.as_deref(), sid, agent, settled)
         }),
@@ -14538,7 +17089,6 @@ fn live_acts(store: Store, sock: String) -> Acts {
                 })
             })
         }),
-        codex_reset: Arc::new(upgrade_drive::codex_wall_reset),
         hold: Arc::new(move |sid, until| {
             o12(sid, 0).is_none_or(|o| upgrade_drive::hold_clock(&o, until))
         }),
@@ -15187,6 +17737,7 @@ fn account_made_at(root: &Path, sid: &str, to: &str, at: AccountAt) -> bool {
     let mut refused = Vec::new();
     let mut ledger = approvals::Ledger::open(Some(&path), Some(sid), &mut refused);
     ledger.write(
+        aterm_agent::supervise::journal::unix_ms(),
         &approvals::Row {
             rule_id: RULE_ACCOUNT,
             outcome: approvals::Outcome::Typed,
@@ -16052,14 +18603,11 @@ fn machine_swap_rate() -> Option<u32> {
 }
 
 /// THE PRODUCT'S [`Acts::watch`], as [`live_acts`] wires it: the tab handed
-/// to [`upgrade_drive::watch`] and nothing else. A named function, not a
-/// closure, so the aterm-census guard `watch-hands` can fence it (the watch's review,
-/// 2026-09-28: the fence stopped at `(acts.watch)(…)` in [`watch_tab`], and
-/// the tests drive their own `Acts`, so an edit here that called
-/// `upgrade_drive::step` — a real visit, typing at the next read — or a
-/// relaunch would have passed both). The guard holds it to an ALLOW-LIST: the one
-/// call it may make is `upgrade_drive::watch`. No home or state directory:
-/// nothing is watched (said as `no-home`).
+/// to [`upgrade_drive::watch`] and nothing else, whose dry run reads over
+/// read-only connections (`RelayClient::reads_only`, pinned by aterm-agent's
+/// `a_dry_runs_connection_reads_and_has_no_hands`), so nothing it reaches can
+/// type, press or signal. No home or state directory: nothing is watched
+/// (said as `no-home`).
 fn watch_off_any_point(
     opts: Option<upgrade_drive::Opts>,
     sid: &str,
@@ -16080,14 +18628,14 @@ fn watch_off_any_point(
 /// look at a time, hands `aterm_agent::harness::cli::disk_tick` where to
 /// SEARCH for build directories ([`disk_roots`]: those working directories
 /// and their worktrees, `$HOME`'s checkouts and their worktrees, x.py's
-/// bootstrap trees, each agent's `CARGO_TARGET_DIR`, Claude Code's temp root,
-/// the cells cache). Below `[disk] auto_free_gib` of free space on the home
+/// bootstrap trees, each agent's `CARGO_TARGET_DIR`, Claude Code's temp
+/// root). Below `[disk] auto_free_gib` of free space on the home
 /// volume it searches, and reclaims in the build directories ON THAT VOLUME
 /// (one on another volume would free nothing there), in this order: the
 /// `incremental/` of every cargo profile idle past `target_stale_days` (one
 /// day unless the file says otherwise); then, the home volume's free space
 /// measured again before each, the build directories whose owner is gone (an
-/// ended Claude Code session's scratch build, a removed checkout's cells)
+/// ended Claude Code session's scratch build)
 /// WHOLE, the longest unwritten first; then recent profiles' `incremental/`,
 /// least recently used first — until free space is back at the floor plus a
 /// GiB, or until the bytes released cover what it was short (a snapshot can
@@ -16099,6 +18647,81 @@ fn watch_off_any_point(
 /// it reads the config and the free figure and nothing else.
 fn live_disk(store: Store, note: Arc<NoteFn>) -> Arc<DiskFn> {
     static LOOKING: AtomicBool = AtomicBool::new(false);
+    let watch = disk_watch(store, note, &LOOKING, Arc::new(disk_look));
+    let look: Arc<DiskFn> = Arc::new(move |sids: &[String]| {
+        *DISK_SIDS.lock().unwrap_or_else(PoisonError::into_inner) = sids.to_vec();
+        watch(sids);
+    });
+    // A POKE ([`aterm_agent::harness::disk::poke`]): whatever in this process
+    // saw the disk full asks for a look now, over the sessions last handed.
+    // The look runs on a thread of its own: a poke comes from whatever write
+    // failed, on whatever thread and under whatever lock that writer held,
+    // and the look takes the store's. One such thread at a time, its flag
+    // cleared however the look ends ([`disk_flight`]: one that panicked —
+    // its reads of the tabs, before the look's own flight — left it set for
+    // good, and every later poke returned at it).
+    let poked = Arc::clone(&look);
+    aterm_agent::harness::disk::poke::set_handler(Arc::new(move |cause| {
+        static POKE_PENDING: AtomicBool = AtomicBool::new(false);
+        aterm_log::info!("harness disk watch: poked, {}", cause.describe());
+        DISK_POKED.store(true, Ordering::SeqCst);
+        if POKE_PENDING.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let poked = Arc::clone(&poked);
+        let spawned = std::thread::Builder::new()
+            .name(format!("{THREAD_PREFIX}disk-poke"))
+            .spawn(move || {
+                let sids = DISK_SIDS
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                disk_flight(&POKE_PENDING, "the disk watch's poke", || poked(&sids));
+            });
+        if spawned.is_err() {
+            POKE_PENDING.store(false, Ordering::SeqCst);
+        }
+    }));
+    look
+}
+
+/// What a disk look runs on its own thread over what the store gave it —
+/// the sessions, their working directories, their agents' process groups
+/// and each one's own word that the disk is full — telling the window
+/// through the note it is handed: [`disk_look`] in production.
+type DiskLookFn = dyn Fn(
+        &[String],
+        &[std::path::PathBuf],
+        &[u32],
+        &[(String, aterm_phase::disk_full::DiskFull)],
+        &NoteFn,
+    ) + Send
+    + Sync;
+
+/// THE DISK WATCH'S LOOK ([`live_disk`]'s, its poke's as well): read what a
+/// look needs from the store, then `run` it on a thread of its own, one at a
+/// time (`looking`), telling the window through ONE filter
+/// ([`DiskEndsSaid`]): each end once a change, not at every look.
+fn disk_watch(
+    store: Store,
+    note: Arc<NoteFn>,
+    looking: &'static AtomicBool,
+    run: Arc<DiskLookFn>,
+) -> Arc<DiskFn> {
+    // The window hears each end once a change ([`DiskEndsSaid`]), not every
+    // look: every look and every poke goes through this one filter.
+    let note: Arc<NoteFn> = {
+        let said = Mutex::new(DiskEndsSaid::default());
+        Arc::new(move |told: HostNote| {
+            let owed = said
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .owed(&told, Instant::now());
+            if owed {
+                note(told);
+            }
+        })
+    };
     Arc::new(move |sids: &[String]| {
         let cwds = working_dirs(&store, sids);
         let agents: Vec<u32> = sids
@@ -16106,21 +18729,68 @@ fn live_disk(store: Store, note: Arc<NoteFn>) -> Arc<DiskFn> {
             .filter_map(|sid| foreground_of(&store, sid))
             .filter_map(|pgid| u32::try_from(pgid).ok())
             .collect();
-        if LOOKING.swap(true, Ordering::SeqCst) {
+        // Each supervised Claude Code's screen, read in memory: its own word
+        // that the disk is full ([`aterm_phase::disk_full`]).
+        let seen: Vec<(String, aterm_phase::disk_full::DiskFull)> = sids
+            .iter()
+            .filter_map(|sid| {
+                let rows = screen_rows(&store, sid)?;
+                Some((sid.clone(), aterm_phase::disk_full::disk_full(&rows)?))
+            })
+            .collect();
+        if looking.swap(true, Ordering::SeqCst) {
             return;
         }
         let note = Arc::clone(&note);
+        let run = Arc::clone(&run);
+        let sids = sids.to_vec();
         let spawned = std::thread::Builder::new()
             .name(format!("{THREAD_PREFIX}disk"))
             .spawn(move || {
-                disk_look(&cwds, &agents, note.as_ref());
-                LOOKING.store(false, Ordering::SeqCst);
+                disk_flight(looking, "the disk watch's look", || {
+                    run(&sids, &cwds, &agents, &seen, note.as_ref());
+                });
             });
         if let Err(e) = spawned {
-            LOOKING.store(false, Ordering::SeqCst);
+            looking.store(false, Ordering::SeqCst);
             aterm_log::warn!("harness disk watch could not start: {e}");
         }
     })
+}
+
+/// The sessions the disk watch was last handed ([`live_disk`]): a poke looks
+/// over them.
+static DISK_SIDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// A poke arrived since the last pass: the next look passes at once if the
+/// volume is short ([`disk_look`]).
+static DISK_POKED: AtomicBool = AtomicBool::new(false);
+
+/// The visible rows of tab `sid`'s screen, read in memory (the store's lock,
+/// then the terminal's, never waited on): `None` when the tab is gone or its
+/// terminal is busy this instant.
+fn screen_rows(store: &Store, sid: &str) -> Option<Vec<String>> {
+    let handle = {
+        let g = store.read().unwrap_or_else(PoisonError::into_inner);
+        g.by_sid(&aterm_session::SessionId::new(sid))?.clone()
+    };
+    let t = handle.term.try_lock().ok()?;
+    let rows = usize::from(t.rows());
+    Some(
+        (0..rows)
+            .map(|i| t.row_text(i).unwrap_or_default())
+            .collect(),
+    )
+}
+
+/// ONE LOOK OF THE DISK WATCH on its own thread ([`live_disk`]: a tick's
+/// look, or a poke's), `what`: `look`, then `looking` — the one look in
+/// flight — cleared, however the look ended. One that panicked ends as any
+/// other ([`caught`]; F1-R6-H2): uncaught, the flag stood for good and every
+/// later tick (or poke) returned at it — no disk watch for any tab for the
+/// rest of the process.
+fn disk_flight(looking: &AtomicBool, what: &str, look: impl FnOnce()) {
+    let _ = caught(what, "it looks again at its next tick", look);
+    looking.store(false, Ordering::SeqCst);
 }
 
 /// The working directories `sids` last reported, each once.
@@ -16152,7 +18822,7 @@ fn working_dirs(store: &Store, sids: &[String]) -> Vec<std::path::PathBuf> {
 /// `cwds` (and the worktree each is in), `$HOME`'s checkouts and their
 /// worktrees, the `CARGO_TARGET_DIR` each agent in `agents` (a process group's
 /// leader) was started with where its environment can be read, Claude Code's
-/// temp root for this uid, and the cells cache; and who may hold a session,
+/// temp root for this uid; and who may hold a session,
 /// `running` (the running Claude Codes and the directories the processes
 /// were started with, or why a process that may be one could not be read),
 /// its end read in those directories and the identities'.
@@ -16198,7 +18868,6 @@ fn disk_roots(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let xdg_cache = std::env::var_os("XDG_CACHE_HOME").map(std::path::PathBuf::from);
     discover::Roots {
         cwds: cwds.to_vec(),
         home: Some(home.to_path_buf()),
@@ -16207,7 +18876,6 @@ fn disk_roots(
         claude_unread,
         agent_target_dirs,
         claude_tmp: Some(discover::claude_tmp_root(discover::own_uid())),
-        cells: Some(discover::cells_root(home, xdg_cache.as_deref())),
         // The home volume's, whose free space the watch measures; and the
         // mount table, so a stalled network mount is never `stat`ed.
         device: discover::device_of(home),
@@ -16287,7 +18955,13 @@ static DISK_NOTES_SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Ve
 /// on the volume's account: an open one stands until a look reads the floor
 /// and finds the volume at or above it (or, for the cleanup-off form, reads
 /// the settings again).
-fn disk_look(cwds: &[std::path::PathBuf], agents: &[u32], note: &NoteFn) {
+fn disk_look(
+    sids: &[String],
+    cwds: &[std::path::PathBuf],
+    agents: &[u32],
+    seen: &[(String, aterm_phase::disk_full::DiskFull)],
+    note: &NoteFn,
+) {
     let (Some(home), Some(state)) = (aterm_primer::home_dir(), harness_state()) else {
         return;
     };
@@ -16322,11 +18996,166 @@ fn disk_look(cwds: &[std::path::PathBuf], agents: &[u32], note: &NoteFn) {
         Vec::new()
     };
     note(disk_settings_note(&reading, &faults));
+    use aterm_agent::harness::disk::Level;
+    let now = aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX));
+    let stats = atpkg::freespace::volume_stats(&home);
+    let free = stats.map(|s| s.free);
+    let total = stats.map(|s| s.total);
+    let thresholds = reading.thresholds(total);
+    let level = thresholds.level(free, stats.and_then(|s| s.files_free));
+    // THE RESERVE FIRST: at an emergency its unlink is what lets the rows
+    // after it be written ([`aterm_agent::harness::cli::disk_reserve_look`]).
+    let reserve = aterm_agent::harness::disk::reserve::path_for(&home);
+    match aterm_agent::harness::cli::disk_reserve_look(
+        &state,
+        &reserve,
+        level,
+        free,
+        &thresholds,
+        now,
+    ) {
+        aterm_agent::harness::cli::ReserveMove::Kept => {}
+        moved => aterm_log::info!(
+            "harness disk watch: reserve {moved:?} at {}",
+            reserve.display()
+        ),
+    }
+    disk_sightings(seen, level, free, &state, now);
+    if level == Level::Unknown {
+        // An unreadable volume proves neither pressure nor recovery. Keep
+        // the prior episode, alerts, pending poke and pass backoff intact.
+        return;
+    }
+    // The floor and the warning as a share of the volume where the file
+    // does not write them ([`aterm_agent::harness::disk::Config::on_volume`]).
+    let reading = aterm_agent::harness::cli::DiskReading {
+        config: reading.on_volume(total),
+        floor_gib: reading.floor_gib.map(|floor| {
+            aterm_agent::harness::disk::Config {
+                auto_free_gib: floor,
+                ..reading.config
+            }
+            .on_volume(total, reading.written)
+            .auto_free_gib
+        }),
+        ..reading
+    };
     let config = reading.config;
-    let free = atpkg::freespace::available_bytes(&home);
+    let poked = DISK_POKED.swap(false, Ordering::SeqCst);
     if !config.below_auto_floor(free) {
         if let Some(told) = disk_look_without_pass(&reading, free, &DISK_RUNS) {
             note(told);
+        }
+        let why = if config.auto_free_gib == 0 {
+            "the automatic removal is off ([disk] auto_free_gib is 0, or a [disk] value aterm \
+             cannot read)"
+        } else {
+            "the volume is out of inodes, not bytes: no build cache aterm may remove is the cause"
+        };
+        disk_alert(level, free, &home, 0, &[], why, note);
+        disk_episode_after(level, 0, &[]);
+        return;
+    }
+    // A pass is rate-limited ([`disk_pass_due`]); what the look measured is
+    // not: the episode, the end of the owner's alert and the resume follow
+    // every look, so they do not wait out [`DISK_PASS_EVERY`] once space is
+    // back above the emergency.
+    let started = Instant::now();
+    let due = disk_pass_due(
+        &mut DISK_LAST_PASS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner),
+        started,
+        level,
+        free,
+        poked,
+    );
+    if !due {
+        disk_episode_after(level, 0, &[]);
+        if level != Level::Emergency {
+            disk_alert(level, free, &home, 0, &[], "", note);
+        }
+        return;
+    }
+    // NO SESSION SUPERVISED: only aterm's own Rust build cache is aterm's to
+    // reclaim — a removed workspace's, unwritten ten minutes, under its
+    // locks ([`atpkg::build_cache::reclaim_under_pressure`]), and only while
+    // `[disk] dead_build_dirs` lets a whole build directory go; the owner's
+    // checkouts are the supervised agents' business, not the watch's. Each
+    // directory is sized and its intent journalled BEFORE it is moved (one
+    // whose row cannot be written is kept), its removal after; what was
+    // freed is the sum of the swept directories, not the volume's change
+    // (the reserve released above and other processes' frees are not
+    // aterm's reclaim).
+    if sids.is_empty() {
+        let mut sized: Vec<(PathBuf, u64)> = Vec::new();
+        let swept = if config.dead_build_dirs {
+            atpkg::build_cache::reclaim_home_under_pressure(&mut |path| {
+                let (bytes, _) = aterm_agent::harness::disk::dir_bytes(path);
+                let on_record =
+                    aterm_agent::harness::cli::disk_sweep_journal(&state, path, bytes, false, now);
+                if on_record {
+                    sized.push((path.to_path_buf(), bytes));
+                }
+                on_record
+            })
+        } else {
+            Vec::new()
+        };
+        let (freed, went) = disk_swept(&swept, &sized);
+        for path in &swept {
+            let bytes = sized.iter().find(|(p, _)| p == path).map_or(0, |(_, b)| *b);
+            aterm_agent::harness::cli::disk_sweep_journal(&state, path, bytes, true, now);
+        }
+        let after = atpkg::freespace::volume_stats(&home);
+        if !swept.is_empty() {
+            aterm_log::info!(
+                "harness disk watch: below {} GiB free, swept {} build cache{} of removed \
+                 workspaces, about {} back",
+                config.auto_free_gib,
+                swept.len(),
+                if swept.len() == 1 { "" } else { "s" },
+                aterm_agent::harness::disk::human_bytes(freed),
+            );
+            note(HostNote::DiskFreed {
+                bytes: freed,
+                went: went.clone(),
+            });
+        }
+        let level_after = thresholds.level(after.map(|s| s.free), after.and_then(|s| s.files_free));
+        disk_alert(
+            level_after,
+            after.map(|s| s.free),
+            &home,
+            freed,
+            &[],
+            if config.dead_build_dirs {
+                "no supervised session: only aterm's own build cache is reclaimed"
+            } else {
+                "no supervised session, and [disk] dead_build_dirs is off: no whole build \
+                 cache is reclaimed"
+            },
+            note,
+        );
+        disk_episode_after(level_after, freed, &went);
+        disk_pass_ran(
+            started,
+            free,
+            swept.is_empty()
+                && (level_after == Level::Emergency
+                    || (level_after == Level::Unknown && level == Level::Emergency)),
+        );
+        if level_after == Level::Unknown {
+            return;
+        }
+        match DISK_RUNS.pass(!swept.is_empty(), after.map(|s| s.free), config) {
+            DiskOutcome::Plenty => note(HostNote::DiskPlenty),
+            DiskOutcome::Short => {}
+            DiskOutcome::Low { free_gib, .. } => note(HostNote::DiskLow {
+                free_gib,
+                floor_gib: config.auto_free_gib,
+                hogs: Vec::new(),
+            }),
         }
         return;
     }
@@ -16334,7 +19163,6 @@ fn disk_look(cwds: &[std::path::PathBuf], agents: &[u32], note: &NoteFn) {
     // Claude Codes, where each works and when it started, from the kernel.
     let running = aterm_agent::harness::disk::discover::running_claude_census(Some(&home));
     let roots = disk_roots(cwds, agents, &home, running);
-    let now = aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX));
     let transcripts = home.join(".claude").join("projects");
     let look = aterm_agent::harness::cli::DiskLook {
         state: &state,
@@ -16396,6 +19224,59 @@ fn disk_look(cwds: &[std::path::PathBuf], agents: &[u32], note: &NoteFn) {
     // Where the pass LEFT the volume, measured again whatever it freed
     // ([`free_after_pass`]).
     let after = free_after_pass(freed, free, || atpkg::freespace::available_bytes(&home));
+    let freed_bytes = match &tick {
+        aterm_agent::harness::cli::DiskTick::Reclaimed(done, _) => done.freed_bytes,
+        aterm_agent::harness::cli::DiskTick::Plenty => 0,
+    };
+    let went: Vec<String> = match &tick {
+        aterm_agent::harness::cli::DiskTick::Reclaimed(done, _) => {
+            let mut rows: Vec<(u64, String)> = done
+                .removed
+                .iter()
+                .map(|(row, removed)| {
+                    (
+                        removed.bytes,
+                        format!(
+                            "{} {}",
+                            aterm_agent::harness::disk::human_bytes(removed.bytes),
+                            row.path.display()
+                        ),
+                    )
+                })
+                .collect();
+            rows.sort_by_key(|r| std::cmp::Reverse(r.0));
+            rows.into_iter().map(|(_, line)| line).take(5).collect()
+        }
+        aterm_agent::harness::cli::DiskTick::Plenty => Vec::new(),
+    };
+    if freed {
+        note(HostNote::DiskFreed {
+            bytes: freed_bytes,
+            went: went.clone(),
+        });
+    }
+    let files_after = atpkg::freespace::volume_stats(&home).and_then(|s| s.files_free);
+    let level_after = thresholds.level(after, files_after);
+    disk_alert(
+        level_after,
+        after,
+        &home,
+        freed_bytes,
+        &hogs,
+        "aterm reclaimed every build cache it may and nothing more is safe to remove",
+        note,
+    );
+    disk_episode_after(level_after, freed_bytes, &went);
+    disk_pass_ran(
+        started,
+        free,
+        !freed
+            && (level_after == Level::Emergency
+                || (level_after == Level::Unknown && level == Level::Emergency)),
+    );
+    if level_after == Level::Unknown {
+        return;
+    }
     match DISK_RUNS.pass(freed, after, config) {
         DiskOutcome::Plenty => note(HostNote::DiskPlenty),
         DiskOutcome::Short => {}
@@ -16422,8 +19303,368 @@ fn disk_look(cwds: &[std::path::PathBuf], agents: &[u32], note: &NoteFn) {
     }
 }
 
+/// The least time between two passes below the floor ([`disk_look`]):
+/// a pass searches and sizes every build directory, which a minute's look
+/// must not repeat. An emergency or a poke passes at once — unless the last
+/// pass at the emergency freed nothing ([`disk_pass_due`]).
+const DISK_PASS_EVERY: Duration = Duration::from_secs(10 * 60);
+/// How far free space must fall after an emergency pass that freed nothing
+/// before another runs ahead of [`DISK_PASS_EVERY`] ([`disk_pass_due`]).
+const DISK_EMERGENCY_DROP: u64 = 512 << 20;
+
+/// The last pass below the floor ([`disk_pass_due`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DiskPass {
+    /// When it started.
+    at: Instant,
+    /// The free figure the look it ran in measured.
+    free: Option<u64>,
+    /// It freed nothing and left the volume at its emergency: what a pass
+    /// can reclaim is gone, and another a minute on would only walk and size
+    /// every build directory again on a disk already failing.
+    fruitless: bool,
+}
+
+/// The last pass ([`DiskPass`]).
+static DISK_LAST_PASS: Mutex<Option<DiskPass>> = Mutex::new(None);
+
+/// Whether a look below the floor at `now` (the volume at `level`, `free`
+/// bytes free, `poked` since the last look) runs a pass, given the `last`
+/// one. A first pass, and one [`DISK_PASS_EVERY`] after the last, always
+/// runs. After a FRUITLESS pass ([`DiskPass::fruitless`]) another runs only
+/// when free space fell a further [`DISK_EMERGENCY_DROP`] — a poke or the
+/// emergency alone does not; the mark lifts once a look measures the volume
+/// out of its emergency, so entering it again passes at once. Otherwise an
+/// emergency or a poke passes at once.
+fn disk_pass_due(
+    last: &mut Option<DiskPass>,
+    now: Instant,
+    level: aterm_agent::harness::disk::Level,
+    free: Option<u64>,
+    poked: bool,
+) -> bool {
+    use aterm_agent::harness::disk::Level;
+    if level == Level::Unknown {
+        return false;
+    }
+    let Some(pass) = last.as_mut() else {
+        return true;
+    };
+    if level != Level::Emergency {
+        pass.fruitless = false;
+    }
+    if now.saturating_duration_since(pass.at) >= DISK_PASS_EVERY {
+        return true;
+    }
+    if pass.fruitless {
+        return matches!((pass.free, free), (Some(was), Some(is))
+            if is.saturating_add(DISK_EMERGENCY_DROP) < was);
+    }
+    poked || level == Level::Emergency
+}
+
+/// A pass that started at `at` in a look that measured `free` ran, and was
+/// `fruitless` ([`DiskPass::fruitless`]).
+fn disk_pass_ran(at: Instant, free: Option<u64>, fruitless: bool) {
+    *DISK_LAST_PASS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(DiskPass {
+        at,
+        free,
+        fruitless,
+    });
+}
+
+/// What the no-session sweep freed: the bytes of the directories it
+/// `swept`, each as `sized` before its removal (one not sized counts
+/// nothing), and each named for the log and the resume.
+fn disk_swept(swept: &[PathBuf], sized: &[(PathBuf, u64)]) -> (u64, Vec<String>) {
+    let mut freed = 0u64;
+    let went = swept
+        .iter()
+        .map(|p| {
+            let bytes = sized.iter().find(|(q, _)| q == p).map_or(0, |(_, b)| *b);
+            freed = freed.saturating_add(bytes);
+            format!(
+                "{} {} (its workspace is gone)",
+                aterm_agent::harness::disk::human_bytes(bytes),
+                p.display()
+            )
+        })
+        .collect();
+    (freed, went)
+}
+
+/// THE DISK EPISODE: what the watch knows of sessions a full disk stopped
+/// ([`disk_sightings`], [`disk_episode_after`]), read by each worker's
+/// [`WorkerIdle`] at its loop's points.
+#[derive(Debug)]
+struct DiskEpisode {
+    /// The volume's level at the last look (`None`: not measured yet).
+    level: Option<aterm_agent::harness::disk::Level>,
+    /// Sessions whose Claude Code said the disk is full while the volume
+    /// MEASURED at an emergency, with the code it named: no continuation is
+    /// typed into them while it stands ([`disk_withholds`]).
+    stuck: BTreeMap<String, String>,
+    /// Sessions owed the resume text once space is back, with it and the
+    /// tries left ([`disk_owed`]).
+    owed: BTreeMap<String, (String, u8)>,
+    /// What the passes of this episode freed, and the largest of it.
+    freed: u64,
+    went: Vec<String>,
+    /// Sessions whose sighting was said in the log (said again once the
+    /// notice left the screen and came back).
+    said: BTreeSet<String>,
+    /// The owner's alert stands ([`HostNote::DiskFull`]).
+    alerted: bool,
+}
+
+static DISK_EPISODE: Mutex<DiskEpisode> = Mutex::new(DiskEpisode {
+    level: None,
+    stuck: BTreeMap::new(),
+    owed: BTreeMap::new(),
+    freed: 0,
+    went: Vec::new(),
+    said: BTreeSet::new(),
+    alerted: false,
+});
+
+/// How many times the resume is tried at a session's idle points before it
+/// is given up (the session's own next write clears Claude Code's notice).
+const DISK_RESUME_TRIES: u8 = 3;
+
+/// The disk episode state. Callers release this guard before logging, I/O or
+/// host callbacks, which may inspect the episode or trigger another disk look.
+fn disk_episode() -> std::sync::MutexGuard<'static, DiskEpisode> {
+    DISK_EPISODE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// What the supervised screens said this look (`seen`), against the level
+/// MEASURED: each sighting said once in the log and journalled as a `poke`
+/// row; a session that says so while the volume measures at an emergency is
+/// STUCK ([`DiskEpisode::stuck`]). A sighting with space measured free (a
+/// quota, another volume, a notice not cleared yet) is reported, not acted
+/// on.
+fn disk_sightings(
+    seen: &[(String, aterm_phase::disk_full::DiskFull)],
+    level: aterm_agent::harness::disk::Level,
+    free: Option<u64>,
+    state: &Path,
+    now: i64,
+) {
+    use aterm_agent::harness::disk::{Level, human_bytes, poke::Cause};
+    use aterm_phase::disk_full::Source;
+    {
+        let mut ep = disk_episode();
+        ep.said.retain(|sid| seen.iter().any(|(s, _)| s == sid));
+    }
+    for (sid, d) in seen {
+        let code = d.code.as_str().to_string();
+        // Only Claude Code's own notice of its writes failing — the pinned
+        // notification, or a goal it cleared for it — makes a session stuck:
+        // a tool's output row is only what a command printed, and an agent
+        // can print the vendor's words (a fixture, a log) with every write of
+        // its own going through. Such a row is still a sighting: measured.
+        let fresh = {
+            let mut ep = disk_episode();
+            if level == Level::Emergency && d.source != Source::ToolOutput {
+                ep.stuck.insert(sid.clone(), code.clone());
+            }
+            ep.said.insert(sid.clone())
+        };
+        if !fresh {
+            continue;
+        }
+        // A NEW sighting is a poke: this look passes at once if the volume
+        // is short ([`disk_look`] reads the flag after the sightings).
+        DISK_POKED.store(true, Ordering::SeqCst);
+        let measured = free.map_or_else(|| "unknown".to_string(), human_bytes);
+        if level == Level::Emergency {
+            aterm_log::warn!(
+                "harness @{sid}: its Claude Code says the disk is full ({code}, {:?}); {measured} \
+                 free measured: no continuation is typed until space is back",
+                d.source
+            );
+        } else {
+            aterm_log::info!(
+                "harness @{sid}: its Claude Code says the disk is full ({code}, {:?}), but {measured} \
+                 is free on the home volume: reported, not acted on",
+                d.source
+            );
+        }
+        aterm_agent::harness::cli::disk_poke_journal(
+            state,
+            &Cause::Screen {
+                sid: sid.clone(),
+                code,
+            },
+            free,
+            level,
+            now,
+        );
+    }
+}
+
+/// After a look (`level`, measured after any pass that freed `freed`, the
+/// largest of it `went`): the episode's level, and every STUCK session owed
+/// the resume once the volume is out of its emergency. Back at or above the
+/// floor with nothing owed, the episode's counts start over.
+fn disk_episode_after(level: aterm_agent::harness::disk::Level, freed: u64, went: &[String]) {
+    use aterm_agent::harness::disk::{Level, resume_text};
+    let resumed = {
+        let mut ep = disk_episode();
+        ep.freed = ep.freed.saturating_add(freed);
+        for w in went {
+            if ep.went.len() < 5 {
+                ep.went.push(w.clone());
+            }
+        }
+        if level == Level::Unknown {
+            return;
+        }
+        ep.level = Some(level);
+        let mut resumed = Vec::new();
+        if level != Level::Emergency && !ep.stuck.is_empty() {
+            let stuck = std::mem::take(&mut ep.stuck);
+            for (sid, code) in stuck {
+                let text = resume_text(&code, ep.freed, &ep.went);
+                ep.owed.insert(sid.clone(), (text, DISK_RESUME_TRIES));
+                resumed.push(sid);
+            }
+        }
+        if matches!(level, Level::Ok | Level::Low) && ep.owed.is_empty() && ep.stuck.is_empty() {
+            ep.freed = 0;
+            ep.went.clear();
+        }
+        resumed
+    };
+    for sid in resumed {
+        aterm_log::info!(
+            "harness @{sid}: space is back ({}); the disk resume is owed at its next idle point",
+            level.as_str()
+        );
+    }
+}
+
+/// THE OWNER'S ALERT at an emergency the look left standing ([`HostNote::DiskFull`]),
+/// and its end once the volume is out of it ([`HostNote::DiskFullOver`]).
+fn disk_alert(
+    level: aterm_agent::harness::disk::Level,
+    free: Option<u64>,
+    volume: &Path,
+    freed: u64,
+    hogs: &[String],
+    why: &str,
+    note: &NoteFn,
+) {
+    if level == aterm_agent::harness::disk::Level::Unknown {
+        return;
+    }
+    let emergency = level == aterm_agent::harness::disk::Level::Emergency;
+    let (was, total_freed) = {
+        let mut ep = disk_episode();
+        (
+            std::mem::replace(&mut ep.alerted, emergency),
+            ep.freed.saturating_add(freed),
+        )
+    };
+    if emergency {
+        if !was {
+            aterm_log::error!(
+                "harness disk watch: the home volume is full ({} free) and {why}",
+                free.map_or_else(
+                    || "unknown".to_string(),
+                    aterm_agent::harness::disk::human_bytes
+                )
+            );
+        }
+        note(HostNote::DiskFull {
+            free: free.unwrap_or(0),
+            volume: volume.to_path_buf(),
+            freed: total_freed,
+            hogs: hogs.to_vec(),
+            why: why.to_string(),
+        });
+    } else if was {
+        note(HostNote::DiskFullOver);
+    }
+}
+
+/// Whether tab `sid`'s continuations are withheld: its Claude Code said the
+/// disk is full and the volume still measures at an emergency.
+fn disk_withholds(sid: &str) -> bool {
+    let ep = disk_episode();
+    ep.stuck.contains_key(sid) && ep.level == Some(aterm_agent::harness::disk::Level::Emergency)
+}
+
+/// The resume owed tab `sid`, if one is.
+fn disk_owed(sid: &str) -> Option<String> {
+    disk_episode().owed.get(sid).map(|(text, _)| text.clone())
+}
+
+/// The resume's step at tab `sid` ended `typed` (or tries ran out): owed no
+/// more. A wait spends a try.
+fn disk_resume_stepped(sid: &str, typed: bool) {
+    let mut ep = disk_episode();
+    let spent = match ep.owed.get_mut(sid) {
+        Some((_, tries)) => {
+            *tries = tries.saturating_sub(1);
+            typed || *tries == 0
+        }
+        None => false,
+    };
+    if spent {
+        ep.owed.remove(sid);
+    }
+}
+
+/// How long an end the window already heard ([`DiskEndsSaid`]) goes unsaid:
+/// the watch's period until 2026-10-16, when every look restated it.
+const DISK_END_RESTATE: Duration = Duration::from_secs(6 * 3600);
+
+/// THE ENDS THE DISK WATCH HAS TOLD THE WINDOW. A look restates
+/// [`HostNote::DiskSettingsRead`] and [`HostNote::DiskPlenty`] every time it
+/// finds them so — the window's end is idempotent, and only a look can end a
+/// line an earlier process raised — and since the watch looks every minute
+/// ([`DISK_TICK`]) that was two main-thread wakes a minute that ended
+/// nothing (the Together run's idle windows, 2026-10-16: `HostNote:2`). So
+/// an end goes to the window the first time this process says it, again
+/// after any note that opens a line (a low disk, cleanup off, a settings
+/// fault — which also re-owes the other end), and otherwise once in
+/// [`DISK_END_RESTATE`]; every other note passes as it is.
+#[derive(Debug, Default)]
+struct DiskEndsSaid {
+    /// When [`HostNote::DiskSettingsRead`] last went to the window.
+    settings_read: Option<Instant>,
+    /// When [`HostNote::DiskPlenty`] last went to the window.
+    plenty: Option<Instant>,
+}
+
+impl DiskEndsSaid {
+    /// Whether `told` goes to the window at `now` (and, for an end, that it
+    /// went).
+    fn owed(&mut self, told: &HostNote, now: Instant) -> bool {
+        let said = match told {
+            HostNote::DiskSettingsRead => &mut self.settings_read,
+            HostNote::DiskPlenty => &mut self.plenty,
+            HostNote::DiskLow { .. }
+            | HostNote::DiskLowCleanupOff { .. }
+            | HostNote::DiskSettingsOff { .. } => {
+                *self = Self::default();
+                return true;
+            }
+            _ => return true,
+        };
+        if said.is_some_and(|at| now.saturating_duration_since(at) < DISK_END_RESTATE) {
+            return false;
+        }
+        *said = Some(now);
+        true
+    }
+}
+
 /// What a reading of the `[disk]` settings tells the window of itself, at
-/// every look: every removal off because the file does not say what the
+/// every look ([`DiskEndsSaid`]: the window hears an end once a change): every removal off because the file does not say what the
 /// owner meant by a removal knob ([`HostNote::DiskSettingsOff`]), or not
 /// ([`HostNote::DiskSettingsRead`]). An owner's own `auto_free_gib = 0` is no
 /// fault: it is read as written.
@@ -16593,12 +19834,10 @@ pub(crate) fn harness_state() -> Option<std::path::PathBuf> {
     if let Some(dir) = STATE_FOR_TEST.with(|dir| dir.borrow().clone()) {
         return Some(dir);
     }
-    aterm_agent::operator::default_state_root()
-        .ok()
-        .map(|root| {
-            root.join("harness")
-                .join(aterm_agent::harness::cli::HARNESS)
-        })
+    aterm_types::dirs::state_dir().map(|root| {
+        root.join("harness")
+            .join(aterm_agent::harness::cli::HARNESS)
+    })
 }
 
 #[cfg(test)]
@@ -16611,7 +19850,7 @@ thread_local! {
 
 /// `f` with [`harness_state`] answering `dir` on this thread: a test drives
 /// the real `restart` verb against its own stamp directory.
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) fn with_harness_state<R>(dir: &std::path::Path, f: impl FnOnce() -> R) -> R {
     struct Restore(Option<std::path::PathBuf>);
     impl Drop for Restore {
@@ -16663,16 +19902,16 @@ fn live_view(sock: String, proxy: winit::event_loop::EventLoopProxy<crate::Wake>
                 human_grace_s: 0,
                 hand_back: true,
                 background: false,
-                // Where each tab's loop keeps its ledger — and the tab's goal
-                // record beside it, a Codex goal the move paused
-                // (`goal_hold`): what the row reads of it.
-                aterm_state: aterm_agent::operator::default_state_root().ok(),
+                // Where each tab's loop keeps its ledger.
+                aterm_state: aterm_types::dirs::state_dir(),
                 ask: UPGRADE_ASK.load(Ordering::SeqCst),
                 several_logins: several_logins(),
                 // The view types no line.
                 usage_tap: None,
                 instances: upgrade_drive::Instances::Machine,
                 agents_off: Vec::new(),
+                land: false,
+                timings: aterm_agent::harness::Timings::for_build(),
             },
             &mut hand,
         );
@@ -16777,18 +20016,6 @@ fn fact_hook(send: impl Fn(crate::Wake) + Send + Sync + 'static) -> Arc<FactFn> 
     })
 }
 
-/// The hook that carries a Codex's placed reset to the window: one
-/// `Wake::HarnessReset` per placement the worker tells (or clears), handed to
-/// `send` — the app loop's proxy in production, a channel in a test.
-fn placed_hook(send: impl Fn(crate::Wake) + Send + Sync + 'static) -> Arc<PlacedFn> {
-    Arc::new(move |sid, placed| {
-        send(crate::Wake::HarnessReset {
-            sid: sid.to_string(),
-            placed,
-        });
-    })
-}
-
 /// The production host: this process's store, its own control socket,
 /// atpkg's activation notice and the owner's word, and the app loop
 /// (`proxy`, headless or not) the owner's view of the upgrades is handed to.
@@ -16801,7 +20028,8 @@ pub(crate) fn start_default(
     proxy: winit::event_loop::EventLoopProxy<crate::Wake>,
 ) -> HostHandle {
     let words = store.clone();
-    let (s1, s2, s3, s4) = (store.clone(), store.clone(), store.clone(), store);
+    let (s1, s2, s3, s4) = (store.clone(), store.clone(), store.clone(), store.clone());
+    let s5 = store;
     let (k1, k2, k3, k4) = (sock.clone(), sock.clone(), sock.clone(), sock);
     // The window's half of what a host thread tells it about itself
     // ([`HostNote`]): one wake, applied on the app loop.
@@ -16833,18 +20061,16 @@ pub(crate) fn start_default(
                     let _ = proxy.send_event(wake);
                 })
             },
-            placed: {
-                let proxy = proxy.clone();
-                placed_hook(move |wake| {
-                    let _ = proxy.send_event(wake);
-                })
-            },
             claim_epoch: Arc::new(|| CLAIM_EPOCH.load(Ordering::SeqCst)),
             acts: live_acts(s3, k3),
-            backoff: Arc::new(restart_backoff),
-            pause: Arc::new(|pause| pause),
+            // The harness host's cadences through the ONE timing value: their
+            // production lengths, or the test values a debug build's
+            // `ATERM_DEV_FAST_TIMERS` selects for a live headless instance.
+            backoff: Arc::new(|n| aterm_gui_timing::current().of(restart_backoff(n))),
+            pause: Arc::new(|pause| aterm_gui_timing::current().of(pause)),
             upgrade_view: live_view(k4, proxy),
             disk: live_disk(s4, Arc::clone(&note)),
+            codex_roster: Arc::new(move || codex_roster_of(&s5)),
             note,
         },
     );
@@ -16885,7 +20111,7 @@ pub(crate) fn sweep_legacy_hooks() {
         });
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bench-support"))]
 impl Acts {
     /// Acts over no real session: every tab closed (so no agent holds one),
     /// no upgrade due, no snapshot, nobody typing, and a step or relaunch
@@ -16898,8 +20124,10 @@ impl Acts {
             behind: Arc::new(|_, _| Behind::Nothing),
             step: Arc::new(|_, _| "current".to_string()),
             notice: Arc::new(|_, _| "current".to_string()),
-            owed: Arc::new(|_| false),
-            resume: Arc::new(|_, _| "current".to_string()),
+            owed: Arc::new(|_, _| false),
+            resume: Arc::new(|_, _, _| "current".to_string()),
+            settle: Arc::new(|_| "current".to_string()),
+            disk_resume: Arc::new(|_, _| "wait:inert".to_string()),
             snapshot: Arc::new(|_| None),
             follow: Arc::new(|_, _| Foreground::Shell),
             status: Arc::new(|_| None),
@@ -16909,15 +20137,21 @@ impl Acts {
             offered: Arc::new(|_| None),
             relaunch: Arc::new(|_, _, _, _, _, _| "refused:inert".to_string()),
             self_copy: Arc::new(|_| None),
+            self_idle: Arc::new(|_, _, _| false),
             self_relaunch: Arc::new(|_, _, _, _, _| "refused:inert".to_string()),
+            self_snapshot: Arc::new(|_, _, _| None),
             restarted: Arc::new(|_, _, _| false),
-            carry: Arc::new(|_, _, _, _| "refused:inert".to_string()),
-            relaunch_restored: Arc::new(|_, _, _| "refused:inert".to_string()),
+            carry: Arc::new(|_, _, _, _, _| "refused:inert".to_string()),
+            relaunch_restored: Arc::new(|_, _, _, _| "refused:inert".to_string()),
+            earlier_tab: Arc::new(|_, _| {}),
+            adopted_gone: Arc::new(|_, _| None),
             carry_in_flight: Arc::new(|_, _| None),
             restart: Arc::new(|_, _, _| "refused:inert".to_string()),
             tasked: Arc::new(|_, _, _| None),
+            finished: Arc::new(|_, _, _| None),
             limit_reset: Arc::new(|_| None),
             transcript_tail: Arc::new(|_| None),
+            standing_limit: Arc::new(|_, _| None),
             account_wall: Arc::new(|_, _, _| ("inert", None)),
             account_usage: Arc::new(|_, _, _, _, _| "inert"),
             account_gone: Arc::new(|_| {}),
@@ -16928,12 +20162,49 @@ impl Acts {
             account_restart: Arc::new(|_, _| None),
             account_made: Arc::new(|_, _, _| {}),
             account_cold: Arc::new(|_| None),
-            codex_reset: Arc::new(|_, _, _, _| None),
             hold: Arc::new(|_, _| true),
             route: Arc::new(|_, _, _| Route::Custom("inert".to_string())),
             memory: Arc::new(|_, _| None),
             watch: Arc::new(|_, _, _| upgrade_drive::Watched::default()),
         }
+    }
+}
+
+#[cfg(any(test, feature = "bench-support"))]
+impl HostHandle {
+    /// A host that SUPERVISES `sids`, each a Claude Code tab, with `body` as
+    /// every worker's loop, every act inert: another module's test of what a
+    /// seamless update's Commit does to the host's workers drives it (the
+    /// review of round eight's #18).
+    pub(crate) fn for_supervised_test(
+        sids: Vec<String>,
+        body: Arc<dyn Fn(&WorkerJob) -> BodyEnd + Send + Sync>,
+    ) -> Self {
+        let (wanted, open) = (sids.clone(), sids.clone());
+        let mut acts = Acts::inert();
+        acts.open = Arc::new(move |sid| open.iter().any(|o| o == sid));
+        let hooks = Hooks {
+            roster: Arc::new(move || {
+                sids.iter()
+                    .map(|sid| (sid.clone(), Program::Claude, FollowStamp::default()))
+                    .collect()
+            }),
+            autopilot: Arc::new(HashMap::new),
+            still_wanted: Arc::new(move |sid, _| wanted.iter().any(|w| w == sid)),
+            body,
+            badge: Arc::new(|_, _| {}),
+            waiting: Arc::new(|_, _| {}),
+            fact: Arc::new(|_, _| {}),
+            claim_epoch: Arc::new(|| 0),
+            acts,
+            backoff: Arc::new(|_| Duration::from_millis(10)),
+            pause: Arc::new(|pause| aterm_gui_timing::Timing::FAST.of(pause)),
+            upgrade_view: Arc::new(|_, _, _, _| ViewNext::default()),
+            disk: Arc::new(|_| {}),
+            codex_roster: Arc::new(Vec::new),
+            note: Arc::new(|_| {}),
+        };
+        Self::start(SupervisorConfig::default(), false, false, hooks)
     }
 }
 
@@ -16965,39 +20236,22 @@ impl HostHandle {
         Self::restored_test_host(act, Arc::new(|_| true))
     }
 
-    /// A host that SUPERVISES `sids`, each a Claude Code tab, with `body` as
-    /// every worker's loop, every act inert: another module's test of what a
-    /// seamless update's Commit does to the host's workers drives it (the
-    /// review of round eight's #18).
-    pub(crate) fn for_supervised_test(
-        sids: Vec<String>,
-        body: Arc<dyn Fn(&WorkerJob) -> BodyEnd + Send + Sync>,
+    /// [`Self::for_restored_test`] whose note of a restored agent's earlier
+    /// tab ([`Acts::earlier_tab`]) is recorded in `noted` — `(tab, was)` —
+    /// for a test of what the App's restore notes through it
+    /// (`App::say_restored_held`; the merge review's GUI-M7-2).
+    pub(crate) fn for_restored_test_noting(
+        act: Arc<RestoredFn>,
+        noted: Arc<Mutex<Vec<(String, String)>>>,
     ) -> Self {
-        let (wanted, open) = (sids.clone(), sids.clone());
         let mut acts = Acts::inert();
-        acts.open = Arc::new(move |sid| open.iter().any(|o| o == sid));
-        let hooks = Hooks {
-            roster: Arc::new(move || {
-                sids.iter()
-                    .map(|sid| (sid.clone(), Program::Claude, FollowStamp::default()))
-                    .collect()
-            }),
-            autopilot: Arc::new(HashMap::new),
-            still_wanted: Arc::new(move |sid, _| wanted.iter().any(|w| w == sid)),
-            body,
-            badge: Arc::new(|_, _| {}),
-            waiting: Arc::new(|_, _| {}),
-            fact: Arc::new(|_, _| {}),
-            placed: Arc::new(|_, _| {}),
-            claim_epoch: Arc::new(|| 0),
-            acts,
-            backoff: Arc::new(|_| Duration::from_millis(10)),
-            pause: Arc::new(|pause| pause / 1000),
-            upgrade_view: Arc::new(|_, _, _, _| ViewNext::default()),
-            disk: Arc::new(|_| {}),
-            note: Arc::new(|_| {}),
-        };
-        Self::start(SupervisorConfig::default(), false, false, hooks)
+        acts.earlier_tab = Arc::new(move |sid, was| {
+            noted
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((sid.to_string(), was.to_string()));
+        });
+        Self::restored_test_host_with(act, Arc::new(|_| false), acts)
     }
 
     /// A SEAMLESS UPDATE'S SUCCESSOR whose tabs are all open with no agent
@@ -17033,7 +20287,7 @@ impl HostHandle {
                     session: None,
                     cwd: "/".to_string(),
                     version: None,
-                    codex: None,
+                    run: aterm_agent::harness::relaunch::AgentRun::Claude,
                     dialect: None,
                     login: None,
                     home: None,
@@ -17068,6 +20322,7 @@ impl HostHandle {
                 }),
                 agent: aterm_agent::harness::upgrade::Agent::Claude,
                 crashed: None,
+                refused: false,
             })
         });
         let lands = Arc::clone(&landed);
@@ -17098,20 +20353,25 @@ impl HostHandle {
             badge: Arc::new(|_, _| {}),
             waiting: Arc::new(|_, _| {}),
             fact: Arc::new(|_, _| {}),
-            placed: Arc::new(|_, _| {}),
             claim_epoch: Arc::new(|| 0),
             acts,
             backoff: Arc::new(|_| Duration::from_millis(10)),
-            pause: Arc::new(|pause| pause / 1000),
+            pause: Arc::new(|pause| aterm_gui_timing::Timing::FAST.of(pause)),
             upgrade_view: Arc::new(|_, _, _, _| ViewNext::default()),
             disk: Arc::new(|_| {}),
+            codex_roster: Arc::new(Vec::new),
             note: Arc::new(|_| {}),
         };
         Self::start(SupervisorConfig::default(), false, true, hooks)
     }
 
     fn restored_test_host(act: Arc<RestoredFn>, open: Arc<WantedFn>) -> Self {
-        let mut acts = Acts::inert();
+        Self::restored_test_host_with(act, open, Acts::inert())
+    }
+
+    /// [`Self::restored_test_host`] over `acts` (every other act of theirs
+    /// kept).
+    fn restored_test_host_with(act: Arc<RestoredFn>, open: Arc<WantedFn>, mut acts: Acts) -> Self {
         acts.relaunch_restored = act;
         acts.open = open;
         let hooks = Hooks {
@@ -17122,13 +20382,13 @@ impl HostHandle {
             badge: Arc::new(|_, _| {}),
             waiting: Arc::new(|_, _| {}),
             fact: Arc::new(|_, _| {}),
-            placed: Arc::new(|_, _| {}),
             claim_epoch: Arc::new(|| 0),
             acts,
             backoff: Arc::new(|_| Duration::from_millis(10)),
-            pause: Arc::new(|pause| pause / 1000),
+            pause: Arc::new(|pause| aterm_gui_timing::Timing::FAST.of(pause)),
             upgrade_view: Arc::new(|_, _, _, _| ViewNext::default()),
             disk: Arc::new(|_| {}),
+            codex_roster: Arc::new(Vec::new),
             note: Arc::new(|_| {}),
         };
         Self::start(SupervisorConfig::default(), false, false, hooks)

@@ -10,7 +10,7 @@
 // (`OVERSHOOT_APRON_ROWS`; hence parentheses, pipes, underscores, descenders)
 // and wide cells riding the shift, in both directions.
 //
-// No GPU or no system font: no-op.
+// No GPU or no font: COULD NOT RUN.
 
 use aterm_core::terminal::Terminal;
 use aterm_gpu::{GpuRenderer, WindowGpu};
@@ -21,7 +21,7 @@ use crate::common;
 const ROWS: usize = 10;
 const COLS: usize = 32;
 
-/// A fresh GpuRenderer (or skip-marker), with lazy fallback parses settled so
+/// A fresh GpuRenderer (no GPU: COULD NOT RUN), with lazy fallback parses settled so
 /// every renderer rasterizes CJK identically, and the wall-clock heat shimmer
 /// off so two renders of one input can agree.
 fn fresh_gpu() -> GpuRenderer {

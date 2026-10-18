@@ -49,6 +49,21 @@ fn transcript(name: &str) -> &'static str {
 struct TranscriptHost {
     tails: std::sync::Mutex<VecDeque<Option<String>>>,
     asks: std::sync::atomic::AtomicUsize,
+    /// The host relaunches its agent ([`IdleHost::can_restart`]).
+    restartable: std::sync::atomic::AtomicBool,
+    /// The host wants a point ([`IdleHost::wants`]); off by default.
+    wanting: std::sync::atomic::AtomicBool,
+    /// The host's steps taken ([`IdleHost::at_idle`]).
+    steps: std::sync::atomic::AtomicUsize,
+    /// What withheld the host's step ([`IdleHost::withheld`]).
+    withheld: std::sync::Mutex<Vec<crate::supervise::Guard>>,
+    /// The re-reads within a decision ([`IdleHost::transcript_tail_again`]),
+    /// counted apart where [`Self::own_again`] is on; off, the trait's
+    /// default reads afresh (a fresh ask).
+    again: std::sync::atomic::AtomicUsize,
+    own_again: std::sync::atomic::AtomicBool,
+    /// The host stops wanting once it took a step ([`Self::wanting`]).
+    once: std::sync::atomic::AtomicBool,
 }
 
 impl TranscriptHost {
@@ -59,8 +74,24 @@ impl TranscriptHost {
         })
     }
 
+    /// Every read of the transcript, fresh or again.
     fn asks(&self) -> usize {
+        self.asks.load(Ordering::SeqCst) + self.again.load(Ordering::SeqCst)
+    }
+
+    /// The fresh reads alone ([`IdleHost::transcript_tail`]).
+    fn fresh(&self) -> usize {
         self.asks.load(Ordering::SeqCst)
+    }
+
+    /// The next tail of the queue (the last repeats).
+    fn next_tail(&self) -> Option<String> {
+        let mut tails = self.tails.lock().unwrap();
+        if tails.len() > 1 {
+            tails.pop_front().flatten()
+        } else {
+            tails.front().cloned().flatten()
+        }
     }
 
     /// From now on, every ask reads `tail` (`None`: none to read).
@@ -73,22 +104,39 @@ impl TranscriptHost {
 
 impl IdleHost for TranscriptHost {
     fn wants(&self) -> bool {
-        false
+        self.wanting.load(Ordering::SeqCst)
     }
     fn at_idle(&self) -> Option<HostStep> {
-        None
+        self.steps.fetch_add(1, Ordering::SeqCst);
+        if self.once.load(Ordering::SeqCst) {
+            self.wanting.store(false, Ordering::SeqCst);
+        }
+        Some(HostStep {
+            line: "upgrade step=carry-on".to_string(),
+            moved: true,
+            typed: Some(crate::supervise::policy::turn_end::HostTurn::CarryOn),
+            repeat: false,
+        })
+    }
+    fn withheld(&self, guard: crate::supervise::Guard) {
+        self.withheld.lock().unwrap().push(guard);
     }
     fn owns_turn_end(&self) -> bool {
         false
     }
+    fn can_restart(&self) -> bool {
+        self.restartable.load(Ordering::SeqCst)
+    }
     fn transcript_tail(&self) -> Option<String> {
         self.asks.fetch_add(1, Ordering::SeqCst);
-        let mut tails = self.tails.lock().unwrap();
-        if tails.len() > 1 {
-            tails.pop_front().flatten()
-        } else {
-            tails.front().cloned().flatten()
+        self.next_tail()
+    }
+    fn transcript_tail_again(&self) -> Option<String> {
+        if !self.own_again.load(Ordering::SeqCst) {
+            return self.transcript_tail();
         }
+        self.again.fetch_add(1, Ordering::SeqCst);
+        self.next_tail()
     }
 }
 
@@ -105,7 +153,7 @@ fn run_at(
     Mock,
     Vec<crate::supervise::journal::JournalRecord>,
 ) {
-    let mut m = Mock::new(true, vec![busy_screen(), wall]);
+    let mut m = Mock::new(vec![busy_screen(), wall]);
     m.vanish_after = Some(3);
     m.stall_sleep = Some(Duration::from_millis(5));
     run_mock(tag, m, host, continuing)
@@ -585,6 +633,125 @@ fn with_no_transcript_a_wall_under_a_tools_call_is_not_acted_on() {
     }
 }
 
+/// ATERM-KI-1015-14: with no transcript (a host with none to read, or no host: `aterm drive
+/// watch`, `aterm drive supervise`), a program's words behind one of Claude Code's own labels —
+/// a Monitor's event row, a hook's stderr or `systemMessage` (2.1.302, measured in the lab) — are
+/// no wall: nothing typed, nothing waited for, no line (the screen read no wall). On the base the
+/// event's row and the hooks' rows under the person's turn or a hook summary were acted on
+/// (`TYPED rule=auth-login@v1 /login`, `TYPED rule=context-compact@v1 /compact`; the first two
+/// measured with `aterm drive watch` against the lab), and the PostToolUse hook's row under a call
+/// was refused as an unconfirmed wall. CONTROL: Claude Code's own context wall under a Monitor's
+/// event is acted on as the screen reads it.
+#[test]
+fn with_no_transcript_a_programs_words_behind_a_vendor_label_are_not_acted_on() {
+    let spoofs = [
+        (
+            "monitor event, login",
+            fx::MONITOR_EVENT_LOGIN_PHRASE_MEASURED,
+        ),
+        (
+            "monitor event, context",
+            fx::MONITOR_EVENT_CONTEXT_PHRASE_MEASURED,
+        ),
+        (
+            "stop hook stderr",
+            fx::STOP_HOOK_STDERR_LOGIN_PHRASE_MEASURED,
+        ),
+        (
+            "stop hook message",
+            fx::STOP_HOOK_MESSAGE_LOGIN_PHRASE_MEASURED,
+        ),
+        (
+            "prompt hook message",
+            fx::PROMPT_HOOK_MESSAGE_CONTEXT_PHRASE_MEASURED,
+        ),
+        (
+            "post-tool hook message",
+            fx::POST_HOOK_MESSAGE_LOGIN_PHRASE_MEASURED,
+        ),
+    ];
+    let real = fx::screen(fx::MONITOR_EVENT_THEN_CONTEXT_WALL_MEASURED);
+    let mut wrong = Vec::new();
+    for none in [true, false] {
+        let host = || (!none).then(|| TranscriptHost::of(&[None]));
+        for (name, capture) in spoofs {
+            let (lines, m, records) = run_at("wc-label", fx::screen(capture), host(), false);
+            let acts = wall_acts(&lines, &records);
+            let said = refusals(&records);
+            if !acts.is_empty() || count(&m, "turn") != 0 || !said.is_empty() {
+                wrong.push(format!("{name} (no host: {none}): {acts:?} {said:?}"));
+            }
+        }
+        let (lines, _, records) = run_at("wc-label-real", real.clone(), host(), false);
+        let acts = wall_acts(&lines, &records);
+        assert!(
+            acts.first()
+                .is_some_and(|a| a.starts_with("TYPED rule=context-compact@v1 /compact")),
+            "the real wall under the event (no host: {none}): {acts:#?}"
+        );
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// ATERM-KI-1015-14, the review of the first pass: with no transcript, a hook's words drawn on a
+/// row of Claude Code's own with NO label (2.1.302, measured in the lab) are no wall — a Stop
+/// hook's `stopReason` under the hook summary, and a PostToolUse hook's blocking `reason` under
+/// its `… hook returned blocking error` row. Nothing typed, nothing waited for, no line. On the
+/// base, measured with `aterm drive watch` against the lab: `TYPED rule=auth-login@v1 /login`
+/// on the `stopReason`, and `LIMITED … WAITING … usage-session resets` (the session parked until
+/// the reset it named) on a double-spaced one; the reason under the call was refused as
+/// `read under a tool's call`. CONTROL: Claude Code's own context wall after the Stop hook's
+/// error row is acted on (`TYPED rule=context-compact@v1 /compact`, measured on the base too),
+/// also right under a Stop hook's `{"decision": "block", …}` behind the summary's label
+/// (measured after the fix, 2026-10-17).
+#[test]
+fn with_no_transcript_a_hooks_words_under_its_own_rows_are_not_acted_on() {
+    let spoofs = [
+        (
+            "stop reason, login",
+            fx::STOP_HOOK_STOP_REASON_LOGIN_PHRASE_MEASURED,
+        ),
+        (
+            "stop reason, context",
+            fx::STOP_HOOK_STOP_REASON_CONTEXT_PHRASE_MEASURED,
+        ),
+        (
+            "hook words, double space",
+            fx::STOP_HOOK_WORDS_DOUBLE_SPACE_LIMIT_PHRASE_MEASURED,
+        ),
+        (
+            "post-tool hook reason",
+            fx::POST_HOOK_BLOCKING_REASON_LOGIN_PHRASE_MEASURED,
+        ),
+    ];
+    let reals = [
+        fx::STOP_HOOK_ERROR_THEN_CONTEXT_WALL_302_MEASURED,
+        fx::STOP_HOOK_DECISION_BLOCK_THEN_CONTEXT_WALL_MEASURED,
+    ];
+    let mut wrong = Vec::new();
+    for none in [true, false] {
+        let host = || (!none).then(|| TranscriptHost::of(&[None]));
+        for (name, capture) in spoofs {
+            let (lines, m, records) = run_at("wc-hook", fx::screen(capture), host(), false);
+            let acts = wall_acts(&lines, &records);
+            let said = refusals(&records);
+            if !acts.is_empty() || count(&m, "turn") != 0 || !said.is_empty() {
+                wrong.push(format!("{name} (no host: {none}): {acts:?} {said:?}"));
+            }
+        }
+        for real in reals {
+            let (lines, _, records) = run_at("wc-hook-real", fx::screen(real), host(), false);
+            let acts = wall_acts(&lines, &records);
+            assert!(
+                acts.first()
+                    .is_some_and(|a| a.starts_with("TYPED rule=context-compact@v1 /compact")),
+                "the real wall after the hook's error row (no host: {none}): {acts:#?}"
+            );
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// A transcript read before Claude Code wrote the notice the screen shows (its newest entry the
 /// prompt, or the model's call) is read again, and the notice that lands meanwhile confirms the
 /// wall: `/compact`. Negative control: one that never catches up is read again `LAG_TRIES` times,
@@ -716,6 +883,126 @@ fn hosted_by(host: &Arc<TranscriptHost>) -> SuperviseOpts {
     }
 }
 
+/// THE HOST'S STEP WAITS AT THE WALL THE DECISION READ (the cross-lane
+/// review's XT-2): a refused request only the transcript names
+/// (`model_not_found`, its notice drawn like prose, which the screen alone
+/// names no wall) is the point's wall by its decision, and the host's gate
+/// reads that verdict: the step is withheld (`Guard::Wall`) — no upgrade
+/// restart or carry-on typed into a request the API refuses — and the gate
+/// asks the transcript nothing. NEGATIVE CONTROLS: no transcript, and the
+/// same words as the model's own reply (no notice): an ordinary idle point,
+/// the step offered.
+#[test]
+fn the_hosts_step_waits_at_the_wall_the_decision_read() {
+    const MODEL: &str = "There's an issue with the selected model (claude-opus-9). It may not exist or you may not have access to it. Run /model to pick a different model.";
+    let rows = ended_on(&[
+        "❯ carry on with the task",
+        "",
+        "⏺ There's an issue with the selected model (claude-opus-9). It may not exist or",
+        "  you may not have access to it. Run /model to pick a different model.",
+    ]);
+    let notice = notice_turn(MODEL, "model_not_found", true);
+    let reply = notice
+        .replace("\"isApiErrorMessage\":true", "\"isApiErrorMessage\":false")
+        .replace("\"<synthetic>\"", "\"claude-opus-5-5\"");
+    for (name, tail, wall) in [
+        ("the transcript's wall", Some(notice.as_str()), true),
+        ("no transcript", None, false),
+        ("the model's own words", Some(reply.as_str()), false),
+    ] {
+        let host = TranscriptHost::of(&[tail]);
+        let opts = hosted_by(&host);
+        let mut m = Mock::new(vec![rows.clone()]);
+        m.cursor_on_caret = true;
+        let mut heard = Noted::default();
+        let (offered, asked) = {
+            let mut s = session(&mut m, None);
+            let screen = s.screen().expect("the point");
+            let mut point = s.turn_of(screen);
+            let _ = s.turn_end_reading(&point.screen, None, &opts);
+            s.point_as_decided(&mut point);
+            let asked = host.asks();
+            host.wanting.store(true, Ordering::SeqCst);
+            let offered = s
+                .host_steps_here(&point, &opts, &mut false, &mut heard)
+                .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            (offered, asked)
+        };
+        let withheld = host.withheld.lock().unwrap().clone();
+        assert_eq!(offered, !wall, "{name}: {withheld:?}");
+        assert_eq!(
+            host.steps.load(Ordering::SeqCst),
+            usize::from(!wall),
+            "{name}"
+        );
+        if wall {
+            assert_eq!(withheld, [crate::supervise::Guard::Wall], "{name}");
+        } else {
+            assert!(withheld.is_empty(), "{name}: {withheld:?}");
+        }
+        assert_eq!(host.asks(), asked, "{name}: the gate asks nothing");
+    }
+}
+
+/// THE HOST'S STEP WAITS AT THE DECIDED WALL THROUGH A REPAINT (the decision
+/// review's RR-DEC-2): the point already handed over, read again at a moved
+/// seq (one footer character changed, nothing the point is made of), is not
+/// decided again, so the decision's verdict is carried to the new seq: the
+/// wall only the transcript named still withholds the host's step there.
+/// Without it the quiet upgrade restarted the agent at the refused request
+/// on the first repaint. NEGATIVE CONTROLS: no transcript, and the words as
+/// the model's own reply: the step is offered, once.
+#[test]
+fn the_hosts_step_waits_at_the_decided_wall_through_a_repaint() {
+    let rows = ended_on(&[
+        "❯ carry on with the task",
+        "",
+        "⏺ There's an issue with the selected model (claude-opus-9). It may not exist or",
+        "  you may not have access to it. Run /model to pick a different model.",
+    ]);
+    let mut ticked = rows.clone();
+    let footer = ticked
+        .iter_mut()
+        .rev()
+        .find(|r| r.contains("auto mode on"))
+        .expect("the footer");
+    *footer = footer.replace("for agents", "for agents ·");
+    const MODEL: &str = "There's an issue with the selected model (claude-opus-9). It may not exist or you may not have access to it. Run /model to pick a different model.";
+    let notice = notice_turn(MODEL, "model_not_found", true);
+    let reply = notice
+        .replace("\"isApiErrorMessage\":true", "\"isApiErrorMessage\":false")
+        .replace("\"<synthetic>\"", "\"claude-opus-5-5\"");
+    for (name, tail, wall) in [
+        ("the transcript's wall", Some(notice.as_str()), true),
+        ("no transcript", None, false),
+        ("the model's own words", Some(reply.as_str()), false),
+    ] {
+        let host = TranscriptHost::of(&[tail]);
+        host.wanting.store(true, Ordering::SeqCst);
+        host.once.store(true, Ordering::SeqCst);
+        let mut m = Mock::new(vec![busy_screen(), rows.clone(), ticked.clone()]);
+        m.cursor_on_caret = true;
+        m.vanish_after = Some(3);
+        m.stall_sleep = Some(Duration::from_millis(5));
+        let _ = run_mock("repaint-wall", m, Some(Arc::clone(&host)), false);
+        let withheld = host.withheld.lock().unwrap().clone();
+        let steps = host.steps.load(Ordering::SeqCst);
+        if wall {
+            assert_eq!(steps, 0, "{name}: {withheld:?}");
+            assert!(
+                withheld.contains(&crate::supervise::Guard::Wall),
+                "{name}: {withheld:?}"
+            );
+        } else {
+            assert_eq!(steps, 1, "{name}: {withheld:?}");
+            assert!(
+                !withheld.contains(&crate::supervise::Guard::Wall),
+                "{name}: {withheld:?}"
+            );
+        }
+    }
+}
+
 /// A refused limit decided again is an idle point: its escalation is the point's (`meta set
 /// attention`), and the journal holds one `unconfirmed wall` line for both reads.
 #[test]
@@ -726,7 +1013,7 @@ fn a_refused_limit_decided_again_is_an_idle_point_and_said_once() {
     ]);
     let host = TranscriptHost::of(&[Some(transcript("bash-output-wall-phrase"))]);
     let opts = hosted_by(&host);
-    let mut m = Mock::new(true, vec![wall]);
+    let mut m = Mock::new(vec![wall]);
     let mut noted = Noted::default();
     {
         let mut s = session(&mut m, None);
@@ -771,7 +1058,7 @@ fn the_seam_spares_the_banner_and_a_codex_and_reads_a_refused_limit_on_its_frame
     use super::super::wall_confirm::Check;
     let host = TranscriptHost::of(&[Some(transcript("bash-output-wall-phrase"))]);
     let opts = hosted_by(&host);
-    let mut m = Mock::new(true, vec![busy_screen()]);
+    let mut m = Mock::new(vec![busy_screen()]);
     let mut s = session(&mut m, None);
     let read = |rows: &[String]| aterm_phase::reader::read(Some("claude"), rows, Some(2));
     // The memory banner.
@@ -831,6 +1118,451 @@ fn the_seam_spares_the_banner_and_a_codex_and_reads_a_refused_limit_on_its_frame
     assert!(host.asks() > asked, "asked");
 }
 
+/// The 529 transcript's last turn with its notice's words `text`, its
+/// `error` word `error`, and no status: a notice of 2.1.300's that names no
+/// status (`model_not_found`, `account_on_hold`). `closed`: the
+/// `turn_duration` after it kept.
+fn notice_turn(text: &str, error: &str, closed: bool) -> String {
+    let rows: Vec<&str> = transcript("529").lines().collect();
+    let at = rows
+        .iter()
+        .rposition(|r| r.contains("\"isApiErrorMessage\":true"))
+        .expect("the notice");
+    let prompt = rows[..at]
+        .iter()
+        .rposition(|r| r.contains("\"type\":\"user\""))
+        .expect("its prompt");
+    let notice = rows[at];
+    let from = notice.find("API Error: Repeated 529").expect("the text");
+    let to = from + notice[from..].find('"').expect("its end");
+    let notice = format!("{}{text}{}", &notice[..from], &notice[to..])
+        .replace(
+            "\"error\":\"server_error\"",
+            &format!("\"error\":\"{error}\""),
+        )
+        .replace("\"apiErrorStatus\":529,", "");
+    let mut turn = rows[prompt..at].to_vec();
+    turn.push(&notice);
+    if closed {
+        turn.extend(
+            rows[at + 1..]
+                .iter()
+                .find(|r| r.contains("\"turn_duration\"")),
+        );
+    }
+    turn.join("\n")
+}
+
+/// A WALL THE SCREEN CANNOT NAME, NAMED BY THE TRANSCRIPT (2026-10-15): a
+/// model not found, as 2.1.300 draws it — its `⏺` bullet and the words at
+/// column 2, like prose, in a warning colour a row of text does not keep —
+/// reads no wall on the screen, and was answered `keep going` hourly for
+/// good. At a decision's read the session's transcript ends on Claude Code's
+/// own CLOSED notice whose words that row shows: the reading carries the
+/// wall the notice is (a refused request, on the `⏺` row, the notice's own
+/// words), and a read for the books of the same screen keeps it, asking
+/// nothing more. NEGATIVE CONTROLS: the same words as the model's own reply;
+/// the notice's turn still open (no `turn_duration`); a notice the screen
+/// does not show (the renderer hid it, or a `/resume`d conversation's older
+/// error under the screen's newer words); and no host: no wall, the
+/// ordinary turn end it was. The transcript is read ONCE where the row is
+/// shaped like prose (no lag re-reads), and again for its lag where it has
+/// the vendor's error row's own shape (`API Error …`).
+#[test]
+fn a_closed_notice_the_screen_cannot_name_is_the_decisions_wall() {
+    use super::super::wall_confirm::{Check, LAG_TRIES};
+    const MODEL: &str = "There's an issue with the selected model (claude-opus-9). It may not exist or you may not have access to it. Run /model to pick a different model.";
+    let shown = ended_on(&[
+        "❯ carry on with the task",
+        "",
+        "⏺ There's an issue with the selected model (claude-opus-9). It may not exist or",
+        "  you may not have access to it. Run /model to pick a different model.",
+    ]);
+    let read = |rows: &[String]| aterm_phase::reader::read(Some("claude"), rows, Some(2));
+    assert_eq!(read(&shown).wall, None, "the screen alone names none");
+    assert_eq!(read(&shown).phase, Phase::Idle);
+    let refused = aterm_phase::WallKind::ApiError {
+        code: None,
+        retryable: false,
+        cause: aterm_phase::ApiCause::Request,
+    };
+    let host = TranscriptHost::of(&[Some(&notice_turn(MODEL, "model_not_found", true))]);
+    let opts = hosted_by(&host);
+    let mut m = Mock::new(vec![busy_screen()]);
+    let mut s = session(&mut m, None);
+    let mut reading = read(&shown);
+    s.confirm_wall(&mut reading, &at(&shown, 1), &opts, Check::Decide);
+    let w = reading.wall.clone().expect("the transcript's wall");
+    assert_eq!(w.kind, refused);
+    assert_eq!(w.message, MODEL);
+    assert_eq!(w.placement, aterm_phase::Placement::ErrorRow);
+    assert!(shown[w.row].starts_with("⏺ There's an issue"));
+    assert_eq!(reading.phase, Phase::Idle, "an API error reads idle");
+    assert_eq!(host.asks(), 1, "read once: the row is shaped like prose");
+    let mut again = read(&shown);
+    s.confirm_wall(&mut again, &at(&shown, 1), &opts, Check::AsDecided);
+    assert_eq!(again.wall.map(|w| w.kind), Some(refused), "the books' read");
+    assert_eq!(host.asks(), 1, "the books' read asks nothing");
+    // NEGATIVE CONTROLS.
+    let notice = notice_turn(MODEL, "model_not_found", true);
+    let reply = notice
+        .replace("\"isApiErrorMessage\":true", "\"isApiErrorMessage\":false")
+        .replace("\"<synthetic>\"", "\"claude-opus-5-5\"");
+    let hidden = ended_on(&[
+        "❯ carry on with the task",
+        "",
+        "⏺ Hi! I am the local lab stub, not a model. (reply 3)",
+    ]);
+    for (seq, (name, rows, tail)) in [
+        ("the model's own words", &shown, Some(reply)),
+        (
+            "a turn still open",
+            &shown,
+            Some(notice_turn(MODEL, "model_not_found", false)),
+        ),
+        ("a notice the screen does not show", &hidden, Some(notice)),
+        ("no transcript", &shown, None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let host = TranscriptHost::of(&[tail.as_deref()]);
+        let opts = hosted_by(&host);
+        let mut reading = read(rows);
+        s.confirm_wall(
+            &mut reading,
+            &at(rows, 10 + seq as u64),
+            &opts,
+            Check::Decide,
+        );
+        assert_eq!(reading.wall, None, "{name}");
+        assert_eq!(reading.phase, Phase::Idle, "{name}");
+    }
+    // The error row's own shape (a notice and its remedy joined by ` · `,
+    // 2.1.300's apiKeyHelper row, which no table names), the transcript not
+    // caught up: read again for its lag, then nothing named.
+    let helper = ended_on(&[
+        "❯ carry on with the task",
+        "",
+        "⏺ Your apiKeyHelper script is failing · This usually means you need to re-authenticate",
+    ]);
+    assert_eq!(read(&helper).wall, None, "no table names it");
+    let lagging = notice_turn(MODEL, "model_not_found", false)
+        .lines()
+        .take_while(|r| !r.contains("\"isApiErrorMessage\""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let host = TranscriptHost::of(&[Some(&lagging)]);
+    let opts = hosted_by(&host);
+    let mut reading = read(&helper);
+    s.confirm_wall(&mut reading, &at(&helper, 20), &opts, Check::Decide);
+    assert_eq!(reading.wall, None);
+    assert!(
+        host.asks() > LAG_TRIES as usize,
+        "read again for its lag: {}",
+        host.asks()
+    );
+    // A row the table reads as no wall (a request stopped with Esc, which
+    // writes no `turn_duration`): not read at all, nothing slept on.
+    let aborted = ended_on(&[
+        "❯ carry on with the task",
+        "",
+        "⏺ API Error: Request was aborted.",
+    ]);
+    let host = TranscriptHost::of(&[Some(&lagging)]);
+    let opts = hosted_by(&host);
+    let mut reading = read(&aborted);
+    assert_eq!(reading.wall, None);
+    s.confirm_wall(&mut reading, &at(&aborted, 21), &opts, Check::Decide);
+    assert_eq!(reading.wall, None);
+    assert_eq!(host.asks(), 0, "an aborted request is not asked about");
+}
+
+/// [`notice_turn`] with the typed `apiError` `api` (`None`: none), as
+/// 2.1.300 writes it on the notice's own row.
+fn typed_turn(text: &str, error: &str, api: Option<&str>, closed: bool) -> String {
+    let turn = notice_turn(text, error, closed);
+    match api {
+        Some(kind) => turn.replace(
+            "\"isApiErrorMessage\":true",
+            &format!("\"isApiErrorMessage\":true,\"apiError\":\"{kind}\""),
+        ),
+        None => turn,
+    }
+}
+
+/// THE SCREEN'S UNNAMED `API Error`, NAMED AT THE DECISION (the review of
+/// 2026-10-15): `API Error: <the server's words>` with no status, which the
+/// table names nothing of, reads on the screen as the server's — retried 1,
+/// 5, 15, 30 minutes, then hourly for good, nobody told — and the
+/// transcript confirmed it by its `error` word alone, so the vendor's typed
+/// fields were never read for it. Now the decision's read names it by the
+/// notice that confirmed it: a DLP policy's refusal (`dlp_request_denied`)
+/// and the model fallback's model not found (`model_not_found`, `API Error
+/// (<model>): … Try /model to switch to …`) are refused requests, on the
+/// screen's own row, and a read for the books of the same screen keeps it,
+/// asking nothing more. NEGATIVE CONTROLS: the same screen under an
+/// `unknown` notice stays the server's; with no transcript (the hostless
+/// path) the screen's words alone decide, the server's.
+#[test]
+fn a_confirmed_unnamed_api_error_is_named_by_its_notice_at_the_decision() {
+    use super::super::wall_confirm::Check;
+    const DLP: &str = "API Error: Request blocked by your organization's policy.";
+    const FALLBACK: &str =
+        "API Error (claude-opus-9): model: claude-opus-9. Try /model to switch to Opus 5.5.";
+    let server = aterm_phase::WallKind::ApiError {
+        code: None,
+        retryable: true,
+        cause: aterm_phase::ApiCause::Server,
+    };
+    let refused = aterm_phase::WallKind::ApiError {
+        code: None,
+        retryable: false,
+        cause: aterm_phase::ApiCause::Request,
+    };
+    let read = |rows: &[String]| aterm_phase::reader::read(Some("claude"), rows, Some(2));
+    let shown = |text: &str| ended_on(&["❯ carry on with the task", "", &format!("⏺ {text}")]);
+    let mut m = Mock::new(vec![busy_screen()]);
+    let mut s = session(&mut m, None);
+    for (seq, (text, error, api)) in [
+        (DLP, "invalid_request", Some("dlp_request_denied")),
+        (FALLBACK, "model_not_found", None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let rows = shown(text);
+        let screen = read(&rows).wall.expect("the screen reads a wall");
+        assert_eq!(screen.kind, server, "{text}: the screen alone");
+        let host = TranscriptHost::of(&[Some(&typed_turn(text, error, api, true))]);
+        let opts = hosted_by(&host);
+        let seq = 1 + seq as u64;
+        let mut reading = read(&rows);
+        s.confirm_wall(&mut reading, &at(&rows, seq), &opts, Check::Decide);
+        let w = reading.wall.clone().expect("confirmed");
+        assert_eq!(w.kind, refused, "{text}");
+        assert_eq!(
+            (w.row, w.message.as_str(), w.placement),
+            (screen.row, screen.message.as_str(), screen.placement),
+            "{text}: the screen's own row and words"
+        );
+        assert_eq!(
+            reading.phase,
+            Phase::Idle,
+            "{text}: an API error reads idle"
+        );
+        let asked = host.asks();
+        let mut again = read(&rows);
+        s.confirm_wall(&mut again, &at(&rows, seq), &opts, Check::AsDecided);
+        assert_eq!(
+            again.wall.map(|w| w.kind),
+            Some(refused),
+            "{text}: the books' read"
+        );
+        assert_eq!(host.asks(), asked, "{text}: the books' read asks nothing");
+    }
+    // NEGATIVE CONTROLS.
+    let rows = shown(DLP);
+    let host = TranscriptHost::of(&[Some(&typed_turn(DLP, "unknown", None, true))]);
+    let opts = hosted_by(&host);
+    let mut reading = read(&rows);
+    s.confirm_wall(&mut reading, &at(&rows, 10), &opts, Check::Decide);
+    assert_eq!(
+        reading.wall.map(|w| w.kind),
+        Some(server),
+        "an unknown notice"
+    );
+    let host = TranscriptHost::of(&[None]);
+    let opts = hosted_by(&host);
+    let mut reading = read(&rows);
+    s.confirm_wall(&mut reading, &at(&rows, 11), &opts, Check::Decide);
+    assert_eq!(reading.wall.map(|w| w.kind), Some(server), "no transcript");
+    // An older DLP notice, still the newest entry: a prompt command's rows
+    // (`<command-message>`, its meta prompt) are passed over, and the
+    // notice its request met (`API Error: terminated`, the server's) is not
+    // written yet. It confirms the class; it names nothing of the newer row.
+    let rows = shown("API Error: terminated");
+    let older = format!(
+        "{}\n{}\n{}",
+        typed_turn(DLP, "invalid_request", Some("dlp_request_denied"), true),
+        r#"{"parentUuid":"p","isSidechain":false,"type":"user","message":{"role":"user","content":"<command-message>review</command-message>\n<command-name>/review</command-name>"},"uuid":"cmd-1","timestamp":"2026-10-15T10:00:00.000Z"}"#,
+        r#"{"parentUuid":"cmd-1","isSidechain":false,"type":"user","isMeta":true,"message":{"role":"user","content":[{"type":"text","text":"Review the diff."}]},"uuid":"cmd-2","timestamp":"2026-10-15T10:00:00.001Z"}"#,
+    );
+    let host = TranscriptHost::of(&[Some(&older)]);
+    let opts = hosted_by(&host);
+    let mut reading = read(&rows);
+    s.confirm_wall(&mut reading, &at(&rows, 12), &opts, Check::Decide);
+    assert_eq!(
+        reading.wall.map(|w| w.kind),
+        Some(server),
+        "an older notice than the row shown"
+    );
+}
+
+/// A NOTICE THE SCREEN SHOWS WHOSE TURN IS NOT CLOSED YET (the review of
+/// 013c9446a): Claude Code writes the `turn_duration` 1 to 14 ms after the
+/// notice, and a read can fall between the two. Read then, a model not
+/// found drawn like prose was an ordinary turn end: the continuation typed
+/// into it, and after a retry its refused request's track dropped and its
+/// ladder started over. Now the notice the row shows is read again until
+/// its turn closes, whether the first read found it open or the read again
+/// for the turn's input did. NEGATIVE CONTROLS: a
+/// notice that stays open is read [`LAG_TRIES`] times more, no more, and
+/// names nothing; an open notice the screen does not show is read once.
+#[test]
+fn a_notice_the_screen_shows_is_read_until_its_turn_closes() {
+    use super::super::wall_confirm::{Check, LAG_TRIES};
+    const MODEL: &str = "There's an issue with the selected model (claude-opus-9). It may not exist or you may not have access to it. Run /model to pick a different model.";
+    let shown = ended_on(&[
+        "❯ carry on with the task",
+        "",
+        "⏺ There's an issue with the selected model (claude-opus-9). It may not exist or",
+        "  you may not have access to it. Run /model to pick a different model.",
+    ]);
+    let read = |rows: &[String]| aterm_phase::reader::read(Some("claude"), rows, Some(2));
+    let closed = notice_turn(MODEL, "model_not_found", true);
+    let open = notice_turn(MODEL, "model_not_found", false);
+    let prompt = closed
+        .lines()
+        .take_while(|r| !r.contains("\"isApiErrorMessage\""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let refused = Some(aterm_phase::WallKind::ApiError {
+        code: None,
+        retryable: false,
+        cause: aterm_phase::ApiCause::Request,
+    });
+    let mut m = Mock::new(vec![busy_screen()]);
+    let mut s = session(&mut m, None);
+    for (seq, (name, tails, asks)) in [
+        (
+            "open, then closed",
+            vec![Some(open.as_str()), Some(&closed)],
+            2,
+        ),
+        (
+            "the prompt, open, then closed",
+            vec![Some(prompt.as_str()), Some(&open), Some(&closed)],
+            3,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let host = TranscriptHost::of(&tails);
+        let opts = hosted_by(&host);
+        let mut reading = read(&shown);
+        s.confirm_wall(
+            &mut reading,
+            &at(&shown, 1 + seq as u64),
+            &opts,
+            Check::Decide,
+        );
+        assert_eq!(reading.wall.map(|w| w.kind), refused, "{name}");
+        assert_eq!(host.asks(), asks, "{name}");
+    }
+    // THE RE-READS ASK THE FILE, NEVER THE AGENT (XT-4): one fresh read for
+    // the decision, the rest again. CONTROL: the trait's default, all fresh.
+    for own_again in [true, false] {
+        let host = TranscriptHost::of(&[Some(prompt.as_str()), Some(&open), Some(&closed)]);
+        host.own_again.store(own_again, Ordering::SeqCst);
+        let opts = hosted_by(&host);
+        let mut reading = read(&shown);
+        s.confirm_wall(
+            &mut reading,
+            &at(&shown, 5 + u64::from(own_again)),
+            &opts,
+            Check::Decide,
+        );
+        assert_eq!(reading.wall.map(|w| w.kind), refused, "{own_again}");
+        assert_eq!(host.fresh(), if own_again { 1 } else { 3 }, "{own_again}");
+        assert_eq!(host.asks(), 3, "{own_again}");
+    }
+    // NEGATIVE CONTROLS.
+    let host = TranscriptHost::of(&[Some(&open)]);
+    let opts = hosted_by(&host);
+    let mut reading = read(&shown);
+    s.confirm_wall(&mut reading, &at(&shown, 10), &opts, Check::Decide);
+    assert_eq!(reading.wall, None, "a notice that stays open");
+    assert_eq!(
+        host.asks(),
+        1 + LAG_TRIES as usize,
+        "a notice that stays open"
+    );
+    let other = notice_turn(
+        "Your account is on hold. Visit claude.ai/restricted for details.",
+        "account_on_hold",
+        false,
+    );
+    let host = TranscriptHost::of(&[Some(&other)]);
+    let opts = hosted_by(&host);
+    let mut reading = read(&shown);
+    s.confirm_wall(&mut reading, &at(&shown, 11), &opts, Check::Decide);
+    assert_eq!(reading.wall, None, "a notice the screen does not show");
+    assert_eq!(host.asks(), 1, "a notice the screen does not show");
+}
+
+/// A NOTICE DRAWN LIKE PROSE THAT THE TRANSCRIPT HAS NOT WRITTEN YET (the
+/// review of 2026-10-15): the hosted loop decides the moment the busy row
+/// leaves, and the notice reaches the transcript 70-110 ms after the screen
+/// draws it. Where the screen's last thing said is a `⏺` row shaped like
+/// prose (a model not found) and the transcript still ends, open, on the
+/// turn's own input (its prompt), nothing the screen says after it is
+/// written yet: it is read again ONCE, and the notice found then is the
+/// wall. A transcript that stays on the prompt is read twice, no more.
+/// NEGATIVE CONTROL: the model's reply already written (its turn not yet
+/// closed, an ordinary turn end) is read once, with no sleep.
+#[test]
+fn a_notice_drawn_like_prose_the_transcript_has_not_written_is_read_again_once() {
+    use super::super::wall_confirm::Check;
+    const MODEL: &str = "There's an issue with the selected model (claude-opus-9). It may not exist or you may not have access to it. Run /model to pick a different model.";
+    let shown = ended_on(&[
+        "❯ carry on with the task",
+        "",
+        "⏺ There's an issue with the selected model (claude-opus-9). It may not exist or",
+        "  you may not have access to it. Run /model to pick a different model.",
+    ]);
+    let read = |rows: &[String]| aterm_phase::reader::read(Some("claude"), rows, Some(2));
+    let closed = notice_turn(MODEL, "model_not_found", true);
+    let prompt = closed
+        .lines()
+        .take_while(|r| !r.contains("\"isApiErrorMessage\""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut m = Mock::new(vec![busy_screen()]);
+    let mut s = session(&mut m, None);
+    let host = TranscriptHost::of(&[Some(&prompt), Some(&closed)]);
+    let opts = hosted_by(&host);
+    let mut reading = read(&shown);
+    s.confirm_wall(&mut reading, &at(&shown, 1), &opts, Check::Decide);
+    assert_eq!(
+        reading.wall.map(|w| w.kind),
+        Some(aterm_phase::WallKind::ApiError {
+            code: None,
+            retryable: false,
+            cause: aterm_phase::ApiCause::Request,
+        }),
+        "found on the second read"
+    );
+    assert_eq!(host.asks(), 2);
+    let host = TranscriptHost::of(&[Some(&prompt)]);
+    let opts = hosted_by(&host);
+    let mut reading = read(&shown);
+    s.confirm_wall(&mut reading, &at(&shown, 2), &opts, Check::Decide);
+    assert_eq!(reading.wall, None, "still on the prompt");
+    assert_eq!(host.asks(), 2, "once more, no more");
+    // NEGATIVE CONTROL.
+    let reply = notice_turn(MODEL, "model_not_found", false)
+        .replace("\"isApiErrorMessage\":true", "\"isApiErrorMessage\":false")
+        .replace("\"<synthetic>\"", "\"claude-opus-5-5\"");
+    let host = TranscriptHost::of(&[Some(&reply)]);
+    let opts = hosted_by(&host);
+    let mut reading = read(&shown);
+    s.confirm_wall(&mut reading, &at(&shown, 3), &opts, Check::Decide);
+    assert_eq!(reading.wall, None, "the model's reply");
+    assert_eq!(host.asks(), 1, "an ordinary turn end is read once");
+}
+
 /// A wall whose call row is above the rows read (an MCP result's weekly-limit words on a 50-row
 /// pane, the call at row 9, the tail rows 10-49) is judged on the whole grid, read once after the
 /// tail: under the call, refused with no transcript, nothing waited for, one line. Control: the
@@ -846,7 +1578,7 @@ fn a_wall_whose_call_is_above_the_rows_read_is_judged_on_the_whole_screen() {
     let mut worker = screen.clone();
     worker[call] = "⏺ The tracker's issue 7, as it stands:".to_string();
     let mock = |rows: &[String]| {
-        let mut m = Mock::new(true, vec![busy_screen(), rows.to_vec()]);
+        let mut m = Mock::new(vec![busy_screen(), rows.to_vec()]);
         m.cursor_on_caret = true;
         m.vanish_after = Some(3);
         m.stall_sleep = Some(Duration::from_millis(5));
@@ -945,7 +1677,7 @@ fn a_whole_read_that_fails_or_reads_another_wall_counts_as_under_a_call() {
     // (`None`: the read fails).
     let stands = |grid: Option<Vec<String>>| -> bool {
         let failed = grid.is_none();
-        let mut m = Mock::new(true, vec![grid.unwrap_or_else(busy_screen)]);
+        let mut m = Mock::new(vec![grid.unwrap_or_else(busy_screen)]);
         m.cursor_on_caret = true;
         if failed {
             m.down = Some((0, err("no such session")));
@@ -1018,15 +1750,12 @@ fn a_refused_wall_is_said_again_once_it_went_away() {
     let host = TranscriptHost::of(&[Some(transcript("mcp-wall-phrase"))]);
     let opts = hosted_by(&host);
     let idle = ended_on(&["❯ /clear", "  ⎿  (no content)"]);
-    let mut m = Mock::new(
-        true,
-        vec![
-            spoof("❯ first try"),
-            spoof("❯ first try"),
-            idle,
-            spoof("❯ second try"),
-        ],
-    );
+    let mut m = Mock::new(vec![
+        spoof("❯ first try"),
+        spoof("❯ first try"),
+        idle,
+        spoof("❯ second try"),
+    ]);
     let mut noted = Noted::default();
     {
         let mut s = session(&mut m, None);
@@ -1070,21 +1799,53 @@ fn a_refused_wall_is_said_again_once_it_went_away() {
 #[test]
 fn a_refused_wall_met_again_after_a_live_turn_is_said_again() {
     let host = TranscriptHost::of(&[Some(transcript("mcp-wall-phrase"))]);
-    let mut m = Mock::new(
-        true,
-        vec![
-            busy_screen(),
-            spoof("❯ first try"),
-            busy_screen(),
-            spoof("❯ second try"),
-        ],
-    );
+    let mut m = Mock::new(vec![
+        busy_screen(),
+        spoof("❯ first try"),
+        busy_screen(),
+        spoof("❯ second try"),
+    ]);
     m.vanish_after = Some(3);
     m.stall_sleep = Some(Duration::from_millis(5));
     let (lines, m, records) = run_mock("wc-live-turn", m, Some(host), false);
     assert_eq!(count(&m, "turn"), 0, "{:#?}", m.requests);
     let said = refusals(&records);
     assert_eq!(said.len(), 2, "{said:#?}\n{lines:#?}");
+}
+
+/// A LAG RE-READ THAT READS NOTHING REFUSES THE WALL, as a fresh read that
+/// failed did (XT-4: the re-read asks only the file, `transcript_tail_again`):
+/// a full context's transcript not caught up, its re-read answering none —
+/// the wall is refused, fail-closed. CONTROL: re-read to the notice, it is
+/// the decision's wall.
+#[test]
+fn a_lag_re_read_that_reads_nothing_refuses_the_wall() {
+    use super::super::wall_confirm::Check;
+    let full = transcript("context");
+    let rows: Vec<&str> = full.lines().collect();
+    let notice = rows
+        .iter()
+        .position(|r| r.contains("\"isApiErrorMessage\":true"))
+        .expect("the notice");
+    let lagging = rows[..notice].join("\n");
+    let shown = fx::screen(fx::MULTI_PARAGRAPH_PROMPT_CONTEXT_WALL_MEASURED);
+    let mut m = Mock::new(vec![busy_screen()]);
+    let mut s = session(&mut m, None);
+    for (seq, (then, stands)) in [(None, false), (Some(full), true)].into_iter().enumerate() {
+        let host = TranscriptHost::of(&[Some(lagging.as_str()), then]);
+        host.own_again.store(true, Ordering::SeqCst);
+        let opts = hosted_by(&host);
+        let mut reading = aterm_phase::reader::read(Some("claude"), &shown, Some(2));
+        assert!(reading.wall.is_some(), "the screen's wall");
+        s.confirm_wall(
+            &mut reading,
+            &at(&shown, 1 + seq as u64),
+            &opts,
+            Check::Decide,
+        );
+        assert_eq!(reading.wall.is_some(), stands, "{then:?}");
+        assert_eq!(host.fresh(), 1, "one fresh read");
+    }
 }
 
 /// A decision's read always asks again, the screen unmoved: a full context refused while its
@@ -1104,10 +1865,9 @@ fn a_point_decided_again_on_an_unmoved_screen_asks_the_transcript_again() {
     tails.push(Some(full));
     let host = TranscriptHost::of(&tails);
     let opts = hosted_by(&host);
-    let mut m = Mock::new(
-        true,
-        vec![fx::screen(fx::MULTI_PARAGRAPH_PROMPT_CONTEXT_WALL_MEASURED)],
-    );
+    let mut m = Mock::new(vec![fx::screen(
+        fx::MULTI_PARAGRAPH_PROMPT_CONTEXT_WALL_MEASURED,
+    )]);
     // The screen sits, its seq unmoved, until something is typed.
     m.turn_releases = Some(0);
     let mut noted = Noted::default();
@@ -1158,10 +1918,9 @@ fn the_books_read_after_an_act_asks_the_transcript_nothing() {
         Some(transcript("bash-output-wall-phrase")),
     ]);
     let opts = hosted_by(&host);
-    let mut m = Mock::new(
-        true,
-        vec![fx::screen(fx::MULTI_PARAGRAPH_PROMPT_CONTEXT_WALL_MEASURED)],
-    );
+    let mut m = Mock::new(vec![fx::screen(
+        fx::MULTI_PARAGRAPH_PROMPT_CONTEXT_WALL_MEASURED,
+    )]);
     let mut noted = Noted::default();
     {
         let mut s = session(&mut m, None);
@@ -1209,6 +1968,142 @@ fn a_limit_still_stands_after_a_persons_local_commands() {
     assert!(host.asks() >= 1);
 }
 
+/// WHICH LIMIT THE TRANSCRIPT NAMES (KI-1015-1 W3, measured on 2.1.300: the
+/// footer's generic `⚠ Usage limit reached · …` over a model's bucket read
+/// as a session limit, the fallback never run). The footer draws the generic
+/// notice and no row of the turn names a limit (the agent's message is the
+/// last thing said); the transcript's newest entry is the 429 the bucket
+/// wrote (`You've hit your Sonnet limit · …`, `rateLimitType`
+/// `seven_day_sonnet`: the lab's measured weekly row in a bucket's words).
+/// The decision's wall is the bucket, in the row's words: under the default
+/// `model_fallback = "opus"` and a host that relaunches, the agent is
+/// relaunched on Opus. The books' read of the same screen keeps it — the
+/// transcript not asked again — and the point's `limited` phase carries the
+/// row's words, the screen's reset. Words that name no model (`You've hit
+/// your limit · …`) carry the bucket's type: a `seven_day_sonnet` one is
+/// relaunched on Opus, a `seven_day_opus` one waits, the fallback being the
+/// model at its limit. NEGATIVE CONTROL: the same footer over a
+/// session limit's row (`five_hour`) is the screen's own wall, its words,
+/// waited out to its reset: no restart.
+#[test]
+fn the_transcript_names_the_limit_a_generic_footer_does_not() {
+    let weekly = transcript("weekly-limit");
+    let written = |words: &str, kind: &str| {
+        weekly
+            .replace(
+                "You've hit your weekly limit · resets Oct 11 at 9:35am (America/Los_Angeles)",
+                words,
+            )
+            .replace(
+                "\"rateLimitType\":\"seven_day\"",
+                &format!("\"rateLimitType\":\"{kind}\""),
+            )
+    };
+    let mut rows = ended_on(&["⏺ Picking the parser back up after the tests."]);
+    let footer = rows.len() - 1;
+    rows.insert(
+        footer,
+        "  ⚠ Usage limit reached · limit resets 6pm".to_string(),
+    );
+    let decide = |tail: String| {
+        let host = TranscriptHost::of(&[Some(tail.as_str())]);
+        host.restartable.store(true, Ordering::SeqCst);
+        let opts = hosted_by(&host);
+        let mut m = Mock::new(vec![rows.clone()]);
+        let mut s = session(&mut m, None);
+        // 17:05 PDT: the done row's `9:59 AM` this morning, `6pm` ahead.
+        s.set_clock(TEST_NOW + 8 * 3600 + 10 * 60, PDT);
+        let mut point = point_at(&mut s, rows.clone(), 7);
+        assert!(
+            matches!(&point.phase, Phase::Limited { message, .. } if message.contains("Usage limit reached")),
+            "the screen reads the generic footer: {:?}",
+            point.phase
+        );
+        let action = s
+            .turn_end_at_point(&point, None, &opts)
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        let asks = host.asks();
+        let books = s.turn_end_reread(&point.screen, &opts);
+        assert_eq!(host.asks(), asks, "the books' read asked nothing");
+        s.point_as_decided(&mut point);
+        (action, books.wall, books.wall_message, point.phase)
+    };
+    let (action, wall, message, phase) = decide(written(
+        "You've hit your Sonnet limit · resets 6pm (America/Los_Angeles)",
+        "seven_day_sonnet",
+    ));
+    assert!(
+        matches!(
+            &action,
+            TurnEndAction::Restart { why: crate::supervise::policy::turn_end::Restart::Model { to }, .. } if to == "opus"
+        ),
+        "{action:?}"
+    );
+    assert_eq!(
+        wall,
+        Some(aterm_phase::WallKind::ModelBucket { consent: false })
+    );
+    assert_eq!(
+        message,
+        "You've hit your Sonnet limit · resets 6pm (America/Los_Angeles)"
+    );
+    assert_eq!(
+        phase,
+        Phase::Limited {
+            message: message.clone(),
+            reset: Some("6pm".to_string()),
+        }
+    );
+    // WORDS THAT NAME NO MODEL, the bucket's type naming it: the model rides
+    // the wall's message. A Sonnet bucket's is relaunched on Opus; an Opus
+    // bucket's — the default fallback the very model at its limit — waits
+    // for its reset (the review of LIM-4: it was relaunched onto Opus).
+    let (action, wall, message, _) = decide(written(
+        "You've hit your limit · resets 6pm (America/Los_Angeles)",
+        "seven_day_sonnet",
+    ));
+    assert!(
+        matches!(
+            &action,
+            TurnEndAction::Restart { why: crate::supervise::policy::turn_end::Restart::Model { to }, .. } if to == "opus"
+        ),
+        "{action:?}"
+    );
+    assert_eq!(
+        wall,
+        Some(aterm_phase::WallKind::ModelBucket { consent: false })
+    );
+    assert!(message.ends_with("seven_day_sonnet"), "{message}");
+    let (action, wall, message, _) = decide(written(
+        "You've hit your limit · resets 6pm (America/Los_Angeles)",
+        "seven_day_opus",
+    ));
+    assert!(
+        matches!(&action, TurnEndAction::WaitUntil { .. }),
+        "the fallback is the bucket at its limit: {action:?}"
+    );
+    assert_eq!(
+        wall,
+        Some(aterm_phase::WallKind::ModelBucket { consent: false })
+    );
+    assert!(message.ends_with("seven_day_opus"), "{message}");
+    // NEGATIVE CONTROL: a session limit's row.
+    let (action, wall, message, phase) = decide(written(
+        "You've hit your session limit · resets 6pm (America/Los_Angeles)",
+        "five_hour",
+    ));
+    assert!(
+        matches!(&action, TurnEndAction::WaitUntil { .. }),
+        "{action:?}"
+    );
+    assert_eq!(wall, Some(aterm_phase::WallKind::UsageSession));
+    assert!(message.contains("Usage limit reached"), "{message}");
+    assert!(
+        matches!(&phase, Phase::Limited { message, .. } if message.contains("Usage limit reached")),
+        "{phase:?}"
+    );
+}
+
 /// `rows` as a point the loop reads: the whole screen at `seq`, the cursor at
 /// the composer's column.
 fn point_at(s: &mut Session<'_, Mock>, rows: Vec<String>, seq: u64) -> Turn {
@@ -1218,6 +2113,29 @@ fn point_at(s: &mut Session<'_, Mock>, rows: Vec<String>, seq: u64) -> Turn {
         cursor_col: 2,
         ..Screen::default()
     })
+}
+
+/// Whether `a` WAITS ON THE RESET OF THE LIMIT `s` waits on
+/// ([`TurnEndState::waited_limit`]): a wait due at that reset or past it (its
+/// grace, the vendor's net). Read off the policy's state and the wait's
+/// time, never the wait's words.
+fn waits_on_the_reset(s: &Session<'_, Mock>, a: &TurnEndAction) -> bool {
+    s.turn_end
+        .waited_limit()
+        .is_some_and(|w| matches!(a, TurnEndAction::WaitUntil { until, .. } if *until >= w.at))
+}
+
+/// Whether `a` is THE CONTINUE POLICY'S BACK-OFF after short turns, at a
+/// point `s` decided between `before` and `after`: no reset waited on, and a
+/// wait due one short turn's back-off past the point at the least, a
+/// streak's doublings of it at the most ([`TurnEndTiming::short_backoff`],
+/// [`TurnEndTiming::short_backoff_max`]). Read off the policy's state and
+/// the wait's time, never the wait's words.
+fn backs_off(s: &Session<'_, Mock>, a: &TurnEndAction, before: Instant, after: Instant) -> bool {
+    let t = &s.turn_end.timing;
+    !s.turn_end.waits_on_named_reset()
+        && matches!(a, TurnEndAction::WaitUntil { until, retry: false, .. }
+            if *until >= before + t.short_backoff && *until <= after + t.short_backoff_max)
 }
 
 /// A person's turn the transcript holds ends a left limit's wait: after a confirmed five-hour
@@ -1271,7 +2189,7 @@ fn a_persons_turn_the_transcript_holds_ends_a_left_limits_wait() {
             },
             ..auto(30, None)
         };
-        let mut m = Mock::new(true, vec![armed.clone()]);
+        let mut m = Mock::new(vec![armed.clone()]);
         let mut s = session(&mut m, Some("@s-1".to_string()));
         let wall = point_at(&mut s, armed.clone(), 101);
         assert!(
@@ -1290,30 +2208,26 @@ fn a_persons_turn_the_transcript_holds_ends_a_left_limits_wait() {
         let a = s
             .turn_end_at_point(&left, None, &opts)
             .unwrap_or_else(|e| panic!("{e:?}"));
-        assert!(
-            matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("usage-session resets")),
-            "the left limit's wait: {a:?}"
-        );
+        assert!(waits_on_the_reset(&s, &a), "the left limit's wait: {a:?}");
         host.reads(after);
         let point = point_at(&mut s, turned.clone(), 103);
-        s.turn_end_at_point(&point, None, &opts)
-            .unwrap_or_else(|e| panic!("{e:?}"))
+        let before = Instant::now();
+        let a = s
+            .turn_end_at_point(&point, None, &opts)
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        let after = Instant::now();
+        let (on_reset, backed) = (waits_on_the_reset(&s, &a), backs_off(&s, &a, before, after));
+        (a, on_reset, backed)
     };
-    let a = decided(Some(measured));
-    assert!(
-        matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("short turn")),
-        "the continue policy's back-off: {a:?}"
-    );
+    let (a, _, backed) = decided(Some(measured));
+    assert!(backed, "the continue policy's back-off: {a:?}");
     // Negative controls.
     for (name, after) in [
         ("nothing since the cancel", Some(at_cancel.as_str())),
         ("no transcript", None),
     ] {
-        let a = decided(after);
-        assert!(
-            matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("usage-session resets")),
-            "{name}: {a:?}"
-        );
+        let (a, on_reset, _) = decided(after);
+        assert!(on_reset, "{name}: {a:?}");
     }
 }
 
@@ -1361,7 +2275,7 @@ fn a_cancelled_limit_answers_the_act_only_by_a_notice_written_since_it() {
             },
             ..auto(30, None)
         };
-        let mut m = Mock::new(true, vec![cancelled.clone()]);
+        let mut m = Mock::new(vec![cancelled.clone()]);
         let mut s = session(&mut m, Some("@s-1".to_string()));
         s.set_clock(clock, PDT);
         // The act the loop typed at a turn's end.
@@ -1383,13 +2297,17 @@ fn a_cancelled_limit_answers_the_act_only_by_a_notice_written_since_it() {
             Instant::now(),
         );
         let mut point = point_at(&mut s, cancelled.clone(), 102);
+        let before = Instant::now();
         let a = s
             .turn_end_at_point(&point, None, &opts)
             .unwrap_or_else(|e| panic!("{e:?}"));
+        let after = Instant::now();
         s.point_as_decided(&mut point);
+        // The act's take window, from this first point with no busy read.
+        let take = s.turn_end.timing.take_within;
         assert!(
-            matches!(&a, TurnEndAction::WaitUntil { why, .. }
-                if why == "the worker to take the continue@v1 act"),
+            matches!(&a, TurnEndAction::WaitUntil { until, .. }
+                if *until >= before + take && *until <= after + take),
             "the act's own window: {a:?}"
         );
         (point.phase, s.turn_end.waits_on_named_reset())
@@ -1481,10 +2399,14 @@ fn transcript_run(
     let (dir, path) = journal_file(tag);
     let tails: Vec<Option<&str>> = tails.iter().map(|t| Some(*t)).collect();
     let host = TranscriptHost::of(&tails);
-    let mut m = Mock::new(true, screens);
+    let mut m = Mock::new(screens);
     m.turn_releases = held;
     m.vanish_after = Some(40);
     m.stall_sleep = Some(Duration::from_millis(100));
+    // The run ends where the loop parks on a reset (`Mock::end_when_parked`;
+    // the host asks nothing between decisions): an act typed into the limit
+    // at the back-off is due sooner and never parks.
+    m.end_when_parked = true;
     let opts = SuperviseOpts {
         journal: Some(path.clone()),
         idle_host: Some(host as Arc<dyn IdleHost>),
@@ -1624,11 +2546,15 @@ fn an_act_over_a_cancelled_limit_answered_by_the_same_reset_is_read_from_the_tra
             .join("\n")
             .replace("carry on with the task", "keep going")
     };
+    // Until the act the transcript ends on the older notice: at the first
+    // decision's read (asked whether its closed notice is a wall the screen
+    // could not name, `Session::transcript_found`: the screen shows the
+    // cancel, not it) and at the act's decision's.
     let (lines, waits, typed, refused, m) = transcript_run(
         "wc-samereset",
         vec![first.clone(), answered.clone()],
         Some(0),
-        &[&older, &format!("{older}\n{acts}")],
+        &[&older, &older, &format!("{older}\n{acts}")],
     );
     assert!(
         typed.len() == 1 && typed[0].ends_with(" rule=continue@v1 keep going"),
@@ -1742,7 +2668,7 @@ fn a_left_limits_wait_ends_on_its_own_rows_alone() {
             },
             ..auto(30, None)
         };
-        let mut m = Mock::new(true, vec![armed.clone()]);
+        let mut m = Mock::new(vec![armed.clone()]);
         let mut s = session(&mut m, Some("@s-1".to_string()));
         let wall = point_at(&mut s, armed.clone(), 101);
         let a = s
@@ -1756,27 +2682,723 @@ fn a_left_limits_wait_ends_on_its_own_rows_alone() {
         let a = s
             .turn_end_at_point(&left, None, &opts)
             .unwrap_or_else(|e| panic!("{e:?}"));
-        assert!(
-            matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("usage-session resets")),
-            "the left limit's wait: {a:?}"
-        );
+        assert!(waits_on_the_reset(&s, &a), "the left limit's wait: {a:?}");
         host.reads(Some(after));
         let p = point_at(&mut s, point.to_vec(), 103);
-        s.turn_end_at_point(&p, None, &opts)
-            .unwrap_or_else(|e| panic!("{e:?}"))
+        let a = s
+            .turn_end_at_point(&p, None, &opts)
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        let on_reset = waits_on_the_reset(&s, &a);
+        (a, on_reset)
     };
     let notified = format!("{at_cancel}\n{}", task_notification(&cancel_id));
     let ended: Vec<String> = [
         ("another conversation resumed", &unordered, measured),
         ("a task notification", &unordered, notified.as_str()),
-        ("the notice still the screen's last", &cancelled, ours.as_str()),
+        (
+            "the notice still the screen's last",
+            &cancelled,
+            ours.as_str(),
+        ),
     ]
     .into_iter()
     .filter_map(|(name, point, after)| {
-        let a = decided(point, after);
-        (!matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("usage-session resets")))
-            .then(|| format!("{name}: {a:?}"))
+        let (a, on_reset) = decided(point, after);
+        (!on_reset).then(|| format!("{name}: {a:?}"))
     })
     .collect();
     assert!(ended.is_empty(), "the wait ended: {ended:#?}");
+}
+
+/// THE SCREEN'S LIMIT NOTICE IS ANOTHER CONVERSATION'S where the transcript
+/// the tab holds now has no row of THIS limit's notice (the residual review's
+/// R2, `Session::notice_elsewhere`): the weekly limit's own notice row kept,
+/// a tail that holds it reads `false`; another conversation's tail (its row
+/// ids not this one's) reads `true`. NEGATIVE CONTROLS: no host, and no row
+/// kept, read `false` — the clock tie decides, as before.
+#[test]
+fn a_limit_notice_is_another_conversations_where_the_tail_lacks_its_row() {
+    let tail = transcript("weekly-limit");
+    let row = tail
+        .lines()
+        .rev()
+        .find(|l| l.contains("\"isApiErrorMessage\":true"))
+        .and_then(|l| {
+            let at = l.find("\"uuid\":\"")? + 8;
+            l.get(at..at + 36).map(str::to_owned)
+        })
+        .expect("the notice's row id");
+    let other = another_conversation(tail);
+    for (name, tails, kept, want) in [
+        ("its own conversation", Some(tail), true, false),
+        ("another conversation", Some(other.as_str()), true, true),
+        ("no transcript", None, true, false),
+        ("no row kept", Some(other.as_str()), false, false),
+    ] {
+        let host = TranscriptHost::of(&[tails]);
+        let opts = hosted_by(&host);
+        let mut m = Mock::new(vec![busy_screen()]);
+        let mut s = session(&mut m, None);
+        s.limit_notice_row = kept.then(|| row.clone());
+        assert_eq!(s.notice_elsewhere(&opts), want, "{name}");
+    }
+    let mut m = Mock::new(vec![busy_screen()]);
+    let mut s = session(&mut m, None);
+    s.limit_notice_row = Some(row);
+    assert!(!s.notice_elsewhere(&auto(30, None)), "no host");
+}
+
+/// A `/RESUME`D CONVERSATION'S NOTICE WITH THIS LIMIT'S CLOCK ENDS NO WAIT,
+/// IN THE LOOP (the residual review's R2): a five-hour limit armed to go on
+/// at 3:15pm, confirmed by the session's transcript at its decision (its
+/// notice row kept). The screen then shows another conversation's history
+/// whose older notice names the same 3:15pm — a session limit's clock names
+/// no date — with the vendor's continuation under it, and the host's tail is
+/// THAT conversation's (no row of this limit's notice): the decision is the
+/// wait on this limit, never the continue policy. NEGATIVE CONTROL: the tail
+/// still the limit's own conversation, the clock tie ends the wait (the
+/// continue policy's back-off).
+#[test]
+fn a_resumed_conversations_notice_with_this_limits_clock_ends_no_wait_in_the_loop() {
+    // The loop's clock at 3:12pm PDT, a minute past the armed screen's own
+    // print (`done 3:11 PM`) and three before its reset; the measured
+    // limit's rows written a minute before, naming the same 3:15pm.
+    let now = TEST_NOW + 6 * 3600 + 17 * 60;
+    let at_cancel = limit_cancelled_at(now - 60).replace("10:38am", "3:15pm");
+    let other = another_conversation(&at_cancel);
+    let armed = fx::screen(fx::WALL_SESSION_AUTO_CONTINUE_ARMED_MEASURED);
+    let history: Vec<String> = fx::screen(fx::WALL_SESSION_RESUMED_BY_ITSELF_MEASURED)
+        .into_iter()
+        .map(|r| r.replace("3:35pm", "3:15pm"))
+        .collect();
+    let since = aterm_phase::since_limit(&history).expect("the history's notice");
+    assert_eq!(
+        (since.reset.as_deref(), since.fired),
+        (Some("3:15pm"), true),
+        "{since:?}"
+    );
+    let decided = |after: &str| {
+        let host = TranscriptHost::of(&[Some(at_cancel.as_str())]);
+        let opts = SuperviseOpts {
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            policy: SupervisorConfig {
+                answer_questions: false,
+                ..SupervisorConfig::default()
+            },
+            ..auto(30, None)
+        };
+        let mut m = Mock::new(vec![armed.clone()]);
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.set_clock(now, PDT);
+        s.set_zone_lookup(test_zones);
+        let wall = point_at(&mut s, armed.clone(), 101);
+        let a = s
+            .turn_end_at_point(&wall, Some(Duration::from_secs(60)), &opts)
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        assert!(
+            matches!(&a, TurnEndAction::WaitUntil { .. }),
+            "the confirmed wall's wait: {a:?}"
+        );
+        assert!(s.limit_notice_row.is_some(), "its notice row kept");
+        host.reads(Some(after));
+        let point = point_at(&mut s, history.clone(), 102);
+        let before = Instant::now();
+        let a = s
+            .turn_end_at_point(&point, None, &opts)
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        let after = Instant::now();
+        let (on_reset, backed) = (waits_on_the_reset(&s, &a), backs_off(&s, &a, before, after));
+        (a, on_reset, backed)
+    };
+    let (a, on_reset, _) = decided(&other);
+    assert!(on_reset, "this limit's wait stands: {a:?}");
+    // NEGATIVE CONTROL: the limit's own conversation.
+    let (a, _, backed) = decided(&at_cancel);
+    assert!(backed, "the continue policy's back-off: {a:?}");
+}
+
+/// A LOOP THAT TOOK A LIMIT'S WAIT OVER READS THE LIMIT'S END IN THE
+/// TRANSCRIPT BY THE RESET IT WAITS ON — a limit's end types no keep going
+/// into a done report (the adversarial verifier of the merged harness fixes;
+/// Claude Code 2.1.296's screens, 2.1.299's transcript, measured). A five-hour
+/// limit (`resets 10:38am`) a loop before this one waited on, taken over from
+/// its ledger row (a seamless update, a new window, a loop restarted): no
+/// notice row id is remembered here. Past the reset Claude Code went on by
+/// itself, and the reply — a done report — scrolled the limit's rows off the
+/// screen, its `⏺ Usage limit reset · continuing automatically` row kept:
+/// nothing on the screen ties that continuation to the limit. The session's
+/// transcript does: its newest notice row naming the reset waited on (the
+/// limit's class, its clock, and the account's `resetsAt` beside the reset
+/// placed) and the model's reply after it. The wait is over as in the loop
+/// that saw the notice — the continuation is work since the limit, and the
+/// point the continue policy's (its back-off, then the done check) — where
+/// before the wait stood to the reset and its grace and `usage-resume@v1`
+/// typed `keep going` into the done report. NEGATIVE CONTROLS, each the wait
+/// standing: the transcript with nothing since the notice; its notice naming
+/// another clock; the same clock a day before (another conversation's older
+/// limit, `/resume`d: `resetsAt` a day off the reset waited on); the
+/// notice's row a model's ordinary reply quoting its words, or a subagent's
+/// (D3 of the verifier of this fix: clauses no test pinned); the
+/// continuation met by the limit again, its notice after the reply; no
+/// transcript.
+#[test]
+fn a_seeded_loop_reads_the_limits_end_in_the_transcript_by_its_reset() {
+    // 10:38am PDT on the measured day, where the predecessor placed the reset.
+    const RESET: i64 = 1_791_999_480;
+    // The measured notice row's own `quotaLimits.resetsAt`.
+    const RESETS_AT: &str = "\"resetsAt\":1791999513";
+    let now = MEASURED_NOTICE_AT + 30 * 60;
+    let measured = transcript("session-limit-cancelled-then-person-turn");
+    let rows: Vec<&str> = measured.lines().skip(1).collect();
+    let cancel = rows
+        .iter()
+        .position(|r| r.contains("Automatic continue cancelled"))
+        .expect("the cancel");
+    let at_limit = rows[..cancel].join("\n");
+    let done = "All done: the change is committed and pushed, and every suite passes.";
+    let stub = "Hi! I am the local lab stub, not a model. (reply 3)";
+    // The limit's turn, closed; then the model's reply, closed.
+    let continued = rows
+        .iter()
+        .filter(|r| {
+            !r.contains("Automatic continue cancelled") && !r.contains("what is left to do?")
+        })
+        .map(|r| r.replace(stub, done))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(continued.contains(RESETS_AT) && continued.contains(done));
+    // The wall the predecessor waited on, as the reader reads the armed
+    // screen at 10:38am.
+    let armed: Vec<String> = fx::screen(fx::WALL_SESSION_AUTO_CONTINUE_ARMED_MEASURED)
+        .into_iter()
+        .map(|r| r.replace("3:15pm", "10:38am"))
+        .collect();
+    let wall = aterm_phase::read(Some("claude"), &armed, Some(2))
+        .wall
+        .expect("the armed wall");
+    // The done report under the vendor's continuation, the limit's rows off
+    // the screen.
+    let replied: Vec<String> = fx::screen(fx::WALL_SESSION_RESUMED_BY_ITSELF_MEASURED)
+        .into_iter()
+        .filter(|r| {
+            ![
+                "carry on with the task",
+                "You've hit your",
+                "/upgrade to",
+                "Usage limit reached",
+            ]
+            .iter()
+            .any(|g| r.contains(g))
+        })
+        .map(|r| r.replace(stub, done))
+        .collect();
+    assert_eq!(
+        aterm_phase::since_limit(&replied),
+        None,
+        "nothing on the screen ties it"
+    );
+    let decided = |tail: Option<&str>| {
+        let host = TranscriptHost::of(&[tail]);
+        let opts = SuperviseOpts {
+            idle_host: Some(host as Arc<dyn IdleHost>),
+            policy: SupervisorConfig {
+                answer_questions: false,
+                ..SupervisorConfig::default()
+            },
+            ..auto(30, None)
+        };
+        let mut m = Mock::new(vec![replied.clone()]);
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.set_clock(now, PDT);
+        s.set_zone_lookup(test_zones);
+        s.seed_wall_memory(Some(crate::supervise::approvals::OpenWall {
+            at_ms: MEASURED_NOTICE_AT * 1000,
+            message: wall.message.clone(),
+            reset: wall.reset.clone(),
+            reset_unix: Some(RESET),
+            kind: Some(wall.kind),
+        }));
+        assert!(s.turn_end.waits_on_named_reset(), "the wait taken over");
+        assert!(s.limit_notice_row.is_none(), "no notice row remembered");
+        let point = point_at(&mut s, replied.clone(), 101);
+        let before = Instant::now();
+        let a = s
+            .turn_end_at_point(&point, None, &opts)
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        let after = Instant::now();
+        let backed = backs_off(&s, &a, before, after);
+        (a, s.turn_end.waits_on_named_reset(), backed)
+    };
+    let (a, _, backed) = decided(Some(&continued));
+    assert!(backed, "the continue policy's back-off: {a:?}");
+    // NEGATIVE CONTROLS.
+    let other_clock = continued.replace("10:38am", "9:10am");
+    let a_day_before = shifted(&continued, -24 * 3600).replace(
+        RESETS_AT,
+        &format!("\"resetsAt\":{}", 1_791_999_513 - 24 * 3600),
+    );
+    // The notice's row as a model's ordinary reply quoting its words (no
+    // `isApiErrorMessage`), and as a subagent's (`isSidechain`): neither is
+    // the main chain's notice; and the vendor's continuation met by the limit
+    // again (its notice row once more after the reply, nothing since).
+    let notice_row = continued
+        .lines()
+        .find(|l| l.contains("\"isApiErrorMessage\":true"))
+        .expect("the notice row");
+    let quoted = continued.replace(
+        notice_row,
+        &notice_row
+            .replace("\"isApiErrorMessage\":true", "\"isApiErrorMessage\":false")
+            .replace(
+                "\"model\":\"<synthetic>\"",
+                "\"model\":\"claude-sonnet-5-5\"",
+            ),
+    );
+    let subagents = continued.replace(
+        notice_row,
+        &notice_row.replace("\"isSidechain\":false", "\"isSidechain\":true"),
+    );
+    let met_again = format!(
+        "{continued}\n{}",
+        shifted(notice_row, 60).replace(
+            "0cf0d54b-537e-4c7a-8e7f-8577289890c5",
+            "0cf0d54b-537e-4c7a-8e7f-000000000002"
+        )
+    );
+    assert!(
+        quoted != continued && subagents != continued,
+        "the variants differ"
+    );
+    let ended: Vec<String> = [
+        ("nothing since the notice", Some(at_limit.as_str())),
+        ("another clock", Some(other_clock.as_str())),
+        ("the same clock a day before", Some(a_day_before.as_str())),
+        ("a reply quoting the notice", Some(quoted.as_str())),
+        ("a subagent's notice", Some(subagents.as_str())),
+        ("met again", Some(met_again.as_str())),
+        ("no transcript", None),
+    ]
+    .into_iter()
+    .filter_map(|(name, tail)| {
+        let (a, waits, _) = decided(tail);
+        (!waits).then(|| format!("{name}: {a:?}"))
+    })
+    .collect();
+    assert!(ended.is_empty(), "the wait ended: {ended:#?}");
+}
+
+/// The measured 2.1.296 screen past a five-hour limit's reset: the vendor's
+/// continuation, and under it the worker's reply `reply` (its lines drawn as
+/// Claude Code draws a message), long enough to scroll the limit's rows off
+/// the screen — the vendor's `⏺ Usage limit reset · continuing
+/// automatically` row kept (`fired_row`), or only the footer's notification
+/// of it — while a shell the worker started still runs (`· 1 shell still
+/// running` on the turn's done row, `· 1 shell` on the footer, as Claude
+/// Code draws one): busy with only background work.
+fn replied_under_a_shell(reply: &str, fired_row: bool) -> Vec<String> {
+    let mut rows = Vec::new();
+    for r in fx::screen(fx::WALL_SESSION_RESUMED_BY_ITSELF_MEASURED) {
+        let gone = [
+            "carry on with the task",
+            "You've hit your",
+            "/upgrade to",
+            "Usage limit reached",
+        ]
+        .iter()
+        .any(|g| r.contains(g))
+            || (!fired_row && r.contains("Usage limit reset"));
+        if gone {
+            continue;
+        }
+        if r.contains("(reply 3)") {
+            for (i, line) in reply.lines().enumerate() {
+                rows.push(if i == 0 {
+                    format!("⏺ {line}")
+                } else {
+                    format!("  {line}")
+                });
+            }
+            continue;
+        }
+        rows.push(r);
+    }
+    let done = rows
+        .iter()
+        .rposition(|r| r.starts_with('✻'))
+        .expect("the done row");
+    rows[done].push_str(" · 1 shell still running");
+    let mode = rows
+        .iter()
+        .position(|r| r.starts_with("  ⏵⏵ auto mode on"))
+        .expect("the footer");
+    let notified = if fired_row {
+        String::new()
+    } else {
+        format!(
+            "{}Usage limit reset · continuing automatically",
+            " ".repeat(16)
+        )
+    };
+    rows[mode] = format!(
+        "  ⏵⏵ auto mode on (shift+tab to cycle) · 1 shell · ← for agents · ↓ to manage{notified}"
+    );
+    assert!(aterm_phase::background_only(&rows), "{rows:#?}");
+    assert_eq!(aterm_phase::since_limit(&rows), None, "nothing ties it");
+    rows
+}
+
+/// A LIMIT'S END UNDER A BACKGROUND SHELL TYPES NO KEEP GOING INTO A DONE
+/// REPORT, IN THE LOOP (the adversarial verifier of the limit's-end fix,
+/// D1; Claude Code 2.1.296's screens, 2.1.299's transcript, measured). Past
+/// a five-hour limit's reset Claude Code went on by itself, and the reply
+/// scrolled the limit's rows off the screen while a shell the worker started
+/// still runs: the screen reads busy with only background work, and the
+/// loop's memory of the limit stands in for its notice (`wall_memory.rs`,
+/// the owner's dominant tab). THE RECORD: the session's transcript is read
+/// under that remembered wall as on an idle screen — by the notice row the
+/// loop kept, or by the reset it waits on in a loop that took the wait over
+/// from its predecessor's ledger row — and the model's reply after the
+/// notice ends the wait: the point is the continue policy's, its back-off.
+/// THE ACT, with no transcript to read: the words under the remembered wall,
+/// its notice drawn no more, are the worker's since the limit — a done
+/// report gets the done check, one naming an irreversible act the
+/// reversible clause, and the worker's [`FINISHED`] ends the task. Measured
+/// before, for every one of them: the wait stood and `keep going` went under
+/// `usage-resume@v1` into the done report. Both screen shapes (the vendor's
+/// row kept, or only the footer's notification). NEGATIVE CONTROLS: a reply
+/// that is no done report gets `usage-resume@v1`; the transcript with nothing
+/// since the notice leaves the wait standing.
+#[test]
+fn a_limits_end_under_a_background_shell_types_no_keep_going_into_a_done_report() {
+    use crate::supervise::policy::turn_end::{
+        DONE_CHECK, DONE_CHECK_REVERSIBLE, RULE_DONE_CHECK, RULE_LIMIT_RESUME,
+    };
+    // 10:38am PDT on the measured day, where the predecessor placed the reset.
+    const RESET: i64 = 1_791_999_480;
+    let done = "All done: the change is committed and pushed, and every suite passes.";
+    let stub = "Hi! I am the local lab stub, not a model. (reply 3)";
+    let measured = transcript("session-limit-cancelled-then-person-turn");
+    let rows: Vec<&str> = measured.lines().skip(1).collect();
+    let cancel = rows
+        .iter()
+        .position(|r| r.contains("Automatic continue cancelled"))
+        .expect("the cancel");
+    let at_limit = rows[..cancel].join("\n");
+    // The limit's turn, closed; then the model's reply, closed.
+    let continued = rows
+        .iter()
+        .filter(|r| {
+            !r.contains("Automatic continue cancelled") && !r.contains("what is left to do?")
+        })
+        .map(|r| r.replace(stub, done))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let policy = SupervisorConfig::default();
+    let mut wrong = Vec::new();
+    for fired_row in [true, false] {
+        // A loop that took the wait over from its predecessor's ledger row
+        // (the wall the armed screen's reader reads at 10:38am), 20 minutes
+        // past the reset.
+        let seeded = |reply: &str, tail: Option<&str>| {
+            let screen = replied_under_a_shell(reply, fired_row);
+            let armed: Vec<String> = fx::screen(fx::WALL_SESSION_AUTO_CONTINUE_ARMED_MEASURED)
+                .into_iter()
+                .map(|r| r.replace("3:15pm", "10:38am"))
+                .collect();
+            let wall = aterm_phase::read(Some("claude"), &armed, Some(2))
+                .wall
+                .expect("the armed wall");
+            let host = TranscriptHost::of(&[tail]);
+            let opts = SuperviseOpts {
+                idle_host: Some(host as Arc<dyn IdleHost>),
+                policy: policy.clone(),
+                ..auto(30, None)
+            };
+            let mut m = Mock::new(vec![screen.clone()]);
+            let mut s = session(&mut m, Some("@s-1".to_string()));
+            s.set_clock(MEASURED_NOTICE_AT + 30 * 60, PDT);
+            s.set_zone_lookup(test_zones);
+            s.seed_wall_memory(Some(crate::supervise::approvals::OpenWall {
+                at_ms: MEASURED_NOTICE_AT * 1000,
+                message: wall.message.clone(),
+                reset: wall.reset.clone(),
+                reset_unix: Some(RESET),
+                kind: Some(wall.kind),
+            }));
+            assert!(s.limit_notice_row.is_none(), "no notice row remembered");
+            let point = point_at(&mut s, screen, 101);
+            let before = Instant::now();
+            let a = s
+                .turn_end_at_point(&point, None, &opts)
+                .unwrap_or_else(|e| panic!("{e:?}"));
+            let after = Instant::now();
+            let backed = backs_off(&s, &a, before, after);
+            (
+                a,
+                s.turn_end.waits_on_named_reset(),
+                s.turn_end.task_done(),
+                backed,
+            )
+        };
+        // THE RECORD, in a seeded loop: the reply after the notice that
+        // names the reset waited on.
+        let (a, waits, _, backed) = seeded(done, Some(&continued));
+        if waits || !backed {
+            wrong.push(format!("fired row {fired_row}, seeded, transcript: {a:?}"));
+        }
+        // NEGATIVE CONTROL: nothing since the notice.
+        let (a, waits, _, _) = seeded(done, Some(&at_limit));
+        if !waits {
+            wrong.push(format!("fired row {fired_row}, nothing since: {a:?}"));
+        }
+        // THE RECORD, in the loop that saw the notice and kept its row
+        // (3:12pm, the reset 3:15pm), read past the reset.
+        let now = TEST_NOW + 6 * 3600 + 17 * 60;
+        let by = now - 60 - MEASURED_NOTICE_AT;
+        let at_notice = shifted(&at_limit, by).replace("10:38am", "3:15pm");
+        let replied = shifted(&continued, by).replace("10:38am", "3:15pm");
+        let host = TranscriptHost::of(&[Some(at_notice.as_str())]);
+        let opts = SuperviseOpts {
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            policy: policy.clone(),
+            ..auto(30, None)
+        };
+        let armed = fx::screen(fx::WALL_SESSION_AUTO_CONTINUE_ARMED_MEASURED);
+        let mut m = Mock::new(vec![armed.clone()]);
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.set_clock(now, PDT);
+        s.set_zone_lookup(test_zones);
+        let wall = point_at(&mut s, armed, 101);
+        let a = s
+            .turn_end_at_point(&wall, Some(Duration::from_secs(60)), &opts)
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        assert!(matches!(&a, TurnEndAction::WaitUntil { .. }), "{a:?}");
+        assert!(s.limit_notice_row.is_some(), "its notice row kept");
+        host.reads(Some(&replied));
+        s.set_clock(now + 20 * 60, PDT);
+        let point = point_at(&mut s, replied_under_a_shell(done, fired_row), 102);
+        let before = Instant::now();
+        let a = s
+            .turn_end_at_point(&point, None, &opts)
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        let after = Instant::now();
+        if s.turn_end.waits_on_named_reset() || !backs_off(&s, &a, before, after) {
+            wrong.push(format!("fired row {fired_row}, saw the notice: {a:?}"));
+        }
+        // THE ACT, with no transcript to read.
+        for (reply, want, finished) in [
+            (
+                done,
+                TurnEndAction::Type {
+                    text: DONE_CHECK.to_string(),
+                    rule_id: RULE_DONE_CHECK,
+                },
+                false,
+            ),
+            (
+                "All done. Shall I delete the old release branches?",
+                TurnEndAction::Type {
+                    text: format!("{DONE_CHECK} {DONE_CHECK_REVERSIBLE}"),
+                    rule_id: RULE_DONE_CHECK,
+                },
+                false,
+            ),
+            ("All done.\nATERM-TASK-DONE", TurnEndAction::Nothing, true),
+            // NEGATIVE CONTROL: no done report.
+            (
+                "Stage 2 of 5 is in; stage 3 is next.",
+                TurnEndAction::Type {
+                    text: "keep going".to_string(),
+                    rule_id: RULE_LIMIT_RESUME,
+                },
+                false,
+            ),
+        ] {
+            let (a, _, task_done, _) = seeded(reply, None);
+            if a != want || task_done != finished {
+                wrong.push(format!(
+                    "fired row {fired_row}, no transcript, {reply:?}: {a:?} (finished {task_done})"
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A BUCKET ONLY ITS `rateLimitType` NAMED IS THAT BUCKET FOR A LOOP THAT
+/// FOLLOWS, whatever words the ledger keeps of it (the verifier of
+/// b5a94f3c1, R5-1). Claude Code 2.1.300 draws a model's bucket under the
+/// generic banner (`You've hit your limit · resets …`), its countdown armed,
+/// and the transcript's notice row names the bucket by its type: the loop
+/// reads, tracks and waits on a bucket, and writes the wall's words as the
+/// row's words, the type after them where it names a model, and the screen's
+/// countdown after that (`named_by`) — or no type at all for
+/// `seven_day_overage_included`, which names no model. The first loop waits
+/// for the vendor's countdown, types `usage-resume@v1` at the bucket's
+/// reset, reads the same screen 5 s later inside the try's take window
+/// (met), and a person's `/resume` takes the countdown away. A loop that
+/// follows a minute after the try, on that ledger, holds the try's rung as
+/// the first loop does. Measured before: its words read back as a usage
+/// window's (`words_kind`), the try was no try met again, the open wall
+/// replaced the seeded bucket's track with a window's at attempt 0, and the
+/// successor typed `usage-resume@v1` at once, ten minutes before the first
+/// loop. NEGATIVE CONTROL: the bucket's own words (`You've hit your Sonnet
+/// limit`) read back as before.
+#[test]
+fn a_bucket_only_its_rate_limit_type_named_is_that_bucket_for_a_loop_that_follows() {
+    use crate::supervise::approvals::{Ledger, open_wall, usage_attempt};
+    use crate::supervise::policy::turn_end::RULE_LIMIT_RESUME;
+    const RESET: i64 = 1_792_279_200;
+    let bucket = aterm_phase::WallKind::ModelBucket { consent: false };
+    let reset = "Oct 17 at 4:20pm (America/Los_Angeles)";
+    let armed = |words: &str| -> Vec<String> {
+        fx::screen(fx::WALL_SONNET_BUCKET_AUTO_CONTINUE_ARMED_2_1_300)
+            .into_iter()
+            .map(|r| {
+                r.replace(
+                    &format!("You've hit your Sonnet limit · resets {reset}"),
+                    words,
+                )
+            })
+            .collect()
+    };
+    let resumed = || fx::screen(fx::RESUMED_NO_LIMIT_AT_ARMED_LIMIT_2_1_300);
+    let weekly = transcript("weekly-limit");
+    let tail = |words: &str, kind: &str| {
+        weekly
+            .replace(
+                "You've hit your weekly limit · resets Oct 11 at 9:35am (America/Los_Angeles)",
+                words,
+            )
+            .replace(
+                "\"rateLimitType\":\"seven_day\"",
+                &format!("\"rateLimitType\":\"{kind}\""),
+            )
+    };
+    let generic = format!("You've hit your limit · resets {reset}");
+    let mut wrong = Vec::new();
+    for (n, (case, words, kind)) in [
+        (
+            "the generic banner, seven_day_opus",
+            generic.clone(),
+            "seven_day_opus",
+        ),
+        (
+            "the generic banner, seven_day_overage_included",
+            generic.clone(),
+            "seven_day_overage_included",
+        ),
+        (
+            "control: the bucket's own words",
+            format!("You've hit your Sonnet limit · resets {reset}"),
+            "seven_day_sonnet",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let dir = crate::supervise::test_scratch_path("bucket-type-read-back", &n.to_string());
+        std::fs::create_dir_all(&dir).expect("the scratch dir");
+        let ledger = dir.join("s-1.jsonl");
+        let books = dir.join("books.jsonl");
+        let t = tail(&words, kind);
+        let wall = armed(&words);
+        // When `rows` at `seq` is decided to be acted on, and by which rule.
+        let decided = |s: &mut Session<'_, Mock>,
+                       opts: &SuperviseOpts,
+                       rows: &[String],
+                       seq: u64,
+                       worked: Option<Duration>|
+         -> (i64, Option<&'static str>, String) {
+            let point = point_at(s, rows.to_vec(), seq);
+            match s
+                .turn_end_at_point(&point, worked, opts)
+                .expect("a decision")
+            {
+                TurnEndAction::WaitUntil { until, why, .. } => (s.unix_of(until), None, why),
+                other => (s.now_unix(), other.rule_id(), format!("{other:?}")),
+            }
+        };
+        let host = TranscriptHost::of(&[Some(t.as_str())]);
+        let mut opts = hosted_by(&host);
+        opts.policy.model_fallback = None;
+        opts.policy.continue_policy = true;
+        let mut m = Mock::new(vec![wall.clone()]);
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.ledger = Ledger::open(Some(&ledger), Some("@s-1"), &mut Vec::new());
+        // The take window on the worker's clock (`Instant`), which the
+        // test's unix clock does not move: 50 ms, slept past below.
+        s.set_turn_end_timing(TurnEndTiming {
+            take_within: Duration::from_millis(50),
+            ..TurnEndTiming::default()
+        });
+        s.set_clock(RESET - 3600, PDT);
+        let try_at = decided(&mut s, &opts, &wall, 100, Some(Duration::from_secs(180))).0;
+        s.set_clock(try_at, PDT);
+        let p = point_at(&mut s, wall.clone(), 101);
+        let a = s.turn_end_at_point(&p, None, &opts).expect("the try");
+        assert_eq!(a.rule_id(), Some(RULE_LIMIT_RESUME), "{case}: {a:?}");
+        s.pass_wake_settle();
+        s.turn_end_execute(&p, a, &opts, &[], &mut Alone)
+            .expect("typed");
+        assert_eq!(
+            s.turn_end.wall_attempts(bucket),
+            Some(1),
+            "{case}: a bucket's try"
+        );
+        // The try's screen read again inside its take window.
+        s.set_clock(try_at + 5, PDT);
+        let _ = decided(&mut s, &opts, &wall, 102, None);
+        // A person's `/resume`: the countdown gone, no notice. The loop's
+        // next read is past the take window.
+        std::thread::sleep(Duration::from_millis(80));
+        s.set_clock(try_at + 35, PDT);
+        let mut mine = decided(&mut s, &opts, &resumed(), 103, None);
+        let mut seq = 104;
+        while mine.2.contains("to take") && seq < 110 {
+            s.set_clock(mine.0, PDT);
+            mine = decided(&mut s, &opts, &resumed(), seq, None);
+            seq += 1;
+        }
+        std::fs::copy(&ledger, &books).expect("books");
+        let act_ms = usage_attempt(&ledger, Some("@s-1")).map_or(0, |a| a.at_ms);
+        drop(s);
+        // The loop that follows, a minute after the try, in `drive_loop`'s
+        // order.
+        let decide_at = try_at + 60;
+        let host2 = TranscriptHost::of(&[Some(t.as_str())]);
+        let mut opts2 = hosted_by(&host2);
+        opts2.policy.model_fallback = None;
+        opts2.policy.continue_policy = true;
+        let mut m2 = Mock::new(vec![resumed()]);
+        let mut s2 = session(&mut m2, Some("@s-1".to_string()));
+        s2.set_clock(decide_at, PDT);
+        s2.ledger = Ledger::open(Some(&books), Some("@s-1"), &mut Vec::new());
+        seed_usage_act(
+            &mut s2.turn_end,
+            &books,
+            s2.setup.sid.as_deref(),
+            act_ms + (decide_at - try_at) * 1000,
+            Instant::now(),
+        );
+        s2.seed_wall_memory(open_wall(&books, Some("@s-1")));
+        let tracked = s2.turn_end.wall_attempts(bucket);
+        let theirs = decided(&mut s2, &opts2, &resumed(), 101, None);
+        drop(s2);
+        let _ = std::fs::remove_dir_all(&dir);
+        // The successor no sooner than the first loop, the take window's
+        // slack aside (it counts the rung from the wall's row, the first
+        // loop from the window's end).
+        if tracked != Some(1) || theirs.0 + 40 < mine.0 {
+            wrong.push(format!(
+                "{case}: the successor tracks the bucket at {tracked:?} and acts at try{:+}s \
+                 ({}); the first loop at try{:+}s ({})",
+                theirs.0 - try_at,
+                theirs.2,
+                mine.0 - try_at,
+                mine.2,
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }

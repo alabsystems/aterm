@@ -25,7 +25,9 @@
 //!   panes; `tab new` replies the window's active index and its tab count; a
 //!   connected preset's tab is connected to its origin before the reply;
 //! * a new window does not exist while its spawn is held, and once released
-//!   its session lands in it, answering `status`.
+//!   its session lands in it, answering `status`;
+//! * a wire spawn's agent identity is checked on the spawner too, before the
+//!   fork: one it refuses is the caller's reply only once the hold is released.
 //!
 //! NEGATIVE CONTROL: with the spawn back on the event loop (the hold then runs
 //! in the turn, or not at all), `status` cannot answer while the hold stands,
@@ -42,13 +44,26 @@ use std::time::Instant;
 
 use crate::headless_boot;
 
-use headless_boot::{Instance, boot_or_refuse, boot_session, ctl, ctl_ok, field, status};
+use headless_boot::{Instance, boot_session, boot_with, ctl, ctl_ok, field, status};
 
 /// Run `args` with the spawner holding its spawn: the loop answers a
 /// main-thread verb (`status` of `boot_sid`) while it is out and the caller
-/// waits; once released, the caller's reply (its stdout) comes back. The hold
-/// is re-armed for the next round once the reply shows the spawner is past it.
+/// waits; once released, the caller's reply (its stdout) comes back, a success.
 fn held_round(inst: &Instance, boot_sid: &str, args: &[&str]) -> String {
+    let out = held_call(inst, boot_sid, args);
+    let reply = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success(),
+        "{args:?} failed: {reply} {:?}",
+        out.stderr
+    );
+    reply
+}
+
+/// [`held_round`]'s hold and checks, with the caller's output however it ended.
+/// The hold is re-armed for the next round once the reply shows the spawner is
+/// past it.
+fn held_call(inst: &Instance, boot_sid: &str, args: &[&str]) -> std::process::Output {
     let hold = inst.tmp.join("hold");
     let held = inst.tmp.join("hold.held");
     std::thread::scope(|scope| {
@@ -72,15 +87,9 @@ fn held_round(inst: &Instance, boot_sid: &str, args: &[&str]) -> String {
 
         std::fs::write(&hold, b"").expect("release the hold");
         let out = call.join().expect("the caller");
-        let reply = String::from_utf8_lossy(&out.stdout).into_owned();
-        assert!(
-            out.status.success(),
-            "{args:?} failed: {reply} {:?}",
-            out.stderr
-        );
         std::fs::remove_file(&hold).expect("re-arm the hold");
         std::fs::remove_file(&held).expect("re-arm the hold");
-        reply
+        out
     })
 }
 
@@ -94,7 +103,7 @@ fn named_sid(reply: &str) -> &str {
 
 #[test]
 fn a_held_tab_spawn_leaves_the_loop_answering_and_replies_once_registered() {
-    let inst = boot_or_refuse(
+    let inst = boot_with(
         "aterm-tabspawn",
         |tmp: &Path, cmd| {
             cmd.env("ATERM_DEBUG_SPAWN_HOLD", tmp.join("hold"));
@@ -112,7 +121,7 @@ fn a_held_tab_spawn_leaves_the_loop_answering_and_replies_once_registered() {
 
 #[test]
 fn a_held_split_tab_new_or_connected_tab_leaves_the_loop_answering() {
-    let inst = boot_or_refuse(
+    let inst = boot_with(
         "aterm-splitspawn",
         |tmp: &Path, cmd| {
             cmd.env("ATERM_DEBUG_SPAWN_HOLD", tmp.join("hold"));
@@ -169,7 +178,7 @@ fn a_held_split_tab_new_or_connected_tab_leaves_the_loop_answering() {
 /// the new one 1.
 #[test]
 fn a_held_new_window_leaves_the_loop_answering_and_lands_once_spawned() {
-    let inst = boot_or_refuse(
+    let inst = boot_with(
         "aterm-winspawn",
         |tmp: &Path, cmd| {
             cmd.env("ATERM_DEBUG_SPAWN_HOLD", tmp.join("hold"));
@@ -225,5 +234,44 @@ fn a_held_new_window_leaves_the_loop_answering_and_lands_once_spawned() {
     assert!(
         field(&born, "phase").is_some(),
         "the new window's session answers: {born}"
+    );
+}
+
+/// A wire spawn's agent identity is checked where its shell starts, on the
+/// spawner, before the fork: never in the request's event-loop turn, since the
+/// identities folder can sit on a volume that stops answering. `@<worker>
+/// spawn` passes the worker's identity down; with that identity's folder gone,
+/// the spawner refuses it, and the caller, which waited while the spawn was
+/// held, hears `ERR identity worker: ...` once it is released.
+///
+/// NEGATIVE CONTROL: with the check back in the turn, the refusal is the reply
+/// before the spawner ever takes the spawn, and `held_call` fails on "the
+/// spawner never took the spawn".
+#[test]
+fn a_wire_spawns_identity_is_refused_on_the_spawner_not_in_the_turn() {
+    let inst = boot_with(
+        "aterm-idspawn",
+        |tmp: &Path, cmd| {
+            cmd.env("ATERM_DEBUG_SPAWN_HOLD", tmp.join("hold"))
+                .env("ATERM_STATE_HOME", tmp.join("state"));
+        },
+        |_| true,
+    );
+    let (_, boot_sid) = boot_session(&inst);
+    let reply = held_round(&inst, &boot_sid, &["spawn", "identity=worker"]);
+    let worker = named_sid(&reply).to_string();
+    std::fs::remove_dir_all(inst.tmp.join("state/identities/worker"))
+        .expect("the worker's identity, made by its spawn");
+
+    let aimed = format!("@{worker}");
+    let out = held_call(&inst, &boot_sid, &[&aimed, "spawn"]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success() && said.contains("identity worker: "),
+        "refused, in the request's words: {said}"
     );
 }

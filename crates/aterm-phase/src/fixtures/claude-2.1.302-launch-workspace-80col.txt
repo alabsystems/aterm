@@ -1,0 +1,11 @@
+# claude-code 2.1.302 · MEASURED 2026-10-17, `aterm ctl text` of a private headless aterm (80x40, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the workspace launch card (--effort workspace) at 80 columns, inline renderer: the wand ╱✦ beside the raised arm, text column 13
+ ▐▛███▛█▄╱✦  Claude Code v2.1.302
+▝▜██████▘    Opus 5.5 with xhigh effort · API Usage Billing
+ ▝▝   ▝▝     /private/tmp/at.tPwT/proj
+
+
+──────────────────────────────────────────────────────────────────── workspace ─
+❯
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents
+                                                 ◉ xhigh · workspace · /effort

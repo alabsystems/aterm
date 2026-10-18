@@ -8,11 +8,14 @@
 // Its one wall-clock term (the rising phase) is pinned via
 // `set_shimmer_phase_for_test` wherever bytes are compared.
 //
-// No GPU or no system font: no-op.
+// No GPU or no font: COULD NOT RUN.
 
 use aterm_core::terminal::Terminal;
+#[cfg(wgpu_arm)]
 use aterm_gpu::video_tap::{CaptureOpts, DEFAULT_BUDGET};
-use aterm_render::{FirePatch, GlowQuad, RenderInput, Theme, premul_rgb};
+#[cfg(wgpu_arm)]
+use aterm_render::RenderInput;
+use aterm_render::{FirePatch, GlowQuad, Theme, premul_rgb};
 
 use crate::common;
 
@@ -229,6 +232,7 @@ fn shimmer_bounded_displacement_and_scoped_to_region() {
     );
 }
 
+#[cfg(wgpu_arm)]
 fn opts() -> CaptureOpts {
     CaptureOpts {
         half_res: false,
@@ -240,6 +244,7 @@ fn opts() -> CaptureOpts {
 
 /// Present `input` once through the copyable-swapchain stand-in with the video
 /// tap armed, returning the single harvested frame's bytes.
+#[cfg(wgpu_arm)]
 fn tap_swapchain(gpu: &mut aterm_gpu::GpuRenderer, input: &RenderInput, w: u32, h: u32) -> Vec<u8> {
     let mut win = aterm_gpu::WindowGpu::new();
     gpu.video_begin_standin_for_test(&mut win, w, h, opts())
@@ -253,6 +258,7 @@ fn tap_swapchain(gpu: &mut aterm_gpu::GpuRenderer, input: &RenderInput, w: u32, 
 
 /// Present `input` once through the virtual present with the video tap armed,
 /// returning the single harvested frame's bytes.
+#[cfg(wgpu_arm)]
 fn tap_virtual(gpu: &mut aterm_gpu::GpuRenderer, input: &RenderInput, w: u32, h: u32) -> Vec<u8> {
     let mut win = aterm_gpu::WindowGpu::new();
     gpu.virtual_begin(&mut win, w, h, opts())
@@ -270,13 +276,13 @@ fn tap_virtual(gpu: &mut aterm_gpu::GpuRenderer, input: &RenderInput, w: u32, h:
 /// counterpart only inside the region rect, and the readback shimmers
 /// identically.
 #[test]
+#[cfg(wgpu_arm)]
 fn shimmer_reaches_all_three_introspection_paths() {
     let mut gpu = gpu();
     // These taps are the wgpu stand-in harness (the wgpu oracle arm). The
     // armed tap ring has its own differential
     // (`armed_present_tap_ring_captures_the_submit_b_destination_byte_for_byte`).
-    #[cfg(target_os = "macos")]
-    gpu.disarm_metal_for_oracle();
+    crate::common::disarm_for_oracle(&mut gpu);
     gpu.set_bloom(true); // the full parity-class stack, as shipped
     gpu.set_sdr_glow_boost(0.0); // keep the crown's own wall-clock ease out
     gpu.set_shimmer_phase_for_test(Some(0.31));

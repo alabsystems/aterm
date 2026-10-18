@@ -10,7 +10,7 @@
 
 use crate::support::write_cap;
 use aterm_buffer::{Edit, Surface};
-use aterm_spec::derive::evict_full_model;
+use aterm_models_session::evict_full_model;
 use std::collections::BTreeSet;
 
 /// The real ring cap (`aterm_buffer::MAX_LOG_EVENTS`).

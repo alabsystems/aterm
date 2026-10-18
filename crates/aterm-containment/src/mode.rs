@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The four containment levels: Master=3, User=2, Safety=1, Containment=0; a higher level
-//! is more capability.
+//! The three containment levels: User=2, Safety=1, Containment=0; a higher level is more
+//! capability.
 
 use std::fmt;
 
-/// The 4 containment modes, ordered by capability ([`Self::level`]); the crate-root table says
+/// The 3 containment modes, ordered by capability ([`Self::level`]); the crate-root table says
 /// what each enforces.
 ///
 /// Set only by the launcher (`--containment` / `--sandbox` / `--no-sandbox`); aterm cannot
@@ -22,8 +22,6 @@ pub enum ContainmentMode {
     Safety = 1,
     /// Normal usage — standard safeguards.
     User = 2,
-    /// Full trust — developer mode.
-    Master = 3,
 }
 
 impl ContainmentMode {
@@ -39,7 +37,6 @@ impl ContainmentMode {
     #[must_use]
     pub(crate) const fn name(self) -> &'static str {
         match self {
-            Self::Master => "Master",
             Self::User => "User",
             Self::Safety => "Safety",
             Self::Containment => "Containment",
@@ -50,7 +47,6 @@ impl ContainmentMode {
     #[must_use]
     pub(crate) fn from_str_loose(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
-            "master" => Some(Self::Master),
             "user" => Some(Self::User),
             "safety" => Some(Self::Safety),
             "containment" => Some(Self::Containment),
@@ -87,7 +83,7 @@ impl fmt::Display for ParseModeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("invalid containment mode: ")?;
         fmt::Debug::fmt(&self.0, f)?;
-        f.write_str(" (expected: master, user, safety, containment)")
+        f.write_str(" (expected: user, safety, containment)")
     }
 }
 
@@ -111,32 +107,8 @@ mod tests {
 
     #[test]
     fn test_ordering() {
-        assert!(ContainmentMode::Master > ContainmentMode::User);
         assert!(ContainmentMode::User > ContainmentMode::Safety);
         assert!(ContainmentMode::Safety > ContainmentMode::Containment);
-    }
-
-    #[test]
-    fn test_parse() {
-        assert_eq!(
-            "master".parse::<ContainmentMode>().unwrap(),
-            ContainmentMode::Master
-        );
-        assert_eq!(
-            "SAFETY".parse::<ContainmentMode>().unwrap(),
-            ContainmentMode::Safety
-        );
-        assert_eq!(
-            "User".parse::<ContainmentMode>().unwrap(),
-            ContainmentMode::User
-        );
-        assert!("invalid".parse::<ContainmentMode>().is_err());
-    }
-
-    #[test]
-    fn test_display() {
-        assert_eq!(ContainmentMode::Master.to_string(), "Master");
-        assert_eq!(ContainmentMode::Containment.to_string(), "Containment");
     }
 
     /// Only an exact mode name (any case) parses: no number, padding, prefix or NUL.
@@ -146,24 +118,22 @@ mod tests {
         assert!("0".parse::<ContainmentMode>().is_err());
         assert!("1".parse::<ContainmentMode>().is_err());
         assert!("2".parse::<ContainmentMode>().is_err());
-        assert!("3".parse::<ContainmentMode>().is_err());
 
-        assert!(" master".parse::<ContainmentMode>().is_err());
-        assert!("master ".parse::<ContainmentMode>().is_err());
-        assert!("master\n".parse::<ContainmentMode>().is_err());
+        assert!(" user".parse::<ContainmentMode>().is_err());
+        assert!("user ".parse::<ContainmentMode>().is_err());
+        assert!("user\n".parse::<ContainmentMode>().is_err());
 
-        assert!("mast".parse::<ContainmentMode>().is_err());
+        assert!("use".parse::<ContainmentMode>().is_err());
         assert!("contain".parse::<ContainmentMode>().is_err());
 
         assert!("".parse::<ContainmentMode>().is_err());
 
-        assert!("master\0".parse::<ContainmentMode>().is_err());
+        assert!("user\0".parse::<ContainmentMode>().is_err());
     }
 
     #[test]
     fn test_display_parse_roundtrip() {
         for mode in [
-            ContainmentMode::Master,
             ContainmentMode::User,
             ContainmentMode::Safety,
             ContainmentMode::Containment,
@@ -171,16 +141,8 @@ mod tests {
             let s = mode.to_string();
             let parsed: ContainmentMode = s.parse().unwrap();
             assert_eq!(parsed, mode, "roundtrip failed for {mode}");
+            let upper: ContainmentMode = s.to_ascii_uppercase().parse().unwrap();
+            assert_eq!(upper, mode, "case-insensitive parse failed for {mode}");
         }
-    }
-
-    #[test]
-    fn test_parse_error_includes_input() {
-        let err = "bogus".parse::<ContainmentMode>().unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("bogus"),
-            "error message should include rejected input, got: {msg}"
-        );
     }
 }

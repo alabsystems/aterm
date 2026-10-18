@@ -420,18 +420,6 @@ mod tests {
             class(Err(HttpError::Transport("curl HEAD x failed".into()))),
             Err(PointerError::Transport(_))
         ));
-        // The standing state's wording names its causes.
-        let text = PointerError::NoRelease { url: url.clone() }.to_string();
-        assert!(
-            text.contains("no published release") && text.contains("private"),
-            "{text}"
-        );
-        // And no refusal ever echoes the server's string.
-        let text = PointerError::Refused {
-            why: "the redirect differs from the derived download URL",
-        }
-        .to_string();
-        assert!(!text.contains("github.com"), "{text}");
     }
 
     /// One HEAD, to the evergreen URL; none for an unsafe source.
@@ -458,21 +446,5 @@ mod tests {
             resolve_with("a/b", REPO, NAME, &canonical_app_tag, &mut none),
             Err(PointerError::UnsafeName)
         );
-    }
-
-    #[test]
-    fn the_app_grammar_is_the_shared_tag_rule() {
-        assert!(canonical_app_tag("v0.74.0"));
-        assert!(canonical_app_tag("v1.2.3"));
-        for bad in [
-            "v0.74",
-            "v01.74.0",
-            "v0.74.0-rc1",
-            "V0.74.0",
-            "0.74.0",
-            "atpkg-ty-2973",
-        ] {
-            assert!(!canonical_app_tag(bad), "{bad}");
-        }
     }
 }

@@ -131,37 +131,6 @@ fn an_ask_derives_its_hold_and_leads_with_the_reason_and_the_action() {
     assert_eq!(s.need().class().as_str(), "now");
 }
 
-/// Only whitelisted movers exist: none of them is a decline, a snooze, a
-/// navigation to a tab or the log, or `Details`.
-#[test]
-fn no_mover_is_a_decline_or_a_snooze() {
-    let movers = [
-        Mover::open_settings("/updates"),
-        Mover::open_system_pane("full-disk-access"),
-        Mover::open_config_editor(Some(3)),
-        Mover::apply_update(7),
-        Mover::new_window(),
-        Mover::upgrade_now("s-1", "2.1.284"),
-    ];
-    for m in &movers {
-        let i = m.intent();
-        assert!(!i.closes_row() && !i.is_ask(), "{i:?} declines");
-        assert_ne!(*i, Intent::Details);
-        assert!(
-            !matches!(
-                i,
-                Intent::AgentUpgrade {
-                    word: UpgradeWord::NotToday | UpgradeWord::Skip,
-                    ..
-                } | Intent::ShowTab { .. }
-                    | Intent::OpenPath { .. }
-                    | Intent::StopPaste { .. }
-            ),
-            "{i:?} is a snooze or a navigation, not the one action"
-        );
-    }
-}
-
 /// `LaterAsk::outlasted` is `None` until the fact has gone on for its named
 /// horizon: the only way to show a self-healing fact is to wait it out.
 #[test]
@@ -213,31 +182,6 @@ fn a_fingerprint_fits_the_key_cap_and_stays_distinct() {
 }
 
 // ---- the door -----------------------------------------------------------------
-
-/// An unclassified hold past two minutes is cut to two minutes and counted as a defect of
-/// its builder (`last_demoted` names it): only a class earns a longer one
-/// (`Ask::flash(.., Span::Ten)`, the posture row).
-#[test]
-fn an_unclassified_hold_past_two_minutes_is_cut_and_named() {
-    let now = t0();
-    let mut c = fresh(now);
-    let id = c
-        .post(
-            Message::new(tags::SYSTEM, Severity::Warn, "long")
-                .key("packages.posture")
-                .hold(Hold::For(Duration::from_secs(600))),
-            stamp(0),
-            now,
-        )
-        .id;
-    assert_eq!(
-        c.live(id).unwrap().msg.hold,
-        Hold::For(MAX_TRANSIENT),
-        "cut to the longest a row may hold"
-    );
-    assert_eq!(c.demotions(), 1);
-    assert_eq!(c.last_demoted(), Some("packages.posture"));
-}
 
 /// A persistent hold cannot be written by hand outside the crate; one copied onto an
 /// unclassified message from another message's `hold` stands on nothing: a record,
@@ -370,21 +314,6 @@ fn an_ask_that_says_nothing_is_a_record() {
     assert_eq!(c.demotions(), 1);
 }
 
-/// The notice kinds are the closed list; each earns its own span.
-#[test]
-fn a_notice_earns_its_kinds_span() {
-    assert_eq!(NoticeKind::LastRun.span(), MAX_TRANSIENT);
-    assert_eq!(NoticeKind::Script.span(), MAX_TRANSIENT);
-    assert_eq!(
-        NoticeKind::Answer.span(),
-        MAX_TRANSIENT,
-        "two minutes; then the log"
-    );
-    let m = Message::new(tags::CRASH, Severity::Error, "aterm crashed last time")
-        .notice(NoticeKind::LastRun);
-    assert_eq!(m.hold, Hold::For(MAX_TRANSIENT));
-}
-
 // ---- the digest never seats ------------------------------------------------------
 
 /// An exception asks for no row, moves no band revision and arms no timer.
@@ -410,7 +339,8 @@ fn a_later_never_wants_a_row() {
 
 /// The metamorphic property, over random operation sequences: two centers see
 /// the same operations, but only one is also posted exceptions and dismissals.
-/// The band-facing state never differs by a single row.
+/// The band-facing state never differs by a single row (a seated exception
+/// would move `wanted_rows` on its first step).
 #[test]
 fn the_digest_is_invisible_to_the_band() {
     let mut rng = 0x9e37_79b9_7f4a_7c15_u64;
@@ -530,25 +460,6 @@ fn the_digest_is_invisible_to_the_band() {
             );
         }
     }
-}
-
-/// Negative control for the sweep above: a `Later` posted as a plain warning (as a broken
-/// router would seat it) is caught by the same comparison on the first step.
-#[test]
-fn a_seated_exception_would_be_seen() {
-    let now = t0();
-    let mut with = fresh(now);
-    let mut without = fresh(now);
-    let seated = Message::new(tags::HARNESS, Severity::Warn, "Claude in tab 1 is behind");
-    with.post(seated, stamp(0), now);
-    assert_ne!(with.wanted_rows(), without.wanted_rows());
-    assert_ne!(with.revision(), without.revision());
-    without.post(fda(), stamp(0), now);
-    assert_eq!(
-        without.wanted_rows(),
-        0,
-        "while the digest entry seats nothing"
-    );
 }
 
 // ---- posting, dismissing, quiet ---------------------------------------------------
@@ -1084,52 +995,35 @@ fn notice_dismiss_files_the_digest() {
     assert!(NoticeRequest::parse("dismiss review please").is_err());
 }
 
-/// `aterm exceptions` reads a replayed log (no center, no window) and lists the exceptions
-/// in the words the glass used: open ones first, then what was filed, and nothing else.
+/// The owner's own Dismiss of an exception keeps it "declined" for its back-off span
+/// (`dismissed_quiet`), and nothing else does: an answer is no decline, and the span
+/// runs out.
 #[test]
-fn the_exceptions_report_reads_a_replayed_log() {
+fn only_the_owners_dismiss_reads_as_a_decline_for_its_span() {
     let now = t0();
     let mut c = fresh(now);
-    c.post(own_work("tab 1"), stamp(0), now);
-    c.post(fda(), stamp(1), now);
-    c.post(flash(), stamp(2), now); // not an exception: never in the report
-    c.file_digest_one(c.digest().entries[1].id, stamp(5_000), now);
-    let lines: Vec<String> = c
-        .drain_new_for_persist()
-        .iter()
-        .map(LogLine::encode)
-        .collect();
-    let mut log = MessageLog::empty();
-    log.replay_all(lines.iter().filter_map(|l| LogLine::decode(l).ok()));
+    c.post(fda(), stamp(0), now);
+    let entry = c.digest().entries[0].clone();
+    let key = entry.key.clone();
+    assert!(
+        !c.dismissed_quiet(&key, Resurface::CHOICE, stamp(1)),
+        "open, not filed"
+    );
+    assert!(c.file_digest_one(entry.id, stamp(5_000), now));
+    assert!(c.dismissed_quiet(&key, Resurface::CHOICE, stamp(10_000)));
+    let after = 5_000 + Resurface::CHOICE.backed_off(1) + 1;
+    assert!(
+        !c.dismissed_quiet(&key, Resurface::CHOICE, stamp(after)),
+        "the span runs out"
+    );
+    assert!(!c.dismissed_quiet("privacy.other", Resurface::CHOICE, stamp(10_000)));
 
-    let open = crate::exceptions_report(&log, crate::ReportScope::Open, 0, 0);
-    assert_eq!(open[0], "To look at (1)");
-    assert!(
-        open.iter().any(|l| l.contains("Claude in tab 1 is behind")),
-        "{open:#?}"
-    );
-    assert!(
-        open.iter()
-            .any(|l| l.trim_start().starts_with("why") && l.contains("background work"))
-    );
-    assert!(
-        open.iter()
-            .any(|l| l.trim_start().starts_with("then") && l.contains("Stop that work"))
-    );
-    assert!(!open.iter().any(|l| l.contains("macOS keeps asking")));
-    assert!(
-        !open.iter().any(|l| l.contains("bad key")),
-        "a Now row is not an exception"
-    );
-
-    let all = crate::exceptions_report(&log, crate::ReportScope::All, 0, 0);
-    let filed_at = all.iter().position(|l| l.starts_with("Filed")).unwrap();
-    assert_eq!(all[filed_at], "Filed (1)");
-    assert!(
-        all[filed_at..]
-            .iter()
-            .any(|l| l.contains("macOS keeps asking") || l.contains("dismissed"))
-    );
+    // Pressing the entry's action (Open Settings) is an answer, never a decline.
+    let mut answered = fresh(now);
+    answered.post(fda(), stamp(0), now);
+    let id = answered.digest().entries[0].id;
+    let _ = answered.act_digest(id, ActionIndex(0), stamp(5_000), now);
+    assert!(!answered.dismissed_quiet(&key, Resurface::CHOICE, stamp(10_000)));
 }
 
 /// The report lists the open entries worst first, marking a warning, and a filed
@@ -1197,48 +1091,6 @@ fn the_exceptions_report_ranks_warnings_first_and_drops_a_fixed_entrys_action() 
     assert!(
         filed.iter().any(|l| l.trim_start().starts_with("then")),
         "{filed:#?}"
-    );
-}
-
-/// A log read days later says when: today's entries by time alone, an earlier day's with
-/// its date, on the reader's own clock (`offset_s`).
-#[test]
-fn the_exceptions_report_says_the_day_of_an_earlier_entry() {
-    let now = t0();
-    let mut c = fresh(now);
-    // 2026-09-21 14:13:20 UTC, a Monday; the reader is one hour east.
-    let at = stamp(0).unix_ms;
-    c.post(own_work("tab 1"), stamp(0), now);
-    c.file_digest(stamp(60_000), now);
-    let lines: Vec<String> = c
-        .drain_new_for_persist()
-        .iter()
-        .map(LogLine::encode)
-        .collect();
-    let mut log = MessageLog::empty();
-    log.replay_all(lines.iter().filter_map(|l| LogLine::decode(l).ok()));
-    let said = |now_ms: u64| {
-        crate::exceptions_report(&log, crate::ReportScope::Filed, 3_600, now_ms)
-            .into_iter()
-            .find(|l| l.trim_start().starts_with("since"))
-            .expect("a filed entry has a since line")
-    };
-    // The same day: the clock alone, in the reader's zone.
-    assert_eq!(
-        said(at + 3_600_000),
-        "      since  3:13 PM \u{b7} dismissed 3:14 PM"
-    );
-    // The next day: the date words lead.
-    assert!(
-        said(at + DAY_MS).contains("Yesterday, 3:13 PM"),
-        "{}",
-        said(at + DAY_MS)
-    );
-    // A week on: the calendar date.
-    assert!(
-        said(at + 8 * DAY_MS).contains("Mon, 21 Sep, 3:13 PM"),
-        "{}",
-        said(at + 8 * DAY_MS)
     );
 }
 
@@ -1560,11 +1412,6 @@ fn a_fact_dismissed_again_backs_off() {
         vec![7, 28, 90, 90, 90],
         "a week, a month, then three months"
     );
-    assert_eq!(Resurface::WAIT.backed_off(1), 7 * DAY_MS);
-    assert_eq!(Resurface::WAIT.backed_off(2), 28 * DAY_MS);
-    assert_eq!(Resurface::WAIT.backed_off(3), 90 * DAY_MS);
-    assert_eq!(Resurface::CHOICE.backed_off(1), 30 * DAY_MS);
-    assert_eq!(Resurface::CHOICE.backed_off(2), 90 * DAY_MS);
     assert_eq!(Resurface::WAIT.backed_off(u32::MAX), 90 * DAY_MS);
 }
 

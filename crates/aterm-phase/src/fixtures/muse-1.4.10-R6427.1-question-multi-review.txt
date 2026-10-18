@@ -1,0 +1,22 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab) · the two-question call after Enter on the second question's `Large`: the review, `Review answers before submit · …`, each answer (the first's note beside it), `⟩ Submit answers` focused and `Interrupt turn` · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+  Muse Code 1.4.10
+
+❯ carry on with the task
+
+◆ Hi! I am the local lab stub, not a model. (reply 1)
+
+❯ toolstart
+
+◈ Request user input Color, Size — running (1m 35s)
+
+  Review answers before submit · Enter to edit or submit · ↑/↓ to move · Esc to go back
+    Color: None of the above; note: the policy text goes here
+    Size: Large
+  ⟩ Submit answers
+    Interrupt turn
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  lab-stub · high · /private/tmp/at.lab0/proj · Auto-review

@@ -13,6 +13,11 @@
 # - The managed dirs, LIVE: an already-running session shell resolves claude/codex
 #   to atpkg's <prefix>/agents twins the moment atpkg lays them - no new tab
 #   (owner ask 2026-09-16; see LIVE below)
+# - Key bindings: the readline chords (Ctrl+A/E/K/U/W/Y, Alt+B/F, ...) layered
+#   over PSReadLine's Windows edit mode in an aterm tab; a key the profile bound
+#   to anything but its Windows-mode default keeps that binding, and
+#   $env:ATERM_DISABLE_READLINE_KEYS = '1' in $PROFILE turns the layer off
+#   (see KEY BINDINGS below)
 #
 # Compatible with: Windows PowerShell 5.1 and PowerShell 7+ (pwsh) on any OS.
 # ASCII only: aterm writes this file without a BOM, and Windows PowerShell 5.1
@@ -41,14 +46,11 @@ if (($env:ATERM_CHILD -or $env:ATERM_SESSION_ID) -and
     catch { }
 }
 
-# Package bin directory
+# Source package shell hooks. No `~/.aterm/bin` goes on PATH: nothing creates or
+# manages that folder, and an entry there ahead of everything would let whatever
+# lands in it shadow every command in every session. atpkg's managed bin/ is
+# APPENDED, by its own hook.
 if ($HOME) {
-    $__aterm_bin = Join-Path $HOME '.aterm/bin'
-    if (Test-Path -LiteralPath $__aterm_bin) {
-        $env:PATH = $__aterm_bin + [System.IO.Path]::PathSeparator + $env:PATH
-    }
-
-    # Source package shell hooks
     $__aterm_hooks = Join-Path $HOME '.aterm/shell.d'
     if (Test-Path -LiteralPath $__aterm_hooks) {
         foreach ($__aterm_hook in (Get-ChildItem -LiteralPath $__aterm_hooks -Filter '*.ps1' -ErrorAction SilentlyContinue)) {
@@ -353,4 +355,143 @@ if (Get-Module -Name PSReadLine) {
         }
         $__aterm_line
     }
+}
+
+# --- KEY BINDINGS: the readline chords, layered over PSReadLine's Windows mode ---
+#
+# A hand that learned the line editor in a macOS or Linux terminal reaches for
+# readline's chords. PSReadLine's default edit mode on Windows, Windows, leaves
+# Ctrl+E/K/U/B/F/P/N/T/D/_ unbound, makes Ctrl+A SelectAll and Ctrl+Y Redo, and
+# types a literal b or f for Alt+B/F (measured 2026-10-16 through ConPTY with
+# the bytes aterm's key encoder writes, on pwsh 7.6.7 / PSReadLine 2.4.5 and
+# Windows PowerShell 5.1 / PSReadLine 2.0.0). Its Emacs mode was measured and
+# rejected: it loses Ctrl+Left/Right word motion, makes Escape and Ctrl+X chord
+# prefixes and Tab Complete. So the readline chords go over Windows mode, and
+# Tab, Ctrl+Z/V/C/X, Ctrl+Left/Right, Ctrl+Backspace/Delete, Escape and Home/End
+# stay as Windows has them. Alt+D is KillWord in Windows mode already.
+#
+# A chord is bound only where it is unbound or still holds its stock Windows-mode
+# function (each row's third column), so a key the user's profile bound to
+# anything else keeps the profile's binding: the profile runs before this file
+# (the -Command aterm passes pwsh). A profile that binds a key to its stock
+# function (Ctrl+A SelectAll, Ctrl+Y Redo, Ctrl+W BackwardKillWord) cannot be
+# told from stock and is replaced; ATERM_DISABLE_READLINE_KEYS keeps those. The
+# first key of a two-key chord counts as bound: -Bound lists only the chord
+# ('Ctrl+d,Ctrl+c'), while PSReadLine dispatches its first key to the chord, so
+# binding that key alone would leave the profile's chord unreachable (measured
+# 2026-10-16 on both hosts with the Ctrl+d,Ctrl+c CaptureScreen chord of
+# PSReadLine's own SamplePSReadLineProfile.ps1).
+#
+# Gated on PSReadLine being loaded, an aterm tab (ATERM_CHILD or ATERM_SESSION_ID,
+# as the UTF-8 block above), ATERM_DISABLE_READLINE_KEYS unset (set it in
+# $PROFILE to keep stock Windows mode), and EditMode Windows, so a profile that
+# chose Emacs or Vi is left alone. Once per shell, by the loaded guard at the top.
+#
+# PowerShell 5.1 ships PSReadLine 2.0.0: it has no -Chord on
+# Get-PSReadLineKeyHandler, so the -Bound list is read whole, and no
+# BackwardKillInput (Ctrl+U falls back to BackwardKillLine) or Upcase/Downcase/
+# CapitalizeWord (those rows are skipped: a row whose function this PSReadLine
+# lacks binds nothing). Key strings are case-significant (Ctrl+C is Copy, Ctrl+c
+# CopyOrCancelLine) and @{} is not, so the bound list is an Ordinal dictionary.
+# Alt+Left/Right (CSI 1;3D/1;3C) move by word on 5.1 with its own PSReadLine
+# 2.0.0 and on pwsh 7. A 5.1 running PSReadLine 2.4.5 (upgraded by
+# Install-Module, or pwsh 7's own, found through a PSModulePath inherited from a
+# pwsh parent) drops both keys, as a bare [Console]::ReadKey under 5.1 does
+# (measured 2026-10-16 through ConPTY).
+#
+# Ctrl+E also accepts PSReadLine's inline suggestion, as end-of-line does under
+# zsh-autosuggestions in a macOS tab. RightArrow and the layer's Ctrl+F
+# (ForwardChar) accept it, while EndOfLine and End leave the caret and the dim
+# suggestion where they were (measured 2026-10-16 through ConPTY on pwsh 7.6.7 /
+# PSReadLine 2.4.5, PredictionSource History, InlineView). So where PSReadLine
+# has AcceptSuggestion, the Ctrl+e row is a script block: with the caret at the
+# end of the line it calls AcceptSuggestion, and then it calls EndOfLine. With the
+# caret inside the line the first press only moves to the end and a second press
+# accepts, which is zsh-autosuggestions' rule (_zsh_autosuggest_accept runs the
+# plain widget unless CURSOR is at the end of the buffer) and ForwardChar's.
+# AcceptSuggestion itself never reads the caret: a block that called it at every
+# press turned a mid-line Ctrl+E, Enter into a run of the suggested history line
+# ('#R5 alpha beta' with the caret 5 left of the end submitted '#R5 alpha beta
+# gamma delta'), where the caret test submits what was typed. With no inline
+# suggestion showing (none matches, or the profile chose PredictionViewStyle
+# ListView), AcceptSuggestion does nothing and the key is EndOfLine. PSReadLine
+# 2.0.0 has neither AcceptSuggestion nor predictions, so there the row stays
+# EndOfLine. The block runs at every press, long after this function has
+# returned, so it names the type in full and reads none of this function's
+# variables: they are gone by then, and a block that read $__aterm_rl printed
+# "You cannot call a method on a null-valued expression" at every press and
+# accepted nothing (all measured 2026-10-16 through ConPTY, as above).
+function Global:__aterm_setup_keybindings {
+    # Local to this function: any failure stops the layer, caught by the caller,
+    # instead of printing at startup.
+    $ErrorActionPreference = 'Stop'
+    if (-not (Get-Module -Name PSReadLine)) { return }
+    if ((Get-PSReadLineOption).EditMode -ne 'Windows') { return }
+    $__aterm_bound = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([System.StringComparer]::Ordinal)
+    foreach ($__aterm_h in @(Get-PSReadLineKeyHandler -Bound)) {
+        $__aterm_k = [string]$__aterm_h.Key
+        $__aterm_bound[$__aterm_k] = [string]$__aterm_h.Function
+        # A chord's first key is bound too (see above). The [^+] keeps the comma
+        # of a comma key ('Alt+,') from splitting it.
+        if ($__aterm_k -match '^(.+?[^+]),.') { $__aterm_bound[$Matches[1]] = 'ChordFirstKey' }
+    }
+    $__aterm_rl = [Microsoft.PowerShell.PSConsoleReadLine]
+    $__aterm_kill_input = if ($__aterm_rl.GetMethod('BackwardKillInput')) { 'BackwardKillInput' } else { 'BackwardKillLine' }
+    $__aterm_end_of_line = 'EndOfLine'
+    if ($__aterm_rl.GetMethod('AcceptSuggestion')) {
+        $__aterm_end_of_line = @{
+            BriefDescription = 'AcceptSuggestionAndEndOfLine'
+            Description      = 'At the end of the line, accept the inline suggestion if one shows; elsewhere, move the cursor to the end of the line (aterm readline keys)'
+            ScriptBlock      = {
+                param($key, $arg)
+                $line = $null
+                $cursor = $null
+                [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
+                if ($cursor -eq $line.Length) {
+                    [Microsoft.PowerShell.PSConsoleReadLine]::AcceptSuggestion($key, $arg)
+                }
+                [Microsoft.PowerShell.PSConsoleReadLine]::EndOfLine($key, $arg)
+            }
+        }
+    }
+    # chord, function (a PSReadLine function's name, or a script block handler's
+    # Set-PSReadLineKeyHandler parameters), the stock Windows-mode function it may
+    # replace ('' = unbound)
+    foreach ($__aterm_row in @(
+            @('Ctrl+a', 'BeginningOfLine', 'SelectAll'),
+            @('Ctrl+e', $__aterm_end_of_line, ''),
+            @('Ctrl+b', 'BackwardChar', ''),
+            @('Ctrl+f', 'ForwardChar', ''),
+            @('Ctrl+k', 'KillLine', ''),
+            @('Ctrl+u', $__aterm_kill_input, ''),
+            @('Ctrl+w', 'UnixWordRubout', 'BackwardKillWord'),
+            @('Ctrl+p', 'PreviousHistory', ''),
+            @('Ctrl+n', 'NextHistory', ''),
+            @('Ctrl+d', 'DeleteCharOrExit', ''),
+            @('Ctrl+t', 'SwapCharacters', ''),
+            @('Ctrl+y', 'Yank', 'Redo'),
+            @('Ctrl+_', 'Undo', ''),
+            @('Alt+b', 'BackwardWord', ''),
+            @('Alt+f', 'ForwardWord', ''),
+            @('Alt+Backspace', 'BackwardKillWord', ''),
+            @('Alt+LeftArrow', 'BackwardWord', ''),
+            @('Alt+RightArrow', 'ForwardWord', ''),
+            @('Alt+u', 'UpcaseWord', ''),
+            @('Alt+l', 'DowncaseWord', ''),
+            @('Alt+c', 'CapitalizeWord', ''))) {
+        $__aterm_how = $__aterm_row[1]
+        if ($__aterm_how -is [string]) {
+            if (-not $__aterm_rl.GetMethod($__aterm_how)) { continue }
+            $__aterm_how = @{ Function = $__aterm_how }
+        }
+        $__aterm_cur = $null
+        $null = $__aterm_bound.TryGetValue($__aterm_row[0], [ref]$__aterm_cur)
+        if ((-not $__aterm_cur) -or ($__aterm_cur -ceq $__aterm_row[2])) {
+            Set-PSReadLineKeyHandler -Chord $__aterm_row[0] @__aterm_how
+        }
+    }
+}
+if ((Get-Module -Name PSReadLine) -and ($env:ATERM_CHILD -or $env:ATERM_SESSION_ID) -and
+    (-not $env:ATERM_DISABLE_READLINE_KEYS)) {
+    try { __aterm_setup_keybindings } catch { }
 }

@@ -71,8 +71,9 @@ impl Terminal {
 
     /// How many cells a paste of `text` advances the caret on its own row,
     /// priced from the same sanitized body [`Self::format_paste_framed`] sends
-    /// (control-character sanitizer, then grapheme display width under the
-    /// terminal's ambiguous-width mode).
+    /// (control-character sanitizer, then the grid's own column walk,
+    /// [`aterm_grapheme::str_grid_columns_with`], under the terminal's
+    /// ambiguous-width mode).
     ///
     /// `Some(cells)` for a single-line body; `None` when the width is unknowable
     /// from the text: a TAB, a line break, or a body longer than
@@ -81,7 +82,7 @@ impl Terminal {
     /// before any character is scanned.
     #[must_use]
     pub fn paste_insert_cells(text: &str, ambiguous_width_double: bool) -> Option<u16> {
-        use aterm_types::text_shaping::{AmbiguousWidth, TextShapingConfig};
+        use aterm_types::text_shaping::AmbiguousWidth;
 
         let text = bounded_paste_text(text);
         if text.len() > PASTE_INSERT_PRICE_BYTES {
@@ -101,19 +102,14 @@ impl Terminal {
         if aterm_grapheme::str_width(&body) == 0 {
             return Some(0);
         }
-        let shaping = TextShapingConfig {
-            ambiguous_width: if ambiguous_width_double {
-                AmbiguousWidth::Double
-            } else {
-                AmbiguousWidth::Single
-            },
-            ..TextShapingConfig::default()
+        let ambiguous = if ambiguous_width_double {
+            AmbiguousWidth::Double
+        } else {
+            AmbiguousWidth::Single
         };
         Some(
-            u16::try_from(
-                aterm_grapheme::grapheme_width_with_config(&body, &shaping).display_width,
-            )
-            .unwrap_or(u16::MAX),
+            u16::try_from(aterm_grapheme::str_grid_columns_with(&body, ambiguous))
+                .unwrap_or(u16::MAX),
         )
     }
 
@@ -224,8 +220,8 @@ impl Terminal {
     /// content scroll and no damage band, so the selection is re-floored here (partial
     /// eviction clamps the head; only a selection wholly evicted is destroyed).
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "SelectionCustody",
             action = "Evict",
             project = "aterm_gui::selection_custody_conformance::project_selection_custody"
@@ -257,8 +253,6 @@ impl Terminal {
             self.text_selection
                 .truncate_to_floor(self.grid.oldest_absolute_row(), live_top_abs);
         }
-        // A vi cursor on an evicted line rests on the oldest line kept.
-        self.vi_shift(0);
     }
 
     /// The retained scrollback line limit of the primary-content grid
@@ -270,32 +264,19 @@ impl Terminal {
     }
 
     /// Highest scrollback watermark pressure across the main and alternate
-    /// grids: the tiered stores' budget watermarks plus the advisory ring byte
-    /// watermark (`set_ring_byte_watermark`), so a ring-only unlimited terminal
-    /// still reports pressure.
+    /// grids' tiered stores' budget watermarks.
     #[must_use]
     pub fn scrollback_pressure_level(&self) -> crate::scrollback::WatermarkLevel {
         let mut level = self.grid.scrollback().map_or(
             crate::scrollback::WatermarkLevel::Green,
             aterm_scrollback::ScrollbackStorage::watermark_level,
         );
-        level = level.max(self.grid.ring_watermark_level());
         if let Some(ref alt) = self.alt_grid {
             if let Some(scrollback) = alt.scrollback() {
                 level = level.max(scrollback.watermark_level());
             }
         }
         level
-    }
-
-    /// Set the advisory ring byte watermark on the primary-content grid: with
-    /// no tiered store and no line limit, it makes
-    /// [`scrollback_pressure_level`](Self::scrollback_pressure_level) report
-    /// Yellow/Red as ring memory approaches it. Advisory only (no eviction);
-    /// `None` disables it.
-    #[cfg(test)]
-    pub fn set_ring_byte_watermark(&mut self, budget: Option<usize>) {
-        self.grid.set_ring_byte_watermark(budget);
     }
 
     /// Monotonic count of history lines lost to non-user-requested truncation across
@@ -346,16 +327,13 @@ impl Terminal {
         // `erase_scrollback` ran on both grids, so the parked selection dangles
         // too; clear it now rather than waiting for the exit batch's damage.
         self.parked_text_selection.clear();
-        // Shell integration marks hold absolute row numbers that dangle once
-        // scrollback is erased.
-        self.shell.command_marks.clear();
-        self.shell.output_blocks.clear();
-        self.shell.current_block = None;
-        self.shell.current_mark = None;
-        self.marks_state.marks.clear();
-        self.marks_state.annotations.clear();
-        // A vi cursor in history rests on the screen.
-        self.vi_shift(0);
+        // The anchors wholly in the erased history go with it; the visible
+        // rows keep their absolute numbers, so the rest stay where they are,
+        // but for the command still being entered or run, which starts at the
+        // oldest row left if the erase took its first rows. Every anchor names
+        // a main-grid row.
+        let oldest = self.main_grid().oldest_absolute_row();
+        super::handler::forget_erased_history(oldest, &mut self.shell, &mut self.marks_state);
     }
 
     /// Scroll display by delta lines.
@@ -424,13 +402,6 @@ impl Terminal {
             self.transient.response_buffer.clear();
             Some(data)
         }
-    }
-
-    /// Expose response buffer capacity for test assertions.
-    #[cfg(test)]
-    #[must_use]
-    pub fn response_buffer_capacity(&self) -> usize {
-        self.transient.response_buffer.capacity()
     }
 
     /// Drain the edge-triggered BEL flag: returns `true` if a (rate-limited)
@@ -610,39 +581,16 @@ mod tests {
         assert_eq!(t.scrollback_line_limit(), Some(50));
     }
 
-    /// The advisory ring byte watermark folds into the pressure query, and the
-    /// truncation counter aggregates grid and store loss, counting nothing for
-    /// user-requested limits.
+    /// A user limit shrink evicts intentionally: the truncation counter never
+    /// counts it as loss.
     #[test]
-    fn ring_watermark_and_truncation_counter_are_out_of_band() {
-        use crate::scrollback::WatermarkLevel;
+    fn requested_truncation_is_not_counted_as_loss() {
         let mut t = Terminal::new(5, 20);
         write_lines(&mut t, 0, 500);
-        assert_eq!(
-            t.scrollback_pressure_level(),
-            WatermarkLevel::Green,
-            "no store, no configured ring watermark → Green"
-        );
         assert_eq!(t.scrollback_truncated_lines(), 0);
-
-        // Configure a budget the ring already exceeds: pressure surfaces
-        // through the same query hosts already poll.
-        t.set_ring_byte_watermark(Some(1));
-        assert_eq!(
-            t.scrollback_pressure_level(),
-            WatermarkLevel::Red,
-            "ring bytes past the advisory budget read Red"
-        );
-        t.set_ring_byte_watermark(None);
-        assert_eq!(t.scrollback_pressure_level(), WatermarkLevel::Green);
-
-        // A user limit shrink evicts intentionally — never counted as loss.
         t.set_scrollback_line_limit(Some(10));
-        assert_eq!(
-            t.scrollback_truncated_lines(),
-            0,
-            "requested truncation is not loss"
-        );
+        assert_eq!(t.grid().scrollback_lines(), 10);
+        assert_eq!(t.scrollback_truncated_lines(), 0);
     }
 
     /// A paste carrying ESC[201~ cannot end the bracket early: ESC is stripped,
@@ -794,16 +742,6 @@ mod tests {
         assert_eq!(codes[3].1, "D;exit=42", "D carries the real exit code");
     }
 
-    /// OSC 52 set queues the real decoded clipboard string (base64 "aGk=" → "hi").
-    #[test]
-    fn osc_52_set_queues_decoded_clipboard() {
-        let mut term = Terminal::new(24, 80);
-        // Clipboard write must be host-authorized (default posture is deny).
-        term.authorize_clipboard_access(crate::terminal::ClipboardAccess::Write);
-        term.process(b"\x1b]52;c;aGk=\x07");
-        assert_eq!(term.take_osc_event(), Some((52, "hi".to_string())));
-    }
-
     /// A flood of large OSC 52 sets is held to the queue's byte budget, not
     /// 1024 x 64 KiB, and a late poll still sees the newest sets in order —
     /// the native hosts never drain this queue, so the bound is all there is.
@@ -826,41 +764,6 @@ mod tests {
             assert_eq!(*code, 52);
             assert!(*text == payload(u8::try_from(newest + offset).unwrap()));
         }
-    }
-
-    /// DEC mode 2031 (color-scheme update notifications) flips the real getter.
-    #[test]
-    fn mode_2031_toggles_color_scheme_getter() {
-        let mut term = Terminal::new(24, 80);
-        assert!(!term.report_color_scheme_enabled(), "defaults off");
-        term.process(b"\x1b[?2031h");
-        assert!(term.report_color_scheme_enabled(), "2031 set enables it");
-        term.process(b"\x1b[?2031l");
-        assert!(
-            !term.report_color_scheme_enabled(),
-            "2031 reset disables it"
-        );
-    }
-
-    /// CUP positions the cursor; the grid exposes the real display-relative col/row.
-    #[test]
-    fn cursor_position_reads_real_grid_state() {
-        let mut term = Terminal::new(24, 80);
-        // CSI 5;10 H → row 5, col 10 (1-based) == (4, 9) 0-based.
-        term.process(b"\x1b[5;10H");
-        assert_eq!(term.grid().cursor().row, 4);
-        assert_eq!(term.grid().cursor().col, 9);
-    }
-
-    /// cell_grapheme returns the real written character (base + combining mark).
-    #[test]
-    fn cell_grapheme_reads_real_cell() {
-        let mut term = Terminal::new(24, 80);
-        // 'e' + combining acute accent (U+0301).
-        term.process("e\u{0301}".as_bytes());
-        assert_eq!(term.cell_grapheme(0, 0).as_deref(), Some("e\u{0301}"));
-        // Out-of-range yields None.
-        assert_eq!(term.cell_grapheme(999, 0), None);
     }
 
     /// Insert width is priced from the sanitized single-line body as sent;

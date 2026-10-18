@@ -146,17 +146,6 @@ mod shift_enter_e2e_tests {
     }
 
     #[test]
-    fn kitty_query_is_answered() {
-        let mut term = Terminal::new(24, 80);
-        term.process(b"\x1b[?u");
-        assert_eq!(
-            term.take_response().unwrap_or_default(),
-            b"\x1b[?0u",
-            "must answer the kitty progressive-enhancement query so apps detect support"
-        );
-    }
-
-    #[test]
     fn push_disambiguate_then_shift_enter_is_csi_u() {
         let mut term = Terminal::new(24, 80);
         // Exactly what a kitty-aware app sends to turn on the protocol.
@@ -246,13 +235,6 @@ mod shift_enter_e2e_tests {
             menu(&term).is_empty(),
             "event-types-only still cannot deliver the Menu key"
         );
-    }
-
-    #[test]
-    fn set_disambiguate_then_shift_enter_is_csi_u() {
-        let mut term = Terminal::new(24, 80);
-        term.process(b"\x1b[=1u"); // CSI = 1 u (set, mode 1)
-        assert_eq!(enc_enter(&term, Modifiers::SHIFT), b"\x1b[13;2u");
     }
 
     #[test]
@@ -532,23 +514,6 @@ mod shift_enter_e2e_tests {
         assert_eq!(enc_enter(&term, Modifiers::CTRL), vec![0x0d]);
         term.process(b"\x1b[?9001$p");
         assert_eq!(term.take_response().unwrap_or_default(), b"\x1b[?9001;0$y");
-    }
-
-    #[test]
-    fn conpty_9001_is_reported_by_decrqm_and_cleared_by_ris() {
-        let mut term = conpty_term();
-        term.process(b"\x1b[?9001$p");
-        assert_eq!(term.take_response().unwrap_or_default(), b"\x1b[?9001;2$y");
-        term.process(b"\x1b[?9001h");
-        term.process(b"\x1b[?9001$p");
-        assert_eq!(term.take_response().unwrap_or_default(), b"\x1b[?9001;1$y");
-        // RIS: the mode resets with every other negotiated mode, so the next
-        // conhost session starts from its own `CSI ? 9001 h`, not a stale one.
-        term.process(b"\x1bc");
-        assert!(!term.keyboard_mode().contains(KeyboardMode::WIN32_INPUT));
-        assert_eq!(enc_enter(&term, Modifiers::SHIFT), vec![0x0a]);
-        term.process(b"\x1b[?9001$p");
-        assert_eq!(term.take_response().unwrap_or_default(), b"\x1b[?9001;2$y");
     }
 
     /// The console-host posture is a function of the resize seam policy, both

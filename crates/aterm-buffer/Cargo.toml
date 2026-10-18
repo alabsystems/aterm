@@ -25,6 +25,9 @@ aterm-cap = { workspace = true, features = ["launcher-mint"] }
 # Tier-1 conformance: the derived models in `aterm_spec::derive`, checked
 # against the real `Surface`/`EventLog`.
 aterm-spec = { workspace = true }
+# The models its tests drive (a model edit rebuilds only their tests).
+aterm-models-core = { workspace = true }
+aterm-models-session = { workspace = true }
 
 [lints]
 workspace = true

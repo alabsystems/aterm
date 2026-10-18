@@ -1,0 +1,1144 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! Tier-1 of the harness tape's models (the replay plan's §9). Model 1, `SuperviseTapeRecovery`
+//! (`aterm_models_harness::supervise_tape_recovery_model`): the real writer and the real reader,
+//! bound to the model; models 2 and 3 follow below, each under its own heading.
+//!
+//! The real [`TapeWriter`] writes three tapes, of one, two and three frames — the magic
+//! with the header, then records frames each closed by an act — every frame's write one
+//! `Write` step of the model, after which the bytes on the sink read back as exactly the
+//! frames the model says are written. Then the real [`recover`] reads, of each tape:
+//!
+//! * every byte-offset truncation — the model's schedule is `Write` once per frame wholly
+//!   before the cut, then `Tear` when the cut falls inside a frame and `Crash` when it falls
+//!   on a frame's end, then `Recover`;
+//! * every byte flipped under three masks, 0x01, 0x80 and 0xff (the low bit, the high bit,
+//!   every bit; not the other 252 values a byte can take) — `Write` once per frame,
+//!   `Crash`, then `RotMagic` for a byte of the magic, `Rot` for a byte of a frame with a
+//!   whole frame after it, or `RotLast` for a byte of the last frame, then `Recover`. The
+//!   one-frame tape is the header alone, whose magic damaged is refused although no frame
+//!   follows it.
+//!
+//! Each reading is projected ([`project`]) onto the variables the reading decides
+//! (`recovered`, `refused`, `said_torn`, `done`) and compared with the model's state after
+//! the same schedule; every invariant is checked on the model state with the real reading
+//! put in, and the real items must be exactly the items of the whole frames read
+//! (`RecoveredIsPrefix` on the bytes, not only on the count). Each write and each read is
+//! its own execution-evidence window, so the anchors on `TapeWriter::put` (`Write`) and
+//! `recover` (`Recover`) are witnessed by the steps they claim.
+//!
+//! The negative control is a reader that ignores xxh64 (the shipping reader's own body
+//! with its checksum test off): the bind rejects it — some readings disagree with the
+//! model, a damaged frame is read as written (`RotRefused` broken on the real reading),
+//! and those readings are what the `Buggy = 1` machine, the checksum-blind reader,
+//! predicts.
+
+use std::cell::Cell;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use astream_effects::EffectRecord;
+use aterm_models_harness::{
+    supervise_replay_cursor_model, supervise_tape_recovery_model, supervisor_raised_latch_model,
+};
+use aterm_spec::derive::Model;
+use aterm_spec::interp::{self, State};
+use aterm_spec::rng::XorShift;
+use aterm_spec::xref::StepEvidence;
+
+use super::codec::{ctl_reply, ctl_request};
+use super::ctl::is_act;
+use super::doors;
+use super::frame::{Hint, MAGIC, TapeWriter};
+use super::frame_tests::{HEADER, Memory, Said, mono, noise, screen_read};
+use super::header::VERBATIM;
+use super::recover::{Check, Keep, Limits, Recovered, Tail, read, recover};
+use super::replay::ReplayCore;
+use crate::supervise::fx::Fx;
+use crate::supervise::{Ctl, CtlReply};
+
+const MACHINE: &str = "SuperviseTapeRecovery";
+
+/// The variables a reading decides, as the real reading has them: `recovered` the whole
+/// frames it returned, `refused` a fault, `said_torn` a torn tail.
+pub(crate) fn project(read: &Recovered) -> BTreeMap<&'static str, i64> {
+    BTreeMap::from([
+        ("done", 1),
+        ("recovered", i64::try_from(read.frames).unwrap_or(i64::MAX)),
+        (
+            "refused",
+            i64::from(matches!(read.tail, Tail::Fault { .. })),
+        ),
+        (
+            "said_torn",
+            i64::from(matches!(read.tail, Tail::Torn { .. })),
+        ),
+    ])
+}
+
+/// The model's state after `schedule`, each action required enabled.
+fn walk(model: &Model, schedule: &[&str]) -> State {
+    let mut state = model.init_state();
+    for action in schedule {
+        assert!(
+            model.fire(action, &mut state),
+            "{action} is enabled after {schedule:?}: {state:?}"
+        );
+    }
+    state
+}
+
+/// The real tape, written step by step: its bytes, each frame's end, and the items of
+/// each records frame.
+struct Tape {
+    bytes: Vec<u8>,
+    ends: Vec<usize>,
+    records: Vec<Vec<crate::supervise::tape::codec::Item>>,
+}
+
+/// Write a tape of `frames` frames (the header and `frames - 1` records frames) with the
+/// real writer, each frame's write one `Write` step checked against the model's `written`.
+fn write_tape(model: &Model, ev: &mut StepEvidence, frames: u64) -> Tape {
+    let sink = Memory::default();
+    let mut state = model.init_state();
+    let written_now = |sink: &Memory| {
+        let read = recover(&sink.bytes());
+        assert_eq!(read.tail, Tail::Clean, "a writer's frames are whole");
+        i64::try_from(read.frames).unwrap_or(i64::MAX)
+    };
+    let mut w = ev.step("Write", || {
+        TapeWriter::start(
+            Box::new(sink.clone()),
+            "/t/bind.atape",
+            HEADER,
+            Box::new(Said::default()),
+        )
+    });
+    assert!(model.fire("Write", &mut state));
+    assert_eq!(written_now(&sink), state["written"], "the header frame");
+    let mut rng = XorShift::new(29);
+    let mut records = Vec::new();
+    for frame in 0..frames - 1 {
+        let items = vec![
+            mono(frame * 9),
+            screen_read(frame as usize),
+            noise(&mut rng, 24),
+        ];
+        for item in &items {
+            w.append(item);
+        }
+        ev.step("Write", || w.flush_hint(Hint::Act));
+        assert!(model.fire("Write", &mut state));
+        assert_eq!(
+            written_now(&sink),
+            state["written"],
+            "records frame {frame}"
+        );
+        records.push(items);
+    }
+    assert_eq!(
+        model.action_enabled("Write", &state),
+        frames < 3,
+        "the model holds at most three frames: the longest tape written here"
+    );
+    let ends = sink
+        .taken()
+        .writes
+        .iter()
+        .scan(0, |end, len| {
+            *end += len;
+            Some(*end)
+        })
+        .collect();
+    Tape {
+        bytes: sink.bytes(),
+        ends,
+        records,
+    }
+}
+
+/// One reading the bind checks: what it is, the bytes, and the model's schedule for them.
+struct Case {
+    what: String,
+    bytes: Vec<u8>,
+    schedule: Vec<&'static str>,
+}
+
+/// Every truncation of `tape`, and every byte of it flipped under three masks, with its
+/// schedule.
+fn cases(tape: &Tape) -> Vec<Case> {
+    let mut out = Vec::new();
+    for cut in 0..=tape.bytes.len() {
+        let whole = tape.ends.iter().filter(|e| **e <= cut).count();
+        let mut schedule = vec!["Write"; whole];
+        schedule.push(if cut == 0 || tape.ends.contains(&cut) {
+            "Crash"
+        } else {
+            "Tear"
+        });
+        schedule.push("Recover");
+        out.push(Case {
+            what: format!("{}-frame tape, cut at {cut}", tape.ends.len()),
+            bytes: tape.bytes[..cut].to_vec(),
+            schedule,
+        });
+    }
+    // The last frame starts where the one before it ends; the header, the only frame of a
+    // one-frame tape, starts after the magic its write carries.
+    let last_start = match tape.ends.as_slice() {
+        [.., before, _] => *before,
+        _ => MAGIC.len(),
+    };
+    for at in 0..tape.bytes.len() {
+        for mask in [0x01u8, 0x80, 0xff] {
+            let mut bytes = tape.bytes.clone();
+            bytes[at] ^= mask;
+            let damage = if at < MAGIC.len() {
+                "RotMagic"
+            } else if at < last_start {
+                "Rot"
+            } else {
+                "RotLast"
+            };
+            let mut schedule = vec!["Write"; tape.ends.len()];
+            schedule.extend(["Crash", damage, "Recover"]);
+            out.push(Case {
+                what: format!("{}-frame tape, byte {at} ^ {mask:#04x}", tape.ends.len()),
+                bytes,
+                schedule,
+            });
+        }
+    }
+    out
+}
+
+/// A reading the model does not admit: the case, what the model holds, what the real
+/// reading was, and the invariants that reading breaks.
+struct Disagreement {
+    what: String,
+    schedule: Vec<&'static str>,
+    model: State,
+    real: State,
+    broken: Vec<&'static str>,
+}
+
+impl std::fmt::Debug for Disagreement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} ({:?}): model {:?}, real {:?}, breaking {:?}",
+            self.what, self.schedule, self.model, self.real, self.broken
+        )
+    }
+}
+
+/// Bind `reader` to the model over every case: the disagreements. With `ev`, each read
+/// is a `Recover` step window.
+fn bind(
+    model: &Model,
+    tape: &Tape,
+    reader: &dyn Fn(&[u8]) -> Recovered,
+    mut ev: Option<&mut StepEvidence>,
+) -> Vec<Disagreement> {
+    let mut out = Vec::new();
+    for case in cases(tape) {
+        let expected = walk(model, &case.schedule);
+        let reading = match ev.as_deref_mut() {
+            Some(ev) => ev.step("Recover", || reader(&case.bytes)),
+            None => reader(&case.bytes),
+        };
+        let mut real = expected.clone();
+        real.extend(project(&reading));
+        let broken: Vec<&'static str> = model
+            .invariants
+            .iter()
+            .map(|inv| inv.name)
+            .filter(|name| !model.check_invariant(name, &real))
+            .collect();
+        // The items, not only their count: exactly the whole records frames read.
+        let frames = reading.frames.saturating_sub(1).min(tape.records.len());
+        let prefix: Vec<_> = tape.records[..frames].iter().flatten().cloned().collect();
+        if real != expected || !broken.is_empty() || reading.items != prefix {
+            out.push(Disagreement {
+                what: case.what,
+                schedule: case.schedule,
+                model: expected,
+                real,
+                broken,
+            });
+        }
+    }
+    out
+}
+
+/// The shipping writer and reader refine `SuperviseTapeRecovery` on every truncation and
+/// every byte flipped under three masks of tapes of one, two and three frames, each step
+/// witnessed by its own anchor.
+#[test]
+fn the_real_writer_and_reader_conform_to_the_model() {
+    let model = interp::with_buggy(&supervise_tape_recovery_model(), 0);
+    let mut ev = StepEvidence::new(MACHINE);
+    for frames in 1..=3 {
+        let tape = write_tape(&model, &mut ev, frames);
+        assert_eq!(tape.ends.len() as u64, frames);
+        let wrong = bind(&model, &tape, &recover, Some(&mut ev));
+        assert!(
+            wrong.is_empty(),
+            "{} reading(s) of the {frames}-frame tape the model does not admit, first: {:?}",
+            wrong.len(),
+            wrong.first()
+        );
+    }
+    let audit = ev.audit();
+    assert_eq!(
+        audit.actions.iter().copied().collect::<Vec<_>>(),
+        ["Recover", "Write"]
+    );
+    assert!(audit.uninstrumented.is_empty(), "{audit:?}");
+    assert!(audit.ambiguous.is_empty(), "{audit:?}");
+    assert!(audit.unanchored_steps.is_empty(), "{audit:?}");
+    assert!(audit.undriven.is_empty(), "{audit:?}");
+    assert!(audit.unwitnessed.is_empty(), "{audit:?}");
+    assert!(audit.blind_steps.is_empty(), "{audit:?}");
+    assert!(audit.stray.is_empty(), "{audit:?}");
+}
+
+/// The negative control: the shipping reader with its checksum test off is rejected by
+/// the bind — a damaged frame read as written breaks `RotRefused` on the real reading —
+/// and what it reads there is what the `Buggy = 1` machine predicts.
+#[test]
+fn a_reader_that_ignores_xxh64_is_rejected() {
+    let model = interp::with_buggy(&supervise_tape_recovery_model(), 0);
+    let blind_model = interp::with_buggy(&supervise_tape_recovery_model(), 1);
+    let tape = write_tape(&model, &mut StepEvidence::new(MACHINE), 3);
+    let blind = |bytes: &[u8]| read(bytes, Keep::Refuse, Check::Nothing, Limits::TAPE);
+    let wrong = bind(&model, &tape, &blind, None);
+    assert!(
+        !wrong.is_empty(),
+        "the bind rejects a checksum-blind reader"
+    );
+    let read_through: Vec<&Disagreement> = wrong
+        .iter()
+        .filter(|d| d.broken.contains(&"RotRefused"))
+        .collect();
+    assert!(
+        !read_through.is_empty(),
+        "a damaged frame is read as written: {:?}",
+        wrong.first()
+    );
+    // Where it reads a damaged frame through, it is the checksum-blind machine.
+    let predicted = read_through.iter().any(|d| {
+        let blind_state = walk(&blind_model, &d.schedule);
+        ["recovered", "refused", "said_torn"]
+            .iter()
+            .all(|v| blind_state[v] == d.real[v])
+    });
+    assert!(predicted, "the Buggy = 1 machine predicts a read-through");
+    // And the bind is not vacuous the other way: the shipping reader's verdicts on the
+    // same cases differ from the blind reader's.
+    assert!(bind(&model, &tape, &recover, None).is_empty());
+}
+
+// -- model 2: a strict replay's cursor ---------------------------------------
+//
+// Tier-1 of `SuperviseReplayCursor` (`aterm_models_harness::supervise_replay_cursor_model`,
+// the replay plan's §9 model 2, the strict arm): the real replay core, asked through its
+// replaying door (`Fx::exchange` in its replay mode, a live call that counts itself if it
+// is ever made), over a real four-record tape — `status` (a read), `key 1` (an act), `meta`
+// (a read), `key 2` (an act) — by schedules drawn from `aterm_spec::rng`, each request one
+// step window. After each step the core is projected onto the model's five variables and
+// compared with the model's state after the same schedule; the anchors on
+// `ReplayCore::step` (every move) and `ReplayCore::halt` (every move that diverges) are
+// witnessed by the steps they claim. The negative control is a cursor that resyncs a read
+// it does not hold forward to the next record that matches, across the act between — the
+// lenient synthesis the plan rejected — which the bind rejects and the `Buggy = 2` machine
+// predicts.
+
+const CURSOR: &str = "SuperviseReplayCursor";
+
+/// The four records' requests, in order: read, act, read, act.
+const TAPE_WORDS: [&[&str]; 4] = [&["status"], &["key", "1"], &["meta"], &["key", "2"]];
+
+/// A control reply saying `OK <what>`.
+fn ok_reply(what: &str) -> Result<CtlReply, String> {
+    Ok(CtlReply {
+        code: 0,
+        stdout: format!("OK {what}\n"),
+        stderr: String::new(),
+    })
+}
+
+/// The real four-record tape.
+fn cursor_tape() -> Vec<EffectRecord> {
+    TAPE_WORDS
+        .iter()
+        .map(|words| EffectRecord::Exchange {
+            door: doors::CTL.to_string(),
+            request: ctl_request(words),
+            reply: ctl_reply(&ok_reply(&words.join(" "))),
+        })
+        .collect()
+}
+
+/// What the move `action` asks at cursor `pos` (the model's).
+fn ask_for(action: &str, pos: i64) -> Vec<&'static str> {
+    let at = |p: i64| TAPE_WORDS[usize::try_from(p.min(3)).unwrap_or(0)].to_vec();
+    match action {
+        "AskNext" | "AskAfterDivergence" => at(pos),
+        // A read the record under the cursor does not hold: the read ahead
+        // of it, past the act, where there is one — what a lenient cursor
+        // would resync to.
+        "AskOtherRead" if pos <= 1 => vec!["meta"],
+        "AskOtherRead" if pos == 2 => vec!["status"],
+        "AskOtherRead" => vec!["meta"],
+        "AskOtherAct" => vec!["key", "9"],
+        "AskPastEnd" => vec!["status"],
+        other => panic!("no move {other}"),
+    }
+}
+
+/// What a cursor did, as the model's variables see it.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct CursorSeen {
+    pos: i64,
+    diverged: bool,
+    live: i64,
+    skipped_act: i64,
+    served_after: i64,
+}
+
+/// The variables a cursor decides, as it has them.
+pub(crate) fn project_cursor(seen: &CursorSeen) -> BTreeMap<&'static str, i64> {
+    BTreeMap::from([
+        ("pos", seen.pos),
+        ("diverged", i64::from(seen.diverged)),
+        ("live", seen.live),
+        ("skipped_act", seen.skipped_act),
+        ("served_after", seen.served_after),
+    ])
+}
+
+/// A cursor a schedule drives: one request at a time.
+trait Cursor {
+    /// Ask `words`; whether it was served.
+    fn ask(&mut self, words: &[&str]) -> bool;
+    fn seen(&self) -> CursorSeen;
+}
+
+/// The real core, asked through its replaying door.
+struct RealCursor {
+    core: Arc<ReplayCore>,
+    fx: Fx,
+    live: Cell<i64>,
+    served_acts: i64,
+    served_after: i64,
+}
+
+impl RealCursor {
+    fn new() -> Self {
+        let core = ReplayCore::start(cursor_tape(), VERBATIM, VERBATIM, "test", None);
+        Self {
+            fx: Fx::replay(Arc::clone(&core)),
+            core,
+            live: Cell::new(0),
+            served_acts: 0,
+            served_after: 0,
+        }
+    }
+}
+
+impl Cursor for RealCursor {
+    fn ask(&mut self, words: &[&str]) -> bool {
+        let was_diverged = self.seen().diverged;
+        let live = &self.live;
+        let fx = &self.fx;
+        let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fx.exchange(
+                doors::CTL,
+                || ctl_request(words),
+                || {
+                    live.set(live.get() + 1);
+                    ok_reply("from the world")
+                },
+            )
+        }))
+        .is_ok();
+        if served {
+            self.served_acts += i64::from(is_act(words));
+            self.served_after += i64::from(was_diverged);
+        }
+        served
+    }
+
+    fn seen(&self) -> CursorSeen {
+        let (pos, _) = self.core.consumed();
+        let consumed_acts = TAPE_WORDS[..pos].iter().filter(|w| is_act(w)).count();
+        CursorSeen {
+            pos: i64::try_from(pos).unwrap_or(i64::MAX),
+            diverged: self.core.diverged().is_some(),
+            live: self.live.get(),
+            skipped_act: i64::try_from(consumed_acts).unwrap_or(0) - self.served_acts,
+            served_after: self.served_after,
+        }
+    }
+}
+
+/// THE NEGATIVE CONTROL: a cursor that resyncs a request it does not hold to
+/// the next record that holds it, across whatever lies between — an act
+/// included.
+struct LenientCursor {
+    pos: usize,
+    diverged: bool,
+    skipped_act: i64,
+    served_after: i64,
+}
+
+impl Cursor for LenientCursor {
+    fn ask(&mut self, words: &[&str]) -> bool {
+        if self.diverged {
+            return false;
+        }
+        match (self.pos..TAPE_WORDS.len()).find(|&p| TAPE_WORDS[p] == words) {
+            Some(found) => {
+                self.skipped_act += i64::try_from(
+                    TAPE_WORDS[self.pos..found]
+                        .iter()
+                        .filter(|w| is_act(w))
+                        .count(),
+                )
+                .unwrap_or(0);
+                self.pos = found + 1;
+                true
+            }
+            None => {
+                self.diverged = true;
+                false
+            }
+        }
+    }
+
+    fn seen(&self) -> CursorSeen {
+        CursorSeen {
+            pos: i64::try_from(self.pos).unwrap_or(i64::MAX),
+            diverged: self.diverged,
+            live: 0,
+            skipped_act: self.skipped_act,
+            served_after: self.served_after,
+        }
+    }
+}
+
+/// A schedule of up to `len` moves, each drawn from those the committed
+/// model has enabled after the moves before it.
+fn cursor_schedule(model: &Model, rng: &mut XorShift, len: usize) -> Vec<&'static str> {
+    const MOVES: [&str; 5] = [
+        "AskNext",
+        "AskOtherRead",
+        "AskOtherAct",
+        "AskPastEnd",
+        "AskAfterDivergence",
+    ];
+    let mut state = model.init_state();
+    let mut out = Vec::new();
+    while out.len() < len {
+        let enabled: Vec<&'static str> = MOVES
+            .into_iter()
+            .filter(|m| model.action_enabled(m, &state))
+            .collect();
+        let Some(&pick) = enabled.get(rng.below(enabled.len().max(1) as u64) as usize) else {
+            break;
+        };
+        assert!(model.fire(pick, &mut state));
+        out.push(pick);
+    }
+    out
+}
+
+/// Drive `cursor` by `schedule`: the first step whose projection the
+/// committed model does not hold, with both states.
+fn bind_cursor(
+    model: &Model,
+    schedule: &[&'static str],
+    cursor: &mut dyn Cursor,
+    mut ev: Option<&mut StepEvidence>,
+) -> Option<(usize, State, State)> {
+    let mut state = model.init_state();
+    for (i, action) in schedule.iter().enumerate() {
+        let words = ask_for(action, state["pos"]);
+        match ev.as_deref_mut() {
+            Some(ev) => ev.step(action, || cursor.ask(&words)),
+            None => cursor.ask(&words),
+        };
+        assert!(
+            model.fire(action, &mut state),
+            "{action} after {schedule:?}"
+        );
+        let mut real = state.clone();
+        real.extend(project_cursor(&cursor.seen()));
+        if real != state {
+            return Some((i, state, real));
+        }
+    }
+    None
+}
+
+/// The real replay core refines `SuperviseReplayCursor` over two hundred schedules,
+/// every move witnessed by its own anchors.
+#[test]
+fn the_real_replay_cursor_conforms_to_the_model() {
+    let model = interp::with_buggy(&supervise_replay_cursor_model(), 0);
+    let mut ev = StepEvidence::new(CURSOR);
+    let mut rng = XorShift::new(61);
+    for _ in 0..200 {
+        let schedule = cursor_schedule(&model, &mut rng, 8);
+        let mut real = RealCursor::new();
+        let wrong = bind_cursor(&model, &schedule, &mut real, Some(&mut ev));
+        assert!(wrong.is_none(), "{schedule:?}: {wrong:?}");
+        assert_eq!(real.live.get(), 0, "no live call, ever");
+    }
+    let audit = ev.audit();
+    assert_eq!(
+        audit.actions.iter().copied().collect::<Vec<_>>(),
+        [
+            "AskAfterDivergence",
+            "AskNext",
+            "AskOtherAct",
+            "AskOtherRead",
+            "AskPastEnd"
+        ]
+    );
+    assert!(audit.uninstrumented.is_empty(), "{audit:?}");
+    assert!(audit.ambiguous.is_empty(), "{audit:?}");
+    assert!(audit.unanchored_steps.is_empty(), "{audit:?}");
+    assert!(audit.undriven.is_empty(), "{audit:?}");
+    assert!(audit.unwitnessed.is_empty(), "{audit:?}");
+    assert!(audit.blind_steps.is_empty(), "{audit:?}");
+    assert!(audit.stray.is_empty(), "{audit:?}");
+}
+
+/// The negative control: a cursor that resyncs across an act is rejected by the
+/// bind — it passes the act between unasked (`NoActSkipped` broken on its
+/// projection) — and where it resyncs, it is the `Buggy = 2` machine.
+#[test]
+fn a_cursor_that_resyncs_across_an_act_is_rejected() {
+    let model = interp::with_buggy(&supervise_replay_cursor_model(), 0);
+    let lenient_model = interp::with_buggy(&supervise_replay_cursor_model(), 2);
+    let mut rng = XorShift::new(61);
+    let mut rejected = 0;
+    for _ in 0..200 {
+        let schedule = cursor_schedule(&model, &mut rng, 8);
+        let mut lenient = LenientCursor {
+            pos: 0,
+            diverged: false,
+            skipped_act: 0,
+            served_after: 0,
+        };
+        if let Some((_, _, real)) = bind_cursor(&model, &schedule, &mut lenient, None) {
+            rejected += 1;
+            assert!(
+                !model.check_invariant("NoActSkipped", &real),
+                "rejected for passing an act: {real:?}"
+            );
+        }
+    }
+    assert!(
+        rejected > 0,
+        "the bind rejects a cursor that resyncs across acts"
+    );
+    // Where it resyncs — a read the tape holds only past the act — it is the
+    // lenient machine, variable for variable.
+    for schedule in [["AskOtherRead"].as_slice(), &["AskNext", "AskOtherRead"]] {
+        let mut lenient = LenientCursor {
+            pos: 0,
+            diverged: false,
+            skipped_act: 0,
+            served_after: 0,
+        };
+        let mut state = lenient_model.init_state();
+        for action in schedule {
+            lenient.ask(&ask_for(action, state["pos"]));
+            assert!(lenient_model.fire(action, &mut state));
+        }
+        let mut real = state.clone();
+        real.extend(project_cursor(&lenient.seen()));
+        assert_eq!(real, state, "{schedule:?}");
+        assert_eq!(state["skipped_act"], 1);
+    }
+}
+
+// -- model 3: the stop flag's latch ------------------------------------------
+//
+// Tier-1 of `SupervisorRaisedLatch` (`aterm_models_harness::supervisor_raised_latch_model`,
+// the replay plan's §9 model 3): a real recorded loop of four operations — a read of the
+// stop flag through the loop's door (`Fx::raised`), a round trip through the recording door
+// (`TapedCtl`), a read, a round trip — while a REAL OTHER THREAD raises the flag before
+// the operation the schedule names (a handshake places it there, so each point is reached
+// on every run). Its tape is then replayed through the replaying door by the same loop. Each
+// run is projected onto `marked` and `mark` (whether the recorder taped the flag, and how
+// many of the loop's operations had completed when it did — read off the recorder's own
+// count) and `diverged` (the replay's verdict), beside the model's run of the same schedule.
+// The negative control is a setter that appends the flag's record itself, at the moment it
+// raises it: the bind rejects it, and the `Buggy = 1` machine predicts it. A second run has
+// the thread raise the flag at moments of its own over many seeds, racing the loop: no
+// replay diverges and every replayed read answers as the recorded one did. A third adds
+// the window's host to the race (T7): the thread also turns the host's answer, which the
+// loop reads through the taped host, and the replay's host gives every answer back.
+
+const LATCH: &str = "SupervisorRaisedLatch";
+
+/// What a recorded loop and its replay did, as the model's variables see them.
+#[derive(Debug, Clone)]
+pub(crate) struct LatchSeen {
+    marked: bool,
+    mark: i64,
+    diverged: bool,
+}
+
+/// The variables a latch run decides.
+pub(crate) fn project_latch(seen: &LatchSeen) -> BTreeMap<&'static str, i64> {
+    BTreeMap::from([
+        ("marked", i64::from(seen.marked)),
+        ("mark", seen.mark),
+        ("diverged", i64::from(seen.diverged)),
+    ])
+}
+
+/// A transport that answers every round trip `OK`.
+struct Answers;
+
+impl Ctl for Answers {
+    fn call(&mut self, _: &[&str]) -> Result<CtlReply, String> {
+        ok_reply("seq=1")
+    }
+}
+
+/// The loop's round trip at operation `op`.
+fn door_words(op: usize) -> Vec<String> {
+    vec![
+        "await".to_string(),
+        "seq".to_string(),
+        op.to_string(),
+        "timeout".to_string(),
+        "20000".to_string(),
+    ]
+}
+
+/// Record the four-operation loop, the flag raised by another thread before
+/// operation `raise_at` (`4`: after the last; `None`: never), the setter
+/// appending the flag's record itself when `setter_tapes`; then replay it.
+/// What it did, and each step through `ev` when given.
+fn latch_run(
+    raise_at: Option<usize>,
+    setter_tapes: bool,
+    mut ev: Option<&mut StepEvidence>,
+) -> (LatchSeen, Vec<bool>, Vec<bool>) {
+    use super::core::TapeCore;
+    use super::ctl::{ReplayCtl, TapedCtl};
+    use crate::supervise::fx::ClockSource;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+
+    let mut step = |action: &'static str, f: &mut dyn FnMut()| match ev.as_deref_mut() {
+        Some(ev) => ev.step(action, f),
+        None => f(),
+    };
+    let sink = Memory::default();
+    let writer = TapeWriter::start(
+        Box::new(sink.clone()),
+        "latch.atape",
+        HEADER,
+        Box::new(Said::default()),
+    );
+    let clock = Fx::over(ClockSource::Scripted(Arc::default()));
+    let (origin, _) = clock.peek();
+    let core = TapeCore::start(writer, VERBATIM, origin, "test");
+    let fx = clock.recording(Arc::clone(&core));
+    let flag = Arc::new(AtomicBool::new(false));
+    // The other thread: raises the flag when told, says so, and — the
+    // negative control — tapes the flag itself as it raises it.
+    let (tell, told) = mpsc::channel::<()>();
+    let (done, raised) = mpsc::channel::<()>();
+    let host = {
+        let flag = Arc::clone(&flag);
+        let core = Arc::clone(&core);
+        std::thread::spawn(move || {
+            if told.recv().is_ok() {
+                flag.store(true, Ordering::SeqCst);
+                if setter_tapes {
+                    core.raised(doors::RAISED_STOP, true, Default::default);
+                }
+                let _ = done.send(());
+            }
+        })
+    };
+    let mut answers = Answers;
+    let mut taped = TapedCtl::new(&mut answers, fx.clone(), doors::CTL);
+    let mut mark = None;
+    let mut reads = Vec::new();
+    for op in 0..=4 {
+        if raise_at == Some(op) {
+            let before = core.effects();
+            tell.send(()).expect("the host thread");
+            raised
+                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .expect("the host thread raises within the hang detector");
+            if core.effects() > before {
+                mark.get_or_insert(op);
+            }
+        }
+        if op == 4 {
+            break;
+        }
+        let before = core.effects();
+        step("LoopOp", &mut || {
+            if op % 2 == 0 {
+                reads.push(fx.raised(doors::RAISED_STOP, || flag.load(Ordering::SeqCst)));
+            } else {
+                let words = door_words(op);
+                let words: Vec<&str> = words.iter().map(String::as_str).collect();
+                let _ = taped.call(&words);
+            }
+        });
+        // A read that taped the flag: the recorder counted one effect more.
+        if op % 2 == 0 && core.effects() > before {
+            mark.get_or_insert(op);
+        }
+    }
+    drop(tell);
+    host.join().expect("the host thread");
+    step("EndRecord", &mut || {
+        fx.finish(super::codec::End::Returned {
+            how: "done".to_string(),
+        });
+    });
+    let read = recover(&sink.bytes());
+    assert_eq!(read.tail, Tail::Clean);
+    let records: Vec<EffectRecord> = read
+        .items
+        .iter()
+        .filter_map(|i| i.record().cloned())
+        .collect();
+    // The replay: the same loop, through the replaying door.
+    let replay_core = ReplayCore::start(records, VERBATIM, VERBATIM, "test", None);
+    let rfx = Fx::replay(Arc::clone(&replay_core));
+    let mut lane = ReplayCtl::new(rfx.clone(), doors::CTL);
+    let mut replayed = Vec::new();
+    let mut diverged = false;
+    for op in 0..4 {
+        if diverged {
+            break;
+        }
+        let mut went = true;
+        step("ReplayOp", &mut || {
+            went = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if op % 2 == 0 {
+                    replayed.push(rfx.raised(doors::RAISED_STOP, || false));
+                } else {
+                    let words = door_words(op);
+                    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+                    let _ = lane.call(&words);
+                }
+            }))
+            .is_ok();
+        });
+        diverged = !went;
+    }
+    if !diverged {
+        let mut left = 0;
+        step("ReplayEnd", &mut || left = replay_core.left());
+        diverged = left > 0;
+    }
+    let seen = LatchSeen {
+        marked: mark.is_some(),
+        mark: mark.map_or(0, |m| i64::try_from(m).unwrap_or(0)),
+        diverged,
+    };
+    (seen, reads, replayed)
+}
+
+/// The model's schedule for a run with the flag raised before operation
+/// `raise_at`, through the replay's end (or its divergence).
+fn latch_schedule(model: &Model, raise_at: Option<usize>) -> State {
+    let mut state = model.init_state();
+    let fire = |action: &str, state: &mut State| {
+        assert!(model.fire(action, state), "{action}: {state:?}");
+    };
+    for op in 0..=4 {
+        if raise_at == Some(op) {
+            fire("Raise", &mut state);
+        }
+        if op < 4 {
+            fire("LoopOp", &mut state);
+        }
+    }
+    fire("EndRecord", &mut state);
+    for _ in 0..4 {
+        if state["diverged"] == 1 {
+            return state;
+        }
+        fire("ReplayOp", &mut state);
+    }
+    if state["diverged"] == 0 {
+        fire("ReplayEnd", &mut state);
+    }
+    state
+}
+
+/// The real recorder and replay refine `SupervisorRaisedLatch` with the flag raised by
+/// another thread before every operation of the loop, after the last, and never: the
+/// flag's record is the loop's own read's, and no replay diverges.
+#[test]
+fn the_real_latch_conforms_to_the_model() {
+    let model = interp::with_buggy(&supervisor_raised_latch_model(), 0);
+    let mut ev = StepEvidence::new(LATCH);
+    for raise_at in [None, Some(0), Some(1), Some(2), Some(3), Some(4)] {
+        let (seen, reads, replayed) = latch_run(raise_at, false, Some(&mut ev));
+        let expected = latch_schedule(&model, raise_at);
+        let mut real = expected.clone();
+        real.extend(project_latch(&seen));
+        assert_eq!(real, expected, "raised before {raise_at:?}");
+        assert_eq!(replayed, reads, "each replayed read answers as recorded");
+    }
+    let audit = ev.audit();
+    assert_eq!(
+        audit.actions.iter().copied().collect::<Vec<_>>(),
+        ["EndRecord", "LoopOp", "ReplayEnd", "ReplayOp"]
+    );
+    assert!(audit.uninstrumented.is_empty(), "{audit:?}");
+    assert!(audit.ambiguous.is_empty(), "{audit:?}");
+    assert!(audit.unanchored_steps.is_empty(), "{audit:?}");
+    assert!(audit.undriven.is_empty(), "{audit:?}");
+    assert!(audit.unwitnessed.is_empty(), "{audit:?}");
+    assert!(audit.blind_steps.is_empty(), "{audit:?}");
+    assert!(audit.stray.is_empty(), "{audit:?}");
+}
+
+/// The negative control: a setter that tapes the flag itself, as it raises it, is
+/// rejected by the bind — raised before a door, its record sits in front of the door and
+/// the replay diverges there — and every run of it is the `Buggy = 1` machine.
+#[test]
+fn a_setter_that_tapes_the_flag_itself_is_rejected() {
+    let model = interp::with_buggy(&supervisor_raised_latch_model(), 0);
+    let setter_model = interp::with_buggy(&supervisor_raised_latch_model(), 1);
+    let mut rejected = 0;
+    for raise_at in [Some(0), Some(1), Some(2), Some(3), Some(4)] {
+        let (seen, _, _) = latch_run(raise_at, true, None);
+        let committed = latch_schedule(&model, raise_at);
+        let mut real = committed.clone();
+        real.extend(project_latch(&seen));
+        if real != committed {
+            rejected += 1;
+        }
+        let predicted = latch_schedule(&setter_model, raise_at);
+        let mut real = predicted.clone();
+        real.extend(project_latch(&seen));
+        assert_eq!(
+            real, predicted,
+            "the setter's machine, raised before {raise_at:?}"
+        );
+    }
+    assert!(
+        rejected > 0,
+        "the bind rejects a setter that tapes the flag"
+    );
+    let (seen, _, _) = latch_run(Some(1), true, None);
+    assert!(
+        seen.diverged,
+        "raised before a door, the replay diverges there"
+    );
+}
+
+/// The flag raised by another thread at moments of its own — racing the loop over a
+/// longer run, no handshake — over many seeds: whichever read first sees it tapes it, and
+/// no replay diverges; every replayed read answers as the recorded one did.
+#[test]
+fn a_flag_raised_at_any_moment_replays_exactly() {
+    use super::core::TapeCore;
+    use super::ctl::{ReplayCtl, TapedCtl};
+    use crate::supervise::fx::ClockSource;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const OPS: usize = 40;
+    for seed in 1..=40u64 {
+        let mut rng = XorShift::new(seed);
+        let spins = rng.below(400);
+        let sink = Memory::default();
+        let writer = TapeWriter::start(
+            Box::new(sink.clone()),
+            "race.atape",
+            HEADER,
+            Box::new(Said::default()),
+        );
+        let clock = Fx::over(ClockSource::Scripted(Arc::default()));
+        let (origin, _) = clock.peek();
+        let fx = clock.recording(TapeCore::start(writer, VERBATIM, origin, "test"));
+        let flag = Arc::new(AtomicBool::new(false));
+        let host = {
+            let flag = Arc::clone(&flag);
+            std::thread::spawn(move || {
+                for _ in 0..spins {
+                    std::thread::yield_now();
+                }
+                flag.store(true, Ordering::SeqCst);
+            })
+        };
+        let mut answers = Answers;
+        let mut taped = TapedCtl::new(&mut answers, fx.clone(), doors::CTL);
+        let mut reads = Vec::new();
+        for op in 0..OPS {
+            if op % 2 == 0 {
+                reads.push(fx.raised(doors::RAISED_STOP, || flag.load(Ordering::SeqCst)));
+            } else {
+                let words = door_words(op);
+                let words: Vec<&str> = words.iter().map(String::as_str).collect();
+                let _ = taped.call(&words);
+            }
+        }
+        host.join().expect("the host thread");
+        fx.finish(super::codec::End::Returned {
+            how: "done".to_string(),
+        });
+        let read = recover(&sink.bytes());
+        let records: Vec<EffectRecord> = read
+            .items
+            .iter()
+            .filter_map(|i| i.record().cloned())
+            .collect();
+        let core = ReplayCore::start(records, VERBATIM, VERBATIM, "test", None);
+        let rfx = Fx::replay(Arc::clone(&core));
+        let mut lane = ReplayCtl::new(rfx.clone(), doors::CTL);
+        let replayed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut replayed = Vec::new();
+            for op in 0..OPS {
+                if op % 2 == 0 {
+                    replayed.push(rfx.raised(doors::RAISED_STOP, || false));
+                } else {
+                    let words = door_words(op);
+                    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+                    let _ = lane.call(&words);
+                }
+            }
+            replayed
+        }))
+        .unwrap_or_else(|_| panic!("seed {seed}: the replay diverged: {core:?}"));
+        assert_eq!(replayed, reads, "seed {seed}");
+        assert_eq!(core.left(), 0, "seed {seed}: nothing left on the tape");
+    }
+}
+
+/// The racing run of [`a_flag_raised_at_any_moment_replays_exactly`] EXTENDED TO THE WINDOW'S
+/// HOST (the replay plan's T7): beside the stop flag, the loop asks its host whether it wants
+/// a point (`host.wants`, through the taped host the loop is handed, `Fx::host_door`), and
+/// the host's thread raises the stop and turns the host's answer at moments of its own,
+/// racing the loop, over many seeds. The host's answers are the host's thread's as the loop
+/// read them, so they are values the loop observed: each is on the tape where it was read,
+/// and the replay — the replay's host, nothing behind it — gives every one back in order,
+/// the stop's latch beside them, with no divergence.
+#[test]
+fn a_host_racing_the_loop_replays_exactly() {
+    use super::core::TapeCore;
+    use super::ctl::{ReplayCtl, TapedCtl};
+    use crate::supervise::IdleHost;
+    use crate::supervise::fx::ClockSource;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A window's host whose wish for a point another thread turns.
+    #[derive(Debug, Default)]
+    struct Racing {
+        wants: AtomicBool,
+    }
+
+    impl IdleHost for Racing {
+        fn wants(&self) -> bool {
+            self.wants.load(Ordering::SeqCst)
+        }
+        fn at_idle(&self) -> Option<crate::supervise::HostStep> {
+            None
+        }
+        fn owns_turn_end(&self) -> bool {
+            false
+        }
+    }
+
+    const OPS: usize = 60;
+    for seed in 1..=40u64 {
+        let mut rng = XorShift::new(seed);
+        let (stop_at, turn_at) = (rng.below(400), rng.below(400));
+        let sink = Memory::default();
+        let writer = TapeWriter::start(
+            Box::new(sink.clone()),
+            "race-host.atape",
+            HEADER,
+            Box::new(Said::default()),
+        );
+        let clock = Fx::over(ClockSource::Scripted(Arc::default()));
+        let (origin, _) = clock.peek();
+        let fx = clock.recording(TapeCore::start(writer, VERBATIM, origin, "test"));
+        let flag = Arc::new(AtomicBool::new(false));
+        let racing = Arc::new(Racing::default());
+        let host = fx.host_door(&(Arc::clone(&racing) as Arc<dyn IdleHost>));
+        let thread = {
+            let (flag, racing) = (Arc::clone(&flag), Arc::clone(&racing));
+            std::thread::spawn(move || {
+                for spin in 0..stop_at.max(turn_at) + 1 {
+                    if spin == turn_at {
+                        racing.wants.store(true, Ordering::SeqCst);
+                    }
+                    if spin == stop_at {
+                        flag.store(true, Ordering::SeqCst);
+                    }
+                    std::thread::yield_now();
+                }
+            })
+        };
+        let mut answers = Answers;
+        let mut taped = TapedCtl::new(&mut answers, fx.clone(), doors::CTL);
+        let mut reads = Vec::new();
+        for op in 0..OPS {
+            match op % 3 {
+                0 => reads.push(fx.raised(doors::RAISED_STOP, || flag.load(Ordering::SeqCst))),
+                1 => reads.push(host.wants()),
+                _ => {
+                    let words = door_words(op);
+                    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+                    let _ = taped.call(&words);
+                }
+            }
+        }
+        thread.join().expect("the host's thread");
+        fx.finish(super::codec::End::Returned {
+            how: "done".to_string(),
+        });
+        let read = recover(&sink.bytes());
+        let records: Vec<EffectRecord> = read
+            .items
+            .iter()
+            .filter_map(|i| i.record().cloned())
+            .collect();
+        let core = ReplayCore::start(records, VERBATIM, VERBATIM, "test", None);
+        let rfx = Fx::replay(Arc::clone(&core));
+        // The replay's door hands back the replay's host whatever it is
+        // given: the racing host is never asked again.
+        let rhost = rfx.host_door(&(Arc::new(Racing::default()) as Arc<dyn IdleHost>));
+        let mut lane = ReplayCtl::new(rfx.clone(), doors::CTL);
+        let replayed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut replayed = Vec::new();
+            for op in 0..OPS {
+                match op % 3 {
+                    0 => replayed.push(rfx.raised(doors::RAISED_STOP, || false)),
+                    1 => replayed.push(rhost.wants()),
+                    _ => {
+                        let words = door_words(op);
+                        let words: Vec<&str> = words.iter().map(String::as_str).collect();
+                        let _ = lane.call(&words);
+                    }
+                }
+            }
+            replayed
+        }))
+        .unwrap_or_else(|_| panic!("seed {seed}: the replay diverged: {core:?}"));
+        assert_eq!(replayed, reads, "seed {seed}");
+        assert_eq!(core.left(), 0, "seed {seed}: nothing left on the tape");
+    }
+}

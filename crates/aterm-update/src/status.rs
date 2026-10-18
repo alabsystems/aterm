@@ -89,17 +89,40 @@ struct Delivery {
     latest: Option<LatestRecord>,
 }
 
+#[cfg(not(test))]
 static DELIVERY: std::sync::Mutex<Delivery> = std::sync::Mutex::new(Delivery {
     note: None,
     latest: None,
 });
 
+// Under test the delivery facts are per THREAD, like the check note: a test that
+// runs a check clears them, and on a shared slot that erases the tag another test
+// set between its `set_latest_tag` and its `record`.
+#[cfg(test)]
+thread_local! {
+    static DELIVERY: std::cell::RefCell<Delivery> = const {
+        std::cell::RefCell::new(Delivery {
+            note: None,
+            latest: None,
+        })
+    };
+}
+
+#[cfg(not(test))]
+fn with_delivery<R>(f: impl FnOnce(&mut Delivery) -> R) -> R {
+    f(&mut DELIVERY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner))
+}
+
+#[cfg(test)]
+fn with_delivery<R>(f: impl FnOnce(&mut Delivery) -> R) -> R {
+    DELIVERY.with(|slot| f(&mut slot.borrow_mut()))
+}
+
 /// Record how this check ended short of a healthy outcome (`deferred` / `blocked`).
 pub(crate) fn set_delivery_note(note: &str) {
-    DELIVERY
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .note = Some(note.to_string());
+    with_delivery(|delivery| delivery.note = Some(note.to_string()));
 }
 
 /// Record the release tag THIS check authorized end to end, against `source`. Written
@@ -112,15 +135,13 @@ pub(crate) fn set_latest_tag(
     current_build: u64,
     release_build: u64,
 ) {
-    DELIVERY
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .latest = Some(LatestRecord {
+    let latest = LatestRecord {
         tag: tag.to_string(),
         source: source_slug(source),
         build: current_build,
         release_build,
-    });
+    };
+    with_delivery(|delivery| delivery.latest = Some(latest));
 }
 
 /// `owner/repo`, the spelling `latest_source` records.
@@ -219,10 +240,7 @@ pub(crate) fn authorized_tag(staging: &Staging, source: &crate::Source) -> Optio
 /// restores an old tag, the reader rechecks its required stage. A lost carry-forward
 /// costs one unmetered re-fetch.
 pub(crate) fn clear_latest_tag(staging: &Staging) {
-    DELIVERY
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .latest = None;
+    with_delivery(|delivery| delivery.latest = None);
     let Ok(text) = std::fs::read_to_string(&staging.status) else {
         return;
     };
@@ -249,9 +267,7 @@ pub(crate) fn clear_latest_tag(staging: &Staging) {
 
 /// Forget the current check's delivery facts (the next check starts clean).
 fn clear_delivery() {
-    *DELIVERY
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Delivery::default();
+    with_delivery(|delivery| *delivery = Delivery::default());
 }
 
 /// A scratch path no other in-flight writer of this record can be holding.
@@ -333,10 +349,7 @@ pub fn record(staging: &Staging, current_build: u64, outcome: &str) {
         }
         _ => outcome,
     };
-    let delivery = DELIVERY
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
+    let delivery = with_delivery(|delivery| delivery.clone());
     // STICKY: a writer that did not authorize a release (the apply lane, a deferral, a
     // refusal) carries the file's `latest_tag` (and its source) forward rather than
     // erasing it — the ledger is one overwritten line, and losing the tag costs the
@@ -406,19 +419,6 @@ mod tests {
         record(&s, 42, "up to date");
         let text = std::fs::read_to_string(&s.status).unwrap();
         assert!(!text.contains("delivery"), "{text}");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn record_writes_a_parseable_status_file() {
-        let s = Staging::scratch("st");
-        let root = s.root.clone();
-        record(&s, 42, "up to date (test)");
-        let text = std::fs::read_to_string(&s.status).expect("status file written");
-        assert!(text.contains("current_build = 42"), "got: {text}");
-        assert!(text.contains("up to date (test)"), "got: {text}");
-        // It must be valid TOML.
-        let _: aterm_toml::Value = aterm_toml::from_str(&text).expect("status is valid TOML");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -516,10 +516,10 @@ mod tests {
     }
 
     /// Invariant (f): `status.toml` stays schema 1 with `latest_tag` OPTIONAL. An older
-    /// ledger (no such key) reads as "no tag" and is otherwise untouched; a record that
-    /// authorized a tag writes it; a later writer that set nothing (the apply lane, a
-    /// deferral) carries the file's forward; an empty value is "no tag"; and an OLDER
-    /// reader — one that knows none of the new keys — still parses the new file.
+    /// ledger (no such key) reads as "no tag"; a record that authorized a tag writes
+    /// it; a later writer that set nothing (the apply lane, a deferral) carries the
+    /// file's forward; an empty value is "no tag"; and an OLDER reader — one that
+    /// knows none of the new keys — still parses the new file.
     #[test]
     fn latest_tag_is_schema_one_optional_sticky_and_readable_by_an_older_reader() {
         let _guard = crate::STRANDED_TEST_LOCK
@@ -571,26 +571,9 @@ mod tests {
             text.contains("latest_source = \"alabsystems/aterm\""),
             "the source is carried forward with the tag: {text}"
         );
-        // THE BINDING. The tag is trusted only by the build that recorded it and only
-        // for the source it was judged against: a record written by build 42 answers
-        // nothing to build 41 (a manual downgrade) or 43 (an applied stage) — and
-        // nothing to a repointed updater, whose new repository this ledger never
-        // judged. GitHub slugs are case-insensitive, so a case variant is the same
-        // source.
-        for other in [41, 43] {
-            assert_eq!(latest_tag(&s, other, &source), None, "build {other}");
-        }
-        assert_eq!(
-            latest_tag(
-                &s,
-                42,
-                &crate::Source {
-                    owner: "example".into(),
-                    repo: "mirror".into(),
-                }
-            ),
-            None
-        );
+        // GitHub slugs are case-insensitive, so a case variant is the same source.
+        // (The binding to the recording build and source, and retirement, are
+        // driven through the check's own acquisition in `github_tests`.)
         assert_eq!(
             latest_tag(
                 &s,
@@ -603,27 +586,6 @@ mod tests {
             .as_deref(),
             Some("v0.74.0")
         );
-        // A tag recorded without a source (an earlier build of this design) binds to
-        // nothing: it is re-judged, at the cost of unmetered requests only.
-        std::fs::write(
-            &s.status,
-            "schema = 1\ncurrent_build = 42\nlatest_tag = \"v0.74.0\"\n",
-        )
-        .unwrap();
-        assert_eq!(latest_tag(&s, 42, &source), None);
-        // RETIREMENT clears the tag on disk (and the source with it) but nothing else
-        // in the record, and a record written afterwards does not resurrect it.
-        set_latest_tag("v0.74.0", &source, 42, 42);
-        record(&s, 42, "staged 0.74.0");
-        assert_eq!(latest_tag(&s, 42, &source).as_deref(), Some("v0.74.0"));
-        s.retire_published();
-        assert_eq!(latest_tag(&s, 42, &source), None);
-        let text = std::fs::read_to_string(&s.status).unwrap();
-        assert!(!text.contains("latest_"), "{text}");
-        assert!(text.contains("outcome = \"staged 0.74.0\""), "{text}");
-        assert!(text.contains("current_build = 42"), "{text}");
-        record(&s, 42, "a later record");
-        assert_eq!(latest_tag(&s, 42, &source), None);
         // Clearing a ledger that has no tag, or no file, is a no-op.
         std::fs::write(&s.status, "schema = 1\ncurrent_build = 42\n").unwrap();
         clear_latest_tag(&s);
@@ -695,7 +657,7 @@ mod tests {
     }
 
     fn cache_decision_matches_model(staging: &Staging, build: u64, source: &crate::Source) -> bool {
-        let model = aterm_spec::derive::native_update_web_cache_model();
+        let model = aterm_models_update::native_update_web_cache_model();
         let latest = read_latest(staging).expect("test wrote a complete cache record");
         let mut state = model.init_state();
         state.insert("running", i64::try_from(build).unwrap());

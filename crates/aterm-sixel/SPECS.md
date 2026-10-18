@@ -3,6 +3,10 @@
 
 # aterm-sixel: spec recovery from its 25 unit tests
 
+> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 8 tests it
+> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
+> were taken before.
+
 > Status 2026-10-15: this is the crate's migration worklist. Each of the 14 specs below is
 > proved through Trust/Clean, and then the tests it subsumes are deleted. The one test in §4
 > that samples no spec is deleted now.
@@ -61,11 +65,11 @@ id	kind	functions	statement	subsumes	difficulty	blocking_gaps
 inactive-noop	contract	SixelDecoder::{new,put,unhook,abort}	∀ d∈Reach with d.active = false, ∀ b: put(b) leaves d unchanged, and unhook() returns None and leaves d unchanged. D::new() is inactive. Every unhook and every abort leaves d inactive.	unhook_without_hook_is_none	EASY: &mut self, an early return on a bool field, an Option result, a struct-equality frame condition	0,1,2,4
 unhook-accept	contract	SixelDecoder::unhook	∀ bs: run(bs) is Some ⇔ W(bs) > 0 ∧ H(bs) > 0 ∧ W(bs)*H(bs) ≤ CAP (over the decoder's own extent). In particular: run([]) = None; a DECGRA-only declaration Ph×Pv with 0 < Ph*Pv ≤ CAP is Some with exactly those dimensions; any declaration or paint whose box exceeds CAP is None, and the width*height output Vec is never allocated for it. Lemma: the `final_bytes > SIXEL_MAX_IMAGE_BYTES` branch is unreachable, because total ≤ CAP gives total*4 ≤ 16 MiB.	empty_sequence_is_none, capped_raster_at_the_pixel_limit_still_decodes, decgra_only_oversized_yields_none_without_transient	MEDIUM: saturating_mul, min/max, Option, and a quantifier over byte strings (a fold over put)	0,1,2,3,4,5,7
 image-shape	invariant	SixelDecoder::unhook, SixelImage::{width,height,pixels}	∀ d∈Reach: if d.unhook() = Some(img), then 1 ≤ img.width ≤ DIM, 1 ≤ img.height ≤ DIM, img.width*img.height ≤ CAP and img.pixels.len() = img.width*img.height. This holds for every input, including a hostile DECGRI count such as `!4294967295`. It is a type invariant on SixelImage.	dimensions_are_clamped	MEDIUM: Vec length after extend_from_slice and resize inside a loop, a struct type invariant, &mut self	0,1,2,3,7
-decode-refines-model	refinement	SixelDecoder::{hook,put,unhook,emit_sixel,paint_pixelwise,finish_params,apply_color,apply_raster,apply_repeat,ensure_capacity}	∀ bs with Box(bs) ≤ CAP (see §5.2; the weaker precondition W*H ≤ CAP is false): run(bs) = Model(bs), meaning equal width, height and every pixel. A painted pixel is 0xFF000000 | (palette[reg] & 0xFFFFFF) of the register current when it was painted. Every other pixel is 0, including the right-edge and bottom padding up to the declared geometry. Consequences: DECGRI `!Pn` repeats only the next data byte; `$` and `-` cancel a pending repeat; `-` advances the band by 6; the output does not depend on the over-allocated raster stride.	single_full_column_is_one_by_six_red, four_columns_one_band_is_four_by_six, partial_column_sets_only_low_bits, graphics_newline_advances_band, decgri_repeat_paints_run, repeat_does_not_survive_band_control, decgra_only_within_cap_uses_declared_geometry, compose_pads_declared_edges_transparent	VERY HARD: a Vec<u32> content model (raster, palette, params, output), get_mut/fill/extend_from_slice/resize, for loops over arrays and ranges, an enum match (ParamMode), &mut self two-state reasoning, a Clean List u8 model bound to the Rust fold, and the trust::skip on ensure_capacity	0,1,2,3,4,5,7,10
+decode-refines-model	refinement	SixelDecoder::{hook,put,unhook,emit_sixel,paint_pixelwise,finish_params,apply_color,apply_raster,apply_repeat,ensure_capacity}	∀ bs with Box(bs) ≤ CAP (see §5.2; the weaker precondition W*H ≤ CAP is false): run(bs) = Model(bs), meaning equal width, height and every pixel. A painted pixel is 0xFF000000 | (palette[reg] & 0xFFFFFF) of the register current when it was painted. Every other pixel is 0, including the right-edge and bottom padding up to the declared geometry. Consequences: DECGRI `!Pn` repeats only the next data byte; `$` and `-` cancel a pending repeat; `-` advances the band by 6; the output does not depend on the over-allocated raster stride.	partial_column_sets_only_low_bits, repeat_does_not_survive_band_control, decgra_only_within_cap_uses_declared_geometry, compose_pads_declared_edges_transparent	VERY HARD: a Vec<u32> content model (raster, palette, params, output), get_mut/fill/extend_from_slice/resize, for loops over arrays and ranges, an enum match (ParamMode), &mut self two-state reasoning, a Clean List u8 model bound to the Rust fold, and the trust::skip on ensure_capacity	0,1,2,3,4,5,7,10
 color-register	contract	SixelDecoder::{apply_color,finish_params}	∀ params p in mode Color: if p = [], nothing changes. Otherwise let reg = min(p[0], NREG-1). Afterwards current_color = reg and palette.len() = NREG still. If |p| ≥ 5, then palette'[reg] = (p[1] = 1 ? hls_to_rgb(p[2],p[3],p[4]) : rgb_percent(p[2],p[3],p[4])). Every other palette entry is unchanged. So an out-of-range register never panics and never grows the palette.	register_select_out_of_range_is_clamped_no_panic	MEDIUM: &mut self, Vec get/get_mut, a tuple of Options, an `as usize` cast, min	0,1,2,3,4
-rgb-percent	equivalence	rgb_percent, scale_pct	∀ r,g,b: u32: rgb_percent(r,g,b) = (scale(r) << 16) | (scale(g) << 8) | scale(b), where scale(v) ∈ 0..=255, scale(0) = 0 and scale(100) = 255. Hence rgb_percent(r,g,b) ≤ 0x00FFFFFF.	rgb_percent_scales_correctly	EASY: pure u32 arithmetic (saturating ops, division by a constant, shifts, bitwise or) and a call to an admitted fn	0,3,5
-hls-range	no-panic	hls_to_rgb	∀ h,l,s: u32: hls_to_rgb(h,l,s) does not panic, and its result is ≤ 0x00FFFFFF, so each channel is in 0..=255. The intended stronger spec (standard HSL with DEC's +240° hue offset) is not sampled by any test (§5.3).	hls_primaries_are_sane	HARD: f64 arithmetic (mul_add, abs, %, round), float-to-int casts, a closure capturing m, a match on `h6 as u32`. No row of audit §7 covers float reasoning.	0,3,5,13
-default-palette	table-property	default_palette	default_palette().len() = NREG. For i < 16: pal[i] = rgb_percent(DEC[i]), so pal[0] = 0. For 16 ≤ i < NREG: pal[i] = 0. Decidable by evaluation once the body is admitted.	default_palette_color_zero_is_black	EASY-MEDIUM: a vec![0; N] content model, a loop over a const array with enumerate, get_mut	0,1,3,5,7
+rgb-percent	equivalence	rgb_percent, scale_pct	∀ r,g,b: u32: rgb_percent(r,g,b) = (scale(r) << 16) | (scale(g) << 8) | scale(b), where scale(v) ∈ 0..=255, scale(0) = 0 and scale(100) = 255. Hence rgb_percent(r,g,b) ≤ 0x00FFFFFF.	-	EASY: pure u32 arithmetic (saturating ops, division by a constant, shifts, bitwise or) and a call to an admitted fn	0,3,5
+hls-range	no-panic	hls_to_rgb	∀ h,l,s: u32: hls_to_rgb(h,l,s) does not panic, and its result is ≤ 0x00FFFFFF, so each channel is in 0..=255. The intended stronger spec (standard HSL with DEC's +240° hue offset) is not sampled by any test (§5.3).	-	HARD: f64 arithmetic (mul_add, abs, %, round), float-to-int casts, a closure capturing m, a match on `h6 as u32`. No row of audit §7 covers float reasoning.	0,3,5,13
+default-palette	table-property	default_palette	default_palette().len() = NREG. For i < 16: pal[i] = rgb_percent(DEC[i]), so pal[0] = 0. For 16 ≤ i < NREG: pal[i] = 0. Decidable by evaluation once the body is admitted.	-	EASY-MEDIUM: a vec![0; N] content model, a loop over a const array with enumerate, get_mut	0,1,3,5,7
 spans	contract	SixelImage::{rows_spanned,cols_spanned}	∀ img, ∀ c: u16, with c' = max(c,1): rows_spanned(c) = ceil(height / c') and cols_spanned(c) = ceil(width / c'). Each is 0 exactly when its dimension is 0, and ≥ 1 otherwise.	span_helpers_round_up	EASY: &self field reads, u16→usize widening, is_multiple_of, saturating_add, max with a bool cast	0,2,3
 hook-reset	equivalence	SixelDecoder::hook	∀ d∈Reach: after d.hook(), d is observationally equal to D::new() followed by hook(). That is, ∀ bs: (d.hook(); put* bs; d.unhook()) = run(bs). No palette, geometry, extent, params or pending repeat carries over from an earlier cycle.	reuse_across_cycles_resets_state	MEDIUM: &mut self two-state reasoning over every field, Vec clear and reassignment; composes with decode-refines-model for the image half	0,1,2,4,5
 release	contract	SixelDecoder::{abort,release,pixel_alloc_bytes,unhook}	∀ d∈Reach: after d.abort(), d.active = false, pixel_alloc_bytes() = 0 and params = [], so a following unhook() is None. After any d.unhook(), pixel_alloc_bytes() = 0 as well.	abort_frees_and_yields_no_image	EASY: &mut self, Vec::new reassignment, Vec len times size_of	0,1,2
@@ -85,27 +89,19 @@ src/tests.rs	unhook_without_hook_is_none	inactive-noop
 src/tests.rs	empty_sequence_is_none	unhook-accept	
 src/tests.rs	width_growth_is_amortized_and_preserves_the_height_fast_path	growth-amortized	
 src/tests.rs	tall_raster_width_growth_stays_amortized_near_the_pixel_cap	growth-amortized	
-src/tests.rs	single_full_column_is_one_by_six_red	decode-refines-model	color-register, rgb-percent
 src/tests.rs	oversized_raster_declaration_is_refused_without_allocating	lazy-alloc	unhook-accept
 src/tests.rs	capped_raster_at_the_pixel_limit_still_decodes	unhook-accept	image-shape
-src/tests.rs	four_columns_one_band_is_four_by_six	decode-refines-model	
 src/tests.rs	partial_column_sets_only_low_bits	decode-refines-model	
-src/tests.rs	graphics_newline_advances_band	decode-refines-model	
-src/tests.rs	decgri_repeat_paints_run	decode-refines-model	
 src/tests.rs	dimensions_are_clamped	image-shape	decode-refines-model
 src/tests.rs	register_select_out_of_range_is_clamped_no_panic	color-register	image-shape
 src/tests.rs	span_helpers_round_up	spans	
 src/tests.rs	reuse_across_cycles_resets_state	hook-reset	decode-refines-model
 src/tests.rs	abort_frees_and_yields_no_image	release	inactive-noop
-src/tests.rs	default_palette_color_zero_is_black	default-palette	rgb-percent
-src/tests.rs	rgb_percent_scales_correctly	rgb-percent	
-src/tests.rs	hls_primaries_are_sane	hls-range	
 src/tests.rs	repeat_does_not_survive_band_control	decode-refines-model	
 src/tests.rs	decgra_only_oversized_yields_none_without_transient	unhook-accept	lazy-alloc
 src/tests.rs	decgra_only_within_cap_uses_declared_geometry	decode-refines-model	unhook-accept
 src/tests.rs	compose_pads_declared_edges_transparent	decode-refines-model	
 src/tests.rs	semicolon_flood_keeps_params_bounded	params-bound	
-src/tests.rs	param_cap_preserves_valid_color_define	(none: §4, delete)	params-bound, decode-refines-model
 ```
 
 ## 3. Coverage
@@ -118,11 +114,7 @@ src/tests.rs	param_cap_preserves_valid_color_define	(none: §4, delete)	params-b
 
 ## 4. Tests that are not spec samples
 
-Status (2026-10-15): `param_cap_preserves_valid_color_define` is deleted. Its `SIXEL_MAX_PARAMS >= 5` const assert is not a tautology (it guards the second clause of `params-bound`), so it was kept as a module-level `const _` in `src/tests.rs` until that clause is proved.
-
-| test | why | recommendation |
-|---|---|---|
-| param_cap_preserves_valid_color_define | It decodes exactly the same bytes (`"1;1;1;6#1;2;100;0;0#1~`) and makes the same assertions as `single_full_column_is_one_by_six_red`. Its only extra check, `const assert SIXEL_MAX_PARAMS >= 5`, is a compile-time tautology. Its intent (the cap does not cut a 5-param define) is the second clause of `params-bound`, together with `decode-refines-model`. | **delete** |
+Status (2026-10-15): `param_cap_preserves_valid_color_define` is deleted, and its §2 row is gone. Its `SIXEL_MAX_PARAMS >= 5` const assert is not a tautology (it guards the second clause of `params-bound`), so it was kept as a module-level `const _` in `src/tests.rs` until that clause is proved.
 
 Every regression test I found is an instance of one of the general specs above. That includes
 the DECGRA-only transient, the tall-raster amortization, the `!3$~` repeat leak and the
@@ -150,10 +142,9 @@ semicolon flood.
    After that, `need_h ≤ H` always holds, and `⌊CAP/new_h⌋ ≥ W` means the grow is never refused for
    a `W*H ≤ CAP` image. The precondition can then go back to `W*H ≤ CAP`.
    (Found while merging, by reading the code; not run.)
-3. **`hls_primaries_are_sane` asserts less than it says.** Its comment promises a "near-fully-saturated",
-   "non-zero" result, but it asserts only `c <= 0x00FFFFFF`. So it samples only `hls-range`. The intended
-   spec is unstated and untested: standard HSL with DEC's +240° hue offset, so that `hls(120,50,100)` is
-   pure red.
+3. **The intended HLS spec is unstated and untested.** `hls-range` states only that `hls_to_rgb` does
+   not panic and returns at most `0x00FFFFFF`. The intended spec is standard HSL with DEC's +240° hue
+   offset, so that `hls(120,50,100)` is pure red.
 4. **`oversized_raster_declaration_is_refused_without_allocating` has stale comments.** They say
    "ensure_capacity refused the 4096x4096 declaration" and mention a "~150 MB raster/mask/compose".
    `apply_raster` never calls `ensure_capacity`. The raster stays small because it grows only to the
@@ -170,7 +161,6 @@ semicolon flood.
 8. **`register_select_out_of_range_is_clamped_no_panic` checks only the dimensions.** Its comment says
    "not grow the palette", but nothing asserts `palette.len()`, or that register 1023 (default black, so
    the painted pixel is `0xFF000000`) was selected. `color-register` states both.
-9. **`param_cap_preserves_valid_color_define` duplicates another test exactly** (§4).
 
 ## 6. Proof order (easiest high-value first)
 

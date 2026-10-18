@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-1 conformance of the crash journal to
-//! `aterm_spec::derive::crash_journal_claim_model` (`CrashJournalClaim`, PTY
+//! `aterm_models_gui::crash_journal_claim_model` (`CrashJournalClaim`, PTY
 //! keeper P1).
 //!
 //! Every schedule of the model up to seven steps — enough to reach every state
@@ -39,7 +39,7 @@ use std::collections::BTreeMap;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::path::{Path, PathBuf};
 
-use aterm_spec::derive::crash_journal_claim_model;
+use aterm_models_gui::crash_journal_claim_model;
 use aterm_spec::interp::{self, State};
 use aterm_spec::verify::validate_transition_tiered;
 
@@ -524,21 +524,21 @@ fn replay(
 /// `claim_at_boot`). The other eight are the process around the journal,
 /// which this runner plays and projects rather than code any journal function
 /// runs.
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "CrashJournalClaim",
     action = "BootFresh",
     reason = "The run's own start: the crash marker it arms is crash_signal's install; the \
               runner arms one in the real log dir and the journal is armed lazily at the \
               first Write."
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "CrashJournalClaim",
     action = "BootFromJournal",
     reason = "The run's own start after a reopened journal: Lane::begin_probation only sets \
               the header mark the runner writes through JournalOwner::publish; its 90 s \
               clock is crash_journal::tests::the_lane_writes_only_changes_at_the_bounded_rate."
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "CrashJournalClaim",
     action = "BootSecondChance",
     reason = "The run's own start after the brake let a stopped probation writer's journal \
@@ -546,28 +546,28 @@ fn replay(
               header mark the runner writes through JournalOwner::publish \
               (crash_journal::tests::a_relapse_inside_probation_is_skipped_and_said)."
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "CrashJournalClaim",
     action = "Crash",
     reason = "A fatal signal runs no journal code: crash_signal's handler writes its banner \
               into the run's own marker, which the runner writes, and the kernel releases the \
               locks as for Die."
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "CrashJournalClaim",
     action = "HandOff",
     reason = "The update parent's _exit after Commit is seamless::commit_and_exit, which \
               removes the crash marker and ends the process; the runner removes the marker \
               and drops the owner, whose drop releases its lock by LOCK_UN."
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "CrashJournalClaim",
     action = "Die",
     reason = "A SIGKILL, a signal or a panic runs no journal code: the runner drops the owner, \
               whose lock goes as the kernel releases a dead process's (a child forked \
               under it and not yet exec'd keeps it until its exec), leaving the marker."
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "CrashJournalClaim",
     action = "FinishWrite",
     reason = "Exists only in the Buggy = 1 unlink-first writer; the shipping publish is one \
@@ -575,7 +575,7 @@ fn replay(
               rewrites always finds a whole image (crash_journal::tests::\
               a_rewrite_never_leaves_the_name_without_a_whole_image)."
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "CrashJournalClaim",
     action = "SuccessorDies",
     reason = "A successor's end before it took anything over runs no journal code: the \

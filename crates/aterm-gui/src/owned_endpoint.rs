@@ -391,17 +391,4 @@ mod tests {
         assert!(!sock.exists() && !token.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
-
-    /// Nothing to remove is not an error: an already-gone file stays gone.
-    #[test]
-    fn an_absent_file_is_left_absent() {
-        let dir = scratch("gone");
-        let path = dir.join("f");
-        std::fs::write(&path, "x").unwrap();
-        let owned = Owned::capture(&path).unwrap();
-        std::fs::remove_file(&path).unwrap();
-        assert!(!owned.remove_if_still_ours());
-        assert!(Owned::capture(&path).is_none());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }

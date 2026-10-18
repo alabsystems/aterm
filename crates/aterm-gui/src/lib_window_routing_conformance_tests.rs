@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use aterm_spec::derive::window_routing_model;
+use aterm_models_session::window_routing_model;
 use std::collections::BTreeMap;
 
 /// The real `App` projected onto `[win_count, frontmost, next_id, exited]`. `frontmost`

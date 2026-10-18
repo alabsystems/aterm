@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The four declarations against the answers windows-sys 0.52.0 gave the
-//! oracle (`tests/oracle/run.sh`, recorded 2026-10-15 on x86_64- and
+//! oracle (`tests/oracle/PROVENANCE.md`; `targo --unverified run -p
+//! aterm-win32-oracle -- oracle-052` runs it; recorded 2026-10-15 on x86_64- and
 //! aarch64-pc-windows-msvc before the `[patch]` row took the registry crate
 //! out of the graph). The oracle needs the registry crate and a Windows std;
 //! this holds the same answers on any host, so a changed width, signedness,

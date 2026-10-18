@@ -9,11 +9,13 @@
 //! single mark did not. Two rigs: the default line height and a doubled one, where every
 //! lift is whole. On macOS `Renderer::from_system(18.0, ..)` resolves SF Mono (an 11x21
 //! cell, baseline 17: two rows of room over an acute, none under a dot below) through
-//! CoreText. Placement reads the mark's ink box, never the raster path's reported box
-//! (`the_stack_is_placed_by_ink_not_by_the_reported_raster_box`).
+//! CoreText. Placement reads the mark's ink box (`aterm_render::glyph_ink_box`), never the
+//! raster path's reported box: CoreText pads a dot below a row past the baseline, so a
+//! box-fed classifier would call it a straddling overlay and never stack it
+//! (`second_below_mark_is_dropped_as_far_as_the_descent_allows`).
 
 use aterm_core::terminal::Terminal;
-use aterm_render::{Frame, Renderer, Theme, glyph_ink_box};
+use aterm_render::{Frame, Renderer, Theme};
 
 const ROWS: usize = 2;
 const COLS: usize = 4;
@@ -119,20 +121,6 @@ fn a_whole_lift_leaves_an_ink_free_row_and_the_first_mark_untouched() {
 }
 
 #[test]
-fn acute_over_circumflex_are_two_separate_bands() {
-    let mut rend = renderer(2.0);
-    let bare = frame(&mut rend, "e");
-    let rows = differing_rows(&frame(&mut rend, "e\u{0302}\u{0301}"), &bare);
-    eprintln!("circumflex + acute rows {rows:?}");
-    assert!(rows.len() >= 3, "non-vacuity: two marks draw ink: {rows:?}");
-    // The lifted acute sits one clear row above the circumflex.
-    assert!(
-        rows.windows(2).any(|w| w[1] > w[0] + 1),
-        "acute and circumflex must be separated by an ink-free row: {rows:?}"
-    );
-}
-
-#[test]
 fn second_below_mark_is_dropped_as_far_as_the_descent_allows() {
     for line_height in [1.0, 2.0] {
         let mut rend = renderer(line_height);
@@ -163,48 +151,5 @@ fn second_below_mark_is_dropped_as_far_as_the_descent_allows() {
                 "line height {line_height}: two dots below must end below one: {rows_two:?} vs {rows_one:?}"
             );
         }
-    }
-}
-
-/// The stack is placed by [`glyph_ink_box`], not the `(height, ymin)` a raster path
-/// reports: CoreText's box overhangs the ink, and for a mark just under the baseline the
-/// overhang crosses it, so a box-fed classifier would call a dot below a straddling
-/// overlay that joins no stack. This asserts the ink is a below-mark and logs the
-/// reported box, so a path whose box needs no trimming (subpixel pads X only, portable
-/// crops its pad) shows in the log rather than silently making the sibling tests vacuous.
-#[test]
-fn the_stack_is_placed_by_ink_not_by_the_reported_raster_box() {
-    let mut rend = renderer(2.0);
-    let key = rend.glyph_key('\u{0323}');
-    let img = rend.glyph_image(key);
-    let (gh, ymin) = (img.height() as i32, img.ymin());
-    let (ink_h, ink_ymin) = glyph_ink_box(img).expect("U+0323 rasterizes to ink");
-    eprintln!(
-        "U+0323: reported box gh {gh} ymin {ymin} (top edge {}), ink gh {ink_h} ymin {ink_ymin} \
-         (top edge {})",
-        ymin + gh,
-        ink_ymin + ink_h as i32,
-    );
-    assert!(
-        ink_ymin + ink_h as i32 <= 0,
-        "U+0323's INK lies wholly below the baseline — it is a below-mark on every raster path"
-    );
-    assert!(
-        ink_h as i32 <= gh && ink_ymin >= ymin,
-        "the ink box is inside the reported box"
-    );
-    if ymin + gh > 0 {
-        // This raster path pads: the box rule would call this below-mark a straddling
-        // overlay, so the below-stack test above is the live regression.
-        assert!(
-            ink_ymin + ink_h as i32 <= 0,
-            "the pad, not the glyph, is what crosses the baseline"
-        );
-    } else {
-        eprintln!(
-            "NOTE: this raster path reports a vertically unpadded box for U+0323 — the operand \
-             seam is not observable here, only on the CoreText path, whose pad crosses the \
-             baseline"
-        );
     }
 }

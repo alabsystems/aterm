@@ -117,18 +117,31 @@ pub fn set_application_should_terminate_handler(handler: fn() -> bool) {
 /// Additional methods on [`Window`] that are specific to MacOS.
 ///
 /// LOCAL PATCH (aterm), 2026-10-15 (docs/AUDIT-third-party-2026-10-15.md, winit-core step 5): the
-/// one method aterm calls. Upstream's simple fullscreen, shadow, native tabbing, document-edited,
-/// option-as-alt and borderless-game controls are cut, with `WindowAttributesExtMacOS` (whose
-/// titlebar, shadow, HiDPI, first-mouse, tabbing and option-as-alt settings now stand at the
-/// defaults aterm always ran with), `ActiveEventLoopExtMacOS`, `OptionAsAlt`,
-/// `EventLoopBuilderExtMacOS::with_default_menu` (winit's default menu, and with it the Services
-/// menu registration, is still always built) and `MonitorHandleExtMacOS::ns_screen`.
+/// methods aterm calls. Upstream's simple fullscreen, shadow, native tabbing, document-edited and
+/// borderless-game controls are cut, with `WindowAttributesExtMacOS` (whose titlebar, shadow,
+/// HiDPI, first-mouse, tabbing and option-as-alt settings now stand at the defaults aterm always
+/// ran with; option-as-alt is set after creation, [`WindowExtMacOS::set_option_as_alt`]),
+/// `ActiveEventLoopExtMacOS`, `EventLoopBuilderExtMacOS::with_default_menu` (winit's default
+/// menu, and with it the Services menu registration, is still always built) and
+/// `MonitorHandleExtMacOS::ns_screen`. Option-as-alt was cut in step 5 and restored on
+/// 2026-10-16 (ATERM-KI-1015-9: aterm's Meta mode needs it).
 pub trait WindowExtMacOS {
     /// LOCAL PATCH (aterm): the modifier state winit last derived from an
     /// event for this window — its own cache, written before the matching
     /// `ModifiersChanged` is queued. For re-syncing after a contained
     /// `NSException`; never a WindowServer-backed probe.
     fn cached_modifiers(&self) -> ModifiersState;
+
+    /// Make the Option keys `option_as_alt` names an Alt for this window's key events: AppKit
+    /// is handed the event with the characters the key types without Option
+    /// (`-charactersIgnoringModifiers`), so Option neither composes a glyph (Option+a, "å")
+    /// nor starts a dead key (Option+e), and the key event's text is the layout's character
+    /// at the Shift level. The Alt modifier is still reported. Not for a chord with Control
+    /// or Command, whose text AppKit already reads without Option.
+    fn set_option_as_alt(&self, option_as_alt: OptionAsAlt);
+
+    /// What [`WindowExtMacOS::set_option_as_alt`] last set ([`OptionAsAlt::None`] until then).
+    fn option_as_alt(&self) -> OptionAsAlt;
 }
 
 impl WindowExtMacOS for Window {
@@ -136,6 +149,32 @@ impl WindowExtMacOS for Window {
     fn cached_modifiers(&self) -> ModifiersState {
         self.window.maybe_wait_on_main(|w| w.cached_modifiers())
     }
+
+    #[inline]
+    fn set_option_as_alt(&self, option_as_alt: OptionAsAlt) {
+        self.window.maybe_queue_on_main(move |w| w.set_option_as_alt(option_as_alt))
+    }
+
+    #[inline]
+    fn option_as_alt(&self) -> OptionAsAlt {
+        self.window.maybe_wait_on_main(|w| w.option_as_alt())
+    }
+}
+
+/// Which Option keys a window treats as Alt ([`WindowExtMacOS::set_option_as_alt`]).
+///
+/// LOCAL PATCH (aterm), 2026-10-16: upstream's type, restored with the setter.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OptionAsAlt {
+    /// The left Option key is Alt; the right one composes.
+    OnlyLeft,
+    /// The right Option key is Alt; the left one composes.
+    OnlyRight,
+    /// Both Option keys are Alt.
+    Both,
+    /// Neither: both compose, AppKit's default.
+    #[default]
+    None,
 }
 
 // LOCAL PATCH (aterm), 2026-10-15 (docs/AUDIT-third-party-2026-10-15.md, winit-core step 6):

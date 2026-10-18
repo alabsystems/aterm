@@ -34,9 +34,13 @@
 //! `fsync`ed: a death mid-write leaves the previous image whole.
 //!
 //! Writing ([`Lane`]): at most once per [`MIN_WRITE_INTERVAL`], only when the
-//! layout changed, and never while idle. It follows `restore_session` (off or
-//! headless: nothing written, an existing journal withdrawn); a clean quit
-//! removes it after writing its own layout.
+//! layout changed, and never while idle — except a tab's STANDING WORDS ABOUT
+//! TYPING ([`OwnerWords`]: its Autopilot word and timer, its holds), which are
+//! captured at once whatever the interval says ([`Lane::note_owner_words`]):
+//! a person's Land, Off or hold lost to the write throttle reopened a tab
+//! that was then typed into (the live lab of 2026-10-17). It follows
+//! `restore_session` (off or headless: nothing written, an existing journal
+//! withdrawn); a clean quit removes it after writing its own layout.
 //!
 //! Claiming ([`claim_at_boot`]): a journal whose writer holds its lock is never
 //! touched. A dead writer's journal is taken by renaming it to a claim name
@@ -50,7 +54,7 @@
 //! also reported on the band, and an unreadable one is kept as
 //! `journal-<pid>-<nanos>.unreadable` (the newest few) for its row to name.
 //!
-//! Model: `CrashJournalClaim` (`aterm_spec::derive::crash_journal_claim_model`);
+//! Model: `CrashJournalClaim` (`aterm_models_gui::crash_journal_claim_model`);
 //! Tier-1: `crash_journal_conformance.rs`.
 #![cfg_attr(
     not(unix),
@@ -71,7 +75,10 @@ use serde::{Deserialize, Serialize};
 use crate::restore::RestoreManifest;
 
 /// At most one journal write per this interval (design §5.5), and at most one
-/// capture: a capture that finds nothing new still waits it out.
+/// capture: a capture that finds nothing new still waits it out. Save a tab's
+/// word about typing ([`Lane::note_owner_words`]), which is captured on the
+/// loop turn that moved it and handed to the writer at once — one capture
+/// for the turn, however many words moved on it.
 pub(crate) const MIN_WRITE_INTERVAL: Duration = Duration::from_secs(2);
 
 /// At most one journal write per this interval when only titles changed: an
@@ -272,7 +279,7 @@ pub(crate) struct LeafProgram {
     pub(crate) program: String,
     /// This leaf's restore carries its agent's relaunch record
     /// ([`crate::restore::TerminalLeafRestore::agent`]), so the program is that
-    /// agent, relaunched on its conversation ([`Reopened::resumed`]).
+    /// agent, relaunched on its conversation ([`Reopened::resumed_agents`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) agent: bool,
     /// This leaf's session was already captured at an earlier leaf of the same
@@ -524,22 +531,43 @@ impl Reopened {
     /// order — none of a tab that was held (`TerminalLeafRestore::holds`,
     /// LC-8): only when `relaunching`
     /// ([`crate::harness_host::HostHandle::relaunches_restored`]) and the record
-    /// resumes ([`crate::restore::AgentRestore::resumes`]). A session shown in
+    /// resumes on a tab the owner did not hold
+    /// ([`crate::restore::TerminalLeafRestore::resumes_agent`]). A session shown in
     /// two windows names its agent on both leaves, and it is relaunched once,
-    /// at the first ([`crate::restore::AgentRestore::ran_as`]).
-    pub(crate) fn resumed(&self, relaunching: bool) -> Vec<(u32, u32)> {
+    /// at the first ([`crate::restore::AgentRestore::ran_as`]). With the agent
+    /// each brings back, Claude Code or Codex
+    /// ([`crate::restore::AgentRestore::agent`]; a leaf whose word its run
+    /// contradicts reads as Claude Code, as the relaunch's snapshot does with
+    /// no run): what the reopened row words its line by (F1-R8-G4).
+    pub(crate) fn resumed_agents(
+        &self,
+        relaunching: bool,
+    ) -> Vec<((u32, u32), aterm_agent::harness::upgrade::Agent)> {
         self.resuming_leaves(relaunching, true)
     }
 
-    /// [`Self::resumed`], or with `once` false one `(window, tab)` per LEAF
-    /// naming such an agent: a co-viewed session's second leaf too, whose
+    /// [`Self::resumed_agents`]' places alone (tests).
+    #[cfg(test)]
+    pub(crate) fn resumed(&self, relaunching: bool) -> Vec<(u32, u32)> {
+        self.resumed_agents(relaunching)
+            .into_iter()
+            .map(|(place, _)| place)
+            .collect()
+    }
+
+    /// [`Self::resumed_agents`], or with `once` false one `(window, tab)` per
+    /// LEAF naming such an agent: a co-viewed session's second leaf too, whose
     /// agent comes back at the first ([`Self::lost_given`]).
-    fn resuming_leaves(&self, relaunching: bool, once: bool) -> Vec<(u32, u32)> {
+    fn resuming_leaves(
+        &self,
+        relaunching: bool,
+        once: bool,
+    ) -> Vec<((u32, u32), aterm_agent::harness::upgrade::Agent)> {
         fn walk<'a>(
             node: &'a crate::restore::RestoredSplitTree,
             place: (u32, u32),
             seen: &mut Option<Vec<(u32, &'a str)>>,
-            out: &mut Vec<(u32, u32)>,
+            out: &mut Vec<((u32, u32), aterm_agent::harness::upgrade::Agent)>,
         ) {
             match node {
                 crate::restore::RestoredSplitTree::Leaf {
@@ -547,20 +575,19 @@ impl Reopened {
                 } => {
                     // A held tab's agent is the holder's: never relaunched
                     // (`App::carry_restored_identity`, ruling 23).
-                    if let Some(agent) = leaf
-                        .agent
-                        .as_deref()
-                        .filter(|_| leaf.holds.is_empty())
-                        .filter(|agent| agent.resumes())
-                        .filter(|agent| {
-                            seen.as_ref()
-                                .is_none_or(|seen| !seen.contains(&agent.ran_as()))
-                        })
-                    {
+                    if let Some(agent) = leaf.resumes_agent().filter(|agent| {
+                        seen.as_ref()
+                            .is_none_or(|seen| !seen.contains(&agent.ran_as()))
+                    }) {
                         if let Some(seen) = seen {
                             seen.push(agent.ran_as());
                         }
-                        out.push(place);
+                        out.push((
+                            place,
+                            agent
+                                .agent()
+                                .unwrap_or(aterm_agent::harness::upgrade::Agent::Claude),
+                        ));
                     }
                 }
                 crate::restore::RestoredSplitTree::Leaf { .. } => {}
@@ -591,7 +618,7 @@ impl Reopened {
     /// agents `relaunched` takes
     /// ([`crate::harness_host::HostHandle::relaunches_restored_of`]): every
     /// other agent's leaf names none, so no place says it comes back
-    /// ([`Self::resumed`]) and its program counts among what was lost
+    /// ([`Self::resumed_agents`]) and its program counts among what was lost
     /// ([`Self::lost_given`]).
     pub(crate) fn relaunched_by(
         &self,
@@ -687,7 +714,7 @@ impl Reopened {
     /// What was lost with the programs, or `None` when the journals did not
     /// say. A leaf counts only when its window and tab are reopened; programs in
     /// one tab's splits count as one tab. Agents relaunched on their
-    /// conversation (`relaunching`, [`Self::resumed`]) are not lost: entries
+    /// conversation (`relaunching`, [`Self::resumed_agents`]) are not lost: entries
     /// marked [`LeafProgram::agent`] are left out, up to the count of that
     /// tab's leaves naming one — a co-viewed session's second leaf too, its
     /// agent relaunched at the first. Every other program counts in every tab
@@ -708,7 +735,7 @@ impl Reopened {
             if entry.agent
                 && let Some(at) = coming_back
                     .iter()
-                    .position(|place| *place == (entry.window, entry.tab))
+                    .position(|(place, _)| *place == (entry.window, entry.tab))
             {
                 coming_back.remove(at);
                 continue;
@@ -911,7 +938,7 @@ mod unix {
         Note, QuitLayout, Reopened, decode, encode, unix_nanos,
     };
     use crate::crash_signal::markers::{self, Owner};
-    use crate::durable::fsync;
+    use crate::durable::{Flush, fsync};
     use crate::restore::RestoreManifest;
 
     /// The writer's half: this process's journal, its lifetime lock held.
@@ -976,8 +1003,8 @@ mod unix {
         /// next claim. One second of slack absorbs a clock step; `None` bounds
         /// nothing.
         #[cfg_attr(
-            test,
-            aterm_spec::refines(
+            any(test, debug_assertions),
+            aterm_spec_anchor::refines(
                 machine = "CrashJournalClaim",
                 action = "Adopt",
                 project = "aterm_gui::crash_journal_conformance::Rig::project"
@@ -1023,16 +1050,16 @@ mod unix {
         /// rename over the journal's name, directory `fsync`. The probation mark
         /// rides the header, so settling probation is a publish too.
         #[cfg_attr(
-            test,
-            aterm_spec::refines(
+            any(test, debug_assertions),
+            aterm_spec_anchor::refines(
                 machine = "CrashJournalClaim",
                 action = "Write",
                 project = "aterm_gui::crash_journal_conformance::Rig::project"
             )
         )]
         #[cfg_attr(
-            test,
-            aterm_spec::refines(
+            any(test, debug_assertions),
+            aterm_spec_anchor::refines(
                 machine = "CrashJournalClaim",
                 action = "Settle",
                 project = "aterm_gui::crash_journal_conformance::Rig::project"
@@ -1057,8 +1084,8 @@ mod unix {
         /// the lock. A death between steps leaves a dead lock with no image,
         /// never an image with no lock to try.
         #[cfg_attr(
-            test,
-            aterm_spec::refines(
+            any(test, debug_assertions),
+            aterm_spec_anchor::refines(
                 machine = "CrashJournalClaim",
                 action = "Quit",
                 project = "aterm_gui::crash_journal_conformance::Rig::project"
@@ -1067,7 +1094,7 @@ mod unix {
         pub(crate) fn retire(self) -> Result<(), String> {
             let removed = remove_if_present(&self.path());
             let _ = fs::remove_file(self.dir.join(self.id.lock_name()));
-            let _ = sync_dir(&self.dir);
+            let _ = sync_dir(&self.dir, None);
             drop(self);
             removed
         }
@@ -1080,10 +1107,8 @@ mod unix {
         /// this process forked while the lock was held keeps a copy of its
         /// description until that child's `exec`, and a lock released only by
         /// the close stays taken on that copy for the child's whole fork→exec
-        /// window — which a child that demoted itself first (the since-retired
-        /// managed Ollama daemon's spawn did, until its parent took the
-        /// demotion after the exec) stretched past ten seconds on a loaded
-        /// host. `LOCK_UN` strips the
+        /// window — which a child that demoted itself first stretched past
+        /// ten seconds on a loaded host. `LOCK_UN` strips the
         /// lock from the description itself, the child's copy included.
         fn drop(&mut self) {
             // SAFETY: `flock` on the descriptor this owner holds open until
@@ -1109,7 +1134,7 @@ mod unix {
     /// so nothing else would before a cold launch, one stray lock per update
     /// (finding 45's review; finding 65's class).
     pub(crate) fn settle_adoption(dir: &Path, parent: JournalId) -> Option<PathBuf> {
-        let _ = sync_dir(dir);
+        let _ = sync_dir(dir, None);
         let lock = dir.join(parent.lock_name());
         (!clear_dead_lock(&lock)).then_some(lock)
     }
@@ -1150,11 +1175,18 @@ mod unix {
         let result = (|| {
             file.write_all(bytes)
                 .map_err(|error| format!("write {}: {error}", temporary.display()))?;
-            fsync(&file).map_err(|error| format!("sync {}: {error}", temporary.display()))?;
+            // Ordered: the image lands before the rename and the name before the next
+            // image, so a power loss leaves the previous whole image. A plain fsync(2)
+            // promises no order on Apple; the barrier is about 0.3 ms. Ordinary layout
+            // captures run at most 0.5 Hz; owner-word changes bypass that interval
+            // (`Lane::note_owner_words`).
+            aterm_durable::ordered(&file)
+                .map_err(|error| format!("sync {}: {error}", temporary.display()))?;
             drop(file);
             fs::rename(&temporary, &target)
                 .map_err(|error| format!("publish {}: {error}", target.display()))?;
-            sync_dir(dir).map_err(|error| format!("sync {}: {error}", dir.display()))
+            sync_dir(dir, Some(Flush::Ordered))
+                .map_err(|error| format!("sync {}: {error}", dir.display()))
         })();
         if result.is_err() {
             let _ = fs::remove_file(&temporary);
@@ -1162,8 +1194,15 @@ mod unix {
         result
     }
 
-    fn sync_dir(dir: &Path) -> std::io::Result<()> {
-        fsync(&File::open(dir)?)
+    /// Flush `dir`'s entries: with `flush` through aterm-durable, or with `None` a
+    /// plain `fsync(2)` (the retirement, the adoption and the boot claim, which guard
+    /// against process death only).
+    fn sync_dir(dir: &Path, flush: Option<Flush>) -> std::io::Result<()> {
+        let handle = File::open(dir)?;
+        match flush {
+            Some(flush) => crate::durable::finish(&handle, flush),
+            None => fsync(&handle),
+        }
     }
 
     fn create_temporary(dir: &Path, id: JournalId) -> Result<(PathBuf, File), String> {
@@ -1399,8 +1438,8 @@ mod unix {
     /// dead writers and claimers (lock without journal, write temporary, claim
     /// file) are cleared on the way.
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "CrashJournalClaim",
             action = "Claim",
             project = "aterm_gui::crash_journal_conformance::Rig::project"
@@ -1529,7 +1568,8 @@ mod unix {
         }
         clear_leftovers(dir, &leftovers);
         claim.reopened = merge(candidates, quit.windows, &mut claim.set_aside);
-        let _ = sync_dir(dir);
+        // Kept as it was, a plain fsync(2): this flush was not upheld as ordering-only.
+        let _ = sync_dir(dir, None);
         claim
     }
 
@@ -1937,11 +1977,17 @@ impl Runs {
     /// Whether the agent `record` describes may still be the one running.
     fn may_be(self, record: &crate::restore::AgentRestore) -> bool {
         // The restore names its agent as its relaunch reads it
-        // (`AgentRestore::agent`): an agent this build has no lane for is
-        // none of the agents a status read names.
+        // (`AgentRestore::agent`): an agent this build has no lane for (agy,
+        // Gemini CLI: `lanes()` all false) is none of the agents a status
+        // read names, so a read that names one drops its leaf. Muse Code's
+        // leaf (its relaunch lane) is Muse Code's.
         let kind = record
             .agent()
-            .map(aterm_agent::harness::upgrade::Agent::program);
+            .map(aterm_agent::harness::upgrade::Agent::program)
+            .filter(|program| {
+                aterm_agent::harness::lanes::lanes(*program)
+                    != aterm_agent::harness::lanes::Lanes::NONE
+            });
         match self {
             Self::Unread => true,
             Self::Agent(program) => kind == Some(program),
@@ -2014,8 +2060,13 @@ pub(crate) struct Lane {
     pid: u32,
     /// Something may have changed since the last capture.
     dirty: bool,
-    /// No capture before this instant.
+    /// No capture before this instant — unless one is [`Self::owed_now`].
     not_before: Option<Instant>,
+    /// A tab's standing words about typing moved from what the last image
+    /// carries ([`Self::note_owner_words`]): the next capture is due at once,
+    /// whatever [`Self::not_before`] says. Cleared by the capture that
+    /// carries them ([`Self::offer`]).
+    owed_now: bool,
     /// This launch reopened a crash journal; until this instant its own
     /// journal carries the probation mark.
     probation_until: Option<Instant>,
@@ -2063,6 +2114,53 @@ pub(crate) struct Lane {
     pub(crate) captures: u64,
 }
 
+/// A TAB'S STANDING WORDS ABOUT TYPING, as its terminal leaf carries them: the
+/// person's Autopilot word and the timer beside it
+/// ([`crate::restore::TerminalLeafRestore::autopilot`], `land_at`) and the
+/// holds that stand on its session (`holds`, the fleet's first). Each decides
+/// whether the reopened tab is typed into — an Off or a held tab must not be,
+/// and a Land tab must not get Cruise's carry-on — so a change of any of them
+/// is journaled at once ([`Lane::note_owner_words`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OwnerWords {
+    pub(crate) autopilot: Option<String>,
+    pub(crate) land_at: Option<i64>,
+    pub(crate) holds: Vec<String>,
+}
+
+impl OwnerWords {
+    /// The words `leaf` carries.
+    pub(crate) fn of_leaf(leaf: &crate::restore::TerminalLeafRestore) -> Self {
+        Self {
+            autopilot: leaf.autopilot.clone(),
+            land_at: leaf.land_at,
+            holds: leaf.holds.clone(),
+        }
+    }
+
+    /// The words `manifest` carries on session `local_id`'s terminal leaf, or
+    /// `None` where it has no leaf for that session.
+    fn carried(manifest: &RestoreManifest, local_id: u64) -> Option<Self> {
+        use crate::restore::{RestoredSplitTree, RestoredView};
+        fn find(node: &RestoredSplitTree, local_id: u64) -> Option<OwnerWords> {
+            match node {
+                RestoredSplitTree::Leaf {
+                    view: RestoredView::Terminal(leaf),
+                } => (leaf.local_id == Some(local_id)).then(|| OwnerWords::of_leaf(leaf)),
+                RestoredSplitTree::Leaf { .. } => None,
+                RestoredSplitTree::Split { first, second, .. } => {
+                    find(first, local_id).or_else(|| find(second, local_id))
+                }
+            }
+        }
+        manifest
+            .windows
+            .iter()
+            .flat_map(|window| &window.restored_tabs)
+            .find_map(|tab| find(&tab.root, local_id))
+    }
+}
+
 /// The image last handed to the writer.
 #[derive(Clone, Debug, PartialEq)]
 struct Written {
@@ -2083,6 +2181,7 @@ impl Lane {
             pid,
             dirty: true,
             not_before: None,
+            owed_now: false,
             probation_until: None,
             second_chance: false,
             last: None,
@@ -2328,7 +2427,7 @@ impl Lane {
     }
 
     /// A lane that never writes (the test App's).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "bench-support"))]
     pub(crate) fn inert() -> Self {
         Self::new(None, 0)
     }
@@ -2357,6 +2456,38 @@ impl Lane {
     /// title may have moved.
     pub(crate) fn note_activity(&mut self) {
         self.dirty = true;
+    }
+
+    /// SESSION `local_id`'s STANDING WORDS ABOUT TYPING are now `words`
+    /// ([`OwnerWords`]): where the last image handed to the writer carries
+    /// other words on that session's leaf, the next capture is OWED NOW —
+    /// due at once, whatever the write interval says ([`Self::capture_due`])
+    /// — and answers `true`. Fail-closed: a person's Land, Off or hold is
+    /// never lost to the throttle. The live lab of 2026-10-17 set Land and
+    /// SIGKILLed aterm 0.8 s after a capture; the image it reopened had no
+    /// word, the tab fell back to Cruise, and its relaunch typed "keep
+    /// going" into work the person had chosen to land.
+    ///
+    /// Every other change keeps [`MIN_WRITE_INTERVAL`]: words the last image
+    /// already carries owe nothing (so a caller may ask on every wake that
+    /// may move them), and so does a session the last image has no leaf for
+    /// — a tab newer than that image is the layout's own change, and none is
+    /// reopened from it. With no image yet the first capture is not held
+    /// back anyway. An inert lane owes nothing.
+    pub(crate) fn note_owner_words(&mut self, local_id: u64, words: &OwnerWords) -> bool {
+        if self.dir.is_none() {
+            return false;
+        }
+        let carried = self
+            .last
+            .as_ref()
+            .and_then(|last| OwnerWords::carried(&last.manifest, local_id));
+        let owed = carried.is_some_and(|carried| carried != *words);
+        if owed {
+            self.dirty = true;
+            self.owed_now = true;
+        }
+        owed
     }
 
     /// Whether a capture was owed, clearing it (tests of what marks it).
@@ -2391,13 +2522,15 @@ impl Lane {
             .flatten()
     }
 
-    /// Whether a capture is due now.
+    /// Whether a capture is due now: one owed now ([`Self::note_owner_words`])
+    /// always, anything else once the write interval allows.
     pub(crate) fn capture_due(&self, now: Instant) -> bool {
         self.dir.is_some()
-            && self.not_before.is_none_or(|at| now >= at)
-            && (self.dirty
-                || self.settle_due(now)
-                || self.title_due_at().is_some_and(|at| now >= at))
+            && (self.owed_now
+                || (self.not_before.is_none_or(|at| now >= at)
+                    && (self.dirty
+                        || self.settle_due(now)
+                        || self.title_due_at().is_some_and(|at| now >= at))))
     }
 
     /// Offer a fresh capture taken at `now`. A leaf whose cwd and title came
@@ -2419,6 +2552,9 @@ impl Lane {
     ) -> bool {
         self.captures = self.captures.saturating_add(1);
         self.dirty = false;
+        // This capture carries the words that were owed now: what moved
+        // them was stored before it was read.
+        self.owed_now = false;
         self.not_before = Some(now + MIN_WRITE_INTERVAL);
         if let Some(last) = &self.last {
             heal_busy_leaves(&mut manifest, &last.manifest);
@@ -2846,6 +2982,8 @@ pub(crate) mod fixtures {
     fn leaf(local: u64, cwd: Option<&str>, title: &str) -> restore::RestoredSplitTree {
         restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(
             restore::TerminalLeafRestore {
+                sid: None,
+                lineage: None,
                 cwd: cwd.map(str::to_string),
                 title: title.to_string(),
                 profile: None,
@@ -2857,7 +2995,9 @@ pub(crate) mod fixtures {
                 attention: None,
                 questions: None,
                 autopilot: None,
+                land_at: None,
                 identity: None,
+                theme: None,
                 agent: None,
                 supervised: None,
                 held: false,
@@ -2905,8 +3045,8 @@ pub(crate) mod tests {
     pub(crate) use super::fixtures::layout;
     use super::{
         BootClaim, DeathClass, Evidence, JournalHeader, JournalId, JournalOwner, Lane,
-        MIN_WRITE_INTERVAL, Note, PROBATION, PanesWithoutFolder, QuitLayout, TITLE_WRITE_INTERVAL,
-        claim_at_boot, classify_death, decode, encode, same_but_titles,
+        MIN_WRITE_INTERVAL, Note, OwnerWords, PROBATION, PanesWithoutFolder, QuitLayout,
+        TITLE_WRITE_INTERVAL, claim_at_boot, classify_death, decode, encode,
     };
     use crate::crash_signal::{MarkerOwner, markers};
     use crate::restore::{self, RestoreManifest};
@@ -3024,178 +3164,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// Through the real journal: an image saying no leaf ran a program reopens
-    /// as a record; a leaf that ran vim keeps the warning and names it; an
-    /// image with no word on programs reads as "programs lost".
-    #[test]
-    fn a_relaunch_whose_tabs_sat_at_their_prompts_is_quiet_through_the_journal() {
-        use crate::message_reporters::{
-            JOURNAL_LOSS, JOURNAL_NOTHING_RAN, journal_reopened_message,
-        };
-        use aterm_messages::{Hold, Severity};
-        let manifest = layout(&[("/work/a", "zsh"), ("/work/b", "zsh")]);
-        let reopen = |programs: Option<Vec<super::LeafProgram>>| {
-            let (dir, logs) = (scratch("cj-dir"), scratch("cj-logs"));
-            die(run_said(dir.path(), logs.path(), &manifest, programs));
-            claim_here(dir.path(), logs.path())
-                .reopened
-                .expect("reopened")
-        };
-
-        let quiet = reopen(Some(Vec::new()));
-        assert_eq!(
-            quiet.programs,
-            Some(Vec::new()),
-            "`programs = []` round-trips"
-        );
-        let row =
-            journal_reopened_message(&quiet, None, None, None, false, PanesWithoutFolder::NONE, 0);
-        assert_eq!((row.severity, row.hold), (Severity::Info, Hold::LogOnly));
-        assert_eq!(row.detail[0], JOURNAL_NOTHING_RAN);
-
-        let lost = reopen(Some(vec![vim_in(0, 1)]));
-        assert_eq!(lost.programs, Some(vec![vim_in(0, 1)]));
-        let row =
-            journal_reopened_message(&lost, None, None, None, false, PanesWithoutFolder::NONE, 0);
-        assert_eq!(row.severity, Severity::Warn);
-        assert_ne!(row.hold, Hold::LogOnly);
-        assert!(row.detail[0].starts_with("vim was running in 1 of 2 tabs"));
-
-        let older = reopen(None);
-        assert_eq!(older.programs, None);
-        let row =
-            journal_reopened_message(&older, None, None, None, false, PanesWithoutFolder::NONE, 0);
-        assert_eq!(row.severity, Severity::Warn);
-        assert_eq!(row.detail[0], JOURNAL_LOSS);
-    }
-
-    /// Through the real journal: a pane whose folder is gone at reopen is
-    /// counted by the spawn's own check (`spawn_folder::folder_fault`), and the
-    /// loss sentence no longer says only scrollback was lost. With both folders
-    /// present the row reads as usual. A pane ssh held is not counted and the
-    /// row claims no folders, unless it carries an aterm-hosted agent.
-    #[test]
-    fn a_reopened_layout_counts_the_panes_whose_folder_is_gone() {
-        use crate::message_reporters::{
-            JOURNAL_NOTHING_RAN, JOURNAL_NOTHING_RAN_FOLDERLESS, journal_reopened_message,
-        };
-        let folders = scratch("cj-folders");
-        let here = folders.path().join("here");
-        let gone = folders.path().join("gone");
-        std::fs::create_dir(&here).unwrap();
-        std::fs::create_dir(&gone).unwrap();
-        let (here, gone_str) = (here.to_str().unwrap(), gone.to_str().unwrap());
-        let manifest = layout(&[(here, "zsh"), (gone_str, "zsh")]);
-        let reopen_from = |manifest: &RestoreManifest, programs: Vec<super::LeafProgram>| {
-            let (dir, logs) = (scratch("cj-dir"), scratch("cj-logs"));
-            die(run_said(dir.path(), logs.path(), manifest, Some(programs)));
-            claim_here(dir.path(), logs.path())
-                .reopened
-                .expect("reopened")
-        };
-        let reopen = || reopen_from(&manifest, Vec::new());
-        let spawn_verdict = |dir: &str| crate::spawn_folder::folder_fault(dir).is_some();
-        let counted = |gone, unasked| PanesWithoutFolder { gone, unasked };
-
-        let whole = reopen();
-        assert_eq!(
-            whole.panes_without_folder(spawn_verdict),
-            PanesWithoutFolder::NONE
-        );
-        let row =
-            journal_reopened_message(&whole, None, None, None, false, PanesWithoutFolder::NONE, 0);
-        assert_eq!(row.detail[0], JOURNAL_NOTHING_RAN);
-        assert_eq!(
-            row.detail[1],
-            "2 tabs in 1 window restored in their folders from its crash journal"
-        );
-
-        std::fs::remove_dir(&gone).unwrap();
-        let reopened = reopen();
-        let homeless = reopened.panes_without_folder(spawn_verdict);
-        assert_eq!(homeless, counted(1, 0), "the tab whose folder is gone");
-        let row = journal_reopened_message(&reopened, None, None, None, false, homeless, 0);
-        assert_eq!(row.detail[0], JOURNAL_NOTHING_RAN_FOLDERLESS);
-        assert_eq!(
-            row.detail[1],
-            "2 tabs in 1 window restored from its crash journal; 1 pane could not open its folder"
-        );
-        assert!(
-            row.detail
-                .iter()
-                .all(|line| !line.contains("in their folders")),
-            "{:?}",
-            row.detail
-        );
-
-        // The same pane while ssh held it: its folder may be remote, so it is
-        // not counted and the row claims no folders.
-        let mut ssh = manifest.clone();
-        if let restore::RestoredSplitTree::Leaf {
-            view: restore::RestoredView::Terminal(leaf),
-        } = &mut ssh.windows[0].restored_tabs[1].root
-        {
-            leaf.held = true;
-        }
-        let ssh_ran = || {
-            vec![super::LeafProgram {
-                window: 0,
-                tab: 1,
-                program: "ssh".to_string(),
-                agent: false,
-                again: false,
-            }]
-        };
-        let reopened = reopen_from(&ssh, ssh_ran());
-        assert!(
-            matches!(
-                &reopened.manifest.windows[0].restored_tabs[1].root,
-                restore::RestoredSplitTree::Leaf {
-                    view: restore::RestoredView::Terminal(leaf),
-                } if leaf.held
-            ),
-            "held survives the journal"
-        );
-        let unasked = reopened.panes_without_folder(spawn_verdict);
-        assert_eq!(unasked, counted(0, 1));
-        let row = journal_reopened_message(&reopened, None, None, None, false, unasked, 0);
-        assert!(
-            row.detail[0].starts_with("ssh was running in 1 of 2 tabs"),
-            "{:?}",
-            row.detail
-        );
-        assert_eq!(
-            row.detail[1],
-            "2 tabs in 1 window restored from its crash journal"
-        );
-        // Unless the pane carries the agent aterm hosted there: it ran on
-        // this machine, in that folder, so the gone folder is counted.
-        let mut hosted = ssh.clone();
-        if let restore::RestoredSplitTree::Leaf {
-            view: restore::RestoredView::Terminal(leaf),
-        } = &mut hosted.windows[0].restored_tabs[1].root
-        {
-            leaf.agent = Some(Box::new(restore::AgentRestore {
-                word: String::new(),
-                pid: 4242,
-                start: "Sat Sep 27 01:02:03 2026".into(),
-                program: "/opt/claude/bin/claude".into(),
-                argv: vec!["/opt/claude/bin/claude".into()],
-                session: None,
-                cwd: gone_str.to_owned(),
-                version: None,
-                home: None,
-                login: None,
-                codex: None,
-                cause: None,
-            }));
-        }
-        assert_eq!(
-            reopen_from(&hosted, Vec::new()).panes_without_folder(spawn_verdict),
-            counted(1, 0)
-        );
-    }
-
     /// Every pane of the tree a window restores from is counted: a split tab's
     /// second pane, and the legacy mirror's panes when no canonical tabs exist.
     /// With every folder present nothing counts, and a window with canonical
@@ -3270,15 +3238,10 @@ pub(crate) mod tests {
         );
     }
 
-    /// Through the real journal: a killed run whose tab 2 hosted Claude reopens
-    /// as a record (only scrollback lost) with the relaunch on; beside a lost
-    /// vim the warning names vim and says Claude starts again. With the
-    /// relaunch off, an agent without a conversation, or an agent entry in a
-    /// tab whose leaf has no record, the agent counts as lost.
+    /// An agent comes back on its conversation only when the relaunch is on
+    /// and its record names one; a leaf with no record brings back none.
     #[test]
-    fn an_agent_the_relaunch_brings_back_is_not_lost_through_the_journal() {
-        use crate::message_reporters::{JOURNAL_ONLY_SCROLLBACK, journal_reopened_message};
-        use aterm_messages::{Hold, Severity};
+    fn only_an_agent_with_a_conversation_is_resumed_and_only_when_relaunching() {
         let claude = |session: Option<&str>| restore::AgentRestore {
             word: String::new(),
             pid: 4242,
@@ -3287,12 +3250,34 @@ pub(crate) mod tests {
             argv: vec!["/opt/claude/bin/claude".into()],
             session: session.map(str::to_string),
             cwd: "/work/b".into(),
-            version: Some("2.1.283".into()),
+            version: None,
             home: None,
             login: None,
-            codex: None,
+            run: None,
             cause: None,
+            tab: None,
         };
+        let reopened = |agent: Option<restore::AgentRestore>| {
+            let mut manifest = layout(&[("/work/a", "zsh"), ("/work/b", "claude")]);
+            manifest.fill_agents(&|id| (id == 1).then(|| agent.clone()).flatten());
+            super::Reopened {
+                manifest,
+                class: DeathClass::Killed,
+                sources: Vec::new(),
+                writers: Vec::new(),
+                handed: Vec::new(),
+                programs: None,
+                second_chance: false,
+            }
+        };
+        const CONVERSATION: &str = "0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c";
+        let with = reopened(Some(claude(Some(CONVERSATION))));
+        assert_eq!(with.resumed(true), vec![(0, 1)]);
+        assert!(with.resumed(false).is_empty(), "the relaunch off");
+        assert!(reopened(Some(claude(None))).resumed(true).is_empty());
+        assert!(reopened(None).resumed(true).is_empty());
+        // The per-agent switch, through the real journal.
+        use crate::message_reporters::journal_reopened_message;
         let agent_in = |tab: u32| super::LeafProgram {
             window: 0,
             tab,
@@ -3300,102 +3285,30 @@ pub(crate) mod tests {
             agent: true,
             again: false,
         };
-        let reopen = |agent: Option<restore::AgentRestore>, programs: Vec<super::LeafProgram>| {
-            let mut manifest = layout(&[("/work/a", "zsh"), ("/work/b", "claude")]);
-            manifest.fill_agents(&|id| (id == 1).then(|| agent.clone()).flatten());
-            let (dir, logs) = (scratch("cj-dir"), scratch("cj-logs"));
-            die(run_said(dir.path(), logs.path(), &manifest, Some(programs)));
-            claim_here(dir.path(), logs.path())
-                .reopened
-                .expect("reopened")
-        };
-        const CONVERSATION: &str = "0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c";
-
-        let only = reopen(Some(claude(Some(CONVERSATION))), vec![agent_in(1)]);
-        assert_eq!(
-            only.programs,
+        let mut manifest = layout(&[("/work/a", "zsh"), ("/work/b", "claude")]);
+        manifest.fill_agents(&|id| (id == 1).then(|| claude(Some(CONVERSATION))));
+        let (dir, logs) = (scratch("cj-dir"), scratch("cj-logs"));
+        die(run_said(
+            dir.path(),
+            logs.path(),
+            &manifest,
             Some(vec![agent_in(1)]),
-            "`agent = true` round-trips"
-        );
-        assert_eq!(only.resumed(true), vec![(0, 1)]);
-        let row =
-            journal_reopened_message(&only, None, None, None, true, PanesWithoutFolder::NONE, 0);
-        assert_eq!((row.severity, row.hold), (Severity::Info, Hold::LogOnly));
-        assert_eq!(row.title, "Tabs restored after aterm stopped");
-        assert_eq!(
-            row.detail[0],
-            format!(
-                "aterm starts Claude again on its conversation in tab 2; {JOURNAL_ONLY_SCROLLBACK}"
-            )
-        );
-        assert!(
-            row.detail.iter().all(|l| !l.contains("did not survive,")),
-            "{:?}",
-            row.detail
-        );
-
-        let beside = reopen(
-            Some(claude(Some(CONVERSATION))),
-            vec![vim_in(0, 0), agent_in(1)],
-        );
-        let row =
-            journal_reopened_message(&beside, None, None, None, true, PanesWithoutFolder::NONE, 0);
-        assert_eq!(row.severity, Severity::Warn);
-        assert_eq!(row.title, "Tabs restored, vim lost");
-        // One sentence (ruling 314): the agent coming back rides detail[0],
-        // never the technical lines under it.
-        assert_eq!(
-            row.detail[0],
-            "vim was running in 1 of 2 tabs and did not survive, nor did the scrollback; \
-             aterm starts Claude again on its conversation in tab 2",
-            "{:?}",
-            row.detail
-        );
-        assert!(
-            row.detail[1..].iter().all(|l| !l.contains("starts Claude")),
-            "{:?}",
-            row.detail
-        );
-
-        // Negative controls.
-        let off =
-            journal_reopened_message(&only, None, None, None, false, PanesWithoutFolder::NONE, 0);
-        assert_eq!(off.severity, Severity::Warn);
-        assert_eq!(off.title, "Tabs restored, claude lost");
-        assert!(
-            off.detail.iter().all(|l| !l.contains("resumes")),
-            "{:?}",
-            off.detail
-        );
-        let unregistered = reopen(Some(claude(None)), vec![agent_in(1)]);
-        assert!(unregistered.resumed(true).is_empty());
-        let row = journal_reopened_message(
-            &unregistered,
-            None,
-            None,
-            None,
-            true,
-            PanesWithoutFolder::NONE,
-            0,
-        );
-        assert_eq!(row.title, "Tabs restored, claude lost");
-        let planted = reopen(None, vec![agent_in(1)]);
-        let row = journal_reopened_message(
-            &planted,
-            None,
-            None,
-            None,
-            true,
-            PanesWithoutFolder::NONE,
-            0,
-        );
-        assert_eq!(row.title, "Tabs restored, claude lost");
+        ));
+        let only = claim_here(dir.path(), logs.path())
+            .reopened
+            .expect("reopened");
         // An agent the host does not relaunch — its own switch off
         // (`HostHandle::relaunches_restored_of`) — is lost with the relaunch
         // on; one it does is told as before.
         let claude_only = |agent: &restore::AgentRestore| match agent.agent() {
             Some(aterm_agent::harness::upgrade::Agent::Claude) => true,
-            Some(aterm_agent::harness::upgrade::Agent::Codex) | None => false,
+            Some(
+                aterm_agent::harness::upgrade::Agent::Codex
+                | aterm_agent::harness::upgrade::Agent::Agy
+                | aterm_agent::harness::upgrade::Agent::Muse
+                | aterm_agent::harness::upgrade::Agent::Gemini,
+            )
+            | None => false,
         };
         assert_eq!(only.relaunched_by(claude_only).resumed(true), vec![(0, 1)]);
         let switched_off = only.relaunched_by(|_| false);
@@ -3421,12 +3334,25 @@ pub(crate) mod tests {
             session: Some("019a0b1c-2d3e-7f40-8a5b-6c7d8e9f0a1b".into()),
             cwd: "/work/c".into(),
             version: None,
-            codex: Some(restore::CodexRestore {
+            // codex-alab, its validated line on the leaf: a vendor `codex`
+            // is relaunched by nobody whatever the switches say.
+            run: Some(restore::RunRestore::Codex(restore::CodexRestore {
                 home: "/h/.codex".into(),
                 home_env: None,
-                embedded: false,
+                embedded: true,
                 started_ms: 0,
-            }),
+                alab: Some(restore::AlabRestore {
+                    argv: vec![
+                        "/opt/codex/bin/codex".into(),
+                        "resume".into(),
+                        "019a0b1c-2d3e-7f40-8a5b-6c7d8e9f0a1b".into(),
+                    ],
+                    session: "019a0b1c-2d3e-7f40-8a5b-6c7d8e9f0a1b".into(),
+                    codex_home: None,
+                    cwd: None,
+                }),
+                carried: None,
+            })),
             ..claude(None)
         };
         let mut manifest = layout(&[
@@ -3454,6 +3380,13 @@ pub(crate) mod tests {
             .reopened
             .expect("reopened");
         assert_eq!(mixed.resumed(true), vec![(0, 1), (0, 2)], "both on");
+        // NEGATIVE CONTROL: the same leaf with no validated line (a vendor
+        // `codex`) is not counted as coming back, both switches on.
+        let mut vendor = codex.clone();
+        if let Some(restore::RunRestore::Codex(run)) = vendor.run.as_mut() {
+            run.alab = None;
+        }
+        assert!(codex.resumes() && !vendor.resumes());
         let told = mixed.relaunched_by(claude_only);
         assert_eq!(told.resumed(true), vec![(0, 1)]);
         let row =
@@ -3522,48 +3455,6 @@ pub(crate) mod tests {
         assert_eq!(read.programs.unwrap()[0].program, "");
     }
 
-    /// One unnamed job whose session two tabs showed: the later leaf's mark
-    /// survives the journal, and the job counts in both tabs as one program.
-    /// An older writer's image, which never marks a leaf, counts every entry.
-    #[test]
-    fn a_co_viewed_program_counts_once_through_the_journal() {
-        let job = |tab: u32, again: bool| super::LeafProgram {
-            window: 0,
-            tab,
-            program: String::new(),
-            agent: false,
-            again,
-        };
-        let (dir, logs) = (scratch("cj-dir"), scratch("cj-logs"));
-        die(run_said(
-            dir.path(),
-            logs.path(),
-            &layout(&[("/a", "zsh"), ("/a", "zsh")]),
-            Some(vec![job(0, false), job(1, true)]),
-        ));
-        let reopened = claim_here(dir.path(), logs.path())
-            .reopened
-            .expect("reopened");
-        assert_eq!(
-            reopened.programs,
-            Some(vec![job(0, false), job(1, true)]),
-            "`again = true` round-trips"
-        );
-        let lost = |tabs, unnamed| {
-            Some(super::Lost {
-                tabs,
-                named: Vec::new(),
-                unnamed,
-            })
-        };
-        assert_eq!(reopened.lost(), lost(2, 1));
-        let older = super::Reopened {
-            programs: Some(vec![job(0, false), job(1, false)]),
-            ..reopened
-        };
-        assert_eq!(older.lost(), lost(2, 2));
-    }
-
     /// The owner dies with no exit path (a SIGKILL): its lock goes with it,
     /// at once, whatever child a sibling test forked meanwhile
     /// ([`JournalOwner`]'s drop).
@@ -3624,17 +3515,62 @@ pub(crate) mod tests {
     }
 
     /// A journal is a `session.toml` too: the layout parses through the quit
-    /// layout's own reader, and the header rides beside it.
+    /// layout's own reader, and the header rides beside it — its programs
+    /// with them: none said, none running (`[]`, a quiet relaunch), and
+    /// entries with their `agent` and `again` marks.
     #[test]
     fn a_journal_is_a_session_toml_with_a_header() {
         let manifest = layout(&[("/work/a", "vim"), ("/work/b", "zsh")]);
-        let header = JournalHeader::now(7, true);
-        let text = encode(&manifest, &header).unwrap();
-        assert_eq!(RestoreManifest::from_toml(&text), Some(manifest.clone()));
-        assert_eq!(decode(&text).unwrap(), (header, manifest));
+        let marked = super::LeafProgram {
+            window: 0,
+            tab: 1,
+            program: "claude".to_string(),
+            agent: true,
+            again: true,
+        };
+        for programs in [None, Some(Vec::new()), Some(vec![vim_in(0, 0), marked])] {
+            let mut header = JournalHeader::now(7, true);
+            header.programs = programs;
+            let text = encode(&manifest, &header).unwrap();
+            assert_eq!(RestoreManifest::from_toml(&text), Some(manifest.clone()));
+            assert_eq!(decode(&text).unwrap(), (header, manifest.clone()));
+        }
         assert!(
             decode(&RestoreManifest::new(Vec::new()).to_toml().unwrap()).is_err(),
             "a plain session.toml has no header and is no journal"
+        );
+    }
+
+    /// A journal image and its entry are only ordered (aterm-durable's counting
+    /// seam): a power loss keeps the previous whole image. The boot claim's
+    /// directory flush is untouched: still the plain `fsync(2)`, which goes
+    /// through no aterm-durable arm, so the seam records nothing for it.
+    #[test]
+    fn a_journal_image_is_only_ordered_and_the_boot_claim_untouched() {
+        use aterm_durable::{Flush, seam::Recording};
+        let (dir, logs) = (scratch("cj-flush"), scratch("cj-flush-logs"));
+        let id = JournalId::now(reaped_pid());
+        marker(logs.path(), id);
+        let owner = JournalOwner::create(dir.path(), id).expect("armed");
+        let recording = Recording::start();
+        owner
+            .publish(
+                &layout(&[("/work/a", "zsh")]),
+                &JournalHeader::now(id.pid, false),
+            )
+            .expect("published");
+        assert_eq!(
+            recording.take(),
+            [Flush::Ordered, Flush::Ordered],
+            "the image and its entry"
+        );
+        die(owner);
+        let claim = claim_here(dir.path(), logs.path());
+        assert!(claim.reopened.is_some(), "the dead run's desk reopens");
+        assert_eq!(
+            recording.take(),
+            [],
+            "the claim's entries take the plain fsync(2), not an aterm-durable arm"
         );
     }
 
@@ -3669,8 +3605,8 @@ pub(crate) mod tests {
     /// has yet to exec. Released by the close alone it stayed taken on that
     /// child's copy of the description, and a claim in the window skipped the
     /// dead run's journal as a live one's: the full suite's conformance runner
-    /// waited out a sibling test's background-band fork (the since-retired
-    /// managed Ollama daemon's) past ten seconds. The fork is made for real while the lock is
+    /// waited out a sibling test's background-band fork past ten seconds. The
+    /// fork is made for real while the lock is
     /// held, and parked short of its exec through the claim.
     #[test]
     fn a_dead_owners_lock_is_free_while_a_child_forked_under_it_has_yet_to_exec() {
@@ -3686,49 +3622,6 @@ pub(crate) mod tests {
         );
         child.release();
         assert_eq!(claim.taken, vec![id], "the dead run's journal is taken");
-    }
-
-    /// P6a (2026-09-27): a killed run's journal brings back, on the leaf whose
-    /// shell hosted it, the agent's relaunch record — what the next launch
-    /// relaunches in that reopened tab. NEGATIVE CONTROL: the leaf whose shell
-    /// hosted none comes back with none.
-    #[test]
-    fn a_killed_runs_journal_brings_back_its_agent() {
-        let (dir, logs) = (scratch("cj-dir"), scratch("cj-logs"));
-        let claude = restore::AgentRestore {
-            word: String::new(),
-            pid: 4242,
-            start: "Sat Sep 27 01:02:03 2026".into(),
-            program: "/opt/claude/bin/claude".into(),
-            argv: vec![
-                "/opt/claude/bin/claude".into(),
-                "--dangerously-skip-permissions".into(),
-            ],
-            session: Some("0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c".into()),
-            cwd: "/work/b".into(),
-            version: Some("2.1.283".into()),
-            home: None,
-            login: None,
-            codex: None,
-            cause: None,
-        };
-        let mut manifest = layout(&[("/work/a", "zsh"), ("/work/b", "claude")]);
-        manifest.fill_agents(&|id| (id == 1).then(|| claude.clone()));
-        die(run(dir.path(), logs.path(), &manifest, false));
-        let reopened = claim_here(dir.path(), logs.path())
-            .reopened
-            .expect("reopened");
-        let agents: Vec<Option<restore::AgentRestore>> = reopened.manifest.windows[0]
-            .restored_tabs
-            .iter()
-            .map(|tab| match &tab.root {
-                restore::RestoredSplitTree::Leaf {
-                    view: restore::RestoredView::Terminal(leaf),
-                } => leaf.agent.as_deref().cloned(),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(agents, vec![None, Some(claude)]);
     }
 
     /// A clean quit removes its journal and lock. A run whose marker went with
@@ -3828,7 +3721,7 @@ pub(crate) mod tests {
 
     /// An unreadable journal of an unclean end is reported and kept aside where
     /// its row says, never read again; a journal planted as a link is never
-    /// followed nor kept. A whole image reopens.
+    /// followed nor kept.
     #[test]
     fn an_unreadable_journal_is_said_and_never_followed() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -3937,17 +3830,6 @@ pub(crate) mod tests {
             "the other name's file is untouched"
         );
         assert_eq!(listed(dir.path()), aside, "a hard link is never kept");
-
-        die(run(
-            dir.path(),
-            logs.path(),
-            &layout(&[("/whole", "zsh")]),
-            false,
-        ));
-        assert!(
-            claim_here(dir.path(), logs.path()).reopened.is_some(),
-            "control"
-        );
     }
 
     /// The brake: a launch that reopened a crash journal and crashed within
@@ -4047,10 +3929,12 @@ pub(crate) mod tests {
         assert!(!settled.second_chance);
     }
 
-    /// A header written before the second-chance mark reads as `false`, and
-    /// the mark rides only a probation image (ruling 285, additive).
+    /// The header's later marks are additive: a header written before one
+    /// reads it as `false`, and an unset one writes no key. The second-chance
+    /// mark rides only a probation image (ruling 285); `stamps_quit` is
+    /// written by this build and absent from an older one's.
     #[test]
-    fn the_second_chance_mark_is_additive() {
+    fn the_header_marks_are_additive() {
         let text = encode(
             &layout(&[("/a", "zsh")]),
             &JournalHeader::now(7, true).with_second_chance(true),
@@ -4065,14 +3949,20 @@ pub(crate) mod tests {
         assert!(header.probation && !header.second_chance);
         let plain = encode(&layout(&[("/a", "zsh")]), &JournalHeader::now(7, false)).unwrap();
         assert!(!plain.contains("second_chance"), "{plain}");
+
+        assert!(plain.contains("stamps_quit = true"), "{plain}");
+        assert!(decode(&plain).expect("decoded").0.stamps_quit);
+        let theirs = encode(&layout(&[("/a", "zsh")]), &older_header(7)).expect("encoded");
+        assert!(!theirs.contains("stamps_quit"), "{theirs}");
+        assert!(!decode(&theirs).expect("decoded").0.stamps_quit);
     }
 
-    /// The last quit's layout wins: every dead journal is taken and set aside.
+    /// A quit layout does not set a crashed desk aside: another instance's
+    /// quit left `session.toml` (one window), then the five-window desk
+    /// crashed, and the claim reopens the crashed desk behind the quit layout.
+    /// Beside a quit layout at the window cap it does not fit, and is set aside.
     #[test]
     fn a_quit_layout_does_not_set_a_crashed_desk_aside() {
-        // Another instance's quit left `session.toml` (one window), then the
-        // five-window desk crashed: the claim reopens the crashed desk behind
-        // the quit layout, and a clean end's journal is still set aside.
         let (dir, logs) = (scratch("cj-dir"), scratch("cj-logs"));
         let desk: Vec<RestoreManifest> = (0..5)
             .map(|i| layout(&[(format!("/w{i}").as_str(), "zsh")]))
@@ -4081,15 +3971,6 @@ pub(crate) mod tests {
         let crashed = run(dir.path(), logs.path(), &desk, false);
         let crashed_id = crashed.id();
         die(crashed);
-        let clean = JournalId::now(reaped_pid());
-        let owner = JournalOwner::create(dir.path(), clean).expect("armed");
-        owner
-            .publish(
-                &layout(&[("/clean", "zsh")]),
-                &JournalHeader::now(clean.pid, false),
-            )
-            .expect("published");
-        die(owner); // no marker: a clean end
         let claim = claim_at_boot(
             dir.path(),
             &evidence(logs.path()),
@@ -4102,11 +3983,7 @@ pub(crate) mod tests {
             cwds(&reopened.manifest),
             vec!["/w0", "/w1", "/w2", "/w3", "/w4"]
         );
-        assert!(claim.set_aside.iter().any(|(id, _)| *id == clean));
-        assert_eq!(claim.taken.len(), 2);
         assert!(names(dir.path()).is_empty());
-        // Beside a quit layout at the window cap, the crashed desk does not fit:
-        // set aside, as a layout over the cap always was.
         let (dir, logs) = (scratch("cj-dir"), scratch("cj-logs"));
         die(run(
             dir.path(),
@@ -4378,11 +4255,12 @@ pub(crate) mod tests {
         );
         assert_eq!(claim.reopened, None, "the later run's report is its own");
         assert_eq!(
-            claim.set_aside,
-            vec![(
-                stale,
-                "no crash evidence of its run (a clean end leaves none)"
-            )]
+            claim
+                .set_aside
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![stale]
         );
         // NEGATIVE CONTROL: with no later run known, the report is the
         // stale run's (a pid-only report from before the mark).
@@ -4780,8 +4658,9 @@ pub(crate) mod tests {
             version: Some("2.1.283".into()),
             home: None,
             login: None,
-            codex: None,
+            run: None,
             cause: None,
+            tab: None,
         };
         let successor = || {
             let dir = scratch("cj-dir");
@@ -4870,6 +4749,77 @@ pub(crate) mod tests {
             None,
             "after a withdraw, not the parent's folder"
         );
+    }
+
+    /// A PARENT'S LEAF OF AN AGENT WITH NO LANE YET (agy, Gemini CLI, a
+    /// newer build's word) is not this run's to carry once its own status
+    /// read names any agent, that very program included: the record is read
+    /// as no agent a status read names (`Runs::may_be`), as every build
+    /// before those words did, so a successor drops it rather than write it
+    /// into its own image. Unread, it stands, as it always did. NEGATIVE
+    /// CONTROL: Claude Code's, Codex's and Muse Code's leaves are carried
+    /// while their own program runs (a Muse Code word with no `[muse]` run is
+    /// no agent's).
+    #[test]
+    fn a_parents_leaf_of_an_agent_with_no_lane_is_no_agent_a_status_read_names() {
+        use super::Runs;
+        use aterm_phase::Program;
+        let record = |word: &str| restore::AgentRestore {
+            word: word.into(),
+            pid: 4242,
+            start: "Sat Sep 27 01:02:03 2026".into(),
+            program: format!("/opt/{word}/bin/{word}"),
+            argv: vec![format!("/opt/{word}/bin/{word}")],
+            session: Some("C-parent".into()),
+            cwd: "/b".into(),
+            version: None,
+            home: None,
+            login: None,
+            run: None,
+            cause: None,
+            tab: None,
+        };
+        for (word, program) in [("agy", Program::Agy), ("gemini", Program::Gemini)] {
+            let leaf = record(word);
+            assert!(leaf.agent().is_some(), "{word}: read as that agent");
+            for runs in [
+                Runs::Agent(program),
+                Runs::Agent(Program::Claude),
+                Runs::Other,
+            ] {
+                assert!(!runs.may_be(&leaf), "{word} under {runs:?}");
+            }
+            assert!(Runs::Unread.may_be(&leaf), "{word}: unread, it stands");
+        }
+        let codex = restore::AgentRestore {
+            run: Some(restore::RunRestore::Codex(restore::CodexRestore {
+                home: "/h/.codex".into(),
+                home_env: None,
+                embedded: false,
+                started_ms: 0,
+                alab: None,
+                carried: None,
+            })),
+            ..record("codex")
+        };
+        assert!(Runs::Agent(Program::Codex).may_be(&codex));
+        assert!(Runs::Agent(Program::Claude).may_be(&record("")));
+        // Muse Code's leaf, its session in its own table, is Muse Code's; its
+        // word with no table is no agent's (the word its run contradicts).
+        let muse = restore::AgentRestore {
+            session: None,
+            run: Some(restore::RunRestore::Muse(restore::MuseRestore {
+                session: Some("01a148f8-9301-7752-96db-fef456f88074".into()),
+                workspace: Some("/b".into()),
+                data: "/h/.local/share".into(),
+                env: Vec::new(),
+            })),
+            ..record("muse")
+        };
+        assert!(Runs::Agent(Program::Muse).may_be(&muse));
+        assert!(!Runs::Agent(Program::Claude).may_be(&muse));
+        assert_eq!(record("muse").agent(), None);
+        assert!(!Runs::Agent(Program::Muse).may_be(&record("muse")));
     }
 
     /// ROUND SEVEN, FINDING 5'S REVIEW: the take-over takes only the parent
@@ -5263,16 +5213,6 @@ pub(crate) mod tests {
             assert!(claim.set_aside.iter().any(|(set, _)| *set == id));
             assert!(claim.taken.contains(&id), "taken, so gone");
         }
-
-        // The mark on the wire: this build writes it, an older image reads
-        // without it, and an unmarked header writes no key.
-        let desk = layout(&[("/w", "zsh")]);
-        let ours = encode(&desk, &JournalHeader::now(7, false)).expect("encoded");
-        assert!(ours.contains("stamps_quit = true"), "{ours}");
-        assert!(decode(&ours).expect("decoded").0.stamps_quit);
-        let theirs = encode(&desk, &older_header(7)).expect("encoded");
-        assert!(!theirs.contains("stamps_quit"), "{theirs}");
-        assert!(!decode(&theirs).expect("decoded").0.stamps_quit);
     }
 
     /// The take-over's other ends: the successor's own image replaces the
@@ -5323,24 +5263,6 @@ pub(crate) mod tests {
         }
         assert!(lane.retire(MUST_HAPPEN).is_ok());
         assert!(names(dir.path()).is_empty(), "{:?}", names(dir.path()));
-    }
-
-    /// A crashed desk of 65 windows comes back as its first 64, not as an
-    /// unreadable image.
-    #[test]
-    fn a_crashed_desk_past_the_window_cap_reopens_what_fits() {
-        let (dir, logs) = (scratch("cj-dir"), scratch("cj-logs"));
-        let desk = RestoreManifest::new(
-            (0..=crate::restore::MAX_WINDOWS)
-                .flat_map(|i| layout(&[(format!("/w{i}").as_str(), "zsh")]).windows)
-                .collect(),
-        );
-        die(run(dir.path(), logs.path(), &desk, false));
-        let claim = claim_here(dir.path(), logs.path());
-        assert!(claim.notes.is_empty(), "{:?}", claim.notes);
-        let reopened = claim.reopened.expect("reopened");
-        assert_eq!(reopened.manifest.windows.len(), crate::restore::MAX_WINDOWS);
-        assert_eq!(cwds(&reopened.manifest)[0], "/w0");
     }
 
     /// A crash whose marker another launch consumed first (renamed `.seen` by
@@ -5572,26 +5494,6 @@ pub(crate) mod tests {
         owner.retire().unwrap();
     }
 
-    /// THE BOOT ORDER, read off `main_entry`: the claim reads the crash evidence
-    /// BEFORE `take_crash_evidence`/`take_kill_evidence` consume it (they rename
-    /// every marker and report to `.seen`, which the claim does not read — an
-    /// installed app's kill would then never reopen), and the quit's retire
-    /// comes after the quit's own layout write.
-    #[test]
-    fn main_entry_claims_before_the_evidence_is_consumed_and_retires_after_the_write() {
-        let source = include_str!("lib.rs");
-        let main = &source[source
-            .find("pub fn main_entry(")
-            .expect("main_entry exists")..];
-        let at = |needle: &str| {
-            main.find(needle)
-                .unwrap_or_else(|| panic!("main_entry calls {needle}"))
-        };
-        assert!(at("crash_journal::claim_at_boot(") < at("logging::take_crash_evidence()"));
-        assert!(at("crash_journal::claim_at_boot(") < at("logging::take_kill_evidence()"));
-        assert!(at("restore::write_quit(") < at(".retire(std::time::Duration"));
-    }
-
     /// Images are private and published whole: `0600`, no temporary left.
     #[test]
     fn an_image_is_private_and_whole() {
@@ -5673,11 +5575,123 @@ pub(crate) mod tests {
         assert!(names(dir.path()).is_empty(), "{:?}", names(dir.path()));
     }
 
-    /// A never-ending title change (an agent's spinner) is written once per
-    /// [`TITLE_WRITE_INTERVAL`]; the last title is written at the interval's
-    /// end, and a layout change inside the interval is written at the layout's
-    /// rate. A program starting or ending in a leaf is written even inside the
-    /// title interval. Control: the spinner's captures are each a change.
+    /// A program starting or ending in a leaf is written even though only the
+    /// title moved, like a moved folder.
+    /// A PERSON'S WORD ABOUT TYPING IS NEVER LOST TO THE WRITE INTERVAL (the
+    /// live lab of 2026-10-17: `meta set autopilot land`, then a SIGKILL
+    /// 0.8 s after a capture; the reopened tab had no word, fell back to
+    /// Cruise and was typed into). A tab's Autopilot word, its timer or a
+    /// hold that moved from what the last image carries makes the next
+    /// capture due AT ONCE, inside the interval, and the capture that carries
+    /// it is handed to the writer; that capture clears the debt, so the
+    /// interval stands again. NEGATIVE CONTROLS: plain activity inside the
+    /// interval still waits for its trailing edge; words the last image
+    /// already carries owe nothing; nor does a session the image has no leaf
+    /// for (a tab newer than it is the layout's own change); nor an inert
+    /// lane.
+    #[test]
+    fn a_word_about_typing_is_captured_at_once_inside_the_write_interval() {
+        let dir = scratch("cj-owner");
+        let mut lane = Lane::new(Some(dir.path().to_path_buf()), std::process::id());
+        let words = |autopilot: Option<&str>, land_at: Option<i64>, holds: &[&str]| OwnerWords {
+            autopilot: autopilot.map(str::to_string),
+            land_at,
+            holds: holds.iter().map(|h| h.to_string()).collect(),
+        };
+        let with = |tab: usize, w: &OwnerWords| {
+            let mut m = layout(&[("/a", "claude"), ("/b", "zsh")]);
+            for (index, other) in m.windows[0].restored_tabs.iter_mut().enumerate() {
+                if let restore::RestoredSplitTree::Leaf {
+                    view: restore::RestoredView::Terminal(leaf),
+                } = &mut other.root
+                    && index == tab
+                {
+                    leaf.autopilot.clone_from(&w.autopilot);
+                    leaf.land_at = w.land_at;
+                    leaf.holds.clone_from(&w.holds);
+                }
+            }
+            m
+        };
+        let none = OwnerWords::default();
+        let t0 = Instant::now();
+        assert!(lane.offer(with(0, &none), Vec::new(), t0));
+
+        // NEGATIVE CONTROL: activity inside the interval waits.
+        let t1 = t0 + Duration::from_millis(800);
+        lane.note_activity();
+        assert!(!lane.capture_due(t1), "plain activity: the interval stands");
+        assert_eq!(lane.next_wake(t1), Some(t0 + MIN_WRITE_INTERVAL));
+        assert!(
+            !lane.note_owner_words(0, &none),
+            "words the last image carries owe nothing"
+        );
+        let land = words(Some("land"), None, &[]);
+        assert!(
+            !lane.note_owner_words(7, &land),
+            "a session the last image has no leaf for owes nothing"
+        );
+        assert!(!lane.capture_due(t1));
+
+        // LAND, 0.8 s after the capture: due at once, handed over at once.
+        assert!(lane.note_owner_words(0, &land));
+        assert!(lane.capture_due(t1), "owed now, inside the interval");
+        assert!(lane.offer(with(0, &land), Vec::new(), t1));
+        assert_eq!(lane.writes, 2);
+        assert!(!lane.note_owner_words(0, &land), "carried now");
+        lane.note_activity();
+        assert!(
+            !lane.capture_due(t1 + Duration::from_millis(100)),
+            "the capture that carried it cleared the debt"
+        );
+
+        // A HOLD, and then OFF, each inside the interval of the last.
+        let t2 = t1 + Duration::from_millis(300);
+        let held = words(Some("land"), None, &["local review"]);
+        assert!(lane.note_owner_words(0, &held));
+        assert!(lane.capture_due(t2));
+        assert!(lane.offer(with(0, &held), Vec::new(), t2));
+        let t3 = t2 + Duration::from_millis(300);
+        let off = words(Some("off"), None, &["local review"]);
+        assert!(lane.note_owner_words(0, &off));
+        assert!(lane.capture_due(t3));
+        assert!(lane.offer(with(0, &off), Vec::new(), t3));
+        // A timer alone is a word too: a timed Cruise, captured at the
+        // interval's rate after the hold's lift, and then its cancel (the
+        // word kept, the landing dropped) inside the next interval.
+        let timed = words(Some("cruise"), Some(9), &[]);
+        let t4 = t3 + MIN_WRITE_INTERVAL;
+        assert!(lane.offer(with(0, &timed), Vec::new(), t4));
+        let t5 = t4 + Duration::from_millis(300);
+        let cancelled = words(Some("cruise"), None, &[]);
+        assert!(lane.note_owner_words(0, &cancelled));
+        assert!(lane.capture_due(t5));
+        assert!(lane.offer(with(0, &cancelled), Vec::new(), t5));
+        assert_eq!(lane.writes, 6);
+
+        // The image on disk carries the last word.
+        let journal = dir.path().join(lane.journal_id().file_name());
+        let image =
+            aterm_spec::wait::until_within(MUST_HAPPEN, "the image naming the cancel", || {
+                std::fs::read_to_string(&journal)
+                    .ok()
+                    .and_then(|text| decode(&text).ok())
+                    .map(|(_, manifest)| manifest)
+                    .filter(|manifest| OwnerWords::carried(manifest, 0) == Some(cancelled.clone()))
+            });
+        assert_eq!(
+            OwnerWords::carried(&image, 1),
+            Some(none.clone()),
+            "the other tab's leaf carries no word"
+        );
+        lane.retire(MUST_HAPPEN).unwrap();
+
+        // An inert lane owes nothing.
+        let mut inert = Lane::inert();
+        assert!(!inert.note_owner_words(0, &land));
+        assert!(!inert.capture_due(t1));
+    }
+
     #[test]
     fn a_program_starting_is_written_like_a_moved_folder() {
         let dir = scratch("cj-lane");
@@ -5702,6 +5716,10 @@ pub(crate) mod tests {
         lane.retire(MUST_HAPPEN).expect("retired");
     }
 
+    /// A never-ending title change (an agent's spinner) is written once per
+    /// [`TITLE_WRITE_INTERVAL`]; the last title is written at the interval's
+    /// end, and a layout change inside the interval is written at the layout's
+    /// rate.
     #[test]
     fn a_title_that_animates_is_written_at_the_title_rate() {
         let dir = scratch("cj-title");
@@ -5715,17 +5733,14 @@ pub(crate) mod tests {
             lane.note_activity();
             assert!(lane.capture_due(t));
             let title = format!("spin {frame}");
-            assert!(
-                !same_but_titles(&layout(&[("/a", "spin 0")]), &layout(&[("/b", "spin 0")])),
-                "control: a cwd is no title"
-            );
-            assert!(
-                layout(&[("/a", "spin 0")]) != layout(&[("/a", title.as_str())]),
-                "control: every frame is a change"
-            );
             written += usize::from(lane.offer(layout(&[("/a", title.as_str())]), Vec::new(), t));
         }
-        assert_eq!(written, 5, "120 s of spinner: at 0, 30, 60, 90 and 120 s");
+        let spun = MIN_WRITE_INTERVAL * 60;
+        assert_eq!(
+            written as u128,
+            1 + spun.as_millis() / TITLE_WRITE_INTERVAL.as_millis(),
+            "{spun:?} of spinner: once per title interval"
+        );
 
         // A new tab inside the title interval: the layout's own rate.
         t += MIN_WRITE_INTERVAL;
@@ -5747,36 +5762,5 @@ pub(crate) mod tests {
         assert!(lane.offer(layout(&[("/a", "done"), ("/b", "zsh")]), Vec::new(), due));
         assert_eq!(lane.next_wake(due), None);
         lane.retire(MUST_HAPPEN).unwrap();
-    }
-
-    /// The writer thread publishes what the lane hands it, as this process,
-    /// holding its lock, and the quit's retire removes it all.
-    #[test]
-    fn the_lane_publishes_on_its_thread_and_retires() {
-        let dir = scratch("cj-thread");
-        let mut lane = Lane::new(Some(dir.path().to_path_buf()), std::process::id());
-        assert!(lane.offer(layout(&[("/t", "zsh")]), Vec::new(), Instant::now()));
-        let deadline = Instant::now() + MUST_HAPPEN;
-        let journal = loop {
-            let found = names(dir.path())
-                .into_iter()
-                .find(|name| JournalId::parse(name).is_some());
-            if let Some(found) = found {
-                break dir.path().join(found);
-            }
-            assert!(Instant::now() < deadline, "the writer never published");
-            std::thread::yield_now();
-        };
-        let (header, manifest) = decode(&std::fs::read_to_string(&journal).unwrap()).unwrap();
-        assert_eq!(header.pid, std::process::id());
-        assert_eq!(cwds(&manifest), vec!["/t"]);
-        let id = JournalId::parse(journal.file_name().unwrap().to_str().unwrap()).unwrap();
-        assert_eq!(
-            markers::probe(&dir.path().join(id.lock_name())),
-            markers::Owner::Live,
-            "the writer holds its lock"
-        );
-        lane.retire(MUST_HAPPEN).unwrap();
-        assert!(names(dir.path()).is_empty(), "{:?}", names(dir.path()));
     }
 }

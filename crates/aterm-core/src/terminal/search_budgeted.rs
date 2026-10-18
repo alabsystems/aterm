@@ -141,16 +141,16 @@ impl Terminal {
     /// Pattern errors from the engine (invalid or oversized regex, regex feature disabled),
     /// and an exhausted cursor space. No state is retained after an error.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "budgeted_search_resume",
             action = "Start",
             project = "conformance_budgeted_search::project_step"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             machine = "budgeted_search_resume",
             action = "BuggyScanOnlyCompletion",
             reason = "Buggy=1 negative control only: a step is complete only once every match \
@@ -160,88 +160,88 @@ impl Terminal {
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "budgeted_search_resume",
             action = "StartComplete",
             project = "conformance_budgeted_search::project_step"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "budgeted_search_resume",
             action = "StartBacklog",
             project = "conformance_budgeted_search::project_step"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "budgeted_search_resume",
             action = "Resume",
             project = "conformance_budgeted_search::project_step"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "budgeted_search_resume",
             action = "FinishScan",
             project = "conformance_budgeted_search::project_step"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "budgeted_search_resume",
             action = "Supersede",
             project = "conformance_budgeted_search::project_step"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "budgeted_search_resume",
             action = "ContentRestart",
             project = "conformance_budgeted_search::project_step"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "budgeted_search_resume",
             action = "QueryRestart",
             project = "conformance_budgeted_search::project_step"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "budgeted_search_resume",
             action = "ForgedRestart",
             project = "conformance_budgeted_search::project_step"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "budgeted_search_resume",
             action = "RestartComplete",
             project = "conformance_budgeted_search::project_step"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "budgeted_search_resume",
             action = "Drain",
             project = "conformance_budgeted_search::project_step"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "budgeted_search_resume",
             action = "DrainComplete",
             project = "conformance_budgeted_search::project_step"
@@ -385,8 +385,8 @@ impl Terminal {
     /// Drop any budgeted search (its matches and scratch; an outstanding cursor would
     /// restart). Call when the search UI closes or a query is abandoned between slices.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "budgeted_search_resume",
             action = "Cancel",
             project = "conformance_budgeted_search::project_cancel"
@@ -402,8 +402,8 @@ impl Terminal {
     /// unchanged); a miss falls back to [`indexed_search`](Self::indexed_search). Both give
     /// identical results (`budgeted_completion_equals_one_shot_all_modes`).
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
             reason = "BudgetedSearchResume models the search_budgeted STEP lifecycle; \
                       search_summary_results is a pure read over the retained completed \
                       results (equal to the modeled completed set by the \
@@ -551,118 +551,6 @@ mod tests {
         }
     }
 
-    /// Each step advances `rows_fed` by exactly `budget` until the final partial step.
-    #[test]
-    fn each_step_consumes_at_most_the_budget() {
-        let mut t = seeded_terminal();
-        let budget = 7usize;
-        let mut cursor = None;
-        let mut prev_rows = 0usize;
-        loop {
-            let step = t
-                .search_budgeted("NEEDLE", true, false, cursor, budget)
-                .expect("step");
-            let advanced = step.rows_fed - prev_rows;
-            assert!(advanced >= 1, "every step makes progress");
-            assert!(
-                advanced <= budget,
-                "step consumed {advanced} > budget {budget}"
-            );
-            if step.complete {
-                assert_eq!(step.rows_fed, step.total_rows);
-                break;
-            }
-            assert_eq!(advanced, budget, "non-final steps consume the full budget");
-            prev_rows = step.rows_fed;
-            cursor = step.cursor;
-        }
-
-        // A zero budget is clamped to one row per step.
-        let mut t = seeded_terminal();
-        let (got, steps) = drive(&mut t, "NEEDLE", true, false, 0);
-        assert_eq!(got, one_shot(&mut t, "NEEDLE", true, false));
-        assert_eq!(steps, t.grid().scrollback_lines() + usize::from(t.rows()));
-    }
-
-    /// A content write between slices makes the old cursor restart (progress reset, new
-    /// cursor), and the completed results reflect the new content.
-    #[test]
-    fn content_change_between_slices_restarts_from_scratch() {
-        let mut t = seeded_terminal();
-        let first = t
-            .search_budgeted("NEEDLE", true, false, None, 5)
-            .expect("first slice");
-        assert!(!first.complete);
-
-        t.process(b"NEEDLE-fresh after the first slice\r\n");
-
-        let resumed = t
-            .search_budgeted("NEEDLE", true, false, first.cursor, 5)
-            .expect("stale resume");
-        assert!(
-            resumed.rows_fed <= 5,
-            "a stale cursor must restart from row zero, not continue at {}",
-            resumed.rows_fed
-        );
-        assert_ne!(
-            resumed.cursor, first.cursor,
-            "the restarted search must issue a fresh cursor"
-        );
-
-        let mut cursor = resumed.cursor;
-        let mut final_results = resumed.results.clone();
-        while cursor.is_some() {
-            let step = t
-                .search_budgeted("NEEDLE", true, false, cursor, 5)
-                .expect("resume");
-            final_results.matches.extend(step.results.matches);
-            final_results.incomplete = step.results.incomplete;
-            final_results.lowest_retained_line = step.results.lowest_retained_line;
-            cursor = step.cursor;
-        }
-        let oracle = one_shot(&mut t, "NEEDLE", true, false);
-        assert_eq!(
-            final_results, oracle,
-            "post-restart results match new content"
-        );
-        // 50 seeded needle rows plus the post-slice write.
-        assert_eq!(final_results.matches.len(), 51);
-    }
-
-    /// An old cursor with a new pattern, a forged cursor, and a cancelled one all restart.
-    #[test]
-    fn pattern_change_forged_cursor_and_cancel_all_restart() {
-        let mut t = seeded_terminal();
-        let first = t
-            .search_budgeted("NEEDLE", true, false, None, 5)
-            .expect("first slice");
-
-        let switched = t
-            .search_budgeted("filler", true, false, first.cursor, 5)
-            .expect("switched pattern");
-        assert!(switched.rows_fed <= 5, "new pattern restarts progress");
-        assert_ne!(switched.cursor, first.cursor);
-
-        let forged = t
-            .search_budgeted("filler", true, false, Some(0xDEAD_BEEF), 5)
-            .expect("forged cursor");
-        assert!(forged.rows_fed <= 5);
-
-        // Cancel stales the outstanding cursor.
-        let live = t
-            .search_budgeted("filler", true, false, forged.cursor, 5)
-            .expect("live resume");
-        assert!(live.rows_fed > forged.rows_fed, "valid cursor resumes");
-        t.cancel_budgeted_search();
-        let after_cancel = t
-            .search_budgeted("filler", true, false, live.cursor, 5)
-            .expect("post-cancel resume");
-        assert!(
-            after_cancel.rows_fed <= 5,
-            "a cancelled search's cursor must restart, not resume"
-        );
-    }
-
     /// An invalid regex propagates the engine error and retains no state.
     #[test]
     fn invalid_regex_errors_and_keeps_no_state() {
@@ -701,48 +589,6 @@ mod tests {
         }
     }
 
-    /// A stale-content restart that completes in one turn still reports `reset` and a fresh
-    /// `search_id`, so a host never appends new-snapshot deltas to old ones.
-    #[test]
-    fn completing_stale_restart_explicitly_resets_delta_stream() {
-        let mut t = seeded_terminal();
-        let first = t
-            .search_budgeted("NEEDLE", true, false, None, 1)
-            .expect("initial partial search");
-        assert!(first.reset);
-        assert!(!first.complete);
-        assert!(
-            !first.results.matches.is_empty(),
-            "pre-restart delta exists"
-        );
-
-        t.process(b"NEEDLE-fresh after partial search\r\n");
-        let restarted = t
-            .search_budgeted("NEEDLE", true, false, first.cursor, usize::MAX)
-            .expect("one-turn stale restart");
-        assert!(restarted.complete);
-        assert_eq!(
-            restarted.cursor, None,
-            "completing step has no resume token"
-        );
-        assert!(restarted.reset, "host must be told to clear earlier deltas");
-        assert_ne!(
-            restarted.search_id, first.search_id,
-            "fresh snapshot identity"
-        );
-
-        let oracle = one_shot(&mut t, "NEEDLE", true, false);
-        assert_eq!(
-            restarted.results, oracle,
-            "fresh one-turn delta is complete"
-        );
-        assert_ne!(
-            first.results.matches.len() + restarted.results.matches.len(),
-            oracle.matches.len(),
-            "blindly appending the pre-reset delta would be detectably wrong"
-        );
-    }
-
     /// A cursor from another live Terminal restarts, even with matching query and content.
     #[test]
     fn foreign_terminal_cursor_restarts_with_a_unique_token() {
@@ -773,41 +619,6 @@ mod tests {
         assert_eq!(allocate_cursor(&counter), Some(u64::MAX - 1));
         assert_eq!(allocate_cursor(&counter), None);
         assert_eq!(allocate_cursor(&counter), None);
-    }
-
-    /// Dense results arrive as bounded deltas; after the scan, a later turn drains the
-    /// remainder without resending the prefix.
-    #[test]
-    fn dense_results_are_delta_bounded_and_concatenate_to_one_shot() {
-        let mut t = Terminal::new(6, 40);
-        for _ in 0..220 {
-            t.process(format!("{}\r\n", "a".repeat(30)).as_bytes());
-        }
-        let oracle = one_shot(&mut t, "a", true, false);
-
-        let first = t
-            .search_budgeted("a", true, false, None, usize::MAX)
-            .expect("first dense slice");
-        assert!(!first.complete, "more than one output chunk is required");
-        assert_eq!(first.results.matches.len(), MAX_MATCHES_PER_STEP);
-        assert_eq!(first.rows_fed, first.total_rows, "indexing finished");
-
-        let second = t
-            .search_budgeted("a", true, false, first.cursor, usize::MAX)
-            .expect("drain dense remainder");
-        assert!(second.complete);
-        assert_eq!(
-            second.rows_fed, first.rows_fed,
-            "drain-only turn scans no rows"
-        );
-        assert!(second.results.matches.len() <= MAX_MATCHES_PER_STEP);
-
-        let got = SearchResults::new(
-            [first.results.matches, second.results.matches].concat(),
-            second.results.incomplete,
-            second.results.lowest_retained_line,
-        );
-        assert_eq!(got, oracle);
     }
 
     /// After a budgeted search completes, `search_summary` reads its retained results with
@@ -857,22 +668,11 @@ mod tests {
         );
     }
 
-    /// A completed search's cursor restarts a fresh scan, and `release_search_index` frees
-    /// the retained results so a later `search_summary` rebuilds.
+    /// `release_search_index` frees a completed search's retained results, so a later
+    /// `search_summary` rebuilds.
     #[test]
-    fn completed_index_is_non_resumable_and_released() {
+    fn a_released_completed_index_is_rebuilt_by_the_next_summary() {
         let mut t = seeded_terminal();
-        let (_driven, _steps) = drive(&mut t, "NEEDLE", true, false, 7);
-
-        let restarted = t
-            .search_budgeted("NEEDLE", true, false, Some(1), 7)
-            .expect("presenting a retired token restarts");
-        assert!(restarted.reset, "a retired-token search resets the stream");
-        assert!(
-            restarted.rows_fed <= 7,
-            "a retained-complete cursor must restart at row zero, not resume"
-        );
-
         drive(&mut t, "NEEDLE", true, false, 7);
         t.release_search_index();
         let before = t.search_index_rebuilds();

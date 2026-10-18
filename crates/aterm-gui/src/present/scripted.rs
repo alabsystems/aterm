@@ -26,7 +26,9 @@ use super::{CpuFrameBuffer, CpuPresenter, DamageRect};
 
 #[cfg(target_os = "macos")]
 type PlatformSurface = super::mac::MacCpuPresenter;
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+type PlatformSurface = super::linux::LinuxPresenter;
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 type PlatformSurface = super::softbuffer_surface::SoftbufferPresenter;
 
 /// One scripted failure, consumed by the present it applies to.

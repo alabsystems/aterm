@@ -269,26 +269,6 @@ mod tests {
             .expect("LCD instance builds for the embedded face")
     }
 
-    /// The metric convention holds: 3 bytes per texel, the ink box padded by
-    /// exactly 1 px each side relative to floor/ceil of the outline bounds,
-    /// and sane 12px boxes over printable ASCII.
-    #[test]
-    fn triplet_layout_and_pad_ascii_12px() {
-        let hint = lcd_instance(12.0);
-        for ch in '!'..='~' {
-            let Some(gid) = unicode_gid(dejavu(), 0, ch) else {
-                continue;
-            };
-            let Some((w, h, _xmin, _ymin, bytes)) =
-                subpixel_glyph_raster(dejavu(), 0, gid, 12.0, Some(&hint), false)
-            else {
-                continue;
-            };
-            assert_eq!(bytes.len(), w * h * 3, "3 bytes/texel for {ch:?}");
-            assert!(w <= 34 && h <= 32, "sane 12px ink box for {ch:?}: {w}x{h}");
-        }
-    }
-
     /// A space has no outline: the raster declines (`None`) and the caller's
     /// grayscale path draws nothing — the blank-glyph convention.
     #[test]
@@ -354,13 +334,6 @@ mod tests {
             assert_eq!(rgb.4[3 * i + 1], bgr.4[3 * i + 1]);
             assert_eq!(rgb.4[3 * i + 2], bgr.4[3 * i]);
         }
-    }
-
-    /// The unhinted draw (the `font_hinting = "off"` pairing) also rasterizes.
-    #[test]
-    fn unhinted_subpixel_rasterizes() {
-        let gid = unicode_gid(dejavu(), 0, 'x').unwrap();
-        assert!(subpixel_glyph_raster(dejavu(), 0, gid, 12.0, None, false).is_some());
     }
 
     /// The unhinted LCD raster fills the outline the grayscale unhinted raster

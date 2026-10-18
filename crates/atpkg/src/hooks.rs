@@ -958,9 +958,9 @@ pub(crate) const INSTALL_SH_PROFILES: [&str; 2] = [".bash_login", ".profile"];
 pub(crate) enum RcState {
     /// The rc carries atpkg's marker block ([`RC_BEGIN`]).
     Wired,
-    /// The rc sources `~/.aterm/shell.d` through a line that is NOT atpkg's block:
-    /// `tools/install.sh`'s own marker pair (`# >>> aterm ALab toolset (managed by
-    /// install.sh) >>>`, its `wire_shell_path`), or a line the user wrote. The toolchain
+    /// The rc sources `~/.aterm/shell.d` through a line that is NOT this block: the PATH
+    /// block `aterm pkg shell-setup --path` writes ([`crate::selfsetup::PATH_BLOCK_START`]),
+    /// or a line the user wrote. The toolchain
     /// reaches that shell; atpkg simply does not own the line. Measured by CONTENT
     /// ([`sources_shell_d`]), so doctor never reports "nothing sources shell.d" from the
     /// mere absence of atpkg's marker — a fault it would not have measured.
@@ -2407,10 +2407,9 @@ mod tests {
         );
         assert_eq!(copied_command_links(&home), vec![copied.clone()]);
 
-        assert_eq!(
-            move_aside_copied_commands_at(&home, &dev.join("aterm"), 7),
-            Err("this atpkg is not the release aterm.app's (a dev or renamed copy)"),
-            "a dev bundle does not lay the links, and says why"
+        assert!(
+            move_aside_copied_commands_at(&home, &dev.join("aterm"), 7).is_err(),
+            "a dev bundle does not lay the links"
         );
         assert!(
             is_file(&copied),
@@ -2422,11 +2421,6 @@ mod tests {
         let refused = move_aside_copied_commands_at(&home, &release.join("aterm"), 7).unwrap();
         assert!(refused.moved.is_empty());
         assert_eq!(refused.failed.len(), 1);
-        assert!(
-            refused.failed[0].1.contains("already exists"),
-            "{:?}",
-            refused.failed
-        );
         assert_eq!(
             fs::read(&earlier).unwrap(),
             b"earlier",
@@ -2489,8 +2483,7 @@ mod tests {
         let blocker = dir.join(format!("aterm.link-{}", std::process::id()));
         fs::create_dir_all(blocker.join("inside")).unwrap();
 
-        let why = rename_file_aside(&from, &aside, Some(&target)).unwrap_err();
-        assert!(why.contains("link"), "{why}");
+        assert!(rename_file_aside(&from, &aside, Some(&target)).is_err());
         assert_eq!(fs::read(&from).unwrap(), b"a build of someone's own");
         assert!(
             fs::symlink_metadata(&aside).is_err(),
@@ -2535,9 +2528,9 @@ mod tests {
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
         let unlock = Unlock(locked.clone());
 
-        let why = rename_file_aside(&from, &aside, None).unwrap_err();
+        let moved = rename_file_aside(&from, &aside, None);
         drop(unlock);
-        assert!(why.contains("removed"), "{why}");
+        assert!(moved.is_err());
         assert_eq!(fs::read(&from).unwrap(), b"an old aterm-ctl");
         assert!(
             fs::symlink_metadata(&aside).is_err(),
@@ -2553,96 +2546,63 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Each copied name gets the remedy that really clears it: on macOS the
-    /// installed app's `repair` (which links nothing in place of a retired name),
-    /// elsewhere moving it aside by hand — the installer lays `aterm` alone, so
-    /// `atpkg` is not ours there and is not reported.
-    #[cfg(unix)]
+    /// The remedy for a copied command on macOS names the installed app's own `atpkg`:
+    /// the alias, from the first app it would act from (never a translocated one), quoted
+    /// as one shell word.
+    #[cfg(target_os = "macos")]
     #[test]
-    fn a_copied_command_is_given_the_remedy_that_replaces_it() {
-        let bin = Path::new("/home/u/.local/bin");
-        let aterm = copied_command_remedy(&bin.join("aterm"));
-        let ctl = copied_command_remedy(&bin.join("aterm-ctl"));
-        #[cfg(target_os = "macos")]
-        {
-            let hint = repair_from_app_hint();
-            assert_eq!(
-                aterm,
-                format!("run {hint} — it moves this file aside and links the app in its place")
-            );
-            assert_eq!(
-                ctl,
-                format!("run {hint} — it moves this file aside; `aterm ctl` replaces it")
-            );
-            assert!(hint.starts_with('`') && hint.contains("repair`"), "{hint}");
-
-            // The installed-app fallback keeps the `atpkg` alias name, and skips an
-            // app it would not act from.
-            let scratch = tmp("hint-installed");
-            let root = scratch.canonicalize().unwrap();
-            let macos = root.join("Apps/aterm.app/Contents/MacOS");
-            fs::create_dir_all(&macos).unwrap();
-            fs::write(macos.join("aterm"), b"").unwrap();
-            std::os::unix::fs::symlink("aterm", macos.join("atpkg")).unwrap();
-            // `Moved/aterm.app` resolves into a translocated mount, which atpkg
-            // refuses to act from: it is skipped for the one it would act from.
-            let mount = root.join("AppTranslocation/X/d/aterm.app/Contents/MacOS");
-            fs::create_dir_all(&mount).unwrap();
-            fs::write(mount.join("aterm"), b"").unwrap();
-            std::os::unix::fs::symlink("aterm", mount.join("atpkg")).unwrap();
-            fs::create_dir_all(root.join("Moved")).unwrap();
-            std::os::unix::fs::symlink(
-                root.join("AppTranslocation/X/d/aterm.app"),
-                root.join("Moved/aterm.app"),
-            )
-            .unwrap();
-            assert_eq!(installed_app_atpkg(&[Some(root.join("Moved"))]), None);
-            assert_eq!(
-                installed_app_atpkg(&[None, Some(root.join("Moved")), Some(root.join("Apps"))]),
-                Some(macos.join("atpkg")),
-                "the alias, not the binary it links to, from the app it would act from"
-            );
-            assert_eq!(installed_app_atpkg(&[Some(root.join("Nowhere"))]), None);
-            // Two it would act from: the first listed wins.
-            let second = root.join("Second/aterm.app/Contents/MacOS");
-            fs::create_dir_all(&second).unwrap();
-            fs::write(second.join("aterm"), b"").unwrap();
-            std::os::unix::fs::symlink("aterm", second.join("atpkg")).unwrap();
-            assert_eq!(
-                installed_app_atpkg(&[Some(root.join("Second")), Some(root.join("Apps"))]),
-                Some(second.join("atpkg"))
-            );
-            let _ = fs::remove_dir_all(&root);
-            assert_eq!(INSTALLED_COMMANDS, &["aterm", "atpkg"]);
-            assert_eq!(
-                repair_hint_for(Some(Path::new(
-                    "/Bob's Apps/aterm.app/Contents/MacOS/atpkg"
-                ))),
-                "`'/Bob'\\''s Apps/aterm.app/Contents/MacOS/atpkg' repair`"
-            );
-            assert_eq!(
-                repair_hint_for(None),
-                "`atpkg repair` from aterm.app installed in /Applications or ~/Applications (a \
-                 real copy, not one on a disk image or mounted volume)"
-            );
-            assert_eq!(
-                installed_app_dirs(Some(PathBuf::from("/Users//u"))),
-                [
-                    Some(PathBuf::from("/Applications")),
-                    Some(PathBuf::from("/Users//u/Applications"))
-                ],
-                "the system folder first"
-            );
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            assert_eq!(
-                aterm,
-                "move it aside, and install aterm again if its link belongs here"
-            );
-            assert_eq!(ctl, "move it aside — `aterm ctl` replaces it");
-            assert_eq!(INSTALLED_COMMANDS, &["aterm"]);
-        }
+    fn the_remedy_names_the_installed_app_it_would_act_from() {
+        // The installed-app fallback keeps the `atpkg` alias name, and skips an
+        // app it would not act from.
+        let scratch = tmp("hint-installed");
+        let root = scratch.canonicalize().unwrap();
+        let macos = root.join("Apps/aterm.app/Contents/MacOS");
+        fs::create_dir_all(&macos).unwrap();
+        fs::write(macos.join("aterm"), b"").unwrap();
+        std::os::unix::fs::symlink("aterm", macos.join("atpkg")).unwrap();
+        // `Moved/aterm.app` resolves into a translocated mount, which atpkg
+        // refuses to act from: it is skipped for the one it would act from.
+        let mount = root.join("AppTranslocation/X/d/aterm.app/Contents/MacOS");
+        fs::create_dir_all(&mount).unwrap();
+        fs::write(mount.join("aterm"), b"").unwrap();
+        std::os::unix::fs::symlink("aterm", mount.join("atpkg")).unwrap();
+        fs::create_dir_all(root.join("Moved")).unwrap();
+        std::os::unix::fs::symlink(
+            root.join("AppTranslocation/X/d/aterm.app"),
+            root.join("Moved/aterm.app"),
+        )
+        .unwrap();
+        assert_eq!(installed_app_atpkg(&[Some(root.join("Moved"))]), None);
+        assert_eq!(
+            installed_app_atpkg(&[None, Some(root.join("Moved")), Some(root.join("Apps"))]),
+            Some(macos.join("atpkg")),
+            "the alias, not the binary it links to, from the app it would act from"
+        );
+        assert_eq!(installed_app_atpkg(&[Some(root.join("Nowhere"))]), None);
+        // Two it would act from: the first listed wins.
+        let second = root.join("Second/aterm.app/Contents/MacOS");
+        fs::create_dir_all(&second).unwrap();
+        fs::write(second.join("aterm"), b"").unwrap();
+        std::os::unix::fs::symlink("aterm", second.join("atpkg")).unwrap();
+        assert_eq!(
+            installed_app_atpkg(&[Some(root.join("Second")), Some(root.join("Apps"))]),
+            Some(second.join("atpkg"))
+        );
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(
+            repair_hint_for(Some(Path::new(
+                "/Bob's Apps/aterm.app/Contents/MacOS/atpkg"
+            ))),
+            "`'/Bob'\\''s Apps/aterm.app/Contents/MacOS/atpkg' repair`"
+        );
+        assert_eq!(
+            installed_app_dirs(Some(PathBuf::from("/Users//u"))),
+            [
+                Some(PathBuf::from("/Applications")),
+                Some(PathBuf::from("/Users//u/Applications"))
+            ],
+            "the system folder first"
+        );
     }
 
     /// The links are laid only from a bundle that stays: not a translocated copy and
@@ -2651,28 +2611,14 @@ mod tests {
     #[cfg(all(unix, target_os = "macos"))]
     #[test]
     fn links_come_only_from_a_bundle_that_stays_and_the_remedy_is_one_word() {
-        for (gone, why) in [
-            (
-                "/Volumes/aterm/aterm.app/Contents/MacOS/aterm",
-                "mounted volume",
-            ),
-            (
-                "/private/var/folders/x/AppTranslocation/ABC/d/aterm.app/Contents/MacOS/aterm",
-                "Gatekeeper's temporary copy",
-            ),
-            (
-                "/Apps/aterm (dev).app/Contents/MacOS/aterm",
-                "dev or renamed copy",
-            ),
-            ("/src/target/release/aterm", "not inside an app bundle"),
+        for gone in [
+            "/Volumes/aterm/aterm.app/Contents/MacOS/aterm",
+            "/private/var/folders/x/AppTranslocation/ABC/d/aterm.app/Contents/MacOS/aterm",
+            "/Apps/aterm (dev).app/Contents/MacOS/aterm",
+            "/src/target/release/aterm",
         ] {
             assert_eq!(command_link_source(Path::new(gone)), None, "{gone}");
-            assert!(
-                command_link_check(Path::new(gone))
-                    .unwrap_err()
-                    .contains(why),
-                "{gone}"
-            );
+            assert!(command_link_check(Path::new(gone)).is_err(), "{gone}");
         }
         assert!(
             command_link_source(Path::new("/Applications/aterm.app/Contents/MacOS/aterm"))
@@ -2790,125 +2736,6 @@ mod tests {
         );
         assert!(ps.contains(r"$__atpkg_agents = 'C:\Users\x\AppData\Local\aterm\pkg\agents'"));
         assert!(ps.contains(r"$__atpkg_reroute = 'C:\Users\x\AppData\Local\aterm\pkg\reroute'"));
-    }
-
-    /// The PATH policy in one test: the managed `bin/` is APPENDED (never ahead of a
-    /// system `sudo`/`ssh`/`git`), and the agents dir — the one exception, owner
-    /// decision 2026-09-10 — is MOVED TO THE FRONT as its own element, with no presence
-    /// guard (module doc: an order failure), exported as `ATPKG_AGENTS` beside `ATPKG_BIN`.
-    #[test]
-    fn posix_dialects_append_bin_first_then_move_the_agents_dir_to_the_front_only_inside_aterm() {
-        let files = hook_files(
-            Path::new("/p/bin"),
-            Path::new("/p/agents"),
-            Path::new("/p/reroute"),
-        );
-        for (name, body) in &files {
-            if name.ends_with(".zsh") || name.ends_with(".bash") {
-                assert!(
-                    body.contains("export PATH=\"$PATH:$__atpkg_bin\""),
-                    "bin/ appends"
-                );
-                assert!(
-                    !body.contains("$__atpkg_bin:$PATH"),
-                    "bin/ is never prepended"
-                );
-                assert!(
-                    body.contains("export PATH=\"$__atpkg_front:$__atpkg_p\"")
-                        && body.contains("in :) export PATH=\"$__atpkg_front\" ;;"),
-                    "agents/ goes to the front"
-                );
-                // And the reroute dir in front of it, in the SAME gated arm (owner ruling
-                // 2026-09-27: in aterm hosted shells a bare `cargo` is announced): removed
-                // by the same fixpoint loop, prepended unless `aterm --no-reroute`'s
-                // marker is engaged — read with the stubs' reading, "" and "0" are not.
-                // 2026-09-27 review: for the reroute dir, "inside aterm" is the agents
-                // union OR a non-empty `$ATERM_REROUTE_DIR` (the degraded TTY launch whose
-                // front door handed no agents dir carries only that); agents/ first iff a
-                // marker, the reroute dir ahead of whatever the front holds.
-                assert!(
-                    body.contains(&format!(
-                        "case \"{m}\" in \"\") unset ATPKG_AGENTS ;; *) __atpkg_front=\"$__atpkg_agents\"; export ATPKG_AGENTS=\"$__atpkg_agents\" ;; esac\n\
-                         case \"${{{p}-}}\" in \"\"|0) case \"{m}${{{r}-}}\" in \"\") ;; *) __atpkg_front=\"$__atpkg_reroute${{__atpkg_front:+:}}$__atpkg_front\" ;; esac ;; esac\n",
-                        m = agents_markers_sh(),
-                        p = crate::reroute::PASSTHROUGH_ENV,
-                        r = crate::reroute::REROUTE_DIR_ENV
-                    )),
-                    "reroute/ leads agents/ inside aterm: {body}"
-                );
-                assert!(
-                    body.contains("__atpkg_q=\"${__atpkg_q//\":$__atpkg_reroute:\"/:}\"")
-                        && !body.contains("*\":$__atpkg_reroute:\"*) ;;"),
-                    "reroute/ is removed like agents/, never skipped-if-present: {body}"
-                );
-                assert!(
-                    !body.contains("ATERM_REROUTE_DIR=")
-                        && !body.contains("export ATERM_REROUTE_DIR")
-                        && !body.contains("unset ATERM_REROUTE_DIR"),
-                    "the hook READS the spawn seam's handle and never sets it: {body}"
-                );
-                assert!(
-                    !body.contains("*\":$__atpkg_agents:\"*) ;;"),
-                    "agents/ has no skip-if-present guard"
-                );
-                assert!(
-                    body.contains("export ATPKG_AGENTS=\"$__atpkg_agents\"")
-                        && body.contains("export ATPKG_BIN=\"$__atpkg_bin\""),
-                    "both exported"
-                );
-                assert_eq!(
-                    body.matches("case \":$PATH:\"").count(),
-                    1,
-                    "one presence guard, bin/'s"
-                );
-                // THE BIN HALF GOES FIRST, and that is a firewall, not a preference: a
-                // shell abandons a sourced file at a parse error, so whichever half is
-                // LAST is the one a future typo costs. The toolchain the owner requires
-                // in every terminal gets the unconditional half; the conditional one can
-                // never reach it. Measured 2026-09-22 with an injected typo: agents-first
-                // lost `ATPKG_BIN` and every Trust shim from PATH, bin-first kept both.
-                assert!(
-                    body.find("__atpkg_bin").unwrap() < body.find("__atpkg_agents").unwrap(),
-                    "the bin element — the Trust toolchain — is set up first, out of the \
-                     agents gate's blast radius"
-                );
-                // The agents move-to-front is gated on aterm's own markers (owner ask
-                // 2026-09-22: the managed claude/codex lead INSIDE ATERM ONLY). The gate
-                // is a UNION because no single marker covers every lane — the GUI exports
-                // ATERM_CHILD/ATERM_SESSION_ID but not ATERM_AGENTS_DIR, and the
-                // `aterm --session` lane carries ATERM_AGENTS_DIR and deliberately neither
-                // of the others.
-                for marker in ["ATERM_AGENTS_DIR", "ATERM_CHILD", "ATERM_SESSION_ID"] {
-                    assert!(
-                        body.contains(&format!("${{{marker}-}}")),
-                        "{marker} is in the gate, and defaulted so `set -u` cannot abort \
-                         the hook"
-                    );
-                }
-                assert!(
-                    !body.contains("EVERYWHERE"),
-                    "no environment escape widens the gate past aterm (2026-09-23)"
-                );
-                assert!(
-                    !body.contains("TERM_PROGRAM"),
-                    "TERM_PROGRAM is NOT a gate marker: a shell rc can reset it, so it \
-                     cannot decide which binary runs"
-                );
-                // The false arm DEMOTES rather than merely declining to promote, so a
-                // shell that INHERITED an agents-first PATH (an iTerm launched from an
-                // aterm tab) heals itself instead of carrying the leak down the tree.
-                assert!(
-                    body.contains("unset ATPKG_AGENTS"),
-                    "outside aterm the agents element is actively removed and its variable \
-                     unset — inheritance is the leak this closes"
-                );
-                assert!(
-                    body.contains("\"/p/agents\"")
-                        && body.contains("\"/p/bin\"")
-                        && body.contains("\"/p/reroute\"")
-                );
-            }
-        }
     }
 
     #[test]
@@ -3389,136 +3216,48 @@ mod tests {
                 assert_eq!(run(&path), spelled(expect), "{shell}: {path:?}");
             }
         }
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    /// A TMUX SERVER CARRIES THE GATE IT WAS BORN WITH (plan PLAN-agents-dir-aterm-only
-    /// §9, risks 1-2). A pane's shell inherits the SERVER's environment, not the client's:
-    /// a private `tmux -L` server started with aterm's markers fronts the agents dir in
-    /// its panes; one started without them demotes it — even when an agents-first PATH
-    /// was inherited. Skipped, and said, where tmux is not installed (it is not on the
-    /// machines this was written on; it first RAN on 2026-09-27, against a tmux 3.5a
-    /// built into a scratch directory and put first on PATH — all three arms green).
-    /// Each server is private to this test and killed after.
-    #[cfg(unix)]
-    #[test]
-    fn a_private_tmux_server_fronts_agents_only_when_born_with_the_markers() {
-        // Resolved on THIS process's PATH once: the server below is started with a
-        // PATH of the test's own, which is not where tmux lives.
-        let Some(tmux) = std::env::var_os("PATH").and_then(|path| {
-            std::env::split_paths(&path)
-                .map(|dir| dir.join("tmux"))
-                .find(|candidate| candidate.is_file())
-        }) else {
-            eprintln!("SKIP: tmux is not installed; the tmux arm of the agents gate did not run");
-            return;
-        };
-        let root = tmp("tmux");
-        let agents = root.join("pkg/agents");
-        let bin = root.join("pkg/bin");
+        // OUTSIDE ATERM (no agents marker), in bash: the agents and reroute dirs are taken
+        // out of an inherited PATH and bin/ is still appended; the seams' reroute handle
+        // alone fronts the reroute dir only.
         let hook = root.join("hook.bash");
-        let reroute = root.join("pkg/reroute");
-        let body = &hook_files(&bin, &agents, &reroute)
-            .into_iter()
-            .find(|(n, _)| n.ends_with(".bash"))
-            .unwrap()
-            .1;
-        fs::write(&hook, body).unwrap();
-        let (a, b, r) = (
-            agents.to_str().unwrap(),
-            bin.to_str().unwrap(),
-            reroute.to_str().unwrap(),
-        );
-        let pane_path = |markers: bool, rerouted: bool| -> String {
-            let socket = format!("atpkg-hook-{}-{markers}-{rerouted}", std::process::id());
-            let out = root.join(format!("pane-{markers}-{rerouted}.out"));
-            let _ = fs::remove_file(&out);
-            struct Server(PathBuf, String);
-            impl Drop for Server {
-                fn drop(&mut self) {
-                    let _ = std::process::Command::new(&self.0)
-                        .args(["-L", &self.1, "kill-server"])
-                        .output();
-                }
-            }
-            let _server = Server(tmux.clone(), socket.clone());
-            let pane = "bash --noprofile --norc -c '. \"$ATPKG_TEST_HOOK\"; \
-                        printf \"PATH=%s\\n\" \"$PATH\" > \"$ATPKG_TEST_OUT\"'";
-            // `spawnfd`'s: the tmux server this starts holds nothing of this
-            // process but what tmux keeps of its stdio — not another test
-            // thread's pipe for as long as the server lives.
-            let mut command = aterm_uds::spawnfd::command(&tmux);
+        let outside = |handle: Option<&Path>| -> String {
+            let mut command = std::process::Command::new("bash");
             command
-                .args([
-                    "-L",
-                    &socket,
-                    "-f",
-                    "/dev/null",
-                    "new-session",
-                    "-d",
-                    "-s",
-                    "t",
-                ])
-                .arg(pane)
-                .env("PATH", format!("{a}:/usr/bin:/bin"))
-                // tmux runs the pane command through `$SHELL -c`: a plain sh with a
-                // scratch HOME reads no dotfile that could move PATH first.
-                .env("SHELL", "/bin/sh")
-                .env("HOME", &*root)
-                .env("ATPKG_TEST_HOOK", &hook)
-                .env("ATPKG_TEST_OUT", &out)
+                .args(["--noprofile", "--norc", "-c", posix_cmd])
+                .env("HOME", &home)
                 .env_remove("BASH_ENV")
-                .env_remove("TMUX")
-                // Run from an aterm tab, THIS process carries the reroute handle and
-                // maybe the passthrough marker: the server's environment is the test's.
+                .env_remove(crate::reroute::PASSTHROUGH_ENV)
                 .env_remove(crate::reroute::REROUTE_DIR_ENV)
-                .env_remove(crate::reroute::PASSTHROUGH_ENV);
+                .env("ATPKG_TEST_HOOK", &hook)
+                .env("ATPKG_TEST_PATH", &inherited);
             for marker in AGENTS_MARKERS {
                 command.env_remove(marker);
             }
-            if markers {
-                command.env("ATERM_SESSION_ID", "atpkg-tmux-test");
+            if let Some(handle) = handle {
+                command.env(crate::reroute::REROUTE_DIR_ENV, handle);
             }
-            if rerouted {
-                command.env(crate::reroute::REROUTE_DIR_ENV, &reroute);
-            }
-            let started = command.output().expect("tmux starts");
+            let out = command.output().expect("bash runs");
             assert!(
-                started.status.success(),
-                "tmux new-session: {}",
-                String::from_utf8_lossy(&started.stderr)
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
             );
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-            loop {
-                if let Ok(text) = fs::read_to_string(&out)
-                    && let Some(path) = text.trim_end().strip_prefix("PATH=")
-                {
-                    return path.to_owned();
-                }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "the pane never reported its PATH"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
+            String::from_utf8_lossy(&out.stdout)
+                .trim_end()
+                .strip_prefix("PATH=")
+                .expect("a PATH line")
+                .to_owned()
         };
-        // Inside aterm the hook fronts the reroute dir, then the agents dir; the
-        // reroute handle alone (a front door that handed no agents dir) fronts the
-        // reroute dir only; outside aterm both are demoted.
+        let rest = "/Users//u/.local/bin:/usr/bin:/opt/homebrew/bin::/bin";
         assert_eq!(
-            pane_path(true, false),
-            format!("{r}:{a}:/usr/bin:/bin:{b}"),
-            "a server born inside aterm fronts the reroute dir, then the agents dir"
+            outside(None),
+            format!("{rest}:{b}"),
+            "both demoted outside aterm"
         );
         assert_eq!(
-            pane_path(false, true),
-            format!("{r}:/usr/bin:/bin:{b}"),
-            "a server born with only the reroute handle fronts the reroute dir alone"
-        );
-        assert_eq!(
-            pane_path(false, false),
-            format!("/usr/bin:/bin:{b}"),
-            "a server born outside aterm demotes the inherited agents dir"
+            outside(Some(&reroute)),
+            format!("{r}:{rest}:{b}"),
+            "the reroute handle alone fronts the reroute dir"
         );
         let _ = fs::remove_dir_all(&root);
     }

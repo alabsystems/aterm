@@ -753,12 +753,8 @@ fn a_delivered_insert_mints_nothing_in_every_other_style() {
         GlowStyle::Beam,
         GlowStyle::Water,
         GlowStyle::Comet,
-        GlowStyle::Custom,
     ] {
-        let mut c = cfg(style, true);
-        if style == GlowStyle::Custom {
-            c.pack = Some(TrailParams::defaults());
-        }
+        let c = cfg(style, true);
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         glow.tick(Some((2, 4)), t0, &c, g, &mut out);

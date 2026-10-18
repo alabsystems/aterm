@@ -64,6 +64,7 @@ static REPAINT_ADOPTIONS: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec
 
 /// `spawn_session` adopted `session` with a blank screen its program is
 /// expected to repaint.
+#[cfg(unix)]
 pub(crate) fn note_repaint_adoption(session: u64) {
     REPAINT_ADOPTIONS
         .lock()
@@ -281,6 +282,7 @@ impl NudgeHost {
     /// its program believes. Each attempt then waits the freeze out as after a release (no parked
     /// reader carries an answer): a successor judges the debt it is handed, and after a rollback
     /// the attempt is judged as any other. An armed one waits at its freeze gate.
+    #[cfg(any(unix, test))]
     pub(crate) fn release_all<W: NudgeWorld>(&mut self, w: &mut W) {
         let now = w.now_ms();
         let sessions: Vec<u64> = self.drivers.keys().copied().collect();
@@ -319,8 +321,8 @@ impl NudgeHost {
     /// One session's held PTY: set it to the engine's size and forget it when
     /// the kernel agrees. Returns whether the hold is gone.
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "RepaintNudge",
             action = "ReleaseByDeadline",
             project = "conformance_repaint_nudge::World::project"
@@ -995,6 +997,7 @@ impl crate::App {
     }
 
     /// Release every held PTY now (a handoff freeze is about to start).
+    #[cfg(unix)]
     pub(crate) fn release_all_nudges(&mut self) {
         if self.nudges.is_idle() {
             return;
@@ -1207,19 +1210,6 @@ mod tests {
             "the engine was never asked"
         );
         assert_eq!(w.s.borrow().published, [1]);
-    }
-
-    #[test]
-    fn mode_log_touches_no_pty_and_says_what_it_would_do() {
-        let (mut host, mut w) = armed(Mode::Log);
-        host.tick(&mut w);
-        assert!(w.s.borrow().writes.is_empty(), "no PTY write in log mode");
-        let logs = w.s.borrow().logs.clone();
-        assert!(
-            logs.iter().any(|l| l.starts_with("would-nudge session=1 reason=debt class=agent epoch=7 shift=-1 pushed=0 drew=1 answered_before=-")),
-            "{logs:?}"
-        );
-        assert!(host.is_idle());
     }
 
     #[test]

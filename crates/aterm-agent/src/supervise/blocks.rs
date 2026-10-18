@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A report's rows as the worker's program draws them: blocks, each opened by
+//! A report's rows as the worker draws them: blocks, each opened by
 //! a head row, so `report --final` and `report --messages` can print what the
 //! worker said without what its tools did.
 //!
-//! Claude Code's head row (the grammar of every program but Codex), found by
+//! Claude Code's head row (the grammar every program's report is read by),
+//! found by
 //! what it starts with:
 //! * `❯` in column 0, then whitespace: the user's turn ([`BlockKind::User`]);
 //! * `⏺` (or `●`; never the session survey) in column 0: the worker's message
@@ -26,23 +27,6 @@
 //! Every other row belongs to the block above it. Rows above the first head
 //! are a block of their own: the worker's words when indented two columns
 //! like a message's, a tool's output otherwise.
-//!
-//! **CODEX** draws its transcript in a grammar of its own, and a report of a
-//! Codex worker is split by it ([`aterm_phase::codex::transcript_head`], the
-//! reader's): `›` and a space a user block; a `•` block the agent's words, or
-//! a tool or notice block (its head, or the `└` output right under it); `✔`
-//! and `✗` an approval's echo, and a card (a `╭` corner, or the session card
-//! drawn with no box: `  >_ OpenAI Codex (v0.163.0)` and the greeting under
-//! it), a tool block too; an end row (`1:39 PM`, `Worked for 1s • 7:14 AM`,
-//! at column 2) or a `■` block (an interrupt, an error, a wall: its rows wrap
-//! to column 0) a done block; a status row, or an empty composer an archived
-//! frame left (`› Ask Codex to do anything`, its footer under it), a status
-//! block. Its gutter is `└`, and a done block that is a `■` block keeps every
-//! row the block owns ([`end_block_rows`]: never a tip Codex drew right under
-//! it).
-
-use aterm_phase::Program;
-use aterm_phase::codex::{Head, end_block_rows, transcript_head};
 
 use super::phase::{is_done_row, is_glyph_row, is_survey, is_tool_call};
 
@@ -139,13 +123,13 @@ const GROUP_VERBS: &[&str] = &[
     "fetching",
 ];
 
-/// Split `rows`, read by `program`'s grammar (Claude Code's for any program
-/// but Codex), into blocks, in order; every row is in exactly one.
-pub fn blocks(rows: &[String], program: Program) -> Vec<Block> {
+/// Split `rows`, read by Claude Code's grammar, into blocks, in order; every
+/// row is in exactly one.
+pub fn blocks(rows: &[String]) -> Vec<Block> {
     let mut out: Vec<Block> = Vec::new();
     let mut open: Option<Block> = None;
     for i in 0..rows.len() {
-        match head_kind(rows, i, program) {
+        match head_kind(rows, i) {
             Some(kind) => {
                 if let Some(b) = open.take() {
                     out.push(Block { end: i, ..b });
@@ -175,11 +159,11 @@ pub fn blocks(rows: &[String], program: Program) -> Vec<Block> {
     // The rows above the first head: the worker's words when they open like a
     // message's wrapped rows do.
     if let Some(first) = out.first_mut()
-        && head_kind(rows, first.start, program).is_none()
+        && head_kind(rows, first.start).is_none()
         && rows[first.start..first.end]
             .iter()
             .find(|r| !r.trim().is_empty())
-            .is_some_and(|r| is_prose_row(r, program))
+            .is_some_and(|r| is_prose_row(r))
     {
         first.kind = BlockKind::Message;
     }
@@ -187,48 +171,18 @@ pub fn blocks(rows: &[String], program: Program) -> Vec<Block> {
 }
 
 /// A row indented exactly two columns that is not tool output: a message's
-/// wrapped row (Codex's: none of its `└` output either).
-fn is_prose_row(row: &str, program: Program) -> bool {
-    row.strip_prefix("  ").is_some_and(|t| {
-        !t.starts_with(' ')
-            && !t.starts_with(gutter(program))
-            && match program {
-                Program::Codex => true,
-                Program::Claude | Program::Agy | Program::Muse | Program::Generic => {
-                    !is_group_row(row)
-                }
-            }
-    })
+/// wrapped row.
+fn is_prose_row(row: &str) -> bool {
+    row.strip_prefix("  ")
+        .is_some_and(|t| !t.starts_with(' ') && !t.starts_with(GUTTER) && !is_group_row(row))
 }
 
-/// The glyph `program`'s tool output hangs under: `⎿` (Claude Code), `└`
-/// (Codex).
-fn gutter(program: Program) -> char {
-    match program {
-        Program::Codex => '└',
-        Program::Claude | Program::Agy | Program::Muse | Program::Generic => '⎿',
-    }
-}
+/// The glyph a tool's output hangs under.
+const GUTTER: char = '⎿';
 
 /// The kind of block row `i` opens, or `None` when it continues the one above,
-/// by `program`'s grammar (the module doc).
-fn head_kind(rows: &[String], i: usize, program: Program) -> Option<BlockKind> {
-    match program {
-        Program::Codex => transcript_head(rows, i).map(|h| match h {
-            Head::User => BlockKind::User,
-            Head::Said => BlockKind::Message,
-            Head::Tool => BlockKind::Tool,
-            Head::Status => BlockKind::Status,
-            Head::End => BlockKind::Done,
-        }),
-        Program::Claude | Program::Agy | Program::Muse | Program::Generic => {
-            claude_head_kind(rows, i)
-        }
-    }
-}
-
-/// [`head_kind`] by Claude Code's grammar.
-fn claude_head_kind(rows: &[String], i: usize) -> Option<BlockKind> {
+/// by Claude Code's grammar (the module doc).
+fn head_kind(rows: &[String], i: usize) -> Option<BlockKind> {
     let row = rows[i].as_str();
     if !row.starts_with(['⏺', '●']) && is_tool_call(row) {
         return Some(BlockKind::Tool);
@@ -323,19 +277,16 @@ fn is_group_clause(clause: &str) -> bool {
     }
 }
 
-/// `rows` less every gutter row (`⎿`; Codex's `└`) and the rows indented
-/// past it under it (five columns or more; Codex's four: the output it hangs
-/// over), down to a blank row or a row back at the text's indent.
-fn without_gutter(rows: &[String], program: Program) -> Vec<String> {
-    let deeper = match program {
-        Program::Codex => 4,
-        Program::Claude | Program::Agy | Program::Muse | Program::Generic => 5,
-    };
+/// `rows` less every gutter row (`⎿`) and the rows indented past it under
+/// it (five columns or more), down to a blank row or a row back at the
+/// text's indent.
+fn without_gutter(rows: &[String]) -> Vec<String> {
+    let deeper = 5;
     let mut out = Vec::new();
     let mut under = false;
     for row in rows {
         let t = row.trim_start();
-        if t.starts_with(gutter(program)) {
+        if t.starts_with(GUTTER) {
             under = true;
             continue;
         }
@@ -361,34 +312,16 @@ fn trimmed(rows: Vec<String>) -> Vec<String> {
     rows[start..end].to_vec()
 }
 
-/// A done block's own rows: its done row — and, for Codex's `■` block (an
-/// interrupt, an error, a wall), every row the block owns: the rows it wraps
-/// onto at column 0, down to the first blank one, a tip or the background
-/// terminals' line ([`end_block_rows`], the rows Codex's reader reads the
-/// wall from: 0.157.1 drew its `Tip: Use /statusline …` right under a usage
-/// wall, no blank between).
-fn done_rows(rows: &[String], b: &Block, program: Program) -> Vec<String> {
-    let head = rows[b.start].clone();
-    match program {
-        Program::Codex if head.starts_with('■') => {
-            rows[b.start..end_block_rows(rows, b.start).min(b.end)].to_vec()
-        }
-        Program::Codex | Program::Claude | Program::Agy | Program::Muse | Program::Generic => {
-            vec![head]
-        }
-    }
-}
-
-/// The rows a view keeps, in order, the rows read by `program`'s grammar
+/// The rows a view keeps, in order, the rows read by Claude Code's grammar
 /// ([`blocks`]). `All` is `rows` unchanged. `Final` is the last message block
 /// (its gutter output, if any, dropped) and, when a done block follows it, a
-/// blank row and that block's own rows ([`done_rows`]) — the first after it,
+/// blank row and that block's done row — the first after it,
 /// the one that ended the turn. `Messages` is every user and message block
-/// (their gutter output dropped) and every done block's own rows, one blank
+/// (their gutter output dropped) and every done block's done row, one blank
 /// row between. Nothing kept is an empty list.
-pub fn view_rows(rows: &[String], view: View, program: Program) -> Vec<String> {
-    let all = blocks(rows, program);
-    let body = |b: &Block| trimmed(without_gutter(&rows[b.start..b.end], program));
+pub fn view_rows(rows: &[String], view: View) -> Vec<String> {
+    let all = blocks(rows);
+    let body = |b: &Block| trimmed(without_gutter(&rows[b.start..b.end]));
     match view {
         View::All => rows.to_vec(),
         View::Final => {
@@ -398,7 +331,7 @@ pub fn view_rows(rows: &[String], view: View, program: Program) -> Vec<String> {
             let mut out = body(&all[last]);
             if let Some(done) = all[last + 1..].iter().find(|b| b.kind == BlockKind::Done) {
                 out.push(String::new());
-                out.extend(done_rows(rows, done, program));
+                out.push(rows[done.start].clone());
             }
             out
         }
@@ -407,7 +340,7 @@ pub fn view_rows(rows: &[String], view: View, program: Program) -> Vec<String> {
             for b in &all {
                 let kept = match b.kind {
                     BlockKind::User | BlockKind::Message => body(b),
-                    BlockKind::Done => done_rows(rows, b, program),
+                    BlockKind::Done => vec![rows[b.start].clone()],
                     BlockKind::Tool | BlockKind::Summary | BlockKind::Status => continue,
                 };
                 if kept.is_empty() {
@@ -433,10 +366,7 @@ mod tests {
 
     fn kinds(v: &[&str]) -> Vec<(BlockKind, usize)> {
         let r = rows(v);
-        blocks(&r, Program::Claude)
-            .iter()
-            .map(|b| (b.kind, b.start))
-            .collect()
+        blocks(&r).iter().map(|b| (b.kind, b.start)).collect()
     }
 
     /// The heads as a live worker's archive draws them: a message, a call, a
@@ -498,7 +428,7 @@ mod tests {
             "      let replay = entry.clone();",
         ] {
             let r = rows(&["⏺ Two things:", row]);
-            assert_eq!(blocks(&r, Program::Claude).len(), 1, "{row:?}");
+            assert_eq!(blocks(&r).len(), 1, "{row:?}");
         }
         // `⏺ Seed 5 (240 vars…` has a space before its `(`: prose.
         assert_eq!(
@@ -541,7 +471,7 @@ mod tests {
             "✻ Churned for 0s · done 2:50 PM",
         ]);
         assert_eq!(
-            view_rows(&r, View::Final, Program::Claude),
+            view_rows(&r, View::Final),
             rows(&[
                 "⏺ Last words:",
                 "",
@@ -551,7 +481,7 @@ mod tests {
             ])
         );
         assert_eq!(
-            view_rows(&r, View::Messages, Program::Claude),
+            view_rows(&r, View::Messages),
             rows(&[
                 "❯ /model",
                 "",
@@ -566,11 +496,11 @@ mod tests {
                 "✻ Churned for 0s · done 2:50 PM",
             ])
         );
-        assert_eq!(view_rows(&r, View::All, Program::Claude), r);
+        assert_eq!(view_rows(&r, View::All), r);
         // Nothing said: nothing kept.
         let tools = rows(&["⏺ Bash(ls)", "  ⎿  a", "  Ran 1 shell command"]);
-        assert!(view_rows(&tools, View::Final, Program::Claude).is_empty());
-        assert!(view_rows(&tools, View::Messages, Program::Claude).is_empty());
+        assert!(view_rows(&tools, View::Final).is_empty());
+        assert!(view_rows(&tools, View::Messages).is_empty());
     }
 
     /// ONE READER OF "A CALL" (H6-HARNESS-1, 2026-10-08): every row
@@ -608,7 +538,7 @@ mod tests {
             "⏺ Read them.",
         ]);
         assert_eq!(
-            view_rows(&r, View::Messages, Program::Claude),
+            view_rows(&r, View::Messages),
             rows(&["❯ check the notes", "", "⏺ Read them."])
         );
     }
@@ -623,7 +553,7 @@ mod tests {
             "✻ Sautéed for 50m 35s · done 10:57 AM",
         ]);
         assert_eq!(
-            view_rows(&r, View::Final, Program::Claude),
+            view_rows(&r, View::Final),
             r[..2]
                 .iter()
                 .cloned()
@@ -631,128 +561,6 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         let r = rows(&["     … +5 lines", "", "⏺ Next."]);
-        assert_eq!(
-            view_rows(&r, View::Messages, Program::Claude),
-            rows(&["⏺ Next."])
-        );
-    }
-
-    /// A CODEX screen read up to where its live zone begins, as a report holds
-    /// it.
-    fn codex_transcript(text: &str) -> Vec<String> {
-        let rows = aterm_phase::prompt::fixtures::screen(text);
-        let end = aterm_phase::codex::transcript_end(&rows);
-        rows[..end].to_vec()
-    }
-
-    /// Codex's SESSION CARD as 0.158.0 on draws it, with no box (`  >_ OpenAI
-    /// Codex (v0.163.0)` over its folder, then its greeting, its command list
-    /// and its art; measured on 0.159.2 and 0.163.0), is a card like the boxed
-    /// one, never the worker's words: a report that holds it (one opened at the
-    /// top, `--since` an early mark, a start not found) keeps none of it in
-    /// `--final` or `--messages`. Read as the rows above the first head, the
-    /// card stood in both views as the worker's last message, and a wall's
-    /// `--final` printed the card over the wall. The title alone and whole
-    /// (the alt-screen archive keeps a frame's lone title over the card) is
-    /// the card too. NEGATIVE CONTROL: a paragraph of the worker's that quotes
-    /// the title with no folder row under it is still its words.
-    #[test]
-    fn a_codex_session_card_is_no_message() {
-        use aterm_phase::codex::fixtures as cx;
-        for text in [cx::IDLE_0_163, cx::IDLE_0_159] {
-            let r = codex_transcript(text);
-            assert!(
-                r.iter().any(|row| row.starts_with("  >_ OpenAI Codex")),
-                "the card is in the rows read"
-            );
-            assert!(view_rows(&r, View::Final, Program::Codex).is_empty());
-            assert!(view_rows(&r, View::Messages, Program::Codex).is_empty());
-        }
-        let wall = codex_transcript(cx::WALL_MID_TURN_160X50_0_159);
-        let words = "■ You’ve hit your usage limit. Visit https://chatgpt.com/codex/settings/usage \
-                     to purchase more credits or try again later.";
-        assert!(view_rows(&wall, View::Final, Program::Codex).is_empty());
-        assert_eq!(
-            view_rows(&wall, View::Messages, Program::Codex),
-            rows(&["› TOOLTHEN429 please", "", words])
-        );
-
-        // The alt-screen archive's own copy (measured in the lab on 0.163.0,
-        // 2026-10-16, `offscreen` from the session's start): a frame's lone
-        // title over the card drawn whole.
-        let archived = rows(&[
-            "  >_ OpenAI Codex (v0.163.0)",
-            "  >_ OpenAI Codex (v0.163.0)",
-            "     /private/tmp/at.wZPe/proj",
-            "",
-            "",
-            "• Hi! I am the local lab stub, not a model. (reply 1)",
-            "",
-            "  Worked for <1s • 1:35 PM",
-        ]);
-        assert_eq!(
-            view_rows(&archived, View::Messages, Program::Codex),
-            rows(&[
-                "• Hi! I am the local lab stub, not a model. (reply 1)",
-                "",
-                "  Worked for <1s • 1:35 PM",
-            ])
-        );
-
-        let quoted = rows(&[
-            "  >_ OpenAI Codex (v0.163.0) is the build this folder runs.",
-            "  Its card names the folder too.",
-            "",
-            "  Worked for 2s • 9:00 AM",
-        ]);
-        assert_eq!(
-            view_rows(&quoted, View::Final, Program::Codex),
-            rows(&[
-                "  >_ OpenAI Codex (v0.163.0) is the build this folder runs.",
-                "  Its card names the folder too.",
-                "",
-                "  Worked for 2s • 9:00 AM",
-            ])
-        );
-    }
-
-    /// A Codex `■` block keeps the rows it OWNS in `--final` and `--messages`
-    /// — the rows it wraps onto at column 0 — never a tip Codex drew right
-    /// under it with no blank between (0.157.1 under a usage wall, the owner's
-    /// 2026-09-27 journal: `Tip: Use /statusline …`, or `└ Tip: …`) nor the
-    /// background terminals' line: the same rows Codex's reader reads the
-    /// wall from. NEGATIVE CONTROL: the measured wall with nothing under it
-    /// keeps both its rows.
-    #[test]
-    fn a_codex_walls_block_keeps_its_own_rows_and_no_tip() {
-        use aterm_phase::codex::fixtures as cx;
-        let plain = codex_transcript(cx::HIT_LIMIT);
-        let head = plain
-            .iter()
-            .rposition(|r| r.starts_with('■'))
-            .expect("the ■ row");
-        let wall = plain[head..head + 2].to_vec();
-        // HIT_LIMIT is 0.163.0's measured weekly wall, wrapped to column 0
-        // after `purchase more`.
-        assert!(
-            wall[1].starts_with("credits or try again at Oct 17th"),
-            "{wall:#?}"
-        );
-        let tail = |r: &[String]| -> Vec<String> {
-            let kept = view_rows(r, View::Messages, Program::Codex);
-            kept[kept.len().saturating_sub(3)..].to_vec()
-        };
-        assert_eq!(tail(&plain)[1..], wall[..], "the control");
-        for under in [
-            "  Tip: Use /statusline to configure which items appear in the status line.",
-            "  └ Tip: Use /statusline to configure which items appear in the status line.",
-            "  1 background terminal running · /ps to view · /stop to close",
-        ] {
-            let mut with = plain.clone();
-            with.insert(head + 2, under.to_string());
-            let kept = view_rows(&with, View::Messages, Program::Codex);
-            assert_eq!(kept[kept.len() - 2..], wall[..], "{under}");
-            assert!(!kept.iter().any(|r| r == under), "{under}: {kept:#?}");
-        }
+        assert_eq!(view_rows(&r, View::Messages), rows(&["⏺ Next."]));
     }
 }

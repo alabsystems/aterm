@@ -84,7 +84,7 @@ struct ModelDef {
     vars: Vec<(Ident, i64)>,
     actions: Vec<ActionDef>,
     /// `(name, expr, kind)`: `invariant` a design claim, `bound` the box the
-    /// checkers walk, `uncaught` a claim no mutant breaks yet.
+    /// checkers walk.
     invariants: Vec<(Ident, Node, &'static str)>,
 }
 
@@ -175,11 +175,11 @@ impl ModelDef {
                         updates,
                     });
                 }
-                word @ ("invariant" | "bound" | "uncaught") => {
-                    let kind = match word {
-                        "invariant" => "Claim",
-                        "bound" => "Bound",
-                        _ => "Uncaught",
+                word @ ("invariant" | "bound") => {
+                    let kind = if word == "invariant" {
+                        "Claim"
+                    } else {
+                        "Bound"
                     };
                     let name = expect_name(&mut body, "identifier")?;
                     body.expect_punct(':', "`:`")?;
@@ -191,7 +191,7 @@ impl ModelDef {
                     return Err(Error::new(
                         kw.span(),
                         format!(
-                            "expected const/scenario/var/action/invariant/bound/uncaught, \
+                            "expected const/scenario/var/action/invariant/bound, \
                              found `{other}`"
                         ),
                     ));

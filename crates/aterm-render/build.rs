@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! COMPILE-TIME licence gate for the bundled DISPLAY FACES (`assets/game/`) and
-//! the non-macOS terminal font STACK (`assets/bundled/`).
+//! COMPILE-TIME licence gate for the bundled DISPLAY FACES (`assets/game/`),
+//! the non-macOS terminal font STACK (`assets/bundled/`) and the faces only the
+//! tests embed (`assets/test/`).
 //!
 //! Every file in that directory is a candidate for `include_bytes!`, and
 //! `include_bytes!` puts the bytes in the shipped binary whether or not any
@@ -29,11 +30,13 @@ use std::path::{Path, PathBuf};
 mod clean_islands;
 
 /// The directories holding gated bundled faces, relative to the manifest: the
-/// display faces (`assets/game/`) and the terminal font STACK
-/// (`assets/bundled/` — JetBrains Mono, Cascadia Mono PL, Iosevka Term and the
-/// Noto symbol/math faces), which is held to exactly the same exact-sibling
-/// grant rule.
-const ASSET_DIRS: &[&str] = &["assets/game", "assets/bundled"];
+/// display faces (`assets/game/`), the terminal font STACK (`assets/bundled/` —
+/// JetBrains Mono, Cascadia Mono PL, both Iosevka Term sets and the Noto
+/// symbol/math faces) and the faces only the tests embed (`assets/test/` — the
+/// variable Cascadia Mono): no shipped binary carries a test face, but the
+/// source tree redistributes it all the same, so it is held to exactly the same
+/// exact-sibling grant rule.
+const ASSET_DIRS: &[&str] = &["assets/game", "assets/bundled", "assets/test"];
 
 /// The suffix that marks a file as a licence notice rather than an asset.
 const LICENSE_SUFFIX: &str = ".LICENSE.txt";

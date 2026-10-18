@@ -1,18 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-verify` — every check aterm has, as one CLI anyone runs freely:
-//! `targo --unverified verify [CHECK|SET ...]`.
+//! `aterm-verify` — every aterm check as one CLI: `targo --unverified verify [CHECK|SET ...]`.
 //!
 //! It runs in place, in the caller's checkout and target dir, offline, and
 //! takes no lock but a short machine-wide one around the checks that judge
 //! timings. A bare run is the `dev` set on the change cone. Each check's
 //! stages run concurrently where they share no resource ([`sched`]), and the
 //! run prints one line per check as it finishes ([`report`]), the full ladder
-//! going to a log. `ship release` runs the `release` set through [`run_cli`].
-//! The tree walks (`fmt`, `guards`, `census`, `forge`, `cells`) run
-//! in-process over the checkout; `verify perf` is the performance lanes
-//! ([`perf`]), a verb beside the checks.
+//! going to a log. `verify perf` ([`perf`]) and `verify glue` ([`wasm_glue`])
+//! are verbs beside the checks, with arguments of their own. `ship release`
+//! runs `verify release --app <bundle>` and publishes only on `0`.
 //!
 //! Exit codes ([`exit`]): `0` every check that ran passed, `1` a check failed,
 //! `2` usage, `3` could not run. A skip names what was absent and its fix and
@@ -22,15 +20,18 @@
     reason = "never linked into the shipped binary: the verify CLI spawns its checks"
 )]
 
+// The browser lane drives Chromium's DevTools over two inherited pipes, a
+// unix spawn (`aterm_uds::spawnfd::spawn_with_two_fds`).
+#[cfg(unix)]
+pub mod browser;
 pub mod cells;
 pub mod changed;
 pub mod checks;
 pub mod cli;
+pub mod docscan;
 pub mod exec;
 pub mod findings;
-pub mod first_exec;
 pub mod fmt;
-pub mod glob;
 pub mod ladder;
 pub mod libtest;
 pub mod perf;
@@ -39,18 +40,17 @@ pub mod report;
 pub mod rustup;
 pub mod sched;
 pub mod scope;
-// The smokes drive a unix control socket with unix process plumbing; off unix
-// the two smoke rows are named skips (`stages::run_stage`).
+// The GUI smoke drives a unix control socket with unix process plumbing; off
+// unix its row is a named skip (`stages::run_stage`).
 #[cfg(unix)]
 pub mod smoke;
 #[cfg(unix)]
 pub mod smoke_stages;
 pub mod stages;
 pub mod testrun;
-/// THE toolchain resolution, shared with atpkg (`aterm help rust`) as one
-/// std-only source file.
-#[path = "../../atpkg/src/toolchain.rs"]
-pub mod toolchain;
+/// THE toolchain resolution, shared with atpkg (`aterm help rust`), the libc
+/// oracle's gate and the release cutter: the std-only `aterm-toolchain`.
+pub use aterm_toolchain::discovery as toolchain;
 pub mod wasm_glue;
 pub mod wasm_smoke;
 
@@ -100,6 +100,12 @@ pub struct EnvSnapshot {
     /// `CARGO_TARGET_DIR`, absolute: the caller's target dir, which every run
     /// builds in.
     pub cargo_target_dir: Option<PathBuf>,
+    /// The variables that choose cargo's layout, raw and only when set
+    /// ([`CARGO_LAYOUT_VARS`]): what decides whether the main lane gets plain
+    /// `targo`'s build cache ([`main_build_dir`]).
+    pub cargo_layout: Vec<(&'static str, OsString)>,
+    /// `RUST_TEST_THREADS`, raw: a caller's pin, which the run never overrides.
+    pub rust_test_threads: Option<OsString>,
     /// `CARGO_HOME`: where rustup-init put `rustup` ([`rustup::find_rustup_in`]).
     pub cargo_home: Option<PathBuf>,
 }
@@ -125,8 +131,77 @@ impl EnvSnapshot {
                 .filter(|p| !p.as_os_str().is_empty())
                 .map(|p| std::path::absolute(&p).unwrap_or(p)),
             cargo_home: var_path("CARGO_HOME").filter(|p| p.is_absolute()),
+            cargo_layout: CARGO_LAYOUT_VARS
+                .iter()
+                .filter_map(|k| Some((*k, std::env::var_os(k)?)))
+                .collect(),
+            rust_test_threads: std::env::var_os("RUST_TEST_THREADS"),
         }
     }
+}
+
+/// The variables that move cargo's target or build directory, and the home whose
+/// config may: any one set (even empty) and atpkg's shim leaves plain `targo`'s
+/// layout alone, so the run does too ([`main_build_dir`]).
+pub const CARGO_LAYOUT_VARS: [&str; 4] = [
+    "CARGO_TARGET_DIR",
+    "CARGO_BUILD_TARGET_DIR",
+    "CARGO_BUILD_BUILD_DIR",
+    "CARGO_HOME",
+];
+
+/// The `build.build-dir` value atpkg's `targo` shim hands a build at `root`
+/// (`aterm_toolchain::build_cache::with_build_dir`, the shim's own rule), so the
+/// main lane's children share plain `targo`'s cache: `None` off macOS, and
+/// wherever the shim would leave the layout alone (the caller chose a target or
+/// build directory, a cargo config names one, the root is not under `$HOME`, the
+/// cache cannot be written).
+#[must_use]
+pub fn main_build_dir(env: &EnvSnapshot, root: &Path) -> Option<String> {
+    use aterm_toolchain::build_cache::{Machine, Tool, read_config, with_build_dir};
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let lookup = |k: &str| {
+        env.cargo_layout
+            .iter()
+            .find(|(name, _)| *name == k)
+            .map(|(_, v)| v.clone())
+    };
+    let machine = Machine {
+        home: Some(&env.home),
+        cwd: Some(root),
+        env: &lookup,
+        read: &read_config,
+        writable: &writable_dir,
+    };
+    let probe = ["--unverified".to_string(), "test".to_string()];
+    let args = with_build_dir(&probe, Tool::Targo, &machine)?;
+    match args.as_slice() {
+        [flag, value, ..] if flag == "--config" => Some(value.clone()),
+        _ => None,
+    }
+}
+
+/// Whether this process may write the directory `dir` (`access(2)`, which a
+/// sandbox's denial answers too, as atpkg's shim asks it); `None` when `dir` is
+/// not a directory.
+#[cfg(unix)]
+fn writable_dir(dir: &Path) -> Option<bool> {
+    use std::os::unix::ffi::OsStrExt as _;
+    if !dir.is_dir() {
+        return None;
+    }
+    let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `c` is a NUL-terminated string that outlives the call, and
+    // `access` only reads it.
+    Some(unsafe { libc::access(c.as_ptr(), libc::W_OK) } == 0)
+}
+
+/// Off unix the shim's cache is never chosen ([`main_build_dir`] is macOS only).
+#[cfg(not(unix))]
+fn writable_dir(_dir: &Path) -> Option<bool> {
+    None
 }
 
 /// The release bundle `measure` judges (`--app <APP>`): the bytes publication
@@ -191,6 +266,12 @@ pub struct Ctx {
     /// Variables given to every child, after the removals and before a stage's
     /// own ([`exec::ExecEnv::add_env`]).
     pub child_env_add: Vec<(OsString, OsString)>,
+    /// The `build.build-dir` the main lane's children are handed as `--config`
+    /// ([`main_build_dir`]), so they share plain `targo`'s cache; `None` pins
+    /// `CARGO_TARGET_DIR` to [`Ctx::target_dir`] instead.
+    pub main_build_dir: Option<String>,
+    /// What the run's toolchain lease is, for the log ([`hold_toolchain`]).
+    pub toolchain_lease: Option<String>,
     /// The wall-clock ceiling on one stage child; `None` for `--timeout off`.
     pub child_ceiling: Option<Duration>,
     /// `--no-windows`: every stage that opens a window ([`plan::WINDOWED`])
@@ -200,20 +281,13 @@ pub struct Ctx {
     pub measure_artifact: Option<MeasureArtifact>,
     /// `--test-jobs`: the most test binaries the test stage runs at once.
     pub test_jobs: u32,
-    /// `--test-threads`: the `RUST_TEST_THREADS` every test binary gets.
+    /// `--test-threads`, else the caller's own `RUST_TEST_THREADS`: the threads
+    /// every test binary gets. `None` lets the run choose per binary
+    /// ([`testrun::threads_for`]).
     pub test_threads: Option<u32>,
     /// The program cargo runs in place of each test binary to record it
     /// ([`testrun::RECORD_FLAG`]): this very binary unless a test names one.
     pub test_recorder: Option<PathBuf>,
-    /// Reads what the test pool widens by in place of the machine's load;
-    /// `None` in a real run.
-    pub test_load: Option<fn() -> Option<f64>>,
-    /// How the headless smoke paces its typing burst.
-    #[cfg(unix)]
-    pub smoke_pacing: smoke_stages::Pacing,
-    /// The host's physical memory in bytes, which caps the test pool
-    /// ([`testrun::memory_jobs`]).
-    pub host_memory: Option<u64>,
     /// The machine-wide lock the timing stages hold while they run
     /// ([`plan::TIMED`]); `None` takes none.
     pub timing_lock: Option<PathBuf>,
@@ -228,19 +302,23 @@ pub fn parse_build_jobs(raw: Option<&OsStr>) -> Option<u32> {
         .filter(|&n| n > 0)
 }
 
-/// What libtest reads from its environment once `-Zunstable-options` is on
-/// ([`stages::LIBTEST_REPORT_TIME`]): a caller's shuffle or a malformed time
-/// unit would change or crash every test binary.
-pub const LIBTEST_UNSTABLE_ENV: [&str; 5] = [
-    "RUST_TEST_SHUFFLE",
-    "RUST_TEST_SHUFFLE_SEED",
-    "RUST_TEST_TIME_UNIT",
-    "RUST_TEST_TIME_INTEGRATION",
-    "RUST_TEST_TIME_DOCTEST",
+/// What `cargo run` hands the verify process about ITSELF (the `verify` alias is
+/// `run -q -p aterm-verify`). A child build inheriting them sees them as its own
+/// environment: ring's build script tracks `CARGO_MANIFEST_DIR`, so 18 packages up
+/// to aterm-gui rebuilt at every switch between a run and a manual build. A name
+/// ending in `*` is a prefix ([`exec::ExecEnv::remove_env`]).
+pub const CARGO_RUN_ENV: [&str; 6] = [
+    "CARGO_MANIFEST_DIR",
+    "CARGO_MANIFEST_PATH",
+    "CARGO_PKG_*",
+    "CARGO_CRATE_NAME",
+    "CARGO_BIN_NAME",
+    "CARGO_PRIMARY_PACKAGE",
 ];
 
-/// Variables removed from every child's inherited environment.
-pub const CHILD_ENV_REMOVED: [&str; 5] = LIBTEST_UNSTABLE_ENV;
+/// Variables removed from every child's inherited environment: what `cargo run`
+/// said about this process.
+pub const CHILD_ENV_REMOVED: [&str; 6] = CARGO_RUN_ENV;
 
 /// The run's toolchain, discovered once from `env` under the pin `root`
 /// declares and the atpkg prefix atpkg itself would read.
@@ -286,10 +364,20 @@ impl Ctx {
             .cargo_target_dir
             .clone()
             .unwrap_or_else(|| root.join("target"));
-        let mut child_env_add: Vec<(OsString, OsString)> = vec![(
-            "CARGO_TARGET_DIR".into(),
-            target_dir.clone().into_os_string(),
-        )];
+        // ONE CACHE WITH PLAIN TARGO. Where atpkg's shim would hand a build its
+        // build-cache `--config`, the main lane's children get the same one and
+        // no CARGO_TARGET_DIR, which would turn the shim's rule off and fork a
+        // second cache; the target dir is `<root>/target` either way. Anywhere
+        // else (a caller's CARGO_TARGET_DIR among them) every child is pinned to
+        // the run's target dir.
+        let main_build_dir = main_build_dir(&env, &root);
+        let mut child_env_add: Vec<(OsString, OsString)> = Vec::new();
+        if main_build_dir.is_none() {
+            child_env_add.push((
+                "CARGO_TARGET_DIR".into(),
+                target_dir.clone().into_os_string(),
+            ));
+        }
         // Every child runs this run's compiler rather than re-discovering one.
         if tools.have_targo() {
             child_env_add.push((
@@ -297,6 +385,8 @@ impl Ctx {
                 tools.stage2_dir.clone().into_os_string(),
             ));
         }
+        // A caller's own RUST_TEST_THREADS is a pin, as --test-threads is.
+        let pinned_threads = parse_build_jobs(env.rust_test_threads.as_deref());
         Self {
             root,
             target_dir,
@@ -311,16 +401,14 @@ impl Ctx {
             env,
             child_env_remove: CHILD_ENV_REMOVED.to_vec(),
             child_env_add,
+            main_build_dir,
+            toolchain_lease: None,
             child_ceiling: Some(exec::DEFAULT_CHILD_CEILING),
             no_windows: false,
             measure_artifact: None,
             test_jobs: testrun::DEFAULT_JOBS,
-            test_threads: None,
+            test_threads: pinned_threads,
             test_recorder: None,
-            test_load: None,
-            #[cfg(unix)]
-            smoke_pacing: smoke_stages::Pacing::PRODUCTION,
-            host_memory: None,
             timing_lock: None,
         }
     }
@@ -365,14 +453,14 @@ impl Ctx {
         aterm_forge::resolve::Cargo::pinned(&self.tools.targo, &self.path_env)
     }
 
-    /// Where the run keeps what it learns between runs (the test binaries'
-    /// last wall times): `<target>/verify`.
+    /// The run's own corner of the target dir (its logs, the foreign cells):
+    /// `<target>/verify`.
     #[must_use]
     pub fn state_dir(&self) -> PathBuf {
         self.target_dir.join("verify")
     }
 
-    /// The cores a load average is read against.
+    /// The machine's parallelism.
     #[must_use]
     pub fn cores(&self) -> u32 {
         std::thread::available_parallelism()
@@ -392,20 +480,11 @@ impl Ctx {
         usize::try_from(self.test_jobs.max(1)).unwrap_or(1)
     }
 
-    /// `--test-threads`, or the machine's parallelism, as libtest would pick.
+    /// `--test-threads` (or the caller's `RUST_TEST_THREADS`), or the machine's
+    /// parallelism, as libtest would pick: what a binary with no history gets.
     #[must_use]
     pub fn test_threads(&self) -> u32 {
         self.test_threads.unwrap_or_else(|| self.cores())
-    }
-
-    /// What the test pool reads against the cores: [`Ctx::test_load`]'s answer,
-    /// else the cores busy over the last second, else the one-minute load.
-    #[must_use]
-    pub fn test_load(&self) -> Option<f64> {
-        self.test_load.map_or_else(
-            || exec::busy_cores().or_else(exec::load_average),
-            |read| read(),
-        )
     }
 
     /// The recording runner: the named program, else this process's own
@@ -458,10 +537,10 @@ impl Ctx {
         self
     }
 
-    /// The host's physical memory, in bytes.
+    /// What the run's toolchain lease is ([`hold_toolchain`]), for the log.
     #[must_use]
-    pub fn with_host_memory(mut self, bytes: Option<u64>) -> Self {
-        self.host_memory = bytes;
+    pub fn with_toolchain_lease(mut self, said: Option<String>) -> Self {
+        self.toolchain_lease = said;
         self
     }
 
@@ -469,15 +548,6 @@ impl Ctx {
     #[must_use]
     pub fn with_timing_lock(mut self, path: Option<PathBuf>) -> Self {
         self.timing_lock = path;
-        self
-    }
-
-    /// Move the smokes' pacing. Only the fixture tests do: a real run paces
-    /// as measured.
-    #[cfg(unix)]
-    #[must_use]
-    pub fn with_smoke_pacing(mut self, pacing: smoke_stages::Pacing) -> Self {
-        self.smoke_pacing = pacing;
         self
     }
 
@@ -586,13 +656,12 @@ fn with_timing_lock<T>(ctx: &Ctx, f: impl FnOnce() -> T) -> T {
     f()
 }
 
-/// The `  time  ` line under a stage in the log: its running time, its start
-/// offset, and the load at its two ends when both were read.
+/// The `  time  ` line under a stage in the log: its running time and its
+/// start offset.
 #[must_use]
-pub fn time_line(begun: Duration, ran: Duration, load: Option<ladder::StageLoad>) -> String {
-    let load = load.map_or_else(String::new, |l| format!("; load {}", l.describe()));
+pub fn time_line(begun: Duration, ran: Duration) -> String {
     format!(
-        "  time  {:.1}s (started +{:.1}s{load})\n",
+        "  time  {:.1}s (started +{:.1}s)\n",
         ran.as_secs_f64(),
         begun.as_secs_f64()
     )
@@ -606,6 +675,8 @@ pub fn header(ctx: &Ctx, cone: Option<&str>) -> String {
         "release".to_string()
     } else if ctx.checks == checks::DEV {
         "dev".to_string()
+    } else if ctx.checks == checks::with_pulled(&checks::DEV, true) {
+        "dev + gpu-oracle (the selection holds aterm-gpu)".to_string()
     } else {
         names.join(" ")
     };
@@ -627,9 +698,9 @@ pub fn selection(ctx: &Ctx, cone: Option<&str>) -> String {
     }
 }
 
-/// When a stage started (from the run's start), how long it ran, and the load
-/// around it: its `time` line in the log.
-type Clock = (Duration, Duration, Option<ladder::StageLoad>);
+/// When a stage started (from the run's start) and how long it ran: its `time`
+/// line in the log.
+type Clock = (Duration, Duration);
 
 /// One check's progress while the stages run.
 struct Progress {
@@ -643,8 +714,6 @@ struct Progress {
 /// How a run presents itself.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Show<'a> {
-    /// `--json`: JSON lines on stdout, nothing else.
-    pub json: bool,
     /// What the header says about the selection when it is the change cone.
     pub cone: Option<&'a str>,
     /// Where the full log is, as the caller should read it: said after the
@@ -664,13 +733,11 @@ pub fn run(
     log: &mut (dyn Write + Send),
     show: &Show<'_>,
 ) -> std::io::Result<i32> {
-    let (json, cone) = (show.json, show.cone);
+    let cone = show.cone;
     let started = Instant::now();
     let head = header(ctx, cone);
-    if !json {
-        writeln!(out, "{head}")?;
-        out.flush()?;
-    }
+    writeln!(out, "{head}")?;
+    out.flush()?;
     let _ = writeln!(log, "{head}");
     let _ = write!(log, "{}", toolchain_lines(ctx));
 
@@ -696,7 +763,6 @@ pub fn run(
     let out = Mutex::new(out);
     let t0 = Instant::now();
     let clocks: Mutex<Vec<Option<Clock>>> = Mutex::new(vec![None; stages.len()]);
-    let cores = ctx.cores();
     let mut log_err = None;
 
     sched::run_stages(
@@ -713,19 +779,13 @@ pub fn run(
             {
                 p.started.get_or_insert(begun_at);
             }
-            let load_start = exec::load_average();
-            let mut report = if spec.id.timed() {
+            let report = if spec.id.timed() {
                 with_timing_lock(ctx, || stages::run_stage(ctx, spec))
             } else {
                 stages::run_stage(ctx, spec)
             };
-            report.load = ladder::StageLoad::of(load_start, exec::load_average(), cores);
             if let Ok(mut c) = clocks.lock() {
-                c[i] = Some((
-                    begun_at.saturating_duration_since(t0),
-                    begun_at.elapsed(),
-                    report.load,
-                ));
+                c[i] = Some((begun_at.saturating_duration_since(t0), begun_at.elapsed()));
             }
             // The check's line goes out the moment its last stage is done.
             if let Some(k) = owner
@@ -747,11 +807,7 @@ pub fn run(
                         String::new()
                     };
                     let result = report::judge(check, &mine, seconds, &scope, ctx.rerun(check));
-                    let text = if json {
-                        format!("{}\n", report::json_check(&result))
-                    } else {
-                        report::render(&result, width)
-                    };
+                    let text = report::render(&result, width);
                     if let Ok(mut o) = out.lock() {
                         let _ = o.write_all(text.as_bytes()).and_then(|()| o.flush());
                     }
@@ -765,8 +821,8 @@ pub fn run(
         |i, report| {
             let clock = clocks.lock().ok().and_then(|c| c.get(i).copied().flatten());
             let mut text = report.render();
-            if let Some((begun, ran, load)) = clock {
-                text.push_str(&time_line(begun, ran, load));
+            if let Some((begun, ran)) = clock {
+                text.push_str(&time_line(begun, ran));
             }
             if log_err.is_none()
                 && let Err(e) = log.write_all(text.as_bytes())
@@ -785,17 +841,9 @@ pub fn run(
     let seconds = started.elapsed().as_secs_f64();
     let (line, code) = report::verdict(&results, ctx.release, seconds);
     let _ = writeln!(log, "\n{line}");
-    if json {
-        writeln!(
-            out,
-            "{}",
-            report::json_summary(&results, code, seconds, &selection(ctx, cone), show.log)
-        )?;
-    } else {
-        writeln!(out, "{line}")?;
-        if let Some(path) = show.log {
-            writeln!(out, "log: {path}")?;
-        }
+    writeln!(out, "{line}")?;
+    if let Some(path) = show.log {
+        writeln!(out, "log: {path}")?;
     }
     out.flush()?;
     if let Some(e) = log_err {
@@ -816,7 +864,60 @@ fn toolchain_lines(ctx: &Ctx) -> String {
     if let Some(d) = &ctx.tools.demoted {
         s.push_str(&format!("toolchain note: {}\n", d.sentence()));
     }
+    if let Some(lease) = &ctx.toolchain_lease {
+        s.push_str(&format!("toolchain lease: {lease}\n"));
+    }
+    match &ctx.main_build_dir {
+        Some(value) => s.push_str(&format!(
+            "build cache: the main lane shares plain targo's ({value})\n"
+        )),
+        None => s.push_str(&format!(
+            "build cache: CARGO_TARGET_DIR={} (no shim cache here)\n",
+            ctx.target_dir.display()
+        )),
+    }
     s
+}
+
+/// THE RUN'S TOOLCHAIN LEASE (`aterm_toolchain::lease`): the run hands one
+/// physical toolchain directory to every child, and between two children no
+/// process runs from it, so without a lease atpkg's gc could reclaim it and an
+/// unattended trust update could flip it mid-run (two compilers, a rebuild of the
+/// graph). Held for the whole run, it keeps the build from gc and makes the
+/// unattended flip wait (atpkg's `quiet`, at most its `CEILING_SECS`). A
+/// toolchain atpkg does not manage takes none; one that cannot be taken is said
+/// on stderr and the run goes on as it would have without it. Returns the lease
+/// (drop it when the run ends) and the log's sentence about it.
+#[must_use]
+pub fn hold_toolchain(
+    env: &EnvSnapshot,
+    tools: &Toolchain,
+    root: &Path,
+) -> (Option<aterm_toolchain::lease::Lease>, Option<String>) {
+    let prefix = toolchain::atpkg_prefix(&env.home, env.xdg_config_home.as_deref());
+    let who = format!(
+        "aterm-verify (pid {}) \u{2014} a verify run in {}",
+        std::process::id(),
+        root.display()
+    );
+    match aterm_toolchain::lease::take_for_dir(&prefix, &tools.stage2_dir, &who) {
+        Ok(Some(lease)) => {
+            let said = format!(
+                "{} held for this run; an unattended trust update waits for it",
+                lease.subject().describe()
+            );
+            (Some(lease), Some(said))
+        }
+        Ok(None) => (None, None),
+        Err(e) => {
+            eprintln!(
+                "verify: warn \u{2014} toolchain not held ({e}); an update during this run can \
+                 replace {}",
+                tools.stage2_dir.display()
+            );
+            (None, None)
+        }
+    }
 }
 
 /// How many of the run logs are kept.
@@ -881,25 +982,23 @@ pub fn checkout_root(cwd: &Path) -> Option<PathBuf> {
     (out.status.success() && !top.is_empty()).then(|| PathBuf::from(top))
 }
 
-/// THE WHOLE CLI, in-process: parse `args` (what follows `verify`), find the
-/// checkout `cwd` is in, run, print, and answer the exit code. `ship release`
-/// calls `run_cli(&["release", "--app", APP], R)` and publishes only on `0`.
+/// The whole CLI, in-process: parse `args` (what follows `verify`), find the
+/// checkout `cwd` is in, run, print, and answer the exit code.
 #[must_use]
 pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
-    // `perf` and `glue` are verbs of their own, with their own arguments.
+    // `perf`, `glue` and `fetch-browser` parse their own arguments.
     if args.first().is_some_and(|a| a == "perf") {
         return perf::run(&args[1..]);
     }
     if args.first().is_some_and(|a| a == "glue") {
         return wasm_glue::run(&args[1..]);
     }
-    // Under --json a run that stops before any check still ends in a summary.
-    let json = args.iter().any(|a| a == "--json");
+    #[cfg(unix)]
+    if args.first().is_some_and(|a| a == "fetch-browser") {
+        return browser::fetch_main(&args[1..]);
+    }
     let stop = |code: i32, line: String| {
         eprintln!("{line}");
-        if json {
-            println!("{}", report::json_refusal(code, &line));
-        }
         code
     };
     let parsed = match cli::parse(args.iter().cloned()) {
@@ -956,6 +1055,8 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         Ok(p) => p,
         Err(e) => return could_not_run(format!("cannot create a scratch directory: {e}")),
     };
+    // Held until this function returns: the whole run.
+    let (_lease, lease_said) = hold_toolchain(&env, &tools, &root);
     #[cfg(unix)]
     exec::group::kill_on_interrupt();
 
@@ -975,8 +1076,10 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         let (scope, said) = changed::cone(&base, &sel);
         (scope, Some(said))
     };
+    // A selection holding aterm-gpu runs its oracle arm with its tests.
+    let wanted = checks::with_pulled(&parsed.checks, scope.includes_crate(checks::ORACLE.0));
     let ctx = Ctx::new_with_tools(root, scope, env, scratch.clone(), tools)
-        .with_checks(&parsed.checks)
+        .with_checks(&wanted)
         .with_release(parsed.release)
         .with_fix(parsed.fix)
         .with_cells(parsed.cells.clone())
@@ -985,8 +1088,8 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         .with_child_ceiling(parsed.timeout.unwrap_or(Some(exec::DEFAULT_CHILD_CEILING)))
         .with_test_jobs(parsed.test_jobs)
         .with_test_threads(parsed.test_threads)
-        .with_host_memory(exec::host_memory_bytes().map(|(bytes, _)| bytes))
-        .with_timing_lock(Some(default_timing_lock()));
+        .with_timing_lock(Some(default_timing_lock()))
+        .with_toolchain_lease(lease_said);
     let log = open_log(parsed.log.as_deref(), cwd, &ctx);
     let log_shown = log
         .as_ref()
@@ -999,7 +1102,6 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
     };
     let mut out = std::io::stdout();
     let show = Show {
-        json: parsed.json,
         cone: cone.as_deref(),
         log: log_shown.as_deref(),
     };
@@ -1041,12 +1143,11 @@ pub fn mktemp_dir(tag: &str) -> std::io::Result<PathBuf> {
 /// whatever is there. A test helper, public so the integration suites and the
 /// unit tests share one copy.
 ///
-/// ONE FILE PER TEXT: macOS assesses each new executable inode on its first
-/// exec, one file at a time machine-wide, so each distinct text is written once
-/// per process and hard-linked into place. The shared file is read-only, so a
-/// stand-in written over in place fails loudly instead of rewriting every
-/// fixture's; replace one through here or by `mv`. Write the text so it holds
-/// no path of its own (`$0` is the link that was run), or nothing shares it.
+/// macOS assesses each new executable inode on its first exec, one at a time
+/// machine-wide, so each distinct text is written once per process and hard-linked
+/// into place. The shared file is read-only, so writing over a stand-in in place
+/// fails loudly; replace one through here or by `mv`. A text that holds its own path
+/// is shared by nothing (`$0` is the link that was run).
 ///
 /// # Panics
 /// When `path`'s directory cannot be made or the stand-in cannot be written.
@@ -1086,12 +1187,11 @@ pub fn standin(path: &Path, body: &str) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 }
 
-/// [`standin`] for a body that is DATA, not text: installs the one constant
-/// text `. "$0.body"` at `path` (one inode, one first-exec assessment per
-/// process) and writes `body` beside it as `<path>.body`, which the stand-in
-/// sources. Sourced, `$0` is still the link and `exit`/`exec` act on the
-/// stand-in; a `return` ends it. The body is replaced by `rename`, so a stage
-/// that sources it mid-rewrite reads the old text or the new, never half.
+/// [`standin`] for a body that varies: installs the constant text `. "$0.body"` at
+/// `path` (one inode, one first-exec assessment per process) and writes `body` beside
+/// it as `<path>.body`. Sourced, `$0` is still the link and `exit`/`exec` act on the
+/// stand-in; a `return` ends it. The body is replaced by `rename`, so a reader sees the
+/// old text or the new, never half.
 ///
 /// # Panics
 /// As [`standin`], and when the body cannot be written.
@@ -1125,22 +1225,26 @@ pub fn have_on_path(name: &str, path: &OsStr) -> bool {
     std::env::split_paths(path).any(|d| is_executable_file(&d.join(name)))
 }
 
+/// The fix a run that lacks `tool` names: Homebrew's `formula` on macOS, and the OS's own
+/// `package` elsewhere, where Homebrew is not how a machine gets tools and the name can
+/// differ (Debian and Fedora ship node as `nodejs`).
+#[must_use]
+pub fn install_fix(tool: &str, formula: &str, package: &str) -> String {
+    if cfg!(target_os = "macos") {
+        format!("install {tool} (brew install {formula})")
+    } else {
+        format!("install {tool} (the {package} package)")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn ctx(checks: &[Check], scope: Scope) -> Ctx {
-        Ctx::new(
-            PathBuf::from("/repo"),
-            scope,
-            EnvSnapshot::default(),
-            PathBuf::from("/tmp"),
-        )
-        .with_checks(checks)
-    }
-
+    /// Every child builds in the caller's `CARGO_TARGET_DIR`, and
+    /// `--test-threads` reaches every child only when asked.
     #[test]
-    fn every_child_builds_in_the_callers_target_dir_and_runs_this_runs_compiler() {
+    fn every_child_builds_in_the_callers_target_dir_and_gets_the_threads_asked_for() {
         let theirs = Ctx::new(
             PathBuf::from("/repo"),
             Scope::workspace(),
@@ -1150,100 +1254,107 @@ mod tests {
             },
             PathBuf::from("/tmp"),
         );
-        let env = theirs.exec_env();
-        assert!(
-            env.add_env
+        let has = |c: &Ctx, k: &str, v: &str| {
+            c.exec_env()
+                .add_env
                 .iter()
-                .any(|(k, v)| k == "CARGO_TARGET_DIR" && v == "/fast/tgt")
-        );
+                .any(|(ek, ev)| ek == k && ev == v)
+        };
+        assert!(has(&theirs, "CARGO_TARGET_DIR", "/fast/tgt"));
         assert!(
-            !env.add_env.iter().any(|(k, _)| k == "CARGO_INCREMENTAL"),
-            "incremental builds stay the caller's"
-        );
-        assert_eq!(env.remove_env, LIBTEST_UNSTABLE_ENV);
-        let mine = ctx(&[Check::Fmt], Scope::workspace());
-        assert_eq!(mine.target_dir, PathBuf::from("/repo/target"));
-        assert_eq!(mine.state_dir(), PathBuf::from("/repo/target/verify"));
-    }
-
-    #[test]
-    fn test_threads_reach_every_child_only_when_asked() {
-        let c = ctx(&[Check::Test], Scope::workspace());
-        assert!(
-            !c.child_env_add
+            !theirs
+                .child_env_add
                 .iter()
                 .any(|(k, _)| k == "RUST_TEST_THREADS")
         );
-        let c = c.with_test_threads(std::num::NonZeroU32::new(3));
-        assert_eq!(c.test_threads(), 3);
-        assert!(
-            c.child_env_add
-                .iter()
-                .any(|(k, v)| k == "RUST_TEST_THREADS" && v == "3")
-        );
+        let env = theirs.exec_env();
+        assert_eq!(env.remove_env, CHILD_ENV_REMOVED);
+        // What `cargo run` told this process about itself never reaches a child
+        // build: ring's build script tracks CARGO_MANIFEST_DIR.
+        for k in ["CARGO_MANIFEST_DIR", "CARGO_PKG_*", "CARGO_PRIMARY_PACKAGE"] {
+            assert!(env.remove_env.contains(&k), "{k}");
+        }
+        let threaded = theirs.with_test_threads(std::num::NonZeroU32::new(3));
+        assert!(has(&threaded, "RUST_TEST_THREADS", "3"));
     }
 
+    /// THE MAIN LANE SHARES PLAIN TARGO'S CACHE exactly where atpkg's shim would
+    /// hand plain `targo` its build-cache `--config` (macOS, a root under a
+    /// writable `$HOME`, no layout chosen): then no child is pinned to a
+    /// CARGO_TARGET_DIR, and the target dir is still `<root>/target`. A layout
+    /// variable set, even empty, turns it off, as it turns the shim off.
     #[test]
-    fn the_rerun_names_the_check_and_exactly_the_selection_it_read() {
-        let c = ctx(
-            &[Check::Lint, Check::Fmt],
-            Scope::changed("origin/main", vec!["a".into(), "b".into()], true),
-        );
-        assert_eq!(
-            c.rerun(Check::Lint),
-            "targo --unverified verify lint -p a -p b"
-        );
-        assert_eq!(c.rerun(Check::Fmt), "targo --unverified verify fmt");
-        let all = ctx(&[Check::Test], Scope::workspace());
-        assert_eq!(
-            all.rerun(Check::Test),
-            "targo --unverified verify test --all"
-        );
-        let c = ctx(&[Check::Appkit], Scope::workspace()).with_no_windows(true);
-        assert_eq!(
-            c.rerun(Check::Appkit),
-            "targo --unverified verify appkit --no-windows"
-        );
-    }
-
-    #[test]
-    fn the_header_names_the_set_or_the_checks_and_what_they_run_over() {
-        let dev = ctx(&checks::DEV, Scope::crate_only("aterm-grid"));
-        assert_eq!(header(&dev, None), "verify: dev — -p aterm-grid");
-        assert_eq!(
-            header(&dev, Some("the change cone since origin/main: aterm-grid")),
-            "verify: dev — the change cone since origin/main: aterm-grid"
-        );
-        let fmt = ctx(&[Check::Fmt, Check::Guards], Scope::workspace());
-        assert_eq!(header(&fmt, None), "verify: fmt guards — the whole tree");
-        let rel = ctx(&checks::RELEASE, Scope::workspace()).with_release(true);
-        assert_eq!(header(&rel, None), "verify: release — the whole workspace");
-    }
-
-    #[test]
-    fn a_held_timing_lock_is_waited_for_and_released_after() {
-        let dir = mktemp_dir("atv-lock").expect("mktemp");
-        let path = dir.join("timing.lock");
-        let c = ctx(&[Check::Smoke], Scope::workspace()).with_timing_lock(Some(path.clone()));
-        let holder = TimingLock::take(&path).expect("hold it");
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                with_timing_lock(&c, || tx.send(()).expect("send"));
-            });
-            assert!(
-                rx.recv_timeout(Duration::from_millis(200)).is_err(),
-                "ran beside the holder"
+    fn the_main_lane_shares_plain_targos_cache_exactly_where_the_shim_would() {
+        let tmp = std::fs::canonicalize(mktemp_dir("atv-cache").expect("mktemp")).expect("real");
+        let home = tmp.join("home");
+        let root = home.join("Developer/repo");
+        std::fs::create_dir_all(home.join("Library/Caches")).expect("mkdir");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let env = EnvSnapshot {
+            home: home.clone(),
+            ..EnvSnapshot::default()
+        };
+        let got = main_build_dir(&env, &root);
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                got,
+                Some(format!(
+                    "build.build-dir='{}/Library/Caches/aterm/cargo-build.noindex\
+                     {{workspace-root}}/.cargo-build'",
+                    home.display()
+                ))
             );
-            drop(holder);
-            rx.recv_timeout(Duration::from_secs(60))
-                .expect("ran once the holder let go");
-        });
-        let _ = std::fs::remove_dir_all(&dir);
+            let c = Ctx::new(
+                root.clone(),
+                Scope::workspace(),
+                env.clone(),
+                PathBuf::from("/tmp"),
+            );
+            assert_eq!(c.main_build_dir, got);
+            assert!(!c.child_env_add.iter().any(|(k, _)| k == "CARGO_TARGET_DIR"));
+            assert_eq!(c.target_dir, root.join("target"));
+            for var in &CARGO_LAYOUT_VARS[..3] {
+                let chosen = EnvSnapshot {
+                    cargo_layout: vec![(*var, OsString::new())],
+                    ..env.clone()
+                };
+                assert_eq!(main_build_dir(&chosen, &root), None, "{var}");
+            }
+            assert_eq!(
+                main_build_dir(&env, &tmp.join("elsewhere")),
+                None,
+                "outside HOME"
+            );
+        } else {
+            assert_eq!(got, None, "the shim's cache is macOS only");
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// The CLI refuses before it runs anything: a usage error is 2, and a
-    /// place it cannot run from — no checkout, no pin — is 3 with its fix.
+    /// A caller's own RUST_TEST_THREADS is a pin, as --test-threads is.
+    #[test]
+    fn a_callers_rust_test_threads_pins_every_binary() {
+        let c = Ctx::new(
+            PathBuf::from("/repo"),
+            Scope::workspace(),
+            EnvSnapshot {
+                rust_test_threads: Some("5".into()),
+                ..EnvSnapshot::default()
+            },
+            PathBuf::from("/tmp"),
+        );
+        assert_eq!(c.test_threads, Some(5));
+        assert_eq!(c.test_threads(), 5);
+        let unpinned = Ctx::new(
+            PathBuf::from("/repo"),
+            Scope::workspace(),
+            EnvSnapshot::default(),
+            PathBuf::from("/tmp"),
+        );
+        assert_eq!(unpinned.test_threads, None);
+    }
+
+    /// A usage error is 2; no checkout or no pin is 3 with its fix, before anything runs.
     #[cfg(unix)]
     #[test]
     fn the_cli_refuses_usage_and_a_place_it_cannot_run_from() {
@@ -1274,22 +1385,5 @@ mod tests {
         assert_eq!(run_cli(&args(&["list"]), &tmp), exit::PASS);
         assert_eq!(run_cli(&args(&["--help"]), &tmp), exit::PASS);
         let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn executable_test_matches_the_shell_test() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let dir = mktemp_dir("atv-exe").expect("mktemp");
-        let f = dir.join("f");
-        std::fs::write(&f, "#!/bin/sh\n").expect("write");
-        assert!(!is_executable_file(&f));
-        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        assert!(is_executable_file(&f));
-        assert!(
-            !is_executable_file(&dir),
-            "a directory is not an executable file"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

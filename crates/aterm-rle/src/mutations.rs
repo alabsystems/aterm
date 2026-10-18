@@ -367,15 +367,17 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
 // stock rustc (the cross cells of `verify cells`, the x86_64-apple-darwin
 // compat slice) parses a cfg'd-out module's body all the same, so the island's
 // module goes through this macro, which drops its tokens there and emits them
-// unchanged under `cfg(trust_verify)`.
-#[cfg(trust_verify)]
+// unchanged under `cfg(clean_islands)`: set by this crate's build script
+// whenever the compiler is Trust (crates/aterm-log/clean_islands.rs), so the
+// island is kernel-checked at every Trust build, not only the verify lane.
+#[cfg(clean_islands)]
 macro_rules! verify_island {
     ($($tt:tt)*) => {
         $($tt)*
     };
 }
 
-#[cfg(not(trust_verify))]
+#[cfg(not(clean_islands))]
 macro_rules! verify_island {
     ($($tt:tt)*) => {};
 }

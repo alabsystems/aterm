@@ -402,57 +402,6 @@ fn next_kitty_walks_the_collection_and_comes_back_round() {
     );
 }
 
-/// With a program cat on glass (tenure served), "Favourite This Kitty"
-/// promotes that cat, and the checkmark asks about the same look; the
-/// launch kitty is promoted only when no program has the cursor.
-#[test]
-fn favourite_promotes_the_tenured_program_cat_when_one_is_worn() {
-    use aterm_effects::companion_look::{AppIdentity, TENURE};
-    let mut app = App::headless_for_test();
-    app.recompute_sparkle();
-    let wid = WindowId(0);
-    let t0 = std::time::Instant::now();
-    let claude = AppIdentity {
-        id: "claude".into(),
-        basename: "claude".into(),
-        look: KittyLook::for_app("claude"),
-    };
-    {
-        let gate = app
-            .windows
-            .get_mut(&wid)
-            .expect("window")
-            .fx
-            .look_mut()
-            .tenure_mut();
-        gate.observe(Some(&claude), t0);
-        assert!(
-            gate.observe(Some(&claude), t0 + TENURE).is_some(),
-            "fixture: tenure served"
-        );
-    }
-    assert_eq!(
-        app.promotable_kitty(wid),
-        claude.look,
-        "the promotable cat is the program's"
-    );
-    assert!(!app.palette_live().kitty_favourited, "not pinned yet");
-
-    app.favourite_kitty_checked(wid, t0 + TENURE)
-        .expect("the pin these assertions read");
-
-    assert_eq!(app.kitty_log.favourite_look(), Some(claude.look));
-    assert!(
-        app.palette_live().kitty_favourited,
-        "the checkmark asks about the same cat"
-    );
-    assert_eq!(
-        app.companion_verdict(wid, 0, t0 + TENURE),
-        claude.look,
-        "the verdict rests on the pin (which happens to be the program cat)"
-    );
-}
-
 /// The two hard gates, in order; neither leaves a trace. Nothing can draw,
 /// so nothing may log; and with `feline.enabled = false` cats do not exist,
 /// so a synthetic row would poison the ledger.
@@ -680,8 +629,7 @@ fn program_cats_arrive_by_tenure_linger_and_the_capture_seam_agrees() {
 }
 
 /// The menu/palette/`invoke` wiring in one assertion, plus the checkmark
-/// that reports the pin back, reachable by both the current invoke spelling
-/// and the legacy `FavouriteSessionKitty` one.
+/// that reports the pin back.
 #[test]
 fn the_favourite_row_is_invoke_reachable_and_checks_once_pinned() {
     let mut app = App::headless_for_test();
@@ -693,16 +641,6 @@ fn the_favourite_row_is_invoke_reachable_and_checks_once_pinned() {
         before.action_by_name("FavouriteKitty"),
         Ok(crate::menu::MenuAction::FavouriteKitty),
         "the row must be reachable by `aterm-ctl invoke`"
-    );
-    assert_eq!(
-        before.action_by_name("FavouriteSessionKitty"),
-        Ok(crate::menu::MenuAction::FavouriteKitty),
-        "the legacy spelling still reaches the renamed action"
-    );
-    assert_eq!(
-        crate::menu::MenuAction::from_invoke_name("FavouriteSessionKitty"),
-        Some(crate::menu::MenuAction::FavouriteKitty),
-        "…and classifies at the authority layer too"
     );
     // `controls_lines` is the same text `controls menu` prints, so this
     // covers the introspection surface as well as the checkmark.

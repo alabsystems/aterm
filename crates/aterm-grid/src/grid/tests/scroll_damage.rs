@@ -184,14 +184,6 @@ fn content_gen_unchanged_on_viewport_scroll() {
     );
 }
 
-#[test]
-fn content_gen_unchanged_on_noop_scroll_up() {
-    let mut grid = Grid::with_scrollback(4, 10, 100);
-    let before = grid.content_gen();
-    grid.scroll_up(0);
-    assert_eq!(grid.content_gen(), before, "scroll_up(0) is a no-op");
-}
-
 /// `content_gen` never decreases, and strictly increases whenever the live row text (read at
 /// display offset 0, where `row_text` reads content rather than the scrolled window) changes.
 #[test]

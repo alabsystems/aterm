@@ -16,7 +16,8 @@
 /// - Bit 12: subscript (SGR 74)
 /// - Bits 11+12: overline (SGR 53), exclusive with super/subscript
 /// - Bit 13: curly underline
-/// - Bit 14: USES_STYLE_ID (colors field stores a StyleId)
+/// - Bit 14: reserved, never set (it once marked a style-interned cell;
+///   `aterm-scrollback`'s `CellAttrs::VISUAL_FLAGS_MASK` still masks it)
 /// - Bit 15: COMPLEX (char_data is an overflow table index)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(transparent)]
@@ -63,16 +64,10 @@ impl CellFlags {
     /// Dashed underline (SGR 4:5) - encoded as DOUBLE_UNDERLINE | CURLY_UNDERLINE.
     pub const DASHED_UNDERLINE: Self = Self((1 << 8) | (1 << 13));
 
-    /// Cell uses StyleId instead of inline colors.
-    /// When set, the colors field stores a StyleId in its low 16 bits.
-    pub const USES_STYLE_ID: Self = Self(1 << 14);
     /// Complex character - char_data is an index into the overflow string table.
     pub const COMPLEX: Self = Self(1 << 15);
 
-    // Alacritty compatibility aliases, for consumers that opt into them.
-
-    /// All underline style flags combined (Alacritty compatibility).
-    #[cfg(feature = "alacritty-compat")]
+    /// All underline style flags combined.
     pub const ALL_UNDERLINES: Self = Self(
         Self::UNDERLINE.0
             | Self::DOUBLE_UNDERLINE.0
@@ -159,19 +154,51 @@ impl CellFlags {
         (self.0 & Self::COMPLEX.0) != 0
     }
 
-    /// Check if this cell uses StyleId instead of inline colors.
-    #[must_use]
-    #[inline]
-    pub const fn uses_style_id(&self) -> bool {
-        (self.0 & Self::USES_STYLE_ID.0) != 0
-    }
-
-    /// Get only the core flags (bits 0-13: without USES_STYLE_ID and COMPLEX).
+    /// Get only the core flags (bits 0-13: without the reserved bit 14 and
+    /// COMPLEX).
     #[must_use]
     #[inline]
     #[cfg(test)]
     pub const fn core_flags(&self) -> Self {
         Self(self.0 & Self::VISUAL_FLAGS_MASK)
+    }
+
+    /// The SGR parameter selecting this rendition's underline style (`4`, or
+    /// `4:2` to `4:5`), if it has one. The composite styles share bits with the
+    /// singletons (DASHED = DOUBLE | CURLY, DOTTED = UNDERLINE | CURLY), so they
+    /// are tested first. DECRQSS and the screen serializer both encode with it.
+    #[must_use]
+    pub const fn underline_sgr(self) -> Option<&'static str> {
+        if self.contains(Self::DASHED_UNDERLINE) {
+            Some("4:5")
+        } else if self.contains(Self::DOTTED_UNDERLINE) {
+            Some("4:4")
+        } else if self.contains(Self::CURLY_UNDERLINE) {
+            Some("4:3")
+        } else if self.contains(Self::DOUBLE_UNDERLINE) {
+            Some("4:2")
+        } else if self.contains(Self::UNDERLINE) {
+            Some("4")
+        } else {
+            None
+        }
+    }
+
+    /// The SGR parameter for this rendition's overline (`53`), superscript
+    /// (`73`) or subscript (`74`), if any. OVERLINE is SUPERSCRIPT | SUBSCRIPT,
+    /// so it is tested first. DECRQSS and the screen serializer both encode
+    /// with it.
+    #[must_use]
+    pub const fn overline_or_script_sgr(self) -> Option<&'static str> {
+        if self.contains(Self::OVERLINE) {
+            Some("53")
+        } else if self.contains(Self::SUPERSCRIPT) {
+            Some("73")
+        } else if self.contains(Self::SUBSCRIPT) {
+            Some("74")
+        } else {
+            None
+        }
     }
 
     /// Mask for the extended flags (bits 11-13).
@@ -195,8 +222,8 @@ impl CellFlags {
     /// bits 0-8 and 11-13, every visual attribute and nothing else.
     ///
     /// Excluded: `WIDE` (bit 9, the spacer is never a lead); bit 10 (the
-    /// spacer's own role bit, which aliases PROTECTED); `USES_STYLE_ID` and
-    /// `COMPLEX` (bits 14-15, storage discriminants the spacer's constructor
+    /// spacer's own role bit, which aliases PROTECTED); the reserved bit 14
+    /// and `COMPLEX` (bit 15, a storage discriminant the spacer's constructor
     /// owns).
     pub const SPACER_RENDITION_MASK: u16 =
         Self::VISUAL_FLAGS_MASK & !(Self::WIDE.0 | Self::WIDE_CONTINUATION.0);
@@ -296,7 +323,6 @@ mod tests {
                 CellFlags::CURLY_UNDERLINE.bits(),
                 1 << 13,
             ),
-            ("USES_STYLE_ID", CellFlags::USES_STYLE_ID.bits(), 1 << 14),
             ("COMPLEX", CellFlags::COMPLEX.bits(), 1 << 15),
             // Combo encodings: two bits each, no bit of their own.
             (
@@ -352,7 +378,7 @@ mod tests {
             CellFlags::VISUAL_FLAGS_MASK,
             0x00FF,
             (CellFlags::BOLD | CellFlags::ITALIC).bits(),
-            (CellFlags::BOLD | CellFlags::COMPLEX | CellFlags::USES_STYLE_ID).bits(),
+            (CellFlags::BOLD | CellFlags::COMPLEX).bits(),
             (CellFlags::BOLD | CellFlags::SUPERSCRIPT | CellFlags::CURLY_UNDERLINE).bits(),
         ]);
 
@@ -361,13 +387,9 @@ mod tests {
             let copy = f;
             assert_eq!(copy, f, "{a:#06x}: Copy");
             assert_eq!(f.bits(), a, "{a:#06x}: from_bits round trip");
+            assert_eq!((!f).bits(), !a, "{a:#06x}: !");
             assert_eq!(f.is_empty(), a == 0, "{a:#06x}: is_empty");
             assert_eq!(f.is_complex(), a & 0x8000 != 0, "{a:#06x}: is_complex");
-            assert_eq!(
-                f.uses_style_id(),
-                a & 0x4000 != 0,
-                "{a:#06x}: uses_style_id"
-            );
             assert_eq!(f.core_flags().bits(), a & 0x3FFF, "{a:#06x}: core_flags");
             assert_eq!(
                 f.extended_flags().bits(),
@@ -392,69 +414,15 @@ mod tests {
                 let mut removed = f;
                 removed.remove(g);
                 assert_eq!(removed.bits(), a & !b, "{pair}: remove");
+                assert_eq!((f | g).bits(), a | b, "{pair}: |");
+                assert_eq!((f & g).bits(), a & b, "{pair}: &");
+                let mut or_assigned = f;
+                or_assigned |= g;
+                assert_eq!(or_assigned.bits(), a | b, "{pair}: |=");
+                let mut and_assigned = f;
+                and_assigned &= g;
+                assert_eq!(and_assigned.bits(), a & b, "{pair}: &=");
             }
         }
-    }
-
-    // ---- contains: the combo flags need every one of their bits ----
-
-    #[test]
-    fn contains_requires_all_bits() {
-        let f = CellFlags::SUPERSCRIPT; // only bit 11
-        assert!(!f.contains(CellFlags::OVERLINE));
-    }
-
-    #[test]
-    fn contains_combo_flag() {
-        let f = CellFlags::OVERLINE;
-        assert!(f.contains(CellFlags::SUPERSCRIPT));
-        assert!(f.contains(CellFlags::SUBSCRIPT));
-        assert!(f.contains(CellFlags::OVERLINE));
-    }
-
-    // ---- Bitwise operators ----
-
-    #[test]
-    fn bitor_operator() {
-        let f = CellFlags::BOLD | CellFlags::DIM;
-        assert!(f.contains(CellFlags::BOLD));
-        assert!(f.contains(CellFlags::DIM));
-    }
-
-    #[test]
-    fn bitand_operator() {
-        let f = (CellFlags::BOLD | CellFlags::DIM) & CellFlags::BOLD;
-        assert!(f.contains(CellFlags::BOLD));
-        assert!(!f.contains(CellFlags::DIM));
-    }
-
-    #[test]
-    fn bitand_disjoint_is_empty() {
-        let f = CellFlags::BOLD & CellFlags::DIM;
-        assert!(f.is_empty());
-    }
-
-    #[test]
-    fn not_operator() {
-        let f = !CellFlags::empty();
-        assert_eq!(f.bits(), 0xFFFF);
-        let f2 = !f;
-        assert!(f2.is_empty());
-    }
-
-    #[test]
-    fn bitor_assign_operator() {
-        let mut f = CellFlags::BOLD;
-        f |= CellFlags::ITALIC;
-        assert!(f.contains(CellFlags::BOLD));
-        assert!(f.contains(CellFlags::ITALIC));
-    }
-
-    #[test]
-    fn bitand_assign_operator() {
-        let mut f = CellFlags::BOLD | CellFlags::ITALIC;
-        f &= CellFlags::BOLD;
-        assert!(f.contains(CellFlags::BOLD));
-        assert!(!f.contains(CellFlags::ITALIC));
     }
 }

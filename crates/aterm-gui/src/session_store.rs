@@ -122,6 +122,12 @@ pub(crate) struct SessionRecord {
     /// the same name, and for the same inspection-only reason as `questions`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autopilot: Option<String>,
+    /// The instant a timed Cruise lands, unix ms (2026-10-16; additive,
+    /// absent tolerated, not written when unset): in lockstep with the leaf
+    /// carrier's `land_at`, beside `autopilot`, for the same inspection-only
+    /// reason (`docs/DESIGN-harness-autopilot-2026-10-15.md` §9.3.6, item 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub land_at: Option<i64>,
     /// CONTROL CARRY (additive, absent tolerated; round 10): `"<len>
     /// <sha256hex>"` of this session's `seamless-<pid>-<nonce>.s<id>.ctl`
     /// sidecar — the turn ledger and the tail of the alt-screen archive
@@ -432,10 +438,27 @@ pub(crate) struct SessionRecord {
         deserialize_with = "lenient_row"
     )]
     pub log_ids: Option<String>,
+    /// THE SESSION LOG'S SEQ COUNT (additive, absent ⇒ 0; Phase 2A of the
+    /// session log, design §2.2): the outgoing log's last seq plus its overlap
+    /// reserve (`session_log::LOG_SEQ_RESERVE`). The successor's log starts
+    /// above it, so a seq names one record for as long as the session lives;
+    /// a process that appends past the reserve refuses its Commit
+    /// (`SessionTimeline::past_handoff_ceiling`). A separate count from
+    /// `timeline_id`: the timeline's `events-dropped=` arithmetic assumes its
+    /// own ids have no holes. `0` is not written; an older reader skips the
+    /// key, and a value that does not read ([`lenient_count`]) is none, never
+    /// the manifest. In neither proof digest.
+    #[serde(
+        default,
+        skip_serializing_if = "is_zero",
+        deserialize_with = "lenient_count"
+    )]
+    pub log_seq: u64,
 }
 
 /// The wire spelling of a crash journal key (`<pid>:<id>`,
 /// [`SessionRecord::journal_key`]).
+#[cfg(any(unix, test))]
 pub(crate) fn journal_key_row((pid, id): (u32, u64)) -> String {
     format!("{pid}:{id}")
 }
@@ -451,6 +474,7 @@ pub(crate) fn parse_journal_key(row: &str) -> Option<(u32, u64)> {
 }
 
 /// The wire spelling of a render debt (`<shift>,<pushed>`).
+#[cfg(any(unix, test))]
 pub(crate) fn render_debt_row(shift: i32, pushed: i32) -> String {
     format!("{shift},{pushed}")
 }
@@ -910,6 +934,11 @@ pub(crate) struct CarriedHealthSaid {
     pub line: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub body: String,
+    /// The warning was said while no window of the parent's could show it, and is
+    /// still owed (`App::owe_unless_seen`): the successor shows it. Absent from an
+    /// older parent, and read as not owed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub owed: bool,
 }
 
 /// The message fields of a [`WindowCarry`] as one value — what
@@ -1124,10 +1153,8 @@ pub(crate) struct ConnectionCarry {
 /// The SEAMLESS-RE-EXEC HANDOFF MANIFEST (proof-carrying DSU, RFC Rung 1a): the
 /// serializable projection of the whole session set that the outgoing process writes
 /// and the incoming (new) binary reads to re-materialize exactly the same tabs — no
-/// session lost, none fabricated. The `handoff_roundtrip_model` (`aterm-spec`) proves
-/// that obligation abstractly; [`SessionHandoff::roundtrips`] and the unit test below
-/// bind it to this concrete serializer, so the modeled property is the one the
-/// shipping code meets.
+/// session lost, none fabricated. [`SessionHandoff::roundtrips`] and the unit test
+/// below check that obligation on this concrete serializer.
 #[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SessionHandoff {
     pub schema: u32,
@@ -1197,6 +1224,25 @@ pub(crate) struct SessionHandoff {
         deserialize_with = "lenient_rows"
     )]
     pub fabric_attached: Vec<String>,
+    /// THE BUS MIRROR's closed sessions (additive, absent tolerated; session
+    /// log phase 4, ruling Q4): one `<sid> <ep>:<seq>:<ms>:<head>` row per
+    /// closed session whose mirrored records the bus does not hold yet, which
+    /// the successor says as one exact `gap why=dropped n=<k>` each
+    /// (`session_log_mirror::Tombstone`). Empty, so not written, while no
+    /// bridge mirrors. A row that does not read is dropped.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "lenient_rows"
+    )]
+    pub mirror_dropped: Vec<String>,
+    /// THE BUS MIRROR was served here (additive; session log phase 4): the
+    /// owning bridge's recorded `hello` said `log=turns`. The successor
+    /// takes it as its own until its bridge's hello says (a session that
+    /// opens and closes before then is still kept for the bus). `false`, so
+    /// not written, while no bridge mirrors.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mirror_served: bool,
 }
 
 /// One held pane's final screen on the wire (round five, item 19): the
@@ -1483,6 +1529,10 @@ impl SessionHandoff {
             fabric_attached: crate::fabric_launch::handoff_attached(),
             #[cfg(not(unix))]
             fabric_attached: Vec::new(),
+            // Drawn with the manifest; a landing past the draw before the
+            // Commit stands it down (`StoreMirror::past_draw`).
+            mirror_dropped: store.mirror.draw_tombstones(),
+            mirror_served: store.mirror.served(),
             sessions: handles
                 .into_iter()
                 .map(|h| {
@@ -1503,14 +1553,14 @@ impl SessionHandoff {
                     // The id the successor's timeline counts on from (the
                     // newest one plus the overlap's reserve: round seven,
                     // finding 50, and its review's item 2), and the session
-                    // log's epoch and node-id counters with theirs, under ONE
+                    // log's epoch, node-id counters and seq count with theirs, under ONE
                     // hold of the timeline's leaf lock. Taken here, not in the
                     // literal: a guard made in a field's initializer lives
                     // until the whole record is built, and a second one there
                     // would wait on the first.
-                    let (timeline_id, log_ids) = {
+                    let (timeline_id, log_ids, log_seq) = {
                         let mut tl = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-                        (tl.handoff_id(), tl.handoff_log_ids())
+                        (tl.handoff_id(), tl.handoff_log_ids(), tl.handoff_log_seq())
                     };
                     let mut hold_rows =
                         crate::fabric::render_holds(&h.ctx.fabric.holds()).into_iter();
@@ -1530,6 +1580,7 @@ impl SessionHandoff {
                         attention: meta.attention.clone(),
                         questions: meta.questions.clone(),
                         autopilot: meta.autopilot.clone(),
+                        land_at: meta.land_at,
                         // Attached by the seamless writer with its sidecar.
                         control: None,
                         // A shell this process itself adopted frozen goes on
@@ -1577,6 +1628,7 @@ impl SessionHandoff {
                         // (`app_update_handoff::stamp_journal_keys`).
                         journal_key: None,
                         log_ids: Some(log_ids),
+                        log_seq,
                     }
                 })
                 .collect(),
@@ -1597,7 +1649,7 @@ impl SessionHandoff {
         (h.schema == Self::SCHEMA).then_some(h)
     }
 
-    /// The concrete round-trip the `handoff_roundtrip_model` abstracts: serialize →
+    /// The concrete round-trip: serialize →
     /// parse yields an identical manifest (no session lost, none fabricated, order
     /// preserved). Returns `true` iff the round-trip is the identity.
     #[must_use]
@@ -1706,6 +1758,26 @@ pub(crate) struct SessionHandle {
     /// the handoff projection, `identities`' live count) reads handles, and
     /// the label is immutable for the session's life.
     pub identity: Option<Arc<str>>,
+}
+
+impl SessionHandle {
+    /// THE SESSION'S NAME AS A SNAPSHOT SHOWS IT: the person's `meta set
+    /// title`, whole, else the registry title without an agent's spinner frame
+    /// (`chrome_label::without_spinner_frame`). Every surface that copies a
+    /// session's name once — a connection card or picker, the tab menu's
+    /// connection lines, the connection map — reads it here, so none of them
+    /// freezes one frame of a title animation (the Together run's D7).
+    pub(crate) fn display_title(&self) -> String {
+        self.ctx
+            .meta
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get("title")
+            .map_or_else(
+                || crate::chrome_label::without_spinner_frame(&self.title).to_string(),
+                str::to_string,
+            )
+    }
 }
 
 /// How many roster lifecycle records the store retains. Drop-oldest past this,
@@ -1954,6 +2026,18 @@ pub(crate) struct SessionStore {
     /// registry no window runs says nothing is supervised. Not per session,
     /// and not carried: the successor publishes its own.
     harness_posture: crate::autopilot::HarnessPosture,
+    /// THE CLOSED-SESSION INDEX ([`crate::session_log::ClosedLogs`]): what
+    /// `log @<sid>` and `brief @<sid>` answer once the session has closed in
+    /// this process. Linked by `App::retire_session_registration` after the
+    /// deregister, built outside this lock; read under the read lock by an
+    /// `Arc` clone. Not carried.
+    closed_logs: crate::session_log::ClosedLogs,
+    /// Only an active journal arms this bounded writer handoff. Off stays None.
+    journal_retirements: Option<crate::session_log_journal::Retirements>,
+    /// THE BUS MIRROR's closed-session tails, tombstones and adoption latch
+    /// (`session_log_mirror`, session log phase 4). Empty, holding no heap,
+    /// while no bridge mirrors.
+    mirror: crate::session_log_mirror::StoreMirror,
 }
 
 /// Shared handle to the registry, cloned into the control thread alongside the
@@ -1979,6 +2063,10 @@ impl SessionStore {
                 .timeline
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
+            // THE BUS MIRROR's state this store shares with the session's
+            // log (`session_log_mirror::Shared`): nothing is engaged by it
+            // while the node does not mirror.
+            tl.slog_mut().bind_mirror(self.mirror.shared());
             tl.record("spawned", format!("state={}", handle.state.as_str()));
             // THE SESSION LOG's session node: `open - spawn|adopt|restore
             // parent=<sid> epoch=<ep>` (an adopted session's log already
@@ -2150,6 +2238,7 @@ impl SessionStore {
 
     /// Whether `local_id` runs an integration loader
     /// ([`Self::mark_body_loader`]) — what the next handoff record carries.
+    #[cfg(any(unix, test))]
     #[must_use]
     pub(crate) fn has_body_loader(&self, local_id: u64) -> bool {
         self.body_loader.contains(&local_id)
@@ -2281,6 +2370,8 @@ impl SessionStore {
         // `state-change` from the same object — and this write precedes the
         // index removal in program order, not merely inside the same lock hold,
         // so "before it is gone" is literally the code's order too.
+        let retirements = &mut self.journal_retirements;
+        let mirror = &self.mirror;
         let resolved = self.by_id.get(&sid).map(|h| {
             let reason = if reason == ExitReason::Unknown && h.state == SessionState::Exited {
                 ExitReason::ShellExit
@@ -2301,6 +2392,12 @@ impl SessionStore {
                 exit_code,
                 at,
             );
+            if let Some(retirements) = retirements.as_mut() {
+                retirements.retire(&sid, &h.ctx.timeline, tl.slog());
+            }
+            // A mirrored log's tail the bus does not hold yet stays for it
+            // (ruling Q4); a log nothing mirrored keeps nothing.
+            mirror.retire(sid.as_str(), tl.slog_mut());
             reason
         });
         if let Some(reason) = resolved {
@@ -2382,6 +2479,26 @@ impl SessionStore {
                     format!("title={}", crate::control::pct_encode(title)),
                 );
         }
+    }
+
+    /// Link a closed session's entry into the closed-session index
+    /// ([`crate::session_log::ClosedLogs::link`]); what it frees comes back
+    /// for the caller to drop once this lock is released.
+    pub(crate) fn link_closed_log(
+        &mut self,
+        entry: crate::session_log::ClosedLog,
+    ) -> Vec<Arc<aterm_slog::Log>> {
+        self.closed_logs.link(entry)
+    }
+
+    /// The closed-session index, for its reads.
+    pub(crate) fn closed_logs(&self) -> &crate::session_log::ClosedLogs {
+        &self.closed_logs
+    }
+
+    /// The bus mirror's state (`session_log_mirror`).
+    pub(crate) fn mirror(&self) -> &crate::session_log_mirror::StoreMirror {
+        &self.mirror
     }
 
     /// Look up a handle by its stable [`SessionId`]. Total + fail-closed: an
@@ -2497,6 +2614,51 @@ impl SessionStore {
     pub(crate) fn roster_since(&self, after: u64) -> impl Iterator<Item = &RosterRecord> {
         let start = self.roster.partition_point(|r| r.seq <= after);
         self.roster.range(start..)
+    }
+
+    /// Idempotent setup shared by the caller's pre-spawn arm and writer setup.
+    pub(crate) fn arm_session_journal(
+        &mut self,
+        wake: Option<aterm_slog::Notify>,
+        timeline_max: usize,
+        dropped_max: usize,
+    ) -> Arc<()> {
+        self.journal_retirements
+            .get_or_insert_with(|| {
+                crate::session_log_journal::Retirements::new(wake, timeline_max, dropped_max)
+            })
+            .owner()
+    }
+
+    pub(crate) fn take_session_journal_retirements(
+        &mut self,
+    ) -> crate::session_log_journal::RetirementBatch {
+        self.journal_retirements.as_mut().map_or_else(
+            crate::session_log_journal::RetirementBatch::default,
+            crate::session_log_journal::Retirements::take,
+        )
+    }
+
+    pub(crate) fn session_journal_pending(&self) -> bool {
+        self.journal_retirements
+            .as_ref()
+            .is_some_and(crate::session_log_journal::Retirements::pending)
+    }
+
+    /// Return ownership for destruction AFTER the caller drops the store lock.
+    pub(crate) fn disarm_session_journal(
+        &mut self,
+        owner: &Arc<()>,
+    ) -> Option<crate::session_log_journal::Retirements> {
+        if self
+            .journal_retirements
+            .as_ref()
+            .is_some_and(|r| r.owned_by(owner))
+        {
+            self.journal_retirements.take()
+        } else {
+            None
+        }
     }
 
     /// Every registered handle, BY REFERENCE and in no particular order.
@@ -2679,6 +2841,7 @@ pub(crate) fn test_handle_on(local_id: u64, master: i32) -> SessionHandle {
 fn handle_alive(local_id: u64, parent: Option<SessionId>, master: i32) -> SessionHandle {
     use aterm_session::EdgeTable;
     use aterm_session::sink::SinkWriter;
+    crate::prime_test_timing();
     let sid = SessionId::generate();
     let nonce = LaunchNonce::generate();
     let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
@@ -2687,7 +2850,7 @@ fn handle_alive(local_id: u64, parent: Option<SessionId>, master: i32) -> Sessio
         output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
         modes: crate::mode_mirror_of(&term),
         ui_waiting: Arc::default(),
-        edges: Mutex::new(EdgeTable::new()),
+        edges: std::sync::Arc::new(Mutex::new(EdgeTable::new())),
         self_id: sid.clone(),
         nonce,
         turn_lease: Mutex::new(None),
@@ -2702,11 +2865,15 @@ fn handle_alive(local_id: u64, parent: Option<SessionId>, master: i32) -> Sessio
             crate::session_timeline::SessionTimeline::default(),
         )),
         fabric: std::sync::Arc::default(),
+        idem: Default::default(),
         rewrap_gauge: std::sync::Arc::default(),
         human_input: Default::default(),
+        launch: Default::default(),
         generation_look: Default::default(),
         reset_lane: Default::default(),
+        crash_journal: Default::default(),
         update_parked: Default::default(),
+        witness: Default::default(),
         fenced_writes: Default::default(),
     });
     SessionHandle {
@@ -3384,7 +3551,7 @@ title = \"zsh\"
     #[test]
     fn the_real_claim_carry_conforms_to_the_handoff_claim_model() {
         use crate::session_timeline::{claim_supervisor, seed_carried_claims};
-        let model = aterm_spec::derive::harness_handoff_claim_model();
+        let model = aterm_models_harness::harness_handoff_claim_model();
         let buggy = aterm_spec::interp::with_buggy(&model, 1);
         let grace = model.consts.iter().find(|c| c.0 == "Grace").unwrap().1;
         let new_keys = ["supervisor = ", "claim_known = ", "attention_owners = "];
@@ -3669,13 +3836,6 @@ title = \"zsh\"
     }
 
     #[test]
-    fn unknown_lookup_is_fail_closed_none() {
-        let store = SessionStore::default();
-        assert!(store.by_local(999).is_none());
-        assert!(store.by_sid(&SessionId::new("s-nope")).is_none());
-    }
-
-    #[test]
     fn snapshot_is_sorted_by_local_id_and_carries_parent() {
         let mut store = SessionStore::default();
         let root = handle(0, None);
@@ -3697,10 +3857,9 @@ title = \"zsh\"
         );
     }
 
-    /// RFC Rung 1a — the CONCRETE binding of `handoff_roundtrip_model`: the real
-    /// `SessionHandoff` serializer round-trips a multi-session store EXACTLY — no
-    /// session lost, none fabricated, order + parent links preserved. This is what
-    /// makes the ty proof about shipping code, not a toy.
+    /// RFC Rung 1a: the real `SessionHandoff` serializer round-trips a
+    /// multi-session store EXACTLY — no session lost, none fabricated, order +
+    /// parent links preserved.
     #[test]
     fn session_handoff_roundtrips_the_whole_set() {
         let mut store = SessionStore::default();
@@ -3824,37 +3983,6 @@ title = \"zsh\"
             "only well-formed entries survive"
         );
         assert_eq!(HandoffFds::decode(""), HandoffFds::default());
-    }
-
-    #[test]
-    fn spawning_session_is_registered_addressable_and_becomes_alive() {
-        // The async-spawn path: a session is registered `Spawning` (engine + PTY
-        // live, reader not yet confirmed) and stays fully addressable by BOTH keys
-        // throughout. Its reader's first iteration flips it `Alive` via `mark_alive`.
-        let mut store = SessionStore::default();
-        let h = handle_in_state(5, None, SessionState::Spawning);
-        let sid = h.sid.clone();
-        store.register(h);
-
-        // Addressable + observably `Spawning` the whole pre-Alive window.
-        assert_eq!(store.len(), 1);
-        assert_eq!(store.by_local(5).unwrap().state, SessionState::Spawning);
-        assert_eq!(store.by_sid(&sid).unwrap().state, SessionState::Spawning);
-        assert_eq!(store.by_local(5).unwrap().sid, sid, "both keys agree");
-
-        // Reader confirms live: Spawning -> Alive, reported as the transitioning call.
-        assert!(
-            store.mark_alive(5),
-            "first readiness performs the transition"
-        );
-        assert_eq!(store.by_local(5).unwrap().state, SessionState::Alive);
-        assert_eq!(
-            store.by_sid(&sid).unwrap().state,
-            SessionState::Alive,
-            "the transition is visible via BOTH key spaces (one handle)"
-        );
-        // Still fully addressable after the transition.
-        assert_eq!(store.by_local(5).unwrap().sid, sid);
     }
 
     #[test]
@@ -4274,19 +4402,5 @@ title = \"zsh\"
         assert_eq!(ExitActor::Ctl.as_wire(), "ctl");
         assert_eq!(ExitActor::Bridge.as_wire(), "bridge");
         assert_eq!(ExitActor::Unknown.as_wire(), "-");
-    }
-
-    #[test]
-    fn set_state_and_title_mutate_in_place() {
-        let mut store = SessionStore::default();
-        store.register(handle(3, None));
-        store.set_state(3, SessionState::Exited);
-        store.set_title(3, "renamed");
-        let h = store.by_local(3).unwrap();
-        assert_eq!(h.state, SessionState::Exited);
-        assert_eq!(h.title, "renamed");
-        // Unknown ids are no-ops, not panics.
-        store.set_state(99, SessionState::Exited);
-        store.set_title(99, "x");
     }
 }

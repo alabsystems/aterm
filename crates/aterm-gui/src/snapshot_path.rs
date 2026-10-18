@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use crate::control_auth;
 
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 fn default_snapshot_file_name(pid: u32) -> String {
     format!("aterm_snapshot-{pid}.png")
 }
@@ -44,14 +44,14 @@ pub(crate) fn resolve() -> Option<String> {
     }
 }
 
-// The two wrappers below — and the lexical-absolutization helper they share —
+// The wrapper below — and the lexical-absolutization helper it uses —
 // have no production caller left: the snapshot writer now pins the directory
 // itself and keeps the handle across the whole PNG/.txt/.done generation
 // (`app_introspect::begin_snapshot_generation`), so it cannot re-derive the
 // parent per file. They are kept, compiled for the TEST build only, because
 // they are the smallest harness that drives the pinned-writer contract this
 // module depends on end to end: `0600` on creation, mode re-tightened on
-// overwrite, `O_NOFOLLOW` on the final component, and single-component names.
+// overwrite, and `O_NOFOLLOW` on the final component.
 // Shipping them would be unreachable code in the binary.
 #[cfg(test)]
 fn absolute_lexical(path: &Path) -> std::io::Result<PathBuf> {
@@ -100,21 +100,6 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     file.validate_path_identity()
 }
 
-/// Compatibility wrapper for a single child of an already-authorized
-/// directory. All mutation is relative to a retained directory handle.
-#[cfg(test)]
-pub(crate) fn write_private_at(
-    dir: &Path,
-    file_name: &std::ffi::OsString,
-    bytes: &[u8],
-) -> std::io::Result<()> {
-    let dir = crate::pinned_dir::PinnedDir::open_resolved(&absolute_lexical(dir)?)?;
-    let file = dir.write_private(file_name, bytes)?;
-    dir.sync()?;
-    dir.validate_path_identity()?;
-    file.validate_path_identity()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,38 +107,9 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-    #[test]
-    fn default_snapshot_name_is_per_process() {
-        assert_eq!(
-            default_snapshot_file_name(42),
-            "aterm_snapshot-42.png",
-            "parallel aterm instances must never share a completion marker"
-        );
-    }
-
     #[cfg(unix)]
     #[test]
-    fn write_private_at_creates_inside_dir_via_openat() {
-        let dir = std::env::temp_dir().join(format!("aterm-snap-at-{}", std::process::id()));
-        ensure_private_dir(&dir).unwrap();
-        let name = std::ffi::OsString::from("shot.png");
-        write_private_at(&dir, &name, b"png-bytes").unwrap();
-        let path = dir.join(&name);
-        assert_eq!(std::fs::read(&path).unwrap(), b"png-bytes");
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
-        // Overwrite truncates and re-tightens.
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        write_private_at(&dir, &name, b"x").unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"x");
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn write_private_at_refuses_symlinked_final_component() {
+    fn write_private_refuses_symlinked_final_component() {
         // A symlink planted at the final name must NOT be followed (O_NOFOLLOW):
         // the write must fail rather than clobber the link target.
         use std::os::unix::fs::symlink;
@@ -162,9 +118,8 @@ mod tests {
         let victim = dir.join("victim.txt");
         std::fs::write(&victim, b"original").unwrap();
         symlink(&victim, dir.join("evil.png")).unwrap();
-        let name = std::ffi::OsString::from("evil.png");
         assert!(
-            write_private_at(&dir, &name, b"attack").is_err(),
+            write_private(&dir.join("evil.png"), b"attack").is_err(),
             "writing through a symlinked final component must be refused",
         );
         // The victim is untouched.
@@ -194,15 +149,6 @@ mod tests {
             "writing through a reparse point must be refused",
         );
         assert_eq!(std::fs::read(&victim).unwrap(), b"original");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn write_private_at_rejects_multi_component_name() {
-        let dir = std::env::temp_dir().join(format!("aterm-snap-at-multi-{}", std::process::id()));
-        ensure_private_dir(&dir).unwrap();
-        let name = std::ffi::OsString::from("sub/shot.png");
-        assert!(write_private_at(&dir, &name, b"x").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

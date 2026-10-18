@@ -327,6 +327,7 @@ impl Deferred {
     }
 
     /// THE COMMIT: write every held key; later ones are written at once.
+    #[cfg(unix)]
     pub(crate) fn release(&self) {
         let queue = self
             .held

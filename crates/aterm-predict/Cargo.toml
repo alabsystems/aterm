@@ -18,7 +18,14 @@ aterm-grapheme = { workspace = true }
 aterm-time = { workspace = true }
 
 [dev-dependencies]
+# The headless engine the safety theorem (`tests/reconciled_view_safety.rs`) folds
+# real program output through: the authoritative screen a prediction overlays is
+# aterm-core's, read the way the GUI reads it. A dev-dependency only, so the
+# shipped crate and the wasm closure stay engine-free.
+aterm-core = { workspace = true }
 aterm-spec = { workspace = true }
+# The models its tests drive (a model edit rebuilds only their tests).
+aterm-models-core = { workspace = true }
 
 [lints]
 workspace = true

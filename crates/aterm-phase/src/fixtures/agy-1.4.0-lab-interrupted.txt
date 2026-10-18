@@ -1,0 +1,26 @@
+# agy 1.4.0 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Antigravity CLI, launched by path with a scratch `HOME` whose settings name the Gemini API provider, its Google hosts black-holed, a fake `GEMINI_API_KEY` and `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:<port>` (a local stub of the Gemini API, crates/aterm-lab) · a `slow` turn interrupted by one Esc 2 s after its first thought drew
+
+      ▄▀▀▄        Antigravity CLI 1.4.0
+     ▀▀▀▀▀▀       Gemini API key
+    ▀▀▀▀▀▀▀▀      Gemini 3.1 Pro (Low)
+   ▄▀▀    ▀▀▄     /private/tmp/at.lpPV/proj
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+> think slowly
+
+▸ Thought for 16s
+  tick 15
+  tick 16 tick 17 tick 18 tick 19 tick 20 tick 21 tick 22 tick 23 tick 24 tick 25 tick 26 tick 27 tick 28 tick 29 tick 30
+
+────────────────────────────────────────────────────────────
+> think slowly again
+
+▸ Thought for 3s
+  tick 3
+
+  ⎿  Interrupted · What should Antigravity CLI do instead?
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts                                                                                                             Gemini 3.1 Pro · low

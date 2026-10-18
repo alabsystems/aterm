@@ -46,13 +46,12 @@ mod source;
 mod sys;
 
 pub use hash::sha256_file;
-#[cfg(all(unix, not(target_os = "linux")))]
-pub use hash::{shasum_command, shasum_digest};
 pub use http::{
-    HeadAnswer, HttpError, RELEASE_ASSET_DOWNLOAD_BOUND, VendorResponse, download_bytes,
+    FirstHead, HeadAnswer, HttpError, RELEASE_ASSET_DOWNLOAD_BOUND, VendorResponse, download_bytes,
     download_error_is_local_write, download_error_is_not_found, download_error_is_rate_limit,
     download_to, download_to_resumable, download_to_resumable_https_only, head_no_redirect,
-    head_no_redirect_quick, vendor_content_length, vendor_download_to, vendor_get, vendor_get_hint,
+    head_no_redirect_again, head_no_redirect_first, head_no_redirect_quick, note_link_down,
+    vendor_content_length, vendor_download_to, vendor_get, vendor_get_hint,
 };
 pub use manifest::{Manifest, SUPPORTED_SCHEMA};
 pub use privatedir::ensure_private_dir;

@@ -4,7 +4,9 @@
 // Added by the aterm project in 2026 to its copy of winit 0.30.13
 // (see the repository NOTICE).
 
-// Modified by the aterm project in 2026; see the repository NOTICE.
+// Modified by the aterm project in 2026; see the repository NOTICE. (The wake pipe and the
+// deadline rounding moved to `common::poll`, which the X11 loop shares:
+// docs/AUDIT-third-party-2026-10-15.md, LW.7.)
 
 // A display-free event loop, selected explicitly with `with_headless`.
 // It never connects to X11 or Wayland or silently substitutes for a failed display.
@@ -16,7 +18,6 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::marker::PhantomData;
-use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -26,76 +27,19 @@ use crate::event_loop::{ActiveEventLoop as RootELW, ControlFlow, DeviceEvents, E
 use crate::platform::pump_events::PumpStatus;
 use crate::window::{CustomCursor, CustomCursorSource};
 
+use super::common::poll::{self, Waker};
 use super::{MonitorHandle, OwnedDisplayHandle};
 
-/// The wake pipe. A proxy writes one byte; the loop polls the read end and drains it.
-///
-/// A PIPE rather than a condvar because `EventLoop` must answer `AsFd`/`AsRawFd` — an
-/// embedder may select on the loop alongside its own sources, and a backend that could
-/// only panic there would be a worse answer than no backend at all. The same object
-/// therefore serves both obligations.
-///
-/// The write end is `O_NONBLOCK`: once a byte is pending the loop is already going to
-/// wake, so a full pipe (`EAGAIN`) means the wake is redundant, not lost. That is what
-/// makes `send_event` safe to call from any thread without ever blocking the sender.
-struct WakePipe {
-    read: OwnedFd,
-    write: Arc<OwnedFd>,
-}
-
-impl WakePipe {
-    fn new() -> std::io::Result<Self> {
-        let mut fds = [0 as libc::c_int; 2];
-        // SAFETY: `fds` is a live two-element array, which is what pipe2 writes.
-        let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: both fds were just created by pipe2 and are owned exclusively here.
-        unsafe {
-            Ok(Self {
-                read: OwnedFd::from_raw_fd(fds[0]),
-                write: Arc::new(OwnedFd::from_raw_fd(fds[1])),
-            })
-        }
-    }
-
-    /// Drain every pending wake byte. The pipe carries no information beyond "something
-    /// was posted" — the payload lives in the user-event queue — so the loop only needs
-    /// the fd to stop being readable.
-    fn drain(&self) {
-        let mut buf = [0u8; 64];
-        loop {
-            // SAFETY: reading into a live local buffer from an owned fd.
-            let n =
-                unsafe { libc::read(self.read.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-            // Anything other than a full buffer means the pipe is empty (or would block),
-            // and an error here is either EAGAIN (empty) or EINTR (retry is pointless —
-            // the next poll will see it again).
-            if n < buf.len() as isize {
-                break;
-            }
-        }
-    }
-}
-
-/// Post one wake byte. Ignores `EAGAIN`: see [`WakePipe`].
-fn poke(write: &OwnedFd) {
-    let byte = 1u8;
-    // SAFETY: writing one byte from a live local to an owned, non-blocking fd.
-    unsafe {
-        libc::write(write.as_raw_fd(), std::ptr::addr_of!(byte).cast(), 1);
-    }
-}
-
+/// A proxy's half of the loop: the queue carries the events, the waker only "something
+/// was posted" (`common::poll::Waker`, which never blocks the sender).
 pub struct EventLoopProxy<T: 'static> {
     queue: Arc<Mutex<VecDeque<T>>>,
-    write: Arc<OwnedFd>,
+    waker: Waker,
 }
 
 impl<T: 'static> Clone for EventLoopProxy<T> {
     fn clone(&self) -> Self {
-        Self { queue: Arc::clone(&self.queue), write: Arc::clone(&self.write) }
+        Self { queue: Arc::clone(&self.queue), waker: self.waker.clone() }
     }
 }
 
@@ -109,7 +53,7 @@ impl<T: 'static> EventLoopProxy<T> {
         };
         queue.push_back(event);
         drop(queue);
-        poke(&self.write);
+        self.waker.wake();
         Ok(())
     }
 }
@@ -204,7 +148,7 @@ pub struct EventLoop<T: 'static> {
     /// The root wrapper handed to the callback on every dispatch.
     target: RootELW,
     queue: Arc<Mutex<VecDeque<T>>>,
-    wake: WakePipe,
+    waker: Waker,
     /// Whether the `StartCause::Init` iteration has already run. `pump_events` may be
     /// called many times for one loop, and only the first is `Init`.
     loop_running: bool,
@@ -213,9 +157,9 @@ pub struct EventLoop<T: 'static> {
 
 impl<T: 'static> EventLoop<T> {
     pub(crate) fn new() -> Result<Self, EventLoopError> {
-        let wake = WakePipe::new().map_err(|_| {
+        let waker = Waker::new().map_err(|_| {
             EventLoopError::Os(os_error!(super::OsError::Misc(
-                "could not create the headless wake pipe"
+                "could not create the headless waker"
             )))
         })?;
         Ok(Self {
@@ -224,7 +168,7 @@ impl<T: 'static> EventLoop<T> {
                 _marker: PhantomData,
             },
             queue: Arc::new(Mutex::new(VecDeque::new())),
-            wake,
+            waker,
             loop_running: false,
             _marker: PhantomData,
         })
@@ -239,7 +183,7 @@ impl<T: 'static> EventLoop<T> {
     }
 
     pub fn create_proxy(&self) -> EventLoopProxy<T> {
-        EventLoopProxy { queue: Arc::clone(&self.queue), write: Arc::clone(&self.wake.write) }
+        EventLoopProxy { queue: Arc::clone(&self.queue), waker: self.waker.clone() }
     }
 
     pub fn window_target(&self) -> &RootELW {
@@ -308,8 +252,9 @@ impl<T: 'static> EventLoop<T> {
             }
         };
 
-        self.wait_on_wake_pipe(deadline);
-        self.wake.drain();
+        // A failed wait is a spurious wake: the turn below runs, and the next one waits again.
+        let _ = poll::wait(&mut [poll::readable(self.waker.as_raw_fd())], deadline);
+        self.waker.drain();
 
         // The cause is read AFTER the wait, so a `WaitUntil` that actually elapsed is
         // reported as `ResumeTimeReached` and one cut short by a proxy wake is reported
@@ -328,31 +273,6 @@ impl<T: 'static> EventLoop<T> {
         };
 
         self.single_iteration(callback, cause);
-    }
-
-    /// Block until the wake pipe is readable or `deadline` elapses. `None` waits forever,
-    /// which is what `ControlFlow::Wait` means when no proxy has posted anything.
-    fn wait_on_wake_pipe(&self, deadline: Option<Duration>) {
-        let mut pollfd =
-            libc::pollfd { fd: self.wake.read.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-        // `poll` takes whole milliseconds, and the wait must round UP: truncating a
-        // 119.6 ms remainder to 119 wakes BEFORE the deadline, which costs a whole
-        // spurious turn reported as `WaitCancelled` when the timer was in fact about to
-        // come due. Rounding up means a `WaitUntil` turn is `ResumeTimeReached` — the
-        // thing a handler uses to tell a due timer from an early wake. -1 is "no
-        // deadline"; zero stays zero so `Poll` does not gain a millisecond of latency.
-        let millis: libc::c_int = match deadline {
-            None => -1,
-            Some(d) if d.is_zero() => 0,
-            Some(d) => {
-                let ceil_ms = d.as_nanos().div_ceil(1_000_000).max(1);
-                libc::c_int::try_from(ceil_ms).unwrap_or(libc::c_int::MAX)
-            },
-        };
-        // SAFETY: one live pollfd, count 1.
-        unsafe {
-            libc::poll(&mut pollfd, 1, millis);
-        }
     }
 
     fn single_iteration<F>(&mut self, callback: &mut F, cause: StartCause)
@@ -378,18 +298,6 @@ impl<T: 'static> EventLoop<T> {
         }
 
         callback(Event::AboutToWait, &self.target);
-    }
-}
-
-impl<T> AsFd for EventLoop<T> {
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        self.wake.read.as_fd()
-    }
-}
-
-impl<T> AsRawFd for EventLoop<T> {
-    fn as_raw_fd(&self) -> RawFd {
-        self.wake.read.as_raw_fd()
     }
 }
 

@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# THE KEYSYM ORACLE'S RECORDER (LW.6, docs/AUDIT-third-party-2026-10-15.md,
+# linux-windowing), in ITS OWN WORKSPACE (the empty `[workspace]` below):
+# xkeysym 0.2.1, the crate the winit fork's key handling named keysyms
+# through, prints the value of every keysym aterm-xkb carries, and aterm-xkb
+# is held to that recording with no xkeysym in the workspace graph.
+#
+# Nothing in the aterm workspace builds this. From this directory:
+#   targo --unverified run --release --locked > ../recorded/xkeysym-0.2.1-keysyms.tsv.new
+# It prints rows only; the committed TSV adds the `#` header.
+[package]
+name = "aterm-xkb-recorder"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+xkeysym = "=0.2.1"

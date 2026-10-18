@@ -80,10 +80,16 @@ spctl -a -t exec -vv /Applications/aterm.app   # must report source=Notarized De
 
 ### Linux
 
-The same installer supports `aarch64-unknown-linux-gnu` and
-`x86_64-unknown-linux-gnu` when the release carries their signed executables
-(`aterm-<version>-linux-aarch64`, `aterm-<version>-linux-x86_64`), and says so
-when there is none for your architecture. It needs Python 3.11+, curl and
+```sh
+curl -fsSL https://alab.systems/install.sh | bash
+```
+
+This is the same installer, served by alab.systems as of the latest release;
+[alab.systems/aterm](https://alab.systems/aterm) shows it to a Linux visitor
+whose architecture the release serves. It supports `aarch64-unknown-linux-gnu`
+and `x86_64-unknown-linux-gnu` when the release carries their signed
+executables (`aterm-<version>-linux-aarch64`, `aterm-<version>-linux-x86_64`),
+and says so when there is none for your architecture. It needs Python 3.11+, curl and
 OpenSSL with Ed25519 support. It verifies the signature chain and the
 executable before running anything, then installs the binary under `~/.local`
 and enrolls it for signed updates:
@@ -150,8 +156,8 @@ terminal.
 | **Stream** | `screen`, `cursor`, `cells`, `bytes`, `events`, `mail`, `sessions` subscriptions, fleet-wide NDJSON | Gaps are marked, never hidden |
 | **Capture** | PNG frames, full-window shots with native chrome (macOS), asciicast history, opt-in temporal replay, GPU video | What aterm rendered, not what the display showed |
 | **Measure** | Render, frame, input and present counters with percentiles and startup phases | Software-side counters |
-| **Extend** | Themes, typography, wallpaper, Trail Packs, Toy Packs, keybindings, the engine source | Path dependencies only; no API stability yet |
-| **Delight** | The rainbow kitty pet, per-program cats, Robi, cursor trails, Sparkle Words, Matrix rain, a typing-sound synth | Synth audio is macOS-only |
+| **Extend** | Themes, typography, wallpaper, Toy Packs, keybindings, the engine source | Path dependencies only; no API stability yet |
+| **Delight** | The rainbow kitty pet, per-program cats, cursor trails, Sparkle Words, Matrix rain, a typing-sound synth | Synth audio is macOS-only |
 
 ### One binary
 
@@ -187,8 +193,8 @@ rules outside its markers. `aterm agents` shows status, `aterm agents remove`
 uninstalls, and `agents_auto_prime = false` stops the window reinstalling it.
 
 - **Env hygiene.** Every spawned shell has `CLAUDE*`, `ANTHROPIC_*`,
-  `COPILOT_*`, `CODEX_*`, `ANTIGRAVITY_*`, `CURSOR_*`, `AI_*` and `_DEVTOOL_*`
-  stripped, and a window's shell gets a fresh session identity.
+  `COPILOT_*`, `CODEX_*`, `ANTIGRAVITY_*`, `GEMINI_*`, `CURSOR_*`, `AI_*` and
+  `_DEVTOOL_*` stripped, and a window's shell gets a fresh session identity.
 - **No MCP server.** The integration surfaces are the CLI (`aterm ctl`, `conn`,
   `drive`, `fleet`) and the Rust library API.
 - **A session fabric**: stable session IDs, `@sid` routing across every
@@ -242,9 +248,8 @@ its own cat, and View ▸ Favourite This Kitty pins one.
 
 - **Trails**: `rainbow kitty pet` (also `kitty`), `rainbow kitty flying`,
   `rainbow dog pet`, `phaser`, `comet`, `lumen`, `sparkle`, `fire`, `laser`,
-  `water`, `beam`, `classic`, `off`, or a TOML Trail Pack. Settings ▸ Cursor &
-  Motion picks the typing sound.
-- **Robi**, a tip-sharing helper robot (`robi = true`).
+  `water`, `beam`, `classic` or `off`. Settings ▸ Cursor & Motion picks the
+  typing sound.
 - **Sparkle Words** give typed words animated ink; TOML Toy Packs add your own.
   They are purely visual: copied text and logs read the exact bytes.
 - **Matrix rain** in empty cells (View ▸ Matrix Rain, `aterm ctl rain toggle`).
@@ -325,9 +330,10 @@ assert!(terminal.visible_content().contains("hello from aterm"));
 ```
 
 Two WebAssembly crates target `wasm32-unknown-unknown`: `aterm-wasm` (engine
-plus CPU rasterizer into a canvas) and `aterm-gpu-web` (engine plus wgpu over
-WebGL2). Embedding excludes the native window, the control socket and the
-sound palette. The crates are pre-1.0.
+plus CPU rasterizer into a canvas) and `aterm-gpu-web` (engine plus
+`aterm-gpu`'s own GL renderer over WebGL2). Both export through
+`aterm-wasm-abi`. Embedding excludes the native window, the control socket and
+the sound palette. The crates are pre-1.0.
 
 ## Security model
 
@@ -343,8 +349,6 @@ it as privileged:
 - Scoped capabilities can grant a single kind of operation on a single session
   without handing over the instance's owner token; owner-only verbs stay
   owner-only.
-- Network driving is opt-in: a TLS 1.3 relay with a pinned certificate
-  fingerprint and channel-bound tokens, never the default control path.
 - Capture paths are confined to server-managed runtime directories.
 - Terminal-side powers other programs could abuse — window operations,
   notifications, palette reconfiguration, kitty-graphics reads of host files,
@@ -377,7 +381,7 @@ The macOS installer roots trust in the Apple Developer ID chain (Team
 installer requires the master-to-roster-to-manifest Ed25519 chain itself.
 
 **Containment** is chosen at launch: `--containment <mode>` takes `user` (the
-default), `master` (the same as `user`), `safety` or `containment`, and
+default), `safety` or `containment`, and
 `--sandbox` is shorthand for the last. `containment` wraps the shell in the
 macOS sandbox and fails closed if the wrapper is missing: no network; writes
 only under the temp directories, `/dev` and the shell's history file; no access

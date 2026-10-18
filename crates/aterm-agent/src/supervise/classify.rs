@@ -313,9 +313,8 @@ const HAZARD_VARS: &[&str] = &[
 const HAZARD_VAR_PREFIXES: &[&str] = &["LD_", "DYLD_", "GIT_", "BASH_FUNC_"];
 
 /// zsh's tied pairs, array then scalar: assigning the array assigns the scalar
-/// (`path=/tmp/x ls` runs `/tmp/x/ls`). Every pair `zsh -f` declares, checked
-/// by `zsh_tied_arrays_are_the_measured_ones`. An array assignment is judged
-/// as its scalar's ([`assignment_hazard`]).
+/// (`path=/tmp/x ls` runs `/tmp/x/ls`). Every pair `zsh -f` declares. An
+/// array assignment is judged as its scalar's ([`assignment_hazard`]).
 const ZSH_TIED: &[(&str, &str)] = &[
     ("cdpath", "CDPATH"),
     ("fignore", "FIGNORE"),
@@ -330,8 +329,7 @@ const ZSH_TIED: &[(&str, &str)] = &[
 
 /// The variables whose value zsh 5.9 runs, loads or sources during an ordinary
 /// line of reads, found by assigning each declared or documented name a marker
-/// program, function, command line and directory. Re-checked by
-/// `zsh_parameters_it_runs_are_the_measured_ones` where zsh is installed.
+/// program, function, command line and directory.
 /// `STTY` runs only on a terminal and is in [`HAZARD_VARS`] separately.
 #[cfg(test)]
 const ZSH_RUNS_A_VALUE: &[&str] = &[
@@ -2016,8 +2014,7 @@ fn loop_assignment_hazard(seg: &[String]) -> Option<String> {
 /// assigned ([`plain_number`]). Found by testing every declared or documented
 /// name: those that evaluate at assignment, `MBEGIN`/`MEND` after a matching
 /// `[[ … =~ … ]]`, and three evaluated on use (`DIRSTACKSIZE` at a `cd`,
-/// `REPORTTIME` and `REPORTMEMORY` when a forked job ends). Re-checked by
-/// `zsh_arithmetic_vars_are_the_measured_ones` where zsh is installed.
+/// `REPORTTIME` and `REPORTMEMORY` when a forked job ends).
 const ZSH_ARITHMETIC_VARS: &[&str] = &[
     "COLUMNS",
     "DIRSTACKSIZE",

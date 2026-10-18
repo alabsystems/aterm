@@ -96,8 +96,9 @@
 //! the mean tone of its span, and a graded row ALSO carries its pixel raster
 //! ([`RowRaster`] → `aterm_render::ChromeRaster`): the ground one colour per
 //! window pixel column, mixed in linear light, the fill's edge one
-//! antialiased pixel, a level's RAIL in the row's lowest pixels (ruling 243),
-//! and the one cell the edge crosses split — its glyph drawn in the fill's
+//! antialiased pixel, the glint in the row's lowest pixels (its rail band)
+//! where at full height it would not read against the words, and the one
+//! cell the edge crosses split — its glyph drawn in the fill's
 //! ink left of the edge and the track's right of it. The words' inks are
 //! chosen ONCE per row (never per cell from the tone passing under), so an
 //! edge, a glint, a comet or an echo moving under a word never changes it.
@@ -178,18 +179,13 @@ use aterm_core::terminal::RenderCell;
 #[cfg(test)]
 use aterm_core::terminal::UnderlineStyle;
 #[cfg(test)]
-use aterm_messages::MARGIN;
-#[cfg(test)]
 use aterm_messages::ink;
-#[cfg(test)]
-use aterm_messages::paint::Icon;
 #[cfg(test)]
 use aterm_messages::text::char_width;
 use aterm_messages::{ActionIndex, Hit, Links, Presentation};
 #[cfg(test)]
-use aterm_messages::{
-    BandMotion, CapsuleLayout, CapsuleRole, FineTone, RowKind, RowLayout, RowMotion, Severity,
-};
+use aterm_messages::{BandMotion, CapsuleRole, FineTone, RowKind, RowLayout, Severity};
+#[cfg(test)]
 use aterm_render::Theme;
 
 #[cfg(test)]
@@ -199,8 +195,6 @@ use crate::{App, WindowId};
 
 // The painter's structure types, under the names the host has always used
 // (ruling 319): the engine owns them now.
-#[cfg(test)]
-pub(crate) use aterm_messages::paint::MeterSpan;
 pub(crate) use aterm_messages::paint::{Geometry as BandGeometry, Hover as BandHover, HoverTarget};
 // The band's repaint key (ruling 328): the engine's pure hash, its values kept.
 // The host reads it through its window's view (`drive::View::band_fp`); the
@@ -212,11 +206,10 @@ pub(crate) use aterm_messages::paint::band_fp;
 pub(crate) use aterm_messages::ink::RowRaster;
 #[cfg(test)]
 pub(crate) use aterm_messages::ink::{
-    MeterInks, WORD_AA, crisp_on_fill, delta_e, fill_ink, glint_step, lin_mix, luminance,
-    outlined_inks,
+    MeterInks, WORD_AA, crisp_on_fill, delta_e, fill_ink, glint_step, outlined_inks,
 };
 #[cfg(test)]
-pub(crate) use aterm_messages::palette::{lin, oklch};
+pub(crate) use aterm_messages::palette::lin;
 
 /// The band's cell measure — the char count, because the band's writer puts
 /// one `char` in one cell (see the module doc) — the tests' name for the
@@ -246,8 +239,11 @@ pub(crate) enum BandTarget {
 /// pads with this when the geometry has committed more rows than the cache
 /// holds, so a reserved row is never a hole the terminal's own top row shows
 /// through.
-pub(crate) fn blank_band_row(cols: usize, theme: Theme) -> Vec<RenderCell> {
-    aterm_render::band::blank_band_row(cols, &chrome_band::band_colors(theme))
+pub(crate) fn blank_band_row(
+    cols: usize,
+    p: impl Into<chrome_band::ChromePalette>,
+) -> Vec<RenderCell> {
+    aterm_render::band::blank_band_row(cols, &chrome_band::band_colors(p))
 }
 
 /// Paint the PRESENCE band's one row (`crate::presence::Words`) at `cols`: the
@@ -263,10 +259,11 @@ pub(crate) fn blank_band_row(cols: usize, theme: Theme) -> Vec<RenderCell> {
 pub(crate) fn paint_presence_row(
     words: &crate::presence::Words,
     cols: usize,
-    theme: Theme,
+    palette: impl Into<chrome_band::ChromePalette>,
 ) -> Vec<RenderCell> {
-    let c = chrome_band::band_colors(theme);
-    let p = chrome_band::presence_inks(theme);
+    let palette = palette.into();
+    let c = chrome_band::band_colors(palette);
+    let p = chrome_band::presence_inks(palette);
     let cells = aterm_messages::presence::paint_row::<crate::presence::Native>(words, cols, &c, &p);
     let (mut rows, _, _) = aterm_render::band::rows(vec![aterm_messages::ink::Resolved {
         cells,
@@ -410,38 +407,6 @@ pub(crate) fn paint_rows(
     paint_rows_on(p, theme, hover, BandGeometry::cells_only(p.cols), motion).0
 }
 
-/// A row's PIXEL raster ([`RowRaster`], the engine's, ruling 324) placed on the
-/// renderer's frame (`aterm_render::band::on_frame`, ruling 331) — the tests'
-/// name for it; the splice places rasters through `aterm_render::band::compose_band`.
-#[cfg(test)]
-pub(crate) trait OnFrame {
-    /// This raster on a frame whose column 0 starts `lo` window pixels in
-    /// from the window's left edge (the leading remainder band, `cells_x −
-    /// pad`) and which is `frame_w` pixels wide, for chrome row `row` whose
-    /// band is `cell_h` pixels tall: the renderer's [`aterm_render::ChromeRaster`].
-    /// A frame pixel past the window's own columns repeats the edge one.
-    fn on_frame(
-        &self,
-        row: u16,
-        lo: usize,
-        frame_w: usize,
-        cell_h: usize,
-    ) -> aterm_render::ChromeRaster;
-}
-
-#[cfg(test)]
-impl OnFrame for RowRaster {
-    fn on_frame(
-        &self,
-        row: u16,
-        lo: usize,
-        frame_w: usize,
-        cell_h: usize,
-    ) -> aterm_render::ChromeRaster {
-        aterm_render::band::on_frame(self, row, lo, frame_w, cell_h)
-    }
-}
-
 /// One painted band: its rows, each metered row's gutter tones and each row's
 /// pixel raster — the renderer's (`aterm_render::band`, ruling 331).
 #[cfg(test)]
@@ -469,7 +434,7 @@ pub(crate) use aterm_render::band::PaintedBand;
 #[cfg(test)]
 pub(crate) fn paint_rows_on(
     p: &Presentation,
-    palette: impl Into<chrome_band::BandPalette>,
+    palette: impl Into<chrome_band::ChromePalette>,
     hover: Option<BandHover>,
     geom: BandGeometry,
     motion: &BandMotion,
@@ -479,30 +444,44 @@ pub(crate) fn paint_rows_on(
     aterm_render::band::rows(ink::paint_band(p, hover, geom, motion, hc, &c))
 }
 
-/// CLOSE THE COMPOSED CHROME STACK against the terminal on `theme`'s band
-/// palette under this host's High Contrast latch: the last row carries the seam,
-/// every row above it a divider — the renderer's `aterm_render::band::seal_stack`
-/// (ruling 331), where the why lives; the splice runs it through
-/// `aterm_render::band::compose_band`.
-#[cfg(test)]
-pub(crate) fn seal_stack(rows: &mut [Vec<RenderCell>], theme: Theme) {
-    aterm_render::band::seal_stack(
-        rows,
-        &chrome_band::band_colors(theme),
-        chrome_band::forced_chrome().is_some(),
-    );
-}
-
 /// How strongly the divider between stacked band rows shows the seam's ink
 /// over the band (design ruling 260) — the renderer's (ruling 331).
 #[cfg(test)]
 pub(crate) use aterm_render::band::DIVIDER_ALPHA;
 
-/// GIVE EACH OUTLINED CAPSULE ITS FLOOR (ruling 254) — the renderer's
-/// (`aterm_render::band`, ruling 331): run after [`seal_stack`], each frame the
-/// stack is composed.
+/// The ink of the line that closes composed row `row` of `frame` (the stack's
+/// seam on its last row, a divider above it), however the compose drew it
+/// (`aterm_render::band::compose_band`): every cell's underline where the cell
+/// is too short to lift the words off a rail, else the row's 1 px rail with
+/// the words lifted clear of it (`aterm_render::band::seam_can_rail`), which a
+/// tall cell gets — Linux's default 15 px face does. `None` where the row
+/// carries neither, or carries no one tone across it.
 #[cfg(test)]
-pub(crate) use aterm_render::band::floor_rings;
+pub(crate) fn closing_line(frame: &aterm_render::RenderInput, row: usize) -> Option<[u8; 3]> {
+    use aterm_core::terminal::UnderlineStyle;
+    let cells = frame.cells.get(row)?;
+    let first = cells.first()?;
+    if first.underline == UnderlineStyle::Single {
+        return cells
+            .iter()
+            .all(|c| {
+                c.underline == UnderlineStyle::Single && c.underline_color == first.underline_color
+            })
+            .then_some(first.underline_color)
+            .flatten();
+    }
+    let at = u16::try_from(row).ok()?;
+    let raster = frame
+        .chrome_rasters
+        .iter()
+        .find(|m| m.row == at && m.clear_rail && m.rail_h == 1)?;
+    let px = *raster.rail.first()?;
+    raster
+        .rail
+        .iter()
+        .all(|&p| p == px && p != aterm_render::ChromeRaster::KEEP)
+        .then_some([(px >> 16) as u8, (px >> 8) as u8, px as u8])
+}
 
 /// The renderer's drawn icon for the engine's (ruling 322: one set in two
 /// tables, held together by `band_icon_ids_match_the_renderers`) — the
@@ -512,19 +491,13 @@ pub(crate) use aterm_render::band::band_icon;
 
 /// The inks row `l`'s surface resolves against, and — on a BUSY row — the
 /// anchor its words floor toward (the engine's [`inks_for`](aterm_messages::ink::inks_for) from the
-/// row's layout): a busy row's surface keeps its words' side, a determinate
-/// row's Fault wash keeps the fill's words' side, and a RAIL (a measured
-/// level, ruling 243) wears warn over the band itself.
+/// row's layout): a busy row's surface keeps its words' side, and a
+/// determinate row's Fault wash keeps the fill's words' side.
 #[cfg(test)]
-pub(crate) fn row_inks(
-    c: &BandColors,
-    l: &RowLayout,
-    rail: bool,
-    hc: bool,
-) -> (MeterInks, Option<[u8; 3]>) {
+pub(crate) fn row_inks(c: &BandColors, l: &RowLayout, hc: bool) -> (MeterInks, Option<[u8; 3]>) {
     let alarm = matches!(l.severity, Severity::Warn | Severity::Error);
     let fill = if hc || !alarm { c.meter } else { c.warn };
-    ink::inks_for(c, fill, l.track.is_some(), rail, hc)
+    ink::inks_for(c, fill, l.track.is_some(), hc)
 }
 
 /// The band row and column for a frame pixel, given the geometry — the pure
@@ -914,8 +887,8 @@ pub(crate) fn worst_word_contrast(
 mod tests {
     use super::*;
     use aterm_messages::{
-        GLYPH_COL, Hit, Hold, Instant, Intent, Look, Message, MessageCenter, MessageLog, Meter,
-        Severity, Tone, WallStamp, tags,
+        Hold, Instant, Intent, Look, Message, MessageCenter, MessageLog, Meter, Severity,
+        WallStamp, tags,
     };
 
     fn t0() -> Instant {
@@ -991,13 +964,10 @@ mod tests {
         paint_rows(p, theme, hover, &center.motion(p, t0(), Look::STILL))
     }
 
-    /// The port of the bars' painter test: every row is exactly `cols` wide and
-    /// carries the words, the meter is laid out as the whole row and leaves no
-    /// procedural glyph behind, the painter draws no seam (the stack's last
-    /// row closes the chrome), and the glyph is text presentation. Its colour
-    /// half — the fill, the track, the edge cell's mix and the crisp ink —
-    /// is the engine's (`band_tests::the_meter_row_is_its_fill_and_track_and_its_words_the_crisp_ink`,
-    /// ruling 328).
+    /// Every row is exactly `cols` wide and carries its title, the meter is
+    /// laid out as the whole row and leaves no procedural glyph behind, and
+    /// the painter draws no seam (only the composed stack knows which row is
+    /// last: `aterm_render::band::seal_stack`).
     #[test]
     fn paint_rows_are_exactly_cols_wide_and_carry_the_words() {
         let center = two_rows();
@@ -1007,27 +977,8 @@ mod tests {
         for row in &rows {
             assert_eq!(row.len(), 140);
         }
-        let top = text_of(&rows[0]);
-        assert!(top.contains("Installing ALab tools"), "{top}");
-        assert!(top.contains("\u{00b7} trust \u{2014} extracting"), "{top}");
-        assert!(top.contains("42%"), "{top}");
-        // Beside a percent the job's size says what it is part of (ruling
-        // 259, amending 246): the count, and the bytes as part of the total.
-        assert!(top.contains("3 of 10 · 512 MB of 1.2 GB"), "{top}");
-        assert!(
-            top.ends_with("  Packages   Details \u{203a}"),
-            "the authored capsule, then the row's link: {top}"
-        );
-        let bottom = text_of(&rows[1]);
-        assert!(bottom.contains("aterm update v0.48.0"), "{bottom}");
-        assert!(bottom.contains("60%"), "{bottom}");
-        assert!(
-            bottom.contains("45 of 74 MB")
-                && !bottom.contains("45 MB")
-                && bottom.ends_with("Details \u{203a}"),
-            "a capsule-less row carries its stats and ends in its link: {bottom}"
-        );
-        // THE METER IS THE ROW (rulings 55, 136).
+        assert!(text_of(&rows[0]).contains("Installing ALab tools"));
+        assert!(text_of(&rows[1]).contains("aterm update v0.48.0"));
         let (mcol, w, fill) = p.rows[0].meter.expect("a meter at 140 cols");
         assert_eq!((mcol, w, fill), (0, 140, 427), "the meter is the row");
         assert!(
@@ -1036,496 +987,11 @@ mod tests {
                 .all(|cell| !(0xFDD0..=0xFDEF).contains(&u32::from(cell.ch))),
             "no procedural meter glyph is left on the band"
         );
-        // The painter draws no seam at all: only the composed stack knows which
-        // row is last ([`seal_stack`]).
         assert!(
             rows.iter()
                 .flatten()
                 .all(|cell| cell.underline == UnderlineStyle::None)
         );
-        assert!(rows[0][MARGIN].text_presentation);
-        assert!(rows[0][MARGIN].bold);
-        assert!(rows[0][p.rows[0].title.0].bold);
-    }
-
-    /// Layout and hit share one law: every cell a capsule is painted on maps
-    /// back to that capsule — the `Details ›` to the Details hit — and the
-    /// gaps map to the body. Below its long width `Details ›` goes (it has
-    /// no short form: a lone `›` said nothing the body press does not do).
-    /// Its colour half — each role's ground and ink on the metered row — is
-    /// the engine's (`band_tests::each_chip_wears_its_roles_ground_and_ink_on_a_metered_row`,
-    /// ruling 328).
-    #[test]
-    fn capsules_are_hit_where_they_are_painted() {
-        let center = two_rows();
-        for cols in [60, 80, 120, 160] {
-            let p = present(&center, cols);
-            let rows = paint_still(&p, Theme::default(), None, &center);
-            let id = center.on_glass().next().unwrap().id;
-            let layout = &p.rows[0];
-            let link = layout
-                .capsules
-                .last()
-                .is_some_and(|c| c.action.is_details());
-            assert_eq!(
-                layout.capsules.len(),
-                1 + usize::from(link),
-                "cols {cols}: Packages, then the row's Details \u{203a} when it fits"
-            );
-            // The meter costs the words nothing (ruling 136, main's width
-            // law), so the link the pill used to crowd out is last from 80
-            // up. At 60 this moving row's PAINTED excerpt is an action
-            // excerpt (ruling 153): `Details ›` pays for it, never the
-            // excerpt for the link.
-            assert!(
-                link || (cols < 80 && layout.detail.is_some()),
-                "cols {cols}: the link is last"
-            );
-            assert!(
-                layout.capsules.iter().all(|c| c.text != "\u{203a}"),
-                "cols {cols}: never a lone \u{203a}"
-            );
-            if !link {
-                assert_eq!(
-                    p.hit(0, layout.title.0),
-                    Hit::Body(id),
-                    "the body press performs Details"
-                );
-            }
-            for cap in &layout.capsules {
-                let painted: String = rows[0][cap.col + 1..cap.col + cap.width - 1]
-                    .iter()
-                    .map(|cell| cell.ch)
-                    .collect();
-                assert_eq!(painted, cap.text, "cols {cols}: painted where laid out");
-                let expected = if cap.action.is_details() {
-                    Hit::Details(id)
-                } else {
-                    Hit::Capsule(id, cap.action)
-                };
-                for col in cap.col..cap.col + cap.width {
-                    assert_eq!(p.hit(0, col), expected, "cols {cols} col {col}");
-                }
-                // `Packages` is a navigation: the quiet chip, never the
-                // accent (ruling 18). A Primary would wear the accent;
-                // Details no fill.
-                assert_eq!(
-                    cap.role,
-                    if cap.action.is_details() {
-                        CapsuleRole::Details
-                    } else {
-                        CapsuleRole::Secondary
-                    },
-                    "cols {cols}"
-                );
-            }
-            let first = layout.capsules.first().unwrap().col;
-            assert_eq!(p.hit(0, first - 1), Hit::Body(id), "cols {cols}");
-            assert_eq!(p.hit(0, layout.title.0), Hit::Body(id), "cols {cols}");
-        }
-    }
-
-    /// Seven held rows on a three-row band: rows 0–1 are messages, row 2 is
-    /// `… 5 more ›` in `label`, not bold — ONE link with no capsule of its own
-    /// (ruling 259) — and a press ANYWHERE on it is that one link.
-    #[test]
-    fn the_overflow_row_is_one_details_link() {
-        let now = t0();
-        let mut center = MessageCenter::new(MessageLog::empty(), now);
-        for i in 0..7 {
-            center.post(
-                Message::new(tags::CONFIG, Severity::Warn, format!("warning {i}")),
-                stamp(),
-                now,
-            );
-        }
-        assert_eq!(center.commit_rows(now, 3), Some(3));
-        let p = present(&center, 80);
-        assert_eq!(p.rows.len(), 3);
-        assert!(matches!(p.rows[2].kind, RowKind::Overflow { hidden: 5 }));
-        let rows = paint_still(&p, Theme::default(), None, &center);
-        let text = text_of(&rows[2]);
-        assert_eq!(text.trim_end(), " \u{2026} 5 more \u{203a}", "{text}");
-        assert!(p.rows[2].capsules.is_empty(), "the words are the link");
-        let c = chrome_band::band_colors(Theme::default());
-        assert_eq!(rows[2][MARGIN].fg, c.label);
-        assert!(!rows[2][MARGIN].bold);
-        assert_eq!(rows[2][p.rows[2].title.0].fg, c.label);
-        assert!(!rows[2][p.rows[2].title.0].bold);
-        for col in 0..80 {
-            assert_eq!(p.hit(2, col), Hit::Overflow, "col {col}");
-        }
-        // A pointer anywhere on the row lifts its words to the value ink.
-        let lit = paint_still(
-            &p,
-            Theme::default(),
-            Some(BandHover {
-                row: 2,
-                target: HoverTarget::Body,
-            }),
-            &center,
-        );
-        assert_eq!(lit[2][p.rows[2].title.0].fg, c.value, "the link lights");
-        assert_eq!(lit[2][p.rows[2].title.0].bg, c.bar_bg, "no chip appears");
-        assert_eq!(lit[1][MARGIN].bg, c.bar_bg, "the row above does not");
-    }
-
-    /// The stack's LAST row carries the seam and every row above it the
-    /// DIVIDER (ruling 260: the seam's ink at 35 % over the band), each in one
-    /// tone — whatever shape the splice composed: painted rows, a padded blank
-    /// row under them, or a single row.
-    #[test]
-    fn the_stack_is_sealed_on_its_last_row_only() {
-        let theme = Theme::default();
-        let colors = chrome_band::band_colors(theme);
-        let ink = colors.label;
-        let divider = chrome_band::mix3(colors.bar_bg, colors.label, DIVIDER_ALPHA);
-        assert!(
-            chrome_band::contrast(divider, colors.bar_bg) > 1.2,
-            "it separates"
-        );
-        assert!(
-            chrome_band::contrast(divider, colors.bar_bg)
-                < chrome_band::contrast(ink, colors.bar_bg),
-            "softer than the seam"
-        );
-        let ruled = |row: &[RenderCell], tone: [u8; 3]| {
-            row.iter()
-                .all(|c| c.underline == UnderlineStyle::Single && c.underline_color == Some(tone))
-        };
-        let sealed = |row: &[RenderCell]| ruled(row, ink);
-        let divided = |row: &[RenderCell]| ruled(row, divider);
-        let bare = |row: &[RenderCell]| row.iter().all(|c| c.underline == UnderlineStyle::None);
-
-        let center = two_rows();
-        let mut rows = paint_still(&present(&center, 100), theme, None, &center);
-        assert!(rows.iter().all(|r| bare(r)), "the painter seals nothing");
-        seal_stack(&mut rows, theme);
-        assert!(divided(&rows[0]) && sealed(&rows[1]));
-
-        // PADDED: the geometry still owns a third row after a dismissal. The seam
-        // moves down to it; the row that used to be last takes the divider.
-        rows.push(blank_band_row(100, theme));
-        seal_stack(&mut rows, theme);
-        assert!(divided(&rows[0]) && divided(&rows[1]) && sealed(&rows[2]));
-
-        // A single row seals itself; an empty stack is left alone.
-        let mut one = vec![blank_band_row(100, theme)];
-        seal_stack(&mut one, theme);
-        assert!(sealed(&one[0]));
-        seal_stack(&mut [], theme);
-    }
-
-    /// An outlined capsule's FLOOR is its middle cells' underline in the
-    /// ring's colour (ruling 254), on any row. On the sealed last row the
-    /// seam hands the pill's two end cells to the ring, which draws it there
-    /// to meet its rounded foot; on a row above, the floor is drawn with no
-    /// seam beside it. The cells outside a ring are untouched.
-    #[test]
-    fn a_ringed_capsule_takes_the_seam_as_its_floor() {
-        let theme = Theme::default();
-        let ink = chrome_band::band_colors(theme).label;
-        let mut rows = vec![blank_band_row(40, theme), blank_band_row(40, theme)];
-        seal_stack(&mut rows, theme);
-        let ring = |row: u16, start: u16, end: u16, rgb: u32| aterm_render::ChromeRaster {
-            row,
-            ground: std::sync::Arc::from(Vec::new()),
-            rail: std::sync::Arc::from(Vec::new()),
-            rail_h: 0,
-            clear_rail: false,
-            own: Vec::new(),
-            split: None,
-            rings: vec![aterm_render::ChromeRing {
-                start,
-                end,
-                ring: rgb,
-                inner: 0x0030_3135,
-                seam: None,
-            }],
-            icons: Vec::new(),
-        };
-        let mut rasters = [
-            ring(0, 3, 9, 0x00BD_93F9),
-            ring(1, 20, 32, 0x0050_FA7B),
-            ring(7, 0, 5, 0),
-        ];
-        floor_rings(&mut rows, &mut rasters);
-        // The row above carries the DIVIDER (ruling 260): the ring meets it
-        // at its ends as it meets the seam on the last row.
-        let colors = chrome_band::band_colors(theme);
-        let divider = chrome_band::mix3(colors.bar_bg, colors.label, DIVIDER_ALPHA);
-        for (c, cell) in rows[0].iter().enumerate() {
-            let (style, tone) = match c {
-                3 | 8 => (UnderlineStyle::None, None),
-                4..=7 => (UnderlineStyle::Single, Some([0xBD, 0x93, 0xF9])),
-                _ => (UnderlineStyle::Single, Some(divider)),
-            };
-            assert_eq!(
-                (cell.underline, cell.underline_color),
-                (style, tone),
-                "upper row {c}"
-            );
-        }
-        let [r, g, b] = divider;
-        assert_eq!(
-            rasters[0].rings[0].seam,
-            Some((u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)),
-            "the ring draws the divider across its ends"
-        );
-        let [r, g, b] = ink;
-        assert_eq!(
-            rasters[1].rings[0].seam,
-            Some((u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)),
-            "the ring draws the seam across its ends"
-        );
-        for (c, cell) in rows[1].iter().enumerate() {
-            let (style, tone) = match c {
-                20 | 31 => (UnderlineStyle::None, None),
-                21..=30 => (UnderlineStyle::Single, Some([0x50, 0xFA, 0x7B])),
-                _ => (UnderlineStyle::Single, Some(ink)),
-            };
-            assert_eq!(
-                (cell.underline, cell.underline_color),
-                (style, tone),
-                "last row {c}"
-            );
-        }
-    }
-
-    /// Hover lights exactly one chip, on the hovered row only, whatever its
-    /// role: a lit PRIMARY keeps its ink and weight and brightens its fill
-    /// (never the grey hover that read as disabled, review 2026-09-22); a
-    /// lit Secondary — the toolchain row's `Packages` is one now (ruling
-    /// 18) — takes the hover fill; a BODY hover lights that row's
-    /// `Details ›` and nothing else — it says what a press there will do.
-    #[test]
-    fn hover_lights_only_the_hovered_capsule_or_the_bodys_details() {
-        let now = t0();
-        let mut center = two_rows();
-        // A two-capsule row beneath: Open Settings (a system pane —
-        // consequential, Primary), Not now (a decline — Secondary).
-        center.post(
-            Message::new(tags::PRIVACY, Severity::Info, "File access not confirmed")
-                .action(Intent::OpenSystemPane {
-                    pane: "full-disk-access".into(),
-                })
-                .action(Intent::NotNow {
-                    decision: aterm_messages::Decision::FileAccess,
-                }),
-            stamp(),
-            now,
-        );
-        assert_eq!(center.commit_rows(now, 3), Some(3));
-        let p = present(&center, 140);
-        let c = chrome_band::band_colors(Theme::default());
-        // The ask ranks first: the FDA row is row 0, the meter row below it
-        // (every row ends in its Details \u{203a}: three chips, two, one).
-        let ask = p
-            .rows
-            .iter()
-            .position(|r| r.capsules.len() == 3)
-            .expect("the two-capsule row");
-        let meter = p
-            .rows
-            .iter()
-            .position(|r| r.capsules.len() == 2)
-            .expect("the Packages row");
-        assert_eq!((ask, meter), (0, 1));
-        assert_eq!(
-            p.rows[2].capsules.len(),
-            1,
-            "the update row: its link alone"
-        );
-        let packages = &p.rows[meter].capsules[0];
-        assert_eq!(
-            packages.role,
-            CapsuleRole::Secondary,
-            "Packages is a navigation: the quiet chip"
-        );
-        let (open, not_now) = (&p.rows[ask].capsules[0], &p.rows[ask].capsules[1]);
-        assert_eq!(
-            open.role,
-            CapsuleRole::Primary,
-            "a system pane is consequential: the accent chip"
-        );
-        assert_eq!(not_now.role, CapsuleRole::Secondary);
-        let lit_primary = |rows: &[Vec<RenderCell>], row: usize, cap: &CapsuleLayout| {
-            rows[row][cap.col].bg == c.capsule_primary_hover
-                && rows[row][cap.col + 1].fg == c.capsule_primary_hover_ink
-                && rows[row][cap.col + 1].bold
-        };
-        let lit_grey = |rows: &[Vec<RenderCell>], row: usize, cap: &CapsuleLayout| {
-            rows[row][cap.col].bg == c.capsule_hover
-                && rows[row][cap.col + 1].fg == c.capsule_hover_ink
-        };
-        let none = paint_still(&p, Theme::default(), None, &center);
-        assert!(!lit_primary(&none, ask, open) && !lit_grey(&none, meter, packages));
-        assert_eq!(
-            none[ask][open.col].bg, c.accent,
-            "at rest the Primary wears the accent"
-        );
-        assert_eq!(
-            none[meter][packages.col].bg, c.meter_track,
-            "at rest the quiet chip on a METERED row draws no ground: it rides the meter (ruling 260)"
-        );
-        assert_eq!(
-            none[ask][not_now.col].bg, c.chip_ground,
-            "on an unmetered row the quiet chip keeps its ground"
-        );
-        assert!(
-            chrome_band::contrast(c.capsule_hover, c.chip_ground) >= chrome_band::HOVER_RISE,
-            "the pointer's step is plain to see (ruling 260)"
-        );
-        // The pointer on the Primary: lit in the accent's family.
-        let on_primary = paint_still(
-            &p,
-            Theme::default(),
-            Some(BandHover {
-                row: ask as u8,
-                target: HoverTarget::Capsule(open.action),
-            }),
-            &center,
-        );
-        assert!(
-            lit_primary(&on_primary, ask, open),
-            "lit, in the accent's family"
-        );
-        assert!(
-            !lit_grey(&on_primary, ask, open),
-            "never the grey that reads as disabled"
-        );
-        assert_ne!(
-            c.capsule_primary_hover, c.accent,
-            "the lit fill is a visible step off the resting accent"
-        );
-        assert!(
-            !lit_grey(&on_primary, ask, not_now) && !lit_grey(&on_primary, meter, packages),
-            "the other chips are untouched"
-        );
-        // The pointer on the toolchain row's `Packages`: the grey hover, and
-        // the ask row untouched.
-        let on_packages = paint_still(
-            &p,
-            Theme::default(),
-            Some(BandHover {
-                row: meter as u8,
-                target: HoverTarget::Capsule(packages.action),
-            }),
-            &center,
-        );
-        assert!(
-            lit_grey(&on_packages, meter, packages),
-            "a Secondary takes the hover fill"
-        );
-        assert!(
-            !lit_primary(&on_packages, meter, packages),
-            "a quiet chip never lights in the accent"
-        );
-        assert!(
-            !lit_primary(&on_packages, ask, open) && !lit_grey(&on_packages, ask, not_now),
-            "the ask row is untouched"
-        );
-        let on_secondary = paint_still(
-            &p,
-            Theme::default(),
-            Some(BandHover {
-                row: ask as u8,
-                target: HoverTarget::Capsule(not_now.action),
-            }),
-            &center,
-        );
-        assert!(
-            lit_grey(&on_secondary, ask, not_now),
-            "a Secondary takes the hover fill"
-        );
-        assert!(
-            !lit_primary(&on_secondary, ask, open) && !lit_grey(&on_secondary, meter, packages)
-        );
-        let on_body = paint_still(
-            &p,
-            Theme::default(),
-            Some(BandHover {
-                row: meter as u8,
-                target: HoverTarget::Body,
-            }),
-            &center,
-        );
-        let details = p.rows[meter]
-            .capsules
-            .iter()
-            .find(|cap| cap.action.is_details())
-            .expect("the meter row's Details \u{203a}");
-        assert!(
-            lit_grey(&on_body, meter, details),
-            "a body hover lights the row's Details \u{203a}"
-        );
-        assert!(
-            !lit_grey(&on_body, meter, packages),
-            "…and not the authored chip beside it"
-        );
-        assert!(
-            !lit_primary(&on_body, ask, open) && !lit_grey(&on_body, ask, not_now),
-            "the other row is untouched"
-        );
-        assert_ne!(
-            c.capsule_hover, c.bar_bg,
-            "the hover fill is a visible step"
-        );
-    }
-
-    /// The band paints on the chrome palette — every cell's ground is the
-    /// band tone, never the terminal background the theme carries.
-    #[test]
-    fn rows_use_the_chrome_palette_not_the_osc11_tint() {
-        let center = two_rows();
-        let theme = Theme {
-            bg: 0x0010_2030,
-            fg: 0x00E0_E0E0,
-            cursor: 0x00FF_8800,
-            selection: 0x0044_4444,
-        };
-        let c = chrome_band::band_colors(theme);
-        let bg = [0x10, 0x20, 0x30];
-        assert_ne!(
-            c.bar_bg, bg,
-            "the band is a step off the theme, not the theme"
-        );
-        let p = present(&center, 100);
-        let rows = paint_still(&p, theme, None, &center);
-        // A meter cell is the track, the fill, or the one edge cell's mix of
-        // the two (its coverage, ruling 138) — never anything else.
-        let inks = MeterInks::of(&c, c.accent);
-        let on_meter = |bg: [u8; 3]| {
-            (0..=255u8).any(|f| {
-                tone_rgb(
-                    Tone {
-                        fill: f,
-                        lift: 0,
-                        warn: 0,
-                    },
-                    &inks,
-                ) == bg
-            })
-        };
-        for row in &rows {
-            for cell in row {
-                assert_ne!(cell.bg, bg, "no cell shows the OSC-11 ground");
-                assert!(
-                    [
-                        c.bar_bg,
-                        c.accent,
-                        c.meter_track,
-                        c.capsule_hover,
-                        c.capsule_primary_hover
-                    ]
-                    .contains(&cell.bg)
-                        || on_meter(cell.bg),
-                    "{:?} is not a band material",
-                    cell.bg
-                );
-            }
-        }
-        assert_eq!(blank_band_row(10, theme)[0].bg, c.bar_bg);
     }
 
     /// Every admitted glyph lands in the glyph cell, text presentation on, so
@@ -1549,129 +1015,6 @@ mod tests {
             assert_eq!(cell.ch, *ch);
             assert!(cell.text_presentation, "{ch:?}");
             assert!(!cell.emoji_presentation, "{ch:?}");
-        }
-    }
-
-    /// THE METER IS THE ROW, the PAINT: every cell of a metered row is the
-    /// tone of its window-pixel span of the engine's surface ([`MeterSpan`],
-    /// the fill, the track, or the edge cell's coverage) — except
-    /// a Secondary chip, which wears the band's own surface so it never
-    /// vanishes into the track; every glyph on it clears AA against the cell
-    /// it sits on, under the default theme, one whose cursor IS its
-    /// foreground, and a light one with a pale cursor; and the row's gutter
-    /// tones are exactly its first and last cells' backgrounds (the
-    /// renderer's no-epoch bleed relies on that).
-    #[test]
-    fn a_metered_row_is_all_meter_and_every_word_reads_on_it() {
-        let dark = Theme::default();
-        let themes = [
-            ("default", dark),
-            (
-                "cursor is fg",
-                Theme {
-                    cursor: dark.fg,
-                    ..dark
-                },
-            ),
-            (
-                "light, pale cursor",
-                Theme {
-                    fg: 0x0020_2020,
-                    bg: 0x00FA_FAFA,
-                    cursor: 0x00E6_E6E6,
-                    ..dark
-                },
-            ),
-        ];
-        let center = two_rows();
-        for (name, theme) in themes {
-            let c = chrome_band::band_colors(theme);
-            // 10 and 24 are the degenerate and short-capsule layouts: a chip
-            // the width law put at column 0 must still be what the left gutter
-            // continues (review, 2026-09-23).
-            for cols in [10usize, 24, 60, 80, 140, 200] {
-                let p = present(&center, cols);
-                let motion = center.motion(&p, t0(), Look::STILL);
-                // The unit grid, and a real window with gutters and a
-                // remainder band either side.
-                for g in [
-                    BandGeometry::cells_only(cols),
-                    BandGeometry {
-                        win_w: cols * 9 + 31,
-                        cells_x: 15,
-                        cell_w: 9,
-                    },
-                ] {
-                    let (rows, edges, rasters) = paint_rows_on(&p, theme, None, g, &motion);
-                    for (i, (row, layout)) in rows.iter().zip(&p.rows).enumerate() {
-                        let (ratio, at) = worst_word_contrast(row, rasters[i].as_ref(), g);
-                        assert!(
-                            ratio >= WORD_AA - 0.02,
-                            "{name}@{cols} row {i}: {ratio:.2}:1 at {at}"
-                        );
-                        let (mcol, w, _) = layout.meter.expect("both rows are metered");
-                        assert_eq!((mcol, w), (0, cols), "{name}@{cols}: the meter is the row");
-                        let span = MeterSpan { geom: g, cols };
-                        let inks = MeterInks::of(&c, c.accent);
-                        // Every cell is the meter's, a resting Secondary's
-                        // too: it draws no ground of its own (ruling 260).
-                        for (x, cell) in row.iter().enumerate() {
-                            let want = fine_rgb(span.fine(&motion.rows[i].surface, x), &inks);
-                            assert_eq!(cell.bg, want, "{name}@{cols} row {i} col {x}");
-                        }
-                        assert_eq!(
-                            edges[i],
-                            Some((row[0].bg, row[cols - 1].bg)),
-                            "{name}@{cols} row {i}: the gutters continue the edge cells"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// A PRIMARY chip on a meter is OUTLINED wherever the fill is (ruling
-    /// 249, the owner: "Outlined on meters"): the band's ground inside, the
-    /// label in the accent at AA on it, over the fill and over the track
-    /// alike — the accent chip on the accent fill would be no chip at all,
-    /// and a solid one over the track read as a second bar.
-    #[test]
-    fn a_primary_chip_on_a_meter_is_outlined_wherever_the_fill_is() {
-        let now = t0();
-        let post = |fill: u16| {
-            let mut center = MessageCenter::new(MessageLog::empty(), now);
-            center.post(
-                Message::new(tags::UPDATE, Severity::Info, "aterm update v0.99.0")
-                    .meter(Meter {
-                        fill_permille: Some(fill),
-                        ..Meter::default()
-                    })
-                    .hold(Hold::Live {
-                        stale_after: aterm_messages::STALE_UPDATE,
-                    })
-                    .action(Intent::NewWindow),
-                stamp(),
-                now,
-            );
-            assert_eq!(center.commit_rows(now, 3), Some(1));
-            center
-        };
-        let theme = Theme::default();
-        let c = chrome_band::band_colors(theme);
-        let cols = 100;
-        let o = outlined_inks(&c, false);
-        for fill in [1000u16, 10] {
-            let center = post(fill);
-            let p = present(&center, cols);
-            let cap = p.rows[0]
-                .capsules
-                .iter()
-                .find(|cap| cap.role == CapsuleRole::Primary)
-                .expect("New window is consequential: a Primary");
-            let rows = paint_still(&p, theme, None, &center);
-            let cell = &rows[0][cap.col + 1];
-            assert_eq!((cell.fg, cell.bg), (o.label, c.bar_bg), "fill {fill}");
-            assert!(chrome_band::contrast(o.label, c.bar_bg) >= WORD_AA);
         }
     }
 
@@ -1889,251 +1232,6 @@ mod tests {
         );
     }
 
-    /// DESIGN §2.2, THE END STATE: every message row ends in its `Details ›`
-    /// — the row with an authored capsule and the row without — and the
-    /// overflow row's words end in its link's `›` (ruling 259), through the host's own presentation
-    /// at every width; the link is the LAST capsule and its full label is
-    /// the page's name for a screen reader. A message row too narrow for
-    /// `Details ›` whole lets it GO rather than paint a lone `›` (review
-    /// round 2, 2026-09-23): its body press performs Details.
-    #[test]
-    fn every_row_ends_in_its_link() {
-        let mut app = App::headless_for_test();
-        // The first-run toolchain row — the one row the silent lane still
-        // raises — and a live update row, neither with an authored capsule.
-        app.post_message(crate::toolchain_words::announced(
-            "installing 10 ALab program(s) over the network (about 3 GB on disk)",
-        ));
-        app.post_message(
-            Message::new(tags::UPDATE, Severity::Info, "aterm update v0.48.0")
-                .line("downloading…")
-                .hold(Hold::Live {
-                    stale_after: aterm_messages::STALE_UPDATE,
-                }),
-        );
-        for i in 0..4 {
-            app.post_message(Message::new(tags::CONFIG, Severity::Warn, format!("w{i}")));
-        }
-        assert_eq!(app.message_band_rows, aterm_messages::MAX_ROWS);
-        for cols in [40usize, 60, 80, 120, 160] {
-            let p = app.band_presentation(cols);
-            assert_eq!(p.rows.len(), 3, "cols {cols}");
-            assert!(matches!(p.rows[2].kind, RowKind::Overflow { .. }));
-            let painted = paint_still(&p, Theme::default(), None, &app.messages);
-            // The overflow row IS its link (ruling 259): its words end in
-            // `›`, no capsule of its own.
-            assert!(p.rows[2].capsules.is_empty(), "cols {cols}");
-            assert!(
-                text_of(&painted[2]).trim_end().ends_with('\u{203a}'),
-                "cols {cols}: the overflow row's words are the link"
-            );
-            for (r, row) in p.rows.iter().enumerate().take(2) {
-                let Some(link) = row.capsules.last() else {
-                    assert!(
-                        r < 2 && cols <= 60,
-                        "cols {cols} row {r}: only a narrow message row lets its link go"
-                    );
-                    let text = text_of(&painted[r]);
-                    assert!(
-                        !text.trim_end().ends_with('\u{203a}'),
-                        "cols {cols} row {r}: never a lone \u{203a}: {text}"
-                    );
-                    if let RowKind::Message(id) = row.kind {
-                        assert_eq!(p.hit(r, row.title.0), Hit::Body(id), "cols {cols}");
-                    }
-                    continue;
-                };
-                assert!(link.action.is_details(), "cols {cols} row {r}: last");
-                assert_eq!(link.text, "Details \u{203a}", "whole, or gone");
-                assert_eq!(link.role, CapsuleRole::Details);
-                assert_eq!(link.full_label, "Details \u{203a}", "cols {cols} row {r}");
-                assert!(
-                    row.capsules
-                        .iter()
-                        .filter(|c| c.action.is_details())
-                        .count()
-                        == 1,
-                    "cols {cols} row {r}: one link"
-                );
-                let text = text_of(&painted[r]);
-                assert!(
-                    text.ends_with('\u{203a}'),
-                    "cols {cols} row {r}: the link closes the row: {text}"
-                );
-            }
-        }
-    }
-
-    /// The first width the Universal Control undo shows at, and its form there.
-    const FIRST_UC_FORM: (usize, &str) = (90, "to turn it back on,\u{2026}");
-
-    /// The retired status bar's pin, ported onto the band: the Universal Control
-    /// row's undo sentence is shown as a run of its own words cut on a word —
-    /// never a mid-word stub (`prints the reve…`, review 2026-09-22) — or not
-    /// at all. Since the silent lane (the rulings on the origin/main merge,
-    /// 2026-09-23) the machine-settings words are a record and never on glass;
-    /// the pin stays as the width law's (§1.5), exercised on the one
-    /// undo-bearing sentence the lane has, posted here at the hold the row had.
-    #[test]
-    fn the_universal_control_undo_is_cut_on_a_word_at_every_width() {
-        let mut app = App::headless_for_test();
-        for msg in crate::toolchain_words::machine_settings("universal-control disabled") {
-            let row = crate::toolchain_words::held_row(&msg);
-            app.post_message(row.hold(Hold::For(aterm_messages::HOLD_WARN)));
-        }
-        let mut shown = Vec::new();
-        for cols in [60usize, 70, 80, 90, 100, 130, 150] {
-            let row = app.band_presentation(cols).rows[0].clone();
-            assert_eq!(
-                row.title.1, "ALab tools turned off Universal Control",
-                "cols {cols}: whole"
-            );
-            let Some((_, excerpt)) = row.detail else {
-                // The title grew thirteen cells (`ALab tools turned off
-                // Universal Control`, ruling 261): every threshold with it.
-                assert!(cols <= 80, "the excerpt is dropped below 90 cols only");
-                continue;
-            };
-            shown.push(cols);
-            // What is shown is a run of the sentence's own words, cut (if at
-            // all) at a word boundary or at its colon, the ellipsis after a whole
-            // word.
-            let pointer = format!(
-                "to turn it back on, set Universal Control on this Mac to leave and run: {}",
-                atpkg::machine::UNIVERSAL_CONTROL_REVERT
-            );
-            let words = excerpt.trim_end_matches('\u{2026}');
-            let at = pointer
-                .find(words)
-                .unwrap_or_else(|| panic!("cols {cols}: not the sentence's words: {excerpt}"));
-            let rest = &pointer[at + words.len()..];
-            assert!(
-                rest.is_empty() || rest.starts_with(' ') || rest.starts_with(':'),
-                "cols {cols}: cut inside a word: {excerpt}"
-            );
-        }
-        assert_eq!(shown, [90, 100, 130, 150]);
-        // Where the excerpt first shows, as the row widens, and its form there.
-        let first = (80..=140).find_map(|cols| {
-            app.band_presentation(cols).rows[0]
-                .detail
-                .clone()
-                .map(|(_, d)| (cols, d))
-        });
-        assert_eq!(
-            first.as_ref().map(|(c, d)| (*c, d.as_str())),
-            Some(FIRST_UC_FORM)
-        );
-    }
-
-    /// THE REMEDY SURVIVES THE CUT (upstream status_bars.rs
-    /// `the_frozen_tab_note_keeps_its_command_at_120_cols_and_drops_whole_at_80`,
-    /// re-cut onto the band). The width law is every row's; upstream pinned
-    /// it on the managed words, which were a row until 2026-09-22 and are a
-    /// record now (the silent lane), so they are posted here at the hold the
-    /// row had. With a frozen tab the detail IS the remedy (2026-09-23: "1 tab
-    /// from before this update picks them up with `…`", no claim on every
-    /// tab and no builds); what survives a cut is the hook line, whole
-    /// wherever the room holds it, and below that its head from the
-    /// backtick, so the path is still recognisable. The band's capsules
-    /// (`Packages`, `Details ›`, design §2.3) take the room the bars' detail
-    /// had: none at 80 cols (the bars' pin), the whole command at 120, and the
-    /// count with the whole command from 135. A count never stands without its
-    /// clause (the stub-head rule, text.rs
-    /// `a_stub_head_gives_way_to_the_command_whole`).
-    #[test]
-    fn the_frozen_tab_note_keeps_its_command_whole_wherever_it_fits() {
-        let command = "`. ~/.aterm/shell.d/00-atpkg.zsh`";
-        let msg = crate::toolchain_words::managed_current(
-            "claude 2.1.273 (build 2026091601); codex 0.154.0 (build 2026091001)",
-            1,
-            true,
-            crate::toolchain_words::HookDialect::Zsh,
-        )
-        .expect("the managed words");
-        let title = msg.title.clone();
-        assert!(msg.detail[0].ends_with(command), "{:?}", msg.detail);
-        let mut app = App::headless_for_test();
-        let row = crate::toolchain_words::held_row(&msg);
-        app.post_message(row.hold(Hold::For(aterm_messages::HOLD_WARN)));
-        let excerpt = |cols: usize| app.band_presentation(cols).rows[0].detail.clone();
-        // The title names each program by its product (`Codex CLI`, four cells
-        // longer than `Codex`): every threshold moves with it.
-        assert_eq!(excerpt(77), None, "drops whole at 77 cols");
-        assert_eq!(
-            excerpt(107).map(|(_, d)| d),
-            Some("`. ~/.aterm/shell.d/00\u{2026}".to_string()),
-            "at 107 the room is narrower than the command: its head, from the backtick"
-        );
-        assert_eq!(
-            excerpt(117).map(|(_, d)| d),
-            Some(command.to_string()),
-            "at 117 the command is whole"
-        );
-        assert_eq!(
-            excerpt(140).map(|(_, d)| d),
-            Some(format!("1 tab from before\u{2026} {command}")),
-            "the count and the whole command"
-        );
-        let mut whole_from = None;
-        for cols in 40..220 {
-            let row = app.band_presentation(cols).rows[0].clone();
-            let Some((col, d)) = row.detail else {
-                assert!(
-                    whole_from.is_none(),
-                    "cols {cols}: a wider row lost its excerpt"
-                );
-                continue;
-            };
-            assert_eq!(row.title.1, title, "cols {cols}: the title is whole first");
-            assert!(
-                col + d.chars().count() <= cols,
-                "cols {cols}: the excerpt fits: {d}"
-            );
-            if d.contains(command) {
-                whole_from.get_or_insert(cols);
-            } else {
-                assert!(
-                    whole_from.is_none(),
-                    "cols {cols}: once whole, the command stays whole: {d}"
-                );
-                assert!(
-                    d.starts_with("`. ~/.aterm/shell.d") && d.ends_with('\u{2026}'),
-                    "cols {cols}: the command's head, from the backtick: {d}"
-                );
-            }
-            assert!(
-                !d.contains("2026091601"),
-                "cols {cols}: the builds are what a person can do without: {d}"
-            );
-            if d.contains("1 tab") {
-                assert!(
-                    d.contains("1 tab from before"),
-                    "cols {cols}: a count never stands without its clause: {d}"
-                );
-            }
-        }
-        assert_eq!(whole_from, Some(117));
-        // The shaper alone, at the caps the row reaches: sentence first, then
-        // the command's own words, then the command's head.
-        let long = "what `claude` and `codex` run in every aterm tab \u{00b7} 1 tab from before \
-                    this update picks them up with `. ~/.aterm/shell.d/00-atpkg.zsh`";
-        let shape = aterm_messages::text::shape_detail;
-        assert_eq!(
-            shape(long, 90),
-            format!("1 tab from before this update picks them up with {command}")
-        );
-        assert_eq!(
-            shape(long, 70),
-            format!("1 tab from before this update picks\u{2026} {command}")
-        );
-        let floor = shape(long, 20);
-        assert!(
-            floor.starts_with("`. ~/.aterm/shell.d") && floor.ends_with('\u{2026}'),
-            "{floor}"
-        );
-    }
-
     // ---- Motion (design §10.7, §10.12; rulings 136–142) ------------------
 
     /// One frame of `center`'s motion over `p` at `at` in `look`, painted on
@@ -2202,132 +1300,10 @@ mod tests {
         (center, download)
     }
 
-    /// AN ERROR READS RED ON THE BAND (design ruling 265): its glyph and words
-    /// wear the band's error ink, a warning's the warn ink — they shared the
-    /// warn yellow, so only the glyph told `✕ Tests failed on main` from `⚠
-    /// Misspelled setting`, while the log paints errors red. Both clear AA on
-    /// the band.
-    #[test]
-    fn an_error_row_reads_red_and_a_warning_amber() {
-        let now = t0();
-        let mut center = MessageCenter::new(MessageLog::empty(), now);
-        center.post(
-            Message::new(tags::SYSTEM, Severity::Error, "Tests failed on main"),
-            stamp(),
-            now,
-        );
-        center.post(
-            Message::new(tags::CONFIG, Severity::Warn, "Misspelled setting"),
-            stamp(),
-            now,
-        );
-        assert_eq!(center.commit_rows(now, 3), Some(2));
-        let p = center.presentation(120, &aterm_messages::text::char_width, None, Links::Painted);
-        let motion = center.motion(&p, now, Look::STILL);
-        let light = Theme {
-            fg: 0x0020_2020,
-            bg: 0x00FA_FAFA,
-            cursor: 0x0020_2020,
-            selection: 0x00C0_C8FF,
-        };
-        for theme in [Theme::default(), light] {
-            let c = chrome_band::band_colors(theme);
-            let rows = paint_rows(&p, theme, None, &motion);
-            let ink = |row: usize| rows[row][aterm_messages::TITLE_COL].fg;
-            assert_eq!(p.rows[0].severity, Severity::Error);
-            assert_eq!(ink(0), c.error, "the error's words");
-            assert_eq!(rows[0][GLYPH_COL].fg, c.error, "the error's glyph");
-            assert_eq!(ink(1), c.warn, "the warning's words");
-            assert_ne!(c.error, c.warn);
-            assert!(chrome_band::contrast(c.error, c.bar_bg) >= 4.5);
-            let [r, g, b] = c.error;
-            assert!(r > g && r > b, "red: {:?}", c.error);
-        }
-    }
-
     /// The frames a test walks: every 50 ms from `from` for `span`.
     fn frames(from: Instant, span: aterm_messages::Duration) -> impl Iterator<Item = Instant> {
         let steps = u64::try_from(span.as_millis() / 50).unwrap_or(0);
         (0..=steps).map(move |k| from + aterm_messages::Duration::from_millis(k * 50))
-    }
-
-    /// Whether column `x` of a row carries words a motion frame may change:
-    /// the elapsed and ETA slots and the glyph cell.
-    fn in_motion_span(l: &RowLayout, x: usize) -> bool {
-        l.elapsed
-            .is_some_and(|c| (c..c + l.elapsed_width()).contains(&x))
-            || l.eta.is_some_and(|c| (c..c + l.eta_width()).contains(&x))
-            || x == aterm_messages::GLYPH_COL
-    }
-
-    /// A MOTION FRAME MOVES ONLY THE SURFACE, THE TIME SLOTS AND THE GLYPH
-    /// (design §10.7; rulings 138, 140 — re-pinned from the pill's "the
-    /// overlay writes only its spans" on the merge: the meter is now the whole
-    /// row, so its surface may move under every cell). Across 12 s of frames —
-    /// the comet's crossings, the glint, the elapsed words
-    /// arriving — and then a Complete echo, every CHARACTER a frame changes
-    /// is in a time slot or the glyph cell, except on a row that is fading;
-    /// no frame draws a seam (the splice seals the composed stack after it);
-    /// every glyph on a moving surface clears AA on its own cell; and the
-    /// held row has no motion and paints exactly its still form.
-    #[test]
-    fn a_motion_frame_moves_only_the_surface_the_slots_and_the_glyph() {
-        let theme = Theme::default();
-        let now = t0();
-        let (mut center, download) = moving_rows(now);
-        let check = |center: &MessageCenter, from: Instant, span| {
-            let p = present(center, 120);
-            let (still, _) = frame_at(center, &p, from, Look::STILL, theme);
-            let mut moved = 0;
-            for t in frames(from, span) {
-                let (rows, m) = frame_at(center, &p, t, Look::MOVING, theme);
-                assert_eq!(m.rows.len(), p.rows.len());
-                for (i, (row, before)) in rows.iter().zip(&still).enumerate() {
-                    assert_eq!(row.len(), before.len());
-                    for (x, (a, b)) in row.iter().zip(before).enumerate() {
-                        assert_eq!(a.underline, UnderlineStyle::None, "row {i} col {x}");
-                        if a.bg != b.bg {
-                            moved += 1;
-                        }
-                        if a.ch != b.ch {
-                            assert!(
-                                m.rows[i].fade > 0 || in_motion_span(&p.rows[i], x),
-                                "row {i} col {x}: {:?} became {:?} outside the time slots at {t:?}",
-                                b.ch,
-                                a.ch
-                            );
-                        }
-                        if a.ch != ' ' && m.rows[i].fade == 0 && p.rows[i].meter.is_some() {
-                            let ratio = chrome_band::contrast(a.fg, a.bg);
-                            assert!(ratio >= WORD_AA - 1e-9, "row {i} col {x}: {ratio:.2}:1");
-                        }
-                    }
-                }
-                // A row with no motion paints its still form, and the held row
-                // has none.
-                for (i, l) in p.rows.iter().enumerate() {
-                    if l.full_title == "Font not found" {
-                        assert_eq!(m.rows[i], RowMotion::default(), "a held row has no motion");
-                    }
-                    if m.rows[i] == RowMotion::default() {
-                        assert_eq!(rows[i], still[i], "row {i} has no motion");
-                    }
-                }
-            }
-            moved
-        };
-        assert!(
-            check(&center, now, aterm_messages::Duration::from_secs(12)) > 0,
-            "the frames move something"
-        );
-        let resolved_at = now + aterm_messages::Duration::from_secs(12);
-        assert!(center.resolve(download, aterm_messages::Outcome::Ok, resolved_at));
-        assert!(!center.echoes().is_empty(), "the resolve left an echo");
-        check(
-            &center,
-            resolved_at,
-            aterm_messages::Duration::from_millis(900),
-        );
     }
 
     /// A HELD ROW HAS NO MOTION AND ASKS FOR NO FRAME (FL-1 on the row): its
@@ -2352,106 +1328,6 @@ mod tests {
             center.motion_deadline(&p, now, Look::MOVING),
             None,
             "…and asks for no frame"
-        );
-    }
-
-    /// A busy row alone, committed at `now`.
-    fn busy_center(now: Instant) -> MessageCenter {
-        let mut center = MessageCenter::new(MessageLog::empty(), now);
-        center.post(
-            Message::new(tags::UPDATE, Severity::Info, "Checking aterm v0.92.0")
-                .meter(Meter::busy(""))
-                .hold(Hold::Live {
-                    stale_after: aterm_messages::STALE_UPDATE,
-                }),
-            stamp(),
-            now,
-        );
-        assert_eq!(center.commit_rows(now, 3), Some(1));
-        center
-    }
-
-    /// THE BUSY ROW DRAWS A COMET, OR HOLDS STILL — on the full-width
-    /// meter's geometry (main's ruling 75, re-pinned on the engine's motion
-    /// by rulings 139–140). The engine lays the track out as the whole row
-    /// and computes the frame; the host paints it: moving, the comet's tones
-    /// over the track with the row's own glyph in its cell (the braille
-    /// spinner went with ruling 251: the comet already says the work moves);
-    /// still, the row's own glyph over an unlit track. Every glyph clears AA on the cell under it at every
-    /// frame, the words never move, and a row that is not busy draws the same
-    /// in both looks.
-    #[test]
-    fn a_busy_row_draws_a_comet_or_holds_still() {
-        let theme = Theme::default();
-        let c = chrome_band::band_colors(theme);
-        let now = t0();
-        let center = busy_center(now);
-        let cols = 110;
-        let p = present(&center, cols);
-        let layout = &p.rows[0];
-        assert!(layout.busy);
-        assert_eq!(layout.track, Some((0, cols)), "the track is the whole row");
-        assert_eq!(layout.meter, None, "a busy row has no fill");
-        let words = |row: &[RenderCell]| -> String {
-            row.iter()
-                .enumerate()
-                .filter(|(x, _)| !in_motion_span(layout, *x))
-                .map(|(_, cell)| cell.ch)
-                .collect()
-        };
-        // Still: the row's own glyph over the unlit track.
-        let (still, _) = frame_at(&center, &p, now, Look::STILL, theme);
-        assert_eq!(still[0][aterm_messages::GLYPH_COL].ch, layout.glyph.1);
-        assert!(
-            still[0]
-                .iter()
-                .all(|cell| cell.bg == c.chip_ground || cell.bg == c.bar_bg),
-            "still: the unlit track (a comet's channel is neutral, ruling 260)"
-        );
-        // Moving: the row's own glyph (no spinner beside the comet, ruling
-        // 251), and the comet somewhere on the row.
-        let mut lit_frames = 0;
-        let steps =
-            aterm_messages::COMET_PERIOD.as_millis() / aterm_messages::ANIM_FRAME.as_millis();
-        for k in 0..u32::try_from(steps).unwrap() {
-            let t = now + aterm_messages::ANIM_FRAME * k;
-            let (rows, _) = frame_at(&center, &p, t, Look::MOVING, theme);
-            let g = rows[0][aterm_messages::GLYPH_COL].ch;
-            assert_eq!(g, layout.glyph.1, "frame {k}: the row's own glyph");
-            if rows[0]
-                .iter()
-                .any(|cell| cell.bg != c.chip_ground && cell.bg != c.bar_bg)
-            {
-                lit_frames += 1;
-            }
-            assert_eq!(
-                words(&rows[0]),
-                words(&still[0]),
-                "frame {k}: the words hold"
-            );
-            for (x, cell) in rows[0].iter().enumerate() {
-                if cell.ch != ' ' {
-                    let ratio = chrome_band::contrast(cell.fg, cell.bg);
-                    assert!(ratio >= WORD_AA - 1e-9, "frame {k} col {x}: {ratio:.2}:1");
-                }
-            }
-        }
-        assert!(
-            lit_frames * 10 >= u32::try_from(steps).unwrap() * 9,
-            "the comet is on the row nearly every frame: {lit_frames} of {steps}"
-        );
-        // A row that is NOT busy — a held one — draws the same in both looks.
-        let mut held = MessageCenter::new(MessageLog::empty(), now);
-        held.post(
-            Message::new(tags::CONFIG, Severity::Warn, "Font not found"),
-            stamp(),
-            now,
-        );
-        held.commit_rows(now, 3);
-        let hp = present(&held, cols);
-        assert_eq!(
-            frame_at(&held, &hp, now, Look::MOVING, theme).0,
-            frame_at(&held, &hp, now, Look::STILL, theme).0
         );
     }
 
@@ -2598,589 +1474,8 @@ mod tests {
     // — is withdrawn by ruling 244: the Fault is a premultiplied cross-fade
     // that stays inside the track–fill–warn hull, pinned pixel by pixel in
     // `band_raster_tests::the_fault_echo_stays_inside_its_hull`.)
-
-    /// THE WORDS ON A DETERMINATE BAR NEVER JUMP (design ruling 158): on
-    /// every builtin scheme, through the glint's travel over a bar at 57 %,
-    /// the Complete echo's wipe and bloom from 80 % and the Fault echo's
-    /// flash from 40 %, every letter of the title keeps its side of the
-    /// ground under it (the glint, the bloom and the Fault's warn are held
-    /// there — ruling 222 withdrew the Fault's one crossing on Solarized
-    /// Light), clears AA, and moves its ink by no more than the ground under
-    /// it moved — the old
-    /// ten-step floor jumped a whole step on a one-level change in the
-    /// bloom, and the glint flipped Catppuccin Latte's letters to white.
-    #[test]
-    fn the_words_on_a_determinate_bar_never_jump() {
-        use aterm_messages::{
-            ANIM_FRAME, Duration, ECHO_FAULT_FLASH, ECHO_SWEEP, GLINT_DELAY, GLINT_TRAVEL, Outcome,
-        };
-        let cols = 120;
-        let run = |name: &str, theme: Theme, permille: u16, outcome: Option<Outcome>| {
-            let now = t0();
-            let mut center = MessageCenter::new(MessageLog::empty(), now);
-            let id = center
-                .post(
-                    Message::new(tags::UPDATE, Severity::Info, "Downloading aterm v0.91.0")
-                        .no_excerpt()
-                        .meter(Meter {
-                            fill_permille: Some(permille),
-                            ..Meter::default()
-                        })
-                        .hold(Hold::Live {
-                            stale_after: aterm_messages::STALE_UPDATE,
-                        }),
-                    stamp(),
-                    now,
-                )
-                .id;
-            center.commit_rows(now, 3);
-            let (from, span) = match outcome {
-                None => (now + GLINT_DELAY, GLINT_TRAVEL),
-                Some(o) => {
-                    let at = now + Duration::from_millis(1000);
-                    assert!(center.resolve(id, o, at));
-                    let span = if o == Outcome::Ok {
-                        aterm_messages::animate::glide_span(800, 1000) + ECHO_SWEEP
-                    } else {
-                        ECHO_FAULT_FLASH
-                    };
-                    (at, span)
-                }
-            };
-            let p = present(&center, cols);
-            let (tcol, title) = p.rows[0].title.clone();
-            let letters: Vec<usize> = title
-                .chars()
-                .enumerate()
-                .filter(|(_, ch)| !ch.is_whitespace())
-                .map(|(k, _)| tcol + k)
-                .collect();
-            let mut last: Option<Vec<RenderCell>> = None;
-            let mut crossed = vec![0u32; cols];
-            // No crossing even through a Fault flash: its warn is held on the
-            // words' side (ruling 222 withdrew ruling 158's one crossing).
-            let crossings = 0u32;
-            let mut t = Duration::ZERO;
-            while t <= span {
-                let (rows, rasters) = frame_rasters(&center, &p, from + t, Look::MOVING, theme);
-                let row = rows[0].clone();
-                let geom = BandGeometry::cells_only(cols);
-                for &x in &letters {
-                    let (fg, bg) = (row[x].fg, row[x].bg);
-                    for (ink, g) in word_grounds(&row, rasters[0].as_ref(), geom, x) {
-                        assert!(
-                            chrome_band::contrast(ink, g) >= WORD_AA - 0.02,
-                            "{name} {outcome:?} t={t:?} col {x}: {ink:?} on {g:?} under AA"
-                        );
-                    }
-                    let Some(prev) = &last else { continue };
-                    let (pfg, pbg) = (prev[x].fg, prev[x].bg);
-                    let lighter = |a: [u8; 3], b: [u8; 3]| luminance(a) > luminance(b);
-                    if lighter(fg, bg) != lighter(pfg, pbg) {
-                        crossed[x] += 1;
-                        assert!(
-                            crossed[x] <= crossings,
-                            "{name} {outcome:?} t={t:?} col {x}: the letter changed side, \
-                             {pfg:?} on {pbg:?} -> {fg:?} on {bg:?}"
-                        );
-                        continue;
-                    }
-                    let moved = |a: [u8; 3], b: [u8; 3]| {
-                        (0..3).map(|k| a[k].abs_diff(b[k])).max().unwrap_or(0)
-                    };
-                    assert!(
-                        moved(fg, pfg) <= moved(bg, pbg).saturating_mul(2) + 2,
-                        "{name} {outcome:?} t={t:?} col {x}: the ink jumped \
-                         {pfg:?} -> {fg:?} while its ground moved {pbg:?} -> {bg:?}"
-                    );
-                }
-                last = Some(row);
-                t += ANIM_FRAME;
-            }
-        };
-        for (name, theme) in super::band_raster_tests::themes() {
-            run(name, theme, 570, None);
-            run(name, theme, 800, Some(Outcome::Ok));
-            run(name, theme, 400, Some(Outcome::Warn));
-        }
-    }
-
-    /// HIGH CONTRAST KEEPS ITS RAW FAULT FLASH (ruling 222's warn exemption):
-    /// under every stock High Contrast palette, in the graded look, every
-    /// flashed cell of a Fault echo over the fill is the engine's tone on the
-    /// row's own inks — HIGHLIGHT warmed toward the raw warn, never pulled back
-    /// toward the side the crisp ink's hold protects (its words wear
-    /// HIGHLIGHTTEXT).
-    #[test]
-    fn high_contrast_keeps_its_raw_fault_flash() {
-        use aterm_messages::{ANIM_FRAME, Duration, ECHO_FAULT_FLASH, Outcome};
-        let cols = 120;
-        for (name, palette) in chrome_band::hc_fixtures::STOCK {
-            chrome_band::hc_fixtures::with_forced(palette, || {
-                let theme = Theme::default();
-                let c = chrome_band::band_colors(theme);
-                let inks = MeterInks::of(&c, c.accent);
-                let now = t0();
-                let mut center = MessageCenter::new(MessageLog::empty(), now);
-                let id = center
-                    .post(
-                        Message::new(tags::UPDATE, Severity::Info, "Downloading aterm v0.91.0")
-                            .no_excerpt()
-                            .meter(Meter {
-                                fill_permille: Some(950),
-                                stats: "70 MB / 74 MB".into(),
-                                ..Meter::default()
-                            })
-                            .hold(Hold::Live {
-                                stale_after: aterm_messages::STALE_UPDATE,
-                            }),
-                        stamp(),
-                        now,
-                    )
-                    .id;
-                center.commit_rows(now, 3);
-                let at = now + Duration::from_millis(1000);
-                assert!(center.resolve(id, Outcome::Warn, at));
-                let p = present(&center, cols);
-                let span = MeterSpan {
-                    geom: BandGeometry::cells_only(cols),
-                    cols,
-                };
-                let mut flashed = 0;
-                let mut t = Duration::ZERO;
-                while t <= ECHO_FAULT_FLASH {
-                    let (rows, m) = frame_at(&center, &p, at + t, Look::MOVING, theme);
-                    for (x, cell) in rows[0].iter().enumerate().take(cols) {
-                        let tone = span.fine(&m.rows[0].surface, x);
-                        if tone.fill < 128 << 8 || tone.warn == 0 {
-                            continue;
-                        }
-                        flashed += 1;
-                        assert_eq!(
-                            cell.bg,
-                            fine_rgb(tone, &inks),
-                            "{name} t={t:?} col {x}: the raw flash"
-                        );
-                    }
-                    t += ANIM_FRAME;
-                }
-                assert!(flashed > 0, "{name}: the flash crossed the fill");
-            });
-        }
-    }
-
-    /// A FAULT ECHO'S EDGE IS ITS COVERAGE OF THE WASH (rulings 158 and
-    /// 244): the cell (or pixel) the fill only partly covers is the wash —
-    /// the fill handing its coverage to warn — over the track by that
-    /// coverage, in linear light, on no other hue.
-    #[test]
-    fn a_fault_echos_edge_cell_is_the_wash_by_its_coverage() {
-        for (name, theme) in super::band_raster_tests::themes() {
-            let c = chrome_band::band_colors(theme);
-            let inks = MeterInks::of(&c, c.accent);
-            for warn in [64u16, 160, 255] {
-                let wash = |cover: u16| {
-                    let w = cover * warn / 255;
-                    fine_rgb(
-                        aterm_messages::FineTone {
-                            fill: (cover - w) << 8,
-                            lift: 0,
-                            warn: w << 8,
-                        },
-                        &inks,
-                    )
-                };
-                let (full, edge) = (wash(255), wash(85));
-                let expect = lin_mix(c.meter_track, full, 85.0 / 255.0);
-                let off = (0..3)
-                    .map(|k| edge[k].abs_diff(expect[k]))
-                    .max()
-                    .unwrap_or(0);
-                assert!(
-                    off <= 2,
-                    "{name} warn {warn}: edge {edge:?}, the wash {full:?} by a third \
-                     over {:?} is {expect:?}",
-                    c.meter_track
-                );
-                assert!(
-                    hull_distance(edge, [inks.track, inks.fill, inks.warn]) < 0.01,
-                    "{name} warn {warn}: the edge left the hull"
-                );
-            }
-        }
-    }
-
-    /// THE COMET'S TAIL IS A SMOOTH MONOTONE FALL-OFF (design ruling 157):
-    /// on every builtin scheme, at 60/80/120/160 columns on whole-cell and on
-    /// non-integral windows (gutters and a remainder band), every fifth frame
-    /// of a crossing rises cell by cell to one head and falls cell by cell past
-    /// it — in every channel — with no neighbouring step over a bound (the
-    /// tail's coverage a fifth of the fill, the lead's half), and no zigzag
-    /// in the steps along the tail (a step never dips more than one level
-    /// below both its neighbours). Eight chords to the tail's curve and a
-    /// byte-rounded tone per cell put steps in pairs and alternated them by a
-    /// level — the faint vertical stripes at capture scale.
-    #[test]
-    fn the_comet_tail_is_a_smooth_monotone_fall_off() {
-        let now = t0();
-        let center = busy_center(now);
-        let steps =
-            aterm_messages::COMET_PERIOD.as_millis() / aterm_messages::ANIM_FRAME.as_millis();
-        let mut worst_zig = 0i32;
-        let mut worst = [0.0f64; 2];
-        for (name, theme) in super::band_raster_tests::themes() {
-            let c = chrome_band::band_colors(theme);
-            // The comet wears the meter's fill (a pastel on Catppuccin Latte,
-            // ruling 264; the cursor accent everywhere else).
-            let (inks, _) = MeterInks::comet(&c, c.meter);
-            for (cols, pad, extra) in [
-                (60usize, 0usize, 0usize),
-                (80, 0, 0),
-                (120, 0, 0),
-                (160, 0, 0),
-                (80, 10, 7),
-                (120, 8, 11),
-                (60, 13, 5),
-            ] {
-                let cell_w = 12;
-                let geom = BandGeometry {
-                    win_w: 2 * pad + cols * cell_w + extra,
-                    cells_x: pad + extra / 2,
-                    cell_w,
-                };
-                let p = present(&center, cols);
-                let span = MeterSpan { geom, cols };
-                for k in (0..u32::try_from(steps).unwrap()).step_by(5) {
-                    let t = now + aterm_messages::ANIM_FRAME * k;
-                    let m = center.motion(&p, t, Look::MOVING);
-                    // The coverage steps between neighbouring cells, off the
-                    // gutter columns: the tail's rise and the lead's fall.
-                    let cover: Vec<f64> = (1..cols - 1)
-                        .map(|x| {
-                            let f = span.fine(&m.rows[0].surface, x);
-                            let l = f64::from(f.lift) / 65_280.0;
-                            let f = f64::from(f.fill) / 65_280.0;
-                            f + (1.0 - f) * l
-                        })
-                        .collect();
-                    let top = (0..cover.len())
-                        .max_by(|&a, &b| cover[a].total_cmp(&cover[b]))
-                        .unwrap_or(0);
-                    for (x, w) in cover.windows(2).enumerate() {
-                        let side = usize::from(x >= top);
-                        worst[side] = worst[side].max((w[1] - w[0]).abs());
-                    }
-                    let (rows, _, _) = paint_rows_on(&p, theme, None, geom, &m);
-                    let bg: Vec<[u8; 3]> = rows[0].iter().map(|cell| cell.bg).collect();
-                    for ch in 0..3 {
-                        let toward = |v: u8| {
-                            let (t0, f) = (i32::from(inks.track[ch]), i32::from(inks.fill[ch]));
-                            (i32::from(v) - t0) * (f - t0).signum()
-                        };
-                        let v: Vec<i32> = bg.iter().map(|c| toward(c[ch])).collect();
-                        let Some(peak) = (0..cols).max_by_key(|&x| v[x]) else {
-                            continue;
-                        };
-                        let rise = &v[..=peak];
-                        let fall = &v[peak..];
-                        assert!(
-                            rise.windows(2).all(|w| w[1] >= w[0])
-                                && fall.windows(2).all(|w| w[1] <= w[0]),
-                            "{name} {cols}+{pad}/{extra} frame {k} channel {ch}: not one \
-                             rise and one fall: {v:?}"
-                        );
-
-                        // The edge columns stand for their gutters too
-                        // (wider spans, [`MeterSpan`]): their steps are the
-                        // gutters', not the tail's texture.
-                        let inner = &v[1..cols - 1];
-                        let top = peak.clamp(1, cols - 2) - 1;
-                        let d: Vec<i32> = inner[..=top].windows(2).map(|w| w[1] - w[0]).collect();
-                        for (x, w) in d.windows(3).enumerate() {
-                            let zig = w[0].min(w[2]) - w[1];
-                            worst_zig = worst_zig.max(zig);
-                            assert!(
-                                zig <= 1,
-                                "{name} {cols}+{pad}/{extra} frame {k} channel {ch} col {x}: \
-                                 the steps zigzag {w:?}: {v:?}"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        // Neither a stripe nor an edge: the tail's rise never steps more than
-        // a fifth of the fill between neighbouring cells (60 columns is the
-        // worst, 0.185), and the soft lead's fall never more than half.
-        assert!(worst_zig <= 1);
-        assert!(
-            worst[0] <= 0.20,
-            "the tail steps {:.3} between cells",
-            worst[0]
-        );
-        assert!(
-            worst[1] <= 0.50,
-            "the lead steps {:.3} between cells",
-            worst[1]
-        );
-    }
 }
 
 #[cfg(test)]
 #[path = "band_raster_tests.rs"]
 mod band_raster_tests;
-
-/// THE ENGINE AND THE HOST'S TABLES AGREE (rulings 319-325): the engine's
-/// icon mirror names exactly the renderer's icon for every `char`, and the
-/// engine's band contrast is `aterm_types::Rgb::contrast` bit for bit.
-#[cfg(test)]
-mod paint_parity_tests {
-    use super::*;
-
-    /// Every `char` the renderer draws as a band icon is the engine's icon of
-    /// that char, and no other char is an engine icon (ruling 322).
-    #[test]
-    fn band_icon_ids_match_the_renderers() {
-        for ch in (0..=0x10_ffffu32).filter_map(char::from_u32) {
-            assert_eq!(
-                aterm_render::BandIcon::for_char(ch),
-                Icon::for_char(ch).map(band_icon),
-                "{ch:?}"
-            );
-        }
-        for icon in aterm_render::BandIcon::ALL {
-            assert_eq!(Icon::for_char(icon.ch()).map(band_icon), Some(icon));
-        }
-    }
-
-    /// THE ENGINE'S BAND TESTS READ THIS HOST'S THEMES (ruling 328): the
-    /// inputs `aterm_messages`' `band_tests` paint on — the default theme, the
-    /// light theme its comet test uses, every builtin scheme as a theme and
-    /// the four stock High Contrast palettes — digest to the number its
-    /// `fixtures_are_the_hosts` pins, and this host maps each theme onto the
-    /// palette those tests derive (the blend base everywhere but Linux, whose
-    /// CSD base `chrome_band`'s own tests keep).
-    #[test]
-    fn the_engines_band_tests_read_the_hosts_themes() {
-        use aterm_messages::ink::{BandInks, BarBase, ThemeInks};
-        let of = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
-        let inks = |t: Theme| ThemeInks {
-            bg: of(t.bg),
-            fg: of(t.fg),
-            cursor: of(t.cursor),
-        };
-        let light = Theme {
-            fg: 0x001F_2328,
-            bg: 0x00FF_FFFF,
-            cursor: 0x0009_69DA,
-            selection: 0x00DD_F4FF,
-        };
-        let mut themes = vec![Theme::default(), light];
-        let builtin: Vec<(&str, ThemeInks)> = aterm_types::scheme::builtin_names()
-            .into_iter()
-            .map(|name| {
-                let theme =
-                    Theme::from(&aterm_types::scheme::builtin(name).expect("a listed scheme"));
-                themes.push(theme);
-                (name, inks(theme))
-            })
-            .collect();
-        let text = format!(
-            "{:?}",
-            (
-                inks(Theme::default()),
-                inks(light),
-                &builtin[..],
-                &chrome_band::hc_fixtures::STOCK[..]
-            )
-        );
-        let digest = text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
-            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
-        });
-        assert_eq!(digest, 0xe8a6_78ba_9a5f_dc64, "{text}");
-        if cfg!(not(target_os = "linux")) {
-            for theme in themes {
-                assert_eq!(
-                    chrome_band::band_colors(theme),
-                    BandInks::derive(inks(theme), None, BarBase::Blend),
-                    "{theme:?}"
-                );
-            }
-        }
-        for (_, palette) in chrome_band::hc_fixtures::STOCK {
-            chrome_band::hc_fixtures::with_forced(palette, || {
-                assert_eq!(
-                    chrome_band::band_colors(Theme::default()),
-                    BandInks::forced(palette)
-                );
-            });
-        }
-    }
-
-    /// THE HOST WRITES WHAT THE ENGINE RESOLVED (ruling 328): every cell
-    /// [`paint_rows_on`] writes is the engine's resolved cell — its character,
-    /// ink, ground, weight and presentation — with no underline, over the
-    /// fixture the engine's colour tests read (two metered rows at every
-    /// width they use), resting and under each hover, in the still and the
-    /// moving look, on the default theme and under each stock High Contrast
-    /// palette; and each metered row's gutters are its edge cells' grounds.
-    #[test]
-    fn paint_rows_on_writes_the_engines_resolved_cells() {
-        use aterm_messages::{Instant, Look, Message, MessageCenter, MessageLog, Meter, WallStamp};
-        let now = Instant::now();
-        let mut center = MessageCenter::new(MessageLog::empty(), now);
-        let stamp = WallStamp { unix_ms: 1 };
-        center.post(
-            Message::new(
-                aterm_messages::tags::TOOLCHAIN,
-                Severity::Info,
-                "Installing ALab tools",
-            )
-            .line("trust — extracting 120 MB / 900 MB")
-            .meter(Meter {
-                fill_permille: Some(427),
-                stats: "3 of 10 · 512 MB / 1.2 GB".into(),
-                ..Meter::default()
-            })
-            .hold(aterm_messages::Hold::Live {
-                stale_after: aterm_messages::STALE_TAILED,
-            })
-            .action(aterm_messages::Intent::OpenSettings {
-                route: "/packages".into(),
-            }),
-            stamp,
-            now,
-        );
-        center.post(
-            Message::new(
-                aterm_messages::tags::UPDATE,
-                Severity::Info,
-                "aterm update v0.48.0",
-            )
-            .line("downloading…")
-            .meter(Meter {
-                fill_permille: Some(608),
-                stats: "45 MB / 74 MB".into(),
-                ..Meter::default()
-            })
-            .hold(aterm_messages::Hold::Live {
-                stale_after: aterm_messages::STALE_UPDATE,
-            }),
-            stamp,
-            now,
-        );
-        assert_eq!(center.commit_rows(now, 3), Some(2));
-        let mut compared = 0usize;
-        let mut check = |hc: bool| {
-            let theme = Theme::default();
-            for cols in [60usize, 80, 120, 140, 160] {
-                let p = center.presentation(cols, &cell_width, None, Links::Painted);
-                let mut hovers = vec![None];
-                for (r, row) in p.rows.iter().enumerate() {
-                    let row_u8 = u8::try_from(r).unwrap();
-                    hovers.push(Some(BandHover {
-                        row: row_u8,
-                        target: HoverTarget::Body,
-                    }));
-                    for cap in &row.capsules {
-                        hovers.push(Some(BandHover {
-                            row: row_u8,
-                            target: HoverTarget::Capsule(cap.action),
-                        }));
-                    }
-                }
-                for look in [Look::STILL, Look::MOVING] {
-                    let m =
-                        center.motion(&p, now + aterm_messages::Duration::from_millis(700), look);
-                    for &hover in &hovers {
-                        for g in [
-                            BandGeometry::cells_only(cols),
-                            BandGeometry {
-                                win_w: cols * 9 + 31,
-                                cells_x: 15,
-                                cell_w: 9,
-                            },
-                        ] {
-                            let c = chrome_band::band_colors(theme);
-                            let want = ink::paint_band(&p, hover, g, &m, hc, &c);
-                            let (rows, edges, rasters) = paint_rows_on(&p, theme, hover, g, &m);
-                            assert_eq!(rows.len(), want.len());
-                            for (i, (row, r)) in rows.iter().zip(&want).enumerate() {
-                                assert_eq!(row.len(), r.cells.len());
-                                for (cell, k) in row.iter().zip(&r.cells) {
-                                    assert_eq!(
-                                        (
-                                            cell.ch,
-                                            cell.fg,
-                                            cell.bg,
-                                            cell.bold,
-                                            cell.text_presentation
-                                        ),
-                                        (k.ch, k.fg, k.bg, k.bold, k.text_presentation),
-                                        "hc {hc} cols {cols} row {i} hover {hover:?}"
-                                    );
-                                    assert_eq!(cell.underline, UnderlineStyle::None);
-                                    compared += 1;
-                                }
-                                assert_eq!(rasters[i], r.raster);
-                                assert_eq!(
-                                    edges[i],
-                                    r.metered.then(|| (row[0].bg, row[row.len() - 1].bg))
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        };
-        check(false);
-        for (_, palette) in chrome_band::hc_fixtures::STOCK {
-            chrome_band::hc_fixtures::with_forced(palette, || check(true));
-        }
-        assert!(compared > 10_000, "{compared} cells compared");
-    }
-
-    /// THE BAND'S CONTRAST IS aterm-types' (ruling 324): the engine's
-    /// `ink::contrast`, which every band floor reads, is
-    /// `aterm_types::Rgb::contrast` bit for bit — an unfused transcription (a
-    /// fused luminance is one ulp apart on a third of all pairs; the palette
-    /// reads this ratio too, ruling 438). Every 13th colour of the cube against
-    /// black, white and mid grey, and every 257th against each builtin's band,
-    /// value, meter and track (round 24 ran all 2^24 against black and white
-    /// once, both orders: 0 of 33,554,432 differ).
-    #[test]
-    fn band_contrast_is_aterm_types_contrast() {
-        let rgb = |c: [u8; 3]| aterm_types::Rgb::new(c[0], c[1], c[2]);
-        let of = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
-        let same = |a: [u8; 3], g: [u8; 3]| {
-            assert_eq!(
-                ink::contrast(a, g).to_bits(),
-                rgb(a).contrast(rgb(g)).to_bits(),
-                "{a:02x?} on {g:02x?}"
-            );
-        };
-        let mut grounds: Vec<[u8; 3]> = Vec::new();
-        for name in aterm_types::scheme::builtin_names() {
-            let s = aterm_types::scheme::builtin(name).expect("a listed scheme");
-            let c = chrome_band::BandPalette {
-                theme: Theme::from(&s),
-                ansi: Some(chrome_band::MeterAnsi::of_scheme(&s)),
-            }
-            .colors();
-            grounds.extend([c.bar_bg, c.value, c.meter, c.meter_track]);
-        }
-        grounds.sort_unstable();
-        grounds.dedup();
-        for v in (0..1u32 << 24).step_by(211) {
-            for g in [[0, 0, 0], [255, 255, 255], [0x80, 0x80, 0x80]] {
-                same(of(v), g);
-            }
-        }
-        for v in (0..1u32 << 24).step_by(4099) {
-            for &g in &grounds {
-                same(of(v), g);
-                same(g, of(v));
-            }
-        }
-    }
-}

@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-1 for `TextSelectionLifecycle`
-//! (`aterm_spec::derive::text_selection_lifecycle_model`): the REAL
+//! (`aterm_models_core::text_selection_lifecycle_model`): the REAL
 //! `TextSelection` calls, driven from every state the model reaches, against
 //! the model's transitions.
 //!
@@ -15,10 +15,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use aterm_models_core::text_selection_lifecycle_model;
 use aterm_selection::{
     SelectionAnchor, SelectionSide, SelectionState, SelectionType, TextSelection,
 };
-use aterm_spec::derive::{Model, text_selection_lifecycle_model};
+use aterm_spec::derive::Model;
 use aterm_spec::verify;
 
 type State = BTreeMap<&'static str, i64>;

@@ -1088,6 +1088,66 @@ shape	IosevkaTerm-BoldItalic	ec1d8bee3d9b3bc0#0	-	liga=1,calt=1	lig.thin-arrow	-
 shape	IosevkaTerm-BoldItalic	ec1d8bee3d9b3bc0#0	-	liga=1,calt=1	lig.www	www	LTR Latn | 89:0:500 89:1:500 89:2:500
 shape	IosevkaTerm-BoldItalic	ec1d8bee3d9b3bc0#0	-	liga=1,calt=1	lig.zero	0	LTR Zzzz | 18:0:500
 shape	IosevkaTerm-BoldItalic	ec1d8bee3d9b3bc0#0	-	liga=1,calt=1	lig.zero-oh	0O0	LTR Latn | 18:0:500 49:1:500 18:2:500
+shape	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	liga=0,calt=0,dnom=1	feat.alternates	a0l1Il|g@&$	LTR Latn | 67:0:500 18:1:500 78:2:500 19:3:500 43:4:500 78:5:500 94:6:500 73:7:500 34:8:500 8:9:500 6:10:500
+shape	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	liga=0,calt=0,dnom=1	feat.caps	HelloWorld	LTR Latn | 42:0:500 71:1:500 78:2:500 78:3:500 81:4:500 57:5:500 81:6:500 84:7:500 78:8:500 70:9:500
+shape	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	liga=0,calt=0,dnom=1	feat.case	(A)-[B]{C}	LTR Latn | 10:0:500 35:1:500 11:2:500 15:3:500 61:4:500 36:5:500 63:6:500 93:7:500 37:8:500 95:9:500
+shape	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	liga=0,calt=0,dnom=1	feat.cell	g	LTR Latn | 73:0:500
+shape	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	liga=0,calt=0,dnom=1	feat.digits	0123456789	LTR Zzzz | 2834:0:500 2835:1:500 2836:2:500 2837:3:500 2838:4:500 2839:5:500 2840:6:500 2841:7:500 2842:8:500 2843:9:500
+shape	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	liga=0,calt=0,frac=1	feat.alternates	a0l1Il|g@&$	LTR Latn | 67:0:500 18:1:500 78:2:500 19:3:500 43:4:500 78:5:500 94:6:500 73:7:500 34:8:500 8:9:500 6:10:500
+shape	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	liga=0,calt=0,frac=1	feat.caps	HelloWorld	LTR Latn | 42:0:500 71:1:500 78:2:500 78:3:500 81:4:500 57:5:500 81:6:500 84:7:500 78:8:500 70:9:500
+shape	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	liga=0,calt=0,frac=1	feat.case	(A)-[B]{C}	LTR Latn | 10:0:500 35:1:500 11:2:500 15:3:500 61:4:500 36:5:500 63:6:500 93:7:500 37:8:500 95:9:500
+shape	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	liga=0,calt=0,frac=1	feat.cell	g	LTR Latn | 73:0:500
+shape	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	liga=0,calt=0,frac=1	feat.digits	0123456789	LTR Zzzz | 18:0:500 19:1:500 20:2:500 21:3:500 22:4:500 23:5:500 24:6:500 25:7:500 26:8:500 27:9:500
+shape	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	liga=0,calt=0,numr=1	feat.alternates	a0l1Il|g@&$	LTR Latn | 67:0:500 18:1:500 78:2:500 19:3:500 43:4:500 78:5:500 94:6:500 73:7:500 34:8:500 8:9:500 6:10:500
+shape	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	liga=0,calt=0,numr=1	feat.caps	HelloWorld	LTR Latn | 42:0:500 71:1:500 78:2:500 78:3:500 81:4:500 57:5:500 81:6:500 84:7:500 78:8:500 70:9:500
+shape	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	liga=0,calt=0,numr=1	feat.case	(A)-[B]{C}	LTR Latn | 10:0:500 35:1:500 11:2:500 15:3:500 61:4:500 36:5:500 63:6:500 93:7:500 37:8:500 95:9:500
+shape	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	liga=0,calt=0,numr=1	feat.cell	g	LTR Latn | 73:0:500
+shape	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	liga=0,calt=0,numr=1	feat.digits	0123456789	LTR Zzzz | 2820:0:500 122:1:500 115:2:500 116:3:500 2822:4:500 2823:5:500 2824:6:500 2825:7:500 2826:8:500 2827:9:500
+shape	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	liga=1,calt=1,dnom=1	feat.alternates	a0l1Il|g@&$	LTR Latn | 67:0:500 18:1:500 78:2:500 19:3:500 43:4:500 78:5:500 94:6:500 73:7:500 34:8:500 8:9:500 6:10:500
+shape	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	liga=1,calt=1,dnom=1	feat.caps	HelloWorld	LTR Latn | 42:0:500 71:1:500 78:2:500 78:3:500 81:4:500 57:5:500 81:6:500 84:7:500 78:8:500 70:9:500
+shape	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	liga=1,calt=1,dnom=1	feat.case	(A)-[B]{C}	LTR Latn | 10:0:500 35:1:500 11:2:500 15:3:500 61:4:500 36:5:500 63:6:500 93:7:500 37:8:500 95:9:500
+shape	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	liga=1,calt=1,dnom=1	feat.cell	g	LTR Latn | 73:0:500
+shape	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	liga=1,calt=1,dnom=1	feat.digits	0123456789	LTR Zzzz | 2834:0:500 2835:1:500 2836:2:500 2837:3:500 2838:4:500 2839:5:500 2840:6:500 2841:7:500 2842:8:500 2843:9:500
+shape	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	liga=1,calt=1,frac=1	feat.alternates	a0l1Il|g@&$	LTR Latn | 67:0:500 18:1:500 78:2:500 19:3:500 43:4:500 78:5:500 94:6:500 73:7:500 34:8:500 8:9:500 6:10:500
+shape	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	liga=1,calt=1,frac=1	feat.caps	HelloWorld	LTR Latn | 42:0:500 71:1:500 78:2:500 78:3:500 81:4:500 57:5:500 81:6:500 84:7:500 78:8:500 70:9:500
+shape	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	liga=1,calt=1,frac=1	feat.case	(A)-[B]{C}	LTR Latn | 10:0:500 35:1:500 11:2:500 15:3:500 61:4:500 36:5:500 63:6:500 93:7:500 37:8:500 95:9:500
+shape	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	liga=1,calt=1,frac=1	feat.cell	g	LTR Latn | 73:0:500
+shape	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	liga=1,calt=1,frac=1	feat.digits	0123456789	LTR Zzzz | 18:0:500 19:1:500 20:2:500 21:3:500 22:4:500 23:5:500 24:6:500 25:7:500 26:8:500 27:9:500
+shape	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	liga=1,calt=1,numr=1	feat.alternates	a0l1Il|g@&$	LTR Latn | 67:0:500 18:1:500 78:2:500 19:3:500 43:4:500 78:5:500 94:6:500 73:7:500 34:8:500 8:9:500 6:10:500
+shape	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	liga=1,calt=1,numr=1	feat.caps	HelloWorld	LTR Latn | 42:0:500 71:1:500 78:2:500 78:3:500 81:4:500 57:5:500 81:6:500 84:7:500 78:8:500 70:9:500
+shape	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	liga=1,calt=1,numr=1	feat.case	(A)-[B]{C}	LTR Latn | 10:0:500 35:1:500 11:2:500 15:3:500 61:4:500 36:5:500 63:6:500 93:7:500 37:8:500 95:9:500
+shape	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	liga=1,calt=1,numr=1	feat.cell	g	LTR Latn | 73:0:500
+shape	IosevkaTerm-ExtraBold	33ce6a66b694222a#0	-	liga=1,calt=1,numr=1	feat.digits	0123456789	LTR Zzzz | 2820:0:500 122:1:500 115:2:500 116:3:500 2822:4:500 2823:5:500 2824:6:500 2825:7:500 2826:8:500 2827:9:500
+shape	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	liga=0,calt=0,dnom=1	feat.alternates	a0l1Il|g@&$	LTR Latn | 67:0:500 18:1:500 78:2:500 19:3:500 43:4:500 78:5:500 94:6:500 73:7:500 34:8:500 8:9:500 6:10:500
+shape	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	liga=0,calt=0,dnom=1	feat.caps	HelloWorld	LTR Latn | 42:0:500 71:1:500 78:2:500 78:3:500 81:4:500 57:5:500 81:6:500 84:7:500 78:8:500 70:9:500
+shape	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	liga=0,calt=0,dnom=1	feat.case	(A)-[B]{C}	LTR Latn | 10:0:500 35:1:500 11:2:500 15:3:500 61:4:500 36:5:500 63:6:500 93:7:500 37:8:500 95:9:500
+shape	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	liga=0,calt=0,dnom=1	feat.cell	g	LTR Latn | 73:0:500
+shape	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	liga=0,calt=0,dnom=1	feat.digits	0123456789	LTR Zzzz | 2842:0:500 2843:1:500 2844:2:500 2845:3:500 2846:4:500 2847:5:500 2848:6:500 2849:7:500 2850:8:500 2851:9:500
+shape	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	liga=0,calt=0,frac=1	feat.alternates	a0l1Il|g@&$	LTR Latn | 67:0:500 18:1:500 78:2:500 19:3:500 43:4:500 78:5:500 94:6:500 73:7:500 34:8:500 8:9:500 6:10:500
+shape	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	liga=0,calt=0,frac=1	feat.caps	HelloWorld	LTR Latn | 42:0:500 71:1:500 78:2:500 78:3:500 81:4:500 57:5:500 81:6:500 84:7:500 78:8:500 70:9:500
+shape	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	liga=0,calt=0,frac=1	feat.case	(A)-[B]{C}	LTR Latn | 10:0:500 35:1:500 11:2:500 15:3:500 61:4:500 36:5:500 63:6:500 93:7:500 37:8:500 95:9:500
+shape	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	liga=0,calt=0,frac=1	feat.cell	g	LTR Latn | 73:0:500
+shape	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	liga=0,calt=0,frac=1	feat.digits	0123456789	LTR Zzzz | 18:0:500 19:1:500 20:2:500 21:3:500 22:4:500 23:5:500 24:6:500 25:7:500 26:8:500 27:9:500
+shape	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	liga=0,calt=0,numr=1	feat.alternates	a0l1Il|g@&$	LTR Latn | 67:0:500 18:1:500 78:2:500 19:3:500 43:4:500 78:5:500 94:6:500 73:7:500 34:8:500 8:9:500 6:10:500
+shape	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	liga=0,calt=0,numr=1	feat.caps	HelloWorld	LTR Latn | 42:0:500 71:1:500 78:2:500 78:3:500 81:4:500 57:5:500 81:6:500 84:7:500 78:8:500 70:9:500
+shape	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	liga=0,calt=0,numr=1	feat.case	(A)-[B]{C}	LTR Latn | 10:0:500 35:1:500 11:2:500 15:3:500 61:4:500 36:5:500 63:6:500 93:7:500 37:8:500 95:9:500
+shape	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	liga=0,calt=0,numr=1	feat.cell	g	LTR Latn | 73:0:500
+shape	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	liga=0,calt=0,numr=1	feat.digits	0123456789	LTR Zzzz | 2828:0:500 122:1:500 115:2:500 116:3:500 2830:4:500 2831:5:500 2832:6:500 2833:7:500 2834:8:500 2835:9:500
+shape	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	liga=1,calt=1,dnom=1	feat.alternates	a0l1Il|g@&$	LTR Latn | 67:0:500 18:1:500 78:2:500 19:3:500 43:4:500 78:5:500 94:6:500 73:7:500 34:8:500 8:9:500 6:10:500
+shape	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	liga=1,calt=1,dnom=1	feat.caps	HelloWorld	LTR Latn | 42:0:500 71:1:500 78:2:500 78:3:500 81:4:500 57:5:500 81:6:500 84:7:500 78:8:500 70:9:500
+shape	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	liga=1,calt=1,dnom=1	feat.case	(A)-[B]{C}	LTR Latn | 10:0:500 35:1:500 11:2:500 15:3:500 61:4:500 36:5:500 63:6:500 93:7:500 37:8:500 95:9:500
+shape	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	liga=1,calt=1,dnom=1	feat.cell	g	LTR Latn | 73:0:500
+shape	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	liga=1,calt=1,dnom=1	feat.digits	0123456789	LTR Zzzz | 2842:0:500 2843:1:500 2844:2:500 2845:3:500 2846:4:500 2847:5:500 2848:6:500 2849:7:500 2850:8:500 2851:9:500
+shape	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	liga=1,calt=1,frac=1	feat.alternates	a0l1Il|g@&$	LTR Latn | 67:0:500 18:1:500 78:2:500 19:3:500 43:4:500 78:5:500 94:6:500 73:7:500 34:8:500 8:9:500 6:10:500
+shape	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	liga=1,calt=1,frac=1	feat.caps	HelloWorld	LTR Latn | 42:0:500 71:1:500 78:2:500 78:3:500 81:4:500 57:5:500 81:6:500 84:7:500 78:8:500 70:9:500
+shape	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	liga=1,calt=1,frac=1	feat.case	(A)-[B]{C}	LTR Latn | 10:0:500 35:1:500 11:2:500 15:3:500 61:4:500 36:5:500 63:6:500 93:7:500 37:8:500 95:9:500
+shape	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	liga=1,calt=1,frac=1	feat.cell	g	LTR Latn | 73:0:500
+shape	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	liga=1,calt=1,frac=1	feat.digits	0123456789	LTR Zzzz | 18:0:500 19:1:500 20:2:500 21:3:500 22:4:500 23:5:500 24:6:500 25:7:500 26:8:500 27:9:500
+shape	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	liga=1,calt=1,numr=1	feat.alternates	a0l1Il|g@&$	LTR Latn | 67:0:500 18:1:500 78:2:500 19:3:500 43:4:500 78:5:500 94:6:500 73:7:500 34:8:500 8:9:500 6:10:500
+shape	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	liga=1,calt=1,numr=1	feat.caps	HelloWorld	LTR Latn | 42:0:500 71:1:500 78:2:500 78:3:500 81:4:500 57:5:500 81:6:500 84:7:500 78:8:500 70:9:500
+shape	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	liga=1,calt=1,numr=1	feat.case	(A)-[B]{C}	LTR Latn | 10:0:500 35:1:500 11:2:500 15:3:500 61:4:500 36:5:500 63:6:500 93:7:500 37:8:500 95:9:500
+shape	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	liga=1,calt=1,numr=1	feat.cell	g	LTR Latn | 73:0:500
+shape	IosevkaTerm-ExtraBoldItalic	6e9267e285ed9bc8#0	-	liga=1,calt=1,numr=1	feat.digits	0123456789	LTR Zzzz | 2828:0:500 122:1:500 115:2:500 116:3:500 2830:4:500 2831:5:500 2832:6:500 2833:7:500 2834:8:500 2835:9:500
 shape	IosevkaTerm-Italic	595fb17ffbdf0d02#0	-	liga=1,calt=1	ar.digit.visual.0	2\u{628}	RTL Arab | 0:1:500 20:0:500
 shape	IosevkaTerm-Italic	595fb17ffbdf0d02#0	-	liga=1,calt=1	ar.indic-digits.visual.0	\u{661}\u{662}\u{663}	RTL Arab | 0:4:500 0:2:500 0:0:500
 shape	IosevkaTerm-Italic	595fb17ffbdf0d02#0	-	liga=1,calt=1	ar.lam-alef.visual.0	\u{627}\u{644}	RTL Arab | 0:2:500 0:0:500
@@ -1266,6 +1326,156 @@ shape	IosevkaTerm-Regular	2ccc643fb1e37af3#0	-	liga=1,calt=1,zero=1,ss01=1,cv01=
 shape	IosevkaTerm-Regular	2ccc643fb1e37af3#0	-	liga=1,calt=1,zero=1,ss01=1,cv01=2	lig.www	www	LTR Latn | 89:0:500 89:1:500 89:2:500
 shape	IosevkaTerm-Regular	2ccc643fb1e37af3#0	-	liga=1,calt=1,zero=1,ss01=1,cv01=2	lig.zero	0	LTR Zzzz | 18:0:500
 shape	IosevkaTerm-Regular	2ccc643fb1e37af3#0	-	liga=1,calt=1,zero=1,ss01=1,cv01=2	lig.zero-oh	0O0	LTR Latn | 18:0:500 49:1:500 18:2:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,dnom=1	feat.alternates	a0l1Il|g@&$	LTR Latn | 67:0:500 18:1:500 78:2:500 19:3:500 43:4:500 78:5:500 94:6:500 73:7:500 34:8:500 8:9:500 6:10:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,dnom=1	feat.caps	HelloWorld	LTR Latn | 42:0:500 71:1:500 78:2:500 78:3:500 81:4:500 57:5:500 81:6:500 84:7:500 78:8:500 70:9:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,dnom=1	feat.case	(A)-[B]{C}	LTR Latn | 10:0:500 35:1:500 11:2:500 15:3:500 61:4:500 36:5:500 63:6:500 93:7:500 37:8:500 95:9:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,dnom=1	feat.cell	g	LTR Latn | 73:0:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,dnom=1	feat.digits	0123456789	LTR Zzzz | 2834:0:500 2835:1:500 2836:2:500 2837:3:500 2838:4:500 2839:5:500 2840:6:500 2841:7:500 2842:8:500 2843:9:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,dnom=1	lig.and	&&	LTR Zzzz | 8:0:500 8:1:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,dnom=1	lig.arrow	=>	LTR Zzzz | 31:0:500 32:1:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,dnom=1	lig.eq-run	=====	LTR Zzzz | 31:0:500 31:1:500 31:2:500 31:3:500 31:4:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,dnom=1	lig.eq3	===	LTR Zzzz | 31:0:500 31:1:500 31:2:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,dnom=1	lig.hello	Hello	LTR Latn | 42:0:500 71:1:500 78:2:500 78:3:500 81:4:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,dnom=1	lig.hex	0xFF	LTR Latn | 18:0:500 90:1:500 40:2:500 40:3:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,dnom=1	lig.html-comment	<!--	LTR Zzzz | 30:0:500 3:1:500 15:2:500 15:3:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,dnom=1	lig.neq	!=	LTR Zzzz | 3:0:500 31:1:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,dnom=1	lig.office	office	LTR Latn | 81:0:500 72:1:500 72:2:500 75:3:500 69:4:500 71:5:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,dnom=1	lig.path	::	LTR Zzzz | 28:0:500 28:1:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,dnom=1	lig.spaceship	<=>	LTR Zzzz | 30:0:500 31:1:500 32:2:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,dnom=1	lig.thin-arrow	->	LTR Zzzz | 15:0:500 32:1:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,dnom=1	lig.www	www	LTR Latn | 89:0:500 89:1:500 89:2:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,dnom=1	lig.zero	0	LTR Zzzz | 2834:0:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,dnom=1	lig.zero-oh	0O0	LTR Latn | 18:0:500 49:1:500 18:2:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,frac=1	feat.alternates	a0l1Il|g@&$	LTR Latn | 67:0:500 18:1:500 78:2:500 19:3:500 43:4:500 78:5:500 94:6:500 73:7:500 34:8:500 8:9:500 6:10:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,frac=1	feat.caps	HelloWorld	LTR Latn | 42:0:500 71:1:500 78:2:500 78:3:500 81:4:500 57:5:500 81:6:500 84:7:500 78:8:500 70:9:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,frac=1	feat.case	(A)-[B]{C}	LTR Latn | 10:0:500 35:1:500 11:2:500 15:3:500 61:4:500 36:5:500 63:6:500 93:7:500 37:8:500 95:9:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,frac=1	feat.cell	g	LTR Latn | 73:0:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,frac=1	feat.digits	0123456789	LTR Zzzz | 18:0:500 19:1:500 20:2:500 21:3:500 22:4:500 23:5:500 24:6:500 25:7:500 26:8:500 27:9:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,frac=1	lig.and	&&	LTR Zzzz | 8:0:500 8:1:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,frac=1	lig.arrow	=>	LTR Zzzz | 31:0:500 32:1:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,frac=1	lig.eq-run	=====	LTR Zzzz | 31:0:500 31:1:500 31:2:500 31:3:500 31:4:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,frac=1	lig.eq3	===	LTR Zzzz | 31:0:500 31:1:500 31:2:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,frac=1	lig.hello	Hello	LTR Latn | 42:0:500 71:1:500 78:2:500 78:3:500 81:4:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,frac=1	lig.hex	0xFF	LTR Latn | 18:0:500 90:1:500 40:2:500 40:3:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,frac=1	lig.html-comment	<!--	LTR Zzzz | 30:0:500 3:1:500 15:2:500 15:3:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,frac=1	lig.neq	!=	LTR Zzzz | 3:0:500 31:1:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,frac=1	lig.office	office	LTR Latn | 81:0:500 72:1:500 72:2:500 75:3:500 69:4:500 71:5:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,frac=1	lig.path	::	LTR Zzzz | 28:0:500 28:1:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,frac=1	lig.spaceship	<=>	LTR Zzzz | 30:0:500 31:1:500 32:2:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,frac=1	lig.thin-arrow	->	LTR Zzzz | 15:0:500 32:1:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,frac=1	lig.www	www	LTR Latn | 89:0:500 89:1:500 89:2:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,frac=1	lig.zero	0	LTR Zzzz | 18:0:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,frac=1	lig.zero-oh	0O0	LTR Latn | 18:0:500 49:1:500 18:2:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,numr=1	feat.alternates	a0l1Il|g@&$	LTR Latn | 67:0:500 18:1:500 78:2:500 19:3:500 43:4:500 78:5:500 94:6:500 73:7:500 34:8:500 8:9:500 6:10:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,numr=1	feat.caps	HelloWorld	LTR Latn | 42:0:500 71:1:500 78:2:500 78:3:500 81:4:500 57:5:500 81:6:500 84:7:500 78:8:500 70:9:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,numr=1	feat.case	(A)-[B]{C}	LTR Latn | 10:0:500 35:1:500 11:2:500 15:3:500 61:4:500 36:5:500 63:6:500 93:7:500 37:8:500 95:9:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,numr=1	feat.cell	g	LTR Latn | 73:0:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,numr=1	feat.digits	0123456789	LTR Zzzz | 2820:0:500 122:1:500 115:2:500 116:3:500 2822:4:500 2823:5:500 2824:6:500 2825:7:500 2826:8:500 2827:9:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,numr=1	lig.and	&&	LTR Zzzz | 8:0:500 8:1:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,numr=1	lig.arrow	=>	LTR Zzzz | 31:0:500 32:1:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,numr=1	lig.eq-run	=====	LTR Zzzz | 31:0:500 31:1:500 31:2:500 31:3:500 31:4:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,numr=1	lig.eq3	===	LTR Zzzz | 31:0:500 31:1:500 31:2:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,numr=1	lig.hello	Hello	LTR Latn | 42:0:500 71:1:500 78:2:500 78:3:500 81:4:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,numr=1	lig.hex	0xFF	LTR Latn | 18:0:500 90:1:500 40:2:500 40:3:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,numr=1	lig.html-comment	<!--	LTR Zzzz | 30:0:500 3:1:500 15:2:500 15:3:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,numr=1	lig.neq	!=	LTR Zzzz | 3:0:500 31:1:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,numr=1	lig.office	office	LTR Latn | 81:0:500 72:1:500 72:2:500 75:3:500 69:4:500 71:5:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,numr=1	lig.path	::	LTR Zzzz | 28:0:500 28:1:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,numr=1	lig.spaceship	<=>	LTR Zzzz | 30:0:500 31:1:500 32:2:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,numr=1	lig.thin-arrow	->	LTR Zzzz | 15:0:500 32:1:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,numr=1	lig.www	www	LTR Latn | 89:0:500 89:1:500 89:2:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,numr=1	lig.zero	0	LTR Zzzz | 2820:0:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=0,calt=0,numr=1	lig.zero-oh	0O0	LTR Latn | 18:0:500 49:1:500 18:2:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,dnom=1	feat.alternates	a0l1Il|g@&$	LTR Latn | 67:0:500 18:1:500 78:2:500 19:3:500 43:4:500 78:5:500 94:6:500 73:7:500 34:8:500 8:9:500 6:10:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,dnom=1	feat.caps	HelloWorld	LTR Latn | 42:0:500 71:1:500 78:2:500 78:3:500 81:4:500 57:5:500 81:6:500 84:7:500 78:8:500 70:9:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,dnom=1	feat.case	(A)-[B]{C}	LTR Latn | 10:0:500 35:1:500 11:2:500 15:3:500 61:4:500 36:5:500 63:6:500 93:7:500 37:8:500 95:9:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,dnom=1	feat.cell	g	LTR Latn | 73:0:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,dnom=1	feat.digits	0123456789	LTR Zzzz | 2834:0:500 2835:1:500 2836:2:500 2837:3:500 2838:4:500 2839:5:500 2840:6:500 2841:7:500 2842:8:500 2843:9:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,dnom=1	lig.and	&&	LTR Zzzz | 8:0:500 8:1:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,dnom=1	lig.arrow	=>	LTR Zzzz | 31:0:500 32:1:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,dnom=1	lig.eq-run	=====	LTR Zzzz | 31:0:500 31:1:500 31:2:500 31:3:500 31:4:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,dnom=1	lig.eq3	===	LTR Zzzz | 31:0:500 31:1:500 31:2:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,dnom=1	lig.hello	Hello	LTR Latn | 42:0:500 71:1:500 78:2:500 78:3:500 81:4:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,dnom=1	lig.hex	0xFF	LTR Latn | 18:0:500 90:1:500 40:2:500 40:3:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,dnom=1	lig.html-comment	<!--	LTR Zzzz | 30:0:500 3:1:500 15:2:500 15:3:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,dnom=1	lig.neq	!=	LTR Zzzz | 3:0:500 31:1:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,dnom=1	lig.office	office	LTR Latn | 81:0:500 72:1:500 72:2:500 75:3:500 69:4:500 71:5:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,dnom=1	lig.path	::	LTR Zzzz | 28:0:500 28:1:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,dnom=1	lig.spaceship	<=>	LTR Zzzz | 30:0:500 31:1:500 32:2:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,dnom=1	lig.thin-arrow	->	LTR Zzzz | 15:0:500 32:1:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,dnom=1	lig.www	www	LTR Latn | 89:0:500 89:1:500 89:2:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,dnom=1	lig.zero	0	LTR Zzzz | 2834:0:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,dnom=1	lig.zero-oh	0O0	LTR Latn | 18:0:500 49:1:500 18:2:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,frac=1	feat.alternates	a0l1Il|g@&$	LTR Latn | 67:0:500 18:1:500 78:2:500 19:3:500 43:4:500 78:5:500 94:6:500 73:7:500 34:8:500 8:9:500 6:10:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,frac=1	feat.caps	HelloWorld	LTR Latn | 42:0:500 71:1:500 78:2:500 78:3:500 81:4:500 57:5:500 81:6:500 84:7:500 78:8:500 70:9:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,frac=1	feat.case	(A)-[B]{C}	LTR Latn | 10:0:500 35:1:500 11:2:500 15:3:500 61:4:500 36:5:500 63:6:500 93:7:500 37:8:500 95:9:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,frac=1	feat.cell	g	LTR Latn | 73:0:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,frac=1	feat.digits	0123456789	LTR Zzzz | 18:0:500 19:1:500 20:2:500 21:3:500 22:4:500 23:5:500 24:6:500 25:7:500 26:8:500 27:9:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,frac=1	lig.and	&&	LTR Zzzz | 8:0:500 8:1:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,frac=1	lig.arrow	=>	LTR Zzzz | 31:0:500 32:1:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,frac=1	lig.eq-run	=====	LTR Zzzz | 31:0:500 31:1:500 31:2:500 31:3:500 31:4:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,frac=1	lig.eq3	===	LTR Zzzz | 31:0:500 31:1:500 31:2:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,frac=1	lig.hello	Hello	LTR Latn | 42:0:500 71:1:500 78:2:500 78:3:500 81:4:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,frac=1	lig.hex	0xFF	LTR Latn | 18:0:500 90:1:500 40:2:500 40:3:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,frac=1	lig.html-comment	<!--	LTR Zzzz | 30:0:500 3:1:500 15:2:500 15:3:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,frac=1	lig.neq	!=	LTR Zzzz | 3:0:500 31:1:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,frac=1	lig.office	office	LTR Latn | 81:0:500 72:1:500 72:2:500 75:3:500 69:4:500 71:5:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,frac=1	lig.path	::	LTR Zzzz | 28:0:500 28:1:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,frac=1	lig.spaceship	<=>	LTR Zzzz | 30:0:500 31:1:500 32:2:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,frac=1	lig.thin-arrow	->	LTR Zzzz | 15:0:500 32:1:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,frac=1	lig.www	www	LTR Latn | 89:0:500 89:1:500 89:2:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,frac=1	lig.zero	0	LTR Zzzz | 18:0:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,frac=1	lig.zero-oh	0O0	LTR Latn | 18:0:500 49:1:500 18:2:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,numr=1	feat.alternates	a0l1Il|g@&$	LTR Latn | 67:0:500 18:1:500 78:2:500 19:3:500 43:4:500 78:5:500 94:6:500 73:7:500 34:8:500 8:9:500 6:10:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,numr=1	feat.caps	HelloWorld	LTR Latn | 42:0:500 71:1:500 78:2:500 78:3:500 81:4:500 57:5:500 81:6:500 84:7:500 78:8:500 70:9:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,numr=1	feat.case	(A)-[B]{C}	LTR Latn | 10:0:500 35:1:500 11:2:500 15:3:500 61:4:500 36:5:500 63:6:500 93:7:500 37:8:500 95:9:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,numr=1	feat.cell	g	LTR Latn | 73:0:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,numr=1	feat.digits	0123456789	LTR Zzzz | 2820:0:500 122:1:500 115:2:500 116:3:500 2822:4:500 2823:5:500 2824:6:500 2825:7:500 2826:8:500 2827:9:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,numr=1	lig.and	&&	LTR Zzzz | 8:0:500 8:1:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,numr=1	lig.arrow	=>	LTR Zzzz | 31:0:500 32:1:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,numr=1	lig.eq-run	=====	LTR Zzzz | 31:0:500 31:1:500 31:2:500 31:3:500 31:4:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,numr=1	lig.eq3	===	LTR Zzzz | 31:0:500 31:1:500 31:2:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,numr=1	lig.hello	Hello	LTR Latn | 42:0:500 71:1:500 78:2:500 78:3:500 81:4:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,numr=1	lig.hex	0xFF	LTR Latn | 18:0:500 90:1:500 40:2:500 40:3:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,numr=1	lig.html-comment	<!--	LTR Zzzz | 30:0:500 3:1:500 15:2:500 15:3:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,numr=1	lig.neq	!=	LTR Zzzz | 3:0:500 31:1:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,numr=1	lig.office	office	LTR Latn | 81:0:500 72:1:500 72:2:500 75:3:500 69:4:500 71:5:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,numr=1	lig.path	::	LTR Zzzz | 28:0:500 28:1:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,numr=1	lig.spaceship	<=>	LTR Zzzz | 30:0:500 31:1:500 32:2:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,numr=1	lig.thin-arrow	->	LTR Zzzz | 15:0:500 32:1:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,numr=1	lig.www	www	LTR Latn | 89:0:500 89:1:500 89:2:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,numr=1	lig.zero	0	LTR Zzzz | 2820:0:500
+shape	IosevkaTerm-SemiBold	c017b4ccc28aea3a#0	-	liga=1,calt=1,numr=1	lig.zero-oh	0O0	LTR Latn | 18:0:500 49:1:500 18:2:500
+shape	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	liga=0,calt=0,dnom=1	feat.alternates	a0l1Il|g@&$	LTR Latn | 67:0:500 18:1:500 78:2:500 19:3:500 43:4:500 78:5:500 94:6:500 73:7:500 34:8:500 8:9:500 6:10:500
+shape	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	liga=0,calt=0,dnom=1	feat.caps	HelloWorld	LTR Latn | 42:0:500 71:1:500 78:2:500 78:3:500 81:4:500 57:5:500 81:6:500 84:7:500 78:8:500 70:9:500
+shape	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	liga=0,calt=0,dnom=1	feat.case	(A)-[B]{C}	LTR Latn | 10:0:500 35:1:500 11:2:500 15:3:500 61:4:500 36:5:500 63:6:500 93:7:500 37:8:500 95:9:500
+shape	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	liga=0,calt=0,dnom=1	feat.cell	g	LTR Latn | 73:0:500
+shape	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	liga=0,calt=0,dnom=1	feat.digits	0123456789	LTR Zzzz | 2842:0:500 2843:1:500 2844:2:500 2845:3:500 2846:4:500 2847:5:500 2848:6:500 2849:7:500 2850:8:500 2851:9:500
+shape	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	liga=0,calt=0,frac=1	feat.alternates	a0l1Il|g@&$	LTR Latn | 67:0:500 18:1:500 78:2:500 19:3:500 43:4:500 78:5:500 94:6:500 73:7:500 34:8:500 8:9:500 6:10:500
+shape	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	liga=0,calt=0,frac=1	feat.caps	HelloWorld	LTR Latn | 42:0:500 71:1:500 78:2:500 78:3:500 81:4:500 57:5:500 81:6:500 84:7:500 78:8:500 70:9:500
+shape	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	liga=0,calt=0,frac=1	feat.case	(A)-[B]{C}	LTR Latn | 10:0:500 35:1:500 11:2:500 15:3:500 61:4:500 36:5:500 63:6:500 93:7:500 37:8:500 95:9:500
+shape	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	liga=0,calt=0,frac=1	feat.cell	g	LTR Latn | 73:0:500
+shape	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	liga=0,calt=0,frac=1	feat.digits	0123456789	LTR Zzzz | 18:0:500 19:1:500 20:2:500 21:3:500 22:4:500 23:5:500 24:6:500 25:7:500 26:8:500 27:9:500
+shape	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	liga=0,calt=0,numr=1	feat.alternates	a0l1Il|g@&$	LTR Latn | 67:0:500 18:1:500 78:2:500 19:3:500 43:4:500 78:5:500 94:6:500 73:7:500 34:8:500 8:9:500 6:10:500
+shape	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	liga=0,calt=0,numr=1	feat.caps	HelloWorld	LTR Latn | 42:0:500 71:1:500 78:2:500 78:3:500 81:4:500 57:5:500 81:6:500 84:7:500 78:8:500 70:9:500
+shape	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	liga=0,calt=0,numr=1	feat.case	(A)-[B]{C}	LTR Latn | 10:0:500 35:1:500 11:2:500 15:3:500 61:4:500 36:5:500 63:6:500 93:7:500 37:8:500 95:9:500
+shape	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	liga=0,calt=0,numr=1	feat.cell	g	LTR Latn | 73:0:500
+shape	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	liga=0,calt=0,numr=1	feat.digits	0123456789	LTR Zzzz | 2828:0:500 122:1:500 115:2:500 116:3:500 2830:4:500 2831:5:500 2832:6:500 2833:7:500 2834:8:500 2835:9:500
+shape	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	liga=1,calt=1,dnom=1	feat.alternates	a0l1Il|g@&$	LTR Latn | 67:0:500 18:1:500 78:2:500 19:3:500 43:4:500 78:5:500 94:6:500 73:7:500 34:8:500 8:9:500 6:10:500
+shape	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	liga=1,calt=1,dnom=1	feat.caps	HelloWorld	LTR Latn | 42:0:500 71:1:500 78:2:500 78:3:500 81:4:500 57:5:500 81:6:500 84:7:500 78:8:500 70:9:500
+shape	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	liga=1,calt=1,dnom=1	feat.case	(A)-[B]{C}	LTR Latn | 10:0:500 35:1:500 11:2:500 15:3:500 61:4:500 36:5:500 63:6:500 93:7:500 37:8:500 95:9:500
+shape	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	liga=1,calt=1,dnom=1	feat.cell	g	LTR Latn | 73:0:500
+shape	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	liga=1,calt=1,dnom=1	feat.digits	0123456789	LTR Zzzz | 2842:0:500 2843:1:500 2844:2:500 2845:3:500 2846:4:500 2847:5:500 2848:6:500 2849:7:500 2850:8:500 2851:9:500
+shape	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	liga=1,calt=1,frac=1	feat.alternates	a0l1Il|g@&$	LTR Latn | 67:0:500 18:1:500 78:2:500 19:3:500 43:4:500 78:5:500 94:6:500 73:7:500 34:8:500 8:9:500 6:10:500
+shape	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	liga=1,calt=1,frac=1	feat.caps	HelloWorld	LTR Latn | 42:0:500 71:1:500 78:2:500 78:3:500 81:4:500 57:5:500 81:6:500 84:7:500 78:8:500 70:9:500
+shape	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	liga=1,calt=1,frac=1	feat.case	(A)-[B]{C}	LTR Latn | 10:0:500 35:1:500 11:2:500 15:3:500 61:4:500 36:5:500 63:6:500 93:7:500 37:8:500 95:9:500
+shape	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	liga=1,calt=1,frac=1	feat.cell	g	LTR Latn | 73:0:500
+shape	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	liga=1,calt=1,frac=1	feat.digits	0123456789	LTR Zzzz | 18:0:500 19:1:500 20:2:500 21:3:500 22:4:500 23:5:500 24:6:500 25:7:500 26:8:500 27:9:500
+shape	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	liga=1,calt=1,numr=1	feat.alternates	a0l1Il|g@&$	LTR Latn | 67:0:500 18:1:500 78:2:500 19:3:500 43:4:500 78:5:500 94:6:500 73:7:500 34:8:500 8:9:500 6:10:500
+shape	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	liga=1,calt=1,numr=1	feat.caps	HelloWorld	LTR Latn | 42:0:500 71:1:500 78:2:500 78:3:500 81:4:500 57:5:500 81:6:500 84:7:500 78:8:500 70:9:500
+shape	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	liga=1,calt=1,numr=1	feat.case	(A)-[B]{C}	LTR Latn | 10:0:500 35:1:500 11:2:500 15:3:500 61:4:500 36:5:500 63:6:500 93:7:500 37:8:500 95:9:500
+shape	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	liga=1,calt=1,numr=1	feat.cell	g	LTR Latn | 73:0:500
+shape	IosevkaTerm-SemiBoldItalic	1c6e69c1643f5bc3#0	-	liga=1,calt=1,numr=1	feat.digits	0123456789	LTR Zzzz | 2828:0:500 122:1:500 115:2:500 116:3:500 2830:4:500 2831:5:500 2832:6:500 2833:7:500 2834:8:500 2835:9:500
 shape	JetBrainsMono-Bold	6ab899dbbae41e07#0	-	liga=1,calt=1	ar.digit.visual.0	2\u{628}	RTL Arab | 0:1:600 726:0:600
 shape	JetBrainsMono-Bold	6ab899dbbae41e07#0	-	liga=1,calt=1	ar.indic-digits.visual.0	\u{661}\u{662}\u{663}	RTL Arab | 0:4:600 0:2:600 0:0:600
 shape	JetBrainsMono-Bold	6ab899dbbae41e07#0	-	liga=1,calt=1	ar.lam-alef.visual.0	\u{627}\u{644}	RTL Arab | 0:2:600 0:0:600

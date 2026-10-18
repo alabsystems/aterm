@@ -1,0 +1,40 @@
+# claude-code 2.1.301 · MEASURED 2026-10-15, `aterm ctl text` of a private headless aterm (10x40, aterm 0.104.0) running the real Claude Code (tools/real-claude-lab) · a turn in flight, the pane 10 columns wide: the spinner with its glyph on a row of its own (`✻` over `Infusing…`), a tip under it
+     (ctrl
+     +b to
+     run
+     in ba
+     ckgro
+     und)
+
+❯ toolsta
+  rt
+  ctrl+ent
+  er to
+  send now
+
+✻
+Infusing…
+  ⎿  Tip:
+     Use
+     /btw
+     to
+     ask a
+
+     quick
+     side
+     ques
+     tion
+     witho
+     ut in
+     terru
+     pting
+     Clau
+     de's
+     curre
+     nt
+     work
+
+──────────
+❯ Press u…
+──────────
+  ⏵⏵

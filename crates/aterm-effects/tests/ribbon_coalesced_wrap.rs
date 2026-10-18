@@ -54,7 +54,6 @@ fn wrap(coalesced: bool, glyph_width: u16, boundary_class: TypedClass) -> Wrappe
         ring: true,
         beam: false,
         head_dx: 0.5,
-        pack: None,
     };
     let mut glow = CursorGlow::default();
     let mut quads = Vec::new();
@@ -127,24 +126,42 @@ fn wrap(coalesced: bool, glyph_width: u16, boundary_class: TypedClass) -> Wrappe
     }
 }
 
+/// A Space and the next glyph echoed on separate frames or coalesced into
+/// one, a narrow glyph or a wide one: the wrap keeps the moved word lit on the
+/// lower row (`x` relocated at column 2, the new key at 3, a wide key's
+/// second cell at 4). And the old row flows into the last cell the wrap kept:
+/// on the tick after the wrap the old row (carried up by the scroll) freezes
+/// its fold edge while the moved Space and glyph are still leaving in its
+/// cohort, and the edge is the last prefix cell (`76 − width`), not the
+/// vacated columns' end at 77 (`Ribbon::flow_target`), so no light slides
+/// over columns the text left.
 #[test]
-fn separated_space_and_glyph_wrap_keep_the_moved_word_lit() {
-    let columns = wrapped_columns(false, 1, TypedClass::Space);
-    assert!(columns.contains(&2), "the relocated x is dark: {columns:?}");
-    assert!(columns.contains(&3), "the new y is dark: {columns:?}");
-}
-
-#[test]
-fn coalesced_space_and_glyph_wrap_keep_the_moved_word_lit() {
-    let columns = wrapped_columns(true, 1, TypedClass::Space);
-    assert!(columns.contains(&2), "the relocated x is dark: {columns:?}");
-    assert!(columns.contains(&3), "the new y is dark: {columns:?}");
-}
-
-#[test]
-fn coalesced_space_and_wide_glyph_wrap_keep_both_moved_cells_lit() {
-    let columns = wrapped_columns(true, 2, TypedClass::Space);
-    assert_eq!(columns, BTreeSet::from([2, 3, 4]));
+fn a_space_and_glyph_wrap_keeps_the_moved_word_lit_and_the_old_row_flows_into_its_kept_end() {
+    for (coalesced, width) in [(false, 1u16), (true, 1), (true, 2)] {
+        let what = format!("coalesced={coalesced} width={width}");
+        let w = wrap(coalesced, width, TypedClass::Space);
+        let want: BTreeSet<u16> = (2..4 + width - 1).collect();
+        assert!(
+            w.columns.is_superset(&want),
+            "{what}: the moved word is dark: {:?}",
+            w.columns
+        );
+        if width == 2 {
+            assert_eq!(w.columns, want, "{what}: both moved cells, and only them");
+        }
+        let kept_end = 76 - width;
+        assert!(
+            w.old_leaving.iter().any(|&col| col > kept_end),
+            "{what}: the fixture's point — the vacated cells are still leaving in the \
+             flowing band: {:?}",
+            w.old_leaving
+        );
+        assert_eq!(
+            w.old_edge,
+            Some(kept_end),
+            "{what}: the old row flows into its kept end"
+        );
+    }
 }
 
 #[test]
@@ -157,27 +174,4 @@ fn the_space_class_is_required_to_relocate_the_word() {
         "plain Glyph cannot invent a word boundary"
     );
     assert!(plain.contains(&3), "the new key itself still lights");
-}
-
-/// On the tick after the wrap the old row (carried up by the scroll) freezes
-/// its fold edge at the last prefix cell (`76 − width`), not the vacated
-/// columns' end at 77 (`Ribbon::flow_target`), while the moved Space and glyph
-/// are still leaving in its cohort: no light slides over columns the text left.
-#[test]
-fn the_old_row_flows_into_the_last_cell_the_wrap_kept() {
-    for (coalesced, width) in [(false, 1u16), (true, 1), (true, 2)] {
-        let w = wrap(coalesced, width, TypedClass::Space);
-        let kept_end = 76 - width;
-        assert!(
-            w.old_leaving.iter().any(|&col| col > kept_end),
-            "coalesced={coalesced} width={width}: the fixture's point — the vacated cells are \
-             still leaving in the flowing band: {:?}",
-            w.old_leaving
-        );
-        assert_eq!(
-            w.old_edge,
-            Some(kept_end),
-            "coalesced={coalesced} width={width}: the old row flows into its kept end"
-        );
-    }
 }

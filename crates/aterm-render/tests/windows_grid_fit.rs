@@ -13,7 +13,7 @@
 //! `font_hinting_config.rs`. THIS file binds the half that is Windows-specific
 //! and that a static test font cannot reach: Windows 11's own Cascadia Mono,
 //! `C:\Windows\Fonts\CascadiaMono.ttf` — what `font_family = "Cascadia Mono"`
-//! names; the unconfigured default is the bundled STATIC Cascadia Mono PL — is
+//! names; the bundled faces, the unconfigured default among them, are STATIC — is
 //! a VARIABLE font with no separate Bold file, so
 //!
 //! * the regular cut is an `fvar` instance, and

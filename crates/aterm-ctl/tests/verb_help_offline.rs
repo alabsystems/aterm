@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm ctl` answers `<verb> --help` client-side, without a socket. Every
-//! verb the client knows (every protocol-table row and every client verb),
-//! asked with `--help` against a socket path that cannot exist, exits 0,
-//! prints the verb's entry, and reports no connect error.
+//! `aterm ctl` answers `<verb> --help` client-side, without a socket: a
+//! protocol-table verb and a client verb, asked with `--help` against a socket
+//! path that cannot exist, exit 0, print the verb's entry, and report no
+//! connect error. (Every table row's entry is pinned in-process by the lib's
+//! `help_is_answered_client_side_only_for_what_the_client_knows`.)
 //!
 //! No live aterm session is discovered or addressed: the socket named does not
 //! exist, and the child runs with every inherited `ATERM_*` variable removed.
@@ -14,10 +15,6 @@
 )]
 
 use std::process::{Command, Output, Stdio};
-
-/// The client verbs `--help` documents in its client-verbs block (not in the
-/// protocol table; the lib's `CLIENT_HELP_VERBS`).
-const CLIENT_VERBS: [&str; 4] = ["ls", "instances", "windows", "mux"];
 
 fn ask_help(verb: &str) -> Output {
     ctl(&[verb, "--help"])
@@ -44,13 +41,8 @@ fn ctl(args: &[&str]) -> Output {
 }
 
 #[test]
-fn every_verb_help_is_answered_without_a_socket() {
-    let names = aterm_types::control_verbs::VERBS
-        .iter()
-        .map(|v| v.name)
-        .chain(CLIENT_VERBS);
-    let mut checked = 0usize;
-    for verb in names {
+fn a_verbs_help_is_answered_without_a_socket() {
+    for verb in ["text", "turn", "ls", "mux"] {
         let out = ask_help(verb);
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -69,10 +61,7 @@ fn every_verb_help_is_answered_without_a_socket() {
             stdout.lines().next().is_some_and(|l| l.starts_with(verb)),
             "`{verb} --help` prints the verb's entry: {stdout}"
         );
-        checked += 1;
     }
-    // Vacuity guard: the table is the whole protocol, not an empty slice.
-    assert!(checked > 80, "only {checked} verbs were asked");
 }
 
 /// Negative control: a name no table knows goes to the server, so with a dead

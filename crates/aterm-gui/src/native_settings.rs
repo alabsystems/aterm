@@ -69,10 +69,12 @@ pub(crate) enum SettingsRoute {
     /// SETTINGS ▸ THEMES, the Theme Showcase: every theme as a live sample,
     /// a trial of one on the whole app (Keep or Revert), the colour and type
     /// settings a theme is tuned with, and Save as theme… A SPECIAL page
-    /// (`showcase_page`). It is Appearance's own sub-page on the rail — the
-    /// rail highlights Appearance while it shows — so the rail keeps its
-    /// height; the compact category sheet, the palette and `aterm ctl open
-    /// app settings /themes` reach it by name.
+    /// (`showcase_page`). It is Appearance's sub-page: while it shows, the
+    /// rail lists an indented Themes row under Appearance, and that row is
+    /// the selected one. The row's height comes out of the other rows, so
+    /// the rail's fit is judged without it (`navigation_row_floor`); the
+    /// compact category sheet, the palette and `aterm ctl open app settings
+    /// /themes` reach it by name.
     Themes,
     TextFonts,
     CursorMotion,
@@ -213,9 +215,9 @@ impl SettingsRoute {
         Self::ALL.into_iter().find(|route| route.path() == path)
     }
 
-    /// The rail entry a sub-page lives under: the rail lists no row of its
-    /// own for it and highlights this one while it shows. `None` for a page
-    /// with its own row.
+    /// The rail entry a sub-page lives under: the rail lists its row,
+    /// indented under this one, only while it shows (`navigation_groups`).
+    /// `None` for a page with its own row.
     pub(crate) const fn rail_parent(self) -> Option<Self> {
         match self {
             Self::Themes => Some(Self::Appearance),
@@ -224,17 +226,28 @@ impl SettingsRoute {
         }
     }
 
-    /// Whether the rail lists a row for this route.
+    /// Whether the rail lists a row for this route whatever page shows.
     pub(crate) const fn on_rail(self) -> bool {
         self.rail_parent().is_none()
     }
 
-    /// How many rows the rail lists.
+    /// How many PERMANENT rows the rail lists: the count every judgement of
+    /// the rail's fit, density and title is made on.
     fn rail_len() -> usize {
         Self::ALL
             .into_iter()
             .filter(|route| route.on_rail())
             .count()
+    }
+
+    /// The rows the rail lists while `current` shows: every route with its
+    /// own row, and `current` itself right under its parent when it is a
+    /// sub-page (Settings ▸ Themes under Appearance). The sub-page row exists
+    /// only while that page shows, so the rail's height is judged by its
+    /// permanent rows (`rail_len`) and the transient row is paid for by the
+    /// others (`navigation_row_floor`).
+    fn rail_rows(current: Self) -> usize {
+        Self::rail_len() + usize::from(current.rail_parent().is_some())
     }
 
     fn section(self) -> Option<Section> {
@@ -419,15 +432,16 @@ fn theme_slot_picker(state: &SettingsViewState, side: aterm_types::Appearance) -
     picker
 }
 
-/// A slot picker's rows: the theme picker's, without the Follow system reset.
-/// A slot names one side of the pair; the reset would unset both sides.
+/// A slot picker's rows: the theme picker's, with its Default row naming
+/// Default instead of being the reset. A slot names one side of the pair; the
+/// reset would unset both sides (and stop following the system).
 fn theme_slot_picker_rows(themes: &crate::app_config::ThemeCatalog) -> Vec<ChoiceOption> {
     let mut rows = theme_picker_rows(themes);
-    rows.retain(|row| {
-        row.theme
-            .as_ref()
-            .is_none_or(|theme| theme.section != ThemeSection::System)
-    });
+    for row in &mut rows {
+        if row.value.is_none() && row.disabled_reason().is_none() {
+            row.value = row.theme.as_ref().map(|theme| theme.id.clone());
+        }
+    }
     rows
 }
 
@@ -437,9 +451,6 @@ enum ThemeSection {
     /// The configured value when no row names it (a `dark:…,light:…` split,
     /// or a theme that is gone), so the picker can always show what is set.
     Current,
-    /// The reset: no `theme`, which follows the OS (Default in dark mode,
-    /// Default Light in light mode).
-    System,
     /// Built-in themes drawn for a dark background, Default first.
     Dark,
     /// Built-in themes drawn for a light background.
@@ -454,7 +465,6 @@ impl ThemeSection {
     fn label(self) -> &'static str {
         match self {
             Self::Current => "Current",
-            Self::System => prefs::UNSET_THEME_LABEL,
             Self::Dark => "Dark",
             Self::Light => "Light",
             Self::Yours => "Yours",
@@ -731,7 +741,7 @@ impl ChoicePicker {
     }
 
     /// The theme picker: [`theme_picker_rows`] in their sections, the reset
-    /// as the Follow system row, a filter, and the catalog's counts.
+    /// folded into the Default row, a filter, and the catalog's counts.
     fn for_themes(
         themes: &crate::app_config::ThemeCatalog,
         current: &str,
@@ -769,8 +779,8 @@ impl ChoicePicker {
         } else {
             current.strip_suffix(" (default)").unwrap_or(current).trim()
         };
-        // A theme row answers to its catalog id (the Follow system row's
-        // value is the reset, but it IS `theme = UNSET_THEME`).
+        // A theme row answers to its catalog id (the Default row's value is
+        // the reset, but it IS `theme = "Default"`).
         let names = |option: &ChoiceOption, wanted: &str| {
             option
                 .value
@@ -809,7 +819,7 @@ impl ChoicePicker {
                 .position(|option| names(option, current))
                 .unwrap_or(0)
         } else {
-            // Unset: the Follow system row (the reset) is what is in use.
+            // Unset: the Default row (the reset) is what is in use.
             rows.iter()
                 .position(|option| option.value.is_none())
                 .unwrap_or(0)
@@ -1427,6 +1437,16 @@ pub(crate) struct SettingsViewState {
     /// Settings ▸ Harness's SETTINGS IN ATERM.TOML card lists every
     /// `[harness]` key (its disclosure open) or only the person's own.
     pub(crate) harness_config_open: bool,
+    /// Settings ▸ Harness's SESSIONS row whose Timer disclosure is open (one
+    /// at a time): its timed Cruises and the cancel show under it.
+    pub(crate) harness_timer_open: Option<u64>,
+    /// Where Settings ▸ Harness was opened landed (§10.3.3, item 8): a
+    /// session's row (`⚙`, the Autopilot menu's `Harness settings…`), drawn
+    /// selected, or SUPERVISION (an `⊘ off` chip) — until the next press or
+    /// scroll; `Top` otherwise. The landing itself is the list's own reveal
+    /// (`page_reveal`, a landing's), which lands it before and after a render
+    /// has measured the page.
+    pub(crate) harness_focus: crate::harness_screen::HarnessFocus,
     /// The unlisted cursor style (Flat rainbow, Classic mono) that was saved
     /// when Cursor Styles opened: the list keeps its row until the page
     /// closes, so choosing another style never pulls a row out from above
@@ -1485,7 +1505,7 @@ pub(crate) struct SettingsViewState {
     /// never inherit Reset All's confirmation edge.
     draft_discard_confirmation: bool,
     /// The exact immutable non-text assets admitted with this config revision.
-    /// Holding the outer Arc keeps Trail Pack, kitty sprite, and parsed-theme
+    /// Holding the outer Arc keeps trail-style, kitty sprite, and parsed-theme
     /// identity atomic:
     /// previews never independently resolve a path or observe assets from two
     /// different revisions.
@@ -1525,6 +1545,10 @@ pub(crate) struct SettingsViewState {
     /// records the `opened` marker for it exactly as it does for the card's
     /// own button, so the one-time ✓ acknowledgement follows this path too.
     consent_open_requests: u8,
+    /// That press opened System Settings at Full Disk Access: aterm's panel joins
+    /// the page (`App::fda_page_opened_by_owner`). A press that opened nothing
+    /// shows no panel and notes no page.
+    fda_page_opened: bool,
     /// The DEVELOPER TOOLS card's *Open Developer Tools…* was pressed and the
     /// host has not performed it yet: the hand-over lane is `App`'s
     /// (`App::hand_devtools_to_owner`), so the press is recorded here and
@@ -1722,8 +1746,7 @@ impl SettingsViewState {
         config: &Config,
         assets: Arc<crate::app_config::ConfigAssetCatalog>,
     ) -> Self {
-        let legacy =
-            SettingsState::from_config_with_trail_pack_ids(config, &assets.trail_packs.ids);
+        let legacy = SettingsState::from_config(config);
         let field_index = build_field_index(&legacy.fields);
         // Production (`from_snapshot`) replaces this with the snapshot's generic
         // TOML projection before anything reads it, so only the test constructors
@@ -1740,7 +1763,7 @@ impl SettingsViewState {
                     .map(|active| (field.key.to_string(), active))
             })
             .collect();
-        Self {
+        let mut state = Self {
             common: CommonViewState::default(),
             route: SettingsRoute::Home,
             search: String::new(),
@@ -1758,6 +1781,8 @@ impl SettingsViewState {
             page_scroll: 0,
             packages_activity_page: 0,
             harness_config_open: false,
+            harness_timer_open: None,
+            harness_focus: crate::harness_screen::HarnessFocus::Top,
             cursor_styles_kept: None,
             showcase: showcase_page::ShowcaseState::new(&assets.themes),
             result_page_limit: Cell::new(None),
@@ -1784,6 +1809,7 @@ impl SettingsViewState {
             config_file_arm: ConfigFileArm::inert(),
             consent_warmup_requests: 0,
             consent_open_requests: 0,
+            fda_page_opened: false,
             devtools_hand_over_request: false,
             claimant_retire_request: None,
             debugger_change_request: None,
@@ -1813,7 +1839,51 @@ impl SettingsViewState {
             font_families: None,
             font_text_entry: None,
             font_refusals: Vec::new(),
+        };
+        let fields = state.theme_seeded_fields(config, &Arc::clone(&state.assets.themes));
+        state.set_fields(fields);
+        state
+    }
+
+    /// The rows for `config`, with the type settings its theme names shown on
+    /// the rows the config leaves unset ([`prefs::editable_fields_with`]).
+    fn theme_seeded_fields(
+        &self,
+        config: &Config,
+        themes: &crate::app_config::ThemeCatalog,
+    ) -> Vec<EditField> {
+        let side = theme_visible_side(self, self.presented_motion.get().system_dark);
+        let typo = Config {
+            theme: config.theme.clone(),
+            ..Config::default()
         }
+        .resolved_typography_with_flag(side, themes, None);
+        if typo.applied.is_empty() {
+            return prefs::editable_fields(config);
+        }
+        let label = themes
+            .meta(&typo.id)
+            .map_or_else(|| typo.id.clone(), |meta| meta.display_name);
+        prefs::editable_fields_with(config, &typo, &label)
+    }
+
+    /// The theme value a typography row would fall back to when its key is
+    /// removed (`Some` only for a key the saved theme names), and the theme's
+    /// label: Reset then reads "Use theme's (…)".
+    fn theme_fallback_for(&self, key: &str) -> Option<(String, String)> {
+        if aterm_types::scheme::THEME_KEYS.iter().all(|spec| {
+            spec.group != aterm_types::scheme::ThemeKeyGroup::Typography || spec.name != key
+        }) {
+            return None;
+        }
+        let typo = self.theme_typography();
+        let value = prefs::theme_value_for(&Config::default(), &typo, key)?;
+        let label = self
+            .assets
+            .themes
+            .meta(&typo.id)
+            .map_or_else(|| typo.id.clone(), |meta| meta.display_name);
+        Some((value, label))
     }
 
     /// Construct from the transaction service's canonical snapshot.  Production
@@ -1835,7 +1905,7 @@ impl SettingsViewState {
         snapshot: &crate::native_config_service::ConfigSnapshot,
     ) -> Result<(), String> {
         let config = Arc::clone(&snapshot.config);
-        let fields = prefs::editable_fields(&config);
+        let fields = self.theme_seeded_fields(&config, &snapshot.assets.themes);
         let raw_values = snapshot.values()?;
         let active_edit = self.editing_field.clone();
         let mut retained_inputs = BTreeMap::new();
@@ -1872,7 +1942,6 @@ impl SettingsViewState {
             }
         }
         self.set_fields(fields);
-        self.legacy.trail_pack_ids = snapshot.assets.trail_packs.ids.clone();
         self.raw_values = raw_values;
         if let Some((key, described, _)) = &self.value_line
             && self.raw_value(key) != *described
@@ -2085,10 +2154,6 @@ impl SettingsViewState {
         key: &str,
     ) -> Option<&crate::app_config::ActiveEnvironmentOverride> {
         self.environment_overrides.get(key)
-    }
-
-    pub(crate) fn trail_pack_catalog(&self) -> &Arc<crate::app_config::TrailPackCatalog> {
-        &self.assets.trail_packs
     }
 
     pub(crate) fn config_assets(&self) -> &Arc<crate::app_config::ConfigAssetCatalog> {
@@ -2355,6 +2420,12 @@ impl SettingsViewState {
     /// Drain the *Open Privacy & Security…* press (see `consent_open_requests`).
     pub(crate) fn take_consent_open_request(&mut self) -> bool {
         std::mem::take(&mut self.consent_open_requests) > 0
+    }
+
+    /// Drain whether that press opened the Full Disk Access page (see
+    /// `fda_page_opened`).
+    pub(crate) fn take_fda_page_opened(&mut self) -> bool {
+        std::mem::take(&mut self.fda_page_opened)
     }
 
     /// Drain the *Open Developer Tools…* press (see
@@ -2852,6 +2923,7 @@ impl SettingsViewState {
         self.messages_reveal = false;
         self.messages_feedback_since = None;
         self.messages_feedback_text = None;
+        self.harness_focus = crate::harness_screen::HarnessFocus::Top;
         self.common.last_focus = self.presented_route_focus(route).or_else(|| {
             if from_compact_navigation {
                 Some(UiKey::new("settings/compact-navigation"))
@@ -2954,9 +3026,9 @@ impl SettingsViewState {
     /// open that row's page; Manual, which opens aterm.toml, is only
     /// focused. The keyboard stays in the sidebar, so arrows browse.
     fn step_navigation_focus(&mut self, lines: i32) -> bool {
-        let rail: Vec<SettingsRoute> = NAVIGATION_GROUPS
-            .iter()
-            .flat_map(|(_, routes)| routes.iter().copied())
+        let rail: Vec<SettingsRoute> = navigation_groups(self.route)
+            .into_iter()
+            .flat_map(|(_, routes)| routes)
             .collect();
         let Some(current) = self.common.last_focus.as_ref().and_then(|key| {
             rail.iter()
@@ -2981,9 +3053,9 @@ impl SettingsViewState {
     /// arrow keys open the row they land on, so Home and End never navigate
     /// away from the page a person is reading.
     fn focus_navigation_edge(&mut self, first: bool) -> bool {
-        let mut rail = NAVIGATION_GROUPS
-            .iter()
-            .flat_map(|(_, routes)| routes.iter().copied());
+        let mut rail = navigation_groups(self.route)
+            .into_iter()
+            .flat_map(|(_, routes)| routes);
         let Some(route) = (if first { rail.next() } else { rail.last() }) else {
             return false;
         };
@@ -3422,8 +3494,10 @@ impl SettingsViewState {
             self.common.presentation_revision = self.common.presentation_revision.saturating_add(1);
             return;
         }
+        // Escape goes up one level: a sub-page to its rail parent
+        // (Settings ▸ Themes to Appearance), any other page Home.
         if self.route != SettingsRoute::Home {
-            self.navigate(SettingsRoute::Home);
+            self.navigate(self.route.rail_parent().unwrap_or(SettingsRoute::Home));
         }
     }
 }
@@ -4111,7 +4185,7 @@ impl SettingsApp {
             return self.reduce_messages_action(view, action, invocation.value.as_ref(), cx);
         }
         if action.starts_with(harness_page::HARNESS_ACTION_PREFIX) {
-            return self.reduce_harness_action(view, action, cx);
+            return self.reduce_harness_action(view, action, invocation.value.as_ref(), cx);
         }
         if action.starts_with(ai_page::AI_ACTION_PREFIX) {
             return self.reduce_ai_action(view, action, cx);
@@ -4207,11 +4281,11 @@ impl SettingsApp {
             return EventResult::Handled;
         }
         if action == THEME_MODE_ACTION {
-            // Follow system on writes the configured theme on its own side
-            // and its pair on the other, or aterm's own theme for that side
-            // when it has none (no key at all for the pair an unset theme
-            // draws); off writes the side on screen as one name. Either
-            // way the mode is the value: nothing else records it.
+            // Follow system on writes the configured theme (Default when
+            // none is set) on its own side and its pair on the other, or
+            // aterm's own theme for that side when it has none; off writes
+            // the side on screen as one name. Either way the mode is the
+            // value: nothing else records it.
             if Self::reject_pending_key(view, prefs::EDIT_THEME, cx) {
                 return EventResult::Handled;
             }
@@ -4230,17 +4304,13 @@ impl SettingsApp {
                 {
                     view.choice_picker = None;
                 }
-                let value = if wanted {
+                let value = Some(if wanted {
                     prefs::theme_follow_system_value(current.as_deref(), &view.assets.themes)
                 } else {
                     let visible = theme_visible_side(view, view.presented_motion.get().system_dark);
                     view.theme_preview_side = None;
-                    Some(prefs::theme_always_value(
-                        current.as_deref(),
-                        visible,
-                        &view.assets.themes,
-                    ))
-                };
+                    prefs::theme_always_value(current.as_deref(), visible, &view.assets.themes)
+                });
                 if value != current {
                     self.commit_theme_value(view, value, cx);
                 }
@@ -4290,7 +4360,8 @@ impl SettingsApp {
             .and_then(parse_appearance_word)
         {
             // A list's slot Reset puts aterm's own theme back on that side
-            // and keeps the other; back on aterm's own pair, the key goes.
+            // and keeps the other; the pair still follows the system (the
+            // Follow system switch is the way back to one theme).
             if Self::reject_pending_key(view, prefs::EDIT_THEME, cx) {
                 return EventResult::Handled;
             }
@@ -4303,12 +4374,17 @@ impl SettingsApp {
             }
             view.common.last_focus = Some(UiKey::new(theme_slot_action(side)));
             let current = view.raw_value(prefs::EDIT_THEME);
-            let value = prefs::theme_with_side(
-                current.as_deref(),
-                side,
-                crate::app_config::unset_theme_name(side),
-                &view.assets.themes,
-            );
+            // One theme (or none) has no sides to put back.
+            let value = (prefs::theme_mode(current.as_deref()) == prefs::ThemeMode::FollowSystem)
+                .then(|| {
+                    prefs::theme_with_side(
+                        current.as_deref(),
+                        side,
+                        crate::app_config::default_pair_side(side),
+                        &view.assets.themes,
+                    )
+                })
+                .or_else(|| current.clone());
             if current != value {
                 self.commit_theme_value(view, value, cx);
             }
@@ -4437,16 +4513,20 @@ impl SettingsApp {
                 let current = view.raw_value(prefs::EDIT_THEME);
                 // A slot picker names its side: only that side changes, even
                 // over a pair that draws one theme on both.
-                let value =
-                    prefs::theme_with_side(current.as_deref(), side, &name, &view.assets.themes);
+                let value = Some(prefs::theme_with_side(
+                    current.as_deref(),
+                    side,
+                    &name,
+                    &view.assets.themes,
+                ));
                 if current != value {
                     self.commit_theme_value(view, value, cx);
                 }
                 cx.repaint(crate::native_app::DamageRegion::All);
                 return EventResult::Handled;
             }
-            // The theme picker's Follow system row is the reset; with no
-            // override there is nothing to remove, so choosing it only closes.
+            // The theme picker's Default row is the reset; with no override
+            // there is nothing to remove, so choosing it only closes.
             if option.as_ref().is_some_and(|option| {
                 option.value.is_none() && option.theme.is_some() && !view.is_explicit(key)
             }) {
@@ -4487,18 +4567,17 @@ impl SettingsApp {
             }
             let mut value = option.map(|option| option.value);
             // A theme name goes through the one choice rule every theme
-            // picker shares, so a pick while `theme` is unset (which follows
-            // the OS) keeps following it instead of pinning one theme for
-            // both appearances.
+            // picker shares: the name itself over one theme or none, only
+            // the side on screen over a pair that follows the system.
             if key == prefs::EDIT_THEME
                 && let Some(Some(name)) = value.as_ref()
             {
                 let side = theme_visible_side(view, view.presented_motion.get().system_dark);
                 let current = view.raw_value(key);
-                value = Some(
+                value = Some(Some(
                     prefs::theme_choice_value(current.as_deref(), side, name, &view.assets.themes)
                         .0,
-                );
+                ));
             }
             if let Some(value) = value {
                 let patch = ConfigPatch {
@@ -4807,12 +4886,7 @@ impl SettingsApp {
                 return EventResult::Handled;
             }
             if key == prefs::EDIT_CURSOR_TRAIL_STYLE {
-                let value = semantic_value_for_field(
-                    field,
-                    invocation.value,
-                    &view.legacy.trail_pack_ids,
-                    &view.assets.themes,
-                );
+                let value = semantic_value_for_field(field, invocation.value, &view.assets.themes);
                 if Self::reject_pending_key(view, prefs::EDIT_CURSOR_TRAIL, cx) {
                     return EventResult::Handled;
                 }
@@ -4844,8 +4918,7 @@ impl SettingsApp {
                 return EventResult::Handled;
             }
             if invocation.value.is_none()
-                && let Some(options) =
-                    choices_for_field(field, &view.legacy.trail_pack_ids, &view.assets.themes)
+                && let Some(options) = choices_for_field(field, &view.assets.themes)
             {
                 if view
                     .choice_picker
@@ -4954,12 +5027,7 @@ impl SettingsApp {
                 };
                 Some(value)
             } else {
-                semantic_value_for_field(
-                    field,
-                    invocation.value,
-                    &view.legacy.trail_pack_ids,
-                    &view.assets.themes,
-                )
+                semantic_value_for_field(field, invocation.value, &view.assets.themes)
             };
             // A switch turned to its default removes its key; a slider's
             // value goes through the one slider write ([`slider_edits`]).
@@ -5259,7 +5327,11 @@ impl SettingsApp {
                 // `openURL:` reports that System Settings TOOK the URL, never
                 // that it scrolled to the row — so the route in words goes out
                 // on every outcome, not only the degraded ones.
-                view.feedback = Some(if (view.consent_gestures.open_settings)(pane).opened() {
+                let opened = (view.consent_gestures.open_settings)(pane).opened();
+                if action == MACOS_ACCESS_OPEN_FDA {
+                    view.fda_page_opened |= opened;
+                }
+                view.feedback = Some(if opened {
                     format!("Opened System Settings \u{2014} look under {words}.")
                 } else {
                     format!("System Settings did not open. The setting is at {words}.")
@@ -5987,12 +6059,28 @@ impl SettingsApp {
             return;
         }
         let selecting = Self::finish_showcase_save(view, operation, &outcome);
+        // A Get More add: once written, the next catalog that lists it
+        // tries it; any other ending lets the try go.
+        let mut trying = false;
+        if let Some((pending, _, written)) = &mut view.showcase.pending_try
+            && *pending == operation
+        {
+            trying = matches!(outcome, ThemesOutcome::Added { .. });
+            *written = trying;
+            if !trying {
+                view.showcase.pending_try = None;
+            }
+        }
         view.feedback = match outcome {
             ThemesOutcome::Saved { id } if selecting => {
                 Some(format!("Saved {id} \u{b7} selecting it\u{2026}"))
             }
             ThemesOutcome::Saved { id } => Some(format!("Saved {id}")),
             ThemesOutcome::Trashed { id } => Some(format!("Moved {id} to the Trash")),
+            ThemesOutcome::Added { id } if trying => {
+                Some(format!("Added {id} \u{b7} trying it\u{2026}"))
+            }
+            ThemesOutcome::Added { id } => Some(format!("Added {id}")),
             ThemesOutcome::Opened => None,
             ThemesOutcome::Cancelled => None,
             ThemesOutcome::Imported { id, dropped: 0 } => Some(format!("Imported {id}")),
@@ -6050,8 +6138,8 @@ impl SettingsApp {
             UpdateOutcome::InstalledNeedsRelaunch { message, .. } => message,
             // NOT "until terminal activity settles" (round eight of the update
             // audit, U35's review): a person's press is deferred for reasons
-            // that are not activity — an installed build being replaced, the
-            // resident operator mid-transition — and nothing here knows whether
+            // that are not activity — an installed build being replaced — and
+            // nothing here knows whether
             // the automatic lane comes back for it. The fact, and its reason.
             UpdateOutcome::Deferred { reason } => format!("Not installed yet · {reason}"),
             UpdateOutcome::Blocked { reasons } => {
@@ -6484,9 +6572,9 @@ impl SettingsApp {
     }
 
     /// FOCUS NEVER SCROLLS AWAY (ruling 267). A compact Messages page scrolls
-    /// its header — the switch, the filters, the report buttons — away with
-    /// the log, and a control that is no longer seated is no longer in the
-    /// tree: the keyboard went with it (round 16: Down on a filter chip left
+    /// its header — the filters, the report buttons — away with the log, and
+    /// a control that is no longer seated is no longer in the tree: the
+    /// keyboard went with it (round 16: Down on a filter chip left
     /// no focused node and no ring). An entry's own controls — its title, and
     /// the open entry's footer buttons — leave with their entry on every
     /// page, since an entry is seated whole or not at all (ruling 441 (o): a
@@ -7008,35 +7096,30 @@ fn retired_packages_override(view: &SettingsViewState, key: &str) -> Option<Manu
     })
 }
 
-/// A KEY THIS BUILD STILL READS UNDER AN OLD NAME, on Settings ▸ Modified: `game_font`
-/// (a serde alias of `display_font`) and 0.93.0's `[harness]` approval switches, which
-/// still limit the supervisor unless written `true`
-/// (`aterm_agent::supervise::config::retired_key_note`). Neither has a schema entry, so
-/// without this each fell to "Unknown key · Ignored by this aterm" while Manual says the
-/// old key still applies — two stories about one key, and the false one on a safety
-/// limit. No reset: neither has a schema entry to reset through.
+/// A KEY THIS BUILD STILL READS UNDER AN OLD NAME, on Settings ▸ Modified: 0.93.0's
+/// `[harness]` approval switches, which still limit the supervisor unless written
+/// `true` (`aterm_agent::supervise::config::retired_key_note`). They have no schema
+/// entry, so without this each fell to "Unknown key · Ignored by this aterm" while
+/// Manual says the old key still applies — two stories about one key, and the false
+/// one on a safety limit. No reset: there is no schema entry to reset through.
 fn old_spelling_override(view: &SettingsViewState, key: &str) -> Option<ManualOverride> {
-    let (label, effect) = if key == prefs::LEGACY_EDIT_DISPLAY_FONT {
-        let current = view
-            .field_by_key(prefs::EDIT_DISPLAY_FONT)
-            .map_or(prefs::EDIT_DISPLAY_FONT, |field| field.label);
-        (format!("Old spelling of {current}"), "Still applies")
+    // The value as the supervisor's one reader takes it (`"no"` and `0` are
+    // offs, `"yes"` an on, anything else no setting), so the row and the
+    // reader never tell two stories.
+    let value = view
+        .raw_values
+        .get(key)
+        .and_then(|raw| aterm_agent::supervise::config::retired_reading(raw));
+    let key_name = key.strip_prefix("harness.")?;
+    aterm_agent::supervise::config::retired_key_note(key_name, value)?;
+    // The reader's own word on whether it still limits: `rate_nudge`, the
+    // retired Codex harness's, limits nothing even written off.
+    let effect = if aterm_agent::supervise::config::retired_still_limits(key_name, value) {
+        "Still limits approvals"
     } else {
-        // The value as the supervisor's one reader takes it (`"no"` and `0` are
-        // offs, `"yes"` an on, anything else no setting), so the row and the
-        // reader never tell two stories.
-        let value = view
-            .raw_values
-            .get(key)
-            .and_then(|raw| aterm_agent::supervise::config::retired_reading(raw));
-        aterm_agent::supervise::config::retired_key_note(key.strip_prefix("harness.")?, value)?;
-        let effect = if value == Some(false) {
-            "Still limits approvals"
-        } else {
-            "No effect"
-        };
-        ("Retired supervisor setting".to_string(), effect)
+        "No effect"
     };
+    let label = "Retired supervisor setting".to_string();
     Some(ManualOverride {
         key: key.to_string(),
         label,
@@ -7285,24 +7368,21 @@ fn change_words(view: &SettingsViewState, patch: &ConfigPatch) -> ChangeWords {
 
 /// The words for every palette slot override coming off at once: the
 /// palette colours now come from the theme `after` draws on the side shown
-/// (a Follow system pair names that side's theme), "the theme" when it is
-/// unset.
+/// (a Follow system pair names that side's theme; no theme at all is
+/// Default).
 fn palette_colours_source_words(
     view: &SettingsViewState,
     after: &dyn Fn(&str) -> Option<String>,
 ) -> String {
     let raw = after(prefs::EDIT_THEME);
     let side = theme_visible_side(view, view.presented_motion.get().system_dark);
-    let theme = if prefs::theme_is_unset(raw.as_deref()) {
-        "the theme".to_string()
-    } else {
-        let id = crate::app_config::resolve_theme_name_value(raw.as_deref(), side)
-            .unwrap_or_else(|| prefs::theme_slots(raw.as_deref(), &view.assets.themes).0);
-        view.assets
-            .themes
-            .meta(&id)
-            .map_or(id, |meta| meta.display_name)
-    };
+    let id = crate::app_config::resolve_theme_name_value(raw.as_deref(), side)
+        .unwrap_or_else(|| "Default".to_string());
+    let theme = view
+        .assets
+        .themes
+        .meta(&id)
+        .map_or(id, |meta| meta.display_name);
     format!("Palette colours now come from {theme}")
 }
 
@@ -7324,14 +7404,18 @@ fn row_name(view: &SettingsViewState, key: &str) -> String {
 }
 
 /// A `theme` value in the words its controls show. One that follows the
-/// system (a `dark:…,light:…` pair, or none at all) reads as its two sides by
-/// their names, "Dracula / GitHub Light · follows system", never as the raw
-/// value; one theme reads as its name.
+/// system (a `dark:…,light:…` pair) reads as its two sides by their names,
+/// "Dracula / GitHub Light · follows system", never as the raw value; one
+/// theme reads as its name, and none at all as Default.
 fn theme_value_words(themes: &crate::app_config::ThemeCatalog, raw: Option<&str>) -> String {
-    let raw = raw.map(str::trim).filter(|raw| !raw.is_empty());
-    match raw {
-        Some(name) if prefs::theme_mode(Some(name)) == prefs::ThemeMode::Always => name.to_string(),
-        _ => {
+    if prefs::theme_is_unset(raw) {
+        return "Default".to_string();
+    }
+    match raw.map(str::trim) {
+        Some(name) if prefs::theme_mode(Some(name)) == prefs::ThemeMode::Always => themes
+            .meta(name)
+            .map_or_else(|| name.to_string(), |meta| meta.display_name),
+        raw => {
             let (dark, light) = prefs::theme_slots(raw, themes);
             let shown = |id: String| themes.meta(&id).map_or(id, |meta| meta.display_name);
             theme_pair_words(&shown(dark), &shown(light))
@@ -7378,7 +7462,7 @@ fn row_words(view: &SettingsViewState, key: &str, raw: &dyn Fn(&str) -> Option<S
         return if !on || style.eq_ignore_ascii_case("off") {
             "Off".to_string()
         } else {
-            setting_choice_label_in(view, key, &style)
+            setting_choice_label(key, &style)
         };
     }
     if key == prefs::EDIT_DISPLAY_FONT {
@@ -7417,6 +7501,14 @@ fn row_words(view: &SettingsViewState, key: &str, raw: &dyn Fn(&str) -> Option<S
         } else {
             format!("{dark} (dark) and {light} (light)")
         };
+    }
+    if key == prefs::EDIT_THEME
+        && let Some(value) = raw(key)
+        && let Some(meta) = view.assets.themes.meta(value.trim())
+    {
+        // One theme reads as the name its card shows (a themes-folder file
+        // goes by its `name`, never its file id).
+        return meta.display_name;
     }
     let value = raw(key);
     match view.field_by_key(key).map(|field| field.kind) {
@@ -7468,8 +7560,8 @@ fn reset_all_nothing_words(view: &SettingsViewState) -> &'static str {
 /// restores it. It keeps every other key Modified lists only in aterm.toml
 /// ([`authored_manual_override_keys`]): lists, maps, sprite paths, custom
 /// records, unknown keys, old spellings, and every `MANUAL_SCHEMA` key with
-/// no Settings row — `[operator]`, `[fabric]`, `[privacy]`, most of
-/// `[harness]`, `windowing_behavior` and the rest.
+/// no Settings row — `[fabric]`, `[privacy]`, most of `[harness]`,
+/// `windowing_behavior` and the rest.
 fn reset_all_keys(view: &SettingsViewState) -> Vec<&'static str> {
     let manual_overrides = authored_manual_override_keys(view)
         .into_iter()
@@ -7807,9 +7899,6 @@ enum AdvancedEffectPath {
     /// aterm's own updater (macOS, and Linux's `linux_updater`), which reads
     /// `[update]` — the two switches Software Update draws.
     UpdaterRuntime,
-    /// The strain engine (`strain_host`), which `explain_heavy_load` parks or
-    /// wakes; Settings ▸ Messages draws the switch.
-    StrainEngine,
 }
 
 /// Deliberately small native Advanced surface. Everything outside this map
@@ -7881,7 +7970,8 @@ fn native_advanced_effect(key: &str) -> Option<AdvancedEffectPath> {
         | prefs::EDIT_EMOJI_FONT
         | prefs::EDIT_LIGATURES
         | prefs::EDIT_FONT_WEIGHT
-        | prefs::EDIT_LINE_HEIGHT => Some(Effect::RendererTypography),
+        | prefs::EDIT_LINE_HEIGHT
+        | prefs::EDIT_FONT_SIZE_SCALE => Some(Effect::RendererTypography),
         prefs::EDIT_FONT_THICKEN => cfg!(target_os = "macos").then_some(Effect::RendererTypography),
         prefs::EDIT_CURSOR_STYLE
         | prefs::EDIT_CURSOR_BLINK
@@ -7891,7 +7981,6 @@ fn native_advanced_effect(key: &str) -> Option<AdvancedEffectPath> {
         | prefs::EDIT_MOTION
         // Read by `App::effect_policy` on every motion decision.
         | prefs::EDIT_LOAD_ADAPTIVE_MOTION
-        | prefs::EDIT_STREAM_FADE
         // The effect-INTENSITY dial (2026-07-24 UX audit). It already scales
         // the ribbon, the starfield and the fresh-ink pop — `cursor_glow` reads
         // `cfg.intensity` on all three — it was simply unreachable outside
@@ -7917,6 +8006,11 @@ fn native_advanced_effect(key: &str) -> Option<AdvancedEffectPath> {
         // The tab strip and toolbar read the selected tab's color as they
         // paint it.
         prefs::EDIT_ACTIVE_TAB_COLOR => Some(Effect::WindowRuntime),
+        // The chrome tokens: every chrome surface re-derives them when the
+        // installed colours change (`App::install_colors`' chrome edge).
+        prefs::EDIT_ACCENT_COLOR | prefs::EDIT_BORDER_COLOR | prefs::EDIT_SEARCH_MATCH_COLOR => {
+            Some(Effect::WindowRuntime)
+        }
         prefs::EDIT_SCROLLBACK
         | prefs::EDIT_SEARCH_HISTORY_LINES
         | prefs::EDIT_BIDI
@@ -7962,10 +8056,7 @@ fn native_advanced_effect(key: &str) -> Option<AdvancedEffectPath> {
         | prefs::EDIT_OUTPUT_STREAK_SOUND
         // PRISM WAKE itself: every streak seam reads `App::output_streak_shows`
         // each frame, beside Matrix rain in the Effects group.
-        | prefs::EDIT_OUTPUT_STREAK_ENABLED
-        // Robi the helper robot: the render tick reads `robi` every frame
-        // (opt-in, default off), beside Matrix rain in the Effects group.
-        | prefs::EDIT_ROBI => Some(Effect::EffectsRuntime),
+        | prefs::EDIT_OUTPUT_STREAK_ENABLED => Some(Effect::EffectsRuntime),
         // THE AUDIBLE BEL. Unlike every key above it is NOT a synth voice —
         // it is the OS alert sound (`NSBeep` / `MessageBeep`), which is why
         // `trail_sound_volume` never reached it and why it had no key at all.
@@ -7991,6 +8082,7 @@ fn native_advanced_effect(key: &str) -> Option<AdvancedEffectPath> {
         // Each agent's own switch is live through the host's admission.
         prefs::EDIT_HARNESS_ENABLED
         | prefs::EDIT_HARNESS_AUTOPILOT
+        | prefs::EDIT_HARNESS_LAND_AT
         | prefs::EDIT_HARNESS_APPROVE
         | prefs::EDIT_HARNESS_ANSWER_QUESTIONS
         | prefs::EDIT_HARNESS_QUESTION_PRIORITY => Some(Effect::HarnessRuntime),
@@ -8004,7 +8096,6 @@ fn native_advanced_effect(key: &str) -> Option<AdvancedEffectPath> {
         prefs::EDIT_UPDATE_ENABLED | "update.auto_apply" => {
             cfg!(any(target_os = "macos", target_os = "linux")).then_some(Effect::UpdaterRuntime)
         }
-        prefs::EDIT_EXPLAIN_HEAVY_LOAD => Some(Effect::StrainEngine),
         // aterm's own desktop notifications: a row only where a desktop
         // notifier exists (the `allow_notifications` gate above, same reason).
         prefs::EDIT_DESKTOP_ALERTS => {
@@ -8070,6 +8161,18 @@ impl NativeAppModel for SettingsApp {
     ) -> EventResult {
         let view_id = cx.view_id();
         view.settle_page_scroll();
+        // Settings ▸ Harness's landed row is drawn selected until the next
+        // press or scroll (§10.3.1): any action but the landing itself, the
+        // wheel, Page Up and Down, and Up and Down — which move the keyboard
+        // or, with no control of the list focused, scroll it a row.
+        let lets_go = match &event {
+            AppEvent::Action(invocation) => invocation.id.as_str() != harness_page::HARNESS_LAND,
+            AppEvent::ScrollLines(_) | AppEvent::ScrollPage(_) | AppEvent::StepFocus(_) => true,
+            _ => false,
+        };
+        if lets_go {
+            view.harness_focus = crate::harness_screen::HarnessFocus::Top;
+        }
         let focus_before = view.common.last_focus.clone();
         let keyboard_move = matches!(
             event,
@@ -8896,7 +8999,6 @@ fn raw_bool_value(config: &Config, key: &str) -> Option<bool> {
         "confirm_multiline_paste" => config.confirm_multiline_paste,
         "option_as_meta" => config.option_as_meta,
         "focus_boost" => config.focus_boost,
-        "explain_heavy_load" => config.explain_heavy_load,
         "desktop_alerts" => config.desktop_alerts,
         "allow_osc52_query" => config.allow_osc52_query,
         "allow_window_ops" => config.allow_window_ops,
@@ -8911,7 +9013,6 @@ fn raw_bool_value(config: &Config, key: &str) -> Option<bool> {
 fn semantic_value_for_field(
     field: &EditField,
     input: Option<SemanticInput>,
-    pack_ids: &[String],
     themes: &crate::app_config::ThemeCatalog,
 ) -> Option<String> {
     match input {
@@ -8920,7 +9021,7 @@ fn semantic_value_for_field(
         // those words ("If asked", "Rainbow kitty") saves its option; a
         // config token saves as it is.
         Some(SemanticInput::Text(value)) => {
-            Some(choice_token_for_words(field, &value, pack_ids).unwrap_or(value))
+            Some(choice_token_for_words(field, &value).unwrap_or(value))
         }
         Some(SemanticInput::Bool(value)) => Some(value.to_string()),
         Some(SemanticInput::Number(value)) => Some(value.to_string()),
@@ -8930,19 +9031,6 @@ fn semantic_value_for_field(
                 .parse::<bool>()
                 .unwrap_or(false);
             Some((!current).to_string())
-        }
-        // The `cursor_trail_style` control cycles through the loaded `pack:<id>`
-        // options too; every other Enum cycles its exact static options.
-        None if matches!(field.kind, EditKind::Enum { .. })
-            && field.key == prefs::EDIT_CURSOR_TRAIL_STYLE =>
-        {
-            let dynamic = prefs::cursor_trail_style_options(pack_ids.iter().map(String::as_str));
-            let refs: Vec<&str> = dynamic.iter().map(String::as_str).collect();
-            cycle_choice(
-                SettingsState::display_value(field),
-                &refs,
-                field.seed.is_some(),
-            )
         }
         None if let EditKind::Enum { options } = field.kind => cycle_choice(
             SettingsState::display_value(field),
@@ -8965,19 +9053,12 @@ fn semantic_value_for_field(
 /// The option of choice `field` whose shown words are `words` ("Auto",
 /// "Auto (default)", "Rainbow kitty"), where `words` is not an option's token
 /// already.
-fn choice_token_for_words(field: &EditField, words: &str, pack_ids: &[String]) -> Option<String> {
+fn choice_token_for_words(field: &EditField, words: &str) -> Option<String> {
     let EditKind::Enum { options } = field.kind else {
         return None;
     };
     let words = words.trim();
     let words = words.strip_suffix(" (default)").unwrap_or(words).trim();
-    let dynamic;
-    let options: Vec<&str> = if field.key == prefs::EDIT_CURSOR_TRAIL_STYLE {
-        dynamic = prefs::cursor_trail_style_options(pack_ids.iter().map(String::as_str));
-        dynamic.iter().map(String::as_str).collect()
-    } else {
-        options.to_vec()
-    };
     if options
         .iter()
         .any(|option| option.eq_ignore_ascii_case(words))
@@ -9081,9 +9162,6 @@ fn cycle_choice(current: &str, choices: &[&str], explicit: bool) -> Option<Strin
 }
 
 fn choice_label(value: &str) -> String {
-    if let Some(id) = value.strip_prefix("pack:") {
-        return format!("Trail pack · {}", sentence_case_token(id));
-    }
     match value {
         "auto" => "Automatic".to_string(),
         "builtin" => "Built-in".to_string(),
@@ -9153,16 +9231,31 @@ pub(crate) fn setting_choice_label(key: &str, value: &str) -> String {
         return choice_label("auto");
     }
     // Automatic window appearance follows the OS, except on Linux, where it
-    // follows the terminal theme's darkness (`chrome_theme_for_apprt`).
+    // follows the terminal theme's darkness (`chrome_theme_for_apprt`). One
+    // two-word form everywhere: the closed control is sized for this word
+    // plus ` (default)` (`top_regular_choice_control_width`), and every point
+    // it takes comes out of the row's label.
     if key == prefs::EDIT_WINDOW_THEME && value.eq_ignore_ascii_case("auto") {
         return if cfg!(target_os = "macos") {
             "Match macOS"
         } else if cfg!(target_os = "linux") {
-            "Match the terminal"
+            "Match terminal"
         } else {
-            "Match the system"
+            "Match system"
         }
         .to_string();
+    }
+    // Where slots 16-255 come from, in the words of what each choice does.
+    if key == prefs::EDIT_PALETTE_GENERATE {
+        let words = match value.to_ascii_lowercase().as_str() {
+            "theme" => Some("Follow theme"),
+            "always" => Some("Always derive"),
+            "never" => Some("xterm table"),
+            _ => None,
+        };
+        if let Some(words) = words {
+            return words.to_string();
+        }
     }
     // The typing-sound picker's `auto` is "follow the trail" — its meaning,
     // not the generic "Automatic"; every instrument falls to sentence case
@@ -9227,7 +9320,6 @@ fn sentence_case_token(value: &str) -> String {
 enum CursorStyleGroup {
     Companions,
     Trails,
-    Packs,
     Off,
 }
 
@@ -9236,7 +9328,6 @@ impl CursorStyleGroup {
         match self {
             Self::Companions => Some("Companions"),
             Self::Trails => Some("Trails"),
-            Self::Packs => Some("Trail packs"),
             Self::Off => None,
         }
     }
@@ -9390,42 +9481,10 @@ const CURSOR_STYLE_ENTRIES: &[CursorStyleEntry] = &[
     },
 ];
 
-/// The name a `cursor_trail_style` value goes by where the pack catalog is in
-/// hand: a loaded pack by its manifest's name ([`pack_display_name`]), as its
-/// row on Cursor Styles says it; every other value, a pack that is not
-/// loaded among them, as [`cursor_style_name`] says it.
-fn cursor_style_name_in(value: &str, catalog: &crate::app_config::TrailPackCatalog) -> String {
-    match value.trim().strip_prefix("pack:").map(str::trim) {
-        Some(id) if catalog.label(id).is_some() => pack_display_name(catalog, id),
-        _ => cursor_style_name(value),
-    }
-}
-
-/// [`setting_choice_label`] where the view is in hand: a loaded trail pack
-/// reads as its manifest's name ([`cursor_style_name_in`]) on every row that
-/// shows the cursor style, as its row on Cursor Styles does.
-fn setting_choice_label_in(state: &SettingsViewState, key: &str, value: &str) -> String {
-    if key == prefs::EDIT_CURSOR_TRAIL_STYLE && value.trim().starts_with("pack:") {
-        return cursor_style_name_in(value, state.trail_pack_catalog());
-    }
-    setting_choice_label(key, value)
-}
-
-/// A loaded pack's name: its manifest's own, else its id in sentence case.
-fn pack_display_name(catalog: &crate::app_config::TrailPackCatalog, id: &str) -> String {
-    catalog
-        .label(id)
-        .and_then(|label| label.name.clone())
-        .unwrap_or_else(|| sentence_case_token(id))
-}
-
 /// The name a `cursor_trail_style` value goes by: its list entry's name,
-/// through any alias, or the pack it names.
+/// through any alias.
 fn cursor_style_name(value: &str) -> String {
     let value = value.trim();
-    if let Some(id) = value.strip_prefix("pack:") {
-        return format!("Trail pack · {}", sentence_case_token(id.trim()));
-    }
     prefs::cursor_trail_style_canonical(value)
         .and_then(|canonical| {
             CURSOR_STYLE_ENTRIES
@@ -9459,8 +9518,7 @@ const OFF_TINT_DESCRIPTION: &str = "No trail; typing tints the cursor";
 
 /// The styles the Cursor Styles page lists: Off first, then every listed
 /// built-in entry (and an unlisted one while it is saved, or was saved when
-/// the page opened), then one row per loaded trail pack. A pack that is not loaded draws nothing, so it is not
-/// listed.
+/// the page opened).
 fn listed_cursor_styles(state: &SettingsViewState) -> Vec<ListedCursorStyle> {
     let saved = saved_cursor_style(state);
     let kept = state.cursor_styles_kept.as_deref();
@@ -9497,39 +9555,16 @@ fn listed_cursor_styles(state: &SettingsViewState) -> Vec<ListedCursorStyle> {
         .to_string(),
         group: entry.group,
     };
-    let mut packs = state.legacy.trail_pack_ids.clone();
-    packs.sort();
-    // A pack's row under the TRAIL PACKS caption says the pack's own words:
-    // its manifest's name and description.
-    let catalog = state.trail_pack_catalog();
     CURSOR_STYLE_ENTRIES
         .iter()
         .filter(shown)
         .map(builtin)
-        .chain(packs.into_iter().map(|id| {
-            let description = catalog
-                .label(&id)
-                .and_then(|label| label.description.clone())
-                .unwrap_or_else(|| "Loaded from aterm.toml".to_string());
-            ListedCursorStyle {
-                name: pack_display_name(catalog, &id),
-                value: format!("pack:{id}"),
-                description,
-                group: CursorStyleGroup::Packs,
-            }
-        }))
         .collect()
 }
 
-/// A style row's key and action: built-ins keep their key fragments, and
-/// loaded pack IDs keep their validated punctuation so distinct IDs remain
-/// distinct (`pack-ember-fall`, `pack-ember_fall`).
+/// A style row's key and action, from the style's key fragment.
 fn cursor_style_row_key(value: &str) -> String {
-    let fragment = match value.strip_prefix("pack:") {
-        Some(id) => format!("pack-{id}"),
-        None => key_fragment(value),
-    };
-    format!("settings/cursor-style/{fragment}")
+    format!("settings/cursor-style/{}", key_fragment(value))
 }
 
 /// The listed style a row key or action names.
@@ -9559,11 +9594,11 @@ fn cursor_style_candidate(state: &SettingsViewState) -> Option<String> {
 }
 
 /// The style the Cursor Styles list checks: what the terminal draws now, so
-/// Serious Mode and the effects switch read Off, an unknown spelling reads as
-/// the default it falls back to, and a missing pack reads Off.
+/// Serious Mode and the effects switch read Off, and an unknown spelling reads
+/// as the default it falls back to.
 fn saved_cursor_style(state: &SettingsViewState) -> String {
     let projected = top_projected_trail_value(state);
-    let resolved = crate::app_config::resolve_trail_style(&projected, state.trail_pack_catalog());
+    let resolved = crate::app_config::resolve_trail_style(&projected);
     if resolved.style.is_none() {
         return "off".to_string();
     }
@@ -9596,8 +9631,7 @@ fn cursor_style_is_saved(state: &SettingsViewState, style: &str) -> bool {
 /// (`cursor_fx::resolve_glow_config`); Fire and Water color from their own
 /// ramps; the accent tints the landing ring and the Lumen and Comet tails,
 /// while Laser and Beam color everything from the trail color. Heat shimmer
-/// is Fire's alone. A trail pack reads its own parameters and owns its crown
-/// and ring.
+/// is Fire's alone.
 fn trail_style_uses(style: &crate::app_config::ResolvedTrailStyle, key: &str) -> bool {
     use aterm_effects::cursor_glow::GlowStyle;
     let Some(glow) = style.style else {
@@ -9605,12 +9639,6 @@ fn trail_style_uses(style: &crate::app_config::ResolvedTrailStyle, key: &str) ->
     };
     if key == prefs::EDIT_CURSOR_FIRE_SHIMMER {
         return glow == GlowStyle::Fire;
-    }
-    if style.pack.is_some() {
-        return !matches!(
-            key,
-            prefs::EDIT_CURSOR_TRAIL_RADIUS | prefs::EDIT_CURSOR_TRAIL_RING
-        );
     }
     match key {
         prefs::EDIT_CURSOR_TRAIL_LENGTH => glow != GlowStyle::RainbowKitty,
@@ -9635,14 +9663,9 @@ fn trail_style_uses(style: &crate::app_config::ResolvedTrailStyle, key: &str) ->
 
 fn choices_for_field(
     field: &EditField,
-    trail_pack_ids: &[String],
     themes: &crate::app_config::ThemeCatalog,
 ) -> Option<Vec<String>> {
     match field.kind {
-        // The cursor style's domain: the built-in styles and the loaded packs.
-        EditKind::Enum { .. } if field.key == prefs::EDIT_CURSOR_TRAIL_STYLE => Some(
-            prefs::cursor_trail_style_options(trail_pack_ids.iter().map(String::as_str)),
-        ),
         EditKind::Enum { .. } if field.key == prefs::EDIT_PREDICTIVE_ECHO => {
             // `always` may expose password keystrokes. Manual accepts it for
             // experts who deliberately author the unsafe mode; the ordinary
@@ -9693,6 +9716,10 @@ fn font_picker_key(key: &str) -> bool {
 /// What an unset font row says: "Automatic", naming the face the terminal
 /// draws for the family once the host has listed the installed fonts.
 fn font_automatic_label(state: &SettingsViewState, key: &str) -> String {
+    // A font the saved theme names is what an unset row draws.
+    if let Some((value, theme)) = state.theme_fallback_for(key) {
+        return format!("{value} (from theme {theme})");
+    }
     match state
         .font_families
         .as_deref()
@@ -9743,7 +9770,13 @@ fn font_choice_picker(state: &SettingsViewState, key: &str) -> ChoicePicker {
         .map(str::trim)
         .filter(|saved| !saved.is_empty());
     let option = ChoiceOption::plain;
-    let mut options = vec![option(font_automatic_label(state, key), None)];
+    // The reset row says where removing the key lands: the theme's font when
+    // the theme names one, else the automatic face.
+    let reset = state.theme_fallback_for(key).map_or_else(
+        || font_automatic_label(state, key),
+        |(value, _)| format!("Use theme's ({value})"),
+    );
+    let mut options = vec![option(reset, None)];
     for family in font_choices(state, key) {
         options.push(option(family.clone(), Some(family)));
     }
@@ -9782,49 +9815,28 @@ pub(crate) fn settings_theme_options(themes: &crate::app_config::ThemeCatalog) -
     merge_theme_options(themes.ready_names().map(str::to_string))
 }
 
-/// The theme picker's rows, in their sections: Follow system (the reset:
-/// choosing it removes the override, so an unset `theme` follows the OS with
-/// Default and Default Light), then Dark and Light built-ins (Default first;
-/// over a plain name choosing it writes `theme = "Default"`, which stays dark
-/// on a light OS, and over an unset theme a pair that keeps following it:
-/// [`prefs::theme_choice_value`]),
-/// then Yours (theme files that loaded,
-/// labelled by their own `name =` as written), then Needs attention (theme
-/// files that did not load, disabled, each with its reason). Built from the
-/// catalog this Settings generation carries; no file is read here.
+/// The theme picker's rows, in their sections: Dark and Light built-ins
+/// (Default first, and Default's row is the reset: choosing it removes the
+/// override, which draws Default on every appearance, so the picker never
+/// offers "Use default · Default" beside a "Default" that previews the same),
+/// then Yours (theme files that loaded, labelled by their own `name =` as
+/// written), then Needs attention (theme files that did not load, disabled,
+/// each with its reason). Built from the catalog this Settings generation
+/// carries; no file is read here.
 fn theme_picker_rows(themes: &crate::app_config::ThemeCatalog) -> Vec<ChoiceOption> {
     let builtins = aterm_types::scheme::builtin_theme_list();
-    let [dark, light] = [
-        aterm_types::Appearance::Dark,
-        aterm_types::Appearance::Light,
-    ]
-    .map(crate::app_config::unset_theme_name);
-    let follow_system = ChoiceOption {
-        label: format!("{}  \u{b7}  {dark} / {light}", prefs::UNSET_THEME_LABEL),
-        value: None,
-        free_text: false,
-        theme: Some(Box::new(ThemeChoice {
-            section: ThemeSection::System,
-            id: crate::app_config::UNSET_THEME.to_string(),
-            description: Some(format!("{dark} in dark mode, {light} in light mode")),
-            appearance: None,
-            swatches: Vec::new(),
-            reason: None,
-            summary: format!(
-                "{}, {dark} in dark mode, {light} in light mode",
-                prefs::UNSET_THEME_LABEL
-            ),
-        })),
-    };
+    // `builtin_theme_list` lists Default first.
+    let default_name = builtins.first().map(|builtin| builtin.name);
     let builtin_row = |builtin: &aterm_types::scheme::BuiltinTheme| {
         let scheme = aterm_types::scheme::builtin(builtin.name).unwrap_or_default();
         let section = match builtin.appearance {
             aterm_types::Appearance::Dark => ThemeSection::Dark,
             aterm_types::Appearance::Light => ThemeSection::Light,
         };
+        let is_default = Some(builtin.name) == default_name;
         ChoiceOption {
             label: builtin.name.to_string(),
-            value: Some(builtin.name.to_string()),
+            value: (!is_default).then(|| builtin.name.to_string()),
             free_text: false,
             theme: Some(Box::new(theme_choice_with_colours(
                 section,
@@ -9835,25 +9847,21 @@ fn theme_picker_rows(themes: &crate::app_config::ThemeCatalog) -> Vec<ChoiceOpti
             ))),
         }
     };
-    let mut rows: Vec<ChoiceOption> = std::iter::once(follow_system)
+    let mut rows: Vec<ChoiceOption> = builtins
+        .iter()
+        .filter(|builtin| builtin.appearance == aterm_types::Appearance::Dark)
         .chain(
             builtins
                 .iter()
-                .filter(|builtin| builtin.appearance == aterm_types::Appearance::Dark)
-                .map(builtin_row),
+                .filter(|builtin| builtin.appearance == aterm_types::Appearance::Light),
         )
+        .map(builtin_row)
         .collect();
-    rows.extend(
-        builtins
-            .iter()
-            .filter(|builtin| builtin.appearance == aterm_types::Appearance::Light)
-            .map(builtin_row),
-    );
     for (id, meta) in themes.ready_themes() {
         if aterm_types::scheme::builtin_theme(id).is_some() {
             continue;
         }
-        let Ok(scheme) = themes.resolve(id) else {
+        let Ok(package) = themes.resolve_package(id) else {
             continue;
         };
         // The file's own name, as written; the id (what config stores) joins
@@ -9863,13 +9871,28 @@ fn theme_picker_rows(themes: &crate::app_config::ThemeCatalog) -> Vec<ChoiceOpti
         } else {
             format!("{}  ·  {id}", meta.display_name)
         };
+        // The description, then the type settings the theme names and, for a
+        // file from a newer theme schema, the settings this aterm skipped.
+        let notes: Vec<String> = meta
+            .description
+            .clone()
+            .into_iter()
+            .chain(
+                package
+                    .typography
+                    .summary()
+                    .map(|summary| format!("Aa {summary}")),
+            )
+            .chain(crate::app_config::skipped_keys_reason(meta))
+            .collect();
+        let description = (!notes.is_empty()).then(|| notes.join(" \u{b7} "));
         // Admission wrote the declared-or-measured appearance into the scheme.
         let theme = theme_choice_with_colours(
             ThemeSection::Yours,
             id,
             &label,
-            meta.description.clone(),
-            &scheme,
+            description,
+            &package.colors,
         );
         rows.push(ChoiceOption {
             label,
@@ -10144,6 +10167,37 @@ fn preview_field_text(state: &SettingsViewState, key: &str, fallback: &str) -> S
 /// size the terminal draws now (`applied`). An out-of-range draft is refused
 /// on its row and never blanks or swells the specimen.
 fn preview_font_px(state: &SettingsViewState, applied: f32) -> f32 {
+    if state.environment_override(prefs::EDIT_FONT_PX).is_some() {
+        // A launch-pinned size stays fixed, just as it does in the terminal.
+        return preview_unscaled_font_px(state, applied).0;
+    }
+    // `font_size_scale` multiplies a configured size; the applied size
+    // already carries the saved scale, so a draft scale replaces it.
+    let scale_of = |text: &str| {
+        text.split_whitespace()
+            .next()
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.8, 1.25))
+    };
+    let saved_scale = state
+        .field_by_key(prefs::EDIT_FONT_SIZE_SCALE)
+        .and_then(|field| field.seed.as_deref())
+        .and_then(scale_of)
+        .unwrap_or_else(|| state.theme_typography_scale());
+    let draft_scale = scale_of(&preview_field_text(state, prefs::EDIT_FONT_SIZE_SCALE, ""))
+        .unwrap_or(saved_scale);
+    let (px, from_applied) = preview_unscaled_font_px(state, applied);
+    if from_applied {
+        px * draft_scale / saved_scale
+    } else {
+        px * draft_scale
+    }
+}
+
+/// [`preview_font_px`] before the size scale: the size and whether it is
+/// the applied one (which already carries the saved scale).
+fn preview_unscaled_font_px(state: &SettingsViewState, applied: f32) -> (f32, bool) {
     let key = prefs::EDIT_FONT_PX;
     let range = prefs::range_of(key);
     let admitted = |text: &str| {
@@ -10156,7 +10210,8 @@ fn preview_font_px(state: &SettingsViewState, applied: f32) -> f32 {
             })
     };
     if let Some(active) = state.environment_override(key) {
-        return admitted(&active.effective).unwrap_or(applied);
+        // A launch size is never scaled.
+        return (admitted(&active.effective).unwrap_or(applied), true);
     }
     if let Some(input) = state.field_inputs.get(key) {
         let draft = if state.editing_field.as_deref() == Some(key) {
@@ -10165,17 +10220,17 @@ fn preview_font_px(state: &SettingsViewState, applied: f32) -> f32 {
             input.value().to_string()
         };
         if draft.trim().is_empty() {
-            return applied;
+            return (applied, true);
         }
         if let Some(px) = admitted(&draft) {
-            return px;
+            return (px, false);
         }
     }
     state
         .field_by_key(key)
         .and_then(|field| field.seed.as_deref())
         .and_then(admitted)
-        .unwrap_or(applied)
+        .map_or((applied, true), |px| (px, false))
 }
 
 fn preview_field_number<T>(state: &SettingsViewState, key: &str, fallback: T) -> T
@@ -10202,11 +10257,7 @@ fn preview_effective_minimum_contrast(state: &SettingsViewState) -> f32 {
     } else {
         1.0
     };
-    if aterm_render::vibrancy::is_translucent(opacity) {
-        configured.max(crate::app_config::VIBRANCY_CONTRAST_FLOOR)
-    } else {
-        configured
-    }
+    aterm_render::vibrancy::effective_minimum_contrast(configured, opacity)
 }
 
 fn settings_number_including_retained_draft(
@@ -10244,11 +10295,7 @@ fn constrained_minimum_contrast(state: &SettingsViewState) -> Option<(f32, f32)>
     } else {
         1.0
     };
-    let effective = if aterm_render::vibrancy::is_translucent(opacity) {
-        configured.max(crate::app_config::VIBRANCY_CONTRAST_FLOOR)
-    } else {
-        configured
-    };
+    let effective = aterm_render::vibrancy::effective_minimum_contrast(configured, opacity);
     (effective > configured + f32::EPSILON).then_some((configured, effective))
 }
 
@@ -10402,11 +10449,7 @@ fn post_patch_minimum_contrast_constraint(
     } else {
         1.0
     };
-    let effective = if aterm_render::vibrancy::is_translucent(opacity) {
-        configured.max(crate::app_config::VIBRANCY_CONTRAST_FLOOR)
-    } else {
-        configured
-    };
+    let effective = aterm_render::vibrancy::effective_minimum_contrast(configured, opacity);
     (effective > configured + f32::EPSILON).then_some((configured, effective))
 }
 
@@ -10624,8 +10667,7 @@ fn preview_resolved_colors(
     system_dark: bool,
 ) -> crate::resolved_colors::ResolvedColors {
     // An ambient override outranks picker hover; an open picker supplies its
-    // highlighted candidate (Follow system, the reset, previews the unset
-    // value: Default or Default Light by the appearance); on Settings ▸
+    // highlighted candidate (Reset previews built-in Default); on Settings ▸
     // Themes the hovered or focused card, else the theme being tried.
     let candidate = state
         .environment_override(prefs::EDIT_THEME)
@@ -10635,21 +10677,11 @@ fn preview_resolved_colors(
                 choice
                     .value
                     .clone()
-                    .unwrap_or_else(|| crate::app_config::UNSET_THEME.to_string())
+                    .unwrap_or_else(|| "Default".to_string())
             })
         })
         .or_else(|| state.showcase_preview_id());
     preview_resolved_colors_with(state, system_dark, candidate.as_deref())
-}
-
-/// Whether the `theme` the preview draws is unset (it follows the OS without
-/// naming a theme): no launch override, no draft, and a saved value that
-/// names nothing ([`prefs::theme_is_unset`]).
-fn theme_unset_in_preview(state: &SettingsViewState) -> bool {
-    state.environment_override(prefs::EDIT_THEME).is_none()
-        && !state.field_has_unsaved_draft(prefs::EDIT_THEME)
-        && picker_choice(state, prefs::EDIT_THEME).is_none()
-        && prefs::theme_is_unset(state.raw_value(prefs::EDIT_THEME).as_deref())
 }
 
 /// The theme Settings ▸ Themes' stage badge names in place of the field's
@@ -10725,8 +10757,7 @@ fn working_theme_is_light(state: &SettingsViewState, system_dark: bool) -> bool 
 }
 
 /// Whether the configured cursor shape draws as a block. `beam` is the
-/// compatibility spelling for Bar; a configured Underline is retired to Bar
-/// by the owning terminal resolver (protocol-driven DECSCUSR underlines stay
+/// compatibility spelling for Bar (protocol-driven DECSCUSR underlines stay
 /// independent of this preference).
 fn configured_cursor_is_block(state: &SettingsViewState) -> bool {
     !matches!(
@@ -10734,7 +10765,7 @@ fn configured_cursor_is_block(state: &SettingsViewState) -> bool {
             .trim()
             .to_ascii_lowercase()
             .as_str(),
-        "bar" | "beam" | "underline"
+        "bar" | "beam"
     )
 }
 
@@ -10859,7 +10890,7 @@ fn renderer_preview_spec_for_key_with_font(
     let font_candidate = preview_font_candidate(state);
     let resolved = preview_resolved_colors(state, motion.system_dark);
     let terminal_theme_candidate = PreviewTerminalTheme::from_resolved(&resolved);
-    let mut terminal_theme_identity = crate::settings_preview::PreviewThemeIdentity::from_resolved(
+    let terminal_theme_identity = crate::settings_preview::PreviewThemeIdentity::from_resolved(
         &resolved,
         &state.assets.themes,
     );
@@ -10990,7 +11021,6 @@ fn renderer_preview_spec_for_key_with_font(
                     prefs::EDIT_CURSOR_TRAIL_STYLE,
                     prefs::DEFAULT_CURSOR_TRAIL_STYLE,
                 )),
-                state.trail_pack_catalog(),
             )),
         ),
         fire_shimmer: !serious_preview_suppression
@@ -11021,8 +11051,7 @@ fn renderer_preview_spec_for_key_with_font(
             prefs::DEFAULT_CURSOR_TRAIL_STYLE,
         )
     });
-    let resolved_trail =
-        crate::app_config::resolve_trail_style(&trail_style_value, state.trail_pack_catalog());
+    let resolved_trail = crate::app_config::resolve_trail_style(&trail_style_value);
     // A style candidate previews its post-commit state, which turns the
     // effects switch on (`trail_style_edits`) — except Off, which writes the
     // style alone and leaves the switch (and the typing glow it gates) as is.
@@ -11034,19 +11063,12 @@ fn renderer_preview_spec_for_key_with_font(
     } else {
         preview_cursor_trail_enabled(state)
     };
-    // A loaded pack is named by its manifest, as its row is.
-    let trail_pack_name = resolved_trail
-        .pack
-        .and(trail_style_value.trim().strip_prefix("pack:"))
-        .map(|id| Arc::from(pack_display_name(state.trail_pack_catalog(), id.trim())));
     let mut cursor = CursorPreviewSpec {
         style: cursor_style,
         blink: field_bool(state, prefs::EDIT_CURSOR_BLINK, true),
         trail_enabled: !serious_preview_suppression && trail_enabled,
-        trail_style: PreviewTrailStyle::from_resolution(&trail_style_value, resolved_trail),
+        trail_style: PreviewTrailStyle::from_resolution(resolved_trail),
         trail_style_raw: Arc::from(trail_style_value),
-        trail_pack: resolved_trail.pack.map(Arc::new),
-        trail_pack_name,
         color: field_color(state, prefs::EDIT_CURSOR_TRAIL_COLOR),
         accent: field_color(state, prefs::EDIT_CURSOR_TRAIL_ACCENT),
         duration_ms: field_number(state, prefs::EDIT_CURSOR_TRAIL_MS, 260_u64),
@@ -11063,7 +11085,6 @@ fn renderer_preview_spec_for_key_with_font(
         // Fire runway while focused so On/Off changes the actual shimmer lane;
         // the authored trail_style value itself remains untouched.
         cursor.trail_style = PreviewTrailStyle::Fire;
-        cursor.trail_pack = None;
         cursor.trail_enabled = true;
     }
     let mut spec = match route {
@@ -11098,21 +11119,8 @@ fn renderer_preview_spec_for_key_with_font(
     // The stage draws a card (pointed at, or being tried) rather than what
     // the configuration applies: its badge names a sample, not the theme.
     let theme_sample = stage_theme.is_some() && state.showcase_preview_id().is_some();
-    if !theme_sample && theme_unset_in_preview(state) {
-        // Unset follows the OS: the spoken palette names it as the badge and
-        // the theme row do, never as the bare theme it happens to draw.
-        terminal_theme_identity.label = prefs::unset_theme_label(&terminal_theme_identity.label);
-    }
     let focused_value = if let Some(theme) = stage_theme {
-        if !theme_sample && theme_unset_in_preview(state) {
-            prefs::unset_theme_label(&theme)
-        } else {
-            theme
-        }
-    } else if focused_key == prefs::EDIT_THEME && theme_unset_in_preview(state) {
-        // Unset follows the OS: named as the theme row names it, with the
-        // side the preview draws.
-        prefs::unset_theme_label(&resolved.id)
+        theme
     } else if focused_key == prefs::EDIT_CURSOR_TRAIL_STYLE {
         // The style the preview draws: the candidate, else what the
         // terminal draws now (Off under Serious Mode or the effects switch).
@@ -11154,6 +11162,16 @@ fn renderer_preview_spec_for_key_with_font(
             value
         }
     };
+    // A theme reads by the name its card shows (a themes-folder file's
+    // `name =`), never by its file id ("harbour-chrome").
+    let focused_value = if focused_key == prefs::EDIT_THEME
+        && prefs::theme_mode(Some(&focused_value)) != prefs::ThemeMode::FollowSystem
+        && let Some(meta) = state.assets.themes.meta(focused_value.trim())
+    {
+        meta.display_name
+    } else {
+        focused_value
+    };
     let prepared_font = prepared_font
         .filter(|prepared| prepared.matches(&font_candidate))
         .cloned()
@@ -11164,7 +11182,11 @@ fn renderer_preview_spec_for_key_with_font(
         spec.with_terminal_theme(terminal_theme_candidate)
             .with_terminal_theme_identity(terminal_theme_identity)
             .with_typography(
-                field_number(state, prefs::EDIT_LINE_HEIGHT, 1.0_f32),
+                field_number(
+                    state,
+                    prefs::EDIT_LINE_HEIGHT,
+                    crate::app_config::DEFAULT_LINE_HEIGHT,
+                ),
                 field_number(state, prefs::EDIT_ADJUST_BASELINE, 0_i32),
                 field_bool(state, prefs::EDIT_LIGATURES, true),
                 field_bool(state, prefs::EDIT_MERGED_LIGATURES, false),
@@ -11316,7 +11338,9 @@ fn airy_navigation_route_floor(scale: f32) -> f32 {
 
 /// The dense rail's route-row floor: a usable 22pt labeled target, so a
 /// short wide window (167×36's 516pt) keeps the rail's group headings beside
-/// every route instead of a flat list of nineteen.
+/// every route instead of a flat list of nineteen. The floor is judged on the
+/// nineteen permanent rows; a sub-page's transient row (Settings ▸ Themes) is
+/// paid for out of them (`navigation_row_floor`).
 fn dense_navigation_route_floor(scale: f32) -> f32 {
     22.0_f32.max(20.0 * scale)
 }
@@ -11354,6 +11378,13 @@ fn persistent_navigation_fits(width: SettingsWidth, height: f32) -> bool {
 }
 
 fn navigation_rail_fits(width: SettingsWidth, height: f32, dense: bool) -> bool {
+    navigation_rail_fits_with(width, height, dense, SettingsRoute::rail_len() as f32)
+}
+
+/// [`navigation_rail_fits`] for a rail of `routes` rows, each at its floor.
+/// Only the permanent rows are ever judged; a test measures what one more
+/// would cost.
+fn navigation_rail_fits_with(width: SettingsWidth, height: f32, dense: bool, routes: f32) -> bool {
     let scale = settings_text_scale();
     // Mirror the exact lower bounds authored by `navigation`: BOTH rails derive
     // their row height from the remaining budget and compress toward a floor
@@ -11401,7 +11432,6 @@ fn navigation_rail_fits(width: SettingsWidth, height: f32, dense: bool) -> bool 
             navigation_headings(),
         )
     };
-    let routes = SettingsRoute::rail_len() as f32;
     let child_gaps = (2.0 + sections + routes - 1.0).max(0.0);
     let fixed = vertical_padding * 2.0 + title + search + sections * section + child_gaps * gap;
     height >= fixed + routes * route
@@ -12762,6 +12792,39 @@ const NAVIGATION_GROUPS: [(&str, &[SettingsRoute]); 4] = [
     ),
 ];
 
+/// `NAVIGATION_GROUPS` as the rail draws it while `current` shows: a
+/// sub-page's row follows its parent's, in the parent's group.
+fn navigation_groups(current: SettingsRoute) -> Vec<(&'static str, Vec<SettingsRoute>)> {
+    NAVIGATION_GROUPS
+        .iter()
+        .map(|(heading, routes)| {
+            let mut rows = Vec::with_capacity(routes.len() + 1);
+            for &route in *routes {
+                rows.push(route);
+                if current.rail_parent() == Some(route) {
+                    rows.push(current);
+                }
+            }
+            (*heading, rows)
+        })
+        .collect()
+}
+
+/// The least row height the rail may draw while it lists `routes` rows, of
+/// which `permanent` are judged by the fit test at `floor`: a transient
+/// sub-page row is paid for by every row (and its one extra `gap`), so
+/// opening a sub-page never changes whether the rail fits, sheds its title,
+/// or densifies. `floor` itself when no sub-page row shows.
+fn navigation_row_floor(floor: f32, permanent: f32, routes: f32, gap: f32) -> f32 {
+    if routes <= permanent {
+        return floor;
+    }
+    (permanent * floor - (routes - permanent) * gap) / routes
+}
+
+/// How far a sub-page's row (Settings ▸ Themes) sits in from its parent's.
+const SUB_ROW_INDENT: f32 = 14.0;
+
 /// How many group headings the rail can show.
 fn navigation_headings() -> f32 {
     NAVIGATION_GROUPS
@@ -12782,9 +12845,14 @@ fn navigation(
     // heights.  The layout metrics, paint rects, hit rects, and accessibility
     // rects all come from this one tree, so the denser rail cannot drift from
     // interaction geometry.  At the common 513-logical-pixel content height the
-    // route rows settle near their 22px floor (nineteen routes, under the
-    // group headings); taller windows relax toward the airier 32px rhythm.
-    let routes = SettingsRoute::rail_len() as f32;
+    // route rows settle near their 22px floor (nineteen permanent rows, under
+    // the group headings); taller windows relax toward the airier 32px rhythm.
+    // A sub-page's transient row (Settings ▸ Themes, under Appearance) is a
+    // twentieth, paid for by the others (`navigation_row_floor`): every
+    // judgement of fit, density and title is made on the permanent rows, so
+    // opening a sub-page never moves the window's width class.
+    let permanent = SettingsRoute::rail_len() as f32;
+    let routes = SettingsRoute::rail_rows(state.route) as f32;
     let dense = navigation_is_dense(width, available_height);
     let vertical_padding = if dense {
         4.0
@@ -12831,7 +12899,7 @@ fn navigation(
     let gap = if dense {
         ((available_height
             - fixed_with(labels, 0.0)
-            - routes * dense_navigation_route_floor(text_scale))
+            - permanent * dense_navigation_route_floor(text_scale))
             / (routes + labels + 1.0))
             .clamp(0.0, 2.0)
             .floor()
@@ -12847,9 +12915,15 @@ fn navigation(
         // short staged-glass host yields to the compact category sheet. The row
         // relaxes toward the airier 32px rhythm when the budget allows and
         // never compresses below a usable 22px labeled target;
-        // `persistent_navigation_fits` demotes below that.
+        // `persistent_navigation_fits` demotes below that. A sub-page's row
+        // takes its share out of that floor.
         ((available_height - fixed) / routes).clamp(
-            dense_navigation_route_floor(text_scale),
+            navigation_row_floor(
+                dense_navigation_route_floor(text_scale),
+                permanent,
+                routes,
+                gap,
+            ),
             32.0_f32.max(24.0 * text_scale),
         )
     } else {
@@ -12858,12 +12932,25 @@ fn navigation(
         // route, so every new destination demoted a band of window heights to
         // the compact category sheet. Its group headings and full labels stay;
         // only the rhythm gives, down to [`airy_navigation_route_floor`] — the
-        // bound `persistent_navigation_fits` judges it by.
+        // bound `persistent_navigation_fits` judges it by, less a sub-page
+        // row's share.
         ((available_height - fixed(headings)) / routes).clamp(
-            airy_navigation_route_floor(text_scale),
+            navigation_row_floor(
+                airy_navigation_route_floor(text_scale),
+                permanent,
+                routes,
+                gap,
+            ),
             32.0_f32.max(24.0 * text_scale),
         )
     };
+    // Every row whole: the fit test admitted the permanent rows at their
+    // floor, and the transient row's share came out of them.
+    debug_assert!(
+        !persistent_navigation_fits(width, available_height)
+            || route_height * routes + fixed(labels) <= available_height + 0.01,
+        "the rail's {routes} rows of {route_height}pt overrun {available_height}pt"
+    );
 
     let mut items = Vec::new();
     if titled {
@@ -12887,7 +12974,7 @@ fn navigation(
         },
         Length::Fixed(search_height),
     ));
-    for (section, routes) in NAVIGATION_GROUPS {
+    for (section, routes) in navigation_groups(state.route) {
         if !section.is_empty() {
             // Accent micro-labels: the rail's section structure is the one
             // place chrome may wear the theme accent at rest — it turns the
@@ -12906,7 +12993,7 @@ fn navigation(
                 .layout(Layout::default().height(Length::Fixed(section_height))),
             );
         }
-        for route in routes {
+        for route in &routes {
             // One icon vocabulary serves both responsive rails. The medium rail
             // (196px, `navigation_width`) pairs it with the route's own name — one
             // shortened below — and the wide rail with the full semantic label.
@@ -12942,31 +13029,50 @@ fn navigation(
                     SettingsRoute::About => "About",
                 });
             }
-            items.push(
+            let row = UiNode::new(
+                format!("settings/nav{}", route.path()),
+                UiContent::Button(
+                    route_control(*route, button, packages)
+                        .state(ControlState {
+                            // Global search spans every route. Keeping the
+                            // previously visited category highlighted makes
+                            // the result set look category-scoped, so search
+                            // deliberately has no selected rail item. A
+                            // sub-page's own row is the selected one, never
+                            // its parent's.
+                            selected: state.search.trim().is_empty() && *route == state.route,
+                            ..ControlState::default()
+                        })
+                        .style(StyleRef::Navigation),
+                ),
+            );
+            items.push(if route.rail_parent().is_some() {
+                // A sub-page's row, indented under its parent's. The wrapper's
+                // key is outside `settings/nav/`, which names rows only (the
+                // rail's focus, Tab and navigation read that prefix).
                 UiNode::new(
-                    format!("settings/nav{}", route.path()),
-                    UiContent::Button(
-                        route_control(*route, button, packages)
-                            .state(ControlState {
-                                // Global search spans every route. Keeping the
-                                // previously visited category highlighted makes
-                                // the result set look category-scoped, so search
-                                // deliberately has no selected rail item.
-                                // A sub-page shows its parent's row selected.
-                                selected: state.search.trim().is_empty()
-                                    && (*route == state.route
-                                        || state.route.rail_parent() == Some(*route)),
-                                ..ControlState::default()
-                            })
-                            .style(StyleRef::Navigation),
-                    ),
+                    format!("settings/nav-sub{}", route.path()),
+                    UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
                 )
                 .layout(
+                    Layout::row()
+                        .height(Length::Fixed(route_height))
+                        .width(Length::Fill)
+                        .padding(Insets {
+                            left: SUB_ROW_INDENT,
+                            ..Insets::default()
+                        }),
+                )
+                .children(vec![
+                    row.layout(Layout::default().height(Length::Fill).width(Length::Fill)),
+                ])
+            } else {
+                row.layout(
                     Layout::default()
                         .height(Length::Fixed(route_height))
                         .width(Length::Fill),
-                ),
-            );
+                )
+            });
         }
     }
 
@@ -13002,7 +13108,9 @@ const fn route_icon(route: SettingsRoute) -> ButtonIcon {
         SettingsRoute::Modified => ButtonIcon::Modified,
         SettingsRoute::Manual => ButtonIcon::Document,
         SettingsRoute::Appearance => ButtonIcon::Appearance,
-        SettingsRoute::Themes => ButtonIcon::Appearance,
+        // Its own pictogram, a set of palettes: its row sits right under
+        // Appearance's while it shows.
+        SettingsRoute::Themes => ButtonIcon::Themes,
         SettingsRoute::TextFonts => ButtonIcon::Text,
         SettingsRoute::CursorMotion => ButtonIcon::Cursor,
         SettingsRoute::CursorStyles => ButtonIcon::Trail,
@@ -13018,9 +13126,9 @@ const fn route_icon(route: SettingsRoute) -> ButtonIcon {
         // The harness runs agents in terminal sessions: the terminal
         // pictogram, as the Terminal route wears it.
         SettingsRoute::Harness => ButtonIcon::Agents,
-        // Harness's sub-page wears its parent's pictogram, as Themes does
-        // Appearance's.
-        SettingsRoute::Ai => ButtonIcon::Agents,
+        // Harness's sub-page: its row sits right under the robot while it
+        // shows, so it wears a pictogram of its own.
+        SettingsRoute::Ai => ButtonIcon::Spark,
         // The pictogram exists already; the page is its first route.
         SettingsRoute::Messages => ButtonIcon::Diagnostics,
         SettingsRoute::About => ButtonIcon::Info,
@@ -13128,12 +13236,21 @@ fn compact_navigation_page(
     // nothing under it.
     let heading_height = 22.0_f32.max(16.0 * scale);
     let heading_gap = 6.0;
-    let sheet: Vec<(Option<&'static str>, &'static [SettingsRoute])> = NAVIGATION_GROUPS
-        .iter()
+    // A sub-page is listed under its parent while it shows, as the rail
+    // lists it, and is the selected cell.
+    let sheet: Vec<(Option<&'static str>, Vec<SettingsRoute>)> = navigation_groups(state.route)
+        .into_iter()
         .flat_map(|(heading, routes)| {
-            routes.chunks(columns).enumerate().map(move |(row, chunk)| {
-                ((row == 0 && !heading.is_empty()).then_some(*heading), chunk)
-            })
+            routes
+                .chunks(columns)
+                .enumerate()
+                .map(|(row, chunk)| {
+                    (
+                        (row == 0 && !heading.is_empty()).then_some(heading),
+                        chunk.to_vec(),
+                    )
+                })
+                .collect::<Vec<_>>()
         })
         .collect();
     let stop_height =
@@ -13773,12 +13890,9 @@ fn elide_wrapped_copy_tail(
 /// A row's second line ([`with_row_detail`]) states this law for notes —
 /// "Safety language must not disappear behind a semantic-only ellipsis" — and
 /// explanatory descriptions and consolidated status rows carry the same kind of
-/// load. The 2026-09 settings audit measured three of them dropping 108.7,
-/// 209.1 and 280.6 points of text at the SHIPPED DEFAULT 80x24 window: the
-/// sentence naming the Appearance page the wallpaper dim/tint controls live on,
-/// and the clause reporting whether the (since retired) Smart Titles provider
-/// errored (and, in the error case, the error text itself, since it was
-/// composed last).
+/// load. The 2026-09 settings audit measured them dropping 108.7 and 280.6
+/// points of text at the SHIPPED DEFAULT 80x24 window, among them the sentence
+/// naming the Appearance page the wallpaper dim/tint controls live on.
 ///
 /// The complete string stays on the returned group's semantic label, so
 /// `semantic(key)` lookups and assistive technology still read it whole; the
@@ -14477,25 +14591,16 @@ fn choice_option_node(
         text_width
     };
     let mut spec = choice_option_button(option, button_text_width, picker.fonts);
-    // Under its section's heading a row need not repeat it: the Follow
-    // system row paints the pair it draws, the current value its name.
+    // Under its section's heading a row need not repeat it: the current
+    // value paints its name.
     if picker.headed.get()
         && let Some(theme) = option.theme.as_ref()
+        && theme.section == ThemeSection::Current
     {
-        let words = match theme.section {
-            ThemeSection::System => Some(theme_pair_words(
-                crate::app_config::unset_theme_name(aterm_types::Appearance::Dark),
-                crate::app_config::unset_theme_name(aterm_types::Appearance::Light),
-            )),
-            ThemeSection::Current => Some(theme.id.clone()),
-            _ => None,
-        };
-        if let Some(words) = words {
-            spec.visual_label = Some(crate::native_ui::fit_native_button_label(
-                &words,
-                button_text_width.max(0.0),
-            ));
-        }
+        spec.visual_label = Some(crate::native_ui::fit_native_button_label(
+            &theme.id,
+            button_text_width.max(0.0),
+        ));
     }
     // The saved option wears the accent wash and a check, the highlighted
     // one the focus ring.
@@ -14909,8 +15014,6 @@ fn settings_location(key: &str) -> &'static str {
     } else if key.starts_with("ai.") {
         // Harness's section, drawn on its AI CLIs sub-page.
         Some(SettingsRoute::Ai)
-    } else if key == prefs::EDIT_EXPLAIN_HEAVY_LOAD {
-        Some(SettingsRoute::Messages)
     } else if key == prefs::EDIT_ACTIVE_TAB_COLOR {
         Some(SettingsRoute::TabColor)
     } else if key == prefs::EDIT_WALLPAPER || drawn_by_special_page(key) {
@@ -15155,18 +15258,6 @@ enum MusicStatus {
 }
 
 impl MusicStatus {
-    /// Every status, for the bounded-paint check.
-    #[cfg(test)]
-    const ALL: [Self; 7] = [
-        Self::NoOutput { saved_on: true },
-        Self::NoOutput { saved_on: false },
-        Self::VolumeZero,
-        Self::TypingNotesOff,
-        Self::MotionPaused(MotionReduction::Setting),
-        Self::MotionPaused(MotionReduction::System),
-        Self::MotionPaused(MotionReduction::HeavyLoad),
-    ];
-
     fn full(self) -> String {
         match self {
             Self::NoOutput { saved_on: true } => {
@@ -15265,8 +15356,8 @@ fn top_music_suppression_reason_for_output(
     // Only the keystroke notes ride the trail: the chime, the bonk, the riff
     // and the output sounds play without it. The STYLE decides, not the
     // spelling: an unrecognized value falls back to the default and still
-    // plays, so only a resolution that draws nothing — `off`, or a `pack:`
-    // naming no loaded pack — quiets the notes.
+    // plays, so only a resolution that draws nothing — `off` — quiets the
+    // notes.
     if top_projected_trail_value(state).eq_ignore_ascii_case("off")
         || candidate_trail_resolution(state, None).style.is_none()
     {
@@ -15336,14 +15427,28 @@ fn top_compact_choice_text_width(viewport: LogicalRect) -> f32 {
 /// the historical 180pt stays the floor, so the shorter theme and appearance
 /// pickers keep the shape they already had at every Dynamic Type step.
 ///
-/// Only the BUILT-IN domain is measured. A user theme name or a Trail Pack id is
-/// unbounded, and letting one of those size this control would push the row's own
-/// label out of a half-grid card — a worse outcome than the ellipsis such a name
-/// already receives.
+/// Only the BUILT-IN domain is measured. A user theme name is unbounded, and
+/// letting one size this control would push the row's own label out of a
+/// half-grid card — a worse outcome than the ellipsis such a name already
+/// receives.
+///
+/// The domain is measured AS THE CLOSED CONTROL PAINTS IT: an unset field shows its
+/// built-in default with the ` (default)` mark (`Match terminal (default)`), and
+/// that is the widest thing the control ever says. Measuring the bare options
+/// sized Linux's Window appearance control for its option words alone (under the
+/// 180pt floor) while it painted 158–181pt of text into 132pt — `Match the
+/// termina…` in DejaVu Sans, `Match the terminal (…` in Noto Sans.
 fn top_regular_choice_control_width(field: &EditField) -> f32 {
-    let widest = choices_for_field(field, &[], &crate::app_config::ThemeCatalog::default())
+    let painted_default = field
+        .seed
+        .is_none()
+        .then_some(field.placeholder.as_str())
+        .filter(|placeholder| placeholder.trim_end().ends_with(" (default)"));
+    let widest = choices_for_field(field, &crate::app_config::ThemeCatalog::default())
         .unwrap_or_default()
         .iter()
+        .map(String::as_str)
+        .chain(painted_default)
         .map(|option| {
             crate::native_ui::native_button_label_width(&setting_choice_label(field.key, option))
         })
@@ -15471,7 +15576,9 @@ enum ThemeRowsHost {
     /// A settings list's Theme rows (the Appearance page's Theme group,
     /// Search, Modified): each row keeps Reset's place, so the controls line
     /// up with the rows around them, and a side that is not aterm's own says
-    /// so and offers its own Reset (Modified names the side's default).
+    /// so and offers its own Reset (Modified names the side's default); a
+    /// written pair of aterm's own offers the theme's Reset on the Follow
+    /// system row.
     List {
         modified_only: bool,
         /// The page draws the live preview, so the preview side switch has
@@ -15481,11 +15588,11 @@ enum ThemeRowsHost {
 }
 
 /// THE THEME CARD'S ROWS, one builder for Top Settings and every list that
-/// shows the theme. Always mode (one theme): the Color theme control
-/// (`single`, the host's own form of that row), then the Follow system
-/// switch. Follow system (a `dark:…,light:…` pair, or no theme at all, which
-/// draws aterm's own pair): a Dark theme and a Light theme slot, each editing
-/// only its own side, the preview side switch, then the Follow system switch.
+/// shows the theme. Always mode (one theme, or none, which is Default): the
+/// Color theme control (`single`, the host's own form of that row), then the
+/// Follow system switch. Follow system (a `dark:…,light:…` pair): a Dark
+/// theme and a Light theme slot, each editing only its own side, the preview
+/// side switch, then the Follow system switch.
 /// The mode is read off the configured value, so a pair always opens here and
 /// never behind a single-name control. `text_width` is the card's text
 /// measure.
@@ -15802,18 +15909,11 @@ fn theme_slot_row(
     )
     .layout(Layout::default().width(control_width).height(Length::Fill));
     let key = format!("theme-slot/{}", appearance_word(side));
-    let default = crate::app_config::unset_theme_name(side);
-    // A side other than aterm's own is changed; so is either side of a file
-    // that spells out the very pair an unset theme draws (an older Follow
-    // system switch wrote it), whose Reset then removes the key: Modified
-    // lists that row, so it must offer a way back.
-    let changed = !name.eq_ignore_ascii_case(default) || {
-        let (dark, light) = prefs::theme_slots(
-            state.raw_value(prefs::EDIT_THEME).as_deref(),
-            &state.assets.themes,
-        );
-        state.is_explicit(prefs::EDIT_THEME) && prefs::theme_pair_value(&dark, &light).is_none()
-    };
+    let default = crate::app_config::default_pair_side(side);
+    // A side other than aterm's own is changed, and its Reset puts aterm's
+    // own back on that side; the pair keeps following the system (the
+    // switch is the way back to one theme).
+    let changed = !name.eq_ignore_ascii_case(default);
     let mut label = title.to_string();
     match host {
         ThemeRowsHost::List {
@@ -15937,7 +16037,10 @@ fn theme_preview_side_row(
 }
 
 /// The Follow system switch: on, a Dark and a Light theme picked by the
-/// system appearance; off, one theme always.
+/// system appearance; off, one theme always. On a list, a written pair whose
+/// sides are both aterm's own (what the switch writes over an unset theme)
+/// has no slot Reset, yet its key is written: this row says Changed and
+/// offers the theme's own Reset, which removes the key (one theme, Default).
 fn theme_mode_row(
     state: &SettingsViewState,
     host: ThemeRowsHost,
@@ -15946,14 +16049,47 @@ fn theme_mode_row(
     text_width: f32,
 ) -> UiNode {
     let pending = state.config_key_pending(prefs::EDIT_THEME);
-    let label = "Follow system light/dark";
+    let own =
+        |name: &str, side| name.eq_ignore_ascii_case(crate::app_config::default_pair_side(side));
+    let at_own_pair = following && state.is_explicit(prefs::EDIT_THEME) && {
+        let (dark, light) = prefs::theme_slots(
+            state.raw_value(prefs::EDIT_THEME).as_deref(),
+            &state.assets.themes,
+        );
+        own(&dark, aterm_types::Appearance::Dark) && own(&light, aterm_types::Appearance::Light)
+    };
+    let reset = (at_own_pair && matches!(host, ThemeRowsHost::List { .. })).then(|| {
+        let action = format!("settings/reset/{}", prefs::EDIT_THEME);
+        row_trailing_button(
+            action.clone(),
+            ButtonSpec::new("Reset Color theme to Default").visual_label("Reset"),
+            action,
+            pending,
+        )
+    });
+    let name = "Follow system light/dark";
+    let (label, visual_label) = if reset.is_some()
+        && matches!(
+            host,
+            ThemeRowsHost::List {
+                modified_only: false,
+                ..
+            }
+        ) {
+        (
+            format!("{name}{ROW_TAG_SEPARATOR}{CHANGED_WORD}"),
+            format!("Follow system{ROW_TAG_SEPARATOR}{CHANGED_WORD}"),
+        )
+    } else {
+        (name.to_string(), "Follow system".to_string())
+    };
     let controls = vec![
         UiNode::new(
             THEME_MODE_ACTION,
             UiContent::Switch(
                 Control::new(
                     SwitchSpec {
-                        label: label.to_string(),
+                        label: name.to_string(),
                         description: Some(
                             "theme · on: a Dark and a Light theme, picked by the system appearance; off: one theme always"
                                 .to_string(),
@@ -15983,10 +16119,10 @@ fn theme_mode_row(
     ];
     theme_card_row(
         "theme-mode",
-        label,
-        "Follow system",
+        &label,
+        &visual_label,
         controls,
-        theme_row_trailing(host, "theme-mode", None, width),
+        theme_row_trailing(host, "theme-mode", reset, width),
         width,
         text_width,
         true,
@@ -16324,6 +16460,13 @@ fn top_card_row(
 /// form) and the Sound page (the ordinary row form, notes and Reset), so the
 /// two cannot disagree (the switch's escape from Serious Mode is the same
 /// transaction on both).
+///
+/// The status is the card's row right under the switch's, at the cards' own
+/// 6pt gap, so the list keeps the two on one screen where they fit under the
+/// card's title and makes the status the stop right after the switch where
+/// they do not ([`SplitCard::stops`]), as a page row's note is: a
+/// compact landscape page at 2× text in Serious Mode, on a host with no audio
+/// output, has 12pt too little for both.
 fn music_effects_rows(
     state: &SettingsViewState,
     width: SettingsWidth,
@@ -16341,19 +16484,10 @@ fn music_effects_rows(
         top,
     );
     match (music, top_music_suppression_reason(state, cx.motion)) {
-        (Some((music, height)), Some(reason)) => {
-            let status_height = page_subtitle_height();
-            let total = height + 6.0 + status_height;
-            vec![(
-                UiNode::new(
-                    "settings/top/music-effects",
-                    UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-                )
-                .layout(Layout::column().height(Length::Fixed(total)).gap(6.0))
-                .children(vec![music, top_music_suppression_node(reason)]),
-                total,
-            )]
-        }
+        (Some(music), Some(reason)) => vec![
+            music,
+            (top_music_suppression_node(reason), page_subtitle_height()),
+        ],
         (music, _) => music.into_iter().collect(),
     }
 }
@@ -16448,8 +16582,8 @@ fn top_card_title_with_note(
 }
 
 /// The ACTIVE ids from the raw `display_font` value, in toggle order: splits the
-/// `+`-joined MIX form, CANONICALIZES each part (so a config still spelling a
-/// face `minecraft` lights the `pixel` toggle rather than none of them), keeps
+/// `+`-joined MIX form, CANONICALIZES each part (so a config spelling a face
+/// `Pixel` lights the `pixel` toggle rather than none of them), keeps
 /// only real bundled ids (never "off"), deduplicates, and caps at
 /// [`aterm_render::DISPLAY_FACE_MIX_MAX`] — the same normalization
 /// `Config::font_family_request` applies, so the toggles always reflect what
@@ -16756,11 +16890,7 @@ fn cursor_styles_page(
         );
         items.push(ListItem::Card(Box::new(row), row_height));
     }
-    for group in [
-        CursorStyleGroup::Companions,
-        CursorStyleGroup::Trails,
-        CursorStyleGroup::Packs,
-    ] {
+    for group in [CursorStyleGroup::Companions, CursorStyleGroup::Trails] {
         let rows = styles
             .iter()
             .filter(|style| style.group == group)
@@ -16905,10 +17035,7 @@ fn cursor_styles_page(
     out.push(scroll::list_page_peeking(
         state,
         "settings/list",
-        &format!(
-            "Cursor styles, saved: {}",
-            cursor_style_name_in(&saved, state.trail_pack_catalog())
-        ),
+        &format!("Cursor styles, saved: {}", cursor_style_name(&saved)),
         items,
         (body - used).max(0.0),
         gap,
@@ -16944,17 +17071,13 @@ fn cursor_style_status(
         ));
     }
     let raw = top_authored_trail_value(state);
-    let resolved = crate::app_config::resolve_trail_style(&raw, state.trail_pack_catalog());
-    let note = match resolved.issue? {
-        crate::app_config::TrailStyleIssue::Unknown => format!(
-            "aterm.toml names a style aterm does not know, so it draws {}.",
-            cursor_style_name(prefs::DEFAULT_CURSOR_TRAIL_STYLE)
-        ),
-        crate::app_config::TrailStyleIssue::EmptyPackId
-        | crate::app_config::TrailStyleIssue::MissingPack => {
-            "The trail pack aterm.toml names is not loaded, so no trail is drawn.".to_string()
-        }
-    };
+    if !crate::app_config::resolve_trail_style(&raw).unknown {
+        return None;
+    }
+    let note = format!(
+        "aterm.toml names a style aterm does not know, so it draws {}.",
+        cursor_style_name(prefs::DEFAULT_CURSOR_TRAIL_STYLE)
+    );
     Some((note, None))
 }
 
@@ -17084,7 +17207,7 @@ fn cursor_style_row(
 }
 
 /// An ordinary settings row the Cursor Styles page draws itself, laid out
-/// as a list lays its rows out ([`finish_setting_row`]).
+/// as a list lays its rows out ([`finish_setting_row_sharing`]).
 fn cursor_styles_setting_row(
     state: &SettingsViewState,
     key: &str,
@@ -17106,10 +17229,9 @@ fn cursor_style_tuning_bound(
     width: SettingsWidth,
     text_width: f32,
 ) -> impl Fn(f32, f32) -> f32 {
-    let catalog = state.trail_pack_catalog();
     let resolved: Vec<_> = styles
         .iter()
-        .map(|style| crate::app_config::resolve_trail_style(&style.value, catalog))
+        .map(|style| crate::app_config::resolve_trail_style(&style.value))
         .filter(|resolved| resolved.style.is_some())
         .collect();
     let rows: Vec<(UiNode, f32)> = prefs::CURSOR_STYLE_TUNING_KEYS
@@ -17156,7 +17278,7 @@ fn cursor_style_tuning_card(
     width: SettingsWidth,
     text_width: f32,
 ) -> Option<SplitCard> {
-    let resolved = crate::app_config::resolve_trail_style(saved, state.trail_pack_catalog());
+    let resolved = crate::app_config::resolve_trail_style(saved);
     resolved.style?;
     let rows = prefs::CURSOR_STYLE_TUNING_KEYS
         .iter()
@@ -17166,10 +17288,7 @@ fn cursor_style_tuning_card(
     if rows.is_empty() {
         return None;
     }
-    let caption = format!(
-        "Adjust {}",
-        cursor_style_name_in(saved, state.trail_pack_catalog())
-    );
+    let caption = format!("Adjust {}", cursor_style_name(saved));
     Some(cursor_styles_card("tuning", Some(&caption), &caption, rows))
 }
 
@@ -17179,7 +17298,7 @@ fn cursor_style_tuning_card(
 fn cursor_style_link_row(state: &SettingsViewState, text_width: f32) -> (UiNode, f32) {
     let height = scaled_control_height();
     let saved = saved_cursor_style(state);
-    let name = cursor_style_name_in(&saved, state.trail_pack_catalog());
+    let name = cursor_style_name(&saved);
     let label = format!("Cursor style: {name}");
     // The painter's 10pt lead and 38pt chevron slot, and a margin past them
     // so the label paints whole (`top_regular_choice_control_width`).
@@ -18643,7 +18762,7 @@ fn route_keywords(route: SettingsRoute) -> &'static [&'static str] {
             "release",
         ],
         SettingsRoute::Packages => &["toolchain", "tools", "alab", "atpkg", "cargo", "rustc"],
-        SettingsRoute::Messages => &["notices", "log", "history", "alerts", "heavy load"],
+        SettingsRoute::Messages => &["notices", "log", "history", "alerts"],
         SettingsRoute::About => &["version", "build", "license", "credits"],
         SettingsRoute::Harness => &[
             "agent",
@@ -19071,7 +19190,7 @@ fn settings_group_heading_fits(caption: &str, available_width: f32) -> bool {
 /// place in the page's sorted fields, or what a row carries under it.
 enum FieldStop {
     Card(UiNode),
-    /// A row, built up front ([`finish_setting_row`]): what it says, its
+    /// A row, built up front ([`finish_setting_row_sharing`]): what it says, its
     /// note included, sets its height.
     Row {
         position: usize,
@@ -19575,10 +19694,10 @@ fn settings_fields_page(
         for (position, (_, index, field)) in fields.iter().enumerate().take(cursor).skip(start) {
             if field.key == prefs::EDIT_THEME {
                 // THE THEME IS ITS CARD'S ROWS here too ([`theme_card_rows`],
-                // Top Settings' own builder): one theme is its Color theme row
-                // and the Follow system switch; a pair (or no theme) its Dark
-                // and Light slots, the preview side and the switch, so both
-                // sides can be edited and a pair never reads as its raw value.
+                // Top Settings' own builder): one theme (or none) is its Color
+                // theme row and the Follow system switch; a pair its Dark and
+                // Light slots, the preview side and the switch, so both sides
+                // can be edited and a pair never reads as its raw value.
                 let host = ThemeRowsHost::List {
                     modified_only,
                     preview: show_renderer_preview,
@@ -20322,18 +20441,6 @@ fn native_compatibility_only_key(key: &str) -> bool {
     crate::native_config_language::is_compatibility_only_key(key)
 }
 
-fn effective_candidate_text(
-    state: &SettingsViewState,
-    patch: Option<&ConfigPatch>,
-    key: &str,
-    fallback: &str,
-) -> String {
-    state.environment_override(key).map_or_else(
-        || candidate_setting_text(state, patch, key, fallback),
-        |active| active.effective.clone(),
-    )
-}
-
 fn candidate_trail_resolution(
     state: &SettingsViewState,
     patch: Option<&ConfigPatch>,
@@ -20344,7 +20451,7 @@ fn candidate_trail_resolution(
         prefs::EDIT_CURSOR_TRAIL_STYLE,
         prefs::DEFAULT_CURSOR_TRAIL_STYLE,
     );
-    crate::app_config::resolve_trail_style(&raw, state.trail_pack_catalog())
+    crate::app_config::resolve_trail_style(&raw)
 }
 
 fn candidate_profanity_style(
@@ -20645,25 +20752,6 @@ fn theme_value_unavailability(state: &SettingsViewState, raw: &str) -> Option<Ef
                 format!("Invalid selector: {applied} still applies"),
                 format!(
                     "Invalid theme selector; {applied} still applies and any other appearance uses Default"
-                ),
-            ));
-        }
-        // A value that names no theme at all draws what an unset `theme`
-        // does, which follows the OS; one whose names do not load draws Default.
-        if selector.named_sides().is_empty() {
-            let [dark, light] = [
-                aterm_types::Appearance::Dark,
-                aterm_types::Appearance::Light,
-            ]
-            .map(crate::app_config::unset_theme_name);
-            return Some(EffectDisclosure::new(
-                EffectNoteKind::Constraint,
-                format!(
-                    "The configured theme selector is invalid ({reason}) and names no theme, so the unset default follows the system: {dark} in dark mode, {light} in light mode"
-                ),
-                "Invalid selector: follows system",
-                format!(
-                    "Invalid theme selector; it names no theme, so {dark} or {light} follows the system"
                 ),
             ));
         }
@@ -21090,6 +21178,7 @@ fn parent_or_motion_inactivity(
         || matches!(
             key,
             prefs::EDIT_HARNESS_AUTOPILOT
+                | prefs::EDIT_HARNESS_LAND_AT
                 | prefs::EDIT_HARNESS_APPROVE
                 | prefs::EDIT_HARNESS_ANSWER_QUESTIONS
                 | prefs::EDIT_HARNESS_QUESTION_PRIORITY
@@ -21112,21 +21201,6 @@ fn parent_or_motion_inactivity(
             "Inactive: Answer questions Off",
             "Currently inactive: Answer questions is Off",
         ));
-    }
-    if key == prefs::EDIT_STREAM_FADE {
-        return candidate_setting_bool(state, patch, key, false)
-            .then(|| motion_suppression(state, patch, motion))
-            .flatten();
-    }
-    if key == prefs::EDIT_STREAM_FADE_MS {
-        if !candidate_setting_bool(state, patch, prefs::EDIT_STREAM_FADE, false) {
-            return Some(inactive(
-                "This duration is saved but inactive while Fade in new output is Off",
-                "Inactive: Fade in new output Off",
-                "Currently inactive: Fade in new output is Off",
-            ));
-        }
-        return motion_suppression(state, patch, motion);
     }
 
     // THE LOAD SHED yields to an explicit Always animate (the host's latch and
@@ -21165,15 +21239,6 @@ fn parent_or_motion_inactivity(
         return motion_suppression(state, patch, motion);
     }
     if key == prefs::EDIT_MATRIX_RAIN_ENABLED && candidate_setting_bool(state, patch, key, false) {
-        return motion_suppression(state, patch, motion);
-    }
-    // Robi has no focus gate (an unfocused window only freezes him), so only
-    // Serious Mode, reduced motion and load hide an invited robot.
-    if key == prefs::EDIT_ROBI && candidate_setting_bool(state, patch, key, false) {
-        let motion = crate::native_app::ViewMotionCx {
-            focused: true,
-            ..motion
-        };
         return motion_suppression(state, patch, motion);
     }
     if matches!(
@@ -21402,8 +21467,8 @@ fn parent_or_motion_inactivity(
 
     // Every one of the five flags below is `false` unless `key` is a cursor-trail
     // key, so gate the whole block on that cheap key-only test: `candidate_trail_resolution`
-    // is a field-vector scan plus a `String` plus a walk of the trail-pack catalog,
-    // and this runs for EVERY settings row on every view rebuild — the ~160 rows that
+    // is a field-vector scan plus a `String` plus a style-vocabulary walk, and
+    // this runs for EVERY settings row on every view rebuild — the ~160 rows that
     // have nothing to do with the trail used to resolve it and throw it away.
     let trail_tuning = TRAIL_TUNING_KEYS.contains(&key);
     if trail_tuning
@@ -21415,8 +21480,7 @@ fn parent_or_motion_inactivity(
         let trail_resolution = candidate_trail_resolution(state, patch);
         let trail_style_enabling =
             key == prefs::EDIT_CURSOR_TRAIL_STYLE && trail_resolution.style.is_some();
-        let trail_style_invalid =
-            key == prefs::EDIT_CURSOR_TRAIL_STYLE && trail_resolution.issue.is_some();
+        let trail_style_invalid = key == prefs::EDIT_CURSOR_TRAIL_STYLE && trail_resolution.unknown;
         // A patch that RESETS the master means "use the built-in default", which is
         // platform-split — so the candidate resolves against
         // `DEFAULT_DECORATIVE_EFFECTS`, never a typed `true`, or a Windows reset
@@ -21429,45 +21493,25 @@ fn parent_or_motion_inactivity(
                 crate::app_config::DEFAULT_DECORATIVE_EFFECTS,
             );
         if trail_tuning || trail_style_enabling || trail_style_invalid || trail_master_enabling {
-            if let Some(issue) = trail_resolution.issue {
-                // AN UNKNOWN STYLE DISABLES NOTHING. `resolve_trail_style`
-                // substitutes the default style and the trail RENDERS, so every
-                // other row in this block still governs the drawn wake: the
-                // master switch turns it on, the Music-effects switch sounds
-                // it, and each TRAIL_TUNING_KEYS row shapes it — duration,
-                // length, wake, intensity, radius, ring, colour, accent,
-                // sprite, the bloom trio, shimmer, HDR glow and SDR boost. The
-                // STYLE row's own authored value is the only unusable one, so
-                // it alone takes the Unavailable shape; the rest fall through
-                // to the gates that really do silence them (master off, Music
-                // effects off, pack ownership, Fire-only shimmer, bloom off,
-                // motion) and pick up a live-effect-preserving note below.
-                // Same shape as the invalid theme selector's
-                // `Constraint`-beside-a-live-effect projection. The PACK issues
-                // are not this case: they disable the trail outright, so they
-                // keep the Unavailable shape on every row.
-                let unknown_elsewhere =
-                    matches!(issue, crate::app_config::TrailStyleIssue::Unknown)
-                        && key != prefs::EDIT_CURSOR_TRAIL_STYLE;
-                if !unknown_elsewhere {
-                    return Some(match issue {
-                        crate::app_config::TrailStyleIssue::Unknown => unavailable(
-                            "The configured cursor style is outside this setting's registered choices, so the runtime draws its default trail instead; open Manual to repair the authored value",
-                            "Invalid trail style: runtime fallback active",
-                            "The cursor style is unknown; the default trail is drawn instead",
-                        ),
-                        crate::app_config::TrailStyleIssue::EmptyPackId => unavailable(
-                            "The configured Trail Pack id is empty, so the renderer disables the trail until a concrete pack is selected",
-                            "Empty Trail Pack id: no effect",
-                            "Trail Pack id is empty; trail remains disabled",
-                        ),
-                        crate::app_config::TrailStyleIssue::MissingPack => unavailable(
-                            "The configured Trail Pack is not present in the admitted pack catalog, so the renderer disables the trail",
-                            "Trail Pack missing: no effect",
-                            "Selected Trail Pack is missing; trail remains disabled",
-                        ),
-                    });
-                }
+            // AN UNKNOWN STYLE DISABLES NOTHING. `resolve_trail_style`
+            // substitutes the default style and the trail RENDERS, so every
+            // other row in this block still governs the drawn wake: the master
+            // switch turns it on, the Music-effects switch sounds it, and each
+            // TRAIL_TUNING_KEYS row shapes it — duration, length, wake,
+            // intensity, radius, ring, colour, accent, sprite, the bloom trio,
+            // shimmer, HDR glow and SDR boost. The STYLE row's own authored
+            // value is the only unusable one, so it alone takes the Unavailable
+            // shape; the rest fall through to the gates that really do silence
+            // them (master off, Music effects off, Fire-only shimmer, bloom
+            // off, motion) and pick up a live-effect-preserving note below.
+            // Same shape as the invalid theme selector's
+            // `Constraint`-beside-a-live-effect projection.
+            if trail_style_invalid {
+                return Some(unavailable(
+                    "The configured cursor style is outside this setting's registered choices, so the runtime draws its default trail instead; open Manual to repair the authored value",
+                    "Invalid trail style: runtime fallback active",
+                    "The cursor style is unknown; the default trail is drawn instead",
+                ));
             }
             // The cursor style control itself already reads Off; only the
             // rows it governs say why they are idle, naming what is off: the
@@ -21514,7 +21558,7 @@ fn parent_or_motion_inactivity(
                     ));
                 }
                 // An unknown style plays the fallback trail's notes.
-                if trail_resolution.issue.is_some() {
+                if trail_resolution.unknown {
                     return Some(fallback_trail_note());
                 }
                 return voices_motion_note(
@@ -21523,17 +21567,6 @@ fn parent_or_motion_inactivity(
                     patch,
                     motion,
                 );
-            }
-            if matches!(
-                key,
-                prefs::EDIT_CURSOR_TRAIL_RADIUS | prefs::EDIT_CURSOR_TRAIL_RING
-            ) && trail_resolution.pack.is_some()
-            {
-                return Some(inactive(
-                    "The selected Trail Pack owns its crown radius and landing ring; this built-in tuning value is saved for non-pack styles",
-                    "Inactive: Trail Pack owns this",
-                    "Currently inactive: selected Trail Pack owns crown and ring tuning",
-                ));
             }
             if key == prefs::EDIT_CURSOR_FIRE_SHIMMER && trail_resolution.canonical != Some("fire")
             {
@@ -21586,13 +21619,12 @@ fn parent_or_motion_inactivity(
                     "Currently inactive: Bloom is Off",
                 ));
             }
-            // The tuning row survived every gate, so it IS live — and the only
-            // issue that reaches here is an unrecognized style, whose fallback
-            // trail is the thing this row tunes. The note names which trail that
-            // is; it must stay a `Constraint` so `has_live_effect` holds, and it
-            // is stated after motion suppression, which really does stop the
-            // drawing.
-            if trail_tuning && trail_resolution.issue.is_some() {
+            // The tuning row survived every gate, so it IS live — and an
+            // unrecognized style's fallback trail is the thing this row tunes.
+            // The note names which trail that is; it must stay a `Constraint`
+            // so `has_live_effect` holds, and it is stated after motion
+            // suppression, which really does stop the drawing.
+            if trail_tuning && trail_resolution.unknown {
                 return motion_suppression(state, patch, motion)
                     .or_else(|| Some(fallback_trail_note()));
             }
@@ -21888,20 +21920,6 @@ fn parent_or_motion_inactivity(
         ));
     }
 
-    if matches!(key, "net.listen" | "net.cert" | "net.key") {
-        let complete = ["net.listen", "net.cert", "net.key"].iter().all(|part| {
-            !effective_candidate_text(state, patch, part, "")
-                .trim()
-                .is_empty()
-        });
-        if !complete {
-            return Some(inactive(
-                "The network listener remains disabled until net.listen, net.cert, and net.key are all set to non-empty values",
-                "Inactive: listener triad incomplete",
-                "Listener inactive; net.listen, net.cert, and net.key are all required",
-            ));
-        }
-    }
     None
 }
 
@@ -22238,9 +22256,7 @@ fn config_application_projection(
 // * **no scope sentence exists here at all.** `FdaScope` is `Unknown` on this
 //   tree and §3.4's escalation clause is explicit about what to ship in that
 //   case — `fda_scope` on the `privacy` verb and no scope sentence in the UI.
-//   Neither of §3.4's two pre-drafted variants is present, and
-//   `the_macos_access_panel_renders_every_state_and_never_speaks_about_scope`
-//   fails if one appears.
+//   Neither of §3.4's two pre-drafted variants is present.
 // * **no string names a folder a grant covers.** The coverage sentence is
 //   selected by [`SpikeEvidence::fda_coverage_measured`], which is `false`
 //   everywhere today, so the shipped sentence says what is true: Full Disk
@@ -22340,7 +22356,8 @@ pub(crate) struct MacosAccess {
     /// Whether `/usr/bin/tccutil` is a runnable file. Unknown fails closed: a
     /// destructive button is never shown on an unproven tool.
     pub(crate) tccutil: TccutilPresence,
-    /// `[privacy] warmup == "on-request"` — whether the gesture is offered.
+    /// `[privacy]` is enabled and `warmup` is "on-request" or "automatic"
+    /// (`PrivacyWarmup::offered`): whether the gesture is offered.
     pub(crate) warmup_offered: bool,
     /// A worker is walking folders right now.
     pub(crate) warmup_live: bool,
@@ -22927,37 +22944,6 @@ pub(crate) struct MacosAccessCopy {
     pub(crate) debugger: DebuggerRowCopy,
 }
 
-impl MacosAccessCopy {
-    /// Every shipped string, in render order. The copy fence drives this
-    /// rather than a screenshot, which is how it can sweep the whole matrix.
-    #[cfg(test)]
-    pub(crate) fn strings(&self) -> Vec<&str> {
-        let mut out = vec![
-            self.headline.as_str(),
-            self.probe_detail.as_str(),
-            self.coverage.as_str(),
-            self.trade.as_str(),
-            self.grants.as_str(),
-            self.lasts.as_str(),
-            self.prompt.as_str(),
-            self.route.as_str(),
-            self.observation.as_str(),
-            self.identity.as_str(),
-            self.responsible.as_str(),
-        ];
-        out.extend(self.anchor_fault.as_deref());
-        out.extend(self.services.iter().map(String::as_str));
-        out.extend(self.rebuild.as_deref());
-        out.extend(self.folders.iter().map(String::as_str));
-        out.extend(self.repair.iter().map(String::as_str));
-        out.extend(self.claimants.iter().map(String::as_str));
-        out.extend(self.retire_status.as_deref());
-        out.extend(self.retired.iter().map(String::as_str));
-        out.extend(self.debugger.strings());
-        out
-    }
-}
-
 /// THE DEVELOPER TOOLS CARD's words (`docs/DESIGN-macos-debugger-access-2026-09-29.md`
 /// §9.1; owner ask 2026-10-15: "make sure that there is a status screen in
 /// settings on this"). Built by [`devtools_card_copy`] as a total function of
@@ -23009,26 +22995,6 @@ pub(crate) struct DevToolsCardCopy {
     /// The owner's Not now while it holds and aterm is not granted: why aterm
     /// leaves the page alone, until when, and that the button still opens it.
     pub(crate) declined: Option<String>,
-}
-
-impl DevToolsCardCopy {
-    /// Every string the card can show, for its copy fence.
-    #[cfg(test)]
-    pub(crate) fn strings(&self) -> Vec<&str> {
-        let mut out = vec![self.state.as_str()];
-        out.extend(self.unread.as_deref());
-        out.extend([self.kind.as_str(), self.why.as_str()]);
-        out.extend(self.checked.as_deref());
-        out.extend([
-            self.how.as_str(),
-            self.route.as_str(),
-            self.trade.as_str(),
-            self.only.as_str(),
-        ]);
-        out.extend(self.opened.as_deref());
-        out.extend(self.declined.as_deref());
-        out
-    }
 }
 
 /// The debugger-access row (`docs/DESIGN-macos-debugger-access-2026-09-29.md`
@@ -23089,28 +23055,6 @@ impl DebuggerButton {
     }
 }
 
-impl DebuggerRowCopy {
-    /// Every string of the row, in render order, for the panel's copy fence.
-    #[cfg(test)]
-    pub(crate) fn strings(&self) -> Vec<&str> {
-        let mut out = vec![
-            self.headline.as_str(),
-            self.kind.as_str(),
-            self.state.as_str(),
-        ];
-        out.extend(self.status.as_deref());
-        out.extend([
-            self.stops.as_str(),
-            self.grants.as_str(),
-            self.lasts.as_str(),
-            self.undo.as_str(),
-            self.trade.as_str(),
-            self.cross_link.as_str(),
-        ]);
-        out
-    }
-}
-
 /// The item's display name, taken from the consent module's own string table
 /// rather than typed here. `native_settings.rs` holds no protected-folder
 /// literal of any shape (the aterm-census guard `protected-folder`).
@@ -23140,6 +23084,7 @@ fn macos_access_service_label(service: &str) -> String {
             "media-library" => "Music and media library".to_string(),
             "photos" => "Photos library".to_string(),
             "app-bundles" => "Other apps' bundles (App Management)".to_string(),
+            "contacts" => "Contacts".to_string(),
             other => other.to_string(),
         },
     }
@@ -23282,8 +23227,8 @@ pub(crate) fn macos_access_copy(access: &MacosAccess) -> MacosAccessCopy {
             if *service == "app-data" && !access.evidence.fda_coverage_measured {
                 // MEASURED 2026-09-19, so this row no longer attributes its
                 // claim to Apple's documentation. `fda_coverage_measured` is
-                // still false because it gates five classes at once and only
-                // this one was measured — the arm stays, its sentence changes.
+                // still false (its doc says why) although the five classes it
+                // gates are measured too: the arm stays, its sentence changes.
                 rows.push(
                     "Other applications' data \u{2014} stopped by Full Disk Access".to_string(),
                 );
@@ -23330,7 +23275,7 @@ pub(crate) fn macos_access_copy(access: &MacosAccess) -> MacosAccessCopy {
     let prompt = if access.prompt_possible() && access.fda == FdaState::Granted {
         // The coverage line above already says what was measured and what
         // was not; this line says what that leaves, pointing at the rows.
-        "Granted. What is marked not measured below can still interrupt a program."
+        "Granted. A row below marked not measured, or one Full Disk Access does not apply to, can still interrupt a program."
     } else if access.prompt_possible() {
         "A program running in aterm can still be interrupted by a macOS file-access request."
     } else {
@@ -25165,7 +25110,7 @@ fn segmented_choices(field: &EditField, value: &str) -> Option<(Vec<SegmentOptio
     {
         return None;
     }
-    let options = choices_for_field(field, &[], &crate::app_config::ThemeCatalog::default())?;
+    let options = choices_for_field(field, &crate::app_config::ThemeCatalog::default())?;
     if !(2..=3).contains(&options.len()) {
         return None;
     }
@@ -25337,30 +25282,10 @@ fn default_value_label(key: &str) -> Option<&'static str> {
 /// row also offers the Tab Color page's wheel, and Modified's Display face
 /// row takes the control its own page gives it, a toggle per face. The
 /// node's height is fixed.
-fn finish_setting_row(
-    state: &SettingsViewState,
-    index: usize,
-    field: &EditField,
-    modified_only: bool,
-    width: SettingsWidth,
-    text_width: f32,
-    note: Option<&str>,
-) -> UiNode {
-    finish_setting_row_sharing(
-        state,
-        index,
-        field,
-        modified_only,
-        width,
-        text_width,
-        note,
-        None,
-    )
-}
-
-/// [`finish_setting_row`] for a row whose box says once why its rows are
-/// idle (`shared_reason`, [`shared_inactive_reason`]): the row leaves that
-/// tag off its own lines; its accessible name still says it.
+///
+/// A row whose box says once why its rows are idle (`shared_reason`,
+/// [`shared_inactive_reason`]) leaves that tag off its own lines; its
+/// accessible name still says it.
 // The row's identity, its place, its measures, its note and the box's
 // reason: one caller in three passes each, so a struct would only rename them.
 #[allow(clippy::too_many_arguments)]
@@ -25388,7 +25313,7 @@ fn finish_setting_row_sharing(
     .whole()
 }
 
-/// [`finish_setting_row`] in a column narrower than a field page's: the
+/// [`finish_setting_row_sharing`] in a column narrower than a field page's: the
 /// control gives up width (to at most `control_width`) before the label is
 /// cut, and the label line is fitted to what is left.
 fn finish_setting_row_narrowed(
@@ -26284,6 +26209,10 @@ fn devtools_card(access: &MacosAccess, compact: bool, fit: DevToolsCardFit) -> (
 /// The tag after the name of a row whose key is written in aterm.toml.
 const CHANGED_TAG: &str = "  ·  Changed";
 
+/// The quiet badge on a font row whose aterm.toml value beats the value the
+/// saved theme names.
+const OVERRIDES_THEME_WORD: &str = "Overrides theme";
+
 /// How much a row's label line gives up to [`CHANGED_TAG`].
 fn changed_tag_width() -> f32 {
     let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Primary);
@@ -26293,9 +26222,28 @@ fn changed_tag_width() -> f32 {
 /// The quiet Reset after a row's control: it removes the row's key from
 /// aterm.toml.
 fn setting_reset_button(field: &EditField, pending: bool) -> UiNode {
+    setting_reset_button_to(field, pending, None)
+}
+
+/// [`setting_reset_button`] for a row whose removal lands on the saved
+/// theme's value (`theme`: the value and the theme's label): it reads "Use
+/// theme's" and says which value it returns to.
+fn setting_reset_button_to(
+    field: &EditField,
+    pending: bool,
+    theme: Option<&(String, String)>,
+) -> UiNode {
+    let spec = match theme {
+        Some((value, label)) => ButtonSpec::new(format!(
+            "Reset {} to theme {label}'s ({value})",
+            field.label
+        ))
+        .visual_label("Use theme's"),
+        None => ButtonSpec::new(format!("Reset {}", field.label)).visual_label("Reset"),
+    };
     row_trailing_button(
         format!("settings/reset/{}", field.key),
-        ButtonSpec::new(format!("Reset {}", field.label)).visual_label("Reset"),
+        spec,
         format!("settings/reset/{}", field.key),
         pending,
     )
@@ -26393,7 +26341,7 @@ fn switch_default(key: &str) -> Option<bool> {
 /// its key is written in aterm.toml — a Reset after the control. The Reset's
 /// place is kept on every row, so a control never moves or shrinks when its
 /// Reset appears. Its visual label is the name and its tags on one line
-/// ([`SettingRowParts`]); [`finish_setting_row`] lays them out for a list.
+/// ([`SettingRowParts`]); [`finish_setting_row_sharing`] lays them out for a list.
 fn setting_row(
     state: &SettingsViewState,
     index: usize,
@@ -26630,7 +26578,7 @@ fn setting_row_parts_with(
     let choice_words = if field.key == prefs::EDIT_THEME && field.seed.is_some() {
         theme_value_words(&state.assets.themes, Some(&value))
     } else {
-        setting_choice_label_in(state, field.key, &value)
+        setting_choice_label(field.key, &value)
     };
     let control = match field.kind {
         _ if font_list => {
@@ -26797,10 +26745,16 @@ fn setting_row_parts_with(
     };
     // Elsewhere a changed row says so; Modified lists only changed rows. The
     // tags follow the name; a list moves those its line has no room for to
-    // the row's second line ([`finish_setting_row`]).
+    // the row's second line ([`finish_setting_row_sharing`]).
     let mut tags: Vec<String> = Vec::new();
     if !modified_only && state.is_explicit(field.key) {
         tags.push(CHANGED_WORD.to_string());
+    }
+    // A typography row the config sets while the saved theme names it too:
+    // the config wins, and the row says so.
+    let theme_fallback = state.theme_fallback_for(field.key);
+    if theme_fallback.is_some() && state.is_explicit(field.key) {
+        tags.push(OVERRIDES_THEME_WORD.to_string());
     }
     if has_draft {
         tags.push("Unsaved draft".to_string());
@@ -26814,7 +26768,15 @@ fn setting_row_parts_with(
     // Modified says what Reset returns each row to. Last, so a label too long
     // for its row loses the default before it loses why the row is idle.
     if modified_only && let Some(default) = default_value_label(field.key) {
-        tags.push(format!("Default: {default}"));
+        // The theme's says "Default theme", as a Follow system slot's does:
+        // aterm's own theme is named Default, and "Default: Default" reads
+        // as if nothing had changed.
+        let tag = if field.key == prefs::EDIT_THEME {
+            "Default theme"
+        } else {
+            "Default"
+        };
+        tags.push(format!("{tag}: {default}"));
     }
     let mut label = field.label.to_string();
     for tag in &tags {
@@ -26893,7 +26855,7 @@ fn setting_row_parts_with(
                 pending,
             )
         } else {
-            setting_reset_button(field, pending)
+            setting_reset_button_to(field, pending, theme_fallback.as_ref())
         })
     } else if reserve_reset_slot {
         // The Reset's place, kept while the row has none, so the control
@@ -27184,7 +27146,11 @@ fn numeric_slider_value(field: &EditField) -> Option<(f64, String)> {
 fn bounded_numeric_nonfinite_effective(key: &str) -> Option<(f64, &'static str)> {
     Some(match key {
         prefs::EDIT_FONT_PX => (f64::from(crate::FONT_PX), "default"),
-        prefs::EDIT_LINE_HEIGHT => (1.0, "default"),
+        prefs::EDIT_LINE_HEIGHT => (
+            f32_as_shown(crate::app_config::DEFAULT_LINE_HEIGHT),
+            "default",
+        ),
+        prefs::EDIT_FONT_SIZE_SCALE => (1.0, "default"),
         prefs::EDIT_MINIMUM_CONTRAST => (1.0, "default"),
         prefs::EDIT_FAINT_OPACITY => (f64::from(aterm_types::DIM_FACTOR), "default"),
         prefs::EDIT_STEM_GAMMA => (1.0, "identity default"),
@@ -27224,10 +27190,7 @@ fn preview_bloom_radius_style_default(state: &SettingsViewState) -> f32 {
         prefs::EDIT_CURSOR_TRAIL_STYLE,
         prefs::DEFAULT_CURSOR_TRAIL_STYLE,
     );
-    Config::bloom_radius_style_default(crate::app_config::resolve_trail_style(
-        &style,
-        state.trail_pack_catalog(),
-    ))
+    Config::bloom_radius_style_default(crate::app_config::resolve_trail_style(&style))
 }
 
 fn numeric_slider_value_for_state(
@@ -27387,11 +27350,7 @@ fn own_trail_color_swatch(state: &SettingsViewState, key: &str) -> Option<[u8; 3
         prefs::EDIT_CURSOR_TRAIL_ACCENT => true,
         _ => return None,
     };
-    let style = crate::app_config::resolve_trail_style(
-        &saved_cursor_style(state),
-        state.trail_pack_catalog(),
-    )
-    .style?;
+    let style = crate::app_config::resolve_trail_style(&saved_cursor_style(state)).style?;
     let (color, _) = aterm_effects::cursor_fx::own_trail_color(style)?;
     let color = if accent {
         aterm_effects::cursor_fx::brighten(color, 1.5)
@@ -30568,8 +30527,7 @@ fn messages_link_width() -> f32 {
 // segments', chips' and pop-up's words, Copy and Copy All and what Copy All
 // copies, a footer button's `Open …`, the meta line, `Technical details` and
 // the empty log's `Nothing yet.` (`MESSAGES_EMPTY`). The macOS page's own
-// affordances keep theirs here: `Open Log Folder` and the `Explain heavy load`
-// row.
+// affordance keeps its words here: `Open Log Folder`.
 
 /// Copy All's action: the shown entries, newest first, and the build
 /// information on top.
@@ -30636,8 +30594,7 @@ fn messages_visible<'a>(
 
 /// The page's subtitle, the engine's (`aterm_messages::page::SUBTITLE`, ruling
 /// 395): what the log is (design §10.11). One line at every width (it fits the
-/// 286.5 pt phone page,
-/// `page_subtitles_fit_compact_and_minimum_medium_content_measure`).
+/// 286.5 pt phone page).
 fn messages_page_subtitle() -> &'static str {
     aterm_messages::page::SUBTITLE
 }
@@ -31095,64 +31052,6 @@ fn messages_tag_popup(filter: &MessagesFilter, open: bool, width: f32, height: f
             .width(Length::Fixed(width))
             .height(Length::Fixed(height)),
     )
-}
-
-/// The "Explain heavy load" setting at the top of Settings ▸ Messages: the
-/// ordinary setting row every page draws ([`setting_row`]: its control, its
-/// timing, its Changed tag), in a group card like every page's, with its note
-/// under it where `with_note` (at every width the page has the room for it).
-/// The card is the row's deep-link target.
-fn messages_explain_load_block(
-    state: &SettingsViewState,
-    content_width: f32,
-    width: SettingsWidth,
-    with_note: bool,
-) -> Option<(UiNode, f32)> {
-    let key = prefs::EDIT_EXPLAIN_HEAVY_LOAD;
-    let (index, field) = state
-        .legacy
-        .fields
-        .iter()
-        .enumerate()
-        .find(|(_, field)| field.key == key)?;
-    let compact = width == SettingsWidth::Compact;
-    let padding = if compact { 8.0 } else { 14.0 };
-    let text_width = (content_width - 2.0 * padding).max(48.0);
-    let row = finish_setting_row(state, index, field, false, width, text_width, None);
-    let row_height = fixed_height(&row);
-    let caption = prefs::footnote_of(key).filter(|_| with_note).map(|note| {
-        wrapped_copy_node(
-            &format!("{MESSAGES_EXPLAIN_LOAD}/caption"),
-            note,
-            SemanticRole::Text,
-            StyleRef::Quiet,
-            text_width,
-            20.0_f32.max(18.0 * settings_text_scale()),
-            Some(2),
-        )
-    });
-    let height =
-        2.0 * padding + row_height + caption.as_ref().map_or(0.0, |(_, height)| 4.0 + height);
-    Some((
-        UiNode::new(
-            MESSAGES_EXPLAIN_LOAD,
-            UiContent::Group(GroupSpec::new(field.label).style(StyleRef::Secondary)),
-        )
-        .layout(
-            Layout::column()
-                .width(Length::Fill)
-                .height(Length::Fixed(height))
-                .padding(Insets::all(padding))
-                .gap(4.0)
-                .clipped(),
-        )
-        .children(
-            std::iter::once(row)
-                .chain(caption.map(|(node, _)| node))
-                .collect(),
-        ),
-        height,
-    ))
 }
 
 /// A fixed-height blank.
@@ -32170,12 +32069,12 @@ fn messages_no_match_node(text_width: f32) -> (UiNode, f32) {
 /// THE LOG IS ONE SCROLLING LIST (design ruling 264 — a default the
 /// supervisor took; the owner can overrule it): no pages and no pager. The
 /// list scrolls by STOP — one per entry, and on a compact page one per header
-/// item before them, because there the switch and the filters scroll away
-/// with the log — and `page_scroll` is the stop at the top of the view. On
-/// the wider pages the heading and the header stay; the card under them
-/// scrolls. What a Messages render seats before it builds a node: the header
-/// items, the room the list has, the lead column, and every admitted entry's
-/// height in the card, the open one with its body fitted to the room. One
+/// item before them, because there the filters scroll away with the log —
+/// and `page_scroll` is the stop at the top of the view. On the wider pages
+/// the heading and the header stay; the card under them scrolls. What a
+/// Messages render seats before it builds a node: the header items, the room
+/// the list has, the lead column, and every admitted entry's height in the
+/// card, the open one with its body fitted to the room. One
 /// function for the renderer and the reducer — a reveal that drops a chip or
 /// opens an entry measures the list it leaves, never the last render's
 /// (ruling 263).
@@ -32385,8 +32284,9 @@ fn messages_plan(
     let total = messages.entries.len();
     let text_width = (content_width - 24.0).max(48.0);
     let item_gap = 8.0;
-    // The header items: the setting row, the not-saved note, the filters and
-    // the count, the invitation of an empty log.
+    // The header items: the not-saved note, the filters with the count line
+    // and the report buttons, then the no-match line or the invitation of an
+    // empty log.
     let mut header: Vec<(UiNode, f32)> = Vec::new();
     if !messages.saved {
         header.push(wrapped_copy_node(
@@ -32419,39 +32319,6 @@ fn messages_plan(
             messages_line_height(),
             None,
         ));
-    }
-    // The setting leads the header and explains itself under its switch
-    // wherever that leaves the first screen what it shows without the note —
-    // the filters, the count and the newest entry; a compact list too short
-    // for both keeps the note as the switch's description alone.
-    let compact_room = compact.then(|| {
-        let (_, heading) = pinned_heading(
-            width,
-            viewport,
-            settings_page_gap(state, width, viewport),
-            aterm_messages::page::HEADING,
-            "",
-        );
-        compact_page_budget(state, viewport).content_height - heading
-    });
-    let rest_height = header
-        .iter()
-        .map(|(_, height)| height + MESSAGES_ROW_GAP)
-        .sum::<f32>()
-        + if visible.is_empty() {
-            0.0
-        } else {
-            messages_row_height() + MESSAGES_ROW_GAP
-        };
-    let block = messages_explain_load_block(state, content_width, width, true).and_then(|block| {
-        if compact_room.is_some_and(|room| block.1 + rest_height > room) {
-            messages_explain_load_block(state, content_width, width, false)
-        } else {
-            Some(block)
-        }
-    });
-    if let Some(block) = block {
-        header.insert(0, block);
     }
     // The room the list has: a compact page's whole section (its items
     // `MESSAGES_ROW_GAP` apart); on the wider pages the page's column under
@@ -32537,15 +32404,14 @@ fn messages_plan(
     plan
 }
 
-/// SETTINGS ▸ MESSAGES (design §4; rulings 262 and 264): the "Explain heavy
-/// load" setting row, the filters, the count line with the report buttons,
-/// and the log — ONE dense scrolling list, newest first, in one card of
-/// one-line entries with hairlines between them; the filters narrow it and
-/// there is no pager. On the wider pages the heading and the header stay and
-/// the card scrolls under them; on a compact page the header scrolls away
-/// with the list. An open entry grows its card in place. What the render
-/// measured is recorded for the reducer: the limit the list scrolls to, the
-/// stop it drew, and the geometry it laid out in.
+/// SETTINGS ▸ MESSAGES (design §4; rulings 262 and 264): the filters, the
+/// count line with the report buttons, and the log — ONE dense scrolling
+/// list, newest first, in one card of one-line entries with hairlines between
+/// them; the filters narrow it and there is no pager. On the wider pages the
+/// heading and the header stay and the card scrolls under them; on a compact
+/// page the header scrolls away with the list. An open entry grows its card
+/// in place. What the render measured is recorded for the reducer: the limit
+/// the list scrolls to, the stop it drew, and the geometry it laid out in.
 fn messages_page(
     state: &SettingsViewState,
     messages: &MessagesState,
@@ -32831,8 +32697,7 @@ fn packages_switch_row(
 
 /// One registry-backed Switch row on a SPECIAL page, its row node keyed
 /// `row_key` and its compact wrappers under `prefix`: the Packages page's
-/// switches ([`packages_switch_row`]). (Settings ▸ Messages's "Explain heavy
-/// load" is an ordinary [`setting_row`] in a card, [`messages_explain_load_block`].)
+/// switches ([`packages_switch_row`]).
 /// The control is the ordinary `settings/control/<key>` / `settings/set/<key>`
 /// pair either way. The row's note follows its name on the label line where
 /// the line holds both in `text_width`, and is a quiet line under the name
@@ -33061,10 +32926,6 @@ fn registry_switch_row(
         }
     })
 }
-
-/// The deep link to Settings ▸ Messages's "Explain heavy load" switch — the
-/// row's own key.
-pub(crate) const MESSAGES_EXPLAIN_LOAD: &str = "settings/messages/explain-load";
 
 /// The switches the Packages page carries: "Keep ALab tools up to date" — `[packages] enabled`,
 /// THE switch, with the retired `auto_update` folded in (2026-09-23), applied LIVE by the
@@ -33863,7 +33724,7 @@ fn route_subtitle(route: SettingsRoute) -> &'static str {
         SettingsRoute::TabColor => "Pick any color for your selected tab.",
         SettingsRoute::Wallpaper => "An image behind every terminal tab.",
         SettingsRoute::KeyboardInput => "Keyboard, clipboard, and typing feedback.",
-        SettingsRoute::Terminal => "Scrollback, search, text direction, output.",
+        SettingsRoute::Terminal => "Scrollback, search, and text direction.",
         SettingsRoute::Security => "Program permissions and privacy.",
         SettingsRoute::Home
         | SettingsRoute::Modified

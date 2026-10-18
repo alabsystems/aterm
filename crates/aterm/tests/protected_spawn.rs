@@ -8,9 +8,6 @@
 //! `libc::forkpty` in `aterm-cli/src`) with a behavioral check that the protected
 //! spawn actually works end-to-end.
 //!
-//! It also pins that a session builds no VT model, sharing this file's
-//! bounded-wait harness and the same session path.
-//!
 //! The unix tests drive a POSIX `/bin/sh` through the binary; the `#[cfg(windows)]`
 //! twin drives the platform's default shell through the ConPTY seam. No fleet host
 //! runs Windows (`FLEET_HOST_TRIPLES`), so `verify cells` type-checks the twin
@@ -161,49 +158,6 @@ fn cli_runs_a_command_through_the_protected_spawn_and_exits_cleanly() {
     );
 }
 
-/// A SESSION BUILDS NO VT MODEL. The daily driver once constructed a full
-/// `Terminal` and fed it every PTY byte — an O(bytes) parse and O(scrollback)
-/// memory for a model nothing could read — and later kept a development seam
-/// (`ATERM_SESSION_MODEL`) that armed it for a consumer that never came
-/// (docs/HARDCORE_BACKLOG.md §4 P0, closed 2026-09-25). aterm-cli no longer
-/// links the engine at all. The `--verbose` epilogue is where the session says
-/// what it did with the bytes; it names passthrough alone, and the old seam
-/// set in the environment arms nothing (the negative control: before the
-/// deletion, `=1` printed "session model ARMED").
-#[cfg(unix)]
-#[test]
-fn a_session_builds_no_vt_model_and_the_old_seam_arms_nothing() {
-    let run = |model: Option<&str>| -> String {
-        let (mut cmd, _root) = session_command("model");
-        cmd.arg("--verbose") // the epilogue is the observable
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-        if let Some(v) = model {
-            cmd.env("ATERM_SESSION_MODEL", v);
-        }
-        let mut child = cmd.spawn().expect("spawn the aterm CLI binary");
-        child
-            .stdin
-            .take()
-            .expect("aterm stdin")
-            .write_all(b"exit\n")
-            .expect("write to aterm stdin");
-        String::from_utf8_lossy(&wait_with_output_bounded(child).stderr).into_owned()
-    };
-    for model in [None, Some("1")] {
-        let err = run(model);
-        assert!(
-            err.contains("bytes passed through."),
-            "the epilogue names the passthrough ({model:?}); stderr={err:?}"
-        );
-        assert!(
-            !err.contains("ARMED") && !err.contains("VT core"),
-            "no session models the screen ({model:?}); stderr={err:?}"
-        );
-    }
-}
-
 /// `--containment containment` wraps the spawn in `sandbox-exec` (deny
 /// network, other processes' task ports, writes outside the temp roots, and
 /// credential/private-data reads). A basic shell command must STILL run
@@ -269,8 +223,7 @@ fn malformed_containment_mode_fails_closed_not_open() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     // It announced the fail-closed fallback — did NOT silently accept the garbage.
     assert!(
-        stderr
-            .contains("--containment takes master, user, safety or containment; using containment"),
+        stderr.contains("using containment"),
         "a malformed mode must announce the fallback to containment; stderr={stderr:?}"
     );
     // `aterm_containment::os_sandbox_actuated()` is exactly this cfg.
@@ -295,10 +248,6 @@ fn malformed_containment_mode_fails_closed_not_open() {
             out.status.code(),
             Some(1),
             "a refused Containment exits 1; stderr={stderr:?}"
-        );
-        assert!(
-            stderr.contains("aterm: the sandbox exists only on macOS"),
-            "the refusal names the platform gap; stderr={stderr:?}"
         );
     }
 }

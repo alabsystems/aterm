@@ -1949,44 +1949,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// The session's pass is the window's targeted pass, argv for argv after the lead —
-    /// its whole pass for a held toolchain move the window's whole pass, and
-    /// its index pass the window's published-build scheduling witness. All
-    /// unattended whole passes hold a busy flip for quiet.
-    #[test]
-    fn a_detached_pass_carries_the_windows_argv() {
-        let l = layout("argv");
-        let passes = DetachedPasses::new(PathBuf::from("/x/aterm"), vec!["pkg".into()], &l);
-        let mut want: Vec<OsString> = ["pkg", "update", "claude", crate::cli::HEAD_WATCH_FLAG]
-            .map(OsString::from)
-            .to_vec();
-        want.extend(aterm_update_core::pkg_check::pass_flags(Some(
-            &l.progress_file(),
-        )));
-        assert_eq!(passes.args("claude"), want);
-        let mut whole: Vec<OsString> = ["pkg", "update", crate::cli::DEFER_BUSY_FLIP_FLAG]
-            .map(OsString::from)
-            .to_vec();
-        whole.extend(aterm_update_core::pkg_check::pass_flags(Some(
-            &l.progress_file(),
-        )));
-        assert_eq!(passes.whole_args(), whole);
-        let mut index: Vec<OsString> = [
-            "pkg",
-            "update",
-            crate::cli::PUBLISHED_INDEX_HINT_FLAG,
-            "43",
-            crate::cli::DEFER_BUSY_FLIP_FLAG,
-        ]
-        .map(OsString::from)
-        .to_vec();
-        index.extend(aterm_update_core::pkg_check::pass_flags(Some(
-            &l.progress_file(),
-        )));
-        assert_eq!(passes.index_args(43), index);
-        let _ = std::fs::remove_dir_all(&l.prefix);
-    }
-
     /// With no window open the seated session looks at a held toolchain move by the
     /// window's rule — two quiet looks a minute apart — and starts the whole pass once,
     /// following it to its end with no head asked meanwhile. Negative control: with a
@@ -2079,7 +2041,7 @@ mod tests {
     /// runner is projected onto the derived model at each decision.
     #[test]
     fn a_seated_session_offers_a_near_index_once_after_window_handoff() {
-        use aterm_spec::derive::atpkg_session_index_handoff_model;
+        use aterm_models_atpkg::atpkg_session_index_handoff_model;
         use std::sync::mpsc;
 
         let l = layout("session-index-window-handoff");
@@ -2177,7 +2139,7 @@ mod tests {
     /// next slice starts a probe without an artificial thirty-second warmup.
     #[test]
     fn an_empty_index_source_becomes_probe_eligible_on_the_next_slice() {
-        use aterm_spec::derive::atpkg_session_index_eligibility_model;
+        use aterm_models_atpkg::atpkg_session_index_eligibility_model;
         use std::sync::mpsc;
 
         let l = layout("session-index-eligibility");
@@ -2274,7 +2236,7 @@ mod tests {
     /// without another full local interval or an early network request.
     #[test]
     fn a_suppressed_session_index_probe_uses_the_shared_expiry() {
-        use aterm_spec::derive::atpkg_index_shared_handoff_model;
+        use aterm_models_atpkg::atpkg_index_shared_handoff_model;
 
         let l = layout("session-index-shared-handoff");
         let time = Time::default();
@@ -2430,7 +2392,7 @@ mod tests {
     /// recover before the next one, but a higher build never inherits that wait.
     #[test]
     fn a_same_index_uses_the_bounded_retry_ladder() {
-        let model = aterm_spec::derive::atpkg_session_index_retry_model();
+        let model = aterm_models_atpkg::atpkg_session_index_retry_model();
         let mut state = model.init_state();
         let mut index = IndexWatch::new();
         let minute = Duration::from_secs(60);
@@ -2554,35 +2516,6 @@ mod tests {
             }
         }
         assert_eq!(passes.launched(), [WHOLE], "the seat resumed promptly");
-        let _ = std::fs::remove_dir_all(&l.prefix);
-    }
-
-    /// A held toolchain may exist even when neither vendor-direct program is
-    /// installed. The session must take the seat for its quiet look without a
-    /// vendor-head round to admit it first.
-    #[test]
-    fn a_session_wakes_a_held_toolchain_without_vendor_programs() {
-        use crate::quiet::{Due, DueFlip};
-        let l = layout("held-no-vendors");
-        let time = Time::default();
-        let vendors = Vendors::new("2.1.280");
-        let passes = Passes::default();
-        let due = |_: &Layout, _: i64| {
-            Some(DueFlip {
-                why: Due::Quiet,
-                checked: 1,
-            })
-        };
-        let mut runner =
-            session(&l, &time, &vendors, "session", &passes, &on()).with_held_move_due(due);
-        for _ in 0..(2 * 60 / SLICE.as_secs()) {
-            runner.step();
-            if !passes.launched().is_empty() {
-                break;
-            }
-        }
-        assert_eq!(passes.launched(), [WHOLE]);
-        assert_eq!(vendors.count("session"), 0, "no vendor GET was needed");
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 

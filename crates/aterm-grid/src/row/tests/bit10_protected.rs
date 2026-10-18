@@ -9,14 +9,24 @@
 //! copies), not for the DECLRMM column shifts.
 
 use super::*;
-use crate::{Cell, CellFlags, PackedColor, StyleId};
+use crate::{Cell, CellFlags, PackedColor};
 
 fn normal(c: char) -> Cell {
-    Cell::with_style_id(c, StyleId::DEFAULT, CellFlags::empty())
+    Cell::with_style(
+        c,
+        crate::PackedColor::DEFAULT_FG,
+        crate::PackedColor::DEFAULT_BG,
+        CellFlags::empty(),
+    )
 }
 
 fn protected(c: char) -> Cell {
-    Cell::with_style_id(c, StyleId::DEFAULT, CellFlags::PROTECTED)
+    Cell::with_style(
+        c,
+        crate::PackedColor::DEFAULT_FG,
+        crate::PackedColor::DEFAULT_BG,
+        CellFlags::PROTECTED,
+    )
 }
 
 fn ch(row: &Row, col: u16) -> char {
@@ -266,7 +276,14 @@ fn fixup_wide_boundary_suppressed_preserves_protected_spaces() {
 fn fixup_wide_boundary_suppressed_still_clears_dangling_wide_heads() {
     // The unambiguous branches (a dangling WIDE head) run even with
     // clear_orphan_spacers=false.
-    let wide = |c: char| Cell::with_style_id(c, StyleId::DEFAULT, CellFlags::WIDE);
+    let wide = |c: char| {
+        Cell::with_style(
+            c,
+            crate::PackedColor::DEFAULT_FG,
+            crate::PackedColor::DEFAULT_BG,
+            CellFlags::WIDE,
+        )
+    };
 
     // Left: dangling WIDE head at left-1 (left is a normal, non-continuation cell).
     let (_p, mut row) = make_row(10);

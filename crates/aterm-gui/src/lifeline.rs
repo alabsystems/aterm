@@ -252,6 +252,108 @@ pub(crate) fn watch(adopted: Adopted, proxy: EventLoopProxy<crate::Wake>) {
     }
 }
 
+/// THE READY SIGNAL — `--ready-fd <n>`: a harness's headless instance says, once,
+/// that its control socket listens, so the harness waits on an event instead of
+/// polling the socket. The harness hands the write end of a pipe (a FIFO's, as
+/// `aterm_agent::ready` makes it) at number `n`; this instance writes ONE byte to
+/// it once the control listener is bound ([`signal_ready`], from the
+/// `Wake::ControlPrepared` the control thread posts after its bind), then closes
+/// it. Closed with nothing written, the instance has no socket to offer — the
+/// control service did not start, or the launch disabled it — and a harness
+/// reads end-of-file; one that died before either reads end-of-file too, the
+/// kernel having closed its descriptors. Three steps, as the lifeline's:
+///
+/// 1. [`check_ready_or_exit`] before the boot apply: a number that is not a
+///    pipe's write end is a usage error before anything runs.
+/// 2. [`adopt_ready_or_exit`] after the boot apply (whose re-exec must find the
+///    number as the harness left it): the descriptor becomes close-on-exec, so
+///    no shell, helper or successor this instance spawns holds it — a held copy
+///    would keep a dead instance's harness from reading end-of-file.
+/// 3. [`signal_ready`]: the byte, or none, and the close.
+///
+/// An update's relaunch of a running instance is never told the number
+/// (`cli::ready_request` drops it): its first image already signalled.
+static READY: std::sync::Mutex<Option<OwnedFd>> = std::sync::Mutex::new(None);
+
+/// Whether descriptor `number` can carry the ready signal: open, a pipe or FIFO,
+/// and open for writing. Nothing is changed.
+fn ready_end(number: i32) -> std::io::Result<()> {
+    // SAFETY: `stat` is plain data for which all-zero is a valid value.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `fstat` writes into the live local `st`; a closed number answers -1.
+    if unsafe { libc::fstat(number, &mut st) } != 0 {
+        return Err(std::io::Error::other(format!(
+            "--ready-fd {number} is not an open descriptor ({})",
+            std::io::Error::last_os_error()
+        )));
+    }
+    if st.st_mode & libc::S_IFMT != libc::S_IFIFO {
+        return Err(std::io::Error::other(format!(
+            "--ready-fd {number} is not a pipe: the signal is one byte down a pipe's write end"
+        )));
+    }
+    // SAFETY: `F_GETFL` only reads the descriptor's status flags.
+    let flags = unsafe { libc::fcntl(number, libc::F_GETFL) };
+    if flags == -1 || flags & libc::O_ACCMODE != libc::O_WRONLY {
+        return Err(std::io::Error::other(format!(
+            "--ready-fd {number} is not a pipe's write end"
+        )));
+    }
+    Ok(())
+}
+
+/// End the launch with a usage error (exit 2) now if descriptor `number` cannot
+/// carry the ready signal ([`ready_end`]), changing nothing when it can. Called
+/// right after the command line is parsed, before the boot apply, as
+/// [`check_or_exit`] is.
+pub(crate) fn check_ready_or_exit(number: i32) {
+    if let Err(e) = ready_end(number) {
+        crate::logging::stderr_line!("aterm-gui: {e} (try --help)");
+        std::process::exit(2);
+    }
+}
+
+/// Take descriptor `number` over as this instance's ready signal: checked again
+/// ([`ready_end`]), made close-on-exec, kept for [`signal_ready`]. Called while
+/// the launch is still single-threaded, after the boot apply and before any
+/// session could be spawned holding the number.
+pub(crate) fn adopt_ready_or_exit(number: i32) {
+    check_ready_or_exit(number);
+    // SAFETY: `number` was just checked open; this process owns it from here
+    // (the harness handed it over, and nothing else here names it).
+    let fd = unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(number) };
+    if !set_close_on_exec(number, true) {
+        crate::logging::stderr_line!(
+            "aterm-gui: --ready-fd {number} could not be made close-on-exec ({}); a shell \
+             holding it would keep a dead instance's harness waiting (try --help)",
+            std::io::Error::last_os_error()
+        );
+        std::process::exit(2);
+    }
+    *READY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(fd);
+}
+
+/// Say whether the control socket listens: one byte down the adopted ready
+/// descriptor when `listening`, none when not, then close it. Once — later calls,
+/// and every call in an instance launched without `--ready-fd`, do nothing. A
+/// harness that is gone makes the write fail (`EPIPE`; Rust ignores `SIGPIPE`),
+/// which changes nothing here.
+pub(crate) fn signal_ready(listening: bool) {
+    let Some(fd) = READY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+    else {
+        return;
+    };
+    if listening {
+        let mut end = std::fs::File::from(fd);
+        let _ = std::io::Write::write_all(&mut end, b"R");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::fd::{AsRawFd as _, IntoRawFd as _};
@@ -266,36 +368,6 @@ mod tests {
     fn close_on_exec(fd: i32) -> bool {
         // SAFETY: `F_GETFD` only reads one descriptor's flags.
         unsafe { libc::fcntl(fd, libc::F_GETFD) & libc::FD_CLOEXEC != 0 }
-    }
-
-    /// Round eight of the update audit, #28: the boot swap's re-exec and the
-    /// crash-loop revert's run inside the boot apply and hand the new image this
-    /// launch's own `--lifeline-fd <n>`, so the number must still be the
-    /// launcher's lifeline then — adopted after the apply, never before it.
-    #[test]
-    fn the_lifeline_is_adopted_after_the_boot_apply() {
-        let src = include_str!("lib.rs");
-        let entry = src.find("pub fn main_entry(").expect("the window's entry");
-        let apply = src[entry..]
-            .find("aterm_update::apply_staged_if_ready_preserving_fds_exact(")
-            .expect("the boot apply");
-        let adopt = src[entry..]
-            .find("let lifeline = lifeline_fd.map(lifeline::adopt_or_exit);")
-            .expect("the adoption");
-        let sessions = src[entry..]
-            .find("let session0 = spawn_session(")
-            .expect("the first session");
-        assert!(apply < adopt && adopt < sessions);
-        // …and a descriptor that cannot be one is refused BEFORE the apply (the
-        // #28 review): a usage error runs nothing, where a refusal after the apply
-        // had already swapped, re-exec'd and counted a trial launch.
-        let parsed = src[entry..]
-            .find("} = parse_cli(argv);")
-            .expect("the command line is parsed");
-        let checked = src[entry..]
-            .find("lifeline::check_or_exit(number)")
-            .expect("the lifeline is checked");
-        assert!(parsed < checked && checked < apply);
     }
 
     /// Round eight of the update audit, #28: the cold lane hands a lifelined

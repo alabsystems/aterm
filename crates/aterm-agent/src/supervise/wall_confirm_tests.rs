@@ -7,7 +7,10 @@
 
 use aterm_phase::{ApiCause, WallKind, classify_wall};
 
-use super::{Entry, confirms, transcript_ends_on};
+use super::{
+    Entry, confirms, ended_with_nothing_pending, found_named, limit_named, limit_words, refined,
+    transcript_ends_on, transcript_wall, waits_on_background,
+};
 
 /// A measured transcript fixture: its header line, then the rows.
 fn fixture(name: &str) -> &'static str {
@@ -575,9 +578,12 @@ fn a_local_commands_rows_are_no_turn_and_no_notice() {
 
 /// A NOTICE THE TABLE DOES NOT NAME is classed by the `error` word Claude
 /// Code wrote with it: words no phrase of the wall table holds, with
-/// `rate_limit` a limit's notice, `authentication_failed` a lost login's,
-/// `server_error` an API error's — each confirming its own class and no
-/// other; an `error` word of no class (`invalid_request`) confirms nothing.
+/// `rate_limit` and `billing_error` a limit's notice, `authentication_failed`
+/// a lost login's, `server_error` an API error's, and (2.1.300's own words
+/// for a request it refuses, 2026-10-15) `invalid_request`, `model_not_found`,
+/// `account_on_hold` and `max_output_tokens` an API error's too — each
+/// confirming its own class and no other; an `error` word of no class
+/// confirms nothing.
 #[test]
 fn a_notice_the_table_does_not_name_is_classed_by_its_error_word() {
     const WORDS: &str = "Something went sideways on our end";
@@ -588,9 +594,14 @@ fn a_notice_the_table_does_not_name_is_classed_by_its_error_word() {
     let worded = format!("{}{WORDS}{}", &notice[..from], &notice[to..]);
     for (error, kind) in [
         ("rate_limit", Some(WallKind::UsageWeekly)),
+        ("billing_error", Some(WallKind::Spend)),
         ("authentication_failed", Some(WallKind::Auth)),
         ("server_error", Some(WallKind::Overloaded)),
-        ("invalid_request", None),
+        ("invalid_request", Some(WallKind::Overloaded)),
+        ("model_not_found", Some(WallKind::Overloaded)),
+        ("account_on_hold", Some(WallKind::Overloaded)),
+        ("max_output_tokens", Some(WallKind::Overloaded)),
+        ("no_such_kind", None),
     ] {
         let row = worded.replace(
             "\"error\":\"server_error\"",
@@ -606,4 +617,783 @@ fn a_notice_the_table_does_not_name_is_classed_by_its_error_word() {
             );
         }
     }
+}
+
+/// The 529 fixture's last turn — its prompt, Claude Code's notice and the
+/// `turn_duration` that closed it — with the notice's words `text`, its
+/// `error` word, its `apiErrorStatus` (`None`: left out) and its typed
+/// `apiError` (`None`: none), as 2.1.300 writes a notice of each kind.
+fn notice_turn(text: &str, error: &str, status: Option<u16>, api_error: Option<&str>) -> String {
+    let rows: Vec<&str> = fixture("529").lines().collect();
+    let at = rows
+        .iter()
+        .rposition(|r| r.contains("\"isApiErrorMessage\":true"))
+        .expect("the notice");
+    let prompt = rows[..at]
+        .iter()
+        .rposition(|r| r.contains("\"type\":\"user\""))
+        .expect("its prompt");
+    let closed = rows[at + 1..]
+        .iter()
+        .find(|r| r.contains("\"turn_duration\""))
+        .expect("its close");
+    let mut notice = rows[at].to_string();
+    let from = notice.find("API Error: Repeated 529").expect("the text");
+    let to = from + notice[from..].find('"').expect("its end");
+    notice = format!(
+        "{}{}{}",
+        &notice[..from],
+        text.replace('"', "\\\""),
+        &notice[to..]
+    );
+    notice = notice.replace(
+        "\"error\":\"server_error\"",
+        &format!("\"error\":\"{error}\""),
+    );
+    notice = match status {
+        Some(code) => notice.replace(
+            "\"apiErrorStatus\":529",
+            &format!("\"apiErrorStatus\":{code}"),
+        ),
+        None => notice.replace("\"apiErrorStatus\":529,", ""),
+    };
+    if let Some(kind) = api_error {
+        notice = notice.replace(
+            "\"isApiErrorMessage\":true",
+            &format!("\"isApiErrorMessage\":true,\"apiError\":\"{kind}\""),
+        );
+    }
+    format!("{}\n{notice}\n{closed}", rows[prompt..at].join("\n"))
+}
+
+/// A TURN THAT ENDED ON CLAUDE CODE'S OWN ERROR ROW IS A WALL (2026-10-15):
+/// a CLOSED notice is the wall its words name (the one table; the vendor's
+/// `Run /compact` remedy for images and attachments the full context's), else the
+/// wall its typed fields name — an `apiError` of 2.1.300's terminal set, an
+/// `error` word of a refused request, a `billing_error`, a status the vendor
+/// does not retry, an `authentication_failed` — and anything else the
+/// server's, retried. Before, a
+/// notice the table could not name (a model not found, an account on hold,
+/// an image too large, the vendor's refusals) was no wall, and the ordinary
+/// policy typed `keep going` into it hourly for good. NEGATIVE CONTROLS: the
+/// vendor's own generic fallbacks (`unknown`, the bare `API Error`, `API
+/// Error: terminated`) are the server's, NEVER a refused request; an
+/// aborted request is no wall; the same words as the model's reply, a
+/// notice whose turn is still open, and a notice a reply came after, name
+/// none.
+#[test]
+fn a_closed_error_notice_is_the_wall_its_words_or_its_typed_fields_name() {
+    let refused = |code| {
+        Some(WallKind::ApiError {
+            code,
+            retryable: false,
+            cause: ApiCause::Request,
+        })
+    };
+    let server = |code| {
+        Some(WallKind::ApiError {
+            code,
+            retryable: true,
+            cause: ApiCause::Server,
+        })
+    };
+    const MODEL: &str = "There's an issue with the selected model (claude-opus-9). It may not exist or you may not have access to it. Run /model to pick a different model.";
+    /// A notice's words, `error` word, status and typed `apiError`, and the
+    /// wall it is.
+    type Case<'a> = (
+        &'a str,
+        &'a str,
+        Option<u16>,
+        Option<&'a str>,
+        Option<WallKind>,
+    );
+    let cases: [Case; 23] = [
+        // By the words: the table's own rows.
+        (MODEL, "model_not_found", None, None, refused(None)),
+        (
+            "You've hit your session limit · resets 3pm (America/Los_Angeles)",
+            "rate_limit",
+            Some(429),
+            None,
+            Some(WallKind::UsageSession),
+        ),
+        (
+            "API Error: Usage credits required for 1M context · run /model to switch to standard context",
+            "rate_limit",
+            Some(429),
+            Some("long_context_credits_required"),
+            Some(WallKind::Spend),
+        ),
+        (
+            "API Error: Claude's response exceeded the 32000 output token maximum. To configure this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable.",
+            "max_output_tokens",
+            None,
+            Some("max_output_tokens"),
+            Some(WallKind::ApiError {
+                code: None,
+                retryable: true,
+                cause: ApiCause::Overlong,
+            }),
+        ),
+        // By the typed `apiError`, the words naming nothing.
+        (
+            "Your ANTHROPIC_API_KEY belongs to a disabled organization · Unset the environment variable to use your subscription instead",
+            "invalid_request",
+            None,
+            Some("org_disabled_credential"),
+            refused(None),
+        ),
+        (
+            "API Error: Request blocked by your organization's policy.",
+            "invalid_request",
+            Some(400),
+            Some("dlp_request_denied"),
+            refused(Some(400)),
+        ),
+        (
+            "PDF too large (max 100 pages, 32MB). Double press esc to go back and try again, or use pdftotext to convert to text first.",
+            "invalid_request",
+            None,
+            Some("pdf_too_large"),
+            refused(None),
+        ),
+        // By the `error` word.
+        (
+            "Image was too large. Double press esc to go back and try again with a smaller image.",
+            "invalid_request",
+            None,
+            None,
+            refused(None),
+        ),
+        // The model fallback's form of a model not found (2.1.300's `ZGe`):
+        // the table's no-status fallback, named by its `error` word.
+        (
+            "API Error (claude-opus-9): model: claude-opus-9. Try /model to switch to Opus 5.5.",
+            "model_not_found",
+            None,
+            None,
+            refused(None),
+        ),
+        // The image past the many-image size, where `/compact` is on: its
+        // own remedy is the full context's act. Where it is off, the same
+        // notice's `Start a new session` is a refused request.
+        (
+            "An image in the conversation exceeds the dimension limit for many-image requests (2000px). Run /compact to remove old images from context, or start a new session.",
+            "invalid_request",
+            None,
+            None,
+            Some(WallKind::Context),
+        ),
+        (
+            "An image in the conversation exceeds the dimension limit for many-image requests (2000px). Start a new session with fewer images.",
+            "invalid_request",
+            None,
+            None,
+            refused(None),
+        ),
+        // A request its images and attachments pushed past the API's size
+        // (413, 2.1.300's measured and unmeasured forms): `/compact` is its
+        // own remedy too. Where nothing removable fills it, no compaction
+        // makes it fit, and it names no `/compact`: a refused request.
+        (
+            "Request too large (max 32 MB; 30 MB of about 33 MB is images or documents). Accumulated images and attachments in the conversation pushed the request over the limit. Run /compact, or double press esc to go back and remove attachments.",
+            "invalid_request",
+            Some(413),
+            None,
+            Some(WallKind::Context),
+        ),
+        (
+            "Request too large (max 32 MB). Accumulated images and attachments in the conversation pushed the request over the limit. Run /compact, or double press esc to go back and remove attachments.",
+            "invalid_request",
+            Some(413),
+            None,
+            Some(WallKind::Context),
+        ),
+        (
+            "Request too large for the API's 32 MB request limit: this conversation is about 33 MB, and none of it is images or documents that could be removed, so removing attachments or compacting cannot make it fit. Double press esc to go back past the large content, or /clear to start a new conversation.",
+            "invalid_request",
+            Some(413),
+            None,
+            refused(Some(413)),
+        ),
+        // A login the API refused, in the words no table names (2.1.300's
+        // non-interactive form): the lost login's, never the server's.
+        (
+            "Failed to authenticate. API Error: 401 Invalid bearer token",
+            "authentication_failed",
+            Some(401),
+            None,
+            Some(WallKind::Auth),
+        ),
+        (
+            "OAuth authentication is currently not allowed for this organization.",
+            "oauth_org_not_allowed",
+            None,
+            None,
+            refused(None),
+        ),
+        (
+            "Something about the bill",
+            "billing_error",
+            None,
+            None,
+            Some(WallKind::Spend),
+        ),
+        // By a status the vendor does not retry.
+        (
+            "API Error: something new went wrong",
+            "server_error",
+            Some(404),
+            None,
+            refused(Some(404)),
+        ),
+        // The Cloud gateway's sign-in (2.1.301, the residual review's R1):
+        // its `run /login` past the table's opening words, its `error`
+        // `unknown` and its apiError no terminal one — the lost login by its
+        // words, never the server's error retried for good.
+        (
+            "API Error: Not signed in to the Cloud gateway — run /login.",
+            "unknown",
+            None,
+            Some("gateway_signin_required"),
+            Some(WallKind::Auth),
+        ),
+        (
+            "API Error: Cloud gateway session expired — run /login to reconnect.",
+            "unknown",
+            None,
+            Some("gateway_session_expired"),
+            Some(WallKind::Auth),
+        ),
+        // The vendor's own fallbacks: the server's, retried.
+        (
+            "API Error: Please wait a moment and try again.",
+            "unknown",
+            None,
+            None,
+            server(None),
+        ),
+        ("API Error: terminated", "unknown", None, None, server(None)),
+        ("API Error", "unknown", None, None, server(None)),
+    ];
+    for (text, error, status, api, want) in cases {
+        let end = transcript_ends_on(&notice_turn(text, error, status, api));
+        assert!(end.closed, "{text}: {end:?}");
+        assert!(
+            matches!(&end.last, Entry::Notice { text: t, .. } if t == text),
+            "{text}: {end:?}"
+        );
+        assert_eq!(transcript_wall(&end), want, "{text}");
+        assert_eq!(end.typed().as_deref(), Some(api.unwrap_or(error)), "{text}");
+        if want == Some(WallKind::Auth) {
+            assert!(
+                confirms(WallKind::Auth, &end),
+                "{text}: the screen's login confirmed"
+            );
+        }
+    }
+    // NEGATIVE CONTROLS.
+    let aborted = notice_turn("API Error: Request was aborted.", "unknown", None, None);
+    assert_eq!(
+        transcript_wall(&transcript_ends_on(&aborted)),
+        None,
+        "aborted"
+    );
+    let notice = notice_turn(MODEL, "model_not_found", None, None);
+    let reply = notice
+        .replace("\"isApiErrorMessage\":true", "\"isApiErrorMessage\":false")
+        .replace("\"<synthetic>\"", "\"claude-opus-5-5\"");
+    let end = transcript_ends_on(&reply);
+    assert_eq!(end.last, Entry::Reply, "the model's own words");
+    assert_eq!(transcript_wall(&end), None, "the model's own words");
+    let open: Vec<&str> = notice
+        .lines()
+        .filter(|r| !r.contains("\"turn_duration\""))
+        .collect();
+    let end = transcript_ends_on(&open.join("\n"));
+    assert!(!end.closed);
+    assert_eq!(transcript_wall(&end), None, "a turn still open");
+    let answered = format!("{notice}\n{reply}");
+    assert_eq!(
+        transcript_wall(&transcript_ends_on(&answered)),
+        None,
+        "a reply after it"
+    );
+}
+
+/// THE SCREEN'S UNNAMED `API Error` NAMED BY THE NOTICE THAT CONFIRMED IT
+/// (the review of 2026-10-15): an `API Error: <the server's words>` with no
+/// status the table names nothing of reads on the screen as the server's,
+/// retried hourly for good, and is confirmed by its notice's `error` word
+/// alone. The notice's typed fields name it — a DLP policy's
+/// `dlp_request_denied`, an organization's minimum version
+/// (`claude_code_version_too_old`), the model fallback's `model_not_found` —
+/// a refused request, on the screen's own row and words; an open notice
+/// names it too (its typed fields are its own row's). NEGATIVE CONTROLS: an
+/// `unknown` notice names nothing more; a wall the table named (a 500, a
+/// refusal by its words) is never renamed; a notice of another class (a
+/// lost login) renames nothing; an older notice than the row the screen
+/// shows renames nothing; an end that is no notice names nothing.
+#[test]
+fn a_confirmed_unnamed_api_error_is_the_wall_its_notice_is_typed_as() {
+    let server = WallKind::ApiError {
+        code: None,
+        retryable: true,
+        cause: ApiCause::Server,
+    };
+    let refused = WallKind::ApiError {
+        code: None,
+        retryable: false,
+        cause: ApiCause::Request,
+    };
+    let on_screen = |text: &str| {
+        let kind = classify_wall(text).expect("the screen reads a wall");
+        aterm_phase::Wall {
+            kind,
+            message: text.to_string(),
+            reset: None,
+            row: 3,
+            placement: aterm_phase::Placement::ErrorRow,
+            under_call: false,
+        }
+    };
+    const DLP: &str = "API Error: Request blocked by your organization's policy.";
+    const OLD: &str = "API Error: Claude Code 2.1.200 is older than the minimum version required by your organization's policy.";
+    const FALLBACK: &str =
+        "API Error (claude-opus-9): model: claude-opus-9. Try /model to switch to Opus 5.5.";
+    for (text, error, api) in [
+        (DLP, "invalid_request", Some("dlp_request_denied")),
+        (OLD, "invalid_request", Some("claude_code_version_too_old")),
+        (FALLBACK, "model_not_found", None),
+    ] {
+        let w = on_screen(text);
+        assert_eq!(w.kind, server, "{text}: the screen's words name nothing");
+        let notice = notice_turn(text, error, None, api);
+        let end = transcript_ends_on(&notice);
+        assert!(confirms(w.kind, &end), "{text}");
+        let named = refined(&w, &end).expect("named by its notice");
+        assert_eq!(named.kind, refused, "{text}");
+        assert_eq!(
+            (named.row, named.message.as_str(), named.placement),
+            (w.row, w.message.as_str(), w.placement),
+            "{text}: the screen's own row"
+        );
+        let open: Vec<&str> = notice
+            .lines()
+            .filter(|r| !r.contains("\"turn_duration\""))
+            .collect();
+        let end = transcript_ends_on(&open.join("\n"));
+        assert!(!end.closed);
+        assert_eq!(
+            refined(&w, &end).map(|n| n.kind),
+            Some(refused),
+            "{text}: open"
+        );
+    }
+    // NEGATIVE CONTROLS.
+    let w = on_screen(DLP);
+    let unknown = transcript_ends_on(&notice_turn(DLP, "unknown", None, None));
+    assert!(confirms(w.kind, &unknown));
+    assert_eq!(refined(&w, &unknown), None, "an unknown names nothing more");
+    let five = on_screen("API Error: 500 Internal server error");
+    let end = transcript_ends_on(&notice_turn(
+        "API Error: 500 Internal server error",
+        "server_error",
+        Some(500),
+        Some("dlp_request_denied"),
+    ));
+    assert_eq!(refined(&five, &end), None, "a wall the table named");
+    let login = transcript_ends_on(&notice_turn(DLP, "authentication_failed", Some(401), None));
+    assert_eq!(refined(&w, &login), None, "another class");
+    // THE GATEWAY'S SIGN-IN BY ITS TYPED FIELD (the residual review's R1): a
+    // notice a later build rewords, which the table names nothing of, is the
+    // lost login by its `apiError` — confirmed as the screen's unnamed `API
+    // Error` and named Auth, the one class change allowed. NEGATIVE CONTROL:
+    // the same words with no such `apiError` stay the server's.
+    const REWORDED: &str = "API Error: The Cloud gateway needs you to sign in again.";
+    let reworded = on_screen(REWORDED);
+    assert_eq!(reworded.kind, server, "the words name nothing");
+    let end = transcript_ends_on(&notice_turn(
+        REWORDED,
+        "unknown",
+        None,
+        Some("gateway_signin_required"),
+    ));
+    assert_eq!(transcript_wall(&end), Some(WallKind::Auth));
+    assert!(confirms(reworded.kind, &end));
+    assert_eq!(
+        refined(&reworded, &end).map(|n| n.kind),
+        Some(WallKind::Auth)
+    );
+    let end = transcript_ends_on(&notice_turn(REWORDED, "unknown", None, None));
+    assert_eq!(transcript_wall(&end), Some(server));
+    assert_eq!(refined(&reworded, &end), None);
+    // An older notice that is still the newest entry (a prompt command's
+    // rows are passed over until its reply or notice is written): it
+    // confirms the class of the screen's newer `API Error: terminated`, and
+    // names nothing of a row the screen does not show.
+    let terminated = on_screen("API Error: terminated");
+    let older = transcript_ends_on(&notice_turn(
+        DLP,
+        "invalid_request",
+        None,
+        Some("dlp_request_denied"),
+    ));
+    assert!(confirms(terminated.kind, &older));
+    assert_eq!(
+        refined(&terminated, &older),
+        None,
+        "a notice the screen does not show"
+    );
+    let reply = notice_turn(DLP, "invalid_request", None, Some("dlp_request_denied"))
+        .replace("\"isApiErrorMessage\":true", "\"isApiErrorMessage\":false")
+        .replace("\"<synthetic>\"", "\"claude-opus-5-5\"");
+    assert_eq!(
+        refined(&w, &transcript_ends_on(&reply)),
+        None,
+        "the model's own words"
+    );
+}
+
+/// Main-chain rows of the shape Claude Code writes around a turn it started
+/// itself (the keys of the trust session's rows, 2.1.267-2.1.300: a
+/// `<task-notification>` prompt of origin `task-notification`, the model's
+/// reply, the `turn_duration` that closes it with its pending counts),
+/// written at `at` (`HH:MM:SS` on 2026-10-07).
+mod carried {
+    pub(super) fn notification(at: &str) -> String {
+        format!(
+            r#"{{"parentUuid":"p0","isSidechain":false,"type":"user","message":{{"role":"user","content":"<task-notification>\n<status>completed</status>\n</task-notification>"}},"uuid":"u1","timestamp":"2026-10-07T{at}.100Z","origin":{{"kind":"task-notification"}},"promptSource":"system","turnOrigin":"task_notification"}}"#
+        )
+    }
+
+    pub(super) fn reply(at: &str) -> String {
+        format!(
+            r#"{{"parentUuid":"u1","isSidechain":false,"type":"assistant","message":{{"model":"claude-opus-5-5","content":[{{"type":"text","text":"I restarted the lander watch."}}]}},"uuid":"a1","timestamp":"2026-10-07T{at}.500Z"}}"#
+        )
+    }
+
+    /// The `turn_duration` row, `workflows` and `agents` pending (`None`:
+    /// the key absent), its `timestamp` at `at` (`None`: none).
+    pub(super) fn closed(at: Option<&str>, workflows: Option<u64>, agents: Option<u64>) -> String {
+        let mut row = String::from(
+            r#"{"parentUuid":"a1","isSidechain":false,"type":"system","subtype":"turn_duration","durationMs":4094,"messageCount":1087,"uuid":"d1","isMeta":false"#,
+        );
+        if let Some(n) = workflows {
+            row.push_str(&format!(r#","pendingWorkflowCount":{n}"#));
+        }
+        if let Some(n) = agents {
+            row.push_str(&format!(r#","pendingBackgroundAgentCount":{n}"#));
+        }
+        if let Some(at) = at {
+            row.push_str(&format!(r#","timestamp":"2026-10-07T{at}.994Z""#));
+        }
+        row.push('}');
+        row
+    }
+
+    /// The process's launch, unix seconds, at `at` on 2026-10-07.
+    pub(super) fn launch(at: &str) -> i64 {
+        crate::harness::upgrade_models::parse_utc(&format!("2026-10-07T{at}Z"))
+            .and_then(|s| i64::try_from(s).ok())
+            .expect("a time")
+    }
+
+    pub(super) fn tail(rows: &[String]) -> String {
+        rows.join("\n")
+    }
+}
+
+/// BG-1's transcript half: a turn that ended waiting on background work —
+/// the newest main-chain `turn_duration` counts a workflow or a background
+/// agent still pending, closes the newest entry (the model's reply), was
+/// written by the process launched before it, and no person's row follows
+/// it — and only that. NEGATIVE CONTROLS: nothing pending (the key absent
+/// or 0), a row older than the launch (a relaunched or resumed process: the
+/// dead one's count), a row that names no time, a later entry (the file
+/// lags the screen), a turn that ended on a notice (the wall's), a local
+/// command a person ran after it. A meta row, a subagent's row and a
+/// `/model`'s `system` rows after it change nothing.
+#[test]
+fn a_turn_that_ended_waiting_on_background_work_is_read_only_where_it_stands() {
+    use carried::{closed, launch, notification, reply, tail};
+    let earlier = launch("20:00:00");
+    let ended = |close: String| tail(&[notification("22:53:28"), reply("22:53:30"), close]);
+    assert!(waits_on_background(
+        &ended(closed(Some("22:53:32"), Some(1), Some(0))),
+        earlier
+    ));
+    assert!(waits_on_background(
+        &ended(closed(Some("22:53:32"), None, Some(2))),
+        earlier
+    ));
+    // NEGATIVE CONTROLS.
+    for (close, why) in [
+        (
+            closed(Some("22:53:32"), Some(0), Some(0)),
+            "nothing pending",
+        ),
+        (closed(Some("22:53:32"), None, None), "no count at all"),
+        (closed(None, Some(1), None), "no time"),
+    ] {
+        assert!(!waits_on_background(&ended(close), earlier), "{why}");
+    }
+    let row = closed(Some("22:53:32"), Some(1), None);
+    assert!(
+        !waits_on_background(&ended(row.clone()), launch("22:53:40")),
+        "written before this process was launched"
+    );
+    assert!(
+        !waits_on_background(&ended(row.clone()), launch("22:53:32")),
+        "in the launch's own second"
+    );
+    let lagging = tail(&[
+        ended(row.clone()),
+        notification("22:54:00"),
+        reply("22:54:01"),
+    ]);
+    assert!(!waits_on_background(&lagging, earlier), "a later turn");
+    let notice = r#"{"parentUuid":"u1","isSidechain":false,"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text","text":"You've reached your Fable limit. Run /usage-credits to continue or switch models with /model."}]},"isApiErrorMessage":true,"error":"rate_limit","uuid":"a2","timestamp":"2026-10-07T22:53:31.000Z"}"#;
+    let walled = tail(&[notification("22:53:28"), notice.to_string(), row.clone()]);
+    assert!(!waits_on_background(&walled, earlier), "the wall's");
+    let login = r#"{"parentUuid":"d1","isSidechain":false,"type":"user","message":{"role":"user","content":"<command-name>/login</command-name>"},"uuid":"c1","timestamp":"2026-10-07T22:54:00.000Z"}"#;
+    assert!(
+        !waits_on_background(&tail(&[ended(row.clone()), login.to_string()]), earlier),
+        "a person's local command"
+    );
+    // What changes nothing.
+    let meta = r#"{"parentUuid":"d1","isSidechain":false,"type":"user","message":{"role":"user","content":"<local-command-caveat>Caveat</local-command-caveat>"},"isMeta":true,"uuid":"m1","timestamp":"2026-10-07T22:54:00.000Z"}"#;
+    let subagent = r#"{"parentUuid":"s0","isSidechain":true,"type":"assistant","message":{"model":"claude-opus-5-5","content":[{"type":"text","text":"Still reviewing."}]},"uuid":"s1","timestamp":"2026-10-07T22:54:01.000Z"}"#;
+    let model = r#"{"parentUuid":"d1","isSidechain":false,"type":"system","subtype":"local_command","content":"<command-name>/model</command-name>","uuid":"l1","timestamp":"2026-10-07T22:54:02.000Z"}"#;
+    for after in [meta, subagent, model] {
+        assert!(
+            waits_on_background(&tail(&[ended(row.clone()), after.to_string()]), earlier),
+            "{after}"
+        );
+    }
+}
+
+/// The other side of the same row (the verifier's correction 3): the turn
+/// CLOSED WITH NOTHING PENDING — the newest main-chain `turn_duration`
+/// closes the model's reply, this process wrote it, no person's row follows,
+/// and its counts say nothing pending (absent, as Claude Code writes a zero,
+/// or 0). NEGATIVE CONTROLS, each the screen's carried wait's to keep: work
+/// pending, no `turn_duration` after the reply (the turn Claude Code started
+/// itself and drew no row for), a row that names no time, a row older than
+/// the launch, a later entry, a turn that ended on a notice, a person's
+/// local command after it, an empty tail.
+#[test]
+fn a_turn_closed_with_nothing_pending_is_read_only_where_it_stands() {
+    use carried::{closed, launch, notification, reply, tail};
+    let earlier = launch("20:00:00");
+    let ended = |close: String| tail(&[notification("22:53:28"), reply("22:53:30"), close]);
+    for close in [
+        closed(Some("22:53:32"), None, None),
+        closed(Some("22:53:32"), Some(0), Some(0)),
+    ] {
+        let t = ended(close);
+        assert!(ended_with_nothing_pending(&t, earlier), "{t}");
+        assert!(!waits_on_background(&t, earlier), "{t}");
+    }
+    let row = closed(Some("22:53:32"), None, None);
+    for (t, launched, why) in [
+        (
+            ended(closed(Some("22:53:32"), Some(1), None)),
+            earlier,
+            "a workflow pending",
+        ),
+        (
+            ended(closed(Some("22:53:32"), None, Some(2))),
+            earlier,
+            "agents pending",
+        ),
+        (
+            tail(&[notification("22:53:28"), reply("22:53:30")]),
+            earlier,
+            "no row closes the reply",
+        ),
+        (ended(closed(None, None, None)), earlier, "no time"),
+        (
+            ended(row.clone()),
+            launch("22:53:40"),
+            "written before this process was launched",
+        ),
+        (
+            tail(&[
+                ended(row.clone()),
+                notification("22:54:00"),
+                reply("22:54:01"),
+            ]),
+            earlier,
+            "a later turn",
+        ),
+        (String::new(), earlier, "nothing read"),
+    ] {
+        assert!(!ended_with_nothing_pending(&t, launched), "{why}");
+    }
+    let notice = r#"{"parentUuid":"u1","isSidechain":false,"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text","text":"You've reached your Fable limit. Run /usage-credits to continue or switch models with /model."}]},"isApiErrorMessage":true,"error":"rate_limit","uuid":"a2","timestamp":"2026-10-07T22:53:31.000Z"}"#;
+    let walled = tail(&[notification("22:53:28"), notice.to_string(), row.clone()]);
+    assert!(!ended_with_nothing_pending(&walled, earlier), "the wall's");
+    let login = r#"{"parentUuid":"d1","isSidechain":false,"type":"user","message":{"role":"user","content":"<command-name>/login</command-name>"},"uuid":"c1","timestamp":"2026-10-07T22:54:00.000Z"}"#;
+    assert!(
+        !ended_with_nothing_pending(&tail(&[ended(row), login.to_string()]), earlier),
+        "a person's local command"
+    );
+}
+
+/// WHICH LIMIT A NOTICE ROW NAMES (KI-1015-1 W3): its words through the wall
+/// table, else its `quotaLimits.rateLimitType` — which also names the limit
+/// of words that name none of their own. Read off the measured weekly row
+/// (`rateLimitType` `seven_day`), its words and type changed as a model's
+/// bucket's are written. NEGATIVE CONTROLS: words naming their own limit
+/// keep it whatever the type says; a row of no limit and no type names none.
+#[test]
+fn a_limit_row_names_its_limit_by_its_words_else_its_limit_type() {
+    let weekly = row_of("weekly-limit", "\"isApiErrorMessage\":true");
+    let written = |words: &str, kind: &str| {
+        let row = weekly
+            .replace(
+                "You've hit your weekly limit · resets Oct 11 at 9:35am (America/Los_Angeles)",
+                words,
+            )
+            .replace(
+                "\"rateLimitType\":\"seven_day\"",
+                &format!("\"rateLimitType\":\"{kind}\""),
+            );
+        match transcript_ends_on(&row).last {
+            Entry::Notice { text, limit, .. } => limit_named(&text, limit.as_deref()),
+            other => panic!("no notice: {other:?}"),
+        }
+    };
+    let bucket = WallKind::ModelBucket { consent: false };
+    for (words, kind, want) in [
+        (
+            "You've hit your weekly limit · resets Oct 11 at 9:35am (America/Los_Angeles)",
+            "seven_day",
+            WallKind::UsageWeekly,
+        ),
+        (
+            "You've hit your Sonnet limit · resets 4pm (America/Los_Angeles)",
+            "seven_day_sonnet",
+            bucket,
+        ),
+        (
+            "You've hit your limit · resets 4pm",
+            "seven_day_opus",
+            bucket,
+        ),
+        (
+            "You've hit your limit · resets 4pm",
+            "seven_day_overage_included",
+            bucket,
+        ),
+        (
+            "You've hit your limit · resets 4pm",
+            "seven_day",
+            WallKind::UsageWeekly,
+        ),
+        (
+            "You've hit your limit · resets 4pm",
+            "five_hour",
+            WallKind::UsageSession,
+        ),
+        (
+            "You've hit your limit · resets 4pm",
+            "overage",
+            WallKind::Spend,
+        ),
+        ("Rate limited", "seven_day_sonnet", bucket),
+        // NEGATIVE CONTROLS: the words name their own limit.
+        (
+            "You've hit your session limit · resets 4pm (America/Los_Angeles)",
+            "seven_day_sonnet",
+            WallKind::UsageSession,
+        ),
+        (
+            "You've reached your Fable limit. Run /usage-credits to continue or switch models \
+             with /model.",
+            "five_hour",
+            bucket,
+        ),
+        (
+            "You've hit your limit · resets 4pm",
+            "not_a_type",
+            WallKind::UsageSession,
+        ),
+    ] {
+        assert_eq!(written(words, kind), Some(want), "{words} / {kind}");
+    }
+    assert_eq!(limit_named("Rate limited", None), None);
+    assert_eq!(limit_named("Rate limited", Some("weird")), None);
+    // THE WALL'S WORDS name the bucket's model where only the type does
+    // (the review of LIM-4: read without it, the default fallback relaunched
+    // the agent onto the very Opus bucket at its limit).
+    assert_eq!(
+        limit_words("You've hit your limit · resets 4pm", Some("seven_day_opus")),
+        "You've hit your limit · resets 4pm \u{2014} seven_day_opus"
+    );
+    assert_eq!(
+        crate::supervise::policy::turn_end::bucket_model(&limit_words(
+            "You've hit your limit · resets 4pm",
+            Some("seven_day_sonnet")
+        ))
+        .as_deref(),
+        Some("sonnet")
+    );
+    // NEGATIVE CONTROLS: the words as written — they name the model, the
+    // bucket's type names none, or the limit is no bucket.
+    for (words, kind) in [
+        (
+            "You've hit your Sonnet limit · resets 4pm (America/Los_Angeles)",
+            Some("seven_day_opus"),
+        ),
+        (
+            "You've hit your limit · resets 4pm",
+            Some("seven_day_overage_included"),
+        ),
+        ("You've hit your limit · resets 4pm", Some("seven_day")),
+        (
+            "You've hit your session limit · resets 4pm",
+            Some("seven_day_opus"),
+        ),
+        ("You've hit your limit · resets 4pm", None),
+    ] {
+        assert_eq!(limit_words(words, kind), words, "{words} / {kind:?}");
+    }
+}
+
+/// A LIMIT ONLY THE TRANSCRIPT NAMES is named as where the screen read it
+/// (the integration of API-1's `transcript_found` and LIM-4): words that
+/// name no limit of their own take the bucket their `rateLimitType` names,
+/// that type riding the message so the fallback is never the model at its
+/// limit. NEGATIVE CONTROLS: a session limit's type, words that name their
+/// own limit, and a wall of another class keep the notice's kind and words.
+#[test]
+fn a_limit_only_the_transcript_names_takes_its_rows_type() {
+    const WORDS: &str = "You've hit your limit · resets 6pm";
+    assert_eq!(
+        found_named(WallKind::UsageSession, WORDS, Some("seven_day_opus")),
+        (
+            WallKind::ModelBucket { consent: false },
+            format!("{WORDS} \u{2014} seven_day_opus")
+        )
+    );
+    assert_eq!(
+        found_named(WallKind::UsageSession, WORDS, Some("five_hour")),
+        (WallKind::UsageSession, WORDS.to_string())
+    );
+    let weekly = "You've hit your weekly limit · resets Oct 11 at 9:35am";
+    assert_eq!(
+        found_named(WallKind::UsageWeekly, weekly, Some("seven_day")),
+        (WallKind::UsageWeekly, weekly.to_string())
+    );
+    let server = WallKind::ApiError {
+        code: None,
+        retryable: true,
+        cause: ApiCause::Server,
+    };
+    assert_eq!(
+        found_named(server, "API Error: terminated", Some("seven_day_opus")),
+        (server, "API Error: terminated".to_string())
+    );
 }

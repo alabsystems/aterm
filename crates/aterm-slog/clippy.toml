@@ -16,6 +16,8 @@ disallowed-methods = [
   { path = "std::fs::File::try_lock", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
   { path = "std::fs::File::lock_shared", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
   { path = "std::fs::File::try_lock_shared", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
+  { path = "std::fs::File::sync_all", reason = "finish the write with aterm_durable::durable or aterm_durable::ordered: name what a power loss may leave (clippy.toml: a chosen flush)" },
+  { path = "std::fs::File::sync_data", reason = "finish the write with aterm_durable::durable_data or aterm_durable::ordered: name what a power loss may leave (clippy.toml: a chosen flush)" },
   { path = "libc::flock", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
   { path = "rustix::fs::flock", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
   { path = "nix::fcntl::flock", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },

@@ -4,7 +4,7 @@
 [package]
 # THE DIRECTORY AND THE PACKAGE NAME DIFFER ON PURPOSE.
 #
-# `[patch.crates-io]` matches on PACKAGE name, so to redirect the five
+# `[patch.crates-io]` matches on PACKAGE name, so to redirect the four
 # third-party consumers' `arrayvec = "0.7.x"` lines at this code the package
 # must be called `arrayvec` — nothing else works, and in particular pointing
 # them at `aterm-alloc` (which is where the implementation actually lives)
@@ -16,8 +16,8 @@
 name = "arrayvec"
 # NOT `version.workspace = true`. This version is a SEMVER CONTRACT with the
 # consumers, not an aterm release number: naga 29.0.3, wgpu 29.0.3, wgpu-core
-# 29.0.3 and wgpu-hal 29.0.3 ask for ^0.7.1 and tiny-skia 0.11.4 for ^0.7.
-# 0.7.8 satisfies all five.
+# 29.0.3 and wgpu-hal 29.0.3 ask for ^0.7.1 (tiny-skia 0.11.4's ^0.7 left with
+# sctk-adwaita at LW.5). 0.7.8 satisfies all four.
 #
 # IT MUST ALSO BE THE HIGHEST `0.7.x` CANDIDATE IN THE GRAPH, and that half was
 # learned the expensive way: this crate shipped as 0.7.6 and the

@@ -29,8 +29,8 @@
 //     VT52 address over queued output (`Terminal::output_state_in_flight`). A
 //     synchronized-update window stays open (`modes` crosses whole), its timer
 //     re-armed at the restore.
-//   - `vi` mode, `text_selection`, the observation watchers and `last_custody`
-//     (`state.rs`): the person's interaction with this process, not the screen.
+//   - `text_selection`, the observation watchers and `last_custody` (`state.rs`):
+//     the person's interaction with this process, not the screen.
 //   - `marks_state` (OSC 1337 SetMark/AddAnnotation), `semantic` zones and `iterm2`
 //     image placements: extras no consumer needs across an update (OSC 133/633
 //     blocks are carried).
@@ -394,6 +394,39 @@ pub struct TerminalCheckpoint {
     pub output_state: OutputStateRepr,
 }
 
+impl TerminalCheckpoint {
+    /// Whether the parser carry holds part of an OSC 133/633 shell-integration mark
+    /// past its command number, the payload a signed mark carries the session's nonce
+    /// in (`Terminal::partial_sequence_is_shell_mark` at the capture). The
+    /// crash-restore journal refuses to write or read such a keyframe. This is a
+    /// keyframe-projection rule; raw journal tail bytes are not redacted.
+    #[must_use]
+    pub fn parser_holds_shell_mark(&self) -> bool {
+        self.parser.as_ref().is_some_and(|carry| {
+            carry.state == aterm_parser::State::OscString && osc_payload_is_shell_mark(&carry.osc)
+        })
+    }
+}
+
+/// Whether `osc`, an OSC payload collected so far, is an OSC 133/633 mark past its
+/// command number: the command parsed as the OSC dispatcher parses it (the first
+/// `;`-separated field as a `u32`, `handler_osc.rs`), and a `;` after it, past which a
+/// signed mark's parameters (its nonce among them) begin. A payload still inside its
+/// number holds no parameter yet.
+fn osc_payload_is_shell_mark(osc: &[u8]) -> bool {
+    let Some(command) = osc
+        .iter()
+        .position(|b| *b == b';')
+        .and_then(|end| osc.get(..end))
+    else {
+        return false;
+    };
+    std::str::from_utf8(command)
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .is_some_and(|n| n == 133 || n == 633)
+}
+
 /// What a hooked DCS string's handler holds at a checkpoint
 /// (`Terminal::hooked_dcs`), which decides whether a carry may swallow the
 /// rest of the string.
@@ -409,11 +442,29 @@ enum HookedDcs {
     Nothing,
     /// A picture placed at the string's end, which a graphics stream's next
     /// frame replaces: swallowing it loses that one picture.
-    #[cfg_attr(not(feature = "sixel"), allow(dead_code))]
     Picture,
     /// A query whose end writes a reply the program waits for: nothing
     /// replaces it, so no carry holds it.
     Query,
+}
+
+/// Which completed shell marks and blocks a projection carries (the in-progress
+/// mark and block always travel: a running command must still complete).
+#[derive(Clone, Copy, Debug)]
+enum MarksFrom {
+    /// Those from the first that names a line the projected primary history
+    /// holds: a mark wholly older than the carry names only lines it does not
+    /// hold (every carry, and [`Terminal::checkpoint_journal`]).
+    Carried,
+    /// Those from the first that names a row at most this many rows above the
+    /// primary's top visible row, or inside the carried history when that
+    /// reaches further: the journal's keyframe, whose history ring brings the
+    /// older lines back ([`Terminal::checkpoint_journal_marked`]).
+    Within(usize),
+    /// Every one the engine holds: the journal's recovery, whose scratch engine
+    /// holds only what a keyframe carried
+    /// ([`Terminal::checkpoint_continuing_swallowing`]).
+    All,
 }
 
 impl Terminal {
@@ -461,6 +512,43 @@ impl Terminal {
             .then(|| self.project_bounded(usize::MAX, usize::MAX, self.parser_is_ground()))
     }
 
+    /// [`Self::checkpoint_continuing`] that never refuses: a hooked DCS query
+    /// ([`Self::partial_sequence_uncarried`]) rides as a string to SWALLOW to its
+    /// terminator, as a hooked string whose handler keeps nothing does
+    /// ([`aterm_parser::Parser::carry_unhooking`]). The query's reply, which lives in
+    /// its handler, is lost; a restored terminal swallows the rest of the string rather
+    /// than print it. Equal to `checkpoint_continuing()` whenever that is `Some`.
+    ///
+    /// For the crash-restore journal's recovery (`aterm-restore`), whose replayed
+    /// scratch engine can end inside such a query: the screen the replay reached is the
+    /// one to restore, because falling back to the keyframe would undo everything the
+    /// replay did, an ED3 or a RIS included. The caller counts the loss
+    /// ([`Self::partial_sequence_uncarried`] and [`Self::partial_sequence_swallowed`]
+    /// name it); it is never hidden. Carries no nonce, like `checkpoint_continuing`.
+    ///
+    /// It keeps EVERY completed shell mark and block the engine holds, those whose
+    /// prompt is older than its history included, where `checkpoint_continuing` leaves
+    /// those behind; that is its one other difference. The scratch engine holds only
+    /// what the keyframe carried ([`Self::checkpoint_journal_marked`]), whose marks reach
+    /// past its bridge because the history ring brings their lines back below the
+    /// restored screen, at the same absolute rows. Filtered again here, by the scratch
+    /// engine's own short history, they would be dropped after all.
+    #[must_use]
+    pub fn checkpoint_continuing_swallowing(&self) -> TerminalCheckpoint {
+        let mut c = self.project(
+            usize::MAX,
+            usize::MAX,
+            self.parser_is_ground(),
+            true,
+            MarksFrom::All,
+        );
+        if self.hooked_dcs() == Some(HookedDcs::Query) {
+            c.parser = Some(self.parser.carry_unhooking());
+            c.parser_ground = false;
+        }
+        c
+    }
+
     /// Capture the exact visible terminal state without copying scrollback history.
     ///
     /// This is the latency-bounded process-handoff projection: screen continuity
@@ -495,6 +583,101 @@ impl Terminal {
             c.shell_integration_nonce = self.carried_shell_integration_nonce();
             c.shell_integration_rev = self.shell_integration_rev().map(str::to_owned);
             c
+        })
+    }
+
+    /// The crash-restore journal's keyframe projection (`aterm-restore`): the
+    /// visible screen and both grids, plus a BRIDGE of at most `bridge` lines of
+    /// the most recent history, at a capture cost of
+    /// `O((rows + bridge) × cols)` under the terminal lock.
+    ///
+    /// The bridge rides on the grid that holds this terminal's history: the
+    /// active grid on the main screen (`grid`, counted in `history_lines`), the
+    /// saved primary while the alternate screen is up (`alt_grid`, whose blob
+    /// then holds up to `rows + bridge` records — the journal's own decoder
+    /// bounds it there, not at the handoff wire's `rows`). The other grid
+    /// carries its visible rows only.
+    ///
+    /// Unlike the seamless carries it keeps the live parser's partial state
+    /// ([`TerminalCheckpoint::parser`]; `parser_ground` records the live
+    /// parser, as [`Self::checkpoint_continuing`] does) and the output state,
+    /// because the journal replays the raw bytes that follow it: a sequence
+    /// split across the keyframe continues through the carried parser state.
+    /// It omits the dedicated nonce and integration-revision fields (a restored shell
+    /// re-keys), and it is never cut inside an OSC 133/633 mark, whose raw payload the
+    /// parser carry would hold with the nonce in it (`id=<hex>`;
+    /// [`Self::partial_sequence_is_shell_mark`]). Raw tail replay bytes are outside this
+    /// projection and are not redacted.
+    ///
+    /// `None` when [`Self::partial_sequence_uncarried`] or
+    /// [`Self::partial_sequence_swallowed`] is `Some` (a hooked query, an
+    /// over-cap OSC, or an active picture whose handler state cannot be
+    /// carried), or when [`Self::partial_sequence_is_shell_mark`]. The journal
+    /// defers its keyframe (K5) rather than silently drop that state or write
+    /// the mark payload into its keyframe.
+    #[must_use]
+    pub fn checkpoint_journal(&self, bridge: usize) -> Option<TerminalCheckpoint> {
+        (self.partial_sequence_uncarried().is_none()
+            && self.partial_sequence_swallowed().is_none()
+            && !self.partial_sequence_is_shell_mark())
+        .then(|| {
+            // `project_bounded`'s first bound is the active grid's, its second the
+            // inactive one's; the history is the saved primary's while the
+            // alternate screen is up (`from_checkpoint` restores it there).
+            let (active, inactive) = if self.modes.alternate_screen {
+                (0, bridge)
+            } else {
+                (bridge, 0)
+            };
+            self.project_bounded(active, inactive, self.parser_is_ground())
+        })
+    }
+
+    /// [`Self::checkpoint_journal`] whose completed shell marks and blocks reach
+    /// `marks` history lines above the screen, whether or not the bridge carries
+    /// those lines: every one from the first that names a row at most `marks`
+    /// rows above the history grid's top visible row (or inside the bridge, when
+    /// that reaches further). Its grids are exactly `checkpoint_journal(bridge)`'s.
+    ///
+    /// The journal's bridge exists to meet its history ring, which carries every
+    /// history line older than the bridge as text alone, and a ring that has caught
+    /// up leaves the bridge empty. A mark's row is absolute, and the restore puts
+    /// the ring's lines back at their own absolute rows below the restored screen,
+    /// so a mark carried past the bridge names the line it named live; filtered by
+    /// the bridge, a keyframe of a caught-up session would carry no mark or block
+    /// in the scrollback at all, and prompt navigation and the block history would
+    /// stop at the screen's top. A mark whose line does not come back names a row
+    /// the restored engine never holds, as a live engine's mark does once its line
+    /// is evicted (marks outlive eviction; only a clear or a reset drops them).
+    ///
+    /// `marks` bounds the cost instead of the history: the engine keeps up to a
+    /// thousand marks and a thousand blocks, each with a working directory and a
+    /// command line of up to 64 KiB, and the keyframe is cloned under the terminal
+    /// lock and written to a fixed-size slot several times a second, so the journal
+    /// passes the line bound its bridge had before the ring (512 lines, 256 under
+    /// tail pressure), which an update's carry (256 lines) does not exceed.
+    #[must_use]
+    pub fn checkpoint_journal_marked(
+        &self,
+        bridge: usize,
+        marks: usize,
+    ) -> Option<TerminalCheckpoint> {
+        (self.partial_sequence_uncarried().is_none()
+            && self.partial_sequence_swallowed().is_none()
+            && !self.partial_sequence_is_shell_mark())
+        .then(|| {
+            let (active, inactive) = if self.modes.alternate_screen {
+                (0, bridge)
+            } else {
+                (bridge, 0)
+            };
+            self.project(
+                active,
+                inactive,
+                self.parser_is_ground(),
+                true,
+                MarksFrom::Within(marks),
+            )
         })
     }
 
@@ -549,7 +732,7 @@ impl Terminal {
     #[cfg(feature = "serde")]
     #[must_use]
     pub fn carry_meta_abandoning_partial(&self) -> CheckpointMeta {
-        let mut scalars = self.project(0, 0, true, false);
+        let mut scalars = self.project(0, 0, true, false, MarksFrom::Carried);
         scalars.shell_integration_nonce = self.carried_shell_integration_nonce();
         scalars.shell_integration_rev = self.shell_integration_rev().map(str::to_owned);
         CheckpointMeta::from_checkpoint(&scalars)
@@ -591,9 +774,12 @@ impl Terminal {
     }
 
     /// What a hooked DCS string's handler holds, or `None` when the parser is not
-    /// inside one. The parser cannot see it; this engine's DCS router can.
+    /// inside one: in its payload, or at the ESC that may begin its ST, whose next
+    /// byte decides whether it ends complete or broken off
+    /// ([`aterm_parser::Parser::in_hooked_dcs`]). The parser cannot see it; this
+    /// engine's DCS router can.
     fn hooked_dcs(&self) -> Option<HookedDcs> {
-        if self.parser.state() != aterm_parser::State::DcsPassthrough {
+        if !self.parser.in_hooked_dcs() {
             return None;
         }
         Some(match self.dcs.dcs_type {
@@ -603,7 +789,6 @@ impl Terminal {
             super::DcsType::None | super::DcsType::Unknown => HookedDcs::Nothing,
             // A picture placed at the unhook, which a stream's next frame
             // replaces.
-            #[cfg(feature = "sixel")]
             super::DcsType::Sixel => HookedDcs::Picture,
             // A query whose unhook writes a reply the program waits for.
             super::DcsType::Decrqss | super::DcsType::Xtgettcap => HookedDcs::Query,
@@ -637,6 +822,20 @@ impl Terminal {
     pub fn partial_sequence_swallowed(&self) -> Option<&'static str> {
         (self.parser.carry_swallows_sequence() || self.hooked_dcs() == Some(HookedDcs::Picture))
             .then(|| self.parser.state().name())
+    }
+
+    /// Whether the parser sits inside an OSC 133/633 shell-integration mark past its
+    /// command number: a carry would hold the mark's raw payload so far, where a signed
+    /// mark carries the session's nonce (`id=<hex>`, from its third parameter on). The
+    /// crash-restore journal never cuts a keyframe there
+    /// ([`Self::checkpoint_journal`]); the seamless carries do, as they carry the nonce
+    /// itself. A pure read.
+    #[must_use]
+    pub fn partial_sequence_is_shell_mark(&self) -> bool {
+        self.parser.state() == aterm_parser::State::OscString
+            && self
+                .parser_carry()
+                .is_some_and(|carry| osc_payload_is_shell_mark(&carry.osc))
     }
 
     /// Whether the sequence [`Self::partial_sequence_swallowed`] names is a picture
@@ -757,7 +956,13 @@ impl Terminal {
         inactive_max_history: usize,
         parser_ground: bool,
     ) -> TerminalCheckpoint {
-        self.project(max_history, inactive_max_history, parser_ground, true)
+        self.project(
+            max_history,
+            inactive_max_history,
+            parser_ground,
+            true,
+            MarksFrom::Carried,
+        )
     }
 
     /// [`Self::project_bounded`], or — `grids == false` — its scalars alone: both
@@ -766,12 +971,15 @@ impl Terminal {
     /// records it. Such a checkpoint is never a carry; it exists only to be read
     /// by [`CheckpointMeta::from_checkpoint`], which ignores the blobs
     /// ([`Self::carry_meta_abandoning_partial`]).
+    ///
+    /// `marks` says which completed shell marks and blocks travel ([`MarksFrom`]).
     fn project(
         &self,
         max_history: usize,
         inactive_max_history: usize,
         parser_ground: bool,
         grids: bool,
+        marks: MarksFrom,
     ) -> TerminalCheckpoint {
         let rows = self.grid.rows();
         let cols = self.grid.cols();
@@ -801,9 +1009,16 @@ impl Terminal {
         } else {
             (Some(&self.grid), max_history)
         };
+        // The marks' floor is that line, reached further back for the journal's
+        // keyframe and dropped for its recovery ([`MarksFrom`]).
         let oldest_carried_row = primary.map_or(0, |g| {
-            let carried = g.scrollback_lines().min(primary_bound) as u64;
-            g.visible_to_absolute(0).saturating_sub(carried)
+            let carried = g.scrollback_lines().min(primary_bound);
+            let top = g.visible_to_absolute(0);
+            match marks {
+                MarksFrom::Carried => top.saturating_sub(carried as u64),
+                MarksFrom::Within(lines) => top.saturating_sub(carried.max(lines) as u64),
+                MarksFrom::All => 0,
+            }
         });
 
         let (alt_grid, alt_cursor) = match &self.alt_grid {
@@ -997,6 +1212,11 @@ impl Terminal {
         // The application's colours go over this process's configured theme,
         // and its shell-integration state (running command included) resumes.
         self.apply_color_repr(&c.color);
+        // The latch came from the predecessor (`modes` above): what the program
+        // was last told. Under this engine's theme its view may be stale; push
+        // once if so and it kept 2031. `from_checkpoint` does not: the host's
+        // `apply_config` that follows reconciles against the carried latch.
+        let _ = self.reconcile_color_scheme();
         self.apply_shell_repr(&c.shell);
         // The program's titles, as OSC input (`restore_title`). A checkpoint
         // that carried none (an older producer) leaves this engine's alone.
@@ -1030,6 +1250,42 @@ impl Terminal {
         self.alt_archive_after_restore();
     }
 }
+
+/// The [`CheckpointMeta`] keys a reader requires before it deserializes a meta it did
+/// not write in this process: the seamless update's screen carry (`aterm-gui`'s
+/// `seamless::parse_checkpoint_meta`) and the crash-restore journal's keyframe
+/// (`aterm-restore`). One list, so the two doors refuse the same metas.
+///
+/// FROZEN — THIS LIST MAY ONLY SHRINK (the 2026-09-22/23 update audit, plan
+/// P0-2f/L3). The producer of a handoff is always the OLDER build, so a key
+/// added here is a key every producer already in the field fails to send: each
+/// of its sessions would arrive "unparseable". That used to refuse the whole
+/// update; since P0-2 it degrades each such session to a blank, repainted
+/// screen — every tab of every desk, on every hop from the older build. A new
+/// meta field rides `#[serde(default)]` instead, and aterm-gui's
+/// `the_required_meta_keys_are_frozen` pins this list verbatim. (A crash
+/// journal is read by the build that relaunches after the crash, which may be
+/// newer than the one that wrote it, for the same reason.)
+#[cfg(feature = "serde")]
+pub const CHECKPOINT_META_REQUIRED_KEYS: &[&str] = &[
+    "rows",
+    "cols",
+    "cursor",
+    "alt_cursor",
+    "saved_cursor_main",
+    "saved_cursor_alt",
+    "modes",
+    "style_fg_bits",
+    "style_bg_bits",
+    "style_flag_bits",
+    "style_protected",
+    "charset",
+    "kitty_keyboard",
+    "xterm_keyboard",
+    "taskbar_progress",
+    "secure_keyboard_entry",
+    "current_working_directory",
+];
 
 /// The serde-carryable half of a [`TerminalCheckpoint`]: every scalar field, without
 /// the two grid byte blobs (which stay on the binary `Line` codec).
@@ -1742,23 +1998,6 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_no_alt_grid_when_absent() {
-        // A plain terminal that never entered alt screen has no alt grid in the
-        // checkpoint, and still round-trips.
-        let mut t = Terminal::new(6, 20);
-        t.process(b"hello\r\nworld\r\n");
-        assert!(t.parser_is_ground());
-        let c0 = t.checkpoint();
-        assert!(c0.alt_grid.is_none(), "no alt grid captured");
-        assert!(c0.alt_cursor.is_none());
-
-        let h = Terminal::from_checkpoint(&c0);
-        assert_eq!(c0, h.checkpoint(), "re-checkpoint equal (no alt)");
-        assert_eq!(t.visible_content(), h.visible_content());
-        assert!(h.alt_grid.is_none(), "hydrated has no alt grid");
-    }
-
-    #[test]
     fn checkpoint_roundtrips_decslrm_horizontal_margins() {
         // DECSLRM margins are not recoverable from any other captured field, so
         // the projection carries them; otherwise a checkpoint under DECLRMM
@@ -2131,39 +2370,6 @@ mod tests {
         );
     }
 
-    /// A hooked DCS query is the one partial sequence no carry holds (its
-    /// reply lives in the handler): the abandoning carry projects it anyway,
-    /// names what it dropped, and restores into Ground — exactly CAN applied
-    /// to the copy.
-    #[test]
-    fn a_hooked_dcs_query_is_carried_by_abandoning_it() {
-        let mut t = Terminal::new(4, 20);
-        t.process(b"hello\x1bP$qm");
-        assert!(t.checkpoint_carry(0).is_none(), "control: no exact carry");
-        let (cp, abandoned) = t.checkpoint_carry_abandoning_partial(0);
-        assert_eq!(
-            abandoned,
-            Some("DcsPassthrough"),
-            "the dropped state is named"
-        );
-        assert!(cp.parser_ground && cp.parser.is_none());
-        assert_eq!(
-            t.parser.state().name(),
-            "DcsPassthrough",
-            "live parser untouched"
-        );
-        let mut restored = Terminal::from_checkpoint(&cp);
-        assert!(restored.parser_is_ground());
-        restored.process(b" world");
-        assert_eq!(
-            restored.row_text(0).as_deref().map(str::trim_end),
-            Some("hello world")
-        );
-        let mut twin = Terminal::new(4, 20);
-        twin.process(b"hello\x1bP$qm\x18");
-        assert_eq!(twin.checkpoint_carry(0).expect("Ground"), cp);
-    }
-
     /// A hooked DCS string rides the carry unless it is a query:
     ///
     /// * a string the engine only consumes (a tmux passthrough wrapper, tmux control
@@ -2173,8 +2379,9 @@ mod tests {
     ///   exactly as the live one does, so it is not named as swallowed;
     /// * a sixel string is carried the same way and named a swallowed picture: its
     ///   tail is swallowed, whichever ST ends it, and the next frame replaces it;
-    /// * a query (DECRQSS) stays uncarried, as its reply would be lost
-    ///   ([`a_hooked_dcs_query_is_carried_by_abandoning_it`]).
+    /// * a query (DECRQSS) stays uncarried, as its reply would be lost (the
+    ///   abandoning carry drops it and names it, see
+    ///   `every_partial_parser_state_is_carried_and_named`).
     #[test]
     fn a_hooked_dcs_rides_the_carry_unless_it_is_a_query() {
         let consumed: [(&[u8], &[u8]); 4] = [
@@ -2224,15 +2431,11 @@ mod tests {
             let mut sixel = Terminal::new(4, 30);
             sixel.process(b"one\r\n\x1bPq#0;2;0;0;0");
             assert_eq!(sixel.partial_sequence_uncarried(), None);
-            assert_eq!(
+            assert!(
                 sixel.partial_sequence_swallowed().is_some(),
-                cfg!(feature = "sixel"),
                 "a sixel the engine decodes is a picture the carry swallows"
             );
-            assert_eq!(
-                sixel.partial_sequence_swallows_picture(),
-                cfg!(feature = "sixel")
-            );
+            assert!(sixel.partial_sequence_swallows_picture());
             let cp = sixel.checkpoint_carry(0).expect("carried");
             let mut restored = Terminal::from_checkpoint(&cp);
             restored.process(tail);
@@ -2252,6 +2455,45 @@ mod tests {
         query.process(b"\x1bP+q");
         assert_eq!(query.partial_sequence_uncarried(), Some("DcsPassthrough"));
         assert!(query.checkpoint_carry(0).is_none());
+    }
+
+    /// A hooked DCS whose ESC has arrived without the byte after it is still
+    /// hooked: that byte decides whether the string ends at ST or is broken off.
+    /// A query there stays uncarried, as inside its payload (its reply would be
+    /// lost); a string the engine only consumes, or a sixel, rides as the ESC
+    /// alone, so the restored engine reads the next byte as the live one does.
+    #[test]
+    fn a_hooked_dcs_at_the_escape_of_its_st_rides_the_carry_unless_it_is_a_query() {
+        for head in [&b"\x1bP$qm\x1b"[..], b"\x1bP+q544E\x1b"] {
+            let mut query = Terminal::new(4, 30);
+            query.process(head);
+            assert_eq!(query.take_response(), None, "{head:?}: not answered yet");
+            assert!(query.partial_sequence_uncarried().is_some(), "{head:?}");
+            assert!(query.checkpoint_carry(0).is_none(), "{head:?}");
+        }
+        for head in [&b"\x1bPtmux;\x1b"[..], b"\x1bPq#0;2;0;0;0#0~\x1b"] {
+            for tail in [&b"\\after"[..], b"]2;inner\x07after"] {
+                let mut live = Terminal::new(4, 30);
+                live.process(b"one\r\n");
+                live.process(head);
+                assert_eq!(live.partial_sequence_uncarried(), None, "{head:?}");
+                let cp = live.checkpoint_carry(0).expect("carried");
+                assert_eq!(
+                    cp.parser.as_ref().map(|carry| carry.state),
+                    Some(aterm_parser::State::Escape),
+                    "{head:?}: the ESC alone"
+                );
+                let mut restored = Terminal::from_checkpoint(&cp);
+                restored.process(tail);
+                live.process(tail);
+                assert_eq!(
+                    restored.row_text(1).as_deref().map(str::trim_end),
+                    Some("after"),
+                    "{head:?} then {tail:?}"
+                );
+                assert_eq!(restored.title(), live.title(), "{head:?} then {tail:?}");
+            }
+        }
     }
 
     /// A string holding a character with a `0x9C` byte is swallowed whole, live and
@@ -2762,6 +3004,7 @@ mod tests {
             window: "vim main.rs".to_string(),
             icon: "the-icon".to_string(),
             stack: vec![("the-icon".to_string(), "the caller".to_string())],
+            ..TitleRepr::default()
         };
         let carry = t.checkpoint_carry(0).expect("Ground");
         assert_eq!(carry.title.as_ref(), Some(&expected), "projected whole");
@@ -2823,6 +3066,97 @@ mod tests {
         assert_eq!(seeded.title(), "", "an untitled program stays untitled");
     }
 
+    /// Empty is a saved title too, while a slot absent from a selective push
+    /// must stay absent. Exercise all three checkpoint projections through the
+    /// real OSC/XTWINOPS path, with a nonempty handoff first in each projection.
+    #[test]
+    fn a_checkpoint_preserves_saved_empty_title_slots() {
+        let mut observed = Vec::new();
+        let mut expected = Vec::new();
+        for projection in ["memory", "carry", "journal"] {
+            for (label, prefix, tail, window, icon) in [
+                (
+                    "nonempty",
+                    &b"\x1b]0;caller\x07\x1b[22t\x1b]0;program\x07"[..],
+                    &b"\x1b[23t"[..],
+                    "caller",
+                    "caller",
+                ),
+                (
+                    "empty window, unsaved icon",
+                    b"\x1b]1;icon\x07\x1b[22;2t\x1b]0;program\x07",
+                    b"\x1b[23;2t",
+                    "",
+                    "program",
+                ),
+                (
+                    "empty icon, unsaved window",
+                    b"\x1b]2;window\x07\x1b[22;1t\x1b]0;program\x07",
+                    b"\x1b[23;1t",
+                    "program",
+                    "",
+                ),
+                (
+                    "both saved empty",
+                    b"\x1b[22t\x1b]0;program\x07",
+                    b"\x1b[23t",
+                    "",
+                    "",
+                ),
+                (
+                    "older saved empty window",
+                    b"\x1b]1;icon\x07\x1b[22;2t\x1b[22;1t\x1b]0;program\x07",
+                    b"\x1b[23;2t",
+                    "",
+                    "program",
+                ),
+            ] {
+                let mut live = Terminal::new(4, 20);
+                live.process(prefix);
+                let checkpoint = match projection {
+                    "memory" => live.checkpoint(),
+                    "carry" => live.checkpoint_carry(0).expect("Ground carry"),
+                    "journal" => live.checkpoint_journal(0).expect("Ground journal"),
+                    _ => unreachable!(),
+                };
+                #[cfg(feature = "serde")]
+                let checkpoint = {
+                    let meta = CheckpointMeta::from_checkpoint(&checkpoint);
+                    let back =
+                        meta.into_checkpoint(checkpoint.grid.clone(), checkpoint.alt_grid.clone());
+                    assert_eq!(back, checkpoint, "{projection}/{label}: meta reassembly");
+                    back
+                };
+                let mut adopted = Terminal::from_checkpoint(&checkpoint);
+                live.process(tail);
+                adopted.process(tail);
+                assert_eq!(
+                    (live.title(), live.icon_name()),
+                    (window, icon),
+                    "{projection}/{label}: live premise"
+                );
+                if label == "nonempty" {
+                    assert_eq!(
+                        (adopted.title(), adopted.icon_name()),
+                        (window, icon),
+                        "{projection}: positive handoff"
+                    );
+                }
+                observed.push((
+                    projection,
+                    label,
+                    adopted.title().to_string(),
+                    adopted.icon_name().to_string(),
+                ));
+                expected.push((projection, label, window.to_string(), icon.to_string()));
+            }
+        }
+        assert_eq!(
+            observed, expected,
+            "a checkpoint must distinguish saved empty slots from slots a push did not save"
+        );
+    }
+
     /// A carried title is OSC input, not trusted text: the restore holds it to
     /// what the OSC 0/1/2 handler would store (1024 bytes at most, no C0 but
     /// tab, no C1, no bidi override) and the stack to the engine's depth,
@@ -2841,6 +3175,7 @@ mod tests {
             stack: (0..15)
                 .map(|n| (format!("icon {n}\x07"), format!("window {n}\x1b")))
                 .collect(),
+            ..TitleRepr::default()
         };
         let mut t = Terminal::new(4, 20);
         t.restore_title(&repr);
@@ -2877,5 +3212,394 @@ mod tests {
         let mut twin = Terminal::new(4, 20);
         twin.restore_title(&again);
         assert_eq!(twin.capture_title_repr(), again, "restoring is idempotent");
+    }
+
+    /// The crash-restore journal's keyframe: a terminal restored from it and fed the same
+    /// bytes as the live one stays identical to it, at Ground and with a sequence split
+    /// across the keyframe (the parser carry continues it); the bridge bounds the history it
+    /// carries; and a hooked DCS query, whose reply no carry can hold, defers it.
+    #[test]
+    fn the_journal_keyframe_continues_the_stream_it_was_cut_from() {
+        let tail: &[u8] = b"lor\x1b[0m after\r\nnext line\r\n";
+        for (label, cut) in [
+            ("ground", &b"\x1b[31mco"[..]),
+            ("mid-csi", &b"\x1b[31mco\x1b[3"[..]),
+            ("mid-osc", &b"\x1b]0;a title being wri"[..]),
+            ("mid-utf8", &b"caf\xc3"[..]),
+        ] {
+            let mut live = build_rich_terminal(6, 24);
+            live.process(cut);
+            let keyframe = live.checkpoint_journal(512).expect("carried");
+            assert_eq!(
+                (keyframe.parser.is_some(), keyframe.parser_ground),
+                (label != "ground", label == "ground"),
+                "{label}: a split sequence rides the keyframe's parser carry"
+            );
+            let mut restored = Terminal::from_checkpoint(&keyframe);
+            assert_eq!(
+                restored.checkpoint_journal(512),
+                Some(keyframe.clone()),
+                "{label}: the keyframe round-trips"
+            );
+            live.process(tail);
+            restored.process(tail);
+            assert_eq!(
+                restored.checkpoint_continuing(),
+                live.checkpoint_continuing(),
+                "{label}: the replayed tail lands where the live one did"
+            );
+        }
+
+        let mut deep = Terminal::new(6, 24);
+        for i in 0..40 {
+            deep.process(format!("history {i}\r\n").as_bytes());
+        }
+        let history = deep.grid.scrollback_lines();
+        assert!(history > 8, "{history}");
+        assert_eq!(deep.checkpoint_journal(8).expect("ground").history_lines, 8);
+        assert_eq!(
+            deep.checkpoint_journal(0).expect("ground").history_lines,
+            0,
+            "a zero bridge is the visible screen"
+        );
+        assert_eq!(
+            deep.checkpoint_journal(usize::MAX)
+                .expect("ground")
+                .history_lines as usize,
+            history,
+            "a bridge past the history carries all of it"
+        );
+
+        let mut query = Terminal::new(4, 20);
+        query.process(b"hello\x1bP$qm");
+        assert!(
+            query.checkpoint_journal(512).is_none(),
+            "a hooked DCS query defers the keyframe"
+        );
+        query.process(b"\x1b\\");
+        assert!(
+            query.checkpoint_journal(512).is_some(),
+            "and its end allows it"
+        );
+    }
+
+    /// The journal's marked keyframe: its grids are the bridge's alone, its completed
+    /// marks and blocks reach `marks` rows above the screen past a shorter bridge (the
+    /// history ring brings their lines back), never further, and the recovery's
+    /// projection of a terminal restored from it keeps every one of them, where the
+    /// carry's own floor would drop those its short history does not reach. A mark or
+    /// block reaches a row when one of its rows is at or past it: one whose output
+    /// runs into the horizon travels though its prompt row is older.
+    #[test]
+    fn the_marked_keyframe_carries_the_marks_its_bridge_does_not_reach() {
+        let mut t = Terminal::new(4, 30);
+        for command in 0..5u8 {
+            t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07cmd\r\n\x1b]133;C\x07");
+            for _ in 0..9 {
+                t.process(b"out\r\n");
+            }
+            t.process(format!("\x1b]133;D;{command}\x07").as_bytes());
+        }
+        let top = t.grid.visible_to_absolute(0);
+        // Each completed mark's prompt row and one past its last row (the D's).
+        let marks: Vec<(u64, u64)> = t
+            .command_marks()
+            .iter()
+            .map(|m| (m.prompt_start_row, m.output_end_row.expect("finished") + 1))
+            .collect();
+        let rows: Vec<u64> = marks.iter().map(|&(prompt, _)| prompt).collect();
+        assert_eq!(rows.len(), 5);
+        assert!(rows.iter().all(|&r| r < top), "premise: all in the history");
+        let reaching = |floor: u64| -> Vec<u64> {
+            marks
+                .iter()
+                .filter(|&&(_, end)| end > floor)
+                .map(|&(prompt, _)| prompt)
+                .collect()
+        };
+        let within = |c: &TerminalCheckpoint| -> Vec<u64> {
+            c.shell
+                .command_marks
+                .iter()
+                .map(|m| m.prompt_start_row)
+                .collect()
+        };
+        let plain = t.checkpoint_journal(0).expect("ground");
+        let on_screen = reaching(top);
+        assert_eq!(
+            within(&plain),
+            on_screen,
+            "the bridge's own floor: the last command's output reaches the screen"
+        );
+        assert_eq!(on_screen.len(), 1, "premise: one reaches the screen");
+        let horizon = 25;
+        let floor = top - horizon as u64;
+        let marked = t.checkpoint_journal_marked(0, horizon).expect("ground");
+        let want = reaching(floor);
+        assert!(
+            want.len() > on_screen.len() && want.len() < rows.len(),
+            "premise: the horizon splits them: {want:?} of {rows:?}"
+        );
+        assert!(
+            want.iter().any(|&prompt| prompt < floor),
+            "premise: one reaches the horizon from a prompt row older than it: {want:?}"
+        );
+        assert_eq!(within(&marked), want, "the horizon, and no further");
+        let blocks = |c: &TerminalCheckpoint| -> Vec<u64> {
+            c.shell
+                .output_blocks
+                .iter()
+                .chain(c.shell.current_block.as_ref())
+                .map(|b| b.span.prompt_start_row)
+                .collect()
+        };
+        // An archived block's `end_row` is one past its last row; the block
+        // being built always travels.
+        let want_blocks: Vec<u64> = t
+            .all_blocks()
+            .filter(|b| b.end_row.is_none_or(|end| end > floor))
+            .map(|b| b.prompt_start_row)
+            .collect();
+        assert!(
+            want_blocks.len() > 1,
+            "premise: archived blocks inside the horizon"
+        );
+        assert_eq!(blocks(&marked), want_blocks, "their blocks too");
+        assert_eq!(
+            (marked.grid.clone(), marked.history_lines),
+            (plain.grid.clone(), plain.history_lines),
+            "the grids are the bridge's"
+        );
+        assert_eq!(
+            within(&t.checkpoint_journal_marked(8, 0).expect("ground")),
+            within(&t.checkpoint_journal(8).expect("ground")),
+            "a bridge reaching further than the horizon keeps its own"
+        );
+
+        let restored = Terminal::from_checkpoint(&marked);
+        assert_eq!(
+            within(&restored.checkpoint_continuing_swallowing()),
+            want,
+            "the recovery's projection keeps them"
+        );
+        assert_eq!(
+            within(&restored.checkpoint_continuing().expect("ground")),
+            on_screen,
+            "control: the carry's floor drops what its history does not reach"
+        );
+    }
+
+    /// While the alternate screen is up the journal's bridge rides the saved primary,
+    /// whose blob then holds the visible rows plus the bridge; the alternate grid keeps
+    /// its visible rows, and the restored terminal gets its history back on the way out.
+    #[test]
+    fn the_journal_bridge_rides_the_saved_primary_on_the_alternate_screen() {
+        let mut live = Terminal::new(5, 20);
+        for i in 0..30 {
+            live.process(format!("shell {i}\r\n").as_bytes());
+        }
+        live.process(b"\x1b[?1049hfull screen app");
+        let keyframe = live.checkpoint_journal(10).expect("ground");
+        assert_eq!(
+            keyframe.history_lines, 0,
+            "the alternate grid has no history"
+        );
+        assert_eq!(deserialize_lines(&keyframe.grid).len(), 5);
+        let primary = keyframe.alt_grid.as_deref().expect("the saved primary");
+        assert_eq!(
+            deserialize_lines(primary).len(),
+            5 + 10,
+            "the bridge rides the saved primary"
+        );
+        let mut restored = Terminal::from_checkpoint(&keyframe);
+        restored.process(b"\x1b[?1049l");
+        live.process(b"\x1b[?1049l");
+        assert_eq!(restored.visible_content(), live.visible_content());
+        assert_eq!(restored.grid.scrollback_lines(), 10);
+    }
+
+    /// The journal's keyframe never carries the shell-integration nonce or the
+    /// integration revision, even while integration is authorized and in use: the
+    /// journal lives in memory a keeper holds, and a restored shell re-keys. The verified
+    /// mark count is what the journal reads instead: it moves only for a mark whose nonce
+    /// verified.
+    #[test]
+    fn the_journal_keyframe_carries_no_nonce_and_marks_are_counted() {
+        let key = [7u8; 32];
+        let mut t = Terminal::new(4, 40);
+        t.set_require_shell_integration_nonce(true);
+        t.authorize_shell_integration(key);
+        assert_eq!(t.shell_marks_verified(), 0);
+        t.process(
+            format!(
+                "\x1b]133;A;id={}\x07$ ",
+                ShellIntegrationNonce(key).to_hex()
+            )
+            .as_bytes(),
+        );
+        assert_eq!(t.shell_marks_verified(), 1, "a verified mark is counted");
+        t.process(format!("\x1b]133;B;id={}\x07", "1".repeat(64)).as_bytes());
+        assert_eq!(
+            t.shell_marks_verified(),
+            1,
+            "a mark with the wrong nonce is dropped, not counted"
+        );
+        assert_eq!(t.shell_integration_dropped_count(), 1);
+        assert!(
+            t.checkpoint_carry(0)
+                .expect("ground")
+                .shell_integration_nonce
+                .is_some(),
+            "control: the seamless carry takes the nonce"
+        );
+        let keyframe = t.checkpoint_journal(512).expect("ground");
+        assert_eq!(keyframe.shell_integration_nonce, None);
+        assert_eq!(keyframe.shell_integration_rev, None);
+
+        let mut open = Terminal::new(4, 40);
+        open.process(b"\x1b]133;A\x07");
+        assert_eq!(
+            open.shell_marks_verified(),
+            0,
+            "with no nonce required nothing is verified (and the replay applies the mark)"
+        );
+    }
+
+    /// A journal waits for a lossless cut instead of turning a partially collected
+    /// sequence into one to ignore. Ordinary split sequences still continue.
+    #[test]
+    fn the_journal_defers_sequences_a_carry_would_only_swallow() {
+        for (label, head, tail) in [
+            ("ground", &b"plain"[..], &b" tail"[..]),
+            ("split-csi", &b"\x1b[3"[..], &b"1mred"[..]),
+            ("split-osc", &b"\x1b]0;short "[..], &b"title\x07"[..]),
+            ("split-glyph", &b"caf\xc3"[..], &b"\xa9"[..]),
+            (
+                "ignored-dcs",
+                &b"\x1bPtmux;"[..],
+                &b"ignored\x1b\\after"[..],
+            ),
+        ] {
+            let mut live = Terminal::new(4, 20);
+            live.process(head);
+            assert_eq!(live.partial_sequence_uncarried(), None, "{label}");
+            assert_eq!(live.partial_sequence_swallowed(), None, "{label}");
+            let keyframe = live.checkpoint_journal(0).expect(label);
+            let mut restored = Terminal::from_checkpoint(&keyframe);
+            live.process(tail);
+            restored.process(tail);
+            assert_eq!(
+                restored.checkpoint_continuing(),
+                live.checkpoint_continuing(),
+                "{label}: lossless parser state remains admitted"
+            );
+        }
+
+        let mut long_title = b"\x1b]0;".to_vec();
+        long_title.extend(std::iter::repeat_n(b'A', aterm_parser::OSC_CARRY_CAP + 1));
+        let mut long_image = b"\x1b]1337;File=inline=1:".to_vec();
+        long_image.extend(std::iter::repeat_n(b'A', aterm_parser::OSC_CARRY_CAP + 1));
+        let mut refusals = Vec::new();
+        for (label, head) in [
+            ("oversize-title", &long_title[..]),
+            ("oversize-image", &long_image[..]),
+            ("active-apc", &b"\x1b_Ga=T,f=100;"[..]),
+            ("hooked-sixel", &b"\x1bPq#0;2;0;0;0"[..]),
+        ] {
+            let mut live = Terminal::new(4, 20);
+            live.process(head);
+            assert_eq!(live.partial_sequence_uncarried(), None, "{label}");
+            assert!(
+                live.partial_sequence_swallowed().is_some(),
+                "{label}: the actual engine has the intended carry state"
+            );
+            let before = live.checkpoint_continuing();
+            let refused = live.checkpoint_journal(0).is_none();
+            assert_eq!(
+                live.checkpoint_continuing(),
+                before,
+                "{label}: the capture does not mutate the live parser"
+            );
+            refusals.push((label, refused));
+            live.process(b"\x1b\\");
+            assert!(live.checkpoint_journal(0).is_some(), "{label}: ended");
+        }
+        assert!(
+            refusals.iter().all(|(_, refused)| *refused),
+            "lossy parser states must defer the journal keyframe: {refusals:?}"
+        );
+    }
+
+    /// The crash restore's projection never refuses: a hooked DCS query rides as a
+    /// string to swallow (its reply is lost, the rest of the string is not printed), and
+    /// every other state is exactly `checkpoint_continuing`'s.
+    #[test]
+    fn the_swallowing_projection_carries_a_hooked_query_as_a_string_to_swallow() {
+        let mut query = Terminal::new(4, 20);
+        query.process(b"before\r\n\x1bP+q544e");
+        assert_eq!(query.partial_sequence_uncarried(), Some("DcsPassthrough"));
+        assert_eq!(
+            query.checkpoint_continuing(),
+            None,
+            "control: refused there"
+        );
+        let c = query.checkpoint_continuing_swallowing();
+        assert!(!c.parser_ground);
+        assert_eq!(c.shell_integration_nonce, None);
+        let mut restored = Terminal::from_checkpoint(&c);
+        restored.process(b"\x1b\\after");
+        query.process(b"\x1b\\after");
+        assert_eq!(
+            restored.row_text(1),
+            query.row_text(1),
+            "the tail is swallowed"
+        );
+        assert!(
+            query.take_response().is_some(),
+            "control: the live engine answered the query"
+        );
+        assert!(
+            restored.take_response().is_none(),
+            "the restored one cannot: its reply lived in the handler"
+        );
+
+        for head in [&b"plain"[..], b"\x1b[3", b"\x1b]0;short ", b"\x1bPtmux;"] {
+            let mut t = Terminal::new(4, 20);
+            t.process(head);
+            assert_eq!(
+                Some(t.checkpoint_continuing_swallowing()),
+                t.checkpoint_continuing(),
+                "{head:?}: equal wherever checkpoint_continuing answers"
+            );
+        }
+    }
+
+    /// The journal never cuts inside an OSC 133/633 mark past its command number, where
+    /// the carry would hold the mark's payload and a signed mark's nonce with it; every
+    /// other OSC, and a mark still inside its number, is cut and carried as before.
+    #[test]
+    fn the_journal_is_never_cut_inside_a_shell_mark() {
+        let hex = "5a".repeat(32);
+        for (payload, mark) in [
+            (format!("133;A;id={hex}"), true),
+            ("133;".to_owned(), true),
+            ("0133;B".to_owned(), true),
+            (format!("633;E;ls;id={hex}"), true),
+            ("133".to_owned(), false),
+            ("13".to_owned(), false),
+            ("0;a title".to_owned(), false),
+            ("1337;SetMark".to_owned(), false),
+            ("7;file:///tmp".to_owned(), false),
+        ] {
+            let mut t = Terminal::new(4, 80);
+            t.process(format!("$ \x1b]{payload}").as_bytes());
+            assert_eq!(t.partial_sequence_is_shell_mark(), mark, "{payload}");
+            assert_eq!(t.checkpoint_journal(8).is_none(), mark, "{payload}");
+            let carried = t.checkpoint_continuing().expect("an OSC is carried");
+            assert_eq!(carried.parser_holds_shell_mark(), mark, "{payload}");
+            t.process(b"\x07");
+            assert!(!t.partial_sequence_is_shell_mark(), "{payload}: ended");
+            assert!(t.checkpoint_journal(8).is_some(), "{payload}: ended");
+        }
     }
 }

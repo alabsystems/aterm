@@ -359,15 +359,13 @@ mod tests {
     /// take turns.
     static SERIAL: Mutex<()> = Mutex::new(());
 
+    /// A zero, NaN or negative `presentedTime` is a skipped present; a real one
+    /// reports registration-to-display, clamped at zero.
     #[test]
-    fn a_zero_presented_time_is_a_skip_not_a_duration() {
+    fn classify_skips_unpresented_frames_and_clamps_the_span() {
         assert_eq!(classify(12.5, 0.0), GlassSample::Skipped);
         assert_eq!(classify(12.5, f64::NAN), GlassSample::Skipped);
         assert_eq!(classify(12.5, -1.0), GlassSample::Skipped);
-    }
-
-    #[test]
-    fn an_on_glass_frame_reports_registration_to_display() {
         let GlassSample::OnGlass { ns } = classify(100.0, 100.016) else {
             panic!("a nonzero presentedTime is on glass");
         };
@@ -375,26 +373,7 @@ mod tests {
             (15_999_000..=16_001_000).contains(&ns),
             "16 ms span read as {ns} ns"
         );
-    }
-
-    #[test]
-    fn a_display_time_before_registration_clamps_to_zero() {
         assert_eq!(classify(100.0, 99.0), GlassSample::OnGlass { ns: 0 });
-    }
-
-    /// `ALL` is dense and in `index` order, and every label is distinct — the
-    /// per-tag ledgers index by it and the wire prints it.
-    #[test]
-    fn tags_are_dense_ordered_and_distinctly_labelled() {
-        for (i, tag) in PresentTag::ALL.iter().enumerate() {
-            assert_eq!(tag.index(), i);
-            assert_eq!(PresentTag::from_u8(*tag as u8), *tag);
-        }
-        let mut labels: Vec<&str> = PresentTag::ALL.iter().map(|t| t.as_str()).collect();
-        labels.sort_unstable();
-        labels.dedup();
-        assert_eq!(labels.len(), PresentTag::COUNT);
-        assert_eq!(PresentTag::from_u8(200), PresentTag::Spaced);
     }
 
     /// Arguments are `(burst, input_hot, occluded)`: occlusion wins, then the

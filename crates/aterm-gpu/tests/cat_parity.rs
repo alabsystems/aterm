@@ -6,7 +6,7 @@
 // <= 1, hard bar <= 2. Also: an opaque sixel hides the sprite, a moved cat repaints without
 // ghosting and a settled one takes the dirty gate, and malformed quads are refused.
 //
-// No GPU or no font: the tests no-op.
+// No GPU or no font: COULD NOT RUN.
 
 use crate::common;
 use std::sync::Arc;

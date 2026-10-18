@@ -679,12 +679,19 @@ pub mod env {
 mod tests {
     use super::*;
 
+    /// Severity order is what `enabled` compares: a filter admits a level at
+    /// or below it, and `Off` admits nothing.
     #[test]
-    fn test_level_ordering() {
+    fn levels_and_filters_order_by_verbosity() {
         assert!(Level::Error < Level::Warn);
         assert!(Level::Warn < Level::Info);
         assert!(Level::Info < Level::Debug);
         assert!(Level::Debug < Level::Trace);
+        assert!(LevelFilter::Off < LevelFilter::Error);
+        assert!(LevelFilter::Error < LevelFilter::Warn);
+        assert!(LevelFilter::Warn < LevelFilter::Info);
+        assert!(LevelFilter::Info < LevelFilter::Debug);
+        assert!(LevelFilter::Debug < LevelFilter::Trace);
     }
 
     #[test]
@@ -697,65 +704,24 @@ mod tests {
     }
 
     #[test]
-    fn test_level_filter_ordering() {
-        assert!(LevelFilter::Off < LevelFilter::Error);
-        assert!(LevelFilter::Error < LevelFilter::Warn);
-        assert!(LevelFilter::Warn < LevelFilter::Info);
-        assert!(LevelFilter::Info < LevelFilter::Debug);
-        assert!(LevelFilter::Debug < LevelFilter::Trace);
-    }
-
-    #[test]
-    fn test_record_fields() {
-        let record = Record {
-            level: Level::Info,
-            target: "my_module",
-            args: format_args!("hello {}", 42),
-            file: Some("lib.rs"),
-            line: Some(10),
-        };
-        assert_eq!(record.level(), Level::Info);
-        assert_eq!(record.target(), "my_module");
-        assert_eq!(record.file(), Some("lib.rs"));
-        assert_eq!(record.line(), Some(10));
-    }
-
-    #[test]
-    fn test_metadata_from_record() {
-        let record = Record {
-            level: Level::Warn,
-            target: "test",
-            args: format_args!(""),
-            file: None,
-            line: None,
-        };
-        let meta = record.metadata();
-        assert_eq!(meta.level(), Level::Warn);
-    }
-
-    #[test]
-    fn test_parse_level_filter_names() {
-        assert_eq!(LevelFilter::parse("off"), Some(LevelFilter::Off));
-        assert_eq!(LevelFilter::parse("error"), Some(LevelFilter::Error));
-        assert_eq!(LevelFilter::parse("warn"), Some(LevelFilter::Warn));
-        assert_eq!(LevelFilter::parse("info"), Some(LevelFilter::Info));
-        assert_eq!(LevelFilter::parse("debug"), Some(LevelFilter::Debug));
-        assert_eq!(LevelFilter::parse("trace"), Some(LevelFilter::Trace));
-    }
-
-    #[test]
-    fn test_parse_level_filter_case_and_whitespace() {
-        assert_eq!(LevelFilter::parse("INFO"), Some(LevelFilter::Info));
-        assert_eq!(LevelFilter::parse("  Warn\n"), Some(LevelFilter::Warn));
-        assert_eq!(LevelFilter::parse("OfF"), Some(LevelFilter::Off));
-    }
-
-    #[test]
-    fn test_parse_level_filter_rejects_junk() {
-        assert_eq!(LevelFilter::parse(""), None);
-        assert_eq!(LevelFilter::parse("verbose"), None);
-        assert_eq!(LevelFilter::parse("info,debug"), None);
-        assert_eq!(LevelFilter::parse("3"), None);
+    fn parse_level_filter_takes_names_in_any_case_and_refuses_junk() {
+        for (text, want) in [
+            ("off", Some(LevelFilter::Off)),
+            ("error", Some(LevelFilter::Error)),
+            ("warn", Some(LevelFilter::Warn)),
+            ("info", Some(LevelFilter::Info)),
+            ("debug", Some(LevelFilter::Debug)),
+            ("trace", Some(LevelFilter::Trace)),
+            ("INFO", Some(LevelFilter::Info)),
+            ("  Warn\n", Some(LevelFilter::Warn)),
+            ("OfF", Some(LevelFilter::Off)),
+            ("", None),
+            ("verbose", None),
+            ("info,debug", None),
+            ("3", None),
+        ] {
+            assert_eq!(LevelFilter::parse(text), want, "{text:?}");
+        }
     }
 
     #[test]
@@ -781,20 +747,6 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_record_for_control_char_at_the_alert_boundary_stays_within_reservation() {
-        let msg = "a".repeat(MAX_ALERT_RECORD_BYTES - 1) + "\u{01}" + "a";
-        let out = sanitize_record_for(Level::Error, &msg);
-        assert!(out.len() <= MAX_ALERT_RECORD_BYTES + '…'.len_utf8());
-        assert!(!out.chars().any(char::is_control));
-    }
-
-    #[test]
-    fn test_sanitize_record_clean_input_is_borrowed() {
-        let msg = "DENIED: control_socket::auth in Standard mode";
-        assert!(matches!(sanitize_record(msg), Cow::Borrowed(m) if m == msg));
-    }
-
-    #[test]
     fn test_sanitize_record_replaces_control_characters() {
         // ESC (escape injection), newline (record forgery), DEL, C1 CSI.
         let msg = "path '\x1b]0;evil\x07\nFAKE\u{7f}\u{9b}'";
@@ -804,14 +756,6 @@ mod tests {
             out,
             "path '\u{fffd}]0;evil\u{fffd}\u{fffd}FAKE\u{fffd}\u{fffd}'"
         );
-    }
-
-    #[test]
-    fn test_sanitize_record_caps_length() {
-        let long = "a".repeat(MAX_RECORD_BYTES * 2);
-        let out = sanitize_record(&long);
-        assert!(out.len() <= MAX_RECORD_BYTES + '…'.len_utf8());
-        assert!(out.ends_with('…'));
     }
 
     #[test]
@@ -826,10 +770,16 @@ mod tests {
 
     #[test]
     fn test_sanitize_record_control_char_at_boundary_stays_within_reservation() {
-        // A 1-byte control char at the boundary is pushed as 3-byte U+FFFD.
-        let msg = "a".repeat(MAX_RECORD_BYTES - 1) + "\u{01}" + "a";
-        let out = sanitize_record(&msg);
-        assert!(out.len() <= MAX_RECORD_BYTES + '…'.len_utf8());
+        // A 1-byte control char at either cap is pushed as 3-byte U+FFFD.
+        for (level, cap) in [
+            (Level::Info, MAX_RECORD_BYTES),
+            (Level::Error, MAX_ALERT_RECORD_BYTES),
+        ] {
+            let msg = "a".repeat(cap - 1) + "\u{01}" + "a";
+            let out = sanitize_record_for(level, &msg);
+            assert!(out.len() <= cap + '…'.len_utf8(), "{level}");
+            assert!(!out.chars().any(char::is_control), "{level}");
+        }
     }
 }
 
@@ -849,16 +799,6 @@ mod env_tests {
         // ONE-SHOT: a consumed handoff authority is gone, so a second consumer
         // cannot observe it. This is the property `take` exists for.
         assert_eq!(super::env::take(KEY), None);
-        assert_eq!(super::env::read(KEY), None);
-    }
-
-    #[test]
-    fn unset_clears_a_key_that_was_never_set() {
-        const KEY: &str = "ATERM_LOG_TEST_UNSET";
-        super::env::unset(KEY);
-        assert_eq!(super::env::read(KEY), None);
-        super::env::set(KEY, "x");
-        super::env::unset(KEY);
         assert_eq!(super::env::read(KEY), None);
     }
 

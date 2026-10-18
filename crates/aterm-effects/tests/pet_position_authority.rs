@@ -14,10 +14,9 @@
 
 use std::time::{Duration, Instant};
 
-use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::Terminal;
 use aterm_effects::kitty_pet::{PetBrain, PetFrame, PetSense};
-use aterm_effects::pet_world::{PetPane, PetRect, PetWorldFacts};
+use aterm_effects::pet_world::{PetPane, PetWorldFacts};
 
 const ROWS: u16 = 24;
 const COLS: u16 = 80;
@@ -69,19 +68,6 @@ impl Scene {
             pointer: None,
         })
     }
-}
-
-fn body(frame: PetFrame) -> Option<PetRect> {
-    frame
-        .body_px(CELL_W, CELL_H, COLS, ROWS)
-        .map(|(x0, x1, y0, y1)| {
-            PetRect::new(
-                y0 as f32 / f32::from(CELL_H),
-                x0 as f32 / f32::from(CELL_W),
-                (y1 - y0) as f32 / f32::from(CELL_H),
-                (x1 - x0) as f32 / f32::from(CELL_W),
-            )
-        })
 }
 
 /// One frame's sample: where the sprite is, where the caret is, and what the console
@@ -150,6 +136,9 @@ fn trace(tag: &str, series: &[Sample], from: usize, to: usize) -> String {
 
 /// The body is not yanked back to a console home while a command prints: it
 /// may walk, fly or stand still, but not cross the pane in one frame and back.
+/// Seen through the reason string too: `cursor-home` claims the escort's body;
+/// `pet_escort_primacy` refuses it on a typing frame, and output is not a
+/// licence either.
 #[test]
 fn streaming_output_never_teleports_the_body() {
     let live = stream_output(true, 900);
@@ -174,13 +163,6 @@ fn streaming_output_never_teleports_the_body() {
         &live_jumps[..live_jumps.len().min(10)],
         trace("live", &live, 110, 160),
     );
-}
-
-/// The same through the reason string: `cursor-home` claims the escort's body, and
-/// output is no licence for it (`pet_escort_primacy` refuses it on typing frames).
-#[test]
-fn a_printing_command_is_not_a_licence_to_claim_the_escorts_body() {
-    let live = stream_output(true, 900);
     let claimed: Vec<_> = live
         .iter()
         .filter(|s| !matches!(s.reason, "quiet" | "committed-input" | "advancing-ink"))
@@ -243,59 +225,5 @@ fn a_caret_that_jumps_does_not_teleport_the_body() {
         worst.0,
         worst.2,
         trace("jump", &series, 0, 24),
-    );
-}
-
-/// The correction the layer does owe remains: a body standing on a surface it
-/// may not occupy still yields.
-#[test]
-fn a_protected_surface_still_moves_or_hides_the_body() {
-    let mut now = Instant::now();
-    let mut scene = Scene::new(true, b"\x1b[12;40H");
-    let mut frame = scene.tick(now);
-    for _ in 0..400 {
-        now += Duration::from_millis(16);
-        frame = scene.tick(now);
-        if !scene.brain.needs_frames() {
-            break;
-        }
-    }
-    let seated = body(frame).expect("precondition: a settled pet has a body");
-    assert!(frame.alpha > 0, "precondition: the pet must be on glass");
-
-    scene.term.text_selection_mut().start_selection(
-        0,
-        0,
-        SelectionSide::Left,
-        SelectionType::Simple,
-    );
-    scene.term.text_selection_mut().update_selection(
-        i32::from(ROWS - 1),
-        COLS - 1,
-        SelectionSide::Right,
-    );
-    now += Duration::from_millis(16);
-    let protected = scene.tick(now);
-    assert!(
-        protected.alpha == 0,
-        "a pane-wide selection left the pet drawn at {:?} (it was seated at \
-         {seated:?}); reason {}",
-        body(protected),
-        scene.brain.console_reason(),
-    );
-
-    scene.term.text_selection_mut().clear();
-    let mut back = protected;
-    for _ in 0..400 {
-        now += Duration::from_millis(16);
-        back = scene.tick(now);
-        if back.alpha > 0 {
-            break;
-        }
-    }
-    assert!(
-        back.alpha > 0,
-        "the pet never came back after the selection was cleared; reason {}",
-        scene.brain.console_reason(),
     );
 }

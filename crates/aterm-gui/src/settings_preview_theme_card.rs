@@ -37,6 +37,9 @@ pub(crate) enum ShowcaseTier {
     Builtin,
     /// The person's own theme files that loaded, by name.
     Yours,
+    /// The community pack's themes not yet in the themes folder (Get More):
+    /// a press adds the file, then tries it.
+    Pack,
 }
 
 impl ShowcaseTier {
@@ -46,6 +49,7 @@ impl ShowcaseTier {
             Self::Signature => "SIGNATURE",
             Self::Builtin => "BUILT IN",
             Self::Yours => "YOURS",
+            Self::Pack => "COMMUNITY PACK",
         }
     }
 }
@@ -75,9 +79,21 @@ pub(crate) struct ShowcaseCard {
     pub(crate) ansi: [u32; 16],
     /// Text contrast, foreground on background.
     pub(crate) contrast: f64,
-    /// The label, id and description lowercased once, for the filter: a
-    /// keystroke in the filter matches every card without allocating.
-    search: [String; 3],
+    /// The theme's type settings in one line ("Berkeley Mono · 1.15×"),
+    /// `None` for a theme that names none.
+    pub(crate) typography: Option<String>,
+    /// The same in words for a screen reader ("sets font Berkeley Mono,
+    /// line height 1.15").
+    pub(crate) typography_spoken: Option<String>,
+    /// How many type settings the theme names.
+    pub(crate) type_keys: usize,
+    /// The theme file was written for a newer theme schema and some of its
+    /// settings were skipped.
+    pub(crate) partial: bool,
+    /// The label, id, description and type summary lowercased once, for the
+    /// filter: a keystroke in the filter matches every card without
+    /// allocating. A theme that names a font matches "font" too.
+    search: [String; 4],
 }
 
 const fn pack(color: Rgb) -> u32 {
@@ -131,7 +147,12 @@ impl ShowcaseCard {
                 label.to_lowercase(),
                 id.to_lowercase(),
                 description.to_lowercase(),
+                String::new(),
             ],
+            typography: None,
+            typography_spoken: None,
+            type_keys: 0,
+            partial: false,
             id: id.to_string(),
             slug: String::new(),
             tier,
@@ -151,6 +172,24 @@ impl ShowcaseCard {
         }
     }
 
+    /// This card with the theme's type settings (a built-in names none).
+    fn with_typography(
+        mut self,
+        typography: &aterm_types::scheme::ThemeTypography,
+        partial: bool,
+    ) -> Self {
+        self.typography = typography.summary();
+        self.typography_spoken = typography.spoken();
+        self.type_keys = typography.keys().len();
+        self.partial = partial;
+        self.search[3] = self
+            .typography
+            .as_ref()
+            .map(|summary| format!("{} font", summary.to_lowercase()))
+            .unwrap_or_default();
+        self
+    }
+
     /// `dark` or `light`.
     pub(crate) const fn appearance_word(&self) -> &'static str {
         match self.appearance {
@@ -160,14 +199,20 @@ impl ShowcaseCard {
     }
 
     /// What assistive technology and `controls` read for the card:
-    /// `<name>, dark|light, text contrast X:1`.
+    /// `<name>, dark|light, text contrast X:1`, then the type settings it
+    /// names in words (`, sets font Berkeley Mono, line height 1.15`).
     pub(crate) fn accessible_label(&self) -> String {
-        format!(
+        let mut label = format!(
             "{}, {}, text contrast {}:1",
             self.label,
             self.appearance_word(),
             contrast_figure(self.contrast)
-        )
+        );
+        if let Some(spoken) = &self.typography_spoken {
+            label.push_str(", ");
+            label.push_str(spoken);
+        }
+        label
     }
 
     /// Whether the gallery's filter `query` (lowercased, trimmed) admits the
@@ -204,6 +249,9 @@ impl ShowcaseCard {
         // rounding of its own.
         value.push_str(&format!("{} ", contrast_figure(self.contrast)));
         value.push_str(if compact { "compact" } else { "full" });
+        if self.typography.is_some() {
+            value.push_str(" type");
+        }
         value
     }
 }
@@ -254,7 +302,9 @@ pub(crate) fn contrast_figure(ratio: f64) -> String {
 /// Every theme the catalog can draw, as gallery cards, in gallery order:
 /// the signature themes (registry order), then every other built-in, Default
 /// included (registry order), then the person's own theme files that loaded,
-/// by name. Built from the parsed catalog alone: no file is read.
+/// by name, then the community pack's themes the folder has no file for
+/// (by id). Built from the parsed catalog and the embedded pack: no file is
+/// read.
 pub(crate) fn showcase_cards(themes: &crate::app_config::ThemeCatalog) -> Vec<ShowcaseCard> {
     let builtins = aterm_types::scheme::builtin_theme_list();
     let mut cards = Vec::with_capacity(builtins.len() + 8);
@@ -279,14 +329,17 @@ pub(crate) fn showcase_cards(themes: &crate::app_config::ThemeCatalog) -> Vec<Sh
         .ready_themes()
         .filter(|(id, _)| aterm_types::scheme::builtin_theme(id).is_none())
         .filter_map(|(id, meta)| {
-            let scheme = themes.resolve(id).ok()?;
-            Some(ShowcaseCard::new(
-                id,
-                ShowcaseTier::Yours,
-                &meta.display_name,
-                meta.description.as_deref(),
-                &scheme,
-            ))
+            let package = themes.resolve_package(id).ok()?;
+            Some(
+                ShowcaseCard::new(
+                    id,
+                    ShowcaseTier::Yours,
+                    &meta.display_name,
+                    meta.description.as_deref(),
+                    &package.colors,
+                )
+                .with_typography(&package.typography, !meta.skipped_keys.is_empty()),
+            )
         })
         .collect();
     yours.sort_by(|a, b| {
@@ -296,6 +349,29 @@ pub(crate) fn showcase_cards(themes: &crate::app_config::ThemeCatalog) -> Vec<Sh
             .then_with(|| a.id.cmp(&b.id))
     });
     cards.extend(yours);
+    // Then every pack theme the folder has no file for at all: a file that
+    // did not load keeps its Needs-attention row instead of a card here.
+    for theme in aterm_theme_pack::themes() {
+        if themes
+            .listing()
+            .any(|(id, _)| id.eq_ignore_ascii_case(theme.id))
+        {
+            continue;
+        }
+        let Ok(parsed) = aterm_types::scheme::parse_theme_str(theme.text) else {
+            continue;
+        };
+        cards.push(
+            ShowcaseCard::new(
+                theme.id,
+                ShowcaseTier::Pack,
+                &parsed.scheme.name,
+                parsed.description.as_deref(),
+                &parsed.scheme,
+            )
+            .with_typography(&parsed.typography, parsed.skipped_count > 0),
+        );
+    }
     // Slugs last, over the final order, so a collision's suffix is stable.
     let mut seen = std::collections::BTreeSet::new();
     for card in &mut cards {
@@ -395,6 +471,8 @@ struct TileColors {
     ansi: [u32; 16],
     contrast: f64,
     compact: bool,
+    /// The theme names type settings: the tile shows an "Aa" chip.
+    typed: bool,
 }
 
 fn parse_tile(value: &str) -> Option<TileColors> {
@@ -416,6 +494,7 @@ fn parse_tile(value: &str) -> Option<TileColors> {
     }
     let contrast = words.next()?.parse().ok()?;
     let compact = words.next()? == "compact";
+    let typed = words.next() == Some("type");
     Some(TileColors {
         fg,
         bg,
@@ -425,6 +504,7 @@ fn parse_tile(value: &str) -> Option<TileColors> {
         ansi,
         contrast,
         compact,
+        typed,
     })
 }
 
@@ -495,7 +575,36 @@ pub(crate) fn paint_card_tile(
         ContrastGrade::Low => tile.ansi[1],
     };
     let mut top = rect.y + TILE_INSET;
-    let first_line_room = right - badge_w - 6.0;
+    // A theme that names type settings carries an "Aa" chip beside the
+    // contrast badge, in the CHROME face: descriptive, not a sample of the
+    // theme's font (no font is parsed on the gallery's paint path).
+    let aa_w = if tile.typed {
+        crate::tray_raster::ui_text_width_for(TextFace::Ui, "Aa", badge_px.get()) + 10.0
+    } else {
+        0.0
+    };
+    let first_line_room = right - badge_w - 6.0 - if tile.typed { aa_w + 4.0 } else { 0.0 };
+    if tile.typed && badge_w + aa_w + 4.0 + 2.0 * TILE_INSET <= rect.width {
+        let chip = crate::native_appearance::mix_srgb(bg, unpack(tile.fg), 0.12);
+        let x = right - badge_w - 4.0 - aa_w;
+        prims.push(DrawPrim::Panel {
+            x,
+            y: top,
+            w: aa_w,
+            h: badge_h,
+            radius: badge_h / 2.0,
+            fill: rgba(chip, 255),
+        });
+        prims.push(text_prim(
+            x + 5.0,
+            crate::tray_raster::row_baseline(top, badge_h, badge_px.get()),
+            "Aa".to_string(),
+            badge_px,
+            TextWeight::Bold,
+            TextFace::Ui,
+            ink(tile.fg),
+        ));
+    }
     if badge_w + 2.0 * TILE_INSET <= rect.width {
         let chip = crate::native_appearance::mix_srgb(bg, unpack(tile.fg), 0.12);
         prims.push(DrawPrim::Panel {
@@ -684,13 +793,21 @@ mod tests {
             );
             assert!(slugs.insert(card.slug.clone()), "duplicate {}", card.slug);
         }
-        // Every built-in is in the gallery exactly once.
+        // Every built-in is in the gallery exactly once, and after them,
+        // every pack theme the folder has no file for.
         assert_eq!(
             cards
                 .iter()
-                .filter(|card| card.tier != ShowcaseTier::Yours)
+                .filter(|card| card.tier < ShowcaseTier::Yours)
                 .count(),
             aterm_types::scheme::builtin_theme_list().len()
+        );
+        assert_eq!(
+            cards
+                .iter()
+                .filter(|card| card.tier == ShowcaseTier::Pack)
+                .count(),
+            aterm_theme_pack::themes().len()
         );
     }
 

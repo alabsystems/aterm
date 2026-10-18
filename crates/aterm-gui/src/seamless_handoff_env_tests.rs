@@ -55,7 +55,8 @@ use super::tests::StagedHandoff;
 use super::tests::{ENV_LOCK, RestoreVar, pipe_pair, stage_outgoing_handoff};
 use super::*;
 use crate::handoff_env::{HANDOFF_ENV_KEYS, HandoffEnv};
-use aterm_spec::derive::{Model, native_update_successor_warm_before_claim_model};
+use aterm_models_update::native_update_successor_warm_before_claim_model;
+use aterm_spec::derive::Model;
 use aterm_spec::interp::{self, State};
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 use std::sync::PoisonError;
@@ -282,7 +283,7 @@ fn the_launched_lane_claims_into_the_snapshot_and_adopts_without_touching_the_en
             // `app_update_handoff`, "From here the successor holds copies of
             // everything"; that ordering is pinned by handoff_rendezvous's
             // `a_grant_whose_connection_closes_at_once_is_still_claimed`.)
-            let granted = peer.transfer(&staged.nonce, &sessions, ready, commit, deadline);
+            let granted = peer.transfer(&staged.nonce, &sessions, ready, commit, deadline, None);
             Ok::<_, crate::handoff_rendezvous::RendezvousError>((peer, granted))
         });
         let claimed = crate::handoff_rendezvous::claim_incoming(
@@ -1052,4 +1053,78 @@ fn the_hint_never_reaches_the_adoption_proof() {
         Some("FoldHint")
     );
     assert!(!model.check_invariant("HintNotInProof", &to));
+}
+
+/// A FORK-LANE SUCCESSOR MAKES ROOM FOR THE SESSIONS IT ADOPTS (ATERM-KI-1015-2,
+/// U9). A successor forked by a producer that never raised its soft descriptor
+/// limit — any build before round eight's park raise, started from the Dock at
+/// launchd's 256 — inherits that limit, and each session it adopts then costs
+/// three descriptors more than the master it was handed: its reader's wake pipe
+/// and its exit witness's `kqueue` (`aterm_uds::exitwatch`). Only the launched
+/// lane's claim raised the limit, so from a few dozen sessions the fork lane's
+/// successor ran out of descriptors after Commit.
+///
+/// Driven in a child of the test binary whose soft limit leaves 96 to spare —
+/// launchd's 256 in miniature — through the steps `main_entry` runs on the fork
+/// lane, in its order (the snapshot, the prearm, the descriptor limit, the
+/// intake), and then the descriptors each adopted session opens.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_fork_lane_successor_makes_room_for_the_sessions_it_adopts() {
+    /// Sessions handed over: their masters and slaves (this process is both
+    /// halves) fit the 96 spare, and their adoption does not.
+    const SESSIONS: usize = 24;
+    if !crate::control_auth::enter_low_nofile_test_child(96) {
+        return;
+    }
+    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let _restore = restore_all();
+    let staged = stage_outgoing_handoff("u9-fork-room", SESSIONS, None);
+    let (ready_read, ready_write) = owned_pipe("ready");
+    let (commit_read, commit_write) = owned_pipe("commit");
+    for key in HANDOFF_ENV_KEYS {
+        aterm_log::env::unset(key);
+    }
+    staged.publish_env(
+        ready_write.into_raw_fd(),
+        commit_read.into_raw_fd(),
+        Some(this_build()),
+    );
+    let mut env = HandoffEnv::capture();
+    let prearmed = prearm_incoming_fds_from(&mut env);
+    assert!(!prearmed.rejects_boot() && prearmed.parent_pid().is_some());
+    crate::handoff_rendezvous::settle_incoming_descriptor_limit(&env);
+    assert_eq!(
+        crate::handoff_rendezvous::park_raised_from(),
+        crate::handoff_rendezvous::launcher_soft_descriptor_limit(),
+        "a forked successor's own raise is recorded as a park's, from the launcher's limit"
+    );
+    let incoming = take_incoming_from(&mut env);
+    assert_eq!(incoming.adopted.len(), SESSIONS, "every session is adopted");
+
+    // What each adopted session opens: its reader's wake pipe and its exit
+    // witness (watching this process, which is alive).
+    let mut pipes = Vec::new();
+    let mut witnesses = Vec::new();
+    for index in 0..incoming.adopted.len() {
+        let mut fds = [0i32; 2];
+        // SAFETY: plain pipe(2) into a valid 2-slot out-array.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            panic!(
+                "adopted session {index} of {SESSIONS}: its wake pipe could not open: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        // SAFETY: pipe(2) just returned both numbers; nothing else holds them.
+        pipes.push(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) });
+        let Some(witness) = aterm_uds::exitwatch::ExitWatch::watch(std::process::id()) else {
+            panic!(
+                "adopted session {index} of {SESSIONS}: its exit witness could not open: {}",
+                std::io::Error::last_os_error()
+            );
+        };
+        witnesses.push(witness);
+    }
+    drop((pipes, witnesses, incoming, ready_read, commit_write));
+    staged.teardown();
 }

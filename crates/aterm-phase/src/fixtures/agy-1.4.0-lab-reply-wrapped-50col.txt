@@ -1,0 +1,21 @@
+# agy 1.4.0 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (50x40, aterm 0.105.0) running the real Antigravity CLI, launched by path with a scratch `HOME` whose settings name the Gemini API provider, its Google hosts black-holed, a fake `GEMINI_API_KEY` and `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:<port>` (a local stub of the Gemini API, crates/aterm-lab) · the pane at 50 columns: a reply of two paragraphs (the stub's reply.txt), the second wrapped over three rows, its last row `or 2)?`
+
+      ▄▀▀▄        Antigravity CLI 1.4.0
+     ▀▀▀▀▀▀       Gemini API key
+    ▀▀▀▀▀▀▀▀      Gemini 3.1 Pro (Low)
+   ▄▀▀    ▀▀▄     /private/tmp/at.cUoL/proj
+  ▄▀▀      ▀▀▄
+
+───────────────────────────────────────────────
+> what next
+
+  I finished the parser and the suite is green.
+
+  Two ways on from here: keep the old API, or
+  move every caller now. Which do you prefer (1
+  or 2)?
+
+──────────────────────────────────────────────────
+>
+──────────────────────────────────────────────────
+? for shortcuts               Gemini 3.1 Pro · low

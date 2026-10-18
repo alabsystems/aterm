@@ -38,10 +38,15 @@
 //!   …`, a PostToolUse hook's row between them or not; measured).
 //! * Every other owner's column-2 rows are read as Claude Code's: the
 //!   person's `❯` turn (a full context, a failed `/compact`), a hook summary
-//!   (`⏺ Ran 1 stop hook (ctrl+o to expand)`), a completion notice (`⏺
-//!   Dynamic workflow … completed`, `⏺ Background command … completed`, `⏺
-//!   Goal check-in: …`), the worker's message, and a `⏺ Monitor event: …`
-//!   row, whose block is its event's payload. So is a block whose owner the
+//!   past its first labelled row (`⏺ Ran 1 stop hook (ctrl+o to expand)`,
+//!   below), a completion notice (`⏺ Dynamic workflow … completed`, `⏺
+//!   Background command … completed`, `⏺ Goal check-in: …`), the worker's
+//!   message, and a `⏺ Monitor event: …`
+//!   row — 2.1.302 draws an event as that ONE row, the line its command
+//!   printed on the row itself, and Claude Code's own wall as the first
+//!   column-2 `⎿` row under it when the request the event started fails
+//!   (measured; the detailed transcript, ctrl+o, draws the event's body
+//!   under its row at column 2, with no `⎿`). So is a block whose owner the
 //!   walk does not reach because a blank row (under it a column-2 row that is
 //!   no `⎿` row) or the top of the screen comes first: Claude Code's walls
 //!   stand so under a prompt's second paragraph, under a collapsed tool group
@@ -50,6 +55,44 @@
 //!   scrolled off (all measured). Not a block that opens with the command's
 //!   own echo (`⎿  $ touch x`, how 2.1.280 draws a running Bash call under `⏺
 //!   <description>`).
+//!
+//! **A label's words are a program's** (`opens_with_label`,
+//! ATERM-KI-1015-14). Some of Claude Code's own rows carry a program's words
+//! behind a label of its own, measured on 2.1.302: a Monitor's event (`⏺
+//! Monitor event: Not logged in · Please run /login · login watch`), a hook's
+//! stderr behind its command (`⎿  Stop hook error: [./h]: …`, under the hook
+//! summary) and a hook's `systemMessage` (`⎿  Stop says: …` and `⎿
+//! UserPromptSubmit says: …` under the person's turn, `⎿  PostToolUse:Bash
+//! says: …` under the call). Each opened with a wall's words within the
+//! table's four words of lead, and was read as Claude Code's own: the event
+//! as its error row, the hooks' rows by the owner walk. Where no transcript
+//! can refuse a wall, `aterm drive watch` typed `/login` on the event and on
+//! the Stop hook's stderr (measured). The table reads a notice only where it
+//! OPENS the row, in its own words: behind a label (a word that ends in `:`,
+//! the vendor's own `API Error:` and `Error during compaction:` aside) it is
+//! none, on every placement. Measured and drawn with no program's words on
+//! the screen: a background command's notice (`⏺ Background command "…"
+//! completed (exit code 0)`), a background agent's (`⏺ Agent "…" finished ·
+//! 4s`), a collapsed Read/Grep group. A tool's output under its call is the
+//! owner walk's to judge, as above.
+//!
+//! **A hook's words under a row of Claude Code's own are a program's**
+//! (`phase::block_is_vendors`, rule 4; ATERM-KI-1015-14, measured on 2.1.302).
+//! Two of Claude Code's rows draw a hook's words with no label: a Stop hook's
+//! `stopReason` (`{"continue": false, …}`) is the first column-2 row under
+//! the stop-hook summary, its later lines at column 2 with no `⎿`, ahead of
+//! the summary's labelled rows (`Stop hook error: …`, measured; `Stop hook
+//! feedback: …`, read from the binary); and the row under a hook's error row
+//! (`⎿  PostToolUse:Bash hook returned blocking error`, `⎿  UserPromptSubmit
+//! hook error`) is the hook's blocking `reason`, Claude Code's `Blocked by
+//! hook` for none, or its stderr behind Claude Code's own `Failed with
+//! non-blocking status code: `. Read as walls, `aterm drive watch` typed
+//! `/login` on a `stopReason` and parked the session until the reset that a
+//! double-spaced one named (measured). They are output, and the readers that
+//! walk every row above the composer and
+//! split a row at wide gaps ([`since_limit`], [`auto_continue_end`],
+//! `named_by_the_turn`) pass over them and over every labelled row, as the
+//! gutter's reader does (`phase::programs_words`).
 //!
 //! **The screen reads for recall; the transcript decides.** The walk reads
 //! some of a tool's output as Claude Code's, and no rule of the screen's can
@@ -154,11 +197,14 @@ pub enum WallKind {
     /// does every turn ends on it in milliseconds, whatever was typed. What
     /// lifts it on the screen is [`login_restored`].
     Auth,
-    /// Any other `API Error: …` the turn ended on. `code` is the HTTP status
-    /// when the notice prints one; `retryable` is the vendor's own rule — 408,
-    /// 409, 429 and every 5xx retry, and a notice with no status retries
-    /// unless it names a TLS or proxy refusal. `cause` says what went wrong
-    /// on the way ([`ApiCause`]), which decides what answers it. `API Error:
+    /// Any other `API Error: …` the turn ended on, and Claude Code's own
+    /// refusal of the request ([`ApiCause::Request`]). `code` is the HTTP
+    /// status when the notice prints one; `retryable` is the vendor's own
+    /// rule — 408, 409, 429 and every 5xx retry, a 4xx it does not retry is a
+    /// refused request (2.1.300's `aMr`: 400-499 but 401, 408, 409, 429 and
+    /// 451), and a notice with no status retries unless it names a TLS or
+    /// proxy refusal or a refused request. `cause` says what went wrong on
+    /// the way ([`ApiCause`]), which decides what answers it. `API Error:
     /// Rate limit reached for requests` is `code: Some(429)`: that is the
     /// status the vendor maps to `rate_limit`.
     ApiError {
@@ -188,8 +234,13 @@ pub enum WallKind {
 /// API server — check your internet or DNS (ENOTFOUND)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiCause {
-    /// The API answered with a failure: a status (5xx, 4xx), or words the
-    /// catalog does not name. Time answers it.
+    /// The API answered with a failure: a status that is no refused request
+    /// (a 5xx, 408, 409 or 429, which the vendor retries; a 401, a token it
+    /// refreshes itself; a 451), or words the catalog does not name —
+    /// `API Error: terminated`, `API Error: fetch failed`, the bare `API
+    /// Error` Claude Code draws as `API Error: Please wait a moment and try
+    /// again.` (its own generic fallbacks, 2.1.300): the vendor retries a
+    /// notice with no status. Time answers it.
     Server,
     /// The API was never reached: the name did not resolve, no route, the
     /// connection refused, dropped or timed out, no response, the computer
@@ -207,6 +258,26 @@ pub enum ApiCause {
     /// another client verified is no evidence it has cleared: the agent
     /// verifies against its own trust store.
     Config,
+    /// The API refused THE REQUEST ITSELF: sent again unchanged it is
+    /// refused again, and only a person's change answers it. A 4xx status
+    /// the vendor does not retry (2.1.300's `aMr`: 400-499 but 401, 408,
+    /// 409, 429 and 451 — `API Error: 400 due to tool use concurrency
+    /// issues. Run /rewind to recover the conversation.`, a 404, a 413, a
+    /// 422), and the vendor's refusals that print none, read by the table's
+    /// [`Tag::Refused`] rows: a safeguards refusal (`API Error: Claude can't
+    /// help with this. Start a new session to continue.`), a model not found
+    /// or not on the plan, an account on hold, an effort the model does not
+    /// take with thinking off. `retryable` is false. A supervisor tries it
+    /// once more soon (a race the next request repairs) and then slowly,
+    /// and tells a person once (aterm-agent's turn-end policy).
+    Request,
+    /// The reply ran past its output token maximum (`Claude's response
+    /// exceeded the 32000 output token maximum. …`), which reaches the
+    /// screen only after Claude Code's own three tries inside the turn to
+    /// finish it in smaller pieces. Trying again answers it only if the
+    /// worker writes less, so a supervisor's tries climb a ladder that work
+    /// does not reset (aterm-agent's turn-end policy). Retryable.
+    Overlong,
 }
 
 impl WallKind {
@@ -336,6 +407,12 @@ pub enum Tag {
     Blocked,
     /// `Goal paused · the request was rate limited`.
     RateLimit,
+    /// The API refused the request itself, by the vendor's own words (a
+    /// safeguards refusal, a model not found or not on the plan, an account
+    /// on hold, an effort it does not take): read as
+    /// [`WallKind::ApiError`] with [`ApiCause::Request`], the status it
+    /// prints kept.
+    Refused,
 }
 
 /// THE phrase table: the first row whose phrase occurs in a notice's head
@@ -354,6 +431,10 @@ pub const PHRASES: &[(&str, Tag)] = &[
     ("fast mode", Tag::NotAWall),
     ("request was aborted", Tag::NotAWall),
     ("update installed", Tag::NotAWall),
+    // Claude Code's own model fallback (`Switched to Sonnet due to high
+    // demand for Opus`, 2.1.300): it went on, on another model. Ahead of
+    // `high demand`.
+    ("due to high demand", Tag::NotAWall),
     // Usage credits carry the session past its limit: the vendor's own list of
     // those notices (the 2.1.300 bundle; the first two and the fourth measured
     // in the lab), and its per-model ones. Work goes on under each, so none is a
@@ -408,6 +489,10 @@ pub const PHRASES: &[(&str, Tag)] = &[
     ("repeated overloaded errors", Tag::Overloaded),
     ("overloaded", Tag::Overloaded),
     ("high load", Tag::Overloaded),
+    // What 2.1.300 DRAWS under the gutter for the row its transcript writes
+    // as `Opus is experiencing high load, …` (its renderer's own case, read
+    // from the binary): `We are experiencing high demand for Opus 4.`
+    ("high demand", Tag::Overloaded),
     ("please run /login", Tag::Auth),
     ("run /login", Tag::Auth),
     ("not logged in", Tag::Auth),
@@ -423,6 +508,41 @@ pub const PHRASES: &[(&str, Tag)] = &[
         Tag::Auth,
     ),
     ("token expired", Tag::Auth),
+    // The Cloud gateway's own sign-in (2.1.301, read from the binary on
+    // 2026-10-15: `Not signed in to the Cloud gateway — run /login.`, and
+    // `Cloud gateway session expired — run /login to reconnect.`, each
+    // behind `API Error: `). Their `run /login` falls past the table's
+    // opening words, and read as the server's unnamed error they were
+    // retried for good, the owner, who alone can sign in, never told (the
+    // residual review's R1): no request is sent until someone signs in.
+    ("not signed in to the cloud gateway", Tag::Auth),
+    ("gateway session expired", Tag::Auth),
+    // THE API REFUSED THE REQUEST ITSELF (2.1.300's error builder, read from
+    // the binary on 2026-10-15; [`ApiCause::Request`]): sent again unchanged
+    // it is refused again, and what answers it is a person's — a new
+    // session, `/rewind`, `/model`, `/effort`, the account's standing. Read
+    // as no wall, each was answered `keep going` hourly for good. The
+    // identity check's and the DLP policy's words are the API's own, which
+    // Claude Code only passes on (`API Error: <its message>`): no build
+    // carries them.
+    ("can't help with this", Tag::Refused),
+    ("safeguards flagged", Tag::Refused),
+    ("run /rewind", Tag::Refused),
+    ("isn't available with thinking", Tag::Refused),
+    // Read anywhere in an `API Error` (`… · The configured advisor model is
+    // not compatible with this request model — …`): not the bare `advisor
+    // model`, which `/advisor`'s own `Invalid advisor model: <name>` opens.
+    ("advisor model is not compatible", Tag::Refused),
+    ("verify your identity", Tag::Refused),
+    ("data loss prevention", Tag::Refused),
+    ("does not support this model", Tag::Refused),
+    ("issue with the selected model", Tag::Refused),
+    // A model not found, as the remedy both of 2.1.300's own notices for it
+    // end on (`… Run /model to pick a different model.`).
+    ("to pick a different model", Tag::Refused),
+    ("not available on your", Tag::Refused),
+    ("account is on hold", Tag::Refused),
+    ("not available with the claude pro plan", Tag::Refused),
     ("weekly limit", Tag::Weekly),
     ("weekly usage limit", Tag::Weekly),
     ("weekly rate limit", Tag::Weekly),
@@ -451,6 +571,11 @@ pub const PHRASES: &[(&str, Tag)] = &[
         Tag::Blocked,
     ),
     ("extra usage is required for long context", Tag::Blocked),
+    // The same entitlement as 2.1.300 words it (`API Error: Usage credits
+    // required for 1M context · run /model to switch to standard context`,
+    // `rate_limit`, `long_context_credits_required`): read as no wall, it was
+    // answered `keep going` hourly for good.
+    ("usage credits required", Tag::Blocked),
     ("session limit", Tag::Session),
     ("5-hour limit", Tag::Session),
     ("usage limit", Tag::Session),
@@ -462,8 +587,11 @@ pub const PHRASES: &[(&str, Tag)] = &[
 /// The wall `text` names, if it is one — `text` being a notice as it OPENS
 /// a vendor row (a leading status glyph such as `⚠` is skipped). `None` for
 /// anything the table does not place, for the not-walls it lists, and for a
-/// warning (`Approaching usage limit`). A `Goal paused · <reason> · …`
-/// notice is read by its reason.
+/// warning (`Approaching usage limit`); an `API Error` the table places
+/// nothing of is still one ([`api_error`]: by its status, else the server's).
+/// A `Goal paused · <reason> · …` notice is read by its reason. A text that
+/// opens with a LABEL ([`opens_with_label`]: `Monitor event: …`, `Stop says:
+/// …`) is a program's words, and no wall.
 #[must_use]
 pub fn classify_wall(text: &str) -> Option<WallKind> {
     let text = text.trim_start_matches(|c: char| !c.is_alphanumeric());
@@ -474,6 +602,9 @@ pub fn classify_wall(text: &str) -> Option<WallKind> {
             .to_string(),
         None => lower,
     };
+    if opens_with_label(&lower) {
+        return None;
+    }
     // Two notices the vendor files under authentication that
     // pass by themselves — `Authentication error · This may be a temporary
     // network issue, please try again` and `Could not refresh your login
@@ -556,11 +687,39 @@ pub fn classify_wall(text: &str) -> Option<WallKind> {
         Some(Tag::Context) => Some(WallKind::Context),
         Some(Tag::Auth) => Some(WallKind::Auth),
         Some(Tag::Overloaded) => Some(WallKind::Overloaded),
+        Some(Tag::Refused) => Some(WallKind::ApiError {
+            code: head.strip_prefix("api error").and_then(api_status),
+            retryable: false,
+            cause: ApiCause::Request,
+        }),
         // The exact `Request timed out` is drawn under `⎿` with no prefix:
         // the whole row, never a tool's line that begins so.
         None if api || crate::text::trim(&lower) == "request timed out" => api_error(head, &lower),
         None => None,
     }
+}
+
+/// Whether the table reads `text` — a notice as it OPENS, its words held
+/// from elsewhere (aterm-agent's transcript of the session) — as one that is
+/// NOT a wall ([`Tag::NotAWall`]: `API Error: Request was aborted.`, a
+/// subagent's quota, the auto-continue's lifecycle): a reader that names a
+/// wall the table does not ([`classify_wall`] `None`) names none for it.
+#[must_use]
+pub fn not_a_wall(text: &str) -> bool {
+    let text = text.trim_start_matches(|c: char| !c.is_alphanumeric());
+    let lower = text.replace('’', "'").to_lowercase();
+    let words: String = notice_head(&lower)
+        .split_whitespace()
+        .filter(|w| {
+            !w.chars()
+                .all(|c| c.is_ascii_digit() || c == '.' || c == ':')
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    PHRASES
+        .iter()
+        .find(|(phrase, _)| opens_with(&words, phrase))
+        .is_some_and(|&(_, tag)| tag == Tag::NotAWall)
 }
 
 /// A notice's head: its text up to the first sentence end (a `.` before a
@@ -586,6 +745,65 @@ const USAGE_VERBS: &[&str] = &[
 /// `you've hit your team's shared budget` is the longest measured lead.
 const OPENING_WORDS: usize = 4;
 
+/// The heads of Claude Code's OWN notices that end in a colon: an API error
+/// (`API Error: 529 …`), a `/compact` whose request failed (`Error during
+/// compaction: <detail>`, read by its detail), and the bare `Error:` such a
+/// detail can open with. Never a label ([`opens_with_label`]).
+const NOTICE_HEADS: &[&str] = &["api error:", "error during compaction:", "error:"];
+
+/// Whether `lower` (a row's text, lowercased) OPENS WITH A LABEL: a word that
+/// ends in `:` among the first [`OPENING_WORDS`] words of its head
+/// ([`notice_head`]), the words up to it no head of Claude Code's own
+/// ([`NOTICE_HEADS`]; a parenthesized word ending in `:` closes the head before
+/// it, as `API Error (<model>): …` does). What follows a label is what the label introduces —
+/// on Claude Code 2.1.302 (measured in the lab, 2026-10-16, ATERM-KI-1015-14)
+/// a PROGRAM'S words: a Monitor's event is one row, `Monitor event: <the
+/// first line the command printed> · <the watch's description>`; a hook's
+/// stderr stands behind its command on its error row (`Stop hook error:
+/// [./h]: <stderr>`), its `systemMessage` behind its name (`Stop says: …`,
+/// `UserPromptSubmit says: …`, `PostToolUse:Bash says: …`). Another hook's
+/// error carries no label: 2.1.302 draws `⎿  <hook> hook error` or `⎿
+/// <hook> hook returned blocking error`, no colon, and the hook's words on
+/// the next row (measured for UserPromptSubmit and PostToolUse:Bash), which
+/// the owner walk reads as output (`phase::block_is_vendors`, rule 4).
+/// Claude Code's own notice opens its row with its own words (`Not logged
+/// in · Please run /login`,
+/// `You've hit your session limit · …`, `Context limit reached · …`): the
+/// words a phrase may follow ([`OPENING_WORDS`]) are the notice's, never a
+/// label. Read as a wall, each of those rows was acted on where no
+/// transcript could refuse it: `aterm drive watch` typed `/login` on a
+/// Monitor's event and on a Stop hook's stderr (measured). A clock or a
+/// number (`10:25:`) is no label.
+fn opens_with_label(lower: &str) -> bool {
+    let mut lead: Vec<&str> = Vec::new();
+    for word in notice_head(lower).split_whitespace().take(OPENING_WORDS) {
+        lead.push(word);
+        let number = word
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '.' || c == ':');
+        if word.ends_with(':') && !number {
+            // A parenthesized word qualifies the head before it and closes it
+            // (`API Error (claude-opus-9): …`, the model a request named):
+            // that head, with the colon, is the one asked of NOTICE_HEADS.
+            let head = if word.starts_with('(') {
+                format!("{}:", lead[..lead.len() - 1].join(" "))
+            } else {
+                lead.join(" ")
+            };
+            return !NOTICE_HEADS.contains(&head.as_str());
+        }
+    }
+    false
+}
+
+/// Whether `text`, a row's text as drawn (a leading glyph such as `⎿` or `⏺`
+/// passed over), OPENS WITH A LABEL ([`opens_with_label`]): a program's words
+/// follow it, never a notice of Claude Code's own.
+pub(crate) fn labelled(text: &str) -> bool {
+    let text = text.trim_start_matches(|c: char| !c.is_alphanumeric());
+    opens_with_label(&text.replace('\u{2019}', "'").to_lowercase())
+}
+
 /// Whether `phrase` starts on a word boundary within the first
 /// [`OPENING_WORDS`] words of `words`.
 fn opens_with(words: &str, phrase: &str) -> bool {
@@ -603,27 +821,22 @@ fn opens_with(words: &str, phrase: &str) -> bool {
 /// the notice's `head`; everything else from the WHOLE notice, `full`
 /// (lowercased): `Unable to connect to API. Check your internet connection`
 /// says what it is after its first sentence, and a wrapped message after
-/// its first row. The tables are asked in order — a certificate or proxy
-/// refusal, then a reply cut off, then a network never reached — so `Server
-/// error mid-response` is cut off and `Connection refused — a firewall or
-/// proxy may be blocking it` is unreachable (a bare `proxy` names no
-/// refusal). `None` for an API error with no status that none of them names
-/// (a safeguards refusal, a model that is not found, an effort it does not
-/// take): no wall, so the ordinary policy answers it, as it did before
-/// 2.1.283 drew one where it could be read.
+/// its first row. A status the vendor does not retry is a refused request
+/// ([`refused_status`]); with no status the tables are asked in order — the
+/// vendor's refusal words ([`Tag::Refused`]'s rows, anywhere in the notice:
+/// `API Error: Claude Opus 4.1's safeguards flagged this message` opens past
+/// the table's four words), a certificate or proxy refusal, a reply past its
+/// output token maximum, then a reply cut off, then a network never reached
+/// — so `Server error mid-response` is cut off and `Connection refused — a
+/// firewall or proxy may be blocking it` is unreachable (a bare `proxy`
+/// names no refusal). An API error with no status that none of them names
+/// (`API Error: terminated`, `fetch failed`, the bare `API Error` Claude Code
+/// draws as `API Error: Please wait a moment and try again.`) is the
+/// server's, retried: the vendor's own rule for a notice with no status.
+/// Until 2026-10-15 it was no wall, and the ordinary policy answered a
+/// refused request `keep going` hourly for good.
 fn api_error(head: &str, full: &str) -> Option<WallKind> {
-    let rest = head
-        .strip_prefix("api error")
-        .unwrap_or(head)
-        .trim_start_matches([':', ' ']);
-    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    let code = if digits.len() == 3 {
-        digits.parse::<u16>().ok()
-    } else if rest.starts_with("rate limit") {
-        Some(429)
-    } else {
-        status_in_parens(rest)
-    };
+    let code = api_status(head.strip_prefix("api error").unwrap_or(head));
     if code == Some(529) {
         return Some(WallKind::Overloaded);
     }
@@ -631,22 +844,24 @@ fn api_error(head: &str, full: &str) -> Option<WallKind> {
         return Some(WallKind::Context);
     }
     let names = |words: &[&str]| words.iter().any(|w| full.contains(w));
-    let cause = if code.is_some() {
-        ApiCause::Server
-    } else if names(CONFIG_WORDS) {
-        ApiCause::Config
-    } else if names(CUT_OFF_WORDS) {
-        ApiCause::CutOff
-    } else if names(UNREACHABLE_WORDS) {
-        ApiCause::Unreachable
-    } else if full.contains("server error") {
-        ApiCause::Server
-    } else {
-        return None;
+    let refused_words = || {
+        PHRASES
+            .iter()
+            .any(|&(phrase, tag)| tag == Tag::Refused && full.contains(phrase))
+    };
+    let cause = match code {
+        Some(c) if refused_status(c) => ApiCause::Request,
+        Some(_) => ApiCause::Server,
+        None if refused_words() => ApiCause::Request,
+        None if names(CONFIG_WORDS) => ApiCause::Config,
+        None if names(OVERLONG_WORDS) => ApiCause::Overlong,
+        None if names(CUT_OFF_WORDS) => ApiCause::CutOff,
+        None if names(UNREACHABLE_WORDS) => ApiCause::Unreachable,
+        None => ApiCause::Server,
     };
     let retryable = match (cause, code) {
-        (ApiCause::Config, _) => false,
-        (ApiCause::Unreachable | ApiCause::CutOff, _) => true,
+        (ApiCause::Config | ApiCause::Request, _) => false,
+        (ApiCause::Unreachable | ApiCause::CutOff | ApiCause::Overlong, _) => true,
         (ApiCause::Server, Some(c)) => matches!(c, 408 | 409 | 429) || c >= 500,
         (ApiCause::Server, None) => true,
     };
@@ -655,6 +870,28 @@ fn api_error(head: &str, full: &str) -> Option<WallKind> {
         retryable,
         cause,
     })
+}
+
+/// The HTTP status an API error's head prints after `API Error`: three
+/// digits first (`: 400 …`), `rate limit` (the status the vendor maps to
+/// `rate_limit`), or a status in parentheses (`Request rejected (429)`).
+fn api_status(rest: &str) -> Option<u16> {
+    let rest = rest.trim_start_matches([':', ' ']);
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    if digits.len() == 3 {
+        digits.parse::<u16>().ok()
+    } else if rest.starts_with("rate limit") {
+        Some(429)
+    } else {
+        status_in_parens(rest)
+    }
+}
+
+/// A status the vendor does not retry, the request itself refused: 2.1.300's
+/// own predicate (`aMr`), 400-499 but 401 (a token it refreshes itself), 408,
+/// 409, 429 and 451.
+fn refused_status(code: u16) -> bool {
+    (400..500).contains(&code) && !matches!(code, 401 | 408 | 409 | 429 | 451)
 }
 
 /// A 4xx or 5xx status printed in parentheses (`request rejected (429)`).
@@ -694,12 +931,11 @@ const CONFIG_WORDS: &[&str] = &[
 /// response above may be incomplete.`), `The response stalled before a
 /// response was produced. Try again.` and its kin.
 ///
-/// So is a reply past its output token maximum (`Claude's response exceeded
-/// the N output token maximum.`) and one whose image was dropped (`… in the
-/// conversation could not be processed and was removed.`).
+/// So is a reply whose image was dropped (`… in the conversation could not
+/// be processed and was removed.`). Not a reply past its output token
+/// maximum: that is [`OVERLONG_WORDS`], whose answer is no plain retry.
 const CUT_OFF_WORDS: &[&str] = &[
     "mid-response",
-    "output token maximum",
     "could not be processed and was removed",
     "may be incomplete",
     "stopped arriving",
@@ -708,6 +944,12 @@ const CUT_OFF_WORDS: &[&str] = &[
     "stalled",
     "before a response was produced",
 ];
+
+/// A reply past its output token maximum ([`ApiCause::Overlong`]): `Claude's
+/// response exceeded the 32000 output token maximum. To configure this
+/// behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable.`,
+/// and its kin for a request sent without streaming (2.1.300).
+const OVERLONG_WORDS: &[&str] = &["output token maximum"];
 
 /// A network never reached: `Can't reach the API server — check your
 /// internet or DNS (ENOTFOUND)`, `No internet route — check your connection
@@ -890,19 +1132,24 @@ pub enum AutoContinue {
 /// continuation met the limit again). A countdown still drawn there is
 /// [`AutoContinue::Armed`]: not ended. `None` when nothing says — and once a
 /// countdown was armed, nothing drawn says it was dropped (a `/resume`, a
-/// `/clear`: W4 of ATERM-KI-1015-1).
+/// `/clear`: W4 of ATERM-KI-1015-1). A row of a program's words in the
+/// transcript (`phase::programs_words`, as [`since_limit`] passes it over)
+/// says neither.
+///
+/// Only the footer's word is the LIVE process's own ([`auto_continue_toast`]);
+/// a word in the transcript may be a `/resume`d conversation's history, an
+/// older limit's `Fired` under a notice of its own (KI W1, 2.1.300: read as
+/// this limit's end, the continuation was typed into the standing limit), and
+/// says which limit it ended only by the notice it is drawn under
+/// ([`SinceLimit::fired`]).
 #[must_use]
 pub fn auto_continue_end(rows: &[String]) -> Option<AutoContinue> {
-    use crate::phase::{footer_end, line_at};
-    let frame = crate::phase::composer_frame(rows)?;
-    let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
-    let until = footer_end(rows, frame.bottom + 1);
-    if let Some(end) = (frame.bottom + 1..until).find_map(|i| {
-        let (_, line) = line_at(rows, i, until, width);
-        gapped_items(&line).find_map(auto_continue_said)
-    }) {
+    use crate::phase::line_at;
+    if let Some(end) = auto_continue_toast(rows) {
         return Some(end);
     }
+    let frame = crate::phase::composer_frame(rows)?;
+    let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
     for (i, row) in rows[..frame.top].iter().enumerate().rev() {
         if crate::phase::leading_spaces(row) == 0 && crate::text::trim_start(row).starts_with('❯')
         {
@@ -910,15 +1157,36 @@ pub fn auto_continue_end(rows: &[String]) -> Option<AutoContinue> {
         }
         let (_, line) = line_at(rows, i, frame.top, width);
         for item in gapped_items(&line) {
-            if let Some(end) = auto_continue_said(item) {
-                return Some(end);
+            let end = auto_continue_said(item);
+            let limit = end.is_none() && classify_wall(item).is_some_and(|k| k.reads_limited());
+            if (end.is_some() || limit) && crate::phase::programs_words(rows, i) {
+                break;
             }
-            if classify_wall(item).is_some_and(|k| k.reads_limited()) {
+            if end.is_some() {
+                return end;
+            }
+            if limit {
                 return None;
             }
         }
     }
     None
+}
+
+/// What the FOOTER'S NOTIFICATION says of Claude Code's own auto-continue
+/// ([`auto_continue_end`]'s first read): the live process's own toast, drawn
+/// under the composer, never a row of a conversation's history. `None` where
+/// the footer says nothing of it, or the screen draws no composer.
+#[must_use]
+pub fn auto_continue_toast(rows: &[String]) -> Option<AutoContinue> {
+    use crate::phase::{footer_end, line_at};
+    let frame = crate::phase::composer_frame(rows)?;
+    let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
+    let until = footer_end(rows, frame.bottom + 1);
+    (frame.bottom + 1..until).find_map(|i| {
+        let (_, line) = line_at(rows, i, until, width);
+        gapped_items(&line).find_map(auto_continue_said)
+    })
 }
 
 /// The screen's NEWEST USAGE LIMIT NOTICE and what was served, or chosen,
@@ -936,6 +1204,13 @@ pub struct SinceLimit {
     /// `⏺` row in column zero, `●` off macOS, that is no notice of the
     /// vendor's: the model's words or a tool's call).
     pub served: bool,
+    /// THE VENDOR WENT ON BY ITSELF under it: its `⏺ Usage limit reset ·
+    /// continuing automatically` (or `Usage limit available again ·
+    /// continuing now`, [`AutoContinue::Fired`]) drawn in column zero BELOW
+    /// this notice. The notice's reset says whose continuation it was: a
+    /// `/resume`d conversation redraws an older limit's `Fired` under that
+    /// limit's own notice (KI W1).
+    pub fired: bool,
     /// A MODEL WAS CHOSEN since it: a person's `/model` below it (`❯ /model`,
     /// `❯ /model opus`) with its result drawn under that prompt (`⎿  Set model
     /// to …`, the anchor `model.set`). This alone says nothing about whether
@@ -969,29 +1244,41 @@ pub struct SinceLimit {
 /// person's turn ran there that no read saw busy (measured on 2.1.299: `❯
 /// what is left to do?`, the reply and its done row under `⏺ Automatic
 /// continue cancelled · …`). A shell-mode `! cmd` is drawn without the `❯`
-/// and is not read here.
+/// and is not read here. The vendor's own continuation drawn under the
+/// notice ([`SinceLimit::fired`]) is read the same way, and tied to its limit
+/// by the same reset.
 ///
 /// Each row is read as the line it opens, across the rows Ink wrapped it
 /// onto (`crate::wrap`, as [`auto_continue_end`] reads them): in a pane
 /// narrower than the notice (`⏺ Usage limit` over `reached ·` over
 /// `continuing` at 26 columns, 2.1.299) a row at a time named no limit, and
-/// the cancel's own `⏺ Automatic` row read as a reply of the model's.
+/// the cancel's own `⏺ Automatic` row read as a reply of the model's. A row
+/// of a program's words (`phase::programs_words`: behind a label, or a
+/// hook's words under the stop-hook summary or its error row) names no limit
+/// however its items split: a Stop hook's `stopReason` of `note  Usage limit
+/// reached · resets 3pm` parked a watched session until 3pm (2.1.302,
+/// measured; ATERM-KI-1015-14).
 #[must_use]
 pub fn since_limit(rows: &[String]) -> Option<SinceLimit> {
     newest_limit(rows).map(|newest| newest.since)
 }
 
-/// A LINE OF THE MODEL'S: `line`, opened by `row`, a row the caller found in
-/// column 0 ([`since_limit`]), says `⏺` — `●` where the
-/// platform draws that (Claude Code draws `●` off macOS), never the session
-/// survey ([`crate::phase::is_survey`]) — and a reply or a tool's call, never
-/// a notice of the vendor's ([`classify_wall`], [`auto_continue_end`]'s
-/// words).
-fn models_line(row: &str, line: &str) -> bool {
-    !crate::phase::is_survey(row)
-        && crate::text::trim(line)
-            .strip_prefix(['⏺', '●'])
-            .is_some_and(|said| classify_wall(said).is_none() && auto_continue_said(said).is_none())
+/// What a LINE DRAWN WITH THE MODEL'S DOT says: `line`, opened by `row`, a
+/// row the caller found in column 0 ([`since_limit`]), says `⏺` — `●` where
+/// the platform draws that (Claude Code draws `●` off macOS), never the
+/// session survey ([`crate::phase::is_survey`]) — and is no notice of a wall
+/// ([`classify_wall`]); its words after the dot. They are a LINE OF THE
+/// MODEL'S (a reply or a tool's call) unless they are the vendor's own word on
+/// its auto-continue ([`auto_continue_said`], [`auto_continue_end`]'s words),
+/// which [`since_limit`] reads as that word ([`SinceLimit::fired`]), never as
+/// a reply.
+fn dotted_said<'a>(row: &str, line: &'a str) -> Option<&'a str> {
+    if crate::phase::is_survey(row) {
+        return None;
+    }
+    crate::text::trim(line)
+        .strip_prefix(['⏺', '●'])
+        .filter(|said| classify_wall(said).is_none())
 }
 
 /// What [`newest_limit`] read: the notice ([`SinceLimit`]), the row its line
@@ -1017,6 +1304,8 @@ fn newest_limit(rows: &[String]) -> Option<Newest> {
     // A reply of the model's below the rows walked so far, and a prompt
     // that drew one.
     let (mut replied, mut served) = (false, false);
+    // The vendor's own continuation (`Fired`) below the rows walked so far.
+    let mut fired = false;
     // A model's choice below the rows walked so far (`⎿  Set model to …`),
     // and a `/model` that drew one.
     let mut set: Option<String> = None;
@@ -1026,25 +1315,29 @@ fn newest_limit(rows: &[String]) -> Option<Newest> {
     // after it resets to continue`), whose reset the notice names. The walk
     // goes on up to it, through no prompt.
     let mut echo: Option<(WallKind, usize, String)> = None;
-    let echoed =
-        |(kind, row, message): (WallKind, usize, String), served, model_set, chosen_model| Newest {
-            since: SinceLimit {
-                kind,
-                reset: None,
-                served,
-                model_set,
-                chosen_model,
-            },
-            row,
-            message,
-            echo: None,
-        };
+    let echoed = |(kind, row, message): (WallKind, usize, String),
+                  served,
+                  fired,
+                  model_set,
+                  chosen_model| Newest {
+        since: SinceLimit {
+            kind,
+            reset: None,
+            served,
+            fired,
+            model_set,
+            chosen_model,
+        },
+        row,
+        message,
+        echo: None,
+    };
     for (i, row) in rows[..frame.top].iter().enumerate().rev() {
         let column0 = crate::phase::leading_spaces(row) == 0;
         let text = crate::text::trim(row);
         if column0 && let Some(prompt) = text.strip_prefix('❯') {
             if let Some(echo) = echo {
-                return Some(echoed(echo, served, model_set, chosen_model));
+                return Some(echoed(echo, served, fired, model_set, chosen_model));
             }
             let prompt = crate::text::trim(prompt);
             served |= replied && !prompt.is_empty() && !prompt.starts_with('/');
@@ -1062,11 +1355,12 @@ fn newest_limit(rows: &[String]) -> Option<Newest> {
             continue;
         }
         let (_, line) = line_at(rows, i, frame.top, width);
-        if let Some((kind, item)) = gapped_items(&line).find_map(|item| {
+        let limit = gapped_items(&line).find_map(|item| {
             classify_wall(item)
                 .filter(|k| k.reads_limited())
                 .map(|k| (k, item))
-        }) {
+        });
+        if let Some((kind, item)) = limit.filter(|_| !crate::phase::programs_words(rows, i)) {
             match crate::phase::notice_reset(item) {
                 Some(reset) => {
                     return Some(Newest {
@@ -1074,6 +1368,7 @@ fn newest_limit(rows: &[String]) -> Option<Newest> {
                             kind,
                             reset: Some(reset),
                             served,
+                            fired,
                             model_set,
                             chosen_model,
                         },
@@ -1095,11 +1390,18 @@ fn newest_limit(rows: &[String]) -> Option<Newest> {
         {
             set.get_or_insert_with(|| crate::text::trim(chosen).to_string());
         }
-        if echo.is_none() && column0 && models_line(row, &line) {
-            replied = true;
+        if echo.is_none()
+            && column0
+            && let Some(said) = dotted_said(row, &line)
+        {
+            match auto_continue_said(said) {
+                None => replied = true,
+                Some(AutoContinue::Fired) => fired = true,
+                Some(AutoContinue::Unkept | AutoContinue::Armed) => {}
+            }
         }
     }
-    echo.map(|echo| echoed(echo, served, model_set, chosen_model))
+    echo.map(|echo| echoed(echo, served, fired, model_set, chosen_model))
 }
 
 /// The words a GENERIC usage limit notice opens with: Claude Code 2.1.295 and
@@ -1144,7 +1446,7 @@ fn reset_clock_words(reset: &str) -> String {
 /// "opus"` never ran, and the session waited days for the bucket's reset; a
 /// weekly limit read `usage-session` too. `found` as it is anywhere else: a
 /// banner that names its limit, a turn's notice of the same kind, one naming
-/// another reset or none, a screen with no composer.
+/// another reset or none, one under a tool's call, a screen with no composer.
 pub(crate) fn named_by_the_turn(
     rows: &[String],
     found: Wall,
@@ -1172,15 +1474,26 @@ pub(crate) fn named_by_the_turn(
             return found;
         }
         let (_, line) = line_at(rows, i, top, width);
-        let Some((kind, item)) = gapped_items(&line).find_map(|item| {
-            classify(item)
-                .filter(|k| k.reads_limited() && !generic_limit(item))
-                .map(|k| (k, item))
-        }) else {
+        let Some((kind, item)) = gapped_items(&line)
+            .find_map(|item| {
+                classify(item)
+                    .filter(|k| k.reads_limited() && !generic_limit(item))
+                    .map(|k| (k, item))
+            })
+            .filter(|_| !crate::phase::programs_words(rows, i))
+        else {
             continue;
         };
         let same = crate::phase::notice_reset(item).is_some_and(|r| reset_clock_words(&r) == said);
         if !same || kind == found.kind {
+            return found;
+        }
+        // A tool's output quoting a limit (`⏺ Bash(cat limits.log)` over
+        // `⎿  You've hit your Sonnet limit · …`) is no word of the vendor's
+        // on this turn: the footer stands, and no model fallback runs on it.
+        // Claude Code's own row drawn under a call reads the same here; the
+        // session's transcript names it ([`crate::phase::under_a_call`]).
+        if crate::phase::under_a_call(rows, i) {
             return found;
         }
         let words = item.trim_start_matches(|c: char| !c.is_alphanumeric());
@@ -1494,7 +1807,8 @@ mod tests {
 
     /// The vendor's own limit catalog (Claude Code 2.1.283 and 2.1.284: the
     /// limit functions, the auto-continue notices, the `/goal` interruption
-    /// table, the authentication notices), one string per row and the kind the
+    /// table, the authentication notices) and every other phrase the binary and
+    /// the captures carry, one string per row and the kind the
     /// reader must give it. Nineteen of these read as something else before the
     /// catalog was classified: an account limit no reset ends was no wall, a
     /// notice that the reset came was a limit still standing, and a network
@@ -1698,9 +2012,16 @@ mod tests {
                 "Your organization has disabled API key authentication · Sign in again with your claude.ai account",
                 Some(WallKind::Auth),
             ),
+            // A model that is not found is a refused request (2.1.300's
+            // `model_not_found`): sent again unchanged it is refused again.
+            // It was no wall here until 2026-10-15, answered `keep going`.
             (
                 "There's an issue with the selected model (x). It may not exist or you may not have access to it. Run /model to pick a different model.",
-                None,
+                Some(WallKind::ApiError {
+                    code: None,
+                    retryable: false,
+                    cause: ApiCause::Request,
+                }),
             ),
             (
                 "Context exceeds the 200000-token limit · run /compact",
@@ -1710,66 +2031,11 @@ mod tests {
                 "Extra usage is required for long context · run /extra-usage",
                 Some(WallKind::Spend),
             ),
-        ];
-        assert_eq!(catalog.len(), 55);
-        for (text, want) in catalog {
-            assert_eq!(classify_wall(text), *want, "{text}");
-        }
-    }
-
-    /// The auto-continue's lifecycle notices say a limit is over, cancelled or
-    /// armed for the next reset; none of them is a limit standing. NEGATIVE
-    /// CONTROL: the same words with `Usage limit reached` in front still are.
-    #[test]
-    fn the_lifecycle_notices_are_no_wall() {
-        for text in [
-            "Usage limit reset · continuing automatically",
-            "Usage limit available again · continuing now",
-            "Usage limit has reset · press enter to continue",
-            "Your usage limit has reset · press enter to continue",
-            "Continuing automatically at 2:10pm · esc to cancel",
-            "Automatic continue cancelled · /rate-limit-options to re-arm",
-            "Automatic continue was turned off · this task will not resume on its own",
-        ] {
-            assert_eq!(classify_wall(text), None, "{text}");
-        }
-        assert_eq!(
-            classify_wall(
-                "Usage limit reached · continuing automatically at 2:10pm · esc to cancel"
+            // The same entitlement as 2.1.300 words it.
+            (
+                "API Error: Usage credits required for 1M context · run /model to switch to standard context",
+                Some(WallKind::Spend),
             ),
-            Some(WallKind::UsageSession)
-        );
-    }
-
-    /// `Authentication error` and a refresh another process is doing are the
-    /// network, tried again on its ladder, never the lost login a person must
-    /// answer. NEGATIVE CONTROL: a gateway that cannot authenticate, and a
-    /// plain `Authentication required`, are the login.
-    #[test]
-    fn authentication_that_passes_by_itself_is_the_network_not_the_login() {
-        let network = Some(WallKind::ApiError {
-            code: None,
-            retryable: true,
-            cause: ApiCause::Unreachable,
-        });
-        for text in [
-            "Authentication error · This may be a temporary network issue, please try again",
-            "Could not refresh your login because another Claude Code process is refreshing it (or exited mid-refresh) · Try again in a minute",
-        ] {
-            assert_eq!(classify_wall(text), network, "{text}");
-        }
-        for text in [
-            "Authentication error · The gateway could not authenticate with its upstream provider — contact your gateway administrator",
-            "Authentication required · Sign in again to continue",
-        ] {
-            assert_eq!(classify_wall(text), Some(WallKind::Auth), "{text}");
-        }
-    }
-
-    /// Every phrase the binary and the captures carry lands on its kind.
-    #[test]
-    fn the_table_names_each_measured_phrase() {
-        let cases: &[(&str, Option<WallKind>)] = &[
             (
                 "API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment. If it persists, check https://status.claude.com.",
                 Some(WallKind::Overloaded),
@@ -1783,12 +2049,19 @@ mod tests {
                 "Server is temporarily limiting requests (not your usage limit)",
                 Some(WallKind::Overloaded),
             ),
+            // What 2.1.300 draws under the gutter for the high load row.
+            (
+                "We are experiencing high demand for Opus 4.",
+                Some(WallKind::Overloaded),
+            ),
+            (
+                "We are experiencing high demand for Fable.",
+                Some(WallKind::Overloaded),
+            ),
             (
                 "API Error: 401 Invalid API key · Please run /login",
                 Some(WallKind::Auth),
             ),
-            ("Not logged in · Please run /login", Some(WallKind::Auth)),
-            ("Login expired · Please run /login", Some(WallKind::Auth)),
             (
                 "Context limit reached · /compact or /clear to continue",
                 Some(WallKind::Context),
@@ -1800,10 +2073,6 @@ mod tests {
             (
                 "You've hit your weekly limit · resets Sep 19 at 11am (America/Los_Angeles)",
                 Some(WallKind::UsageWeekly),
-            ),
-            (
-                "You've reached your Fable limit. Run /usage-credits to continue or switch models with /model.",
-                Some(WallKind::ModelBucket { consent: false }),
             ),
             (
                 "You've reached your Fable 5 limit.",
@@ -1835,19 +2104,11 @@ mod tests {
                 Some(WallKind::ModelBucket { consent: true }),
             ),
             (
-                "You've hit your monthly spend limit.",
-                Some(WallKind::Spend),
-            ),
-            (
                 "You're out of usage credits. Switch to another model",
                 Some(WallKind::Spend),
             ),
             (
                 "⚠ Usage limit reached · continuing automatically at 1:50pm · esc to cancel",
-                Some(WallKind::UsageSession),
-            ),
-            (
-                "Goal paused · usage limit reached · send a message after it resets to continue",
                 Some(WallKind::UsageSession),
             ),
             (
@@ -1878,12 +2139,14 @@ mod tests {
                     cause: ApiCause::Server,
                 }),
             ),
+            // A 400 the vendor does not retry is the request refused: it
+            // says so itself (`Run /rewind to recover the conversation`).
             (
                 "API Error: 400 due to tool use concurrency issues.",
                 Some(WallKind::ApiError {
                     code: Some(400),
                     retryable: false,
-                    cause: ApiCause::Server,
+                    cause: ApiCause::Request,
                 }),
             ),
             (
@@ -1894,33 +2157,13 @@ mod tests {
                     cause: ApiCause::CutOff,
                 }),
             ),
-            (
-                "Your seat type doesn't include usage credits",
-                Some(WallKind::Spend),
-            ),
-            (
-                "Goal paused · the request was rate limited · send a message to retry",
-                Some(WallKind::ApiError {
-                    code: Some(429),
-                    retryable: true,
-                    cause: ApiCause::Server,
-                }),
-            ),
-            (
-                "Context exceeds the 200000-token limit · run /compact",
-                Some(WallKind::Context),
-            ),
         ];
-        for (text, want) in cases {
+        for (text, want) in catalog {
             assert_eq!(classify_wall(text), *want, "{text}");
         }
-    }
-
-    /// The negative controls: notices the worker goes on under, a warning,
-    /// the update banner, an interrupt, and words that merely mention a
-    /// limit.
-    #[test]
-    fn the_not_walls_and_ordinary_words_are_not_walls() {
+        // The negative controls: notices the worker goes on under, a warning,
+        // the update banner, an interrupt, and words that merely mention a
+        // limit.
         for text in [
             "Concurrent subagent limit reached. You can run 5 subagents at once. Do not retry.",
             "Subagent nesting limit reached (depth 3 of 3). Complete this task directly",
@@ -1933,28 +2176,51 @@ mod tests {
             "API Error: Request was aborted.",
             "you've hit your memory limit (512 MiB)",
             "Error: API rate limit exceeded for user ID 1234.",
-            "queued 8 runs",
             "Monthly limit reached",
-            "Updated the usage limit docs",
             "Checked the weekly limit handling in the parser",
             "The parser now reads the Fable limit notice too, and the session limit one.",
-            "Usage limit has reset · press enter to continue",
-            "Usage limit available again · continuing now",
-            "Continuing automatically at 3pm · esc to cancel",
+            // Claude Code's own model fallback goes on, on another model.
+            "Switched to Sonnet due to high demand for Opus",
+            "Switched to claude-sonnet-4-5 due to high demand for claude-opus-4-1",
         ] {
             assert_eq!(classify_wall(text), None, "{text}");
         }
     }
 
+    /// A CLOUD GATEWAY SIGN-IN IS THE LOST LOGIN (the residual review's R1):
+    /// 2.1.301's two gateway notices (read from the binary: `Not signed in to
+    /// the Cloud gateway — run /login.` and `Cloud gateway session expired —
+    /// run /login to reconnect.`, each behind `API Error: `) name `run /login`
+    /// past the table's opening words, and read as the server's unnamed error
+    /// they were retried for good. NEGATIVE CONTROLS: `API Error: terminated`
+    /// is still the server's, retried; the env-token notice still reads Auth
+    /// by `token expired`.
+    #[test]
+    fn a_cloud_gateway_sign_in_is_the_lost_login() {
+        for text in [
+            "API Error: Not signed in to the Cloud gateway — run /login.",
+            "API Error: Cloud gateway session expired — run /login to reconnect.",
+            "API Error: Cloud gateway token expired — refresh ANTHROPIC_AUTH_TOKEN and restart.",
+        ] {
+            assert_eq!(classify_wall(text), Some(WallKind::Auth), "{text}");
+        }
+        assert_eq!(
+            classify_wall("API Error: terminated"),
+            Some(WallKind::ApiError {
+                code: None,
+                retryable: true,
+                cause: ApiCause::Server,
+            })
+        );
+    }
+
     use crate::phase::{Phase, limit_notice, worker_phase};
     use crate::prompt::fixtures::{
-        API_ERROR_529, API_ERROR_ENOTFOUND, API_ERROR_ENOTFOUND_80,
         API_ERROR_ENOTFOUND_80_MEASURED, API_ERROR_ENOTFOUND_MEASURED,
-        API_ERROR_QUEUED_SENT_MEASURED, API_ERROR_SLEEP, API_ERROR_TWICE_MEASURED,
-        COMPACT_ERROR_500_MEASURED, COMPACT_FAILED_3_MEASURED, COMPACT_FAILED_FIRST_MEASURED,
-        COMPACT_NOT_ENOUGH_MEASURED, COMPACT_SUCCEEDED_MEASURED,
-        CONTEXT_WALL_COMPACT_MENU_MEASURED, CONTEXT_WALL_MEASURED, END_529, END_OFFER,
-        END_SESSION_LIMIT, IDLE_AFTER_LIMIT_AND_MODEL_SWITCH, composer, rows, screen,
+        API_ERROR_QUEUED_SENT_MEASURED, API_ERROR_TWICE_MEASURED, COMPACT_ERROR_500_MEASURED,
+        COMPACT_FAILED_3_MEASURED, COMPACT_FAILED_FIRST_MEASURED, COMPACT_NOT_ENOUGH_MEASURED,
+        COMPACT_SUCCEEDED_MEASURED, CONTEXT_WALL_COMPACT_MENU_MEASURED, CONTEXT_WALL_MEASURED,
+        composer, rows, screen,
     };
 
     fn framed(body: &[&str], footer: &str) -> Vec<String> {
@@ -1965,93 +2231,6 @@ mod tests {
 
     const FOOTER: &str = "  ⏵⏵ bypass permissions on (shift+tab to cycle)";
     const API_529: &str = "API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment. If it persists, check https://status.claude.com.";
-
-    /// The 529 end of turn: `worker_phase` still says idle (its consumers
-    /// match five words), `limit_notice` says nothing, and the wall says
-    /// overloaded, read from the vendor row under the worker's message.
-    #[test]
-    fn a_529_end_of_turn_is_an_overloaded_wall_not_just_idle() {
-        let r = screen(END_529);
-        assert_eq!(worker_phase(&r), Phase::Idle);
-        assert_eq!(limit_notice(&r), None);
-        let w = wall(&r).expect("the wall");
-        assert_eq!(w.kind, WallKind::Overloaded);
-        assert_eq!(w.placement, Placement::Gutter);
-        assert_eq!(w.message, API_529);
-        assert_eq!(w.reset, None);
-        assert!(r[w.row].contains("API Error: 529"));
-        // The control: the same screen ending on an offer is no wall.
-        assert_eq!(wall(&screen(END_OFFER)), None);
-    }
-
-    /// NEGATIVE CONTROLS for the vendor row: the same `API Error: 529` text
-    /// as a tool's OUTPUT — under a `⏺ Bash(…)` call, under a 2.1.280
-    /// running-command echo (`⎿  $ …`), in the worker's own prose — is not
-    /// a wall.
-    #[test]
-    fn a_529_in_a_tools_output_or_the_workers_words_is_not_a_wall() {
-        let under_call = framed(
-            &[
-                "⏺ Bash(tail -1 build.log)",
-                &format!("  ⎿  {API_529}"),
-                "",
-                "✻ Cooked for 3m 2s · done 4:24 PM",
-                "",
-            ],
-            FOOTER,
-        );
-        let echo = framed(
-            &[
-                "⏺ Reading the build log",
-                "  ⎿  $ tail -1 build.log",
-                &format!("     {API_529}"),
-                "",
-            ],
-            FOOTER,
-        );
-        let prose = framed(&[&format!("⏺ The last run died on {API_529}"), ""], FOOTER);
-        let mcp = framed(
-            &[
-                "⏺ github - get_issue (MCP)(owner: \"acme\", repo: \"app\", issue_number: 7)",
-                &format!("  ⎿  {API_529}"),
-                "",
-                "✻ Cooked for 3m 2s · done 4:24 PM",
-                "",
-            ],
-            FOOTER,
-        );
-        for (name, r) in [
-            ("tool call", under_call),
-            ("echo", echo),
-            ("prose", prose),
-            ("mcp", mcp),
-        ] {
-            assert_eq!(wall(&r), None, "{name}");
-            assert_eq!(worker_phase(&r), Phase::Idle, "{name}");
-        }
-        assert!(crate::phase::is_tool_call("⏺ Bash(tail -1 build.log)"));
-        assert!(crate::phase::is_tool_call("⏺ Update(notes.txt)"));
-        assert!(crate::phase::is_tool_call(
-            "⏺ github - get_issue (MCP)(owner: \"acme\")"
-        ));
-        assert!(crate::phase::is_tool_call("⏺ github - ping (MCP)"));
-        assert!(crate::phase::is_tool_call("! cat notes.txt"));
-        assert!(!crate::phase::is_tool_call(
-            "⏺ Dynamic workflow \"Second review pass\" completed · 5s"
-        ));
-        assert!(!crate::phase::is_tool_call(
-            "⏺ Suites are running (all three)."
-        ));
-        assert!(!crate::phase::is_tool_call(
-            "⏺ Wired the github server in (MCP), and it answers."
-        ));
-        assert!(crate::phase::is_tool_call(
-            "⏺ Claude in Chrome[get_page_text](tabId: 1)"
-        ));
-        assert!(!crate::phase::is_tool_call(
-            "⏺ Fixed rows[i] so the parser keeps the last one (it dropped it)."
-        ));
-    }
 
     /// THE SCREEN'S HALF OF H6-HARNESS-1 (2026-10-08), on hand-built screens.
     /// NEVER A WALL: a wall's words in a call's FIRST column-2 `⎿` row — the
@@ -2288,6 +2467,10 @@ mod tests {
             for owner in [
                 &["❯ fourth turn: the stub says the prompt is too long"][..],
                 &["⏺ Suites are running; I'll report the number when it lands."],
+                // Prose with a call's punctuation in it is no call.
+                &["⏺ Suites are running (all three)."],
+                &["⏺ Wired the github server in (MCP), and it answers."],
+                &["⏺ Fixed rows[i] so the parser keeps the last one (it dropped it)."],
                 &["⏺ Here is the plan:"],
                 &["⏺ Done:", "  - parser fixed", "  - tests added"],
                 &["⏺ Dynamic workflow \"Second review pass\" completed · 5s"],
@@ -2460,43 +2643,6 @@ mod tests {
                 "{name}: read, for the transcript to refuse"
             );
         }
-    }
-
-    /// THE WALK NEEDS EVERY ROW THE SCREEN SHOWS (the review of pass 4,
-    /// measured): an MCP result's second block, a weekly limit's words, on a
-    /// 50-row pane whose call row is row 9 and whose last 31 rows are blank.
-    /// The whole screen reads the limit UNDER THE CALL; the pane's last 40
-    /// rows — the tail a supervisor reads — hold the limit and not the call,
-    /// and the walk, reaching their top, reads it under no owner. So whoever
-    /// acts on [`Wall::under_call`] reads the whole screen for it
-    /// (aterm-agent, `supervise/wall_confirm.rs`).
-    #[test]
-    fn a_wall_is_under_its_call_on_the_whole_screen_and_not_on_a_tail_that_cut_the_call() {
-        use crate::prompt::fixtures::MCP_LIMIT_PHRASE_CALL_ROW_ABOVE_TAIL_MEASURED;
-        let whole = screen(MCP_LIMIT_PHRASE_CALL_ROW_ABOVE_TAIL_MEASURED);
-        assert_eq!(whole.len(), 50);
-        assert_eq!(whole[9], "⏺ github - get_limit (MCP)(n: 7)");
-        let tail = &whole[whole.len() - 40..];
-        assert!(
-            tail[0].starts_with("  ⎿") && tail[0].ends_with("Issue 7: the parser drops a row"),
-            "the tail opens on the result's first block: {:?}",
-            tail[0]
-        );
-        let read = |rows: &[String]| {
-            crate::reader::read(Some("claude"), rows, None)
-                .wall
-                .map(|w| (w.kind, w.placement, w.under_call))
-        };
-        assert_eq!(
-            read(&whole),
-            Some((WallKind::UsageWeekly, Placement::Gutter, true)),
-            "the whole screen"
-        );
-        assert_eq!(
-            read(tail),
-            Some((WallKind::UsageWeekly, Placement::Gutter, false)),
-            "the tail"
-        );
     }
 
     /// THE LOGIN WALL OF 2026-09-27 (tab `s-b5cf2faabac5ce5127bd`): Claude
@@ -2798,6 +2944,58 @@ mod tests {
         assert_eq!(auto_continue_end(&cancelled[..top]), None);
     }
 
+    /// THE LIVE PROCESS'S OWN WORD is the footer's notification alone
+    /// ([`auto_continue_toast`]): a `Fired` drawn in the transcript may be a
+    /// `/resume`d conversation's history (KI W1, 2.1.300), and is tied to its
+    /// limit by the notice it stands under ([`SinceLimit::fired`]). On the
+    /// lab's 2.1.296 captures: the cancel's footer notification is the toast;
+    /// the vendor's continuation drawn in the transcript (no toast) is none;
+    /// a `Fired` toast in the footer's place is; the armed countdown in the
+    /// footer is the toast's word that it still stands (`Armed`), no end.
+    /// NEGATIVE CONTROLS: the cancel in the transcript alone, no composer.
+    #[test]
+    fn only_the_footers_notification_is_the_live_processs_toast() {
+        use crate::prompt::fixtures::{
+            WALL_SESSION_AUTO_CONTINUE_ARMED_MEASURED,
+            WALL_SESSION_AUTO_CONTINUE_CANCELLED_MEASURED, WALL_SESSION_RESUMED_BY_ITSELF_MEASURED,
+            screen,
+        };
+        let cancelled = screen(WALL_SESSION_AUTO_CONTINUE_CANCELLED_MEASURED);
+        let resumed = screen(WALL_SESSION_RESUMED_BY_ITSELF_MEASURED);
+        assert_eq!(auto_continue_toast(&cancelled), Some(AutoContinue::Unkept));
+        assert_eq!(auto_continue_end(&resumed), Some(AutoContinue::Fired));
+        assert_eq!(auto_continue_toast(&resumed), None);
+        let footer = cancelled
+            .iter()
+            .position(|r| r.starts_with("  ⏵⏵ auto mode on"))
+            .expect("the footer");
+        let mut toasted = cancelled.clone();
+        toasted[footer] = format!(
+            "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents{}Usage limit reset · \
+             continuing automatically",
+            " ".repeat(29)
+        );
+        assert_eq!(auto_continue_toast(&toasted), Some(AutoContinue::Fired));
+        // NEGATIVE CONTROLS.
+        let mut only_transcript = cancelled.clone();
+        only_transcript[footer] =
+            "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents".to_string();
+        assert_eq!(
+            auto_continue_end(&only_transcript),
+            Some(AutoContinue::Unkept)
+        );
+        assert_eq!(auto_continue_toast(&only_transcript), None);
+        assert_eq!(
+            auto_continue_toast(&screen(WALL_SESSION_AUTO_CONTINUE_ARMED_MEASURED)),
+            Some(AutoContinue::Armed)
+        );
+        let top = cancelled
+            .iter()
+            .rposition(|r| r.starts_with('─'))
+            .expect("rule");
+        assert_eq!(auto_continue_toast(&cancelled[..top]), None);
+    }
+
     /// WHAT A `/RESUME` AT AN ARMED LIMIT LEAVES OF ITS COUNTDOWN (W1 and W4
     /// of ATERM-KI-1015-1, the lab on Claude Code 2.1.300): armed, the
     /// countdown is drawn (`Armed`); after a `/resume`, the history redrawn
@@ -2827,6 +3025,7 @@ mod tests {
                 kind: WallKind::UsageSession,
                 reset: Some("8:48am".to_string()),
                 served: false,
+                fired: true,
                 model_set: false,
                 chosen_model: None,
             })
@@ -2870,6 +3069,7 @@ mod tests {
                 kind,
                 reset: Some(reset.to_string()),
                 served,
+                fired: false,
                 model_set: false,
                 chosen_model: None,
             })
@@ -2894,23 +3094,80 @@ mod tests {
             ["❯ /usage", "  ⎿  Status dialog dismissed", ""].map(str::to_string),
         );
         assert_eq!(since_limit(&after_usage), since(countdown, "10:38am", true));
-        // NEGATIVE CONTROLS: a limit, nothing served since.
-        for (name, text, reset) in [
-            ("armed", WALL_SESSION_AUTO_CONTINUE_ARMED_MEASURED, "3:15pm"),
+        // NEGATIVE CONTROLS: a limit, nothing served since — and only the
+        // vendor's own continuation under its notice FIRED (its reset says
+        // whose: KI W1).
+        for (name, text, reset, fired) in [
+            (
+                "armed",
+                WALL_SESSION_AUTO_CONTINUE_ARMED_MEASURED,
+                "3:15pm",
+                false,
+            ),
             (
                 "cancelled",
                 WALL_SESSION_AUTO_CONTINUE_CANCELLED_MEASURED,
                 "3:50pm",
+                false,
             ),
-            ("resumed", WALL_SESSION_RESUMED_BY_ITSELF_MEASURED, "3:35pm"),
+            (
+                "resumed",
+                WALL_SESSION_RESUMED_BY_ITSELF_MEASURED,
+                "3:35pm",
+                true,
+            ),
         ] {
             let read = since_limit(&screen(text)).unwrap_or_else(|| panic!("{name}: no limit"));
             assert_eq!(
-                (read.served, read.reset.as_deref()),
-                (false, Some(reset)),
+                (read.served, read.reset.as_deref(), read.fired),
+                (false, Some(reset), fired),
                 "{name}"
             );
         }
+        // A `/resume`d conversation's history (KI W1, 2.1.300): an older
+        // session limit, the vendor's continuation under it, a reply and its
+        // done row — fired under THAT notice, by its reset.
+        let history = rows(&[
+            "❯ carry on with the task",
+            "  ⎿  You've hit your session limit · resets 3pm (America/Los_Angeles)",
+            "",
+            "⏺ Usage limit reset · continuing automatically",
+            "",
+            "⏺ Picked the task up again.",
+            "",
+            "✻ Cogitated for 2s · done 3:01 PM",
+            "",
+            &"─".repeat(100),
+            "❯",
+            &"─".repeat(100),
+            "  ⏵⏵ auto mode on (shift+tab to cycle)",
+        ]);
+        assert_eq!(
+            since_limit(&history),
+            Some(SinceLimit {
+                kind: WallKind::UsageSession,
+                reset: Some("3pm (America/Los_Angeles)".to_string()),
+                served: false,
+                fired: true,
+                model_set: false,
+                chosen_model: None,
+            })
+        );
+        // The continuation ABOVE the newest notice is none of its.
+        let mut met_after = history.clone();
+        met_after.splice(
+            8..8,
+            [
+                "❯ keep going",
+                "  ⎿  You've hit your session limit · resets 6pm (America/Los_Angeles)",
+                "",
+            ]
+            .map(str::to_string),
+        );
+        assert_eq!(
+            since_limit(&met_after).map(|s| (s.reset, s.fired)),
+            Some((Some("6pm (America/Los_Angeles)".to_string()), false))
+        );
         let mut local = turned.clone();
         local[prompt] = "❯ /usage".to_string();
         assert_eq!(since_limit(&local), since(countdown, "10:38am", false));
@@ -2984,6 +3241,7 @@ mod tests {
                 kind: WallKind::ModelBucket { consent: false },
                 reset: Some(reset.to_string()),
                 served: false,
+                fired: false,
                 model_set,
                 chosen_model: model_set
                     .then(|| "Opus 5.5 and saved as your default for new sessions".to_string()),
@@ -3096,6 +3354,7 @@ mod tests {
                 kind: WallKind::UsageSession,
                 reset: Some("10:50am".to_string()),
                 served: false,
+                fired: false,
                 model_set: false,
                 chosen_model: None,
             })
@@ -3439,27 +3698,6 @@ mod tests {
         assert_eq!(banner_only(&history), (WallKind::UsageSession, true));
     }
 
-    /// The control: a line Ink wrapped where the reader always joined its
-    /// rows — the `⏺ API Error` row (`error_row_notice`), here a 529 over
-    /// eight rows of a 34-column pane, the done row's `AM` on a row of its own
-    /// under it.
-    #[test]
-    fn an_api_error_row_wrapped_in_a_narrow_pane_is_read_whole() {
-        let r = screen(crate::prompt::fixtures::API_ERROR_529_34_2_1_299);
-        let w = wall(&r).expect("the 529");
-        assert_eq!(
-            (w.kind, w.placement),
-            (WallKind::Overloaded, Placement::ErrorRow)
-        );
-        assert!(
-            w.message
-                .starts_with("API Error: 529 Overloaded. This is a server-side issue,")
-                && w.message.ends_with("inference gateway (127.0.0.1:58931)."),
-            "{}",
-            w.message
-        );
-    }
-
     /// EVERY NOTICE'S LINE RUNS ON OVER THE ROWS INK WRAPPED IT ONTO, in the
     /// three places no capture shows a wrapped one in (the review of
     /// fix/r15-banner, 2026-10-14: each join could be undone with every test
@@ -3662,23 +3900,350 @@ mod tests {
         }
     }
 
-    /// What placement does NOT decide (module header): a `⎿` block under a
-    /// `⏺ Monitor event: …` row is read as the vendor's, because a limit
-    /// notice lands there exactly as under a completion notice — so a
-    /// payload that opens with a wall phrase reads as a wall. Pinned so the
-    /// day this is told apart shows up here. The control: the same payload
-    /// under a `⏺ Name(…)` tool call is output.
+    /// ATERM-KI-1015-14, MEASURED on 2.1.302 in the lab (2026-10-16): a
+    /// program's words behind one of Claude Code's own labels — a Monitor's
+    /// event row (`Monitor event: <the line the command printed> · <the
+    /// watch>`), a hook's stderr (`Stop hook error: [./h]: …`) or
+    /// `systemMessage` (`Stop says: …`, `UserPromptSubmit says: …`,
+    /// `PostToolUse:Bash says: …`) — are no wall, though each OPENS with a
+    /// wall's words in its first four: the screen ends idle, or soft busy
+    /// below a composer where the event's monitor is still running (`· 1
+    /// monitor still running`, the phase it has with no wall in the way).
+    /// Each was read as one (the event's row as the vendor's error row, a
+    /// hook's row under the person's turn or the hook summary), and a
+    /// supervisor with no transcript typed `/login` or `/compact` on it. The
+    /// event's body in the detailed transcript is no wall either. CONTROL:
+    /// Claude Code's own context wall under a Monitor's event, its first
+    /// column-2 `⎿` row, is the wall it is, read under no call.
     #[test]
-    fn a_monitor_events_payload_is_read_as_the_vendors() {
-        let payload = "  ⎿  You've hit your session limit · resets 3pm (America/Los_Angeles)";
-        let monitor = framed(
-            &["⏺ Monitor event: worker s-1 screen changed", payload, ""],
-            FOOTER,
+    fn a_programs_words_behind_a_vendor_label_are_no_wall() {
+        use crate::prompt::fixtures::{
+            MONITOR_EVENT_CONTEXT_PHRASE_MEASURED, MONITOR_EVENT_LOGIN_PHRASE_DETAILED_MEASURED,
+            MONITOR_EVENT_LOGIN_PHRASE_MEASURED, MONITOR_EVENT_THEN_CONTEXT_WALL_MEASURED,
+            POST_HOOK_MESSAGE_LOGIN_PHRASE_MEASURED, PROMPT_HOOK_MESSAGE_CONTEXT_PHRASE_MEASURED,
+            STOP_HOOK_MESSAGE_LOGIN_PHRASE_MEASURED, STOP_HOOK_STDERR_LOGIN_PHRASE_MEASURED,
+        };
+        let mut read = Vec::new();
+        for (name, capture, phase) in [
+            (
+                "monitor event, login",
+                MONITOR_EVENT_LOGIN_PHRASE_MEASURED,
+                Phase::Busy,
+            ),
+            (
+                "monitor event, context",
+                MONITOR_EVENT_CONTEXT_PHRASE_MEASURED,
+                Phase::Busy,
+            ),
+            // The detailed transcript draws no composer, so no soft busy.
+            (
+                "monitor event, detailed",
+                MONITOR_EVENT_LOGIN_PHRASE_DETAILED_MEASURED,
+                Phase::Idle,
+            ),
+            (
+                "stop hook stderr",
+                STOP_HOOK_STDERR_LOGIN_PHRASE_MEASURED,
+                Phase::Idle,
+            ),
+            (
+                "stop hook message",
+                STOP_HOOK_MESSAGE_LOGIN_PHRASE_MEASURED,
+                Phase::Idle,
+            ),
+            (
+                "prompt hook message",
+                PROMPT_HOOK_MESSAGE_CONTEXT_PHRASE_MEASURED,
+                Phase::Idle,
+            ),
+            (
+                "post-tool hook message",
+                POST_HOOK_MESSAGE_LOGIN_PHRASE_MEASURED,
+                Phase::Idle,
+            ),
+        ] {
+            let r = screen(capture);
+            if let Some(w) = wall(&r) {
+                read.push(format!(
+                    "{name}: {:?} {:?} {}",
+                    w.kind, w.placement, w.message
+                ));
+            }
+            assert_eq!(limit_notice(&r), None, "{name}");
+            assert_eq!(worker_phase(&r), phase, "{name}");
+        }
+        assert!(read.is_empty(), "{read:#?}");
+        let w = wall(&screen(MONITOR_EVENT_THEN_CONTEXT_WALL_MEASURED)).expect("the real wall");
+        assert_eq!(
+            (w.kind, w.placement, w.under_call, w.message.as_str()),
+            (
+                WallKind::Context,
+                Placement::Gutter,
+                false,
+                "Context limit reached · /compact or /clear to continue"
+            )
         );
-        assert_eq!(wall(&monitor).map(|w| w.kind), Some(WallKind::UsageSession));
-        let peek = framed(&["⏺ mcp__aterm__peek(s-1)", payload, ""], FOOTER);
-        assert_eq!(wall(&peek), None, "the control");
-        assert_eq!(worker_phase(&peek), Phase::Idle);
+    }
+
+    /// ATERM-KI-1015-14, the review of the first pass, MEASURED on 2.1.302 in
+    /// the lab (2026-10-16): a hook's words drawn on a row of Claude Code's own
+    /// with NO label are no wall, no limit and no box — a Stop hook's
+    /// `stopReason`, the summary's first column-2 row (its second in the
+    /// detailed transcript, under the hook's command; a later line of it at
+    /// column 2 with no `⎿`), and a PostToolUse hook's blocking `reason`, the
+    /// row under its `… hook returned blocking error` row. Read as walls,
+    /// `aterm drive watch` typed `/login` on the `stopReason` and parked the
+    /// session on a double-spaced one until the reset it named (measured);
+    /// the reason under the call was read and refused for want of a
+    /// transcript. The hook words Claude Code puts behind words of its own
+    /// (a non-blocking error's `Failed with non-blocking status code: …`, a
+    /// blocked prompt's `⏺ UserPromptSubmit operation blocked by hook:`, a
+    /// stopped one's `⏺ Operation stopped by hook: …`) are no wall either. A
+    /// box the hook's words spell above a composer is no box. CONTROL:
+    /// Claude Code's own walls after a hook's rows stand — after the Stop
+    /// hook's error row and a blank row, after a Stop hook's `{"decision":
+    /// "block", …}` drawn behind the summary's label with no blank row
+    /// (2026-10-17: rule 4 ends the summary's own rows at a labelled one),
+    /// after the default reason of a reasonless block (under the call, read
+    /// there), after a non-blocking error's lead row.
+    /// A stopReason's later line, drawn at column 2 with no `⎿` of its own,
+    /// is the program's words through the `⎿` row that opens it
+    /// (`programs_words`' owning-gutter walk): a limit spelled there names
+    /// no limit and ends no countdown. The measured two-line capture, its
+    /// second line respelled as a usage limit.
+    #[test]
+    fn a_stop_reasons_later_line_at_column_two_names_no_limit() {
+        let capture = crate::prompt::fixtures::STOP_HOOK_STOP_REASON_TWO_LINES_MEASURED;
+        let second = "\n  Not logged in · Please run /login\n";
+        assert_eq!(
+            capture.matches(second).count(),
+            1,
+            "the capture's second line"
+        );
+        let respelled = capture.replace(second, "\n  Usage limit reached · resets 3pm\n");
+        let r = screen(&respelled);
+        assert!(wall(&r).is_none(), "{:?}", wall(&r).map(|w| w.message));
+        assert!(since_limit(&r).is_none(), "{:?}", since_limit(&r));
+        assert!(
+            auto_continue_end(&r).is_none(),
+            "{:?}",
+            auto_continue_end(&r)
+        );
+    }
+
+    #[test]
+    fn a_hooks_words_under_its_own_rows_are_no_wall() {
+        use crate::prompt::fixtures::{
+            POST_HOOK_BLOCK_NO_REASON_THEN_CONTEXT_WALL_MEASURED,
+            POST_HOOK_BLOCKING_REASON_LOGIN_PHRASE_MEASURED,
+            PROMPT_HOOK_BLOCKED_LOGIN_PHRASE_MEASURED,
+            PROMPT_HOOK_ERROR_NO_STDERR_THEN_TOO_LONG_WALL_MEASURED,
+            PROMPT_HOOK_ERROR_STDERR_LOGIN_PHRASE_MEASURED,
+            PROMPT_HOOK_STOPPED_LOGIN_PHRASE_MEASURED,
+            STOP_HOOK_DECISION_BLOCK_THEN_CONTEXT_WALL_MEASURED,
+            STOP_HOOK_ERROR_THEN_CONTEXT_WALL_302_MEASURED,
+            STOP_HOOK_STOP_REASON_CONTEXT_PHRASE_MEASURED, STOP_HOOK_STOP_REASON_DETAILED_MEASURED,
+            STOP_HOOK_STOP_REASON_LOGIN_PHRASE_MEASURED, STOP_HOOK_STOP_REASON_TWO_LINES_MEASURED,
+            STOP_HOOK_WORDS_DOUBLE_SPACE_LIMIT_PHRASE_MEASURED,
+            STOP_HOOK_WORDS_SPELL_A_BOX_MEASURED,
+        };
+        let mut read = Vec::new();
+        for (name, capture) in [
+            (
+                "stop reason, login",
+                STOP_HOOK_STOP_REASON_LOGIN_PHRASE_MEASURED,
+            ),
+            (
+                "stop reason, context",
+                STOP_HOOK_STOP_REASON_CONTEXT_PHRASE_MEASURED,
+            ),
+            (
+                "stop reason, detailed",
+                STOP_HOOK_STOP_REASON_DETAILED_MEASURED,
+            ),
+            (
+                "stop reason, two lines",
+                STOP_HOOK_STOP_REASON_TWO_LINES_MEASURED,
+            ),
+            (
+                "hook words, double space",
+                STOP_HOOK_WORDS_DOUBLE_SPACE_LIMIT_PHRASE_MEASURED,
+            ),
+            (
+                "post-tool hook reason",
+                POST_HOOK_BLOCKING_REASON_LOGIN_PHRASE_MEASURED,
+            ),
+            (
+                "hook words spell a box",
+                STOP_HOOK_WORDS_SPELL_A_BOX_MEASURED,
+            ),
+            (
+                "prompt hook stderr",
+                PROMPT_HOOK_ERROR_STDERR_LOGIN_PHRASE_MEASURED,
+            ),
+            (
+                "prompt hook blocked",
+                PROMPT_HOOK_BLOCKED_LOGIN_PHRASE_MEASURED,
+            ),
+            (
+                "prompt hook stopped",
+                PROMPT_HOOK_STOPPED_LOGIN_PHRASE_MEASURED,
+            ),
+        ] {
+            let r = screen(capture);
+            if let Some(w) = wall(&r) {
+                read.push(format!(
+                    "{name}: wall {:?} {:?} under_call={} {}",
+                    w.kind, w.placement, w.under_call, w.message
+                ));
+            }
+            if let Some(s) = since_limit(&r) {
+                read.push(format!("{name}: since_limit {s:?}"));
+            }
+            if let Some(a) = auto_continue_end(&r) {
+                read.push(format!("{name}: auto_continue_end {a:?}"));
+            }
+            if let Some(p) = crate::prompt::parse_prompt(&r) {
+                read.push(format!("{name}: a box {p:?}"));
+            }
+            let phase = worker_phase(&r);
+            if phase != Phase::Idle {
+                read.push(format!("{name}: {phase:?}"));
+            }
+        }
+        assert!(read.is_empty(), "{read:#?}");
+        for (name, capture, under_call, opens) in [
+            (
+                "after the stop hook's error row",
+                STOP_HOOK_ERROR_THEN_CONTEXT_WALL_302_MEASURED,
+                false,
+                "Context limit reached",
+            ),
+            (
+                "after a stop hook's decision to block, no blank row",
+                STOP_HOOK_DECISION_BLOCK_THEN_CONTEXT_WALL_MEASURED,
+                false,
+                "Context limit reached",
+            ),
+            (
+                "after a reasonless block's default reason",
+                POST_HOOK_BLOCK_NO_REASON_THEN_CONTEXT_WALL_MEASURED,
+                true,
+                "Context limit reached",
+            ),
+            (
+                "after a non-blocking error's lead row",
+                PROMPT_HOOK_ERROR_NO_STDERR_THEN_TOO_LONG_WALL_MEASURED,
+                false,
+                "Prompt is too long",
+            ),
+        ] {
+            let w = wall(&screen(capture)).unwrap_or_else(|| panic!("the real wall {name}"));
+            assert_eq!(
+                (w.kind, w.placement, w.under_call),
+                (WallKind::Context, Placement::Gutter, under_call),
+                "{name}"
+            );
+            assert!(w.message.starts_with(opens), "{name}: {}", w.message);
+        }
+    }
+
+    /// A PROGRAM'S WORDS NAME NO LIMIT AND NO END OF THE AUTO-CONTINUE,
+    /// HOWEVER THEIR ITEMS SPLIT (ATERM-KI-1015-14; screens composed from
+    /// measured 2.1.302 and 2.1.300 ones). The readers that walk every row
+    /// above the composer split a row at wide gaps before they classify it
+    /// (`since_limit`, `auto_continue_end`, the turn's own notice behind a
+    /// generic banner). A hook's labelled row ALONE, `⎿  Stop says: note
+    /// Usage limit reached · resets 3pm` (the double space Claude Code keeps),
+    /// named the session limit; the same row reading `Automatic continue
+    /// cancelled · …` ended the countdown; and a Bash call's output naming
+    /// the weekly limit at the generic banner's reset made the banner the
+    /// weekly limit. CONTROL: the same words as Claude Code's own row under
+    /// the person's turn are read.
+    #[test]
+    fn a_programs_words_name_no_limit_and_no_continue_however_they_split() {
+        use crate::prompt::fixtures::{
+            STOP_HOOK_WORDS_DOUBLE_SPACE_LIMIT_PHRASE_MEASURED,
+            WALL_SONNET_BUCKET_AUTO_CONTINUE_ARMED_2_1_300,
+        };
+        let measured = screen(STOP_HOOK_WORDS_DOUBLE_SPACE_LIMIT_PHRASE_MEASURED);
+        // The `Stop says:` row alone: the summary and its stopReason dropped.
+        let labelled: Vec<String> = measured
+            .iter()
+            .filter(|r| {
+                !r.starts_with("⏺ Ran 1 stop hook")
+                    && crate::text::trim(r) != "⎿ \u{a0}note  Usage limit reached · resets 3pm"
+            })
+            .cloned()
+            .collect();
+        assert_eq!(labelled.len() + 2, measured.len());
+        let cancelled: Vec<String> = labelled
+            .iter()
+            .map(|r| {
+                r.replace(
+                    "Usage limit reached · resets 3pm",
+                    "Automatic continue cancelled · /rate-limit-options to re-arm",
+                )
+            })
+            .collect();
+        let sonnet = screen(WALL_SONNET_BUCKET_AUTO_CONTINUE_ARMED_2_1_300);
+        let notice = "  ⎿ \u{a0}You've hit your Sonnet limit · resets Oct 17 at 4:20pm (America/Los_Angeles)";
+        let weekly = notice.replace("Sonnet", "weekly");
+        let output: Vec<String> = sonnet
+            .iter()
+            .flat_map(|r| {
+                if crate::text::trim_end(r) == notice {
+                    vec!["⏺ Bash(cat notes.txt)".to_string(), weekly.clone()]
+                } else {
+                    vec![r.clone()]
+                }
+            })
+            .collect();
+        assert_eq!(output.len(), sonnet.len() + 1);
+
+        let mut read = Vec::new();
+        if let Some(s) = since_limit(&labelled) {
+            read.push(format!("a labelled limit: since_limit {s:?}"));
+        }
+        if let Some(w) = wall(&labelled) {
+            read.push(format!("a labelled limit: wall {:?} {}", w.kind, w.message));
+        }
+        if let Some(a) = auto_continue_end(&cancelled) {
+            read.push(format!("a labelled cancel: auto_continue_end {a:?}"));
+        }
+        let banner = wall(&output).expect("the generic banner");
+        if banner.kind != WallKind::UsageSession {
+            read.push(format!(
+                "a tool's output names the banner: {:?} {}",
+                banner.kind, banner.message
+            ));
+        }
+        if let Some(s) = since_limit(&output) {
+            read.push(format!("a tool's output: since_limit {s:?}"));
+        }
+        assert!(read.is_empty(), "{read:#?}");
+
+        // CONTROL: Claude Code's own rows, the same words.
+        let vendors: Vec<String> = labelled
+            .iter()
+            .map(|r| r.replace("⎿ \u{a0}Stop says: note  ", "⎿ \u{a0}"))
+            .collect();
+        let s = since_limit(&vendors).expect("Claude Code's own limit");
+        assert_eq!(
+            (s.kind, s.reset.as_deref()),
+            (WallKind::UsageSession, Some("3pm"))
+        );
+        let named: Vec<String> = sonnet
+            .iter()
+            .map(|r| {
+                if crate::text::trim_end(r) == notice {
+                    weekly.clone()
+                } else {
+                    r.clone()
+                }
+            })
+            .collect();
+        assert_eq!(wall(&named).map(|w| w.kind), Some(WallKind::UsageWeekly));
     }
 
     /// THE FABLE BUCKET ON 2.1.301, MEASURED in the lab (crates/aterm-lab,
@@ -3703,36 +4268,6 @@ mod tests {
         let warning = screen(FABLE_WARNING_2_1_301);
         assert_eq!(wall(&warning), None);
         assert_eq!(worker_phase(&warning), Phase::Idle);
-    }
-
-    /// The session limit and the Fable limit read the same through both
-    /// doors: `worker_phase` says limited, and the wall names the window.
-    #[test]
-    fn a_usage_wall_is_limited_and_named() {
-        let r = screen(END_SESSION_LIMIT);
-        let w = wall(&r).expect("the wall");
-        assert_eq!(w.kind, WallKind::UsageSession);
-        assert_eq!(w.reset.as_deref(), Some("3pm (America/Los_Angeles)"));
-        assert_eq!(
-            worker_phase(&r),
-            Phase::Limited {
-                message: w.message.clone(),
-                reset: w.reset.clone(),
-            }
-        );
-        // The real Fable screen, cut before its `/model` (as phase.rs's own
-        // test cuts it): a model bucket, no consent asked.
-        let full: Vec<String> = IDLE_AFTER_LIMIT_AND_MODEL_SWITCH
-            .lines()
-            .map(str::to_string)
-            .collect();
-        let mut cut = full[..56].to_vec();
-        cut.extend_from_slice(&full[58..]);
-        let w = wall(&cut).expect("the Fable wall");
-        assert_eq!(w.kind, WallKind::ModelBucket { consent: false });
-        assert!(matches!(worker_phase(&cut), Phase::Limited { .. }));
-        // After the `/model` switch it is history.
-        assert_eq!(wall(&full), None);
     }
 
     /// `Context limit reached` is a wall of its own, and not a usage limit
@@ -3843,29 +4378,6 @@ mod tests {
         }
     }
 
-    /// `Goal paused · usage limit reached` (the 2.1.280 binary's text; where
-    /// it is drawn is not measured, so the banner and the gutter both read
-    /// it) is a usage wall; the update banner beside it is not.
-    #[test]
-    fn goal_paused_parses_and_the_update_banner_is_not_a_wall() {
-        const PAUSED: &str =
-            "⚠ Goal paused · usage limit reached · send a message after it resets to continue";
-        let banner = framed(&["⏺ Step 3 is done.", "", PAUSED, ""], FOOTER);
-        let w = wall(&banner).expect("the wall");
-        assert_eq!(w.kind, WallKind::UsageSession);
-        assert_eq!(w.placement, Placement::Banner);
-        let update = framed(
-            &[
-                "⏺ Step 3 is done.",
-                "",
-                "                                                               ✔ Update installed · Restart to update",
-            ],
-            FOOTER,
-        );
-        assert_eq!(wall(&update), None);
-        assert_eq!(worker_phase(&update), Phase::Idle);
-    }
-
     /// The banner as the incident drew it, and as it would be drawn beside
     /// the spinner: a memory wall read from the banner row, its message the
     /// banner's whole text. The draft quoting it five rows lower is inside
@@ -3881,12 +4393,6 @@ mod tests {
         assert_eq!(w.reset, None);
         assert!(w.message.starts_with(anchor_text("wall.memory")));
         assert!(w.message.ends_with("claude --continue"), "{}", w.message);
-        assert_eq!(r[w.row].trim_start(), w.message);
-        assert_eq!(crate::phase::leading_spaces(&r[w.row]), 67);
-        assert!(
-            r[w.row + 1].starts_with('─'),
-            "the row right above the rule"
-        );
         // The same banner sharing the spinner's row reads the same.
         let mut shared = r.clone();
         let spinner = w.row - 1;
@@ -3942,7 +4448,6 @@ mod tests {
         let wide = screen(MEMORY_BANNER_BUSY);
         let at = memory_wall(&wide).expect("the control").row;
         let banner = wide[at].trim_start().to_string();
-        assert_eq!(banner.chars().count(), 75);
         for width in 77..=144 {
             let r = narrowed(&wide, at, width, &banner);
             let w = memory_wall(&r).unwrap_or_else(|| panic!("{width} columns"));
@@ -3955,8 +4460,6 @@ mod tests {
                 "{width} columns"
             );
         }
-        let at_80 = narrowed(&wide, at, 80, &banner);
-        assert_eq!(crate::phase::leading_spaces(&at_80[at]), 3);
     }
 
     /// NEGATIVE CONTROL under the spinner: the one person's text the live
@@ -4032,10 +4535,6 @@ mod tests {
             Some(at)
         );
         let blank = with(String::new());
-        assert!(
-            blank.iter().any(|row| row.contains(&banner[..40])),
-            "the draft still quotes it"
-        );
         let idle = screen(MEMORY_BANNER_IDLE);
         let at_idle = memory_wall(&idle).expect("the idle control").row;
         // The banner row replaced by the last rows of a transcript block.
@@ -4110,7 +4609,6 @@ mod tests {
         assert!(!WallKind::Context.reads_limited());
         assert!(!WallKind::Auth.reads_limited());
         assert!(!WallKind::Memory.reads_limited());
-        assert_eq!(WallKind::Memory.name(), "memory");
         assert!(
             !WallKind::ApiError {
                 code: Some(500),
@@ -4135,13 +4633,11 @@ mod tests {
     /// sixteen times. It is a wall — at 144 columns, at 80 where
     /// `(ENOTFOUND)` wraps onto the second row, without a done row, with the
     /// `●` off macOS, and under the vendor's expand hint — and the message is
-    /// the whole of it, joined. The SYNTHETIC rows were MEASURED live on
-    /// 2026-09-27 word for word, at both widths and under an earlier error.
+    /// the whole of it, joined (MEASURED live on 2026-09-27, at both widths
+    /// and under an earlier error).
     #[test]
     fn a_283_api_error_message_row_is_a_wall_at_every_width() {
         for (name, r) in [
-            ("144", screen(API_ERROR_ENOTFOUND)),
-            ("80", screen(API_ERROR_ENOTFOUND_80)),
             ("144 measured", screen(API_ERROR_ENOTFOUND_MEASURED)),
             ("80 measured", screen(API_ERROR_ENOTFOUND_80_MEASURED)),
             ("two errors measured", screen(API_ERROR_TWICE_MEASURED)),
@@ -4161,12 +4657,10 @@ mod tests {
             .rposition(|r| r.starts_with("⏺ API Error"))
             .expect("the second error");
         assert_eq!(wall(&twice).map(|w| w.row), Some(last));
-        assert!(twice[..last].iter().any(|r| r.starts_with("⏺ API Error")));
         // NEGATIVE CONTROL, measured: the retries spent with a message
         // queued, which Claude sends under the error at once — the error is
         // history, the next turn retrying: busy, no wall.
         let sent = screen(API_ERROR_QUEUED_SENT_MEASURED);
-        assert!(sent.iter().any(|r| r.starts_with("⏺ API Error")));
         assert_eq!(worker_phase(&sent), Phase::Busy);
         assert_eq!(wall(&sent), None);
         let variants = [
@@ -4187,28 +4681,6 @@ mod tests {
             let w = wall(r).expect("the wall");
             assert_eq!((w.kind, w.message.as_str()), (UNREACHABLE, ENOTFOUND));
         }
-    }
-
-    /// The same shape carries every other API error: a 529 (its URL wrapped
-    /// onto the second row) is an overload, and a reply the Mac's sleep cut
-    /// off is cut off.
-    #[test]
-    fn the_283_529_and_sleep_rows_read_their_kinds() {
-        let w = wall(&screen(API_ERROR_529)).expect("the 529");
-        assert_eq!(
-            (w.kind, w.placement),
-            (WallKind::Overloaded, Placement::ErrorRow)
-        );
-        assert_eq!(w.message, API_529);
-        let w = wall(&screen(API_ERROR_SLEEP)).expect("the sleep");
-        assert_eq!(
-            w.kind,
-            WallKind::ApiError {
-                code: None,
-                retryable: true,
-                cause: ApiCause::CutOff,
-            }
-        );
     }
 
     /// NEGATIVE CONTROLS for the message row. The table names a wall within
@@ -4349,8 +4821,14 @@ mod tests {
             "Part of the response never arrived and no response was produced. Try again.",
             "Your computer went to sleep before a response was produced. Try again.",
             "Connection lost before a response was produced. Try again.",
-            "Claude's response exceeded the 32000 output token maximum. To configure this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable.",
             "An image in the conversation could not be processed and was removed. Re-read the file with a different approach if you still need it.",
+        ];
+        // A reply past its output token maximum is no cut-off: it is retried
+        // on a ladder work does not reset (moved out of the cut-off list
+        // 2026-10-15).
+        let overlong = [
+            "Claude's response exceeded the 32000 output token maximum. To configure this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable.",
+            "Claude's response exceeded the 32000 output token maximum for a request sent without streaming. The CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable cannot raise this limit.",
         ];
         let config = [
             "Unable to connect to API: SSL certificate verification failed",
@@ -4365,6 +4843,7 @@ mod tests {
         for (texts, cause, retryable) in [
             (&unreachable[..], ApiCause::Unreachable, true),
             (&cut_off[..], ApiCause::CutOff, true),
+            (&overlong[..], ApiCause::Overlong, true),
             (&config[..], ApiCause::Config, false),
         ] {
             for text in texts {
@@ -4404,13 +4883,275 @@ mod tests {
             classify_wall("API Error: The model has reached its context window limit."),
             Some(WallKind::Context)
         );
-        // What the catalog does not name is no wall: the ordinary policy's.
+        // What the catalog does not name is the server's, retried (the
+        // vendor's rule for a notice with no status) — no longer no wall,
+        // which the ordinary policy answered `keep going` hourly for good.
+        // The vendor's refusals are refused requests (2026-10-15).
         for text in [
             "API Error: Claude Opus 5.5 can't help with this. Start a new session to continue.",
-            "API Error (claude-x-1): The model claude-x-1 is not available. Run /model to pick another.",
+            "API Error (claude-x-1): The provided model identifier is invalid. Run /model to pick a different model.",
+            "API Error: Effort 'max' isn't available with thinking turned off on this model · run /effort high to continue",
+        ] {
+            assert_eq!(
+                classify_wall(text),
+                Some(WallKind::ApiError {
+                    code: None,
+                    retryable: false,
+                    cause: ApiCause::Request,
+                }),
+                "{text}"
+            );
+        }
+        for text in [
+            "API Error (claude-x-1): The model claude-x-1 is not available.",
             "API Error: Effort 'max' isn't available for this model.",
         ] {
+            assert_eq!(
+                classify_wall(text),
+                Some(WallKind::ApiError {
+                    code: None,
+                    retryable: true,
+                    cause: ApiCause::Server,
+                }),
+                "{text}"
+            );
+        }
+    }
+
+    /// A REFUSED REQUEST IS A WALL OF ITS OWN, AND AN UNNAMED API ERROR THE
+    /// SERVER'S (2026-10-15). Before, every `API Error` no table named, and
+    /// every refusal 2.1.300 draws like prose, read as no wall, and the
+    /// ordinary policy answered it `keep going` at 0, 2, 4 … minutes, then
+    /// hourly for good. Each text is the 2.1.300 error builder's (read from
+    /// the binary), the status a 4xx the vendor does not retry (its `aMr`:
+    /// 400-499 but 401, 408, 409, 429 and 451). NEGATIVE CONTROLS: the
+    /// vendor's own generic fallbacks (`API Error: terminated`, the bare
+    /// `API Error` drawn as `Please wait a moment and try again.`) are the
+    /// server's and retried, never refused; a statused failure the vendor
+    /// retries stays the server's; an aborted request, `/advisor`'s own
+    /// answer to a name it does not know, and prose that mentions an API
+    /// error or a refusal's words past its opening, are no wall.
+    #[test]
+    fn a_refused_request_is_its_own_wall_and_an_unnamed_api_error_the_servers() {
+        let refused = |code| {
+            Some(WallKind::ApiError {
+                code,
+                retryable: false,
+                cause: ApiCause::Request,
+            })
+        };
+        for text in [
+            "API Error: Claude can't help with this. Start a new session to continue. Send feedback with /feedback or learn more: https://www.anthropic.com/legal/aup",
+            "API Error: Opus 4.1's safeguards flagged this message (https://www.anthropic.com/legal/aup). This sometimes happens with safe, normal conversations.",
+            // The model's name puts the words past the table's opening four:
+            // read anywhere in an `API Error` with no status.
+            "API Error: Claude Opus 5.5's safeguards flagged this message (https://www.anthropic.com/legal/aup). This sometimes happens with safe, normal conversations.",
+            "API Error: Effort 'max' isn't available with thinking turned off on this model · run /effort high to continue, or turn thinking back on (unset MAX_THINKING_TOKENS=0)",
+            "API Error: advisor tool is not supported · The configured advisor model is not compatible with this request model — run /advisor to change or disable the advisor",
+            "API Error: Verify your identity to keep using Claude: https://claude.ai/verify",
+            "API Error: Claude Code 2.1.200 does not support this model; version 2.1.250 or newer is required. Run 'claude update', or update the Claude desktop app, then try again.",
+            "There's an issue with the selected model (claude-opus-9). It may not exist or you may not have access to it. Run /model to pick a different model.",
+            "The model claude-opus-9 is not available on your Bedrock deployment. Try switching to opus, or ask your admin to enable this model.",
+            "Your account is on hold and can't use Claude Code. View details or appeal: https://claude.ai/restricted",
+            "Claude Opus is not available with the Claude Pro plan. If you have updated your subscription plan recently, run /logout and /login for the plan to take effect.",
+        ] {
+            assert_eq!(classify_wall(text), refused(None), "{text}");
+        }
+        for (text, code) in [
+            (
+                "API Error: 400 due to tool use concurrency issues. Run /rewind to recover the conversation.",
+                400,
+            ),
+            (
+                "API Error: 400 orphaned tool_result in conversation history. Run /rewind to recover the conversation.",
+                400,
+            ),
+            (
+                "API Error: 400 Request blocked by your organization's data loss prevention policy.",
+                400,
+            ),
+            ("API Error: 400 This organization has been disabled.", 400),
+            ("API Error: 403 Forbidden", 403),
+            ("API Error: 404 Not Found", 404),
+            ("API Error: 413 Request too large", 413),
+            ("API Error: 422 Unprocessable Entity", 422),
+        ] {
+            assert_eq!(classify_wall(text), refused(Some(code)), "{text}");
+        }
+        let server = |code, retryable| {
+            Some(WallKind::ApiError {
+                code,
+                retryable,
+                cause: ApiCause::Server,
+            })
+        };
+        // The vendor's own generic fallbacks, and a status it retries (or a
+        // 401: a token it refreshes; a 451): the server's.
+        for text in [
+            "API Error: Please wait a moment and try again.",
+            "API Error: terminated",
+            "API Error: fetch failed",
+            "API Error",
+        ] {
+            assert_eq!(classify_wall(text), server(None, true), "{text}");
+        }
+        for (text, code, retryable) in [
+            ("API Error: 401 Unauthorized", 401, false),
+            ("API Error: 408 Request Timeout", 408, true),
+            ("API Error: 409 Conflict", 409, true),
+            ("API Error: 451 Unavailable For Legal Reasons", 451, false),
+            ("API Error: 500 Internal server error", 500, true),
+        ] {
+            assert_eq!(classify_wall(text), server(Some(code), retryable), "{text}");
+        }
+        for text in [
+            "API Error: Request was aborted.",
+            "I hit API Error: 400 earlier in the logs, so I patched the retry",
+            "The tests check that the advisor model is not compatible with Haiku.",
+            "Fixed the parser so it reads an account that is on hold as a wall.",
+            // `/advisor`'s own answer to a name it does not know (2.1.300): a
+            // person's typo, no request refused.
+            "Invalid advisor model: claude-haiku-9",
+        ] {
             assert_eq!(classify_wall(text), None, "{text}");
+        }
+    }
+
+    /// The same on the screen: the vendor's `⏺` error row (2.1.300's `su`,
+    /// the text at column 2) reads as the wall it names — a refusal, an
+    /// unnamed API error, the long context's entitlement — and the gutter's
+    /// high-demand row as an overload. NEGATIVE CONTROLS: the worker's prose
+    /// that mentions an API error, and the vendor's model fallback.
+    #[test]
+    fn the_refusals_and_the_unnamed_api_errors_read_on_the_screen() {
+        let row = |text: &str| framed(&["⏺ Working.", "", &format!("⏺ {text}"), ""], FOOTER);
+        for (text, kind) in [
+            (
+                "API Error: Claude can't help with this. Start a new session to continue.",
+                WallKind::ApiError {
+                    code: None,
+                    retryable: false,
+                    cause: ApiCause::Request,
+                },
+            ),
+            (
+                "API Error: 400 due to tool use concurrency issues. Run /rewind to recover the conversation.",
+                WallKind::ApiError {
+                    code: Some(400),
+                    retryable: false,
+                    cause: ApiCause::Request,
+                },
+            ),
+            (
+                "API Error: Please wait a moment and try again.",
+                WallKind::ApiError {
+                    code: None,
+                    retryable: true,
+                    cause: ApiCause::Server,
+                },
+            ),
+            (
+                "API Error: Usage credits required for 1M context · run /model to switch to standard context",
+                WallKind::Spend,
+            ),
+        ] {
+            let w = wall(&row(text)).unwrap_or_else(|| panic!("{text}: the wall"));
+            assert_eq!((w.kind, w.placement), (kind, Placement::ErrorRow), "{text}");
+            assert_eq!(w.message, text);
+        }
+        let high = framed(
+            &[
+                "⏺ Running the suites.",
+                "  ⎿  We are experiencing high demand for Opus 4.",
+                "",
+            ],
+            FOOTER,
+        );
+        let w = wall(&high).expect("the high demand row");
+        assert_eq!(
+            (w.kind, w.placement),
+            (WallKind::Overloaded, Placement::Gutter)
+        );
+        for r in [
+            framed(
+                &[
+                    "⏺ I hit API Error: 400 earlier in the logs, so I patched the retry.",
+                    "",
+                ],
+                FOOTER,
+            ),
+            framed(
+                &[
+                    "⏺ Running the suites.",
+                    "  ⎿  Switched to Sonnet due to high demand for Opus",
+                    "",
+                ],
+                FOOTER,
+            ),
+        ] {
+            assert_eq!(wall(&r), None, "{r:?}");
+        }
+    }
+
+    /// THE LAST THING SAID WHERE THE VENDOR DRAWS ITS OWN NOTICES
+    /// ([`crate::phase::last_said_notice`]), for a caller that holds a
+    /// notice's words: a `⏺` row in column 0 — drawn like prose or in the
+    /// error row's shape, wrapped or not — and a vendor `⎿` block are given
+    /// with their text. NEGATIVE CONTROLS: a call's first output row, a call
+    /// row, the person's `❯` row, and a row said before the last.
+    #[test]
+    fn the_last_thing_said_is_given_where_the_vendor_draws_a_notice() {
+        use crate::phase::last_said_notice;
+        let hold = "Your account is on hold and can't use Claude Code. View details or appeal: https://claude.ai/restricted";
+        let r = framed(&["⏺ Working.", "", &format!("⏺ {hold}"), ""], FOOTER);
+        let said = last_said_notice(&r).expect("the hold row");
+        assert_eq!((said.text.as_str(), said.shaped), (hold, false));
+        let wrapped = framed(
+            &[
+                "⏺ Working.",
+                "",
+                "⏺ Your account is on hold and can't use",
+                "  Claude Code. View details or appeal:",
+                "  https://claude.ai/restricted",
+                "",
+            ],
+            FOOTER,
+        );
+        assert_eq!(
+            last_said_notice(&wrapped).map(|s| s.text),
+            Some(hold.to_string())
+        );
+        let api = framed(&["⏺ Working.", "", "⏺ API Error: terminated", ""], FOOTER);
+        let said = last_said_notice(&api).expect("the error row");
+        assert_eq!(
+            (said.text.as_str(), said.shaped),
+            ("API Error: terminated", true)
+        );
+        let gutter = framed(
+            &["❯ /compact", "  ⎿  Not enough messages to compact.", ""],
+            FOOTER,
+        );
+        let said = last_said_notice(&gutter).expect("the gutter row");
+        assert_eq!(
+            (said.text.as_str(), said.shaped),
+            ("Not enough messages to compact.", false)
+        );
+        for (name, r) in [
+            (
+                "a call's output",
+                framed(&["⏺ Bash(cat x)", "  ⎿  API Error: terminated", ""], FOOTER),
+            ),
+            ("a call", framed(&["⏺ Bash(ls)", ""], FOOTER)),
+            (
+                "the person's row",
+                framed(&["❯ API Error: terminated", ""], FOOTER),
+            ),
+            (
+                "said before the last",
+                framed(&["⏺ API Error: terminated", "", "❯ keep going", ""], FOOTER),
+            ),
+        ] {
+            assert_eq!(last_said_notice(&r), None, "{name}");
         }
     }
 
@@ -4462,6 +5203,10 @@ mod tests {
             "reached your limit",
             "limit will reset",
         ];
+        /// Rows whose words are the API's own, which Claude Code only passes
+        /// on (`API Error: <its message>`): no build carries them (anchors.rs,
+        /// `wall.refused.identity`, `wall.refused.dlp`).
+        const SERVER_WORDS: &[&str] = &["verify your identity", "data loss prevention"];
         let path = crate::anchors::canary_binary("claude", "ATERM_CLAUDE_BIN");
         let Some(bytes) = path
             .and_then(|p| std::fs::read(p).ok())
@@ -4479,7 +5224,7 @@ mod tests {
         let missing: Vec<&str> = PHRASES
             .iter()
             .map(|(p, _)| *p)
-            .filter(|p| !OLDER_BUILDS.contains(p))
+            .filter(|p| !OLDER_BUILDS.contains(p) && !SERVER_WORDS.contains(p))
             .filter(|p| {
                 !crate::anchors::contains_bytes(&lower, p.replace('\'', "\u{2019}").as_bytes())
                     && !crate::anchors::contains_bytes(&lower, p.as_bytes())

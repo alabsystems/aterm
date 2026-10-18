@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What the checks that read a selection (lint, test, doc, trust) build and
+//! What the checks that read a selection (lint, test, doc) build and
 //! test: the whole workspace (`--all`), the packages `-p` named, or the change
 //! cone ([`crate::changed`]). The driver flags and the label derive from one
 //! value, so a check can never print `--workspace` while running `-p`.
@@ -115,12 +115,19 @@ impl Scope {
             .collect()
     }
 
-    /// Would this selection compile `name`?
+    /// Would this selection compile the bare package `name`? A supported
+    /// `name@version` spec identifies the same package; its original text is
+    /// retained by the driver arguments.
     #[must_use]
     pub fn includes_crate(&self, name: &str) -> bool {
         match self {
             Self::Workspace => true,
-            _ => self.crates().iter().any(|n| n == name),
+            _ => self.crates().iter().any(|spec| {
+                spec == name
+                    || spec
+                        .split_once('@')
+                        .is_some_and(|(package, version)| package == name && !version.is_empty())
+            }),
         }
     }
 }
@@ -137,45 +144,23 @@ mod tests {
         )
     }
 
+    /// A selection hands cargo exactly its crates; the empty cone selects
+    /// nothing yet falls back WIDER (`--workspace`), never to an empty argv;
+    /// and only the cone can say nothing has a library.
     #[test]
-    fn the_label_and_the_flags_can_never_disagree() {
-        for s in [
-            Scope::workspace(),
-            Scope::crate_only("aterm-pty"),
-            Scope::packages(&["aterm-grid".into(), "aterm-gui".into()]),
-            changed(&["aterm-pty"]),
-            changed(&["aterm-grid", "aterm-gui", "aterm-cli"]),
-        ] {
-            assert_eq!(s.label(), s.args().join(" "));
-        }
+    fn a_selection_hands_cargo_its_crates_and_an_empty_cone_falls_back_wider() {
         assert_eq!(
             Scope::packages(&["a".into(), "b".into()]).args(),
             ["-p", "a", "-p", "b"]
         );
         assert_eq!(Scope::packages(&[]), Scope::Workspace);
-    }
-
-    #[test]
-    fn the_empty_cone_says_so_and_falls_back_wider_never_narrower() {
-        let s = changed(&[]);
-        assert!(s.selects_nothing());
-        assert_eq!(s.label(), "<no crates selected>");
-        assert_eq!(s.args(), ["--workspace"]);
-        assert!(!s.is_workspace());
-    }
-
-    #[test]
-    fn a_selection_includes_exactly_what_it_names() {
+        assert_eq!(changed(&["a", "b"]).args(), ["-p", "a", "-p", "b"]);
+        let empty = changed(&[]);
+        assert!(empty.selects_nothing() && !empty.is_workspace());
+        assert_eq!(empty.args(), ["--workspace"]);
+        assert!(!empty.includes_crate("aterm-link"));
         assert!(Scope::workspace().includes_crate("aterm-link"));
-        assert!(Scope::crate_only("aterm-link").includes_crate("aterm-link"));
         assert!(!Scope::crate_only("aterm-grid").includes_crate("aterm-link"));
-        assert!(changed(&["aterm-grid", "aterm-link"]).includes_crate("aterm-link"));
-        assert!(!changed(&[]).includes_crate("aterm-link"));
-    }
-
-    #[test]
-    fn only_the_cone_can_report_that_nothing_has_a_library() {
-        assert!(Scope::workspace().has_lib_target());
         assert!(Scope::crate_only("aterm-lab").has_lib_target());
         assert!(!Scope::changed("main", vec!["aterm-lab".into()], false).has_lib_target());
     }

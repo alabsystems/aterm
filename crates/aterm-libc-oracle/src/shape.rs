@@ -18,17 +18,14 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use aterm_json::{Map, Value};
-use serde::Serialize;
-
 use crate::closure::{PRIMS, closure};
 use crate::rustdoc::{Doc, Entry, FormatError, Namespace, Public, Result, kind_of};
+use aterm_json::{Map, Value};
 
 const PUBLIC_TRAITS: [&str; 6] = ["Clone", "Copy", "Debug", "PartialEq", "Eq", "Hash"];
 
 /// One fact about a crate's public surface.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-#[serde(tag = "record", rename_all = "snake_case")]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ShapeRecord {
     Item {
         name: String,
@@ -144,8 +141,7 @@ impl fmt::Display for ShapeRecord {
 }
 
 /// Which side of the comparison a record is on alone.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Side {
     /// The reference declares it; the shim does not.
     Missing,
@@ -154,7 +150,7 @@ pub enum Side {
 }
 
 /// One record the two surfaces disagree on.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ShapeDiff {
     pub side: Side,
     pub record: ShapeRecord,

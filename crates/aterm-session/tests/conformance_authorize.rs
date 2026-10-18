@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-1 conformance of the SHIPPING authorization gate to
-//! `aterm_spec::derive::authorize_soundness_model` (`AuthorizeSoundness`).
+//! `aterm_models_session::authorize_soundness_model` (`AuthorizeSoundness`).
 //!
 //! The model states the trust core's central predicate as a four-guard
 //! conjunction — the presented token is in the table (`token`), its row's
@@ -39,8 +39,9 @@
 
 use std::collections::BTreeMap;
 
+use aterm_models_session::authorize_soundness_model;
 use aterm_session::{EdgeDecision, EdgeTable, EdgeToken, LaunchNonce, Op, SessionId, decide_edge};
-use aterm_spec::derive::{Model, authorize_soundness_model};
+use aterm_spec::derive::Model;
 use aterm_spec::verify::validate_transition_tiered;
 
 type State = BTreeMap<&'static str, i64>;

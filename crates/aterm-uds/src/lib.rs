@@ -78,8 +78,8 @@ pub mod listener;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod output;
 /// Who holds a file's owner lock (the PTY keeper reads a dead window's crash
-/// marker with it).
-#[cfg(unix)]
+/// marker with it). Every platform has it: off Apple and Linux the probe answers
+/// `Unknown`, which callers such as aterm-agent's tape sweep compile against.
 pub mod ownerlock;
 /// The kernel's record of a socket peer: its uid and (Darwin) audit token.
 pub mod peer;
@@ -93,6 +93,16 @@ pub mod rand;
 /// [`reaper`].
 #[cfg(unix)]
 pub mod reaper;
+/// Unix-only: whether an account other than this one can write a file or directory (its
+/// mode bits, its owner, its access ACL, its filesystem and the user-private-group rule).
+/// See [`shared_write`].
+#[cfg(unix)]
+pub mod shared_write;
+/// Unix-only: anonymous POSIX shared memory, the crash-restore journal's region: created
+/// read-write with a read-only custody descriptor the keeper holds unmapped, and mapped read-only
+/// by the window that restores a dead one's sessions. See [`shm`].
+#[cfg(unix)]
+pub mod shm;
 /// Which Windows console a child process gets: a windowless one when this process has none
 /// (the window), so no console flashes on screen, and nothing changed when it has one or off
 /// Windows. [`spawnfd::command`] applies it to every child; [`spawn::set_flags`] is the one
@@ -111,6 +121,9 @@ pub mod spawnfd;
 #[cfg(not(unix))]
 #[path = "spawnfd_nonunix.rs"]
 pub mod spawnfd;
+/// A verb's answer on stdout, where a reader that closed the pipe (`| head -1`) ends the
+/// answer instead of panicking the process. See [`stdout`].
+pub mod stdout;
 /// The kernel facts a `sudo` askpass relay stands on, and a scrubbed secret
 /// for the password in flight (`docs/DESIGN-sudo-askpass-2026-10-15.md`).
 pub mod sudo;
@@ -123,12 +136,28 @@ pub mod sudo;
 /// stays outside `%APPDATA%`: a OneDrive-style filter there lets afunix `bind`
 /// succeed while `connect` fails with `WSAEINVAL`.
 ///
-/// **Unix:** `$XDG_RUNTIME_DIR/aterm` when set, else
-/// `$HOME/Library/Application Support/aterm`.
+/// **Unix:** `$XDG_RUNTIME_DIR/aterm` when set, else the per-user default:
+/// on macOS `$HOME/Library/Application Support/aterm` (aterm's state folder
+/// there), on every other Unix `$XDG_STATE_HOME/aterm/run` when that is
+/// absolute, else `$HOME/.local/state/aterm/run` — under aterm's XDG state
+/// folder, never a macOS `~/Library` grown in a Linux home. That rule is
+/// `aterm_types::dirs::resolve_state_dir`'s, spelled here because this crate
+/// has no dependencies, and without its `ATERM_STATE_HOME` development seam:
+/// the socket folder does not follow it on macOS either, and the server and
+/// every client must resolve it alike.
 #[must_use]
 pub fn control_socket_dir() -> Option<std::path::PathBuf> {
     control_socket_dir_inner()
 }
+
+/// [`control_socket_dir`]'s per-user default when `$XDG_RUNTIME_DIR` is unset,
+/// as `~/<that>` for a person to read.
+#[cfg(target_os = "macos")]
+pub const CONTROL_SOCKET_DIR_DEFAULT: &str = "~/Library/Application Support/aterm";
+/// [`control_socket_dir`]'s per-user default when `$XDG_RUNTIME_DIR` is unset,
+/// as `~/<that>` for a person to read.
+#[cfg(not(target_os = "macos"))]
+pub const CONTROL_SOCKET_DIR_DEFAULT: &str = "${XDG_STATE_HOME:-~/.local/state}/aterm/run";
 
 /// Whether [`control_socket_dir`] is private: `$XDG_RUNTIME_DIR` is set, so it
 /// is not the per-user default under `$HOME`. Always `false` on Windows. The
@@ -162,12 +191,72 @@ fn control_socket_dir_inner() -> Option<std::path::PathBuf> {
         if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR") {
             return Some(PathBuf::from(xdg).join("aterm"));
         }
-        let home = std::env::var_os("HOME")?;
-        Some(
-            PathBuf::from(home)
+        per_user_default(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+    }
+}
+
+/// [`control_socket_dir`] with `$XDG_RUNTIME_DIR` unset, over `$XDG_STATE_HOME`
+/// and `$HOME`.
+#[cfg(not(windows))]
+fn per_user_default(
+    xdg_state_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    if cfg!(any(target_os = "macos", not(unix))) {
+        let _ = xdg_state_home;
+        return Some(
+            PathBuf::from(home?)
                 .join("Library")
                 .join("Application Support")
                 .join("aterm"),
-        )
+        );
+    }
+    // Plain matches, no closures: a closure body is an absent callee to the
+    // Trust panic-freedom verifier.
+    let state = match xdg_state_home.map(PathBuf::from) {
+        Some(root) if root.is_absolute() => root,
+        _ => PathBuf::from(home?).join(".local").join("state"),
+    };
+    Some(state.join("aterm").join("run"))
+}
+
+#[cfg(all(test, not(windows)))]
+mod control_dir_tests {
+    use super::per_user_default;
+    use std::path::PathBuf;
+
+    /// With `$XDG_RUNTIME_DIR` unset the control folder is aterm's state folder
+    /// on macOS, and on every other Unix a `run` folder under aterm's XDG state
+    /// folder — `$XDG_STATE_HOME` when absolute, else `~/.local/state` — never a
+    /// `~/Library` in a Linux home.
+    #[test]
+    fn the_default_control_dir_follows_each_platforms_state_folder() {
+        let os = |s: &str| Some(std::ffi::OsString::from(s));
+        let home = os("/home/u");
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                per_user_default(os("/x/state"), home),
+                Some(PathBuf::from("/home/u/Library/Application Support/aterm"))
+            );
+            return;
+        }
+        assert_eq!(
+            per_user_default(os("/x/state"), home.clone()),
+            Some(PathBuf::from("/x/state/aterm/run"))
+        );
+        for state in [None, os(""), os("relative/state")] {
+            assert_eq!(
+                per_user_default(state.clone(), home.clone()),
+                Some(PathBuf::from("/home/u/.local/state/aterm/run")),
+                "XDG_STATE_HOME {state:?} is no state root"
+            );
+        }
+        assert_eq!(per_user_default(None, None), None);
+        assert_eq!(
+            per_user_default(os("/x/state"), None),
+            Some(PathBuf::from("/x/state/aterm/run")),
+            "an absolute XDG_STATE_HOME needs no HOME"
+        );
     }
 }

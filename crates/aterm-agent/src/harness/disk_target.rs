@@ -111,6 +111,7 @@ pub const PRESSURE_MIN_IDLE_S: i64 = 10 * 60;
 
 /// The deepest tree the deletion descends; deeper is kept and reported,
 /// rather than overflowing a stack.
+#[cfg(unix)]
 const MAX_DELETE_DEPTH: usize = 256;
 
 /// The profile walk's bounds.
@@ -805,6 +806,10 @@ pub fn reclaim_whole_with(
 
 /// Which profiles one reclaim of a build directory takes.
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(
+    not(unix),
+    expect(dead_code, reason = "only the unix reclaim reads a selection")
+)]
 enum Select<'a> {
     /// Every idle one — past `judge.threshold_days` — but those inside one
     /// of `leave`, the build directories named inside this one.
@@ -822,6 +827,7 @@ enum Select<'a> {
     },
 }
 
+#[cfg(unix)]
 impl Select<'_> {
     /// Why a profile last written at `clock` is not taken under this
     /// selection at `judge.now`, or `None` when it is.

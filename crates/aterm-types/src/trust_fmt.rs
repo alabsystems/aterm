@@ -87,13 +87,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn debug_string_matches_format() {
-        assert_eq!(debug_string("a\"b\n"), format!("{:?}", "a\"b\n"));
-        assert_eq!(debug_string(String::from("x")), format!("{:?}", "x"));
-        assert_eq!(debug_string(7usize), format!("{:?}", 7usize));
-    }
-
-    #[test]
     fn push_hex4_matches_format() {
         for v in [0u16, 1, 0xf, 0x10, 0xabc, 0x1234, 0xffff] {
             let mut s = String::new();

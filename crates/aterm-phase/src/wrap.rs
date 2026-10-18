@@ -139,6 +139,76 @@ pub(crate) fn line_end(
     end
 }
 
+/// THE FIRST ROW OF THE LINE ROW `last` ENDS, in a pane `width` cells wide,
+/// read back from `last` over the rows a word wrap broke the line onto: each
+/// row above that the row under it [`continues`], at the column `last`'s text
+/// starts at, up to the row that OPENS the line — its text at that column
+/// past a mark of its own ([`text_column`]: a reply's `•`, `✦`, `◆` or `⏺`, a
+/// notice's `⎿`, a list's `-` or `1.`) — which is the first. `last` itself
+/// where it opens its line, or no row above continues it. MEASURED at 50
+/// columns on the agents' replies (the `*-lab-reply-wrapped-50col` captures
+/// of 2026-10-16): Claude Code, Gemini CLI and Muse Code wrap a paragraph at the pane's edge, agy a cell or two short of it, and
+/// each draws every row of it at the column its first row's text starts at
+/// (two in). The rule's limit (module header, "THE LIMITS") holds here too:
+/// a line that ended under a row full enough to have been wrapped reads as
+/// one with the line under it.
+#[must_use]
+pub fn line_start(rows: &[String], last: usize, width: usize) -> usize {
+    let Some(row) = rows.get(last) else {
+        return last;
+    };
+    let col = leading_spaces(row);
+    if text_column(row) != col {
+        return last;
+    }
+    let room = room(col, width);
+    let mut first = last;
+    while first > 0 {
+        let above = rows[first - 1].as_str();
+        let lead = leading_spaces(above);
+        let opens = lead < col;
+        if lead > col || (opens && text_column(above) != col) {
+            break;
+        }
+        let text: String = if opens {
+            above.chars().skip(col).collect()
+        } else {
+            above.to_string()
+        };
+        if !continues(crate::text::trim(&text), col, &rows[first], room) {
+            break;
+        }
+        first -= 1;
+        if opens {
+            break;
+        }
+    }
+    first
+}
+
+/// The column a row's TEXT starts at: past its indent and, where the first
+/// thing on it is a MARK and a space — one glyph that is no letter or digit
+/// (`•`, `✦`, `◆`, `⏺`, `⎿`, `-`), or a list's number and its `.` or `)` —
+/// past the mark and the spaces after it.
+fn text_column(row: &str) -> usize {
+    let lead = leading_spaces(row);
+    let rest = crate::text::trim_start(row);
+    let Some((mark, after)) = rest.split_once(' ') else {
+        return lead;
+    };
+    let mut glyphs = mark.chars();
+    let one_glyph = glyphs
+        .next()
+        .is_some_and(|c| !c.is_alphanumeric() && glyphs.next().is_none());
+    let numbered = mark
+        .strip_suffix(['.', ')'])
+        .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+    if !(one_glyph || numbered) {
+        return lead;
+    }
+    lead + mark.chars().count() + 1 + leading_spaces(after)
+}
+
 /// The last row of a line Ink broke at the edges of its SPANS rather than
 /// where a row was full (module header, "THE LIMITS"): row `first` and each
 /// row after it, short of row `until`, that is not blank, starts at column
@@ -284,80 +354,6 @@ mod tests {
         r.iter().map(|s| s.to_string()).collect()
     }
 
-    /// The rule on the rows Claude Code 2.1.299 drew at 34 columns: the
-    /// banner's rest at its column, the countdown at its own, the gutter's
-    /// text column under a `⎿` notice. NEGATIVE CONTROLS: a row at another
-    /// column (the countdown under the banner), a row the row above had room
-    /// for (the same rows at 144 columns), a rule, a blank row.
-    #[test]
-    fn a_row_continues_a_line_only_where_ink_could_have_wrapped_it() {
-        let footer = rows(&[
-            "  ⚠ Usage limit reached · limit",
-            "  resets 10:25am",
-            "    Continuing automatically at",
-            "    10:25am · esc to cancel",
-            "  ⏵⏵ auto mode on (shift+tab to",
-        ]);
-        let end = |i: usize, w: usize| {
-            line_end(
-                &footer,
-                i,
-                crate::text::trim(&footer[i]),
-                leading_spaces(&footer[i]),
-                w,
-                footer.len(),
-            )
-        };
-        assert_eq!(end(0, 34), 1);
-        assert_eq!(end(2, 34), 3);
-        assert_eq!(
-            rejoined(&footer[0..=1]),
-            "  ⚠ Usage limit reached · limit resets 10:25am"
-        );
-        assert_eq!(
-            rejoined(&footer[2..=3]),
-            "    Continuing automatically at 10:25am · esc to cancel"
-        );
-        // A `⎿` notice: the line's text from the gutter's column five.
-        let notice = rows(&[
-            "  ⎿  You've hit your session limit",
-            "     · resets 10:25am",
-            "",
-            "     not this",
-        ]);
-        assert_eq!(
-            line_end(&notice, 0, "You've hit your session limit", 5, 34, 4),
-            1
-        );
-        // NEGATIVE CONTROLS. The same rows where the row above had room.
-        assert_eq!(end(0, 144), 0);
-        assert_eq!(end(2, 144), 2);
-        assert!(!continues(
-            "You've hit your session limit",
-            5,
-            "     · resets 10:25am",
-            room(5, 144)
-        ));
-        // Another column, a rule, a blank row, `until`.
-        assert!(!continues(
-            "resets 10:25am",
-            2,
-            "    Continuing automatically at",
-            20
-        ));
-        assert!(!continues(
-            "Enter to confirm · Esc to cancel",
-            2,
-            "  ────────────────",
-            20
-        ));
-        assert!(!continues("· resets 10:25am", 5, "", 20));
-        assert_eq!(
-            line_end(&notice, 0, "You've hit your session limit", 5, 34, 1),
-            0
-        );
-    }
-
     /// Ink's wrap counted as Claude Code 2.1.299 drew it in its notice column
     /// (`width - 10` cells, `phase`'s `NOTICE_MARGIN`): the rows of each
     /// measured `⏺` notice at 26 and 34 columns (the fixtures
@@ -450,5 +446,72 @@ mod tests {
             " x                        Dismiss",
         ]);
         assert_eq!(rejoined_cells(&left, &[2, 10, 18, 26], 34), None);
+    }
+
+    /// A REPLY'S LAST LINE IS READ BACK TO THE FIRST ROW OF ITS PARAGRAPH, on
+    /// each agent's reply measured at 50 columns: Claude Code's, Gemini CLI's and Muse Code's
+    /// second paragraph, two rows, the blank row above it ending the walk;
+    /// agy's, three rows a cell or two short of the pane's edge. NEGATIVE
+    /// CONTROLS: the same rows read in a pane they fit in whole (144 columns)
+    /// are each their own line; a paragraph's head row (`⏺`, `✦`, `◆` past
+    /// its mark) opens its line, and so does a list item's row.
+    #[test]
+    fn a_replys_last_line_starts_at_its_paragraphs_first_row() {
+        use crate::prompt::fixtures::screen;
+        let last = "every caller now. Which do you prefer (1 or 2)?";
+        let second = "Two ways on from here: keep the old API, or move";
+        let head = "I finished the parser and the suite is green.";
+        for (name, text, first, last, rows_in_line) in [
+            (
+                "claude",
+                crate::prompt::fixtures::REPLY_WRAPPED_50_2_1_302,
+                second,
+                last,
+                2,
+            ),
+            (
+                "gemini",
+                crate::gemini::fixtures::REPLY_WRAPPED_50,
+                second,
+                last,
+                2,
+            ),
+            (
+                "muse",
+                crate::muse::fixtures::REPLY_WRAPPED_50_1_4_10,
+                second,
+                last,
+                2,
+            ),
+            (
+                "agy",
+                crate::agy::fixtures::lab::REPLY_WRAPPED_50,
+                "Two ways on from here: keep the old API, or",
+                "or 2)?",
+                3,
+            ),
+        ] {
+            let rows = screen(text);
+            let at = rows
+                .iter()
+                .rposition(|r| crate::text::trim(r) == last)
+                .expect("the last row");
+            let from = line_start(&rows, at, 50);
+            assert_eq!(at + 1 - from, rows_in_line, "{name}");
+            assert!(rows[from].ends_with(first), "{name}: {:?}", rows[from]);
+            assert_eq!(line_start(&rows, at, 144), at, "the control: {name}");
+            let opens = rows
+                .iter()
+                .position(|r| r.ends_with(head))
+                .expect("the head row");
+            assert_eq!(line_start(&rows, opens, 50), opens, "the control: {name}");
+        }
+        let list = rows(&[
+            "  - keep the old API and wrap every new call in",
+            "    an adapter",
+            "  - move every caller now",
+        ]);
+        assert_eq!(line_start(&list, 1, 50), 0, "an item's wrapped row");
+        assert_eq!(line_start(&list, 2, 50), 2, "the control: an item opens");
     }
 }

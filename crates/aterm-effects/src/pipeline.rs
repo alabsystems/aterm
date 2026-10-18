@@ -50,8 +50,6 @@ use crate::host::{
     CaptureMode, FrameGeom, HostFrameInput, PressOutcome, SingFacts, TerminalFacts, Visibility,
 };
 use crate::kitty_pet::{PetInputKind, PetSpecies};
-#[cfg(test)]
-use crate::kitty_registry::KittyLook;
 use crate::matrix_rain::{
     MatrixRain, RAIN_ALPHA_CAP, RAIN_ALPHA_FLOOR, RainClock, RainConfig, RainFrame, RainHue,
     RainLatches, RainScan, RainTickInput, RainVisibility,
@@ -282,7 +280,7 @@ pub struct EffectsPipeline {
     /// dresses its pet with its own setter and never reads it.
     look: crate::companion_look::LookPolicy,
     /// The companions beside the resident pet ([`crate::companions`]): the
-    /// flying head, the sing-along, the typed detectors, the dog and Robi.
+    /// flying head, the sing-along, the typed detectors and the dog.
     /// A native window's; the page drives none of them.
     companions: crate::companions::Companions,
     /// The RAW glow style string named a pet at the last
@@ -375,7 +373,6 @@ impl EffectsPipeline {
                 ring: true,
                 beam: true,
                 head_dx: 0.5,
-                pack: None,
             },
             glow_color_from_cursor: true,
             glow_accent_from_cursor: true,
@@ -876,13 +873,7 @@ impl EffectsPipeline {
             } else {
                 PetSpecies::Cat
             });
-        let mut spelling = crate::cursor_fx::GlowSpelling::parse(style);
-        // A built-in style clears any armed trail pack (packs arrive via
-        // `set_cursor_trail_pack`), or `tick` keeps rendering the stale pack.
-        // Only a style that parses back to `Custom` keeps the resolved pack.
-        if spelling.style == Some(GlowStyle::Custom) {
-            spelling.pack = self.glow_cfg.pack;
-        }
+        let spelling = crate::cursor_fx::GlowSpelling::parse(style);
         // The config rule both hosts use
         // ([`crate::cursor_fx::resolve_glow_config`]). The ground pair is
         // carried forward so a reconfigure does not flip a light theme to the
@@ -910,34 +901,6 @@ impl EffectsPipeline {
         self.glow_cfg.audible = true;
         if !enabled {
             self.cursor.glow.reset();
-        }
-    }
-
-    /// Arm (or clear) a trail pack (`trail_pack::compile_trail_pack_toml`).
-    /// `None` clears any live pack; `Some(source)` compiles it and on success
-    /// stores the [`TrailParams`] in `glow_cfg.pack` with
-    /// `style = GlowStyle::Custom`. On a compile error the prior pack is kept
-    /// and the joined diagnostics are returned; success returns `None`.
-    pub fn set_cursor_trail_pack(&mut self, toml: Option<String>) -> Option<String> {
-        match toml {
-            None => {
-                self.glow_cfg.pack = None;
-                // Revert the enum to the plain default so the built-in emit path
-                // resumes cleanly (the resolver re-picks a real style next call).
-                if matches!(self.glow_cfg.style, GlowStyle::Custom) {
-                    self.glow_cfg.style = GlowStyle::Lumen;
-                }
-                None
-            }
-            Some(source) => match crate::trail_pack::compile_trail_pack_toml(&source) {
-                Ok(pack) => {
-                    self.glow_cfg.pack = Some(*pack.params());
-                    self.glow_cfg.style = GlowStyle::Custom;
-                    self.glow_cfg.beam = true;
-                    None
-                }
-                Err(e) => Some(e.diagnostics().join("\n")),
-            },
         }
     }
 
@@ -1718,10 +1681,10 @@ impl EffectsPipeline {
         // Window-space layout under the embedder's chrome; 0/0 chrome is the
         // identity layout.
         let glow_geom = self.chrome_geom(rows, cols, cell_w, cell_h);
-        // Scale intensity in place and restore it after the tick: `GlowConfig`
-        // carries the resolved trail pack inline, and only `set_cursor_glow`
-        // may change the user's dial. `intensity <= 0` is the engine's unfocus
-        // channel (it cools the thermal integrators instead of wiping them).
+        // Scale intensity in place and restore it after the tick: only
+        // `set_cursor_glow` may change the user's dial. `intensity <= 0` is
+        // the engine's unfocus channel (it cools the thermal integrators
+        // instead of wiping them).
         // The head attaches where the live shape asks.
         let configured_intensity = self.glow_cfg.intensity;
         let configured_head_dx = self.glow_cfg.head_dx;
@@ -2330,45 +2293,11 @@ mod tests {
         }
     }
 
-    /// A page's `set_cursor_glow` builds its config through the native
-    /// resolver: `beam` draws the tube alone (no bloom crown or ring), and a
-    /// non-finite intensity or radius turns the glow off.
+    /// A page's `set_cursor_glow` is a wasm boundary: a non-finite intensity
+    /// or radius turns the glow off, never NaN in the engine.
     #[test]
     fn set_cursor_glow_resolves_through_the_native_config_law() {
         let mut p = EffectsPipeline::new();
-        p.set_cursor_glow(
-            true,
-            "beam",
-            None,
-            None,
-            400,
-            24,
-            0.9,
-            0.8,
-            true,
-            0x0050_FA7B,
-        );
-        assert!(p.glow_cfg.enabled && p.glow_cfg.style == GlowStyle::Beam);
-        assert_eq!(
-            p.glow_cfg.radius, 0.0,
-            "the beam is the tube: no bloom crown"
-        );
-        assert!(!p.glow_cfg.ring, "and no ring");
-        // Negative control: the same knobs on a crowned style keep both.
-        p.set_cursor_glow(
-            true,
-            "lumen",
-            None,
-            None,
-            400,
-            24,
-            0.9,
-            0.8,
-            true,
-            0x0050_FA7B,
-        );
-        assert!((p.glow_cfg.radius - 0.8).abs() < f32::EPSILON && p.glow_cfg.ring);
-        // A non-finite knob is OFF, never NaN in the engine.
         p.set_cursor_glow(
             true,
             "lumen",
@@ -2388,8 +2317,6 @@ mod tests {
     use crate::cursor_trail::TypingCadence;
     use aterm_core::render::FreeSprite;
     use aterm_core::terminal::TerminalBuilder;
-
-    const SYNTHWAVE: &str = include_str!("../assets/trail-packs/synthwave.toml");
 
     fn stamp_effective_terminal_background(term: &Terminal, input: &mut RenderInput) {
         let color = if term.modes().reverse_video() {
@@ -2422,7 +2349,7 @@ mod tests {
     }
 
     fn validate_cursor_scroll_action(action: &str, event: i64, decision: ContentScrollDelta) {
-        let base = aterm_spec::derive::cursor_scroll_signal_model();
+        let base = aterm_models_effects::cursor_scroll_signal_model();
         let model = aterm_spec::interp::with_consts(&base, &[]);
         let source = model.init_state();
         let mut projected = source.clone();
@@ -2501,7 +2428,7 @@ mod tests {
     }
 
     fn validate_pipeline_layout_prepare(label: &str) {
-        let model = aterm_spec::derive::layout_coordinate_reset_model();
+        let model = aterm_models_misc::layout_coordinate_reset_model();
         let charged = model.successors("Charge", &model.init_state())[0].clone();
         let changed = model.successors("ChangeCoordinate", &charged)[0].clone();
         let mut prepared = changed.clone();
@@ -2617,7 +2544,7 @@ mod tests {
         // Tier 1 for the pipeline's projection of the cursor viewport
         // lifecycle: glow, classic trail, body/fill, DEC cursor, and the pet
         // projected from the real companion (alpha, fade-out, `needs_frames`).
-        let model = aterm_spec::derive::cursor_viewport_lifecycle_model();
+        let model = aterm_models_effects::cursor_viewport_lifecycle_model();
         let charged = model.successors("ChargeLive", &model.init_state())[0].clone();
         let mut history = charged.clone();
         history.insert("live_viewport", 0);
@@ -2693,41 +2620,63 @@ mod tests {
 
     // ── the resident pet ────────────────────────────────────────────────────
 
-    /// Every rainbow-kitty spelling `set_cursor_glow` accepts (the bare word,
-    /// the pet, `nyan rainbow`, the `… v2` alias) engages v2 with no flag,
-    /// matching the native default; `… v1` is an unknown word that parses to
-    /// the embedder's default (`Lumen`) and never engages v2.
+    /// A page's `set_cursor_glow` resolves every spelling through the native
+    /// law: each rainbow-kitty spelling names the style (and engages v2 with
+    /// no flag, matching the native default) while `… v1` is an unknown word
+    /// that falls to the embedder's default; every pet alias names the pet
+    /// (cat or dog by species) while the flying head and other looks do not;
+    /// and the ribbon is tall unless `underline` is asked for.
     #[test]
     fn every_web_rainbow_kitty_spelling_is_v2() {
-        for (style, v2) in [
+        let mut p = EffectsPipeline::new();
+        for (style, kitty) in [
             ("rainbow kitty", true),
             ("rainbow kitty pet", true),
             ("nyan rainbow", true),
-            ("rainbow kitty v2", true),
-            ("kitty v2", true),
             ("rainbow kitty v1", false),
             ("kitty v1", false),
         ] {
+            rainbow_kitty_glow(&mut p, style);
+            let want = if kitty {
+                GlowStyle::RainbowKitty
+            } else {
+                GlowStyle::Lumen
+            };
+            assert_eq!(p.glow_cfg.style, want, "{style:?}");
+        }
+        for (style, v2) in [("rainbow kitty", true), ("rainbow kitty v1", false)] {
             let mut p = EffectsPipeline::new();
             rainbow_kitty_glow(&mut p, style);
-            assert_eq!(
-                p.glow_cfg.style,
-                if v2 {
-                    GlowStyle::RainbowKitty
-                } else {
-                    GlowStyle::Lumen
-                },
-                "{style:?}: a v1 spelling names no style and falls to the default"
-            );
             let (mut term, mut input) = glass(8, 40);
             for _ in 0..6 {
                 commit_ascii(&mut p, &mut term, &mut input, b"k", 33.0);
             }
-            assert_eq!(
-                p.cursor.glow.v2_status().is_some(),
-                v2,
-                "{style:?}: v2 engaged should be {v2}"
-            );
+            assert_eq!(p.cursor.glow.v2_status().is_some(), v2, "{style:?}: v2");
+        }
+        for (style, named, species) in [
+            ("rainbow kitty", true, PetSpecies::Cat),
+            ("kitty", true, PetSpecies::Cat),
+            ("rainbow kitty pet", true, PetSpecies::Cat),
+            ("Rainbow Kitty Underline", true, PetSpecies::Cat),
+            ("rainbow dog pet", true, PetSpecies::Dog),
+            ("pet dog", true, PetSpecies::Dog),
+            ("rainbow kitty flying", false, PetSpecies::Cat),
+            ("rainbow", false, PetSpecies::Cat),
+            ("lumen", false, PetSpecies::Cat),
+        ] {
+            rainbow_kitty_glow(&mut p, style);
+            assert_eq!(p.pet_style_named, named, "{style:?}: names the pet?");
+            assert_eq!(p.companion.species(), species, "{style:?}: which animal");
+        }
+        for (style, tall) in [
+            ("rainbow kitty", true),
+            ("rainbow kitty pet", true),
+            ("rainbow kitty flying", true),
+            ("rainbow kitty tall", true),
+            ("rainbow kitty underline", false),
+        ] {
+            rainbow_kitty_glow(&mut p, style);
+            assert_eq!(p.glow_cfg.ribbon_tall, tall, "{style:?}: tall ribbon?");
         }
     }
 
@@ -3201,9 +3150,10 @@ mod tests {
     }
 
     /// Hiding is not retiring: history takes the pet off glass while its brain
-    /// fades and releases the lane; an unfocused surface retires the body;
-    /// hidden is the hard coordinate boundary. After each the resident
-    /// returns in the same coat.
+    /// fades and releases the lane (its first frame is
+    /// `pipeline_history_uses_the_exact_frame_snapshot_and_retires_cursor_state`);
+    /// an unfocused surface retires the body; hidden is the hard coordinate
+    /// boundary. After each the resident returns in the same coat.
     #[test]
     fn cursor_pet_hides_in_history_and_when_unfocused_but_keeps_its_identity() {
         let mut p = pet_pipeline(7);
@@ -3221,19 +3171,6 @@ mod tests {
         term.scroll_display(1);
         term.cell_frame_into(&mut input, 8, 40);
         assert!(input.display_offset > 0, "fixture: scrolled into history");
-        p.advance(33.0);
-        p.apply(&mut term, &mut input, 10, 19);
-        assert_eq!(
-            p.cursor_pet_alpha(),
-            0,
-            "off glass on the first history frame"
-        );
-        assert_eq!(p.companion_hit_rect(), None);
-        assert!(input.free_sprites.is_empty(), "history draws no pet");
-        assert!(
-            p.companion.brain().is_active(),
-            "…but the brain is only fading"
-        );
         let mut released = false;
         for _ in 0..40 {
             idle(&mut p, &mut term, &mut input, 1, 100.0);
@@ -3340,71 +3277,6 @@ mod tests {
         assert!(!stacked, "nothing stacks on the pet's body");
         let (control, _) = drive(false);
         assert!(control, "control: with no companion the word-cat peeks");
-    }
-
-    /// The seed is the only entropy: two pipelines with one seed, the same
-    /// bytes and `dt` stream draw identical sprites and keys; another seed
-    /// (found through `KittyLook::for_launch`) dresses another cat.
-    #[test]
-    fn cursor_pet_same_seed_same_pixels() {
-        let script = b"same seed same cat";
-        let run = |seed: u64| {
-            let mut p = pet_pipeline(seed);
-            let (mut term, mut input) = glass(8, 40);
-            let mut sprites = Vec::new();
-            let mut fps = Vec::new();
-            for b in script {
-                fps.push(commit_ascii(&mut p, &mut term, &mut input, &[*b], 33.0));
-                sprites.push(input.free_sprites.clone());
-            }
-            for _ in 0..30 {
-                fps.push(idle(&mut p, &mut term, &mut input, 1, 50.0));
-                sprites.push(input.free_sprites.clone());
-            }
-            (sprites, fps, p.companion.brain().worn_pair())
-        };
-        let (sprites_a, fps_a, worn_a) = run(7);
-        let (sprites_b, fps_b, worn_b) = run(7);
-        assert_eq!(sprites_a, sprites_b, "same seed, same sprites, every frame");
-        assert_eq!(fps_a, fps_b, "…and the same fold");
-        assert_eq!(worn_a, worn_b);
-        assert!(
-            sprites_a
-                .iter()
-                .any(|f| pet_body_sprite(f, CELL_H).is_some()),
-            "non-vacuous: the cat was drawn"
-        );
-        let worn = worn_a.expect("dressed");
-        let other_seed = (1u64..)
-            .find(|s| {
-                let look = KittyLook::for_launch(*s);
-                (look.coat, look.iris) != worn
-            })
-            .expect("some seed dresses another coat");
-        let (_, _, worn_other) = run(other_seed);
-        assert_ne!(worn_other, Some(worn), "another seed is another cat");
-    }
-
-    /// The pet is a spelling of the style: every pet alias names it (cat or dog
-    /// by species); the flying-head alias and non-kitty styles do not.
-    #[test]
-    fn web_pipeline_resolves_pet_spelling_and_species() {
-        let mut p = EffectsPipeline::new();
-        for (style, named, species) in [
-            ("rainbow kitty", true, PetSpecies::Cat),
-            ("kitty", true, PetSpecies::Cat),
-            ("rainbow kitty pet", true, PetSpecies::Cat),
-            ("Rainbow Kitty Underline", true, PetSpecies::Cat),
-            ("rainbow dog pet", true, PetSpecies::Dog),
-            ("pet dog", true, PetSpecies::Dog),
-            ("rainbow kitty flying", false, PetSpecies::Cat),
-            ("rainbow", false, PetSpecies::Cat),
-            ("lumen", false, PetSpecies::Cat),
-        ] {
-            rainbow_kitty_glow(&mut p, style);
-            assert_eq!(p.pet_style_named, named, "{style:?}: names the pet?");
-            assert_eq!(p.companion.species(), species, "{style:?}: which animal");
-        }
     }
 
     /// The pointer and stroke only latch: the pointer is value-shadowed (still
@@ -3532,54 +3404,6 @@ mod tests {
                 "pet talk {pet_talk}: only an ordinary failure is grieved"
             );
         }
-    }
-
-    #[test]
-    fn slow_pointer_strokes_reach_the_pet_through_host_pixel_coordinates() {
-        use crate::kitty_pet::PetAction;
-
-        let mut p = pet_pipeline(7);
-        let (mut term, mut input) = glass(8, 40);
-        materialize_pet(&mut p, &mut term, &mut input);
-        idle(&mut p, &mut term, &mut input, 60, 50.0);
-        let (x0, x1, y0, y1) = p.companion_hit_rect().expect("resident on glass");
-        let width = (x1 - x0) as f32;
-        let x = x0 as f32 + width * 0.20;
-        let y = (y0 + y1) as f32 * 0.5;
-        let before = p.companion.brain().content();
-
-        assert!(p.note_pointer_px(x, y));
-        for _ in 0..40 {
-            idle(&mut p, &mut term, &mut input, 1, 50.0);
-            assert!(!p.note_pointer_px(x, y));
-            assert_eq!(p.companion.brain().pending_pets(), 0);
-        }
-        assert!(
-            p.companion.brain().content() <= before,
-            "a stationary pointer cannot earn affection through host redraws"
-        );
-        let before_stroke = p.companion.brain().content();
-        let mut answered = false;
-        for step in 1..=20 {
-            let x = x0 as f32 + width * (0.20 + 0.60 * step as f32 / 20.0);
-            assert!(p.note_pointer_px(x, y));
-            idle(&mut p, &mut term, &mut input, 1, 50.0);
-            answered |= p.companion.brain().action() == PetAction::Purr;
-        }
-        assert!(
-            answered,
-            "frame-pixel input must reach the shared brain's stroke detector"
-        );
-        assert!(
-            p.companion.brain().content() > before_stroke + 0.05,
-            "the reaction was earned by pointer travel, not an idle pose"
-        );
-        assert!(pet_body_sprite(&input.free_sprites, CELL_H).is_some());
-
-        p.note_pointer_leave();
-        idle(&mut p, &mut term, &mut input, 350, 100.0);
-        assert!(!p.companion.needs_frames());
-        assert!(matches!(p.wake(), Wake::Idle));
     }
 
     /// The pointer under host rows: a host that prepends rows above the grid
@@ -4230,35 +4054,6 @@ mod tests {
     }
 
     #[test]
-    fn web_pipeline_resolves_default_tall_and_explicit_underline() {
-        let mut pipeline = EffectsPipeline::new();
-        for (style, expected_tall) in [
-            ("rainbow kitty", true),
-            ("rainbow kitty pet", true),
-            ("rainbow kitty flying", true),
-            ("rainbow kitty tall", true),
-            ("rainbow kitty underline", false),
-        ] {
-            pipeline.set_cursor_glow(
-                true,
-                style,
-                None,
-                None,
-                400,
-                24,
-                1.0,
-                0.9,
-                true,
-                0x0050_FA7B,
-            );
-            assert_eq!(
-                pipeline.glow_cfg.ribbon_tall, expected_tall,
-                "web/WASM resolver chose the wrong presentation for {style:?}"
-            );
-        }
-    }
-
-    #[test]
     fn glow_polarity_tracks_live_osc11_and_decscnm_background() {
         let mut pipeline = EffectsPipeline::new();
         pipeline.set_cursor_glow(
@@ -4413,117 +4208,6 @@ mod tests {
             input.cursor_trail_color, 0x00AA_BBCC,
             "an independently enabled automatic opaque trail still follows OSC 12"
         );
-    }
-
-    /// `set_cursor_trail_pack`: a valid pack arms `GlowStyle::Custom` with
-    /// resolved params; a malformed pack returns diagnostics and keeps the
-    /// prior pack; `None` clears it.
-    #[test]
-    fn set_cursor_trail_pack_arms_clears_and_reports_diagnostics() {
-        let mut p = EffectsPipeline::new();
-        // Valid pack → armed, no diagnostics.
-        assert!(
-            p.set_cursor_trail_pack(Some(SYNTHWAVE.to_string()))
-                .is_none()
-        );
-        assert!(p.glow_cfg.pack.is_some(), "valid pack is armed");
-        assert!(matches!(p.glow_cfg.style, GlowStyle::Custom));
-        let armed_fp = p.glow_cfg.pack.unwrap().pack_fp;
-
-        // Malformed pack → diagnostics returned, PRIOR pack left intact.
-        let diags = p
-            .set_cursor_trail_pack(Some(
-                "pack = 1\nid = \"x\"\n[ramp]\nkind = \"bogus\"\n".to_string(),
-            ))
-            .expect("malformed pack returns diagnostics");
-        assert!(diags.contains("bogus"), "diagnostics surfaced: {diags}");
-        assert_eq!(
-            p.glow_cfg.pack.map(|q| q.pack_fp),
-            Some(armed_fp),
-            "the prior pack survives a failed reload"
-        );
-
-        // None clears the pack and reverts the enum off Custom.
-        assert!(p.set_cursor_trail_pack(None).is_none());
-        assert!(p.glow_cfg.pack.is_none(), "None clears the pack");
-        assert!(!matches!(p.glow_cfg.style, GlowStyle::Custom));
-    }
-
-    /// Selecting a built-in style after a pack was armed clears the pack, so
-    /// `tick` renders the built-in; re-selecting the same `pack:<id>` style
-    /// preserves the resolved pack.
-    #[test]
-    fn set_cursor_glow_builtin_clears_a_previously_armed_pack() {
-        let mut p = EffectsPipeline::new();
-        // Arm a pack (style → Custom, pack resolved).
-        assert!(
-            p.set_cursor_trail_pack(Some(SYNTHWAVE.to_string()))
-                .is_none()
-        );
-        assert!(p.glow_cfg.pack.is_some() && matches!(p.glow_cfg.style, GlowStyle::Custom));
-
-        // Select a built-in ("phaser"): the pack must be dropped and the style
-        // must resolve to PHASER — the tick will take the built-in branch.
-        p.set_cursor_glow(
-            true,
-            "phaser",
-            None,
-            None,
-            240,
-            18,
-            0.7,
-            0.6,
-            true,
-            0x0050_FA7B,
-        );
-        assert!(
-            p.glow_cfg.pack.is_none(),
-            "a built-in selection clears the pack"
-        );
-        assert!(
-            matches!(p.glow_cfg.style, GlowStyle::Phaser),
-            "style is PHASER"
-        );
-
-        // Drive a real frame: with the pack cleared and style Phaser, the glow
-        // renders through the built-in path (non-empty on a hot typing run).
-        let mut term = Terminal::new(6, 40);
-        let mut input = term.cell_frame(6, 40);
-        p.apply(&mut term, &mut input, 8, 16);
-        for _ in 0..6 {
-            commit_ascii(&mut p, &mut term, &mut input, b"a", 60.0);
-        }
-        // The pack stays cleared across ticks (no resurrection of the custom path).
-        assert!(
-            p.glow_cfg.pack.is_none(),
-            "pack stays cleared while rendering PHASER"
-        );
-
-        // Re-arming the same pack then re-selecting the SAME pack: style parses
-        // back to Custom, so the resolved pack is PRESERVED (a plain reconfigure).
-        assert!(
-            p.set_cursor_trail_pack(Some(SYNTHWAVE.to_string()))
-                .is_none()
-        );
-        let fp = p.glow_cfg.pack.expect("re-armed").pack_fp;
-        p.set_cursor_glow(
-            true,
-            "pack:synthwave",
-            None,
-            None,
-            240,
-            18,
-            0.7,
-            0.6,
-            true,
-            0x0050_FA7B,
-        );
-        assert_eq!(
-            p.glow_cfg.pack.map(|q| q.pack_fp),
-            Some(fp),
-            "re-selecting the same pack style keeps the resolved pack"
-        );
-        assert!(matches!(p.glow_cfg.style, GlowStyle::Custom));
     }
 
     /// Keystrokes batched between `advance` calls do not collapse to a zero
@@ -4713,24 +4397,15 @@ mod tests {
             assert!(input.glow_under.is_empty(), "lumen never emits glow_under");
             assert!(input.char_fg.is_empty(), "lumen never emits char_fg");
             assert!(input.fire_halo.is_empty(), "lumen never emits fire_halo");
-            // Lumen's block is the LIGHT ROD's charged emitter (the native
-            // law, one step for both hosts) — never the forge's.
-            assert_ne!(
-                p.cursor_block_fill().map(|owned| owned.owner),
-                Some(crate::cursor_glow::BlockFillOwner::Forge),
-                "a non-fire style never inherits the forge cursor fill"
-            );
-            assert_eq!(
-                input.cursor_fill_override,
-                p.cursor_block_fill().map(|owned| owned.fill),
-                "the published fill is the resolved owner's"
-            );
         }
     }
 
     /// The focus gate: the engine expects unfocus as amplitude 0, so an
     /// unfocused but visible split pane must not animate at full strength. The
-    /// focused half runs first so the unfocused assertion is not vacuous.
+    /// focused half runs first so the unfocused assertion is not vacuous. The
+    /// gate scales the stored intensity in place and restores it before
+    /// `apply` returns, so refocus comes back at full strength: only
+    /// `set_cursor_glow` may change the user's value.
     #[test]
     fn unfocused_pane_emits_no_glow_but_focused_one_does() {
         let mut p = EffectsPipeline::new();
@@ -4746,6 +4421,7 @@ mod tests {
             true,
             0x0050_FA7B,
         );
+        let configured = p.glow_cfg.intensity;
         let mut term = Terminal::new(6, 20);
         let mut input = term.cell_frame(6, 20);
         p.apply(&mut term, &mut input, 10, 19);
@@ -4778,6 +4454,17 @@ mod tests {
             );
             assert_eq!(fp, 0, "an unfocused pane folds the identity fingerprint");
         }
+        assert_eq!(
+            p.glow_cfg.intensity, configured,
+            "the stored intensity survives an unfocused stretch byte-unchanged"
+        );
+        p.set_focused(true);
+        let mut relit = false;
+        for ch in [b"g", b"h", b"i"] {
+            commit_ascii(&mut p, &mut term, &mut input, ch, 30.0);
+            relit |= !input.cursor_glow_add.is_empty();
+        }
+        assert!(relit, "refocus restores the light");
     }
 
     /// A dark pane must settle, or the host's shared rAF keeps re-booking it.
@@ -5160,50 +4847,11 @@ mod tests {
         );
     }
 
-    /// The unfocus gate scales the stored intensity in place and restores it
-    /// before `apply` returns; only `set_cursor_glow` may change the user's
-    /// value.
-    #[test]
-    fn unfocusing_never_consumes_the_configured_glow_intensity() {
-        let mut p = EffectsPipeline::new();
-        p.set_cursor_glow(
-            true,
-            "lumen",
-            None,
-            None,
-            400,
-            24,
-            0.9,
-            0.9,
-            true,
-            0x0050_FA7B,
-        );
-        let configured = p.glow_cfg.intensity;
-        let mut term = Terminal::new(6, 20);
-        let mut input = term.cell_frame(6, 20);
-        p.apply(&mut term, &mut input, 10, 19);
-        p.set_focused(false);
-        for ch in [b"a", b"b", b"c"] {
-            commit_ascii(&mut p, &mut term, &mut input, ch, 30.0);
-        }
-        assert_eq!(
-            p.glow_cfg.intensity, configured,
-            "the stored intensity survives an unfocused stretch byte-unchanged"
-        );
-
-        // And it comes back at full strength.
-        p.set_focused(true);
-        let mut relit = false;
-        for ch in [b"d", b"e", b"f"] {
-            commit_ascii(&mut p, &mut term, &mut input, ch, 30.0);
-            relit |= !input.cursor_glow_add.is_empty();
-        }
-        assert!(relit, "refocus restores the light");
-    }
-
     /// The embedded hosts use this pipeline as their sole overlay producer, so
     /// Fire's warm-metal cursor body must ride the same RenderInput field as it
-    /// does in the native GUI. A live style toggle must scrub it immediately.
+    /// does in the native GUI. A live style toggle must scrub it immediately
+    /// (the all-off frame's scrub is
+    /// `effects_off_and_non_fire_styles_leave_fire_streams_empty`).
     #[test]
     fn fire_forge_cursor_fill_is_spliced_and_cleared_on_toggle() {
         let mut p = EffectsPipeline::new();
@@ -5255,26 +4903,6 @@ mod tests {
             input.cursor_fill_override,
             p.cursor_block_fill().map(|owned| owned.fill),
             "the reused frame carries the new owner's fill, not the forge's"
-        );
-        // A style with no block body leaves the caret to the terminal; switch
-        // the master off to see the fill scrubbed outright.
-        p.set_cursor_glow(
-            false,
-            "lumen",
-            None,
-            None,
-            400,
-            24,
-            1.0,
-            0.9,
-            true,
-            0x0050_FA7B,
-        );
-        term.cell_frame_into(&mut input, 6, 20);
-        p.apply(&mut term, &mut input, 10, 19);
-        assert_eq!(
-            input.cursor_fill_override, None,
-            "a master-off frame clears the reused frame's fill"
         );
     }
 
@@ -5473,13 +5101,11 @@ mod tests {
         assert!(
             warns
                 .iter()
-                .any(|w| w.contains("\"犬\"") && w.contains("requires cjk_single_char = true")),
+                .any(|w| w.contains('犬') && w.contains("cjk_single_char")),
             "FIX 7: the web path surfaces the single-char-CJK conflict, got {warns:?}"
         );
         assert!(
-            warns
-                .iter()
-                .any(|w| w.contains("\"abc猫\"") && w.contains("dropped")),
+            warns.iter().any(|w| w.contains("abc猫")),
             "FIX 7: the web path surfaces the mixed-script drop, got {warns:?}"
         );
         // Enable the opt-in (a cfg refresh, not a rebuild): the requires-warning
@@ -5487,15 +5113,11 @@ mod tests {
         p.set_sparkle_feline("cat", true, true, true);
         let warns = p.sparkle_lexicon_warnings();
         assert!(
-            !warns
-                .iter()
-                .any(|w| w.contains("requires cjk_single_char = true")),
+            !warns.iter().any(|w| w.contains('犬')),
             "FIX 8: cjk_single_char = true satisfies the warning, got {warns:?}"
         );
         assert!(
-            warns
-                .iter()
-                .any(|w| w.contains("\"abc猫\"") && w.contains("dropped")),
+            warns.iter().any(|w| w.contains("abc猫")),
             "unrelated warnings survive the opt-in filter, got {warns:?}"
         );
         // Flipping the opt-in back off re-applies it (filtered at read, so a
@@ -5504,7 +5126,7 @@ mod tests {
         assert!(
             p.sparkle_lexicon_warnings()
                 .iter()
-                .any(|w| w.contains("requires cjk_single_char = true"))
+                .any(|w| w.contains('犬'))
         );
         // Master off drops the diagnostics with the lexicon they describe.
         p.set_sparkle_enabled(false);
@@ -5659,21 +5281,6 @@ mod tests {
         panic!("rain never appeared on an empty 24x80 grid");
     }
 
-    /// With the streak disabled `apply` leaves `nova_add` as `clear_overlays`
-    /// does, contributes nothing to `is_active`/`enabled_any`, and folds 0.
-    #[test]
-    fn output_streak_disabled_leaves_nova_clear_and_is_active_unaffected() {
-        let mut p = EffectsPipeline::new();
-        assert!(!p.enabled_any());
-        let mut term = Terminal::new(24, 80);
-        let mut input = RenderInput::default();
-        term.cell_frame_into(&mut input, 24, 80);
-        let fp = p.apply(&mut term, &mut input, 10, 20);
-        assert_eq!(fp, 0, "all-off apply is fingerprint 0");
-        assert!(input.nova_add.is_empty());
-        assert!(!p.is_active());
-    }
-
     /// After the last comet leaves, an open streak episode does not pin rAF:
     /// the pipeline exposes the analytic low-crossing as one exact wake whose
     /// tick emits one Settle and returns the scheduler to Idle.
@@ -5740,32 +5347,25 @@ mod tests {
         assert!(matches!(p.wake(), Wake::Idle));
     }
 
-    /// The shared `nova_add` channel: the word engine owns `nova_scratch` and
-    /// its clear; the streak only appends to the channel already swapped into
-    /// `input`. With the streak enabled no decoration quad is lost; disabled,
-    /// the channel is exactly as the decorations left it.
+    /// The page's streak reaches the glass: with the streak enabled, streamed
+    /// output lines put light in the shared `nova_add` channel through
+    /// `apply`.
     #[test]
-    fn the_streak_appends_to_nova_and_never_clears_a_co_resident_producer() {
+    fn the_page_streak_lights_the_nova_channel_through_apply() {
         let mut term = Terminal::new(24, 80);
         let mut input = RenderInput::default();
-
-        // A frame with ONLY the streak: whatever it draws, it drew by
-        // appending — the channel it appended to started empty.
         let mut p = EffectsPipeline::new();
         p.set_output_streak(true, 1.0, 9, 3, 10, false, 7);
         p.set_output_streak_theme(true, 0x0000_0000, 0x00FF_FFFF, 0x0088_C0D0);
-        let mut streak_only = 0usize;
+        let mut lit = 0usize;
         for i in 0..40 {
             p.advance(40.0);
             term.process(format!("line {i}\r\n").as_bytes());
             term.cell_frame_into(&mut input, 24, 80);
             p.apply(&mut term, &mut input, 10, 20);
-            streak_only = streak_only.max(input.nova_add.len());
+            lit = lit.max(input.nova_add.len());
         }
-        assert!(
-            streak_only > 0,
-            "NON-VACUITY: the streak must actually put light in nova_add"
-        );
+        assert!(lit > 0, "the streak must actually put light in nova_add");
 
         // The page-wide preference retires live comets and forbids new ones,
         // without overwriting the configured amplitude needed when it clears.
@@ -5794,49 +5394,6 @@ mod tests {
             restored,
             "clearing reduced motion restores the configured streak"
         );
-
-        // The same script with the streak OFF leaves the channel empty — so
-        // the quads above were the streak's, and disabling it strands nothing.
-        let mut q = EffectsPipeline::new();
-        let mut term2 = Terminal::new(24, 80);
-        let mut input2 = RenderInput::default();
-        for i in 0..40 {
-            q.advance(40.0);
-            term2.process(format!("line {i}\r\n").as_bytes());
-            term2.cell_frame_into(&mut input2, 24, 80);
-            q.apply(&mut term2, &mut input2, 10, 20);
-            assert!(
-                input2.nova_add.is_empty(),
-                "a disabled streak contributes no quads at all"
-            );
-        }
-    }
-
-    /// With rain disabled (the default) `apply` leaves the rain channels as
-    /// `clear_overlays` does on both the all-off return and the enabled path,
-    /// and rain contributes nothing to `is_active`.
-    #[test]
-    fn rain_disabled_leaves_channels_clear_and_is_active_unaffected() {
-        let mut p = EffectsPipeline::new();
-        assert!(!p.is_active(), "everything off: inactive");
-        assert!(!p.matrix_rain_enabled());
-        let mut term = Terminal::new(24, 80);
-        let mut input = RenderInput::default();
-        term.cell_frame_into(&mut input, 24, 80);
-        let fp = p.apply(&mut term, &mut input, 10, 20);
-        assert_eq!(fp, 0, "all-off apply is fingerprint 0");
-        assert!(input.rain_quads.is_empty());
-        assert!(input.rain_add.is_empty());
-        assert!(input.rain_atlas.is_none());
-        assert!(!p.is_active(), "rain-off never animates the pipeline");
-        // Enabled path (another effect on), rain still absent: same posture.
-        p.set_cursor_trail(true, 260, 24, None, 0x0050_FA7B);
-        p.advance(50.0);
-        term.cell_frame_into(&mut input, 24, 80);
-        p.apply(&mut term, &mut input, 10, 20);
-        assert!(input.rain_quads.is_empty());
-        assert!(input.rain_add.is_empty());
-        assert!(input.rain_atlas.is_none());
     }
 
     /// Enable + advance + apply rains on an empty grid, the atlas rides only

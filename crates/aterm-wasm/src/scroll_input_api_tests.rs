@@ -9,10 +9,7 @@ use super::*;
 
 #[test]
 fn render_presents_the_banked_residual_and_is_identity_at_zero() {
-    let Some(mut t) = terminal_with_history() else {
-        eprintln!("no system font; skipping render smoke");
-        return;
-    };
+    let mut t = terminal_with_history();
     t.render();
     let base = t.rgba();
     // Bank half a row: same engine offset, but the presented frame shifts.

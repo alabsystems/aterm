@@ -5,8 +5,9 @@
 //! canvas path, and `aterm-gpu-web`, the WebGL path), with no third-party
 //! dependency: the layer that replaces wasm-bindgen
 //! (docs/AUDIT-third-party-2026-10-15.md, wasm-platform WP.3 and WP.6).
-//! `aterm-wasm` exports through it and imports through [`host`] (WP.7);
-//! `aterm-gpu-web` takes only [`panic_hook`] until it leaves wasm-bindgen.
+//! `aterm-wasm` (WP.7) and `aterm-gpu-web` (WP.8) export through it and
+//! import through [`host`]; aterm-gpu's WebGL2 arm imports its GL calls
+//! beside it (`aterm_gl`) and takes its canvas as a [`js`] object.
 //!
 //! * [`export`] (from `aterm-wasm-abi-macros`) marks what JS sees: a
 //!   `struct` becomes a class, the `pub fn`s of its `impl` its methods
@@ -18,7 +19,9 @@
 //!   `Err`, a misused handle) is left in the return slot for the glue to
 //!   throw, never thrown through an import.
 //! * [`marshal`] is how each type crosses; [`handle`] is how a class's value
-//!   lives behind a JS object (null, aliasing and post-trap checks).
+//!   lives behind a JS object (null, aliasing and post-trap checks); [`js`]
+//!   is how a JS object the host hands in (a canvas) lives in the module: as
+//!   its slot in the glue's object table.
 //! * [`descriptor`] is what each export tells the glue generator,
 //!   `verify glue`, in the module's `aterm_abi` custom section.
 //! * [`host`] is the JS the module calls (`console.error`,
@@ -51,6 +54,11 @@ pub mod handle;
     reason = "the aterm_host imports and the buffers they hand over"
 )]
 pub mod host;
+#[allow(
+    unsafe_code,
+    reason = "a JS object's slot crosses as a word the glue vouches for"
+)]
+pub mod js;
 #[allow(
     unsafe_code,
     reason = "buffers cross the boundary as pointers and lengths the glue allocates"

@@ -49,13 +49,6 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn test_lock_or_recover_normal_access() {
-        let m = Mutex::new(42);
-        let guard = m.lock_or_recover();
-        assert_eq!(*guard, 42);
-    }
-
-    #[test]
     fn test_lock_or_recover_after_poison() {
         let m = Arc::new(Mutex::new(0));
         let m2 = Arc::clone(&m);

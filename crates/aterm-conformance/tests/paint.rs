@@ -57,19 +57,16 @@ mod measuring {
         }
     }
 
-    /// Opens every take that decided nothing, so the verify gate records the
-    /// machine (COULD NOT RUN), not a paint finding.
-    const COULD_NOT_RUN: &str = "aterm-gate: COULD NOT RUN";
-
     fn run(row: PaintRow) {
         let rig = Rig::release(&["ATERM_PAINT_BIN"], env!("CARGO_BIN_EXE_fake-tui"));
         let scene = row.scene.name();
         let report = match measure(&rig, &row) {
             Ok(report) => report,
-            Err(why) => panic!(
-                "{COULD_NOT_RUN} — PAINT COULD NOT RUN [{scene}]: the take decided nothing, which \
-                 is not a pass: {why}"
-            ),
+            // A take that decided nothing ends COULD NOT RUN, so the verify gate
+            // records the machine, not a paint finding.
+            Err(why) => aterm_spec::host::could_not_run(format!(
+                "PAINT COULD NOT RUN [{scene}]: the take decided nothing, which is not a pass: {why}"
+            )),
         };
         match report.disposition {
             Disposition::Pass => eprintln!("{report}"),
@@ -78,12 +75,12 @@ mod measuring {
                 row.expect,
                 row.meaning()
             ),
-            Disposition::Unproved => panic!(
-                "{COULD_NOT_RUN} — PAINT UNPROVED [{scene}]: the take is not evidence about paint ({}); take it on an \
+            Disposition::Unproved => aterm_spec::host::could_not_run(format!(
+                "PAINT UNPROVED [{scene}]: the take is not evidence about paint ({}); take it on an \
                  unloaded machine, from an interactive shell or a LaunchAgent with \
                  ProcessType=Interactive.\n  {report}",
                 report.starvation
-            ),
+            )),
         }
     }
 

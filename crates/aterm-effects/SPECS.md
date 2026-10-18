@@ -3,9 +3,21 @@
 
 # aterm-effects: spec recovery from its 3027 unit tests
 
-> Status 2026-10-15: this is the crate's migration worklist. Each of the 854 specs below is
+> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 863 tests
+> it deleted and 19 specs whose functions it deleted are gone. Counts elsewhere in this file
+> were taken before.
+>
+> 2026-10-17: three more specs went with code deleted since: `pl-trail-pack` (Trail Packs),
+> `hole-tripwire` (the Rainbow Kitty v2 hole tripwire) and `v1-refines-v056` (the frozen v0.56
+> synth reference). Two §2 rows of deleted tests went too, and their specs' `primary_tests`
+> dropped by one each. Two renamed tests now carry their new names. Four §4 rows whose work is
+> done went (the two cursor benches and the v2 frame-cost budget live in `benches/`, the
+> wrap-band census is deleted), and so did the §5 item about the companion router's test-only
+> composition, which is deleted; the items after it moved up one.
+
+> Status 2026-10-15: this is the crate's migration worklist. Each of the 855 specs below is
 > proved through Trust/Clean about the compiled Rust function, then the tests it subsumes are
-> deleted. The 96 tests in §4 sample no spec; delete or move them as §4 says. Nothing here is
+> deleted. The 97 tests in §4 sample no spec; delete or move them as §4 says. Nothing here is
 > proved yet.
 >
 > **Blocked on seal `150efe4a` (measured 2026-10-16): the whole crate, not one spec.** A strict
@@ -26,7 +38,7 @@ are mentions in comments (`tests/effects_suite.rs`, `tests/pet_holds_through_a_t
 `tests/trick_flash_alloc.rs`, `tests/typed_tricks_alloc.rs`), so the crate has 3027 tests.
 Nothing was compiled or run; every claim comes from reading the code and the tests.
 
-Result: **854 specs**, covering **2931 tests** as primary. **96 tests are not spec
+Result: **855 specs**, covering **2931 tests** as primary. **97 tests are not spec
 samples** (§4). Every test is in exactly one of §2 or §4.
 
 Specs that were the same property seen from different chunks were merged: the exact-tile baker
@@ -89,8 +101,8 @@ park, quad and idle-to-zero laws (the cursor_glow unit tests and the host-seam i
   Today these are Tier-1 tests; the spec is the projection lemma over all inputs.
 - Spec-only reference functions: several tests compare against a `#[cfg(test)]` model
   (`cursor_trail::line_cells`, `effect_util` walked ramp, `simhash_majority_reference`,
-  `generate_spectrum_table`, `v056_reference::RefSynth`, `peak_shade_quadratic`). Those become the
-  spec's model, not code that ships.
+  `generate_spectrum_table`, `peak_shade_quadratic`). Those become the spec's model, not code that
+  ships.
 
 
 ## 1. Specs (TSV)
@@ -99,7 +111,7 @@ Columns: `id`, `kind`, `functions`, `statement`, `blocking_gaps` (audit §7 row 
 
 ```tsv
 id	kind	functions	statement	blocking_gaps	primary_tests
-exact-tile-baker-lru	refinement	pet_baker::ExactTileBaker::{begin_frame,clear,tile,evict_lru,version,len,resident_bytes}; animal_baker::AnimalBakeKey::bake; robi_baker::RobiBakeKey::bake	Model M = (slots of (key, pixels, last_used), bytes, clock, bakes_left, version, cell). begin_frame(cw,ch): clock+1, bakes_left := MAX_BAKES_PER_FRAME, a metric change clears and stores the cell. clear(): no-op when empty, else slots := [], bytes := 0, version+1. tile(k) with (w,h)=k.size(): w=0, h=0 or 4wh > MAX_ATLAS_BYTES gives None with M unchanged (no bake spent); a hit gives Some(the cached pixels, exactly 4wh bytes), stamps last_used, version unchanged; a miss with no budget gives None; a miss with budget spends one bake, evicts the minimum (last_used, index) slot until len < MAX_SLOTS and bytes+want <= MAX_ATLAS_BYTES, inserts k.bake_tile().pixels() and bumps version. Invariants over every call sequence: len <= MAX_SLOTS, bytes = sum of resident tile sizes <= MAX_ATLAS_BYTES, keys unique, every cached tile equals the bake of its key, at most MAX_BAKES_PER_FRAME cold bakes per frame.	0,1,2,7,11	10
+exact-tile-baker-lru	refinement	pet_baker::ExactTileBaker::{begin_frame,clear,tile,evict_lru,version,len,resident_bytes}; animal_baker::AnimalBakeKey::bake	Model M = (slots of (key, pixels, last_used), bytes, clock, bakes_left, version, cell). begin_frame(cw,ch): clock+1, bakes_left := MAX_BAKES_PER_FRAME, a metric change clears and stores the cell. clear(): no-op when empty, else slots := [], bytes := 0, version+1. tile(k) with (w,h)=k.size(): w=0, h=0 or 4wh > MAX_ATLAS_BYTES gives None with M unchanged (no bake spent); a hit gives Some(the cached pixels, exactly 4wh bytes), stamps last_used, version unchanged; a miss with no budget gives None; a miss with budget spends one bake, evicts the minimum (last_used, index) slot until len < MAX_SLOTS and bytes+want <= MAX_ATLAS_BYTES, inserts k.bake_tile().pixels() and bumps version. Invariants over every call sequence: len <= MAX_SLOTS, bytes = sum of resident tile sizes <= MAX_ATLAS_BYTES, keys unique, every cached tile equals the bake of its key, at most MAX_BAKES_PER_FRAME cold bakes per frame.	0,1,2,7,11	10
 bake-tile-geometry	contract	animal_baker::bake_species; cat_baker::{bake_variant,bake_variant_with}; BakeKeyV4::bake	bake_species(id,f,w,h) is a w x h tile (pixels().len() = 4wh) and bake_variant_with(id,acc,f,w,h,eyes) a (w+PATCH_STRIP) x h tile; both are functions of their arguments only. Table half over ANIMAL_GLYPHS and GLYPHS: for w,h >= 16 every roster entry paints at least one non-zero texel.	0,1,3,7	2
 catbaker-slot-count	contract	cat_baker::CatBaker::slot_count	slot_count(ch) = clamp(floor(MAX_ATLAS_BYTES / (32*max(ch,1)^2)), 1, MAX_SLOTS). Corollary for 1 <= ch <= 256: slot_count(ch)*(4ch)(2ch)*4 <= MAX_ATLAS_BYTES (false above 256, §5).	0,3	1
 catbaker-atlas-lru	contract	cat_baker::CatBaker::{begin_frame,clear,get_v4,host_tile,host_peek,touch,bake_slot,install,atlas,version}	get_v4(k) is None with no state change when cell_h = 0, k.w = 0, k.w+PATCH_STRIP > slot_w, k.h = 0 or k.h > 2ch (host_tile likewise for w > slot_w, h > 2ch or short rgba). A resident key returns CatTile{ax:0, ay:i*2ch}, stamps last_used, version unchanged. A miss spends one bake even when refused; with no budget it returns None; otherwise it takes the first free slot, else the LRU slot (lowest index on ties) whose last_used != clock, and returns None when every slot was served this frame. install writes band i, zeroes the rest of the band, bumps version, marks dirty. begin_frame resets the budget to MAX_BAKES_PER_FRAME; a metric change clears (version+1 iff something was resident or published) and atlas() = None after clear. atlas() rebuilds only when dirty, else returns the same Arc. Invariant: band i equals key_i.bake() (or the host rgba) padded.	0,1,2,3,7	6
@@ -128,7 +140,7 @@ pet-arrival-mapping	contract	companion::pet_arrival_for_sync; kitty_registry::co
 pin-pet-mode-exit	contract	companion::pin_pet_mode_exit	f'.exit = Plain if pm else f.exit; every other field unchanged.	0,1,2	1
 cat-color-key-footprint	contract	companion::cursor_cat_color_key; CompanionOwner::emit_on	Degenerate geometry, no cells or an empty clipped footprint gives from_rgb(fbg,ffg,facc). Otherwise with S the first 64 row-major cells of the footprint's cell rectangle, the key is from_rgb_span(avg bg, first visible fg or ffg, avg visible fg or facc, min band, max band); cells outside the rectangle never matter. Over blank glass the key is from_rgb(bg, ContrastFallback.cursor, ContrastFallback.accent).	0,1,3,7	3
 pet-ink-binding	contract	companion::prepare_resident_pet_tick; CompanionOwner::feed_ink; WordDecorations::{bind_pane,pet_ink}	With pane = Some((s,o)), bind_pane(s,o) happens before pet_ink() is read, and pet.species() = species afterwards.	0,1,2,4	1
-reduced-handoff-refines-model	refinement	kitty_pet::PetBrain::tick; kitty_cursor::CursorCat::{set_singing,static_frame}; aterm_spec::derive::reduced_motion_companion_handoff_model	Under reduced motion every custody step projected onto (phase, singer_visible, pet_ready, pet_visible) is a transition of reduced_motion_companion_handoff_model, and the resident's alpha stays 255; a cold reduced-motion PetBrain's first live-caret tick has alpha 255.	0,1,2,10	1
+reduced-handoff-refines-model	refinement	kitty_pet::PetBrain::tick; kitty_cursor::CursorCat::{set_singing,static_frame}; aterm_models_effects::reduced_motion_companion_handoff_model	Under reduced motion every custody step projected onto (phase, singer_visible, pet_ready, pet_visible) is a transition of reduced_motion_companion_handoff_model, and the resident's alpha stays 255; a cold reduced-motion PetBrain's first live-caret tick has alpha 255.	0,1,2,10	1
 pet-brain-settles	other	kitty_pet::PetBrain::{tick,needs_frames}; CompanionOwner::{prepare,tick,needs_frames}	Liveness: from every reachable PetBrain, ticks with caret = None reach needs_frames() = false within bounded time; on each such owner frame on_glass = false, alpha() = 0, hit_rect() = None. An unticked brain keeps its needs_frames value.	0,1,2,5,7	2
 owner-custody	contract	CompanionOwner::{prepare,tick}	For every frame: owned = enabled and not serious and resident_pet_owner_present(..); visible = owned and resident_pet_surface_presentable(..); not owned retires the brain; on_glass = visible and pet.alpha > 0; pet.alpha ignores shed_envelope; duty = cursor_companion_duty(on_glass, pet_mode ? 0 : shed_companion_alpha(..), painted_caret); body_px = on_glass ? pet.body_px : None; hit_rect = pet_hit_rect_win(body_px, origin); alpha() = on_glass ? pet.alpha : 0. An obscured or unowned surface keeps nothing clickable; an obscured one keeps the brain active.	0,1,2,4	3
 owner-sense-projection	contract	CompanionOwner::prepare	sense.write = frame_unfinished and not cursor_visible; a write frame reads the latched finished caret of the same live session, else (facts.caret, cursor_visible); the latch is written only on present non-write frames. sense.caret = visible ? caret : None; pointer = present and hit_rect and visible ? pet_pointer_cell(..) : None; reduced_motion = host.reduced_motion. A withdrawn, hidden or unpresented body senses no pointer.	0,1,2	5
@@ -144,11 +156,10 @@ owner-note-peeks	contract	CompanionOwner::note_peeks	Drains every cue; for each,
 claim-derive	contract	companion_look::derive_identity; kitty_registry::{app_basename,canonical_app_id}	derive_identity(b) = Some({id, basename, look: for_app(id)}) iff b is Executing, app_basename(commandline) = Some(basename) and id = canonical_app_id(basename) != SHELL_APP_ID; None otherwise.	0,1,4,7	1
 claim-cache	contract	companion_look::ProgramClaim::resolve	resolve(s,b) = derive_identity of the block from the most recent call whose key (s, b.id, b.state, b.commandline.is_some()) differed from the previous call's key.	0,1,2	2
 tenure-gate	contract	companion_look::KittyTenure::{observe,poll,deadline,worn}; companion_look::dwell_for	Invariant: a pending candidate differs from worn. observe(raw): raw = worn clears the candidate; a candidate held for its dwell lands; a different raw becomes the candidate at now. deadline = since + dwell (TENURE for a program, RELEASE for the base cat). poll lands a due candidate and returns whether worn changed. Worn changes only to a claim observed for its whole dwell; alternation faster than the dwell never lands.	0,1,2	4
-tenure-flicker-refines-model	refinement	companion_look::KittyTenure::observe; aterm_spec::derive::companion_tenure_flicker_model	An alternating claim storm below TENURE keeps worn() = None and every step is a model transition preserving FlickerNeverLands; a steady claim lands (negative control).	0,1,2,10	1
+tenure-flicker-refines-model	refinement	companion_look::KittyTenure::observe; aterm_models_effects::companion_tenure_flicker_model	An alternating claim storm below TENURE keeps worn() = None and every step is a model transition preserving FlickerNeverLands; a steady claim lands (negative control).	0,1,2,10	1
 roster-rate-law	contract	companion_look::KittyTenure::{land,floor,commit_hello,note_non_program_verdict,arrival}; companion_look::insert_lru	land(None) gives Quiet. land(Some(id)) first evicts greeted foreign slots aged >= HOMECOMING; a resident id refreshes and arrives Quiet if greeted else floor(now); a stranger is inserted (free slot, else oldest greeted; refused when every slot is unpaid) and arrives floor(now) if inserted. floor(now) = Ceremony iff no hello within HELLO_FLOOR. commit_hello marks the worn id greeted. Invariants: an ungreeted slot is never evicted, |roster| <= HOMECOMING_SLOTS, ids unique; observe and poll land identically.	0,1,2,7	6
 companion-precedence	contract	companion_look::companion_precedence	(f, Favourite) if f = Some; (a, Program) if f = None and a = Some; (l, Launch) otherwise.	0,1	1
 typed-press-cascade	contract	companions::TypedPress::{feed,chars}; companions::Companions::note_typed_press	feed calls exactly on_break if brk, else on_backspace if backspace, else on_char once per char of typed then ime in order. note_typed_press applies this to tone_tracker, kitty_sing and kitty_summon in that order (summon's on_char only with words); windows equal a bounded-stack model.	0,1,2,7,11,13	1
-robi-name	contract	companions::Companions::note_robi_press	Returns true iff not brk, not backspace, chars non-empty and tail' (the last 8 lowercase chars of tail ++ chars) ends with "robi" or "robot"; on true tail := "", robi_shows += 1 and the show restarts.	0,1,2,7	1
 cursor-body-inert	contract	CursorBeamRod::tick; CursorComet::tick; CursorDroplet::tick	Not enabled, cw = 0, ch = 0 or intensity <= 0 leaves out unchanged, fill = None, fp = 0 and not is_active().	0,1,2,3	3
 cursor-body-activity	contract	CursorBeamRod/CursorComet/CursorDroplet::{tick,is_active}	For an enabled tick with blaze b: fp has bit 0 set; is_active() <=> clamp(b,0,1)*clamp(intensity,0,1) > 0.02; cur None or off grid appends no quads; the fill is resolved regardless (beam: None for a bar).	0,1,2,3	5
 cursor-body-fill-ramp	contract	CursorBeamRod::tick; cursor_comet::ice_ramp; effect_util::water_ramp	Beam block channel c' = min(255, c + (255-c)(0.10+0.35e)), non-decreasing in e. Comet fill = ice_ramp(color, 0.34+0.40e+0.05(breathe-0.5)), channel-sum non-decreasing in t, keeping r <= g <= b order and, for small t, the dominant channel. Droplet fill = water_ramp(..), non-decreasing with b >= g >= r.	0,3	4
@@ -167,7 +178,7 @@ glow-exact-payment	invariant	CursorGlow::{tick,typed_credits_within,share_rule,n
 glow-band-move	contract	CursorGlow::note_band_move; cursor_glow::scroll::{band_row,band_pos,translate_band_state}	band_row(row,top,bot,d) = Some(row) outside [top,bot], Some(row+d) when it stays in the band, None otherwise; band_pos saturates. note_band_move(top,bot,d): top > bot or d = 0 is a no-op; else band_moves += 1 and every row-addressed member in the band moves by d, members carried past the edge are dropped (Move ends saturate), members outside are untouched; licences kept, row-content classifiers retired; it spawns, judges and draws nothing.	0,1,2,3,7	5
 glow-idle-to-zero	invariant	CursorGlow::{tick,is_active,next_change_deadline,needs_frame_cadence,under_quads}; thermal integrators	A fresh engine emits nothing until a licensed move. Safety: if under_quads() is non-empty after a tick then needs_frame_cadence() or next_change_deadline(..) is Some; is_active() or a deadline holds iff a visible change is pending (live light, a heating forge ember above threshold, a held park, a live fade). Liveness: after the last input at t there is a bound T (configured duration plus fixed tails, at most 2.5 s) such that every tick at now >= t+T returns 0, every plane is empty, !is_active, no deadline, and thermal integrators are exactly 0; a lone key's wake is gone within 500 ms; a ribbon drains without a visible step. An engaged v2 with nothing live is Idle0; under v2 no v1 crown or brisk pool holds cadence.	0,1,2,3,4,5,7,10,13	12
 frame-fingerprint	contract	cursor_glow::FrameFingerprint::{glow_quads,chars,fire_halos,finish}; CursorGlow::tick	finish() = 0 iff no stream was fed; otherwise the FNV-1a fold over (tag, length, records) of every fed stream in order, with 0 remapped to 1. tick folds every presented plane, so fp = 0 <=> every plane empty.	0,1,7	2
-glow-quad-invariants	invariant	CursorGlow::{tick,emit_custom}; cursor_glow::{emit,raster}; effect_util::{push_fx_rect,push_grid_quad,push_fx_quad}	For every style (built-in or Trail Pack) and reachable state, every quad in out, under and halos lies in one cell-row band with consistent tag, inside the effects box (the grid when head = 0), halo radii >= 1, |plane| <= MAX_QUADS. With head > 0 fire may rise into the chrome band only with tag 0, root at origin_y+2; with head = 0 nothing is above the grid. A Custom pack's spark coverage never exceeds CUSTOM_COV_CAP, and a resolved pack decays to Idle0.	0,1,2,3,4,5,7	9
+glow-quad-invariants	invariant	CursorGlow::tick; cursor_glow::{emit,raster}; effect_util::{push_fx_rect,push_grid_quad,push_fx_quad}	For every style and reachable state, every quad in out, under and halos lies in one cell-row band with consistent tag, inside the effects box (the grid when head = 0), halo radii >= 1, |plane| <= MAX_QUADS. With head > 0 fire may rise into the chrome band only with tag 0, root at origin_y+2; with head = 0 nothing is above the grid.	0,1,2,3,4,5,7	9
 glow-window-absolute	contract	cursor_glow::spawn; cursor_glow::emit (bridge vertex, debris, stardust)	Spawn geometry is window px = origin + grid px: the bridge vertex is at origin_x + (col+head_dx)*cw; jump debris and stardust lie within 0.4 cell of the leap segment; typing debris drifts opposite the motion; comet grains have near-zero gravity; lumen sheds no debris.	0,1,3,7	4
 glow-heat-momentum	contract	CursorGlow::{tick,typing_momentum}; cursor_glow::thermal; cursor_glow::companion::typing_momentum	Each licensed key adds gain*cadence(gap) heat (capped at 1), decaying as exp(-dt/tau); wake brightness and fire light are non-decreasing in heat. Momentum advances on the press-hint half of a typing-shaped echo, never on program output: a lone key stays near cold, six fast keys stay below full blaze, a sustained run climbs, human cadence keeps an ember floor > 0.	0,1,2,3	8
 typing-momentum-unified	equivalence	CursorGlow::typing_momentum; kitty_cursor::CursorCat; crate::typing_momentum	Under one keystream the glow engine's and the cursor cat's typing_momentum are equal at every instant; deletes only drain; the cat wake fires iff the shared value passes its band and dwell.	0,1,2,3,4	1
@@ -188,7 +199,7 @@ style-spelling-table	table-property	GlowStyle::{parse,style_names_any_pet,style_
 style-hue-fidelity	invariant	cursor_glow::emit per style	Beam with its default colour keeps blue >= red on every quad; laser stays within the 70% white core mix of its colour; the comet tail brightens monotonically toward the head, stays below pure white, and its far tail is dimmer than the accent.	0,3,5	3
 beam-rod-morphology	contract	CursorGlow::spawn (Beam); emit beam rod	A licensed beam jump lays sparks spanning the whole leap, no bolts, at most 14 stardust motes with gy = 0 and life >= 0.5 s, tail coverage >= 0.65 of the head's; past the hold the rod thins.	0,1,3,7	2
 laser-and-sparkle-bursts	contract	CursorGlow::spawn (Laser, Sparkle); bolts	A licensed laser jump forges a main channel plus forks frozen at spawn and decaying to nothing; a hot laser typing run leaves a charged trail that bleeds and drains; sparkle births jitter within the cell window at full coverage, laser births stay at the point scaled by 1/sqrt(burst).	0,1,3,7	3
-light-theme-veils	invariant	cursor_glow::emit (beam family, light theme)	With dark_theme = false the beam-family band, crown and ring emit no additive quads; the band is source-over veil halos.	0,1,3	1
+light-theme-veils	invariant	cursor_glow::emit (beam family, light theme)	With dark_theme = false the beam-family band, crown and ring emit no additive quads; the band is source-over ink under the letters, and every halo is source-over.	0,1,3	1
 glow-disabled-inert	contract	CursorGlow::tick	cfg.enabled = false or intensity = 0 emits nothing and returns 0.	0,1,2	1
 glow-resident-caps	invariant	CursorGlow::spawn	After every spawn |sparks| <= MAX_SPARKS and |particles| <= MAX_PARTICLES (oldest-first clamp), even for a same-instant flood with cfg.length = usize::MAX; the real Water spawn tracks the saturating CursorGlowResidentCaps model, which proves both bounds and catches the missing-clamp mutant.	0,1,2,7,10	3
 hsv-fire-ramp	contract	cursor_glow::raster::hsv2rgb; effect_util::fire_ramp	hsv2rgb is the standard HSV to RGB map rounded to bytes; fire_ramp's red channel is non-decreasing in t.	0,3	1
@@ -232,7 +243,6 @@ rainbow-sweep-and-bands	table-property	rainbow_sweep_at; rainbow_band_at; RAINBO
 glyph-tint-palette	contract	fresh_ink_glyph_palette; fresh_ink_glyph_ink; CursorGlow.glyph_palette memo	fresh_ink_glyph_palette(fg,bg) is None if either is unset, fg == bg, or contrast is below the usable floor; otherwise every band and weight keeps the box-corner colour's luminance on the usable side of the cap (1e-6). The bisection predicate is monotone and its answer satisfies it. The engine memoizes per (fg,bg) and re-derives exactly when they change.	0,1,3,5,6,7	4
 light-ink-laws	contract	light_ink; light_ink_bold; LIGHT_INK_ALPHA_CAP	light_ink(rgb) has luma <= LIGHT_INK_MAX_LUMA and max channel <= LIGHT_INK_MAX_CHANNEL, keeps channel order, and is the identity under both bars; light_ink_bold lands chromatic input on the luma bar preserving hue, maps achromatic non-black to 0x787878 and 0 to 0; every band at LIGHT_INK_ALPHA_CAP stays dark over near-black ink and visibly darkens white.	0,3,5,6	3
 water-style-laws	invariant	CursorGlow::{tick,emit_water}	Under Water every quad has blue >= red; a slow key's light is droplets falling below the row; a hot wake is one connected travelling curve within MAX_QUADS with no full-cell slab; a licensed Home/End move lays a full-vector crest with no heat, ring or splash, a one-cell arrow is no streak, an unlicensed relocation is dark; repaint corridors keep one owner per coordinate and never change composited glyph ink; a jump's reflection drips and fades to exact zero.	0,1,2,3,4,5,7	6
-trail-pack-params-live	other	CursorGlow::{emit_custom,spawn_pack_particles}	For every wired Trail Pack parameter some two values give different whole-frame folds (no dead knob); the theme arm changes only the light-theme render; no built-in style reads cfg.pack.	0,1,2,3,4,5,7	2
 sparkle-glitter-survives	invariant	CursorGlow::{tick,spawn_burst_particles}	Under Sparkle a glitter grain retires only by age or a wholesale teardown; no unlicensed batch or licensed advance removes a live grain.	0,1,2,3,4,5,7	1
 glow-witness-rows	contract	CursorGlow::{ribbon_rows,witness_row_slot}; rainbow_kitty::witness; NbrProbe	Under v2 star pixels are gated by v2's occupancy bitsets alone; filling a far witness row takes one terminal read into the engine's slot, and a repeated row replaces its slot; ribbon_rows(buf) returns WITNESS_ROWS + ARMING_ROWS rows when buf is large enough (content rows first, then the pending key's source and arming rows), and WITNESS_ROWS for a short buffer.	0,1,2,3,4,5,7,13	3
 line-cells-tail-is-bounded-bresenham-suffix	equivalence	trail_sweep::line_cells_tail; cursor_trail::line_cells (spec-only model)	For all origin o, destination d in i32^2, limit and include: after line_cells_tail(path,o,d,limit,include), path = the last min(limit,|B|) cells of the forward Bresenham walk B from o to d, with d dropped iff not include. So |path| <= limit, cells are Chebyshev-adjacent, include implies the last cell is d, and limit = 0 gives []. The i128 lattice arithmetic cannot overflow.	0,1,2,3,5,7	4
@@ -268,7 +278,7 @@ simhash-filter-silence	contract	simhash_ctx; vote_token	Replacing a context toke
 v4-head-ticket-fairness	contract	cat_variant_v4; cat_variant_index_v4; scale_head_spill	With H = |HEADS| and t = field(g,0,6): index = t mod H if t < 64 - 64 mod H, else scale_head_spill(field(g,34,30),H) = (spill*H) >> 30; so it is < H and depends only on bits 0..6 and 34..64.	0,3,5	2
 genome-feature-ranges	contract	nova_features; nova_duration_ms; nova_palette; nova_radius; cat_fills_v4; cat_age_v4; cat_variant_v4	nova_features(g) lies in its documented ranges (palette <= 7, radius in [1.6,2.2], ring in [1.5,3.5], duration 1000..=1400, debris 8..=20, chroma in [1,2.5], rot <= 15, rays 5..=8) with every value reachable; the single-field accessors equal the full decode bit for bit; cat_fills_v4 is in 0..16 x 0..8 and the age and variant decoders reach every band and head.	0,1,3,5	2
 mix-nonzero	contract	mix	mix(s) != 0 for all s, and mix is injective except on at most one pair (the 0 -> 0xD1B5_4A32_D192_ED03 remap of the bijective splitmix finalizer).	0,3,5	1
-motion-caret-contract	contract	host::{motion_caret,hidden_caret_withheld,draws_ink,cursor_row_empty}; Terminal::sync_frame_unfinished; TerminalFacts::frame_unfinished	motion_caret(caret,visible,withheld) = caret.filter(visible or not withheld). hidden_caret_withheld(term) = term.sync_frame_unfinished() or (cursor hidden and every cell of the cursor row fails draws_ink); draws_ink is true for a non-space, complex or styled cell, non-default bg, inverse/underline/strike, or both super- and subscript. sync_frame_unfinished means the program's ?2026 bracket is still open by its own account and written into, including after the timeout force-cleared the mode. So a hidden cursor on an unfinished sync frame or a blank row is no caret for the motion engines, and a scrolled viewport withdraws the caret.	0,1,2,3,4,7,12,13	7
+motion-caret-contract	contract	host::{motion_caret,motion_print_anchor,hidden_caret_withheld,draws_ink,cursor_row_empty}; Terminal::sync_frame_unfinished; TerminalFacts::frame_unfinished	motion_caret(caret,visible,withheld) = caret.filter(visible or not withheld). motion_print_anchor(term) = (None, None) when term.sync_frame_unfinished() and the cursor is hidden, else (term.print_anchor(), term.print_anchor_glyph()): an unfinished frame's print run behind a hidden cursor ends at its write position, so it hands the hidden-caret lane no anchor, and a drawn caret keeps its anchor as it keeps the caret. hidden_caret_withheld(term) = term.sync_frame_unfinished() or (cursor hidden and every cell of the cursor row fails draws_ink); draws_ink is true for a non-space, complex or styled cell, non-default bg, inverse/underline/strike, or both super- and subscript. sync_frame_unfinished means the program's ?2026 bracket is still open by its own account and written into, including after the timeout force-cleared the mode. So a hidden cursor on an unfinished sync frame or a blank row is no caret for the motion engines, and a scrolled viewport withdraws the caret.	0,1,2,3,4,7,12,13	9
 terminal-facts-reader	refinement	host::TerminalFacts::read; aterm_core::Terminal	For every Terminal state reachable by bytes, read reports caret = Some(cursor) iff the viewport is live (a DECTCEM-hidden caret still travels), cursor_visible = DECTCEM, live_viewport, alt_screen, shell_executing = last OSC 133 phase C, cmd_done = (code, completed_command_seq) after OSC 133 D, the host's scrolled flag, and a content clock that advances on output.	0,1,2,3,7,12	2
 fold-placement-bounded	contract	CursorCat::placement_frame	r = placement_frame(now) has sampled_at = now; with fold Some(F) and p = (now-F.started)/D, D = CURSOR_FOLD_DURATION, r.fold = Some{F.started, F.direction, clamp(p,0,1)} if p < 1 else None; r.facing_left follows the fold direction while it lasts and sigma.facing_left otherwise; sigma is unchanged.	0,1,2,3,6	2
 motion-pulse-fold-gate	contract	CursorCat::{on_motion_pulse,on_pet_mode_motion_pulse,on_motion_pulse_with_owner}	Advance and FoldForward act exactly as on_key_with_owner(P.at, true, o) then facing_left := false; FoldReverse calls no key path and sets facing_left := true. For fold kinds fold := Some{P.at, direction} iff active after the key step and (o or sing > 0); a fold pulse on a Hidden cat that its key does not summon leaves fold None.	0,1,2,3,4	0
@@ -391,10 +401,6 @@ ksum-tiers	contract	TypedKittySummon::note_char; TypedHit	keys_typed counts ever
 ksum-window-edits	contract	TypedKittySummon::{note_backspace,note_break,rekey}	Backspace rekeys then pops a char and never reports a hit; a break clears the window; a session change clears it; a completion clears it.	0,1,2	4
 ksum-merge	contract	TypedHit::merge	The field-wise OR.	0,1	1
 ksum-builtin-vocabulary	table-property	aterm_lexicon::Lexicon::builtin; TypedKittySummon::note_char	Under the builtin lexicon the listed feline, profanity and canine words complete in any case and language; glued words and the Scunthorpe set complete nothing.	0,1,12	6
-overlay-freshness-refinement	refinement	ExternalRainOverlay::{sync_snapshot,emit,set_visibility,set_reduced_motion,set_config}	The overlay refines ExternalRainFreshness: output reaches glass only when the snapshot is ready, every invalidating edge clears readiness and output, and a refocus alone never restores freshness.	0,1,2,10	2
-overlay-sync-gating	contract	ExternalRainOverlay::sync_snapshot	A scrolled snapshot defers with no copy or scan; an unchanged identity with a ready snapshot is Unchanged; a non-emitting rain defers; otherwise a changed identity rescans (scan_epoch + 1) and a same identity resamples.	0,1,2,7	3
-overlay-validate-fail-closed	contract	ExternalRainOverlay::{validate_snapshot,validate_live,validate_geometry,emit}	sync_snapshot returns the first failing error in a fixed order (empty, axis, cell count, metadata, hidden-cursor rows) and emit rejects bad hidden rows and pixel geometry; every error leaves output empty and the snapshot not ready.	0,1,2	1
-overlay-to-render-cell	contract	matrix_overlay::{to_render_cell,rgb}	A protected (selected or image) cell becomes U+FFFC; a NUL becomes space; a protected or non-default-background cell whose colour equals the default background gets one bit flipped so it never reads as default; flags map through. So no quad lands on text, explicit background, selection or the cursor band.	0,1,3,4	1
 rb-progressive-bake	contract	matrix_rain::bake::RainBaker::{begin_frame,restart,bake_tiles,complete,atlas,version}	begin_frame restarts only on a metric change; bake_tiles bakes the next 8 of 64 tiles, bumps version and marks dirty unless complete; a full bake is 8 batches with increasing versions, a function of the call sequence; a dirty atlas() publishes a fresh Arc.	0,1,2,7	3
 rb-box-filter	contract	RainBaker::bake_tile	Each texel's alpha is the exact integer area-weighted box filter of the 24x48 master over the cell, never above 255; at the live metrics every classic tile peaks at >= 64.	0,1,3,5,7	1
 bf-table-lookup	table-property	matrix_rain::bitmap_font::{GLYPHS,bitmap}	GLYPHS keys are strictly increasing and no glyph is blank, so bitmap(c) is the exact table entry or None; the advertised families are present and the listed absences absent.	0,1,3,7	3
@@ -428,7 +434,7 @@ mr-weather-machine	contract	MatrixRain::{step_engine_tick,desired_weather}	desir
 mr-wave-limiter	invariant	MatrixRain::step_engine_tick (ign_ms ring)	At most 2 wave ignitions per 1000 ms of engine time; a pending wave is delayed, never dropped.	0,1,2,5	1
 mr-drain-bound	contract	MatrixRain::{set_visibility,step_engine_tick,emit,is_active,can_emit,step_suspended}	Hidden sets drain_ticks to 30 at once, unfocused or sleeping ticks count it up, focus resets it unless sleeping; emit is empty at 30; so Hidden empties the next frame, unfocused panes empty within 30 ticks, idle drains and disarms, and a suspended step starves to sleep.	0,1,2	4
 mr-lifecycle-refinement	refinement	MatrixRain::{set_visibility,step_engine_tick,emit}	The rain refines rain_lifecycle_model: activity, drain and drain ticks map to real steps, Idle at DRAIN_TICKS, and a refocus of a drained slept pane does not relight.	0,1,2,10	2
-mr-gates-off	contract	MatrixRain::{emit,is_active,note_alt_scroll,rain_atlas}	Disabled or reduced motion emits nothing, is inactive and bakes nothing; scrollback, or the alt screen when suppressed or within the scroll quiet window, gates the frame and disarms until a live emit.	0,1,2	4
+mr-gates-off	contract	MatrixRain::{emit,is_active,note_alt_scroll,rain_atlas}	Disabled or reduced motion emits nothing, is inactive and bakes nothing; scrollback, or the alt screen when suppressed or within the scroll quiet window, gates the frame and disarms until a live emit.	0,1,2	3
 mr-pending-notes	contract	MatrixRain::{note_bell,note_exit_status,step_suspended,apply_pending_notes}	A suspended step drops key and content notes and keeps bell, exit, alt-scroll and signal notes; the next emit applies the bell flash and the failure ember or success wave per their knobs.	0,1,2	2
 mr-fingerprint	contract	matrix_rain::fingerprint	0 for empty output, otherwise an FNV chain over the version, each quad's injective packing, the tick folded once and each halo; injective in the tick, so even quad counts cannot cancel and an animating field changes fp every tick.	0,1,3,5,7	2
 mr-step-stable-damage	contract	MatrixRain::emit_column; field::{trail_level,dither}	Between two ticks sharing their quanta at most 3 + ceil(15/p) cells of a column change.	0,1,3,5	1
@@ -469,7 +475,7 @@ pane-crop-sampling	contract	pane::{crop_free_sprite,translate_free_into_pane}	Fo
 pb-roster	table-property	pet_glyphs_gen::{PET_GLYPHS,PET_GLYPH_IDS}; pet_baker::{PetBaker::aspect,bake_pose}	The pet roster is non-empty with matching tables, positive aspects and layers; the stand pose draws a cat; coat, background and pose axes change texels.	0,1,5,7	3
 pb-host-id	contract	PetBakeKey::host_id; host_tile_id	host_id is an FNV chain over the key fields with bit 63 set, injective in each single field except where pre-OR hashes differ only in bit 63.	0,1,3,5	1
 pb-face-lod-roles	contract	pet_baker::bake_pose_with_reflections	Below FACE_DETAIL_MIN_H charm layers are skipped and eyes become dots, below MOUTH_DETAIL_MIN_H the mouth is skipped, above every layer paints; the reflection rebuild appears at small sizes and the authored catch-light at large.	0,1,3,7	2
-pb-eye-reflections	contract	pet_baker::{paint_eye_reflections,paint_eye_dots_with_mask_observer}	At small sizes every reflection texel was dark and lies in one grown eye mask; every open eye gains a bright texel; shallow eyes gain none.	0,1,3,7,13	1
+pb-eye-reflections	contract	pet_baker::paint_eye_reflections	At small sizes every reflection texel was dark and lies in one grown eye mask; every open eye gains a bright texel; shallow eyes gain none.	0,1,3,7,13	1
 pb-eye-legibility	table-property	pet_baker::paint_eye_dots	For every live pose and ground at 24 and 36 px each eye keeps a dark core of lawful size, eyes stay apart, and none is over-occluded.	0,1,3,5,7	2
 ps-stroke-refinement	refinement	pet_stroke::StrokeDetector::sample	The detector refines pet_stroke_detector_model; only complete strokes earn, a reset forgets contact, the cooldown cannot be bypassed, and the mutants are rejected.	0,1,2,10	1
 ps-stroke-contract	contract	pet_stroke::StrokeDetector::sample	sample earns iff the input is finite, the point moved with a gap in (0, 600 ms], normalized speed in [0.04, 2.5], not cooling, and travel reaches 0.45, then starts a 1.5 s cooldown; invalid input forgets contact but keeps the cooldown; gaps, bad speeds and cooling moves zero travel; a still pointer never earns.	0,1,2,3	4
@@ -481,14 +487,13 @@ pw-clearance-planes	contract	PetWorld::{clearance,under_text_clearance,clearance
 pw-reuse-equals-fresh	equivalence	PetWorld::observe_with_exclusions_near	Observing into a reused world equals observing into a fresh one on every query.	0,1,2,5,7	1
 pw-coverage-window	contract	PetWorld::observe_with_exclusions_near (coverage)	The coverage window is at most 64 x 256 cells, centred on the live caret, else the selection target, else the held centre or the pane middle, clamped into the pane.	0,1,3	1
 pw-selection-target	contract	pet_world::selection_target	The selected cell nearest the active endpoint among five candidate rows of the visible span, or None.	0,1,3	1
-pw-anchors	contract	PetWorldFacts::read; PetWorld::resolve	Anchors exist only off the alt screen, one per visible block at its last glyph row, and resolve only on the same surface while the block and row are on screen.	0,1,12	1
+pw-anchors	contract	PetWorldFacts::read; PetWorld::resolve	Anchors exist only off the alt screen, one per visible block at its last glyph row, and resolve only on the same surface while the block and row are on screen.	0,1,12	2
 pw-progress	contract	PetWorldFacts::read; PetWorld::progress	progress() is the terminal's last OSC 9;4 state and samples no anchor or completion.	0,1,12	1
 pw-perch	contract	PetWorld::{perch_near,nearest_perch,home_perch}	perch_near returns the clear candidate minimizing the weighted distance within d, or None when none is clear.	0,1,3,7	1
 pw-rowscan-equivalence	equivalence	RowScan::{default_bg,line_size,cluster,combining,image}; SparseRow::get	For every row and non-decreasing query sequence the row cursors answer exactly what the per-cell lookups answer, including malformed sidecars.	0,1,2,7,12	2
 pl-all-off-identity	contract	EffectsPipeline::{apply,enabled_any,is_active}	With nothing enabled apply clears every channel, retires the pet and bodies, baselines the fences and returns 0, keeping the pet opt-in; a disabled rain or streak leaves its channels as others left them and adds nothing to is_active.	0,1,2	3
 pl-rain-host-latches	contract	EffectsPipeline::apply (rain arm); MatrixRain::host_frame	A torn frame runs only note_activity and advances no latch; a fresh frame runs the host frame with the execute and completion latches; a suppressed alt screen runs the suspended arm; with no engine the latches keep observing, so re-enabling replays nothing.	0,1,2,4,12	4
-pl-glow-config	contract	EffectsPipeline::set_cursor_glow; cursor_fx::{GlowSpelling::parse,resolve_glow_config}; GlowStyle::{style_names_any_pet,style_names_dog_pet}	set_cursor_glow stores the native resolved config (audible, pack only for Custom), with the pet and species flags from the spelling; the spelling table holds for beam, non-finite knobs, every rainbow kitty and v2 spelling, tall vs underline and the pet spellings.	0,1,4	4
-pl-trail-pack	contract	EffectsPipeline::{set_cursor_trail_pack,set_cursor_glow}	None clears the pack and turns Custom into Lumen; a valid pack arms Custom; an invalid one returns diagnostics and keeps the old pack; a built-in style drops the pack.	0,1,9	2
+pl-glow-config	contract	EffectsPipeline::set_cursor_glow; cursor_fx::{GlowSpelling::parse,resolve_glow_config}; GlowStyle::{style_names_any_pet,style_names_dog_pet}	set_cursor_glow stores the native resolved config (audible), with the pet and species flags from the spelling; the spelling table holds for beam, non-finite knobs, every rainbow kitty and v2 spelling, tall vs underline and the pet spellings.	0,1,4	4
 pl-history-lifecycle-refinement	refinement	EffectsPipeline::apply (history arm)	In history or on an incoherent snapshot every cursor channel clears, the caret is hidden and the pet draws nothing while its brain fades; refines cursor_viewport_lifecycle_model.	0,1,2,10,12	1
 pl-coordinate-fence-refinement	refinement	EffectsPipeline::sync_cursor_coordinate_space	A change of rows, cell metrics or chrome origin makes every later frame equal to a fresh family that kept only glow, momentum and cadence (layout_coordinate_reset_model).	0,1,2,4,10	1
 pl-scroll-translation	refinement	pipeline::content_scroll_decision; EffectsPipeline::sync_scroll; ContentScrollState::delta_since	The scroll decision is delta_since: a silent baseline, Translate and explained Bands move licensed trail cells exactly, Invalidate clears; each validates as its cursor_scroll_signal_model action.	0,1,2,4,10,12	4
@@ -532,7 +537,7 @@ spine-birth-price	contract	spine::Spine::{birth_disp,note_verdict,update,note_ke
 spine-erase-mark	contract	spine::Spine::{drain_delete,advance,drain_kill,mend,erase_mark}	drain_delete keeps a mark of the highest birth price over the delete run within MEND_WINDOW_S and counts it; advance, kill and reset clear it; mend(now) returns it while the count is at most MEND_MAX_DELETES and the window is open, as a pure read that never changes disp or momentum.	0,1,2,3,6	1
 spine-flow-counter	contract	spine::Spine::{note_keys,flow,drive}; spine::{flow_heat,Flow::open}	note_keys(now,k,price) spends the verdict and, outside a drive freeze, grows the run by k when price >= FLOW_KEY_DISP else breaks it, tracking best; flow heat is a smoothstep of the run between 20 and 24 keys and open iff combo >= FLOW_ENTRY_KEYS; deletes and kills take combo and heat to 0 and keep best.	0,1,2,3,4,6	2
 spine-ranges-and-phase-ring	invariant	spine::Spine::{update,phase}	disp and disp_peak stay in [0,1] and phase in [0, PHASE_RING); phase advances by dt PHASE_RATE disp (rem_euclid of a non-negative value) and is frozen at disp 0.	0,1,2,3,6	1
-tri-triangle-wave	contract	meteor::tri; meteor::arc_t (test-only)	For finite x, tri(x) = 1 - |1 - (x rem_euclid 2)|: in [0,1], the identity on [0,1], period 2, even; non-finite gives 0.	0,3,6	1
+tri-triangle-wave	contract	meteor::tri	For finite x, tri(x) = 1 - |1 - (x rem_euclid 2)|: in [0,1], the identity on [0,1], period 2, even; non-finite gives 0.	0,3,6	1
 axis-and-dir-dominant	contract	meteor::Axis::of; mod::Dir::{of,sign,is_vertical}	Axis::of is Horizontal iff |dx| >= |dy| (ties x-major, NaN vertical); Dir::of resolves on the dominant axis with the stated tie rules; sign and is_vertical follow.	0,1,3	2
 meteor-const-relations	table-property	meteor::{RETIRE_DECAY,BURST_ROOT_SEP_AT_MAX_N,JET_PROBE_CELLS}	exp(-RETIRE_DECAY) is within 1e-3 of CHROMA_CULL_ALPHA, BURST_ROOT_SEP_AT_MAX_N = 2 sin(pi/BURST_N_MAX), and the capped jet reach fits JET_PROBE_CELLS at every supported aspect. Decidable by evaluation.	0,3,6,14	3
 meteor-grade-laws	contract	meteor::{fan_count,fan_reach_ch,burst_n,ring_ms,ring_full_radius}; timing::impact	fan_count, fan_reach_ch, burst_n and ring_ms are the stated clamped affine laws of impact(cells), each monotone in cells, with the evaluated floor and cap values.	0,3,6	1
@@ -563,26 +568,24 @@ meteor-arrival-flash	contract	meteor::{draw_flash,Meteors::emit}; SkyMask::flash
 meteor-sparks-haloed	contract	meteor::{mint_landing,draw_sparks,spark_at}	A landing's spark count is the clamped law of its span; every spark above its hold draws a halo, and its star spans at least 5x5 px.	0,1,3,6,7	1
 meteor-hand-floor	contract	meteor::{Meteors::set_hand_floor,spark_room,draw_sparks}; Engine::tick; Ribbon::hand_floor_cell	With a hand floor no spark station or quad lies left of it on that row and the count is unchanged; the engine hands the ribbon's floor to the pool on the jump's tick.	0,1,2,3,4,6,7	2
 meteor-cadence	contract	meteor::Meteors::{brisk,next_change_deadline}; Landing::moving_until; Engine::{next_change_deadline,needs_frame_cadence}	Before arrival + PIN_MS the pool is brisk with frame-cadence deadlines; while anything moves it is brisk with deadlines at least TAIL_FLOOR away; until its end it names deadlines at least TAIL_FLOOR away; after its end it rests.	0,1,2,3,5,7	2
-landing-pool-fifo	refinement	meteor::Meteors::{emit,party,reset}; aterm_spec::derive::rainbow_landing_pool_model	The landings pool refines RainbowLandingPool: a bounded FIFO that drops the oldest on admission at capacity; dropping the arrival instead is the Buggy twin.	0,1,2,7,10,12	1
+landing-pool-fifo	refinement	meteor::Meteors::{emit,party,reset}; aterm_models_effects::rainbow_landing_pool_model	The landings pool refines RainbowLandingPool: a bounded FIFO that drops the oldest on admission at capacity; dropping the arrival instead is the Buggy twin.	0,1,2,7,10,12	1
 swept-space-cell	contract	mod::swept_space_cell	swept_space_cell(events,i) is Some((row, col0 + r)) iff events[i] is a Sweep followed by its Typed Move, the preceding Typed run's widths exactly fill the sweep (Spaces one cell), and r is the width before the run's last Space; None otherwise.	0,1,3,7	2
 rk-engine-idle-to-zero	contract	Engine::{tick,fingerprint,needs_frame_cadence,next_change_deadline,status}; Ribbon::{plan,emit,at_rest,next_change_deadline}	With nothing live every tick writes nothing, fp and fingerprint() are 0, no cadence or deadline is owed and status counts are 0; the ribbon draws nothing and rests.	0,1,2,3,4,7	3
 engine-disengaged-inert	contract	Engine::{on_event,tick,celebrate,earn_hero,translate_scroll,pet_offer}	A disengaged engine changes no observable state at any seam, writes nothing on tick, owes nothing and offers nothing.	0,1,2,4	1
 engine-fresh-state	contract	Engine::{new,default}	default() equals new(): disengaged, full glint budget, at rest.	0,1	1
-row-holes-census	contract	holes::row_holes	With lit(c) = owned(c) and (one slab or coverage > 0), row_holes yields exactly the interior columns that are unlit between two lit ones, in order.	0,1,7,11,13	1
-hole-tripwire	contract	Engine::{trace_holes,drain_hole_records,tick}; holes tripwire	An armed engine records exactly one record on the first frame a typed row shows an interior hole, at every slab density, and nothing for whole lines; disarming drops the records.	0,1,2,7	2
 echo-band-fence	refinement	Engine::translate_band; EchoLedger; echo_band_fence_model (test module)	A valid band transform retires every pending press credit, keeps earned momentum, moves the mirror and fields with their text; an invalid one changes nothing; bound to EchoBandFence with the stale-ledger negative control.	0,1,2,4,10,12	1
-echo-ledger-refinement	refinement	Engine::{on_event,echo_bridge,lay_bridge,observe_caret}; EchoLedger::{bank,expire,spend,clear,forget,partition}; aterm_spec::derive::echo_ledger_bridge_model	The echo ledger refines EchoLedgerBridge: a press never pre-draws, one press pays one cell, only presses older than the licensing sweep pay left of it, presses expire after ECHO_PATIENCE_S, navigation, row changes, reset, erase, kill and focus loss forget them, unswept moves are paid from presses or refused whole, inserts pay late holes, and the ledger holds at least 43 presses.	0,1,2,4,5,7,10,12	16
+echo-ledger-refinement	refinement	Engine::{on_event,echo_bridge,lay_bridge,observe_caret}; EchoLedger::{bank,expire,spend,clear,forget,partition}; aterm_models_effects::echo_ledger_bridge_model	The echo ledger refines EchoLedgerBridge: a press never pre-draws, one press pays one cell, only presses older than the licensing sweep pay left of it, presses expire after ECHO_PATIENCE_S, navigation, row changes, reset, erase, kill and focus loss forget them, unswept moves are paid from presses or refused whole, inserts pay late holes, and the ledger holds at least 43 presses.	0,1,2,4,5,7,10,12	16
 held-key-and-sweep	contract	Engine::replay_events; Engine::on_event (Sweep); Ribbon::{sweep,hold_typed}	A Typed event with no licensed move after it in its frame lays nothing; its cell arrives with its echo, from the host's Sweep or from ledger presses, born no earlier than the birth floor.	0,1,2,4,7	4
 caret-mirror-observation	contract	Engine::{observe_caret,tick,caret_mirror}	observe_caret never seeds the mirror before the first licensed move; a same-row observation never moves it; a cross-row one moves it after the next tick's ingest and forgets the presses.	0,1,2,4	3
 engine-rewrite	contract	Engine::on_event (Rewrite); Ribbon::retract_suffix	A Rewrite keeps the spine and ledger, moves the mirror to its column, offers no impulse or cue, births no star, retracts the suffix, and the next echo lays at the new caret.	0,1,2,4	1
 witness-rows	contract	Engine::{ribbon_rows_for,band_rows,follow_rows}	ribbon_rows_for names at most WITNESS_ROWS band rows (the hand's run first with its neighbours) then the arming rows when room allows, never a row two away, keeping the hand's lower follow row.	0,1,2,7,13	3
 witness-withheld	contract	Engine::follow_rows	withheld lists, in order, the asked rows inside the grid and the focused pane that were not delivered.	0,1,2,7	1
 witness-retire-engine	contract	Engine::{witness_rows,reset}; Ribbon::retire_cells	A cell retires only on a glyph that changed against its armed record, counted in status().retired; a payout beside it lays a fresh cell without reviving it; reset keeps the count and clears the records.	0,1,2,4,7	1
-short-wrap-park-refinement	refinement	Engine::follow_rows_with_park; aterm_spec::derive::rainbow_short_wrap_park_model	follow_rows_with_park reports proved only when the moved run belongs to the caret's own short retreat, matching the model's FollowExact or FollowOther.	0,1,2,10,12	1
+short-wrap-park-refinement	refinement	Engine::follow_rows_with_park; aterm_models_effects::rainbow_short_wrap_park_model	follow_rows_with_park reports proved only when the moved run belongs to the caret's own short retreat, matching the model's FollowExact or FollowOther.	0,1,2,10,12	1
 engine-sound-cues	contract	Engine::{tick,on_spawn,drain_sound_cues,set_engaged}; mod::sub_floor_hop	Cues are minted only by tick into the frame: one Meteor cue per licensed jump on the flight clock, one Enter per Return move, Jump for a Pty row change, one Navigation cue per keyed sub-floor hop priced at the frame's momentum; no-ops, Pty hops and typed moves are silent; disengaging drops unticked events.	0,1,2,4,7	4
 engine-companion-impulse	contract	Engine::{offer,take_companion_impulse,tick}	Erase and Kill offer Wince, a Meteor outranks it, take transfers it once; under reduced motion a credited spawn offers Land with paint 1 and no flare.	0,1,2	2
 flow-draws-nothing	equivalence	Engine::{tick,fingerprint,needs_frame_cadence,next_change_deadline}	Flow only re-prices births: once the glass is dark an open-theme engine writes nothing and agrees on cadence, deadline and fingerprint with a twin whose combo stayed shut.	0,1,2,4,7	1
-exit-sampling-refinement	refinement	Engine::tick; Ribbon::advance_swoosh; aterm_spec::derive::rainbow_exit_sampling_model	The exit swoosh is a function of time: one late tick after any silence sees the settled state (ObserveDone); restarting unobserved swooshes is the Buggy twin.	0,1,2,10,12	1
+exit-sampling-refinement	refinement	Engine::tick; Ribbon::advance_swoosh; aterm_models_effects::rainbow_exit_sampling_model	The exit swoosh is a function of time: one late tick after any silence sees the settled state (ObserveDone); restarting unobserved swooshes is the Buggy twin.	0,1,2,10,12	1
 mend-pricing	contract	Engine::tick; Ctx::mend; spine::Spine::mend; Ribbon::lay_cell	A key during a live mend is born at max(birth_disp, mark.disp), so a quick typo fix keeps the interrupted momentum; a slow correction is not a mend; the mark is a value that owes no wake.	0,1,2,3,4,6	3
 caret-seam-flare-and-paint	contract	Engine::{tick,caret_paint}	flare_at is the spawn instant within SPRING_SNAP_RESPONSE_S and None after; paint = max(momentum_display, the landing relight), which is 1 during the snap, halves one constant later and is 0 past RELIGHT_LIFE_S; with no landing paint equals the display; a Pty move gives no flare or paint.	0,1,2,3,6	2
 glint-budget	contract	Engine::earn_hero; StarBudget; Engine::tick	earn_hero over a probed-blank sky always births one M1 and offers Delight; a glint cue is minted iff a token is available.	0,1,2,3,6	1
@@ -610,7 +613,7 @@ walk-same-row-origin	contract	Ribbon::{join_cohort,mint_cohort,wake_origin,lay_r
 walk-chain-and-fold-distance	contract	Ribbon::{join_cohort,retire,leave_row,fresh_line}	A key within CHAIN_GAP_MAX of a finished swoosh continues its walk; past it the walk starts cold; folds, completions and Pty row changes carry the walk distance across rows; a short line finishes its fast leg first.	0,1,2,3,6,7	5
 walk-new-line-gate	contract	Ribbon::{arm_fresh_line,lay_cell,hold_typed,curtain}; FreshLine::takes; Engine::replay_events	A new line (Return, newline, keyed Nav to another row, line kill, curtain) arms a gate dated at its earliest instant; the first typed cell it takes mints a cohort continuing the colour one step past the old line on the fast leg; keys re-laid on the old row and the old line's late glyph do not spend it; a Pty move arms nothing.	0,1,2,3,5,6,7	9
 fresh-line-takes	contract	ribbon::FreshLine::takes	takes(row,at) iff not awaiting the move, at is not the chord's own key, and at >= since or the key lands off the row the hand left.	0,1,3	1
-composer-newline-gate-refinement	refinement	Ribbon::{on_event,curtain}; aterm_spec::derive::rainbow_composer_newline_gate_model	fresh_line follows RainbowComposerNewlineGate: a composer key arms it awaiting the home, type-ahead does not spend it, the home clears the wait, the first real echo spends it, a curtain or a cancelling edit resolves it.	0,1,2,10,12	1
+composer-newline-gate-refinement	refinement	Ribbon::{on_event,curtain}; aterm_models_effects::rainbow_composer_newline_gate_model	fresh_line follows RainbowComposerNewlineGate: a composer key arms it awaiting the home, type-ahead does not spend it, the home clears the wait, the first real echo spends it, a curtain or a cancelling edit resolves it.	0,1,2,10,12	1
 field-index-is-newest-scan	equivalence	ribbon::FieldIndex::{begin,set,at,translate,translate_band}; Ribbon::{field_at,build}	After every plan field_at(row,col) is Some iff a resident cell is there and then equals the newest such cell's t, through shadowing, rows going dark and relit.	0,1,2,3,7	1
 cohort-phase-timeline	contract	ribbon::{Phase::at,swoosh_total_s,retract_start_s}; Ribbon::{retire,advance_swoosh,note_key}	A cohort runs Laying/Grace through grace_s = max(PHRASE_REST_MIN_S, 2.5 x the cadence), then Reaching, Retracting, Fading, and leaves at swoosh_total_s(grace); cells under a typing hand stay resident; the mark is off glass one swoosh after the last key.	0,1,2,3,6,7	3
 swoosh-monotone-retract	contract	Ribbon::{plan,emit,retract_x,wipe_of,env_of,emit_hot_edge}	After the last key the body never brightens, the retract moves only toward the caret draining the tail first and never past the caret block, the hot edge only falls to exactly 0, and everything is empty at the swoosh's end; reduced motion only fades.	0,1,2,3,5,6,7	5
@@ -652,25 +655,14 @@ tone-shipped-asset-valid	table-property	tone::{ToneModel::from_bytes,builtin}	Th
 tone-ngram-featurization	contract	tone::for_each_ngram_bucket	With whitespace runs collapsed and ASCII lowercased into k chars, it reports 0, 1 or 3k - 3 n-grams, every bucket < BUCKETS, invariant under case and whitespace length, whatever the script.	0,1,5,7,13	1
 tone-scores-abstain-classify	contract	ToneModel::{scores,classify_opt,classify}	scores abstains (None) below 6 n-grams and is otherwise a deterministic function of (model, text) with non-negative scores; classify_opt takes the lowest maximal index; classify falls back to Technical.	0,1,2,3,5,7,13	3
 tone-tracker-model	refinement	tone_infer::ToneTracker::{note_char,drain_pending_inference,note_backspace,note_break,effective,current,window_chars,default}	The tracker refines a model of (buffer <= 160 chars, session, tone, key count, last inference, pending): note_char appends (a session change clears the buffer) and marks inference due after 6 keys or 500 ms; drain runs the classifier only when due and keeps the tone on abstention; Backspace pops, break clears; effective(false) is Technical. So inference is throttled, deletion never classifies, and a session switch keeps the tone.	0,1,2,4,5,10	11
-robi-sizing-law	contract	robi::{art_rows,body_size_px,body_rect_px,body_px,caret_clearance,ladder_tile_px}	art_rows grows with rows within [3.2, 5.4]; the body is at most 4 cell_h wide and four 2-row slices tall; body_rect_px anchors at the feet or the grip; body_px is None at alpha 0 or zero cells.	0,1,3,6	2
-robi-schedule	contract	robi::RobiShow::{start,stop,born,frame,tip_a,tip_b}; robi::ladder_retract	frame is a pure function of (birth, seed, now, sense); a born show never expires and walks its fixed 76 s cycle of scenes (walk, jacks, idle, ladder, climb, bars, drop, wander, rest) with the ladder extending and retracting, a Starter tip and a non-Starter tip at their windows, and static idle windows that need no wakes.	0,1,3,4,5,13	5
-robi-window-clamp	invariant	RobiShow::frame; robi::{body_px,ladder_tile_px}	frame is None exactly when the window cannot hold him; otherwise every body rect and ladder lies inside the window, and hiding is not state.	0,1,3,5,13	3
-robi-caret-avoidance	contract	RobiShow::frame; robi::caret_clearance	In stationary ground scenes he stands at least caret_clearance from the caret whenever the grid allows, purely and without animating; the ladder stays planted regardless of the caret.	0,1,3,5,13	3
-robi-tip-bank	table-property	robi::{ROBI_TIPS,pick_tip}	The tip bank has enough tips of each kind, each non-empty and <= 90 bytes, so pick_tip's unreachable arm is dead.	0,1,5,7,13	1
-robi-roster-table	table-property	robi_glyphs_gen::{ROBI_GLYPHS,ROBI_GLYPH_IDS}; RobiBaker::aspect	Every robi pose is present with at least one layer, and every aspect is finite and positive.	0,1,3	1
-robi-bake-deterministic	equivalence	robi_baker::bake_pose; RobiBakeKey::bake; ExactTileBaker::tile	bake_pose is a pure 4wh-byte bake, and every tile the baker returns equals bake_pose of its key.	0,1,2,3,7,11,12	2
-robi-host-id-namespace	contract	RobiBakeKey::{host_id,host_id_slice}; pet_baker::host_tile_id	host_id and host_id_slice are pure functions of the key with bit 63 set.	0,1,3,4,7	1
 toy-pack-source-cap	contract	spec::compile_toy_pack_toml	A source longer than MAX_TOY_PACK_BYTES is refused with one diagnostic before any parse.	0,1	1
 toy-pack-validation	contract	spec::{compile_toy_pack_toml,validate_pack_metadata,valid_id,valid_lang,validate_toy_word,compile_toy_spec,compile_toy_ink,compile_toy_burst,compile_toy_graphic,toy_dispatch_hashes}	compile succeeds iff the strict schema parses and none of the independent diagnostics fires (schema, id, metadata, counts, word rules, duplicate and possessive-collision hashes, kind and bound checks, and finally scanner reachability); every fired clause is reported, naming its field.	0,1,4,5,7,9,12	4
 toy-pack-denotation	contract	spec::compile_toy_pack_toml; SpecTable::override_for; CompiledToyPack::lexicon_toml	A compiled pack counts its toys and words, maps every dispatch hash of every word to its compiled spec, and its lexicon fragment scans every word as a whole-word match.	0,1,4,5,7,9,12	1
-shipped-packs-compile	table-property	spec::compile_toy_pack_toml; trail_pack::compile_trail_pack_toml	Every checked-in toy pack and trail pack compiles; synthwave's params are the expected ones.	0,1,7,8,9	3
+shipped-packs-compile	table-property	spec::compile_toy_pack_toml	Every checked-in community toy pack (toy-packs/community/*/pack.toml) compiles.	0,1,7,8,9	3
 custom-spec-table-keys	contract	SpecTable::{insert_custom,has_custom,override_for}; spec::{build_custom,parse_custom_toml,push_lexicon_entry}; RawCustomEntry::to_spec	insert_custom keys a non-default spec by the word's form hash (and, for spaced words, its folded possessive variants) and touches no other key; to_spec clamps chance and maps burst, graphic and ink kinds; build_custom folds entries and writes an escaped lexicon fragment; parse_custom_toml errs only on malformed TOML.	0,1,2,5,7,9	4
 custom-colorway-parse	contract	spec::{custom_colorway_is_valid,parse_two_tone,parse_colorway,parse_hex}	parse_hex accepts exactly 6 hex digits after an optional '#'; parse_two_tone exactly two such fields after "twotone:"; a colorway is valid iff rainbow or a valid two-tone; parse_colorway falls back to rainbow.	0,1,5	1
 spec-table-overlay	contract	SpecTable::overlay	After A.overlay(B), override_for(h) is B's answer when B has one, else A's.	0,1,2,5,7	1
 spec-consumer-capabilities	contract	SpecTable::consumer_capabilities	Each capability flag is true iff some reachable override spec (not the whole arena) needs it.	0,1,5,7	1
-trail-pack-source-cap	contract	trail_pack::compile_trail_pack_toml	A source longer than MAX_TRAIL_PACK_BYTES is refused with one diagnostic before any parse.	0,1	1
-trail-pack-validation	contract	trail_pack::{compile_trail_pack_toml,bounded_f32,bounded_pair,bounded_u32,strict_pack_hex,forbid,compile_envelope,compile_ramp,compile_channels,compile_theme,compile_beam,compile_pop}	compile succeeds iff the strict schema parses and the one-pass diagnostics are empty: schema version, id, metadata, every out-of-range or non-finite scalar and pair, unknown enum strings, malformed colours, cross-kind fields, layer and population counts; unknown fields fail with serde's message.	0,1,3,5,7,9	8
-trail-pack-params	contract	trail_pack::{compile_trail_pack_toml,quant,pack_fingerprint}; TrailParams::defaults	Compiled params are quantized and in range, absent tables keep the defaults, and pack_fp fingerprints the id and source.	0,1,3,5,7,9	1
 spectrum-lut-is-generated	equivalence	spectrum::{SPECTRUM_LUT,SPECTRUM_ANCHOR_AT,generate_spectrum_table}	The committed LUT and anchor positions equal the spec-only generator's output bit for bit.	0,1,3,5,7,14	1
 spectrum-lut-table-properties	table-property	spectrum::{SPECTRUM_LUT,SPECTRUM_ANCHOR_AT,SPECTRUM_ANCHORS,spectrum_hsv,spectrum_with_min_saturation}	Over the 511 entries: anchors sit at their positions, hue climbs without reversal, saturation and chroma stay full, adjacent steps are at most 4 levels, there is no deep luminance dip, and the saturation floor is the identity on every entry.	0,1,3,7,14	6
 spectrum-read-and-snap	contract	spectrum::{spectrum,spectrum_stop,spectrum_stop_position,spectrum_snap_index,spectrum_snap,spectrum_max_byte_rate}	spectrum(t) lerps the LUT at clamp(t)*510 (red for t <= 0 or NaN, violet for t >= 1) and equals each anchor at its position; spectrum_snap returns the nearest of the seven named stops and is onto them.	0,1,3,5,7	2
@@ -727,7 +719,7 @@ momentum-crossing-deadlines	contract	TypingMomentum::{low_crossing,reading_low_c
 flash-envelope-shape	contract	trick_flash::envelope	The envelope is 0 at both ends, rises strictly over RAMP_MS, holds exactly 1, falls strictly over FADE_MS with per-ms steps under 0.02; a revoke continues from its value and reaches 0 within REVOKE_FADE_MS.	0,1,3,4,5,6,12	1
 flash-legibility-guard	contract	trick_flash::{legible_strength,resolve_sat_val}	legible_strength is the largest eighth-step strength at which the tint keeps text contrast at min(MIN_INK_CONTRAST, the original) at every hue, on fg's side of bg; 0 when the theme has no usable contrast.	0,1,3,4,5,6,7,12	1
 flash-photosensitivity-bound	other	trick_flash::{envelope,flash_hue}; color_math::{hsv2rgb,relative_luminance}	Every cell's luminance trajectory over the flash has at most FLASH_REVERSALS opposing changes of 0.1, for every theme, strength, hue, position and revoke.	0,1,3,4,5,6,7,12	1
-flash-find-whole-word	contract	trick_flash::{find_in_row,find_word,is_word_char,is_strong_rtl}	A candidate spells the word on lead cells as a whole word within reach of the caret; find_in_row prefers an exactly anchored candidate, then the rightmost; find_word tries the mirrored spelling for RTL words.	0,1,3,4,5,7,12	6
+flash-find-whole-word	contract	trick_flash::{find_in_row,find_word,is_word_char,is_strong_rtl}	A candidate spells the word on lead cells as a whole word within reach of the caret; find_in_row prefers the strongest anchor (Exact, then Inside, then Slack, which counts only with the live cursor just past the word), then the rightmost; find_word tries the mirrored spelling for RTL words.	0,1,3,4,5,7,12	6
 flash-note-admission	contract	TrickFlash::note; trick_flash::hue_seed	note stores a slot iff a caret is known, the last flash started at least MIN_ANIMATION_MS ago, and the word has 1..=MAX_CHARS visible chars; the slot's hue seed is a function of caret and chars; the debounce outlives the slot.	0,1,2,3,5,7,12,13	3
 flash-lifecycle	invariant	TrickFlash::{phase,on_rescan,revoke,emit,clear}; WordDecorations::{note_trick_typed,revoke_trick_flash,trick_flash_phase}	phase is Idle, Pending, Live or Revoked as a function of the slot and now; a matching rescan locates, drops or gives up a slot, a revoke fades a live flash once, unpaintable rescans and emits drop it; on glass the flash emits exactly on [since, since + window).	0,1,2,3,4,5,10,12,13	6
 flash-emit-is-the-law	contract	TrickFlash::emit; word_decorations::fold_ink	A live flash in scope merges its cells into ink (kept sorted and unique, other cells untouched) with the envelope law's colours from the current base and folds them into fp; otherwise ink and fp are unchanged.	0,1,2,3,4,5,6,7,12	4
@@ -794,7 +786,6 @@ isolated-loudness-ladder	other	TrailSynth::{push,render,push_v2}; every Palette:
 rendered-timbre-bounds	other	rainbow_kitty_v2::{tine,wood,pluck,forte}; TrailSynth::{design_erase_poof,v2_shift,render}	Isolated renders meet their spectral bounds: the poof is airy above the key, the ting is clean and warm, the bloomed step stays under the glass line, the felt mallet chirps into the sparkle band, families are distinct, a shifted key holds its pitch.	0,1,2,3,4,5,6,7	8
 capital-weight-rendered	other	rainbow_kitty_v2::forte; Forte::of; TrailSynth::{v2_typed,render}	Under the music box a capital outweighs its plain twin by its weight in onset RMS and peak within bounds, rings a twelfth at a word head, is brighter early and mellower later than force 0, and crests no higher than before forte.	0,1,2,3,4,5,6,7	4
 sin01-accuracy	contract	trail_sound::sin01	For finite ph, sin01(ph) is within 2^-15 of sin(2 pi frac(ph)).	0,1,3,5,6	1
-v1-refines-v056	refinement	TrailSynth::{push,render}; v056_reference::RefSynth (spec-only)	For every style, seed and script of plain Technical Trail events, the new synth stays within 3e-5 per sample of the frozen v0.56 reference; every Lumen jump of a fast burst speaks.	0,1,2,3,5,6,7,10	2
 v2-fields-identity-on-v1	invariant	TrailSynth::push_meta_latched; Voice::default	Every voice a v1 event builds has every v2 field at its identity, so no v2 branch runs for it.	0,1,2,4,5	1
 mb-sky-bed	contract	rainbow_kitty_v2::sky_bed_degrees; TrailSynth::bed_rainbow_sky; CHORD_LOOP; BED_PARTIALS	The sky pad plays the live chord's lit degrees under the bass, and the hue moves its tilt and width, never its pitch.	0,1,2,3,5,6	2
 mb-music-box-only-gestures	contract	TrailSynth::{v2_verdict,v2_strum,design_output_pip}	Verdicts and strums sound only under the music box, a verdict is never louder than a key, and a strum is four rising tines on the chord that do not step the melody.	0,1,2,3,4,5,6	2
@@ -818,7 +809,7 @@ mb-space-bass	contract	TrailSynth::v2_space; MelodyV2::on_space; rainbow_kitty_v
 mb-meteor	contract	TrailSynth::{v2_meteor,v2_meteor_arm,v2_claim_arm,v2_release_arm,v2_core_voice}; timing::flight_ms; rainbow_kitty_v2::met_tick	The meteor bell and landing share the flight clock; the core carries direction; Land is silent; arms fizzle or are claimed without a click, a second meteor never eats a sounded bell; the tick is heard briefly.	0,1,2,3,4,5,6,12	5
 mb-cascade	contract	TrailSynth::v2_cascade; MelodyV2::{on_jump,run_theme_step,jump_echoes_enter}	A jump run plays one cascade and then rate-limited re-strikes; a keyed Enter mints none; streamed line feeds walk the theme and a lone one stands.	0,1,2,3,4,5	2
 mb-stardust-glint	contract	TrailSynth::{v2_glint,v2_glint_at}; MelodyV2::next_glint_deg	A hero star's cue is one pitched glint twinkling at the star's rate.	0,1,2,3,4	1
-mb-tails-and-damps	invariant	every v2 voice builder; TrailSynth::v2_damp	Every music-box voice ends quietly (at most 0.07 of its level) and every damp is at least the 12 ms ramp; the ting decays out before its release.	0,1,2,3,5,6	2
+mb-tails-and-damps	invariant	every v2 voice builder; TrailSynth::v2_damp	Every music-box voice ends quietly (at most 0.07 of its level) and every damp is at least the 12 ms ramp; the ting decays out before its release.	0,1,2,3,5,6	1
 mb-bus-limiter	contract	trail_sound::limit; TrailSynth::render	The limiter is exactly transparent below its threshold and holds the ceiling above, returning to gain 1 after.	0,1,2,3,5,6,7	1
 mb-fallback-clock	contract	TrailSynth::{v2_at_ms,render}	An unstamped key's clock is the render clock wrapped into u32 like a host stamp, so keys still step across the wrap.	0,2,3,5,6	1
 wd-twinkle	contract	word_decorations::twinkle; effect_util::twinkle_env	twinkle(s,t) = twinkle_env(t, phase of the seed's low byte), a function of wall time only, whose envelope peaks at most 3 times per second, so frame rate cannot add flashes.	0,3,5,14	1
@@ -879,7 +870,6 @@ wd-cursor-placement	refinement	WordDecorations::{resolve_kitty_cursor_placement,
 wd-held-tiles	contract	WordDecorations::{pet_cursor,dog_cameo,drop_holds_if_metric_moved}	A held tile is re-emitted only for the same look; a metric change drops every held tile.	0,1,2	3
 wd-pet-sprite-in-grid	contract	WordDecorations::pet_cursor; PetFrame::body_px	Every pet sprite lies inside the grid and the body equals the clamped body_px.	0,1,3,7	2
 wd-dog-cameo	contract	WordDecorations::dog_cameo	Once baked, the cameo is one sprite at the frame's alpha trailing behind the caret.	0,1,2,3	1
-wd-robi	contract	WordDecorations::robi; robi::ladder_tile_px	robi reports the body rect iff body slices were drawn, and the ladder stack reaches the window's top.	0,1,2,7	2
 wd-trick-flash	contract	WordDecorations::{note_trick_typed,tick,trick_flash_phase}	A live flash on a wordless screen emits exactly its cells and its own deadline; beside other ink it only extends the deadline; a pending flash changes nothing.	0,1,2	5
 art-asset-quality	table-property	art/glyphs and art/animal TOML; cat_glyphs_gen::GLYPHS; aterm_scene::{fill_path,parse_path}	Every roster asset is semantic and bounded (layers, commands, one dark outline first, roles, anchors and aspect in band), survives a 16 px bake per role, and is distinct within its class; the maneki's paw keeps its keyline.	0,1,3,7,8	11
 art-roster-completeness	table-property	Lexicon::{builtin,species_codes,classify_token}; animal_glyph_from_key; cat_glyphs_gen::{HEADS,GLYPHS}; KittyLook::{for_launch,normalized}; authored_cat_size	The lexicon's species and the authored animal roster are the same set and every head resolves; launch looks always pick a head and never the maneki, which keeps its aspect on the discovery path.	0,1,5,8,12	3
@@ -888,7 +878,8 @@ rb-walk-continuity	contract	Ribbon::{join_cohort,seat_fold_successor,settle_carr
 rb-follow-witness	contract	witness::{follow_runs,shape_verdicts,witness}; Engine::follow_rows; Ribbon::retire_cells	At the host seam a lit run whose glyphs arrive as one block a row or two away is translated with its clocks (followed counted, nothing retired beyond a wrap's slack); a run arriving around a hole is counted missed once; changed glyphs retire their cells; identical redraws keep every cell; a line killed under an identical line drains on its own row.	0,1,2,5,7	29
 rb-trail-status-line	contract	cursor_glow::TrailStatus::line_v2	Under v2 the status line ends with the meteor, bridged, retired, followed and follow_missed fields, with nothing before them moved.	0,1,9	1
 rb-echo-custody	invariant	CursorGlow::{tick,observe_print_anchor_glyph,observe_caret_drawn,supersede_typed_press,clear_typed_keeping_hand,hand_types_at_the_caret,refused_below_the_caret}; seam::admission; custody parks	At the host seam, for every interleaving of presses, echoes, status-row ticks, scrolls, frame phases and latencies: a press licenses only its own echo and program rows elsewhere are refused without forgetting presses; no cell lights off the composer row; footer parks flush without painting; a delayed echo is still paid; returns and margin wraps move at once; the next key after a declined relocation lays at the true caret; the re-anchor stays inside its pane.	0,1,2,5,7,10,13	15
-rb-same-caret-echo	refinement	CursorGlow::tick (same-caret re-own); seam::same_caret_typed_echo; Ribbon::sweep	On a caret that did not move, a cell is re-owned by a typed echo iff same_caret_typed_echo_model admits it (an exact in-flight press of that glyph, a prior probe, a blank-to-glyph change after the press, no ambient particle); exact coalesced batches of 9..128 keys light every cell on their first frame.	0,1,2,5,7,10	9
+rb-same-caret-echo	refinement	CursorGlow::tick (same-caret re-own); seam::{same_caret_typed_echo,exact_pending_prefix_slot,merged_correction,judge_merged_correction}; CursorGlow::row_shown; Ribbon::sweep	On a caret that did not move, a cell is re-owned by a typed echo iff same_caret_typed_echo_model admits it (an exact in-flight press of that glyph, a prior probe, a blank-to-glyph change after the press, no ambient particle; or a merged correction: a Backspace whose retreat no caret move has shown and the j keys typed since it rendered as one repaint, the caret moved j − k for the k cells the erases owe, the j cells before it spelling those keys, one of them changed, judged as the erases' retreat and then the keys' advance, against the last probe that showed the caret after a torn repaint; a glyph replaced with no erase claims nothing); exact coalesced batches of 9..128 keys light every cell on their first frame.	0,1,2,5,7,10	14
+rb-erase-echo-order	refinement	CursorGlow::{note_backspace_erasing,erase_hop,classify_move,park_candidate,spawn_judged}; EraseWitness	Bytes are processed in order, so a Backspace's echo follows the echoes of the keys typed before it and precedes those of the keys typed after it, as erased_key_echo_order_model states. While no caret move has shown it (within the press patience) the erase licenses its own same-row retreat of up to the cells the Backspaces owe, which is the deletion and never Ink's park; a forward hop the presses typed before it pay is theirs and leaves it owed; past those, cells printing the glyphs of keys it retired before they echoed are their late echo, paid by no press and leaving it owed; any other move shows it past.	0,1,2,5,7,10	3
 rb-typed-continuity	refinement	Ribbon::{revive,restore_abandoned,at_rest,next_change_deadline}; CursorGlow::tick	A retired typed run is revived only by a prompt typed continuation over its unchanged text (RainbowTypedContinuity); dormant runs owe nothing; an abandoned cohort is restored with its original clock only by its complete original text before expiry.	0,1,2,5,7,10	5
 rb-band-connectivity	invariant	CursorGlow::tick; Ribbon::sweep; Ink::plan	While the hand types a row, its live cells form one interval with no dark interior run, through hops, inserts, particles and keys typed over lit cells, and a typed line ends covered.	0,1,2,5,7	3
 rb-soft-wrap-indent	invariant	CursorGlow::{soft_wrapped_caret,key_pushed_text_down}; Ribbon::settle_carry; Engine::replay_events	For a soft-wrapping composer, under every present timing: nothing lights the indent, every column from the indent to the caret is lit from the landing on (first letter included), nothing lights over moved-down app text, and the old row empties on time.	0,1,2,5,7	6
@@ -897,8 +888,8 @@ rb-short-wrap-park	refinement	CursorGlow::tick (park hold/flush); witness::follo
 pet-contact	contract	PetBrain::{observe_console,tick,note_console_input,console_attention,console_reason}; PetWorld::observe; PetWorldFacts::read	Contact happens iff, during an unconsumed text input episode, a coherent observation saw new ink appear beside the body; scrolls, viewport round trips, incoherent snapshots and earlier ink never count; one pending contact, consumed once; unchanged ink gives Typing.	0,1,2,5,7,12	8
 pet-cursor-home	refinement	PetBrain::{tick,observe_console,sense_ink,needs_frames,console_reason}; PetWorld::{under_text_clearance_past_caret,ink_clearance}; PetFrame::body_px	The resident refines console_cursor_home_model: a full body stays near the painted caret over dense ink and under text, a full selection hides it, a hidden cursor and hidden region scrolls keep its last home without fake input or fades, a moved caret is followed home, and typing keeps it visible.	0,1,2,3,5,7,10,12	14
 pet-resident-handoff	refinement	PetBrain::{tick,console_legacy_motion_pending,console_resident_handoff_pending,pending_pets,needs_frames,next_change_deadline,note_petted,content}	The handoff refines console_resident_handoff_model: legacy motion owns the cadence until it lands, landing owes one resident tick that reads or yields (consuming touch), and then the brain is quiet.	0,1,2,3,10,12	2
-witness-follow-refines-twin-model	refinement	witness::Witness::{follow_runs,walk}; Seen::arrivals; aterm_spec::derive::ribbon_follow_twin_model	For every run of N distinct-glyph records, each arrived, standing, absent or absent-twin and gone or not, the real follow verdict equals the RibbonFollowTwin Decide successor and every invariant holds (the test checks N = 6).	0,1,2,5,7,10	1
-witness-arrival-evidence-refines-model	refinement	Witness::{walk,arm}; Seen::{pending,twin}; aterm_spec::derive::ribbon_arrival_evidence_model	For every RibbonArrivalEvidence trace up to its bound, the real witness's evidence projects onto the model state after each step and follow_runs names the run iff the model says clear and not twin.	0,1,2,5,7,10	1
+witness-follow-refines-twin-model	refinement	witness::Witness::{follow_runs,walk}; Seen::arrivals; aterm_models_effects::ribbon_follow_twin_model	For every run of N distinct-glyph records, each arrived, standing, absent or absent-twin and gone or not, the real follow verdict equals the RibbonFollowTwin Decide successor and every invariant holds (the test checks N = 6).	0,1,2,5,7,10	1
+witness-arrival-evidence-refines-model	refinement	Witness::{walk,arm}; Seen::{pending,twin}; aterm_models_effects::ribbon_arrival_evidence_model	For every RibbonArrivalEvidence trace up to its bound, the real witness's evidence projects onto the model state after each step and follow_runs names the run iff the model says clear and not twin.	0,1,2,5,7,10	1
 copy-is-not-arrival	contract	Witness::{follow_runs,walk,translate,translate_band,shape_verdicts}; Engine::follow_rows; CursorGlow::tick	If a typed line is erased while every record's glyph stands at a follow offset as a twin (seen at arm or for TWIN_MIN, not first shown by the erase), no run is followed there and nothing on that row ever lights, for every key count, lag, erase key, pacing, band move, scroll, alt screen and host.	0,1,2,5,7,8,12	23
 witness-row-slots	contract	Engine::ribbon_rows_for; CursorGlow::ribbon_rows; Witness::find_deferred_runs; CURSOR_WITNESS_ROWS; WITNESS_ROWS	With keys waiting the caret row and its neighbours have reserved slots after the bands' rows; a row with a slot is never withheld; a run beside an undelivered row is deferred one walk, and an undelivered row is never evidence of arrival.	0,1,2,3,5	7
 twin-evidence-timing	contract	Seen::{observe,pending,twin}; Witness::{translate,translate_cells,last_walk}	A copy becomes a twin iff seen at arm or on every sampled frame over at least TWIN_MIN, and stays one; carried records start over, scrolls keep evidence; so a torn relocation onto a row that stood under TWIN_MIN follows and one that stood longer melts.	0,1,2,3,5	7
@@ -915,7 +906,7 @@ wake-corridor-host	contract	Ribbon::{wake,scrub}; WAKE_MAX_CELLS	Home, End or a 
 wake-fold	contract	Ribbon::{fold_wakes_into_band,join_cohort,place}	A key at a hop wake's landing folds the wake into its band (never revives a retracting band), keeping one owner per column per cohort.	0,1,2,7	3
 scrub-never-raises-light	contract	Ribbon::{scrub,wake}; CursorTrail::spawn (nav arm)	At the host seam a word hop or arrow over live or melting light raises no cell, lays nothing over a live band, leaves abandoned bands byte-identical, returns the census unchanged after a round trip, and the classic trail matches a twin told of no key.	0,1,2,4,7	6
 licensed-insert-bridge	contract	CursorGlow::{hidden_bridge_source,visible_insert_echo}; spawn (insert arm); INSERT_GESTURE_HINT_FRESH; note_insert_armed; note_insert_delivered_from	hidden_bridge_source and visible_insert_echo share one predicate: a fresh Tab or a priced paste admits a reappearance within its reach and is laid whole in every frame shape; wider reappearances, stale Tabs and unlicensed program output lay nothing.	0,1,2,3,5	5
-crossed-echo-laid	contract	Engine::{lay_crossed_echo,follow_rows}; CursorGlow::judge_observed_caret	An echo that crossed rows with the caret's run in one tick is read as the same-row advance it is in the text's frame and every typed glyph is laid on the new row; a keyless relayout lays nothing and moves the band; the earlier band stays lit.	0,1,2,3,4,7	6
+crossed-echo-laid	contract	Engine::{follow_rows,hand_rides,hand_line_follow,lift_hand}; Witness::{follow_hand,await_caret}; Ribbon::{lift_hand,lift_seam}; CursorGlow::{judge_observed_caret,lift_hand_row}	An echo that crossed rows with the caret's run is read as the same-row advance it is in the text's frame and every typed glyph is laid on the new row: while a key is in flight the hand rides its line. The hand's own run (the cohort of its last typed glyph) is judged on its typed records alone, any folded wake riding with it, and a lone typed glyph stands with the caret shown on its new row as the second witness. That verdict moves the caret anchors, the hand's row, the mirror and the ribbon's hand-addressed members (caret, pen, arrival, floor, spaces, relocation, new-line gate) with the run, keeping the presses, before a caret shown one row away is judged, or when the follow pass carries the run while the caret is withheld; the pass carries the hand's run whether or not the general search names it, lifts at most once against the mirror it began with, arms the new-line seam only for other text leaving the hand's row as it stood before the lift, and carries the hand's line's own seam with it. Under a withheld caret, a lone glyph only the caret could follow gets no walk verdict until the caret shows. A keyless relayout lays nothing and moves the band; the earlier band stays lit.	0,1,2,3,4,7	14
 rewrap-carries-word	contract	CursorGlow::{key_pushed_text_down,soft_wrapped_caret,lifted_word,carried_word_left}; Ribbon::{moved_word_len,arrived,lift_word,settle_carry,flow_target,note_rewrap_start}	A key pushing a glued word down is judged at once iff the source tail is erased and its glyph stands left of the landing (otherwise a park keeps custody); the moved word is measured over its live typed cells back to the typed Space, never onto the indent; a lifted word goes up on its walk; a soft-wrapped word comes down only if its columns blanked; coalesced and stalled wraps relay the word whole.	0,1,2,3,4,7	23
 typed-reanchor-no-phantom-vector	contract	CursorGlow::judge_observed_caret (typed re-anchor); hide bridge; note_repaint_blink; note_context	On the alt screen a typed cross-row re-anchor after a repaint blink lays no light along the jump vector in any style, and a frame catching the repaint hidden bridges nothing beyond Chebyshev 2.	0,1,2,3	4
 rk-v2-steady-tick-contract	contract	rainbow_kitty::Engine::{tick,next_change_deadline,needs_frame_cadence,fingerprint}; CursorGlow::tick	Every tick emits at most MAX_QUADS quads and MAX_HALOS halos, warmed steady and idle ticks allocate nothing, and after the last key the engine reaches no deadline, no cadence and fp 0.	0,1,2,7,8	1
@@ -923,17 +914,17 @@ rk-ribbon-quad-share	contract	CursorGlow::under_quads; RAINBOW_RIBBON_QUAD_BUDGE
 trick-paths-allocation-free	contract	WordDecorations::{note_trick_typed,revoke_trick_flash,trick_flash_phase}; TrickListener	Once warmed, the trick flash and listener paths never allocate for any word input; a flash paints at most 32 cells.	0,1,2,7,8	2
 output-streak-quad-bound	contract	OutputStreak::{tick,emit}; MAX_COMETS; TAIL_MAX	Each OutputStreak tick appends at most cols + MAX_COMETS (TAIL_MAX + 2) quads, independent of rows.	0,1,2,3,7	1
 nova-draw-is-total	contract	aterm_render::Renderer::{draw_nova,render_input}; draw_flat_add	render_input draws every nova quad with no truncation, deterministically.	0,1,7,8,12	1
-output-streak-attribution	refinement	OutputStreak::{note_output_cells,note_output,note_keystroke,rebase,tick}; aterm_spec::derive::output_streak_attribution_model	note_output_cells refines OutputStreakAttribution: a frame is licensed iff fresh, undiscounted glyph content changed at fixed geometry and was not a moved row or a style-only repaint; geometry changes and rebases baseline silently; quads lie only in the changed run; viewport changes retire output.	0,1,2,5,7,10,12	17
-output-streak-delivery-refines-model	refinement	OutputStreak; output synth; OutputStreak::next_change_deadline; aterm_spec::derive::output_streak_episode_delivery_model	Every episode edge of the real streak and its synth refines OutputStreakEpisodeDelivery.	0,1,2,10	1
-nova-phase-refines-model	refinement	nova::{phase,emit_nova}; aterm_spec::derive::nova_phase_model	For every decodable duration the phase walk maps monotonically onto NovaPhase and the crown rises exactly once per Dip-to-Flash entry.	0,1,3,5,10	1
-cursor-cat-refines-model	refinement	CursorCat; aterm_spec::derive::{cursor_cat_model,cursor_cat_curse_wince_model}	The real CursorCat's frames project onto CursorCat model traces with every invariant held.	0,1,2,10	3
-kitty-sing-activation-refines-model	refinement	KittySing; CursorCat singing bypass; aterm_spec::derive::{kitty_sing_detector_model,cursor_cat_earn_floor_model}	The sing detector and the earn floor refine their models at every boundary, and the singing bypass still needs sixteen travel events.	0,1,2,10	3
-ribbon-row-hold-refines-model	refinement	Ribbon row clocks; aterm_spec::derive::ribbon_row_hold_model	Typing and erases renew only their own row (RibbonRowHold), and typing below never postpones an earlier row's exit.	0,1,2,10	2
-console-life-episode-refines-model	refinement	PetBrain::{note_console_input,console_attention,console_anchor_id,console_input_seq,console_input_consumed_seq,console_event_seq,console_reason,tick}; aterm_spec::derive::console_life_episode_model	Console state refines ConsoleLifeEpisode: echoes never replay, batched commits coalesce, input revokes a perch, stale results expire, ED2, ED3 and RIS clear what they should and nothing else, and erased ink never replays as contact.	0,1,2,10,12	8
-console-z-order-refines-model	refinement	PetFrame::under_ink; PetBrain z-order hold; aterm_spec::derive::console_pet_z_order_model	Every frame is a ConsolePetZOrder step: the pet is never painted over a glyph under its body, a burst changes layers at most twice, and blinking ink flips the held order once each way.	0,1,2,10,12	4
-console-observation-admission	refinement	PetBrain::{sense_ink,tick,tick_static_capture,console_legacy_motion_pending}; aterm_spec::derive::console_observation_admission_model	Failed and sparse observations refine ConsoleObservationAdmission: particles and one incoherent frame never send the pet far, invalid surfaces cannot materialize it, a real glyph still evicts it, protected surfaces hold, a real caret move is followed once coherent, and the idle ladder sleeps among particles.	0,1,2,10	11
-pet-surface-seam-refines-model	refinement	CompanionOwner::{observe,prepare,tick,rescan,resight_owner,invalidate_colors}; Departure::stance0; PetDepartureSprite::id; aterm_spec::derive::pet_surface_seam_model	At every coordinate-space boundary the owner's frames are a PetSurfaceSeam trace: the boundary frame is dark, then arriver and ghosts sum to about one cat, each ghost fading on its own glass in the look and palette it last drew and reaching zero as the arriver reaches full; incoherent frames hold then fade; sub-row scrolls change nothing.	0,1,2,4,10,12	16
-pet-torn-frame-hold	refinement	TerminalFacts::read; CompanionOwner; PetBrain HIDDEN_HOLD_MAX hold; aterm_spec::derive::console_cursor_home_model	Under the shipping contract a torn full repaint never moves or fades a settled pet for any bracket length, typing keeps it at the composer, and a finished frame's hidden caret is held within HIDDEN_HOLD_MAX then followed (ConsoleCursorHome).	0,1,2,10,12	7
+output-streak-attribution	refinement	OutputStreak::{note_output_cells,note_output,note_keystroke,rebase,tick}; aterm_models_effects::output_streak_attribution_model	note_output_cells refines OutputStreakAttribution: a frame is licensed iff fresh, undiscounted glyph content changed at fixed geometry and was not a moved row or a style-only repaint; geometry changes and rebases baseline silently; quads lie only in the changed run; viewport changes retire output.	0,1,2,5,7,10,12	17
+output-streak-delivery-refines-model	refinement	OutputStreak; output synth; OutputStreak::next_change_deadline; aterm_models_effects::output_streak_episode_delivery_model	Every episode edge of the real streak and its synth refines OutputStreakEpisodeDelivery.	0,1,2,10	1
+nova-phase-refines-model	refinement	nova::{phase,emit_nova}; aterm_models_effects::nova_phase_model	For every decodable duration the phase walk maps monotonically onto NovaPhase and the crown rises exactly once per Dip-to-Flash entry.	0,1,3,5,10	1
+cursor-cat-refines-model	refinement	CursorCat; aterm_models_effects::{cursor_cat_model,cursor_cat_curse_wince_model}	The real CursorCat's frames project onto CursorCat model traces with every invariant held.	0,1,2,10	3
+kitty-sing-activation-refines-model	refinement	KittySing; CursorCat singing bypass; aterm_models_effects::{kitty_sing_detector_model,cursor_cat_earn_floor_model}	The sing detector and the earn floor refine their models at every boundary, and the singing bypass still needs sixteen travel events.	0,1,2,10	3
+ribbon-row-hold-refines-model	refinement	Ribbon row clocks; aterm_models_effects::ribbon_row_hold_model	Typing and erases renew only their own row (RibbonRowHold), and typing below never postpones an earlier row's exit.	0,1,2,10	2
+console-life-episode-refines-model	refinement	PetBrain::{note_console_input,console_attention,console_anchor_id,console_input_seq,console_input_consumed_seq,console_event_seq,console_reason,tick}; aterm_models_effects::console_life_episode_model	Console state refines ConsoleLifeEpisode: echoes never replay, batched commits coalesce, input revokes a perch, stale results expire, ED2, ED3 and RIS clear what they should and nothing else, and erased ink never replays as contact.	0,1,2,10,12	8
+console-z-order-refines-model	refinement	PetFrame::under_ink; PetBrain z-order hold; aterm_models_effects::console_pet_z_order_model	Every frame is a ConsolePetZOrder step: the pet is never painted over a glyph under its body, a burst changes layers at most twice, and blinking ink flips the held order once each way.	0,1,2,10,12	4
+console-observation-admission	refinement	PetBrain::{sense_ink,tick,tick_static_capture,console_legacy_motion_pending}; aterm_models_effects::console_observation_admission_model	Failed and sparse observations refine ConsoleObservationAdmission: particles and one incoherent frame never send the pet far, invalid surfaces cannot materialize it, a real glyph still evicts it, protected surfaces hold, a real caret move is followed once coherent, and the idle ladder sleeps among particles.	0,1,2,10	11
+pet-surface-seam-refines-model	refinement	CompanionOwner::{observe,prepare,tick,rescan,resight_owner,invalidate_colors}; Departure::stance0; PetDepartureSprite::id; aterm_models_effects::pet_surface_seam_model	At every coordinate-space boundary the owner's frames are a PetSurfaceSeam trace: the boundary frame is dark, then arriver and ghosts sum to about one cat, each ghost fading on its own glass in the look and palette it last drew and reaching zero as the arriver reaches full; incoherent frames hold then fade; sub-row scrolls change nothing.	0,1,2,4,10,12	16
+pet-torn-frame-hold	refinement	TerminalFacts::read; CompanionOwner; PetBrain HIDDEN_HOLD_MAX hold; aterm_models_effects::console_cursor_home_model	Under the shipping contract a torn full repaint never moves or fades a settled pet for any bracket length, typing keeps it at the composer, and a finished frame's hidden caret is held within HIDDEN_HOLD_MAX then followed (ConsoleCursorHome).	0,1,2,10,12	7
 pet-hidden-caret-bounded-hold	contract	PetBrain::tick (caret, caret_drawn); tennis watch; scroll compensation; flight birth	A hidden but known caret is followed after a bounded hold; the tennis watch never blocks travel; scroll compensation never lifts the body off the glass; a flight is not advanced on its birth tick.	0,1,2,3	2
 pet-visibility-hold	contract	PetBrain visibility hold; PetFrame::alpha; set_console_presentable	Typing never blanks or cuts the pet; an output burst only fades it by bounded steps; with the console gate off there is no veto at all.	0,1,2,3,7	4
 protected-surface-yield	contract	PetFrame::under_ink; PetBrain visibility veto; console placement pass	Over ordinary ink the body stays whole and renders under the glyphs; on a protected surface it moves off or goes to alpha 0.	0,1,2	2
@@ -943,7 +934,7 @@ pet-wake-liveness	contract	PetBrain::{needs_frames,next_change_deadline,pending_
 pet-no-nonfinite	no-panic	PetBrain::tick; PetFrame	For every sense (any u16 geometry including 0 and MAX, any caret) and tick sequence, the frame's position is finite and, when visible, within 64 cells of the grid.	0,1,2,3,7	1
 pet-art-roster-table	table-property	pet_glyphs_gen pose table; PetGlyphId; cat_glyphs_codegen::quant	Over the generated pet roster every pose shares one viewbox and anchor set, stays inside it, planted poses stand on one ground line, every pose is within its layer and command budget with one dark outline first, and reading-gaze poses keep the perch body fixed.	0,1,7,14	6
 pet-bake-properties	table-property	PetBaker::bake; CatBaker::host_tile; kitty_pet::{ART_ROWS,ART_ASPECT}; MOUTH_DETAIL_MIN_H	The pet's box fits the atlas slot at every metric, airborne gaits clear the ground, the yawn's gape survives the mouth cull, and contact beats have distinct silhouettes.	0,1,3,7	4
-pack-decoders-denotation	equivalence	spec::{parse_custom_toml,compile_toy_pack_toml}; trail_pack::compile_trail_pack_toml	Each first-party decoder equals its schema's denotation (strict tables for packs, a lenient container with an untagged ink union for custom words), as recorded in the golden corpus.	0,1,5,7,9,12	3
+pack-decoders-denotation	equivalence	spec::{parse_custom_toml,compile_toy_pack_toml}	Each first-party decoder equals its schema's denotation (strict tables for packs, a lenient container with an untagged ink union for custom words), as recorded in the golden corpus.	0,1,5,7,9,12	3
 sound-seam-independent-of-amplitude	contract	CursorGlow::{tick,sound_seam_open,cue_keystroke_kind,take_key_cue}; keyed_blaze; clear_sound_ledger; cue_move_sound	The key seam is open iff enabled and audible, whatever the intensity; key cues read this tick's thermal constants; a shed tick banks what a lit tick banks; unfocus, master off and reset wipe the ledger; the cue queue stays bounded while dark.	0,1,2,3	6
 licence-is-precondition	equivalence	CursorGlow::tick; licence seam; GlowConfig::ribbon_flat	For every style and fully licensed script, the frames, counters, momentum and cues equal those with the licence gate forced open; earned light survives unlicensed moves; only a key's first move takes the licence; ribbon_flat collapses the comet terms.	0,1,2,4,5	4
 word-deco-rekey-preserves-spent-guard	contract	WordDecorations::{rescan,tick}; Lexicon	A same-width redraw that moves a matched word is one episode: a spent supernova is not re-armed and the ink follows; a genuinely fresh occurrence still bursts.	0,1,2,7	1
@@ -962,13 +953,10 @@ Paths are relative to `crates/aterm-effects/`. `primary` is the spec that retire
 ```tsv
 file	test	primary	also
 src/animal_baker.rs	bake_is_deterministic_and_exact_size	bake-tile-geometry	
-src/animal_baker.rs	cache_hits_and_frame_budget_bound_cold_bakes	exact-tile-baker-lru	
-src/animal_baker.rs	metric_change_clears_residency	exact-tile-baker-lru	
 src/cat_baker.rs	a_slot_served_this_frame_is_never_evicted_under_its_own_quad	catbaker-atlas-lru	
 src/cat_baker.rs	accessory_overlay_preserves_each_authored_aspect	accessory-transform	
 src/cat_baker.rs	atlas_publishes_on_change_only	catbaker-atlas-lru	
 src/cat_baker.rs	bake_budget_is_two_per_frame	catbaker-atlas-lru	
-src/cat_baker.rs	context_background_selects_contrast_outline	outline-contrast	
 src/cat_baker.rs	context_outline_clears_wcag_contrast_at_every_band_edge	outline-contrast	
 src/cat_baker.rs	context_palette_default_is_neutral_and_hue_families_are_cardinal	color-key-quantize	
 src/cat_baker.rs	context_palette_is_bounded_and_color_aware	color-key-quantize	
@@ -977,7 +965,6 @@ src/cat_baker.rs	dark_coats_are_lifted_on_dark_backgrounds_only	coat-lift
 src/cat_baker.rs	dirty_publish_recycles_and_never_mutates_a_held_snapshot	catbaker-recycled-publish	
 src/cat_baker.rs	exterior_whiskers_follow_context_ink_but_internal_features_stay_fixed	resolve-layer	
 src/cat_baker.rs	eyes_frame_bakes_distinct_but_open_is_authored	eyes-frame-transform	
-src/cat_baker.rs	flying_cursor_reflections_are_contained_and_expression_aware	reflection-containment	
 src/cat_baker.rs	flying_reflection_roster_is_contained_and_nonvacuous	reflection-containment	
 src/cat_baker.rs	get_v4_rejects_art_wider_than_slot_minus_strip	catbaker-atlas-lru	
 src/cat_baker.rs	lru_evicts_oldest_and_version_bumps	catbaker-atlas-lru	
@@ -986,44 +973,30 @@ src/cat_baker.rs	mixed_background_bake_contains_both_keyline_inks	outline-contra
 src/cat_baker.rs	mixed_background_dual_keyline_covers_every_luminance	outline-contrast	
 src/cat_baker.rs	recycled_publish_is_byte_equal_to_full_clone	catbaker-recycled-publish	
 src/cat_baker.rs	slot_count_is_structural	catbaker-slot-count	
-src/cat_baker.rs	v4_accessory_overlay_differs_and_is_distinct_key	eyes-frame-transform	
 src/cat_baker.rs	v4_bake_variant_is_deterministic	bake-tile-geometry	
 src/cat_baker.rs	v4_coat_recolor_produces_distinct_tiles	coat-noninterference	
-src/cat_baker.rs	v4_dark_bg_lifts_outline	outline-contrast	
 src/cat_baker.rs	v4_fixed_patterned_variant_is_coat_invariant	coat-noninterference	
 src/cat_glyphs_codegen.rs	roster_schema_rejects_text_primitives_and_unknown_keys	codegen-schema-fail-closed	
-src/cat_glyphs_codegen.rs	variant_names_are_camel_case	codegen-variant-name	
-src/classic_wake.rs	a_typing_advance_lights_a_short_wake	cw-motion-spawns	
 src/classic_wake.rs	disabled_returns_the_engine_to_rest	cw-rest	
 src/classic_wake.rs	reset_forgets_the_cursor_so_no_cross_space_comet_spawns	cw-rest	
 src/classic_wake.rs	the_classic_wake_spawns_on_motion_alone_with_no_license	cw-motion-spawns	
 src/classic_wake.rs	the_comet_run_pool_keeps_its_buffers_between_frames	cw-run-pool-monotone	
 src/classic_wake.rs	the_mono_face_follows_the_configured_colour_and_the_spectrum_does_not	cw-color-faces	
-src/classic_wake.rs	the_same_schedule_folds_identically	cw-time-shift	
 src/classic_wake.rs	the_wake_decays_to_exactly_empty_and_disarms	cw-rest	
 src/companion.rs	a_capture_spends_no_present_latch	owner-present-latches	
-src/companion.rs	a_chosen_species_is_the_brains_at_once_and_a_drain_drops_it_until_the_next_prepare	owner-retire-family	
-src/companion.rs	a_hidden_caret_is_still_chased_and_reported_unpainted	owner-sense-projection	
 src/companion.rs	a_pointer_over_the_grid_is_sensed_and_one_off_the_grid_is_not	owner-sense-projection	
 src/companion.rs	a_press_inside_the_body_plus_slop_pets_and_outside_passes	owner-press	
-src/companion.rs	a_press_lands_inside_the_body_plus_slop_and_nowhere_else	pet-geometry-maps	
 src/companion.rs	a_shed_edge_never_snaps_or_seats_a_moving_resident	shed-refines-model	
 src/companion.rs	a_song_and_its_tail_keep_full_resident_custody	owner-custody	
 src/companion.rs	a_static_capture_materialises_the_first_still	pet-still-postures	
 src/companion.rs	a_torn_frames_hidden_cursor_reads_as_the_last_finished_caret	owner-sense-projection	
-src/companion.rs	a_withdrawn_body_cannot_be_touched_and_keeps_its_brain	owner-sense-projection	
 src/companion.rs	an_obscured_surface_keeps_the_pet_owned_but_off_glass	owner-custody	
-src/companion.rs	an_off_glass_emit_leaves_no_hello_to_commit	owner-emit-hello	
 src/companion.rs	blank_glass_keys_the_pets_contrast_off_the_cursor_colour	cat-color-key-footprint	
 src/companion.rs	capture_and_reenable_do_not_leave_stale_static_scheduler_custody	owner-cadence-law	
 src/companion.rs	cursor_companion_ignores_alternating_backgrounds_outside_its_footprint	cat-color-key-footprint	
 src/companion.rs	cursor_companion_samples_its_actual_multiline_footprint	cat-color-key-footprint	
 src/companion.rs	emit_draws_one_body_wearing_the_latched_pair_and_syncs_the_verdict	owner-emit-hello	
-src/companion.rs	exactly_one_companion_can_own_a_frame_even_if_both_alphas_arrive	companion-duty-on-glass	
-src/companion.rs	face_goes_live_at_the_swap_threshold	companion-gates	
 src/companion.rs	hidden_caret_keeps_exact_resident_body_custody_without_a_stale_cell	companion-duty-on-glass	
-src/companion.rs	history_lets_the_fading_pet_brain_settle	pet-brain-settles	
-src/companion.rs	history_suppresses_both_cursor_companions_without_suspending_decorations	companion-gates	
 src/companion.rs	only_a_presented_resident_can_receive_pointer_strokes	owner-sense-projection	
 src/companion.rs	peek_cues_reach_the_brain_as_fractional_cells	owner-note-peeks	
 src/companion.rs	pet_hit_rect_win_offsets_the_body_by_the_effects_origin	pet-geometry-maps	
@@ -1031,22 +1004,18 @@ src/companion.rs	pet_mode_summons_exit_plain	pin-pet-mode-exit
 src/companion.rs	pointer_maps_into_pane_cells_and_dies_at_the_edge	pet-geometry-maps	
 src/companion.rs	pre_tick_setup_binds_focused_ink_before_read_and_applies_species	pet-ink-binding	
 src/companion.rs	reduced_motion_pins_the_pet_at_its_station	pet-still-postures	
-src/companion.rs	reduced_song_keeps_full_pet_present_and_late_cutoffs_never_blank	reduced-handoff-refines-model	
 src/companion.rs	resident_shed_model_proves_and_catches_the_snap	shed-refines-model	
 src/companion.rs	retire_coordinate_space_keeps_the_command_latch_and_retire_owner_rebaselines_it	owner-present-latches	
-src/companion.rs	retiring_the_owner_keeps_identity_and_drops_the_surface	owner-retire-family	
 src/companion.rs	same_session_change_is_a_wrap_and_a_session_switch_never_is	wrap-fact-edge	
 src/companion.rs	single_and_composed_companions_share_continuous_shed_admission_and_alpha	shed-companion-alpha	
 src/companion.rs	the_arrival_mapping_rations_the_theater_by_rung_and_difference	pet-arrival-mapping	
 src/companion.rs	the_brain_ticks_even_when_undrawable_so_the_lane_is_released	pet-brain-settles	
-src/companion.rs	the_command_latch_baselines_silently_then_feels_each_completion_once	owner-present-latches	
 src/companion.rs	the_completion_edge_is_handed_back_once_and_never_on_a_session_switch	owner-present-latches	
 src/companion.rs	the_drain_is_a_fresh_brain_that_keeps_the_session_latches	owner-present-latches	
 src/companion.rs	the_hello_seam_commits_only_a_performed_ceremony_on_a_present	owner-emit-hello	
 src/companion.rs	the_level_rules_retire_hide_and_preserve_the_resident_under_load	owner-custody	
 src/companion.rs	the_owner_is_present_only_with_pet_mode_the_master_and_the_pet_style	companion-gates	
 src/companion.rs	the_pointer_is_value_shadowed	owner-set-pointer	
-src/companion.rs	the_seed_door_dresses_the_pet_and_disabling_retires_it	owner-retire-family	
 src/companion.rs	the_shed_latch_takes_the_train_never_the_motion	owner-cadence-law	
 src/companion.rs	typing_echo_never_reads_as_a_burst	companion-gates	
 src/companion_look.rs	a_focus_move_to_another_session_re_derives_the_claim	claim-cache	
@@ -1065,32 +1034,24 @@ src/companion_look.rs	switching_programs_and_flapping_claims	tenure-gate
 src/companion_look.rs	the_base_cat_is_always_a_homecoming	roster-rate-law	
 src/companion_look.rs	the_claim_caches_by_block_state_and_commandline_presence	claim-cache	
 src/companions.rs	one_press_feeds_every_typed_detector_by_the_same_cascade	typed-press-cascade	
-src/companions.rs	robi_answers_to_his_name_once_per_spelling	robi-name	
 src/cursor_beam.rs	bar_rod_hugs_the_bar_and_stays_text_safe	cursor-body-quads	
-src/cursor_beam.rs	block_emitter_fill_rides_the_blaze	cursor-body-fill-ramp	
 src/cursor_beam.rs	disabled_or_reduced_motion_is_inert	cursor-body-inert	
 src/cursor_beam.rs	rod_lands_at_the_window_origin	cursor-body-origin-translation	
 src/cursor_beam.rs	settles_when_the_blaze_dies	cursor-body-activity	
 src/cursor_comet.rs	blaze_swells_and_brightens	cursor-body-energy-monotone	
 src/cursor_comet.rs	coma_surrounds_the_caret_in_a_padded_headed_window	cursor-body-origin-translation	
 src/cursor_comet.rs	disabled_or_zero_intensity_is_inert	cursor-body-inert	
-src/cursor_comet.rs	fill_frosts_with_blaze	cursor-body-fill-ramp	
 src/cursor_comet.rs	hidden_cursor_draws_no_coma	cursor-body-activity	
 src/cursor_comet.rs	nucleus_follows_the_configured_hue	cursor-body-fill-ramp	
-src/cursor_comet.rs	quad_count_is_bounded	cursor-body-quads	
 src/cursor_comet.rs	quads_respect_grid_hue_and_cap	cursor-body-quads	
 src/cursor_comet.rs	settles_to_inactive_when_blaze_dies	cursor-body-activity	
 src/cursor_droplet.rs	bead_surrounds_the_caret_in_a_padded_headed_window	cursor-body-origin-translation	
 src/cursor_droplet.rs	disabled_or_zero_intensity_is_inert	cursor-body-inert	
-src/cursor_droplet.rs	fill_foams_with_surge	cursor-body-fill-ramp	
 src/cursor_droplet.rs	hidden_cursor_draws_no_bead	cursor-body-activity	
-src/cursor_droplet.rs	quad_count_is_bounded	cursor-body-quads	
 src/cursor_droplet.rs	quads_respect_grid_hue_and_cap	cursor-body-quads	
 src/cursor_droplet.rs	settles_to_inactive_when_surge_dies	cursor-body-activity	
-src/cursor_droplet.rs	surge_drips_below_and_ripples_wide	cursor-body-energy-monotone	
 src/cursor_droplet.rs	surge_swells_and_brightens	cursor-body-energy-monotone	
 src/cursor_fx.rs	every_effect_body_fades_to_the_terminal_cursor_through_one_seam	project-block-fill	
-src/cursor_fx.rs	head_dx_noses_into_a_bar_and_centres_everything_else	head-dx	
 src/cursor_fx.rs	the_caret_style_law_is_one_truth_table	caret-style-law	
 src/cursor_fx.rs	the_momentum_engine_yields_the_caret_cell_to_the_rainbow	momentum-glow-allowed	
 src/cursor_fx.rs	the_momentum_glow_obeys_the_effects_master	momentum-master-gate	
@@ -1101,13 +1062,9 @@ src/cursor_glow/tests/band_move.rs	the_codex_excursion_print_anchor_stays_inert	
 src/cursor_glow/tests/band_move.rs	translate_band_moves_last_and_last_visible_only_inside_the_band_and_drops_what_leaves	glow-band-move	
 src/cursor_glow/tests/beam.rs	beam_jump_is_one_clean_full_vector_rod	beam-rod-morphology	
 src/cursor_glow/tests/beam.rs	beam_parses_to_its_own_style	style-spelling-table	
-src/cursor_glow/tests/beam.rs	beam_powers_down_thinner	beam-rod-morphology	
-src/cursor_glow/tests/beam.rs	beam_stays_cool_light	style-hue-fidelity	
 src/cursor_glow/tests/beam.rs	beam_typing_never_goes_dark_mid_rhythm	ribbon-continuity	
 src/cursor_glow/tests/cold_motion.rs	cold_program_motion_emits_no_rainbow_light	glow-no-licence-no-light	
 src/cursor_glow/tests/cold_motion.rs	every_style_keeps_a_timestamp_only_relayout_dark	glow-no-licence-no-light	
-src/cursor_glow/tests/cold_motion.rs	one_press_multi_cell_hop_is_not_coalesced_typing	glow-exact-payment	
-src/cursor_glow/tests/cold_motion.rs	one_reflow_timestamp_produces_no_streaks	glow-no-licence-no-light	
 src/cursor_glow/tests/cold_motion.rs	rainbow_ribbon_vanishes_without_a_visible_step	glow-idle-to-zero	
 src/cursor_glow/tests/cold_motion.rs	synthetic_rainbow_moves_are_visible_and_cold_output_stays_dark	glow-licence-grant	
 src/cursor_glow/tests/comet.rs	beam_stardust_strewn_along_window_absolute_leap	glow-window-absolute	
@@ -1115,8 +1072,6 @@ src/cursor_glow/tests/comet.rs	comet_bridge_attaches_window_absolute	glow-window
 src/cursor_glow/tests/comet.rs	comet_debris_born_window_absolute_with_chrome_origin	glow-window-absolute	
 src/cursor_glow/tests/comet.rs	comet_light_respects_invariants_and_decays	glow-quad-invariants	
 src/cursor_glow/tests/comet.rs	comet_parses_apart_from_beam_and_lumen	style-spelling-table	
-src/cursor_glow/tests/comet.rs	comet_sheds_hanging_debris_behind_the_motion	glow-window-absolute	
-src/cursor_glow/tests/comet.rs	comet_tail_freezes_white_toward_the_head	style-hue-fidelity	
 src/cursor_glow/tests/erase.rs	a_bigger_erase_makes_a_bigger_cloud_not_a_thinner_one	erase-poof-shape	
 src/cursor_glow/tests/erase.rs	a_plain_backspace_arms_the_host_exactly_like_a_kill	glow-scheduler-pacing	
 src/cursor_glow/tests/erase.rs	a_plain_backspace_never_throws_the_kill_swoosh	erase-sound-cues	
@@ -1126,7 +1081,6 @@ src/cursor_glow/tests/erase.rs	an_unwitnessed_kill_still_serves_the_full_grace	e
 src/cursor_glow/tests/erase.rs	cadence_predicate_separates_brisk_rainbow_from_coarse_ember	glow-scheduler-pacing	
 src/cursor_glow/tests/erase.rs	ctrl_k_shrink_poofs_once	erase-poof-licence	
 src/cursor_glow/tests/erase.rs	erase_poof_drive_grows_with_momentum_and_weight	erase-poof-drive	
-src/cursor_glow/tests/erase.rs	exact_plain_backspace_poofs_cat_independent	erase-poof-licence	
 src/cursor_glow/tests/erase.rs	ink_repaint_same_text_is_silent	erase-poof-licence	
 src/cursor_glow/tests/erase.rs	kill_hint_paces_coarse	glow-scheduler-pacing	
 src/cursor_glow/tests/erase.rs	kill_repeat_rate_limits_to_one_poof	erase-poof-licence	
@@ -1136,24 +1090,19 @@ src/cursor_glow/tests/erase.rs	reflow_kill_poofs_at_the_caret	erase-poof-licence
 src/cursor_glow/tests/erase.rs	repaint_same_text_with_stale_hint_is_silent	erase-poof-licence	
 src/cursor_glow/tests/erase.rs	scroll_fence_retires_plain_backspace_poof_provenance	erase-poof-licence	
 src/cursor_glow/tests/erase.rs	the_shipping_default_puffs_a_cloud_on_every_delete_shape	erase-poof-shape	
-src/cursor_glow/tests/fire.rs	backspace_steam_escalates_and_decays	fire-forge-and-vapor	
 src/cursor_glow/tests/fire.rs	emberforge_real_thermal_conforms_to_model	fire-thermal-refines-model	
 src/cursor_glow/tests/fire.rs	emberforge_thermal_model_proves_and_catches_heating_quench	fire-thermal-refines-model	
 src/cursor_glow/tests/fire.rs	fire_backspace_quenches_and_navigation_never_heats	fire-thermal-refines-model	
 src/cursor_glow/tests/fire.rs	fire_embers_dim_over_probed_glyph_cells	fire-no-recolor	
-src/cursor_glow/tests/fire.rs	fire_field_full_blaze_respects_quad_budget	glow-quad-invariants	
 src/cursor_glow/tests/fire.rs	fire_field_full_blaze_respects_quad_budget_with_head_band	glow-quad-invariants	
 src/cursor_glow/tests/fire.rs	fire_forge_cursor_heats_holds_and_cools_to_ember	fire-forge-and-vapor	
-src/cursor_glow/tests/fire.rs	fire_human_cadence_keeps_a_live_ember_floor	glow-heat-momentum	
 src/cursor_glow/tests/fire.rs	fire_identity_at_origin_without_head	glow-quad-invariants	
 src/cursor_glow/tests/fire.rs	fire_jump_flares_and_cools	fire-thermal-refines-model	
 src/cursor_glow/tests/fire.rs	fire_light_drops_the_additive_crown	fire-no-recolor	
 src/cursor_glow/tests/fire.rs	fire_light_is_radial_halos_not_squares	glow-quad-invariants	
 src/cursor_glow/tests/fire.rs	fire_meteor_survives_an_unlicensed_second_hop_without_retargeting	jump-morphology	
-src/cursor_glow/tests/fire.rs	fire_momentum_is_earned_not_instant	glow-heat-momentum	
 src/cursor_glow/tests/fire.rs	fire_rises_into_the_chrome_band	glow-quad-invariants	
 src/cursor_glow/tests/fire.rs	fire_row_change_snuffs_the_old_lines_trail	jump-morphology	
-src/cursor_glow/tests/fire.rs	fire_smolders_cold_and_blazes_hot	glow-heat-momentum	
 src/cursor_glow/tests/fire.rs	frame_fingerprint_preserves_private_stream_identity_and_idle_zero	frame-fingerprint	
 src/cursor_glow/tests/fire.rs	halo_changes_change_the_fingerprint	frame-fingerprint	
 src/cursor_glow/tests/fire.rs	hot_blaze_emits_halo_strengths_rising_toward_the_head_and_never_recolors	fire-no-recolor	
@@ -1161,18 +1110,10 @@ src/cursor_glow/tests/fire.rs	hot_cursor_smokes_and_cool_cursor_stops	fire-forge
 src/cursor_glow/tests/fire.rs	light_theme_fire_is_ink_over_mode	fire-no-recolor	
 src/cursor_glow/tests/fire.rs	towering_blaze_chars_the_engulfed_rows_and_decays	fire-no-recolor	
 src/cursor_glow/tests/fire.rs	typing_wrap_no_meteor_deliberate_enter_still_meteors	jump-morphology	
-src/cursor_glow/tests/goldens.rs	the_other_nine_styles_are_byte_identical_with_v2_unconditional	v2-noninterference	
 src/cursor_glow/tests/heat_and_laser.rs	heat_cools_after_a_pause	glow-heat-momentum	
-src/cursor_glow/tests/heat_and_laser.rs	laser_is_monochrome	style-hue-fidelity	
 src/cursor_glow/tests/heat_and_laser.rs	laser_jump_strikes_lightning	laser-and-sparkle-bursts	
 src/cursor_glow/tests/heat_and_laser.rs	laser_navigation_forges_no_strike	glow-no-licence-no-light	
-src/cursor_glow/tests/heat_and_laser.rs	laser_typing_leaves_a_charged_crackling_trail	laser-and-sparkle-bursts	
-src/cursor_glow/tests/heat_and_laser.rs	sparkle_and_laser_bursts_never_stack_one_point	laser-and-sparkle-bursts	
 src/cursor_glow/tests/heat_and_laser.rs	sustained_typing_outshines_relaxed_typing	glow-heat-momentum	
-src/cursor_glow/tests/ink_wrap_seam.rs	an_ink_wrap_observed_as_a_same_row_re_anchor_keeps_the_light_under_the_text	ribbon-text-custody	
-src/cursor_glow/tests/ink_wrap_seam.rs	an_ink_wrap_observed_as_one_scrolled_move_lets_the_streak_follow_the_caret_down	ribbon-text-custody	
-src/cursor_glow/tests/ink_wrap_seam.rs	an_ink_wrap_observed_as_two_scrolled_moves_lets_the_streak_follow_the_caret_down	ribbon-text-custody	
-src/cursor_glow/tests/ink_wrap_seam.rs	an_ink_wrap_of_a_one_letter_word_observed_as_one_scrolled_move_lets_the_streak_follow_the_caret_down	ribbon-text-custody	
 src/cursor_glow/tests/insert.rs	a_delivered_insert_brands_no_row	insert-effects	
 src/cursor_glow/tests/insert.rs	a_delivered_insert_builds_no_momentum_and_cues_nothing	insert-effects	
 src/cursor_glow/tests/insert.rs	a_delivered_insert_is_inert_for_a_program_row	insert-licence	
@@ -1205,11 +1146,8 @@ src/cursor_glow/tests/insert_witness.rs	an_unknown_width_receipt_that_lands_late
 src/cursor_glow/tests/insert_witness.rs	insert_row_identity_is_the_witnessed_row_or_a_priced_whole_width	insert-row-identity	
 src/cursor_glow/tests/insert_witness.rs	repeated_unknown_inserts_do_not_widen_the_bound_past_the_gesture_cap	insert-licence	
 src/cursor_glow/tests/insert_witness.rs	two_receipts_straddling_the_frame_claim_the_refused_hop_together	insert-licence	
-src/cursor_glow/tests/licence.rs	a_synthetic_note_licenses_its_own_move	glow-licence-grant	
 src/cursor_glow/tests/licence.rs	an_unlicensed_move_mints_nothing_and_retires_nothing_in_every_style	glow-no-licence-no-light	
-src/cursor_glow/tests/licence.rs	cold_three_cell_hops_lay_no_ribbon_and_leave_no_ring	glow-no-licence-no-light	
 src/cursor_glow/tests/licence.rs	content_only_probes_never_license_a_kill_poof	glow-no-licence-no-light	
-src/cursor_glow/tests/licence.rs	momentum_climbs_through_streaming_collisions_that_retire_every_candidate	glow-heat-momentum	
 src/cursor_glow/tests/licence.rs	rainbow_ribbon_survives_a_three_per_frame_mash	glow-licence-grant	
 src/cursor_glow/tests/licence.rs	rainbow_ribbon_survives_word_boundaries_and_keeps_its_head	glow-licence-grant	
 src/cursor_glow/tests/licence.rs	the_real_glow_engine_conforms_to_the_licence_model	glow-licence-refines-model	
@@ -1218,7 +1156,6 @@ src/cursor_glow/tests/lifecycle.rs	conpty_hide_gap_still_spawns_the_typing_spark
 src/cursor_glow/tests/lifecycle.rs	every_style_keeps_the_invariants	glow-quad-invariants	
 src/cursor_glow/tests/lifecycle.rs	hidden_far_teleport_stays_suppressed	hide-bridge	
 src/cursor_glow/tests/lifecycle.rs	jump_spawns_light_and_fades_to_empty	glow-idle-to-zero	
-src/cursor_glow/tests/lifecycle.rs	lone_key_wake_fades_crisply	glow-idle-to-zero	
 src/cursor_glow/tests/lifecycle.rs	no_light_until_a_move	glow-idle-to-zero	
 src/cursor_glow/tests/lifecycle.rs	typing_chain_never_goes_dark	ribbon-continuity	
 src/cursor_glow/tests/momentum.rs	composed_physical_margin_fold_keeps_ribbon_material_and_kitty_direction	ribbon-text-custody	
@@ -1240,10 +1177,8 @@ src/cursor_glow/tests/park.rs	a_short_retreat_beside_a_fresh_stamp_keeps_the_hid
 src/cursor_glow/tests/park.rs	an_ink_park_after_a_stall_is_held_on_the_in_flight_pool_and_its_return_sweeps_the_batch	glow-park	
 src/cursor_glow/tests/park.rs	an_ink_rewrite_observed_as_park_and_return_is_one_typed_echo_per_key	glow-park	
 src/cursor_glow/tests/park.rs	an_insert_echoed_through_an_ink_park_is_laid	glow-park	
-src/cursor_glow/tests/phaser.rs	coalesced_echo_advance_is_typing_and_lays_every_cell	jump-morphology	
 src/cursor_glow/tests/phaser.rs	disabled_or_zero_intensity_emits_nothing	glow-disabled-inert	
-src/cursor_glow/tests/phaser.rs	hidden_cursor_does_not_spawn_on_reappear	hide-bridge	
-src/cursor_glow/tests/phaser.rs	light_theme_band_is_veils_not_additive	light-theme-veils	
+src/cursor_glow/tests/phaser.rs	light_theme_band_is_ink_not_additive	light-theme-veils	
 src/cursor_glow/tests/phaser.rs	phaser_band_spans_three_letters_and_never_parks	ribbon-continuity	
 src/cursor_glow/tests/phaser.rs	phaser_burst_origin_cannot_outlive_the_band	ribbon-continuity	
 src/cursor_glow/tests/phaser.rs	vertical_navigation_timestamps_stay_dark	glow-no-licence-no-light	
@@ -1252,18 +1187,14 @@ src/cursor_glow/tests/phaser.rs	wrap_echo_continues_the_band_across_the_fold	jum
 src/cursor_glow/tests/rainbow.rs	a_caret_that_advances_with_no_unpaid_press_still_buys_nothing	glow-no-licence-no-light	
 src/cursor_glow/tests/rainbow.rs	a_late_repaint_lays_every_cell_the_hand_typed	glow-exact-payment	
 src/cursor_glow/tests/rainbow.rs	a_refused_rainbow_sweep_names_the_credit_budget_that_refused_it	glow-exact-payment	
-src/cursor_glow/tests/rainbow.rs	a_repaint_that_lands_after_the_hand_pauses_still_lays_the_keys_it_owes	glow-exact-payment	
 src/cursor_glow/tests/rainbow.rs	a_wide_glyph_echo_pays_for_the_cells_its_own_glyphs_occupy	glow-exact-payment	
 src/cursor_glow/tests/rainbow.rs	a_wide_glyphs_single_press_sweeps_its_continuation_cell	glow-exact-payment	
 src/cursor_glow/tests/rainbow.rs	every_kitty_spelling_draws_the_resident_and_flying_stays_reachable	style-spelling-table	
-src/cursor_glow/tests/rainbow.rs	one_press_still_cannot_buy_a_word_wide_hop	glow-exact-payment	
 src/cursor_glow/tests/rainbow.rs	rainbow_coalesced_typing_sweeps_every_skipped_cell	ribbon-continuity	
 src/cursor_glow/tests/rainbow.rs	rainbow_decays_to_empty_when_idle	glow-idle-to-zero	
 src/cursor_glow/tests/rainbow.rs	rainbow_first_key_orphan_does_not_outlive_the_ribbon	ribbon-continuity	
-src/cursor_glow/tests/rainbow.rs	rainbow_hot_ribbon_has_visible_travelling_wave	ribbon-geometry-and-caret-primacy	
 src/cursor_glow/tests/rainbow.rs	rainbow_kitty_parse_and_beam	style-spelling-table	
 src/cursor_glow/tests/rainbow.rs	rainbow_ribbon_brightens_with_typing_momentum	glow-heat-momentum	
-src/cursor_glow/tests/rainbow.rs	rainbow_ribbon_four_letters_even_glacial	ribbon-continuity	
 src/cursor_glow/tests/rainbow.rs	rainbow_ribbon_spans_four_letters_at_any_rhythm	ribbon-continuity	
 src/cursor_glow/tests/rainbow.rs	rainbow_sequential_and_coalesced_typing_lay_equivalent_hues	ribbon-hue-equivalence	
 src/cursor_glow/tests/rainbow.rs	rainbow_typed_hide_bridge_spans_the_batch	hide-bridge	
@@ -1276,8 +1207,6 @@ src/cursor_glow/tests/reanchor.rs	claude_code_wrap_reanchors_all_styles	jump-mor
 src/cursor_glow/tests/reanchor.rs	synthetic_alt_without_blink_keeps_the_jump	jump-morphology	
 src/cursor_glow/tests/resident_cap.rs	cursor_resident_cap_derived_model_proves_and_catches_missing_clamp	glow-resident-caps	
 src/cursor_glow/tests/resident_cap.rs	cursor_resident_cap_real_spawn_conforms_to_model	glow-resident-caps	
-src/cursor_glow/tests/resident_cap.rs	hsv_and_fire_are_sane	hsv-fire-ramp	
-src/cursor_glow/tests/resident_cap.rs	resident_glow_state_is_hard_capped_at_spawn	glow-resident-caps	
 src/cursor_glow/tests/review.rs	a_backspace_into_an_ime_run_retires_one_glyphs_credit	glow-backspace-retires-newest	
 src/cursor_glow/tests/review.rs	a_backspace_retires_only_the_newest_in_flight_press	glow-backspace-retires-newest	
 src/cursor_glow/tests/review.rs	a_batch_draining_inside_the_backspaces_quench_window_is_the_survivors_echo	glow-exact-payment	
@@ -1309,26 +1238,17 @@ src/cursor_glow/tests/review.rs	an_unpaid_credit_survives_a_hidden_boundary_for_
 src/cursor_glow/tests/review.rs	mid_line_typing_under_a_hidden_caret_is_shown_where_the_glyph_put_the_caret	glow-park	
 src/cursor_glow/tests/review.rs	the_coalesced_fold_on_the_alt_screen_is_admitted_under_a_fresh_blink	glow-exact-payment	
 src/cursor_glow/tests/rings.rs	classic_landing_ring_expands_wider_with_the_jump	glow-landing-ring-raster	
-src/cursor_glow/tests/rings.rs	classic_ring_grade_is_floored_and_capped_like_the_kittys	classic-ring-grade	
 src/cursor_glow/tests/rings.rs	cold_navigation_timestamp_scatters_nothing	glow-no-licence-no-light	
 src/cursor_glow/tests/rings.rs	halo_centres_past_the_box_stay_true_and_negative_centres_cull	glow-landing-ring-raster	
 src/cursor_glow/tests/rings.rs	landing_ring_bars_partition_the_square_outline	glow-landing-ring-raster	
 src/cursor_glow/tests/rings.rs	rainbow_landing_ring_light_theme_forks_to_source_over	glow-landing-ring-raster	
-src/cursor_glow/tests/seam_laws.rs	a_backspace_licenses_one_move_whatever_its_shape	glow-one-shot-once	
 src/cursor_glow/tests/seam_laws.rs	a_classic_erase_key_leaves_no_standing_wake	glow-idle-to-zero	
-src/cursor_glow/tests/seam_laws.rs	a_composer_newline_licenses_its_own_row_change_and_nothing_after	glow-one-shot-once	
 src/cursor_glow/tests/seam_laws.rs	a_composer_newline_starts_the_walk_again_however_soon_the_next_glyph_follows	glow-typed-cell-lit	
 src/cursor_glow/tests/seam_laws.rs	a_cross_row_park_sleeps_until_its_own_expiry	glow-park	
-src/cursor_glow/tests/seam_laws.rs	a_cross_row_park_wakes_at_its_last_credits_expiry	glow-park	
 src/cursor_glow/tests/seam_laws.rs	a_dangling_stamp_does_not_hold_the_enter_open_for_a_keyless_plus_one	glow-no-licence-no-light	
 src/cursor_glow/tests/seam_laws.rs	a_flushed_park_is_witnessed_by_the_glyph_it_was_held_over	glow-park	
 src/cursor_glow/tests/seam_laws.rs	a_foreign_landing_restores_the_prior_licensed_hand_row	glow-program-row-never-spends	
 src/cursor_glow/tests/seam_laws.rs	a_glyph_echo_landing_after_an_arrow_is_the_glyphs_not_the_arrows	glow-forget-edges	
-src/cursor_glow/tests/seam_laws.rs	a_glyph_typed_before_the_backspaces_retreat_lands_spends_its_credit	glow-forget-edges	
-src/cursor_glow/tests/seam_laws.rs	a_glyph_typed_before_the_composer_clears_keeps_its_cell	glow-forget-edges	
-src/cursor_glow/tests/seam_laws.rs	a_glyph_typed_before_the_composer_newline_lands_keeps_its_credit_and_its_cell	glow-forget-edges	
-src/cursor_glow/tests/seam_laws.rs	a_glyph_typed_before_the_enters_response_lands_keeps_its_credit_and_its_cell	glow-forget-edges	
-src/cursor_glow/tests/seam_laws.rs	a_glyph_typed_before_the_kills_retreat_lands_keeps_its_credit_and_its_cell	glow-forget-edges	
 src/cursor_glow/tests/seam_laws.rs	a_held_park_is_a_wake_source	glow-park	
 src/cursor_glow/tests/seam_laws.rs	a_key_queued_behind_an_unknown_insert_is_retired_with_the_hop_that_echoed_it	glow-forget-edges	
 src/cursor_glow/tests/seam_laws.rs	a_key_whose_echo_lands_a_frame_late_lays_no_cell_left_of_the_caret	glow-typed-cell-lit	
@@ -1368,7 +1288,6 @@ src/cursor_glow/tests/sound.rs	take_key_cue_hands_back_the_click_without_touchin
 src/cursor_glow/tests/sound.rs	the_classic_wake_and_an_empty_grid_obey_the_one_key_seam_law	glow-key-time-click-ledger	
 src/cursor_glow/tests/sound.rs	the_key_time_click_carries_its_own_keystrokes_heat	glow-key-time-heat	
 src/cursor_glow/tests/stall.rs	a_batch_whose_last_key_is_three_seconds_old_is_lit_in_the_echoing_frame	glow-exact-payment	
-src/cursor_glow/tests/stall.rs	a_fifty_key_batch_after_a_five_second_stall_is_one_sweep	glow-exact-payment	
 src/cursor_glow/tests/stall.rs	a_hidden_caret_single_key_stall_relights_on_its_own_anchored_echo	glow-program-row-never-spends	
 src/cursor_glow/tests/stall.rs	a_single_stalled_press_wider_than_one_cell_is_still_refused_and_kept	glow-no-licence-no-light	
 src/cursor_glow/tests/stall.rs	a_swallowed_press_buys_at_most_its_own_one_cell_and_only_once	glow-no-licence-no-light	
@@ -1381,7 +1300,6 @@ src/cursor_glow/tests/stall_fold.rs	a_program_newline_with_no_press_in_flight_la
 src/cursor_glow/tests/stall_fold.rs	a_stalled_fold_is_born_no_earlier_than_the_birth_floor	glow-typed-cell-lit	
 src/cursor_glow/tests/stall_fold.rs	a_stalled_key_whose_echo_wraps_the_row_lights_the_last_column	glow-exact-payment	
 src/cursor_glow/tests/status.rs	a_celebration_freezes_the_combo_so_a_held_key_cannot_farm_it	glow-status-row	
-src/cursor_glow/tests/status.rs	a_typed_burst_earns_a_rainbow_ribbon_the_status_verb_reports	glow-status-row	
 src/cursor_glow/tests/status.rs	a_word_typed_at_human_cadence_earns_the_full_rainbow_ribbon	glow-status-row	
 src/cursor_glow/tests/status.rs	the_status_row_names_every_gate_and_derives_the_ribbon_verdict	glow-status-row	
 src/cursor_glow/tests/status.rs	the_status_row_names_who_owns_the_block_cursor	glow-status-row	
@@ -1395,7 +1313,6 @@ src/cursor_glow/tests/stray.rs	the_stray_probe_s_bed_bridges_a_real_word_hop_acr
 src/cursor_glow/tests/style_switch.rs	a_pooled_bolt_jag_is_deterministic_across_strikes	glow-bolt-jag-deterministic	
 src/cursor_glow/tests/style_switch.rs	chained_switches_cap_fades_and_never_go_dark	glow-style-switch-crossfade	
 src/cursor_glow/tests/style_switch.rs	no_switch_keeps_the_crossfade_machinery_inert	glow-style-switch-crossfade	
-src/cursor_glow/tests/style_switch.rs	non_fire_crown_is_radial_halos_not_squares	glow-crown-radial	
 src/cursor_glow/tests/style_switch.rs	style_switch_crossfades_the_old_light_and_stays_active	glow-style-switch-crossfade	
 src/cursor_glow/tests/style_switch.rs	style_switch_drops_pending_sound_cues	glow-cue-classification	
 src/cursor_glow/tests/tint.rs	glyph_tint_bisection_predicate_is_monotone_and_its_answer_holds	glyph-tint-palette	
@@ -1406,12 +1323,6 @@ src/cursor_glow/tests/tint.rs	light_ink_bold_holds_one_ink_weight_across_the_spe
 src/cursor_glow/tests/tint.rs	light_ink_cap_keeps_glyphs_legible	light-ink-laws	
 src/cursor_glow/tests/tint.rs	light_ink_darkens_every_band_to_one_bar	light-ink-laws	
 src/cursor_glow/tests/tint.rs	one_rainbow_sweep_is_continuous_and_shared	rainbow-sweep-and-bands	
-src/cursor_glow/tests/tint.rs	rainbow_bands_are_the_spectrum_stops	rainbow-sweep-and-bands	
-src/cursor_glow/tests/trail_pack.rs	each_wired_pack_param_changes_the_custom_fold	trail-pack-params-live	
-src/cursor_glow/tests/trail_pack.rs	pack_to_pack_swap_drops_stale_light	glow-style-switch-crossfade	
-src/cursor_glow/tests/trail_pack.rs	theme_arm_changes_the_light_theme_custom_fold	trail-pack-params-live	
-src/cursor_glow/tests/trail_pack.rs	trail_pack_cannot_exceed_the_occupied_cell_coverage_ceiling	glow-quad-invariants	
-src/cursor_glow/tests/trail_pack.rs	trail_pack_ticks_capped_gridclamped_and_settles_to_idle_zero	glow-quad-invariants	
 src/cursor_glow/tests/typed_stamps.rs	a_busy_tuis_status_row_keeps_its_brand_across_five_print_rows	glow-program-row-never-spends	
 src/cursor_glow/tests/typed_stamps.rs	a_composer_that_stays_put_under_a_scroll_keeps_the_hand_on_its_row	glow-hand-row-hold	
 src/cursor_glow/tests/typed_stamps.rs	a_held_press_pays_for_its_own_late_echo_on_the_hand_s_row	glow-hand-row-hold	
@@ -1439,12 +1350,10 @@ src/cursor_glow/tests/unknown_insert.rs	unknown_insert_orphan_key_exact_echo_mat
 src/cursor_glow/tests/unknown_insert.rs	unknown_insert_orphan_space_cannot_claim_an_unchanged_blank	glow-unknown-insert-orphans-refine	
 src/cursor_glow/tests/v2_seam.rs	a_line_still_being_typed_has_no_dark_cell_inside_its_live_span	glow-typed-cell-lit	
 src/cursor_glow/tests/v2_seam.rs	a_v2_nav_jump_draws_the_meteor_on_the_observed_frame	glow-v2-meteor-frame-zero	
-src/cursor_glow/tests/v2_seam.rs	every_rainbow_kitty_spelling_engages_v2	glow-style-parse-and-v2-engage	
 src/cursor_glow/tests/v2_seam.rs	the_frame_that_echoes_the_key_already_shows_its_ribbon_cell	glow-typed-cell-lit	
 src/cursor_glow/tests/v2_seam.rs	under_v2_trail_status_claims_the_ribbon_it_lays	glow-status-row	
 src/cursor_glow/tests/v2_seam.rs	v2_idle_is_exactly_zero	glow-idle-to-zero	
 src/cursor_glow/tests/wake_census.rs	under_v2_the_seam_never_paces_the_frame_train_for_v1s_crown	glow-idle-to-zero	
-src/cursor_glow/tests/water.rs	water_drips_fall_below_the_typed_row	water-style-laws	
 src/cursor_glow/tests/water.rs	water_emits_a_smooth_wavy_wake	water-style-laws	
 src/cursor_glow/tests/water.rs	water_jump_reflection_drips_then_fades_smoothly_to_zero	water-style-laws	
 src/cursor_glow/tests/water.rs	water_navigation_jump_spans_the_vector_without_celebration	water-style-laws	
@@ -1489,30 +1398,18 @@ src/cursor_phaser.rs	settled_present_gaps_are_byte_identical	phaser-tick-laws
 src/cursor_phaser.rs	settles_to_inactive_when_charge_dies	phaser-tick-laws	
 src/cursor_phaser.rs	wings_hug_the_beam_axis	phaser-tick-laws	
 src/cursor_rainbow.rs	caret_and_ribbon_share_one_live_clock_through_a_streaming_run	rainbow-caret-fill	
-src/cursor_rainbow.rs	caret_uses_the_continuous_family_spectrum_end_to_end	rainbow-caret-fill	
 src/cursor_rainbow.rs	disabled_or_zero_intensity_is_inert	rainbow-caret-inert	
 src/cursor_rainbow.rs	emitted_ribbon_head_is_the_hot_caret_authority	rainbow-caret-fill	
-src/cursor_rainbow.rs	energy_spins_faster_and_glows_brighter	rainbow-caret-fill	
 src/cursor_rainbow.rs	fallback_fill_flows_through_the_anchors_without_temporal_hue_steps	rainbow-colour-continuity	
 src/cursor_rainbow.rs	fill_blooms_from_base_with_energy	rainbow-caret-fill	
-src/cursor_rainbow.rs	halo_and_glitter_offsets_have_no_anchor_colour_steps	rainbow-colour-continuity	
-src/cursor_rainbow.rs	halo_hugs_within_half_a_cell_width	rainbow-caret-geometry	
 src/cursor_rainbow.rs	halo_quads_respect_grid_and_cap	rainbow-caret-geometry	
 src/cursor_rainbow.rs	host_base_is_the_settled_block_on_either_polarity	rainbow-caret-fill	
 src/cursor_rainbow.rs	idle_blink_transition_conforms_to_model	rainbow-flare-rungs	
 src/cursor_rainbow.rs	idle_phase_flips_never_arm_effect_timer	rainbow-caret-lane	
-src/cursor_rainbow.rs	light_theme_base_is_dark	rainbow-caret-fill	
-src/cursor_rainbow.rs	light_theme_glint_stays_saturated	rainbow-caret-fill	
 src/cursor_rainbow.rs	momentum_rung_crossing_fires_twinkle_star	rainbow-flare-rungs	
 src/cursor_rainbow.rs	momentum_rungs_fire_once_each_and_never_on_the_way_down	rainbow-flare-rungs	
-src/cursor_rainbow.rs	reduced_motion_keeps_plain_blink	rainbow-caret-inert	
-src/cursor_rainbow.rs	rim_light_grey_is_the_arcs_mean	rainbow-rim-light	
-src/cursor_rainbow.rs	settled_present_gaps_are_byte_identical_and_resume_without_a_snap	rainbow-caret-lane	
-src/cursor_rainbow.rs	settles_to_inactive_when_energy_drops	rainbow-caret-lane	
 src/cursor_rainbow.rs	shared_phase_complete_frame_is_exact_across_the_family_ring	rainbow-colour-continuity	
 src/cursor_rainbow.rs	spin_is_continuous_across_its_wrap	rainbow-colour-continuity	
-src/cursor_rainbow.rs	standalone_stream_crosses_its_one_second_wrap_without_a_spectrum_jump	rainbow-colour-continuity	
-src/cursor_rainbow.rs	steady_block_never_twinkles	rainbow-caret-lane	
 src/cursor_rainbow.rs	the_caret_colour_release_is_drawn_to_its_last_step_on_demand	rainbow-caret-lane	
 src/cursor_rainbow.rs	the_caret_cools_with_its_trail_and_not_with_the_ignition_heat	rainbow-colour-continuity	
 src/cursor_rainbow.rs	the_caret_settles_on_its_own_stop_without_a_pop	rainbow-caret-flare	
@@ -1523,11 +1420,8 @@ src/cursor_rainbow.rs	the_rim_light_is_hue_invariant_and_monotone_in_paint	rainb
 src/cursor_rainbow.rs	the_rim_turns_with_momentum_and_freezes_at_rest	rainbow-caret-lane	
 src/cursor_rainbow.rs	the_settle_split_is_a_partition_of_still_moving	rainbow-caret-lane	
 src/cursor_rainbow.rs	twinkle_completes_and_resettles	rainbow-flare-rungs	
-src/cursor_rainbow.rs	twinkle_is_deterministic	rainbow-flare-rungs	
-src/cursor_rainbow.rs	twinkle_star_hugs_and_caps	rainbow-caret-geometry	
 src/cursor_trail.rs	a_band_move_translates_the_trail_inside_the_band_and_drops_what_leaves	trail-scroll-band-translate	
 src/cursor_trail.rs	a_caret_seen_still_at_rest_after_the_press_proves_the_key_moved_nothing	bridge-reach-contract	
-src/cursor_trail.rs	a_few_keys_stay_gentle	typing-cadence-ignition	
 src/cursor_trail.rs	a_glyph_typed_before_the_enters_response_lands_keeps_its_stamp_for_its_own_echo	trail-licence-refines-model	
 src/cursor_trail.rs	a_pause_decays_the_ignition	typing-cadence-ignition	
 src/cursor_trail.rs	a_user_gesture_establishes_one_class_and_licenses_its_landing	trail-licence-refines-model	
@@ -1537,47 +1431,34 @@ src/cursor_trail.rs	classic_trail_requires_one_shot_correlated_candidate	trail-l
 src/cursor_trail.rs	comet_fades_to_empty_after_the_duration	trail-comet-emission	
 src/cursor_trail.rs	composed_physical_margin_fold_lights_only_departure_material	trail-licence-refines-model	
 src/cursor_trail.rs	dedup_index_matches_the_linear_scan_byte_for_byte	trail-dedup-equals-linear-merge	
-src/cursor_trail.rs	disabled_draws_nothing_but_tracks_cursor	trail-comet-emission	
-src/cursor_trail.rs	fast_sustained_burst_ignites	typing-cadence-ignition	
 src/cursor_trail.rs	fingerprint_folds_the_trail_colour	trail-comet-emission	
-src/cursor_trail.rs	hidden_cursor_does_not_spawn_on_reappear	trail-licence-refines-model	
 src/cursor_trail.rs	hinted_ink_wrap_lays_no_comet_but_typing_still_trails	trail-licence-refines-model	
 src/cursor_trail.rs	ignite_stamps_intensity_and_heats_colour	typing-cadence-ignition	
 src/cursor_trail.rs	ignited_comet_is_brighter_and_longer_lived_than_gentle	trail-comet-emission	
-src/cursor_trail.rs	ignition_intensity_is_a_clamped_smoothstep	typing-cadence-ignition	
-src/cursor_trail.rs	navigation_lays_no_comet	trail-licence-refines-model	
-src/cursor_trail.rs	no_trail_until_a_move	trail-licence-refines-model	
 src/cursor_trail.rs	presentation_opacity_attenuates_resident_cells_and_fingerprints_exact_output	trail-presentation-projection	
 src/cursor_trail.rs	readability_cap_bounds_every_cell_at_any_intensity	trail-comet-emission	
 src/cursor_trail.rs	same_row_jump_spawns_a_bounded_comet_nearest_the_cursor	trail-comet-emission	
 src/cursor_trail.rs	sample_matches_the_separate_reads_bit_for_bit	typing-cadence-ignition	
 src/cursor_trail.rs	scroll_translates_every_live_trail_cell_and_retires_off_top_state	trail-scroll-band-translate	
-src/cursor_trail.rs	slow_typing_never_ignites	typing-cadence-ignition	
 src/cursor_trail.rs	the_nav_bridge_reaches_one_pane_across_and_a_wrapped_box_down	bridge-reach-contract	
 src/cursor_trail.rs	warm_chain_outlives_the_gap	trail-comet-emission	
 src/cursor_trail.rs	warmth_is_zero_for_a_lone_key_and_ramps_with_cadence	typing-cadence-ignition	
 src/dog_baker.rs	budgets_hold	dog-baker-contract	
 src/dog_baker.rs	every_breed_draws_a_dog	dog-roster-table	
-src/dog_baker.rs	roster_is_a_wide_selection_of_dogs	dog-roster-table	
 src/dog_baker.rs	same_key_bakes_byte_identical_tiles	dog-baker-contract	
 src/dog_baker.rs	tiles_are_exact_size_and_axes_are_wired	dog-baker-contract	
 src/dog_cameo.rs	entry_bounce_hops_then_settles	dog-cameo-envelope	
 src/dog_cameo.rs	envelope_rises_holds_and_expires	dog-cameo-envelope	
-src/dog_cameo.rs	rolls_are_deterministic_and_in_range	dog-cameo-envelope	
 src/effect_util.rs	a_source_over_quad_that_rounds_to_black_still_darkens	push-grid-quad-contract	
 src/effect_util.rs	ramp_rewrite_is_bit_identical_to_the_stop_walk	ramp-5stop-equals-walk	
-src/effect_util.rs	ramp_stop_tables_hold_the_branchless_contract	ramp-5stop-equals-walk	
 src/effect_util.rs	the_additive_star_draws_the_family_silhouette	star-arm-and-silhouette	
 src/effect_util.rs	the_one_arm_conversion_truncates_and_floors	star-arm-and-silhouette	
-src/effect_util.rs	twinkle_glint_gate_holds_its_duty	twinkle-envelope-law	
-src/effect_util.rs	twinkle_law_dims_between_the_floor_and_unity	twinkle-envelope-law	
 src/effect_util.rs	twinkle_law_stays_under_the_photosensitivity_bound	twinkle-envelope-law	
 src/file_feed.rs	oversize_directory_and_invalid_utf8_are_rejected_by_read_and_hash	file-feed-bounded-regular-read	
 src/file_feed.rs	regular_file_round_trips_and_fingerprints_content	file-feed-bounded-regular-read	
 src/file_feed.rs	writerless_fifo_and_final_symlink_are_rejected_at_open	file-feed-bounded-regular-read	
 src/genome.rs	feature_decoders_cover_documented_ranges	genome-feature-ranges	
 src/genome.rs	gray_decode_locality	gray-field-decode	
-src/genome.rs	mix_decorrelates_and_is_nonzero	mix-nonzero	
 src/genome.rs	nova_single_field_accessors_match_full_decode	genome-feature-ranges	
 src/genome.rs	simhash_bitsliced_equals_reference_over_voter_sets	simhash-bitsliced-equals-reference	
 src/genome.rs	simhash_clock_and_spinner_immunity	simhash-filter-silence	
@@ -1587,8 +1468,8 @@ src/genome.rs	v4_head_spill_is_independent_of_coat_iris_age_motion_and_ink	v4-he
 src/host.rs	a_hidden_cursor_keeps_its_caret_and_history_withdraws_it	terminal-facts-reader	
 src/host.rs	a_hidden_cursor_on_a_blank_row_is_no_caret_for_the_motion_engines	motion-caret-contract	
 src/host.rs	a_hidden_cursor_on_an_unfinished_frame_is_no_caret_for_the_motion_engines	motion-caret-contract	
+src/host.rs	an_unfinished_frames_print_anchor_is_no_echo_for_the_motion_engines	motion-caret-contract	
 src/host.rs	the_facts_reader_reports_what_the_emulator_said	terminal-facts-reader	
-src/kitty_cursor.rs	a_favourite_pin_still_swaps_the_look	on-collect-contract	
 src/kitty_cursor.rs	a_kill_flood_grounds_the_flight_and_the_goodbye_keeps_the_oops	lifecycle-grounding-and-fade	
 src/kitty_cursor.rs	authenticated_fold_is_bounded_by_wall_time_and_hidden_cats_ignore_it	fold-placement-bounded	
 src/kitty_cursor.rs	banking_leans_and_stretches_with_momentum	pose-closed-form	
@@ -1603,11 +1484,9 @@ src/kitty_cursor.rs	cursor_palette_is_frozen_for_one_visible_episode	episode-pal
 src/kitty_cursor.rs	delete_burst_is_one_sustained_oops_with_one_kick	oops-burst	
 src/kitty_cursor.rs	delight_is_expression_not_displacement	stride-and-bob	
 src/kitty_cursor.rs	discovery_hello_presents_the_new_look_mid_flight	on-collect-contract	
-src/kitty_cursor.rs	exit_flourish_inks_come_from_the_shared_recipe	exit-fx-sinks	
 src/kitty_cursor.rs	exit_fx_emits_for_wink_and_heart_only	exit-fx-sinks	
 src/kitty_cursor.rs	exit_fx_light_theme_is_a_darkening_source_over_veil	exit-fx-sinks	
 src/kitty_cursor.rs	exit_fx_light_veil_vanishes_at_the_exit_ends	exit-fx-sinks	
-src/kitty_cursor.rs	exit_rolls_are_roughly_20_20_60	exit-roll-table	
 src/kitty_cursor.rs	fading_cat_revives_on_resumed_typing	revive-continuity	
 src/kitty_cursor.rs	global_companion_sync_cannot_morph_an_active_discovery	static-frame-contract	
 src/kitty_cursor.rs	hello_goodbye_is_not_revived_by_typing	lifecycle-grounding-and-fade	
@@ -1626,7 +1505,6 @@ src/kitty_cursor.rs	reduced_motion_flight_retires_and_releases_the_look_latch	st
 src/kitty_cursor.rs	reduced_motion_never_draws_a_cat_the_machine_calls_hidden	static-frame-agrees-on-existence	
 src/kitty_cursor.rs	reduced_motion_oops_is_a_static_swap_with_a_decay_wake	static-frame-contract	
 src/kitty_cursor.rs	reverse_fold_changes_place_without_double_delivering_backspace	fold-placement-bounded	
-src/kitty_cursor.rs	short_burst_never_summons	earn-gate	
 src/kitty_cursor.rs	singing_pins_momentum_summons_and_dances_on_the_beat	pose-closed-form	
 src/kitty_cursor.rs	sixteen_high_band_keys_are_required_even_after_full_dwell	earn-gate	
 src/kitty_cursor.rs	sparse_frame_after_collection_deadline_settles_directly_hidden	lifecycle-grounding-and-fade	
@@ -1642,14 +1520,11 @@ src/kitty_cursor.rs	wind_down_crossfades_the_dance_out	render-look-table
 src/kitty_pet.rs	a_bell_during_flight_expires_unconsumed	bell-stimulus	
 src/kitty_pet.rs	a_bell_flinches_the_settled_pet	bell-stimulus	
 src/kitty_pet.rs	a_bell_inside_a_commanded_sit_ends_the_seat	bell-stimulus	
-src/kitty_pet.rs	a_bell_under_reduced_motion_is_bookkeeping_only	reduced-motion-static	
 src/kitty_pet.rs	a_bell_wakes_the_sleeper	bell-stimulus	
-src/kitty_pet.rs	a_big_bound_hangs_at_its_apex	flight-lift-shape	
 src/kitty_pet.rs	a_big_retreat_still_bottles	retreat-reactions	
 src/kitty_pet.rs	a_bored_cat_hides_behind_a_word_and_comes_back	pointer-play	
 src/kitty_pet.rs	a_build_log_under_the_cat_is_not_chased_across_the_pane	stream-watch	
 src/kitty_pet.rs	a_burst_of_new_lines_comes_home_quietly	show-door	
-src/kitty_pet.rs	a_caret_going_up_is_not_a_hole_in_the_floor	sleeper-drop	
 src/kitty_pet.rs	a_caret_jump_interrupts_the_watch	stream-watch	
 src/kitty_pet.rs	a_caret_jump_is_served_before_the_swap	breed-handoff	
 src/kitty_pet.rs	a_caret_move_interrupts_a_commanded_seat	trick-lifetime	
@@ -1657,27 +1532,20 @@ src/kitty_pet.rs	a_caret_that_hides_and_returns_elsewhere_is_a_new_sighting_not_
 src/kitty_pet.rs	a_caret_withheld_mid_flight_holds_its_fade_and_lands_when_dark	hidden-arc-deferral	
 src/kitty_pet.rs	a_cat_on_vigil_gets_up_to_answer_and_is_not_dragged_back_mid_seat	vigil	
 src/kitty_pet.rs	a_cat_waiting_up_with_a_job_sleeps_when_told_to	vigil	
-src/kitty_pet.rs	a_ceremony_park_still_runs_today_s_theater	breed-handoff	
 src/kitty_pet.rs	a_cheer_survives_a_hold	verdict-choreography	
 src/kitty_pet.rs	a_commanded_hide_behind_a_word_at_the_margin_still_ends	pet-idle-to-zero	
 src/kitty_pet.rs	a_commanded_hide_walks_behind_a_word_in_reach	trick-performance	
-src/kitty_pet.rs	a_commanded_loaf_rides_the_offer_to_its_named_end	offer-soundness	
-src/kitty_pet.rs	a_commanded_sit_parks_wears_the_look_up_seat_and_names_its_end	offer-soundness	
 src/kitty_pet.rs	a_commanded_sleep_ends_byte_stable_and_rides_the_offer	offer-soundness	
 src/kitty_pet.rs	a_confirmation_after_the_cat_answered_replays_nothing	trick-latch-algebra	
 src/kitty_pet.rs	a_confirmation_inside_the_heard_you_beat_is_still_owed_and_plays_once	trick-latch-algebra	
-src/kitty_pet.rs	a_content_cat_still_hops_the_line_quietly	show-door	
-src/kitty_pet.rs	a_content_seat_purrs_before_it_wears_the_purr	contentment-purr	
 src/kitty_pet.rs	a_cursor_resting_on_a_sleeping_cat_is_not_a_side_to_turn_to	sleeper-gaze-brakes	
 src/kitty_pet.rs	a_cursor_swinging_over_a_sleeping_cat_never_flips_it	sleeper-gaze-brakes	
 src/kitty_pet.rs	a_dashing_pointer_gets_pounced_only_when_content	pointer-play	
 src/kitty_pet.rs	a_debounced_park_swaps_in_place_and_a_departing_body_runs_off	breed-handoff	
 src/kitty_pet.rs	a_deep_sleep_re_anchor_hops_then_gives_the_lane_back	pet-idle-to-zero	
-src/kitty_pet.rs	a_departing_body_is_a_pure_function_of_its_record	departure-lane	
 src/kitty_pet.rs	a_driven_session_s_cat_keeps_its_distance_and_walks_back_at_release	room-facts-no-wake	
 src/kitty_pet.rs	a_failure_droops_and_cools	verdict-choreography	
 src/kitty_pet.rs	a_failure_never_fires_the_party_ring	verdict-choreography	
-src/kitty_pet.rs	a_far_caret_behind_earns_the_over_shoulder_peek	wall-side	
 src/kitty_pet.rs	a_far_peek_is_ignored	peek-latch-ranges	
 src/kitty_pet.rs	a_fast_command_only_nudges	verdict-choreography	
 src/kitty_pet.rs	a_first_sighting_materialises_at_the_station_not_at_the_origin	first-sighting	
@@ -1694,23 +1562,16 @@ src/kitty_pet.rs	a_held_word_jump_is_not_a_stream	stream-watch
 src/kitty_pet.rs	a_hidden_caret_fades_the_crossfade_with_the_body_instead_of_cutting_it	breed-handoff	
 src/kitty_pet.rs	a_hidden_caret_fades_the_pet_out_and_the_fingerprint_settles_to_zero	fade-and-appearance	
 src/kitty_pet.rs	a_hidden_caret_reduced_motion_and_a_hold_on_each_drop_a_trick	trick-lifetime	
-src/kitty_pet.rs	a_hidden_frame_at_enter_still_crosses_lawfully	new-line-law	
 src/kitty_pet.rs	a_hidden_frame_that_hid_no_move_keeps_the_next_show	show-door	
 src/kitty_pet.rs	a_hidden_pet_takes_a_look_sync_immediately	fade-and-appearance	
-src/kitty_pet.rs	a_landing_far_from_the_moved_station_may_scrabble	scrabble-and-commit-stare	
 src/kitty_pet.rs	a_light_sleeper_comes_round_slowly_and_a_deep_one_not_at_all	sleeper-gaze-brakes	
-src/kitty_pet.rs	a_light_sleeper_s_zs_ride_the_offer_not_the_frame_train	offer-soundness	
 src/kitty_pet.rs	a_line_change_to_the_right_is_still_a_quiet_crossing	new-line-law	
-src/kitty_pet.rs	a_loafed_cat_flicks_its_own_ear	seat-beat-reachability	
-src/kitty_pet.rs	a_long_gallop_overshoots_then_trots_back	chase-convergence-and-facing	
-src/kitty_pet.rs	a_long_green_command_pounces_and_a_red_one_droops	verdict-choreography	
 src/kitty_pet.rs	a_long_rally_earns_the_tennis_watch	pointer-play	
 src/kitty_pet.rs	a_long_success_cheers_and_warms	verdict-choreography	
 src/kitty_pet.rs	a_low_cadence_host_still_puts_the_pet_to_sleep_on_time	settle-ladder	
 src/kitty_pet.rs	a_mid_appearance_look_sync_parks_until_the_pet_has_faded_out	fade-and-appearance	
 src/kitty_pet.rs	a_move_that_ends_a_pause_lands_on_windows_the_pause_has_aged	keep-ahead-lead	
 src/kitty_pet.rs	a_moving_pet_still_asks_for_every_frame	needs-frames-motion	
-src/kitty_pet.rs	a_multi_row_prompt_flies_at_a_lawful_row_rate	new-line-law	
 src/kitty_pet.rs	a_nearby_peek_gets_batted	bat-and-look	
 src/kitty_pet.rs	a_new_line_costs_one_flight_and_no_gallop	new-line-law	
 src/kitty_pet.rs	a_one_frame_caret_hide_never_teleports_a_visible_cat	no-teleport-law	
@@ -1719,17 +1580,13 @@ src/kitty_pet.rs	a_pause_eases_the_lead_back_to_the_base_station	keep-ahead-lead
 src/kitty_pet.rs	a_pet_during_flight_waits_for_the_ground	petting-affection	
 src/kitty_pet.rs	a_pet_on_the_head_makes_a_heart	petting-affection	
 src/kitty_pet.rs	a_pet_only_submit_forgives_the_fast_failure_that_follows	command-verdict-ledger	
-src/kitty_pet.rs	a_pet_under_reduced_motion_is_bookkeeping_only	reduced-motion-static	
 src/kitty_pet.rs	a_pounce_mid_rhythm_lands_at_the_predicted_station	keep-ahead-lead	
 src/kitty_pet.rs	a_prompt_row_that_inks_past_the_caret_still_gets_a_quiet_new_line	new-line-law	
-src/kitty_pet.rs	a_purring_cat_floats_notes_and_hearts	contentment-purr	
 src/kitty_pet.rs	a_purring_cat_s_commanded_seat_rides_the_offer	offer-soundness	
 src/kitty_pet.rs	a_purring_seat_s_notes_and_hearts_ride_the_offer_not_the_frame_train	offer-soundness	
 src/kitty_pet.rs	a_quick_caret_return_cancels_the_deferred_hidden_landing	hidden-arc-deferral	
-src/kitty_pet.rs	a_quiet_redress_is_a_quarter_second_crossfade	breed-handoff	
 src/kitty_pet.rs	a_quiet_redress_never_flips_the_cat	breed-handoff	
 src/kitty_pet.rs	a_re_aim_in_the_last_frames_of_an_arc_is_dropped_not_solved	no-teleport-law	
-src/kitty_pet.rs	a_re_aim_never_outruns_the_flight	no-teleport-law	
 src/kitty_pet.rs	a_re_aim_that_changes_row_is_refused	no-teleport-law	
 src/kitty_pet.rs	a_re_anchor_leaves_the_ground_instead_of_cutting	ink-eviction-behavior	
 src/kitty_pet.rs	a_repeating_jump_must_not_pin_the_pet_in_its_double_take	chase-convergence-and-facing	
@@ -1740,42 +1597,28 @@ src/kitty_pet.rs	a_revoked_trick_leaves_the_frames_byte_identical	trick-latch-al
 src/kitty_pet.rs	a_roll_interrupted_by_an_enter_jump_releases_the_lane_and_never_replays	pet-idle-to-zero	
 src/kitty_pet.rs	a_round_trip_flip_never_walks	breed-handoff	
 src/kitty_pet.rs	a_running_job_keeps_the_cat_awake_with_you	vigil	
-src/kitty_pet.rs	a_screen_crossing_move_plays_the_whole_choreography	flight-choreography	
-src/kitty_pet.rs	a_screen_wide_span_splits_into_two_bounds	show-door	
 src/kitty_pet.rs	a_scrolled_wrap_is_a_wrap	new-line-law	
 src/kitty_pet.rs	a_seam_crossing_never_bets_past_the_station	keep-ahead-lead	
 src/kitty_pet.rs	a_seat_commanded_off_its_mark_is_taken_after_the_walk_home	trick-performance	
-src/kitty_pet.rs	a_seated_sulk_keeps_its_seat	verdict-choreography	
 src/kitty_pet.rs	a_settled_cat_after_a_drop_still_notices	sleeper-drop	
-src/kitty_pet.rs	a_settled_cat_blinks_on_a_dealt_beat	seat-beat-reachability	
-src/kitty_pet.rs	a_settled_cat_notices_before_a_bound_from_any_door	new-line-law	
-src/kitty_pet.rs	a_settled_pet_asks_for_its_next_breath_step_not_every_frame	offer-soundness	
 src/kitty_pet.rs	a_shed_frame_after_a_verdict_never_strands_the_frame_lane	pet-idle-to-zero	
-src/kitty_pet.rs	a_short_enter_hop_never_wears_the_pounce_hero_frame	flight-choreography	
-src/kitty_pet.rs	a_short_enter_still_hops	new-line-law	
 src/kitty_pet.rs	a_short_new_line_does_not_stand_down_the_next_show	show-door	
 src/kitty_pet.rs	a_sibling_pane_s_burst_earns_one_look	room-facts-no-wake	
 src/kitty_pet.rs	a_single_backspace_flinches_without_the_full_bottle	retreat-reactions	
 src/kitty_pet.rs	a_sleeper_is_woken_for_a_trick_but_sleep_is_done_and_stretch_is_the_wake	trick-performance	
-src/kitty_pet.rs	a_sleeping_pet_asks_for_nothing_between_blinks	offer-soundness	
 src/kitty_pet.rs	a_slow_caret_walks_laterally_and_a_brisk_one_trots	gait-by-speed-and-distance	
-src/kitty_pet.rs	a_small_hop_keeps_its_parabola	flight-lift-shape	
 src/kitty_pet.rs	a_snap_home_is_a_jump_not_a_fright	show-door	
 src/kitty_pet.rs	a_spent_watch_rearms_once_the_stream_ends	pet-idle-to-zero	
 src/kitty_pet.rs	a_stale_peek_expires	bat-and-look	
 src/kitty_pet.rs	a_stale_pet_expires	petting-affection	
 src/kitty_pet.rs	a_startle_shoved_off_its_spot_is_not_replayed	retreat-reactions	
-src/kitty_pet.rs	a_step_aside_glides_and_a_re_anchor_hops	evict-step	
 src/kitty_pet.rs	a_streaming_pane_is_followed_with_or_without_shell_integration	stream-watch	
 src/kitty_pet.rs	a_streaming_pane_perks_the_sitter	stream-watch	
 src/kitty_pet.rs	a_success_soon_after_a_sulk_is_a_big_cheer	command-verdict-ledger	
 src/kitty_pet.rs	a_surface_switch_drops_a_trick_and_carries_the_praise_cooldown	coordinate-retirement	
 src/kitty_pet.rs	a_suspended_host_clock_cannot_teleport_the_pet	no-teleport-law	
 src/kitty_pet.rs	a_tentative_trick_settles_at_one_second_and_a_confirmed_one_at_seven_tenths	trick-performance	
-src/kitty_pet.rs	a_third_jump_abandons_the_stare	scrabble-and-commit-stare	
-src/kitty_pet.rs	a_three_line_prompt_wakes_the_ordinary_way	sleeper-drop	
 src/kitty_pet.rs	a_top_down_paint_never_hops_every_row	stream-watch	
-src/kitty_pet.rs	a_travel_perk_looks_where_it_is_going	verdict-choreography	
 src/kitty_pet.rs	a_trick_expires_four_seconds_after_the_last_key_and_never_from_caret_moves	trick-lifetime	
 src/kitty_pet.rs	a_trick_latch_arms_and_releases_the_lane_and_survives_a_hold_and_a_flight	trick-performance	
 src/kitty_pet.rs	a_trick_noted_at_a_retired_cat_meets_the_slow_arm_and_is_dropped	pet-idle-to-zero	
@@ -1785,171 +1628,91 @@ src/kitty_pet.rs	a_typed_word_and_enter_plays_at_the_new_prompt	trick-performanc
 src/kitty_pet.rs	a_typing_rhythm_grows_the_lead_past_the_base_station	keep-ahead-lead	
 src/kitty_pet.rs	a_wide_prompt_s_own_new_line_does_not_startle	new-line-law	
 src/kitty_pet.rs	a_wide_prompt_still_leaves_the_caret_at_home	caret-at-home	
-src/kitty_pet.rs	a_woken_cat_does_not_look_up_twice	sleeper-drop	
-src/kitty_pet.rs	a_word_jump_pounces_through_a_crouch_and_a_landing	flight-choreography	
-src/kitty_pet.rs	a_word_jump_stays_a_pounce_below_the_thresholds	flight-wall-time	
-src/kitty_pet.rs	a_working_cat_still_gets_its_seat_and_its_beats	seat-beat-reachability	
-src/kitty_pet.rs	a_wrap_from_a_long_line_bounds_across_never_glides	flight-wall-time	
-src/kitty_pet.rs	a_wrap_is_one_character_not_a_screen_crossing_jump	caret-delta-fold	
 src/kitty_pet.rs	a_wrapping_build_log_sits_the_cat_down_to_watch	stream-watch	
-src/kitty_pet.rs	a_yawning_seat_is_offered_its_tail_edges	seat-deal-arithmetic	
 src/kitty_pet.rs	a_zero_dt_tick_does_not_park_a_gliding_body	needs-frames-motion	
 src/kitty_pet.rs	alternating_moves_never_lead	keep-ahead-lead	
 src/kitty_pet.rs	an_agreeing_re_sync_cannot_downgrade_a_parked_ceremony	breed-handoff	
 src/kitty_pet.rs	an_enter_drops_the_sleeper_off_the_line	sleeper-drop	
 src/kitty_pet.rs	an_enter_during_a_gather_never_latches_the_show	show-door	
-src/kitty_pet.rs	an_enter_from_mid_line_is_one_quiet_bound	new-line-law	
-src/kitty_pet.rs	an_ordinary_pounce_keeps_its_three_beats	flight-pose-schedule	
-src/kitty_pet.rs	an_output_pulse_twitches_the_settled_ear	seat-beat-reachability	
 src/kitty_pet.rs	an_unfed_ink_map_changes_nothing	empty-ink-identity	
 src/kitty_pet.rs	an_unrelated_failure_still_sulks	command-verdict-ledger	
 src/kitty_pet.rs	an_unseen_inbox_row_perks_the_cat_and_a_hold_on_sits_it	room-facts-no-wake	
 src/kitty_pet.rs	caret_work_outranks_pointer_play	pointer-play	
 src/kitty_pet.rs	changing_species_preserves_the_pets_state	species-skin-on-glass	
-src/kitty_pet.rs	consecutive_grooms_differ	settle-ladder	
-src/kitty_pet.rs	consecutive_settles_climb_different_ladders	settle-ladder	
-src/kitty_pet.rs	consecutive_settles_deal_different_seeds	settle-ladder	
 src/kitty_pet.rs	coordinate_retirement_is_dark_idempotent_and_preserves_identity	coordinate-retirement	
 src/kitty_pet.rs	coordinate_retirement_lands_the_latest_parked_identity	coordinate-retirement	
 src/kitty_pet.rs	creeping_toy_pins_the_stakeout	pointer-play	
 src/kitty_pet.rs	departures_cap_at_the_documented_bound_and_drop_the_oldest	departure-lane	
-src/kitty_pet.rs	event_pose_retargets_off_ink	ink-eviction-behavior	
 src/kitty_pet.rs	every_cat_pose_has_a_distinct_dog_counterpart	dog-skin-table	
 src/kitty_pet.rs	every_dealt_idle_frame_holds_at_least_two_ticks	idle-frame-laws	
 src/kitty_pet.rs	every_idle_deal_goes_byte_stable_by_the_breath_window	pet-idle-to-zero	
-src/kitty_pet.rs	every_ladder_deal_sleeps_at_twenty_two_and_goes_byte_stable	pet-idle-to-zero	
 src/kitty_pet.rs	every_new_line_reaction_is_lawful_and_brief	new-line-law	
 src/kitty_pet.rs	every_trick_is_heard_performs_something_observable_and_releases_the_lane	trick-performance	
-src/kitty_pet.rs	exit_bump_respects_the_cold_purr_law	command-verdict-ledger	
-src/kitty_pet.rs	eye_contact_breaks_and_returns_on_a_dealt_beat	seat-beat-reachability	
 src/kitty_pet.rs	facing_follows_travel_with_hysteresis	chase-convergence-and-facing	
 src/kitty_pet.rs	far_peek_gets_a_look_not_a_trip	bat-and-look	
-src/kitty_pet.rs	flick_beats_are_quiet_phased	time-translation-determinism	
 src/kitty_pet.rs	fussing_back_and_forth_makes_it_frolic	retreat-reactions	
 src/kitty_pet.rs	gentle_strokes_can_wake_a_sleeper_but_not_a_reduced_motion_pet	petting-affection	
-src/kitty_pet.rs	ghost_text_flickering_under_the_cat_never_teleports_it	no-teleport-law	
 src/kitty_pet.rs	grief_replays_beside_the_new_prompt	verdict-choreography	
 src/kitty_pet.rs	horizontal_flight_stretches_along_the_motion_axis	flight-choreography	
 src/kitty_pet.rs	hunt_and_peck_never_sees_the_lead	keep-ahead-lead	
 src/kitty_pet.rs	ink_arriving_under_the_heard_you_beat_drops_the_owed_verb	ink-eviction-behavior	
-src/kitty_pet.rs	joy_upgrades_a_word_jump_into_the_show	show-door	
 src/kitty_pet.rs	landing_dust_holds_the_train_for_a_bounded_beat_past_the_landing	needs-frames-motion	
-src/kitty_pet.rs	light_sleep_drifts_zees_capped_and_free_floating	mote-laws	
-src/kitty_pet.rs	near_peek_alternates_swipe_and_greeting	peek-latch-ranges	
 src/kitty_pet.rs	no_bound_crosses_more_than_half_the_animal_in_a_frame	quiet-pace-law	
 src/kitty_pet.rs	no_flight_may_outrun_the_animal_that_flies_it	no-teleport-law	
 src/kitty_pet.rs	no_idle_beat_moves_the_body	idle-frame-laws	
-src/kitty_pet.rs	no_seat_beat_is_ever_cut_by_the_look	idle-frame-laws	
 src/kitty_pet.rs	non_finite_inputs_never_poison_the_pose	peek-latch-ranges	
-src/kitty_pet.rs	one_dwell_in_three_loafs_and_the_loaf_keeps_its_ear	seat-beat-reachability	
-src/kitty_pet.rs	one_hand_in_four_skips_the_second_wash	settle-ladder	
 src/kitty_pet.rs	one_long_frame_cannot_move_a_ghost_a_screen	breed-handoff	
 src/kitty_pet.rs	one_pounce_per_dash	pointer-play	
-src/kitty_pet.rs	ordinary_typing_never_scrabbles	scrabble-and-commit-stare	
-src/kitty_pet.rs	petting_enough_earns_a_purr	petting-affection	
 src/kitty_pet.rs	pointer_none_clears_heat	pointer-play	
 src/kitty_pet.rs	quiet_settles_then_sleeps_and_typing_wakes_it_with_a_stretch	settle-ladder	
-src/kitty_pet.rs	reduced_motion_exit_is_bookkeeping	reduced-motion-static	
 src/kitty_pet.rs	reduced_motion_mid_roll_releases_the_lane_and_replays_nothing	reduced-motion-static	
-src/kitty_pet.rs	reduced_motion_never_flicks	reduced-motion-static	
-src/kitty_pet.rs	reduced_motion_never_peeks	reduced-motion-static	
-src/kitty_pet.rs	reduced_motion_never_spawns_motes	reduced-motion-static	
-src/kitty_pet.rs	reduced_motion_peek_is_nothing_at_all	reduced-motion-static	
 src/kitty_pet.rs	reduced_motion_pins_the_pet_at_its_station_with_no_arc_or_gait	reduced-motion-static	
-src/kitty_pet.rs	reduced_motion_pointer_is_nothing_at_all	reduced-motion-static	
-src/kitty_pet.rs	reduced_motion_stream_is_nothing_at_all	reduced-motion-static	
 src/kitty_pet.rs	reduced_motion_swaps_instantly	reduced-motion-static	
-src/kitty_pet.rs	repeat_affection_adds_a_tail_flick_without_extending_each_hold	petting-affection	
 src/kitty_pet.rs	resident_palette_is_owned_by_one_pet_appearance	fade-and-appearance	
 src/kitty_pet.rs	retire_unowned_kills_a_live_mote_where_withholding_the_caret_does_not	pet-retire-unowned	
-src/kitty_pet.rs	rise_and_descend_frames_schedule_on_pounces_and_hops_too	flight-choreography	
-src/kitty_pet.rs	sit_flicks_are_dealt_not_metronomed	seat-beat-reachability	
-src/kitty_pet.rs	sit_flicks_are_quiet_phased	time-translation-determinism	
-src/kitty_pet.rs	skinning_is_identity_for_cats_and_idempotent_for_dogs	dog-skin-table	
-src/kitty_pet.rs	sleep_breathes_so_the_frame_never_settles_to_a_dead_sticker	settle-ladder	
 src/kitty_pet.rs	sparse_ink_refinement_keeps_real_glyphs_and_unknown_coverage_obstructed	ink-ladder	
 src/kitty_pet.rs	stand_is_emitted_between_arrival_and_sit	settle-ladder	
 src/kitty_pet.rs	startle_faces_the_caret_even_at_the_wall	wall-side	
 src/kitty_pet.rs	steady_typing_walks_and_fast_typing_runs	gait-by-speed-and-distance	
 src/kitty_pet.rs	stroke_progress_cannot_cross_hidden_reduced_or_work_frames	petting-affection	
 src/kitty_pet.rs	tease_earns_a_running_chase_then_dignity	pointer-play	
-src/kitty_pet.rs	the_apex_breaks_the_hang_on_a_bound	flight-pose-schedule	
 src/kitty_pet.rs	the_bound_apex_never_clips_the_viewport_top	viewport-clamp	
 src/kitty_pet.rs	the_cat_never_changes_position_without_animating_it	no-teleport-law	
 src/kitty_pet.rs	the_cat_walks_home_after_playing	pointer-play	
 src/kitty_pet.rs	the_catch_ttl_is_the_sky_m1_s_catchable_life	reach-constants	
 src/kitty_pet.rs	the_chase_converges_without_oscillating_around_the_station	chase-convergence-and-facing	
-src/kitty_pet.rs	the_cheer_stands_up_from_the_loaf	verdict-choreography	
 src/kitty_pet.rs	the_chosen_show_is_paced_like_every_other_bound	show-door	
-src/kitty_pet.rs	the_coil_releases_without_a_volume_pop	flight-choreography	
-src/kitty_pet.rs	the_coil_scales_with_the_span	coil-scaling	
-src/kitty_pet.rs	the_dealt_seat_is_reachable_for_a_cat_that_works	seat-beat-reachability	
 src/kitty_pet.rs	the_departing_ghost_leaves_at_full_opacity	breed-handoff	
-src/kitty_pet.rs	the_dog_sulks_in_its_own_skin	species-skin-on-glass	
-src/kitty_pet.rs	the_drift_brakes_gate_is_rare_by_construction	chase-convergence-and-facing	
-src/kitty_pet.rs	the_drop_refuses_ink_under_its_own_column	sleeper-drop	
-src/kitty_pet.rs	the_ear_that_flicks_alternates_by_serial	seat-beat-reachability	
-src/kitty_pet.rs	the_escort_seat_keeps_its_travel_facing	settle-ladder	
-src/kitty_pet.rs	the_face_on_seat_blinks_without_looking_away	seat-beat-reachability	
 src/kitty_pet.rs	the_first_step_out_of_a_seat_faces_the_gap	chase-convergence-and-facing	
 src/kitty_pet.rs	the_first_tick_of_a_fade_in_keeps_the_frame_lane	first-sighting	
 src/kitty_pet.rs	the_first_windowless_still_materializes_the_resident_pet	first-sighting	
 src/kitty_pet.rs	the_gait_cycle_is_driven_by_distance_not_by_the_clock	gait-by-speed-and-distance	
 src/kitty_pet.rs	the_gallop_cycle_never_exceeds_half_frame_rate	gait-by-speed-and-distance	
-src/kitty_pet.rs	the_gallop_keeps_its_lift_out_of_the_pixel_grid	gait-by-speed-and-distance	
-src/kitty_pet.rs	the_gallop_lag_is_cancelled_at_twenty_keys_per_second	keep-ahead-lead	
 src/kitty_pet.rs	the_gaze_brakes_never_reach_the_waking_chase	chase-convergence-and-facing	
 src/kitty_pet.rs	the_gaze_follows_a_wandering_pointer	pointer-play	
-src/kitty_pet.rs	the_glance_never_flips_the_body	idle-frame-laws	
 src/kitty_pet.rs	the_ink_ladder_prefers_a_blank_row_to_a_distant_stand	ink-ladder	
 src/kitty_pet.rs	the_ink_map_scroll_fact_is_only_true_for_a_one_row_scroll	ink-scroll-fact	
-src/kitty_pet.rs	the_landing_squash_scales_with_the_span	flight-choreography	
-src/kitty_pet.rs	the_landing_steps_off_on_a_contact_frame	flight-choreography	
-src/kitty_pet.rs	the_landing_steps_off_on_a_planted_frame	flight-choreography	
-src/kitty_pet.rs	the_lateral_walk_cycle_never_exceeds_half_frame_rate	gait-by-speed-and-distance	
 src/kitty_pet.rs	the_leap_arc_leaves_the_ground_and_lands_back_on_a_baseline	flight-choreography	
-src/kitty_pet.rs	the_loaf_peeks_then_sleeps	settle-ladder	
-src/kitty_pet.rs	the_long_look_is_only_dealt_to_a_seat_that_can_hold_it	seat-deal-arithmetic	
 src/kitty_pet.rs	the_meteor_s_perk_reaches_the_resident_at_the_landing_s_own_instant	v2-offer-latch	
 src/kitty_pet.rs	the_notice_beat_is_only_paid_by_a_cat_at_rest	new-line-law	
 src/kitty_pet.rs	the_offer_buys_no_wake	v2-offer-latch	
 src/kitty_pet.rs	the_offer_is_the_renderer_s_own_pixel_step_at_an_odd_cell_height	offer-soundness	
-src/kitty_pet.rs	the_owed_groom_is_the_paw_lick	pointer-play	
 src/kitty_pet.rs	the_peck_stance_clears_the_caret_cell	settle-ladder	
 src/kitty_pet.rs	the_pet_frolics_once_when_the_hand_finds_its_flow	flow-latch	
-src/kitty_pet.rs	the_pet_knows_the_wall_and_crosses_to_the_caret_s_left	station-wall	
 src/kitty_pet.rs	the_pet_never_leaves_the_viewport	viewport-clamp	
-src/kitty_pet.rs	the_pose_schedule_always_shows_the_hero_or_falls_back_to_two	flight-pose-schedule	
 src/kitty_pet.rs	the_purr_notes_wear_the_ribbon_s_colour_under_the_cat	v2-offer-latch	
-src/kitty_pet.rs	the_quiet_split_needs_a_pane_wider_than_anyone_has	quiet-pace-law	
-src/kitty_pet.rs	the_release_precedes_the_rise	flight-choreography	
 src/kitty_pet.rs	the_room_s_facts_buy_no_wake	room-facts-no-wake	
 src/kitty_pet.rs	the_same_typing_still_produces_the_same_cat	time-translation-determinism	
-src/kitty_pet.rs	the_scroll_fact_folds_a_new_line_the_row_inference_cannot_see	caret-delta-fold	
-src/kitty_pet.rs	the_seat_yawns_before_it_loafs_on_even_deals	settle-ladder	
-src/kitty_pet.rs	the_seats_side_on_beats_come_through_the_look	seat-beat-reachability	
-src/kitty_pet.rs	the_settled_gaze_follows_the_caret_row	seat-beat-reachability	
-src/kitty_pet.rs	the_shells_own_new_line_is_a_line_change_not_a_retreat	caret-delta-fold	
-src/kitty_pet.rs	the_sleep_zees_drift_at_a_breathing_cadence	mote-laws	
 src/kitty_pet.rs	the_sleeper_follows_the_prompt	ink-eviction-behavior	
-src/kitty_pet.rs	the_tail_swaps_sides_only_between_tip_up_frames	idle-frame-laws	
-src/kitty_pet.rs	the_touch_point_dodges_the_ink	show-door	
-src/kitty_pet.rs	the_touchdown_is_not_a_cliff	flight-choreography	
-src/kitty_pet.rs	the_wake_s_startled_z_never_holds_the_frame_train_on_its_own	needs-frames-motion	
-src/kitty_pet.rs	the_wake_stretches_front_then_hind	settle-ladder	
 src/kitty_pet.rs	the_wall_crossing_transits_with_a_small_arc	wall-side	
 src/kitty_pet.rs	the_wall_side_stand_takes_the_blank_row_below	ink-eviction-behavior	
 src/kitty_pet.rs	the_wall_transit_never_fires_after_a_flight_that_already_crossed	wall-side	
 src/kitty_pet.rs	the_watch_ends_before_sleep_is_due	stream-watch	
 src/kitty_pet.rs	the_watcher_hugs_the_live_edge	stream-watch	
 src/kitty_pet.rs	the_zees_die_before_the_ink	mote-laws	
-src/kitty_pet.rs	touch_land_mirrors_cleanly	flight-choreography	
 src/kitty_pet.rs	typed_praise_is_rationed_and_a_scold_moves_nothing	trick-performance	
 src/kitty_pet.rs	typing_aborts_the_chase_instantly	pointer-play	
 src/kitty_pet.rs	typing_echo_never_perks	stream-watch	
-src/kitty_pet.rs	typing_past_the_margin_does_not_launch_a_bound	new-line-law	
-src/kitty_pet.rs	typing_past_the_margin_never_launches_the_show	new-line-law	
-src/kitty_pet.rs	waking_pops_one_startled_z_before_the_stretch	settle-ladder	
 src/kitty_pet.rs	wall_hysteresis_does_not_flip_flop_at_the_crossing	wall-side	
 src/kitty_pet.rs	wave_one_latches_arm_and_release_the_frame_lane	pet-idle-to-zero	
 src/kitty_pet.rs	work_outranks_the_bat	bat-and-look	
@@ -1987,19 +1750,12 @@ src/kitty_pet/full_screen_tests.rs	a_torn_redraw_stream_arms_no_hug	full-screen-
 src/kitty_pet/full_screen_tests.rs	full_screen_repaint_model_proves_and_catches	full-screen-repaint-refinement	
 src/kitty_pet/full_screen_tests.rs	the_shipped_law_reads_the_same_take_as_a_stream	full-screen-repaint-refinement	
 src/kitty_registry.rs	app_basename_strips_paths_prefixes_and_case	kr-app-basename	
-src/kitty_registry.rs	canonical_table_folds_shells	kr-canonical-app-id	
-src/kitty_registry.rs	coat_distance_is_symmetric_with_a_zero_diagonal	kr-coat-distance	
 src/kitty_registry.rs	coat_distance_table_is_pinned_to_the_live_lift	kr-coat-distance	
-src/kitty_registry.rs	dark_collapse_pairs_are_insufficient_where_raw_rgb_would_pass	kr-coat-distance	
-src/kitty_registry.rs	flagship_breeds_are_fixed_and_distinct	kr-app-look	
 src/kitty_registry.rs	flagship_trio_is_always_sufficiently_different	kr-coat-distance	
 src/kitty_registry.rs	for_app_never_emits_an_accessory	kr-app-look	
-src/kitty_registry.rs	launch_draws_are_pinned_forever	kr-launch-look	
-src/kitty_registry.rs	launch_kitties_spread_the_roster_and_avoid_the_shared_default	kr-launch-look	
 src/kitty_registry.rs	launch_kitty_is_seed_pure_normalized_head_and_bare	kr-launch-look	
 src/kitty_registry.rs	look_normalization_never_leaves_an_overlay_as_the_base	kr-look-normalized	
 src/kitty_registry.rs	registry_keys_are_unique_and_pinned	kr-registry-keys	
-src/kitty_registry.rs	unknown_app_breed_is_name_derived_and_stable	kr-app-look	
 src/kitty_sing.rs	a_batched_ime_commit_of_repeats_does_not_arm	ks-arm-threshold	
 src/kitty_sing.rs	a_celebration_s_fans_ride_the_bars_and_the_outro_ends_on_do	ks-external-run-events	
 src/kitty_sing.rs	a_continuous_hold_does_not_rewind_its_beat_clock	ks-arm-threshold	
@@ -2008,7 +1764,6 @@ src/kitty_sing.rs	a_six_key_medley_holds_the_stage_end_to_end	ks-key-switch-hand
 src/kitty_sing.rs	an_armed_celebration_fires_on_the_next_green_block_and_only_once	ks-external-fire	
 src/kitty_sing.rs	an_unarmed_session_never_celebrates_on_a_green_block	ks-external-fire	
 src/kitty_sing.rs	backspace_never_arms_and_breaks_a_run	ks-arm-threshold	
-src/kitty_sing.rs	changing_the_held_key_transposes_the_song_without_a_seam	ks-key-switch-handover	
 src/kitty_sing.rs	cold_arms_still_cost_sixteen	ks-arm-threshold	
 src/kitty_sing.rs	external_deadline_conforms_through_bars_outro_and_settle	ks-external-deadline-refinement	
 src/kitty_sing.rs	external_deadline_does_not_schedule_held_keys_or_replay_missed_bars	ks-external-deadline-refinement	
@@ -2016,16 +1771,12 @@ src/kitty_sing.rs	external_deadline_model_proves_and_catches_a_rearmed_consumed_
 src/kitty_sing.rs	genuine_typing_still_winds_the_song_down	ks-key-switch-handover	
 src/kitty_sing.rs	interleaved_chars_never_arm	ks-arm-threshold	
 src/kitty_sing.rs	letting_go_winds_down_without_an_event	ks-drive-envelope	
-src/kitty_sing.rs	note_bake_is_deterministic_distinct_and_translucent	ks-note-art	
 src/kitty_sing.rs	note_host_ids_avoid_kitty_sprite_family	ks-note-art	
-src/kitty_sing.rs	old_transpose_collision_classes_now_sing_apart	ks-song-signature-bijective	
 src/kitty_sing.rs	re_earning_the_threshold_during_wind_down_re_arms	ks-arm-threshold	
 src/kitty_sing.rs	reduced_motion_notes_hold_still	ks-note-resolve	
 src/kitty_sing.rs	session_switch_releases_the_hold	ks-arm-threshold	
-src/kitty_sing.rs	signature_is_neutral_at_rest_and_the_run_chars_while_held	ks-key-switch-handover	
 src/kitty_sing.rs	slow_same_key_striking_never_arms	ks-arm-threshold	
 src/kitty_sing.rs	song_signature_mixer_is_bijective_over_all_chars	ks-song-signature-bijective	
-src/kitty_sing.rs	switching_the_held_key_changes_the_verse_at_the_next_bar	ks-key-switch-handover	
 src/kitty_sing.rs	the_cooldown_refuses_a_second_arm_for_thirty_seconds	ks-external-arm-admission	
 src/kitty_sing.rs	the_owner_pattern_w_a_r_never_drops_the_drive	ks-key-switch-handover	
 src/kitty_sing.rs	threshold_at_cadence_arms_full_sing	ks-arm-threshold	
@@ -2035,63 +1786,37 @@ src/kitty_summon.rs	a_feline_word_glued_to_another_is_not_the_word	ksum-builtin-
 src/kitty_summon.rs	a_recorded_summon_is_always_a_completion	ksum-tiers	
 src/kitty_summon.rs	backspace_pops_typos_and_never_summons	ksum-window-edits	
 src/kitty_summon.rs	break_clears_the_run	ksum-window-edits	
-src/kitty_summon.rs	completion_is_case_insensitive	ksum-builtin-vocabulary	
 src/kitty_summon.rs	cooldown_suppresses_the_record_without_restamping	ksum-tiers	
-src/kitty_summon.rs	documented_constants_are_pinned	ksum-hit-is-lexicon-completion	
 src/kitty_summon.rs	dogs_arrive_only_after_a_lot_of_typing	ksum-tiers	
-src/kitty_summon.rs	earned_dogs_answer_in_every_listed_language	ksum-builtin-vocabulary	
-src/kitty_summon.rs	feline_words_summon_in_every_listed_language	ksum-builtin-vocabulary	
 src/kitty_summon.rs	incremental_scan_matches_a_whole_window_rescan_keystroke_for_keystroke	ksum-hit-is-lexicon-completion	
 src/kitty_summon.rs	innocent_words_containing_a_curse_never_fire	ksum-builtin-vocabulary	
-src/kitty_summon.rs	merge_keeps_every_axis	ksum-merge	
 src/kitty_summon.rs	profanity_winces_multilingually_and_never_records	ksum-builtin-vocabulary	
 src/kitty_summon.rs	session_switch_clears_the_window	ksum-window-edits	
-src/kitty_summon.rs	the_cooldown_never_withholds_a_completion	ksum-tiers	
 src/kitty_summon.rs	the_gate_odometer_survives_window_resets	ksum-tiers	
 src/kitty_summon.rs	typed_word_summons_once_at_completion	ksum-window-edits	
 src/kitty_summon.rs	window_stays_bounded_and_utf8	ksum-hit-is-lexicon-completion	
-src/matrix_overlay.rs	display_alt_and_visibility_gates_scrub_output	overlay-sync-gating	
-src/matrix_overlay.rs	external_rain_freshness_model_proves_and_catches_stale_refocus	overlay-freshness-refinement	
-src/matrix_overlay.rs	masks_text_explicit_background_selection_and_cursor_band	overlay-to-render-cell	
-src/matrix_overlay.rs	real_overlay_hide_refocus_trace_conforms_to_freshness_model	overlay-freshness-refinement	
-src/matrix_overlay.rs	samples_literal_output_without_a_second_terminal_parser	overlay-sync-gating	
-src/matrix_overlay.rs	scrolled_snapshot_defers_without_copy_or_scan_and_live_return_rescans	overlay-sync-gating	
-src/matrix_overlay.rs	storage_is_reused_and_malformed_input_fails_closed	overlay-validate-fail-closed	
 src/matrix_rain/bake.rs	all_tiles_nonempty_at_live_metrics	rb-box-filter	
-src/matrix_rain/bake.rs	progressive_bake_and_version_bumps	rb-progressive-bake	
 src/matrix_rain/bake.rs	rebuilt_bakers_replay_versions_but_publish_fresh_arcs	rb-progressive-bake	
 src/matrix_rain/bake.rs	same_metric_begin_frame_keeps_progress	rb-progressive-bake	
 src/matrix_rain/bitmap_font.rs	every_advertised_family_is_present	bf-table-lookup	
-src/matrix_rain/bitmap_font.rs	no_glyph_is_blank	bf-table-lookup	
 src/matrix_rain/bitmap_font.rs	the_table_is_sorted_and_has_no_duplicates	bf-table-lookup	
-src/matrix_rain/field.rs	bits_is_half_open_lsb_first	rf-bits	
 src/matrix_rain/field.rs	density_ring_looks_up_cycle_start	rf-density-ring	
 src/matrix_rain/field.rs	dither_quantum_rides_the_mutation_grid	rf-quanta	
 src/matrix_rain/field.rs	flash_floor_holds_at_all_clamped_configs	rf-col-params	
-src/matrix_rain/field.rs	hash_is_the_murmur3_finalizer	rf-hash	
-src/matrix_rain/field.rs	quad_cap_derives_from_texels	rf-quad-cap	
-src/matrix_rain/field.rs	stammer_holds_one_tick_in_window_seven	rf-stammer	
-src/matrix_rain/field.rs	step_period_is_at_least_two_ticks	rf-col-params	
 src/matrix_rain/field.rs	tiny_viewports_never_panic_and_keep_invariants	rf-col-params	
-src/matrix_rain/field.rs	trail_levels_are_time_keyed	rf-trail-level	
 src/matrix_rain/mod.rs	alpha_cap_is_pinned	mr-luminance	
 src/matrix_rain/mod.rs	bell_and_exit_survive_suspension_activity_does_not	mr-pending-notes	
 src/matrix_rain/mod.rs	budget_bound_holds_and_truncation_fires	mr-budget-and-truncation	
 src/matrix_rain/mod.rs	can_emit_probe_tracks_visibility_and_motion	mr-drain-bound	
 src/matrix_rain/mod.rs	closed_tui_frame_protects_default_background_interior	mr-frame-regions	
-src/matrix_rain/mod.rs	coalesced_edit_echo_yields_to_submitted_turn_and_seq_rebases	mr-activity-credit-refinement	
 src/matrix_rain/mod.rs	composer_material_gate_model_proves_and_catches_draft_sampling	mr-composer-gate	
 src/matrix_rain/mod.rs	deterministic_across_engines_and_clock_paths	mr-clock-path-equivalence	
-src/matrix_rain/mod.rs	disabled_engine_is_byte_identical_off	mr-gates-off	
-src/matrix_rain/mod.rs	drain_reaches_empty_within_bound_from_every_state	mr-drain-bound	
 src/matrix_rain/mod.rs	emission_never_rains_bottom_band_when_ring_unknown	mr-emission-mask	
 src/matrix_rain/mod.rs	emits_over_trimmed_blank_rows	mr-occupancy-rescan	
-src/matrix_rain/mod.rs	emitted_quads_are_row_sorted	mr-quad-geometry	
 src/matrix_rain/mod.rs	even_quad_counts_do_not_cancel	mr-fingerprint	
 src/matrix_rain/mod.rs	exit_status_drives_wave_and_ember	mr-pending-notes	
 src/matrix_rain/mod.rs	fingerprint_liveness_and_stability	mr-fingerprint	
 src/matrix_rain/mod.rs	frame_detector_handles_many_unmatched_left_corners_without_masking	mr-frame-regions	
-src/matrix_rain/mod.rs	frame_detector_rejects_text_as_a_bottom_edge	mr-frame-regions	
 src/matrix_rain/mod.rs	frame_region_overflow_fails_closed_for_the_rescan	mr-frame-regions	
 src/matrix_rain/mod.rs	literal_material_flows_in_source_order_down_each_column	mr-literal-strict	
 src/matrix_rain/mod.rs	literal_material_slots_are_bounded_stable_and_never_faked	mr-material-sample	
@@ -2101,42 +1826,28 @@ src/matrix_rain/mod.rs	live_selection_and_cursor_band_mask	mr-emission-mask
 src/matrix_rain/mod.rs	luminance_invariant_on_both_stock_themes	mr-luminance	
 src/matrix_rain/mod.rs	material_bank_samples_output_not_typing	mr-material-sample	
 src/matrix_rain/mod.rs	material_remaps_emitted_glyphs_unmirrored	mr-literal-strict	
-src/matrix_rain/mod.rs	needs_rescan_follows_the_damage_epoch	mr-rescan-gate	
-src/matrix_rain/mod.rs	note_grid_replaced_clears_the_material_bank	mr-rescan-gate	
-src/matrix_rain/mod.rs	note_grid_replaced_forces_rescan_despite_epoch_collision	mr-rescan-gate	
-src/matrix_rain/mod.rs	note_grid_replaced_releases_the_editing_latch	mr-composer-gate	
 src/matrix_rain/mod.rs	occupancy_mask_predicates	mr-occupancy-rescan	
 src/matrix_rain/mod.rs	progressive_bake_through_the_engine	mr-engine-bake	
 src/matrix_rain/mod.rs	quads_are_row_banded_and_tile_aligned	mr-quad-geometry	
 src/matrix_rain/mod.rs	rain_activity_credit_derived_model_proves_and_catches_overflow	mr-activity-credit-refinement	
 src/matrix_rain/mod.rs	rain_activity_credit_real_engine_conforms_to_model	mr-activity-credit-refinement	
-src/matrix_rain/mod.rs	rain_ignition_conformance_real_col_params_hold_the_flash_floor	rf-col-params	
 src/matrix_rain/mod.rs	rain_lifecycle_conformance_real_engine_projects_onto_model	mr-lifecycle-refinement	
-src/matrix_rain/mod.rs	rain_lifecycle_negative_control_phantom_relight_is_buggy_trace	mr-lifecycle-refinement	
-src/matrix_rain/mod.rs	reading_gate_disarms_and_rearms	mr-gates-off	
 src/matrix_rain/mod.rs	reading_gates_suppress_emission	mr-gates-off	
 src/matrix_rain/mod.rs	real_codex_and_claude_frames_feed_literal_output_not_composer	mr-material-sample	
 src/matrix_rain/mod.rs	real_material_sampling_gate_conforms_and_defers_refresh	mr-composer-gate	
-src/matrix_rain/mod.rs	reduced_motion_emits_nothing	mr-gates-off	
 src/matrix_rain/mod.rs	semantic_pulse_derived_model_proves_and_catches_overflow	mr-semantic-pulse-refinement	
 src/matrix_rain/mod.rs	semantic_pulse_real_engine_conforms_across_all_phases	mr-semantic-pulse-refinement	
 src/matrix_rain/mod.rs	semantic_pulse_real_engine_priority_motion_reset_and_expiry_conform	mr-semantic-pulse-refinement	
 src/matrix_rain/mod.rs	semantic_pulse_same_priority_replaces_phase_and_energy	mr-semantic-pulse-refinement	
 src/matrix_rain/mod.rs	semantic_pulses_are_bounded_prioritized_and_shape_real_tape_lanes	mr-semantic-pulse-refinement	
-src/matrix_rain/mod.rs	semantic_signal_numeric_abi_is_contiguous_and_pinned	mr-signal-abi	
-src/matrix_rain/mod.rs	semantic_work_wakes_drained_weather_then_expires_without_gaps	mr-semantic-pulse-refinement	
 src/matrix_rain/mod.rs	step_stable_damage_shape	mr-step-stable-damage	
 src/matrix_rain/mod.rs	suspended_tick_starves_to_sleep_and_disarms	mr-drain-bound	
 src/matrix_rain/mod.rs	tiny_pane_emits_without_panicking	mr-quad-geometry	
-src/matrix_rain/mod.rs	truncation_drops_whole_highest_hash_columns	mr-budget-and-truncation	
 src/matrix_rain/mod.rs	turn_wave_fires_on_working_to_sleep	mr-weather-machine	
 src/matrix_rain/mod.rs	turn_wave_limiter_caps_ignitions	mr-wave-limiter	
 src/matrix_rain/mod.rs	typing_echo_never_pours	mr-weather-machine	
 src/matrix_rain/mod.rs	unfocused_drained_engine_disarms_despite_streaming	mr-drain-bound	
 src/matrix_rain/mod.rs	weather_transitions_with_dwell_hysteresis	mr-weather-machine	
-src/matrix_rain/rom.rs	all_64_glyphs_are_nonempty	rom-classic-table	
-src/matrix_rain/rom.rs	glyphs_are_pairwise_distinct	rom-classic-table	
-src/matrix_rain/rom.rs	master_is_deterministic_and_in_bounds	rom-plot-in-bounds	
 src/matrix_rain/rom.rs	material_master_preserves_real_characters	rom-material-master	
 src/matrix_rain/step.rs	a_completion_is_news_once_in_its_own_session	rl-completion-news	
 src/matrix_rain/step.rs	a_surface_without_an_engine_keeps_both_latches_observing	rl-completion-news	
@@ -2147,19 +1858,13 @@ src/motion.rs	reduce_motion_never_mutes_typing	mo-reduce-motion-audible
 src/motion.rs	reduced_motion_totality	mo-resolve-truth-table	
 src/motion.rs	serious_mode_policy_conforms_to_derived_transition_model	mo-serious-refinement	
 src/motion.rs	serious_mode_policy_is_total_and_non_vacuous	mo-serious	
-src/motion.rs	unfocused_windows_demote_to_static	mo-resolve-truth-table	
 src/nova.rs	coupling_crossing_is_deterministic_and_monotone	nova-crossing	
-src/nova.rs	debris_rides_add_stream_on_the_phase_grid	nova-debris	
 src/nova.rs	delta_l_bound_over_palette_table	nova-delta-l	
-src/nova.rs	ember_pairs	nova-ember-pair	
 src/nova.rs	nova_budget_geometry_invariant	nova-budget-geometry	
-src/nova.rs	phase_windows_are_monotone	nova-phase	
-src/nova.rs	quasar_jets_are_vertical_and_doubled	nova-quasar	
 src/nova.rs	singularity_contracts_and_darkens	nova-singularity	
 src/nova.rs	spend_order_truncation_ring_first_crown_drops	nova-spend-order	
 src/nova_host_conformance_tests.rs	a_rearm_into_flash_is_the_buggy_step_the_host_bind_rejects	nova-host-refinement	
 src/nova_host_conformance_tests.rs	the_real_host_conforms_to_nova_phase_model	nova-host-refinement	
-src/nuke.rs	baking_is_deterministic	nuke-bake-nonempty	
 src/nuke.rs	natural_sizes_stay_inside_the_baker_slot	nuke-nat-size	
 src/nuke.rs	parts_live_only_in_their_phase	nuke-draw-windows	
 src/nuke.rs	the_whole_window_is_finite_and_cools	nuke-draw-windows	
@@ -2171,11 +1876,9 @@ src/output_streak.rs	an_unchanged_token_is_no_arrival_and_rebase_baselines	os-li
 src/output_streak.rs	cell_observation_all_blank_row_mints_nothing	os-cell-observation	
 src/output_streak.rs	cell_observation_is_gated_by_the_host_token_before_geometry	os-cell-observation	
 src/output_streak.rs	clipping_rejects_malformed_and_wholly_off_right_spans	os-clipped-span	
-src/output_streak.rs	different_themes_enter_the_spectrum_at_different_places	os-hue-for	
 src/output_streak.rs	disabled_is_inert	os-inert	
 src/output_streak.rs	echo_discount_mints_nothing_including_paste	os-license	
 src/output_streak.rs	empty_damage_mints_nothing	os-license	
-src/output_streak.rs	first_observation_baselines_and_mints_nothing	os-license	
 src/output_streak.rs	fractional_idle_deadline_is_consumed_at_the_exact_promised_boundary	os-idle-deadline	
 src/output_streak.rs	huge_finite_idle_value_drains_immediately_without_panicking	os-idle-deadline	
 src/output_streak.rs	idle_settles_to_fingerprint_zero_and_no_deadline	os-idle-deadline	
@@ -2188,31 +1891,26 @@ src/output_streak.rs	the_spawn_gap_clamps_eye_and_ear_together	os-ignition-floor
 src/output_streak.rs	theme_hue_uses_named_stop_positions_with_bounded_non_wrapping_jitter	os-hue-for	
 src/pane.rs	cropping_preserves_which_texels_the_surviving_pixels_sample	pane-crop-sampling	
 src/pet_baker.rs	a_cleared_baker_rebakes	exact-tile-baker-lru	
-src/pet_baker.rs	a_standing_pose_draws_a_cat	pb-roster	
 src/pet_baker.rs	bake_rate_is_capped_per_frame	exact-tile-baker-lru	
 src/pet_baker.rs	degenerate_keys_are_refused_without_spending_a_bake	exact-tile-baker-lru	
 src/pet_baker.rs	face_lod_keeps_a_dark_eye_core_at_ship_size	pb-eye-legibility	
 src/pet_baker.rs	face_lod_rebuilds_reflections_but_culls_other_charm_ink	pb-face-lod-roles	
-src/pet_baker.rs	face_lod_reflections_are_contained_and_expression_aware	pb-eye-reflections	
 src/pet_baker.rs	host_ids_are_stable_and_distinct	pb-host-id	
 src/pet_baker.rs	key_axes_change_the_texels	pb-roster	
-src/pet_baker.rs	lod_eyes_hold_the_artists_proportion_at_desktop_sizes	pb-eye-legibility	
 src/pet_baker.rs	lru_holds_the_slot_ceiling_and_evicts_the_oldest	exact-tile-baker-lru	
 src/pet_baker.rs	metric_change_clears_the_cache	exact-tile-baker-lru	
 src/pet_baker.rs	retina_scale_bakes_hit_the_identity_path	pb-face-lod-roles	
-src/pet_baker.rs	roster_is_populated_and_aspects_are_sane	pb-roster	
 src/pet_baker.rs	same_key_bakes_byte_identical_tiles	exact-tile-baker-lru	
 src/pet_baker.rs	tile_is_exact_size_with_no_patch_strip	exact-tile-baker-lru	
 src/pet_stroke.rs	a_stationary_pause_cannot_preserve_half_a_stroke	ps-stroke-contract	
 src/pet_stroke.rs	a_still_pointer_cannot_earn_from_a_moving_or_breathing_body	ps-stroke-contract	
-src/pet_stroke.rs	contact_loss_discards_partial_travel_and_cannot_bypass_cooldown	ps-stroke-contract	
 src/pet_stroke.rs	gaps_fast_sweeps_jitter_and_invalid_inputs_discard_partial_strokes	ps-stroke-contract	
 src/pet_stroke.rs	periodic_still_frames_preserve_the_real_movement_clock	ps-still-frames-equivalence	
 src/pet_stroke.rs	real_stroke_detector_transitions_conform_and_reject_negative_controls	ps-stroke-refinement	
 src/pet_stroke.rs	scale_changes_do_not_change_the_stroke_threshold	ps-scale-invariance	
+src/pet_world.rs	a_full_clear_moves_the_running_blocks_anchor_onto_what_followed_it	pw-anchors	
 src/pet_world.rs	a_pane_local_default_background_decides_ink_column_by_column	pw-classify	
 src/pet_world.rs	a_protected_cell_the_map_sees_vetoes_a_body_half_outside_it	pw-clearance-planes	
-src/pet_world.rs	both_prefix_planes_reset_correctly_when_the_scan_shrinks_and_grows	pw-clearance-planes	
 src/pet_world.rs	budget_overflow_and_missing_rows_are_unknown_not_empty	pw-clearance-planes	
 src/pet_world.rs	cursor_protection_does_not_erase_or_invent_actual_ink	pw-classify	
 src/pet_world.rs	exact_cells_allow_a_real_gutter_and_protect_the_whole_body	pw-classify	
@@ -2242,7 +1940,6 @@ src/pipeline.rs	cursor_pet_body_rect_is_handed_to_the_word_engine	pl-pet-word-ha
 src/pipeline.rs	cursor_pet_hides_in_history_and_when_unfocused_but_keeps_its_identity	pl-pet-ownership	
 src/pipeline.rs	cursor_pet_off_leaves_every_channel_and_fingerprint_untouched	pl-pet-ownership	
 src/pipeline.rs	cursor_pet_retires_when_the_style_stops_naming_it	pl-pet-ownership	
-src/pipeline.rs	cursor_pet_same_seed_same_pixels	pl-pet-ownership	
 src/pipeline.rs	cursor_pet_walks_beside_the_caret_then_sleeps_and_releases_cadence	pl-pet-ownership	
 src/pipeline.rs	effects_off_and_non_fire_styles_leave_fire_streams_empty	pl-fire-streams	
 src/pipeline.rs	embedded_pipeline_freezes_literal_tape_across_multiline_draft	pl-composer-toggle-refinement	
@@ -2259,7 +1956,6 @@ src/pipeline.rs	live_classic_to_literal_switch_resamples_without_grid_damage	pl-
 src/pipeline.rs	matrix_rain_theme_updates_cached_and_live_config	pl-rain-integration	
 src/pipeline.rs	next_deadline_ms_is_none_while_the_pet_moves_and_exact_while_it_breathes	pl-scheduler	
 src/pipeline.rs	only_the_owner_fence_rebaselines_the_command_probe_not_a_hide_or_a_resize	pl-owner-fence	
-src/pipeline.rs	output_streak_disabled_leaves_nova_clear_and_is_active_unaffected	pl-all-off-identity	
 src/pipeline.rs	output_streak_parks_until_its_exact_settle_deadline	pl-scheduler	
 src/pipeline.rs	pipeline_history_uses_the_exact_frame_snapshot_and_retires_cursor_state	pl-history-lifecycle-refinement	
 src/pipeline.rs	pipeline_real_alt_uniform_translates_while_ambiguous_motion_invalidates	pl-scroll-translation	
@@ -2269,7 +1965,6 @@ src/pipeline.rs	pipeline_translates_real_zero_and_saturated_scrollback_exactly	p
 src/pipeline.rs	pipeline_typed_keys_light_and_cold_program_motion_stays_dark	pl-input-provenance	
 src/pipeline.rs	pointer_and_petting_latch_only_and_need_a_tick	pl-pet-input-latch	
 src/pipeline.rs	pointer_under_host_rows_is_read_where_the_frame_draws_the_pet	pl-pet-input-latch	
-src/pipeline.rs	rain_disabled_leaves_channels_clear_and_is_active_unaffected	pl-all-off-identity	
 src/pipeline.rs	rain_enabled_emits_and_repeat_apply_is_byte_stable	pl-rain-integration	
 src/pipeline.rs	rain_only_uses_engine_deadline_while_frame_effects_keep_raf	pl-scheduler	
 src/pipeline.rs	rain_toggle_off_clears_stale_channels_on_every_off_path	pl-all-off-identity	
@@ -2279,22 +1974,15 @@ src/pipeline.rs	reduced_motion_pins_the_web_pet_at_its_station	pl-pet-reduced-mo
 src/pipeline.rs	reduced_motion_turns_off_the_page_cursor_family	pl-reduced-motion-cursor	
 src/pipeline.rs	refocus_resumes_without_a_phantom_comet	pl-focus-gate	
 src/pipeline.rs	scrollback_reading_skips_scan_and_live_return_rescans	pl-rain-integration	
-src/pipeline.rs	set_cursor_glow_builtin_clears_a_previously_armed_pack	pl-trail-pack	
 src/pipeline.rs	set_cursor_glow_resolves_through_the_native_config_law	pl-glow-config	
-src/pipeline.rs	set_cursor_trail_pack_arms_clears_and_reports_diagnostics	pl-trail-pack	
-src/pipeline.rs	slow_pointer_strokes_reach_the_pet_through_host_pixel_coordinates	pl-pet-input-latch	
 src/pipeline.rs	the_page_keeps_a_caret_touching_collision_form_provisional	pl-word-scan-context	
 src/pipeline.rs	the_page_samples_a_peeking_cats_palette_over_its_footprint	pl-word-scan-context	
 src/pipeline.rs	the_pets_contrast_cursor_is_the_stamped_cursor_colour_or_the_terminals	pl-pet-contrast-cursor	
-src/pipeline.rs	the_streak_appends_to_nova_and_never_clears_a_co_resident_producer	pl-streak-channel	
 src/pipeline.rs	unfocused_glow_settles_so_the_host_stops_rebooking_the_pane	pl-scheduler	
 src/pipeline.rs	unfocused_pane_emits_no_glow_but_focused_one_does	pl-focus-gate	
 src/pipeline.rs	unfocused_trail_clears_its_comet_but_still_publishes_the_colour	pl-focus-gate	
-src/pipeline.rs	unfocusing_never_consumes_the_configured_glow_intensity	pl-focus-gate	
 src/pipeline.rs	v3_reset_table_knob_setters_hard_reset_and_alt_suppression_freezes	pl-sparkle-reset-table	
 src/pipeline.rs	v3_web_resolver_pins_classes_and_custom_specs	pl-sparkle-config	
-src/pipeline.rs	web_pipeline_resolves_default_tall_and_explicit_underline	pl-glow-config	
-src/pipeline.rs	web_pipeline_resolves_pet_spelling_and_species	pl-glow-config	
 src/pipeline.rs	web_rain_hears_command_completions_and_execute_edges	pl-rain-host-latches	
 src/pipeline_input_tests.rs	web_accepted_printables_conform_to_the_existing_input_credit_model	pl-input-credit-refinement	
 src/pipeline_input_tests.rs	web_delete_dispatch_reaches_erase_without_a_typed_replay	pl-console-input-credits	
@@ -2303,15 +1991,9 @@ src/pipeline_input_tests.rs	web_non_text_intents_preserve_or_retire_the_existing
 src/pipeline_native.rs	the_flying_head_is_at_the_landing_on_frame_zero_and_squashes_on_arrival	pn-flying-head-meteor	
 src/rainbow_kitty/companion.rs	a_claimed_frame_draws_no_second_body	rkc-body-for	
 src/rainbow_kitty/companion.rs	a_crowded_line_yields_to_the_sky_then_draws_over_the_words	rkc-placement	
-src/rainbow_kitty/companion.rs	a_delight_earns_exactly_one_hero	rkc-heroes	
 src/rainbow_kitty/companion.rs	an_ink_blind_host_keeps_the_shipped_seat_but_never_the_caret_cell	rkc-placement	
-src/rainbow_kitty/companion.rs	rainbow_kitty_and_bare_kitty_mean_the_pet	rkc-body-for	
-src/rainbow_kitty/companion.rs	the_flying_head_needs_its_own_spelling	rkc-body-for	
 src/rainbow_kitty/companion.rs	the_flying_head_never_covers_the_cell_the_caret_is_typing_into	rkc-placement	
 src/rainbow_kitty/companion.rs	the_pet_is_offered_the_meteor_edge_but_keeps_its_own_pounce	rkc-impulse-for	
-src/rainbow_kitty/companion.rs	the_router_seats_the_flying_head_at_the_landing_on_the_spawn_frame	rkc-placement	
-src/rainbow_kitty/companion.rs	the_whip_starts_against_travel_and_springs_past_its_rest	rkc-whip	
-src/rainbow_kitty/companion.rs	v2_holds_the_cadence_only_for_its_own_clocks	rkc-whip	
 src/rainbow_kitty/meteor.rs	a_band_move_carries_a_flight_inside_the_band_and_retires_one_that_straddles_it	meteor-translate	
 src/rainbow_kitty/meteor.rs	a_burst_stays_inside_its_quad_cap_at_every_grade	meteor-quad-caps	
 src/rainbow_kitty/meteor.rs	a_chained_continuation_never_puts_the_head_behind_where_it_was	meteor-pool-cap-and-chain	
@@ -2319,78 +2001,34 @@ src/rainbow_kitty/meteor.rs	a_chained_stub_never_costs_another_row_its_head	mete
 src/rainbow_kitty/meteor.rs	a_fan_star_core_never_lands_on_a_probed_glyph	meteor-fan-geometry	
 src/rainbow_kitty/meteor.rs	a_jet_breaks_over_a_glyph_and_the_star_survives	meteor-burst-coverage	
 src/rainbow_kitty/meteor.rs	a_jet_is_probed_over_its_whole_capped_reach	meteor-const-relations	
-src/rainbow_kitty/meteor.rs	a_landed_train_keeps_its_afterglow_when_a_continuation_launches_from_it	meteor-retire-continuity	
-src/rainbow_kitty/meteor.rs	a_landing_on_a_continued_band_walks_the_band_s_number_bit_for_bit	landing-walk-is-band-field	
-src/rainbow_kitty/meteor.rs	a_leftward_landing_walks_the_band_s_way_too	meteor-landing-palette-walk	
-src/rainbow_kitty/meteor.rs	a_mid_screen_landing_fan_stays_within_two_rows_of_its_line	meteor-fan-geometry	
 src/rainbow_kitty/meteor.rs	a_party_landing_is_a_fan_off_the_glass_inside_315_ms	meteor-fan-census	
 src/rainbow_kitty/meteor.rs	a_ping_pong_never_spends_more_than_its_under_share	meteor-quad-caps	
 src/rainbow_kitty/meteor.rs	a_retired_head_sheds_nothing_more	meteor-retire-continuity	
-src/rainbow_kitty/meteor.rs	a_retired_train_retracts_toward_its_frozen_head_and_is_gone_at_sixty	meteor-retire-continuity	
 src/rainbow_kitty/meteor.rs	a_row_zero_fan_may_use_the_head_band_but_never_the_tab_strip_beyond_it	meteor-fan-geometry	
 src/rainbow_kitty/meteor.rs	a_scroll_between_spawn_and_arrival_moves_the_landing_with_the_train	meteor-translate	
 src/rainbow_kitty/meteor.rs	a_second_meteor_retires_the_first_without_a_pop	meteor-retire-continuity	
-src/rainbow_kitty/meteor.rs	a_shed_fragment_is_born_at_its_station_wearing_the_train_colour_there	meteor-shed-stations	
-src/rainbow_kitty/meteor.rs	a_shed_fragment_rests_beside_the_train_not_under_it	meteor-shed-stations	
 src/rainbow_kitty/meteor.rs	a_spark_is_culled_exactly_where_the_cadence_law_says_it_is	spark-cull-exact	
-src/rainbow_kitty/meteor.rs	a_spike_is_whole_or_absent	meteor-burst-geometry	
 src/rainbow_kitty/meteor.rs	a_spike_root_is_derived_from_the_spacing_it_must_keep_open	meteor-const-relations	
 src/rainbow_kitty/meteor.rs	a_vertical_recall_meteor_draws_its_train	meteor-spawn-latch	
-src/rainbow_kitty/meteor.rs	a_warm_landing_throws_no_cyan_and_the_seam_is_the_band_s_teal	meteor-landing-palette-walk	
 src/rainbow_kitty/meteor.rs	a_word_hop_is_a_mini_fan_not_a_flight	meteor-spawn-latch	
 src/rainbow_kitty/meteor.rs	an_idle_meteor_pool_draws_nothing_and_names_no_deadline	meteor-spawn-latch	
-src/rainbow_kitty/meteor.rs	fan_count_and_reach_are_the_graded_law_at_floor_and_cap	meteor-grade-laws	
 src/rainbow_kitty/meteor.rs	only_one_head_is_in_the_air_per_row	meteor-pool-cap-and-chain	
 src/rainbow_kitty/meteor.rs	reduced_motion_draws_the_static_form	meteor-reduced-motion-static	
-src/rainbow_kitty/meteor.rs	the_arrival_flashes_white_and_dies_into_the_rainbow	meteor-arrival-flash	
 src/rainbow_kitty/meteor.rs	the_attack_asks_for_every_frame_and_the_release_rides_the_host_s_train	meteor-cadence	
-src/rainbow_kitty/meteor.rs	the_axis_rule_sends_verticals_to_the_transposed_twin	axis-and-dir-dominant	
-src/rainbow_kitty/meteor.rs	the_brightest_point_is_the_nucleus_and_it_leads_the_train	meteor-luminance-hierarchy	
-src/rainbow_kitty/meteor.rs	the_burst_covers_its_angles_uniformly_in_screen_space	meteor-burst-geometry	
-src/rainbow_kitty/meteor.rs	the_burst_is_bright_at_its_hold_and_spent_after_it	meteor-burst-coverage	
 src/rainbow_kitty/meteor.rs	the_burst_is_off_glass_by_the_flight_horizon	meteor-idle-and-horizon	
 src/rainbow_kitty/meteor.rs	the_burst_paints_inside_the_fan_s_rise_at_every_cell	meteor-burst-geometry	
-src/rainbow_kitty/meteor.rs	the_burst_reaches_farther_and_spikes_harder_with_distance	meteor-burst-geometry	
-src/rainbow_kitty/meteor.rs	the_burst_walks_at_the_band_s_own_pace_where_it_lands	meteor-landing-palette-walk	
-src/rainbow_kitty/meteor.rs	the_burst_walks_the_band_s_arc_across_its_own_reach	meteor-landing-palette-walk	
-src/rainbow_kitty/meteor.rs	the_fan_reaches_its_reach_and_the_mini_fan_moves	meteor-fan-geometry	
-src/rainbow_kitty/meteor.rs	the_flash_pops_the_nucleus_and_not_the_coma	meteor-flash-is-area	
-src/rainbow_kitty/meteor.rs	the_flash_wears_the_field_s_own_stops_on_all_three_cells	meteor-landing-palette-walk	
-src/rainbow_kitty/meteor.rs	the_flight_speed_is_unchanged	meteor-spawn-latch	
 src/rainbow_kitty/meteor.rs	the_head_is_already_moving_and_lit_on_frame_zero	meteor-frame0-head	
 src/rainbow_kitty/meteor.rs	the_impact_is_off_glass_by_t_plus_600	meteor-idle-and-horizon	
-src/rainbow_kitty/meteor.rs	the_jets_continue_the_band_s_walk_red_toward_the_tail_and_do_not_drift	meteor-landing-palette-walk	
-src/rainbow_kitty/meteor.rs	the_landing_fan_is_one_hero_four_m2_and_grains	meteor-fan-census	
-src/rainbow_kitty/meteor.rs	the_landing_outshines_the_train_it_ends	meteor-luminance-hierarchy	
-src/rainbow_kitty/meteor.rs	the_landing_phase_locks_to_the_field_latched_at_spawn	meteor-phase-lock	
 src/rainbow_kitty/meteor.rs	the_landing_pool_conforms_to_the_model	landing-pool-fifo	
-src/rainbow_kitty/meteor.rs	the_landing_s_ink_is_the_band_s_hot_ink_entry_for_entry	landing-ink-is-hot-edge-ink	
-src/rainbow_kitty/meteor.rs	the_light_burst_is_the_same_star_in_ink	meteor-burst-coverage	
-src/rainbow_kitty/meteor.rs	the_meteor_arc_reflects_and_never_clamps	tri-triangle-wave	
-src/rainbow_kitty/meteor.rs	the_meteor_locks_to_the_carets_reflected_stop_on_a_long_line	meteor-phase-lock	
-src/rainbow_kitty/meteor.rs	the_nucleus_and_coma_are_culled_on_their_own_floors	meteor-two-tau-fade	
-src/rainbow_kitty/meteor.rs	the_pin_is_born_at_peak_and_closes_into_the_caret	meteor-pin-geometry	
 src/rainbow_kitty/meteor.rs	the_reduced_motion_burst_is_a_still_star	meteor-reduced-motion-static	
 src/rainbow_kitty/meteor.rs	the_retire_decay_lands_on_the_chroma_cull	meteor-const-relations	
 src/rainbow_kitty/meteor.rs	the_shower_stops_where_the_hand_stopped	meteor-hand-floor	
-src/rainbow_kitty/meteor.rs	the_sparks_are_haloed_stars_twice_the_bold_round_s_count	meteor-sparks-haloed	
-src/rainbow_kitty/meteor.rs	the_sparks_wear_the_band_s_stop_at_their_own_column	meteor-landing-palette-walk	
-src/rainbow_kitty/meteor.rs	the_star_emerges_as_the_flash_s_white_dies	meteor-burst-geometry	
-src/rainbow_kitty/meteor.rs	the_star_is_the_colour_of_the_light_it_lands_on	meteor-landing-palette-walk	
 src/rainbow_kitty/meteor.rs	the_train_carries_the_whole_spectrum_on_every_frame_of_the_flight	meteor-train-spectrum	
-src/rainbow_kitty/meteor.rs	the_train_dies_white_first_and_is_never_grey	meteor-two-tau-fade	
-src/rainbow_kitty/meteor.rs	the_train_is_brightest_just_behind_the_head	meteor-luminance-hierarchy	
-src/rainbow_kitty/meteor.rs	the_train_turns_white_then_spectrum_as_it_dies	meteor-two-tau-fade	
-src/rainbow_kitty/meteor.rs	the_width_grade_is_capped_at_one_and_a_half	meteor-spawn-latch	
 src/rainbow_kitty/mod.rs	a_band_move_moves_the_caret_with_its_band_and_keeps_the_spine	engine-translate	
 src/rainbow_kitty/mod.rs	a_batch_sweep_on_the_oldest_press_clock_is_born_no_earlier_than_the_birth_floor	held-key-and-sweep	
-src/rainbow_kitty/mod.rs	a_batched_echo_sweeps_every_glyph_cell_it_skipped	held-key-and-sweep	
 src/rainbow_kitty/mod.rs	a_bridge_sweep_inserted_after_a_one_shot_move_does_not_shift_the_pre_move_caret	pre-move-caret	
-src/rainbow_kitty/mod.rs	a_cold_backward_typed_echo_keeps_the_press_for_the_forward_move_after_it	echo-ledger-refinement	
 src/rainbow_kitty/mod.rs	a_cold_engine_s_first_coalesced_echo_lays_the_keys_it_held	echo-ledger-refinement	
-src/rainbow_kitty/mod.rs	a_curtain_keeps_the_ribbon_easing_while_the_rest_resets_and_a_hidden_frame_writes_nothing	curtain-and-hide	
 src/rainbow_kitty/mod.rs	a_declined_row_change_moves_the_mirror_after_the_ingest_and_the_next_key_lays_on_the_new_row	caret-mirror-observation	
-src/rainbow_kitty/mod.rs	a_delivered_insert_sweep_beside_banked_presses_forfeits_them_and_bridges_nothing	echo-ledger-refinement	
 src/rainbow_kitty/mod.rs	a_disengaged_engine_is_inert_at_every_seam_point	engine-disengaged-inert	
 src/rainbow_kitty/mod.rs	a_falling_curtain_is_reported_drawn_on_every_frame_it_composites	status-drawn-honesty	
 src/rainbow_kitty/mod.rs	a_flight_asks_for_every_frame	meteor-cadence	
@@ -2399,71 +2037,50 @@ src/rainbow_kitty/mod.rs	a_gold_star_near_a_contented_cat_is_offered_and_caught	
 src/rainbow_kitty/mod.rs	a_held_space_measures_the_word_the_composer_moves_from_its_own_cell	word-relay	
 src/rainbow_kitty/mod.rs	a_hide_is_taken_by_one_frame_and_an_un_taken_one_is_dropped_by_a_reset_or_a_curtain	curtain-and-hide	
 src/rainbow_kitty/mod.rs	a_key_typed_before_the_first_licensed_move_is_held_not_laid_at_an_unset_mirror	held-key-and-sweep	
-src/rainbow_kitty/mod.rs	a_key_whose_echo_lands_a_frame_late_still_lights_its_glyph	held-key-and-sweep	
-src/rainbow_kitty/mod.rs	a_key_whose_echo_the_seam_refused_is_relit_by_the_next_licensed_echo	echo-ledger-refinement	
 src/rainbow_kitty/mod.rs	a_late_tick_samples_the_settled_exit_swoosh	exit-sampling-refinement	
-src/rainbow_kitty/mod.rs	a_licensed_echo_the_host_did_not_sweep_is_laid_from_its_presses	echo-ledger-refinement	
 src/rainbow_kitty/mod.rs	a_licensed_jump_mints_one_meteor_cue_on_the_shared_clock	engine-sound-cues	
-src/rainbow_kitty/mod.rs	a_navigation_licence_a_row_change_and_a_reset_forget_the_presses	echo-ledger-refinement	
-src/rainbow_kitty/mod.rs	a_new_line_s_first_key_pressed_before_the_row_change_was_seen_starts_the_walk_again	walk-new-line-gate	
 src/rainbow_kitty/mod.rs	a_pre_move_caret_carried_off_the_top_is_forgotten_not_clamped	pre-move-caret	
-src/rainbow_kitty/mod.rs	a_press_older_than_the_echo_patience_buys_no_cell	echo-ledger-refinement	
-src/rainbow_kitty/mod.rs	a_press_waits_on_the_ledger_for_the_whole_patience	echo-ledger-refinement	
 src/rainbow_kitty/mod.rs	a_reported_bar_mints_its_fan_and_a_withdrawn_one_mints_nothing	party-seam	
 src/rainbow_kitty/mod.rs	a_reset_or_a_curtain_forgets_the_pre_move_caret_with_the_events_it_indexed	pre-move-caret	
 src/rainbow_kitty/mod.rs	a_return_is_the_cadence_and_a_pty_feed_is_the_cascade	engine-sound-cues	
 src/rainbow_kitty/mod.rs	a_rewrite_offers_no_impulse_drains_no_spine_throws_no_star_and_keeps_the_ledger	engine-rewrite	
-src/rainbow_kitty/mod.rs	a_rewrite_retract_completes_and_the_engine_idles_free	rk-engine-idle-to-zero	
 src/rainbow_kitty/mod.rs	a_run_of_fast_clean_keys_opens_the_theme_and_a_delete_closes_it	spine-flow-counter	
 src/rainbow_kitty/mod.rs	a_same_row_observation_leaves_the_mirror_for_the_ledger_to_measure	caret-mirror-observation	
 src/rainbow_kitty/mod.rs	a_scroll_moves_every_live_star_and_the_caret_with_the_viewport	engine-translate	
 src/rainbow_kitty/mod.rs	a_scroll_or_a_band_move_carries_the_pre_move_caret_with_the_text_it_names	pre-move-caret	
 src/rainbow_kitty/mod.rs	a_settling_sky_asks_for_no_more_frames_than_its_light_can_show	engine-cadence-tail	
 src/rainbow_kitty/mod.rs	a_slow_correction_is_not_a_mend	mend-pricing	
-src/rainbow_kitty/mod.rs	a_stale_press_cannot_fund_a_later_stray_hop	echo-ledger-refinement	
 src/rainbow_kitty/mod.rs	a_style_switch_drops_an_unticked_event_and_never_a_minted_cue	engine-sound-cues	
 src/rainbow_kitty/mod.rs	a_sub_floor_hop_is_one_nav_tick_and_a_no_op_is_silent	engine-sound-cues	
-src/rainbow_kitty/mod.rs	a_swallowed_press_never_rolls_forward_as_a_phantom_credit	echo-ledger-refinement	
 src/rainbow_kitty/mod.rs	a_sweep_on_the_origin_row_before_a_fold_move_lays_the_last_column_and_clears_the_ledger	echo-ledger-refinement	
 src/rainbow_kitty/mod.rs	a_swept_space_requires_the_complete_key_run_and_typed_move	swept-space-cell	
 src/rainbow_kitty/mod.rs	a_swept_space_uses_the_last_space_and_counts_wide_glyph_cells	swept-space-cell	
 src/rainbow_kitty/mod.rs	a_typed_fold_wraps_at_the_pane_edge_not_the_grid_edge	pane-fold	
 src/rainbow_kitty/mod.rs	a_typo_fixed_within_a_breath_is_born_at_the_momentum_it_interrupted	mend-pricing	
 src/rainbow_kitty/mod.rs	a_waiting_key_s_arming_rows_have_slots_of_their_own	witness-rows	
+src/rainbow_kitty/mod.rs	a_withheld_follow_lifts_the_hand_once	crossed-echo-laid	
 src/rainbow_kitty/mod.rs	a_witness_retirement_is_counted_survives_a_reset_and_is_never_undone_by_a_payout	witness-retire-engine	
 src/rainbow_kitty/mod.rs	an_erase_winces_the_kitty_and_a_meteor_outranks_it	engine-companion-impulse	
 src/rainbow_kitty/mod.rs	an_inserts_sweep_pays_the_hole_a_late_key_left_before_it	echo-ledger-refinement	
 src/rainbow_kitty/mod.rs	an_unprobed_sky_bears_no_star	sky-probe-gate	
 src/rainbow_kitty/mod.rs	an_unrelated_follow_on_the_parked_row_does_not_prove_the_park	short-wrap-park-refinement	
-src/rainbow_kitty/mod.rs	at_one_slab_the_owner_census_alone_decides_a_hole	row-holes-census	
-src/rainbow_kitty/mod.rs	config_projects_only_what_v2_needs	config-from-glow	
-src/rainbow_kitty/mod.rs	default_and_new_build_the_same_engine	engine-fresh-state	
 src/rainbow_kitty/mod.rs	delight_earns_one_hero_that_chimes_only_with_a_token	glint-budget	
-src/rainbow_kitty/mod.rs	direction_resolves_on_the_dominant_axis	axis-and-dir-dominant	
 src/rainbow_kitty/mod.rs	flow_draws_nothing_of_its_own	flow-draws-nothing	
 src/rainbow_kitty/mod.rs	forty_presses_typed_into_a_stall_fit_the_ledger	echo-ledger-refinement	
-src/rainbow_kitty/mod.rs	no_row_two_away_is_named	witness-rows	
-src/rainbow_kitty/mod.rs	presses_younger_than_the_licensing_key_never_pay_for_a_cell_to_its_left	echo-ledger-refinement	
-src/rainbow_kitty/mod.rs	rainbow_kitty_v2_idles_at_exactly_zero	rk-engine-idle-to-zero	
 src/rainbow_kitty/mod.rs	real_band_transforms_retire_echo_credits_without_resetting_earned_light	echo-band-fence	
 src/rainbow_kitty/mod.rs	reduced_motion_lands_the_kitty_without_a_flight_or_a_flash	engine-companion-impulse	
 src/rainbow_kitty/mod.rs	the_cadence_fold_floors_tails_and_ignores_past_edges	cadence-fold	
 src/rainbow_kitty/mod.rs	the_caret_flare_is_one_edge_that_ages_out	caret-seam-flare-and-paint	
 src/rainbow_kitty/mod.rs	the_caret_paint_is_the_display_spine_floored_by_the_landing_relight	caret-seam-flare-and-paint	
-src/rainbow_kitty/mod.rs	the_caret_seam_reports_this_frames_field_at_the_landing	meteor-phase-lock	
 src/rainbow_kitty/mod.rs	the_fingerprint_folds_only_this_ticks_own_marks	frame-liveness-fingerprint	
-src/rainbow_kitty/mod.rs	the_hole_tripwire_records_a_hole_at_one_slab_per_cell	hole-tripwire	
-src/rainbow_kitty/mod.rs	the_hole_tripwire_records_the_first_frame_of_a_hole_inside_a_lit_typed_line	hole-tripwire	
+src/rainbow_kitty/mod.rs	the_hands_floor_rides_with_its_line	crossed-echo-laid	
 src/rainbow_kitty/mod.rs	the_mend_mark_is_a_value_not_a_timer	mend-pricing	
 src/rainbow_kitty/mod.rs	the_meteor_pool_is_handed_the_hand_s_floor	meteor-hand-floor	
 src/rainbow_kitty/mod.rs	the_meteor_s_perk_reaches_the_resident_at_the_landing_s_own_instant	pet-offer	
-src/rainbow_kitty/mod.rs	the_purr_notes_wear_the_ribbon_s_colour_under_the_cat	pet-offer	
 src/rainbow_kitty/mod.rs	the_real_engine_conforms_to_the_echo_ledger_model	echo-ledger-refinement	
+src/rainbow_kitty/mod.rs	the_seam_rides_with_the_hands_line	crossed-echo-laid	
 src/rainbow_kitty/mod.rs	three_disjoint_cohorts_keep_the_hands_lower_follow_row_in_the_witness	witness-rows	
-src/rainbow_kitty/mod.rs	three_keys_typed_into_a_stall_are_relit_together	echo-ledger-refinement	
 src/rainbow_kitty/mod.rs	withheld_is_what_the_host_was_asked_for_and_did_not_deliver	witness-withheld	
-src/rainbow_kitty/ribbon.rs	a_backspace_back_through_a_shell_fold_whose_echo_lands_with_the_key_re_wets_the_row_at_once	fold-flow	
-src/rainbow_kitty/ribbon.rs	a_backspace_run_back_through_a_shell_fold_re_wets_the_row_and_holds_it	fold-flow	
 src/rainbow_kitty/ribbon.rs	a_backspace_run_begun_after_the_rest_snaps_the_band_back_and_runs_the_tail_from_it	row-hold-own-clock	
 src/rainbow_kitty/ribbon.rs	a_backspace_run_holds_the_phrase_so_the_left_end_stays_lit_through_it	row-hold-own-clock	
 src/rainbow_kitty/ribbon.rs	a_backward_typed_echo_under_the_re_anchor_floor_stamps_nothing	typed-landing-pen	
@@ -2473,60 +2090,28 @@ src/rainbow_kitty/ribbon.rs	a_band_move_drops_what_leaves_the_band_and_retires_i
 src/rainbow_kitty/ribbon.rs	a_band_move_under_the_hand_carries_the_seam_and_its_floor_together	ribbon-translate	
 src/rainbow_kitty/ribbon.rs	a_boundary_takes_the_brighter_cell_s_coverage	attack-and-boundary	
 src/rainbow_kitty/ribbon.rs	a_boundary_two_live_runs_share_carries_the_older_side_s_light	seam-heal-no-slivers	
-src/rainbow_kitty/ribbon.rs	a_bright_foreground_s_bed_takes_the_bar_s_whole_budget_not_a_tenth	bed-luma-budget-def	
 src/rainbow_kitty/ribbon.rs	a_capped_rail_does_not_cut_the_body_of_an_adjacent_run	ribbon-quad-budget	
 src/rainbow_kitty/ribbon.rs	a_capped_run_keeps_the_light_at_its_head_and_sheds_the_distant_tail	ribbon-quad-budget	
 src/rainbow_kitty/ribbon.rs	a_coalesced_echo_leaves_one_cohort_and_no_feather_inside_the_row	seam-heal-no-slivers	
 src/rainbow_kitty/ribbon.rs	a_cohort_still_being_typed_keeps_its_boundaries_while_its_row_mate_retracts	row-hold-own-clock	
-src/rainbow_kitty/ribbon.rs	a_cold_arrow_s_wake_carries_no_hairline_and_a_hot_one_keeps_its_own	hot-edge-emission	
 src/rainbow_kitty/ribbon.rs	a_cold_caret_mirror_is_not_a_hand_a_key_can_be_brought_back_to	typed-landing-pen	
-src/rainbow_kitty/ribbon.rs	a_cold_hand_carries_the_edge_s_floor_and_a_light_ground_carries_no_hot_edge	hot-edge-gain-and-cells	
-src/rainbow_kitty/ribbon.rs	a_cold_walk_reads_bit_for_bit_what_it_read_before_the_odometer	cohort-walk-invariant	
-src/rainbow_kitty/ribbon.rs	a_completion_that_crosses_the_fold_keeps_the_walk_s_distance	walk-chain-and-fold-distance	
 src/rainbow_kitty/ribbon.rs	a_composer_gate_waits_for_its_home_and_only_its_first_real_echo_spends_it	composer-newline-gate-refinement	
-src/rainbow_kitty/ribbon.rs	a_composer_re_anchor_relays_the_moved_word_on_the_new_row	word-relay	
 src/rainbow_kitty/ribbon.rs	a_composer_re_wrap_s_moved_word_fades_in_place_while_the_row_it_left_drifts	fold-flow	
-src/rainbow_kitty/ribbon.rs	a_corridor_s_landing_on_a_pushed_tail_wears_the_band_s_number	cohort-walk-invariant	
 src/rainbow_kitty/ribbon.rs	a_curtain_gathers_the_band_into_its_hand_over_a_quarter_second_with_no_cliff_and_lays_nothing	curtain-law	
-src/rainbow_kitty/ribbon.rs	a_dark_body_rides_its_ceiling_and_the_strip_shows_above_it	body-ceiling-rail-and-pane	
 src/rainbow_kitty/ribbon.rs	a_delivered_burst_that_wraps_keeps_the_cells_it_left_on_the_row_above	typed-landing-pen	
 src/rainbow_kitty/ribbon.rs	a_downward_landing_is_questioned_only_where_lay_would_write_above_it	typed-landing-pen	
 src/rainbow_kitty/ribbon.rs	a_fades_next_level_is_solved_not_polled	level-step-closed-form	
-src/rainbow_kitty/ribbon.rs	a_fold_leaves_a_row_below_that_did_not_continue_it_exactly_as_it_is	walk-same-row-origin	
-src/rainbow_kitty/ribbon.rs	a_fold_s_first_cell_laid_before_the_glyph_above_it_is_re_seated_one_step_on	walk-same-row-origin	
-src/rainbow_kitty/ribbon.rs	a_frame_is_a_pure_function_of_its_events_and_now	ribbon-frame-determinism	
-src/rainbow_kitty/ribbon.rs	a_heal_merge_takes_the_relaid_word_s_whole_origin_and_keeps_the_walk_s_pace	walk-same-row-origin	
-src/rainbow_kitty/ribbon.rs	a_home_and_an_end_inside_the_band_abandon_nothing_and_take_nothing_over	scrub-holds-and-damages-nothing	
 src/rainbow_kitty/ribbon.rs	a_hop_covers_a_leaving_band_from_its_level_and_leaves_a_live_one_as_it_is	wake-overlay-no-touch	
 src/rainbow_kitty/ribbon.rs	a_hot_paragraph_at_retina_keeps_its_head_row_whole_and_sheds_only_the_oldest_tail	ribbon-quad-budget	
-src/rainbow_kitty/ribbon.rs	a_jump_into_a_band_already_leaving_lays_its_wake_over_it_from_the_level_it_has	wake-overlay-no-touch	
-src/rainbow_kitty/ribbon.rs	a_jump_lays_its_wake_counted_back_from_the_landing_and_never_the_whole_row	wake-corridor	
 src/rainbow_kitty/ribbon.rs	a_jump_lays_its_wake_over_the_live_band_and_leaves_the_band_s_cells_untouched	wake-overlay-no-touch	
-src/rainbow_kitty/ribbon.rs	a_jump_past_the_band_s_oldest_cell_or_off_its_row_still_abandons_it	abandon-retract	
 src/rainbow_kitty/ribbon.rs	a_jump_s_cap_binds_at_the_corridor_s_far_edge_never_inside_it	wake-corridor	
 src/rainbow_kitty/ribbon.rs	a_jump_s_landing_column_is_stamped_on_its_own_row_alone	abandon-retract	
 src/rainbow_kitty/ribbon.rs	a_jump_takes_the_band_out_from_the_light_it_has_never_by_a_step	abandon-retract	
-src/rainbow_kitty/ribbon.rs	a_key_pressed_before_the_return_whose_glyph_lands_after_it_does_not_spend_the_gate	walk-new-line-gate	
-src/rainbow_kitty/ribbon.rs	a_key_replayed_before_its_echo_keeps_the_previous_cell_s_attack	attack-and-boundary	
 src/rainbow_kitty/ribbon.rs	a_key_sampled_at_readlines_cr_park_stays_on_the_hands_own_row	typed-landing-pen	
-src/rainbow_kitty/ribbon.rs	a_landing_across_a_yanked_word_wears_the_band_s_number_whichever_cell_each_reader_takes	cohort-walk-invariant	
-src/rainbow_kitty/ribbon.rs	a_landing_walk_on_a_continued_band_is_the_band_s_field_bit_for_bit	landing-walk-is-band-field	
-src/rainbow_kitty/ribbon.rs	a_leftward_wake_s_hot_edge_sits_at_the_landing_not_where_the_caret_left	hot-edge-emission	
-src/rainbow_kitty/ribbon.rs	a_lifted_word_goes_up_with_its_light_on_the_walk_it_had	word-relay	
 src/rainbow_kitty/ribbon.rs	a_light_theme_ribbon_is_source_over_ink_and_never_additive	light-theme-and-spellings	
-src/rainbow_kitty/ribbon.rs	a_line_after_a_return_that_wraps_carries_its_own_distance_across_the_fold	walk-chain-and-fold-distance	
-src/rainbow_kitty/ribbon.rs	a_line_kill_retyped_at_once_continues_the_colour_on_the_fast_leg	walk-new-line-gate	
 src/rainbow_kitty/ribbon.rs	a_line_still_being_typed_keeps_every_cell_from_its_first_key_to_the_caret	cohort-phase-timeline	
 src/rainbow_kitty/ribbon.rs	a_live_retype_with_a_changed_glyph_does_not_inherit_the_old_witness	retire-and-release-identity	
 src/rainbow_kitty/ribbon.rs	a_nav_moves_the_pen_so_a_fold_after_it_still_lays_where_it_folded	typed-landing-pen	
-src/rainbow_kitty/ribbon.rs	a_never_armed_space_past_a_one_cell_backward_typed_echo_keeps_its_light	typed-landing-pen	
-src/rainbow_kitty/ribbon.rs	a_new_cell_s_light_enters_from_the_caret_side	attack-and-boundary	
-src/rainbow_kitty/ribbon.rs	a_new_line_after_a_curtain_continues_the_colour_on_the_fast_leg	walk-new-line-gate	
-src/rainbow_kitty/ribbon.rs	a_new_line_after_a_line_kill_continues_the_colour_on_the_fast_leg	walk-new-line-gate	
-src/rainbow_kitty/ribbon.rs	a_new_line_after_a_return_a_newline_or_an_arrow_continues_the_colour_on_the_fast_leg	walk-new-line-gate	
-src/rainbow_kitty/ribbon.rs	a_new_line_after_a_same_row_composer_newline_continues_the_colour_on_the_fast_leg	walk-new-line-gate	
-src/rainbow_kitty/ribbon.rs	a_new_line_s_first_key_pressed_before_its_row_change_was_seen_still_starts_the_walk_again	walk-new-line-gate	
-src/rainbow_kitty/ribbon.rs	a_new_line_s_first_key_replayed_on_the_old_row_before_the_return_s_move_still_starts_the_walk_again	walk-new-line-gate	
 src/rainbow_kitty/ribbon.rs	a_new_phrase_holds_none_of_a_closed_one_s_cohorts_until_the_hand_resumes_it	row-hold-own-clock	
 src/rainbow_kitty/ribbon.rs	a_parking_pass_after_the_row_was_backspaced_empty_still_finds_the_hand	typed-landing-pen	
 src/rainbow_kitty/ribbon.rs	a_parking_pass_is_caught_at_every_column_it_can_be_sampled_at	typed-landing-pen	
@@ -2535,125 +2120,65 @@ src/rainbow_kitty/ribbon.rs	a_partial_reversal_keeps_the_whole_corridor_on_one_c
 src/rainbow_kitty/ribbon.rs	a_ping_pong_at_speed_does_not_accumulate_and_empties_one_wake_life_after_its_last_key	wake-corridor	
 src/rainbow_kitty/ribbon.rs	a_program_round_trip_does_not_strand_the_band_under_a_typing_hand	abandon-retract	
 src/rainbow_kitty/ribbon.rs	a_re_anchor_inside_the_scroll_that_moved_the_band_drains_nothing	ribbon-translate	
-src/rainbow_kitty/ribbon.rs	a_rebirth_after_a_finished_swoosh_continues_the_walk	walk-chain-and-fold-distance	
-src/rainbow_kitty/ribbon.rs	a_rebirth_after_a_finished_swoosh_continues_the_walk_s_pace	walk-chain-and-fold-distance	
-src/rainbow_kitty/ribbon.rs	a_relaid_word_s_letters_join_the_run_its_first_letter_minted	word-relay	
 src/rainbow_kitty/ribbon.rs	a_relay_over_a_content_retired_cell_has_a_fresh_witness_identity	retire-and-release-identity	
 src/rainbow_kitty/ribbon.rs	a_released_run_is_abandoned_into_its_retract_and_a_cell_already_leaving_keeps_its_clock	retire-and-release-identity	
 src/rainbow_kitty/ribbon.rs	a_relocation_pays_a_content_retired_destination_and_preserves_live_neighbors	retire-and-release-identity	
-src/rainbow_kitty/ribbon.rs	a_repaint_that_parks_below_the_hand_does_not_take_the_key_with_it	typed-landing-pen	
 src/rainbow_kitty/ribbon.rs	a_repaints_home_pass_does_not_abandon_the_row_the_hand_is_typing_on	typed-landing-pen	
 src/rainbow_kitty/ribbon.rs	a_repaints_home_pass_poisons_the_mirror_and_the_pen_still_holds_the_hand	typed-landing-pen	
 src/rainbow_kitty/ribbon.rs	a_retired_cell_melts_to_exactly_nothing_inside_150_ms_and_never_brightens	retire-and-release-identity	
-src/rainbow_kitty/ribbon.rs	a_revive_lays_the_retired_run_back_on_its_own_walk_in_either_order	walk-same-row-origin	
 src/rainbow_kitty/ribbon.rs	a_rewrite_retracts_the_suffix_from_the_given_column_not_the_mirror	erase-retract-suffix	
 src/rainbow_kitty/ribbon.rs	a_row_change_a_pty_jump_and_a_typed_move_lay_no_wake	wake-corridor	
 src/rainbow_kitty/ribbon.rs	a_row_the_caret_is_not_on_retracts_into_its_own_nearest_end_in_logical_order	abandon-retract	
-src/rainbow_kitty/ribbon.rs	a_run_the_hand_backspaced_whole_is_rejoined_on_its_stops_inside_its_fade	erase-retract-suffix	
-src/rainbow_kitty/ribbon.rs	a_same_row_rebirth_after_a_program_jump_continues_the_walk_s_pace	walk-same-row-origin	
-src/rainbow_kitty/ribbon.rs	a_same_row_rebirth_left_of_a_live_run_takes_its_walk_by_position	walk-same-row-origin	
 src/rainbow_kitty/ribbon.rs	a_scroll_carries_the_ribbon_with_its_text	ribbon-translate	
 src/rainbow_kitty/ribbon.rs	a_scrub_inside_the_band_keeps_every_cell_s_light_and_holds_the_row	scrub-holds-and-damages-nothing	
 src/rainbow_kitty/ribbon.rs	a_scrub_into_a_leftward_corridor_does_not_move_its_soft_end	scrub-holds-and-damages-nothing	
-src/rainbow_kitty/ribbon.rs	a_scrub_over_a_melting_wake_stub_raises_no_cell_s_coverage	scrub-holds-and-damages-nothing	
-src/rainbow_kitty/ribbon.rs	a_scrub_over_holes_a_hop_filled_leaves_an_abandoned_cohort_exactly_as_it_was	scrub-holds-and-damages-nothing	
-src/rainbow_kitty/ribbon.rs	a_scrub_s_landing_on_a_pushed_tail_wears_the_band_s_number	cohort-walk-invariant	
 src/rainbow_kitty/ribbon.rs	a_shell_home_relays_no_word_onto_the_prompt	word-relay	
 src/rainbow_kitty/ribbon.rs	a_shift_of_a_flowing_band_carries_its_frozen_fold_edge	fold-flow	
 src/rainbow_kitty/ribbon.rs	a_slow_hand_s_folded_row_flows_whole_whatever_it_paused_before_the_wrap	fold-flow	
-src/rainbow_kitty/ribbon.rs	a_slow_hand_s_grace_is_the_tempo_multiple_and_a_fast_hand_s_is_the_floor	cohort-phase-timeline	
 src/rainbow_kitty/ribbon.rs	a_top_anchored_band_moves_the_transcript_up_and_pins_the_footer	ribbon-translate	
 src/rainbow_kitty/ribbon.rs	a_typed_key_under_a_burning_ember_clears_it_and_relights_from_the_level	focus-ember	
 src/rainbow_kitty/ribbon.rs	a_typed_row_change_lets_the_old_row_leave_on_its_own_clock	fold-flow	
-src/rainbow_kitty/ribbon.rs	a_wake_cell_is_dark_until_it_is_born_then_takes_the_one_attack	wake-corridor	
-src/rainbow_kitty/ribbon.rs	a_wake_continues_the_band_s_own_walk_across_the_kink_whichever_way_it_jumps	walk-same-row-origin	
-src/rainbow_kitty/ribbon.rs	a_wake_is_never_typing_and_holds_no_other_cohort	wake-corridor	
-src/rainbow_kitty/ribbon.rs	a_wake_on_a_dark_row_starts_its_walk_at_the_landing_as_the_meteor_paints_it	landing-walk-is-band-field	
-src/rainbow_kitty/ribbon.rs	a_word_begun_where_the_hand_arrived_is_measured_from_the_arrival	word-relay	
-src/rainbow_kitty/ribbon.rs	a_word_killed_and_retyped_inside_its_drain_takes_back_its_stops	erase-retract-suffix	
-src/rainbow_kitty/ribbon.rs	a_wrap_after_fewer_than_sixteen_cells_continues_the_fast_leg_for_the_distance_it_has_left	walk-chain-and-fold-distance	
-src/rainbow_kitty/ribbon.rs	a_wrapped_paragraph_is_one_phrase_and_each_row_keeps_its_own_clock	row-hold-own-clock	
 src/rainbow_kitty/ribbon.rs	an_arrow_hop_lays_a_short_wake_behind_the_caret_and_leaves_live_cells_alone	wake-corridor	
-src/rainbow_kitty/ribbon.rs	an_arrow_inside_the_hands_live_word_does_not_cut_its_measure	word-relay	
-src/rainbow_kitty/ribbon.rs	an_erase_holds_the_row_s_cohort_through_the_edit	row-hold-own-clock	
 src/rainbow_kitty/ribbon.rs	an_erase_whose_echo_lands_a_tick_late_still_retracts_the_erased_cell	erase-retract-suffix	
-src/rainbow_kitty/ribbon.rs	an_idle_ribbon_draws_nothing_and_asks_for_no_frame	rk-engine-idle-to-zero	
-src/rainbow_kitty/ribbon.rs	every_stop_of_the_arc_composites_at_one_weight	bed-ink-even-and-chromatic	
 src/rainbow_kitty/ribbon.rs	focus_regained_inside_the_ember_comes_back_up_through_edge_in_not_a_snap	focus-ember	
-src/rainbow_kitty/ribbon.rs	head_rgb_is_the_authored_stop_on_dark_and_the_rail_ink_on_light	light-theme-and-spellings	
 src/rainbow_kitty/ribbon.rs	letters_stay_legible_under_the_ribbon_on_every_dark_theme_above_the_floor	bed-legibility-bar	
-src/rainbow_kitty/ribbon.rs	tall_and_underline_are_one_emitter_with_two_shoulders	band-geometry	
-src/rainbow_kitty/ribbon.rs	the_after_glow_of_a_fast_line_ends_at_the_rest_plus_the_swoosh	cohort-phase-timeline	
 src/rainbow_kitty/ribbon.rs	the_attach_and_the_seam_law_hold_at_one_slab_per_cell	caret-attach	
 src/rainbow_kitty/ribbon.rs	the_band_stops_at_the_focused_pane_s_floor_not_the_grid_s	body-ceiling-rail-and-pane	
-src/rainbow_kitty/ribbon.rs	the_bed_s_dark_stops_arrive_at_full_chroma_not_walked_grey	bed-ink-even-and-chromatic	
-src/rainbow_kitty/ribbon.rs	the_bed_sits_at_the_bar_not_under_it_on_the_default_dark_theme	bed-legibility-bar	
 src/rainbow_kitty/ribbon.rs	the_block_stands_on_whole_light_after_a_jump_and_the_keys_that_follow_it	caret-attach	
 src/rainbow_kitty/ribbon.rs	the_block_stays_on_the_band_while_the_cell_under_it_leaves_and_when_it_is_gone	caret-attach	
 src/rainbow_kitty/ribbon.rs	the_body_never_brightens_after_the_last_keystroke	swoosh-monotone-retract	
 src/rainbow_kitty/ribbon.rs	the_caret_block_stands_on_the_band_under_a_cold_hand_and_a_hot_one	caret-attach	
-src/rainbow_kitty/ribbon.rs	the_comet_is_fattest_at_the_hand_and_thins_behind_it	band-geometry	
-src/rainbow_kitty/ribbon.rs	the_crossing_composites_no_greyer_than_its_flanks	bed-ink-even-and-chromatic	
-src/rainbow_kitty/ribbon.rs	the_crossing_is_smoothed_out_of_its_own_legs_cells_and_nothing_else_moves	walk-pace-perceptual	
-src/rainbow_kitty/ribbon.rs	the_curtain_is_legible_under_the_app_s_first_frames_on_every_frame_it_falls	curtain-law	
-src/rainbow_kitty/ribbon.rs	the_dimmest_stop_of_the_bed_composites_at_a_max_channel_of_about_80_under_the_bar	bed-luma-budget-def	
-src/rainbow_kitty/ribbon.rs	the_ember_never_takes_a_stop_under_the_census_on_any_shipped_ground	ember-seen-floor	
 src/rainbow_kitty/ribbon.rs	the_exit_swoosh_retracts_toward_the_caret_and_reaches_exactly_zero	swoosh-monotone-retract	
 src/rainbow_kitty/ribbon.rs	the_feather_grows_in_as_a_drained_neighbour_goes_never_in_one_frame	seam-heal-no-slivers	
 src/rainbow_kitty/ribbon.rs	the_field_index_answers_what_a_newest_first_scan_would	field-index-is-newest-scan	
 src/rainbow_kitty/ribbon.rs	the_flat_spelling_draws_no_rail	light-theme-and-spellings	
 src/rainbow_kitty/ribbon.rs	the_focus_ember_never_opens_a_dark_run_inside_the_band	focus-ember	
-src/rainbow_kitty/ribbon.rs	the_ground_never_lifts_the_bed_over_the_bar	bed-luma-budget-def	
 src/rainbow_kitty/ribbon.rs	the_hand_arriving_back_through_a_shell_fold_takes_the_row_back_after_the_rest_and_alone	fold-flow	
 src/rainbow_kitty/ribbon.rs	the_hot_edge_embers_out_with_its_body_on_focus_loss	hot-edge-emission	
-src/rainbow_kitty/ribbon.rs	the_hot_edge_is_the_stop_under_it_lifted_hot_and_brighter_than_the_bed	hot-edge-emission	
 src/rainbow_kitty/ribbon.rs	the_hot_edge_lives_only_at_the_head_on_a_dark_ground	hot-edge-emission	
-src/rainbow_kitty/ribbon.rs	the_new_line_s_gate_takes_a_late_key_off_the_row_the_hand_left_and_never_on_it	fresh-line-takes	
-src/rainbow_kitty/ribbon.rs	the_rail_ink_table	rail-ink-band	
-src/rainbow_kitty/ribbon.rs	the_rail_is_yellow_below_the_row_bottom_and_the_glyph_box_stays_at_the_bar	body-ceiling-rail-and-pane	
-src/rainbow_kitty/ribbon.rs	the_reach_extends_its_own_cohort_and_continues_its_own_walk	walk-same-row-origin	
 src/rainbow_kitty/ribbon.rs	the_reach_stops_at_the_hand_s_own_first_column	reach-hand-floor	
-src/rainbow_kitty/ribbon.rs	the_retract_drains_the_tail_before_the_head	swoosh-monotone-retract	
-src/rainbow_kitty/ribbon.rs	the_ribbon_publishes_the_band_stardust_must_stay_out_of	band-geometry	
-src/rainbow_kitty/ribbon.rs	the_row_the_hand_folded_off_drifts_into_the_fold_and_fades_as_one_band	fold-flow	
-src/rainbow_kitty/ribbon.rs	the_row_the_hand_left_rides_a_scroll_and_a_band_move_with_its_text	ribbon-translate	
-src/rainbow_kitty/ribbon.rs	the_seam_marks_a_continued_line_s_tail_and_spends_with_the_row_above	seam-hairline	
-src/rainbow_kitty/ribbon.rs	the_surge_stretches_the_edge_on_a_change_of_speed	hot-edge-emission	
-src/rainbow_kitty/ribbon.rs	the_swoosh_stops_at_the_caret_block_s_left_edge	swoosh-monotone-retract	
-src/rainbow_kitty/ribbon.rs	the_visibility_floor_costs_the_bar_nothing_on_nord	bed-ink-even-and-chromatic	
 src/rainbow_kitty/ribbon.rs	the_walk_is_a_function_of_position_so_a_retyped_cell_takes_back_its_stop	cohort-walk-invariant	
-src/rainbow_kitty/ribbon.rs	the_walk_lays_a_sixteenth_per_cell_for_sixteen_cells_then_a_thirty_sixth	walk-t-def	
-src/rainbow_kitty/ribbon.rs	the_walk_s_distance_travels_along_one_input_and_restarts_at_a_new_line	cohort-walk-invariant	
 src/rainbow_kitty/ribbon.rs	the_walk_s_pace_is_the_arc_s_own_perceptual_step	walk-pace-perceptual	
-src/rainbow_kitty/ribbon.rs	the_warm_stops_go_out_at_several_times_the_coverage_the_cool_ones_do	ember-seen-floor	
 src/rainbow_kitty/ribbon.rs	the_wave_breathes_a_tenth_of_a_cell_at_full_momentum_inside_the_body_s_own_rows	band-geometry	
 src/rainbow_kitty/ribbon.rs	under_reduced_motion_a_flowing_band_asks_for_no_wake_before_its_fade	fold-flow	
 src/rainbow_kitty/ribbon.rs	under_reduced_motion_the_exit_swoosh_moves_nothing_and_only_fades	swoosh-monotone-retract	
 src/rainbow_kitty/spine.rs	a_backspace_leaves_a_mark_that_counts_the_run_and_a_typed_key_closes_it	spine-erase-mark	
 src/rainbow_kitty/spine.rs	a_big_rise_slams_faster_than_it_attacks_and_the_slam_is_latched	spine-follower-step	
-src/rainbow_kitty/spine.rs	a_cold_hand_reaches_half_momentum_display_a_key_earlier_with_the_gain	spine-gain-target	
 src/rainbow_kitty/spine.rs	a_held_key_cannot_farm_the_combo	spine-flow-counter	
 src/rainbow_kitty/spine.rs	deletes_drain_and_never_build	spine-deletes-never-build	
 src/rainbow_kitty/spine.rs	idle_drains_to_exactly_zero	spine-idle-snaps-to-exact-zero	
 src/rainbow_kitty/spine.rs	resume_floors_births_without_touching_the_honest_spine	spine-birth-price	
 src/rainbow_kitty/spine.rs	the_first_key_after_a_long_green_run_is_born_hot	spine-birth-price	
-src/rainbow_kitty/spine.rs	the_follower_attacks_fast_and_releases_slow	spine-follower-step	
-src/rainbow_kitty/spine.rs	the_follower_constants_are_the_published_three	spine-follower-step	
 src/rainbow_kitty/spine.rs	the_follower_is_frame_rate_independent	spine-follower-rate-independence	
 src/rainbow_kitty/spine.rs	the_follower_settles_on_the_gained_metric_and_reports_the_raw_one	spine-gain-target	
 src/rainbow_kitty/spine.rs	the_phase_clock_rides_the_spine_and_stays_on_its_ring	spine-ranges-and-phase-ring	
 src/rainbow_kitty/stardust.rs	a_band_move_moves_stars_in_the_band_and_clears_the_probe	sd-translate	
 src/rainbow_kitty/stardust.rs	a_cell_less_geometry_falls_back_to_one_chain	sd-sky-index-equivalence	
-src/rainbow_kitty/stardust.rs	a_fan_reaches_its_reach_and_a_mini_fan_hops_one_or_two_pixels	sd-throw-kinematics	
 src/rainbow_kitty/stardust.rs	a_fan_star_is_born_at_full_and_clears_its_cell_inside_its_hold	sd-throw-kinematics	
 src/rainbow_kitty/stardust.rs	a_field_star_is_pinned_and_finishes_with_its_cell	sd-envelopes	
 src/rainbow_kitty/stardust.rs	a_field_star_rides_its_cell_s_envelope_not_the_grain_s_life	sd-envelopes	
 src/rainbow_kitty/stardust.rs	a_gold_star_walks_from_the_deal_through_the_paw_to_the_catch	sd-catch-point-update	
 src/rainbow_kitty/stardust.rs	a_grain_opens_and_closes_at_least_twice_in_its_life	sd-scintillation	
-src/rainbow_kitty/stardust.rs	a_grain_s_share_is_honoured_push_by_push_core_first	sd-frame-budgets	
-src/rainbow_kitty/stardust.rs	a_halo_is_culled_below_the_chroma_floor	sd-chroma-fixed	
-src/rainbow_kitty/stardust.rs	a_hot_hand_deals_every_cell_a_field_star	sd-deal-rules	
-src/rainbow_kitty/stardust.rs	a_kill_throws_one_star_per_three_cells_capped_at_eight	sd-populations	
 src/rainbow_kitty/stardust.rs	a_lay_too_wide_to_file_spills_the_index_and_still_answers	sd-sky-index-equivalence	
 src/rainbow_kitty/stardust.rs	a_light_rule_over_the_typing_row_keeps_the_sky_alive	sd-birth-gate	
 src/rainbow_kitty/stardust.rs	a_mend_s_star_is_born_where_the_typo_was_and_dragged_to_the_fix	sd-mend-pull	
@@ -2661,28 +2186,19 @@ src/rainbow_kitty/stardust.rs	a_paid_hero_cues_one_glint_at_its_own_column	sd-gl
 src/rainbow_kitty/stardust.rs	a_row_zero_hero_clipped_off_the_glass_spends_nothing	sd-glint-bucket	
 src/rainbow_kitty/stardust.rs	a_scroll_moves_the_sky_and_forgets_the_probe	sd-translate	
 src/rainbow_kitty/stardust.rs	a_sky_star_keeps_its_centre_when_the_probe_forgets_its_row	sd-probe-pricing	
-src/rainbow_kitty/stardust.rs	a_star_is_a_peak_not_a_blob	sd-paint-recipes	
-src/rainbow_kitty/stardust.rs	a_star_is_born_at_full_and_scintillates_once_its_hold_is_spent	sd-scintillation	
-src/rainbow_kitty/stardust.rs	a_star_is_priced_over_the_veils_and_halos_already_under_it	sd-caret-light-ceiling	
 src/rainbow_kitty/stardust.rs	a_thrown_core_is_cleared_where_it_rests_nudged_walked_back_or_dropped	sd-settle	
 src/rainbow_kitty/stardust.rs	a_transient_over_ink_or_unknown_is_held_to_a_third	sd-probe-pricing	
 src/rainbow_kitty/stardust.rs	an_earned_hero_is_never_demoted_by_spacing_but_a_dealt_one_is	sd-deal-rules	
-src/rainbow_kitty/stardust.rs	an_erase_throw_reaches_its_reach_by_eighty_ms_then_pins	sd-throw-kinematics	
 src/rainbow_kitty/stardust.rs	an_exhaust_grain_rests_by_the_probe_and_not_by_its_home_cell	sd-settle	
 src/rainbow_kitty/stardust.rs	an_idle_sky_draws_exactly_nothing	sd-envelopes	
-src/rainbow_kitty/stardust.rs	an_m2_arm_never_collapses_to_the_grain	sd-scintillation	
 src/rainbow_kitty/stardust.rs	an_open_theme_holds_the_sky_open_through_a_dip	sd-deal-rules	
 src/rainbow_kitty/stardust.rs	an_over_budget_frame_keeps_every_star_s_core	sd-frame-budgets	
 src/rainbow_kitty/stardust.rs	band_moves_follow_the_earning_glyph_at_sky_and_footer_edges	sd-translate	
 src/rainbow_kitty/stardust.rs	cell_ink_classifies_the_light_horizontal_rules_and_nothing_else	sd-glyph-probe	
 src/rainbow_kitty/stardust.rs	every_v2_mark_forks_to_source_over_on_light	sd-paint-recipes	
-src/rainbow_kitty/stardust.rs	field_stars_dim_with_the_ribbon_they_were_born_over	sd-envelopes	
 src/rainbow_kitty/stardust.rs	focus_loss_embers_the_sky_instead_of_popping_it	sd-envelopes	
-src/rainbow_kitty/stardust.rs	gold_is_dealt_not_inferred_from_yellow	sd-scintillation	
 src/rainbow_kitty/stardust.rs	halos_are_budgeted_per_star_not_per_split	sd-frame-budgets	
 src/rainbow_kitty/stardust.rs	hero_births_and_glints_share_one_budget	sd-glint-bucket	
-src/rainbow_kitty/stardust.rs	heroes_are_earned_deterministically	sd-deal-rules	
-src/rainbow_kitty/stardust.rs	light_thins_every_thrown_population_but_never_a_law_fixed_slot	sd-populations	
 src/rainbow_kitty/stardust.rs	no_mark_crosses_ink_or_the_pane_edge_at_any_instant_under_either_band_anchor	sd-flight-stays-clear	
 src/rainbow_kitty/stardust.rs	no_star_core_is_ever_born_over_a_probed_glyph	sd-birth-gate	
 src/rainbow_kitty/stardust.rs	no_star_outshines_the_caret_s_floor_share_on_the_shipped_ground	sd-caret-light-ceiling	
@@ -2690,124 +2206,57 @@ src/rainbow_kitty/stardust.rs	no_two_sky_stars_share_a_pixel	sd-deal-rules
 src/rainbow_kitty/stardust.rs	one_sky_star_per_cell_and_no_pile_outshines_the_caret	sd-deal-rules	
 src/rainbow_kitty/stardust.rs	reduced_motion_freezes_both_clocks_and_takes_the_linear_fade	sd-scintillation	
 src/rainbow_kitty/stardust.rs	sky_ownership_survives_uniform_scroll_before_a_band_move	sd-translate	
-src/rainbow_kitty/stardust.rs	stars_born_at_speed_stream_backwards_at_the_hand_s_own_cadence	sd-throw-kinematics	
-src/rainbow_kitty/stardust.rs	stars_fade_by_alpha_at_a_snapped_stop	sd-chroma-fixed	
 src/rainbow_kitty/stardust.rs	stars_over_the_cap_finish_oldest_first_within_forty_ms	sd-pool-cap	
 src/rainbow_kitty/stardust.rs	the_aurora_leaves_with_the_ribbon	sd-aurora	
 src/rainbow_kitty/stardust.rs	the_aurora_rises_with_momentum_and_never_enters_a_glyph_row	sd-aurora	
 src/rainbow_kitty/stardust.rs	the_blank_frontiers_early_stop_is_the_whole_walks_answer	sd-headroom-and-frontier	
-src/rainbow_kitty/stardust.rs	the_bucket_keeps_chiming_as_it_refills	sd-glint-bucket	
-src/rainbow_kitty/stardust.rs	the_caret_law_spends_colour_first_and_white_last_on_a_star_s_centre	sd-caret-light-ceiling	
 src/rainbow_kitty/stardust.rs	the_closer_dims_a_star_by_one_factor_until_its_arms_fit_and_leaves_one_that_fits	sd-caret-light-ceiling	
 src/rainbow_kitty/stardust.rs	the_combo_ladder_pays_at_sixteen_thirty_two_and_sixty_four	sd-deal-rules	
 src/rainbow_kitty/stardust.rs	the_exhaust_costs_the_frame_train_its_own_window_and_no_more	sd-brisk-cadence	
 src/rainbow_kitty/stardust.rs	the_exhaust_flies_along_a_rule_row_in_the_sky_zone_under_the_stroke	sd-flight-stays-clear	
 src/rainbow_kitty/stardust.rs	the_exhaust_floors_its_spine_on_the_mend_s	sd-exhaust	
-src/rainbow_kitty/stardust.rs	the_exhaust_is_born_in_the_caret_s_sky_and_thrown_back_on_the_hand_s_wind	sd-exhaust	
-src/rainbow_kitty/stardust.rs	the_exhaust_is_not_born_on_the_caret_cell_s_own_glyph	sd-exhaust	
 src/rainbow_kitty/stardust.rs	the_exhaust_needs_a_blank_cell_behind_the_caret	sd-exhaust	
 src/rainbow_kitty/stardust.rs	the_exhaust_never_chimes_skips_a_space_and_deals_its_m2_only_at_a_hot_spine	sd-exhaust	
-src/rainbow_kitty/stardust.rs	the_fan_wears_the_band_s_stop_at_each_star_s_own_column	sd-populations	
-src/rainbow_kitty/stardust.rs	the_field_is_dark_before_the_retract_moves	sd-envelopes	
 src/rainbow_kitty/stardust.rs	the_frame_that_echoes_the_key_already_shows_its_field_star	sd-envelopes	
 src/rainbow_kitty/stardust.rs	the_glint_toggle_is_solved_not_polled	sd-solved-deadlines	
-src/rainbow_kitty/stardust.rs	the_grain_and_the_m2_wear_their_tint_to_the_core_and_the_hero_stays_white_hot	sd-paint-recipes	
 src/rainbow_kitty/stardust.rs	the_headroom_under_a_rule_reads_every_column_the_flight_crosses	sd-headroom-and-frontier	
-src/rainbow_kitty/stardust.rs	the_indexed_ground_is_the_scan_s_on_every_pixel_of_a_real_frame	sd-sky-index-equivalence	
-src/rainbow_kitty/stardust.rs	the_meteor_lanes_sow_their_published_class_census	sd-populations	
 src/rainbow_kitty/stardust.rs	the_pixel_probe_answers_ink_only_inside_a_rules_stroke_band	sd-glyph-probe	
 src/rainbow_kitty/stardust.rs	the_population_cap_never_refuses_a_newborn	sd-pool-cap	
 src/rainbow_kitty/stardust.rs	the_second_grain_is_priced_on_the_honest_spine	sd-deal-rules	
 src/rainbow_kitty/stardust.rs	the_size_clocks_next_step_is_solved_not_polled	sd-solved-deadlines	
-src/rainbow_kitty/stardust.rs	the_sky_at_two_x_is_the_sky_at_one_x_twice_the_size	sd-optical-size	
 src/rainbow_kitty/stardust.rs	the_sky_is_at_rest_one_star_life_after_the_last_key	sd-throw-kinematics	
 src/rainbow_kitty/stardust.rs	the_slot_hash_is_injective_over_every_box_the_cap_allows	sd-sky-index-equivalence	
 src/rainbow_kitty/stardust.rs	the_stream_step_is_solved_not_polled	sd-solved-deadlines	
 src/rainbow_kitty/stardust.rs	the_stroke_band_is_one_set_of_pixels_for_the_probe_the_zones_and_the_headroom	sd-glyph-probe	
-src/rainbow_kitty/stardust.rs	two_backspaces_at_one_cell_throw_different_debris	sd-deal-rules	
-src/rainbow_kitty/stardust.rs	warm_and_cool_neighbours_never_blink_together	sd-scintillation	
-src/rainbow_kitty/timing.rs	flight_ms_is_shared_and_clamped	flight-clock	
-src/rainbow_kitty/timing.rs	impact_is_monotone_floored_and_capped	impact-curve	
-src/rainbow_kitty/timing.rs	rain_spacing_rides_the_flight_clock	shed-and-rain-counts	
-src/rainbow_kitty/timing.rs	shed_and_fan_counts_are_clamped	shed-and-rain-counts	
-src/rainbow_kitty/timing.rs	the_phrase_rest_is_the_floor_at_speed_and_the_tempo_multiple_below_it	phrase-rest-and-tempo	
 src/rainbow_kitty/timing.rs	the_seven_curves_hit_their_endpoints	named-easing-curves	
 src/rainbow_kitty/witness.rs	a_band_move_carries_the_records_inside_it_drops_what_leaves_and_keeps_the_list_sorted	wit-evidence-carriage	
 src/rainbow_kitty/witness.rs	a_band_move_that_opens_a_row_beside_a_line_leaves_it_unseen_until_a_frame_shows_it	wit-evidence-carriage	
-src/rainbow_kitty/witness.rs	a_blank_in_a_word_goes_with_its_run_and_stays_with_it_on_a_redraw	wit-walk-blanks	
-src/rainbow_kitty/witness.rs	a_blanked_tail_of_a_standing_run_is_released_though_its_glyphs_stand_elsewhere	wit-walk-run-clock	
-src/rainbow_kitty/witness.rs	a_block_already_standing_beside_the_run_when_it_was_armed_is_not_followed	wit-follow-runs	
 src/rainbow_kitty/witness.rs	a_carried_record_starts_over_on_its_new_row_as_if_just_armed	wit-evidence-carriage	
 src/rainbow_kitty/witness.rs	a_copy_that_appears_beside_a_standing_line_is_a_twin_once_it_has_stood_forty_ms	wit-evidence	
 src/rainbow_kitty/witness.rs	a_different_glyph_retires_and_a_relaid_cell_arms_afresh	wit-walk-cell-verdict	
-src/rainbow_kitty/witness.rs	a_glyph_landing_on_a_blank_between_standing_words_stays_out_of_its_run_s_melt	wit-walk-blanks	
 src/rainbow_kitty/witness.rs	a_glyph_landing_on_a_blank_with_the_rewrite_that_took_its_run_goes_with_the_run	wit-walk-blanks	
-src/rainbow_kitty/witness.rs	a_glyph_landing_on_a_released_run_s_blank_goes_with_the_run	wit-walk-blanks	
-src/rainbow_kitty/witness.rs	a_key_typed_among_repeated_letters_inserts_at_the_caret	wit-shift-runs	
-src/rainbow_kitty/witness.rs	a_never_armed_cell_past_a_cleared_suffix_goes_with_it	wit-walk-blanks	
-src/rainbow_kitty/witness.rs	a_one_glyph_tail_moves_only_under_the_caret	wit-shift-runs	
 src/rainbow_kitty/witness.rs	a_partial_release_of_one_glyph_leaves_the_run_s_spaces_standing	wit-released-lifecycle	
 src/rainbow_kitty/witness.rs	a_partial_release_takes_no_space_from_between_standing_letters	wit-walk-blanks	
-src/rainbow_kitty/witness.rs	a_record_armed_after_the_release_whose_glyph_changed_is_neutral_to_the_restore	wit-released-lifecycle	
 src/rainbow_kitty/witness.rs	a_record_the_shape_pass_caught_up_is_armed_again	wit-evidence	
 src/rainbow_kitty/witness.rs	a_released_record_is_kept_so_a_glyph_landing_under_it_later_melts_fast_and_counts_once	wit-released-lifecycle	
 src/rainbow_kitty/witness.rs	a_released_run_s_never_armed_cell_is_held_with_it_and_a_glyph_on_it_melts_the_run	wit-released-lifecycle	
-src/rainbow_kitty/witness.rs	a_released_tail_of_a_standing_run_takes_only_its_own_spaces	wit-walk-blanks	
-src/rainbow_kitty/witness.rs	a_replaced_glyph_or_a_moved_run_melts_fast_and_only_a_vanished_run_is_released	wit-walk-run-clock	
-src/rainbow_kitty/witness.rs	a_rewrite_or_a_clear_is_never_read_as_an_insert	wit-shift-runs	
 src/rainbow_kitty/witness.rs	a_row_a_scroll_brings_in_dates_its_copy_from_the_last_frame_before_the_scroll	wit-evidence-carriage	
 src/rainbow_kitty/witness.rs	a_run_beside_a_withheld_row_waits_one_walk	wit-withheld-deferral	
-src/rainbow_kitty/witness.rs	a_run_re_laid_elsewhere_on_its_own_row_moved_and_melts_fast	wit-walk-run-clock	
-src/rainbow_kitty/witness.rs	a_run_under_a_near_copy_of_itself_follows_on_the_letters_that_arrived	wit-follow-runs	
-src/rainbow_kitty/witness.rs	a_run_whose_text_arrived_but_not_as_one_block_is_counted_missed	wit-follow-runs	
-src/rainbow_kitty/witness.rs	a_scroll_keeps_the_evidence_and_a_band_move_keeps_what_moved_with_the_record	wit-evidence-carriage	
 src/rainbow_kitty/witness.rs	a_shift_onto_its_own_left_behind_tail_leaves_one_record_per_key	wit-evidence-carriage	
 src/rainbow_kitty/witness.rs	a_short_park_cannot_relax_an_unrelated_run	wit-follow-runs	
 src/rainbow_kitty/witness.rs	a_stale_cell_under_a_fresh_one_is_named_by_its_own_birth_and_the_fresh_one_never	wit-walk-cell-verdict	
-src/rainbow_kitty/witness.rs	a_twin_inside_an_arrived_block_is_neutral_not_a_hole	wit-follow-runs	
-src/rainbow_kitty/witness.rs	a_twin_inside_the_block_is_neutral_and_the_block_follows	wit-follow-runs	
 src/rainbow_kitty/witness.rs	a_twin_testifies_only_about_its_own_row	wit-follow-runs	
-src/rainbow_kitty/witness.rs	a_twin_whose_glyph_is_not_at_the_target_is_a_hole	wit-follow-runs	
-src/rainbow_kitty/witness.rs	a_unit_is_the_lead_glyph_for_either_half_of_a_wide_one	wit-unit-at	
 src/rainbow_kitty/witness.rs	a_wide_glyph_s_two_cells_are_retired_as_one_unit	wit-walk-cell-verdict	
 src/rainbow_kitty/witness.rs	a_word_the_wrap_relaid_at_its_row_s_start_does_not_count_against_the_line	wit-follow-runs	
-src/rainbow_kitty/witness.rs	an_edge_twin_rides_with_its_block_whether_or_not_its_own_glyph_is_gone	wit-follow-runs	
 src/rainbow_kitty/witness.rs	an_insert_names_the_tail_it_pushed_with_its_width	wit-shift-runs	
-src/rainbow_kitty/witness.rs	an_insert_whose_tail_left_the_row_moves_what_stayed	wit-shift-runs	
-src/rainbow_kitty/witness.rs	an_unsampled_neighbour_is_no_evidence_either_way	wit-evidence	
 src/rainbow_kitty/witness.rs	an_unsampled_row_keeps_its_records_and_a_dropped_cell_is_forgotten	wit-walk-cell-verdict	
 src/rainbow_kitty/witness.rs	blank_to_glyph_only_arms_and_glyph_to_blank_releases	wit-walk-cell-verdict	
-src/rainbow_kitty/witness.rs	one_blanked_glyph_found_elsewhere_is_released_not_moved	wit-walk-run-clock	
-src/rainbow_kitty/witness.rs	one_blanked_wide_glyph_found_elsewhere_is_released_not_moved	wit-walk-run-clock	
 src/rainbow_kitty/witness.rs	shifted_records_find_their_glyphs_on_the_next_walk	wit-shift-runs	
 src/rainbow_kitty/witness.rs	standing_run_index_matches_the_retirement_oracle	wit-standing-run-index	
 src/rainbow_kitty/witness.rs	the_deferral_s_scratch_is_reserved_and_never_grows	wit-withheld-deferral	
-src/rainbow_kitty/witness.rs	the_evidence_is_what_each_follow_row_was_seen_holding	wit-evidence	
-src/rainbow_kitty/witness.rs	the_follow_pass_names_only_a_block_never_letters_around_a_hole	wit-follow-runs	
 src/rainbow_kitty/witness.rs	the_last_walk_s_blanks_ride_with_their_cells	wit-evidence-carriage	
 src/rainbow_kitty/witness.rs	the_witness_is_bounded_and_allocates_nothing_past_its_cap	wit-record-list-invariant	
-src/robi.rs	a_caret_parked_under_a_resting_robi_displaces_him_purely	robi-caret-avoidance	
-src/robi.rs	a_resident_never_disappears	robi-schedule	
-src/robi.rs	a_window_too_small_to_hold_him_hides_him	robi-window-clamp	
-src/robi.rs	art_rows_scales_with_the_window_and_always_fits_the_atlas_slot	robi-sizing-law	
-src/robi.rs	body_px_is_the_emitters_body_law	robi-sizing-law	
-src/robi.rs	deterministic_and_tips_rotate	robi-schedule	
-src/robi.rs	every_scene_stays_inside_a_shallow_window	robi-window-clamp	
-src/robi.rs	idle_is_static_and_costs_no_wakes	robi-schedule	
-src/robi.rs	ladder_retracts_behind_him	robi-schedule	
-src/robi.rs	stationary_scenes_stay_out_of_the_typists_column	robi-caret-avoidance	
-src/robi.rs	stays_inside_the_grid	robi-window-clamp	
-src/robi.rs	the_ladder_stays_planted_even_with_the_caret_beneath_it	robi-caret-avoidance	
-src/robi.rs	the_rounds_hit_every_beat	robi-schedule	
-src/robi.rs	tip_bank_is_wide_and_on_topic	robi-tip-bank	
-src/robi_baker.rs	budgets_hold	exact-tile-baker-lru	
-src/robi_baker.rs	host_ids_are_stable_distinct_and_namespaced	robi-host-id-namespace	
-src/robi_baker.rs	roster_covers_the_whole_show	robi-roster-table	
-src/robi_baker.rs	same_key_bakes_byte_identical_tiles	robi-bake-deterministic	
-src/robi_baker.rs	tiles_are_exact_size_and_the_pose_axis_is_wired	robi-bake-deterministic	
 src/sound_policy.rs	bonk_gain_policy_gates_master_focus_knob_motion_and_volume	sound-gain-laws	
-src/sound_policy.rs	the_riff_stays_subordinate_to_focus_master_and_volume	sound-gain-laws	
-src/sound_policy.rs	the_riff_switch_alone_silences_the_song_under_shipped_defaults	sound-gain-laws	
 src/spec.rs	checked_in_toy_pack_compiles_through_real_dispatch_and_scanner	toy-pack-denotation	
 src/spec.rs	consumer_capabilities_name_only_actual_shared_tuning_consumers	spec-consumer-capabilities	
 src/spec.rs	custom_fragment_parses_and_keys_all_hash_variants	custom-spec-table-keys	
@@ -2825,7 +2274,6 @@ src/spec.rs	toy_pack_source_cap_precedes_toml_parse	toy-pack-source-cap
 src/spec.rs	unscannable_custom_words_warn_on_the_conflicts_channel	custom-spec-table-keys	
 src/spectrum.rs	a_colour_at_or_over_the_floor_and_every_grey_is_returned_bit_for_bit	spectrum-min-saturation	
 src/spectrum.rs	spectrum_endpoints_are_the_named_red_and_violet	spectrum-read-and-snap	
-src/spectrum.rs	spectrum_has_no_deep_interior_luminance_dip	spectrum-lut-table-properties	
 src/spectrum.rs	spectrum_hue_climbs_from_red_to_violet_without_reversing	spectrum-lut-table-properties	
 src/spectrum.rs	spectrum_lut_has_bounded_adjacent_steps	spectrum-lut-table-properties	
 src/spectrum.rs	spectrum_lut_is_byte_reproducible_from_its_generator	spectrum-lut-is-generated	
@@ -2833,7 +2281,6 @@ src/spectrum.rs	spectrum_reproduces_its_anchors_exactly	spectrum-lut-table-prope
 src/spectrum.rs	spectrum_snap_resolves_to_one_of_the_seven_names	spectrum-read-and-snap	
 src/spectrum.rs	spectrum_stays_saturated_across_the_whole_arc	spectrum-lut-table-properties	
 src/spectrum.rs	the_floor_is_reached_with_hue_and_value_untouched	spectrum-min-saturation	
-src/spectrum.rs	the_floor_is_the_identity_on_every_entry_of_the_shipped_arc	spectrum-lut-table-properties	
 src/supernova.rs	combo_baseline_is_byte_identical	supernova-tier-ladder	
 src/supernova.rs	combo_ladder_climbs_to_guaranteed_nuke	supernova-tier-ladder	
 src/supernova.rs	detonation_has_a_hard_aggregate_readability_ceiling	emit-super-quads	
@@ -2846,46 +2293,24 @@ src/supernova.rs	r_max_for_matches_engine_clamp	supernova-reach
 src/supernova.rs	shade_peak_probe_is_bit_identical_to_quadratic_reference	shade-peak-exact	
 src/supernova.rs	super_budget_s_max_bound	emit-super-quads	
 src/supernova.rs	super_deco_stream_bounded	emit-super-decos	
-src/supernova.rs	tier_split_is_the_designed_distribution	supernova-tier-ladder	
-src/supernova.rs	tier_windows_are_ordered	supernova-tier-ladder	
 src/supernova.rs	wash_window_centers_on_blast_row	emit-super-quads	
 src/tone.rs	classify_opt_reports_abstention_as_none	tone-scores-abstain-classify	
 src/tone.rs	corrupted_assets_are_refused	tone-asset-decoder-fail-closed	
 src/tone.rs	encode_decode_round_trips_the_quantized_lattice	tone-encode-decode-round-trip	
 src/tone.rs	featurization_is_script_agnostic_and_folded	tone-ngram-featurization	
-src/tone.rs	inference_is_deterministic	tone-scores-abstain-classify	
 src/tone.rs	shipped_weights_load_and_verify	tone-shipped-asset-valid	
-src/tone.rs	thin_evidence_abstains_to_neutral	tone-scores-abstain-classify	
 src/tone_infer.rs	backspace_pops_and_window_stays_bounded	tone-tracker-model	
 src/tone_infer.rs	breaks_while_inactive_keep_the_window_coherent	tone-tracker-model	
 src/tone_infer.rs	effective_is_neutral_with_the_knob_off_even_with_a_cached_verdict	tone-tracker-model	
 src/tone_infer.rs	inference_is_throttled_by_keystrokes	tone-tracker-model	
 src/tone_infer.rs	interval_reopens_inference	tone-tracker-model	
-src/tone_infer.rs	introspection_counters_track_the_window_and_the_classifier	tone-tracker-model	
 src/tone_infer.rs	session_switch_clears_window_but_keeps_mood	tone-tracker-model	
-src/tone_infer.rs	starts_neutral	tone-tracker-model	
 src/tone_infer.rs	the_key_path_marks_inference_due_and_only_the_drain_runs_it	tone-tracker-model	
 src/tone_infer.rs	thin_window_after_a_classified_line_keeps_the_mood	tone-tracker-model	
-src/tone_infer.rs	typed_mood_moves_the_cached_tone	tone-tracker-model	
-src/trail_pack.rs	bad_hex_color_is_rejected	trail-pack-validation	
-src/trail_pack.rs	byte_cap_precedes_toml_parse	trail-pack-source-cap	
-src/trail_pack.rs	cross_kind_fields_are_forbidden	trail-pack-validation	
-src/trail_pack.rs	every_checked_in_example_pack_compiles	shipped-packs-compile	
-src/trail_pack.rs	layer_and_pop_counts_are_bounded	trail-pack-validation	
-src/trail_pack.rs	minimal_pack_inherits_defaults	trail-pack-params	
-src/trail_pack.rs	out_of_range_scalars_are_clamped_and_collected_in_one_pass	trail-pack-validation	
-src/trail_pack.rs	synthwave_resolves_to_expected_params	shipped-packs-compile	
-src/trail_pack.rs	unknown_enum_strings_are_rejected	trail-pack-validation	
-src/trail_pack.rs	unknown_field_is_rejected	trail-pack-validation	
-src/trail_pack.rs	unsupported_schema_version_is_rejected	trail-pack-validation	
-src/trail_pack.rs	wrong_length_velocity_or_life_pair_is_rejected	trail-pack-validation	
-src/trail_sound.rs	a_capital_is_louder_at_every_degree_of_the_walk	v1-capital-lift	
 src/trail_sound.rs	a_deletion_does_not_advance_the_song	song-frame-conditions	
 src/trail_sound.rs	a_drained_cue_batch_speaks_once_however_deep_the_backlog	v1-admission	
-src/trail_sound.rs	a_ghost_is_quieter_and_shorter_than_the_accent_it_follows	advance-song	
 src/trail_sound.rs	a_held_delete_run_shimmers_once_on_release	erase-poof-anatomy	
 src/trail_sound.rs	a_held_spacebar_cannot_machine_gun_the_indent_steps	v1-space-downbeat	
-src/trail_sound.rs	a_per_character_gesture_rises_within_sixteen_milliseconds	first-buffer-onset	
 src/trail_sound.rs	a_rest_before_a_phrase_starts_cannot_skip_it	theme-playhead	
 src/trail_sound.rs	a_rest_cadences_the_phrase_and_opens_the_next	theme-playhead	
 src/trail_sound.rs	a_shifted_glyph_lands_an_octave_over_its_plain_self	v1-capital-lift	
@@ -2899,109 +2324,60 @@ src/trail_sound.rs	bed_off_events_never_energise_the_bed_and_the_setting_reenabl
 src/trail_sound.rs	bonk_bypasses_min_gap_thinning_like_jump	v1-admission	
 src/trail_sound.rs	bonk_ducks_the_melody_around_it	duck-envelopes	
 src/trail_sound.rs	bonk_is_discordant_against_the_walk_and_moves_nothing	bonk-design	
-src/trail_sound.rs	bonk_path_ignores_tone	tone-feel-and-bonk-exemption	
-src/trail_sound.rs	brrrring_of_rapid_line_feeds_is_pinned	v1-refines-v056	
 src/trail_sound.rs	celebration_bar_fits_the_polyphony_budget	output-bounded-finite	
 src/trail_sound.rs	celebration_bass_always_has_a_carrier	celebration-tables	
 src/trail_sound.rs	celebration_bypasses_min_gap_thinning	v1-admission	
 src/trail_sound.rs	celebration_ducks_the_melody_and_hands_back	duck-envelopes	
 src/trail_sound.rs	celebration_form_is_wrap_safe	celebration-tables	
-src/trail_sound.rs	celebration_never_feeds_the_bed	bed-gate	
-src/trail_sound.rs	celebration_phrases_live_on_the_pentatonic_lattice	celebration-tables	
 src/trail_sound.rs	celebration_riff_follows_the_active_tone_lattice	tone-lattice-consonance	
-src/trail_sound.rs	celebration_riff_is_deterministic_given_seed_and_events	synth-deterministic	
-src/trail_sound.rs	chorus_bars_are_byte_identical_across_sigs	celebration-tables	
 src/trail_sound.rs	cross_key_difference	celebration-tables	
-src/trail_sound.rs	cursor_motion_sings_in_the_palettes_register	gesture-family	
-src/trail_sound.rs	deterministic	synth-deterministic	
 src/trail_sound.rs	every_gesture_speaks_in_its_first_post_cue_buffer	first-buffer-onset	
-src/trail_sound.rs	every_palette_erases_with_the_same_poof	erase-poof-anatomy	
 src/trail_sound.rs	every_pitched_voice_lands_on_the_melody_note	gesture-family	
 src/trail_sound.rs	every_tone_recolors_and_still_decays_to_silence	silence-is-exact	
 src/trail_sound.rs	fill_carries_root	celebration-design	
 src/trail_sound.rs	flood_is_ducked	governor-loudness-bound	
-src/trail_sound.rs	glide_plays_one_soft_in_key_tone	gesture-family	
 src/trail_sound.rs	key_switch_damps_the_old_keys_ring	celebration-design	
-src/trail_sound.rs	kill_swoosh_band_is_voice_first	kill-swoosh-band-table	
-src/trail_sound.rs	mech_bed_is_structurally_silent	bed-gate	
-src/trail_sound.rs	melody_is_deterministic_given_events_seed_and_tone	synth-deterministic	
 src/trail_sound.rs	mode_rotation_alone_changes_the_chorus_color	celebration-design	
 src/trail_sound.rs	neutral_signature_is_the_reference_voicing	celebration-tables	
 src/trail_sound.rs	new_voice_beds_are_silent_for_keyboards_and_designed_for_instruments	bed-gate	
 src/trail_sound.rs	nonfinite_event_fields_are_rejected_before_state_mutation	push-input-guard	
-src/trail_sound.rs	one_keystroke_of_heat_lag_is_audible	isolated-loudness-ladder	
 src/trail_sound.rs	output_cues_bypass_but_never_claim_the_human_voice_gap	v1-admission	
-src/trail_sound.rs	palettes_render_within_one_16bit_step_of_v056_reference	v1-refines-v056	
-src/trail_sound.rs	polyphony_is_bounded	polyphony-bounded	
 src/trail_sound.rs	punctuation_and_the_note_after_a_pause_always_sing	advance-song	
 src/trail_sound.rs	rain_glints_are_muted_under_the_sing	duck-envelopes	
-src/trail_sound.rs	same_key_bars_never_damp	celebration-design	
-src/trail_sound.rs	same_key_stability	celebration-design	
 src/trail_sound.rs	shift_is_the_ting_and_never_claims_the_beat	v1-shift-ting	
-src/trail_sound.rs	silent_when_idle	silence-is-exact	
 src/trail_sound.rs	sin_table_stays_below_one_16bit_step	sin01-accuracy	
 src/trail_sound.rs	sky_bed_pitches_stay_on_the_active_lattice_for_every_tone	tone-lattice-consonance	
 src/trail_sound.rs	standalone_voice_is_the_style_palette_verbatim	standalone-voice-alias	
-src/trail_sound.rs	sweep_plays_a_rate_limited_run	gesture-family	
 src/trail_sound.rs	the_bar_is_a_regular_beat_of_consonant_offsets	song-pulse-table	
 src/trail_sound.rs	the_bass_walk_never_returns_inside_four_words	bass-walk	
-src/trail_sound.rs	the_bass_walk_stays_in_the_audible_register	bass-walk	
-src/trail_sound.rs	the_bed_renders_deterministically_and_decays_to_exact_silence	synth-deterministic	
 src/trail_sound.rs	the_block_pre_roll_delays_every_voice_of_the_push_and_nothing_after	block-pre-roll	
-src/trail_sound.rs	the_clap_arrives_at_bar_eight	celebration-design	
 src/trail_sound.rs	the_clouds_puff_survives_the_bell_it_follows	v1-admission	
 src/trail_sound.rs	the_deletion_is_a_poof_and_only_a_poof	erase-poof-anatomy	
-src/trail_sound.rs	the_downbeat_carries_a_fifth_and_breathes_after_a_rest	v1-space-downbeat	
-src/trail_sound.rs	the_erase_is_an_airy_poof_above_the_keystroke	rendered-timbre-bounds	
-src/trail_sound.rs	the_gesture_family_is_one_rule	gesture-family	
 src/trail_sound.rs	the_glyph_class_table_is_one_for_host_bench_and_engine	glyph-class-table	
 src/trail_sound.rs	the_glyph_rank_is_ordered_total_and_lossy	glyph-rank-table	
-src/trail_sound.rs	the_ladder_holds_for_the_key_family	isolated-loudness-ladder	
-src/trail_sound.rs	the_melody_sings_at_a_third_of_typing_speed	advance-song	
-src/trail_sound.rs	the_music_box_ting_stays_under_the_forte_capital_on_every_slot	isolated-loudness-ladder	
 src/trail_sound.rs	the_outro_s_lead_is_do_and_holds_the_sing_duck	celebration-design	
-src/trail_sound.rs	the_puff_is_the_quietest_delete_in_the_ladder	isolated-loudness-ladder	
-src/trail_sound.rs	the_rainbow_kitty_style_is_the_music_box_by_itself	engine-routing	
 src/trail_sound.rs	the_register_fold_is_total_and_never_flattens	fold-register	
 src/trail_sound.rs	the_song_form_partitions_the_theme	theme-form-tables	
-src/trail_sound.rs	the_space_head_is_heard_with_top_on_every_v1_voice	isolated-loudness-ladder	
 src/trail_sound.rs	the_space_is_a_lawful_walking_bass	v1-space-downbeat	
 src/trail_sound.rs	the_theme_is_played_in_order_and_loops	theme-playhead	
 src/trail_sound.rs	the_theme_never_folds_in_any_tone	theme-form-tables	
 src/trail_sound.rs	the_ting_decays_out_instead_of_being_cut	v1-shift-ting	
 src/trail_sound.rs	the_ting_rotates_and_never_drones	v1-shift-ting	
-src/trail_sound.rs	the_ting_stays_under_the_capital_it_announces_on_every_slot	isolated-loudness-ladder	
-src/trail_sound.rs	the_twinkle_is_the_roots_pitch_class_in_one_sparkle_band	v1-space-downbeat	
-src/trail_sound.rs	the_typed_line_moves_more_than_it_repeats	theme-form-tables	
-src/trail_sound.rs	the_typewriter_strike_keeps_its_three_voices	palette-voice-anatomy	
-src/trail_sound.rs	the_word_kill_sits_between_the_poof_and_the_swoosh	isolated-loudness-ladder	
-src/trail_sound.rs	tone_feel_scales_notes_but_never_the_bonk	tone-feel-and-bonk-exemption	
-src/trail_sound.rs	tone_selects_scale_table_and_transpose	tone-lattice-consonance	
 src/trail_sound.rs	tone_tables_are_mutually_consonant_and_exclude_the_bonk_clash	tone-lattice-consonance	
 src/trail_sound.rs	two_word_boundaries_never_stack_one_bass_note	v1-space-downbeat	
 src/trail_sound.rs	typing_transposes_with_the_song_and_returns_when_it_ends	duck-envelopes	
 src/trail_sound.rs	verse_walk_always_moves_and_keeps_rhythm_and_register	celebration-tables	
 src/trail_sound.rs	voice_roster_round_trips	voice-roster-table	
-src/trail_sound.rs	zero_gain_is_inert	push-input-guard	
 src/trail_sound/rainbow_kitty_v2.rs	a_bare_shift_is_a_ting_that_never_steps	mb-ting	
-src/trail_sound/rainbow_kitty_v2.rs	a_capital_is_one_strike_with_a_lifted_degree_and_one_ring	mb-capital-forte	
-src/trail_sound/rainbow_kitty_v2.rs	a_capital_rings_and_out_peaks_its_plain_self_by_its_weight	capital-weight-rendered	
-src/trail_sound/rainbow_kitty_v2.rs	a_deleted_mark_does_not_still_ask	mb-undo	
-src/trail_sound/rainbow_kitty_v2.rs	a_digit_is_a_wood_bar_that_counts_in_the_stardust	mb-class-voices	
 src/trail_sound/rainbow_kitty_v2.rs	a_doubled_letter_is_a_re_strike_wherever_the_line_stands	mb-melodic-bounds	
-src/trail_sound/rainbow_kitty_v2.rs	a_full_stop_rings_and_a_comma_is_a_breath	mb-class-voices	
 src/trail_sound/rainbow_kitty_v2.rs	a_held_backspace_unsings_one_note_per_repeat	mb-undo	
 src/trail_sound/rainbow_kitty_v2.rs	a_held_key_is_felt_not_silenced_and_the_line_keeps_moving	mb-one-key-one-step	
 src/trail_sound/rainbow_kitty_v2.rs	a_hero_star_is_a_pitched_glint_at_its_own_stars_rate	mb-stardust-glint	
-src/trail_sound/rainbow_kitty_v2.rs	a_line_feed_run_walks_the_theme_and_a_lone_line_feed_stands	mb-cascade	
-src/trail_sound/rainbow_kitty_v2.rs	a_line_of_code_is_no_louder_than_prose	isolated-loudness-ladder	
 src/trail_sound/rainbow_kitty_v2.rs	a_mark_confirms_its_cadence_in_the_space_bass	mb-punctuation-phrasing	
 src/trail_sound/rainbow_kitty_v2.rs	a_meteor_fizzles_claims_without_a_click_and_never_eats_a_sounded_bell	mb-meteor	
 src/trail_sound/rainbow_kitty_v2.rs	a_mid_word_rest_never_cadences_by_more_than_a_sixth	mb-melodic-bounds	
 src/trail_sound/rainbow_kitty_v2.rs	a_password_key_is_one_tone_whatever_it_was	mb-secret	
 src/trail_sound/rainbow_kitty_v2.rs	a_password_leaves_the_melody_where_it_was	mb-secret	
-src/trail_sound/rainbow_kitty_v2.rs	a_pathological_stream_never_becomes_a_siren	mb-melodic-bounds	
-src/trail_sound/rainbow_kitty_v2.rs	a_plain_key_is_the_tine_forte_never_touched	mb-capital-forte	
 src/trail_sound/rainbow_kitty_v2.rs	a_question_s_return_lands_on_the_g	mb-punctuation-phrasing	
 src/trail_sound/rainbow_kitty_v2.rs	a_quotation_lifts_and_comes_home_and_an_apostrophe_is_neither	mb-punctuation-phrasing	
 src/trail_sound/rainbow_kitty_v2.rs	a_re_struck_mark_does_not_spark_or_graft_again	mb-class-voices	
@@ -3010,79 +2386,49 @@ src/trail_sound/rainbow_kitty_v2.rs	a_run_of_capitals_keeps_its_contour_instead_
 src/trail_sound/rainbow_kitty_v2.rs	a_run_of_spaces_is_one_downbeat_and_a_rising_figure	mb-space-bass	
 src/trail_sound/rainbow_kitty_v2.rs	a_sentence_neither_ends_nor_starts_where_the_last_one_did	mb-punctuation-phrasing	
 src/trail_sound/rainbow_kitty_v2.rs	a_shifted_key_does_not_bend	mb-capital-forte	
-src/trail_sound/rainbow_kitty_v2.rs	a_shifted_key_holds_its_pitch_from_its_first_millisecond	rendered-timbre-bounds	
-src/trail_sound/rainbow_kitty_v2.rs	a_shifted_key_is_forte_not_higher_and_a_word_opening_capital_is_loudest	mb-capital-forte	
 src/trail_sound/rainbow_kitty_v2.rs	a_sing_along_never_machine_guns_and_hands_the_key_back_at_a_phrase_boundary	duck-envelopes	
-src/trail_sound/rainbow_kitty_v2.rs	a_space_head_is_heard_and_never_over_the_letter	mb-space-bass	
 src/trail_sound/rainbow_kitty_v2.rs	a_strike_or_a_ring_on_the_tings_pitch_never_combs	mb-same-pitch-no-comb	
 src/trail_sound/rainbow_kitty_v2.rs	a_v1_event_leaves_every_v2_delta_at_its_identity	v2-fields-identity-on-v1	
 src/trail_sound/rainbow_kitty_v2.rs	a_v1_voice_after_the_music_box_snaps_a_pending_key_instead_of_holding_it_for_ever	duck-envelopes	
 src/trail_sound/rainbow_kitty_v2.rs	a_word_head_common_tone_keeps_the_steps_touch_and_still_damps_the_old_voice	mb-same-pitch-no-comb	
 src/trail_sound/rainbow_kitty_v2.rs	a_word_hop_is_never_thinned_by_the_typing_gap_under_a_named_instrument	v1-admission	
-src/trail_sound/rainbow_kitty_v2.rs	a_word_opening_capital_rings_a_twelfth_over_its_own_strike	capital-weight-rendered	
 src/trail_sound/rainbow_kitty_v2.rs	all_glyph_sparkles_share_the_strikes_loudness_arc	mb-class-voices	
 src/trail_sound/rainbow_kitty_v2.rs	an_adjacent_pair_closes_with_its_tink	mb-class-voices	
 src/trail_sound/rainbow_kitty_v2.rs	an_aside_is_sotto_voce_and_ends_where_it_should	mb-punctuation-phrasing	
-src/trail_sound/rainbow_kitty_v2.rs	backspace_is_unpitched_and_takes_the_note_away	mb-undo	
-src/trail_sound/rainbow_kitty_v2.rs	backspace_restores_the_hammer	mb-capital-forte	
 src/trail_sound/rainbow_kitty_v2.rs	backspace_unsings_a_phrase	mb-undo	
 src/trail_sound/rainbow_kitty_v2.rs	code_punctuation_never_moves_the_harmony	mb-punctuation-phrasing	
 src/trail_sound/rainbow_kitty_v2.rs	consecutive_typed_onsets_are_never_a_leap_inside_a_word	mb-melodic-bounds	
-src/trail_sound/rainbow_kitty_v2.rs	every_class_is_deterministic_and_the_letter_path_is_untouched	synth-deterministic	
 src/trail_sound/rainbow_kitty_v2.rs	every_key_is_a_step_at_every_rate_and_no_key_is_silent	mb-one-key-one-step	
 src/trail_sound/rainbow_kitty_v2.rs	every_repeated_pitch_is_charged_to_a_cause_the_design_names	mb-melodic-bounds	
-src/trail_sound/rainbow_kitty_v2.rs	faster_is_brighter_never_louder	mb-take-loudness	
 src/trail_sound/rainbow_kitty_v2.rs	flow_echo_phase_requires_the_current_keys_sounding_octave	mb-flow	
 src/trail_sound/rainbow_kitty_v2.rs	flow_s_voice_is_identity_at_heat_zero	mb-flow	
 src/trail_sound/rainbow_kitty_v2.rs	flowing_knocks_do_not_regrow_an_octave_echo	mb-flow	
-src/trail_sound/rainbow_kitty_v2.rs	forte_is_brighter_at_the_onset_mellow_in_the_body_and_costs_no_structural_peak	capital-weight-rendered	
 src/trail_sound/rainbow_kitty_v2.rs	graft_retirement_model_proves_and_catches_an_omitted_delete	mb-graft-retirement-refines-model	
 src/trail_sound/rainbow_kitty_v2.rs	land_is_silent_under_v2	mb-meteor	
 src/trail_sound/rainbow_kitty_v2.rs	later_text_keys_disown_the_previous_keys_ring_and_graft	mb-graft-retirement-refines-model	
-src/trail_sound/rainbow_kitty_v2.rs	no_partial_pair_beats_in_the_roughness_band_above_one_kilohertz	mb-roughness	
-src/trail_sound/rainbow_kitty_v2.rs	punctuation_is_voiced_and_each_bucket_speaks	mb-class-voices	
 src/trail_sound/rainbow_kitty_v2.rs	punctuation_phrases_the_line	mb-punctuation-phrasing	
 src/trail_sound/rainbow_kitty_v2.rs	shifted_marks_never_steal_their_own_strike_in_a_batched_burst	mb-lane-admission	
 src/trail_sound/rainbow_kitty_v2.rs	tails_end_quietly_and_damps_are_ramps	mb-tails-and-damps	
-src/trail_sound/rainbow_kitty_v2.rs	tau_v_meets_both_anchors_and_the_floor_is_reachable	mb-ioi-arc	
 src/trail_sound/rainbow_kitty_v2.rs	the_bell_and_the_landing_share_one_clock	mb-meteor	
 src/trail_sound/rainbow_kitty_v2.rs	the_bell_yields_to_the_shifted_key_it_announced_and_to_nothing_else	mb-ting	
-src/trail_sound/rainbow_kitty_v2.rs	the_bloom_rides_every_lit_step_on_the_lattice_and_follows_the_hue	mb-bloom-and-room	
-src/trail_sound/rainbow_kitty_v2.rs	the_bloomed_step_is_brighter_than_the_tine_and_under_the_glass_line	rendered-timbre-bounds	
-src/trail_sound/rainbow_kitty_v2.rs	the_box_opens_with_the_hand_and_never_gets_louder	mb-take-loudness	
-src/trail_sound/rainbow_kitty_v2.rs	the_capital_ring_is_a_twelfth_on_its_own_phase_and_its_draws_are_spent_either_way	mb-capital-forte	
 src/trail_sound/rainbow_kitty_v2.rs	the_cascade_never_stacks	mb-cascade	
 src/trail_sound/rainbow_kitty_v2.rs	the_column_and_the_mood_never_move_the_tune	mb-melody-is-a-function	
 src/trail_sound/rainbow_kitty_v2.rs	the_core_carries_direction_and_the_whoosh_does_not	mb-meteor	
 src/trail_sound/rainbow_kitty_v2.rs	the_fallback_clock_wraps_like_a_host_stamp_instead_of_saturating	mb-fallback-clock	
-src/trail_sound/rainbow_kitty_v2.rs	the_felt_mallet_chirps_up_into_the_sparkle_band_and_climbs	rendered-timbre-bounds	
-src/trail_sound/rainbow_kitty_v2.rs	the_flow_echo_always_adds_to_the_octave	mb-flow	
 src/trail_sound/rainbow_kitty_v2.rs	the_indent_figure_is_a_cycle_on_every_chord_and_key	mb-space-bass	
-src/trail_sound/rainbow_kitty_v2.rs	the_isolated_step_centroid_is_the_one_the_partial_table_builds	rendered-timbre-bounds	
 src/trail_sound/rainbow_kitty_v2.rs	the_lanes_hold_their_caps_and_steals_are_zero	mb-lane-admission	
 src/trail_sound/rainbow_kitty_v2.rs	the_limiter_is_transparent_below_threshold_and_holds_the_ceiling_above	mb-bus-limiter	
 src/trail_sound/rainbow_kitty_v2.rs	the_line_is_a_function_of_the_text_and_the_rhythm_and_of_nothing_else	mb-melody-is-a-function	
-src/trail_sound/rainbow_kitty_v2.rs	the_meteor_tick_is_heard	mb-meteor	
 src/trail_sound/rainbow_kitty_v2.rs	the_question_never_rises_a_wolf_in_any_key	mb-punctuation-phrasing	
 src/trail_sound/rainbow_kitty_v2.rs	the_remainder_past_the_cap_is_one_strum_not_a_verse	mb-music-box-only-gestures	
 src/trail_sound/rainbow_kitty_v2.rs	the_room_answers_line_ends_and_rests_and_the_subject_is_answered_from_above	mb-bloom-and-room	
 src/trail_sound/rainbow_kitty_v2.rs	the_run_guard_holds_on_the_sounded_line_not_the_counted_one	mb-melodic-bounds	
-src/trail_sound/rainbow_kitty_v2.rs	the_sky_follows_the_hue_in_tilt_and_width_and_never_in_pitch	mb-sky-bed	
 src/trail_sound/rainbow_kitty_v2.rs	the_sky_is_fed_by_the_music_boxs_keys_only_behind_the_knob	bed-gate	
-src/trail_sound/rainbow_kitty_v2.rs	the_sky_pad_is_the_live_chords_lit_degrees_under_the_bass	mb-sky-bed	
 src/trail_sound/rainbow_kitty_v2.rs	the_space_walks_pure_fifths_and_enter_comes_home	mb-space-bass	
-src/trail_sound/rainbow_kitty_v2.rs	the_sparkle_is_under_the_loudness_arc	mb-take-loudness	
-src/trail_sound/rainbow_kitty_v2.rs	the_split_classes_are_told_apart_and_an_unnamed_id_is_still_the_letter	mb-class-voices	
-src/trail_sound/rainbow_kitty_v2.rs	the_three_families_are_distinct_timbres_on_one_line	rendered-timbre-bounds	
-src/trail_sound/rainbow_kitty_v2.rs	the_tine_is_small_and_warm_not_hard_and_bright	rendered-timbre-bounds	
-src/trail_sound/rainbow_kitty_v2.rs	the_ting_and_a_word_opening_capital_crest_no_higher_than_before_forte	capital-weight-rendered	
-src/trail_sound/rainbow_kitty_v2.rs	the_ting_decays_out_instead_of_being_cut	mb-tails-and-damps	
-src/trail_sound/rainbow_kitty_v2.rs	the_ting_is_musical_not_harsh	rendered-timbre-bounds	
 src/trail_sound/rainbow_kitty_v2.rs	the_ting_rings_through_the_next_key	mb-ting	
 src/trail_sound/rainbow_kitty_v2.rs	the_verdict_is_the_music_boxs_alone_and_never_louder_than_a_key	mb-music-box-only-gestures	
 src/trail_sound/rainbow_kitty_v2.rs	typed_grafts_conform_to_owned_retirement_before_and_after_onset	mb-graft-retirement-refines-model	
 src/trail_sweep.rs	bounded_tail_matches_forward_bresenham_exhaustively	line-cells-tail-is-bounded-bresenham-suffix	
-src/trail_sweep.rs	line_cells_tail_is_gapless_and_bounded	line-cells-tail-is-bounded-bresenham-suffix	
 src/trail_sweep.rs	wrap_fold_finishes_old_row_and_starts_new	sweep-physical-margin-fold	
 src/trick_flash.rs	a_declaration_is_spent_by_the_rescan_it_was_made_for	flash-base-y-declaration-and-memo	
 src/trick_flash.rs	a_flash_ends_when_its_text_is_erased_or_the_grid_changes_width	flash-follow-rule	
@@ -3101,11 +2447,10 @@ src/trick_flash.rs	a_revoke_fast_fades_a_live_flash_and_drops_an_unfound_one	fla
 src/trick_flash.rs	a_russian_word_is_found_under_ambiguous_double_width	flash-find-whole-word	
 src/trick_flash.rs	a_scroll_region_scroll_is_followed_upward_by_exact_anchor_only	flash-locate-row-rule	
 src/trick_flash.rs	a_second_flash_inside_the_opening_window_is_skipped_and_a_later_one_replaces	flash-note-admission	
-src/trick_flash.rs	a_tab_switch_never_lets_the_flash_hold_the_scheduler_past_its_own_window	flash-pane-scope	
 src/trick_flash.rs	a_typed_word_flashes_then_emits_nothing_with_a_stable_fp_and_a_disarmed_scheduler	flash-lifecycle	
 src/trick_flash.rs	a_word_not_found_within_the_echo_window_is_given_up_unpainted	flash-lifecycle	
 src/trick_flash.rs	a_word_recoloured_mid_flash_fades_to_the_colour_it_has_now	flash-follow-rule	
-src/trick_flash.rs	an_exact_anchor_beats_a_tolerant_one_and_among_equals_the_rightmost_wins	flash-find-whole-word	
+src/trick_flash.rs	an_exact_anchor_beats_an_inside_one_beats_slack_and_among_equals_the_rightmost_wins	flash-find-whole-word	
 src/trick_flash.rs	closing_the_pane_takes_its_flash_with_it	flash-pane-scope	
 src/trick_flash.rs	echo_sit_output_never_inks_without_a_note	flash-typed-never-seen	
 src/trick_flash.rs	enter_on_the_bottom_row_is_found_on_the_scrolled_row_never_on_the_shells_error_line	flash-locate-row-rule	
@@ -3115,13 +2460,10 @@ src/trick_flash.rs	thai_and_hindi_words_are_found_under_their_combining_marks	fl
 src/trick_flash.rs	the_base_y_memo_is_bounded_and_pruned_with_the_panes	flash-base-y-declaration-and-memo	
 src/trick_flash.rs	the_cold_path_and_the_snapshot_path_paint_the_same_bytes	flash-rescan-twins-equivalent	
 src/trick_flash.rs	the_envelope_ramps_in_holds_and_fades_to_zero_at_both_ends	flash-envelope-shape	
-src/trick_flash.rs	the_fade_lands_back_on_the_words_own_colour	flash-emit-is-the-law	
 src/trick_flash.rs	the_flash_inserts_between_other_rows_ink_in_order	flash-emit-is-the-law	
 src/trick_flash.rs	the_flash_stays_under_the_photosensitivity_bound	flash-photosensitivity-bound	
 src/trick_flash.rs	the_legibility_guard_holds_the_contrast_bound_at_every_hue	flash-legibility-guard	
 src/trick_flash.rs	the_merge_keeps_ink_sorted_unique_over_an_overlapping_self_glow	flash-emit-is-the-law	
-src/trick_flash.rs	the_painted_bytes_are_the_envelope_law_cell_for_cell	flash-emit-is-the-law	
-src/trick_flash.rs	without_base_y_the_upward_search_skips_a_match_that_is_not_exactly_anchored	flash-locate-row-rule	
 src/typed_tricks.rs	a_break_revokes_a_live_tentative_fire	tt-poison-and-reset	
 src/typed_tricks.rs	a_character_with_no_column_of_its_own_poisons	tt-poison-and-reset	
 src/typed_tricks.rs	a_delimiter_run_longer_than_the_window_still_gives_the_token_back	tt-backspace-undo	
@@ -3143,8 +2485,6 @@ src/typed_tricks.rs	a_named_pet_makes_the_fire_final	tt-firing-tiers
 src/typed_tricks.rs	a_narrow_stop_parks_a_no_space_run_like_any_other_token	tt-punctuation-park	
 src/typed_tricks.rs	a_new_line_is_a_new_phrase	tt-phrase-law	
 src/typed_tricks.rs	a_no_echo_prompt_poisons_and_says_nothing	tt-poison-and-reset	
-src/typed_tricks.rs	a_paste_poisons	tt-poison-and-reset	
-src/typed_tricks.rs	a_plain_fire_clears_the_held_address_word	tt-phrase-law	
 src/typed_tricks.rs	a_plain_word_fires_tentatively_at_the_space_and_not_a_letter_sooner	tt-firing-tiers	
 src/typed_tricks.rs	a_poisoned_session_is_remembered_as_dirty	tt-session-dirty-memory	
 src/typed_tricks.rs	a_second_boundary_crossed_backwards_leaves_the_line_impure_but_counted	tt-backspace-undo	
@@ -3193,32 +2533,23 @@ src/typed_tricks.rs	submit_pet_only_means_the_whole_submitted_line_was_pet_vocab
 src/typed_tricks.rs	thai_typed_through_a_layout_fires	tt-firing-tiers	
 src/typed_tricks.rs	the_dirty_memory_is_bounded_and_forgets_the_least_recently_left	tt-session-dirty-memory	
 src/typed_tricks.rs	the_glue_law_holds_with_nothing_parked	tt-punctuation-park	
-src/typed_tricks.rs	the_heap_the_listener_holds_is_stable_once_warm	tt-bounded-heap	
 src/typed_tricks.rs	the_lexicons_code_context_set_is_code_here_too	tt-kind-of-table	
-src/typed_tricks.rs	the_phrase_gap_is_measured_boundary_to_boundary_and_is_inclusive	tt-phrase-law	
 src/typed_tricks.rs	the_shipped_english_answers_the_owners_examples	tt-shipped-en-vocabulary	
-src/typed_tricks.rs	the_shipped_english_hears_good_night_kitty_as_one_final_sleep	tt-shipped-en-vocabulary	
-src/typed_tricks.rs	the_shipped_english_says_each_two_word_phrase_once	tt-shipped-en-vocabulary	
 src/typed_tricks.rs	the_vocabulary_is_wanted_only_when_a_token_closes_on_a_pure_line	tt-needs-lexicon	
 src/typed_tricks.rs	two_word_phrases_fire_once_each	tt-phrase-law	
 src/typed_tricks.rs	under_the_shipped_english_a_fire_is_final_only_on_an_all_vocabulary_prefix	tt-fire-licence-safety	
 src/typed_tricks.rs	whole_words_only	tt-fire-licence-safety	
 src/typing_momentum.rs	accrual_is_rate_capped_so_key_repeat_cannot_outrun_typing	momentum-advance-credit-law	
 src/typing_momentum.rs	credit_cannot_be_banked_across_a_pause	momentum-advance-credit-law	
-src/typing_momentum.rs	decay_follows_the_documented_tau	momentum-read-and-decay	
 src/typing_momentum.rs	delete_flood_walks_an_earned_run_to_zero	momentum-delete-kill-drain	
-src/typing_momentum.rs	deletes_and_kills_never_build	momentum-delete-kill-drain	
 src/typing_momentum.rs	low_crossing_predicts_the_analytic_decay_instant	momentum-crossing-deadlines	
 src/typing_momentum.rs	reading_crossing_reaches_the_actual_floor_including_the_zero_snap	momentum-crossing-deadlines	
 src/word_decorations.rs	a_collapsed_split_still_witnesses_the_survivors_keystrokes	wd-typed-rearm	
 src/word_decorations.rs	a_downward_peek_is_cut_only_at_the_text_line	wd-peek-geometry	
-src/word_decorations.rs	a_feline_word_away_from_both_caret_and_pet_still_peeks	wd-companion-claim	
 src/word_decorations.rs	a_feline_word_away_from_the_caret_still_peeks_beside_the_companion	wd-companion-claim	
 src/word_decorations.rs	a_fold_started_mid_glide_exits_from_the_glide_position	wd-cursor-placement	
 src/word_decorations.rs	a_frozen_engine_neither_finds_nor_paints_the_flash	wd-trick-flash	
 src/word_decorations.rs	a_held_dog_tile_is_refused_to_another_breed	wd-held-tiles	
-src/word_decorations.rs	a_ladder_only_frame_reports_no_body	wd-robi	
-src/word_decorations.rs	a_live_flash_on_a_wordless_screen_arms_exactly_its_own_window	wd-trick-flash	
 src/word_decorations.rs	a_look_flip_refuses_the_old_looks_held_tile_under_bake_pressure	wd-held-tiles	
 src/word_decorations.rs	a_metric_change_drops_every_held_tile	wd-held-tiles	
 src/word_decorations.rs	a_panes_pending_ignition_survives_another_panes_tick	wd-ignition-prune	
@@ -3226,13 +2557,10 @@ src/word_decorations.rs	a_peek_landing_records_one_positioned_cue	wd-peek-cue
 src/word_decorations.rs	a_pet_in_open_grid_is_untouched_and_still_matches_body_px	wd-pet-sprite-in-grid	
 src/word_decorations.rs	a_pet_on_row_zero_emits_no_sprite_above_the_grid	wd-pet-sprite-in-grid	
 src/word_decorations.rs	a_repaint_midway_through_the_cat_plays_no_second_cat	wd-done-marks	
-src/word_decorations.rs	a_repaint_with_the_caret_elsewhere_plays_no_second_cat	wd-typed-rearm	
-src/word_decorations.rs	a_retype_after_the_episode_expired_still_plays_its_cat	wd-typed-rearm	
 src/word_decorations.rs	a_second_feline_word_typed_while_the_companion_stays_up_is_claimed_too	wd-companion-claim	
 src/word_decorations.rs	a_settled_keyword_kitty_breathes_without_resizing	wd-peek-geometry	
 src/word_decorations.rs	a_settled_kitty_on_screen_never_plays_again_without_a_keystroke	wd-done-marks	
 src/word_decorations.rs	a_split_keystroke_is_attributed_to_the_pane_it_was_typed_in	wd-typed-rearm	
-src/word_decorations.rs	a_word_under_the_companion_never_peeks_a_second_cat	wd-companion-claim	
 src/word_decorations.rs	a_word_under_the_pet_body_never_peeks	wd-companion-claim	
 src/word_decorations.rs	a_wordless_screen_with_no_flash_still_returns_fp_zero_and_disarms	wd-trick-flash	
 src/word_decorations.rs	alignment_skip_semantics_old_episode_goes_unmatched	wd-alignment-cardinality	
@@ -3245,27 +2573,20 @@ src/word_decorations.rs	an_unbound_scans_pending_ignition_is_not_session_zeros_t
 src/word_decorations.rs	an_unrelated_edit_does_not_license_a_repaint_replay	wd-typed-rearm	
 src/word_decorations.rs	animal_words_peek_their_species_heads	wd-scan-classification	
 src/word_decorations.rs	beside_other_ink_the_flash_extends_the_deadline_and_never_shortens_it	wd-trick-flash	
-src/word_decorations.rs	born_unfocused_entrance_never_replays_on_refocus	wd-peek-lifecycle	
-src/word_decorations.rs	born_unfocused_reduced_shows_static_pose_and_never_replays	wd-peek-lifecycle	
 src/word_decorations.rs	bottom_rows_keep_occurrence_slots_on_a_match_saturated_screen	wd-occurrence-cap	
 src/word_decorations.rs	bound_panes_keep_independent_damage_epochs	wd-pane-scoping	
 src/word_decorations.rs	bow_cat_sighting_carries_trait_bow	wd-kitty-sighting	
 src/word_decorations.rs	burst_chance_pct_gates_starburst_rolls	wd-burst-roll	
 src/word_decorations.rs	busy_band_above_flips_the_peek_downward	wd-peek-plan	
 src/word_decorations.rs	capture_during_freeze_preserves_episodes_byte_for_byte	wd-freeze	
-src/word_decorations.rs	cjk_custom_surface_matches	wd-scan-classification	
-src/word_decorations.rs	clear_then_retype_at_same_prompt_plays_a_second_cat	wd-typed-rearm	
 src/word_decorations.rs	compat_settled_emission_is_the_raw_footprint_and_ignores_the_glide	wd-cursor-placement	
 src/word_decorations.rs	coupling_pulse_is_deterministic_and_luminance_bounded	wd-nova-coupling	
 src/word_decorations.rs	curse_cues_clear_at_tick_start_and_on_state_drop	wd-curse-cue	
-src/word_decorations.rs	cursor_age_rounding_alias_reuses_the_exact_size_bake	wd-bake-budget	
 src/word_decorations.rs	cursor_cat_body_clamps_after_right_shift_stretch_and_lead	wd-kitty-cursor-emission	
 src/word_decorations.rs	cursor_cat_fold_conformance_real_placement_and_teleport_mutant	wd-cursor-placement	
-src/word_decorations.rs	cursor_cat_fold_leaves_and_arrives_off_glass_without_edge_clamp	wd-cursor-placement	
 src/word_decorations.rs	custom_kitty_footprint_matches_emission_at_interior_right_and_top_edges	wd-kitty-cursor-emission	
 src/word_decorations.rs	custom_kitty_hot_reload_rebases_repaints_and_invalid_replacement_is_dark	wd-cursor-placement	
 src/word_decorations.rs	custom_on_builtin_profanity_fires_with_class_disabled	wd-scan-classification	
-src/word_decorations.rs	custom_rainbow_word_end_to_end	wd-settle-identity	
 src/word_decorations.rs	dec_rows_anchor_nova_via_row_advance	wd-burst-emission	
 src/word_decorations.rs	declaring_an_unsplit_session_retires_a_stale_pane_binding	wd-typed-rearm	
 src/word_decorations.rs	dog_cameo_emits_one_trailing_sprite	wd-dog-cameo	
@@ -3273,14 +2594,8 @@ src/word_decorations.rs	done_mark_lru_full_capacity_replacement_is_bounded_and_g
 src/word_decorations.rs	done_mark_lru_real_order_and_constant_work_conform	wd-done-mark-lru	
 src/word_decorations.rs	done_marks_spread_keys_precomputed_to_collide	wd-keyed-hashers	
 src/word_decorations.rs	emphasis_and_ink_gates	wd-ink-layout	
-src/word_decorations.rs	empty_occurrences_emit_nothing	wd-empty-emits-nothing	
-src/word_decorations.rs	entrance_overshoot_never_crosses_into_row_r_minus_3	wd-peek-geometry	
-src/word_decorations.rs	every_host_frame_emits_exactly_one_companion_body	wd-one-body-per-frame	
-src/word_decorations.rs	exact_context_blank_grace_survives_more_than_two_scans	wd-alignment-cardinality	
 src/word_decorations.rs	excess_concurrent_novas_skip_to_ember	wd-nova-concurrency-cap	
-src/word_decorations.rs	expired_episode_cannot_be_resurrected_by_low_rescan_count	wd-identity-model	
 src/word_decorations.rs	fbomb_combo_cools_across_freeze_thaw	wd-burst-roll	
-src/word_decorations.rs	fbomb_combo_cools_on_hard_reset	wd-burst-roll	
 src/word_decorations.rs	fbomb_combo_five_typed_fucks_go_nuclear_then_decay	wd-burst-roll	
 src/word_decorations.rs	fbomb_combo_nuke_cloud_reaches_the_free_lane	wd-burst-emission	
 src/word_decorations.rs	fbomb_combo_output_fucks_do_not_charge	wd-burst-roll	
@@ -3291,7 +2606,6 @@ src/word_decorations.rs	flash_limiter_conformance_real_limiter_projects_onto_mod
 src/word_decorations.rs	flash_limiter_negative_control_overlap_blind_limiter_is_buggy_trace	wd-ignition-limiter	
 src/word_decorations.rs	flash_limiter_stays_window_wide_across_panes	wd-ignition-limiter	
 src/word_decorations.rs	fold_free_covers_every_field_including_z_and_sampler	fp-field-coverage	
-src/word_decorations.rs	free_rise_and_descend_reveal_window	wd-peek-geometry	
 src/word_decorations.rs	freeze_thaw_mid_rise_resumes_at_same_phase	wd-freeze	
 src/word_decorations.rs	fresh_episode_latches_phase_clock_at_birth	wd-peek-lifecycle	
 src/word_decorations.rs	fuc_is_ordinary_and_only_complete_fuck_activates	wd-scan-classification	
@@ -3299,7 +2613,6 @@ src/word_decorations.rs	full_play_then_reduce_resurrects_nothing	wd-peek-lifecyc
 src/word_decorations.rs	genome_frozen_across_neighbor_churn	wd-identity-model	
 src/word_decorations.rs	geometry_scan_samples_and_freezes_the_prospective_cat_footprint	wd-cat-context	
 src/word_decorations.rs	global_insertion_transfers_dense_triple_without_births	wd-alignment-cardinality	
-src/word_decorations.rs	grace_survives_one_epoch	wd-identity-model	
 src/word_decorations.rs	graphic_only_custom_word_with_ink_off_shows_a_cat	wd-scan-classification	
 src/word_decorations.rs	identical_words_in_two_panes_each_get_their_own_cat	wd-pane-scoping	
 src/word_decorations.rs	identical_words_in_two_tabs_each_get_their_own_cat	wd-pane-scoping	
@@ -3312,18 +2625,13 @@ src/word_decorations.rs	ink_legibility_guard_pulls_on_light_bg	wd-ink-color
 src/word_decorations.rs	ink_settles_to_constant_bytes_and_disarms	wd-idle-fixed-point	
 src/word_decorations.rs	ink_truncation_is_whole_word_and_stable	wd-ink-layout	
 src/word_decorations.rs	invalid_kitty_source_fails_closed_instead_of_using_builtin_art	wd-kitty-cursor-emission	
-src/word_decorations.rs	kitten_landing_bounce_moves_dest_two_px	wd-peek-geometry	
 src/word_decorations.rs	kitty_emits_only_its_body_in_front_of_the_cursor	wd-kitty-cursor-emission	
-src/word_decorations.rs	kitty_flies_a_user_sprite_when_set	wd-kitty-cursor-emission	
 src/word_decorations.rs	kitty_sighting_once_per_episode_across_occlusion	wd-kitty-sighting	
 src/word_decorations.rs	limiter_delays_third_of_three_ignitions_deterministically	wd-ignition-limiter	
 src/word_decorations.rs	limiter_reused_owner_label_does_not_alias_fired_episode	wd-ignition-limiter	
 src/word_decorations.rs	limiter_tightens_to_one_per_second_on_overlap	wd-ignition-limiter	
 src/word_decorations.rs	live_classic_nova_defers_the_supernova_grant	wd-burst-mutex	
-src/word_decorations.rs	magic_position_independent	wd-genome-derivation	
 src/word_decorations.rs	margin_staircase_glides_instead_of_stepping_per_key	wd-cursor-placement	
-src/word_decorations.rs	memo_hit_over_a_wide_row_keeps_the_frame_and_the_guard_quiet	wd-scan-memo-transparent	
-src/word_decorations.rs	moved_episode_rechecks_text_clearance_with_the_transferred_genome	wd-cat-context	
 src/word_decorations.rs	multilingual_typed_curses_bonk_zh_ja_ko_en	wd-curse-cue	
 src/word_decorations.rs	nova_dip_freezes_sweep_and_embers_ink	wd-nova-ink	
 src/word_decorations.rs	nova_one_flash_per_episode_across_occlusion	wd-nova-one-flash	
@@ -3334,29 +2642,17 @@ src/word_decorations.rs	one_host_frame_bakes_at_most_two_tiles_across_panes	wd-b
 src/word_decorations.rs	one_keystroke_re_arms_one_cat_however_many_repaints_follow	wd-typed-rearm	
 src/word_decorations.rs	one_shot_peek_conformance_real_engine	wd-peek-lifecycle	
 src/word_decorations.rs	one_typed_animal_word_grows_exactly_one_cat_centred_on_its_span	wd-peek-geometry	
-src/word_decorations.rs	only_a_cat_stacked_on_the_companion_yields	wd-cat-stacked-on	
-src/word_decorations.rs	onscreen_curse_output_never_records_a_typed_bonk	wd-curse-cue	
-src/word_decorations.rs	ordinal_transfer_is_episode_only	wd-genome-derivation	
 src/word_decorations.rs	pane_ticks_do_not_inflate_rescan_seq	wd-pane-scoping	
 src/word_decorations.rs	passive_output_at_terminal_cursor_stays_spent	wd-typed-rearm	
 src/word_decorations.rs	persist_cap_drops_unmatched_grace_after_fresh_move	wd-persist-capacity	
-src/word_decorations.rs	possessive_custom_form_styled_identically	wd-scan-classification	
-src/word_decorations.rs	post_done_duty_pin_no_deadline_no_activity_zero_quads	wd-idle-fixed-point	
 src/word_decorations.rs	profanity_rainbow_opens_with_bounded_sparkles	wd-sparkle-lifecycle	
 src/word_decorations.rs	profanity_sparkles_then_self_terminates	wd-sparkle-lifecycle	
-src/word_decorations.rs	quasar_and_singularity_ride_the_host_tick	wd-burst-emission	
 src/word_decorations.rs	rainbow_freeze_is_byte_stable_on_both_themes_and_done_born	wd-settle-identity	
 src/word_decorations.rs	rainbow_guard_samples_four_points_not_just_mid	wd-ink-color	
-src/word_decorations.rs	rainbow_span_clamps_to_lead_cells	wd-ink-color	
 src/word_decorations.rs	real_burst_grants_conform_to_the_supernova_mutex_model	wd-burst-mutex	
-src/word_decorations.rs	recent_same_column_retype_after_one_partial_is_fresh_and_armed	wd-alignment-cardinality	
-src/word_decorations.rs	reduced_from_birth_focused_shows_static_pose_and_logs_once	wd-reduced-motion-static	
 src/word_decorations.rs	reduced_motion_forces_static	wd-reduced-motion-static	
-src/word_decorations.rs	reduced_motion_ink_static_from_frame_0	wd-reduced-motion-static	
 src/word_decorations.rs	reduced_motion_nova_is_a_static_glint	wd-reduced-motion-static	
-src/word_decorations.rs	reflow_taint_and_blank_grace_negative_controls_match_buggy_model	wd-alignment-cardinality	
 src/word_decorations.rs	repeated_complete_fuck_rearms_while_fuc_stays_ordinary	wd-typed-rearm	
-src/word_decorations.rs	rescan_finds_words_on_a_real_grid	wd-scan-classification	
 src/word_decorations.rs	rescan_from_cells_matches_term_rescan	wd-scan-path-equivalence	
 src/word_decorations.rs	reset_clears_a_live_trick_flash_on_the_next_tick	wd-trick-flash	
 src/word_decorations.rs	reset_clears_stale_ink_on_next_tick	wd-reset	
@@ -3366,53 +2662,31 @@ src/word_decorations.rs	retain_panes_evicts_departed_panes	wd-pane-scoping
 src/word_decorations.rs	reverse_fold_mirrors_reenters_and_rebaselines_on_coordinate_breaks	wd-cursor-placement	
 src/word_decorations.rs	right_edge_clamp_rises_the_companion_instead_of_covering_the_text	wd-kitty-cursor-emission	
 src/word_decorations.rs	rotation_alignment_plays_new_twin_and_pins_survivor	wd-alignment-cardinality	
-src/word_decorations.rs	same_column_retype_after_more_typing_is_fresh_and_armed	wd-alignment-cardinality	
-src/word_decorations.rs	same_position_hour_old_episode_expires_before_fast_adoption	wd-identity-model	
 src/word_decorations.rs	scan_memo_frames_are_identical_to_an_always_rescanning_engine	wd-scan-memo-transparent	
-src/word_decorations.rs	scan_memo_retires_when_the_lexicon_changes	wd-scan-memo-transparent	
-src/word_decorations.rs	scan_memo_retires_when_the_scan_gates_change	wd-scan-memo-transparent	
 src/word_decorations.rs	scan_memo_spreads_rows_precomputed_to_collide	wd-keyed-hashers	
 src/word_decorations.rs	scrolled_off_supernova_window_still_defers_classic_grants	wd-burst-mutex	
-src/word_decorations.rs	scunthorpe_not_decorated_on_real_grid	wd-scan-classification	
 src/word_decorations.rs	selection_defers_ignition_and_attenuates_active_novas	wd-selection-safety	
 src/word_decorations.rs	selection_mid_eclipse_punches_through_the_veil	wd-selection-safety	
 src/word_decorations.rs	shipping_cat_sprites_preserve_authored_aspect_and_uniform_age_scale	wd-peek-geometry	
 src/word_decorations.rs	singing_notes_stream_ring_capped_tinted_and_drive_scaled	wd-kitty-cursor-emission	
-src/word_decorations.rs	snapshot_cursor_defers_ambiguous_form_until_delimiter	wd-scan-classification	
 src/word_decorations.rs	sparkle_identity_conformance_real_persist_map	wd-identity-model	
-src/word_decorations.rs	sparkle_identity_negative_control_context_move_false_birth	wd-identity-model	
 src/word_decorations.rs	sparkle_identity_negative_control_graceless_map_is_buggy_trace	wd-identity-model	
-src/word_decorations.rs	sparkle_identity_negative_control_missing_rekey_is_buggy_trace	wd-identity-model	
 src/word_decorations.rs	sparkle_reflow_cardinality_conformance_repeated_surfaces	wd-alignment-cardinality	
 src/word_decorations.rs	sparkle_reflow_cardinality_negative_control_context_gate	wd-alignment-cardinality	
-src/word_decorations.rs	sparkle_twinkle_is_frame_rate_independent	wd-twinkle	
 src/word_decorations.rs	sparkle_word_reset_preserves_cursor_companion_placement_and_atlas	wd-reset	
 src/word_decorations.rs	supernova_detonation_cues_at_the_grant_edge_once	wd-curse-cue	
-src/word_decorations.rs	supernova_mutex_serializes_bursts	wd-burst-mutex	
 src/word_decorations.rs	supernova_roll_decorrelates_and_transfers_across_alignment	wd-burst-roll	
 src/word_decorations.rs	supernova_suppressed_under_reduced_motion	wd-reduced-motion-static	
 src/word_decorations.rs	supernova_wash_splits_around_selection	wd-selection-safety	
-src/word_decorations.rs	the_claimed_word_stays_quiet_while_the_companion_holds	wd-companion-claim	
-src/word_decorations.rs	the_cursor_escort_really_grew_and_still_fits_its_slot	wd-kitty-cursor-emission	
-src/word_decorations.rs	the_enlarged_maneki_is_off_the_launch_roster_but_on_the_discovery_path	art-roster-completeness	
-src/word_decorations.rs	the_ladder_reaches_the_top_of_a_tall_window	wd-robi	
-src/word_decorations.rs	the_maneki_raised_paw_grew_with_its_keyline_intact	art-asset-quality	
 src/word_decorations.rs	the_summoning_word_is_claimed_even_after_the_caret_moved_on	wd-companion-claim	
-src/word_decorations.rs	top_row_word_peeks_down_under_the_word_never_over_it	wd-peek-plan	
 src/word_decorations.rs	transfer_then_expire_writes_mark_under_departure_ident	wd-done-marks	
 src/word_decorations.rs	tui_prompt_box_frame_still_summons_a_cat	wd-peek-plan	
-src/word_decorations.rs	twin_desync_dwells_and_descend_frames_differ	wd-peek-timing	
-src/word_decorations.rs	two_char_custom_word_scans_and_styles	wd-scan-classification	
 src/word_decorations.rs	two_consecutive_recent_kitty_retypes_both_arm	wd-typed-rearm	
 src/word_decorations.rs	typed_curse_birth_records_one_bonk_cue	wd-curse-cue	
 src/word_decorations.rs	typed_kitty_after_dense_cat_output_is_not_slot_starved	wd-slot-pools	
 src/word_decorations.rs	typing_dmg_never_bonks_but_the_marked_vietnamese_form_does	wd-curse-cue	
-src/word_decorations.rs	un_reduce_after_static_showing_marks_the_peek_done	wd-peek-lifecycle	
 src/word_decorations.rs	unequal_pane_widths_do_not_pin_born_settled	wd-resize-settle	
-src/word_decorations.rs	unrelated_changed_column_retype_remains_fresh_and_armed	wd-alignment-cardinality	
 src/word_decorations.rs	vanished_classic_nova_flood_has_constant_reservation_storage	wd-bounded-storage	
-src/word_decorations.rs	weak_redraw_sequence_boundary_is_exactly_two_scans	wd-alignment-cardinality	
-src/word_decorations.rs	width_change_never_uses_weak_redraw_transfer	wd-alignment-cardinality	
 src/word_decorations.rs	words_arriving_while_away_never_storm_on_return	wd-peek-lifecycle	
 tests/abandoned_ribbon.rs	a_backspace_back_up_through_a_shell_fold_holds_the_row_under_the_parked_hand	rb-hand-return	
 tests/abandoned_ribbon.rs	a_band_overwritten_with_different_text_is_retired	rb-follow-witness	
@@ -3421,7 +2695,6 @@ tests/abandoned_ribbon.rs	a_ctrl_u_under_an_identical_line_drains_on_its_own_row
 tests/abandoned_ribbon.rs	a_fold_s_seam_holds_when_two_keys_echoes_land_on_one_frame	rb-walk-continuity	
 tests/abandoned_ribbon.rs	a_key_typed_over_an_abandoned_cohorts_cell_keeps_its_own_light	rb-follow-witness	
 tests/abandoned_ribbon.rs	a_killed_line_under_an_identical_line_is_released_not_followed_onto_it	rb-follow-witness	
-tests/abandoned_ribbon.rs	a_line_that_arrives_a_row_up_around_a_hole_is_counted_missed_on_trail_status	rb-follow-witness	
 tests/abandoned_ribbon.rs	a_prompt_redraw_that_puts_the_same_text_back_keeps_every_cell	rb-follow-witness	
 tests/abandoned_ribbon.rs	a_re_anchor_onto_the_pane_s_first_column_lights_nothing_in_the_pane_beside_it	rb-echo-custody	
 tests/abandoned_ribbon.rs	a_relocated_input_box_carries_the_band_with_its_text_and_stamps_nothing	rb-follow-witness	
@@ -3433,9 +2706,6 @@ tests/abandoned_ribbon.rs	the_box_growth_wrap_carries_the_band_up_and_a_silent_f
 tests/abandoned_ribbon.rs	the_box_growth_wrap_carries_the_band_up_with_its_text_and_the_flush_pays_its_landing	rb-follow-witness	
 tests/abandoned_ribbon.rs	the_next_key_after_a_declined_relocation_lays_at_the_caret_s_true_cell	rb-echo-custody	
 tests/abandoned_ribbon.rs	trail_status_appends_ribbon_retired_after_the_v2_rows	rb-trail-status-line	
-tests/animal_art_quality.rs	animal_faces_survive_a_sixteen_pixel_bake	art-asset-quality	
-tests/animal_art_quality.rs	animal_heads_are_semantic_bounded_and_species_true	art-asset-quality	
-tests/animal_art_quality.rs	every_authored_head_resolves_through_the_compiled_lookup	art-roster-completeness	
 tests/animal_art_quality.rs	lexicon_species_and_authored_roster_are_the_same_set	art-roster-completeness	
 tests/animal_art_quality.rs	species_heads_do_not_alias_each_other_at_sprite_size	art-asset-quality	
 tests/busy_status_rows_keep_their_brand.rs	a_footer_below_the_composer_leaves_no_hole_after_a_scroll	rb-echo-custody	
@@ -3447,9 +2717,6 @@ tests/busy_status_rows_keep_their_brand.rs	a_transcript_streaming_onto_new_rows_
 tests/cat_art_quality.rs	authored_accessories_have_no_backdrop_or_fragmented_outline	art-asset-quality	
 tests/cat_art_quality.rs	authored_characters_stay_clean_bounded_and_readable	art-asset-quality	
 tests/cat_art_quality.rs	cursor_reactions_remain_visibly_distinct_at_terminal_size	art-asset-quality	
-tests/cat_art_quality.rs	hero_assets_are_semantic_bounded_and_layout_stable	art-asset-quality	
-tests/cat_art_quality.rs	hero_faces_survive_a_sixteen_pixel_bake	art-asset-quality	
-tests/cat_art_quality.rs	polished_faces_keep_visible_non_textual_features_at_sixteen_pixels	art-asset-quality	
 tests/cat_art_quality.rs	repaired_roster_heads_are_semantic_bounded_and_legible	art-asset-quality	
 tests/claude_wrap_band.rs	a_partial_word_carried_down_by_the_next_key_keeps_its_first_letter_and_no_indent_stub	rb-soft-wrap-indent	
 tests/claude_wrap_band.rs	a_six_letter_word_carried_down_keeps_every_letter_and_no_indent_stub	rb-soft-wrap-indent	
@@ -3457,7 +2724,6 @@ tests/claude_wrap_band.rs	an_insert_whose_first_key_carries_the_caret_down_is_li
 tests/claude_wrap_band.rs	controls_an_insert_on_the_wrapped_row_and_an_end_of_text_wrap	rb-soft-wrap-indent	
 tests/claude_wrap_band.rs	the_reflowed_word_after_fast_word_hops_keeps_its_first_letter	rb-soft-wrap-indent	
 tests/claude_wrap_band.rs	the_reflowed_word_after_word_hops_keeps_its_first_letter	rb-soft-wrap-indent	
-tests/codex_background_redraw.rs	a_background_footer_park_cannot_spend_the_composer_key	rb-echo-custody	
 tests/codex_background_redraw.rs	a_coalesced_pair_across_the_pending_margin_wrap_lights_both_glyphs	rb-echo-custody	
 tests/codex_background_redraw.rs	a_delayed_original_echo_survives_multiple_foreign_row_repaints	rb-echo-custody	
 tests/codex_background_redraw.rs	a_footer_park_that_never_returns_expires_without_painting_the_footer	rb-echo-custody	
@@ -3481,7 +2747,6 @@ tests/codex_particle_replay.rs	ordinary_first_a_reanchor_is_cached_for_the_first
 tests/codex_particle_replay.rs	plain_typing_under_codex_keeps_the_whole_line_lit	rb-band-connectivity	
 tests/codex_particle_replay.rs	retired_prefix_rejoin_refuses_changed_keyless_navigated_and_stale_rows	rb-typed-continuity	
 tests/codex_particle_replay.rs	stalled_codex_batch_reowns_first_a_from_exact_inflight_run	rb-same-caret-echo	
-tests/codex_particle_replay.rs	wide_wrapped_batch_still_requires_every_exact_key	rb-same-caret-echo	
 tests/composer_box_growth_wrap.rs	a_backspace_back_through_the_fold_rewets_the_row_the_hand_returned_to	rb-hand-return	
 tests/composer_box_growth_wrap.rs	a_shift_enter_newline_starts_the_walk_again_however_soon_the_first_key_follows	rb-walk-continuity	
 tests/composer_box_growth_wrap.rs	a_shift_enter_newline_starts_the_walk_again_in_a_bottom_anchored_box_too	rb-walk-continuity	
@@ -3491,36 +2756,16 @@ tests/composer_box_growth_wrap.rs	an_unwrap_takes_the_seam_off_the_line_the_hand
 tests/composer_box_growth_wrap.rs	one_frame_after_the_wrap_the_band_stands_under_its_text_a_row_up_and_is_not_melted	rb-follow-witness	
 tests/composer_box_growth_wrap.rs	the_followed_row_flows_into_the_fold_and_is_dark_by_the_flows_end	rb-row-scoped-flow	
 tests/composer_box_growth_wrap.rs	the_new_row_continues_the_old_rows_walk_at_the_pace_it_had_reached	rb-walk-continuity	
-tests/composer_box_growth_wrap.rs	the_new_rows_cells_carry_a_monotone_walk_and_the_relaid_word_keeps_the_t_it_had	rb-walk-continuity	
 tests/composer_growth_follows.rs	a_line_whose_first_glyph_twins_above_and_below_follows_whole	rb-follow-witness	
-tests/composer_growth_follows.rs	a_long_word_s_wrap_continues_the_old_row_s_walk_as_the_hand_types_on	rb-walk-continuity	
-tests/composer_growth_follows.rs	a_long_word_s_wrap_continues_the_old_row_s_walk_when_the_hand_stops	rb-walk-continuity	
-tests/composer_growth_follows.rs	a_narrow_composer_s_wrap_that_moves_more_than_it_keeps_follows	rb-follow-witness	
-tests/composer_growth_follows.rs	a_narrow_wrap_continues_the_old_row_s_walk_as_the_hand_types_on	rb-walk-continuity	
-tests/composer_growth_follows.rs	a_narrow_wrap_continues_the_old_row_s_walk_when_the_hand_stops	rb-walk-continuity	
-tests/composer_growth_follows.rs	a_new_line_that_reaches_the_old_line_s_melting_remnant_keeps_its_own_walk	rb-walk-continuity	
-tests/composer_growth_follows.rs	a_new_line_three_keys_short_of_the_remnant_at_forty_columns_keeps_its_own_walk	rb-walk-continuity	
-tests/composer_growth_follows.rs	a_new_line_three_keys_short_of_the_remnant_at_the_owner_s_width_keeps_its_own_walk	rb-walk-continuity	
-tests/composer_growth_follows.rs	a_new_line_two_keys_short_of_the_remnant_keeps_its_own_walk	rb-walk-continuity	
-tests/composer_growth_follows.rs	a_path_s_wrap_at_the_owner_s_width_continues_the_old_row_s_walk_as_the_hand_types_on	rb-walk-continuity	
-tests/composer_growth_follows.rs	a_path_s_wrap_at_the_owner_s_width_continues_the_old_row_s_walk_when_the_hand_stops	rb-walk-continuity	
 tests/composer_growth_follows.rs	a_proved_short_wrap_does_not_reanchor_a_later_false_park	rb-short-wrap-park	
 tests/composer_growth_follows.rs	a_short_wrap_relay_survives_a_delayed_echo	rb-walk-continuity	
 tests/composer_growth_follows.rs	a_space_typed_before_the_wrap_s_echo_lands_leaves_the_moved_word_relaid	rb-walk-continuity	
-tests/composer_growth_follows.rs	a_wrap_that_carries_a_long_path_down_keeps_its_short_line_following	rb-follow-witness	
-tests/composer_growth_follows.rs	a_wrap_that_keeps_one_cell_relays_the_moved_word	rb-walk-continuity	
-tests/composer_growth_follows.rs	a_wrap_that_keeps_one_or_two_cells_follows_and_flows	rb-follow-witness	
-tests/composer_growth_follows.rs	a_wrap_that_keeps_two_cells_relays_the_moved_word	rb-walk-continuity	
-tests/composer_growth_follows.rs	a_wrap_that_moves_exactly_as_much_as_it_keeps_continues_the_walk	rb-walk-continuity	
 tests/composer_growth_follows.rs	a_wrap_that_moves_no_word_continues_one_past_the_eaten_space_whatever_the_echo_lag	rb-walk-continuity	
 tests/composer_growth_follows.rs	every_growth_at_the_glass_take_s_geometry_follows_its_text_and_flows	rb-follow-witness	
 tests/composer_growth_follows.rs	every_growth_of_the_owner_s_composer_follows_and_flows_when_the_hand_stops_at_the_wrap	rb-follow-witness	
 tests/composer_growth_follows.rs	every_growth_of_the_owner_s_composer_follows_its_text_and_flows	rb-follow-witness	
 tests/composer_growth_follows.rs	one_coincident_letter_does_not_change_the_exit	rb-follow-witness	
 tests/composer_growth_follows.rs	the_control_a_letter_typed_before_the_wrap_s_echo_lands	rb-walk-continuity	
-tests/composer_growth_follows.rs	the_control_a_wrap_that_keeps_more_than_it_moves_continues_the_walk	rb-walk-continuity	
-tests/composer_growth_follows.rs	the_owner_s_text_at_21_columns_keeps_its_own_walk_past_the_remnant	rb-walk-continuity	
-tests/composer_growth_follows.rs	two_spaces_before_the_moved_word_continue_the_walk_when_the_hand_stops	rb-walk-continuity	
 tests/composer_multiline_wrap.rs	a_line_typed_under_a_near_copy_of_itself_follows_on_the_letters_that_differ	rb-follow-witness	
 tests/composer_multiline_wrap.rs	a_second_line_that_shares_no_letter_with_the_first_follows_on_both_trees	rb-follow-witness	
 tests/composer_multiline_wrap.rs	a_second_wrap_that_writes_other_text_a_row_up_follows_nothing	rb-follow-witness	
@@ -3537,12 +2782,10 @@ tests/console_contact_observation.rs	observed_ink_is_not_saved_for_a_later_input
 tests/console_contact_observation.rs	repeated_observations_preserve_one_pending_local_contact	pet-contact	
 tests/console_contact_observation.rs	repeated_unchanged_observations_cannot_create_contact_from_input_alone	pet-contact	
 tests/console_contact_observation.rs	uniform_output_scroll_moves_old_ink_without_creating_contact	pet-contact	
-tests/console_cursor_home.rs	a_visible_output_watcher_returns_home_after_a_large_caret_move	pet-cursor-home	
 tests/console_cursor_home.rs	coding_console_cursor_hide_show_keeps_the_full_resident_without_fake_input	pet-cursor-home	
 tests/console_cursor_home.rs	dense_colored_coding_prompt_keeps_a_full_pet_near_the_cursor	pet-cursor-home	
 tests/console_cursor_home.rs	distant_program_output_changes_attention_without_moving_home_across_the_console	pet-cursor-home	
 tests/console_cursor_home.rs	frame_fingerprint_observes_the_body_moving_behind_text	fp-field-coverage	
-tests/console_cursor_home.rs	full_selection_still_protects_the_console_and_explains_the_hidden_body	pet-cursor-home	
 tests/console_cursor_home.rs	hidden_cursor_region_scrolls_keep_the_full_body_at_its_last_real_home	pet-cursor-home	
 tests/console_cursor_home.rs	ordinary_dense_output_does_not_make_an_idle_resident_blink_out	pet-cursor-home	
 tests/console_cursor_home.rs	ordinary_typing_keeps_the_full_body_visible_between_keys	pet-cursor-home	
@@ -3550,10 +2793,6 @@ tests/console_cursor_home.rs	real_cursor_home_placement_conforms_and_rejects_the
 tests/console_cursor_home.rs	wall_side_changes_and_line_wrap_keep_the_body_visible	pet-cursor-home	
 tests/console_handoff_conformance.rs	real_flight_landing_and_resident_consumption_conform_for_clear_and_dense_reading	pet-resident-handoff	
 tests/console_handoff_conformance.rs	real_no_target_retirement_consumes_touch_and_cannot_poll_or_replay	pet-resident-handoff	
-tests/console_hidden_cursor_coverage.rs	hidden_caret_large_keeps_resident_home	pet-cursor-home	
-tests/console_hidden_cursor_coverage.rs	hidden_caret_small_control_keeps_resident_home	pet-cursor-home	
-tests/console_hidden_cursor_coverage.rs	hidden_caret_tall_keeps_resident_home	pet-cursor-home	
-tests/console_hidden_cursor_coverage.rs	hidden_caret_wide_keeps_resident_home	pet-cursor-home	
 tests/console_idle_output.rs	an_actual_glyph_in_the_sleeping_footprint_still_causes_eviction	console-observation-admission	
 tests/console_idle_output.rs	nearby_output_particles_allow_uninterrupted_sleep_after_the_idle_ladder	console-observation-admission	
 tests/console_idle_output.rs	real_navigation_releases_the_sleeping_seat_and_follows_the_new_caret	console-observation-admission	
@@ -3564,7 +2803,7 @@ tests/console_life_conformance.rs	direct_input_revokes_a_real_command_perch_and_
 tests/console_life_conformance.rs	input_echo_selection_and_surface_ownership_conform	console-life-episode-refines-model	
 tests/console_life_conformance.rs	multiple_commits_coalesce_to_the_latest_subject_without_echo_replay	console-life-episode-refines-model	
 tests/console_life_erase_conformance.rs	ed2_clears_selected_occupancy_without_retiring_live_coordinates_or_input	console-life-episode-refines-model	
-tests/console_life_erase_conformance.rs	ed3_discards_history_and_block_metadata_without_relocating_live_cells_or_pet	console-life-episode-refines-model	
+tests/console_life_erase_conformance.rs	ed3_discards_history_without_relocating_live_cells_the_running_block_or_pet	console-life-episode-refines-model	
 tests/console_life_erase_conformance.rs	erases_and_selection_release_cannot_replay_old_ink_as_contact	console-life-episode-refines-model	
 tests/console_life_erase_conformance.rs	ris_retires_the_previous_surface_anchor_and_pending_input	console-life-episode-refines-model	
 tests/console_life_geometry.rs	fully_occupied_output_keeps_the_resident_under_text_without_polling	pet-wake-liveness	
@@ -3579,21 +2818,17 @@ tests/console_life_wakes.rs	a_selection_arriving_midflight_preserves_the_arc_and
 tests/console_life_wakes.rs	petting_suppressed_by_full_viewport_selection_is_consumed_without_polling	pet-wake-liveness	
 tests/console_life_wakes.rs	settled_console_resident_offers_a_consumption_tick_for_pending_notes	pet-wake-liveness	
 tests/console_pet_escort_lead.rs	the_escort_keeps_off_the_words_it_leads	escort-locomotion-speed-limit	
-tests/console_pet_visibility_hold.rs	a_full_screen_of_text_goes_under_the_ink_and_a_protected_one_still_yields	protected-surface-yield	
 tests/console_pet_visibility_hold.rs	an_output_burst_yields_by_fading_never_by_cutting	pet-visibility-hold	
 tests/console_pet_visibility_hold.rs	the_caret_alone_never_blanks_its_escort	pet-visibility-hold	
-tests/console_pet_visibility_hold.rs	the_gate_is_the_only_difference	pet-visibility-hold	
 tests/console_pet_visibility_hold.rs	typing_never_blanks_the_pet	pet-visibility-hold	
 tests/console_pet_z_order_hold.rs	claude_code_s_recorded_composer_conforms_and_never_paints_over_ink	console-z-order-refines-model	
 tests/console_pet_z_order_hold.rs	ink_toggling_under_the_body_faster_than_the_dwell_flips_once_each_way	console-z-order-refines-model	
 tests/console_pet_z_order_hold.rs	the_real_z_order_conforms_to_the_derived_model_and_rejects_the_old_rule	console-z-order-refines-model	
 tests/console_pet_z_order_hold.rs	typing_never_paints_over_ink_and_holds_the_z_order	console-z-order-refines-model	
 tests/console_sparse_ink_motion.rs	a_real_caret_move_waits_for_coherence_then_follows_normally	console-observation-admission	
-tests/console_sparse_ink_motion.rs	a_single_incoherent_observation_does_not_commission_a_far_trip	console-observation-admission	
 tests/console_sparse_ink_motion.rs	invalid_surface_cannot_materialize_static_capture_or_replay_an_unfocused_trip	console-observation-admission	
 tests/console_sparse_ink_motion.rs	real_failed_observations_conform_for_idle_and_airborne_locomotion	console-observation-admission	
 tests/console_sparse_ink_motion.rs	sparse_ink_stays_local_across_observation_budget_edges	console-observation-admission	
-tests/console_sparse_ink_motion.rs	sparse_program_particles_do_not_send_a_fixed_caret_pet_across_the_pane	console-observation-admission	
 tests/copies_are_not_moves.rs	a_completion_menu_or_a_twin_drawn_late_is_not_where_the_line_went	copy-is-not-arrival	
 tests/copies_are_not_moves.rs	a_copy_beside_the_line_is_not_where_the_line_went_flat_and_paced	copy-is-not-arrival	
 tests/copies_are_not_moves.rs	a_copy_drawn_after_the_last_key_then_erased_at_every_pause_and_pacing	copy-is-not-arrival	
@@ -3618,12 +2853,8 @@ tests/cursor_bench.rs	cursor_rainbow_hot_ribbon_work_stays_below_its_normalized_
 tests/cursor_cat_conformance.rs	real_cursor_cat_collectible_lifecycle_conforms_and_hidden_expiry_is_caught	cursor-cat-refines-model	
 tests/cursor_cat_conformance.rs	real_cursor_cat_long_presentable_gap_settles_without_a_deferred_fade	cursor-cat-refines-model	
 tests/cursor_cat_conformance.rs	real_cursor_cat_winces_only_for_complete_cues_and_repeats_build_force	cursor-cat-refines-model	
-tests/erased_under_its_twin.rs	a_ctrl_u_right_after_a_final_burst_under_its_twin_follows_nothing	copy-is-not-arrival	
-tests/erased_under_its_twin.rs	a_ctrl_u_right_after_a_paste_under_its_twin_follows_nothing	copy-is-not-arrival	
-tests/erased_under_its_twin.rs	a_ctrl_u_right_after_a_whole_command_echoed_at_once_under_its_twin_follows_nothing	copy-is-not-arrival	
 tests/erased_under_its_twin.rs	a_full_row_budget_still_arms_a_line_s_first_keys_on_what_stood_above_them	witness-row-slots	
 tests/erased_under_its_twin.rs	a_full_row_budget_still_lets_a_line_moved_two_rows_down_carry_its_band	move-is-followed	
-tests/erased_under_its_twin.rs	a_redraw_erasing_a_line_typed_under_its_twin_follows_nothing_when_two_keys_echo_together	copy-is-not-arrival	
 tests/erased_under_its_twin.rs	a_redraw_erasing_a_line_typed_under_its_twin_over_a_slow_link_follows_nothing	copy-is-not-arrival	
 tests/erased_under_its_twin.rs	a_vim_line_typed_under_its_duplicate_then_undone_follows_nothing	copy-is-not-arrival	
 tests/erased_under_its_twin.rs	an_fzf_query_cleared_under_its_best_match_follows_nothing	copy-is-not-arrival	
@@ -3645,14 +2876,10 @@ tests/kitty_activation_conformance.rs	real_kitty_sing_arm_break_release_and_fini
 tests/kitty_activation_conformance.rs	real_kitty_sing_lazy_release_maps_to_the_same_bounded_tail	kitty-sing-activation-refines-model	
 tests/licensed_insert_band.rs	a_licensed_insert_is_laid_whole_in_every_frame_shape_that_reaches_the_glass_whole	licensed-insert-bridge	
 tests/licensed_insert_band.rs	a_one_frame_tear_of_the_completed_word_heals_while_the_hand_types	torn-read-restore	
-tests/licensed_insert_band.rs	a_paste_whose_frame_is_torn_before_its_glyphs_is_laid_as_the_insert	licensed-insert-bridge	
-tests/licensed_insert_band.rs	a_tab_completion_whose_frame_is_torn_before_its_glyphs_is_laid_as_the_insert	licensed-insert-bridge	
 tests/licensed_insert_band.rs	a_torn_reappearance_the_licence_cannot_buy_lays_nothing	licensed-insert-bridge	
 tests/licensed_insert_band.rs	program_output_at_the_caret_lays_no_light_however_its_frame_reaches_the_glass	licensed-insert-bridge	
-tests/licensed_typed_parity.rs	a_licensed_typed_move_is_byte_identical_across_the_license_commit	licence-is-precondition	
 tests/licensed_typed_parity.rs	earned_light_survives_a_cold_program_move	licence-is-precondition	
 tests/licensed_typed_parity.rs	split_batch_suffix_is_dark_but_keeps_resident_light_and_advances_anchors	licence-is-precondition	
-tests/licensed_typed_parity.rs	the_flat_spelling_keeps_the_pre_comet_typed_fold	licence-is-precondition	
 tests/midline_insert_band.rs	a_tail_the_program_rewrote_still_leaves	release-accounting	
 tests/midline_insert_band.rs	typing_inside_a_lit_line_keeps_the_tail_it_pushes_lit	shift-pass-carries-insert	
 tests/midline_insert_colour_seam.rs	a_hop_over_the_pushed_tail_does_not_repaint_it	scrub-never-raises-light	
@@ -3683,32 +2910,20 @@ tests/moves_are_followed.rs	the_limit_an_unsynced_composer_s_wrap_torn_past_twin
 tests/new_line_fade.rs	a_declined_hidden_relocation_whose_text_went_with_it_carries_the_band_with_it	move-is-followed	
 tests/new_line_fade.rs	a_declined_hidden_relocation_with_the_old_row_s_text_intact_moves_only_the_mirror	text-gone-leaves-by-swoosh	
 tests/new_line_fade.rs	a_glyph_the_clear_paints_on_a_typed_space_leaves_with_the_swoosh_not_ahead_of_it	text-gone-leaves-by-swoosh	
-tests/new_line_fade.rs	a_released_band_is_counted_once_on_ribbon_retired	release-accounting	
 tests/new_line_fade.rs	a_released_band_that_different_text_lands_under_it_a_frame_later_melts_fast	release-accounting	
 tests/new_line_fade.rs	a_shell_s_enter_leaves_the_typed_row_s_band_to_its_own_swoosh	text-gone-leaves-by-swoosh	
 tests/new_line_fade.rs	a_submit_split_across_a_hidden_frame_still_leaves_through_the_swoosh	text-gone-leaves-by-swoosh	
 tests/new_line_fade.rs	a_submit_that_clears_the_composer_lets_the_band_leave_through_its_own_swoosh_not_a_cut	text-gone-leaves-by-swoosh	
 tests/new_line_fade.rs	a_submit_that_moves_the_cleared_composer_down_fades_the_old_row_the_same_way	text-gone-leaves-by-swoosh	
-tests/new_line_fade.rs	the_blanked_band_is_drawn_into_the_hand_by_the_swoosh_s_retract_not_stamped	text-gone-leaves-by-swoosh	
 tests/nova_channel_budget.rs	the_over_budget_channel_is_drawn_in_full_not_truncated	nova-draw-is-total	
 tests/nova_channel_budget.rs	the_streak_share_is_tail_bounded_not_column_bounded	output-streak-quad-bound	
 tests/nova_phase_conformance.rs	real_nova_phase_walk_conforms_to_nova_phase_model	nova-phase-refines-model	
-tests/output_streak_attribution.rs	an_echo_discounted_change_is_consumed_without_later_replay	output-streak-attribution	
-tests/output_streak_attribution.rs	an_identical_prompt_redraw_does_not_restart_output_light	output-streak-attribution	
 tests/output_streak_attribution.rs	another_rows_timer_cannot_paint_the_stationary_composer	output-streak-attribution	
-tests/output_streak_attribution.rs	clearing_a_suffix_cannot_license_the_surviving_prefix	output-streak-attribution	
-tests/output_streak_attribution.rs	colour_and_bold_repaint_of_the_same_text_is_not_new_output	output-streak-attribution	
 tests/output_streak_attribution.rs	compact_row_growth_at_fixed_dimensions_preserves_live_output	output-streak-attribution	
-tests/output_streak_attribution.rs	genuine_same_row_append_and_rewrite_are_output	output-streak-attribution	
-tests/output_streak_attribution.rs	moving_an_existing_input_row_is_not_new_output	output-streak-attribution	
-tests/output_streak_attribution.rs	newline_and_soft_wrap_keep_the_newly_written_row	output-streak-attribution	
 tests/output_streak_attribution.rs	ordinary_contiguous_output_can_still_sweep_its_full_changed_run	output-streak-attribution	
 tests/output_streak_attribution.rs	real_cell_observations_refine_the_attribution_snapshot_model	output-streak-attribution	
-tests/output_streak_attribution.rs	rebase_does_not_compare_a_new_sessions_rows_with_the_old_one	output-streak-attribution	
-tests/output_streak_attribution.rs	repeated_new_output_is_not_mistaken_for_a_moved_row	output-streak-attribution	
 tests/output_streak_attribution.rs	sparse_particle_rewrites_never_light_the_unchanged_composer_or_gaps	output-streak-attribution	
 tests/output_streak_attribution.rs	viewport_change_retires_pending_and_live_output_even_before_a_new_token	output-streak-attribution	
-tests/output_streak_attribution.rs	wide_glyph_rewrites_and_presentation_changes_are_output	output-streak-attribution	
 tests/output_streak_attribution.rs	width_only_reflow_does_not_licence_existing_text_as_new_output	output-streak-attribution	
 tests/output_streak_conformance.rs	real_output_episode_and_synth_refine_delivery_model	output-streak-delivery-refines-model	
 tests/partial_release.rs	a_partial_clear_and_an_identical_rewrite_a_frame_later_restore_the_light	torn-read-restore	
@@ -3719,13 +2934,10 @@ tests/partial_release.rs	a_whole_clear_after_a_suffix_the_program_cleared_still_
 tests/pet_art_quality.rs	a_yawn_keeps_its_gape_below_the_mouth_cull	pet-bake-properties	
 tests/pet_art_quality.rs	contact_beats_have_distinct_silhouettes_at_terminal_sizes	pet-bake-properties	
 tests/pet_art_quality.rs	every_planted_pose_stands_on_one_ground_line	pet-art-roster-table	
-tests/pet_art_quality.rs	every_pose_opens_with_exactly_one_dark_outline	pet-art-roster-table	
-tests/pet_art_quality.rs	every_pose_respects_the_layer_and_command_budget	pet-art-roster-table	
 tests/pet_art_quality.rs	every_pose_shares_one_viewbox_and_one_anchor_set	pet-art-roster-table	
 tests/pet_art_quality.rs	no_pose_escapes_its_viewbox	pet-art-roster-table	
 tests/pet_art_quality.rs	reading_gaze_keeps_the_perch_body_geometry_fixed	pet-art-roster-table	
 tests/pet_art_quality.rs	the_gaits_vertical_survives_the_pixel_grid_at_every_cell_height	pet-bake-properties	
-tests/pet_art_quality.rs	the_layout_constants_match_the_art_and_fit_the_atlas_slot	pet-bake-properties	
 tests/pet_coordinate_seams.rs	a_breed_leaver_crosses_a_boundary_where_it_was_drawn	pet-surface-seam-refines-model	
 tests/pet_coordinate_seams.rs	a_carried_ghost_keeps_its_own_tile	pet-surface-seam-refines-model	
 tests/pet_coordinate_seams.rs	a_font_step_and_a_live_drag_keep_the_resident_on_glass	pet-surface-seam-refines-model	
@@ -3746,45 +2958,20 @@ tests/pet_degenerate_geometry.rs	no_legal_sense_makes_the_pet_non_finite_or_off_
 tests/pet_escort_primacy.rs	a_settled_cat_typed_at_keeps_its_own_animation	escort-primacy	
 tests/pet_escort_primacy.rs	plain_typing_is_the_pet_with_no_console_layer	escort-primacy	
 tests/pet_escort_primacy.rs	the_caret_is_not_an_obstruction_to_its_own_escort	escort-primacy	
-tests/pet_escort_primacy.rs	the_escort_stands_at_the_caret_ladder_not_a_console_perch	escort-primacy	
 tests/pet_follows_a_hidden_caret.rs	a_pet_follows_a_caret_that_moves_while_the_cursor_is_hidden	pet-hidden-caret-bounded-hold	
 tests/pet_follows_a_hidden_caret.rs	a_repainting_console_does_not_freeze_the_pet_away_from_the_caret	pet-hidden-caret-bounded-hold	
 tests/pet_holds_through_a_torn_frame.rs	a_finished_frames_hidden_caret_is_held_for_a_repaint_and_then_followed	pet-torn-frame-hold	
 tests/pet_holds_through_a_torn_frame.rs	a_torn_full_repaint_neither_moves_nor_fades_the_settled_pet	pet-torn-frame-hold	
-tests/pet_holds_through_a_torn_frame.rs	every_bracket_torn_keeps_the_pet_at_the_composer_while_typing_end	pet-torn-frame-hold	
-tests/pet_holds_through_a_torn_frame.rs	every_bracket_torn_keeps_the_pet_at_the_composer_while_typing_insert	pet-torn-frame-hold	
-tests/pet_holds_through_a_torn_frame.rs	every_bracket_torn_keeps_the_pet_at_the_composer_while_typing_popup	pet-torn-frame-hold	
-tests/pet_holds_through_a_torn_frame.rs	every_bracket_torn_keeps_the_pet_at_the_composer_while_typing_popup_past_timeout	pet-torn-frame-hold	
-tests/pet_holds_through_a_torn_frame.rs	every_bracket_torn_keeps_the_pet_at_the_composer_while_typing_scrub3	pet-torn-frame-hold	
 tests/pet_position_authority.rs	a_caret_that_jumps_does_not_teleport_the_body	escort-locomotion-speed-limit	
-tests/pet_position_authority.rs	a_printing_command_is_not_a_licence_to_claim_the_escorts_body	escort-primacy	
-tests/pet_position_authority.rs	a_protected_surface_still_moves_or_hides_the_body	protected-surface-yield	
 tests/pet_position_authority.rs	streaming_output_never_teleports_the_body	escort-locomotion-speed-limit	
 tests/pet_resident_standoff.rs	the_resident_settles_where_the_escort_settles	escort-primacy	
-tests/phrase_pause_gaps.rs	an_ink_composer_coalescing_keys_into_one_repaint_keeps_every_boundary_space_lit	typed-columns-owned	
-tests/phrase_pause_gaps.rs	an_ink_composer_repainting_mid_pause_keeps_every_boundary_space_lit	typed-columns-owned	
-tests/phrase_pause_gaps.rs	an_ink_composer_sampled_mid_rewrite_with_a_key_inside_the_melt_keeps_every_boundary_space_lit	torn-read-restore	
-tests/phrase_pause_gaps.rs	an_ink_composer_whose_space_repaints_late_keeps_every_boundary_space_lit	typed-columns-owned	
 tests/phrase_pause_gaps.rs	an_ink_composer_with_a_hidden_caret_keeps_every_boundary_space_lit	typed-columns-owned	
-tests/phrase_pause_gaps.rs	an_ink_composer_with_its_own_cursor_cell_keeps_every_boundary_space_lit	typed-columns-owned	
-tests/phrase_pause_gaps.rs	claude_code_s_recorded_frames_idle_keep_every_boundary_space_lit_at_10cps	typed-columns-owned	
-tests/phrase_pause_gaps.rs	claude_code_s_recorded_frames_idle_keep_every_boundary_space_lit_at_25cps	typed-columns-owned	
-tests/phrase_pause_gaps.rs	claude_code_s_recorded_frames_mid_turn_keep_every_boundary_space_lit_at_10cps	typed-columns-owned	
-tests/phrase_pause_gaps.rs	claude_code_s_recorded_frames_mid_turn_keep_every_boundary_space_lit_at_25cps	typed-columns-owned	
-tests/phrase_pause_gaps.rs	phrases_typed_in_bursts_through_an_ink_repaint_keep_every_boundary_space_lit	typed-columns-owned	
-tests/phrase_pause_gaps.rs	phrases_typed_in_bursts_through_zsh_keep_every_boundary_space_lit	typed-columns-owned	
 tests/rainbow_kitty_v2_frame_cost.rs	rainbow_kitty_v2_steady_frames_allocate_nothing_and_idle_to_exactly_zero	rk-v2-steady-tick-contract	
 tests/relaid_composer_echo.rs	a_key_whose_echo_rides_a_relayout_a_row_up_is_laid_under_its_glyph	crossed-echo-laid	
-tests/relaid_composer_echo.rs	a_key_whose_echo_rides_a_relayout_read_in_1024_byte_pieces_is_laid_under_its_glyph	crossed-echo-laid	
 tests/relaid_composer_echo.rs	a_keyless_relayout_moves_the_band_and_the_next_keys_join_it	crossed-echo-laid	
 tests/relaid_composer_echo.rs	every_stall_width_around_the_relayout_lays_every_key	crossed-echo-laid	
 tests/relaid_composer_echo.rs	the_band_laid_before_the_relayout_stays_lit_under_the_hand	crossed-echo-laid	
 tests/review_real_bytes.rs	claude_code_s_arrow_insert_keeps_the_pushed_tail_lit_at_every_read_size	shift-pass-carries-insert	
-tests/review_real_bytes.rs	claude_code_s_end_take_holds_whole_and_torn_at_every_read_size	typed-columns-owned	
-tests/review_real_bytes.rs	claude_code_s_insert_take_holds_whole_and_torn_at_every_read_size	typed-columns-owned	
-tests/review_real_bytes.rs	claude_code_s_popup_take_holds_whole_and_torn_at_every_read_size	typed-columns-owned	
-tests/review_real_bytes.rs	claude_code_s_scrub_take_holds_whole_and_torn_at_every_read_size	typed-columns-owned	
-tests/review_real_bytes.rs	codex_s_particle_take_holds_whole_and_torn_at_every_read_size	typed-columns-owned	
 tests/review_real_bytes.rs	the_owner_s_line_torn_at_the_same_column_stays_whole_into_the_swoosh	typed-columns-owned	
 tests/revived_line_keeps_its_stops.rs	a_line_revived_after_a_rest_keeps_its_stops_and_the_key_continues_its_walk	revive-restores-stops	
 tests/revived_line_keeps_its_stops.rs	a_line_revived_when_the_key_s_echo_lands_a_frame_late_keeps_its_stops	revive-restores-stops	
@@ -3793,10 +2980,6 @@ tests/revived_line_keeps_its_stops.rs	a_wrapped_line_revived_after_a_rest_lights
 tests/revived_line_keeps_its_stops.rs	claude_codes_composer_revived_after_a_rest_keeps_its_stops	revive-restores-stops	
 tests/revived_line_keeps_its_stops.rs	without_the_revive_the_key_continues_the_walk_and_no_stop_moves	revive-restores-stops	
 tests/ribbon_arrival_conformance.rs	the_real_witness_writes_the_arrival_evidence_on_every_trace	witness-arrival-evidence-refines-model	
-tests/ribbon_coalesced_wrap.rs	coalesced_space_and_glyph_wrap_keep_the_moved_word_lit	rewrap-carries-word	
-tests/ribbon_coalesced_wrap.rs	coalesced_space_and_wide_glyph_wrap_keep_both_moved_cells_lit	rewrap-carries-word	
-tests/ribbon_coalesced_wrap.rs	separated_space_and_glyph_wrap_keep_the_moved_word_lit	rewrap-carries-word	
-tests/ribbon_coalesced_wrap.rs	the_old_row_flows_into_the_last_cell_the_wrap_kept	rewrap-carries-word	
 tests/ribbon_coalesced_wrap.rs	the_space_class_is_required_to_relocate_the_word	rewrap-carries-word	
 tests/ribbon_follow_conformance.rs	the_real_follow_pass_is_the_twin_contract_on_every_six_record_run	witness-follow-refines-twin-model	
 tests/ribbon_row_hold_conformance.rs	continuous_typing_below_does_not_postpone_the_earlier_rows_exit	ribbon-row-hold-refines-model	
@@ -3807,28 +2990,30 @@ tests/scrub_gaps.rs	a_word_scrub_through_an_ink_repaint_leaves_no_gap_and_both_e
 tests/scrub_gaps.rs	a_word_scrub_through_zsh_leaves_no_gap_and_both_engines_agree	scrub-never-raises-light	
 tests/serde_corpus.rs	custom_word_fragments_answer_as_recorded	pack-decoders-denotation	
 tests/serde_corpus.rs	toy_packs_answer_as_recorded	pack-decoders-denotation	
-tests/serde_corpus.rs	trail_packs_answer_as_recorded	pack-decoders-denotation	
 tests/shed_frame_is_still_a_heard_key.rs	a_dark_audible_run_never_fills_the_cue_backlog	sound-seam-independent-of-amplitude	
 tests/shed_frame_is_still_a_heard_key.rs	a_master_off_tick_still_wipes_the_sound_ledger	sound-seam-independent-of-amplitude	
 tests/shed_frame_is_still_a_heard_key.rs	a_shed_frame_keeps_the_key_seam_open	sound-seam-independent-of-amplitude	
 tests/shed_frame_is_still_a_heard_key.rs	a_shed_tick_keeps_the_keyed_click_ledger	sound-seam-independent-of-amplitude	
 tests/shed_frame_is_still_a_heard_key.rs	idle_zero_holds_while_the_audio_seam_is_open	glow-idle-to-zero	
-tests/shed_frame_is_still_a_heard_key.rs	the_lit_path_is_byte_identical_after_the_hoist	sound-seam-independent-of-amplitude	
 tests/shed_frame_is_still_a_heard_key.rs	the_silent_visual_click_reads_this_tick_s_thermal_constants	sound-seam-independent-of-amplitude	
+tests/the_owners_composer_gaps.rs	a_glyph_replaced_after_its_erase_echoed_claims_no_key	rb-same-caret-echo	
+tests/the_owners_composer_gaps.rs	a_glyph_replaced_in_place_without_an_erase_claims_no_key	rb-same-caret-echo	
+tests/the_owners_composer_gaps.rs	a_growth_echo_after_a_pause_lights_its_own_cell	crossed-echo-laid	
+tests/the_owners_composer_gaps.rs	a_growth_echo_after_one_typed_glyph_lights_its_own_cell	crossed-echo-laid	
+tests/the_owners_composer_gaps.rs	a_growth_echo_inside_a_hops_wake_lights_its_own_cell	crossed-echo-laid	
+tests/the_owners_composer_gaps.rs	a_growth_echo_torn_before_its_caret_lights_its_own_cell	crossed-echo-laid	
+tests/the_owners_composer_gaps.rs	a_space_retyped_over_a_typo_in_one_repaint_lights_its_own_cell	rb-same-caret-echo	
 tests/the_owners_composer_gaps.rs	a_space_that_grows_the_box_lights_its_own_cell	crossed-echo-laid	
+tests/the_owners_composer_gaps.rs	a_torn_box_move_down_keeps_the_edit_lit	crossed-echo-laid	
 tests/the_owners_composer_gaps.rs	a_word_wrapped_in_a_stalled_repaint_is_lit_whole	rewrap-carries-word	
 tests/torn_edit_gaps.rs	a_backspace_run_under_torn_reads_keeps_the_band_whole	ribbon-contiguity-invariant	
 tests/torn_edit_gaps.rs	a_growing_composer_torn_at_its_wrap_keeps_the_band_whole	typed-columns-owned	
 tests/torn_edit_gaps.rs	a_torn_backspace_frame_keeps_the_standing_text_lit	torn-read-restore	
-tests/torn_edit_gaps.rs	a_torn_backspace_then_typing_on_still_goes_idle_to_zero	glow-idle-to-zero	
-tests/torn_edit_gaps.rs	a_torn_read_at_the_wrap_column_of_a_fixed_two_row_composer_keeps_both_rows_whole	typed-columns-owned	
 tests/torn_edit_gaps.rs	a_torn_word_kill_frame_keeps_the_standing_text_lit	torn-read-restore	
 tests/torn_edit_gaps.rs	claude_code_1024_byte_reads_with_the_boundary_at_the_wrap_keep_both_rows_whole	typed-columns-owned	
 tests/torn_edit_gaps.rs	codex_particle_replay_stays_one_run_whole_and_torn_in_half_under_the_capped_sync_hold	typed-columns-owned	
 tests/torn_edit_gaps.rs	ctrl_k_then_typing_on_keeps_one_run	ribbon-contiguity-invariant	
-tests/torn_edit_gaps.rs	ctrl_k_then_typing_on_with_every_frame_torn_keeps_one_run	ribbon-contiguity-invariant	
 tests/torn_edit_gaps.rs	every_key_in_1024_byte_reads_for_three_seconds_at_one_fixed_boundary_keeps_the_band_whole	typed-columns-owned	
-tests/torn_edit_gaps.rs	every_key_torn_for_three_seconds_at_one_fixed_boundary_keeps_the_band_whole	typed-columns-owned	
 tests/torn_read_gaps.rs	a_really_cleared_tail_leaves_and_takes_only_its_own_spaces	release-accounting	
 tests/torn_read_gaps.rs	a_released_tail_is_restored_although_the_key_is_laid_before_the_restore	torn-read-restore	
 tests/torn_read_gaps.rs	a_spinner_repaint_torn_under_to_with_no_key_in_flight_keeps_the_band_whole	torn-read-restore	
@@ -3836,22 +3021,23 @@ tests/torn_read_gaps.rs	a_whole_run_re_laid_on_another_row_follows_its_text	move
 tests/torn_read_gaps.rs	an_insert_through_word_hops_under_torn_reads_keeps_the_band_whole	typed-columns-owned	
 tests/torn_read_gaps.rs	claude_code_frames_in_1024_byte_reads_keep_the_band_whole_while_the_hand_types	typed-columns-owned	
 tests/torn_read_gaps.rs	claude_code_s_recorded_bytes_read_whole_or_torn_keep_the_band_whole_while_typing	typed-columns-owned	
-tests/torn_read_gaps.rs	plain_typing_at_the_end_of_the_line_over_a_read_boundary_keeps_the_band_whole	typed-columns-owned	
 tests/torn_read_gaps.rs	the_owners_line_torn_under_to_of_into_keeps_its_band_whole	torn-read-restore	
-tests/torn_repaint_hidden_caret.rs	a_repaint_closing_inside_the_cap_keeps_the_boundary_space_lit	motion-caret-contract	
+tests/torn_repaint_hidden_caret.rs	a_correction_repainted_torn_keeps_its_keys_lit	rb-same-caret-echo	
+tests/torn_repaint_hidden_caret.rs	a_correction_the_app_has_not_drawn_spends_no_key	rb-same-caret-echo	
+tests/torn_repaint_hidden_caret.rs	a_key_erased_and_never_drawn_leaves_the_next_key_its_echo	rb-erase-echo-order	
+tests/torn_repaint_hidden_caret.rs	a_key_erased_before_its_echo_keeps_the_next_key_lit	rb-erase-echo-order	
 tests/torn_repaint_hidden_caret.rs	a_torn_full_screen_repaint_keeps_the_boundary_space_lit	motion-caret-contract	
+tests/torn_repaint_hidden_caret.rs	a_torn_mid_line_echo_keeps_the_space_lit	motion-caret-contract	
 tests/torn_repaint_hidden_caret.rs	a_torn_repaint_outliving_the_terminal_timeout_keeps_the_line_whole	motion-caret-contract	
-tests/torn_repaint_hidden_caret.rs	a_torn_repaint_with_the_hidden_caret_withheld_keeps_the_boundary_space_lit	motion-caret-contract	
 tests/torn_repaint_hidden_caret.rs	every_bracket_length_keeps_the_line_whole_under_the_shipping_contract	motion-caret-contract	
+tests/torn_repaint_hidden_caret.rs	every_correction_echoed_late_or_merged_keeps_the_line_lit	rb-erase-echo-order	
 tests/trick_flash_alloc.rs	a_flash_costs_the_input_path_and_the_frame_path_no_allocation	trick-paths-allocation-free	
 tests/typed_tricks_alloc.rs	a_warmed_listener_is_allocation_free_on_every_lane	trick-paths-allocation-free	
 tests/wake_and_landing_walk_origins.rs	a_jump_s_landing_marks_wear_the_band_they_land_on	one-walk-per-row	
-tests/wake_and_landing_walk_origins.rs	a_wake_after_a_finished_swoosh_has_nothing_lit_to_seam_against	one-walk-per-row	
 tests/wake_and_landing_walk_origins.rs	a_wake_keeps_the_colours_of_the_band_it_covers	one-walk-per-row	
 tests/walk_continuity_census.rs	census	cohort-walk-invariant	
 tests/word_reflow_identity.rs	spent_profanity_horizontal_redraw_does_not_rearm_or_decorate_fix	word-deco-rekey-preserves-spent-guard	
 tests/wrap_code_reflow.rs	a_delayed_first_key_still_carries_the_glued_word_down	rewrap-carries-word	
-tests/wrap_code_reflow.rs	a_footer_showing_the_keys_own_glyph_keeps_the_parks_custody	rewrap-carries-word	
 tests/wrap_code_reflow.rs	a_scrub_over_the_word_keeps_the_word_lit_when_it_wraps_down	rewrap-carries-word	
 tests/wrap_code_reflow.rs	a_soft_wrapped_word_that_stays_on_its_row_keeps_its_light_there	rewrap-carries-word	
 tests/wrap_code_reflow.rs	a_soft_wrapped_word_the_next_key_reflows_comes_down_with_its_light	rewrap-carries-word	
@@ -3860,12 +3046,8 @@ tests/wrap_code_reflow.rs	a_stale_typed_space_lays_nothing_on_the_continuation_i
 tests/wrap_code_reflow.rs	a_token_the_box_hard_breaks_keeps_its_band_on_the_row_it_fills	rewrap-carries-word	
 tests/wrap_code_reflow.rs	a_typo_fixed_inside_the_word_keeps_the_word_lit_when_it_wraps_down	rewrap-carries-word	
 tests/wrap_code_reflow.rs	a_word_begun_at_a_navigated_caret_keeps_its_first_glyph_when_it_wraps_down	rewrap-carries-word	
-tests/wrap_code_reflow.rs	an_erased_tail_under_a_foreign_footer_glyph_keeps_the_parks_custody	rewrap-carries-word	
-tests/wrap_code_reflow.rs	an_erased_tail_under_a_same_glyph_footer_keeps_the_parks_custody	rewrap-carries-word	
 tests/wrap_code_reflow.rs	claude_codes_recorded_reflow_keeps_every_typed_glyph_lit_and_strands_nothing	rewrap-carries-word	
 tests/wrap_code_reflow.rs	control_a_word_after_the_hands_own_space_is_relaid_exactly	rewrap-carries-word	
-tests/wrap_code_reflow.rs	control_a_word_typed_straight_through_wraps_down_lit	rewrap-carries-word	
-tests/wrap_code_reflow.rs	control_an_insert_that_never_folds_keeps_its_band_whole	rewrap-carries-word	
 tests/wrap_code_reflow.rs	the_first_key_that_pushes_a_glued_word_down_is_judged_not_parked	rewrap-carries-word	
 tests/wrapped_composer_band.rs	a_backspace_run_at_the_end_never_punches_a_hole_in_the_wrapped_band	ribbon-contiguity-invariant	
 tests/wrapped_composer_band.rs	a_backspace_run_mid_word_never_punches_a_hole_in_the_wrapped_band	ribbon-contiguity-invariant	
@@ -3875,7 +3057,6 @@ tests/zsh_isearch_band.rs	a_hidden_caret_s_echo_is_judged_alike_on_every_path	mi
 tests/zsh_isearch_band.rs	a_keyless_walk_back_onto_a_typed_echo_keeps_it	torn-lay-recall	
 tests/zsh_isearch_band.rs	a_longer_search_lays_no_band_on_cells_nobody_typed	minibuffer-gate	
 tests/zsh_isearch_band.rs	a_match_that_hops_along_its_row_lays_no_ink_there	re-anchor-landing-gate	
-tests/zsh_isearch_band.rs	a_minibuffer_echo_below_a_stationary_caret_lays_nothing_under_its_fake_cursor	minibuffer-gate	
 tests/zsh_isearch_band.rs	a_parked_caret_s_own_echo_lights_after_enter_on_the_caret_s_row	minibuffer-gate	
 tests/zsh_isearch_band.rs	a_parked_caret_s_own_echo_still_lights	minibuffer-gate	
 tests/zsh_isearch_band.rs	a_wide_glyph_echo_below_a_parked_caret_still_lights	press-credits-foreign-to-live	
@@ -3886,22 +3067,19 @@ tests/zsh_isearch_band.rs	isearch_ink_retires_within_the_idle_ceiling	glow-idle-
 tests/zsh_isearch_band.rs	one_torn_read_at_any_boundary_leaves_no_band_on_the_match_row	torn-lay-recall	
 tests/zsh_isearch_band.rs	plain_prompt_typing_lights_and_retires_on_the_normal_schedule	own-glyph-echo-lights	
 tests/zsh_isearch_band.rs	the_gates_refuse_nothing_in_claude_code_s_or_codex_s_composer	minibuffer-gate	
-tests/zsh_isearch_band.rs	the_minibuffer_echoes_are_refused_program_row	minibuffer-gate	
-tests/zsh_isearch_band.rs	the_refused_search_keys_pay_for_nothing_after_the_search	refused-presses-are-forgotten	
 tests/zsh_isearch_band.rs	torn_reads_leave_no_band_on_the_match_row	torn-lay-recall	
 tests/zsh_isearch_band.rs	typeahead_into_the_minibuffer_lays_nothing	minibuffer-gate	
-tests/zsh_isearch_band.rs	typing_on_the_prompt_row_after_leaving_the_search_still_lights_its_cells	own-glyph-echo-lights	
 tests/zsh_isearch_band.rs	whole_reads_lay_no_band_on_the_match_row_or_under_zle_s_fake_cursor	minibuffer-gate	
 ```
 
 
 ## 3. Coverage
 
-- 3027 tests in the crate (`#[test]` count at `ab02e1da7`). 2931 map to one of the 854 specs as primary. 96 are not spec samples (§4).
+- 3027 tests in the crate (`#[test]` count at `ab02e1da7`). 2931 map to one of the 855 specs as primary. 97 are not spec samples (§4).
 - 11 specs subsume no test today (they are the real-code statements their test-local model tests should become, or are corollaries only).
 - Biggest collapses (primary tests): `glow-exact-payment` (29), `rb-walk-continuity` (29), `rb-follow-witness` (29), `typed-columns-owned` (27), `glow-no-licence-no-light` (25), `copy-is-not-arrival` (23), `rewrap-carries-word` (23), `glow-park` (22), `insert-licence` (21), `output-streak-attribution` (17), `echo-ledger-refinement` (16), `pet-surface-seam-refines-model` (16).
 - Gap histogram (audit §7 row → specs blocked by it): 0 → 854, 1 → 775, 2 → 586, 3 → 564, 4 → 213, 5 → 391, 6 → 162, 7 → 443, 8 → 13, 9 → 11, 10 → 78, 11 → 10, 12 → 95, 13 → 38, 14 → 17, 16 → 3.
-- Non-spec tests by action: becomes-spec-after-fix 14, delete 51, move-to-bench 31.
+- Non-spec tests by action: becomes-spec-after-fix 14, delete 51, move-to-bench 30.
 
 ## 4. Tests that are not spec samples
 
@@ -3916,15 +3094,10 @@ Status 2026-10-15: the 30 rows marked **deleted** below were removed from the cr
 | `src/cat_glyphs_codegen.rs::cat_glyphs_gen_matches_assets` | **move-to-bench** | Drift gate over art/glyphs (fs read). |
 | `src/cat_glyphs_codegen.rs::dog_glyphs_gen_matches_assets` | **move-to-bench** | Drift gate over art/dogs (fs read). |
 | `src/cat_glyphs_codegen.rs::pet_glyphs_gen_matches_assets` | **move-to-bench** | Drift gate over art/pet (fs read). |
-| `src/cat_glyphs_codegen.rs::robi_glyphs_gen_matches_assets` | **move-to-bench** | Drift gate over checked-in generated source (fs read); a targo verify drift check, not a spec. |
 | `src/cursor_glow/tests/fire.rs::fire_field_is_deterministic` | **deleted** (was delete) | Two runs from the same t0 compare equal by construction; it cannot detect absolute-time dependence. |
-| `src/cursor_glow/tests/fire.rs::fire_streak_caps_are_ordered_for_the_head_bridge` | **delete** | Compares two consts; replace with a const assertion. The behaviour is in fire-no-recolor. |
-| `src/cursor_glow/tests/goldens.rs::rainbow_kitty_is_byte_identical_to_the_seam_era_v2` | **deleted** (was delete) | Golden hash pin, re-pinned on every deliberate change. |
-| `src/cursor_glow/tests/goldens.rs::the_flat_spelling_collapses_every_comet_branch_byte_for_byte` | **delete** | Golden hash re-pinned on every change; no property beyond v2-noninterference. |
 | `src/cursor_glow/tests/rainbow.rs::rainbow_occupied_coverage_derived_model_proves_and_catches_regression` | **becomes-spec-after-fix** | Test-local ty_model with a hand-copied Cap = 236 and no binding to the ribbon; becomes ribbon-occupied-cov-cap. |
 | `src/cursor_glow/tests/rainbow.rs::rainbow_retract_rearm_model_proves_and_catches_brightness_snap` | **becomes-spec-after-fix** | Test-local ty_model whose claimed Tier-1 projection does not exist; becomes ribbon-retract-rearm. |
 | `src/cursor_glow/tests/tint.rs::glyph_tint_box_corner_is_stronger_than_its_endpoints` | **deleted** (was delete) | Negative control on the guard's design; samples nothing beyond glyph-tint-palette. |
-| `src/cursor_glow/tests/trail_pack.rs::builtins_are_byte_identical_and_never_touch_the_custom_path` | **move-to-bench** | Golden whole-frame fold per style; keep as a regression corpus outside the unit suite. |
 | `src/cursor_glow/tests/water.rs::water_scales_from_trickle_to_torpedo` | **move-to-bench** | Aesthetic ratio between two scripted cadences. |
 | `src/cursor_rainbow.rs::active_rim_reuses_its_warmed_scratch` | **move-to-bench** | Vec capacity property, an allocator-dependent performance budget. |
 | `src/cursor_rainbow.rs::twinkle_flash_rate_stays_under_the_photosensitivity_bound` | **delete** | Constant arithmetic; move the inequality into a const assert beside the constants. |
@@ -3933,67 +3106,33 @@ Status 2026-10-15: the 30 rows marked **deleted** below were removed from the cr
 | `src/dog_baker.rs::host_ids_are_stable_distinct_and_namespaced` | **becomes-spec-after-fix** | Stability and the namespace bit are dog-baker-contract; drop the FNV distinctness point checks. |
 | `src/dog_cameo.rs::resummons_parade_distinct_breeds` | **becomes-spec-after-fix** | Its non-statistical half is dog-cameo-envelope; drop the "256 seeds reach most of the roster" half. |
 | `src/effect_util.rs::the_star_arm_ladder_is_ordered_and_derived` | **deleted** (was delete) | Restates a one-line definition already const-asserted. |
-| `src/effect_util.rs::the_stardust_accent_is_a_small_dealt_minority` | **delete** | Restates star_accent(seed) = seed % 16 == 0. |
 | `src/genome.rs::magic_windows_hit_expected_rates` | **move-to-bench** | 1e6-sample rate test; window widths are definitional; reads #[cfg(test)] cat_accessory. |
 | `src/genome.rs::simhash_locality` | **move-to-bench** | Statistical locality check of SimHash. |
 | `src/genome.rs::v4_magic_windows_hit_expected_rates` | **move-to-bench** | Statistical rate test; widths are definitional. |
 | `src/host.rs::press_outcomes_cross_the_boundary_as_their_u8` | **deleted** (was delete) | Tautology: the #[repr(u8)] discriminants fix the casts. |
 | `src/kitty_cursor.rs::on_summon_presents_without_ever_changing_the_look` | **deleted** (was delete) | Tests the #[cfg(test)] CursorCat::on_summon (no production caller); its live content, on_delight never changes look, is reactions-gate-and-preserve-identity. |
-| `src/kitty_pet.rs::a_lone_key_on_a_contented_cat_costs_a_counted_census` | **move-to-bench** | A wake-budget census; its claims are offer-soundness and needs-frames-motion. |
 | `src/kitty_pet.rs::a_lone_key_on_a_quiet_screen_costs_the_pet_a_counted_census` | **move-to-bench** | A wake-budget census; its correctness half repeats offer-soundness. |
-| `src/kitty_pet.rs::the_drift_brake_skids_on_a_planted_frame` | **becomes-spec-after-fix** | Arms the drift-brake by hand because production input never reaches it; make the gate reachable or delete the arm with this test. |
-| `src/kitty_registry.rs::accessory_trait_bits_are_pinned_and_disjoint` | **delete** | Pins const values and exercises the #[cfg(test)] accessory_trait_bits. |
 | `src/kitty_sing.rs::note_ring_never_exceeds_the_cap` | **deleted** (was delete) | The bounds are type facts of a fixed array; frames() is #[cfg(test)]. |
 | `src/matrix_rain/bake.rs::bake_bytes_are_deterministic` | **deleted** (was delete) | Determinism of a pure integer function; rb-box-filter states the bytes. |
-| `src/matrix_rain/bitmap_font.rs::the_table_is_pinned` | **move-to-bench** | An FNV digest pin of generated data; a drift guard, not a spec. |
 | `src/matrix_rain/field.rs::field_is_deterministic` | **deleted** (was delete) | Compares pure functions with themselves; glyph_at is #[cfg(test)]. |
 | `src/motion.rs::effect_set_is_complete` | **deleted** (was delete) | Checks #[cfg(test)] ALL bookkeeping; exhaustive matches already catch it. |
 | `src/motion.rs::ignoring_the_system_flag_is_caught` | **deleted** (was delete) | Negative control on a test-local closure; the model's Buggy twin is the real control. |
 | `src/motion.rs::serious_effect_set_is_complete_and_ordered` | **deleted** (was delete) | Same, for SeriousEffect. |
 | `src/motion.rs::serious_mode_policy_catches_an_ungated_effect` | **deleted** (was delete) | Negative control on a test-local closure. |
-| `src/output_streak.rs::a_different_seed_draws_differently` | **delete** | An existential point sample with no general property. |
 | `src/output_streak.rs::identical_scripts_replay_identical_light` | **deleted** (was delete) | Determinism by construction. |
 | `src/output_streak.rs::sound_edges_have_one_canonical_output_gesture_mapping` | **deleted** (was delete) | Restates an exhaustive match. |
 | `src/pet_world.rs::safe_endpoints_do_not_license_crossing_text` | **deleted** (was delete) | Exercises the #[cfg(test)] corridor_clear. |
 | `src/pipeline_input_tests.rs::glow_frame_equality_rejects_equal_count_changed_content` | **deleted** (was delete) | Tests the test harness's own equality. |
-| `src/rainbow_kitty/mod.rs::echo_band_fence_model_proves_and_catches_an_omitted_retirement` | **becomes-spec-after-fix** | Model-checks a ty_model defined in the test module; move the model into aterm_spec::derive as echo-band-fence's target. |
-| `src/rainbow_kitty/ribbon.rs::a_busy_band_keeps_its_boundary_and_pixel_signature_across_its_exit` | **delete** | Golden FNV hash of today's bytes; the laws it names are ribbon-frame-determinism, swoosh-monotone-retract and curtain-law. |
 | `src/rainbow_kitty/stardust.rs::a_point_query_reads_one_cell_not_the_whole_sky` | **move-to-bench** | A performance ratio through #[cfg(test)] counters. |
-| `src/rainbow_kitty/stardust.rs::a_twelve_cps_sky_holds_about_twenty_stars` | **move-to-bench** | Calibration census. |
-| `src/rainbow_kitty/stardust.rs::a_typing_sky_is_not_monochrome` | **move-to-bench** | Statistical chroma census. |
-| `src/rainbow_kitty/stardust.rs::stardust_is_a_magnitude_distribution_under_the_cap` | **move-to-bench** | Statistical census of the hash deal. |
-| `src/rainbow_kitty/stardust.rs::stardust_is_coloured_on_the_glass_not_white_with_a_tint` | **move-to-bench** | Ratio under a scanner heuristic. |
-| `src/rainbow_kitty/stardust.rs::the_stream_spent_share_is_the_exponential_s` | **becomes-spec-after-fix** | Define STREAM_SPENT from its expression (or a const assert) so it holds by construction. |
 | `src/rainbow_kitty/timing.rs::the_two_coverage_ceilings_hold_every_class` | **deleted** (was delete) | Compares literals with constants; the relations are already const assertions. |
-| `src/robi_baker.rs::every_pose_draws_a_robot` | **move-to-bench** | Asset quality check of generated art. |
-| `src/spectrum.rs::emit_spectrum_lut` | **move-to-bench** | An #[ignore]d generator that asserts nothing. |
-| `src/tone.rs::canonical_lines_land_in_plausible_classes` | **move-to-bench** | Pins the weights' verdicts on seven sentences. |
 | `src/tone.rs::holdout_sanity_set_clears_documented_floors` | **move-to-bench** | Model-quality accuracy gate of the trained weights. |
-| `src/trail_pack.rs::trail_pack_file_reader_admits_regular_and_rejects_oversize` | **deleted** (was delete) | Exercises the #[cfg(test)] read_trail_pack_file; the law is file-feed-bounded-regular-read. |
-| `src/trail_sound.rs::every_voice_lands_typed_on_the_ladder_floor` | **move-to-bench** | A single-seed loudness calibration pin. |
 | `src/trail_sound/rainbow_kitty_v2.rs::a_pause_the_render_clock_never_saw_still_rests_the_phrase` | **deleted** (was delete) | Exercises the #[cfg(test)] resume_after; the shipped half is mb-fallback-clock. |
-| `src/trail_sound/rainbow_kitty_v2.rs::the_isolated_step_lands_on_the_ladder_floor` | **move-to-bench** | A fit pin for KEY_TINE_TRIM. |
 | `src/trail_sweep.rs::row_sweep_lays_exactly_the_skipped_cells` | **deleted** (was delete) | Tests the #[cfg(test)] row_sweep_cells, which no production code calls. |
-| `src/word_decorations.rs::live_profanity_retype_model_proves_and_catches_unconditional_transfer` | **delete** | Model-checks a ty_model in #[cfg(test)]; move it to aterm_spec::derive as wd-typed-rearm's target. |
-| `src/word_decorations.rs::memo_hit_without_the_scan_chars_rebuild_trips_the_guard` | **delete** | Driven by a #[cfg(test)] mutation knob; it is the negative control wd-scan-memo-transparent's proof must carry. |
-| `tests/busy_status_rows_keep_their_brand.rs::every_law_over_the_whole_frame_and_latency_grid` | **delete** | An #[ignore]d rerun of the six laws over the full grid, subsumed by rb-echo-custody's for-all. |
-| `tests/cat_art_quality.rs::dump_hero_context_crops_when_requested` | **move-to-bench** | An env-gated preview dump that asserts nothing. |
-| `tests/claude_wrap_band.rs::census` | **move-to-bench** | An #[ignore]d diagnostic that asserts nothing. |
-| `tests/composer_multiline_wrap.rs::the_writers_reproduce_the_captured_wrap_chunks_byte_for_byte` | **delete** | Checks the harness's own byte writers. |
 | `tests/console_pet_escort_lead.rs::escort_feel_trace` | **deleted** (was delete) | An #[ignore]d diagnostic trace. |
-| `tests/console_pet_escort_lead.rs::the_oracle_sees_a_trailing_escort` | **delete** | Self-tests the test-local PetWorld oracle. |
-| `tests/cursor_bench.rs::bench_cursor_rainbow_frozen_sweep_baseline` | **move-to-bench** | An #[ignore]d wall-clock gate. |
-| `tests/cursor_bench.rs::bench_cursor_rainbow_hot_ribbon_worstcase` | **move-to-bench** | An #[ignore]d wall-clock gate. |
-| `tests/licensed_typed_parity.rs::an_unlicensed_script_moves_every_golden_entry` | **delete** | Control for a golden table that goes once licence-is-precondition is proved. |
 | `tests/nova_channel_budget.rs::four_panes_of_build_output_push_the_channel_past_the_backstop` | **deleted** (was delete) | Pins the absence of a cap; a premise, not a property. |
 | `tests/nova_channel_budget.rs::the_resident_scratch_grows_once_not_every_frame` | **deleted** (was delete) | Exercises a test-local replica of the host scratch. |
-| `tests/pet_holds_through_a_torn_frame.rs::every_bracket_torn_past_timeout_raw_chases_the_write_cursor` | **delete** | Becomes the mutation control of pet-torn-frame-hold. |
-| `tests/rainbow_kitty_v2_frame_cost.rs::bench_rainbow_kitty_v2_frame_cost_budget` | **move-to-bench** | An #[ignore]d CPU budget. |
 | `tests/ribbon_arrival_conformance.rs::the_2026_09_23_writer_is_caught_on_the_copies_that_stood` | **delete** | Becomes the mutation control of witness-arrival-evidence-refines-model. |
-| `tests/ribbon_follow_conformance.rs::the_2026_09_22_veto_is_the_buggy_model_and_the_contract_refuses_it` | **delete** | Becomes the mutation control of witness-follow-refines-twin-model. |
-| `tests/torn_repaint_hidden_caret.rs::the_pre_fix_contract_spends_the_keys_on_the_write_cursor` | **delete** | Becomes the mutation control of motion-caret-contract. |
-| `tests/walk_continuity_census.rs::the_census_flags_each_discontinuity_and_not_the_walk` | **delete** | Negative control of a test-only oracle. |
-| `tests/walk_continuity_census.rs::the_recolour_reading_sees_a_moved_stop_and_not_a_retype` | **delete** | Negative control of a test-only oracle. |
+| `tests/torn_repaint_hidden_caret.rs::a_raw_echo_anchor_spends_a_torn_space_at_the_line_end` | **delete** | Becomes the mutation control of motion-caret-contract (the echo anchor handed over raw). |
 | `tests/web_binding_parity.rs::effects_api_requires_matrix_rain_surface` | **deleted** (was becomes-spec-after-fix) | A symbol floor on another crate's text; single-sourcing makes it a compile error. |
 | `tests/web_binding_parity.rs::effects_api_requires_output_streak_surface` | **deleted** (was becomes-spec-after-fix) | Same as effects_api_requires_matrix_rain_surface. |
 | `tests/web_binding_parity.rs::every_cpu_only_web_binding_module_is_declared` | **deleted** (was delete) | Meta-test of a registry policed by a test. |
@@ -4003,8 +3142,6 @@ Status 2026-10-15: the 30 rows marked **deleted** below were removed from the cr
 | `tests/web_binding_parity.rs::production_binding_surface_is_identical` | **deleted** (was becomes-spec-after-fix) | Single-source the shared wasm-bindgen modules so parity holds by construction; until then an aterm-census guard. |
 | `tests/web_binding_parity.rs::wasm_lib_facade_surface_is_mirrored_by_gpu_web` | **deleted** (was becomes-spec-after-fix) | A shared trait both facades implement makes the mirror type-checked. |
 | `tests/wrap_code_reflow.rs::diagnostic_sweep` | **deleted** (was delete) | An #[ignore]d census that prints. |
-| `tests/zsh_isearch_band.rs::one_torn_read_at_any_boundary_lays_no_band_on_the_match_row` | **becomes-spec-after-fix** | The same known-false law over single tears. |
-| `tests/zsh_isearch_band.rs::torn_reads_lay_no_band_on_the_match_row` | **becomes-spec-after-fix** | #[ignore]d latent row asserting a zero-ink law the code knowingly misses (RAINBOW-PATH-V3 D-13); the met law is torn-lay-recall. |
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
@@ -4014,100 +3151,71 @@ Status 2026-10-15: the 30 rows marked **deleted** below were removed from the cr
 4. `rainbow.rs::rainbow_retract_rearm_model_proves_and_catches_brightness_snap`: its doc claims a Tier-1 projection of the real multiplier that no test or code binds. `rainbow_occupied_coverage_derived_model_proves_and_catches_regression` hard-codes Cap = 236 instead of reading RAINBOW_UNDER_COV_CAP.
 5. `fire.rs::halo_changes_change_the_fingerprint` and `frame_fingerprint_preserves_private_stream_identity_and_idle_zero`: "different stream => different fp" is a point fact about one FNV input pair, not a universal property; only the idle sentinel generalises.
 6. `goldens.rs` (all three): goldens are re-pinned whenever bytes move (the documented re-bake law), so they guard drift, not a specification.
-7. `cat_baker.rs::v4_accessory_overlay_differs_and_is_distinct_key` and `eyes_frame_bakes_distinct_but_open_is_authored`: their "distinct cache slots" halves exercise the #[cfg(test)] CatBakerV4, not the shipped CatBaker.
-8. `companion.rs::reduced_song_keeps_full_pet_present_and_late_cutoffs_never_blank`: the "forged blackout" half checks the model, not the code, and singer_visible is hard-wired false rather than read from CursorCat.
-9. `fire.rs::fire_field_is_deterministic` is labelled a determinism law but both runs share t0; the classic wake's twin (`the_same_schedule_folds_identically`) is the one that tests translation invariance.
-10. `rings.rs::classic_ring_grade_is_floored_and_capped_like_the_kittys` carries the doc comment of `landing_ring_bars_partition_the_square_outline` (which has none); the test itself checks the ring grade functions.
-11. `PressCredits::foreign_to_live`: the doc says None for any glyph-less live press, but the loop returns Some(false) as soon as a matching glyph appears earlier in physical slot order (not chronological order), even with a later glyph-less press. Harmless for refusal (only Some(true) refuses); press-credits-foreign-to-live states what the code does.
-12. `witness.rs::swept_path_retains_only_the_bounded_landing_suffix` asserts `path.capacity() <= MAX_SPARKS`, which depends on Vec growth policy; only the suffix values are spec.
-13. `cursor_momentum.rs::cooldown_is_monotone_and_snaps_to_exact_zero`: its analytic-crossing clause uses the #[cfg(test)] `TypingRate::cold_at`, pinning test-only code.
-14. `genome.rs::mix_decorrelates_and_is_nonzero`: distinctness is not universal; the 0 remap makes mix non-injective on one pair and the test samples 64 seeds.
-15. `genome.rs::simhash_bitsliced_equals_reference_over_voter_sets`: the live kernel is Reference, so the bitsliced functions have no production caller unless SIMHASH_KERNEL flips, and simhash_majority_reference is #[cfg(test)]. The equivalence is still the gate for that switch.
-16. `review.rs::a_press_the_tty_will_not_echo_banks_nothing_for_a_same_row_program_hop` computes a per-key clock but calls `note_typed_swallowed_no_echo()` with none, so the 85 ms cadence it describes never reaches the engine.
-17. `trail_pack.rs::builtins_are_byte_identical_and_never_touch_the_custom_path`: "never touch the custom path" is inferred from goldens matching; nothing observes that emit_custom is not called.
-18. `dog_baker.rs::every_breed_draws_a_dog` samples coats {0, 8, 15} although its doc says every ramp extreme; the spec ranges over all 16.
-19. `kitty_cursor.rs`: `typed_word_reactions_are_bounded_expression` and `delight_is_expression_not_displacement` drive the cat through the #[cfg(test)] `CursorCat::on_summon`, whose doc (and on_collect's) calls it the production path for a typed `kitty`; production never calls it (the GUI's on_summon is DogCameo's). Rewrite onto on_collect + on_delight and delete on_summon, or make it real.
-20. `kitty_cursor.rs::delight_is_expression_not_displacement` is near-vacuous: with no keys stride stays 0, so bob is 0 at both samples whatever the reaction.
-21. `kitty_cursor.rs::mid_flight_look_sync_is_latched_until_the_next_wake` guards its revive assertion with `if c.is_active()`, so the clause can be skipped silently.
-22. `kitty_cursor.rs::sixteen_high_band_keys_are_required_even_after_full_dwell` and the const assert against `V056_MIN_RUN_KEYS` pin a historical constant; that is release history, not a property.
-23. `kitty_cursor.rs::exit_rolls_are_roughly_20_20_60` is a 1000-sample ratio test over a deterministic orbit; the exact spec is the residue table.
-24. `kitty_cursor.rs::launch_kitties_are_unique_per_seed_and_stable` tests `KittyLook::for_launch` (kitty_registry.rs) from the wrong module; its 32-of-64 distinctness is a point sample.
-25. `kitty_cursor.rs::exit_flourish_inks_come_from_the_shared_recipe` asserts `exit_heart_light() == InkRole::OverText.ink(EXIT_HEART_PINK)`, the function's literal body; its real content is about InkRole::ink and is pinned at two seeds.
-26. `EXIT_STAR_SCINT`'s doc says the bound is pinned by a test; the property is a pure constant inequality and belongs in a const assertion.
-27. Stale doc: typing_momentum.rs says the metric "crosses the cat's 0.75 band", but CAT_BAND is 0.65 and the latency claims depend on 0.65.
-28. `static_frame`'s retirement to Hidden applies pending_look at once (`reduced_motion_flight_retires_and_releases_the_look_latch`), while `frame`'s FadeOut -> Hidden keeps it parked until the next summon. Both satisfy look-latch-per-appearance but leave `CursorCat.look` different; confirm it is intended.
-29. `kitty_pet.rs::a_long_gallop_overshoots_then_trots_back` puts every overshoot assertion under `if overshot`, which `the_drift_brakes_gate_is_rare_by_construction` shows never holds, so it only checks arrival and its name describes behaviour the code never shows.
-30. `kitty_pet.rs`: the drift-brake run-out is unreachable from production input (the skid test arms it by hand). Either the arm is dead code or its gate needs a trigger; no skid spec can be stated until that is decided.
-31. `kitty_pet.rs::no_bound_crosses_more_than_half_the_animal_in_a_frame` claims the sweep is not monotone in cols, but quiet_speed_max is a clamp of a linear function and is monotone; the comment is wrong.
-32. `kitty_pet.rs::the_gallop_cycle_never_exceeds_half_frame_rate` asserts cells-per-cycle > 3, which is distance pacing; the frame-rate law is the build-time const assert. Mislabelled. `a_sleeping_pet_asks_for_nothing_between_blinks` checks breath steps and Zs, not blinks.
-33. `kitty_pet.rs::a_confirmation_after_the_cat_answered_replays_nothing` asserts `!needs_frames() || pending_trick().is_none()` right after asserting `pending_trick() == None`, a tautology.
-34. `kitty_pet.rs::every_cat_pose_has_a_distinct_dog_counterpart`: DOG_SKIN documents a fallback that the shipped roster never uses; the property belongs in a const assert over the generated table. `the_catch_ttl_is_the_sky_m1_s_catchable_life` checks a hand-copied literal; derive it instead.
-35. `kitty_pet.rs::the_sleep_zees_drift_at_a_breathing_cadence`: its `hz < 3.0` clause checks a constant and belongs in a const assert.
-36. `console_life.rs::hidden_cursor_home_continuity_conforms_to_real_terminal_motion` checks conformance one step from the model's init only, never along multi-step traces.
-37. `kitty_pet.rs`: many tests assert exact counts over seeds 0..12 (`long == 8`, `glanced == 8`, `blinked == 4`), pinning the sample rather than the per-seed law over all 256 seeds; `force_seed` is a #[cfg(test)] seam.
-38. `kitty_registry.rs::registry_keys_are_unique_and_pinned` and `accessory_trait_bits_are_pinned_and_disjoint` test #[cfg(test)] code (`KittyShownAs::ALL`, `config_key`, `accessory_trait_bits`), so the pinned vocabulary is not the shipping one.
-39. `kitty_sing::bar_fan`: `(bar + 1).is_multiple_of(..)` overflows at `bar == u64::MAX`; the spec needs `requires bar < u64::MAX` or a saturating add.
-40. `matrix_rain/field.rs::trail_levels_are_time_keyed`: its doc claims a bound on changing rows that the body never checks, and head level 15 holds only when l >= 15.
-41. `matrix_rain::field::bits` panics for `b - a == 32`, and `col_params` has unchecked u32 products; the specs carry `requires` clauses.
-42. `matrix_rain/mod.rs::fingerprint_liveness_and_stability` asserts fp != 0 for every non-empty emission, but an FNV chain can hash to 0; only injectivity in the tick term is provable. The fingerprint also ignores RainHalo's cx/cy/rx/ry/mode, despite its doc.
-43. `nova.rs::debris_rides_add_stream_on_the_phase_grid`: its phase-grid half recomputes a one-bit value in the test and asserts it has at most 2 values, which always holds.
-44. `nova::crossing_ms(r_max, r_max, false)` returns 900 = RING_END_MS, where ring_radius returns None; the doc's "inside the ring window" holds only for dist < r_max.
-45. `nuke::nuke_nat_size` panics for cell_h <= 1 (`clamp(4.0, 2.0*ch)` with min > max); the test samples cell_h >= 12.
-46. `pet_baker.rs::host_ids_are_stable_and_distinct`: distinct keys can collide in host_tile_id when pre-OR hashes differ only in bit 63, so distinctness is not provable.
-47. `pipeline.rs::a_typed_trick_latches_through_the_pipeline_and_needs_ticks` drives #[cfg(test)] pipeline wrappers (`note_trick`, `revoke_trick`, `note_trick_submit`) that no page path ships.
-48. `rainbow_kitty/companion.rs`: `duty()`, `DutyQuery`, `Identity`, `BodyImpulse::deadline` and others are #[cfg(test)]; three tests pin a test-side mirror of `route_flying_head` instead of the production route.
-49. `rainbow_kitty::companion::placement`'s doc says it never covers the caret cell, but a grid too narrow for either side keeps the footprint over it (asserted by a test); state it conditionally.
-50. `matrix_overlay.rs::storage_is_reused_and_malformed_input_fails_closed` mixes an allocation-identity check with the fail-closed contract; only the latter is a spec.
-51. `meteor.rs::the_meteor_locks_to_the_carets_reflected_stop_on_a_long_line`: the doc says walk_t(47) = 1.861 for a 48-cell line, but the code uses walk_t(48.0) = 1.889.
-52. `meteor.rs::the_landing_s_ink_is_the_band_s_hot_ink_entry_for_entry` hard-codes `/128.0` instead of `(BED_INK_LUT_LEN-1)`; a LUT length change silently breaks the between-entries oracle.
-53. `ribbon.rs::a_line_still_being_typed_keeps_every_cell_from_its_first_key_to_the_caret` says the grace is 0.75 s, but PHRASE_REST_MIN_S is 0.90 s; it checks at +700 ms and never samples the real end.
-54. `ribbon.rs::a_slow_hand_s_grace_is_the_tempo_multiple_and_a_fast_hand_s_is_the_floor` labels a 60 ms-per-key fixture "10 cps" (it is about 16.7 cps).
-55. `ribbon.rs::a_fades_next_level_is_solved_not_polled`: the polling oracle accumulates `t += 1e-5` in f32 for up to 5 s, so its rounding approaches the 2e-4 tolerance it judges.
-56. `mod.rs::flow_draws_nothing_of_its_own`: the clause `(|cold-eng| < 1e-6) || cold > 0.0` pins nothing.
-57. `mod.rs::a_gold_star_near_a_contented_cat_is_offered_and_caught`: the "scratch shrank" check cannot fail on an append-only scratch, and the second-catch clause passes whenever catch_star returns false.
-58. `mod.rs::the_hole_tripwire_records_the_first_frame_of_a_hole_inside_a_lit_typed_line` pins the debug record's wording; only counts and the header fields are properties.
-59. `spine.rs::a_cold_hand_reaches_half_momentum_display_a_key_earlier_with_the_gain` and `ribbon.rs`'s two-sided channel pins (79..=81, 102..=104, 91..=93) are calibration point evaluations, kept only as evaluated corollaries.
-60. `meteor.rs::the_burst_covers_its_angles_uniformly_in_screen_space`: its thresholds were tuned on two geometries and one grade; it does not sample the general statement.
-61. `supernova.rs::tier_split_is_the_designed_distribution` carries the doc of `phases_live_in_their_windows`, and it measures statistically what the window table gives exactly (700/250/50 of 1000); `combo_ladder_climbs_to_guaranteed_nuke` does the same per level.
-62. `supernova.rs::detonation_has_a_hard_aggregate_readability_ceiling` bundles a contrast check of `aterm_render::Theme::default()` and lower "stays vivid" pins with the real ceiling law.
-63. `stardust.rs::a_hot_hand_deals_every_cell_a_field_star`: the doc's per-key birth figures disagree with the assertions; the ratio clauses are statistical and only "every laid cell holds a field star when hot" is exact.
-64. `stardust.rs::the_exhaust_costs_the_frame_train_its_own_window_and_no_more` and `the_exhaust_never_chimes...` mix calibration ratios and a direct check of a const match arm with the real predicate. `gold_is_dealt_not_inferred_from_yellow`'s 100..=200-of-1000 clause and `the_sky_at_two_x...`'s area ratios are statistical.
-65. `stardust.rs::a_field_star_rides_its_cell_s_envelope_not_the_grain_s_life` pins the literal horizon 1690 ms and grain life 225 ms inside a behavioural test.
-66. `spectrum.rs::spectrum_lut_has_bounded_adjacent_steps` measures the #[cfg(test)] generator, not the shipped LUT, and pins `worst == 4` against its own ceiling of 5.
-67. `robi.rs::deterministic_and_tips_rotate`'s ">= 6 distinct tips" depends on genome::mix; `tip_bank_is_wide_and_on_topic` pins one tip's text and its counts depend on the target OS (pick_tip's unreachable arm relies on them); `robi_baker.rs::host_ids_are_stable_distinct_and_namespaced`'s distinctness is sampled on an FNV hash.
-68. `trail_pack::read_trail_pack_file`'s doc says hosts call it, but it is #[cfg(test)]; `out_of_range_scalars_are_clamped_and_collected_in_one_pass`'s comment lists a 7th layer and 4th population the fixture lacks.
-69. `tone_infer.rs`: five tests assert concrete classifier verdicts on fixed text, pinning the trained weights rather than the tracker; `timing.rs::rain_spacing_rides_the_flight_clock`'s `5*spacing <= 250` clause is vacuous.
-70. `spec.rs::every_checked_in_community_toy_pack_compiles` enumerates the repository directory at test time; as a spec it should range over include_str! constants.
-71. `trail_sweep.rs` module docs list `row_sweep_cells`, `wrap_fold_cells` and `wrap_fold_cells_in_pane` as shared primitives the tests pin, but all three are #[cfg(test)]; only the physical_margin_fold half of `wrap_fold_finishes_old_row_and_starts_new` reaches shipped code.
-72. `TrailSynth::resume_after` is #[cfg(test)], yet the clock doc tells hosts to call it; either expose it or drop the doc.
-73. `trail_sound.rs::palettes_render_within_one_16bit_step_of_v056_reference` and `brrrring_of_rapid_line_feeds_is_pinned`: their music-box halves are golden folds, and the v1 oracle RefSynth mirrors redesigns in lock-step, so it is partly a copy of the code.
-74. `rainbow_kitty_v2.rs::every_class_is_deterministic_and_the_letter_path_is_untouched` part 2 and `the_ting_and_a_word_opening_capital_crest_no_higher_than_before_forte` are golden or baseline pins; the latter's doc admits the -14.5 dBFS clause stays open at word and sentence heads.
-75. Seed-sampled loudness windows (ladder, ting, space head, capital weight, flow echo) are checked on 1-5 seeds while their docs call a single crest a lottery; restate as seed means or phase-free energy before proving the for-all-seeds forms.
-76. Corpus statistics in mb-melodic-bounds tests and `the_typed_line_moves_more_than_it_repeats` are fixed-corpus facts; the latter's seed loop is vacuous because the v1 theme walk draws no randomness.
-77. `trail_sound.rs::every_pitched_voice_lands_on_the_melody_note` checks only Marimba and Felt; `the_glyph_rank_is_ordered_total_and_lossy` accepts 2..=8 buckets where the code promises eight.
-78. `trail_sound.rs::one_keystroke_of_heat_lag_is_audible` is a design-decision probe; `typing_momentum.rs::accrual_is_rate_capped...` uses a padded empirical ceiling instead of the closed-form bound; `typed_tricks.rs::a_paste_poisons` duplicates the escape test's first clause.
-79. `word_decorations.rs::twin_desync_dwells_and_descend_frames_differ` asserts the dwell differs for one twin pair; the jitter can collide for others, so only the dwell formula is a spec.
-80. `word_decorations.rs::sparkle_twinkle_is_frame_rate_independent`: frame-rate independence holds by construction; the load-bearing claim is the flash bound.
-81. `word_decorations.rs::scan_memo_spreads_rows_precomputed_to_collide` and `done_marks_spread_keys_precomputed_to_collide` are randomized with a claimed failure probability; not deterministic specs.
-82. `word_decorations.rs::allocation_regression_all_miss_repaint_reuses_retired_buffers`'s `fresh < 260*rows/10` is a ratio bound, not behaviour.
-83. `word_decorations.rs::kitty_emits_only_its_body_in_front_of_the_cursor` pins the v0.57 x offset against v0.56 (release history); `the_cursor_escort_really_grew_and_still_fits_its_slot`'s 34 px floor recalls an old design; `the_maneki_raised_paw_grew_with_its_keyline_intact`'s spans pin one art revision.
-84. `word_decorations.rs::coupling_pulse_is_deterministic_and_luminance_bounded`'s `pulsed_frames <= 32` depends on the 10 ms sampling step.
-85. `composer_box_growth_wrap.rs`'s two hand-return tests use ratios to a control with no derivation; the exact law is "flow and seam cleared".
-86. `composer_multiline_wrap.rs::the_limit_a_line_identical_to_the_one_above_it_or_one_column_off_melts_instead_of_following` pins a known limitation as expected behaviour.
-87. `abandoned_ribbon.rs::a_wrapped_line_s_first_row_goes_out_on_its_own_clock...` also asserts a constants-only bound; `busy_status_rows_keep_their_brand.rs`'s default run samples 6 of 20 replays chosen by a historical red count.
-88. `word_decorations.rs::one_keystroke_re_arms_one_cat_however_many_repaints_follow` depends on a timing premise against TYPED_EDIT_WITNESS_MS; `fix_never_triggers_or_inherits_profanity_rainbow` mixes classification, eviction and fingerprint claims.
-89. `tests/copies_are_not_moves.rs` and `moves_are_followed.rs`: the `the_limit_*` tests pin known-wrong outcomes as expected (a real move melts, a real copy lights), and `trail_host::holds_but` is a registry policed by a test, which AGENTS.md rules out; the spec is twin-evidence-timing's rule.
-90. `tests/wrap_code_reflow.rs::a_delayed_first_key_still_carries_the_glued_word_down`: its doc describes the old defect while the test asserts the fixed behaviour.
-91. `tests/console_pet_escort_lead.rs::the_escort_keeps_off_the_words_it_leads` mixes invariants with quality ratios (cover percentage, turns per second).
-92. `tests/nova_channel_budget.rs::the_over_budget_channel_is_drawn_in_full_not_truncated` passes vacuously on a headless host with no monospace font, and tests aterm-render, not this crate.
-93. `tests/cursor_bench.rs::cursor_rainbow_hot_ribbon_work_stays_below_its_normalized_share` restates RAINBOW_RIBBON_QUAD_BUDGET and MAX_QUADS as literals because tests cannot see the consts.
-94. `tests/licensed_typed_parity.rs`'s golden fold pins numbers and prints instead of asserting under `ATERM_CAPTURE_TYPED_PARITY=1`; `cursor_cat_conformance.rs` and `kitty_activation_conformance.rs` run `ty trace validate` only when installed.
-95. `tests/web_binding_parity.rs` reads other crates' source from disk (aterm-census territory); `tests/pet_art_quality.rs` reads art/pet/*.toml rather than the compiled table; `tests/serde_corpus.rs` compares against the retired dependency's recorded answers.
-96. `tests/shed_frame_is_still_a_heard_key.rs::a_shed_tick_keeps_the_keyed_click_ledger` overclaims: only the shed == lit equality is meaningful. Many host-seam files record "RED on 0.93.0 N of M" history in doc comments.
-97. `zsh_isearch_band.rs::the_gates_refuse_nothing_in_claude_code_s_or_codex_s_composer`: beyond the gates' positive halves it asserts facts about 16 recordings of external programs, which no proof of CursorGlow carries; the residue belongs in a corpus lane.
-98. `zsh_isearch_band.rs`'s torn recall tests pin a 330 ms bound built from TORN_REST_S and the retract; derive it from the named constants rather than restating 330. Their `tried > 100` and `recalled > 0` checks are fixture non-vacuity, not code properties.
-99. `zsh_isearch_band.rs::a_hidden_caret_s_echo_is_judged_alike_on_every_path`: the equivalence holds only because the arm checks caret_hidden, and seam.rs documents that a visible parked caret with a fake cursor goes dark by design; the spec keeps that exclusion.
-100. `zsh_isearch_band.rs::whole_reads_lay_no_band_on_the_match_row_or_under_zle_s_fake_cursor`'s oracle accepts any status cell whose glyph is among the typed chars, weaker than cell identity.
+7. `PressCredits::foreign_to_live`: the doc says None for any glyph-less live press, but the loop returns Some(false) as soon as a matching glyph appears earlier in physical slot order (not chronological order), even with a later glyph-less press. Harmless for refusal (only Some(true) refuses); press-credits-foreign-to-live states what the code does.
+8. `witness.rs::swept_path_retains_only_the_bounded_landing_suffix` asserts `path.capacity() <= MAX_SPARKS`, which depends on Vec growth policy; only the suffix values are spec.
+9. `cursor_momentum.rs::cooldown_is_monotone_and_snaps_to_exact_zero`: its analytic-crossing clause uses the #[cfg(test)] `TypingRate::cold_at`, pinning test-only code.
+10. `genome.rs::simhash_bitsliced_equals_reference_over_voter_sets`: the live kernel is Reference, so the bitsliced functions have no production caller unless SIMHASH_KERNEL flips, and simhash_majority_reference is #[cfg(test)]. The equivalence is still the gate for that switch.
+11. `review.rs::a_press_the_tty_will_not_echo_banks_nothing_for_a_same_row_program_hop` computes a per-key clock but calls `note_typed_swallowed_no_echo()` with none, so the 85 ms cadence it describes never reaches the engine.
+12. `dog_baker.rs::every_breed_draws_a_dog` samples coats {0, 8, 15} although its doc says every ramp extreme; the spec ranges over all 16.
+13. `kitty_cursor.rs`: `typed_word_reactions_are_bounded_expression` and `delight_is_expression_not_displacement` drive the cat through the #[cfg(test)] `CursorCat::on_summon`, whose doc (and on_collect's) calls it the production path for a typed `kitty`; production never calls it (the GUI's on_summon is DogCameo's). Rewrite onto on_collect + on_delight and delete on_summon, or make it real.
+14. `kitty_cursor.rs::delight_is_expression_not_displacement` is near-vacuous: with no keys stride stays 0, so bob is 0 at both samples whatever the reaction.
+15. `kitty_cursor.rs::mid_flight_look_sync_is_latched_until_the_next_wake` guards its revive assertion with `if c.is_active()`, so the clause can be skipped silently.
+16. `kitty_cursor.rs::sixteen_high_band_keys_are_required_even_after_full_dwell` and the const assert against `V056_MIN_RUN_KEYS` pin a historical constant; that is release history, not a property.
+17. `kitty_cursor.rs::launch_kitties_are_unique_per_seed_and_stable` tests `KittyLook::for_launch` (kitty_registry.rs) from the wrong module; its 32-of-64 distinctness is a point sample.
+18. `EXIT_STAR_SCINT`'s doc says the bound is pinned by a test; the property is a pure constant inequality and belongs in a const assertion.
+19. Stale doc: typing_momentum.rs says the metric "crosses the cat's 0.75 band", but CAT_BAND is 0.65 and the latency claims depend on 0.65.
+20. `static_frame`'s retirement to Hidden applies pending_look at once (`reduced_motion_flight_retires_and_releases_the_look_latch`), while `frame`'s FadeOut -> Hidden keeps it parked until the next summon. Both satisfy look-latch-per-appearance but leave `CursorCat.look` different; confirm it is intended.
+21. `kitty_pet.rs`: the drift-brake run-out is unreachable from production input. Either the arm is dead code or its gate needs a trigger; no skid spec can be stated until that is decided.
+22. `kitty_pet.rs::no_bound_crosses_more_than_half_the_animal_in_a_frame` claims the sweep is not monotone in cols, but quiet_speed_max is a clamp of a linear function and is monotone; the comment is wrong.
+23. `kitty_pet.rs::the_gallop_cycle_never_exceeds_half_frame_rate` asserts cells-per-cycle > 3, which is distance pacing; the frame-rate law is the build-time const assert. Mislabelled.
+24. `kitty_pet.rs::a_confirmation_after_the_cat_answered_replays_nothing` asserts `!needs_frames() || pending_trick().is_none()` right after asserting `pending_trick() == None`, a tautology.
+25. `kitty_pet.rs::every_cat_pose_has_a_distinct_dog_counterpart`: DOG_SKIN documents a fallback that the shipped roster never uses; the property belongs in a const assert over the generated table. `the_catch_ttl_is_the_sky_m1_s_catchable_life` checks a hand-copied literal; derive it instead.
+26. `console_life.rs::hidden_cursor_home_continuity_conforms_to_real_terminal_motion` checks conformance one step from the model's init only, never along multi-step traces.
+27. `kitty_pet.rs`: many tests assert exact counts over seeds 0..12 (`long == 8`, `glanced == 8`, `blinked == 4`), pinning the sample rather than the per-seed law over all 256 seeds; `force_seed` is a #[cfg(test)] seam.
+28. `kitty_sing::bar_fan`: `(bar + 1).is_multiple_of(..)` overflows at `bar == u64::MAX`; the spec needs `requires bar < u64::MAX` or a saturating add.
+29. `matrix_rain::field::bits` panics for `b - a == 32`, and `col_params` has unchecked u32 products; the specs carry `requires` clauses.
+30. `matrix_rain/mod.rs::fingerprint_liveness_and_stability` asserts fp != 0 for every non-empty emission, but an FNV chain can hash to 0; only injectivity in the tick term is provable. The fingerprint also ignores RainHalo's cx/cy/rx/ry/mode, despite its doc.
+31. `nova::crossing_ms(r_max, r_max, false)` returns 900 = RING_END_MS, where ring_radius returns None; the doc's "inside the ring window" holds only for dist < r_max.
+32. `nuke::nuke_nat_size` panics for cell_h <= 1 (`clamp(4.0, 2.0*ch)` with min > max); the test samples cell_h >= 12.
+33. `pet_baker.rs::host_ids_are_stable_and_distinct`: distinct keys can collide in host_tile_id when pre-OR hashes differ only in bit 63, so distinctness is not provable.
+34. `pipeline.rs::a_typed_trick_latches_through_the_pipeline_and_needs_ticks` drives #[cfg(test)] pipeline wrappers (`note_trick`, `revoke_trick`, `note_trick_submit`) that no page path ships.
+35. `rainbow_kitty::companion::placement`'s doc says it never covers the caret cell, but a grid too narrow for either side keeps the footprint over it (asserted by a test); state it conditionally.
+36. `ribbon.rs::a_line_still_being_typed_keeps_every_cell_from_its_first_key_to_the_caret` says the grace is 0.75 s, but PHRASE_REST_MIN_S is 0.90 s; it checks at +700 ms and never samples the real end.
+37. `ribbon.rs::a_fades_next_level_is_solved_not_polled`: the polling oracle accumulates `t += 1e-5` in f32 for up to 5 s, so its rounding approaches the 2e-4 tolerance it judges.
+38. `mod.rs::flow_draws_nothing_of_its_own`: the clause `(|cold-eng| < 1e-6) || cold > 0.0` pins nothing.
+39. `mod.rs::a_gold_star_near_a_contented_cat_is_offered_and_caught`: the "scratch shrank" check cannot fail on an append-only scratch, and the second-catch clause passes whenever catch_star returns false.
+40. `supernova.rs::combo_ladder_climbs_to_guaranteed_nuke` measures statistically, level by level, what the window table gives exactly.
+41. `supernova.rs::detonation_has_a_hard_aggregate_readability_ceiling` bundles a contrast check of `aterm_render::Theme::default()` and lower "stays vivid" pins with the real ceiling law.
+42. `stardust.rs::the_exhaust_costs_the_frame_train_its_own_window_and_no_more` and `the_exhaust_never_chimes...` mix calibration ratios and a direct check of a const match arm with the real predicate.
+43. `stardust.rs::a_field_star_rides_its_cell_s_envelope_not_the_grain_s_life` pins the literal horizon 1690 ms and grain life 225 ms inside a behavioural test.
+44. `spectrum.rs::spectrum_lut_has_bounded_adjacent_steps` measures the #[cfg(test)] generator, not the shipped LUT, and pins `worst == 4` against its own ceiling of 5.
+45. `tone_infer.rs`: five tests assert concrete classifier verdicts on fixed text, pinning the trained weights rather than the tracker.
+46. `spec.rs::every_checked_in_community_toy_pack_compiles` enumerates the repository directory at test time; as a spec it should range over include_str! constants.
+47. `trail_sweep.rs` module docs list `row_sweep_cells`, `wrap_fold_cells` and `wrap_fold_cells_in_pane` as shared primitives the tests pin, but all three are #[cfg(test)]; only the physical_margin_fold half of `wrap_fold_finishes_old_row_and_starts_new` reaches shipped code.
+48. `TrailSynth::resume_after` is #[cfg(test)], yet the clock doc tells hosts to call it; either expose it or drop the doc.
+49. Seed-sampled loudness windows (ladder, ting, space head, capital weight, flow echo) are checked on 1-5 seeds while their docs call a single crest a lottery; restate as seed means or phase-free energy before proving the for-all-seeds forms.
+50. Corpus statistics in mb-melodic-bounds tests are fixed-corpus facts.
+51. `trail_sound.rs::every_pitched_voice_lands_on_the_melody_note` checks only Marimba and Felt; `the_glyph_rank_is_ordered_total_and_lossy` accepts 2..=8 buckets where the code promises eight.
+52. `typing_momentum.rs::accrual_is_rate_capped...` uses a padded empirical ceiling instead of the closed-form bound.
+53. `word_decorations.rs::scan_memo_spreads_rows_precomputed_to_collide` and `done_marks_spread_keys_precomputed_to_collide` are randomized with a claimed failure probability; not deterministic specs.
+54. `word_decorations.rs::allocation_regression_all_miss_repaint_reuses_retired_buffers`'s `fresh < 260*rows/10` is a ratio bound, not behaviour.
+55. `word_decorations.rs::coupling_pulse_is_deterministic_and_luminance_bounded`'s `pulsed_frames <= 32` depends on the 10 ms sampling step.
+56. `composer_box_growth_wrap.rs`'s two hand-return tests use ratios to a control with no derivation; the exact law is "flow and seam cleared".
+57. `composer_multiline_wrap.rs::the_limit_a_line_identical_to_the_one_above_it_or_one_column_off_melts_instead_of_following` pins a known limitation as expected behaviour.
+58. `abandoned_ribbon.rs::a_wrapped_line_s_first_row_goes_out_on_its_own_clock...` also asserts a constants-only bound; `busy_status_rows_keep_their_brand.rs`'s default run samples 6 of 20 replays chosen by a historical red count.
+59. `word_decorations.rs::one_keystroke_re_arms_one_cat_however_many_repaints_follow` depends on a timing premise against TYPED_EDIT_WITNESS_MS; `fix_never_triggers_or_inherits_profanity_rainbow` mixes classification, eviction and fingerprint claims.
+60. `tests/copies_are_not_moves.rs` and `moves_are_followed.rs`: the `the_limit_*` tests pin known-wrong outcomes as expected (a real move melts, a real copy lights), and `trail_host::holds_but` is a registry policed by a test, which AGENTS.md rules out; the spec is twin-evidence-timing's rule.
+61. `tests/wrap_code_reflow.rs::a_delayed_first_key_still_carries_the_glued_word_down`: its doc describes the old defect while the test asserts the fixed behaviour.
+62. `tests/console_pet_escort_lead.rs::the_escort_keeps_off_the_words_it_leads` mixes invariants with quality ratios (cover percentage, turns per second).
+63. `tests/nova_channel_budget.rs::the_over_budget_channel_is_drawn_in_full_not_truncated` passes vacuously on a headless host with no monospace font, and tests aterm-render, not this crate.
+64. `tests/cursor_bench.rs::cursor_rainbow_hot_ribbon_work_stays_below_its_normalized_share` restates RAINBOW_RIBBON_QUAD_BUDGET and MAX_QUADS as literals because tests cannot see the consts.
+65. `tests/licensed_typed_parity.rs`'s golden fold pins numbers and prints instead of asserting under `ATERM_CAPTURE_TYPED_PARITY=1`; `cursor_cat_conformance.rs` and `kitty_activation_conformance.rs` run `ty trace validate` only when installed.
+66. `tests/pet_art_quality.rs` reads art/pet/*.toml rather than the compiled table; `tests/serde_corpus.rs` compares against the retired dependency's recorded answers.
+67. `tests/shed_frame_is_still_a_heard_key.rs::a_shed_tick_keeps_the_keyed_click_ledger` overclaims: only the shed == lit equality is meaningful. Many host-seam files record "RED on 0.93.0 N of M" history in doc comments.
+68. `zsh_isearch_band.rs::the_gates_refuse_nothing_in_claude_code_s_or_codex_s_composer`: beyond the gates' positive halves it asserts facts about 16 recordings of external programs, which no proof of CursorGlow carries; the residue belongs in a corpus lane.
+69. `zsh_isearch_band.rs`'s torn recall tests pin a 330 ms bound built from TORN_REST_S and the retract; derive it from the named constants rather than restating 330. Their `tried > 100` and `recalled > 0` checks are fixture non-vacuity, not code properties.
+70. `zsh_isearch_band.rs::a_hidden_caret_s_echo_is_judged_alike_on_every_path`: the equivalence holds only because the arm checks caret_hidden, and seam.rs documents that a visible parked caret with a fake cursor goes dark by design; the spec keeps that exclusion.
+71. `zsh_isearch_band.rs::whole_reads_lay_no_band_on_the_match_row_or_under_zle_s_fake_cursor`'s oracle accepts any status cell whose glyph is among the typed chars, weaker than cell identity.
 
 ## 6. Proof order (easiest high-value first)
 

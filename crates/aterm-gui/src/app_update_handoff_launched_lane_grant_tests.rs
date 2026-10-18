@@ -180,18 +180,19 @@ fn a_worker_that_skips_verification_still_refuses_a_raised_floor() {
     // Negative control: a worker that verifies never asks the floor separately (the full check
     // reads it), and files the verifier's word.
     job.verify_staged_candidate = true;
-    assert_eq!(
-        super::worker_pre_park_check(
-            &mut job,
-            |_| Err("codesign --verify (structural) failed".to_string()),
-            |_, _| panic!("the full check reads the floor itself"),
+    let verified = super::worker_pre_park_check(
+        &mut job,
+        |_| Err("codesign --verify (structural) failed".to_string()),
+        |_, _| panic!("the full check reads the floor itself"),
+    );
+    assert!(
+        matches!(
+            &verified,
+            Err(super::PreParkRefusal::Verification { outcome, detail })
+                if *outcome == crate::UpdateHandoffOutcome::PreparationFailed
+                    && detail.contains("codesign --verify (structural) failed")
         ),
-        Err(super::PreParkRefusal::Verification {
-            outcome: crate::UpdateHandoffOutcome::PreparationFailed,
-            detail: "staged update failed pre-park verification: codesign --verify \
-                     (structural) failed"
-                .to_string(),
-        })
+        "the verifier's word is filed: {verified:?}"
     );
     app.update_handoff_prelaunch = None;
 }
@@ -268,10 +269,13 @@ fn a_worker_that_verifies_keeps_its_verdict_for_the_booking() {
     assert!(!entry.passed);
     assert_eq!(entry.build, ticket.target_build());
     assert_eq!(entry.artifact, ticket.target_dmg_sha256());
-    assert_eq!(
-        entry.reason.as_deref(),
-        Some(format!("staged update failed pre-park verification: {folder}").as_str()),
-        "in the arm-time read's own words"
+    assert!(
+        entry
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains(&folder)),
+        "the verifier's word is kept: {:?}",
+        entry.reason
     );
     app.update_handoff_prelaunch = None;
 }

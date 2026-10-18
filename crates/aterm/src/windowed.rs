@@ -1,36 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-windowed` — the WINDOWED image of the one front door (Windows).
+//! `aterm-windowed`: the windowed image of the one front door (Windows).
 //!
-//! The PE subsystem is a header field of ONE FILE, and a Windows shell keys on
-//! it: it waits for a console-subsystem child and returns at once from a
-//! GUI-subsystem one. `aterm.exe` (built from `src/main.rs`) is the console
-//! image, so `aterm help`, `aterm ctl …` and every CLI alias hardlinked onto it
-//! print inline, pipe, and are waited for. THIS bin is the same front door —
-//! `main.rs` is included below as a module, byte for byte, so there is still
-//! exactly one `main` and one routing table — with the one attribute the
-//! Start Menu, the Explorer verb, the jump list and a pinned tile need: no
-//! console flashes on launch. `build.ps1` ships it as `aterm-gui.exe`; under
-//! that argv0 (and under its own target name) the router serves the window
-//! in-process, and the console image hands every window it is asked for to
-//! this file's sibling copy (`main.rs`'s `run_window`). See
-//! `docs/NATIVE_WINDOWS_DESIGN.md` §7 and the header of `main.rs`.
+//! A Windows shell keys on a file's PE subsystem: it waits for a console-subsystem child and
+//! returns at once from a GUI one. `aterm.exe` (`src/main.rs`) is the console image, so
+//! `aterm help`, `aterm ctl …` and every CLI alias hardlinked onto it print inline, pipe and are
+//! waited for. This bin includes `main.rs` as a module (one `main`, one routing table) and adds
+//! the attribute the Start Menu, the Explorer verb, the jump list and a pinned tile need: no
+//! console flash. `build.ps1` ships it as `aterm-gui.exe`; under that argv0 (and its own target
+//! name) the router serves the window in-process, and the console image hands every window to
+//! this sibling (`main.rs`'s `run_window`). See `docs/NATIVE_WINDOWS_DESIGN.md` §7.
 //!
-//! On macOS and Linux this target still builds — cargo has no per-target `cfg`
-//! for a `[[bin]]` — but as a std-only STUB: including the front door there
-//! would make every `build --release -p aterm` (the release cutter's per-arch
-//! slice, `ship dev-app`, `tools/install.sh`, the conformance support
-//! build) run a second whole-program `lto = true` link of the largest binary,
-//! for an artifact no bundle, release or install list carries.
+//! Elsewhere it builds as a std-only stub (cargo has no per-target `[[bin]]`): including the
+//! front door would add a second whole-program `lto = true` link of the largest binary to every
+//! `build --release -p aterm`, for an artifact nothing ships.
 
-// `not(test)` on the attribute as well: a test harness is not a window, and a
-// GUI-subsystem harness would have no console to print its results to.
+// `not(test)`: a GUI-subsystem test harness would have no console to print to.
 #![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 
-// The front door's body — on Windows only (see the module docs), and under
-// `not(test)` so `cargo test -p aterm` runs the tests it carries ONCE, in the
-// `aterm` bin's harness, whose root the file is, rather than a second time here.
+// The front door's body: Windows only, and `not(test)` so its tests run once, in the `aterm`
+// bin's harness.
 #[cfg(all(windows, not(test)))]
 #[path = "main.rs"]
 mod front_door;

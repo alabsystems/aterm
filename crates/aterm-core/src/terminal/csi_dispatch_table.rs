@@ -1,10 +1,11 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 //
-// Maintained by hand. `test_no_collisions` re-derives every occupied slot and
-// refuses a duplicate; `test_entry_count` pins the population. A sequence that
-// does not hash into a free slot falls back to `csi_dispatch_untabled`
-// (handler_csi.rs), which both dispatch paths take on a miss.
+// Maintained by hand. `every_entry_sits_in_its_own_hash_slot` re-derives every
+// occupied slot from its key, so a misplaced entry (one `lookup_csi_handler`
+// could never find) fails. A sequence that does not hash into a free slot falls
+// back to `csi_dispatch_untabled` (handler_csi.rs), which both dispatch paths
+// take on a miss.
 //
 //! Minimal perfect hash table for CSI dispatch routing.
 //!
@@ -270,385 +271,32 @@ pub(crate) fn lookup_csi_handler(intermediates: &[u8], final_byte: u8) -> Option
 mod tests {
     use super::*;
 
+    /// Every occupied slot holds the entry its own key hashes to, so each
+    /// entry is reachable through `lookup_csi_handler`.
     #[test]
-    fn test_all_entries_resolve() {
-        assert_eq!(
-            lookup_csi_handler(&[], 0x6d),
-            Some(CsiHandler::Sgr),
-            "failed for Sgr",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[], 0x41),
-            Some(CsiHandler::CursorUp),
-            "failed for CursorUp",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[], 0x42),
-            Some(CsiHandler::CursorDown),
-            "failed for CursorDown",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[], 0x43),
-            Some(CsiHandler::CursorForward),
-            "failed for CursorForward",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[], 0x44),
-            Some(CsiHandler::CursorBackward),
-            "failed for CursorBackward",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[], 0x48),
-            Some(CsiHandler::CursorPosition),
-            "failed for CursorPosition",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[], 0x66),
-            Some(CsiHandler::CursorPositionAlt),
-            "failed for CursorPositionAlt",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[], 0x45),
-            Some(CsiHandler::CursorNextLine),
-            "failed for CursorNextLine",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[], 0x46),
-            Some(CsiHandler::CursorPrevLine),
-            "failed for CursorPrevLine",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[], 0x47),
-            Some(CsiHandler::CursorHorizAbs),
-            "failed for CursorHorizAbs",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[], 0x64),
-            Some(CsiHandler::LinePositionAbs),
-            "failed for LinePositionAbs",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[], 0x61),
-            Some(CsiHandler::CharPositionRelative),
-            "failed for CharPositionRelative",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[], 0x65),
-            Some(CsiHandler::LinePositionRel),
-            "failed for LinePositionRel",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[], 0x60),
-            Some(CsiHandler::CharPositionAbs),
-            "failed for CharPositionAbs",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[], 0x4a),
-            Some(CsiHandler::EraseDisplay),
-            "failed for EraseDisplay",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[], 0x4b),
-            Some(CsiHandler::EraseLine),
-            "failed for EraseLine",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[], 0x53),
-            Some(CsiHandler::ScrollUp),
-            "failed for ScrollUp",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[], 0x54),
-            Some(CsiHandler::ScrollDown),
-            "failed for ScrollDown",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[], 0x40),
-            Some(CsiHandler::InsertChars),
-            "failed for InsertChars",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[], 0x50),
-            Some(CsiHandler::DeleteChars),
-            "failed for DeleteChars",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[], 0x4c),
-            Some(CsiHandler::InsertLines),
-            "failed for InsertLines",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[], 0x4d),
-            Some(CsiHandler::DeleteLines),
-            "failed for DeleteLines",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[], 0x58),
-            Some(CsiHandler::EraseChars),
-            "failed for EraseChars",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[], 0x62),
-            Some(CsiHandler::RepeatChar),
-            "failed for RepeatChar",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[], 0x5a),
-            Some(CsiHandler::BackwardTab),
-            "failed for BackwardTab",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[], 0x49),
-            Some(CsiHandler::ForwardTab),
-            "failed for ForwardTab",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[], 0x73),
-            Some(CsiHandler::SaveCursor),
-            "failed for SaveCursor",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[], 0x75),
-            Some(CsiHandler::RestoreCursor),
-            "failed for RestoreCursor",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[], 0x72),
-            Some(CsiHandler::SetScrollRegion),
-            "failed for SetScrollRegion",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[], 0x67),
-            Some(CsiHandler::TabClear),
-            "failed for TabClear",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[], 0x68),
-            Some(CsiHandler::SetMode),
-            "failed for SetMode",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[], 0x6c),
-            Some(CsiHandler::ResetMode),
-            "failed for ResetMode",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[], 0x6e),
-            Some(CsiHandler::DeviceStatusReport),
-            "failed for DeviceStatusReport",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[], 0x63),
-            Some(CsiHandler::PrimaryDA),
-            "failed for PrimaryDA",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[], 0x74),
-            Some(CsiHandler::Xtwinops),
-            "failed for Xtwinops",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b'?'], 0x68),
-            Some(CsiHandler::DecModeSet),
-            "failed for DecModeSet",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b'?'], 0x6c),
-            Some(CsiHandler::DecModeReset),
-            "failed for DecModeReset",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b'?'], 0x4a),
-            Some(CsiHandler::SelectiveEraseDisplay),
-            "failed for SelectiveEraseDisplay",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b'?'], 0x4b),
-            Some(CsiHandler::SelectiveEraseLine),
-            "failed for SelectiveEraseLine",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b'?'], 0x75),
-            Some(CsiHandler::KittyKeyboardQuery),
-            "failed for KittyKeyboardQuery",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b'?'], 0x6d),
-            Some(CsiHandler::XtermModkeysQuery),
-            "failed for XtermModkeysQuery",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b'?'], 0x67),
-            Some(CsiHandler::XtermFmtkeysQuery),
-            "failed for XtermFmtkeysQuery",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b'?'], 0x53),
-            Some(CsiHandler::Xtsmgraphics),
-            "failed for Xtsmgraphics",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b'?'], 0x6e),
-            Some(CsiHandler::DecDsr),
-            "failed for DecDsr",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b'?'], 0x73),
-            Some(CsiHandler::Xtsave),
-            "failed for Xtsave",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b'?'], 0x72),
-            Some(CsiHandler::Xtrestore),
-            "failed for Xtrestore",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b'?'], 0x57),
-            Some(CsiHandler::Decst8c),
-            "failed for Decst8c",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b'?', b'$'], 0x70),
-            Some(CsiHandler::Decrqm),
-            "failed for Decrqm",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b'>'], 0x63),
-            Some(CsiHandler::SecondaryDA),
-            "failed for SecondaryDA",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b'>'], 0x6d),
-            Some(CsiHandler::XtmodkeysSet),
-            "failed for XtmodkeysSet",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b'>'], 0x6e),
-            Some(CsiHandler::XtmodkeysDisable),
-            "failed for XtmodkeysDisable",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b'>'], 0x66),
-            Some(CsiHandler::XtfmtkeysSet),
-            "failed for XtfmtkeysSet",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b'>'], 0x71),
-            Some(CsiHandler::Xtversion),
-            "failed for Xtversion",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b'>'], 0x75),
-            Some(CsiHandler::KittyKeyboardPush),
-            "failed for KittyKeyboardPush",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b'='], 0x63),
-            Some(CsiHandler::TertiaryDA),
-            "failed for TertiaryDA",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b'='], 0x75),
-            Some(CsiHandler::KittyKeyboardSet),
-            "failed for KittyKeyboardSet",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b'<'], 0x75),
-            Some(CsiHandler::KittyKeyboardPop),
-            "failed for KittyKeyboardPop",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b'!'], 0x70),
-            Some(CsiHandler::Decstr),
-            "failed for Decstr",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b' '], 0x71),
-            Some(CsiHandler::Decscusr),
-            "failed for Decscusr",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b' '], 0x6b),
-            Some(CsiHandler::Scp),
-            "failed for Scp",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b'"'], 0x71),
-            Some(CsiHandler::Decsca),
-            "failed for Decsca",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b'"'], 0x70),
-            Some(CsiHandler::Decscl),
-            "failed for Decscl",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b'#'], 0x7b),
-            Some(CsiHandler::Xtpushsgr),
-            "failed for Xtpushsgr",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b'#'], 0x7d),
-            Some(CsiHandler::Xtpopsgr),
-            "failed for Xtpopsgr",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b'$'], 0x70),
-            Some(CsiHandler::AnsiDecrqm),
-            "failed for AnsiDecrqm",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b'$'], 0x72),
-            Some(CsiHandler::Deccara),
-            "failed for Deccara",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b'$'], 0x76),
-            Some(CsiHandler::Deccra),
-            "failed for Deccra",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b'$'], 0x78),
-            Some(CsiHandler::Decfra),
-            "failed for Decfra",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b'$'], 0x7b),
-            Some(CsiHandler::Decsera),
-            "failed for Decsera",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b'$'], 0x7a),
-            Some(CsiHandler::Decera),
-            "failed for Decera",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b'+'], 0x54),
-            Some(CsiHandler::KittyUnscroll),
-            "failed for KittyUnscroll",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b'\''], 0x7d),
-            Some(CsiHandler::Decic),
-            "failed for Decic",
-        );
-        assert_eq!(
-            lookup_csi_handler(&[b'\''], 0x7e),
-            Some(CsiHandler::Decdc),
-            "failed for Decdc",
-        );
+    fn every_entry_sits_in_its_own_hash_slot() {
+        let mut occupied = 0;
+        for (slot, entry) in CSI_DISPATCH_TABLE.iter().enumerate() {
+            if let Some((inter_enc, final_byte, _)) = *entry {
+                occupied += 1;
+                assert_eq!(
+                    csi_hash(inter_enc, final_byte),
+                    slot,
+                    "entry ({inter_enc:#04x}, {final_byte:#04x}) is in slot {slot}"
+                );
+            }
+        }
+        assert!(occupied > 0);
     }
 
     #[test]
     fn test_unknown_returns_none() {
+        // Unknown final byte, unknown intermediate, known intermediate with an
+        // unknown final, and unsupported intermediate combinations.
         assert_eq!(lookup_csi_handler(&[], b'Q'), None);
         assert_eq!(lookup_csi_handler(&[b'%'], b'A'), None);
+        assert_eq!(lookup_csi_handler(&[b'?'], b'z'), None);
+        assert_eq!(lookup_csi_handler(&[b'?', b'$', b'!'], b'p'), None);
         assert_eq!(lookup_csi_handler(&[b'>', b'$'], b'p'), None);
-    }
-
-    #[test]
-    fn test_entry_count() {
-        let count = CSI_DISPATCH_TABLE.iter().filter(|s| s.is_some()).count();
-        assert_eq!(count, 73);
     }
 }

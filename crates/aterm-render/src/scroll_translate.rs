@@ -28,20 +28,19 @@
 //! `[grid_top_row, grid_bot_row)` partition ([`grid_band_px`]); every pixel
 //! OUTSIDE that band is left byte-for-byte identical. That structural confinement
 //! is exactly [`translate_grid_band_in_place`]'s contract and is proven below
-//! (`chrome_pixels_are_invariant`) — the M1b chrome-invariance theorem.
+//! (`matches_out_of_place`, against a reference that writes only the band) —
+//! the M1b chrome-invariance theorem.
 //!
 //! # Invariants (proven)
 //!
 //! 1. **Identity at `frac == 0`.** A zero residual moves nothing: the present
 //!    buffer is byte-identical to the untranslated frame — so a frame at
 //!    `scroll_frac_px == 0` equals the same viewport reached by a whole-row jump
-//!    (`frac_zero_is_identity`). This is the raster-invariance PROVE bullet.
+//!    (`matches_out_of_place` at `frac == 0`). This is the raster-invariance
+//!    PROVE bullet.
 //! 2. **Chrome invariance.** For ANY `frac`, every pixel with a row index outside
 //!    `[y0, y1)` is byte-identical to the input; only the grid band is rewritten
-//!    (`chrome_pixels_are_invariant`). The abstract
-//!    twin is `aterm_spec::derive::grid_translate_model` (a row shifts IFF it is
-//!    in the grid band), proven by the real `ty` at `Buggy=0` and counterexampled
-//!    by a mutant that leaks the shift onto a chrome row (`Buggy=1`).
+//!    (`matches_out_of_place`): a row shifts IFF it is in the grid band.
 //! 3. **Band derivation.** [`grid_band_px`] reproduces the renderer's own row→px
 //!    mapping (`pad + row*cell_h`) and clamps to the framebuffer, so the band is
 //!    exactly the terminal-content rows' pixels (`band_matches_row_mapping`).
@@ -244,12 +243,9 @@ pub fn paint_incoming_strip(
 
 #[cfg(test)]
 mod tests {
-    //! M1b PROVE bullets, always-on layer (real pixel buffers). The boolean
-    //! grid-vs-chrome partition additionally carries a `ty` twin
-    //! (`aterm_spec::derive::grid_translate_model`); these tests bind the pixel
-    //! behaviour to that policy. Row→px arithmetic (`pad + r*cell_h`) is outside
-    //! the `ty` `Expr` language, so the lattice/exhaustive tests here are the
-    //! proof layer for the band derivation (the documented waiver).
+    //! M1b PROVE bullets, always-on layer (real pixel buffers): the
+    //! grid-vs-chrome partition and, by lattice/exhaustive tests, the band
+    //! derivation (`pad + r*cell_h`).
 
     use super::*;
 
@@ -286,65 +282,6 @@ mod tests {
             out[dst * w..dst * w + w].copy_from_slice(&src[s * w..s * w + w]);
         }
         out
-    }
-
-    /// PROVE (1) — identity at `frac == 0`: the present buffer is byte-identical
-    /// to the untranslated frame, over a band × geometry lattice. This is the
-    /// raster-invariance bullet: a `scroll_frac_px == 0` frame equals the
-    /// whole-row-jump frame exactly.
-    #[test]
-    fn frac_zero_is_identity() {
-        for (w, h) in [(1usize, 1usize), (4, 10), (7, 33)] {
-            let base = checkerboard(w, h);
-            for y0 in 0..h {
-                for y1 in y0..=h {
-                    let mut buf = base.clone();
-                    translate_grid_band_in_place(&mut buf, w, y0, y1, 0);
-                    assert_eq!(
-                        buf, base,
-                        "frac=0 must be a literal no-op (w={w} h={h} y0={y0} y1={y1})"
-                    );
-                }
-            }
-        }
-    }
-
-    /// PROVE (2) — chrome invariance (the KEY theorem): for ANY frac and ANY
-    /// band, every pixel OUTSIDE `[y0, y1)` is byte-identical to the input. The
-    /// translate touches only the grid band, so chrome (rows `< y0` and `>= y1`)
-    /// is pinned. Non-vacuity: at least one in-band pixel genuinely moves.
-    #[test]
-    fn chrome_pixels_are_invariant() {
-        let (w, h) = (5usize, 20usize);
-        let base = checkerboard(w, h);
-        let mut any_moved = false;
-        for y0 in 0..h {
-            for y1 in y0..=h {
-                // BIDIRECTIONAL: sweep the residual across BOTH signs (up-glide and
-                // down-bounce) past the band height on each side.
-                let span = (y1 - y0 + 2) as i64;
-                for frac in -span..=span {
-                    let mut buf = base.clone();
-                    translate_grid_band_in_place(&mut buf, w, y0, y1, frac);
-                    for y in 0..h {
-                        if y < y0 || y >= y1 {
-                            assert_eq!(
-                                buf[y * w..y * w + w],
-                                base[y * w..y * w + w],
-                                "chrome row {y} must be invariant (y0={y0} y1={y1} frac={frac})"
-                            );
-                        }
-                    }
-                    if buf != base {
-                        any_moved = true;
-                    }
-                }
-            }
-        }
-        assert!(
-            any_moved,
-            "non-vacuity: some band/frac genuinely shifts pixels"
-        );
     }
 
     /// PROVE (2), companion: the in-place move equals the out-of-place reference

@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-1 conformance of the successor's pre-Commit input queue to
-//! `aterm_spec::derive::native_update_precommit_input_model`
+//! `aterm_models_update::native_update_precommit_input_model`
 //! (`NativeUpdatePreCommitInput`, gap #33).
 //!
 //! Every schedule of the model up to four steps — enough to reach every state
@@ -26,7 +26,8 @@
 
 use std::collections::BTreeMap;
 
-use aterm_spec::derive::{Model, native_update_precommit_input_model};
+use aterm_models_update::native_update_precommit_input_model;
+use aterm_spec::derive::Model;
 use aterm_spec::interp::{self, State};
 use aterm_spec::verify::validate_transition_tiered;
 use winit::event::WindowEvent;

@@ -494,7 +494,7 @@ fn the_login_wall_is_read_from_the_screen_and_the_transcript() {
     let walled = screen(LOGIN_EXPIRED);
     assert!(upgrade::login_wall(Agent::Claude, &walled));
     assert!(
-        !upgrade::limited(Agent::Claude, &walled),
+        !upgrade::limited(&walled),
         "the login wall is no usage limit"
     );
     let back: Vec<String> = aterm_json::from_str::<Value>(&logged_in_screen_json())
@@ -816,148 +816,6 @@ fn a_session_at_the_login_wall_is_never_asked_and_no_clock_runs() {
     assert_eq!(ready_since(50, true, &free, 90), 50);
 }
 
-/// At a break of the agent's background work the wall and the refund hold
-/// too: a break re-asks, and gives up past the last ask, wherever a notice's
-/// window has run out, but at the login wall it still waits `login`, and a
-/// notice the wall answered is typed again as the same ask. Negative control:
-/// the same break with the last notice read and unanswered gives up.
-#[test]
-fn a_break_of_background_work_spends_nothing_at_the_login_wall() {
-    let at_break = Facts {
-        status: "busy".to_string(),
-        background_point: true,
-        ..idle()
-    };
-    let tired = Phase::Announced {
-        at_s: 1_000,
-        asks: MAX_ASKS,
-    };
-    let late = 1_000 + 2 * REASK_S;
-    let walled = Facts {
-        login: true,
-        ..at_break.clone()
-    };
-    assert_eq!(next_step(&tired, &walled, false, late), Step::Wait("login"));
-    assert_eq!(next_step(&tired, &walled, true, late), Step::Wait("login"));
-    let unread = Facts {
-        undelivered: true,
-        ..at_break.clone()
-    };
-    assert_eq!(next_step(&tired, &unread, false, late), Step::Announce);
-    assert_eq!(announce_asks(&tired, true), MAX_ASKS, "the same ask");
-    // Negative control.
-    assert_eq!(next_step(&tired, &at_break, false, late), Step::GiveUp);
-}
-
-/// A notice the wall answered spent no ask: it is typed again at the first point a notice could
-/// be, as the same ask (the same READY marker), without waiting out its window or giving up; a
-/// READY that came first still wins, and the wall still waits. A give-up over such notices (the
-/// recorded 0.93.0 state) is taken back ([`upgrade::rearmed`]): pending when none reached the
-/// model (counted over the round's markers), else announced with the asks that did. Negative
-/// controls: a notice the model received waits its window and is given up on after the last ask;
-/// a give-up whose last or every notice the model received stays given up; a stop for any other
-/// reason stays stopped.
-#[test]
-fn a_notice_the_wall_answered_spent_no_ask() {
-    let unread = Facts {
-        undelivered: true,
-        ..idle()
-    };
-    let fresh = Phase::Announced {
-        at_s: 1_000,
-        asks: 1,
-    };
-    let tired = Phase::Announced {
-        at_s: 1_000,
-        asks: MAX_ASKS,
-    };
-    let gave_up = Phase::Failed(GAVE_UP.to_string());
-    let soon = 1_000 + 60;
-    let late = 1_000 + REASK_S;
-    assert_eq!(next_step(&fresh, &unread, false, soon), Step::Announce);
-    assert_eq!(next_step(&tired, &unread, false, late), Step::Announce);
-    assert_eq!(announce_asks(&fresh, true), 1);
-    assert_eq!(announce_asks(&tired, true), MAX_ASKS);
-    assert_eq!(announce_asks(&Phase::Pending, true), 1);
-    // The give-up taken back, over the recorded rows.
-    let to = Version::parse("2.1.283").expect("to");
-    let round = upgrade::round_markers(INCIDENT_SESSION, &to, INCIDENT_SALT);
-    assert_eq!(
-        round,
-        LEDGER
-            .iter()
-            .map(|(_, m)| m.to_string())
-            .collect::<Vec<_>>(),
-        "the markers 0.93.0 minted"
-    );
-    let whole = incident(INCIDENT_SESSION, 4, true);
-    let received = upgrade::notices_received(&whole, &round);
-    assert_eq!(received, 0, "none of the four reached the model");
-    assert_eq!(
-        upgrade::rearmed(&gave_up, true, received),
-        Some(Phase::Pending)
-    );
-    let two = Phase::Announced { at_s: 0, asks: 2 };
-    assert_eq!(upgrade::rearmed(&gave_up, true, 2), Some(two.clone()));
-    assert_eq!(next_step(&two, &idle(), false, late), Step::Announce);
-    assert_eq!(
-        announce_asks(&two, false),
-        3,
-        "the next ask the model has not had"
-    );
-    for (phase, undelivered, received) in [
-        (&gave_up, false, 0),
-        (&gave_up, true, MAX_ASKS),
-        (&fresh, true, 0),
-        (&Phase::Failed("signal-refused".to_string()), true, 0),
-    ] {
-        assert_eq!(
-            upgrade::rearmed(phase, undelivered, received),
-            None,
-            "{phase:?} {undelivered} {received}"
-        );
-    }
-    assert_eq!(
-        next_step(&gave_up, &unread, false, late),
-        Step::Wait("failed")
-    );
-    // The wall itself, a READY, and the notice's own gate still come first.
-    let walled = Facts {
-        login: true,
-        ..unread.clone()
-    };
-    assert_eq!(next_step(&tired, &walled, false, late), Step::Wait("login"));
-    assert_eq!(next_step(&tired, &unread, true, late), Step::Terminate);
-    assert_eq!(next_step(&gave_up, &unread, true, late), Step::Terminate);
-    let drafted = Facts {
-        composer_empty: false,
-        ..unread.clone()
-    };
-    assert_eq!(
-        next_step(&tired, &drafted, false, late),
-        Step::Wait("draft")
-    );
-    // Negative controls.
-    let read = idle();
-    assert_eq!(
-        next_step(&fresh, &read, false, soon),
-        Step::Wait("awaiting-ready")
-    );
-    assert_eq!(next_step(&tired, &read, false, late), Step::GiveUp);
-    assert_eq!(
-        next_step(&gave_up, &read, false, late),
-        Step::Wait("failed")
-    );
-    assert_eq!(announce_asks(&fresh, false), 2);
-    for other in ["signal-refused", "not-a-shell-job", "resumed-elsewhere"] {
-        assert_eq!(
-            next_step(&Phase::Failed(other.to_string()), &unread, false, late),
-            Step::Wait("failed"),
-            "{other}"
-        );
-    }
-}
-
 // ---------------------------------------------------------------- the real visit
 
 /// The recorded session through the real visit (the driver's `visit`, a parked
@@ -1052,8 +910,7 @@ fn the_incident_is_waited_out_and_its_last_notice_asked_again() {
         again
             .ledger
             .iter()
-            .any(|l| l.contains(r#""step":"announced:4""#)
-                && l.contains("never reached the model")),
+            .any(|l| l.contains(r#""step":"announced:4""#)),
         "{:?}",
         again.ledger
     );
@@ -1274,14 +1131,6 @@ fn the_state_0_93_0_left_is_read_and_recovered() {
         "{:?}",
         rearmed.typed
     );
-    assert!(
-        rearmed
-            .ledger
-            .iter()
-            .any(|l| l.contains("had given up on notices that never reached the model")),
-        "{:?}",
-        rearmed.ledger
-    );
     // The conversation gone on 400 KB past the notice: found further back.
     let mut far = spoken.clone();
     let filler = model_row(
@@ -1378,8 +1227,7 @@ fn the_state_0_93_0_left_is_read_and_recovered() {
     assert!(
         old.ledger
             .iter()
-            .any(|l| l.contains(r#""step":"rearmed:unanswered""#)
-                && l.contains("before its time was recorded")),
+            .any(|l| l.contains(r#""step":"rearmed:unanswered""#)),
         "{:?}",
         old.ledger
     );

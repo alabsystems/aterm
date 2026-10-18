@@ -242,92 +242,52 @@ mod tests {
         assert_eq!(KeyModifiers::SUPER.bits(), Modifiers::SUPER.bits());
     }
 
+    /// `KeyCode` <-> `keyboard::Key` (#5681): every application key
+    /// round-trips, and what has no application spelling is refused.
     #[test]
-    fn from_conversion_roundtrip() {
-        use crate::keyboard::Modifiers;
-
-        let input_mods = KeyModifiers::CTRL | KeyModifiers::SHIFT;
-        let kb_mods: Modifiers = input_mods.into();
-        let back: KeyModifiers = kb_mods.into();
-        assert_eq!(input_mods, back);
-    }
-
-    #[test]
-    fn key_bridge_space_roundtrip() {
-        use crate::keyboard::Key;
-        // KeyCode::Char(' ') -> Key::Character(' '), not NamedKey::Space
-        let key: Key = KeyCode::Char(' ').try_into().unwrap();
-        assert_eq!(key, Key::Character(' '));
-        let back: KeyCode = key.try_into().unwrap();
-        assert_eq!(back, KeyCode::Char(' '));
-    }
-
-    #[test]
-    fn key_bridge_named_space_to_char() {
+    fn key_bridge_round_trips_and_refuses_what_it_cannot_spell() {
         use crate::keyboard::{Key, NamedKey};
-        // NamedKey::Space -> KeyCode::Char(' ')
-        let back: KeyCode = Key::Named(NamedKey::Space).try_into().unwrap();
-        assert_eq!(back, KeyCode::Char(' '));
-    }
-
-    #[test]
-    fn key_bridge_enter_roundtrip() {
-        use crate::keyboard::{Key, NamedKey};
-        let key: Key = KeyCode::Enter.try_into().unwrap();
-        assert_eq!(key, Key::Named(NamedKey::Enter));
-        let back: KeyCode = key.try_into().unwrap();
-        assert_eq!(back, KeyCode::Enter);
-    }
-
-    #[test]
-    fn key_bridge_arrow_up_roundtrip() {
-        use crate::keyboard::{Key, NamedKey};
-        let key: Key = KeyCode::Up.try_into().unwrap();
-        assert_eq!(key, Key::Named(NamedKey::ArrowUp));
-        let back: KeyCode = key.try_into().unwrap();
-        assert_eq!(back, KeyCode::Up);
-    }
-
-    #[test]
-    fn key_bridge_delete_roundtrip() {
-        use crate::keyboard::{Key, NamedKey};
-        let key: Key = KeyCode::Delete.try_into().unwrap();
-        assert_eq!(key, Key::Named(NamedKey::Delete));
-        let back: KeyCode = key.try_into().unwrap();
-        assert_eq!(back, KeyCode::Delete);
-    }
-
-    #[test]
-    fn key_bridge_f0_out_of_range() {
-        use crate::keyboard::Key;
-        let result: Result<Key, _> = KeyCode::F(0).try_into();
-        assert_eq!(result, Err(KeyConversionError::FunctionKeyOutOfRange(0)));
-    }
-
-    #[test]
-    fn key_bridge_f25_out_of_range() {
-        use crate::keyboard::Key;
-        let result: Result<Key, _> = KeyCode::F(25).try_into();
-        assert_eq!(result, Err(KeyConversionError::FunctionKeyOutOfRange(25)));
-    }
-
-    #[test]
-    fn key_bridge_numpad5_protocol_only() {
-        use crate::keyboard::{Key, NamedKey};
-        let result: Result<KeyCode, _> = Key::Named(NamedKey::Numpad5).try_into();
+        let pairs = [
+            // A space is a character, NOT NamedKey::Space.
+            (KeyCode::Char(' '), Key::Character(' ')),
+            (KeyCode::Char('\u{1F980}'), Key::Character('\u{1F980}')),
+            (KeyCode::Enter, Key::Named(NamedKey::Enter)),
+            (KeyCode::Up, Key::Named(NamedKey::ArrowUp)),
+            (KeyCode::Down, Key::Named(NamedKey::ArrowDown)),
+            (KeyCode::Left, Key::Named(NamedKey::ArrowLeft)),
+            (KeyCode::Right, Key::Named(NamedKey::ArrowRight)),
+            (KeyCode::Delete, Key::Named(NamedKey::Delete)),
+            (KeyCode::Backspace, Key::Named(NamedKey::Backspace)),
+            (KeyCode::Tab, Key::Named(NamedKey::Tab)),
+            (KeyCode::Escape, Key::Named(NamedKey::Escape)),
+            (KeyCode::Home, Key::Named(NamedKey::Home)),
+            (KeyCode::End, Key::Named(NamedKey::End)),
+            (KeyCode::PageUp, Key::Named(NamedKey::PageUp)),
+            (KeyCode::PageDown, Key::Named(NamedKey::PageDown)),
+            (KeyCode::Insert, Key::Named(NamedKey::Insert)),
+            (KeyCode::F(1), Key::Named(NamedKey::F1)),
+            (KeyCode::F(12), Key::Named(NamedKey::F12)),
+            (KeyCode::F(24), Key::Named(NamedKey::F24)),
+        ];
+        for (code, key) in pairs {
+            assert_eq!(Key::try_from(code), Ok(key.clone()), "{code:?} -> protocol");
+            assert_eq!(KeyCode::try_from(key), Ok(code), "{code:?} <- protocol");
+        }
         assert_eq!(
-            result,
-            Err(KeyConversionError::ProtocolOnlyKey(NamedKey::Numpad5))
+            KeyCode::try_from(Key::Named(NamedKey::Space)),
+            Ok(KeyCode::Char(' '))
         );
-    }
-
-    #[test]
-    fn key_bridge_numpad_enter_protocol_only() {
-        use crate::keyboard::{Key, NamedKey};
-        let result: Result<KeyCode, _> = Key::Named(NamedKey::NumpadEnter).try_into();
-        assert_eq!(
-            result,
-            Err(KeyConversionError::ProtocolOnlyKey(NamedKey::NumpadEnter))
-        );
+        for n in [0, 25] {
+            assert_eq!(
+                Key::try_from(KeyCode::F(n)),
+                Err(KeyConversionError::FunctionKeyOutOfRange(n))
+            );
+        }
+        for named in [NamedKey::Numpad5, NamedKey::NumpadEnter] {
+            assert_eq!(
+                KeyCode::try_from(Key::Named(named)),
+                Err(KeyConversionError::ProtocolOnlyKey(named))
+            );
+        }
     }
 }

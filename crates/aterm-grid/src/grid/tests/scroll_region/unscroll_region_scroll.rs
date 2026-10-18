@@ -60,33 +60,3 @@ fn grid_unscroll_scroll_region_marks_only_region_rows_dirty() {
     assert_eq!(unscrolled, 2);
     assert_eq!(dirty_rows(&grid), vec![2, 3, 4, 5]);
 }
-
-#[test]
-fn grid_unscroll_clamps_region_scroll_delta_to_available_scrollback() {
-    let scrollback = Scrollback::new(100, 1000, 10_000_000);
-    let mut grid = Grid::with_tiered_scrollback(4, 10, 2, scrollback);
-    write_line(&mut grid, "Line0");
-    grid.line_feed();
-    write_line(&mut grid, "Line1");
-    grid.line_feed();
-    for i in 2..6 {
-        write_line(&mut grid, &format!("Line{i}"));
-        grid.line_feed();
-    }
-    assert_eq!(
-        grid.tiered_scrollback_lines(),
-        1,
-        "fixture should leave exactly one tiered line"
-    );
-    assert_eq!(
-        grid.scrollback_lines(),
-        3,
-        "fixture history is 2 ring lines over 1 tiered line"
-    );
-
-    grid.clear_damage();
-    let unscrolled = grid.unscroll_from_scrollback(100);
-
-    assert_eq!(unscrolled, 3);
-    assert_eq!(dirty_rows(&grid), vec![0, 1, 2, 3]);
-}

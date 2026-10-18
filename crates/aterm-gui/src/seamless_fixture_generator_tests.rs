@@ -290,6 +290,7 @@ fn fx_record(local_id: u64, title: &str) -> SessionRecord {
         attention: None,
         questions: None,
         autopilot: None,
+        land_at: None,
         control: None,
         frozen_path: false,
         identity: None,
@@ -323,6 +324,7 @@ fn fx_record(local_id: u64, title: &str) -> SessionRecord {
         fabric: crate::fabric::FabricCarry::default(),
         timeline_id: 24 + local_id * 3 + crate::session_timeline::HANDOFF_ID_RESERVE,
         log_ids: None,
+        log_seq: 0,
         // Since v0.101.0, stamped by the park (`fx_write`, as
         // `stamp_render_debts` and `stamp_journal_keys`): the rows the engine
         // owed a carried alternate screen, and the crash journal key of a
@@ -346,6 +348,8 @@ fn fx_session(local_id: u64, title: &str, t: Terminal) -> FxSession {
 fn fx_leaf(local_id: u64, title: &str, cwd: Option<&str>) -> crate::restore::RestoredSplitTree {
     use crate::restore::{RestoredSplitTree, RestoredView, TerminalLeafRestore};
     RestoredSplitTree::leaf(RestoredView::Terminal(TerminalLeafRestore {
+        sid: None,
+        lineage: None,
         cwd: cwd.map(str::to_string),
         title: title.to_string(),
         profile: None,
@@ -356,8 +360,10 @@ fn fx_leaf(local_id: u64, title: &str, cwd: Option<&str>) -> crate::restore::Res
         role: None,
         attention: None,
         identity: None,
+        theme: None,
         questions: None,
         autopilot: None,
+        land_at: None,
         // Since v0.95.0: filled only by the crash journal and a system
         // quit's layout, never by the handoff's (`capture_restore_manifest`).
         agent: None,
@@ -949,8 +955,14 @@ fn fx_capture(
         // Since v0.100.0 every session's control carry travels (round seven,
         // finding 24): a rung that does not keep the screen it describes goes
         // without the DIFFER'S STATE only (`CarryRung::keeps_differ_state`).
-        let mut source =
-            handoff_carry::capture_head(id, &guard, &s.term, &s.turns, rung.keeps_differ_state());
+        let mut source = handoff_carry::capture_head(
+            id,
+            &guard,
+            &s.term,
+            &s.turns,
+            None,
+            rung.keeps_differ_state(),
+        );
         if !rung.keeps_differ_state() {
             source.without_differ();
         }
@@ -1048,8 +1060,14 @@ fn fx_capture_held(
             carry_for_wire_within(&terminal, pane.local_id, 0, &mut cells, caps, ceiling);
         let history_dropped = u64::try_from(terminal.main_grid().scrollback_lines()).unwrap();
         let history_head = Some(terminal.history_fence());
-        let mut control =
-            handoff_carry::capture_head(pane.local_id, &terminal, &pane.term, &pane.turns, false);
+        let mut control = handoff_carry::capture_head(
+            pane.local_id,
+            &terminal,
+            &pane.term,
+            &pane.turns,
+            None,
+            false,
+        );
         control.without_differ();
         drop(terminal);
         assert!(
@@ -1307,6 +1325,8 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         held: Vec::new(),
         roster_seq: Some(FX_ROSTER_SEQ),
         fabric_attached: Vec::new(),
+        mirror_dropped: Vec::new(),
+        mirror_served: false,
     };
     // THE LAYOUT, captured after the screens and committed at the park
     // (`App::capture_handoff_layout`, then `commit_handoff_layout`). Since
@@ -2301,12 +2321,17 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             item.local_id
         );
         // A repainted screen is blank until its program redraws, so its
-        // marks name rows the successor has not drawn yet.
+        // marks name rows the successor has not drawn yet. A carry keeps a
+        // mark while any row it names is carried (804646426f), so a row older
+        // than the successor's oldest one (a prompt above a visible-only
+        // carry's screen) reads Evicted there, as in the live terminal.
         let redraws = capture.repaint.contains(&item.local_id);
+        let oldest = successor.main_grid().oldest_absolute_row();
         for mark in successor.command_marks().iter().filter(|_| !redraws) {
             for row in [Some(mark.prompt_start_row), mark.output_end_row]
                 .into_iter()
                 .flatten()
+                .filter(|row| *row >= oldest)
             {
                 let text = fx_text_at(&successor, row);
                 assert!(
@@ -2398,7 +2423,6 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             shown.sid.clone().expect("a held pane keeps its sid"),
             &shown.checkpoint,
             None,
-            aterm_types::Appearance::Dark,
         );
         let history = crate::held_pane_history(&session.term, shown.history).unwrap_or_else(|| {
             panic!(

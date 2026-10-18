@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! E1 (lazy host fonts): the missing-font CLASS drain. A poll-based host
-//! (web/wasm) cannot read font files itself; the renderer reports WHICH
-//! injectable face class a `.notdef` char needed so the host fetches and
-//! injects only that class — an ASCII-only session never pays the
-//! multi-hundred-MB emoji/CJK payload.
+//! The missing-font class drain. A poll-based host (web/wasm) cannot read
+//! font files, so the renderer reports which injectable face class a
+//! `.notdef` char needed and the host fetches only that class: an ASCII-only
+//! session never pays for the emoji/CJK payload.
 //!
 //! Deterministic on any machine: `Renderer::from_bytes` leaves the lazy
-//! system-font path lists empty (only `from_system*` populates them) and every
-//! test disables the M3 runtime resolver, exactly like a web host.
+//! system-font path lists empty and every test disables the runtime resolver,
+//! as a web host does.
 
 use aterm_render::{FaceId, MISSING_FONT_CLASS_EMOJI, MISSING_FONT_CLASS_TEXT, Renderer, Theme};
 
@@ -31,18 +30,62 @@ fn nerd_symbols() -> Vec<u8> {
 
 fn renderer() -> Renderer {
     let mut r = Renderer::from_bytes(&dejavu(), 18.0, Theme::default()).expect("fixture parses");
-    // Machine-independent `.notdef`: never consult the system resolver (the
-    // same posture the wasm hosts run with — no filesystem there).
+    // Machine-independent `.notdef`: never consult the system resolver, as on
+    // wasm.
     r.set_runtime_font_discovery(false);
     r
 }
 
+/// Which class each kind of probe reports: nothing for covered and procedural
+/// chars, TEXT for a text miss, EMOJI from both the text and the emoji dispatch
+/// paths, and the union when several classes miss before a drain.
 #[test]
-fn covered_chars_report_nothing() {
-    let mut r = renderer();
-    r.glyph_key('a');
-    r.glyph_key('░'); // procedural source
-    assert_eq!(r.take_missing_font_classes(), 0);
+fn each_miss_reports_its_own_class() {
+    type Probe = fn(&mut Renderer);
+    let cases: [(&str, Probe, u8); 5] = [
+        (
+            "covered + procedural",
+            |r| {
+                r.glyph_key('a');
+                r.glyph_key('░');
+            },
+            0,
+        ),
+        (
+            "unassigned scalar",
+            |r| {
+                r.glyph_key('\u{0378}');
+            },
+            MISSING_FONT_CLASS_TEXT,
+        ),
+        (
+            "emoji via the text path",
+            |r| {
+                r.glyph_key('😀');
+            },
+            MISSING_FONT_CLASS_EMOJI,
+        ),
+        (
+            "emoji via the emoji dispatch",
+            |r| {
+                r.glyph_key_emoji('🚀');
+            },
+            MISSING_FONT_CLASS_EMOJI,
+        ),
+        (
+            "CJK + emoji accumulate",
+            |r| {
+                r.glyph_key('中');
+                r.glyph_key('😀');
+            },
+            MISSING_FONT_CLASS_TEXT | MISSING_FONT_CLASS_EMOJI,
+        ),
+    ];
+    for (name, probe, want) in cases {
+        let mut r = renderer();
+        probe(&mut r);
+        assert_eq!(r.take_missing_font_classes(), want, "{name}");
+    }
 }
 
 #[test]
@@ -56,31 +99,6 @@ fn text_miss_reports_text_class_once_and_drains() {
 }
 
 #[test]
-fn emoji_miss_reports_emoji_class() {
-    let mut r = renderer();
-    r.glyph_key('😀');
-    assert_eq!(r.take_missing_font_classes(), MISSING_FONT_CLASS_EMOJI);
-}
-
-#[test]
-fn emoji_dispatch_path_reports_emoji_class_too() {
-    let mut r = renderer();
-    r.glyph_key_emoji('🚀');
-    assert_eq!(r.take_missing_font_classes(), MISSING_FONT_CLASS_EMOJI);
-}
-
-#[test]
-fn classes_accumulate_across_chars() {
-    let mut r = renderer();
-    r.glyph_key('中'); // CJK: not in DejaVu Sans Mono
-    r.glyph_key('😀');
-    assert_eq!(
-        r.take_missing_font_classes(),
-        MISSING_FONT_CLASS_TEXT | MISSING_FONT_CLASS_EMOJI
-    );
-}
-
-#[test]
 fn injecting_the_missing_face_stops_the_class() {
     let mut r = renderer();
     let branch = '\u{E0A0}'; // Powerline branch: Nerd-Symbols-only coverage
@@ -88,8 +106,7 @@ fn injecting_the_missing_face_stops_the_class() {
     assert_eq!(r.take_missing_font_classes(), MISSING_FONT_CLASS_TEXT);
     r.set_fallback_bytes(&nerd_symbols())
         .expect("nerd face parses");
-    // The installer cleared the per-char memos, so the char re-probes and the
-    // injected face now covers it: no new miss.
+    // The installer cleared the per-char memos, so the char re-probes.
     let key = r.glyph_key(branch);
     assert_eq!(key.source, FaceId::Fallback, "served by the injected face");
     assert_eq!(r.take_missing_font_classes(), 0);
@@ -110,11 +127,10 @@ fn still_uncovered_chars_re_fire_after_injection() {
     );
 }
 
-/// macOS system-font test: a colour face injected AFTER an emoji already
-/// rendered `.notdef` must take over — `install_color_font` drops the `keys`
-/// memo (where the TEXT-path dispatch parked the `.notdef`), or the code point
-/// would never re-probe. This is the exact lazy-injection sequence a web host
-/// performs on an EMOJI-class signal.
+/// A colour face injected after an emoji drew `.notdef` takes over, because
+/// `install_color_font` drops the `keys` memo where the text-path dispatch
+/// parked it. This is the injection sequence a web host runs on an
+/// emoji-class signal.
 #[cfg(target_os = "macos")]
 #[test]
 fn late_color_face_takes_over_after_notdef() {

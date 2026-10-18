@@ -197,6 +197,71 @@ impl Drop for FirstFrameWarm {
     }
 }
 
+/// The latch the first-frame compile measurement (`benches/first_frame_compile.rs`)
+/// warms and waits on: one per process, as a launch's is.
+static BENCH_LATCH: WarmLatch = WarmLatch::new(CELL_DEADLINE);
+
+/// The measurement's compile: the shipped source plus a per-run `nonce`
+/// comment, so every library is a cache miss.
+fn bench_compile(nonce: u128) -> impl Fn(&Device, ShaderLibrary) -> Result<Library, String> + Copy {
+    move |dev: &Device, lib: ShaderLibrary| -> Result<Library, String> {
+        let opts = super::ffi::CompileOptions::aterm_default()
+            .ok_or_else(|| "no MTLCompileOptions".to_owned())?;
+        let src = format!("{}\n// bench nonce {nonce}\n", super::shaders::source(lib));
+        dev.new_library_with_options(&src, &opts)
+    }
+}
+
+/// THE FIRST-FRAME COMPILE MEASUREMENT's warm half
+/// (`benches/first_frame_compile.rs`, which runs the job on a thread of its
+/// own): begin the warm and hand back its job, which answers how long the warm
+/// took. One per process.
+///
+/// # Errors
+/// A second call in one process.
+#[doc(hidden)]
+pub fn first_frame_bench_warm(
+    nonce: u128,
+) -> Result<impl FnOnce() -> Result<Duration, String> + Send + 'static, String> {
+    let mut warm = BENCH_LATCH
+        .begin()
+        .ok_or_else(|| "one warm per process".to_owned())?;
+    Ok(move || {
+        let _pool = AutoreleasePool::new();
+        let began = Instant::now();
+        let dev = Device::preferred().ok_or_else(|| "no Metal device".to_owned())?;
+        warm.run_on(&dev, true, bench_compile(nonce))?;
+        Ok(began.elapsed())
+    })
+}
+
+/// THE FIRST-FRAME COMPILE MEASUREMENT's main half: the first mint's compiles
+/// on the calling thread (`cell.metal`, the first-frame rows, the present
+/// blit), after waiting for a warm the caller began, if any. Answers the
+/// times since the call at which it stopped waiting, built the cell library,
+/// built the frame rows, and finished the present blit.
+///
+/// # Errors
+/// No Metal device, or a shipped shader that does not compile.
+#[doc(hidden)]
+pub fn first_frame_bench_main(nonce: u128) -> Result<[Duration; 4], String> {
+    let compile = bench_compile(nonce);
+    let _pool = AutoreleasePool::new();
+    let arrived = Instant::now();
+    BENCH_LATCH.await_cell();
+    let waited = arrived.elapsed();
+    let dev = Device::preferred().ok_or_else(|| "no Metal device".to_owned())?;
+    let cell = compile(&dev, ShaderLibrary::Cell)?;
+    let lib = arrived.elapsed();
+    for row in FIRST_FRAME_ROWS {
+        pipelines::build(&dev, &cell, row.spec(), PixelFormat::Bgra8Unorm)?;
+    }
+    let rows = arrived.elapsed();
+    let blit = compile(&dev, ShaderLibrary::Blit)?;
+    pipelines::build(&dev, &blit, Pipeline::Blit.spec(), PixelFormat::Bgra8Unorm)?;
+    Ok([waited, lib, rows, arrived.elapsed()])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,80 +370,5 @@ mod tests {
         let mut warm = LATCH.begin().expect("the latch's first warm");
         warm.run_on(&dev, true, pipelines::compile_library)
             .expect("the first-frame warm on the shipped shaders");
-    }
-
-    /// MANUAL TIMING HARNESS: the first mint's compiles (`cell.metal`, the
-    /// first-frame rows, the present blit) on the main thread, after a warm
-    /// begun at t0 on another thread (`FIRST_FRAME_BENCH=warm`) or with none
-    /// (`inline`), the main thread arriving `FIRST_FRAME_BENCH_PROLOGUE_MS`
-    /// after t0. A per-run nonce comment makes every library a cache miss.
-    #[test]
-    #[ignore = "manual timing harness, not a correctness test"]
-    fn first_frame_compile_timing() {
-        static LATCH: WarmLatch = WarmLatch::new(CELL_DEADLINE);
-        let warmed = std::env::var("FIRST_FRAME_BENCH").is_ok_and(|m| m == "warm");
-        let prologue = std::time::Duration::from_millis(
-            std::env::var("FIRST_FRAME_BENCH_PROLOGUE_MS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0),
-        );
-        let nonce = aterm_time::SystemTime::now()
-            .duration_since(aterm_time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let compile = move |dev: &Device, lib: ShaderLibrary| -> Result<Library, String> {
-            let opts = super::super::ffi::CompileOptions::aterm_default().expect("options");
-            let src = format!(
-                "{}\n// bench nonce {nonce}\n",
-                super::super::shaders::source(lib)
-            );
-            dev.new_library_with_options(&src, &opts)
-        };
-        let t0 = Instant::now();
-        let warm = warmed.then(|| {
-            let mut warm = LATCH.begin().expect("the bench's warm");
-            std::thread::spawn(move || {
-                let _pool = AutoreleasePool::new();
-                let began = Instant::now();
-                let dev = Device::preferred().expect("device");
-                warm.run_on(&dev, true, compile).expect("warm");
-                began.elapsed()
-            })
-        });
-        if let Some(left) = prologue.checked_sub(t0.elapsed()) {
-            std::thread::sleep(left);
-        }
-        let _pool = AutoreleasePool::new();
-        let arrived = Instant::now();
-        LATCH.await_cell();
-        let waited = arrived.elapsed();
-        let dev = Device::preferred().expect("device");
-        let cell = compile(&dev, ShaderLibrary::Cell).expect("cell");
-        let lib = arrived.elapsed();
-        for row in FIRST_FRAME_ROWS {
-            pipelines::build(&dev, &cell, row.spec(), PixelFormat::Bgra8Unorm).expect("row");
-        }
-        let rows = arrived.elapsed();
-        let blit = compile(&dev, ShaderLibrary::Blit).expect("blit");
-        pipelines::build(&dev, &blit, Pipeline::Blit.spec(), PixelFormat::Bgra8Unorm)
-            .expect("blit row");
-        let total = arrived.elapsed();
-        let warm_ms = warm.map_or_else(
-            || "-".to_owned(),
-            |h| format!("{:.2}", h.join().expect("warm thread").as_secs_f64() * 1e3),
-        );
-        let ms = |d: Duration| d.as_secs_f64() * 1e3;
-        println!(
-            "BENCH mode={} prologue_ms={} waited_ms={:.2} cell_lib_ms={:.2} frame_psos_ms={:.2} \
-             present_ms={:.2} main_total_ms={:.2} warm_ms={warm_ms}",
-            if warmed { "warm" } else { "inline" },
-            prologue.as_millis(),
-            ms(waited),
-            ms(lib),
-            ms(rows - lib),
-            ms(total - rows),
-            ms(total),
-        );
     }
 }

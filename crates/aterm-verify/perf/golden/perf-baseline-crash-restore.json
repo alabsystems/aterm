@@ -1,0 +1,10 @@
+{
+  "_comment": "aterm CRASH-RESTORE baseline: parse-thread MB/s with the journal's tail tap, keyframes/s (shell, TUI over a saved primary, +256 and +512 bridge) and restores/s of a keyframe plus a 256 KiB tail. BIGGER-IS-BETTER; the tap overhead fence lives in the lane code. Re-record with targo --unverified verify perf --record crash-restore.",
+  "tail_tap_mbps": 605.430,
+  "kf_shell_hz": 88144.071,
+  "kf_tui_hz": 62494.934,
+  "kf_bridge256_hz": 19115.890,
+  "kf_bridge512_hz": 10683.211,
+  "recover_hz": 1788.759,
+  "pass_ratio": 0.450
+}

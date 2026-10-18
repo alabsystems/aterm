@@ -100,36 +100,7 @@ fn a_landed_park_keeps_a_live_take_until_commit_answers_it() {
         .session
         .master = master;
 
-    let root = std::env::temp_dir().join(format!(
-        "aterm-video-park-{}-{}",
-        std::process::id(),
-        crate::metrics::now_us()
-    ));
-    let _ = std::fs::remove_dir_all(&root);
-    crate::control_auth::ensure_private_dir(&root).expect("private recording root");
-    let dir = crate::control_auth::confine_video_dir(&root).expect("confined recording dir");
-    let (reply, replies) = std::sync::mpsc::channel();
-    app.video_rec = Some(crate::VideoRec {
-        window: crate::WindowId(0),
-        deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
-        started_us: 0,
-        keys: false,
-        key_log: Vec::new(),
-        trail: false,
-        trail_log: Vec::new(),
-        trail_seen: 0,
-        trail_lost: 0,
-        pace_ticks: Vec::new(),
-        mode: crate::VideoMode::OffscreenPresentReal,
-        next_frame: None,
-        presented: None,
-        unseamed_at_begin: 0,
-        unlogged_other_window: 0,
-        dir,
-        handoff: None,
-        cancel: crate::VideoCancellation::new(),
-        reply,
-    });
+    let (root, replies) = live_take(&mut app);
     assert!(app.video_request_live());
 
     // An explicit apply's launched lane: the gate parks at once.
@@ -444,7 +415,7 @@ fn a_commit_the_worker_took_first_never_answers_a_live_take() {
 /// answer, re-posting nothing.
 #[test]
 fn a_commit_whose_answers_took_time_holds_its_claim_through_the_fence() {
-    let model = aterm_spec::derive::native_update_overlap_handoff_model();
+    let model = aterm_models_misc::native_update_overlap_handoff_model();
     let mut state = model.init_state();
     for action in [
         "ParkParentReaders",
@@ -1011,44 +982,6 @@ fn a_held_claim_activates_the_successor_only_at_its_write() {
     }
 }
 
-/// Wired where it holds: the successor is activated on both of the
-/// Commit's write arms — inside the operator's permit, right before the
-/// write — past the claim and its held pass, and nowhere in what the
-/// claim answers (the test above drives the arm with no operator).
-#[cfg(target_os = "macos")]
-#[test]
-fn the_successor_is_activated_in_the_write_alone() {
-    let src = include_str!("app_update_handoff.rs");
-    // Spelled in halves so this test's own text is not counted.
-    let call = ["self.activate_successor", "_at_write(child_pid);"].concat();
-    assert_eq!(
-        src.matches(call.as_str()).count(),
-        2,
-        "the Commit's two write arms, nowhere else"
-    );
-    let held = src
-        .find("pending.held_commit = Some(HeldCommit {")
-        .expect("the held claim");
-    let mut from = held;
-    for _ in 0..2 {
-        let at = from + src[from..].find(call.as_str()).expect("an arm");
-        let write = at
-            + src[at..]
-                .find("crate::seamless::commit_and_exit(commit_fd, proof)")
-                .expect("its write");
-        assert!(write - at < 200, "right before the write");
-        from = write;
-    }
-    let answers = src
-        .find("    fn answer_at_commit_claim(")
-        .expect("what the claim answers");
-    let end = answers + src[answers..].find("\n    }\n").expect("its end");
-    assert!(
-        !src[answers..end].contains("activate_running("),
-        "the claim's answers activate nothing"
-    );
-}
-
 /// A SLOW COMMIT FLUSH SENDS THE ATTEMPT THROUGH THE FENCE AGAIN (round
 /// eight of the update audit, finding 18): the flush blocks the main thread
 /// for up to `MESSAGES_FLUSH_COMMIT_WAIT`, and a key the OS queued then
@@ -1142,10 +1075,6 @@ fn live_take(
         started_us: 0,
         keys: false,
         key_log: Vec::new(),
-        trail: false,
-        trail_log: Vec::new(),
-        trail_seen: 0,
-        trail_lost: 0,
         pace_ticks: Vec::new(),
         mode: crate::VideoMode::OffscreenPresentReal,
         next_frame: None,

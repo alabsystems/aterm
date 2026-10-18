@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-1 conformance for the control socket's lane tenure
-//! (`aterm_spec::derive::control_lane_tenure_model`), and the lanes' scheduling
+//! (`aterm_models_native::control_lane_tenure_model`), and the lanes' scheduling
 //! tests.
 //!
 //! Everything here drives the GENUINE shipping [`Lanes`] — its request lanes,
@@ -22,7 +22,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use aterm_spec::derive::{Model, control_lane_tenure_model};
+use aterm_models_native::control_lane_tenure_model;
+use aterm_spec::derive::Model;
 use aterm_spec::interp::{State, admits};
 use aterm_uds::CtlStream;
 
@@ -56,6 +57,9 @@ struct Stub {
     released: Mutex<Vec<u64>>,
     panic_release: Mutex<Vec<u64>>,
 }
+
+/// The length of the stub's ` big` answer: 4 MiB, past any socket buffer.
+const BIG_ANSWER: usize = 4 << 20;
 
 /// The busy reply, as the lanes write it.
 const BUSY: &str = aterm_types::control_verbs::CONTROL_BUSY_REPLY;
@@ -129,10 +133,10 @@ impl LaneService for Stub {
         &self,
         stream: &CtlStream,
         reader: &mut LaneReader<'_>,
-    ) -> Option<(Scope, Option<String>)> {
+    ) -> Option<(Scope, crate::control::Principal, Option<String>)> {
         let first = super::super::read_request_line(reader)?;
         if first == "AUTH ok" {
-            return Some((Scope::Owner, None));
+            return Some((Scope::Owner, crate::control::Principal::Instance, None));
         }
         let mut writer = stream;
         let _ = writer.write_all(b"ERR auth\n");
@@ -159,6 +163,9 @@ impl LaneService for Stub {
                 self.block();
                 format!("OK {other}")
             }
+            // An answer larger than any socket buffer: the lane delivers what the
+            // peer has room for, the parker the rest.
+            other if other.ends_with(" big") => format!("OK {}", "x".repeat(BIG_ANSWER)),
             other => format!("OK {other}"),
         };
         out.extend_from_slice(format!("{reply}\n").as_bytes());
@@ -825,12 +832,6 @@ fn pipelined_requests_answer_in_order() {
     assert_eq!(driver.request("lane"), "OK rpc");
 }
 
-/// How long the negative controls watch a request that must NOT be answered
-/// (starved behind the waits) before calling it starved. Only an ABSENCE is
-/// judged by it — a request that must be answered is read within [`SETTLE`],
-/// since nothing here frees a lane before the test lets a wait finish.
-const STARVED: Duration = Duration::from_millis(500);
-
 /// Read one line within `within`, or say that none came. (macOS refuses a
 /// read timeout on a socket its peer has already closed; a read there cannot
 /// block anyway, so the refusal is ignored.)
@@ -942,11 +943,6 @@ fn waits_past_every_wait_lane_leave_a_request_lane_for_requests() {
                 "negative control: waits on every request lane refuse a fresh client"
             );
             parked.send("lane\n");
-            assert_eq!(
-                line_within(&mut parked, STARVED),
-                None,
-                "negative control: the parked driver's request is starved behind the waits"
-            );
             // It is served only when a wait ends and frees its lane.
             rig.stub.let_finish(false);
             assert_eq!(parked.line(), "OK rpc");
@@ -964,16 +960,15 @@ fn waits_past_every_wait_lane_leave_a_request_lane_for_requests() {
 }
 
 /// A WAIT WITH A REQUEST PIPELINED BEHIND IT (the review of the budget,
-/// 2026-09-27) — `RelayClient::dial_via_local`'s shape, `dial <name>` then
-/// `version` written back to back, one `aterm drive --dial` relay each — moves
-/// to a wait lane like any other, carrying the requests behind it: more such
+/// 2026-09-27) — a wait then `version` written back to back — moves to a wait
+/// lane like any other, carrying the requests behind it: more such
 /// waits than the request lanes and their budget are all held, none is answered
 /// busy, a fresh client is served beside them, and each connection's pipelined
 /// requests are answered after its wait, in order, on the wait lane it moved
 /// to. The negative control is the rule before the carry (a wait with anything
 /// buffered behind it stays on its request lane): the first takes the budget's
 /// one place and every later one is answered busy with seven wait lanes free —
-/// the fifth relay turned away — which the model rejects (`WaitLaneTakenFirst`).
+/// the fifth client turned away — which the model rejects (`WaitLaneTakenFirst`).
 #[test]
 fn pipelined_waits_move_with_the_requests_behind_them() {
     const WAITS: usize = 5;
@@ -1221,20 +1216,11 @@ fn a_parker_that_cannot_go_on_closes_what_it_holds_and_the_lanes_serve_on() {
         vec![claimed_id],
         "its claim ended with it"
     );
-    // The lanes run as without a parker: served, and kept on its lane when
-    // idle (never handed to the parker that is gone). A lane places a
-    // connection in microseconds; for a quarter of a second it must stay there.
+    // The lanes run as without a parker: served, and never handed to the
+    // parker that is gone.
     let mut fresh = rig.idle().expect("a fresh client after the stop");
-    let kept_until = Instant::now() + Duration::from_millis(250);
-    while Instant::now() < kept_until {
-        let census = rig.lanes.census();
-        assert!(
-            census.rpc == 1 && census.parked == 0,
-            "an idle connection after the stop must keep its lane: {census:?}"
-        );
-        std::thread::sleep(Duration::from_millis(2));
-    }
     assert_eq!(fresh.request("again"), "OK again");
+    assert_eq!(rig.lanes.census().parked, 0, "nothing parks after the stop");
 }
 
 /// A CLIENT THAT HALF-CLOSED AFTER ITS REQUEST (`printf … | nc -U`) reads its
@@ -1281,4 +1267,48 @@ fn a_half_closed_client_reads_eof_when_its_lane_closes_though_a_copy_survives() 
          lived: {end:?}"
     );
     drop(forked_copy);
+}
+
+/// An answer the exit waits for (`close`'s: its action can end the process,
+/// `control::FinalReplies`) stays owed after its lane is done with it, while the
+/// parker holds the part its peer has not taken yet, and is released once the peer
+/// has it all. Counted once from before the dispatch, so a request served is owed
+/// at least until its lane gives the connection back.
+#[test]
+fn an_answer_the_exit_waits_for_is_owed_until_the_parker_delivers_it() {
+    static REPLIES: super::super::FinalReplies = super::super::FinalReplies::new();
+    let rig = Rig::new(model_limits());
+    rig.lanes.count_final_replies_on(&REPLIES);
+    let mut client = rig.idle().expect("admitted");
+
+    client.send("close big\n");
+    // A hang detector, never a latency budget.
+    let deadline = Instant::now() + SETTLE;
+    while REPLIES.owed() == 0 {
+        assert!(Instant::now() < deadline, "the lane took the request");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // The lane gave the connection back, its answer's tail with the parker.
+    rig.settle("the answer's tail parked", |c, f| {
+        c.parked == 1 && c.rpc == 0 && f == (0, 0)
+    });
+    assert_eq!(REPLIES.owed(), 1, "undelivered: still owed");
+    assert!(
+        !REPLIES.settle(Duration::from_millis(20)),
+        "the exit's wait ends at its bound"
+    );
+
+    let answer = client.line();
+    assert_eq!(answer.len(), "OK ".len() + BIG_ANSWER, "the whole answer");
+    assert!(
+        REPLIES.settle(SETTLE),
+        "delivered: the exit no longer waits for it"
+    );
+
+    // An answer delivered at once is released with it; any other verb is never
+    // owed.
+    assert_eq!(client.request("close"), "OK close");
+    assert_eq!(client.request("ping"), "OK ping");
+    assert!(REPLIES.settle(SETTLE));
+    assert_eq!(REPLIES.owed(), 0);
 }

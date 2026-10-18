@@ -78,7 +78,7 @@ fn every_corpus_folds_chunk_independently() {
     );
 }
 
-/// Tier-1 bind of `aterm_spec::derive::coalesce_model()`: the two write lanes,
+/// Tier-1 bind of `aterm_models_session::coalesce_model()`: the two write lanes,
 /// compared after every parser-ground prefix rather than only at the end.
 ///
 /// The single lane feeds one byte per `process_at` (the per-glyph writer); the
@@ -93,7 +93,7 @@ fn every_corpus_folds_chunk_independently() {
 /// rejected by the committed model and admitted by `Buggy = 1` at `SKIPAT`.
 #[test]
 fn every_corpus_record_conforms_to_coalesce_model() {
-    use aterm_spec::derive::coalesce_model;
+    use aterm_models_session::coalesce_model;
     use aterm_spec::{interp, verify};
     use std::collections::BTreeMap;
 

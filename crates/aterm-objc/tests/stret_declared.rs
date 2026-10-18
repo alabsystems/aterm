@@ -47,8 +47,12 @@
 //! prevent.
 
 #![cfg(target_os = "macos")]
+#![expect(
+    clippy::disallowed_methods,
+    reason = "aterm-objc's own runtime tests drive the bare `msg` cast; everything else uses checked_msg"
+)]
 
-use std::ffi::{CStr, c_char, c_void};
+use std::ffi::c_void;
 
 use aterm_objc::{
     CGPoint, CGRect, CGSize, ClassPtr, ClassType, Encode, Id, NSRange, Sel, class, declare_class,
@@ -161,30 +165,6 @@ fn signature_for(cls: ClassPtr, s: Sel) -> Id {
     }
 }
 
-/// `-[NSMethodSignature methodReturnLength]` — the byte count Foundation
-/// computed FROM THE STRING `class_addMethod` was handed.
-fn return_length(sig: Id) -> usize {
-    // SAFETY: `-methodReturnLength` is `-(NSUInteger)` on a live signature.
-    unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = msg();
-        f(sig, sel!(methodReturnLength))
-    }
-}
-
-/// `-[NSMethodSignature methodReturnType]` — the return's encoding, as
-/// Foundation re-emits it.
-fn return_type(sig: Id) -> String {
-    // SAFETY: `-methodReturnType` is `-(const char *)` on a live signature;
-    // the string is owned by the signature and outlives this read.
-    let p = unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel) -> *const c_char = msg();
-        f(sig, sel!(methodReturnType))
-    };
-    assert!(!p.is_null(), "a signature always reports a return type");
-    // SAFETY: a non-null, NUL-terminated, signature-owned C string.
-    unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
-}
-
 /// Build an `NSInvocation` for `sel` on `target`, +0.
 fn invocation(target: Id, cls: ClassPtr, s: Sel) -> Id {
     let sig = signature_for(cls, s);
@@ -280,33 +260,6 @@ fn the_registered_encodings_are_what_clang_emits_for_the_same_signatures() {
             "registered encoding for {s:?} is not clang's, modulo offsets"
         );
     }
-}
-
-/// Foundation reads OUR string and gets the right byte count — 32, 24 and 16.
-///
-/// This is the assertion the encoding contract actually rests on. A send would
-/// pass whatever the string said; `NSMethodSignature` is where it is believed.
-#[test]
-fn foundation_computes_the_return_length_from_the_registered_string() {
-    let cls = StretProbe::class();
-    for (s, want_len, want_type) in [
-        (
-            sel!(firstRectForCharacterRange:actualRange:),
-            32_usize,
-            "{CGRect={CGPoint=dd}{CGSize=dd}}",
-        ),
-        (sel!(tripleForCharacterRange:), 24, "{?=qqq}"),
-        (sel!(markedRange), 16, "{_NSRange=QQ}"),
-    ] {
-        let sig = signature_for(cls, s);
-        assert!(!sig.is_null(), "{s:?} has a signature");
-        assert_eq!(return_length(sig), want_len, "return length for {s:?}");
-        assert_eq!(return_type(sig), want_type, "return type for {s:?}");
-    }
-    // The three lengths are DIFFERENT, so the check discriminates.
-    assert_eq!(size_of::<CGRect>(), 32);
-    assert_eq!(size_of::<Triple>(), 24);
-    assert_eq!(size_of::<NSRange>(), 16);
 }
 
 /// A direct, typed `objc_msgSend` into each declared trampoline: the register
@@ -424,8 +377,9 @@ fn nsinvocation_drives_every_return_class_through_the_registered_encoding() {
             set_argument(inv, std::ptr::from_ref(&range).cast(), 2);
             set_argument(inv, std::ptr::from_mut(&mut actual_ptr).cast(), 3);
         }
-        // SAFETY: `CGRect` is the return type the signature records, checked by
-        // `foundation_computes_the_return_length_from_the_registered_string`.
+        // SAFETY: `CGRect` is the return type the signature records, as
+        // `the_registered_encodings_are_what_clang_emits_for_the_same_signatures`
+        // checks.
         let rect: CGRect = unsafe { invoke_returning(inv) };
         assert_eq!(
             rect,

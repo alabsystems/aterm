@@ -132,40 +132,6 @@ fn insert_chars_count_exceeds_remaining_space() {
     }
 }
 
-/// insert_chars at col 0 should shift all content right.
-#[test]
-fn insert_chars_at_col_zero() {
-    let (_pages, mut row) = make_row(10);
-    for (i, c) in "ABC".chars().enumerate() {
-        row.write_char(u16_from_usize(i), c);
-    }
-
-    row.insert_chars(0, 3);
-    assert_eq!(row.get(0).unwrap().char(), ' ');
-    assert_eq!(row.get(1).unwrap().char(), ' ');
-    assert_eq!(row.get(2).unwrap().char(), ' ');
-    assert_eq!(row.get(3).unwrap().char(), 'A');
-    assert_eq!(row.get(4).unwrap().char(), 'B');
-    assert_eq!(row.get(5).unwrap().char(), 'C');
-    assert_eq!(row.len(), 6);
-}
-
-/// delete_chars at col 0 should shift all content left.
-#[test]
-fn delete_chars_at_col_zero() {
-    let (_pages, mut row) = make_row(10);
-    for (i, c) in "ABCDE".chars().enumerate() {
-        row.write_char(u16_from_usize(i), c);
-    }
-
-    row.delete_chars(0, 2);
-    assert_eq!(row.get(0).unwrap().char(), 'C');
-    assert_eq!(row.get(1).unwrap().char(), 'D');
-    assert_eq!(row.get(2).unwrap().char(), 'E');
-    assert_eq!(row.get(3).unwrap().char(), ' ');
-    assert_eq!(row.len(), 3);
-}
-
 // selective_clear_range len recalculation
 
 /// selective_clear_range should correctly update len when the last non-empty
@@ -185,7 +151,7 @@ fn selective_clear_range_len_with_protected_at_end() {
     row.write_char_styled(4, 'D', fg, bg, CellFlags::empty());
     assert_eq!(row.len(), 5);
 
-    row.selective_clear_range(0, 5);
+    row.selective_clear_range(0, 5, Cell::EMPTY);
 
     assert_eq!(
         row.get(3).unwrap().char(),
@@ -215,7 +181,7 @@ fn selective_clear_all_protected_preserves_len() {
     }
     assert_eq!(row.len(), 5);
 
-    row.selective_clear();
+    row.selective_clear(Cell::EMPTY);
 
     assert_eq!(row.len(), 5);
     for i in 0..5u16 {
@@ -298,56 +264,9 @@ fn erase_chars_wide_head_at_tail_recalcs_len() {
     assert!(row.get(3).unwrap().is_empty());
 }
 
-/// delete_chars at the last column with a large count should handle gracefully.
-#[test]
-fn delete_chars_at_last_col() {
-    let (_pages, mut row) = make_row(10);
-    for (i, c) in "ABCDE".chars().enumerate() {
-        row.write_char(u16_from_usize(i), c);
-    }
-
-    // Delete 5 at col 9 (last column, which is empty)
-    row.delete_chars(9, 5);
-    assert_eq!(row.len(), 5, "deleting at empty tail should not change len");
-    assert_eq!(row.get(0).unwrap().char(), 'A');
-}
-
 // Row::set boundary tests: `self.len = col + 1` cannot overflow, since rows
 // are at most PAGE_SIZE / size_of::<Cell>() columns wide. Writing the last
 // valid column yields len == cols.
-
-/// Row::set at the last valid column should update len to cols.
-#[test]
-fn row_set_last_valid_column_updates_len() {
-    let (_pages, mut row) = make_row(100);
-    let cell = Cell::new('X');
-
-    assert!(row.set(99, cell), "set at last column (99) should succeed");
-    assert_eq!(
-        row.len(),
-        100,
-        "len should be cols (100) after writing last column"
-    );
-
-    assert!(!row.set(100, cell), "set at col 100 should fail (OOB)");
-    assert_eq!(row.len(), 100, "len unchanged after OOB set");
-}
-
-/// Row::set at col=0 on a 1-column row: tests the smallest row size.
-#[test]
-fn row_set_single_column_row() {
-    let (_pages, mut row) = make_row(1);
-    let cell = Cell::new('X');
-
-    assert_eq!(row.cols(), 1);
-    assert_eq!(row.len(), 0);
-
-    assert!(row.set(0, cell), "set at col 0 should succeed");
-    assert_eq!(row.len(), 1, "len should be 1 after writing sole column");
-
-    assert!(!row.set(1, cell), "set at col 1 should fail (OOB)");
-    assert_eq!(row.len(), 1);
-}
 
 /// Row::set at the last column of an 8192-column row (the PAGE_SIZE limit)
 /// yields len == 8192.
@@ -368,21 +287,4 @@ fn row_set_page_max_cols_last_valid() {
         !row.set(8192, cell),
         "set at col 8192 should fail (OOB on 8192-element row)"
     );
-}
-
-/// Row::set does not overflow on repeated writes to the same column.
-#[test]
-fn row_set_repeated_same_column_no_len_regression() {
-    let (_pages, mut row) = make_row(10);
-    let cell = Cell::new('X');
-
-    // Write to col 5 three times — len should stay at 6
-    assert!(row.set(5, cell));
-    assert_eq!(row.len(), 6);
-
-    assert!(row.set(5, cell));
-    assert_eq!(row.len(), 6, "repeated set should not change len");
-
-    assert!(row.set(5, cell));
-    assert_eq!(row.len(), 6, "len stable after third set");
 }

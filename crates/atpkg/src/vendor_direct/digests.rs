@@ -366,20 +366,6 @@ mod tests {
         assert!(!vendor_dir(&l).exists());
     }
 
-    /// Each program's log is a file no program's stamp is.
-    #[test]
-    fn no_log_is_a_stamp() {
-        let l = layout("names");
-        let programs = || super::super::table::VENDORS.iter().map(|s| s.program);
-        for program in programs() {
-            let stamp = super::super::stamp::stamp_path(&l, program).unwrap();
-            assert!(
-                programs().all(|p| digests_path(&l, p) != stamp),
-                "{program}"
-            );
-        }
-    }
-
     /// Only a digest of the named algorithm authenticates (sample: agy 1.3.6's darwin_arm64
     /// sha512 from Google's manifest), held lowercase.
     #[test]

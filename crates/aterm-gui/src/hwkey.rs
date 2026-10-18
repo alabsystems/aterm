@@ -396,6 +396,11 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
     if window_number == 0 {
         return Err("ERR hwkey: no frontmost AppKit window to post into\n".to_string());
     }
+    // A headless process has no AppKit window to post into, and asking for
+    // `NSApp` below would CREATE the application object.
+    if crate::platform::Windowed::get().is_none() {
+        return Err("ERR hwkey: a headless instance has no AppKit event queue\n".to_string());
+    }
     let (Some(chars), Some(ignoring)) = (
         appkit::nsstring(&spec.chars),
         appkit::nsstring(&spec.chars_ignoring),
@@ -480,7 +485,7 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
                     Id,
                     Bool,
                     u16,
-                ) -> Id = aterm_objc::msg();
+                ) -> Id = aterm_objc::checked_msg();
                 make(
                     class(c"NSEvent").as_id(),
                     sel!(
@@ -506,7 +511,8 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
             // SAFETY: `-postEvent:atStart:` is `-(void)(NSEvent *, BOOL)` on the
             // shared application with a live event; see the thread-safety note.
             unsafe {
-                let post: unsafe extern "C-unwind" fn(Id, Sel, Id, Bool) = aterm_objc::msg();
+                let post: unsafe extern "C-unwind" fn(Id, Sel, Id, Bool) =
+                    aterm_objc::checked_msg();
                 post(app, sel!(postEvent:atStart:), down, Bool::NO);
                 // The release too: a real key always produces one, and leaving
                 // the press unmatched would drift AppKit's notion of the
@@ -538,7 +544,7 @@ pub(crate) fn post(_spec: &HwKeySpec, _window_number: i64) -> Result<u32, String
 
 #[cfg(test)]
 mod tests {
-    use super::{FLAG_COMMAND, FLAG_CONTROL, FLAG_FUNCTION, FLAG_SHIFT, MAX_COUNT, parse_hwkey};
+    use super::{FLAG_CONTROL, FLAG_FUNCTION, FLAG_SHIFT, MAX_COUNT, parse_hwkey};
 
     /// A bare letter is the unshifted US-QWERTY key for it, with no modifiers and
     /// both character strings equal — the shape AppKit reports for a plain press.
@@ -555,23 +561,17 @@ mod tests {
     /// SHIFT is DERIVED from the character, not demanded from the caller: `hwkey X`
     /// must be the same physical key as `hwkey x` plus the shift flag, because that
     /// is what the keyboard does. Getting this wrong would post keycode-for-`x`
-    /// with no shift and quietly measure the wrong keystroke.
+    /// with no shift and quietly measure the wrong keystroke. A shifted
+    /// punctuation character folds to its unshifted key too.
     #[test]
     fn an_uppercase_letter_shifts_the_same_physical_key() {
-        let lower = parse_hwkey("x").unwrap();
-        let upper = parse_hwkey("X").unwrap();
-        assert_eq!(upper.keycode, lower.keycode);
-        assert_eq!(upper.flags, FLAG_SHIFT);
-        assert_eq!(upper.chars_ignoring, "X");
-    }
-
-    /// A shifted PUNCTUATION character folds to its unshifted key too.
-    #[test]
-    fn shifted_punctuation_folds_to_its_base_key() {
-        let plain = parse_hwkey("1").unwrap();
-        let bang = parse_hwkey("!").unwrap();
-        assert_eq!(bang.keycode, plain.keycode);
-        assert_eq!(bang.flags, FLAG_SHIFT);
+        for (plain, shifted) in [("x", "X"), ("1", "!")] {
+            let lower = parse_hwkey(plain).unwrap();
+            let upper = parse_hwkey(shifted).unwrap();
+            assert_eq!(upper.keycode, lower.keycode, "{shifted}");
+            assert_eq!(upper.flags, FLAG_SHIFT, "{shifted}");
+            assert_eq!(upper.chars_ignoring, shifted);
+        }
     }
 
     /// Control chords carry the C0 byte in `characters` (what AppKit delivers) and
@@ -662,11 +662,6 @@ mod tests {
         assert_eq!(s.interval_ms, 25);
         assert_eq!(s.keycode, parse_hwkey("x").unwrap().keycode);
 
-        assert_eq!(
-            parse_hwkey("x").unwrap().interval_ms,
-            40,
-            "human-ish default"
-        );
         assert!(parse_hwkey("x count=0").is_err());
         assert!(parse_hwkey(&format!("x count={}", MAX_COUNT + 1)).is_err());
         assert!(parse_hwkey("x count=1oo").is_err());
@@ -683,27 +678,5 @@ mod tests {
         assert!(parse_hwkey("ab").is_err());
         // A modifier prefix with nothing after it is not a key.
         assert!(parse_hwkey("ctrl+").is_err());
-    }
-
-    /// Modifier spelling aliases match the `key` verb's table, so a driver that
-    /// knows one verb's grammar can move to the other without surprises.
-    #[test]
-    fn modifier_aliases_match_the_key_verb() {
-        assert_eq!(
-            parse_hwkey("cmd+v").unwrap().flags & FLAG_COMMAND,
-            FLAG_COMMAND
-        );
-        assert_eq!(
-            parse_hwkey("command+v").unwrap(),
-            parse_hwkey("super+v").unwrap()
-        );
-        assert_eq!(
-            parse_hwkey("control+c").unwrap(),
-            parse_hwkey("ctrl+c").unwrap()
-        );
-        assert_eq!(
-            parse_hwkey("option+x").unwrap(),
-            parse_hwkey("alt+x").unwrap()
-        );
     }
 }

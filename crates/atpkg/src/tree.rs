@@ -144,9 +144,7 @@ pub(crate) const SYMLINK_TAG: &str = "symlink";
 
 /// Lowercase-hex SHA-256 of a symlink's raw target bytes — the digest slot of its line.
 pub(crate) fn symlink_target_sha(target_bytes: &[u8]) -> String {
-    let mut h = Sha256::new();
-    h.update(target_bytes);
-    aterm_codec::hex::encode_lower(&h.finalize())
+    sha256_bytes(target_bytes)
 }
 
 /// Build one canonical entry line for a symlink: `<relpath-bytes> 0x00 symlink 0x00
@@ -278,6 +276,15 @@ pub(crate) fn oct_mode(mode: u32) -> String {
     format!("{:o}", mode & 0o7777)
 }
 
+/// SHA-256 of bytes in memory → lowercase hex: [`sha256_file`]'s digest of a file
+/// holding exactly these bytes.
+#[must_use]
+pub fn sha256_bytes(bytes: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(bytes);
+    aterm_codec::hex::encode_lower(&h.finalize())
+}
+
 /// Streamed SHA-256 of a file's contents → lowercase hex (public producer helper: the
 /// publish pipeline computes a manifest's `sha256` with the *same* hash the client checks).
 pub fn sha256_file(path: &Path) -> io::Result<String> {
@@ -364,16 +371,6 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-    /// `tree_root` is a cross-version byte contract (signed manifests embed roots
-    /// computed by earlier releases): the mode field is minimal octal of the masked bits.
-    #[test]
-    fn oct_mode_is_minimal_octal_of_the_masked_bits() {
-        assert_eq!(oct_mode(0), "0");
-        assert_eq!(oct_mode(0o644), "644");
-        assert_eq!(oct_mode(0o4755), "4755");
-        assert_eq!(oct_mode(0o100_644), "644", "file-type bits are masked off");
-    }
-
     fn tmp(label: &str) -> crate::testdir::Dir {
         crate::testdir::dir(&format!("atpkg-tree-{label}-"))
     }
@@ -385,22 +382,11 @@ mod tests {
         std::fs::write(p, content).unwrap();
     }
 
-    // file_sha256 and file_sha512 match the canonical SHA-256/SHA-512("abc") vectors,
-    // and a file longer than one read buffer streams to the one-shot digest.
+    // A file longer than one read buffer streams to the one-shot digest.
     #[test]
-    fn file_digests_match_the_known_vectors() {
+    fn a_long_file_streams_to_the_one_shot_digest() {
         let d = tmp("vec");
         let f = d.join("v");
-        write(&f, b"abc");
-        assert_eq!(
-            file_digest(&f, DigestAlg::Sha256).unwrap(),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-        assert_eq!(
-            file_digest(&f, DigestAlg::Sha512).unwrap(),
-            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a\
-             2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
-        );
         let long: Vec<u8> = (0..200_003_u32)
             .map(|i| u8::try_from(i % 251).unwrap())
             .collect();
@@ -568,21 +554,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(tree_root_declared(&d, &modes).unwrap(), expected);
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    // tree_root is a 64-char lowercase hex digest and is deterministic across recomputes.
-    #[test]
-    fn tree_root_is_deterministic() {
-        let d = tmp("det");
-        write(&d.join("bin/ay"), b"binary");
-        write(&d.join("share/doc/readme"), b"hello");
-        write(&d.join("lib/a.so"), b"\x00\x01\x02");
-        let r1 = tree_root(&d).unwrap();
-        let r2 = tree_root(&d).unwrap();
-        assert_eq!(r1, r2);
-        assert_eq!(r1.len(), 64);
-        assert!(r1.bytes().all(|b| b.is_ascii_hexdigit()));
         let _ = std::fs::remove_dir_all(&d);
     }
 

@@ -11,6 +11,5 @@
 //! `targo --unverified test -p aterm-session --test session_suite -- <file>::`.
 
 mod conformance_authorize;
-mod conformance_fabric;
 #[cfg(unix)]
 mod immediate_egress;

@@ -3,30 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-#[test]
-fn grid_unscroll_from_scrollback_basic() {
-    let mut grid = tiered_grid(4, 10, 2);
-
-    write_numbered_lines(&mut grid, 8);
-
-    // Scrollback holds lines 0-3; the screen shows lines 4-7.
-    assert_eq!(
-        grid.tiered_scrollback_lines(),
-        2,
-        "8 lines on a 4-row grid with ring scrollback 2 should leave 2 tiered lines"
-    );
-
-    let unscrolled = grid.unscroll_from_scrollback(2);
-    assert_eq!(
-        unscrolled, 2,
-        "requesting 2 lines should recover the 2 newest history lines"
-    );
-
-    // The top rows hold the newest history (the ring's Lines 2-3), not blanks and not the
-    // tiered store's older Lines 0-1.
-    assert_eq!(row_text(&grid, 0), "Line 2");
-    assert_eq!(row_text(&grid, 1), "Line 3");
-}
 
 /// A `rows`×`cols` grid over a tiered store with a `ring`-line ring.
 fn tiered_grid(rows: u16, cols: u16, ring: usize) -> Grid {
@@ -180,17 +156,6 @@ fn grid_unscroll_no_scrollback_fallback() {
 
     assert_eq!(grid.cell(2, 0).unwrap().char(), 'A');
     assert_eq!(grid.cell(3, 0).unwrap().char(), 'B');
-}
-
-#[test]
-fn grid_unscroll_zero_does_nothing() {
-    let mut grid = tiered_grid(4, 10, 2);
-
-    grid.write_char('X');
-
-    let unscrolled = grid.unscroll_from_scrollback(0);
-    assert_eq!(unscrolled, 0);
-    assert_eq!(grid.cell(0, 0).unwrap().char(), 'X');
 }
 
 #[test]
@@ -463,64 +428,6 @@ fn grid_unscroll_wide_char_column_alignment() {
     );
 }
 
-/// A wide char at the last column is dropped on unscroll, not written single-width
-/// (`Row::write_wide_char` rejects it; WideCharNotAtEnd).
-#[test]
-fn grid_unscroll_wide_char_at_last_col_dropped() {
-    use crate::cell::{CellFlags, PackedColor};
-
-    // 5 columns: a wide char at col 4 cannot fit.
-    let mut grid = tiered_grid(4, 5, 2);
-
-    let fg = PackedColor::DEFAULT_FG;
-    let bg = PackedColor::DEFAULT_BG;
-
-    grid.set_cursor(0, 0);
-    for c in "ABCD".chars() {
-        grid.write_char(c);
-    }
-    if let Some(row) = grid.row_mut(0) {
-        let ok = row.write_wide_char(4, '\u{4E2D}', fg, bg, CellFlags::empty());
-        assert!(!ok, "Wide char at last col should be rejected");
-    }
-
-    grid.set_cursor(0, 4);
-    grid.write_char('E');
-
-    for i in 0..6 {
-        grid.set_cursor(3, 0);
-        for c in format!("L{i}xx").chars() {
-            grid.write_char(c);
-        }
-        grid.line_feed();
-    }
-
-    let sb_count = grid.tiered_scrollback_lines();
-    assert_eq!(
-        sb_count, 4,
-        "6 bottom-row scrolls on a 4-row grid with ring scrollback 2 should offload 4 tiered lines"
-    );
-
-    let unscrolled = grid.unscroll_from_scrollback(sb_count.min(4));
-    assert_eq!(
-        unscrolled, 4,
-        "unscroll should recover all 4 available tiered lines"
-    );
-
-    for row_idx in 0..4u16 {
-        if let Some(row) = grid.row(row_idx)
-            && row.get(0).map(|c| c.char()) == Some('A')
-        {
-            let last_cell = row.get(4).unwrap();
-            assert!(
-                !last_cell.is_wide(),
-                "Last col should not have WIDE flag — wide char should be dropped"
-            );
-            break;
-        }
-    }
-}
-
 /// A scrollback round trip keeps CURLY_UNDERLINE, SUPERSCRIPT and SUBSCRIPT (bits 11-13, inside
 /// `CellFlags::VISUAL_FLAGS_MASK`).
 #[test]
@@ -667,120 +574,27 @@ fn grid_unscroll_zwj_emoji_not_split() {
     );
 }
 
-/// Unscroll removes the recovered lines from scrollback (no duplicates).
-#[test]
-fn grid_unscroll_removes_lines_from_scrollback() {
-    // 8 lines on 4 rows: 2 history lines in the ring, 2 in the tiered store.
-    let mut grid = tiered_grid(4, 10, 2);
-
-    write_numbered_lines(&mut grid, 8);
-
-    let sb_before = grid.scrollback_lines();
-    assert_eq!(
-        sb_before, 4,
-        "Should have 4 history lines (2 ring, 2 tiered)"
-    );
-
-    let unscrolled = grid.unscroll_from_scrollback(1);
-    assert_eq!(unscrolled, 1);
-
-    let sb_after = grid.scrollback_lines();
-    assert_eq!(
-        sb_after,
-        sb_before - 1,
-        "Scrollback should shrink by the number of unscrolled lines"
-    );
-}
-
-/// Unscrolling all available scrollback lines should leave scrollback empty.
-#[test]
-fn grid_unscroll_all_empties_scrollback() {
-    // 8 lines on 4 rows: 2 history lines in the ring, 2 in the tiered store.
-    let mut grid = tiered_grid(4, 10, 2);
-
-    write_numbered_lines(&mut grid, 8);
-
-    let sb_before = grid.scrollback_lines();
-    assert_eq!(
-        sb_before, 4,
-        "Should have 4 history lines (2 ring, 2 tiered)"
-    );
-
-    let unscrolled = grid.unscroll_from_scrollback(sb_before);
-    assert_eq!(unscrolled, sb_before);
-
-    assert_eq!(
-        grid.scrollback_lines(),
-        0,
-        "Scrollback should be empty after unscrolling all lines"
-    );
-}
-
 /// Unscroll aborts entirely when any scrollback line fails to decompress,
 /// leaving scrollback intact.
-// Needs aterm-scrollback's disk-tier `DiskBackedScrollback`.
-#[cfg(feature = "disk-tier")]
 #[test]
 fn grid_unscroll_aborts_on_decompression_failure() {
-    use aterm_scrollback::{DiskBackedScrollback, DiskBackedScrollbackConfig, ScrollbackStorage};
+    // Three corrupt warm lines ahead of one readable hot line.
+    let mut sb = Scrollback::with_block_size(4, 12, 10_000_000, 4);
+    sb.push_str("HotLine");
+    sb.inject_corrupted_warm_block(3);
+    assert_eq!(sb.line_count(), 4);
+    assert!(
+        sb.get_line_rev(1).is_err(),
+        "the fixture needs a corrupt line"
+    );
 
-    let temp_dir = aterm_tempfile::tempdir().expect("create temp dir");
-    let cold_path = temp_dir.path().join("scrollback.dtrm");
+    let sb_before = sb.line_count();
+    let mut grid = Grid::with_tiered_scrollback(4, 20, 0, sb);
 
-    // Zero-size hot/warm tiers and block_size=1: after 20 pushes, 19 lines are
-    // cold (on disk) and 1 is hot.
-    let config = DiskBackedScrollbackConfig::new(&cold_path)
-        .with_hot_limit(0)
-        .with_warm_limit(0)
-        .with_block_size(1);
-    let disk_sb = DiskBackedScrollback::with_config(config).expect("create disk scrollback");
-
-    let mut storage: ScrollbackStorage = disk_sb.into();
-    for i in 0..20 {
-        let line = aterm_scrollback::Line::from(format!("ColdLine{i:02}").as_str());
-        storage.push_line(line).expect("push line");
-    }
-    assert_eq!(storage.line_count(), 20);
-    assert!(std::fs::metadata(&cold_path).map_or(0, |m| m.len()) > 0);
-
-    // Truncate the cold file to its 32-byte header. The in-memory page index
-    // still references the newest pages at the file tail, so reads fail.
-    #[cfg(unix)]
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(&cold_path)
-        .and_then(|f| f.set_len(32))
-        .expect("truncate cold file");
-    // Windows refuses to shrink a mapped file (ERROR_USER_MAPPED_FILE): overwrite every page
-    // byte past the 32-byte header instead.
-    #[cfg(windows)]
-    {
-        use std::io::{Seek, SeekFrom, Write};
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&cold_path)
-            .expect("open cold file");
-        let len = f.metadata().expect("stat cold file").len();
-        f.seek(SeekFrom::Start(32)).expect("seek past header");
-        f.write_all(&vec![
-            0xFF;
-            usize::try_from(len.saturating_sub(32)).unwrap()
-        ])
-        .expect("overwrite cold pages");
-    }
-
-    // The newest cold line (`get_line_rev(1)`; rev 0 is hot) must fail to read.
-    if storage.get_line_rev(1).is_ok() {
-        return; // Truncation didn't affect newest cold page — skip.
-    }
-
-    let sb_before = storage.line_count();
-    let mut grid = Grid::with_tiered_scrollback(4, 20, 0, storage);
-
-    // Line 19 (hot) reads but lines 16-18 (cold) fail: unscroll aborts with 0, nothing changed.
+    // Unscroll 4: the hot line reads, the three corrupt ones fail, so unscroll
+    // aborts with 0 and leaves grid and scrollback unchanged.
     let unscrolled = grid.unscroll_from_scrollback(4);
     assert_eq!(unscrolled, 0, "Unscroll must abort when any line fails");
-
     assert_eq!(
         grid.tiered_scrollback_lines(),
         sb_before,

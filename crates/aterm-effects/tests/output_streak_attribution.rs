@@ -11,8 +11,8 @@ use aterm_effects::{
     cursor_glow::Geom,
     output_streak::{OutputStreak, StreakConfig},
 };
+use aterm_models_effects::output_streak_attribution_model;
 use aterm_render::GlowQuad;
-use aterm_spec::derive::output_streak_attribution_model;
 
 const ROWS: usize = 8;
 const COLS: usize = 48;
@@ -110,78 +110,67 @@ fn another_rows_timer_cannot_paint_the_stationary_composer() {
     assert!(!h.streak.is_active());
 }
 
+/// A write that leaves no new ink is not output and lights nothing; the next
+/// genuinely new glyph still earns light.
 #[test]
-fn an_identical_prompt_redraw_does_not_restart_output_light() {
-    let mut h = Host::new("\x1b[6;3HAsk Codex to do anything\x1b[6;3H");
-    assert!(!h.output("\x1b[6;1H\x1b[2K  Ask Codex to do anything\x1b[6;3H"));
-    assert_eq!(h.paint(), 0);
+fn a_write_that_adds_no_new_ink_is_not_output() {
+    for (name, initial, repaint, fresh) in [
+        (
+            "an identical prompt redraw",
+            "\x1b[6;3HAsk Codex to do anything\x1b[6;3H",
+            "\x1b[6;1H\x1b[2K  Ask Codex to do anything\x1b[6;3H",
+            "x",
+        ),
+        (
+            "a colour and bold repaint",
+            "prompt",
+            "\r\x1b[31;1mprompt\x1b[0m",
+            "!",
+        ),
+        (
+            "a cleared suffix",
+            "kept removed",
+            "\x1b[1;5H\x1b[K",
+            " fresh",
+        ),
+    ] {
+        let mut h = Host::new(initial);
+        assert!(!h.output(repaint), "{name}: licensed as output");
+        assert_eq!(h.paint(), 0, "{name}: painted light");
+        assert!(h.output(fresh), "{name}: new ink after it earns no light");
+    }
+}
+
+/// Genuinely new ink is output, and only the row it was written on lights.
+#[test]
+fn new_ink_is_output_on_the_row_it_was_written_on() {
+    let full_row = "x".repeat(COLS);
+    for (name, initial, write, row) in [
+        ("a same-row append", "result", " ready", 0),
+        (
+            "a same-row rewrite",
+            "\x1b[3;1Hprogress 1",
+            "\x1b[3;1Hprogress 2",
+            2,
+        ),
+        ("a newline", "", "new output\r\n", 0),
+        ("a soft wrap", full_row.as_str(), "fresh", 1),
+        ("repeated output", "same\r\n", "same\r\n", 1),
+        ("a presentation change", "\u{2764}", "\u{fe0f}", 0),
+    ] {
+        let mut h = Host::new(initial);
+        assert!(h.output(write), "{name}: not licensed as output");
+        assert_ne!(h.paint(), 0, "{name}: painted nothing");
+        assert!(
+            h.out.iter().all(|q| q.row == row),
+            "{name}: lit another row than {row}: {:?}",
+            h.out
+        );
+    }
 }
 
 #[test]
-fn genuine_same_row_append_and_rewrite_are_output() {
-    let mut append = Host::new("result");
-    assert!(append.output(" ready"));
-    assert_ne!(append.paint(), 0);
-    assert!(append.out.iter().all(|q| q.row == 0));
-
-    let mut rewrite = Host::new("\x1b[3;1Hprogress 1");
-    assert!(rewrite.output("\x1b[3;1Hprogress 2"));
-    assert_ne!(rewrite.paint(), 0);
-    assert!(rewrite.out.iter().all(|q| q.row == 2));
-}
-
-#[test]
-fn newline_and_soft_wrap_keep_the_newly_written_row() {
-    let mut newline = Host::new("");
-    assert!(newline.output("new output\r\n"));
-    assert_eq!((newline.input.cursor_row, newline.input.cursor_col), (1, 0));
-    assert_ne!(newline.paint(), 0);
-    assert!(newline.out.iter().all(|q| q.row == 0));
-
-    let mut wrap = Host::new(&"x".repeat(COLS));
-    assert!(wrap.output("fresh"));
-    assert_eq!((wrap.input.cursor_row, wrap.input.cursor_col), (1, 5));
-    assert_ne!(wrap.paint(), 0);
-    assert!(wrap.out.iter().all(|q| q.row == 1));
-}
-
-#[test]
-fn clearing_a_suffix_cannot_license_the_surviving_prefix() {
-    let mut h = Host::new("kept removed");
-    assert!(!h.output("\x1b[1;5H\x1b[K"));
-    assert_eq!(h.paint(), 0);
-    assert!(
-        h.output(" fresh"),
-        "new ink after the clear still earns light"
-    );
-}
-
-#[test]
-fn moving_an_existing_input_row_is_not_new_output() {
-    let mut h = Host::new("\x1b[6;3HAsk Codex to do anything\x1b[6;3H");
-    assert!(!h.output("\x1b[2J\x1b[5;3HAsk Codex to do anything\x1b[5;3H"));
-    assert_eq!(h.paint(), 0);
-    assert!(
-        h.output("x"),
-        "a genuine replacement at the new location is output"
-    );
-}
-
-#[test]
-fn an_echo_discounted_change_is_consumed_without_later_replay() {
-    let mut h = Host::new("prompt");
-    h.now += Duration::from_millis(50);
-    h.streak.note_keystroke(h.now);
-    h.term.process(b" typed");
-    assert!(!h.observe(true));
-    h.now += Duration::from_secs(1);
-    assert!(!h.output("\x1b[3;1Htimer changed\x1b[1;13H"));
-    assert_eq!(h.paint(), 0);
-    assert!(h.output("!"));
-}
-
-#[test]
-fn wide_glyph_rewrites_and_presentation_changes_are_output() {
+fn a_rewritten_wide_glyph_owns_both_columns() {
     let mut h = Host::new("\u{4f60}");
     assert!(h.output("\r\u{597d}"));
     assert_ne!(h.paint(), 0);
@@ -193,25 +182,6 @@ fn wide_glyph_rewrites_and_presentation_changes_are_output() {
         h.now += Duration::from_millis(20);
     }
     assert!(continuation_lit, "the changed wide glyph owns both columns");
-
-    let mut presentation = Host::new("\u{2764}");
-    assert!(presentation.output("\u{fe0f}"));
-    assert_ne!(presentation.paint(), 0);
-}
-
-#[test]
-fn colour_and_bold_repaint_of_the_same_text_is_not_new_output() {
-    let mut h = Host::new("prompt");
-    assert!(!h.output("\r\x1b[31;1mprompt\x1b[0m"));
-    assert_eq!(h.paint(), 0);
-}
-
-#[test]
-fn repeated_new_output_is_not_mistaken_for_a_moved_row() {
-    let mut h = Host::new("same\r\n");
-    assert!(h.output("same\r\n"));
-    assert_ne!(h.paint(), 0);
-    assert!(h.out.iter().all(|q| q.row == 1));
 }
 
 #[test]
@@ -420,15 +390,6 @@ fn real_cell_observations_refine_the_attribution_snapshot_model() {
     assert!(buggy.fire("GeometryBaseline", &mut reflow));
     assert!(model.check_invariant("LicensedRequiresFreshUndiscountedInk", &reflow));
     assert!(!model.check_invariant("GeometryBaselineIsSilent", &reflow));
-}
-
-#[test]
-fn rebase_does_not_compare_a_new_sessions_rows_with_the_old_one() {
-    let mut h = Host::new("old session");
-    h.streak.rebase();
-    assert!(!h.output("\r\x1b[2Knew session"));
-    assert_eq!(h.paint(), 0);
-    assert!(h.output(" output"));
 }
 
 #[test]

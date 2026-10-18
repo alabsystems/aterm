@@ -9,10 +9,15 @@
 //! LOCAL PATCH (aterm), 2026-10-15 (docs/AUDIT-third-party-2026-10-15.md, winit-core step 5):
 //! upstream winit re-exports `cursor_icon::CursorIcon`, 35 icons; this crate defines the six aterm
 //! sets, so the package left the macOS and Windows graphs. Linux still links it, through
-//! smithay-client-toolkit and its decoration frame: the Wayland backend converts at that boundary
+//! smithay-client-toolkit: the Wayland backend converts at that boundary
 //! (`platform_impl::linux::wayland::types::cursor::sctk_icon`). The variant docs are aterm's own;
 //! the names are the CSS `cursor` keywords and the fallbacks are cursor-icon's table, as
 //! `tests/recorded_answers.rs` records.
+//!
+//! LOCAL PATCH (aterm), 2026-10-17 (docs/AUDIT-third-party-2026-10-15.md, LW.5): ADDED the eight
+//! edge-resize icons (`n-resize` … `nw-resize`), which aterm's own Wayland frame sets on its
+//! edges and corners where the window had sctk-adwaita's frame; their names and fallbacks were
+//! recorded from cursor-icon 1.2.0 like the six above.
 
 /// A named cursor icon.
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Hash)]
@@ -30,6 +35,22 @@ pub enum CursorIcon {
     ColResize,
     /// A boundary between rows that can be dragged up or down.
     RowResize,
+    /// The window's top edge, which resizes it.
+    NResize,
+    /// The window's top-right corner, which resizes it.
+    NeResize,
+    /// The window's right edge, which resizes it.
+    EResize,
+    /// The window's bottom-right corner, which resizes it.
+    SeResize,
+    /// The window's bottom edge, which resizes it.
+    SResize,
+    /// The window's bottom-left corner, which resizes it.
+    SwResize,
+    /// The window's left edge, which resizes it.
+    WResize,
+    /// The window's top-left corner, which resizes it.
+    NwResize,
 }
 
 impl CursorIcon {
@@ -42,6 +63,14 @@ impl CursorIcon {
             CursorIcon::Grabbing => "grabbing",
             CursorIcon::ColResize => "col-resize",
             CursorIcon::RowResize => "row-resize",
+            CursorIcon::NResize => "n-resize",
+            CursorIcon::NeResize => "ne-resize",
+            CursorIcon::EResize => "e-resize",
+            CursorIcon::SeResize => "se-resize",
+            CursorIcon::SResize => "s-resize",
+            CursorIcon::SwResize => "sw-resize",
+            CursorIcon::WResize => "w-resize",
+            CursorIcon::NwResize => "nw-resize",
         }
     }
 
@@ -55,6 +84,14 @@ impl CursorIcon {
             CursorIcon::Grabbing => &["closedhand"],
             CursorIcon::ColResize => &["split_h", "h_double_arrow", "sb_h_double_arrow"],
             CursorIcon::RowResize => &["split_v", "v_double_arrow", "sb_v_double_arrow"],
+            CursorIcon::NResize => &["top_side"],
+            CursorIcon::NeResize => &["top_right_corner"],
+            CursorIcon::EResize => &["right_side"],
+            CursorIcon::SeResize => &["bottom_right_corner"],
+            CursorIcon::SResize => &["bottom_side"],
+            CursorIcon::SwResize => &["bottom_left_corner"],
+            CursorIcon::WResize => &["left_side"],
+            CursorIcon::NwResize => &["top_left_corner"],
         }
     }
 }

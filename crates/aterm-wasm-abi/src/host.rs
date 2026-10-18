@@ -14,6 +14,7 @@
 //! | `aterm_host.error_stack(out)` | `new Error().stack`, written as a string the module owns |
 //! | `aterm_host.performance_now()` | `performance.now()` |
 //! | `aterm_host.date_now()` | `Date.now()` |
+//! | `aterm_host.object_drop(index)` | release a [`crate::js::JsObject`]'s slot in the glue's object table |
 
 use crate::panic_hook::Console;
 
@@ -27,6 +28,8 @@ unsafe extern "C" {
     safe fn host_performance_now() -> f64;
     #[link_name = "date_now"]
     safe fn host_date_now() -> f64;
+    #[link_name = "object_drop"]
+    safe fn host_object_drop(index: u32);
 }
 
 /// `console.error(text)`.
@@ -60,6 +63,12 @@ pub fn performance_now() -> f64 {
 #[must_use]
 pub fn date_now() -> f64 {
     host_date_now()
+}
+
+/// Release slot `index` of the glue's object table (a dropped
+/// [`crate::js::JsObject`]).
+pub fn object_drop(index: u32) {
+    host_object_drop(index);
 }
 
 /// The panic hook's console through these imports

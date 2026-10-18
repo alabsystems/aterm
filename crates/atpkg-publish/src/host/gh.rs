@@ -389,6 +389,14 @@ impl ReleaseHost for GhCli {
         RETRY_PAUSE
     }
 
+    /// No non-empty token file: the head is read where a client reads it, never through
+    /// whatever login `gh` may or may not have.
+    fn reads_anonymously(&self) -> bool {
+        self.token_file
+            .as_ref()
+            .is_none_or(|f| !std::fs::metadata(f).is_ok_and(|m| m.len() > 0))
+    }
+
     /// `git fetch` of the slug's https URL (never the clone's `origin`, which may name an
     /// ssh remote and its ambient key), with every configured helper cleared and gh's
     /// helper reading `GH_TOKEN` from this identity's token file.

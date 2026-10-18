@@ -196,21 +196,31 @@ fn a_forged_subject_never_reaches_an_inbox_and_is_recorded() {
         "exactly one of the four records may be delivered: {rows:#?}"
     );
 
-    let ev = w.ev();
-    for (off, reason) in [
-        (offs[0], "malformed"),
-        (offs[1], "not-hosted"),
-        (offs[2], "forged-self"),
-    ] {
-        assert!(
-            ev.iter()
-                .any(|e| e.contains(&format!("undeliverable off={off} reason={reason}"))),
-            "no `undeliverable off={off} reason={reason}` in {ev:#?}"
-        );
-    }
-    assert!(
-        ev.iter().any(|e| e.starts_with("cap-compromised")),
-        "a forged record on our own lane is a COMPROMISE, not a delivery problem: {ev:#?}"
+    // THE RECORDS ARE WAITED FOR, NOT READ ONCE. The bridge pipelines its
+    // `ev` publishes (`publish_ev_for` does not wait for the broker's ack)
+    // while the sentinel reaches the inbox over the endpoint, a different
+    // channel: the sentinel landing orders the DELIVERIES, not the `ev`s,
+    // so a read right after it could miss the newest one under load.
+    let wanted = [
+        format!("undeliverable off={} reason=malformed", offs[0]),
+        format!("undeliverable off={} reason=not-hosted", offs[1]),
+        format!("undeliverable off={} reason=forged-self", offs[2]),
+        // A forged record on our own lane is a COMPROMISE, not a delivery
+        // problem.
+        format!("cap-compromised off={}", offs[2]),
+    ];
+    until("every refusal to be recorded", || {
+        let ev = w.ev();
+        wanted
+            .iter()
+            .all(|want| ev.iter().any(|e| e.starts_with(want.as_str())))
+            .then_some(())
+    });
+    // Nor did a refused record reach the inbox while its `ev` was awaited.
+    assert_eq!(
+        w.inbox(&a).len(),
+        before + 1,
+        "still exactly one of the four records delivered"
     );
 }
 
@@ -488,6 +498,76 @@ fn a_kill_between_publish_and_outbox_sent_leaves_one_record_on_the_bus() {
     );
 }
 
+/// **A KILL AFTER A BURST WAS DELIVERED AND BEFORE ITS GROUP COMMIT LOSES
+/// NOTHING AND DOUBLES NOTHING.** The bridge commits the inbox group once per
+/// burst rather than once per record, which widens the window between a
+/// `deliver` and the commit that accounts for it from one record to a burst.
+/// `ATERM_LINK_FAULT=kill-before-inbox-commit` kills the bridge at the widest
+/// point of it — every record of the burst delivered, the commit about to go
+/// out — once (`fault-fired` in the state dir), so the relaunch runs clean.
+///
+/// The relaunch's group subscription starts where the LAST commit left the
+/// durable cursor, so it hands over every record of the burst again, and the
+/// endpoint — the same instance, which outlived its bridge — answers each
+/// offset it already took with the row it gave it: one row per message, no
+/// gap, no double. That idempotency on `off=` is the whole reason the commit
+/// may wait.
+#[test]
+fn a_kill_before_the_inbox_bursts_commit_redelivers_and_aterm_keeps_one_row_of_each() {
+    const BURST: u64 = 6;
+    let w = World::boot_with(
+        "burstkill",
+        &[],
+        &[("ATERM_LINK_FAULT", "kill-before-inbox-commit")],
+    );
+    w.wait_ready();
+    let (a, _b) = w.two_sessions();
+    let first = w.bridge_pid();
+
+    // Sent together, so they reach the bridge as one burst more often than
+    // not; whether they do is the broker's timing and changes nothing here —
+    // the kill lands after the first burst's deliveries, whatever it held.
+    let subject = format!("/f/{FLEET}/in/{}/{a}/h-sender/note", w.node);
+    let records: Vec<harness::Record> = (1..=BURST)
+        .map(|i| {
+            (
+                6_300,
+                i,
+                subject.clone(),
+                format!("v=1 t=1 text=burst{i}").into_bytes(),
+            )
+        })
+        .collect();
+    harness::publish_pipelined(&mut w.god(), &records);
+
+    until("the bridge to kill itself before the commit", || {
+        std::fs::read_to_string(w.state.join("fault-fired"))
+            .ok()
+            .map(|_| ())
+    });
+    until("the bridge to be relaunched", || {
+        let pid: i32 = std::fs::read_to_string(w.state.join("pid"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        (pid != first).then_some(())
+    });
+    let rows = until("every record of the burst in the inbox", || {
+        let rows = w.inbox(&a);
+        (1..=BURST)
+            .all(|i| rows.iter().any(|r| r.contains(&format!("text=burst{i}"))))
+            .then_some(rows)
+    });
+    for i in 1..=BURST {
+        let copies = rows
+            .iter()
+            .filter(|r| r.contains(&format!("text=burst{i}")))
+            .count();
+        assert_eq!(copies, 1, "burst{i} is one row, not {copies}: {rows:#?}");
+    }
+}
+
 /// **EVERY CONNECTION CARRIES ITS OWN WILL.** A broker restart fires the will
 /// of the connection it cut, and the reconnect registers a new one; `SIGKILL`
 /// of the bridge then fires exactly that one; and the relaunch publishes `live`
@@ -574,6 +654,7 @@ fn every_connection_carries_its_own_will_across_a_broker_restart_and_a_kill() {
     // relaunch must still not reuse a sequence, because the bus's own last row
     // tells it where it had got to.
     let _ = std::fs::remove_file(w.state.join("inc"));
+    let _ = std::fs::remove_file(w.state.join("inc-lease"));
     let _ = std::fs::remove_file(w.state.join("seq"));
     harness::kill(pid, 9);
 
@@ -600,75 +681,6 @@ fn every_connection_carries_its_own_will_across_a_broker_restart_and_a_kill() {
     assert!(
         seq > (second_inc << 32) | 0xFFFF_FFFF,
         "the new incarnation's sequences must be above the old one's reserved top: {seq}"
-    );
-}
-
-/// **`SIGKILL` `aterm` after a `deliver`, before the `seen`.** The relaunched
-/// instance shows the row ONCE — which today means: not at all in the new
-/// session, because its sid is new, and never twice anywhere.
-///
-/// HONEST SCOPE, and it is narrower than the rung's wording. §6.2 describes a
-/// refill "on an instance relaunch or a `session-created` with a known sid",
-/// but aterm mints a FRESH sid at every launch (`SessionId::generate`,
-/// `aterm-session/src/id.rs`) and has no way to ask for one, so a relaunched
-/// instance's sessions are sids the bridge has never seen and the old
-/// session's rows have no session to be refilled INTO. The refill mechanism
-/// itself — the persisted watermark, the fetch from `seen_off + 1`, and the
-/// idempotency that makes it safe over rows the ring holds — is proved across a
-/// BRIDGE restart, which needs no stable sid (`bridge_recovery.rs`,
-/// `a_session_that_existed_when_the_bridge_started_is_still_refilled`). This
-/// test pins what IS true across an `aterm` restart and what the rung's
-/// safety content actually is — the bus keeps the durable copy, the bridge
-/// comes back clean against a live broker, and nothing is duplicated or
-/// replayed into a session that did not ask for it.
-#[test]
-fn killing_aterm_gui_loses_no_row_and_duplicates_none() {
-    let mut w = World::boot("relaunch", &[]);
-    w.wait_ready();
-    let (a, _b) = w.two_sessions();
-
-    let mut god = w.god();
-    let subject = format!("/f/{FLEET}/in/{}/{a}/h-andrew/note", w.node);
-    god.publish(8_800, 1, &subject, b"v=1 t=1 text=unseen")
-        .expect("publish");
-    until("the row to be delivered", || {
-        w.inbox(&a)
-            .into_iter()
-            .any(|r| r.contains("text=unseen"))
-            .then_some(())
-    });
-    // Deliberately NOT `inbox seen`: the row is delivered and unhandled, which is
-    // the window the rung names.
-
-    let mut gui = w.gui.take().expect("the instance");
-    let _ = gui.kill();
-    let _ = gui.wait();
-    // The bridge's descriptors close with it, so the bridge exits too.
-    until("the bridge to exit with the instance", || {
-        let pid = w.bridge_pid();
-        (!harness::alive(pid)).then_some(())
-    });
-
-    // RELAUNCH against the same broker, the same state dir, the same node id.
-    let gui = w.gui.insert(World::relaunch_gui(&w));
-    w.token = World::wait_for_token_of(&w.ctl_sock, gui, &w.gui_log);
-    w.wait_ready();
-
-    // The record is still on the bus — the durable copy the design promises —
-    // and the group cursor has already passed it, so it is not re-delivered into
-    // the fresh session that does not own it.
-    let mut c = w.god();
-    let (rows, _) = c.fetch(0, &subject, 64).expect("fetch the lane");
-    assert_eq!(rows.len(), 1, "the bus keeps exactly one copy: {rows:#?}");
-    let fresh: Vec<String> = w
-        .sessions()
-        .into_iter()
-        .flat_map(|(_, sid, _)| w.inbox(&sid))
-        .filter(|r| r.contains("text=unseen"))
-        .collect();
-    assert!(
-        fresh.is_empty(),
-        "a relaunched instance's NEW sid must not inherit another session's mail: {fresh:#?}"
     );
 }
 
@@ -749,11 +761,15 @@ fn an_orphaned_bridge_mid_drain_neither_publishes_more_nor_shares_the_node() {
         w.state.join("fault-fired").exists().then_some(())
     });
     let orphan = w.bridge_pid();
-    let inc: u64 = std::fs::read_to_string(w.state.join("inc"))
-        .expect("the orphan's incarnation")
-        .trim()
-        .parse()
-        .expect("a number");
+    // The orphan's incarnation is its own node row's: the state dir's `inc`
+    // holds the top of the incarnation LEASE (`aterm-link`'s `state.rs`, "The
+    // incarnation lease"), not the incarnation the attach took.
+    let node_face = format!("/f/{FLEET}/pub/{}/node/presence", w.node);
+    let inc: u64 = until("the orphan's own live node row", || {
+        let row = w.row(&node_face)?;
+        let mine = row.contains("state=live") && kv(&row, "pid") == Some(&*orphan.to_string());
+        mine.then(|| kv(&row, "inc")?.parse().ok()).flatten()
+    });
 
     // THE INSTANCE GOES — its bridge is not waited for — AND ITS SUCCESSOR
     // COMES UP on the same state dir at once. (Should this test fail from here
@@ -788,7 +804,6 @@ fn an_orphaned_bridge_mid_drain_neither_publishes_more_nor_shares_the_node() {
     until("the orphan to exit", || {
         (!harness::alive(orphan)).then_some(())
     });
-    let node_face = format!("/f/{FLEET}/pub/{}/node/presence", w.node);
     let successor = until("the successor's bridge to carry the node", || {
         let pid: i32 = std::fs::read_to_string(w.state.join("pid"))
             .ok()?

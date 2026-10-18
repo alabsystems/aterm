@@ -39,12 +39,12 @@
 //!   bound each row's login ([`bound`]), the forecast of its end
 //!   ([`forecast`]) and its state ([`login_state`]): derived from what is on
 //!   record, never by running anything under a login.
-//! * THE STATE ([`State`]): OBSERVATIONS, which are account-wide and merge by
-//!   newest `at` ([`merge_observations`]: a wall, the two newest `/usage`
-//!   samples, a reset offer), and MACHINE-LOCAL facts that never merge (the
-//!   auth word, when a session last ran on an account, `active`, `proven`,
-//!   `pinned`, the canary and what a rotation wrote over, the sessions, the
-//!   rotation times, the claims).
+//! * THE STATE ([`State`]): OBSERVATIONS, which are account-wide and stamped
+//!   with their `at` and `by` (a wall, the two newest `/usage` samples, a
+//!   reset offer), and MACHINE-LOCAL facts (the auth word, when a session
+//!   last ran on an account, `active`, `proven`, `pinned`, the canary and
+//!   what a rotation wrote over, the sessions, the rotation times, the
+//!   claims).
 //! * THE CONDITION ([`condition`]): derived at every read, never stored.
 //! * THE ADVICE ([`advise`]): `Stay | Probe | Move | Wait | Resume`, design
 //!   §6 rules 1–5 and the owner's clearing between rules 2 and 3, with
@@ -1293,8 +1293,6 @@ pub fn default_roster_path() -> Option<PathBuf> {
 ///   [`ProcessLogin::with_settings`] — a credential, a profile or a route
 ///   name in an `env` block, an `apiKeyHelper`, and a source that could not
 ///   be read.
-/// * ITS ROUTE, where a host already keeps one
-///   ([`super::netwatch::route_of`]): [`ProcessLogin::with_route_default`].
 /// * THE VENDOR'S PROFILE STORE ([`profile_configs_dir`],
 ///   [`profile_configured`]): [`ProcessLogin::with_profile_store`].
 ///
@@ -1449,17 +1447,6 @@ impl ProcessLogin {
     pub fn of_exec_env(env: &[String]) -> Option<ProcessLogin> {
         (!env.is_empty())
             .then(|| ProcessLogin::of_env(env.iter().filter_map(|kv| kv.split_once('='))))
-    }
-
-    /// With the host's half: whether the route the process's SETTINGS give
-    /// it is the default one ([`super::netwatch::route_of`]). `false` makes
-    /// it no stored login, whatever its environment said; `true` leaves what
-    /// the environment said, and never makes a stored login of a process
-    /// with a credential in its environment.
-    #[must_use]
-    pub fn with_route_default(mut self, default: bool) -> ProcessLogin {
-        self.stored_login &= default;
-        self
     }
 
     /// With THE SETTINGS FILES Claude Code reads for the process, as the
@@ -3735,22 +3722,6 @@ pub fn candidates(
     out
 }
 
-/// The first candidate, where there is one.
-#[must_use]
-pub fn next_candidate(
-    roster: &Roster,
-    state: &State,
-    enrolled: &BTreeSet<String>,
-    me: Option<&str>,
-    point: &Point,
-    now: i64,
-) -> Option<String> {
-    candidates(roster, state, enrolled, me, point, now)
-        .into_iter()
-        .find(|(_, verdict)| verdict.is_ok())
-        .map(|(label, _)| label)
-}
-
 /// The instant to wait for when nothing can be moved into: the earliest
 /// instant any account is usable — and the earliest DEDICATED instant when
 /// that is within [`DEDICATED_WAIT_S`] of it, so a herd is not relaunched
@@ -4095,7 +4066,7 @@ pub fn advise(
 /// or not anybody makes the probe. And a host's commit asks THIS, at both of
 /// its re-advices: a due probe is no reason to refuse a move it was asked
 /// for. Everywhere [`advise`] is not `Probe` the two are the same answer
-/// (`accounts_tests.rs` asks both at every fixture).
+/// ([`advise_with`]: one body).
 #[must_use]
 pub fn advise_past_probe(
     roster: &Roster,
@@ -4658,12 +4629,11 @@ pub fn believed_reset(until: Option<i64>, at: i64) -> Option<i64> {
 /// A wall on the pinned account ends the pin, whichever of those it was:
 /// seeing a wall there again says the same thing as seeing it first.
 ///
-/// THE OWNER'S CLEARING STANDS, as in [`merge_observations`]: a wall
-/// observed BEFORE the pin cleared the account's walls
-/// ([`Account::cleared_at`]) is the wall the owner cleared. It is dropped
-/// and ends no pin — a session left standing at that wall still has the row
-/// in its transcript, and a look at it ([`record_wall`]) would otherwise
-/// put the wall back and end the owner's pin with it.
+/// THE OWNER'S CLEARING STANDS: a wall observed BEFORE the pin cleared the
+/// account's walls ([`Account::cleared_at`]) is the wall the owner cleared.
+/// It is dropped and ends no pin — a session left standing at that wall
+/// still has the row in its transcript, and a look at it ([`record_wall`])
+/// would otherwise put the wall back and end the owner's pin with it.
 ///
 /// A RESET TOO FAR OFF IS NOT BELIEVED ([`believed_reset`]): one more than
 /// [`RESET_BELIEVED_S`] past the observation is recorded as no reset, here,
@@ -5774,9 +5744,9 @@ pub fn strike(state: &mut State, account: &str, sid: &str, why: &Strike, now: i6
 }
 
 /// The owner's word, `accounts use <label>`: the account's walls are
-/// cleared — and the instant kept ([`Account::cleared_at`]), so neither a
-/// merge nor a row still standing in a transcript ([`note_wall`]) brings
-/// back the walls the owner cleared — and it is `active`, `proven` and
+/// cleared — and the instant kept ([`Account::cleared_at`]), so a row still
+/// standing in a transcript ([`note_wall`]) does not bring back the walls
+/// the owner cleared — and it is `active`, `proven` and
 /// `pinned`: every session follows at its next point, and the early move
 /// is off.
 ///
@@ -5831,126 +5801,6 @@ pub fn unpin(state: &mut State, why: &str, now: i64) -> Option<Event> {
     state.pinned = false;
     let account = state.active.clone().unwrap_or_default();
     Some(Event::new(now, Kind::Unpin, &account).because(why))
-}
-
-/// The newer of two observations by `(at, by)`, so a merge gives one answer
-/// whichever side it is run from.
-fn newer<T: Clone>(
-    mine: Option<&T>,
-    theirs: Option<&T>,
-    key: impl Fn(&T) -> (i64, &str),
-) -> Option<T> {
-    match (mine, theirs) {
-        (Some(a), Some(b)) => Some(if key(b) > key(a) { b } else { a }.clone()),
-        (a, b) => a.or(b).cloned(),
-    }
-}
-
-/// Take `from`'s OBSERVATIONS into `into`: per account and fact, the newer
-/// `at` wins (a tie goes to the greater `by`). Walls merge per limit type;
-/// the two newest distinct samples of the four are kept; the offer is the
-/// newer one. MACHINE-LOCAL facts — the auth word, when a session last ran
-/// on an account, `active`, `previous`, `proven`, `pinned`, the canary and
-/// the undo, the sessions, the rotation times, the claims, the machine id —
-/// are never read from `from`.
-///
-/// The merge keeps this module's own rules:
-///
-/// * ONLY THIS MACHINE'S ACCOUNTS: a label `into` already holds, or one
-///   `roster` lists. Another machine's label is skipped, and none ever costs
-///   this machine a record: with the state full, a listed label takes the
-///   place of the stalest record the roster no longer lists.
-/// * NO STAMP FROM THE FUTURE: each of `from`'s observations is read as made
-///   no later than `now` plus [`STAMP_SKEW_S`], as [`State::from_json`]
-///   reads this machine's own.
-/// * THE OWNER'S CLEARING STANDS: a wall observed at or before the instant
-///   the pin cleared that account's walls ([`Account::cleared_at`]) is the
-///   one the owner cleared, and is not taken.
-/// * A NINTH WALL takes the place of the one that stops standing first, as
-///   in [`note_wall`].
-/// * A WALL ON THE PINNED ACCOUNT ENDS THE PIN: the answer is that `unpin`
-///   row, for the ledger, when a wall that stands at `now` was taken for it.
-pub fn merge_observations(into: &mut State, from: &State, roster: &Roster, now: i64) -> Vec<Event> {
-    let cap = stamp_cap(now);
-    let mut out = Vec::new();
-    for (label, theirs) in &from.accounts {
-        if !admissible_label(label) {
-            continue;
-        }
-        if !into.accounts.contains_key(label) {
-            if roster.row(label).is_none() {
-                continue;
-            }
-            if into.accounts.len() >= MAX_ACCOUNTS {
-                let unlisted = into
-                    .accounts
-                    .iter()
-                    .filter(|(held, _)| roster.row(held).is_none())
-                    .min_by_key(|(_, a)| a.touched())
-                    .map(|(held, _)| held.clone());
-                let Some(unlisted) = unlisted else {
-                    continue;
-                };
-                into.accounts.remove(&unlisted);
-            }
-        }
-        let mine = into.accounts.entry(label.clone()).or_default();
-        let mut walled = false;
-        for (window, wall) in &theirs.walls {
-            let wall = Wall {
-                at: wall.at.min(cap),
-                ..wall.clone()
-            };
-            let cleared = mine.cleared_at.is_some_and(|cleared| wall.at <= cleared);
-            let wins = mine
-                .walls
-                .get(window)
-                .is_none_or(|held| (wall.at, wall.by.as_str()) > (held.at, held.by.as_str()));
-            if cleared || !wins {
-                continue;
-            }
-            let stands = now < wall.stands_until();
-            mine.walls.insert(window.clone(), wall);
-            let lapsed = (mine.walls.len() > MAX_WALLS)
-                .then(|| most_lapsed(&mine.walls))
-                .flatten();
-            if let Some(lapsed) = &lapsed {
-                mine.walls.remove(lapsed);
-            }
-            walled |= stands && lapsed.as_ref() != Some(window);
-        }
-        let read = |s: &Option<Sample>| {
-            s.as_ref().map(|s| Sample {
-                at: s.at.min(cap),
-                ..s.clone()
-            })
-        };
-        let mut samples: Vec<Sample> = [
-            mine.sample.clone(),
-            mine.before.clone(),
-            read(&theirs.sample),
-            read(&theirs.before),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        samples.sort_by(|a, b| (b.at, b.by.as_str()).cmp(&(a.at, a.by.as_str())));
-        samples.dedup();
-        let mut newest = samples.into_iter();
-        mine.sample = newest.next();
-        mine.before = newest.next();
-        let offered = theirs.offer.as_ref().map(|o| Offer {
-            at: o.at.min(cap),
-            ..o.clone()
-        });
-        mine.offer = newer(mine.offer.as_ref(), offered.as_ref(), |o| {
-            (o.at, o.by.as_str())
-        });
-        if walled {
-            end_pin(into, label, "wall", now, &mut out);
-        }
-    }
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -6280,7 +6130,9 @@ impl Store {
     /// The directory cannot be made or the write or rename failed.
     pub fn touch_wake(&self) -> io::Result<()> {
         self.ensure()?;
-        super::upgrade_models::write_atomic(&self.wake_path(), "")
+        // Ordered: the marker means only "the file changed" to a live watcher, and no
+        // watcher outlives a power loss.
+        super::upgrade_models::write_atomic_ordered(&self.wake_path(), "")
     }
 
     /// The state as of `now` (the clock [`State::from_json`] reads stamps

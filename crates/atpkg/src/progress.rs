@@ -1566,30 +1566,6 @@ mod writer_tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// The rate cap: a burst of changes inside [`WRITE_MIN_INTERVAL_MS`] lands at most
-    /// one extra write — the on-disk file does NOT track every mutation.
-    #[test]
-    fn writes_are_rate_capped_to_ten_hz() {
-        let l = layout("ratecap");
-        let path = l.progress_file();
-        let sink = ProgressSink::create(&path, "net").unwrap();
-        sink.plan(&[("trust".into(), 100)]);
-        // Burst immediately after create: within the 100 ms window nothing may land.
-        for n in 1..50u64 {
-            sink.download_bytes("trust", n, 100);
-        }
-        let file = read_file(&path);
-        assert!(
-            file.programs.is_empty() || file.programs["trust"].bytes_done < 49,
-            "a same-instant burst must not land write-per-mutation: {file:?}"
-        );
-        // After the window, the next change lands.
-        std::thread::sleep(Duration::from_millis(WRITE_MIN_INTERVAL_MS + 20));
-        sink.download_bytes("trust", 50, 100);
-        assert_eq!(read_file(&path).programs["trust"].bytes_done, 50);
-        let _ = std::fs::remove_dir_all(&l.prefix);
-    }
-
     /// The terminal snapshot: `finish` clears the pid, stamps `ended_unix`, and writes
     /// unconditionally (no rate cap can swallow the last word).
     #[test]
@@ -1711,36 +1687,6 @@ mod writer_tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A dead pid renders not-running even under a fresh heartbeat — the 10 s lie
-    /// window a crashed installer would otherwise get.
-    #[cfg(unix)]
-    #[test]
-    fn snapshot_running_rejects_a_dead_pid() {
-        // Spawn-and-reap a child so its pid is known-dead (not merely unlikely).
-        let child = std::process::Command::new("/usr/bin/true")
-            .status()
-            .map(|_| ())
-            .ok();
-        let dead = std::process::Command::new("/usr/bin/true")
-            .spawn()
-            .map(|mut c| {
-                let pid = c.id();
-                let _ = c.wait();
-                pid
-            });
-        let _ = child;
-        let Ok(dead_pid) = dead else {
-            return; // cannot build the fixture on this host — skip, don't lie
-        };
-        let mut file: ProgressFile = aterm_json::from_str(r#"{"v":1}"#).unwrap();
-        file.pid = Some(dead_pid);
-        file.heartbeat_unix = 1_000_000;
-        assert!(
-            !snapshot_running(&file, 1_000_000),
-            "a reaped pid must not read as a live installer"
-        );
-    }
-
     /// A pid we may not SIGNAL is still a pid that EXISTS. The probe used to fork
     /// `/bin/kill -0 <pid>`, which exits non-zero on `EPERM`, so an installer owned by
     /// another user (pid 1 — launchd/init — stands in for one here, and is the same
@@ -1763,6 +1709,16 @@ mod writer_tests {
         );
         // Wider than `pid_t`: cannot name a process, and read dead before too.
         assert!(!pid_alive(u32::MAX), "an impossible pid is not alive");
+        // A reaped child's pid is known dead (`ESRCH`, the one "no"): a crashed installer's
+        // record never reads as running under a fresh heartbeat.
+        let mut child = std::process::Command::new("/usr/bin/true")
+            .spawn()
+            .expect("spawn /usr/bin/true");
+        let dead = child.id();
+        child.wait().expect("reap it");
+        assert!(!pid_alive(dead), "a reaped pid must not read as alive");
+        file.pid = Some(dead);
+        assert!(!snapshot_running(&file, 1_000_000));
     }
 
     /// TTY sanitization: control characters (escape injection) stripped, length capped

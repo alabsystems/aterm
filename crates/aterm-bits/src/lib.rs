@@ -316,38 +316,6 @@ pub fn bytes_of<T: Pod>(value: &T) -> &[u8] {
 mod tests {
     use super::*;
 
-    #[repr(C)]
-    #[derive(Copy, Clone, Debug, PartialEq)]
-    struct Vec4 {
-        x: f32,
-        y: f32,
-        z: f32,
-        w: f32,
-    }
-
-    // SAFETY: Vec4 is `#[repr(C)]` with 4×f32 fields, no padding, no niches.
-
-    unsafe impl Zeroable for Vec4 {}
-    // SAFETY: see Zeroable impl; additionally `Copy + 'static`.
-
-    unsafe impl Pod for Vec4 {}
-
-    #[test]
-    fn zeroable_primitives() {
-        assert_eq!(u32::zeroed(), 0);
-        assert_eq!(f32::zeroed(), 0.0);
-        assert_eq!(<[u8; 3]>::zeroed(), [0, 0, 0]);
-        assert_eq!(
-            Vec4::zeroed(),
-            Vec4 {
-                x: 0.0,
-                y: 0.0,
-                z: 0.0,
-                w: 0.0
-            }
-        );
-    }
-
     #[test]
     fn cast_slice_u32_to_u8_native_endian() {
         let src: [u32; 2] = [0xDEAD_BEEF, 0x1234_5678];

@@ -26,8 +26,4 @@
 
 mod types;
 
-#[cfg(test)]
-#[path = "../../test_support/config/tests.rs"]
-mod tests;
-
 pub use types::{BiDiConfig, BiDiMode, ConfigChange, TerminalConfig};

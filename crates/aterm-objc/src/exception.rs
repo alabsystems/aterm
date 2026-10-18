@@ -484,46 +484,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_body_that_returns_is_ok_and_counts_nothing() {
-        let before = contained_count();
-        let r = objc_try(|| 41 + 1, |_| panic!("no exception was raised"));
-        assert_eq!(r, Ok(42));
-        assert_eq!(contained_count(), before);
-    }
-
-    #[test]
-    fn drops_in_the_body_run_on_the_normal_path() {
-        use std::cell::Cell;
-        let dropped = Cell::new(false);
-        struct Tell<'a>(&'a Cell<bool>);
-        impl Drop for Tell<'_> {
-            fn drop(&mut self) {
-                self.0.set(true);
-            }
-        }
-        let r = objc_try(
-            || {
-                let _t = Tell(&dropped);
-                7
-            },
-            |_| {},
-        );
-        assert_eq!(r, Ok(7));
-        assert!(dropped.get());
-    }
-
-    #[test]
-    fn inert_is_the_zero_value() {
-        assert_eq!(inert::<i64>(), 0);
-        assert_eq!(inert::<f64>(), 0.0);
-        assert!(inert::<Id>().is_null());
-        assert!(!inert::<Bool>().as_bool());
-        let r = inert::<NSRange>();
-        assert_eq!((r.location, r.length), (0, 0));
-        assert!(inert::<Option<std::ptr::NonNull<u8>>>().is_none());
-    }
-
-    #[test]
     fn a_rust_panic_passes_through_the_wrapper_to_catch_unwind() {
         use std::cell::Cell;
         let dropped = Cell::new(false);

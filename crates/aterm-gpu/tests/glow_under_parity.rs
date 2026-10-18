@@ -8,13 +8,15 @@
 // additive and source-over quads, gradients, the transposed ribbon, the cached path, char_fg
 // on line decorations, and that the bed is never boosted or bloomed.
 //
-// Skips without a GPU or font; byte-exact additive checks also skip on downlevel adapters
-// (`additive_is_byte_exact`).
+// No GPU or no font: COULD NOT RUN. On a downlevel (sRGB-offscreen) adapter
+// (`additive_is_byte_exact`) a test runs its other checks, then ends COULD NOT
+// RUN naming the byte-exact comparisons it could not make (`common::ByteExact`).
 
 use aterm_core::render::{CharFg, GlowBlend, GlowQuad};
 use aterm_core::terminal::Terminal;
 use aterm_render::{BeamClip, RibbonVertex, Theme, WindowCpu};
 
+use crate::common::ByteExact;
 use crate::common::{assert_byte_exact, backends, bb, block_text_term, gg, max_channel_delta, rr};
 
 fn luma(p: u32) -> i32 {
@@ -56,6 +58,7 @@ fn emit_under(
 /// darkest thing in the fire on both backends.
 #[test]
 fn glow_under_char_fg_field_is_byte_exact_over_text() {
+    let exact = ByteExact::default();
     let theme = Theme::default();
     let (mut cpu, mut gpu) = backends(18.0, theme);
     let mut win = aterm_gpu::WindowGpu::new();
@@ -145,13 +148,11 @@ fn glow_under_char_fg_field_is_byte_exact_over_text() {
     );
     // Byte-exact additive holds only on native (plain-Unorm offscreen); a downlevel sRGB
     // offscreen does the add in linear.
-    if gpu.additive_is_byte_exact() {
+    if exact.holds(&gpu, "byte-exact glow_under gate") {
         assert_eq!(
             delta, 0,
             "glow_under under the glyph ink must be BYTE-EXACT CPU==GPU (got {delta})"
         );
-    } else {
-        eprintln!("SKIP byte-exact glow_under gate: downlevel sRGB offscreen (linear add)");
     }
 
     // (d) Inside the row-2 body quad, the charred block (col 3) is darker than
@@ -176,6 +177,7 @@ fn glow_under_char_fg_field_is_byte_exact_over_text() {
 /// previous and current rows, and match on both backends.
 #[test]
 fn damaged_path_glow_under_char_fg_parity_cpu_matches_gpu() {
+    let exact = ByteExact::default();
     let theme = Theme::default();
     let (mut cpu, mut gpu) = backends(18.0, theme);
     let mut win_cpu = WindowCpu::new();
@@ -253,13 +255,11 @@ fn damaged_path_glow_under_char_fg_parity_cpu_matches_gpu() {
     // ... and byte-exact across backends.
     let delta = max_channel_delta(&cpu_b, &gpu_b);
     eprintln!("damaged-path glow_under+char_fg CPU vs GPU max per-channel delta = {delta}");
-    if gpu.additive_is_byte_exact() {
+    if exact.holds(&gpu, "damaged-path byte-exact glow_under gate") {
         assert_eq!(
             delta, 0,
             "engulfed frame via the cached path must be BYTE-EXACT CPU==GPU (got {delta})"
         );
-    } else {
-        eprintln!("SKIP damaged-path byte-exact glow_under gate: downlevel sRGB offscreen");
     }
 }
 
@@ -384,6 +384,7 @@ fn char_fg_follows_into_line_decorations_on_both_backends() {
 ///    differ (the source-over one darker by the displaced ground).
 #[test]
 fn source_over_glow_under_is_byte_exact_and_leaves_the_additive_half_alone() {
+    let exact = ByteExact::default();
     let theme = Theme::default();
     let (mut cpu, mut gpu) = backends(18.0, theme);
     let mut win = aterm_gpu::WindowGpu::new();
@@ -514,7 +515,7 @@ fn source_over_glow_under_is_byte_exact_and_leaves_the_additive_half_alone() {
         input.glow_under.len(),
         input.glow_under.iter().filter(|q| q.alpha > 0).count()
     );
-    if gpu.additive_is_byte_exact() {
+    if exact.holds(&gpu, "byte-exact source-over gate") {
         assert_byte_exact(
             "source_over_glow_under_is_byte_exact_and_leaves_the_additive_half_alone",
             "source-over glow_under field",
@@ -524,8 +525,6 @@ fn source_over_glow_under_is_byte_exact_and_leaves_the_additive_half_alone() {
                 "a source-over glow_under field must be BYTE-EXACT CPU==GPU (got {delta})"
             ),
         );
-    } else {
-        eprintln!("SKIP byte-exact source-over gate: downlevel sRGB offscreen (linear blend)");
     }
 }
 
@@ -537,6 +536,7 @@ fn source_over_glow_under_is_byte_exact_and_leaves_the_additive_half_alone() {
 /// previous and current rows, and equal a fresh render.
 #[test]
 fn ribbon_beam_v_train_is_byte_exact_cpu_vs_gpu() {
+    let exact = ByteExact::default();
     let theme = Theme::default();
     // 17 px: the fixture's row (23 px) is no multiple of the 4 px stride, so
     // the row edges cut some pieces short of it.
@@ -640,7 +640,7 @@ fn ribbon_beam_v_train_is_byte_exact_cpu_vs_gpu() {
     );
     let delta = max_channel_delta(&cpu_train.pixels, &gpu_train.pixels);
     eprintln!("ribbon_beam_v trains CPU vs GPU max per-channel delta = {delta}");
-    if gpu.additive_is_byte_exact() {
+    if exact.holds(&gpu, "byte-exact ribbon_beam_v gate") {
         assert_byte_exact(
             "ribbon_beam_v_train_is_byte_exact_cpu_vs_gpu",
             "ribbon_beam_v trains",
@@ -648,8 +648,6 @@ fn ribbon_beam_v_train_is_byte_exact_cpu_vs_gpu() {
             delta,
             format_args!("a ribbon_beam_v train must be BYTE-EXACT CPU==GPU (got {delta})"),
         );
-    } else {
-        eprintln!("SKIP byte-exact ribbon_beam_v gate: downlevel sRGB offscreen");
     }
 
     // Cached path: frame A primes both caches, frame B moves the trains down one
@@ -682,7 +680,7 @@ fn ribbon_beam_v_train_is_byte_exact_cpu_vs_gpu() {
     );
     let delta = max_channel_delta(&cpu_b, &gpu_b);
     eprintln!("damaged-path ribbon_beam_v CPU vs GPU max per-channel delta = {delta}");
-    if gpu.additive_is_byte_exact() {
+    if exact.holds(&gpu, "damaged-path byte-exact ribbon_beam_v gate") {
         assert_byte_exact(
             "ribbon_beam_v_train_is_byte_exact_cpu_vs_gpu",
             "damaged-path ribbon_beam_v",
@@ -692,8 +690,6 @@ fn ribbon_beam_v_train_is_byte_exact_cpu_vs_gpu() {
                 "a moved ribbon_beam_v train via the cached path must be BYTE-EXACT CPU==GPU (got {delta})"
             ),
         );
-    } else {
-        eprintln!("SKIP damaged-path byte-exact ribbon_beam_v gate: downlevel sRGB offscreen");
     }
 }
 
@@ -707,12 +703,12 @@ fn ribbon_beam_v_train_is_byte_exact_cpu_vs_gpu() {
 /// The core's emission equals `lin × HDR_GLOW_BOOST × (1 + 2·smoothstep(0.35, 0.60, white))`,
 /// capped at the headroom, so the boost pass ran.
 #[test]
+#[cfg(wgpu_arm)]
 fn the_bed_is_never_boosted_or_bloomed() {
     let theme = Theme::default();
     let (_cpu, mut gpu) = backends(18.0, theme);
     // The HDR crown drives the wgpu present stand-in (wgpu oracle arm).
-    #[cfg(target_os = "macos")]
-    gpu.disarm_metal_for_oracle();
+    crate::common::disarm_for_oracle(&mut gpu);
     gpu.set_hdr_glow(true);
     gpu.set_shimmer(false);
     gpu.set_bloom(false);
@@ -884,25 +880,26 @@ fn the_bed_is_never_boosted_or_bloomed() {
 /// and the gradient field differs from it.
 #[test]
 fn gradient_glow_under_is_byte_exact_cpu_vs_gpu() {
-    gradient_glow_under_parity(false);
+    gradient_glow_under_parity(false, &ByteExact::default());
 }
 
 /// [`gradient_glow_under_is_byte_exact_cpu_vs_gpu`] through the wgpu oracle arm
-/// on macOS, so the WGSL `fs_glow` (the live shader off macOS) runs here too.
-#[cfg(target_os = "macos")]
+/// on macOS and Linux, so the WGSL `fs_glow` (the live shader on Windows and
+/// wasm) runs here too.
+#[cfg(all(any(target_os = "macos", target_os = "linux"), wgpu_arm))]
 #[test]
 fn gradient_glow_under_is_byte_exact_cpu_vs_wgpu_oracle() {
-    gradient_glow_under_parity(true);
+    gradient_glow_under_parity(true, &ByteExact::default());
 }
 
-fn gradient_glow_under_parity(oracle: bool) {
+fn gradient_glow_under_parity(oracle: bool, exact: &ByteExact) {
     let theme = Theme::default();
     let (mut cpu, mut gpu) = backends(18.0, theme);
-    #[cfg(target_os = "macos")]
+    #[cfg(all(any(target_os = "macos", target_os = "linux"), wgpu_arm))]
     if oracle {
-        gpu.disarm_metal_for_oracle();
+        crate::common::disarm_for_oracle(&mut gpu);
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(all(any(target_os = "macos", target_os = "linux"), wgpu_arm)))]
     let _ = oracle;
     let mut win = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (12usize, 40usize);
@@ -1009,7 +1006,7 @@ fn gradient_glow_under_parity(oracle: bool) {
          quads); flat twin = {delta_flat}",
         input.glow_under.len()
     );
-    if gpu.additive_is_byte_exact() {
+    if exact.holds(&gpu, "byte-exact gradient gate") {
         assert_byte_exact(
             "gradient_glow_under_is_byte_exact_cpu_vs_gpu",
             "gradient glow_under field",
@@ -1024,7 +1021,5 @@ fn gradient_glow_under_parity(oracle: bool) {
             delta_flat,
             format_args!("the flat twin must be BYTE-EXACT CPU==GPU (got {delta_flat})"),
         );
-    } else {
-        eprintln!("SKIP byte-exact gradient gate: downlevel sRGB offscreen (linear blend)");
     }
 }

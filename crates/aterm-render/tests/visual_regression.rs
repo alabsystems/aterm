@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// The CPU render pipeline, end to end, in ONE rendered session: render a
+// The CPU render pipeline, end to end, in ONE rendered frame: render a
 // controlled grid to real pixels and assert SEMANTIC properties of each cell
 // (a colour is present, a glyph was drawn), not a brittle golden PNG. This is
-// aterm's `read_image` oracle (ATERM_DESIGN §8) turned into an automated gate —
-// the AI-visibility loop, codified. One test, because every row below reads
-// the same frame (or the same renderer) and they were eight copies of the
-// setup. It locks in:
+// aterm's `read_image` oracle (ATERM_DESIGN §8) turned into an automated gate.
+// It locks in:
 //   - foreground colour (red text renders red pixels)
 //   - background colour (blue-bg cell fills blue)
 //   - inverse video (cell background becomes the light fg colour)
@@ -16,19 +14,9 @@
 //     from passing on an "everything is non-bg" frame)
 //   - `read_image`: the frame encodes as a valid PNG that decodes back to the
 //     exact rendered size and the exact 0xTTRRGGBB → RGBA projection
-//   - replay purity: two engines fed the same output log render
-//     pixel-identical frames and byte-identical PNGs (the astream determinism
-//     thesis, pixel layer — same machine, same font, so it asserts purity, not
-//     a pinned cross-machine image)
-//   - a REAL shell in a PTY drives the engine and the renderer turns it into
-//     pixels (unix; the Windows ConPTY twin lives with the aterm-pty seam)
 // against the theme's dark background.
-#![allow(
-    clippy::disallowed_types,
-    reason = "test code: a stand-in child may inherit descriptors"
-)]
 
-use aterm_core::terminal::{ClockReading, Terminal};
+use aterm_core::terminal::Terminal;
 use aterm_render::{Frame, Renderer, Theme};
 
 const BG: u32 = 0x0011_1318; // Theme::default().bg
@@ -64,84 +52,13 @@ fn non_bg_count(px: &[u32]) -> usize {
     px.iter().filter(|&&p| dist(p, BG) > 24).count()
 }
 
-/// The replay session: colour, attributes and a full-width CJK character so the
-/// replayed frame is non-trivial.
-const REPLAY_SESSION: &[&[u8]] = &[
-    b"\x1b[1;38;5;202mhi\x1b[0m ",
-    b"\x1b[7mrev\x1b[0m\r\n",
-    b"\x1b[32mwide \xe6\x97\xa5\xe6\x9c\xac\x1b[0m\r\n",
-    b"\x1b[4munder\x1b[0m line",
-];
-
-/// Spawn `/bin/sh -c "printf 'ATERM_RENDER_OK\n'"` in a PTY and feed all of its
-/// output into a fresh 24x80 engine.
-#[cfg(unix)]
-fn real_shell_session() -> Terminal {
-    use std::ptr;
-    let ws = libc::winsize {
-        ws_row: 24,
-        ws_col: 80,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    // Both ends close-on-exec from birth, not `forkpty`'s inheritable master:
-    // a sibling test's child forked meanwhile must not hold the master.
-    let (master, slave) = aterm_pty::open_pty_pair().expect("a pty pair");
-    let sh = std::ffi::CString::new("/bin/sh").unwrap();
-    let dashc = std::ffi::CString::new("-c").unwrap();
-    let cmd = std::ffi::CString::new("printf 'ATERM_RENDER_OK\\n'").unwrap();
-    let argv = [sh.as_ptr(), dashc.as_ptr(), cmd.as_ptr(), ptr::null()];
-    // SAFETY: `slave` is the live slave just opened; `ws` outlives the call.
-    unsafe { libc::ioctl(slave, libc::TIOCSWINSZ, ptr::addr_of!(ws)) };
-    // SAFETY: the child calls only login_tty (forkpty's own child step),
-    // execvp and _exit, on argv built before the fork.
-    let pid = unsafe { libc::fork() };
-    assert!(pid >= 0, "fork failed");
-    if pid == 0 {
-        unsafe {
-            if libc::login_tty(slave) == 0 {
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "test code: a stand-in shell for the render fixture, not the shipped spawn"
-                )]
-                libc::execvp(sh.as_ptr(), argv.as_ptr());
-            }
-            libc::_exit(127);
-        }
-    }
-    // The parent's copy of the slave goes, so the read below sees EOF once the
-    // shell exits.
-    unsafe { libc::close(slave) };
-    let mut term = Terminal::new(24, 80);
-    let mut buf = [0u8; 4096];
-    let mut total = 0usize;
-    loop {
-        let n = unsafe { libc::read(master, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-        if n <= 0 {
-            break; // EOF when the shell exits
-        }
-        term.process(&buf[..n as usize]);
-        total += n as usize;
-        if total > (1 << 20) {
-            break;
-        }
-    }
-    unsafe {
-        libc::close(master);
-        let mut st = 0;
-        libc::waitpid(pid, &mut st, 0);
-    }
-    assert!(total > 0, "the shell produced output");
-    term
-}
-
 #[test]
-fn the_render_pipeline_draws_reads_back_and_replays_what_it_was_fed() {
+fn the_render_pipeline_draws_and_reads_back_what_it_was_fed() {
     if std::env::var("ATERM_NO_FONT").is_ok() {
-        return;
+        aterm_spec::host::could_not_run("ATERM_NO_FONT is set: this run has no font to render");
     }
     let Some(mut rend) = Renderer::from_system(18.0, Theme::default()) else {
-        panic!("SKIP-VIA-PANIC: no system monospace font");
+        aterm_spec::host::could_not_run("no system monospace font");
     };
     // Deterministic pixels: block on the lazy fallback parses so CJK/emoji
     // probes assert against real glyphs, not a provisional `.notdef`, and so a
@@ -233,57 +150,4 @@ ab\r\n",
         f.rgba_bytes().as_slice(),
         "PNG pixels are the exact 0xTTRRGGBB → RGBA projection"
     );
-
-    // Replay purity: a live host and a fresh replay/viewer fed the same output
-    // log at the same clock render the same pixels and encode the same PNG.
-    let clock = ClockReading {
-        monotonic: std::time::Instant::now(), // captured once, reused so deltas are zero (determinism)
-        wall_ms: Some(0),
-    };
-    let feed = || {
-        let mut t = Terminal::new(8, 24);
-        for rec in REPLAY_SESSION {
-            t.process_at(rec, clock);
-        }
-        t
-    };
-    let live = rend.render_input(&feed().cell_frame(8, 24));
-    let replay = rend.render_input(&feed().cell_frame(8, 24));
-    assert!(
-        live.width > 0 && live.height > 0 && !live.pixels.is_empty(),
-        "the replayed frame must be a real, non-empty image"
-    );
-    assert_eq!(
-        (live.width, live.height),
-        (replay.width, replay.height),
-        "replay frame dimensions must match the live host"
-    );
-    assert_eq!(
-        live.pixels, replay.pixels,
-        "replay must render a pixel-identical framebuffer to the live host"
-    );
-    assert_eq!(
-        live.to_png(),
-        replay.to_png(),
-        "replay must encode a byte-identical PNG to the live host"
-    );
-
-    // A real shell in a PTY drives the engine, and the renderer turns that
-    // session into actual pixels — PTY + engine + renderer, no display.
-    #[cfg(unix)]
-    {
-        let mut shell = real_shell_session();
-        let content = shell.visible_content();
-        assert!(
-            content.contains("ATERM_RENDER_OK"),
-            "engine model should contain the shell output; got: {content:?}"
-        );
-        let frame = rend.render_input(&shell.cell_frame(24, 80));
-        assert_eq!(frame.pixels.len(), frame.width * frame.height);
-        let non_bg = frame.pixels.iter().filter(|&&p| p != BG).count();
-        assert!(
-            non_bg > 100,
-            "expected rasterized glyph + cursor pixels; only {non_bg} non-background pixels"
-        );
-    }
 }

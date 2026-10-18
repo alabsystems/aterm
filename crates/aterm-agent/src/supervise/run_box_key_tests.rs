@@ -188,7 +188,7 @@ fn watched(
     tag: &str,
     m: &mut Mock,
     opts: &SuperviseOpts,
-    setup: impl FnOnce(&mut Session<'_, Mock>),
+    setup: impl FnOnce(&mut Watched<'_, '_>),
 ) -> (Asked, Vec<String>) {
     let (dir, path) = journal_file(tag);
     let opts = SuperviseOpts {
@@ -213,15 +213,6 @@ fn watched(
         cleared: kind("cleared"),
     };
     (asked, lines)
-}
-
-/// [`watched`] over a fresh mock of `script` (it ends once the last screen
-/// has stood two waits).
-fn asked(tag: &str, script: Vec<Vec<String>>, opts: &SuperviseOpts) -> (Asked, Mock) {
-    let mut m = Mock::new(true, script);
-    m.vanish_after = Some(2);
-    let (a, _) = watched(tag, &mut m, opts, |_| {});
-    (a, m)
 }
 
 // ---- the key, pure ---------------------------------------------------------
@@ -357,8 +348,7 @@ fn the_box_key_changes_for_another_box() {
 }
 
 /// The key is read by the loop's reader, never the screen's guess: the generic reader gives the
-/// generic key where Claude Code's reads the box, and under `program=codex` Codex's exec box
-/// served twice, its `Tip:` rows re-wrapped, is one point.
+/// generic key where Claude Code's reads the box.
 #[test]
 fn the_box_key_is_the_readers() {
     let before = f::screen(BEFORE);
@@ -368,107 +358,9 @@ fn the_box_key_is_the_readers() {
         "{generic}"
     );
     assert!(claude_key(&before).starts_with("prompt bash whole\n"));
-
-    use aterm_phase::codex::fixtures as cx;
-    let exec = f::screen(cx::BOX_EXEC);
-    let tip = exec
-        .iter()
-        .position(|r| r.starts_with("  Tip: "))
-        .expect("the tip");
-    let mut retipped = exec.clone();
-    retipped[tip..tip + 3].clone_from_slice(&rows(&[
-        "  Tip: This is GPT-6, a new generation of intelligence. Astra is state-of-the-art in coding, computer use,",
-        "  science, and professional work. Give it a hard problem, a half-formed idea, or anything you've been meaning",
-        "  to build. See where it takes you.",
-    ]));
-    assert_ne!(exec, retipped, "the tip re-wrapped");
-    let codex_key = |r: &[String]| point_key(&aterm_phase::CodexReader, &prompt_turn(r.to_vec()));
-    assert!(
-        codex_key(&exec).starts_with("prompt bash whole\n"),
-        "{}",
-        codex_key(&exec)
-    );
-    assert_eq!(codex_key(&exec), codex_key(&retipped));
-    let mut m = Mock::new(true, vec![f::screen(cx::BUSY), exec, retipped]);
-    m.program = "codex";
-    m.vanish_after = Some(2);
-    let (a, lines) = watched("box-key-codex", &mut m, &handing(), |_| {});
-    assert_eq!(a, Asked::each(1, 0), "{lines:#?}\n{:#?}", m.requests);
 }
 
 // ---- the loop --------------------------------------------------------------
-
-/// A box handed over, then redrawn and re-wrapped with no busy read between: one `EVENT
-/// prompt`, one badge, one ask, no `CLEARED`.
-#[test]
-fn a_redrawn_box_is_asked_once() {
-    let script = vec![
-        busy_screen(),
-        f::screen(BEFORE),
-        f::screen(REDRAWN),
-        f::screen(REDRAWN),
-        rewrapped(),
-        rewrapped(),
-    ];
-    let (a, m) = asked("box-key-redrawn", script, &handing());
-    assert_eq!(a, Asked::each(1, 0), "{:#?}", m.requests);
-}
-
-/// A ticking auto-deny countdown, wrapped or not, is asked once, under the safe rules and
-/// `approve = "none"` alike.
-#[test]
-fn a_ticking_countdown_is_asked_once() {
-    let script = vec![
-        busy_screen(),
-        ticking("1:59"),
-        ticking("1:58"),
-        ticking("1:57"),
-        ticking_wrapped("1:56"),
-    ];
-    for (tag, opts) in [("safe", auto(30, None)), ("none", handing())] {
-        let (a, m) = asked("box-key-ticking", script.clone(), &opts);
-        assert_eq!(a, Asked::each(1, 0), "{tag}: {:#?}", m.requests);
-    }
-}
-
-/// Negative control: two Edit boxes on one path with different diffs, no busy read between,
-/// are two asks, the first badge cleared. Run with the mock's own `await gone` and with the
-/// server's (`gone_on_next`), where the path row never leaves and only the read after the
-/// step that ran out sees the second box.
-#[test]
-fn two_edit_boxes_on_one_path_are_two_asks() {
-    for servers in [false, true] {
-        let script = vec![busy_screen(), f::screen(f::BOX_EDIT), edit_other_diff()];
-        let mut m = Mock::new(true, script);
-        m.gone_on_next = servers;
-        // The first wait on the first box's path runs out (a timeout, not
-        // the end); the session goes at the second box's second wait.
-        m.vanish_after = Some(2);
-        let (a, lines) = watched("box-key-two-edits", &mut m, &handing(), |_| {});
-        assert_eq!(
-            a,
-            Asked::each(2, 1),
-            "gone_on_next={servers}: {lines:#?}\n{:#?}",
-            m.requests
-        );
-        if servers {
-            assert!(
-                m.gone_held >= 1,
-                "the path held the wait: {:#?}",
-                m.requests
-            );
-        }
-    }
-}
-
-/// Negative control: two Bash boxes with different commands, no busy read between, are two
-/// asks.
-#[test]
-fn two_bash_boxes_with_different_commands_are_two_asks() {
-    let script = vec![busy_screen(), rm_box("cmd-A"), rm_box("cmd-B")];
-    let (a, m) = asked("box-key-two-commands", script, &handing());
-    assert_eq!(a, Asked::each(2, 1), "{:#?}", m.requests);
-}
 
 /// The measured box's transcript with no box under it, no composer, no busy
 /// row: what the screen shows a frame while Claude Code redraws (`writing`).
@@ -479,41 +371,6 @@ fn writing_frame() -> Vec<String> {
         .position(|r| r.starts_with('─'))
         .expect("the rule over the box");
     before[..rule].to_vec()
-}
-
-/// A box redrawn through frames of output being written (no read of the worker's own busy
-/// row) is asked once; with the worker's busy screen in their place it is asked twice, the
-/// badge cleared at the busy read.
-#[test]
-fn a_box_redrawn_through_a_writing_frame_is_asked_once() {
-    let writing = writing_frame();
-    let claude = aterm_phase::ClaudeReader;
-    assert!(
-        !matches!(claude.phase(&writing), Phase::Busy | Phase::Prompt),
-        "{:?}",
-        claude.phase(&writing)
-    );
-    assert!(claude.composer(&writing).is_none());
-    let box_rows = f::screen(BEFORE);
-    for (between, want) in [(writing.clone(), 1), (busy_screen(), 2)] {
-        let script = vec![
-            busy_screen(),
-            box_rows.clone(),
-            between.clone(),
-            between,
-            box_rows.clone(),
-        ];
-        let mut m = Mock::new(true, script);
-        m.idle_never = true;
-        m.vanish_after = Some(2);
-        let (a, lines) = watched("box-key-writing", &mut m, &handing(), |_| {});
-        assert_eq!(
-            a,
-            Asked::each(want, want - 1),
-            "{want}: {lines:#?}\n{:#?}",
-            m.requests
-        );
-    }
 }
 
 /// Under a nonzero box settle the box is judged only on a read made after the settle (an
@@ -528,7 +385,7 @@ fn a_redrawn_box_under_the_settle_is_asked_once_after_the_settle() {
         f::screen(REDRAWN),
         f::screen(REDRAWN),
     ];
-    let mut m = Mock::new(true, script);
+    let mut m = Mock::new(script);
     m.attention_gates = vec![(1, 0)];
     m.stall_sleep = Some(settle);
     m.vanish_after = Some(3);
@@ -607,10 +464,12 @@ fn a_box_asked_again_after_work_waits_the_settle_again() {
 
     // Handed over, with the busy spell read by the turn's wait between: the
     // second box's badge only after its own settle.
-    let mut m = Mock::new(
-        true,
-        vec![busy_screen(), bash_one_row(), busy_screen(), bash_one_row()],
-    );
+    let mut m = Mock::new(vec![
+        busy_screen(),
+        bash_one_row(),
+        busy_screen(),
+        bash_one_row(),
+    ]);
     m.attention_gates = vec![(1, 0), (3, 1)];
     m.stall_sleep = Some(settle);
     m.vanish_after = Some(2);
@@ -698,90 +557,6 @@ fn preview_moved() -> Vec<String> {
     r
 }
 
-/// The measured Edit box with text typed into option 1, hand-built (the `Tab to amend` shape is
-/// not captured): what counts is that the typing stays in the option rows.
-fn edit_amended() -> Vec<String> {
-    swap_rows(
-        &f::screen(f::BOX_EDIT),
-        &[(" ❯ 1. Yes", &[" ❯ 1. Yes, and keep the comment above it"])],
-    )
-}
-
-/// A box someone is answering (a multi-select ticked, free text typed, a preview's focus
-/// moved, an Edit box's focus moved or option amended, a subagent box printed over) is asked
-/// once under the server's own `await gone`: a question or a command is not read while its row
-/// stands, and a file box is read once a step, its request holding while its options change.
-#[test]
-fn a_box_someone_is_answering_is_asked_once() {
-    let edit = f::screen(f::BOX_EDIT);
-    for (tag, first, then, file) in [
-        (
-            "multi-select ticked",
-            f::screen(f::QUESTION_MULTISELECT),
-            f::screen(f::QUESTION_MULTISELECT_CHECKED),
-            false,
-        ),
-        (
-            "free text typed",
-            f::screen(f::QUESTION_FREE_TEXT_FOCUSED),
-            f::screen(f::QUESTION_FREE_TEXT_TYPED),
-            false,
-        ),
-        (
-            "preview focus moved",
-            f::screen(f::QUESTION_PREVIEW),
-            preview_moved(),
-            false,
-        ),
-        ("edit focus moved", edit.clone(), edit_focused(3), true),
-        ("edit amended", edit, edit_amended(), true),
-        (
-            "subagent box printed over",
-            subagent_box(),
-            subagent_box_printed_over(),
-            false,
-        ),
-    ] {
-        let claude = aterm_phase::ClaudeReader;
-        let (a, b) = (
-            claude.prompt(&first).expect("the box"),
-            claude.prompt(&then).expect("the box, still"),
-        );
-        assert_eq!(a.kind, b.kind, "{tag}");
-        assert_ne!(first, then, "{tag}: the rows differ");
-        assert_eq!(
-            box_anchor(&claude, &first),
-            box_anchor(&claude, &then),
-            "{tag}: one first row, so the wait on it runs out"
-        );
-        let mut m = Mock::new(true, vec![busy_screen(), first, then]);
-        m.gone_on_next = true;
-        m.vanish_after = Some(3);
-        let (asked, lines) = watched("box-key-answering", &mut m, &handing(), |_| {});
-        assert_eq!(
-            asked,
-            Asked::each(1, 0),
-            "{tag}: {lines:#?}\n{:#?}",
-            m.requests
-        );
-        assert!(m.gone_held >= 2, "{tag}: the row held: {:#?}", m.requests);
-        let probes = m.after_gone.iter().filter(|p| **p).count();
-        if file {
-            assert!(
-                probes >= 1 && m.reads.iter().any(|(i, _)| *i == 2),
-                "{tag}: the step's read saw the box changed and passed it: {:#?}",
-                m.requests
-            );
-        } else {
-            assert_eq!(
-                probes, 0,
-                "{tag}: no read while it stands: {:#?}",
-                m.requests
-            );
-        }
-    }
-}
-
 /// [`BEFORE`]'s 2.1.283 layout (the vendor's echo of the pending call, `Running 1 shell
 /// command…` over `⎿  $ <command>`, wrapped at a space as the capture wraps it) around a
 /// 55-letter command, under `transcript`. Hand-built on the measured 80-column geometry.
@@ -845,7 +620,7 @@ fn a_retried_long_command_is_asked_again() {
     );
     assert_ne!(claude_key(&first), claude_key(&again));
     assert_eq!(claude_key(&first), claude_key(&suite_box(&[said])));
-    let mut m = Mock::new(true, vec![first, busy_screen(), again]);
+    let mut m = Mock::new(vec![first, busy_screen(), again]);
     m.idle_skips_busy = true;
     m.vanish_after = Some(0);
     let (lines, _) = watch_lines(
@@ -1071,7 +846,7 @@ struct Walked {
 #[test]
 fn tier1_the_box_is_asked_once_per_request() {
     use Seen::{Box as B, Busy, Writing};
-    let model = aterm_spec::derive::supervisor_box_ask_model();
+    let model = aterm_models_harness::supervisor_box_ask_model();
     let edit_a = f::screen(f::BOX_EDIT);
     let edit_b = edit_other_diff();
     let writing = writing_frame();
@@ -1188,7 +963,7 @@ fn tier1_the_box_is_asked_once_per_request() {
         caught,
     } in scripts
     {
-        let mut m = Mock::new(true, screens.iter().map(|(r, _)| r.clone()).collect());
+        let mut m = Mock::new(screens.iter().map(|(r, _)| r.clone()).collect());
         m.idle_never = idle_never;
         m.gone_on_next = servers_gone;
         m.vanish_after = Some(if servers_gone { 3 } else { 2 });

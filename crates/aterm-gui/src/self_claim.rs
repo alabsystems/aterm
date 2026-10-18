@@ -2,8 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! THE PROVEN SELF-CLAIM (the codex-alab native harness contract, §1–§2): an
-//! agent ALab builds from source supervises ITSELF, and aterm's own lane
-//! stands down for it — but only where the kernel proves the claim is the
+//! agent ALab builds from source supervises ITSELF, and aterm watches beside
+//! it (aterm supervises no Codex: the Codex screen lane's retirement,
+//! 2026-10-16) — the claim counts only where the kernel proves it is the
 //! agent's own.
 //!
 //! A `meta set supervisor codex-alab@<pid>` is PROVEN when, and only when:
@@ -19,7 +20,7 @@
 //!   the PTY master (`tcgetpgrp`), not from the sweep's last sighting;
 //! * `<pid>` RUNS AN ALAB BUILD: the kernel's image of the process
 //!   (`proc_pidpath`) lies in a Codex package whose root carries
-//!   `alab-build.json` ([`upgrade_codex::alab_bytes`]), so another program
+//!   `alab-build.json` ([`codex_alab::alab_bytes`]), so another program
 //!   that leads the group — a shell, a vendor `codex`, a tool a model ran in
 //!   the foreground — proves nothing, whatever pid it names;
 //! * the claim is connection-bound (no `ttl=`): the connection is
@@ -43,7 +44,7 @@
 use std::sync::{Mutex, PoisonError};
 
 use aterm_agent::harness::self_claimed::{self, Copy};
-use aterm_agent::harness::{restart_stamp, upgrade_codex};
+use aterm_agent::harness::{codex_alab, restart_stamp};
 
 /// The holder prefix a self-claim is made under: `codex-alab@<pid>`.
 pub(crate) const SELF_CLAIM_PREFIX: &str = "codex-alab@";
@@ -104,14 +105,14 @@ pub(crate) fn proves(holder: &str, facts: Facts) -> Option<u32> {
 }
 
 /// Whether process `pid`'s kernel image (`proc_pidpath`) is an ALab build of
-/// Codex ([`upgrade_codex::alab_bytes`]). `false` where the image cannot be
+/// Codex ([`codex_alab::alab_bytes`]). `false` where the image cannot be
 /// read. A syscall and a few file reads: never under a lock.
 #[must_use]
 pub(crate) fn runs_alab_build(pid: u32) -> bool {
     i32::try_from(pid)
         .ok()
         .and_then(aterm_uds::sudo::exe_path)
-        .is_some_and(|exe| upgrade_codex::alab_bytes(&exe))
+        .is_some_and(|exe| codex_alab::alab_bytes(&exe))
 }
 
 /// The proof of `holder`'s claim on `facts`, with the agent's kernel start
@@ -122,6 +123,61 @@ pub(crate) fn prove(holder: &str, facts: Facts) -> Option<Proven> {
     let pid = proves(holder, facts)?;
     let start = restart_stamp::kernel_start(pid)?;
     Some(Proven { pid, start })
+}
+
+/// Whether `program`, the program in front as the status sweep publishes it
+/// (`status program=`, the `argv[0]` basename), is the one a proven self-claim
+/// speaks for: a Codex, by its own name or an ALab build's `codex-alab`. A wall
+/// read while anything else is in front (Claude Code, a shell, a name not yet
+/// resolved) is not the claimant's, so [`wall_answer`] is not asked of it.
+#[must_use]
+pub(crate) fn fronts_claimant(program: Option<&str>) -> bool {
+    use aterm_phase::Program;
+    program.is_some_and(|program| {
+        // An exhaustive match, so a new agent decides here (the agent-gate guard).
+        match aterm_phase::program_of(program) {
+            Some(Program::Codex) => true,
+            Some(
+                Program::Claude | Program::Generic | Program::Agy | Program::Muse | Program::Gemini,
+            ) => false,
+            None => {
+                let word = program.split_whitespace().next().unwrap_or(program);
+                let word = word.rsplit('/').next().unwrap_or(word);
+                word.eq_ignore_ascii_case("codex-alab")
+            }
+        }
+    })
+}
+
+/// WHO ANSWERS a wall on a session under a PROVEN self-claim (the presence
+/// row and tab chip): the agent itself, when it is a usage wall (the session
+/// or the weekly window) and the `[harness]` policy it reads over `harness
+/// policy` is in `effective` and has `resume_limits` on. codex-alab knows the
+/// exact reset from its own rate-limit snapshot and waits it out, so the band
+/// reads it as aterm's own harness's wall reads (`note`, "resumes by
+/// itself"), never `limited`. Every other wall, or the policy off, is
+/// nobody's: the stop stands for a person (fail closed).
+#[must_use]
+pub(crate) fn wall_answer(
+    kind: aterm_phase::WallKind,
+    has_reset: bool,
+    policy: &aterm_agent::supervise::SupervisorConfig,
+    effective: bool,
+) -> aterm_messages::presence::WallAnswer {
+    use aterm_agent::supervise::policy::outlook::{Answer, answer};
+    use aterm_messages::presence::WallAnswer;
+    use aterm_phase::WallKind;
+    if !effective
+        || !policy.resume_limits
+        || !matches!(kind, WallKind::UsageSession | WallKind::UsageWeekly)
+    {
+        return WallAnswer::Nobody;
+    }
+    match answer(kind, has_reset, policy, true) {
+        Answer::Nobody => WallAnswer::Nobody,
+        Answer::Resumes => WallAnswer::Harness,
+        Answer::ResumesAsks(action) => WallAnswer::HarnessAsks(action),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -140,6 +196,30 @@ static COPIES: Mutex<Copies> = Mutex::new(Copies::new());
 /// The copies by tab (a `BTreeMap`, so the static needs no lazy init).
 type Copies = std::collections::BTreeMap<String, Copy>;
 
+/// The line the crash rule last typed in each tab ([`typed`]): what a
+/// codex-alab it started, read before its record's first write, relaunches
+/// on ([`self_claimed::inherited`]: only a process that runs exactly it).
+static TYPED: Mutex<std::collections::BTreeMap<String, self_claimed::Resume>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// The crash rule types `resume` in tab `sid` (`harness_host`'s
+/// `self_claimed_exit`): a copy of the process it starts that finds no
+/// record yet inherits it.
+pub(crate) fn typed(sid: &str, resume: &self_claimed::Resume) {
+    TYPED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(sid.to_string(), resume.clone());
+}
+
+fn typed_for(sid: &str) -> Option<self_claimed::Resume> {
+    TYPED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(sid)
+        .cloned()
+}
+
 /// Read the proven claim's record now, while its identity is live
 /// ([`self_claimed::read_copy`]: looked at before and after the read), and
 /// keep it as aterm's copy. A read that cannot be vouched for keeps the copy
@@ -147,8 +227,9 @@ type Copies = std::collections::BTreeMap<String, Copy>;
 /// renewal during the off-lock read invalidates it. Returns whether the claim
 /// still stands. Never on the render or input path.
 fn refresh(ctx: &crate::SessionCtx, proven: &Proven, revision: u64) -> bool {
+    let typed = typed_for(ctx.self_id.as_str());
     refresh_by(ctx, proven, revision, || {
-        self_claimed::read_copy(proven.pid, &proven.start)
+        self_claimed::read_copy(proven.pid, &proven.start, typed.as_ref())
     })
 }
 
@@ -178,10 +259,18 @@ fn refresh_by(
         return false;
     }
     if let Some(copy) = copy {
-        COPIES
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(ctx.self_id.to_string(), copy);
+        let mut copies = COPIES.lock().unwrap_or_else(PoisonError::into_inner);
+        let copy = self_claimed::fold(copies.get(ctx.self_id.as_str()), copy);
+        let line = copy.resume.clone().ok();
+        let before = copies.insert(ctx.self_id.to_string(), copy);
+        drop(copies);
+        drop(meta);
+        // The line a layout's leaf carries moved: the host follows the
+        // session again, publishing it ([`crate::harness_host`]'s
+        // `with_self_claimed_line`).
+        if before.and_then(|copy| copy.resume.ok()) != line {
+            crate::harness_host::ring();
+        }
     }
     true
 }
@@ -193,6 +282,18 @@ fn standing(ctx: &crate::SessionCtx) -> Option<(Proven, u64)> {
     meta.live_claim(crate::metrics::now_us())
         .and_then(|claim| claim.proven.clone())
         .map(|proven| (proven, meta.supervisor_revision))
+}
+
+/// THE WATCH-ONLY WORKER'S IDLE POINT (the contract, §4): `ctx`'s live
+/// proven claim names the process `pid` started at `start`, and that
+/// process's own session record, read NOW while its identity is live, says it
+/// rests ([`self_claimed::read_idle`]: `status: "idle"`, `draftEmpty:
+/// true`). The meta guard is let go before the read. `false` with no proven
+/// claim, a claim of another process, and anything the read cannot vouch for.
+pub(crate) fn idle_now(ctx: &crate::SessionCtx, pid: u32, start: &str) -> bool {
+    standing(ctx).is_some_and(|(proven, _)| {
+        proven.pid == pid && proven.start == start && self_claimed::read_idle(pid, start)
+    })
 }
 
 /// A `meta-change` of the session: its proven claim's record is read again
@@ -237,9 +338,23 @@ pub(crate) fn discard_dead(sid: &str) {
     }
 }
 
+/// Tests: tab `sid`'s copy is `copy` (`None`: none).
+#[cfg(test)]
+pub(crate) fn set_copy_for_test(sid: &str, copy: Option<Copy>) {
+    let mut copies = COPIES.lock().unwrap_or_else(PoisonError::into_inner);
+    match copy {
+        Some(copy) => copies.insert(sid.to_string(), copy),
+        None => copies.remove(sid),
+    };
+}
+
 /// Tab `sid` closed: nothing of its agent is read again.
 pub(crate) fn forget(sid: &str) {
     COPIES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(sid);
+    TYPED
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .remove(sid);
@@ -267,23 +382,25 @@ pub(crate) fn claimed(
 /// gone from the front): its record is read once more while the identity is
 /// still live (an orderly end removes it first), and the window host is
 /// told whether the agent goes on without it (`true`: codex-alab went
-/// passive, so aterm's own lane takes the session back) or is gone.
+/// passive, and aterm's worker goes on watching beside the agent itself) or
+/// is gone.
 ///
 /// A claim given back by an agent that GOES ON — its record standing with no
 /// word of an end ([`self_claimed::shows_end`]: passive, or an `execve` into
 /// its next build) — leaves no copy: nothing is read from it again while no
-/// proof stands, so its later exit is aterm's own lane's to read, as for any
-/// Codex, and never decided from a copy frozen at the release (a `/new` or a
-/// fork since, an orderly `/exit` it never saw). A next proven claim reads a
-/// fresh copy. A release that shows the end coming (the record removed, an
+/// proof stands, so its later exit is decided by nobody and nothing relaunches
+/// it (fail closed: no lane reads a Codex's end), never decided from a copy
+/// frozen at the release (a `/new` or a fork since, an orderly `/exit` it
+/// never saw). A next proven claim reads a fresh copy. A release that shows the end coming (the record removed, an
 /// exit word) keeps it, for the exit's reader.
 pub(crate) fn released(ctx: &crate::SessionCtx, proven: &Proven, revision: u64) {
+    let typed = typed_for(ctx.self_id.as_str());
     if let Some(alive) = released_by(
         ctx,
         proven,
         revision,
         || proven.alive(),
-        || self_claimed::read_copy(proven.pid, &proven.start),
+        || self_claimed::read_copy(proven.pid, &proven.start, typed.as_ref()),
     ) {
         crate::harness_host::self_claim_released(ctx.self_id.as_str(), alive);
     }
@@ -319,6 +436,7 @@ fn finish_release(
     let mut copies = COPIES.lock().unwrap_or_else(PoisonError::into_inner);
     let sid = ctx.self_id.as_str();
     if let Some(copy) = copy {
+        let copy = self_claimed::fold(copies.get(sid), copy);
         copies.insert(sid.to_string(), copy);
     }
     if alive
@@ -326,8 +444,12 @@ fn finish_release(
             .get(sid)
             .filter(|copy| copy.pid == proven.pid && copy.start == proven.start)
             .is_none_or(|copy| !self_claimed::shows_end(copy))
+        && copies.remove(sid).is_some_and(|copy| copy.resume.is_ok())
     {
-        copies.remove(sid);
+        drop(copies);
+        drop(meta);
+        // No line to carry any more: the host publishes the session again.
+        crate::harness_host::ring();
     }
     true
 }
@@ -335,6 +457,67 @@ fn finish_release(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only a usage wall, only with the policy in effect and `resume_limits`
+    /// on, is the self-claim's own to wait out; everything else stays a stop.
+    #[test]
+    fn a_self_claim_answers_only_a_usage_wall_under_resume_limits() {
+        use aterm_agent::supervise::SupervisorConfig;
+        use aterm_messages::presence::WallAnswer;
+        use aterm_phase::WallKind;
+        let on = SupervisorConfig::default();
+        assert!(on.resume_limits, "the default resumes limits");
+        let off = SupervisorConfig {
+            resume_limits: false,
+            ..SupervisorConfig::default()
+        };
+        for kind in [WallKind::UsageSession, WallKind::UsageWeekly] {
+            assert_eq!(wall_answer(kind, true, &on, true), WallAnswer::Harness);
+            assert_eq!(wall_answer(kind, false, &on, true), WallAnswer::Harness);
+            assert_eq!(wall_answer(kind, true, &off, true), WallAnswer::Nobody);
+            assert_eq!(wall_answer(kind, true, &on, false), WallAnswer::Nobody);
+        }
+        for kind in [
+            WallKind::Spend,
+            WallKind::Context,
+            WallKind::Auth,
+            WallKind::Memory,
+            WallKind::ModelBucket { consent: false },
+        ] {
+            assert_eq!(
+                wall_answer(kind, true, &on, true),
+                WallAnswer::Nobody,
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// A self-claim speaks for a Codex in front, by either name it runs
+    /// under. NEGATIVE CONTROLS: another agent, a shell, a look-alike name and
+    /// a program not yet resolved are not the claimant.
+    #[test]
+    fn a_self_claim_speaks_only_for_a_codex_in_front() {
+        for claimant in [
+            "codex",
+            "CODEX",
+            "/opt/alab/bin/codex",
+            "codex-alab",
+            "Codex-Alab",
+        ] {
+            assert!(fronts_claimant(Some(claimant)), "{claimant}");
+        }
+        for other in [
+            None,
+            Some("claude"),
+            Some("node"),
+            Some("zsh"),
+            Some("codexx"),
+            Some("codex-alab-helper"),
+            Some(""),
+        ] {
+            assert!(!fronts_claimant(other), "{other:?}");
+        }
+    }
 
     #[test]
     fn a_holder_names_its_pid_in_one_spelling() {
@@ -410,6 +593,7 @@ mod tests {
                 status: Some("busy".to_string()),
                 exit: None,
                 cwd: None,
+                draft_empty: None,
             }))
         };
         forget(sid);
@@ -505,7 +689,109 @@ mod tests {
             copy_of_tab(sid).unwrap().seen,
             self_claimed::Seen::Present(_)
         ));
+
+        // THE KEPT COPY FOLDS ITS READS (AD-3): a read that finds nothing
+        // after one that found the record keeps a REMOVAL; a first read that
+        // finds nothing keeps NEVER — no orderly end it never saw.
+        let next = claim_supervisor_as(ctx, holder, Some(4), None, Some(proven.clone()), now)
+            .expect("a next claim");
+        assert!(refresh_by(ctx, &proven, next.revision, || Some(copy(
+            self_claimed::Seen::Never
+        ))));
+        assert_eq!(copy_of_tab(sid).unwrap().seen, self_claimed::Seen::Removed);
         forget(sid);
+        assert!(refresh_by(ctx, &proven, next.revision, || Some(copy(
+            self_claimed::Seen::Never
+        ))));
+        assert_eq!(copy_of_tab(sid).unwrap().seen, self_claimed::Seen::Never);
+        forget(sid);
+    }
+
+    /// THE WATCH-ONLY WORKER'S IDLE POINT, live ([`idle_now`]): a real
+    /// stand-in process (a signed copy of `sleep`, its `CODEX_HOME` the
+    /// test's directory) holding the session's PROVEN claim, with a PLANTED
+    /// record saying `idle` and `draftEmpty: true`, is at its idle point; the
+    /// record saying `busy` is not. NEGATIVE CONTROLS: the claim's process
+    /// named under another pid or start, the claim released (no proof
+    /// stands), and the process gone (a dead identity) read no idle point.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn the_idle_point_is_the_proven_processs_own_record_read_live() {
+        use crate::session_timeline::{claim_supervisor_as, release_supervisor};
+        let dir = aterm_tempfile::TempDir::new().expect("dir");
+        let home = std::fs::canonicalize(dir.path()).expect("canonical");
+        let sleep = home.join("sleep");
+        std::fs::copy("/bin/sleep", &sleep).expect("copy sleep");
+        let signed = aterm_uds::spawnfd::command("codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(&sleep)
+            .output()
+            .expect("codesign");
+        assert!(signed.status.success(), "{signed:?}");
+        let sleep_s = sleep.to_string_lossy().into_owned();
+        let mut child = aterm_uds::spawnfd::command(&sleep)
+            .arg("60")
+            .env("CODEX_HOME", &home)
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        // Its exec has landed once its own argv reads back (a hang detector).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !atpkg::caller_shell::process_args(pid)
+            .is_some_and(|a| a.argv.first() == Some(&sleep_s))
+        {
+            assert!(std::time::Instant::now() < deadline, "sleep never ran");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let start = restart_stamp::kernel_start(pid).expect("its start");
+        let path = self_claimed::record_path(&home, pid);
+        std::fs::create_dir_all(path.parent().expect("dir")).expect("sessions dir");
+        let plant = |status: &str| {
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"v":1,"pid":{pid},"status":"{status}","draftEmpty":true,"exit":null}}"#
+                ),
+            )
+            .expect("the record");
+        };
+        let handle = crate::session_store::test_handle_on(7512, -1);
+        let ctx = handle.ctx.as_ref();
+        let proven = Proven {
+            pid,
+            start: start.clone(),
+        };
+        let holder = format!("{SELF_CLAIM_PREFIX}{pid}");
+        let now = crate::metrics::now_us();
+        claim_supervisor_as(ctx, &holder, Some(1), None, Some(proven), now).expect("a claim");
+        plant("idle");
+        assert!(idle_now(ctx, pid, &start), "its own record says it rests");
+        plant("busy");
+        assert!(!idle_now(ctx, pid, &start), "busy");
+        plant("idle");
+        assert!(!idle_now(ctx, pid + 1, &start), "another process");
+        assert!(
+            !idle_now(ctx, pid, "Thu Jan  1 00:00:00 1970"),
+            "another identity"
+        );
+        assert!(release_supervisor(ctx, None, now));
+        assert!(!idle_now(ctx, pid, &start), "no proof stands");
+        claim_supervisor_as(
+            ctx,
+            &holder,
+            Some(2),
+            None,
+            Some(Proven {
+                pid,
+                start: start.clone(),
+            }),
+            now,
+        )
+        .expect("claimed again");
+        assert!(idle_now(ctx, pid, &start), "positive control, again");
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(!idle_now(ctx, pid, &start), "a dead identity rests nowhere");
     }
 
     #[cfg(target_vendor = "apple")]

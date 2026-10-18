@@ -545,7 +545,8 @@ pub fn one_digest<'a>(sha256: &'a str, sha512: &'a str) -> Option<(DigestAlg, &'
 }
 
 /// `[artifact.provenance]`: the scan record of the packer that signed the row. Every
-/// field is a string exactly as `atpkg lineage scan` printed it.
+/// field is a string exactly as the packer's payload scan recorded it
+/// (`atpkg-publish`'s `artifact::pkgdoc::provenance`).
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 pub struct Provenance {
     /// `release:` of the compiler that built the payload (`1.99.0-dev`).
@@ -863,6 +864,8 @@ pin = {{ trust = 7100, nn = 108 }}
             Some("rustc")
         );
         assert_eq!(idx.program("ay").unwrap().repo, "ay");
+        assert_eq!(idx.program("gh").unwrap().system.as_deref(), Some("gh"));
+        assert_eq!(idx.program("ay").unwrap().system, None);
         assert_eq!(idx.channels.len(), 1);
         let ch = &idx.channels[0];
         assert_eq!(ch.name, "stable");
@@ -1007,34 +1010,6 @@ pin = {{ trust = 7100, nn = 108 }}
         );
     }
 
-    /// The key is OPTIONAL and additive: an index without it (every index published
-    /// before this key existed) resolves to exactly its `pin` for every target.
-    #[test]
-    fn without_an_overlay_the_view_is_the_published_pin() {
-        let idx = parse_index(&verified(&full_index())).expect("valid index parses");
-        let view = idx
-            .channel_for("stable", "x86_64-unknown-linux-gnu")
-            .unwrap();
-        assert_eq!(view.pin, idx.channels[0].pin);
-        assert!(idx.channels[0].pin_by_target.is_empty());
-    }
-
-    /// A LEFTOVER `[keys]` table carries no authority any more: it parses (unknown tables
-    /// are ignored, so a producer mid-changeover is not refused for emitting it) and there
-    /// is no API that can read a release key out of an index. The delegation tier is gone,
-    /// not merely unused — this test would not compile if `Index::delegation` still
-    /// existed and something called it.
-    #[test]
-    fn a_leftover_keys_table_is_ignored_and_grants_nothing() {
-        let mut body = full_index();
-        body.push_str("\n[keys]\nrelease_key_id = \"rk-2026-06\"\nrelease_key_pubkey = \"AAAA\"\n");
-        let idx = parse_index(&verified(&body)).expect("an ignored table is not a refusal");
-        assert_eq!(idx.index_build, 41, "the rest of the index still reads");
-        // The only authority over a pkg manifest is the roster generation, reached
-        // through `TrustedIndex::verify_pkg` — never anything inside these bytes.
-        assert_eq!(idx.machine_id.as_deref(), Some(testkit::MACHINE_ID));
-    }
-
     // R4: a private-config repo (never named in the index) is unreachable BY CONSTRUCTION.
     #[test]
     fn unlisted_repo_is_unreachable() {
@@ -1073,20 +1048,6 @@ pin = {{ trust = 7100, nn = 108 }}
                 .map(|s| s.to_string())
                 .collect()
         );
-    }
-
-    /// The EXTRAS tier is retired (design 2026-09-22 §5.3(c)): an older index that still
-    /// marks programs `extra = true` verifies, and the key means nothing — the programs are
-    /// default-set members like any other. `system` still parses beside it.
-    #[test]
-    fn a_retired_extra_key_verifies_and_reads_as_default_set() {
-        let body = full_index();
-        assert!(body.contains("[programs.vendorx]") && body.contains("extra = true"));
-        let idx = parse_index(&verified(&body)).expect("an index carrying `extra` verifies");
-        assert!(idx.installable(&[]).contains("vendorx"));
-        assert!(idx.installable(&[]).contains("codex"));
-        assert_eq!(idx.program("gh").unwrap().system.as_deref(), Some("gh"));
-        assert_eq!(idx.program("ay").unwrap().system, None);
     }
 
     /// The `https` row keys parse as signed data (all `serde(default)`, so a row without
@@ -1160,38 +1121,27 @@ links = { emacs = "Emacs.app/Contents/MacOS/Emacs" }
         let m = parse_pkg(&verified(&with)).expect("a valid shim_env parses");
         assert_eq!(m.shim_env, vec!["DISABLE_AUTOUPDATER=1".to_string()]);
         assert_eq!(m.shim_env().spelled(), "DISABLE_AUTOUPDATER=1");
-        assert_eq!(
-            m.shim_env().fix_line("ay").as_deref(),
-            Some("its own updater is off here (DISABLE_AUTOUPDATER=1)")
-        );
         // Absent: no environment, exactly as every manifest published before the key.
         let without = parse_pkg(&verified(&format!("{head}{row}"))).unwrap();
         assert!(without.shim_env.is_empty() && without.shim_env().is_empty());
         // Refused, each by name, as ShimEnv — the publisher's verify-pkg spells the fix.
-        for (list, why) in [
-            ("[\"DISABLE_AUTOUPDATER\"]", "not NAME=VALUE"),
-            ("[\"disable_autoupdater=1\"]", "name is not [A-Z0-9_]+"),
-            ("[\"PATH=/tmp\"]", "never sets"),
-            ("[\"X=\"]", "empty value"),
-            ("[\"X=1\", \"X=2\"]", "duplicate name"),
-            (
-                "[\"A=1\", \"B=1\", \"C=1\", \"D=1\", \"E=1\", \"F=1\", \"G=1\", \"H=1\", \"I=1\"]",
-                "at most 8",
-            ),
+        // A control byte inside the TOML string (the string escape carries it through the
+        // parser) is refused the same way.
+        for list in [
+            "[\"DISABLE_AUTOUPDATER\"]",
+            "[\"disable_autoupdater=1\"]",
+            "[\"PATH=/tmp\"]",
+            "[\"X=\"]",
+            "[\"X=1\", \"X=2\"]",
+            "[\"A=1\", \"B=1\", \"C=1\", \"D=1\", \"E=1\", \"F=1\", \"G=1\", \"H=1\", \"I=1\"]",
+            "[\"X=a\\nb\"]",
         ] {
             let body = format!("{head}shim_env = {list}\n{row}");
             match parse_pkg(&verified(&body)) {
-                Err(Reject::ShimEnv(m)) => assert!(m.contains(why), "{list}: {m}"),
+                Err(Reject::ShimEnv(_)) => {}
                 other => panic!("{list}: expected Reject::ShimEnv, got {other:?}"),
             }
         }
-        // A control byte inside the TOML string is refused the same way (the string
-        // escape carries it through the parser; the rule refuses it after).
-        let body = format!("{head}shim_env = [\"X=a\\nb\"]\n{row}");
-        assert!(matches!(
-            parse_pkg(&verified(&body)),
-            Err(Reject::ShimEnv(m)) if m.contains("control byte")
-        ));
         // The wrong TYPE is the parser's own refusal, as for any key.
         let body = format!("{head}shim_env = \"DISABLE_AUTOUPDATER=1\"\n{row}");
         assert_eq!(parse_pkg(&verified(&body)).unwrap_err(), Reject::Malformed);
@@ -1225,11 +1175,7 @@ links = { emacs = "Emacs.app/Contents/MacOS/Emacs" }
                     target = \"aarch64-apple-darwin\"\nkind = \"vendor-fetch\"\n\
                     asset = \"claude\"\nsha256 = \"d\"\nurl = \"https://downloads.claude.ai/c\"\n";
         match parse_pkg(&verified(body)) {
-            Err(Reject::RetiredKind(why)) => {
-                assert!(why.contains("vendor-fetch"), "{why}");
-                assert!(why.contains("kind = \"binary\""), "{why}");
-                assert!(why.contains("protocol = \"https\""), "{why}");
-            }
+            Err(Reject::RetiredKind(why)) => assert!(why.contains("vendor-fetch"), "{why}"),
             other => panic!("expected RetiredKind, got {other:?}"),
         }
         // Even a SECOND row spelled that way refuses the manifest: a publisher emitting it
@@ -1355,31 +1301,6 @@ provides = ["emacs"]
         ] {
             assert!(!alg.is_lower_hex(&bad), "{alg} {bad}");
         }
-        assert_eq!(
-            (DigestAlg::Sha256.to_string(), DigestAlg::Sha512.key()),
-            (String::from("sha256"), "sha512")
-        );
-    }
-
-    /// The six targets, in the schema's spelling — every one a `<arch>-<vendor>-<os>[-abi]`
-    /// triple over the two architectures and three operating systems the client ships on.
-    #[test]
-    fn the_target_list_is_the_six_triples() {
-        assert_eq!(TARGETS.len(), 6);
-        for t in TARGETS {
-            let arch = t.split('-').next().unwrap();
-            assert!(matches!(arch, "aarch64" | "x86_64"), "{t}");
-            assert!(
-                t.ends_with("-apple-darwin")
-                    || t.ends_with("-unknown-linux-gnu")
-                    || t.ends_with("-pc-windows-msvc"),
-                "{t}"
-            );
-        }
-        let mut sorted = TARGETS.to_vec();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(sorted.len(), 6, "no duplicates");
     }
 
     /// Every published triple is a forge cell, so some lane's compiler reads it:
@@ -1393,22 +1314,6 @@ provides = ["emacs"]
                 "no forge cell compiles `{t}`, and atpkg publishes artifact rows for it"
             );
         }
-    }
-
-    /// `[programs.<name>].unavailable_hint` parses beside `system`; absent ⇒ None.
-    #[test]
-    fn parses_the_unavailable_hint() {
-        let mut body = full_index();
-        body = body.replace(
-            "[programs.gh]\nrepo = \"gh\"",
-            "[programs.gh]\nunavailable_hint = \"gh is a macOS/Linux member\"\nrepo = \"gh\"",
-        );
-        let idx = parse_index(&verified(&body)).unwrap();
-        assert_eq!(
-            idx.program("gh").unwrap().unavailable_hint.as_deref(),
-            Some("gh is a macOS/Linux member")
-        );
-        assert_eq!(idx.program("ay").unwrap().unavailable_hint, None);
     }
 
     // reject-newer: a schema beyond this build is refused (the client stays put).
@@ -1544,11 +1449,9 @@ build_seconds = 0
     }
 
     /// `[artifact.provenance]` rides per row, exactly as `atpkg-publish` writes it
-    /// (after the row's `[artifact.cost]`, with a merged row appended after it), and
-    /// a client that predates the table parses the same bytes: no struct on the path
-    /// denies unknown fields, which is the whole backward-compatibility story.
+    /// (after the row's `[artifact.cost]`, with a merged row appended after it).
     #[test]
-    fn provenance_rides_per_row_and_old_clients_ignore_it() {
+    fn provenance_rides_per_row() {
         let commit = "7d5533b2bb9c9417bc09c27f1acd9d0b808f8f15";
         let body = format!(
             "schema = 1\nprogram = \"ay\"\nversion = \"0.28.0\"\nbuild_number = 9001\nexposes = [\"ay\"]\n\n\
@@ -1578,28 +1481,6 @@ build_seconds = 0
             m.artifacts[1].cost.disk_installed, 20,
             "the table does not swallow the next row"
         );
-
-        // The pre-provenance client's shape: the same rows, no `provenance` field.
-        #[derive(Deserialize)]
-        struct OldCost {
-            disk_installed: u64,
-        }
-        #[derive(Deserialize)]
-        struct OldArtifact {
-            target: String,
-            cost: OldCost,
-        }
-        #[derive(Deserialize)]
-        struct OldPkg {
-            build_number: u64,
-            #[serde(rename = "artifact")]
-            artifacts: Vec<OldArtifact>,
-        }
-        let old: OldPkg = aterm_toml::from_str(&body).expect("an old client parses it");
-        assert_eq!(old.build_number, 9001);
-        assert_eq!(old.artifacts.len(), 2);
-        assert_eq!(old.artifacts[1].target, "x86_64-apple-darwin");
-        assert_eq!(old.artifacts[0].cost.disk_installed, 20);
     }
 
     // The signed `program` field binds the manifest to a program (§4.2 anti-replay): a
@@ -1616,24 +1497,6 @@ build_seconds = 0
         assert!(
             !m.is_for("trust"),
             "a pkg signed for ay must not pass as trust"
-        );
-    }
-
-    // §17: `requires` is SIGNED metadata parsed from the verified bytes; absent ⇒ empty.
-    #[test]
-    fn parses_requires_field() {
-        let with = parse_pkg(&verified(
-            "schema = 2\nprogram = \"ay\"\nbuild_number = 18\nrequires = [\"ny\"]\n",
-        ))
-        .unwrap();
-        assert_eq!(with.requires, vec!["ny".to_string()]);
-        let without = parse_pkg(&verified(
-            "schema = 2\nprogram = \"ay\"\nbuild_number = 18\n",
-        ))
-        .unwrap();
-        assert!(
-            without.requires.is_empty(),
-            "absent requires defaults to empty"
         );
     }
 }

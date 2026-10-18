@@ -5,17 +5,12 @@
 //!
 //! ## Boolean policy
 //!
-//! * Tier-0: the `HdrPresentGate` model
-//!   (`aterm_spec::derive::hdr_present_gate_model`) carries `SdrInvariance`,
-//!   `BoostNeedsLinearF16` and `F16NeedsSupport`, proved and mutation-caught in
-//!   aterm-spec (`derived_hdr_present_gate_proves_and_catches_hdr_without_optin`).
 //! * Tier-1 (this file): [`aterm_gpu::hdr_swapchain_wants_f16`] (attach) and
 //!   [`aterm_gpu::hdr_present_plan`] (present) have finite boolean domains, so
 //!   every attach-to-present chain and every raw plan input is enumerated, with
-//!   non-vacuity controls. The macOS Metal attach
-//!   ([`aterm_gpu::hdr_swapchain_wants_f16_on_screen`]) implies the base gate,
-//!   and the live re-pick ([`aterm_gpu::hdr_screen_upgrade_wants_f16`]) implies
-//!   that, so this enumeration bounds them.
+//!   non-vacuity controls. The macOS screen-narrowed attach and live re-pick
+//!   imply the base gate for every input (`format_plan`'s unit tests), so this
+//!   enumeration bounds them.
 //!
 //! ## On-GPU clamp laws
 //!
@@ -26,18 +21,20 @@
 //! linear decode of the SDR readback within f16 quantization;
 //! (2) additive clamp: with the aurora pass on, no channel exceeds the
 //! sanitized EDR max, and some channel exceeds 1.0.
-//! Skips without a GPU or system font.
+//! No GPU or no font: COULD NOT RUN.
 
-use aterm_core::terminal::Terminal;
 use aterm_gpu::{
-    GpuRenderer, HdrReconfigurePlan, WindowGpu, hdr_live_upgrade_wants_f16, hdr_present_plan,
-    hdr_reconfigure_plan, hdr_screen_upgrade_wants_f16, hdr_swapchain_wants_f16,
-    hdr_swapchain_wants_f16_on_screen,
+    hdr_present_plan, hdr_screen_upgrade_decision, hdr_screen_upgrade_wants_f16,
+    hdr_swapchain_wants_f16,
 };
-use aterm_render::{GlowQuad, RenderInput, hdr, premul_rgb};
-use aterm_spec::derive::hdr_reconfigure_retag_model;
-
-use crate::common;
+// The GPU halves render through the wgpu oracle's HDR present seam.
+#[cfg(wgpu_arm)]
+use {
+    crate::common,
+    aterm_core::terminal::Terminal,
+    aterm_gpu::{GpuRenderer, WindowGpu},
+    aterm_render::{GlowQuad, RenderInput, hdr, premul_rgb},
+};
 
 /// Iterate every (hdr_glow, supports_f16, glow_nonempty) tuple over {false,true}^3.
 fn all_inputs() -> impl Iterator<Item = (bool, bool, bool)> {
@@ -48,7 +45,7 @@ fn all_inputs() -> impl Iterator<Item = (bool, bool, bool)> {
 }
 
 /// Chain the attach decision into the present plan for every input and check
-/// the three model invariants, plus the raw plan over all surface states
+/// the three invariants, plus the raw plan over all surface states
 /// (including live-flip mismatches no attach chain reaches).
 #[test]
 fn hdr_gate_exhaustive_attach_present_chain() {
@@ -102,419 +99,10 @@ fn hdr_gate_exhaustive_attach_present_chain() {
     }
 }
 
-/// Lifecycle conformance for an f16 surface rebuilt by a reconfigure or checked
-/// after a same-size Windows HDR change: drive `hdr_reconfigure_plan`, project
-/// onto the model, and require the modeled successor for both re-tag outcomes.
-///
-/// This is the planner half of the `HdrReconfigureRetag` binding. The apply half
-/// is the in-crate `renderer::tests::hdr_reconfigure_apply_conforms_to_retag_model`
-/// (the applies are private), and the surface-side obligations are held by
-/// source order in [`every_live_surface_reconfigure_routes_through_hdr_recovery`].
-/// `aterm_spec::derive::hdr_reconfigure_retag_model` documents which instrument
-/// holds what.
-#[test]
-fn hdr_reconfigure_retag_policy_conforms_and_old_ignore_failure_is_rejected() {
-    let model = hdr_reconfigure_retag_model();
-    let initial = model.init_state();
-    let mut downgrade_fallbacks = 0usize;
-
-    for retagged in [false, true] {
-        let action = if retagged {
-            "RetagSucceeds"
-        } else {
-            "RetagFails"
-        };
-        assert!(
-            model.action_enabled(action, &initial),
-            "{action} must be enabled for the initial confirmed-HDR surface"
-        );
-        let successors = model.successors(action, &initial);
-        assert_eq!(
-            successors.len(),
-            1,
-            "{action} must have one deterministic modeled successor"
-        );
-        let modeled = &successors[0];
-
-        let plan = hdr_reconfigure_plan(true, retagged);
-        let (is_f16, capture_linear) = match plan {
-            HdrReconfigurePlan::KeepHdr => (1, 1),
-            HdrReconfigurePlan::FallbackToSdr => {
-                downgrade_fallbacks += 1;
-                (0, 0)
-            }
-            HdrReconfigurePlan::KeepSdr => {
-                panic!("an existing f16 surface cannot take the KeepSdr arm")
-            }
-        };
-        assert_eq!(modeled["stage"], 2);
-        assert_eq!(modeled["retagged"], if retagged { 1 } else { 0 });
-        assert_eq!(modeled["is_f16"], is_f16);
-        assert_eq!(modeled["capture_linear"], capture_linear);
-        for invariant in [
-            "ResolvedF16RequiresSuccessfulRetag",
-            "CaptureMatchesSurfaceEncoding",
-            "ValuesBounded",
-        ] {
-            assert!(
-                model.check_invariant(invariant, modeled),
-                "{action} shipping projection violated {invariant}: {modeled:?}"
-            );
-        }
-    }
-    assert_eq!(
-        downgrade_fallbacks, 1,
-        "exactly the failed f16 re-tag must select SDR fallback"
-    );
-
-    // Live HDR-on recovery starts from the retained SDR surface; after the
-    // output probe admits it, configure and tag have the same two outcomes.
-    let sdr = model
-        .successors("EnterSdrFallback", &initial)
-        .into_iter()
-        .next()
-        .expect("the model must expose an eligible SDR fallback");
-    assert_eq!(sdr["stage"], 1);
-    assert_eq!(sdr["is_f16"], 0);
-    assert_eq!(sdr["capture_linear"], 0);
-    let mut upgrade_fallbacks = 0usize;
-    for retagged in [false, true] {
-        let action = if retagged {
-            "UpgradeSucceeds"
-        } else {
-            "UpgradeFails"
-        };
-        assert!(model.action_enabled(action, &sdr));
-        let modeled = model
-            .successors(action, &sdr)
-            .into_iter()
-            .next()
-            .expect("upgrade action must have one successor");
-        let plan = hdr_reconfigure_plan(true, retagged);
-        let (is_f16, capture_linear) = match plan {
-            HdrReconfigurePlan::KeepHdr => (1, 1),
-            HdrReconfigurePlan::FallbackToSdr => {
-                upgrade_fallbacks += 1;
-                (0, 0)
-            }
-            HdrReconfigurePlan::KeepSdr => {
-                panic!("an admitted f16 upgrade cannot take the KeepSdr arm")
-            }
-        };
-        assert_eq!(modeled["stage"], 2);
-        assert_eq!(modeled["retagged"], if retagged { 1 } else { 0 });
-        assert_eq!(modeled["is_f16"], is_f16);
-        assert_eq!(modeled["capture_linear"], capture_linear);
-        for invariant in [
-            "ResolvedF16RequiresSuccessfulRetag",
-            "CaptureMatchesSurfaceEncoding",
-            "ValuesBounded",
-        ] {
-            assert!(
-                model.check_invariant(invariant, &modeled),
-                "{action} shipping projection violated {invariant}: {modeled:?}"
-            );
-        }
-    }
-    assert_eq!(
-        upgrade_fallbacks, 1,
-        "a failed upgrade tag must restore exactly one SDR fallback"
-    );
-
-    // SDR reconfigures never become HDR merely because a meaningless re-tag
-    // boolean is true.
-    for retagged in [false, true] {
-        assert_eq!(
-            hdr_reconfigure_plan(false, retagged),
-            HdrReconfigurePlan::KeepSdr
-        );
-    }
-
-    // Negative control: a reconfigure that ignores the failed re-tag and keeps
-    // f16 with linear capture metadata is neither the successor nor safe.
-    let mut ignored_failure = initial.clone();
-    ignored_failure.insert("stage", 2);
-    ignored_failure.insert("retagged", 0);
-    ignored_failure.insert("is_f16", 1);
-    ignored_failure.insert("capture_linear", 1);
-    assert!(
-        !model
-            .successors("RetagFails", &initial)
-            .contains(&ignored_failure),
-        "old ignore-failure transition must not conform"
-    );
-    assert!(
-        !model.check_invariant("ResolvedF16RequiresSuccessfulRetag", &ignored_failure),
-        "negative control must expose untagged f16"
-    );
-
-    // Negative control: an upgrade whose tag failed but left the f16 surface
-    // live, with capture still SDR, mismatches format and metadata.
-    let mut failed_upgrade = sdr.clone();
-    failed_upgrade.insert("stage", 2);
-    failed_upgrade.insert("retagged", 0);
-    failed_upgrade.insert("is_f16", 1);
-    failed_upgrade.insert("capture_linear", 0);
-    assert!(
-        !model
-            .successors("UpgradeFails", &sdr)
-            .contains(&failed_upgrade),
-        "failed upgrade must not leave an untagged f16 surface"
-    );
-    assert!(
-        !model.check_invariant("ResolvedF16RequiresSuccessfulRetag", &failed_upgrade),
-        "failed-upgrade negative control must expose untagged f16"
-    );
-    assert!(
-        !model.check_invariant("CaptureMatchesSurfaceEncoding", &failed_upgrade),
-        "failed-upgrade negative control must expose metadata/format mismatch"
-    );
-}
-
-/// The live-upgrade gate keeps raw f16 support independent of the attach-time
-/// opt-in, then requires the current opt-in and Windows output state. The full
-/// boolean domain is enumerated, including the hot-reload case.
-#[test]
-fn hdr_live_upgrade_gate_is_complete_and_hot_reloadable() {
-    let mut admitted = 0usize;
-    for (hdr_glow, supports_f16, output_hdr_enabled) in all_inputs() {
-        let got = hdr_live_upgrade_wants_f16(hdr_glow, supports_f16, output_hdr_enabled);
-        let expected = hdr_glow && supports_f16 && output_hdr_enabled;
-        assert_eq!(
-            got, expected,
-            "upgrade gate drifted for ({hdr_glow},{supports_f16},{output_hdr_enabled})"
-        );
-        admitted += usize::from(got);
-    }
-    assert_eq!(admitted, 1, "only the all-true upgrade tuple is admitted");
-
-    let supports_f16 = true;
-    assert!(
-        !hdr_live_upgrade_wants_f16(false, supports_f16, true),
-        "live opt-out must suppress an SDR upgrade"
-    );
-    assert!(
-        hdr_live_upgrade_wants_f16(true, supports_f16, true),
-        "turning the live opt-in on must use retained raw f16 support"
-    );
-
-    // Negative control: freezing opt-in and support together at attach (opt-in
-    // false) would reject the same capable surface after a hot reload.
-    let old_attach_frozen_capable = hdr_swapchain_wants_f16(false, supports_f16);
-    assert!(!old_attach_frozen_capable);
-    assert!(
-        old_attach_frozen_capable != hdr_live_upgrade_wants_f16(true, supports_f16, true),
-        "the test must distinguish the old attach-frozen policy"
-    );
-}
-
-/// Binds the reconfigure policy above to every existing-surface call site.
-/// Initial attach configures a fresh local `surface` with its own tag/fallback
-/// gate; once a `GpuSurface` is live, `surf.surface.configure` is permitted only
-/// inside the shared transaction. Present also runs one bounded reconciliation
-/// for same-size Windows HDR toggles, which need not produce a surface event.
-///
-/// A source scan rather than a wgpu mock: no unit test off Windows can force the
-/// DX12 swapchain recreation that clears the colour-space tag. For the same
-/// reason it holds the surface-side obligations of the `HdrReconfigureRetag`
-/// binding, by order (a source scan witnesses no state): `FallbackToSdr`
-/// installs the retained SDR format before it flips capture metadata, and the
-/// live upgrade publishes extended-linear metadata only if configure+tag left an
-/// f16 surface.
-#[test]
-fn every_live_surface_reconfigure_routes_through_hdr_recovery() {
-    let source = include_str!("../src/renderer.rs");
-
-    let resize = source
-        .split_once("    pub fn resize_surface(")
-        .expect("resize_surface must remain present")
-        .1
-        .split_once("    fn configure_surface_retagging_scrgb(")
-        .expect("shared reconfigure helper must follow resize_surface")
-        .0;
-    assert_eq!(
-        resize
-            .matches("self.configure_surface_retagging_scrgb(")
-            .count(),
-        1,
-        "resize must route exactly once through the shared HDR recovery"
-    );
-    assert!(
-        !resize.contains("surf.surface.configure("),
-        "resize must not bypass the shared HDR recovery"
-    );
-
-    let helper = source
-        .split_once("    fn configure_surface_retagging_scrgb(")
-        .expect("shared reconfigure helper must remain present")
-        .1
-        .split_once("    fn tag_swapchain_scrgb(")
-        .expect("platform tag helper must follow shared reconfigure helper")
-        .0;
-    assert_eq!(
-        helper.matches("surf.surface.configure(").count(),
-        2,
-        "shared transaction must configure once, plus exactly one SDR fallback"
-    );
-    assert!(
-        helper.contains("hdr_reconfigure_plan(was_hdr, scrgb_retagged)"),
-        "shared transaction must drive the model-bound shipping policy"
-    );
-    assert!(
-        helper.contains("win.apply_hdr_reconfigure_plan(plan)"),
-        "shared transaction must reconcile capture/HDR metadata"
-    );
-    assert_eq!(
-        helper
-            .matches("self.finish_surface_color_space_recovery(")
-            .count(),
-        2,
-        "post-configure and same-size live validation must share one recovery decision"
-    );
-
-    // The format half of every `HdrReconfigureRetag` transition. The in-crate
-    // conformance reads `capture_linear` back off the window, but its `is_f16` is
-    // the planner's answer: the configure that installs the format lives here on
-    // the `GpuSurface`, so the atomic fallback is held by order.
-    let recovery = source
-        .split_once("    fn finish_surface_color_space_recovery(")
-        .expect("the shared recovery decision must remain present")
-        .1
-        .split_once("    fn reconcile_live_hdr_state_if_due(")
-        .expect("live HDR-state reconciliation must follow the shared recovery decision")
-        .0;
-    let decide = recovery
-        .find("hdr_reconfigure_plan(was_hdr, scrgb_retagged)")
-        .expect("recovery must drive the model-bound shipping policy");
-    let select_sdr = recovery
-        .find("surf.config.format = surf.sdr_format;")
-        .expect("the SDR escape must install the retained SDR format on the surface");
-    let configure_sdr = recovery
-        .find("surf.surface.configure(")
-        .expect("the SDR escape must configure the surface it just retargeted");
-    let publish_sdr = recovery
-        .find("self.cached_surface_format = Some(surf.sdr_format);")
-        .expect("the SDR escape must publish the retained format to later presents");
-    let reconcile_metadata = recovery
-        .find("win.apply_hdr_reconfigure_plan(plan);")
-        .expect("recovery must reconcile capture/HDR metadata");
-    assert!(
-        decide < select_sdr
-            && select_sdr < configure_sdr
-            && configure_sdr < publish_sdr
-            && publish_sdr < reconcile_metadata,
-        "FallbackToSdr must decide, retarget the surface to the retained SDR format, \
-         configure it, publish it, and only then flip capture metadata — the two halves \
-         of the atomic fallback, in that order"
-    );
-    assert_eq!(
-        recovery.matches("surf.surface.configure(").count(),
-        1,
-        "recovery configures only for the SDR escape"
-    );
-    assert!(
-        !recovery.contains("Self::tag_swapchain_scrgb("),
-        "the SDR escape must leave the 8-bit swapchain on DXGI's gamma-2.2 default"
-    );
-
-    let reconcile = source
-        .split_once("    fn reconcile_live_hdr_state_if_due(")
-        .expect("live HDR-state reconciliation must remain present")
-        .1
-        .split_once("    /// Whether this surface's containing Windows output")
-        .expect("side-effect-free output probe must follow reconciliation")
-        .0;
-    assert!(
-        reconcile.contains("self.hdr_glow && surf.supports_f16"),
-        "SDR polling must follow the current opt-in plus retained raw capability"
-    );
-    assert!(
-        reconcile.contains("hdr_live_upgrade_wants_f16("),
-        "the upgrade attempt must pass the exhaustive shipping gate"
-    );
-    let probe = reconcile
-        .find("Self::surface_output_hdr_enabled(&surf.surface)")
-        .expect("SDR upgrade must probe output HDR state");
-    let select_f16 = reconcile
-        .find("surf.config.format = wgpu::TextureFormat::Rgba16Float")
-        .expect("admitted upgrade must select f16");
-    let configure = reconcile
-        .find("self.configure_surface_retagging_scrgb(")
-        .expect("admitted upgrade must use shared configure recovery");
-    assert!(
-        probe < select_f16 && select_f16 < configure,
-        "probe must precede f16 selection, which must precede shared configure+tag"
-    );
-
-    // The branch that separates `UpgradeSucceeds` from `UpgradeFails`: re-reading
-    // the surface after configure+tag decides whether the upgrade publishes
-    // extended-linear capture metadata. Without the guard a failed scRGB tag
-    // publishes linear capture over an SDR swapchain, violating
-    // `CaptureMatchesSurfaceEncoding`.
-    assert_eq!(
-        reconcile.matches("if surf.is_hdr() {").count(),
-        2,
-        "reconciliation branches on the live surface twice: revalidate an f16 surface, \
-         and publish an upgrade only if configure+tag actually left one"
-    );
-    let publish_guard = reconcile
-        .rfind("if surf.is_hdr() {")
-        .expect("the upgrade's publication must be guarded on the resulting surface");
-    let publish = reconcile
-        .find("win.apply_hdr_surface_upgrade();")
-        .expect("a confirmed upgrade must publish the new capture encoding");
-    assert_eq!(
-        reconcile
-            .matches("win.apply_hdr_surface_upgrade();")
-            .count(),
-        1,
-        "exactly one publication boundary for the SDR->HDR upgrade"
-    );
-    assert!(
-        configure < publish_guard && publish_guard < publish,
-        "the upgrade must configure+tag, then re-read the surface, and publish metadata \
-         only inside that guard"
-    );
-
-    let present = source
-        .split_once("    fn present_input_with_crop(")
-        .expect("present_input_with_crop must remain present")
-        .1
-        .split_once("    fn present_to_view(")
-        .expect("present_to_view must follow present_input_with_crop")
-        .0;
-    assert_eq!(
-        present
-            .matches("self.configure_surface_retagging_scrgb(")
-            .count(),
-        2,
-        "live alpha changes and Outdated/Lost recovery must share HDR recovery"
-    );
-    assert_eq!(
-        present
-            .matches("self.reconcile_live_hdr_state_if_due(win, surf);")
-            .count(),
-        1,
-        "present must reconcile same-size system HDR changes before acquisition"
-    );
-    assert!(
-        !present.contains("surf.surface.configure("),
-        "present recovery paths must not configure the surface directly"
-    );
-
-    let runtime = source
-        .split_once("#[cfg(test)]\nmod tests {")
-        .map_or(source, |(runtime, _)| runtime);
-    assert_eq!(
-        runtime.matches("surf.surface.configure(").count(),
-        2,
-        "no live-surface configure may escape the shared transaction"
-    );
-}
-
 /// A tiny glow-bearing frame: an all-background grid with a row of premultiplied
 /// additive glow quads (the glow_parity construction), cursor hidden so the
 /// pixels are exactly bg + aurora.
+#[cfg(wgpu_arm)]
 fn glow_input(cpu_cell: (usize, usize), rows: usize, cols: usize) -> RenderInput {
     let (cw, ch) = cpu_cell;
     let mut t = Terminal::new(rows as u16, cols as u16);
@@ -539,6 +127,7 @@ fn glow_input(cpu_cell: (usize, usize), rows: usize, cols: usize) -> RenderInput
     input
 }
 
+#[cfg(wgpu_arm)]
 fn gpu(px: f32) -> GpuRenderer {
     // The EDR gates drive the wgpu present stand-ins (the wgpu offscreen and
     // test-hdr destinations).
@@ -555,6 +144,7 @@ fn gpu(px: f32) -> GpuRenderer {
 /// `aterm_render::hdr::hdr_grid_encode` of the SDR readback byte within f16
 /// quantization.
 #[test]
+#[cfg(wgpu_arm)]
 fn gpu_hdr_blit_grid_clamped_and_linear() {
     let mut gpu = gpu(18.0);
     gpu.set_hdr_glow(true);
@@ -594,6 +184,7 @@ fn gpu_hdr_blit_grid_clamped_and_linear() {
 /// pixels equal `scrgb_present_channel(sdr byte, 3.0)` and band pixels the same
 /// encode of the theme background.
 #[test]
+#[cfg(wgpu_arm)]
 fn gpu_hdr_blit_bands_take_the_reference_white_scale() {
     let mut gpu = gpu(18.0);
     gpu.set_hdr_glow(true);
@@ -667,6 +258,7 @@ fn gpu_hdr_blit_bands_take_the_reference_white_scale() {
 /// the sanitized EDR max and the aurora emits above 1.0. On an SDR panel
 /// (`edr_max = 1.0`) the output equals the pass-less present.
 #[test]
+#[cfg(wgpu_arm)]
 fn gpu_hdr_aurora_bounded_by_edr_and_nonvacuous() {
     let mut gpu = gpu(18.0);
     gpu.set_hdr_glow(true);
@@ -712,6 +304,7 @@ fn gpu_hdr_aurora_bounded_by_edr_and_nonvacuous() {
 /// SDR invariance at present: with `hdr_glow` off the plan keeps the aurora
 /// pass off even when asked and glow exists; no channel exceeds 1.0.
 #[test]
+#[cfg(wgpu_arm)]
 fn gpu_hdr_off_never_boosts() {
     let mut gpu = gpu(18.0);
     gpu.set_hdr_glow(false);
@@ -728,46 +321,13 @@ fn gpu_hdr_off_never_boosts() {
     }
 }
 
-/// Every live-surface reconfigure goes through
-/// `GpuRenderer::configure_surface_retagging_scrgb`. DX12 rebuilds the swapchain
-/// on every `Surface::configure` (a resize, and the composite-alpha /
-/// copyable-usage reconcile when `swapchain_usage_for` flips for a `video`
-/// capture), and each rebuild reverts to the DXGI gamma-2.2 default, so a bare
-/// configure drops the scRGB tag and washes out an f16 present. Windows-only, so
-/// pinned structurally.
-#[test]
-fn every_surface_reconfigure_retags_scrgb() {
-    const RENDERER: &str = include_str!("../src/renderer.rs");
-
-    let bare = RENDERER
-        .match_indices("surf.surface.configure(")
-        .filter(|(i, _)| {
-            // The one legitimate occurrence is the helper's own body; identify it
-            // by the retag that must immediately follow within the same function.
-            let tail = &RENDERER[*i..];
-            let window = &tail[..tail.len().min(400)];
-            !window.contains("tag_swapchain_scrgb")
-        })
-        .count();
-
-    assert_eq!(
-        bare, 0,
-        "found {bare} bare `surf.surface.configure(..)` call(s) in renderer.rs that do not \
-         re-tag scRGB; route them through `configure_surface_retagging_scrgb` instead"
-    );
-
-    assert!(
-        RENDERER.contains("fn configure_surface_retagging_scrgb"),
-        "the retag helper must exist for this closure to mean anything"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // The HDR crown's per-fragment white boost
 // ---------------------------------------------------------------------------
 
 /// One rainbow-kitty palette mark as the crown sees it: the premultiplied
 /// colour and its composited coverage.
+#[cfg(wgpu_arm)]
 struct Mark {
     name: &'static str,
     rgb: u32,
@@ -778,6 +338,7 @@ struct Mark {
 
 /// The palette: five white cores and the coloured company they must not drag
 /// over reference white with them.
+#[cfg(wgpu_arm)]
 const PALETTE: &[Mark] = &[
     // The meteor's head and the landing pin.
     Mark {
@@ -873,6 +434,7 @@ const PALETTE: &[Mark] = &[
 /// CPU twin of `HDR_GLOW_SHADER::white_part` and the boost,
 /// `1 + 2*smoothstep(0.35, 0.60, min(r, g, b))` capped at 3x. Exactly 1.0 below
 /// the knee.
+#[cfg(wgpu_arm)]
 fn white_boost(premul: [f32; 3]) -> f32 {
     let w = premul[0].min(premul[1]).min(premul[2]);
     let t = ((w - 0.35) / (0.60 - 0.35)).clamp(0.0, 1.0);
@@ -880,6 +442,7 @@ fn white_boost(premul: [f32; 3]) -> f32 {
 }
 
 /// The premultiplied channels one [`Mark`] hands the crown.
+#[cfg(wgpu_arm)]
 fn mark_channels(m: &Mark) -> [f32; 3] {
     let p = premul_rgb(m.rgb, m.cov);
     [
@@ -891,6 +454,7 @@ fn mark_channels(m: &Mark) -> [f32; 3] {
 
 /// A frame carrying the whole [`PALETTE`], one cell-sized quad per mark, laid
 /// left to right from (row 1, col 1). Returns the frame and each mark's cell.
+#[cfg(wgpu_arm)]
 fn palette_input(
     cpu_cell: (usize, usize),
     rows: usize,
@@ -932,6 +496,7 @@ fn palette_input(
 ///   * the pixels over reference white are exactly the predicted ones, none
 ///     within 3 % of the boundary.
 #[test]
+#[cfg(wgpu_arm)]
 fn only_the_whitest_cores_exceed_reference_white() {
     let mut gpu = gpu(18.0);
     gpu.set_hdr_glow(true);
@@ -1050,236 +615,43 @@ fn only_the_whitest_cores_exceed_reference_white() {
     );
 }
 
-/// An SDR panel is byte-identical: at `edr_max = 1.0` the pass is skipped and
-/// the present equals the pass-less one over the whole palette. (The SDR crown
-/// on a non-f16 swapchain is the separate `fs_sdr_glow`.)
-#[test]
-fn an_sdr_panel_is_byte_identical() {
-    let mut gpu = gpu(18.0);
-    gpu.set_hdr_glow(true);
-    let mut win = WindowGpu::new();
-    let (cw, ch) = gpu.cell_size();
-    let (input, cells) = palette_input((cw, ch), 6, 9);
-
-    win.set_edr_max(1.0);
-    assert_eq!(hdr::additive_headroom(1.0), 0.0);
-    let (boosted, w, _) = gpu.present_hdr_for_test(&mut win, &input, true);
-    let (plain, _, _) = gpu.present_hdr_for_test(&mut win, &input, false);
-    assert_eq!(
-        boosted, plain,
-        "zero headroom must leave the whitened crown a provable no-op"
-    );
-    for &v in &boosted {
-        assert!(v <= 1.0, "an SDR panel must stay at reference white ({v})");
-    }
-
-    // Non-vacuity: the same frame on a panel with headroom boosts only the
-    // white part.
-    win.set_edr_max(4.0);
-    let (edr_plain, _, _) = gpu.present_hdr_for_test(&mut win, &input, false);
-    let (edr_lit, _, _) = gpu.present_hdr_for_test(&mut win, &input, true);
-    let factor = |i: usize| {
-        let (row, col) = cells[i];
-        let b = ((row * ch + ch / 2) * w as usize + (col * cw + cw / 2)) * 4;
-        let c = mark_channels(&PALETTE[i]);
-        let lin = hdr::srgb_channel_to_linear(c[0]);
-        (edr_lit[b] - edr_plain[b]) / lin
-    };
-    let core = PALETTE
-        .iter()
-        .position(|m| m.name == "field star core m1")
-        .expect("core");
-    let bar = PALETTE
-        .iter()
-        .position(|m| m.name == "star bar / m3 body")
-        .expect("bar");
-    println!(
-        "edr 4.0x: white core factor {:.3}, coloured bar factor {:.3}",
-        factor(core),
-        factor(bar)
-    );
-    assert!(
-        factor(core) > 2.0,
-        "the m1 core must climb on a panel with headroom (factor {})",
-        factor(core)
-    );
-    assert!(
-        (factor(bar) - 1.0).abs() <= 1e-2,
-        "a coloured mark must stay at reference emission (factor {})",
-        factor(bar)
-    );
-}
-
-/// The macOS Metal attach consults the screen: the f16 pick is the proven gate
-/// narrowed by `NSScreen.maximumPotentialExtendedDynamicRangeColorComponentValue`,
-/// so a window on an SDR-only screen gets the 8-bit swapchain and its SDR crown,
-/// not an f16 one that draws no crown at ~2x the blit's GPU time and drawable
-/// memory. The screen gate only narrows, so the Tier-1 chain stays complete; the
-/// source scan pins that the attach resolves the screen off the parent layer's
-/// handle before the pick (and before `target` is moved).
-#[test]
-fn metal_attach_pick_is_the_proven_gate_narrowed_by_the_screen() {
-    for (hdr_glow, supports_f16, _) in all_inputs() {
-        for potential in [None, Some(1.0), Some(2.0), Some(16.0), Some(f32::NAN)] {
-            let on_screen = hdr_swapchain_wants_f16_on_screen(hdr_glow, supports_f16, potential);
-            assert!(
-                !on_screen || hdr_swapchain_wants_f16(hdr_glow, supports_f16),
-                "({hdr_glow},{supports_f16},{potential:?}): the screen gate must only narrow"
-            );
-            let plan = hdr_present_plan(hdr_glow, on_screen, true);
-            assert_eq!(
-                plan.blit_linear_encode, on_screen,
-                "the encode follows the surface"
-            );
-        }
-    }
-    // The load-bearing narrowing, once: an SDR screen (potential 1.0) takes the
-    // 8-bit pick away from the fully opted-in, f16-capable corner.
-    assert!(hdr_swapchain_wants_f16(true, true));
-    assert!(!hdr_swapchain_wants_f16_on_screen(true, true, Some(1.0)));
-
-    let attach = include_str!("../src/renderer.rs")
-        .split_once("    pub fn create_window_surface<W: WindowTarget>(")
-        .expect("create_window_surface must remain present")
-        .1
-        .split_once("    fn create_window_surface_wgpu<W: WindowTarget>(")
-        .expect("the wgpu attach must follow the Metal attach")
-        .0;
-    let resolve = attach
-        .find("crate::metal::present::screen_edr_potential_of(&target)")
-        .expect("the Metal attach must resolve the screen's EDR potential off the target");
-    let pick = attach
-        .find("crate::format_plan::hdr_swapchain_wants_f16_on_screen(")
-        .expect("the Metal attach must pick the format through the screen gate");
-    assert!(
-        resolve < pick,
-        "the screen must be resolved before the pick (and before `target` is moved)"
-    );
-}
-
 /// The live half of the screen gate: a window that attached 8-bit on a non-EDR
 /// screen is re-picked by `GpuRenderer::upgrade_surface_for_screen` (from the
-/// frontend's monitor-change hook and throttled headroom re-query). Its decision,
-/// `hdr_screen_upgrade_wants_f16`, implies the attach gate for every input and
-/// acts only on a resolved screen. The source scan pins the upgrade's order: the
-/// proven gate before any AppKit read, the screen read with the attach's reader,
-/// the retained format moved, the live layer flipped through the present's own
-/// reconcile before capture metadata is promoted (so the scRGB tag never lands on
-/// an 8-bit layer), the held format read back rather than trusting `Ok`, and the
-/// retained format reverted when the flip is refused or deferred.
+/// frontend's monitor-change hook and throttled headroom re-query). The re-pick
+/// decides through `hdr_screen_upgrade_decision`, which reads the screen only
+/// past the cheap gates: an f16 surface or a gate-refused window never pays the
+/// AppKit read the throttled re-query would make for every 8-bit window. Over
+/// every input it equals `hdr_screen_upgrade_wants_f16`, whose implication of
+/// the attach gate and need of a resolved screen are `format_plan`'s unit tests.
 #[test]
 fn metal_monitor_change_upgrade_is_the_attach_gate_on_positive_evidence() {
     for (hdr_glow, supports_f16, _) in all_inputs() {
         for swapchain_is_f16 in [false, true] {
             for potential in [None, Some(1.0), Some(2.0), Some(16.0), Some(f32::NAN)] {
-                let upgrade = hdr_screen_upgrade_wants_f16(
-                    hdr_glow,
-                    supports_f16,
-                    swapchain_is_f16,
-                    potential,
-                );
-                assert!(
-                    !upgrade
-                        || hdr_swapchain_wants_f16_on_screen(hdr_glow, supports_f16, potential),
-                    "({hdr_glow},{supports_f16},{swapchain_is_f16},{potential:?}): \
-                     the upgrade must sit inside the attach gate"
-                );
-                assert!(
-                    !upgrade || hdr_swapchain_wants_f16(hdr_glow, supports_f16),
-                    "({hdr_glow},{supports_f16},{swapchain_is_f16},{potential:?}): \
-                     the upgrade must sit inside the proven gate"
-                );
-                assert!(
-                    !upgrade || potential.is_some(),
-                    "({hdr_glow},{supports_f16},{swapchain_is_f16}): an unresolved screen \
-                     is not evidence"
-                );
-                // After an upgrade the per-frame plan follows the new surface.
-                let now_f16 = swapchain_is_f16 || upgrade;
-                let plan = hdr_present_plan(hdr_glow, now_f16, true);
+                let mut read = false;
+                let decided =
+                    hdr_screen_upgrade_decision(hdr_glow, supports_f16, swapchain_is_f16, || {
+                        read = true;
+                        potential
+                    });
                 assert_eq!(
-                    plan.blit_linear_encode, now_f16,
-                    "the encode follows the surface"
+                    decided,
+                    hdr_screen_upgrade_wants_f16(
+                        hdr_glow,
+                        supports_f16,
+                        swapchain_is_f16,
+                        potential
+                    ),
+                    "({hdr_glow},{supports_f16},{swapchain_is_f16},{potential:?})"
+                );
+                let cheap_refusal =
+                    swapchain_is_f16 || !hdr_swapchain_wants_f16(hdr_glow, supports_f16);
+                assert_eq!(
+                    read, !cheap_refusal,
+                    "({hdr_glow},{supports_f16},{swapchain_is_f16}): the screen is read \
+                     exactly when the cheap gates pass"
                 );
             }
         }
     }
-    // The load-bearing widening, once: an EDR screen (potential 2.0) lights an
-    // opted-in 8-bit window; the same window on no resolvable screen stays.
-    assert!(hdr_screen_upgrade_wants_f16(true, true, false, Some(2.0)));
-    assert!(!hdr_screen_upgrade_wants_f16(true, true, false, None));
-
-    let src = include_str!("../src/renderer.rs");
-    let body = src
-        .split_once("    pub fn upgrade_surface_for_screen<W: WindowTarget>(")
-        .expect("the live re-pick must remain present")
-        .1
-        .split_once("\n    }\n")
-        .expect("the live re-pick must close")
-        .0;
-    let resolve = body
-        .find("crate::metal::present::screen_edr_potential_of(target)")
-        .expect("the re-pick must resolve the screen with the attach's reader");
-    let gate = body
-        .find("crate::format_plan::hdr_screen_upgrade_wants_f16(")
-        .expect("the re-pick must decide through the pure upgrade gate");
-    assert!(
-        resolve < gate,
-        "the screen must be resolved before the decision"
-    );
-    let cheap = body
-        .find("hdr_swapchain_wants_f16(self.hdr_glow, surf.supports_f16)")
-        .expect("the re-pick must consult the proven gate before any AppKit read");
-    assert!(
-        cheap < resolve,
-        "the proven gate must short-circuit before the screen is read: the throttled \
-         re-query calls this for every 8-bit GPU window"
-    );
-    let moved = body
-        .find("surf.neutral.format = crate::device_layer::TexelFormat::Rgba16Float")
-        .expect("the re-pick must move the retained format the Metal present's reconcile reads");
-    let derived = body
-        .find("self.metal_present_want(win, surf)")
-        .expect("the re-pick must derive `want` through the present's own derivation");
-    let flip = body
-        .find("ms.reconcile(&device, &want)")
-        .expect("the re-pick must flip the LIVE layer through the present's reconcile");
-    let promote = body
-        .find("win.apply_hdr_surface_upgrade()")
-        .expect("the capture metadata must be promoted with the format");
-    assert!(
-        gate < moved && moved < derived && derived < flip && flip < promote,
-        "gate, then the retained format moves, then `want` derives off it, then the \
-         layer flips, and only then is the capture metadata promoted"
-    );
-    let revert = body
-        .find("surf.neutral.format = previous")
-        .expect("a refused flip must revert the retained format to what the layer holds");
-    assert!(
-        flip < revert && revert < promote,
-        "the revert sits between the flip and the promotion"
-    );
-    // `Ok` from reconcile is not a flip: with a drawable acquisition in flight on
-    // the surface's worker it only records the desire. The held format decides,
-    // and a layer still holding 8-bit takes the revert.
-    let held = body
-        .find("ms.config().format == want.format")
-        .expect("the re-pick must read the format the layer holds, not trust `Ok`");
-    assert!(
-        flip < held && held < revert,
-        "the held-format check follows the reconcile and precedes the revert it feeds"
-    );
-    // The present derives its `want` through the same helper, so the flip the
-    // re-pick performs is the one the next present would otherwise perform.
-    let present = src
-        .split_once("    fn metal_present_input_with_crop(")
-        .expect("the armed present must remain present")
-        .1
-        .split_once("\n    }\n")
-        .expect("the armed present must close")
-        .0;
-    assert!(
-        present.contains("self.metal_present_want(win, surf)"),
-        "the armed present must derive its `want` through the shared helper"
-    );
 }

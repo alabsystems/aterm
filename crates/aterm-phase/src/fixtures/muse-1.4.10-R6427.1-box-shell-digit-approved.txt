@@ -1,0 +1,45 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab) · the third shell box (`touch probe-c.txt`) answered with the digit `1`: run at once, the turn ended on the stub's answer · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+  Structured user input answered — Color: None of the above (note: the policy text goes here); Size: Large
+
+◆ Tool call done. Result: {"status":"answered","answers":[{"id":"color","free_text":"None of the above","note":"the policy text goes
+  here"},{"id":"size","selected_label":"Large"}]}
+
+◆ Worked for 1m 36s · 6:15 PM · 16/Oct
+
+❯ toolstart
+
+  Structured user input answered — Checks: Lint (Recommended)
+
+◆ Tool call done. Result: {"status":"answered","answers":[{"id":"checks","selected_labels":["Lint (Recommended)"]}]}
+
+❯ toolstart
+
+  Structured user input answered — Color: None of the above (note: Decide yourself: choose the option that best serves long term correctness.)
+
+◆ Tool call done. Result: {"status":"answered","answers":[{"id":"color","free_text":"None of the above","note":"Decide yourself: choose the
+  option that best serves long term correctness."}]}
+
+❯ toolstart
+
+  Questions 0/1 answered (interrupted)
+  Which color should the probe use? (unanswered)
+  interrupted with 1 unanswered
+
+◆ Interrupted · Report issues with /feedback
+
+❯ toolstart
+
+◆ Ran touch probe-a.txt — denied
+  └ approval aborted
+    The user rejected this action. Don't retry it unless they ask.
+
+◆ Ran 2 commands · Create the third probe · Create the second probe · 18s · ctrl+o
+
+◆ Tool call done. Result: { "chunk_id": "exec-2-1", "exit_code": 0, "terminal_status": "completed", "output": "", "original_output_bytes": 0,
+  "original_output_tokens": 0, "truncated": false }
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  lab-stub · high · /private/tmp/at.lab0/proj · Auto-review

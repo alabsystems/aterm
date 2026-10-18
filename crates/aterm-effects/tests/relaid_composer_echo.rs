@@ -9,11 +9,14 @@
 //! agent list under it grew a row) and the composer text rewritten there.
 //!
 //! When the frame train stalls across the relayout, one tick sees the keys before, on and after
-//! it as one caret move, `(r, 21) → (r − 1, 25)`. The move judge
-//! (`CursorGlow::judge_observed_caret`) takes the typed re-anchor arm and lays only the landing;
-//! the follow pass (`Engine::follow_rows`) carries the band up a row, and its `lay_crossed_echo`
-//! re-reads the buffered row-crossing echo as the same-row advance it is in the text's frame and
-//! lays that sweep on the new row.
+//! it as one caret move, `(r, 21) → (r − 1, 25)`. Read against the old row, the move judge
+//! (`CursorGlow::judge_observed_caret`) would take the typed re-anchor arm and lay only the
+//! landing. The hand riding its line (`CursorGlow::lift_hand_row`, `rk::Engine::lift_hand`) lays
+//! the middle key: with a key in flight, a caret shown a row away first asks whether the hand's
+//! own line was repainted there with it, and the move is judged as the same-row advance
+//! `21 → 25` it is in the text's frame, while the follow pass carries the band up with the hand.
+//! With the seam's lift switched off the stalled takes go red; the per-key and keyless takes stay
+//! green.
 //!
 //! Each take feeds an `aterm_core` [`Terminal`], samples rows as `app_render.rs`'s frame hold
 //! does and ticks [`CursorGlow`] every 16.7 ms with the app's per-key stamp
@@ -109,7 +112,6 @@ fn cfg() -> GlowConfig {
         ring: true,
         beam: false,
         head_dx: 0.5,
-        pack: None,
     }
 }
 
@@ -510,7 +512,7 @@ fn assert_whole_from(h: &Host, label: &str, what: &str, forgotten_before: u64) {
 
 /// Every frame ticks: the key before, the relayout and the keys after are each
 /// observed on their own (a one-cell diagonal hop, licensed as the rider's
-/// typed advance). A guard: whole with and without `lay_crossed_echo`.
+/// typed advance). A guard: whole with and without the seam's lift.
 fn take(delivery: Delivery) {
     let mut h = Host::new();
     h.type_str(BEFORE);
@@ -526,13 +528,10 @@ fn take(delivery: Delivery) {
     );
 }
 
+/// The relayout delivered whole, and read in 1024-byte pieces.
 #[test]
 fn a_key_whose_echo_rides_a_relayout_a_row_up_is_laid_under_its_glyph() {
     take(Delivery::Whole);
-}
-
-#[test]
-fn a_key_whose_echo_rides_a_relayout_read_in_1024_byte_pieces_is_laid_under_its_glyph() {
     take(Delivery::Reads);
 }
 
@@ -565,7 +564,7 @@ fn stalled_take(before: usize, after: usize) {
 /// Every stall width around the relayout, from the rider alone to three keys
 /// either side: each must lay every glyph typed. `(1, 2)` is the recorded map:
 /// the `h` before, the relayout with the `e`, and `ck` after, seen by one tick
-/// as `(r, 21) → (r − 1, 25)`; red without `lay_crossed_echo`.
+/// as `(r, 21) → (r − 1, 25)`; red without the seam's lift.
 #[test]
 fn every_stall_width_around_the_relayout_lays_every_key() {
     for before in 0..=3 {

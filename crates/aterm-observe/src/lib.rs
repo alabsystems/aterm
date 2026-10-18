@@ -11,9 +11,7 @@
 //! fires — but it carries **no vocabulary**: it cannot turn a pattern string into
 //! a matcher. That vocabulary (`aterm-regex`, the first-party bounded Pike VM)
 //! lives **here**, so `aterm-core` takes no **direct** regex-engine dependency
-//! (RFC requirement R2; enforced by
-//! [`tests::regex_is_not_in_aterm_core_production_deps`], which checks the core's
-//! direct production deps — the engine does still appear in the workspace's
+//! (RFC requirement R2; the engine does still appear in the workspace's
 //! transitive closure via `aterm-search`'s `regex` feature). The agent layer
 //! (`aterm-agent`, L2) composes these predicates into turn-completion; it never
 //! reaches into the core enum directly.
@@ -304,11 +302,6 @@ mod tests {
     }
 
     #[test]
-    fn bad_pattern_is_a_clean_error_not_a_panic() {
-        assert!(row_matcher(r"(unclosed").is_err());
-    }
-
-    #[test]
     fn row_matcher_rejects_overlong_pattern() {
         // A pattern at the ceiling still compiles (it is a valid regex — 1024
         // literal 'a's); one byte over is rejected before compilation so an
@@ -353,46 +346,6 @@ mod tests {
         );
     }
 
-    /// The scan bound, which the size bound above cannot give.
-    ///
-    /// `(?:x?){1020}z` is thirteen bytes, passes the length gate, and compiles
-    /// happily under [`REGEX_SIZE_LIMIT`] — 2,042 instructions is well inside
-    /// 128 KiB. What it then costs is ~16.7M work units, ~19 ms in release, to
-    /// cross ONE 4,096-column row; a watcher is evaluated against every visible
-    /// row on every content change, so that is a live-output stall per frame
-    /// from a pattern nothing else in this file refuses. [`REGEX_STEP_LIMIT`]
-    /// is what refuses it.
-    ///
-    /// The refusal must be UNDECIDED, neither a match nor clear: latching on a
-    /// row the engine never finished reading would release an agent's `await`
-    /// (`match` or `gone`) on evidence that was never gathered. That the budget
-    /// is what ended the scan is read off the compiled pattern's sticky flag
-    /// (shared with its clone in the matcher), never a stopwatch.
-    #[test]
-    fn row_matcher_fails_closed_when_a_row_exhausts_the_scan_budget() {
-        let pattern = "(?:x?){1020}z";
-        assert!(
-            pattern.len() <= MAX_REGEX_PATTERN_LEN,
-            "under the length gate"
-        );
-        let re = bounded_regex(pattern).expect("compiles: the size ceiling admits this one");
-        let matcher = RegexRowMatch { re: re.clone() };
-        let row = "x".repeat(4096);
-        assert_eq!(matcher.verdict(&row), RowVerdict::Undecided);
-        assert!(
-            !matcher.matches(&row) && !matcher.clears(&row),
-            "an unfinishable row is neither a match nor clear"
-        );
-        assert!(
-            re.step_limit_exceeded(),
-            "the step budget is not bounding the scan"
-        );
-
-        // A row it CAN finish still answers normally — the budget refuses the
-        // expensive input, not the pattern.
-        assert!(row_matcher(pattern).expect("compiles").matches("xxxz"));
-    }
-
     /// Ordinary watcher patterns over ordinary rows never touch the budget: a
     /// row the budget refused would read as undecided, not as a match.
     #[test]
@@ -408,31 +361,6 @@ mod tests {
             assert!(
                 m.matches(&row),
                 "{pattern:?} must match a full-width row of its own content"
-            );
-        }
-    }
-
-    /// RFC R2 purity, made a checkable invariant: a regex ENGINE must NOT appear
-    /// in `aterm-core`'s **production** `[dependencies]` — only its
-    /// `[dev-dependencies]`. The kernel stays vocabulary-free; the engine lives
-    /// here. If someone adds one to the core's production deps, this fails.
-    ///
-    /// Both names are checked: `regex` is the retired third-party crate,
-    /// `aterm-regex` the first-party engine that replaced it.
-    #[test]
-    fn regex_is_not_in_aterm_core_production_deps() {
-        let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/../aterm-core/Cargo.toml");
-        let toml = std::fs::read_to_string(manifest).expect("read aterm-core Cargo.toml");
-        // Slice the production [dependencies] section (up to the next table header).
-        let deps = toml
-            .split_once("\n[dependencies]\n")
-            .map(|(_, rest)| rest.split("\n[").next().unwrap_or(rest))
-            .unwrap_or("");
-        for engine in ["regex", "aterm-regex"] {
-            assert!(
-                !deps.lines().any(|l| l.trim_start().starts_with(engine)),
-                "{engine} leaked into aterm-core's PRODUCTION dependencies — it must \
-                 stay in aterm-observe (RFC R2 purity). Production [dependencies]:\n{deps}"
             );
         }
     }

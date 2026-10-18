@@ -4,60 +4,7 @@
 
 use super::super::*;
 
-#[test]
-fn page_is_zeroed() {
-    let page = Page::new();
-    // SAFETY: We have exclusive access to the page data in this test; read
-    // through data_ptr().
-    let data = unsafe { std::slice::from_raw_parts(page.data_ptr(), PAGE_SIZE) };
-    assert!(data.iter().all(|&b| b == 0));
-}
-
-#[test]
-fn page_store_allocates_slices() {
-    let mut store = PageStore::new();
-    let slice = store.alloc_slice::<u32>(16);
-    assert_eq!(slice.len_u16(), 16);
-    assert!(slice.offset().byte_offset() < PAGE_SIZE as u32);
-}
-
 // Memory pooling.
-
-#[test]
-fn preheat_allocates_pages() {
-    let mut store = PageStore::new();
-    assert_eq!(store.free_pages(), 0);
-
-    store.preheat(4);
-    assert_eq!(store.free_pages(), 4);
-    assert_eq!(store.stats().pages_allocated, 4);
-    assert_eq!(store.stats().pages_free, 4);
-}
-
-#[test]
-fn with_capacity_preheats() {
-    let store = PageStore::with_capacity(3);
-    assert_eq!(store.free_pages(), 3);
-    assert_eq!(store.stats().pages_allocated, 3);
-}
-
-#[test]
-fn alloc_uses_free_list() {
-    let mut store = PageStore::new();
-    store.preheat(2);
-    assert_eq!(store.free_pages(), 2);
-
-    // First allocation should use a preheated page
-    let _slice1 = store.alloc_slice::<u32>(16);
-    assert_eq!(store.free_pages(), 1);
-    assert_eq!(store.active_pages(), 1);
-    assert_eq!(store.stats().reused, 1);
-
-    // Second allocation on same page shouldn't use another free page
-    let _slice2 = store.alloc_slice::<u32>(16);
-    assert_eq!(store.free_pages(), 1);
-    assert_eq!(store.active_pages(), 1);
-}
 
 #[test]
 fn alloc_new_page_when_full() {

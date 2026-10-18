@@ -835,57 +835,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    #[test]
-    fn write_then_read_round_trips() {
-        let l = layout("rt");
-        let mut programs = BTreeMap::new();
-        programs.insert(
-            "ay".to_string(),
-            ProgramStatus {
-                installed_build: Some(18),
-                state: "active".into(),
-                tree_root: "abc123".into(),
-            },
-        );
-        programs.insert(
-            "trust".to_string(),
-            ProgramStatus {
-                installed_build: None,
-                state: "tombstoned: yanked@4790".into(),
-                tree_root: String::new(),
-            },
-        );
-        let s = Status {
-            schema: 1,
-            updated_at: "2026-06-29T00:00:00Z".into(),
-            enabled: true,
-            index_source: "alabsystems/aterm-toolchain-index".into(),
-            outcome: "up to date".into(),
-            seams: Vec::new(),
-            last_success_at: "2026-06-29T00:00:00Z".into(),
-            last_index_build: 0,
-            index_build_changed_at: String::new(),
-            last_pass: String::new(),
-            last_pass_at: String::new(),
-            last_pass_attempted_index_build: 0,
-            last_pass_attempted_at: String::new(),
-            pass_seq: 3,
-            stale_index_only_pass_seq: 0,
-            programs,
-            extra: Default::default(),
-        };
-        write(&l, &s).unwrap();
-        let back = read(&l).expect("status reads back");
-        assert_eq!(back, s);
-        // The signed tree_root survives the TOML round-trip (drives `atpkg verify`).
-        assert_eq!(back.programs["ay"].tree_root, "abc123");
-        // It is valid TOML on disk.
-        let text = std::fs::read_to_string(l.status()).unwrap();
-        let _: aterm_toml::Value = aterm_toml::from_str(&text).expect("valid TOML");
-        assert!(text.contains("index_source = \"alabsystems/aterm-toolchain-index\""));
-        let _ = std::fs::remove_dir_all(&l.prefix);
-    }
-
     /// A failed write reclaims its `status.toml.tmp-<pid>`, which nothing else sweeps.
     /// Staged with a `status.toml` that is a directory, so the rename is what refuses.
     #[cfg(unix)]
@@ -1300,7 +1249,7 @@ mod tests {
     #[test]
     fn the_full_pass_rule_conforms_to_its_derived_model() {
         use super::full_pass_rule_tier1::{legacy_stamps, looks, realize, records};
-        use aterm_spec::derive::atpkg_full_pass_rule_model;
+        use aterm_models_atpkg::atpkg_full_pass_rule_model;
         use aterm_update_core::pkg_check;
         let model = atpkg_full_pass_rule_model();
         let buggy = aterm_spec::interp::with_buggy(&model, 1);

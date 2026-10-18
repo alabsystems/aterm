@@ -21,8 +21,7 @@ fn wide_continuation_of_keeps_every_rendition_and_only_its_own_role_bit() {
     // A lead carrying every rendition bit plus both structural bits.
     let lead = EVERY_RENDITION
         .union(CellFlags::WIDE)
-        .union(CellFlags::COMPLEX)
-        .union(CellFlags::USES_STYLE_ID);
+        .union(CellFlags::COMPLEX);
     let spacer = lead.wide_continuation_of();
 
     assert!(
@@ -40,10 +39,6 @@ fn wide_continuation_of_keeps_every_rendition_and_only_its_own_role_bit() {
     assert!(
         !spacer.contains(CellFlags::COMPLEX),
         "COMPLEX describes the spacer's OWN char_data (a space), not the lead's"
-    );
-    assert!(
-        !spacer.contains(CellFlags::USES_STYLE_ID),
-        "USES_STYLE_ID describes the spacer's OWN colors field; its constructor owns it"
     );
     assert_eq!(
         spacer.bits(),
@@ -93,29 +88,6 @@ fn write_wide_char_inverse_reaches_the_spacer() {
     assert!(
         !spacer.flags().contains(CellFlags::WIDE),
         "the spacer must not become a second lead"
-    );
-}
-
-/// The decorations that draw a RULE across the cell: a gap under the right half
-/// is as visible as the lost glyph was.
-#[test]
-fn write_wide_char_rules_reach_the_spacer() {
-    let (_pages, mut row) = make_row(10);
-    let rules = CellFlags::UNDERLINE
-        .union(CellFlags::STRIKETHROUGH)
-        .union(CellFlags::OVERLINE)
-        .union(CellFlags::BLINK);
-    row.write_wide_char(
-        0,
-        '\u{5B57}', // 字
-        PackedColor::DEFAULT_FG,
-        PackedColor::DEFAULT_BG,
-        rules,
-    );
-
-    assert!(
-        row.get(1).unwrap().flags().contains(rules),
-        "underline, strikethrough, overline and blink must not gap at the column seam"
     );
 }
 

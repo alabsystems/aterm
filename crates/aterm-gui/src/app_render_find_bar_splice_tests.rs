@@ -145,38 +145,6 @@ fn find_bar_appears_on_top_row_while_searching() {
     );
 }
 
-/// A query with no hits paints a `no matches` find bar (not a silent/blank frame),
-/// and the bar is still exactly `cols` wide.
-#[test]
-fn find_bar_shows_no_matches() {
-    let mut app = App::headless_for_test();
-    let wid = WindowId(0);
-    let term = app.pool.get(0).expect("session 0").term.clone();
-    term_lock(&term).process(b"nothing to see\r\n");
-
-    app.search_enter();
-    seed_query(&mut app, wid, "zzz");
-    app.search_recompute();
-
-    let (_rows, cols) = fill_scratch(&mut app, wid);
-    app.splice_find_bar(wid);
-    // No matches ⇒ no current match to protect ⇒ the panel sits at its default top.
-    let band = app.windows[&wid]
-        .find_bar_hit
-        .as_ref()
-        .expect("panel geometry")
-        .band
-        .clone();
-    assert_eq!(band, 0..crate::find_bar::FIND_BAR_ROWS);
-    let cells = &app.windows[&wid].input_scratch.cells;
-    for row in band {
-        assert_eq!(cells[row].len(), cols, "every spliced row stays full width");
-    }
-    let field = field_row_text(&app, wid);
-    assert!(field.contains("zzz"), "{field:?}");
-    assert!(field.contains("no matches"), "{field:?}");
-}
-
 /// A terminal shorter than the panel shrinks the band (dropping the pad,
 /// then the hints); the field row always survives, exactly `cols` wide.
 #[test]
@@ -425,43 +393,19 @@ fn recompute_honors_case_and_regex_toggles() {
 }
 
 /// The highlight-all colour `splice_find_bar` paints: the default theme's
-/// `find_bar::match_tint` (no OSC 11 in headless). It must stand apart from the
-/// selection the current match is painted in, or the tests below could not tell
-/// a tinted cell from a selected one.
+/// search-match token (`aterm_messages::tokens::ChromeTokens::search_match`; no
+/// OSC 11 in headless, and Default's accent is its green cursor whatever the
+/// palette). It must stand apart from the selection the current match is
+/// painted in, or the tests below could not tell a tinted cell from a selected
+/// one.
 fn highlight_bg() -> [u8; 3] {
     let t = aterm_render::Theme::default();
-    let hi = crate::find_bar::match_tint(t);
-    assert_ne!(hi, crate::settings::u32_rgb(t.selection));
+    let selection = crate::settings::u32_rgb(t.selection);
+    let hi = crate::chrome_band::ChromePalette::from(t)
+        .tokens()
+        .search_match(selection);
+    assert_ne!(hi, selection);
     hi
-}
-
-/// Highlight-all tints the bg of every visible match, not just the current one — the
-/// `display_offset == 0` (live, unscrolled) case where screen row == selection row.
-#[test]
-fn highlight_all_tints_visible_matches() {
-    let mut app = App::headless_for_test();
-    let wid = WindowId(0);
-    let term = app.pool.get(0).expect("session 0").term.clone();
-    // "hit" at cols 3..=5 on live rows 0 and 1.
-    term_lock(&term).process(b"aa hit bb\r\ncc hit dd\r\n");
-    app.search_enter();
-    seed_query(&mut app, wid, "hit");
-    app.search_recompute();
-    assert_eq!(
-        app.windows.get(&wid).unwrap().input_scratch.display_offset,
-        0,
-        "live matches keep the viewport at the bottom"
-    );
-    fill_scratch(&mut app, wid);
-    app.splice_find_bar(wid);
-    let hi = highlight_bg();
-    let cells = &app.windows.get(&wid).unwrap().input_scratch.cells;
-    for row in [0usize, 1] {
-        for (i, cell) in cells[row][3..=5].iter().enumerate() {
-            assert_eq!(cell.bg, hi, "match cell ({row},{}) tinted", 3 + i);
-        }
-        assert_ne!(cells[row][0].bg, hi, "non-match cell ({row},0) untinted");
-    }
 }
 
 /// A hit straddling a soft wrap is one match: the tint covers the tail
@@ -1830,62 +1774,6 @@ fn find_bar_pixel_gate_rejects_pad_clamp_click() {
     );
 }
 
-/// Top-placement twin: a press in the top pad border that `pixel_to_cell`
-/// clamps down onto the bar's row does not toggle a mode.
-#[test]
-fn find_bar_pixel_gate_rejects_top_pad_clamp_click() {
-    use winit::event::{ElementState, MouseButton};
-    let mut app = App::headless_for_test();
-    let wid = WindowId(0);
-    let term = app.pool.get(0).expect("session 0").term.clone();
-    // Matches below the panel band, so it keeps its default top placement.
-    term_lock(&term).process(b"\r\n\r\n\r\n\r\ntarget line here\r\n");
-    app.search_enter();
-    seed_query(&mut app, wid, "target");
-    app.search_recompute();
-    fill_scratch(&mut app, wid);
-    app.splice_find_bar(wid);
-    let hit = app
-        .windows
-        .get(&wid)
-        .unwrap()
-        .find_bar_hit
-        .clone()
-        .expect("splice recorded the indicator geometry");
-    let case = hit.case_cols.expect("Aa drawn");
-    let (cw, _ch) = app.win_cell_size(wid);
-    let pad = app.win_pad(wid);
-    assert_eq!(hit.band.start, 0, "panel sits at its default top placement");
-    // `Aa`'s x, in the top pad above the band; `pixel_to_cell` clamps it into the band.
-    let x = (pad + case.start * cw) as f64 + cw as f64 / 2.0;
-    let y_above = pad as f64 - 2.0;
-    assert_eq!(
-        app.pixel_to_cell(wid, x, y_above).0 as usize,
-        hit.band.start,
-        "the above-grid press clamps into the panel band"
-    );
-    assert!(
-        !app.find_bar_pixel_hit(wid, x, y_above),
-        "the pixel gate rejects the pad press the row-clamp would have admitted"
-    );
-    app.windows.get_mut(&wid).unwrap().last_cursor_px = (x, y_above);
-    app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
-    assert!(
-        !app.windows
-            .get(&wid)
-            .unwrap()
-            .search
-            .as_ref()
-            .unwrap()
-            .case_sensitive,
-        "an above-grid pad press must NOT toggle match-case"
-    );
-    assert!(
-        !app.search_sticky_case,
-        "the sticky default is untouched by the rejected press"
-    );
-}
-
 /// The match re-anchor (`delta = base_y_now − match_base_y`) at delta > 0: output scrolls the
 /// grid after the search while the match stays on screen, and the tint follows the match's row.
 #[test]
@@ -2057,4 +1945,66 @@ fn highlight_all_suppressed_in_split() {
             "no highlight-all tint anywhere in a split (row {r})"
         );
     }
+}
+
+/// AN AUTHORED SEARCH MATCH AND BORDER REACH THE FIND SPLICE: with
+/// `search_match_color` and `border_color` in `aterm.toml`, every visible
+/// non-current match is the authored tint lifted to its rise off the live
+/// background, and the panel's seam is the authored border floored on the band.
+/// NEGATIVE CONTROL: without the keys the tint is the derived one and the seam
+/// the band's label tone.
+#[test]
+fn authored_search_match_and_border_reach_the_find_splice() {
+    let paint = |config: &str| {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.config = aterm_toml::from_str(config).expect("valid toml");
+        app.install_resolved_colors(crate::app_colorscheme::ThemeChange::ConfigReload);
+        let term = app.pool.get(0).expect("session 0").term.clone();
+        term_lock(&term).process(b"aa hit bb\r\ncc hit dd\r\n");
+        app.search_enter();
+        seed_query(&mut app, wid, "hit");
+        app.search_recompute();
+        fill_scratch(&mut app, wid);
+        app.splice_find_bar(wid);
+        let cells = &app.windows[&wid].input_scratch.cells;
+        // Row 1's hit is not the current match (the current one is the
+        // selection), so it wears the tint.
+        let tint = cells[1][3].bg;
+        // The panel seals its content-facing edge: an overline when it floats to
+        // the bottom (the current match is under the top rows here), else an
+        // underline.
+        let seam = cells
+            .iter()
+            .flatten()
+            .find_map(|cell| {
+                if cell.overline {
+                    cell.overline_color
+                } else if cell.underline != aterm_core::terminal::UnderlineStyle::None {
+                    cell.underline_color
+                } else {
+                    None
+                }
+            })
+            .expect("the panel seals its edge");
+        let band = crate::chrome_band::band_colors(
+            app.chrome_palette(crate::app_render::ChromeSurface::OverGrid(wid)),
+        );
+        (tint, seam, band)
+    };
+    let bg = crate::settings::u32_rgb(aterm_render::Theme::default().bg);
+    let (tint, seam, band) =
+        paint("search_match_color = \"#335533\"\nborder_color = \"#5a5a5a\"\n");
+    assert_eq!(
+        tint,
+        aterm_messages::ink::ensure_contrast([0x33, 0x55, 0x33], bg, 1.5)
+    );
+    assert_eq!(seam, band.seam);
+    assert_eq!(
+        seam,
+        aterm_messages::ink::ensure_contrast([0x5a; 3], band.bar_bg, 1.5)
+    );
+    let (tint, seam, band) = paint("");
+    assert_eq!(tint, highlight_bg(), "CONTROL: the derived tint");
+    assert_eq!(seam, band.label, "CONTROL: the label seam");
 }

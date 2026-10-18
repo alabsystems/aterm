@@ -51,25 +51,6 @@ fn a_carry_continues_every_split_exactly() {
     }
 }
 
-/// The byte-by-byte path (`advance`) carries the same way.
-#[test]
-fn a_carry_from_the_byte_path_continues_too() {
-    let mut whole = RecordingSink::default();
-    Parser::new().advance(STREAM, &mut whole);
-    for split in 0..=STREAM.len() {
-        let (head, tail) = STREAM.split_at(split);
-        let mut sink = RecordingSink::default();
-        let mut outgoing = Parser::new();
-        outgoing.advance(head, &mut sink);
-        let mut successor = Parser::new();
-        successor
-            .restore_carry(&outgoing.carry().expect("carried"))
-            .expect("restores");
-        successor.advance(tail, &mut sink);
-        assert_eq!(format!("{sink:?}"), format!("{whole:?}"), "split {split}");
-    }
-}
-
 #[test]
 fn a_ground_parser_carries_nothing_but_a_split_glyph() {
     let mut parser = Parser::new();
@@ -210,14 +191,78 @@ fn a_hooked_dcs_carried_unhooking_is_swallowed_to_its_terminator() {
     assert_eq!(Some(ground.carry_unhooking()), ground.carry());
 }
 
+/// A hooked DCS at the ESC that may begin its ST still holds its string: the
+/// next byte decides whether it ends complete (`\`) or broken off (anything
+/// else), and only the handler holds what it collected. So `carry` holds none,
+/// as inside the payload, and `carry_unhooking` carries the ESC alone: the
+/// successor reads the next byte as the ESC's, which is what follows the string
+/// either way, and the string itself, which it never hooked, ends with nothing.
+#[test]
+fn a_dcs_at_the_escape_that_may_begin_its_st_is_still_hooked() {
+    for c1 in [false, true] {
+        for head in [&b"\x1bP$qm\x1b"[..], b"\x1bPq#0~\x1b", b"\x1bPtmux;\x1b"] {
+            let mut outgoing = parser_c1(c1);
+            let mut sink = RecordingSink::default();
+            outgoing.advance_fast(head, &mut sink);
+            assert_eq!(
+                (sink.dcs_unhooks, sink.dcs_cancels),
+                (0, 0),
+                "c1={c1} {head:?}: the string has not ended yet"
+            );
+            assert_eq!(outgoing.state(), State::Escape);
+            assert!(outgoing.in_hooked_dcs(), "c1={c1} {head:?}");
+            assert_eq!(
+                outgoing.carry(),
+                None,
+                "c1={c1} {head:?}: `carry` holds none"
+            );
+            let carry = outgoing.carry_unhooking();
+            assert_eq!(
+                carry,
+                ParserCarry {
+                    state: State::Escape,
+                    ..ParserCarry::default()
+                },
+                "c1={c1} {head:?}: the ESC alone"
+            );
+            for tail in [&b"\\after"[..], b"[1mafter", b"]2;t\x07after", b"\x18after"] {
+                let mut successor = parser_c1(c1);
+                successor.restore_carry(&carry).expect("restores");
+                let mut successor_sink = RecordingSink::default();
+                successor.advance_fast(tail, &mut successor_sink);
+                let mut live = outgoing.clone();
+                let mut live_sink = RecordingSink::default();
+                live.advance_fast(tail, &mut live_sink);
+                assert_eq!(
+                    outside_the_hook(&successor_sink),
+                    outside_the_hook(&live_sink),
+                    "c1={c1} {head:?} then {tail:?}: the same screen after it"
+                );
+                assert_eq!(
+                    (live_sink.dcs_unhooks, live_sink.dcs_cancels),
+                    if tail.starts_with(b"\\") {
+                        (1, 0)
+                    } else {
+                        (0, 1)
+                    },
+                    "c1={c1} {head:?} then {tail:?}: the live string ends at ST, or is canceled"
+                );
+                assert_eq!(
+                    (successor_sink.dcs_unhooks, successor_sink.dcs_cancels),
+                    (0, 0)
+                );
+            }
+        }
+    }
+}
+
 /// THE HOOKED STRING'S CARRY READS EVERY BYTE AS THE HOOKED STRING DOES
 /// ([`HOOKED_STRING_CARRY`]). The table, entry by entry: for every byte the
 /// carried state stays in itself exactly where `DcsPassthrough` stays in
 /// itself, and where either leaves, both go to the same state by the same
 /// action. Then the parsers: a hooked live parser and a successor restored
 /// from its `carry_unhooking`, fed every one- and two-byte tail (65,792 of
-/// them), with C1 controls off and on, through both the byte path and the
-/// fast path, agree on everything outside the hook and end in corresponding
+/// them), with C1 controls off and on, agree on everything outside the hook and end in corresponding
 /// states — and, once out of the string, in the same one.
 #[test]
 fn the_hooked_string_carry_reads_every_byte_as_the_hooked_string() {
@@ -244,42 +289,40 @@ fn the_hooked_string_carry_reads_every_byte_as_the_hooked_string() {
     }
     for c1 in [false, true] {
         let mut hooked = parser_c1(c1);
-        hooked.advance(b"\x1bP1000p%", &mut RecordingSink::default());
+        hooked.advance_fast(b"\x1bP1000p%", &mut RecordingSink::default());
         assert_eq!(hooked.state(), State::DcsPassthrough);
         let mut restored = parser_c1(c1);
         restored
             .restore_carry(&hooked.carry_unhooking())
             .expect("restores");
-        for fast in [false, true] {
-            for tail in &tails {
-                let (mut live, mut successor) = (hooked.clone(), restored.clone());
-                let (mut live_sink, mut successor_sink) =
-                    (RecordingSink::default(), RecordingSink::default());
-                if fast {
-                    live.advance_fast(tail, &mut live_sink);
-                    successor.advance_fast(tail, &mut successor_sink);
-                } else {
-                    live.advance(tail, &mut live_sink);
-                    successor.advance(tail, &mut successor_sink);
-                }
+        for tail in &tails {
+            let (mut live, mut successor) = (hooked.clone(), restored.clone());
+            let (mut live_sink, mut successor_sink) =
+                (RecordingSink::default(), RecordingSink::default());
+            live.advance_fast(tail, &mut live_sink);
+            successor.advance_fast(tail, &mut successor_sink);
+            assert_eq!(
+                outside_the_hook(&successor_sink),
+                outside_the_hook(&live_sink),
+                "c1={c1} tail={tail:02x?}"
+            );
+            if live.state() == State::DcsPassthrough {
                 assert_eq!(
-                    outside_the_hook(&successor_sink),
-                    outside_the_hook(&live_sink),
-                    "c1={c1} fast={fast} tail={tail:02x?}"
+                    successor.state(),
+                    HOOKED_STRING_CARRY,
+                    "c1={c1} tail={tail:02x?}: still in the string"
                 );
-                if live.state() == State::DcsPassthrough {
-                    assert_eq!(
-                        successor.state(),
-                        HOOKED_STRING_CARRY,
-                        "c1={c1} fast={fast} tail={tail:02x?}: still in the string"
-                    );
-                } else {
-                    assert_eq!(
-                        (successor.state(), successor.carry()),
-                        (live.state(), live.carry()),
-                        "c1={c1} fast={fast} tail={tail:02x?}: out of it alike"
-                    );
-                }
+            } else {
+                // Out of it alike, the live parser's ESC that may begin its ST
+                // included: that one still holds the string, which its own
+                // unhooking carry leaves behind, as the successor's string
+                // state did.
+                assert_eq!(
+                    (successor.state(), Some(successor.carry_unhooking())),
+                    (live.state(), Some(live.carry_unhooking())),
+                    "c1={c1} tail={tail:02x?}: out of it alike"
+                );
+                assert_eq!(successor.carry(), Some(successor.carry_unhooking()));
             }
         }
     }
@@ -996,9 +1039,7 @@ fn restore_carry_installs_only_safe_carries_whoever_wrote_them() {
 /// keeps subparameter bits below the parameters, holds a UTF-8 tail only at
 /// `Ground` and still incomplete, and a string's UTF-8 head only in a
 /// string — and the invariant still holds after every possible next byte.
-/// The next byte goes through the fast path, the successor's, and through the
-/// byte path too unless a UTF-8 tail is pending: the byte path collects no
-/// UTF-8, so only the fast path could have written or can finish one.
+/// The next byte goes through `advance_fast`, the successor's path.
 fn assert_restored_state_is_safe(parser: &Parser, at: &str) {
     parser.assert_invariants();
     assert_ne!(
@@ -1026,19 +1067,12 @@ fn assert_restored_state_is_safe(parser: &Parser, at: &str) {
         "{at}: a string's UTF-8 head outside a string"
     );
     for byte in 0..=u8::MAX {
-        let mut next = vec![parser.clone()];
-        next[0].advance_fast(&[byte], &mut NullSink);
-        if parser.utf8_len == 0 {
-            let mut slow = parser.clone();
-            slow.advance(&[byte], &mut NullSink);
-            next.push(slow);
-        }
-        for next in &next {
-            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| next.assert_invariants()))
-                .is_err()
-            {
-                panic!("{at}: the invariant broke at the next byte {byte:#04x}");
-            }
+        let mut next = parser.clone();
+        next.advance_fast(&[byte], &mut NullSink);
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| next.assert_invariants()))
+            .is_err()
+        {
+            panic!("{at}: the invariant broke at the next byte {byte:#04x}");
         }
     }
 }
@@ -1143,7 +1177,7 @@ fn a_string_carry_continues_a_split_utf8_character() {
 /// parameters and intermediates, and the successor reads EVERY tail as the
 /// live parser does: from a header in each state, every one- and two-byte
 /// tail (65,792 of them) and the longer ones the finding measured, C1 off and
-/// on, through the byte path and the fast path, end in the same sink — the
+/// on, end in the same sink — the
 /// hook, its parameters and the payload included — and the same parser.
 #[test]
 fn a_dcs_header_carry_reads_every_tail_as_the_live_parser() {
@@ -1171,41 +1205,35 @@ fn a_dcs_header_carry_reads_every_tail_as_the_live_parser() {
         tails.push(tail.to_vec());
     }
     for c1 in [false, true] {
-        for fast in [false, true] {
-            let feed = |parser: &mut Parser, bytes: &[u8], sink: &mut RecordingSink| {
-                if fast {
-                    parser.advance_fast(bytes, sink);
-                } else {
-                    parser.advance(bytes, sink);
-                }
-            };
-            for (head, state) in heads {
-                let at = format!("c1={c1} fast={fast} {:?}", String::from_utf8_lossy(head));
-                let mut live = parser_c1(c1);
-                feed(&mut live, head, &mut RecordingSink::default());
-                assert_eq!(live.state(), state, "{at}");
-                let carry = live.carry().expect("a header is carried");
-                assert_eq!(carry.state, state, "{at}: carried as itself");
-                assert!(!live.carry_swallows_sequence(), "{at}: nothing is lost");
-                let mut successor = parser_c1(c1);
-                successor.restore_carry(&carry).expect("restores");
-                assert_eq!(successor.carry(), Some(carry), "{at}: a fixed point");
-                for tail in &tails {
-                    let (mut live, mut carried) = (live.clone(), successor.clone());
-                    let (mut live_sink, mut carried_sink) =
-                        (RecordingSink::default(), RecordingSink::default());
-                    feed(&mut live, tail, &mut live_sink);
-                    feed(&mut carried, tail, &mut carried_sink);
-                    if carried_sink != live_sink
-                        || carried.state() != live.state()
-                        || carried.carry() != live.carry()
-                    {
-                        panic!(
-                            "{at} tail={tail:02x?}\n  live:    {live_sink:?} {:?}\n  carried: {carried_sink:?} {:?}",
-                            live.state(),
-                            carried.state()
-                        );
-                    }
+        let feed = |parser: &mut Parser, bytes: &[u8], sink: &mut RecordingSink| {
+            parser.advance_fast(bytes, sink);
+        };
+        for (head, state) in heads {
+            let at = format!("c1={c1} {:?}", String::from_utf8_lossy(head));
+            let mut live = parser_c1(c1);
+            feed(&mut live, head, &mut RecordingSink::default());
+            assert_eq!(live.state(), state, "{at}");
+            let carry = live.carry().expect("a header is carried");
+            assert_eq!(carry.state, state, "{at}: carried as itself");
+            assert!(!live.carry_swallows_sequence(), "{at}: nothing is lost");
+            let mut successor = parser_c1(c1);
+            successor.restore_carry(&carry).expect("restores");
+            assert_eq!(successor.carry(), Some(carry), "{at}: a fixed point");
+            for tail in &tails {
+                let (mut live, mut carried) = (live.clone(), successor.clone());
+                let (mut live_sink, mut carried_sink) =
+                    (RecordingSink::default(), RecordingSink::default());
+                feed(&mut live, tail, &mut live_sink);
+                feed(&mut carried, tail, &mut carried_sink);
+                if carried_sink != live_sink
+                    || carried.state() != live.state()
+                    || carried.carry() != live.carry()
+                {
+                    panic!(
+                        "{at} tail={tail:02x?}\n  live:    {live_sink:?} {:?}\n  carried: {carried_sink:?} {:?}",
+                        live.state(),
+                        carried.state()
+                    );
                 }
             }
         }
@@ -1217,55 +1245,46 @@ fn a_dcs_header_carry_reads_every_tail_as_the_live_parser() {
 /// header holding GR bytes and an ignored one. Split at every byte, the
 /// prefix to one parser, its carry to a fresh one and the rest to that: the
 /// sink is the sink of one parser fed the whole stream, C1 controls off and
-/// on, byte path and fast path. A split inside a hooked string has no carry
-/// (`a_hooked_dcs_is_not_carried`) and is skipped; one inside every header
-/// state is met.
+/// on. A split inside a hooked string, or at the ESC that may begin its ST,
+/// has no carry (`a_hooked_dcs_is_not_carried`) and is skipped; one inside
+/// every header state is met.
 #[test]
 fn every_split_of_a_dcs_stream_continues_exactly() {
     const DCS_STREAM: &[u8] = b"a\x1bP0;1;0q#0;2;0;0;0#0!10~-\x1b\\b\x1bP$qm\x1b\\c\
 \x1bP+q544e\x9cd\x1bP>|x\x1b\\e\x1bP1\xc3\xa9;2$\xa0qm\x1b\\f\x1bP1:ignored\x1b\\g";
     for c1 in [false, true] {
-        for fast in [false, true] {
-            let feed = |parser: &mut Parser, bytes: &[u8], sink: &mut RecordingSink| {
-                if fast {
-                    parser.advance_fast(bytes, sink);
-                } else {
-                    parser.advance(bytes, sink);
-                }
+        let feed = |parser: &mut Parser, bytes: &[u8], sink: &mut RecordingSink| {
+            parser.advance_fast(bytes, sink);
+        };
+        let mut whole = RecordingSink::default();
+        feed(&mut parser_c1(c1), DCS_STREAM, &mut whole);
+        assert_eq!(whole.dcs_hooks.len(), 5, "c1={c1}: {whole:?}");
+        let mut met = Vec::new();
+        for split in 0..=DCS_STREAM.len() {
+            let (head, tail) = DCS_STREAM.split_at(split);
+            let mut sink = RecordingSink::default();
+            let mut outgoing = parser_c1(c1);
+            feed(&mut outgoing, head, &mut sink);
+            let Some(carry) = outgoing.carry() else {
+                assert!(outgoing.in_hooked_dcs(), "split {split}");
+                continue;
             };
-            let mut whole = RecordingSink::default();
-            feed(&mut parser_c1(c1), DCS_STREAM, &mut whole);
-            assert_eq!(whole.dcs_hooks.len(), 5, "c1={c1} fast={fast}: {whole:?}");
-            let mut met = Vec::new();
-            for split in 0..=DCS_STREAM.len() {
-                let (head, tail) = DCS_STREAM.split_at(split);
-                let mut sink = RecordingSink::default();
-                let mut outgoing = parser_c1(c1);
-                feed(&mut outgoing, head, &mut sink);
-                let Some(carry) = outgoing.carry() else {
-                    assert_eq!(outgoing.state(), State::DcsPassthrough);
-                    continue;
-                };
-                if !met.contains(&carry.state) {
-                    met.push(carry.state);
-                }
-                let mut successor = parser_c1(c1);
-                successor.restore_carry(&carry).expect("restores");
-                feed(&mut successor, tail, &mut sink);
-                assert_eq!(
-                    sink,
-                    whole,
-                    "c1={c1} fast={fast} split {split} ({:?} | {:?})",
-                    String::from_utf8_lossy(head),
-                    String::from_utf8_lossy(tail)
-                );
+            if !met.contains(&carry.state) {
+                met.push(carry.state);
             }
-            for state in [State::DcsEntry, State::DcsParam, State::DcsIntermediate] {
-                assert!(
-                    met.contains(&state),
-                    "c1={c1} fast={fast}: no split in {state:?}"
-                );
-            }
+            let mut successor = parser_c1(c1);
+            successor.restore_carry(&carry).expect("restores");
+            feed(&mut successor, tail, &mut sink);
+            assert_eq!(
+                sink,
+                whole,
+                "c1={c1} split {split} ({:?} | {:?})",
+                String::from_utf8_lossy(head),
+                String::from_utf8_lossy(tail)
+            );
+        }
+        for state in [State::DcsEntry, State::DcsParam, State::DcsIntermediate] {
+            assert!(met.contains(&state), "c1={c1}: no split in {state:?}");
         }
     }
 }

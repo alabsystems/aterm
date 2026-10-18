@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! The shipping `aterm_objc::WakeTimer`, on this thread's own run loop against real
-//! CoreFoundation, stepped beside `aterm_spec::derive::run_loop_waker_model`. Every projected
+//! CoreFoundation, stepped beside `aterm_models_core::run_loop_waker_model`. Every projected
 //! variable is read back from the plan and from `CFRunLoopTimerGetNextFireDate`, never from the
 //! harness's bookkeeping; `steps` is CoreFoundation's catch-up walk, measured as how many repeat
 //! intervals past the armed date it moved the next fire date. Two negative controls replay the
@@ -16,9 +16,10 @@ use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::time::{Duration, Instant};
 
+use aterm_models_core::run_loop_waker_model;
 use aterm_objc::wake_timer::{WAKE_TIMER_REPEAT_SECS, WakePlan, WakeTarget};
 use aterm_objc::{WakeArm, WakeTimer};
-use aterm_spec::derive::{Model, run_loop_waker_model};
+use aterm_spec::derive::Model;
 
 type State = BTreeMap<&'static str, i64>;
 

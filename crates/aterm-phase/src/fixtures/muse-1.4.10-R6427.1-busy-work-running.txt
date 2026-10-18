@@ -1,0 +1,51 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab) · that draft submitted in the stub's `slow` mode while the backgrounded shell runs: the status row over the composer, the work panel under its bottom rule · the lab's random project dir is spelled /private/tmp/at.lab0 here
+❯ toolstart
+
+◆ Fetched http://127.0.0.1:50581/lab-probe-guard — denied
+
+◆ Tool call done. Result: tool failed: web_fetch failed: network access denied
+
+❯ toolstart
+
+◆ Fetched http://127.0.0.1:50581/lab-probe-guard2 — denied
+
+◆ Tool call done. Result: tool failed: web_fetch failed: network access denied
+
+❯ toolstart
+
+◆ Fetched http://127.0.0.1:50581/lab-probe-a-rather-long-path-for-the-narrow-tab — denied
+
+◆ Tool call done. Result: tool failed: web_fetch failed: network access denied
+
+❯ toolstart
+
+  Structured user input answered — Color: Red (Recommended); Size: Small (Recommended)
+
+◆ Tool call done. Result: {"status":"answered","answers":[{"id":"color","selected_label":"Red
+  (Recommended)"},{"id":"size","selected_label":"Small (Recommended)"}]}
+
+❯ toolstart
+
+  Questions 0/1 answered (interrupted)
+  Which checks should the probe run? (unanswered)
+  interrupted with 1 unanswered
+
+◆ Interrupted · Report issues with /feedback
+
+❯ toolstart
+
+◆ Backgrounded · Wait in the background · 3.2s · ctrl+o
+
+◆ Tool call done. Result: { "chunk_id": "exec-3-1", "execution_state": "background_running", "session_id": 3, "work_id":
+  "work.v2.managed_bash.sha256.ee604ea74c24964fcafa5eedd1192c7eabb2dd521c8247e9879b11b1fb23c640", ~
+
+❯ carry on with the task
+
+◈ Calling tools (2s · esc to interrupt)
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+main · ↓ to select
+└ ◆ Wait in the background  running                                                                                                          33s
+  lab-stub · high · /private/tmp/at.lab0/proj · Auto-review

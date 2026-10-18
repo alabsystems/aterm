@@ -39,7 +39,7 @@ impl Grid {
     /// A history line by index (0 = oldest): the tiered store (oldest), then the
     /// lazy buffer, then the ring (newest). `Ok(None)` when out of bounds.
     ///
-    /// `&self` suffices: the disk tier's LRU cache and the deferred line's
+    /// `&self` suffices: the tiers' decode caches and the deferred line's
     /// `OnceCell` are interior-mutable.
     pub fn try_get_history_line(
         &self,
@@ -192,7 +192,6 @@ impl Grid {
         for _ in 0..n {
             self.storage.ring_extras.pop_front();
         }
-        self.storage.generations.evict_all();
         // The retained line set changed: re-clamp a scrolled-back viewport and
         // invalidate content-keyed caches (search index, cross-session polls).
         self.clamp_display_offset();
@@ -278,114 +277,6 @@ impl Grid {
     }
 }
 
-// Uses aterm-scrollback's disk-tier-gated DiskBackedScrollback APIs.
-#[cfg(all(test, feature = "disk-tier"))]
-mod tests {
-    use super::*;
-    use aterm_scrollback::{
-        DiskBackedScrollback, DiskBackedScrollbackConfig, Line, ScrollbackStorage,
-    };
-
-    /// Create a grid with corrupted disk-backed scrollback for error-path tests.
-    fn grid_with_corrupted_scrollback() -> (Grid, aterm_tempfile::TempDir) {
-        let temp_dir = aterm_tempfile::tempdir().expect("create temp dir");
-        let cold_path = temp_dir.path().join("scrollback.dtrm");
-        let config = DiskBackedScrollbackConfig::new(&cold_path)
-            .with_hot_limit(0)
-            .with_warm_limit(0)
-            .with_block_size(1);
-        let disk = DiskBackedScrollback::with_config(config).expect("create disk scrollback");
-        let mut storage: ScrollbackStorage = disk.into();
-
-        for i in 0..10 {
-            storage
-                .push_line(Line::from(format!("Line{i:02}").as_str()))
-                .expect("push line");
-        }
-
-        // Truncate the cold file to corrupt disk-backed pages.
-        #[cfg(unix)]
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&cold_path)
-            .and_then(|file| file.set_len(32))
-            .expect("truncate cold file");
-        // Windows refuses to shrink a mapped file (ERROR_USER_MAPPED_FILE), so
-        // overwrite every page byte past the 32-byte header instead.
-        #[cfg(windows)]
-        {
-            use std::io::{Seek, SeekFrom, Write};
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&cold_path)
-                .expect("open cold file");
-            let len = file.metadata().expect("stat cold file").len();
-            file.seek(SeekFrom::Start(32)).expect("seek past header");
-            file.write_all(&vec![
-                0xFF;
-                usize::try_from(len.saturating_sub(32)).unwrap()
-            ])
-            .expect("overwrite cold pages");
-        }
-
-        let mut grid = Grid::new(5, 80);
-        grid.attach_scrollback(storage);
-        (grid, temp_dir)
-    }
-
-    /// `try_get_history_line` propagates scrollback errors instead of masking
-    /// them as `None`.
-    #[test]
-    fn try_get_history_line_propagates_scrollback_error() {
-        let (grid, _temp_dir) = grid_with_corrupted_scrollback();
-        let result = grid.try_get_history_line(0);
-        assert!(
-            result.is_err(),
-            "corrupted cold-tier line should return Err, got: {result:?}"
-        );
-    }
-
-    /// The compatibility wrapper `get_history_line` returns `None` (not panic)
-    /// for corrupted scrollback.
-    #[test]
-    fn get_history_line_returns_none_on_error() {
-        let (grid, _temp_dir) = grid_with_corrupted_scrollback();
-        let result = grid.get_history_line(0);
-        assert!(
-            result.is_none(),
-            "compatibility wrapper should return None for corrupted line"
-        );
-    }
-
-    /// `try_history_line_rev` propagates errors on the reverse-index path used
-    /// by scrollback rendering.
-    #[test]
-    fn try_history_line_rev_propagates_scrollback_error() {
-        let (grid, _temp_dir) = grid_with_corrupted_scrollback();
-        // The oldest line, in the corrupted cold tier.
-        let total = grid.scrollback_lines();
-        let result = grid.try_history_line_rev(total.saturating_sub(1));
-        assert!(
-            result.is_err(),
-            "reverse-index access to corrupted cold line should return Err, got: {result:?}"
-        );
-    }
-
-    /// `SearchContent::get_row_text` for Grid returns `None` rather than
-    /// panicking on corrupted scrollback.
-    #[test]
-    fn search_content_returns_none_on_corrupted_scrollback() {
-        use aterm_types::SearchContent;
-
-        let (mut grid, _temp_dir) = grid_with_corrupted_scrollback();
-        let result = grid.get_row_text(0);
-        assert!(
-            result.is_none(),
-            "SearchContent should return None for corrupted scrollback, not panic"
-        );
-    }
-}
-
 /// Dense forward walk over a grid's history ([`Grid::history_lines_from`]):
 /// one item per line from the start index to the newest, in order: tiered
 /// store, lazy buffer, ring.
@@ -445,3 +336,34 @@ impl<'a> Iterator for HistoryLines<'a> {
 }
 
 impl ExactSizeIterator for HistoryLines<'_> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aterm_scrollback::Scrollback;
+
+    /// A grid whose tiered history starts with a corrupt warm block (three
+    /// lines that fail to decompress) ahead of one readable hot line.
+    fn grid_with_corrupted_scrollback() -> Grid {
+        let mut sb = Scrollback::with_block_size(4, 12, 10_000_000, 4);
+        sb.push_str("Line00");
+        sb.inject_corrupted_warm_block(3);
+        let mut grid = Grid::new(5, 80);
+        grid.attach_scrollback(sb);
+        grid
+    }
+
+    /// A corrupted tier surfaces as an error on the fallible reads (by index
+    /// and by reverse index) and as `None`, never a panic, on the
+    /// compatibility wrapper.
+    #[test]
+    fn corrupted_scrollback_reads_fail_without_panicking() {
+        let grid = grid_with_corrupted_scrollback();
+        let result = grid.try_get_history_line(0);
+        assert!(result.is_err(), "try_get_history_line: {result:?}");
+        assert!(grid.get_history_line(0).is_none());
+        let total = grid.scrollback_lines();
+        let result = grid.try_history_line_rev(total.saturating_sub(1));
+        assert!(result.is_err(), "try_history_line_rev: {result:?}");
+    }
+}

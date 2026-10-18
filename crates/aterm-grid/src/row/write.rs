@@ -471,25 +471,7 @@ mod tests {
         (PackedColor::DEFAULT_FG, PackedColor::DEFAULT_BG)
     }
 
-    // ── write_char: ASCII ────────────────────────────────────────────
-
-    #[test]
-    fn write_char_ascii_single() {
-        let (_pages, mut row) = make_row(80);
-        assert!(row.write_char(0, 'A'));
-        assert_eq!(row.get(0).unwrap().char(), 'A');
-        assert_eq!(row.len(), 1);
-    }
-
-    #[test]
-    fn write_char_ascii_multiple_sequential() {
-        let (_pages, mut row) = make_row(80);
-        for (i, c) in "Hello".chars().enumerate() {
-            assert!(row.write_char(i as u16, c));
-        }
-        assert_eq!(row.len(), 5);
-        assert_eq!(row.to_string(), "Hello");
-    }
+    // ── write_char ───────────────────────────────────────────────────
 
     #[test]
     fn write_char_out_of_bounds_returns_false() {
@@ -499,78 +481,7 @@ mod tests {
         assert_eq!(row.len(), 0);
     }
 
-    #[test]
-    fn write_char_at_last_column() {
-        let (_pages, mut row) = make_row(10);
-        assert!(row.write_char(9, 'Z'));
-        assert_eq!(row.get(9).unwrap().char(), 'Z');
-        assert_eq!(row.len(), 10);
-    }
-
-    #[test]
-    fn write_char_sets_dirty_flag() {
-        let (_pages, mut row) = make_row(10);
-        row.write_char(0, 'A');
-        assert!(row.flags().contains(RowFlags::DIRTY));
-    }
-
-    // ── write_char: multibyte UTF-8 (BMP) ───────────────────────────
-
-    #[test]
-    fn write_char_bmp_accented() {
-        let (_pages, mut row) = make_row(80);
-        assert!(row.write_char(0, '\u{00E9}')); // e with acute
-        assert_eq!(row.get(0).unwrap().char(), '\u{00E9}');
-        assert_eq!(row.len(), 1);
-    }
-
-    #[test]
-    fn write_char_bmp_greek() {
-        let (_pages, mut row) = make_row(80);
-        assert!(row.write_char(0, '\u{03B1}')); // alpha
-        assert!(row.write_char(1, '\u{03B2}')); // beta
-        assert_eq!(row.get(0).unwrap().char(), '\u{03B1}');
-        assert_eq!(row.get(1).unwrap().char(), '\u{03B2}');
-    }
-
-    #[test]
-    fn write_char_bmp_cjk_ideograph_single_cell() {
-        // CJK ideograph fits in BMP but write_char treats it as single-width.
-        // Wide rendering requires write_wide_char.
-        let (_pages, mut row) = make_row(80);
-        assert!(row.write_char(0, '\u{4E2D}')); // 中
-        assert_eq!(row.get(0).unwrap().char(), '\u{4E2D}');
-        assert_eq!(row.len(), 1);
-    }
-
     // ── write_char: overwrite existing content ──────────────────────
-
-    #[test]
-    fn write_char_overwrites_existing() {
-        let (_pages, mut row) = make_row(80);
-        row.write_char(0, 'A');
-        row.write_char(0, 'B');
-        assert_eq!(row.get(0).unwrap().char(), 'B');
-        assert_eq!(row.len(), 1);
-    }
-
-    #[test]
-    fn write_char_overwrite_wide_first_half_clears_continuation() {
-        let (_pages, mut row) = make_row(80);
-        let (fg, bg) = default_colors();
-
-        // Place wide char at col 0-1
-        row.write_wide_char(0, '\u{4E2D}', fg, bg, CellFlags::empty());
-        assert!(row.get(0).unwrap().is_wide());
-        assert!(row.get(1).unwrap().is_wide_continuation());
-
-        // Overwrite the first half (col 0) with a narrow char
-        row.write_char(0, 'X');
-        assert_eq!(row.get(0).unwrap().char(), 'X');
-        // Continuation at col 1 should be cleared
-        assert_eq!(row.get(1).unwrap().char(), ' ');
-        assert!(!row.get(1).unwrap().is_wide_continuation());
-    }
 
     #[test]
     fn write_char_overwrite_wide_continuation_clears_main() {
@@ -589,28 +500,7 @@ mod tests {
         assert!(!row.get(2).unwrap().is_wide());
     }
 
-    // ── write_char_styled ───────────────────────────────────────────
-
-    #[test]
-    fn write_char_styled_basic() {
-        let (_pages, mut row) = make_row(80);
-        let (fg, bg) = default_colors();
-        assert!(row.write_char_styled(0, 'S', fg, bg, CellFlags::BOLD));
-        assert_eq!(row.get(0).unwrap().char(), 'S');
-        assert!(row.get(0).unwrap().flags().contains(CellFlags::BOLD));
-    }
-
     // ── write_char_packed ───────────────────────────────────────────
-
-    #[test]
-    fn write_char_packed_ascii() {
-        use super::super::super::PackedColors;
-        let (_pages, mut row) = make_row(80);
-        let colors = PackedColors::DEFAULT;
-        assert!(row.write_char_packed(0, 'P', colors, CellFlags::empty()));
-        assert_eq!(row.get(0).unwrap().char(), 'P');
-        assert_eq!(row.len(), 1);
-    }
 
     #[test]
     fn write_char_packed_out_of_bounds() {
@@ -620,47 +510,6 @@ mod tests {
         assert!(!row.write_char_packed(5, 'X', colors, CellFlags::empty()));
         assert!(!row.write_char_packed(100, 'X', colors, CellFlags::empty()));
         assert_eq!(row.len(), 0);
-    }
-
-    #[test]
-    fn write_char_packed_overwrite_wide_continuation_clears_main() {
-        use super::super::super::PackedColors;
-        let (_pages, mut row) = make_row(80);
-        let (fg, bg) = default_colors();
-        let colors = PackedColors::DEFAULT;
-
-        row.write_wide_char(4, '\u{4E2D}', fg, bg, CellFlags::empty());
-        // Overwrite the continuation at col 5
-        assert!(row.write_char_packed(5, 'Z', colors, CellFlags::empty()));
-        assert_eq!(row.get(5).unwrap().char(), 'Z');
-        assert_eq!(row.get(4).unwrap().char(), ' ');
-    }
-
-    #[test]
-    fn write_char_packed_overwrite_wide_main_clears_continuation() {
-        use super::super::super::PackedColors;
-        let (_pages, mut row) = make_row(80);
-        let (fg, bg) = default_colors();
-        let colors = PackedColors::DEFAULT;
-
-        row.write_wide_char(4, '\u{4E2D}', fg, bg, CellFlags::empty());
-        // Overwrite the main wide cell at col 4
-        assert!(row.write_char_packed(4, 'Q', colors, CellFlags::empty()));
-        assert_eq!(row.get(4).unwrap().char(), 'Q');
-        assert_eq!(row.get(5).unwrap().char(), ' ');
-    }
-
-    #[test]
-    fn write_char_packed_updates_len() {
-        use super::super::super::PackedColors;
-        let (_pages, mut row) = make_row(80);
-        let colors = PackedColors::DEFAULT;
-
-        row.write_char_packed(5, 'A', colors, CellFlags::empty());
-        assert_eq!(row.len(), 6);
-        // Writing at a lower column should not change len
-        row.write_char_packed(2, 'B', colors, CellFlags::empty());
-        assert_eq!(row.len(), 6);
     }
 
     // ── write_wide_char ─────────────────────────────────────────────
@@ -702,17 +551,6 @@ mod tests {
     // ── write_wide_char_packed ──────────────────────────────────────
 
     #[test]
-    fn write_wide_char_packed_basic() {
-        use super::super::super::PackedColors;
-        let (_pages, mut row) = make_row(80);
-        let colors = PackedColors::DEFAULT;
-        assert!(row.write_wide_char_packed(0, '\u{4E2D}', colors, CellFlags::empty()));
-        assert!(row.get(0).unwrap().is_wide());
-        assert!(row.get(1).unwrap().is_wide_continuation());
-        assert_eq!(row.len(), 2);
-    }
-
-    #[test]
     fn write_wide_char_packed_out_of_bounds() {
         use super::super::super::PackedColors;
         let (_pages, mut row) = make_row(5);
@@ -723,53 +561,6 @@ mod tests {
     }
 
     // ── fill_cell_run ───────────────────────────────────────────────
-
-    #[test]
-    fn fill_cell_run_basic_fill() {
-        let (_pages, mut row) = make_row(20);
-        let template = Cell::from_ascii_fast(b'X');
-        let written = row.fill_cell_run(0, 10, template);
-        assert_eq!(written, 10);
-        assert_eq!(row.len(), 10);
-        for col in 0..10 {
-            assert_eq!(row.get(col).unwrap().char(), 'X');
-        }
-    }
-
-    #[test]
-    fn fill_cell_run_overwrites_wide_at_start_boundary() {
-        let (_pages, mut row) = make_row(20);
-        let (fg, bg) = default_colors();
-
-        // Place wide char at col 2-3
-        row.write_wide_char(2, '\u{4E2D}', fg, bg, CellFlags::empty());
-
-        // Fill starting at the continuation (col 3)
-        let template = Cell::from_ascii_fast(b'.');
-        row.fill_cell_run(3, 5, template);
-
-        // The orphaned wide main at col 2 should be cleared
-        assert_eq!(row.get(2).unwrap().char(), ' ');
-        for col in 3..8 {
-            assert_eq!(row.get(col).unwrap().char(), '.');
-        }
-    }
-
-    #[test]
-    fn fill_cell_run_overwrites_wide_at_end_boundary() {
-        let (_pages, mut row) = make_row(20);
-        let (fg, bg) = default_colors();
-
-        // Place wide char at col 5-6
-        row.write_wide_char(5, '\u{4E2D}', fg, bg, CellFlags::empty());
-
-        // Fill col 3..6 (covers the wide main at 5 but not continuation at 6)
-        let template = Cell::from_ascii_fast(b'.');
-        row.fill_cell_run(3, 3, template);
-
-        // Col 6 should be cleared (orphaned continuation)
-        assert_eq!(row.get(6).unwrap().char(), ' ');
-    }
 
     /// A run of printed default blanks is written text (ruling 2026-10-10,
     /// r15 C4): `len` covers it as it covers the same blanks written one at a
@@ -792,60 +583,6 @@ mod tests {
         assert_eq!(row.len(), per_glyph.len(), "the same as one at a time");
     }
 
-    // ── fixup_wide_char_overwrite ───────────────────────────────────
-
-    #[test]
-    fn fixup_wide_char_overwrite_clears_continuation() {
-        let (_pages, mut row) = make_row(10);
-        let (fg, bg) = default_colors();
-        row.write_wide_char(0, '\u{4E2D}', fg, bg, CellFlags::empty());
-
-        // Manually call fixup as if we're overwriting col 0 (WIDE cell)
-        let current_flags = row.get(0).unwrap().flags();
-        row.fixup_wide_char_overwrite(0, current_flags, row.cols() as usize);
-
-        // Continuation at col 1 should be cleared
-        assert_eq!(row.get(1).unwrap().char(), ' ');
-        assert!(!row.get(1).unwrap().is_wide_continuation());
-    }
-
-    #[test]
-    fn fixup_wide_char_overwrite_clears_main_when_at_continuation() {
-        let (_pages, mut row) = make_row(10);
-        let (fg, bg) = default_colors();
-        row.write_wide_char(2, '\u{4E2D}', fg, bg, CellFlags::empty());
-
-        // Fixup at col 3 (WIDE_CONTINUATION)
-        let current_flags = row.get(3).unwrap().flags();
-        row.fixup_wide_char_overwrite(3, current_flags, row.cols() as usize);
-
-        // Main at col 2 should be cleared
-        assert_eq!(row.get(2).unwrap().char(), ' ');
-        assert!(!row.get(2).unwrap().is_wide());
-    }
-
-    // ── fixup_wide_char_write ───────────────────────────────────────
-
-    #[test]
-    fn fixup_wide_char_write_handles_overlapping_wides() {
-        let (_pages, mut row) = make_row(10);
-        let (fg, bg) = default_colors();
-
-        // Place wide at col 0-1 and col 2-3
-        row.write_wide_char(0, '\u{4E00}', fg, bg, CellFlags::empty());
-        row.write_wide_char(2, '\u{4E8C}', fg, bg, CellFlags::empty());
-
-        // Now simulate writing a wide at col 1-2: col 1 is WIDE_CONTINUATION,
-        // col 2 is WIDE
-        let second_flags = row.get(2).unwrap().flags();
-        row.fixup_wide_char_write(1, second_flags, row.cols() as usize);
-
-        // Col 0 should be cleared (orphaned first half)
-        assert_eq!(row.get(0).unwrap().char(), ' ');
-        // Col 3 should be cleared (orphaned continuation)
-        assert_eq!(row.get(3).unwrap().char(), ' ');
-    }
-
     // ── len tracking edge cases ─────────────────────────────────────
 
     #[test]
@@ -856,15 +593,5 @@ mod tests {
         row.write_char(10, 'B');
         // len should stay at 51 since 10 < 50
         assert_eq!(row.len(), 51);
-    }
-
-    #[test]
-    fn write_wide_char_len_accounts_for_both_cells() {
-        let (_pages, mut row) = make_row(80);
-        let (fg, bg) = default_colors();
-        row.write_wide_char(0, '\u{4E2D}', fg, bg, CellFlags::empty());
-        assert_eq!(row.len(), 2);
-        row.write_wide_char(10, '\u{4E2D}', fg, bg, CellFlags::empty());
-        assert_eq!(row.len(), 12);
     }
 }

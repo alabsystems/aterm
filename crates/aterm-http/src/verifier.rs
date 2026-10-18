@@ -247,8 +247,7 @@ fn invalid_certificate(reason: impl Into<String>) -> rustls::Error {
 /// Verifies server certificates against the operating system's trust store.
 ///
 /// Handshake-signature verification is not platform work — it is the crypto
-/// provider's — so those three methods delegate to `rustls` exactly as
-/// `crates/aterm-net/src/tls.rs:120` already does. Only
+/// provider's — so those three methods delegate to `rustls`. Only
 /// [`Self::verify_server_cert`] differs per platform.
 #[derive(Debug)]
 pub struct PlatformVerifier {
@@ -271,8 +270,7 @@ impl PlatformVerifier {
     ///
     /// `#[cfg(test)]` on purpose — see this module's header. Extra anchors ADD
     /// to the system set rather than replacing it, so chains a real system root
-    /// validates still validate. An operator-facing REPLACE-the-roots override
-    /// already exists and is a different thing: [`crate::Trust::Roots`].
+    /// validates still validate.
     #[cfg(test)]
     fn new_with_extra_roots(
         extra_roots: Vec<CertificateDer<'static>>,

@@ -283,11 +283,19 @@ struct Watch {
     /// The first tick that saw a non-empty queue with no accept since.
     stalled_since: Option<Instant>,
     last_rebind: Option<Instant>,
+    /// How long a beat may stand still, or a queue go unaccepted, before it
+    /// is a wedge: [`WEDGE_AFTER`] (a test's own pace, [`Pace`]).
+    wedge_after: Duration,
 }
 
 #[cfg(unix)]
 impl Watch {
+    #[cfg(test)]
     fn new(now: Instant) -> Self {
+        Self::paced(now, WEDGE_AFTER)
+    }
+
+    fn paced(now: Instant, wedge_after: Duration) -> Self {
         Self {
             last: Reading {
                 progress: 0,
@@ -298,6 +306,7 @@ impl Watch {
             unchanged_ticks: 0,
             stalled_since: None,
             last_rebind: None,
+            wedge_after,
         }
     }
 
@@ -321,7 +330,7 @@ impl Watch {
             return None;
         }
         let still = now.saturating_duration_since(self.progress_at);
-        if self.unchanged_ticks >= STUCK_TICKS && still >= WEDGE_AFTER {
+        if self.unchanged_ticks >= STUCK_TICKS && still >= self.wedge_after {
             return Some(Wedge::Stuck {
                 for_ms: still.as_millis(),
             });
@@ -329,7 +338,7 @@ impl Watch {
         let stalled = self
             .stalled_since
             .map(|since| now.saturating_duration_since(since))?;
-        (stalled >= WEDGE_AFTER).then(|| Wedge::Stalled {
+        (stalled >= self.wedge_after).then(|| Wedge::Stalled {
             queued: reading.pending.unwrap_or(0),
             for_ms: stalled.as_millis(),
         })
@@ -344,7 +353,7 @@ impl Watch {
     fn rebound(&mut self, now: Instant) {
         *self = Self {
             last_rebind: Some(now),
-            ..Self::new(now)
+            ..Self::paced(now, self.wedge_after)
         };
     }
 }
@@ -633,7 +642,9 @@ fn close_listening(fd: RawFd) -> bool {
 /// of them accepted, wherever each is held — a request or wait lane, the
 /// parker, a subscription, a relay — so no path that holds one keeps any
 /// bookkeeping for this. A retired generation's listening socket carries one
-/// of the names too; it refuses the shutdown (ENOTCONN) and is not counted.
+/// of the names too; Darwin refuses its shutdown (ENOTCONN) and it is not
+/// counted, while Linux shuts it (harmless: retiring closes every listener)
+/// and counts it.
 ///
 /// Each half is shut on its own ([`aterm_uds::hangup::hang_up`]). A client
 /// that half-closed after its request (`printf … | nc -U`, parked in a verb)
@@ -706,6 +717,24 @@ fn is_socket(fd: RawFd) -> bool {
     info.st_mode & libc::S_IFMT == libc::S_IFSOCK
 }
 
+/// The watchdog's pace: how long an idle accept thread parks between beats
+/// and how long a stand-still is before it is a wedge. [`Pace::PRODUCTION`]
+/// everywhere but a test that sets its own ([`Seams::pace`]).
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+struct Pace {
+    tick: Duration,
+    wedge_after: Duration,
+}
+
+#[cfg(unix)]
+impl Pace {
+    const PRODUCTION: Self = Self {
+        tick: TICK,
+        wedge_after: WEDGE_AFTER,
+    };
+}
+
 /// THE TEST SEAMS, shared with every generation's accept thread. Each holds a
 /// generation number (or `u64::MAX` for none) that the seam applies to.
 #[cfg(all(unix, test))]
@@ -730,6 +759,9 @@ struct Seams {
     /// connects before this names the thread can be served by it (measured
     /// 2026-09-28 under load: "replaced after 90µs", the socket never rebound).
     parked: Arc<AtomicU64>,
+    /// The watchdog's pace for this test ([`Pace::PRODUCTION`] unless the test
+    /// shortens it).
+    pace: Pace,
 }
 
 #[cfg(all(unix, test))]
@@ -834,9 +866,13 @@ impl<R: FnMut() -> Option<CtlListener> + Send + 'static> Supervisor<R> {
                 Err(accept) => return accept.run(),
             },
         };
-        let mut watch = Watch::new(Instant::now());
+        #[cfg(test)]
+        let pace = seams.as_ref().map_or(Pace::PRODUCTION, |s| s.pace);
+        #[cfg(not(test))]
+        let pace = Pace::PRODUCTION;
+        let mut watch = Watch::paced(Instant::now(), pace.wedge_after);
         while !stop() {
-            let handed = endpoint.tick(TICK);
+            let handed = endpoint.tick(pace.tick);
             let now = Instant::now();
             let reopened = handed.is_some();
             let fresh = match handed {
@@ -960,12 +996,12 @@ impl AcceptThread {
         // (a closure the builder never ran is dropped, not returned).
         let slot = Arc::new(std::sync::Mutex::new(Some(accept)));
         let started = slot.clone();
-        let spawned = std::thread::Builder::new()
-            .name(format!("aterm-control-accept-{generation}"))
-            .spawn(move || {
+        let spawned = crate::qos::spawn_lane_thread(
+            format!("aterm-control-accept-{generation}"),
+            crate::qos::Role::Responsive,
+            move || {
                 // Admission sits in front of every lane, and it holds locks the
                 // UI thread contends (see the listener thread's own floor).
-                crate::qos::set_self(crate::qos::Role::Responsive);
                 let accept = started
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -973,7 +1009,8 @@ impl AcceptThread {
                 if let Some(accept) = accept {
                     accept.run();
                 }
-            });
+            },
+        );
         match spawned {
             Ok(_) => Ok(beat),
             Err(error) => {
@@ -1018,13 +1055,18 @@ impl AcceptThread {
             self.beat.progress.fetch_add(1, Ordering::Release);
         };
         let mut stalled = false;
+        // How long an idle turn parks: [`TICK`], or a test's own pace.
+        #[cfg(test)]
+        let tick = self.seams.as_ref().map_or(TICK, |s| s.pace.tick);
+        #[cfg(not(test))]
+        let tick = TICK;
         // The accept-error streak's current pause (`control::accept_error_backoff`).
         let mut backoff = None;
         while !self.retired() {
             if stalled {
                 std::thread::sleep(STALL_PACE);
             } else {
-                wait_readable(&self.listener, TICK);
+                wait_readable(&self.listener, tick);
             }
             if self.retired() {
                 break;
@@ -1325,10 +1367,13 @@ mod tests {
         drop(clients);
     }
 
-    /// Run a supervisor on `path` in a thread: every accepted peer is answered
-    /// `OK served` and closed. Returns the stop flag, the seams (both naming no
-    /// generation yet) and the thread.
-    fn supervised(path: &std::path::Path) -> (Arc<AtomicBool>, Seams, std::thread::JoinHandle<()>) {
+    /// Run a supervisor on `path` in a thread at `pace`: every accepted peer is
+    /// answered `OK served` and closed. Returns the stop flag, the seams (both
+    /// naming no generation yet) and the thread.
+    fn supervised(
+        path: &std::path::Path,
+        pace: Pace,
+    ) -> (Arc<AtomicBool>, Seams, std::thread::JoinHandle<()>) {
         let listener = CtlListener::bind(path).expect("bind");
         let published = path.to_str().expect("utf8").to_string();
         let mut expected = socket_file_id(&published);
@@ -1343,6 +1388,7 @@ mod tests {
             withholding: Arc::new(AtomicU64::new(u64::MAX)),
             park: Arc::new(AtomicU64::new(u64::MAX)),
             parked: Arc::new(AtomicU64::new(u64::MAX)),
+            pace,
         };
         supervisor.seams = Some(seams.clone());
         let stop = Arc::new(AtomicBool::new(false));
@@ -1432,14 +1478,19 @@ mod tests {
     /// THE QUEUE STANDS STILL. The accept path stops consuming (the seam
     /// withholds every accept on generation 0) while clients keep connecting
     /// into the kernel queue. The watchdog must see the queue stand still,
-    /// rebind within a few seconds, and serve a NEW client on the fresh socket
-    /// at the SAME path. The healthy pre-wedge answer is the negative control:
-    /// the same client code is served before the wedge.
+    /// rebind, and serve a NEW client on the fresh socket at the SAME path.
+    /// The healthy pre-wedge answer is the negative control: the same client
+    /// code is served before the wedge. At a test's pace (a 50 ms tick, a
+    /// 300 ms wedge): the stuck thread below keeps the production one.
     #[test]
     fn a_stalled_listener_is_detected_and_rebound() {
         let dir = scratch();
         let path = dir.path().join("w.sock");
-        let (stop, seams, thread) = supervised(&path);
+        let pace = Pace {
+            tick: Duration::from_millis(50),
+            wedge_after: Duration::from_millis(300),
+        };
+        let (stop, seams, thread) = supervised(&path, pace);
         let rebinds_before = HEALTH.rebinds.load(Ordering::Relaxed);
 
         assert_eq!(
@@ -1488,7 +1539,7 @@ mod tests {
     fn a_listener_stuck_inside_accept_is_detected_and_rebound() {
         let dir = scratch();
         let path = dir.path().join("p.sock");
-        let (stop, seams, thread) = supervised(&path);
+        let (stop, seams, thread) = supervised(&path, Pace::PRODUCTION);
         let rebinds_before = HEALTH.rebinds.load(Ordering::Relaxed);
         assert_eq!(
             ask(&path, aterm_spec::wait::MUST_HAPPEN).expect("healthy ask"),

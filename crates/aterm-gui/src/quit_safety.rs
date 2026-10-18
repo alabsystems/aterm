@@ -1,61 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Quit-safety guard: a close/quit request while a foreground job is running is
-//! refused the first time (a mis-click or a stray Cmd-W/Cmd-Q must not kill an
-//! in-flight build or AI run) and confirmed by a second request inside a brief window.
-//! The decisions are pure; `App` wires the PTY (`tcgetpgrp` on the session master on
-//! unix; a creation-time-vetted walk of the shell's children on windows,
-//! [`ChildLinks::has_job`]), the shell's own word ([`shell_word`]), and the title and
-//! timer shims.
+//! M2 quit-safety guard (audit): a close/quit request while a foreground job is
+//! running asks first — a mis-click or a stray Cmd-W/Cmd-Q must not kill an
+//! in-flight build or AI run. The copy and the job test are pure and unit-tested
+//! here; `App` asks (macOS `NSAlert`, the in-window banner elsewhere —
+//! `crate::close_confirm`) and wires the PTY (`tcgetpgrp` on the session master on
+//! unix; a child-process walk of the shell pid on windows, vetted by creation
+//! time — [`ChildLinks::has_job`]) and the shell-integration state
+//! ([`shell_word`]: the shell's own word that a command is running, or that it
+//! went idle).
 
 use std::time::{Duration, Instant};
 
-/// How long a refused close keeps the confirm window armed: a second request inside
-/// this window proceeds; after it lapses the program title is restored and the next
-/// request starts over.
-pub(crate) const CLOSE_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
-
-/// The titlebar hint shown while a refused close keeps the confirm window armed.
-pub(crate) const CLOSE_WARNING_TITLE: &str = "job running — close again within 2s to end it";
-
-/// The titlebar hint shown while a refused quit keeps the confirm window armed: a
-/// repeat ends the whole program, not this window.
-pub(crate) const QUIT_WARNING_TITLE: &str = "job running — quit again within 2s to end it";
-
-/// The titlebar hint for an armed confirm window: the quit's when the gesture was a
-/// quit, the close's otherwise (closing the last window included).
-pub(crate) fn warning_title(quit_gesture: bool) -> &'static str {
-    if quit_gesture {
-        QUIT_WARNING_TITLE
-    } else {
-        CLOSE_WARNING_TITLE
-    }
-}
-
-/// What a close/quit request should do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CloseDecision {
-    /// Proceed now: nothing is busy, or this is the confirming second request.
-    Close,
-    /// Refuse and arm the warning: a foreground job is running and no confirm
-    /// window is currently armed.
-    Warn,
-}
-
-/// Decide a close/quit request: a busy foreground job refuses the first request
-/// (arming the confirm window); a second request while armed, or any request with
-/// nothing busy, proceeds.
-pub(crate) fn close_decision(foreground_busy: bool, warning_armed: bool) -> CloseDecision {
-    if foreground_busy && !warning_armed {
-        CloseDecision::Warn
-    } else {
-        CloseDecision::Close
-    }
-}
-
-/// The copy for a destructive close/quit confirmation dialog, handed as is to the
-/// platform alert (`AppRt::confirm` → `NSAlert`).
+/// The copy for a destructive close/quit confirmation dialog. Static strings, so the
+/// platform layer (`AppRt::confirm` → the native `NSAlert`) just hands them straight
+/// to the alert.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ConfirmPrompt {
     /// The alert's primary message (`NSAlert.messageText`).
@@ -104,6 +64,27 @@ pub(crate) fn confirm_prompt(exits_app: bool, busy: bool, reopens: bool) -> Opti
         })
     } else {
         None
+    }
+}
+
+/// The affirmative verb of a busy TAB close's confirm ([`busy_view_close_prompt`]),
+/// which names the wire `kind=close-tab` (`close_confirm::kind`).
+pub(crate) const CLOSE_TAB: &str = "Close Tab";
+/// The affirmative verb of a busy PANE close's confirm (`kind=close-pane`).
+pub(crate) const CLOSE_PANE: &str = "Close Pane";
+
+/// The copy for closing a tab (`pane` false) or a pane that leaves its window
+/// standing while a job runs in it: the confirm a window close asks, worded for
+/// what is actually closing.
+pub(crate) fn busy_view_close_prompt(pane: bool) -> ConfirmPrompt {
+    ConfirmPrompt {
+        title: if pane {
+            "A process is still running in this pane."
+        } else {
+            "A process is still running in this tab."
+        },
+        body: "Closing it now will end that process.",
+        proceed: if pane { CLOSE_PANE } else { CLOSE_TAB },
     }
 }
 
@@ -183,6 +164,16 @@ pub(crate) fn shell_executing(term: &aterm_core::terminal::Terminal) -> bool {
     term.shell_state() == aterm_core::terminal::ShellState::Executing
 }
 
+/// Whether `term`'s shell integration has ever reported a whole COMMAND (a 133;C
+/// that a 133;D closed: the engine drops a D no C opened) rather than only its
+/// prompts. An integration that marks prompts and never commands (cmd.exe's
+/// `%PROMPT%` tier, pwsh without PSReadLine) never moves this. The close guard's
+/// idle word ([`shell_word`]) and the status classifier's prompt
+/// ([`crate::session_status::prompt_yields_to_job`]) both draw the line here.
+pub(crate) fn shell_reports_commands(term: &aterm_core::terminal::Terminal) -> bool {
+    term.completed_command_seq() > 0
+}
+
 /// What the shell's own integration says, as the close guard reads it: the two facts
 /// [`foreground_busy`] needs from the engine, taken under one lock.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -210,7 +201,7 @@ pub(crate) struct ShellWord {
 pub(crate) fn shell_word(term: &aterm_core::terminal::Terminal) -> ShellWord {
     let own_marks =
         term.shell_integration_posture() == aterm_core::terminal::ShellIntegrationPosture::On;
-    let reports_commands = term.completed_command_seq() > 0;
+    let reports_commands = shell_reports_commands(term);
     ShellWord {
         executing: shell_executing(term),
         idle_since_ms: (own_marks && reports_commands)
@@ -870,24 +861,6 @@ mod windows_jobs {
 mod tests {
     use super::*;
 
-    /// The close truth table: a busy tab is refused the first time and closes when
-    /// confirmed a second time within the window; an idle one closes immediately.
-    #[test]
-    fn close_decision_warns_once_while_busy_and_otherwise_closes() {
-        for (busy, confirmed, expected) in [
-            (true, false, CloseDecision::Warn),
-            (true, true, CloseDecision::Close),
-            (false, false, CloseDecision::Close),
-            (false, true, CloseDecision::Close),
-        ] {
-            assert_eq!(
-                close_decision(busy, confirmed),
-                expected,
-                "busy={busy} confirmed={confirmed}"
-            );
-        }
-    }
-
     #[test]
     fn quit_always_prompts_and_notes_a_running_job() {
         // ⌘Q confirms whether or not a job is running (the user asked for an
@@ -904,33 +877,6 @@ mod tests {
                 "the busy-quit copy must mention the running process"
             );
             assert!(busy.body.contains("process"), "{}", busy.body);
-        }
-    }
-
-    /// With restore on (the default) a quit loses the shells and their
-    /// scrollback while the windows and tabs come back, so the body names what
-    /// is lost and never says every window closes; with restore off it does.
-    #[test]
-    fn quit_copy_names_what_is_lost_and_what_comes_back() {
-        for busy in [false, true] {
-            let kept = confirm_prompt(true, busy, true).expect("a quit confirms");
-            assert!(kept.body.contains("scrollback is lost"), "{}", kept.body);
-            assert!(kept.body.contains("come back"), "{}", kept.body);
-            assert!(!kept.body.contains("close every window"), "{}", kept.body);
-            let gone = confirm_prompt(true, busy, false).expect("a quit confirms");
-            assert!(gone.body.contains("close every window"), "{}", gone.body);
-        }
-    }
-
-    /// The Linux titlebar warning names the gesture a repeat completes and how
-    /// long the window stays armed.
-    #[test]
-    fn the_titlebar_warning_names_the_gesture_and_the_window() {
-        assert!(warning_title(true).contains("quit again"));
-        assert!(warning_title(false).contains("close again"));
-        let secs = format!("{}s", CLOSE_CONFIRM_WINDOW.as_secs());
-        for title in [warning_title(true), warning_title(false)] {
-            assert!(title.contains(&secs), "{title}");
         }
     }
 
@@ -1312,22 +1258,39 @@ mod tests {
     }
 
     /// A running command that clears the scrollback stays busy: ED 3 (`clear`, `cls`,
-    /// `Clear-Host`) drops the engine's current block, but only the shell's own 133;D
-    /// ends the command.
+    /// `Clear-Host`) is output, and only the shell's own 133;D ends the command. The
+    /// engine keeps the running block through the erase too, executing. Block storage
+    /// is not the reading either: an engine adopted from a carry that holds the open
+    /// C..D phase and no block is executing until its D.
     #[test]
     fn a_command_that_clears_the_scrollback_is_still_executing() {
         let mut term = aterm_core::terminal::Terminal::new(24, 80);
         term.process(b"\x1b]133;A\x07PS> \x1b]133;B\x07Clear-Host; Start-Sleep 60\n\x1b]133;C\x07");
         assert!(shell_executing(&term), "precondition: executing");
         term.process(b"\x1b[H\x1b[2J\x1b[3J");
-        assert!(
-            term.current_block().is_none(),
-            "precondition: ED 3 dropped the block, the reading this guard used to take"
+        assert_eq!(
+            term.current_block().map(|b| b.state),
+            Some(aterm_types::BlockState::Executing),
+            "ED 3 keeps the running block"
         );
         assert!(
             shell_executing(&term),
             "the command is still running: ED 3 is output, not the end of the command"
         );
+        let mut carry = term.checkpoint();
+        carry.shell.current_block = None;
+        let mut adopted = aterm_core::terminal::Terminal::new(24, 80);
+        adopted.restore_checkpoint(&carry);
+        assert!(
+            adopted.current_block().is_none(),
+            "precondition: the carry held no block"
+        );
+        assert!(
+            shell_executing(&adopted),
+            "the open C..D phase is the reading, block or no block"
+        );
+        adopted.process(b"\x1b]133;D;0\x07");
+        assert!(!shell_executing(&adopted), "and its 133;D ends it");
         term.process(b"\x1b]133;D;0\x07");
         assert!(
             !shell_executing(&term),

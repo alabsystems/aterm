@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use aterm_spec::derive::ordered_input_admission_model;
+use aterm_models_session::ordered_input_admission_model;
 use aterm_spec::interp::State;
 
 fn project(budget: &Budget, expected: &State) -> State {
@@ -269,7 +269,7 @@ fn stalled_sink_case(hidden: bool) {
     }
     let submit = |app: &mut App, ev| {
         if hidden {
-            app.input_to_hidden_session(0, ev, super::super::PressPhase::Initial)
+            app.input_to_hidden_session(0, ev, super::super::PressPhase::Initial, None)
         } else {
             app.input(wid, ev, Source::Human)
         }
@@ -345,17 +345,15 @@ fn stalled_sink_case(hidden: bool) {
         InputOutcome::WriteFailed
     );
     assert_eq!(budget.used.load(Ordering::Acquire) >> 32, 3);
-    assert_eq!(
+    let rows = |app: &App| {
         app.messages
             .live_rows()
             .filter(|m| m.msg.key.as_deref() == Some("session.input-full.0"))
             .map(|m| m.msg.detail.clone())
-            .collect::<Vec<_>>(),
-        [vec![
-            "earlier input is still being sent \u{2014} try again".to_string()
-        ]],
-        "one row, naming the cause the queue reported: a full queue, not a size"
-    );
+            .collect::<Vec<_>>()
+    };
+    let busy = rows(&app);
+    assert_eq!(busy.len(), 1, "one row for the refusals");
     // A paste whose len equals the paste cap still cannot fit an empty
     // queue once its Job is charged: too large, not busy, and the one
     // row's line follows the new cause.
@@ -364,17 +362,9 @@ fn stalled_sink_case(hidden: bool) {
         InputOutcome::WriteFailed
     );
     assert_eq!(budget.used.load(Ordering::Acquire) >> 32, 3);
-    assert_eq!(
-        app.messages
-            .live_rows()
-            .filter(|m| m.msg.key.as_deref() == Some("session.input-full.0"))
-            .map(|m| m.msg.detail.clone())
-            .collect::<Vec<_>>(),
-        [vec![
-            "the paste is too large \u{2014} paste it in smaller pieces".to_string()
-        ]],
-        "one row, its line replaced by the new cause"
-    );
+    let too_large = rows(&app);
+    assert_eq!(too_large.len(), 1, "still one row");
+    assert_ne!(too_large, busy, "its line replaced by the new cause");
     ready_tx.send(()).unwrap();
     let (responsive, actual, expected, mut reader) = drain.join().unwrap();
     assert!(

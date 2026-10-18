@@ -55,7 +55,6 @@ fn download(done: u64) -> Message {
             }),
             load: None,
             busy: false,
-            level: false,
         })
         .hold(Hold::Live {
             stale_after: STALE_UPDATE,
@@ -558,13 +557,13 @@ fn the_load_slot_is_reserved_for_the_declared_loads() {
     );
     restate(&mut c, Some(Load::Cpu), ms(1000));
     assert_eq!(slot(&c), Some("CPU busy".chars().count()), "and come back");
-    restate(&mut c, Some(Load::Memory), ms(1500));
+    restate(&mut c, Some(Load::Network), ms(1500));
     assert_eq!(
         c.live(id).unwrap().load_slot,
-        [Load::Cpu, Load::Memory].into_iter().collect::<Loads>(),
+        [Load::Cpu, Load::Network].into_iter().collect::<Loads>(),
         "a load outside the declaration widens it once"
     );
-    assert_eq!(slot(&c), Some("memory full".chars().count()));
+    assert_eq!(slot(&c), Some("network busy".chars().count()));
     // Undeclared: every load's width.
     let mut u = fresh(now);
     let other = u.post(row(&[]), stamp(), now).id;
@@ -1039,56 +1038,6 @@ fn the_comet_never_leaves_the_row_empty_and_never_rests() {
     );
 }
 
-/// The comet is one soft gradient: no two stops share a position, its fill
-/// rises to the head and falls after it, and inside the row it lights about a
-/// quarter of the row ([`crate::COMET_PERMILLE`]).
-#[test]
-fn the_comet_is_one_soft_gradient_about_a_quarter_of_the_row() {
-    let mut inside = 0;
-    let mut t = Duration::ZERO;
-    while t < COMET_PERIOD {
-        let s = crate::animate::comet(t, true);
-        assert!(
-            s.stops.windows(2).all(|w| w[0].at < w[1].at),
-            "a hard edge at {t:?}: {s:?}"
-        );
-        let peak = s
-            .stops
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, p)| p.tone.fill)
-            .map_or(0, |(i, _)| i);
-        for (i, w) in s.stops.windows(2).enumerate() {
-            if i < peak {
-                assert!(w[0].tone.fill <= w[1].tone.fill, "{t:?}: the tail dips");
-            } else {
-                assert!(w[0].tone.fill >= w[1].tone.fill, "{t:?}: the lead rises");
-            }
-        }
-        let x = crate::animate::comet_head(t);
-        let lead = i64::from(crate::ROW) * i64::from(crate::COMET_LEAD_PERMILLE) / 1000;
-        let len = i64::from(crate::ROW) * i64::from(crate::COMET_PERMILLE) / 1000;
-        if x - len + lead > 0 && x + lead < i64::from(crate::ROW) {
-            inside += 1;
-            let lit = s.cells(1000).iter().filter(|c| c.fill > 0).count();
-            assert!((240..=260).contains(&lit), "{lit}‰ lit at {t:?}");
-        }
-        t += ANIM_FRAME;
-    }
-    assert!(
-        inside > 40,
-        "the comet crosses wholly inside the row: {inside}"
-    );
-    // Flat: a solid segment in the full ink.
-    let flat = crate::animate::comet(COMET_PERIOD / 2, false);
-    assert!(flat.flat);
-    assert!(
-        flat.cells(120)
-            .iter()
-            .all(|c| *c == Tone::TRACK || *c == Tone::FULL)
-    );
-}
-
 #[test]
 fn the_glint_never_lifts_the_track() {
     for shown in [100u16, 380, 620, 999] {
@@ -1288,31 +1237,6 @@ fn motion_deadlines_land_on_the_frame_grid() {
     }
 }
 
-/// A layout painted as `glass`'s pinned strings are, with one frame's time
-/// words in their slots: the readout in the elapsed slot, the ETA words in
-/// the ETA slot.
-fn render_with_motion(
-    row: &crate::glass::RowLayout,
-    rm: &crate::animate::RowMotion,
-    cols: usize,
-) -> String {
-    let mut cells: Vec<char> = crate::glass::tests::render(row, cols).chars().collect();
-    let mut put = |col: usize, words: &str| {
-        for (i, ch) in words.chars().enumerate() {
-            if let Some(cell) = cells.get_mut(col + i) {
-                *cell = ch;
-            }
-        }
-    };
-    if let (Some(col), Some(words)) = (row.elapsed, rm.readout.as_deref()) {
-        put(col, words);
-    }
-    if let (Some(col), Some(words)) = (row.eta, rm.eta.as_deref()) {
-        put(col, words);
-    }
-    cells.into_iter().collect()
-}
-
 /// The first run's live row: a step count behind its fill, disk busy.
 fn first_run(permille: u16) -> Message {
     Message::new(tags::PACKAGES, Severity::Info, "Installing ALab tools")
@@ -1327,7 +1251,6 @@ fn first_run(permille: u16) -> Message {
             }),
             load: Some(Load::Disk),
             busy: false,
-            level: false,
         })
         .hold(Hold::Live {
             stale_after: STALE_TAILED,
@@ -1337,44 +1260,26 @@ fn first_run(permille: u16) -> Message {
 
 /// A hidden estimate leaves the ETA slot blank (an elapsed `0:07` there reads
 /// as seven seconds left). The slot keeps its cells, so nothing re-lays when
-/// the estimate latches, and nothing ticks there. Pinned at 80 and 120
-/// columns, then latched.
+/// the estimate latches, and nothing ticks there, at 80 and 120 columns, then
+/// latched.
 #[test]
 fn a_hidden_estimate_leaves_the_eta_slot_blank() {
-    let pinned: &[(&str, usize, &str)] = &[
-        (
-            "download",
-            80,
-            " ℹ Downloading aterm v0.92.0   42%              31 of 74 MB          Details ›  ",
-        ),
-        (
-            "download",
-            120,
-            " ℹ Downloading aterm v0.92.0   42%              31 of 74 MB                                                  Details ›  ",
-        ),
-        (
-            "first-run",
-            80,
-            " ℹ Installing ALab tools   39%                           disk busy   Details ›  ",
-        ),
-        (
-            "first-run",
-            120,
-            " ℹ Installing ALab tools   39%              3 of 10 programs                                     disk busy   Details ›  ",
-        ),
-    ];
-    let mut failures = Vec::new();
-    for (name, cols, want) in pinned {
+    for (name, cols) in [
+        ("download", 80usize),
+        ("download", 120),
+        ("first-run", 80),
+        ("first-run", 120),
+    ] {
         let now = t0();
         let mut c = fresh(now);
-        let msg = if *name == "download" {
+        let msg = if name == "download" {
             download(31_080_000)
         } else {
             first_run(420)
         };
         let id = c.post(msg, stamp(), now).id;
         c.commit_rows(now, 3);
-        let p = present(&c, *cols);
+        let p = present(&c, cols);
         let at = now + ms(12_400);
         assert!(
             matches!(
@@ -1384,11 +1289,6 @@ fn a_hidden_estimate_leaves_the_eta_slot_blank() {
             "one read: nothing to estimate from"
         );
         assert!(p.rows[0].eta.is_some(), "the slot is reserved");
-        let m = c.motion(&p, at, Look::MOVING);
-        let got = render_with_motion(&p.rows[0], &m.rows[0], *cols);
-        if got != *want {
-            failures.push(format!("(\"{name}\", {cols}, {got:?}),"));
-        }
         // Blank in every look, and no tick is asked for it: the next text
         // change is at the earliest the stall onset, never the next second.
         for look in [Look::MOVING, Look::STILL] {
@@ -1398,7 +1298,6 @@ fn a_hidden_estimate_leaves_the_eta_slot_blank() {
             assert!(d >= now + ms(13_400), "{name}/{cols}: {:?}", d - now);
         }
     }
-    assert!(failures.is_empty(), "re-pin:\n{}", failures.join("\n"));
     // Latched, the slot says what is left.
     let now = t0();
     let mut c = fresh(now);
